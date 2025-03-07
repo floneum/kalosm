@@ -1,6 +1,6 @@
 [package]
 name = "kalosm-parse-macro"
-version = "0.4.0"
+version = "0.4.1"
 edition = "2021"
 description = "A macro to derive kalosm parsing traits"
 license = "MIT/Apache-2.0"
