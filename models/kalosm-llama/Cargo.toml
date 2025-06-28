@@ -14,6 +14,7 @@ candle-nn.workspace = true
 candle-transformers.workspace = true
 tokenizers = { workspace = true }
 
+ahash = "0.8.12"
 accelerate-src = { version = "0.3.2", optional = true }
 intel-mkl-src = { version = "0.8.1", features = [
     "mkl-static-lp64-iomp",
