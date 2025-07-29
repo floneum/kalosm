@@ -36,25 +36,16 @@ impl IntoDocument for DocxDocument {
         let docx = DocxFile::from_xml(reader).map_err(FsDocumentError::Decode)?;
         let mut text = String::new();
         for section in docx.children {
-            match section {
-                docx_rs::DocumentChild::Paragraph(paragraph) => {
-                    for child in paragraph.children {
-                        match child {
-                            docx_rs::ParagraphChild::Run(run) => {
-                                for child in run.children {
-                                    match child {
-                                        docx_rs::RunChild::Text(text_child) => {
-                                            text += &text_child.text;
-                                        }
-                                        _ => {}
-                                    }
-                                }
+            if let docx_rs::DocumentChild::Paragraph(paragraph) = section {
+                for child in paragraph.children {
+                    if let docx_rs::ParagraphChild::Run(run) = child {
+                        for child in run.children {
+                            if let docx_rs::RunChild::Text(text_child) = child {
+                                text += &text_child.text;
                             }
-                            _ => {}
                         }
                     }
                 }
-                _ => {}
             }
         }
         Ok(Document::from_parts("", text))
