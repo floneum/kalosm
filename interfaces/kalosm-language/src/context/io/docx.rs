@@ -46,39 +46,15 @@ impl IntoDocument for DocxDocument {
                                         docx_rs::RunChild::Text(text_child) => {
                                             text += &text_child.text;
                                         }
-                                        docx_rs::RunChild::Sym(_) => {}
-                                        docx_rs::RunChild::DeleteText(_) => {}
-                                        docx_rs::RunChild::Tab(_) => {}
-                                        docx_rs::RunChild::Break(_) => {}
-                                        docx_rs::RunChild::Drawing(_) => {}
-                                        docx_rs::RunChild::Shape(_) => {}
-                                        docx_rs::RunChild::CommentStart(_) => {}
-                                        docx_rs::RunChild::CommentEnd(_) => {}
-                                        docx_rs::RunChild::FieldChar(_) => {}
-                                        docx_rs::RunChild::InstrText(_) => {}
-                                        docx_rs::RunChild::DeleteInstrText(_) => {}
-                                        docx_rs::RunChild::InstrTextString(_) => {}
+                                        _ => {}
                                     }
                                 }
                             }
-                            docx_rs::ParagraphChild::Insert(_) => {}
-                            docx_rs::ParagraphChild::Delete(_) => {}
-                            docx_rs::ParagraphChild::BookmarkStart(_) => {}
-                            docx_rs::ParagraphChild::Hyperlink(_) => {}
-                            docx_rs::ParagraphChild::BookmarkEnd(_) => {}
-                            docx_rs::ParagraphChild::CommentStart(_) => {}
-                            docx_rs::ParagraphChild::CommentEnd(_) => {}
-                            docx_rs::ParagraphChild::StructuredDataTag(_) => {}
+                            _ => {}
                         }
                     }
                 }
-                docx_rs::DocumentChild::Table(_) => {}
-                docx_rs::DocumentChild::BookmarkStart(_) => {}
-                docx_rs::DocumentChild::BookmarkEnd(_) => {}
-                docx_rs::DocumentChild::CommentStart(_) => {}
-                docx_rs::DocumentChild::CommentEnd(_) => {}
-                docx_rs::DocumentChild::StructuredDataTag(_) => {}
-                docx_rs::DocumentChild::TableOfContents(_) => {}
+                _ => {}
             }
         }
         Ok(Document::from_parts("", text))
