@@ -509,11 +509,23 @@ impl Layout {
         let new_shape: Box<[usize]> = specs.iter().map(|s| s.size).collect();
         let new_strides: Box<[usize]> = specs
             .iter()
-            .map(|s| self.strides[s.input_dim] * s.multiplier)
+            .map(|s| {
+                if s.multiplier == 0 {
+                    0
+                } else {
+                    self.strides[s.input_dim] * s.multiplier
+                }
+            })
             .collect();
         let additional_offset: usize = specs
             .iter()
-            .map(|s| s.offset * self.strides[s.input_dim])
+            .map(|s| {
+                if s.offset == 0 {
+                    0
+                } else {
+                    s.offset * self.strides[s.input_dim]
+                }
+            })
             .sum();
         Self::from_parts(self.offset + additional_offset, new_shape, new_strides)
     }

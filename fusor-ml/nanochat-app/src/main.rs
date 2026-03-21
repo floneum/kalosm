@@ -608,25 +608,6 @@ fn InteractivePad(
                             stage_bounds(),
                             interactive_grid_size(&tokenizer),
                         );
-                        let cursor = tokenizer.cursor_after_tokens(&prompt_tokens());
-                        let current = GridPoint {
-                            x: cursor.0,
-                            y: cursor.1,
-                        };
-                        if point != current {
-                            let mut next = prompt_tokens();
-                            append_tokens_for_path(&tokenizer, &mut next, current, point, false);
-                            prompt_tokens.set(next.clone());
-                            prediction_tokens.set(Vec::new());
-                            request_prediction(
-                                worker(),
-                                worker_generation(),
-                                request_revision,
-                                sketch_status,
-                                prediction_tokens,
-                                next,
-                            );
-                        }
                         dragging.set(true);
                         last_point.set(Some(point));
                     },
@@ -654,6 +635,23 @@ fn InteractivePad(
                             return;
                         }
                         let mut next = prompt_tokens();
+                        // If the pen-down position differs from the token
+                        // cursor, travel there first (pen-up repositioning)
+                        // before starting the draw stroke.
+                        let cursor = tokenizer.cursor_after_tokens(&next);
+                        let current = GridPoint {
+                            x: cursor.0,
+                            y: cursor.1,
+                        };
+                        if previous_point != current {
+                            append_tokens_for_path(
+                                &tokenizer,
+                                &mut next,
+                                current,
+                                previous_point,
+                                false,
+                            );
+                        }
                         append_tokens_for_path(&tokenizer, &mut next, previous_point, point, true);
                         prompt_tokens.set(next.clone());
                         prediction_tokens.set(Vec::new());

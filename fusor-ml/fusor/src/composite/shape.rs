@@ -207,10 +207,11 @@ where
     {
         let shape = self.shape();
         assert_eq!(shape[dim], 1, "Squeeze dimension must have size 1");
-        let new_shape: [usize; R2] = std::array::from_fn(|i| {
-            if i < dim { shape[i] } else { shape[i + 1] }
+        let specs: [StrideSpec; R2] = std::array::from_fn(|out_i| {
+            let in_i = if out_i < dim { out_i } else { out_i + 1 };
+            StrideSpec::dim(in_i, shape[in_i])
         });
-        self.reshape(new_shape)
+        self.restride(specs)
     }
 
     /// Unsqueeze (add a dimension of size 1).
@@ -223,10 +224,15 @@ where
         fusor_core::Tensor<R, D>: fusor_core::NextRank<R2, D>,
     {
         let shape = self.shape();
-        let new_shape: [usize; R2] = std::array::from_fn(|i| {
-            if i < dim { shape[i] } else if i == dim { 1 } else { shape[i - 1] }
+        let specs: [StrideSpec; R2] = std::array::from_fn(|out_i| {
+            if out_i == dim {
+                StrideSpec::dim_with(0, 1, 0)
+            } else {
+                let in_i = if out_i < dim { out_i } else { out_i - 1 };
+                StrideSpec::dim(in_i, shape[in_i])
+            }
         });
-        self.reshape(new_shape)
+        self.restride(specs)
     }
 
     /// Squeeze multiple dimensions of size 1.
@@ -249,15 +255,20 @@ where
         for &ax in &axes {
             assert_eq!(shape[ax], 1, "Squeeze dimension {} must have size 1", ax);
         }
-        // Build new shape by skipping squeezed axes
-        let mut new_dims = Vec::with_capacity(R2);
-        for i in 0..R {
-            if !axes.contains(&i) {
-                new_dims.push(shape[i]);
+        let mut sorted_axes = axes;
+        sorted_axes.sort_unstable();
+        let mut in_i = 0;
+        let mut axis_idx = 0;
+        let specs: [StrideSpec; R2] = std::array::from_fn(|_| {
+            while axis_idx < DIFF && in_i == sorted_axes[axis_idx] {
+                in_i += 1;
+                axis_idx += 1;
             }
-        }
-        let new_shape: [usize; R2] = std::array::from_fn(|i| new_dims[i]);
-        self.reshape(new_shape)
+            let spec = StrideSpec::dim(in_i, shape[in_i]);
+            in_i += 1;
+            spec
+        });
+        self.restride(specs)
     }
 
     /// Unsqueeze multiple dimensions (add dimensions of size 1).
@@ -277,20 +288,21 @@ where
         fusor_core::Tensor<R, D>: fusor_core::LargerRank<DIFF, R2, D>,
     {
         let shape = self.shape();
-        let new_shape: [usize; R2] = {
-            let mut result = [0usize; R2];
-            let mut old_idx = 0;
-            for i in 0..R2 {
-                if axes.contains(&i) {
-                    result[i] = 1;
-                } else {
-                    result[i] = shape[old_idx];
-                    old_idx += 1;
-                }
+        let mut sorted_axes = axes;
+        sorted_axes.sort_unstable();
+        let mut old_idx = 0;
+        let mut axis_idx = 0;
+        let specs: [StrideSpec; R2] = std::array::from_fn(|out_i| {
+            if axis_idx < DIFF && out_i == sorted_axes[axis_idx] {
+                axis_idx += 1;
+                StrideSpec::dim_with(0, 1, 0)
+            } else {
+                let spec = StrideSpec::dim(old_idx, shape[old_idx]);
+                old_idx += 1;
+                spec
             }
-            result
-        };
-        self.reshape(new_shape)
+        });
+        self.restride(specs)
     }
 
     /// Create a sliding window view of the tensor (zero-copy).
@@ -311,10 +323,23 @@ where
         ConcreteTensor<D, R>: fusor_cpu::LargerRank<R2, DIFF, D>,
         fusor_core::Tensor<R, D>: fusor_core::LargerRank<DIFF, R2, D>,
     {
-        match self {
-            Tensor::Cpu(t) => Tensor::Cpu(t.as_ref().sliding_window_view(windows)),
-            Tensor::Gpu(t) => Tensor::Gpu(t.sliding_window_view(windows)),
-        }
+        let shape = self.shape();
+        let mut sorted_windows = windows;
+        sorted_windows.sort_by_key(|w| w.axis);
+        let specs: [StrideSpec; R2] = std::array::from_fn(|out_i| {
+            if out_i < R {
+                if let Some(w) = sorted_windows.iter().find(|w| w.axis == out_i) {
+                    let num_positions = (shape[out_i] - w.window_size) / w.step + 1;
+                    StrideSpec::dim_with(out_i, num_positions, w.step)
+                } else {
+                    StrideSpec::dim(out_i, shape[out_i])
+                }
+            } else {
+                let w = &sorted_windows[out_i - R];
+                StrideSpec::dim(w.axis, w.window_size)
+            }
+        });
+        self.restride(specs)
     }
 }
 

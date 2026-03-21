@@ -19,6 +19,7 @@ const CANVAS_SIZE: f32 = 128.0;
 const CANVAS_PADDING: f32 = 14.0;
 pub const ACTION_MODE_COUNT: usize = 3;
 pub const ACTION_DIRECTION_COUNT: usize = 8;
+const MAX_STROKE_PERMUTATIONS: usize = 24;
 
 #[derive(Clone)]
 pub struct StrokeTokenizer {
@@ -187,7 +188,7 @@ struct RenderState {
     completed_strokes: Vec<Vec<(i32, i32)>>,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct FeatherStroke {
     points: Vec<(i32, i32)>,
 }
@@ -204,12 +205,26 @@ enum ShapeKind {
     Square,
     Rectangle,
     Triangle,
+    RightTriangle,
     Diamond,
     Hexagon,
     Octagon,
     House,
     Trapezoid,
     Parallelogram,
+    Elbow,
+    Shield,
+    Spiral,
+    Kite,
+    Tag,
+    Notch,
+    Bookmark,
+    Stair,
+    Capsule,
+    Vase,
+    Bolt,
+    Tab,
+    Cup,
     Cross,
     Star,
     Arrow,
@@ -315,18 +330,32 @@ impl ActionMode {
 }
 
 impl ShapeKind {
-    fn all() -> [Self; 14] {
+    fn all() -> [Self; 28] {
         [
             Self::Circle,
             Self::Square,
             Self::Rectangle,
             Self::Triangle,
+            Self::RightTriangle,
             Self::Diamond,
             Self::Hexagon,
             Self::Octagon,
             Self::House,
             Self::Trapezoid,
             Self::Parallelogram,
+            Self::Elbow,
+            Self::Shield,
+            Self::Spiral,
+            Self::Kite,
+            Self::Tag,
+            Self::Notch,
+            Self::Bookmark,
+            Self::Stair,
+            Self::Capsule,
+            Self::Vase,
+            Self::Bolt,
+            Self::Tab,
+            Self::Cup,
             Self::Cross,
             Self::Star,
             Self::Arrow,
@@ -340,12 +369,26 @@ impl ShapeKind {
             Self::Square => "square",
             Self::Rectangle => "rectangle",
             Self::Triangle => "triangle",
+            Self::RightTriangle => "righttriangle",
             Self::Diamond => "diamond",
             Self::Hexagon => "hexagon",
             Self::Octagon => "octagon",
             Self::House => "house",
             Self::Trapezoid => "trapezoid",
             Self::Parallelogram => "parallelogram",
+            Self::Elbow => "elbow",
+            Self::Shield => "shield",
+            Self::Spiral => "spiral",
+            Self::Kite => "kite",
+            Self::Tag => "tag",
+            Self::Notch => "notch",
+            Self::Bookmark => "bookmark",
+            Self::Stair => "stair",
+            Self::Capsule => "capsule",
+            Self::Vase => "vase",
+            Self::Bolt => "bolt",
+            Self::Tab => "tab",
+            Self::Cup => "cup",
             Self::Cross => "cross",
             Self::Star => "star",
             Self::Arrow => "arrow",
@@ -1047,31 +1090,58 @@ fn feather_source_files(
     let mut seen = HashSet::new();
     let mut files = Vec::new();
 
-    for &augmentation in augmentations {
-        let strokes = augment_feather_strokes(&base_strokes, icon.grid_size, augmentation);
-        let content_tokens = feather_content_tokens(tokenizer, &strokes, &icon.name);
-        if !seen.insert(content_tokens.clone()) {
-            continue;
+    let permutations = match split {
+        FeatherSplit::Train => stroke_order_permutations(&base_strokes, &icon.name),
+        FeatherSplit::Validation | FeatherSplit::Test => vec![(0, base_strokes.clone())],
+    };
+
+    for (perm_index, permuted_strokes) in &permutations {
+        for &augmentation in augmentations {
+            let strokes =
+                augment_feather_strokes(permuted_strokes, icon.grid_size, augmentation);
+            let content_tokens = feather_content_tokens(tokenizer, &strokes, &icon.name);
+            if !seen.insert(content_tokens.clone()) {
+                continue;
+            }
+
+            let mut tokens = Vec::with_capacity(content_tokens.len() + 2);
+            tokens.push(tokenizer.bos_token());
+            tokens.extend_from_slice(&content_tokens);
+            tokens.push(tokenizer.eot_token());
+
+            let aug_suffix = augmentation.suffix();
+            let perm_suffix = if *perm_index == 0 {
+                String::new()
+            } else {
+                format!("perm{perm_index}")
+            };
+
+            let path = match (perm_suffix.is_empty(), aug_suffix.is_empty()) {
+                (true, true) => format!("{}/{}.stroke", split.as_str(), icon.name),
+                (false, true) => {
+                    format!("{}/{}__{}.stroke", split.as_str(), icon.name, perm_suffix)
+                }
+                (true, false) => {
+                    format!("{}/{}__{}.stroke", split.as_str(), icon.name, aug_suffix)
+                }
+                (false, false) => {
+                    format!(
+                        "{}/{}__{}__{}.stroke",
+                        split.as_str(),
+                        icon.name,
+                        perm_suffix,
+                        aug_suffix
+                    )
+                }
+            };
+
+            files.push(SourceFile {
+                path,
+                tokens,
+                prompt_tokens: content_tokens.clone(),
+                target_tokens: content_tokens,
+            });
         }
-
-        let mut tokens = Vec::with_capacity(content_tokens.len() + 2);
-        tokens.push(tokenizer.bos_token());
-        tokens.extend_from_slice(&content_tokens);
-        tokens.push(tokenizer.eot_token());
-
-        let suffix = augmentation.suffix();
-        let path = if suffix.is_empty() {
-            format!("{}/{}.stroke", split.as_str(), icon.name)
-        } else {
-            format!("{}/{}__{}.stroke", split.as_str(), icon.name, suffix)
-        };
-
-        files.push(SourceFile {
-            path,
-            tokens,
-            prompt_tokens: content_tokens.clone(),
-            target_tokens: content_tokens,
-        });
     }
 
     files
@@ -1129,6 +1199,129 @@ fn feather_strokes(icon: &FeatherIconRecord) -> Vec<FeatherStroke> {
             (points.len() >= 2).then_some(FeatherStroke { points })
         })
         .collect()
+}
+
+fn stroke_order_permutations(
+    strokes: &[FeatherStroke],
+    icon_name: &str,
+) -> Vec<(usize, Vec<FeatherStroke>)> {
+    let n = strokes.len();
+    if n == 0 {
+        return vec![(0, strokes.to_vec())];
+    }
+    if n == 1 {
+        // Single stroke: identity + reversed = 2 variants.
+        let mut reversed = strokes[0].clone();
+        reversed.points.reverse();
+        return vec![(0, strokes.to_vec()), (1, vec![reversed])];
+    }
+
+    // Total combinatorial space: N! orderings × 2^N reversal masks.
+    let factorial = (1..=n)
+        .try_fold(1usize, |acc, x| acc.checked_mul(x))
+        .unwrap_or(usize::MAX);
+    let total = factorial.saturating_mul(1usize << n.min(30));
+
+    if total <= MAX_STROKE_PERMUTATIONS {
+        all_order_and_reversal_variants(strokes)
+    } else {
+        sampled_order_and_reversal_variants(strokes, icon_name)
+    }
+}
+
+fn apply_reversal_mask(strokes: &[FeatherStroke], mask: usize) -> Vec<FeatherStroke> {
+    strokes
+        .iter()
+        .enumerate()
+        .map(|(i, stroke)| {
+            if mask & (1 << i) != 0 {
+                let mut reversed = stroke.clone();
+                reversed.points.reverse();
+                reversed
+            } else {
+                stroke.clone()
+            }
+        })
+        .collect()
+}
+
+fn all_order_and_reversal_variants(
+    strokes: &[FeatherStroke],
+) -> Vec<(usize, Vec<FeatherStroke>)> {
+    let n = strokes.len();
+    let mut indices: Vec<usize> = (0..n).collect();
+    let mut result = Vec::new();
+    let mut variant_index = 0usize;
+    let reversal_count = 1usize << n;
+
+    loop {
+        let permuted: Vec<FeatherStroke> = indices.iter().map(|&i| strokes[i].clone()).collect();
+        for mask in 0..reversal_count {
+            result.push((variant_index, apply_reversal_mask(&permuted, mask)));
+            variant_index += 1;
+        }
+
+        if !next_permutation(&mut indices) {
+            break;
+        }
+    }
+
+    result
+}
+
+fn next_permutation(indices: &mut [usize]) -> bool {
+    let n = indices.len();
+    if n < 2 {
+        return false;
+    }
+    let Some(i) = (0..n - 1).rev().find(|&i| indices[i] < indices[i + 1]) else {
+        return false;
+    };
+    let j = (i + 1..n)
+        .rev()
+        .find(|&j| indices[i] < indices[j])
+        .unwrap();
+    indices.swap(i, j);
+    indices[i + 1..].reverse();
+    true
+}
+
+fn sampled_order_and_reversal_variants(
+    strokes: &[FeatherStroke],
+    icon_name: &str,
+) -> Vec<(usize, Vec<FeatherStroke>)> {
+    let seed = stable_name_hash(icon_name);
+    let mut rng = StdRng::seed_from_u64(seed);
+
+    let n = strokes.len();
+    let reversal_count = 1usize << n.min(30);
+    let mut result = Vec::with_capacity(MAX_STROKE_PERMUTATIONS);
+    let mut seen: HashSet<(Vec<usize>, usize)> = HashSet::new();
+
+    // Always include the identity (original order, no reversals).
+    let identity: Vec<usize> = (0..n).collect();
+    seen.insert((identity, 0));
+    result.push((0, strokes.to_vec()));
+
+    let mut variant_index = 1usize;
+    let max_attempts = MAX_STROKE_PERMUTATIONS * 10;
+    let mut attempts = 0;
+
+    while result.len() < MAX_STROKE_PERMUTATIONS && attempts < max_attempts {
+        let mut indices: Vec<usize> = (0..n).collect();
+        indices.shuffle(&mut rng);
+        let mask = rng.random_range(0..reversal_count);
+        attempts += 1;
+
+        if seen.insert((indices.clone(), mask)) {
+            let permuted: Vec<FeatherStroke> =
+                indices.iter().map(|&i| strokes[i].clone()).collect();
+            result.push((variant_index, apply_reversal_mask(&permuted, mask)));
+            variant_index += 1;
+        }
+    }
+
+    result
 }
 
 fn feather_stroke_dirs(points: &[(i32, i32)], icon_name: &str) -> Vec<Direction> {
@@ -1806,6 +1999,17 @@ fn shape_tokens(shape: ShapeKind, tokenizer: &StrokeTokenizer, rng: &mut StdRng)
                 mirror,
             );
         }
+        ShapeKind::RightTriangle => {
+            let rotation = rng.random_range(0..4) * 2;
+            let mirror = rng.random_bool(0.5);
+            trace_moves(
+                &mut drawing_tokens,
+                tokenizer,
+                &[(Direction::E, 2), (Direction::SW, 2), (Direction::N, 2)],
+                rotation,
+                mirror,
+            );
+        }
         ShapeKind::Diamond => {
             let edge = rng.random_range(1..=2);
             let rotation = rng.random_range(0..Direction::all().len());
@@ -1912,6 +2116,241 @@ fn shape_tokens(shape: ShapeKind, tokenizer: &StrokeTokenizer, rng: &mut StdRng)
                     (Direction::NE, lean),
                     (Direction::W, width),
                     (Direction::SW, lean),
+                ],
+                rotation,
+                mirror,
+            );
+        }
+        ShapeKind::Elbow => {
+            let rotation = rng.random_range(0..4) * 2;
+            let mirror = rng.random_bool(0.5);
+            trace_moves(
+                &mut drawing_tokens,
+                tokenizer,
+                &[
+                    (Direction::E, 2),
+                    (Direction::S, 1),
+                    (Direction::W, 1),
+                    (Direction::S, 1),
+                    (Direction::W, 1),
+                    (Direction::N, 2),
+                ],
+                rotation,
+                mirror,
+            );
+        }
+        ShapeKind::Shield => {
+            let rotation = rng.random_range(0..4) * 2;
+            let mirror = rng.random_bool(0.5);
+            trace_moves(
+                &mut drawing_tokens,
+                tokenizer,
+                &[
+                    (Direction::E, 2),
+                    (Direction::SE, 1),
+                    (Direction::SW, 1),
+                    (Direction::W, 2),
+                    (Direction::NW, 1),
+                    (Direction::NE, 1),
+                ],
+                rotation,
+                mirror,
+            );
+        }
+        ShapeKind::Spiral => {
+            let rotation = rng.random_range(0..4) * 2;
+            let mirror = rng.random_bool(0.5);
+            trace_moves(
+                &mut drawing_tokens,
+                tokenizer,
+                &[
+                    (Direction::E, 2),
+                    (Direction::S, 2),
+                    (Direction::W, 1),
+                    (Direction::N, 1),
+                    (Direction::W, 2),
+                    (Direction::N, 2),
+                    (Direction::E, 1),
+                    (Direction::S, 1),
+                ],
+                rotation,
+                mirror,
+            );
+        }
+        ShapeKind::Kite => {
+            let rotation = rng.random_range(0..4) * 2;
+            let mirror = rng.random_bool(0.5);
+            trace_moves(
+                &mut drawing_tokens,
+                tokenizer,
+                &[
+                    (Direction::E, 1),
+                    (Direction::SE, 1),
+                    (Direction::SW, 1),
+                    (Direction::W, 1),
+                    (Direction::NW, 1),
+                    (Direction::NE, 1),
+                ],
+                rotation,
+                mirror,
+            );
+        }
+        ShapeKind::Tag => {
+            let rotation = rng.random_range(0..4) * 2;
+            let mirror = rng.random_bool(0.5);
+            trace_moves(
+                &mut drawing_tokens,
+                tokenizer,
+                &[
+                    (Direction::E, 2),
+                    (Direction::SE, 1),
+                    (Direction::SW, 1),
+                    (Direction::W, 1),
+                    (Direction::NW, 1),
+                    (Direction::N, 1),
+                ],
+                rotation,
+                mirror,
+            );
+        }
+        ShapeKind::Notch => {
+            let rotation = rng.random_range(0..4) * 2;
+            let mirror = rng.random_bool(0.5);
+            trace_moves(
+                &mut drawing_tokens,
+                tokenizer,
+                &[
+                    (Direction::E, 2),
+                    (Direction::S, 2),
+                    (Direction::W, 1),
+                    (Direction::N, 1),
+                    (Direction::W, 1),
+                    (Direction::N, 1),
+                ],
+                rotation,
+                mirror,
+            );
+        }
+        ShapeKind::Bookmark => {
+            let rotation = rng.random_range(0..4) * 2;
+            let mirror = rng.random_bool(0.5);
+            trace_moves(
+                &mut drawing_tokens,
+                tokenizer,
+                &[
+                    (Direction::E, 2),
+                    (Direction::S, 2),
+                    (Direction::NW, 1),
+                    (Direction::SW, 1),
+                    (Direction::N, 2),
+                ],
+                rotation,
+                mirror,
+            );
+        }
+        ShapeKind::Stair => {
+            let rotation = rng.random_range(0..4) * 2;
+            let mirror = rng.random_bool(0.5);
+            trace_moves(
+                &mut drawing_tokens,
+                tokenizer,
+                &[
+                    (Direction::E, 1),
+                    (Direction::S, 1),
+                    (Direction::E, 1),
+                    (Direction::S, 1),
+                    (Direction::W, 2),
+                    (Direction::N, 2),
+                ],
+                rotation,
+                mirror,
+            );
+        }
+        ShapeKind::Capsule => {
+            let rotation = rng.random_range(0..4) * 2;
+            let mirror = rng.random_bool(0.5);
+            trace_moves(
+                &mut drawing_tokens,
+                tokenizer,
+                &[
+                    (Direction::NE, 1),
+                    (Direction::E, 2),
+                    (Direction::SE, 1),
+                    (Direction::SW, 1),
+                    (Direction::W, 2),
+                    (Direction::NW, 1),
+                ],
+                rotation,
+                mirror,
+            );
+        }
+        ShapeKind::Vase => {
+            let rotation = rng.random_range(0..4) * 2;
+            let mirror = rng.random_bool(0.5);
+            trace_moves(
+                &mut drawing_tokens,
+                tokenizer,
+                &[
+                    (Direction::NE, 1),
+                    (Direction::N, 1),
+                    (Direction::SE, 1),
+                    (Direction::S, 2),
+                    (Direction::SW, 1),
+                    (Direction::NW, 1),
+                    (Direction::N, 1),
+                ],
+                rotation,
+                mirror,
+            );
+        }
+        ShapeKind::Bolt => {
+            let rotation = rng.random_range(0..4) * 2;
+            let mirror = rng.random_bool(0.5);
+            trace_moves(
+                &mut drawing_tokens,
+                tokenizer,
+                &[
+                    (Direction::E, 1),
+                    (Direction::NE, 1),
+                    (Direction::SE, 1),
+                    (Direction::SW, 1),
+                    (Direction::W, 2),
+                    (Direction::N, 1),
+                ],
+                rotation,
+                mirror,
+            );
+        }
+        ShapeKind::Tab => {
+            let rotation = rng.random_range(0..4) * 2;
+            let mirror = rng.random_bool(0.5);
+            trace_moves(
+                &mut drawing_tokens,
+                tokenizer,
+                &[
+                    (Direction::NE, 1),
+                    (Direction::E, 2),
+                    (Direction::S, 1),
+                    (Direction::SW, 1),
+                    (Direction::W, 1),
+                    (Direction::NW, 1),
+                ],
+                rotation,
+                mirror,
+            );
+        }
+        ShapeKind::Cup => {
+            let rotation = rng.random_range(0..4) * 2;
+            let mirror = rng.random_bool(0.5);
+            trace_moves(
+                &mut drawing_tokens,
+                tokenizer,
+                &[
+                    (Direction::S, 1),
+                    (Direction::SE, 1),
+                    (Direction::E, 1),
+                    (Direction::N, 2),
+                    (Direction::W, 2),
                 ],
                 rotation,
                 mirror,
@@ -2851,5 +3290,126 @@ mod tests {
                 points: vec![(1, 0), (1, 1)],
             }]
         );
+    }
+
+    #[test]
+    fn stroke_variants_single_stroke_produces_identity_and_reversed() {
+        let strokes = vec![FeatherStroke {
+            points: vec![(0, 0), (1, 0), (2, 0)],
+        }];
+        let perms = stroke_order_permutations(&strokes, "single");
+        assert_eq!(perms.len(), 2);
+        assert_eq!(perms[0].1, strokes);
+        assert_eq!(perms[1].1[0].points, vec![(2, 0), (1, 0), (0, 0)]);
+    }
+
+    #[test]
+    fn stroke_variants_two_strokes_all_order_and_reversal_combos() {
+        let strokes = vec![
+            FeatherStroke {
+                points: vec![(0, 0), (1, 0)],
+            },
+            FeatherStroke {
+                points: vec![(3, 3), (4, 3)],
+            },
+        ];
+        // 2! orderings × 2^2 reversal masks = 8 variants
+        let perms = stroke_order_permutations(&strokes, "two");
+        assert_eq!(perms.len(), 8);
+        // First variant is the identity (original order, no reversals)
+        assert_eq!(perms[0].1[0].points, vec![(0, 0), (1, 0)]);
+        assert_eq!(perms[0].1[1].points, vec![(3, 3), (4, 3)]);
+        // All variants are unique
+        let unique: HashSet<Vec<Vec<(i32, i32)>>> = perms
+            .iter()
+            .map(|(_, s)| s.iter().map(|stroke| stroke.points.clone()).collect())
+            .collect();
+        assert_eq!(unique.len(), 8);
+    }
+
+    #[test]
+    fn stroke_variants_caps_at_max_for_many_strokes() {
+        let strokes: Vec<FeatherStroke> = (0..4)
+            .map(|i| FeatherStroke {
+                points: vec![(i, 0), (i, 1)],
+            })
+            .collect();
+        // 4! × 2^4 = 384 > MAX_STROKE_PERMUTATIONS, so sampled
+        let perms = stroke_order_permutations(&strokes, "four");
+        assert_eq!(perms.len(), MAX_STROKE_PERMUTATIONS);
+        assert_eq!(perms[0].0, 0);
+        // All variants are unique
+        let unique: HashSet<Vec<Vec<(i32, i32)>>> = perms
+            .iter()
+            .map(|(_, s)| s.iter().map(|stroke| stroke.points.clone()).collect())
+            .collect();
+        assert_eq!(unique.len(), MAX_STROKE_PERMUTATIONS);
+    }
+
+    #[test]
+    fn stroke_variants_include_reversals() {
+        let strokes = vec![
+            FeatherStroke {
+                points: vec![(0, 0), (1, 0)],
+            },
+            FeatherStroke {
+                points: vec![(3, 3), (4, 3)],
+            },
+        ];
+        let perms = stroke_order_permutations(&strokes, "rev_check");
+        // Should contain a variant where first stroke is reversed
+        assert!(perms.iter().any(|(_, s)| s[0].points == vec![(1, 0), (0, 0)]));
+        // Should contain a variant where second stroke is reversed
+        assert!(perms.iter().any(|(_, s)| s[1].points == vec![(4, 3), (3, 3)]));
+    }
+
+    #[test]
+    fn stroke_variants_are_deterministic() {
+        let strokes: Vec<FeatherStroke> = (0..6)
+            .map(|i| FeatherStroke {
+                points: vec![(i, 0), (i, 1)],
+            })
+            .collect();
+        let run1 = stroke_order_permutations(&strokes, "deterministic");
+        let run2 = stroke_order_permutations(&strokes, "deterministic");
+        assert_eq!(run1.len(), run2.len());
+        for (a, b) in run1.iter().zip(run2.iter()) {
+            assert_eq!(a.0, b.0);
+            assert_eq!(a.1, b.1);
+        }
+    }
+
+    #[test]
+    fn feather_source_files_generates_shuffle_variants_for_multistroke() {
+        let icon = FeatherIconRecord {
+            name: "archive".to_string(),
+            _original_svg_path: "/tmp/archive.svg".to_string(),
+            quantized_points: vec![vec![[0, 0], [1, 0]], vec![[2, 2], [2, 3], [2, 4]]],
+            _dirs: vec![
+                vec!["E".to_string()],
+                vec!["S".to_string(), "S".to_string()],
+            ],
+            grid_size: 9,
+            accepted: true,
+        };
+        let tokenizer = StrokeTokenizer::with_grid(9);
+
+        let train_files = feather_source_files(&tokenizer, &icon, FeatherSplit::Train);
+        assert!(
+            train_files.iter().any(|f| f.path().contains("__perm1")),
+            "train files should contain permutation variants"
+        );
+        assert!(
+            train_files.len() > 8,
+            "multi-stroke icon should produce more than 8 files (was {})",
+            train_files.len()
+        );
+
+        let val_files = feather_source_files(&tokenizer, &icon, FeatherSplit::Validation);
+        assert!(
+            !val_files.iter().any(|f| f.path().contains("perm")),
+            "validation files should not contain permutation variants"
+        );
+        assert_eq!(val_files.len(), 1);
     }
 }
