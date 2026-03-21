@@ -1,7 +1,7 @@
 use rustc_hash::FxHashMap;
 
 use crate::{
-    Layout, TensorLayoutInfo, index_select::IndexSelectOperation, nary_wise::NaryOperation,
+    Layout, TensorLayoutInfo, nary_wise::NaryOperation,
 };
 
 use super::{ComputeGraphNodeVariant, NodeIndex, queue::ComputeQueue};
@@ -35,8 +35,6 @@ impl LayoutPass {
                 ComputeGraphNodeVariant::SliceAssign(op) => self.visit_slice_assign(node, op),
                 ComputeGraphNodeVariant::Tensor(op) => self.visit_tensor(node, op),
                 ComputeGraphNodeVariant::Dequantize(op) => self.visit_dequantize(node, op),
-                ComputeGraphNodeVariant::IndexSelect(op) => self.visit_index_select(node, op),
-                ComputeGraphNodeVariant::WhereCond(op) => self.visit_where_cond(node, op),
                 ComputeGraphNodeVariant::Custom(op) => self.visit_custom(node, op),
             }
         }
@@ -177,58 +175,6 @@ impl LayoutPass {
         let new_layout = Layout::contiguous(matrix.shape());
         self.output_layout
             .insert(key, TensorLayoutInfo::new(new_layout, operation.datatype));
-    }
-
-    fn visit_index_select(
-        &mut self,
-        key: NodeIndex,
-        operation: &crate::index_select::IndexSelectOperation,
-    ) {
-        let Some(indexes_shape) = self.output_layout.get(&operation.indexes) else {
-            self.queue.push_back(operation.indexes);
-            self.queue.push_back(key);
-            return;
-        };
-        let Some(input_shape) = self.output_layout.get(&operation.input) else {
-            self.queue.push_back(operation.input);
-            self.queue.push_back(key);
-            return;
-        };
-        let shape = IndexSelectOperation::calc_output_shape(
-            operation.dimension,
-            indexes_shape.shape(),
-            input_shape.shape(),
-        );
-        let new_layout = Layout::contiguous(&shape);
-        self.output_layout
-            .insert(key, TensorLayoutInfo::new(new_layout, operation.datatype));
-    }
-
-    fn visit_where_cond(
-        &mut self,
-        key: NodeIndex,
-        operation: &crate::composite::where_cond::WhereCondOperation,
-    ) {
-        // Check all dependencies are ready
-        if !self.output_layout.contains_key(&operation.condition) {
-            self.queue.push_back(operation.condition);
-            self.queue.push_back(key);
-            return;
-        }
-        if !self.output_layout.contains_key(&operation.on_true) {
-            self.queue.push_back(operation.on_true);
-            self.queue.push_back(key);
-            return;
-        }
-        if !self.output_layout.contains_key(&operation.on_false) {
-            self.queue.push_back(operation.on_false);
-            self.queue.push_back(key);
-            return;
-        }
-
-        // Use on_true's layout (same as operation.output_layout implementation)
-        let on_true_layout = self.output_layout.get(&operation.on_true).unwrap();
-        self.output_layout.insert(key, on_true_layout.clone());
     }
 
     fn visit_custom(

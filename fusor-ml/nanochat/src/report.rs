@@ -88,6 +88,17 @@ enum SamplingMode {
     Sample,
 }
 
+/// Constraint applied to the first predicted token during constrained decoding.
+/// Used to handle partial-token boundaries: when the user has drawn part of what
+/// would be a single RLE token, we pop that partial token from the prompt and
+/// constrain the model's first prediction to continue in the same direction.
+#[derive(Clone, Debug)]
+pub struct FirstTokenConstraint {
+    pub mode_index: u32,
+    pub direction_index: u32,
+    pub min_count: usize,
+}
+
 pub fn load_runtime_config() -> Result<RuntimeConfig, String> {
     RuntimeConfig::try_load()
 }
@@ -143,6 +154,7 @@ impl LivePredictor {
         &self,
         prompt_tokens: &[u32],
         max_tokens: usize,
+        first_token_constraint: Option<FirstTokenConstraint>,
     ) -> Result<Vec<u32>, String> {
         let mut model_prompt = vec![self.tokenizer.bos_token()];
         model_prompt.extend_from_slice(prompt_tokens);
@@ -156,6 +168,7 @@ impl LivePredictor {
                 &model_prompt,
                 max_tokens,
                 SamplingMode::Greedy,
+                first_token_constraint,
             )))
         })
         .and_then(|result| result)
@@ -172,6 +185,7 @@ impl LivePredictor {
                 &[self.tokenizer.bos_token()],
                 self.runtime.sample_tokens,
                 SamplingMode::Sample,
+                None,
             ));
             let svg = tokens_to_svg_string(&self.tokenizer, &[], &generated);
 
@@ -255,6 +269,7 @@ async fn build_comparison_report_async(
             &model_prompt,
             expected.len(),
             SamplingMode::Greedy,
+            None,
         )
         .await;
         let edit_distance = token_edit_distance(&generated, expected);
@@ -363,6 +378,7 @@ async fn generate_interactive_completion(
     prompt_tokens: &[u32],
     max_tokens: usize,
     mode: SamplingMode,
+    first_token_constraint: Option<FirstTokenConstraint>,
 ) -> Vec<u32> {
     let block_size = model.block_size().min(runtime.block_size);
     let mut rng = StdRng::seed_from_u64(seed);
@@ -372,7 +388,7 @@ async fn generate_interactive_completion(
         .iter()
         .map(|&t| tokenizer.token_name(t))
         .collect();
-    eprintln!(
+    println!(
         "[DEBUG] generate_interactive_completion: block_size={}, prompt_len={}, prompt={:?}",
         block_size,
         prompt_tokens.len(),
@@ -387,7 +403,7 @@ async fn generate_interactive_completion(
             .iter()
             .map(|&t| tokenizer.token_name(t))
             .collect();
-        eprintln!(
+        println!(
             "[DEBUG] step={}: context_len={}, last_index={}, context={:?}",
             step,
             context.len(),
@@ -395,17 +411,13 @@ async fn generate_interactive_completion(
             context_names
         );
 
-        // Compute canvas state indices for logging
         if let Some(spec) = model.canvas_state_spec() {
             let indexes =
                 canvas_state_indexes(tokenizer, std::slice::from_ref(&context), spec);
-            eprintln!(
-                "[DEBUG] step={}: canvas_x={:?}, canvas_y={:?}, pen={:?}",
-                step, indexes.cursor_x[0], indexes.cursor_y[0], indexes.pen_state[0]
-            );
-            eprintln!(
-                "[DEBUG] step={}: canvas_spec: vocab_size={}, offset={}",
-                step, spec.coordinate_vocab_size, spec.coordinate_offset
+            println!(
+                "[DEBUG] step={}: canvas_x={:?}, canvas_y={:?}, pen={:?}, coord_vocab_size={}, coord_offset={}",
+                step, indexes.cursor_x[0], indexes.cursor_y[0], indexes.pen_state[0],
+                spec.coordinate_vocab_size, spec.coordinate_offset
             );
         }
 
@@ -435,29 +447,23 @@ async fn generate_interactive_completion(
         let ml = &mode_logits[0][last_index];
         let dl = &direction_logits[0][last_index];
         let cl = &count_logits[0][last_index];
-        eprintln!(
-            "[DEBUG] step={}: mode_logits={:?}",
-            step, ml
-        );
-        // Log top-3 direction logits
+        println!("[DEBUG] step={}: mode_logits={:?}", step, ml);
         let mut dir_indexed: Vec<(usize, f32)> =
             dl.iter().copied().enumerate().collect();
         dir_indexed.sort_by(|a, b| b.1.total_cmp(&a.1));
         let top3_dir: Vec<(usize, f32)> = dir_indexed.into_iter().take(3).collect();
-        eprintln!(
-            "[DEBUG] step={}: top3_direction={:?}",
-            step, top3_dir
-        );
-        // Log top-3 count logits
+        println!("[DEBUG] step={}: top3_direction={:?}", step, top3_dir);
         let mut count_indexed: Vec<(usize, f32)> =
             cl.iter().copied().enumerate().collect();
         count_indexed.sort_by(|a, b| b.1.total_cmp(&a.1));
         let top3_count: Vec<(usize, f32)> = count_indexed.into_iter().take(3).collect();
-        eprintln!(
-            "[DEBUG] step={}: top3_count={:?}",
-            step, top3_count
-        );
+        println!("[DEBUG] step={}: top3_count={:?}", step, top3_count);
 
+        let step_constraint = if step == 0 {
+            first_token_constraint.as_ref()
+        } else {
+            None
+        };
         let next = decode_next_action_token(
             tokenizer,
             &context[..=last_index],
@@ -468,13 +474,9 @@ async fn generate_interactive_completion(
             runtime.sample_top_k,
             &mut rng,
             mode,
+            step_constraint,
         );
-        eprintln!(
-            "[DEBUG] step={}: predicted token={} ({})",
-            step,
-            next,
-            tokenizer.token_name(next)
-        );
+        println!("[DEBUG] step={}: predicted token={} ({})", step, next, tokenizer.token_name(next));
         tokens.push(next);
         if next == tokenizer.eot_token() {
             break;
@@ -575,46 +577,62 @@ fn decode_next_action_token(
     top_k: usize,
     rng: &mut StdRng,
     sampling: SamplingMode,
+    constraint: Option<&FirstTokenConstraint>,
 ) -> u32 {
-    let mode_index = match sampling {
-        SamplingMode::Greedy => argmax_from_logits(mode_logits),
-        SamplingMode::Sample => sample_from_logits(rng, mode_logits, temperature, top_k),
+    let mode_index = if let Some(c) = constraint {
+        c.mode_index
+    } else {
+        match sampling {
+            SamplingMode::Greedy => argmax_from_logits(mode_logits),
+            SamplingMode::Sample => sample_from_logits(rng, mode_logits, temperature, top_k),
+        }
     };
     if mode_index >= 2 {
         return tokenizer.eot_token();
     }
 
     let cursor = tokenizer.cursor_after_tokens(context);
-    let mut filtered_direction_logits = direction_logits.to_vec();
-    for (direction_index, logit) in filtered_direction_logits.iter_mut().enumerate() {
-        if tokenizer.legal_count_limit(cursor, direction_index as u32) == 0 {
-            *logit = f32::NEG_INFINITY;
-        }
-    }
-    if !filtered_direction_logits
-        .iter()
-        .any(|logit| logit.is_finite())
-    {
-        return tokenizer.eot_token();
-    }
 
-    let direction_index = match sampling {
-        SamplingMode::Greedy => argmax_from_logits(&filtered_direction_logits),
-        SamplingMode::Sample => {
-            sample_from_logits(rng, &filtered_direction_logits, temperature, top_k)
+    let direction_index = if let Some(c) = constraint {
+        c.direction_index
+    } else {
+        let mut filtered_direction_logits = direction_logits.to_vec();
+        for (direction_index, logit) in filtered_direction_logits.iter_mut().enumerate() {
+            if tokenizer.legal_count_limit(cursor, direction_index as u32) == 0 {
+                *logit = f32::NEG_INFINITY;
+            }
+        }
+        if !filtered_direction_logits
+            .iter()
+            .any(|logit| logit.is_finite())
+        {
+            return tokenizer.eot_token();
+        }
+        match sampling {
+            SamplingMode::Greedy => argmax_from_logits(&filtered_direction_logits),
+            SamplingMode::Sample => {
+                sample_from_logits(rng, &filtered_direction_logits, temperature, top_k)
+            }
         }
     };
+
     let legal_limit = tokenizer.legal_count_limit(cursor, direction_index);
     if legal_limit == 0 {
         return tokenizer.eot_token();
     }
 
+    let min_count = constraint.map_or(0, |c| c.min_count);
     let mut filtered_count_logits = count_logits.to_vec();
     for (count_index, logit) in filtered_count_logits.iter_mut().enumerate() {
         let count = count_index + 1;
-        if count > legal_limit {
+        if count > legal_limit || count < min_count {
             *logit = f32::NEG_INFINITY;
         }
+    }
+    if !filtered_count_logits.iter().any(|logit| logit.is_finite()) {
+        // min_count exceeds legal_limit — fall back to the legal limit itself
+        let count = legal_limit.max(1);
+        return tokenizer.token_from_components(mode_index, direction_index, count);
     }
     let count_index = match sampling {
         SamplingMode::Greedy => argmax_from_logits(&filtered_count_logits),

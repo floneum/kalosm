@@ -4079,6 +4079,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tokio",
+ "tracing",
 ]
 
 [[package]]
@@ -4089,6 +4090,7 @@ dependencies = [
  "base64 0.22.1",
  "dioxus",
  "fusor-nanochat",
+ "tracing-subscriber 0.3.23",
  "web-sys",
 ]
 

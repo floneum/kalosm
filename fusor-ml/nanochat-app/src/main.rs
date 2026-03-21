@@ -5,9 +5,9 @@ use dioxus::{
     prelude::*,
 };
 use fusor_nanochat::{
-    ComparisonReport, ComparisonSample, DatasetGalleryItem, LivePredictor, RuntimeConfig,
-    ShapeCount, StrokeTokenizer, build_comparison_report, load_runtime_config, load_tokenizer,
-    tokens_to_stroke_scene,
+    ComparisonReport, ComparisonSample, DatasetGalleryItem, FirstTokenConstraint, LivePredictor,
+    RuntimeConfig, ShapeCount, StrokeTokenizer, build_comparison_report, load_runtime_config,
+    load_tokenizer, tokens_to_stroke_scene,
 };
 use std::rc::Rc;
 #[cfg(not(target_arch = "wasm32"))]
@@ -18,6 +18,9 @@ const DEFAULT_SKETCH_STAGE_PX: f64 = 480.0;
 const PREVIEW_TOKEN_LIMIT: usize = 16;
 
 fn main() {
+    tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .init();
     dioxus::launch(App);
 }
 
@@ -60,6 +63,9 @@ enum WorkerUpdate {
         generation: u64,
         revision: u64,
         completion_tokens: Vec<u32>,
+        /// When true, the worker popped the last prompt token and used constrained
+        /// decoding. The first completion token replaces the popped token on accept.
+        popped_prompt_token: bool,
     },
     Failed {
         generation: u64,
@@ -293,6 +299,7 @@ fn InteractivePad(
 ) -> Element {
     let mut prompt_tokens = use_signal(Vec::<u32>::new);
     let mut prediction_tokens = use_signal(Vec::<u32>::new);
+    let prediction_popped = use_signal(|| false);
     let mut tokenizer = use_signal(|| None::<StrokeTokenizer>);
     let mut worker = use_signal(|| None::<PredictorWorker>);
     let mut sketch_status = use_signal(|| {
@@ -347,6 +354,7 @@ fn InteractivePad(
                     generation,
                     tokenizer,
                     prediction_tokens,
+                    prediction_popped,
                     sketch_status,
                     request_revision,
                     worker_generation,
@@ -370,6 +378,16 @@ fn InteractivePad(
     let tokenizer_loaded = tokenizer();
     let prompt_preview = prompt_tokens();
     let prediction_preview = prediction_tokens();
+    let is_popped = prediction_popped();
+    // When the prediction was produced with a popped last token, the first
+    // completion token overlaps with what the user already drew.  Build
+    // display tokens that subtract the overlap so the orange preview starts
+    // from the current cursor, not from behind it.
+    let display_prediction = if is_popped {
+        compute_display_tokens(tokenizer_loaded.as_ref(), &prompt_preview, &prediction_preview)
+    } else {
+        prediction_preview.clone()
+    };
     let prompt_display = tokenizer_loaded
         .as_ref()
         .map(|tokenizer| tokenizer.describe_tokens(&prompt_preview, 80))
@@ -377,7 +395,7 @@ fn InteractivePad(
         .unwrap_or_else(|| "<empty>".to_string());
     let prediction_display = tokenizer_loaded
         .as_ref()
-        .map(|tokenizer| tokenizer.describe_tokens(&prediction_preview, 80))
+        .map(|tokenizer| tokenizer.describe_tokens(&display_prediction, 80))
         .filter(|text| !text.is_empty())
         .unwrap_or_else(|| "<none>".to_string());
     let current_cursor = tokenizer_loaded
@@ -390,7 +408,7 @@ fn InteractivePad(
         .unwrap_or(16);
     let stroke_scene = tokenizer_loaded
         .as_ref()
-        .map(|tokenizer| tokens_to_stroke_scene(tokenizer, &prompt_preview, &prediction_preview));
+        .map(|tokenizer| tokens_to_stroke_scene(tokenizer, &prompt_preview, &display_prediction));
     let prompt_paths = stroke_scene
         .as_ref()
         .map(|scene| {
@@ -415,6 +433,23 @@ fn InteractivePad(
     let view_box = format!("0 0 {grid_size} {grid_size}");
     let cursor_x = current_cursor.0 as f32 + 0.5;
     let cursor_y = current_cursor.1 as f32 + 0.5;
+    let max_index = grid_size.saturating_sub(1) as i32;
+    let neighbor_dots: Vec<(f32, f32)> = [
+        (-1, -1), (0, -1), (1, -1),
+        (-1,  0),          (1,  0),
+        (-1,  1), (0,  1), (1,  1),
+    ]
+    .iter()
+    .filter_map(|&(dx, dy)| {
+        let nx = current_cursor.0 + dx;
+        let ny = current_cursor.1 + dy;
+        if nx >= 0 && ny >= 0 && nx <= max_index && ny <= max_index {
+            Some((nx as f32 + 0.5, ny as f32 + 0.5))
+        } else {
+            None
+        }
+    })
+    .collect();
 
     rsx! {
         div {
@@ -469,6 +504,7 @@ fn InteractivePad(
                                 accept_prediction(
                                     prompt_tokens,
                                     prediction_tokens,
+                                    prediction_popped,
                                     worker(),
                                     worker_generation(),
                                     request_revision,
@@ -518,6 +554,7 @@ fn InteractivePad(
                                 accept_prediction(
                                     prompt_tokens,
                                     prediction_tokens,
+                                    prediction_popped,
                                     worker(),
                                     worker_generation(),
                                     request_revision,
@@ -601,21 +638,23 @@ fn InteractivePad(
                             return;
                         }
                         event.prevent_default();
-                        let point = grid_point_from_event(
+                        let Some(previous_point) = last_point() else {
+                            return;
+                        };
+                        // Snap to the nearest neighbor of the current grid
+                        // point so that diagonal connections are as easy to
+                        // reach as cardinal ones.
+                        let point = grid_point_from_event_constrained(
                             &event,
                             stage_bounds(),
                             interactive_grid_size(&tokenizer),
+                            previous_point,
                         );
-                        let Some(previous_point) = last_point() else {
-                            last_point.set(Some(point));
-                            return;
-                        };
                         if point == previous_point {
                             return;
                         }
                         let mut next = prompt_tokens();
                         append_tokens_for_path(&tokenizer, &mut next, previous_point, point, true);
-                        pixel_perfect_filter(&tokenizer, &mut next);
                         prompt_tokens.set(next.clone());
                         prediction_tokens.set(Vec::new());
                         last_point.set(Some(point));
@@ -703,6 +742,16 @@ fn InteractivePad(
                             fill: "none",
                             for path_data in prediction_paths {
                                 path { d: "{path_data}" }
+                            }
+                        }
+                        // Neighbor dots: show reachable grid points.
+                        for (nx, ny) in neighbor_dots.iter().copied() {
+                            circle {
+                                cx: "{nx}",
+                                cy: "{ny}",
+                                r: "0.09",
+                                fill: "#264653",
+                                opacity: "0.32",
                             }
                         }
                         circle {
@@ -967,6 +1016,7 @@ fn spawn_predictor_worker(
     generation: u64,
     mut tokenizer_signal: Signal<Option<StrokeTokenizer>>,
     mut prediction_signal: Signal<Vec<u32>>,
+    mut prediction_popped_signal: Signal<bool>,
     mut status_signal: Signal<String>,
     request_revision: Signal<u64>,
     worker_generation: Signal<u64>,
@@ -1005,12 +1055,14 @@ fn spawn_predictor_worker(
                     generation,
                     revision,
                     completion_tokens,
+                    popped_prompt_token,
                 } => {
                     if generation != worker_generation() || revision != request_revision() {
                         continue;
                     }
                     let has_prediction = !completion_tokens.is_empty();
                     prediction_signal.set(completion_tokens);
+                    prediction_popped_signal.set(popped_prompt_token);
                     status_signal.set(if has_prediction {
                         "Prediction updated. Press Tab to accept the continuation.".to_string()
                     } else {
@@ -1116,18 +1168,53 @@ fn predict_with_command(predictor: &LivePredictor, command: WorkerCommand) -> Wo
             revision,
             prompt_tokens,
             max_tokens,
-        } => match predictor.predict_greedy(&prompt_tokens, max_tokens) {
-            Ok(completion_tokens) => WorkerUpdate::Prediction {
-                generation,
-                revision,
-                completion_tokens,
-            },
-            Err(error) => WorkerUpdate::Failed {
-                generation,
-                message: error,
-            },
-        },
+        } => {
+            // Build a constraint from the last prompt token (BPE boundary fix).
+            // Pop the last token if it's a valid segment, predict from the
+            // shortened prompt, and constrain the first predicted token to
+            // continue in the same mode+direction with count >= user's count.
+            let (effective_prompt, constraint, popped) =
+                build_prediction_constraint(predictor.tokenizer(), prompt_tokens);
+
+            match predictor.predict_greedy(&effective_prompt, max_tokens, constraint) {
+                Ok(completion_tokens) => WorkerUpdate::Prediction {
+                    generation,
+                    revision,
+                    completion_tokens,
+                    popped_prompt_token: popped,
+                },
+                Err(error) => WorkerUpdate::Failed {
+                    generation,
+                    message: error,
+                },
+            }
+        }
     }
+}
+
+/// Pop the last prompt token if it's a valid segment token, and build a
+/// `FirstTokenConstraint` so the model's first prediction continues in the
+/// same direction with at least the same count.
+fn build_prediction_constraint(
+    tokenizer: &StrokeTokenizer,
+    mut prompt_tokens: Vec<u32>,
+) -> (Vec<u32>, Option<FirstTokenConstraint>, bool) {
+    if let Some(&last_token) = prompt_tokens.last() {
+        if let Some(decoded) = tokenizer.decode_segment_token(last_token) {
+            if let (Some(direction_index), Some(count)) =
+                (decoded.direction_index, decoded.count)
+            {
+                prompt_tokens.pop();
+                let constraint = FirstTokenConstraint {
+                    mode_index: decoded.mode_index,
+                    direction_index,
+                    min_count: count,
+                };
+                return (prompt_tokens, Some(constraint), true);
+            }
+        }
+    }
+    (prompt_tokens, None, false)
 }
 
 fn request_prediction(
@@ -1163,6 +1250,7 @@ fn request_prediction(
 fn accept_prediction(
     mut prompt_tokens: Signal<Vec<u32>>,
     mut prediction_tokens: Signal<Vec<u32>>,
+    mut prediction_popped: Signal<bool>,
     worker: Option<PredictorWorker>,
     generation: u64,
     request_revision: Signal<u64>,
@@ -1173,10 +1261,19 @@ fn accept_prediction(
         return;
     }
 
+    let is_popped = prediction_popped();
     let mut next = prompt_tokens();
-    next.extend_from_slice(&prediction);
+    if is_popped && !next.is_empty() {
+        // Replace the last prompt token with the first completion token
+        // (which has the full count from constrained decoding)
+        *next.last_mut().unwrap() = prediction[0];
+        next.extend_from_slice(&prediction[1..]);
+    } else {
+        next.extend_from_slice(&prediction);
+    }
     prompt_tokens.set(next.clone());
     prediction_tokens.set(Vec::new());
+    prediction_popped.set(false);
     request_prediction(
         worker,
         generation,
@@ -1185,6 +1282,62 @@ fn accept_prediction(
         prediction_tokens,
         next,
     );
+}
+
+/// When the worker popped the last prompt token and produced a constrained
+/// prediction, the first completion token covers what the user already drew
+/// plus potentially more.  This function creates display tokens where the
+/// first token's count is reduced by the overlap.
+fn compute_display_tokens(
+    tokenizer: Option<&StrokeTokenizer>,
+    prompt_tokens: &[u32],
+    completion_tokens: &[u32],
+) -> Vec<u32> {
+    let Some(tokenizer) = tokenizer else {
+        return completion_tokens.to_vec();
+    };
+    let Some(&first_completion) = completion_tokens.first() else {
+        return Vec::new();
+    };
+    let Some(&last_prompt) = prompt_tokens.last() else {
+        return completion_tokens.to_vec();
+    };
+    let Some(completion_decoded) = tokenizer.decode_segment_token(first_completion) else {
+        return completion_tokens.to_vec();
+    };
+    let Some(prompt_decoded) = tokenizer.decode_segment_token(last_prompt) else {
+        return completion_tokens.to_vec();
+    };
+    let (Some(comp_dir), Some(comp_count)) =
+        (completion_decoded.direction_index, completion_decoded.count)
+    else {
+        return completion_tokens.to_vec();
+    };
+    let (Some(prompt_dir), Some(prompt_count)) =
+        (prompt_decoded.direction_index, prompt_decoded.count)
+    else {
+        return completion_tokens.to_vec();
+    };
+
+    // Only adjust if same mode+direction (the constraint should guarantee this)
+    if completion_decoded.mode_index != prompt_decoded.mode_index || comp_dir != prompt_dir {
+        return completion_tokens.to_vec();
+    }
+
+    let remaining = comp_count.saturating_sub(prompt_count);
+    if remaining == 0 {
+        // The model chose the exact count the user drew — skip first token entirely
+        completion_tokens[1..].to_vec()
+    } else {
+        let mut display = Vec::with_capacity(completion_tokens.len());
+        display.push(tokenizer.token_from_components(
+            completion_decoded.mode_index,
+            comp_dir,
+            remaining,
+        ));
+        display.extend_from_slice(&completion_tokens[1..]);
+        display
+    }
 }
 
 fn interactive_grid_size(tokenizer: &StrokeTokenizer) -> usize {
@@ -1241,6 +1394,52 @@ fn grid_point_from_event(
     }
 }
 
+/// During a drag, snap the pointer to one of the 8 neighbors of `anchor`
+/// (or `anchor` itself).  The pointer must be within a snap radius of a
+/// neighbor dot before the connection is drawn — this prevents the line
+/// from appearing before the pointer visually reaches the target dot.
+fn grid_point_from_event_constrained(
+    event: &PointerEvent,
+    stage_bounds: StageBounds,
+    grid_size: usize,
+    anchor: GridPoint,
+) -> GridPoint {
+    let point = event.data().element_coordinates();
+    let max_index = grid_size.saturating_sub(1) as i32;
+    // Raw continuous position in grid coordinates (not rounded).
+    let raw_x = (point.x.clamp(0.0, stage_bounds.width) / stage_bounds.width.max(1.0))
+        * grid_size as f64
+        - 0.5;
+    let raw_y = (point.y.clamp(0.0, stage_bounds.height) / stage_bounds.height.max(1.0))
+        * grid_size as f64
+        - 0.5;
+
+    // Snap radius: the pointer must be within this distance (squared) of a
+    // neighbor dot to connect to it.  0.45² = 0.2025 grid units².
+    const SNAP_RADIUS_SQ: f64 = 0.45 * 0.45;
+
+    let mut best = anchor;
+    let mut best_dist = f64::MAX;
+    for dy in -1..=1_i32 {
+        for dx in -1..=1_i32 {
+            if dx == 0 && dy == 0 {
+                continue; // skip anchor itself
+            }
+            let cx = anchor.x + dx;
+            let cy = anchor.y + dy;
+            if cx < 0 || cy < 0 || cx > max_index || cy > max_index {
+                continue;
+            }
+            let dist = (raw_x - cx as f64).powi(2) + (raw_y - cy as f64).powi(2);
+            if dist < best_dist && dist <= SNAP_RADIUS_SQ {
+                best_dist = dist;
+                best = GridPoint { x: cx, y: cy };
+            }
+        }
+    }
+    best
+}
+
 fn grid_path_data(points: &[(i32, i32)]) -> Option<String> {
     let mut points = points.iter();
     let &(first_x, first_y) = points.next()?;
@@ -1258,55 +1457,11 @@ fn append_tokens_for_path(
     to: GridPoint,
     is_draw: bool,
 ) {
-    // Use Bresenham-style rasterization to produce smooth diagonal lines
-    // instead of the L-shaped paths that signum-only walking creates.
-    //
-    // For a line from (0,0) to (3,7) the old code produced SE_3 then S_4
-    // (an L-shape). This version interleaves diagonal and cardinal steps
-    // to approximate the true line: e.g. S, SE, S, SE, S, SE, S.
-    let total_dx = to.x - from.x;
-    let total_dy = to.y - from.y;
-    let abs_dx = total_dx.unsigned_abs() as usize;
-    let abs_dy = total_dy.unsigned_abs() as usize;
-    let step_x = total_dx.signum();
-    let step_y = total_dy.signum();
-
-    // Decompose into `minor` diagonal steps and `major - minor` cardinal
-    // steps along the longer axis, then interleave them evenly.
-    let minor = abs_dx.min(abs_dy);
-    let major = abs_dx.max(abs_dy);
-    if major == 0 {
-        return;
-    }
-
-    let (cardinal_dx, cardinal_dy) = if abs_dx >= abs_dy {
-        (step_x, 0)
-    } else {
-        (0, step_y)
-    };
-    let diagonal = (step_x, step_y);
-
-    // Bresenham-style interleave: distribute `minor` diagonal steps evenly
-    // among `major` total steps.  Each step is either cardinal-only or
-    // diagonal depending on the accumulated error.
-    let mut steps: Vec<(i32, i32)> = Vec::with_capacity(major);
-    let mut error: isize = 0;
-    for _ in 0..major {
-        error += minor as isize;
-        if 2 * error >= major as isize {
-            steps.push(diagonal);
-            error -= major as isize;
-        } else {
-            steps.push((cardinal_dx, cardinal_dy));
-        }
-    }
-
-    // Run-length encode consecutive same-direction steps into tokens.
     let mode = if is_draw { 1u32 } else { 0 };
     let mut current = from;
-    let mut i = 0;
-    while i < steps.len() {
-        let (dx, dy) = steps[i];
+    while current != to {
+        let dx = (to.x - current.x).signum();
+        let dy = (to.y - current.y).signum();
         let direction_index = direction_index_from_delta(dx, dy);
         let legal_limit = tokenizer
             .legal_count_limit((current.x, current.y), direction_index)
@@ -1314,121 +1469,56 @@ fn append_tokens_for_path(
             .max(1);
 
         let mut count = 0usize;
-        while i < steps.len() && count < legal_limit {
-            if steps[i] != (dx, dy) {
+        while current != to && count < legal_limit {
+            let next_dx = (to.x - current.x).signum();
+            let next_dy = (to.y - current.y).signum();
+            if next_dx != dx || next_dy != dy {
                 break;
             }
             current.x += dx;
             current.y += dy;
             count += 1;
-            i += 1;
         }
 
         if count == 0 {
             break;
         }
 
-        prompt_tokens.push(tokenizer.token_from_components(mode, direction_index, count));
-    }
-}
-
-/// Pixel-perfect filter: removes L-shaped corners from the end of the token
-/// list.  When two consecutive count-1 draw tokens form perpendicular cardinal
-/// steps (e.g. E then S), the first is redundant — removing it yields a
-/// smoother diagonal (the second step effectively becomes SE).  This mirrors
-/// the approach used by Aseprite and other pixel-art editors.
-///
-/// The filter inspects the last three tokens (A, B, C) and removes B when:
-///   - A, B, and C are all draw tokens with count 1
-///   - B is cardinal (not diagonal)
-///   - A's direction ≠ B's direction ≠ C's direction  (a direction change at B)
-///   - A and C move in the same direction             (B is a detour)
-///
-/// Additionally handles the simpler two-token tail case: if the last two
-/// tokens are perpendicular cardinals with count 1, replace them with a
-/// single diagonal.
-fn pixel_perfect_filter(tokenizer: &StrokeTokenizer, tokens: &mut Vec<u32>) {
-    if tokens.len() < 2 {
-        return;
-    }
-
-    // Decode the last two (and optionally three) tokens.
-    let len = tokens.len();
-    let dec_last = tokenizer.decode_segment_token(tokens[len - 1]);
-    let dec_prev = tokenizer.decode_segment_token(tokens[len - 2]);
-
-    let (Some(last), Some(prev)) = (dec_last, dec_prev) else {
-        return;
-    };
-
-    // Both must be draw-mode, count-1 tokens.
-    if last.mode_index != 1 || prev.mode_index != 1 {
-        return;
-    }
-    if last.count != Some(1) || prev.count != Some(1) {
-        return;
-    }
-
-    let last_dir = last.direction_index.unwrap();
-    let prev_dir = prev.direction_index.unwrap();
-
-    if last_dir == prev_dir {
-        return;
-    }
-
-    // Compute the deltas for both directions.
-    let prev_delta = delta_from_direction_index(prev_dir);
-    let last_delta = delta_from_direction_index(last_dir);
-
-    let combined_dx = prev_delta.0 + last_delta.0;
-    let combined_dy = prev_delta.1 + last_delta.1;
-
-    // The combination must itself be a valid single-step direction (one of
-    // the 8 directions).  Two perpendicular cardinals combine into a diagonal;
-    // other combinations (e.g. opposite directions) do not.
-    if combined_dx.abs() > 1 || combined_dy.abs() > 1 {
-        return;
-    }
-    if combined_dx == 0 && combined_dy == 0 {
-        return;
-    }
-
-    // Three-token check: if there is a token before prev, use the A-B-C
-    // pattern.  Remove B (prev) only when A and C share a direction,
-    // confirming B was an unintentional detour.
-    if len >= 3 {
-        if let Some(before) = tokenizer.decode_segment_token(tokens[len - 3]) {
-            if before.mode_index == 1
-                && before.count == Some(1)
-                && before.direction_index == last.direction_index
-            {
-                // A == C direction — remove B (the middle corner pixel).
-                tokens.remove(len - 2);
-                return;
+        // RLE merging: if the last token has the same mode+direction, merge by
+        // incrementing the count instead of pushing a new token.
+        let merged = if let Some(&last_token) = prompt_tokens.last() {
+            if let Some(decoded) = tokenizer.decode_segment_token(last_token) {
+                if decoded.mode_index == mode
+                    && decoded.direction_index == Some(direction_index)
+                {
+                    let prev_count = decoded.count.unwrap_or(0);
+                    let new_count = prev_count + count;
+                    // Check the limit from the cursor before the previous token
+                    let prev_cursor =
+                        tokenizer.cursor_after_tokens(&prompt_tokens[..prompt_tokens.len() - 1]);
+                    let merge_limit = tokenizer
+                        .legal_count_limit(prev_cursor, direction_index)
+                        .min(tokenizer.max_count());
+                    if new_count <= merge_limit {
+                        *prompt_tokens.last_mut().unwrap() =
+                            tokenizer.token_from_components(mode, direction_index, new_count);
+                        true
+                    } else {
+                        false
+                    }
+                } else {
+                    false
+                }
+            } else {
+                false
             }
-            // A ≠ C — this isn't clearly an L-shape artifact; leave it alone.
-            return;
+        } else {
+            false
+        };
+
+        if !merged {
+            prompt_tokens.push(tokenizer.token_from_components(mode, direction_index, count));
         }
-    }
-
-    // Two-token tail: replace both perpendicular cardinals with one diagonal.
-    let diag_dir = direction_index_from_delta(combined_dx, combined_dy);
-    tokens.pop();
-    tokens.pop();
-    tokens.push(tokenizer.token_from_components(1, diag_dir, 1));
-}
-
-fn delta_from_direction_index(dir: u32) -> (i32, i32) {
-    match dir {
-        0 => (0, -1),  // N
-        1 => (1, -1),  // NE
-        2 => (1, 0),   // E
-        3 => (1, 1),   // SE
-        4 => (0, 1),   // S
-        5 => (-1, 1),  // SW
-        6 => (-1, 0),  // W
-        7 => (-1, -1), // NW
-        _ => (0, 0),
     }
 }
 

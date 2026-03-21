@@ -226,7 +226,7 @@ async fn main() {
                 let prompt_tokens = continuation_prompt_tokens(&tokenizer, file, &runtime);
                 Some(
                     predictor
-                        .predict_greedy(&prompt_tokens[1..], runtime.sample_tokens)
+                        .predict_greedy(&prompt_tokens[1..], runtime.sample_tokens, None)
                         .unwrap_or_else(|error| {
                             panic!(
                                 "could not generate continuation sample from checkpoint: {error}"
@@ -1209,7 +1209,7 @@ async fn evaluate_interactive_continuation(
         for file in chunk {
             let prompt_tokens = continuation_prompt_tokens(tokenizer, file, runtime);
             let generated = predictor
-                .predict_greedy(&prompt_tokens[1..], runtime.sample_tokens)
+                .predict_greedy(&prompt_tokens[1..], runtime.sample_tokens, None)
                 .unwrap_or_else(|error| {
                     panic!(
                         "interactive continuation evaluation failed at file {}: {error}",
@@ -1581,7 +1581,7 @@ mod tests {
         let predictor = LivePredictor::load(to_shared_runtime_config(&runtime), true)
             .unwrap_or_else(|error| panic!("failed to load GGUF predictor: {error}"));
         let actual = predictor
-            .predict_greedy(&prompt, runtime.sample_tokens)
+            .predict_greedy(&prompt, runtime.sample_tokens, None)
             .unwrap_or_else(|error| panic!("failed to generate GGUF continuation: {error}"));
 
         assert_eq!(actual, expected);

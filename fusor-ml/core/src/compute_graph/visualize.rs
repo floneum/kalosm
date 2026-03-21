@@ -146,29 +146,6 @@ impl GraphVisPass {
         self.identities.insert(key, id.clone());
     }
 
-    fn visit_index_select(
-        &mut self,
-        key: NodeIndex,
-        operation: &crate::index_select::IndexSelectOperation,
-    ) {
-        let input = self.identities.get(&operation.input).unwrap();
-        let value = self.identities.get(&operation.indexes).unwrap();
-        let output_layout = self.layout_pass.output_layout.get(&key).unwrap();
-        let id = Identity::quoted(format!("index_select ({}) #{:?}", output_layout, key));
-        self.statements.push(Stmt::Node {
-            id: id.clone(),
-            port: None,
-            attr: None,
-        });
-        self.statements.push(Stmt::Edge(
-            Edge::head_node(input.clone(), None).arrow_to_node(id.clone(), None),
-        ));
-        self.statements.push(Stmt::Edge(
-            Edge::head_node(value.clone(), None).arrow_to_node(id.clone(), None),
-        ));
-        self.identities.insert(key, id.clone());
-    }
-
     fn visit_dequantize(
         &mut self,
         key: NodeIndex,
@@ -192,33 +169,6 @@ impl GraphVisPass {
             port: None,
             attr: None,
         });
-        self.identities.insert(key, id.clone());
-    }
-
-    fn visit_where_cond(
-        &mut self,
-        key: NodeIndex,
-        operation: &crate::composite::where_cond::WhereCondOperation,
-    ) {
-        let condition = self.identities.get(&operation.condition).unwrap();
-        let on_true = self.identities.get(&operation.on_true).unwrap();
-        let on_false = self.identities.get(&operation.on_false).unwrap();
-        let output_layout = self.layout_pass.output_layout.get(&key).unwrap();
-        let id = Identity::quoted(format!("where_cond ({}) #{:?}", output_layout, key));
-        self.statements.push(Stmt::Node {
-            id: id.clone(),
-            port: None,
-            attr: None,
-        });
-        self.statements.push(Stmt::Edge(
-            Edge::head_node(condition.clone(), None).arrow_to_node(id.clone(), None),
-        ));
-        self.statements.push(Stmt::Edge(
-            Edge::head_node(on_true.clone(), None).arrow_to_node(id.clone(), None),
-        ));
-        self.statements.push(Stmt::Edge(
-            Edge::head_node(on_false.clone(), None).arrow_to_node(id.clone(), None),
-        ));
         self.identities.insert(key, id.clone());
     }
 
@@ -299,10 +249,6 @@ impl ComputeGraphInner {
                 ComputeGraphNodeVariant::Dequantize(op) => {
                     graph_vis_pass.visit_dequantize(node, op)
                 }
-                ComputeGraphNodeVariant::IndexSelect(op) => {
-                    graph_vis_pass.visit_index_select(node, op)
-                }
-                ComputeGraphNodeVariant::WhereCond(op) => graph_vis_pass.visit_where_cond(node, op),
                 ComputeGraphNodeVariant::Custom(op) => graph_vis_pass.visit_custom(node, op),
             }
         }

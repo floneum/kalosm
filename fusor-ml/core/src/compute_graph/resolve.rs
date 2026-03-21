@@ -369,21 +369,6 @@ impl Resolver {
             ComputeGraphNodeVariant::MapLayout(op) => Some(Arc::new(op.clone())),
             ComputeGraphNodeVariant::Resize(op) => Some(Arc::new(op.clone())),
             ComputeGraphNodeVariant::SliceAssign(op) => Some(Arc::new(op.clone())),
-            ComputeGraphNodeVariant::IndexSelect(op) => {
-                // Convert IndexSelect to NaryOperation
-                // Let the nary fusion optimization handle combining with element-wise ops
-                let inputs = vec![op.input, op.indexes];
-                let rank = op.rank();
-                let expression = NaryExpr::index_select(rank, op.dimension);
-
-                let nary = NaryOperation {
-                    inputs,
-                    expression,
-                    shape: op.output_shape(),
-                    output_datatype: op.datatype,
-                };
-                Some(Arc::new(nary))
-            }
             ComputeGraphNodeVariant::QMatMul(op) => Some(Arc::new(QMatMulOperation::new(
                 op.input_datatype,
                 &op.in_shape,
@@ -391,7 +376,6 @@ impl Resolver {
                 op.matrix.clone(),
             ))),
             ComputeGraphNodeVariant::Dequantize(op) => Some(Arc::new(op.clone())),
-            ComputeGraphNodeVariant::WhereCond(op) => Some(Arc::new(op.to_nary())),
             ComputeGraphNodeVariant::Tensor(_) => None, // Handled in execution loop
             ComputeGraphNodeVariant::Custom(op) => Some(op.clone()),
         }
@@ -418,13 +402,9 @@ impl Resolver {
                 .neighbors_undirected(node_idx)
                 .collect();
 
-            // 1. Convert where_cond to nary (canonical form)
-            // 2. Fuse naries together (combine expression trees)
-            // 3. Try to fuse resulting nary into specialized ops (reduce, matmul, etc.)
-            // Note: IndexSelect is converted to Nary in lower_node, not during optimization,
-            // because its custom indexing pattern doesn't fuse well with other naries.
-            let changed = self.try_convert_where_cond_to_nary(graph, node_idx)
-                || self.try_fuse_naries(graph, node_idx)
+            // 1. Fuse naries together (combine expression trees)
+            // 2. Try to fuse resulting nary into specialized ops (reduce, matmul, etc.)
+            let changed = self.try_fuse_naries(graph, node_idx)
                 || self.try_fuse_into_reduce(graph, node_idx)
                 || self.try_fuse_into_matmul(graph, node_idx)
                 || self.try_fuse_into_dequantize(graph, node_idx);
@@ -505,26 +485,6 @@ impl Resolver {
     }
 
     // Rules
-
-    /// Convert a WhereCond operation to a Nary operation with Select expression.
-    fn try_convert_where_cond_to_nary(
-        &mut self,
-        graph: &mut ComputeGraphInner,
-        node_idx: ExecutionNodeIndex,
-    ) -> bool {
-        let node_variant = self.execution_graph[node_idx].variant.clone();
-
-        let ComputeGraphNodeVariant::WhereCond(op) = node_variant else {
-            return false;
-        };
-
-        let nary = op.to_nary();
-
-        self.execution_graph[node_idx].variant = ComputeGraphNodeVariant::Nary(nary.clone());
-        self.add_physical_dependencies(graph, node_idx, &nary.inputs);
-
-        true
-    }
 
     /// Fuse a Nary operation with all of its Nary inputs.
     fn try_fuse_naries(

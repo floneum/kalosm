@@ -14,9 +14,9 @@ mod visualize;
 
 use crate::{
     DataTypeEnum, Device, MatMulOperation, QMatrix,
-    ReduceOperation, composite::where_cond::WhereCondOperation,
+    ReduceOperation,
     compute_graph::resolve::ResolverResult, dequantize::DequantizeOperation,
-    index_select::IndexSelectOperation, map_layout::MapLayoutOperation, mir::operation::Operation,
+    map_layout::MapLayoutOperation, mir::operation::Operation,
     nary_wise::NaryOperation, quantized::matmul::QMatMulOperation, resize::ResizeOperation,
     slice_assign::SliceAssignOperation, tensor::TensorData, visit_tiled::MaybeQData,
 };
@@ -74,10 +74,6 @@ impl ComputeGraph {
         self.create_node(ComputeGraphNodeVariant::SliceAssign(op))
     }
 
-    pub(crate) fn create_index_select(&self, op: IndexSelectOperation) -> NodeIndex {
-        self.create_node(ComputeGraphNodeVariant::IndexSelect(op))
-    }
-
     pub(crate) fn create_tensor(&self, op: TensorData) -> NodeIndex {
         self.create_node(ComputeGraphNodeVariant::Tensor(op))
     }
@@ -90,10 +86,6 @@ impl ComputeGraph {
 
     pub(crate) fn create_custom(&self, op: Arc<dyn Operation + Send + Sync>) -> NodeIndex {
         self.create_node(ComputeGraphNodeVariant::Custom(op))
-    }
-
-    pub(crate) fn create_where_cond(&self, op: WhereCondOperation) -> NodeIndex {
-        self.create_node(ComputeGraphNodeVariant::WhereCond(op))
     }
 
     pub(crate) fn resolve(&self, key: NodeIndex, device: &Device) -> ResolverResult {
@@ -181,8 +173,6 @@ pub(crate) enum ComputeGraphNodeVariant {
     QMatMul(QMatMulOperation),
     Tensor(TensorData),
     Reduce(ReduceOperation),
-    IndexSelect(IndexSelectOperation),
-    WhereCond(WhereCondOperation),
     Custom(Arc<dyn Operation + Send + Sync>),
 }
 
@@ -207,15 +197,6 @@ impl ComputeGraphNodeVariant {
             ComputeGraphNodeVariant::SliceAssign(op) => {
                 f(op.input);
                 f(op.value);
-            }
-            ComputeGraphNodeVariant::IndexSelect(op) => {
-                f(op.input);
-                f(op.indexes);
-            }
-            ComputeGraphNodeVariant::WhereCond(op) => {
-                f(op.condition);
-                f(op.on_true);
-                f(op.on_false);
             }
             ComputeGraphNodeVariant::Dequantize(_) => {}
             ComputeGraphNodeVariant::Tensor(_) => {}

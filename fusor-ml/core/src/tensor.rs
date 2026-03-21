@@ -14,7 +14,6 @@ use crate::{
     Device, Dim, Layout, MatMulOperation, MatMulParams,
     ReduceFunction, ReduceOperation,
     compute_graph::NodeIndex,
-    index_select::IndexSelectOperation,
     map_layout::MapLayoutOperation,
     mir::operation::Operation,
     nary_wise::{NaryExpr, NaryFunction, NaryOperation},
@@ -256,17 +255,6 @@ impl LazyTensorData {
         Self::from_parts(device, info, key)
     }
 
-    pub(crate) fn where_cond(
-        &self,
-        operation: crate::composite::where_cond::WhereCondOperation,
-    ) -> Self {
-        let device = self.device.clone();
-        let info = self.info.clone();
-        let key = device.compute_graph().create_where_cond(operation);
-
-        Self::from_parts(device, info, key)
-    }
-
     pub(crate) fn unary_nary(&self, function: NaryFunction) -> Self {
         let device = self.device.clone();
         let mut info = self.info.clone();
@@ -363,15 +351,6 @@ impl LazyTensorData {
         let device = self.device.clone();
         let info = self.info.clone();
         let key = device.compute_graph().create_slice_assign(op);
-
-        Self::from_parts(device, info, key)
-    }
-
-    pub(crate) fn index_select(&self, op: IndexSelectOperation) -> Self {
-        let device = self.device.clone();
-        let mut info = self.info.clone();
-        info.shape = op.output_shape();
-        let key = device.compute_graph().create_index_select(op);
 
         Self::from_parts(device, info, key)
     }
@@ -1034,18 +1013,6 @@ impl<D: DataType, const R: usize> Tensor<R, D> {
         let op =
             SliceAssignOperation::new(self.data.key, other.data.key, slices.into(), input_shape);
         Self::from_parts(self.data.slice_assign(op))
-    }
-
-    pub(crate) fn add_index_select(&self, dimension: usize, indexes: &Tensor<1, u32>) -> Self {
-        let op = IndexSelectOperation::new(
-            self.data.key,
-            indexes.data.key,
-            self.datatype(),
-            dimension,
-            self.shape(),
-            indexes.shape(),
-        );
-        Self::from_parts(self.data.index_select(op))
     }
 
     pub(crate) fn reduce<const OUT: usize>(
