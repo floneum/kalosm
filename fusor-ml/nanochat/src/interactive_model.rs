@@ -21,7 +21,9 @@ struct ModelShape {
 pub struct InteractiveNanoChatModel {
     shape: ModelShape,
     use_extra_norms: bool,
-    wte: Tensor<2, f32>,
+    token_input_mode: Tensor<2, f32>,
+    token_input_direction: Tensor<2, f32>,
+    token_input_count: Tensor<2, f32>,
     wpe: Option<Tensor<2, f32>>,
     canvas_state: Option<CanvasStateEmbeddings>,
     rotary: Option<RopeCache>,
@@ -196,7 +198,12 @@ impl InteractiveNanoChatModel {
             );
         }
 
-        let wte: Tensor<2, f32> = vb.get("token_embd.weight", device)?.dequantize();
+        let token_input_mode: Tensor<2, f32> =
+            vb.get("token_input_mode.weight", device)?.dequantize();
+        let token_input_direction: Tensor<2, f32> =
+            vb.get("token_input_direction.weight", device)?.dequantize();
+        let token_input_count: Tensor<2, f32> =
+            vb.get("token_input_count.weight", device)?.dequantize();
         let wpe = if vb.contains_key("position_embd.weight") {
             Some(vb.get("position_embd.weight", device)?.dequantize())
         } else if use_rope {
@@ -271,7 +278,9 @@ impl InteractiveNanoChatModel {
         Ok(Self {
             shape,
             use_extra_norms,
-            wte,
+            token_input_mode,
+            token_input_direction,
+            token_input_count,
             wpe,
             canvas_state,
             rotary,
@@ -296,17 +305,23 @@ impl InteractiveNanoChatModel {
     #[allow(dead_code)]
     pub fn forward(
         &self,
-        token_inputs: &Tensor<2, u32>,
+        mode_inputs: &Tensor<2, u32>,
+        direction_inputs: &Tensor<2, u32>,
+        count_inputs: &Tensor<2, u32>,
         position_inputs: &Tensor<2, u32>,
         cursor_x_inputs: &Tensor<2, u32>,
         cursor_y_inputs: &Tensor<2, u32>,
         pen_state_inputs: &Tensor<2, u32>,
         causal_mask: &AttentionMask<f32>,
     ) -> InteractiveActionLogits {
-        let batch_size = token_inputs.shape()[0];
-        let token_embeddings: Tensor<3, f32> =
-            Embedding::new_from_tensor(self.wte.clone()).forward(token_inputs);
-        let mut x: Tensor<3, f32> = token_embeddings;
+        let batch_size = mode_inputs.shape()[0];
+        let mode_emb: Tensor<3, f32> =
+            Embedding::new_from_tensor(self.token_input_mode.clone()).forward(mode_inputs);
+        let dir_emb: Tensor<3, f32> =
+            Embedding::new_from_tensor(self.token_input_direction.clone()).forward(direction_inputs);
+        let count_emb: Tensor<3, f32> =
+            Embedding::new_from_tensor(self.token_input_count.clone()).forward(count_inputs);
+        let mut x: Tensor<3, f32> = (mode_emb + dir_emb + count_emb).to_concrete();
         if let Some(wpe) = &self.wpe {
             let position_embeddings: Tensor<3, f32> =
                 Embedding::new_from_tensor(wpe.clone()).forward(position_inputs);

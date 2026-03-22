@@ -2,7 +2,8 @@ use crate::{
     config::RuntimeConfig,
     data::{
         CanvasStateIndexes, CanvasStateSpec, DatasetSplit, StrokeTokenizer, autoregressive_context,
-        canvas_state_indexes, load_dataset_source, position_indexes, tokens_to_svg_string,
+        canvas_state_indexes, load_dataset_source, position_indexes, token_component_indexes,
+        tokens_to_svg_string,
     },
     interactive_model::InteractiveNanoChatModel,
 };
@@ -421,10 +422,13 @@ async fn generate_interactive_completion(
             );
         }
 
+        let components = token_component_indexes(tokenizer, std::slice::from_ref(&context));
+        let mode_inputs: Tensor<2, u32> = Tensor::new(device, &components.mode);
+        let direction_inputs: Tensor<2, u32> = Tensor::new(device, &components.direction);
+        let count_inputs: Tensor<2, u32> = Tensor::new(device, &components.count);
         let position_values = position_indexes(1, context.len().max(1));
         let position_inputs: Tensor<2, u32> = Tensor::new(device, &position_values);
         let causal_mask = fusor::cache::AttentionMask::<f32>::causal(device, context.len().max(1));
-        let token_inputs: Tensor<2, u32> = Tensor::new(device, std::slice::from_ref(&context));
         let (cursor_x_inputs, cursor_y_inputs, pen_state_inputs) = canvas_state_tensors(
             device,
             tokenizer,
@@ -432,7 +436,9 @@ async fn generate_interactive_completion(
             model.canvas_state_spec(),
         );
         let logits = model.forward(
-            &token_inputs,
+            &mode_inputs,
+            &direction_inputs,
+            &count_inputs,
             &position_inputs,
             &cursor_x_inputs,
             &cursor_y_inputs,
@@ -747,6 +753,7 @@ mod tests {
             test_examples: 1,
             dataset_path: Some(PathBuf::from("/path/that/does/not/exist.json")),
             include_synthetic_data: false,
+            synthetic_multiplier: 1,
             gguf_path,
             sample_output_path: PathBuf::from("sample.svg"),
         }

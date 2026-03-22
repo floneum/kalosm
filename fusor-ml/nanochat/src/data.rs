@@ -7,7 +7,12 @@ use std::{
 
 use fusor::VarBuilder;
 use fusor_gguf::GgufValue;
-use rand::{Rng, SeedableRng, rngs::StdRng, seq::SliceRandom};
+use rand::{
+    Rng, SeedableRng,
+    distr::{Distribution, weighted::WeightedIndex},
+    rngs::StdRng,
+    seq::SliceRandom,
+};
 use serde::Deserialize;
 
 use crate::config::RuntimeConfig;
@@ -19,6 +24,8 @@ const CANVAS_SIZE: f32 = 128.0;
 const CANVAS_PADDING: f32 = 14.0;
 pub const ACTION_MODE_COUNT: usize = 3;
 pub const ACTION_DIRECTION_COUNT: usize = 8;
+/// Input mode count includes BOS (index 3) in addition to Travel/Draw/Stop.
+pub const INPUT_MODE_COUNT: usize = 4;
 const MAX_STROKE_PERMUTATIONS: usize = 24;
 
 #[derive(Clone)]
@@ -55,6 +62,9 @@ fn inferred_max_count(tokens: &[String]) -> usize {
 
 pub struct SourceDataset {
     files: Vec<SourceFile>,
+    /// Per-file sampling weights. Empty means uniform (weight 1.0 for all).
+    /// When non-empty, `weights.len() == files.len()`.
+    weights: Vec<f32>,
 }
 
 #[derive(Clone)]
@@ -87,6 +97,40 @@ pub struct CanvasStateIndexes {
     pub cursor_x: Vec<Vec<u32>>,
     pub cursor_y: Vec<Vec<u32>>,
     pub pen_state: Vec<Vec<u32>>,
+}
+
+pub struct TokenComponentIndexes {
+    pub mode: Vec<Vec<u32>>,
+    pub direction: Vec<Vec<u32>>,
+    pub count: Vec<Vec<u32>>,
+}
+
+pub fn token_component_indexes(
+    tokenizer: &StrokeTokenizer,
+    token_windows: &[Vec<u32>],
+) -> TokenComponentIndexes {
+    let mut mode = Vec::with_capacity(token_windows.len());
+    let mut direction = Vec::with_capacity(token_windows.len());
+    let mut count = Vec::with_capacity(token_windows.len());
+    for window in token_windows {
+        let mut mode_row = Vec::with_capacity(window.len());
+        let mut direction_row = Vec::with_capacity(window.len());
+        let mut count_row = Vec::with_capacity(window.len());
+        for &token in window {
+            let (m, d, c) = tokenizer.decode_input_token(token);
+            mode_row.push(m);
+            direction_row.push(d);
+            count_row.push(c);
+        }
+        mode.push(mode_row);
+        direction.push(direction_row);
+        count.push(count_row);
+    }
+    TokenComponentIndexes {
+        mode,
+        direction,
+        count,
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -681,6 +725,29 @@ impl StrokeTokenizer {
         })
     }
 
+    /// Decompose any token (including BOS) into (mode_index, direction_index, count_index)
+    /// for structured input embeddings.
+    /// - BOS: (3, 0, 0)
+    /// - EOT: (2, 0, 0)
+    /// - TRAVEL: (0, dir_index, count-1)
+    /// - DRAW: (1, dir_index, count-1)
+    pub fn decode_input_token(&self, token: u32) -> (u32, u32, u32) {
+        if token == self.bos_token {
+            return (3, 0, 0);
+        }
+        if token == self.eot_token {
+            return (2, 0, 0);
+        }
+        let segment = self
+            .decode_segment_token(token)
+            .unwrap_or_else(|| panic!("unknown input token {}", self.token_name(token)));
+        (
+            segment.mode_index,
+            segment.direction_index.unwrap_or(0),
+            segment.count.map(|c| (c - 1) as u32).unwrap_or(0),
+        )
+    }
+
     fn travel_token(&self, direction: Direction, count: usize) -> u32 {
         self.segment_token(ActionMode::Travel, direction, count)
     }
@@ -801,9 +868,16 @@ impl SourceDataset {
             };
         }
 
-        let mut sampled = (0..config.batch_size)
-            .map(|_| rng.random_range(0..self.files.len()))
-            .collect::<Vec<_>>();
+        let mut sampled = if self.weights.is_empty() {
+            (0..config.batch_size)
+                .map(|_| rng.random_range(0..self.files.len()))
+                .collect::<Vec<_>>()
+        } else {
+            let dist = WeightedIndex::new(&self.weights).expect("invalid sampling weights");
+            (0..config.batch_size)
+                .map(|_| dist.sample(rng))
+                .collect::<Vec<_>>()
+        };
         sampled.sort_by_key(|&index| Reverse(self.window_len_at(index, config.block_size)));
 
         self.build_batch(&sampled, pad_token, config.block_size)
@@ -819,7 +893,18 @@ impl SourceDataset {
             return Vec::new();
         }
 
-        let mut indices: Vec<usize> = (0..self.files.len()).collect();
+        let mut indices: Vec<usize> = if self.weights.is_empty() {
+            (0..self.files.len()).collect()
+        } else {
+            let mut expanded = Vec::new();
+            for (i, &w) in self.weights.iter().enumerate() {
+                let repeats = w.round().max(1.0) as usize;
+                for _ in 0..repeats {
+                    expanded.push(i);
+                }
+            }
+            expanded
+        };
         indices.shuffle(rng);
         let batch_size = config.batch_size.max(1);
         let bucket_size = batch_size.saturating_mul(32).max(batch_size);
@@ -838,7 +923,15 @@ impl SourceDataset {
     }
 
     pub fn steps_per_epoch(&self, _block_size: usize, batch_size: usize) -> usize {
-        self.files.len().div_ceil(batch_size).max(1)
+        let effective_examples = if self.weights.is_empty() {
+            self.files.len()
+        } else {
+            self.weights
+                .iter()
+                .map(|&w| w.round().max(1.0) as usize)
+                .sum()
+        };
+        effective_examples.div_ceil(batch_size).max(1)
     }
 
     pub fn evaluation_batches(&self, pad_token: u32, config: &RuntimeConfig) -> Vec<Batch> {
@@ -967,12 +1060,14 @@ fn load_hybrid_dataset(dataset_path: &Path, runtime: &RuntimeConfig) -> DatasetS
         "hybrid dataset requires synthetic and real vocabularies to match"
     );
 
+    let multiplier = runtime.synthetic_multiplier.max(1);
+
     let synthetic_split = synthetic_dataset_split_with_sizes(
         &tokenizer,
         runtime.seed,
-        real_train_examples,
-        real_validation_examples,
-        real_test_examples,
+        real_train_examples * multiplier,
+        real_validation_examples * multiplier,
+        real_test_examples * multiplier,
     );
     let total_train_examples = real_train_examples + synthetic_split.train.num_docs();
     let total_validation_examples =
@@ -986,19 +1081,20 @@ fn load_hybrid_dataset(dataset_path: &Path, runtime: &RuntimeConfig) -> DatasetS
 
     DatasetSource {
         label: format!(
-            "hybrid-stroke-autocomplete real=[{real_label}] synthetic={}/{}/{} total={}/{}/{}",
+            "hybrid-stroke-autocomplete real=[{real_label}] synthetic={}/{}/{} multiplier={} total={}/{}/{}",
             synthetic_split.train.num_docs(),
             synthetic_split.validation.num_docs(),
             synthetic_split.test.num_docs(),
+            multiplier,
             total_train_examples,
             total_validation_examples,
             total_test_examples
         ),
         tokenizer,
         split: DatasetSplit {
-            train: merge_source_datasets(train, synthetic_split.train),
-            validation: merge_source_datasets(validation, synthetic_split.validation),
-            test: merge_source_datasets(test, synthetic_split.test),
+            train: merge_source_datasets(train, synthetic_split.train, multiplier),
+            validation: merge_source_datasets(validation, synthetic_split.validation, multiplier),
+            test: merge_source_datasets(test, synthetic_split.test, multiplier),
         },
     }
 }
@@ -1067,9 +1163,9 @@ fn load_feather_dataset(dataset_path: &Path, runtime: &RuntimeConfig) -> Dataset
         ),
         tokenizer,
         split: DatasetSplit {
-            train: SourceDataset { files: train },
-            validation: SourceDataset { files: validation },
-            test: SourceDataset { files: test },
+            train: SourceDataset { files: train, weights: Vec::new() },
+            validation: SourceDataset { files: validation, weights: Vec::new() },
+            test: SourceDataset { files: test, weights: Vec::new() },
         },
     }
 }
@@ -1552,15 +1648,30 @@ fn synthetic_dataset_split_with_sizes(
     }
 }
 
-fn merge_source_datasets(mut primary: SourceDataset, secondary: SourceDataset) -> SourceDataset {
-    let SourceDataset {
-        files: secondary_files,
-    } = secondary;
-    primary.files.extend(secondary_files);
-    primary
+fn merge_source_datasets(
+    primary: SourceDataset,
+    secondary: SourceDataset,
+    synthetic_multiplier: usize,
+) -> SourceDataset {
+    let real_count = primary.files.len();
+    let synthetic_count = secondary.files.len();
+    let real_weight = synthetic_multiplier.max(1) as f32;
+    let synthetic_weight = 1.0f32;
+
+    let mut weights = Vec::with_capacity(real_count + synthetic_count);
+    weights.extend(std::iter::repeat_n(real_weight, real_count));
+    weights.extend(std::iter::repeat_n(synthetic_weight, synthetic_count));
+
+    let mut paired: Vec<(SourceFile, f32)> = primary
         .files
-        .sort_by(|left, right| left.path.cmp(&right.path));
-    primary
+        .into_iter()
+        .chain(secondary.files)
+        .zip(weights)
+        .collect();
+    paired.sort_by(|(a, _), (b, _)| a.path.cmp(&b.path));
+
+    let (files, weights): (Vec<_>, Vec<_>) = paired.into_iter().unzip();
+    SourceDataset { files, weights }
 }
 
 pub fn write_tokens_to_svg_file(
@@ -1900,7 +2011,7 @@ fn generate_split(
             )
         })
         .collect();
-    SourceDataset { files }
+    SourceDataset { files, weights: Vec::new() }
 }
 
 fn generate_source_file(
@@ -2702,6 +2813,7 @@ mod tests {
             test_examples: 0,
             dataset_path: None,
             include_synthetic_data: false,
+            synthetic_multiplier: 1,
             gguf_path: "test.gguf".into(),
             sample_output_path: "sample.svg".into(),
         }
@@ -2754,6 +2866,7 @@ mod tests {
                 test_file("c.stroke", 5),
                 test_file("d.stroke", 9),
             ],
+            weights: Vec::new(),
         };
         let config = test_runtime(32, 2, 2);
         let mut rng = StdRng::seed_from_u64(7);
@@ -2790,6 +2903,7 @@ mod tests {
                 test_file("long.stroke", 8),
                 test_file("mid.stroke", 6),
             ],
+            weights: Vec::new(),
         };
         let config = test_runtime(32, 2, 2);
         let batches = dataset.evaluation_batches(77, &config);
@@ -2982,6 +3096,7 @@ mod tests {
             test_examples: 1,
             dataset_path: Some(dataset_path.clone()),
             include_synthetic_data: true,
+            synthetic_multiplier: 1,
             gguf_path: "test.gguf".into(),
             sample_output_path: "sample.svg".into(),
         };
@@ -3069,6 +3184,7 @@ mod tests {
             test_examples: 2,
             dataset_path: None,
             include_synthetic_data: false,
+            synthetic_multiplier: 1,
             gguf_path: "test.gguf".into(),
             sample_output_path: "sample.svg".into(),
         };
@@ -3121,6 +3237,7 @@ mod tests {
             test_examples: ShapeKind::all().len(),
             dataset_path: None,
             include_synthetic_data: false,
+            synthetic_multiplier: 1,
             gguf_path: "test.gguf".into(),
             sample_output_path: "sample.svg".into(),
         };

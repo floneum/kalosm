@@ -40,6 +40,7 @@ pub struct RuntimeConfig {
     pub test_examples: usize,
     pub dataset_path: Option<PathBuf>,
     pub include_synthetic_data: bool,
+    pub synthetic_multiplier: usize,
     pub gguf_path: PathBuf,
     pub sample_output_path: PathBuf,
 }
@@ -139,6 +140,7 @@ impl RuntimeConfig {
             test_examples: try_read_env("NANOCHAT_TEST_EXAMPLES", 16)?,
             dataset_path: try_read_env_path_optional("NANOCHAT_DATASET_PATH")?,
             include_synthetic_data: try_read_env("NANOCHAT_INCLUDE_SYNTHETIC_DATA", false)?,
+            synthetic_multiplier: try_read_env("NANOCHAT_SYNTHETIC_MULTIPLIER", 1)?,
             gguf_path: try_read_env_path("NANOCHAT_GGUF_PATH", "nanochat.gguf")?,
             sample_output_path: try_read_env_path(
                 "NANOCHAT_SAMPLE_OUTPUT_PATH",

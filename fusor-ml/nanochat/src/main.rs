@@ -7,7 +7,8 @@ use fusor_gguf::{
 use fusor_nanochat::data::{
     CanvasStateIndexes, CanvasStateSpec, DatasetSplit, SourceDataset, SourceFile, StrokeTokenizer,
     autoregressive_context, canvas_state_indexes, load_dataset_source, position_indexes,
-    windows_to_token_inputs, windows_to_token_targets, write_tokens_to_svg_file,
+    token_component_indexes, windows_to_token_inputs, windows_to_token_targets,
+    write_tokens_to_svg_file,
 };
 use fusor_nanochat::{
     ComparisonReport, LivePredictor, RuntimeConfig as SharedRuntimeConfig,
@@ -122,7 +123,11 @@ async fn main() {
 
                 let input_values = windows_to_token_inputs(&batch.windows);
                 let target_values = windows_to_token_targets(&batch.windows);
-                let token_inputs: Tensor<2, u32> = Tensor::new(&device, &input_values);
+                let components = token_component_indexes(&tokenizer, &input_values);
+                let mode_inputs: Tensor<2, u32> = Tensor::new(&device, &components.mode);
+                let direction_inputs: Tensor<2, u32> =
+                    Tensor::new(&device, &components.direction);
+                let count_inputs: Tensor<2, u32> = Tensor::new(&device, &components.count);
                 let (cursor_x_inputs, cursor_y_inputs, pen_state_inputs) = canvas_state_tensors(
                     &device,
                     &tokenizer,
@@ -138,7 +143,9 @@ async fn main() {
                     batch.seq_len,
                 );
                 let logits = model.forward(
-                    &token_inputs,
+                    &mode_inputs,
+                    &direction_inputs,
+                    &count_inputs,
                     &position_inputs,
                     &cursor_x_inputs,
                     &cursor_y_inputs,
@@ -681,10 +688,13 @@ async fn generate_completion(
 
     for _ in 0..runtime.sample_tokens {
         let (context, last_index) = autoregressive_context(&tokens, stop_token, runtime.block_size);
+        let components = token_component_indexes(tokenizer, std::slice::from_ref(&context));
+        let mode_inputs: Tensor<2, u32> = Tensor::new(device, &components.mode);
+        let direction_inputs: Tensor<2, u32> = Tensor::new(device, &components.direction);
+        let count_inputs: Tensor<2, u32> = Tensor::new(device, &components.count);
         let position_values = position_indexes(1, context.len().max(1));
         let position_inputs: Tensor<2, u32> = Tensor::new(device, &position_values);
         let causal_mask = causal_mask_tensor(model.graph(), device, 1, context.len().max(1));
-        let token_inputs: Tensor<2, u32> = Tensor::new(device, std::slice::from_ref(&context));
         let (cursor_x_inputs, cursor_y_inputs, pen_state_inputs) = canvas_state_tensors(
             device,
             tokenizer,
@@ -692,7 +702,9 @@ async fn generate_completion(
             model.canvas_state_spec(),
         );
         let logits = model.forward(
-            &token_inputs,
+            &mode_inputs,
+            &direction_inputs,
+            &count_inputs,
             &position_inputs,
             &cursor_x_inputs,
             &cursor_y_inputs,
@@ -995,11 +1007,16 @@ async fn evaluate_autoregressive_metrics(
         let position_inputs: Tensor<2, u32> = Tensor::new(device, &position_values);
         let input_values = windows_to_token_inputs(&batch.windows);
         let target_values = windows_to_token_targets(&batch.windows);
-        let token_inputs: Tensor<2, u32> = Tensor::new(device, &input_values);
+        let components = token_component_indexes(tokenizer, &input_values);
+        let mode_inputs: Tensor<2, u32> = Tensor::new(device, &components.mode);
+        let direction_inputs: Tensor<2, u32> = Tensor::new(device, &components.direction);
+        let count_inputs: Tensor<2, u32> = Tensor::new(device, &components.count);
         let (cursor_x_inputs, cursor_y_inputs, pen_state_inputs) =
             canvas_state_tensors(device, tokenizer, &input_values, model.canvas_state_spec());
         let logits = model.forward(
-            &token_inputs,
+            &mode_inputs,
+            &direction_inputs,
+            &count_inputs,
             &position_inputs,
             &cursor_x_inputs,
             &cursor_y_inputs,
@@ -1309,6 +1326,7 @@ fn to_shared_runtime_config(runtime: &RuntimeConfig) -> SharedRuntimeConfig {
         test_examples: runtime.test_examples,
         dataset_path: runtime.dataset_path.clone(),
         include_synthetic_data: runtime.include_synthetic_data,
+        synthetic_multiplier: runtime.synthetic_multiplier,
         gguf_path: runtime.gguf_path.clone(),
         sample_output_path: runtime.sample_output_path.clone(),
     }
@@ -1537,6 +1555,7 @@ mod tests {
             test_examples: 1,
             dataset_path: None,
             include_synthetic_data: false,
+            synthetic_multiplier: 1,
             gguf_path,
             sample_output_path: PathBuf::from("sample.svg"),
         }

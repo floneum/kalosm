@@ -10,8 +10,8 @@ use std::{io::Write, time::Instant};
 use fusor_nanochat::{
     RuntimeConfig,
     data::{
-        ACTION_DIRECTION_COUNT, ACTION_MODE_COUNT, CanvasStateSpec, StrokeTokenizer,
-        canvas_state_spec,
+        ACTION_DIRECTION_COUNT, ACTION_MODE_COUNT, CanvasStateSpec, INPUT_MODE_COUNT,
+        StrokeTokenizer, canvas_state_spec,
     },
 };
 
@@ -47,6 +47,35 @@ struct CanvasStateEmbeddings {
 }
 
 #[derive(Clone)]
+struct TokenInputEmbeddings {
+    mode: Tensor<2>,      // [INPUT_MODE_COUNT=4, n_embd]
+    direction: Tensor<2>, // [ACTION_DIRECTION_COUNT=8, n_embd]
+    count: Tensor<2>,     // [max_count, n_embd]
+}
+
+struct TokenInputAdamState {
+    mode: AdamMoments<2>,
+    direction: AdamMoments<2>,
+    count: AdamMoments<2>,
+}
+
+impl TokenInputAdamState {
+    fn new(device: &Device, embeddings: &TokenInputEmbeddings) -> Self {
+        Self {
+            mode: AdamMoments::zeros_like(device, &embeddings.mode),
+            direction: AdamMoments::zeros_like(device, &embeddings.direction),
+            count: AdamMoments::zeros_like(device, &embeddings.count),
+        }
+    }
+
+    fn collect_gpu_keys(&self, keys: &mut Vec<NodeIndex>) {
+        self.mode.collect_gpu_keys(keys);
+        self.direction.collect_gpu_keys(keys);
+        self.count.collect_gpu_keys(keys);
+    }
+}
+
+#[derive(Clone)]
 struct OutputHead {
     weight: Tensor<2>,
     bias: Tensor<1>,
@@ -68,7 +97,7 @@ pub struct NanoChatModel {
     use_rope: bool,
     rope_theta: f32,
     use_extra_norms: bool,
-    wte: Tensor<2>,
+    token_input: TokenInputEmbeddings,
     wpe: Option<Tensor<2>>,
     canvas_state: Option<CanvasStateEmbeddings>,
     rotary: Option<RotaryEmbeddings>,
@@ -81,7 +110,7 @@ pub struct NanoChatModel {
 }
 
 pub struct NanoChatAdamState {
-    wte: AdamMoments<2>,
+    token_input: TokenInputAdamState,
     wpe: Option<AdamMoments<2>>,
     canvas_state: Option<CanvasStateAdamState>,
     ln_in_weight: AdamMoments<1>,
@@ -94,7 +123,7 @@ pub struct NanoChatAdamState {
 
 impl NanoChatAdamState {
     fn collect_gpu_keys(&self, keys: &mut Vec<NodeIndex>) {
-        self.wte.collect_gpu_keys(keys);
+        self.token_input.collect_gpu_keys(keys);
         if let Some(wpe) = &self.wpe {
             wpe.collect_gpu_keys(keys);
         }
@@ -321,11 +350,11 @@ impl NanoChatModel {
             use_rope: config.use_rope,
             rope_theta: config.rope_theta,
             use_extra_norms: config.use_extra_norms,
-            wte: random_matrix(
+            token_input: TokenInputEmbeddings::new(
                 &graph,
                 device,
                 rng,
-                vocab_size,
+                tokenizer.max_count(),
                 shape.n_embd,
                 config.init_scale,
             ),
@@ -380,7 +409,7 @@ impl NanoChatModel {
     }
 
     pub fn num_parameters(&self) -> usize {
-        tensor_len(&self.wte)
+        self.token_input.num_parameters()
             + self.wpe.as_ref().map_or(0, tensor_len)
             + self
                 .canvas_state
@@ -460,16 +489,22 @@ impl NanoChatModel {
 
     pub fn forward(
         &self,
-        token_inputs: &RawTensor<2, u32>,
+        mode_inputs: &RawTensor<2, u32>,
+        direction_inputs: &RawTensor<2, u32>,
+        count_inputs: &RawTensor<2, u32>,
         position_inputs: &RawTensor<2, u32>,
         cursor_x_inputs: &RawTensor<2, u32>,
         cursor_y_inputs: &RawTensor<2, u32>,
         pen_state_inputs: &RawTensor<2, u32>,
         causal_mask: &Tensor<3>,
     ) -> ActionLogits {
-        let batch_size = token_inputs.shape()[0];
-        let token_embeddings = self.wte.embedding(token_inputs);
-        let mut x = token_embeddings;
+        let batch_size = mode_inputs.shape()[0];
+        let mode_embeddings = self.token_input.mode.embedding(mode_inputs);
+        let direction_embeddings = self.token_input.direction.embedding(direction_inputs);
+        let count_embeddings = self.token_input.count.embedding(count_inputs);
+        let mut x = mode_embeddings
+            .add(&direction_embeddings)
+            .add(&count_embeddings);
         if let Some(wpe) = &self.wpe {
             let position_embeddings = wpe.embedding(position_inputs);
             x = x.add(&position_embeddings);
@@ -510,8 +545,7 @@ impl NanoChatModel {
 
     pub async fn named_tensors(&self) -> Vec<NamedTensor> {
         let mut tensors = Vec::new();
-        log_materialize_start("token_embd.weight", &self.wte.shape());
-        push_tensor_2d(&mut tensors, "token_embd.weight", &self.wte).await;
+        self.token_input.append_named_tensors(&mut tensors).await;
         if let Some(wpe) = &self.wpe {
             log_materialize_start("position_embd.weight", &wpe.shape());
             push_tensor_2d(&mut tensors, "position_embd.weight", wpe).await;
@@ -546,7 +580,7 @@ impl AdamWModel for NanoChatModel {
 
     fn adamw_state(device: &Device, model: &Self) -> Self::State {
         NanoChatAdamState {
-            wte: AdamMoments::zeros_like(device, &model.wte),
+            token_input: TokenInputAdamState::new(device, &model.token_input),
             wpe: model
                 .wpe
                 .as_ref()
@@ -599,7 +633,7 @@ impl AdamWModel for NanoChatModel {
             use_rope,
             rope_theta,
             use_extra_norms,
-            wte: _,
+            token_input: _,
             wpe: _,
             canvas_state: _,
             rotary,
@@ -641,15 +675,9 @@ impl AdamWModel for NanoChatModel {
         // incrementally.
         let new_graph = Graph::new();
 
-        let wte = extracted
-            .wte
-            .map(|(grad, val)| {
-                Tensor::from_raw(
-                    &new_graph,
-                    adamw_update_raw(val, grad, &mut state.wte, step, settings),
-                )
-            })
-            .unwrap_or_else(|| Tensor::from_raw(&new_graph, extracted.wte_value));
+        let token_input = extracted
+            .token_input
+            .apply(&new_graph, &mut state.token_input, step, settings);
 
         let wpe = match (extracted.wpe, state.wpe.as_mut()) {
             (Some(Some((grad, val))), Some(moments)) => Some(Tensor::from_raw(
@@ -733,7 +761,7 @@ impl AdamWModel for NanoChatModel {
             use_rope,
             rope_theta,
             use_extra_norms,
-            wte,
+            token_input,
             wpe,
             canvas_state,
             rotary,
@@ -799,6 +827,43 @@ impl CanvasStateAdamState {
             cursor_y: AdamMoments::zeros_like(device, &state.cursor_y),
             pen_state: AdamMoments::zeros_like(device, &state.pen_state),
         }
+    }
+}
+
+impl TokenInputEmbeddings {
+    fn new(
+        graph: &Graph,
+        device: &Device,
+        rng: &mut StdRng,
+        max_count: usize,
+        n_embd: usize,
+        init_scale: f32,
+    ) -> Self {
+        Self {
+            mode: random_matrix(graph, device, rng, INPUT_MODE_COUNT, n_embd, init_scale),
+            direction: random_matrix(
+                graph,
+                device,
+                rng,
+                ACTION_DIRECTION_COUNT,
+                n_embd,
+                init_scale,
+            ),
+            count: random_matrix(graph, device, rng, max_count, n_embd, init_scale),
+        }
+    }
+
+    fn num_parameters(&self) -> usize {
+        tensor_len(&self.mode) + tensor_len(&self.direction) + tensor_len(&self.count)
+    }
+
+    async fn append_named_tensors(&self, tensors: &mut Vec<NamedTensor>) {
+        log_materialize_start("token_input_mode.weight", &self.mode.shape());
+        push_tensor_2d(tensors, "token_input_mode.weight", &self.mode).await;
+        log_materialize_start("token_input_direction.weight", &self.direction.shape());
+        push_tensor_2d(tensors, "token_input_direction.weight", &self.direction).await;
+        log_materialize_start("token_input_count.weight", &self.count.shape());
+        push_tensor_2d(tensors, "token_input_count.weight", &self.count).await;
     }
 }
 
@@ -1518,8 +1583,7 @@ fn collect_grad_pair_gpu_keys<const R: usize>(
 type GradPair<const R: usize> = Option<(fusor::Tensor<R, f32>, fusor::Tensor<R, f32>)>;
 
 struct ExtractedModelGradients {
-    wte: GradPair<2>,
-    wte_value: fusor::Tensor<2, f32>,
+    token_input: ExtractedTokenInputGradients,
     wpe: Option<GradPair<2>>,
     wpe_value: Option<fusor::Tensor<2, f32>>,
     canvas_state: Option<ExtractedCanvasStateGradients>,
@@ -1537,8 +1601,7 @@ struct ExtractedModelGradients {
 impl ExtractedModelGradients {
     fn extract(model: &NanoChatModel, gradients: &Gradients) -> Self {
         Self {
-            wte: extract_gradient(&model.wte, gradients),
-            wte_value: model.wte.raw().clone(),
+            token_input: ExtractedTokenInputGradients::extract(&model.token_input, gradients),
             wpe: model
                 .wpe
                 .as_ref()
@@ -1561,12 +1624,11 @@ impl ExtractedModelGradients {
     }
 
     fn device(&self) -> Device {
-        self.wte_value.device()
+        self.token_input.mode_value.device()
     }
 
     fn collect_gpu_keys(&self, keys: &mut Vec<NodeIndex>) {
-        collect_grad_pair_gpu_keys(&self.wte, keys);
-        collect_tensor_gpu_key(&self.wte_value, keys);
+        self.token_input.collect_gpu_keys(keys);
         if let Some(wpe) = &self.wpe {
             collect_grad_pair_gpu_keys(wpe, keys);
         }
@@ -1585,6 +1647,72 @@ impl ExtractedModelGradients {
         collect_grad_pair_gpu_keys(&self.ln_f_bias, keys);
         collect_tensor_gpu_key(&self.ln_f_bias_value, keys);
         self.action_head.collect_gpu_keys(keys);
+    }
+}
+
+struct ExtractedTokenInputGradients {
+    mode: GradPair<2>,
+    mode_value: fusor::Tensor<2, f32>,
+    direction: GradPair<2>,
+    direction_value: fusor::Tensor<2, f32>,
+    count: GradPair<2>,
+    count_value: fusor::Tensor<2, f32>,
+}
+
+impl ExtractedTokenInputGradients {
+    fn extract(embeddings: &TokenInputEmbeddings, gradients: &Gradients) -> Self {
+        Self {
+            mode: extract_gradient(&embeddings.mode, gradients),
+            mode_value: embeddings.mode.raw().clone(),
+            direction: extract_gradient(&embeddings.direction, gradients),
+            direction_value: embeddings.direction.raw().clone(),
+            count: extract_gradient(&embeddings.count, gradients),
+            count_value: embeddings.count.raw().clone(),
+        }
+    }
+
+    fn collect_gpu_keys(&self, keys: &mut Vec<NodeIndex>) {
+        collect_grad_pair_gpu_keys(&self.mode, keys);
+        collect_tensor_gpu_key(&self.mode_value, keys);
+        collect_grad_pair_gpu_keys(&self.direction, keys);
+        collect_tensor_gpu_key(&self.direction_value, keys);
+        collect_grad_pair_gpu_keys(&self.count, keys);
+        collect_tensor_gpu_key(&self.count_value, keys);
+    }
+
+    fn apply(
+        self,
+        graph: &Graph,
+        state: &mut TokenInputAdamState,
+        step: usize,
+        settings: AdamWSettings,
+    ) -> TokenInputEmbeddings {
+        TokenInputEmbeddings {
+            mode: apply_extracted(
+                graph,
+                self.mode,
+                self.mode_value,
+                &mut state.mode,
+                step,
+                settings,
+            ),
+            direction: apply_extracted(
+                graph,
+                self.direction,
+                self.direction_value,
+                &mut state.direction,
+                step,
+                settings,
+            ),
+            count: apply_extracted(
+                graph,
+                self.count,
+                self.count_value,
+                &mut state.count,
+                step,
+                settings,
+            ),
+        }
     }
 }
 
@@ -2153,7 +2281,9 @@ mod tests {
     use super::*;
     use fusor_nanochat::{
         RuntimeConfig, SaveQuantization,
-        data::{StrokeTokenizer, canvas_state_indexes, position_indexes},
+        data::{
+            StrokeTokenizer, canvas_state_indexes, position_indexes, token_component_indexes,
+        },
     };
     use rand::SeedableRng;
 
@@ -2200,6 +2330,7 @@ mod tests {
             test_examples: 1,
             dataset_path: None,
             include_synthetic_data: false,
+            synthetic_multiplier: 1,
             gguf_path: "test.gguf".into(),
             sample_output_path: "sample.svg".into(),
         };
@@ -2284,6 +2415,7 @@ mod tests {
             test_examples: 1,
             dataset_path: None,
             include_synthetic_data: false,
+            synthetic_multiplier: 1,
             gguf_path: "test.gguf".into(),
             sample_output_path: "sample.svg".into(),
         };
@@ -2302,7 +2434,10 @@ mod tests {
                 tokenizer.eot_token(),
             ],
         ];
-        let token_inputs: RawTensor<2, u32> = RawTensor::new(&device, &inputs);
+        let components = token_component_indexes(&tokenizer, &inputs);
+        let mode_inputs: RawTensor<2, u32> = RawTensor::new(&device, &components.mode);
+        let direction_inputs: RawTensor<2, u32> = RawTensor::new(&device, &components.direction);
+        let count_inputs: RawTensor<2, u32> = RawTensor::new(&device, &components.count);
         let position_values = position_indexes(2, 3);
         let position_inputs: RawTensor<2, u32> = RawTensor::new(&device, &position_values);
         let canvas = canvas_state_indexes(
@@ -2327,7 +2462,9 @@ mod tests {
             Tensor::constant_from_raw(model.graph(), RawTensor::new(&device, &causal_mask_values));
 
         let logits = model.forward(
-            &token_inputs,
+            &mode_inputs,
+            &direction_inputs,
+            &count_inputs,
             &position_inputs,
             &cursor_x_inputs,
             &cursor_y_inputs,
