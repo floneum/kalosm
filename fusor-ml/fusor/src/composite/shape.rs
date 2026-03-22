@@ -183,7 +183,6 @@ where
     /// # Arguments
     /// * `repeats` - Number of times to repeat along each dimension
     pub fn repeat(&self, repeats: [usize; R]) -> Tensor<R, D> {
-        let shape = self.shape();
         // Concatenate copies along each dimension
         let mut result: Tensor<R, D> = self.to_concrete();
         for dim in 0..R {
@@ -422,30 +421,6 @@ pub(crate) fn broadcast_shapes<const R1: usize, const R2: usize, const R3: usize
     }
 
     result
-}
-
-fn dispatch_vec<const R: usize, D, B, O>(
-    tensors: impl IntoIterator<Item = Tensor<R, D, B>>,
-    cpu: impl FnOnce(Vec<fusor_cpu::Tensor<R, B>>) -> O,
-    gpu: impl FnOnce(Vec<fusor_core::Tensor<R, D>>) -> O,
-) -> O
-where
-    D: SimdElement + DataType,
-    B: TensorBacking<R, Elem = D>,
-{
-    let mut cpu_tensors = Vec::new();
-    let mut gpu_tensors = Vec::new();
-    for t in tensors {
-        match t {
-            Tensor::Cpu(ct) => cpu_tensors.push(ct),
-            Tensor::Gpu(gt) => gpu_tensors.push(gt),
-        }
-    }
-    if gpu_tensors.is_empty() {
-        cpu(cpu_tensors)
-    } else {
-        gpu(gpu_tensors)
-    }
 }
 
 /// Concatenate multiple tensors along a given dimension.

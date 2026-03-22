@@ -24,7 +24,7 @@ pub use quantized::{CpuF32Tensor, QMatrix};
 use std::ops::{Deref, Range};
 
 pub use composite::{
-    MaskKind, RopeCache, ToVec1, ToVec2, ToVec3, arange, arange_step, base_inverse_frequency, cat,
+    MaskKind, RopeCache, ToVec, ToVec1, ToVec2, ToVec3, arange, arange_step, base_inverse_frequency, cat,
     stack,
 };
 pub use device::Device;

@@ -10,7 +10,7 @@ use std::{
     pin::Pin,
 };
 
-use fusor::{DataType, Device, SimdElement, Tensor};
+use fusor::{DataType, Device, FromArray, SimdElement, Tensor};
 use rand::{
     Rng, RngCore, SeedableRng,
     distr::{Distribution, StandardUniform, Uniform},
@@ -175,8 +175,9 @@ impl<const R: usize, T: SimdElement + DataType> GenerateFromDevice for FuzzGener
     }
 }
 
-trait FnMutTuple<Args> {
+trait AsyncFnMutTuple<Args> {
     type Output;
+
     fn call_mut<'a>(
         &'a mut self,
         args: Args,
@@ -185,7 +186,7 @@ trait FnMutTuple<Args> {
 
 macro_rules! impl_fn_mut_tuple {
     ($($type:ident),*) => {
-        impl<Fn, U, Fut, $($type),*> FnMutTuple<($($type,)*)> for Fn
+        impl<Fn, U, Fut, $($type),*> AsyncFnMutTuple<($($type,)*)> for Fn
         where
             Fn: FnMut($($type,)*) -> Fut,
             Fut: std::future::Future<Output = U> + Send + 'static,
@@ -238,6 +239,53 @@ impl_gen_tuple!(A -> AOut, B -> BOut, C -> COut);
 impl_gen_tuple!(A -> AOut, B -> BOut, C -> COut, D -> DOut);
 impl_gen_tuple!(A -> AOut, B -> BOut, C -> COut, D -> DOut, E -> EOut);
 impl_gen_tuple!(A -> AOut, B -> BOut, C -> COut, D -> DOut, E -> EOut, F -> FOut);
+
+trait ResolveTensorTuple {
+    type Output;
+
+    fn resolve(self) -> impl Future<Output = Result<Self::Output, fusor::Error>> + Send + 'static;
+
+    fn extract_device(&self) -> Device;
+}
+
+macro_rules! impl_resolve_tensor_tuple {
+    ($($type:ident = $rank:ident),*) => {
+        impl<$(const $rank: usize,)* $($type: DataType + SimdElement),*> ResolveTensorTuple for ($(Tensor<$rank, $type>,)*)
+            where
+                $(
+                    fusor_types::TensorSlice<$rank, $type, fusor::EitherMappedBuffer>: fusor::ToVec<Output: Send + 'static>,
+                )*
+        {
+            type Output = ($(<fusor_types::TensorSlice<$rank, $type, fusor::EitherMappedBuffer> as fusor::ToVec>::Output,)*);
+
+            async fn resolve(self) -> Result<Self::Output, fusor::Error> {
+                let ($($type,)*) = self;
+                Ok((
+                    $(
+                        fusor::ToVec::to_vec(&$type.as_slice().await?),
+                    )*
+                ))
+            }
+
+            #[allow(unused)]
+            fn extract_device(&self) -> Device {
+                let ($($type,)*) = self;
+                $(
+                    let device = $type.device();
+                    return device;
+                )*
+                unreachable!()
+            }
+        }
+    };
+}
+
+impl_resolve_tensor_tuple!(A = N1);
+impl_resolve_tensor_tuple!(A = N1, B = N2);
+impl_resolve_tensor_tuple!(A = N1, B = N2, C = N3);
+impl_resolve_tensor_tuple!(A = N1, B = N2, C = N3, D = N4);
+impl_resolve_tensor_tuple!(A = N1, B = N2, C = N3, D = N4, E = N5);
+impl_resolve_tensor_tuple!(A = N1, B = N2, C = N3, D = N4, E = N5, F = N6);
 
 trait PushTuple<Tail> {
     type Output;
@@ -331,8 +379,8 @@ impl Display for ItemMismatchError {
 ///         .build();
 /// ```
 struct AssertBuilder<T, U, Generators = (), Compare = ()> {
-    baseline: Box<dyn FnMutTuple<T, Output = U>>,
-    to_validate: Vec<Box<dyn FnMutTuple<T, Output = U>>>,
+    baseline: Box<dyn AsyncFnMutTuple<T, Output = U>>,
+    to_validate: Vec<Box<dyn AsyncFnMutTuple<T, Output = U>>>,
     generators: Generators,
     compare: Compare,
     devices: Option<Vec<Device>>,
@@ -340,7 +388,7 @@ struct AssertBuilder<T, U, Generators = (), Compare = ()> {
 }
 
 impl<T, U> AssertBuilder<T, U> {
-    fn new(op: impl FnMutTuple<T, Output = U> + 'static) -> Self {
+    fn new(op: impl AsyncFnMutTuple<T, Output = U> + 'static) -> Self {
         Self {
             baseline: Box::new(op),
             to_validate: Vec::new(),
@@ -392,9 +440,46 @@ impl<T, U, Generators, Compare> AssertBuilder<T, U, Generators, Compare> {
         self
     }
 
-    fn equal_to(mut self, other: impl FnMutTuple<T, Output = U> + 'static) -> Self {
+    fn equal_to(mut self, other: impl AsyncFnMutTuple<T, Output = U> + 'static) -> Self {
         self.to_validate.push(Box::new(other));
         self
+    }
+
+    fn equal_to_array_op<const R: usize, D, Arr>(
+        self,
+        mut other: impl AsyncFnMutTuple<T::Output, Output = Vec<Arr>> + Copy + Send + 'static,
+    ) -> Self
+    where
+        T: ResolveTensorTuple,
+        for<'a> U: FromArray<R, D, &'a Vec<Arr>, Device>,
+    {
+        struct UnpackedTuple<T>(T);
+
+        impl<F, Fut, I, O> AsyncFnMutTuple<I> for UnpackedTuple<F>
+        where
+            F: FnMut(I) -> Fut,
+            Fut: std::future::Future<Output = O> + Send + 'static,
+        {
+            type Output = O;
+            fn call_mut<'a>(
+                &'a mut self,
+                input: I,
+            ) -> Pin<Box<dyn std::future::Future<Output = Self::Output> + Send + 'a>> {
+                Box::pin((self.0)(input))
+            }
+        }
+
+        let wrapped = move |input: T| {
+            let device = input.extract_device();
+            let input = input.resolve();
+            async move {
+                let input = input.await.unwrap();
+                let output = other.call_mut(input).await;
+                U::from_array(&output, &device)
+            }
+        };
+
+        self.equal_to(UnpackedTuple(wrapped))
     }
 }
 
@@ -494,13 +579,13 @@ impl<const R: usize> IntoCompare<Tensor<R, f32>> for () {
     }
 }
 
-fn assert<T, U>(op: impl FnMutTuple<T, Output = U> + 'static) -> AssertBuilder<T, U> {
+fn assert<T, U>(op: impl AsyncFnMutTuple<T, Output = U> + 'static) -> AssertBuilder<T, U> {
     AssertBuilder::new(op)
 }
 
 #[cfg(test)]
 mod api_tests {
-    use fusor::{FromArray, Tensor, ToVec1};
+    use fusor::{FromArray, Tensor, ToVec};
 
     use crate::FuzzGenerator;
 
@@ -508,11 +593,8 @@ mod api_tests {
     async fn test_api() {
         crate::assert(async |x: fusor::Tensor<1, f32>| x.sin().to_concrete())
             .arg(FuzzGenerator::new([64; 1]))
-            .equal_to(async |x: fusor::Tensor<1, f32>| {
-                let slice = x.as_slice().await.unwrap();
-                let vec = slice.to_vec1();
-                let sin = vec.iter().map(|&v| v.sin()).collect::<Vec<_>>();
-                Tensor::from_array(&sin, &x.device())
+            .equal_to_array_op(async |vec: Vec<f32>| {
+                vec.iter().map(|&v| v.sin()).collect::<Vec<_>>()
             })
             .await
             .unwrap();
