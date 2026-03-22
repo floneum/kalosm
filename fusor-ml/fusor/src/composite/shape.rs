@@ -392,6 +392,38 @@ where
     }
 }
 
+/// Calculate the broadcasted shape for two tensors.
+/// Returns the output shape where each dimension is the max of the corresponding input dimensions.
+/// Dimensions are aligned from the right.
+pub(crate) fn broadcast_shapes<const R1: usize, const R2: usize, const R3: usize>(
+    shape1: &[usize; R1],
+    shape2: &[usize; R2],
+) -> [usize; R3] {
+    let mut result = [1usize; R3];
+
+    // Align shapes from the right
+    for (i, &dim) in shape1.iter().enumerate().take(R1) {
+        let idx = R3 - R1 + i;
+        result[idx] = dim;
+    }
+
+    for i in 0..R2 {
+        let idx = R3 - R2 + i;
+        let d2 = shape2[i];
+        let d1 = result[idx];
+        if d1 == 1 {
+            result[idx] = d2;
+        } else if d2 != 1 && d1 != d2 {
+            panic!(
+                "Cannot broadcast shapes {:?} and {:?}: incompatible dimensions {} and {} at index {}",
+                shape1, shape2, d1, d2, idx
+            );
+        }
+    }
+
+    result
+}
+
 fn dispatch_vec<const R: usize, D, B, O>(
     tensors: impl IntoIterator<Item = Tensor<R, D, B>>,
     cpu: impl FnOnce(Vec<fusor_cpu::Tensor<R, B>>) -> O,

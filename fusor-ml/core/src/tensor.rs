@@ -1079,7 +1079,10 @@ async fn test_tensor_slice() {
     let data = [[1., 2.], [3., 4.], [5., 6.]];
     let tensor = Tensor::new(&device, &data);
 
-    let slice = tensor.slice([0..2, 0..1]);
+    let slice = tensor.restride([
+        crate::StrideSpec::dim(0, 2),
+        crate::StrideSpec::dim(1, 1),
+    ]);
     let as_slice = slice.as_slice().await.unwrap();
     assert_eq!(as_slice[[0, 0]], 1.);
     assert_eq!(as_slice.get([0, 1]), None);
@@ -1128,15 +1131,27 @@ async fn test_tensor_compare() {
     ];
     let tensor = Tensor::new(&device, &data);
 
-    let slice = tensor.slice([0..2, 0..1, 0..1]);
+    let slice = tensor.restride([
+        crate::StrideSpec::dim(0, 2),
+        crate::StrideSpec::dim(1, 1),
+        crate::StrideSpec::dim(2, 1),
+    ]);
     let as_slice = slice.as_slice().await.unwrap();
     assert_eq!(as_slice, as_slice);
 
-    let other_slice = tensor.slice([0..1, 0..1, 0..1]);
+    let other_slice = tensor.restride([
+        crate::StrideSpec::dim(0, 1),
+        crate::StrideSpec::dim(1, 1),
+        crate::StrideSpec::dim(2, 1),
+    ]);
     let other_as_slice = other_slice.as_slice().await.unwrap();
     assert!(as_slice != other_as_slice);
 
-    let other_slice = tensor.slice([1..3, 0..1, 0..1]);
+    let other_slice = tensor.restride([
+        crate::StrideSpec::dim(0, 2).with_offset(1),
+        crate::StrideSpec::dim(1, 1),
+        crate::StrideSpec::dim(2, 1),
+    ]);
     let other_as_slice = other_slice.as_slice().await.unwrap();
     assert!(as_slice != other_as_slice);
 }

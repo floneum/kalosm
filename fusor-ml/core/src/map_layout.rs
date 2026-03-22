@@ -1,4 +1,4 @@
-use std::{fmt::Debug, ops::Range, sync::Arc};
+use std::{fmt::Debug, sync::Arc};
 
 use crate::{
     D, DataType, Dim, Layout, MaxRank, Tensor, TensorData, compute_graph::NodeIndex,
@@ -112,22 +112,7 @@ impl<const R: usize, T: DataType> Tensor<R, T> {
         ))
     }
 
-    pub fn slice(&self, slices: [Range<usize>; R]) -> Tensor<R, T> {
-        let specs: [crate::StrideSpec; R] = std::array::from_fn(|i| {
-            crate::StrideSpec::dim(i, slices[i].len()).with_offset(slices[i].start)
-        });
-        self.restride(specs)
-    }
-
-    pub fn permute(&self, axes: [usize; R]) -> Tensor<R, T> {
-        let shape = self.shape();
-        let specs: [crate::StrideSpec; R] = std::array::from_fn(|i| {
-            crate::StrideSpec::dim(axes[i], shape[axes[i]])
-        });
-        self.restride(specs)
-    }
-
-    pub fn transpose(&self, first_axis: impl Dim<R>, second_axis: impl Dim<R>) -> Tensor<R, T> {
+    pub(crate) fn transpose(&self, first_axis: impl Dim<R>, second_axis: impl Dim<R>) -> Tensor<R, T> {
         let first_axis = first_axis.resolve();
         let second_axis = second_axis.resolve();
         let shape = self.shape();
@@ -143,7 +128,7 @@ impl<const R: usize, T: DataType> Tensor<R, T> {
         self.restride(specs)
     }
 
-    pub fn t(&self) -> Tensor<R, T> {
+    pub(crate) fn t(&self) -> Tensor<R, T> {
         const {
             assert!(
                 R >= 2,
@@ -153,12 +138,7 @@ impl<const R: usize, T: DataType> Tensor<R, T> {
         self.transpose(D::Minus1, D::Minus2)
     }
 
-    /// Alias for [`broadcast_as`](Tensor::broadcast_as)
-    pub fn expand<const R2: usize>(&self, out_shape: [usize; R2]) -> Tensor<R2, T> {
-        self.broadcast_as(out_shape)
-    }
-
-    pub fn broadcast_as<const R2: usize>(&self, out_shape: [usize; R2]) -> Tensor<R2, T> {
+    pub(crate) fn broadcast_as<const R2: usize>(&self, out_shape: [usize; R2]) -> Tensor<R2, T> {
         const {
             assert!(
                 R2 >= R,
@@ -272,7 +252,10 @@ async fn test_broadcast_as_non_continuous() {
     let data = [[1., 2., -1.], [3., 4., -1.]];
     let tensor = Tensor::new(&device, &data);
     println!("tensor: {tensor:?}");
-    let sliced = tensor.slice([0..2, 0..2]);
+    let sliced = tensor.restride([
+        crate::StrideSpec::dim(0, 2),
+        crate::StrideSpec::dim(1, 2),
+    ]);
     println!("sliced: {sliced:?}");
     let broadcasted = sliced.broadcast_as([2, 2, 3]);
     println!("{broadcasted:?}");

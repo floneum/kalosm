@@ -937,7 +937,11 @@ mod tests {
         // Regular matmul expects [K, N], so we transpose dequantized weight
         let rhs_dequantized = rhs.dequantize::<2>();
         let rhs_tensor = crate::Tensor::new(rhs_dequantized);
-        let rhs_transposed = rhs_tensor.transpose(0, 1).to_concrete();
+        let [n, k] = rhs_tensor.shape();
+        let rhs_transposed = rhs_tensor.restride([
+            fusor_types::StrideSpec::dim(1, k),
+            fusor_types::StrideSpec::dim(0, n),
+        ]).to_concrete();
         let result_dequantized = lhs.matmul_ref(rhs_transposed.inner());
 
         // Results should match

@@ -340,7 +340,10 @@ async fn test_matrix_vector_mul_non_contiguous() {
     let vector = [[7.], [8.], [9.]];
 
     // Take a slice of the matrix to make it non-contiguous
-    let tensor_matrix = Tensor::new(&device, &matrix).slice([0..2, 0..3]);
+    let tensor_matrix = Tensor::new(&device, &matrix).restride([
+        crate::StrideSpec::dim(0, 2),
+        crate::StrideSpec::dim(1, 3),
+    ]);
     let tensor_vector = Tensor::new(&device, &vector);
     let result = tensor_matrix.mat_mul(&tensor_vector);
     let as_slice = result.as_slice().await.unwrap();

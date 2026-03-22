@@ -62,18 +62,9 @@ where
         let sin: Tensor<4, D, _> = sin_unsqueezed.unsqueeze(0);
 
         let rotated = rotate_half(self);
-        self.dispatch_quad(
-            &cos,
-            &sin,
-            &rotated,
-            |s, c, sn, r| {
-                // Use broadcasting mul_ and add_
-                let sc = s.as_ref().mul_(c.as_ref());
-                let rsn = r.as_ref().mul_(sn.as_ref());
-                sc.add_(rsn)
-            },
-            |s, c, sn, r| s.mul_(c) + r.mul_(sn),
-        )
+        let sc: Tensor<4, D> = self.mul_(&cos);
+        let rsn: Tensor<4, D> = rotated.mul_(&sin);
+        sc.add_(&rsn)
     }
 
     /// Apply interleaved rotary position embedding.
@@ -105,30 +96,13 @@ where
         let x0 = x.narrow(4, 0, 1);
         let x1 = x.narrow(4, 1, 1);
 
-        let y0 = x0.dispatch_quad(
-            &cos,
-            &x1,
-            &sin,
-            |a, c, b, s| {
-                // Use broadcasting mul_ and sub_
-                let ac = a.as_ref().mul_(c.as_ref());
-                let bs = b.as_ref().mul_(s.as_ref());
-                ac.sub_(bs)
-            },
-            |a, c, b, s| &a.mul_(c) - &b.mul_(s),
-        );
-        let y1 = x0.dispatch_quad(
-            &sin,
-            &x1,
-            &cos,
-            |a, s, b, c| {
-                // Use broadcasting mul_ and add_
-                let as_ = a.as_ref().mul_(s.as_ref());
-                let bc = b.as_ref().mul_(c.as_ref());
-                as_.add_(bc)
-            },
-            |a, s, b, c| &a.mul_(s) + &b.mul_(c),
-        );
+        let ac: Tensor<5, D> = x0.mul_(&cos);
+        let bs: Tensor<5, D> = x1.mul_(&sin);
+        let y0: Tensor<5, D> = ac.sub_(&bs);
+
+        let as_: Tensor<5, D> = x0.mul_(&sin);
+        let bc: Tensor<5, D> = x1.mul_(&cos);
+        let y1: Tensor<5, D> = as_.add_(&bc);
 
         crate::cat([y0, y1], 4).flatten_last_n::<1, 4>()
     }
@@ -142,13 +116,20 @@ where
         cos: &Tensor<2, D, ConcreteTensor<D, 2>>,
         sin: &Tensor<2, D, ConcreteTensor<D, 2>>,
     ) -> Self {
-        match (self, cos, sin) {
+        let sequence_length = self.shape()[2];
+        let cos_narrow: Tensor<2, D, ConcreteTensor<D, 2>> =
+            cos.narrow(0, 0, sequence_length).to_concrete();
+        let sin_narrow: Tensor<2, D, ConcreteTensor<D, 2>> =
+            sin.narrow(0, 0, sequence_length).to_concrete();
+        match (self, &cos_narrow, &sin_narrow) {
             // GPU path - use the optimized fused kernel
             (Tensor::Gpu(x), Tensor::Gpu(cos), Tensor::Gpu(sin)) => {
                 Tensor::Gpu(x.rope_fused(cos, sin))
             }
             // CPU path - use composite operations
-            (Tensor::Cpu(_), Tensor::Cpu(_), Tensor::Cpu(_)) => self.rope_interleaved(cos, sin),
+            (Tensor::Cpu(_), Tensor::Cpu(_), Tensor::Cpu(_)) => {
+                self.rope_interleaved(&cos_narrow, &sin_narrow)
+            }
             _ => panic!("All tensors must be on the same device"),
         }
     }
@@ -162,13 +143,20 @@ where
         cos: &Tensor<2, D, ConcreteTensor<D, 2>>,
         sin: &Tensor<2, D, ConcreteTensor<D, 2>>,
     ) -> Self {
-        match (self, cos, sin) {
+        let sequence_length = self.shape()[2];
+        let cos_narrow: Tensor<2, D, ConcreteTensor<D, 2>> =
+            cos.narrow(0, 0, sequence_length).to_concrete();
+        let sin_narrow: Tensor<2, D, ConcreteTensor<D, 2>> =
+            sin.narrow(0, 0, sequence_length).to_concrete();
+        match (self, &cos_narrow, &sin_narrow) {
             // GPU path - use the optimized fused kernel
             (Tensor::Gpu(x), Tensor::Gpu(cos), Tensor::Gpu(sin)) => {
                 Tensor::Gpu(x.rope_normal_fused(cos, sin))
             }
             // CPU path - use composite operations
-            (Tensor::Cpu(_), Tensor::Cpu(_), Tensor::Cpu(_)) => self.rope(cos, sin),
+            (Tensor::Cpu(_), Tensor::Cpu(_), Tensor::Cpu(_)) => {
+                self.rope(&cos_narrow, &sin_narrow)
+            }
             _ => panic!("All tensors must be on the same device"),
         }
     }

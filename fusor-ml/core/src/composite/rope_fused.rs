@@ -7,12 +7,16 @@ use crate::{
 impl<D: DataType> Tensor<4, D> {
     /// Apply fused interleaved RoPE (rotary position embedding).
     /// This pairs adjacent elements: (0, 1), (2, 3), etc.
+    ///
+    /// `cos` and `sin` must already be narrowed to the sequence length.
     pub fn rope_fused(&self, cos: &Tensor<2, D>, sin: &Tensor<2, D>) -> Tensor<4, D> {
         self.rope_fused_impl(cos, sin, RopeMode::Interleaved)
     }
 
     /// Apply fused normal RoPE (rotary position embedding).
     /// This pairs first half with second half: (0, head_dim/2), (1, head_dim/2+1), etc.
+    ///
+    /// `cos` and `sin` must already be narrowed to the sequence length.
     pub fn rope_normal_fused(&self, cos: &Tensor<2, D>, sin: &Tensor<2, D>) -> Tensor<4, D> {
         self.rope_fused_impl(cos, sin, RopeMode::Normal)
     }
@@ -23,10 +27,7 @@ impl<D: DataType> Tensor<4, D> {
         sin: &Tensor<2, D>,
         mode: RopeMode,
     ) -> Tensor<4, D> {
-        let [_, _, sequence_length, head_dim] = *self.shape();
-        // Narrow cos/sin to the sequence length
-        let cos = cos.slice([0..sequence_length, 0..cos.shape()[1]]);
-        let sin = sin.slice([0..sequence_length, 0..sin.shape()[1]]);
+        let [_, _, _, head_dim] = *self.shape();
 
         let operation = RopeFusedOperation {
             input: self.key(),

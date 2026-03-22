@@ -40,6 +40,7 @@ members = [
     "fusor-ml/types",
     "fusor-ml/nanochat",
     "fusor-ml/nanochat-app",
+    "fusor-ml/conformance",
 ]
 
 [workspace.dependencies]

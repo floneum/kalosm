@@ -3982,6 +3982,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "fusor-conformance"
+version = "0.1.0"
+dependencies = [
+ "fusor",
+ "fusor-core",
+ "fusor-cpu",
+ "fusor-types",
+ "half 2.7.1",
+ "rand 0.9.2",
+ "thiserror 2.0.18",
+ "tokio",
+]
+
+[[package]]
 name = "fusor-core"
 version = "0.1.0"
 dependencies = [

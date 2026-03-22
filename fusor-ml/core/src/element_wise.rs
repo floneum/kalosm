@@ -287,7 +287,10 @@ async fn test_add_const_sliced() {
 
     let data = [[1., 2.], [3., 4.], [5., 6.]];
     let tensor = Tensor::new(&device, &data);
-    let sliced = tensor.slice([0..3, 0..1]);
+    let sliced = tensor.restride([
+        crate::StrideSpec::dim(0, 3),
+        crate::StrideSpec::dim(1, 1),
+    ]);
 
     let sliced = sliced + 1.0;
 

@@ -1,4 +1,4 @@
-use fusor_core::{Device, Tensor};
+use fusor_core::{Device, StrideSpec, Tensor};
 
 const LEARNING_RATE: f32 = 0.05;
 const EPOCHS: usize = 80;
@@ -16,7 +16,10 @@ fn main() {
 
         for epoch in 0..EPOCHS {
             let batch_size = inputs.shape()[0] as f32;
-            let bias_broadcast: Tensor<2, f32> = bias.broadcast_as([inputs.shape()[0], 1]);
+            let bias_broadcast: Tensor<2, f32> = bias.restride([
+                StrideSpec::dim_with(0, inputs.shape()[0], 0),
+                StrideSpec::dim(1, 1),
+            ]);
             let prediction = inputs.mat_mul(&weight) + &bias_broadcast;
             let error = &prediction - &targets;
             let squared_error = &error * &error;
@@ -63,7 +66,10 @@ fn main() {
             }
         }
 
-        let final_prediction = inputs.mat_mul(&weight) + &bias.broadcast_as([inputs.shape()[0], 1]);
+        let final_prediction = inputs.mat_mul(&weight) + &bias.restride([
+            StrideSpec::dim_with(0, inputs.shape()[0], 0),
+            StrideSpec::dim(1, 1),
+        ]);
         println!(
             "final predictions: {:?}",
             final_prediction.as_slice().await.unwrap()

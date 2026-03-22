@@ -626,7 +626,10 @@ async fn test_reduce_sliced_sum() {
 
     let data = [[1., 2.], [3., 4.], [5., 6.]];
     let tensor = Tensor::new(&device, &data);
-    let tensor = tensor.slice([0..3, 0..1]);
+    let tensor = tensor.restride([
+        crate::StrideSpec::dim(0, 3),
+        crate::StrideSpec::dim(1, 1),
+    ]);
 
     let output = tensor.sum(0);
 

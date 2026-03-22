@@ -19,7 +19,6 @@ pub use matmul::*;
 pub use resize::ShapeWithOneHole;
 pub use varbuilder::{ShardedVarBuilder, VarBuilder};
 
-pub mod cache;
 mod composite;
 mod compute_graph;
 pub use compute_graph::NodeIndex;
