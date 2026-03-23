@@ -511,7 +511,7 @@ where
     let mut val = start;
     while val < end {
         data.push(val);
-        val = val + step;
+        val += step;
     }
     let len = data.len();
     match device {

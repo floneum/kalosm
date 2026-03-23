@@ -3,10 +3,10 @@ use std::time::Duration;
 
 use candle_core::MetalDevice;
 use candle_core::backend::BackendDevice;
-use candle_nn::{Module, VarBuilder};
+use candle_nn::Module;
 use criterion::BatchSize;
 use fusor::layers::Linear;
-use fusor::{Device, Tensor};
+use fusor::{Device, Tensor, VarBuilder};
 use futures::executor::block_on;
 
 use criterion::BenchmarkId;
@@ -44,10 +44,9 @@ fn linear(c: &mut Criterion) {
 
             {
                 let mut reader = std::io::Cursor::new(&bytes);
-                let mut var_builder = fusor_core::VarBuilder::from_gguf(&mut reader).unwrap();
+                let mut var_builder = VarBuilder::from_gguf(&mut reader).unwrap();
                 let device = block_on(async { Device::new().await.unwrap() });
-                let gpu_device = device.gpu_device().unwrap();
-                let linear = Linear::load(gpu_device, &mut var_builder.pp(name)).unwrap();
+                let linear = Linear::load(&device, &mut var_builder.pp(name)).unwrap();
                 let quantization = linear.quantization();
 
                 let mut group = c.benchmark_group(format!("linear-wgpu-{width}-{quantization}"));
@@ -65,13 +64,13 @@ fn linear(c: &mut Criterion) {
                                 random_data.iter().flat_map(|r| r.iter().copied()).collect();
                             let tensor: Tensor<2, f32> =
                                 Tensor::from_slice(&device, [size, width], &flat_data);
-                            tensor.materialize().await;
+                            tensor.as_gpu().unwrap().materialize().await;
                             let mut sum = Duration::ZERO;
                             while sum.is_zero() {
                                 for _ in 0..iters {
                                     let start = std::time::Instant::now();
                                     let new = linear.forward(&tensor.unsqueeze::<3>(0));
-                                    new.materialize().await;
+                                    new.as_gpu().unwrap().materialize().await;
                                     sum += start.elapsed();
                                 }
                             }

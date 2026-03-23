@@ -89,7 +89,7 @@ fn rope_benchmark(c: &mut Criterion) {
                             for _ in 0..iters {
                                 let start = std::time::Instant::now();
                                 let result = input.rope_interleaved(&cos, &sin);
-                                result.materialize().await;
+                                result.as_gpu().unwrap().materialize().await;
                                 sum += start.elapsed();
                             }
                         }
@@ -121,7 +121,7 @@ fn rope_benchmark(c: &mut Criterion) {
                             for _ in 0..iters {
                                 let start = std::time::Instant::now();
                                 let result = input.rope_fused(&cos, &sin);
-                                result.materialize().await;
+                                result.as_gpu().unwrap().materialize().await;
                                 sum += start.elapsed();
                             }
                         }

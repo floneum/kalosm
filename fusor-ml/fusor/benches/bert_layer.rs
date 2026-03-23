@@ -3,10 +3,10 @@ use std::time::Duration;
 
 use candle_core::MetalDevice;
 use candle_core::backend::BackendDevice;
-use candle_nn::{Module, VarBuilder};
+use candle_nn::Module;
 use criterion::BatchSize;
 use fusor::layers::Linear;
-use fusor::{Device, Tensor};
+use fusor::{Device, Tensor, VarBuilder};
 use futures::executor::block_on;
 
 use criterion::BenchmarkId;
@@ -51,22 +51,20 @@ fn layer_norm(c: &mut Criterion) {
             // Fusor LayerNorm benchmark
             {
                 let mut reader = std::io::Cursor::new(&bytes);
-                let mut var_builder = fusor_core::VarBuilder::from_gguf(&mut reader).unwrap();
+                let mut var_builder = VarBuilder::from_gguf(&mut reader).unwrap();
                 let device = block_on(async { Device::new().await.unwrap() });
 
                 // Load layer norm weights from the model
-                let weight: Tensor<1, f32> = Tensor::Gpu(
-                    var_builder
-                        .pp("blk.0.attn_output_norm")
-                        .get("weight", device.gpu_device().unwrap())
-                        .unwrap()
-                        .dequantize(),
-                );
+                let weight: Tensor<1, f32> = var_builder
+                    .pp("blk.0.attn_output_norm")
+                    .get("weight", &device)
+                    .unwrap()
+                    .dequantize();
                 let bias: Option<Tensor<1, f32>> = var_builder
                     .pp("blk.0.attn_output_norm")
-                    .get("bias", device.gpu_device().unwrap())
+                    .get("bias", &device)
                     .ok()
-                    .map(|b| Tensor::Gpu(b.dequantize()));
+                    .map(|b| b.dequantize());
 
                 let mut group =
                     c.benchmark_group(format!("layer_norm-fusor-{batch_size}x{seq_len}"));
@@ -88,7 +86,7 @@ fn layer_norm(c: &mut Criterion) {
                                     .flat_map(|b| b.iter().flat_map(|s| s.iter().copied()))
                                     .collect::<Vec<_>>(),
                             );
-                            tensor.materialize().await;
+                            tensor.as_gpu().unwrap().materialize().await;
                             let weight_broadcast = weight.broadcast_as([batch_size, seq_len, 1024]);
                             let bias_broadcast = bias
                                 .as_ref()
@@ -103,7 +101,7 @@ fn layer_norm(c: &mut Criterion) {
                                         1e-12,
                                         true,
                                     );
-                                    normalized.materialize().await;
+                                    normalized.as_gpu().unwrap().materialize().await;
                                     sum += start.elapsed();
                                 }
                             }
@@ -247,13 +245,12 @@ fn self_attention(c: &mut Criterion) {
             // Fusor Self-Attention benchmark
             {
                 let mut reader = std::io::Cursor::new(&bytes);
-                let mut var_builder = fusor_core::VarBuilder::from_gguf(&mut reader).unwrap();
+                let mut var_builder = VarBuilder::from_gguf(&mut reader).unwrap();
                 let device = block_on(async { Device::new().await.unwrap() });
 
-                let gpu_device = device.gpu_device().unwrap();
-                let query = Linear::load(gpu_device, &mut var_builder.pp("blk.0.attn_q")).unwrap();
-                let key = Linear::load(gpu_device, &mut var_builder.pp("blk.0.attn_k")).unwrap();
-                let value = Linear::load(gpu_device, &mut var_builder.pp("blk.0.attn_v")).unwrap();
+                let query = Linear::load(&device, &mut var_builder.pp("blk.0.attn_q")).unwrap();
+                let key = Linear::load(&device, &mut var_builder.pp("blk.0.attn_k")).unwrap();
+                let value = Linear::load(&device, &mut var_builder.pp("blk.0.attn_v")).unwrap();
 
                 let mut group =
                     c.benchmark_group(format!("self_attention-fusor-{batch_size}x{seq_len}"));
@@ -276,7 +273,7 @@ fn self_attention(c: &mut Criterion) {
                                     .flat_map(|b| b.iter().flat_map(|s| s.iter().copied()))
                                     .collect::<Vec<_>>(),
                             );
-                            tensor.materialize().await;
+                            tensor.as_gpu().unwrap().materialize().await;
                             let mut sum = Duration::ZERO;
                             while sum.is_zero() {
                                 for _ in 0..iters {
@@ -286,24 +283,21 @@ fn self_attention(c: &mut Criterion) {
                                     let k = key.forward(&tensor);
                                     let v = value.forward(&tensor);
 
-                                    let q = q
-                                        .reshape([batch_size, seq_len, num_heads, head_size])
-                                        .transpose(1, 2);
-                                    let k = k
-                                        .reshape([batch_size, seq_len, num_heads, head_size])
-                                        .transpose(1, 2);
-                                    let v = v
-                                        .reshape([batch_size, seq_len, num_heads, head_size])
-                                        .transpose(1, 2);
+                                    let q = q.reshape([batch_size, seq_len, num_heads, head_size]);
+                                    let q = q.transpose(1, 2);
+                                    let k = k.reshape([batch_size, seq_len, num_heads, head_size]);
+                                    let k = k.transpose(1, 2);
+                                    let v = v.reshape([batch_size, seq_len, num_heads, head_size]);
+                                    let v = v.transpose(1, 2);
 
-                                    let scores = q.mat_mul(&k.t()) / (head_size as f32).sqrt();
-                                    let probs = scores.softmax_last_dim();
+                                    let scores = q.mat_mul(&k.t()).div_scalar((head_size as f32).sqrt());
+                                    let probs = scores.softmax_last_dim::<3>();
 
                                     let context = probs.mat_mul(&v);
                                     let context = context.transpose(1, 2);
                                     let output = context.flatten_last_n::<1, _>();
 
-                                    output.materialize().await;
+                                    output.as_gpu().unwrap().materialize().await;
                                     sum += start.elapsed();
                                 }
                             }
@@ -510,13 +504,11 @@ fn ffn_block(c: &mut Criterion) {
             // Fusor FFN benchmark
             {
                 let mut reader = std::io::Cursor::new(&bytes);
-                let mut var_builder = fusor_core::VarBuilder::from_gguf(&mut reader).unwrap();
+                let mut var_builder = VarBuilder::from_gguf(&mut reader).unwrap();
                 let device = block_on(async { Device::new().await.unwrap() });
 
-                let gpu_device = device.gpu_device().unwrap();
-                let ffn_up = Linear::load(gpu_device, &mut var_builder.pp("blk.0.ffn_up")).unwrap();
-                let ffn_down =
-                    Linear::load(gpu_device, &mut var_builder.pp("blk.0.ffn_down")).unwrap();
+                let ffn_up = Linear::load(&device, &mut var_builder.pp("blk.0.ffn_up")).unwrap();
+                let ffn_down = Linear::load(&device, &mut var_builder.pp("blk.0.ffn_down")).unwrap();
 
                 let mut group =
                     c.benchmark_group(format!("ffn_block-fusor-{batch_size}x{seq_len}"));
@@ -539,7 +531,7 @@ fn ffn_block(c: &mut Criterion) {
                                     .flat_map(|b| b.iter().flat_map(|s| s.iter().copied()))
                                     .collect::<Vec<_>>(),
                             );
-                            tensor.materialize().await;
+                            tensor.as_gpu().unwrap().materialize().await;
                             let mut sum = Duration::ZERO;
                             while sum.is_zero() {
                                 for _ in 0..iters {
@@ -550,7 +542,7 @@ fn ffn_block(c: &mut Criterion) {
 
                                     let output = ffn_down.forward(&intermediate);
 
-                                    output.materialize().await;
+                                    output.as_gpu().unwrap().materialize().await;
                                     sum += start.elapsed();
                                 }
                             }

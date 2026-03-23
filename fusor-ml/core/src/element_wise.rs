@@ -844,7 +844,7 @@ impl<const R: usize, D: crate::FloatDataType> Tensor<R, D> {
             self,
             Some("exp2"),
             "let output = exp2(input);",
-            |grad, input| (grad * &input.exp2()) * D::from_f32(0.6931471805599453),
+            |grad, input| (grad * &input.exp2()) * D::from_f32(std::f32::consts::LN_2),
         )
     }
 }
@@ -906,7 +906,7 @@ impl<const R: usize, D: crate::FloatDataType> Tensor<R, D> {
             self,
             Some("log2"),
             "let output = log2(input);",
-            |grad, input| grad / &(input * D::from_f32(0.6931471805599453)),
+            |grad, input| grad / &(input * D::from_f32(std::f32::consts::LN_2)),
         )
     }
 }
