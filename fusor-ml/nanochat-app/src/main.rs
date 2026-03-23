@@ -384,7 +384,11 @@ fn InteractivePad(
     // display tokens that subtract the overlap so the orange preview starts
     // from the current cursor, not from behind it.
     let display_prediction = if is_popped {
-        compute_display_tokens(tokenizer_loaded.as_ref(), &prompt_preview, &prediction_preview)
+        compute_display_tokens(
+            tokenizer_loaded.as_ref(),
+            &prompt_preview,
+            &prediction_preview,
+        )
     } else {
         prediction_preview.clone()
     };
@@ -435,9 +439,14 @@ fn InteractivePad(
     let cursor_y = current_cursor.1 as f32 + 0.5;
     let max_index = grid_size.saturating_sub(1) as i32;
     let neighbor_dots: Vec<(f32, f32)> = [
-        (-1, -1), (0, -1), (1, -1),
-        (-1,  0),          (1,  0),
-        (-1,  1), (0,  1), (1,  1),
+        (-1, -1),
+        (0, -1),
+        (1, -1),
+        (-1, 0),
+        (1, 0),
+        (-1, 1),
+        (0, 1),
+        (1, 1),
     ]
     .iter()
     .filter_map(|&(dx, dy)| {
@@ -1199,9 +1208,7 @@ fn build_prediction_constraint(
 ) -> (Vec<u32>, Option<FirstTokenConstraint>, bool) {
     if let Some(&last_token) = prompt_tokens.last() {
         if let Some(decoded) = tokenizer.decode_segment_token(last_token) {
-            if let (Some(direction_index), Some(count)) =
-                (decoded.direction_index, decoded.count)
-            {
+            if let (Some(direction_index), Some(count)) = (decoded.direction_index, decoded.count) {
                 prompt_tokens.pop();
                 let constraint = FirstTokenConstraint {
                     mode_index: decoded.mode_index,
@@ -1486,9 +1493,7 @@ fn append_tokens_for_path(
         // incrementing the count instead of pushing a new token.
         let merged = if let Some(&last_token) = prompt_tokens.last() {
             if let Some(decoded) = tokenizer.decode_segment_token(last_token) {
-                if decoded.mode_index == mode
-                    && decoded.direction_index == Some(direction_index)
-                {
+                if decoded.mode_index == mode && decoded.direction_index == Some(direction_index) {
                     let prev_count = decoded.count.unwrap_or(0);
                     let new_count = prev_count + count;
                     // Check the limit from the cursor before the previous token

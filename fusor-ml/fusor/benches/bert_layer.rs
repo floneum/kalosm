@@ -80,17 +80,29 @@ fn layer_norm(c: &mut Criterion) {
                         let device = device.clone();
                         let random_data = random_data.clone();
                         b.to_async(FuturesExecutor).iter_custom(async |iters| {
-                            let tensor: Tensor<3, f32> =
-                                Tensor::from_slice(&device, [batch_size, seq_len, 1024], &random_data.iter().flat_map(|b| b.iter().flat_map(|s| s.iter().copied())).collect::<Vec<_>>());
+                            let tensor: Tensor<3, f32> = Tensor::from_slice(
+                                &device,
+                                [batch_size, seq_len, 1024],
+                                &random_data
+                                    .iter()
+                                    .flat_map(|b| b.iter().flat_map(|s| s.iter().copied()))
+                                    .collect::<Vec<_>>(),
+                            );
                             tensor.materialize().await;
                             let weight_broadcast = weight.broadcast_as([batch_size, seq_len, 1024]);
-                            let bias_broadcast = bias.as_ref().map(|b| b.broadcast_as([batch_size, seq_len, 1024]));
+                            let bias_broadcast = bias
+                                .as_ref()
+                                .map(|b| b.broadcast_as([batch_size, seq_len, 1024]));
                             let mut sum = Duration::ZERO;
                             while sum.is_zero() {
                                 for _ in 0..iters {
                                     let start = std::time::Instant::now();
-                                    let normalized =
-                                        tensor.layer_norm(&weight_broadcast, bias_broadcast.as_ref(), 1e-12, true);
+                                    let normalized = tensor.layer_norm(
+                                        &weight_broadcast,
+                                        bias_broadcast.as_ref(),
+                                        1e-12,
+                                        true,
+                                    );
                                     normalized.materialize().await;
                                     sum += start.elapsed();
                                 }
@@ -256,8 +268,14 @@ fn self_attention(c: &mut Criterion) {
                         let random_data = random_data.clone();
 
                         b.to_async(FuturesExecutor).iter_custom(async |iters| {
-                            let tensor: Tensor<3, f32> =
-                                Tensor::from_slice(&device, [batch_size, seq_len, hidden_size], &random_data.iter().flat_map(|b| b.iter().flat_map(|s| s.iter().copied())).collect::<Vec<_>>());
+                            let tensor: Tensor<3, f32> = Tensor::from_slice(
+                                &device,
+                                [batch_size, seq_len, hidden_size],
+                                &random_data
+                                    .iter()
+                                    .flat_map(|b| b.iter().flat_map(|s| s.iter().copied()))
+                                    .collect::<Vec<_>>(),
+                            );
                             tensor.materialize().await;
                             let mut sum = Duration::ZERO;
                             while sum.is_zero() {
@@ -513,8 +531,14 @@ fn ffn_block(c: &mut Criterion) {
                         let random_data = random_data.clone();
 
                         b.to_async(FuturesExecutor).iter_custom(async |iters| {
-                            let tensor: Tensor<3, f32> =
-                                Tensor::from_slice(&device, [batch_size, seq_len, hidden_size], &random_data.iter().flat_map(|b| b.iter().flat_map(|s| s.iter().copied())).collect::<Vec<_>>());
+                            let tensor: Tensor<3, f32> = Tensor::from_slice(
+                                &device,
+                                [batch_size, seq_len, hidden_size],
+                                &random_data
+                                    .iter()
+                                    .flat_map(|b| b.iter().flat_map(|s| s.iter().copied()))
+                                    .collect::<Vec<_>>(),
+                            );
                             tensor.materialize().await;
                             let mut sum = Duration::ZERO;
                             while sum.is_zero() {

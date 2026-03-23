@@ -547,8 +547,7 @@ impl Resolver {
                 //   - 1 wgpu sizes buffer
                 //   - up to `info_headroom` uniform info bindings
                 let info_headroom = 4usize;
-                let max_fused_inputs =
-                    max_storage_bindings.saturating_sub(2 + info_headroom);
+                let max_fused_inputs = max_storage_bindings.saturating_sub(2 + info_headroom);
 
                 // Count unique inputs after potential merge (duplicates share a binding)
                 let unique_inputs: FxHashSet<_> = all_inputs
@@ -801,9 +800,7 @@ impl Resolver {
 
     /// Try to extract a unary function chain from a node variant.
     /// Only Nary ops with a single input and element-wise access can be converted.
-    fn try_get_unary_chain(
-        variant: &ComputeGraphNodeVariant,
-    ) -> Option<ExtractedUnaryChain> {
+    fn try_get_unary_chain(variant: &ComputeGraphNodeVariant) -> Option<ExtractedUnaryChain> {
         match variant {
             ComputeGraphNodeVariant::Nary(nary) => nary.try_extract_unary_chain(),
             _ => None,
@@ -1088,5 +1085,4 @@ impl Resolver {
             max_dispatch_size,
         );
     }
-
 }

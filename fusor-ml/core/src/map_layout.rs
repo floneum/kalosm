@@ -102,17 +102,17 @@ impl Operation for MapLayoutOperation {
 }
 
 impl<const R: usize, T: DataType> Tensor<R, T> {
-    pub fn restride<const R2: usize>(
-        &self,
-        specs: [crate::StrideSpec; R2],
-    ) -> Tensor<R2, T> {
-        self.add_map_layout(MapLayoutOperation::new(
-            self.key(),
-            move |layout| layout.restride(&specs),
-        ))
+    pub fn restride<const R2: usize>(&self, specs: [crate::StrideSpec; R2]) -> Tensor<R2, T> {
+        self.add_map_layout(MapLayoutOperation::new(self.key(), move |layout| {
+            layout.restride(&specs)
+        }))
     }
 
-    pub(crate) fn transpose(&self, first_axis: impl Dim<R>, second_axis: impl Dim<R>) -> Tensor<R, T> {
+    pub(crate) fn transpose(
+        &self,
+        first_axis: impl Dim<R>,
+        second_axis: impl Dim<R>,
+    ) -> Tensor<R, T> {
         let first_axis = first_axis.resolve();
         let second_axis = second_axis.resolve();
         let shape = self.shape();
@@ -252,10 +252,7 @@ async fn test_broadcast_as_non_continuous() {
     let data = [[1., 2., -1.], [3., 4., -1.]];
     let tensor = Tensor::new(&device, &data);
     println!("tensor: {tensor:?}");
-    let sliced = tensor.restride([
-        crate::StrideSpec::dim(0, 2),
-        crate::StrideSpec::dim(1, 2),
-    ]);
+    let sliced = tensor.restride([crate::StrideSpec::dim(0, 2), crate::StrideSpec::dim(1, 2)]);
     println!("sliced: {sliced:?}");
     let broadcasted = sliced.broadcast_as([2, 2, 3]);
     println!("{broadcasted:?}");

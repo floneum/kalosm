@@ -666,8 +666,7 @@ mod tests {
         let eps = 1e-5f32;
 
         // Composite RMS norm (CPU path: layer_norm with remove_mean=false)
-        let cpu_input: Tensor<2, f32> =
-            Tensor::Cpu(fusor_cpu::Tensor::from_slice([2, 4], &data));
+        let cpu_input: Tensor<2, f32> = Tensor::Cpu(fusor_cpu::Tensor::from_slice([2, 4], &data));
         let cpu_weight: Tensor<2, f32> =
             Tensor::Cpu(fusor_cpu::Tensor::from_slice([2, 4], &[1.0; 8]));
         let composite_result = cpu_input.rms_norm::<1, _>(&cpu_weight, eps);
@@ -677,8 +676,7 @@ mod tests {
         let gpu_input: Tensor<2, f32> = Tensor::from_slice(&gpu_device, [2, 4], &data);
         let gpu_weight: Tensor<1, f32, ConcreteTensor<f32, 1>> =
             Tensor::from_slice(&gpu_device, [4], &weight_data);
-        let fused_result =
-            gpu_input.rms_norm_fused::<1, 1>(&gpu_weight, None, eps);
+        let fused_result = gpu_input.rms_norm_fused::<1, 1>(&gpu_weight, None, eps);
         let fused_output = fused_result.as_slice().await.unwrap();
 
         for i in 0..2 {
@@ -686,7 +684,10 @@ mod tests {
                 assert!(
                     (composite_output[[i, j]] - fused_output[[i, j]]).abs() < 0.001,
                     "Mismatch at [{}, {}]: composite={}, fused={}",
-                    i, j, composite_output[[i, j]], fused_output[[i, j]]
+                    i,
+                    j,
+                    composite_output[[i, j]],
+                    fused_output[[i, j]]
                 );
             }
         }
@@ -704,8 +705,7 @@ mod tests {
         let eps = 1e-5f32;
 
         // Composite: CPU rms_norm + manual bias
-        let cpu_input: Tensor<2, f32> =
-            Tensor::Cpu(fusor_cpu::Tensor::from_slice([2, 2], &data));
+        let cpu_input: Tensor<2, f32> = Tensor::Cpu(fusor_cpu::Tensor::from_slice([2, 2], &data));
         let cpu_weight: Tensor<2, f32> =
             Tensor::Cpu(fusor_cpu::Tensor::from_slice([2, 2], &[2.0, 3.0, 2.0, 3.0]));
         let cpu_bias: Tensor<2, f32> =
@@ -720,8 +720,7 @@ mod tests {
             Tensor::from_slice(&gpu_device, [2], &weight_data);
         let gpu_bias: Tensor<1, f32, ConcreteTensor<f32, 1>> =
             Tensor::from_slice(&gpu_device, [2], &bias_data);
-        let fused_result =
-            gpu_input.rms_norm_fused::<1, 1>(&gpu_weight, Some(&gpu_bias), eps);
+        let fused_result = gpu_input.rms_norm_fused::<1, 1>(&gpu_weight, Some(&gpu_bias), eps);
         let fused_output = fused_result.as_slice().await.unwrap();
 
         for i in 0..2 {
@@ -729,7 +728,10 @@ mod tests {
                 assert!(
                     (composite_output[[i, j]] - fused_output[[i, j]]).abs() < 0.001,
                     "Mismatch at [{}, {}]: composite={}, fused={}",
-                    i, j, composite_output[[i, j]], fused_output[[i, j]]
+                    i,
+                    j,
+                    composite_output[[i, j]],
+                    fused_output[[i, j]]
                 );
             }
         }
@@ -752,8 +754,10 @@ mod tests {
         let eps = 1e-5f32;
 
         // CPU composite
-        let cpu_input: Tensor<2, f32> =
-            Tensor::Cpu(fusor_cpu::Tensor::from_slice([batch_size, hidden_size], &input_data));
+        let cpu_input: Tensor<2, f32> = Tensor::Cpu(fusor_cpu::Tensor::from_slice(
+            [batch_size, hidden_size],
+            &input_data,
+        ));
         // Broadcast weight to full shape for composite rms_norm
         let cpu_weight: Tensor<1, f32> =
             Tensor::Cpu(fusor_cpu::Tensor::from_slice([hidden_size], &weight_data));
@@ -766,8 +770,7 @@ mod tests {
             Tensor::from_slice(&gpu_device, [batch_size, hidden_size], &input_data);
         let gpu_weight: Tensor<1, f32, ConcreteTensor<f32, 1>> =
             Tensor::from_slice(&gpu_device, [hidden_size], &weight_data);
-        let fused_result =
-            gpu_input.rms_norm_fused::<1, 1>(&gpu_weight, None, eps);
+        let fused_result = gpu_input.rms_norm_fused::<1, 1>(&gpu_weight, None, eps);
         let fused_output = fused_result.as_slice().await.unwrap();
 
         for i in 0..batch_size {
@@ -776,7 +779,11 @@ mod tests {
                 assert!(
                     diff < 0.01,
                     "Mismatch at [{}, {}]: composite={}, fused={}, diff={}",
-                    i, j, composite_output[[i, j]], fused_output[[i, j]], diff
+                    i,
+                    j,
+                    composite_output[[i, j]],
+                    fused_output[[i, j]],
+                    diff
                 );
             }
         }

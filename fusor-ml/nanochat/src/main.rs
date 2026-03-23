@@ -125,8 +125,7 @@ async fn main() {
                 let target_values = windows_to_token_targets(&batch.windows);
                 let components = token_component_indexes(&tokenizer, &input_values);
                 let mode_inputs: Tensor<2, u32> = Tensor::new(&device, &components.mode);
-                let direction_inputs: Tensor<2, u32> =
-                    Tensor::new(&device, &components.direction);
+                let direction_inputs: Tensor<2, u32> = Tensor::new(&device, &components.direction);
                 let count_inputs: Tensor<2, u32> = Tensor::new(&device, &components.count);
                 let (cursor_x_inputs, cursor_y_inputs, pen_state_inputs) = canvas_state_tensors(
                     &device,

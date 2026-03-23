@@ -400,10 +400,7 @@ async fn generate_interactive_completion(
         let (context, last_index) =
             autoregressive_context(&tokens, tokenizer.eot_token(), block_size);
 
-        let context_names: Vec<&str> = context
-            .iter()
-            .map(|&t| tokenizer.token_name(t))
-            .collect();
+        let context_names: Vec<&str> = context.iter().map(|&t| tokenizer.token_name(t)).collect();
         println!(
             "[DEBUG] step={}: context_len={}, last_index={}, context={:?}",
             step,
@@ -413,12 +410,15 @@ async fn generate_interactive_completion(
         );
 
         if let Some(spec) = model.canvas_state_spec() {
-            let indexes =
-                canvas_state_indexes(tokenizer, std::slice::from_ref(&context), spec);
+            let indexes = canvas_state_indexes(tokenizer, std::slice::from_ref(&context), spec);
             println!(
                 "[DEBUG] step={}: canvas_x={:?}, canvas_y={:?}, pen={:?}, coord_vocab_size={}, coord_offset={}",
-                step, indexes.cursor_x[0], indexes.cursor_y[0], indexes.pen_state[0],
-                spec.coordinate_vocab_size, spec.coordinate_offset
+                step,
+                indexes.cursor_x[0],
+                indexes.cursor_y[0],
+                indexes.pen_state[0],
+                spec.coordinate_vocab_size,
+                spec.coordinate_offset
             );
         }
 
@@ -454,13 +454,11 @@ async fn generate_interactive_completion(
         let dl = &direction_logits[0][last_index];
         let cl = &count_logits[0][last_index];
         println!("[DEBUG] step={}: mode_logits={:?}", step, ml);
-        let mut dir_indexed: Vec<(usize, f32)> =
-            dl.iter().copied().enumerate().collect();
+        let mut dir_indexed: Vec<(usize, f32)> = dl.iter().copied().enumerate().collect();
         dir_indexed.sort_by(|a, b| b.1.total_cmp(&a.1));
         let top3_dir: Vec<(usize, f32)> = dir_indexed.into_iter().take(3).collect();
         println!("[DEBUG] step={}: top3_direction={:?}", step, top3_dir);
-        let mut count_indexed: Vec<(usize, f32)> =
-            cl.iter().copied().enumerate().collect();
+        let mut count_indexed: Vec<(usize, f32)> = cl.iter().copied().enumerate().collect();
         count_indexed.sort_by(|a, b| b.1.total_cmp(&a.1));
         let top3_count: Vec<(usize, f32)> = count_indexed.into_iter().take(3).collect();
         println!("[DEBUG] step={}: top3_count={:?}", step, top3_count);
@@ -482,7 +480,12 @@ async fn generate_interactive_completion(
             mode,
             step_constraint,
         );
-        println!("[DEBUG] step={}: predicted token={} ({})", step, next, tokenizer.token_name(next));
+        println!(
+            "[DEBUG] step={}: predicted token={} ({})",
+            step,
+            next,
+            tokenizer.token_name(next)
+        );
         tokens.push(next);
         if next == tokenizer.eot_token() {
             break;

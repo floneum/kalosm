@@ -82,9 +82,8 @@ where
     /// * `axes` - A permutation of [0, 1, ..., R-1] specifying the new order
     pub fn permute(&self, axes: [usize; R]) -> Tensor<R, D, MapLayout<&B, R>> {
         let shape = self.shape();
-        let specs: [StrideSpec; R] = std::array::from_fn(|i| {
-            StrideSpec::dim(axes[i], shape[axes[i]])
-        });
+        let specs: [StrideSpec; R] =
+            std::array::from_fn(|i| StrideSpec::dim(axes[i], shape[axes[i]]));
         self.restride(specs)
     }
 
@@ -187,8 +186,7 @@ where
         let mut result: Tensor<R, D> = self.to_concrete();
         for dim in 0..R {
             if repeats[dim] > 1 {
-                let copies: Vec<Tensor<R, D>> =
-                    (0..repeats[dim]).map(|_| result.clone()).collect();
+                let copies: Vec<Tensor<R, D>> = (0..repeats[dim]).map(|_| result.clone()).collect();
                 result = cat(copies, dim);
             }
         }
@@ -442,7 +440,11 @@ where
     let first_shape = tensors[0].shape();
     let total_dim_size: usize = tensors.iter().map(|t| t.shape()[dim]).sum();
     let new_shape: [usize; R] = std::array::from_fn(|i| {
-        if i == dim { total_dim_size } else { first_shape[i] }
+        if i == dim {
+            total_dim_size
+        } else {
+            first_shape[i]
+        }
     });
 
     // Create the output tensor with splat, then slice_assign each tensor into it
@@ -451,7 +453,11 @@ where
     for tensor in &tensors {
         let len = tensor.shape()[dim];
         let slice: [std::ops::Range<usize>; R] = std::array::from_fn(|i| {
-            if i == dim { offset..(offset + len) } else { 0..new_shape[i] }
+            if i == dim {
+                offset..(offset + len)
+            } else {
+                0..new_shape[i]
+            }
         });
         result = result.slice_assign(slice, tensor);
         offset += len;
@@ -709,10 +715,7 @@ mod tests {
         // multiplier [1, 2] → strides [3, 2] (skip every other element in last dim)
         let data = [1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0];
         let t: Tensor<2, f32> = Tensor::Cpu(fusor_cpu::Tensor::from_slice([2, 3], &data));
-        let restrided = t.restride([
-            StrideSpec::dim(0, 2),
-            StrideSpec::dim_with(1, 2, 2),
-        ]);
+        let restrided = t.restride([StrideSpec::dim(0, 2), StrideSpec::dim_with(1, 2, 2)]);
         assert_eq!(restrided.shape(), [2, 2]);
         let slice = restrided.as_slice().await.unwrap();
         // strides [3, 2]: index [i, j] -> offset i*3 + j*2

@@ -675,9 +675,10 @@ impl AdamWModel for NanoChatModel {
         // incrementally.
         let new_graph = Graph::new();
 
-        let token_input = extracted
-            .token_input
-            .apply(&new_graph, &mut state.token_input, step, settings);
+        let token_input =
+            extracted
+                .token_input
+                .apply(&new_graph, &mut state.token_input, step, settings);
 
         let wpe = match (extracted.wpe, state.wpe.as_mut()) {
             (Some(Some((grad, val))), Some(moments)) => Some(Tensor::from_raw(
@@ -1561,16 +1562,12 @@ fn collect_tensor_gpu_key<const R: usize>(
 }
 
 /// Collect GPU keys from an optional (gradient, param_value) pair.
-fn collect_grad_pair_gpu_keys<const R: usize>(
-    pair: &GradPair<R>,
-    keys: &mut Vec<NodeIndex>,
-) {
+fn collect_grad_pair_gpu_keys<const R: usize>(pair: &GradPair<R>, keys: &mut Vec<NodeIndex>) {
     if let Some((grad, val)) = pair {
         collect_tensor_gpu_key(grad, keys);
         collect_tensor_gpu_key(val, keys);
     }
 }
-
 
 // ---------------------------------------------------------------------------
 // Extracted-gradient structs for the two-phase optimizer step.
@@ -2281,9 +2278,7 @@ mod tests {
     use super::*;
     use fusor_nanochat::{
         RuntimeConfig, SaveQuantization,
-        data::{
-            StrokeTokenizer, canvas_state_indexes, position_indexes, token_component_indexes,
-        },
+        data::{StrokeTokenizer, canvas_state_indexes, position_indexes, token_component_indexes},
     };
     use rand::SeedableRng;
 

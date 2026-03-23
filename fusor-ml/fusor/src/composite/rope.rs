@@ -154,9 +154,7 @@ where
                 Tensor::Gpu(x.rope_normal_fused(cos, sin))
             }
             // CPU path - use composite operations
-            (Tensor::Cpu(_), Tensor::Cpu(_), Tensor::Cpu(_)) => {
-                self.rope(&cos_narrow, &sin_narrow)
-            }
+            (Tensor::Cpu(_), Tensor::Cpu(_), Tensor::Cpu(_)) => self.rope(&cos_narrow, &sin_narrow),
             _ => panic!("All tensors must be on the same device"),
         }
     }
@@ -343,16 +341,14 @@ mod tests {
         let cos_flat: Vec<f32> = (0..pos_shape[0])
             .flat_map(|i| {
                 (0..pos_shape[1]).map(move |j| {
-                    ((i as f32) / 10000f32.powf((2 * j) as f32 / (pos_shape[1] * 2) as f32))
-                        .cos()
+                    ((i as f32) / 10000f32.powf((2 * j) as f32 / (pos_shape[1] * 2) as f32)).cos()
                 })
             })
             .collect();
         let sin_flat: Vec<f32> = (0..pos_shape[0])
             .flat_map(|i| {
                 (0..pos_shape[1]).map(move |j| {
-                    ((i as f32) / 10000f32.powf((2 * j) as f32 / (pos_shape[1] * 2) as f32))
-                        .sin()
+                    ((i as f32) / 10000f32.powf((2 * j) as f32 / (pos_shape[1] * 2) as f32)).sin()
                 })
             })
             .collect();
@@ -395,7 +391,13 @@ mod tests {
                         assert!(
                             diff < 1e-4,
                             "Interleaved fused mismatch at [{},{},{},{}]: cpu {} vs gpu {}, diff {}",
-                            b, h, s, d, cpu_val, gpu_val, diff
+                            b,
+                            h,
+                            s,
+                            d,
+                            cpu_val,
+                            gpu_val,
+                            diff
                         );
                     }
                 }
@@ -409,16 +411,14 @@ mod tests {
         let cos_flat: Vec<f32> = (0..pos_shape[0])
             .flat_map(|i| {
                 (0..pos_shape[1]).map(move |j| {
-                    ((i as f32) / 10000f32.powf((2 * j) as f32 / (pos_shape[1] * 2) as f32))
-                        .cos()
+                    ((i as f32) / 10000f32.powf((2 * j) as f32 / (pos_shape[1] * 2) as f32)).cos()
                 })
             })
             .collect();
         let sin_flat: Vec<f32> = (0..pos_shape[0])
             .flat_map(|i| {
                 (0..pos_shape[1]).map(move |j| {
-                    ((i as f32) / 10000f32.powf((2 * j) as f32 / (pos_shape[1] * 2) as f32))
-                        .sin()
+                    ((i as f32) / 10000f32.powf((2 * j) as f32 / (pos_shape[1] * 2) as f32)).sin()
                 })
             })
             .collect();
@@ -461,7 +461,13 @@ mod tests {
                         assert!(
                             diff < 1e-4,
                             "Normal fused mismatch at [{},{},{},{}]: cpu {} vs gpu {}, diff {}",
-                            b, h, s, d, cpu_val, gpu_val, diff
+                            b,
+                            h,
+                            s,
+                            d,
+                            cpu_val,
+                            gpu_val,
+                            diff
                         );
                     }
                 }

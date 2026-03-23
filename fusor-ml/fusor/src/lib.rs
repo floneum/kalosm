@@ -24,8 +24,8 @@ pub use quantized::{CpuF32Tensor, QMatrix};
 use std::ops::{Deref, Range};
 
 pub use composite::{
-    MaskKind, RopeCache, ToVec, ToVec1, ToVec2, ToVec3, arange, arange_step, base_inverse_frequency, cat,
-    stack,
+    MaskKind, RopeCache, ToVec, ToVec1, ToVec2, ToVec3, arange, arange_step,
+    base_inverse_frequency, cat, stack,
 };
 pub use device::Device;
 pub use error::Error;
@@ -750,16 +750,18 @@ where
         let b = second.broadcast_as(out_shape).to_concrete();
         match (&a, &b) {
             (Tensor::Cpu(a), Tensor::Cpu(b)) => {
-                let result: Vec<D> = a.inner().data()
+                let result: Vec<D> = a
+                    .inner()
+                    .data()
                     .iter()
                     .zip(b.inner().data().iter())
                     .map(|(x, y)| x.powf(*y))
                     .collect();
-                Tensor::Cpu(fusor_cpu::Tensor::new(ConcreteTensor::from_slice(out_shape, &result)))
+                Tensor::Cpu(fusor_cpu::Tensor::new(ConcreteTensor::from_slice(
+                    out_shape, &result,
+                )))
             }
-            (Tensor::Gpu(a), Tensor::Gpu(b)) => {
-                Tensor::Gpu(a.pow_(b))
-            }
+            (Tensor::Gpu(a), Tensor::Gpu(b)) => Tensor::Gpu(a.pow_(b)),
             _ => panic!("Cannot mix CPU and GPU tensors"),
         }
     }

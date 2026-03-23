@@ -938,10 +938,12 @@ mod tests {
         let rhs_dequantized = rhs.dequantize::<2>();
         let rhs_tensor = crate::Tensor::new(rhs_dequantized);
         let [n, k] = rhs_tensor.shape();
-        let rhs_transposed = rhs_tensor.restride([
-            fusor_types::StrideSpec::dim(1, k),
-            fusor_types::StrideSpec::dim(0, n),
-        ]).to_concrete();
+        let rhs_transposed = rhs_tensor
+            .restride([
+                fusor_types::StrideSpec::dim(1, k),
+                fusor_types::StrideSpec::dim(0, n),
+            ])
+            .to_concrete();
         let result_dequantized = lhs.matmul_ref(rhs_transposed.inner());
 
         // Results should match

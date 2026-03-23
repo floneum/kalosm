@@ -23,10 +23,8 @@ impl<const R: usize, D: DataType> Tensor<R, D> {
             output_datatype: on_true.datatype(),
         };
         let device = on_true.device().clone();
-        let info = crate::tensor::TensorInfo::new(
-            on_true.shape().as_slice().into(),
-            on_true.datatype(),
-        );
+        let info =
+            crate::tensor::TensorInfo::new(on_true.shape().as_slice().into(), on_true.datatype());
         let key = device.compute_graph().create_nary(nary);
         Tensor::from_parts(crate::tensor::LazyTensorData::from_parts(device, info, key))
     }

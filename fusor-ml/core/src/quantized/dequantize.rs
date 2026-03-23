@@ -5,9 +5,8 @@ use crate::mir::inputs::MirValue;
 use crate::mir::operation::Operation;
 use crate::mir::workgroup_shape::WorkgroupShapeConstraints;
 use crate::{
-    DataType, DataTypeEnum, Device, LazyTensorData, Tensor, TensorData,
-    TensorInfo, mir::kernel::GenericKernel,
-    nary_wise::UnaryFunctionChain,
+    DataType, DataTypeEnum, Device, LazyTensorData, Tensor, TensorData, TensorInfo,
+    mir::kernel::GenericKernel, nary_wise::UnaryFunctionChain,
 };
 use std::fmt::Write;
 

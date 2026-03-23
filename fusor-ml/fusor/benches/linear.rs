@@ -61,8 +61,10 @@ fn linear(c: &mut Criterion) {
                         let device = device.clone();
                         let random_data = random_data.clone();
                         b.to_async(FuturesExecutor).iter_custom(async |iters| {
-                            let flat_data: Vec<f32> = random_data.iter().flat_map(|r| r.iter().copied()).collect();
-                            let tensor: Tensor<2, f32> = Tensor::from_slice(&device, [size, width], &flat_data);
+                            let flat_data: Vec<f32> =
+                                random_data.iter().flat_map(|r| r.iter().copied()).collect();
+                            let tensor: Tensor<2, f32> =
+                                Tensor::from_slice(&device, [size, width], &flat_data);
                             tensor.materialize().await;
                             let mut sum = Duration::ZERO;
                             while sum.is_zero() {

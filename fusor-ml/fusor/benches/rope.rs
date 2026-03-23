@@ -34,14 +34,16 @@ async fn setup_fusor_tensors(
     let pos_shape = [seq_len * 2, head_dim / 2];
     let cos_flat: Vec<f32> = (0..pos_shape[0])
         .flat_map(|i| {
-            (0..pos_shape[1])
-                .map(move |j| ((i as f32) / 10000f32.powf((2 * (j / 2)) as f32 / head_dim as f32)).cos())
+            (0..pos_shape[1]).map(move |j| {
+                ((i as f32) / 10000f32.powf((2 * (j / 2)) as f32 / head_dim as f32)).cos()
+            })
         })
         .collect();
     let sin_flat: Vec<f32> = (0..pos_shape[0])
         .flat_map(|i| {
-            (0..pos_shape[1])
-                .map(move |j| ((i as f32) / 10000f32.powf((2 * (j / 2)) as f32 / head_dim as f32)).sin())
+            (0..pos_shape[1]).map(move |j| {
+                ((i as f32) / 10000f32.powf((2 * (j / 2)) as f32 / head_dim as f32)).sin()
+            })
         })
         .collect();
 
@@ -50,7 +52,8 @@ async fn setup_fusor_tensors(
 
     let numel = batch * heads * seq_len * head_dim;
     let input_flat: Vec<f32> = (0..numel).map(|_| 1.0f32).collect();
-    let input: Tensor<4, f32> = Tensor::from_slice(device, [batch, heads, seq_len, head_dim], &input_flat);
+    let input: Tensor<4, f32> =
+        Tensor::from_slice(device, [batch, heads, seq_len, head_dim], &input_flat);
 
     // Ensure materialization
     _ = input.as_slice().await.unwrap();

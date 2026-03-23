@@ -13,11 +13,10 @@ mod resolve;
 mod visualize;
 
 use crate::{
-    DataTypeEnum, Device, MatMulOperation, QMatrix,
-    ReduceOperation,
+    DataTypeEnum, Device, MatMulOperation, QMatrix, ReduceOperation,
     compute_graph::resolve::ResolverResult, dequantize::DequantizeOperation,
-    map_layout::MapLayoutOperation, mir::operation::Operation,
-    nary_wise::NaryOperation, quantized::matmul::QMatMulOperation, resize::ResizeOperation,
+    map_layout::MapLayoutOperation, mir::operation::Operation, nary_wise::NaryOperation,
+    quantized::matmul::QMatMulOperation, resize::ResizeOperation,
     slice_assign::SliceAssignOperation, tensor::TensorData, visit_tiled::MaybeQData,
 };
 

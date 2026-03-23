@@ -8,18 +8,19 @@ use std::{
     fmt::{Debug, Display},
     ops::Sub,
     pin::Pin,
+    sync::Arc,
 };
 
 use fusor::{DataType, Device, FromArray, SimdElement, Tensor};
 use rand::{
-    Rng, RngCore, SeedableRng,
+    RngCore, SeedableRng,
     distr::{Distribution, StandardUniform, Uniform},
     rngs::StdRng,
 };
 use thiserror::Error;
 
 /// Return all available devices: always CPU, plus GPU if available.
-async fn devices() -> Vec<Device> {
+pub async fn available_devices() -> Vec<Device> {
     let mut devs = vec![Device::Cpu];
     if let Ok(gpu) = Device::gpu().await {
         devs.push(gpu);
@@ -100,62 +101,146 @@ pub fn random_tensor<const R: usize, T: DataType + SimdElement>(
     Tensor::from_slice(device, shape, &data)
 }
 
-/// Generate a sequential f32 tensor: [0, 1, 2, ...].
-pub fn sequential_tensor<const R: usize, T: DataType + SimdElement + From<usize>>(
+/// Generate a sequential tensor: [0, 1, 2, ...].
+///
+/// This uses `From<u16>` so it works for both floating-point and integer tensor types
+/// used throughout fusor conformance tests.
+pub fn sequential_tensor<const R: usize, T: DataType + SimdElement + From<u16>>(
     device: &Device,
     shape: [usize; R],
 ) -> Tensor<R, T> {
     let total: usize = shape.iter().product();
-    let data: Vec<T> = (0..total).map(|i| T::from(i)).collect();
+    let data: Vec<T> = (0..total)
+        .map(|i| T::from(u16::try_from(i).expect("sequential tensor index fits in u16")))
+        .collect();
     Tensor::from_slice(device, shape, &data)
 }
 
-struct FuzzGenerator<const R: usize, T: SimdElement> {
-    rng: rand::rngs::StdRng,
-    distribution: Box<dyn Fn(&mut rand::rngs::StdRng) -> T>,
+#[derive(Clone)]
+pub struct FuzzGenerator<const R: usize, T: SimdElement> {
+    seed: u64,
+    distribution: Arc<dyn Fn(&mut rand::rngs::StdRng) -> T + Send + Sync>,
     shape: [usize; R],
     phantom: std::marker::PhantomData<T>,
 }
 
 impl<const R: usize, T: SimdElement + DataType> FuzzGenerator<R, T> {
-    fn new(shape: [usize; R]) -> Self
+    pub fn new(shape: [usize; R]) -> Self
     where
         StandardUniform: rand::distr::Distribution<T>,
     {
         Self {
-            rng: rand::rngs::StdRng::from_os_rng(),
-            distribution: Box::new(move |rng| StandardUniform.sample(rng)),
+            seed: 0,
+            distribution: Arc::new(move |rng| StandardUniform.sample(rng)),
             shape,
             phantom: std::marker::PhantomData,
         }
     }
 
-    fn with_rng(mut self, mut rng: impl RngCore) -> Self {
-        self.rng = rand::rngs::StdRng::from_rng(&mut rng);
+    pub fn with_seed(mut self, seed: u64) -> Self {
+        self.seed = seed;
         self
     }
 
-    fn with_distribution(mut self, distribution: impl Distribution<T> + 'static) -> Self {
-        self.distribution = Box::new(move |rng| distribution.sample(rng));
+    pub fn with_rng(mut self, mut rng: impl RngCore) -> Self {
+        self.seed = rng.next_u64();
         self
     }
 
-    fn generate(&mut self, device: &Device) -> Tensor<R, T> {
-        random_tensor(device, self.shape, &mut self.rng, &self.distribution)
+    pub fn with_distribution(
+        mut self,
+        distribution: impl Distribution<T> + Send + Sync + 'static,
+    ) -> Self {
+        self.distribution = Arc::new(move |rng| distribution.sample(rng));
+        self
     }
+
+    fn seed_for_run(&self, run: usize) -> u64 {
+        // Stable run-dependent mixing so every backend sees identical samples.
+        self.seed
+            ^ (run as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15)
+            ^ (R as u64).wrapping_mul(0xBF58_476D_1CE4_E5B9)
+    }
+
+    fn generate_for_run(&self, device: &Device, run: usize) -> Tensor<R, T> {
+        let mut rng = rand::rngs::StdRng::seed_from_u64(self.seed_for_run(run));
+        let base = random_tensor(device, self.shape, &mut rng, &*self.distribution);
+        // Vary layout based on run index: even runs stay contiguous, odd runs
+        // get a non-contiguous layout so operations are tested with both.
+        let strategy = run % 3;
+        match strategy {
+            0 => base,
+            1 => make_transposed(base, &mut rng, &*self.distribution),
+            _ => make_sliced(base, &mut rng, &*self.distribution),
+        }
+    }
+}
+
+/// Generate a contiguous tensor with the last two dimensions swapped, then
+/// transpose it so the result has the correct shape but non-contiguous strides.
+fn make_transposed<const R: usize, T: SimdElement + DataType + Default>(
+    tensor: Tensor<R, T>,
+    rng: &mut StdRng,
+    sample: &dyn Fn(&mut StdRng) -> T,
+) -> Tensor<R, T> {
+    if R < 2 {
+        return tensor;
+    }
+    let shape = tensor.shape();
+    // Build a shape with the last two dims swapped.
+    let transposed_shape: [usize; R] = std::array::from_fn(|i| {
+        if i == R - 2 {
+            shape[R - 1]
+        } else if i == R - 1 {
+            shape[R - 2]
+        } else {
+            shape[i]
+        }
+    });
+    let device = tensor.device();
+    // Generate fresh contiguous data in the transposed shape, then
+    // transpose so the logical shape matches `self.shape` but strides
+    // are non-contiguous (the last two dims' strides are swapped).
+    let contiguous = random_tensor(&device, transposed_shape, rng, sample);
+    contiguous.transpose(R - 2, R - 1).to_concrete()
+}
+
+/// Generate a larger tensor and narrow it back to the original shape,
+/// producing a tensor with a non-zero offset in the underlying buffer.
+fn make_sliced<const R: usize, T: SimdElement + DataType + Default>(
+    tensor: Tensor<R, T>,
+    rng: &mut StdRng,
+    sample: &dyn Fn(&mut StdRng) -> T,
+) -> Tensor<R, T> {
+    if R == 0 {
+        return tensor;
+    }
+    let shape = tensor.shape();
+    // Pick the last dimension to pad. We prepend `pad` extra elements
+    // along that dimension so the resulting narrow has a non-zero offset.
+    let pad_dim = R - 1;
+    let pad = 1;
+    let padded_size = shape[pad_dim] + pad;
+    let padded_shape: [usize; R] =
+        std::array::from_fn(|i| if i == pad_dim { padded_size } else { shape[i] });
+    let device = tensor.device();
+    let padded = random_tensor(&device, padded_shape, rng, sample);
+    // Narrow away the extra padding, creating an offset view.
+    padded.narrow(pad_dim, pad, shape[pad_dim]).to_concrete()
 }
 
 impl<const R: usize> FuzzGenerator<R, f32> {
-    fn with_positive(mut self) -> Self {
+    pub fn with_positive(mut self) -> Self {
         self.distribution =
-            Box::new(move |rng| Uniform::new(0.0, 1.0).expect("0.0 < 1.0").sample(rng));
+            Arc::new(move |rng| Uniform::new(0.0, 1.0).expect("0.0 < 1.0").sample(rng));
         self
     }
 }
 
-trait GenerateFromDevice {
+#[doc(hidden)]
+pub trait GenerateFromDevice {
     type Output;
-    fn generate(&mut self, device: &Device) -> Self::Output;
+    fn generate(&mut self, device: &Device, run: usize) -> Self::Output;
 }
 
 impl<F, O> GenerateFromDevice for F
@@ -163,19 +248,20 @@ where
     F: FnMut(&Device) -> O,
 {
     type Output = O;
-    fn generate(&mut self, device: &Device) -> Self::Output {
+    fn generate(&mut self, device: &Device, _run: usize) -> Self::Output {
         (self)(device)
     }
 }
 
 impl<const R: usize, T: SimdElement + DataType> GenerateFromDevice for FuzzGenerator<R, T> {
     type Output = Tensor<R, T>;
-    fn generate(&mut self, device: &Device) -> Self::Output {
-        self.generate(device)
+    fn generate(&mut self, device: &Device, run: usize) -> Self::Output {
+        self.generate_for_run(device, run)
     }
 }
 
-trait AsyncFnMutTuple<Args> {
+#[doc(hidden)]
+pub trait AsyncFnMutTuple<Args> {
     type Output;
 
     fn call_mut<'a>(
@@ -192,6 +278,7 @@ macro_rules! impl_fn_mut_tuple {
             Fut: std::future::Future<Output = U> + Send + 'static,
         {
             type Output = U;
+            #[allow(non_snake_case)]
             fn call_mut<'a>(&'a mut self, ($($type,)*): ($($type,)*)) -> Pin<Box<dyn std::future::Future<Output = Self::Output> + Send + 'a>> {
                 Box::pin((self)($($type,)*))
             }
@@ -207,9 +294,10 @@ impl_fn_mut_tuple!(A, B, C, D);
 impl_fn_mut_tuple!(A, B, C, D, E);
 impl_fn_mut_tuple!(A, B, C, D, E, F);
 
-trait GenTuple {
+#[doc(hidden)]
+pub trait GenTuple {
     type Output;
-    fn generate(&mut self, device: &Device) -> Self::Output;
+    fn generate(&mut self, device: &Device, run: usize) -> Self::Output;
 }
 
 macro_rules! impl_gen_tuple {
@@ -221,11 +309,12 @@ macro_rules! impl_gen_tuple {
             )*
         {
             type Output = ($($type_out,)*);
-            fn generate(&mut self, device: &Device) -> Self::Output {
+            #[allow(non_snake_case)]
+            fn generate(&mut self, device: &Device, run: usize) -> Self::Output {
                 let ($($type,)*) = self;
                 (
                     $(
-                        $type.generate(device),
+                        $type.generate(device, run),
                     )*
                 )
             }
@@ -240,7 +329,8 @@ impl_gen_tuple!(A -> AOut, B -> BOut, C -> COut, D -> DOut);
 impl_gen_tuple!(A -> AOut, B -> BOut, C -> COut, D -> DOut, E -> EOut);
 impl_gen_tuple!(A -> AOut, B -> BOut, C -> COut, D -> DOut, E -> EOut, F -> FOut);
 
-trait ResolveTensorTuple {
+#[doc(hidden)]
+pub trait ResolveTensorTuple {
     type Output;
 
     fn resolve(self) -> impl Future<Output = Result<Self::Output, fusor::Error>> + Send + 'static;
@@ -258,6 +348,7 @@ macro_rules! impl_resolve_tensor_tuple {
         {
             type Output = ($(<fusor_types::TensorSlice<$rank, $type, fusor::EitherMappedBuffer> as fusor::ToVec>::Output,)*);
 
+            #[allow(non_snake_case)]
             async fn resolve(self) -> Result<Self::Output, fusor::Error> {
                 let ($($type,)*) = self;
                 Ok((
@@ -268,6 +359,7 @@ macro_rules! impl_resolve_tensor_tuple {
             }
 
             #[allow(unused)]
+            #[allow(non_snake_case)]
             fn extract_device(&self) -> Device {
                 let ($($type,)*) = self;
                 $(
@@ -287,12 +379,14 @@ impl_resolve_tensor_tuple!(A = N1, B = N2, C = N3, D = N4);
 impl_resolve_tensor_tuple!(A = N1, B = N2, C = N3, D = N4, E = N5);
 impl_resolve_tensor_tuple!(A = N1, B = N2, C = N3, D = N4, E = N5, F = N6);
 
-trait PushTuple<Tail> {
+#[doc(hidden)]
+pub trait PushTuple<Tail> {
     type Output;
     fn push(self, new_last: Tail) -> Self::Output;
 }
 
-trait PopTuple {
+#[doc(hidden)]
+pub trait PopTuple {
     type First;
     type Rest;
     fn pop(self) -> (Self::First, Self::Rest);
@@ -303,6 +397,7 @@ macro_rules! impl_push_pop_tuple {
         impl<$first_type $(,$type)*> PopTuple for ($first_type, $($type,)*) {
             type First = $first_type;
             type Rest = ($($type,)*);
+            #[allow(non_snake_case)]
             fn pop(self) -> (Self::First, Self::Rest) {
                 let ($first_type, $($type,)*) = self;
                 ($first_type, ($($type,)*))
@@ -311,6 +406,7 @@ macro_rules! impl_push_pop_tuple {
 
         impl<$first_type, $($type,)* Tail> PushTuple<Tail> for ($first_type, $($type,)*) {
             type Output = ($first_type, $($type,)* Tail);
+            #[allow(non_snake_case)]
             fn push(self, new_last: Tail) -> Self::Output {
                 let (head, $($type,)*) = self;
                 (head, $($type,)* new_last)
@@ -340,7 +436,7 @@ impl_push_pop_tuple!(A, B, C, D, E);
 impl_push_pop_tuple!(A, B, C, D, E, F);
 
 #[derive(Error, Debug)]
-struct ItemMismatchError {
+pub struct ItemMismatchError {
     device: Device,
     position: Vec<usize>,
     expected: String,
@@ -348,7 +444,7 @@ struct ItemMismatchError {
 }
 
 impl ItemMismatchError {
-    fn new(
+    pub fn new(
         device: Device,
         position: impl IntoIterator<Item = usize>,
         expected: impl ToString,
@@ -375,10 +471,10 @@ impl Display for ItemMismatchError {
 
 /// ```compile_fail
 /// crate::assert(|x: fusor::Tensor<2, f32>| x.sin().to_concrete())
-///         .arg(FuzzGenerator::new([10; 2]))
+///         .arg(FuzzGenerator::<2, f32>::new([10; 2]))
 ///         .build();
 /// ```
-struct AssertBuilder<T, U, Generators = (), Compare = ()> {
+pub struct AssertBuilder<T, U, Generators = (), Compare = ()> {
     baseline: Box<dyn AsyncFnMutTuple<T, Output = U>>,
     to_validate: Vec<Box<dyn AsyncFnMutTuple<T, Output = U>>>,
     generators: Generators,
@@ -401,7 +497,7 @@ impl<T, U> AssertBuilder<T, U> {
 }
 
 impl<T, U, Generators, Compare> AssertBuilder<T, U, Generators, Compare> {
-    fn arg<Gen, O>(self, g: Gen) -> AssertBuilder<T, U, Generators::Output, Compare>
+    pub fn arg<Gen, O>(self, g: Gen) -> AssertBuilder<T, U, Generators::Output, Compare>
     where
         Generators: PushTuple<Gen>,
         Gen: GenerateFromDevice<Output = O>,
@@ -416,9 +512,9 @@ impl<T, U, Generators, Compare> AssertBuilder<T, U, Generators, Compare> {
         }
     }
 
-    fn compare_with<Cmp>(self, cmp: Cmp) -> AssertBuilder<T, U, Generators, Cmp>
+    pub fn compare_with<Cmp>(self, cmp: Cmp) -> AssertBuilder<T, U, Generators, Cmp>
     where
-        Cmp: Fn(U, U) -> bool + 'static,
+        Cmp: IntoCompare<U>,
     {
         AssertBuilder {
             baseline: self.baseline,
@@ -430,28 +526,101 @@ impl<T, U, Generators, Compare> AssertBuilder<T, U, Generators, Compare> {
         }
     }
 
-    fn runs(mut self, runs: usize) -> Self {
+    pub fn runs(mut self, runs: usize) -> Self {
         self.runs = runs;
         self
     }
 
-    fn devices(mut self, devices: impl IntoIterator<Item = Device>) -> Self {
+    pub fn devices(mut self, devices: impl IntoIterator<Item = Device>) -> Self {
         self.devices = Some(devices.into_iter().collect());
         self
     }
 
-    fn equal_to(mut self, other: impl AsyncFnMutTuple<T, Output = U> + 'static) -> Self {
+    pub fn equal_to(mut self, other: impl AsyncFnMutTuple<T, Output = U> + 'static) -> Self {
         self.to_validate.push(Box::new(other));
         self
     }
 
-    fn equal_to_array_op<const R: usize, D, Arr>(
+    pub fn equal_to_resolved_op(
         self,
-        mut other: impl AsyncFnMutTuple<T::Output, Output = Vec<Arr>> + Copy + Send + 'static,
+        mut other: impl AsyncFnMutTuple<T::Output, Output = U> + Copy + Send + 'static,
     ) -> Self
     where
         T: ResolveTensorTuple,
-        for<'a> U: FromArray<R, D, &'a Vec<Arr>, Device>,
+    {
+        struct UnpackedTuple<T>(T);
+
+        impl<F, Fut, I, O> AsyncFnMutTuple<I> for UnpackedTuple<F>
+        where
+            F: FnMut(I) -> Fut,
+            Fut: std::future::Future<Output = O> + Send + 'static,
+        {
+            type Output = O;
+            fn call_mut<'a>(
+                &'a mut self,
+                input: I,
+            ) -> Pin<Box<dyn std::future::Future<Output = Self::Output> + Send + 'a>> {
+                Box::pin((self.0)(input))
+            }
+        }
+
+        let wrapped = move |input: T| {
+            let input = input.resolve();
+            async move {
+                let input = input.await.unwrap();
+                other.call_mut(input).await
+            }
+        };
+
+        self.equal_to(UnpackedTuple(wrapped))
+    }
+
+    pub fn equal_to_resolved_with_device(
+        self,
+        mut other: impl AsyncFnMutTuple<<T::Output as PushTuple<Device>>::Output, Output = U>
+        + Copy
+        + Send
+        + 'static,
+    ) -> Self
+    where
+        T: ResolveTensorTuple,
+        T::Output: PushTuple<Device>,
+    {
+        struct UnpackedTuple<T>(T);
+
+        impl<F, Fut, I, O> AsyncFnMutTuple<I> for UnpackedTuple<F>
+        where
+            F: FnMut(I) -> Fut,
+            Fut: std::future::Future<Output = O> + Send + 'static,
+        {
+            type Output = O;
+            fn call_mut<'a>(
+                &'a mut self,
+                input: I,
+            ) -> Pin<Box<dyn std::future::Future<Output = Self::Output> + Send + 'a>> {
+                Box::pin((self.0)(input))
+            }
+        }
+
+        let wrapped = move |input: T| {
+            let device = input.extract_device();
+            let input = input.resolve();
+            async move {
+                let input = input.await.unwrap();
+                other.call_mut(input.push(device)).await
+            }
+        };
+
+        self.equal_to(UnpackedTuple(wrapped))
+    }
+
+    pub fn equal_to_array_op<const R: usize, D, A>(
+        self,
+        mut other: impl AsyncFnMutTuple<T::Output, Output = A> + Copy + Send + 'static,
+    ) -> Self
+    where
+        T: ResolveTensorTuple,
+        for<'a> U: FromArray<R, D, &'a A, Device>,
     {
         struct UnpackedTuple<T>(T);
 
@@ -499,11 +668,11 @@ where
             let devices = if let Some(devs) = self.devices {
                 devs
             } else {
-                devices().await
+                available_devices().await
             };
-            for device in devices {
-                for _ in 0..self.runs {
-                    let args = self.generators.generate(&device);
+            for run in 0..self.runs {
+                for device in &devices {
+                    let args = self.generators.generate(device, run);
                     let expected = self.baseline.call_mut(args.clone()).await;
                     for to_validate in &mut self.to_validate {
                         let actual = to_validate.call_mut(args.clone()).await;
@@ -517,7 +686,8 @@ where
     }
 }
 
-trait IntoCompare<U> {
+#[doc(hidden)]
+pub trait IntoCompare<U> {
     type Error: Error;
 
     fn into_compare(
@@ -579,23 +749,50 @@ impl<const R: usize> IntoCompare<Tensor<R, f32>> for () {
     }
 }
 
-fn assert<T, U>(op: impl AsyncFnMutTuple<T, Output = U> + 'static) -> AssertBuilder<T, U> {
+pub fn exact_compare<const R: usize, T>() -> impl for<'a> Fn(
+    &'a Tensor<R, T>,
+    &'a Tensor<R, T>,
+) -> Pin<
+    Box<dyn std::future::Future<Output = Result<(), ItemMismatchError>> + 'a>,
+> + Clone
+where
+    T: DataType + SimdElement + PartialEq,
+{
+    |a, b| Box::pin(exact_eq(a, b))
+}
+
+pub fn approx_compare<const R: usize, T>(
+    tol: T,
+) -> impl for<'a> Fn(
+    &'a Tensor<R, T>,
+    &'a Tensor<R, T>,
+) -> Pin<Box<dyn std::future::Future<Output = Result<(), ItemMismatchError>> + 'a>>
++ Clone
+where
+    T: Sub<Output = T> + PartialOrd + DataType + SimdElement + Copy,
+{
+    move |a, b| Box::pin(approx_eq(a, b, tol))
+}
+
+pub fn assert<T, U>(op: impl AsyncFnMutTuple<T, Output = U> + 'static) -> AssertBuilder<T, U> {
     AssertBuilder::new(op)
 }
 
 #[cfg(test)]
 mod api_tests {
-    use fusor::{FromArray, Tensor, ToVec};
+    use fusor::{Device, Tensor};
 
     use crate::FuzzGenerator;
 
     #[tokio::test]
     async fn test_api() {
         crate::assert(async |x: fusor::Tensor<1, f32>| x.sin().to_concrete())
-            .arg(FuzzGenerator::new([64; 1]))
-            .equal_to_array_op(async |vec: Vec<f32>| {
-                vec.iter().map(|&v| v.sin()).collect::<Vec<_>>()
+            .arg(FuzzGenerator::<1, f32>::new([64; 1]))
+            .equal_to_resolved_with_device(async |vec: Vec<f32>, device: Device| {
+                let expected = vec.iter().map(|&v| v.sin()).collect::<Vec<_>>();
+                Tensor::new(&device, &expected)
             })
+            .runs(10)
             .await
             .unwrap();
     }

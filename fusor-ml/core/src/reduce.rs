@@ -2,12 +2,12 @@ use std::fmt::{Display, Write};
 
 use crate::{
     Dim, LastRank, LastRankInner, NextRankInner,
-    nary_wise::UnaryFunctionChain,
     mir::{
         globals::KernelGlobalSpace,
         operation::Operation,
         workgroup_shape::{Constraint, WorkgroupShape, WorkgroupShapeConstraints},
     },
+    nary_wise::UnaryFunctionChain,
     visit_tiled::distribute_workgroups,
 };
 use crate::{
@@ -626,10 +626,7 @@ async fn test_reduce_sliced_sum() {
 
     let data = [[1., 2.], [3., 4.], [5., 6.]];
     let tensor = Tensor::new(&device, &data);
-    let tensor = tensor.restride([
-        crate::StrideSpec::dim(0, 3),
-        crate::StrideSpec::dim(1, 1),
-    ]);
+    let tensor = tensor.restride([crate::StrideSpec::dim(0, 3), crate::StrideSpec::dim(1, 1)]);
 
     let output = tensor.sum(0);
 

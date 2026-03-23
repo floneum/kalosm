@@ -11,8 +11,7 @@ use tabbycat::Graph;
 use wgpu::COPY_BUFFER_ALIGNMENT;
 
 use crate::{
-    Device, Dim, Layout, MatMulOperation, MatMulParams,
-    ReduceFunction, ReduceOperation,
+    Device, Dim, Layout, MatMulOperation, MatMulParams, ReduceFunction, ReduceOperation,
     compute_graph::NodeIndex,
     map_layout::MapLayoutOperation,
     mir::operation::Operation,
@@ -274,7 +273,12 @@ impl LazyTensorData {
         Self::from_parts(device, info, key)
     }
 
-    pub(crate) fn binary_nary(&self, other_key: NodeIndex, function: NaryFunction, shape: &[usize]) -> Self {
+    pub(crate) fn binary_nary(
+        &self,
+        other_key: NodeIndex,
+        function: NaryFunction,
+        shape: &[usize],
+    ) -> Self {
         let device = self.device.clone();
         let mut info = self.info.clone();
         info.datatype = function.output_type;
@@ -957,10 +961,7 @@ impl<D: DataType, const R: usize> Tensor<R, D> {
         self
     }
 
-    pub(crate) fn unary_nary<D2: DataType>(
-        &self,
-        function: NaryFunction,
-    ) -> Tensor<R, D2> {
+    pub(crate) fn unary_nary<D2: DataType>(&self, function: NaryFunction) -> Tensor<R, D2> {
         Tensor::from_parts(self.data.unary_nary(function))
     }
 
@@ -977,7 +978,10 @@ impl<D: DataType, const R: usize> Tensor<R, D> {
         }
 
         assert_eq!(self.shape(), other.shape());
-        Self::from_parts(self.data.binary_nary(other.data.key, function, self.shape()))
+        Self::from_parts(
+            self.data
+                .binary_nary(other.data.key, function, self.shape()),
+        )
     }
 
     pub(crate) fn add_mat_mul(&self, other: &Self, parameters: Option<MatMulParams>) -> Self {
@@ -1079,10 +1083,7 @@ async fn test_tensor_slice() {
     let data = [[1., 2.], [3., 4.], [5., 6.]];
     let tensor = Tensor::new(&device, &data);
 
-    let slice = tensor.restride([
-        crate::StrideSpec::dim(0, 2),
-        crate::StrideSpec::dim(1, 1),
-    ]);
+    let slice = tensor.restride([crate::StrideSpec::dim(0, 2), crate::StrideSpec::dim(1, 1)]);
     let as_slice = slice.as_slice().await.unwrap();
     assert_eq!(as_slice[[0, 0]], 1.);
     assert_eq!(as_slice.get([0, 1]), None);

@@ -5,8 +5,8 @@ mod report;
 
 pub use config::{RuntimeConfig, SaveQuantization};
 pub use data::{
-    StrokePath, StrokeScene, StrokeTokenizer, TokenComponentIndexes, token_component_indexes,
-    tokens_to_stroke_scene, tokens_to_svg_string, INPUT_MODE_COUNT,
+    INPUT_MODE_COUNT, StrokePath, StrokeScene, StrokeTokenizer, TokenComponentIndexes,
+    token_component_indexes, tokens_to_stroke_scene, tokens_to_svg_string,
 };
 pub use report::{
     ComparisonReport, ComparisonSample, DatasetGalleryItem, FirstTokenConstraint, InferenceSample,

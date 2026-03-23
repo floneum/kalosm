@@ -1163,9 +1163,18 @@ fn load_feather_dataset(dataset_path: &Path, runtime: &RuntimeConfig) -> Dataset
         ),
         tokenizer,
         split: DatasetSplit {
-            train: SourceDataset { files: train, weights: Vec::new() },
-            validation: SourceDataset { files: validation, weights: Vec::new() },
-            test: SourceDataset { files: test, weights: Vec::new() },
+            train: SourceDataset {
+                files: train,
+                weights: Vec::new(),
+            },
+            validation: SourceDataset {
+                files: validation,
+                weights: Vec::new(),
+            },
+            test: SourceDataset {
+                files: test,
+                weights: Vec::new(),
+            },
         },
     }
 }
@@ -1193,8 +1202,7 @@ fn feather_source_files(
 
     for (perm_index, permuted_strokes) in &permutations {
         for &augmentation in augmentations {
-            let strokes =
-                augment_feather_strokes(permuted_strokes, icon.grid_size, augmentation);
+            let strokes = augment_feather_strokes(permuted_strokes, icon.grid_size, augmentation);
             let content_tokens = feather_content_tokens(tokenizer, &strokes, &icon.name);
             if !seen.insert(content_tokens.clone()) {
                 continue;
@@ -1341,9 +1349,7 @@ fn apply_reversal_mask(strokes: &[FeatherStroke], mask: usize) -> Vec<FeatherStr
         .collect()
 }
 
-fn all_order_and_reversal_variants(
-    strokes: &[FeatherStroke],
-) -> Vec<(usize, Vec<FeatherStroke>)> {
+fn all_order_and_reversal_variants(strokes: &[FeatherStroke]) -> Vec<(usize, Vec<FeatherStroke>)> {
     let n = strokes.len();
     let mut indices: Vec<usize> = (0..n).collect();
     let mut result = Vec::new();
@@ -1373,10 +1379,7 @@ fn next_permutation(indices: &mut [usize]) -> bool {
     let Some(i) = (0..n - 1).rev().find(|&i| indices[i] < indices[i + 1]) else {
         return false;
     };
-    let j = (i + 1..n)
-        .rev()
-        .find(|&j| indices[i] < indices[j])
-        .unwrap();
+    let j = (i + 1..n).rev().find(|&j| indices[i] < indices[j]).unwrap();
     indices.swap(i, j);
     indices[i + 1..].reverse();
     true
@@ -2011,7 +2014,10 @@ fn generate_split(
             )
         })
         .collect();
-    SourceDataset { files, weights: Vec::new() }
+    SourceDataset {
+        files,
+        weights: Vec::new(),
+    }
 }
 
 fn generate_source_file(
@@ -3475,9 +3481,17 @@ mod tests {
         ];
         let perms = stroke_order_permutations(&strokes, "rev_check");
         // Should contain a variant where first stroke is reversed
-        assert!(perms.iter().any(|(_, s)| s[0].points == vec![(1, 0), (0, 0)]));
+        assert!(
+            perms
+                .iter()
+                .any(|(_, s)| s[0].points == vec![(1, 0), (0, 0)])
+        );
         // Should contain a variant where second stroke is reversed
-        assert!(perms.iter().any(|(_, s)| s[1].points == vec![(4, 3), (3, 3)]));
+        assert!(
+            perms
+                .iter()
+                .any(|(_, s)| s[1].points == vec![(4, 3), (3, 3)])
+        );
     }
 
     #[test]

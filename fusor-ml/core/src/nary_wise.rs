@@ -548,7 +548,8 @@ impl NaryOperation {
                 return None;
             }
             writeln!(function_body, "let output = output_0;").unwrap();
-            let nary_func = NaryFunction::unary(None, function_body, input_datatype, output_datatype);
+            let nary_func =
+                NaryFunction::unary(None, function_body, input_datatype, output_datatype);
 
             Some(ExtractedUnaryChain {
                 value,

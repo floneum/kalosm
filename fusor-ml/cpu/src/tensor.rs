@@ -137,7 +137,10 @@ where
     /// the layout produces valid memory access patterns.
     ///
     /// This operation is lazy and preserves laziness of the inner tensor.
-    pub fn restride_layout<const R2: usize>(self, new_layout: Layout) -> Tensor<R2, MapLayout<T, R2>> {
+    pub fn restride_layout<const R2: usize>(
+        self,
+        new_layout: Layout,
+    ) -> Tensor<R2, MapLayout<T, R2>> {
         Tensor::new(MapLayout::new(self.inner, new_layout))
     }
 
@@ -1148,8 +1151,6 @@ where
         Tensor::new(scalar::DivScalar::new(self.inner, scalar_val))
     }
 }
-
-
 
 // Static methods for creating 1D tensors
 impl<E: SimdElement> Tensor<1, ConcreteTensor<E, 1>> {

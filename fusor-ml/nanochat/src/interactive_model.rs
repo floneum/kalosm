@@ -318,7 +318,8 @@ impl InteractiveNanoChatModel {
         let mode_emb: Tensor<3, f32> =
             Embedding::new_from_tensor(self.token_input_mode.clone()).forward(mode_inputs);
         let dir_emb: Tensor<3, f32> =
-            Embedding::new_from_tensor(self.token_input_direction.clone()).forward(direction_inputs);
+            Embedding::new_from_tensor(self.token_input_direction.clone())
+                .forward(direction_inputs);
         let count_emb: Tensor<3, f32> =
             Embedding::new_from_tensor(self.token_input_count.clone()).forward(count_inputs);
         let mut x: Tensor<3, f32> = (mode_emb + dir_emb + count_emb).to_concrete();

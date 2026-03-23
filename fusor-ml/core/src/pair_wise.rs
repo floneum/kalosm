@@ -1,10 +1,6 @@
 use std::ops::{Add, Div, Mul, Sub};
 
-use crate::{
-    MaxRank, Tensor,
-    nary_wise::NaryFunction,
-    tensor::DataType,
-};
+use crate::{MaxRank, Tensor, nary_wise::NaryFunction, tensor::DataType};
 
 fn binary_op<const R: usize, T: DataType>(
     lhs: &Tensor<R, T>,
@@ -241,15 +237,9 @@ async fn test_pair_wise_add_sparse() {
     let data_a = [[1., 2.], [3., 4.], [5., 6.]];
     let data_b = [[1., 2.], [3., 4.], [5., 6.]];
     let tensor_a = Tensor::new(&device, &data_a);
-    let tensor_a = tensor_a.restride([
-        crate::StrideSpec::dim(0, 3),
-        crate::StrideSpec::dim(1, 1),
-    ]);
+    let tensor_a = tensor_a.restride([crate::StrideSpec::dim(0, 3), crate::StrideSpec::dim(1, 1)]);
     let tensor_b = Tensor::new(&device, &data_b);
-    let tensor_b = tensor_b.restride([
-        crate::StrideSpec::dim(0, 3),
-        crate::StrideSpec::dim(1, 1),
-    ]);
+    let tensor_b = tensor_b.restride([crate::StrideSpec::dim(0, 3), crate::StrideSpec::dim(1, 1)]);
 
     let tensor = &tensor_a + &tensor_b;
     let as_slice = tensor.as_slice().await.unwrap();

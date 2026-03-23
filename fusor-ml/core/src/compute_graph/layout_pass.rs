@@ -1,8 +1,6 @@
 use rustc_hash::FxHashMap;
 
-use crate::{
-    Layout, TensorLayoutInfo, nary_wise::NaryOperation,
-};
+use crate::{Layout, TensorLayoutInfo, nary_wise::NaryOperation};
 
 use super::{ComputeGraphNodeVariant, NodeIndex, queue::ComputeQueue};
 

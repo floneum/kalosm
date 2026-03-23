@@ -66,10 +66,11 @@ fn main() {
             }
         }
 
-        let final_prediction = inputs.mat_mul(&weight) + &bias.restride([
-            StrideSpec::dim_with(0, inputs.shape()[0], 0),
-            StrideSpec::dim(1, 1),
-        ]);
+        let final_prediction = inputs.mat_mul(&weight)
+            + &bias.restride([
+                StrideSpec::dim_with(0, inputs.shape()[0], 0),
+                StrideSpec::dim(1, 1),
+            ]);
         println!(
             "final predictions: {:?}",
             final_prediction.as_slice().await.unwrap()

@@ -42,7 +42,6 @@ pub use quantized::{Dequantize, QuantizedTensor};
 pub use scalar::{AddScalar, Broadcast, DivScalar, MulScalar, SubScalar};
 pub use tensor::{FloatOps, Scalar, Tensor};
 
-
 // Re-export FromArray trait from fusor-types
 pub use fusor_types::FromArray;
 
