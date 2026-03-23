@@ -131,14 +131,15 @@ pub(crate) fn general_sgemv(
             )
             .unwrap();
         }
-        let index = if SGEMV_CHUNK_SIZE > 1 {
-            "(workgroup_offset + acc_offset)"
+        if SGEMV_CHUNK_SIZE > 1 {
+            writeln!(kernel, "let output_index = workgroup_offset + acc_offset;").unwrap();
         } else {
-            "workgroup_offset"
-        };
+            writeln!(kernel, "let output_index = workgroup_offset;").unwrap();
+        }
+        writeln!(kernel, "if output_index < {n_size} {{").unwrap();
         writeln!(
             kernel,
-            "let chunk = &{input_b}[{index} * k_block_size + index];"
+            "let chunk = &{input_b}[output_index * k_block_size + index];"
         )
         .unwrap();
 
@@ -158,6 +159,7 @@ pub(crate) fn general_sgemv(
                 .unwrap();
             },
         );
+        writeln!(kernel, "}}").unwrap();
 
         if SGEMV_CHUNK_SIZE > 1 {
             writeln!(kernel, "}}").unwrap();
@@ -278,6 +280,7 @@ pub(crate) fn general_sgemv(
         } else {
             writeln!(kernel, "let output_index = workgroup_offset;").unwrap();
         }
+        writeln!(kernel, "if output_index < {n_size} {{").unwrap();
         write!(kernel, "{output}[").unwrap();
         let mut output_indices = Vec::new();
         // Add batch indices first
@@ -291,6 +294,7 @@ pub(crate) fn general_sgemv(
         // Convert from f32 accumulator to output dtype (single element per iteration)
         let acc_val = maybe_vec_storage_index(SGEMV_CHUNK_SIZE, "acc", "acc_offset");
         writeln!(kernel, "] = {dtype}({acc_val});").unwrap();
+        writeln!(kernel, "}}").unwrap();
     }
     if SGEMV_CHUNK_SIZE > 1 {
         writeln!(kernel, "}}").unwrap();
