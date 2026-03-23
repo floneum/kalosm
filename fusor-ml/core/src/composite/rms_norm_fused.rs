@@ -135,6 +135,7 @@ impl RmsNormOperation {
         // Hidden dimension size and stride
         let reduce_size = kernel.add_integer_input();
         let reduce_stride = kernel.add_integer_input();
+        let output_reduce_stride = kernel.add_integer_input();
         // Epsilon uniform
         let eps_input = kernel.add_float_input();
 
@@ -357,7 +358,7 @@ impl RmsNormOperation {
                 let component = ["result.x", "result.y", "result.z", "result.w"][i];
                 writeln!(
                     kernel,
-                    "{output_tensor}[out_start_offset + (out_index + {i}u) * {reduce_stride}] = {input_dtype}({component});"
+                    "{output_tensor}[out_start_offset + (out_index + {i}u) * {output_reduce_stride}] = {input_dtype}({component});"
                 )
                 .unwrap();
             }
@@ -383,7 +384,7 @@ impl RmsNormOperation {
 
         writeln!(
             kernel,
-            "{output_tensor}[out_start_offset + out_index * {reduce_stride}] = {input_dtype}(result);"
+            "{output_tensor}[out_start_offset + out_index * {output_reduce_stride}] = {input_dtype}(result);"
         )
         .unwrap();
         writeln!(kernel, "out_index += 1u;").unwrap();
@@ -504,6 +505,9 @@ impl Operation for RmsNormOperation {
         ));
         inputs.push(MirValue::Integer(
             input_tensor.layout().strides()[hidden_dim] as u32,
+        ));
+        inputs.push(MirValue::Integer(
+            shape[hidden_dim + 1..].iter().product::<usize>().max(1) as u32,
         ));
         // Add epsilon
         inputs.push(MirValue::Float(self.eps));

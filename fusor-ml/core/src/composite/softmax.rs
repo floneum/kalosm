@@ -114,6 +114,7 @@ impl SoftmaxOperation {
         let output_tensor = kernel.add_tensor_input(output_rank, true, out_datatype);
         let reduce_size = kernel.add_integer_input();
         let reduce_stride = kernel.add_integer_input();
+        let output_reduce_stride = kernel.add_integer_input();
 
         let global_m_final = kernel.add_global_value(KernelGlobalSpace::Workgroup, dtype);
         let global_d_final = kernel.add_global_value(KernelGlobalSpace::Workgroup, dtype);
@@ -357,7 +358,7 @@ impl SoftmaxOperation {
             for (i, component) in components.iter().enumerate() {
                 writeln!(
                 kernel,
-                "{output_tensor}[out_start_offset + (out_index + {i}u) * {reduce_stride}] = exp({component} - m_all) / d_all;"
+                "{output_tensor}[out_start_offset + (out_index + {i}u) * {output_reduce_stride}] = exp({component} - m_all) / d_all;"
             )
             .unwrap();
             }
@@ -375,7 +376,7 @@ impl SoftmaxOperation {
         .unwrap();
         writeln!(
             kernel,
-            "{output_tensor}[out_start_offset + out_index * {reduce_stride}] = exp(data - m_all) / d_all;"
+            "{output_tensor}[out_start_offset + out_index * {output_reduce_stride}] = exp(data - m_all) / d_all;"
         )
         .unwrap();
         writeln!(kernel, "out_index += 1u;").unwrap();
@@ -459,6 +460,7 @@ impl Operation for SoftmaxOperation {
             MirValue::Tensor(output_tensor.clone()),
             MirValue::Integer(tensor.layout().shape()[dim] as u32),
             MirValue::Integer(tensor.layout().strides()[dim] as u32),
+            MirValue::Integer(shape[dim + 1..].iter().product::<usize>().max(1) as u32),
         ]
     }
 

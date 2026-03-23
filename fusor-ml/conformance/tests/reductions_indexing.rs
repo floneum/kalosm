@@ -1,211 +1,254 @@
 mod common;
 
-use common::{
-    assert_approx_devices, assert_approx_tensors, index_select2, keepdim2, mean_axis2,
-    reduce_axis2, slice_assign2, var_axis2,
-};
-use fusor::{Tensor, arange};
-use fusor_conformance::{available_devices, sequential_tensor};
+use common::{index_select1, index_select2, keepdim2, mean_axis2, reduce_axis2, var_axis2};
+use fusor::{Device, Tensor, arange};
+use fusor_conformance::{FuzzGenerator, approx_compare, available_devices, sequential_tensor};
 use half::f16;
-
-fn matrix_3x4() -> Vec<Vec<f32>> {
-    vec![
-        vec![0.0, 1.0, 2.0, 3.0],
-        vec![4.0, 5.0, 6.0, 7.0],
-        vec![8.0, 9.0, 10.0, 11.0],
-    ]
-}
+use rand::distr::Uniform;
 
 #[tokio::test]
 async fn reductions_match_host_reference() {
-    let matrix = matrix_3x4();
+    const SHAPE: [usize; 2] = [3, 4];
+    let fuzz = FuzzGenerator::<2, f32>::new(SHAPE)
+        .with_seed(200)
+        .with_distribution(Uniform::new(-5.0, 5.0).unwrap());
 
-    assert_approx_devices(
-        |device| sequential_tensor::<2, f32>(device, [3, 4]).sum::<1>(1),
-        |device| {
-            Tensor::new(
-                device,
-                &reduce_axis2(&matrix, 1, 0.0, |acc, value| acc + value),
+    // sum along axis 1
+    fusor_conformance::assert(async |x: Tensor<2, f32>| x.sum::<1>(1))
+        .arg(fuzz.clone())
+        .equal_to_resolved_with_device(async |v: Vec<Vec<f32>>, device: Device| {
+            Tensor::from_slice(
+                &device,
+                [SHAPE[0]],
+                &reduce_axis2(&v, 1, 0.0, |a, b| a + b),
             )
-        },
-        1e-6,
-    )
-    .await;
+        })
+        .compare_with(approx_compare::<1, f32>(1e-4))
+        .runs(3)
+        .await
+        .unwrap();
 
-    assert_approx_devices(
-        |device| sequential_tensor::<2, f32>(device, [3, 4]).max::<1>(0),
-        |device| {
-            Tensor::new(
-                device,
-                &reduce_axis2(&matrix, 0, f32::NEG_INFINITY, f32::max),
+    // max along axis 0
+    fusor_conformance::assert(async |x: Tensor<2, f32>| x.max::<1>(0))
+        .arg(fuzz.clone())
+        .equal_to_resolved_with_device(async |v: Vec<Vec<f32>>, device: Device| {
+            Tensor::from_slice(
+                &device,
+                [SHAPE[1]],
+                &reduce_axis2(&v, 0, f32::NEG_INFINITY, f32::max),
             )
-        },
-        1e-6,
-    )
-    .await;
+        })
+        .compare_with(approx_compare::<1, f32>(1e-5))
+        .runs(3)
+        .await
+        .unwrap();
 
-    assert_approx_devices(
-        |device| sequential_tensor::<2, f32>(device, [3, 4]).min::<1>(0),
-        |device| Tensor::new(device, &reduce_axis2(&matrix, 0, f32::INFINITY, f32::min)),
-        1e-6,
-    )
-    .await;
-
-    assert_approx_devices(
-        |device| sequential_tensor::<2, f32>(device, [3, 4]).product::<1>(1),
-        |device| {
-            Tensor::new(
-                device,
-                &reduce_axis2(&matrix, 1, 1.0, |acc, value| acc * value),
+    // min along axis 0
+    fusor_conformance::assert(async |x: Tensor<2, f32>| x.min::<1>(0))
+        .arg(fuzz.clone())
+        .equal_to_resolved_with_device(async |v: Vec<Vec<f32>>, device: Device| {
+            Tensor::from_slice(
+                &device,
+                [SHAPE[1]],
+                &reduce_axis2(&v, 0, f32::INFINITY, f32::min),
             )
-        },
-        1e-6,
-    )
-    .await;
+        })
+        .compare_with(approx_compare::<1, f32>(1e-5))
+        .runs(3)
+        .await
+        .unwrap();
 
-    assert_approx_devices(
-        |device| sequential_tensor::<2, f32>(device, [3, 4]).sum_keepdim::<1>(1),
-        |device| {
-            Tensor::new(
-                device,
-                &keepdim2(&reduce_axis2(&matrix, 1, 0.0, |acc, value| acc + value), 1),
+    // product along axis 1 (bounded to avoid overflow)
+    let fuzz_small = FuzzGenerator::<2, f32>::new(SHAPE)
+        .with_seed(201)
+        .with_distribution(Uniform::new(0.5, 2.0).unwrap());
+    fusor_conformance::assert(async |x: Tensor<2, f32>| x.product::<1>(1))
+        .arg(fuzz_small)
+        .equal_to_resolved_with_device(async |v: Vec<Vec<f32>>, device: Device| {
+            Tensor::from_slice(
+                &device,
+                [SHAPE[0]],
+                &reduce_axis2(&v, 1, 1.0, |a, b| a * b),
             )
-        },
-        1e-6,
-    )
-    .await;
+        })
+        .compare_with(approx_compare::<1, f32>(1e-3))
+        .runs(3)
+        .await
+        .unwrap();
 
-    assert_approx_devices(
-        |device| sequential_tensor::<2, f32>(device, [3, 4]).max_keepdim::<1>(0),
-        |device| {
+    // sum_keepdim along axis 1
+    fusor_conformance::assert(async |x: Tensor<2, f32>| x.sum_keepdim::<1>(1))
+        .arg(fuzz.clone())
+        .equal_to_resolved_with_device(async |v: Vec<Vec<f32>>, device: Device| {
             Tensor::new(
-                device,
-                &keepdim2(&reduce_axis2(&matrix, 0, f32::NEG_INFINITY, f32::max), 0),
+                &device,
+                &keepdim2(&reduce_axis2(&v, 1, 0.0, |a, b| a + b), 1),
             )
-        },
-        1e-6,
-    )
-    .await;
+        })
+        .compare_with(approx_compare::<2, f32>(1e-4))
+        .runs(3)
+        .await
+        .unwrap();
 
-    assert_approx_devices(
-        |device| sequential_tensor::<2, f32>(device, [3, 4]).min_keepdim::<1>(0),
-        |device| {
+    // max_keepdim along axis 0
+    fusor_conformance::assert(async |x: Tensor<2, f32>| x.max_keepdim::<1>(0))
+        .arg(fuzz.clone())
+        .equal_to_resolved_with_device(async |v: Vec<Vec<f32>>, device: Device| {
             Tensor::new(
-                device,
-                &keepdim2(&reduce_axis2(&matrix, 0, f32::INFINITY, f32::min), 0),
+                &device,
+                &keepdim2(&reduce_axis2(&v, 0, f32::NEG_INFINITY, f32::max), 0),
             )
-        },
-        1e-6,
-    )
-    .await;
+        })
+        .compare_with(approx_compare::<2, f32>(1e-5))
+        .runs(3)
+        .await
+        .unwrap();
 
-    assert_approx_devices(
-        |device| sequential_tensor::<2, f32>(device, [3, 4]).product_keepdim::<1>(1),
-        |device| {
+    // min_keepdim along axis 0
+    fusor_conformance::assert(async |x: Tensor<2, f32>| x.min_keepdim::<1>(0))
+        .arg(fuzz.clone())
+        .equal_to_resolved_with_device(async |v: Vec<Vec<f32>>, device: Device| {
             Tensor::new(
-                device,
-                &keepdim2(&reduce_axis2(&matrix, 1, 1.0, |acc, value| acc * value), 1),
+                &device,
+                &keepdim2(&reduce_axis2(&v, 0, f32::INFINITY, f32::min), 0),
             )
-        },
-        1e-6,
-    )
-    .await;
+        })
+        .compare_with(approx_compare::<2, f32>(1e-5))
+        .runs(3)
+        .await
+        .unwrap();
 
-    assert_approx_devices(
-        |device| sequential_tensor::<2, f32>(device, [3, 4]).mean::<1>(1),
-        |device| Tensor::new(device, &mean_axis2(&matrix, 1)),
-        1e-6,
-    )
-    .await;
+    // product_keepdim along axis 1
+    let fuzz_small2 = FuzzGenerator::<2, f32>::new(SHAPE)
+        .with_seed(202)
+        .with_distribution(Uniform::new(0.5, 2.0).unwrap());
+    fusor_conformance::assert(async |x: Tensor<2, f32>| x.product_keepdim::<1>(1))
+        .arg(fuzz_small2)
+        .equal_to_resolved_with_device(async |v: Vec<Vec<f32>>, device: Device| {
+            Tensor::new(
+                &device,
+                &keepdim2(&reduce_axis2(&v, 1, 1.0, |a, b| a * b), 1),
+            )
+        })
+        .compare_with(approx_compare::<2, f32>(1e-3))
+        .runs(3)
+        .await
+        .unwrap();
 
-    assert_approx_devices(
-        |device| sequential_tensor::<2, f32>(device, [3, 4]).mean_keepdim::<1>(1),
-        |device| Tensor::new(device, &keepdim2(&mean_axis2(&matrix, 1), 1)),
-        1e-6,
-    )
-    .await;
+    // mean along axis 1
+    fusor_conformance::assert(async |x: Tensor<2, f32>| x.mean::<1>(1))
+        .arg(fuzz.clone())
+        .equal_to_resolved_with_device(async |v: Vec<Vec<f32>>, device: Device| {
+            Tensor::from_slice(&device, [SHAPE[0]], &mean_axis2(&v, 1))
+        })
+        .compare_with(approx_compare::<1, f32>(1e-4))
+        .runs(3)
+        .await
+        .unwrap();
 
-    assert_approx_devices(
-        |device| sequential_tensor::<2, f32>(device, [3, 4]).var::<1>(1),
-        |device| Tensor::new(device, &var_axis2(&matrix, 1)),
-        1e-5,
-    )
-    .await;
+    // mean_keepdim along axis 1
+    fusor_conformance::assert(async |x: Tensor<2, f32>| x.mean_keepdim::<1>(1))
+        .arg(fuzz.clone())
+        .equal_to_resolved_with_device(async |v: Vec<Vec<f32>>, device: Device| {
+            Tensor::new(&device, &keepdim2(&mean_axis2(&v, 1), 1))
+        })
+        .compare_with(approx_compare::<2, f32>(1e-4))
+        .runs(3)
+        .await
+        .unwrap();
 
-    assert_approx_devices(
-        |device| sequential_tensor::<2, f32>(device, [3, 4]).var_keepdim::<1>(1),
-        |device| Tensor::new(device, &keepdim2(&var_axis2(&matrix, 1), 1)),
-        1e-5,
-    )
-    .await;
+    // var along axis 1
+    fusor_conformance::assert(async |x: Tensor<2, f32>| x.var::<1>(1))
+        .arg(fuzz.clone())
+        .equal_to_resolved_with_device(async |v: Vec<Vec<f32>>, device: Device| {
+            Tensor::from_slice(&device, [SHAPE[0]], &var_axis2(&v, 1))
+        })
+        .compare_with(approx_compare::<1, f32>(1e-3))
+        .runs(3)
+        .await
+        .unwrap();
+
+    // var_keepdim along axis 1
+    fusor_conformance::assert(async |x: Tensor<2, f32>| x.var_keepdim::<1>(1))
+        .arg(fuzz)
+        .equal_to_resolved_with_device(async |v: Vec<Vec<f32>>, device: Device| {
+            Tensor::new(&device, &keepdim2(&var_axis2(&v, 1), 1))
+        })
+        .compare_with(approx_compare::<2, f32>(1e-3))
+        .runs(3)
+        .await
+        .unwrap();
 }
 
 #[tokio::test]
 async fn indexing_cast_and_rank_specific_indexing_match_reference() {
-    let matrix = vec![
-        vec![0.0, 1.0, 2.0, 3.0],
-        vec![4.0, 5.0, 6.0, 7.0],
-        vec![8.0, 9.0, 10.0, 11.0],
-        vec![12.0, 13.0, 14.0, 15.0],
-    ];
+    // index_select, slice_assign, and cast use fuzzed data
+    const SHAPE: [usize; 2] = [4, 4];
+    let fuzz = FuzzGenerator::<2, f32>::new(SHAPE)
+        .with_seed(210)
+        .with_distribution(Uniform::new(-5.0, 5.0).unwrap());
 
-    assert_approx_devices(
-        |device| {
-            let x: Tensor<2, f32> = Tensor::new(device, &matrix);
-            let indices: Tensor<1, u32> = Tensor::from_slice(device, [3], &[3u32, 1, 0]);
-            x.index_select(1, &indices)
+    static IDX_DIM1: &[u32] = &[3, 1, 0];
+
+    // index_select dim=1
+    fusor_conformance::assert(async |x: Tensor<2, f32>| {
+        let indices = Tensor::from_slice(&x.device(), [IDX_DIM1.len()], IDX_DIM1);
+        x.index_select(1, &indices)
+    })
+    .arg(fuzz.clone())
+    .equal_to_resolved_with_device(async |v: Vec<Vec<f32>>, device: Device| {
+        Tensor::new(&device, &index_select2(&v, 1, IDX_DIM1))
+    })
+    .compare_with(approx_compare::<2, f32>(1e-6))
+    .runs(3)
+    .await
+    .unwrap();
+
+    // slice_assign
+    let fuzz_patch = FuzzGenerator::<2, f32>::new([2, 2])
+        .with_seed(211)
+        .with_distribution(Uniform::new(90.0, 110.0).unwrap());
+    fusor_conformance::assert(async |x: Tensor<2, f32>, patch: Tensor<2, f32>| {
+        x.slice_assign([1..3, 1..3], &patch)
+    })
+    .arg(fuzz.clone())
+    .arg(fuzz_patch)
+    .equal_to_resolved_with_device(
+        async |v: Vec<Vec<f32>>, patch: Vec<Vec<f32>>, device: Device| {
+            let out = common::slice_assign2(&v, 1..3, 1..3, &patch);
+            Tensor::new(&device, &out)
         },
-        |device| Tensor::new(device, &index_select2(&matrix, 1, &[3, 1, 0])),
-        1e-6,
     )
-    .await;
+    .compare_with(approx_compare::<2, f32>(1e-6))
+    .runs(3)
+    .await
+    .unwrap();
 
-    assert_approx_devices(
-        |device| {
-            let x: Tensor<2, f32> = Tensor::new(device, &matrix);
-            let patch: Tensor<2, f32> =
-                Tensor::from_slice(device, [2, 2], &[100.0, 101.0, 102.0, 103.0]);
-            x.slice_assign([1..3, 1..3], &patch)
-        },
-        |device| {
-            let patch = vec![vec![100.0, 101.0], vec![102.0, 103.0]];
-            Tensor::new(device, &slice_assign2(&matrix, 1..3, 1..3, &patch))
-        },
-        1e-6,
-    )
-    .await;
+    // cast f32 -> f16 -> f32
+    fusor_conformance::assert(async |x: Tensor<2, f32>| x.cast::<f16>().cast::<f32>().to_concrete())
+        .arg(fuzz)
+        .equal_to_resolved_with_device(async |v: Vec<Vec<f32>>, device: Device| {
+            let out: Vec<Vec<f32>> = v
+                .iter()
+                .map(|row| {
+                    row.iter()
+                        .map(|&x| f16::from_f32(x).to_f32())
+                        .collect()
+                })
+                .collect();
+            Tensor::new(&device, &out)
+        })
+        .compare_with(approx_compare::<2, f32>(1e-6))
+        .runs(3)
+        .await
+        .unwrap();
 
-    assert_approx_devices(
-        |device| {
-            Tensor::from_slice(device, [2, 3], &[0.1, 1.9, 2.4, 3.8, 4.2, 5.9])
-                .cast::<f16>()
-                .cast::<f32>()
-                .to_concrete()
-        },
-        |device| {
-            let expected = vec![
-                vec![
-                    f16::from_f32(0.1).to_f32(),
-                    f16::from_f32(1.9).to_f32(),
-                    f16::from_f32(2.4).to_f32(),
-                ],
-                vec![
-                    f16::from_f32(3.8).to_f32(),
-                    f16::from_f32(4.2).to_f32(),
-                    f16::from_f32(5.9).to_f32(),
-                ],
-            ];
-            Tensor::new(device, &expected)
-        },
-        1e-6,
-    )
-    .await;
-
+    // .i() rank-specific indexing: compare against slice+squeeze
     for device in available_devices().await {
         let matrix: Tensor<2, f32> = sequential_tensor(&device, [3, 4]);
         let indexed_2d = matrix.i((1, 1..4));
         let sliced_2d = matrix.slice([1..2, 1..4]).squeeze::<1>(0).to_concrete();
-        assert_approx_tensors(indexed_2d, sliced_2d, 1e-6).await;
+        common::assert_approx_tensors(indexed_2d, sliced_2d, 1e-6).await;
 
         let tensor3: Tensor<3, f32> = sequential_tensor(&device, [2, 3, 4]);
         let indexed_3d = tensor3.i((0, 1..3, 1..4));
@@ -213,7 +256,7 @@ async fn indexing_cast_and_rank_specific_indexing_match_reference() {
             .slice([0..1, 1..3, 1..4])
             .squeeze::<2>(0)
             .to_concrete();
-        assert_approx_tensors(indexed_3d, sliced_3d, 1e-6).await;
+        common::assert_approx_tensors(indexed_3d, sliced_3d, 1e-6).await;
 
         let tensor4: Tensor<4, f32> = arange(&device, 0.0f32, 48.0)
             .reshape([2, 2, 3, 4])
@@ -223,6 +266,199 @@ async fn indexing_cast_and_rank_specific_indexing_match_reference() {
             .slice([1..2, 0..2, 1..3, 1..4])
             .squeeze::<3>(0)
             .to_concrete();
-        assert_approx_tensors(indexed_4d, sliced_4d, 1e-6).await;
+        common::assert_approx_tensors(indexed_4d, sliced_4d, 1e-6).await;
     }
+}
+
+#[tokio::test]
+async fn full_tensor_reductions_fuzzed() {
+    // 2D reductions with fuzzed data + non-contiguous layouts
+    const SHAPE: [usize; 2] = [8, 16];
+    let fuzz = FuzzGenerator::<2, f32>::new(SHAPE)
+        .with_seed(42)
+        .with_distribution(Uniform::new(-5.0, 5.0).unwrap());
+
+    // sum along axis 1
+    fusor_conformance::assert(async |x: Tensor<2, f32>| x.sum::<1>(1))
+        .arg(fuzz.clone())
+        .equal_to_resolved_with_device(async |v: Vec<Vec<f32>>, device: Device| {
+            let out: Vec<f32> = v.iter().map(|row| row.iter().sum()).collect();
+            Tensor::from_slice(&device, [SHAPE[0]], &out)
+        })
+        .compare_with(approx_compare::<1, f32>(1e-3))
+        .runs(3)
+        .await
+        .unwrap();
+
+    // sum along axis 0
+    fusor_conformance::assert(async |x: Tensor<2, f32>| x.sum::<1>(0))
+        .arg(fuzz.clone())
+        .equal_to_resolved_with_device(async |v: Vec<Vec<f32>>, device: Device| {
+            let out = reduce_axis2(&v, 0, 0.0, |a, b| a + b);
+            Tensor::from_slice(&device, [SHAPE[1]], &out)
+        })
+        .compare_with(approx_compare::<1, f32>(1e-3))
+        .runs(3)
+        .await
+        .unwrap();
+
+    // max along axis 1
+    fusor_conformance::assert(async |x: Tensor<2, f32>| x.max::<1>(1))
+        .arg(fuzz.clone())
+        .equal_to_resolved_with_device(async |v: Vec<Vec<f32>>, device: Device| {
+            let out = reduce_axis2(&v, 1, f32::NEG_INFINITY, f32::max);
+            Tensor::from_slice(&device, [SHAPE[0]], &out)
+        })
+        .compare_with(approx_compare::<1, f32>(1e-5))
+        .runs(3)
+        .await
+        .unwrap();
+
+    // min along axis 0
+    fusor_conformance::assert(async |x: Tensor<2, f32>| x.min::<1>(0))
+        .arg(fuzz.clone())
+        .equal_to_resolved_with_device(async |v: Vec<Vec<f32>>, device: Device| {
+            let out = reduce_axis2(&v, 0, f32::INFINITY, f32::min);
+            Tensor::from_slice(&device, [SHAPE[1]], &out)
+        })
+        .compare_with(approx_compare::<1, f32>(1e-5))
+        .runs(3)
+        .await
+        .unwrap();
+
+    // product along axis 1 (small range to avoid overflow)
+    let fuzz_small = FuzzGenerator::<2, f32>::new([4, 6])
+        .with_seed(43)
+        .with_distribution(Uniform::new(0.5, 2.0).unwrap());
+    fusor_conformance::assert(async |x: Tensor<2, f32>| x.product::<1>(1))
+        .arg(fuzz_small)
+        .equal_to_resolved_with_device(async |v: Vec<Vec<f32>>, device: Device| {
+            let out = reduce_axis2(&v, 1, 1.0, |a, b| a * b);
+            Tensor::from_slice(&device, [4], &out)
+        })
+        .compare_with(approx_compare::<1, f32>(1e-2))
+        .runs(3)
+        .await
+        .unwrap();
+
+    // mean along axis 1
+    fusor_conformance::assert(async |x: Tensor<2, f32>| x.mean::<1>(1))
+        .arg(fuzz.clone())
+        .equal_to_resolved_with_device(async |v: Vec<Vec<f32>>, device: Device| {
+            let out = mean_axis2(&v, 1);
+            Tensor::from_slice(&device, [SHAPE[0]], &out)
+        })
+        .compare_with(approx_compare::<1, f32>(1e-4))
+        .runs(3)
+        .await
+        .unwrap();
+
+    // var along axis 1
+    fusor_conformance::assert(async |x: Tensor<2, f32>| x.var::<1>(1))
+        .arg(fuzz)
+        .equal_to_resolved_with_device(async |v: Vec<Vec<f32>>, device: Device| {
+            let out = var_axis2(&v, 1);
+            Tensor::from_slice(&device, [SHAPE[0]], &out)
+        })
+        .compare_with(approx_compare::<1, f32>(1e-3))
+        .runs(3)
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn full_tensor_sum_large_fuzzed() {
+    // Large 2D sum to test accumulation precision with non-contiguous layouts
+    const SHAPE: [usize; 2] = [100, 100];
+    let fuzz = FuzzGenerator::<2, f32>::new(SHAPE)
+        .with_seed(99)
+        .with_distribution(Uniform::new(0.0, 10.0).unwrap());
+
+    fusor_conformance::assert(async |x: Tensor<2, f32>| x.sum::<1>(1))
+        .arg(fuzz)
+        .equal_to_resolved_with_device(async |v: Vec<Vec<f32>>, device: Device| {
+            let out: Vec<f32> = v.iter().map(|row| row.iter().sum()).collect();
+            Tensor::from_slice(&device, [SHAPE[0]], &out)
+        })
+        .compare_with(approx_compare::<1, f32>(1e-1))
+        .runs(3)
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn index_select_fuzzed() {
+    static INDICES_1D: &[u32] = &[31, 15, 0, 7, 23, 3, 28, 10];
+    static INDICES_2D_DIM0: &[u32] = &[7, 3, 0, 5, 1];
+    static INDICES_2D_DIM1: &[u32] = &[5, 2, 0, 4];
+    static DUP_INDICES: &[u32] = &[0, 0, 2, 2, 1, 1];
+
+    // 1D index_select with fuzzed data, dim=0
+    const SHAPE_1D: [usize; 1] = [32];
+    let gen_1d = FuzzGenerator::<1, f32>::new(SHAPE_1D).with_seed(50);
+
+    fusor_conformance::assert(async |x: Tensor<1, f32>| {
+        let indices = Tensor::from_slice(&x.device(), [INDICES_1D.len()], INDICES_1D);
+        x.index_select(0, &indices)
+    })
+    .arg(gen_1d)
+    .equal_to_resolved_with_device(async |v: Vec<f32>, device: Device| {
+        let out = index_select1(&v, INDICES_1D);
+        Tensor::from_slice(&device, [INDICES_1D.len()], &out)
+    })
+    .compare_with(approx_compare::<1, f32>(1e-6))
+    .runs(3)
+    .await
+    .unwrap();
+
+    // 2D index_select dim=0 with fuzzed data
+    const SHAPE_2D: [usize; 2] = [8, 6];
+    let gen_2d = FuzzGenerator::<2, f32>::new(SHAPE_2D).with_seed(51);
+
+    fusor_conformance::assert(async |x: Tensor<2, f32>| {
+        let indices =
+            Tensor::from_slice(&x.device(), [INDICES_2D_DIM0.len()], INDICES_2D_DIM0);
+        x.index_select(0, &indices)
+    })
+    .arg(gen_2d.clone())
+    .equal_to_resolved_with_device(async |v: Vec<Vec<f32>>, device: Device| {
+        let out = index_select2(&v, 0, INDICES_2D_DIM0);
+        Tensor::new(&device, &out)
+    })
+    .compare_with(approx_compare::<2, f32>(1e-6))
+    .runs(3)
+    .await
+    .unwrap();
+
+    // 2D index_select dim=1 with fuzzed data
+    fusor_conformance::assert(async |x: Tensor<2, f32>| {
+        let indices =
+            Tensor::from_slice(&x.device(), [INDICES_2D_DIM1.len()], INDICES_2D_DIM1);
+        x.index_select(1, &indices)
+    })
+    .arg(gen_2d)
+    .equal_to_resolved_with_device(async |v: Vec<Vec<f32>>, device: Device| {
+        let out = index_select2(&v, 1, INDICES_2D_DIM1);
+        Tensor::new(&device, &out)
+    })
+    .compare_with(approx_compare::<2, f32>(1e-6))
+    .runs(3)
+    .await
+    .unwrap();
+
+    // Duplicate indices with fuzzed data
+    let gen_3x4 = FuzzGenerator::<2, f32>::new([3, 4]).with_seed(52);
+    fusor_conformance::assert(async |x: Tensor<2, f32>| {
+        let indices = Tensor::from_slice(&x.device(), [DUP_INDICES.len()], DUP_INDICES);
+        x.index_select(0, &indices)
+    })
+    .arg(gen_3x4)
+    .equal_to_resolved_with_device(async |v: Vec<Vec<f32>>, device: Device| {
+        let out = index_select2(&v, 0, DUP_INDICES);
+        Tensor::new(&device, &out)
+    })
+    .compare_with(approx_compare::<2, f32>(1e-6))
+    .runs(3)
+    .await
+    .unwrap();
 }

@@ -571,6 +571,22 @@ pub fn rope_normal_4d(
     out
 }
 
+pub fn index_select1(input: &[f32], indices: &[u32]) -> Vec<f32> {
+    indices
+        .iter()
+        .map(|index| input[*index as usize])
+        .collect()
+}
+
+pub fn where_cond1(cond: &[f32], on_true: &[f32], on_false: &[f32]) -> Vec<f32> {
+    cond.iter()
+        .copied()
+        .zip(on_true.iter().copied())
+        .zip(on_false.iter().copied())
+        .map(|((c, t), f)| if c != 0.0 { t } else { f })
+        .collect()
+}
+
 pub fn rope_interleaved_4d(
     input: &[Vec<Vec<Vec<f32>>>],
     cos: &[Vec<f32>],

@@ -1,132 +1,154 @@
 mod common;
 
-use common::{
-    assert_approx_devices, layer_norm_last_dim_3d, rms_norm_last_dim_3d, softmax_last_dim_2d,
-};
-use fusor::Tensor;
-
-fn softmax_input() -> Vec<Vec<f32>> {
-    vec![
-        vec![-3.0, -1.0, 0.5, 2.0],
-        vec![1.0, -2.0, 3.0, -4.0],
-        vec![0.25, -0.75, 1.25, -1.5],
-    ]
-}
-
-fn norm_input() -> Vec<Vec<Vec<f32>>> {
-    common::reshape3(
-        &(-8..16).map(|value| value as f32 / 2.0).collect::<Vec<_>>(),
-        [2, 3, 4],
-    )
-}
+use common::{layer_norm_last_dim_3d, rms_norm_last_dim_3d, softmax_last_dim_2d};
+use fusor::{Device, Tensor};
+use fusor_conformance::{FuzzGenerator, approx_compare};
+use rand::distr::Uniform;
 
 #[tokio::test]
 async fn softmax_and_normalization_match_reference_paths() {
-    let softmax = softmax_input();
-    let norm = norm_input();
-    let weight = [1.0, 1.5, 0.5, 2.0];
-    let bias = [0.1, -0.2, 0.3, -0.4];
+    // Softmax with fuzzed input
+    const SOFTMAX_SHAPE: [usize; 2] = [3, 4];
+    let gen_softmax = FuzzGenerator::<2, f32>::new(SOFTMAX_SHAPE)
+        .with_seed(400)
+        .with_distribution(Uniform::new(-4.0, 4.0).unwrap());
 
-    assert_approx_devices(
-        |device| Tensor::new(device, &softmax).softmax::<1>(1),
-        |device| Tensor::new(device, &softmax_last_dim_2d(&softmax)),
-        1e-5,
-    )
-    .await;
+    // softmax vs host reference
+    fusor_conformance::assert(async |x: Tensor<2, f32>| x.softmax::<1>(1))
+        .arg(gen_softmax.clone())
+        .equal_to_resolved_with_device(async |v: Vec<Vec<f32>>, device: Device| {
+            Tensor::new(&device, &softmax_last_dim_2d(&v))
+        })
+        .compare_with(approx_compare::<2, f32>(1e-5))
+        .runs(3)
+        .await
+        .unwrap();
 
-    assert_approx_devices(
-        |device| Tensor::new(device, &softmax).softmax_last_dim::<1>(),
-        |device| Tensor::new(device, &softmax).softmax::<1>(1),
-        1e-6,
-    )
-    .await;
+    // softmax_last_dim vs softmax
+    fusor_conformance::assert(async |x: Tensor<2, f32>| x.softmax_last_dim::<1>())
+        .arg(gen_softmax.clone())
+        .equal_to(async |x: Tensor<2, f32>| x.softmax::<1>(1))
+        .compare_with(approx_compare::<2, f32>(1e-6))
+        .runs(3)
+        .await
+        .unwrap();
 
-    assert_approx_devices(
-        |device| Tensor::new(device, &softmax).softmax_slow::<1>(1),
-        |device| Tensor::new(device, &softmax).softmax::<1>(1),
-        1e-6,
-    )
-    .await;
+    // softmax_slow vs softmax
+    fusor_conformance::assert(async |x: Tensor<2, f32>| x.softmax_slow::<1>(1))
+        .arg(gen_softmax.clone())
+        .equal_to(async |x: Tensor<2, f32>| x.softmax::<1>(1))
+        .compare_with(approx_compare::<2, f32>(1e-6))
+        .runs(3)
+        .await
+        .unwrap();
 
-    assert_approx_devices(
-        |device| Tensor::new(device, &softmax).softmax_slow_last_dim::<1>(),
-        |device| Tensor::new(device, &softmax).softmax_last_dim::<1>(),
-        1e-6,
-    )
-    .await;
+    // softmax_slow_last_dim vs softmax_last_dim
+    fusor_conformance::assert(async |x: Tensor<2, f32>| x.softmax_slow_last_dim::<1>())
+        .arg(gen_softmax.clone())
+        .equal_to(async |x: Tensor<2, f32>| x.softmax_last_dim::<1>())
+        .compare_with(approx_compare::<2, f32>(1e-6))
+        .runs(3)
+        .await
+        .unwrap();
 
-    assert_approx_devices(
-        |device| Tensor::new(device, &softmax).softmax_last_dim_fused::<1>(),
-        |device| Tensor::new(device, &softmax).softmax_last_dim::<1>(),
-        1e-5,
-    )
-    .await;
+    // softmax_last_dim_fused vs softmax_last_dim
+    fusor_conformance::assert(async |x: Tensor<2, f32>| x.softmax_last_dim_fused::<1>())
+        .arg(gen_softmax)
+        .equal_to(async |x: Tensor<2, f32>| x.softmax_last_dim::<1>())
+        .compare_with(approx_compare::<2, f32>(1e-5))
+        .runs(3)
+        .await
+        .unwrap();
 
-    assert_approx_devices(
-        |device| {
-            let x: Tensor<3, f32> = Tensor::new(device, &norm);
-            let weight: Tensor<3, f32> = Tensor::from_slice(device, [1, 1, 4], &weight)
-                .broadcast_as([2, 3, 4])
-                .to_concrete();
-            x.rms_norm::<2, _>(&weight, 1e-5)
-        },
-        |device| Tensor::new(device, &rms_norm_last_dim_3d(&norm, &weight, 1e-5)),
-        1e-5,
-    )
-    .await;
+    // RMS norm with fuzzed input
+    const NORM_SHAPE: [usize; 3] = [2, 3, 4];
+    let gen_norm = FuzzGenerator::<3, f32>::new(NORM_SHAPE)
+        .with_seed(410)
+        .with_distribution(Uniform::new(-4.0, 4.0).unwrap());
 
-    assert_approx_devices(
-        |device| {
-            let x: Tensor<3, f32> = Tensor::new(device, &norm);
-            let weight: Tensor<3, f32> = Tensor::from_slice(device, [1, 1, 4], &weight)
-                .broadcast_as([2, 3, 4])
-                .to_concrete();
-            let bias: Tensor<3, f32> = Tensor::from_slice(device, [1, 1, 4], &bias)
-                .broadcast_as([2, 3, 4])
-                .to_concrete();
-            x.layer_norm::<2, _, _>(&weight, Some(&bias), 1e-5, true)
-        },
-        |device| Tensor::new(device, &layer_norm_last_dim_3d(&norm, &weight, &bias, 1e-5)),
-        1e-5,
-    )
-    .await;
+    static WEIGHT: [f32; 4] = [1.0, 1.5, 0.5, 2.0];
+    static BIAS: [f32; 4] = [0.1, -0.2, 0.3, -0.4];
 
-    assert_approx_devices(
-        |device| {
-            let x: Tensor<3, f32> = Tensor::new(device, &norm);
-            let weight = Tensor::from_slice(device, [4], &weight);
-            let bias = Tensor::from_slice(device, [4], &bias);
-            x.rms_norm_fused::<1, 2>(&weight, Some(&bias), 1e-5)
-        },
-        |device| {
-            let expected = rms_norm_last_dim_3d(&norm, &weight, 1e-5)
-                .into_iter()
-                .map(|matrix| {
-                    matrix
-                        .into_iter()
-                        .map(|row| {
-                            row.into_iter()
-                                .zip(bias)
-                                .map(|(value, bias)| value + bias)
-                                .collect()
-                        })
-                        .collect()
-                })
-                .collect::<Vec<Vec<Vec<f32>>>>();
-            Tensor::new(device, &expected)
-        },
-        1e-5,
-    )
-    .await;
+    // rms_norm vs host reference
+    fusor_conformance::assert(async |x: Tensor<3, f32>| {
+        let device = x.device();
+        let weight: Tensor<3, f32> = Tensor::from_slice(&device, [1, 1, 4], &WEIGHT)
+            .broadcast_as([2, 3, 4])
+            .to_concrete();
+        x.rms_norm::<2, _>(&weight, 1e-5)
+    })
+    .arg(gen_norm.clone())
+    .equal_to_resolved_with_device(async |v: Vec<Vec<Vec<f32>>>, device: Device| {
+        Tensor::new(&device, &rms_norm_last_dim_3d(&v, &WEIGHT, 1e-5))
+    })
+    .compare_with(approx_compare::<3, f32>(1e-4))
+    .runs(3)
+    .await
+    .unwrap();
 
-    assert_approx_devices(
-        |device| {
-            let x: Tensor<3, f32> = Tensor::new(device, &norm);
-            let weight = Tensor::from_slice(device, [4], &weight);
-            x.rms_norm_fused_no_bias::<1, 2>(&weight, 1e-5)
-        },
-        |device| Tensor::new(device, &rms_norm_last_dim_3d(&norm, &weight, 1e-5)),
-        1e-5,
-    )
-    .await;
+    // layer_norm vs host reference
+    fusor_conformance::assert(async |x: Tensor<3, f32>| {
+        let device = x.device();
+        let weight: Tensor<3, f32> = Tensor::from_slice(&device, [1, 1, 4], &WEIGHT)
+            .broadcast_as([2, 3, 4])
+            .to_concrete();
+        let bias: Tensor<3, f32> = Tensor::from_slice(&device, [1, 1, 4], &BIAS)
+            .broadcast_as([2, 3, 4])
+            .to_concrete();
+        x.layer_norm::<2, _, _>(&weight, Some(&bias), 1e-5, true)
+    })
+    .arg(gen_norm.clone())
+    .equal_to_resolved_with_device(async |v: Vec<Vec<Vec<f32>>>, device: Device| {
+        Tensor::new(&device, &layer_norm_last_dim_3d(&v, &WEIGHT, &BIAS, 1e-5))
+    })
+    .compare_with(approx_compare::<3, f32>(1e-4))
+    .runs(3)
+    .await
+    .unwrap();
+
+    // rms_norm_fused (with bias) vs rms_norm + bias
+    fusor_conformance::assert(async |x: Tensor<3, f32>| {
+        let device = x.device();
+        let weight = Tensor::from_slice(&device, [4], &WEIGHT);
+        let bias = Tensor::from_slice(&device, [4], &BIAS);
+        x.rms_norm_fused::<1, 2>(&weight, Some(&bias), 1e-5)
+    })
+    .arg(gen_norm.clone())
+    .equal_to_resolved_with_device(async |v: Vec<Vec<Vec<f32>>>, device: Device| {
+        let rms = rms_norm_last_dim_3d(&v, &WEIGHT, 1e-5);
+        let out: Vec<Vec<Vec<f32>>> = rms
+            .into_iter()
+            .map(|matrix| {
+                matrix
+                    .into_iter()
+                    .map(|row| {
+                        row.into_iter()
+                            .zip(BIAS)
+                            .map(|(v, b)| v + b)
+                            .collect()
+                    })
+                    .collect()
+            })
+            .collect();
+        Tensor::new(&device, &out)
+    })
+    .compare_with(approx_compare::<3, f32>(1e-4))
+    .runs(3)
+    .await
+    .unwrap();
+
+    // rms_norm_fused_no_bias vs rms_norm reference
+    fusor_conformance::assert(async |x: Tensor<3, f32>| {
+        let device = x.device();
+        let weight = Tensor::from_slice(&device, [4], &WEIGHT);
+        x.rms_norm_fused_no_bias::<1, 2>(&weight, 1e-5)
+    })
+    .arg(gen_norm)
+    .equal_to_resolved_with_device(async |v: Vec<Vec<Vec<f32>>>, device: Device| {
+        Tensor::new(&device, &rms_norm_last_dim_3d(&v, &WEIGHT, 1e-5))
+    })
+    .compare_with(approx_compare::<3, f32>(1e-4))
+    .runs(3)
+    .await
+    .unwrap();
 }
