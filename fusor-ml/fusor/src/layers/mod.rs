@@ -8,12 +8,10 @@ mod conv1d;
 mod embedding;
 mod layer_norm;
 mod linear;
-mod recurrent;
 mod rms_norm;
 
 pub use conv1d::{Conv1d, Conv1dConfig};
 pub use embedding::Embedding;
 pub use layer_norm::LayerNorm;
 pub use linear::Linear;
-pub use recurrent::{RecurrentWeights, recurrent_forward};
 pub use rms_norm::RmsNorm;

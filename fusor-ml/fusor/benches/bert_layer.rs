@@ -290,7 +290,8 @@ fn self_attention(c: &mut Criterion) {
                                     let v = v.reshape([batch_size, seq_len, num_heads, head_size]);
                                     let v = v.transpose(1, 2);
 
-                                    let scores = q.mat_mul(&k.t()).div_scalar((head_size as f32).sqrt());
+                                    let scores =
+                                        q.mat_mul(&k.t()).div_scalar((head_size as f32).sqrt());
                                     let probs = scores.softmax_last_dim::<3>();
 
                                     let context = probs.mat_mul(&v);
@@ -508,7 +509,8 @@ fn ffn_block(c: &mut Criterion) {
                 let device = block_on(async { Device::new().await.unwrap() });
 
                 let ffn_up = Linear::load(&device, &mut var_builder.pp("blk.0.ffn_up")).unwrap();
-                let ffn_down = Linear::load(&device, &mut var_builder.pp("blk.0.ffn_down")).unwrap();
+                let ffn_down =
+                    Linear::load(&device, &mut var_builder.pp("blk.0.ffn_down")).unwrap();
 
                 let mut group =
                     c.benchmark_group(format!("ffn_block-fusor-{batch_size}x{seq_len}"));

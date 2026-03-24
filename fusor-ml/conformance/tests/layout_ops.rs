@@ -184,7 +184,10 @@ async fn shape_and_layout_ops_match_host_reference() {
     fusor_conformance::assert(async |x: Tensor<3, f32>| x.squeeze::<2>(1).to_concrete())
         .arg(gen_2x1x3)
         .equal_to_resolved_with_device(async |v: Vec<Vec<Vec<f32>>>, device: Device| {
-            let squeezed: Vec<Vec<f32>> = v.into_iter().map(|m| m.into_iter().next().unwrap()).collect();
+            let squeezed: Vec<Vec<f32>> = v
+                .into_iter()
+                .map(|m| m.into_iter().next().unwrap())
+                .collect();
             Tensor::new(&device, &squeezed)
         })
         .compare_with(approx_compare::<2, f32>(0.0))
@@ -193,25 +196,29 @@ async fn shape_and_layout_ops_match_host_reference() {
         .unwrap();
 
     // unsqueeze_dims = chained unsqueeze
-    fusor_conformance::assert(async |x: Tensor<2, f32>| x.unsqueeze_dims::<2, 4>([1, 3]).to_concrete())
-        .arg(gen_2x3.clone())
-        .equal_to(async |x: Tensor<2, f32>| x.unsqueeze::<3>(1).unsqueeze::<4>(3).to_concrete())
-        .compare_with(approx_compare::<4, f32>(0.0))
-        .runs(3)
-        .await
-        .unwrap();
+    fusor_conformance::assert(async |x: Tensor<2, f32>| {
+        x.unsqueeze_dims::<2, 4>([1, 3]).to_concrete()
+    })
+    .arg(gen_2x3.clone())
+    .equal_to(async |x: Tensor<2, f32>| x.unsqueeze::<3>(1).unsqueeze::<4>(3).to_concrete())
+    .compare_with(approx_compare::<4, f32>(0.0))
+    .runs(3)
+    .await
+    .unwrap();
 
     // squeeze_dims = chained squeeze
     let gen_2x1x3x1 = FuzzGenerator::<4, f32>::new([2, 1, 3, 1])
         .with_seed(506)
         .with_distribution(Uniform::new(-5.0, 5.0).unwrap());
-    fusor_conformance::assert(async |x: Tensor<4, f32>| x.squeeze_dims::<2, 2>([1, 3]).to_concrete())
-        .arg(gen_2x1x3x1.clone())
-        .equal_to(async |x: Tensor<4, f32>| x.squeeze::<3>(3).squeeze::<2>(1).to_concrete())
-        .compare_with(approx_compare::<2, f32>(0.0))
-        .runs(3)
-        .await
-        .unwrap();
+    fusor_conformance::assert(async |x: Tensor<4, f32>| {
+        x.squeeze_dims::<2, 2>([1, 3]).to_concrete()
+    })
+    .arg(gen_2x1x3x1.clone())
+    .equal_to(async |x: Tensor<4, f32>| x.squeeze::<3>(3).squeeze::<2>(1).to_concrete())
+    .compare_with(approx_compare::<2, f32>(0.0))
+    .runs(3)
+    .await
+    .unwrap();
 
     // shape preserves correctness
     fusor_conformance::assert(async |x: Tensor<4, f32>| {
@@ -260,11 +267,9 @@ async fn cat_stack_and_chunk_match_expected_views() {
         .with_distribution(Uniform::new(-5.0, 5.0).unwrap());
 
     // cat (free fn vs assoc fn)
-    fusor_conformance::assert(
-        async |left: Tensor<2, f32>, right: Tensor<2, f32>| {
-            cat([left.to_concrete(), right.to_concrete()], 0)
-        },
-    )
+    fusor_conformance::assert(async |left: Tensor<2, f32>, right: Tensor<2, f32>| {
+        cat([left.to_concrete(), right.to_concrete()], 0)
+    })
     .arg(fuzz_2x3.clone())
     .arg(fuzz_2x3.clone())
     .equal_to(async |left: Tensor<2, f32>, right: Tensor<2, f32>| {
@@ -283,9 +288,11 @@ async fn cat_stack_and_chunk_match_expected_views() {
     )
     .arg(fuzz_2x3.clone())
     .arg(fuzz_2x3.clone())
-    .equal_to(async |left: Tensor<2, f32>, right: Tensor<2, f32>| -> Tensor<3, f32> {
-        Tensor::stack([left.to_concrete(), right.to_concrete()], 0)
-    })
+    .equal_to(
+        async |left: Tensor<2, f32>, right: Tensor<2, f32>| -> Tensor<3, f32> {
+            Tensor::stack([left.to_concrete(), right.to_concrete()], 0)
+        },
+    )
     .compare_with(approx_compare::<3, f32>(1e-6))
     .runs(3)
     .await

@@ -1,7 +1,5 @@
 use fusor::{
-    Device, MaskKind, RopeCache, Tensor, VarBuilder,
-    cache::AttentionMask,
-    layers::{Embedding, RecurrentWeights, recurrent_forward},
+    Device, MaskKind, RopeCache, Tensor, VarBuilder, cache::AttentionMask, layers::Embedding,
 };
 
 use crate::data::{ACTION_DIRECTION_COUNT, ACTION_MODE_COUNT, CanvasStateSpec};
@@ -66,7 +64,6 @@ struct TransformerBlock {
 enum SequenceMixer {
     Attention(CausalSelfAttention),
     Conv(ConvMixer),
-    Recurrent(RecurrentMixer),
 }
 
 #[derive(Clone)]
@@ -75,15 +72,6 @@ struct CausalSelfAttention {
     c_attn_k: Tensor<2, f32>,
     c_attn_v: Tensor<2, f32>,
     c_proj: Tensor<2, f32>,
-}
-
-#[derive(Clone)]
-struct RecurrentMixer {
-    input_proj: Tensor<2, f32>,
-    state_proj: Tensor<2, f32>,
-    gate_input_proj: Tensor<2, f32>,
-    gate_state_proj: Tensor<2, f32>,
-    out_proj: Tensor<2, f32>,
 }
 
 #[derive(Clone)]
@@ -396,7 +384,10 @@ impl TransformerBlock {
         } else if vb.contains_key("conv_kernel.0.weight") {
             SequenceMixer::Conv(ConvMixer::load(device, vb, shape)?)
         } else {
-            SequenceMixer::Recurrent(RecurrentMixer::load(device, vb)?)
+            return Err(fusor::Error::VarBuilder(
+                "unsupported nanochat checkpoint: recurrent mixer blocks are no longer supported"
+                    .into(),
+            ));
         };
         let ln_attn_out_weight = get_tensor1_or_default(
             vb,
@@ -586,35 +577,7 @@ impl SequenceMixer {
                 attn.forward(x, causal_mask, batch_size, shape, rotary)
             }
             SequenceMixer::Conv(conv) => conv.forward(x, batch_size, shape),
-            SequenceMixer::Recurrent(recurrent) => recurrent.forward(x, batch_size, shape),
         }
-    }
-}
-
-impl RecurrentMixer {
-    fn load(device: &Device, vb: &mut VarBuilder) -> fusor::Result<Self> {
-        Ok(Self {
-            input_proj: get_tensor2(vb, device, &["recurrent_in.weight"])?,
-            state_proj: get_tensor2(vb, device, &["recurrent_state.weight"])?,
-            gate_input_proj: get_tensor2(vb, device, &["recurrent_gate_in.weight"])?,
-            gate_state_proj: get_tensor2(vb, device, &["recurrent_gate_state.weight"])?,
-            out_proj: get_tensor2(vb, device, &["recurrent_out.weight"])?,
-        })
-    }
-
-    fn forward(&self, x: &Tensor<3, f32>, batch_size: usize, shape: ModelShape) -> Tensor<3, f32> {
-        debug_assert_eq!(batch_size, x.shape()[0]);
-        debug_assert_eq!(shape.n_embd, x.shape()[2]);
-        recurrent_forward(
-            x,
-            &RecurrentWeights::new(
-                self.input_proj.clone(),
-                self.state_proj.clone(),
-                self.gate_input_proj.clone(),
-                self.gate_state_proj.clone(),
-                self.out_proj.clone(),
-            ),
-        )
     }
 }
 

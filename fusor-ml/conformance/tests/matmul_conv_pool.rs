@@ -44,6 +44,25 @@ async fn matmul_match_host_reference() {
 }
 
 #[tokio::test]
+async fn matmul_small_fixed_regression() {
+    const LHS: [f32; 6] = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
+    const RHS: [f32; 6] = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
+
+    fusor_conformance::assert(async |a: Tensor<2, f32>, b: Tensor<2, f32>| a.matmul(&b))
+        .arg(move |device: &Device| Tensor::from_slice(device, [2, 3], &LHS))
+        .arg(move |device: &Device| Tensor::from_slice(device, [3, 2], &RHS))
+        .equal_to_resolved_with_device(
+            async |_a: Vec<Vec<f32>>, _b: Vec<Vec<f32>>, device: Device| {
+                Tensor::new(&device, &[[22.0f32, 28.0], [49.0, 64.0]])
+            },
+        )
+        .compare_with(approx_compare::<2, f32>(1e-6))
+        .runs(1)
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
 async fn conv_and_pool_match_host_reference() {
     // Conv1D with fuzzed input
     const CONV_SHAPE: [usize; 3] = [1, 1, 7];
@@ -60,18 +79,10 @@ async fn conv_and_pool_match_host_reference() {
         input.conv(&weight, Some(&bias), [1], [2])
     })
     .arg(gen_conv)
-    .equal_to_resolved_with_device(
-        async |v: Vec<Vec<Vec<f32>>>, device: Device| {
-            let expected = conv1d_ncw(
-                &v,
-                &[vec![vec![0.25, -0.5, 1.0]]],
-                Some(&[0.1]),
-                1,
-                2,
-            );
-            Tensor::new(&device, &expected)
-        },
-    )
+    .equal_to_resolved_with_device(async |v: Vec<Vec<Vec<f32>>>, device: Device| {
+        let expected = conv1d_ncw(&v, &[vec![vec![0.25, -0.5, 1.0]]], Some(&[0.1]), 1, 2);
+        Tensor::new(&device, &expected)
+    })
     .compare_with(approx_compare::<3, f32>(1e-4))
     .runs(3)
     .await
@@ -98,10 +109,7 @@ async fn conv_and_pool_match_host_reference() {
     fusor_conformance::assert(async |x: Tensor<3, f32>| x.pool_max([(2, 2)]))
         .arg(gen_pool.clone())
         .equal_to_resolved_with_device(async |v: Vec<Vec<Vec<f32>>>, device: Device| {
-            Tensor::new(
-                &device,
-                &pool1d_ncw(&v, 2, 2, f32::max, f32::NEG_INFINITY),
-            )
+            Tensor::new(&device, &pool1d_ncw(&v, 2, 2, f32::max, f32::NEG_INFINITY))
         })
         .compare_with(approx_compare::<3, f32>(1e-6))
         .runs(3)
@@ -112,10 +120,7 @@ async fn conv_and_pool_match_host_reference() {
     fusor_conformance::assert(async |x: Tensor<3, f32>| x.pool_min([(2, 2)]))
         .arg(gen_pool)
         .equal_to_resolved_with_device(async |v: Vec<Vec<Vec<f32>>>, device: Device| {
-            Tensor::new(
-                &device,
-                &pool1d_ncw(&v, 2, 2, f32::min, f32::INFINITY),
-            )
+            Tensor::new(&device, &pool1d_ncw(&v, 2, 2, f32::min, f32::INFINITY))
         })
         .compare_with(approx_compare::<3, f32>(1e-6))
         .runs(3)

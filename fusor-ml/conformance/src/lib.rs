@@ -491,7 +491,7 @@ impl<T, U> AssertBuilder<T, U> {
             generators: (),
             compare: (),
             devices: None,
-            runs: 1,
+            runs: 100,
         }
     }
 }

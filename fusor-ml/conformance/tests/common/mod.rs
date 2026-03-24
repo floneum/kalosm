@@ -572,10 +572,7 @@ pub fn rope_normal_4d(
 }
 
 pub fn index_select1(input: &[f32], indices: &[u32]) -> Vec<f32> {
-    indices
-        .iter()
-        .map(|index| input[*index as usize])
-        .collect()
+    indices.iter().map(|index| input[*index as usize]).collect()
 }
 
 pub fn where_cond1(cond: &[f32], on_true: &[f32], on_false: &[f32]) -> Vec<f32> {

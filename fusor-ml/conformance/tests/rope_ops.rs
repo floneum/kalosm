@@ -64,7 +64,13 @@ async fn rope_and_cache_paths_match_reference_variants() {
             let sin_t: Tensor<2, f32> = Tensor::new(&device, &sin_vec());
 
             // rope vs host reference
-            let slice = x.to_concrete().flatten_all().to_concrete().as_slice().await.unwrap();
+            let slice = x
+                .to_concrete()
+                .flatten_all()
+                .to_concrete()
+                .as_slice()
+                .await
+                .unwrap();
             let flat: Vec<f32> = slice.to_vec1();
             let v = reshape4(&flat, [1, 2, 3, 4]);
             let expected_normal = rope_normal_4d(&v, &cos_vec(), &sin_vec());

@@ -67,10 +67,7 @@ async fn nary_mixed_ops_fuzzed() {
 async fn nary_nested_pairwise_fuzzed() {
     // (a + b) * (c - d)
     fusor_conformance::assert(
-        async |a: Tensor<2, f32>,
-               b: Tensor<2, f32>,
-               c: Tensor<2, f32>,
-               d: Tensor<2, f32>| {
+        async |a: Tensor<2, f32>, b: Tensor<2, f32>, c: Tensor<2, f32>, d: Tensor<2, f32>| {
             let ab = a.add_::<2, 2, _>(&b);
             let cd = c.sub_::<2, 2, _>(&d);
             ab.mul_::<2, 2, _>(&cd)
@@ -113,15 +110,13 @@ async fn nary_unary_in_middle_fuzzed() {
     })
     .arg(fuzz(30))
     .arg(fuzz_b)
-    .equal_to_resolved_with_device(
-        async |a: Vec<Vec<f32>>, b: Vec<Vec<f32>>, device: Device| {
-            let neg_a = unary_map2(&a, |x| -x);
-            let sin_b = unary_map2(&b, f32::sin);
-            let sum = binary_map2(&neg_a, &sin_b, |l, r| l + r);
-            let out = unary_map2(&sum, |x| x.cos() + 1.0);
-            Tensor::new(&device, &out)
-        },
-    )
+    .equal_to_resolved_with_device(async |a: Vec<Vec<f32>>, b: Vec<Vec<f32>>, device: Device| {
+        let neg_a = unary_map2(&a, |x| -x);
+        let sin_b = unary_map2(&b, f32::sin);
+        let sum = binary_map2(&neg_a, &sin_b, |l, r| l + r);
+        let out = unary_map2(&sum, |x| x.cos() + 1.0);
+        Tensor::new(&device, &out)
+    })
     .compare_with(approx_compare::<2, f32>(1e-3))
     .runs(3)
     .await
@@ -142,14 +137,12 @@ async fn nary_chain_then_pairwise_fuzzed() {
     })
     .arg(fuzz_a)
     .arg(fuzz(41))
-    .equal_to_resolved_with_device(
-        async |a: Vec<Vec<f32>>, b: Vec<Vec<f32>>, device: Device| {
-            let a_exp = unary_map2(&a, |x| (x + 1.0).exp());
-            let sin_b = unary_map2(&b, f32::sin);
-            let out = binary_map2(&a_exp, &sin_b, |l, r| l + r);
-            Tensor::new(&device, &out)
-        },
-    )
+    .equal_to_resolved_with_device(async |a: Vec<Vec<f32>>, b: Vec<Vec<f32>>, device: Device| {
+        let a_exp = unary_map2(&a, |x| (x + 1.0).exp());
+        let sin_b = unary_map2(&b, f32::sin);
+        let out = binary_map2(&a_exp, &sin_b, |l, r| l + r);
+        Tensor::new(&device, &out)
+    })
     .compare_with(approx_compare::<2, f32>(1e-3))
     .runs(3)
     .await
@@ -220,23 +213,21 @@ async fn fused_cached_results_fuzzed() {
         (plus_one * 2.0).to_concrete()
     })
     .arg(fuzz_3d.clone())
-    .equal_to_resolved_with_device(
-        async |v: Vec<Vec<Vec<f32>>>, device: Device| {
-            // manual: (data*2+1).sum(axis=0) * 2
-            let rows = SHAPE_3D[1];
-            let cols = SHAPE_3D[2];
-            let mut summed = vec![vec![0.0f32; cols]; rows];
-            for slice in &v {
-                for (r, row) in slice.iter().enumerate() {
-                    for (c, val) in row.iter().enumerate() {
-                        summed[r][c] += val * 2.0 + 1.0;
-                    }
+    .equal_to_resolved_with_device(async |v: Vec<Vec<Vec<f32>>>, device: Device| {
+        // manual: (data*2+1).sum(axis=0) * 2
+        let rows = SHAPE_3D[1];
+        let cols = SHAPE_3D[2];
+        let mut summed = vec![vec![0.0f32; cols]; rows];
+        for slice in &v {
+            for (r, row) in slice.iter().enumerate() {
+                for (c, val) in row.iter().enumerate() {
+                    summed[r][c] += val * 2.0 + 1.0;
                 }
             }
-            let out = unary_map2(&summed, |x| x * 2.0);
-            Tensor::new(&device, &out)
-        },
-    )
+        }
+        let out = unary_map2(&summed, |x| x * 2.0);
+        Tensor::new(&device, &out)
+    })
     .compare_with(approx_compare::<2, f32>(1e-2))
     .runs(3)
     .await
@@ -249,22 +240,20 @@ async fn fused_cached_results_fuzzed() {
         (plus_one * 3.0).to_concrete()
     })
     .arg(fuzz_3d)
-    .equal_to_resolved_with_device(
-        async |v: Vec<Vec<Vec<f32>>>, device: Device| {
-            let rows = SHAPE_3D[1];
-            let cols = SHAPE_3D[2];
-            let mut summed = vec![vec![0.0f32; cols]; rows];
-            for slice in &v {
-                for (r, row) in slice.iter().enumerate() {
-                    for (c, val) in row.iter().enumerate() {
-                        summed[r][c] += val * 2.0 + 1.0;
-                    }
+    .equal_to_resolved_with_device(async |v: Vec<Vec<Vec<f32>>>, device: Device| {
+        let rows = SHAPE_3D[1];
+        let cols = SHAPE_3D[2];
+        let mut summed = vec![vec![0.0f32; cols]; rows];
+        for slice in &v {
+            for (r, row) in slice.iter().enumerate() {
+                for (c, val) in row.iter().enumerate() {
+                    summed[r][c] += val * 2.0 + 1.0;
                 }
             }
-            let out = unary_map2(&summed, |x| x * 3.0);
-            Tensor::new(&device, &out)
-        },
-    )
+        }
+        let out = unary_map2(&summed, |x| x * 3.0);
+        Tensor::new(&device, &out)
+    })
     .compare_with(approx_compare::<2, f32>(1e-2))
     .runs(3)
     .await

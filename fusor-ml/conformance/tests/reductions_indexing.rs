@@ -17,11 +17,7 @@ async fn reductions_match_host_reference() {
     fusor_conformance::assert(async |x: Tensor<2, f32>| x.sum::<1>(1))
         .arg(fuzz.clone())
         .equal_to_resolved_with_device(async |v: Vec<Vec<f32>>, device: Device| {
-            Tensor::from_slice(
-                &device,
-                [SHAPE[0]],
-                &reduce_axis2(&v, 1, 0.0, |a, b| a + b),
-            )
+            Tensor::from_slice(&device, [SHAPE[0]], &reduce_axis2(&v, 1, 0.0, |a, b| a + b))
         })
         .compare_with(approx_compare::<1, f32>(1e-4))
         .runs(3)
@@ -65,11 +61,7 @@ async fn reductions_match_host_reference() {
     fusor_conformance::assert(async |x: Tensor<2, f32>| x.product::<1>(1))
         .arg(fuzz_small)
         .equal_to_resolved_with_device(async |v: Vec<Vec<f32>>, device: Device| {
-            Tensor::from_slice(
-                &device,
-                [SHAPE[0]],
-                &reduce_axis2(&v, 1, 1.0, |a, b| a * b),
-            )
+            Tensor::from_slice(&device, [SHAPE[0]], &reduce_axis2(&v, 1, 1.0, |a, b| a * b))
         })
         .compare_with(approx_compare::<1, f32>(1e-3))
         .runs(3)
@@ -225,23 +217,21 @@ async fn indexing_cast_and_rank_specific_indexing_match_reference() {
     .unwrap();
 
     // cast f32 -> f16 -> f32
-    fusor_conformance::assert(async |x: Tensor<2, f32>| x.cast::<f16>().cast::<f32>().to_concrete())
-        .arg(fuzz)
-        .equal_to_resolved_with_device(async |v: Vec<Vec<f32>>, device: Device| {
-            let out: Vec<Vec<f32>> = v
-                .iter()
-                .map(|row| {
-                    row.iter()
-                        .map(|&x| f16::from_f32(x).to_f32())
-                        .collect()
-                })
-                .collect();
-            Tensor::new(&device, &out)
-        })
-        .compare_with(approx_compare::<2, f32>(1e-6))
-        .runs(3)
-        .await
-        .unwrap();
+    fusor_conformance::assert(async |x: Tensor<2, f32>| {
+        x.cast::<f16>().cast::<f32>().to_concrete()
+    })
+    .arg(fuzz)
+    .equal_to_resolved_with_device(async |v: Vec<Vec<f32>>, device: Device| {
+        let out: Vec<Vec<f32>> = v
+            .iter()
+            .map(|row| row.iter().map(|&x| f16::from_f32(x).to_f32()).collect())
+            .collect();
+        Tensor::new(&device, &out)
+    })
+    .compare_with(approx_compare::<2, f32>(1e-6))
+    .runs(3)
+    .await
+    .unwrap();
 
     // .i() rank-specific indexing: compare against slice+squeeze
     for device in available_devices().await {
@@ -416,8 +406,7 @@ async fn index_select_fuzzed() {
     let gen_2d = FuzzGenerator::<2, f32>::new(SHAPE_2D).with_seed(51);
 
     fusor_conformance::assert(async |x: Tensor<2, f32>| {
-        let indices =
-            Tensor::from_slice(&x.device(), [INDICES_2D_DIM0.len()], INDICES_2D_DIM0);
+        let indices = Tensor::from_slice(&x.device(), [INDICES_2D_DIM0.len()], INDICES_2D_DIM0);
         x.index_select(0, &indices)
     })
     .arg(gen_2d.clone())
@@ -432,8 +421,7 @@ async fn index_select_fuzzed() {
 
     // 2D index_select dim=1 with fuzzed data
     fusor_conformance::assert(async |x: Tensor<2, f32>| {
-        let indices =
-            Tensor::from_slice(&x.device(), [INDICES_2D_DIM1.len()], INDICES_2D_DIM1);
+        let indices = Tensor::from_slice(&x.device(), [INDICES_2D_DIM1.len()], INDICES_2D_DIM1);
         x.index_select(1, &indices)
     })
     .arg(gen_2d)
@@ -461,4 +449,47 @@ async fn index_select_fuzzed() {
     .runs(3)
     .await
     .unwrap();
+}
+
+#[tokio::test]
+async fn index_select_single_rank_and_large_regressions() {
+    for device in available_devices().await {
+        let single_input: Tensor<2, f32> =
+            Tensor::from_slice(&device, [3, 2], &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
+        let single_indices = Tensor::from_slice(&device, [1], &[1u32]);
+        let single_actual = single_input.index_select(0, &single_indices);
+        let single_expected: Tensor<2, f32> = Tensor::from_slice(&device, [1, 2], &[3.0, 4.0]);
+        common::assert_approx_tensors(single_actual, single_expected, 0.0).await;
+
+        let input_3d: Tensor<3, f32> = Tensor::from_slice(
+            &device,
+            [2, 2, 2],
+            &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0],
+        );
+        let indices_3d = Tensor::from_slice(&device, [2], &[1u32, 0]);
+        let actual_3d = input_3d.index_select(0, &indices_3d);
+        let expected_3d: Tensor<3, f32> = Tensor::new(
+            &device,
+            &[[[5.0, 6.0], [7.0, 8.0]], [[1.0, 2.0], [3.0, 4.0]]],
+        );
+        common::assert_approx_tensors(actual_3d, expected_3d, 0.0).await;
+
+        const SIZE: usize = 100;
+        let large_input: Tensor<2, f32> = arange(&device, 0.0f32, (SIZE * SIZE) as f32)
+            .reshape([SIZE, SIZE])
+            .to_concrete();
+        let reverse_indices: Vec<u32> = (0..SIZE).rev().map(|i| i as u32).collect();
+        let large_indices = Tensor::from_slice(&device, [SIZE], &reverse_indices);
+        let large_actual = large_input.index_select(0, &large_indices);
+        let large_expected_rows: Vec<Vec<f32>> = (0..SIZE)
+            .map(|row| {
+                let source_row = SIZE - 1 - row;
+                (0..SIZE)
+                    .map(|col| (source_row * SIZE + col) as f32)
+                    .collect()
+            })
+            .collect();
+        let large_expected = Tensor::new(&device, &large_expected_rows);
+        common::assert_approx_tensors(large_actual, large_expected, 0.0).await;
+    }
 }

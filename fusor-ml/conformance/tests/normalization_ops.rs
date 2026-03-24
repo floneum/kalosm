@@ -121,12 +121,7 @@ async fn softmax_and_normalization_match_reference_paths() {
             .map(|matrix| {
                 matrix
                     .into_iter()
-                    .map(|row| {
-                        row.into_iter()
-                            .zip(BIAS)
-                            .map(|(v, b)| v + b)
-                            .collect()
-                    })
+                    .map(|row| row.into_iter().zip(BIAS).map(|(v, b)| v + b).collect())
                     .collect()
             })
             .collect();
