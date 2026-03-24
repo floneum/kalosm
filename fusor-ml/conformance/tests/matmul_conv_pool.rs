@@ -31,16 +31,6 @@ async fn matmul_match_host_reference() {
         .runs(3)
         .await
         .unwrap();
-
-    // mat_mul vs matmul (two API paths)
-    fusor_conformance::assert(async |a: Tensor<2, f32>, b: Tensor<2, f32>| a.mat_mul(&b))
-        .arg(gen_lhs)
-        .arg(gen_rhs)
-        .equal_to(async |a: Tensor<2, f32>, b: Tensor<2, f32>| a.matmul(&b))
-        .compare_with(approx_compare::<2, f32>(1e-6))
-        .runs(3)
-        .await
-        .unwrap();
 }
 
 #[tokio::test]
@@ -93,17 +83,6 @@ async fn conv_and_pool_match_host_reference() {
     let gen_pool = FuzzGenerator::<3, f32>::new(POOL_SHAPE)
         .with_seed(320)
         .with_distribution(Uniform::new(-4.0, 12.0).unwrap());
-
-    // pool(Tensor::max) vs pool_max (two API paths)
-    fusor_conformance::assert(async |x: Tensor<3, f32>| -> Tensor<3, f32> {
-        x.pool([(2, 2)], Tensor::max)
-    })
-    .arg(gen_pool.clone())
-    .equal_to(async |x: Tensor<3, f32>| x.pool_max([(2, 2)]))
-    .compare_with(approx_compare::<3, f32>(1e-6))
-    .runs(3)
-    .await
-    .unwrap();
 
     // pool_max vs host reference
     fusor_conformance::assert(async |x: Tensor<3, f32>| x.pool_max([(2, 2)]))

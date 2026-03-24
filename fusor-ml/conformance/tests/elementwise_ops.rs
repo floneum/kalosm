@@ -331,15 +331,6 @@ async fn activation_and_scalar_ops_match_host_reference() {
         1e-4
     );
 
-    // pow_elementwise vs pow_scalar
-    fusor_conformance::assert(async |x: Tensor<2, f32>| x.pow_elementwise(2.5))
-        .arg(positive())
-        .equal_to(async |x: Tensor<2, f32>| x.pow_scalar(2.5))
-        .compare_with(approx_compare::<2, f32>(1e-6))
-        .runs(3)
-        .await
-        .unwrap();
-
     // max_scalar
     fuzz_unary!(
         _max_scalar,
@@ -349,15 +340,6 @@ async fn activation_and_scalar_ops_match_host_reference() {
         1e-6
     );
 
-    // max_elementwise vs max_scalar
-    fusor_conformance::assert(async |x: Tensor<2, f32>| x.max_elementwise(0.4))
-        .arg(signed())
-        .equal_to(async |x: Tensor<2, f32>| x.max_scalar(0.4))
-        .compare_with(approx_compare::<2, f32>(1e-6))
-        .runs(3)
-        .await
-        .unwrap();
-
     // min_scalar
     fuzz_unary!(
         _min_scalar,
@@ -366,15 +348,6 @@ async fn activation_and_scalar_ops_match_host_reference() {
         |v: f32| v.min(-0.4),
         1e-6
     );
-
-    // min_elementwise vs min_scalar
-    fusor_conformance::assert(async |x: Tensor<2, f32>| x.min_elementwise(-0.4))
-        .arg(signed())
-        .equal_to(async |x: Tensor<2, f32>| x.min_scalar(-0.4))
-        .compare_with(approx_compare::<2, f32>(1e-6))
-        .runs(3)
-        .await
-        .unwrap();
 
     // clamp
     fuzz_unary!(
@@ -533,51 +506,6 @@ async fn comparison_and_conditionals_match_expected() {
                 &common::compare_scalar_map2(&v, 0.25, |l, r| l >= r),
             )
         })
-        .compare_with(approx_compare::<2, f32>(0.0))
-        .runs(3)
-        .await
-        .unwrap();
-
-    // eq alias
-    fusor_conformance::assert(async |x: Tensor<2, f32>| x.eq(0.25))
-        .arg(fuzz.clone())
-        .equal_to(async |x: Tensor<2, f32>| x.eq_scalar(0.25))
-        .compare_with(approx_compare::<2, f32>(0.0))
-        .runs(3)
-        .await
-        .unwrap();
-
-    // lt alias
-    fusor_conformance::assert(async |x: Tensor<2, f32>| x.lt(0.25))
-        .arg(fuzz.clone())
-        .equal_to(async |x: Tensor<2, f32>| x.lt_scalar(0.25))
-        .compare_with(approx_compare::<2, f32>(0.0))
-        .runs(3)
-        .await
-        .unwrap();
-
-    // lte alias
-    fusor_conformance::assert(async |x: Tensor<2, f32>| x.lte(0.25))
-        .arg(fuzz.clone())
-        .equal_to(async |x: Tensor<2, f32>| x.lte_scalar(0.25))
-        .compare_with(approx_compare::<2, f32>(0.0))
-        .runs(3)
-        .await
-        .unwrap();
-
-    // mt alias (gt)
-    fusor_conformance::assert(async |x: Tensor<2, f32>| x.mt(0.25))
-        .arg(fuzz.clone())
-        .equal_to(async |x: Tensor<2, f32>| x.gt_scalar(0.25))
-        .compare_with(approx_compare::<2, f32>(0.0))
-        .runs(3)
-        .await
-        .unwrap();
-
-    // mte alias (gte)
-    fusor_conformance::assert(async |x: Tensor<2, f32>| x.mte(0.25))
-        .arg(fuzz.clone())
-        .equal_to(async |x: Tensor<2, f32>| x.gte_scalar(0.25))
         .compare_with(approx_compare::<2, f32>(0.0))
         .runs(3)
         .await

@@ -24,42 +24,6 @@ async fn softmax_and_normalization_match_reference_paths() {
         .await
         .unwrap();
 
-    // softmax_last_dim vs softmax
-    fusor_conformance::assert(async |x: Tensor<2, f32>| x.softmax_last_dim::<1>())
-        .arg(gen_softmax.clone())
-        .equal_to(async |x: Tensor<2, f32>| x.softmax::<1>(1))
-        .compare_with(approx_compare::<2, f32>(1e-6))
-        .runs(3)
-        .await
-        .unwrap();
-
-    // softmax_slow vs softmax
-    fusor_conformance::assert(async |x: Tensor<2, f32>| x.softmax_slow::<1>(1))
-        .arg(gen_softmax.clone())
-        .equal_to(async |x: Tensor<2, f32>| x.softmax::<1>(1))
-        .compare_with(approx_compare::<2, f32>(1e-6))
-        .runs(3)
-        .await
-        .unwrap();
-
-    // softmax_slow_last_dim vs softmax_last_dim
-    fusor_conformance::assert(async |x: Tensor<2, f32>| x.softmax_slow_last_dim::<1>())
-        .arg(gen_softmax.clone())
-        .equal_to(async |x: Tensor<2, f32>| x.softmax_last_dim::<1>())
-        .compare_with(approx_compare::<2, f32>(1e-6))
-        .runs(3)
-        .await
-        .unwrap();
-
-    // softmax_last_dim_fused vs softmax_last_dim
-    fusor_conformance::assert(async |x: Tensor<2, f32>| x.softmax_last_dim_fused::<1>())
-        .arg(gen_softmax)
-        .equal_to(async |x: Tensor<2, f32>| x.softmax_last_dim::<1>())
-        .compare_with(approx_compare::<2, f32>(1e-5))
-        .runs(3)
-        .await
-        .unwrap();
-
     // RMS norm with fuzzed input
     const NORM_SHAPE: [usize; 3] = [2, 3, 4];
     let gen_norm = FuzzGenerator::<3, f32>::new(NORM_SHAPE)

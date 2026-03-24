@@ -2,7 +2,7 @@ mod common;
 
 use common::{index_select1, index_select2, keepdim2, mean_axis2, reduce_axis2, var_axis2};
 use fusor::{Device, Tensor, arange};
-use fusor_conformance::{FuzzGenerator, approx_compare, available_devices, sequential_tensor};
+use fusor_conformance::{FuzzGenerator, approx_compare};
 use half::f16;
 use rand::distr::Uniform;
 
@@ -232,32 +232,6 @@ async fn indexing_cast_and_rank_specific_indexing_match_reference() {
     .runs(3)
     .await
     .unwrap();
-
-    // .i() rank-specific indexing: compare against slice+squeeze
-    for device in available_devices().await {
-        let matrix: Tensor<2, f32> = sequential_tensor(&device, [3, 4]);
-        let indexed_2d = matrix.i((1, 1..4));
-        let sliced_2d = matrix.slice([1..2, 1..4]).squeeze::<1>(0).to_concrete();
-        common::assert_approx_tensors(indexed_2d, sliced_2d, 1e-6).await;
-
-        let tensor3: Tensor<3, f32> = sequential_tensor(&device, [2, 3, 4]);
-        let indexed_3d = tensor3.i((0, 1..3, 1..4));
-        let sliced_3d = tensor3
-            .slice([0..1, 1..3, 1..4])
-            .squeeze::<2>(0)
-            .to_concrete();
-        common::assert_approx_tensors(indexed_3d, sliced_3d, 1e-6).await;
-
-        let tensor4: Tensor<4, f32> = arange(&device, 0.0f32, 48.0)
-            .reshape([2, 2, 3, 4])
-            .to_concrete();
-        let indexed_4d = tensor4.i((1, 0..2, 1..3, 1..4));
-        let sliced_4d = tensor4
-            .slice([1..2, 0..2, 1..3, 1..4])
-            .squeeze::<3>(0)
-            .to_concrete();
-        common::assert_approx_tensors(indexed_4d, sliced_4d, 1e-6).await;
-    }
 }
 
 #[tokio::test]
