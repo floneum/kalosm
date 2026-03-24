@@ -29,7 +29,7 @@ pub use composite::{
 };
 pub use device::Device;
 pub use error::Error;
-pub use fusor_types::FromArray;
+pub use fusor_types::{FromArray, Layout};
 
 /// Result type for fusor operations.
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -1161,25 +1161,17 @@ where
     where
         fusor_core::Tensor<R, D>: fusor_core::SmallerRank<FROM_END, R2, D>,
     {
-        match self {
-            Tensor::Cpu(t) => {
-                // CPU flatten_last_n takes N where output = input - N + 1
-                // So we need CPU_N = FROM_END + 1 to match GPU semantics
-                // Calculate new shape manually since we can't do const arithmetic
-                let shape = t.shape();
-                let new_shape: [usize; R2] = std::array::from_fn(|i| {
-                    if i < R - 1 - FROM_END {
-                        shape[i]
-                    } else if i == R - 1 - FROM_END {
-                        shape[R - 1 - FROM_END..].iter().product()
-                    } else {
-                        1
-                    }
-                });
-                Tensor::Cpu(t.as_ref().reshape(new_shape).to_concrete())
+        let shape = self.shape();
+        let new_shape: [usize; R2] = std::array::from_fn(|i| {
+            if i < R - 1 - FROM_END {
+                shape[i]
+            } else if i == R - 1 - FROM_END {
+                shape[R - 1 - FROM_END..].iter().product()
+            } else {
+                1
             }
-            Tensor::Gpu(t) => Tensor::Gpu(t.flatten_last_n::<FROM_END, R2>()),
-        }
+        });
+        self.reshape(new_shape).to_concrete()
     }
 
     /// Flatten the first FROM_START+1 dimensions into one.
@@ -1196,22 +1188,15 @@ where
     where
         fusor_core::Tensor<R, D>: fusor_core::SmallerRank<FROM_START, R2, D>,
     {
-        match self {
-            Tensor::Cpu(t) => {
-                // Calculate new shape: first element is product of first FROM_START+1 dims
-                // remaining elements are the rest of the dimensions
-                let shape = t.shape();
-                let new_shape: [usize; R2] = std::array::from_fn(|i| {
-                    if i == 0 {
-                        shape[..=FROM_START].iter().product()
-                    } else {
-                        shape[i + FROM_START]
-                    }
-                });
-                Tensor::Cpu(t.as_ref().reshape(new_shape).to_concrete())
+        let shape = self.shape();
+        let new_shape: [usize; R2] = std::array::from_fn(|i| {
+            if i == 0 {
+                shape[..=FROM_START].iter().product()
+            } else {
+                shape[i + FROM_START]
             }
-            Tensor::Gpu(t) => Tensor::Gpu(t.flatten_first_n::<FROM_START, R2>()),
-        }
+        });
+        self.reshape(new_shape).to_concrete()
     }
 }
 

@@ -5,7 +5,7 @@ use std::ops::Range;
 use crate::{ConcreteTensor, Device, SimdElement, Tensor};
 use fusor_core::{DataType, Dim, ShapeWithOneHole};
 use fusor_cpu::{MapLayout, TensorBacking};
-use fusor_types::{SlidingWindow, StrideSpec};
+use fusor_types::{Layout, SlidingWindow, StrideSpec};
 
 impl<const R: usize, D, B> Tensor<R, D, B>
 where
@@ -76,6 +76,17 @@ where
         }
     }
 
+    /// Set the layout directly from a pre-computed [`Layout`].
+    pub fn restride_layout<const R2: usize>(
+        &self,
+        new_layout: Layout,
+    ) -> Tensor<R2, D, MapLayout<&B, R2>> {
+        match self {
+            Tensor::Cpu(t) => Tensor::Cpu(t.as_ref().restride_layout(new_layout.clone())),
+            Tensor::Gpu(t) => Tensor::Gpu(t.restride_layout(new_layout)),
+        }
+    }
+
     /// Permute the tensor dimensions according to the given axes order.
     ///
     /// # Arguments
@@ -124,10 +135,8 @@ where
 
     /// Flatten the tensor to 1D.
     pub fn flatten_all(&self) -> Tensor<1, D, MapLayout<&B, 1>> {
-        match self {
-            Tensor::Cpu(t) => Tensor::Cpu(t.as_ref().flatten_all()),
-            Tensor::Gpu(t) => Tensor::Gpu(t.flatten_all()),
-        }
+        let total = self.shape().iter().product();
+        self.reshape([total])
     }
 
     /// Narrow the tensor along a given dimension.
@@ -488,6 +497,32 @@ where
     cat(unsqueezed, dim)
 }
 
+impl<D> Tensor<1, D>
+where
+    D: SimdElement + DataType + Default,
+{
+    /// Create a range tensor from start (inclusive) to end (exclusive).
+    pub fn arange(device: &Device, start: D, end: D) -> Tensor<1, D, ConcreteTensor<D, 1>>
+    where
+        D: std::ops::Add<Output = D> + PartialOrd + From<u8>,
+    {
+        arange(device, start, end)
+    }
+
+    /// Create a range tensor with a custom step.
+    pub fn arange_step(
+        device: &Device,
+        start: D,
+        end: D,
+        step: D,
+    ) -> Tensor<1, D, ConcreteTensor<D, 1>>
+    where
+        D: std::ops::Add<Output = D> + PartialOrd + Copy,
+    {
+        arange_step(device, start, end, step)
+    }
+}
+
 /// Create a range tensor from start (inclusive) to end (exclusive).
 pub fn arange<D>(device: &Device, start: D, end: D) -> Tensor<1, D, ConcreteTensor<D, 1>>
 where
@@ -557,6 +592,36 @@ mod tests {
         assert_eq!(slice[[1, 1]], 5.0);
         assert_eq!(slice[[2, 0]], 3.0);
         assert_eq!(slice[[2, 1]], 6.0);
+    }
+
+    #[tokio::test]
+    async fn test_restride_layout_cpu() {
+        let data = [1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0];
+        let t: Tensor<2, f32> = Tensor::Cpu(fusor_cpu::Tensor::from_slice([2, 3], &data));
+
+        let layout = Layout::from_parts(0, vec![3, 2].into_boxed_slice(), vec![1, 3].into());
+        let restrided: Tensor<2, f32, _> = t.restride_layout(layout);
+        let slice = restrided.as_slice().await.unwrap();
+
+        assert_eq!(slice[[0, 0]], 1.0);
+        assert_eq!(slice[[0, 1]], 4.0);
+        assert_eq!(slice[[1, 0]], 2.0);
+        assert_eq!(slice[[1, 1]], 5.0);
+        assert_eq!(slice[[2, 0]], 3.0);
+        assert_eq!(slice[[2, 1]], 6.0);
+    }
+
+    #[tokio::test]
+    async fn test_tensor_arange_cpu() {
+        let device = Device::Cpu;
+        let t = Tensor::<1, f32>::arange(&device, 0.0, 5.0);
+        let slice = t.as_slice().await.unwrap();
+
+        assert_eq!(slice[[0]], 0.0);
+        assert_eq!(slice[[1]], 1.0);
+        assert_eq!(slice[[2]], 2.0);
+        assert_eq!(slice[[3]], 3.0);
+        assert_eq!(slice[[4]], 4.0);
     }
 
     #[tokio::test]

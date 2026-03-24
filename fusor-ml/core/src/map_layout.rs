@@ -108,6 +108,12 @@ impl<const R: usize, T: DataType> Tensor<R, T> {
         }))
     }
 
+    pub fn restride_layout<const R2: usize>(&self, new_layout: Layout) -> Tensor<R2, T> {
+        self.add_map_layout(MapLayoutOperation::new(self.key(), move |_| {
+            new_layout.clone()
+        }))
+    }
+
     pub(crate) fn transpose(
         &self,
         first_axis: impl Dim<R>,
