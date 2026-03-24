@@ -453,35 +453,50 @@ async fn index_select_fuzzed() {
 
 #[tokio::test]
 async fn index_select_single_rank_and_large_regressions() {
-    for device in available_devices().await {
-        let single_input: Tensor<2, f32> =
-            Tensor::from_slice(&device, [3, 2], &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
-        let single_indices = Tensor::from_slice(&device, [1], &[1u32]);
-        let single_actual = single_input.index_select(0, &single_indices);
-        let single_expected: Tensor<2, f32> = Tensor::from_slice(&device, [1, 2], &[3.0, 4.0]);
-        common::assert_approx_tensors(single_actual, single_expected, 0.0).await;
+    let single_gen = FuzzGenerator::<2, f32>::new([3, 2])
+        .with_seed(53)
+        .with_distribution(Uniform::new(-5.0, 5.0).unwrap());
+    fusor_conformance::assert(async |x: Tensor<2, f32>| {
+        let indices = Tensor::from_slice(&x.device(), [1], &[1u32]);
+        x.index_select(0, &indices)
+    })
+    .arg(single_gen)
+    .equal_to_resolved_with_device(async |v: Vec<Vec<f32>>, device: Device| {
+        Tensor::new(&device, &[v[1].clone()])
+    })
+    .compare_with(approx_compare::<2, f32>(0.0))
+    .runs(3)
+    .await
+    .unwrap();
 
-        let input_3d: Tensor<3, f32> = Tensor::from_slice(
-            &device,
-            [2, 2, 2],
-            &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0],
-        );
-        let indices_3d = Tensor::from_slice(&device, [2], &[1u32, 0]);
-        let actual_3d = input_3d.index_select(0, &indices_3d);
-        let expected_3d: Tensor<3, f32> = Tensor::new(
-            &device,
-            &[[[5.0, 6.0], [7.0, 8.0]], [[1.0, 2.0], [3.0, 4.0]]],
-        );
-        common::assert_approx_tensors(actual_3d, expected_3d, 0.0).await;
+    let gen_3d = FuzzGenerator::<3, f32>::new([2, 2, 2])
+        .with_seed(54)
+        .with_distribution(Uniform::new(-5.0, 5.0).unwrap());
+    fusor_conformance::assert(async |x: Tensor<3, f32>| {
+        let indices = Tensor::from_slice(&x.device(), [2], &[1u32, 0]);
+        x.index_select(0, &indices)
+    })
+    .arg(gen_3d)
+    .equal_to_resolved_with_device(async |v: Vec<Vec<Vec<f32>>>, device: Device| {
+        Tensor::new(&device, &[v[1].clone(), v[0].clone()])
+    })
+    .compare_with(approx_compare::<3, f32>(0.0))
+    .runs(3)
+    .await
+    .unwrap();
 
-        const SIZE: usize = 100;
-        let large_input: Tensor<2, f32> = arange(&device, 0.0f32, (SIZE * SIZE) as f32)
+    const SIZE: usize = 100;
+    fusor_conformance::assert(async |device: Device| {
+        let input: Tensor<2, f32> = arange(&device, 0.0f32, (SIZE * SIZE) as f32)
             .reshape([SIZE, SIZE])
             .to_concrete();
         let reverse_indices: Vec<u32> = (0..SIZE).rev().map(|i| i as u32).collect();
-        let large_indices = Tensor::from_slice(&device, [SIZE], &reverse_indices);
-        let large_actual = large_input.index_select(0, &large_indices);
-        let large_expected_rows: Vec<Vec<f32>> = (0..SIZE)
+        let indices = Tensor::from_slice(&device, [SIZE], &reverse_indices);
+        input.index_select(0, &indices)
+    })
+    .arg(|device: &Device| device.clone())
+    .equal_to(async |device: Device| {
+        let rows: Vec<Vec<f32>> = (0..SIZE)
             .map(|row| {
                 let source_row = SIZE - 1 - row;
                 (0..SIZE)
@@ -489,7 +504,9 @@ async fn index_select_single_rank_and_large_regressions() {
                     .collect()
             })
             .collect();
-        let large_expected = Tensor::new(&device, &large_expected_rows);
-        common::assert_approx_tensors(large_actual, large_expected, 0.0).await;
-    }
+        Tensor::new(&device, &rows)
+    })
+    .compare_with(approx_compare::<2, f32>(0.0))
+    .await
+    .unwrap();
 }

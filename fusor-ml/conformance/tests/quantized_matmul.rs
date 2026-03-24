@@ -2,21 +2,22 @@ mod common;
 
 use std::mem::size_of;
 
-use common::{assert_approx_devices, flatten2, matmul2, transpose2};
-use fusor::{QMatrix, Tensor};
+use common::{matmul2, transpose2};
+use fusor::{Device, QMatrix, Tensor, ToVec2};
+use fusor_conformance::{FuzzGenerator, approx_compare};
 use fusor_cpu::{
     BlockQ4_0, BlockQ4K, BlockQ5_0, BlockQ5K, BlockQ6K, BlockQ8_0, ConcreteTensor, GgmlType,
     GgufBlock, QuantizedTensor,
 };
+use rand::distr::Uniform;
 
 #[derive(Clone)]
 struct QuantizedFixture {
     ty: GgmlType,
     weight_shape: [usize; 2],
     raw_bytes: Vec<u8>,
-    input: Vec<Vec<f32>>,
+    input_row_count: usize,
     dequantized: Vec<Vec<f32>>,
-    q_mat_mul: Vec<Vec<f32>>,
     dequantize_tol: f32,
     q_mat_mul_tol: f32,
 }
@@ -31,19 +32,6 @@ fn packed_nibble_byte(low: usize, high: usize) -> u8 {
 
 fn block_count(shape: [usize; 2], block_size: usize) -> usize {
     (shape[0] * shape[1]) / block_size
-}
-
-fn input_rows(cols: usize, rows: usize) -> Vec<Vec<f32>> {
-    (0..rows)
-        .map(|row| {
-            (0..cols)
-                .map(|col| {
-                    let base = ((row * cols + col * 3) % 17) as f32;
-                    0.02 + base * 0.01
-                })
-                .collect()
-        })
-        .collect()
 }
 
 fn concrete_to_rows(tensor: &ConcreteTensor<f32, 2>, shape: [usize; 2]) -> Vec<Vec<f32>> {
@@ -65,22 +53,15 @@ where
     B::Dequantized: AsRef<[f32]>,
     B::ActivationBlock: Send + Sync,
 {
-    let input = input_rows(weight_shape[1], input_row_count);
     let weights = QuantizedTensor::<B>::from_raw_bytes(weight_shape, &raw_bytes);
     let dequantized = concrete_to_rows(&weights.dequantize::<2>(), weight_shape);
-
-    let lhs_shape = [input.len(), input[0].len()];
-    let lhs = ConcreteTensor::<f32, 2>::from_slice(lhs_shape, &flatten2(&input));
-    let q_mat_mul_shape = [lhs_shape[0], weight_shape[0]];
-    let q_mat_mul = concrete_to_rows(&lhs.q_mat_mul(&weights), q_mat_mul_shape);
 
     QuantizedFixture {
         ty,
         weight_shape,
         raw_bytes,
-        input,
+        input_row_count,
         dequantized,
-        q_mat_mul,
         dequantize_tol,
         q_mat_mul_tol,
     }
@@ -326,43 +307,64 @@ async fn assert_dequantize_matches_cpu_reference(fixture: QuantizedFixture) {
         ..
     } = fixture;
 
-    assert_approx_devices(
-        move |device| {
-            QMatrix::from_raw_bytes(device, weight_shape, &raw_bytes, ty)
+    fusor_conformance::assert(move |device: Device| {
+        let raw_bytes = raw_bytes.clone();
+        async move {
+            QMatrix::from_raw_bytes(&device, weight_shape, &raw_bytes, ty)
                 .unwrap()
                 .dequantize::<2>()
-        },
-        move |device| Tensor::new(device, &dequantized),
-        dequantize_tol,
-    )
-    .await;
+        }
+    })
+    .arg(|device: &Device| device.clone())
+    .equal_to(move |device: Device| {
+        let dequantized = dequantized.clone();
+        async move { Tensor::new(&device, &dequantized) }
+    })
+    .compare_with(approx_compare::<2, f32>(dequantize_tol))
+    .await
+    .unwrap();
 }
 
-async fn assert_q_mat_mul_matches_cpu_reference(fixture: QuantizedFixture) {
+async fn assert_q_mat_mul_matches_cpu_reference(fixture: QuantizedFixture, seed: u64) {
     let QuantizedFixture {
         ty,
         weight_shape,
         raw_bytes,
-        input,
-        q_mat_mul,
+        input_row_count,
+        dequantized,
         q_mat_mul_tol,
         ..
     } = fixture;
 
-    assert_approx_devices(
-        move |device| {
-            let input: Tensor<2, f32> = Tensor::new(device, &input);
-            let weights = QMatrix::from_raw_bytes(device, weight_shape, &raw_bytes, ty).unwrap();
+    fusor_conformance::assert(move |input: Tensor<2, f32>| {
+        let raw_bytes = raw_bytes.clone();
+        async move {
+            let weights =
+                QMatrix::from_raw_bytes(&input.device(), weight_shape, &raw_bytes, ty).unwrap();
             input.q_mat_mul(&weights)
-        },
-        move |device| Tensor::new(device, &q_mat_mul),
-        q_mat_mul_tol,
+        }
+    })
+    .arg(
+        FuzzGenerator::<2, f32>::new([input_row_count, weight_shape[1]])
+            .with_seed(seed)
+            .with_distribution(Uniform::new(-0.25, 0.25).unwrap()),
     )
-    .await;
+    .equal_to(move |input: Tensor<2, f32>| {
+        let dequantized = dequantized.clone();
+        async move {
+            let device = input.device();
+            let input_values = input.as_slice().await.unwrap().to_vec2();
+            Tensor::new(&device, &matmul2(&input_values, &transpose2(&dequantized)))
+        }
+    })
+    .compare_with(approx_compare::<2, f32>(q_mat_mul_tol))
+    .runs(3)
+    .await
+    .unwrap();
 }
 
 macro_rules! quantized_fixture_tests {
-    ($fixture_fn:ident, $dequantize_test:ident, $q_mat_mul_test:ident) => {
+    ($fixture_fn:ident, $dequantize_test:ident, $q_mat_mul_test:ident, $seed:expr) => {
         #[tokio::test]
         async fn $dequantize_test() {
             assert_dequantize_matches_cpu_reference($fixture_fn()).await;
@@ -370,7 +372,7 @@ macro_rules! quantized_fixture_tests {
 
         #[tokio::test]
         async fn $q_mat_mul_test() {
-            assert_q_mat_mul_matches_cpu_reference($fixture_fn()).await;
+            assert_q_mat_mul_matches_cpu_reference($fixture_fn(), $seed).await;
         }
     };
 }
@@ -378,57 +380,63 @@ macro_rules! quantized_fixture_tests {
 quantized_fixture_tests!(
     q4_0_fixture,
     q4_0_dequantize_matches_cpu_reference,
-    q4_0_q_mat_mul_matches_cpu_reference
+    q4_0_q_mat_mul_matches_cpu_reference,
+    800
 );
 quantized_fixture_tests!(
     q5_0_fixture,
     q5_0_dequantize_matches_cpu_reference,
-    q5_0_q_mat_mul_matches_cpu_reference
+    q5_0_q_mat_mul_matches_cpu_reference,
+    801
 );
 quantized_fixture_tests!(
     q8_0_fixture,
     q8_0_dequantize_matches_cpu_reference,
-    q8_0_q_mat_mul_matches_cpu_reference
+    q8_0_q_mat_mul_matches_cpu_reference,
+    802
 );
 quantized_fixture_tests!(
     q4k_fixture,
     q4k_dequantize_matches_cpu_reference,
-    q4k_q_mat_mul_matches_cpu_reference
+    q4k_q_mat_mul_matches_cpu_reference,
+    803
 );
 quantized_fixture_tests!(
     q5k_fixture,
     q5k_dequantize_matches_cpu_reference,
-    q5k_q_mat_mul_matches_cpu_reference
+    q5k_q_mat_mul_matches_cpu_reference,
+    804
 );
 quantized_fixture_tests!(
     q6k_fixture,
     q6k_dequantize_matches_cpu_reference,
-    q6k_q_mat_mul_matches_cpu_reference
+    q6k_q_mat_mul_matches_cpu_reference,
+    805
 );
 
 #[tokio::test]
 async fn q5_0_q_mat_mul_multi_row_matches_cpu_reference() {
-    assert_q_mat_mul_matches_cpu_reference(q5_0_wide_fixture()).await;
+    assert_q_mat_mul_matches_cpu_reference(q5_0_wide_fixture(), 810).await;
 }
 
 #[tokio::test]
 async fn q8_0_q_mat_mul_multi_row_matches_cpu_reference() {
-    assert_q_mat_mul_matches_cpu_reference(q8_0_wide_fixture()).await;
+    assert_q_mat_mul_matches_cpu_reference(q8_0_wide_fixture(), 811).await;
 }
 
 #[tokio::test]
 async fn q4k_q_mat_mul_multi_row_matches_cpu_reference() {
-    assert_q_mat_mul_matches_cpu_reference(q4k_wide_fixture()).await;
+    assert_q_mat_mul_matches_cpu_reference(q4k_wide_fixture(), 812).await;
 }
 
 #[tokio::test]
 async fn q5k_q_mat_mul_multi_row_matches_cpu_reference() {
-    assert_q_mat_mul_matches_cpu_reference(q5k_wide_fixture()).await;
+    assert_q_mat_mul_matches_cpu_reference(q5k_wide_fixture(), 813).await;
 }
 
 #[tokio::test]
 async fn q6k_q_mat_mul_multi_row_matches_cpu_reference() {
-    assert_q_mat_mul_matches_cpu_reference(q6k_wide_fixture()).await;
+    assert_q_mat_mul_matches_cpu_reference(q6k_wide_fixture(), 814).await;
 }
 
 fn f32_weight_rows() -> Vec<Vec<f32>> {
@@ -443,25 +451,35 @@ fn f32_weight_bytes() -> Vec<u8> {
         .collect()
 }
 
-fn f32_input() -> Vec<Vec<f32>> {
-    vec![vec![1.0, 1.0, 1.0, 1.0], vec![0.5, -1.0, 2.0, 3.5]]
-}
-
 #[tokio::test]
 async fn f32_q_matrix_q_mat_mul_matches_host_reference() {
-    let input = f32_input();
-    let weights = f32_weight_rows();
     let raw_bytes = f32_weight_bytes();
+    let weights = f32_weight_rows();
 
-    assert_approx_devices(
-        |device| {
-            let input: Tensor<2, f32> = Tensor::new(device, &input);
+    fusor_conformance::assert(move |input: Tensor<2, f32>| {
+        let raw_bytes = raw_bytes.clone();
+        async move {
             let weights =
-                QMatrix::from_raw_bytes(device, [2, 4], &raw_bytes, GgmlType::F32).unwrap();
+                QMatrix::from_raw_bytes(&input.device(), [2, 4], &raw_bytes, GgmlType::F32)
+                    .unwrap();
             input.q_mat_mul(&weights)
-        },
-        |device| Tensor::new(device, &matmul2(&input, &transpose2(&weights))),
-        1e-6,
+        }
+    })
+    .arg(
+        FuzzGenerator::<2, f32>::new([2, 4])
+            .with_seed(820)
+            .with_distribution(Uniform::new(-0.5, 0.5).unwrap()),
     )
-    .await;
+    .equal_to(move |input: Tensor<2, f32>| {
+        let weights = weights.clone();
+        async move {
+            let device = input.device();
+            let input_values = input.as_slice().await.unwrap().to_vec2();
+            Tensor::new(&device, &matmul2(&input_values, &transpose2(&weights)))
+        }
+    })
+    .compare_with(approx_compare::<2, f32>(1e-6))
+    .runs(3)
+    .await
+    .unwrap();
 }

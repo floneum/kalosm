@@ -1,8 +1,8 @@
 mod common;
 
-use common::{assert_approx_tensors, reshape4, rope_interleaved_4d, rope_normal_4d};
-use fusor::{RopeCache, Tensor, ToVec1, base_inverse_frequency};
-use fusor_conformance::{FuzzGenerator, GenerateFromDevice, available_devices};
+use common::{reshape4, rope_interleaved_4d, rope_normal_4d};
+use fusor::{Device, RopeCache, Tensor, ToVec1, base_inverse_frequency};
+use fusor_conformance::{FuzzGenerator, approx_compare};
 use rand::distr::Uniform;
 
 fn rope_tables(
@@ -36,6 +36,7 @@ static SIN: &[[f32; 2]] = &[[0.1, 0.2], [0.3, 0.4], [0.5, 0.6]];
 fn cos_vec() -> Vec<Vec<f32>> {
     COS.iter().map(|r| r.to_vec()).collect()
 }
+
 fn sin_vec() -> Vec<Vec<f32>> {
     SIN.iter().map(|r| r.to_vec()).collect()
 }
@@ -50,117 +51,362 @@ async fn rope_and_cache_paths_match_reference_variants() {
     ];
     assert_eq!(base_inverse_frequency(8, 10_000.0), expected);
 
-    // Fuzz input tensor [1, 2, 3, 4] — cos/sin tables stay fixed
-    // Note: ToVec is not implemented for rank-4, so we use available_devices loop
-    // with fuzz generator for non-contiguous layout testing
-    let mut fuzz_input = FuzzGenerator::<4, f32>::new([1, 2, 3, 4])
+    let cos = cos_vec();
+    let sin = sin_vec();
+    let fuzz_input = FuzzGenerator::<4, f32>::new([1, 2, 3, 4])
         .with_seed(600)
         .with_distribution(Uniform::new(-6.0, 6.0).unwrap());
 
-    for device in available_devices().await {
-        for run in 0..3 {
-            let x = fuzz_input.generate(&device, run);
-            let cos_t: Tensor<2, f32> = Tensor::new(&device, &cos_vec());
-            let sin_t: Tensor<2, f32> = Tensor::new(&device, &sin_vec());
-
-            // rope vs host reference
-            let slice = x
-                .to_concrete()
-                .flatten_all()
-                .to_concrete()
-                .as_slice()
-                .await
-                .unwrap();
-            let flat: Vec<f32> = slice.to_vec1();
-            let v = reshape4(&flat, [1, 2, 3, 4]);
-            let expected_normal = rope_normal_4d(&v, &cos_vec(), &sin_vec());
-            assert_approx_tensors(
-                x.rope(&cos_t, &sin_t),
-                Tensor::new(&device, &expected_normal),
-                1e-4,
-            )
-            .await;
-
-            // rope_interleaved vs host reference
-            let expected_interleaved = rope_interleaved_4d(&v, &cos_vec(), &sin_vec());
-            assert_approx_tensors(
-                x.rope_interleaved(&cos_t, &sin_t),
-                Tensor::new(&device, &expected_interleaved),
-                1e-4,
-            )
-            .await;
-
-            // rope_normal_fused vs rope
-            assert_approx_tensors(
-                x.rope_normal_fused(&cos_t, &sin_t),
-                x.rope(&cos_t, &sin_t),
-                1e-4,
-            )
-            .await;
-
-            // rope_fused vs rope_interleaved
-            assert_approx_tensors(
-                x.rope_fused(&cos_t, &sin_t),
-                x.rope_interleaved(&cos_t, &sin_t),
-                1e-4,
-            )
-            .await;
+    fusor_conformance::assert({
+        let cos = cos.clone();
+        let sin = sin.clone();
+        move |x: Tensor<4, f32>| {
+            let cos = cos.clone();
+            let sin = sin.clone();
+            async move {
+                let device = x.device();
+                let slice = x
+                    .to_concrete()
+                    .flatten_all()
+                    .to_concrete()
+                    .as_slice()
+                    .await
+                    .unwrap();
+                let flat: Vec<f32> = slice.to_vec1();
+                let host = reshape4(&flat, [1, 2, 3, 4]);
+                Tensor::new(&device, &rope_normal_4d(&host, &cos, &sin))
+            }
         }
-    }
+    })
+    .arg(fuzz_input.clone())
+    .equal_to({
+        let cos = cos.clone();
+        let sin = sin.clone();
+        move |x: Tensor<4, f32>| {
+            let cos = cos.clone();
+            let sin = sin.clone();
+            async move {
+                let device = x.device();
+                let cos_t: Tensor<2, f32> = Tensor::new(&device, &cos);
+                let sin_t: Tensor<2, f32> = Tensor::new(&device, &sin);
+                x.rope(&cos_t, &sin_t)
+            }
+        }
+    })
+    .compare_with(approx_compare::<4, f32>(1e-4))
+    .runs(3)
+    .await
+    .unwrap();
 
-    // RopeCache tests
-    for device in available_devices().await {
-        let cache_cos = vec![
-            vec![1.0f32, 1.1],
-            vec![1.2, 1.3],
-            vec![1.4, 1.5],
-            vec![1.6, 1.7],
-        ];
-        let cache_sin = vec![
-            vec![0.1f32, 0.2],
-            vec![0.3, 0.4],
-            vec![0.5, 0.6],
-            vec![0.7, 0.8],
-        ];
-        let cache = RopeCache::from_parts(
-            Tensor::new(&device, &cache_cos),
-            Tensor::new(&device, &cache_sin),
-        );
+    fusor_conformance::assert({
+        let cos = cos.clone();
+        let sin = sin.clone();
+        move |x: Tensor<4, f32>| {
+            let cos = cos.clone();
+            let sin = sin.clone();
+            async move {
+                let device = x.device();
+                let slice = x
+                    .to_concrete()
+                    .flatten_all()
+                    .to_concrete()
+                    .as_slice()
+                    .await
+                    .unwrap();
+                let flat: Vec<f32> = slice.to_vec1();
+                let host = reshape4(&flat, [1, 2, 3, 4]);
+                Tensor::new(&device, &rope_interleaved_4d(&host, &cos, &sin))
+            }
+        }
+    })
+    .arg(fuzz_input.clone())
+    .equal_to({
+        let cos = cos.clone();
+        let sin = sin.clone();
+        move |x: Tensor<4, f32>| {
+            let cos = cos.clone();
+            let sin = sin.clone();
+            async move {
+                let device = x.device();
+                let cos_t: Tensor<2, f32> = Tensor::new(&device, &cos);
+                let sin_t: Tensor<2, f32> = Tensor::new(&device, &sin);
+                x.rope_interleaved(&cos_t, &sin_t)
+            }
+        }
+    })
+    .compare_with(approx_compare::<4, f32>(1e-4))
+    .runs(3)
+    .await
+    .unwrap();
 
-        let gen_q = FuzzGenerator::<4, f32>::new([1, 2, 3, 4])
-            .with_seed(601)
-            .with_distribution(Uniform::new(-6.0, 6.0).unwrap());
-        let gen_k = FuzzGenerator::<4, f32>::new([1, 2, 3, 4])
-            .with_seed(602)
-            .with_distribution(Uniform::new(-6.0, 6.0).unwrap());
+    fusor_conformance::assert({
+        let cos = cos.clone();
+        let sin = sin.clone();
+        move |x: Tensor<4, f32>| {
+            let cos = cos.clone();
+            let sin = sin.clone();
+            async move {
+                let device = x.device();
+                let cos_t: Tensor<2, f32> = Tensor::new(&device, &cos);
+                let sin_t: Tensor<2, f32> = Tensor::new(&device, &sin);
+                x.rope_normal_fused(&cos_t, &sin_t)
+            }
+        }
+    })
+    .arg(fuzz_input.clone())
+    .equal_to({
+        let cos = cos.clone();
+        let sin = sin.clone();
+        move |x: Tensor<4, f32>| {
+            let cos = cos.clone();
+            let sin = sin.clone();
+            async move {
+                let device = x.device();
+                let cos_t: Tensor<2, f32> = Tensor::new(&device, &cos);
+                let sin_t: Tensor<2, f32> = Tensor::new(&device, &sin);
+                x.rope(&cos_t, &sin_t)
+            }
+        }
+    })
+    .compare_with(approx_compare::<4, f32>(1e-4))
+    .runs(3)
+    .await
+    .unwrap();
 
-        let q = gen_q.clone().generate(&device, 0);
-        let k = gen_k.clone().generate(&device, 0);
+    fusor_conformance::assert({
+        let cos = cos.clone();
+        let sin = sin.clone();
+        move |x: Tensor<4, f32>| {
+            let cos = cos.clone();
+            let sin = sin.clone();
+            async move {
+                let device = x.device();
+                let cos_t: Tensor<2, f32> = Tensor::new(&device, &cos);
+                let sin_t: Tensor<2, f32> = Tensor::new(&device, &sin);
+                x.rope_fused(&cos_t, &sin_t)
+            }
+        }
+    })
+    .arg(fuzz_input.clone())
+    .equal_to({
+        let cos = cos.clone();
+        let sin = sin.clone();
+        move |x: Tensor<4, f32>| {
+            let cos = cos.clone();
+            let sin = sin.clone();
+            async move {
+                let device = x.device();
+                let cos_t: Tensor<2, f32> = Tensor::new(&device, &cos);
+                let sin_t: Tensor<2, f32> = Tensor::new(&device, &sin);
+                x.rope_interleaved(&cos_t, &sin_t)
+            }
+        }
+    })
+    .compare_with(approx_compare::<4, f32>(1e-4))
+    .runs(3)
+    .await
+    .unwrap();
 
-        let cos_slice: Tensor<2, f32> = Tensor::new(&device, &cache_cos[1..4].to_vec());
-        let sin_slice: Tensor<2, f32> = Tensor::new(&device, &cache_sin[1..4].to_vec());
+    let cache_cos = vec![
+        vec![1.0f32, 1.1],
+        vec![1.2, 1.3],
+        vec![1.4, 1.5],
+        vec![1.6, 1.7],
+    ];
+    let cache_sin = vec![
+        vec![0.1f32, 0.2],
+        vec![0.3, 0.4],
+        vec![0.5, 0.6],
+        vec![0.7, 0.8],
+    ];
+    let gen_q = FuzzGenerator::<4, f32>::new([1, 2, 3, 4])
+        .with_seed(601)
+        .with_distribution(Uniform::new(-6.0, 6.0).unwrap());
+    let gen_k = FuzzGenerator::<4, f32>::new([1, 2, 3, 4])
+        .with_seed(602)
+        .with_distribution(Uniform::new(-6.0, 6.0).unwrap());
 
-        let (q_rope, k_rope) = cache.forward(&q, &k, 1);
-        assert_approx_tensors(q_rope, q.rope_normal_fused(&cos_slice, &sin_slice), 1e-4).await;
-        assert_approx_tensors(k_rope, k.rope_normal_fused(&cos_slice, &sin_slice), 1e-4).await;
+    fusor_conformance::assert({
+        let cache_cos = cache_cos.clone();
+        let cache_sin = cache_sin.clone();
+        move |q: Tensor<4, f32>, k: Tensor<4, f32>| {
+            let cache_cos = cache_cos.clone();
+            let cache_sin = cache_sin.clone();
+            async move {
+                let device = q.device();
+                let cache = RopeCache::from_parts(
+                    Tensor::new(&device, &cache_cos),
+                    Tensor::new(&device, &cache_sin),
+                );
+                cache.forward(&q, &k, 1).0
+            }
+        }
+    })
+    .arg(gen_q.clone())
+    .arg(gen_k.clone())
+    .equal_to({
+        let cache_cos = cache_cos.clone();
+        let cache_sin = cache_sin.clone();
+        move |q: Tensor<4, f32>, _k: Tensor<4, f32>| {
+            let cache_cos = cache_cos.clone();
+            let cache_sin = cache_sin.clone();
+            async move {
+                let device = q.device();
+                let cos_slice: Tensor<2, f32> = Tensor::new(&device, &cache_cos[1..4].to_vec());
+                let sin_slice: Tensor<2, f32> = Tensor::new(&device, &cache_sin[1..4].to_vec());
+                q.rope_normal_fused(&cos_slice, &sin_slice)
+            }
+        }
+    })
+    .compare_with(approx_compare::<4, f32>(1e-4))
+    .runs(3)
+    .await
+    .unwrap();
 
-        let (q_interleaved, k_interleaved) = cache.forward_interleaved(&q, &k, 1);
-        assert_approx_tensors(q_interleaved, q.rope_fused(&cos_slice, &sin_slice), 1e-4).await;
-        assert_approx_tensors(k_interleaved, k.rope_fused(&cos_slice, &sin_slice), 1e-4).await;
+    fusor_conformance::assert({
+        let cache_cos = cache_cos.clone();
+        let cache_sin = cache_sin.clone();
+        move |q: Tensor<4, f32>, k: Tensor<4, f32>| {
+            let cache_cos = cache_cos.clone();
+            let cache_sin = cache_sin.clone();
+            async move {
+                let device = q.device();
+                let cache = RopeCache::from_parts(
+                    Tensor::new(&device, &cache_cos),
+                    Tensor::new(&device, &cache_sin),
+                );
+                cache.forward(&q, &k, 1).1
+            }
+        }
+    })
+    .arg(gen_q.clone())
+    .arg(gen_k.clone())
+    .equal_to({
+        let cache_cos = cache_cos.clone();
+        let cache_sin = cache_sin.clone();
+        move |_q: Tensor<4, f32>, k: Tensor<4, f32>| {
+            let cache_cos = cache_cos.clone();
+            let cache_sin = cache_sin.clone();
+            async move {
+                let device = k.device();
+                let cos_slice: Tensor<2, f32> = Tensor::new(&device, &cache_cos[1..4].to_vec());
+                let sin_slice: Tensor<2, f32> = Tensor::new(&device, &cache_sin[1..4].to_vec());
+                k.rope_normal_fused(&cos_slice, &sin_slice)
+            }
+        }
+    })
+    .compare_with(approx_compare::<4, f32>(1e-4))
+    .runs(3)
+    .await
+    .unwrap();
 
-        let built_cache = RopeCache::new(4, 3, 10_000.0, &device).unwrap();
-        let (expected_cos, expected_sin) = rope_tables(4, 3, 10_000.0);
-        assert_approx_tensors(
-            built_cache.cos().clone(),
-            Tensor::new(&device, &expected_cos),
-            1e-6,
-        )
-        .await;
-        assert_approx_tensors(
-            built_cache.sin().clone(),
-            Tensor::new(&device, &expected_sin),
-            1e-6,
-        )
-        .await;
-    }
+    fusor_conformance::assert({
+        let cache_cos = cache_cos.clone();
+        let cache_sin = cache_sin.clone();
+        move |q: Tensor<4, f32>, k: Tensor<4, f32>| {
+            let cache_cos = cache_cos.clone();
+            let cache_sin = cache_sin.clone();
+            async move {
+                let device = q.device();
+                let cache = RopeCache::from_parts(
+                    Tensor::new(&device, &cache_cos),
+                    Tensor::new(&device, &cache_sin),
+                );
+                cache.forward_interleaved(&q, &k, 1).0
+            }
+        }
+    })
+    .arg(gen_q.clone())
+    .arg(gen_k.clone())
+    .equal_to({
+        let cache_cos = cache_cos.clone();
+        let cache_sin = cache_sin.clone();
+        move |q: Tensor<4, f32>, _k: Tensor<4, f32>| {
+            let cache_cos = cache_cos.clone();
+            let cache_sin = cache_sin.clone();
+            async move {
+                let device = q.device();
+                let cos_slice: Tensor<2, f32> = Tensor::new(&device, &cache_cos[1..4].to_vec());
+                let sin_slice: Tensor<2, f32> = Tensor::new(&device, &cache_sin[1..4].to_vec());
+                q.rope_fused(&cos_slice, &sin_slice)
+            }
+        }
+    })
+    .compare_with(approx_compare::<4, f32>(1e-4))
+    .runs(3)
+    .await
+    .unwrap();
+
+    fusor_conformance::assert({
+        let cache_cos = cache_cos.clone();
+        let cache_sin = cache_sin.clone();
+        move |q: Tensor<4, f32>, k: Tensor<4, f32>| {
+            let cache_cos = cache_cos.clone();
+            let cache_sin = cache_sin.clone();
+            async move {
+                let device = q.device();
+                let cache = RopeCache::from_parts(
+                    Tensor::new(&device, &cache_cos),
+                    Tensor::new(&device, &cache_sin),
+                );
+                cache.forward_interleaved(&q, &k, 1).1
+            }
+        }
+    })
+    .arg(gen_q)
+    .arg(gen_k)
+    .equal_to({
+        let cache_cos = cache_cos.clone();
+        let cache_sin = cache_sin.clone();
+        move |_q: Tensor<4, f32>, k: Tensor<4, f32>| {
+            let cache_cos = cache_cos.clone();
+            let cache_sin = cache_sin.clone();
+            async move {
+                let device = k.device();
+                let cos_slice: Tensor<2, f32> = Tensor::new(&device, &cache_cos[1..4].to_vec());
+                let sin_slice: Tensor<2, f32> = Tensor::new(&device, &cache_sin[1..4].to_vec());
+                k.rope_fused(&cos_slice, &sin_slice)
+            }
+        }
+    })
+    .compare_with(approx_compare::<4, f32>(1e-4))
+    .runs(3)
+    .await
+    .unwrap();
+
+    fusor_conformance::assert(async |device: Device| {
+        RopeCache::new(4, 3, 10_000.0, &device)
+            .unwrap()
+            .cos()
+            .clone()
+    })
+    .arg(|device: &Device| device.clone())
+    .equal_to({
+        let expected_cos = rope_tables(4, 3, 10_000.0).0;
+        move |device: Device| {
+            let expected_cos = expected_cos.clone();
+            async move { Tensor::new(&device, &expected_cos) }
+        }
+    })
+    .compare_with(approx_compare::<2, f32>(1e-6))
+    .await
+    .unwrap();
+
+    fusor_conformance::assert(async |device: Device| {
+        RopeCache::new(4, 3, 10_000.0, &device)
+            .unwrap()
+            .sin()
+            .clone()
+    })
+    .arg(|device: &Device| device.clone())
+    .equal_to({
+        let expected_sin = rope_tables(4, 3, 10_000.0).1;
+        move |device: Device| {
+            let expected_sin = expected_sin.clone();
+            async move { Tensor::new(&device, &expected_sin) }
+        }
+    })
+    .compare_with(approx_compare::<2, f32>(1e-6))
+    .await
+    .unwrap();
 }
