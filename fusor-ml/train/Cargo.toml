@@ -1,0 +1,10 @@
+[package]
+name = "fusor-train"
+version = "0.1.0"
+edition = "2024"
+authors = ["Evan Almloff <evanalmloff@gmail.com>"]
+license = "MIT/Apache-2.0"
+description = "Training utilities and optimizers for fusor models"
+
+[dependencies]
+fusor.workspace = true

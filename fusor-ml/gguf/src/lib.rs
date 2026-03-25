@@ -723,6 +723,35 @@ pub struct BlockQ4_0 {
 impl BlockQ4_0 {
     pub const WEIGHTS_SIZE: usize = Q4_0_BLOCK_SIZE / 2;
     pub const BLOCK_SIZE: usize = Q4_0_BLOCK_SIZE;
+
+    /// Quantize 32 f32 values into a Q4_0 block.
+    ///
+    /// Each value is mapped to a 4-bit unsigned integer (0..15) centered at 8,
+    /// so the representable range is [-8, 7] * scale.
+    pub fn quantize(data: &[f32; Q4_0_BLOCK_SIZE]) -> Self {
+        let max_abs = data.iter().map(|x| x.abs()).fold(0.0f32, f32::max);
+        let scale = max_abs / 7.0; // 4-bit signed range is -8..7, symmetric about 0 uses 7
+        let inv_scale = if max_abs != 0.0 { 7.0 / max_abs } else { 0.0 };
+
+        // Quantize to 4-bit values stored as pairs in each byte.
+        // Low half of block (indices 0..15) go into the low nibble,
+        // high half (indices 16..31) go into the high nibble.
+        let mut packed = [0u8; Q4_0_BLOCK_SIZE / 2];
+        for i in 0..Q4_0_BLOCK_SIZE / 2 {
+            let low_val = (data[i] * inv_scale).round().clamp(-8.0, 7.0) as i8;
+            let high_val = (data[i + Q4_0_BLOCK_SIZE / 2] * inv_scale)
+                .round()
+                .clamp(-8.0, 7.0) as i8;
+            let low_u = (low_val + 8) as u8; // shift to unsigned 0..15
+            let high_u = (high_val + 8) as u8;
+            packed[i] = low_u | (high_u << 4);
+        }
+
+        Self {
+            scale: half::f16::from_f32(scale),
+            data: packed,
+        }
+    }
 }
 
 impl GgufBlock for BlockQ4_0 {
@@ -877,6 +906,7 @@ impl GgufBlock for BlockQ4_0 {
     }
 }
 
+#[cfg(not(any(all(target_arch = "aarch64", nightly), target_arch = "x86_64")))]
 #[inline(always)]
 fn q4_0_vec_dot_scalar(data: &[u8; 16], y_data: &[i8; 32]) -> i32 {
     const CENTER: i8 = 8;
@@ -1303,6 +1333,7 @@ impl GgufBlock for BlockQ8_0 {
     }
 }
 
+#[cfg(not(any(all(target_arch = "aarch64", nightly), target_arch = "x86_64")))]
 #[inline(always)]
 fn q8_0_vec_dot_scalar(x_data: &[i8; 32], y_data: &[i8; 32]) -> i32 {
     let mut sum: i32 = 0;

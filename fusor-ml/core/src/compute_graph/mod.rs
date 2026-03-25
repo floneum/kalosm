@@ -1,11 +1,11 @@
 use std::sync::Arc;
 
 use parking_lot::RwLock;
-pub(crate) use petgraph::graph::NodeIndex;
+pub use petgraph::graph::NodeIndex;
 use petgraph::prelude::StableGraph;
 use resolve::Resolver;
+use rustc_hash::FxHashSet;
 use tabbycat::Graph;
-use wgpu::CommandEncoderDescriptor;
 
 mod layout_pass;
 mod queue;
@@ -13,11 +13,10 @@ mod resolve;
 mod visualize;
 
 use crate::{
-    DataTypeEnum, Device, ElementWiseOperation, MatMulOperation, PairWiseOperation, QMatrix,
-    ReduceOperation, composite::where_cond::WhereCondOperation,
+    DataTypeEnum, Device, MatMulOperation, QMatrix, ReduceOperation,
     compute_graph::resolve::ResolverResult, dequantize::DequantizeOperation,
-    index_select::IndexSelectOperation, map_layout::MapLayoutOperation, mir::operation::Operation,
-    nary_wise::NaryOperation, quantized::matmul::QMatMulOperation, resize::ResizeOperation,
+    map_layout::MapLayoutOperation, mir::operation::Operation, nary_wise::NaryOperation,
+    quantized::matmul::QMatMulOperation, resize::ResizeOperation,
     slice_assign::SliceAssignOperation, tensor::TensorData, visit_tiled::MaybeQData,
 };
 
@@ -46,12 +45,8 @@ impl ComputeGraph {
         self.with_mut(|inner| inner.create_node(node))
     }
 
-    pub(crate) fn create_element_wise(&self, op: ElementWiseOperation) -> NodeIndex {
-        self.create_node(ComputeGraphNodeVariant::ElementWise(op))
-    }
-
-    pub(crate) fn create_pair_wise(&self, op: PairWiseOperation) -> NodeIndex {
-        self.create_node(ComputeGraphNodeVariant::PairWise(op))
+    pub(crate) fn create_nary(&self, op: NaryOperation) -> NodeIndex {
+        self.create_node(ComputeGraphNodeVariant::Nary(op))
     }
 
     pub(crate) fn create_mat_mul(&self, op: MatMulOperation) -> NodeIndex {
@@ -78,10 +73,6 @@ impl ComputeGraph {
         self.create_node(ComputeGraphNodeVariant::SliceAssign(op))
     }
 
-    pub(crate) fn create_index_select(&self, op: IndexSelectOperation) -> NodeIndex {
-        self.create_node(ComputeGraphNodeVariant::IndexSelect(op))
-    }
-
     pub(crate) fn create_tensor(&self, op: TensorData) -> NodeIndex {
         self.create_node(ComputeGraphNodeVariant::Tensor(op))
     }
@@ -96,37 +87,44 @@ impl ComputeGraph {
         self.create_node(ComputeGraphNodeVariant::Custom(op))
     }
 
-    pub(crate) fn create_where_cond(&self, op: WhereCondOperation) -> NodeIndex {
-        self.create_node(ComputeGraphNodeVariant::WhereCond(op))
-    }
-
-    pub(crate) fn resolve(&self, key: NodeIndex, device: &Device) -> ResolverResult {
-        let mut encoder = device
-            .wgpu_device()
-            .create_command_encoder(&CommandEncoderDescriptor {
-                label: Some("ComputeGraph Encoder"),
-            });
-        let data = self.with_mut(|inner| {
-            let mut resolver = Resolver::new(inner, key, &mut encoder);
-            resolver.run(inner)
-        });
-        device.wgpu_queue().submit(Some(encoder.finish()));
-        // Reset the written flag on all buffers
-        device.reset_initialized_buffers();
-
-        // Flush the cache to a file
-        if let (Some(pipeline_cache), Some(cache_file)) =
-            (device.wgpu_cache(), device.wgpu_cache_file())
-        {
-            let data = pipeline_cache.get_data();
-            if let Some(data) = data {
-                let temp_file = cache_file.with_extension("temp");
-                std::fs::write(&temp_file, &data).unwrap();
-                std::fs::rename(&temp_file, cache_file).unwrap();
+    pub(crate) fn resolve(&self, key: NodeIndex) -> ResolverResult {
+        let (data, removed) = {
+            let mut inner = self.inner.write();
+            let mut removed = Vec::new();
+            let mut resolver = Resolver::new(&mut inner, key);
+            let data = resolver.run(&mut inner, &mut removed);
+            #[cfg(feature = "extra_assertions")]
+            {
+                inner.verify_integrity()
             }
-        }
+            (data, removed)
+        };
+        // Drop removed nodes now that the resolver has submitted its commands.
+        drop(removed);
 
         data
+    }
+
+    /// Resolve multiple targets in a single pass. All targets share one
+    /// execution graph so intermediate nodes can be freed as soon as every
+    /// consumer within the batch has been computed, keeping peak GPU memory
+    /// much lower than resolving targets one-by-one.
+    pub(crate) fn resolve_batch(&self, keys: &[NodeIndex]) {
+        if keys.is_empty() {
+            return;
+        }
+        let removed = {
+            let mut inner = self.inner.write();
+            let mut removed = Vec::new();
+            let mut resolver = Resolver::new_batch(&mut inner, keys.to_vec());
+            let _ = resolver.run(&mut inner, &mut removed);
+            #[cfg(feature = "extra_assertions")]
+            {
+                inner.verify_integrity()
+            }
+            removed
+        };
+        drop(removed);
     }
 
     pub(crate) fn graphvis(&self, root: NodeIndex) -> Graph {
@@ -138,7 +136,17 @@ impl ComputeGraph {
     }
 
     pub(crate) fn remove_reference(&self, key: NodeIndex) {
-        self.with_mut(|inner| inner.remove_reference(key));
+        let removed = {
+            let mut inner = self.inner.write();
+            let mut removed = Vec::new();
+            inner.remove_reference(key, &mut removed);
+            #[cfg(feature = "extra_assertions")]
+            {
+                inner.verify_integrity()
+            }
+            removed
+        };
+        drop(removed);
     }
 }
 
@@ -155,8 +163,6 @@ pub(crate) struct ComputeGraphNode {
 
 #[derive(Clone, Debug)]
 pub(crate) enum ComputeGraphNodeVariant {
-    ElementWise(ElementWiseOperation),
-    PairWise(PairWiseOperation),
     Nary(NaryOperation),
     SliceAssign(SliceAssignOperation),
     Resize(ResizeOperation),
@@ -166,19 +172,12 @@ pub(crate) enum ComputeGraphNodeVariant {
     QMatMul(QMatMulOperation),
     Tensor(TensorData),
     Reduce(ReduceOperation),
-    IndexSelect(IndexSelectOperation),
-    WhereCond(WhereCondOperation),
     Custom(Arc<dyn Operation + Send + Sync>),
 }
 
 impl ComputeGraphNodeVariant {
     fn visit_dependencies(&self, f: &mut dyn FnMut(NodeIndex)) {
         match &self {
-            ComputeGraphNodeVariant::ElementWise(op) => f(op.value),
-            ComputeGraphNodeVariant::PairWise(op) => {
-                f(op.first);
-                f(op.second);
-            }
             ComputeGraphNodeVariant::Nary(op) => {
                 for input in &op.inputs {
                     f(*input);
@@ -197,15 +196,6 @@ impl ComputeGraphNodeVariant {
             ComputeGraphNodeVariant::SliceAssign(op) => {
                 f(op.input);
                 f(op.value);
-            }
-            ComputeGraphNodeVariant::IndexSelect(op) => {
-                f(op.input);
-                f(op.indexes);
-            }
-            ComputeGraphNodeVariant::WhereCond(op) => {
-                f(op.condition);
-                f(op.on_true);
-                f(op.on_false);
             }
             ComputeGraphNodeVariant::Dequantize(_) => {}
             ComputeGraphNodeVariant::Tensor(_) => {}
@@ -269,13 +259,13 @@ impl ComputeGraphInner {
         }
     }
 
-    fn remove_reference(&mut self, key: NodeIndex) {
+    fn remove_reference(&mut self, key: NodeIndex, removed: &mut Vec<ComputeGraphNode>) {
         let node = self.nodes.nodes.node_weight_mut(key).unwrap();
         node.reference_count = node.reference_count.saturating_sub(1);
-        self.check_life(key);
+        self.check_life(key, removed);
     }
 
-    fn check_life(&mut self, key: NodeIndex) {
+    fn check_life(&mut self, key: NodeIndex, removed: &mut Vec<ComputeGraphNode>) {
         // Check the reference count
         let ref_count = self.nodes.nodes.node_weight(key).map(|n| n.reference_count);
         match ref_count {
@@ -298,13 +288,12 @@ impl ComputeGraphInner {
             .collect();
 
         for dependant in dependents {
-            // If the dependant still exists and it hasn't been computed yet
-            // keep this node alive
-            if let Some(dep_node) = self.nodes.nodes.node_weight(dependant) {
-                let computed = dep_node.cached.is_some();
-                if !computed {
-                    return;
-                }
+            // Keep dependencies alive while any downstream dependent is materially
+            // live, even if intermediate nodes have already been computed. This
+            // preserves the full ancestry needed for backprop after materializing
+            // a live output tensor.
+            if self.has_materially_live_dependant(dependant, &mut FxHashSet::default()) {
+                return;
             }
         }
 
@@ -315,17 +304,42 @@ impl ComputeGraphInner {
 
         // If no other nodes depend on this key and it has zero references, it is dead
         // remove it from the graph
-        self.remove_key(key);
+        self.remove_key(key, removed);
 
         // Then check if any nodes it depends on are alive
         for dependency in dependencies {
-            self.check_life(dependency);
+            self.check_life(dependency, removed);
         }
     }
 
-    fn remove_key(&mut self, key: NodeIndex) {
+    fn has_materially_live_dependant(
+        &self,
+        key: NodeIndex,
+        visited: &mut FxHashSet<NodeIndex>,
+    ) -> bool {
+        if !visited.insert(key) {
+            return false;
+        }
+
+        let Some(node) = self.nodes.nodes.node_weight(key) else {
+            return false;
+        };
+
+        if node.reference_count > 0 {
+            return true;
+        }
+
+        self.nodes
+            .nodes
+            .neighbors_directed(key, petgraph::Direction::Outgoing)
+            .any(|dependant| self.has_materially_live_dependant(dependant, visited))
+    }
+
+    fn remove_key(&mut self, key: NodeIndex, removed: &mut Vec<ComputeGraphNode>) {
         // Remove the node from the graph (this also removes all edges)
-        self.nodes.nodes.remove_node(key);
+        if let Some(node) = self.nodes.nodes.remove_node(key) {
+            removed.push(node);
+        }
     }
 
     pub(crate) fn get_result_or_qmatrix(&self, key: NodeIndex) -> Option<MaybeQData> {

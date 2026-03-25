@@ -1,0 +1,12 @@
+[application]
+name = "Nanochat Studio"
+
+[web.app]
+title = "Nanochat Studio"
+
+[web.resource]
+style = []
+script = []
+
+[web.resource.dev]
+script = []

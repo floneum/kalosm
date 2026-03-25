@@ -44,6 +44,7 @@ pub(crate) struct GenericKernel {
     globals: Vec<KernelGlobal>,
     enabled_builtins: EnumSet<EnabledBuiltins>,
     quantized_type_definitions: EnumSet<GgmlType>,
+    cooperative_matrix_enabled: bool,
     kernel: OnceLock<wgpu::ShaderModule>,
     body: String,
     name: String,
@@ -68,6 +69,7 @@ impl GenericKernel {
             max_global_id: 0,
             enabled_builtins: Default::default(),
             quantized_type_definitions: Default::default(),
+            cooperative_matrix_enabled: false,
             kernel: OnceLock::new(),
             body: String::new(),
             name: String::new(),
@@ -85,6 +87,7 @@ impl GenericKernel {
         self.max_global_id = 0;
         self.enabled_builtins.clear();
         self.quantized_type_definitions.clear();
+        self.cooperative_matrix_enabled = false;
         self.kernel = OnceLock::new();
         self.body.clear();
         self.name.clear();
@@ -227,6 +230,10 @@ impl GenericKernel {
         let global = KernelGlobal::new(index, space, KernelGlobalType::Value(ty));
         self.globals.push(global.clone());
         global
+    }
+
+    pub(crate) fn enable_cooperative_matrix(&mut self) {
+        self.cooperative_matrix_enabled = true;
     }
 
     pub(crate) fn subgroup_size(&mut self) -> &'static str {
@@ -390,6 +397,15 @@ impl GenericKernel {
         let module = self.kernel.get_or_init(|| {
             let mut kernel = String::new();
             self.kernel(&mut kernel, device).unwrap();
+            if let Ok(path) = std::env::var("FUSOR_DUMP_WGSL") {
+                let dump_path = format!(
+                    "{}.{}.wgsl",
+                    path,
+                    self.name.replace("/", "_").replace(" ", "_")
+                );
+                let _ = std::fs::write(&dump_path, &kernel);
+                eprintln!("Dumped WGSL to {dump_path} (name={})", self.name);
+            }
             device
                 .shader_module_cache()
                 .write()
@@ -594,6 +610,10 @@ impl GenericKernel {
         #[cfg(target_arch = "wasm32")]
         if device.subgroups_supported() {
             writeln!(f, "enable subgroups;")?;
+        }
+
+        if self.cooperative_matrix_enabled {
+            writeln!(f, "enable wgpu_cooperative_matrix;")?;
         }
 
         self.declare_quantized_types(f, use_f16)?;

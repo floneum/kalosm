@@ -1,0 +1,20 @@
+[package]
+name = "fusor-nanochat-app"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+async-channel = "2.5.0"
+base64 = "0.22.1"
+dioxus = { version = "0.7.1" }
+fusor-nanochat = { path = "../nanochat" }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+web-sys = { version = "0.3", features = ["Element"] }
+
+[features]
+default = ["desktop"]
+desktop = ["dioxus/desktop"]
+web = ["dioxus/web"]

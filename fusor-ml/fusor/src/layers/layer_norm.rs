@@ -113,42 +113,11 @@ impl LayerNorm<1, f32> {
     ///
     /// This is significantly faster than the standard forward pass on CPU
     /// as it computes mean, variance, and normalization in fewer passes.
-    pub fn forward_fused<B>(
-        &self,
-        input: &Tensor<3, f32, B>,
-    ) -> Tensor<3, f32, ConcreteTensor<f32, 3>>
+    pub fn forward_fused<B>(&self, input: &Tensor<3, f32, B>) -> Tensor<3, f32>
     where
         B: TensorBacking<3, Elem = f32>,
     {
-        match input {
-            Tensor::Cpu(t) => {
-                let contiguous = t.to_concrete();
-                // Broadcast weight to match input shape for fused kernel
-                let weight_broadcast = self.weight.broadcast_as(input.shape());
-                let bias_broadcast = self.bias.as_ref().map(|b| b.broadcast_as(input.shape()));
-
-                let (weight_inner, bias_inner) = match (&weight_broadcast, &bias_broadcast) {
-                    (Tensor::Cpu(w), Some(Tensor::Cpu(b))) => (
-                        w.to_concrete().inner().clone(),
-                        Some(b.to_concrete().inner().clone()),
-                    ),
-                    (Tensor::Cpu(w), None) => (w.to_concrete().inner().clone(), None),
-                    _ => unreachable!(),
-                };
-
-                let result = fusor_cpu::layer_norm_last_dim_fused(
-                    contiguous.inner(),
-                    &weight_inner,
-                    bias_inner.as_ref(),
-                    self.eps,
-                );
-                Tensor::Cpu(fusor_cpu::Tensor::new(result))
-            }
-            Tensor::Gpu(_) => {
-                // Fall back to standard forward for GPU
-                self.forward(input)
-            }
-        }
+        input.layer_norm_last_dim_fused::<2, 1, _, _>(&self.weight, self.bias.as_ref(), self.eps)
     }
 
     /// Load LayerNorm from VarBuilder.
@@ -243,5 +212,40 @@ mod tests {
         // First position [1, 3]: mean=2, std=1, normalized=[-1, 1]
         assert!((result[[0, 0, 0]] - (-1.0)).abs() < 1e-4);
         assert!((result[[0, 0, 1]] - 1.0).abs() < 1e-4);
+    }
+
+    #[tokio::test]
+    async fn test_layer_norm_forward_fused_cpu() {
+        let weight: Tensor<1, f32> =
+            Tensor::Cpu(fusor_cpu::Tensor::from_slice([2], &[1.5f32, 0.5]));
+        let bias: Tensor<1, f32> =
+            Tensor::Cpu(fusor_cpu::Tensor::from_slice([2], &[0.25f32, -0.75]));
+        let layer_norm = LayerNorm::new(weight, Some(bias), 1e-5);
+
+        let input_data = [1.0f32, 3.0, 2.0, 4.0];
+        let input: Tensor<3, f32> =
+            Tensor::Cpu(fusor_cpu::Tensor::from_slice([1, 2, 2], &input_data));
+
+        let fused = layer_norm.forward_fused(&input);
+        let reference = layer_norm.forward(&input);
+
+        let fused = fused.as_slice().await.unwrap();
+        let reference = reference.as_slice().await.unwrap();
+
+        for i in 0..1 {
+            for j in 0..2 {
+                for k in 0..2 {
+                    assert!(
+                        (fused[[i, j, k]] - reference[[i, j, k]]).abs() < 1e-4,
+                        "Mismatch at [{}, {}, {}]: fused={}, reference={}",
+                        i,
+                        j,
+                        k,
+                        fused[[i, j, k]],
+                        reference[[i, j, k]]
+                    );
+                }
+            }
+        }
     }
 }

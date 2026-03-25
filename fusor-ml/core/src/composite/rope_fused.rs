@@ -7,12 +7,16 @@ use crate::{
 impl<D: DataType> Tensor<4, D> {
     /// Apply fused interleaved RoPE (rotary position embedding).
     /// This pairs adjacent elements: (0, 1), (2, 3), etc.
+    ///
+    /// `cos` and `sin` must already be narrowed to the sequence length.
     pub fn rope_fused(&self, cos: &Tensor<2, D>, sin: &Tensor<2, D>) -> Tensor<4, D> {
         self.rope_fused_impl(cos, sin, RopeMode::Interleaved)
     }
 
     /// Apply fused normal RoPE (rotary position embedding).
     /// This pairs first half with second half: (0, head_dim/2), (1, head_dim/2+1), etc.
+    ///
+    /// `cos` and `sin` must already be narrowed to the sequence length.
     pub fn rope_normal_fused(&self, cos: &Tensor<2, D>, sin: &Tensor<2, D>) -> Tensor<4, D> {
         self.rope_fused_impl(cos, sin, RopeMode::Normal)
     }
@@ -23,10 +27,7 @@ impl<D: DataType> Tensor<4, D> {
         sin: &Tensor<2, D>,
         mode: RopeMode,
     ) -> Tensor<4, D> {
-        let [_, _, sequence_length, head_dim] = *self.shape();
-        // Narrow cos/sin to the sequence length
-        let cos = cos.narrow(0, 0, sequence_length);
-        let sin = sin.narrow(0, 0, sequence_length);
+        let [_, _, _, head_dim] = *self.shape();
 
         let operation = RopeFusedOperation {
             input: self.key(),
@@ -209,170 +210,4 @@ impl RopeFusedOperation {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::Device;
-
-    #[tokio::test]
-    async fn test_rope_fused_interleaved() {
-        let device = Device::test_instance();
-
-        let pos_shape = [11, 32]; // seq_len=11, head_dim/2=32 -> head_dim=64
-        let cos_data: Vec<Vec<f32>> = (0..pos_shape[0])
-            .map(|i| {
-                (0..pos_shape[1])
-                    .map(|j| {
-                        ((i as f32) / 10000f32.powf((2 * j) as f32 / (pos_shape[1] * 2) as f32))
-                            .cos()
-                    })
-                    .collect()
-            })
-            .collect();
-        let sin_data: Vec<Vec<f32>> = (0..pos_shape[0])
-            .map(|i| {
-                (0..pos_shape[1])
-                    .map(|j| {
-                        ((i as f32) / 10000f32.powf((2 * j) as f32 / (pos_shape[1] * 2) as f32))
-                            .sin()
-                    })
-                    .collect()
-            })
-            .collect();
-
-        let cos = Tensor::new(&device, &cos_data);
-        let sin = Tensor::new(&device, &sin_data);
-
-        // Input: [1, 3, 11, 64]
-        let shape = [1, 3, 11, 64];
-        let data: Vec<Vec<Vec<Vec<f32>>>> = (0..shape[0])
-            .map(|_| {
-                (0..shape[1])
-                    .map(|_| {
-                        (0..shape[2])
-                            .map(|_| {
-                                (0..shape[3])
-                                    .map(|k| (k as f32).sin()) // Some deterministic data
-                                    .collect()
-                            })
-                            .collect()
-                    })
-                    .collect()
-            })
-            .collect();
-
-        let x = Tensor::new(&device, &data);
-
-        // Compare interleaved vs fused
-        let rope_original = x.rope_interleaved(&cos, &sin);
-        let rope_fused = x.rope_fused(&cos, &sin);
-
-        let original = rope_original.as_slice().await.unwrap();
-        let fused = rope_fused.as_slice().await.unwrap();
-
-        // Verify
-        for b in 0..shape[0] {
-            for h in 0..shape[1] {
-                for s in 0..shape[2] {
-                    for d in 0..shape[3] {
-                        let original_val = original[[b, h, s, d]];
-                        let fused_val = fused[[b, h, s, d]];
-                        let diff = (original_val - fused_val).abs();
-                        assert!(
-                            diff < 1e-4,
-                            "Mismatch at index [{}, {}, {}, {}]: original {} vs fused {}, diff {}",
-                            b,
-                            h,
-                            s,
-                            d,
-                            original_val,
-                            fused_val,
-                            diff
-                        );
-                    }
-                }
-            }
-        }
-    }
-
-    #[tokio::test]
-    async fn test_rope_fused_normal() {
-        let device = Device::test_instance();
-
-        let pos_shape = [11, 32]; // seq_len=11, head_dim/2=32 -> head_dim=64
-        let cos_data: Vec<Vec<f32>> = (0..pos_shape[0])
-            .map(|i| {
-                (0..pos_shape[1])
-                    .map(|j| {
-                        ((i as f32) / 10000f32.powf((2 * j) as f32 / (pos_shape[1] * 2) as f32))
-                            .cos()
-                    })
-                    .collect()
-            })
-            .collect();
-        let sin_data: Vec<Vec<f32>> = (0..pos_shape[0])
-            .map(|i| {
-                (0..pos_shape[1])
-                    .map(|j| {
-                        ((i as f32) / 10000f32.powf((2 * j) as f32 / (pos_shape[1] * 2) as f32))
-                            .sin()
-                    })
-                    .collect()
-            })
-            .collect();
-
-        let cos = Tensor::new(&device, &cos_data);
-        let sin = Tensor::new(&device, &sin_data);
-
-        // Input: [1, 3, 11, 64]
-        let shape = [1, 3, 11, 64];
-        let data: Vec<Vec<Vec<Vec<f32>>>> = (0..shape[0])
-            .map(|_| {
-                (0..shape[1])
-                    .map(|_| {
-                        (0..shape[2])
-                            .map(|_| {
-                                (0..shape[3])
-                                    .map(|k| (k as f32).sin()) // Some deterministic data
-                                    .collect()
-                            })
-                            .collect()
-                    })
-                    .collect()
-            })
-            .collect();
-
-        let x = Tensor::new(&device, &data);
-
-        // Compare normal rope vs fused normal
-        let rope_original = x.rope(&cos, &sin);
-        let rope_fused = x.rope_normal_fused(&cos, &sin);
-
-        let original = rope_original.as_slice().await.unwrap();
-        let fused = rope_fused.as_slice().await.unwrap();
-
-        // Verify
-        for b in 0..shape[0] {
-            for h in 0..shape[1] {
-                for s in 0..shape[2] {
-                    for d in 0..shape[3] {
-                        let original_val = original[[b, h, s, d]];
-                        let fused_val = fused[[b, h, s, d]];
-                        let diff = (original_val - fused_val).abs();
-                        assert!(
-                            diff < 1e-4,
-                            "Mismatch at index [{}, {}, {}, {}]: original {} vs fused {}, diff {}",
-                            b,
-                            h,
-                            s,
-                            d,
-                            original_val,
-                            fused_val,
-                            diff
-                        );
-                    }
-                }
-            }
-        }
-    }
-}
+// Fused vs composite comparison tests are in fusor::composite::rope::tests

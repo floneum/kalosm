@@ -11,12 +11,11 @@ use tabbycat::Graph;
 use wgpu::COPY_BUFFER_ALIGNMENT;
 
 use crate::{
-    Device, Dim, ElementWiseOperation, Layout, MatMulOperation, MatMulParams, PairWiseFunction,
-    PairWiseOperation, ReduceFunction, ReduceOperation,
+    Device, Dim, Layout, MatMulOperation, MatMulParams, ReduceFunction, ReduceOperation,
     compute_graph::NodeIndex,
-    index_select::IndexSelectOperation,
     map_layout::MapLayoutOperation,
     mir::operation::Operation,
+    nary_wise::{NaryExpr, NaryFunction, NaryOperation},
     quantized::{QMatrix, matmul::QMatMulOperation},
     resize::ResizeOperation,
     slice_assign::SliceAssignOperation,
@@ -38,6 +37,9 @@ pub trait DataType:
     + AnyBitPattern
     + Debug
     + Display
+    + Send
+    + Sync
+    + 'static
 {
     const WGSL_TYPE: DataTypeEnum;
 
@@ -247,30 +249,45 @@ impl LazyTensorData {
         Self::from_parts(device, info, key)
     }
 
-    pub(crate) fn where_cond(
-        &self,
-        operation: crate::composite::where_cond::WhereCondOperation,
-    ) -> Self {
-        let device = self.device.clone();
-        let info = self.info.clone();
-        let key = device.compute_graph().create_where_cond(operation);
-
-        Self::from_parts(device, info, key)
-    }
-
-    pub(crate) fn element_wise(&self, function: ElementWiseOperation) -> Self {
+    pub(crate) fn unary_nary(&self, function: NaryFunction) -> Self {
         let device = self.device.clone();
         let mut info = self.info.clone();
-        info.datatype = function.functions.out_datatype();
-        let key = device.compute_graph().create_element_wise(function);
+        info.datatype = function.output_type;
+        let rank = info.rank();
+        let nary = NaryOperation {
+            inputs: vec![self.key],
+            expression: NaryExpr::Op {
+                children: vec![NaryExpr::input(0, rank)],
+                function,
+            },
+            shape: info.shape().into(),
+            output_datatype: info.datatype,
+        };
+        let key = device.compute_graph().create_nary(nary);
 
         Self::from_parts(device, info, key)
     }
 
-    pub(crate) fn pair_wise(&self, function: PairWiseOperation) -> Self {
+    pub(crate) fn binary_nary(
+        &self,
+        other_key: NodeIndex,
+        function: NaryFunction,
+        shape: &[usize],
+    ) -> Self {
         let device = self.device.clone();
-        let info = self.info.clone();
-        let key = device.compute_graph().create_pair_wise(function);
+        let mut info = self.info.clone();
+        info.datatype = function.output_type;
+        let rank = shape.len();
+        let nary = NaryOperation {
+            inputs: vec![self.key, other_key],
+            expression: NaryExpr::Op {
+                children: vec![NaryExpr::input(0, rank), NaryExpr::input(1, rank)],
+                function,
+            },
+            shape: shape.into(),
+            output_datatype: info.datatype,
+        };
+        let key = device.compute_graph().create_nary(nary);
 
         Self::from_parts(device, info, key)
     }
@@ -337,17 +354,8 @@ impl LazyTensorData {
         Self::from_parts(device, info, key)
     }
 
-    pub(crate) fn index_select(&self, op: IndexSelectOperation) -> Self {
-        let device = self.device.clone();
-        let mut info = self.info.clone();
-        info.shape = op.output_shape();
-        let key = device.compute_graph().create_index_select(op);
-
-        Self::from_parts(device, info, key)
-    }
-
     pub(crate) fn materialize(&self) -> (TensorData, usize) {
-        let result = self.device.compute_graph().resolve(self.key, &self.device);
+        let result = self.device.compute_graph().resolve(self.key);
         (result.data, result.total_kernels)
     }
 
@@ -543,6 +551,18 @@ impl<const R: usize, D> Clone for Tensor<R, D> {
     fn clone(&self) -> Self {
         Self {
             data: self.data.clone(),
+            datatype: PhantomData,
+        }
+    }
+}
+
+impl<const R: usize, D> Tensor<R, D> {
+    /// Resolve the current tensor value on device and return a fresh leaf tensor
+    /// that no longer carries the original compute graph history.
+    pub fn detach(&self) -> Self {
+        let (data, _) = self.data.materialize();
+        Self {
+            data: LazyTensorData::new(data),
             datatype: PhantomData,
         }
     }
@@ -834,6 +854,14 @@ impl<D: DataType, const R: usize> Tensor<R, D> {
         ))
     }
 
+    /// Synchronously dispatch and wait for GPU completion using device.poll().
+    /// More efficient than the async version for benchmarking since it avoids
+    /// the on_submitted_work_done callback overhead.
+    pub fn materialize_sync(&self) {
+        self.data.materialize();
+        self.device().poll_wait();
+    }
+
     #[track_caller]
     pub fn materialize(&self) -> impl Future<Output = ()> + 'static {
         #[allow(unused)]
@@ -915,28 +943,27 @@ impl<D: DataType, const R: usize> Tensor<R, D> {
         self
     }
 
-    pub(crate) fn element_wise<D2: DataType>(
-        &self,
-        function: ElementWiseOperation,
-    ) -> Tensor<R, D2> {
-        Tensor::from_parts(self.data.element_wise(function))
+    pub(crate) fn unary_nary<D2: DataType>(&self, function: NaryFunction) -> Tensor<R, D2> {
+        Tensor::from_parts(self.data.unary_nary(function))
     }
 
-    pub(crate) fn pair_wise(&self, other: &Self, function: PairWiseFunction) -> Self {
-        // If the two tensors are the same, we can lower this to a cheaper element wise operation
+    pub(crate) fn binary_nary(&self, other: &Self, function: NaryFunction) -> Self {
+        // If the two tensors are the same, we can lower this to a cheaper unary operation
         if self.data.key == other.data.key {
-            return self.element_wise(ElementWiseOperation::new(
-                self.datatype(),
-                self.key(),
-                function.lower_to_element_wise(),
-                self.shape().as_slice(),
-            ));
+            let unary = NaryFunction::unary(
+                function.name.clone(),
+                format!("let a = input;\nlet b = input;\n{}", function.operation),
+                function.input_types[0],
+                function.output_type,
+            );
+            return self.unary_nary(unary);
         }
 
         assert_eq!(self.shape(), other.shape());
-        let operation =
-            PairWiseOperation::new(function, self.data.key, other.data.key, self.shape());
-        Self::from_parts(self.data.pair_wise(operation))
+        Self::from_parts(
+            self.data
+                .binary_nary(other.data.key, function, self.shape()),
+        )
     }
 
     pub(crate) fn add_mat_mul(&self, other: &Self, parameters: Option<MatMulParams>) -> Self {
@@ -947,6 +974,7 @@ impl<D: DataType, const R: usize> Tensor<R, D> {
             self.shape(),
             other.shape(),
             parameters,
+            &self.data.device,
         );
 
         Self::from_parts(self.data.mat_mul(operation))
@@ -973,18 +1001,6 @@ impl<D: DataType, const R: usize> Tensor<R, D> {
         Self::from_parts(self.data.slice_assign(op))
     }
 
-    pub(crate) fn add_index_select(&self, dimension: usize, indexes: &Tensor<1, u32>) -> Self {
-        let op = IndexSelectOperation::new(
-            self.data.key,
-            indexes.data.key,
-            self.datatype(),
-            dimension,
-            self.shape(),
-            indexes.shape(),
-        );
-        Self::from_parts(self.data.index_select(op))
-    }
-
     pub(crate) fn reduce<const OUT: usize>(
         &self,
         function: ReduceFunction,
@@ -1005,7 +1021,8 @@ impl<D: DataType, const R: usize> Tensor<R, D> {
         Tensor::from_parts(self.data.map_layout(op))
     }
 
-    pub(crate) fn key(&self) -> NodeIndex {
+    /// Return the compute-graph node index for this tensor.
+    pub fn key(&self) -> NodeIndex {
         self.data.key
     }
 
@@ -1048,7 +1065,7 @@ async fn test_tensor_slice() {
     let data = [[1., 2.], [3., 4.], [5., 6.]];
     let tensor = Tensor::new(&device, &data);
 
-    let slice = tensor.slice([0..2, 0..1]);
+    let slice = tensor.restride([crate::StrideSpec::dim(0, 2), crate::StrideSpec::dim(1, 1)]);
     let as_slice = slice.as_slice().await.unwrap();
     assert_eq!(as_slice[[0, 0]], 1.);
     assert_eq!(as_slice.get([0, 1]), None);
@@ -1097,15 +1114,27 @@ async fn test_tensor_compare() {
     ];
     let tensor = Tensor::new(&device, &data);
 
-    let slice = tensor.slice([0..2, 0..1, 0..1]);
+    let slice = tensor.restride([
+        crate::StrideSpec::dim(0, 2),
+        crate::StrideSpec::dim(1, 1),
+        crate::StrideSpec::dim(2, 1),
+    ]);
     let as_slice = slice.as_slice().await.unwrap();
     assert_eq!(as_slice, as_slice);
 
-    let other_slice = tensor.slice([0..1, 0..1, 0..1]);
+    let other_slice = tensor.restride([
+        crate::StrideSpec::dim(0, 1),
+        crate::StrideSpec::dim(1, 1),
+        crate::StrideSpec::dim(2, 1),
+    ]);
     let other_as_slice = other_slice.as_slice().await.unwrap();
     assert!(as_slice != other_as_slice);
 
-    let other_slice = tensor.slice([1..3, 0..1, 0..1]);
+    let other_slice = tensor.restride([
+        crate::StrideSpec::dim(0, 2).with_offset(1),
+        crate::StrideSpec::dim(1, 1),
+        crate::StrideSpec::dim(2, 1),
+    ]);
     let other_as_slice = other_slice.as_slice().await.unwrap();
     assert!(as_slice != other_as_slice);
 }
@@ -1131,7 +1160,7 @@ async fn test_tensor() {
 async fn test_zeros_f16() {
     let device = Device::test_instance();
 
-    let tensor: Tensor<2, half::f16> = Tensor::zeros(&device, [2, 2]);
+    let tensor: Tensor<2, half::f16> = Tensor::splat(&device, half::f16::ZERO, [2, 2]);
 
     let as_slice = tensor.as_slice().await.unwrap();
     assert_eq!(as_slice[[0, 0]], half::f16::ZERO);

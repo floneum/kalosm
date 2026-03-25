@@ -202,11 +202,11 @@ pub(super) fn build_kernel(
     )
     .unwrap();
 
-    // Allocate thread-local cache for results
+    // Allocate thread-local cache for results as vec4 accumulators when thread_n is 2-4
+    let thread_n_vec_type = maybe_vec_storage_type(thread_n_size, datatype);
     writeln!(
         kernel,
-        "var threadResults: array<{datatype}, {}>;",
-        thread_m_size * thread_n_size
+        "var threadResults: array<{thread_n_vec_type}, {thread_m_size}u>;"
     )
     .unwrap();
 
@@ -415,6 +415,8 @@ pub(super) fn build_kernel(
     }
 
     // Calculate per-thread results for current tile with overlapped prefetch
+    let stride_a = block_k_size + PADDING;
+    let stride_b = block_k_size + PADDING;
     writeln!(
         kernel,
         "    for (var dotIdx = 0u; dotIdx < {block_k_size}u; dotIdx++) {{"
@@ -423,7 +425,6 @@ pub(super) fn build_kernel(
     writeln!(kernel, "        let reg_m_offset = {a_offset}threadRow * {thread_m_size}u * ({block_k_size}u + {PADDING}) + dotIdx;").unwrap();
 
     // Vectorized loads with padding for bank conflict avoidance
-    let stride_a = block_k_size + PADDING;
     write!(kernel, "            regM = {thread_m_dtype}(").unwrap();
     for i in 0..thread_m_size {
         if i > 0 {
@@ -440,7 +441,6 @@ pub(super) fn build_kernel(
     .unwrap();
 
     // Vectorized load for N register with padding
-    let stride_b = block_k_size + PADDING;
     write!(kernel, "            regN = {thread_n_dtype}(").unwrap();
     for i in 0..thread_n_size {
         if i > 0 {
@@ -454,22 +454,9 @@ pub(super) fn build_kernel(
         let indexed_reg_m = maybe_vec_storage_index(thread_m_size, "regM", res_idx_m);
         writeln!(
             kernel,
-            "        let result_{res_idx_m} = {indexed_reg_m} * regN;"
+            "        threadResults[{res_idx_m}] = fma({thread_n_dtype}({indexed_reg_m}), regN, threadResults[{res_idx_m}]);"
         )
         .unwrap();
-        for res_idx_n in 0..thread_n_size {
-            let indexed_result = maybe_vec_storage_index(
-                thread_m_size,
-                format_args!("result_{res_idx_m}"),
-                res_idx_n,
-            );
-            writeln!(
-                kernel,
-                "        threadResults[{} * {thread_n_size}u + {}] += {indexed_result};",
-                res_idx_m, res_idx_n
-            )
-            .unwrap();
-        }
     }
     writeln!(kernel, "    }}").unwrap();
 
@@ -687,7 +674,7 @@ pub(super) fn build_kernel(
             )
             .unwrap();
             let result = post_element_wise_functions.iter().fold(
-                    format!("threadResults[(outRow{res_idx_m} - outRowOffset) * {thread_n_size}u + (outCol{res_idx_n} - outColOffset)]"),
+                    format!("threadResults[outRow{res_idx_m} - outRowOffset][outCol{res_idx_n} - outColOffset]"),
                     |acc, f| f.call(vec![acc]),
                 );
             writeln!(kernel, "{result};").unwrap();

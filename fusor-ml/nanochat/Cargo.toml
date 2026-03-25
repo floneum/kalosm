@@ -1,0 +1,28 @@
+[package]
+name = "fusor-nanochat"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+bytemuck = "1.23.2"
+dotenvy = "0.15.7"
+fusor.workspace = true
+fusor-gguf.workspace = true
+fusor-train.workspace = true
+half = "2.7.1"
+pollster = "0.4.0"
+rand.workspace = true
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tracing = "0.1"
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+getrandom = { version = "0.3", features = ["wasm_js"] }
+
+[lib]
+name = "fusor_nanochat"
+path = "src/lib.rs"

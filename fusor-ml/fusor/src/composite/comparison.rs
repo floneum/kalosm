@@ -4,7 +4,7 @@
 
 use crate::{SimdElement, Tensor};
 use fusor_core::DataType;
-use fusor_cpu::{EqOp, GtOp, GteOp, LtOp, LteOp, SimdBinaryOp};
+use fusor_cpu::{EqOp, GtOp, GteOp, LtOp, LteOp, NeOp, SimdBinaryOp};
 
 impl<const R: usize, D> Tensor<R, D>
 where
@@ -19,6 +19,17 @@ where
         EqOp: SimdBinaryOp<D>,
     {
         self.dispatch_cpu_only_pair(rhs, |a, b| a.as_ref().eq(b.as_ref()).to_concrete())
+    }
+
+    /// Element-wise inequality comparison between two tensors.
+    ///
+    /// Returns 1.0 where elements are not equal, 0.0 otherwise.
+    /// Note: GPU comparison is only available for CPU tensors at this time.
+    pub fn ne_tensor(&self, rhs: &Self) -> Self
+    where
+        NeOp: SimdBinaryOp<D>,
+    {
+        self.dispatch_cpu_only_pair(rhs, |a, b| a.as_ref().ne(b.as_ref()).to_concrete())
     }
 
     /// Element-wise less-than comparison between two tensors.
@@ -75,6 +86,22 @@ where
         self.dispatch_ref(
             |t| t.as_ref().eq_scalar(scalar).to_concrete(),
             |t| t.eq(scalar),
+        )
+    }
+
+    /// Element-wise inequality comparison with a scalar.
+    ///
+    /// Returns 1.0 where elements are not equal to the scalar, 0.0 otherwise.
+    pub fn ne_scalar(&self, scalar: D) -> Self
+    where
+        NeOp: SimdBinaryOp<D>,
+    {
+        self.dispatch_ref(
+            |t| t.as_ref().ne_scalar(scalar).to_concrete(),
+            |t| {
+                let eq: fusor_core::Tensor<R, D> = t.eq(scalar);
+                eq.eq(D::zero())
+            },
         )
     }
 
@@ -139,6 +166,17 @@ where
         EqOp: SimdBinaryOp<D>,
     {
         self.eq_scalar(rhs)
+    }
+
+    /// Element-wise inequality comparison with a scalar (fusor-core compatible API).
+    ///
+    /// Returns 1.0 where elements are not equal to the scalar, 0.0 otherwise.
+    /// This is an alias for `ne_scalar`.
+    pub fn ne(&self, rhs: D) -> Self
+    where
+        NeOp: SimdBinaryOp<D>,
+    {
+        self.ne_scalar(rhs)
     }
 
     /// Element-wise less-than comparison with a scalar (fusor-core compatible API).

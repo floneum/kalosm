@@ -8,19 +8,18 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use wgpu::CommandEncoder;
 
 use crate::{
-    ElementWiseFunctions,
     mir::{
         inputs::{KernelInputValue, MirValue},
         kernel::GenericKernel,
         operation::Operation,
         workgroup_shape::{self, WorkgroupShapeConstraints},
     },
-    nary_wise::{NaryExpr, NaryOperation},
+    nary_wise::{ExtractedUnaryChain, NaryExpr, NaryOperation, UnaryFunctionChain},
     quantized::matmul::QMatMulOperation,
     tensor::TensorData,
 };
 
-use super::{ComputeGraphInner, ComputeGraphNodeVariant, NodeIndex};
+use super::{ComputeGraphInner, ComputeGraphNode, ComputeGraphNodeVariant, NodeIndex};
 
 pub(crate) struct ResolverResult {
     pub(crate) data: TensorData,
@@ -36,20 +35,19 @@ struct ExecutionNode {
 type ExecutionGraph = StableGraph<ExecutionNode, ()>;
 type ExecutionNodeIndex = petgraph::graph::NodeIndex;
 
-pub(crate) struct Resolver<'a> {
-    command_encoder: &'a mut CommandEncoder,
+pub(crate) struct Resolver {
     execution_graph: ExecutionGraph,
     node_mapping: FxHashMap<NodeIndex, ExecutionNodeIndex>,
-    target: NodeIndex,
+    targets: Vec<NodeIndex>,
     resolved_set: FxHashSet<NodeIndex>,
 }
 
-impl<'a> Resolver<'a> {
-    pub(crate) fn new(
-        graph: &mut ComputeGraphInner,
-        target: NodeIndex,
-        command_encoder: &'a mut CommandEncoder,
-    ) -> Self {
+impl Resolver {
+    pub(crate) fn new(graph: &mut ComputeGraphInner, target: NodeIndex) -> Self {
+        Self::new_batch(graph, vec![target])
+    }
+
+    pub(crate) fn new_batch(graph: &mut ComputeGraphInner, targets: Vec<NodeIndex>) -> Self {
         let resolved_set = graph
             .nodes
             .nodes
@@ -64,20 +62,26 @@ impl<'a> Resolver<'a> {
             })
             .collect();
         Self {
-            command_encoder,
-            target,
+            targets,
             execution_graph: Default::default(),
             node_mapping: Default::default(),
             resolved_set,
         }
     }
 
-    pub(crate) fn run(&mut self, graph: &mut ComputeGraphInner) -> ResolverResult {
+    pub(crate) fn run(
+        &mut self,
+        graph: &mut ComputeGraphInner,
+        removed: &mut Vec<ComputeGraphNode>,
+    ) -> ResolverResult {
         let device = graph.device();
         let max_subgroup_size = device.max_subgroup_size();
 
-        // Pass 1: Build execution graph
-        self.build_execution_graph(graph, self.target);
+        // Pass 1: Build execution graph for all targets
+        let targets = self.targets.clone();
+        for &target in &targets {
+            self.build_execution_graph(graph, target);
+        }
 
         // Pass 2: Apply Rewrite Rules
         self.optimize(graph);
@@ -87,8 +91,10 @@ impl<'a> Resolver<'a> {
             .unwrap_or_else(|_| panic!("Cycle detected in execution graph"));
 
         // Pass 4: Execution
-        // Extract operations in order
+        // Extract operations in order.
+        let target_set: FxHashSet<NodeIndex> = self.targets.iter().copied().collect();
         let mut queued_operations = Vec::with_capacity(sorted_nodes.len());
+
         for idx in sorted_nodes {
             let node = &self.execution_graph[idx];
             // Handle Tensor caching explicitly here
@@ -102,6 +108,27 @@ impl<'a> Resolver<'a> {
             }
         }
 
+        // Build a remaining-consumer count. For each queued operation, we use
+        // the Operation's visit_dependencies (which reflects post-optimization
+        // fused dependencies) to count how many future operations read each
+        // inner NodeIndex.
+        let mut remaining_consumers: FxHashMap<NodeIndex, usize> = FxHashMap::default();
+        for (_, op) in &queued_operations {
+            op.visit_dependencies(&mut |dep| {
+                *remaining_consumers.entry(dep).or_insert(0) += 1;
+            });
+        }
+
+        // Create the first command encoder. We submit and recreate it after
+        // each kernel flush so that the GPU can reclaim freed intermediate
+        // buffers instead of accumulating all commands in one giant encoder.
+        let mut command_encoder =
+            device
+                .wgpu_device()
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("Resolver Encoder"),
+                });
+
         // Find runs of compatible dispatch shapes
         let mut current_constraints = WorkgroupShapeConstraints::new();
         let mut pending_operations = Vec::new();
@@ -109,7 +136,6 @@ impl<'a> Resolver<'a> {
         let mut all_input_values = Vec::new();
         let mut kernel = GenericKernel::new();
         let mut total_kernels = 0;
-
         for (node, operation) in queued_operations {
             let new_inputs = operation.inputs(graph);
             let constraint = operation.workgroup_shape_constraints(&device);
@@ -127,13 +153,32 @@ impl<'a> Resolver<'a> {
             } else {
                 if !pending_operations.is_empty() {
                     total_kernels += 1;
-                    self.flush_operations(
+                    Self::flush_operations(
                         graph,
                         &mut kernel,
                         &pending_operations,
                         &inputs,
                         &all_input_values,
                         old_best,
+                        removed,
+                        &mut command_encoder,
+                    );
+                    // After flushing, free intermediate cached results whose
+                    // consumers within this execution are all satisfied.
+                    Self::release_dead_intermediates(
+                        graph,
+                        &pending_operations,
+                        &mut remaining_consumers,
+                        &target_set,
+                    );
+                    // Submit the current command encoder so the GPU can
+                    // reclaim buffers we just freed, then start a new one.
+                    device.wgpu_queue().submit(Some(command_encoder.finish()));
+                    device.reset_initialized_buffers();
+                    command_encoder = device.wgpu_device().create_command_encoder(
+                        &wgpu::CommandEncoderDescriptor {
+                            label: Some("Resolver Encoder"),
+                        },
                     );
                     pending_operations.clear();
                     all_input_values.clear();
@@ -156,6 +201,16 @@ impl<'a> Resolver<'a> {
                 let result = map_layout.run(graph);
                 // Cache the result
                 graph.set_cached_result(node, result);
+                // Map-layout nodes are resolved immediately — release any
+                // input buffers that are no longer needed.
+                // Use graph.visit_dependencies for map_layout since they
+                // are not lowered to Operations.
+                Self::release_dead_intermediates_from_graph(
+                    graph,
+                    &[node],
+                    &mut remaining_consumers,
+                    &target_set,
+                );
             } else {
                 self.push_operation(
                     graph,
@@ -177,22 +232,91 @@ impl<'a> Resolver<'a> {
                 )
             });
             total_kernels += 1;
-            self.flush_operations(
+            Self::flush_operations(
                 graph,
                 &mut kernel,
                 &pending_operations,
                 &inputs,
                 &all_input_values,
                 old_best,
+                removed,
+                &mut command_encoder,
+            );
+            Self::release_dead_intermediates(
+                graph,
+                &pending_operations,
+                &mut remaining_consumers,
+                &target_set,
             );
         }
 
+        // Submit any remaining commands.
+        device.wgpu_queue().submit(Some(command_encoder.finish()));
+        device.reset_initialized_buffers();
+
         let data = graph
-            .get_result(self.target)
+            .get_result(self.targets[0])
             .expect("Target result not cached");
         ResolverResult {
             data,
             total_kernels,
+        }
+    }
+
+    /// After a kernel flush produces cached results for a set of nodes,
+    /// decrement the remaining-consumer count for each of their inputs. When
+    /// an input's count reaches zero and it is not a target node, drop its
+    /// cached result to free the GPU buffer.
+    ///
+    /// Uses `op.visit_dependencies()` to match the post-optimization
+    /// dependencies that were used to build the consumer counts.
+    fn release_dead_intermediates(
+        graph: &mut ComputeGraphInner,
+        produced_ops: &[(NodeIndex, Arc<dyn Operation>)],
+        remaining_consumers: &mut FxHashMap<NodeIndex, usize>,
+        targets: &FxHashSet<NodeIndex>,
+    ) {
+        for (_, op) in produced_ops {
+            op.visit_dependencies(&mut |dep| {
+                if let Some(count) = remaining_consumers.get_mut(&dep) {
+                    *count = count.saturating_sub(1);
+                    if *count == 0 && !targets.contains(&dep) {
+                        // All consumers within this execution have been
+                        // processed — free the cached buffer.
+                        if let Some(node) = graph.nodes.nodes.node_weight_mut(dep) {
+                            node.cached = None;
+                        }
+                    }
+                }
+            });
+        }
+    }
+
+    /// Like `release_dead_intermediates` but uses the compute graph's
+    /// `visit_dependencies` instead of an Operation's. Used for map-layout
+    /// and resize nodes that are resolved immediately without being lowered
+    /// to an Operation.
+    fn release_dead_intermediates_from_graph(
+        graph: &mut ComputeGraphInner,
+        produced_nodes: &[NodeIndex],
+        remaining_consumers: &mut FxHashMap<NodeIndex, usize>,
+        targets: &FxHashSet<NodeIndex>,
+    ) {
+        for &produced in produced_nodes {
+            let mut deps = Vec::new();
+            graph.visit_dependencies(produced, &mut |dep| {
+                deps.push(dep);
+            });
+            for dep in deps {
+                if let Some(count) = remaining_consumers.get_mut(&dep) {
+                    *count = count.saturating_sub(1);
+                    if *count == 0 && !targets.contains(&dep) {
+                        if let Some(node) = graph.nodes.nodes.node_weight_mut(dep) {
+                            node.cached = None;
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -239,63 +363,12 @@ impl<'a> Resolver<'a> {
 
     fn lower_node(&self, node: &ExecutionNode) -> Option<Arc<dyn Operation>> {
         match &node.variant {
-            ComputeGraphNodeVariant::ElementWise(op) => {
-                let inputs = vec![op.value];
-                let shape: Box<[_]> = op.shape().into();
-                let rank = shape.len();
-                // Construct NaryExpr for simple unary chain
-                let expression =
-                    self.wrap_with_element_wise_functions(NaryExpr::input(0, rank), &op.functions);
-
-                let final_output_datatype = op.functions.out_datatype();
-                let nary = NaryOperation {
-                    inputs,
-                    expression,
-                    shape,
-                    output_datatype: final_output_datatype,
-                };
-                Some(Arc::new(nary))
-            }
-            ComputeGraphNodeVariant::PairWise(op) => {
-                let inputs = vec![op.first, op.second];
-                let shape: Box<[_]> = op.shape().into();
-                let rank = shape.len();
-                let ty = op.function.datatype;
-                let expression = NaryExpr::Op {
-                    children: vec![NaryExpr::input(0, rank), NaryExpr::input(1, rank)],
-                    function: op.function.to_nary_function(ty, ty),
-                };
-
-                let final_output_datatype = op.function.datatype;
-                let nary = NaryOperation {
-                    inputs,
-                    expression,
-                    shape,
-                    output_datatype: final_output_datatype,
-                };
-                Some(Arc::new(nary))
-            }
             ComputeGraphNodeVariant::Nary(op) => Some(Arc::new(op.clone())),
             ComputeGraphNodeVariant::MatMul(op) => Some(Arc::new(op.clone())),
             ComputeGraphNodeVariant::Reduce(op) => Some(Arc::new(op.clone())),
             ComputeGraphNodeVariant::MapLayout(op) => Some(Arc::new(op.clone())),
             ComputeGraphNodeVariant::Resize(op) => Some(Arc::new(op.clone())),
             ComputeGraphNodeVariant::SliceAssign(op) => Some(Arc::new(op.clone())),
-            ComputeGraphNodeVariant::IndexSelect(op) => {
-                // Convert IndexSelect to NaryOperation
-                // Let the nary fusion optimization handle combining with element-wise ops
-                let inputs = vec![op.input, op.indexes];
-                let rank = op.rank();
-                let expression = NaryExpr::index_select(rank, op.dimension);
-
-                let nary = NaryOperation {
-                    inputs,
-                    expression,
-                    shape: op.output_shape(),
-                    output_datatype: op.datatype,
-                };
-                Some(Arc::new(nary))
-            }
             ComputeGraphNodeVariant::QMatMul(op) => Some(Arc::new(QMatMulOperation::new(
                 op.input_datatype,
                 &op.in_shape,
@@ -303,7 +376,6 @@ impl<'a> Resolver<'a> {
                 op.matrix.clone(),
             ))),
             ComputeGraphNodeVariant::Dequantize(op) => Some(Arc::new(op.clone())),
-            ComputeGraphNodeVariant::WhereCond(op) => Some(Arc::new(op.to_nary())),
             ComputeGraphNodeVariant::Tensor(_) => None, // Handled in execution loop
             ComputeGraphNodeVariant::Custom(op) => Some(op.clone()),
         }
@@ -330,15 +402,9 @@ impl<'a> Resolver<'a> {
                 .neighbors_undirected(node_idx)
                 .collect();
 
-            // 1. Convert elementwise/pairwise/where_cond to nary (canonical form)
-            // 2. Fuse naries together (combine expression trees)
-            // 3. Try to fuse resulting nary into specialized ops (reduce, matmul, etc.)
-            // Note: IndexSelect is converted to Nary in lower_node, not during optimization,
-            // because its custom indexing pattern doesn't fuse well with other naries.
-            let changed = self.try_convert_elementwise_to_nary(graph, node_idx)
-                || self.try_convert_pairwise_to_nary(graph, node_idx)
-                || self.try_convert_where_cond_to_nary(graph, node_idx)
-                || self.try_fuse_naries(graph, node_idx)
+            // 1. Fuse naries together (combine expression trees)
+            // 2. Try to fuse resulting nary into specialized ops (reduce, matmul, etc.)
+            let changed = self.try_fuse_naries(graph, node_idx)
                 || self.try_fuse_into_reduce(graph, node_idx)
                 || self.try_fuse_into_matmul(graph, node_idx)
                 || self.try_fuse_into_dequantize(graph, node_idx);
@@ -420,92 +486,6 @@ impl<'a> Resolver<'a> {
 
     // Rules
 
-    /// Convert an ElementWise operation to a simple Nary operation with one input.
-    fn try_convert_elementwise_to_nary(
-        &mut self,
-        graph: &mut ComputeGraphInner,
-        node_idx: ExecutionNodeIndex,
-    ) -> bool {
-        let node_variant = self.execution_graph[node_idx].variant.clone();
-
-        let ComputeGraphNodeVariant::ElementWise(op) = node_variant else {
-            return false;
-        };
-
-        let inputs = vec![op.value];
-        let shape: Box<[_]> = op.shape().into();
-        let rank = shape.len();
-        let expression =
-            self.wrap_with_element_wise_functions(NaryExpr::input(0, rank), &op.functions);
-        let output_datatype = op.functions.out_datatype();
-
-        let nary = NaryOperation {
-            inputs,
-            expression,
-            shape,
-            output_datatype,
-        };
-
-        self.execution_graph[node_idx].variant = ComputeGraphNodeVariant::Nary(nary.clone());
-        self.add_physical_dependencies(graph, node_idx, &nary.inputs);
-
-        true
-    }
-
-    /// Convert a PairWise operation to a simple Nary operation with two inputs.
-    fn try_convert_pairwise_to_nary(
-        &mut self,
-        graph: &mut ComputeGraphInner,
-        node_idx: ExecutionNodeIndex,
-    ) -> bool {
-        let node_variant = self.execution_graph[node_idx].variant.clone();
-
-        let ComputeGraphNodeVariant::PairWise(op) = node_variant else {
-            return false;
-        };
-
-        let inputs = vec![op.first, op.second];
-        let shape: Box<[_]> = op.shape().into();
-        let rank = shape.len();
-        let ty = op.function.datatype;
-        let expression = NaryExpr::Op {
-            children: vec![NaryExpr::input(0, rank), NaryExpr::input(1, rank)],
-            function: op.function.to_nary_function(ty, ty),
-        };
-
-        let nary = NaryOperation {
-            inputs,
-            expression,
-            shape,
-            output_datatype: ty,
-        };
-
-        self.execution_graph[node_idx].variant = ComputeGraphNodeVariant::Nary(nary.clone());
-        self.add_physical_dependencies(graph, node_idx, &nary.inputs);
-
-        true
-    }
-
-    /// Convert a WhereCond operation to a Nary operation with Select expression.
-    fn try_convert_where_cond_to_nary(
-        &mut self,
-        graph: &mut ComputeGraphInner,
-        node_idx: ExecutionNodeIndex,
-    ) -> bool {
-        let node_variant = self.execution_graph[node_idx].variant.clone();
-
-        let ComputeGraphNodeVariant::WhereCond(op) = node_variant else {
-            return false;
-        };
-
-        let nary = op.to_nary();
-
-        self.execution_graph[node_idx].variant = ComputeGraphNodeVariant::Nary(nary.clone());
-        self.add_physical_dependencies(graph, node_idx, &nary.inputs);
-
-        true
-    }
-
     /// Fuse a Nary operation with all of its Nary inputs.
     fn try_fuse_naries(
         &mut self,
@@ -553,7 +533,22 @@ impl<'a> Resolver<'a> {
             // Only fuse if substitution was successful
             // If not, the expression still references the original input which must remain
             if success {
-                // Check if fusing would exceed GPU storage binding limit
+                // Check if fusing would exceed the GPU's per-stage buffer limit.
+                // On Metal, `max_buffers_per_stage` is 31 and covers ALL buffer
+                // types (storage + uniform) plus an implicit sizes buffer added
+                // by wgpu. Each unique tensor input needs at least 1 storage
+                // binding, and there will also be a small number of uniform
+                // "info" bindings (for tensor shape/stride metadata), plus the
+                // output storage binding, plus the wgpu sizes buffer.
+                //
+                // We use `max_storage_bindings` (which equals `max_buffers_per_stage`
+                // on Metal = 31) as the hard ceiling and reserve slots for:
+                //   - 1 output storage binding
+                //   - 1 wgpu sizes buffer
+                //   - up to `info_headroom` uniform info bindings
+                let info_headroom = 4usize;
+                let max_fused_inputs = max_storage_bindings.saturating_sub(2 + info_headroom);
+
                 // Count unique inputs after potential merge (duplicates share a binding)
                 let unique_inputs: FxHashSet<_> = all_inputs
                     .iter()
@@ -561,8 +556,7 @@ impl<'a> Resolver<'a> {
                     .copied()
                     .collect();
 
-                // Each unique input needs a binding, plus 1 for output
-                if unique_inputs.len() + 1 >= max_storage_bindings {
+                if unique_inputs.len() >= max_fused_inputs {
                     // Skip fusion - would exceed GPU binding limit
                     continue;
                 }
@@ -804,12 +798,11 @@ impl<'a> Resolver<'a> {
         }
     }
 
-    /// Try to extract ElementWiseOperation from a node variant (only Nary with single input can be converted).
-    fn try_get_elementwise(
-        variant: &ComputeGraphNodeVariant,
-    ) -> Option<crate::ElementWiseOperation> {
+    /// Try to extract a unary function chain from a node variant.
+    /// Only Nary ops with a single input and element-wise access can be converted.
+    fn try_get_unary_chain(variant: &ComputeGraphNodeVariant) -> Option<ExtractedUnaryChain> {
         match variant {
-            ComputeGraphNodeVariant::Nary(nary) => nary.try_into_elementwise_op(),
+            ComputeGraphNodeVariant::Nary(nary) => nary.try_extract_unary_chain(),
             _ => None,
         }
     }
@@ -821,7 +814,7 @@ impl<'a> Resolver<'a> {
     ) -> bool {
         let node_variant = self.execution_graph[node_idx].variant.clone();
 
-        let Some(el_op) = Self::try_get_elementwise(&node_variant) else {
+        let Some(el_op) = Self::try_get_unary_chain(&node_variant) else {
             return false;
         };
 
@@ -843,7 +836,7 @@ impl<'a> Resolver<'a> {
         let mut existing_post = new_reduce.post_element_wise.functions.clone();
         existing_post.extend(el_op.functions.functions.iter().cloned());
         new_reduce.post_element_wise =
-            ElementWiseFunctions::new(existing_post, reduce_op.post_element_wise.input_datatype());
+            UnaryFunctionChain::new(existing_post, reduce_op.post_element_wise.input_datatype());
 
         self.execution_graph[node_idx].variant =
             ComputeGraphNodeVariant::Reduce(new_reduce.clone());
@@ -870,7 +863,7 @@ impl<'a> Resolver<'a> {
         let node_variant = self.execution_graph[node_idx].variant.clone();
 
         // Post-op: fuse elementwise after matmul
-        if let Some(el_op) = Self::try_get_elementwise(&node_variant) {
+        if let Some(el_op) = Self::try_get_unary_chain(&node_variant) {
             let input_inner = el_op.value;
             if !self.check_cached(graph, input_inner)
                 && let Some(input_exec_idx) = self.get_input_node_in_exec_graph(input_inner)
@@ -880,7 +873,7 @@ impl<'a> Resolver<'a> {
                     let mut new_matmul = matmul_op.clone();
                     let mut existing_post = new_matmul.post_element_wise.functions.clone();
                     existing_post.extend(el_op.functions.functions.iter().cloned());
-                    new_matmul.post_element_wise = ElementWiseFunctions::new(
+                    new_matmul.post_element_wise = UnaryFunctionChain::new(
                         existing_post,
                         matmul_op.post_element_wise.input_datatype(),
                     );
@@ -914,7 +907,7 @@ impl<'a> Resolver<'a> {
             if !self.check_cached(graph, matmul_op.first)
                 && let Some(first_exec) = self.get_input_node_in_exec_graph(matmul_op.first)
                 && let Some(el_op) =
-                    Self::try_get_elementwise(&self.execution_graph[first_exec].variant)
+                    Self::try_get_unary_chain(&self.execution_graph[first_exec].variant)
             {
                 new_matmul.first = el_op.value;
                 new_matmul.pre_element_wise[0] = el_op.functions.clone();
@@ -925,7 +918,7 @@ impl<'a> Resolver<'a> {
             if !self.check_cached(graph, matmul_op.second)
                 && let Some(second_exec) = self.get_input_node_in_exec_graph(matmul_op.second)
                 && let Some(el_op) =
-                    Self::try_get_elementwise(&self.execution_graph[second_exec].variant)
+                    Self::try_get_unary_chain(&self.execution_graph[second_exec].variant)
             {
                 new_matmul.second = el_op.value;
                 new_matmul.pre_element_wise[1] = el_op.functions.clone();
@@ -974,7 +967,7 @@ impl<'a> Resolver<'a> {
         node_idx: ExecutionNodeIndex,
     ) -> bool {
         let node_variant = self.execution_graph[node_idx].variant.clone();
-        let Some(el_op) = Self::try_get_elementwise(&node_variant) else {
+        let Some(el_op) = Self::try_get_unary_chain(&node_variant) else {
             return false;
         };
 
@@ -995,7 +988,7 @@ impl<'a> Resolver<'a> {
         let mut new_deq = deq_op.clone();
         let mut existing_post = new_deq.post_dequantize.functions.clone();
         existing_post.extend(el_op.functions.functions.iter().cloned());
-        new_deq.post_dequantize = ElementWiseFunctions::new(existing_post, deq_op.datatype);
+        new_deq.post_dequantize = UnaryFunctionChain::new(existing_post, deq_op.datatype);
 
         self.execution_graph[node_idx].variant = ComputeGraphNodeVariant::Dequantize(new_deq);
 
@@ -1044,13 +1037,14 @@ impl<'a> Resolver<'a> {
     }
 
     fn flush_operations(
-        &mut self,
         graph: &mut ComputeGraphInner,
         mut kernel: &mut GenericKernel,
         queued_operations: &[(NodeIndex, Arc<dyn Operation>)],
         inputs: &[Vec<MirValue>],
         all_input_values: &[KernelInputValue],
         workgroup_shape: workgroup_shape::WorkgroupShape,
+        removed: &mut Vec<ComputeGraphNode>,
+        command_encoder: &mut CommandEncoder,
     ) {
         let mut max_dispatch_size = [0; 3];
         for ((key, operation), inputs) in queued_operations.iter().zip(inputs) {
@@ -1065,29 +1059,21 @@ impl<'a> Resolver<'a> {
             for (new, max) in dispatch_size.iter().zip(max_dispatch_size.iter_mut()) {
                 *max = (*max).max(*new);
             }
-            if cfg!(debug_assertions) {
-                writeln!(&mut kernel, "{{ // start {}", operation.name()).unwrap();
-            } else {
-                writeln!(&mut kernel, "{{").unwrap();
-            }
+            writeln!(&mut kernel, "{{").unwrap();
             operation.build_kernel(graph, &workgroup_shape, inputs, kernel);
             let name = kernel.name_mut();
             if !name.is_empty() {
                 *name += "->";
             }
             *name += &operation.name();
-            if cfg!(debug_assertions) {
-                writeln!(&mut kernel, "}} // end {}", operation.name()).unwrap();
-            } else {
-                writeln!(&mut kernel, "}}").unwrap();
-            }
+            writeln!(&mut kernel, "}}").unwrap();
             // Check if that makes any of this node's dependencies dead
             let mut dependencies = Vec::new();
             graph.visit_dependencies(*key, &mut |dependent_key| {
                 dependencies.push(dependent_key);
             });
             for dependency in dependencies {
-                graph.check_life(dependency);
+                graph.check_life(dependency, removed);
             }
         }
         kernel.set_workgroup_size(workgroup_shape);
@@ -1095,25 +1081,8 @@ impl<'a> Resolver<'a> {
         kernel.run(
             &device,
             all_input_values,
-            self.command_encoder,
+            command_encoder,
             max_dispatch_size,
         );
-    }
-
-    /// Wrap an expression with element-wise functions (each becomes a unary Op node)
-    fn wrap_with_element_wise_functions(
-        &self,
-        mut expr: NaryExpr,
-        funcs: &ElementWiseFunctions,
-    ) -> NaryExpr {
-        let mut current_input_type = funcs.input_datatype();
-        for func in funcs.functions.iter() {
-            expr = NaryExpr::Op {
-                children: vec![expr],
-                function: func.to_nary_function(current_input_type),
-            };
-            current_input_type = func.datatype;
-        }
-        expr
     }
 }

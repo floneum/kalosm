@@ -122,21 +122,13 @@ where
 
     /// Create a tensor filled with zeros.
     pub fn zeros(device: &Device, shape: [usize; R]) -> Self {
-        match device {
-            Device::Cpu => Tensor::Cpu(fusor_cpu::Tensor::zeros(shape)),
-            Device::Gpu(gpu_device) => Tensor::Gpu(fusor_core::Tensor::zeros(gpu_device, shape)),
-        }
+        Self::splat(device, D::default(), shape)
     }
 
     /// Create a tensor filled with zeros that has the same shape as this tensor.
     pub fn zeros_like(&self) -> Self {
-        match self {
-            Tensor::Cpu(t) => {
-                let shape: [usize; R] = t.shape();
-                Tensor::Cpu(fusor_cpu::Tensor::zeros(shape))
-            }
-            Tensor::Gpu(t) => Tensor::Gpu(t.zeros_like()),
-        }
+        let shape = self.shape();
+        Self::splat(&self.device(), D::default(), shape)
     }
 
     /// Create a tensor filled with a specific value.
