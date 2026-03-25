@@ -405,12 +405,93 @@ where
     }
 }
 
-// Specialized f32 implementation with fused softmax
+// Specialized f32 implementation with fused normalization helpers
 impl<const R: usize, B> Tensor<R, f32, B>
 where
     B: TensorBacking<R, Elem = f32>,
     fusor_core::Tensor<R, f32>: fusor_core::LastRankInner,
 {
+    /// Optimized fused layer norm along the last dimension for f32.
+    ///
+    /// `weight` and `bias` are expected to contain exactly one row of parameters
+    /// for the last dimension. On CPU this uses the SIMD fused kernel after
+    /// reshaping those parameters to `[1, ..., 1, last_dim]` and making them
+    /// contiguous. On GPU it falls back to the common composite layer norm
+    /// implementation after broadcasting the parameters to the input shape.
+    pub fn layer_norm_last_dim_fused<const OUT_RANK: usize, const W: usize, B2, B3>(
+        &self,
+        weight: &Tensor<W, f32, B2>,
+        bias: Option<&Tensor<W, f32, B3>>,
+        eps: f32,
+    ) -> Tensor<R, f32>
+    where
+        ConcreteTensor<f32, R>: CpuLastRank<OUT_RANK, f32>,
+        fusor_core::Tensor<R, f32>: GpuLastRank<OUT_RANK, f32>,
+        <fusor_core::Tensor<R, f32> as fusor_core::LastRankInner>::LastRank:
+            GpuNextRankInner<NextRank = fusor_core::Tensor<R, f32>>,
+        SumOp: SimdReduceOp<f32>,
+        AddOp: SimdBinaryOp<f32>,
+        SubOp: SimdBinaryOp<f32>,
+        MulOp: SimdBinaryOp<f32>,
+        DivOp: SimdBinaryOp<f32>,
+        SqrtOp: SimdUnaryOp<f32>,
+        B2: TensorBacking<W, Elem = f32>,
+        B3: TensorBacking<W, Elem = f32>,
+    {
+        let last_dim = self.shape()[R - 1];
+        let weight_elements = weight.shape().iter().product::<usize>();
+        assert_eq!(
+            weight_elements, last_dim,
+            "layer_norm_last_dim_fused expects weight to contain exactly the last dimension"
+        );
+        if let Some(bias) = bias {
+            let bias_elements = bias.shape().iter().product::<usize>();
+            assert_eq!(
+                bias_elements, last_dim,
+                "layer_norm_last_dim_fused expects bias to contain exactly the last dimension"
+            );
+        }
+
+        let mut param_shape = [1; R];
+        param_shape[R - 1] = last_dim;
+
+        match (self, weight) {
+            (Tensor::Cpu(input), Tensor::Cpu(weight)) => {
+                let input = input.as_ref().make_contiguous();
+                let weight = weight.as_ref().reshape(param_shape).make_contiguous();
+                let bias = match bias {
+                    Some(Tensor::Cpu(bias)) => {
+                        Some(bias.as_ref().reshape(param_shape).make_contiguous())
+                    }
+                    Some(Tensor::Gpu(_)) => {
+                        panic!("Layer norm requires tensors on the same backend")
+                    }
+                    None => None,
+                };
+                let result = fusor_cpu::layer_norm_last_dim_fused(
+                    input.inner(),
+                    weight.inner(),
+                    bias.as_ref().map(|bias| bias.inner()),
+                    eps,
+                );
+                Tensor::Cpu(fusor_cpu::Tensor::new(result))
+            }
+            (Tensor::Gpu(_), Tensor::Gpu(_)) => {
+                if matches!(bias, Some(Tensor::Cpu(_))) {
+                    panic!("Layer norm requires tensors on the same backend");
+                }
+                let weight_params = weight.reshape(param_shape);
+                let weight = weight_params.broadcast_as(self.shape());
+                let bias_params = bias.map(|bias| bias.reshape(param_shape));
+                let bias = bias_params
+                    .as_ref()
+                    .map(|bias| bias.broadcast_as(self.shape()));
+                self.layer_norm::<OUT_RANK, _, _>(&weight, bias.as_ref(), eps, true)
+            }
+            _ => panic!("Layer norm requires tensors on the same backend"),
+        }
+    }
+
     /// Optimized fused softmax along the last dimension for f32.
     ///
     /// This performs the entire softmax (max, exp, sum, normalize) in a single
@@ -422,7 +503,7 @@ where
         self.dispatch_ref(
             |t| {
                 // Make contiguous if needed, then use fused kernel
-                let contiguous = t.to_concrete();
+                let contiguous = t.as_ref().make_contiguous();
                 let result = fusor_cpu::softmax_last_dim_fused(contiguous.inner());
                 fusor_cpu::Tensor::new(result)
             },
@@ -435,6 +516,7 @@ where
 #[allow(clippy::identity_op, clippy::useless_conversion)]
 mod tests {
     use super::*;
+    use crate::Layout;
 
     #[tokio::test]
     async fn test_softmax_cpu() {
@@ -586,6 +668,59 @@ mod tests {
                 expected[i]
             );
         }
+    }
+
+    #[tokio::test]
+    async fn test_layer_norm_last_dim_fused_cpu() {
+        let data = [1.0f32, 2.0, 3.0, 4.0, 0.5, -1.0, 2.5, 6.0];
+        let input: Tensor<2, f32> = Tensor::Cpu(fusor_cpu::Tensor::from_slice([2, 4], &data));
+
+        let weight: Tensor<1, f32> =
+            Tensor::Cpu(fusor_cpu::Tensor::from_slice([4], &[1.5, 0.5, 2.0, 1.0]));
+        let bias: Tensor<1, f32> =
+            Tensor::Cpu(fusor_cpu::Tensor::from_slice([4], &[0.1, -0.2, 0.3, -0.4]));
+
+        let fused = input.layer_norm_last_dim_fused::<1, 1, _, _>(&weight, Some(&bias), 1e-5);
+        let weight_broadcast = weight.broadcast_as([2, 4]);
+        let bias_broadcast = bias.broadcast_as([2, 4]);
+        let composite =
+            input.layer_norm::<1, _, _>(&weight_broadcast, Some(&bias_broadcast), 1e-5, true);
+
+        let fused_slice = fused.as_slice().await.unwrap();
+        let composite_slice = composite.as_slice().await.unwrap();
+
+        for i in 0..2 {
+            for j in 0..4 {
+                assert!(
+                    (fused_slice[[i, j]] - composite_slice[[i, j]]).abs() < 0.001,
+                    "Mismatch at [{}, {}]: fused={}, composite={}",
+                    i,
+                    j,
+                    fused_slice[[i, j]],
+                    composite_slice[[i, j]]
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_cpu_make_contiguous_helper() {
+        let data = [1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0];
+        let t = fusor_cpu::Tensor::from_slice([2, 3], &data);
+
+        let layout = Layout::from_parts(0, vec![3, 2].into_boxed_slice(), vec![1, 3].into());
+        let restrided = t.restride_layout(layout);
+        let contiguous = restrided.make_contiguous();
+
+        assert!(contiguous.inner().layout().is_contiguous());
+
+        let slice = contiguous.as_slice();
+        assert_eq!(slice[[0, 0]], 1.0);
+        assert_eq!(slice[[0, 1]], 4.0);
+        assert_eq!(slice[[1, 0]], 2.0);
+        assert_eq!(slice[[1, 1]], 5.0);
+        assert_eq!(slice[[2, 0]], 3.0);
+        assert_eq!(slice[[2, 1]], 6.0);
     }
 
     #[tokio::test]
