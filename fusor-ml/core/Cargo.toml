@@ -76,7 +76,3 @@ harness = false
 [[bench]]
 name = "softmax"
 harness = false
-
-[[bench]]
-name = "attention_comparison"
-harness = false
