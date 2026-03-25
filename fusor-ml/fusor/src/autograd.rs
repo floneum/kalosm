@@ -163,6 +163,13 @@ impl<const R: usize> Tensor<R> {
         graph.tensor(device, data)
     }
 
+    pub fn from_array<T>(graph: &Graph, device: &Device, data: T) -> Self
+    where
+        RawTensor<R, f32>: fusor_types::FromArray<R, f32, T, Device>,
+    {
+        Self::new(graph, device, data)
+    }
+
     pub fn from_slice(graph: &Graph, device: &Device, shape: [usize; R], data: &[f32]) -> Self {
         graph.leaf(RawTensor::from_slice(device, shape, data))
     }
@@ -173,6 +180,14 @@ impl<const R: usize> Tensor<R> {
 
     pub fn splat(graph: &Graph, device: &Device, value: f32, shape: [usize; R]) -> Self {
         graph.leaf(RawTensor::splat(device, value, shape))
+    }
+
+    pub fn full(graph: &Graph, device: &Device, shape: [usize; R], value: f32) -> Self {
+        Self::splat(graph, device, value, shape)
+    }
+
+    pub fn zeros_like(&self) -> Self {
+        Self::zeros(&self.graph(), &self.device(), self.shape())
     }
 
     pub fn raw(&self) -> &RawTensor<R, f32> {
@@ -324,12 +339,28 @@ impl<const R: usize> Tensor<R> {
         )
     }
 
+    pub fn add_<const R2: usize, const R3: usize>(&self, second: &Tensor<R2>) -> Tensor<R3> {
+        let out_shape: [usize; R3] =
+            crate::composite::broadcast_shapes(&self.shape(), &second.shape());
+        let lhs = self.broadcast_as(out_shape);
+        let rhs = second.broadcast_as(out_shape);
+        lhs.add(&rhs)
+    }
+
     pub fn sub(&self, rhs: &Self) -> Self {
         self.binary_op(
             rhs,
             (self.value.clone() - rhs.value.clone()).to_concrete(),
             |grad, _, _| vec![grad.clone().to_concrete(), (-grad).to_concrete()],
         )
+    }
+
+    pub fn sub_<const R2: usize, const R3: usize>(&self, second: &Tensor<R2>) -> Tensor<R3> {
+        let out_shape: [usize; R3] =
+            crate::composite::broadcast_shapes(&self.shape(), &second.shape());
+        let lhs = self.broadcast_as(out_shape);
+        let rhs = second.broadcast_as(out_shape);
+        lhs.sub(&rhs)
     }
 
     pub fn mul(&self, rhs: &Self) -> Self {
@@ -345,6 +376,14 @@ impl<const R: usize> Tensor<R> {
         )
     }
 
+    pub fn mul_<const R2: usize, const R3: usize>(&self, second: &Tensor<R2>) -> Tensor<R3> {
+        let out_shape: [usize; R3] =
+            crate::composite::broadcast_shapes(&self.shape(), &second.shape());
+        let lhs = self.broadcast_as(out_shape);
+        let rhs = second.broadcast_as(out_shape);
+        lhs.mul(&rhs)
+    }
+
     pub fn div(&self, rhs: &Self) -> Self {
         self.binary_op(
             rhs,
@@ -355,6 +394,45 @@ impl<const R: usize> Tensor<R> {
                 vec![lhs_grad, rhs_grad]
             },
         )
+    }
+
+    pub fn div_<const R2: usize, const R3: usize>(&self, second: &Tensor<R2>) -> Tensor<R3> {
+        let out_shape: [usize; R3] =
+            crate::composite::broadcast_shapes(&self.shape(), &second.shape());
+        let lhs = self.broadcast_as(out_shape);
+        let rhs = second.broadcast_as(out_shape);
+        lhs.div(&rhs)
+    }
+
+    pub fn pow(&self, rhs: &Self) -> Self {
+        self.binary_op(rhs, self.value.pow(&rhs.value).to_concrete(), |grad, lhs, rhs| {
+            let rhs_minus_one = rhs.sub_scalar(1.0).to_concrete();
+            let lhs_power = lhs.pow(&rhs_minus_one).to_concrete();
+            let lhs_grad = ((grad.clone() * rhs.clone()).to_concrete() * lhs_power).to_concrete();
+            let rhs_grad = ((grad * lhs.pow(&rhs).to_concrete()).to_concrete() * lhs.log().to_concrete())
+                .to_concrete();
+            vec![lhs_grad, rhs_grad]
+        })
+    }
+
+    pub fn pow_<const R2: usize, const R3: usize>(&self, second: &Tensor<R2>) -> Tensor<R3> {
+        let out_shape: [usize; R3] =
+            crate::composite::broadcast_shapes(&self.shape(), &second.shape());
+        let lhs = self.broadcast_as(out_shape);
+        let rhs = second.broadcast_as(out_shape);
+        lhs.pow(&rhs)
+    }
+
+    pub fn pow_elementwise(&self, exponent: f32) -> Self {
+        let input = self.value.clone();
+        self.unary_from_value(self.value.pow_elementwise(exponent).to_concrete(), move |grad, _| {
+            let power = input.pow_elementwise(exponent - 1.0).to_concrete();
+            (grad * power).to_concrete().mul_scalar(exponent).to_concrete()
+        })
+    }
+
+    pub fn pow_scalar(&self, exponent: f32) -> Self {
+        self.pow_elementwise(exponent)
     }
 
     pub fn add_scalar(&self, scalar: f32) -> Self {
@@ -392,12 +470,314 @@ impl<const R: usize> Tensor<R> {
         })
     }
 
+    pub fn abs(&self) -> Self {
+        let input = self.value.clone();
+        self.unary_from_value(self.value.abs().to_concrete(), move |grad, _| {
+            let positive = input.mt(0.0).to_concrete();
+            let negative = input.lt(0.0).to_concrete();
+            ((grad.clone() * positive).to_concrete() - (grad * negative).to_concrete()).to_concrete()
+        })
+    }
+
+    pub fn acos(&self) -> Self {
+        let input = self.value.clone();
+        self.unary_from_value(self.value.acos().to_concrete(), move |grad, _| {
+            let denom = (RawTensor::splat(&input.device(), 1.0, input.shape())
+                - input.sqr().to_concrete())
+            .to_concrete()
+            .sqrt()
+            .to_concrete();
+            (-(grad / denom).to_concrete()).to_concrete()
+        })
+    }
+
+    pub fn acosh(&self) -> Self {
+        let input = self.value.clone();
+        self.unary_from_value(self.value.acosh().to_concrete(), move |grad, _| {
+            let lower = input.add_scalar(-1.0).to_concrete().sqrt().to_concrete();
+            let upper = input.add_scalar(1.0).to_concrete().sqrt().to_concrete();
+            (grad / (lower * upper).to_concrete()).to_concrete()
+        })
+    }
+
+    pub fn approximate_exp(&self) -> Self {
+        self.unary_from_value(self.value.approximate_exp().to_concrete(), move |grad, out| {
+            (grad * out).to_concrete()
+        })
+    }
+
+    pub fn asin(&self) -> Self {
+        let input = self.value.clone();
+        self.unary_from_value(self.value.asin().to_concrete(), move |grad, _| {
+            let denom = (RawTensor::splat(&input.device(), 1.0, input.shape())
+                - input.sqr().to_concrete())
+            .to_concrete()
+            .sqrt()
+            .to_concrete();
+            (grad / denom).to_concrete()
+        })
+    }
+
+    pub fn asinh(&self) -> Self {
+        let input = self.value.clone();
+        self.unary_from_value(self.value.asinh().to_concrete(), move |grad, _| {
+            let denom = input
+                .sqr()
+                .add_scalar(1.0)
+                .to_concrete()
+                .sqrt()
+                .to_concrete();
+            (grad / denom).to_concrete()
+        })
+    }
+
+    pub fn atan(&self) -> Self {
+        let input = self.value.clone();
+        self.unary_from_value(self.value.atan().to_concrete(), move |grad, _| {
+            let denom = input.sqr().add_scalar(1.0).to_concrete();
+            (grad / denom).to_concrete()
+        })
+    }
+
+    pub fn atanh(&self) -> Self {
+        let input = self.value.clone();
+        self.unary_from_value(self.value.atanh().to_concrete(), move |grad, _| {
+            let denom = (RawTensor::splat(&input.device(), 1.0, input.shape())
+                - input.sqr().to_concrete())
+            .to_concrete();
+            (grad / denom).to_concrete()
+        })
+    }
+
+    pub fn cos(&self) -> Self {
+        let input = self.value.clone();
+        self.unary_from_value(self.value.cos().to_concrete(), move |grad, _| {
+            (-(grad * input.sin().to_concrete()).to_concrete()).to_concrete()
+        })
+    }
+
+    pub fn cosh(&self) -> Self {
+        let input = self.value.clone();
+        self.unary_from_value(self.value.cosh().to_concrete(), move |grad, _| {
+            (grad * input.sinh().to_concrete()).to_concrete()
+        })
+    }
+
+    pub fn exp2(&self) -> Self {
+        self.unary_from_value(self.value.exp2().to_concrete(), move |grad, out| {
+            (grad * out).to_concrete().mul_scalar(std::f32::consts::LN_2).to_concrete()
+        })
+    }
+
+    pub fn less_approximate_exp(&self) -> Self {
+        self.unary_from_value(self.value.less_approximate_exp().to_concrete(), move |grad, out| {
+            (grad * out).to_concrete()
+        })
+    }
+
+    pub fn log2(&self) -> Self {
+        let input = self.value.clone();
+        self.unary_from_value(self.value.log2().to_concrete(), move |grad, _| {
+            (grad / input.clone()).to_concrete().div_scalar(std::f32::consts::LN_2).to_concrete()
+        })
+    }
+
+    pub fn sin(&self) -> Self {
+        let input = self.value.clone();
+        self.unary_from_value(self.value.sin().to_concrete(), move |grad, _| {
+            (grad * input.cos().to_concrete()).to_concrete()
+        })
+    }
+
+    pub fn sinh(&self) -> Self {
+        let input = self.value.clone();
+        self.unary_from_value(self.value.sinh().to_concrete(), move |grad, _| {
+            (grad * input.cosh().to_concrete()).to_concrete()
+        })
+    }
+
+    pub fn tan(&self) -> Self {
+        let input = self.value.clone();
+        self.unary_from_value(self.value.tan().to_concrete(), move |grad, _| {
+            let cos = input.cos().to_concrete();
+            (grad / (cos.clone() * cos).to_concrete()).to_concrete()
+        })
+    }
+
+    pub fn tanh_exact(&self) -> Self {
+        self.unary_from_value(self.value.tanh_exact().to_concrete(), move |grad, out| {
+            let one_minus_sq = (RawTensor::splat(&out.device(), 1.0, out.shape())
+                - out.sqr().to_concrete())
+            .to_concrete();
+            (grad * one_minus_sq).to_concrete()
+        })
+    }
+
+    pub fn cast<D2>(&self) -> crate::Tensor<R, D2>
+    where
+        f32: crate::CastTo<D2> + crate::CastTensor<D2>,
+        D2: crate::SimdElement + crate::DataType + Default,
+    {
+        self.value.cast()
+    }
+
     pub fn relu(&self) -> Self {
         let output = self.value.max_scalar(0.0).to_concrete();
         self.unary_from_value(output.clone(), move |grad, out| {
             let zeros = RawTensor::zeros(&out.device(), out.shape());
             let ones = RawTensor::splat(&out.device(), 1.0, out.shape());
             (grad * out.where_cond(&ones, &zeros)).to_concrete()
+        })
+    }
+
+    pub fn clamp(&self, min: f32, max: f32) -> Self {
+        let input = self.value.clone();
+        self.unary_from_value(self.value.clamp(min, max).to_concrete(), move |grad, _| {
+            let lower = input.mt(min).to_concrete();
+            let upper = input.lt(max).to_concrete();
+            ((grad * lower).to_concrete() * upper).to_concrete()
+        })
+    }
+
+    pub fn eq(&self, rhs: f32) -> Self {
+        self.unary_from_value(self.value.eq(rhs).to_concrete(), move |_, out| {
+            RawTensor::zeros(&out.device(), out.shape())
+        })
+    }
+
+    pub fn eq_scalar(&self, rhs: f32) -> Self {
+        self.eq(rhs)
+    }
+
+    pub fn eq_tensor(&self, rhs: &Self) -> Self {
+        assert_same_graph(self, rhs);
+        self.binary_op(rhs, self.value.eq_tensor(&rhs.value).to_concrete(), move |_, lhs, rhs| {
+            vec![
+                RawTensor::zeros(&lhs.device(), lhs.shape()),
+                RawTensor::zeros(&rhs.device(), rhs.shape()),
+            ]
+        })
+    }
+
+    pub fn gt_scalar(&self, rhs: f32) -> Self {
+        self.unary_from_value(self.value.gt_scalar(rhs).to_concrete(), move |_, out| {
+            RawTensor::zeros(&out.device(), out.shape())
+        })
+    }
+
+    pub fn gt_tensor(&self, rhs: &Self) -> Self {
+        assert_same_graph(self, rhs);
+        self.binary_op(rhs, self.value.gt_tensor(&rhs.value).to_concrete(), move |_, lhs, rhs| {
+            vec![
+                RawTensor::zeros(&lhs.device(), lhs.shape()),
+                RawTensor::zeros(&rhs.device(), rhs.shape()),
+            ]
+        })
+    }
+
+    pub fn gte_scalar(&self, rhs: f32) -> Self {
+        self.unary_from_value(self.value.gte_scalar(rhs).to_concrete(), move |_, out| {
+            RawTensor::zeros(&out.device(), out.shape())
+        })
+    }
+
+    pub fn gte_tensor(&self, rhs: &Self) -> Self {
+        assert_same_graph(self, rhs);
+        self.binary_op(rhs, self.value.gte_tensor(&rhs.value).to_concrete(), move |_, lhs, rhs| {
+            vec![
+                RawTensor::zeros(&lhs.device(), lhs.shape()),
+                RawTensor::zeros(&rhs.device(), rhs.shape()),
+            ]
+        })
+    }
+
+    pub fn lt(&self, rhs: f32) -> Self {
+        self.unary_from_value(self.value.lt(rhs).to_concrete(), move |_, out| {
+            RawTensor::zeros(&out.device(), out.shape())
+        })
+    }
+
+    pub fn lt_scalar(&self, rhs: f32) -> Self {
+        self.lt(rhs)
+    }
+
+    pub fn lt_tensor(&self, rhs: &Self) -> Self {
+        assert_same_graph(self, rhs);
+        self.binary_op(rhs, self.value.lt_tensor(&rhs.value).to_concrete(), move |_, lhs, rhs| {
+            vec![
+                RawTensor::zeros(&lhs.device(), lhs.shape()),
+                RawTensor::zeros(&rhs.device(), rhs.shape()),
+            ]
+        })
+    }
+
+    pub fn lte(&self, rhs: f32) -> Self {
+        self.unary_from_value(self.value.lte(rhs).to_concrete(), move |_, out| {
+            RawTensor::zeros(&out.device(), out.shape())
+        })
+    }
+
+    pub fn lte_scalar(&self, rhs: f32) -> Self {
+        self.lte(rhs)
+    }
+
+    pub fn lte_tensor(&self, rhs: &Self) -> Self {
+        assert_same_graph(self, rhs);
+        self.binary_op(rhs, self.value.lte_tensor(&rhs.value).to_concrete(), move |_, lhs, rhs| {
+            vec![
+                RawTensor::zeros(&lhs.device(), lhs.shape()),
+                RawTensor::zeros(&rhs.device(), rhs.shape()),
+            ]
+        })
+    }
+
+    pub fn max_elementwise(&self, rhs: f32) -> Self {
+        let input = self.value.clone();
+        self.unary_from_value(self.value.max_elementwise(rhs).to_concrete(), move |grad, _| {
+            (grad * input.mt(rhs).to_concrete()).to_concrete()
+        })
+    }
+
+    pub fn max_scalar(&self, rhs: f32) -> Self {
+        self.max_elementwise(rhs)
+    }
+
+    pub fn min_elementwise(&self, rhs: f32) -> Self {
+        let input = self.value.clone();
+        self.unary_from_value(self.value.min_elementwise(rhs).to_concrete(), move |grad, _| {
+            (grad * input.lt(rhs).to_concrete()).to_concrete()
+        })
+    }
+
+    pub fn min_scalar(&self, rhs: f32) -> Self {
+        self.min_elementwise(rhs)
+    }
+
+    pub fn mt(&self, rhs: f32) -> Self {
+        self.gt_scalar(rhs)
+    }
+
+    pub fn mte(&self, rhs: f32) -> Self {
+        self.gte_scalar(rhs)
+    }
+
+    pub fn ne(&self, rhs: f32) -> Self {
+        self.unary_from_value(self.value.ne(rhs).to_concrete(), move |_, out| {
+            RawTensor::zeros(&out.device(), out.shape())
+        })
+    }
+
+    pub fn ne_scalar(&self, rhs: f32) -> Self {
+        self.ne(rhs)
+    }
+
+    pub fn ne_tensor(&self, rhs: &Self) -> Self {
+        assert_same_graph(self, rhs);
+        self.binary_op(rhs, self.value.ne_tensor(&rhs.value).to_concrete(), move |_, lhs, rhs| {
+            vec![
+                RawTensor::zeros(&lhs.device(), lhs.shape()),
+                RawTensor::zeros(&rhs.device(), rhs.shape()),
+            ]
         })
     }
 
@@ -610,6 +990,22 @@ impl<const R: usize> Tensor<R> {
             }
         });
         self.slice(slices)
+    }
+
+    pub fn chunk(&self, chunks: usize, dim: impl Dim<R>) -> Vec<Self> {
+        let dim = dim.resolve();
+        let shape = self.shape();
+        let dim_size = shape[dim];
+        let chunk_size = dim_size.div_ceil(chunks);
+
+        let mut result = Vec::with_capacity(chunks);
+        let mut start = 0;
+        while start < dim_size {
+            let length = chunk_size.min(dim_size - start);
+            result.push(self.narrow(dim, start, length));
+            start += length;
+        }
+        result
     }
 
     pub fn repeat(&self, repeats: [usize; R]) -> Self {
@@ -1039,6 +1435,15 @@ impl<const R: usize> Tensor<R> {
         )
     }
 
+    pub fn matmul(&self, rhs: &Self) -> Self {
+        self.mat_mul_internal(rhs)
+    }
+
+    pub fn t(&self) -> Self {
+        assert!(R >= 2, "t requires rank >= 2");
+        self.transpose(R - 2, R - 1)
+    }
+
     fn sum_keepdim_any<const OUT_RANK: usize>(&self, axis: usize) -> Self
     where
         crate::ConcreteTensor<f32, R>: fusor_cpu::LastRank<OUT_RANK, f32>,
@@ -1118,6 +1523,58 @@ impl<const R: usize> Tensor<R> {
             .div_scalar(self.shape()[axis] as f32)
     }
 
+    fn product_keepdim_any<const OUT_RANK: usize>(&self, axis: usize) -> Self
+    where
+        crate::ConcreteTensor<f32, R>: fusor_cpu::LastRank<OUT_RANK, f32>,
+        fusor_core::Tensor<R, f32>: fusor_core::LastRank<OUT_RANK, f32>,
+        fusor_cpu::ProdOp: fusor_cpu::SimdReduceOp<f32>,
+        fusor_cpu::SumOp: fusor_cpu::SimdReduceOp<f32>,
+        fusor_cpu::EqOp: fusor_cpu::SimdBinaryOp<f32>,
+    {
+        let input = self.value.clone();
+        let input_shape = self.shape();
+        let value = input.product_keepdim::<OUT_RANK>(axis).to_concrete();
+        let input_id = self.handle.id;
+        let backward: BackwardRule = Arc::new(move |gradient| {
+            let gradient = downcast_tensor::<R>(&*gradient, "product_keepdim")?;
+            let upstream = gradient.broadcast_as(input_shape).to_concrete();
+            let zeros = RawTensor::zeros(&input.device(), input_shape);
+            let ones = RawTensor::splat(&input.device(), 1.0, input_shape);
+            let zero_mask = input.eq(0.0).to_concrete();
+            let safe_input = zero_mask.where_cond(&ones, &input).to_concrete();
+            let zero_count = zero_mask.sum_keepdim::<OUT_RANK>(axis).to_concrete();
+            let zero_count_broadcast = zero_count.broadcast_as(input_shape).to_concrete();
+            let product_non_zero = safe_input
+                .product_keepdim::<OUT_RANK>(axis)
+                .broadcast_as(input_shape)
+                .to_concrete();
+            let no_zero_grad = (upstream.clone() * (product_non_zero.clone() / safe_input).to_concrete())
+                .to_concrete();
+            let single_zero_grad = zero_mask
+                .where_cond(&(upstream * product_non_zero).to_concrete(), &zeros)
+                .to_concrete();
+            let gradient = ((no_zero_grad * zero_count_broadcast.eq(0.0).to_concrete()).to_concrete()
+                + (single_zero_grad * zero_count_broadcast.eq(1.0).to_concrete()).to_concrete())
+            .to_concrete();
+            Ok(vec![BackwardTarget {
+                node: input_id,
+                gradient: Box::new(gradient),
+            }])
+        });
+        self.from_op(value, vec![self.handle.clone()], Some(backward))
+    }
+
+    fn var_keepdim_any<const OUT_RANK: usize>(&self, axis: usize) -> Self
+    where
+        crate::ConcreteTensor<f32, R>: fusor_cpu::LastRank<OUT_RANK, f32>,
+        fusor_core::Tensor<R, f32>: fusor_core::LastRank<OUT_RANK, f32>,
+        fusor_cpu::SumOp: fusor_cpu::SimdReduceOp<f32>,
+    {
+        let mean = self.mean_keepdim_any::<OUT_RANK>(axis);
+        let centered = self.sub(&mean.broadcast_as(self.shape()));
+        centered.sqr().mean_keepdim_any::<OUT_RANK>(axis)
+    }
+
     fn softmax_composite<const OUT_RANK: usize>(&self, axis: usize) -> Self
     where
         crate::ConcreteTensor<f32, R>: fusor_cpu::LastRank<OUT_RANK, f32>,
@@ -1186,6 +1643,167 @@ impl<const R: usize> Tensor<R> {
         }
     }
 
+    pub fn pool<const DIFF: usize, const R2: usize, const R3: usize, const O: usize>(
+        &self,
+        pools: [impl Into<crate::composite::pool::PoolSize>; DIFF],
+        with: impl Fn(&Tensor<O>, usize) -> Self + Copy,
+    ) -> Self
+    where
+        crate::ConcreteTensor<f32, R>: fusor_cpu::LargerRank<R2, DIFF, f32>,
+        fusor_core::Tensor<R, f32>: fusor_core::LargerRank<DIFF, R2, f32>,
+        crate::ConcreteTensor<f32, R2>: fusor_cpu::LargerRank<R3, 1, f32>,
+        fusor_core::Tensor<R2, f32>: fusor_core::LargerRank<1, R3, f32>,
+        fusor_core::Tensor<R3, f32>: fusor_core::SmallerRank<DIFF, O, f32>,
+    {
+        let pools: [crate::composite::pool::PoolSize; DIFF] = pools.map(|pool| pool.into());
+        let axis_start = R - DIFF;
+        let windows: [SlidingWindow; DIFF] = std::array::from_fn(|i| {
+            let pool = pools[i];
+            SlidingWindow::new(axis_start + i, pool.size, pool.stride)
+        });
+        let shape = self.shape();
+        let mut sorted_windows = windows;
+        sorted_windows.sort_by_key(|window| window.axis);
+        let specs: [StrideSpec; R2] = std::array::from_fn(|out_i| {
+            if out_i < R {
+                if let Some(window) = sorted_windows.iter().find(|window| window.axis == out_i) {
+                    let positions = (shape[out_i] - window.window_size) / window.step + 1;
+                    StrideSpec::dim_with(out_i, positions, window.step)
+                } else {
+                    StrideSpec::dim(out_i, shape[out_i])
+                }
+            } else {
+                let window = &sorted_windows[out_i - R];
+                StrideSpec::dim(window.axis, window.window_size)
+            }
+        });
+
+        let tiled: Tensor<R2> = self.restride(specs);
+        let unsqueezed: Tensor<R3> = tiled.unsqueeze_dims::<1, R3>([R2]);
+        let flattened: Tensor<O> = unsqueezed.flatten_last_n::<DIFF, O>();
+        with(&flattened, O - 1)
+    }
+
+    pub fn pool_max<const DIFF: usize, const R2: usize, const R3: usize, const O: usize>(
+        &self,
+        pools: [impl Into<crate::composite::pool::PoolSize>; DIFF],
+    ) -> Self
+    where
+        crate::ConcreteTensor<f32, R>: fusor_cpu::LargerRank<R2, DIFF, f32>,
+        fusor_core::Tensor<R, f32>: fusor_core::LargerRank<DIFF, R2, f32>,
+        crate::ConcreteTensor<f32, R2>: fusor_cpu::LargerRank<R3, 1, f32>,
+        fusor_core::Tensor<R2, f32>: fusor_core::LargerRank<1, R3, f32>,
+        fusor_core::Tensor<R3, f32>: fusor_core::SmallerRank<DIFF, O, f32>,
+        crate::ConcreteTensor<f32, O>: fusor_cpu::LastRank<R, f32>,
+        fusor_core::Tensor<O, f32>:
+            fusor_core::LastRank<R, f32> + fusor_core::SmallerRank<1, R, f32>,
+        fusor_cpu::MaxOp: fusor_cpu::SimdReduceOp<f32>,
+        fusor_cpu::SumOp: fusor_cpu::SimdReduceOp<f32>,
+    {
+        self.pool::<DIFF, R2, R3, O>(pools, |windowed, axis| windowed.max::<R>(axis))
+    }
+
+    pub fn pool_min<const DIFF: usize, const R2: usize, const R3: usize, const O: usize>(
+        &self,
+        pools: [impl Into<crate::composite::pool::PoolSize>; DIFF],
+    ) -> Self
+    where
+        crate::ConcreteTensor<f32, R>: fusor_cpu::LargerRank<R2, DIFF, f32>,
+        fusor_core::Tensor<R, f32>: fusor_core::LargerRank<DIFF, R2, f32>,
+        crate::ConcreteTensor<f32, R2>: fusor_cpu::LargerRank<R3, 1, f32>,
+        fusor_core::Tensor<R2, f32>: fusor_core::LargerRank<1, R3, f32>,
+        fusor_core::Tensor<R3, f32>: fusor_core::SmallerRank<DIFF, O, f32>,
+        crate::ConcreteTensor<f32, O>: fusor_cpu::LastRank<R, f32>,
+        fusor_core::Tensor<O, f32>:
+            fusor_core::LastRank<R, f32> + fusor_core::SmallerRank<1, R, f32>,
+        fusor_cpu::MinOp: fusor_cpu::SimdReduceOp<f32>,
+        fusor_cpu::SumOp: fusor_cpu::SimdReduceOp<f32>,
+    {
+        self.pool::<DIFF, R2, R3, O>(pools, |windowed, axis| windowed.min::<R>(axis))
+    }
+
+    pub fn q_mat_mul(&self, weights: &crate::QMatrix) -> Self {
+        assert!(R >= 2, "q_mat_mul requires rank >= 2");
+        let value = self.value.q_mat_mul(weights).to_concrete();
+        let dequantized: RawTensor<2, f32> = weights.dequantize();
+        let n = weights.shape()[0];
+        let k = weights.shape()[1];
+        let batch_dims = R - 2;
+        let weight_shape: [usize; R] = std::array::from_fn(|i| {
+            if i < batch_dims {
+                1
+            } else if i == batch_dims {
+                k
+            } else {
+                n
+            }
+        });
+        let weight = dequantized.transpose(0, 1).reshape(weight_shape).to_concrete();
+        self.replay_unary("q_mat_mul", value, move |input| {
+            let weight = Tensor::constant_from_raw(&input.graph(), weight.clone());
+            input.mat_mul_internal(&weight)
+        })
+    }
+
+    pub fn stack<const OUT: usize>(tensors: impl IntoIterator<Item = Self>, dim: usize) -> Tensor<OUT>
+    where
+        crate::ConcreteTensor<f32, R>: fusor_cpu::LargerRank<OUT, 1, f32>,
+        fusor_core::Tensor<R, f32>: fusor_core::LargerRank<1, OUT, f32>,
+    {
+        let tensors: Vec<Self> = tensors.into_iter().collect();
+        assert!(!tensors.is_empty(), "stack requires at least one tensor");
+
+        let graph = tensors[0].handle.graph.clone();
+        let input_shape = tensors[0].shape();
+        let raw = tensors
+            .iter()
+            .map(|tensor| {
+                assert!(
+                    Arc::ptr_eq(&graph, &tensor.handle.graph),
+                    "cannot mix autograd tensors from different graphs"
+                );
+                assert_eq!(tensor.shape(), input_shape, "stack requires matching shapes");
+                tensor.value.unsqueeze_dims::<1, OUT>([dim]).to_concrete()
+            })
+            .collect::<Vec<_>>();
+        let value = RawTensor::cat(raw, dim);
+        let parents = tensors
+            .iter()
+            .map(|tensor| tensor.handle.clone())
+            .collect::<Vec<_>>();
+        let parent_ids = parents.iter().map(|parent| parent.id).collect::<Vec<_>>();
+        let backward: BackwardRule = Arc::new(move |gradient| {
+            let gradient = downcast_tensor::<OUT>(&*gradient, "stack")?;
+            let mut targets = Vec::with_capacity(parent_ids.len());
+            for (index, &parent_id) in parent_ids.iter().enumerate() {
+                let slices: [Range<usize>; OUT] = std::array::from_fn(|axis| {
+                    if axis == dim {
+                        index..index + 1
+                    } else {
+                        0..gradient.shape()[axis]
+                    }
+                });
+                let grad = gradient.slice(slices).reshape(input_shape).to_concrete();
+                targets.push(BackwardTarget {
+                    node: parent_id,
+                    gradient: Box::new(grad),
+                });
+            }
+            Ok(targets)
+        });
+        let id = graph.add_node(
+            parents.iter().map(|parent| parent.id).collect(),
+            Some(backward),
+            parents
+                .iter()
+                .any(|parent| parent.graph.requires_grad(parent.id)),
+        );
+        Tensor {
+            value,
+            handle: NodeHandle { graph, id },
+        }
+    }
+
     pub fn max_keepdim<const OUT_RANK: usize>(&self, axis: usize) -> Self
     where
         crate::ConcreteTensor<f32, R>: fusor_cpu::LastRank<OUT_RANK, f32>,
@@ -1218,6 +1836,18 @@ impl<const R: usize> Tensor<R> {
         self.min_keepdim_any::<OUT_RANK>(axis)
     }
 
+    pub fn min<const OUT_RANK: usize>(&self, axis: usize) -> Tensor<OUT_RANK>
+    where
+        crate::ConcreteTensor<f32, R>: fusor_cpu::LastRank<OUT_RANK, f32>,
+        fusor_core::Tensor<R, f32>:
+            fusor_core::LastRank<OUT_RANK, f32> + fusor_core::SmallerRank<1, OUT_RANK, f32>,
+        fusor_cpu::MinOp: fusor_cpu::SimdReduceOp<f32>,
+        fusor_cpu::SumOp: fusor_cpu::SimdReduceOp<f32>,
+    {
+        self.min_keepdim_any::<OUT_RANK>(axis)
+            .squeeze_dims::<1, OUT_RANK>([axis])
+    }
+
     pub fn mean_keepdim<const OUT_RANK: usize>(&self, axis: usize) -> Self
     where
         crate::ConcreteTensor<f32, R>: fusor_cpu::LastRank<OUT_RANK, f32>,
@@ -1225,6 +1855,61 @@ impl<const R: usize> Tensor<R> {
         fusor_cpu::SumOp: fusor_cpu::SimdReduceOp<f32>,
     {
         self.mean_keepdim_any::<OUT_RANK>(axis)
+    }
+
+    pub fn mean<const OUT_RANK: usize>(&self, axis: usize) -> Tensor<OUT_RANK>
+    where
+        crate::ConcreteTensor<f32, R>: fusor_cpu::LastRank<OUT_RANK, f32>,
+        fusor_core::Tensor<R, f32>:
+            fusor_core::LastRank<OUT_RANK, f32> + fusor_core::SmallerRank<1, OUT_RANK, f32>,
+        fusor_cpu::SumOp: fusor_cpu::SimdReduceOp<f32>,
+    {
+        self.mean_keepdim_any::<OUT_RANK>(axis)
+            .squeeze_dims::<1, OUT_RANK>([axis])
+    }
+
+    pub fn product<const OUT_RANK: usize>(&self, axis: usize) -> Tensor<OUT_RANK>
+    where
+        crate::ConcreteTensor<f32, R>: fusor_cpu::LastRank<OUT_RANK, f32>,
+        fusor_core::Tensor<R, f32>:
+            fusor_core::LastRank<OUT_RANK, f32> + fusor_core::SmallerRank<1, OUT_RANK, f32>,
+        fusor_cpu::ProdOp: fusor_cpu::SimdReduceOp<f32>,
+        fusor_cpu::SumOp: fusor_cpu::SimdReduceOp<f32>,
+        fusor_cpu::EqOp: fusor_cpu::SimdBinaryOp<f32>,
+    {
+        self.product_keepdim_any::<OUT_RANK>(axis)
+            .squeeze_dims::<1, OUT_RANK>([axis])
+    }
+
+    pub fn product_keepdim<const OUT_RANK: usize>(&self, axis: usize) -> Self
+    where
+        crate::ConcreteTensor<f32, R>: fusor_cpu::LastRank<OUT_RANK, f32>,
+        fusor_core::Tensor<R, f32>: fusor_core::LastRank<OUT_RANK, f32>,
+        fusor_cpu::ProdOp: fusor_cpu::SimdReduceOp<f32>,
+        fusor_cpu::SumOp: fusor_cpu::SimdReduceOp<f32>,
+        fusor_cpu::EqOp: fusor_cpu::SimdBinaryOp<f32>,
+    {
+        self.product_keepdim_any::<OUT_RANK>(axis)
+    }
+
+    pub fn var<const OUT_RANK: usize>(&self, axis: usize) -> Tensor<OUT_RANK>
+    where
+        crate::ConcreteTensor<f32, R>: fusor_cpu::LastRank<OUT_RANK, f32>,
+        fusor_core::Tensor<R, f32>:
+            fusor_core::LastRank<OUT_RANK, f32> + fusor_core::SmallerRank<1, OUT_RANK, f32>,
+        fusor_cpu::SumOp: fusor_cpu::SimdReduceOp<f32>,
+    {
+        self.var_keepdim_any::<OUT_RANK>(axis)
+            .squeeze_dims::<1, OUT_RANK>([axis])
+    }
+
+    pub fn var_keepdim<const OUT_RANK: usize>(&self, axis: usize) -> Self
+    where
+        crate::ConcreteTensor<f32, R>: fusor_cpu::LastRank<OUT_RANK, f32>,
+        fusor_core::Tensor<R, f32>: fusor_core::LastRank<OUT_RANK, f32>,
+        fusor_cpu::SumOp: fusor_cpu::SimdReduceOp<f32>,
+    {
+        self.var_keepdim_any::<OUT_RANK>(axis)
     }
 
     pub fn softmax<const OUT_RANK: usize>(&self, axis: usize) -> Self
@@ -1237,6 +1922,16 @@ impl<const R: usize> Tensor<R> {
         self.softmax_composite::<OUT_RANK>(axis)
     }
 
+    pub fn softmax_slow<const OUT_RANK: usize>(&self, axis: usize) -> Self
+    where
+        crate::ConcreteTensor<f32, R>: fusor_cpu::LastRank<OUT_RANK, f32>,
+        fusor_core::Tensor<R, f32>: fusor_core::LastRank<OUT_RANK, f32>,
+        fusor_cpu::MaxOp: fusor_cpu::SimdReduceOp<f32>,
+        fusor_cpu::SumOp: fusor_cpu::SimdReduceOp<f32>,
+    {
+        self.softmax::<OUT_RANK>(axis)
+    }
+
     pub fn softmax_last_dim<const OUT_RANK: usize>(&self) -> Self
     where
         crate::ConcreteTensor<f32, R>: fusor_cpu::LastRank<OUT_RANK, f32>,
@@ -1245,6 +1940,16 @@ impl<const R: usize> Tensor<R> {
         fusor_cpu::SumOp: fusor_cpu::SimdReduceOp<f32>,
     {
         self.softmax::<OUT_RANK>(R - 1)
+    }
+
+    pub fn softmax_slow_last_dim<const OUT_RANK: usize>(&self) -> Self
+    where
+        crate::ConcreteTensor<f32, R>: fusor_cpu::LastRank<OUT_RANK, f32>,
+        fusor_core::Tensor<R, f32>: fusor_core::LastRank<OUT_RANK, f32>,
+        fusor_cpu::MaxOp: fusor_cpu::SimdReduceOp<f32>,
+        fusor_cpu::SumOp: fusor_cpu::SimdReduceOp<f32>,
+    {
+        self.softmax_last_dim::<OUT_RANK>()
     }
 
     pub fn softmax_last_dim_fused<const OUT_RANK: usize>(&self) -> Self
@@ -1369,6 +2074,14 @@ impl<const R: usize> Tensor<R> {
 }
 
 impl Tensor<1> {
+    pub fn arange(graph: &Graph, device: &Device, start: f32, end: f32) -> Tensor<1> {
+        graph.leaf(crate::arange(device, start, end))
+    }
+
+    pub fn arange_step(graph: &Graph, device: &Device, start: f32, end: f32, step: f32) -> Tensor<1> {
+        graph.leaf(crate::arange_step(device, start, end, step))
+    }
+
     pub fn sum(&self) -> Tensor<0> {
         let input_shape = self.shape();
         let value = self.value.sum::<0>(0);
@@ -1888,6 +2601,58 @@ impl Tensor<3> {
 }
 
 impl Tensor<4> {
+    fn rotate_half(&self) -> Tensor<4> {
+        let [batch, heads, sequence_length, embed] = self.shape();
+        let half = embed / 2;
+        let first_half = self.narrow(3, 0, half);
+        let second_half = self.narrow(3, half, embed - half).mul_scalar(-1.0);
+        let graph = self.graph();
+        let device = self.device();
+        let zeros = Tensor::zeros(&graph, &device, [batch, heads, sequence_length, embed]);
+        let combined = zeros.slice_assign(
+            [0..batch, 0..heads, 0..sequence_length, 0..half],
+            &second_half,
+        );
+        combined.slice_assign(
+            [0..batch, 0..heads, 0..sequence_length, half..embed],
+            &first_half,
+        )
+    }
+
+    fn rope_interleaved_composite(&self, cos: &Tensor<2>, sin: &Tensor<2>) -> Tensor<4> {
+        assert_same_graph(self, cos);
+        assert_same_graph(self, sin);
+
+        let [batch, heads, sequence_length, embed] = self.shape();
+        let half = embed / 2;
+        let cos = cos
+            .narrow(0, 0, sequence_length)
+            .reshape([sequence_length, half, 1])
+            .broadcast_as([batch, 1, sequence_length, half, 1]);
+        let sin = sin
+            .narrow(0, 0, sequence_length)
+            .reshape([sequence_length, half, 1])
+            .broadcast_as([batch, 1, sequence_length, half, 1]);
+        let x = self.reshape([batch, heads, sequence_length, half, 2]);
+        let x0 = x.narrow(4, 0, 1);
+        let x1 = x.narrow(4, 1, 1);
+        let y0 = x0.mul(&cos).sub(&x1.mul(&sin));
+        let y1 = x0.mul(&sin).add(&x1.mul(&cos));
+        let graph = self.graph();
+        let device = self.device();
+        let zeros = Tensor::zeros(&graph, &device, [batch, heads, sequence_length, half, 2]);
+        let combined = zeros.slice_assign(
+            [0..batch, 0..heads, 0..sequence_length, 0..half, 0..1],
+            &y0,
+        );
+        combined
+            .slice_assign(
+                [0..batch, 0..heads, 0..sequence_length, 0..half, 1..2],
+                &y1,
+            )
+            .flatten_last_n::<1, 4>()
+    }
+
     pub fn sum(&self, axis: usize) -> Tensor<3> {
         let input_shape = self.shape();
         let value = self.value.sum::<3>(axis).to_concrete();
@@ -1907,6 +2672,34 @@ impl Tensor<4> {
         self.from_op(value, vec![self.handle.clone()], Some(backward))
     }
 
+    pub fn rope(&self, cos: &Tensor<2>, sin: &Tensor<2>) -> Tensor<4> {
+        assert_same_graph(self, cos);
+        assert_same_graph(self, sin);
+
+        let [batch, heads, sequence_length, embed] = self.shape();
+        let half = embed / 2;
+        let graph = self.graph();
+        let device = self.device();
+        let cos_base = cos.narrow(0, 0, sequence_length);
+        let sin_base = sin.narrow(0, 0, sequence_length);
+        let cos = Tensor::zeros(&graph, &device, [sequence_length, embed])
+            .slice_assign([0..sequence_length, 0..half], &cos_base)
+            .slice_assign([0..sequence_length, half..embed], &cos_base)
+            .unsqueeze_dims::<2, 4>([0, 1])
+            .broadcast_as([batch, heads, sequence_length, embed]);
+        let sin = Tensor::zeros(&graph, &device, [sequence_length, embed])
+            .slice_assign([0..sequence_length, 0..half], &sin_base)
+            .slice_assign([0..sequence_length, half..embed], &sin_base)
+            .unsqueeze_dims::<2, 4>([0, 1])
+            .broadcast_as([batch, heads, sequence_length, embed]);
+        let rotated = self.rotate_half();
+        self.mul(&cos).add(&rotated.mul(&sin))
+    }
+
+    pub fn rope_interleaved(&self, cos: &Tensor<2>, sin: &Tensor<2>) -> Tensor<4> {
+        self.rope_interleaved_composite(cos, sin)
+    }
+
     pub fn flash_attention(
         &self,
         k: &Tensor<4>,
@@ -1923,6 +2716,29 @@ impl Tensor<4> {
         let mask_value = mask.map(|(mask, kind)| (mask.clone(), kind));
         self.replay_ternary(k, v, "flash_attention", value, move |q, k, v| {
             q.flash_attention_composite(&k, &v, scale, mask_value.as_ref())
+        })
+    }
+
+    pub fn rope_fused(&self, cos: &Tensor<2>, sin: &Tensor<2>) -> Tensor<4> {
+        assert_same_graph(self, cos);
+        assert_same_graph(self, sin);
+
+        let value = self.value.rope_fused(&cos.value, &sin.value).to_concrete();
+        self.replay_ternary(cos, sin, "rope_fused", value, |input, cos, sin| {
+            input.rope_interleaved_composite(&cos, &sin)
+        })
+    }
+
+    pub fn rope_normal_fused(&self, cos: &Tensor<2>, sin: &Tensor<2>) -> Tensor<4> {
+        assert_same_graph(self, cos);
+        assert_same_graph(self, sin);
+
+        let value = self
+            .value
+            .rope_normal_fused(&cos.value, &sin.value)
+            .to_concrete();
+        self.replay_ternary(cos, sin, "rope_normal_fused", value, |input, cos, sin| {
+            input.rope(&cos, &sin)
         })
     }
 
@@ -2456,82 +3272,43 @@ fn reduce_broadcast_gradient<const IN: usize, const OUT: usize>(
     gradient: RawTensor<OUT, f32>,
     input_shape: [usize; IN],
 ) -> Result<Box<dyn AnyTensorValue>> {
-    match (IN, OUT) {
-        (1, 1) => Ok(Box::new(reduce_same_rank_broadcast_1(
-            gradient.reshape([gradient.shape()[0]]).to_concrete(),
-            [input_shape[0]],
-        ))),
-        (2, 2) => Ok(Box::new(reduce_same_rank_broadcast_2(
-            gradient
-                .reshape([gradient.shape()[0], gradient.shape()[1]])
-                .to_concrete(),
-            [input_shape[0], input_shape[1]],
-        ))),
-        (3, 3) => Ok(Box::new(reduce_same_rank_broadcast_3(
-            gradient
-                .reshape([
-                    gradient.shape()[0],
-                    gradient.shape()[1],
-                    gradient.shape()[2],
-                ])
-                .to_concrete(),
-            [input_shape[0], input_shape[1], input_shape[2]],
-        ))),
-        (4, 4) => Ok(Box::new(reduce_same_rank_broadcast_4(
-            gradient
-                .reshape([
-                    gradient.shape()[0],
-                    gradient.shape()[1],
-                    gradient.shape()[2],
-                    gradient.shape()[3],
-                ])
-                .to_concrete(),
-            [
-                input_shape[0],
-                input_shape[1],
-                input_shape[2],
-                input_shape[3],
-            ],
-        ))),
-        (1, 2) => {
-            let reduced = reduce_to_1_from_2(
-                gradient
-                    .reshape([gradient.shape()[0], gradient.shape()[1]])
-                    .to_concrete(),
-                input_shape[0],
-            );
-            Ok(Box::new(reduced))
-        }
-        (1, 3) => {
-            let reduced = reduce_to_1_from_3(
-                gradient
-                    .reshape([
-                        gradient.shape()[0],
-                        gradient.shape()[1],
-                        gradient.shape()[2],
-                    ])
-                    .to_concrete(),
-                input_shape[0],
-            );
-            Ok(Box::new(reduced))
-        }
-        (2, 3) => {
-            let reduced = reduce_to_2_from_3(
-                gradient
-                    .reshape([
-                        gradient.shape()[0],
-                        gradient.shape()[1],
-                        gradient.shape()[2],
-                    ])
-                    .to_concrete(),
-                [input_shape[0], input_shape[1]],
-            );
-            Ok(Box::new(reduced))
-        }
-        _ => Err(Error::msg(
-            "unsupported broadcast gradient rank combination",
-        )),
+    let output_shape = gradient.shape();
+    let mut aligned_input_shape = [1usize; OUT];
+    for axis in 0..IN {
+        aligned_input_shape[OUT - IN + axis] = input_shape[axis];
     }
+
+    for axis in 0..OUT {
+        let output_dim = output_shape[axis];
+        let input_dim = aligned_input_shape[axis];
+        if input_dim != 1 && input_dim != output_dim {
+            return Err(Error::msg("incompatible broadcast gradient shape"));
+        }
+    }
+
+    let mut reduced = RawTensor::zeros(&gradient.device(), input_shape);
+    for_each_index(output_shape, |output_index| {
+        let mut input_index = [0usize; IN];
+        for axis in 0..IN {
+            let output_axis = OUT - IN + axis;
+            input_index[axis] = if input_shape[axis] == 1 {
+                0
+            } else {
+                output_index[output_axis]
+            };
+        }
+
+        let output_slices: [Range<usize>; OUT] =
+            std::array::from_fn(|axis| output_index[axis]..output_index[axis] + 1);
+        let input_slices: [Range<usize>; IN] =
+            std::array::from_fn(|axis| input_index[axis]..input_index[axis] + 1);
+        let patch = gradient.slice(output_slices).reshape([1]).to_concrete();
+        let current = reduced.slice(input_slices.clone()).reshape([1]).to_concrete();
+        let updated = (current + patch).reshape([1usize; IN]).to_concrete();
+        reduced = reduced.slice_assign(input_slices, &updated).to_concrete();
+    });
+
+    Ok(Box::new(reduced))
 }
 
 fn reduce_same_rank_broadcast_1(
@@ -2753,7 +3530,7 @@ mod tests {
 
         let output = condition.where_cond(&on_true, &on_false);
         let output_values = output.raw().clone().as_slice().await.unwrap().to_vec1();
-        let gradients = output.sum().backward().unwrap();
+        let gradients = output.flatten_all().sum().backward().unwrap();
 
         let dcondition = gradients
             .get(&condition)
@@ -2875,7 +3652,7 @@ mod tests {
 
         let output = input.flatten_all();
         let output_values = output.raw().clone().as_slice().await.unwrap().to_vec1();
-        let gradients = output.sum().backward().unwrap();
+        let gradients = output.flatten_all().sum().backward().unwrap();
         let dinput = gradients
             .get(&input)
             .unwrap()
@@ -3173,6 +3950,1801 @@ mod tests {
 
         assert_eq!(output_values, vec![5.0, 4.0]);
         assert_eq!(dinput, vec![vec![0.0, 0.5, 0.5], vec![1.0, 0.0, 0.0]]);
+    }
+
+    #[tokio::test]
+    async fn test_backward_min_cpu() {
+        let graph = Graph::new();
+        let device = Device::cpu();
+        let input: Tensor<2> = Tensor::new(&graph, &device, &[[1.0f32, 1.0, 5.0], [4.0, 2.0, 0.0]]);
+
+        let output = input.min::<1>(1);
+        let output_values = output.raw().clone().as_slice().await.unwrap().to_vec1();
+        let gradients = output.sum().backward().unwrap();
+        let dinput = gradients
+            .get(&input)
+            .unwrap()
+            .as_slice()
+            .await
+            .unwrap()
+            .to_vec2();
+
+        assert_eq!(output_values, vec![1.0, 0.0]);
+        assert_eq!(dinput, vec![vec![0.5, 0.5, 0.0], vec![0.0, 0.0, 1.0]]);
+    }
+
+    #[tokio::test]
+    async fn test_backward_mean_cpu() {
+        let graph = Graph::new();
+        let device = Device::cpu();
+        let input: Tensor<2> = Tensor::new(&graph, &device, &[[1.0f32, 2.0, 3.0], [4.0, 5.0, 6.0]]);
+
+        let output = input.mean::<1>(1);
+        let output_values = output.raw().clone().as_slice().await.unwrap().to_vec1();
+        let gradients = output.sum().backward().unwrap();
+        let dinput = gradients
+            .get(&input)
+            .unwrap()
+            .as_slice()
+            .await
+            .unwrap()
+            .to_vec2();
+
+        assert_eq!(output_values, vec![2.0, 5.0]);
+        assert_eq!(
+            dinput,
+            vec![
+                vec![1.0 / 3.0, 1.0 / 3.0, 1.0 / 3.0],
+                vec![1.0 / 3.0, 1.0 / 3.0, 1.0 / 3.0]
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_backward_product_cpu() {
+        let graph = Graph::new();
+        let device = Device::cpu();
+        let input: Tensor<2> =
+            Tensor::new(&graph, &device, &[[2.0f32, 3.0, 4.0], [5.0, 0.0, 7.0], [0.0, 0.0, 9.0]]);
+
+        let output = input.product::<1>(1);
+        let output_values = output.raw().clone().as_slice().await.unwrap().to_vec1();
+        let gradients = output.sum().backward().unwrap();
+        let dinput = gradients
+            .get(&input)
+            .unwrap()
+            .as_slice()
+            .await
+            .unwrap()
+            .to_vec2();
+
+        assert_eq!(output_values, vec![24.0, 0.0, 0.0]);
+        assert_eq!(
+            dinput,
+            vec![vec![12.0, 8.0, 6.0], vec![0.0, 35.0, 0.0], vec![0.0, 0.0, 0.0]]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_backward_product_keepdim_cpu() {
+        let graph = Graph::new();
+        let device = Device::cpu();
+        let input: Tensor<2> = Tensor::new(&graph, &device, &[[2.0f32, 3.0, 4.0], [5.0, 0.0, 7.0]]);
+
+        let output = input.product_keepdim::<1>(1);
+        let output_values = output.raw().clone().as_slice().await.unwrap().to_vec2();
+        let gradients = output.sum(1).sum().backward().unwrap();
+        let dinput = gradients
+            .get(&input)
+            .unwrap()
+            .as_slice()
+            .await
+            .unwrap()
+            .to_vec2();
+
+        assert_eq!(output_values, vec![vec![24.0], vec![0.0]]);
+        assert_eq!(dinput, vec![vec![12.0, 8.0, 6.0], vec![0.0, 35.0, 0.0]]);
+    }
+
+    #[tokio::test]
+    async fn test_backward_var_cpu() {
+        let graph = Graph::new();
+        let device = Device::cpu();
+        let input: Tensor<2> = Tensor::new(&graph, &device, &[[1.0f32, 2.0, 3.0], [4.0, 5.0, 6.0]]);
+
+        let output = input.var::<1>(1);
+        let output_values = output.raw().clone().as_slice().await.unwrap().to_vec1();
+        let gradients = output.sum().backward().unwrap();
+        let dinput = gradients
+            .get(&input)
+            .unwrap()
+            .as_slice()
+            .await
+            .unwrap()
+            .to_vec2();
+
+        assert_eq!(output_values, vec![2.0 / 3.0, 2.0 / 3.0]);
+        assert_eq!(
+            dinput,
+            vec![
+                vec![-2.0 / 3.0, 0.0, 2.0 / 3.0],
+                vec![-2.0 / 3.0, 0.0, 2.0 / 3.0]
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_backward_var_keepdim_cpu() {
+        let graph = Graph::new();
+        let device = Device::cpu();
+        let input: Tensor<2> = Tensor::new(&graph, &device, &[[1.0f32, 2.0, 3.0], [4.0, 5.0, 6.0]]);
+
+        let output = input.var_keepdim::<1>(1);
+        let output_values = output.raw().clone().as_slice().await.unwrap().to_vec2();
+        let gradients = output.sum(1).sum().backward().unwrap();
+        let dinput = gradients
+            .get(&input)
+            .unwrap()
+            .as_slice()
+            .await
+            .unwrap()
+            .to_vec2();
+
+        assert_eq!(output_values, vec![vec![2.0 / 3.0], vec![2.0 / 3.0]]);
+        assert_eq!(
+            dinput,
+            vec![
+                vec![-2.0 / 3.0, 0.0, 2.0 / 3.0],
+                vec![-2.0 / 3.0, 0.0, 2.0 / 3.0]
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_backward_clamp_cpu() {
+        let graph = Graph::new();
+        let device = Device::cpu();
+        let input: Tensor<1> = Tensor::new(&graph, &device, &[-1.0f32, 0.0, 2.0, 5.0]);
+
+        let output = input.clamp(0.0, 3.0);
+        let output_values = output.raw().clone().as_slice().await.unwrap().to_vec1();
+        let gradients = output.sum().backward().unwrap();
+        let dinput = gradients
+            .get(&input)
+            .unwrap()
+            .as_slice()
+            .await
+            .unwrap()
+            .to_vec1();
+
+        assert_eq!(output_values, vec![0.0, 0.0, 2.0, 3.0]);
+        assert_eq!(dinput, vec![0.0, 0.0, 1.0, 0.0]);
+    }
+
+    #[tokio::test]
+    async fn test_backward_eq_cpu() {
+        let graph = Graph::new();
+        let device = Device::cpu();
+        let input: Tensor<1> = Tensor::new(&graph, &device, &[1.0f32, 2.0, 1.0]);
+
+        let output = input.eq(1.0);
+        let output_values = output.raw().clone().as_slice().await.unwrap().to_vec1();
+        let gradients = output.sum().backward().unwrap();
+        let dinput = gradients
+            .get(&input)
+            .unwrap()
+            .as_slice()
+            .await
+            .unwrap()
+            .to_vec1();
+
+        assert_eq!(output_values, vec![1.0, 0.0, 1.0]);
+        assert_eq!(dinput, vec![0.0, 0.0, 0.0]);
+    }
+
+    #[tokio::test]
+    async fn test_backward_eq_scalar_cpu() {
+        let graph = Graph::new();
+        let device = Device::cpu();
+        let input: Tensor<1> = Tensor::new(&graph, &device, &[3.0f32, 2.0, 3.0]);
+
+        let output = input.eq_scalar(3.0);
+        let output_values = output.raw().clone().as_slice().await.unwrap().to_vec1();
+        let gradients = output.sum().backward().unwrap();
+        let dinput = gradients
+            .get(&input)
+            .unwrap()
+            .as_slice()
+            .await
+            .unwrap()
+            .to_vec1();
+
+        assert_eq!(output_values, vec![1.0, 0.0, 1.0]);
+        assert_eq!(dinput, vec![0.0, 0.0, 0.0]);
+    }
+
+    #[tokio::test]
+    async fn test_backward_eq_tensor_cpu() {
+        let graph = Graph::new();
+        let device = Device::cpu();
+        let lhs: Tensor<1> = Tensor::new(&graph, &device, &[1.0f32, 2.0, 3.0]);
+        let rhs: Tensor<1> = Tensor::new(&graph, &device, &[1.0f32, 0.0, 3.0]);
+
+        let output = lhs.eq_tensor(&rhs);
+        let output_values = output.raw().clone().as_slice().await.unwrap().to_vec1();
+        let gradients = output.sum().backward().unwrap();
+        let dlhs = gradients
+            .get(&lhs)
+            .unwrap()
+            .as_slice()
+            .await
+            .unwrap()
+            .to_vec1();
+        let drhs = gradients
+            .get(&rhs)
+            .unwrap()
+            .as_slice()
+            .await
+            .unwrap()
+            .to_vec1();
+
+        assert_eq!(output_values, vec![1.0, 0.0, 1.0]);
+        assert_eq!(dlhs, vec![0.0, 0.0, 0.0]);
+        assert_eq!(drhs, vec![0.0, 0.0, 0.0]);
+    }
+
+    #[tokio::test]
+    async fn test_backward_gt_scalar_cpu() {
+        let graph = Graph::new();
+        let device = Device::cpu();
+        let input: Tensor<1> = Tensor::new(&graph, &device, &[1.0f32, 2.0, 3.0]);
+
+        let output = input.gt_scalar(2.0);
+        let output_values = output.raw().clone().as_slice().await.unwrap().to_vec1();
+        let gradients = output.sum().backward().unwrap();
+        let dinput = gradients
+            .get(&input)
+            .unwrap()
+            .as_slice()
+            .await
+            .unwrap()
+            .to_vec1();
+
+        assert_eq!(output_values, vec![0.0, 0.0, 1.0]);
+        assert_eq!(dinput, vec![0.0, 0.0, 0.0]);
+    }
+
+    #[tokio::test]
+    async fn test_backward_gt_tensor_cpu() {
+        let graph = Graph::new();
+        let device = Device::cpu();
+        let lhs: Tensor<1> = Tensor::new(&graph, &device, &[1.0f32, 4.0, 3.0]);
+        let rhs: Tensor<1> = Tensor::new(&graph, &device, &[2.0f32, 1.0, 3.0]);
+
+        let output = lhs.gt_tensor(&rhs);
+        let output_values = output.raw().clone().as_slice().await.unwrap().to_vec1();
+        let gradients = output.sum().backward().unwrap();
+        let dlhs = gradients
+            .get(&lhs)
+            .unwrap()
+            .as_slice()
+            .await
+            .unwrap()
+            .to_vec1();
+        let drhs = gradients
+            .get(&rhs)
+            .unwrap()
+            .as_slice()
+            .await
+            .unwrap()
+            .to_vec1();
+
+        assert_eq!(output_values, vec![0.0, 1.0, 0.0]);
+        assert_eq!(dlhs, vec![0.0, 0.0, 0.0]);
+        assert_eq!(drhs, vec![0.0, 0.0, 0.0]);
+    }
+
+    #[tokio::test]
+    async fn test_backward_gte_scalar_cpu() {
+        let graph = Graph::new();
+        let device = Device::cpu();
+        let input: Tensor<1> = Tensor::new(&graph, &device, &[1.0f32, 2.0, 3.0]);
+
+        let output = input.gte_scalar(2.0);
+        let output_values = output.raw().clone().as_slice().await.unwrap().to_vec1();
+        let gradients = output.sum().backward().unwrap();
+        let dinput = gradients
+            .get(&input)
+            .unwrap()
+            .as_slice()
+            .await
+            .unwrap()
+            .to_vec1();
+
+        assert_eq!(output_values, vec![0.0, 1.0, 1.0]);
+        assert_eq!(dinput, vec![0.0, 0.0, 0.0]);
+    }
+
+    #[tokio::test]
+    async fn test_backward_gte_tensor_cpu() {
+        let graph = Graph::new();
+        let device = Device::cpu();
+        let lhs: Tensor<1> = Tensor::new(&graph, &device, &[1.0f32, 4.0, 3.0]);
+        let rhs: Tensor<1> = Tensor::new(&graph, &device, &[2.0f32, 4.0, 2.0]);
+
+        let output = lhs.gte_tensor(&rhs);
+        let output_values = output.raw().clone().as_slice().await.unwrap().to_vec1();
+        let gradients = output.sum().backward().unwrap();
+        let dlhs = gradients
+            .get(&lhs)
+            .unwrap()
+            .as_slice()
+            .await
+            .unwrap()
+            .to_vec1();
+        let drhs = gradients
+            .get(&rhs)
+            .unwrap()
+            .as_slice()
+            .await
+            .unwrap()
+            .to_vec1();
+
+        assert_eq!(output_values, vec![0.0, 1.0, 1.0]);
+        assert_eq!(dlhs, vec![0.0, 0.0, 0.0]);
+        assert_eq!(drhs, vec![0.0, 0.0, 0.0]);
+    }
+
+    #[tokio::test]
+    async fn test_backward_lt_cpu() {
+        let graph = Graph::new();
+        let device = Device::cpu();
+        let input: Tensor<1> = Tensor::new(&graph, &device, &[1.0f32, 2.0, 3.0]);
+
+        let output = input.lt(2.0);
+        let output_values = output.raw().clone().as_slice().await.unwrap().to_vec1();
+        let gradients = output.sum().backward().unwrap();
+        let dinput = gradients
+            .get(&input)
+            .unwrap()
+            .as_slice()
+            .await
+            .unwrap()
+            .to_vec1();
+
+        assert_eq!(output_values, vec![1.0, 0.0, 0.0]);
+        assert_eq!(dinput, vec![0.0, 0.0, 0.0]);
+    }
+
+    #[tokio::test]
+    async fn test_backward_lt_scalar_cpu() {
+        let graph = Graph::new();
+        let device = Device::cpu();
+        let input: Tensor<1> = Tensor::new(&graph, &device, &[1.0f32, 2.0, 3.0]);
+
+        let output = input.lt_scalar(3.0);
+        let output_values = output.raw().clone().as_slice().await.unwrap().to_vec1();
+        let gradients = output.sum().backward().unwrap();
+        let dinput = gradients
+            .get(&input)
+            .unwrap()
+            .as_slice()
+            .await
+            .unwrap()
+            .to_vec1();
+
+        assert_eq!(output_values, vec![1.0, 1.0, 0.0]);
+        assert_eq!(dinput, vec![0.0, 0.0, 0.0]);
+    }
+
+    #[tokio::test]
+    async fn test_backward_lt_tensor_cpu() {
+        let graph = Graph::new();
+        let device = Device::cpu();
+        let lhs: Tensor<1> = Tensor::new(&graph, &device, &[1.0f32, 2.0, 3.0]);
+        let rhs: Tensor<1> = Tensor::new(&graph, &device, &[2.0f32, 1.0, 3.0]);
+
+        let output = lhs.lt_tensor(&rhs);
+        let output_values = output.raw().clone().as_slice().await.unwrap().to_vec1();
+        let gradients = output.sum().backward().unwrap();
+        let dlhs = gradients
+            .get(&lhs)
+            .unwrap()
+            .as_slice()
+            .await
+            .unwrap()
+            .to_vec1();
+        let drhs = gradients
+            .get(&rhs)
+            .unwrap()
+            .as_slice()
+            .await
+            .unwrap()
+            .to_vec1();
+
+        assert_eq!(output_values, vec![1.0, 0.0, 0.0]);
+        assert_eq!(dlhs, vec![0.0, 0.0, 0.0]);
+        assert_eq!(drhs, vec![0.0, 0.0, 0.0]);
+    }
+
+    #[tokio::test]
+    async fn test_backward_lte_cpu() {
+        let graph = Graph::new();
+        let device = Device::cpu();
+        let input: Tensor<1> = Tensor::new(&graph, &device, &[1.0f32, 2.0, 3.0]);
+
+        let output = input.lte(2.0);
+        let output_values = output.raw().clone().as_slice().await.unwrap().to_vec1();
+        let gradients = output.sum().backward().unwrap();
+        let dinput = gradients
+            .get(&input)
+            .unwrap()
+            .as_slice()
+            .await
+            .unwrap()
+            .to_vec1();
+
+        assert_eq!(output_values, vec![1.0, 1.0, 0.0]);
+        assert_eq!(dinput, vec![0.0, 0.0, 0.0]);
+    }
+
+    #[tokio::test]
+    async fn test_backward_lte_scalar_cpu() {
+        let graph = Graph::new();
+        let device = Device::cpu();
+        let input: Tensor<1> = Tensor::new(&graph, &device, &[1.0f32, 2.0, 3.0]);
+
+        let output = input.lte_scalar(1.0);
+        let output_values = output.raw().clone().as_slice().await.unwrap().to_vec1();
+        let gradients = output.sum().backward().unwrap();
+        let dinput = gradients
+            .get(&input)
+            .unwrap()
+            .as_slice()
+            .await
+            .unwrap()
+            .to_vec1();
+
+        assert_eq!(output_values, vec![1.0, 0.0, 0.0]);
+        assert_eq!(dinput, vec![0.0, 0.0, 0.0]);
+    }
+
+    #[tokio::test]
+    async fn test_backward_lte_tensor_cpu() {
+        let graph = Graph::new();
+        let device = Device::cpu();
+        let lhs: Tensor<1> = Tensor::new(&graph, &device, &[1.0f32, 2.0, 3.0]);
+        let rhs: Tensor<1> = Tensor::new(&graph, &device, &[2.0f32, 2.0, 1.0]);
+
+        let output = lhs.lte_tensor(&rhs);
+        let output_values = output.raw().clone().as_slice().await.unwrap().to_vec1();
+        let gradients = output.sum().backward().unwrap();
+        let dlhs = gradients
+            .get(&lhs)
+            .unwrap()
+            .as_slice()
+            .await
+            .unwrap()
+            .to_vec1();
+        let drhs = gradients
+            .get(&rhs)
+            .unwrap()
+            .as_slice()
+            .await
+            .unwrap()
+            .to_vec1();
+
+        assert_eq!(output_values, vec![1.0, 1.0, 0.0]);
+        assert_eq!(dlhs, vec![0.0, 0.0, 0.0]);
+        assert_eq!(drhs, vec![0.0, 0.0, 0.0]);
+    }
+
+    #[tokio::test]
+    async fn test_backward_max_elementwise_cpu() {
+        let graph = Graph::new();
+        let device = Device::cpu();
+        let input: Tensor<1> = Tensor::new(&graph, &device, &[-1.0f32, 0.0, 2.0]);
+
+        let output = input.max_elementwise(0.0);
+        let output_values = output.raw().clone().as_slice().await.unwrap().to_vec1();
+        let gradients = output.sum().backward().unwrap();
+        let dinput = gradients
+            .get(&input)
+            .unwrap()
+            .as_slice()
+            .await
+            .unwrap()
+            .to_vec1();
+
+        assert_eq!(output_values, vec![0.0, 0.0, 2.0]);
+        assert_eq!(dinput, vec![0.0, 0.0, 1.0]);
+    }
+
+    #[tokio::test]
+    async fn test_backward_max_scalar_cpu() {
+        let graph = Graph::new();
+        let device = Device::cpu();
+        let input: Tensor<1> = Tensor::new(&graph, &device, &[1.0f32, 4.0, 2.0]);
+
+        let output = input.max_scalar(3.0);
+        let output_values = output.raw().clone().as_slice().await.unwrap().to_vec1();
+        let gradients = output.sum().backward().unwrap();
+        let dinput = gradients
+            .get(&input)
+            .unwrap()
+            .as_slice()
+            .await
+            .unwrap()
+            .to_vec1();
+
+        assert_eq!(output_values, vec![3.0, 4.0, 3.0]);
+        assert_eq!(dinput, vec![0.0, 1.0, 0.0]);
+    }
+
+    #[tokio::test]
+    async fn test_backward_min_elementwise_cpu() {
+        let graph = Graph::new();
+        let device = Device::cpu();
+        let input: Tensor<1> = Tensor::new(&graph, &device, &[1.0f32, 4.0, 2.0]);
+
+        let output = input.min_elementwise(3.0);
+        let output_values = output.raw().clone().as_slice().await.unwrap().to_vec1();
+        let gradients = output.sum().backward().unwrap();
+        let dinput = gradients
+            .get(&input)
+            .unwrap()
+            .as_slice()
+            .await
+            .unwrap()
+            .to_vec1();
+
+        assert_eq!(output_values, vec![1.0, 3.0, 2.0]);
+        assert_eq!(dinput, vec![1.0, 0.0, 1.0]);
+    }
+
+    #[tokio::test]
+    async fn test_backward_min_scalar_cpu() {
+        let graph = Graph::new();
+        let device = Device::cpu();
+        let input: Tensor<1> = Tensor::new(&graph, &device, &[1.0f32, 4.0, 2.0]);
+
+        let output = input.min_scalar(2.0);
+        let output_values = output.raw().clone().as_slice().await.unwrap().to_vec1();
+        let gradients = output.sum().backward().unwrap();
+        let dinput = gradients
+            .get(&input)
+            .unwrap()
+            .as_slice()
+            .await
+            .unwrap()
+            .to_vec1();
+
+        assert_eq!(output_values, vec![1.0, 2.0, 2.0]);
+        assert_eq!(dinput, vec![1.0, 0.0, 0.0]);
+    }
+
+    #[tokio::test]
+    async fn test_backward_mt_cpu() {
+        let graph = Graph::new();
+        let device = Device::cpu();
+        let input: Tensor<1> = Tensor::new(&graph, &device, &[1.0f32, 4.0, 2.0]);
+
+        let output = input.mt(2.0);
+        let output_values = output.raw().clone().as_slice().await.unwrap().to_vec1();
+        let gradients = output.sum().backward().unwrap();
+        let dinput = gradients
+            .get(&input)
+            .unwrap()
+            .as_slice()
+            .await
+            .unwrap()
+            .to_vec1();
+
+        assert_eq!(output_values, vec![0.0, 1.0, 0.0]);
+        assert_eq!(dinput, vec![0.0, 0.0, 0.0]);
+    }
+
+    #[tokio::test]
+    async fn test_backward_mte_cpu() {
+        let graph = Graph::new();
+        let device = Device::cpu();
+        let input: Tensor<1> = Tensor::new(&graph, &device, &[1.0f32, 4.0, 2.0]);
+
+        let output = input.mte(2.0);
+        let output_values = output.raw().clone().as_slice().await.unwrap().to_vec1();
+        let gradients = output.sum().backward().unwrap();
+        let dinput = gradients
+            .get(&input)
+            .unwrap()
+            .as_slice()
+            .await
+            .unwrap()
+            .to_vec1();
+
+        assert_eq!(output_values, vec![0.0, 1.0, 1.0]);
+        assert_eq!(dinput, vec![0.0, 0.0, 0.0]);
+    }
+
+    #[tokio::test]
+    async fn test_backward_ne_cpu() {
+        let graph = Graph::new();
+        let device = Device::cpu();
+        let input: Tensor<1> = Tensor::new(&graph, &device, &[1.0f32, 4.0, 2.0]);
+
+        let output = input.ne(2.0);
+        let output_values = output.raw().clone().as_slice().await.unwrap().to_vec1();
+        let gradients = output.sum().backward().unwrap();
+        let dinput = gradients
+            .get(&input)
+            .unwrap()
+            .as_slice()
+            .await
+            .unwrap()
+            .to_vec1();
+
+        assert_eq!(output_values, vec![1.0, 1.0, 0.0]);
+        assert_eq!(dinput, vec![0.0, 0.0, 0.0]);
+    }
+
+    #[tokio::test]
+    async fn test_backward_ne_scalar_cpu() {
+        let graph = Graph::new();
+        let device = Device::cpu();
+        let input: Tensor<1> = Tensor::new(&graph, &device, &[1.0f32, 4.0, 2.0]);
+
+        let output = input.ne_scalar(4.0);
+        let output_values = output.raw().clone().as_slice().await.unwrap().to_vec1();
+        let gradients = output.sum().backward().unwrap();
+        let dinput = gradients
+            .get(&input)
+            .unwrap()
+            .as_slice()
+            .await
+            .unwrap()
+            .to_vec1();
+
+        assert_eq!(output_values, vec![1.0, 0.0, 1.0]);
+        assert_eq!(dinput, vec![0.0, 0.0, 0.0]);
+    }
+
+    #[tokio::test]
+    async fn test_backward_ne_tensor_cpu() {
+        let graph = Graph::new();
+        let device = Device::cpu();
+        let lhs: Tensor<1> = Tensor::new(&graph, &device, &[1.0f32, 4.0, 2.0]);
+        let rhs: Tensor<1> = Tensor::new(&graph, &device, &[1.0f32, 0.0, 3.0]);
+
+        let output = lhs.ne_tensor(&rhs);
+        let output_values = output.raw().clone().as_slice().await.unwrap().to_vec1();
+        let gradients = output.sum().backward().unwrap();
+        let dlhs = gradients
+            .get(&lhs)
+            .unwrap()
+            .as_slice()
+            .await
+            .unwrap()
+            .to_vec1();
+        let drhs = gradients
+            .get(&rhs)
+            .unwrap()
+            .as_slice()
+            .await
+            .unwrap()
+            .to_vec1();
+
+        assert_eq!(output_values, vec![0.0, 1.0, 1.0]);
+        assert_eq!(dlhs, vec![0.0, 0.0, 0.0]);
+        assert_eq!(drhs, vec![0.0, 0.0, 0.0]);
+    }
+
+    #[tokio::test]
+    async fn test_backward_abs_cpu() {
+        let graph = Graph::new();
+        let device = Device::cpu();
+        let input: Tensor<1> = Tensor::new(&graph, &device, &[-2.0f32, 0.0, 3.0]);
+
+        let output = input.abs();
+        let output_values = output.raw().clone().as_slice().await.unwrap().to_vec1();
+        let gradients = output.sum().backward().unwrap();
+        let dinput = gradients
+            .get(&input)
+            .unwrap()
+            .as_slice()
+            .await
+            .unwrap()
+            .to_vec1();
+
+        assert_eq!(output_values, vec![2.0, 0.0, 3.0]);
+        assert_eq!(dinput, vec![-1.0, 0.0, 1.0]);
+    }
+
+    #[tokio::test]
+    async fn test_backward_acos_cpu() {
+        let graph = Graph::new();
+        let device = Device::cpu();
+        let input: Tensor<1> = Tensor::new(&graph, &device, &[0.5f32]);
+
+        let output = input.acos();
+        let output_values = output.raw().clone().as_slice().await.unwrap().to_vec1();
+        let gradients = output.sum().backward().unwrap();
+        let dinput = gradients
+            .get(&input)
+            .unwrap()
+            .as_slice()
+            .await
+            .unwrap()
+            .to_vec1();
+
+        assert_close(output_values[0], 0.5f32.acos());
+        assert_close(dinput[0], -1.0f32 / (1.0f32 - 0.25f32).sqrt());
+    }
+
+    #[tokio::test]
+    async fn test_backward_acosh_cpu() {
+        let graph = Graph::new();
+        let device = Device::cpu();
+        let input: Tensor<1> = Tensor::new(&graph, &device, &[2.0f32]);
+
+        let output = input.acosh();
+        let output_values = output.raw().clone().as_slice().await.unwrap().to_vec1();
+        let gradients = output.sum().backward().unwrap();
+        let dinput = gradients
+            .get(&input)
+            .unwrap()
+            .as_slice()
+            .await
+            .unwrap()
+            .to_vec1();
+
+        assert_close(output_values[0], 2.0f32.acosh());
+        assert_close(dinput[0], 1.0f32 / ((2.0f32 - 1.0f32).sqrt() * (2.0f32 + 1.0f32).sqrt()));
+    }
+
+    #[tokio::test]
+    async fn test_backward_approximate_exp_cpu() {
+        let graph = Graph::new();
+        let device = Device::cpu();
+        let input: Tensor<1> = Tensor::new(&graph, &device, &[1.0f32]);
+
+        let output = input.approximate_exp();
+        let output_values = output.raw().clone().as_slice().await.unwrap().to_vec1();
+        let gradients = output.sum().backward().unwrap();
+        let dinput = gradients
+            .get(&input)
+            .unwrap()
+            .as_slice()
+            .await
+            .unwrap()
+            .to_vec1();
+
+        assert_close(output_values[0], 1.0f32.exp());
+        assert_close(dinput[0], 1.0f32.exp());
+    }
+
+    #[tokio::test]
+    async fn test_backward_asin_cpu() {
+        let graph = Graph::new();
+        let device = Device::cpu();
+        let input: Tensor<1> = Tensor::new(&graph, &device, &[0.5f32]);
+
+        let output = input.asin();
+        let output_values = output.raw().clone().as_slice().await.unwrap().to_vec1();
+        let gradients = output.sum().backward().unwrap();
+        let dinput = gradients
+            .get(&input)
+            .unwrap()
+            .as_slice()
+            .await
+            .unwrap()
+            .to_vec1();
+
+        assert_close(output_values[0], 0.5f32.asin());
+        assert_close(dinput[0], 1.0f32 / (1.0f32 - 0.25f32).sqrt());
+    }
+
+    #[tokio::test]
+    async fn test_backward_asinh_cpu() {
+        let graph = Graph::new();
+        let device = Device::cpu();
+        let input: Tensor<1> = Tensor::new(&graph, &device, &[1.5f32]);
+
+        let output = input.asinh();
+        let output_values = output.raw().clone().as_slice().await.unwrap().to_vec1();
+        let gradients = output.sum().backward().unwrap();
+        let dinput = gradients
+            .get(&input)
+            .unwrap()
+            .as_slice()
+            .await
+            .unwrap()
+            .to_vec1();
+
+        assert_close(output_values[0], 1.5f32.asinh());
+        assert_close(dinput[0], 1.0f32 / (1.5f32 * 1.5f32 + 1.0f32).sqrt());
+    }
+
+    #[tokio::test]
+    async fn test_backward_atan_cpu() {
+        let graph = Graph::new();
+        let device = Device::cpu();
+        let input: Tensor<1> = Tensor::new(&graph, &device, &[0.5f32]);
+
+        let output = input.atan();
+        let output_values = output.raw().clone().as_slice().await.unwrap().to_vec1();
+        let gradients = output.sum().backward().unwrap();
+        let dinput = gradients
+            .get(&input)
+            .unwrap()
+            .as_slice()
+            .await
+            .unwrap()
+            .to_vec1();
+
+        assert_close(output_values[0], 0.5f32.atan());
+        assert_close(dinput[0], 1.0f32 / (1.0f32 + 0.25f32));
+    }
+
+    #[tokio::test]
+    async fn test_backward_atanh_cpu() {
+        let graph = Graph::new();
+        let device = Device::cpu();
+        let input: Tensor<1> = Tensor::new(&graph, &device, &[0.5f32]);
+
+        let output = input.atanh();
+        let output_values = output.raw().clone().as_slice().await.unwrap().to_vec1();
+        let gradients = output.sum().backward().unwrap();
+        let dinput = gradients
+            .get(&input)
+            .unwrap()
+            .as_slice()
+            .await
+            .unwrap()
+            .to_vec1();
+
+        assert_close(output_values[0], 0.5f32.atanh());
+        assert_close(dinput[0], 1.0f32 / (1.0f32 - 0.25f32));
+    }
+
+    #[tokio::test]
+    async fn test_backward_cos_cpu() {
+        let graph = Graph::new();
+        let device = Device::cpu();
+        let input: Tensor<1> = Tensor::new(&graph, &device, &[0.5f32]);
+
+        let output = input.cos();
+        let output_values = output.raw().clone().as_slice().await.unwrap().to_vec1();
+        let gradients = output.sum().backward().unwrap();
+        let dinput = gradients
+            .get(&input)
+            .unwrap()
+            .as_slice()
+            .await
+            .unwrap()
+            .to_vec1();
+
+        assert_close(output_values[0], 0.5f32.cos());
+        assert_close(dinput[0], -0.5f32.sin());
+    }
+
+    #[tokio::test]
+    async fn test_backward_cosh_cpu() {
+        let graph = Graph::new();
+        let device = Device::cpu();
+        let input: Tensor<1> = Tensor::new(&graph, &device, &[0.5f32]);
+
+        let output = input.cosh();
+        let output_values = output.raw().clone().as_slice().await.unwrap().to_vec1();
+        let gradients = output.sum().backward().unwrap();
+        let dinput = gradients
+            .get(&input)
+            .unwrap()
+            .as_slice()
+            .await
+            .unwrap()
+            .to_vec1();
+
+        assert_close(output_values[0], 0.5f32.cosh());
+        assert_close(dinput[0], 0.5f32.sinh());
+    }
+
+    #[tokio::test]
+    async fn test_backward_exp2_cpu() {
+        let graph = Graph::new();
+        let device = Device::cpu();
+        let input: Tensor<1> = Tensor::new(&graph, &device, &[2.0f32]);
+
+        let output = input.exp2();
+        let output_values = output.raw().clone().as_slice().await.unwrap().to_vec1();
+        let gradients = output.sum().backward().unwrap();
+        let dinput = gradients
+            .get(&input)
+            .unwrap()
+            .as_slice()
+            .await
+            .unwrap()
+            .to_vec1();
+
+        assert_close(output_values[0], 2.0f32.exp2());
+        assert_close(dinput[0], std::f32::consts::LN_2 * 2.0f32.exp2());
+    }
+
+    #[tokio::test]
+    async fn test_backward_less_approximate_exp_cpu() {
+        let graph = Graph::new();
+        let device = Device::cpu();
+        let input: Tensor<1> = Tensor::new(&graph, &device, &[1.0f32]);
+
+        let output = input.less_approximate_exp();
+        let output_values = output.raw().clone().as_slice().await.unwrap().to_vec1();
+        let gradients = output.sum().backward().unwrap();
+        let dinput = gradients
+            .get(&input)
+            .unwrap()
+            .as_slice()
+            .await
+            .unwrap()
+            .to_vec1();
+
+        assert_close(output_values[0], 1.0f32.exp());
+        assert_close(dinput[0], 1.0f32.exp());
+    }
+
+    #[tokio::test]
+    async fn test_backward_log2_cpu() {
+        let graph = Graph::new();
+        let device = Device::cpu();
+        let input: Tensor<1> = Tensor::new(&graph, &device, &[4.0f32]);
+
+        let output = input.log2();
+        let output_values = output.raw().clone().as_slice().await.unwrap().to_vec1();
+        let gradients = output.sum().backward().unwrap();
+        let dinput = gradients
+            .get(&input)
+            .unwrap()
+            .as_slice()
+            .await
+            .unwrap()
+            .to_vec1();
+
+        assert_close(output_values[0], 4.0f32.log2());
+        assert_close(dinput[0], 1.0f32 / (4.0f32 * std::f32::consts::LN_2));
+    }
+
+    #[tokio::test]
+    async fn test_backward_sin_cpu() {
+        let graph = Graph::new();
+        let device = Device::cpu();
+        let input: Tensor<1> = Tensor::new(&graph, &device, &[0.5f32]);
+
+        let output = input.sin();
+        let output_values = output.raw().clone().as_slice().await.unwrap().to_vec1();
+        let gradients = output.sum().backward().unwrap();
+        let dinput = gradients
+            .get(&input)
+            .unwrap()
+            .as_slice()
+            .await
+            .unwrap()
+            .to_vec1();
+
+        assert_close(output_values[0], 0.5f32.sin());
+        assert_close(dinput[0], 0.5f32.cos());
+    }
+
+    #[tokio::test]
+    async fn test_backward_sinh_cpu() {
+        let graph = Graph::new();
+        let device = Device::cpu();
+        let input: Tensor<1> = Tensor::new(&graph, &device, &[0.5f32]);
+
+        let output = input.sinh();
+        let output_values = output.raw().clone().as_slice().await.unwrap().to_vec1();
+        let gradients = output.sum().backward().unwrap();
+        let dinput = gradients
+            .get(&input)
+            .unwrap()
+            .as_slice()
+            .await
+            .unwrap()
+            .to_vec1();
+
+        assert_close(output_values[0], 0.5f32.sinh());
+        assert_close(dinput[0], 0.5f32.cosh());
+    }
+
+    #[tokio::test]
+    async fn test_backward_tan_cpu() {
+        let graph = Graph::new();
+        let device = Device::cpu();
+        let input: Tensor<1> = Tensor::new(&graph, &device, &[0.5f32]);
+
+        let output = input.tan();
+        let output_values = output.raw().clone().as_slice().await.unwrap().to_vec1();
+        let gradients = output.sum().backward().unwrap();
+        let dinput = gradients
+            .get(&input)
+            .unwrap()
+            .as_slice()
+            .await
+            .unwrap()
+            .to_vec1();
+
+        assert_close(output_values[0], 0.5f32.tan());
+        assert_close(dinput[0], 1.0f32 / (0.5f32.cos() * 0.5f32.cos()));
+    }
+
+    #[tokio::test]
+    async fn test_backward_tanh_exact_cpu() {
+        let graph = Graph::new();
+        let device = Device::cpu();
+        let input: Tensor<1> = Tensor::new(&graph, &device, &[0.5f32]);
+
+        let output = input.tanh_exact();
+        let output_values = output.raw().clone().as_slice().await.unwrap().to_vec1();
+        let gradients = output.sum().backward().unwrap();
+        let dinput = gradients
+            .get(&input)
+            .unwrap()
+            .as_slice()
+            .await
+            .unwrap()
+            .to_vec1();
+
+        assert_close(output_values[0], 0.5f32.tanh());
+        assert_close(dinput[0], 1.0f32 - 0.5f32.tanh().powi(2));
+    }
+
+    #[tokio::test]
+    async fn test_cast_cpu() {
+        let graph = Graph::new();
+        let device = Device::cpu();
+        let input: Tensor<1> = Tensor::new(&graph, &device, &[1.0f32, 2.0, 3.0]);
+
+        let output = input.cast::<half::f16>();
+        let output_values = output.as_slice().await.unwrap().to_vec1();
+
+        assert_close(f32::from(output_values[0]), 1.0);
+        assert_close(f32::from(output_values[1]), 2.0);
+        assert_close(f32::from(output_values[2]), 3.0);
+    }
+
+    #[tokio::test]
+    async fn test_arange_cpu() {
+        let graph = Graph::new();
+        let device = Device::cpu();
+
+        let output = Tensor::<1>::arange(&graph, &device, 1.0, 5.0);
+        let output_values = output.raw().clone().as_slice().await.unwrap().to_vec1();
+
+        assert_eq!(output_values, vec![1.0, 2.0, 3.0, 4.0]);
+    }
+
+    #[tokio::test]
+    async fn test_arange_step_cpu() {
+        let graph = Graph::new();
+        let device = Device::cpu();
+
+        let output = Tensor::<1>::arange_step(&graph, &device, 1.0, 6.0, 2.0);
+        let output_values = output.raw().clone().as_slice().await.unwrap().to_vec1();
+
+        assert_eq!(output_values, vec![1.0, 3.0, 5.0]);
+    }
+
+    #[tokio::test]
+    async fn test_full_cpu() {
+        let graph = Graph::new();
+        let device = Device::cpu();
+
+        let output: Tensor<2> = Tensor::full(&graph, &device, [2, 3], 1.5);
+        let output_values = output.raw().clone().as_slice().await.unwrap();
+
+        assert_eq!(output_values.shape(), &[2, 3]);
+        for row in 0..2 {
+            for col in 0..3 {
+                assert_close(output_values[[row, col]], 1.5);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_zeros_like_cpu() {
+        let graph = Graph::new();
+        let device = Device::cpu();
+        let input: Tensor<2> = Tensor::new(&graph, &device, &[[1.0f32, 2.0], [3.0, 4.0]]);
+
+        let output = input.zeros_like();
+        let output_values = output.raw().clone().as_slice().await.unwrap();
+
+        assert_eq!(output_values.shape(), &[2, 2]);
+        assert_close(output_values[[0, 0]], 0.0);
+        assert_close(output_values[[0, 1]], 0.0);
+        assert_close(output_values[[1, 0]], 0.0);
+        assert_close(output_values[[1, 1]], 0.0);
+    }
+
+    #[tokio::test]
+    async fn test_from_array_cpu() {
+        let graph = Graph::new();
+        let device = Device::cpu();
+
+        let output: Tensor<2> = Tensor::from_array(&graph, &device, &[[1.0f32, 2.0], [3.0, 4.0]]);
+        let output_values = output.raw().clone().as_slice().await.unwrap();
+
+        assert_eq!(output_values.shape(), &[2, 2]);
+        assert_close(output_values[[0, 0]], 1.0);
+        assert_close(output_values[[0, 1]], 2.0);
+        assert_close(output_values[[1, 0]], 3.0);
+        assert_close(output_values[[1, 1]], 4.0);
+    }
+
+    #[tokio::test]
+    async fn test_backward_add_broadcast_api_cpu() {
+        let graph = Graph::new();
+        let device = Device::cpu();
+        let lhs: Tensor<1> = Tensor::new(&graph, &device, &[1.0f32, 2.0]);
+        let rhs: Tensor<2> = Tensor::new(&graph, &device, &[[10.0f32], [20.0]]);
+
+        let output: Tensor<2> = lhs.add_::<2, 2>(&rhs);
+        let output_values = output.raw().clone().as_slice().await.unwrap().to_vec2();
+        let gradients = output.flatten_all().sum().backward().unwrap();
+        let dlhs = gradients.get(&lhs).unwrap().as_slice().await.unwrap().to_vec1();
+        let drhs = gradients.get(&rhs).unwrap().as_slice().await.unwrap().to_vec2();
+
+        assert_close(output_values[0][0], 11.0);
+        assert_close(output_values[0][1], 12.0);
+        assert_close(output_values[1][0], 21.0);
+        assert_close(output_values[1][1], 22.0);
+        assert_close(dlhs[0], 2.0);
+        assert_close(dlhs[1], 2.0);
+        assert_close(drhs[0][0], 2.0);
+        assert_close(drhs[1][0], 2.0);
+    }
+
+    #[tokio::test]
+    async fn test_backward_sub_broadcast_api_cpu() {
+        let graph = Graph::new();
+        let device = Device::cpu();
+        let lhs: Tensor<2> = Tensor::new(&graph, &device, &[[3.0f32], [4.0]]);
+        let rhs: Tensor<1> = Tensor::new(&graph, &device, &[1.0f32, 2.0]);
+
+        let output: Tensor<2> = lhs.sub_::<1, 2>(&rhs);
+        let output_values = output.raw().clone().as_slice().await.unwrap().to_vec2();
+        let gradients = output.flatten_all().sum().backward().unwrap();
+        let dlhs = gradients.get(&lhs).unwrap().as_slice().await.unwrap().to_vec2();
+        let drhs = gradients.get(&rhs).unwrap().as_slice().await.unwrap().to_vec1();
+
+        assert_close(output_values[0][0], 2.0);
+        assert_close(output_values[0][1], 1.0);
+        assert_close(output_values[1][0], 3.0);
+        assert_close(output_values[1][1], 2.0);
+        assert_close(dlhs[0][0], 2.0);
+        assert_close(dlhs[1][0], 2.0);
+        assert_close(drhs[0], -2.0);
+        assert_close(drhs[1], -2.0);
+    }
+
+    #[tokio::test]
+    async fn test_backward_mul_broadcast_api_cpu() {
+        let graph = Graph::new();
+        let device = Device::cpu();
+        let lhs: Tensor<1> = Tensor::new(&graph, &device, &[2.0f32, 3.0]);
+        let rhs: Tensor<2> = Tensor::new(&graph, &device, &[[10.0f32], [20.0]]);
+
+        let output: Tensor<2> = lhs.mul_::<2, 2>(&rhs);
+        let output_values = output.raw().clone().as_slice().await.unwrap().to_vec2();
+        let gradients = output.flatten_all().sum().backward().unwrap();
+        let dlhs = gradients.get(&lhs).unwrap().as_slice().await.unwrap().to_vec1();
+        let drhs = gradients.get(&rhs).unwrap().as_slice().await.unwrap().to_vec2();
+
+        assert_close(output_values[0][0], 20.0);
+        assert_close(output_values[0][1], 30.0);
+        assert_close(output_values[1][0], 40.0);
+        assert_close(output_values[1][1], 60.0);
+        assert_close(dlhs[0], 30.0);
+        assert_close(dlhs[1], 30.0);
+        assert_close(drhs[0][0], 5.0);
+        assert_close(drhs[1][0], 5.0);
+    }
+
+    #[tokio::test]
+    async fn test_backward_div_broadcast_api_cpu() {
+        let graph = Graph::new();
+        let device = Device::cpu();
+        let lhs: Tensor<2> = Tensor::new(&graph, &device, &[[10.0f32], [20.0]]);
+        let rhs: Tensor<1> = Tensor::new(&graph, &device, &[2.0f32, 4.0]);
+
+        let output: Tensor<2> = lhs.div_::<1, 2>(&rhs);
+        let output_values = output.raw().clone().as_slice().await.unwrap().to_vec2();
+        let gradients = output.flatten_all().sum().backward().unwrap();
+        let dlhs = gradients.get(&lhs).unwrap().as_slice().await.unwrap().to_vec2();
+        let drhs = gradients.get(&rhs).unwrap().as_slice().await.unwrap().to_vec1();
+
+        assert_close(output_values[0][0], 5.0);
+        assert_close(output_values[0][1], 2.5);
+        assert_close(output_values[1][0], 10.0);
+        assert_close(output_values[1][1], 5.0);
+        assert_close(dlhs[0][0], 0.75);
+        assert_close(dlhs[1][0], 0.75);
+        assert_close(drhs[0], -7.5);
+        assert_close(drhs[1], -1.875);
+    }
+
+    #[tokio::test]
+    async fn test_backward_pow_broadcast_api_cpu() {
+        let graph = Graph::new();
+        let device = Device::cpu();
+        let lhs: Tensor<1> = Tensor::new(&graph, &device, &[2.0f32, 3.0]);
+        let rhs: Tensor<2> = Tensor::new(&graph, &device, &[[2.0f32], [1.0]]);
+
+        let output: Tensor<2> = lhs.pow_::<2, 2>(&rhs);
+        let output_values = output.raw().clone().as_slice().await.unwrap().to_vec2();
+        let gradients = output.flatten_all().sum().backward().unwrap();
+        let dlhs = gradients.get(&lhs).unwrap().as_slice().await.unwrap().to_vec1();
+        let drhs = gradients.get(&rhs).unwrap().as_slice().await.unwrap().to_vec2();
+
+        assert_close(output_values[0][0], 4.0);
+        assert_close(output_values[0][1], 9.0);
+        assert_close(output_values[1][0], 2.0);
+        assert_close(output_values[1][1], 3.0);
+        assert_close(dlhs[0], 5.0);
+        assert_close(dlhs[1], 7.0);
+        assert_close(drhs[0][0], 12.660099);
+        assert_close(drhs[1][0], 4.6821313);
+    }
+
+    #[tokio::test]
+    async fn test_backward_chunk_cpu() {
+        let graph = Graph::new();
+        let device = Device::cpu();
+        let input: Tensor<2> = Tensor::new(
+            &graph,
+            &device,
+            &[[1.0f32, 2.0, 3.0, 4.0], [5.0, 6.0, 7.0, 8.0]],
+        );
+
+        let chunks = input.chunk(2, 1);
+        assert_eq!(chunks.len(), 2);
+        let first = chunks[0].raw().clone().as_slice().await.unwrap().to_vec2();
+        let second = chunks[1].raw().clone().as_slice().await.unwrap().to_vec2();
+        let loss = chunks[0]
+            .flatten_all()
+            .sum()
+            .add(&chunks[1].flatten_all().sum().mul_scalar(2.0));
+        let gradients = loss.backward().unwrap();
+        let dinput = gradients.get(&input).unwrap().as_slice().await.unwrap().to_vec2();
+
+        assert_close(first[0][0], 1.0);
+        assert_close(first[0][1], 2.0);
+        assert_close(first[1][0], 5.0);
+        assert_close(first[1][1], 6.0);
+        assert_close(second[0][0], 3.0);
+        assert_close(second[0][1], 4.0);
+        assert_close(second[1][0], 7.0);
+        assert_close(second[1][1], 8.0);
+        assert_close(dinput[0][0], 1.0);
+        assert_close(dinput[0][1], 1.0);
+        assert_close(dinput[0][2], 2.0);
+        assert_close(dinput[0][3], 2.0);
+        assert_close(dinput[1][0], 1.0);
+        assert_close(dinput[1][1], 1.0);
+        assert_close(dinput[1][2], 2.0);
+        assert_close(dinput[1][3], 2.0);
+    }
+
+    #[tokio::test]
+    async fn test_backward_softmax_slow_matches_softmax_cpu() {
+        let device = Device::cpu();
+
+        let slow_graph = Graph::new();
+        let slow_input: Tensor<2> =
+            Tensor::new(&slow_graph, &device, &[[1.0f32, 2.0], [3.0, 4.0]]);
+        let slow_weights: Tensor<2> =
+            Tensor::new(&slow_graph, &device, &[[0.5f32, 1.5], [2.5, 3.5]]);
+        let slow_output = slow_input.softmax_slow::<1>(1);
+        let slow_values = slow_output.raw().clone().as_slice().await.unwrap().to_vec2();
+        let slow_loss = slow_output.mul(&slow_weights).flatten_all().sum();
+        let slow_gradients = slow_loss.backward().unwrap();
+        let slow_dinput = slow_gradients
+            .get(&slow_input)
+            .unwrap()
+            .as_slice()
+            .await
+            .unwrap()
+            .to_vec2();
+
+        let regular_graph = Graph::new();
+        let regular_input: Tensor<2> =
+            Tensor::new(&regular_graph, &device, &[[1.0f32, 2.0], [3.0, 4.0]]);
+        let regular_weights: Tensor<2> =
+            Tensor::new(&regular_graph, &device, &[[0.5f32, 1.5], [2.5, 3.5]]);
+        let regular_output = regular_input.softmax::<1>(1);
+        let regular_values = regular_output.raw().clone().as_slice().await.unwrap().to_vec2();
+        let regular_loss = regular_output.mul(&regular_weights).flatten_all().sum();
+        let regular_gradients = regular_loss.backward().unwrap();
+        let regular_dinput = regular_gradients
+            .get(&regular_input)
+            .unwrap()
+            .as_slice()
+            .await
+            .unwrap()
+            .to_vec2();
+
+        assert_close(slow_values[0][0], regular_values[0][0]);
+        assert_close(slow_values[0][1], regular_values[0][1]);
+        assert_close(slow_values[1][0], regular_values[1][0]);
+        assert_close(slow_values[1][1], regular_values[1][1]);
+        assert_close(slow_dinput[0][0], regular_dinput[0][0]);
+        assert_close(slow_dinput[0][1], regular_dinput[0][1]);
+        assert_close(slow_dinput[1][0], regular_dinput[1][0]);
+        assert_close(slow_dinput[1][1], regular_dinput[1][1]);
+    }
+
+    #[tokio::test]
+    async fn test_backward_softmax_slow_last_dim_matches_softmax_last_dim_cpu() {
+        let device = Device::cpu();
+
+        let slow_graph = Graph::new();
+        let slow_input: Tensor<3> = Tensor::new(
+            &slow_graph,
+            &device,
+            &[[[1.0f32, 2.0], [3.0, 4.0]], [[5.0, 6.0], [7.0, 8.0]]],
+        );
+        let slow_weights: Tensor<3> = Tensor::new(
+            &slow_graph,
+            &device,
+            &[[[0.5f32, 1.5], [2.5, 3.5]], [[4.5, 5.5], [6.5, 7.5]]],
+        );
+        let slow_output = slow_input.softmax_slow_last_dim::<2>();
+        let slow_values = slow_output.raw().clone().as_slice().await.unwrap();
+        let slow_loss = slow_output.mul(&slow_weights).flatten_all().sum();
+        let slow_gradients = slow_loss.backward().unwrap();
+        let slow_dinput = slow_gradients.get(&slow_input).unwrap().as_slice().await.unwrap();
+
+        let regular_graph = Graph::new();
+        let regular_input: Tensor<3> = Tensor::new(
+            &regular_graph,
+            &device,
+            &[[[1.0f32, 2.0], [3.0, 4.0]], [[5.0, 6.0], [7.0, 8.0]]],
+        );
+        let regular_weights: Tensor<3> = Tensor::new(
+            &regular_graph,
+            &device,
+            &[[[0.5f32, 1.5], [2.5, 3.5]], [[4.5, 5.5], [6.5, 7.5]]],
+        );
+        let regular_output = regular_input.softmax_last_dim::<2>();
+        let regular_values = regular_output.raw().clone().as_slice().await.unwrap();
+        let regular_loss = regular_output.mul(&regular_weights).flatten_all().sum();
+        let regular_gradients = regular_loss.backward().unwrap();
+        let regular_dinput = regular_gradients
+            .get(&regular_input)
+            .unwrap()
+            .as_slice()
+            .await
+            .unwrap();
+
+        for batch in 0..2 {
+            for row in 0..2 {
+                for col in 0..2 {
+                    assert_close(slow_values[[batch, row, col]], regular_values[[batch, row, col]]);
+                    assert_close(
+                        slow_dinput[[batch, row, col]],
+                        regular_dinput[[batch, row, col]],
+                    );
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_backward_matmul_cpu() {
+        let graph = Graph::new();
+        let device = Device::cpu();
+        let lhs: Tensor<2> = Tensor::new(&graph, &device, &[[1.0f32, 2.0], [3.0, 4.0]]);
+        let rhs: Tensor<2> = Tensor::new(&graph, &device, &[[5.0f32, 6.0], [7.0, 8.0]]);
+
+        let output = lhs.matmul(&rhs);
+        let output_values = output.raw().clone().as_slice().await.unwrap();
+        let gradients = output.flatten_all().sum().backward().unwrap();
+        let dlhs = gradients.get(&lhs).unwrap().as_slice().await.unwrap();
+        let drhs = gradients.get(&rhs).unwrap().as_slice().await.unwrap();
+
+        assert_eq!(output_values.shape(), &[2, 2]);
+        assert_close(output_values[[0, 0]], 19.0);
+        assert_close(output_values[[0, 1]], 22.0);
+        assert_close(output_values[[1, 0]], 43.0);
+        assert_close(output_values[[1, 1]], 50.0);
+
+        assert_close(dlhs[[0, 0]], 11.0);
+        assert_close(dlhs[[0, 1]], 15.0);
+        assert_close(dlhs[[1, 0]], 11.0);
+        assert_close(dlhs[[1, 1]], 15.0);
+
+        assert_close(drhs[[0, 0]], 4.0);
+        assert_close(drhs[[0, 1]], 4.0);
+        assert_close(drhs[[1, 0]], 6.0);
+        assert_close(drhs[[1, 1]], 6.0);
+    }
+
+    #[tokio::test]
+    async fn test_backward_t_cpu() {
+        let graph = Graph::new();
+        let device = Device::cpu();
+        let input: Tensor<2> = Tensor::new(&graph, &device, &[[1.0f32, 2.0], [3.0, 4.0]]);
+
+        let output = input.t();
+        let output_values = output.raw().clone().as_slice().await.unwrap();
+        let gradients = output.flatten_all().sum().backward().unwrap();
+        let dinput = gradients.get(&input).unwrap().as_slice().await.unwrap();
+
+        assert_eq!(output_values.shape(), &[2, 2]);
+        assert_close(output_values[[0, 0]], 1.0);
+        assert_close(output_values[[0, 1]], 3.0);
+        assert_close(output_values[[1, 0]], 2.0);
+        assert_close(output_values[[1, 1]], 4.0);
+
+        assert_close(dinput[[0, 0]], 1.0);
+        assert_close(dinput[[0, 1]], 1.0);
+        assert_close(dinput[[1, 0]], 1.0);
+        assert_close(dinput[[1, 1]], 1.0);
+    }
+
+    #[tokio::test]
+    async fn test_backward_pool_cpu() {
+        let graph = Graph::new();
+        let device = Device::cpu();
+        let input: Tensor<3> = Tensor::new(&graph, &device, &[[[1.0f32, 2.0, 3.0, 4.0]]]);
+
+        let output = input.pool::<1, 4, 5, 4>([(2, 1)], |windowed, axis| windowed.mean::<3>(axis));
+        let output_values = output.raw().clone().as_slice().await.unwrap();
+        let gradients = output.flatten_all().sum().backward().unwrap();
+        let dinput = gradients.get(&input).unwrap().as_slice().await.unwrap();
+
+        assert_eq!(output_values.shape(), &[1, 1, 3]);
+        assert_close(output_values[[0, 0, 0]], 1.5);
+        assert_close(output_values[[0, 0, 1]], 2.5);
+        assert_close(output_values[[0, 0, 2]], 3.5);
+
+        assert_close(dinput[[0, 0, 0]], 0.5);
+        assert_close(dinput[[0, 0, 1]], 1.0);
+        assert_close(dinput[[0, 0, 2]], 1.0);
+        assert_close(dinput[[0, 0, 3]], 0.5);
+    }
+
+    #[tokio::test]
+    async fn test_backward_pool_max_cpu() {
+        let graph = Graph::new();
+        let device = Device::cpu();
+        let input: Tensor<3> = Tensor::new(&graph, &device, &[[[1.0f32, 4.0, 2.0, 3.0]]]);
+
+        let output = input.pool_max::<1, 4, 5, 4>([(2, 1)]);
+        let output_values = output.raw().clone().as_slice().await.unwrap();
+        let gradients = output.flatten_all().sum().backward().unwrap();
+        let dinput = gradients.get(&input).unwrap().as_slice().await.unwrap();
+
+        assert_eq!(output_values.shape(), &[1, 1, 3]);
+        assert_close(output_values[[0, 0, 0]], 4.0);
+        assert_close(output_values[[0, 0, 1]], 4.0);
+        assert_close(output_values[[0, 0, 2]], 3.0);
+
+        assert_close(dinput[[0, 0, 0]], 0.0);
+        assert_close(dinput[[0, 0, 1]], 2.0);
+        assert_close(dinput[[0, 0, 2]], 0.0);
+        assert_close(dinput[[0, 0, 3]], 1.0);
+    }
+
+    #[tokio::test]
+    async fn test_backward_pool_min_cpu() {
+        let graph = Graph::new();
+        let device = Device::cpu();
+        let input: Tensor<3> = Tensor::new(&graph, &device, &[[[1.0f32, 4.0, 2.0, 3.0]]]);
+
+        let output = input.pool_min::<1, 4, 5, 4>([(2, 1)]);
+        let output_values = output.raw().clone().as_slice().await.unwrap();
+        let gradients = output.flatten_all().sum().backward().unwrap();
+        let dinput = gradients.get(&input).unwrap().as_slice().await.unwrap();
+
+        assert_eq!(output_values.shape(), &[1, 1, 3]);
+        assert_close(output_values[[0, 0, 0]], 1.0);
+        assert_close(output_values[[0, 0, 1]], 2.0);
+        assert_close(output_values[[0, 0, 2]], 2.0);
+
+        assert_close(dinput[[0, 0, 0]], 1.0);
+        assert_close(dinput[[0, 0, 1]], 0.0);
+        assert_close(dinput[[0, 0, 2]], 2.0);
+        assert_close(dinput[[0, 0, 3]], 0.0);
+    }
+
+    #[tokio::test]
+    async fn test_backward_q_mat_mul_cpu() {
+        let graph = Graph::new();
+        let device = Device::cpu();
+        let input: Tensor<2> = Tensor::new(&graph, &device, &[[1.0f32, 1.0, 1.0, 1.0]]);
+        let weight_bytes: Vec<u8> = [1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]
+            .into_iter()
+            .flat_map(|value| value.to_le_bytes())
+            .collect();
+        let weights = crate::QMatrix::from_raw_bytes(
+            &device,
+            [2, 4],
+            &weight_bytes,
+            fusor_gguf::GgmlType::F32,
+        )
+        .unwrap();
+
+        let output = input.q_mat_mul(&weights);
+        let output_values = output.raw().clone().as_slice().await.unwrap();
+        let gradients = output.flatten_all().sum().backward().unwrap();
+        let dinput = gradients.get(&input).unwrap().as_slice().await.unwrap();
+
+        assert_eq!(output_values.shape(), &[1, 2]);
+        assert_close(output_values[[0, 0]], 10.0);
+        assert_close(output_values[[0, 1]], 26.0);
+
+        assert_close(dinput[[0, 0]], 6.0);
+        assert_close(dinput[[0, 1]], 8.0);
+        assert_close(dinput[[0, 2]], 10.0);
+        assert_close(dinput[[0, 3]], 12.0);
+    }
+
+    #[tokio::test]
+    async fn test_backward_stack_cpu() {
+        let graph = Graph::new();
+        let device = Device::cpu();
+        let first: Tensor<1> = Tensor::new(&graph, &device, &[1.0f32, 2.0]);
+        let second: Tensor<1> = Tensor::new(&graph, &device, &[3.0f32, 4.0]);
+
+        let output = Tensor::stack::<2>(vec![first.clone(), second.clone()], 0);
+        let output_values = output.raw().clone().as_slice().await.unwrap();
+        let gradients = output.flatten_all().sum().backward().unwrap();
+        let dfirst = gradients.get(&first).unwrap().as_slice().await.unwrap().to_vec1();
+        let dsecond = gradients.get(&second).unwrap().as_slice().await.unwrap().to_vec1();
+
+        assert_eq!(output_values.shape(), &[2, 2]);
+        assert_close(output_values[[0, 0]], 1.0);
+        assert_close(output_values[[0, 1]], 2.0);
+        assert_close(output_values[[1, 0]], 3.0);
+        assert_close(output_values[[1, 1]], 4.0);
+
+        assert_close(dfirst[0], 1.0);
+        assert_close(dfirst[1], 1.0);
+        assert_close(dsecond[0], 1.0);
+        assert_close(dsecond[1], 1.0);
+    }
+
+    #[tokio::test]
+    async fn test_backward_rope_cpu() {
+        let graph = Graph::new();
+        let device = Device::cpu();
+        let input: Tensor<4> =
+            Tensor::new(&graph, &device, &[[[[1.0f32, 2.0, 3.0, 4.0], [5.0, 6.0, 7.0, 8.0]]]]);
+        let cos: Tensor<2> = Tensor::new(&graph, &device, &[[1.0f32, 1.0], [1.0, 1.0]]);
+        let sin: Tensor<2> = Tensor::new(&graph, &device, &[[0.0f32, 0.0], [0.0, 0.0]]);
+
+        let output = input.rope(&cos, &sin);
+        let output_values = output.raw().clone().as_slice().await.unwrap();
+        let gradients = output.flatten_all().sum().backward().unwrap();
+        let dinput = gradients.get(&input).unwrap().as_slice().await.unwrap();
+        let dcos = gradients.get(&cos).unwrap().as_slice().await.unwrap();
+        let dsin = gradients.get(&sin).unwrap().as_slice().await.unwrap();
+
+        assert_eq!(output_values.shape(), &[1, 1, 2, 4]);
+        assert_close(output_values[[0, 0, 0, 0]], 1.0);
+        assert_close(output_values[[0, 0, 0, 1]], 2.0);
+        assert_close(output_values[[0, 0, 0, 2]], 3.0);
+        assert_close(output_values[[0, 0, 0, 3]], 4.0);
+        assert_close(output_values[[0, 0, 1, 0]], 5.0);
+        assert_close(output_values[[0, 0, 1, 1]], 6.0);
+        assert_close(output_values[[0, 0, 1, 2]], 7.0);
+        assert_close(output_values[[0, 0, 1, 3]], 8.0);
+
+        for index in [[0, 0, 0, 0], [0, 0, 0, 1], [0, 0, 0, 2], [0, 0, 0, 3], [0, 0, 1, 0], [0, 0, 1, 1], [0, 0, 1, 2], [0, 0, 1, 3]] {
+            assert_close(dinput[index], 1.0);
+        }
+
+        assert_close(dcos[[0, 0]], 4.0);
+        assert_close(dcos[[0, 1]], 6.0);
+        assert_close(dcos[[1, 0]], 12.0);
+        assert_close(dcos[[1, 1]], 14.0);
+
+        assert_close(dsin[[0, 0]], -2.0);
+        assert_close(dsin[[0, 1]], -2.0);
+        assert_close(dsin[[1, 0]], -2.0);
+        assert_close(dsin[[1, 1]], -2.0);
+    }
+
+    #[tokio::test]
+    async fn test_backward_rope_fused_cpu() {
+        let graph = Graph::new();
+        let device = Device::cpu();
+        let input: Tensor<4> =
+            Tensor::new(&graph, &device, &[[[[1.0f32, 2.0, 3.0, 4.0], [5.0, 6.0, 7.0, 8.0]]]]);
+        let cos: Tensor<2> = Tensor::new(&graph, &device, &[[1.0f32, 1.0], [1.0, 1.0]]);
+        let sin: Tensor<2> = Tensor::new(&graph, &device, &[[0.0f32, 0.0], [0.0, 0.0]]);
+
+        let output = input.rope_fused(&cos, &sin);
+        let output_values = output.raw().clone().as_slice().await.unwrap();
+        let gradients = output.flatten_all().sum().backward().unwrap();
+        let dinput = gradients.get(&input).unwrap().as_slice().await.unwrap();
+        let dcos = gradients.get(&cos).unwrap().as_slice().await.unwrap();
+        let dsin = gradients.get(&sin).unwrap().as_slice().await.unwrap();
+
+        assert_eq!(output_values.shape(), &[1, 1, 2, 4]);
+        assert_close(output_values[[0, 0, 0, 0]], 1.0);
+        assert_close(output_values[[0, 0, 0, 1]], 2.0);
+        assert_close(output_values[[0, 0, 0, 2]], 3.0);
+        assert_close(output_values[[0, 0, 0, 3]], 4.0);
+        assert_close(output_values[[0, 0, 1, 0]], 5.0);
+        assert_close(output_values[[0, 0, 1, 1]], 6.0);
+        assert_close(output_values[[0, 0, 1, 2]], 7.0);
+        assert_close(output_values[[0, 0, 1, 3]], 8.0);
+
+        for index in [[0, 0, 0, 0], [0, 0, 0, 1], [0, 0, 0, 2], [0, 0, 0, 3], [0, 0, 1, 0], [0, 0, 1, 1], [0, 0, 1, 2], [0, 0, 1, 3]] {
+            assert_close(dinput[index], 1.0);
+        }
+
+        assert_close(dcos[[0, 0]], 3.0);
+        assert_close(dcos[[0, 1]], 7.0);
+        assert_close(dcos[[1, 0]], 11.0);
+        assert_close(dcos[[1, 1]], 15.0);
+
+        assert_close(dsin[[0, 0]], -1.0);
+        assert_close(dsin[[0, 1]], -1.0);
+        assert_close(dsin[[1, 0]], -1.0);
+        assert_close(dsin[[1, 1]], -1.0);
+    }
+
+    #[tokio::test]
+    async fn test_backward_rope_interleaved_cpu() {
+        let graph = Graph::new();
+        let device = Device::cpu();
+        let input: Tensor<4> =
+            Tensor::new(&graph, &device, &[[[[1.0f32, 2.0, 3.0, 4.0], [5.0, 6.0, 7.0, 8.0]]]]);
+        let cos: Tensor<2> = Tensor::new(&graph, &device, &[[1.0f32, 1.0], [1.0, 1.0]]);
+        let sin: Tensor<2> = Tensor::new(&graph, &device, &[[0.0f32, 0.0], [0.0, 0.0]]);
+
+        let output = input.rope_interleaved(&cos, &sin);
+        let output_values = output.raw().clone().as_slice().await.unwrap();
+        let gradients = output.flatten_all().sum().backward().unwrap();
+        let dinput = gradients.get(&input).unwrap().as_slice().await.unwrap();
+        let dcos = gradients.get(&cos).unwrap().as_slice().await.unwrap();
+        let dsin = gradients.get(&sin).unwrap().as_slice().await.unwrap();
+
+        assert_eq!(output_values.shape(), &[1, 1, 2, 4]);
+        assert_close(output_values[[0, 0, 0, 0]], 1.0);
+        assert_close(output_values[[0, 0, 0, 1]], 2.0);
+        assert_close(output_values[[0, 0, 0, 2]], 3.0);
+        assert_close(output_values[[0, 0, 0, 3]], 4.0);
+        assert_close(output_values[[0, 0, 1, 0]], 5.0);
+        assert_close(output_values[[0, 0, 1, 1]], 6.0);
+        assert_close(output_values[[0, 0, 1, 2]], 7.0);
+        assert_close(output_values[[0, 0, 1, 3]], 8.0);
+
+        for index in [[0, 0, 0, 0], [0, 0, 0, 1], [0, 0, 0, 2], [0, 0, 0, 3], [0, 0, 1, 0], [0, 0, 1, 1], [0, 0, 1, 2], [0, 0, 1, 3]] {
+            assert_close(dinput[index], 1.0);
+        }
+
+        assert_close(dcos[[0, 0]], 3.0);
+        assert_close(dcos[[0, 1]], 7.0);
+        assert_close(dcos[[1, 0]], 11.0);
+        assert_close(dcos[[1, 1]], 15.0);
+
+        assert_close(dsin[[0, 0]], -1.0);
+        assert_close(dsin[[0, 1]], -1.0);
+        assert_close(dsin[[1, 0]], -1.0);
+        assert_close(dsin[[1, 1]], -1.0);
+    }
+
+    #[tokio::test]
+    async fn test_backward_rope_normal_fused_cpu() {
+        let graph = Graph::new();
+        let device = Device::cpu();
+        let input: Tensor<4> =
+            Tensor::new(&graph, &device, &[[[[1.0f32, 2.0, 3.0, 4.0], [5.0, 6.0, 7.0, 8.0]]]]);
+        let cos: Tensor<2> = Tensor::new(&graph, &device, &[[1.0f32, 1.0], [1.0, 1.0]]);
+        let sin: Tensor<2> = Tensor::new(&graph, &device, &[[0.0f32, 0.0], [0.0, 0.0]]);
+
+        let output = input.rope_normal_fused(&cos, &sin);
+        let output_values = output.raw().clone().as_slice().await.unwrap();
+        let gradients = output.flatten_all().sum().backward().unwrap();
+        let dinput = gradients.get(&input).unwrap().as_slice().await.unwrap();
+        let dcos = gradients.get(&cos).unwrap().as_slice().await.unwrap();
+        let dsin = gradients.get(&sin).unwrap().as_slice().await.unwrap();
+
+        assert_eq!(output_values.shape(), &[1, 1, 2, 4]);
+        assert_close(output_values[[0, 0, 0, 0]], 1.0);
+        assert_close(output_values[[0, 0, 0, 1]], 2.0);
+        assert_close(output_values[[0, 0, 0, 2]], 3.0);
+        assert_close(output_values[[0, 0, 0, 3]], 4.0);
+        assert_close(output_values[[0, 0, 1, 0]], 5.0);
+        assert_close(output_values[[0, 0, 1, 1]], 6.0);
+        assert_close(output_values[[0, 0, 1, 2]], 7.0);
+        assert_close(output_values[[0, 0, 1, 3]], 8.0);
+
+        for index in [[0, 0, 0, 0], [0, 0, 0, 1], [0, 0, 0, 2], [0, 0, 0, 3], [0, 0, 1, 0], [0, 0, 1, 1], [0, 0, 1, 2], [0, 0, 1, 3]] {
+            assert_close(dinput[index], 1.0);
+        }
+
+        assert_close(dcos[[0, 0]], 4.0);
+        assert_close(dcos[[0, 1]], 6.0);
+        assert_close(dcos[[1, 0]], 12.0);
+        assert_close(dcos[[1, 1]], 14.0);
+
+        assert_close(dsin[[0, 0]], -2.0);
+        assert_close(dsin[[0, 1]], -2.0);
+        assert_close(dsin[[1, 0]], -2.0);
+        assert_close(dsin[[1, 1]], -2.0);
+    }
+
+    #[tokio::test]
+    async fn test_backward_pow_cpu() {
+        let graph = Graph::new();
+        let device = Device::cpu();
+        let lhs: Tensor<1> = Tensor::new(&graph, &device, &[2.0f32]);
+        let rhs: Tensor<1> = Tensor::new(&graph, &device, &[3.0f32]);
+
+        let output = lhs.pow(&rhs);
+        let output_values = output.raw().clone().as_slice().await.unwrap().to_vec1();
+        let gradients = output.sum().backward().unwrap();
+        let dlhs = gradients
+            .get(&lhs)
+            .unwrap()
+            .as_slice()
+            .await
+            .unwrap()
+            .to_vec1();
+        let drhs = gradients
+            .get(&rhs)
+            .unwrap()
+            .as_slice()
+            .await
+            .unwrap()
+            .to_vec1();
+
+        assert_close(output_values[0], 8.0);
+        assert_close(dlhs[0], 12.0);
+        assert_close(drhs[0], 8.0 * 2.0f32.ln());
+    }
+
+    #[tokio::test]
+    async fn test_backward_pow_elementwise_cpu() {
+        let graph = Graph::new();
+        let device = Device::cpu();
+        let input: Tensor<1> = Tensor::new(&graph, &device, &[3.0f32]);
+
+        let output = input.pow_elementwise(2.0);
+        let output_values = output.raw().clone().as_slice().await.unwrap().to_vec1();
+        let gradients = output.sum().backward().unwrap();
+        let dinput = gradients
+            .get(&input)
+            .unwrap()
+            .as_slice()
+            .await
+            .unwrap()
+            .to_vec1();
+
+        assert_close(output_values[0], 9.0);
+        assert_close(dinput[0], 6.0);
+    }
+
+    #[tokio::test]
+    async fn test_backward_pow_scalar_cpu() {
+        let graph = Graph::new();
+        let device = Device::cpu();
+        let input: Tensor<1> = Tensor::new(&graph, &device, &[4.0f32]);
+
+        let output = input.pow_scalar(0.5);
+        let output_values = output.raw().clone().as_slice().await.unwrap().to_vec1();
+        let gradients = output.sum().backward().unwrap();
+        let dinput = gradients
+            .get(&input)
+            .unwrap()
+            .as_slice()
+            .await
+            .unwrap()
+            .to_vec1();
+
+        assert_close(output_values[0], 2.0);
+        assert_close(dinput[0], 0.25);
     }
 
     #[tokio::test]
