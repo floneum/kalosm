@@ -3,7 +3,6 @@ use crate::{
     compute_graph::NodeIndex,
     mir::{inputs::MirValue, kernel::GenericKernel, operation::Operation},
 };
-use fusor_gguf::GgmlType;
 
 use super::QMatrix;
 

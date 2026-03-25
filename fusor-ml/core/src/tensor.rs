@@ -237,11 +237,6 @@ impl LazyTensorData {
         }
     }
 
-    pub(crate) fn reference(device: Device, info: TensorInfo, key: NodeIndex) -> Self {
-        device.compute_graph().add_reference(key);
-        Self { device, info, key }
-    }
-
     pub(crate) fn from_parts(device: Device, info: TensorInfo, key: NodeIndex) -> Self {
         Self { device, info, key }
     }
@@ -360,21 +355,8 @@ impl LazyTensorData {
     }
 
     pub(crate) fn materialize(&self) -> (TensorData, usize) {
-        let result = self.device.compute_graph().resolve(self.key, &self.device);
+        let result = self.device.compute_graph().resolve(self.key);
         (result.data, result.total_kernels)
-    }
-
-    pub(crate) fn device(&self) -> &Device {
-        &self.device
-    }
-
-    pub(crate) fn info(&self) -> &TensorInfo {
-        &self.info
-    }
-
-    /// Return the compute-graph node index for this lazy tensor.
-    pub fn key(&self) -> NodeIndex {
-        self.key
     }
 
     pub fn graphvis(&self) -> Graph {

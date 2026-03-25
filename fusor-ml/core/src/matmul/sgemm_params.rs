@@ -32,7 +32,6 @@ pub fn gemm_parameters(m: usize, n: usize, k: usize) -> SgemmParams {
     let diff_mn = (m - n).abs();
     let diff_nk = (n - k).abs();
     let diff_mk = (m - k).abs();
-    let m_eq_n = if m_u == n_u { 1.0 } else { 0.0 };
     let m_eq_k = if m_u == k_u { 1.0 } else { 0.0 };
     let gcd_mn = gcd(m_u, n_u) as f32;
     let gcd_nk = gcd(n_u, k_u) as f32;

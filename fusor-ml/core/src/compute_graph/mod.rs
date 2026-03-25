@@ -87,7 +87,7 @@ impl ComputeGraph {
         self.create_node(ComputeGraphNodeVariant::Custom(op))
     }
 
-    pub(crate) fn resolve(&self, key: NodeIndex, device: &Device) -> ResolverResult {
+    pub(crate) fn resolve(&self, key: NodeIndex) -> ResolverResult {
         let (data, removed) = {
             let mut inner = self.inner.write();
             let mut removed = Vec::new();
@@ -109,7 +109,7 @@ impl ComputeGraph {
     /// execution graph so intermediate nodes can be freed as soon as every
     /// consumer within the batch has been computed, keeping peak GPU memory
     /// much lower than resolving targets one-by-one.
-    pub(crate) fn resolve_batch(&self, keys: &[NodeIndex], device: &Device) {
+    pub(crate) fn resolve_batch(&self, keys: &[NodeIndex]) {
         if keys.is_empty() {
             return;
         }

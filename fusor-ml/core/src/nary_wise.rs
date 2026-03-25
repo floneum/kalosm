@@ -118,10 +118,6 @@ impl UnaryFunctionChain {
             self.input_datatype
         }
     }
-
-    pub fn is_empty(&self) -> bool {
-        self.functions.is_empty()
-    }
 }
 
 /// Result of extracting a unary function chain from an NaryOperation.

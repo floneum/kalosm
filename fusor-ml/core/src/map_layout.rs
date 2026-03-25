@@ -1,7 +1,7 @@
 use std::{fmt::Debug, sync::Arc};
 
 use crate::{
-    D, DataType, Dim, Layout, MaxRank, Tensor, TensorData, compute_graph::NodeIndex,
+     DataType, Layout, MaxRank, Tensor, TensorData, compute_graph::NodeIndex,
     mir::operation::Operation,
 };
 
@@ -112,36 +112,6 @@ impl<const R: usize, T: DataType> Tensor<R, T> {
         self.add_map_layout(MapLayoutOperation::new(self.key(), move |_| {
             new_layout.clone()
         }))
-    }
-
-    pub(crate) fn transpose(
-        &self,
-        first_axis: impl Dim<R>,
-        second_axis: impl Dim<R>,
-    ) -> Tensor<R, T> {
-        let first_axis = first_axis.resolve();
-        let second_axis = second_axis.resolve();
-        let shape = self.shape();
-        let specs: [crate::StrideSpec; R] = std::array::from_fn(|i| {
-            if i == first_axis {
-                crate::StrideSpec::dim(second_axis, shape[second_axis])
-            } else if i == second_axis {
-                crate::StrideSpec::dim(first_axis, shape[first_axis])
-            } else {
-                crate::StrideSpec::dim(i, shape[i])
-            }
-        });
-        self.restride(specs)
-    }
-
-    pub(crate) fn t(&self) -> Tensor<R, T> {
-        const {
-            assert!(
-                R >= 2,
-                "The tensor must have at least 2 dimensions to transpose"
-            )
-        };
-        self.transpose(D::Minus1, D::Minus2)
     }
 
     pub(crate) fn broadcast_as<const R2: usize>(&self, out_shape: [usize; R2]) -> Tensor<R2, T> {

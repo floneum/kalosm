@@ -385,9 +385,6 @@ impl Device {
         self.inner.cache.as_ref()
     }
 
-    pub(crate) fn wgpu_cache_file(&self) -> Option<&PathBuf> {
-        self.inner.cache_file.as_ref()
-    }
 
     pub(crate) fn bind_group_layout_cache(
         &self,
@@ -538,7 +535,7 @@ impl Device {
     /// consumer within the batch has been computed. This keeps peak GPU memory
     /// much lower than resolving targets one-by-one.
     pub fn resolve_batch(&self, keys: &[crate::compute_graph::NodeIndex]) {
-        self.compute_graph().resolve_batch(keys, self);
+        self.compute_graph().resolve_batch(keys);
     }
 }
 
