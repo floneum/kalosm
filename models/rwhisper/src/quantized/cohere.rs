@@ -486,6 +486,33 @@ impl DecoderAttention {
             .to_concrete();
         self.out_projection.forward(&context)
     }
+
+    fn forward_with_attention(
+        &self,
+        hidden_states: &Tensor<3, f32>,
+        context_states: Option<&Tensor<3, f32>>,
+        attention_mask: Option<&Tensor<4, f32>>,
+    ) -> (Tensor<3, f32>, Tensor<4, f32>) {
+        let [batch, time, _] = hidden_states.shape();
+        let source = context_states.unwrap_or(hidden_states);
+        let q = self.reshape_heads(&self.query_net.forward(hidden_states));
+        let k = self.reshape_heads(&self.key_net.forward(source));
+        let v = self.reshape_heads(&self.value_net.forward(source));
+        let mut scores = q
+            .mat_mul(&k.transpose(2, 3).to_concrete())
+            .to_concrete()
+            .mul_scalar(self.scale);
+        if let Some(mask) = attention_mask {
+            scores = scores.add_(mask);
+        }
+        let attn = scores.softmax_last_dim_fused().to_concrete();
+        let context = attn
+            .mat_mul(&v)
+            .transpose(1, 2)
+            .reshape([batch, time, self.num_heads * self.head_dim])
+            .to_concrete();
+        (self.out_projection.forward(&context), attn)
+    }
 }
 
 struct DecoderFeedForward {
@@ -544,6 +571,33 @@ impl TransformerDecoderLayer {
         .to_concrete();
         let residual = hidden_states.clone();
         (residual + self.third_sub_layer.forward(&self.layer_norm_3.forward(&hidden_states))).to_concrete()
+    }
+
+    fn forward_with_cross_attention(
+        &self,
+        hidden_states: &Tensor<3, f32>,
+        encoder_hidden_states: &Tensor<3, f32>,
+        self_attention_mask: &Tensor<4, f32>,
+        cross_attention_mask: Option<&Tensor<4, f32>>,
+    ) -> (Tensor<3, f32>, Tensor<4, f32>) {
+        let residual = hidden_states.clone();
+        let hidden_states = (residual
+            + self
+                .first_sub_layer
+                .forward(&self.layer_norm_1.forward(hidden_states), None, Some(self_attention_mask)))
+        .to_concrete();
+        let residual = hidden_states.clone();
+        let (cross_hidden, cross_attention) = self.second_sub_layer.forward_with_attention(
+            &self.layer_norm_2.forward(&hidden_states),
+            Some(encoder_hidden_states),
+            cross_attention_mask,
+        );
+        let hidden_states = (residual + cross_hidden).to_concrete();
+        let residual = hidden_states.clone();
+        let hidden_states =
+            (residual + self.third_sub_layer.forward(&self.layer_norm_3.forward(&hidden_states)))
+                .to_concrete();
+        (hidden_states, cross_attention)
     }
 }
 
@@ -607,6 +661,41 @@ impl TransformerDecoder {
             hidden_states = layer.forward(&hidden_states, encoder_hidden_states, &self_mask, cross_mask.as_ref());
         }
         self.final_layer_norm.forward(&hidden_states)
+    }
+
+    fn forward_with_cross_attention(
+        &self,
+        input_ids: &Tensor<2, u32>,
+        encoder_hidden_states: &Tensor<3, f32>,
+        encoder_length: usize,
+    ) -> (Tensor<3, f32>, Vec<Tensor<4, f32>>) {
+        let [batch, seq_len] = input_ids.shape();
+        let positions: Vec<u32> = (0..seq_len as u32).collect();
+        let positions = Tensor::from_slice(&input_ids.device(), [batch, seq_len], &positions);
+        let mut hidden_states = self.embedding.forward(input_ids, &positions);
+        let self_mask = causal_mask(&input_ids.device(), seq_len);
+        let cross_mask = if encoder_length < encoder_hidden_states.shape()[1] {
+            Some(encoder_attention_mask(
+                &input_ids.device(),
+                encoder_hidden_states.shape()[0],
+                encoder_hidden_states.shape()[1],
+                encoder_length,
+            ))
+        } else {
+            None
+        };
+        let mut cross_attentions = Vec::with_capacity(self.layers.len());
+        for layer in &self.layers {
+            let (next_hidden, cross_attention) = layer.forward_with_cross_attention(
+                &hidden_states,
+                encoder_hidden_states,
+                &self_mask,
+                cross_mask.as_ref(),
+            );
+            hidden_states = next_hidden;
+            cross_attentions.push(cross_attention);
+        }
+        (self.final_layer_norm.forward(&hidden_states), cross_attentions)
     }
 }
 
@@ -846,5 +935,60 @@ impl Cohere {
         }
 
         Ok(tokens[prompt_ids.len()..].to_vec())
+    }
+
+    pub async fn generate_greedy_with_attention(
+        &self,
+        input_features: &Tensor<3, f32>,
+        length: usize,
+        prompt_ids: &[u32],
+        eos_token_id: u32,
+        max_new_tokens: usize,
+    ) -> Result<(Vec<u32>, Vec<Tensor<4, f32>>, usize)> {
+        let (encoder_hidden_states, encoder_length) = self.encode(input_features, length);
+        let mut tokens = prompt_ids.to_vec();
+        let mut collected_attentions: Vec<Vec<Tensor<4, f32>>> =
+            (0..self.decoder.layers.len()).map(|_| Vec::new()).collect();
+
+        for _ in 0..max_new_tokens {
+            let input_ids = Tensor::from_slice(&input_features.device(), [1, tokens.len()], &tokens);
+            let (hidden_states, cross_attentions) = self
+                .decoder
+                .forward_with_cross_attention(&input_ids, &encoder_hidden_states, encoder_length);
+            let last_hidden = hidden_states.narrow(1, tokens.len() - 1, 1).to_concrete();
+            let logits = self.lm_head(&last_hidden);
+            let logits = logits.as_slice().await?;
+
+            let mut best_token = 0u32;
+            let mut best_value = f32::NEG_INFINITY;
+            for token_id in 0..self.config.vocab_size {
+                let value = logits[[0, 0, token_id]];
+                if value > best_value {
+                    best_value = value;
+                    best_token = token_id as u32;
+                }
+            }
+
+            if best_token == eos_token_id {
+                break;
+            }
+            for (layer, attn) in cross_attentions.into_iter().enumerate() {
+                collected_attentions[layer].push(attn.narrow(2, tokens.len() - 1, 1).to_concrete());
+            }
+            tokens.push(best_token);
+        }
+
+        let collected_attentions = collected_attentions
+            .into_iter()
+            .filter_map(|attentions| {
+                if attentions.is_empty() {
+                    None
+                } else {
+                    Some(Tensor::cat(attentions, 2))
+                }
+            })
+            .collect();
+
+        Ok((tokens[prompt_ids.len()..].to_vec(), collected_attentions, encoder_length))
     }
 }

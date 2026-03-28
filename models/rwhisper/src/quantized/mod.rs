@@ -9,7 +9,7 @@ use fusor::{
 };
 use timestamps::extract_timestamps;
 
-use crate::config::Config;
+use crate::config::{Config, HOP_LENGTH, N_FRAMES, SAMPLE_RATE};
 
 pub(crate) mod timestamps;
 pub(crate) mod cohere;
@@ -558,10 +558,11 @@ impl Whisper {
         }
 
         extract_timestamps(
-            attention_heads,
+            Some(attention_heads),
             &attention_output_tensor,
             filter_width,
-            n_frames,
+            n_frames.min(N_FRAMES) / 2,
+            crate::WhisperDType::from((HOP_LENGTH * 2) as f32 / SAMPLE_RATE as f32),
             mask,
         )
         .await

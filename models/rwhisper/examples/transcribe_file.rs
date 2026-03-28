@@ -60,6 +60,9 @@ async fn main() -> Result<(), anyhow::Error> {
     } else {
         model.transcribe(audio)
     };
+    if std::env::var("RWHISPER_TIMESTAMPED").ok().as_deref() == Some("1") {
+        text = text.timestamped();
+    }
 
     eprintln!("Waiting for segments...");
     let mut segment_count = 0;
@@ -73,10 +76,14 @@ async fn main() -> Result<(), anyhow::Error> {
             chunks.len()
         );
         for chunk in chunks {
-            eprintln!("Chunk: {:?}", chunk);
-            print!("{chunk}");
-            // Play the audio chunk
             if let Some(timestamp) = chunk.timestamp() {
+                println!(
+                    "{:?}\t{:.3}..{:.3}",
+                    chunk.text(),
+                    timestamp.start,
+                    timestamp.end
+                );
+                // Play the audio chunk
                 let (_stream, stream_handle) = rodio::OutputStream::try_default()?;
                 let sink = rodio::Sink::try_new(&stream_handle).unwrap();
                 let start = timestamp.start;
@@ -88,6 +95,8 @@ async fn main() -> Result<(), anyhow::Error> {
                 let audio_source = rodio::buffer::SamplesBuffer::new(1, rate as u32, audio_chunk);
                 sink.append(audio_source);
                 sink.sleep_until_end();
+            } else {
+                print!("{chunk}");
             }
         }
     }

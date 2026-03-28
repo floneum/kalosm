@@ -198,7 +198,10 @@ impl WhisperInner {
                 }
             }
             Self::Cohere(runtime) => {
-                if let Err(err) = runtime.transcribe(pcm_data, language, result).await {
+                if let Err(err) = runtime
+                    .transcribe(pcm_data, language, word_level_time_stamps, result)
+                    .await
+                {
                     tracing::error!("Error transcribing audio: {err}");
                 }
             }

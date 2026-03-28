@@ -3,10 +3,11 @@ use half::bf16;
 use tokenizers::Tokenizer;
 
 use crate::{
-    cohere_audio::pcm_to_features, cohere_config::CohereConfig, quantized::cohere::Cohere,
+    cohere_audio::pcm_to_features, cohere_config::CohereConfig, quantized::{cohere::Cohere, timestamps::extract_timestamps},
     DecodingResult, Segment, TokenChunk, WhisperLanguage,
 };
 use fusor::{Device, Tensor, VarBuilder};
+use std::num::NonZeroUsize;
 
 pub(crate) struct CohereRuntime {
     device: Device,
@@ -72,7 +73,8 @@ impl CohereRuntime {
         &self,
         samples: &[f32],
         language: WhisperLanguage,
-    ) -> Result<String, crate::model::WhisperError> {
+        with_timestamps: bool,
+    ) -> Result<DecodingResult, crate::model::WhisperError> {
         let prompt_ids = self.prompt_ids(language)?;
         let (features, total_frames, valid_frames) =
             pcm_to_features(&self.model.config, samples, &self.filterbank);
@@ -81,31 +83,107 @@ impl CohereRuntime {
             [1, self.model.config.preprocessor.features, total_frames],
             &features,
         );
-        let generated = self
-            .model
-            .generate_greedy(
-                &input_features,
-                valid_frames,
-                &prompt_ids,
-                self.eos_token,
-                self.max_new_tokens,
+        let (generated, token_timestamps) = if with_timestamps {
+            let (generated, cross_attentions, encoder_length) = self
+                .model
+                .generate_greedy_with_attention(
+                    &input_features,
+                    valid_frames,
+                    &prompt_ids,
+                    self.eos_token,
+                    self.max_new_tokens,
+                )
+                .await?;
+            let duration_s = samples.len() as f32 / self.model.config.sample_rate as f32;
+            let seconds_per_frame = if encoder_length == 0 {
+                0.0
+            } else {
+                duration_s / encoder_length as f32
+            };
+            let token_mask = vec![vec![true; generated.len()]];
+            let token_timestamps = extract_timestamps(
+                None,
+                &cross_attentions,
+                const { NonZeroUsize::new(7).unwrap() },
+                encoder_length,
+                seconds_per_frame,
+                token_mask,
             )
-            .await?;
-        let text = self
-            .tokenizer
-            .decode(&generated, true)
-            .map_err(crate::model::WhisperError::Tokenizer)?;
-        Ok(text.trim().to_owned())
+            .await?
+            .into_iter()
+            .next();
+            (generated, token_timestamps)
+        } else {
+            (
+                self.model
+                    .generate_greedy(
+                        &input_features,
+                        valid_frames,
+                        &prompt_ids,
+                        self.eos_token,
+                        self.max_new_tokens,
+                    )
+                    .await?,
+                None,
+            )
+        };
+
+        let mut remaining_tokens: Vec<_> = generated.iter().copied().enumerate().collect();
+        remaining_tokens.reverse();
+        let mut processed_tokens = Vec::new();
+        let mut timestamp_start: Option<f32> = None;
+        let mut prev_text_len = 0;
+        let mut chunks = Vec::new();
+        let mut current_text = String::new();
+        let clip_end = samples.len() as f32 / self.model.config.sample_rate as f32;
+
+        while let Some((index, token)) = remaining_tokens.pop() {
+            processed_tokens.push(token);
+            if let Some(timestamps) = &token_timestamps {
+                if timestamp_start.is_none() {
+                    timestamp_start = timestamps.get(index).copied();
+                }
+            }
+            let detokenized = self
+                .tokenizer
+                .decode(&processed_tokens, true)
+                .map_err(crate::model::WhisperError::Tokenizer)?;
+            if detokenized.len() > prev_text_len
+                && detokenized.chars().last().unwrap_or_default().is_ascii()
+            {
+                let timestamp = token_timestamps.as_ref().and_then(|timestamps| {
+                    let start = timestamp_start?;
+                    let end = timestamps.get(index).copied().unwrap_or(clip_end);
+                    timestamp_start = Some(end);
+                    Some(start..end)
+                });
+                let text_range = current_text.len()..detokenized.len();
+                current_text = detokenized;
+                prev_text_len = current_text.len();
+                chunks.push(TokenChunk { text_range, timestamp });
+            } else {
+                prev_text_len = detokenized.len();
+            }
+        }
+
+        Ok(DecodingResult {
+            text: current_text,
+            avg_logprob: 0.0,
+            no_speech_prob: 0.0,
+            compression_ratio: 0.0,
+            chunks,
+        })
     }
 
     pub(crate) async fn transcribe(
         &self,
         samples: Vec<f32>,
         language: Option<WhisperLanguage>,
+        with_timestamps: bool,
         result: UnboundedSender<Segment>,
     ) -> Result<(), crate::model::WhisperError> {
         let language = language.unwrap_or(WhisperLanguage::English);
-        let text = self.transcribe_clip(&samples, language).await?;
+        let decoding = self.transcribe_clip(&samples, language, with_timestamps).await?;
         let segment = Segment {
             sample_range: 0..samples.len(),
             start: 0.0,
@@ -113,16 +191,7 @@ impl CohereRuntime {
             elapsed_time: None,
             remaining_time: None,
             progress: 1.0,
-            result: DecodingResult {
-                text: text.clone(),
-                avg_logprob: 0.0,
-                no_speech_prob: 0.0,
-                compression_ratio: 0.0,
-                chunks: vec![TokenChunk {
-                    text_range: 0..text.len(),
-                    timestamp: None,
-                }],
-            },
+            result: decoding,
         };
         let mut result = result;
         let _ = result.start_send(segment);
