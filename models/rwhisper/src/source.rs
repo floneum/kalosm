@@ -1,4 +1,15 @@
 use kalosm_model_types::FileSource;
+use std::path::PathBuf;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ModelFamily {
+    Whisper {
+        multilingual: bool,
+        heads: Option<&'static [[usize; 2]]>,
+        apply_speech_filter: bool,
+    },
+    CohereTranscribe,
+}
 
 /// Predefined Whisper model sources
 #[derive(Debug, Clone)]
@@ -6,8 +17,7 @@ pub struct WhisperSource {
     pub(crate) model: FileSource,
     pub(crate) tokenizer: FileSource,
     pub(crate) config: FileSource,
-    pub(crate) multilingual: bool,
-    pub(crate) heads: Option<&'static [[usize; 2]]>,
+    pub(crate) family: ModelFamily,
 }
 
 impl Default for WhisperSource {
@@ -25,13 +35,42 @@ impl WhisperSource {
         multilingual: bool,
         heads: Option<&'static [[usize; 2]]>,
     ) -> Self {
+        Self::new_with_family(
+            model,
+            tokenizer,
+            config,
+            ModelFamily::Whisper {
+                multilingual,
+                heads,
+                apply_speech_filter: true,
+            },
+        )
+    }
+
+    pub(crate) fn new_with_family(
+        model: FileSource,
+        tokenizer: FileSource,
+        config: FileSource,
+        family: ModelFamily,
+    ) -> Self {
         Self {
             model,
             tokenizer,
             config,
-            multilingual,
-            heads,
+            family,
         }
+    }
+
+    /// Cohere Transcribe 03/2026 from a local directory containing
+    /// `model.gguf`, `tokenizer.json`, and `config.json`.
+    pub fn cohere_transcribe_03_2026_local(dir: impl Into<PathBuf>) -> Self {
+        let dir = dir.into();
+        Self::new_with_family(
+            FileSource::local(dir.join("model.gguf")),
+            FileSource::local(dir.join("tokenizer.json")),
+            FileSource::local(dir.join("config.json")),
+            ModelFamily::CohereTranscribe,
+        )
     }
 
     /// Tiny english model

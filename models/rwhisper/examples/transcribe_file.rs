@@ -1,14 +1,46 @@
 use kalosm::sound::*;
 use rodio::Decoder;
+use rodio::Source;
+use std::path::PathBuf;
+use std::time::Duration;
 
 #[tokio::main]
 async fn main() -> Result<(), anyhow::Error> {
     eprintln!("Starting transcription...");
 
-    // Create a new large whisper model
+    let source = if let Ok(dir) = std::env::var("RWHISPER_COHERE_DIR") {
+        WhisperSource::cohere_transcribe_03_2026_local(dir)
+    } else if let Ok(dir) = std::env::var("RWHISPER_WHISPER_DIR") {
+        let dir = PathBuf::from(dir);
+        let model_path = dir.join("whisper-tiny-en.gguf.real");
+        let model_path = if model_path.exists() {
+            model_path
+        } else {
+            dir.join("whisper-tiny-en.gguf")
+        };
+        WhisperSource::new(
+            FileSource::local(model_path),
+            FileSource::local(dir.join("tokenizer-tiny-en.json")),
+            FileSource::local(dir.join("config-tiny-en.json")),
+            false,
+            Some(&[
+                [1, 0],
+                [2, 0],
+                [2, 5],
+                [3, 0],
+                [3, 1],
+                [3, 2],
+                [3, 3],
+                [3, 4],
+            ]),
+        )
+    } else {
+        WhisperSource::tiny_en()
+    };
+
     eprintln!("Building model...");
     let model = WhisperBuilder::default()
-        .with_source(WhisperSource::tiny_en())
+        .with_source(source)
         .build()
         .await?;
     eprintln!("Model built successfully");
@@ -16,14 +48,18 @@ async fn main() -> Result<(), anyhow::Error> {
     // Load audio from a file
     let contents = std::fs::read("./models/rwhisper/examples/samples_jfk.wav").unwrap();
     let audio = Decoder::new(std::io::Cursor::new(contents.clone())).unwrap();
-
-    let (_stream, stream_handle) = rodio::OutputStream::try_default()?;
-    let sink = rodio::Sink::try_new(&stream_handle).unwrap();
-    let rate = audio.sample_rate() as f32;
+    let max_seconds = std::env::var("RWHISPER_MAX_SECONDS")
+        .ok()
+        .and_then(|value| value.parse::<f32>().ok());
+    let rate = rodio::Source::sample_rate(&audio) as f32;
 
     // Transcribe the source audio into text
     eprintln!("Starting transcription...");
-    let mut text = model.transcribe(audio);
+    let mut text = if let Some(max_seconds) = max_seconds {
+        model.transcribe(audio.take_duration(Duration::from_secs_f32(max_seconds)))
+    } else {
+        model.transcribe(audio)
+    };
 
     eprintln!("Waiting for segments...");
     let mut segment_count = 0;
@@ -41,6 +77,8 @@ async fn main() -> Result<(), anyhow::Error> {
             print!("{chunk}");
             // Play the audio chunk
             if let Some(timestamp) = chunk.timestamp() {
+                let (_stream, stream_handle) = rodio::OutputStream::try_default()?;
+                let sink = rodio::Sink::try_new(&stream_handle).unwrap();
                 let start = timestamp.start;
                 let end = timestamp.end;
                 let start = (start * rate) as usize;

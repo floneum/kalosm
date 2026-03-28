@@ -61,12 +61,23 @@ where
     ) -> Self {
         let shape = weight.shape();
         let out_channels = shape[0];
-        let in_channels = shape[1];
+        let in_channels_per_group = shape[1];
         let kernel_size = shape[2];
+        let in_channels = in_channels_per_group * config.groups;
 
         // Validate configuration
-        assert_eq!(config.groups, 1, "Only groups=1 is currently supported");
         assert_eq!(config.dilation, 1, "Only dilation=1 is currently supported");
+        assert!(
+            config.groups > 0,
+            "groups must be greater than zero, got {}",
+            config.groups
+        );
+        assert_eq!(
+            out_channels % config.groups,
+            0,
+            "out_channels ({out_channels}) must be divisible by groups ({})",
+            config.groups
+        );
 
         if let Some(ref b) = bias {
             assert_eq!(
@@ -99,12 +110,41 @@ where
         crate::AddOp: fusor_cpu::SimdBinaryOp<D>,
         fusor_cpu::SumOp: fusor_cpu::SimdReduceOp<D>,
     {
-        input.conv(
-            &self.weight,
-            self.bias.as_ref(),
-            [self.config.padding],
-            [self.config.stride],
-        )
+        if self.config.groups == 1 {
+            return input.conv(
+                &self.weight,
+                self.bias.as_ref(),
+                [self.config.padding],
+                [self.config.stride],
+            );
+        }
+
+        let in_channels_per_group = self.in_channels / self.config.groups;
+        let out_channels_per_group = self.out_channels / self.config.groups;
+        let mut outputs = Vec::with_capacity(self.config.groups);
+
+        for group in 0..self.config.groups {
+            let input_group = input
+                .narrow(1, group * in_channels_per_group, in_channels_per_group)
+                .to_concrete();
+            let weight_group = self
+                .weight
+                .narrow(0, group * out_channels_per_group, out_channels_per_group)
+                .to_concrete();
+            let bias_group = self.bias.as_ref().map(|bias| {
+                bias.narrow(0, group * out_channels_per_group, out_channels_per_group)
+                    .to_concrete()
+            });
+
+            outputs.push(input_group.conv(
+                &weight_group,
+                bias_group.as_ref(),
+                [self.config.padding],
+                [self.config.stride],
+            ));
+        }
+
+        Tensor::cat(outputs, 1)
     }
 
     /// Get the configuration.
@@ -217,6 +257,44 @@ mod tests {
         assert_eq!(conv.kernel_size(), 1);
         assert_eq!(conv.config().padding, 2);
         assert_eq!(conv.config().stride, 3);
+    }
+
+    #[tokio::test]
+    async fn test_conv1d_depthwise_groups() {
+        let config = Conv1dConfig {
+            padding: 1,
+            stride: 1,
+            groups: 2,
+            dilation: 1,
+        };
+
+        let input_data = [
+            1.0f32, 2.0, 3.0, 4.0, //
+            10.0, 20.0, 30.0, 40.0,
+        ];
+        let input: Tensor<3, f32> =
+            Tensor::Cpu(fusor_cpu::Tensor::from_slice([1, 2, 4], &input_data));
+
+        let weight_data = [
+            1.0f32, 0.0, -1.0, //
+            0.5, 0.0, -0.5,
+        ];
+        let weight: Tensor<3, f32> =
+            Tensor::Cpu(fusor_cpu::Tensor::from_slice([2, 1, 3], &weight_data));
+
+        let conv = Conv1d::new(weight, None, config);
+        let output = conv.forward(&input);
+        let result = output.as_slice().await.unwrap();
+
+        assert_eq!(result.shape(), &[1, 2, 4]);
+        assert!((result[[0, 0, 0]] - -2.0).abs() < 1e-5);
+        assert!((result[[0, 0, 1]] - -2.0).abs() < 1e-5);
+        assert!((result[[0, 0, 2]] - -2.0).abs() < 1e-5);
+        assert!((result[[0, 0, 3]] - 3.0).abs() < 1e-5);
+        assert!((result[[0, 1, 0]] - -10.0).abs() < 1e-5);
+        assert!((result[[0, 1, 1]] - -10.0).abs() < 1e-5);
+        assert!((result[[0, 1, 2]] - -10.0).abs() < 1e-5);
+        assert!((result[[0, 1, 3]] - 15.0).abs() < 1e-5);
     }
 
     #[tokio::test]

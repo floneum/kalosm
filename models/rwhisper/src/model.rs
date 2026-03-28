@@ -15,7 +15,8 @@ use tokenizers::Tokenizer;
 
 use super::{DecodingResult, Segment};
 use crate::{
-    audio, config::*, quantized::TextDecoderCache, Task, TaskType, TokenChunk, WhisperBuilder,
+    audio, cohere_config::CohereConfig, cohere_runtime::CohereRuntime, config::*,
+    quantized::TextDecoderCache, source::ModelFamily, Task, TaskType, TokenChunk, WhisperBuilder,
     WhisperLanguage,
 };
 use kalosm_common::CacheError;
@@ -77,11 +78,16 @@ pub enum WhisperError {
     Compression(std::io::Error),
 }
 
-pub(crate) struct WhisperInner {
+pub(crate) struct WhisperRuntime {
     mel_filters: Vec<f32>,
     device: Device,
     decoder: Decoder,
     config: Config,
+}
+
+pub(crate) enum WhisperInner {
+    Whisper(WhisperRuntime),
+    Cohere(CohereRuntime),
 }
 
 impl WhisperInner {
@@ -101,48 +107,55 @@ impl WhisperInner {
             Device::cpu()
         };
 
-        let tokenizer =
-            Tokenizer::from_bytes(tokenizer).map_err(WhisperLoadingError::LoadTokenizer)?;
-        let config: Config =
-            serde_json::from_slice(config).map_err(WhisperLoadingError::LoadConfig)?;
+        match settings.model.family {
+            ModelFamily::Whisper {
+                multilingual,
+                heads,
+                ..
+            } => {
+                let tokenizer =
+                    Tokenizer::from_bytes(tokenizer).map_err(WhisperLoadingError::LoadTokenizer)?;
+                let config: Config =
+                    serde_json::from_slice(config).map_err(WhisperLoadingError::LoadConfig)?;
 
-        let mel_bytes = match config.num_mel_bins {
-            80 => include_bytes!("melfilters.bytes").as_slice(),
-            128 => include_bytes!("melfilters128.bytes").as_slice(),
-            nmel => return Err(WhisperLoadingError::UnsupportedMelFilterLength(nmel)),
-        };
-        let mut mel_filters = vec![0f32; mel_bytes.len() / 4];
-        <byteorder::LittleEndian as byteorder::ByteOrder>::read_f32_into(
-            mel_bytes,
-            &mut mel_filters,
-        );
-        let attention_heads = settings.model.heads;
+                let mel_bytes = match config.num_mel_bins {
+                    80 => include_bytes!("melfilters.bytes").as_slice(),
+                    128 => include_bytes!("melfilters128.bytes").as_slice(),
+                    nmel => return Err(WhisperLoadingError::UnsupportedMelFilterLength(nmel)),
+                };
+                let mut mel_filters = vec![0f32; mel_bytes.len() / 4];
+                <byteorder::LittleEndian as byteorder::ByteOrder>::read_f32_into(
+                    mel_bytes,
+                    &mut mel_filters,
+                );
 
-        let model = ModelType::load(weights, &device, config.clone())?;
-        let language_token = if settings.model.multilingual {
-            let language = settings.language.unwrap_or(WhisperLanguage::English);
-            match token_id(&tokenizer, &format!("<|{language}|>")) {
-                Ok(token_id) => Some(token_id),
-                Err(_) => return Err(WhisperLoadingError::UnsupportedLanguage(language)),
+                let model = ModelType::load(weights, &device, config.clone())?;
+                let language_token = if multilingual {
+                    let language = settings.language.unwrap_or(WhisperLanguage::English);
+                    match token_id(&tokenizer, &format!("<|{language}|>")) {
+                        Ok(token_id) => Some(token_id),
+                        Err(_) => return Err(WhisperLoadingError::UnsupportedLanguage(language)),
+                    }
+                } else {
+                    None
+                };
+                let decoder = Decoder::new(model, tokenizer, 0, &device, language_token, heads)?;
+
+                Ok(Self::Whisper(WhisperRuntime {
+                    mel_filters,
+                    device,
+                    decoder,
+                    config,
+                }))
             }
-        } else {
-            None
-        };
-        let decoder = Decoder::new(
-            model,
-            tokenizer,
-            0,
-            &device,
-            language_token,
-            attention_heads,
-        )?;
-
-        Ok(Self {
-            mel_filters,
-            device,
-            decoder,
-            config,
-        })
+            ModelFamily::CohereTranscribe => {
+                let config: CohereConfig =
+                    serde_json::from_slice(config).map_err(WhisperLoadingError::LoadConfig)?;
+                Ok(Self::Cohere(CohereRuntime::new(
+                    device, weights, tokenizer, config,
+                )?))
+            }
+        }
     }
 
     pub(crate) async fn transcribe(
@@ -152,36 +165,43 @@ impl WhisperInner {
         language: Option<WhisperLanguage>,
         result: UnboundedSender<Segment>,
     ) {
-        let mel = audio::pcm_to_mel(&self.config, &pcm_data, &self.mel_filters);
-        let mel_len = mel.len();
-        let mel = Tensor::new(&self.device, &mel)
-            .reshape([self.config.num_mel_bins, mel_len / self.config.num_mel_bins])
-            .to_concrete()
-            .cast();
+        match self {
+            Self::Whisper(runtime) => {
+                let mel = audio::pcm_to_mel(&runtime.config, &pcm_data, &runtime.mel_filters);
+                let mel_len = mel.len();
+                let mel = Tensor::new(&runtime.device, &mel)
+                    .reshape([runtime.config.num_mel_bins, mel_len / runtime.config.num_mel_bins])
+                    .to_concrete()
+                    .cast();
 
-        if let Some(language) = language {
-            if let Err(err) = self.decoder.set_language_token(language) {
-                // Log error or send error message to result channel
-                // Continue with default language
-                tracing::error!("Error updating language token: {err}");
+                if let Some(language) = language {
+                    if let Err(err) = runtime.decoder.set_language_token(language) {
+                        tracing::error!("Error updating language token: {err}");
+                    }
+                }
+
+                if let Err(err) = runtime
+                    .decoder
+                    .run(
+                        &mel,
+                        pcm_data.len(),
+                        Task {
+                            task_type: TaskType::Unset,
+                            word_level_time_stamps,
+                            without_timestamps: true,
+                        },
+                        result,
+                    )
+                    .await
+                {
+                    tracing::error!("Error transcribing audio: {err}");
+                }
             }
-        }
-
-        if let Err(err) = self
-            .decoder
-            .run(
-                &mel,
-                pcm_data.len(),
-                Task {
-                    task_type: TaskType::Unset,
-                    word_level_time_stamps,
-                    without_timestamps: true,
-                },
-                result,
-            )
-            .await
-        {
-            tracing::error!("Error transcribing audio: {err}");
+            Self::Cohere(runtime) => {
+                if let Err(err) = runtime.transcribe(pcm_data, language, result).await {
+                    tracing::error!("Error transcribing audio: {err}");
+                }
+            }
         }
     }
 }

@@ -57,8 +57,11 @@ mod model;
 mod source;
 pub use source::*;
 
-use crate::config::SAMPLE_RATE;
+use crate::{config::SAMPLE_RATE, source::ModelFamily};
 mod audio;
+mod cohere_audio;
+mod cohere_config;
+mod cohere_runtime;
 mod config;
 mod quantized;
 
@@ -394,7 +397,7 @@ impl WhisperBuilder {
         mut progress_handler: impl FnMut(ModelLoadingProgress) + 'static,
     ) -> Result<Whisper, WhisperLoadingError> {
         // Download section
-        let whisper = &self.model;
+        let whisper = self.model.clone();
         let tokenizer_source = &whisper.tokenizer;
         let model_source = &whisper.model;
         let config_source = &whisper.config;
@@ -402,30 +405,75 @@ impl WhisperBuilder {
         let display_tokenizer_source = format!("Tokenizer ({tokenizer_source})");
         let mut create_progress =
             ModelLoadingProgress::downloading_progress(display_tokenizer_source);
-        let tokenizer = self
-            .cache
-            .get_bytes(tokenizer_source, |progress| {
-                progress_handler(create_progress(progress))
-            })
-            .await?;
+        let tokenizer = match tokenizer_source {
+            FileSource::Local(path) => {
+                let size = std::fs::metadata(path)
+                    .map_err(kalosm_common::CacheError::from)?
+                    .len();
+                progress_handler(create_progress(kalosm_model_types::FileLoadingProgress {
+                    start_time: None,
+                    cached_size: 0,
+                    size,
+                    progress: size,
+                }));
+                std::fs::read(path).map_err(kalosm_common::CacheError::from)?
+            }
+            _ => {
+                self.cache
+                    .get_bytes(tokenizer_source, |progress| {
+                        progress_handler(create_progress(progress))
+                    })
+                    .await?
+            }
+        };
 
         let display_model_source = format!("Model ({model_source})");
         let mut create_progress = ModelLoadingProgress::downloading_progress(display_model_source);
-        let model = self
-            .cache
-            .get_bytes(model_source, |progress| {
-                progress_handler(create_progress(progress))
-            })
-            .await?;
+        let model = match model_source {
+            FileSource::Local(path) => {
+                let size = std::fs::metadata(path)
+                    .map_err(kalosm_common::CacheError::from)?
+                    .len();
+                progress_handler(create_progress(kalosm_model_types::FileLoadingProgress {
+                    start_time: None,
+                    cached_size: 0,
+                    size,
+                    progress: size,
+                }));
+                std::fs::read(path).map_err(kalosm_common::CacheError::from)?
+            }
+            _ => {
+                self.cache
+                    .get_bytes(model_source, |progress| {
+                        progress_handler(create_progress(progress))
+                    })
+                    .await?
+            }
+        };
 
         let display_config_source = format!("Config ({config_source})");
         let mut create_progress = ModelLoadingProgress::downloading_progress(display_config_source);
-        let config = self
-            .cache
-            .get_bytes(config_source, |progress| {
-                progress_handler(create_progress(progress))
-            })
-            .await?;
+        let config = match config_source {
+            FileSource::Local(path) => {
+                let size = std::fs::metadata(path)
+                    .map_err(kalosm_common::CacheError::from)?
+                    .len();
+                progress_handler(create_progress(kalosm_model_types::FileLoadingProgress {
+                    start_time: None,
+                    cached_size: 0,
+                    size,
+                    progress: size,
+                }));
+                std::fs::read(path).map_err(kalosm_common::CacheError::from)?
+            }
+            _ => {
+                self.cache
+                    .get_bytes(config_source, |progress| {
+                        progress_handler(create_progress(progress))
+                    })
+                    .await?
+            }
+        };
 
         let (tx, rx) = futures_channel::mpsc::unbounded::<WhisperMessage>();
         let mut model = WhisperInner::new(self, &model, &tokenizer, &config).await?;
@@ -448,6 +496,13 @@ impl WhisperBuilder {
             inner: Arc::new(WhisperTask {
                 sender: tx,
                 task: Mutex::new(task),
+                apply_speech_filter: matches!(
+                    whisper.family,
+                    ModelFamily::Whisper {
+                        apply_speech_filter: true,
+                        ..
+                    }
+                ),
             }),
         })
     }
@@ -805,6 +860,7 @@ impl Display for WhisperLanguage {
 struct WhisperTask {
     sender: UnboundedSender<WhisperMessage>,
     task: Mutex<Pin<Box<dyn FutureWasmNotSend<Output = ()> + 'static>>>,
+    apply_speech_filter: bool,
 }
 
 #[derive(Clone)]
@@ -833,7 +889,7 @@ impl Whisper {
         <S as Iterator>::Item: rodio::Sample,
         f32: FromSample<<S as Iterator>::Item>,
     {
-        let pcm_data: Vec<_> = normalize_audio(input);
+        let pcm_data: Vec<_> = normalize_audio(input, self.inner.apply_speech_filter);
         TranscriptionTask {
             word_level_time_stamps: false,
             audio: pcm_data,
@@ -914,13 +970,19 @@ struct WhisperMessage {
     sender: UnboundedSender<Segment>,
 }
 
-pub(crate) fn normalize_audio<S: Source>(input: S) -> Vec<f32>
+pub(crate) fn normalize_audio<S: Source>(input: S, apply_speech_filter: bool) -> Vec<f32>
 where
     <S as Iterator>::Item: rodio::Sample,
     f32: FromSample<<S as Iterator>::Item>,
 {
     let resample = UniformSourceIterator::new(input, 1, SAMPLE_RATE as u32);
-    let pass_filter = resample.low_pass(3000).high_pass(200).convert_samples();
-
-    pass_filter.collect::<Vec<f32>>()
+    if apply_speech_filter {
+        resample
+            .low_pass(3000)
+            .high_pass(200)
+            .convert_samples()
+            .collect::<Vec<f32>>()
+    } else {
+        resample.convert_samples().collect::<Vec<f32>>()
+    }
 }

@@ -12,6 +12,7 @@ use timestamps::extract_timestamps;
 use crate::config::Config;
 
 pub(crate) mod timestamps;
+pub(crate) mod cohere;
 
 fn conv1d(
     config: Conv1dConfig,
