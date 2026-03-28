@@ -97,7 +97,7 @@ impl WhisperInner {
         tokenizer: &[u8],
         config: &[u8],
     ) -> Result<Self, WhisperLoadingError> {
-        // Set FUSOR_USE_GPU=1 to use GPU, otherwise CPU
+        // Set FUSOR_USE_GPU=1 to use GPU, otherwise CPU.
         let use_gpu = std::env::var("FUSOR_USE_GPU")
             .map(|v| v == "1")
             .unwrap_or(false);
@@ -170,7 +170,10 @@ impl WhisperInner {
                 let mel = audio::pcm_to_mel(&runtime.config, &pcm_data, &runtime.mel_filters);
                 let mel_len = mel.len();
                 let mel = Tensor::new(&runtime.device, &mel)
-                    .reshape([runtime.config.num_mel_bins, mel_len / runtime.config.num_mel_bins])
+                    .reshape([
+                        runtime.config.num_mel_bins,
+                        mel_len / runtime.config.num_mel_bins,
+                    ])
                     .to_concrete()
                     .cast();
 
@@ -318,6 +321,9 @@ impl Decoder {
         let tensor = match &mut self.model {
             ModelType::Quantized(model) => model.encoder.forward(mel)?,
         };
+        if tensor.is_gpu() {
+            tensor.materialize_blocking();
+        }
 
         Ok(tensor)
     }
@@ -690,6 +696,9 @@ impl Decoder {
 
                 // Squeeze the batch dimension since decode_with_fallback expects 2D tensor
                 let audio_features_2d = audio_features.squeeze(0).to_concrete();
+                if audio_features_2d.is_gpu() {
+                    audio_features_2d.materialize_blocking();
+                }
 
                 let mut dr = self
                     .decode_with_fallback(

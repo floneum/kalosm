@@ -17,7 +17,11 @@ fn sample_standard_normal(rng: &mut rand::rngs::StdRng) -> f32 {
     (-2.0 * u1.ln()).sqrt() * (std::f32::consts::TAU * u2).cos()
 }
 
-pub fn pcm_to_features(cfg: &CohereConfig, samples: &[f32], filters: &[f32]) -> (Vec<f32>, usize, usize) {
+pub fn pcm_to_features(
+    cfg: &CohereConfig,
+    samples: &[f32],
+    filters: &[f32],
+) -> (Vec<f32>, usize, usize) {
     let sample_rate = cfg.preprocessor.sample_rate;
     let n_fft = cfg.preprocessor.n_fft;
     let win_length = (cfg.preprocessor.window_size * sample_rate as f32).round() as usize;
@@ -110,8 +114,8 @@ pub fn pcm_to_features(cfg: &CohereConfig, samples: &[f32], filters: &[f32]) -> 
 mod tests {
     use super::*;
     use crate::cohere_config::{
-        CohereConfig, CohereDecoderConfig, CohereDecoderWrapperConfig, CohereEncoderConfig, CohereHeadConfig,
-        CoherePreprocessorConfig,
+        CohereConfig, CohereDecoderConfig, CohereDecoderWrapperConfig, CohereEncoderConfig,
+        CohereHeadConfig, CoherePreprocessorConfig,
     };
 
     fn test_config() -> CohereConfig {
@@ -185,7 +189,10 @@ mod tests {
             .collect::<Vec<_>>();
         let filter_bytes = include_bytes!("cohere_melfilters128.bytes").as_slice();
         let mut filterbank = vec![0.0f32; filter_bytes.len() / 4];
-        <byteorder::LittleEndian as byteorder::ByteOrder>::read_f32_into(filter_bytes, &mut filterbank);
+        <byteorder::LittleEndian as byteorder::ByteOrder>::read_f32_into(
+            filter_bytes,
+            &mut filterbank,
+        );
 
         let (features, total_frames, valid_frames) = pcm_to_features(&cfg, &samples, &filterbank);
         let sum: f32 = features.iter().sum();

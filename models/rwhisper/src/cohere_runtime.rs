@@ -3,11 +3,15 @@ use half::bf16;
 use tokenizers::Tokenizer;
 
 use crate::{
-    cohere_audio::pcm_to_features, cohere_config::CohereConfig, quantized::{cohere::Cohere, timestamps::extract_timestamps},
+    cohere_audio::pcm_to_features,
+    cohere_config::CohereConfig,
+    quantized::{cohere::Cohere, timestamps::extract_timestamps},
     DecodingResult, Segment, TokenChunk, WhisperLanguage,
 };
 use fusor::{Device, Tensor, VarBuilder};
 use std::num::NonZeroUsize;
+use std::ops::Range;
+use std::time::Instant;
 
 pub(crate) struct CohereRuntime {
     device: Device,
@@ -25,8 +29,8 @@ impl CohereRuntime {
         tokenizer_bytes: &[u8],
         config: CohereConfig,
     ) -> Result<Self, crate::model::WhisperLoadingError> {
-        let tokenizer =
-            Tokenizer::from_bytes(tokenizer_bytes).map_err(crate::model::WhisperLoadingError::LoadTokenizer)?;
+        let tokenizer = Tokenizer::from_bytes(tokenizer_bytes)
+            .map_err(crate::model::WhisperLoadingError::LoadTokenizer)?;
         let eos_token = tokenizer
             .token_to_id("<|endoftext|>")
             .ok_or_else(|| fusor::Error::msg("missing <|endoftext|> token"))?;
@@ -36,7 +40,10 @@ impl CohereRuntime {
             .unwrap_or(256);
         let filter_bytes = include_bytes!("cohere_melfilters128.bytes").as_slice();
         let mut filterbank = vec![0.0f32; filter_bytes.len() / 4];
-        <byteorder::LittleEndian as byteorder::ByteOrder>::read_f32_into(filter_bytes, &mut filterbank);
+        <byteorder::LittleEndian as byteorder::ByteOrder>::read_f32_into(
+            filter_bytes,
+            &mut filterbank,
+        );
         for value in &mut filterbank {
             *value = bf16::from_f32(*value).to_f32();
         }
@@ -160,7 +167,10 @@ impl CohereRuntime {
                 let text_range = current_text.len()..detokenized.len();
                 current_text = detokenized;
                 prev_text_len = current_text.len();
-                chunks.push(TokenChunk { text_range, timestamp });
+                chunks.push(TokenChunk {
+                    text_range,
+                    timestamp,
+                });
             } else {
                 prev_text_len = detokenized.len();
             }
@@ -183,18 +193,108 @@ impl CohereRuntime {
         result: UnboundedSender<Segment>,
     ) -> Result<(), crate::model::WhisperError> {
         let language = language.unwrap_or(WhisperLanguage::English);
-        let decoding = self.transcribe_clip(&samples, language, with_timestamps).await?;
-        let segment = Segment {
-            sample_range: 0..samples.len(),
-            start: 0.0,
-            duration: samples.len() as f64 / self.model.config.sample_rate as f64,
-            elapsed_time: None,
-            remaining_time: None,
-            progress: 1.0,
-            result: decoding,
-        };
         let mut result = result;
-        let _ = result.start_send(segment);
+        let chunk_ranges = split_audio_chunks_energy(&self.model.config, &samples);
+        let total_samples = samples.len();
+        let start_time = cfg!(not(target_arch = "wasm32")).then(Instant::now);
+
+        for range in chunk_ranges {
+            let mut decoding = self
+                .transcribe_clip(&samples[range.clone()], language, with_timestamps)
+                .await?;
+            let start_seconds = range.start as f32 / self.model.config.sample_rate as f32;
+            for chunk in &mut decoding.chunks {
+                if let Some(timestamp) = &mut chunk.timestamp {
+                    timestamp.start += start_seconds;
+                    timestamp.end += start_seconds;
+                }
+            }
+            let elapsed_time = start_time.map(|start| start.elapsed());
+            let remaining_time = elapsed_time.map(|elapsed| {
+                let processed = range.end.max(1);
+                std::time::Duration::from_millis(
+                    ((elapsed.as_millis() as usize / processed) * (total_samples.saturating_sub(range.end)))
+                        as u64,
+                )
+            });
+            let segment = Segment {
+                sample_range: range.clone(),
+                start: start_seconds as f64,
+                duration: (range.end - range.start) as f64 / self.model.config.sample_rate as f64,
+                elapsed_time,
+                remaining_time,
+                progress: range.end as f32 / total_samples.max(1) as f32,
+                result: decoding,
+            };
+            let _ = result.start_send(segment);
+        }
         Ok(())
     }
+}
+
+fn split_audio_chunks_energy(config: &CohereConfig, waveform: &[f32]) -> Vec<Range<usize>> {
+    let sample_rate = config.sample_rate;
+    let chunk_size = (config.max_audio_clip_s * sample_rate).max(1);
+    let boundary_context_size = (config.overlap_chunk_second * sample_rate).max(1);
+    let fast_path_threshold = chunk_size.saturating_sub(boundary_context_size);
+
+    if waveform.len() <= fast_path_threshold {
+        return vec![0..waveform.len()];
+    }
+
+    let mut chunks = Vec::new();
+    let mut idx = 0usize;
+    while idx < waveform.len() {
+        if idx + chunk_size >= waveform.len() {
+            chunks.push(idx..waveform.len());
+            break;
+        }
+
+        let search_start = (idx + chunk_size).saturating_sub(boundary_context_size).max(idx);
+        let search_end = (idx + chunk_size).min(waveform.len());
+        let split_point = if search_end <= search_start {
+            idx + chunk_size
+        } else {
+            find_split_point_energy(
+                waveform,
+                search_start,
+                search_end,
+                config.min_energy_window_samples,
+            )
+        };
+        let split_point = split_point.max(idx + 1).min(waveform.len());
+        chunks.push(idx..split_point);
+        idx = split_point;
+    }
+
+    chunks
+}
+
+fn find_split_point_energy(
+    waveform: &[f32],
+    start_idx: usize,
+    end_idx: usize,
+    min_energy_window_samples: usize,
+) -> usize {
+    let segment = &waveform[start_idx..end_idx];
+    if segment.len() <= min_energy_window_samples {
+        return (start_idx + end_idx) / 2;
+    }
+
+    let mut min_energy = f32::INFINITY;
+    let mut quietest_idx = start_idx;
+    let upper = segment.len().saturating_sub(min_energy_window_samples);
+    let step = min_energy_window_samples.max(1);
+    let mut i = 0usize;
+    while i < upper {
+        let window = &segment[i..(i + min_energy_window_samples)];
+        let energy = (window.iter().map(|sample| sample * sample).sum::<f32>() / window.len() as f32)
+            .sqrt();
+        if energy < min_energy {
+            min_energy = energy;
+            quietest_idx = start_idx + i;
+        }
+        i += step;
+    }
+    quietest_idx
 }

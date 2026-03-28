@@ -35,7 +35,7 @@ async fn main() -> Result<(), anyhow::Error> {
             ]),
         )
     } else {
-        WhisperSource::tiny_en()
+        WhisperSource::large_v3_turbo()
     };
 
     eprintln!("Building model...");
