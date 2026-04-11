@@ -54,6 +54,14 @@ impl<T: DataType + SimdElement + Default> Linear<T> {
 
 // f32-specific implementations for loading and forward
 impl Linear<f32> {
+    /// Forward pass without applying bias.
+    pub fn forward_no_bias<B>(&self, input: &Tensor<3, f32, B>) -> Tensor<3, f32>
+    where
+        B: fusor_cpu::TensorBacking<3, Elem = f32>,
+    {
+        input.q_mat_mul(&self.weight)
+    }
+
     /// Load a Linear layer from a VarBuilder.
     ///
     /// Expects:
@@ -73,7 +81,7 @@ impl Linear<f32> {
     where
         B: fusor_cpu::TensorBacking<3, Elem = f32>,
     {
-        let output = input.q_mat_mul(&self.weight);
+        let output = self.forward_no_bias(input);
 
         if let Some(bias) = &self.bias {
             output.add_(bias)

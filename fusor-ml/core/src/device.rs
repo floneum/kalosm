@@ -333,9 +333,34 @@ impl Device {
         usage: wgpu::BufferUsages,
         to_initilize: bool,
     ) -> Arc<wgpu::Buffer> {
+        let disable_cache =
+            std::env::var("FUSOR_DISABLE_BUFFER_CACHE").ok().as_deref() == Some("1");
+        let log_allocations = std::env::var("FUSOR_LOG_BUFFER_ALLOCATIONS")
+            .ok()
+            .as_deref()
+            == Some("1");
+
+        if disable_cache {
+            if log_allocations {
+                eprintln!(
+                    "fusor buffer alloc uncached: {} bytes usage={usage:?}",
+                    size
+                );
+            }
+            return Arc::new(self.wgpu_device().create_buffer(&wgpu::BufferDescriptor {
+                label: Some("Tensor Buffer"),
+                size,
+                usage,
+                mapped_at_creation: false,
+            }));
+        }
+
         // Try to get a buffer from the cache first
         self.get_cached_buffer(size, usage, to_initilize)
             .unwrap_or_else(|| {
+                if log_allocations {
+                    eprintln!("fusor buffer alloc cached: {} bytes usage={usage:?}", size);
+                }
                 let new_buffer = self.wgpu_device().create_buffer(&wgpu::BufferDescriptor {
                     label: Some("Tensor Buffer"),
                     size,

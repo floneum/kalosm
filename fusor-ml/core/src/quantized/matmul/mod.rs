@@ -53,14 +53,13 @@ impl QMatMulOperation {
     fn sgemv(&self) -> bool {
         let m_dim_idx = self.in_shape.len() - 2;
         let m = self.in_shape[m_dim_idx];
-        // Use SGEMV for tall and skinny matrices (small M, any K)
-        // SGEMV is more efficient when M is small because:
-        // - Each workgroup processes one M value independently
-        // - Less workgroup synchronization overhead
-        // - Better cache utilization for the K dimension
-        // SGEMM becomes more efficient for larger M where it can use
-        // tile-based processing with 16x16 workgroups
-        m <= 32
+        // Use SGEMV for tall and skinny matrices (small M, any K).
+        // Decoder cross-attention cache init in encoder-decoder ASR models
+        // frequently lands in the 8..16-token range after audio subsampling.
+        // Routing those tiny widths through the SGEMM path has proven unstable
+        // on the current GPU backend, while SGEMV remains both stable and fast
+        // enough for these shapes.
+        m <= 16
     }
 
     fn m_size(&self) -> u32 {
@@ -75,32 +74,78 @@ impl QMatMulOperation {
 
 impl<const R: usize, T: DataType> Tensor<R, T> {
     pub fn q_mat_mul(&self, other: &QMatrix) -> Self {
+        let in_shape = self.shape();
+        let m = in_shape[R - 2];
+        let rows = in_shape[..R - 1].iter().product::<usize>();
+
         // For F16/F32 matrices, dequantize and use regular mat_mul
         // because they don't have block structure like quantized types
         if matches!(other.datatype(), GgmlType::F16 | GgmlType::F32) {
             let dequantized: Tensor<2, T> = other.dequantize();
-            // Broadcast the 2D matrix to match input tensor rank by unsqueezing batch dimensions
-            let mut broadcast_shape = Vec::from(self.shape().as_slice());
-            broadcast_shape[R - 1] = other.shape()[0]; // Output dimension is first dim of weight
+            // Flatten all leading dimensions into a single rows dimension so we can use
+            // a plain 2D matmul instead of a broadcasted batched matmul. The broadcasted
+            // GPU path is particularly costly for encoder FFNs with tiny M and large N.
+            let rows = in_shape[..R - 1].iter().product::<usize>();
+            let k = in_shape[R - 1];
+            let n = other.shape()[0];
 
-            // The weight matrix is [out_features, in_features], need to transpose for mat_mul
-            // self: [..., M, K] @ weight.T: [K, N] -> [..., M, N]
-            // Reshape weight to add batch dimensions: [1, 1, ..., K, N]
+            let input_2d: Tensor<2, T> = self.reshape([rows, k]);
             let weight_t = dequantized.transpose(0, 1);
+            let output_2d = input_2d.mat_mul(&weight_t);
 
-            // Create batch dimensions for the weight
-            let weight_shape: [usize; R] = std::array::from_fn(|i| {
-                if i < R - 2 {
-                    1 // Broadcast batch dimensions
-                } else if i == R - 2 {
-                    other.shape()[1] // K dimension
+            let out_shape: [usize; R] = std::array::from_fn(|i| {
+                if i == R - 1 {
+                    n
                 } else {
-                    other.shape()[0] // N dimension
+                    in_shape[i]
                 }
             });
-            let weight_broadcast: Tensor<R, T> = weight_t.reshape(weight_shape);
+            return output_2d.reshape(out_shape);
+        }
 
-            return self.mat_mul(&weight_broadcast);
+        // Metal has an unresolved issue with tiny-M standalone quantized matmuls
+        // which shows up during cached decoder cross-attention K/V projection.
+        // Fall back to a dequantize + regular matmul path there instead of the
+        // quantized kernel, and materialize the intermediates on GPU so the
+        // problematic lazy quantized graph never reaches execution.
+        if self.device().wgpu_adapter().get_info().backend == wgpu::Backend::Metal
+            && m <= 16
+        {
+            use pollster::FutureExt as _;
+
+            let profile = std::env::var_os("RWHISPER_COHERE_PROFILE").is_some();
+            let dequantized: Tensor<2, T> = other.dequantize();
+            let k = in_shape[R - 1];
+            let n = other.shape()[0];
+
+            if profile {
+                eprintln!(
+                    "q_mat_mul metal tiny_m start: shape={:?} rows={} m={} n={} dtype={:?}",
+                    in_shape,
+                    rows,
+                    m,
+                    n,
+                    other.datatype()
+                );
+            }
+            let input_2d: Tensor<2, T> = self.reshape([rows, k]).materialized().block_on();
+            let weight_t = dequantized.transpose(0, 1).materialized().block_on();
+            if profile {
+                eprintln!("q_mat_mul metal tiny_m weight materialized");
+            }
+            let output_2d = input_2d.mat_mul(&weight_t).materialized().block_on();
+            if profile {
+                eprintln!("q_mat_mul metal tiny_m output materialized");
+            }
+
+            let out_shape: [usize; R] = std::array::from_fn(|i| {
+                if i == R - 1 {
+                    n
+                } else {
+                    in_shape[i]
+                }
+            });
+            return output_2d.reshape(out_shape);
         }
         self.add_q_mat_mul(other)
     }

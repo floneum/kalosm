@@ -8,7 +8,10 @@ use crate::{
     },
     quantized::matmul::{
         QMatMulOperation,
-        sgemv::{SGEMV_CHUNK_SIZE, SGEMV_VECTOR_SIZE, decompose_workgroup_index},
+        sgemv::{
+            SGEMV_CHUNK_SIZE, SGEMV_VECTOR_SIZE, decompose_workgroup_index,
+            quantized_sgemv_subgroups_supported,
+        },
     },
     util::{
         maybe_vec_storage_add, maybe_vec_storage_index, maybe_vec_storage_subgroup_add,
@@ -169,7 +172,7 @@ pub(crate) fn general_sgemv(
     writeln!(kernel, "}}").unwrap();
 
     // Reduce with subgroup operations if the device supports subgroups
-    if device.subgroups_supported() {
+    if quantized_sgemv_subgroups_supported(&device) {
         // Get the sum among all threads in the subgroup
         writeln!(
             kernel,

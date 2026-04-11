@@ -405,9 +405,11 @@ impl AudioEncoder {
         let mut x = x.add_(&positional_embedding);
         materialize_if_gpu(&x);
 
-        for block in self.blocks.iter_mut() {
+        for (i, block) in self.blocks.iter_mut().enumerate() {
             x = block.forward(None, &x, None, None, None)?;
-            materialize_if_gpu(&x);
+            if (i + 1) % 4 == 0 {
+                materialize_if_gpu(&x);
+            }
         }
         let x = self.ln_post.forward_fused(&x);
         materialize_if_gpu(&x);
@@ -496,7 +498,6 @@ impl TextDecoder {
         let positional_embedding = self.positional_embedding.narrow(0, index_pos, seq_len);
 
         let mut x = token_embedding.add_(&positional_embedding);
-        materialize_if_gpu(&x);
 
         // Add batch dimension to audio_features for forward_kv
         let audio_features_batched = audio_features.unsqueeze(0).to_concrete();
@@ -522,7 +523,6 @@ impl TextDecoder {
             let query = block_cache.feature_attn_cache.clone();
             let attention_output = attention_output.as_mut().map(|outputs| &mut outputs[i]);
             x = block.forward(query, &x, Some(&mask), Some(block_cache), attention_output)?;
-            materialize_if_gpu(&x);
         }
 
         let out = self.ln.forward_fused(&x);

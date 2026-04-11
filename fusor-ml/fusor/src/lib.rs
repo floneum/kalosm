@@ -417,6 +417,95 @@ where
         }
     }
 
+    /// Ensure any deferred GPU work for this tensor is submitted and resolved.
+    ///
+    /// This is primarily useful when a long-lived tensor would otherwise keep a
+    /// growing compute graph alive across many incremental decode steps.
+    pub fn materialize_blocking(&self)
+    where
+        B: TensorBacking<R>,
+        D: SimdElement + DataType + 'static,
+    {
+        match self {
+            Tensor::Cpu(_) => {}
+            #[cfg(not(target_arch = "wasm32"))]
+            Tensor::Gpu(t) => pollster::block_on(t.materialize()),
+            #[cfg(target_arch = "wasm32")]
+            Tensor::Gpu(_) => {}
+        }
+    }
+
+    pub fn to_materialized_blocking(&self) -> Tensor<R, D>
+    where
+        B: TensorBacking<R>,
+        D: SimdElement + DataType + 'static,
+    {
+        match self {
+            Tensor::Cpu(t) => Tensor::Cpu(t.to_concrete()),
+            #[cfg(not(target_arch = "wasm32"))]
+            Tensor::Gpu(t) => Tensor::Gpu(pollster::block_on(t.materialized())),
+            #[cfg(target_arch = "wasm32")]
+            Tensor::Gpu(t) => Tensor::Gpu(t.clone()),
+        }
+    }
+
+    pub fn materialize_many_blocking(tensors: &[&Self])
+    where
+        B: TensorBacking<R>,
+        D: SimdElement + DataType + 'static,
+    {
+        if tensors.is_empty() {
+            return;
+        }
+
+        match tensors[0] {
+            Tensor::Cpu(_) => {}
+            #[cfg(not(target_arch = "wasm32"))]
+            Tensor::Gpu(_) => {
+                let gpu_tensors: Vec<_> = tensors
+                    .iter()
+                    .map(|tensor| match tensor {
+                        Tensor::Gpu(t) => t,
+                        Tensor::Cpu(_) => panic!("cannot mix CPU and GPU tensors in materialize_many_blocking"),
+                    })
+                    .collect();
+                pollster::block_on(fusor_core::Tensor::materialize_many(&gpu_tensors));
+            }
+            #[cfg(target_arch = "wasm32")]
+            Tensor::Gpu(_) => {}
+        }
+    }
+
+    pub fn to_materialized_many_blocking(tensors: &[&Self]) -> Vec<Tensor<R, D>>
+    where
+        B: TensorBacking<R>,
+        D: SimdElement + DataType + 'static,
+    {
+        if tensors.is_empty() {
+            return Vec::new();
+        }
+
+        match tensors[0] {
+            Tensor::Cpu(_) => tensors.iter().map(|tensor| tensor.to_concrete()).collect(),
+            #[cfg(not(target_arch = "wasm32"))]
+            Tensor::Gpu(_) => {
+                let gpu_tensors: Vec<_> = tensors
+                    .iter()
+                    .map(|tensor| match tensor {
+                        Tensor::Gpu(t) => t,
+                        Tensor::Cpu(_) => panic!("cannot mix CPU and GPU tensors in to_materialized_many_blocking"),
+                    })
+                    .collect();
+                pollster::block_on(fusor_core::Tensor::materialized_many(&gpu_tensors))
+                    .into_iter()
+                    .map(Tensor::Gpu)
+                    .collect()
+            }
+            #[cfg(target_arch = "wasm32")]
+            Tensor::Gpu(_) => tensors.iter().map(|tensor| tensor.to_concrete()).collect(),
+        }
+    }
+
     /// Returns the shape of the tensor.
     pub fn shape(&self) -> [usize; R]
     where

@@ -1,0 +1,39 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(cargo check:*)",
+      "Bash(cargo test:*)",
+      "Bash(RUST_BACKTRACE=1 cargo test test_fuzz_q_mat_mul -- --nocapture)",
+      "Bash(RUST_BACKTRACE=1 cargo test test_fuzz_q_mat_mul_q8_0 -- --nocapture)",
+      "Bash(RUST_BACKTRACE=1 cargo test test_fuzz_q_mat_mul_sgemv -- --nocapture)",
+      "Bash(git log:*)",
+      "Read(//Users/evanalmloff/Desktop/Github/floneum/models/rwhisper/src/**)",
+      "Read(//Users/evanalmloff/Desktop/Github/floneum/models/rwhisper/**)",
+      "Read(//Users/evanalmloff/.cargo/registry/src/**)",
+      "Bash(git merge:*)",
+      "Bash(git checkout:*)",
+      "Bash(git add:*)",
+      "Bash(git rm:*)",
+      "Bash(git commit:*)",
+      "Bash(RUST_BACKTRACE=1 cargo test:*)",
+      "Bash(cargo build:*)",
+      "Bash(RUST_BACKTRACE=1 cargo run:*)",
+      "Bash(cargo run:*)",
+      "Bash(FUSOR_DEBUG_SHADERS=1 cargo run:*)",
+      "Bash(tee:*)",
+      "Bash(timeout 120 bash:*)",
+      "Bash(timeout 120 cargo run:*)",
+      "Bash(timeout 60 cargo run:*)",
+      "Bash(FUSOR_DEBUG_SHADERS=1 timeout 45 cargo run:*)",
+      "Bash(cat:*)",
+      "Bash(timeout 300 cargo run:*)",
+      "Bash(FUSOR_DEBUG_SHADERS=1 timeout 120 cargo run:*)",
+      "Bash(RUST_BACKTRACE=1 timeout 120 cargo run:*)",
+      "Bash(git stash:*)",
+      "Bash(FUSOR_DEBUG_SHADERS=1 cargo test:*)",
+      "Bash(git show:*)"
+    ],
+    "deny": [],
+    "ask": []
+  }
+}

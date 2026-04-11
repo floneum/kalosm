@@ -13,6 +13,10 @@ use crate::{
     },
 };
 
+fn matmul_sgemv_subgroups_supported(device: &crate::Device) -> bool {
+    device.subgroups_supported() && device.wgpu_adapter().get_info().backend != wgpu::Backend::Metal
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn sgemv(
     op: &MatMulOperation,
@@ -165,7 +169,7 @@ pub(crate) fn sgemv(
     writeln!(kernel, "}}").unwrap();
 
     // If subgroups are supported, perform a reduction with subgroup operations
-    if device.subgroups_supported() {
+    if matmul_sgemv_subgroups_supported(&device) {
         // Get the sum among all threads in the subgroup
         writeln!(
             kernel,
@@ -332,19 +336,21 @@ pub(crate) fn workgroup_shape_constraints(
             device.limits().max_compute_workgroup_size_x + 1,
         ),
     );
-    constraints.add_constraint(
-        0,
-        crate::mir::workgroup_shape::Constraint::more_than_or_equals(device.min_subgroup_size()),
-    );
-    constraints.add_constraint(
-        0,
-        crate::mir::workgroup_shape::Constraint::less_than_or_equals(
-            device.max_subgroup_size()
-                * params
-                    .subgroups_per_workgroup
-                    .min(device.max_subgroup_size()),
-        ),
-    );
+    if matmul_sgemv_subgroups_supported(device) {
+        constraints.add_constraint(
+            0,
+            crate::mir::workgroup_shape::Constraint::more_than_or_equals(device.min_subgroup_size()),
+        );
+        constraints.add_constraint(
+            0,
+            crate::mir::workgroup_shape::Constraint::less_than_or_equals(
+                device.max_subgroup_size()
+                    * params
+                        .subgroups_per_workgroup
+                        .min(device.max_subgroup_size()),
+            ),
+        );
+    }
     constraints.add_constraint(1, crate::mir::workgroup_shape::Constraint::Equals(1));
     constraints.add_constraint(2, crate::mir::workgroup_shape::Constraint::Equals(1));
     constraints

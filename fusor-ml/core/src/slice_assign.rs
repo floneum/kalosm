@@ -244,3 +244,53 @@ async fn test_slice_assign_nonzero_offset() {
     assert_eq!(as_slice[[2, 3]], 30.);
     assert_eq!(as_slice[[2, 4]], 40.);
 }
+
+#[cfg(test)]
+#[tokio::test]
+async fn test_slice_assign_4d_preserves_prefix() {
+    use crate::Device;
+
+    let device = Device::test_instance();
+
+    let data = vec![vec![
+        vec![vec![0.1f32, 0.2, 0.3, 0.4]],
+        vec![vec![0.0f32, 0.0, 0.0, 0.0]],
+    ]];
+    let tensor = Tensor::new(&device, &data);
+    let value_tensor = Tensor::new(&device, &vec![vec![vec![vec![0.5f32, 0.6, 0.7, 0.8]]]]);
+    let result = tensor.slice_assign([0..1, 1..2, 0..1, 0..4], &value_tensor);
+    let as_slice = result.as_slice().await.unwrap();
+
+    assert!((as_slice[[0, 0, 0, 0]] - 0.1).abs() < 1e-6);
+    assert!((as_slice[[0, 0, 0, 1]] - 0.2).abs() < 1e-6);
+    assert!((as_slice[[0, 0, 0, 2]] - 0.3).abs() < 1e-6);
+    assert!((as_slice[[0, 0, 0, 3]] - 0.4).abs() < 1e-6);
+    assert!((as_slice[[0, 1, 0, 0]] - 0.5).abs() < 1e-6);
+    assert!((as_slice[[0, 1, 0, 1]] - 0.6).abs() < 1e-6);
+    assert!((as_slice[[0, 1, 0, 2]] - 0.7).abs() < 1e-6);
+    assert!((as_slice[[0, 1, 0, 3]] - 0.8).abs() < 1e-6);
+}
+
+#[cfg(test)]
+#[tokio::test]
+async fn test_cat_then_slice_assign_4d_preserves_prefix() {
+    use crate::Device;
+
+    let device = Device::test_instance();
+
+    let data = vec![vec![vec![vec![0.1f32, 0.2, 0.3, 0.4]]]];
+    let tensor = Tensor::new(&device, &data);
+    let grown = Tensor::cat([tensor, Tensor::zeros(&device, [1, 1, 1, 4])], 1);
+    let value_tensor = Tensor::new(&device, &vec![vec![vec![vec![0.5f32, 0.6, 0.7, 0.8]]]]);
+    let result = grown.slice_assign([0..1, 1..2, 0..1, 0..4], &value_tensor);
+    let as_slice = result.as_slice().await.unwrap();
+
+    assert!((as_slice[[0, 0, 0, 0]] - 0.1).abs() < 1e-6);
+    assert!((as_slice[[0, 0, 0, 1]] - 0.2).abs() < 1e-6);
+    assert!((as_slice[[0, 0, 0, 2]] - 0.3).abs() < 1e-6);
+    assert!((as_slice[[0, 0, 0, 3]] - 0.4).abs() < 1e-6);
+    assert!((as_slice[[0, 1, 0, 0]] - 0.5).abs() < 1e-6);
+    assert!((as_slice[[0, 1, 0, 1]] - 0.6).abs() < 1e-6);
+    assert!((as_slice[[0, 1, 0, 2]] - 0.7).abs() < 1e-6);
+    assert!((as_slice[[0, 1, 0, 3]] - 0.8).abs() < 1e-6);
+}

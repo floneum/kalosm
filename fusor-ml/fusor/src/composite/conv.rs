@@ -360,4 +360,33 @@ mod tests {
         assert!((result[[0, 2, 1]] - 18.0).abs() < 1e-5);
         assert!((result[[0, 2, 2]] - 22.0).abs() < 1e-5);
     }
+
+    #[tokio::test]
+    async fn test_pad_axis_gpu_matches_cpu_4d() {
+        let gpu = crate::Device::new().await.expect("GPU required for this test");
+
+        let input_data = vec![
+            1.0f32, 2.0, 3.0, 4.0, //
+            5.0, 6.0, 7.0, 8.0, //
+            9.0, 10.0, 11.0, 12.0, //
+            13.0, 14.0, 15.0, 16.0,
+        ];
+        let cpu_input: Tensor<4, f32> =
+            Tensor::Cpu(fusor_cpu::Tensor::from_slice([1, 1, 4, 4], &input_data));
+        let gpu_input: Tensor<4, f32> = Tensor::from_slice(&gpu, [1, 1, 4, 4], &input_data);
+
+        let cpu_padded = cpu_input.pad_axis(2, 1).pad_axis(3, 1).as_slice().await.unwrap();
+        let gpu_padded = gpu_input.pad_axis(2, 1).pad_axis(3, 1).as_slice().await.unwrap();
+
+        for h in 0..cpu_padded.shape()[2] {
+            for w in 0..cpu_padded.shape()[3] {
+                let expected = cpu_padded[[0, 0, h, w]];
+                let actual = gpu_padded[[0, 0, h, w]];
+                assert!(
+                    (expected - actual).abs() < 1e-6,
+                    "mismatch at [{h}, {w}]: expected {expected}, got {actual}"
+                );
+            }
+        }
+    }
 }

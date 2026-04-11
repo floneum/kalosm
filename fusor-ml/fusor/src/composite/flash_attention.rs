@@ -203,6 +203,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::Device;
 
     #[tokio::test]
     async fn test_flash_attention_cpu() {
@@ -353,6 +354,75 @@ mod tests {
                         d,
                         val
                     );
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_flash_attention_gpu_matches_cpu_with_causal_mask() {
+        let gpu_device = Device::new().await.expect("GPU required for this test");
+
+        let batch = 1;
+        let heads = 4;
+        let seq = 9;
+        let dim = 8;
+
+        let q_data: Vec<f32> = (0..(batch * heads * seq * dim))
+            .map(|i| ((i % 17) as f32 - 8.0) * 0.05)
+            .collect();
+        let k_data: Vec<f32> = (0..(batch * heads * seq * dim))
+            .map(|i| ((i % 19) as f32 - 9.0) * 0.04)
+            .collect();
+        let v_data: Vec<f32> = (0..(batch * heads * seq * dim))
+            .map(|i| ((i % 23) as f32 - 11.0) * 0.03)
+            .collect();
+
+        let mut mask_data = vec![0.0f32; seq * seq];
+        for q in 0..seq {
+            for k in (q + 1)..seq {
+                mask_data[q * seq + k] = f32::NEG_INFINITY;
+            }
+        }
+
+        let cpu_q: Tensor<4, f32> =
+            Tensor::Cpu(fusor_cpu::Tensor::from_slice([batch, heads, seq, dim], &q_data));
+        let cpu_k: Tensor<4, f32> =
+            Tensor::Cpu(fusor_cpu::Tensor::from_slice([batch, heads, seq, dim], &k_data));
+        let cpu_v: Tensor<4, f32> =
+            Tensor::Cpu(fusor_cpu::Tensor::from_slice([batch, heads, seq, dim], &v_data));
+        let cpu_mask: Tensor<2, f32> =
+            Tensor::Cpu(fusor_cpu::Tensor::from_slice([seq, seq], &mask_data));
+
+        let gpu_q = Tensor::from_slice(&gpu_device, [batch, heads, seq, dim], &q_data);
+        let gpu_k = Tensor::from_slice(&gpu_device, [batch, heads, seq, dim], &k_data);
+        let gpu_v = Tensor::from_slice(&gpu_device, [batch, heads, seq, dim], &v_data);
+        let gpu_mask = Tensor::from_slice(&gpu_device, [seq, seq], &mask_data);
+
+        let scale = 1.0 / (dim as f32).sqrt();
+
+        let cpu_out = cpu_q
+            .flash_attention(&cpu_k, &cpu_v, scale, Some((&cpu_mask, MaskKind::QKMask)))
+            .as_slice()
+            .await
+            .unwrap();
+        let gpu_out = gpu_q
+            .flash_attention(&gpu_k, &gpu_v, scale, Some((&gpu_mask, MaskKind::QKMask)))
+            .as_slice()
+            .await
+            .unwrap();
+
+        for b in 0..batch {
+            for h in 0..heads {
+                for s in 0..seq {
+                    for d in 0..dim {
+                        let expected = cpu_out[[b, h, s, d]];
+                        let actual = gpu_out[[b, h, s, d]];
+                        assert!(
+                            (expected - actual).abs() < 0.02,
+                            "mismatch at [{b}, {h}, {s}, {d}]: expected {expected}, got {actual}"
+                        );
+                    }
                 }
             }
         }

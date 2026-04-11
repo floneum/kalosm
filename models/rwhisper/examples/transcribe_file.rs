@@ -10,6 +10,8 @@ async fn main() -> Result<(), anyhow::Error> {
 
     let source = if let Ok(dir) = std::env::var("RWHISPER_COHERE_DIR") {
         WhisperSource::cohere_transcribe_03_2026_local(dir)
+    } else if std::env::var("RWHISPER_COHERE").is_ok() {
+        WhisperSource::cohere_transcribe_03_2026()
     } else if let Ok(dir) = std::env::var("RWHISPER_WHISPER_DIR") {
         let dir = PathBuf::from(dir);
         let model_path = dir.join("whisper-tiny-en.gguf.real");

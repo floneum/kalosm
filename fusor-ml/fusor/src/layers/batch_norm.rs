@@ -73,9 +73,13 @@ where
         let mean = mean_reshaped.broadcast_as(shape);
         let var_reshaped = self.running_var.reshape([1, channels, 1]);
         let var = var_reshaped.broadcast_as(shape);
-        let normalized = (input.to_concrete() - mean)
-            .to_concrete()
-            .div_(&(var.to_concrete().add_scalar(self.eps).sqrt().broadcast_as(shape)));
+        let normalized = (input.to_concrete() - mean).to_concrete().div_(
+            &(var
+                .to_concrete()
+                .add_scalar(self.eps)
+                .sqrt()
+                .broadcast_as(shape)),
+        );
 
         let scaled = if let Some(weight) = &self.weight {
             let weight_reshaped = weight.reshape([1, channels, 1]);
@@ -113,8 +117,7 @@ mod tests {
     #[tokio::test]
     async fn test_batch_norm_1d_inference() {
         let device = Device::Cpu;
-        let input: Tensor<3, f32> =
-            Tensor::from_slice(&device, [1, 2, 2], &[1.0, 3.0, 10.0, 14.0]);
+        let input: Tensor<3, f32> = Tensor::from_slice(&device, [1, 2, 2], &[1.0, 3.0, 10.0, 14.0]);
         let weight: Tensor<1, f32> = Tensor::from_slice(&device, [2], &[2.0, 0.5]);
         let bias: Tensor<1, f32> = Tensor::from_slice(&device, [2], &[1.0, -1.0]);
         let mean: Tensor<1, f32> = Tensor::from_slice(&device, [2], &[2.0, 12.0]);

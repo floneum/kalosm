@@ -155,4 +155,31 @@ mod tests {
         assert_eq!(output[[0, 1, 0]], 3.0);
         assert_eq!(output[[0, 1, 1]], 4.0);
     }
+
+    #[tokio::test]
+    async fn test_attention_mask_causal_gpu_matches_cpu() {
+        let cpu = Device::cpu();
+        let gpu = Device::new().await.expect("GPU required for this test");
+
+        let cpu_mask: AttentionMask<f32> = AttentionMask::causal(&cpu, 9);
+        let gpu_mask: AttentionMask<f32> = AttentionMask::causal(&gpu, 9);
+
+        let cpu_data = cpu_mask.mask().clone().as_slice().await.unwrap();
+        let gpu_data = gpu_mask.mask().clone().as_slice().await.unwrap();
+
+        for i in 0..9 {
+            for j in 0..9 {
+                let expected = cpu_data[[i, j]];
+                let actual = gpu_data[[i, j]];
+                if expected.is_infinite() {
+                    assert!(actual.is_infinite() && actual.is_sign_negative());
+                } else {
+                    assert!(
+                        (expected - actual).abs() < 1e-6,
+                        "mismatch at [{i}, {j}]: expected {expected}, got {actual}"
+                    );
+                }
+            }
+        }
+    }
 }

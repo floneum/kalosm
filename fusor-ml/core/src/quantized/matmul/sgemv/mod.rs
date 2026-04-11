@@ -68,13 +68,29 @@ pub(crate) fn decompose_workgroup_index(
 /// Check if the device can support specialized SGEMV kernels that require 2 subgroups per workgroup.
 /// This requires the workgroup to be large enough to fit 2 subgroups, which means:
 /// max_subgroup_size >= 2 * min_subgroup_size
+pub(crate) fn quantized_sgemv_subgroups_supported(device: &Device) -> bool {
+    device.subgroups_supported() && device.wgpu_adapter().get_info().backend != wgpu::Backend::Metal
+}
+
 fn can_use_specialized_sgemv(device: &Device) -> bool {
-    if !device.subgroups_supported() {
+    if !quantized_sgemv_subgroups_supported(device) {
         return false;
     }
     // The workgroup is constrained to be <= max_subgroup_size, so we need
     // max_subgroup_size >= 2 * min_subgroup_size to fit 2 subgroups
     device.max_subgroup_size() >= 2 * device.min_subgroup_size()
+}
+
+fn can_use_specialized_q8_0_sgemv(device: &Device) -> bool {
+    if !can_use_specialized_sgemv(device) {
+        return false;
+    }
+
+    // The subgroup-specialized Q8_0 kernel is unstable on Metal for the tiny
+    // batched widths used by encoder-decoder cross-attention cache init.
+    // Fall back to the general SGEMV path there until the specialized kernel is
+    // fixed.
+    device.wgpu_adapter().get_info().backend != wgpu::Backend::Metal
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -138,7 +154,7 @@ pub(crate) fn sgemv(
             _m_size,
             k_size,
         ),
-        GgmlType::Q8_0 if use_specialized => q_8_0_sgemv(
+        GgmlType::Q8_0 if can_use_specialized_q8_0_sgemv(&device) => q_8_0_sgemv(
             op,
             generic_kernel,
             workgroup_size,
@@ -199,7 +215,7 @@ pub(crate) fn workgroup_shape_constraints(
     device: &Device,
 ) -> crate::mir::workgroup_shape::WorkgroupShapeConstraints {
     let mut constraints = crate::mir::workgroup_shape::WorkgroupShapeConstraints::default();
-    if device.subgroups_supported() {
+    if quantized_sgemv_subgroups_supported(device) {
         constraints.add_constraint(
             0,
             crate::mir::workgroup_shape::Constraint::more_than_or_equals(

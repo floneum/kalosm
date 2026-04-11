@@ -173,6 +173,7 @@ impl TensorLayoutInfo {
 pub(crate) struct TensorInfo {
     shape: Box<[usize]>,
     datatype: DataTypeEnum,
+    is_zero_splat: bool,
 }
 
 impl Display for TensorInfo {
@@ -183,7 +184,19 @@ impl Display for TensorInfo {
 
 impl TensorInfo {
     pub(crate) fn new(shape: Box<[usize]>, datatype: DataTypeEnum) -> Self {
-        Self { shape, datatype }
+        Self {
+            shape,
+            datatype,
+            is_zero_splat: false,
+        }
+    }
+
+    pub(crate) fn new_zero_splat(shape: Box<[usize]>, datatype: DataTypeEnum) -> Self {
+        Self {
+            shape,
+            datatype,
+            is_zero_splat: true,
+        }
     }
 
     pub(crate) fn shape(&self) -> &[usize] {
@@ -196,6 +209,14 @@ impl TensorInfo {
 
     pub(crate) fn datatype(&self) -> DataTypeEnum {
         self.datatype
+    }
+
+    pub(crate) fn is_zero_splat(&self) -> bool {
+        self.is_zero_splat
+    }
+
+    pub(crate) fn mark_zero_splat(&mut self) {
+        self.is_zero_splat = true;
     }
 }
 
@@ -226,11 +247,16 @@ impl LazyTensorData {
     pub(crate) fn new(data: TensorData) -> Self {
         let device = data.device.clone();
         let info = data.info.clone();
+        let is_zero_splat = data.is_zero_splat();
         let key = device.compute_graph().create_tensor(data);
 
         Self {
             device,
-            info: TensorInfo::new(info.shape().into(), info.datatype()),
+            info: if is_zero_splat {
+                TensorInfo::new_zero_splat(info.shape().into(), info.datatype())
+            } else {
+                TensorInfo::new(info.shape().into(), info.datatype())
+            },
             key,
         }
     }
@@ -315,7 +341,11 @@ impl LazyTensorData {
         // Compute output shape by applying the layout transformation to a temporary layout
         let temp_layout = Layout::contiguous(self.info.shape());
         let new_layout = op.map_layout(&temp_layout);
-        let info = TensorInfo::new(new_layout.shape().into(), self.info.datatype());
+        let info = if self.info.is_zero_splat() {
+            TensorInfo::new_zero_splat(new_layout.shape().into(), self.info.datatype())
+        } else {
+            TensorInfo::new(new_layout.shape().into(), self.info.datatype())
+        };
         let key = device.compute_graph().create_map_layout(op);
 
         Self::from_parts(device, info, key)
@@ -323,7 +353,11 @@ impl LazyTensorData {
 
     pub(crate) fn resize(&self, op: ResizeOperation) -> Self {
         let device = self.device.clone();
-        let info = TensorInfo::new(op.new_shape.clone(), self.info.datatype());
+        let info = if self.info.is_zero_splat() {
+            TensorInfo::new_zero_splat(op.new_shape.clone(), self.info.datatype())
+        } else {
+            TensorInfo::new(op.new_shape.clone(), self.info.datatype())
+        };
         let key = device.compute_graph().create_resize(op);
 
         Self::from_parts(device, info, key)
@@ -331,7 +365,9 @@ impl LazyTensorData {
 
     pub(crate) fn slice_assign(&self, op: SliceAssignOperation) -> Self {
         let device = self.device.clone();
-        let info = self.info.clone();
+        // slice_assign can introduce non-zero values even when the input tensor is a zero splat,
+        // so the result must not inherit the zero-splat marker from the input.
+        let info = TensorInfo::new(self.info.shape().into(), self.info.datatype());
         let key = device.compute_graph().create_slice_assign(op);
 
         Self::from_parts(device, info, key)
@@ -351,6 +387,10 @@ impl LazyTensorData {
         (result.data, result.total_kernels)
     }
 
+    pub(crate) fn is_zero_splat(&self) -> bool {
+        self.info.is_zero_splat()
+    }
+
     pub fn graphvis(&self) -> Graph {
         self.device.compute_graph().graphvis(self.key)
     }
@@ -361,11 +401,14 @@ pub(crate) struct TensorData {
     device: Device,
     buffer: Arc<wgpu::Buffer>,
     info: TensorLayoutInfo,
+    is_zero_splat: bool,
 }
 
 impl PartialEq for TensorData {
     fn eq(&self, other: &Self) -> bool {
-        self.info == other.info && self.buffer == other.buffer
+        self.info == other.info
+            && self.buffer == other.buffer
+            && self.is_zero_splat == other.is_zero_splat
     }
 }
 
@@ -402,6 +445,7 @@ impl TensorData {
             device: device.clone(),
             buffer,
             info: TensorLayoutInfo::new(layout, datatype),
+            is_zero_splat: false,
         }
     }
 
@@ -435,7 +479,9 @@ impl TensorData {
         );
         let strides = (0..shape.len()).map(|_| 0).collect();
         let layout = Layout::from_parts(0, shape.into(), strides);
-        Self::new_from_parts(device, buffer, layout, datatype)
+        let mut tensor = Self::new_from_parts(device, buffer, layout, datatype);
+        tensor.is_zero_splat = raw_data.iter().all(|byte| *byte == 0);
+        tensor
     }
 
     fn new_inner<'a, D: DataType, I: Iterator<Item = &'a D>>(
@@ -484,6 +530,7 @@ impl TensorData {
             device: self.device.clone(),
             buffer: self.buffer.clone(),
             info: TensorLayoutInfo::new(layout, self.info.datatype),
+            is_zero_splat: self.is_zero_splat,
         }
     }
 
@@ -493,6 +540,14 @@ impl TensorData {
 
     pub(crate) fn datatype(&self) -> DataTypeEnum {
         self.info.datatype
+    }
+
+    pub(crate) fn is_zero_splat(&self) -> bool {
+        self.is_zero_splat
+    }
+
+    pub(crate) fn mark_zero_splat(&mut self) {
+        self.is_zero_splat = true;
     }
 
     pub fn device(&self) -> &Device {
@@ -784,6 +839,10 @@ impl<D: DataType, const R: usize> Tensor<R, D> {
         }
     }
 
+    pub(crate) fn is_zero_splat(&self) -> bool {
+        self.data.is_zero_splat()
+    }
+
     fn new_inner<'a, I: Iterator<Item = &'a D>>(
         device: &Device,
         data: I,
@@ -873,10 +932,92 @@ impl<D: DataType, const R: usize> Tensor<R, D> {
         }
     }
 
+    #[track_caller]
+    pub fn materialized(&self) -> impl Future<Output = Self> + 'static {
+        let (data, _) = self.data.materialize();
+        let device = self.device().clone();
+        let (sender, receiver) = futures_channel::oneshot::channel();
+        device.wgpu_queue().on_submitted_work_done(|| {
+            _ = sender.send(());
+        });
+        async move {
+            let _ = receiver.await;
+            Self::from_parts(LazyTensorData::new(data))
+        }
+    }
+
+    #[track_caller]
+    pub fn materialized_many(
+        tensors: &[&Self],
+    ) -> std::pin::Pin<Box<dyn Future<Output = Vec<Self>> + 'static>> {
+        if tensors.is_empty() {
+            return Box::pin(async { Vec::new() });
+        }
+
+        let device = tensors[0].device().clone();
+        let keys: Vec<_> = tensors
+            .iter()
+            .map(|tensor| {
+                assert_eq!(
+                    tensor.device().wgpu_device(),
+                    device.wgpu_device(),
+                    "all tensors in materialized_many must be on the same device"
+                );
+                tensor.data.key
+            })
+            .collect();
+        let resolved = device.compute_graph().resolve_many(&keys, &device);
+        let data = resolved.data;
+        let (sender, receiver) = futures_channel::oneshot::channel();
+        device.wgpu_queue().on_submitted_work_done(|| {
+            _ = sender.send(());
+        });
+        Box::pin(async move {
+            let _ = receiver.await;
+            data.into_iter()
+                .map(|data| Self::from_parts(LazyTensorData::new(data)))
+                .collect()
+        })
+    }
+
+    #[track_caller]
+    pub fn materialize_many(
+        tensors: &[&Self],
+    ) -> std::pin::Pin<Box<dyn Future<Output = ()> + 'static>> {
+        if tensors.is_empty() {
+            return Box::pin(async {});
+        }
+
+        let device = tensors[0].device().clone();
+        let keys: Vec<_> = tensors
+            .iter()
+            .map(|tensor| {
+                assert_eq!(
+                    tensor.device().wgpu_device(),
+                    device.wgpu_device(),
+                    "all tensors in materialize_many must be on the same device"
+                );
+                tensor.data.key
+            })
+            .collect();
+        let _ = device.compute_graph().resolve_many(&keys, &device);
+        let (sender, receiver) = futures_channel::oneshot::channel();
+        device.wgpu_queue().on_submitted_work_done(|| {
+            _ = sender.send(());
+        });
+        Box::pin(async move {
+            let _ = receiver.await;
+        })
+    }
+
     /// How many kernel calls are needed to fully resolve this tensor
     pub fn count_kernels_to_resolve(&self) -> usize {
         let (_, count) = self.data.materialize();
         count
+    }
+
+    pub(crate) fn is_materialized(&self) -> bool {
+        self.device().compute_graph().is_cached(self.data.key)
     }
 
     pub async fn as_slice(

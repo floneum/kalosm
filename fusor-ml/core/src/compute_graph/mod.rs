@@ -5,7 +5,6 @@ pub(crate) use petgraph::graph::NodeIndex;
 use petgraph::prelude::StableGraph;
 use resolve::Resolver;
 use tabbycat::Graph;
-use wgpu::CommandEncoderDescriptor;
 
 mod layout_pass;
 mod queue;
@@ -15,7 +14,7 @@ mod visualize;
 use crate::{
     DataTypeEnum, Device, ElementWiseOperation, MatMulOperation, PairWiseOperation, QMatrix,
     ReduceOperation, composite::where_cond::WhereCondOperation,
-    compute_graph::resolve::ResolverResult, dequantize::DequantizeOperation,
+    compute_graph::resolve::{ResolverManyResult, ResolverResult}, dequantize::DequantizeOperation,
     index_select::IndexSelectOperation, map_layout::MapLayoutOperation, mir::operation::Operation,
     nary_wise::NaryOperation, quantized::matmul::QMatMulOperation, resize::ResizeOperation,
     slice_assign::SliceAssignOperation, tensor::TensorData, visit_tiled::MaybeQData,
@@ -101,20 +100,39 @@ impl ComputeGraph {
     }
 
     pub(crate) fn resolve(&self, key: NodeIndex, device: &Device) -> ResolverResult {
-        let mut encoder = device
-            .wgpu_device()
-            .create_command_encoder(&CommandEncoderDescriptor {
-                label: Some("ComputeGraph Encoder"),
-            });
         let data = self.with_mut(|inner| {
-            let mut resolver = Resolver::new(inner, key, &mut encoder);
+            let mut resolver = Resolver::new(inner, key, device);
             resolver.run(inner)
         });
-        device.wgpu_queue().submit(Some(encoder.finish()));
         // Reset the written flag on all buffers
         device.reset_initialized_buffers();
 
         // Flush the cache to a file
+        if let (Some(pipeline_cache), Some(cache_file)) =
+            (device.wgpu_cache(), device.wgpu_cache_file())
+        {
+            let data = pipeline_cache.get_data();
+            if let Some(data) = data {
+                let temp_file = cache_file.with_extension("temp");
+                std::fs::write(&temp_file, &data).unwrap();
+                std::fs::rename(&temp_file, cache_file).unwrap();
+            }
+        }
+
+        data
+    }
+
+    pub(crate) fn resolve_many(
+        &self,
+        keys: &[NodeIndex],
+        device: &Device,
+    ) -> ResolverManyResult {
+        let data = self.with_mut(|inner| {
+            let mut resolver = Resolver::new_many(inner, keys, device);
+            resolver.run_many(inner)
+        });
+        device.reset_initialized_buffers();
+
         if let (Some(pipeline_cache), Some(cache_file)) =
             (device.wgpu_cache(), device.wgpu_cache_file())
         {
@@ -139,6 +157,10 @@ impl ComputeGraph {
 
     pub(crate) fn remove_reference(&self, key: NodeIndex) {
         self.with_mut(|inner| inner.remove_reference(key));
+    }
+
+    pub(crate) fn is_cached(&self, key: NodeIndex) -> bool {
+        self.with_mut(|inner| inner.get_cached_result(key).is_some())
     }
 }
 

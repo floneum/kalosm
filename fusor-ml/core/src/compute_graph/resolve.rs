@@ -5,9 +5,10 @@ use std::sync::Arc;
 use petgraph::algo::toposort;
 use petgraph::stable_graph::StableGraph;
 use rustc_hash::{FxHashMap, FxHashSet};
-use wgpu::CommandEncoder;
+use wgpu::{CommandEncoder, CommandEncoderDescriptor};
 
 use crate::{
+    Device,
     ElementWiseFunctions,
     mir::{
         inputs::{KernelInputValue, MirValue},
@@ -27,6 +28,11 @@ pub(crate) struct ResolverResult {
     pub(crate) total_kernels: usize,
 }
 
+pub(crate) struct ResolverManyResult {
+    pub(crate) data: Vec<TensorData>,
+    pub(crate) total_kernels: usize,
+}
+
 #[derive(Debug, Clone)]
 struct ExecutionNode {
     inner_idx: NodeIndex,
@@ -36,19 +42,29 @@ struct ExecutionNode {
 type ExecutionGraph = StableGraph<ExecutionNode, ()>;
 type ExecutionNodeIndex = petgraph::graph::NodeIndex;
 
-pub(crate) struct Resolver<'a> {
-    command_encoder: &'a mut CommandEncoder,
+pub(crate) struct Resolver {
+    device: Device,
+    command_encoder: CommandEncoder,
     execution_graph: ExecutionGraph,
     node_mapping: FxHashMap<NodeIndex, ExecutionNodeIndex>,
-    target: NodeIndex,
+    targets: Vec<NodeIndex>,
     resolved_set: FxHashSet<NodeIndex>,
+    dispatched_kernels_since_submit: usize,
 }
 
-impl<'a> Resolver<'a> {
+impl Resolver {
     pub(crate) fn new(
         graph: &mut ComputeGraphInner,
         target: NodeIndex,
-        command_encoder: &'a mut CommandEncoder,
+        device: &Device,
+    ) -> Self {
+        Self::new_many(graph, &[target], device)
+    }
+
+    pub(crate) fn new_many(
+        graph: &mut ComputeGraphInner,
+        targets: &[NodeIndex],
+        device: &Device,
     ) -> Self {
         let resolved_set = graph
             .nodes
@@ -64,20 +80,28 @@ impl<'a> Resolver<'a> {
             })
             .collect();
         Self {
-            command_encoder,
-            target,
+            device: device.clone(),
+            command_encoder: device
+                .wgpu_device()
+                .create_command_encoder(&CommandEncoderDescriptor {
+                    label: Some("ComputeGraph Resolver Encoder"),
+                }),
+            targets: targets.to_vec(),
             execution_graph: Default::default(),
             node_mapping: Default::default(),
             resolved_set,
+            dispatched_kernels_since_submit: 0,
         }
     }
 
-    pub(crate) fn run(&mut self, graph: &mut ComputeGraphInner) -> ResolverResult {
+    fn execute(&mut self, graph: &mut ComputeGraphInner) -> usize {
         let device = graph.device();
         let max_subgroup_size = device.max_subgroup_size();
 
         // Pass 1: Build execution graph
-        self.build_execution_graph(graph, self.target);
+        for target in self.targets.clone() {
+            self.build_execution_graph(graph, target);
+        }
 
         // Pass 2: Apply Rewrite Rules
         self.optimize(graph);
@@ -139,6 +163,8 @@ impl<'a> Resolver<'a> {
                     all_input_values.clear();
                     inputs.clear();
                     kernel.clear();
+                    self.dispatched_kernels_since_submit += 1;
+                    self.maybe_submit_partial();
                 }
                 current_constraints = constraint;
             }
@@ -185,15 +211,59 @@ impl<'a> Resolver<'a> {
                 &all_input_values,
                 old_best,
             );
+            self.dispatched_kernels_since_submit += 1;
+            self.maybe_submit_partial();
         }
 
+        self.submit_encoder();
+
         let data = graph
-            .get_result(self.target)
+            .get_result(self.targets[0])
             .expect("Target result not cached");
-        ResolverResult {
-            data,
-            total_kernels,
+        graph.set_cached_result(self.targets[0], data.clone());
+        total_kernels
+    }
+
+    pub(crate) fn run(&mut self, graph: &mut ComputeGraphInner) -> ResolverResult {
+        let total_kernels = self.execute(graph);
+        let data = graph
+            .get_result(self.targets[0])
+            .expect("Target result not cached");
+        ResolverResult { data, total_kernels }
+    }
+
+    pub(crate) fn run_many(&mut self, graph: &mut ComputeGraphInner) -> ResolverManyResult {
+        let total_kernels = self.execute(graph);
+        let data = self
+            .targets
+            .iter()
+            .map(|target| graph.get_result(*target).expect("Target result not cached"))
+            .collect();
+        ResolverManyResult { data, total_kernels }
+    }
+
+    fn maybe_submit_partial(&mut self) {
+        if self.device.wgpu_adapter().get_info().backend == wgpu::Backend::Metal
+            && self.dispatched_kernels_since_submit >= 1
+        {
+            self.submit_encoder();
         }
+    }
+
+    fn submit_encoder(&mut self) {
+        if self.dispatched_kernels_since_submit == 0 {
+            return;
+        }
+        let encoder = std::mem::replace(
+            &mut self.command_encoder,
+            self.device
+                .wgpu_device()
+                .create_command_encoder(&CommandEncoderDescriptor {
+                    label: Some("ComputeGraph Resolver Encoder"),
+                }),
+        );
+        self.device.wgpu_queue().submit(Some(encoder.finish()));
+        self.dispatched_kernels_since_submit = 0;
     }
 
     fn build_execution_graph(
@@ -1092,12 +1162,24 @@ impl<'a> Resolver<'a> {
         }
         kernel.set_workgroup_size(workgroup_shape);
         let device = graph.device();
+        let profile = std::env::var_os("RWHISPER_COHERE_PROFILE").is_some();
+        if profile {
+            let names = queued_operations
+                .iter()
+                .map(|(key, operation)| format!("{}#{key:?}", operation.name()))
+                .collect::<Vec<_>>()
+                .join(" | ");
+            eprintln!("resolver kernel start: {names}");
+        }
         kernel.run(
             &device,
             all_input_values,
-            self.command_encoder,
+            &mut self.command_encoder,
             max_dispatch_size,
         );
+        if profile {
+            eprintln!("resolver kernel queued");
+        }
     }
 
     /// Wrap an expression with element-wise functions (each becomes a unary Op node)

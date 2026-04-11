@@ -82,14 +82,30 @@ impl CohereRuntime {
         language: WhisperLanguage,
         with_timestamps: bool,
     ) -> Result<DecodingResult, crate::model::WhisperError> {
+        let profile = std::env::var("RWHISPER_COHERE_PROFILE").ok().as_deref() == Some("1");
+        let total_start = Instant::now();
         let prompt_ids = self.prompt_ids(language)?;
+        if profile {
+            eprintln!("cohere prompt ids: {:.3}s", total_start.elapsed().as_secs_f32());
+        }
         let (features, total_frames, valid_frames) =
             pcm_to_features(&self.model.config, samples, &self.filterbank);
+        if profile {
+            eprintln!(
+                "cohere features: {:.3}s total_frames={} valid_frames={}",
+                total_start.elapsed().as_secs_f32(),
+                total_frames,
+                valid_frames
+            );
+        }
         let input_features = Tensor::from_slice(
             &self.device,
             [1, self.model.config.preprocessor.features, total_frames],
             &features,
         );
+        if profile {
+            eprintln!("cohere input tensor: {:.3}s", total_start.elapsed().as_secs_f32());
+        }
         let (generated, token_timestamps) = if with_timestamps {
             let (generated, cross_attentions, encoder_length) = self
                 .model
@@ -121,6 +137,9 @@ impl CohereRuntime {
             .next();
             (generated, token_timestamps)
         } else {
+            if profile {
+                eprintln!("cohere generate start: {:.3}s", total_start.elapsed().as_secs_f32());
+            }
             (
                 self.model
                     .generate_greedy(
@@ -134,6 +153,13 @@ impl CohereRuntime {
                 None,
             )
         };
+        if profile {
+            eprintln!(
+                "cohere generate done: {:.3}s generated_tokens={}",
+                total_start.elapsed().as_secs_f32(),
+                generated.len()
+            );
+        }
 
         let mut remaining_tokens: Vec<_> = generated.iter().copied().enumerate().collect();
         remaining_tokens.reverse();

@@ -400,6 +400,134 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn test_gpu_qmatmul_tiny_m_q8_0_matches_cpu() {
+        let gpu_device = Device::new().await.expect("GPU required for this test");
+        let cpu_device = Device::Cpu;
+
+        let shape = [2, 32];
+        let block_size_bytes = 34;
+        let mut raw_bytes = vec![0u8; 2 * block_size_bytes];
+
+        let scale_f16 = half::f16::from_f32(1.0);
+        raw_bytes[0..2].copy_from_slice(&scale_f16.to_le_bytes());
+        for i in 0..32 {
+            raw_bytes[2 + i] = 1i8 as u8;
+        }
+
+        raw_bytes[block_size_bytes..block_size_bytes + 2]
+            .copy_from_slice(&scale_f16.to_le_bytes());
+        for i in 0..32 {
+            raw_bytes[block_size_bytes + 2 + i] = 2i8 as u8;
+        }
+
+        let cpu_qmatrix =
+            QMatrix::from_raw_bytes(&cpu_device, shape, &raw_bytes, GgmlType::Q8_0).unwrap();
+        let gpu_qmatrix =
+            QMatrix::from_raw_bytes(&gpu_device, shape, &raw_bytes, GgmlType::Q8_0).unwrap();
+
+        let input_data: Vec<f32> = (0..13)
+            .flat_map(|row| std::iter::repeat_n(0.25f32 * (row as f32 + 1.0), 32))
+            .collect();
+        let cpu_input: Tensor<3, f32> = Tensor::from_slice(&cpu_device, [1, 13, 32], &input_data);
+        let gpu_input: Tensor<3, f32> = Tensor::from_slice(&gpu_device, [1, 13, 32], &input_data);
+
+        let cpu_output = cpu_input.q_mat_mul(&cpu_qmatrix).as_slice().await.unwrap();
+        let gpu_output = gpu_input.q_mat_mul(&gpu_qmatrix).as_slice().await.unwrap();
+
+        for row in 0..13 {
+            for col in 0..2 {
+                let expected = cpu_output[[0, row, col]];
+                let actual = gpu_output[[0, row, col]];
+                assert!(
+                    (expected - actual).abs() < 0.1,
+                    "row {row} col {col}: expected {expected}, got {actual}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_gpu_qmatmul_materialized_many_matches_individual() {
+        let gpu_device = Device::new().await.expect("GPU required for this test");
+        let cpu_device = Device::Cpu;
+
+        let shape = [2, 32];
+        let block_size_bytes = 34;
+        let mut raw_bytes_a = vec![0u8; 2 * block_size_bytes];
+        let mut raw_bytes_b = vec![0u8; 2 * block_size_bytes];
+
+        let scale_f16 = half::f16::from_f32(1.0);
+        raw_bytes_a[0..2].copy_from_slice(&scale_f16.to_le_bytes());
+        raw_bytes_b[0..2].copy_from_slice(&scale_f16.to_le_bytes());
+        for i in 0..32 {
+            raw_bytes_a[2 + i] = 1i8 as u8;
+            raw_bytes_b[2 + i] = 3i8 as u8;
+        }
+
+        raw_bytes_a[block_size_bytes..block_size_bytes + 2]
+            .copy_from_slice(&scale_f16.to_le_bytes());
+        raw_bytes_b[block_size_bytes..block_size_bytes + 2]
+            .copy_from_slice(&scale_f16.to_le_bytes());
+        for i in 0..32 {
+            raw_bytes_a[block_size_bytes + 2 + i] = 2i8 as u8;
+            raw_bytes_b[block_size_bytes + 2 + i] = 4i8 as u8;
+        }
+
+        let cpu_qmatrix_a =
+            QMatrix::from_raw_bytes(&cpu_device, shape, &raw_bytes_a, GgmlType::Q8_0).unwrap();
+        let cpu_qmatrix_b =
+            QMatrix::from_raw_bytes(&cpu_device, shape, &raw_bytes_b, GgmlType::Q8_0).unwrap();
+        let gpu_qmatrix_a =
+            QMatrix::from_raw_bytes(&gpu_device, shape, &raw_bytes_a, GgmlType::Q8_0).unwrap();
+        let gpu_qmatrix_b =
+            QMatrix::from_raw_bytes(&gpu_device, shape, &raw_bytes_b, GgmlType::Q8_0).unwrap();
+
+        let input_data: Vec<f32> = (0..13)
+            .flat_map(|row| std::iter::repeat_n(0.25f32 * (row as f32 + 1.0), 32))
+            .collect();
+        let cpu_input: Tensor<3, f32> = Tensor::from_slice(&cpu_device, [1, 13, 32], &input_data);
+        let gpu_input: Tensor<3, f32> = Tensor::from_slice(&gpu_device, [1, 13, 32], &input_data);
+
+        let cpu_output_a = cpu_input.clone().q_mat_mul(&cpu_qmatrix_a).as_slice().await.unwrap();
+        let cpu_output_b = cpu_input.q_mat_mul(&cpu_qmatrix_b).as_slice().await.unwrap();
+
+        let gpu_output_a = gpu_input.clone().q_mat_mul(&gpu_qmatrix_a);
+        let gpu_output_b = gpu_input.q_mat_mul(&gpu_qmatrix_b);
+        let individual_a = gpu_output_a.clone().as_slice().await.unwrap();
+        let individual_b = gpu_output_b.clone().as_slice().await.unwrap();
+        let many = Tensor::to_materialized_many_blocking(&[&gpu_output_a, &gpu_output_b]);
+        let many_a = many[0].clone().as_slice().await.unwrap();
+        let many_b = many[1].clone().as_slice().await.unwrap();
+
+        for row in 0..13 {
+            for col in 0..2 {
+                let cpu_a = cpu_output_a[[0, row, col]];
+                let cpu_b = cpu_output_b[[0, row, col]];
+                let gpu_a = individual_a[[0, row, col]];
+                let gpu_b = individual_b[[0, row, col]];
+                let shared_a = many_a[[0, row, col]];
+                let shared_b = many_b[[0, row, col]];
+                assert!(
+                    (cpu_a - gpu_a).abs() < 0.1,
+                    "individual A row {row} col {col}: expected {cpu_a}, got {gpu_a}"
+                );
+                assert!(
+                    (cpu_b - gpu_b).abs() < 0.1,
+                    "individual B row {row} col {col}: expected {cpu_b}, got {gpu_b}"
+                );
+                assert!(
+                    (gpu_a - shared_a).abs() < 0.1,
+                    "shared A row {row} col {col}: individual {gpu_a}, shared {shared_a}"
+                );
+                assert!(
+                    (gpu_b - shared_b).abs() < 0.1,
+                    "shared B row {row} col {col}: individual {gpu_b}, shared {shared_b}"
+                );
+            }
+        }
+    }
+
     #[test]
     fn test_cpu_f32_qmatmul() {
         // Test F32 (non-quantized) qmatmul

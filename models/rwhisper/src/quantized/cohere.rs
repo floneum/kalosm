@@ -3,11 +3,59 @@ use fusor::{
     layers::{
         BatchNorm1d, Conv1d, Conv1dConfig, Conv2d, Conv2dConfig, Embedding, LayerNorm, Linear,
     },
-    Device, Result, Tensor, VarBuilder,
+    Device, MaskKind, Result, Tensor, VarBuilder,
 };
 use std::sync::Arc;
 
 use crate::cohere_config::{CohereConfig, CohereDecoderConfig, CohereEncoderConfig};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::Instant;
+
+static COHERE_ENCODER_LAYER_CALLS: AtomicUsize = AtomicUsize::new(0);
+
+fn materialize_if_gpu<const R: usize, D, B>(tensor: &Tensor<R, D, B>)
+where
+    B: fusor::TensorBacking<R, Elem = D>,
+    D: fusor::SimdElement + fusor::DataType + 'static,
+{
+    if tensor.is_gpu() {
+        tensor.materialize_blocking();
+    }
+}
+
+fn profile_enabled() -> bool {
+    std::env::var("RWHISPER_COHERE_PROFILE").ok().as_deref() == Some("1")
+}
+
+fn cohere_layer_norm_3d(norm: &LayerNorm<1, f32>, input: &Tensor<3, f32>) -> Tensor<3, f32> {
+    if !input.is_gpu() {
+        return norm.forward(input);
+    }
+
+    let profile = profile_enabled();
+    let start = profile.then(Instant::now);
+    let [batch, time, hidden] = input.shape();
+    let flat: Tensor<2, f32> = input.reshape([batch * time, hidden]).to_concrete();
+    if let Some(start) = start {
+        eprintln!("cohere layer_norm reshape: {:.3}s", start.elapsed().as_secs_f32());
+    }
+    let mean = flat.mean_keepdim::<1>(1);
+    if let Some(start) = start {
+        eprintln!("cohere layer_norm mean: {:.3}s", start.elapsed().as_secs_f32());
+    }
+    let centered = (&flat - &mean.broadcast_as(flat.shape())).to_concrete();
+    if let Some(start) = start {
+        eprintln!(
+            "cohere layer_norm center: {:.3}s",
+            start.elapsed().as_secs_f32()
+        );
+    }
+    let normalized = centered.rms_norm_fused::<1, 1>(norm.weight(), norm.bias(), norm.eps());
+    if let Some(start) = start {
+        eprintln!("cohere layer_norm rms: {:.3}s", start.elapsed().as_secs_f32());
+    }
+    normalized.reshape([batch, time, hidden]).to_concrete()
+}
 
 fn conv_output_length(input: usize, kernel: usize, stride: usize, padding: usize) -> usize {
     ((input + 2 * padding - kernel) / stride) + 1
@@ -192,8 +240,21 @@ impl ConformerFeedForward {
     }
 
     fn forward(&self, x: &Tensor<3, f32>) -> Tensor<3, f32> {
-        self.linear2
-            .forward(&self.linear1.forward(x).silu().to_concrete())
+        let profile = profile_enabled();
+        let start = profile.then(Instant::now);
+        let x = self.linear1.forward(x);
+        if let Some(start) = start {
+            eprintln!("cohere ff linear1: {:.3}s", start.elapsed().as_secs_f32());
+        }
+        let x = x.silu().to_concrete();
+        if let Some(start) = start {
+            eprintln!("cohere ff silu: {:.3}s", start.elapsed().as_secs_f32());
+        }
+        let x = self.linear2.forward(&x);
+        if let Some(start) = start {
+            eprintln!("cohere ff linear2: {:.3}s", start.elapsed().as_secs_f32());
+        }
+        x
     }
 }
 
@@ -408,31 +469,67 @@ impl ConformerLayer {
         mask: Option<&Tensor<4, f32>>,
         valid_mask: Option<&Tensor<2, f32>>,
     ) -> Tensor<3, f32> {
+        let profile = profile_enabled();
+        let layer_idx = COHERE_ENCODER_LAYER_CALLS.fetch_add(1, Ordering::Relaxed) + 1;
+        let layer_start = profile.then(Instant::now);
         let residual = x.clone();
+        let normed_ff1 = cohere_layer_norm_3d(&self.norm_feed_forward1, x);
+        if let Some(layer_start) = layer_start {
+            eprintln!(
+                "cohere encoder layer {layer_idx} ff1 norm: {:.3}s",
+                layer_start.elapsed().as_secs_f32()
+            );
+        }
         let x = (residual
-            + self
-                .feed_forward1
-                .forward(&self.norm_feed_forward1.forward(x))
-                .mul_scalar(0.5))
+            + self.feed_forward1.forward(&normed_ff1).mul_scalar(0.5))
         .to_concrete();
+        if let Some(layer_start) = layer_start {
+            eprintln!(
+                "cohere encoder layer {layer_idx} ff1: {:.3}s",
+                layer_start.elapsed().as_secs_f32()
+            );
+        }
         let residual = x.clone();
         let x = (residual
             + self
                 .self_attn
-                .forward(&self.norm_self_att.forward(&x), pos_emb, mask))
+                .forward(&cohere_layer_norm_3d(&self.norm_self_att, &x), pos_emb, mask))
         .to_concrete();
+        if let Some(layer_start) = layer_start {
+            eprintln!(
+                "cohere encoder layer {layer_idx} attn: {:.3}s",
+                layer_start.elapsed().as_secs_f32()
+            );
+        }
         let residual = x.clone();
-        let x =
-            (residual + self.conv.forward(&self.norm_conv.forward(&x), valid_mask)).to_concrete();
+        let x = (residual
+            + self
+                .conv
+                .forward(&cohere_layer_norm_3d(&self.norm_conv, &x), valid_mask))
+        .to_concrete();
+        if let Some(layer_start) = layer_start {
+            eprintln!(
+                "cohere encoder layer {layer_idx} conv: {:.3}s",
+                layer_start.elapsed().as_secs_f32()
+            );
+        }
         let residual = x.clone();
-        self.norm_out.forward(
+        let out = cohere_layer_norm_3d(
+            &self.norm_out,
             &(residual
                 + self
                     .feed_forward2
-                    .forward(&self.norm_feed_forward2.forward(&x))
+                    .forward(&cohere_layer_norm_3d(&self.norm_feed_forward2, &x))
                     .mul_scalar(0.5))
             .to_concrete(),
-        )
+        );
+        if let Some(layer_start) = layer_start {
+            eprintln!(
+                "cohere encoder layer {layer_idx} ff2+out: {:.3}s",
+                layer_start.elapsed().as_secs_f32()
+            );
+        }
+        out
     }
 }
 
@@ -460,13 +557,42 @@ impl ConformerEncoder {
     }
 
     fn forward(&self, input_features: &Tensor<3, f32>, length: usize) -> (Tensor<3, f32>, usize) {
+        let profile = profile_enabled();
+        let encode_start = profile.then(Instant::now);
         let (x, length) = self.pre_encode.forward(input_features, length);
+        if let Some(encode_start) = encode_start {
+            eprintln!(
+                "cohere pre_encode: {:.3}s time={} length={}",
+                encode_start.elapsed().as_secs_f32(),
+                x.shape()[1],
+                length
+            );
+        }
         let time = x.shape()[1];
         let (mut x, pos_emb) = self.pos_enc.forward(&x);
+        if let Some(encode_start) = encode_start {
+            eprintln!("cohere pos_enc: {:.3}s", encode_start.elapsed().as_secs_f32());
+        }
         let valid = valid_mask(&x.device(), x.shape()[0], time, length);
+        if let Some(encode_start) = encode_start {
+            eprintln!("cohere valid mask: {:.3}s", encode_start.elapsed().as_secs_f32());
+        }
         let att_mask = encoder_attention_mask(&x.device(), x.shape()[0], time, length);
-        for layer in &self.layers {
+        if let Some(encode_start) = encode_start {
+            eprintln!("cohere att mask: {:.3}s", encode_start.elapsed().as_secs_f32());
+        }
+        for (i, layer) in self.layers.iter().enumerate() {
             x = layer.forward(&x, &pos_emb, Some(&att_mask), Some(&valid));
+            if profile && (i + 1) % 4 == 0 {
+                eprintln!(
+                    "cohere encoder layer {}: {:.3}s",
+                    i + 1,
+                    encode_start.unwrap().elapsed().as_secs_f32()
+                );
+            }
+        }
+        if let Some(encode_start) = encode_start {
+            eprintln!("cohere encode total: {:.3}s", encode_start.elapsed().as_secs_f32());
         }
         (x, length)
     }
@@ -567,8 +693,20 @@ impl DecoderAttention {
     ) -> Tensor<3, f32> {
         let [batch, q_time, _] = q.shape();
         let q = self.reshape_heads(q);
-        let k = self.reshape_heads(k).transpose(2, 3).to_concrete();
         let v = self.reshape_heads(v);
+        let k = self.reshape_heads(k);
+
+        if attention_output.is_none() && attention_mask.is_some() {
+            let mask = attention_mask.map(|mask| (mask.mask(), MaskKind::QKMask));
+            let context = q
+                .flash_attention(&k, &v, self.scale, mask)
+                .transpose(1, 2)
+                .reshape([batch, q_time, self.num_heads * self.head_dim])
+                .to_concrete();
+            return self.out_projection.forward(&context);
+        }
+
+        let k = k.transpose(2, 3).to_concrete();
         let mut scores = q.mat_mul(&k).to_concrete().mul_scalar(self.scale);
         if let Some(mask) = attention_mask {
             mask.forward(&mut scores);
@@ -681,7 +819,7 @@ impl TransformerDecoderLayer {
         let residual = hidden_states.clone();
         let self_kv = self
             .first_sub_layer
-            .forward_kv(&self.layer_norm_1.forward(hidden_states), None);
+            .forward_kv(&cohere_layer_norm_3d(&self.layer_norm_1, hidden_states), None);
         let self_mask = AttentionMask::new(
             self_attention_mask
                 .squeeze::<3>(0)
@@ -690,7 +828,7 @@ impl TransformerDecoderLayer {
         );
         let hidden_states = (residual
             + self.first_sub_layer.forward(
-                &self.layer_norm_1.forward(hidden_states),
+                &cohere_layer_norm_3d(&self.layer_norm_1, hidden_states),
                 self_kv,
                 Some(&self_mask),
                 None,
@@ -702,7 +840,7 @@ impl TransformerDecoderLayer {
             .forward_kv(encoder_hidden_states, None);
         let hidden_states = (residual
             + self.second_sub_layer.forward(
-                &self.layer_norm_2.forward(&hidden_states),
+                &cohere_layer_norm_3d(&self.layer_norm_2, &hidden_states),
                 cross_kv,
                 None,
                 None,
@@ -712,7 +850,7 @@ impl TransformerDecoderLayer {
         (residual
             + self
                 .third_sub_layer
-                .forward(&self.layer_norm_3.forward(&hidden_states)))
+                .forward(&cohere_layer_norm_3d(&self.layer_norm_3, &hidden_states)))
         .to_concrete()
     }
 
@@ -723,33 +861,70 @@ impl TransformerDecoderLayer {
         cache: &mut TransformerDecoderLayerCache,
         attention_output: Option<&mut TensorCache<4, f32>>,
     ) -> Tensor<3, f32> {
-        let ln1 = self.layer_norm_1.forward(hidden_states);
+        let profile = profile_enabled();
+        let start = profile.then(Instant::now);
+        let ln1 = cohere_layer_norm_3d(&self.layer_norm_1, hidden_states);
+        materialize_if_gpu(&ln1);
+        if let Some(start) = start {
+            eprintln!(
+                "cohere decoder layer cached ln1: {:.3}s",
+                start.elapsed().as_secs_f32()
+            );
+        }
         let self_kv = self
             .first_sub_layer
             .forward_kv(&ln1, Some(&mut cache.self_attn));
+        if let Some(start) = start {
+            eprintln!(
+                "cohere decoder layer cached self kv: {:.3}s",
+                start.elapsed().as_secs_f32()
+            );
+        }
         let residual = hidden_states.clone();
         let hidden_states = (residual
             + self
                 .first_sub_layer
                 .forward(&ln1, self_kv, Some(self_attention_mask), None))
         .to_concrete();
+        materialize_if_gpu(&hidden_states);
+        if let Some(start) = start {
+            eprintln!(
+                "cohere decoder layer cached self attn: {:.3}s",
+                start.elapsed().as_secs_f32()
+            );
+        }
 
         let residual = hidden_states.clone();
         let hidden_states = (residual
             + self.second_sub_layer.forward(
-                &self.layer_norm_2.forward(&hidden_states),
+                &cohere_layer_norm_3d(&self.layer_norm_2, &hidden_states),
                 cache.cross_attn_kv.clone(),
                 None,
                 attention_output,
             ))
         .to_concrete();
+        materialize_if_gpu(&hidden_states);
+        if let Some(start) = start {
+            eprintln!(
+                "cohere decoder layer cached cross attn: {:.3}s",
+                start.elapsed().as_secs_f32()
+            );
+        }
 
         let residual = hidden_states.clone();
-        (residual
+        let hidden_states = (residual
             + self
                 .third_sub_layer
-                .forward(&self.layer_norm_3.forward(&hidden_states)))
-        .to_concrete()
+                .forward(&cohere_layer_norm_3d(&self.layer_norm_3, &hidden_states)))
+        .to_concrete();
+        materialize_if_gpu(&hidden_states);
+        if let Some(start) = start {
+            eprintln!(
+                "cohere decoder layer cached mlp: {:.3}s",
+                start.elapsed().as_secs_f32()
+            );
+        }
+        hidden_states
     }
 }
 
@@ -772,7 +947,8 @@ impl TransformerDecoderEmbedding {
     }
 
     fn forward(&self, input_ids: &Tensor<2, u32>, positions: &Tensor<2, u32>) -> Tensor<3, f32> {
-        self.layer_norm.forward(
+        cohere_layer_norm_3d(
+            &self.layer_norm,
             &(self.token_embedding.forward(input_ids) + self.position_embedding.forward(positions))
                 .to_concrete(),
         )
@@ -851,7 +1027,7 @@ impl TransformerDecoder {
                 cross_mask.as_ref(),
             );
         }
-        self.final_layer_norm.forward(&hidden_states)
+        cohere_layer_norm_3d(&self.final_layer_norm, &hidden_states)
     }
 
     fn forward_cached(
@@ -862,6 +1038,8 @@ impl TransformerDecoder {
         cache: &mut TransformerDecoderCache,
         mut attention_output: Option<&mut [TensorCache<4, f32>]>,
     ) -> Tensor<3, f32> {
+        let profile = profile_enabled();
+        let start = profile.then(Instant::now);
         let index_pos = cache.tokens.len();
         cache.tokens.extend_from_slice(tokens);
         let seq_len = tokens.len();
@@ -877,23 +1055,113 @@ impl TransformerDecoder {
         let positions: Vec<u32> = (index_pos as u32..(index_pos + seq_len) as u32).collect();
         let positions = Tensor::from_slice(&device, [1, seq_len], &positions);
         let mut hidden_states = self.embedding.forward(&token_tensor, &positions);
+        materialize_if_gpu(&hidden_states);
+        if let Some(start) = start {
+            eprintln!(
+                "cohere decoder embedding: {:.3}s",
+                start.elapsed().as_secs_f32()
+            );
+        }
 
         for (i, layer) in self.layers.iter().enumerate() {
             if cache.layers.len() <= i {
+                if let Some(start) = start {
+                    eprintln!(
+                        "cohere decoder layer {i} cache init start: {:.3}s",
+                        start.elapsed().as_secs_f32()
+                    );
+                }
+                let cross_attn_kv = if start.is_some() {
+                    let key_proj = layer
+                        .second_sub_layer
+                        .key_net
+                        .forward_no_bias(encoder_hidden_states)
+                        .add_scalar(0.0);
+                    if let Some(start) = start {
+                        eprintln!(
+                            "cohere decoder layer {i} cache init key proj forward: {:.3}s",
+                            start.elapsed().as_secs_f32()
+                        );
+                    }
+                    let key_proj = key_proj.to_materialized_blocking();
+                    if let Some(start) = start {
+                        eprintln!(
+                            "cohere decoder layer {i} cache init key proj materialized: {:.3}s",
+                            start.elapsed().as_secs_f32()
+                        );
+                    }
+                    let key_states = layer.second_sub_layer.key_net.forward(encoder_hidden_states);
+                    if let Some(start) = start {
+                        eprintln!(
+                            "cohere decoder layer {i} cache init key forward: {:.3}s",
+                            start.elapsed().as_secs_f32()
+                        );
+                    }
+                    let key_states = key_states.to_materialized_blocking();
+                    if let Some(start) = start {
+                        eprintln!(
+                            "cohere decoder layer {i} cache init key materialized: {:.3}s",
+                            start.elapsed().as_secs_f32()
+                        );
+                    }
+
+                    let value_states =
+                        layer.second_sub_layer.value_net.forward(encoder_hidden_states);
+                    if let Some(start) = start {
+                        eprintln!(
+                            "cohere decoder layer {i} cache init value forward: {:.3}s",
+                            start.elapsed().as_secs_f32()
+                        );
+                    }
+                    let value_states = value_states.to_materialized_blocking();
+                    if let Some(start) = start {
+                        eprintln!(
+                            "cohere decoder layer {i} cache init value materialized: {:.3}s",
+                            start.elapsed().as_secs_f32()
+                        );
+                    }
+                    (key_states, value_states)
+                } else {
+                    let cross_attn_kv = layer.second_sub_layer.forward_kv(encoder_hidden_states, None);
+                    let materialized = Tensor::to_materialized_many_blocking(&[
+                        &cross_attn_kv.0,
+                        &cross_attn_kv.1,
+                    ]);
+                    (materialized[0].clone(), materialized[1].clone())
+                };
                 cache.layers.push(TransformerDecoderLayerCache {
                     self_attn: DecoderAttentionCache::new(self.max_target_positions),
-                    cross_attn_kv: layer
-                        .second_sub_layer
-                        .forward_kv(encoder_hidden_states, None),
+                    cross_attn_kv,
                 });
+                if let Some(start) = start {
+                    eprintln!(
+                        "cohere decoder layer {i} cache init done: {:.3}s",
+                        start.elapsed().as_secs_f32()
+                    );
+                }
             }
             let layer_cache = &mut cache.layers[i];
             let attention_output = attention_output.as_mut().map(|outputs| &mut outputs[i]);
             hidden_states =
                 layer.forward_cached(&hidden_states, &self_mask, layer_cache, attention_output);
+            materialize_if_gpu(&hidden_states);
+            if let Some(start) = start {
+                eprintln!(
+                    "cohere decoder layer {i} forward: {:.3}s",
+                    start.elapsed().as_secs_f32()
+                );
+            }
         }
 
-        self.final_layer_norm.forward(&hidden_states)
+        let hidden_states = cohere_layer_norm_3d(&self.final_layer_norm, &hidden_states);
+        materialize_if_gpu(&hidden_states);
+        if let Some(start) = start {
+            eprintln!(
+                "cohere decoder final ln: {:.3}s",
+                start.elapsed().as_secs_f32()
+            );
+        }
+        hidden_states
     }
 }
 
@@ -1105,6 +1373,160 @@ mod tests {
         top.sort_by(|a, b| b.1.total_cmp(&a.1));
         println!("top10={:?}", &top[..10]);
     }
+
+    #[tokio::test]
+    async fn compare_cpu_gpu_first_step() {
+        let root = Path::new("/tmp/cohere-transcribe-03-2026");
+        if !root.exists() {
+            return;
+        }
+
+        let gpu_device = match Device::new().await {
+            Ok(device) => device,
+            Err(_) => return,
+        };
+
+        let config: CohereConfig =
+            serde_json::from_slice(&std::fs::read(root.join("config.json")).unwrap()).unwrap();
+        let weights = std::fs::read(root.join("model.gguf")).unwrap();
+
+        let cpu_device = Device::cpu();
+        let mut cpu_reader = std::io::Cursor::new(weights.clone());
+        let mut cpu_vb = VarBuilder::from_gguf(&mut cpu_reader).unwrap();
+        let cpu_model = Cohere::load(&cpu_device, &mut cpu_vb, config.clone()).unwrap();
+
+        let mut gpu_reader = std::io::Cursor::new(weights);
+        let mut gpu_vb = VarBuilder::from_gguf(&mut gpu_reader).unwrap();
+        let gpu_model = Cohere::load(&gpu_device, &mut gpu_vb, config.clone()).unwrap();
+
+        let wav = hound::WavReader::open(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/examples/samples_jfk.wav"
+        ))
+        .unwrap()
+        .into_samples::<i16>()
+        .map(|sample| sample.unwrap() as f32 / 32768.0)
+        .take(16_000)
+        .collect::<Vec<_>>();
+
+        let filter_bytes = include_bytes!("../cohere_melfilters128.bytes").as_slice();
+        let mut filterbank = vec![0.0f32; filter_bytes.len() / 4];
+        <byteorder::LittleEndian as byteorder::ByteOrder>::read_f32_into(
+            filter_bytes,
+            &mut filterbank,
+        );
+        for value in &mut filterbank {
+            *value = half::bf16::from_f32(*value).to_f32();
+        }
+
+        let (features, total_frames, valid_frames) = pcm_to_features(&config, &wav, &filterbank);
+        let cpu_input = Tensor::from_slice(
+            &cpu_device,
+            [1, config.preprocessor.features, total_frames],
+            &features,
+        );
+        let gpu_input = Tensor::from_slice(
+            &gpu_device,
+            [1, config.preprocessor.features, total_frames],
+            &features,
+        );
+        let prompt_ids = [7_u32, 4, 16, 62, 62, 5, 9, 11, 13];
+        let cpu_input_ids = Tensor::from_slice(&cpu_device, [1, prompt_ids.len()], &prompt_ids);
+        let gpu_input_ids = Tensor::from_slice(&gpu_device, [1, prompt_ids.len()], &prompt_ids);
+
+        let (cpu_pre, cpu_pre_len) = cpu_model.encoder.pre_encode.forward(&cpu_input, valid_frames);
+        let (gpu_pre, gpu_pre_len) = gpu_model.encoder.pre_encode.forward(&gpu_input, valid_frames);
+        assert_eq!(cpu_pre_len, gpu_pre_len);
+        eprintln!("compare: pre_encode slices");
+        let cpu_pre = cpu_pre.as_slice().await.unwrap();
+        let gpu_pre = gpu_pre.as_slice().await.unwrap();
+
+        let mut cpu_pre_max = 0.0f32;
+        let pre_shape = cpu_pre.shape();
+        for i in 0..pre_shape[0] {
+            for j in 0..pre_shape[1] {
+                for k in 0..pre_shape[2] {
+                    cpu_pre_max = cpu_pre_max.max((cpu_pre[[i, j, k]] - gpu_pre[[i, j, k]]).abs());
+                }
+            }
+        }
+        println!("pre_encode max_abs_diff={cpu_pre_max}");
+
+        let (cpu_enc, cpu_enc_len) = cpu_model.encode(&cpu_input, valid_frames);
+        let (gpu_enc, gpu_enc_len) = gpu_model.encode(&gpu_input, valid_frames);
+        assert_eq!(cpu_enc_len, gpu_enc_len);
+        eprintln!("compare: encoder slices");
+        let cpu_enc_slice = cpu_enc.clone().as_slice().await.unwrap();
+        let gpu_enc_slice = gpu_enc.clone().as_slice().await.unwrap();
+
+        let mut cpu_enc_max = 0.0f32;
+        let enc_shape = cpu_enc_slice.shape();
+        for i in 0..enc_shape[0] {
+            for j in 0..enc_shape[1] {
+                for k in 0..enc_shape[2] {
+                    cpu_enc_max =
+                        cpu_enc_max.max((cpu_enc_slice[[i, j, k]] - gpu_enc_slice[[i, j, k]]).abs());
+                }
+            }
+        }
+        println!("encoder max_abs_diff={cpu_enc_max}");
+
+        eprintln!("compare: decoder cached init");
+        let mut cpu_cache = TransformerDecoderCache::default();
+        let mut gpu_cache = TransformerDecoderCache::default();
+        let cpu_hidden = cpu_model
+            .decoder
+            .forward_cached(&prompt_ids, &cpu_enc, cpu_enc_len, &mut cpu_cache, None)
+            .narrow(1, prompt_ids.len() - 1, 1)
+            .to_concrete();
+        let gpu_hidden = gpu_model
+            .decoder
+            .forward_cached(&prompt_ids, &gpu_enc, gpu_enc_len, &mut gpu_cache, None)
+            .narrow(1, prompt_ids.len() - 1, 1)
+            .to_concrete();
+        eprintln!("compare: decoder hidden slices");
+        let cpu_hidden_slice = cpu_hidden.clone().as_slice().await.unwrap();
+        let gpu_hidden_slice = gpu_hidden.clone().as_slice().await.unwrap();
+
+        let mut cpu_hidden_max = 0.0f32;
+        let hidden_shape = cpu_hidden_slice.shape();
+        for i in 0..hidden_shape[0] {
+            for j in 0..hidden_shape[1] {
+                for k in 0..hidden_shape[2] {
+                    cpu_hidden_max = cpu_hidden_max
+                        .max((cpu_hidden_slice[[i, j, k]] - gpu_hidden_slice[[i, j, k]]).abs());
+                }
+            }
+        }
+        println!("decoder_hidden max_abs_diff={cpu_hidden_max}");
+
+        eprintln!("compare: logits slices");
+        let cpu_logits = cpu_model.lm_head(&cpu_hidden).as_slice().await.unwrap();
+        let gpu_logits = gpu_model.lm_head(&gpu_hidden).as_slice().await.unwrap();
+
+        let mut logits_max = 0.0f32;
+        let logits_shape = cpu_logits.shape();
+        for i in 0..logits_shape[0] {
+            for j in 0..logits_shape[1] {
+                for k in 0..logits_shape[2] {
+                    logits_max =
+                        logits_max.max((cpu_logits[[i, j, k]] - gpu_logits[[i, j, k]]).abs());
+                }
+            }
+        }
+        println!("logits max_abs_diff={logits_max}");
+
+        let mut cpu_top = (0..config.vocab_size)
+            .map(|token_id| (token_id, cpu_logits[[0, 0, token_id]]))
+            .collect::<Vec<_>>();
+        cpu_top.sort_by(|a, b| b.1.total_cmp(&a.1));
+        let mut gpu_top = (0..config.vocab_size)
+            .map(|token_id| (token_id, gpu_logits[[0, 0, token_id]]))
+            .collect::<Vec<_>>();
+        gpu_top.sort_by(|a, b| b.1.total_cmp(&a.1));
+        println!("cpu_top10={:?}", &cpu_top[..10]);
+        println!("gpu_top10={:?}", &gpu_top[..10]);
+    }
 }
 
 impl Cohere {
@@ -1138,11 +1560,12 @@ impl Cohere {
 
     fn encode(&self, input_features: &Tensor<3, f32>, length: usize) -> (Tensor<3, f32>, usize) {
         let (encoder_hidden_states, encoder_length) = self.encoder.forward(input_features, length);
-        if let Some(proj) = &self.encoder_decoder_proj {
-            (proj.forward(&encoder_hidden_states), encoder_length)
+        let encoder_hidden_states = if let Some(proj) = &self.encoder_decoder_proj {
+            proj.forward(&encoder_hidden_states)
         } else {
-            (encoder_hidden_states, encoder_length)
-        }
+            encoder_hidden_states
+        };
+        (encoder_hidden_states, encoder_length)
     }
 
     fn lm_head(&self, hidden_states: &Tensor<3, f32>) -> Tensor<3, f32> {
@@ -1164,9 +1587,15 @@ impl Cohere {
         eos_token_id: u32,
         max_new_tokens: usize,
     ) -> Result<Vec<u32>> {
+        let profile = profile_enabled();
+        let encode_start = Instant::now();
         let (encoder_hidden_states, encoder_length) = self.encode(input_features, length);
+        if profile {
+            eprintln!("cohere encode: {:.3}s", encode_start.elapsed().as_secs_f32());
+        }
         let mut cache = TransformerDecoderCache::default();
         let mut tokens = prompt_ids.to_vec();
+        let first_decode_start = Instant::now();
         let mut hidden_states = self.decoder.forward_cached(
             prompt_ids,
             &encoder_hidden_states,
@@ -1174,8 +1603,15 @@ impl Cohere {
             &mut cache,
             None,
         );
+        if profile {
+            eprintln!(
+                "cohere decode init: {:.3}s",
+                first_decode_start.elapsed().as_secs_f32()
+            );
+        }
 
-        for _ in 0..max_new_tokens {
+        for step in 0..max_new_tokens {
+            let step_start = profile.then(Instant::now);
             let last_hidden = hidden_states
                 .narrow(1, hidden_states.shape()[1] - 1, 1)
                 .to_concrete();
@@ -1203,6 +1639,12 @@ impl Cohere {
                 &mut cache,
                 None,
             );
+            if let Some(step_start) = step_start {
+                eprintln!(
+                    "cohere decode step {step}: {:.3}s token={best_token}",
+                    step_start.elapsed().as_secs_f32()
+                );
+            }
         }
 
         Ok(tokens[prompt_ids.len()..].to_vec())
@@ -1216,12 +1658,18 @@ impl Cohere {
         eos_token_id: u32,
         max_new_tokens: usize,
     ) -> Result<(Vec<u32>, Vec<Tensor<4, f32>>, usize)> {
+        let profile = profile_enabled();
+        let encode_start = Instant::now();
         let (encoder_hidden_states, encoder_length) = self.encode(input_features, length);
+        if profile {
+            eprintln!("cohere encode: {:.3}s", encode_start.elapsed().as_secs_f32());
+        }
         let mut tokens = prompt_ids.to_vec();
         let mut cache = TransformerDecoderCache::default();
         let mut attention_output: Vec<TensorCache<4, f32>> = (0..self.decoder.layers.len())
             .map(|_| TensorCache::new(2, max_new_tokens))
             .collect();
+        let first_decode_start = Instant::now();
         let mut hidden_states = self.decoder.forward_cached(
             prompt_ids,
             &encoder_hidden_states,
@@ -1229,8 +1677,15 @@ impl Cohere {
             &mut cache,
             Some(&mut attention_output),
         );
+        if profile {
+            eprintln!(
+                "cohere decode init: {:.3}s",
+                first_decode_start.elapsed().as_secs_f32()
+            );
+        }
 
-        for _ in 0..max_new_tokens {
+        for step in 0..max_new_tokens {
+            let step_start = profile.then(Instant::now);
             let last_hidden = hidden_states
                 .narrow(1, hidden_states.shape()[1] - 1, 1)
                 .to_concrete();
@@ -1258,6 +1713,12 @@ impl Cohere {
                 &mut cache,
                 Some(&mut attention_output),
             );
+            if let Some(step_start) = step_start {
+                eprintln!(
+                    "cohere decode step {step}: {:.3}s token={best_token}",
+                    step_start.elapsed().as_secs_f32()
+                );
+            }
         }
 
         let collected_attentions = attention_output

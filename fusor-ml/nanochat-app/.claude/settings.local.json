@@ -1,0 +1,10 @@
+{
+  "permissions": {
+    "allow": [
+      "WebFetch(domain:deepnight.net)",
+      "WebFetch(domain:rickyhan.com)",
+      "WebFetch(domain:kenlo.hashnode.dev)",
+      "WebFetch(domain:dev.aseprite.org)"
+    ]
+  }
+}

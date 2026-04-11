@@ -25,6 +25,11 @@ def should_quantize(name: str, shape: tuple[int, ...]) -> bool:
         return False
     if shape[-1] % 32 != 0:
         return False
+    # Keep the encoder in fp16 on GPU. The current fusor quantized GPU path is
+    # disproportionately slow for the Cohere Conformer encoder, while the
+    # regular GPU matmul path is much healthier for these shapes.
+    if name.startswith("encoder."):
+        return False
     if name.endswith(".pos_enc"):
         return False
     if name.endswith(".pos_bias_u") or name.endswith(".pos_bias_v"):
