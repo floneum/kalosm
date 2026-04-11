@@ -1,5 +1,5 @@
 use crate::{
-    DataTypeEnum, dequantize_vec4_block,
+    dequantize_vec4_block,
     mir::{
         inputs::{QMatrixInput, TensorInput},
         kernel::GenericKernel,
@@ -7,6 +7,7 @@ use crate::{
     quantized::matmul::QMatMulOperation,
 };
 use std::fmt::Write;
+use std::sync::OnceLock;
 
 /// Configuration for general SGEMM algorithm
 #[derive(Debug, Clone, Copy)]
@@ -44,7 +45,10 @@ pub fn general_sgemm_with_config(
 ) {
     let global_id = kernel.global_id();
     let elements_per_block = op.elements_per_block();
-    let dtype = op.input_datatype;
+    let input_datatype = op.input_datatype;
+    let dtype = op.matmul_datatype();
+    let pre_element_wise_functions = OnceLock::new();
+    let post_element_wise_functions = OnceLock::new();
 
     // Validate configuration
     config.validate().unwrap();
@@ -85,8 +89,10 @@ pub fn general_sgemm_with_config(
         kernel,
         op.matrix.datatype,
         "chunk".to_string(),
-        DataTypeEnum::F32,
+        dtype,
         |index, data, code| {
+            let pre_element_wise_functions =
+                pre_element_wise_functions.get_or_init(|| op.pre_element_wise.add_functions(code));
             writeln!(code, "{{",).unwrap();
             writeln!(
                 code,
@@ -98,7 +104,8 @@ pub fn general_sgemm_with_config(
                 if local > 0 {
                     write!(code, ", ").unwrap();
                 }
-                write!(code, "{input_a}[").unwrap();
+                let mut raw_input = String::new();
+                write!(&mut raw_input, "{input_a}[").unwrap();
                 let mut indices = vec![];
                 // Add batch indices first
                 for dim in (0..input_a.rank()).rev().skip(2) {
@@ -107,8 +114,12 @@ pub fn general_sgemm_with_config(
                 // Then add M and K indices
                 indices.push("y".to_string());
                 indices.push(format!("a_index_local_offset + {local}"));
-                input_a.strided_index(code, indices);
-                write!(code, "]").unwrap();
+                input_a.strided_index(&mut raw_input, indices);
+                write!(&mut raw_input, "]").unwrap();
+                let processed = pre_element_wise_functions
+                    .iter()
+                    .fold(raw_input, |acc, f| f.call(vec![acc]));
+                write!(code, "{processed}").unwrap();
             }
             writeln!(code, ");").unwrap();
 
@@ -136,6 +147,10 @@ pub fn general_sgemm_with_config(
     output_indices.push("x".to_string());
     output.strided_index(kernel, output_indices);
     writeln!(kernel, ";").unwrap();
-    writeln!(kernel, "{output}[output_index] = acc;").unwrap();
+    let result = post_element_wise_functions
+        .get_or_init(|| op.post_element_wise.add_functions(kernel))
+        .iter()
+        .fold(format!("{input_datatype}(acc)"), |acc, f| f.call(vec![acc]));
+    writeln!(kernel, "{output}[output_index] = {result};").unwrap();
     writeln!(kernel, "}}").unwrap();
 }

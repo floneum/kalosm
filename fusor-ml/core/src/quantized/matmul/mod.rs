@@ -1,5 +1,5 @@
 use crate::{
-    DataType, DataTypeEnum, Device, Tensor, TensorData,
+    DataType, DataTypeEnum, Device, ElementWiseFunctions, Tensor, TensorData,
     compute_graph::NodeIndex,
     mir::{inputs::MirValue, kernel::GenericKernel, operation::Operation},
 };
@@ -19,6 +19,8 @@ pub(crate) struct QMatMulOperation {
     pub(crate) matrix: QMatrix,
     pub(crate) in_shape: Box<[usize]>,
     pub(crate) out_shape: Box<[usize]>,
+    pub(crate) pre_element_wise: ElementWiseFunctions,
+    pub(crate) post_element_wise: ElementWiseFunctions,
     pub(crate) chunked_config: Option<ChunkedSgemmConfig>,
     pub(crate) general_config: Option<GeneralSgemmConfig>,
 }
@@ -41,6 +43,8 @@ impl QMatMulOperation {
             matrix,
             in_shape: input_shape.into(),
             out_shape,
+            pre_element_wise: ElementWiseFunctions::empty(input_datatype),
+            post_element_wise: ElementWiseFunctions::empty(input_datatype),
             chunked_config: None,
             general_config: None,
         }
@@ -70,6 +74,10 @@ impl QMatMulOperation {
     fn n_size(&self) -> u32 {
         self.matrix.shape[0] as u32
     }
+
+    pub(crate) fn matmul_datatype(&self) -> DataTypeEnum {
+        self.pre_element_wise.out_datatype()
+    }
 }
 
 impl<const R: usize, T: DataType> Tensor<R, T> {
@@ -93,13 +101,8 @@ impl<const R: usize, T: DataType> Tensor<R, T> {
             let weight_t = dequantized.transpose(0, 1);
             let output_2d = input_2d.mat_mul(&weight_t);
 
-            let out_shape: [usize; R] = std::array::from_fn(|i| {
-                if i == R - 1 {
-                    n
-                } else {
-                    in_shape[i]
-                }
-            });
+            let out_shape: [usize; R] =
+                std::array::from_fn(|i| if i == R - 1 { n } else { in_shape[i] });
             return output_2d.reshape(out_shape);
         }
 
@@ -108,9 +111,7 @@ impl<const R: usize, T: DataType> Tensor<R, T> {
         // Fall back to a dequantize + regular matmul path there instead of the
         // quantized kernel, and materialize the intermediates on GPU so the
         // problematic lazy quantized graph never reaches execution.
-        if self.device().wgpu_adapter().get_info().backend == wgpu::Backend::Metal
-            && m <= 16
-        {
+        if self.device().wgpu_adapter().get_info().backend == wgpu::Backend::Metal && m <= 16 {
             use pollster::FutureExt as _;
 
             let profile = std::env::var_os("RWHISPER_COHERE_PROFILE").is_some();
@@ -138,13 +139,8 @@ impl<const R: usize, T: DataType> Tensor<R, T> {
                 eprintln!("q_mat_mul metal tiny_m output materialized");
             }
 
-            let out_shape: [usize; R] = std::array::from_fn(|i| {
-                if i == R - 1 {
-                    n
-                } else {
-                    in_shape[i]
-                }
-            });
+            let out_shape: [usize; R] =
+                std::array::from_fn(|i| if i == R - 1 { n } else { in_shape[i] });
             return output_2d.reshape(out_shape);
         }
         self.add_q_mat_mul(other)
@@ -867,7 +863,11 @@ impl Operation for QMatMulOperation {
         let input = nodes.get_result(self.input).unwrap();
         let q_matrix = self.matrix.clone();
         let device = input.device();
-        let output_tensor = TensorData::new_for_shape(device, &self.out_shape, input.datatype());
+        let output_tensor = TensorData::new_for_shape(
+            device,
+            &self.out_shape,
+            self.post_element_wise.out_datatype(),
+        );
         vec![input.into(), q_matrix.into(), output_tensor.into()]
     }
 
@@ -889,7 +889,8 @@ impl Operation for QMatMulOperation {
 
         let input_a = generic_kernel.add_tensor_input(rank, false, datatype);
         let input_b = generic_kernel.add_q_matrix_input(matrix_rank, self.matrix.datatype);
-        let output = generic_kernel.add_tensor_input(rank, true, datatype);
+        let output =
+            generic_kernel.add_tensor_input(rank, true, self.post_element_wise.out_datatype());
 
         // For batched operations, we need to get the correct dimension indices
         let k_size = input_a.shape_binding(rank - 1).to_string(); // Last dimension is K
@@ -1065,4 +1066,130 @@ async fn test_fuzz_q_mat_mul_f16_sgemv() {
     }
 
     println!("f16 sgemv test passed for shape {:?}", fusor_shape);
+}
+
+#[cfg(test)]
+fn q8_matrix_from_rows(device: &Device, rows: &[Vec<i8>]) -> QMatrix {
+    assert!(!rows.is_empty());
+    let cols = rows[0].len();
+    assert_eq!(cols % 32, 0, "Q8_0 rows must be a multiple of 32 elements");
+    for row in rows {
+        assert_eq!(row.len(), cols, "all rows must have the same width");
+    }
+
+    let block_size_bytes = 34;
+    let blocks_per_row = cols / 32;
+    let mut raw_bytes = vec![0u8; rows.len() * blocks_per_row * block_size_bytes];
+    let scale = half::f16::from_f32(1.0).to_le_bytes();
+
+    for (row_idx, row) in rows.iter().enumerate() {
+        for block_idx in 0..blocks_per_row {
+            let offset = (row_idx * blocks_per_row + block_idx) * block_size_bytes;
+            raw_bytes[offset..offset + 2].copy_from_slice(&scale);
+            for element_idx in 0..32 {
+                raw_bytes[offset + 2 + element_idx] = row[block_idx * 32 + element_idx] as u8;
+            }
+        }
+    }
+
+    QMatrix::from_parts(
+        device,
+        &raw_bytes,
+        vec![rows.len(), cols].into_boxed_slice(),
+        GgmlType::Q8_0,
+    )
+    .unwrap()
+}
+
+#[cfg(test)]
+async fn assert_close_3d(actual: &Tensor<3, f32>, expected: &Tensor<3, f32>) {
+    let actual = actual.as_slice().await.unwrap();
+    let expected = expected.as_slice().await.unwrap();
+
+    assert_eq!(actual.shape(), expected.shape());
+    for batch in 0..actual.shape()[0] {
+        for row in 0..actual.shape()[1] {
+            for col in 0..actual.shape()[2] {
+                let actual = actual[[batch, row, col]];
+                let expected = expected[[batch, row, col]];
+                assert!(
+                    (actual - expected).abs() <= 1e-4,
+                    "mismatch at [{batch}, {row}, {col}]: expected {expected}, got {actual}"
+                );
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+fn q8_test_matrix(device: &Device) -> QMatrix {
+    q8_matrix_from_rows(
+        device,
+        &[
+            (1..=32).map(|value| value as i8).collect(),
+            (0..32).map(|value| (31 - value) as i8).collect(),
+            vec![1; 32],
+            vec![2; 32],
+        ],
+    )
+}
+
+#[cfg(test)]
+fn q8_test_input(device: &Device) -> Tensor<3, f32> {
+    let input_data: Vec<Vec<Vec<f32>>> = vec![{
+        (0..17)
+            .map(|row| {
+                (0..32)
+                    .map(|value| (row as f32 + 1.0) * (value as f32 - 7.5) * 0.125)
+                    .collect()
+            })
+            .collect()
+    }];
+    Tensor::<3, f32>::new(device, &input_data)
+}
+
+#[cfg(test)]
+#[tokio::test]
+async fn test_q_mat_mul_post_elementwise_fuses() {
+    let device = Device::test_instance();
+    let q_matrix = q8_test_matrix(&device);
+    let input = q8_test_input(&device);
+
+    let fused: Tensor<3, f32> = input.q_mat_mul(&q_matrix) + 1.25;
+    assert_eq!(fused.count_kernels_to_resolve(), 1);
+
+    let materialized = input.q_mat_mul(&q_matrix).materialized().await;
+    let expected: Tensor<3, f32> = materialized + 1.25;
+
+    assert_close_3d(&fused, &expected).await;
+}
+
+#[cfg(test)]
+#[tokio::test]
+async fn test_q_mat_mul_pre_elementwise_fuses() {
+    let device = Device::test_instance();
+    let q_matrix = q8_test_matrix(&device);
+    let input = q8_test_input(&device);
+
+    let fused: Tensor<3, f32> = (input.clone() + 0.5).q_mat_mul(&q_matrix);
+    assert_eq!(fused.count_kernels_to_resolve(), 1);
+
+    let materialized_input = (input + 0.5).materialized().await;
+    let expected: Tensor<3, f32> = materialized_input.q_mat_mul(&q_matrix);
+
+    assert_close_3d(&fused, &expected).await;
+}
+
+#[cfg(test)]
+#[tokio::test]
+async fn test_q_mat_mul_view_chain_matches_materialized_barrier() {
+    let device = Device::test_instance();
+    let q_matrix = q8_test_matrix(&device);
+    let input = q8_test_input(&device);
+
+    let direct: Tensor<3, f32> = input.q_mat_mul(&q_matrix).transpose(1, 2) + 1.25;
+    let materialized = input.q_mat_mul(&q_matrix).materialized().await;
+    let staged: Tensor<3, f32> = materialized.transpose(1, 2) + 1.25;
+
+    assert_close_3d(&direct, &staged).await;
 }

@@ -8,8 +8,7 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use wgpu::{CommandEncoder, CommandEncoderDescriptor};
 
 use crate::{
-    Device,
-    ElementWiseFunctions,
+    Device, ElementWiseFunctions,
     mir::{
         inputs::{KernelInputValue, MirValue},
         kernel::GenericKernel,
@@ -17,7 +16,6 @@ use crate::{
         workgroup_shape::{self, WorkgroupShapeConstraints},
     },
     nary_wise::{NaryExpr, NaryOperation},
-    quantized::matmul::QMatMulOperation,
     tensor::TensorData,
 };
 
@@ -53,11 +51,7 @@ pub(crate) struct Resolver {
 }
 
 impl Resolver {
-    pub(crate) fn new(
-        graph: &mut ComputeGraphInner,
-        target: NodeIndex,
-        device: &Device,
-    ) -> Self {
+    pub(crate) fn new(graph: &mut ComputeGraphInner, target: NodeIndex, device: &Device) -> Self {
         Self::new_many(graph, &[target], device)
     }
 
@@ -81,11 +75,11 @@ impl Resolver {
             .collect();
         Self {
             device: device.clone(),
-            command_encoder: device
-                .wgpu_device()
-                .create_command_encoder(&CommandEncoderDescriptor {
+            command_encoder: device.wgpu_device().create_command_encoder(
+                &CommandEncoderDescriptor {
                     label: Some("ComputeGraph Resolver Encoder"),
-                }),
+                },
+            ),
             targets: targets.to_vec(),
             execution_graph: Default::default(),
             node_mapping: Default::default(),
@@ -229,7 +223,10 @@ impl Resolver {
         let data = graph
             .get_result(self.targets[0])
             .expect("Target result not cached");
-        ResolverResult { data, total_kernels }
+        ResolverResult {
+            data,
+            total_kernels,
+        }
     }
 
     pub(crate) fn run_many(&mut self, graph: &mut ComputeGraphInner) -> ResolverManyResult {
@@ -239,7 +236,10 @@ impl Resolver {
             .iter()
             .map(|target| graph.get_result(*target).expect("Target result not cached"))
             .collect();
-        ResolverManyResult { data, total_kernels }
+        ResolverManyResult {
+            data,
+            total_kernels,
+        }
     }
 
     fn maybe_submit_partial(&mut self) {
@@ -366,12 +366,7 @@ impl Resolver {
                 };
                 Some(Arc::new(nary))
             }
-            ComputeGraphNodeVariant::QMatMul(op) => Some(Arc::new(QMatMulOperation::new(
-                op.input_datatype,
-                &op.in_shape,
-                op.input,
-                op.matrix.clone(),
-            ))),
+            ComputeGraphNodeVariant::QMatMul(op) => Some(Arc::new(op.clone())),
             ComputeGraphNodeVariant::Dequantize(op) => Some(Arc::new(op.clone())),
             ComputeGraphNodeVariant::WhereCond(op) => Some(Arc::new(op.to_nary())),
             ComputeGraphNodeVariant::Tensor(_) => None, // Handled in execution loop
@@ -411,6 +406,7 @@ impl Resolver {
                 || self.try_fuse_naries(graph, node_idx)
                 || self.try_fuse_into_reduce(graph, node_idx)
                 || self.try_fuse_into_matmul(graph, node_idx)
+                || self.try_fuse_into_q_matmul(graph, node_idx)
                 || self.try_fuse_into_dequantize(graph, node_idx);
 
             if changed {
@@ -1076,9 +1072,106 @@ impl Resolver {
         true
     }
 
-    fn should_extend_kernel(&mut self, _: Vec<MirValue>, _: &[Vec<MirValue>]) -> bool {
-        // TODO: Restore with better testing. This passes all tests in fusor, but breaks rbert and rwhisper
-        false
+    fn try_fuse_into_q_matmul(
+        &mut self,
+        graph: &mut ComputeGraphInner,
+        node_idx: ExecutionNodeIndex,
+    ) -> bool {
+        let node_variant = self.execution_graph[node_idx].variant.clone();
+
+        // Post-op: fuse elementwise after qmatmul
+        if let Some(el_op) = Self::try_get_elementwise(&node_variant) {
+            let input_inner = el_op.value;
+            if !self.check_cached(graph, input_inner)
+                && let Some(input_exec_idx) = self.get_input_node_in_exec_graph(input_inner)
+            {
+                let input_variant = self.execution_graph[input_exec_idx].variant.clone();
+                if let ComputeGraphNodeVariant::QMatMul(q_mat_mul_op) = input_variant {
+                    let mut new_q_mat_mul = q_mat_mul_op.clone();
+                    let mut existing_post = new_q_mat_mul.post_element_wise.functions.clone();
+                    existing_post.extend(el_op.functions.functions.iter().cloned());
+                    new_q_mat_mul.post_element_wise = ElementWiseFunctions::new(
+                        existing_post,
+                        q_mat_mul_op.post_element_wise.input_datatype(),
+                    );
+
+                    self.execution_graph[node_idx].variant =
+                        ComputeGraphNodeVariant::QMatMul(new_q_mat_mul.clone());
+
+                    let input_inner = q_mat_mul_op.input;
+                    if let Some(idx) = self.get_input_node_in_exec_graph(input_inner) {
+                        self.execution_graph.add_edge(idx, node_idx, ());
+                    }
+                    if let Some(edge) = self.execution_graph.find_edge(input_exec_idx, node_idx) {
+                        self.execution_graph.remove_edge(edge);
+                    }
+                    self.add_physical_dependencies(graph, node_idx, &[input_inner]);
+                    self.remove_node_if_dead(input_exec_idx);
+                    return true;
+                }
+            }
+        }
+
+        // Pre-op: fuse elementwise before qmatmul input
+        let ComputeGraphNodeVariant::QMatMul(q_mat_mul_op) = &node_variant else {
+            return false;
+        };
+
+        if self.check_cached(graph, q_mat_mul_op.input) {
+            return false;
+        }
+
+        let Some(input_exec_idx) = self.get_input_node_in_exec_graph(q_mat_mul_op.input) else {
+            return false;
+        };
+        let Some(el_op) = Self::try_get_elementwise(&self.execution_graph[input_exec_idx].variant)
+        else {
+            return false;
+        };
+
+        let mut new_q_mat_mul = q_mat_mul_op.clone();
+        new_q_mat_mul.input = el_op.value;
+        new_q_mat_mul.pre_element_wise = el_op.functions.clone();
+
+        self.execution_graph[node_idx].variant =
+            ComputeGraphNodeVariant::QMatMul(new_q_mat_mul.clone());
+
+        if let Some(edge) = self.execution_graph.find_edge(input_exec_idx, node_idx) {
+            self.execution_graph.remove_edge(edge);
+        }
+        if let Some(new_input_exec_idx) = self.get_input_node_in_exec_graph(new_q_mat_mul.input) {
+            self.execution_graph
+                .add_edge(new_input_exec_idx, node_idx, ());
+        }
+        self.add_physical_dependencies(graph, node_idx, &[new_q_mat_mul.input]);
+        self.remove_node_if_dead(input_exec_idx);
+        true
+    }
+
+    fn should_extend_kernel(
+        &mut self,
+        new_inputs: Vec<MirValue>,
+        inputs: &[Vec<MirValue>],
+    ) -> bool {
+        for input in &new_inputs {
+            let Some(input_tensor) = input.as_tensor() else {
+                continue;
+            };
+            for other in inputs.iter().flatten() {
+                let Some(other_tensor) = other.as_tensor() else {
+                    continue;
+                };
+
+                // Batched kernels are only safe when they touch disjoint tensor buffers.
+                // Views created by reshape/transpose share the same storage, so extending
+                // across them can read values that were written by a different invocation
+                // earlier in the same dispatch.
+                if std::sync::Arc::ptr_eq(input_tensor.buffer(), other_tensor.buffer()) {
+                    return false;
+                }
+            }
+        }
+        true
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1197,5 +1290,42 @@ impl Resolver {
             current_input_type = func.datatype;
         }
         expr
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::{DataTypeEnum, Device, TensorData};
+
+    use super::*;
+
+    #[test]
+    fn test_should_extend_kernel_allows_disjoint_tensor_buffers() {
+        let device = Device::test_instance();
+        let mut graph = ComputeGraphInner::new(&device);
+        let mut resolver = Resolver::new_many(&mut graph, &[], &device);
+
+        let pending_tensor = TensorData::new_for_shape(&device, &[4, 4], DataTypeEnum::F32);
+        let new_tensor = TensorData::new_for_shape(&device, &[4, 4], DataTypeEnum::F32);
+
+        assert!(resolver.should_extend_kernel(
+            vec![MirValue::Tensor(new_tensor)],
+            &[vec![MirValue::Tensor(pending_tensor)]],
+        ));
+    }
+
+    #[test]
+    fn test_should_extend_kernel_blocks_shared_buffer_views() {
+        let device = Device::test_instance();
+        let mut graph = ComputeGraphInner::new(&device);
+        let mut resolver = Resolver::new_many(&mut graph, &[], &device);
+
+        let pending_tensor = TensorData::new_for_shape(&device, &[4, 4], DataTypeEnum::F32);
+        let aliased_view = pending_tensor.slice(&[1..3, 0..4]);
+
+        assert!(!resolver.should_extend_kernel(
+            vec![MirValue::Tensor(aliased_view)],
+            &[vec![MirValue::Tensor(pending_tensor)]],
+        ));
     }
 }

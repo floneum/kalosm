@@ -19,6 +19,7 @@ use crate::{
     },
 };
 use std::fmt::Write;
+use std::sync::OnceLock;
 
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn general_sgemv(
@@ -34,10 +35,12 @@ pub(crate) fn general_sgemv(
     graph: &crate::compute_graph::ComputeGraphInner,
 ) {
     let blocksize = workgroup_size.x();
-    let dtype = op.input_datatype;
+    let input_datatype = op.input_datatype;
     let workgroup_local_index = kernel.workgroup_local_index();
     let elements_per_block = op.elements_per_block();
     let device = graph.device();
+    let pre_element_wise_functions = OnceLock::new();
+    let post_element_wise_functions = OnceLock::new();
 
     // Calculate n_workgroups for decomposing the linearized workgroup index
     let n_workgroups = format!("(({n_size} + {SGEMV_CHUNK_SIZE} - 1) / {SGEMV_CHUNK_SIZE})");
@@ -90,7 +93,7 @@ pub(crate) fn general_sgemv(
     debug_assert!(elements_per_block.is_multiple_of(SGEMV_VECTOR_SIZE));
     writeln!(
         kernel,
-        "var a_cache = array<vec{SGEMV_VECTOR_SIZE}<{dtype}>, {chunk_blocks}>();"
+        "var a_cache = array<vec{SGEMV_VECTOR_SIZE}<f32>, {chunk_blocks}>();"
     )
     .unwrap();
 
@@ -101,9 +104,12 @@ pub(crate) fn general_sgemv(
         writeln!(kernel, "for (var i = 0u; i < {chunk_blocks}; i += 1u) {{").unwrap();
         {
             // Get the values first
+            let pre_element_wise_functions = pre_element_wise_functions
+                .get_or_init(|| op.pre_element_wise.add_functions(kernel));
             for i in 0..SGEMV_VECTOR_SIZE {
                 writeln!(kernel, "let input_a_{i}_index = index * {elements_per_block} + i * {SGEMV_VECTOR_SIZE} + {i};").unwrap();
-                write!(kernel, "let input_a_{i} = {input_a}[").unwrap();
+                let mut raw_input = String::new();
+                write!(&mut raw_input, "{input_a}[").unwrap();
                 let mut indices = Vec::new();
                 // Add batch indices first
                 for dim in (0..input_a.rank()).rev().skip(2) {
@@ -112,8 +118,12 @@ pub(crate) fn general_sgemv(
                 // Then add M and K indices
                 indices.push("m_idx".to_string());
                 indices.push(format!("input_a_{i}_index"));
-                input_a.strided_index(kernel, indices);
-                writeln!(kernel, "];").unwrap();
+                input_a.strided_index(&mut raw_input, indices);
+                write!(&mut raw_input, "]").unwrap();
+                let processed = pre_element_wise_functions
+                    .iter()
+                    .fold(raw_input, |acc, f| f.call(vec![acc]));
+                writeln!(kernel, "let input_a_{i} = f32({processed});").unwrap();
             }
             // The pack them into a vector and write to the cache
             write!(kernel, "a_cache[i] = vec{SGEMV_VECTOR_SIZE}(").unwrap();
@@ -154,11 +164,7 @@ pub(crate) fn general_sgemv(
             "chunk".to_string(),
             DataTypeEnum::F32,
             |index, data, code| {
-                writeln!(
-                    code,
-                    "{acc_indexed} += dot(vec4<f32>(a_cache[{index}]), {data});"
-                )
-                .unwrap();
+                writeln!(code, "{acc_indexed} += dot(a_cache[{index}], {data});").unwrap();
             },
         );
 
@@ -293,7 +299,13 @@ pub(crate) fn general_sgemv(
         output.strided_index(kernel, output_indices);
         // Convert from f32 accumulator to output dtype (single element per iteration)
         let acc_val = maybe_vec_storage_index(SGEMV_CHUNK_SIZE, "acc", "acc_offset");
-        writeln!(kernel, "] = {dtype}({acc_val});").unwrap();
+        let result = post_element_wise_functions
+            .get_or_init(|| op.post_element_wise.add_functions(kernel))
+            .iter()
+            .fold(format!("{input_datatype}({acc_val})"), |acc, f| {
+                f.call(vec![acc])
+            });
+        writeln!(kernel, "] = {result};").unwrap();
     }
     if SGEMV_CHUNK_SIZE > 1 {
         writeln!(kernel, "}}").unwrap();

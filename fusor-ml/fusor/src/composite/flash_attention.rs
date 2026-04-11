@@ -385,12 +385,18 @@ mod tests {
             }
         }
 
-        let cpu_q: Tensor<4, f32> =
-            Tensor::Cpu(fusor_cpu::Tensor::from_slice([batch, heads, seq, dim], &q_data));
-        let cpu_k: Tensor<4, f32> =
-            Tensor::Cpu(fusor_cpu::Tensor::from_slice([batch, heads, seq, dim], &k_data));
-        let cpu_v: Tensor<4, f32> =
-            Tensor::Cpu(fusor_cpu::Tensor::from_slice([batch, heads, seq, dim], &v_data));
+        let cpu_q: Tensor<4, f32> = Tensor::Cpu(fusor_cpu::Tensor::from_slice(
+            [batch, heads, seq, dim],
+            &q_data,
+        ));
+        let cpu_k: Tensor<4, f32> = Tensor::Cpu(fusor_cpu::Tensor::from_slice(
+            [batch, heads, seq, dim],
+            &k_data,
+        ));
+        let cpu_v: Tensor<4, f32> = Tensor::Cpu(fusor_cpu::Tensor::from_slice(
+            [batch, heads, seq, dim],
+            &v_data,
+        ));
         let cpu_mask: Tensor<2, f32> =
             Tensor::Cpu(fusor_cpu::Tensor::from_slice([seq, seq], &mask_data));
 

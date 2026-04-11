@@ -86,7 +86,10 @@ impl CohereRuntime {
         let total_start = Instant::now();
         let prompt_ids = self.prompt_ids(language)?;
         if profile {
-            eprintln!("cohere prompt ids: {:.3}s", total_start.elapsed().as_secs_f32());
+            eprintln!(
+                "cohere prompt ids: {:.3}s",
+                total_start.elapsed().as_secs_f32()
+            );
         }
         let (features, total_frames, valid_frames) =
             pcm_to_features(&self.model.config, samples, &self.filterbank);
@@ -104,7 +107,10 @@ impl CohereRuntime {
             &features,
         );
         if profile {
-            eprintln!("cohere input tensor: {:.3}s", total_start.elapsed().as_secs_f32());
+            eprintln!(
+                "cohere input tensor: {:.3}s",
+                total_start.elapsed().as_secs_f32()
+            );
         }
         let (generated, token_timestamps) = if with_timestamps {
             let (generated, cross_attentions, encoder_length) = self
@@ -138,7 +144,10 @@ impl CohereRuntime {
             (generated, token_timestamps)
         } else {
             if profile {
-                eprintln!("cohere generate start: {:.3}s", total_start.elapsed().as_secs_f32());
+                eprintln!(
+                    "cohere generate start: {:.3}s",
+                    total_start.elapsed().as_secs_f32()
+                );
             }
             (
                 self.model
@@ -239,8 +248,8 @@ impl CohereRuntime {
             let remaining_time = elapsed_time.map(|elapsed| {
                 let processed = range.end.max(1);
                 std::time::Duration::from_millis(
-                    ((elapsed.as_millis() as usize / processed) * (total_samples.saturating_sub(range.end)))
-                        as u64,
+                    ((elapsed.as_millis() as usize / processed)
+                        * (total_samples.saturating_sub(range.end))) as u64,
                 )
             });
             let segment = Segment {
@@ -276,7 +285,9 @@ fn split_audio_chunks_energy(config: &CohereConfig, waveform: &[f32]) -> Vec<Ran
             break;
         }
 
-        let search_start = (idx + chunk_size).saturating_sub(boundary_context_size).max(idx);
+        let search_start = (idx + chunk_size)
+            .saturating_sub(boundary_context_size)
+            .max(idx);
         let search_end = (idx + chunk_size).min(waveform.len());
         let split_point = if search_end <= search_start {
             idx + chunk_size
@@ -314,8 +325,8 @@ fn find_split_point_energy(
     let mut i = 0usize;
     while i < upper {
         let window = &segment[i..(i + min_energy_window_samples)];
-        let energy = (window.iter().map(|sample| sample * sample).sum::<f32>() / window.len() as f32)
-            .sqrt();
+        let energy =
+            (window.iter().map(|sample| sample * sample).sum::<f32>() / window.len() as f32).sqrt();
         if energy < min_energy {
             min_energy = energy;
             quietest_idx = start_idx + i;

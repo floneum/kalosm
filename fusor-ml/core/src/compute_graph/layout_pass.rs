@@ -112,7 +112,7 @@ impl LayoutPass {
         key: NodeIndex,
         operation: &crate::quantized::matmul::QMatMulOperation,
     ) {
-        let Some(first_layout) = self.output_layout.get(&operation.input) else {
+        let Some(_first_layout) = self.output_layout.get(&operation.input) else {
             self.queue.push_back(operation.input);
             self.queue.push_back(key);
             return;
@@ -120,7 +120,7 @@ impl LayoutPass {
         let output_layout = Layout::contiguous(&operation.out_shape);
         self.output_layout.insert(
             key,
-            TensorLayoutInfo::new(output_layout, first_layout.datatype()),
+            TensorLayoutInfo::new(output_layout, operation.post_element_wise.out_datatype()),
         );
     }
 

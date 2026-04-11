@@ -130,7 +130,10 @@ async fn test_rel_shift_cat_pattern_matches_cpu() {
 
     let gpu = Device::test_instance();
 
-    let data = vec![vec![vec![vec![1.0, 2.0, 3.0, 4.0, 5.0], vec![6.0, 7.0, 8.0, 9.0, 10.0]]]];
+    let data = vec![vec![vec![
+        vec![1.0, 2.0, 3.0, 4.0, 5.0],
+        vec![6.0, 7.0, 8.0, 9.0, 10.0],
+    ]]];
     let gpu_x = Tensor::new(&gpu, &data);
 
     let run = |x: Tensor<4, f32>| -> Tensor<4, f32> {
@@ -144,9 +147,7 @@ async fn test_rel_shift_cat_pattern_matches_cpu() {
     };
 
     let gpu_out = run(gpu_x).as_slice().await.unwrap();
-    let expected = [
-        [[[2.0f32, 3.0, 4.0, 5.0, 0.0], [6.0, 7.0, 8.0, 9.0, 10.0]]]
-    ];
+    let expected = [[[[2.0f32, 3.0, 4.0, 5.0, 0.0], [6.0, 7.0, 8.0, 9.0, 10.0]]]];
 
     for b in 0..1 {
         for h in 0..1 {

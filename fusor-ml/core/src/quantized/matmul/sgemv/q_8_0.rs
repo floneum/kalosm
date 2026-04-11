@@ -8,6 +8,7 @@ use crate::{
     util::{maybe_vec_storage_index, maybe_vec_storage_subgroup_add, maybe_vec_storage_type},
 };
 use std::fmt::Write;
+use std::sync::OnceLock;
 
 pub(crate) const Q_8_0_SGEMV_CHUNK_SIZE: u32 = 4; // This is the size of the chunk each thread will process at a time
 const STEP_SIZE: u32 = 8;
@@ -27,10 +28,13 @@ pub(crate) fn q_8_0_sgemv(
     m_size: &str,
     k_size: &str,
 ) {
-    let dtype = op.input_datatype;
+    let input_datatype = op.input_datatype;
+    let dtype = op.matmul_datatype();
     let subgroup_index = kernel.subgroup_index();
     let subgroup_local_index = kernel.subgroup_local_index();
     let elements_per_block = op.elements_per_block();
+    let pre_element_wise_functions = OnceLock::new();
+    let post_element_wise_functions = OnceLock::new();
 
     // Calculate n_workgroups for this kernel type (SUBGROUP_COUNT subgroups per workgroup, Q_8_0_SGEMV_CHUNK_SIZE per subgroup)
     let chunk_size = Q_8_0_SGEMV_CHUNK_SIZE * SUBGROUP_COUNT;
@@ -102,8 +106,10 @@ pub(crate) fn q_8_0_sgemv(
         // First load the values of a into cached_a_values
         for j in 0..STEP_SIZE {
             writeln!(kernel, "{{").unwrap();
-
-            write!(kernel, "cached_a_values[{j}] = {input_a}[").unwrap();
+            let pre_element_wise_functions = pre_element_wise_functions
+                .get_or_init(|| op.pre_element_wise.add_functions(kernel));
+            let mut raw_input = String::new();
+            write!(&mut raw_input, "{input_a}[").unwrap();
             let mut indices = Vec::new();
             // Add batch indices first
             for dim in (0..input_a.rank()).rev().skip(2) {
@@ -112,8 +118,12 @@ pub(crate) fn q_8_0_sgemv(
             // Then add M and K indices
             indices.push("m_idx".to_string());
             indices.push(format!("y_offset + {j}"));
-            input_a.strided_index(kernel, indices);
-            writeln!(kernel, "];").unwrap();
+            input_a.strided_index(&mut raw_input, indices);
+            write!(&mut raw_input, "]").unwrap();
+            let processed = pre_element_wise_functions
+                .iter()
+                .fold(raw_input, |acc, f| f.call(vec![acc]));
+            writeln!(kernel, "cached_a_values[{j}] = {processed};").unwrap();
 
             writeln!(kernel, "}}").unwrap();
         }
@@ -173,7 +183,13 @@ pub(crate) fn q_8_0_sgemv(
             output_indices.push(index);
             output.strided_index(kernel, output_indices);
             let indexed = maybe_vec_storage_index(Q_8_0_SGEMV_CHUNK_SIZE, "sum", offset);
-            writeln!(kernel, "] = {indexed};").unwrap();
+            let result = post_element_wise_functions
+                .get_or_init(|| op.post_element_wise.add_functions(kernel))
+                .iter()
+                .fold(format!("{input_datatype}({indexed})"), |acc, f| {
+                    f.call(vec![acc])
+                });
+            writeln!(kernel, "] = {result};").unwrap();
         }
         writeln!(kernel, "}}").unwrap();
 

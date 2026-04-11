@@ -13,11 +13,19 @@ mod visualize;
 
 use crate::{
     DataTypeEnum, Device, ElementWiseOperation, MatMulOperation, PairWiseOperation, QMatrix,
-    ReduceOperation, composite::where_cond::WhereCondOperation,
-    compute_graph::resolve::{ResolverManyResult, ResolverResult}, dequantize::DequantizeOperation,
-    index_select::IndexSelectOperation, map_layout::MapLayoutOperation, mir::operation::Operation,
-    nary_wise::NaryOperation, quantized::matmul::QMatMulOperation, resize::ResizeOperation,
-    slice_assign::SliceAssignOperation, tensor::TensorData, visit_tiled::MaybeQData,
+    ReduceOperation,
+    composite::where_cond::WhereCondOperation,
+    compute_graph::resolve::{ResolverManyResult, ResolverResult},
+    dequantize::DequantizeOperation,
+    index_select::IndexSelectOperation,
+    map_layout::MapLayoutOperation,
+    mir::operation::Operation,
+    nary_wise::NaryOperation,
+    quantized::matmul::QMatMulOperation,
+    resize::ResizeOperation,
+    slice_assign::SliceAssignOperation,
+    tensor::TensorData,
+    visit_tiled::MaybeQData,
 };
 
 #[derive(Clone)]
@@ -122,11 +130,7 @@ impl ComputeGraph {
         data
     }
 
-    pub(crate) fn resolve_many(
-        &self,
-        keys: &[NodeIndex],
-        device: &Device,
-    ) -> ResolverManyResult {
+    pub(crate) fn resolve_many(&self, keys: &[NodeIndex], device: &Device) -> ResolverManyResult {
         let data = self.with_mut(|inner| {
             let mut resolver = Resolver::new_many(inner, keys, device);
             resolver.run_many(inner)

@@ -10,6 +10,7 @@ use crate::{
     util::{maybe_vec_storage_index, maybe_vec_storage_subgroup_add, maybe_vec_storage_type},
 };
 use std::fmt::Write;
+use std::sync::OnceLock;
 
 pub(crate) const Q4K_SGEMV_CHUNK_SIZE: u32 = 4; // This is the size of the chunk each thread will process at a time
 const SUBGROUP_COUNT: u32 = 2;
@@ -35,6 +36,8 @@ pub(crate) fn q4k_sgemv(
     let subgroup_index = kernel.subgroup_index();
     let subgroup_local_index = kernel.subgroup_local_index();
     let elements_per_block = op.elements_per_block();
+    let pre_element_wise_functions = OnceLock::new();
+    let post_element_wise_functions = OnceLock::new();
 
     // Calculate n_workgroups for this kernel type (SUBGROUP_COUNT subgroups per workgroup, Q4K_SGEMV_CHUNK_SIZE per subgroup)
     let chunk_size = Q4K_SGEMV_CHUNK_SIZE * SUBGROUP_COUNT;
@@ -103,7 +106,10 @@ pub(crate) fn q4k_sgemv(
         for j in 0..8 {
             // Load all 4 values using strided indexing
             for (idx, offset) in [(0, 0), (1, 32), (2, 128), (3, 160)] {
-                write!(kernel, "let a_val_{j}_{idx} = {input_a}[").unwrap();
+                let pre_element_wise_functions = pre_element_wise_functions
+                    .get_or_init(|| op.pre_element_wise.add_functions(kernel));
+                let mut raw_input = String::new();
+                write!(&mut raw_input, "{input_a}[").unwrap();
                 let mut indices = Vec::new();
                 // Add batch indices first
                 for dim in (0..input_a.rank()).rev().skip(2) {
@@ -112,8 +118,12 @@ pub(crate) fn q4k_sgemv(
                 // Then add M and K indices
                 indices.push("m_idx".to_string());
                 indices.push(format!("vector_offset + {j} + {offset}"));
-                input_a.strided_index(kernel, indices);
-                writeln!(kernel, "];").unwrap();
+                input_a.strided_index(&mut raw_input, indices);
+                write!(&mut raw_input, "]").unwrap();
+                let processed = pre_element_wise_functions
+                    .iter()
+                    .fold(raw_input, |acc, f| f.call(vec![acc]));
+                writeln!(kernel, "let a_val_{j}_{idx} = f32({processed});").unwrap();
             }
 
             writeln!(
@@ -310,7 +320,11 @@ pub(crate) fn q4k_sgemv(
             output_indices.push(index);
             output.strided_index(kernel, output_indices);
             let indexed = maybe_vec_storage_index(Q4K_SGEMV_CHUNK_SIZE, "sum", offset);
-            writeln!(kernel, "] = {dtype}({indexed});").unwrap();
+            let result = post_element_wise_functions
+                .get_or_init(|| op.post_element_wise.add_functions(kernel))
+                .iter()
+                .fold(format!("{dtype}({indexed})"), |acc, f| f.call(vec![acc]));
+            writeln!(kernel, "] = {result};").unwrap();
         }
         writeln!(kernel, "}}").unwrap();
     }

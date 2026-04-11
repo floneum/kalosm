@@ -92,7 +92,8 @@ where
                 });
                 // Allocate new tensor with larger size
                 let new_data = Tensor::zeros(device, new_data_shape);
-                *cached = cat([cached.clone(), new_data], self.concat_dim).to_materialized_blocking();
+                *cached =
+                    cat([cached.clone(), new_data], self.concat_dim).to_materialized_blocking();
             }
             // Assign the new data into the cached tensor
             let slice: [std::ops::Range<usize>; R] = std::array::from_fn(|i| {
@@ -202,10 +203,8 @@ mod tests {
         ];
 
         for chunk in chunks {
-            let cpu_tensor: Tensor<4, f32> =
-                Tensor::from_slice(&cpu, [1, 1, 1, 4], &chunk);
-            let gpu_tensor: Tensor<4, f32> =
-                Tensor::from_slice(&gpu, [1, 1, 1, 4], &chunk);
+            let cpu_tensor: Tensor<4, f32> = Tensor::from_slice(&cpu, [1, 1, 1, 4], &chunk);
+            let gpu_tensor: Tensor<4, f32> = Tensor::from_slice(&gpu, [1, 1, 1, 4], &chunk);
 
             let gpu_direct = gpu_tensor.clone().as_slice().await.unwrap();
             for d in 0..4 {
@@ -217,8 +216,16 @@ mod tests {
                 );
             }
 
-            let cpu_result = cpu_cache.append(&cpu, &cpu_tensor).as_slice().await.unwrap();
-            let gpu_result = gpu_cache.append(&gpu, &gpu_tensor).as_slice().await.unwrap();
+            let cpu_result = cpu_cache
+                .append(&cpu, &cpu_tensor)
+                .as_slice()
+                .await
+                .unwrap();
+            let gpu_result = gpu_cache
+                .append(&gpu, &gpu_tensor)
+                .as_slice()
+                .await
+                .unwrap();
 
             let shape = cpu_result.shape();
             for b in 0..shape[0] {

@@ -259,7 +259,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_conv2d_gpu_matches_cpu_stride2_padding1() {
-        let gpu = crate::Device::new().await.expect("GPU required for this test");
+        let gpu = crate::Device::new()
+            .await
+            .expect("GPU required for this test");
 
         let input_data = vec![
             1.0f32, 2.0, 3.0, 4.0, //
@@ -267,9 +269,7 @@ mod tests {
             9.0, 10.0, 11.0, 12.0, //
             13.0, 14.0, 15.0, 16.0,
         ];
-        let weight_data = vec![
-            1.0f32, 0.0, 0.0, 1.0,
-        ];
+        let weight_data = vec![1.0f32, 0.0, 0.0, 1.0];
         let bias_data = vec![0.25f32];
 
         let cpu_input: Tensor<4, f32> =
@@ -278,8 +278,7 @@ mod tests {
         let cpu_weight: Tensor<4, f32> =
             Tensor::Cpu(fusor_cpu::Tensor::from_slice([1, 1, 2, 2], &weight_data));
         let gpu_weight: Tensor<4, f32> = Tensor::from_slice(&gpu, [1, 1, 2, 2], &weight_data);
-        let cpu_bias: Tensor<1, f32> =
-            Tensor::Cpu(fusor_cpu::Tensor::from_slice([1], &bias_data));
+        let cpu_bias: Tensor<1, f32> = Tensor::Cpu(fusor_cpu::Tensor::from_slice([1], &bias_data));
         let gpu_bias: Tensor<1, f32> = Tensor::from_slice(&gpu, [1], &bias_data);
 
         let config = Conv2dConfig {
@@ -314,7 +313,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_conv2d_gpu_matches_cpu_depthwise_stride2_padding1() {
-        let gpu = crate::Device::new().await.expect("GPU required for this test");
+        let gpu = crate::Device::new()
+            .await
+            .expect("GPU required for this test");
 
         let input_data = vec![
             1.0f32, 2.0, 3.0, 4.0, //

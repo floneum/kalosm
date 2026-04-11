@@ -363,7 +363,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_pad_axis_gpu_matches_cpu_4d() {
-        let gpu = crate::Device::new().await.expect("GPU required for this test");
+        let gpu = crate::Device::new()
+            .await
+            .expect("GPU required for this test");
 
         let input_data = vec![
             1.0f32, 2.0, 3.0, 4.0, //
@@ -375,8 +377,18 @@ mod tests {
             Tensor::Cpu(fusor_cpu::Tensor::from_slice([1, 1, 4, 4], &input_data));
         let gpu_input: Tensor<4, f32> = Tensor::from_slice(&gpu, [1, 1, 4, 4], &input_data);
 
-        let cpu_padded = cpu_input.pad_axis(2, 1).pad_axis(3, 1).as_slice().await.unwrap();
-        let gpu_padded = gpu_input.pad_axis(2, 1).pad_axis(3, 1).as_slice().await.unwrap();
+        let cpu_padded = cpu_input
+            .pad_axis(2, 1)
+            .pad_axis(3, 1)
+            .as_slice()
+            .await
+            .unwrap();
+        let gpu_padded = gpu_input
+            .pad_axis(2, 1)
+            .pad_axis(3, 1)
+            .as_slice()
+            .await
+            .unwrap();
 
         for h in 0..cpu_padded.shape()[2] {
             for w in 0..cpu_padded.shape()[3] {

@@ -339,7 +339,9 @@ pub(crate) fn workgroup_shape_constraints(
     if matmul_sgemv_subgroups_supported(device) {
         constraints.add_constraint(
             0,
-            crate::mir::workgroup_shape::Constraint::more_than_or_equals(device.min_subgroup_size()),
+            crate::mir::workgroup_shape::Constraint::more_than_or_equals(
+                device.min_subgroup_size(),
+            ),
         );
         constraints.add_constraint(
             0,

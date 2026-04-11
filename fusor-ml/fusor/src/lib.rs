@@ -466,7 +466,9 @@ where
                     .iter()
                     .map(|tensor| match tensor {
                         Tensor::Gpu(t) => t,
-                        Tensor::Cpu(_) => panic!("cannot mix CPU and GPU tensors in materialize_many_blocking"),
+                        Tensor::Cpu(_) => {
+                            panic!("cannot mix CPU and GPU tensors in materialize_many_blocking")
+                        }
                     })
                     .collect();
                 pollster::block_on(fusor_core::Tensor::materialize_many(&gpu_tensors));
@@ -493,7 +495,9 @@ where
                     .iter()
                     .map(|tensor| match tensor {
                         Tensor::Gpu(t) => t,
-                        Tensor::Cpu(_) => panic!("cannot mix CPU and GPU tensors in to_materialized_many_blocking"),
+                        Tensor::Cpu(_) => panic!(
+                            "cannot mix CPU and GPU tensors in to_materialized_many_blocking"
+                        ),
                     })
                     .collect();
                 pollster::block_on(fusor_core::Tensor::materialized_many(&gpu_tensors))

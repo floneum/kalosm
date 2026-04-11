@@ -64,8 +64,10 @@ impl WhisperSource {
     /// Cohere Transcribe 03/2026
     pub fn cohere_transcribe_03_2026() -> Self {
         let repo = "Demonthos/cohere-transcribe-03-2026-gguf".to_owned();
-        let model = FileSource::huggingface(repo.clone(), "main".to_owned(), "model.gguf".to_owned());
-        let tokenizer = FileSource::huggingface(repo.clone(), "main".to_owned(), "tokenizer.json".to_owned());
+        let model =
+            FileSource::huggingface(repo.clone(), "main".to_owned(), "model.gguf".to_owned());
+        let tokenizer =
+            FileSource::huggingface(repo.clone(), "main".to_owned(), "tokenizer.json".to_owned());
         let config = FileSource::huggingface(repo, "main".to_owned(), "config.json".to_owned());
         Self::new_with_family(model, tokenizer, config, ModelFamily::CohereTranscribe)
     }

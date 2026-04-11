@@ -37,11 +37,17 @@ fn cohere_layer_norm_3d(norm: &LayerNorm<1, f32>, input: &Tensor<3, f32>) -> Ten
     let [batch, time, hidden] = input.shape();
     let flat: Tensor<2, f32> = input.reshape([batch * time, hidden]).to_concrete();
     if let Some(start) = start {
-        eprintln!("cohere layer_norm reshape: {:.3}s", start.elapsed().as_secs_f32());
+        eprintln!(
+            "cohere layer_norm reshape: {:.3}s",
+            start.elapsed().as_secs_f32()
+        );
     }
     let mean = flat.mean_keepdim::<1>(1);
     if let Some(start) = start {
-        eprintln!("cohere layer_norm mean: {:.3}s", start.elapsed().as_secs_f32());
+        eprintln!(
+            "cohere layer_norm mean: {:.3}s",
+            start.elapsed().as_secs_f32()
+        );
     }
     let centered = (&flat - &mean.broadcast_as(flat.shape())).to_concrete();
     if let Some(start) = start {
@@ -52,7 +58,10 @@ fn cohere_layer_norm_3d(norm: &LayerNorm<1, f32>, input: &Tensor<3, f32>) -> Ten
     }
     let normalized = centered.rms_norm_fused::<1, 1>(norm.weight(), norm.bias(), norm.eps());
     if let Some(start) = start {
-        eprintln!("cohere layer_norm rms: {:.3}s", start.elapsed().as_secs_f32());
+        eprintln!(
+            "cohere layer_norm rms: {:.3}s",
+            start.elapsed().as_secs_f32()
+        );
     }
     normalized.reshape([batch, time, hidden]).to_concrete()
 }
@@ -480,9 +489,7 @@ impl ConformerLayer {
                 layer_start.elapsed().as_secs_f32()
             );
         }
-        let x = (residual
-            + self.feed_forward1.forward(&normed_ff1).mul_scalar(0.5))
-        .to_concrete();
+        let x = (residual + self.feed_forward1.forward(&normed_ff1).mul_scalar(0.5)).to_concrete();
         if let Some(layer_start) = layer_start {
             eprintln!(
                 "cohere encoder layer {layer_idx} ff1: {:.3}s",
@@ -491,9 +498,11 @@ impl ConformerLayer {
         }
         let residual = x.clone();
         let x = (residual
-            + self
-                .self_attn
-                .forward(&cohere_layer_norm_3d(&self.norm_self_att, &x), pos_emb, mask))
+            + self.self_attn.forward(
+                &cohere_layer_norm_3d(&self.norm_self_att, &x),
+                pos_emb,
+                mask,
+            ))
         .to_concrete();
         if let Some(layer_start) = layer_start {
             eprintln!(
@@ -571,15 +580,24 @@ impl ConformerEncoder {
         let time = x.shape()[1];
         let (mut x, pos_emb) = self.pos_enc.forward(&x);
         if let Some(encode_start) = encode_start {
-            eprintln!("cohere pos_enc: {:.3}s", encode_start.elapsed().as_secs_f32());
+            eprintln!(
+                "cohere pos_enc: {:.3}s",
+                encode_start.elapsed().as_secs_f32()
+            );
         }
         let valid = valid_mask(&x.device(), x.shape()[0], time, length);
         if let Some(encode_start) = encode_start {
-            eprintln!("cohere valid mask: {:.3}s", encode_start.elapsed().as_secs_f32());
+            eprintln!(
+                "cohere valid mask: {:.3}s",
+                encode_start.elapsed().as_secs_f32()
+            );
         }
         let att_mask = encoder_attention_mask(&x.device(), x.shape()[0], time, length);
         if let Some(encode_start) = encode_start {
-            eprintln!("cohere att mask: {:.3}s", encode_start.elapsed().as_secs_f32());
+            eprintln!(
+                "cohere att mask: {:.3}s",
+                encode_start.elapsed().as_secs_f32()
+            );
         }
         for (i, layer) in self.layers.iter().enumerate() {
             x = layer.forward(&x, &pos_emb, Some(&att_mask), Some(&valid));
@@ -592,7 +610,10 @@ impl ConformerEncoder {
             }
         }
         if let Some(encode_start) = encode_start {
-            eprintln!("cohere encode total: {:.3}s", encode_start.elapsed().as_secs_f32());
+            eprintln!(
+                "cohere encode total: {:.3}s",
+                encode_start.elapsed().as_secs_f32()
+            );
         }
         (x, length)
     }
@@ -817,9 +838,10 @@ impl TransformerDecoderLayer {
         _cross_attention_mask: Option<&Tensor<4, f32>>,
     ) -> Tensor<3, f32> {
         let residual = hidden_states.clone();
-        let self_kv = self
-            .first_sub_layer
-            .forward_kv(&cohere_layer_norm_3d(&self.layer_norm_1, hidden_states), None);
+        let self_kv = self.first_sub_layer.forward_kv(
+            &cohere_layer_norm_3d(&self.layer_norm_1, hidden_states),
+            None,
+        );
         let self_mask = AttentionMask::new(
             self_attention_mask
                 .squeeze::<3>(0)
@@ -1090,7 +1112,10 @@ impl TransformerDecoder {
                             start.elapsed().as_secs_f32()
                         );
                     }
-                    let key_states = layer.second_sub_layer.key_net.forward(encoder_hidden_states);
+                    let key_states = layer
+                        .second_sub_layer
+                        .key_net
+                        .forward(encoder_hidden_states);
                     if let Some(start) = start {
                         eprintln!(
                             "cohere decoder layer {i} cache init key forward: {:.3}s",
@@ -1105,8 +1130,10 @@ impl TransformerDecoder {
                         );
                     }
 
-                    let value_states =
-                        layer.second_sub_layer.value_net.forward(encoder_hidden_states);
+                    let value_states = layer
+                        .second_sub_layer
+                        .value_net
+                        .forward(encoder_hidden_states);
                     if let Some(start) = start {
                         eprintln!(
                             "cohere decoder layer {i} cache init value forward: {:.3}s",
@@ -1122,7 +1149,9 @@ impl TransformerDecoder {
                     }
                     (key_states, value_states)
                 } else {
-                    let cross_attn_kv = layer.second_sub_layer.forward_kv(encoder_hidden_states, None);
+                    let cross_attn_kv = layer
+                        .second_sub_layer
+                        .forward_kv(encoder_hidden_states, None);
                     let materialized = Tensor::to_materialized_many_blocking(&[
                         &cross_attn_kv.0,
                         &cross_attn_kv.1,
@@ -1434,8 +1463,14 @@ mod tests {
         let cpu_input_ids = Tensor::from_slice(&cpu_device, [1, prompt_ids.len()], &prompt_ids);
         let gpu_input_ids = Tensor::from_slice(&gpu_device, [1, prompt_ids.len()], &prompt_ids);
 
-        let (cpu_pre, cpu_pre_len) = cpu_model.encoder.pre_encode.forward(&cpu_input, valid_frames);
-        let (gpu_pre, gpu_pre_len) = gpu_model.encoder.pre_encode.forward(&gpu_input, valid_frames);
+        let (cpu_pre, cpu_pre_len) = cpu_model
+            .encoder
+            .pre_encode
+            .forward(&cpu_input, valid_frames);
+        let (gpu_pre, gpu_pre_len) = gpu_model
+            .encoder
+            .pre_encode
+            .forward(&gpu_input, valid_frames);
         assert_eq!(cpu_pre_len, gpu_pre_len);
         eprintln!("compare: pre_encode slices");
         let cpu_pre = cpu_pre.as_slice().await.unwrap();
@@ -1464,8 +1499,8 @@ mod tests {
         for i in 0..enc_shape[0] {
             for j in 0..enc_shape[1] {
                 for k in 0..enc_shape[2] {
-                    cpu_enc_max =
-                        cpu_enc_max.max((cpu_enc_slice[[i, j, k]] - gpu_enc_slice[[i, j, k]]).abs());
+                    cpu_enc_max = cpu_enc_max
+                        .max((cpu_enc_slice[[i, j, k]] - gpu_enc_slice[[i, j, k]]).abs());
                 }
             }
         }
@@ -1591,7 +1626,10 @@ impl Cohere {
         let encode_start = Instant::now();
         let (encoder_hidden_states, encoder_length) = self.encode(input_features, length);
         if profile {
-            eprintln!("cohere encode: {:.3}s", encode_start.elapsed().as_secs_f32());
+            eprintln!(
+                "cohere encode: {:.3}s",
+                encode_start.elapsed().as_secs_f32()
+            );
         }
         let mut cache = TransformerDecoderCache::default();
         let mut tokens = prompt_ids.to_vec();
@@ -1662,7 +1700,10 @@ impl Cohere {
         let encode_start = Instant::now();
         let (encoder_hidden_states, encoder_length) = self.encode(input_features, length);
         if profile {
-            eprintln!("cohere encode: {:.3}s", encode_start.elapsed().as_secs_f32());
+            eprintln!(
+                "cohere encode: {:.3}s",
+                encode_start.elapsed().as_secs_f32()
+            );
         }
         let mut tokens = prompt_ids.to_vec();
         let mut cache = TransformerDecoderCache::default();

@@ -415,8 +415,7 @@ mod tests {
             raw_bytes[2 + i] = 1i8 as u8;
         }
 
-        raw_bytes[block_size_bytes..block_size_bytes + 2]
-            .copy_from_slice(&scale_f16.to_le_bytes());
+        raw_bytes[block_size_bytes..block_size_bytes + 2].copy_from_slice(&scale_f16.to_le_bytes());
         for i in 0..32 {
             raw_bytes[block_size_bytes + 2 + i] = 2i8 as u8;
         }
@@ -489,8 +488,17 @@ mod tests {
         let cpu_input: Tensor<3, f32> = Tensor::from_slice(&cpu_device, [1, 13, 32], &input_data);
         let gpu_input: Tensor<3, f32> = Tensor::from_slice(&gpu_device, [1, 13, 32], &input_data);
 
-        let cpu_output_a = cpu_input.clone().q_mat_mul(&cpu_qmatrix_a).as_slice().await.unwrap();
-        let cpu_output_b = cpu_input.q_mat_mul(&cpu_qmatrix_b).as_slice().await.unwrap();
+        let cpu_output_a = cpu_input
+            .clone()
+            .q_mat_mul(&cpu_qmatrix_a)
+            .as_slice()
+            .await
+            .unwrap();
+        let cpu_output_b = cpu_input
+            .q_mat_mul(&cpu_qmatrix_b)
+            .as_slice()
+            .await
+            .unwrap();
 
         let gpu_output_a = gpu_input.clone().q_mat_mul(&gpu_qmatrix_a);
         let gpu_output_b = gpu_input.q_mat_mul(&gpu_qmatrix_b);
