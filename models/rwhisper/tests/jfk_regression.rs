@@ -2,13 +2,15 @@ use std::{
     fs,
     io::Cursor,
     path::{Path, PathBuf},
+    time::{SystemTime, UNIX_EPOCH},
 };
 
-use anyhow::{Context, Result, bail};
-use futures_util::StreamExt;
+use anyhow::{bail, Context, Result};
+use futures_util::{stream, StreamExt};
 use kalosm::sound::*;
 use kalosm_model_types::FileSource;
 use rodio::Decoder;
+use rwhisper::TranscribeChunkedAudioStreamExt;
 
 // Reference text from JFK's January 20, 1961 inaugural address:
 // "And so, my fellow Americans, ask not what your country can do for you,
@@ -68,18 +70,23 @@ fn repo_artifact_dir(name: &str) -> PathBuf {
 
 fn moonshine_dir(size: &str) -> Option<PathBuf> {
     let env_var = format!("RWHISPER_MOONSHINE_{}_DIR", size.to_ascii_uppercase());
-    std::env::var(&env_var)
-        .ok()
-        .map(PathBuf::from)
-        .or_else(|| {
-            let dir = repo_artifact_dir(&format!("moonshine-streaming-{size}"));
-            dir.exists().then_some(dir)
-        })
+    std::env::var(&env_var).ok().map(PathBuf::from).or_else(|| {
+        let dir = repo_artifact_dir(&format!("moonshine-streaming-{size}"));
+        dir.exists().then_some(dir)
+    })
 }
 
 fn moonshine_source(size: &str) -> Option<WhisperSource> {
     let dir = moonshine_dir(size)?;
     Some(WhisperSource::moonshine_streaming_local(dir))
+}
+
+fn unique_temp_dir(prefix: &str) -> PathBuf {
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("clock drifted backwards")
+        .as_nanos();
+    std::env::temp_dir().join(format!("{prefix}-{}-{timestamp}", std::process::id()))
 }
 
 fn whisper_source() -> Option<WhisperSource> {
@@ -136,6 +143,46 @@ async fn transcribe_jfk_sample(source: WhisperSource) -> Result<String> {
     let audio = Decoder::new(Cursor::new(contents)).context("failed to decode JFK sample")?;
 
     let mut stream = model.transcribe(audio);
+    let mut transcript = String::new();
+    while let Some(segment) = stream.next().await {
+        if !transcript.is_empty() {
+            transcript.push(' ');
+        }
+        transcript.push_str(segment.text().trim());
+    }
+
+    Ok(transcript)
+}
+
+async fn transcribe_jfk_sample_streaming(
+    source: WhisperSource,
+    chunk_ms: usize,
+    max_seconds: Option<f32>,
+) -> Result<String> {
+    let model = WhisperBuilder::default()
+        .with_source(source)
+        .build()
+        .await
+        .context("failed to build model")?;
+
+    let contents = fs::read(Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/samples_jfk.wav"))
+        .context("failed to read JFK sample")?;
+    let audio = Decoder::new(Cursor::new(contents)).context("failed to decode JFK sample")?;
+    let sample_rate = rodio::Source::sample_rate(&audio);
+    let channels = rodio::Source::channels(&audio);
+    let samples: Vec<i16> = if let Some(max_seconds) = max_seconds {
+        rodio::Source::take_duration(audio, std::time::Duration::from_secs_f32(max_seconds))
+            .collect()
+    } else {
+        audio.collect()
+    };
+    let samples_per_chunk = ((sample_rate as usize * chunk_ms) / 1000).max(1) * channels as usize;
+    let chunks = samples
+        .chunks(samples_per_chunk)
+        .map(|chunk| rodio::buffer::SamplesBuffer::new(channels, sample_rate, chunk.to_vec()))
+        .collect::<Vec<_>>();
+
+    let mut stream = stream::iter(chunks).transcribe(model);
     let mut transcript = String::new();
     while let Some(segment) = stream.next().await {
         if !transcript.is_empty() {
@@ -204,6 +251,62 @@ async fn moonshine_medium_matches_the_jfk_reference() -> Result<()> {
         normalize_text(&transcript),
         normalize_text(JFK_REFERENCE),
         "unexpected Moonshine transcript: {transcript}"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires a local Moonshine tiny artifact directory with embedded GGUF metadata"]
+async fn moonshine_tiny_loads_from_embedded_metadata_without_sidecars() -> Result<()> {
+    let Some(source_dir) = moonshine_dir("tiny") else {
+        bail!("missing Moonshine tiny artifact dir; set RWHISPER_MOONSHINE_TINY_DIR or place files in artifacts/moonshine-streaming-tiny");
+    };
+
+    let temp_dir = unique_temp_dir("rwhisper-moonshine-embedded");
+    fs::create_dir_all(&temp_dir)?;
+    fs::copy(source_dir.join("model.gguf"), temp_dir.join("model.gguf"))
+        .context("failed to copy GGUF into temp directory")?;
+    assert!(!temp_dir.join("tokenizer.json").exists());
+    assert!(!temp_dir.join("config.json").exists());
+
+    let _model = WhisperBuilder::default()
+        .with_source(WhisperSource::moonshine_streaming_local(&temp_dir))
+        .build()
+        .await
+        .context("failed to load Moonshine from embedded GGUF metadata only")?;
+
+    let _ = fs::remove_dir_all(&temp_dir);
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires a local Moonshine artifact directory"]
+async fn moonshine_tiny_streaming_matches_the_jfk_reference() -> Result<()> {
+    let Some(source) = moonshine_source("tiny") else {
+        bail!("missing Moonshine tiny artifact dir; set RWHISPER_MOONSHINE_TINY_DIR or place files in artifacts/moonshine-streaming-tiny");
+    };
+
+    let transcript = transcribe_jfk_sample_streaming(source, 250, None).await?;
+    assert_eq!(
+        normalize_text(&transcript),
+        normalize_text(JFK_REFERENCE),
+        "unexpected Moonshine streaming transcript: {transcript}"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires a local Moonshine artifact directory"]
+async fn moonshine_tiny_streaming_short_prefix_smoke() -> Result<()> {
+    let Some(source) = moonshine_source("tiny") else {
+        bail!("missing Moonshine tiny artifact dir; set RWHISPER_MOONSHINE_TINY_DIR or place files in artifacts/moonshine-streaming-tiny");
+    };
+
+    let transcript = transcribe_jfk_sample_streaming(source, 1_000, Some(2.0)).await?;
+    assert_eq!(
+        normalize_text(&transcript),
+        "and so my fellow america",
+        "unexpected short Moonshine streaming transcript: {transcript}"
     );
     Ok(())
 }

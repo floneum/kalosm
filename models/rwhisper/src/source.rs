@@ -131,7 +131,8 @@ impl WhisperSource {
     }
 
     /// Moonshine streaming English model from a local directory containing
-    /// `model.gguf`, `tokenizer.json`, and `config.json`.
+    /// `model.gguf` and, for older artifacts, optional `tokenizer.json`
+    /// and `config.json` sidecars.
     pub fn moonshine_streaming_local(dir: impl Into<PathBuf>) -> Self {
         let dir = dir.into();
         Self::new_with_family(

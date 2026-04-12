@@ -5,7 +5,10 @@ use tokenizers::Tokenizer;
 
 use crate::{
     moonshine_config::MoonshineStreamingConfig,
-    quantized::{moonshine::{Moonshine, MoonshineDecoderCache}, timestamps::extract_timestamps},
+    quantized::{
+        moonshine::{Moonshine, MoonshineDecoderCache, MoonshineEncoderStreamState},
+        timestamps::extract_timestamps,
+    },
     DecodingResult, Segment, TokenChunk, WhisperLanguage,
 };
 use fusor::{Device, Tensor, VarBuilder};
@@ -19,10 +22,12 @@ struct CandidateDecode {
 }
 
 struct MoonshineStreamState {
-    samples: Vec<f32>,
     word_timestamps: bool,
     sender: UnboundedSender<Segment>,
     last_candidate: Option<CandidateDecode>,
+    encoder_state: MoonshineEncoderStreamState,
+    prepared_encoder_hidden_states: Option<Tensor<3, f32>>,
+    last_decoded_finalized_frames: usize,
     emitted_tokens: usize,
     last_emitted_end_s: f32,
 }
@@ -36,6 +41,7 @@ pub(crate) struct MoonshineRuntime {
     sample_rate: usize,
     frame_len: usize,
     max_tokens_per_second: f32,
+    stream_decode_interval_frames: usize,
     alignment_heads: Option<&'static [[usize; 2]]>,
     streams: HashMap<u64, MoonshineStreamState>,
 }
@@ -58,6 +64,12 @@ impl MoonshineRuntime {
             .ok()
             .and_then(|value| value.parse().ok())
             .unwrap_or(6.5);
+        let stream_decode_interval_frames =
+            std::env::var("RWHISPER_MOONSHINE_STREAM_DECODE_MS")
+                .ok()
+                .and_then(|value| value.parse::<usize>().ok())
+                .map(|milliseconds| (milliseconds / 20).max(1))
+                .unwrap_or(50);
 
         let mut reader = std::io::Cursor::new(weights);
         let mut vb = VarBuilder::from_gguf(&mut reader).map_err(|err| {
@@ -75,6 +87,7 @@ impl MoonshineRuntime {
             sample_rate,
             frame_len,
             max_tokens_per_second,
+            stream_decode_interval_frames,
             alignment_heads,
             streams: HashMap::new(),
         })
@@ -86,7 +99,9 @@ impl MoonshineRuntime {
     ) -> Result<(), crate::model::WhisperLoadingError> {
         if let Some(language) = language {
             if !matches!(language, WhisperLanguage::English) {
-                return Err(crate::model::WhisperLoadingError::UnsupportedLanguage(language));
+                return Err(crate::model::WhisperLoadingError::UnsupportedLanguage(
+                    language,
+                ));
             }
         }
         Ok(())
@@ -100,6 +115,24 @@ impl MoonshineRuntime {
     fn max_new_tokens(&self, sample_count: usize) -> usize {
         let seconds = sample_count as f32 / self.sample_rate as f32;
         (seconds * self.max_tokens_per_second).ceil() as usize + 8
+    }
+
+    fn encode_prepared_full(
+        &mut self,
+        samples: &[f32],
+    ) -> Result<(Tensor<3, f32>, usize), crate::model::WhisperError> {
+        let encoder_hidden_states = self
+            .model
+            .encoder
+            .encode(&self.device, samples)
+            .map_err(crate::model::WhisperError::Fusor)?;
+        let total_frames = encoder_hidden_states.shape()[1];
+        let adapted_encoder_hidden_states = self
+            .model
+            .decoder
+            .prepare_encoder_hidden_states(&encoder_hidden_states)
+            .map_err(crate::model::WhisperError::Fusor)?;
+        Ok((adapted_encoder_hidden_states, total_frames))
     }
 
     async fn greedy_generate(
@@ -118,7 +151,11 @@ impl MoonshineRuntime {
                 .decode_cached(&decoder_inputs, &encoder_hidden_states, &mut decoder_cache)
                 .map_err(crate::model::WhisperError::Fusor)?;
             let last_index = logits.shape()[1].saturating_sub(1);
-            let last_logits = logits.narrow(1, last_index, 1).squeeze(1).squeeze(0).to_concrete();
+            let last_logits = logits
+                .narrow(1, last_index, 1)
+                .squeeze(1)
+                .squeeze(0)
+                .to_concrete();
             let logits = last_logits.as_slice().await?;
             let mut best_token = 0u32;
             let mut best_logit = f32::NEG_INFINITY;
@@ -156,7 +193,11 @@ impl MoonshineRuntime {
         let _ = self
             .model
             .decoder
-            .decode_prepared(decoder_inputs.as_slice(), encoder_hidden_states, Some(&mut cross_attentions))
+            .decode_prepared(
+                decoder_inputs.as_slice(),
+                encoder_hidden_states,
+                Some(&mut cross_attentions),
+            )
             .map_err(crate::model::WhisperError::Fusor)?;
 
         let mask = vec![vec![true; generated.len()]];
@@ -174,45 +215,139 @@ impl MoonshineRuntime {
         Ok(timestamps.into_iter().next().unwrap_or_default())
     }
 
-    async fn decode_candidate(
+    async fn decode_candidate_from_prepared(
         &mut self,
-        samples: &[f32],
+        adapted_encoder_hidden_states: &Tensor<3, f32>,
+        clip_end_s: f32,
+        usable_samples: usize,
+        compute_timestamps: bool,
     ) -> Result<Option<CandidateDecode>, crate::model::WhisperError> {
-        let samples = self.usable_samples(samples);
-        if samples.is_empty() {
+        let total_frames = adapted_encoder_hidden_states.shape()[1];
+        if usable_samples == 0 || total_frames == 0 {
             return Ok(None);
         }
 
-        let encoder_hidden_states = self
-            .model
-            .encoder
-            .encode(&self.device, samples)
-            .map_err(crate::model::WhisperError::Fusor)?;
-        let adapted_encoder_hidden_states = self
-            .model
-            .decoder
-            .prepare_encoder_hidden_states(&encoder_hidden_states)
-            .map_err(crate::model::WhisperError::Fusor)?;
-        let max_new_tokens = self.max_new_tokens(samples.len());
+        let max_new_tokens = self.max_new_tokens(usable_samples);
         let generated = self
-            .greedy_generate(&adapted_encoder_hidden_states, max_new_tokens)
+            .greedy_generate(adapted_encoder_hidden_states, max_new_tokens)
             .await?;
-        let clip_end_s = samples.len() as f32 / self.sample_rate as f32;
-        let seconds_per_frame = if encoder_hidden_states.shape()[1] == 0 {
+        let seconds_per_frame = if total_frames == 0 {
             0.0
         } else {
-            clip_end_s / encoder_hidden_states.shape()[1] as f32
+            clip_end_s / total_frames as f32
         };
-        let token_timestamps = self
-            .token_timestamps(&generated, &adapted_encoder_hidden_states, seconds_per_frame)
-            .await?;
+        let token_timestamps = if compute_timestamps {
+            self.token_timestamps(
+                &generated,
+                adapted_encoder_hidden_states,
+                seconds_per_frame,
+            )
+            .await?
+        } else {
+            Vec::new()
+        };
 
         Ok(Some(CandidateDecode {
             tokens: generated,
             token_timestamps,
             clip_end_s,
-            usable_samples: samples.len(),
+            usable_samples,
         }))
+    }
+
+    async fn populate_candidate_timestamps(
+        &mut self,
+        candidate: &mut CandidateDecode,
+        adapted_encoder_hidden_states: &Tensor<3, f32>,
+    ) -> Result<(), crate::model::WhisperError> {
+        if !candidate.token_timestamps.is_empty() || candidate.tokens.is_empty() {
+            return Ok(());
+        }
+        let total_frames = adapted_encoder_hidden_states.shape()[1];
+        let seconds_per_frame = if total_frames == 0 {
+            0.0
+        } else {
+            candidate.clip_end_s / total_frames as f32
+        };
+        candidate.token_timestamps = self
+            .token_timestamps(
+                &candidate.tokens,
+                adapted_encoder_hidden_states,
+                seconds_per_frame,
+            )
+            .await?;
+        Ok(())
+    }
+
+    async fn update_stream_candidate(
+        &mut self,
+        state: &mut MoonshineStreamState,
+        samples: &[f32],
+        flush: bool,
+    ) -> Result<Option<CandidateDecode>, crate::model::WhisperError> {
+        let encoder_append = self
+            .model
+            .encoder
+            .encode_stream(&self.device, &mut state.encoder_state, samples, flush)
+            .map_err(crate::model::WhisperError::Fusor)?;
+
+        let finalized_encoder_frames = state
+            .prepared_encoder_hidden_states
+            .as_ref()
+            .map(|tensor| tensor.shape()[1])
+            .unwrap_or(0);
+        if encoder_append.hidden_states.is_none()
+            && encoder_append.total_finalized_frames == finalized_encoder_frames
+        {
+            return Ok(state.last_candidate.clone());
+        }
+
+        if let Some(hidden_states) = encoder_append.hidden_states {
+            let start_pos = state
+                .prepared_encoder_hidden_states
+                .as_ref()
+                .map(|tensor| tensor.shape()[1])
+                .unwrap_or(0);
+            let prepared = self
+                .model
+                .decoder
+                .prepare_encoder_hidden_states_range(&hidden_states, start_pos)
+                .map_err(crate::model::WhisperError::Fusor)?;
+            state.prepared_encoder_hidden_states = Some(match state.prepared_encoder_hidden_states.take() {
+                Some(existing) => Tensor::cat([existing, prepared], 1).to_materialized_blocking(),
+                None => prepared,
+            });
+        }
+
+        let Some(prepared_encoder_hidden_states) = state.prepared_encoder_hidden_states.as_ref() else {
+            return Ok(None);
+        };
+        let newly_finalized_frames = encoder_append
+            .total_finalized_frames
+            .saturating_sub(state.last_decoded_finalized_frames);
+        if !flush && newly_finalized_frames < self.stream_decode_interval_frames {
+            return Ok(state.last_candidate.clone());
+        }
+
+        let clip_end_s = if encoder_append.total_seen_frames == 0 {
+            0.0
+        } else {
+            encoder_append.usable_input_samples as f32 / self.sample_rate as f32
+                * encoder_append.total_finalized_frames as f32
+                / encoder_append.total_seen_frames as f32
+        };
+        let candidate = self
+            .decode_candidate_from_prepared(
+            prepared_encoder_hidden_states,
+            clip_end_s,
+            encoder_append.usable_input_samples,
+            false,
+        )
+        .await?;
+        if candidate.is_some() {
+            state.last_decoded_finalized_frames = encoder_append.total_finalized_frames;
+        }
+        Ok(candidate)
     }
 
     fn decoding_result_from_tokens(
@@ -300,24 +435,54 @@ impl MoonshineRuntime {
             return Ok(None);
         }
 
-        let tokens = &candidate.tokens[range.clone()];
+        let prefix_text = if range.start == 0 {
+            String::new()
+        } else {
+            self.tokenizer
+                .decode(&candidate.tokens[..range.start], true)
+                .map_err(crate::model::WhisperError::Tokenizer)?
+        };
         let token_timestamps = if candidate.token_timestamps.is_empty() {
             vec![]
         } else {
-            candidate.token_timestamps[range.clone()].to_vec()
+            candidate.token_timestamps[..range.end].to_vec()
         };
-        let result = self.decoding_result_from_tokens(
-            tokens,
+        let mut result = self.decoding_result_from_tokens(
+            &candidate.tokens[..range.end],
             &token_timestamps,
             word_timestamps,
             candidate.clip_end_s,
         )?;
+        if result.text.len() >= prefix_text.len() && result.text.starts_with(&prefix_text) {
+            let prefix_len = prefix_text.len();
+            result.text = result.text[prefix_len..].to_string();
+            result.chunks = result
+                .chunks
+                .into_iter()
+                .filter_map(|mut chunk| {
+                    if chunk.text_range.end <= prefix_len {
+                        return None;
+                    }
+                    chunk.text_range.start = chunk.text_range.start.saturating_sub(prefix_len);
+                    chunk.text_range.end -= prefix_len;
+                    Some(chunk)
+                })
+                .collect();
+        }
         if result.text.is_empty() {
             return Ok(None);
         }
 
-        let mut start_s = token_timestamps.first().copied().unwrap_or(fallback_start_s);
-        let mut end_s = token_timestamps.last().copied().unwrap_or(candidate.clip_end_s);
+        let total_tokens = candidate.tokens.len().max(1) as f32;
+        let mut start_s = token_timestamps
+            .get(range.start)
+            .copied()
+            .unwrap_or_else(|| candidate.clip_end_s * range.start as f32 / total_tokens);
+        let mut end_s = token_timestamps
+            .get(range.end.saturating_sub(1))
+            .copied()
+            .unwrap_or_else(|| candidate.clip_end_s * range.end as f32 / total_tokens);
+        start_s = start_s.max(fallback_start_s);
         if end_s <= start_s {
             end_s = candidate.clip_end_s.max(start_s);
         }
@@ -353,7 +518,21 @@ impl MoonshineRuntime {
                 err.to_string(),
             )));
         }
-        let Some(candidate) = self.decode_candidate(&samples).await? else {
+        let samples = self.usable_samples(&samples);
+        if samples.is_empty() {
+            return Ok(());
+        }
+        let (adapted_encoder_hidden_states, total_frames) = self.encode_prepared_full(samples)?;
+        let clip_end_s = samples.len() as f32 / self.sample_rate as f32;
+        let Some(candidate) = self
+            .decode_candidate_from_prepared(
+                &adapted_encoder_hidden_states,
+                if total_frames == 0 { 0.0 } else { clip_end_s },
+                samples.len(),
+                true,
+            )
+            .await?
+        else {
             return Ok(());
         };
         if let Some(segment) = self.segment_from_token_range(
@@ -379,10 +558,12 @@ impl MoonshineRuntime {
         self.streams.insert(
             session_id,
             MoonshineStreamState {
-                samples: Vec::new(),
                 word_timestamps,
                 sender,
                 last_candidate: None,
+                encoder_state: self.model.encoder.new_stream_state(),
+                prepared_encoder_hidden_states: None,
+                last_decoded_finalized_frames: 0,
                 emitted_tokens: 0,
                 last_emitted_end_s: 0.0,
             },
@@ -398,14 +579,28 @@ impl MoonshineRuntime {
         let Some(mut state) = self.streams.remove(&session_id) else {
             return Ok(());
         };
-        state.samples.extend(samples);
-        let Some(candidate) = self.decode_candidate(&state.samples).await? else {
+        let Some(mut candidate) = self
+            .update_stream_candidate(&mut state, &samples, false)
+            .await?
+        else {
             self.streams.insert(session_id, state);
             return Ok(());
         };
         if let Some(previous) = &state.last_candidate {
             let stable = self.common_prefix_len(&previous.tokens, &candidate.tokens);
             if stable > state.emitted_tokens {
+                if state.word_timestamps {
+                    if let Some(prepared_encoder_hidden_states) =
+                        state.prepared_encoder_hidden_states.as_ref()
+                    {
+                    let prepared_encoder_hidden_states = prepared_encoder_hidden_states.clone();
+                        self.populate_candidate_timestamps(
+                            &mut candidate,
+                            &prepared_encoder_hidden_states,
+                        )
+                        .await?;
+                    }
+                }
                 if let Some(segment) = self.segment_from_token_range(
                     state.emitted_tokens..stable,
                     &candidate,
@@ -431,9 +626,26 @@ impl MoonshineRuntime {
         let Some(state) = self.streams.remove(&session_id) else {
             return Ok(());
         };
-        let Some(candidate) = self.decode_candidate(&state.samples).await? else {
+        let mut state = state;
+        let Some(mut candidate) = self
+            .update_stream_candidate(&mut state, &[], true)
+            .await?
+        else {
             return Ok(());
         };
+        if state.emitted_tokens < candidate.tokens.len() {
+            if state.word_timestamps {
+                if let Some(prepared_encoder_hidden_states) =
+                    state.prepared_encoder_hidden_states.as_ref()
+                {
+                    self.populate_candidate_timestamps(
+                        &mut candidate,
+                        prepared_encoder_hidden_states,
+                    )
+                    .await?;
+                }
+            }
+        }
         if let Some(segment) = self.segment_from_token_range(
             state.emitted_tokens..candidate.tokens.len(),
             &candidate,

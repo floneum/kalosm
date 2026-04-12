@@ -1,7 +1,9 @@
+use futures_util::{stream, Stream};
 use kalosm::sound::*;
 use rodio::Decoder;
 use rodio::Source;
 use std::path::PathBuf;
+use std::pin::Pin;
 use std::time::Duration;
 
 #[tokio::main]
@@ -51,22 +53,54 @@ async fn main() -> Result<(), anyhow::Error> {
 
     // Load audio from a file
     let contents = std::fs::read("./models/rwhisper/examples/samples_jfk.wav").unwrap();
-    let audio = Decoder::new(std::io::Cursor::new(contents.clone())).unwrap();
     let max_seconds = std::env::var("RWHISPER_MAX_SECONDS")
         .ok()
         .and_then(|value| value.parse::<f32>().ok());
+    let streaming_chunk_ms = std::env::var("RWHISPER_STREAMING_CHUNK_MS")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok());
+    let timestamped = std::env::var("RWHISPER_TIMESTAMPED").ok().as_deref() == Some("1");
+
+    let audio = Decoder::new(std::io::Cursor::new(contents.clone())).unwrap();
     let rate = rodio::Source::sample_rate(&audio) as f32;
 
     // Transcribe the source audio into text
     eprintln!("Starting transcription...");
-    let mut text = if let Some(max_seconds) = max_seconds {
-        model.transcribe(audio.take_duration(Duration::from_secs_f32(max_seconds)))
+    let mut text: Pin<Box<dyn Stream<Item = Segment>>> = if let Some(chunk_ms) = streaming_chunk_ms
+    {
+        let channels = rodio::Source::channels(&audio);
+        let sample_rate = rodio::Source::sample_rate(&audio);
+        let samples = if let Some(max_seconds) = max_seconds {
+            audio
+                .take_duration(Duration::from_secs_f32(max_seconds))
+                .collect::<Vec<_>>()
+        } else {
+            audio.collect::<Vec<_>>()
+        };
+        let samples_per_chunk =
+            ((sample_rate as usize * chunk_ms) / 1000).max(1) * channels as usize;
+        let chunks = samples
+            .chunks(samples_per_chunk)
+            .map(|chunk| rodio::buffer::SamplesBuffer::new(channels, sample_rate, chunk.to_vec()))
+            .collect::<Vec<_>>();
+        let mut task = stream::iter(chunks).transcribe(model);
+        if timestamped {
+            task = task.timestamped();
+        }
+        Box::pin(task)
+    } else if let Some(max_seconds) = max_seconds {
+        let mut task = model.transcribe(audio.take_duration(Duration::from_secs_f32(max_seconds)));
+        if timestamped {
+            task = task.timestamped();
+        }
+        Box::pin(task)
     } else {
-        model.transcribe(audio)
+        let mut task = model.transcribe(audio);
+        if timestamped {
+            task = task.timestamped();
+        }
+        Box::pin(task)
     };
-    if std::env::var("RWHISPER_TIMESTAMPED").ok().as_deref() == Some("1") {
-        text = text.timestamped();
-    }
 
     eprintln!("Waiting for segments...");
     let mut segment_count = 0;

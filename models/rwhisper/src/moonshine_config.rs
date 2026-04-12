@@ -90,7 +90,6 @@ impl MoonshineStreamingEncoderConfig {
         self.head_dim
             .unwrap_or(self.hidden_size / self.num_attention_heads.max(1))
     }
-
 }
 
 #[derive(Debug, Clone, Deserialize)]

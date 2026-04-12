@@ -57,6 +57,9 @@ pub enum WhisperLoadingError {
     /// An error that can occur when trying to load the whisper config.
     #[error("Failed to load config: {0}")]
     LoadConfig(serde_json::Error),
+    /// An error that can occur when trying to read embedded GGUF metadata.
+    #[error("Failed to read embedded GGUF metadata: {0}")]
+    EmbeddedMetadata(fusor::GgufReadError),
     /// Unsupported mel filter length
     #[error("Unsupported mel filter length: {0}; only 80 and 128 are supported")]
     UnsupportedMelFilterLength(usize),
@@ -161,11 +164,7 @@ impl WhisperInner {
                 let config: MoonshineStreamingConfig =
                     serde_json::from_slice(config).map_err(WhisperLoadingError::LoadConfig)?;
                 Ok(Self::Moonshine(MoonshineRuntime::new(
-                    device,
-                    weights,
-                    tokenizer,
-                    config,
-                    heads,
+                    device, weights, tokenizer, config, heads,
                 )?))
             }
         }

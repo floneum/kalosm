@@ -71,6 +71,55 @@ mod config;
 mod quantized;
 
 static NEXT_STREAM_SESSION_ID: AtomicU64 = AtomicU64::new(1);
+const GGUF_TOKENIZER_JSON_METADATA_KEY: &str = "rwhisper.tokenizer.json";
+const GGUF_CONFIG_JSON_METADATA_KEY: &str = "rwhisper.config.json";
+
+async fn load_source_bytes(
+    cache: &Cache,
+    source: &FileSource,
+    display_name: impl Display,
+    progress_handler: &mut impl FnMut(ModelLoadingProgress),
+) -> Result<Vec<u8>, WhisperLoadingError> {
+    let mut create_progress = ModelLoadingProgress::downloading_progress(display_name.to_string());
+    let bytes = match source {
+        FileSource::Local(path) => {
+            let size = std::fs::metadata(path)
+                .map_err(kalosm_common::CacheError::from)?
+                .len();
+            progress_handler(create_progress(kalosm_model_types::FileLoadingProgress {
+                start_time: None,
+                cached_size: 0,
+                size,
+                progress: size,
+            }));
+            std::fs::read(path).map_err(kalosm_common::CacheError::from)?
+        }
+        _ => {
+            cache
+                .get_bytes(source, |progress| {
+                    progress_handler(create_progress(progress))
+                })
+                .await?
+        }
+    };
+    Ok(bytes)
+}
+
+fn embedded_json_bytes(
+    model: &[u8],
+    metadata_key: &str,
+) -> Result<Option<Vec<u8>>, WhisperLoadingError> {
+    let mut reader = std::io::Cursor::new(model);
+    let vb =
+        fusor::VarBuilder::from_gguf(&mut reader).map_err(WhisperLoadingError::EmbeddedMetadata)?;
+    let Some(value) = vb.get_metadata(metadata_key) else {
+        return Ok(None);
+    };
+    let value = value
+        .to_string()
+        .map_err(WhisperLoadingError::EmbeddedMetadata)?;
+    Ok(Some(value.as_bytes().to_vec()))
+}
 
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 struct DecodingResult {
@@ -446,9 +495,11 @@ impl ModelBuilder for WhisperBuilder {
     fn requires_download(&self) -> bool {
         let whisper = &self.model;
         let cache = Cache::default();
-        !cache.exists(&whisper.model)
-            || !cache.exists(&whisper.tokenizer)
-            || !cache.exists(&whisper.config)
+        if !cache.exists(&whisper.model) {
+            return true;
+        }
+        !matches!(whisper.family, ModelFamily::MoonshineStreaming { .. })
+            && (!cache.exists(&whisper.tokenizer) || !cache.exists(&whisper.config))
     }
 }
 
@@ -486,84 +537,42 @@ impl WhisperBuilder {
         self,
         mut progress_handler: impl FnMut(ModelLoadingProgress) + 'static,
     ) -> Result<Whisper, WhisperLoadingError> {
-        // Download section
         let whisper = self.model.clone();
-        let tokenizer_source = &whisper.tokenizer;
         let model_source = &whisper.model;
-        let config_source = &whisper.config;
+        let model = load_source_bytes(
+            &self.cache,
+            model_source,
+            format!("Model ({model_source})"),
+            &mut progress_handler,
+        )
+        .await?;
 
-        let display_tokenizer_source = format!("Tokenizer ({tokenizer_source})");
-        let mut create_progress =
-            ModelLoadingProgress::downloading_progress(display_tokenizer_source);
-        let tokenizer = match tokenizer_source {
-            FileSource::Local(path) => {
-                let size = std::fs::metadata(path)
-                    .map_err(kalosm_common::CacheError::from)?
-                    .len();
-                progress_handler(create_progress(kalosm_model_types::FileLoadingProgress {
-                    start_time: None,
-                    cached_size: 0,
-                    size,
-                    progress: size,
-                }));
-                std::fs::read(path).map_err(kalosm_common::CacheError::from)?
-            }
-            _ => {
-                self.cache
-                    .get_bytes(tokenizer_source, |progress| {
-                        progress_handler(create_progress(progress))
-                    })
-                    .await?
-            }
+        let tokenizer = if let Some(tokenizer) =
+            embedded_json_bytes(&model, GGUF_TOKENIZER_JSON_METADATA_KEY)?
+        {
+            tokenizer
+        } else {
+            load_source_bytes(
+                &self.cache,
+                &whisper.tokenizer,
+                format!("Tokenizer ({})", whisper.tokenizer),
+                &mut progress_handler,
+            )
+            .await?
         };
 
-        let display_model_source = format!("Model ({model_source})");
-        let mut create_progress = ModelLoadingProgress::downloading_progress(display_model_source);
-        let model = match model_source {
-            FileSource::Local(path) => {
-                let size = std::fs::metadata(path)
-                    .map_err(kalosm_common::CacheError::from)?
-                    .len();
-                progress_handler(create_progress(kalosm_model_types::FileLoadingProgress {
-                    start_time: None,
-                    cached_size: 0,
-                    size,
-                    progress: size,
-                }));
-                std::fs::read(path).map_err(kalosm_common::CacheError::from)?
-            }
-            _ => {
-                self.cache
-                    .get_bytes(model_source, |progress| {
-                        progress_handler(create_progress(progress))
-                    })
-                    .await?
-            }
-        };
-
-        let display_config_source = format!("Config ({config_source})");
-        let mut create_progress = ModelLoadingProgress::downloading_progress(display_config_source);
-        let config = match config_source {
-            FileSource::Local(path) => {
-                let size = std::fs::metadata(path)
-                    .map_err(kalosm_common::CacheError::from)?
-                    .len();
-                progress_handler(create_progress(kalosm_model_types::FileLoadingProgress {
-                    start_time: None,
-                    cached_size: 0,
-                    size,
-                    progress: size,
-                }));
-                std::fs::read(path).map_err(kalosm_common::CacheError::from)?
-            }
-            _ => {
-                self.cache
-                    .get_bytes(config_source, |progress| {
-                        progress_handler(create_progress(progress))
-                    })
-                    .await?
-            }
-        };
+        let config =
+            if let Some(config) = embedded_json_bytes(&model, GGUF_CONFIG_JSON_METADATA_KEY)? {
+                config
+            } else {
+                load_source_bytes(
+                    &self.cache,
+                    &whisper.config,
+                    format!("Config ({})", whisper.config),
+                    &mut progress_handler,
+                )
+                .await?
+            };
 
         let (tx, rx) = futures_channel::mpsc::unbounded::<WhisperMessage>();
         let mut model = WhisperInner::new(self, &model, &tokenizer, &config).await?;
@@ -590,7 +599,10 @@ impl WhisperBuilder {
                             tracing::error!("Error starting transcription stream: {err}");
                         }
                     }
-                    WhisperMessage::AppendStream { session_id, samples } => {
+                    WhisperMessage::AppendStream {
+                        session_id,
+                        samples,
+                    } => {
                         if let Err(err) = model.push_stream_audio(session_id, samples).await {
                             tracing::error!("Error updating transcription stream: {err}");
                         }
@@ -619,7 +631,10 @@ impl WhisperBuilder {
                     } => apply_speech_filter,
                     ModelFamily::CohereTranscribe => false,
                 },
-                supports_streaming: matches!(whisper.family, ModelFamily::MoonshineStreaming { .. }),
+                supports_streaming: matches!(
+                    whisper.family,
+                    ModelFamily::MoonshineStreaming { .. }
+                ),
             }),
         })
     }

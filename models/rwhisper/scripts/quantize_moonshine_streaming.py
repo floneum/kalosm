@@ -228,11 +228,32 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--input", type=Path, required=True, help="Path to model.safetensors")
     parser.add_argument("--output", type=Path, required=True, help="Path to output model.gguf")
+    parser.add_argument(
+        "--tokenizer",
+        type=Path,
+        help="Path to tokenizer.json (defaults to a tokenizer.json next to --input)",
+    )
+    parser.add_argument(
+        "--config",
+        type=Path,
+        help="Path to config.json (defaults to a config.json next to --input)",
+    )
     args = parser.parse_args()
+
+    tokenizer_path = args.tokenizer or args.input.with_name("tokenizer.json")
+    config_path = args.config or args.input.with_name("config.json")
+    if not tokenizer_path.exists():
+        raise FileNotFoundError(f"missing tokenizer json: {tokenizer_path}")
+    if not config_path.exists():
+        raise FileNotFoundError(f"missing config json: {config_path}")
+    tokenizer_json = tokenizer_path.read_text(encoding="utf-8")
+    config_json = config_path.read_text(encoding="utf-8")
 
     metadata = {
         "general.architecture": ("string", "moonshine_streaming_asr"),
         "general.alignment": ("u32", ALIGNMENT),
+        "rwhisper.tokenizer.json": ("string", tokenizer_json),
+        "rwhisper.config.json": ("string", config_json),
     }
 
     data_base, source_tensors = load_safetensors_index(args.input)

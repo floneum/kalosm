@@ -33,11 +33,7 @@ fn tensor1d(device: &Device, vb: &mut VarBuilder, name: &str) -> Result<Tensor<1
     })
 }
 
-fn conv1d(
-    config: Conv1dConfig,
-    device: &Device,
-    vb: &mut VarBuilder,
-) -> Result<Conv1d<f32>> {
+fn conv1d(config: Conv1dConfig, device: &Device, vb: &mut VarBuilder) -> Result<Conv1d<f32>> {
     let weight_q = vb.get("weight", device)?;
     let weight_shape = weight_q.shape();
     let weight: Tensor<3, f32> = if weight_shape.len() == 3 {
@@ -47,9 +43,7 @@ fn conv1d(
         let kernel = 5usize;
         let in_channels = weight_shape[1] / kernel;
         let weight_2d: Tensor<2, f32> = weight_q.dequantize();
-        weight_2d
-            .reshape([out, in_channels, kernel])
-            .to_concrete()
+        weight_2d.reshape([out, in_channels, kernel]).to_concrete()
     };
     let bias = vb.get("bias", device).ok().map(|bias_q| {
         let bias_shape = bias_q.shape();
@@ -119,6 +113,29 @@ fn sliding_window_mask(
     Tensor::from_slice(device, [1, 1, seq_len, seq_len], &data)
 }
 
+fn streaming_sliding_window_mask(
+    device: &Device,
+    query_start: usize,
+    query_len: usize,
+    key_len: usize,
+    left: usize,
+    right: usize,
+) -> Tensor<4, f32> {
+    let mut data = vec![f32::NEG_INFINITY; query_len * key_len];
+    for q in 0..query_len {
+        let query_index = query_start + q;
+        for k in 0..key_len {
+            let dist = query_index as isize - k as isize;
+            let allowed =
+                (dist >= 0 && dist < left as isize) || (dist < 0 && -dist < right as isize);
+            if allowed {
+                data[q * key_len + k] = 0.0;
+            }
+        }
+    }
+    Tensor::from_slice(device, [1, 1, query_len, key_len], &data)
+}
+
 fn causal_mask(device: &Device, seq_len: usize) -> Tensor<4, f32> {
     let mut data = vec![0.0f32; seq_len * seq_len];
     for q in 0..seq_len {
@@ -158,6 +175,7 @@ impl UnitOffsetLayerNorm {
     }
 }
 
+#[derive(Clone)]
 struct MoonshineAttentionCache {
     kv_cache: KvCache<f32>,
 }
@@ -444,6 +462,30 @@ struct MoonshineEncoderLayer {
     mlp: MoonshineEncoderMlp,
 }
 
+#[derive(Clone, Default)]
+pub struct MoonshineEncoderLayerStreamState {
+    left_context_inputs: Option<Tensor<3, f32>>,
+    pending_inputs: Option<Tensor<3, f32>>,
+}
+
+pub struct MoonshineEncoderStreamState {
+    sample_remainder: Vec<f32>,
+    linear_tail: Option<Tensor<3, f32>>,
+    total_linear_frames: usize,
+    conv1_tail: Option<Tensor<3, f32>>,
+    total_conv1_frames: usize,
+    layer_states: Vec<MoonshineEncoderLayerStreamState>,
+    total_seen_frames: usize,
+    total_finalized_frames: usize,
+}
+
+pub struct MoonshineEncoderStreamAppend {
+    pub hidden_states: Option<Tensor<3, f32>>,
+    pub total_seen_frames: usize,
+    pub total_finalized_frames: usize,
+    pub usable_input_samples: usize,
+}
+
 impl MoonshineEncoderLayer {
     fn load(
         config: &MoonshineStreamingEncoderConfig,
@@ -487,6 +529,98 @@ impl MoonshineEncoderLayer {
         let mlp = self.mlp.forward(&mlp_in);
         Ok((hidden_states + mlp).to_concrete())
     }
+
+    fn forward_stream(
+        &self,
+        device: &Device,
+        new_hidden_states: Option<Tensor<3, f32>>,
+        state: &mut MoonshineEncoderLayerStreamState,
+        left: usize,
+        right: usize,
+        flush: bool,
+    ) -> Result<Option<Tensor<3, f32>>> {
+        let left_context_len = state
+            .left_context_inputs
+            .as_ref()
+            .map(|tensor| tensor.shape()[1])
+            .unwrap_or(0);
+        let pending_len = state
+            .pending_inputs
+            .as_ref()
+            .map(|tensor| tensor.shape()[1])
+            .unwrap_or(0);
+        let new_len = new_hidden_states
+            .as_ref()
+            .map(|tensor| tensor.shape()[1])
+            .unwrap_or(0);
+        let working_len = pending_len + new_len;
+        if left_context_len + working_len == 0 {
+            return Ok(None);
+        }
+
+        let mut parts = Vec::with_capacity(3);
+        if let Some(left_context_inputs) = &state.left_context_inputs {
+            parts.push(left_context_inputs.clone());
+        }
+        if let Some(pending_inputs) = &state.pending_inputs {
+            parts.push(pending_inputs.clone());
+        }
+        if let Some(new_hidden_states) = new_hidden_states {
+            parts.push(new_hidden_states);
+        }
+        let combined_inputs = Tensor::cat(parts, 1).to_materialized_blocking();
+
+        let emit_len = if flush {
+            working_len
+        } else {
+            working_len.saturating_sub(right)
+        };
+        let pending_start = left_context_len + emit_len;
+        let pending_len = working_len.saturating_sub(emit_len);
+        state.pending_inputs = (pending_len > 0).then(|| {
+            combined_inputs
+                .narrow(1, pending_start, pending_len)
+                .to_materialized_blocking()
+        });
+
+        let finalized_input_end = left_context_len + emit_len;
+        let keep_left = left.min(finalized_input_end);
+        state.left_context_inputs = (keep_left > 0).then(|| {
+            combined_inputs
+                .narrow(1, finalized_input_end - keep_left, keep_left)
+                .to_materialized_blocking()
+        });
+
+        if emit_len == 0 {
+            return Ok(None);
+        }
+
+        let key_value_inputs = self.input_layernorm.forward(&combined_inputs);
+        let query_inputs = key_value_inputs
+            .narrow(1, left_context_len, emit_len)
+            .to_concrete();
+        let residual_inputs = combined_inputs
+            .narrow(1, left_context_len, emit_len)
+            .to_concrete();
+        let attention_mask = streaming_sliding_window_mask(
+            device,
+            left_context_len,
+            emit_len,
+            combined_inputs.shape()[1],
+            left,
+            right,
+        );
+        let attn = self.self_attn.forward(
+            &query_inputs,
+            &key_value_inputs,
+            Some(&attention_mask),
+            None,
+        )?;
+        let hidden_states = (residual_inputs + &attn).to_concrete();
+        let mlp_in = self.post_attention_layernorm.forward(&hidden_states);
+        let mlp = self.mlp.forward(&mlp_in);
+        Ok(Some((hidden_states + mlp).to_concrete()))
+    }
 }
 
 struct MoonshineDecoderLayer {
@@ -498,6 +632,7 @@ struct MoonshineDecoderLayer {
     mlp: MoonshineDecoderMlp,
 }
 
+#[derive(Clone)]
 struct MoonshineDecoderLayerCache {
     self_attn: MoonshineAttentionCache,
     cross_attn_kv: (Tensor<3, f32>, Tensor<3, f32>),
@@ -534,11 +669,7 @@ impl MoonshineDecoderLayer {
                 1e-5,
             )?,
             final_layernorm: LayerNorm::load(device, &mut vb.pp("final_layernorm"), 1e-5)?,
-            mlp: MoonshineDecoderMlp::load(
-                device,
-                &mut vb.pp("mlp"),
-                config.intermediate_size,
-            )?,
+            mlp: MoonshineDecoderMlp::load(device, &mut vb.pp("mlp"), config.intermediate_size)?,
         })
     }
 
@@ -550,9 +681,9 @@ impl MoonshineDecoderLayer {
         attention_output: Option<&mut Vec<Tensor<4, f32>>>,
     ) -> Result<Tensor<3, f32>> {
         let self_attn_in = self.input_layernorm.forward_fused(hidden_states);
-        let self_attn = self
-            .self_attn
-            .forward(&self_attn_in, &self_attn_in, Some(causal_mask), None)?;
+        let self_attn =
+            self.self_attn
+                .forward(&self_attn_in, &self_attn_in, Some(causal_mask), None)?;
         let hidden_states = (hidden_states + &self_attn).to_concrete();
 
         let cross_attn_in = self.post_attention_layernorm.forward_fused(&hidden_states);
@@ -620,6 +751,23 @@ pub struct MoonshineEncoder {
     config: MoonshineStreamingEncoderConfig,
 }
 
+impl MoonshineEncoderStreamState {
+    fn new(layer_count: usize) -> Self {
+        Self {
+            sample_remainder: Vec::new(),
+            linear_tail: None,
+            total_linear_frames: 0,
+            conv1_tail: None,
+            total_conv1_frames: 0,
+            layer_states: (0..layer_count)
+                .map(|_| MoonshineEncoderLayerStreamState::default())
+                .collect(),
+            total_seen_frames: 0,
+            total_finalized_frames: 0,
+        }
+    }
+}
+
 impl MoonshineEncoder {
     fn load(
         config: &MoonshineStreamingEncoderConfig,
@@ -633,7 +781,9 @@ impl MoonshineEncoder {
             dilation: 1,
         };
         let layers = (0..config.num_hidden_layers)
-            .map(|idx| MoonshineEncoderLayer::load(config, device, &mut vb.pp(format!("layers.{idx}"))))
+            .map(|idx| {
+                MoonshineEncoderLayer::load(config, device, &mut vb.pp(format!("layers.{idx}")))
+            })
             .collect::<Result<Vec<_>>>()?;
         let compression_log_k = {
             let log_k_q = vb.pp("embedder.comp").get("log_k", device)?;
@@ -655,6 +805,198 @@ impl MoonshineEncoder {
         flatten_frames(samples, self.config.frame_len(), self.compression_log_k)
     }
 
+    pub fn new_stream_state(&self) -> MoonshineEncoderStreamState {
+        MoonshineEncoderStreamState::new(self.layers.len())
+    }
+
+    fn ceil_div_2(value: usize) -> usize {
+        (value + 1) / 2
+    }
+
+    fn take_last_len(
+        tensor: &Tensor<3, f32>,
+        dim: usize,
+        max_len: usize,
+    ) -> Option<Tensor<3, f32>> {
+        let len = tensor.shape()[dim].min(max_len);
+        (len > 0).then(|| {
+            tensor
+                .narrow(dim, tensor.shape()[dim] - len, len)
+                .to_materialized_blocking()
+        })
+    }
+
+    fn append_tail(
+        previous_tail: Option<&Tensor<3, f32>>,
+        new_values: &Tensor<3, f32>,
+        dim: usize,
+        max_len: usize,
+    ) -> Option<Tensor<3, f32>> {
+        let combined = match previous_tail {
+            Some(previous_tail) => Tensor::cat([previous_tail.clone(), new_values.clone()], dim),
+            None => new_values.clone(),
+        };
+        Self::take_last_len(&combined, dim, max_len)
+    }
+
+    fn append_conv1_outputs(
+        &self,
+        new_linear: Option<Tensor<3, f32>>,
+        state: &mut MoonshineEncoderStreamState,
+    ) -> Option<Tensor<3, f32>> {
+        let Some(new_linear) = new_linear else {
+            return None;
+        };
+        let old_linear_frames = state.total_linear_frames;
+        let old_conv1_frames = state.total_conv1_frames;
+        let new_linear_frames = new_linear.shape()[2];
+        let total_linear_frames = old_linear_frames + new_linear_frames;
+        let total_conv1_frames = Self::ceil_div_2(total_linear_frames);
+        let new_conv1_frames = total_conv1_frames.saturating_sub(old_conv1_frames);
+
+        let output = if old_linear_frames == 0 {
+            self.conv1
+                .forward(&causal_pad_1d(&new_linear, self.config.hidden_size, 4))
+                .silu()
+                .to_concrete()
+        } else {
+            let start_frame = old_conv1_frames.saturating_mul(2).saturating_sub(4);
+            let prefix_len = old_linear_frames.saturating_sub(start_frame);
+            let mut parts = Vec::with_capacity(2);
+            if prefix_len > 0 {
+                if let Some(tail) = &state.linear_tail {
+                    parts.push(
+                        tail.narrow(2, tail.shape()[2] - prefix_len, prefix_len)
+                            .to_concrete(),
+                    );
+                }
+            }
+            parts.push(new_linear.clone());
+            let window = Tensor::cat(parts, 2);
+            self.conv1.forward(&window).silu().to_concrete()
+        };
+
+        state.linear_tail = Self::append_tail(state.linear_tail.as_ref(), &new_linear, 2, 4);
+        state.total_linear_frames = total_linear_frames;
+        state.total_conv1_frames = total_conv1_frames;
+
+        (new_conv1_frames > 0).then(|| {
+            output
+                .narrow(2, output.shape()[2] - new_conv1_frames, new_conv1_frames)
+                .to_materialized_blocking()
+        })
+    }
+
+    fn append_encoder_outputs(
+        &self,
+        new_conv1: Option<Tensor<3, f32>>,
+        state: &mut MoonshineEncoderStreamState,
+    ) -> Option<Tensor<3, f32>> {
+        let Some(new_conv1) = new_conv1 else {
+            return None;
+        };
+        let old_conv1_frames = state.total_conv1_frames.saturating_sub(new_conv1.shape()[2]);
+        let old_seen_frames = state.total_seen_frames;
+        let total_conv1_frames = state.total_conv1_frames;
+        let total_seen_frames = Self::ceil_div_2(total_conv1_frames);
+        let new_seen_frames = total_seen_frames.saturating_sub(old_seen_frames);
+
+        let output = if old_conv1_frames == 0 {
+            self.conv2
+                .forward(&causal_pad_1d(
+                    &new_conv1,
+                    self.config.hidden_size * 2,
+                    4,
+                ))
+                .transpose(1, 2)
+                .to_concrete()
+        } else {
+            let start_frame = old_seen_frames.saturating_mul(2).saturating_sub(4);
+            let prefix_len = old_conv1_frames.saturating_sub(start_frame);
+            let mut parts = Vec::with_capacity(2);
+            if prefix_len > 0 {
+                if let Some(tail) = &state.conv1_tail {
+                    parts.push(
+                        tail.narrow(2, tail.shape()[2] - prefix_len, prefix_len)
+                            .to_concrete(),
+                    );
+                }
+            }
+            parts.push(new_conv1.clone());
+            let window = Tensor::cat(parts, 2);
+            self.conv2.forward(&window).transpose(1, 2).to_concrete()
+        };
+
+        state.conv1_tail = Self::append_tail(state.conv1_tail.as_ref(), &new_conv1, 2, 4);
+        state.total_seen_frames = total_seen_frames;
+
+        (new_seen_frames > 0).then(|| {
+            output
+                .narrow(1, output.shape()[1] - new_seen_frames, new_seen_frames)
+                .to_materialized_blocking()
+        })
+    }
+
+    pub fn encode_stream(
+        &self,
+        device: &Device,
+        state: &mut MoonshineEncoderStreamState,
+        samples: &[f32],
+        flush: bool,
+    ) -> Result<MoonshineEncoderStreamAppend> {
+        if !samples.is_empty() {
+            state.sample_remainder.extend_from_slice(samples);
+        }
+        let frame_len = self.config.frame_len();
+        let usable_sample_count = state.sample_remainder.len() / frame_len * frame_len;
+        let new_hidden_states = if usable_sample_count > 0 {
+            let frames = self.preprocess(&state.sample_remainder[..usable_sample_count]);
+            state.sample_remainder.drain(..usable_sample_count);
+            let frame_count = frames.len() / frame_len;
+            let hidden_states = Tensor::from_slice(device, [1, frame_count, frame_len], &frames);
+            let hidden_states = self.linear.forward(&hidden_states).silu().to_concrete();
+            Some(hidden_states.transpose(1, 2).to_concrete())
+        } else {
+            None
+        };
+
+        let mut hidden_states = self.append_conv1_outputs(new_hidden_states, state);
+        hidden_states = self.append_encoder_outputs(hidden_states, state);
+
+        for (idx, layer) in self.layers.iter().enumerate() {
+            let window = self.config.sliding_windows[idx];
+            hidden_states = layer.forward_stream(
+                device,
+                hidden_states,
+                &mut state.layer_states[idx],
+                window[0],
+                window[1],
+                flush,
+            )?;
+            if let Some(layer_hidden_states) = &hidden_states {
+                if (idx + 1) % 4 == 0 {
+                    materialize_if_gpu(layer_hidden_states);
+                }
+            }
+        }
+
+        let finalized_hidden_states = hidden_states.map(|hidden_states| {
+            self.final_norm
+                .forward(&hidden_states)
+                .to_materialized_blocking()
+        });
+        if let Some(finalized_hidden_states) = &finalized_hidden_states {
+            state.total_finalized_frames += finalized_hidden_states.shape()[1];
+        }
+
+        Ok(MoonshineEncoderStreamAppend {
+            hidden_states: finalized_hidden_states,
+            total_seen_frames: state.total_seen_frames,
+            total_finalized_frames: state.total_finalized_frames,
+            usable_input_samples: state.total_linear_frames * frame_len,
+        })
+    }
+
     pub fn encode(&self, device: &Device, samples: &[f32]) -> Result<Tensor<3, f32>> {
         let frames = self.preprocess(samples);
         let frame_len = self.config.frame_len();
@@ -672,7 +1014,11 @@ impl MoonshineEncoder {
             .to_concrete();
         hidden_states = self
             .conv2
-            .forward(&causal_pad_1d(&hidden_states, self.config.hidden_size * 2, 4))
+            .forward(&causal_pad_1d(
+                &hidden_states,
+                self.config.hidden_size * 2,
+                4,
+            ))
             .transpose(1, 2)
             .to_concrete();
 
@@ -702,10 +1048,11 @@ pub struct MoonshineDecoder {
     config: MoonshineStreamingConfig,
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct MoonshineDecoderCache {
     tokens: Vec<u32>,
     layers: Vec<MoonshineDecoderLayerCache>,
+    encoder_seq_len: usize,
 }
 
 impl MoonshineDecoder {
@@ -746,12 +1093,18 @@ impl MoonshineDecoder {
         })
     }
 
-    fn adapt_encoder(&self, encoder_hidden_states: &Tensor<3, f32>) -> Result<Tensor<3, f32>> {
+    fn adapt_encoder(
+        &self,
+        encoder_hidden_states: &Tensor<3, f32>,
+        start_pos: usize,
+    ) -> Result<Tensor<3, f32>> {
         let [_, seq_len, _] = encoder_hidden_states.shape();
-        if seq_len > self.config.max_position_embeddings {
-            return Err(Error::msg("moonshine encoder sequence exceeds max_position_embeddings"));
+        if start_pos + seq_len > self.config.max_position_embeddings {
+            return Err(Error::msg(
+                "moonshine encoder sequence exceeds max_position_embeddings",
+            ));
         }
-        let positions: Vec<u32> = (0..seq_len as u32).collect();
+        let positions: Vec<u32> = (start_pos as u32..(start_pos + seq_len) as u32).collect();
         let position_ids: Tensor<1, u32> = Tensor::new(&encoder_hidden_states.device(), &positions);
         let position_embeddings: Tensor<2, f32> = self.pos_embedding.forward(&position_ids);
         let position_embeddings = position_embeddings.unsqueeze(0).to_concrete();
@@ -766,7 +1119,17 @@ impl MoonshineDecoder {
         &self,
         encoder_hidden_states: &Tensor<3, f32>,
     ) -> Result<Tensor<3, f32>> {
-        Ok(self.adapt_encoder(encoder_hidden_states)?.to_materialized_blocking())
+        self.prepare_encoder_hidden_states_range(encoder_hidden_states, 0)
+    }
+
+    pub fn prepare_encoder_hidden_states_range(
+        &self,
+        encoder_hidden_states: &Tensor<3, f32>,
+        start_pos: usize,
+    ) -> Result<Tensor<3, f32>> {
+        Ok(self
+            .adapt_encoder(encoder_hidden_states, start_pos)?
+            .to_materialized_blocking())
     }
 
     pub fn decode_prepared(
@@ -809,6 +1172,7 @@ impl MoonshineDecoder {
             ));
         }
         cache.tokens.extend_from_slice(tokens);
+        self.sync_cross_attention_kv(encoder_hidden_states, cache)?;
 
         let device = encoder_hidden_states.device();
         let self_mask = self.mask_cache.get_mask(seq_len, index_pos, None, &device);
@@ -838,6 +1202,7 @@ impl MoonshineDecoder {
             materialize_if_gpu(&hidden_states);
         }
 
+        cache.encoder_seq_len = encoder_hidden_states.shape()[1];
         let hidden_states = self.norm.forward_fused(&hidden_states);
         Ok(self.output.forward(&hidden_states))
     }
@@ -850,6 +1215,40 @@ impl MoonshineDecoder {
     ) -> Result<Tensor<3, f32>> {
         let encoder_hidden_states = self.prepare_encoder_hidden_states(encoder_hidden_states)?;
         self.decode_prepared(tokens, &encoder_hidden_states, attention_output)
+    }
+
+    fn sync_cross_attention_kv(
+        &mut self,
+        encoder_hidden_states: &Tensor<3, f32>,
+        cache: &mut MoonshineDecoderCache,
+    ) -> Result<()> {
+        let encoder_seq_len = encoder_hidden_states.shape()[1];
+        if encoder_seq_len == 0 {
+            cache.encoder_seq_len = 0;
+            return Ok(());
+        }
+        if cache.layers.is_empty() || cache.encoder_seq_len >= encoder_seq_len {
+            return Ok(());
+        }
+
+        let new_encoder_hidden_states = encoder_hidden_states
+            .narrow(1, cache.encoder_seq_len, encoder_seq_len - cache.encoder_seq_len)
+            .to_materialized_blocking();
+        for (layer, layer_cache) in self.layers.iter_mut().zip(cache.layers.iter_mut()) {
+            let new_cross_attn_kv = layer.encoder_attn.project_kv(&new_encoder_hidden_states);
+            let materialized = Tensor::to_materialized_many_blocking(&[
+                &new_cross_attn_kv.0,
+                &new_cross_attn_kv.1,
+            ]);
+            layer_cache.cross_attn_kv = (
+                Tensor::cat([layer_cache.cross_attn_kv.0.clone(), materialized[0].clone()], 1)
+                    .to_materialized_blocking(),
+                Tensor::cat([layer_cache.cross_attn_kv.1.clone(), materialized[1].clone()], 1)
+                    .to_materialized_blocking(),
+            );
+        }
+        cache.encoder_seq_len = encoder_seq_len;
+        Ok(())
     }
 }
 
@@ -864,7 +1263,8 @@ impl Moonshine {
         vb: &mut VarBuilder,
         config: MoonshineStreamingConfig,
     ) -> Result<Self> {
-        let encoder = MoonshineEncoder::load(&config.encoder_config, device, &mut vb.pp("model.encoder"))?;
+        let encoder =
+            MoonshineEncoder::load(&config.encoder_config, device, &mut vb.pp("model.encoder"))?;
         let decoder = MoonshineDecoder::load(&config, device, &mut vb.pp("model.decoder"))?;
         Ok(Self { encoder, decoder })
     }
@@ -951,6 +1351,59 @@ mod tests {
         assert!(
             max_diff < 1e-3,
             "cached decode diverged from full decode: max_diff={max_diff}"
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires a local Moonshine tiny artifact directory"]
+    async fn streaming_encoder_matches_full_encoder() {
+        let Some(dir) = tiny_artifact_dir() else {
+            return;
+        };
+
+        let config: MoonshineStreamingConfig =
+            serde_json::from_slice(&fs::read(dir.join("config.json")).unwrap()).unwrap();
+        let weights = fs::read(dir.join("model.gguf")).unwrap();
+        let device = Device::cpu();
+        let mut reader = Cursor::new(weights);
+        let mut vb = VarBuilder::from_gguf(&mut reader).unwrap();
+        let model = Moonshine::load(&device, &mut vb, config.clone()).unwrap();
+
+        let samples = vec![0.0f32; config.encoder_config.frame_len() * 127];
+        let full = model.encoder.encode(&device, &samples).unwrap();
+        let full = full.as_slice().await.unwrap();
+
+        let mut stream_state = model.encoder.new_stream_state();
+        let mut streamed_parts = Vec::new();
+        for chunk in samples.chunks(config.encoder_config.frame_len() * 11) {
+            let append = model
+                .encoder
+                .encode_stream(&device, &mut stream_state, chunk, false)
+                .unwrap();
+            if let Some(hidden_states) = append.hidden_states {
+                streamed_parts.push(hidden_states);
+            }
+        }
+        let append = model
+            .encoder
+            .encode_stream(&device, &mut stream_state, &[], true)
+            .unwrap();
+        if let Some(hidden_states) = append.hidden_states {
+            streamed_parts.push(hidden_states);
+        }
+        let streamed = Tensor::cat(streamed_parts, 1);
+        let streamed = streamed.as_slice().await.unwrap();
+
+        assert_eq!(full.shape(), streamed.shape());
+        let max_diff = full
+            .as_slice()
+            .iter()
+            .zip(streamed.as_slice())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            max_diff < 1e-3,
+            "streaming encoder diverged from full encoder: max_diff={max_diff}"
         );
     }
 }
