@@ -47,13 +47,18 @@ use std::{
     ops::Range,
     pin::Pin,
     str::FromStr,
-    sync::{Arc, Mutex},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc, Mutex,
+    },
     time::Duration,
 };
 
 use futures_util::{FutureExt, Stream, StreamExt};
 
 mod model;
+mod moonshine_config;
+mod moonshine_runtime;
 mod source;
 pub use source::*;
 
@@ -64,6 +69,8 @@ mod cohere_config;
 mod cohere_runtime;
 mod config;
 mod quantized;
+
+static NEXT_STREAM_SESSION_ID: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 struct DecodingResult {
@@ -212,6 +219,10 @@ where
             stream: self,
             whisper: model,
             current_segment_task: None,
+            streaming_receiver: None,
+            streaming_session_id: None,
+            stream_finished: false,
+            sent_stream_finish: false,
             language: Some(WhisperLanguage::English),
         }
     }
@@ -223,6 +234,10 @@ pub struct ChunkedTranscriptionTask<S> {
     stream: S,
     whisper: Whisper,
     current_segment_task: Option<TranscriptionTask>,
+    streaming_receiver: Option<UnboundedReceiver<Segment>>,
+    streaming_session_id: Option<u64>,
+    stream_finished: bool,
+    sent_stream_finish: bool,
     language: Option<WhisperLanguage>,
 }
 
@@ -257,6 +272,81 @@ where
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Option<Self::Item>> {
         let myself = self.get_mut();
+
+        if myself.whisper.inner.supports_streaming {
+            loop {
+                if myself.streaming_receiver.is_none() {
+                    let (sender, receiver) = futures_channel::mpsc::unbounded();
+                    let session_id = NEXT_STREAM_SESSION_ID.fetch_add(1, Ordering::Relaxed);
+                    myself
+                        .whisper
+                        .inner
+                        .sender
+                        .unbounded_send(WhisperMessage::StartStream {
+                            session_id,
+                            timestamps: myself.word_level_time_stamps,
+                            lang: myself.language,
+                            sender,
+                        })
+                        .unwrap();
+                    myself.streaming_receiver = Some(receiver);
+                    myself.streaming_session_id = Some(session_id);
+                }
+
+                {
+                    let mut task = myself.whisper.inner.task.lock().unwrap();
+                    let _ = task.poll_unpin(cx);
+                }
+
+                if let Some(receiver) = &mut myself.streaming_receiver {
+                    match receiver.poll_next_unpin(cx) {
+                        std::task::Poll::Ready(Some(ready)) => {
+                            return std::task::Poll::Ready(Some(ready));
+                        }
+                        std::task::Poll::Ready(None) => return std::task::Poll::Ready(None),
+                        std::task::Poll::Pending => {}
+                    }
+                }
+
+                if !myself.stream_finished {
+                    match myself.stream.poll_next_unpin(cx) {
+                        std::task::Poll::Ready(Some(source)) => {
+                            let samples =
+                                normalize_audio(source, myself.whisper.inner.apply_speech_filter);
+                            myself
+                                .whisper
+                                .inner
+                                .sender
+                                .unbounded_send(WhisperMessage::AppendStream {
+                                    session_id: myself.streaming_session_id.unwrap(),
+                                    samples,
+                                })
+                                .unwrap();
+                            continue;
+                        }
+                        std::task::Poll::Ready(None) => {
+                            myself.stream_finished = true;
+                        }
+                        std::task::Poll::Pending => return std::task::Poll::Pending,
+                    }
+                }
+
+                if myself.stream_finished && !myself.sent_stream_finish {
+                    myself
+                        .whisper
+                        .inner
+                        .sender
+                        .unbounded_send(WhisperMessage::FinishStream {
+                            session_id: myself.streaming_session_id.unwrap(),
+                        })
+                        .unwrap();
+                    myself.sent_stream_finish = true;
+                    continue;
+                }
+
+                return std::task::Poll::Pending;
+            }
+        }
 
         loop {
             if let Some(task) = &mut myself.current_segment_task {
@@ -481,14 +571,36 @@ impl WhisperBuilder {
         let task = Box::pin(async move {
             let mut rx = rx;
             while let Some(message) = rx.next().await {
-                model
-                    .transcribe(
-                        message.samples,
-                        message.timestamps,
-                        message.lang,
-                        message.sender,
-                    )
-                    .await;
+                match message {
+                    WhisperMessage::Transcribe {
+                        samples,
+                        timestamps,
+                        lang,
+                        sender,
+                    } => {
+                        model.transcribe(samples, timestamps, lang, sender).await;
+                    }
+                    WhisperMessage::StartStream {
+                        session_id,
+                        timestamps,
+                        lang,
+                        sender,
+                    } => {
+                        if let Err(err) = model.start_stream(session_id, timestamps, lang, sender) {
+                            tracing::error!("Error starting transcription stream: {err}");
+                        }
+                    }
+                    WhisperMessage::AppendStream { session_id, samples } => {
+                        if let Err(err) = model.push_stream_audio(session_id, samples).await {
+                            tracing::error!("Error updating transcription stream: {err}");
+                        }
+                    }
+                    WhisperMessage::FinishStream { session_id } => {
+                        if let Err(err) = model.finish_stream(session_id).await {
+                            tracing::error!("Error finishing transcription stream: {err}");
+                        }
+                    }
+                }
             }
         });
 
@@ -496,13 +608,18 @@ impl WhisperBuilder {
             inner: Arc::new(WhisperTask {
                 sender: tx,
                 task: Mutex::new(task),
-                apply_speech_filter: matches!(
-                    whisper.family,
+                apply_speech_filter: match whisper.family {
                     ModelFamily::Whisper {
-                        apply_speech_filter: true,
+                        apply_speech_filter,
                         ..
                     }
-                ),
+                    | ModelFamily::MoonshineStreaming {
+                        apply_speech_filter,
+                        ..
+                    } => apply_speech_filter,
+                    ModelFamily::CohereTranscribe => false,
+                },
+                supports_streaming: matches!(whisper.family, ModelFamily::MoonshineStreaming { .. }),
             }),
         })
     }
@@ -861,6 +978,7 @@ struct WhisperTask {
     sender: UnboundedSender<WhisperMessage>,
     task: Mutex<Pin<Box<dyn FutureWasmNotSend<Output = ()> + 'static>>>,
     apply_speech_filter: bool,
+    supports_streaming: bool,
 }
 
 #[derive(Clone)]
@@ -944,7 +1062,7 @@ impl Stream for TranscriptionTask {
                 .whisper
                 .inner
                 .sender
-                .unbounded_send(WhisperMessage {
+                .unbounded_send(WhisperMessage::Transcribe {
                     samples: pcm_data,
                     timestamps: myself.word_level_time_stamps,
                     lang: myself.language,
@@ -963,11 +1081,26 @@ impl Stream for TranscriptionTask {
     }
 }
 
-struct WhisperMessage {
-    samples: Vec<f32>,
-    timestamps: bool,
-    lang: Option<WhisperLanguage>,
-    sender: UnboundedSender<Segment>,
+enum WhisperMessage {
+    Transcribe {
+        samples: Vec<f32>,
+        timestamps: bool,
+        lang: Option<WhisperLanguage>,
+        sender: UnboundedSender<Segment>,
+    },
+    StartStream {
+        session_id: u64,
+        timestamps: bool,
+        lang: Option<WhisperLanguage>,
+        sender: UnboundedSender<Segment>,
+    },
+    AppendStream {
+        session_id: u64,
+        samples: Vec<f32>,
+    },
+    FinishStream {
+        session_id: u64,
+    },
 }
 
 pub(crate) fn normalize_audio<S: Source>(input: S, apply_speech_filter: bool) -> Vec<f32>

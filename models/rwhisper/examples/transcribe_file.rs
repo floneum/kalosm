@@ -10,6 +10,8 @@ async fn main() -> Result<(), anyhow::Error> {
 
     let source = if let Ok(dir) = std::env::var("RWHISPER_COHERE_DIR") {
         WhisperSource::cohere_transcribe_03_2026_local(dir)
+    } else if let Ok(dir) = std::env::var("RWHISPER_MOONSHINE_DIR") {
+        WhisperSource::moonshine_streaming_local(dir)
     } else if std::env::var("RWHISPER_COHERE").is_ok() {
         WhisperSource::cohere_transcribe_03_2026()
     } else if let Ok(dir) = std::env::var("RWHISPER_WHISPER_DIR") {

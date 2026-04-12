@@ -9,6 +9,10 @@ pub(crate) enum ModelFamily {
         apply_speech_filter: bool,
     },
     CohereTranscribe,
+    MoonshineStreaming {
+        heads: Option<&'static [[usize; 2]]>,
+        apply_speech_filter: bool,
+    },
 }
 
 /// Predefined Whisper model sources
@@ -81,6 +85,63 @@ impl WhisperSource {
             FileSource::local(dir.join("tokenizer.json")),
             FileSource::local(dir.join("config.json")),
             ModelFamily::CohereTranscribe,
+        )
+    }
+
+    /// Moonshine streaming tiny English model.
+    pub fn moonshine_streaming_tiny() -> Self {
+        let repo = "Demonthos/moonshine-streaming-tiny-gguf".to_owned();
+        Self::new_with_family(
+            FileSource::huggingface(repo.clone(), "main".to_owned(), "model.gguf".to_owned()),
+            FileSource::huggingface(repo.clone(), "main".to_owned(), "tokenizer.json".to_owned()),
+            FileSource::huggingface(repo, "main".to_owned(), "config.json".to_owned()),
+            ModelFamily::MoonshineStreaming {
+                heads: None,
+                apply_speech_filter: false,
+            },
+        )
+    }
+
+    /// Moonshine streaming small English model.
+    pub fn moonshine_streaming_small() -> Self {
+        let repo = "Demonthos/moonshine-streaming-small-gguf".to_owned();
+        Self::new_with_family(
+            FileSource::huggingface(repo.clone(), "main".to_owned(), "model.gguf".to_owned()),
+            FileSource::huggingface(repo.clone(), "main".to_owned(), "tokenizer.json".to_owned()),
+            FileSource::huggingface(repo, "main".to_owned(), "config.json".to_owned()),
+            ModelFamily::MoonshineStreaming {
+                heads: None,
+                apply_speech_filter: false,
+            },
+        )
+    }
+
+    /// Moonshine streaming medium English model.
+    pub fn moonshine_streaming_medium() -> Self {
+        let repo = "Demonthos/moonshine-streaming-medium-gguf".to_owned();
+        Self::new_with_family(
+            FileSource::huggingface(repo.clone(), "main".to_owned(), "model.gguf".to_owned()),
+            FileSource::huggingface(repo.clone(), "main".to_owned(), "tokenizer.json".to_owned()),
+            FileSource::huggingface(repo, "main".to_owned(), "config.json".to_owned()),
+            ModelFamily::MoonshineStreaming {
+                heads: None,
+                apply_speech_filter: false,
+            },
+        )
+    }
+
+    /// Moonshine streaming English model from a local directory containing
+    /// `model.gguf`, `tokenizer.json`, and `config.json`.
+    pub fn moonshine_streaming_local(dir: impl Into<PathBuf>) -> Self {
+        let dir = dir.into();
+        Self::new_with_family(
+            FileSource::local(dir.join("model.gguf")),
+            FileSource::local(dir.join("tokenizer.json")),
+            FileSource::local(dir.join("config.json")),
+            ModelFamily::MoonshineStreaming {
+                heads: None,
+                apply_speech_filter: false,
+            },
         )
     }
 

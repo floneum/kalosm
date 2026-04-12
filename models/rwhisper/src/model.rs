@@ -16,6 +16,7 @@ use tokenizers::Tokenizer;
 use super::{DecodingResult, Segment};
 use crate::{
     audio, cohere_config::CohereConfig, cohere_runtime::CohereRuntime, config::*,
+    moonshine_config::MoonshineStreamingConfig, moonshine_runtime::MoonshineRuntime,
     quantized::TextDecoderCache, source::ModelFamily, Task, TaskType, TokenChunk, WhisperBuilder,
     WhisperLanguage,
 };
@@ -88,6 +89,7 @@ pub(crate) struct WhisperRuntime {
 pub(crate) enum WhisperInner {
     Whisper(WhisperRuntime),
     Cohere(CohereRuntime),
+    Moonshine(MoonshineRuntime),
 }
 
 impl WhisperInner {
@@ -155,6 +157,17 @@ impl WhisperInner {
                     device, weights, tokenizer, config,
                 )?))
             }
+            ModelFamily::MoonshineStreaming { heads, .. } => {
+                let config: MoonshineStreamingConfig =
+                    serde_json::from_slice(config).map_err(WhisperLoadingError::LoadConfig)?;
+                Ok(Self::Moonshine(MoonshineRuntime::new(
+                    device,
+                    weights,
+                    tokenizer,
+                    config,
+                    heads,
+                )?))
+            }
         }
     }
 
@@ -208,6 +221,53 @@ impl WhisperInner {
                     tracing::error!("Error transcribing audio: {err}");
                 }
             }
+            Self::Moonshine(runtime) => {
+                if let Err(err) = runtime
+                    .transcribe(pcm_data, language, word_level_time_stamps, result)
+                    .await
+                {
+                    tracing::error!("Error transcribing audio: {err}");
+                }
+            }
+        }
+    }
+
+    pub(crate) fn start_stream(
+        &mut self,
+        session_id: u64,
+        word_level_time_stamps: bool,
+        language: Option<WhisperLanguage>,
+        sender: UnboundedSender<Segment>,
+    ) -> Result<(), WhisperLoadingError> {
+        match self {
+            Self::Moonshine(runtime) => {
+                runtime.start_stream(session_id, language, word_level_time_stamps, sender)
+            }
+            _ => Err(WhisperLoadingError::LoadModel(fusor::Error::msg(
+                "streaming is only supported for moonshine models",
+            ))),
+        }
+    }
+
+    pub(crate) async fn push_stream_audio(
+        &mut self,
+        session_id: u64,
+        samples: Vec<f32>,
+    ) -> Result<(), WhisperError> {
+        match self {
+            Self::Moonshine(runtime) => runtime.push_stream_audio(session_id, samples).await,
+            _ => Err(WhisperError::Fusor(fusor::Error::msg(
+                "streaming is only supported for moonshine models",
+            ))),
+        }
+    }
+
+    pub(crate) async fn finish_stream(&mut self, session_id: u64) -> Result<(), WhisperError> {
+        match self {
+            Self::Moonshine(runtime) => runtime.finish_stream(session_id).await,
+            _ => Err(WhisperError::Fusor(fusor::Error::msg(
+                "streaming is only supported for moonshine models",
+            ))),
         }
     }
 }

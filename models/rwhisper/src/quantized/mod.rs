@@ -12,6 +12,7 @@ use timestamps::extract_timestamps;
 use crate::config::{Config, HOP_LENGTH, N_FRAMES, SAMPLE_RATE};
 
 pub(crate) mod cohere;
+pub(crate) mod moonshine;
 pub(crate) mod timestamps;
 
 fn materialize_if_gpu<const R: usize, D, B>(tensor: &Tensor<R, D, B>)

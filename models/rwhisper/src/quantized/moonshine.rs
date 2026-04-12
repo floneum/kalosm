@@ -1,0 +1,956 @@
+use std::sync::Arc;
+
+use fusor::{
+    cache::{AttentionMask, KvCache, MaskCache, TensorCache},
+    layers::{Conv1d, Conv1dConfig, Embedding, LayerNorm, Linear},
+    Device, Error, MaskKind, Result, RopeCache, Tensor, VarBuilder,
+};
+
+use crate::moonshine_config::{MoonshineStreamingConfig, MoonshineStreamingEncoderConfig};
+
+fn materialize_if_gpu<const R: usize, D, B>(tensor: &Tensor<R, D, B>)
+where
+    B: fusor::TensorBacking<R, Elem = D>,
+    D: fusor::SimdElement + fusor::DataType + 'static,
+{
+    if tensor.is_gpu() {
+        tensor.materialize_blocking();
+    }
+}
+
+fn tensor1d(device: &Device, vb: &mut VarBuilder, name: &str) -> Result<Tensor<1, f32>> {
+    let q = vb.get(name, device)?;
+    let shape = q.shape();
+    Ok(if shape.len() == 1 {
+        q.dequantize()
+    } else {
+        let value: Tensor<2, f32> = q.dequantize();
+        if value.shape()[0] == 1 {
+            value.squeeze(0).to_concrete()
+        } else {
+            value.squeeze(1).to_concrete()
+        }
+    })
+}
+
+fn conv1d(
+    config: Conv1dConfig,
+    device: &Device,
+    vb: &mut VarBuilder,
+) -> Result<Conv1d<f32>> {
+    let weight_q = vb.get("weight", device)?;
+    let weight_shape = weight_q.shape();
+    let weight: Tensor<3, f32> = if weight_shape.len() == 3 {
+        weight_q.dequantize()
+    } else {
+        let out = weight_shape[0];
+        let kernel = 5usize;
+        let in_channels = weight_shape[1] / kernel;
+        let weight_2d: Tensor<2, f32> = weight_q.dequantize();
+        weight_2d
+            .reshape([out, in_channels, kernel])
+            .to_concrete()
+    };
+    let bias = vb.get("bias", device).ok().map(|bias_q| {
+        let bias_shape = bias_q.shape();
+        if bias_shape.len() == 1 {
+            bias_q.dequantize()
+        } else {
+            let bias_2d: Tensor<2, f32> = bias_q.dequantize();
+            if bias_2d.shape()[0] == 1 {
+                bias_2d.squeeze(0).to_concrete()
+            } else {
+                bias_2d.squeeze(1).to_concrete()
+            }
+        }
+    });
+    Ok(Conv1d::new(weight.to_concrete(), bias, config))
+}
+
+fn ones_1d(device: &Device, len: usize) -> Tensor<1, f32> {
+    Tensor::splat(device, 1.0, [len])
+}
+
+fn causal_pad_1d(x: &Tensor<3, f32>, channels: usize, pad: usize) -> Tensor<3, f32> {
+    let [batch, _, _] = x.shape();
+    let zeros = Tensor::zeros(&x.device(), [batch, channels, pad]);
+    Tensor::cat([zeros, x.clone()], 2)
+}
+
+fn flatten_frames(samples: &[f32], frame_len: usize, log_k: f32) -> Vec<f32> {
+    let usable_len = samples.len() / frame_len * frame_len;
+    let k = log_k.exp();
+    let mut frames = Vec::with_capacity(usable_len);
+    for frame in samples[..usable_len].chunks_exact(frame_len) {
+        let mean = frame.iter().sum::<f32>() / frame_len as f32;
+        let mut centered = vec![0.0f32; frame_len];
+        let mut rms = 0.0f32;
+        for (i, sample) in frame.iter().enumerate() {
+            let value = *sample - mean;
+            centered[i] = value;
+            rms += value * value;
+        }
+        rms = (rms / frame_len as f32 + 1e-6).sqrt();
+        for value in centered {
+            let scaled = k * value / rms;
+            frames.push((scaled + (scaled * scaled + 1.0).sqrt()).ln());
+        }
+    }
+    frames
+}
+
+fn sliding_window_mask(
+    device: &Device,
+    seq_len: usize,
+    left: usize,
+    right: usize,
+) -> Tensor<4, f32> {
+    let mut data = vec![f32::NEG_INFINITY; seq_len * seq_len];
+    for q in 0..seq_len {
+        for k in 0..seq_len {
+            let dist = q as isize - k as isize;
+            let allowed =
+                (dist >= 0 && dist < left as isize) || (dist < 0 && -dist < right as isize);
+            if allowed {
+                data[q * seq_len + k] = 0.0;
+            }
+        }
+    }
+    Tensor::from_slice(device, [1, 1, seq_len, seq_len], &data)
+}
+
+fn causal_mask(device: &Device, seq_len: usize) -> Tensor<4, f32> {
+    let mut data = vec![0.0f32; seq_len * seq_len];
+    for q in 0..seq_len {
+        for k in (q + 1)..seq_len {
+            data[q * seq_len + k] = f32::NEG_INFINITY;
+        }
+    }
+    Tensor::from_slice(device, [1, 1, seq_len, seq_len], &data)
+}
+
+struct UnitOffsetLayerNorm {
+    norm: LayerNorm<1, f32>,
+    gamma: Tensor<1, f32>,
+    unit_offset: f32,
+}
+
+impl UnitOffsetLayerNorm {
+    fn load(device: &Device, vb: &mut VarBuilder, eps: f32) -> Result<Self> {
+        let gamma = tensor1d(device, vb, "gamma")?.to_concrete();
+        let weight = ones_1d(device, gamma.shape()[0]).to_concrete();
+        let norm = LayerNorm::new(weight, None, eps);
+        Ok(Self {
+            norm,
+            gamma,
+            unit_offset: 1.0,
+        })
+    }
+
+    fn forward<B>(&self, x: &Tensor<3, f32, B>) -> Tensor<3, f32>
+    where
+        B: fusor::TensorBacking<3, Elem = f32>,
+    {
+        let normed = self.norm.forward_fused(x);
+        let gamma = self.gamma.add_scalar(self.unit_offset);
+        let weight = gamma.broadcast_as(normed.shape());
+        normed.mul_(&weight).to_concrete()
+    }
+}
+
+struct MoonshineAttentionCache {
+    kv_cache: KvCache<f32>,
+}
+
+impl MoonshineAttentionCache {
+    fn new(max_seq_len: usize) -> Self {
+        Self {
+            kv_cache: KvCache::new(1, max_seq_len),
+        }
+    }
+}
+
+struct MoonshineAttention {
+    q_proj: Linear<f32>,
+    k_proj: Linear<f32>,
+    v_proj: Linear<f32>,
+    o_proj: Linear<f32>,
+    num_heads: usize,
+    head_dim: usize,
+    scale: f32,
+    rope_cache: Option<Arc<RopeCache>>,
+    rotary_dim: usize,
+}
+
+impl MoonshineAttention {
+    fn load(
+        device: &Device,
+        vb: &mut VarBuilder,
+        num_heads: usize,
+        head_dim: usize,
+        rope_cache: Option<Arc<RopeCache>>,
+        rotary_dim: usize,
+    ) -> Result<Self> {
+        Ok(Self {
+            q_proj: Linear::load(device, &mut vb.pp("q_proj"))?,
+            k_proj: Linear::load(device, &mut vb.pp("k_proj"))?,
+            v_proj: Linear::load(device, &mut vb.pp("v_proj"))?,
+            o_proj: Linear::load(device, &mut vb.pp("o_proj"))?,
+            num_heads,
+            head_dim,
+            scale: head_dim as f32,
+            rope_cache,
+            rotary_dim,
+        })
+    }
+
+    fn reshape_heads(&self, x: &Tensor<3, f32>) -> Tensor<4, f32> {
+        let [batch, seq_len, _] = x.shape();
+        x.reshape([batch, seq_len, self.num_heads, self.head_dim])
+            .transpose(1, 2)
+            .to_concrete()
+    }
+
+    fn flatten_heads(&self, x: Tensor<4, f32>) -> Tensor<3, f32> {
+        let [batch, _, seq_len, _] = x.shape();
+        x.transpose(1, 2)
+            .reshape([batch, seq_len, self.num_heads * self.head_dim])
+            .to_concrete()
+    }
+
+    fn apply_rope(
+        &self,
+        q: Tensor<4, f32>,
+        k: Tensor<4, f32>,
+        start_pos: usize,
+    ) -> (Tensor<4, f32>, Tensor<4, f32>) {
+        let Some(cache) = &self.rope_cache else {
+            return (q, k);
+        };
+        if self.rotary_dim == 0 {
+            return (q, k);
+        }
+        let q_rot = q.narrow(3, 0, self.rotary_dim).to_concrete();
+        let k_rot = k.narrow(3, 0, self.rotary_dim).to_concrete();
+        let (q_rot, k_rot) = cache.forward_interleaved(&q_rot, &k_rot, start_pos);
+        if self.rotary_dim == self.head_dim {
+            return (q_rot, k_rot);
+        }
+        let q_pass = q
+            .narrow(3, self.rotary_dim, self.head_dim - self.rotary_dim)
+            .to_concrete();
+        let k_pass = k
+            .narrow(3, self.rotary_dim, self.head_dim - self.rotary_dim)
+            .to_concrete();
+        (
+            Tensor::cat([q_rot, q_pass], 3),
+            Tensor::cat([k_rot, k_pass], 3),
+        )
+    }
+
+    fn apply_rope_3d(
+        &self,
+        q: Tensor<3, f32>,
+        k: Tensor<3, f32>,
+        start_pos: usize,
+    ) -> (Tensor<3, f32>, Tensor<3, f32>) {
+        if self.rope_cache.is_none() || self.rotary_dim == 0 {
+            return (q, k);
+        }
+        let q = self.reshape_heads(&q);
+        let k = self.reshape_heads(&k);
+        let (q, k) = self.apply_rope(q, k, start_pos);
+        (self.flatten_heads(q), self.flatten_heads(k))
+    }
+
+    fn project_kv(&self, hidden_states: &Tensor<3, f32>) -> (Tensor<3, f32>, Tensor<3, f32>) {
+        (
+            self.k_proj.forward(hidden_states),
+            self.v_proj.forward(hidden_states),
+        )
+    }
+
+    fn append_kv(
+        &self,
+        key_states: Tensor<3, f32>,
+        value_states: Tensor<3, f32>,
+        cache: Option<&mut MoonshineAttentionCache>,
+    ) -> (Tensor<3, f32>, Tensor<3, f32>) {
+        match cache {
+            None => (key_states, value_states),
+            Some(cache) => {
+                let device = key_states.device();
+                let key_states_4d = key_states.unsqueeze(2).to_concrete();
+                let value_states_4d = value_states.unsqueeze(2).to_concrete();
+                let (k, v) = cache
+                    .kv_cache
+                    .append(&device, &key_states_4d, &value_states_4d);
+                (k.squeeze(2).to_concrete(), v.squeeze(2).to_concrete())
+            }
+        }
+    }
+
+    fn qkv_attention_dense(
+        &self,
+        q: &Tensor<3, f32>,
+        k: &Tensor<3, f32>,
+        v: &Tensor<3, f32>,
+        attention_mask: Option<&Tensor<4, f32>>,
+        attention_output: Option<&mut Vec<Tensor<4, f32>>>,
+    ) -> Result<Tensor<3, f32>> {
+        let q = self.reshape_heads(q);
+        let k = self.reshape_heads(k);
+        let v = self.reshape_heads(v);
+        let k_t = k.transpose(2, 3).to_concrete();
+        let mut scores = q.mat_mul(&k_t).mul_scalar(self.scale.powf(-0.5));
+        if let Some(mask) = attention_mask {
+            scores = scores.add_(mask).to_concrete();
+        }
+        if let Some(outputs) = attention_output {
+            outputs.push(scores.clone());
+        }
+        let weights = scores.softmax_last_dim_fused();
+        let context = weights.mat_mul(&v).transpose(1, 2).flatten_last_n::<1, _>();
+        Ok(self.o_proj.forward(&context))
+    }
+
+    fn qkv_attention_masked(
+        &self,
+        q: &Tensor<3, f32>,
+        k: &Tensor<3, f32>,
+        v: &Tensor<3, f32>,
+        attention_mask: Option<&AttentionMask<f32>>,
+        attention_output: Option<&mut TensorCache<4, f32>>,
+    ) -> Result<Tensor<3, f32>> {
+        let [batch, q_len, _] = q.shape();
+        let q = self.reshape_heads(q);
+        let k = self.reshape_heads(k);
+        let v = self.reshape_heads(v);
+
+        if attention_output.is_none() {
+            let mask = attention_mask.map(|mask| (mask.mask(), MaskKind::QKMask));
+            let context = q
+                .flash_attention(&k, &v, self.scale.powf(-0.5), mask)
+                .transpose(1, 2)
+                .reshape([batch, q_len, self.num_heads * self.head_dim])
+                .to_concrete();
+            return Ok(self.o_proj.forward(&context));
+        }
+
+        let k_t = k.transpose(2, 3).to_concrete();
+        let mut scores = q.mat_mul(&k_t).mul_scalar(self.scale.powf(-0.5));
+        if let Some(mask) = attention_mask {
+            mask.forward(&mut scores);
+        }
+        if let Some(output) = attention_output {
+            let last_query = scores.narrow(2, q_len.saturating_sub(1), 1).to_concrete();
+            output.append(&q.device(), &last_query);
+        }
+        let weights = scores.softmax_last_dim_fused();
+        let context = weights
+            .mat_mul(&v)
+            .transpose(1, 2)
+            .reshape([batch, q_len, self.num_heads * self.head_dim])
+            .to_concrete();
+        Ok(self.o_proj.forward(&context))
+    }
+
+    fn forward(
+        &self,
+        hidden_states: &Tensor<3, f32>,
+        key_value_states: &Tensor<3, f32>,
+        attention_mask: Option<&Tensor<4, f32>>,
+        attention_output: Option<&mut Vec<Tensor<4, f32>>>,
+    ) -> Result<Tensor<3, f32>> {
+        let query_states = self.q_proj.forward(hidden_states);
+        let (key_states, value_states) = self.project_kv(key_value_states);
+        let (query_states, key_states) = self.apply_rope_3d(query_states, key_states, 0);
+        self.qkv_attention_dense(
+            &query_states,
+            &key_states,
+            &value_states,
+            attention_mask,
+            attention_output,
+        )
+    }
+
+    fn forward_cached(
+        &self,
+        hidden_states: &Tensor<3, f32>,
+        kv: (Tensor<3, f32>, Tensor<3, f32>),
+        attention_mask: Option<&AttentionMask<f32>>,
+        attention_output: Option<&mut TensorCache<4, f32>>,
+    ) -> Result<Tensor<3, f32>> {
+        let query_states = self.q_proj.forward(hidden_states);
+        let (key_states, value_states) = kv;
+        self.qkv_attention_masked(
+            &query_states,
+            &key_states,
+            &value_states,
+            attention_mask,
+            attention_output,
+        )
+    }
+}
+
+struct MoonshineEncoderMlp {
+    fc1: Linear<f32>,
+    fc2: Linear<f32>,
+}
+
+impl MoonshineEncoderMlp {
+    fn load(device: &Device, vb: &mut VarBuilder) -> Result<Self> {
+        Ok(Self {
+            fc1: Linear::load(device, &mut vb.pp("fc1"))?,
+            fc2: Linear::load(device, &mut vb.pp("fc2"))?,
+        })
+    }
+
+    fn forward(&self, x: &Tensor<3, f32>) -> Tensor<3, f32> {
+        self.fc2.forward(&self.fc1.forward(x).gelu())
+    }
+}
+
+struct MoonshineDecoderMlp {
+    fc1: Linear<f32>,
+    fc2: Linear<f32>,
+    intermediate_size: usize,
+}
+
+impl MoonshineDecoderMlp {
+    fn load(device: &Device, vb: &mut VarBuilder, intermediate_size: usize) -> Result<Self> {
+        Ok(Self {
+            fc1: Linear::load(device, &mut vb.pp("fc1"))?,
+            fc2: Linear::load(device, &mut vb.pp("fc2"))?,
+            intermediate_size,
+        })
+    }
+
+    fn forward(&self, x: &Tensor<3, f32>) -> Tensor<3, f32> {
+        let hidden = self.fc1.forward(x);
+        let states = hidden.narrow(2, 0, self.intermediate_size).to_concrete();
+        let gate = hidden
+            .narrow(2, self.intermediate_size, self.intermediate_size)
+            .to_concrete()
+            .silu();
+        self.fc2.forward(&states.mul_(&gate).to_concrete())
+    }
+}
+
+struct MoonshineEncoderLayer {
+    self_attn: MoonshineAttention,
+    input_layernorm: UnitOffsetLayerNorm,
+    post_attention_layernorm: UnitOffsetLayerNorm,
+    mlp: MoonshineEncoderMlp,
+}
+
+impl MoonshineEncoderLayer {
+    fn load(
+        config: &MoonshineStreamingEncoderConfig,
+        device: &Device,
+        vb: &mut VarBuilder,
+    ) -> Result<Self> {
+        Ok(Self {
+            self_attn: MoonshineAttention::load(
+                device,
+                &mut vb.pp("self_attn"),
+                config.num_attention_heads,
+                config.head_dim(),
+                None,
+                0,
+            )?,
+            input_layernorm: UnitOffsetLayerNorm::load(
+                device,
+                &mut vb.pp("input_layernorm"),
+                1e-5,
+            )?,
+            post_attention_layernorm: UnitOffsetLayerNorm::load(
+                device,
+                &mut vb.pp("post_attention_layernorm"),
+                1e-5,
+            )?,
+            mlp: MoonshineEncoderMlp::load(device, &mut vb.pp("mlp"))?,
+        })
+    }
+
+    fn forward(
+        &self,
+        hidden_states: &Tensor<3, f32>,
+        attention_mask: &Tensor<4, f32>,
+    ) -> Result<Tensor<3, f32>> {
+        let attn_in = self.input_layernorm.forward(hidden_states);
+        let attn = self
+            .self_attn
+            .forward(&attn_in, &attn_in, Some(attention_mask), None)?;
+        let hidden_states = (hidden_states + &attn).to_concrete();
+        let mlp_in = self.post_attention_layernorm.forward(&hidden_states);
+        let mlp = self.mlp.forward(&mlp_in);
+        Ok((hidden_states + mlp).to_concrete())
+    }
+}
+
+struct MoonshineDecoderLayer {
+    self_attn: MoonshineAttention,
+    encoder_attn: MoonshineAttention,
+    input_layernorm: LayerNorm<1, f32>,
+    post_attention_layernorm: LayerNorm<1, f32>,
+    final_layernorm: LayerNorm<1, f32>,
+    mlp: MoonshineDecoderMlp,
+}
+
+struct MoonshineDecoderLayerCache {
+    self_attn: MoonshineAttentionCache,
+    cross_attn_kv: (Tensor<3, f32>, Tensor<3, f32>),
+}
+
+impl MoonshineDecoderLayer {
+    fn load(
+        config: &MoonshineStreamingConfig,
+        device: &Device,
+        vb: &mut VarBuilder,
+        rope_cache: Arc<RopeCache>,
+    ) -> Result<Self> {
+        Ok(Self {
+            self_attn: MoonshineAttention::load(
+                device,
+                &mut vb.pp("self_attn"),
+                config.num_attention_heads,
+                config.decoder_head_dim(),
+                Some(rope_cache),
+                config.decoder_rotary_dim(),
+            )?,
+            encoder_attn: MoonshineAttention::load(
+                device,
+                &mut vb.pp("encoder_attn"),
+                config.num_attention_heads,
+                config.decoder_head_dim(),
+                None,
+                0,
+            )?,
+            input_layernorm: LayerNorm::load(device, &mut vb.pp("input_layernorm"), 1e-5)?,
+            post_attention_layernorm: LayerNorm::load(
+                device,
+                &mut vb.pp("post_attention_layernorm"),
+                1e-5,
+            )?,
+            final_layernorm: LayerNorm::load(device, &mut vb.pp("final_layernorm"), 1e-5)?,
+            mlp: MoonshineDecoderMlp::load(
+                device,
+                &mut vb.pp("mlp"),
+                config.intermediate_size,
+            )?,
+        })
+    }
+
+    fn forward(
+        &mut self,
+        hidden_states: &Tensor<3, f32>,
+        encoder_hidden_states: &Tensor<3, f32>,
+        causal_mask: &Tensor<4, f32>,
+        attention_output: Option<&mut Vec<Tensor<4, f32>>>,
+    ) -> Result<Tensor<3, f32>> {
+        let self_attn_in = self.input_layernorm.forward_fused(hidden_states);
+        let self_attn = self
+            .self_attn
+            .forward(&self_attn_in, &self_attn_in, Some(causal_mask), None)?;
+        let hidden_states = (hidden_states + &self_attn).to_concrete();
+
+        let cross_attn_in = self.post_attention_layernorm.forward_fused(&hidden_states);
+        let cross_attn = self.encoder_attn.forward(
+            &cross_attn_in,
+            encoder_hidden_states,
+            None,
+            attention_output,
+        )?;
+        let hidden_states = (hidden_states + &cross_attn).to_concrete();
+
+        let mlp_in = self.final_layernorm.forward_fused(&hidden_states);
+        let mlp = self.mlp.forward(&mlp_in);
+        Ok((hidden_states + mlp).to_concrete())
+    }
+
+    fn forward_cached(
+        &mut self,
+        hidden_states: &Tensor<3, f32>,
+        self_attention_mask: &AttentionMask<f32>,
+        index_pos: usize,
+        cache: &mut MoonshineDecoderLayerCache,
+        attention_output: Option<&mut TensorCache<4, f32>>,
+    ) -> Result<Tensor<3, f32>> {
+        let self_attn_in = self.input_layernorm.forward_fused(hidden_states);
+        let query_states = self.self_attn.q_proj.forward(&self_attn_in);
+        let (key_states, value_states) = self.self_attn.project_kv(&self_attn_in);
+        let (query_states, key_states) =
+            self.self_attn
+                .apply_rope_3d(query_states, key_states, index_pos);
+        let kv = self
+            .self_attn
+            .append_kv(key_states, value_states, Some(&mut cache.self_attn));
+        let self_attn = self.self_attn.qkv_attention_masked(
+            &query_states,
+            &kv.0,
+            &kv.1,
+            Some(self_attention_mask),
+            None,
+        )?;
+        let hidden_states = (hidden_states + &self_attn).to_concrete();
+
+        let cross_attn_in = self.post_attention_layernorm.forward_fused(&hidden_states);
+        let cross_attn = self.encoder_attn.forward_cached(
+            &cross_attn_in,
+            cache.cross_attn_kv.clone(),
+            None,
+            attention_output,
+        )?;
+        let hidden_states = (hidden_states + &cross_attn).to_concrete();
+
+        let mlp_in = self.final_layernorm.forward_fused(&hidden_states);
+        let mlp = self.mlp.forward(&mlp_in);
+        Ok((hidden_states + mlp).to_concrete())
+    }
+}
+
+pub struct MoonshineEncoder {
+    linear: Linear<f32>,
+    conv1: Conv1d<f32>,
+    conv2: Conv1d<f32>,
+    compression_log_k: f32,
+    layers: Vec<MoonshineEncoderLayer>,
+    final_norm: UnitOffsetLayerNorm,
+    config: MoonshineStreamingEncoderConfig,
+}
+
+impl MoonshineEncoder {
+    fn load(
+        config: &MoonshineStreamingEncoderConfig,
+        device: &Device,
+        vb: &mut VarBuilder,
+    ) -> Result<Self> {
+        let conv_config = Conv1dConfig {
+            padding: 0,
+            stride: 2,
+            groups: 1,
+            dilation: 1,
+        };
+        let layers = (0..config.num_hidden_layers)
+            .map(|idx| MoonshineEncoderLayer::load(config, device, &mut vb.pp(format!("layers.{idx}"))))
+            .collect::<Result<Vec<_>>>()?;
+        let compression_log_k = {
+            let log_k_q = vb.pp("embedder.comp").get("log_k", device)?;
+            let log_k: Tensor<0, f32> = log_k_q.dequantize();
+            pollster::block_on(log_k.to_scalar())?
+        };
+        Ok(Self {
+            linear: Linear::load(device, &mut vb.pp("embedder.linear"))?,
+            conv1: conv1d(conv_config, device, &mut vb.pp("embedder.conv1"))?,
+            conv2: conv1d(conv_config, device, &mut vb.pp("embedder.conv2"))?,
+            compression_log_k,
+            layers,
+            final_norm: UnitOffsetLayerNorm::load(device, &mut vb.pp("final_norm"), 1e-5)?,
+            config: config.clone(),
+        })
+    }
+
+    fn preprocess(&self, samples: &[f32]) -> Vec<f32> {
+        flatten_frames(samples, self.config.frame_len(), self.compression_log_k)
+    }
+
+    pub fn encode(&self, device: &Device, samples: &[f32]) -> Result<Tensor<3, f32>> {
+        let frames = self.preprocess(samples);
+        let frame_len = self.config.frame_len();
+        if frames.is_empty() {
+            return Err(Error::msg("moonshine input is too short"));
+        }
+        let frame_count = frames.len() / frame_len;
+        let mut hidden_states = Tensor::from_slice(device, [1, frame_count, frame_len], &frames);
+        hidden_states = self.linear.forward(&hidden_states).silu();
+        let mut hidden_states = hidden_states.transpose(1, 2).to_concrete();
+        hidden_states = self
+            .conv1
+            .forward(&causal_pad_1d(&hidden_states, self.config.hidden_size, 4))
+            .silu()
+            .to_concrete();
+        hidden_states = self
+            .conv2
+            .forward(&causal_pad_1d(&hidden_states, self.config.hidden_size * 2, 4))
+            .transpose(1, 2)
+            .to_concrete();
+
+        let seq_len = hidden_states.shape()[1];
+        for (idx, layer) in self.layers.iter().enumerate() {
+            let window = self.config.sliding_windows[idx];
+            let mask = sliding_window_mask(device, seq_len, window[0], window[1]);
+            hidden_states = layer.forward(&hidden_states, &mask)?;
+            if (idx + 1) % 4 == 0 {
+                materialize_if_gpu(&hidden_states);
+            }
+        }
+
+        Ok(self.final_norm.forward(&hidden_states))
+    }
+}
+
+pub struct MoonshineDecoder {
+    token_embedding: Embedding<f32>,
+    pos_embedding: Embedding<f32>,
+    proj: Option<Linear<f32>>,
+    layers: Vec<MoonshineDecoderLayer>,
+    norm: LayerNorm<1, f32>,
+    output: Linear<f32>,
+    max_target_positions: usize,
+    mask_cache: Arc<MaskCache<f32>>,
+    config: MoonshineStreamingConfig,
+}
+
+#[derive(Default)]
+pub struct MoonshineDecoderCache {
+    tokens: Vec<u32>,
+    layers: Vec<MoonshineDecoderLayerCache>,
+}
+
+impl MoonshineDecoder {
+    fn load(
+        config: &MoonshineStreamingConfig,
+        device: &Device,
+        vb: &mut VarBuilder,
+    ) -> Result<Self> {
+        let rope_cache = Arc::new(RopeCache::new(
+            config.decoder_rotary_dim(),
+            config.max_position_embeddings,
+            config.rope_theta(),
+            device,
+        )?);
+        let layers = (0..config.num_hidden_layers)
+            .map(|idx| {
+                MoonshineDecoderLayer::load(
+                    config,
+                    device,
+                    &mut vb.pp(format!("layers.{idx}")),
+                    rope_cache.clone(),
+                )
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let proj = (config.encoder_hidden_size() != config.hidden_size)
+            .then(|| Linear::load(device, &mut vb.pp("proj")))
+            .transpose()?;
+        Ok(Self {
+            token_embedding: Embedding::load(device, &mut vb.pp("embed_tokens"))?,
+            pos_embedding: Embedding::load(device, &mut vb.pp("pos_emb"))?,
+            proj,
+            layers,
+            norm: LayerNorm::load(device, &mut vb.pp("norm"), 1e-5)?,
+            output: Linear::load(device, &mut vb.pp("proj_out"))?,
+            max_target_positions: config.max_position_embeddings,
+            mask_cache: Default::default(),
+            config: config.clone(),
+        })
+    }
+
+    fn adapt_encoder(&self, encoder_hidden_states: &Tensor<3, f32>) -> Result<Tensor<3, f32>> {
+        let [_, seq_len, _] = encoder_hidden_states.shape();
+        if seq_len > self.config.max_position_embeddings {
+            return Err(Error::msg("moonshine encoder sequence exceeds max_position_embeddings"));
+        }
+        let positions: Vec<u32> = (0..seq_len as u32).collect();
+        let position_ids: Tensor<1, u32> = Tensor::new(&encoder_hidden_states.device(), &positions);
+        let position_embeddings: Tensor<2, f32> = self.pos_embedding.forward(&position_ids);
+        let position_embeddings = position_embeddings.unsqueeze(0).to_concrete();
+        let hidden_states = (encoder_hidden_states + &position_embeddings).to_concrete();
+        Ok(match &self.proj {
+            Some(proj) => proj.forward(&hidden_states),
+            None => hidden_states,
+        })
+    }
+
+    pub fn prepare_encoder_hidden_states(
+        &self,
+        encoder_hidden_states: &Tensor<3, f32>,
+    ) -> Result<Tensor<3, f32>> {
+        Ok(self.adapt_encoder(encoder_hidden_states)?.to_materialized_blocking())
+    }
+
+    pub fn decode_prepared(
+        &mut self,
+        tokens: &[u32],
+        encoder_hidden_states: &Tensor<3, f32>,
+        attention_output: Option<&mut Vec<Tensor<4, f32>>>,
+    ) -> Result<Tensor<3, f32>> {
+        let device = encoder_hidden_states.device();
+        let token_ids: Tensor<2, u32> = Tensor::new(&device, tokens)
+            .reshape([1, tokens.len()])
+            .to_concrete();
+        let mut hidden_states: Tensor<3, f32> = self.token_embedding.forward(&token_ids);
+        let mask = causal_mask(&device, tokens.len());
+
+        let mut attention_output = attention_output;
+        for layer in self.layers.iter_mut() {
+            hidden_states = layer.forward(
+                &hidden_states,
+                encoder_hidden_states,
+                &mask,
+                attention_output.as_mut().map(|outputs| &mut **outputs),
+            )?;
+        }
+        let hidden_states = self.norm.forward_fused(&hidden_states);
+        Ok(self.output.forward(&hidden_states))
+    }
+
+    pub fn decode_cached(
+        &mut self,
+        tokens: &[u32],
+        encoder_hidden_states: &Tensor<3, f32>,
+        cache: &mut MoonshineDecoderCache,
+    ) -> Result<Tensor<3, f32>> {
+        let index_pos = cache.tokens.len();
+        let seq_len = tokens.len();
+        if index_pos + seq_len > self.max_target_positions {
+            return Err(Error::msg(
+                "moonshine decoder sequence exceeds max_position_embeddings",
+            ));
+        }
+        cache.tokens.extend_from_slice(tokens);
+
+        let device = encoder_hidden_states.device();
+        let self_mask = self.mask_cache.get_mask(seq_len, index_pos, None, &device);
+        let token_tensor: Tensor<1, u32> = Tensor::new(&device, tokens);
+        let token_tensor = token_tensor.unsqueeze(0).to_concrete();
+        let mut hidden_states: Tensor<3, f32> = self.token_embedding.forward(&token_tensor);
+        materialize_if_gpu(&hidden_states);
+
+        for (i, layer) in self.layers.iter_mut().enumerate() {
+            if cache.layers.len() <= i {
+                let cross_attn_kv = layer.encoder_attn.project_kv(encoder_hidden_states);
+                let materialized =
+                    Tensor::to_materialized_many_blocking(&[&cross_attn_kv.0, &cross_attn_kv.1]);
+                cache.layers.push(MoonshineDecoderLayerCache {
+                    self_attn: MoonshineAttentionCache::new(self.max_target_positions),
+                    cross_attn_kv: (materialized[0].clone(), materialized[1].clone()),
+                });
+            }
+
+            hidden_states = layer.forward_cached(
+                &hidden_states,
+                &self_mask,
+                index_pos,
+                &mut cache.layers[i],
+                None,
+            )?;
+            materialize_if_gpu(&hidden_states);
+        }
+
+        let hidden_states = self.norm.forward_fused(&hidden_states);
+        Ok(self.output.forward(&hidden_states))
+    }
+
+    pub fn decode(
+        &mut self,
+        tokens: &[u32],
+        encoder_hidden_states: &Tensor<3, f32>,
+        attention_output: Option<&mut Vec<Tensor<4, f32>>>,
+    ) -> Result<Tensor<3, f32>> {
+        let encoder_hidden_states = self.prepare_encoder_hidden_states(encoder_hidden_states)?;
+        self.decode_prepared(tokens, &encoder_hidden_states, attention_output)
+    }
+}
+
+pub struct Moonshine {
+    pub encoder: MoonshineEncoder,
+    pub decoder: MoonshineDecoder,
+}
+
+impl Moonshine {
+    pub fn load(
+        device: &Device,
+        vb: &mut VarBuilder,
+        config: MoonshineStreamingConfig,
+    ) -> Result<Self> {
+        let encoder = MoonshineEncoder::load(&config.encoder_config, device, &mut vb.pp("model.encoder"))?;
+        let decoder = MoonshineDecoder::load(&config, device, &mut vb.pp("model.decoder"))?;
+        Ok(Self { encoder, decoder })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::moonshine_config::MoonshineStreamingConfig;
+    use std::{fs, io::Cursor, path::Path};
+
+    fn tiny_artifact_dir() -> Option<std::path::PathBuf> {
+        std::env::var("RWHISPER_MOONSHINE_TINY_DIR")
+            .ok()
+            .map(Into::into)
+            .or_else(|| {
+                let dir = Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("artifacts")
+                    .join("moonshine-streaming-tiny");
+                dir.exists().then_some(dir)
+            })
+    }
+
+    #[tokio::test]
+    #[ignore = "requires a local Moonshine tiny artifact directory"]
+    async fn cached_decode_matches_full_decode() {
+        let Some(dir) = tiny_artifact_dir() else {
+            return;
+        };
+
+        let config: MoonshineStreamingConfig =
+            serde_json::from_slice(&fs::read(dir.join("config.json")).unwrap()).unwrap();
+        let weights = fs::read(dir.join("model.gguf")).unwrap();
+        let device = Device::cpu();
+        let mut reader = Cursor::new(weights);
+        let mut vb = VarBuilder::from_gguf(&mut reader).unwrap();
+        let mut model = Moonshine::load(&device, &mut vb, config.clone()).unwrap();
+
+        let samples = vec![0.0f32; config.encoder_config.frame_len() * 80];
+        let encoder_hidden_states = model.encoder.encode(&device, &samples).unwrap();
+        let adapted_encoder_hidden_states = model
+            .decoder
+            .prepare_encoder_hidden_states(&encoder_hidden_states)
+            .unwrap();
+
+        let tokens = [
+            config.decoder_start_token(),
+            123,
+            456,
+            config.eos_token_id.saturating_sub(1),
+        ];
+        let full_logits = model
+            .decoder
+            .decode_prepared(&tokens, &adapted_encoder_hidden_states, None)
+            .unwrap();
+        let full_last = full_logits
+            .narrow(1, tokens.len() - 1, 1)
+            .squeeze(1)
+            .squeeze(0)
+            .to_concrete();
+        let full_last = full_last.as_slice().await.unwrap();
+
+        let mut cache = MoonshineDecoderCache::default();
+        let mut cached_logits = model
+            .decoder
+            .decode_cached(&tokens[..1], &adapted_encoder_hidden_states, &mut cache)
+            .unwrap();
+        for token in &tokens[1..] {
+            cached_logits = model
+                .decoder
+                .decode_cached(&[*token], &adapted_encoder_hidden_states, &mut cache)
+                .unwrap();
+        }
+        let cached_last = cached_logits.squeeze(0).squeeze(0).to_concrete();
+        let cached_last = cached_last.as_slice().await.unwrap();
+
+        assert_eq!(full_last.shape(), cached_last.shape());
+        let max_diff = full_last
+            .as_slice()
+            .iter()
+            .zip(cached_last.as_slice())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            max_diff < 1e-3,
+            "cached decode diverged from full decode: max_diff={max_diff}"
+        );
+    }
+}
