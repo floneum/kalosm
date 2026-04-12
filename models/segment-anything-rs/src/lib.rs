@@ -750,14 +750,11 @@ mod tests {
         );
     }
 
-    /// MRE: GPU dual-consumer buffer reuse bug in pe_encoding.
+    /// Regression test for the shared-node `sin`/`cos` path used by `pe_encoding`.
     ///
     /// When a single lazy graph node feeds into two consumers (sin() and cos()),
-    /// the GPU compute graph can incorrectly reuse/overwrite the shared buffer.
+    /// both GPU consumers must still see the correct values.
     /// This reproduces the exact chain from PositionEmbeddingRandom::pe_encoding().
-    ///
-    /// The bug requires: warmed-up buffer pool + GGUF F32 zero-copy dequantize path.
-    /// Workaround applied in prompt_encoder.rs: duplicate the mul_scalar node.
     #[tokio::test]
     async fn test_dual_consumer_gpu_bug() {
         use fusor::{ConcreteTensor, Device, Tensor};
@@ -845,7 +842,7 @@ mod tests {
                 .broadcast_as([h, gm_shape[0], gm_shape[1]])
                 .to_concrete();
             let mm = coords.mat_mul(&gm3);
-            // Workaround: separate mul_scalar for each consumer
+            // Control path: force distinct mul_scalar nodes for comparison.
             let for_sin = mm.mul_scalar(2.0 * std::f32::consts::PI);
             let for_cos = mm.mul_scalar(2.0 * std::f32::consts::PI);
             Tensor::cat(
@@ -875,11 +872,11 @@ mod tests {
         );
 
         let diff_shared = max_diff(&f_to_vec(&cpu_result), &f_to_vec(&gpu_shared));
-        if diff_shared > 0.01 {
-            // Bug still present — workaround in prompt_encoder.rs is still needed
-        } else {
-            // Bug fixed upstream — workaround can be removed
-        }
+        assert!(
+            diff_shared < 0.01,
+            "shared consumers diverged: {}",
+            diff_shared
+        );
     }
 
     /// Benchmark: fusor GPU vs candle CPU/Metal end-to-end inference.

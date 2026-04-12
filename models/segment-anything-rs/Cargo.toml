@@ -20,12 +20,11 @@ image.workspace = true
 [dev-dependencies]
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 pollster = "0.4"
-candle-core = { workspace = true, features = ["metal"] }
+candle-core = { workspace = true }
 candle-nn = { workspace = true }
 candle-transformers = { workspace = true }
 
-[features]
-cuda = []
-metal = []
-mkl = []
-accelerate = []
+[target.'cfg(target_os = "macos")'.dev-dependencies]
+candle-core = { workspace = true, features = ["metal"] }
+candle-nn = { workspace = true, features = ["metal"] }
+candle-transformers = { workspace = true, features = ["metal"] }

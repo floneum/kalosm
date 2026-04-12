@@ -1,10 +1,87 @@
 //! Mask decoder: predicts masks from image+prompt embeddings.
 
-use fusor::layers::{ConvTranspose2d, Embedding, LayerNorm2d, Linear};
+use fusor::layers::{Embedding, LayerNorm2d, Linear};
 use fusor::{ConcreteTensor, Device, Tensor, VarBuilder};
 
 use super::transformer::TwoWayTransformer;
 use super::Result;
+
+/// Private 2x2 stride-2 learned upsampler used by the SAM output head.
+///
+/// This is intentionally local to the SAM port rather than exposed as a generic
+/// `fusor` layer. The implementation relies on the exact kernel/stride pattern
+/// used by SAM and reorders the result into image space with a pixel-shuffle.
+struct SamUpscale2x2 {
+    weight: Tensor<4, f32, ConcreteTensor<f32, 4>>,
+    bias: Option<Tensor<1, f32, ConcreteTensor<f32, 1>>>,
+}
+
+impl SamUpscale2x2 {
+    fn load(device: &Device, vb: &mut VarBuilder) -> Result<Self> {
+        let weight: Tensor<4, f32> = vb.get("weight", device)?.dequantize();
+        let bias: Option<Tensor<1, f32, ConcreteTensor<f32, 1>>> =
+            vb.get("bias", device).ok().map(|b| b.dequantize());
+        Ok(Self {
+            weight: weight.to_concrete(),
+            bias,
+        })
+    }
+
+    fn forward(
+        &self,
+        input: &Tensor<4, f32, ConcreteTensor<f32, 4>>,
+    ) -> Tensor<4, f32, ConcreteTensor<f32, 4>> {
+        let shape = input.shape();
+        let b = shape[0];
+        let in_ch = shape[1];
+        let h = shape[2];
+        let w = shape[3];
+
+        let weight_shape = self.weight.shape();
+        let out_ch = weight_shape[1];
+        let kh = weight_shape[2];
+        let kw = weight_shape[3];
+
+        assert_eq!(
+            [kh, kw],
+            [2, 2],
+            "SAM upscaling expects a 2x2 transposed-conv kernel, got {:?}",
+            [kh, kw]
+        );
+
+        let input_flat: Tensor<2, f32, ConcreteTensor<f32, 2>> = input
+            .reshape([b, in_ch, h * w])
+            .transpose(1, 2)
+            .to_concrete()
+            .reshape([b * h * w, in_ch])
+            .to_concrete();
+        let weight_flat: Tensor<2, f32, ConcreteTensor<f32, 2>> =
+            self.weight.reshape([in_ch, out_ch * kh * kw]).to_concrete();
+        let result = input_flat.mat_mul(&weight_flat);
+
+        let result: Tensor<6, f32, ConcreteTensor<f32, 6>> =
+            result.reshape([b, h, w, out_ch, kh, kw]).to_concrete();
+        let result: Tensor<4, f32, ConcreteTensor<f32, 4>> = result
+            .transpose(2, 3)
+            .to_concrete()
+            .transpose(1, 2)
+            .to_concrete()
+            .transpose(3, 4)
+            .to_concrete()
+            .reshape([b, out_ch, h * kh, w * kw])
+            .to_concrete();
+
+        if let Some(bias) = &self.bias {
+            let bias_4d: Tensor<4, f32, ConcreteTensor<f32, 4>> = bias
+                .reshape([1, out_ch, 1, 1])
+                .broadcast_as([b, out_ch, h * kh, w * kw])
+                .to_concrete();
+            (result + bias_4d).to_concrete()
+        } else {
+            result
+        }
+    }
+}
 
 struct MlpMaskDecoder {
     layers: Vec<Linear<f32>>,
@@ -49,9 +126,9 @@ pub struct MaskDecoder {
     pub(crate) iou_token: Embedding<f32>,
     pub(crate) mask_tokens: Embedding<f32>,
     iou_prediction_head: MlpMaskDecoder,
-    pub(crate) output_upscaling_conv1: ConvTranspose2d,
+    output_upscaling_conv1: SamUpscale2x2,
     pub(crate) output_upscaling_ln: LayerNorm2d,
-    pub(crate) output_upscaling_conv2: ConvTranspose2d,
+    output_upscaling_conv2: SamUpscale2x2,
     pub(crate) num_mask_tokens: usize,
     output_hypernetworks_mlps: Vec<MlpMaskDecoder>,
     pub(crate) transformer: TwoWayTransformer,
@@ -74,12 +151,10 @@ impl MaskDecoder {
         )?;
         let iou_token = Embedding::load(device, &mut vb.pp("iou_token"))?;
         let mask_tokens = Embedding::load(device, &mut vb.pp("mask_tokens"))?;
-        let output_upscaling_conv1 =
-            ConvTranspose2d::load(device, &mut vb.pp("output_upscaling.0"), [2, 2])?;
+        let output_upscaling_conv1 = SamUpscale2x2::load(device, &mut vb.pp("output_upscaling.0"))?;
         let output_upscaling_ln =
             LayerNorm2d::load(device, &mut vb.pp("output_upscaling.1"), 1e-6)?;
-        let output_upscaling_conv2 =
-            ConvTranspose2d::load(device, &mut vb.pp("output_upscaling.3"), [2, 2])?;
+        let output_upscaling_conv2 = SamUpscale2x2::load(device, &mut vb.pp("output_upscaling.3"))?;
         let mut output_hypernetworks_mlps = Vec::with_capacity(num_mask_tokens);
         for i in 0..num_mask_tokens {
             let mlp = MlpMaskDecoder::load(
@@ -190,8 +265,8 @@ impl MaskDecoder {
         let mask_tokens_out: Tensor<3, f32> = hs.narrow(1, 1, self.num_mask_tokens).to_concrete();
 
         // Upscale mask embeddings
-        // Process each batch item individually through the upscaling pipeline
-        // to work around a GPU framework issue with batch > 1 in ConvTranspose2d/LayerNorm2d.
+        // Process each batch item individually through the upscaling pipeline.
+        // The SAM-specific upscaler and LayerNorm2d are only exercised here.
         let src: Tensor<4, f32> = src
             .transpose(1, 2)
             .to_concrete()

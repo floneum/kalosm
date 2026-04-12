@@ -6,14 +6,12 @@
 
 mod conv1d;
 mod conv2d;
-mod conv_transpose_2d;
 mod embedding;
 mod layer_norm;
 mod layer_norm_2d;
 mod linear;
 mod rms_norm;
 
-pub use conv_transpose_2d::ConvTranspose2d;
 pub use conv1d::{Conv1d, Conv1dConfig};
 pub use conv2d::{Conv2d, Conv2dConfig};
 pub use embedding::Embedding;

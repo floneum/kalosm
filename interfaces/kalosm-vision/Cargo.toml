@@ -20,6 +20,6 @@ futures-util = "0.3.28"
 tokio = { version = "1", features = ["full"] }
 
 [features]
-metal = ["kalosm-ocr/metal", "rwuerstchen/metal", "segment-anything-rs/metal"]
-cublas = ["kalosm-ocr/cuda", "rwuerstchen/cuda", "segment-anything-rs/cuda"]
-mkl = ["kalosm-ocr/mkl", "rwuerstchen/mkl", "segment-anything-rs/mkl"]
+metal = ["kalosm-ocr/metal", "rwuerstchen/metal"]
+cublas = ["kalosm-ocr/cuda", "rwuerstchen/cuda"]
+mkl = ["kalosm-ocr/mkl", "rwuerstchen/mkl"]
