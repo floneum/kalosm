@@ -155,6 +155,33 @@ impl ComputeGraph {
         self.with_mut(|inner| inner.graphvis(root))
     }
 
+    #[cfg(test)]
+    pub(crate) fn node_variant_name(&self, key: NodeIndex) -> &'static str {
+        self.with_mut(|inner| {
+            let node = inner
+                .nodes
+                .nodes
+                .node_weight(key)
+                .expect("Node not found in graph");
+            match &node.variant {
+                ComputeGraphNodeVariant::ElementWise(_) => "ElementWise",
+                ComputeGraphNodeVariant::PairWise(_) => "PairWise",
+                ComputeGraphNodeVariant::Nary(_) => "Nary",
+                ComputeGraphNodeVariant::SliceAssign(_) => "SliceAssign",
+                ComputeGraphNodeVariant::Resize(_) => "Resize",
+                ComputeGraphNodeVariant::MapLayout(_) => "MapLayout",
+                ComputeGraphNodeVariant::Dequantize(_) => "Dequantize",
+                ComputeGraphNodeVariant::MatMul(_) => "MatMul",
+                ComputeGraphNodeVariant::QMatMul(_) => "QMatMul",
+                ComputeGraphNodeVariant::Tensor(_) => "Tensor",
+                ComputeGraphNodeVariant::Reduce(_) => "Reduce",
+                ComputeGraphNodeVariant::IndexSelect(_) => "IndexSelect",
+                ComputeGraphNodeVariant::WhereCond(_) => "WhereCond",
+                ComputeGraphNodeVariant::Custom(_) => "Custom",
+            }
+        })
+    }
+
     pub(crate) fn add_reference(&self, key: NodeIndex) {
         self.with_mut(|inner| inner.add_reference(key));
     }

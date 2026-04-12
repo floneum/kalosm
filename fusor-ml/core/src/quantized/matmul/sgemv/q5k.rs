@@ -186,6 +186,8 @@ pub(crate) fn q5k_sgemv(
 
         for offset in 0..Q5K_SGEMV_CHUNK_SIZE {
             writeln!(kernel, "{{").unwrap();
+            writeln!(kernel, "let row_index = row + {offset};").unwrap();
+            writeln!(kernel, "if row_index < {n_size} {{").unwrap();
             // Fetch and unpack the two sets of values from the cache
             writeln!(kernel, "let first_values_offset = data_offset;").unwrap();
             writeln!(kernel, "let second_values_offset = data_offset + 16u;").unwrap();
@@ -380,6 +382,7 @@ pub(crate) fn q5k_sgemv(
             // Move forward the block offset by one row
             writeln!(kernel, "local_block_offset += k_block_size;").unwrap();
             writeln!(kernel, "}}").unwrap();
+            writeln!(kernel, "}}").unwrap();
         }
 
         // move forward the vector offset
@@ -401,8 +404,9 @@ pub(crate) fn q5k_sgemv(
         {
             // Write the output to the output tensor if this is the first thread in the workgroup
             // Convert from f32 accumulator to output dtype
+            writeln!(kernel, "let row_index = row + {offset};").unwrap();
+            writeln!(kernel, "if row_index < {n_size} {{").unwrap();
             write!(kernel, "{output}[").unwrap();
-            let index = format!("row + {offset}");
             let mut output_indices = Vec::new();
             // Add batch indices first
             for dim in (0..output.rank()).rev().skip(2) {
@@ -410,7 +414,7 @@ pub(crate) fn q5k_sgemv(
             }
             // Then add M and N indices
             output_indices.push("m_idx".to_string());
-            output_indices.push(index);
+            output_indices.push("row_index".to_string());
             output.strided_index(kernel, output_indices);
             let indexed = maybe_vec_storage_index(Q5K_SGEMV_CHUNK_SIZE, "sum", offset);
             let result = post_element_wise_functions
@@ -418,6 +422,7 @@ pub(crate) fn q5k_sgemv(
                 .iter()
                 .fold(format!("{dtype}({indexed})"), |acc, f| f.call(vec![acc]));
             writeln!(kernel, "] = {result};").unwrap();
+            writeln!(kernel, "}}").unwrap();
         }
         writeln!(kernel, "}}").unwrap();
     }

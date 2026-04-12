@@ -83,8 +83,6 @@ impl QMatMulOperation {
 impl<const R: usize, T: DataType> Tensor<R, T> {
     pub fn q_mat_mul(&self, other: &QMatrix) -> Self {
         let in_shape = self.shape();
-        let m = in_shape[R - 2];
-        let rows = in_shape[..R - 1].iter().product::<usize>();
 
         // For F16/F32 matrices, dequantize and use regular mat_mul
         // because they don't have block structure like quantized types
@@ -106,43 +104,6 @@ impl<const R: usize, T: DataType> Tensor<R, T> {
             return output_2d.reshape(out_shape);
         }
 
-        // Metal has an unresolved issue with tiny-M standalone quantized matmuls
-        // which shows up during cached decoder cross-attention K/V projection.
-        // Fall back to a dequantize + regular matmul path there instead of the
-        // quantized kernel, and materialize the intermediates on GPU so the
-        // problematic lazy quantized graph never reaches execution.
-        if self.device().wgpu_adapter().get_info().backend == wgpu::Backend::Metal && m <= 16 {
-            use pollster::FutureExt as _;
-
-            let profile = std::env::var_os("RWHISPER_COHERE_PROFILE").is_some();
-            let dequantized: Tensor<2, T> = other.dequantize();
-            let k = in_shape[R - 1];
-            let n = other.shape()[0];
-
-            if profile {
-                eprintln!(
-                    "q_mat_mul metal tiny_m start: shape={:?} rows={} m={} n={} dtype={:?}",
-                    in_shape,
-                    rows,
-                    m,
-                    n,
-                    other.datatype()
-                );
-            }
-            let input_2d: Tensor<2, T> = self.reshape([rows, k]).materialized().block_on();
-            let weight_t = dequantized.transpose(0, 1).materialized().block_on();
-            if profile {
-                eprintln!("q_mat_mul metal tiny_m weight materialized");
-            }
-            let output_2d = input_2d.mat_mul(&weight_t).materialized().block_on();
-            if profile {
-                eprintln!("q_mat_mul metal tiny_m output materialized");
-            }
-
-            let out_shape: [usize; R] =
-                std::array::from_fn(|i| if i == R - 1 { n } else { in_shape[i] });
-            return output_2d.reshape(out_shape);
-        }
         self.add_q_mat_mul(other)
     }
 }
@@ -1102,6 +1063,18 @@ fn q8_matrix_from_rows(device: &Device, rows: &[Vec<i8>]) -> QMatrix {
 }
 
 #[cfg(test)]
+fn q8_test_matrix_with_rows(device: &Device, row_count: usize) -> QMatrix {
+    let rows: Vec<Vec<i8>> = (0..row_count)
+        .map(|row| {
+            (0..32)
+                .map(|value| ((row as i32 * 3 + value as i32) % 23 - 11) as i8)
+                .collect()
+        })
+        .collect();
+    q8_matrix_from_rows(device, &rows)
+}
+
+#[cfg(test)]
 async fn assert_close_3d(actual: &Tensor<3, f32>, expected: &Tensor<3, f32>) {
     let actual = actual.as_slice().await.unwrap();
     let expected = expected.as_slice().await.unwrap();
@@ -1135,9 +1108,9 @@ fn q8_test_matrix(device: &Device) -> QMatrix {
 }
 
 #[cfg(test)]
-fn q8_test_input(device: &Device) -> Tensor<3, f32> {
+fn q8_test_input_with_rows(device: &Device, rows: usize) -> Tensor<3, f32> {
     let input_data: Vec<Vec<Vec<f32>>> = vec![{
-        (0..17)
+        (0..rows)
             .map(|row| {
                 (0..32)
                     .map(|value| (row as f32 + 1.0) * (value as f32 - 7.5) * 0.125)
@@ -1146,6 +1119,57 @@ fn q8_test_input(device: &Device) -> Tensor<3, f32> {
             .collect()
     }];
     Tensor::<3, f32>::new(device, &input_data)
+}
+
+#[cfg(test)]
+fn q8_test_input(device: &Device) -> Tensor<3, f32> {
+    q8_test_input_with_rows(device, 17)
+}
+
+#[cfg(test)]
+#[test]
+fn test_q8_0_specialized_sgemv_enabled_on_metal() {
+    let device = Device::test_instance();
+    if device.wgpu_adapter().get_info().backend != wgpu::Backend::Metal {
+        return;
+    }
+    if !device.subgroups_supported() || device.max_subgroup_size() < 2 * device.min_subgroup_size()
+    {
+        return;
+    }
+
+    let op = QMatMulOperation::new(
+        DataTypeEnum::F32,
+        &[1, 8, 32],
+        NodeIndex::new(0),
+        q8_test_matrix_with_rows(&device, 3),
+    );
+
+    assert_eq!(sgemv::selected_sgemv_kernel_kind(&op, &device), "q_8_0");
+}
+
+#[cfg(test)]
+#[tokio::test]
+async fn test_q_mat_mul_metal_tiny_m_stays_quantized_and_correct() {
+    let device = Device::test_instance();
+    if device.wgpu_adapter().get_info().backend != wgpu::Backend::Metal {
+        return;
+    }
+
+    let q_matrix = q8_test_matrix_with_rows(&device, 3);
+    let input = q8_test_input_with_rows(&device, 8);
+
+    let result: Tensor<3, f32> = input.q_mat_mul(&q_matrix);
+    assert_eq!(
+        device.compute_graph().node_variant_name(result.key()),
+        "QMatMul"
+    );
+
+    let dequantized: Tensor<2, f32> = q_matrix.dequantize();
+    let expected_2d: Tensor<2, f32> = input.reshape([8, 32]).mat_mul(&dequantized.transpose(0, 1));
+    let expected = expected_2d.reshape([1, 8, 3]);
+
+    assert_close_3d(&result, &expected).await;
 }
 
 #[cfg(test)]

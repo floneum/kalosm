@@ -1153,21 +1153,34 @@ impl Resolver {
         new_inputs: Vec<MirValue>,
         inputs: &[Vec<MirValue>],
     ) -> bool {
-        for input in &new_inputs {
+        fn is_tensor_output(values: &[MirValue], index: usize) -> bool {
+            index + 1 == values.len() && values[index].as_tensor().is_some()
+        }
+
+        for (new_index, input) in new_inputs.iter().enumerate() {
             let Some(input_tensor) = input.as_tensor() else {
                 continue;
             };
-            for other in inputs.iter().flatten() {
-                let Some(other_tensor) = other.as_tensor() else {
-                    continue;
-                };
+            for pending in inputs {
+                for (pending_index, other) in pending.iter().enumerate() {
+                    let Some(other_tensor) = other.as_tensor() else {
+                        continue;
+                    };
 
-                // Batched kernels are only safe when they touch disjoint tensor buffers.
-                // Views created by reshape/transpose share the same storage, so extending
-                // across them can read values that were written by a different invocation
-                // earlier in the same dispatch.
-                if std::sync::Arc::ptr_eq(input_tensor.buffer(), other_tensor.buffer()) {
-                    return false;
+                    // Read/read aliasing is safe. We only need to split dispatches
+                    // when a pending write aliases a later read or write.
+                    let new_writes = is_tensor_output(&new_inputs, new_index);
+                    let pending_writes = is_tensor_output(pending, pending_index);
+                    if !new_writes && !pending_writes {
+                        continue;
+                    }
+
+                    // Views created by reshape/transpose share the same storage, so extending
+                    // across a write/read or write/write dependency can observe incomplete data
+                    // from another invocation in the same dispatch.
+                    if std::sync::Arc::ptr_eq(input_tensor.buffer(), other_tensor.buffer()) {
+                        return false;
+                    }
                 }
             }
         }
@@ -1307,25 +1320,57 @@ mod tests {
 
         let pending_tensor = TensorData::new_for_shape(&device, &[4, 4], DataTypeEnum::F32);
         let new_tensor = TensorData::new_for_shape(&device, &[4, 4], DataTypeEnum::F32);
+        let pending_output = TensorData::new_for_shape(&device, &[4, 4], DataTypeEnum::F32);
+        let new_output = TensorData::new_for_shape(&device, &[4, 4], DataTypeEnum::F32);
 
         assert!(resolver.should_extend_kernel(
-            vec![MirValue::Tensor(new_tensor)],
-            &[vec![MirValue::Tensor(pending_tensor)]],
+            vec![MirValue::Tensor(new_tensor), MirValue::Tensor(new_output)],
+            &[vec![
+                MirValue::Tensor(pending_tensor),
+                MirValue::Tensor(pending_output),
+            ]],
         ));
     }
 
     #[test]
-    fn test_should_extend_kernel_blocks_shared_buffer_views() {
+    fn test_should_extend_kernel_allows_shared_read_only_inputs() {
         let device = Device::test_instance();
         let mut graph = ComputeGraphInner::new(&device);
         let mut resolver = Resolver::new_many(&mut graph, &[], &device);
 
-        let pending_tensor = TensorData::new_for_shape(&device, &[4, 4], DataTypeEnum::F32);
-        let aliased_view = pending_tensor.slice(&[1..3, 0..4]);
+        let shared_input = TensorData::new_for_shape(&device, &[4, 4], DataTypeEnum::F32);
+        let pending_output = TensorData::new_for_shape(&device, &[4, 4], DataTypeEnum::F32);
+        let new_output = TensorData::new_for_shape(&device, &[4, 4], DataTypeEnum::F32);
+
+        assert!(resolver.should_extend_kernel(
+            vec![
+                MirValue::Tensor(shared_input.clone()),
+                MirValue::Tensor(new_output),
+            ],
+            &[vec![
+                MirValue::Tensor(shared_input),
+                MirValue::Tensor(pending_output),
+            ]],
+        ));
+    }
+
+    #[test]
+    fn test_should_extend_kernel_blocks_output_to_view_dependency() {
+        let device = Device::test_instance();
+        let mut graph = ComputeGraphInner::new(&device);
+        let mut resolver = Resolver::new_many(&mut graph, &[], &device);
+
+        let pending_input = TensorData::new_for_shape(&device, &[4, 4], DataTypeEnum::F32);
+        let pending_output = TensorData::new_for_shape(&device, &[4, 4], DataTypeEnum::F32);
+        let aliased_view = pending_output.slice(&[1..3, 0..4]);
+        let new_output = TensorData::new_for_shape(&device, &[2, 4], DataTypeEnum::F32);
 
         assert!(!resolver.should_extend_kernel(
-            vec![MirValue::Tensor(aliased_view)],
-            &[vec![MirValue::Tensor(pending_tensor)]],
+            vec![MirValue::Tensor(aliased_view), MirValue::Tensor(new_output)],
+            &[vec![
+                MirValue::Tensor(pending_input),
+                MirValue::Tensor(pending_output),
+            ]],
         ));
     }
 }

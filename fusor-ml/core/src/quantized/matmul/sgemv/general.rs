@@ -149,6 +149,8 @@ pub(crate) fn general_sgemv(
         } else {
             "workgroup_offset"
         };
+        writeln!(kernel, "let row_in_bounds = {index} < {n_size};").unwrap();
+        writeln!(kernel, "if row_in_bounds {{").unwrap();
         writeln!(
             kernel,
             "let chunk = &{input_b}[{index} * k_block_size + index];"
@@ -167,6 +169,7 @@ pub(crate) fn general_sgemv(
                 writeln!(code, "{acc_indexed} += dot(a_cache[{index}], {data});").unwrap();
             },
         );
+        writeln!(kernel, "}}").unwrap();
 
         if SGEMV_CHUNK_SIZE > 1 {
             writeln!(kernel, "}}").unwrap();
@@ -287,6 +290,7 @@ pub(crate) fn general_sgemv(
         } else {
             writeln!(kernel, "let output_index = workgroup_offset;").unwrap();
         }
+        writeln!(kernel, "if output_index >= {n_size} {{ continue; }}").unwrap();
         write!(kernel, "{output}[").unwrap();
         let mut output_indices = Vec::new();
         // Add batch indices first

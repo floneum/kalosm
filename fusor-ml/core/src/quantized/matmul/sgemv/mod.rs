@@ -69,7 +69,7 @@ pub(crate) fn decompose_workgroup_index(
 /// This requires the workgroup to be large enough to fit 2 subgroups, which means:
 /// max_subgroup_size >= 2 * min_subgroup_size
 pub(crate) fn quantized_sgemv_subgroups_supported(device: &Device) -> bool {
-    device.subgroups_supported() && device.wgpu_adapter().get_info().backend != wgpu::Backend::Metal
+    device.subgroups_supported()
 }
 
 fn can_use_specialized_sgemv(device: &Device) -> bool {
@@ -82,15 +82,20 @@ fn can_use_specialized_sgemv(device: &Device) -> bool {
 }
 
 fn can_use_specialized_q8_0_sgemv(device: &Device) -> bool {
-    if !can_use_specialized_sgemv(device) {
-        return false;
-    }
+    can_use_specialized_sgemv(device)
+}
 
-    // The subgroup-specialized Q8_0 kernel is unstable on Metal for the tiny
-    // batched widths used by encoder-decoder cross-attention cache init.
-    // Fall back to the general SGEMV path there until the specialized kernel is
-    // fixed.
-    device.wgpu_adapter().get_info().backend != wgpu::Backend::Metal
+#[cfg(test)]
+pub(crate) fn selected_sgemv_kernel_kind(op: &QMatMulOperation, device: &Device) -> &'static str {
+    let use_specialized = can_use_specialized_sgemv(device);
+    match op.matrix.datatype {
+        GgmlType::Q6K if use_specialized => "q6k",
+        GgmlType::Q4K if use_specialized => "q4k",
+        GgmlType::Q5K if use_specialized => "q5k",
+        GgmlType::Q4_0 | GgmlType::Q5_0 if use_specialized => "q_n",
+        GgmlType::Q8_0 if can_use_specialized_q8_0_sgemv(device) => "q_8_0",
+        _ => "general",
+    }
 }
 
 #[allow(clippy::too_many_arguments)]

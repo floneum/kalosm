@@ -168,6 +168,13 @@ pub(crate) fn q6k_sgemv(
             .unwrap();
         }
         {
+            let row_index = if Q6K_SGEMV_CHUNK_SIZE > 1 {
+                "row + offset"
+            } else {
+                "row"
+            };
+            writeln!(kernel, "let row_index = {row_index};").unwrap();
+            writeln!(kernel, "if row_index < {n_size} {{").unwrap();
             if Q6K_SGEMV_CHUNK_SIZE > 1 {
                 writeln!(
                     kernel,
@@ -245,6 +252,7 @@ pub(crate) fn q6k_sgemv(
             writeln!(kernel, "}}").unwrap();
             let indexed = maybe_vec_storage_index(Q6K_SGEMV_CHUNK_SIZE, "sum", "offset");
             writeln!(kernel, "{indexed} += scale * dot(sums, scales);").unwrap();
+            writeln!(kernel, "}}").unwrap();
         }
         if Q6K_SGEMV_CHUNK_SIZE > 1 {
             writeln!(kernel, "}}").unwrap();
@@ -272,12 +280,14 @@ pub(crate) fn q6k_sgemv(
     }
     {
         // Write the output to the output tensor if this is the first thread in the workgroup
-        write!(kernel, "{output}[").unwrap();
         let index = if Q6K_SGEMV_CHUNK_SIZE > 1 {
             "row + offset".to_string()
         } else {
             "row".to_string()
         };
+        writeln!(kernel, "let row_index = {index};").unwrap();
+        writeln!(kernel, "if row_index < {n_size} {{").unwrap();
+        write!(kernel, "{output}[").unwrap();
         let mut output_indices = Vec::new();
         // Add batch indices first
         for dim in (0..output.rank()).rev().skip(2) {
@@ -285,7 +295,7 @@ pub(crate) fn q6k_sgemv(
         }
         // Then add M and N indices
         output_indices.push("m_idx".to_string());
-        output_indices.push(index);
+        output_indices.push("row_index".to_string());
         output.strided_index(kernel, output_indices);
         let indexed = maybe_vec_storage_index(Q6K_SGEMV_CHUNK_SIZE, "sum", "offset");
         let result = post_element_wise_functions
@@ -293,6 +303,7 @@ pub(crate) fn q6k_sgemv(
             .iter()
             .fold(format!("{dtype}({indexed})"), |acc, f| f.call(vec![acc]));
         writeln!(kernel, "] = {result};").unwrap();
+        writeln!(kernel, "}}").unwrap();
     }
     if Q6K_SGEMV_CHUNK_SIZE > 1 {
         writeln!(kernel, "}}").unwrap();
