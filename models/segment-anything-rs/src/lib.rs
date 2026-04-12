@@ -1,6 +1,9 @@
 //! # Segment Anything RS
 //! A rust wrapper for [Segment Anything](https://segment-anything.com/)
 //!
+//! The model uses fusor tensors and prefers GPU execution when available,
+//! automatically falling back to CPU otherwise.
+//!
 //! ## Usage
 //!
 //! ```rust, no_run
@@ -31,12 +34,21 @@ use raw::sam::{
 #[derive(Default)]
 pub struct SegmentAnythingBuilder {
     source: SegmentAnythingSource,
+    device: Option<Device>,
 }
 
 impl SegmentAnythingBuilder {
     /// Sets the source of the model.
     pub fn source(mut self, source: SegmentAnythingSource) -> Self {
         self.source = source;
+        self
+    }
+
+    /// Sets the fusor device used to load and run the model.
+    ///
+    /// When not specified, the builder prefers GPU and falls back to CPU.
+    pub fn device(mut self, device: Device) -> Self {
+        self.device = Some(device);
         self
     }
 
@@ -154,8 +166,8 @@ impl SegmentAnythingInferenceSettings {
 /// An error that can occur when loading a [`SegmentAnything`] model.
 #[derive(Debug, thiserror::Error)]
 pub enum LoadSegmentAnythingError {
-    /// An error that can occur when trying to load a [`SegmentAnything`] model into a device.
-    #[error("Failed to load model into device: {0}")]
+    /// An error that can occur when initializing the runtime for a [`SegmentAnything`] model.
+    #[error("Failed to initialize model runtime: {0}")]
     LoadModel(#[from] fusor::Error),
     /// An error that can occur when downloading a [`SegmentAnything`] model from Hugging Face.
     #[error("Failed to download model from Hugging Face: {0}")]
@@ -189,15 +201,16 @@ impl SegmentAnything {
     }
 
     async fn new(settings: SegmentAnythingBuilder) -> Result<Self, LoadSegmentAnythingError> {
-        let SegmentAnythingBuilder { source } = settings;
+        let SegmentAnythingBuilder { source, device } = settings;
         let model_path = {
             let api = hf_hub::api::sync::Api::new()?;
             let api = api.model(source.model);
             api.get(&source.filename)?
         };
-        let device = Device::new()
-            .await
-            .map_err(|e| fusor::Error::msg(format!("GPU init: {e}")))?;
+        let device = match device {
+            Some(device) => device,
+            None => Device::auto().await,
+        };
         let mut reader = std::io::BufReader::new(std::fs::File::open(&model_path)?);
         let mut vb = VarBuilder::from_gguf(&mut reader)
             .map_err(|e| fusor::Error::msg(format!("Failed to read GGUF: {e}")))?;
@@ -218,10 +231,8 @@ impl SegmentAnything {
     /// # async fn run() {
     /// let model = SegmentAnything::builder().build().await.unwrap();
     /// let image = image::open("examples/landscape.jpg").unwrap();
-    /// let x = image.width() / 2;
-    /// let y = image.height() / 4;
     /// let images = model
-    ///     .segment_from_points(SegmentAnythingInferenceSettings::new(image).add_goal_point(x, y))
+    ///     .segment_from_points(SegmentAnythingInferenceSettings::new(image).add_goal_point(0.5, 0.25))
     ///     .await
     ///     .unwrap();
     ///
@@ -290,10 +301,7 @@ impl SegmentAnything {
             .to_concrete();
         let mask_flat: Tensor<1, f32, ConcreteTensor<f32, 1>> =
             mask_hwc.reshape([h * w * 3]).to_concrete();
-        let mask_slice = mask_flat
-            .as_slice()
-            .await
-            .expect("Failed to read mask data");
+        let mask_slice = mask_flat.as_slice().await?;
         let mask_pixels: Vec<u8> = mask_slice.as_slice().iter().map(|&v| v as u8).collect();
 
         let mask_img: image::ImageBuffer<image::Rgb<u8>, Vec<u8>> =
@@ -405,24 +413,18 @@ impl SegmentAnything {
             // padded 1024x1024 image space. The actual image occupies only the top-left
             // (original_h, original_w) region of that 1024x1024 space. Compute the
             // corresponding crop region at the low-res mask scale.
-            let crop_h = (original_h * mask_h) / IMAGE_SIZE;
-            let crop_w = (original_w * mask_w) / IMAGE_SIZE;
+            let crop_h = low_res_crop_extent(original_h, mask_h);
+            let crop_w = low_res_crop_extent(original_w, mask_w);
 
             let masks_flat: Tensor<1, f32, ConcreteTensor<f32, 1>> =
                 low_res_masks.reshape([total_mask_elems]).to_concrete();
-            let masks_slice = masks_flat
-                .as_slice()
-                .await
-                .expect("Failed to read mask data");
+            let masks_slice = masks_flat.as_slice().await?;
             let masks_vec = masks_slice.as_slice();
 
             let total_iou_elems = batch * n_masks_per_point;
             let iou_flat: Tensor<1, f32, ConcreteTensor<f32, 1>> =
                 iou_preds.reshape([total_iou_elems]).to_concrete();
-            let iou_slice = iou_flat
-                .as_slice()
-                .await
-                .expect("Failed to read IoU data");
+            let iou_slice = iou_flat.as_slice().await?;
             let iou_vec = iou_slice.as_slice();
 
             for point_idx in 0..batch {
@@ -468,7 +470,11 @@ impl SegmentAnything {
         }
 
         // NMS: sort by IoU descending, suppress overlapping masks
-        candidates.sort_by(|a, b| b.iou.partial_cmp(&a.iou).unwrap_or(std::cmp::Ordering::Equal));
+        candidates.sort_by(|a, b| {
+            b.iou
+                .partial_cmp(&a.iou)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
         let mut keep = vec![true; candidates.len()];
         for i in 0..candidates.len() {
             if !keep[i] {
@@ -497,7 +503,11 @@ impl SegmentAnything {
                 .mask_data
                 .iter()
                 .flat_map(|&v| {
-                    let p = if v >= MODEL_MASK_THRESHOLD { 255u8 } else { 0u8 };
+                    let p = if v >= MODEL_MASK_THRESHOLD {
+                        255u8
+                    } else {
+                        0u8
+                    };
                     [p, p, p]
                 })
                 .collect();
@@ -517,14 +527,12 @@ impl SegmentAnything {
         Ok(masks)
     }
 
-    /// Load from a local GGUF file path on the GPU.
+    /// Load from a local GGUF file path using fusor, preferring GPU but falling back to CPU.
     pub async fn from_gguf_path(
         path: &std::path::Path,
         tiny: bool,
     ) -> Result<Self, LoadSegmentAnythingError> {
-        let device = Device::new()
-            .await
-            .map_err(|e| fusor::Error::msg(format!("GPU init: {e}")))?;
+        let device = Device::auto().await;
         let mut reader = std::io::BufReader::new(std::fs::File::open(path)?);
         let mut vb = VarBuilder::from_gguf(&mut reader)
             .map_err(|e| fusor::Error::msg(format!("Failed to read GGUF: {e}")))?;
@@ -558,10 +566,32 @@ fn mask_iou(a: &[f32], b: &[f32]) -> f32 {
     }
 }
 
+fn low_res_crop_extent(original_len: usize, low_res_len: usize) -> usize {
+    (original_len * low_res_len)
+        .div_ceil(IMAGE_SIZE)
+        .min(low_res_len)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::path::Path;
+
+    fn load_model_with_device(
+        gguf_path: &Path,
+        device: Device,
+        tiny: bool,
+    ) -> Result<SegmentAnything, LoadSegmentAnythingError> {
+        let mut reader = std::io::BufReader::new(std::fs::File::open(gguf_path)?);
+        let mut vb = VarBuilder::from_gguf(&mut reader)
+            .map_err(|e| fusor::Error::msg(format!("Failed to read GGUF: {e}")))?;
+        let sam = if tiny {
+            raw::sam::Sam::load_tiny(&device, &mut vb)?
+        } else {
+            raw::sam::Sam::load_vit_b(&device, &mut vb)?
+        };
+        Ok(SegmentAnything { sam, device })
+    }
 
     fn f_to_vec<const R: usize>(t: &Tensor<R, f32>) -> Vec<f32> {
         let shape = t.shape();
@@ -616,6 +646,31 @@ mod tests {
         let black_frac = black_count as f64 / total as f64;
         assert!(white_frac > 0.01, "Mask is all black");
         assert!(black_frac > 0.01, "Mask is all white");
+    }
+
+    #[tokio::test]
+    async fn test_load_tiny_model_cpu_runtime() {
+        let gguf_path = Path::new("/tmp/mobile_sam-tiny-vitt.gguf");
+        if !gguf_path.exists() {
+            return;
+        }
+
+        let model = load_model_with_device(gguf_path, Device::cpu(), true)
+            .expect("Failed to load model on CPU");
+
+        let image_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/landscape.jpg");
+        let image = image::open(&image_path).expect("Failed to open test image");
+
+        let mask = model
+            .segment_from_points(
+                SegmentAnythingInferenceSettings::new(image).add_goal_point(0.5, 0.25),
+            )
+            .await
+            .expect("Failed to run CPU inference");
+
+        assert!(mask.width() > 0);
+        assert!(mask.height() > 0);
+        assert!(model.device.is_cpu());
     }
 
     /// CPU vs GPU mask decoder: dense PE, prompt encoder, transformer, masks, IoU.
@@ -1080,15 +1135,13 @@ mod tests {
             );
             let ms = masks.shape();
             let m_total = ms[0] * ms[1] * ms[2] * ms[3];
-            let mf: Tensor<1, f32, ConcreteTensor<f32, 1>> =
-                masks.reshape([m_total]).to_concrete();
+            let mf: Tensor<1, f32, ConcreteTensor<f32, 1>> = masks.reshape([m_total]).to_concrete();
             let ms_data = mf.as_slice().await.unwrap();
             unbatched_masks_data.extend_from_slice(ms_data.as_slice());
 
             let is = iou.shape();
             let i_total = is[0] * is[1];
-            let if_: Tensor<1, f32, ConcreteTensor<f32, 1>> =
-                iou.reshape([i_total]).to_concrete();
+            let if_: Tensor<1, f32, ConcreteTensor<f32, 1>> = iou.reshape([i_total]).to_concrete();
             let is_data = if_.as_slice().await.unwrap();
             unbatched_iou_data.extend_from_slice(is_data.as_slice());
         }
@@ -1126,5 +1179,13 @@ mod tests {
             iou_diff < 0.01,
             "Batched vs unbatched IoU divergence too large: {iou_diff}"
         );
+    }
+
+    #[test]
+    fn test_low_res_crop_extent_uses_ceil_coverage() {
+        assert_eq!(low_res_crop_extent(771, 256), 193);
+        assert_eq!(low_res_crop_extent(769, 256), 193);
+        assert_eq!(low_res_crop_extent(1024, 256), 256);
+        assert_eq!(low_res_crop_extent(1, 256), 1);
     }
 }

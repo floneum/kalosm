@@ -281,8 +281,7 @@ impl Sam {
         let lbls: Tensor<2, f32> = Tensor::from_slice(&device, [batch_size, 1], &labels);
 
         let (sparse_prompt_embeddings, dense_prompt_embeddings) =
-            self.prompt_encoder
-                .forward(Some((&pts, &lbls)), None, None);
+            self.prompt_encoder.forward(Some((&pts, &lbls)), None, None);
 
         self.mask_decoder.forward(
             img_embeddings,

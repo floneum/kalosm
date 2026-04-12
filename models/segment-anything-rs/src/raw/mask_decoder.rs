@@ -207,9 +207,7 @@ impl MaskDecoder {
         } else {
             let mut upscaled_items = Vec::with_capacity(batch_size);
             for i in 0..batch_size {
-                let src_i: Tensor<4, f32> = src
-                    .narrow(0, i, 1)
-                    .to_concrete();
+                let src_i: Tensor<4, f32> = src.narrow(0, i, 1).to_concrete();
                 let up_i = self.output_upscaling_conv1.forward(&src_i);
                 let up_i = self.output_upscaling_ln.forward(&up_i);
                 let up_i = up_i.gelu();
