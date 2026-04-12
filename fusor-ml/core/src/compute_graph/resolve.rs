@@ -158,7 +158,6 @@ impl Resolver {
                     inputs.clear();
                     kernel.clear();
                     self.dispatched_kernels_since_submit += 1;
-                    self.maybe_submit_partial();
                 }
                 current_constraints = constraint;
             }
@@ -206,7 +205,6 @@ impl Resolver {
                 old_best,
             );
             self.dispatched_kernels_since_submit += 1;
-            self.maybe_submit_partial();
         }
 
         self.submit_encoder();
@@ -239,14 +237,6 @@ impl Resolver {
         ResolverManyResult {
             data,
             total_kernels,
-        }
-    }
-
-    fn maybe_submit_partial(&mut self) {
-        if self.device.wgpu_adapter().get_info().backend == wgpu::Backend::Metal
-            && self.dispatched_kernels_since_submit >= 1
-        {
-            self.submit_encoder();
         }
     }
 

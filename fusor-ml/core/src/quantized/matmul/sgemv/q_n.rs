@@ -74,6 +74,13 @@ pub(crate) fn q_n_sgemv(
     )
     .unwrap();
 
+    // Fast path check: if all rows in this tile are valid, skip per-row bounds checks
+    writeln!(
+        kernel,
+        "let is_full_tile = row + {Q_N_SGEMV_CHUNK_SIZE} <= {n_size};"
+    )
+    .unwrap();
+
     writeln!(kernel, "let row_block_offset = row * k_block_size;").unwrap();
 
     writeln!(kernel, "let thread_id = {subgroup_local_index} / 2;").unwrap();
@@ -166,6 +173,28 @@ pub(crate) fn q_n_sgemv(
         writeln!(kernel, "let vector_total = vector_sum;").unwrap();
 
         writeln!(kernel, "var block_offset = row_block_offset + i;").unwrap();
+
+        // Fast path: all rows in tile are valid, no bounds checks needed
+        writeln!(kernel, "if is_full_tile {{").unwrap();
+        if Q_N_SGEMV_CHUNK_SIZE > 1 {
+            writeln!(
+                kernel,
+                "for (var offset = 0u; offset < {Q_N_SGEMV_CHUNK_SIZE}; offset += 1u) {{"
+            )
+            .unwrap();
+        }
+        {
+            writeln!(kernel, "let row_index = row + offset;").unwrap();
+            block_dot(kernel, op, input_b);
+            let indexed = maybe_vec_storage_index(Q_N_SGEMV_CHUNK_SIZE, "sum", "offset");
+            writeln!(kernel, "{indexed} += product;").unwrap();
+        }
+        if Q_N_SGEMV_CHUNK_SIZE > 1 {
+            writeln!(kernel, "block_offset += k_block_size;").unwrap();
+            writeln!(kernel, "}}").unwrap();
+        }
+        writeln!(kernel, "}} else {{").unwrap();
+        // Slow path: check bounds for each row
         if Q_N_SGEMV_CHUNK_SIZE > 1 {
             writeln!(
                 kernel,
@@ -185,6 +214,7 @@ pub(crate) fn q_n_sgemv(
             writeln!(kernel, "block_offset += k_block_size;").unwrap();
             writeln!(kernel, "}}").unwrap();
         }
+        writeln!(kernel, "}}").unwrap();
 
         writeln!(kernel, "y_offset += {elements_per_block} * 16;").unwrap();
     }
@@ -198,8 +228,31 @@ pub(crate) fn q_n_sgemv(
     )
     .unwrap();
 
-    // If this is not the first simd thread in the workgroup, we can return early
+    // Initialize post element-wise functions once before the loop
+    let post_fns = post_element_wise_functions
+        .get_or_init(|| op.post_element_wise.add_functions(kernel));
 
+    // Generate the output body for one row
+    let generate_row_output = |kernel: &mut GenericKernel| {
+        write!(kernel, "{output}[").unwrap();
+        let mut output_indices = Vec::new();
+        // Add batch indices first
+        for dim in (0..output.rank()).rev().skip(2) {
+            output_indices.push(format!("batch_idx_{dim}"));
+        }
+        // Then add M and N indices
+        output_indices.push("m_idx".to_string());
+        output_indices.push("row_index".to_string());
+        output.strided_index(kernel, output_indices);
+        let indexed = maybe_vec_storage_index(Q_N_SGEMV_CHUNK_SIZE, "sum", "offset");
+        let result = post_fns
+            .iter()
+            .fold(format!("{dtype}({indexed})"), |acc, f| f.call(vec![acc]));
+        writeln!(kernel, "] = {result};").unwrap();
+    };
+
+    // Fast path: all rows in tile are valid, no bounds checks needed
+    writeln!(kernel, "if is_full_tile {{").unwrap();
     if Q_N_SGEMV_CHUNK_SIZE > 1 {
         writeln!(
             kernel,
@@ -209,39 +262,44 @@ pub(crate) fn q_n_sgemv(
     }
     {
         writeln!(kernel, "if {subgroup_local_index} == 0u {{").unwrap();
-        {
-            // Write the output to the output tensor if this is the first thread in the workgroup
-            // Convert from f32 accumulator to output dtype
-            let index = if Q_N_SGEMV_CHUNK_SIZE > 1 {
-                "row + offset".to_string()
-            } else {
-                "row".to_string()
-            };
-            writeln!(kernel, "let row_index = {index};").unwrap();
-            writeln!(kernel, "if row_index < {n_size} {{").unwrap();
-            write!(kernel, "{output}[").unwrap();
-            let mut output_indices = Vec::new();
-            // Add batch indices first
-            for dim in (0..output.rank()).rev().skip(2) {
-                output_indices.push(format!("batch_idx_{dim}"));
-            }
-            // Then add M and N indices
-            output_indices.push("m_idx".to_string());
-            output_indices.push("row_index".to_string());
-            output.strided_index(kernel, output_indices);
-            let indexed = maybe_vec_storage_index(Q_N_SGEMV_CHUNK_SIZE, "sum", "offset");
-            let result = post_element_wise_functions
-                .get_or_init(|| op.post_element_wise.add_functions(kernel))
-                .iter()
-                .fold(format!("{dtype}({indexed})"), |acc, f| f.call(vec![acc]));
-            writeln!(kernel, "] = {result};").unwrap();
-            writeln!(kernel, "}}").unwrap();
-        }
+        let index = if Q_N_SGEMV_CHUNK_SIZE > 1 {
+            "row + offset".to_string()
+        } else {
+            "row".to_string()
+        };
+        writeln!(kernel, "let row_index = {index};").unwrap();
+        generate_row_output(kernel);
         writeln!(kernel, "}}").unwrap();
     }
     if Q_N_SGEMV_CHUNK_SIZE > 1 {
         writeln!(kernel, "}}").unwrap();
     }
+    writeln!(kernel, "}} else {{").unwrap();
+    // Slow path: check bounds for each row
+    if Q_N_SGEMV_CHUNK_SIZE > 1 {
+        writeln!(
+            kernel,
+            "for (var offset = 0u; offset < {Q_N_SGEMV_CHUNK_SIZE}; offset += 1u) {{"
+        )
+        .unwrap();
+    }
+    {
+        writeln!(kernel, "if {subgroup_local_index} == 0u {{").unwrap();
+        let index = if Q_N_SGEMV_CHUNK_SIZE > 1 {
+            "row + offset".to_string()
+        } else {
+            "row".to_string()
+        };
+        writeln!(kernel, "let row_index = {index};").unwrap();
+        writeln!(kernel, "if row_index < {n_size} {{").unwrap();
+        generate_row_output(kernel);
+        writeln!(kernel, "}}").unwrap();
+        writeln!(kernel, "}}").unwrap();
+    }
+    if Q_N_SGEMV_CHUNK_SIZE > 1 {
+        writeln!(kernel, "}}").unwrap();
+    }
+    writeln!(kernel, "}}").unwrap();
 }
 
 fn block_dot(kernel: &mut GenericKernel, op: &QMatMulOperation, input_b: &QMatrixInput) {

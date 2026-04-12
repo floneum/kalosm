@@ -129,7 +129,8 @@
       "Bash(RWHISPER_COHERE_DIR=/private/tmp/cohere-transcribe-03-2026 cargo run:*)",
       "Bash(huggingface-cli whoami:*)",
       "Bash(huggingface-cli repo create:*)",
-      "Bash(RWHISPER_COHERE=1 cargo run:*)"
+      "Bash(RWHISPER_COHERE=1 cargo run:*)",
+      "Bash(do echo \"=== $commit ===\")"
     ],
     "deny": [],
     "additionalDirectories": [

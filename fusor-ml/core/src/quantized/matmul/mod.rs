@@ -1174,6 +1174,37 @@ async fn test_q_mat_mul_metal_tiny_m_stays_quantized_and_correct() {
 
 #[cfg(test)]
 #[tokio::test]
+async fn test_q_mat_mul_materialized_many_matches_individual_on_metal() {
+    let device = Device::test_instance();
+    if device.wgpu_adapter().get_info().backend != wgpu::Backend::Metal {
+        return;
+    }
+
+    let input = q8_test_input_with_rows(&device, 13);
+    let matrix_a = q8_test_matrix_with_rows(&device, 3);
+    let matrix_b = q8_matrix_from_rows(
+        &device,
+        &[
+            vec![3; 32],
+            (0..32).map(|value| (value as i8 % 7) - 3).collect(),
+            (0..32).map(|value| 5 - (value as i8 % 11)).collect(),
+        ],
+    );
+
+    let combined_a: Tensor<3, f32> = input.clone().q_mat_mul(&matrix_a);
+    let combined_b: Tensor<3, f32> = input.clone().q_mat_mul(&matrix_b);
+
+    let expected_a: Tensor<3, f32> = input.clone().q_mat_mul(&matrix_a).materialized().await;
+    let expected_b: Tensor<3, f32> = input.q_mat_mul(&matrix_b).materialized().await;
+
+    let combined = Tensor::materialized_many(&[&combined_a, &combined_b]).await;
+
+    assert_close_3d(&combined[0], &expected_a).await;
+    assert_close_3d(&combined[1], &expected_b).await;
+}
+
+#[cfg(test)]
+#[tokio::test]
 async fn test_q_mat_mul_post_elementwise_fuses() {
     let device = Device::test_instance();
     let q_matrix = q8_test_matrix(&device);

@@ -1,4 +1,5 @@
 use crate::{
+    DataTypeEnum,
     mir::{
         inputs::{QMatrixInput, TensorInput},
         kernel::GenericKernel,
@@ -14,6 +15,55 @@ pub(crate) const Q_8_0_SGEMV_CHUNK_SIZE: u32 = 4; // This is the size of the chu
 const STEP_SIZE: u32 = 8;
 const SUBGROUP_COUNT: u32 = 2;
 const SUBGROUP_SIZE: u32 = 32;
+
+/// Generate WGSL for computing one row's contribution in the inner loop
+fn generate_row_computation(
+    kernel: &mut GenericKernel,
+    offset: u32,
+    dtype: DataTypeEnum,
+    input_b: &QMatrixInput,
+) {
+    writeln!(kernel, "var local_sum = {dtype}();").unwrap();
+    for data_offset in 0..(STEP_SIZE / 4) {
+        writeln!(kernel, "{{").unwrap();
+        writeln!(kernel, "let block = vec4<{dtype}>(unpack4xI8({input_b}[block_offset].data[thread_local_id * 2u + {data_offset}]));").unwrap();
+        writeln!(kernel, "let float_block = vec4<{dtype}>(cached_a_values[{data_offset} * 4u + 0], cached_a_values[{data_offset} * 4u + 1], cached_a_values[{data_offset} * 4u + 2], cached_a_values[{data_offset} * 4u + 3]);").unwrap();
+        writeln!(kernel, "local_sum += dot(block, float_block);").unwrap();
+        writeln!(kernel, "}}").unwrap();
+    }
+    let indexed = maybe_vec_storage_index(Q_8_0_SGEMV_CHUNK_SIZE, "sum", offset);
+    writeln!(
+        kernel,
+        "{indexed} += local_sum * {dtype}({input_b}[block_offset].scale);"
+    )
+    .unwrap();
+    writeln!(kernel, "block_offset += k_block_size;").unwrap();
+}
+
+/// Generate WGSL for writing one row's output
+fn generate_row_output(
+    kernel: &mut GenericKernel,
+    offset: u32,
+    input_datatype: DataTypeEnum,
+    output: &TensorInput,
+    post_element_wise_functions: &[crate::mir::function::Function],
+) {
+    write!(kernel, "{output}[").unwrap();
+    let mut output_indices = Vec::new();
+    for dim in (0..output.rank()).rev().skip(2) {
+        output_indices.push(format!("batch_idx_{dim}"));
+    }
+    output_indices.push("m_idx".to_string());
+    output_indices.push("row_index".to_string());
+    output.strided_index(kernel, output_indices);
+    let indexed = maybe_vec_storage_index(Q_8_0_SGEMV_CHUNK_SIZE, "sum", offset);
+    let result = post_element_wise_functions
+        .iter()
+        .fold(format!("{input_datatype}({indexed})"), |acc, f| {
+            f.call(vec![acc])
+        });
+    writeln!(kernel, "] = {result};").unwrap();
+}
 
 // https://github.com/ggml-org/llama.cpp/blob/6efcd65945a98cf6883cdd9de4c8ccd8c79d219a/ggml/src/ggml-metal/ggml-metal.metal#L2452
 #[allow(clippy::too_many_arguments)]
@@ -74,6 +124,13 @@ pub(crate) fn q_8_0_sgemv(
     )
     .unwrap();
 
+    // Fast path check: if all rows in this tile are valid, skip per-row bounds checks
+    writeln!(
+        kernel,
+        "let is_full_tile = row + {Q_8_0_SGEMV_CHUNK_SIZE} <= {n_size};"
+    )
+    .unwrap();
+
     writeln!(kernel, "let row_block_offset = row * k_block_size;").unwrap();
 
     writeln!(kernel, "let thread_id = {subgroup_local_index} / 4;").unwrap();
@@ -128,32 +185,25 @@ pub(crate) fn q_8_0_sgemv(
             writeln!(kernel, "}}").unwrap();
         }
         writeln!(kernel, "var block_offset = row_block_offset + i;").unwrap();
+
+        // Fast path: all rows in tile are valid, no bounds checks needed
+        writeln!(kernel, "if is_full_tile {{").unwrap();
+        for offset in 0..Q_8_0_SGEMV_CHUNK_SIZE {
+            writeln!(kernel, "{{").unwrap();
+            generate_row_computation(kernel, offset, dtype, input_b);
+            writeln!(kernel, "}}").unwrap();
+        }
+        writeln!(kernel, "}} else {{").unwrap();
+        // Slow path: check bounds for each row
         for offset in 0..Q_8_0_SGEMV_CHUNK_SIZE {
             writeln!(kernel, "{{").unwrap();
             writeln!(kernel, "let row_index = row + {offset};").unwrap();
             writeln!(kernel, "if row_index < {n_size} {{").unwrap();
-
-            writeln!(kernel, "var local_sum = {dtype}();").unwrap();
-            for data_offset in 0..(STEP_SIZE / 4) {
-                writeln!(kernel, "{{").unwrap();
-
-                writeln!(kernel, "let block = vec4<{dtype}>(unpack4xI8({input_b}[block_offset].data[thread_local_id * 2u + {data_offset}]));").unwrap();
-                writeln!(kernel, "let float_block = vec4<{dtype}>(cached_a_values[{data_offset} * 4u + 0], cached_a_values[{data_offset} * 4u + 1], cached_a_values[{data_offset} * 4u + 2], cached_a_values[{data_offset} * 4u + 3]);").unwrap();
-                writeln!(kernel, "local_sum += dot(block, float_block);").unwrap();
-
-                writeln!(kernel, "}}").unwrap();
-            }
-            let indexed = maybe_vec_storage_index(Q_8_0_SGEMV_CHUNK_SIZE, "sum", offset);
-            writeln!(
-                kernel,
-                "{indexed} += local_sum * {dtype}({input_b}[block_offset].scale);"
-            )
-            .unwrap();
-
-            writeln!(kernel, "block_offset += k_block_size;").unwrap();
+            generate_row_computation(kernel, offset, dtype, input_b);
             writeln!(kernel, "}}").unwrap();
             writeln!(kernel, "}}").unwrap();
         }
+        writeln!(kernel, "}}").unwrap();
 
         writeln!(kernel, "y_offset += {elements_per_block} * {STEP_SIZE};").unwrap();
     }
@@ -167,37 +217,31 @@ pub(crate) fn q_8_0_sgemv(
     )
     .unwrap();
 
+    // Initialize post element-wise functions once before the loop
+    let post_fns = post_element_wise_functions
+        .get_or_init(|| op.post_element_wise.add_functions(kernel));
+
+    // Fast path: all rows in tile are valid, no bounds checks needed
+    writeln!(kernel, "if is_full_tile {{").unwrap();
     for offset in 0..Q_8_0_SGEMV_CHUNK_SIZE {
         writeln!(kernel, "{{").unwrap();
-
-        // If this is not the first simd thread in the workgroup, we can return early
         writeln!(kernel, "if {subgroup_local_index} == 0u {{").unwrap();
-        {
-            // Write the output to the output tensor if this is the first thread in the workgroup
-            writeln!(kernel, "let row_index = row + {offset};").unwrap();
-            writeln!(kernel, "if row_index < {n_size} {{").unwrap();
-            write!(kernel, "{output}[").unwrap();
-            let mut output_indices = Vec::new();
-            // Add batch indices first
-            for dim in (0..output.rank()).rev().skip(2) {
-                output_indices.push(format!("batch_idx_{dim}"));
-            }
-            // Then add M and N indices
-            output_indices.push("m_idx".to_string());
-            output_indices.push("row_index".to_string());
-            output.strided_index(kernel, output_indices);
-            let indexed = maybe_vec_storage_index(Q_8_0_SGEMV_CHUNK_SIZE, "sum", offset);
-            let result = post_element_wise_functions
-                .get_or_init(|| op.post_element_wise.add_functions(kernel))
-                .iter()
-                .fold(format!("{input_datatype}({indexed})"), |acc, f| {
-                    f.call(vec![acc])
-                });
-            writeln!(kernel, "] = {result};").unwrap();
-            writeln!(kernel, "}}").unwrap();
-        }
+        writeln!(kernel, "let row_index = row + {offset}u;").unwrap();
+        generate_row_output(kernel, offset, input_datatype, output, post_fns);
         writeln!(kernel, "}}").unwrap();
-
         writeln!(kernel, "}}").unwrap();
     }
+    writeln!(kernel, "}} else {{").unwrap();
+    // Slow path: check bounds for each row
+    for offset in 0..Q_8_0_SGEMV_CHUNK_SIZE {
+        writeln!(kernel, "{{").unwrap();
+        writeln!(kernel, "if {subgroup_local_index} == 0u {{").unwrap();
+        writeln!(kernel, "let row_index = row + {offset}u;").unwrap();
+        writeln!(kernel, "if row_index < {n_size} {{").unwrap();
+        generate_row_output(kernel, offset, input_datatype, output, post_fns);
+        writeln!(kernel, "}}").unwrap();
+        writeln!(kernel, "}}").unwrap();
+        writeln!(kernel, "}}").unwrap();
+    }
+    writeln!(kernel, "}}").unwrap();
 }
