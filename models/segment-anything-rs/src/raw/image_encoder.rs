@@ -394,7 +394,7 @@ impl ImageEncoderViT {
             };
             let block = Block::load(
                 device,
-                &mut vb.pp(&format!("blocks.{i}")),
+                &mut vb.pp(format!("blocks.{i}")),
                 embed_dim,
                 num_heads,
                 use_rel_pos,

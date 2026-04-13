@@ -164,27 +164,35 @@ impl PatchMerging {
     }
 }
 
+pub(crate) struct ConvLayerConfig {
+    pub dim: usize,
+    pub out: usize,
+    pub input_resolution: (usize, usize),
+    pub depth: usize,
+    pub downsample: bool,
+    pub conv_expand_ratio: usize,
+}
+
 pub(crate) struct ConvLayer {
     blocks: Vec<MBConv>,
     downsample: Option<PatchMerging>,
 }
 
 impl ConvLayer {
-    fn load(
-        device: &Device,
-        vb: &mut VarBuilder,
-        dim: usize,
-        out: usize,
-        input_resolution: (usize, usize),
-        depth: usize,
-        downsample: bool,
-        conv_expand_ratio: usize,
-    ) -> Result<Self> {
+    fn load(device: &Device, vb: &mut VarBuilder, cfg: ConvLayerConfig) -> Result<Self> {
+        let ConvLayerConfig {
+            dim,
+            out,
+            input_resolution,
+            depth,
+            downsample,
+            conv_expand_ratio,
+        } = cfg;
         let mut blocks = Vec::with_capacity(depth);
         for i in 0..depth {
             let block = MBConv::load(
                 device,
-                &mut vb.pp(&format!("blocks.{i}")),
+                &mut vb.pp(format!("blocks.{i}")),
                 dim,
                 dim,
                 conv_expand_ratio,
@@ -495,28 +503,37 @@ impl TinyViTBlock {
     }
 }
 
+pub(crate) struct BasicLayerConfig {
+    pub dim: usize,
+    pub input_resolution: (usize, usize),
+    pub depth: usize,
+    pub num_heads: usize,
+    pub window_size: usize,
+    pub downsample: bool,
+    pub out: usize,
+}
+
 pub(crate) struct BasicLayer {
     blocks: Vec<TinyViTBlock>,
     downsample: Option<PatchMerging>,
 }
 
 impl BasicLayer {
-    fn load(
-        device: &Device,
-        vb: &mut VarBuilder,
-        dim: usize,
-        input_resolution: (usize, usize),
-        depth: usize,
-        num_heads: usize,
-        window_size: usize,
-        downsample: bool,
-        out: usize,
-    ) -> Result<Self> {
+    fn load(device: &Device, vb: &mut VarBuilder, cfg: BasicLayerConfig) -> Result<Self> {
+        let BasicLayerConfig {
+            dim,
+            input_resolution,
+            depth,
+            num_heads,
+            window_size,
+            downsample,
+            out,
+        } = cfg;
         let mut blocks = Vec::with_capacity(depth);
         for i in 0..depth {
             let block = TinyViTBlock::load(
                 device,
-                &mut vb.pp(&format!("blocks.{i}")),
+                &mut vb.pp(format!("blocks.{i}")),
                 dim,
                 input_resolution,
                 num_heads,
@@ -575,12 +592,14 @@ impl TinyViT {
         let layer0 = ConvLayer::load(
             device,
             &mut vb.pp("layers.0"),
-            embed_dims[0],
-            embed_dims[1],
-            (patches_resolution, patches_resolution),
-            depths[0],
-            true, // downsample
-            MBCONV_EXPAND_RATIO,
+            ConvLayerConfig {
+                dim: embed_dims[0],
+                out: embed_dims[1],
+                input_resolution: (patches_resolution, patches_resolution),
+                depth: depths[0],
+                downsample: true,
+                conv_expand_ratio: MBCONV_EXPAND_RATIO,
+            },
         )?;
 
         let num_layers = embed_dims.len();
@@ -589,14 +608,16 @@ impl TinyViT {
             let patches_resolution = patches_resolution / (1 << usize::min(i_layer, 2));
             let layer = BasicLayer::load(
                 device,
-                &mut vb.pp(&format!("layers.{i_layer}")),
-                embed_dims[i_layer],
-                (patches_resolution, patches_resolution),
-                depths[i_layer],
-                num_heads[i_layer],
-                window_sizes[i_layer],
-                i_layer < num_layers - 1,
-                embed_dims[usize::min(i_layer + 1, num_layers - 1)],
+                &mut vb.pp(format!("layers.{i_layer}")),
+                BasicLayerConfig {
+                    dim: embed_dims[i_layer],
+                    input_resolution: (patches_resolution, patches_resolution),
+                    depth: depths[i_layer],
+                    num_heads: num_heads[i_layer],
+                    window_size: window_sizes[i_layer],
+                    downsample: i_layer < num_layers - 1,
+                    out: embed_dims[usize::min(i_layer + 1, num_layers - 1)],
+                },
             )?;
             layers.push(layer);
         }

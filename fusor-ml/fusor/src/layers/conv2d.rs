@@ -117,7 +117,7 @@ where
             // 1. Pad input
             let padded: Tensor<4, D, ConcreteTensor<D, 4>> =
                 if self.config.padding[0] > 0 || self.config.padding[1] > 0 {
-                    let mut result: Tensor<4, D> = input.clone().into();
+                    let mut result: Tensor<4, D> = input.clone();
                     if self.config.padding[0] > 0 {
                         result = result.pad_axis(2, self.config.padding[0]);
                     }

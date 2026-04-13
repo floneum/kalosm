@@ -82,7 +82,7 @@ impl MlpMaskDecoder {
     ) -> Result<Self> {
         let mut layers = Vec::with_capacity(num_layers);
         for i in 0..num_layers {
-            let layer = Linear::load(device, &mut vb.pp(&format!("layers.{i}")))?;
+            let layer = Linear::load(device, &mut vb.pp(format!("layers.{i}")))?;
             layers.push(layer);
         }
         Ok(Self {
@@ -144,7 +144,7 @@ impl MaskDecoder {
         for i in 0..num_mask_tokens {
             let mlp = MlpMaskDecoder::load(
                 device,
-                &mut vb.pp(&format!("output_hypernetworks_mlps.{i}")),
+                &mut vb.pp(format!("output_hypernetworks_mlps.{i}")),
                 3,
                 false,
             )?;

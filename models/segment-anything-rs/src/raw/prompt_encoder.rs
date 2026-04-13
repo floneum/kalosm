@@ -138,7 +138,7 @@ impl PromptEncoder {
         let num_points_embeddings = 4;
         let mut point_embeddings = Vec::with_capacity(num_points_embeddings);
         for i in 0..num_points_embeddings {
-            let emb = Embedding::load(device, &mut vb.pp(&format!("point_embeddings.{i}")))?;
+            let emb = Embedding::load(device, &mut vb.pp(format!("point_embeddings.{i}")))?;
             point_embeddings.push(emb);
         }
 

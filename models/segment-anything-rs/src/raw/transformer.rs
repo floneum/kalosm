@@ -62,9 +62,9 @@ impl Attention {
         k: &Tensor<3, f32, impl TensorBacking<3, Elem = f32>>,
         v: &Tensor<3, f32, impl TensorBacking<3, Elem = f32>>,
     ) -> Tensor<3, f32> {
-        let q = self.q_proj.forward(&q);
-        let k = self.k_proj.forward(&k);
-        let v = self.v_proj.forward(&v);
+        let q = self.q_proj.forward(q);
+        let k = self.k_proj.forward(k);
+        let v = self.v_proj.forward(v);
 
         let q = self.separate_heads(&q);
         let k = self.separate_heads(&k);
@@ -204,7 +204,7 @@ impl TwoWayTransformer {
         for i in 0..depth {
             let layer = TwoWayAttentionBlock::load(
                 device,
-                &mut vb.pp(&format!("layers.{i}")),
+                &mut vb.pp(format!("layers.{i}")),
                 embedding_dim,
                 num_heads,
                 mlp_dim,

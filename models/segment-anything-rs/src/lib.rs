@@ -327,7 +327,7 @@ impl SegmentAnything {
         let device = &self.device;
         // (H, W, 3) -> permute to (3, H, W)
         let image: Tensor<3, f32, ConcreteTensor<f32, 3>> =
-            Tensor::from_slice(&device, [height, width, 3], &data_f32)
+            Tensor::from_slice(device, [height, width, 3], &data_f32)
                 .transpose(1, 2) // (H, 3, W)
                 .transpose(0, 1) // (3, H, W)
                 .to_concrete();
