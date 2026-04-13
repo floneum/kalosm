@@ -124,6 +124,45 @@ impl GlinerSource {
         }
     }
 
+    /// Demonthos GLiNER GGUF edge upload.
+    ///
+    /// Uses the GGUF weights and sidecar tokenizer/config files from
+    /// `Demonthos/gliner-gguf`.
+    pub fn demonthos_edge() -> Self {
+        Self {
+            model: Self::huggingface_or_cached(
+                "Demonthos/gliner-gguf",
+                "main",
+                "gliner-edge.gguf",
+            ),
+            label_encoder: Self::huggingface_or_cached(
+                "Demonthos/gliner-gguf",
+                "main",
+                "gliner-edge-label-encoder.gguf",
+            ),
+            label_encoder_config: Self::huggingface_or_cached(
+                "Demonthos/gliner-gguf",
+                "main",
+                "label-encoder-config.json",
+            ),
+            label_encoder_tokenizer: Self::huggingface_or_cached(
+                "Demonthos/gliner-gguf",
+                "main",
+                "label-encoder-tokenizer.json",
+            ),
+            tokenizer: Self::huggingface_or_cached(
+                "Demonthos/gliner-gguf",
+                "main",
+                "text-tokenizer.json",
+            ),
+            config: Self::huggingface_or_cached(
+                "Demonthos/gliner-gguf",
+                "main",
+                "text-gliner-config.json",
+            ),
+        }
+    }
+
     /// GLiNER bi-encoder v2.0 Small variant (108M parameters).
     ///
     /// Good balance of speed and accuracy, using:
