@@ -44,6 +44,24 @@ impl Bert {
         ))
     }
 
+    /// Embed a batch of sentences with a specific pooling strategy and explicit
+    /// control over whether the pooled vectors are L2-normalized.
+    pub async fn embed_batch_with_pooling_and_normalization(
+        &self,
+        inputs: Vec<&str>,
+        pooling: Pooling,
+        normalize: bool,
+    ) -> Result<Vec<Embedding>, BertError> {
+        let tensors = self.embed_batch_raw_with_options(inputs, pooling, normalize)?;
+
+        let mut embeddings = Vec::with_capacity(tensors.len());
+        for tensor in tensors {
+            embeddings.push(self.tensor_to_embedding(tensor).await?);
+        }
+
+        Ok(embeddings)
+    }
+
     /// Embed a sentence with a specific pooling strategy.
     pub async fn embed_with_pooling(
         &self,
@@ -60,14 +78,8 @@ impl Bert {
         inputs: Vec<&str>,
         pooling: Pooling,
     ) -> Result<Vec<Embedding>, BertError> {
-        let tensors = self.embed_batch_raw(inputs, pooling)?;
-
-        let mut embeddings = Vec::with_capacity(tensors.len());
-        for tensor in tensors {
-            embeddings.push(self.tensor_to_embedding(tensor).await?);
-        }
-
-        Ok(embeddings)
+        self.embed_batch_with_pooling_and_normalization(inputs, pooling, true)
+            .await
     }
 }
 

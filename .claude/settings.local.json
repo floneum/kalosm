@@ -1,0 +1,16 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(GLINER_MODEL=/tmp/gliner-edge.gguf cargo run:*)",
+      "Bash(GLINER_MODEL=/private/tmp/gliner-edge.gguf cargo run:*)",
+      "Bash(RUST_BACKTRACE=1 GLINER_MODEL=/private/tmp/gliner-edge.gguf cargo run:*)",
+      "Bash(RUST_BACKTRACE=full GLINER_MODEL=./models/rgliner/weights/gliner-edge.gguf cargo run:*)",
+      "Bash(GLINER_MODEL=./models/rgliner/weights/gliner-edge.gguf cargo run:*)",
+      "Bash(git -C /Users/evanalmloff/Desktop/Github/ner diff HEAD -- fusor-ml/core/src/matmul/mod.rs)",
+      "Bash(GLINER_MODEL=/Users/evanalmloff/Desktop/Github/ner/models/rgliner/weights/gliner-edge.gguf cargo run:*)",
+      "Bash(RUST_BACKTRACE=1 GLINER_MODEL=/Users/evanalmloff/Desktop/Github/ner/models/rgliner/weights/gliner-edge.gguf cargo run:*)",
+      "Bash(git -C /Users/evanalmloff/Desktop/Github/ner checkout -- fusor-ml/core/src/matmul/mod.rs)",
+      "WebFetch(domain:api.github.com)"
+    ]
+  }
+}

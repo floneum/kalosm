@@ -35,4 +35,45 @@ impl BertEncoder {
         }
         hidden_states
     }
+
+    pub(crate) fn debug_hidden_states(
+        &self,
+        hidden_states: &Tensor<3, f32>,
+        attention_mask: Option<&Tensor<2, u32>>,
+    ) -> Vec<Tensor<3, f32>> {
+        let _enter = self.span.enter();
+        let mut hidden_states = hidden_states.clone();
+        let mut states = Vec::with_capacity(self.layers.len());
+        for layer in self.layers.iter() {
+            hidden_states = layer.forward(&hidden_states, attention_mask);
+            states.push(hidden_states.clone());
+        }
+        states
+    }
+
+    pub(crate) fn debug_first_layer(
+        &self,
+        hidden_states: &Tensor<3, f32>,
+        attention_mask: Option<&Tensor<2, u32>>,
+    ) -> Option<(Tensor<3, f32>, Tensor<3, f32>, Tensor<3, f32>)> {
+        self.layers
+            .first()
+            .map(|layer| layer.debug_forward(hidden_states, attention_mask))
+    }
+
+    pub(crate) fn debug_first_layer_attention(
+        &self,
+        hidden_states: &Tensor<3, f32>,
+        attention_mask: Option<&Tensor<2, u32>>,
+    ) -> Option<(
+        Tensor<4, f32>,
+        Tensor<4, f32>,
+        Tensor<4, f32>,
+        Tensor<3, f32>,
+        Tensor<3, f32>,
+    )> {
+        self.layers
+            .first()
+            .map(|layer| layer.debug_attention_forward(hidden_states, attention_mask))
+    }
 }

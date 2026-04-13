@@ -1,0 +1,475 @@
+#!/usr/bin/env python3
+"""
+Convert GLiNER PyTorch models to GGUF format.
+
+Usage:
+    python convert_to_gguf.py --model knowledgator/gliner-bi-edge-v2.0 --output gliner-bi-edge-v2.0.gguf
+
+This script converts both:
+1. The main text encoder (ModernBERT/Ettin) + span layer weights
+2. The label encoder projection weights (sentence transformer is loaded separately)
+"""
+
+import argparse
+import json
+import os
+import struct
+import sys
+from pathlib import Path
+from typing import Any, Dict, List, Tuple
+
+import numpy as np
+import torch
+from huggingface_hub import hf_hub_download, snapshot_download
+
+
+# GGUF constants
+GGUF_MAGIC = 0x46554747  # "GGUF" in little-endian
+GGUF_VERSION = 3
+
+# GGUF data types
+GGUF_TYPE_UINT8 = 0
+GGUF_TYPE_INT8 = 1
+GGUF_TYPE_UINT16 = 2
+GGUF_TYPE_INT16 = 3
+GGUF_TYPE_UINT32 = 4
+GGUF_TYPE_INT32 = 5
+GGUF_TYPE_FLOAT32 = 6
+GGUF_TYPE_BOOL = 7
+GGUF_TYPE_STRING = 8
+GGUF_TYPE_ARRAY = 9
+GGUF_TYPE_UINT64 = 10
+GGUF_TYPE_INT64 = 11
+GGUF_TYPE_FLOAT64 = 12
+
+# GGML tensor types
+GGML_TYPE_F32 = 0
+GGML_TYPE_F16 = 1
+GGML_TYPE_Q4_0 = 2
+GGML_TYPE_Q4_1 = 3
+GGML_TYPE_Q5_0 = 6
+GGML_TYPE_Q5_1 = 7
+GGML_TYPE_Q8_0 = 8
+GGML_TYPE_Q8_1 = 9
+GGML_TYPE_BF16 = 30
+
+
+class GGUFWriter:
+    """Simple GGUF file writer."""
+
+    def __init__(self, path: str):
+        self.path = path
+        self.metadata: Dict[str, Any] = {}
+        self.tensors: List[Tuple[str, np.ndarray, int]] = []  # (name, data, ggml_type)
+
+    def add_metadata(self, key: str, value: Any):
+        """Add metadata key-value pair."""
+        self.metadata[key] = value
+
+    def add_tensor(self, name: str, data: np.ndarray, ggml_type: int = GGML_TYPE_F32):
+        """Add a tensor."""
+        self.tensors.append((name, data, ggml_type))
+
+    def _write_string(self, f, s: str):
+        """Write a GGUF string (length-prefixed UTF-8)."""
+        encoded = s.encode('utf-8')
+        f.write(struct.pack('<Q', len(encoded)))
+        f.write(encoded)
+
+    def _write_metadata_value(self, f, value: Any):
+        """Write a metadata value with its type."""
+        if isinstance(value, bool):
+            f.write(struct.pack('<I', GGUF_TYPE_BOOL))
+            f.write(struct.pack('<B', 1 if value else 0))
+        elif isinstance(value, int):
+            if value < 0:
+                f.write(struct.pack('<I', GGUF_TYPE_INT64))
+                f.write(struct.pack('<q', value))
+            else:
+                f.write(struct.pack('<I', GGUF_TYPE_UINT64))
+                f.write(struct.pack('<Q', value))
+        elif isinstance(value, float):
+            f.write(struct.pack('<I', GGUF_TYPE_FLOAT32))
+            f.write(struct.pack('<f', value))
+        elif isinstance(value, str):
+            f.write(struct.pack('<I', GGUF_TYPE_STRING))
+            self._write_string(f, value)
+        elif isinstance(value, (list, tuple)):
+            f.write(struct.pack('<I', GGUF_TYPE_ARRAY))
+            if len(value) == 0:
+                f.write(struct.pack('<I', GGUF_TYPE_UINT32))
+                f.write(struct.pack('<Q', 0))
+            elif isinstance(value[0], int):
+                f.write(struct.pack('<I', GGUF_TYPE_INT64))
+                f.write(struct.pack('<Q', len(value)))
+                for v in value:
+                    f.write(struct.pack('<q', v))
+            elif isinstance(value[0], float):
+                f.write(struct.pack('<I', GGUF_TYPE_FLOAT32))
+                f.write(struct.pack('<Q', len(value)))
+                for v in value:
+                    f.write(struct.pack('<f', v))
+            elif isinstance(value[0], str):
+                f.write(struct.pack('<I', GGUF_TYPE_STRING))
+                f.write(struct.pack('<Q', len(value)))
+                for v in value:
+                    self._write_string(f, v)
+            else:
+                raise ValueError(f"Unsupported array element type: {type(value[0])}")
+        else:
+            raise ValueError(f"Unsupported metadata type: {type(value)}")
+
+    def write(self):
+        """Write the GGUF file."""
+        with open(self.path, 'wb') as f:
+            # Header
+            f.write(struct.pack('<I', GGUF_MAGIC))
+            f.write(struct.pack('<I', GGUF_VERSION))
+            f.write(struct.pack('<Q', len(self.tensors)))  # n_tensors
+            f.write(struct.pack('<Q', len(self.metadata)))  # n_kv
+
+            # Metadata
+            for key, value in self.metadata.items():
+                self._write_string(f, key)
+                self._write_metadata_value(f, value)
+
+            # Tensor infos (we'll write actual data after alignment)
+            tensor_data_offset = 0
+            tensor_infos = []
+
+            for name, data, ggml_type in self.tensors:
+                # Ensure contiguous and correct dtype
+                if ggml_type == GGML_TYPE_F32:
+                    data = np.ascontiguousarray(data, dtype=np.float32)
+                elif ggml_type == GGML_TYPE_F16:
+                    data = np.ascontiguousarray(data, dtype=np.float16)
+                elif ggml_type == GGML_TYPE_BF16:
+                    # Convert to bfloat16 via float32
+                    data = np.ascontiguousarray(data, dtype=np.float32)
+                    data = data.view(np.uint32)
+                    data = ((data >> 16) & 0xFFFF).astype(np.uint16)
+
+                # Write tensor info
+                # GGUF stores dimensions in reverse order (column-major)
+                # Reader reverses them back, so we write reversed to get original order
+                self._write_string(f, name)
+                f.write(struct.pack('<I', len(data.shape)))  # n_dims
+                for dim in reversed(data.shape):
+                    f.write(struct.pack('<Q', dim))
+                f.write(struct.pack('<I', ggml_type))
+                f.write(struct.pack('<Q', tensor_data_offset))
+
+                tensor_infos.append((data, tensor_data_offset))
+                tensor_data_offset += data.nbytes
+                # Align to 32 bytes
+                padding = (32 - (tensor_data_offset % 32)) % 32
+                tensor_data_offset += padding
+
+            # Alignment padding before tensor data
+            current_pos = f.tell()
+            alignment = 32
+            padding_needed = (alignment - (current_pos % alignment)) % alignment
+            f.write(b'\x00' * padding_needed)
+
+            # Tensor data
+            for (data, _), (name, _, ggml_type) in zip(tensor_infos, self.tensors):
+                f.write(data.tobytes())
+                # Align to 32 bytes
+                padding = (32 - (data.nbytes % 32)) % 32
+                f.write(b'\x00' * padding)
+
+        print(f"Wrote GGUF file: {self.path}")
+
+
+def load_pytorch_model(model_id: str, cache_dir: str = None) -> Tuple[Dict[str, torch.Tensor], Dict]:
+    """Load PyTorch model from HuggingFace."""
+    print(f"Downloading model: {model_id}")
+
+    # Download the model files
+    model_dir = snapshot_download(
+        model_id,
+        cache_dir=cache_dir,
+        allow_patterns=["*.bin", "*.json", "*.safetensors"]
+    )
+
+    # Load config
+    config_path = os.path.join(model_dir, "gliner_config.json")
+    with open(config_path, 'r') as f:
+        config = json.load(f)
+
+    # Load weights
+    weights_path = os.path.join(model_dir, "pytorch_model.bin")
+    if os.path.exists(weights_path):
+        print(f"Loading weights from: {weights_path}")
+        state_dict = torch.load(weights_path, map_location='cpu', weights_only=True)
+    else:
+        # Try safetensors
+        from safetensors.torch import load_file
+        weights_path = os.path.join(model_dir, "model.safetensors")
+        print(f"Loading weights from: {weights_path}")
+        state_dict = load_file(weights_path)
+
+    return state_dict, config
+
+
+def map_weight_name(pytorch_name: str) -> str:
+    """Map PyTorch weight names to GGUF conventions."""
+    name = pytorch_name
+
+    # ===== Text Encoder (ModernBERT/Ettin) =====
+    # token_rep_layer.bert_layer.model.embeddings.tok_embeddings.weight -> text.token_embd.weight
+    name = name.replace("token_rep_layer.bert_layer.model.embeddings.tok_embeddings.weight", "text.token_embd.weight")
+    name = name.replace("token_rep_layer.bert_layer.model.embeddings.norm.weight", "text.embd_norm.weight")
+
+    # token_rep_layer.bert_layer.model.layers.X -> text.blk.X
+    name = name.replace("token_rep_layer.bert_layer.model.layers.", "text.blk.")
+    name = name.replace("token_rep_layer.bert_layer.model.final_norm.weight", "text.output_norm.weight")
+
+    # ModernBERT attention (fused Wqkv)
+    name = name.replace(".attn.Wqkv.", ".attn_qkv.")
+    name = name.replace(".attn.Wo.", ".attn_output.")
+
+    # ModernBERT FFN (GeGLU with fused Wi)
+    name = name.replace(".mlp.Wi.", ".ffn_gate_up.")  # Fused gate+up
+    name = name.replace(".mlp.Wo.", ".ffn_down.")
+    name = name.replace(".mlp_norm.", ".ffn_norm.")
+
+    # ===== Label Encoder (BERT/MiniLM) =====
+    name = name.replace("token_rep_layer.labels_encoder.model.", "label.")
+
+    # BERT embeddings (rbert expects token_types, token_embd_norm)
+    name = name.replace("label.embeddings.word_embeddings.", "label.token_embd.")
+    name = name.replace("label.embeddings.position_embeddings.", "label.position_embd.")
+    name = name.replace("label.embeddings.token_type_embeddings.", "label.token_types.")
+    name = name.replace("label.embeddings.LayerNorm.", "label.token_embd_norm.")
+
+    # BERT layers
+    name = name.replace("label.encoder.layer.", "label.blk.")
+
+    # BERT attention (rbert uses attn_output_norm, not attn_norm)
+    name = name.replace(".attention.self.query.", ".attn_q.")
+    name = name.replace(".attention.self.key.", ".attn_k.")
+    name = name.replace(".attention.self.value.", ".attn_v.")
+    name = name.replace(".attention.output.dense.", ".attn_output.")
+    name = name.replace(".attention.output.LayerNorm.", ".attn_output_norm.")
+
+    # BERT FFN (rbert uses layer_output_norm, not ffn_norm)
+    name = name.replace(".intermediate.dense.", ".ffn_up.")
+    name = name.replace(".output.dense.", ".ffn_down.")
+    name = name.replace(".output.LayerNorm.", ".layer_output_norm.")
+
+    # BERT pooler
+    name = name.replace("label.pooler.dense.", "label.pooler.")
+
+    # ===== BiLSTM =====
+    # Keep rnn.lstm.* as-is for now
+    name = name.replace("rnn.lstm.", "rnn.")
+
+    # ===== Span Representation Layer =====
+    name = name.replace("span_rep_layer.span_rep_layer.project_start.0.", "span.start_fc1.")
+    name = name.replace("span_rep_layer.span_rep_layer.project_start.3.", "span.start_fc2.")
+    name = name.replace("span_rep_layer.span_rep_layer.project_end.0.", "span.end_fc1.")
+    name = name.replace("span_rep_layer.span_rep_layer.project_end.3.", "span.end_fc2.")
+    name = name.replace("span_rep_layer.span_rep_layer.out_project.0.", "span.out_fc1.")
+    name = name.replace("span_rep_layer.span_rep_layer.out_project.3.", "span.out_fc2.")
+
+    # ===== Prompt/Label Projection =====
+    name = name.replace("prompt_rep_layer.0.", "label_proj.0.")
+    name = name.replace("prompt_rep_layer.3.", "label_proj.2.")
+
+    return name
+
+
+def convert_gliner_to_gguf(
+    model_id: str,
+    output_path: str,
+    quantize: str = "f32",
+    cache_dir: str = None
+):
+    """Convert GLiNER model to GGUF format.
+
+    Creates two GGUF files:
+    - {output_path}: Main model (text encoder, span layer, projection)
+    - {output_path_stem}-label-encoder.gguf: Label encoder (BERT/MiniLM)
+    """
+
+    # Load model
+    state_dict, config = load_pytorch_model(model_id, cache_dir)
+
+    # Print model structure
+    print("\nModel weights:")
+    for name, tensor in state_dict.items():
+        print(f"  {name}: {tensor.shape} {tensor.dtype}")
+
+    # Determine quantization type
+    if quantize == "f32":
+        ggml_type = GGML_TYPE_F32
+    elif quantize == "f16":
+        ggml_type = GGML_TYPE_F16
+    elif quantize == "bf16":
+        ggml_type = GGML_TYPE_BF16
+    else:
+        raise ValueError(f"Unsupported quantization: {quantize}")
+
+    # Separate label encoder weights from main model weights
+    label_encoder_weights = {}
+    main_model_weights = {}
+
+    for pytorch_name, tensor in state_dict.items():
+        if "token_rep_layer.labels_encoder" in pytorch_name:
+            label_encoder_weights[pytorch_name] = tensor
+        else:
+            main_model_weights[pytorch_name] = tensor
+
+    # ============ Main Model GGUF ============
+    writer = GGUFWriter(output_path)
+
+    # Add metadata
+    writer.add_metadata("general.architecture", "gliner")
+    writer.add_metadata("general.name", model_id.split("/")[-1])
+    writer.add_metadata("general.quantization_version", 2)
+
+    # GLiNER-specific metadata
+    writer.add_metadata("gliner.max_width", config.get("max_width", 12))
+    writer.add_metadata("gliner.span_mode", config.get("span_mode", "markerV0"))
+    writer.add_metadata("gliner.subtoken_pooling", config.get("subtoken_pooling", "first"))
+
+    # Encoder config - use standard GGUF naming for model loading
+    encoder_config = config.get("encoder_config", {})
+    hidden_size = encoder_config.get("hidden_size", 384)
+    num_heads = encoder_config.get("num_attention_heads", 6)
+    num_layers = encoder_config.get("num_hidden_layers", 10)
+    intermediate_size = encoder_config.get("intermediate_size", 576)
+    vocab_size = encoder_config.get("vocab_size", 50368)
+    context_length = encoder_config.get("max_position_embeddings", 8192)
+    rope_theta = encoder_config.get("local_rope_theta", 160000.0)
+
+    # Standard GGUF metadata (without architecture prefix - the loader adds it)
+    writer.add_metadata("gliner.attention.head_count", num_heads)
+    writer.add_metadata("gliner.attention.head_count_kv", num_heads)  # No GQA in this model
+    writer.add_metadata("gliner.block_count", num_layers)
+    writer.add_metadata("gliner.embedding_length", hidden_size)
+    writer.add_metadata("gliner.feed_forward_length", intermediate_size)
+    writer.add_metadata("gliner.context_length", context_length)
+    writer.add_metadata("gliner.rope.freq_base", float(rope_theta))
+    writer.add_metadata("gliner.attention.layer_norm_rms_epsilon", 1e-5)
+    writer.add_metadata("gliner.vocab_size", vocab_size)
+
+    # Convert main model tensors
+    print(f"\nConverting {len(main_model_weights)} main model tensors to GGUF...")
+
+    for pytorch_name, tensor in main_model_weights.items():
+        gguf_name = map_weight_name(pytorch_name)
+
+        # Convert to numpy (workaround for numpy/torch incompatibility)
+        try:
+            data = tensor.detach().float().cpu().numpy()
+        except RuntimeError:
+            import array
+            t = tensor.detach().float().cpu().contiguous()
+            data = np.frombuffer(
+                array.array('f', t.flatten().tolist()),
+                dtype=np.float32
+            ).reshape(t.shape)
+
+        print(f"  {pytorch_name} -> {gguf_name} {data.shape}")
+        writer.add_tensor(gguf_name, data, ggml_type)
+
+    writer.write()
+    print(f"Main model output: {output_path}")
+    print(f"Size: {os.path.getsize(output_path) / 1024 / 1024:.2f} MB")
+
+    # ============ Label Encoder GGUF ============
+    # Create separate file for label encoder (without prefix, for rbert compatibility)
+    label_output_path = output_path.replace(".gguf", "-label-encoder.gguf")
+    label_writer = GGUFWriter(label_output_path)
+
+    # Add BERT metadata
+    labels_config = config.get("labels_encoder_config", {})
+    label_writer.add_metadata("general.architecture", "bert")
+    label_writer.add_metadata("general.name", model_id.split("/")[-1] + "-label-encoder")
+
+    label_hidden = labels_config.get("hidden_size", 384)
+    label_heads = labels_config.get("num_attention_heads", 12)
+    label_layers = labels_config.get("num_hidden_layers", 6)
+    label_intermediate = labels_config.get("intermediate_size", 1536)
+    label_vocab = labels_config.get("vocab_size", 30522)
+    label_max_pos = labels_config.get("max_position_embeddings", 512)
+
+    label_writer.add_metadata("bert.attention.head_count", label_heads)
+    label_writer.add_metadata("bert.block_count", label_layers)
+    label_writer.add_metadata("bert.embedding_length", label_hidden)
+    label_writer.add_metadata("bert.feed_forward_length", label_intermediate)
+    label_writer.add_metadata("bert.context_length", label_max_pos)
+    label_writer.add_metadata("bert.attention.layer_norm_epsilon", 1e-12)
+    label_writer.add_metadata("bert.vocab_size", label_vocab)
+
+    # Convert label encoder tensors (remove prefix so rbert can load them)
+    print(f"\nConverting {len(label_encoder_weights)} label encoder tensors to GGUF...")
+
+    for pytorch_name, tensor in label_encoder_weights.items():
+        # Map name but remove the "label." prefix for rbert compatibility
+        gguf_name = map_weight_name(pytorch_name)
+        if gguf_name.startswith("label."):
+            gguf_name = gguf_name[6:]  # Remove "label." prefix
+
+        try:
+            data = tensor.detach().float().cpu().numpy()
+        except RuntimeError:
+            import array
+            t = tensor.detach().float().cpu().contiguous()
+            data = np.frombuffer(
+                array.array('f', t.flatten().tolist()),
+                dtype=np.float32
+            ).reshape(t.shape)
+
+        print(f"  {pytorch_name} -> {gguf_name} {data.shape}")
+        label_writer.add_tensor(gguf_name, data, ggml_type)
+
+    label_writer.write()
+    print(f"Label encoder output: {label_output_path}")
+    print(f"Size: {os.path.getsize(label_output_path) / 1024 / 1024:.2f} MB")
+
+    print(f"\nConversion complete!")
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Convert GLiNER PyTorch models to GGUF")
+    parser.add_argument(
+        "--model", "-m",
+        type=str,
+        required=True,
+        help="HuggingFace model ID (e.g., knowledgator/gliner-bi-edge-v2.0)"
+    )
+    parser.add_argument(
+        "--output", "-o",
+        type=str,
+        required=True,
+        help="Output GGUF file path"
+    )
+    parser.add_argument(
+        "--quantize", "-q",
+        type=str,
+        default="f32",
+        choices=["f32", "f16", "bf16"],
+        help="Quantization type (default: f32)"
+    )
+    parser.add_argument(
+        "--cache-dir",
+        type=str,
+        default=None,
+        help="HuggingFace cache directory"
+    )
+
+    args = parser.parse_args()
+
+    convert_gliner_to_gguf(
+        model_id=args.model,
+        output_path=args.output,
+        quantize=args.quantize,
+        cache_dir=args.cache_dir
+    )
+
+
+if __name__ == "__main__":
+    main()

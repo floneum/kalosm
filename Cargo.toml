@@ -13,6 +13,7 @@ bench = false
 [workspace]
 members = [
     "models/rbert",
+    "models/rgliner",
     "models/kalosm-llama",
     "models/rwhisper",
     "models/rwuerstchen",
@@ -55,6 +56,7 @@ kalosm-vision = { path = "./interfaces/kalosm-vision", version = "0.4.0" }
 kalosm-learning = { path = "./interfaces/kalosm-learning", version = "0.4.0" }
 kalosm-learning-macro = { path = "./interfaces/kalosm-learning-macro", version = "0.4.0" }
 rbert = { path = "./models/rbert", version = "0.4.0" }
+rgliner = { path = "./models/rgliner", version = "0.4.0" }
 kalosm-llama = { path = "./models/kalosm-llama", version = "0.4.0" }
 rwhisper = { path = "./models/rwhisper", version = "0.4.0" }
 rwuerstchen = { path = "./models/rwuerstchen", version = "0.4.0" }

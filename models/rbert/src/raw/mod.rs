@@ -145,6 +145,55 @@ impl BertModel {
         self.encoder.forward(&embedding_output, attention_mask)
     }
 
+    #[doc(hidden)]
+    pub fn debug_hidden_states(
+        &self,
+        input_ids: &Tensor<2, u32>,
+        token_type_ids: &Tensor<2, u32>,
+        attention_mask: Option<&Tensor<2, u32>>,
+    ) -> Vec<Tensor<3, f32>> {
+        let _enter = self.span.enter();
+        let embedding_output = self.embeddings.forward(input_ids, token_type_ids);
+        let mut states = vec![embedding_output.clone()];
+        states.extend(
+            self.encoder
+                .debug_hidden_states(&embedding_output, attention_mask),
+        );
+        states
+    }
+
+    #[doc(hidden)]
+    pub fn debug_first_layer(
+        &self,
+        input_ids: &Tensor<2, u32>,
+        token_type_ids: &Tensor<2, u32>,
+        attention_mask: Option<&Tensor<2, u32>>,
+    ) -> Option<(Tensor<3, f32>, Tensor<3, f32>, Tensor<3, f32>)> {
+        let _enter = self.span.enter();
+        let embedding_output = self.embeddings.forward(input_ids, token_type_ids);
+        self.encoder
+            .debug_first_layer(&embedding_output, attention_mask)
+    }
+
+    #[doc(hidden)]
+    pub fn debug_first_layer_attention(
+        &self,
+        input_ids: &Tensor<2, u32>,
+        token_type_ids: &Tensor<2, u32>,
+        attention_mask: Option<&Tensor<2, u32>>,
+    ) -> Option<(
+        Tensor<4, f32>,
+        Tensor<4, f32>,
+        Tensor<4, f32>,
+        Tensor<3, f32>,
+        Tensor<3, f32>,
+    )> {
+        let _enter = self.span.enter();
+        let embedding_output = self.embeddings.forward(input_ids, token_type_ids);
+        self.encoder
+            .debug_first_layer_attention(&embedding_output, attention_mask)
+    }
+
     pub(crate) fn max_seq_len(&self) -> usize {
         self.embeddings.max_seq_len()
     }

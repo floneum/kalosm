@@ -50,15 +50,19 @@ where
         D: fusor_cpu::Scalar,
     {
         let coeff = D::from_f32((2.0 / std::f32::consts::PI).sqrt());
+        // Clamp the tanh approximation input range before the cubic term.
+        // Large transformer activations can otherwise drive the backend tanh into
+        // unstable territory on GPU, even though GELU is already saturated there.
+        let clamped = self.clamp(D::from_f32(-5.5), D::from_f32(5.5));
 
         // x^2
-        let x_squared = self * self;
+        let x_squared = &clamped * &clamped;
 
         // 0.044715 * x^2 + 1.0
         let inner_factor = x_squared * D::from_f32(0.044715) + D::from_f32(1.0);
 
         // x * (1 + 0.044715 * x^2)
-        let inner = self * &inner_factor;
+        let inner = &clamped * &inner_factor;
 
         // sqrt(2/pi) * (x * (1 + 0.044715 * x^2))
         let tanh_input = inner * coeff;
@@ -146,9 +150,13 @@ mod tests {
     async fn test_gelu_cpu_vs_gpu() {
         use crate::Device;
 
-        // Create random-ish data similar to FFN activations
+        // Use a wider activation range so backend tanh/gelu instability shows up.
         let data: Vec<f32> = (0..1 * 100 * 1536)
-            .map(|i| (i as f32 * 0.001).sin() * 5.0)
+            .map(|i| {
+                let base = (i as f32 * 0.001).sin() * 40.0;
+                let offset = ((i % 29) as f32 - 14.0) * 2.0;
+                base + offset
+            })
             .collect();
 
         // CPU version
@@ -170,8 +178,8 @@ mod tests {
         let mut sum_diff = 0.0f32;
         let mut count = 0;
         for i in 0..cpu_slice.shape()[0] {
-            for j in 0..cpu_slice.shape()[1].min(50) {
-                for k in 0..cpu_slice.shape()[2].min(100) {
+            for j in 0..cpu_slice.shape()[1] {
+                for k in 0..cpu_slice.shape()[2] {
                     let cpu_val: f32 = cpu_slice[[i, j, k]].into();
                     let gpu_val: f32 = gpu_slice[[i, j, k]].into();
                     let diff = (cpu_val - gpu_val).abs();

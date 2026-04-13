@@ -7671,6 +7671,26 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "47b34b781b31e5d73e9fbc8689c70551fd1ade9a19e3e28cfec8580a79290cc4"
 
 [[package]]
+name = "rgliner"
+version = "0.4.0"
+dependencies = [
+ "anyhow",
+ "fusor",
+ "fusor-core",
+ "fusor-gguf",
+ "kalosm-common",
+ "kalosm-language-model",
+ "kalosm-model-types",
+ "rbert",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokenizers",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "ring"
 version = "0.17.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"

@@ -59,35 +59,64 @@ impl BertSelfAttention {
         let key_layer = self.transpose_for_scores(&key_layer);
         let value_layer = self.transpose_for_scores(&value_layer);
 
-        let attention_scores = query_layer.mat_mul(&key_layer.t());
-        let mut attention_scores =
-            attention_scores.div_scalar((self.attention_head_size as f32).sqrt());
+        let scale = 1.0 / (self.attention_head_size as f32).sqrt();
+        const MASK_NEG_VALUE: f32 = -10000.0;
+        let mask: Option<Tensor<2, f32>> = attention_mask.map(|m| {
+            let mask_f32: Tensor<2, f32> = m.cast();
+            let zeros = mask_f32.zeros_like();
+            let ones = (zeros + 1.0f32).to_concrete();
+            ((ones - mask_f32) * MASK_NEG_VALUE).to_concrete()
+        });
 
-        // If there is an attention mask, filter the attention scores by that mask
-        if let Some(attention_mask) = attention_mask {
-            // The attention mask is a tensor of shape (bsize, seq_len)
-            // the attention scores are a tensor of shape (bsize, _, seq_len, seq_len)
-            // We expand the attention mask to (bsize, 1, 1, seq_len)
-            let mask = attention_mask
-                .unsqueeze::<3>(1)
-                .unsqueeze::<4>(2)
-                .to_concrete();
-            let shape = attention_scores.shape();
-            let mask: Tensor<4, f32> = mask.broadcast_as::<4>(shape).to_concrete().cast();
-            // We use a value slightly larger that the true f32 min value to avoid NaN
-            const FALSE_MIN: f32 = -3.4028235e34f32;
-            let device = attention_scores.device();
-            let on_false = Tensor::splat(&device, FALSE_MIN, shape);
-            attention_scores = mask.where_cond(&attention_scores, &on_false);
-        }
-
-        let attention_probs = {
+        let context_layer = {
             let _enter_sm = self.span_softmax.enter();
-            attention_scores.softmax_last_dim::<3>()
+            query_layer.flash_attention(
+                &key_layer,
+                &value_layer,
+                scale,
+                mask.as_ref().map(|m| (m, fusor::MaskKind::BatchKeyMask)),
+            )
         };
-        let context_layer = attention_probs.mat_mul(&value_layer);
         let context_layer = context_layer.transpose(1, 2).to_concrete();
         context_layer.flatten_last_n::<1, _>()
+    }
+
+    pub(crate) fn debug_forward(
+        &self,
+        hidden_states: &Tensor<3, f32>,
+        attention_mask: Option<&Tensor<2, u32>>,
+    ) -> (Tensor<4, f32>, Tensor<4, f32>, Tensor<4, f32>, Tensor<3, f32>) {
+        let _enter = self.span.enter();
+        let query_layer = self.query.forward(hidden_states);
+        let key_layer = self.key.forward(hidden_states);
+        let value_layer = self.value.forward(hidden_states);
+
+        let query_layer = self.transpose_for_scores(&query_layer);
+        let key_layer = self.transpose_for_scores(&key_layer);
+        let value_layer = self.transpose_for_scores(&value_layer);
+
+        let scale = 1.0 / (self.attention_head_size as f32).sqrt();
+        const MASK_NEG_VALUE: f32 = -10000.0;
+        let mask: Option<Tensor<2, f32>> = attention_mask.map(|m| {
+            let mask_f32: Tensor<2, f32> = m.cast();
+            let zeros = mask_f32.zeros_like();
+            let ones = (zeros + 1.0f32).to_concrete();
+            ((ones - mask_f32) * MASK_NEG_VALUE).to_concrete()
+        });
+
+        let context_layer = {
+            let _enter_sm = self.span_softmax.enter();
+            query_layer.flash_attention(
+                &key_layer,
+                &value_layer,
+                scale,
+                mask.as_ref().map(|m| (m, fusor::MaskKind::BatchKeyMask)),
+            )
+        };
+        let context_layer = context_layer.transpose(1, 2).to_concrete();
+        let context_layer = context_layer.flatten_last_n::<1, _>();
+
+        (query_layer, key_layer, value_layer, context_layer)
     }
 }
 
