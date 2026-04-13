@@ -343,7 +343,7 @@ impl TinyAttention {
         // q: (b, n, num_heads, key_dim) -> (b, num_heads, n, key_dim)
         let q_narrow = qkv.narrow(3, 0, self.key_dim);
         let q = q_narrow.transpose(1, 2); // (b, num_heads, n, key_dim)
-        // k: (b, n, num_heads, key_dim) -> (b, num_heads, n, key_dim)
+                                          // k: (b, n, num_heads, key_dim) -> (b, num_heads, n, key_dim)
         let k_narrow = qkv.narrow(3, self.key_dim, self.key_dim);
         let k = k_narrow.transpose(1, 2);
         // v: (b, n, num_heads, d) -> (b, num_heads, n, d)

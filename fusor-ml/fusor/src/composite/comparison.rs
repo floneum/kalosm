@@ -14,56 +14,71 @@ where
     /// Element-wise equality comparison between two tensors.
     ///
     /// Returns 1.0 where elements are equal, 0.0 otherwise.
-    /// Note: GPU comparison is only available for CPU tensors at this time.
     pub fn eq_tensor(&self, rhs: &Self) -> Tensor<R, D>
     where
         EqOp: SimdBinaryOp<D>,
     {
-        self.dispatch_cpu_only_pair(rhs, |a, b| a.as_ref().eq(b.as_ref()).to_concrete())
+        self.dispatch_pair_concrete(
+            rhs,
+            |a, b| a.as_ref().eq(b.as_ref()).to_concrete(),
+            |a, b| a.eq_tensor(b),
+        )
     }
 
     /// Element-wise less-than comparison between two tensors.
     ///
     /// Returns 1.0 where self < rhs, 0.0 otherwise.
-    /// Note: GPU comparison is only available for CPU tensors at this time.
     pub fn lt_tensor(&self, rhs: &Self) -> Tensor<R, D>
     where
         LtOp: SimdBinaryOp<D>,
     {
-        self.dispatch_cpu_only_pair(rhs, |a, b| a.as_ref().lt(b.as_ref()).to_concrete())
+        self.dispatch_pair_concrete(
+            rhs,
+            |a, b| a.as_ref().lt(b.as_ref()).to_concrete(),
+            |a, b| a.lt_tensor(b),
+        )
     }
 
     /// Element-wise less-than-or-equal comparison between two tensors.
     ///
     /// Returns 1.0 where self <= rhs, 0.0 otherwise.
-    /// Note: GPU comparison is only available for CPU tensors at this time.
     pub fn lte_tensor(&self, rhs: &Self) -> Tensor<R, D>
     where
         LteOp: SimdBinaryOp<D>,
     {
-        self.dispatch_cpu_only_pair(rhs, |a, b| a.as_ref().lte(b.as_ref()).to_concrete())
+        self.dispatch_pair_concrete(
+            rhs,
+            |a, b| a.as_ref().lte(b.as_ref()).to_concrete(),
+            |a, b| a.lte_tensor(b),
+        )
     }
 
     /// Element-wise greater-than comparison between two tensors.
     ///
     /// Returns 1.0 where self > rhs, 0.0 otherwise.
-    /// Note: GPU comparison is only available for CPU tensors at this time.
     pub fn gt_tensor(&self, rhs: &Self) -> Tensor<R, D>
     where
         GtOp: SimdBinaryOp<D>,
     {
-        self.dispatch_cpu_only_pair(rhs, |a, b| a.as_ref().gt(b.as_ref()).to_concrete())
+        self.dispatch_pair_concrete(
+            rhs,
+            |a, b| a.as_ref().gt(b.as_ref()).to_concrete(),
+            |a, b| a.gt_tensor(b),
+        )
     }
 
     /// Element-wise greater-than-or-equal comparison between two tensors.
     ///
     /// Returns 1.0 where self >= rhs, 0.0 otherwise.
-    /// Note: GPU comparison is only available for CPU tensors at this time.
     pub fn gte_tensor(&self, rhs: &Self) -> Tensor<R, D>
     where
         GteOp: SimdBinaryOp<D>,
     {
-        self.dispatch_cpu_only_pair(rhs, |a, b| a.as_ref().gte(b.as_ref()).to_concrete())
+        self.dispatch_pair_concrete(
+            rhs,
+            |a, b| a.as_ref().gte(b.as_ref()).to_concrete(),
+            |a, b| a.gte_tensor(b),
+        )
     }
 
     /// Element-wise equality comparison with a scalar.

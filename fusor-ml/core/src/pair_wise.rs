@@ -420,6 +420,65 @@ macro_rules! impl_pairwise_method {
 
 impl_pairwise_method!(pow, "pow(a, b)", "pow", pow_, |a, b| a.pow(&b));
 
+// Tensor-tensor comparison operations
+// These use format! instead of the macro because they need runtime type name insertion
+impl<const R: usize, T: DataType> Tensor<R, T> {
+    /// Element-wise equality comparison between two tensors.
+    /// Returns 1.0 where elements are equal, 0.0 otherwise.
+    pub fn eq_tensor(&self, other: &Self) -> Self {
+        let datatype = T::WGSL_TYPE;
+        self.pair_wise(
+            other,
+            PairWiseFunction::new(format!("let output = {datatype}(a == b);"), T::WGSL_TYPE)
+                .with_name("eq_tensor"),
+        )
+    }
+
+    /// Element-wise less-than comparison between two tensors.
+    /// Returns 1.0 where self < other, 0.0 otherwise.
+    pub fn lt_tensor(&self, other: &Self) -> Self {
+        let datatype = T::WGSL_TYPE;
+        self.pair_wise(
+            other,
+            PairWiseFunction::new(format!("let output = {datatype}(a < b);"), T::WGSL_TYPE)
+                .with_name("lt_tensor"),
+        )
+    }
+
+    /// Element-wise less-than-or-equal comparison between two tensors.
+    /// Returns 1.0 where self <= other, 0.0 otherwise.
+    pub fn lte_tensor(&self, other: &Self) -> Self {
+        let datatype = T::WGSL_TYPE;
+        self.pair_wise(
+            other,
+            PairWiseFunction::new(format!("let output = {datatype}(a <= b);"), T::WGSL_TYPE)
+                .with_name("lte_tensor"),
+        )
+    }
+
+    /// Element-wise greater-than comparison between two tensors.
+    /// Returns 1.0 where self > other, 0.0 otherwise.
+    pub fn gt_tensor(&self, other: &Self) -> Self {
+        let datatype = T::WGSL_TYPE;
+        self.pair_wise(
+            other,
+            PairWiseFunction::new(format!("let output = {datatype}(a > b);"), T::WGSL_TYPE)
+                .with_name("gt_tensor"),
+        )
+    }
+
+    /// Element-wise greater-than-or-equal comparison between two tensors.
+    /// Returns 1.0 where self >= other, 0.0 otherwise.
+    pub fn gte_tensor(&self, other: &Self) -> Self {
+        let datatype = T::WGSL_TYPE;
+        self.pair_wise(
+            other,
+            PairWiseFunction::new(format!("let output = {datatype}(a >= b);"), T::WGSL_TYPE)
+                .with_name("gte_tensor"),
+        )
+    }
+}
+
 #[cfg(test)]
 #[tokio::test]
 async fn test_pair_wise_pow() {
@@ -442,4 +501,119 @@ async fn test_pair_wise_pow() {
     assert!((as_slice[[1, 1]] - 4_f32.powf(4.)) < 0.001);
     assert!((as_slice[[2, 0]] - 5_f32.powf(5.)) < 0.001);
     assert!((as_slice[[2, 1]] - 6_f32.powf(6.)) < 0.001);
+}
+
+#[cfg(test)]
+#[tokio::test]
+async fn test_eq_tensor() {
+    use crate::Device;
+
+    let device = Device::test_instance();
+
+    let data_a = [[1., 2.], [3., 4.], [5., 6.]];
+    let data_b = [[1., 3.], [3., 5.], [5., 7.]];
+    let tensor_a = Tensor::new(&device, &data_a);
+    let tensor_b = Tensor::new(&device, &data_b);
+
+    let tensor = tensor_a.eq_tensor(&tensor_b);
+    let as_slice = tensor.as_slice().await.unwrap();
+
+    assert_eq!(as_slice[[0, 0]], 1.); // 1 == 1
+    assert_eq!(as_slice[[0, 1]], 0.); // 2 != 3
+    assert_eq!(as_slice[[1, 0]], 1.); // 3 == 3
+    assert_eq!(as_slice[[1, 1]], 0.); // 4 != 5
+    assert_eq!(as_slice[[2, 0]], 1.); // 5 == 5
+    assert_eq!(as_slice[[2, 1]], 0.); // 6 != 7
+}
+
+#[cfg(test)]
+#[tokio::test]
+async fn test_lt_tensor() {
+    use crate::Device;
+
+    let device = Device::test_instance();
+
+    let data_a = [[1., 2.], [3., 4.], [5., 6.]];
+    let data_b = [[2., 2.], [2., 2.], [2., 2.]];
+    let tensor_a = Tensor::new(&device, &data_a);
+    let tensor_b = Tensor::new(&device, &data_b);
+
+    let tensor = tensor_a.lt_tensor(&tensor_b);
+    let as_slice = tensor.as_slice().await.unwrap();
+
+    assert_eq!(as_slice[[0, 0]], 1.); // 1 < 2
+    assert_eq!(as_slice[[0, 1]], 0.); // 2 < 2
+    assert_eq!(as_slice[[1, 0]], 0.); // 3 < 2
+    assert_eq!(as_slice[[1, 1]], 0.); // 4 < 2
+    assert_eq!(as_slice[[2, 0]], 0.); // 5 < 2
+    assert_eq!(as_slice[[2, 1]], 0.); // 6 < 2
+}
+
+#[cfg(test)]
+#[tokio::test]
+async fn test_gt_tensor() {
+    use crate::Device;
+
+    let device = Device::test_instance();
+
+    let data_a = [[1., 2.], [3., 4.], [5., 6.]];
+    let data_b = [[2., 2.], [2., 2.], [2., 2.]];
+    let tensor_a = Tensor::new(&device, &data_a);
+    let tensor_b = Tensor::new(&device, &data_b);
+
+    let tensor = tensor_a.gt_tensor(&tensor_b);
+    let as_slice = tensor.as_slice().await.unwrap();
+
+    assert_eq!(as_slice[[0, 0]], 0.); // 1 > 2
+    assert_eq!(as_slice[[0, 1]], 0.); // 2 > 2
+    assert_eq!(as_slice[[1, 0]], 1.); // 3 > 2
+    assert_eq!(as_slice[[1, 1]], 1.); // 4 > 2
+    assert_eq!(as_slice[[2, 0]], 1.); // 5 > 2
+    assert_eq!(as_slice[[2, 1]], 1.); // 6 > 2
+}
+
+#[cfg(test)]
+#[tokio::test]
+async fn test_lte_tensor() {
+    use crate::Device;
+
+    let device = Device::test_instance();
+
+    let data_a = [[1., 2.], [3., 4.], [5., 6.]];
+    let data_b = [[2., 2.], [2., 2.], [2., 2.]];
+    let tensor_a = Tensor::new(&device, &data_a);
+    let tensor_b = Tensor::new(&device, &data_b);
+
+    let tensor = tensor_a.lte_tensor(&tensor_b);
+    let as_slice = tensor.as_slice().await.unwrap();
+
+    assert_eq!(as_slice[[0, 0]], 1.); // 1 <= 2
+    assert_eq!(as_slice[[0, 1]], 1.); // 2 <= 2
+    assert_eq!(as_slice[[1, 0]], 0.); // 3 <= 2
+    assert_eq!(as_slice[[1, 1]], 0.); // 4 <= 2
+    assert_eq!(as_slice[[2, 0]], 0.); // 5 <= 2
+    assert_eq!(as_slice[[2, 1]], 0.); // 6 <= 2
+}
+
+#[cfg(test)]
+#[tokio::test]
+async fn test_gte_tensor() {
+    use crate::Device;
+
+    let device = Device::test_instance();
+
+    let data_a = [[1., 2.], [3., 4.], [5., 6.]];
+    let data_b = [[2., 2.], [2., 2.], [2., 2.]];
+    let tensor_a = Tensor::new(&device, &data_a);
+    let tensor_b = Tensor::new(&device, &data_b);
+
+    let tensor = tensor_a.gte_tensor(&tensor_b);
+    let as_slice = tensor.as_slice().await.unwrap();
+
+    assert_eq!(as_slice[[0, 0]], 0.); // 1 >= 2
+    assert_eq!(as_slice[[0, 1]], 1.); // 2 >= 2
+    assert_eq!(as_slice[[1, 0]], 1.); // 3 >= 2
+    assert_eq!(as_slice[[1, 1]], 1.); // 4 >= 2
+    assert_eq!(as_slice[[2, 0]], 1.); // 5 >= 2
+    assert_eq!(as_slice[[2, 1]], 1.); // 6 >= 2
 }
