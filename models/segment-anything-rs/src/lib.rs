@@ -506,7 +506,7 @@ impl SegmentAnything {
             let image = image::DynamicImage::from(mask_img).resize_exact(
                 image_width,
                 image_height,
-                image::imageops::FilterType::CatmullRom,
+                image::imageops::FilterType::Nearest,
             );
             masks.push(image);
         }
@@ -584,7 +584,7 @@ mod tests {
         let shape = t.shape();
         let n: usize = shape.iter().product();
         let ones: Tensor<R, f32> = Tensor::from_slice(&t.device(), shape, &vec![1.0f32; n]);
-        let materialized = (t * ones);
+        let materialized = t * ones;
         let flat = materialized.reshape([n]);
         let s = pollster::block_on(flat.as_slice()).unwrap();
         s.as_slice().to_vec()
@@ -775,15 +775,16 @@ mod tests {
                 fusor::arange_step::<f32>(device, 0.5, w as f32 + 0.5, 1.0).div_scalar(w as f32);
             let y: Tensor<1, f32> =
                 fusor::arange_step::<f32>(device, 0.5, h as f32 + 0.5, 1.0).div_scalar(h as f32);
-            let xu = x.reshape([1, w]).broadcast_as([h, w]).reshape([h, w, 1]);
-            let yu = y.reshape([h, 1]).broadcast_as([h, w]).reshape([h, w, 1]);
-            let coords = (Tensor::cat([xu, yu], 2).mul_scalar(2.0) + (-1.0f32));
+            let x_2d = x.reshape([1, w]);
+            let x_broadcast = x_2d.broadcast_as([h, w]);
+            let xu = x_broadcast.reshape([h, w, 1]);
+            let y_2d = y.reshape([h, 1]);
+            let y_broadcast = y_2d.broadcast_as([h, w]);
+            let yu = y_broadcast.reshape([h, w, 1]);
+            let coords = Tensor::cat([xu, yu], 2).mul_scalar(2.0) + (-1.0f32);
             let gm_shape = gm.shape();
-            let gm3 = gm.reshape([1, gm_shape[0], gm_shape[1]]).broadcast_as([
-                h,
-                gm_shape[0],
-                gm_shape[1],
-            ]);
+            let gm_reshaped = gm.reshape([1, gm_shape[0], gm_shape[1]]);
+            let gm3 = gm_reshaped.broadcast_as([h, gm_shape[0], gm_shape[1]]);
             let scaled = coords.mat_mul(&gm3).mul_scalar(2.0 * std::f32::consts::PI);
             // Dual consumer: sin() and cos() both read from `scaled`
             Tensor::cat([scaled.sin().to_concrete(), scaled.cos().to_concrete()], 2)
@@ -799,15 +800,16 @@ mod tests {
                 fusor::arange_step::<f32>(device, 0.5, w as f32 + 0.5, 1.0).div_scalar(w as f32);
             let y: Tensor<1, f32> =
                 fusor::arange_step::<f32>(device, 0.5, h as f32 + 0.5, 1.0).div_scalar(h as f32);
-            let xu = x.reshape([1, w]).broadcast_as([h, w]).reshape([h, w, 1]);
-            let yu = y.reshape([h, 1]).broadcast_as([h, w]).reshape([h, w, 1]);
-            let coords = (Tensor::cat([xu, yu], 2).mul_scalar(2.0) + (-1.0f32));
+            let x_2d = x.reshape([1, w]);
+            let x_broadcast = x_2d.broadcast_as([h, w]);
+            let xu = x_broadcast.reshape([h, w, 1]);
+            let y_2d = y.reshape([h, 1]);
+            let y_broadcast = y_2d.broadcast_as([h, w]);
+            let yu = y_broadcast.reshape([h, w, 1]);
+            let coords = Tensor::cat([xu, yu], 2).mul_scalar(2.0) + (-1.0f32);
             let gm_shape = gm.shape();
-            let gm3 = gm.reshape([1, gm_shape[0], gm_shape[1]]).broadcast_as([
-                h,
-                gm_shape[0],
-                gm_shape[1],
-            ]);
+            let gm_reshaped = gm.reshape([1, gm_shape[0], gm_shape[1]]);
+            let gm3 = gm_reshaped.broadcast_as([h, gm_shape[0], gm_shape[1]]);
             let mm = coords.mat_mul(&gm3);
             // Control path: force distinct mul_scalar nodes for comparison.
             let for_sin = mm.mul_scalar(2.0 * std::f32::consts::PI);
