@@ -129,24 +129,32 @@ impl SegmentAnythingInferenceSettings {
     }
 
     /// Add a point to the list of points to segment.
+    ///
+    /// Coordinates are normalized to `[0, 1]`.
     pub fn add_goal_point(mut self, x: impl Into<f64>, y: impl Into<f64>) -> Self {
         self.goal_points.push((x.into(), y.into()));
         self
     }
 
     /// Set the list of points to segment.
+    ///
+    /// Coordinates are normalized to `[0, 1]`.
     pub fn set_goal_points(mut self, points: Vec<(f64, f64)>) -> Self {
         self.goal_points = points;
         self
     }
 
     /// Add a point to the list of points to avoid.
+    ///
+    /// Coordinates are normalized to `[0, 1]`.
     pub fn add_avoid_points(mut self, x: impl Into<f64>, y: impl Into<f64>) -> Self {
         self.avoid_points.push((x.into(), y.into()));
         self
     }
 
     /// Set the list of points to avoid.
+    ///
+    /// Coordinates are normalized to `[0, 1]`.
     pub fn set_avoid_points(mut self, points: Vec<(f64, f64)>) -> Self {
         self.avoid_points = points;
         self
@@ -366,13 +374,6 @@ impl SegmentAnything {
         // Build a 32x32 grid of points (1024 points)
         let point_grid = build_point_grid(32);
 
-        struct MaskCandidate {
-            mask_data: Vec<f32>,
-            iou: f32,
-            h: usize,
-            w: usize,
-        }
-
         let mut candidates: Vec<MaskCandidate> = Vec::new();
 
         const BATCH_SIZE: usize = 64;
@@ -446,59 +447,25 @@ impl SegmentAnything {
                         continue;
                     }
 
-                    candidates.push(MaskCandidate {
-                        mask_data: cropped_mask,
-                        iou,
-                        h: crop_h,
-                        w: crop_w,
-                    });
+                    if let Some((mask, bbox)) =
+                        BinaryMask::from_thresholded(&cropped_mask, crop_w, MODEL_MASK_THRESHOLD)
+                    {
+                        candidates.push(MaskCandidate {
+                            mask,
+                            bbox,
+                            score: iou,
+                            h: crop_h,
+                            w: crop_w,
+                        });
+                    }
                 }
             }
         }
 
-        // NMS: sort by IoU descending, suppress overlapping masks
-        candidates.sort_by(|a, b| {
-            b.iou
-                .partial_cmp(&a.iou)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
-        let mut keep = vec![true; candidates.len()];
-        for i in 0..candidates.len() {
-            if !keep[i] {
-                continue;
-            }
-            for j in (i + 1)..candidates.len() {
-                if !keep[j] {
-                    continue;
-                }
-                let iou = mask_iou(&candidates[i].mask_data, &candidates[j].mask_data);
-                if iou > CROP_NMS_THRESH {
-                    keep[j] = false;
-                }
-            }
-        }
-
-        // Convert surviving masks to images
+        let candidates = non_maximum_suppression(candidates, CROP_NMS_THRESH);
         let mut masks = Vec::new();
-        for (i, candidate) in candidates.iter().enumerate() {
-            if !keep[i] {
-                continue;
-            }
-
-            // Threshold mask at 0.0 -> binary 0/255
-            let rgb_pixels: Vec<u8> = candidate
-                .mask_data
-                .iter()
-                .flat_map(|&v| {
-                    let p = if v >= MODEL_MASK_THRESHOLD {
-                        255u8
-                    } else {
-                        0u8
-                    };
-                    [p, p, p]
-                })
-                .collect();
-
+        for candidate in candidates {
+            let rgb_pixels = candidate.mask.to_rgb_pixels();
             let mask_img: image::ImageBuffer<image::Rgb<u8>, Vec<u8>> =
                 image::ImageBuffer::from_raw(candidate.w as u32, candidate.h as u32, rgb_pixels)
                     .ok_or(SegmentAnythingInferenceError::MergeMasks)?;
@@ -532,25 +499,125 @@ impl SegmentAnything {
     }
 }
 
-/// Compute IoU (Intersection over Union) between two masks on CPU.
-/// Masks are raw float values; pixels >= MODEL_MASK_THRESHOLD count as foreground.
-fn mask_iou(a: &[f32], b: &[f32]) -> f32 {
-    let mut intersection = 0u32;
-    let mut area_a = 0u32;
-    let mut area_b = 0u32;
-    for (&av, &bv) in a.iter().zip(b.iter()) {
-        let a_fg = av >= MODEL_MASK_THRESHOLD;
-        let b_fg = bv >= MODEL_MASK_THRESHOLD;
-        area_a += a_fg as u32;
-        area_b += b_fg as u32;
-        intersection += (a_fg && b_fg) as u32;
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct BoundingBox {
+    x0: usize,
+    y0: usize,
+    x1: usize,
+    y1: usize,
+}
+
+impl BoundingBox {
+    fn area(self) -> usize {
+        (self.x1 - self.x0) * (self.y1 - self.y0)
     }
-    let union = area_a + area_b - intersection;
-    if union > 0 {
-        intersection as f32 / union as f32
-    } else {
-        0.0
+}
+
+#[derive(Clone, Debug)]
+struct BinaryMask {
+    bits: Vec<u64>,
+    len: usize,
+}
+
+impl BinaryMask {
+    fn from_thresholded(mask: &[f32], width: usize, threshold: f32) -> Option<(Self, BoundingBox)> {
+        let mut bits = vec![0u64; mask.len().div_ceil(64)];
+        let mut min_x = usize::MAX;
+        let mut min_y = usize::MAX;
+        let mut max_x = 0usize;
+        let mut max_y = 0usize;
+        let mut has_foreground = false;
+
+        for (idx, &value) in mask.iter().enumerate() {
+            if value < threshold {
+                continue;
+            }
+
+            has_foreground = true;
+            bits[idx / 64] |= 1u64 << (idx % 64);
+
+            let x = idx % width;
+            let y = idx / width;
+            min_x = min_x.min(x);
+            min_y = min_y.min(y);
+            max_x = max_x.max(x);
+            max_y = max_y.max(y);
+        }
+
+        has_foreground.then_some((
+            Self {
+                bits,
+                len: mask.len(),
+            },
+            BoundingBox {
+                x0: min_x,
+                y0: min_y,
+                x1: max_x + 1,
+                y1: max_y + 1,
+            },
+        ))
     }
+
+    fn bit(&self, idx: usize) -> bool {
+        let word = self.bits[idx / 64];
+        ((word >> (idx % 64)) & 1) != 0
+    }
+
+    fn to_rgb_pixels(&self) -> Vec<u8> {
+        let mut pixels = Vec::with_capacity(self.len * 3);
+        for idx in 0..self.len {
+            let value = if self.bit(idx) { 255u8 } else { 0u8 };
+            pixels.extend_from_slice(&[value, value, value]);
+        }
+        pixels
+    }
+}
+
+#[derive(Clone, Debug)]
+struct MaskCandidate {
+    mask: BinaryMask,
+    bbox: BoundingBox,
+    score: f32,
+    h: usize,
+    w: usize,
+}
+
+fn bbox_iou(a: BoundingBox, b: BoundingBox) -> f32 {
+    let x0 = a.x0.max(b.x0);
+    let y0 = a.y0.max(b.y0);
+    let x1 = a.x1.min(b.x1);
+    let y1 = a.y1.min(b.y1);
+
+    if x0 >= x1 || y0 >= y1 {
+        return 0.0;
+    }
+
+    let intersection = (x1 - x0) * (y1 - y0);
+    let union = a.area() + b.area() - intersection;
+    intersection as f32 / union as f32
+}
+
+fn non_maximum_suppression(
+    mut candidates: Vec<MaskCandidate>,
+    threshold: f32,
+) -> Vec<MaskCandidate> {
+    candidates.sort_by(|a, b| {
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+
+    let mut kept: Vec<MaskCandidate> = Vec::with_capacity(candidates.len());
+    'candidate: for candidate in candidates {
+        for kept_candidate in &kept {
+            if bbox_iou(candidate.bbox, kept_candidate.bbox) > threshold {
+                continue 'candidate;
+            }
+        }
+        kept.push(candidate);
+    }
+
+    kept
 }
 
 fn low_res_crop_extent(original_len: usize, low_res_len: usize) -> usize {
@@ -1153,5 +1220,79 @@ mod tests {
         assert_eq!(low_res_crop_extent(769, 256), 193);
         assert_eq!(low_res_crop_extent(1024, 256), 256);
         assert_eq!(low_res_crop_extent(1, 256), 1);
+    }
+
+    #[test]
+    fn test_binary_mask_bbox_tracks_foreground_extent() {
+        let mask = vec![
+            -1.0, -1.0, -1.0, -1.0, -1.0, 1.0, 1.0, -1.0, -1.0, -1.0, 1.0, -1.0,
+        ];
+        let (binary, bbox) = BinaryMask::from_thresholded(&mask, 4, 0.0).unwrap();
+
+        assert_eq!(
+            bbox,
+            BoundingBox {
+                x0: 1,
+                y0: 1,
+                x1: 3,
+                y1: 3,
+            }
+        );
+        assert!(binary.bit(5));
+        assert!(binary.bit(6));
+        assert!(binary.bit(10));
+        assert!(!binary.bit(0));
+        assert!(!binary.bit(11));
+    }
+
+    #[test]
+    fn test_bbox_nms_prefers_highest_scoring_candidate() {
+        let candidate = |bbox, score| MaskCandidate {
+            mask: BinaryMask {
+                bits: vec![1],
+                len: 1,
+            },
+            bbox,
+            score,
+            h: 1,
+            w: 1,
+        };
+
+        let kept = non_maximum_suppression(
+            vec![
+                candidate(
+                    BoundingBox {
+                        x0: 0,
+                        y0: 0,
+                        x1: 10,
+                        y1: 10,
+                    },
+                    0.95,
+                ),
+                candidate(
+                    BoundingBox {
+                        x0: 0,
+                        y0: 0,
+                        x1: 10,
+                        y1: 10,
+                    },
+                    0.80,
+                ),
+                candidate(
+                    BoundingBox {
+                        x0: 20,
+                        y0: 20,
+                        x1: 30,
+                        y1: 30,
+                    },
+                    0.70,
+                ),
+            ],
+            0.7,
+        );
+
+        assert_eq!(kept.len(), 2);
+        assert_eq!(kept[0].score, 0.95);
+        assert_eq!(kept[1].score, 0.70);
     }
 }
