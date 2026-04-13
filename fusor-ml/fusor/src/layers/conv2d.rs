@@ -2,7 +2,7 @@
 
 use crate::{ConcreteTensor, Device, MatmulImpl, SimdElement, Tensor, VarBuilder};
 use fusor_core::{DataType, FloatDataType};
-use fusor_cpu::FloatOps;
+use fusor_cpu::{FloatOps, TensorBacking};
 
 /// Configuration for Conv2d layer
 #[derive(Debug, Clone, Copy)]
@@ -81,13 +81,14 @@ where
     /// Output shape: (batch, out_channels, out_height, out_width)
     pub fn forward(
         &self,
-        input: &Tensor<4, D, ConcreteTensor<D, 4>>,
+        input: &Tensor<4, D, impl TensorBacking<4, Elem = D>>,
     ) -> Tensor<4, D, ConcreteTensor<D, 4>>
     where
         crate::MulOp: fusor_cpu::SimdBinaryOp<D>,
         crate::AddOp: fusor_cpu::SimdBinaryOp<D>,
         fusor_cpu::SumOp: fusor_cpu::SimdReduceOp<D>,
     {
+        let input = input.to_concrete();
         if self.config.groups == 1 {
             input.conv(
                 &self.weight,

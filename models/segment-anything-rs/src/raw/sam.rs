@@ -1,6 +1,6 @@
 //! Top-level Sam model: ties together image encoder, prompt encoder, and mask decoder.
 
-use fusor::{ConcreteTensor, Device, Tensor, VarBuilder};
+use fusor::{ConcreteTensor, Device, Tensor, TensorBacking, VarBuilder};
 
 use super::image_encoder::ImageEncoderViT;
 use super::mask_decoder::MaskDecoder;
@@ -24,7 +24,7 @@ pub(crate) enum ImageEncoder {
 }
 
 impl ImageEncoder {
-    fn forward(&self, xs: &Tensor<4, f32, ConcreteTensor<f32, 4>>) -> Tensor<4, f32> {
+    fn forward(&self, xs: &Tensor<4, f32, impl TensorBacking<4, Elem = f32>>) -> Tensor<4, f32> {
         match self {
             Self::Original(vit) => vit.forward(xs),
             Self::TinyViT(vit) => vit.forward(xs),
@@ -141,8 +141,7 @@ impl Sam {
         let img = self.preprocess(img);
         // Add batch dim: (C, H, W) -> (1, C, H, W)
         let shape = img.shape();
-        let img: Tensor<4, f32, ConcreteTensor<f32, 4>> =
-            img.reshape([1, shape[0], shape[1], shape[2]]).to_concrete();
+        let img = img.reshape([1, shape[0], shape[1], shape[2]]);
         self.image_encoder.forward(&img)
     }
 
@@ -162,9 +161,7 @@ impl Sam {
         let img = self.preprocess(img);
         // (C, H, W) -> (1, C, H, W)
         let img_shape = img.shape();
-        let img: Tensor<4, f32, ConcreteTensor<f32, 4>> = img
-            .reshape([1, img_shape[0], img_shape[1], img_shape[2]])
-            .to_concrete();
+        let img = img.reshape([1, img_shape[0], img_shape[1], img_shape[2]]);
         let img_embeddings = self.image_encoder.forward(&img);
 
         let (low_res_mask, iou) = self.forward_for_embeddings(
@@ -176,17 +173,13 @@ impl Sam {
         );
 
         // Upsample to IMAGE_SIZE
-        let upscaled: Tensor<4, f32> = low_res_mask.to_concrete().upsample_nearest2d(
+        let upscaled: Tensor<4, f32> = low_res_mask.upsample_nearest2d(
             IMAGE_SIZE / low_res_mask.shape()[2],
             IMAGE_SIZE / low_res_mask.shape()[3],
         );
 
         // Crop to original size: narrow on H and W dims
-        let cropped = upscaled
-            .narrow(2, 0, original_h)
-            .to_concrete()
-            .narrow(3, 0, original_w)
-            .to_concrete();
+        let cropped = upscaled.narrow(2, 0, original_h).narrow(3, 0, original_w);
 
         (cropped.to_concrete(), iou)
     }
@@ -293,10 +286,7 @@ impl Sam {
     }
 
     /// Preprocess an image tensor: normalize by pixel mean/std and pad to IMAGE_SIZE.
-    pub(crate) fn preprocess(
-        &self,
-        img: &Tensor<3, f32, ConcreteTensor<f32, 3>>,
-    ) -> Tensor<3, f32, ConcreteTensor<f32, 3>> {
+    pub(crate) fn preprocess(&self, img: &Tensor<3, f32>) -> Tensor<3, f32> {
         let shape = img.shape();
         let c = shape[0];
         let h = shape[1];
@@ -304,14 +294,10 @@ impl Sam {
         let device = img.device();
 
         // Create mean and std tensors: (3, 1, 1) broadcast to (3, H, W)
-        let mean: Tensor<3, f32> = Tensor::from_slice(&device, [3, 1, 1], &self.pixel_mean)
-            .broadcast_as([c, h, w])
-            .to_concrete();
-        let std: Tensor<3, f32> = Tensor::from_slice(&device, [3, 1, 1], &self.pixel_std)
-            .broadcast_as([c, h, w])
-            .to_concrete();
+        let mean = Tensor::from_slice(&device, [3, 1, 1], &self.pixel_mean).broadcast_as([c, h, w]);
+        let std = Tensor::from_slice(&device, [3, 1, 1], &self.pixel_std).broadcast_as([c, h, w]);
 
-        let img: Tensor<3, f32, ConcreteTensor<f32, 3>> = ((img - mean) / std).to_concrete();
+        let img = ((img - mean) / std);
 
         // Pad to IMAGE_SIZE
         let img = if h < IMAGE_SIZE {
@@ -324,7 +310,7 @@ impl Sam {
         } else {
             img
         };
-        img
+        img.to_concrete()
     }
 }
 

@@ -21,10 +21,7 @@ impl SamUpscale2x2 {
         let weight: Tensor<4, f32> = vb.get("weight", device)?.dequantize();
         let bias: Option<Tensor<1, f32, ConcreteTensor<f32, 1>>> =
             vb.get("bias", device).ok().map(|b| b.dequantize());
-        Ok(Self {
-            weight: weight.to_concrete(),
-            bias,
-        })
+        Ok(Self { weight, bias })
     }
 
     fn forward(
@@ -49,36 +46,24 @@ impl SamUpscale2x2 {
             [kh, kw]
         );
 
-        let input_flat: Tensor<2, f32, ConcreteTensor<f32, 2>> = input
-            .reshape([b, in_ch, h * w])
-            .transpose(1, 2)
-            .to_concrete()
-            .reshape([b * h * w, in_ch])
-            .to_concrete();
-        let weight_flat: Tensor<2, f32, ConcreteTensor<f32, 2>> =
-            self.weight.reshape([in_ch, out_ch * kh * kw]).to_concrete();
+        let input_flat = input.reshape([b, in_ch, h * w]);
+        let input_flat = input_flat.transpose(1, 2);
+        let input_flat = input_flat.reshape([b * h * w, in_ch]);
+        let weight_flat = self.weight.reshape([in_ch, out_ch * kh * kw]);
         let result = input_flat.mat_mul(&weight_flat);
 
-        let result: Tensor<6, f32, ConcreteTensor<f32, 6>> =
-            result.reshape([b, h, w, out_ch, kh, kw]).to_concrete();
-        let result: Tensor<4, f32, ConcreteTensor<f32, 4>> = result
-            .transpose(2, 3)
-            .to_concrete()
-            .transpose(1, 2)
-            .to_concrete()
-            .transpose(3, 4)
-            .to_concrete()
-            .reshape([b, out_ch, h * kh, w * kw])
-            .to_concrete();
+        let result = result.reshape([b, h, w, out_ch, kh, kw]);
+        let result = result.transpose(2, 3);
+        let result = result.transpose(1, 2);
+        let result = result.transpose(3, 4);
+        let result = result.reshape([b, out_ch, h * kh, w * kw]);
 
         if let Some(bias) = &self.bias {
-            let bias_4d: Tensor<4, f32, ConcreteTensor<f32, 4>> = bias
-                .reshape([1, out_ch, 1, 1])
-                .broadcast_as([b, out_ch, h * kh, w * kw])
-                .to_concrete();
+            let bias = bias.reshape([1, out_ch, 1, 1]);
+            let bias_4d = bias.broadcast_as([b, out_ch, h * kh, w * kw]);
             (result + bias_4d).to_concrete()
         } else {
-            result
+            result.to_concrete()
         }
     }
 }

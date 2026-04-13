@@ -1,7 +1,7 @@
 //! Raw SAM model implementation using fusor-ml.
 
 use fusor::layers::Linear;
-use fusor::{Device, Tensor, VarBuilder};
+use fusor::{Device, Tensor, TensorBacking, VarBuilder};
 
 #[allow(dead_code)]
 pub mod image_encoder;
@@ -49,22 +49,15 @@ impl MlpBlock {
         })
     }
 
-    pub fn forward(&self, xs: &Tensor<3, f32>) -> Tensor<3, f32> {
+    pub fn forward(
+        &self,
+        xs: &Tensor<3, f32, impl TensorBacking<3, Elem = f32>>,
+    ) -> Tensor<3, f32> {
         let xs = self.lin1.forward(xs);
         let xs = match self.activation {
             Activation::Gelu => xs.gelu(),
             Activation::Relu => xs.relu(),
         };
         self.lin2.forward(&xs)
-    }
-
-    #[allow(dead_code)]
-    pub fn forward_2d(&self, xs: &Tensor<2, f32>) -> Tensor<2, f32> {
-        let xs = self.lin1.forward_2d(xs);
-        let xs = match self.activation {
-            Activation::Gelu => xs.gelu(),
-            Activation::Relu => xs.relu(),
-        };
-        self.lin2.forward_2d(&xs)
     }
 }

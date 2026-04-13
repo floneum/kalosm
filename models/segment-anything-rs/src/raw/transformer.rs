@@ -1,7 +1,7 @@
 //! TwoWayTransformer for cross-attention between queries and image embeddings.
 
 use fusor::layers::{LayerNorm, Linear};
-use fusor::{ConcreteTensor, Device, Tensor, VarBuilder};
+use fusor::{ConcreteTensor, Device, Tensor, TensorBacking, VarBuilder};
 
 use super::{Activation, MlpBlock, Result};
 
@@ -52,20 +52,19 @@ impl Attention {
         let n_tokens = shape[2];
         let c_per_head = shape[3];
         x.transpose(1, 2)
-            .to_concrete()
             .reshape([b, n_tokens, n_heads * c_per_head])
             .to_concrete()
     }
 
     fn forward(
         &self,
-        q: &Tensor<3, f32>,
-        k: &Tensor<3, f32>,
-        v: &Tensor<3, f32>,
+        q: &Tensor<3, f32, impl TensorBacking<3, Elem = f32>>,
+        k: &Tensor<3, f32, impl TensorBacking<3, Elem = f32>>,
+        v: &Tensor<3, f32, impl TensorBacking<3, Elem = f32>>,
     ) -> Tensor<3, f32> {
-        let q = self.q_proj.forward(&q.to_concrete());
-        let k = self.k_proj.forward(&k.to_concrete());
-        let v = self.v_proj.forward(&v.to_concrete());
+        let q = self.q_proj.forward(&q);
+        let k = self.k_proj.forward(&k);
+        let v = self.v_proj.forward(&v);
 
         let q = self.separate_heads(&q);
         let k = self.separate_heads(&k);
@@ -76,7 +75,7 @@ impl Attention {
 
         // attn = (q * scale) @ k^T
         let q_scaled = q.mul_scalar(scale);
-        let attn = q_scaled.mat_mul(&k.transpose(2, 3).to_concrete());
+        let attn = q_scaled.mat_mul(&k.transpose(2, 3));
         let attn: Tensor<4, f32> = attn.softmax_last_dim::<3>();
 
         let out = attn.mat_mul(&v);
@@ -148,38 +147,38 @@ impl TwoWayAttentionBlock {
 
     fn forward(
         &self,
-        queries: &Tensor<3, f32>,
-        keys: &Tensor<3, f32>,
-        query_pe: &Tensor<3, f32>,
-        key_pe: &Tensor<3, f32>,
+        queries: &Tensor<3, f32, impl TensorBacking<3, Elem = f32>>,
+        keys: &Tensor<3, f32, impl TensorBacking<3, Elem = f32>>,
+        query_pe: &Tensor<3, f32, impl TensorBacking<3, Elem = f32>>,
+        key_pe: &Tensor<3, f32, impl TensorBacking<3, Elem = f32>>,
     ) -> (Tensor<3, f32>, Tensor<3, f32>) {
         // Self attention block
         let queries: Tensor<3, f32> = if self.skip_first_layer_pe {
             self.self_attn.forward(queries, queries, queries)
         } else {
-            let q: Tensor<3, f32> = (queries + query_pe).to_concrete();
+            let q = (queries + query_pe);
             let attn_out = self.self_attn.forward(&q, &q, queries);
             (queries + attn_out).to_concrete()
         };
         let queries = self.norm1.forward(&queries);
 
         // Cross attention block, tokens attending to image embedding
-        let q: Tensor<3, f32> = (&queries + query_pe).to_concrete();
-        let k: Tensor<3, f32> = (keys + key_pe).to_concrete();
+        let q = (&queries + query_pe);
+        let k = (keys + key_pe);
         let attn_out = self.cross_attn_token_to_image.forward(&q, &k, keys);
-        let queries: Tensor<3, f32> = (&queries + attn_out).to_concrete();
+        let queries = (&queries + attn_out);
         let queries = self.norm2.forward(&queries);
 
         // MLP block
         let mlp_out = self.mlp.forward(&queries);
-        let queries: Tensor<3, f32> = (&queries + mlp_out).to_concrete();
+        let queries = (&queries + mlp_out);
         let queries = self.norm3.forward(&queries);
 
         // Cross attention block, image embedding attending to tokens
-        let q: Tensor<3, f32> = (&queries + query_pe).to_concrete();
-        let k: Tensor<3, f32> = (keys + key_pe).to_concrete();
+        let q = (&queries + query_pe);
+        let k = (keys + key_pe);
         let attn_out = self.cross_attn_image_to_token.forward(&k, &q, &queries);
-        let keys: Tensor<3, f32> = (keys + attn_out).to_concrete();
+        let keys = (keys + attn_out);
         let keys = self.norm4.forward(&keys);
 
         (queries.to_concrete(), keys.to_concrete())
@@ -241,16 +240,12 @@ impl TwoWayTransformer {
         let w = shape[3];
 
         // Flatten spatial dims and permute: (B, C, H, W) -> (B, H*W, C)
-        let image_embedding: Tensor<3, f32> = image_embedding
+        let image_embedding = image_embedding
             .reshape([b, c, h * w])
-            .to_concrete()
             .transpose(1, 2)
             .to_concrete();
-        let image_pe: Tensor<3, f32> = image_pe
-            .reshape([b, c, h * w])
-            .to_concrete()
-            .transpose(1, 2)
-            .to_concrete();
+        let image_pe = image_pe.reshape([b, c, h * w]);
+        let image_pe = image_pe.transpose(1, 2);
 
         let mut queries = point_embedding.clone();
         let mut keys = image_embedding;
@@ -259,10 +254,10 @@ impl TwoWayTransformer {
             (queries, keys) = layer.forward(&queries, &keys, point_embedding, &image_pe);
         }
 
-        let q: Tensor<3, f32> = (&queries + point_embedding).to_concrete();
-        let k: Tensor<3, f32> = (&keys + &image_pe).to_concrete();
+        let q = (&queries + point_embedding);
+        let k = (&keys + &image_pe);
         let attn_out = self.final_attn_token_to_image.forward(&q, &k, &keys);
-        let queries: Tensor<3, f32> = (queries + attn_out).to_concrete();
+        let queries = (queries + attn_out);
         let queries = self.norm_final_attn.forward(&queries);
 
         (queries.to_concrete(), keys)

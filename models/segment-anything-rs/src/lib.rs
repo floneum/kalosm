@@ -274,33 +274,21 @@ impl SegmentAnything {
         let w = mask_shape[3];
 
         // Get first mask (batch=0, mask=0)
-        let mask_2d: Tensor<2, f32> = mask
-            .narrow(0, 0, 1)
-            .to_concrete()
-            .narrow(1, 0, 1)
-            .to_concrete()
-            .reshape([h, w])
-            .to_concrete();
+        let mask_2d = mask.narrow(0, 0, 1).narrow(1, 0, 1).reshape([h, w]);
 
         // Threshold: >= threshold -> 255, else 0
-        let threshold_mask: Tensor<2, f32> = mask_2d.gt_scalar(threshold - 1e-6).to_concrete();
+        let threshold_mask = mask_2d.gt_scalar(threshold - 1e-6);
 
         let mask_u8: Tensor<2, f32> = threshold_mask.mul_scalar(255.0f32);
 
         // Expand to 3 channels: (H, W) -> (3, H, W)
-        let mask_3ch: Tensor<3, f32> = mask_u8
-            .reshape([1, h, w])
-            .broadcast_as([3, h, w])
-            .to_concrete();
+        let mask_3ch = mask_u8.reshape([1, h, w]).broadcast_as([3, h, w]);
 
         // Permute to (H, W, 3) and flatten
-        let mask_hwc: Tensor<3, f32> = mask_3ch
+        let mask_hwc = mask_3ch
             .transpose(0, 1) // (H, 3, W)
-            .to_concrete()
-            .transpose(1, 2) // (H, W, 3)
-            .to_concrete();
-        let mask_flat: Tensor<1, f32, ConcreteTensor<f32, 1>> =
-            mask_hwc.reshape([h * w * 3]).to_concrete();
+            .transpose(1, 2); // (H, W, 3);
+        let mask_flat = mask_hwc.reshape([h * w * 3]);
         let mask_slice = mask_flat.as_slice().await?;
         let mask_pixels: Vec<u8> = mask_slice.as_slice().iter().map(|&v| v as u8).collect();
 
@@ -339,7 +327,6 @@ impl SegmentAnything {
         let image: Tensor<3, f32, ConcreteTensor<f32, 3>> =
             Tensor::from_slice(&device, [height, width, 3], &data_f32)
                 .transpose(1, 2) // (H, 3, W)
-                .to_concrete()
                 .transpose(0, 1) // (3, H, W)
                 .to_concrete();
         image
@@ -416,14 +403,12 @@ impl SegmentAnything {
             let crop_h = low_res_crop_extent(original_h, mask_h);
             let crop_w = low_res_crop_extent(original_w, mask_w);
 
-            let masks_flat: Tensor<1, f32, ConcreteTensor<f32, 1>> =
-                low_res_masks.reshape([total_mask_elems]).to_concrete();
+            let masks_flat = low_res_masks.reshape([total_mask_elems]);
             let masks_slice = masks_flat.as_slice().await?;
             let masks_vec = masks_slice.as_slice();
 
             let total_iou_elems = batch * n_masks_per_point;
-            let iou_flat: Tensor<1, f32, ConcreteTensor<f32, 1>> =
-                iou_preds.reshape([total_iou_elems]).to_concrete();
+            let iou_flat = iou_preds.reshape([total_iou_elems]);
             let iou_slice = iou_flat.as_slice().await?;
             let iou_vec = iou_slice.as_slice();
 
@@ -597,8 +582,8 @@ mod tests {
         let shape = t.shape();
         let n: usize = shape.iter().product();
         let ones: Tensor<R, f32> = Tensor::from_slice(&t.device(), shape, &vec![1.0f32; n]);
-        let materialized: Tensor<R, f32> = (t * ones).to_concrete();
-        let flat: Tensor<1, f32, ConcreteTensor<f32, 1>> = materialized.reshape([n]).to_concrete();
+        let materialized = (t * ones);
+        let flat = materialized.reshape([n]);
         let s = pollster::block_on(flat.as_slice()).unwrap();
         s.as_slice().to_vec()
     }
@@ -788,25 +773,15 @@ mod tests {
                 fusor::arange_step::<f32>(device, 0.5, w as f32 + 0.5, 1.0).div_scalar(w as f32);
             let y: Tensor<1, f32> =
                 fusor::arange_step::<f32>(device, 0.5, h as f32 + 0.5, 1.0).div_scalar(h as f32);
-            let xu: Tensor<3, f32> = x
-                .reshape([1, w])
-                .broadcast_as([h, w])
-                .to_concrete()
-                .reshape([h, w, 1])
-                .to_concrete();
-            let yu: Tensor<3, f32> = y
-                .reshape([h, 1])
-                .broadcast_as([h, w])
-                .to_concrete()
-                .reshape([h, w, 1])
-                .to_concrete();
-            let coords: Tensor<3, f32> =
-                (Tensor::cat([xu, yu], 2).mul_scalar(2.0) + (-1.0f32)).to_concrete();
+            let xu = x.reshape([1, w]).broadcast_as([h, w]).reshape([h, w, 1]);
+            let yu = y.reshape([h, 1]).broadcast_as([h, w]).reshape([h, w, 1]);
+            let coords = (Tensor::cat([xu, yu], 2).mul_scalar(2.0) + (-1.0f32));
             let gm_shape = gm.shape();
-            let gm3: Tensor<3, f32> = gm
-                .reshape([1, gm_shape[0], gm_shape[1]])
-                .broadcast_as([h, gm_shape[0], gm_shape[1]])
-                .to_concrete();
+            let gm3 = gm.reshape([1, gm_shape[0], gm_shape[1]]).broadcast_as([
+                h,
+                gm_shape[0],
+                gm_shape[1],
+            ]);
             let scaled = coords.mat_mul(&gm3).mul_scalar(2.0 * std::f32::consts::PI);
             // Dual consumer: sin() and cos() both read from `scaled`
             Tensor::cat([scaled.sin().to_concrete(), scaled.cos().to_concrete()], 2)
@@ -822,25 +797,15 @@ mod tests {
                 fusor::arange_step::<f32>(device, 0.5, w as f32 + 0.5, 1.0).div_scalar(w as f32);
             let y: Tensor<1, f32> =
                 fusor::arange_step::<f32>(device, 0.5, h as f32 + 0.5, 1.0).div_scalar(h as f32);
-            let xu: Tensor<3, f32> = x
-                .reshape([1, w])
-                .broadcast_as([h, w])
-                .to_concrete()
-                .reshape([h, w, 1])
-                .to_concrete();
-            let yu: Tensor<3, f32> = y
-                .reshape([h, 1])
-                .broadcast_as([h, w])
-                .to_concrete()
-                .reshape([h, w, 1])
-                .to_concrete();
-            let coords: Tensor<3, f32> =
-                (Tensor::cat([xu, yu], 2).mul_scalar(2.0) + (-1.0f32)).to_concrete();
+            let xu = x.reshape([1, w]).broadcast_as([h, w]).reshape([h, w, 1]);
+            let yu = y.reshape([h, 1]).broadcast_as([h, w]).reshape([h, w, 1]);
+            let coords = (Tensor::cat([xu, yu], 2).mul_scalar(2.0) + (-1.0f32));
             let gm_shape = gm.shape();
-            let gm3: Tensor<3, f32> = gm
-                .reshape([1, gm_shape[0], gm_shape[1]])
-                .broadcast_as([h, gm_shape[0], gm_shape[1]])
-                .to_concrete();
+            let gm3 = gm.reshape([1, gm_shape[0], gm_shape[1]]).broadcast_as([
+                h,
+                gm_shape[0],
+                gm_shape[1],
+            ]);
             let mm = coords.mat_mul(&gm3);
             // Control path: force distinct mul_scalar nodes for comparison.
             let for_sin = mm.mul_scalar(2.0 * std::f32::consts::PI);

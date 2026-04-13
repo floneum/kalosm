@@ -406,6 +406,7 @@ where
     ///
     /// For CPU tensors, this evaluates any lazy expressions.
     /// For GPU tensors, this is a no-op as GPU tensors are already concrete.
+    #[must_use = "to_concrete does not modify in place, you must use the returned tensor"]
     pub fn to_concrete(&self) -> Tensor<R, D>
     where
         B: TensorBacking<R>,

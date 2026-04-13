@@ -4,7 +4,7 @@
 //! so Conv2dBN becomes plain Conv2d here.
 
 use fusor::layers::{Conv2d, Conv2dConfig, LayerNorm, LayerNorm2d, Linear};
-use fusor::{ConcreteTensor, Device, Tensor, VarBuilder};
+use fusor::{ConcreteTensor, Device, Tensor, TensorBacking, VarBuilder};
 
 use super::Result;
 
@@ -28,7 +28,7 @@ impl Conv2dBN {
         Ok(Self { conv })
     }
 
-    fn forward(&self, xs: &Tensor<4, f32, ConcreteTensor<f32, 4>>) -> Tensor<4, f32> {
+    fn forward(&self, xs: &Tensor<4, f32, impl TensorBacking<4, Elem = f32>>) -> Tensor<4, f32> {
         self.conv.forward(xs)
     }
 }
@@ -50,10 +50,13 @@ impl PatchEmbed {
         Ok(Self { conv1, conv2 })
     }
 
-    pub(crate) fn forward(&self, xs: &Tensor<4, f32, ConcreteTensor<f32, 4>>) -> Tensor<4, f32> {
+    pub(crate) fn forward(
+        &self,
+        xs: &Tensor<4, f32, impl TensorBacking<4, Elem = f32>>,
+    ) -> Tensor<4, f32> {
         let xs = self.conv1.forward(xs);
         let xs = xs.gelu();
-        self.conv2.forward(&xs.to_concrete())
+        self.conv2.forward(&xs)
     }
 }
 
@@ -91,13 +94,13 @@ impl MBConv {
         &self,
         xs: &Tensor<4, f32, ConcreteTensor<f32, 4>>,
     ) -> Tensor<4, f32, ConcreteTensor<f32, 4>> {
-        let shortcut = xs.to_concrete();
+        let shortcut = xs;
         let out = self.conv1.forward(xs);
         let out = out.gelu();
-        let out = self.conv2.forward(&out.to_concrete());
+        let out = self.conv2.forward(&out);
         let out = out.gelu();
-        let out = self.conv3.forward(&out.to_concrete());
-        (out + &shortcut).to_concrete().gelu().to_concrete()
+        let out = self.conv3.forward(&out);
+        (out + &shortcut).gelu().to_concrete()
     }
 }
 
@@ -133,7 +136,7 @@ impl PatchMerging {
         })
     }
 
-    fn forward(&self, xs: &Tensor<3, f32>) -> Tensor<3, f32> {
+    fn forward(&self, xs: &Tensor<3, f32, impl TensorBacking<3, Elem = f32>>) -> Tensor<3, f32> {
         let shape = xs.shape();
         let b = shape[0];
         let _l = shape[1];
@@ -141,30 +144,23 @@ impl PatchMerging {
         let (h, w) = self.input_resolution;
 
         // If rank is 3, reshape to (B, H, W, C) then permute to (B, C, H, W)
-        let xs: Tensor<4, f32, ConcreteTensor<f32, 4>> = xs
-            .reshape([b, h, w, c])
-            .to_concrete()
-            .transpose(2, 3) // (B, H, C, W)
-            .to_concrete()
-            .transpose(1, 2) // (B, C, H, W)
-            .to_concrete();
+        let xs = xs.reshape([b, h, w, c]);
+        let xs = xs.transpose(2, 3); // (B, H, C, W)
+        let xs = xs.transpose(1, 2); // (B, C, H, W)
 
         let xs = self.conv1.forward(&xs);
         let xs = xs.gelu();
-        let xs = self.conv2.forward(&xs.to_concrete());
+        let xs = self.conv2.forward(&xs);
         let xs = xs.gelu();
-        let xs = self.conv3.forward(&xs.to_concrete());
+        let xs = self.conv3.forward(&xs);
 
         // Flatten spatial dims and transpose to (B, L, C)
         let out_shape = xs.shape();
         let out_c = out_shape[1];
         let out_h = out_shape[2];
         let out_w = out_shape[3];
-        xs.to_concrete()
-            .reshape([b, out_c, out_h * out_w])
-            .to_concrete()
-            .transpose(1, 2) // (B, L, C)
-            .to_concrete()
+        let xs = xs.reshape([b, out_c, out_h * out_w]);
+        xs.transpose(1, 2).to_concrete() // (B, L, C)
     }
 }
 
@@ -210,7 +206,7 @@ impl ConvLayer {
     }
 
     pub(crate) fn forward(&self, xs: &Tensor<4, f32, ConcreteTensor<f32, 4>>) -> Tensor<3, f32> {
-        let mut xs = xs.to_concrete();
+        let mut xs = xs.clone();
         for block in &self.blocks {
             xs = block.forward(&xs);
         }
@@ -221,14 +217,10 @@ impl ConvLayer {
         let c = shape[1];
         let h = shape[2];
         let w = shape[3];
-        let flat: Tensor<3, f32> = xs
-            .reshape([b, c, h * w])
-            .to_concrete()
-            .transpose(1, 2) // (B, L, C)
-            .to_concrete();
+        let flat = xs.reshape([b, c, h * w]).transpose(1, 2); // (B, L, C)
         match &self.downsample {
             Some(ds) => ds.forward(&flat),
-            None => flat,
+            None => flat.to_concrete(),
         }
     }
 }
@@ -253,7 +245,7 @@ impl TinyMlp {
         Ok(Self { norm, fc1, fc2 })
     }
 
-    fn forward(&self, xs: &Tensor<3, f32>) -> Tensor<3, f32> {
+    fn forward(&self, xs: &Tensor<3, f32, impl TensorBacking<3, Elem = f32>>) -> Tensor<3, f32> {
         let xs = self.norm.forward(xs);
         let xs = self.fc1.forward(&xs);
         let xs = xs.gelu();
@@ -317,7 +309,7 @@ impl TinyAttention {
         let idxs_tensor: Tensor<1, u32> = Tensor::from_slice(device, [idxs.len()], &idxs);
         let selected: Tensor<2, f32> = attention_biases.index_select(1, &idxs_tensor);
         // Reshape to (num_heads, n_points, n_points)
-        let ab: Tensor<3, f32> = selected
+        let ab = selected
             .reshape([num_heads, n_points, n_points])
             .to_concrete();
 
@@ -336,7 +328,7 @@ impl TinyAttention {
         })
     }
 
-    fn forward(&self, xs: &Tensor<3, f32>) -> Tensor<3, f32> {
+    fn forward(&self, xs: &Tensor<3, f32, impl TensorBacking<3, Elem = f32>>) -> Tensor<3, f32> {
         let shape = xs.shape();
         let b = shape[0];
         let n = shape[1];
@@ -345,54 +337,35 @@ impl TinyAttention {
         let qkv = self.qkv.forward(&xs);
 
         // (b, n, num_heads, key_dim + key_dim + d) -> split into q, k, v
-        let qkv: Tensor<4, f32> = qkv
-            .reshape([b, n, self.num_heads, self.key_dim * 2 + self.d])
-            .to_concrete();
+        let qkv = qkv.reshape([b, n, self.num_heads, self.key_dim * 2 + self.d]);
 
         // q: (b, n, num_heads, key_dim) -> (b, num_heads, n, key_dim)
-        let q: Tensor<4, f32> = qkv
-            .narrow(3, 0, self.key_dim)
-            .to_concrete()
-            .transpose(1, 2) // (b, num_heads, n, key_dim)
-            .to_concrete();
-        // k: (b, n, num_heads, key_dim) -> (b, num_heads, n, key_dim)
-        let k: Tensor<4, f32> = qkv
-            .narrow(3, self.key_dim, self.key_dim)
-            .to_concrete()
-            .transpose(1, 2)
-            .to_concrete();
+        let q = qkv.narrow(3, 0, self.key_dim).transpose(1, 2); // (b, num_heads, n, key_dim)
+                                                                // k: (b, n, num_heads, key_dim) -> (b, num_heads, n, key_dim)
+        let k = qkv.narrow(3, self.key_dim, self.key_dim).transpose(1, 2);
         // v: (b, n, num_heads, d) -> (b, num_heads, n, d)
-        let v: Tensor<4, f32> = qkv
-            .narrow(3, 2 * self.key_dim, self.d)
-            .to_concrete()
-            .transpose(1, 2)
-            .to_concrete();
+        let v = qkv.narrow(3, 2 * self.key_dim, self.d).transpose(1, 2);
 
         // attn = q * scale @ k^T
-        let attn: Tensor<4, f32> = q
-            .mul_scalar(self.scale)
-            .mat_mul(&k.transpose(2, 3).to_concrete());
+        let attn = q.mul_scalar(self.scale).mat_mul(&k.transpose(2, 3));
 
         // Add pre-computed attention bias: (num_heads, n, n) broadcast to (b, num_heads, n, n)
-        let ab_broadcast: Tensor<4, f32> = self
-            .ab
-            .reshape([1, self.num_heads, n, n])
-            .broadcast_as([b, self.num_heads, n, n])
-            .to_concrete();
-        let attn: Tensor<4, f32> = (attn + ab_broadcast).to_concrete();
+        let ab_broadcast =
+            self.ab
+                .reshape([1, self.num_heads, n, n])
+                .broadcast_as([b, self.num_heads, n, n]);
+        let attn = (attn + ab_broadcast);
 
         // Softmax
-        let attn: Tensor<4, f32> = attn.softmax_last_dim::<3>();
+        let attn = attn.softmax_last_dim::<3>();
 
         // attn @ v -> (b, num_heads, n, d)
-        let out: Tensor<4, f32> = attn.mat_mul(&v);
+        let out = attn.mat_mul(&v);
 
         // transpose -> (b, n, num_heads, d) -> reshape to (b, n, dh)
-        let out: Tensor<3, f32> = out
+        let out = out
             .transpose(1, 2) // (b, n, num_heads, d)
-            .to_concrete()
-            .reshape([b, n, self.dh])
-            .to_concrete();
+            .reshape([b, n, self.dh]);
 
         self.proj.forward(&out)
     }
@@ -454,7 +427,7 @@ impl TinyViTBlock {
             self.attn.forward(xs)
         } else {
             // Reshape to (B, H, W, C)
-            let xs: Tensor<4, f32> = xs.reshape([b, h, w, c]).to_concrete();
+            let xs = xs.reshape([b, h, w, c]);
 
             let pad_b = (self.window_size - h % self.window_size) % self.window_size;
             let pad_r = (self.window_size - w % self.window_size) % self.window_size;
@@ -476,30 +449,24 @@ impl TinyViTBlock {
             let n_w = p_w / self.window_size;
 
             // Window partition: (B, n_h, ws, n_w, ws, C) -> transpose(2,3) -> reshape
-            let xs: Tensor<3, f32> = xs
+            let xs = xs
                 .reshape([b, n_h, self.window_size, n_w, self.window_size, c])
-                .to_concrete()
                 .transpose(2, 3) // (B, n_h, n_w, ws, ws, C)
-                .to_concrete()
-                .reshape([b * n_h * n_w, self.window_size * self.window_size, c])
-                .to_concrete();
+                .reshape([b * n_h * n_w, self.window_size * self.window_size, c]);
 
             let xs = self.attn.forward(&xs);
 
             // Window unpartition
-            let xs: Tensor<4, f32> = xs
+            let xs = xs
                 .reshape([b, n_h, n_w, self.window_size, self.window_size, c])
-                .to_concrete()
                 .transpose(2, 3) // (B, n_h, ws, n_w, ws, C)
-                .to_concrete()
-                .reshape([b, p_h, p_w, c])
-                .to_concrete();
+                .reshape([b, p_h, p_w, c]);
 
             // Remove padding
             let xs = if pad_r > 0 {
                 xs.narrow(2, 0, w).to_concrete()
             } else {
-                xs
+                xs.to_concrete()
             };
             let xs = if pad_b > 0 {
                 xs.narrow(1, 0, h).to_concrete()
@@ -512,22 +479,17 @@ impl TinyViTBlock {
         };
 
         // Residual
-        let xs: Tensor<3, f32> = (xs + &res_x).to_concrete();
+        let xs = (xs + &res_x);
 
         // Local conv: (B, L, C) -> (B, C, H, W) -> conv -> (B, C, L) -> (B, L, C)
-        let xs_conv: Tensor<4, f32, ConcreteTensor<f32, 4>> = xs
+        let xs_conv = xs
             .transpose(1, 2) // (B, C, L)
-            .to_concrete()
-            .reshape([b, c, h, w])
-            .to_concrete();
+            .reshape([b, c, h, w]);
         let xs_conv = self.local_conv.forward(&xs_conv);
         let xs_conv_shape = xs_conv.shape();
-        let xs: Tensor<3, f32> = xs_conv
-            .to_concrete()
+        let xs = xs_conv
             .reshape([b, c, xs_conv_shape[2] * xs_conv_shape[3]])
-            .to_concrete()
-            .transpose(1, 2) // (B, L, C)
-            .to_concrete();
+            .transpose(1, 2); // (B, L, C)
 
         // MLP residual
         let mlp_out = self.mlp.forward(&xs);
@@ -579,7 +541,7 @@ impl BasicLayer {
     }
 
     pub(crate) fn forward(&self, xs: &Tensor<3, f32>) -> Tensor<3, f32> {
-        let mut xs = xs.to_concrete();
+        let mut xs = xs.clone();
         for block in &self.blocks {
             xs = block.forward(&xs).to_concrete();
         }
@@ -664,7 +626,10 @@ impl TinyViT {
         })
     }
 
-    pub fn forward(&self, xs: &Tensor<4, f32, ConcreteTensor<f32, 4>>) -> Tensor<4, f32> {
+    pub fn forward(
+        &self,
+        xs: &Tensor<4, f32, impl TensorBacking<4, Elem = f32>>,
+    ) -> Tensor<4, f32> {
         // PatchEmbed: (B, C, H, W) -> (B, C', H/4, W/4)
         let xs = self.patch_embed.forward(xs);
 
@@ -679,18 +644,15 @@ impl TinyViT {
         let shape = xs.shape();
         let b = shape[0];
         let c = shape[2];
-        let xs: Tensor<4, f32, ConcreteTensor<f32, 4>> = xs
+        let xs = xs
             .reshape([b, 64, 64, c])
-            .to_concrete()
             .transpose(2, 3) // (B, 64, C, 64)
-            .to_concrete()
-            .transpose(1, 2) // (B, C, 64, 64)
-            .to_concrete();
+            .transpose(1, 2); // (B, C, 64, 64)
 
         // Neck
         let xs = self.neck_conv1.forward(&xs);
         let xs = self.neck_ln1.forward(&xs);
-        let xs = self.neck_conv2.forward(&xs.to_concrete());
+        let xs = self.neck_conv2.forward(&xs);
         self.neck_ln2.forward(&xs)
     }
 }

@@ -16,18 +16,13 @@ where
         scale_h: usize,
         scale_w: usize,
     ) -> Tensor<4, D, ConcreteTensor<D, 4>> {
-        let shape = self.shape();
-        let b = shape[0];
-        let c = shape[1];
-        let h = shape[2];
-        let w = shape[3];
+        let [b, c, h, w] = self.shape();
         // (B, C, H, W) -> (B, C, H, 1, W, 1)
         let expanded: Tensor<6, D, _> = self.reshape([b, c, h, 1, w, 1]);
         // Broadcast to (B, C, H, scale_h, W, scale_w)
         let broadcast = expanded.broadcast_as([b, c, h, scale_h, w, scale_w]);
         // Reshape to (B, C, H * scale_h, W * scale_w)
         broadcast
-            .to_concrete()
             .reshape([b, c, h * scale_h, w * scale_w])
             .to_concrete()
     }

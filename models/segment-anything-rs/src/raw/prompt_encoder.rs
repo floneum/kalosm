@@ -1,7 +1,7 @@
 //! Prompt encoder: encodes points, boxes, and masks into embeddings.
 
 use fusor::layers::{Conv2d, Conv2dConfig, Embedding, LayerNorm2d};
-use fusor::{ConcreteTensor, Device, Tensor, VarBuilder};
+use fusor::{ConcreteTensor, Device, Tensor, TensorBacking, VarBuilder};
 
 use super::Result;
 
@@ -15,28 +15,27 @@ impl PositionEmbeddingRandom {
             .get("positional_encoding_gaussian_matrix", device)?
             .dequantize();
         Ok(Self {
-            positional_encoding_gaussian_matrix: m.to_concrete(),
+            positional_encoding_gaussian_matrix: m,
         })
     }
 
     fn pe_encoding(&self, coords: &Tensor<3, f32>) -> Tensor<3, f32> {
         // coords * 2 - 1
-        let coords: Tensor<3, f32> = (coords.mul_scalar(2.0) + (-1.0f32)).to_concrete();
+        let coords = coords.mul_scalar(2.0) + (-1.0f32);
         // coords @ gaussian_matrix: (B, N, 2) @ (2, D) -> need to broadcast gaussian to (B, 2, D)
         let shape = coords.shape();
         let b = shape[0];
         let gm_shape = self.positional_encoding_gaussian_matrix.shape();
-        let gm: Tensor<3, f32> = self
+        let gm = self
             .positional_encoding_gaussian_matrix
-            .reshape([1, gm_shape[0], gm_shape[1]])
-            .broadcast_as([b, gm_shape[0], gm_shape[1]])
-            .to_concrete();
+            .reshape([1, gm_shape[0], gm_shape[1]]);
+        let gm = gm.broadcast_as([b, gm_shape[0], gm_shape[1]]);
         let coords = coords.mat_mul(&gm);
         // coords * 2 * pi
         let coords = coords.mul_scalar(2.0 * std::f32::consts::PI);
         // cat([sin, cos], last_dim)
-        let sin_coords: Tensor<3, f32> = coords.sin().to_concrete();
-        let cos_coords: Tensor<3, f32> = coords.cos().to_concrete();
+        let sin_coords = coords.sin().to_concrete();
+        let cos_coords = coords.cos().to_concrete();
         Tensor::cat([sin_coords, cos_coords], 2)
     }
 
@@ -51,43 +50,34 @@ impl PositionEmbeddingRandom {
         let y_embed = y_embed.div_scalar(h as f32);
 
         // x_embed: (1, w) -> broadcast to (h, w)
-        let x_embed: Tensor<2, f32> = x_embed.reshape([1, w]).broadcast_as([h, w]).to_concrete();
+        let x_embed = x_embed.reshape([1, w]);
+        let x_embed = x_embed.broadcast_as([h, w]);
         // y_embed: (h, 1) -> broadcast to (h, w)
-        let y_embed: Tensor<2, f32> = y_embed.reshape([h, 1]).broadcast_as([h, w]).to_concrete();
+        let y_embed = y_embed.reshape([h, 1]);
+        let y_embed = y_embed.broadcast_as([h, w]);
 
         // Stack: (h, w, 2)
-        let x_unsq: Tensor<3, f32> = x_embed.reshape([h, w, 1]).to_concrete();
-        let y_unsq: Tensor<3, f32> = y_embed.reshape([h, w, 1]).to_concrete();
+        let x_unsq = x_embed.reshape([h, w, 1]);
+        let y_unsq = y_embed.reshape([h, w, 1]);
         let coords: Tensor<3, f32> = Tensor::cat([x_unsq, y_unsq], 2);
 
         // pe_encoding -> (h, w, embed_dim), then permute to (embed_dim, h, w)
         let encoded = self.pe_encoding(&coords);
-        encoded
-            .to_concrete()
-            .transpose(1, 2)
-            .to_concrete()
-            .transpose(0, 1)
-            .to_concrete()
+        encoded.transpose(1, 2).transpose(0, 1).to_concrete()
     }
 
     fn forward_with_coords(
         &self,
-        coords_input: &Tensor<3, f32>,
+        coords_input: &Tensor<3, f32, impl TensorBacking<3, Elem = f32>>,
         image_size: (usize, usize),
     ) -> Tensor<3, f32> {
         // Normalize coordinates by image size
         let shape = coords_input.shape();
         let last = shape[2];
         // coords0 = coords[..., 0:1] / width
-        let coords0 = coords_input
-            .narrow(2, 0, 1)
-            .to_concrete()
-            .div_scalar(image_size.1 as f32);
+        let coords0 = coords_input.narrow(2, 0, 1).div_scalar(image_size.1 as f32);
         // coords1 = coords[..., 1:2] / height
-        let coords1 = coords_input
-            .narrow(2, 1, 1)
-            .to_concrete()
-            .div_scalar(image_size.0 as f32);
+        let coords1 = coords_input.narrow(2, 1, 1).div_scalar(image_size.0 as f32);
 
         let mut parts = vec![coords0.to_concrete(), coords1.to_concrete()];
         if last > 2 {
@@ -193,7 +183,7 @@ impl PromptEncoder {
         labels: &Tensor<2, f32>,
         pad: bool,
     ) -> Tensor<3, f32> {
-        let points: Tensor<3, f32> = (points + 0.5f32).to_concrete();
+        let points = (points + 0.5f32).to_concrete();
         let device = points.device();
         let points_shape = points.shape();
         let batch = points_shape[0];
@@ -217,36 +207,24 @@ impl PromptEncoder {
 
         let pe_shape = point_embedding.shape();
         // labels: (batch, n_points) -> (batch, n_points, 1) broadcast to (batch, n_points, embed_dim)
-        let labels_broadcast: Tensor<3, f32> = labels
-            .reshape([pe_shape[0], pe_shape[1], 1])
-            .broadcast_as(pe_shape)
-            .to_concrete();
+        let labels_broadcast = labels.reshape([pe_shape[0], pe_shape[1], 1]);
+        let labels_broadcast = labels_broadcast.broadcast_as(pe_shape);
 
         let zeros: Tensor<3, f32> = Tensor::zeros(&device, pe_shape);
 
         // Where labels < 0, use not_a_point embedding; else use point_embedding
-        let not_a_point: Tensor<3, f32> = self
-            .not_a_point_embed
-            .embeddings()
-            .broadcast_as(pe_shape)
-            .to_concrete();
-        let point_embedding: Tensor<3, f32> = labels_broadcast
+        let not_a_point = self.not_a_point_embed.embeddings().broadcast_as(pe_shape);
+        let point_embedding = labels_broadcast
             .lt_scalar(0.0f32)
-            .where_cond(&not_a_point, &point_embedding.to_concrete());
+            .where_cond(&not_a_point, &point_embedding);
 
         // Add point_embeddings[0] where label == 0
-        let emb0: Tensor<3, f32> = self.point_embeddings[0]
-            .embeddings()
-            .broadcast_as(pe_shape)
-            .to_concrete();
+        let emb0 = self.point_embeddings[0].embeddings().broadcast_as(pe_shape);
         let labels0 = labels_broadcast.eq_scalar(0.0f32).where_cond(&emb0, &zeros);
-        let point_embedding: Tensor<3, f32> = (point_embedding + labels0).to_concrete();
+        let point_embedding = point_embedding + labels0;
 
         // Add point_embeddings[1] where label == 1
-        let emb1: Tensor<3, f32> = self.point_embeddings[1]
-            .embeddings()
-            .broadcast_as(pe_shape)
-            .to_concrete();
+        let emb1 = self.point_embeddings[1].embeddings().broadcast_as(pe_shape);
         let labels1 = labels_broadcast.eq_scalar(1.0f32).where_cond(&emb1, &zeros);
         let point_embedding: Tensor<3, f32> = (point_embedding + labels1).to_concrete();
 
@@ -254,35 +232,30 @@ impl PromptEncoder {
     }
 
     fn embed_boxes(&self, boxes: &Tensor<3, f32>) -> Tensor<3, f32> {
-        let boxes: Tensor<3, f32> = (boxes + 0.5f32).to_concrete();
+        let boxes = (boxes + 0.5f32);
         let shape = boxes.shape();
         let batch = shape[0];
         // (batch, N, 4) -> (batch, N*2, 2)
-        let coords: Tensor<3, f32> = boxes.reshape([batch, shape[1] * 2, 2]).to_concrete();
+        let coords = boxes.reshape([batch, shape[1] * 2, 2]);
         let corner_embedding = self
             .pe_layer
             .forward_with_coords(&coords, self.input_image_size);
         let ce_shape = corner_embedding.shape();
 
         // ce1 = corner_embedding[:, 0] + point_embeddings[2]
-        let ce1: Tensor<2, f32> = corner_embedding
-            .narrow(1, 0, 1)
-            .to_concrete()
-            .reshape([batch, ce_shape[2]])
-            .to_concrete();
-        let ce1: Tensor<2, f32> = (ce1 + self.point_embeddings[2].embeddings()).to_concrete();
+        let ce1 = corner_embedding.narrow(1, 0, 1);
+        let ce1 = ce1.reshape([batch, ce_shape[2]]);
+
+        let ce1 = (ce1 + self.point_embeddings[2].embeddings());
 
         // ce2 = corner_embedding[:, 1] + point_embeddings[3]
-        let ce2: Tensor<2, f32> = corner_embedding
-            .narrow(1, 1, 1)
-            .to_concrete()
-            .reshape([batch, ce_shape[2]])
-            .to_concrete();
-        let ce2: Tensor<2, f32> = (ce2 + self.point_embeddings[3].embeddings()).to_concrete();
+        let ce2 = corner_embedding.narrow(1, 1, 1);
+        let ce2 = ce2.reshape([batch, ce_shape[2]]);
+        let ce2 = ce2 + self.point_embeddings[3].embeddings();
 
         // Stack: (batch, 2, dim)
-        let ce1_3d: Tensor<3, f32> = ce1.reshape([batch, 1, ce_shape[2]]).to_concrete();
-        let ce2_3d: Tensor<3, f32> = ce2.reshape([batch, 1, ce_shape[2]]).to_concrete();
+        let ce1_3d = ce1.reshape([batch, 1, ce_shape[2]]);
+        let ce2_3d = ce2.reshape([batch, 1, ce_shape[2]]);
         Tensor::cat([ce1_3d, ce2_3d], 1)
     }
 

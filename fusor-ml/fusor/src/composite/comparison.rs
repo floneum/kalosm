@@ -6,15 +6,16 @@ use crate::{SimdElement, Tensor};
 use fusor_core::DataType;
 use fusor_cpu::{EqOp, GtOp, GteOp, LtOp, LteOp, SimdBinaryOp};
 
-impl<const R: usize, D> Tensor<R, D>
+impl<const R: usize, D, B> Tensor<R, D, B>
 where
     D: SimdElement + DataType + Default,
+    B: fusor_cpu::TensorBacking<R, Elem = D>,
 {
     /// Element-wise equality comparison between two tensors.
     ///
     /// Returns 1.0 where elements are equal, 0.0 otherwise.
     /// Note: GPU comparison is only available for CPU tensors at this time.
-    pub fn eq_tensor(&self, rhs: &Self) -> Self
+    pub fn eq_tensor(&self, rhs: &Self) -> Tensor<R, D>
     where
         EqOp: SimdBinaryOp<D>,
     {
@@ -25,7 +26,7 @@ where
     ///
     /// Returns 1.0 where self < rhs, 0.0 otherwise.
     /// Note: GPU comparison is only available for CPU tensors at this time.
-    pub fn lt_tensor(&self, rhs: &Self) -> Self
+    pub fn lt_tensor(&self, rhs: &Self) -> Tensor<R, D>
     where
         LtOp: SimdBinaryOp<D>,
     {
@@ -36,7 +37,7 @@ where
     ///
     /// Returns 1.0 where self <= rhs, 0.0 otherwise.
     /// Note: GPU comparison is only available for CPU tensors at this time.
-    pub fn lte_tensor(&self, rhs: &Self) -> Self
+    pub fn lte_tensor(&self, rhs: &Self) -> Tensor<R, D>
     where
         LteOp: SimdBinaryOp<D>,
     {
@@ -47,7 +48,7 @@ where
     ///
     /// Returns 1.0 where self > rhs, 0.0 otherwise.
     /// Note: GPU comparison is only available for CPU tensors at this time.
-    pub fn gt_tensor(&self, rhs: &Self) -> Self
+    pub fn gt_tensor(&self, rhs: &Self) -> Tensor<R, D>
     where
         GtOp: SimdBinaryOp<D>,
     {
@@ -58,7 +59,7 @@ where
     ///
     /// Returns 1.0 where self >= rhs, 0.0 otherwise.
     /// Note: GPU comparison is only available for CPU tensors at this time.
-    pub fn gte_tensor(&self, rhs: &Self) -> Self
+    pub fn gte_tensor(&self, rhs: &Self) -> Tensor<R, D>
     where
         GteOp: SimdBinaryOp<D>,
     {
@@ -68,7 +69,7 @@ where
     /// Element-wise equality comparison with a scalar.
     ///
     /// Returns 1.0 where elements equal the scalar, 0.0 otherwise.
-    pub fn eq_scalar(&self, scalar: D) -> Self
+    pub fn eq_scalar(&self, scalar: D) -> Tensor<R, D>
     where
         EqOp: SimdBinaryOp<D>,
     {
@@ -81,7 +82,7 @@ where
     /// Element-wise less-than comparison with a scalar.
     ///
     /// Returns 1.0 where self < scalar, 0.0 otherwise.
-    pub fn lt_scalar(&self, scalar: D) -> Self
+    pub fn lt_scalar(&self, scalar: D) -> Tensor<R, D>
     where
         LtOp: SimdBinaryOp<D>,
     {
@@ -94,7 +95,7 @@ where
     /// Element-wise less-than-or-equal comparison with a scalar.
     ///
     /// Returns 1.0 where self <= scalar, 0.0 otherwise.
-    pub fn lte_scalar(&self, scalar: D) -> Self
+    pub fn lte_scalar(&self, scalar: D) -> Tensor<R, D>
     where
         LteOp: SimdBinaryOp<D>,
     {
@@ -107,7 +108,7 @@ where
     /// Element-wise greater-than comparison with a scalar.
     ///
     /// Returns 1.0 where self > scalar, 0.0 otherwise.
-    pub fn gt_scalar(&self, scalar: D) -> Self
+    pub fn gt_scalar(&self, scalar: D) -> Tensor<R, D>
     where
         GtOp: SimdBinaryOp<D>,
     {
@@ -120,7 +121,7 @@ where
     /// Element-wise greater-than-or-equal comparison with a scalar.
     ///
     /// Returns 1.0 where self >= scalar, 0.0 otherwise.
-    pub fn gte_scalar(&self, scalar: D) -> Self
+    pub fn gte_scalar(&self, scalar: D) -> Tensor<R, D>
     where
         GteOp: SimdBinaryOp<D>,
     {
@@ -134,7 +135,7 @@ where
     ///
     /// Returns 1.0 where elements equal the scalar, 0.0 otherwise.
     /// This is an alias for `eq_scalar` to match fusor-core's API.
-    pub fn eq(&self, rhs: D) -> Self
+    pub fn eq(&self, rhs: D) -> Tensor<R, D>
     where
         EqOp: SimdBinaryOp<D>,
     {
@@ -145,7 +146,7 @@ where
     ///
     /// Returns 1.0 where self < scalar, 0.0 otherwise.
     /// This is an alias for `lt_scalar` to match fusor-core's API.
-    pub fn lt(&self, rhs: D) -> Self
+    pub fn lt(&self, rhs: D) -> Tensor<R, D>
     where
         LtOp: SimdBinaryOp<D>,
     {
@@ -156,7 +157,7 @@ where
     ///
     /// Returns 1.0 where self <= scalar, 0.0 otherwise.
     /// This is an alias for `lte_scalar` to match fusor-core's API.
-    pub fn lte(&self, rhs: D) -> Self
+    pub fn lte(&self, rhs: D) -> Tensor<R, D>
     where
         LteOp: SimdBinaryOp<D>,
     {
@@ -168,7 +169,7 @@ where
     /// Returns 1.0 where self > scalar, 0.0 otherwise.
     /// This is an alias for `gt_scalar` to match fusor-core's API.
     /// Named `mt` (more than) to match fusor-core.
-    pub fn mt(&self, rhs: D) -> Self
+    pub fn mt(&self, rhs: D) -> Tensor<R, D>
     where
         GtOp: SimdBinaryOp<D>,
     {
@@ -180,7 +181,7 @@ where
     /// Returns 1.0 where self >= scalar, 0.0 otherwise.
     /// This is an alias for `gte_scalar` to match fusor-core's API.
     /// Named `mte` (more than or equal) to match fusor-core.
-    pub fn mte(&self, rhs: D) -> Self
+    pub fn mte(&self, rhs: D) -> Tensor<R, D>
     where
         GteOp: SimdBinaryOp<D>,
     {

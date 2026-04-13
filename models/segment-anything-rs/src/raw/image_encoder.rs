@@ -1,7 +1,7 @@
 //! ViT-based image encoder for SAM.
 
 use fusor::layers::{Conv2d, Conv2dConfig, LayerNorm, LayerNorm2d, Linear};
-use fusor::{ConcreteTensor, Device, Tensor, VarBuilder};
+use fusor::{ConcreteTensor, Device, Tensor, TensorBacking, VarBuilder};
 
 use super::{Activation, MlpBlock, Result};
 
@@ -25,13 +25,12 @@ impl PatchEmbed {
         Ok(Self { proj })
     }
 
-    fn forward(&self, xs: &Tensor<4, f32, ConcreteTensor<f32, 4>>) -> Tensor<4, f32> {
+    fn forward(&self, xs: &Tensor<4, f32, impl TensorBacking<4, Elem = f32>>) -> Tensor<4, f32> {
         let out = self.proj.forward(xs);
         // (B, C, H, W) -> (B, H, W, C)
-        out.transpose(1, 2)
-            .to_concrete()
-            .transpose(2, 3)
-            .to_concrete()
+        let out = out.transpose(1, 2);
+        let out = out.transpose(2, 3);
+        out.to_concrete()
     }
 }
 
@@ -60,7 +59,7 @@ impl Attention {
         let (rel_pos_h, rel_pos_w) = if use_rel_pos {
             let h: Tensor<2, f32> = vb.get("rel_pos_h", device)?.dequantize();
             let w: Tensor<2, f32> = vb.get("rel_pos_w", device)?.dequantize();
-            (Some(h.to_concrete()), Some(w.to_concrete()))
+            (Some(h), Some(w))
         } else {
             (None, None)
         };
@@ -82,47 +81,32 @@ impl Attention {
         let c = shape[3];
 
         // Flatten to (b, h*w, c) for linear
-        let flat: Tensor<3, f32> = xs.reshape([b, h * w, c]).to_concrete();
+        let flat = xs.reshape([b, h * w, c]);
         let qkv = self.qkv.forward(&flat);
 
         // Reshape to (b, h*w, 3, num_heads, c/num_heads)
         let c_per_head = c / self.num_heads;
-        let qkv: Tensor<5, f32> = qkv
-            .reshape([b, h * w, 3, self.num_heads, c_per_head])
-            .to_concrete();
+        let qkv = qkv.reshape([b, h * w, 3, self.num_heads, c_per_head]);
 
         // Permute to (3, b, num_heads, h*w, c/num_heads) then reshape
         // -> (3, b*num_heads, h*w, c/num_heads)
-        let qkv: Tensor<5, f32> = qkv
-            .transpose(1, 2) // (b, 3, h*w, num_heads, c_per_head)
-            .to_concrete()
-            .transpose(0, 1) // (3, b, h*w, num_heads, c_per_head)
-            .to_concrete()
-            .transpose(2, 3) // (3, b, num_heads, h*w, c_per_head)
-            .to_concrete();
-        let qkv: Tensor<4, f32> = qkv
-            .reshape([3, b * self.num_heads, h * w, c_per_head])
-            .to_concrete();
+        let qkv = qkv.transpose(1, 2); // (b, 3, h*w, num_heads, c_per_head)
+        let qkv = qkv.transpose(0, 1); // (3, b, h*w, num_heads, c_per_head)
+        let qkv = qkv.transpose(2, 3); // (3, b, num_heads, h*w, c_per_head);
+        let qkv = qkv.reshape([3, b * self.num_heads, h * w, c_per_head]);
 
-        let q: Tensor<3, f32> = qkv
+        let q = qkv
             .narrow(0, 0, 1)
-            .to_concrete()
             .reshape([b * self.num_heads, h * w, c_per_head])
             .to_concrete();
-        let k: Tensor<3, f32> = qkv
-            .narrow(0, 1, 1)
-            .to_concrete()
-            .reshape([b * self.num_heads, h * w, c_per_head])
-            .to_concrete();
-        let v: Tensor<3, f32> = qkv
-            .narrow(0, 2, 1)
-            .to_concrete()
-            .reshape([b * self.num_heads, h * w, c_per_head])
-            .to_concrete();
+        let k = qkv.narrow(0, 1, 1);
+        let k = k.reshape([b * self.num_heads, h * w, c_per_head]);
+        let v = qkv.narrow(0, 2, 1);
+        let v = v.reshape([b * self.num_heads, h * w, c_per_head]);
 
         // attn = (q * scale) @ k^T
         let q_scaled = q.mul_scalar(self.scale);
-        let attn: Tensor<3, f32> = q_scaled.mat_mul(&k.transpose(1, 2).to_concrete());
+        let attn: Tensor<3, f32> = q_scaled.mat_mul(&k.transpose(1, 2));
 
         // Add relative position bias
         let attn = self.add_decomposed_rel_pos(attn, &q, (h, w), (h, w));
@@ -134,17 +118,11 @@ impl Attention {
         let attn = attn.mat_mul(&v);
 
         // Reshape back to (b, num_heads, h, w, c_per_head)
-        let attn: Tensor<5, f32> = attn
-            .reshape([b, self.num_heads, h, w, c_per_head])
-            .to_concrete();
+        let attn = attn.reshape([b, self.num_heads, h, w, c_per_head]);
         // Permute to (b, h, w, num_heads, c_per_head) then reshape to (b, h*w, c)
-        let attn: Tensor<3, f32> = attn
-            .transpose(1, 2) // (b, h, num_heads, w, c_per_head)
-            .to_concrete()
-            .transpose(2, 3) // (b, h, w, num_heads, c_per_head)
-            .to_concrete()
-            .reshape([b, h * w, c])
-            .to_concrete();
+        let attn = attn.transpose(1, 2); // (b, h, num_heads, w, c_per_head)
+        let attn = attn.transpose(2, 3); // (b, h, w, num_heads, c_per_head)
+        let attn = attn.reshape([b, h * w, c]);
 
         let out = self.proj.forward(&attn);
         out.reshape([b, h, w, c]).to_concrete()
@@ -166,41 +144,32 @@ impl Attention {
                 let b_nh = q_shape[0]; // b * num_heads
                 let dim = q_shape[2];
 
-                let r_q: Tensor<4, f32> = q.reshape([b_nh, q_h, q_w, dim]).to_concrete();
+                let r_q = q.reshape([b_nh, q_h, q_w, dim]);
 
                 // rel_h = r_q @ r_h^T: (b_nh, q_h, q_w, dim) @ (q_h, k_h, dim)^T -> (b_nh, q_h, q_w, k_h)
-                let r_h_t: Tensor<3, f32> = r_h.transpose(1, 2).to_concrete(); // (q_h, dim, k_h)
-                let r_h_broadcast: Tensor<4, f32> = r_h_t
-                    .reshape([1, q_h, dim, k_h])
-                    .broadcast_as([b_nh, q_h, dim, k_h])
-                    .to_concrete();
-                let rel_h: Tensor<4, f32> = r_q.mat_mul(&r_h_broadcast);
+                let r_h_t = r_h.transpose(1, 2); // (q_h, dim, k_h)
+                let r_h_broadcast = r_h_t.reshape([1, q_h, dim, k_h]);
+                let r_h_broadcast = r_h_broadcast.broadcast_as([b_nh, q_h, dim, k_h]);
+                let rel_h = r_q.mat_mul(&r_h_broadcast);
 
                 // rel_w: transpose r_q to (b_nh, q_w, q_h, dim), matmul with r_w^T, transpose back
-                let r_w_t: Tensor<3, f32> = r_w.transpose(1, 2).to_concrete(); // (q_w, dim, k_w)
-                let r_w_broadcast: Tensor<4, f32> = r_w_t
-                    .reshape([1, q_w, dim, k_w])
-                    .broadcast_as([b_nh, q_w, dim, k_w])
-                    .to_concrete();
-                let r_q_t: Tensor<4, f32> = r_q.transpose(1, 2).to_concrete(); // (b_nh, q_w, q_h, dim)
-                let rel_w: Tensor<4, f32> =
-                    r_q_t.mat_mul(&r_w_broadcast).transpose(1, 2).to_concrete(); // (b_nh, q_h, q_w, k_w)
+                let r_w_t = r_w.transpose(1, 2); // (q_w, dim, k_w)
+                let r_w_broadcast = r_w_t.reshape([1, q_w, dim, k_w]);
+                let r_w_broadcast = r_w_broadcast.broadcast_as([b_nh, q_w, dim, k_w]);
+                let r_q_t = r_q.transpose(1, 2); // (b_nh, q_w, q_h, dim)
+                let rel_w = r_q_t.mat_mul(&r_w_broadcast);
+                let rel_w = rel_w.transpose(1, 2); // (b_nh, q_h, q_w, k_w)
 
                 // attn = attn.reshape(b_nh, q_h, q_w, k_h, k_w) + rel_h.unsqueeze(4) + rel_w.unsqueeze(3)
-                let attn_5d: Tensor<5, f32> =
-                    attn.reshape([b_nh, q_h, q_w, k_h, k_w]).to_concrete();
+                let attn_5d = attn.reshape([b_nh, q_h, q_w, k_h, k_w]);
                 // rel_h: (b_nh, q_h, q_w, k_h) -> (b_nh, q_h, q_w, k_h, 1)
-                let rel_h_5d: Tensor<5, f32> = rel_h
-                    .reshape([b_nh, q_h, q_w, k_h, 1])
-                    .broadcast_as([b_nh, q_h, q_w, k_h, k_w])
-                    .to_concrete();
+                let rel_h_5d = rel_h.reshape([b_nh, q_h, q_w, k_h, 1]);
+                let rel_h_5d = rel_h_5d.broadcast_as([b_nh, q_h, q_w, k_h, k_w]);
                 // rel_w: (b_nh, q_h, q_w, k_w) -> (b_nh, q_h, q_w, 1, k_w)
-                let rel_w_5d: Tensor<5, f32> = rel_w
-                    .reshape([b_nh, q_h, q_w, 1, k_w])
-                    .broadcast_as([b_nh, q_h, q_w, k_h, k_w])
-                    .to_concrete();
+                let rel_w_5d = rel_w.reshape([b_nh, q_h, q_w, 1, k_w]);
+                let rel_w_5d = rel_w_5d.broadcast_as([b_nh, q_h, q_w, k_h, k_w]);
 
-                let result: Tensor<5, f32> = (attn_5d + rel_h_5d + rel_w_5d).to_concrete();
+                let result = attn_5d + rel_h_5d + rel_w_5d;
                 result.reshape([b_nh, q_h * q_w, k_h * k_w]).to_concrete()
             }
             _ => attn,
@@ -280,7 +249,7 @@ impl Block {
     }
 
     fn forward(&self, xs: &Tensor<4, f32>) -> Tensor<4, f32> {
-        let shortcut = xs.to_concrete();
+        let shortcut = xs;
         let shape = xs.shape();
         let h = shape[1];
         let w = shape[2];
@@ -300,18 +269,14 @@ impl Block {
             xs
         };
 
-        let xs: Tensor<4, f32> = (xs + &shortcut).to_concrete();
+        let xs = xs + shortcut;
 
         // MLP
         let mlp_in = layer_norm_bhwc(&self.norm2, &xs);
         let mlp_shape = mlp_in.shape();
-        let mlp_flat: Tensor<3, f32> = mlp_in
-            .reshape([mlp_shape[0], mlp_shape[1] * mlp_shape[2], mlp_shape[3]])
-            .to_concrete();
+        let mlp_flat = mlp_in.reshape([mlp_shape[0], mlp_shape[1] * mlp_shape[2], mlp_shape[3]]);
         let mlp_out = self.mlp.forward(&mlp_flat);
-        let mlp_out: Tensor<4, f32> = mlp_out
-            .reshape([mlp_shape[0], mlp_shape[1], mlp_shape[2], mlp_shape[3]])
-            .to_concrete();
+        let mlp_out = mlp_out.reshape(mlp_shape);
 
         (&xs + mlp_out).to_concrete()
     }
@@ -350,9 +315,7 @@ fn window_partition(
     let n_w = w_p / window_size;
     let windows: Tensor<4, f32, ConcreteTensor<f32, 4>> = xs
         .reshape([b, n_h, window_size, n_w, window_size, c])
-        .to_concrete()
         .transpose(2, 3) // (b, n_h, n_w, ws, ws, c)
-        .to_concrete()
         .reshape([b * n_h * n_w, window_size, window_size, c])
         .to_concrete();
 
@@ -470,7 +433,10 @@ impl ImageEncoderViT {
         })
     }
 
-    pub fn forward(&self, xs: &Tensor<4, f32, ConcreteTensor<f32, 4>>) -> Tensor<4, f32> {
+    pub fn forward(
+        &self,
+        xs: &Tensor<4, f32, impl TensorBacking<4, Elem = f32>>,
+    ) -> Tensor<4, f32> {
         let xs = self.patch_embed.forward(xs); // (B, H, W, C)
 
         let mut xs: Tensor<4, f32> = match &self.pos_embed {
@@ -499,15 +465,11 @@ impl ImageEncoderViT {
 /// LayerNorm helper for BHWC tensors (normalizes last dim).
 fn layer_norm_bhwc(
     norm: &LayerNorm<1, f32>,
-    input: &Tensor<4, f32>,
+    input: &Tensor<4, f32, impl TensorBacking<4, Elem = f32>>,
 ) -> Tensor<4, f32, ConcreteTensor<f32, 4>> {
-    let shape = input.shape();
-    let b = shape[0];
-    let h = shape[1];
-    let w = shape[2];
-    let c = shape[3];
+    let [b, h, w, c] = input.shape();
     // Flatten to 3D (b*h, w, c) for layer_norm, then reshape back
-    let flat: Tensor<3, f32> = input.reshape([b * h, w, c]).to_concrete();
+    let flat = input.reshape([b * h, w, c]);
     let normed = norm.forward(&flat);
     normed.reshape([b, h, w, c]).to_concrete()
 }
