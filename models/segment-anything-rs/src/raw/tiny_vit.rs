@@ -100,7 +100,7 @@ impl MBConv {
         let out = self.conv2.forward(&out);
         let out = out.gelu();
         let out = self.conv3.forward(&out);
-        (out + &shortcut).gelu().to_concrete()
+        (out + shortcut).to_concrete().gelu().to_concrete()
     }
 }
 
@@ -217,7 +217,8 @@ impl ConvLayer {
         let c = shape[1];
         let h = shape[2];
         let w = shape[3];
-        let flat = xs.reshape([b, c, h * w]).transpose(1, 2); // (B, L, C)
+        let flat_reshaped = xs.reshape([b, c, h * w]);
+        let flat = flat_reshaped.transpose(1, 2); // (B, L, C)
         match &self.downsample {
             Some(ds) => ds.forward(&flat),
             None => flat.to_concrete(),
@@ -340,21 +341,23 @@ impl TinyAttention {
         let qkv = qkv.reshape([b, n, self.num_heads, self.key_dim * 2 + self.d]);
 
         // q: (b, n, num_heads, key_dim) -> (b, num_heads, n, key_dim)
-        let q = qkv.narrow(3, 0, self.key_dim).transpose(1, 2); // (b, num_heads, n, key_dim)
-                                                                // k: (b, n, num_heads, key_dim) -> (b, num_heads, n, key_dim)
-        let k = qkv.narrow(3, self.key_dim, self.key_dim).transpose(1, 2);
+        let q_narrow = qkv.narrow(3, 0, self.key_dim);
+        let q = q_narrow.transpose(1, 2); // (b, num_heads, n, key_dim)
+        // k: (b, n, num_heads, key_dim) -> (b, num_heads, n, key_dim)
+        let k_narrow = qkv.narrow(3, self.key_dim, self.key_dim);
+        let k = k_narrow.transpose(1, 2);
         // v: (b, n, num_heads, d) -> (b, num_heads, n, d)
-        let v = qkv.narrow(3, 2 * self.key_dim, self.d).transpose(1, 2);
+        let v_narrow = qkv.narrow(3, 2 * self.key_dim, self.d);
+        let v = v_narrow.transpose(1, 2);
 
         // attn = q * scale @ k^T
-        let attn = q.mul_scalar(self.scale).mat_mul(&k.transpose(2, 3));
+        let k_t = k.transpose(2, 3);
+        let attn = q.mul_scalar(self.scale).mat_mul(&k_t);
 
         // Add pre-computed attention bias: (num_heads, n, n) broadcast to (b, num_heads, n, n)
-        let ab_broadcast =
-            self.ab
-                .reshape([1, self.num_heads, n, n])
-                .broadcast_as([b, self.num_heads, n, n]);
-        let attn = (attn + ab_broadcast);
+        let ab_reshaped = self.ab.reshape([1, self.num_heads, n, n]);
+        let ab_broadcast = ab_reshaped.broadcast_as([b, self.num_heads, n, n]);
+        let attn = attn + ab_broadcast;
 
         // Softmax
         let attn = attn.softmax_last_dim::<3>();
@@ -363,9 +366,8 @@ impl TinyAttention {
         let out = attn.mat_mul(&v);
 
         // transpose -> (b, n, num_heads, d) -> reshape to (b, n, dh)
-        let out = out
-            .transpose(1, 2) // (b, n, num_heads, d)
-            .reshape([b, n, self.dh]);
+        let out_transposed = out.transpose(1, 2); // (b, n, num_heads, d)
+        let out = out_transposed.reshape([b, n, self.dh]);
 
         self.proj.forward(&out)
     }
@@ -433,12 +435,12 @@ impl TinyViTBlock {
             let pad_r = (self.window_size - w % self.window_size) % self.window_size;
 
             let xs = if pad_b > 0 {
-                xs.pad_with_zeros(1, 0, pad_b)
+                xs.to_concrete().pad_with_zeros(1, 0, pad_b).to_concrete()
             } else {
                 xs.to_concrete()
             };
             let xs = if pad_r > 0 {
-                xs.pad_with_zeros(2, 0, pad_r)
+                xs.pad_with_zeros(2, 0, pad_r).to_concrete()
             } else {
                 xs
             };
@@ -449,18 +451,16 @@ impl TinyViTBlock {
             let n_w = p_w / self.window_size;
 
             // Window partition: (B, n_h, ws, n_w, ws, C) -> transpose(2,3) -> reshape
-            let xs = xs
-                .reshape([b, n_h, self.window_size, n_w, self.window_size, c])
-                .transpose(2, 3) // (B, n_h, n_w, ws, ws, C)
-                .reshape([b * n_h * n_w, self.window_size * self.window_size, c]);
+            let xs_r1 = xs.reshape([b, n_h, self.window_size, n_w, self.window_size, c]);
+            let xs_t1 = xs_r1.transpose(2, 3); // (B, n_h, n_w, ws, ws, C)
+            let xs = xs_t1.reshape([b * n_h * n_w, self.window_size * self.window_size, c]);
 
             let xs = self.attn.forward(&xs);
 
             // Window unpartition
-            let xs = xs
-                .reshape([b, n_h, n_w, self.window_size, self.window_size, c])
-                .transpose(2, 3) // (B, n_h, ws, n_w, ws, C)
-                .reshape([b, p_h, p_w, c]);
+            let xs_r2 = xs.reshape([b, n_h, n_w, self.window_size, self.window_size, c]);
+            let xs_t2 = xs_r2.transpose(2, 3); // (B, n_h, ws, n_w, ws, C)
+            let xs = xs_t2.reshape([b, p_h, p_w, c]);
 
             // Remove padding
             let xs = if pad_r > 0 {
@@ -479,17 +479,15 @@ impl TinyViTBlock {
         };
 
         // Residual
-        let xs = (xs + &res_x);
+        let xs: Tensor<3, f32> = (xs + &res_x).to_concrete();
 
         // Local conv: (B, L, C) -> (B, C, H, W) -> conv -> (B, C, L) -> (B, L, C)
-        let xs_conv = xs
-            .transpose(1, 2) // (B, C, L)
-            .reshape([b, c, h, w]);
+        let xs_t = xs.transpose(1, 2); // (B, C, L)
+        let xs_conv = xs_t.reshape([b, c, h, w]);
         let xs_conv = self.local_conv.forward(&xs_conv);
         let xs_conv_shape = xs_conv.shape();
-        let xs = xs_conv
-            .reshape([b, c, xs_conv_shape[2] * xs_conv_shape[3]])
-            .transpose(1, 2); // (B, L, C)
+        let xs_r = xs_conv.reshape([b, c, xs_conv_shape[2] * xs_conv_shape[3]]);
+        let xs = xs_r.transpose(1, 2); // (B, L, C)
 
         // MLP residual
         let mlp_out = self.mlp.forward(&xs);
@@ -644,10 +642,9 @@ impl TinyViT {
         let shape = xs.shape();
         let b = shape[0];
         let c = shape[2];
-        let xs = xs
-            .reshape([b, 64, 64, c])
-            .transpose(2, 3) // (B, 64, C, 64)
-            .transpose(1, 2); // (B, C, 64, 64)
+        let xs_reshaped = xs.reshape([b, 64, 64, c]);
+        let xs_t1 = xs_reshaped.transpose(2, 3); // (B, 64, C, 64)
+        let xs = xs_t1.transpose(1, 2); // (B, C, 64, 64)
 
         // Neck
         let xs = self.neck_conv1.forward(&xs);

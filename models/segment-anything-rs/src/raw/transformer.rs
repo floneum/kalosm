@@ -156,29 +156,29 @@ impl TwoWayAttentionBlock {
         let queries: Tensor<3, f32> = if self.skip_first_layer_pe {
             self.self_attn.forward(queries, queries, queries)
         } else {
-            let q = (queries + query_pe);
+            let q: Tensor<3, f32> = (queries + query_pe).to_concrete();
             let attn_out = self.self_attn.forward(&q, &q, queries);
             (queries + attn_out).to_concrete()
         };
         let queries = self.norm1.forward(&queries);
 
         // Cross attention block, tokens attending to image embedding
-        let q = (&queries + query_pe);
-        let k = (keys + key_pe);
+        let q: Tensor<3, f32> = (&queries + query_pe).to_concrete();
+        let k: Tensor<3, f32> = (keys + key_pe).to_concrete();
         let attn_out = self.cross_attn_token_to_image.forward(&q, &k, keys);
-        let queries = (&queries + attn_out);
+        let queries: Tensor<3, f32> = (&queries + attn_out).to_concrete();
         let queries = self.norm2.forward(&queries);
 
         // MLP block
         let mlp_out = self.mlp.forward(&queries);
-        let queries = (&queries + mlp_out);
+        let queries: Tensor<3, f32> = (&queries + mlp_out).to_concrete();
         let queries = self.norm3.forward(&queries);
 
         // Cross attention block, image embedding attending to tokens
-        let q = (&queries + query_pe);
-        let k = (keys + key_pe);
+        let q: Tensor<3, f32> = (&queries + query_pe).to_concrete();
+        let k: Tensor<3, f32> = (keys + key_pe).to_concrete();
         let attn_out = self.cross_attn_image_to_token.forward(&k, &q, &queries);
-        let keys = (keys + attn_out);
+        let keys: Tensor<3, f32> = (keys + attn_out).to_concrete();
         let keys = self.norm4.forward(&keys);
 
         (queries.to_concrete(), keys.to_concrete())
@@ -254,10 +254,10 @@ impl TwoWayTransformer {
             (queries, keys) = layer.forward(&queries, &keys, point_embedding, &image_pe);
         }
 
-        let q = (&queries + point_embedding);
-        let k = (&keys + &image_pe);
+        let q: Tensor<3, f32> = (&queries + point_embedding).to_concrete();
+        let k: Tensor<3, f32> = (&keys + &image_pe).to_concrete();
         let attn_out = self.final_attn_token_to_image.forward(&q, &k, &keys);
-        let queries = (queries + attn_out);
+        let queries: Tensor<3, f32> = (queries + attn_out).to_concrete();
         let queries = self.norm_final_attn.forward(&queries);
 
         (queries.to_concrete(), keys)

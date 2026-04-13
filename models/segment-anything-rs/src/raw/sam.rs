@@ -179,7 +179,8 @@ impl Sam {
         );
 
         // Crop to original size: narrow on H and W dims
-        let cropped = upscaled.narrow(2, 0, original_h).narrow(3, 0, original_w);
+        let cropped_h = upscaled.narrow(2, 0, original_h);
+        let cropped = cropped_h.narrow(3, 0, original_w);
 
         (cropped.to_concrete(), iou)
     }
@@ -294,19 +295,21 @@ impl Sam {
         let device = img.device();
 
         // Create mean and std tensors: (3, 1, 1) broadcast to (3, H, W)
-        let mean = Tensor::from_slice(&device, [3, 1, 1], &self.pixel_mean).broadcast_as([c, h, w]);
-        let std = Tensor::from_slice(&device, [3, 1, 1], &self.pixel_std).broadcast_as([c, h, w]);
+        let mean_base = Tensor::from_slice(&device, [3, 1, 1], &self.pixel_mean);
+        let mean = mean_base.broadcast_as([c, h, w]);
+        let std_base = Tensor::from_slice(&device, [3, 1, 1], &self.pixel_std);
+        let std = std_base.broadcast_as([c, h, w]);
 
-        let img = ((img - mean) / std);
+        let img: Tensor<3, f32> = ((img - mean) / std).to_concrete();
 
         // Pad to IMAGE_SIZE
         let img = if h < IMAGE_SIZE {
-            img.pad_with_zeros(1, 0, IMAGE_SIZE - h)
+            img.pad_with_zeros(1, 0, IMAGE_SIZE - h).to_concrete()
         } else {
             img
         };
         let img = if w < IMAGE_SIZE {
-            img.pad_with_zeros(2, 0, IMAGE_SIZE - w)
+            img.pad_with_zeros(2, 0, IMAGE_SIZE - w).to_concrete()
         } else {
             img
         };

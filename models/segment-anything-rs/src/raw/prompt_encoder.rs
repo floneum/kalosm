@@ -232,7 +232,7 @@ impl PromptEncoder {
     }
 
     fn embed_boxes(&self, boxes: &Tensor<3, f32>) -> Tensor<3, f32> {
-        let boxes = (boxes + 0.5f32);
+        let boxes = boxes + 0.5f32;
         let shape = boxes.shape();
         let batch = shape[0];
         // (batch, N, 4) -> (batch, N*2, 2)
@@ -246,7 +246,7 @@ impl PromptEncoder {
         let ce1 = corner_embedding.narrow(1, 0, 1);
         let ce1 = ce1.reshape([batch, ce_shape[2]]);
 
-        let ce1 = (ce1 + self.point_embeddings[2].embeddings());
+        let ce1 = ce1 + self.point_embeddings[2].embeddings();
 
         // ce2 = corner_embedding[:, 1] + point_embeddings[3]
         let ce2 = corner_embedding.narrow(1, 1, 1);

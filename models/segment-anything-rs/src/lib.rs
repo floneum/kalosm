@@ -274,7 +274,9 @@ impl SegmentAnything {
         let w = mask_shape[3];
 
         // Get first mask (batch=0, mask=0)
-        let mask_2d = mask.narrow(0, 0, 1).narrow(1, 0, 1).reshape([h, w]);
+        let mask_n0 = mask.narrow(0, 0, 1);
+        let mask_n1 = mask_n0.narrow(1, 0, 1);
+        let mask_2d = mask_n1.reshape([h, w]);
 
         // Threshold: >= threshold -> 255, else 0
         let threshold_mask = mask_2d.gt_scalar(threshold - 1e-6);
@@ -282,12 +284,12 @@ impl SegmentAnything {
         let mask_u8: Tensor<2, f32> = threshold_mask.mul_scalar(255.0f32);
 
         // Expand to 3 channels: (H, W) -> (3, H, W)
-        let mask_3ch = mask_u8.reshape([1, h, w]).broadcast_as([3, h, w]);
+        let mask_reshaped = mask_u8.reshape([1, h, w]);
+        let mask_3ch = mask_reshaped.broadcast_as([3, h, w]);
 
         // Permute to (H, W, 3) and flatten
-        let mask_hwc = mask_3ch
-            .transpose(0, 1) // (H, 3, W)
-            .transpose(1, 2); // (H, W, 3);
+        let mask_t1 = mask_3ch.transpose(0, 1); // (H, 3, W)
+        let mask_hwc = mask_t1.transpose(1, 2); // (H, W, 3);
         let mask_flat = mask_hwc.reshape([h * w * 3]);
         let mask_slice = mask_flat.as_slice().await?;
         let mask_pixels: Vec<u8> = mask_slice.as_slice().iter().map(|&v| v as u8).collect();
