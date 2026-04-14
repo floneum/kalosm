@@ -309,8 +309,8 @@ pub(crate) fn q6k_sgemv(
     writeln!(kernel, "if {subgroup_local_index} != 0u {{ return; }}").unwrap();
 
     // Initialize post element-wise functions once before the loop
-    let post_fns = post_element_wise_functions
-        .get_or_init(|| op.post_element_wise.add_functions(kernel));
+    let post_fns =
+        post_element_wise_functions.get_or_init(|| op.post_element_wise.add_functions(kernel));
 
     // Generate the output body for one row
     let generate_row_output = |kernel: &mut GenericKernel| {

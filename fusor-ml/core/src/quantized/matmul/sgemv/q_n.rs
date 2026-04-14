@@ -229,8 +229,8 @@ pub(crate) fn q_n_sgemv(
     .unwrap();
 
     // Initialize post element-wise functions once before the loop
-    let post_fns = post_element_wise_functions
-        .get_or_init(|| op.post_element_wise.add_functions(kernel));
+    let post_fns =
+        post_element_wise_functions.get_or_init(|| op.post_element_wise.add_functions(kernel));
 
     // Generate the output body for one row
     let generate_row_output = |kernel: &mut GenericKernel| {

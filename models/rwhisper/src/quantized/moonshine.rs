@@ -854,6 +854,14 @@ impl MoonshineEncoder {
         let total_conv1_frames = Self::ceil_div_2(total_linear_frames);
         let new_conv1_frames = total_conv1_frames.saturating_sub(old_conv1_frames);
 
+        state.linear_tail = Self::append_tail(state.linear_tail.as_ref(), &new_linear, 2, 4);
+        state.total_linear_frames = total_linear_frames;
+        state.total_conv1_frames = total_conv1_frames;
+
+        if new_conv1_frames == 0 {
+            return None;
+        }
+
         let output = if old_linear_frames == 0 {
             self.conv1
                 .forward(&causal_pad_1d(&new_linear, self.config.hidden_size, 4))
@@ -873,18 +881,24 @@ impl MoonshineEncoder {
             }
             parts.push(new_linear.clone());
             let window = Tensor::cat(parts, 2);
+            let pad = self
+                .conv1
+                .kernel_size()
+                .saturating_sub(1)
+                .saturating_sub(old_conv1_frames.saturating_mul(self.conv1.config().stride));
+            let window = if pad > 0 {
+                causal_pad_1d(&window, self.config.hidden_size, pad)
+            } else {
+                window
+            };
             self.conv1.forward(&window).silu().to_concrete()
         };
 
-        state.linear_tail = Self::append_tail(state.linear_tail.as_ref(), &new_linear, 2, 4);
-        state.total_linear_frames = total_linear_frames;
-        state.total_conv1_frames = total_conv1_frames;
-
-        (new_conv1_frames > 0).then(|| {
+        Some(
             output
                 .narrow(2, output.shape()[2] - new_conv1_frames, new_conv1_frames)
-                .to_materialized_blocking()
-        })
+                .to_materialized_blocking(),
+        )
     }
 
     fn append_encoder_outputs(
@@ -895,19 +909,24 @@ impl MoonshineEncoder {
         let Some(new_conv1) = new_conv1 else {
             return None;
         };
-        let old_conv1_frames = state.total_conv1_frames.saturating_sub(new_conv1.shape()[2]);
+        let old_conv1_frames = state
+            .total_conv1_frames
+            .saturating_sub(new_conv1.shape()[2]);
         let old_seen_frames = state.total_seen_frames;
         let total_conv1_frames = state.total_conv1_frames;
         let total_seen_frames = Self::ceil_div_2(total_conv1_frames);
         let new_seen_frames = total_seen_frames.saturating_sub(old_seen_frames);
 
+        state.conv1_tail = Self::append_tail(state.conv1_tail.as_ref(), &new_conv1, 2, 4);
+        state.total_seen_frames = total_seen_frames;
+
+        if new_seen_frames == 0 {
+            return None;
+        }
+
         let output = if old_conv1_frames == 0 {
             self.conv2
-                .forward(&causal_pad_1d(
-                    &new_conv1,
-                    self.config.hidden_size * 2,
-                    4,
-                ))
+                .forward(&causal_pad_1d(&new_conv1, self.config.hidden_size * 2, 4))
                 .transpose(1, 2)
                 .to_concrete()
         } else {
@@ -924,17 +943,24 @@ impl MoonshineEncoder {
             }
             parts.push(new_conv1.clone());
             let window = Tensor::cat(parts, 2);
+            let pad = self
+                .conv2
+                .kernel_size()
+                .saturating_sub(1)
+                .saturating_sub(old_seen_frames.saturating_mul(self.conv2.config().stride));
+            let window = if pad > 0 {
+                causal_pad_1d(&window, self.config.hidden_size * 2, pad)
+            } else {
+                window
+            };
             self.conv2.forward(&window).transpose(1, 2).to_concrete()
         };
 
-        state.conv1_tail = Self::append_tail(state.conv1_tail.as_ref(), &new_conv1, 2, 4);
-        state.total_seen_frames = total_seen_frames;
-
-        (new_seen_frames > 0).then(|| {
+        Some(
             output
                 .narrow(1, output.shape()[1] - new_seen_frames, new_seen_frames)
-                .to_materialized_blocking()
-        })
+                .to_materialized_blocking(),
+        )
     }
 
     pub fn encode_stream(
@@ -1050,9 +1076,9 @@ pub struct MoonshineDecoder {
 
 #[derive(Clone, Default)]
 pub struct MoonshineDecoderCache {
-    tokens: Vec<u32>,
+    pub(crate) tokens: Vec<u32>,
     layers: Vec<MoonshineDecoderLayerCache>,
-    encoder_seq_len: usize,
+    pub(crate) encoder_seq_len: usize,
 }
 
 impl MoonshineDecoder {
@@ -1232,7 +1258,11 @@ impl MoonshineDecoder {
         }
 
         let new_encoder_hidden_states = encoder_hidden_states
-            .narrow(1, cache.encoder_seq_len, encoder_seq_len - cache.encoder_seq_len)
+            .narrow(
+                1,
+                cache.encoder_seq_len,
+                encoder_seq_len - cache.encoder_seq_len,
+            )
             .to_materialized_blocking();
         for (layer, layer_cache) in self.layers.iter_mut().zip(cache.layers.iter_mut()) {
             let new_cross_attn_kv = layer.encoder_attn.project_kv(&new_encoder_hidden_states);
@@ -1241,10 +1271,16 @@ impl MoonshineDecoder {
                 &new_cross_attn_kv.1,
             ]);
             layer_cache.cross_attn_kv = (
-                Tensor::cat([layer_cache.cross_attn_kv.0.clone(), materialized[0].clone()], 1)
-                    .to_materialized_blocking(),
-                Tensor::cat([layer_cache.cross_attn_kv.1.clone(), materialized[1].clone()], 1)
-                    .to_materialized_blocking(),
+                Tensor::cat(
+                    [layer_cache.cross_attn_kv.0.clone(), materialized[0].clone()],
+                    1,
+                )
+                .to_materialized_blocking(),
+                Tensor::cat(
+                    [layer_cache.cross_attn_kv.1.clone(), materialized[1].clone()],
+                    1,
+                )
+                .to_materialized_blocking(),
             );
         }
         cache.encoder_seq_len = encoder_seq_len;
@@ -1404,6 +1440,60 @@ mod tests {
         assert!(
             max_diff < 1e-3,
             "streaming encoder diverged from full encoder: max_diff={max_diff}"
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires a local Moonshine tiny artifact directory"]
+    async fn streaming_encoder_matches_full_encoder_with_single_frame_chunks() {
+        let Some(dir) = tiny_artifact_dir() else {
+            return;
+        };
+
+        let config: MoonshineStreamingConfig =
+            serde_json::from_slice(&fs::read(dir.join("config.json")).unwrap()).unwrap();
+        let weights = fs::read(dir.join("model.gguf")).unwrap();
+        let device = Device::cpu();
+        let mut reader = Cursor::new(weights);
+        let mut vb = VarBuilder::from_gguf(&mut reader).unwrap();
+        let model = Moonshine::load(&device, &mut vb, config.clone()).unwrap();
+
+        let frame_len = config.encoder_config.frame_len();
+        let samples = vec![0.0f32; frame_len * 31];
+        let full = model.encoder.encode(&device, &samples).unwrap();
+        let full = full.as_slice().await.unwrap();
+
+        let mut stream_state = model.encoder.new_stream_state();
+        let mut streamed_parts = Vec::new();
+        for chunk in samples.chunks(frame_len) {
+            let append = model
+                .encoder
+                .encode_stream(&device, &mut stream_state, chunk, false)
+                .unwrap();
+            if let Some(hidden_states) = append.hidden_states {
+                streamed_parts.push(hidden_states);
+            }
+        }
+        let append = model
+            .encoder
+            .encode_stream(&device, &mut stream_state, &[], true)
+            .unwrap();
+        if let Some(hidden_states) = append.hidden_states {
+            streamed_parts.push(hidden_states);
+        }
+        let streamed = Tensor::cat(streamed_parts, 1);
+        let streamed = streamed.as_slice().await.unwrap();
+
+        assert_eq!(full.shape(), streamed.shape());
+        let max_diff = full
+            .as_slice()
+            .iter()
+            .zip(streamed.as_slice())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            max_diff < 1e-3,
+            "single-frame streaming encoder diverged from full encoder: max_diff={max_diff}"
         );
     }
 }

@@ -6,6 +6,7 @@ use std::{
 };
 
 use anyhow::{bail, Context, Result};
+use futures_channel::mpsc;
 use futures_util::{stream, StreamExt};
 use kalosm::sound::*;
 use kalosm_model_types::FileSource;
@@ -194,6 +195,54 @@ async fn transcribe_jfk_sample_streaming(
     Ok(transcript)
 }
 
+async fn first_streaming_emission_chunk(
+    source: WhisperSource,
+    chunk_ms: usize,
+) -> Result<Option<usize>> {
+    let model = WhisperBuilder::default()
+        .with_source(source)
+        .build()
+        .await
+        .context("failed to build model")?;
+
+    let contents = fs::read(Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/samples_jfk.wav"))
+        .context("failed to read JFK sample")?;
+    let audio = Decoder::new(Cursor::new(contents)).context("failed to decode JFK sample")?;
+    let sample_rate = rodio::Source::sample_rate(&audio);
+    let channels = rodio::Source::channels(&audio);
+    let samples: Vec<i16> = audio.collect();
+    let samples_per_chunk = ((sample_rate as usize * chunk_ms) / 1000).max(1) * channels as usize;
+    let chunks = samples
+        .chunks(samples_per_chunk)
+        .map(|chunk| rodio::buffer::SamplesBuffer::new(channels, sample_rate, chunk.to_vec()))
+        .collect::<Vec<_>>();
+    let chunk_count = chunks.len();
+
+    let (tx, rx) = mpsc::unbounded();
+    let mut stream = rx.transcribe(model);
+
+    for (index, chunk) in chunks.into_iter().enumerate() {
+        tx.unbounded_send(chunk)
+            .map_err(|_| anyhow::anyhow!("failed to send chunk to transcription stream"))?;
+        if let Ok(Some(segment)) =
+            tokio::time::timeout(std::time::Duration::from_millis(250), stream.next()).await
+        {
+            if !segment.text().trim().is_empty() {
+                return Ok(Some(index));
+            }
+        }
+    }
+
+    drop(tx);
+    while let Some(segment) = stream.next().await {
+        if !segment.text().trim().is_empty() {
+            return Ok(Some(chunk_count));
+        }
+    }
+
+    Ok(None)
+}
+
 #[test]
 fn normalize_text_keeps_the_reference_stable() {
     assert_eq!(
@@ -307,6 +356,24 @@ async fn moonshine_tiny_streaming_short_prefix_smoke() -> Result<()> {
         normalize_text(&transcript),
         "and so my fellow america",
         "unexpected short Moonshine streaming transcript: {transcript}"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires a local Moonshine artifact directory"]
+async fn moonshine_tiny_streaming_emits_before_the_clip_ends() -> Result<()> {
+    let Some(source) = moonshine_source("tiny") else {
+        bail!("missing Moonshine tiny artifact dir; set RWHISPER_MOONSHINE_TINY_DIR or place files in artifacts/moonshine-streaming-tiny");
+    };
+
+    let first_chunk = first_streaming_emission_chunk(source, 250).await?;
+    let Some(first_chunk) = first_chunk else {
+        bail!("streaming Moonshine never emitted a non-empty segment");
+    };
+    assert!(
+        first_chunk <= 8,
+        "expected streaming Moonshine to emit within the first 2 seconds; first emission chunk index was {first_chunk}"
     );
     Ok(())
 }

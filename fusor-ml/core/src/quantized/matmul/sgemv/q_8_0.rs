@@ -218,8 +218,8 @@ pub(crate) fn q_8_0_sgemv(
     .unwrap();
 
     // Initialize post element-wise functions once before the loop
-    let post_fns = post_element_wise_functions
-        .get_or_init(|| op.post_element_wise.add_functions(kernel));
+    let post_fns =
+        post_element_wise_functions.get_or_init(|| op.post_element_wise.add_functions(kernel));
 
     // Fast path: all rows in tile are valid, no bounds checks needed
     writeln!(kernel, "if is_full_tile {{").unwrap();
