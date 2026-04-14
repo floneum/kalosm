@@ -10,13 +10,15 @@ import numpy as np
 
 GGUF_VERSION = 3
 GGML_TYPE_F16 = 1
-GGML_TYPE_Q8_0 = 8
+GGML_TYPE_Q4_0 = 2
 GGML_TYPE_Q4K = 12
 METADATA_TYPE_U32 = 4
 METADATA_TYPE_STRING = 8
 ALIGNMENT = 32
 K_BLOCK_SIZE = 256
 Q4K_BLOCK_BYTES = 2 + 2 + 12 + (K_BLOCK_SIZE // 2)
+Q4_0_BLOCK_SIZE = 32
+Q4_0_BLOCK_BYTES = 2 + (Q4_0_BLOCK_SIZE // 2)
 
 
 def align_up(value: int, alignment: int) -> int:
@@ -28,8 +30,8 @@ def quantization_type(name: str, shape: tuple[int, ...]) -> int:
         return GGML_TYPE_F16
     if shape[-1] % K_BLOCK_SIZE == 0:
         return GGML_TYPE_Q4K
-    if shape[-1] % 32 == 0:
-        return GGML_TYPE_Q8_0
+    if shape[-1] % Q4_0_BLOCK_SIZE == 0:
+        return GGML_TYPE_Q4_0
     return GGML_TYPE_F16
 
 
@@ -63,10 +65,10 @@ def tensor_size_bytes(shape: tuple[int, ...], ggml_type: int) -> int:
         assert len(shape) == 2
         assert shape[-1] % K_BLOCK_SIZE == 0
         return (numel // K_BLOCK_SIZE) * Q4K_BLOCK_BYTES
-    if ggml_type == GGML_TYPE_Q8_0:
+    if ggml_type == GGML_TYPE_Q4_0:
         assert len(shape) == 2
-        assert shape[-1] % 32 == 0
-        return (numel // 32) * 34
+        assert shape[-1] % Q4_0_BLOCK_SIZE == 0
+        return (numel // Q4_0_BLOCK_SIZE) * Q4_0_BLOCK_BYTES
     if ggml_type == GGML_TYPE_F16:
         return numel * 2
     raise ValueError(f"unsupported ggml type: {ggml_type}")
@@ -112,20 +114,35 @@ def pack_q4k_scales(scales: np.ndarray, offsets: np.ndarray) -> bytes:
     return bytes(first.tolist() + middle.tolist() + last.tolist())
 
 
-def q8_0_bytes(array: np.ndarray) -> bytes:
+def q4_0_bytes(array: np.ndarray) -> bytes:
     assert array.ndim == 2
     rows, cols = array.shape
-    assert cols % 32 == 0
+    assert cols % Q4_0_BLOCK_SIZE == 0
 
-    blocks = np.asarray(array, dtype=np.float32).reshape(-1, 32)
-    max_abs = np.max(np.abs(blocks), axis=1)
-    scales = np.divide(max_abs, 127.0, out=np.zeros_like(max_abs), where=max_abs != 0).astype(np.float16)
-    inv_scales = np.divide(127.0, max_abs, out=np.zeros_like(max_abs), where=max_abs != 0)
-    quantized = np.clip(np.rint(blocks * inv_scales[:, None]), -127, 127).astype(np.int8)
+    blocks = np.asarray(array, dtype=np.float32).reshape(-1, Q4_0_BLOCK_SIZE)
 
-    packed = np.empty(blocks.shape[0], dtype=np.dtype([("d", "<f2"), ("qs", "i1", (32,))]))
-    packed["d"] = scales
-    packed["qs"] = quantized
+    # ggml Q4_0: d = max_signed / -8, where max_signed is the value with largest magnitude
+    # (sign preserved). q = clamp(round(v / d) + 8, 0, 15).
+    abs_blocks = np.abs(blocks)
+    max_idx = np.argmax(abs_blocks, axis=1)
+    max_signed = np.take_along_axis(blocks, max_idx[:, None], axis=1).squeeze(1)
+    scales = (max_signed / -8.0).astype(np.float32)
+    inv_scales = np.divide(1.0, scales, out=np.zeros_like(scales), where=scales != 0.0)
+    quantized = np.clip(
+        np.rint(blocks * inv_scales[:, None]) + 8.0, 0.0, 15.0
+    ).astype(np.uint8)
+
+    # Pack: low nibble at position i (i < 16), high nibble at position i+16.
+    low = quantized[:, : Q4_0_BLOCK_SIZE // 2]
+    high = quantized[:, Q4_0_BLOCK_SIZE // 2 :]
+    packed_weights = (low | (high << 4)).astype(np.uint8)
+
+    packed = np.empty(
+        blocks.shape[0],
+        dtype=np.dtype([("d", "<f2"), ("qs", "u1", (Q4_0_BLOCK_SIZE // 2,))]),
+    )
+    packed["d"] = scales.astype(np.float16)
+    packed["qs"] = packed_weights
     return packed.tobytes()
 
 
@@ -213,9 +230,9 @@ def tensor_bytes(
     if ggml_type == GGML_TYPE_Q4K:
         array = decode_tensor(mm, data_base, dtype, shape, start, end)
         return GGML_TYPE_Q4K, q4k_bytes(array)
-    if ggml_type == GGML_TYPE_Q8_0:
+    if ggml_type == GGML_TYPE_Q4_0:
         array = decode_tensor(mm, data_base, dtype, shape, start, end)
-        return GGML_TYPE_Q8_0, q8_0_bytes(array)
+        return GGML_TYPE_Q4_0, q4_0_bytes(array)
 
     if dtype == "F16":
         return GGML_TYPE_F16, raw_tensor_bytes(mm, data_base, start, end)
@@ -321,10 +338,10 @@ def main() -> None:
     q4k_count = sum(
         1 for _, source_name, shape, _, _ in tensors if quantization_type(source_name, shape) == GGML_TYPE_Q4K
     )
-    q8_0_count = sum(
-        1 for _, source_name, shape, _, _ in tensors if quantization_type(source_name, shape) == GGML_TYPE_Q8_0
+    q4_0_count = sum(
+        1 for _, source_name, shape, _, _ in tensors if quantization_type(source_name, shape) == GGML_TYPE_Q4_0
     )
-    print(f"wrote {args.output} with {len(tensors)} tensors ({q4k_count} q4k, {q8_0_count} q8_0)")
+    print(f"wrote {args.output} with {len(tensors)} tensors ({q4k_count} q4k, {q4_0_count} q4_0)")
 
 
 if __name__ == "__main__":

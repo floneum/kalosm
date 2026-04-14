@@ -67,62 +67,54 @@ impl WhisperSource {
 
     /// Cohere Transcribe 03/2026
     pub fn cohere_transcribe_03_2026() -> Self {
-        let repo = "Demonthos/cohere-transcribe-03-2026-gguf".to_owned();
-        let model =
-            FileSource::huggingface(repo.clone(), "main".to_owned(), "model.gguf".to_owned());
-        let tokenizer =
-            FileSource::huggingface(repo.clone(), "main".to_owned(), "tokenizer.json".to_owned());
-        let config = FileSource::huggingface(repo, "main".to_owned(), "config.json".to_owned());
-        Self::new_with_family(model, tokenizer, config, ModelFamily::CohereTranscribe)
+        let source = FileSource::huggingface(
+            "Demonthos/cohere-transcribe-03-2026-gguf".to_owned(),
+            "main".to_owned(),
+            "model.gguf".to_owned(),
+        );
+        Self::new_with_family(
+            source.clone(),
+            source.clone(),
+            source,
+            ModelFamily::CohereTranscribe,
+        )
     }
 
-    /// Cohere Transcribe 03/2026 from a local directory containing
-    /// `model.gguf`, `tokenizer.json`, and `config.json`.
-    pub fn cohere_transcribe_03_2026_local(dir: impl Into<PathBuf>) -> Self {
-        let dir = dir.into();
+    /// Cohere Transcribe 03/2026 from a local GGUF file. Tokenizer and config
+    /// metadata must be embedded in the GGUF (all files produced by
+    /// `scripts/quantize_cohere_transcribe.py` embed them).
+    pub fn cohere_transcribe_03_2026_local(path: impl Into<PathBuf>) -> Self {
+        let source = FileSource::local(path.into());
         Self::new_with_family(
-            FileSource::local(dir.join("model.gguf")),
-            FileSource::local(dir.join("tokenizer.json")),
-            FileSource::local(dir.join("config.json")),
+            source.clone(),
+            source.clone(),
+            source,
             ModelFamily::CohereTranscribe,
         )
     }
 
     /// Moonshine streaming tiny English model.
     pub fn moonshine_streaming_tiny() -> Self {
-        let repo = "Demonthos/moonshine-streaming-tiny-gguf".to_owned();
-        Self::new_with_family(
-            FileSource::huggingface(repo.clone(), "main".to_owned(), "model.gguf".to_owned()),
-            FileSource::huggingface(repo.clone(), "main".to_owned(), "tokenizer.json".to_owned()),
-            FileSource::huggingface(repo, "main".to_owned(), "config.json".to_owned()),
-            ModelFamily::MoonshineStreaming {
-                heads: None,
-                apply_speech_filter: false,
-            },
-        )
+        Self::moonshine_streaming_remote("moonshine-streaming-tiny.gguf")
     }
 
     /// Moonshine streaming small English model.
     pub fn moonshine_streaming_small() -> Self {
-        let repo = "Demonthos/moonshine-streaming-small-gguf".to_owned();
-        Self::new_with_family(
-            FileSource::huggingface(repo.clone(), "main".to_owned(), "model.gguf".to_owned()),
-            FileSource::huggingface(repo.clone(), "main".to_owned(), "tokenizer.json".to_owned()),
-            FileSource::huggingface(repo, "main".to_owned(), "config.json".to_owned()),
-            ModelFamily::MoonshineStreaming {
-                heads: None,
-                apply_speech_filter: false,
-            },
-        )
+        Self::moonshine_streaming_remote("moonshine-streaming-small.gguf")
     }
 
     /// Moonshine streaming medium English model.
     pub fn moonshine_streaming_medium() -> Self {
-        let repo = "Demonthos/moonshine-streaming-medium-gguf".to_owned();
+        Self::moonshine_streaming_remote("moonshine-streaming-medium.gguf")
+    }
+
+    fn moonshine_streaming_remote(file: &str) -> Self {
+        let repo = "Demonthos/moonshot-gguf".to_owned();
+        let source = FileSource::huggingface(repo, "main".to_owned(), file.to_owned());
         Self::new_with_family(
-            FileSource::huggingface(repo.clone(), "main".to_owned(), "model.gguf".to_owned()),
-            FileSource::huggingface(repo.clone(), "main".to_owned(), "tokenizer.json".to_owned()),
-            FileSource::huggingface(repo, "main".to_owned(), "config.json".to_owned()),
+            source.clone(),
+            source.clone(),
+            source,
             ModelFamily::MoonshineStreaming {
                 heads: None,
                 apply_speech_filter: false,
@@ -130,15 +122,15 @@ impl WhisperSource {
         )
     }
 
-    /// Moonshine streaming English model from a local directory containing
-    /// `model.gguf` and, for older artifacts, optional `tokenizer.json`
-    /// and `config.json` sidecars.
-    pub fn moonshine_streaming_local(dir: impl Into<PathBuf>) -> Self {
-        let dir = dir.into();
+    /// Moonshine streaming English model from a local GGUF file. Tokenizer
+    /// and config metadata must be embedded in the GGUF (all files produced
+    /// by `scripts/quantize_moonshine_streaming.py` embed them).
+    pub fn moonshine_streaming_local(path: impl Into<PathBuf>) -> Self {
+        let source = FileSource::local(path.into());
         Self::new_with_family(
-            FileSource::local(dir.join("model.gguf")),
-            FileSource::local(dir.join("tokenizer.json")),
-            FileSource::local(dir.join("config.json")),
+            source.clone(),
+            source.clone(),
+            source,
             ModelFamily::MoonshineStreaming {
                 heads: None,
                 apply_speech_filter: false,

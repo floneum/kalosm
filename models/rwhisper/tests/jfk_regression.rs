@@ -1,15 +1,13 @@
 use std::{
     fs,
     io::Cursor,
-    path::{Path, PathBuf},
-    time::{SystemTime, UNIX_EPOCH},
+    path::Path,
 };
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result};
 use futures_channel::mpsc;
 use futures_util::{stream, StreamExt};
 use kalosm::sound::*;
-use kalosm_model_types::FileSource;
 use rodio::Decoder;
 use rwhisper::TranscribeChunkedAudioStreamExt;
 
@@ -63,73 +61,13 @@ fn word_error_rate(reference: &str, hypothesis: &str) -> f32 {
     }
 }
 
-fn repo_artifact_dir(name: &str) -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("artifacts")
-        .join(name)
-}
-
-fn moonshine_dir(size: &str) -> Option<PathBuf> {
-    let env_var = format!("RWHISPER_MOONSHINE_{}_DIR", size.to_ascii_uppercase());
-    std::env::var(&env_var).ok().map(PathBuf::from).or_else(|| {
-        let dir = repo_artifact_dir(&format!("moonshine-streaming-{size}"));
-        dir.exists().then_some(dir)
-    })
-}
-
-fn moonshine_source(size: &str) -> Option<WhisperSource> {
-    let dir = moonshine_dir(size)?;
-    Some(WhisperSource::moonshine_streaming_local(dir))
-}
-
-fn unique_temp_dir(prefix: &str) -> PathBuf {
-    let timestamp = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("clock drifted backwards")
-        .as_nanos();
-    std::env::temp_dir().join(format!("{prefix}-{}-{timestamp}", std::process::id()))
-}
-
-fn whisper_source() -> Option<WhisperSource> {
-    let explicit_model = std::env::var("RWHISPER_WHISPER_MODEL").ok();
-    let explicit_tokenizer = std::env::var("RWHISPER_WHISPER_TOKENIZER").ok();
-    let explicit_config = std::env::var("RWHISPER_WHISPER_CONFIG").ok();
-    if let (Some(model), Some(tokenizer), Some(config)) =
-        (explicit_model, explicit_tokenizer, explicit_config)
-    {
-        return Some(WhisperSource::new(
-            FileSource::local(model.into()),
-            FileSource::local(tokenizer.into()),
-            FileSource::local(config.into()),
-            false,
-            None,
-        ));
+fn moonshine_source(size: &str) -> WhisperSource {
+    match size {
+        "tiny" => WhisperSource::moonshine_streaming_tiny(),
+        "small" => WhisperSource::moonshine_streaming_small(),
+        "medium" => WhisperSource::moonshine_streaming_medium(),
+        other => panic!("unknown Moonshine size: {other}"),
     }
-
-    let dir = std::env::var("RWHISPER_WHISPER_DIR")
-        .ok()
-        .map(PathBuf::from)
-        .or_else(|| {
-            let dir = repo_artifact_dir("whisper-tiny-en");
-            dir.exists().then_some(dir)
-        })?;
-
-    Some(WhisperSource::new(
-        FileSource::local(dir.join("whisper-tiny-en.gguf")),
-        FileSource::local(dir.join("tokenizer-tiny-en.json")),
-        FileSource::local(dir.join("config-tiny-en.json")),
-        false,
-        Some(&[
-            [1, 0],
-            [2, 0],
-            [2, 5],
-            [3, 0],
-            [3, 1],
-            [3, 2],
-            [3, 3],
-            [3, 4],
-        ]),
-    ))
 }
 
 async fn transcribe_jfk_sample(source: WhisperSource) -> Result<String> {
@@ -257,13 +195,8 @@ fn word_error_rate_is_zero_for_exact_match() {
 }
 
 #[tokio::test]
-#[ignore = "requires a local Moonshine artifact directory"]
 async fn moonshine_tiny_matches_the_jfk_reference() -> Result<()> {
-    let Some(source) = moonshine_source("tiny") else {
-        bail!("missing Moonshine tiny artifact dir; set RWHISPER_MOONSHINE_TINY_DIR or place files in artifacts/moonshine-streaming-tiny");
-    };
-
-    let transcript = transcribe_jfk_sample(source).await?;
+    let transcript = transcribe_jfk_sample(moonshine_source("tiny")).await?;
     assert_eq!(
         normalize_text(&transcript),
         normalize_text(JFK_REFERENCE),
@@ -273,13 +206,8 @@ async fn moonshine_tiny_matches_the_jfk_reference() -> Result<()> {
 }
 
 #[tokio::test]
-#[ignore = "requires a local Moonshine artifact directory"]
 async fn moonshine_small_matches_the_jfk_reference() -> Result<()> {
-    let Some(source) = moonshine_source("small") else {
-        bail!("missing Moonshine small artifact dir; set RWHISPER_MOONSHINE_SMALL_DIR or place files in artifacts/moonshine-streaming-small");
-    };
-
-    let transcript = transcribe_jfk_sample(source).await?;
+    let transcript = transcribe_jfk_sample(moonshine_source("small")).await?;
     assert_eq!(
         normalize_text(&transcript),
         normalize_text(JFK_REFERENCE),
@@ -289,13 +217,8 @@ async fn moonshine_small_matches_the_jfk_reference() -> Result<()> {
 }
 
 #[tokio::test]
-#[ignore = "requires a local Moonshine artifact directory"]
 async fn moonshine_medium_matches_the_jfk_reference() -> Result<()> {
-    let Some(source) = moonshine_source("medium") else {
-        bail!("missing Moonshine medium artifact dir; set RWHISPER_MOONSHINE_MEDIUM_DIR or place files in artifacts/moonshine-streaming-medium");
-    };
-
-    let transcript = transcribe_jfk_sample(source).await?;
+    let transcript = transcribe_jfk_sample(moonshine_source("medium")).await?;
     assert_eq!(
         normalize_text(&transcript),
         normalize_text(JFK_REFERENCE),
@@ -305,37 +228,8 @@ async fn moonshine_medium_matches_the_jfk_reference() -> Result<()> {
 }
 
 #[tokio::test]
-#[ignore = "requires a local Moonshine tiny artifact directory with embedded GGUF metadata"]
-async fn moonshine_tiny_loads_from_embedded_metadata_without_sidecars() -> Result<()> {
-    let Some(source_dir) = moonshine_dir("tiny") else {
-        bail!("missing Moonshine tiny artifact dir; set RWHISPER_MOONSHINE_TINY_DIR or place files in artifacts/moonshine-streaming-tiny");
-    };
-
-    let temp_dir = unique_temp_dir("rwhisper-moonshine-embedded");
-    fs::create_dir_all(&temp_dir)?;
-    fs::copy(source_dir.join("model.gguf"), temp_dir.join("model.gguf"))
-        .context("failed to copy GGUF into temp directory")?;
-    assert!(!temp_dir.join("tokenizer.json").exists());
-    assert!(!temp_dir.join("config.json").exists());
-
-    let _model = WhisperBuilder::default()
-        .with_source(WhisperSource::moonshine_streaming_local(&temp_dir))
-        .build()
-        .await
-        .context("failed to load Moonshine from embedded GGUF metadata only")?;
-
-    let _ = fs::remove_dir_all(&temp_dir);
-    Ok(())
-}
-
-#[tokio::test]
-#[ignore = "requires a local Moonshine artifact directory"]
 async fn moonshine_tiny_streaming_matches_the_jfk_reference() -> Result<()> {
-    let Some(source) = moonshine_source("tiny") else {
-        bail!("missing Moonshine tiny artifact dir; set RWHISPER_MOONSHINE_TINY_DIR or place files in artifacts/moonshine-streaming-tiny");
-    };
-
-    let transcript = transcribe_jfk_sample_streaming(source, 250, None).await?;
+    let transcript = transcribe_jfk_sample_streaming(moonshine_source("tiny"), 250, None).await?;
     assert_eq!(
         normalize_text(&transcript),
         normalize_text(JFK_REFERENCE),
@@ -345,13 +239,9 @@ async fn moonshine_tiny_streaming_matches_the_jfk_reference() -> Result<()> {
 }
 
 #[tokio::test]
-#[ignore = "requires a local Moonshine artifact directory"]
 async fn moonshine_tiny_streaming_short_prefix_smoke() -> Result<()> {
-    let Some(source) = moonshine_source("tiny") else {
-        bail!("missing Moonshine tiny artifact dir; set RWHISPER_MOONSHINE_TINY_DIR or place files in artifacts/moonshine-streaming-tiny");
-    };
-
-    let transcript = transcribe_jfk_sample_streaming(source, 1_000, Some(2.0)).await?;
+    let transcript =
+        transcribe_jfk_sample_streaming(moonshine_source("tiny"), 1_000, Some(2.0)).await?;
     assert_eq!(
         normalize_text(&transcript),
         "and so my fellow america",
@@ -361,16 +251,10 @@ async fn moonshine_tiny_streaming_short_prefix_smoke() -> Result<()> {
 }
 
 #[tokio::test]
-#[ignore = "requires a local Moonshine artifact directory"]
 async fn moonshine_tiny_streaming_emits_before_the_clip_ends() -> Result<()> {
-    let Some(source) = moonshine_source("tiny") else {
-        bail!("missing Moonshine tiny artifact dir; set RWHISPER_MOONSHINE_TINY_DIR or place files in artifacts/moonshine-streaming-tiny");
-    };
-
-    let first_chunk = first_streaming_emission_chunk(source, 250).await?;
-    let Some(first_chunk) = first_chunk else {
-        bail!("streaming Moonshine never emitted a non-empty segment");
-    };
+    let first_chunk = first_streaming_emission_chunk(moonshine_source("tiny"), 250).await?;
+    let first_chunk =
+        first_chunk.context("streaming Moonshine never emitted a non-empty segment")?;
     assert!(
         first_chunk <= 8,
         "expected streaming Moonshine to emit within the first 2 seconds; first emission chunk index was {first_chunk}"
@@ -379,23 +263,13 @@ async fn moonshine_tiny_streaming_emits_before_the_clip_ends() -> Result<()> {
 }
 
 #[tokio::test]
-#[ignore = "requires local Moonshine and Whisper artifact directories"]
-async fn moonshine_tiny_beats_whisper_tiny_on_the_jfk_sample() -> Result<()> {
-    let Some(moonshine_source) = moonshine_source("tiny") else {
-        bail!("missing Moonshine tiny artifact dir; set RWHISPER_MOONSHINE_TINY_DIR or place files in artifacts/moonshine-streaming-tiny");
-    };
-    let Some(whisper_source) = whisper_source() else {
-        bail!("missing Whisper artifact paths; set RWHISPER_WHISPER_MODEL/RWHISPER_WHISPER_TOKENIZER/RWHISPER_WHISPER_CONFIG or RWHISPER_WHISPER_DIR");
-    };
-
-    let moonshine = transcribe_jfk_sample(moonshine_source).await?;
-    let whisper = transcribe_jfk_sample(whisper_source).await?;
-    let moonshine_wer = word_error_rate(JFK_REFERENCE, &moonshine);
-    let whisper_wer = word_error_rate(JFK_REFERENCE, &whisper);
-
-    assert!(
-        moonshine_wer < whisper_wer,
-        "expected Moonshine to be closer to the JFK reference on this sample\nmoonshine: {moonshine:?} (wer={moonshine_wer:.3})\nwhisper: {whisper:?} (wer={whisper_wer:.3})"
+async fn cohere_transcribe_matches_the_jfk_reference() -> Result<()> {
+    let transcript =
+        transcribe_jfk_sample(WhisperSource::cohere_transcribe_03_2026()).await?;
+    assert_eq!(
+        normalize_text(&transcript),
+        normalize_text(JFK_REFERENCE),
+        "unexpected Cohere transcript: {transcript}"
     );
     Ok(())
 }

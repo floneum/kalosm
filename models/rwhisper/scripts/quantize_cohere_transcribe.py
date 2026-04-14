@@ -10,31 +10,45 @@ import numpy as np
 
 GGUF_VERSION = 3
 GGML_TYPE_F16 = 1
-GGML_TYPE_Q8_0 = 8
+GGML_TYPE_Q4_0 = 2
+GGML_TYPE_Q4K = 12
 METADATA_TYPE_U32 = 4
 METADATA_TYPE_STRING = 8
 ALIGNMENT = 32
+K_BLOCK_SIZE = 256
+Q4K_BLOCK_BYTES = 2 + 2 + 12 + (K_BLOCK_SIZE // 2)
+Q4_0_BLOCK_SIZE = 32
+Q4_0_BLOCK_BYTES = 2 + (Q4_0_BLOCK_SIZE // 2)
 
 
 def align_up(value: int, alignment: int) -> int:
     return ((value + alignment - 1) // alignment) * alignment
 
 
-def should_quantize(name: str, shape: tuple[int, ...]) -> bool:
+def storage_shape(name: str, shape: tuple[int, ...]) -> tuple[int, ...]:
+    """Reshape a tensor for GGUF storage so it can fit a Q4K block.
+
+    Only applied to `pos_bias_u`/`pos_bias_v` (rel-pos Conformer attention
+    biases) which the Rust runtime reshapes at use site anyway. Safe because
+    dequantization preserves the flat row-major buffer and `.reshape()` at
+    load recovers the logical `(num_heads, head_dim)` view.
+    """
+    if len(shape) == 2 and (name.endswith(".pos_bias_u") or name.endswith(".pos_bias_v")):
+        numel = shape[0] * shape[1]
+        if numel % K_BLOCK_SIZE == 0:
+            return (numel // K_BLOCK_SIZE, K_BLOCK_SIZE)
+    return shape
+
+
+def quantization_type(name: str, shape: tuple[int, ...]) -> int:
+    shape = storage_shape(name, shape)
     if len(shape) != 2:
-        return False
-    if shape[-1] % 32 != 0:
-        return False
-    # Keep the encoder in fp16 on GPU. The current fusor quantized GPU path is
-    # disproportionately slow for the Cohere Conformer encoder, while the
-    # regular GPU matmul path is much healthier for these shapes.
-    if name.startswith("encoder."):
-        return False
-    if name.endswith(".pos_enc"):
-        return False
-    if name.endswith(".pos_bias_u") or name.endswith(".pos_bias_v"):
-        return False
-    return True
+        return GGML_TYPE_F16
+    if shape[-1] % K_BLOCK_SIZE == 0:
+        return GGML_TYPE_Q4K
+    if shape[-1] % Q4_0_BLOCK_SIZE == 0:
+        return GGML_TYPE_Q4_0
+    return GGML_TYPE_F16
 
 
 def load_safetensors_index(path: Path) -> tuple[int, list[tuple[str, str, tuple[int, ...], int, int]]]:
@@ -57,10 +71,14 @@ def tensor_size_bytes(shape: tuple[int, ...], ggml_type: int) -> int:
     numel = 1
     for dim in shape:
         numel *= dim
-    if ggml_type == GGML_TYPE_Q8_0:
+    if ggml_type == GGML_TYPE_Q4K:
         assert len(shape) == 2
-        assert shape[-1] % 32 == 0
-        return (numel // 32) * 34
+        assert shape[-1] % K_BLOCK_SIZE == 0
+        return (numel // K_BLOCK_SIZE) * Q4K_BLOCK_BYTES
+    if ggml_type == GGML_TYPE_Q4_0:
+        assert len(shape) == 2
+        assert shape[-1] % Q4_0_BLOCK_SIZE == 0
+        return (numel // Q4_0_BLOCK_SIZE) * Q4_0_BLOCK_BYTES
     if ggml_type == GGML_TYPE_F16:
         return numel * 2
     raise ValueError(f"unsupported ggml type: {ggml_type}")
@@ -86,21 +104,117 @@ def decode_tensor(mm: np.memmap, data_base: int, dtype: str, shape: tuple[int, .
     raise ValueError(f"unsupported safetensors dtype: {dtype}")
 
 
-def q8_0_bytes(array: np.ndarray) -> bytes:
+def pack_q4k_scales(scales: np.ndarray, offsets: np.ndarray) -> bytes:
+    first = np.zeros(4, dtype=np.uint8)
+    middle = np.zeros(4, dtype=np.uint8)
+    last = np.zeros(4, dtype=np.uint8)
+
+    for i in range(4):
+        first[i] = (int(scales[i]) & 0x3F) | (((int(scales[i + 4]) >> 4) & 0x03) << 6)
+        middle[i] = (int(offsets[i]) & 0x3F) | (((int(offsets[i + 4]) >> 4) & 0x03) << 6)
+        last[i] = (int(scales[i + 4]) & 0x0F) | ((int(offsets[i + 4]) & 0x0F) << 4)
+
+    return bytes(first.tolist() + middle.tolist() + last.tolist())
+
+
+def q4_0_bytes(array: np.ndarray) -> bytes:
     assert array.ndim == 2
     rows, cols = array.shape
-    assert cols % 32 == 0
+    assert cols % Q4_0_BLOCK_SIZE == 0
 
-    blocks = np.asarray(array, dtype=np.float32).reshape(-1, 32)
-    max_abs = np.max(np.abs(blocks), axis=1)
-    scales = np.divide(max_abs, 127.0, out=np.zeros_like(max_abs), where=max_abs != 0).astype(np.float16)
-    inv_scales = np.divide(127.0, max_abs, out=np.zeros_like(max_abs), where=max_abs != 0)
-    quantized = np.clip(np.rint(blocks * inv_scales[:, None]), -127, 127).astype(np.int8)
+    blocks = np.asarray(array, dtype=np.float32).reshape(-1, Q4_0_BLOCK_SIZE)
 
-    packed = np.empty(blocks.shape[0], dtype=np.dtype([("d", "<f2"), ("qs", "i1", (32,))]))
-    packed["d"] = scales
-    packed["qs"] = quantized
+    abs_blocks = np.abs(blocks)
+    max_idx = np.argmax(abs_blocks, axis=1)
+    max_signed = np.take_along_axis(blocks, max_idx[:, None], axis=1).squeeze(1)
+    scales = (max_signed / -8.0).astype(np.float32)
+    inv_scales = np.divide(1.0, scales, out=np.zeros_like(scales), where=scales != 0.0)
+    quantized = np.clip(
+        np.rint(blocks * inv_scales[:, None]) + 8.0, 0.0, 15.0
+    ).astype(np.uint8)
+
+    low = quantized[:, : Q4_0_BLOCK_SIZE // 2]
+    high = quantized[:, Q4_0_BLOCK_SIZE // 2 :]
+    packed_weights = (low | (high << 4)).astype(np.uint8)
+
+    packed = np.empty(
+        blocks.shape[0],
+        dtype=np.dtype([("d", "<f2"), ("qs", "u1", (Q4_0_BLOCK_SIZE // 2,))]),
+    )
+    packed["d"] = scales.astype(np.float16)
+    packed["qs"] = packed_weights
     return packed.tobytes()
+
+
+def q4k_bytes(array: np.ndarray) -> bytes:
+    assert array.ndim == 2
+    rows, cols = array.shape
+    assert cols % K_BLOCK_SIZE == 0
+
+    blocks = np.asarray(array, dtype=np.float32).reshape(-1, K_BLOCK_SIZE)
+    out = bytearray(blocks.shape[0] * Q4K_BLOCK_BYTES)
+    cursor = 0
+
+    for block in blocks:
+        local_scales = np.zeros(8, dtype=np.float32)
+        local_offsets = np.zeros(8, dtype=np.float32)
+        quantized_groups = []
+
+        groups = [block[i * 32 : (i + 1) * 32] for i in range(8)]
+        for group in groups:
+            group_min = float(group.min())
+            group_max = float(group.max())
+            offset = max(0.0, -group_min)
+            scale = max(0.0, (group_max + offset) / 15.0)
+            local_scales[len(quantized_groups)] = scale
+            local_offsets[len(quantized_groups)] = offset
+            quantized_groups.append(group)
+
+        super_scale = float(local_scales.max() / 63.0) if local_scales.max() > 0 else 0.0
+        super_min = float(local_offsets.max() / 63.0) if local_offsets.max() > 0 else 0.0
+
+        scale_codes = np.zeros(8, dtype=np.uint8)
+        offset_codes = np.zeros(8, dtype=np.uint8)
+        packed_weights = np.zeros(K_BLOCK_SIZE // 2, dtype=np.uint8)
+
+        if super_scale > 0:
+            scale_codes = np.clip(np.rint(local_scales / super_scale), 0, 63).astype(np.uint8)
+        if super_min > 0:
+            offset_codes = np.clip(np.rint(local_offsets / super_min), 0, 63).astype(np.uint8)
+
+        for pair in range(4):
+            low_idx = pair * 2
+            high_idx = low_idx + 1
+
+            low_scale = float(scale_codes[low_idx]) * super_scale
+            high_scale = float(scale_codes[high_idx]) * super_scale
+            low_offset = float(offset_codes[low_idx]) * super_min
+            high_offset = float(offset_codes[high_idx]) * super_min
+
+            low_group = groups[low_idx]
+            high_group = groups[high_idx]
+
+            if low_scale > 0:
+                low_q = np.clip(np.rint((low_group + low_offset) / low_scale), 0, 15).astype(np.uint8)
+            else:
+                low_q = np.zeros(32, dtype=np.uint8)
+            if high_scale > 0:
+                high_q = np.clip(np.rint((high_group + high_offset) / high_scale), 0, 15).astype(np.uint8)
+            else:
+                high_q = np.zeros(32, dtype=np.uint8)
+
+            packed_weights[pair * 32 : (pair + 1) * 32] = low_q | (high_q << 4)
+
+        out[cursor : cursor + 2] = np.asarray(super_scale, dtype="<f2").tobytes()
+        cursor += 2
+        out[cursor : cursor + 2] = np.asarray(super_min, dtype="<f2").tobytes()
+        cursor += 2
+        out[cursor : cursor + 12] = pack_q4k_scales(scale_codes, offset_codes)
+        cursor += 12
+        out[cursor : cursor + (K_BLOCK_SIZE // 2)] = packed_weights.tobytes()
+        cursor += K_BLOCK_SIZE // 2
+
+    return bytes(out)
 
 
 def tensor_bytes(
@@ -112,9 +226,14 @@ def tensor_bytes(
     start: int,
     end: int,
 ) -> tuple[int, bytes]:
-    if should_quantize(name, shape):
-        array = decode_tensor(mm, data_base, dtype, shape, start, end)
-        return GGML_TYPE_Q8_0, q8_0_bytes(array)
+    s_shape = storage_shape(name, shape)
+    ggml_type = quantization_type(name, shape)
+    if ggml_type == GGML_TYPE_Q4K:
+        array = decode_tensor(mm, data_base, dtype, shape, start, end).reshape(s_shape)
+        return GGML_TYPE_Q4K, q4k_bytes(array)
+    if ggml_type == GGML_TYPE_Q4_0:
+        array = decode_tensor(mm, data_base, dtype, shape, start, end).reshape(s_shape)
+        return GGML_TYPE_Q4_0, q4_0_bytes(array)
 
     if dtype == "F16":
         return GGML_TYPE_F16, raw_tensor_bytes(mm, data_base, start, end)
@@ -127,18 +246,40 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--input", type=Path, required=True, help="Path to model.safetensors")
     parser.add_argument("--output", type=Path, required=True, help="Path to output model.gguf")
+    parser.add_argument(
+        "--tokenizer",
+        type=Path,
+        help="Path to tokenizer.json (defaults to a tokenizer.json next to --input)",
+    )
+    parser.add_argument(
+        "--config",
+        type=Path,
+        help="Path to config.json (defaults to a config.json next to --input)",
+    )
     args = parser.parse_args()
+
+    tokenizer_path = args.tokenizer or args.input.with_name("tokenizer.json")
+    config_path = args.config or args.input.with_name("config.json")
+    if not tokenizer_path.exists():
+        raise FileNotFoundError(f"missing tokenizer json: {tokenizer_path}")
+    if not config_path.exists():
+        raise FileNotFoundError(f"missing config json: {config_path}")
+    tokenizer_json = tokenizer_path.read_text(encoding="utf-8")
+    config_json = config_path.read_text(encoding="utf-8")
 
     metadata = {
         "general.architecture": ("string", "cohere_asr"),
         "general.alignment": ("u32", ALIGNMENT),
+        "rwhisper.tokenizer.json": ("string", tokenizer_json),
+        "rwhisper.config.json": ("string", config_json),
     }
 
     data_base, source_tensors = load_safetensors_index(args.input)
     tensors = []
     for name, _, shape, _, _ in source_tensors:
-        ggml_type = GGML_TYPE_Q8_0 if should_quantize(name, shape) else GGML_TYPE_F16
-        tensors.append((name, shape, ggml_type, tensor_size_bytes(shape, ggml_type)))
+        s_shape = storage_shape(name, shape)
+        ggml_type = quantization_type(name, shape)
+        tensors.append((name, s_shape, ggml_type, tensor_size_bytes(s_shape, ggml_type)))
 
     header = bytearray()
     header.extend(b"GGUF")
@@ -195,8 +336,13 @@ def main() -> None:
             handle.write(raw)
             cursor = offset + len(raw)
 
-    quantized = sum(1 for name, shape, _, _ in tensors if should_quantize(name, shape))
-    print(f"wrote {args.output} with {len(tensors)} tensors ({quantized} q8_0)")
+    q4k_count = sum(
+        1 for name, shape, _, _ in tensors if quantization_type(name, shape) == GGML_TYPE_Q4K
+    )
+    q4_0_count = sum(
+        1 for name, shape, _, _ in tensors if quantization_type(name, shape) == GGML_TYPE_Q4_0
+    )
+    print(f"wrote {args.output} with {len(tensors)} tensors ({q4k_count} q4k, {q4_0_count} q4_0)")
 
 
 if __name__ == "__main__":
