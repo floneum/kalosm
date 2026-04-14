@@ -200,12 +200,8 @@ mod tests {
         let tanh_tensor: Tensor<1, f32> = Tensor::from_slice(&gpu_device, [5], &tanh_data);
         let tanh_result = tanh_tensor.tanh();
         let tanh_slice = tanh_result.as_slice().await.unwrap();
-        for i in 0..5 {
-            eprintln!(
-                "GPU tanh({:>10.1}) = {}",
-                tanh_data[i],
-                tanh_slice.as_slice()[i]
-            );
+        for (i, &x) in tanh_data.iter().enumerate() {
+            eprintln!("GPU tanh({:>10.1}) = {}", x, tanh_slice.as_slice()[i]);
         }
 
         // Test x * x for large values
@@ -213,24 +209,24 @@ mod tests {
         let sq_tensor: Tensor<1, f32> = Tensor::from_slice(&gpu_device, [5], &sq_data);
         let sq_result = (&sq_tensor * &sq_tensor).to_concrete();
         let sq_slice = sq_result.clone().as_slice().await.unwrap();
-        for i in 0..5 {
+        for (i, &x) in sq_data.iter().enumerate() {
             eprintln!(
                 "GPU {}^2 = {} (expected {})",
-                sq_data[i],
+                x,
                 sq_slice.as_slice()[i],
-                sq_data[i] * sq_data[i]
+                x * x
             );
         }
 
         // Test the inner factor: 0.044715 * x^2 + 1
         let inner_factor = (sq_result * 0.044715f32 + 1.0f32).to_concrete();
         let inner_slice = inner_factor.as_slice().await.unwrap();
-        for i in 0..5 {
+        for (i, &x) in sq_data.iter().enumerate() {
             eprintln!(
                 "GPU inner_factor({}) = {} (expected {})",
-                sq_data[i],
+                x,
                 inner_slice.as_slice()[i],
-                0.044715 * sq_data[i] * sq_data[i] + 1.0
+                0.044715 * x * x + 1.0
             );
         }
 

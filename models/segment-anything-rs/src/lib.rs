@@ -753,7 +753,7 @@ mod tests {
         assert!(pe_diff < 0.001, "dense PE diverged: {}", pe_diff);
 
         // Prompt encoder
-        let points = vec![(0.5, 0.25, true)];
+        let points = [(0.5, 0.25, true)];
         let xys: Vec<f32> = points
             .iter()
             .flat_map(|(x, y, _)| [(*x as f32) * 1024.0, (*y as f32) * 771.0])

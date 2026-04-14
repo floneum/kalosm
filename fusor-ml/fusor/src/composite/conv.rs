@@ -744,12 +744,12 @@ mod tests {
         // Regression test: bias must be added along the channel dim (axis 1),
         // not the last spatial dim. Use out_channels=3 with spatial dims 2x2
         // so that out_channels != any spatial dim.
-        let input_data: Vec<f32> = vec![0.0; 1 * 1 * 4 * 4];
+        let input_data: Vec<f32> = vec![0.0; 4 * 4];
         let input: Tensor<4, f32> =
             Tensor::Cpu(fusor_cpu::Tensor::from_slice([1, 1, 4, 4], &input_data));
 
         // Weight: (out_channels=3, in_channels=1, kH=3, kW=3) — all zeros
-        let weight_data = vec![0.0f32; 3 * 1 * 3 * 3];
+        let weight_data = vec![0.0f32; 3 * 3 * 3];
         let weight: Tensor<4, f32> =
             Tensor::Cpu(fusor_cpu::Tensor::from_slice([3, 1, 3, 3], &weight_data));
 
