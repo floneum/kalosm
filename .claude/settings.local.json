@@ -1,0 +1,12 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(cargo clippy:*)",
+      "Bash(gh pr:*)",
+      "Bash(gh run:*)",
+      "Read(//tmp/**)",
+      "Read(//private/tmp/**)",
+      "Bash(gh api:*)"
+    ]
+  }
+}
