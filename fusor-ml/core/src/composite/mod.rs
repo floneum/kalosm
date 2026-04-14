@@ -14,7 +14,6 @@ mod rms_norm;
 mod rms_norm_fused;
 mod rope;
 mod rope_fused;
-mod silu;
 mod sliding_window_view;
 mod softmax;
 mod sqr;

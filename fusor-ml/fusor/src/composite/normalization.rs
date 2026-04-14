@@ -615,40 +615,17 @@ mod tests {
         assert_eq!(cpu_slice.shape(), gpu_slice.shape());
 
         let mut max_diff = 0.0f32;
-        let mut sum_diff = 0.0f32;
-        let mut count = 0;
         for i in 0..cpu_slice.shape()[0] {
             for j in 0..cpu_slice.shape()[1] {
                 for k in 0..cpu_slice.shape()[2].min(50) {
                     for l in 0..cpu_slice.shape()[3].min(50) {
                         let cpu_val: f32 = cpu_slice[[i, j, k, l]].into();
                         let gpu_val: f32 = gpu_slice[[i, j, k, l]].into();
-                        let diff = (cpu_val - gpu_val).abs();
-                        max_diff = max_diff.max(diff);
-                        sum_diff += diff;
-                        count += 1;
+                        max_diff = max_diff.max((cpu_val - gpu_val).abs());
                     }
                 }
             }
         }
-
-        eprintln!(
-            "Softmax CPU vs GPU: max_diff={}, mean_diff={}",
-            max_diff,
-            sum_diff / count as f32
-        );
-        eprintln!(
-            "CPU[0,0,0,0..5]: {:?}",
-            (0..5)
-                .map(|i| cpu_slice[[0, 0, 0, i]])
-                .collect::<Vec<f32>>()
-        );
-        eprintln!(
-            "GPU[0,0,0,0..5]: {:?}",
-            (0..5)
-                .map(|i| gpu_slice[[0, 0, 0, i]])
-                .collect::<Vec<f32>>()
-        );
 
         assert!(
             max_diff < 0.001,
@@ -706,34 +683,15 @@ mod tests {
         assert_eq!(cpu_slice.shape(), gpu_slice.shape());
 
         let mut max_diff = 0.0f32;
-        let mut sum_diff = 0.0f32;
-        let mut count = 0;
         for i in 0..cpu_slice.shape()[0] {
             for j in 0..cpu_slice.shape()[1].min(50) {
                 for k in 0..cpu_slice.shape()[2].min(100) {
                     let cpu_val: f32 = cpu_slice[[i, j, k]].into();
                     let gpu_val: f32 = gpu_slice[[i, j, k]].into();
-                    let diff = (cpu_val - gpu_val).abs();
-                    max_diff = max_diff.max(diff);
-                    sum_diff += diff;
-                    count += 1;
+                    max_diff = max_diff.max((cpu_val - gpu_val).abs());
                 }
             }
         }
-
-        eprintln!(
-            "LayerNorm CPU vs GPU: max_diff={}, mean_diff={}",
-            max_diff,
-            sum_diff / count as f32
-        );
-        eprintln!(
-            "CPU[0,0,0..5]: {:?}",
-            (0..5).map(|i| cpu_slice[[0, 0, i]]).collect::<Vec<f32>>()
-        );
-        eprintln!(
-            "GPU[0,0,0..5]: {:?}",
-            (0..5).map(|i| gpu_slice[[0, 0, i]]).collect::<Vec<f32>>()
-        );
 
         assert!(
             max_diff < 0.01,

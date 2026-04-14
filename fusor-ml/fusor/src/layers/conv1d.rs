@@ -262,35 +262,15 @@ mod tests {
         assert_eq!(result_cpu.shape(), result_gpu.shape());
 
         let mut max_diff = 0.0f32;
-        let mut sum_diff = 0.0f32;
-        let mut count = 0;
         for i in 0..result_cpu.shape()[0] {
             for j in 0..result_cpu.shape()[1] {
                 for k in 0..result_cpu.shape()[2].min(100) {
-                    // Sample first 100 positions
                     let cpu_val: f32 = result_cpu[[i, j, k]].into();
                     let gpu_val: f32 = result_gpu[[i, j, k]].into();
-                    let diff = (cpu_val - gpu_val).abs();
-                    max_diff = max_diff.max(diff);
-                    sum_diff += diff;
-                    count += 1;
+                    max_diff = max_diff.max((cpu_val - gpu_val).abs());
                 }
             }
         }
-
-        eprintln!(
-            "Conv1d CPU vs GPU: max_diff={}, mean_diff={}",
-            max_diff,
-            sum_diff / count as f32
-        );
-        eprintln!(
-            "CPU[0,0,0..5]: {:?}",
-            (0..5).map(|i| result_cpu[[0, 0, i]]).collect::<Vec<f32>>()
-        );
-        eprintln!(
-            "GPU[0,0,0..5]: {:?}",
-            (0..5).map(|i| result_gpu[[0, 0, i]]).collect::<Vec<f32>>()
-        );
 
         assert!(
             max_diff < 0.01,

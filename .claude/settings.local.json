@@ -6,7 +6,13 @@
       "Bash(gh run:*)",
       "Read(//tmp/**)",
       "Read(//private/tmp/**)",
-      "Bash(gh api:*)"
+      "Bash(gh api:*)",
+      "Bash(chmod +x /tmp/find_tests.sh)",
+      "Bash(bash /tmp/find_tests.sh)",
+      "Bash(git diff:*)",
+      "Bash(awk '/fn test_/{p=1; fname=$0} p && /eprintln!/{if\\(!seen[fname]++\\) print fname}' fusor-ml/fusor/src/composite/activations.rs)",
+      "Bash(awk:*)",
+      "Bash(wait:*)"
     ]
   }
 }
