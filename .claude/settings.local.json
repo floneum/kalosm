@@ -10,7 +10,15 @@
       "Bash(GLINER_MODEL=/Users/evanalmloff/Desktop/Github/ner/models/rgliner/weights/gliner-edge.gguf cargo run:*)",
       "Bash(RUST_BACKTRACE=1 GLINER_MODEL=/Users/evanalmloff/Desktop/Github/ner/models/rgliner/weights/gliner-edge.gguf cargo run:*)",
       "Bash(git -C /Users/evanalmloff/Desktop/Github/ner checkout -- fusor-ml/core/src/matmul/mod.rs)",
-      "WebFetch(domain:api.github.com)"
+      "WebFetch(domain:api.github.com)",
+      "WebFetch(domain:arxiv.org)",
+      "WebFetch(domain:urchade.github.io)",
+      "Bash(python3:*)",
+      "Bash(RUST_BACKTRACE=1 cargo run:*)",
+      "Bash(GLINER_MODEL=/Users/evanalmloff/Desktop/Github/ner/models/rgliner/weights/gliner-relex-multi-v1.0.gguf cargo run:*)",
+      "Bash(GLINER_MODEL=./weights/gliner-relex-multi-v1.0.gguf cargo run:*)",
+      "Bash(cargo add:*)",
+      "Bash(pip install:*)"
     ]
   }
 }

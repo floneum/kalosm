@@ -143,22 +143,139 @@ impl GlinerSource {
             label_encoder_config: Self::huggingface_or_cached(
                 "Demonthos/gliner-gguf",
                 "main",
-                "label-encoder-config.json",
+                "edge-label-encoder-config.json",
             ),
             label_encoder_tokenizer: Self::huggingface_or_cached(
                 "Demonthos/gliner-gguf",
                 "main",
-                "label-encoder-tokenizer.json",
+                "edge-label-encoder-tokenizer.json",
             ),
             tokenizer: Self::huggingface_or_cached(
                 "Demonthos/gliner-gguf",
                 "main",
-                "text-tokenizer.json",
+                "edge-text-tokenizer.json",
             ),
             config: Self::huggingface_or_cached(
                 "Demonthos/gliner-gguf",
                 "main",
-                "text-gliner-config.json",
+                "edge-text-gliner-config.json",
+            ),
+        }
+    }
+
+    /// Demonthos GLiNER GGUF small upload.
+    ///
+    /// Uses the GGUF weights and sidecar tokenizer/config files from
+    /// `Demonthos/gliner-gguf`.
+    pub fn demonthos_small() -> Self {
+        Self {
+            model: Self::huggingface_or_cached(
+                "Demonthos/gliner-gguf",
+                "main",
+                "gliner-small.gguf",
+            ),
+            label_encoder: Self::huggingface_or_cached(
+                "Demonthos/gliner-gguf",
+                "main",
+                "gliner-small-label-encoder.gguf",
+            ),
+            label_encoder_config: Self::huggingface_or_cached(
+                "Demonthos/gliner-gguf",
+                "main",
+                "small-label-encoder-config.json",
+            ),
+            label_encoder_tokenizer: Self::huggingface_or_cached(
+                "Demonthos/gliner-gguf",
+                "main",
+                "small-label-encoder-tokenizer.json",
+            ),
+            tokenizer: Self::huggingface_or_cached(
+                "Demonthos/gliner-gguf",
+                "main",
+                "small-text-tokenizer.json",
+            ),
+            config: Self::huggingface_or_cached(
+                "Demonthos/gliner-gguf",
+                "main",
+                "small-text-gliner-config.json",
+            ),
+        }
+    }
+
+    /// Demonthos GLiNER GGUF base upload.
+    ///
+    /// Uses the GGUF weights and sidecar tokenizer/config files from
+    /// `Demonthos/gliner-gguf`.
+    pub fn demonthos_base() -> Self {
+        Self {
+            model: Self::huggingface_or_cached(
+                "Demonthos/gliner-gguf",
+                "main",
+                "gliner-base.gguf",
+            ),
+            label_encoder: Self::huggingface_or_cached(
+                "Demonthos/gliner-gguf",
+                "main",
+                "gliner-base-label-encoder.gguf",
+            ),
+            label_encoder_config: Self::huggingface_or_cached(
+                "Demonthos/gliner-gguf",
+                "main",
+                "base-label-encoder-config.json",
+            ),
+            label_encoder_tokenizer: Self::huggingface_or_cached(
+                "Demonthos/gliner-gguf",
+                "main",
+                "base-label-encoder-tokenizer.json",
+            ),
+            tokenizer: Self::huggingface_or_cached(
+                "Demonthos/gliner-gguf",
+                "main",
+                "base-text-tokenizer.json",
+            ),
+            config: Self::huggingface_or_cached(
+                "Demonthos/gliner-gguf",
+                "main",
+                "base-text-gliner-config.json",
+            ),
+        }
+    }
+
+    /// Demonthos GLiNER GGUF large upload.
+    ///
+    /// Uses the GGUF weights and sidecar tokenizer/config files from
+    /// `Demonthos/gliner-gguf`.
+    pub fn demonthos_large() -> Self {
+        Self {
+            model: Self::huggingface_or_cached(
+                "Demonthos/gliner-gguf",
+                "main",
+                "gliner-large.gguf",
+            ),
+            label_encoder: Self::huggingface_or_cached(
+                "Demonthos/gliner-gguf",
+                "main",
+                "gliner-large-label-encoder.gguf",
+            ),
+            label_encoder_config: Self::huggingface_or_cached(
+                "Demonthos/gliner-gguf",
+                "main",
+                "large-label-encoder-config.json",
+            ),
+            label_encoder_tokenizer: Self::huggingface_or_cached(
+                "Demonthos/gliner-gguf",
+                "main",
+                "large-label-encoder-tokenizer.json",
+            ),
+            tokenizer: Self::huggingface_or_cached(
+                "Demonthos/gliner-gguf",
+                "main",
+                "large-text-tokenizer.json",
+            ),
+            config: Self::huggingface_or_cached(
+                "Demonthos/gliner-gguf",
+                "main",
+                "large-text-gliner-config.json",
             ),
         }
     }

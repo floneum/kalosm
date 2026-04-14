@@ -48,6 +48,28 @@
 //! # Ok(())
 //! # }
 //! ```
+//!
+//! ## Relation Extraction (GLiNER-RelEx)
+//!
+//! For joint NER and relation extraction, use the `relex` module:
+//!
+//! ```rust, no_run
+//! use rgliner::relex::*;
+//!
+//! # async fn example() -> anyhow::Result<()> {
+//! let relex = GlinerRelEx::builder()
+//!     .with_source(GlinerRelExSource::relex_multi())
+//!     .build()
+//!     .await?;
+//!
+//! let (entities, relations) = relex.extract(
+//!     "Apple was founded by Steve Jobs.",
+//!     &["person", "organization"],
+//!     &["founded by"],
+//! ).await?;
+//! # Ok(())
+//! # }
+//! ```
 
 #![warn(missing_docs)]
 
@@ -55,6 +77,9 @@ mod config;
 mod decoding;
 mod error;
 mod raw;
+pub mod relation_decoding;
+pub mod relex;
+pub mod relex_tokenization;
 mod source;
 mod tokenization;
 

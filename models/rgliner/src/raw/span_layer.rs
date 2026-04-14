@@ -162,6 +162,67 @@ impl SpanLayer {
         (span_embeddings, span_indices)
     }
 
+    /// Compute span representations for specific (start, end) word positions.
+    ///
+    /// Matches Python TokenMarker forward:
+    /// 1. project_start(h) -> start_rep
+    /// 2. project_end(h) -> end_rep
+    /// 3. gather at span positions
+    /// 4. cat + relu
+    /// 5. out_project
+    ///
+    /// # Arguments
+    /// * `word_embeddings` - Word embeddings [batch=1, num_words, hidden]
+    /// * `spans` - List of (start_word, end_word) pairs
+    ///
+    /// # Returns
+    /// Span embeddings [num_spans, hidden]
+    pub fn forward_for_spans(
+        &self,
+        word_embeddings: &Tensor<3, f32>,
+        spans: &[(usize, usize)],
+        device: &Device,
+    ) -> Tensor<2, f32> {
+        let [batch_size, num_words, hidden_dim] = word_embeddings.shape();
+        assert_eq!(batch_size, 1, "only batch_size=1 supported");
+        let num_spans = spans.len();
+
+        // Apply project_start and project_end to the full word embeddings
+        let start_rep = self
+            .start_fc2
+            .forward(&self.start_fc1.forward(word_embeddings).relu());
+        let end_rep = self
+            .end_fc2
+            .forward(&self.end_fc1.forward(word_embeddings).relu());
+
+        // Gather at span positions
+        let start_rep_2d = start_rep.squeeze(0).to_concrete();
+        let end_rep_2d = end_rep.squeeze(0).to_concrete();
+        let _ = num_words;
+
+        let start_indices: Vec<u32> = spans.iter().map(|(s, _)| *s as u32).collect();
+        let end_indices: Vec<u32> = spans.iter().map(|(_, e)| *e as u32).collect();
+        let start_idx_tensor = Tensor::new(device, &start_indices);
+        let end_idx_tensor = Tensor::new(device, &end_indices);
+
+        let start_gathered = start_rep_2d.index_select(0, &start_idx_tensor);
+        let end_gathered = end_rep_2d.index_select(0, &end_idx_tensor);
+
+        // Concat along last dim: [num_spans, hidden*2]
+        let start_3d: Tensor<3, f32> = start_gathered.unsqueeze(0).to_concrete();
+        let end_3d: Tensor<3, f32> = end_gathered.unsqueeze(0).to_concrete();
+        let combined = Tensor::cat([start_3d, end_3d], 2).relu();
+
+        // Apply out_project: Linear -> ReLU -> Linear
+        let hidden = self.out_fc1.forward(&combined).relu();
+        let out = self.out_fc2.forward(&hidden);
+
+        // [1, num_spans, hidden] -> [num_spans, hidden]
+        let _ = num_spans;
+        let _ = hidden_dim;
+        out.squeeze(0).to_concrete()
+    }
+
     fn gather_span_embeddings(
         &self,
         word_embeddings: &Tensor<3, f32>,

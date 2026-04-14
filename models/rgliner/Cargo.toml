@@ -23,6 +23,7 @@ serde = { version = "1", features = ["derive"] }
 kalosm-common = { workspace = true }
 kalosm-model-types.workspace = true
 kalosm-language-model.workspace = true
+pollster = "0.4.0"
 
 [dev-dependencies]
 anyhow.workspace = true
