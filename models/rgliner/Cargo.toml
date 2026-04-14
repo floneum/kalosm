@@ -28,6 +28,7 @@ pollster = "0.4.0"
 [dev-dependencies]
 anyhow.workspace = true
 tokio = { version = "1", features = ["full"] }
+clap = { version = "4", features = ["derive"] }
 
 [features]
 default = ["tokio"]

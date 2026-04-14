@@ -7675,6 +7675,7 @@ name = "rgliner"
 version = "0.4.0"
 dependencies = [
  "anyhow",
+ "clap 4.6.0",
  "fusor",
  "fusor-core",
  "fusor-gguf",
