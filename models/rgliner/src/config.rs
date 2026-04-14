@@ -122,6 +122,24 @@ impl GlinerConfig {
     pub fn uses_first_subtoken(&self) -> bool {
         self.subtoken_pooling == "first"
     }
+
+    /// Whether the tokenizer should add [CLS]/[SEP] special tokens around text.
+    ///
+    /// Matches Python GLiNER's `_set_tokenizer_spec_tokens` behavior:
+    /// ModernBERT/ettin-style encoders (which have `add_bos_token=False`
+    /// semantics because they have no bos token) are fed raw text without
+    /// [CLS]/[SEP] wrappers. DeBERTa/RoBERTa/XLM-R family keep them.
+    pub fn should_add_special_tokens(&self) -> bool {
+        match self.model_name.as_deref() {
+            Some(name) => {
+                let lower = name.to_ascii_lowercase();
+                !(lower.contains("ettin")
+                    || lower.contains("modernbert")
+                    || lower.contains("modern-bert"))
+            }
+            None => true,
+        }
+    }
 }
 
 impl Default for GlinerConfig {

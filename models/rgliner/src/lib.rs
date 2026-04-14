@@ -243,7 +243,7 @@ impl Gliner {
 
         let tokenizer =
             Tokenizer::from_bytes(&tokenizer_bytes).map_err(GlinerLoadingError::LoadTokenizer)?;
-        let word_tokenizer = WordTokenizer::new(tokenizer);
+        let word_tokenizer = WordTokenizer::new(tokenizer, config.should_add_special_tokens());
 
         // Download main model weights
         let model_source = format!("Text Encoder ({})", source.model);

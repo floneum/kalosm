@@ -23,12 +23,22 @@ pub struct TokenizedText {
 /// Word-level tokenizer wrapper.
 pub struct WordTokenizer {
     tokenizer: Tokenizer,
+    add_special_tokens: bool,
 }
 
 impl WordTokenizer {
-    /// Create a new word tokenizer from a HuggingFace tokenizer.
-    pub fn new(tokenizer: Tokenizer) -> Self {
-        Self { tokenizer }
+    /// Create a tokenizer.
+    ///
+    /// `add_special_tokens` controls whether the tokenizer's post-processor is
+    /// applied. Set to `false` for encoders whose Python counterpart strips
+    /// [CLS]/[SEP] from the post-processor (ModernBERT/ettin have
+    /// `add_bos_token=False` because they lack bos/eos tokens — see GLiNER's
+    /// `_set_tokenizer_spec_tokens`).
+    pub fn new(tokenizer: Tokenizer, add_special_tokens: bool) -> Self {
+        Self {
+            tokenizer,
+            add_special_tokens,
+        }
     }
 
     /// Tokenize text and track word boundaries.
@@ -40,7 +50,7 @@ impl WordTokenizer {
 
         let encoding = self
             .tokenizer
-            .encode(words, true)
+            .encode(words, self.add_special_tokens)
             .map_err(GlinerError::Tokenizer)?;
 
         let token_ids = encoding.get_ids().to_vec();
