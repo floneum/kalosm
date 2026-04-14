@@ -23,14 +23,11 @@ async fn main() -> anyhow::Result<()> {
 
     println!("Model loaded!");
 
-    let labels = ["person", "organization", "location"];
+    let labels = ["person", "award", "date", "competitions", "teams"];
 
-    // Test with multiple texts to see if the issue is consistent
+    // The Ronaldo paragraph from the v2.0 model card (short strings score poorly on v2.0).
     let texts = [
-        "Apple Inc. was founded by Steve Jobs in California.",
-        "Microsoft Corporation is headquartered in Seattle.",
-        "Elon Musk is the CEO of Tesla.",
-        "Google was founded in Mountain View.",
+        "Cristiano Ronaldo dos Santos Aveiro (Portuguese pronunciation: [kɾiʃˈtjɐnu ʁɔˈnaldu]; born 5 February 1985) is a Portuguese professional footballer who plays as a forward for and captains both Saudi Pro League club Al Nassr and the Portugal national team.",
     ];
 
     for text in texts {

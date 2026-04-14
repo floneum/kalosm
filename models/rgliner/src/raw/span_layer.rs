@@ -24,8 +24,6 @@ pub struct SpanLayer {
     out_fc2: Linear<f32>,
     /// Maximum span width
     max_width: usize,
-    /// Hidden dimension
-    hidden_dim: usize,
 }
 
 impl SpanLayer {
@@ -71,8 +69,6 @@ impl SpanLayer {
             )
         })?;
 
-        let hidden_dim = out_fc2.out_features();
-
         Ok(Self {
             start_fc1,
             start_fc2,
@@ -81,13 +77,7 @@ impl SpanLayer {
             out_fc1,
             out_fc2,
             max_width,
-            hidden_dim,
         })
-    }
-
-    /// Get the maximum span width.
-    pub fn max_width(&self) -> usize {
-        self.max_width
     }
 
     /// Enumerate all valid spans up to max_width.

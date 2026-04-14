@@ -3,7 +3,7 @@
 use fusor::layers::LayerNorm;
 use fusor::{Device, Result, Tensor, VarBuilder};
 
-use super::attention::DisentangledSelfAttention;
+use super::attention::{DisentangledSelfAttention, GatherIndices};
 use super::feed_forward::MDebertaFeedForward;
 
 /// A single mDeBERTa transformer layer.
@@ -47,22 +47,19 @@ impl MDebertaLayer {
     /// # Arguments
     /// * `hidden_states` - Input [batch, seq_len, hidden_size]
     /// * `rel_pos_emb` - Relative position embedding table [2*max_pos, hidden_size]
-    /// * `rel_pos_indices` - Relative position indices [seq_len, seq_len]
+    /// * `gather_idx` - Precomputed flat indices for the c2p / p2c gathers.
     /// * `attention_mask` - Optional attention mask [batch, seq_len]
     pub fn forward_with_rel(
         &self,
         hidden_states: &Tensor<3, f32>,
         rel_pos_emb: &Tensor<2, f32>,
-        rel_pos_indices: &Tensor<2, u32>,
+        gather_idx: &GatherIndices,
         attention_mask: Option<&Tensor<2, u32>>,
     ) -> Tensor<3, f32> {
         // Self-attention + residual + norm
-        let attn_output = self.attention.forward_with_rel(
-            hidden_states,
-            rel_pos_emb,
-            rel_pos_indices,
-            attention_mask,
-        );
+        let attn_output =
+            self.attention
+                .forward_with_rel(hidden_states, rel_pos_emb, gather_idx, attention_mask);
         let hidden_states = self
             .attention_norm
             .forward(&hidden_states.add_(&attn_output));

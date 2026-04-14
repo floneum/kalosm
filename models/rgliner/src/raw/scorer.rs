@@ -43,20 +43,3 @@ impl Scorer {
             .to_concrete()
     }
 }
-
-/// Apply sigmoid to raw scores in Rust (not on GPU).
-///
-/// # Arguments
-/// * `logits` - Raw logit scores
-///
-/// # Returns
-/// Probability scores (0.0 to 1.0)
-#[inline]
-pub fn sigmoid(x: f32) -> f32 {
-    1.0 / (1.0 + (-x).exp())
-}
-
-/// Apply sigmoid to a slice of logits.
-pub fn apply_sigmoid(logits: &[f32]) -> Vec<f32> {
-    logits.iter().map(|&x| sigmoid(x)).collect()
-}

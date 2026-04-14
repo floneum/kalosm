@@ -12,8 +12,6 @@ pub struct TokenizedText {
     pub token_ids: Vec<u32>,
     /// Attention mask (1 for real tokens, 0 for padding).
     pub attention_mask: Vec<u32>,
-    /// Maps each token position to its word index (-1 for special tokens).
-    pub token_to_word: Vec<i32>,
     /// Index of the first token for each word.
     pub word_first_token: Vec<usize>,
     /// Number of words in the input.
@@ -31,12 +29,6 @@ impl WordTokenizer {
     /// Create a new word tokenizer from a HuggingFace tokenizer.
     pub fn new(tokenizer: Tokenizer) -> Self {
         Self { tokenizer }
-    }
-
-    /// Load tokenizer from JSON bytes.
-    pub fn from_bytes(bytes: &[u8]) -> Result<Self, tokenizers::Error> {
-        let tokenizer = Tokenizer::from_bytes(bytes)?;
-        Ok(Self::new(tokenizer))
     }
 
     /// Tokenize text and track word boundaries.
@@ -58,21 +50,12 @@ impl WordTokenizer {
             .map(|&x| x as u32)
             .collect();
 
-        // Build token-to-word mapping
-        // word_ids() returns Option<usize> for each token
-        let token_to_word: Vec<i32> = encoding
-            .get_word_ids()
-            .iter()
-            .map(|opt| opt.map(|w| w as i32).unwrap_or(-1))
-            .collect();
-
+        // Build token-to-word mapping to find the first token for each word.
         let num_words = word_offsets.len();
-
-        // Find first token index for each word
         let mut word_first_token = vec![0usize; num_words];
         let mut seen_words = vec![false; num_words];
-        for (token_idx, &word_id) in token_to_word.iter().enumerate() {
-            if word_id >= 0 {
+        for (token_idx, opt) in encoding.get_word_ids().iter().enumerate() {
+            if let Some(word_id) = *opt {
                 let word_id = word_id as usize;
                 if !seen_words[word_id] {
                     word_first_token[word_id] = token_idx;
@@ -84,16 +67,10 @@ impl WordTokenizer {
         Ok(TokenizedText {
             token_ids,
             attention_mask,
-            token_to_word,
             word_first_token,
             num_words,
             word_offsets,
         })
-    }
-
-    /// Tokenize a batch of texts.
-    pub fn tokenize_batch(&self, texts: &[&str]) -> Result<Vec<TokenizedText>, GlinerError> {
-        texts.iter().map(|text| self.tokenize(text)).collect()
     }
 }
 

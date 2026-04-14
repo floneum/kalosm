@@ -10,6 +10,19 @@
 use fusor::layers::{LayerNorm, Linear};
 use fusor::{Device, Result, Tensor, VarBuilder};
 
+/// Precomputed flat index tensors for the c2p and p2c gathers, valid for a
+/// single `(b_sz, num_heads, seq_len)` combination. Built once per forward in
+/// [`MDebertaModel::forward`] and threaded through every layer.
+pub struct GatherIndices {
+    /// Flat source indices for c2p, shape `[b_sz * num_heads * seq_len * seq_len]`.
+    pub(crate) c2p: Tensor<1, u32>,
+    /// Flat source indices for p2c, shape `[b_sz * num_heads * seq_len * seq_len]`.
+    pub(crate) p2c: Tensor<1, u32>,
+    pub(crate) b_sz: usize,
+    pub(crate) num_heads: usize,
+    pub(crate) seq_len: usize,
+}
+
 /// Relative position embeddings for disentangled attention.
 pub struct RelativePositionEmbedding {
     /// Relative position embedding table [2*max_pos, hidden_size]
@@ -73,43 +86,77 @@ impl RelativePositionEmbedding {
         }
     }
 
-    /// Compute relative position indices for a sequence.
-    /// Returns indices [seq_len, seq_len] where each entry is the relative position
-    /// index into the embedding table.
+    /// Number of entries (`2 * max_relative_positions`) in the relative
+    /// position embedding table — this is the per-head "position dimension" of
+    /// the `c2p_all` / `p2c_all` attention scores before gathering.
+    pub fn num_positions(&self) -> usize {
+        self.embeddings.shape()[0]
+    }
+
+    /// Build the flat index tensors used to gather `c2p_all` and `p2c_all`
+    /// along the last two dims in a single on-device `index_select`.
     ///
-    /// Matches Python: rel_pos_ids = q_ids[:,None] - k_ids[None,:] = i - j
-    /// Then applies log bucketing with bucket_size=2*max_relative_positions (pos_ebd_size*2),
-    /// max_position = 2*max_relative_positions... actually:
-    /// - bucket_size = position_buckets = 256 (pos_ebd_size)
-    /// - max_position = max_relative_positions = 512
-    pub fn compute_relative_indices(&self, seq_len: usize, device: &Device) -> Tensor<2, u32> {
-        // Python: bucket_size = position_buckets = 256, max_position = max_relative_positions = 512
-        // att_span = pos_ebd_size = 256 (= bucket_size)
-        // The position embedding table has 2*pos_ebd_size = 512 entries
-        // After bucketing, rel_pos ranges in [-(pos_ebd_size), pos_ebd_size-1] approximately
-        // c2p_pos = clamp(rel_pos + att_span, 0, 2*att_span-1) -> [0, 2*pos_ebd_size-1]
-        let bucket_size = self.max_relative_positions as i32; // 256 (pos_ebd_size)
-        let max_position = 2 * bucket_size; // 512 (2*pos_ebd_size = max_relative_positions)
-        let att_span = bucket_size; // 256
-        let num_positions = (2 * att_span) as i32; // 512
+    /// The gather semantics are:
+    ///   c2p_out[b, h, i, j] = c2p_all[b, h, i, indices[i, j]]
+    ///   p2c_out[b, h, i, j] = p2c_all[b, h, j, indices[i, j]]
+    ///
+    /// `indices[i, j]` is the DeBERTa log-bucketed relative position index. We
+    /// bake the `(b, h, i|j)` outer offsets into a single 1D `u32` tensor of
+    /// length `b_sz * num_heads * seq_len * seq_len`, so each gather becomes:
+    ///   source.reshape([b*h*s*p]).index_select(0, flat_idx).reshape([b,h,s,s])
+    pub fn compute_gather_indices(
+        &self,
+        b_sz: usize,
+        num_heads: usize,
+        seq_len: usize,
+        device: &Device,
+    ) -> GatherIndices {
+        let num_pos = self.num_positions();
+        let bucket_size = self.max_relative_positions as i32;
+        let max_position = 2 * bucket_size;
+        let att_span = bucket_size;
+        let num_positions_i = (2 * att_span) as i32;
 
-        let mut indices = vec![0u32; seq_len * seq_len];
-
+        // Raw relative-position indices, [seq_len, seq_len].
+        let mut rel = vec![0u32; seq_len * seq_len];
         for i in 0..seq_len {
             for j in 0..seq_len {
-                // Python: rel_pos = q - k = i - j
                 let rel_pos = i as i32 - j as i32;
-                // Apply log bucketing
                 let bucketed = Self::make_log_bucket_position(rel_pos, bucket_size, max_position);
-                // Shift to positive index: c2p_pos = clamp(bucketed + att_span, 0, 2*att_span-1)
-                let idx = (bucketed + att_span).clamp(0, num_positions - 1) as u32;
-                indices[i * seq_len + j] = idx;
+                let idx = (bucketed + att_span).clamp(0, num_positions_i - 1) as u32;
+                rel[i * seq_len + j] = idx;
             }
         }
 
-        Tensor::new(device, &indices)
-            .reshape([seq_len, seq_len])
-            .to_concrete()
+        let total = b_sz * num_heads * seq_len * seq_len;
+        let mut c2p = vec![0u32; total];
+        let mut p2c = vec![0u32; total];
+        for b in 0..b_sz {
+            for h in 0..num_heads {
+                let bh_offset = ((b * num_heads + h) * seq_len) * num_pos;
+                for i in 0..seq_len {
+                    let row_offset_c2p = bh_offset + i * num_pos;
+                    for j in 0..seq_len {
+                        let rel_idx = rel[i * seq_len + j] as usize;
+                        // c2p: key dim = i
+                        c2p[((b * num_heads + h) * seq_len + i) * seq_len + j] =
+                            (row_offset_c2p + rel_idx.min(num_pos - 1)) as u32;
+                        // p2c: key dim = j (different row offset)
+                        let row_offset_p2c = bh_offset + j * num_pos;
+                        p2c[((b * num_heads + h) * seq_len + i) * seq_len + j] =
+                            (row_offset_p2c + rel_idx.min(num_pos - 1)) as u32;
+                    }
+                }
+            }
+        }
+
+        GatherIndices {
+            c2p: Tensor::new(device, &c2p),
+            p2c: Tensor::new(device, &p2c),
+            b_sz,
+            num_heads,
+            seq_len,
+        }
     }
 
     /// Get the raw relative position embedding table (normalized).
@@ -172,13 +219,13 @@ impl MDebertaAttention {
     /// # Arguments
     /// * `hidden_states` - Input [batch, seq_len, hidden_size]
     /// * `rel_pos_emb` - Relative position embedding table [2*max_pos, hidden_size]
-    /// * `rel_pos_indices` - Relative position indices [seq_len, seq_len]
+    /// * `gather_idx` - Precomputed flat indices for the c2p / p2c gathers.
     /// * `attention_mask` - Optional attention mask [batch, seq_len]
     pub fn forward_with_indices(
         &self,
         hidden_states: &Tensor<3, f32>,
         rel_pos_emb: &Tensor<2, f32>,
-        rel_pos_indices: &Tensor<2, u32>,
+        gather_idx: &GatherIndices,
         attention_mask: Option<&Tensor<2, u32>>,
     ) -> Tensor<3, f32> {
         use super::super::utils::split_heads;
@@ -222,13 +269,13 @@ impl MDebertaAttention {
         // c2p = Q @ pos_key^T -> [batch, heads, seq, 2*max_pos]
         // Then gather based on relative positions
         let c2p_all = query.mat_mul(&pos_key.transpose(2, 3));
-        let c2p_scores = self.gather_c2p(&c2p_all, rel_pos_indices);
+        let c2p_scores = gather_by_flat_index(&c2p_all, gather_idx, &gather_idx.c2p);
 
         // === Position-to-Content attention ===
         // p2c = K @ pos_query^T -> [batch, heads, seq, 2*max_pos]
         // Then gather based on transposed relative positions
         let p2c_all = key.mat_mul(&pos_query.transpose(2, 3));
-        let p2c_scores = self.gather_p2c(&p2c_all, rel_pos_indices);
+        let p2c_scores = gather_by_flat_index(&p2c_all, gather_idx, &gather_idx.p2c);
 
         // Combine: attention = (c2c + c2p + p2c) * scale
         let attn_scores = c2c_scores
@@ -254,105 +301,24 @@ impl MDebertaAttention {
         let context = super::super::utils::merge_heads(&context);
         self.output.forward(&context)
     }
+}
 
-    /// Gather c2p attention scores based on relative position indices.
-    ///
-    /// Input: c2p_all [batch, heads, seq_len, 2*max_pos] - scores to all positions
-    /// rel_pos_indices: [seq_len, seq_len] - index into position embeddings
-    ///
-    /// Output: [batch, heads, seq_len, seq_len] - gathered scores
-    fn gather_c2p(
-        &self,
-        c2p_all: &Tensor<4, f32>,
-        rel_pos_indices: &Tensor<2, u32>,
-    ) -> Tensor<4, f32> {
-        let [b_sz, num_heads, seq_len, _num_pos] = c2p_all.shape();
-        let device = c2p_all.device();
-
-        // Get data slices
-        let c2p_data = pollster::block_on(c2p_all.clone().as_slice()).unwrap();
-        let indices_data = pollster::block_on(rel_pos_indices.clone().as_slice()).unwrap();
-        let c2p = c2p_data.as_slice();
-        let indices = indices_data.as_slice();
-        let num_pos = _num_pos;
-
-        let mut gathered = vec![0.0f32; b_sz * num_heads * seq_len * seq_len];
-
-        for b in 0..b_sz {
-            for h in 0..num_heads {
-                for i in 0..seq_len {
-                    for j in 0..seq_len {
-                        // Index into c2p_all: [b, h, i, rel_pos[i,j]]
-                        let rel_idx = indices[i * seq_len + j] as usize;
-                        let c2p_idx = b * num_heads * seq_len * num_pos
-                            + h * seq_len * num_pos
-                            + i * num_pos
-                            + rel_idx;
-                        let out_idx = b * num_heads * seq_len * seq_len
-                            + h * seq_len * seq_len
-                            + i * seq_len
-                            + j;
-                        gathered[out_idx] = c2p[c2p_idx];
-                    }
-                }
-            }
-        }
-
-        Tensor::new(&device, &gathered)
-            .reshape([b_sz, num_heads, seq_len, seq_len])
-            .to_concrete()
-    }
-
-    /// Gather p2c attention scores.
-    ///
-    /// Python derivation:
-    /// - r_pos = relative_pos (since seq_q == seq_k)
-    /// - p2c_pos[i,j] = clamp(-r_pos[i,j] + att_span, 0, 2*att_span-1)
-    ///   = clamp(-(i-j) + att_span) = clamp((j-i) + att_span)
-    /// - gather_out[b, m, n] = p2c_att[b, m, p2c_pos[m, n]]
-    /// - final[b, i, j] = gather_out[b, j, i] (after transpose)
-    ///   = p2c_att[b, j, p2c_pos[j, i]]
-    ///   = p2c_att[b, j, clamp(i - j + att_span)]
-    ///   = p2c_all[b, j, indices[i, j]]  (using indices[i,j] = bucketed(i-j) + att_span)
-    fn gather_p2c(
-        &self,
-        p2c_all: &Tensor<4, f32>,
-        rel_pos_indices: &Tensor<2, u32>,
-    ) -> Tensor<4, f32> {
-        let [b_sz, num_heads, seq_len, num_pos] = p2c_all.shape();
-        let device = p2c_all.device();
-
-        let p2c_data = pollster::block_on(p2c_all.clone().as_slice()).unwrap();
-        let indices_data = pollster::block_on(rel_pos_indices.clone().as_slice()).unwrap();
-        let p2c = p2c_data.as_slice();
-        let indices = indices_data.as_slice();
-
-        let mut gathered = vec![0.0f32; b_sz * num_heads * seq_len * seq_len];
-
-        for b in 0..b_sz {
-            for h in 0..num_heads {
-                for i in 0..seq_len {
-                    for j in 0..seq_len {
-                        // final[b, i, j] = p2c_all[b, j, indices[i, j]]
-                        let rel_idx = (indices[i * seq_len + j] as usize).min(num_pos - 1);
-                        let p2c_idx = b * num_heads * seq_len * num_pos
-                            + h * seq_len * num_pos
-                            + j * num_pos  // key dim = j
-                            + rel_idx;
-                        let out_idx = b * num_heads * seq_len * seq_len
-                            + h * seq_len * seq_len
-                            + i * seq_len
-                            + j;
-                        gathered[out_idx] = p2c[p2c_idx];
-                    }
-                }
-            }
-        }
-
-        Tensor::new(&device, &gathered)
-            .reshape([b_sz, num_heads, seq_len, seq_len])
-            .to_concrete()
-    }
+/// On-device gather used by both c2p and p2c. `flat_idx` encodes the full
+/// `((b*H + h)*S + i_or_j) * P + rel[i, j]` source offset so that the gather
+/// reduces to flatten → `index_select` → reshape.
+fn gather_by_flat_index(
+    src: &Tensor<4, f32>,
+    shape: &GatherIndices,
+    flat_idx: &Tensor<1, u32>,
+) -> Tensor<4, f32> {
+    let [b, h, s, p] = src.shape();
+    debug_assert_eq!(b, shape.b_sz);
+    debug_assert_eq!(h, shape.num_heads);
+    debug_assert_eq!(s, shape.seq_len);
+    src.reshape([b * h * s * p])
+        .index_select(0, flat_idx)
+        .reshape([b, h, s, s])
+        .to_concrete()
 }
 
 /// Shared relative position embedding layer (used across all layers in DeBERTa).
@@ -371,19 +337,15 @@ impl DisentangledSelfAttention {
         Ok(Self { attention })
     }
 
-    /// Forward with relative position indices and embedding table.
+    /// Forward with precomputed gather indices and relative embedding table.
     pub fn forward_with_rel(
         &self,
         hidden_states: &Tensor<3, f32>,
         rel_pos_emb: &Tensor<2, f32>,
-        rel_pos_indices: &Tensor<2, u32>,
+        gather_idx: &GatherIndices,
         attention_mask: Option<&Tensor<2, u32>>,
     ) -> Tensor<3, f32> {
-        self.attention.forward_with_indices(
-            hidden_states,
-            rel_pos_emb,
-            rel_pos_indices,
-            attention_mask,
-        )
+        self.attention
+            .forward_with_indices(hidden_states, rel_pos_emb, gather_idx, attention_mask)
     }
 }

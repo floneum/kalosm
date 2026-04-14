@@ -141,11 +141,6 @@ impl LabelEncoder {
         })
     }
 
-    /// Get the output dimension.
-    pub fn output_dim(&self) -> usize {
-        self.output_dim
-    }
-
     #[cfg(test)]
     pub async fn debug_sentence_embeddings(
         &self,
@@ -289,20 +284,5 @@ impl CachedLabels {
     /// Create cached labels from precomputed embeddings.
     pub fn new(labels: Vec<String>, embeddings: Tensor<2, f32>) -> Self {
         Self { labels, embeddings }
-    }
-
-    /// Get the number of labels.
-    pub fn len(&self) -> usize {
-        self.labels.len()
-    }
-
-    /// Check if empty.
-    pub fn is_empty(&self) -> bool {
-        self.labels.is_empty()
-    }
-
-    /// Get label at index.
-    pub fn get_label(&self, idx: usize) -> Option<&str> {
-        self.labels.get(idx).map(|s| s.as_str())
     }
 }

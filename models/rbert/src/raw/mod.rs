@@ -16,8 +16,11 @@ mod self_output;
 use self_output::*;
 mod intermediate_layer;
 use intermediate_layer::*;
+/// mDeBERTa-v3 raw encoder.
 pub mod mdeberta;
+/// ModernBERT raw encoder.
 pub mod modern_bert;
+/// Qwen embedding model raw implementation.
 pub mod qwen;
 mod utils;
 
@@ -29,10 +32,14 @@ use fusor::{Device, Result, Tensor, VarBuilder};
 use serde::Deserialize;
 use std::fmt::Debug;
 
+/// Non-linear activation applied between the intermediate and output dense
+/// layers of each [`BertLayer`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum HiddenAct {
+    /// Gaussian Error Linear Unit.
     Gelu,
+    /// Rectified Linear Unit.
     Relu,
 }
 

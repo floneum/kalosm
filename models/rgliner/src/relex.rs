@@ -50,10 +50,8 @@ use tokenizers::Tokenizer;
 
 use crate::decoding::Entity;
 use crate::error::{GlinerError, GlinerLoadingError};
-use crate::raw::{
-    BiLstm, JointScorer, PairProjector, PromptRepLayer, RelationsRepLayer, SpanLayer,
-};
-use crate::relation_decoding::{Relation, RelationDecoder, RelationDecoderConfig};
+use crate::raw::{BiLstm, JointScorer, PairProjector, PromptRepLayer, SpanLayer};
+use crate::relation_decoding::Relation;
 use crate::relex_tokenization::{RelExTokenizer, SpecialTokenIds};
 use rbert::raw::MDebertaModel;
 
@@ -281,14 +279,10 @@ pub struct GlinerRelEx {
     scorer: Option<JointScorer>,
     /// Span representation layer
     span_layer: SpanLayer,
-    /// Relations representation layer (adjacency scoring)
-    relations_layer: RelationsRepLayer,
     /// Entity pair projector
     pair_projector: PairProjector,
     /// Tokenizer with special token handling
     tokenizer: Arc<RelExTokenizer>,
-    /// Relation decoder
-    relation_decoder: RelationDecoder,
     /// How entities are scored (derived from `gliner.span_mode` metadata).
     span_mode: SpanMode,
     /// Device
@@ -416,19 +410,8 @@ impl GlinerRelEx {
         // Load span layer
         let span_layer = SpanLayer::load(&device, &mut vb, config.max_width)?;
 
-        // Load relations layer (may not exist, use projection from pair_proj)
-        let relations_layer = RelationsRepLayer::load(&device, &mut vb.pp("relations"))
-            .unwrap_or_else(|_| RelationsRepLayer::identity(&device, config.hidden_size));
-
         // Load pair projector
         let pair_projector = PairProjector::load(&device, &mut vb.pp("pair_proj"))?;
-
-        // Create relation decoder
-        let relation_decoder = RelationDecoder::with_config(RelationDecoderConfig {
-            entity_threshold: config.entity_threshold,
-            adjacency_threshold: config.adjacency_threshold,
-            relation_threshold: config.relation_threshold,
-        });
 
         Ok(Self {
             encoder,
@@ -436,10 +419,8 @@ impl GlinerRelEx {
             prompt_rep_layer,
             scorer,
             span_layer,
-            relations_layer,
             pair_projector,
             tokenizer: Arc::new(relex_tokenizer),
-            relation_decoder,
             span_mode,
             device,
             config,
@@ -504,7 +485,7 @@ impl GlinerRelEx {
         let entities = match self.span_mode {
             SpanMode::TokenLevel => {
                 let scorer = self.scorer.as_ref().expect("token_level requires scorer");
-                let token_scores = scorer.forward_entity_scores(&text_embs, &ent_embs_2d).await;
+                let token_scores = scorer.forward_entity_scores(&text_embs, &ent_embs_2d);
                 self.decode_entities_from_tokens(
                     &token_scores,
                     entity_labels,
@@ -826,21 +807,6 @@ impl GlinerRelEx {
         let gathered = hidden_2d.index_select(0, &index_tensor);
 
         gathered.unsqueeze(0).to_concrete()
-    }
-
-    /// Build a tensor from entity embeddings.
-    fn build_entity_tensor(&self, embeddings: &[Vec<f32>], device: &Device) -> Tensor<3, f32> {
-        let num_entities = embeddings.len();
-        if num_entities == 0 || embeddings[0].is_empty() {
-            return Tensor::zeros(device, [1, 1, self.config.hidden_size]);
-        }
-
-        let hidden_size = embeddings[0].len();
-        let flat: Vec<f32> = embeddings.iter().flatten().copied().collect();
-
-        Tensor::new(device, &flat)
-            .reshape([1, num_entities, hidden_size])
-            .to_concrete()
     }
 
     /// Get the device.

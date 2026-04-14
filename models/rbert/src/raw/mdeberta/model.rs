@@ -92,17 +92,22 @@ impl MDebertaModel {
         let _enter = self.span.enter();
         let [_batch_size, seq_len] = input_ids.shape();
 
+        let [b_sz, _] = input_ids.shape();
         let hidden_states = self.token_embeddings.forward(input_ids);
         let mut hidden_states = self.embedding_norm.forward(&hidden_states);
 
-        let rel_indices = self
-            .rel_pos_embedding
-            .compute_relative_indices(seq_len, &self.device);
+        // Compute the flat gather indices once per forward; every layer shares them.
+        let gather_idx = self.rel_pos_embedding.compute_gather_indices(
+            b_sz,
+            self.config.num_heads,
+            seq_len,
+            &self.device,
+        );
         let rel_pos_emb = self.rel_pos_embedding.get_embeddings();
 
         for layer in &self.layers {
             hidden_states =
-                layer.forward_with_rel(&hidden_states, &rel_pos_emb, &rel_indices, attention_mask);
+                layer.forward_with_rel(&hidden_states, &rel_pos_emb, &gather_idx, attention_mask);
         }
 
         if let Some(ref proj) = self.output_proj {

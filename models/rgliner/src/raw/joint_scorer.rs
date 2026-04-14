@@ -54,7 +54,7 @@ impl JointScorer {
     /// 2. Split each projection into two halves (first, second)
     /// 3. MLP input = concat(token_first, label_first, token_second * label_second)
     /// 4. This enables complex token-label interactions through the element-wise product
-    pub async fn forward(
+    pub fn forward(
         &self,
         token_embs: &Tensor<3, f32>,
         label_embs: &Tensor<2, f32>,
@@ -62,74 +62,55 @@ impl JointScorer {
         let [batch_size, seq_len, _hidden_dim] = token_embs.shape();
         let [n_labels, _] = label_embs.shape();
 
-        // Project both token and label embeddings
-        // token: [batch, seq, hidden] -> [batch, seq, hidden*2]
+        // Project tokens: [batch, seq, hidden] -> [batch, seq, 2*half]
         let proj_tokens = self.proj_token.forward(token_embs);
         let [_, _, proj_dim] = proj_tokens.shape();
-        let half_proj = proj_dim / 2;
+        let half = proj_dim / 2;
 
-        // label: [n_labels, hidden] -> [n_labels, hidden*2]
+        // Project labels: [n_labels, hidden] -> [n_labels, 2*half]
         let label_embs_3d: Tensor<3, f32> = label_embs.unsqueeze(0).to_concrete();
         let proj_labels = self.proj_label.forward(&label_embs_3d);
         let proj_labels: Tensor<2, f32> = proj_labels.squeeze(0).to_concrete();
 
-        // Split and combine: token_first + label_first + (token_second * label_second)
-        // MLP input dimension = half_proj + half_proj + half_proj = 3 * half_proj
-        let mlp_input_dim = 3 * half_proj;
+        // Split projections into first/second halves along the feature dim.
+        let tokens_first = proj_tokens.narrow(2, 0, half).to_concrete(); // [b, s, half]
+        let tokens_second = proj_tokens.narrow(2, half, half).to_concrete(); // [b, s, half]
+        let labels_first = proj_labels.narrow(1, 0, half).to_concrete(); // [n, half]
+        let labels_second = proj_labels.narrow(1, half, half).to_concrete(); // [n, half]
 
-        // Get raw data slices (without expansion - we'll handle broadcast manually)
-        // proj_tokens shape: [batch, seq, proj_dim]
-        // proj_labels shape: [n_labels, proj_dim]
-        let tokens_data = proj_tokens.clone().as_slice().await.unwrap();
-        let labels_data = proj_labels.clone().as_slice().await.unwrap();
-
-        let tokens_slice = tokens_data.as_slice(); // [batch * seq * proj_dim]
-        let labels_slice = labels_data.as_slice(); // [n_labels * proj_dim]
-
-        // Build combined features with manual broadcasting
-        // Output: [batch, seq, n_labels, mlp_input_dim]
-        let total_elements = batch_size * seq_len * n_labels;
-        let mut combined_data = vec![0.0f32; total_elements * mlp_input_dim];
-
-        for b in 0..batch_size {
-            for s in 0..seq_len {
-                for l in 0..n_labels {
-                    // Token features for (b, s): at index (b * seq_len + s) * proj_dim
-                    let tok_base = (b * seq_len + s) * proj_dim;
-                    // Label features for l: at index l * proj_dim
-                    let lab_base = l * proj_dim;
-                    // Output index for (b, s, l)
-                    let out_idx = (b * seq_len * n_labels + s * n_labels + l) * mlp_input_dim;
-
-                    // token_first (first half of token projection)
-                    for i in 0..half_proj {
-                        combined_data[out_idx + i] = tokens_slice[tok_base + i];
-                    }
-                    // label_first (first half of label projection)
-                    for i in 0..half_proj {
-                        combined_data[out_idx + half_proj + i] = labels_slice[lab_base + i];
-                    }
-                    // element-wise product of second halves
-                    for i in 0..half_proj {
-                        let tok_second = tokens_slice[tok_base + half_proj + i];
-                        let lab_second = labels_slice[lab_base + half_proj + i];
-                        combined_data[out_idx + 2 * half_proj + i] = tok_second * lab_second;
-                    }
-                }
-            }
-        }
-
-        let device = token_embs.device();
-        let combined: Tensor<3, f32> = Tensor::new(&device, &combined_data)
-            .reshape([1, total_elements, mlp_input_dim])
+        // Broadcast to [batch, seq, n_labels, half] and build the three concatenation parts:
+        //   [token_first, label_first, token_second * label_second]
+        let target = [batch_size, seq_len, n_labels, half];
+        let tok_first_4d: Tensor<4, f32> =
+            tokens_first.unsqueeze(2).broadcast_as(target).to_concrete();
+        let tok_second_4d: Tensor<4, f32> = tokens_second
+            .unsqueeze(2)
+            .broadcast_as(target)
+            .to_concrete();
+        let lab_first_4d: Tensor<4, f32> = labels_first
+            .unsqueeze(0)
+            .unsqueeze(0)
+            .broadcast_as(target)
+            .to_concrete();
+        let lab_second_4d: Tensor<4, f32> = labels_second
+            .unsqueeze(0)
+            .unsqueeze(0)
+            .broadcast_as(target)
             .to_concrete();
 
-        // Apply MLP: fc1 -> ReLU -> fc2
-        let hidden = self.out_fc1.forward(&combined);
-        let hidden = hidden.relu();
-        let output = self.out_fc2.forward(&hidden);
+        let prod_4d: Tensor<4, f32> = (tok_second_4d * lab_second_4d).to_concrete();
 
-        // Reshape back: [batch, seq, n_labels, 3]
+        // Concat along the last dim -> [batch, seq, n_labels, 3*half]
+        let combined: Tensor<4, f32> = Tensor::cat([tok_first_4d, lab_first_4d, prod_4d], 3);
+
+        // Linear::forward takes 3D input, so fold (batch, seq, n_labels) into one dim.
+        let mlp_in_dim = 3 * half;
+        let flat: Tensor<3, f32> = combined
+            .reshape([1, batch_size * seq_len * n_labels, mlp_in_dim])
+            .to_concrete();
+
+        let hidden = self.out_fc1.forward(&flat).relu();
+        let output = self.out_fc2.forward(&hidden);
         output
             .reshape([batch_size, seq_len, n_labels, 3])
             .to_concrete()
@@ -142,22 +123,17 @@ impl JointScorer {
     ///
     /// The 3 channels are: [start, end, inside] (NOT OBI).
     /// Each channel is passed through independent sigmoid.
-    pub async fn forward_entity_scores(
+    pub fn forward_entity_scores(
         &self,
         token_embs: &Tensor<3, f32>,
         label_embs: &Tensor<2, f32>,
     ) -> Tensor<4, f32> {
-        let logits = self.forward(token_embs, label_embs).await;
-        let logits_data = logits.clone().as_slice().await.unwrap();
-
-        // Apply sigmoid to each value independently (NOT softmax).
-        let data = logits_data.as_slice();
-        let sigmoid_data: Vec<f32> = data.iter().map(|&x| 1.0 / (1.0 + (-x).exp())).collect();
-
-        let device = logits.device();
-        Tensor::new(&device, &sigmoid_data)
-            .reshape(logits.shape())
-            .to_concrete()
+        let logits = self.forward(token_embs, label_embs);
+        // sigmoid(x) = 0.5 * (tanh(x / 2) + 1); stays on-device and avoids needing
+        // scalar-left division or a `recip` primitive.
+        let half_logits: Tensor<4, f32> = (logits * 0.5f32).to_concrete();
+        let tanh = half_logits.tanh();
+        ((tanh + 1.0f32) * 0.5f32).to_concrete()
     }
 }
 
@@ -176,22 +152,6 @@ impl PromptRepLayer {
         let fc2 = Linear::load(device, &mut vb.pp("3"))?;
 
         Ok(Self { fc1, fc2 })
-    }
-
-    /// Project label embeddings.
-    ///
-    /// # Arguments
-    /// * `label_embs` - Label embeddings from encoder [n_labels, hidden]
-    ///
-    /// # Returns
-    /// Projected embeddings [n_labels, hidden]
-    pub fn forward(&self, label_embs: &Tensor<2, f32>) -> Tensor<2, f32> {
-        // Wrap as 3D for Linear::forward
-        let label_3d: Tensor<3, f32> = label_embs.unsqueeze(0).to_concrete();
-        let hidden = self.fc1.forward(&label_3d);
-        let hidden = hidden.relu();
-        let output = self.fc2.forward(&hidden);
-        output.squeeze(0).to_concrete()
     }
 
     /// Forward for 3D tensor [batch, n_labels, hidden].

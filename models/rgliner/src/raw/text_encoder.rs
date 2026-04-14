@@ -44,26 +44,6 @@ impl TextEncoder {
         }
     }
 
-    /// Get the maximum sequence length.
-    pub fn max_seq_len(&self) -> usize {
-        self.model.max_seq_len()
-    }
-
-    /// Get the embedding dimension seen by downstream layers (post-projection
-    /// if this variant has one, otherwise the raw encoder hidden dim).
-    pub fn embedding_dim(&self) -> usize {
-        if let Some(ref proj) = self.output_proj {
-            proj.out_features()
-        } else {
-            self.model.embedding_dim()
-        }
-    }
-
-    /// Get the device.
-    pub fn device(&self) -> &Device {
-        self.model.device()
-    }
-
     #[cfg(test)]
     pub fn debug_hidden_states(
         &self,
