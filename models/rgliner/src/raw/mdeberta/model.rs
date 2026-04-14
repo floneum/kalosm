@@ -3,7 +3,7 @@
 #[cfg(debug_assertions)]
 use pollster;
 
-use fusor::layers::{Embedding, LayerNorm};
+use fusor::layers::{Embedding, LayerNorm, Linear};
 use fusor::{Device, Result, Tensor, VarBuilder};
 
 use super::attention::RelativePositionEmbedding;
@@ -23,6 +23,10 @@ pub struct MDebertaModel {
     rel_pos_embedding: RelativePositionEmbedding,
     /// Transformer layers
     layers: Vec<MDebertaLayer>,
+    /// Optional encoder output projection (used by the `large` variants to
+    /// map the encoder's 1024-dim hidden state down to the 768-dim space
+    /// expected by the downstream heads). Absent on base/multi variants.
+    output_proj: Option<Linear<f32>>,
     /// Device
     device: Device,
     /// Configuration
@@ -64,11 +68,25 @@ impl MDebertaModel {
             layers.push(layer);
         }
 
+        // Optional post-encoder projection (only present on the large variants,
+        // which use DeBERTa-v3-large at 1024-dim and project down to 768).
+        let output_proj = Linear::load(device, &mut vb.pp("output_proj")).ok();
+
+        #[cfg(debug_assertions)]
+        if let Some(ref p) = output_proj {
+            eprintln!(
+                "[DEBUG] Encoder output projection loaded: {} -> {}",
+                p.in_features(),
+                p.out_features()
+            );
+        }
+
         Ok(Self {
             token_embeddings,
             embedding_norm,
             rel_pos_embedding,
             layers,
+            output_proj,
             device: device.clone(),
             config,
         })
@@ -147,10 +165,26 @@ impl MDebertaModel {
             let slice = data.as_slice();
             let mean: f32 = slice.iter().sum::<f32>() / slice.len() as f32;
             let std: f32 = (slice.iter().map(|x| (x - mean).powi(2)).sum::<f32>() / slice.len() as f32).sqrt();
-            eprintln!("[DEBUG] Encoder output: mean={:.6}, std={:.6}", mean, std);
+            eprintln!("[DEBUG] Encoder output (pre-projection): mean={:.6}, std={:.6}", mean, std);
         }
 
-        // Return last layer output directly (no final LayerNorm on hidden states)
+        // Apply optional post-encoder projection (large variants).
+        if let Some(ref proj) = self.output_proj {
+            hidden_states = proj.forward(&hidden_states);
+
+            #[cfg(debug_assertions)]
+            {
+                let data = pollster::block_on(hidden_states.clone().as_slice()).unwrap();
+                let slice = data.as_slice();
+                let mean: f32 = slice.iter().sum::<f32>() / slice.len() as f32;
+                let std: f32 = (slice.iter().map(|x| (x - mean).powi(2)).sum::<f32>() / slice.len() as f32).sqrt();
+                eprintln!(
+                    "[DEBUG] Encoder output (post-projection): mean={:.6}, std={:.6}",
+                    mean, std
+                );
+            }
+        }
+
         hidden_states
     }
 

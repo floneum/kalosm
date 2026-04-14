@@ -26,13 +26,37 @@ pub struct SpecialTokenIds {
 
 impl Default for SpecialTokenIds {
     fn default() -> Self {
+        // Defaults match mdeberta-v3-base (used by gliner-relex-multi-v1.0).
+        // For other variants (deberta-v3-base/large), use
+        // `SpecialTokenIds::from_tokenizer` to resolve the IDs dynamically.
         Self {
-            cls_id: 1,            // [CLS] token
-            sep_id: 2,            // [SEP] token (end-of-sequence)
-            pad_id: 0,            // [PAD] token
-            ent_id: 250102,       // <<ENT>> token
-            rel_id: 250104,       // <<REL>> token
-            inner_sep_id: 250103, // <<SEP>> token (internal separator)
+            cls_id: 1,
+            sep_id: 2,
+            pad_id: 0,
+            ent_id: 250102,
+            rel_id: 250104,
+            inner_sep_id: 250103,
+        }
+    }
+}
+
+impl SpecialTokenIds {
+    /// Resolve IDs by querying the tokenizer for each special token.
+    ///
+    /// This handles vocab differences between variants (e.g. multi vs base/large
+    /// where `<<ENT>>` is id 250102 vs 128001). Falls back to the corresponding
+    /// field in `fallback` if the tokenizer doesn't contain a particular token.
+    pub fn from_tokenizer(tokenizer: &tokenizers::Tokenizer, fallback: Self) -> Self {
+        let lookup = |tok: &str, default: u32| -> u32 {
+            tokenizer.token_to_id(tok).unwrap_or(default)
+        };
+        Self {
+            cls_id: lookup("[CLS]", fallback.cls_id),
+            sep_id: lookup("[SEP]", fallback.sep_id),
+            pad_id: lookup("[PAD]", fallback.pad_id),
+            ent_id: lookup("<<ENT>>", fallback.ent_id),
+            rel_id: lookup("<<REL>>", fallback.rel_id),
+            inner_sep_id: lookup("<<SEP>>", fallback.inner_sep_id),
         }
     }
 }

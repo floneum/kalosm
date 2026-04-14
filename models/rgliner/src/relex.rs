@@ -75,14 +75,34 @@ pub struct GlinerRelExSource {
 impl GlinerRelExSource {
     /// GLiNER-RelEx Multi v1.0 source.
     ///
-    /// Downloads the GGUF-converted weights from HuggingFace. Tokenizer and
-    /// config are embedded in the GGUF file.
+    /// Multilingual variant built on `mdeberta-v3-base` with `span_mode = token_level`.
+    /// Downloads the GGUF-converted weights from HuggingFace.
+    ///
+    /// Tokenizer and config are embedded in the GGUF file.
     pub fn relex_multi() -> Self {
         Self {
             model: FileSource::huggingface(
                 "knowledgator/gliner-relex-multi-v1.0-gguf".to_string(),
                 "main".to_string(),
                 "gliner-relex-multi-v1.0-Q8_0.gguf".to_string(),
+            ),
+            tokenizer: None,
+            config: None,
+        }
+    }
+
+    /// GLiNER-RelEx Base v1.0 source.
+    ///
+    /// English-only variant built on `deberta-v3-base` with `span_mode = token_level`.
+    /// Smaller than the multilingual variant but limited to English text.
+    ///
+    /// Tokenizer and config are embedded in the GGUF file.
+    pub fn relex_base() -> Self {
+        Self {
+            model: FileSource::huggingface(
+                "knowledgator/gliner-relex-base-v1.0-gguf".to_string(),
+                "main".to_string(),
+                "gliner-relex-base-v1.0-Q8_0.gguf".to_string(),
             ),
             tokenizer: None,
             config: None,
@@ -217,6 +237,17 @@ impl GlinerRelExBuilder {
     }
 }
 
+/// Span-scoring modes supported by the Rust inference path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SpanMode {
+    /// Per-token BIO-style output (`[start, end, inside]` sigmoids per (token, label)).
+    /// Used by the `multi` and `base` variants.
+    TokenLevel,
+    /// Per-span scoring: enumerate all spans up to `max_width`, score each against
+    /// the projected entity prompts. Used by the `large` variants.
+    MarkerV0,
+}
+
 /// GLiNER-RelEx model for joint NER and relation extraction.
 pub struct GlinerRelEx {
     /// mDeBERTa encoder
@@ -225,8 +256,8 @@ pub struct GlinerRelEx {
     bilstm: BiLstm,
     /// Prompt representation layer for label projection
     prompt_rep_layer: PromptRepLayer,
-    /// Joint scorer for token-level predictions
-    scorer: JointScorer,
+    /// Joint scorer for token-level predictions (None for markerV0 variants).
+    scorer: Option<JointScorer>,
     /// Span representation layer
     span_layer: SpanLayer,
     /// Relations representation layer (adjacency scoring)
@@ -237,6 +268,8 @@ pub struct GlinerRelEx {
     tokenizer: Arc<RelExTokenizer>,
     /// Relation decoder
     relation_decoder: RelationDecoder,
+    /// How entities are scored (derived from `gliner.span_mode` metadata).
+    span_mode: SpanMode,
     /// Device
     device: Device,
     /// Configuration
@@ -290,6 +323,24 @@ impl GlinerRelEx {
         let mut vb = VarBuilder::from_gguf(&mut model_cursor)
             .map_err(|err| GlinerLoadingError::LoadModel(fusor::Error::from(err)))?;
 
+        // Determine span mode to pick the right decoder path. Supported modes
+        // are `token_level` (base/multi) and `markerV0` (large).
+        let span_mode_str = vb
+            .get_metadata("gliner.span_mode")
+            .and_then(|v| v.to_string().ok())
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| "token_level".to_string());
+        let span_mode = match span_mode_str.as_str() {
+            "token_level" => SpanMode::TokenLevel,
+            "markerV0" => SpanMode::MarkerV0,
+            other => {
+                return Err(GlinerLoadingError::LoadModel(fusor::Error::msg(format!(
+                    "Unsupported gliner.span_mode '{other}'. \
+                     Supported values: 'token_level', 'markerV0'."
+                ))));
+            }
+        };
+
         // Resolve tokenizer: explicit override > embedded metadata.
         let tokenizer_bytes: Vec<u8> = if let Some(tokenizer_src) = source.tokenizer.as_ref() {
             let tok_label = format!("Tokenizer ({})", tokenizer_src);
@@ -316,7 +367,17 @@ impl GlinerRelEx {
 
         let tokenizer =
             Tokenizer::from_bytes(&tokenizer_bytes).map_err(GlinerLoadingError::LoadTokenizer)?;
-        let relex_tokenizer = RelExTokenizer::with_special_tokens(tokenizer, config.special_tokens.clone());
+        // Resolve special tokens from the tokenizer so we pick up the right IDs
+        // regardless of variant (multi uses 250102/250103/250104, base/large
+        // use 128001/128002/128003). Falls back to the user-supplied IDs.
+        let mut effective_config = config;
+        effective_config.special_tokens =
+            SpecialTokenIds::from_tokenizer(&tokenizer, effective_config.special_tokens);
+        let relex_tokenizer = RelExTokenizer::with_special_tokens(
+            tokenizer,
+            effective_config.special_tokens.clone(),
+        );
+        let config = effective_config;
 
         // Load encoder (mDeBERTa)
         let encoder = MDebertaModel::load(&device, &mut vb.pp("text"))?;
@@ -328,7 +389,10 @@ impl GlinerRelEx {
         let prompt_rep_layer = PromptRepLayer::load(&device, &mut vb.pp("prompt_rep_layer"))?;
 
         // Load joint scorer
-        let scorer = JointScorer::load(&device, &mut vb.pp("scorer"))?;
+        let scorer = match span_mode {
+            SpanMode::TokenLevel => Some(JointScorer::load(&device, &mut vb.pp("scorer"))?),
+            SpanMode::MarkerV0 => None,
+        };
 
         // Load span layer
         let span_layer = SpanLayer::load(&device, &mut vb, config.max_width)?;
@@ -357,6 +421,7 @@ impl GlinerRelEx {
             pair_projector,
             tokenizer: Arc::new(relex_tokenizer),
             relation_decoder,
+            span_mode,
             device,
             config,
         })
@@ -512,17 +577,34 @@ impl GlinerRelEx {
                       text_slice.iter().cloned().fold(f32::NEG_INFINITY, f32::max));
         }
 
-        // 7. Score tokens against entity labels using joint scorer
+        // 7–8. Decode entities using the mode matching the trained head.
         let ent_embs_2d: Tensor<2, f32> = ent_embs.squeeze(0).to_concrete();
-        let token_scores = self.scorer.forward_entity_scores(&text_embs, &ent_embs_2d).await;
-
-        // 8. Decode entities from token-level scores
-        let entities = self.decode_entities_from_tokens(
-            &token_scores,
-            entity_labels,
-            &tokenized.word_offsets,
-            text,
-        ).await?;
+        let entities = match self.span_mode {
+            SpanMode::TokenLevel => {
+                let scorer = self.scorer.as_ref().expect("token_level requires scorer");
+                let token_scores = scorer
+                    .forward_entity_scores(&text_embs, &ent_embs_2d)
+                    .await;
+                self.decode_entities_from_tokens(
+                    &token_scores,
+                    entity_labels,
+                    &tokenized.word_offsets,
+                    text,
+                )
+                .await?
+            }
+            SpanMode::MarkerV0 => {
+                self.decode_entities_marker_v0(
+                    &text_embs,
+                    &ent_embs_2d,
+                    entity_labels,
+                    &tokenized.word_offsets,
+                    tokenized.num_words,
+                    text,
+                )
+                .await?
+            }
+        };
 
         // If no entities or no relation labels, return early
         if entities.len() < 2 || relation_labels.is_empty() {
@@ -640,6 +722,103 @@ impl GlinerRelEx {
         relations.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
 
         Ok((entities, relations))
+    }
+
+    /// Decode entities for `span_mode = markerV0` (used by the `large` variants).
+    ///
+    /// Enumerates every `(start, end)` pair up to `config.max_width` words,
+    /// computes the span representation via `SpanLayer::forward_for_spans`,
+    /// scores each span against every projected entity prompt via a dot
+    /// product, applies sigmoid + `entity_threshold`, and greedy-filters
+    /// overlapping spans (keeping the highest-scoring one).
+    async fn decode_entities_marker_v0(
+        &self,
+        text_embs: &Tensor<3, f32>,
+        ent_embs_2d: &Tensor<2, f32>,
+        entity_labels: &[&str],
+        word_offsets: &[(usize, usize)],
+        num_words: usize,
+        text: &str,
+    ) -> Result<Vec<Entity>, GlinerError> {
+        let threshold = self.config.entity_threshold;
+        let max_width = self.config.max_width;
+        let hidden = self.config.hidden_size;
+        let n_labels = entity_labels.len();
+
+        if num_words == 0 || n_labels == 0 {
+            return Ok(Vec::new());
+        }
+
+        // Enumerate spans: (start, end) with end-start+1 <= max_width.
+        let mut spans: Vec<(usize, usize)> = Vec::new();
+        for start in 0..num_words {
+            for width in 1..=max_width.min(num_words - start) {
+                spans.push((start, start + width - 1));
+            }
+        }
+
+        // Compute span reps [num_spans, hidden].
+        let span_reps = self
+            .span_layer
+            .forward_for_spans(text_embs, &spans, &self.device);
+
+        // Score: [num_spans, hidden] @ [hidden, n_labels] -> [num_spans, n_labels].
+        let label_rep_t: Tensor<2, f32> = ent_embs_2d.transpose(0, 1).to_concrete();
+        let logits = span_reps.mat_mul(&label_rep_t);
+
+        let logits_data = logits.clone().as_slice().await?;
+        let logits_slice = logits_data.as_slice();
+
+        #[cfg(debug_assertions)]
+        eprintln!(
+            "[DEBUG] markerV0 decoding: {} spans x {} labels, threshold={}",
+            spans.len(),
+            n_labels,
+            threshold,
+        );
+
+        // Candidate (start, end, label, score) above threshold.
+        let mut candidates: Vec<(usize, usize, usize, f32)> = Vec::new();
+        for (span_idx, &(s, e)) in spans.iter().enumerate() {
+            for l in 0..n_labels {
+                let raw = logits_slice[span_idx * n_labels + l];
+                let prob = 1.0 / (1.0 + (-raw).exp());
+                if prob >= threshold {
+                    candidates.push((s, e, l, prob));
+                }
+            }
+        }
+
+        // Sort by score descending and greedy non-overlapping filter.
+        candidates.sort_by(|a, b| b.3.partial_cmp(&a.3).unwrap_or(std::cmp::Ordering::Equal));
+
+        let mut taken: Vec<(usize, usize)> = Vec::new();
+        let mut entities = Vec::new();
+        for (s, e, l, score) in candidates {
+            let overlap = taken.iter().any(|&(a, b)| !(e < a || s > b));
+            if overlap {
+                continue;
+            }
+            taken.push((s, e));
+            if s < word_offsets.len() && e < word_offsets.len() {
+                let (start_char, _) = word_offsets[s];
+                let (_, end_char) = word_offsets[e];
+                entities.push(Entity {
+                    text: text[start_char..end_char].to_string(),
+                    label: entity_labels[l].to_string(),
+                    start_char,
+                    end_char,
+                    start_word: s,
+                    end_word: e,
+                    score,
+                });
+            }
+        }
+
+        // Ensure output is sorted by score descending for presentation.
+        entities.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+        let _ = hidden;
+        Ok(entities)
     }
 
     /// Decode entities using span-boundary detection with start/end/inside scores.

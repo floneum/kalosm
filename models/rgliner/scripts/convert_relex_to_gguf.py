@@ -197,6 +197,10 @@ def map_relex_weight_name(pytorch_name: str) -> str:
     """Map PyTorch weight names to GGUF conventions for GLiNER-RelEx."""
     name = pytorch_name
 
+    # ===== Encoder output projection (large variants: 1024 -> 768) =====
+    name = name.replace("token_rep_layer.projection.weight", "text.output_proj.weight")
+    name = name.replace("token_rep_layer.projection.bias", "text.output_proj.bias")
+
     # ===== mDeBERTa Encoder (token_rep_layer.bert_layer.model.*) =====
     name = name.replace("token_rep_layer.bert_layer.model.embeddings.word_embeddings.weight", "text.token_embd.weight")
     name = name.replace("token_rep_layer.bert_layer.model.embeddings.LayerNorm.weight", "text.embd_norm.weight")
