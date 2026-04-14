@@ -289,6 +289,12 @@ def map_weight_name(pytorch_name: str) -> str:
     """Map PyTorch weight names to GGUF conventions."""
     name = pytorch_name
 
+    # ===== Encoder output projection =====
+    # Some bi-encoder variants (small/base/large v2.0) project the text-encoder
+    # hidden state down to the shared label-aligned dim (e.g. 512 -> 384).
+    name = name.replace("token_rep_layer.projection.weight", "text.output_proj.weight")
+    name = name.replace("token_rep_layer.projection.bias", "text.output_proj.bias")
+
     # ===== Text Encoder (ModernBERT/Ettin) =====
     # token_rep_layer.bert_layer.model.embeddings.tok_embeddings.weight -> text.token_embd.weight
     name = name.replace("token_rep_layer.bert_layer.model.embeddings.tok_embeddings.weight", "text.token_embd.weight")
@@ -353,6 +359,52 @@ def map_weight_name(pytorch_name: str) -> str:
     return name
 
 
+def _llama_quantize(f32_path: str, output_path: str, quant_type: str, keep_f32: List[str]) -> None:
+    """Run `llama-quantize` to convert an f32 GGUF to a k-quant type.
+
+    `keep_f32` is a list of tensor names that should remain at F32 (tiny
+    classifier heads hit a fusor bug; see the gliner-relex project notes).
+    """
+    binary = shutil.which("llama-quantize")
+    if binary is None:
+        raise RuntimeError(
+            "`llama-quantize` not found in PATH. Install llama.cpp to use k-quant types:\n"
+            "    brew install llama.cpp        # macOS\n"
+            "    or build from https://github.com/ggml-org/llama.cpp"
+        )
+    cmd = [binary]
+    for name in keep_f32:
+        cmd += ["--tensor-type", f"{name}=f32"]
+    cmd += [f32_path, output_path, quant_type.upper()]
+    print(f"\n$ {' '.join(cmd)}")
+    result = subprocess.run(cmd)
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"llama-quantize failed (exit {result.returncode}) for {quant_type!r}. "
+            f"See output above. The f32 GGUF was kept at {f32_path} for inspection."
+        )
+
+
+def _quantize_tensor(data: np.ndarray, quant: str, default_ggml_type: int) -> Tuple[np.ndarray, int, Tuple[int, ...]]:
+    """Quantise a single tensor, falling back to F32 for unsupported shapes.
+
+    Returns (packed_data, ggml_type, logical_shape). Applies the same rules as
+    the relex converter: only 2-D+ tensors with inner dim divisible by 32 and
+    outer dim >= 32 are block-quantised. The lower outer-dim threshold avoids
+    a fusor quantised-matmul bug on tiny classifier heads.
+    """
+    logical_shape = tuple(data.shape)
+    MIN_OUT_DIM_FOR_QUANT = 32
+    if (
+        quant.startswith("q")
+        and data.ndim >= 2
+        and data.shape[-1] % 32 == 0
+        and data.shape[0] >= MIN_OUT_DIM_FOR_QUANT
+    ):
+        return _gguf_block_quant(data, quant), default_ggml_type, logical_shape
+    return np.ascontiguousarray(data, dtype=np.float32), GGML_TYPE_F32, logical_shape
+
+
 def convert_gliner_to_gguf(
     model_id: str,
     output_path: str,
@@ -374,15 +426,39 @@ def convert_gliner_to_gguf(
     for name, tensor in state_dict.items():
         print(f"  {name}: {tensor.shape} {tensor.dtype}")
 
-    # Determine quantization type
-    if quantize == "f32":
-        ggml_type = GGML_TYPE_F32
-    elif quantize == "f16":
-        ggml_type = GGML_TYPE_F16
-    elif quantize == "bf16":
-        ggml_type = GGML_TYPE_BF16
-    else:
-        raise ValueError(f"Unsupported quantization: {quantize}")
+    # Determine quantization type and post-processing
+    quantize = quantize.lower()
+    if quantize not in QUANT_TYPES:
+        raise ValueError(
+            f"Unsupported quantization: {quantize!r}. Supported: {', '.join(sorted(QUANT_TYPES))}"
+        )
+    post_quant = None
+    if quantize in LLAMA_QUANT_TYPES:
+        post_quant = quantize
+        quantize = "f32"
+    default_ggml_type = _ggml_type_for(quantize)
+
+    # When post-quantising, write the raw f32 file to a temp path first.
+    main_label_output = output_path.replace(".gguf", "-label-encoder.gguf")
+    final_main = output_path
+    final_label = main_label_output
+    if post_quant is not None:
+        main_tmp = tempfile.NamedTemporaryFile(
+            prefix=os.path.basename(output_path).rsplit(".", 1)[0] + ".f32.",
+            suffix=".gguf",
+            delete=False,
+            dir=os.path.dirname(os.path.abspath(output_path)) or None,
+        )
+        label_tmp = tempfile.NamedTemporaryFile(
+            prefix=os.path.basename(main_label_output).rsplit(".", 1)[0] + ".f32.",
+            suffix=".gguf",
+            delete=False,
+            dir=os.path.dirname(os.path.abspath(main_label_output)) or None,
+        )
+        output_path = main_tmp.name
+        main_label_output = label_tmp.name
+        main_tmp.close()
+        label_tmp.close()
 
     # Separate label encoder weights from main model weights
     label_encoder_weights = {}
@@ -397,8 +473,11 @@ def convert_gliner_to_gguf(
     # ============ Main Model GGUF ============
     writer = GGUFWriter(output_path)
 
-    # Add metadata
-    writer.add_metadata("general.architecture", "gliner")
+    # Add metadata. Masquerade as `bert` when we'll feed this to llama-quantize
+    # so its loader accepts the custom architecture. rgliner reads `gliner.*`
+    # keys, not `general.architecture`.
+    main_arch = "bert" if post_quant is not None else "gliner"
+    writer.add_metadata("general.architecture", main_arch)
     writer.add_metadata("general.name", model_id.split("/")[-1])
     writer.add_metadata("general.quantization_version", 2)
 
@@ -428,8 +507,17 @@ def convert_gliner_to_gguf(
     writer.add_metadata("gliner.attention.layer_norm_rms_epsilon", 1e-5)
     writer.add_metadata("gliner.vocab_size", vocab_size)
 
+    # When feeding to llama-quantize, mirror arch keys with u32 scalars.
+    if post_quant is not None:
+        writer.add_metadata("bert.context_length", _U32(context_length))
+        writer.add_metadata("bert.embedding_length", _U32(hidden_size))
+        writer.add_metadata("bert.feed_forward_length", _U32(intermediate_size))
+        writer.add_metadata("bert.block_count", _U32(num_layers))
+        writer.add_metadata("bert.attention.head_count", _U32(num_heads))
+        writer.add_metadata("bert.attention.layer_norm_epsilon", 1e-5)
+
     # Convert main model tensors
-    print(f"\nConverting {len(main_model_weights)} main model tensors to GGUF...")
+    print(f"\nConverting {len(main_model_weights)} main model tensors to GGUF ({quantize.upper()})...")
 
     for pytorch_name, tensor in main_model_weights.items():
         gguf_name = map_weight_name(pytorch_name)
@@ -445,8 +533,9 @@ def convert_gliner_to_gguf(
                 dtype=np.float32
             ).reshape(t.shape)
 
-        print(f"  {pytorch_name} -> {gguf_name} {data.shape}")
-        writer.add_tensor(gguf_name, data, ggml_type)
+        packed, tensor_type, logical_shape = _quantize_tensor(data, quantize, default_ggml_type)
+        print(f"  {pytorch_name} -> {gguf_name} {logical_shape}  [{_name_for_type(tensor_type)}]")
+        writer.add_tensor(gguf_name, packed, tensor_type, shape=logical_shape)
 
     writer.write()
     print(f"Main model output: {output_path}")
@@ -454,7 +543,7 @@ def convert_gliner_to_gguf(
 
     # ============ Label Encoder GGUF ============
     # Create separate file for label encoder (without prefix, for rbert compatibility)
-    label_output_path = output_path.replace(".gguf", "-label-encoder.gguf")
+    label_output_path = main_label_output
     label_writer = GGUFWriter(label_output_path)
 
     # Add BERT metadata
@@ -469,16 +558,18 @@ def convert_gliner_to_gguf(
     label_vocab = labels_config.get("vocab_size", 30522)
     label_max_pos = labels_config.get("max_position_embeddings", 512)
 
-    label_writer.add_metadata("bert.attention.head_count", label_heads)
-    label_writer.add_metadata("bert.block_count", label_layers)
-    label_writer.add_metadata("bert.embedding_length", label_hidden)
-    label_writer.add_metadata("bert.feed_forward_length", label_intermediate)
-    label_writer.add_metadata("bert.context_length", label_max_pos)
+    # Use u32 for arch-scoped ints when we'll feed this through llama-quantize.
+    int_ctor = _U32 if post_quant is not None else (lambda x: x)
+    label_writer.add_metadata("bert.attention.head_count", int_ctor(label_heads))
+    label_writer.add_metadata("bert.block_count", int_ctor(label_layers))
+    label_writer.add_metadata("bert.embedding_length", int_ctor(label_hidden))
+    label_writer.add_metadata("bert.feed_forward_length", int_ctor(label_intermediate))
+    label_writer.add_metadata("bert.context_length", int_ctor(label_max_pos))
     label_writer.add_metadata("bert.attention.layer_norm_epsilon", 1e-12)
-    label_writer.add_metadata("bert.vocab_size", label_vocab)
+    label_writer.add_metadata("bert.vocab_size", int_ctor(label_vocab))
 
     # Convert label encoder tensors (remove prefix so rbert can load them)
-    print(f"\nConverting {len(label_encoder_weights)} label encoder tensors to GGUF...")
+    print(f"\nConverting {len(label_encoder_weights)} label encoder tensors to GGUF ({quantize.upper()})...")
 
     for pytorch_name, tensor in label_encoder_weights.items():
         # Map name but remove the "label." prefix for rbert compatibility
@@ -496,12 +587,32 @@ def convert_gliner_to_gguf(
                 dtype=np.float32
             ).reshape(t.shape)
 
-        print(f"  {pytorch_name} -> {gguf_name} {data.shape}")
-        label_writer.add_tensor(gguf_name, data, ggml_type)
+        packed, tensor_type, logical_shape = _quantize_tensor(data, quantize, default_ggml_type)
+        print(f"  {pytorch_name} -> {gguf_name} {logical_shape}  [{_name_for_type(tensor_type)}]")
+        label_writer.add_tensor(gguf_name, packed, tensor_type, shape=logical_shape)
 
     label_writer.write()
     print(f"Label encoder output: {label_output_path}")
     print(f"Size: {os.path.getsize(label_output_path) / 1024 / 1024:.2f} MB")
+
+    if post_quant is not None:
+        print(f"\nQuantizing main model to {post_quant.upper()} via llama-quantize...")
+        _llama_quantize(output_path, final_main, post_quant, keep_f32=[])
+        try:
+            os.remove(output_path)
+        except OSError:
+            pass
+        print(f"Final main output: {final_main}")
+        print(f"Final main size:   {os.path.getsize(final_main) / 1024 / 1024:.2f} MB")
+
+        print(f"\nQuantizing label encoder to {post_quant.upper()} via llama-quantize...")
+        _llama_quantize(label_output_path, final_label, post_quant, keep_f32=[])
+        try:
+            os.remove(label_output_path)
+        except OSError:
+            pass
+        print(f"Final label output: {final_label}")
+        print(f"Final label size:   {os.path.getsize(final_label) / 1024 / 1024:.2f} MB")
 
     print(f"\nConversion complete!")
 
@@ -524,8 +635,13 @@ def main():
         "--quantize", "-q",
         type=str,
         default="f32",
-        choices=["f32", "f16", "bf16"],
-        help="Quantization type (default: f32)"
+        choices=sorted(QUANT_TYPES),
+        help=(
+            "Quantization type (default: f32). "
+            "Block quants (q4_0, q5_0, q8_0, ...) are packed in-process via the "
+            "`gguf` Python package. K-quants (q4_k, q5_k, q6_k, ...) require "
+            "`llama-quantize` in PATH and are applied as a post-processing step."
+        ),
     )
     parser.add_argument(
         "--cache-dir",

@@ -49,7 +49,8 @@ use std::sync::{Arc, RwLock};
 use tokenizers::{Encoding, PaddingDirection, PaddingParams, Tokenizer};
 
 mod language_model;
-mod raw;
+/// Low-level encoder implementations (standard BERT, Qwen, ModernBERT, mDeBERTa-v3).
+pub mod raw;
 mod source;
 
 pub use crate::language_model::*;

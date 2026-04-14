@@ -15,7 +15,11 @@ async fn main() -> anyhow::Result<()> {
         GlinerSource::edge()
     };
 
-    let mut gliner = Gliner::builder().with_source(source).build().await?;
+    let mut gliner = Gliner::builder()
+        .with_source(source)
+        .with_threshold(0.01)
+        .build()
+        .await?;
 
     println!("Model loaded!");
 

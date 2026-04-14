@@ -86,7 +86,7 @@ mod tokenization;
 pub use config::GlinerConfig;
 pub use decoding::{Decoder, DecodingMode, Entity};
 pub use error::{GlinerError, GlinerLoadingError};
-pub use raw::modern_bert::{ModernBertConfig, ModernBertModel};
+pub use rbert::raw::{ModernBertConfig, ModernBertModel};
 pub use source::GlinerSource;
 
 use fusor::{Device, Tensor, VarBuilder};

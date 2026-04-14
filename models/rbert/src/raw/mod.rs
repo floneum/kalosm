@@ -16,8 +16,12 @@ mod self_output;
 use self_output::*;
 mod intermediate_layer;
 use intermediate_layer::*;
+pub mod mdeberta;
+pub mod modern_bert;
 pub mod qwen;
 
+pub use mdeberta::{MDebertaConfig, MDebertaModel};
+pub use modern_bert::{ModernBertConfig, ModernBertModel};
 pub use qwen::QwenEmbeddingModel;
 
 use fusor::{Device, Result, Tensor, VarBuilder};

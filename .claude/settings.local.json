@@ -30,7 +30,14 @@
       "Bash(git stash:*)",
       "Bash(FILTER_BRANCH_SQUELCH_WARNING=1 git filter-branch -f --index-filter 'git rm --cached --ignore-unmatch models/rgliner/weights/gliner-relex-multi-v1.0.gguf' d6d5c674..HEAD)",
       "Bash(git ls-tree:*)",
-      "Bash(git push:*)"
+      "Bash(git push:*)",
+      "WebFetch(domain:dioxuslabs.com)",
+      "Bash(cp /Users/evanalmloff/Desktop/Github/ner/models/rgliner/src/raw/modern_bert/*.rs /Users/evanalmloff/Desktop/Github/ner/models/rbert/src/raw/modern_bert/)",
+      "Bash(cp /Users/evanalmloff/Desktop/Github/ner/models/rgliner/src/raw/mdeberta/*.rs /Users/evanalmloff/Desktop/Github/ner/models/rbert/src/raw/mdeberta/)",
+      "Bash(cargo tree:*)",
+      "Bash(r\" | head -20)",
+      "Read(//tmp/**)",
+      "Bash(cargo fmt:*)"
     ]
   }
 }

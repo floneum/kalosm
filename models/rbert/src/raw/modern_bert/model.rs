@@ -6,7 +6,9 @@ use fusor::{Device, Result, RopeCache, Tensor, VarBuilder};
 use super::config::ModernBertConfig;
 use super::layer::ModernBertLayer;
 
-/// ModernBERT encoder model (text encoder for GLiNER).
+/// A raw synchronous ModernBERT (Ettin) encoder model. This is a bidirectional
+/// transformer with RoPE positional embeddings, pre-normalization, and GeGLU
+/// feed-forward blocks.
 pub struct ModernBertModel {
     token_embeddings: Embedding<f32>,
     /// Embedding norm applied after token embeddings, before first layer
@@ -16,6 +18,7 @@ pub struct ModernBertModel {
     rope_cache: RopeCache,
     pub(crate) device: Device,
     config: ModernBertConfig,
+    span: tracing::Span,
 }
 
 impl ModernBertModel {
@@ -63,6 +66,7 @@ impl ModernBertModel {
             rope_cache,
             device: device.clone(),
             config,
+            span: tracing::span!(tracing::Level::TRACE, "modern-bert"),
         })
     }
 
@@ -74,6 +78,7 @@ impl ModernBertModel {
         input_ids: &Tensor<2, u32>,
         attention_mask: Option<&Tensor<2, u32>>,
     ) -> Tensor<3, f32> {
+        let _enter = self.span.enter();
         // Get token embeddings
         let hidden_states = self.token_embeddings.forward(input_ids);
 
@@ -104,12 +109,14 @@ impl ModernBertModel {
         &self.device
     }
 
-    #[cfg(test)]
+    /// Return the hidden state after each layer (for debugging / regression tests).
+    #[doc(hidden)]
     pub fn debug_hidden_states(
         &self,
         input_ids: &Tensor<2, u32>,
         attention_mask: Option<&Tensor<2, u32>>,
     ) -> Vec<Tensor<3, f32>> {
+        let _enter = self.span.enter();
         let mut states = Vec::with_capacity(self.layers.len() + 2);
 
         let hidden_states = self.token_embeddings.forward(input_ids);

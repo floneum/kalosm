@@ -50,12 +50,12 @@ use tokenizers::Tokenizer;
 
 use crate::decoding::Entity;
 use crate::error::{GlinerError, GlinerLoadingError};
-use crate::raw::mdeberta::MDebertaModel;
 use crate::raw::{
     BiLstm, JointScorer, PairProjector, PromptRepLayer, RelationsRepLayer, SpanLayer,
 };
 use crate::relation_decoding::{Relation, RelationDecoder, RelationDecoderConfig};
 use crate::relex_tokenization::{RelExTokenizer, SpecialTokenIds};
+use rbert::raw::MDebertaModel;
 
 /// Source configuration for GLiNER-RelEx models.
 ///

@@ -31,31 +31,25 @@ pub struct MDebertaConfig {
 
 impl MDebertaConfig {
     /// Load configuration from GGUF metadata.
-    ///
-    /// Note: GGUF metadata keys use "gliner." prefix regardless of VarBuilder scope,
-    /// since metadata is stored globally (not per-tensor).
     pub fn from_gguf(vb: &VarBuilder) -> Result<Self> {
-        // Metadata keys use "gliner." prefix (not the tensor prefix)
         let num_heads = vb
-            .get_metadata("gliner.attention.head_count")
+            .get_metadata(".attention.head_count")
             .and_then(|v| v.to_u32().ok())
             .ok_or_else(|| {
-                fusor::Error::msg("Missing required GGUF metadata: gliner.attention.head_count")
+                fusor::Error::msg("Missing required GGUF metadata: .attention.head_count")
             })? as usize;
 
         let num_layers = vb
-            .get_metadata("gliner.block_count")
+            .get_metadata(".block_count")
             .and_then(|v| v.to_u32().ok())
-            .ok_or_else(|| {
-                fusor::Error::msg("Missing required GGUF metadata: gliner.block_count")
-            })? as usize;
+            .ok_or_else(|| fusor::Error::msg("Missing required GGUF metadata: .block_count"))?
+            as usize;
 
         let hidden_size = vb
-            .get_metadata("gliner.embedding_length")
+            .get_metadata(".embedding_length")
             .and_then(|v| v.to_u32().ok())
-            .ok_or_else(|| {
-                fusor::Error::msg("Missing required GGUF metadata: gliner.embedding_length")
-            })? as usize;
+            .ok_or_else(|| fusor::Error::msg("Missing required GGUF metadata: .embedding_length"))?
+            as usize;
 
         if hidden_size % num_heads != 0 {
             return Err(fusor::Error::msg(format!(
@@ -64,45 +58,43 @@ impl MDebertaConfig {
         }
 
         let head_dimension = vb
-            .get_metadata("gliner.attention.key_length")
+            .get_metadata(".attention.key_length")
             .and_then(|v| v.to_u32().ok())
             .map(|x| x as usize)
             .unwrap_or_else(|| hidden_size / num_heads);
 
         let intermediate_size = vb
-            .get_metadata("gliner.feed_forward_length")
+            .get_metadata(".feed_forward_length")
             .and_then(|v| v.to_u32().ok())
             .unwrap_or((hidden_size * 4) as u32) as usize;
 
         let context_length = vb
-            .get_metadata("gliner.context_length")
+            .get_metadata(".context_length")
             .and_then(|v| v.to_u32().ok())
             .unwrap_or(512) as usize;
 
-        // DeBERTa-specific: maximum relative position distance
         let max_relative_positions = vb
-            .get_metadata("gliner.attention.max_relative_positions")
+            .get_metadata(".attention.max_relative_positions")
             .and_then(|v| v.to_u32().ok())
             .unwrap_or(512) as usize;
 
         let norm_eps = vb
-            .get_metadata("gliner.attention.layer_norm_epsilon")
+            .get_metadata(".attention.layer_norm_epsilon")
             .and_then(|v| v.to_f32().ok())
             .unwrap_or(1e-7);
 
         let vocab_size = vb
-            .get_metadata("gliner.vocab_size")
+            .get_metadata(".vocab_size")
             .and_then(|v| v.to_u32().ok())
             .unwrap_or(250105) as usize;
 
-        // DeBERTa-v3 specific: position buckets for relative position encoding
         let position_buckets = vb
-            .get_metadata("gliner.attention.position_buckets")
+            .get_metadata(".attention.position_buckets")
             .and_then(|v| v.to_u32().ok())
             .unwrap_or(256) as usize;
 
         let share_att_key = vb
-            .get_metadata("gliner.attention.share_att_key")
+            .get_metadata(".attention.share_att_key")
             .and_then(|v| v.to_bool().ok())
             .unwrap_or(true);
 

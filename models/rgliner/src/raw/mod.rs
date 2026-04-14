@@ -1,8 +1,5 @@
 //! Raw model implementations for GLiNER.
 
-pub mod mdeberta;
-pub mod modern_bert;
-
 mod bilstm;
 mod joint_scorer;
 mod label_encoder;

@@ -10,10 +10,9 @@ use super::attention::RelativePositionEmbedding;
 use super::config::MDebertaConfig;
 use super::layer::MDebertaLayer;
 
-/// mDeBERTa-v3 encoder model for GLiNER-RelEx.
-///
-/// This is a bidirectional transformer encoder using disentangled attention
-/// with relative position embeddings.
+/// A raw synchronous mDeBERTa-v3 encoder model. This is a bidirectional
+/// transformer encoder using disentangled attention with relative position
+/// embeddings (DeBERTa-v3 architecture).
 pub struct MDebertaModel {
     /// Token embeddings
     token_embeddings: Embedding<f32>,
@@ -31,6 +30,7 @@ pub struct MDebertaModel {
     device: Device,
     /// Configuration
     config: MDebertaConfig,
+    span: tracing::Span,
 }
 
 impl MDebertaModel {
@@ -89,6 +89,7 @@ impl MDebertaModel {
             output_proj,
             device: device.clone(),
             config,
+            span: tracing::span!(tracing::Level::TRACE, "mdeberta"),
         })
     }
 
@@ -105,6 +106,7 @@ impl MDebertaModel {
         input_ids: &Tensor<2, u32>,
         attention_mask: Option<&Tensor<2, u32>>,
     ) -> Tensor<3, f32> {
+        let _enter = self.span.enter();
         let [_batch_size, seq_len] = input_ids.shape();
 
         // Get token embeddings
