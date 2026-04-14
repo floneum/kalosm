@@ -82,9 +82,9 @@ impl GlinerRelExSource {
     pub fn relex_multi() -> Self {
         Self {
             model: FileSource::huggingface(
-                "knowledgator/gliner-relex-multi-v1.0-gguf".to_string(),
+                "Demonthos/gliner-gguf".to_string(),
                 "main".to_string(),
-                "gliner-relex-multi-v1.0-Q8_0.gguf".to_string(),
+                "gliner-relex-multi-v1.0-Q4_K.gguf".to_string(),
             ),
             tokenizer: None,
             config: None,
@@ -100,9 +100,9 @@ impl GlinerRelExSource {
     pub fn relex_base() -> Self {
         Self {
             model: FileSource::huggingface(
-                "knowledgator/gliner-relex-base-v1.0-gguf".to_string(),
+                "Demonthos/gliner-gguf".to_string(),
                 "main".to_string(),
-                "gliner-relex-base-v1.0-Q8_0.gguf".to_string(),
+                "gliner-relex-base-v1.0-Q4_K.gguf".to_string(),
             ),
             tokenizer: None,
             config: None,
@@ -119,9 +119,9 @@ impl GlinerRelExSource {
     pub fn relex_large() -> Self {
         Self {
             model: FileSource::huggingface(
-                "knowledgator/gliner-relex-large-v1.0-gguf".to_string(),
+                "Demonthos/gliner-gguf".to_string(),
                 "main".to_string(),
-                "gliner-relex-large-v1.0-Q8_0.gguf".to_string(),
+                "gliner-relex-large-v1.0-Q4_K.gguf".to_string(),
             ),
             tokenizer: None,
             config: None,
@@ -291,11 +291,8 @@ pub struct GlinerRelEx {
     config: GlinerRelExConfig,
 }
 
-fn default_device() -> Device {
-    std::panic::catch_unwind(Device::gpu_blocking)
-        .ok()
-        .and_then(Result::ok)
-        .unwrap_or_else(Device::cpu)
+async fn default_device() -> Device {
+    Device::gpu().await.unwrap_or_else(|_| Device::cpu())
 }
 
 impl GlinerRelEx {
@@ -331,7 +328,10 @@ impl GlinerRelEx {
             .await?;
 
         // Initialize device
-        let device = device.unwrap_or_else(default_device);
+        let device = match device {
+            Some(d) => d,
+            None => default_device().await,
+        };
 
         // Load model components from GGUF
         let mut model_cursor = std::io::Cursor::new(&model_bytes);

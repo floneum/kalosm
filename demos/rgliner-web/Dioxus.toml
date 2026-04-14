@@ -1,0 +1,5 @@
+[application]
+name = "rgliner-web"
+
+[web.app]
+title = "rgliner — GLiNER NER + Relation Extraction in your browser"

@@ -37,7 +37,8 @@
       "Bash(cargo tree:*)",
       "Bash(r\" | head -20)",
       "Read(//tmp/**)",
-      "Bash(cargo fmt:*)"
+      "Bash(cargo fmt:*)",
+      "Bash(dx:*)"
     ]
   }
 }

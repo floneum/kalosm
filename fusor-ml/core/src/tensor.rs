@@ -904,7 +904,7 @@ impl<D: DataType, const R: usize> Tensor<R, D> {
     where
         D: FloatDataType,
     {
-        #[cfg(debug_assertions)]
+        #[cfg(all(debug_assertions, not(target_arch = "wasm32")))]
         {
             use pollster::FutureExt as _;
             let as_slice = self.as_slice().block_on().unwrap();

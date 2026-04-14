@@ -93,24 +93,14 @@ use fusor::{Device, Tensor, VarBuilder};
 use kalosm_common::Cache;
 use kalosm_model_types::ModelLoadingProgress;
 use rbert::BertSource;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::Arc;
 use tokenizers::Tokenizer;
 
 use crate::raw::{CachedLabels, LabelEncoder, Scorer, SpanLayer, TextEncoder};
 use crate::tokenization::{first_subtoken_pooling, WordTokenizer};
 
-fn default_device() -> Device {
-    static PANIC_HOOK_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-
-    let lock = PANIC_HOOK_LOCK.get_or_init(|| Mutex::new(()));
-    let _guard = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-
-    let hook = std::panic::take_hook();
-    std::panic::set_hook(Box::new(|_| {}));
-    let result = std::panic::catch_unwind(Device::gpu_blocking);
-    std::panic::set_hook(hook);
-
-    result.ok().and_then(Result::ok).unwrap_or_else(Device::cpu)
+async fn default_device() -> Device {
+    Device::gpu().await.unwrap_or_else(|_| Device::cpu())
 }
 
 /// Builder for constructing a [`Gliner`] model.
@@ -266,7 +256,7 @@ impl Gliner {
         // Initialize device
         let device = match device {
             Some(device) => device,
-            None => default_device(),
+            None => default_device().await,
         };
 
         // Load text encoder

@@ -1,0 +1,234 @@
+:root {
+    --bg: #0b0d12;
+    --panel: #141821;
+    --panel-border: #232833;
+    --text: #e6e9ef;
+    --muted: #8b92a3;
+    --accent: #7aa7ff;
+    --accent-strong: #4a7fff;
+    --err: #ff6b6b;
+    --ok: #4ade80;
+    --radius: 8px;
+}
+
+* {
+    box-sizing: border-box;
+}
+
+body {
+    margin: 0;
+    font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    background: var(--bg);
+    color: var(--text);
+    line-height: 1.5;
+}
+
+.app {
+    max-width: 960px;
+    margin: 0 auto;
+    padding: 2rem 1.5rem 4rem;
+}
+
+header.site-header {
+    display: flex;
+    align-items: baseline;
+    justify-content: space-between;
+    gap: 1rem;
+    margin-bottom: 1.5rem;
+}
+
+header.site-header h1 {
+    font-size: 1.5rem;
+    margin: 0;
+}
+
+header.site-header .tag {
+    color: var(--muted);
+    font-size: 0.9rem;
+}
+
+header.site-header a {
+    color: var(--accent);
+    text-decoration: none;
+    font-size: 0.9rem;
+}
+
+.tabs {
+    display: flex;
+    gap: 0.25rem;
+    border-bottom: 1px solid var(--panel-border);
+    margin-bottom: 1.5rem;
+}
+
+.tab {
+    background: none;
+    border: none;
+    color: var(--muted);
+    padding: 0.6rem 1rem;
+    cursor: pointer;
+    font-size: 0.95rem;
+    border-bottom: 2px solid transparent;
+}
+
+.tab:hover {
+    color: var(--text);
+}
+
+.tab.active {
+    color: var(--text);
+    border-bottom-color: var(--accent);
+}
+
+.panel {
+    background: var(--panel);
+    border: 1px solid var(--panel-border);
+    border-radius: var(--radius);
+    padding: 1rem 1.25rem;
+    margin-bottom: 1rem;
+}
+
+.row {
+    display: flex;
+    gap: 0.75rem;
+    align-items: center;
+    flex-wrap: wrap;
+}
+
+label {
+    color: var(--muted);
+    font-size: 0.85rem;
+    display: block;
+    margin-bottom: 0.35rem;
+}
+
+input[type="text"],
+textarea,
+select {
+    background: #0f1218;
+    color: var(--text);
+    border: 1px solid var(--panel-border);
+    border-radius: 6px;
+    padding: 0.55rem 0.7rem;
+    font-family: inherit;
+    font-size: 0.95rem;
+    width: 100%;
+}
+
+textarea {
+    min-height: 110px;
+    resize: vertical;
+    font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, monospace;
+    font-size: 0.9rem;
+}
+
+select {
+    width: auto;
+    min-width: 220px;
+}
+
+button.primary,
+button.secondary {
+    background: var(--accent-strong);
+    color: white;
+    border: none;
+    border-radius: 6px;
+    padding: 0.55rem 1rem;
+    cursor: pointer;
+    font-size: 0.95rem;
+    font-weight: 500;
+}
+
+button.primary:hover:not(:disabled) {
+    background: var(--accent);
+}
+
+button.secondary {
+    background: transparent;
+    color: var(--text);
+    border: 1px solid var(--panel-border);
+}
+
+button:disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
+}
+
+.status {
+    font-size: 0.85rem;
+    color: var(--muted);
+}
+
+.status.ok {
+    color: var(--ok);
+}
+
+.status.err {
+    color: var(--err);
+}
+
+.err-banner {
+    background: rgba(255, 107, 107, 0.08);
+    border: 1px solid rgba(255, 107, 107, 0.4);
+    color: #ffb3b3;
+    padding: 0.75rem 1rem;
+    border-radius: 6px;
+    margin-bottom: 1rem;
+    font-size: 0.9rem;
+}
+
+.results {
+    line-height: 1.9;
+    font-size: 1rem;
+    word-wrap: break-word;
+}
+
+.entity {
+    border-radius: 4px;
+    padding: 0.05em 0.3em;
+    margin: 0 0.05em;
+    font-weight: 500;
+    color: #0b0d12;
+}
+
+.entity .chip {
+    font-size: 0.7em;
+    font-weight: 700;
+    padding: 0 0.35em;
+    margin-left: 0.3em;
+    border-radius: 3px;
+    background: rgba(0, 0, 0, 0.25);
+    color: #fff;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+}
+
+.entity-list,
+.relation-list {
+    margin-top: 1rem;
+    display: flex;
+    flex-direction: column;
+    gap: 0.35rem;
+}
+
+.entity-list li,
+.relation-list li {
+    list-style: none;
+    font-size: 0.9rem;
+    color: var(--muted);
+    font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, monospace;
+}
+
+.entity-list .label,
+.relation-list .label {
+    color: var(--text);
+    font-weight: 600;
+}
+
+.score {
+    color: var(--accent);
+}
+
+.muted {
+    color: var(--muted);
+    font-size: 0.85rem;
+}

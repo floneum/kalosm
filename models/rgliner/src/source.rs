@@ -84,23 +84,19 @@ impl GlinerSource {
         std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".cache").join("huggingface"))
     }
 
-    /// GLiNER bi-encoder v2.0 Edge variant (60M parameters).
+    fn demonthos_gguf(file: &str) -> FileSource {
+        Self::huggingface_or_cached("Demonthos/gliner-gguf", "main", file)
+    }
+
+    /// GLiNER bi-encoder v2.0 Edge variant (60M parameters, Q4_K).
     ///
     /// The smallest and fastest variant, using:
     /// - Text encoder: ettin-encoder-32m
     /// - Label encoder: all-MiniLM-L6-v2
     pub fn edge() -> Self {
         Self {
-            model: FileSource::huggingface(
-                "knowledgator/gliner-bi-edge-v2.0-gguf".to_string(),
-                "main".to_string(),
-                "gliner-bi-edge-v2.0-Q8_0.gguf".to_string(),
-            ),
-            label_encoder: FileSource::huggingface(
-                "knowledgator/gliner-bi-edge-v2.0-gguf".to_string(),
-                "main".to_string(),
-                "label-encoder-Q8_0.gguf".to_string(),
-            ),
+            model: Self::demonthos_gguf("gliner-bi-edge-v2.0-Q4_K.gguf"),
+            label_encoder: Self::demonthos_gguf("gliner-bi-edge-v2.0-Q4_K-label-encoder.gguf"),
             label_encoder_config: FileSource::huggingface(
                 "sentence-transformers/all-MiniLM-L6-v2".to_string(),
                 "main".to_string(),
@@ -124,171 +120,15 @@ impl GlinerSource {
         }
     }
 
-    /// Demonthos GLiNER GGUF edge upload.
-    ///
-    /// Uses the GGUF weights and sidecar tokenizer/config files from
-    /// `Demonthos/gliner-gguf`.
-    pub fn demonthos_edge() -> Self {
-        Self {
-            model: Self::huggingface_or_cached("Demonthos/gliner-gguf", "main", "gliner-edge.gguf"),
-            label_encoder: Self::huggingface_or_cached(
-                "Demonthos/gliner-gguf",
-                "main",
-                "gliner-edge-label-encoder.gguf",
-            ),
-            label_encoder_config: Self::huggingface_or_cached(
-                "Demonthos/gliner-gguf",
-                "main",
-                "edge-label-encoder-config.json",
-            ),
-            label_encoder_tokenizer: Self::huggingface_or_cached(
-                "Demonthos/gliner-gguf",
-                "main",
-                "edge-label-encoder-tokenizer.json",
-            ),
-            tokenizer: Self::huggingface_or_cached(
-                "Demonthos/gliner-gguf",
-                "main",
-                "edge-text-tokenizer.json",
-            ),
-            config: Self::huggingface_or_cached(
-                "Demonthos/gliner-gguf",
-                "main",
-                "edge-text-gliner-config.json",
-            ),
-        }
-    }
-
-    /// Demonthos GLiNER GGUF small upload.
-    ///
-    /// Uses the GGUF weights and sidecar tokenizer/config files from
-    /// `Demonthos/gliner-gguf`.
-    pub fn demonthos_small() -> Self {
-        Self {
-            model: Self::huggingface_or_cached(
-                "Demonthos/gliner-gguf",
-                "main",
-                "gliner-small.gguf",
-            ),
-            label_encoder: Self::huggingface_or_cached(
-                "Demonthos/gliner-gguf",
-                "main",
-                "gliner-small-label-encoder.gguf",
-            ),
-            label_encoder_config: Self::huggingface_or_cached(
-                "Demonthos/gliner-gguf",
-                "main",
-                "small-label-encoder-config.json",
-            ),
-            label_encoder_tokenizer: Self::huggingface_or_cached(
-                "Demonthos/gliner-gguf",
-                "main",
-                "small-label-encoder-tokenizer.json",
-            ),
-            tokenizer: Self::huggingface_or_cached(
-                "Demonthos/gliner-gguf",
-                "main",
-                "small-text-tokenizer.json",
-            ),
-            config: Self::huggingface_or_cached(
-                "Demonthos/gliner-gguf",
-                "main",
-                "small-text-gliner-config.json",
-            ),
-        }
-    }
-
-    /// Demonthos GLiNER GGUF base upload.
-    ///
-    /// Uses the GGUF weights and sidecar tokenizer/config files from
-    /// `Demonthos/gliner-gguf`.
-    pub fn demonthos_base() -> Self {
-        Self {
-            model: Self::huggingface_or_cached("Demonthos/gliner-gguf", "main", "gliner-base.gguf"),
-            label_encoder: Self::huggingface_or_cached(
-                "Demonthos/gliner-gguf",
-                "main",
-                "gliner-base-label-encoder.gguf",
-            ),
-            label_encoder_config: Self::huggingface_or_cached(
-                "Demonthos/gliner-gguf",
-                "main",
-                "base-label-encoder-config.json",
-            ),
-            label_encoder_tokenizer: Self::huggingface_or_cached(
-                "Demonthos/gliner-gguf",
-                "main",
-                "base-label-encoder-tokenizer.json",
-            ),
-            tokenizer: Self::huggingface_or_cached(
-                "Demonthos/gliner-gguf",
-                "main",
-                "base-text-tokenizer.json",
-            ),
-            config: Self::huggingface_or_cached(
-                "Demonthos/gliner-gguf",
-                "main",
-                "base-text-gliner-config.json",
-            ),
-        }
-    }
-
-    /// Demonthos GLiNER GGUF large upload.
-    ///
-    /// Uses the GGUF weights and sidecar tokenizer/config files from
-    /// `Demonthos/gliner-gguf`.
-    pub fn demonthos_large() -> Self {
-        Self {
-            model: Self::huggingface_or_cached(
-                "Demonthos/gliner-gguf",
-                "main",
-                "gliner-large.gguf",
-            ),
-            label_encoder: Self::huggingface_or_cached(
-                "Demonthos/gliner-gguf",
-                "main",
-                "gliner-large-label-encoder.gguf",
-            ),
-            label_encoder_config: Self::huggingface_or_cached(
-                "Demonthos/gliner-gguf",
-                "main",
-                "large-label-encoder-config.json",
-            ),
-            label_encoder_tokenizer: Self::huggingface_or_cached(
-                "Demonthos/gliner-gguf",
-                "main",
-                "large-label-encoder-tokenizer.json",
-            ),
-            tokenizer: Self::huggingface_or_cached(
-                "Demonthos/gliner-gguf",
-                "main",
-                "large-text-tokenizer.json",
-            ),
-            config: Self::huggingface_or_cached(
-                "Demonthos/gliner-gguf",
-                "main",
-                "large-text-gliner-config.json",
-            ),
-        }
-    }
-
-    /// GLiNER bi-encoder v2.0 Small variant (108M parameters).
+    /// GLiNER bi-encoder v2.0 Small variant (108M parameters, Q4_K).
     ///
     /// Good balance of speed and accuracy, using:
     /// - Text encoder: ettin-encoder-68m
     /// - Label encoder: all-MiniLM-L12-v2
     pub fn small() -> Self {
         Self {
-            model: FileSource::huggingface(
-                "knowledgator/gliner-bi-small-v2.0-gguf".to_string(),
-                "main".to_string(),
-                "gliner-bi-small-v2.0-Q8_0.gguf".to_string(),
-            ),
-            label_encoder: FileSource::huggingface(
-                "knowledgator/gliner-bi-small-v2.0-gguf".to_string(),
-                "main".to_string(),
-                "label-encoder-Q8_0.gguf".to_string(),
-            ),
+            model: Self::demonthos_gguf("gliner-bi-small-v2.0-Q4_K.gguf"),
+            label_encoder: Self::demonthos_gguf("gliner-bi-small-v2.0-Q4_K-label-encoder.gguf"),
             label_encoder_config: FileSource::huggingface(
                 "sentence-transformers/all-MiniLM-L12-v2".to_string(),
                 "main".to_string(),
@@ -312,23 +152,15 @@ impl GlinerSource {
         }
     }
 
-    /// GLiNER bi-encoder v2.0 Base variant (194M parameters).
+    /// GLiNER bi-encoder v2.0 Base variant (194M parameters, Q4_K).
     ///
     /// Default variant with good accuracy, using:
     /// - Text encoder: ettin-encoder-150m
     /// - Label encoder: bge-small-en-v1.5
     pub fn base() -> Self {
         Self {
-            model: FileSource::huggingface(
-                "knowledgator/gliner-bi-base-v2.0-gguf".to_string(),
-                "main".to_string(),
-                "gliner-bi-base-v2.0-Q8_0.gguf".to_string(),
-            ),
-            label_encoder: FileSource::huggingface(
-                "knowledgator/gliner-bi-base-v2.0-gguf".to_string(),
-                "main".to_string(),
-                "label-encoder-Q8_0.gguf".to_string(),
-            ),
+            model: Self::demonthos_gguf("gliner-bi-base-v2.0-Q4_K.gguf"),
+            label_encoder: Self::demonthos_gguf("gliner-bi-base-v2.0-Q4_K-label-encoder.gguf"),
             label_encoder_config: FileSource::huggingface(
                 "BAAI/bge-small-en-v1.5".to_string(),
                 "main".to_string(),
@@ -352,23 +184,15 @@ impl GlinerSource {
         }
     }
 
-    /// GLiNER bi-encoder v2.0 Large variant (530M parameters).
+    /// GLiNER bi-encoder v2.0 Large variant (530M parameters, Q4_K).
     ///
     /// Highest accuracy variant, using:
     /// - Text encoder: ettin-encoder-400m
     /// - Label encoder: bge-base-en-v1.5
     pub fn large() -> Self {
         Self {
-            model: FileSource::huggingface(
-                "knowledgator/gliner-bi-large-v2.0-gguf".to_string(),
-                "main".to_string(),
-                "gliner-bi-large-v2.0-Q8_0.gguf".to_string(),
-            ),
-            label_encoder: FileSource::huggingface(
-                "knowledgator/gliner-bi-large-v2.0-gguf".to_string(),
-                "main".to_string(),
-                "label-encoder-Q8_0.gguf".to_string(),
-            ),
+            model: Self::demonthos_gguf("gliner-bi-large-v2.0-Q4_K.gguf"),
+            label_encoder: Self::demonthos_gguf("gliner-bi-large-v2.0-Q4_K-label-encoder.gguf"),
             label_encoder_config: FileSource::huggingface(
                 "BAAI/bge-base-en-v1.5".to_string(),
                 "main".to_string(),

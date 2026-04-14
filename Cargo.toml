@@ -37,6 +37,7 @@ members = [
     "fusor-ml/cpu",
     "fusor-ml/fusor",
     "fusor-ml/types",
+    "demos/rgliner-web",
 ]
 
 [workspace.dependencies]
