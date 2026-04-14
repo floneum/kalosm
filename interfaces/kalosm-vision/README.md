@@ -40,7 +40,7 @@ async fn main() {
     let images = model
         .segment_from_points(
             SegmentAnythingInferenceSettings::new(image)
-                .add_goal_point(0.5, 0.25),
+                .add_goal_point_normalized(0.5, 0.25),
         )
         .await
         .unwrap();

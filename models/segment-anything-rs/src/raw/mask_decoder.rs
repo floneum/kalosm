@@ -6,6 +6,17 @@ use fusor::{ConcreteTensor, Device, Tensor, VarBuilder};
 use super::transformer::TwoWayTransformer;
 use super::Result;
 
+/// Mask-decoder transformer config, matching Meta's official SAM checkpoint.
+/// Promoted to named constants so SAM2 / future ports don't have to chase
+/// magic literals through `MaskDecoder::load`.
+const TRANSFORMER_DEPTH: usize = 2;
+const TRANSFORMER_NUM_HEADS: usize = 8;
+const TRANSFORMER_MLP_DIM: usize = 2048;
+/// Hyper-network MLPs that turn each mask token into a per-pixel kernel.
+const HYPER_MLP_LAYERS: usize = 3;
+/// Expected upscaling kernel shape (2x2 stride-2 transposed conv).
+const UPSCALE_KERNEL_HW: [usize; 2] = [2, 2];
+
 /// Private 2x2 stride-2 learned upsampler used by the SAM output head.
 ///
 /// This is intentionally local to the SAM port rather than exposed as a generic
@@ -21,7 +32,20 @@ impl SamUpscale2x2 {
         let weight: Tensor<4, f32> = vb.get("weight", device)?.dequantize();
         let bias: Option<Tensor<1, f32, ConcreteTensor<f32, 1>>> =
             vb.get("bias", device).ok().map(|b| b.dequantize());
-        Ok(Self { weight, bias })
+        let weight_shape = weight.shape();
+        let kh = weight_shape[2];
+        let kw = weight_shape[3];
+        if [kh, kw] != UPSCALE_KERNEL_HW {
+            return Err(fusor::Error::msg(format!(
+                "SAM upscaling expects a {:?} transposed-conv kernel, got {:?}",
+                UPSCALE_KERNEL_HW,
+                [kh, kw]
+            )));
+        }
+        Ok(Self {
+            weight: weight.to_concrete(),
+            bias,
+        })
     }
 
     fn forward(
@@ -38,13 +62,6 @@ impl SamUpscale2x2 {
         let out_ch = weight_shape[1];
         let kh = weight_shape[2];
         let kw = weight_shape[3];
-
-        assert_eq!(
-            [kh, kw],
-            [2, 2],
-            "SAM upscaling expects a 2x2 transposed-conv kernel, got {:?}",
-            [kh, kw]
-        );
 
         let input_flat = input.reshape([b, in_ch, h * w]);
         let input_flat = input_flat.transpose(1, 2);
@@ -107,16 +124,23 @@ impl MlpMaskDecoder {
     }
 }
 
+/// SAM mask decoder head.
+///
+/// `forward(image_embeddings, image_pe, sparse_prompt, dense_prompt, multimask)`
+/// returns `(masks, iou_predictions)`:
+/// - `masks`: `(batch, n_masks, low_res_h, low_res_w)`. `n_masks` = 3 if
+///   `multimask=true`, else 1. The masks are at 1/4 resolution of `IMAGE_SIZE`.
+/// - `iou_predictions`: `(batch, n_masks)` quality scores in `[0, 1]`.
 pub struct MaskDecoder {
-    pub(crate) iou_token: Embedding<f32>,
-    pub(crate) mask_tokens: Embedding<f32>,
+    iou_token: Embedding<f32>,
+    mask_tokens: Embedding<f32>,
     iou_prediction_head: MlpMaskDecoder,
     output_upscaling_conv1: SamUpscale2x2,
-    pub(crate) output_upscaling_ln: LayerNorm2d,
+    output_upscaling_ln: LayerNorm2d,
     output_upscaling_conv2: SamUpscale2x2,
-    pub(crate) num_mask_tokens: usize,
+    num_mask_tokens: usize,
     output_hypernetworks_mlps: Vec<MlpMaskDecoder>,
-    pub(crate) transformer: TwoWayTransformer,
+    transformer: TwoWayTransformer,
 }
 
 impl MaskDecoder {
@@ -145,7 +169,7 @@ impl MaskDecoder {
             let mlp = MlpMaskDecoder::load(
                 device,
                 &mut vb.pp(format!("output_hypernetworks_mlps.{i}")),
-                3,
+                HYPER_MLP_LAYERS,
                 false,
             )?;
             output_hypernetworks_mlps.push(mlp);
@@ -153,10 +177,10 @@ impl MaskDecoder {
         let transformer = TwoWayTransformer::load(
             device,
             &mut vb.pp("transformer"),
-            2,
+            TRANSFORMER_DEPTH,
             transformer_dim,
-            8,
-            2048,
+            TRANSFORMER_NUM_HEADS,
+            TRANSFORMER_MLP_DIM,
         )?;
         Ok(Self {
             iou_token,
@@ -258,25 +282,21 @@ impl MaskDecoder {
             .reshape([batch_size, c, h, w])
             .to_concrete();
 
-        let upscaled = if batch_size == 1 {
-            let upscaled = self.output_upscaling_conv1.forward(&src);
-            let upscaled = self.output_upscaling_ln.forward(&upscaled);
-            let upscaled = upscaled.gelu();
-            let upscaled = self.output_upscaling_conv2.forward(&upscaled.to_concrete());
-            upscaled.gelu().to_concrete()
-        } else {
-            let mut upscaled_items = Vec::with_capacity(batch_size);
-            for i in 0..batch_size {
-                let src_i: Tensor<4, f32> = src.narrow(0, i, 1).to_concrete();
-                let up_i = self.output_upscaling_conv1.forward(&src_i);
-                let up_i = self.output_upscaling_ln.forward(&up_i);
-                let up_i = up_i.gelu();
-                let up_i = self.output_upscaling_conv2.forward(&up_i.to_concrete());
-                let up_i = up_i.gelu();
-                upscaled_items.push(up_i.to_concrete());
-            }
-            Tensor::cat(upscaled_items, 0).to_concrete()
-        };
+        // Run the upscaling pipeline per batch item. Batched conv2d through
+        // the SAM-specific upscaler hits an issue with `LayerNorm2d` on some
+        // backends, so we always slice per item; for `batch_size == 1` this
+        // is a single narrow + cat with negligible overhead.
+        let mut upscaled_items = Vec::with_capacity(batch_size);
+        for i in 0..batch_size {
+            let src_i: Tensor<4, f32> = src.narrow(0, i, 1).to_concrete();
+            let up_i = self.output_upscaling_conv1.forward(&src_i);
+            let up_i = self.output_upscaling_ln.forward(&up_i);
+            let up_i = up_i.gelu();
+            let up_i = self.output_upscaling_conv2.forward(&up_i.to_concrete());
+            let up_i = up_i.gelu();
+            upscaled_items.push(up_i.to_concrete());
+        }
+        let upscaled: Tensor<4, f32> = Tensor::cat(upscaled_items, 0).to_concrete();
 
         // Predict masks using hypernetwork MLPs
         let mut hyper_in_list = Vec::with_capacity(self.num_mask_tokens);

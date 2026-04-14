@@ -1,12 +1,24 @@
 [package]
 name = "segment-anything-rs"
-version = "0.4.0"
+version = "0.5.0"
 edition = "2021"
 description = "A simple interface for Segment Anything models "
 license = "MIT/Apache-2.0"
 repository = "https://github.com/floneum/floneum"
 authors = ["Evan Almloff <evanalmloff@gmail.com>"]
 keywords = ["ai", "segment-anything", "segmentation", "computer-vision"]
+
+[features]
+# Backward-compat stubs. Device selection is now runtime via fusor's
+# `Device::auto()`; these features are accepted but no longer affect the build.
+metal = []
+cuda = []
+cudnn = []
+cublas = []
+mkl = []
+accelerate = []
+flash = []
+nccl = []
 
 [dependencies]
 fusor = { workspace = true }

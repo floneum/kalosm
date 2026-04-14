@@ -8,22 +8,11 @@ impl<const R: usize, D> Tensor<R, D>
 where
     D: SimdElement + DataType + FloatDataType + FloatOps + Default,
 {
-    /// Pad a specific axis with zeros on both sides.
+    /// Pad a specific axis with zeros on both sides (symmetric).
+    ///
+    /// Equivalent to `pad_with_zeros(axis, padding, padding)`.
     pub fn pad_axis(&self, axis: usize, padding: usize) -> Self {
-        if padding == 0 {
-            return self.clone();
-        }
-
-        let shape = self.shape();
-
-        // Create left padding shape
-        let mut pad_shape = shape;
-        pad_shape[axis] = padding;
-        let pad_left = Self::zeros(&self.device(), pad_shape);
-        let pad_right = Self::zeros(&self.device(), pad_shape);
-
-        // Concatenate: [pad_left, self, pad_right] along the axis
-        super::cat([pad_left, self.clone(), pad_right], axis)
+        self.pad_with_zeros(axis, padding, padding)
     }
 
     /// Pad a specific axis with zeros on left and right sides separately.

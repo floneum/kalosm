@@ -238,7 +238,13 @@ impl Block {
             use_rel_pos,
             input_size_attn,
         )?;
-        let mlp = MlpBlock::load(device, &mut vb.pp("mlp"), dim, dim * 4, Activation::Gelu)?;
+        let mlp = MlpBlock::load(
+            device,
+            &mut vb.pp("mlp"),
+            Some(dim),
+            Some(dim * 4),
+            Activation::Gelu,
+        )?;
         Ok(Self {
             norm1,
             attn,
@@ -356,6 +362,10 @@ fn window_unpartition(
     xs
 }
 
+/// Standard ViT-B/H/L image encoder used by the upstream SAM checkpoints.
+///
+/// `forward` takes a `(B, 3, IMAGE_SIZE, IMAGE_SIZE)` preprocessed input and
+/// returns `(B, prompt_embed_dim, IMAGE_SIZE/16, IMAGE_SIZE/16)` features.
 pub struct ImageEncoderViT {
     patch_embed: PatchEmbed,
     blocks: Vec<Block>,

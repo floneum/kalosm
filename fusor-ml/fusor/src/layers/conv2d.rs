@@ -58,6 +58,14 @@ where
         let out_channels = shape[0];
         let in_channels = shape[1] * config.groups;
 
+        assert!(config.groups >= 1, "groups must be >= 1");
+        assert_eq!(
+            out_channels % config.groups,
+            0,
+            "out_channels ({out_channels}) must be divisible by groups ({})",
+            config.groups
+        );
+
         if let Some(ref b) = bias {
             assert_eq!(
                 b.shape()[0],

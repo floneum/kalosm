@@ -13,7 +13,9 @@ async fn main() {
     // Point at center-x, quarter-y (in the sky above the building)
     // Coordinates are normalized to [0, 1]
     let mask = model
-        .segment_from_points(SegmentAnythingInferenceSettings::new(image).add_goal_point(0.5, 0.25))
+        .segment_from_points(
+            SegmentAnythingInferenceSettings::new(image).add_goal_point_normalized(0.5, 0.25),
+        )
         .await
         .unwrap();
 

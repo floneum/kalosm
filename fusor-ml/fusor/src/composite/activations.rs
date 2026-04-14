@@ -6,6 +6,15 @@ use crate::{
 };
 use fusor_core::{DataType, FloatDataType};
 
+/// Maximum |x| fed to `tanh` on GPU before WGSL's `(e^x - e^-x) / (e^x + e^-x)`
+/// implementation overflows f32. tanh is saturated outside ±10 anyway.
+const TANH_INPUT_CLAMP: f32 = 15.0;
+/// Lower clamp on `1 + tanh(x)`; mathematically the value lives in [0, 2] but
+/// driver-specific tanh precision can drift slightly below 0.
+const ONE_PLUS_TANH_MIN: f32 = 0.0;
+/// Upper clamp on `1 + tanh(x)`; see `ONE_PLUS_TANH_MIN`.
+const ONE_PLUS_TANH_MAX: f32 = 2.0;
+
 impl<const R: usize, D> Tensor<R, D>
 where
     D: SimdElement + DataType + FloatDataType + FloatOps + Default,
@@ -29,12 +38,8 @@ where
         NegOp: SimdUnaryOp<D>,
         ExpOp: SimdUnaryOp<D>,
     {
-        let neg_self = -self;
-        let exp_neg = neg_self.exp();
-        let one_plus_exp = (exp_neg + D::from_f32(1.0)).to_concrete();
-        // Create ones with the same shape by: x * 0 + 1
-        let ones = (self.mul_scalar(D::from_f32(0.0)) + D::from_f32(1.0)).to_concrete();
-        (ones / one_plus_exp).to_concrete()
+        let one_plus_exp = ((-self).exp() + D::from_f32(1.0)).to_concrete();
+        (self.ones_like() / one_plus_exp).to_concrete()
     }
 
     /// Sigmoid Linear Unit activation: silu(x) = x * sigmoid(x)
@@ -79,16 +84,21 @@ where
         // sqrt(2/pi) * (x * (1 + 0.044715 * x^2))
         let tanh_input = inner * coeff;
 
-        // Clamp tanh INPUT to [-15, 15] to prevent GPU NaN from WGSL tanh overflow.
-        // WGSL's tanh(x) computes (e^x - e^-x)/(e^x + e^-x), but e^x overflows f32
-        // for x > ~88. For |x| > 10, tanh(x) ≈ ±1.0, so clamping to ±15 is safe.
-        let tanh_input = tanh_input.clamp(D::from_f32(-15.0), D::from_f32(15.0));
+        // WGSL's tanh(x) computes (e^x - e^-x)/(e^x + e^-x); e^x overflows f32
+        // for x > ~88, producing NaN on GPU. For |x| > 10, tanh(x) ≈ ±1, so
+        // clamping to TANH_INPUT_CLAMP is mathematically inert but prevents NaN.
+        let tanh_input = tanh_input.clamp(
+            D::from_f32(-TANH_INPUT_CLAMP),
+            D::from_f32(TANH_INPUT_CLAMP),
+        );
         let tanh_result = tanh_input.tanh();
 
         // 1 + tanh(...) — mathematically in [0, 2]. Clamp defensively against
         // driver-specific tanh precision that can return values slightly outside [-1, 1].
-        let one_plus_tanh = (&tanh_result + D::from_f32(1.0))
-            .clamp(D::from_f32(0.0), D::from_f32(2.0));
+        let one_plus_tanh = (&tanh_result + D::from_f32(1.0)).clamp(
+            D::from_f32(ONE_PLUS_TANH_MIN),
+            D::from_f32(ONE_PLUS_TANH_MAX),
+        );
 
         // x * (1 + tanh(...))
         let product = self * &one_plus_tanh;
@@ -120,8 +130,57 @@ mod tests {
         assert!((slice[[5]] - 0.0).abs() < 0.001);
     }
 
+    fn sigmoid_ref(x: f32) -> f32 {
+        1.0 / (1.0 + (-x).exp())
+    }
+
     fn silu_ref(x: f32) -> f32 {
-        x / (1.0 + (-x).exp())
+        x * sigmoid_ref(x)
+    }
+
+    #[tokio::test]
+    async fn test_sigmoid_cpu() {
+        let data = [0.0f32, 1.0, -1.0, 2.0, -2.0, 5.0];
+        let t: Tensor<1, f32> = Tensor::Cpu(fusor_cpu::Tensor::from_slice([6], &data));
+        let result = t.sigmoid();
+        let slice = result.as_slice().await.unwrap();
+
+        for i in 0..6 {
+            assert!(
+                (slice[[i]] - sigmoid_ref(data[i])).abs() < 0.001,
+                "Mismatch at index {}: got {}, expected {}",
+                i,
+                slice[[i]],
+                sigmoid_ref(data[i])
+            );
+        }
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    #[tokio::test]
+    async fn test_sigmoid_cpu_vs_gpu() {
+        use crate::Device;
+
+        let data: Vec<f32> = (0..256).map(|i| ((i as f32) - 128.0) * 0.1).collect();
+
+        let cpu_tensor: Tensor<1, f32> = Tensor::Cpu(fusor_cpu::Tensor::from_slice([256], &data));
+        let cpu_slice = cpu_tensor.sigmoid().as_slice().await.unwrap();
+
+        let gpu_device = Device::new().await.expect("GPU required for this test");
+        let gpu_tensor: Tensor<1, f32> = Tensor::from_slice(&gpu_device, [256], &data);
+        let gpu_slice = gpu_tensor.sigmoid().as_slice().await.unwrap();
+
+        let mut max_diff = 0.0f32;
+        for i in 0..256 {
+            let cpu_val: f32 = cpu_slice[[i]].into();
+            let gpu_val: f32 = gpu_slice[[i]].into();
+            max_diff = max_diff.max((cpu_val - gpu_val).abs());
+        }
+        assert!(
+            max_diff < 0.001,
+            "sigmoid CPU vs GPU diverged: max_diff={}",
+            max_diff
+        );
     }
 
     #[tokio::test]

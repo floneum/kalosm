@@ -23,5 +23,6 @@ pub use to_vec::{ToVec1, ToVec2, ToVec3};
 mod unsqueeze;
 mod variance;
 pub(crate) mod where_cond;
+mod ones_like;
 mod zeros;
 mod zeros_like;

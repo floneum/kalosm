@@ -177,17 +177,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let nyt = RssFeed::new(Url::parse("https://rss.nytimes.com/services/xml/rss/nyt/US.xml").unwrap());
     // Read a local folder of documents
     let mut documents = DocumentFolder::try_from(PathBuf::from("./documents")).unwrap();
-    // Read a website (requires the `scrape` feature)
-    #[cfg(feature = "scrape")]
-    {
-        let page = Page::new(
-            Url::parse("https://www.nytimes.com/live/2023/09/21/world/zelensky-russia-ukraine-news").unwrap(),
-            BrowserMode::Static,
-        ).unwrap();
-        let document = page.article().await.unwrap();
-        println!("Title: {}", document.title());
-        println!("Body: {}", document.body());
-    }
+    // Read a website (either from the raw HTML or inside of a headless browser)
+    let page = Page::new(Url::parse("https://www.nytimes.com/live/2023/09/21/world/zelensky-russia-ukraine-news").unwrap(), BrowserMode::Static).unwrap();
+    let document = page.article().await.unwrap();
+    println!("Title: {}", document.title());
+    println!("Body: {}", document.body());
     // Read pages from a search engine (You must have the SERPER_API_KEY environment variable set to run this example)
     let query = "What is the capital of France?";
     let api_key = std::env::var("SERPER_API_KEY").unwrap();

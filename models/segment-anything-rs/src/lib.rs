@@ -35,6 +35,7 @@ use raw::sam::{
 pub struct SegmentAnythingBuilder {
     source: SegmentAnythingSource,
     device: Option<Device>,
+    local_path: Option<std::path::PathBuf>,
 }
 
 impl SegmentAnythingBuilder {
@@ -49,6 +50,16 @@ impl SegmentAnythingBuilder {
     /// When not specified, the builder prefers GPU and falls back to CPU.
     pub fn device(mut self, device: Device) -> Self {
         self.device = Some(device);
+        self
+    }
+
+    /// Load weights from a local GGUF file instead of downloading from
+    /// Hugging Face. Pair with [`SegmentAnythingBuilder::source`] (or rely on
+    /// the default `tiny` source) to indicate which architecture the file
+    /// contains — the source's `tiny` flag controls whether the loader uses
+    /// `Sam::load_tiny` or `Sam::load_vit_b`.
+    pub fn gguf_path(mut self, path: impl Into<std::path::PathBuf>) -> Self {
+        self.local_path = Some(path.into());
         self
     }
 
@@ -130,8 +141,10 @@ impl SegmentAnythingInferenceSettings {
 
     /// Add a point to the list of points to segment.
     ///
-    /// Coordinates are normalized to `[0, 1]`.
-    pub fn add_goal_point(mut self, x: impl Into<f64>, y: impl Into<f64>) -> Self {
+    /// Coordinates are normalized to `[0, 1]` (0.5 is the middle of the image).
+    /// Renamed from `add_goal_point` in 0.5 to flag the absolute→normalized
+    /// coordinate switch — old pixel-based callers should divide by image size.
+    pub fn add_goal_point_normalized(mut self, x: impl Into<f64>, y: impl Into<f64>) -> Self {
         self.goal_points.push((x.into(), y.into()));
         self
     }
@@ -146,8 +159,10 @@ impl SegmentAnythingInferenceSettings {
 
     /// Add a point to the list of points to avoid.
     ///
-    /// Coordinates are normalized to `[0, 1]`.
-    pub fn add_avoid_points(mut self, x: impl Into<f64>, y: impl Into<f64>) -> Self {
+    /// Coordinates are normalized to `[0, 1]` (0.5 is the middle of the image).
+    /// Renamed from `add_avoid_points` in 0.5 to flag the absolute→normalized
+    /// coordinate switch and fix the singular/plural mismatch.
+    pub fn add_avoid_point_normalized(mut self, x: impl Into<f64>, y: impl Into<f64>) -> Self {
         self.avoid_points.push((x.into(), y.into()));
         self
     }
@@ -209,11 +224,18 @@ impl SegmentAnything {
     }
 
     async fn new(settings: SegmentAnythingBuilder) -> Result<Self, LoadSegmentAnythingError> {
-        let SegmentAnythingBuilder { source, device } = settings;
-        let model_path = {
-            let api = hf_hub::api::sync::Api::new()?;
-            let api = api.model(source.model);
-            api.get(&source.filename)?
+        let SegmentAnythingBuilder {
+            source,
+            device,
+            local_path,
+        } = settings;
+        let model_path = match local_path {
+            Some(path) => path,
+            None => {
+                let api = hf_hub::api::sync::Api::new()?;
+                let api = api.model(source.model.clone());
+                api.get(&source.filename)?
+            }
         };
         let device = match device {
             Some(device) => device,
@@ -240,7 +262,7 @@ impl SegmentAnything {
     /// let model = SegmentAnything::builder().build().await.unwrap();
     /// let image = image::open("examples/landscape.jpg").unwrap();
     /// let images = model
-    ///     .segment_from_points(SegmentAnythingInferenceSettings::new(image).add_goal_point(0.5, 0.25))
+    ///     .segment_from_points(SegmentAnythingInferenceSettings::new(image).add_goal_point_normalized(0.5, 0.25))
     ///     .await
     ///     .unwrap();
     ///
@@ -481,21 +503,31 @@ impl SegmentAnything {
         Ok(masks)
     }
 
-    /// Load from a local GGUF file path using fusor, preferring GPU but falling back to CPU.
+    /// Load from a local GGUF file path. `tiny` selects between the TinyViT
+    /// (Mobile-SAM) and ViT-B architectures.
+    ///
+    /// Deprecated: prefer
+    /// `SegmentAnything::builder().source(SegmentAnythingSource::tiny()).gguf_path(path).build().await`
+    /// — the builder respects `device(...)` and gives consistent error
+    /// handling. This shim will be removed in a future release.
+    #[deprecated(
+        since = "0.5.0",
+        note = "Use `SegmentAnything::builder().source(...).gguf_path(path).build().await`"
+    )]
     pub async fn from_gguf_path(
         path: &std::path::Path,
         tiny: bool,
     ) -> Result<Self, LoadSegmentAnythingError> {
-        let device = Device::auto().await;
-        let mut reader = std::io::BufReader::new(std::fs::File::open(path)?);
-        let mut vb = VarBuilder::from_gguf(&mut reader)
-            .map_err(|e| fusor::Error::msg(format!("Failed to read GGUF: {e}")))?;
-        let sam = if tiny {
-            raw::sam::Sam::load_tiny(&device, &mut vb)?
+        let source = if tiny {
+            SegmentAnythingSource::tiny()
         } else {
-            raw::sam::Sam::load_vit_b(&device, &mut vb)?
+            SegmentAnythingSource::medium()
         };
-        Ok(Self { sam, device })
+        SegmentAnything::builder()
+            .source(source)
+            .gguf_path(path)
+            .build()
+            .await
     }
 }
 
@@ -669,7 +701,7 @@ mod tests {
         let image = image::open(&image_path).expect("Failed to open test image");
         let (w, h) = (image.width(), image.height());
 
-        let settings = SegmentAnythingInferenceSettings::new(image).add_goal_point(0.5, 0.25);
+        let settings = SegmentAnythingInferenceSettings::new(image).add_goal_point_normalized(0.5, 0.25);
 
         let mask = model
             .segment_from_points(settings)
@@ -703,7 +735,7 @@ mod tests {
 
         let mask = model
             .segment_from_points(
-                SegmentAnythingInferenceSettings::new(image).add_goal_point(0.5, 0.25),
+                SegmentAnythingInferenceSettings::new(image).add_goal_point_normalized(0.5, 0.25),
             )
             .await
             .expect("Failed to run CPU inference");

@@ -89,6 +89,12 @@ impl PositionEmbeddingRandom {
     }
 }
 
+/// Encodes user prompts (points, boxes, masks) into the sparse and dense
+/// embeddings that `MaskDecoder` consumes.
+///
+/// `forward` returns:
+/// - sparse embeddings: `(batch, num_prompts, embed_dim)`
+/// - dense embeddings: `(batch, embed_dim, image_embedding_size, image_embedding_size)`
 pub struct PromptEncoder {
     pub(crate) pe_layer: PositionEmbeddingRandom,
     point_embeddings: Vec<Embedding<f32>>,
@@ -135,9 +141,12 @@ impl PromptEncoder {
             Conv2dConfig::default(),
         )?;
 
-        let num_points_embeddings = 4;
-        let mut point_embeddings = Vec::with_capacity(num_points_embeddings);
-        for i in 0..num_points_embeddings {
+        // SAM's prompt encoder learns four point-type embeddings:
+        //   0 = background point, 1 = foreground point,
+        //   2 = box top-left,     3 = box bottom-right.
+        const NUM_POINT_TYPE_EMBEDDINGS: usize = 4;
+        let mut point_embeddings = Vec::with_capacity(NUM_POINT_TYPE_EMBEDDINGS);
+        for i in 0..NUM_POINT_TYPE_EMBEDDINGS {
             let emb = Embedding::load(device, &mut vb.pp(format!("point_embeddings.{i}")))?;
             point_embeddings.push(emb);
         }

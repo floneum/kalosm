@@ -11,12 +11,21 @@ use super::Result;
 const PROMPT_EMBED_DIM: usize = 256;
 /// The expected image size (both width and height) for the SAM model.
 pub const IMAGE_SIZE: usize = 1024;
+/// Patch size for the standard ViT image encoder. The TinyViT/MobileSAM encoder
+/// also happens to downsample by 16 across its full stride stack — we rely on
+/// this coincidence so a single `IMAGE_SIZE / VIT_PATCH_SIZE` constant works
+/// for the prompt-encoder geometry. SAM2 variants must NOT reuse this constant.
 const VIT_PATCH_SIZE: usize = 16;
 pub(crate) const PRED_IOU_THRESH: f32 = 0.78;
 pub(crate) const STABILITY_SCORE_OFFSET: f32 = 1.0;
 pub(crate) const STABILITY_SCORE_THRESHOLD: f32 = 0.88;
 pub(crate) const MODEL_MASK_THRESHOLD: f32 = 0.0;
 pub(crate) const CROP_NMS_THRESH: f32 = 0.7;
+
+/// Pixel-mean used to normalize input images (matches Meta's SAM checkpoint).
+const PIXEL_MEAN: [f32; 3] = [123.675, 116.28, 103.53];
+/// Pixel-std used to normalize input images.
+const PIXEL_STD: [f32; 3] = [58.395, 57.12, 57.375];
 
 pub(crate) enum ImageEncoder {
     Original(Box<ImageEncoderViT>),
@@ -37,8 +46,6 @@ pub struct Sam {
     pub(crate) image_encoder: ImageEncoder,
     pub(crate) prompt_encoder: PromptEncoder,
     pub(crate) mask_decoder: MaskDecoder,
-    pub(crate) pixel_mean: [f32; 3],
-    pub(crate) pixel_std: [f32; 3],
 }
 
 impl Sam {
@@ -100,8 +107,6 @@ impl Sam {
             image_encoder: ImageEncoder::Original(Box::new(image_encoder)),
             prompt_encoder,
             mask_decoder,
-            pixel_mean: [123.675, 116.28, 103.53],
-            pixel_std: [58.395, 57.12, 57.375],
         })
     }
 
@@ -131,8 +136,6 @@ impl Sam {
             image_encoder: ImageEncoder::TinyViT(Box::new(image_encoder)),
             prompt_encoder,
             mask_decoder,
-            pixel_mean: [123.675, 116.28, 103.53],
-            pixel_std: [58.395, 57.12, 57.375],
         })
     }
 
@@ -172,11 +175,26 @@ impl Sam {
             multimask_output,
         );
 
-        // Upsample to IMAGE_SIZE
-        let upscaled: Tensor<4, f32> = low_res_mask.upsample_nearest2d(
-            IMAGE_SIZE / low_res_mask.shape()[2],
-            IMAGE_SIZE / low_res_mask.shape()[3],
+        // Upsample to IMAGE_SIZE.
+        // Low-res masks come back at exactly IMAGE_SIZE/4 (256). If a
+        // future model changes the upsampling ratio this assert will catch it
+        // before `upsample_nearest2d` silently truncates.
+        let lr_shape = low_res_mask.shape();
+        let scale_h = IMAGE_SIZE / lr_shape[2];
+        let scale_w = IMAGE_SIZE / lr_shape[3];
+        assert_eq!(
+            scale_h * lr_shape[2],
+            IMAGE_SIZE,
+            "low-res mask H ({}) must divide IMAGE_SIZE ({IMAGE_SIZE})",
+            lr_shape[2]
         );
+        assert_eq!(
+            scale_w * lr_shape[3],
+            IMAGE_SIZE,
+            "low-res mask W ({}) must divide IMAGE_SIZE ({IMAGE_SIZE})",
+            lr_shape[3]
+        );
+        let upscaled: Tensor<4, f32> = low_res_mask.upsample_nearest2d(scale_h, scale_w);
 
         // Crop to original size: narrow on H and W dims
         let cropped_h = upscaled.narrow(2, 0, original_h);
@@ -196,29 +214,13 @@ impl Sam {
         points: &[(f64, f64, bool)],
         multimask_output: bool,
     ) -> (Tensor<4, f32>, Tensor<2, f32>) {
+        // Single-batch path; equivalent to calling the batched variant with
+        // batch_size = 1 but producing a `(1, 1, 2)` point tensor.
         let device = img_embeddings.device();
         let image_pe = self.prompt_encoder.get_dense_pe();
 
-        let points_data = if points.is_empty() {
-            None
-        } else {
-            let n_points = points.len();
-            let xys: Vec<f32> = points
-                .iter()
-                .flat_map(|(x, y, _b)| {
-                    let x = (*x as f32) * (original_w as f32);
-                    let y = (*y as f32) * (original_h as f32);
-                    [x, y]
-                })
-                .collect();
-            let labels: Vec<f32> = points
-                .iter()
-                .map(|(_x, _y, b)| if *b { 1f32 } else { 0f32 })
-                .collect();
-            let pts: Tensor<3, f32> = Tensor::from_slice(&device, [1, n_points, 2], &xys);
-            let lbls: Tensor<2, f32> = Tensor::from_slice(&device, [1, n_points], &labels);
-            Some((pts, lbls))
-        };
+        let points_data =
+            (!points.is_empty()).then(|| build_point_tensors(&device, points, original_h, original_w, 1));
 
         let points_ref = points_data
             .as_ref()
@@ -257,22 +259,8 @@ impl Sam {
         let image_pe = self.prompt_encoder.get_dense_pe();
         let batch_size = points.len();
 
-        // Build batched point tensors: (batch_size, 1, 2) and (batch_size, 1)
-        let xys: Vec<f32> = points
-            .iter()
-            .flat_map(|(x, y, _b)| {
-                let x = (*x as f32) * (original_w as f32);
-                let y = (*y as f32) * (original_h as f32);
-                [x, y]
-            })
-            .collect();
-        let labels: Vec<f32> = points
-            .iter()
-            .map(|(_x, _y, b)| if *b { 1f32 } else { 0f32 })
-            .collect();
-
-        let pts: Tensor<3, f32> = Tensor::from_slice(&device, [batch_size, 1, 2], &xys);
-        let lbls: Tensor<2, f32> = Tensor::from_slice(&device, [batch_size, 1], &labels);
+        let (pts, lbls) =
+            build_point_tensors(&device, points, original_h, original_w, batch_size);
 
         let (sparse_prompt_embeddings, dense_prompt_embeddings) =
             self.prompt_encoder.forward(Some((&pts, &lbls)), None, None);
@@ -295,9 +283,9 @@ impl Sam {
         let device = img.device();
 
         // Create mean and std tensors: (3, 1, 1) broadcast to (3, H, W)
-        let mean_base = Tensor::from_slice(&device, [3, 1, 1], &self.pixel_mean);
+        let mean_base = Tensor::from_slice(&device, [3, 1, 1], &PIXEL_MEAN);
         let mean = mean_base.broadcast_as([c, h, w]);
-        let std_base = Tensor::from_slice(&device, [3, 1, 1], &self.pixel_std);
+        let std_base = Tensor::from_slice(&device, [3, 1, 1], &PIXEL_STD);
         let std = std_base.broadcast_as([c, h, w]);
 
         let img: Tensor<3, f32> = ((img - mean) / std).to_concrete();
@@ -317,62 +305,39 @@ impl Sam {
     }
 }
 
-// Grid-based mask generation support
-
-struct CropBox {
-    x0: usize,
-    y0: usize,
-    x1: usize,
-    y1: usize,
-    layer_idx: usize,
+/// Convert normalized `(x, y, is_foreground)` prompt points into the
+/// `(batch_size, n_points_per_batch, 2)` xy tensor and `(batch_size,
+/// n_points_per_batch)` label tensor expected by the prompt encoder.
+///
+/// `points.len()` is interpreted as either `batch_size` (one point per batch)
+/// or `1 * n_points` (one batch with N points), depending on `batch_size`.
+fn build_point_tensors(
+    device: &Device,
+    points: &[(f64, f64, bool)],
+    original_h: usize,
+    original_w: usize,
+    batch_size: usize,
+) -> (Tensor<3, f32>, Tensor<2, f32>) {
+    let n_per_batch = points.len() / batch_size;
+    let xys: Vec<f32> = points
+        .iter()
+        .flat_map(|(x, y, _b)| {
+            let x = (*x as f32) * (original_w as f32);
+            let y = (*y as f32) * (original_h as f32);
+            [x, y]
+        })
+        .collect();
+    let labels: Vec<f32> = points
+        .iter()
+        .map(|(_x, _y, b)| if *b { 1f32 } else { 0f32 })
+        .collect();
+    let pts: Tensor<3, f32> = Tensor::from_slice(device, [batch_size, n_per_batch, 2], &xys);
+    let lbls: Tensor<2, f32> = Tensor::from_slice(device, [batch_size, n_per_batch], &labels);
+    (pts, lbls)
 }
 
-fn generate_crop_boxes(
-    (im_h, im_w): (usize, usize),
-    n_layers: usize,
-    overlap_ratio: f64,
-) -> Vec<CropBox> {
-    fn crop_len(orig_len: usize, n_crops: usize, overlap: usize) -> usize {
-        f64::ceil((overlap * (n_crops - 1) + orig_len) as f64 / n_crops as f64) as usize
-    }
-
-    let short_side = usize::min(im_h, im_w);
-    let mut crop_boxes = Vec::new();
-
-    crop_boxes.push(CropBox {
-        x0: 0,
-        y0: 0,
-        x1: im_w,
-        y1: im_h,
-        layer_idx: 0,
-    });
-
-    for layer_idx in 1..=n_layers {
-        let n_crops_per_side = 1 << layer_idx;
-        let overlap = (overlap_ratio * short_side as f64 * 2.0 / n_crops_per_side as f64) as usize;
-        let crop_w = crop_len(im_w, n_crops_per_side, overlap);
-        let crop_h = crop_len(im_h, n_crops_per_side, overlap);
-
-        for i_x in 0..n_crops_per_side {
-            let x0 = (crop_w - overlap) * i_x;
-            for i_y in 0..n_crops_per_side {
-                let y0 = (crop_h - overlap) * i_y;
-                let x1 = usize::min(im_w, x0 + crop_w);
-                let y1 = usize::min(im_h, y0 + crop_h);
-                crop_boxes.push(CropBox {
-                    x0,
-                    y0,
-                    x1,
-                    y1,
-                    layer_idx,
-                });
-            }
-        }
-    }
-
-    crop_boxes
-}
-
+/// Build a uniform `n_per_side × n_per_side` grid of normalized `(x, y)`
+/// coordinates in `(0, 1)`. Used as the prompt grid for `segment_everything`.
 pub(crate) fn build_point_grid(n_per_side: usize) -> Vec<(f64, f64)> {
     let offset = 1f64 / (2 * n_per_side) as f64;
     let mut points = Vec::with_capacity(n_per_side * n_per_side);
@@ -384,17 +349,4 @@ pub(crate) fn build_point_grid(n_per_side: usize) -> Vec<(f64, f64)> {
         }
     }
     points
-}
-
-fn build_all_layer_point_grids(
-    n_per_side: usize,
-    n_layers: usize,
-    scale_per_layer: usize,
-) -> Vec<Vec<(f64, f64)>> {
-    let mut points_by_layer = Vec::with_capacity(n_layers + 1);
-    for i in 0..=n_layers {
-        let n_points = n_per_side / scale_per_layer.pow(i as u32);
-        points_by_layer.push(build_point_grid(n_points));
-    }
-    points_by_layer
 }

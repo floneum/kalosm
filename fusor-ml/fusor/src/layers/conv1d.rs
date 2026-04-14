@@ -30,8 +30,11 @@ impl Default for Conv1dConfig {
 /// Input shape: (batch, in_channels, length)
 /// Output shape: (batch, out_channels, out_length)
 /// where out_length = (length + 2*padding - kernel_size) / stride + 1
+///
+/// Supports `groups >= 1` (grouped conv via per-group narrow + cat).
+/// `dilation` is currently fixed at 1.
 pub struct Conv1d<D: SimdElement> {
-    weight: Tensor<3, D, ConcreteTensor<D, 3>>, // (out_channels, in_channels, kernel_size)
+    weight: Tensor<3, D, ConcreteTensor<D, 3>>, // (out_channels, in_channels/groups, kernel_size)
     bias: Option<Tensor<1, D, ConcreteTensor<D, 1>>>, // (out_channels,)
     config: Conv1dConfig,
     in_channels: usize,
@@ -52,7 +55,7 @@ where
 {
     /// Create a new Conv1d layer with given weights and configuration.
     ///
-    /// Weight shape: (out_channels, in_channels, kernel_size)
+    /// Weight shape: (out_channels, in_channels / groups, kernel_size)
     /// Bias shape: (out_channels,)
     pub fn new(
         weight: Tensor<3, D, ConcreteTensor<D, 3>>,
@@ -61,12 +64,20 @@ where
     ) -> Self {
         let shape = weight.shape();
         let out_channels = shape[0];
-        let in_channels = shape[1];
+        let in_channels = shape[1] * config.groups;
         let kernel_size = shape[2];
 
-        // Validate configuration
-        assert_eq!(config.groups, 1, "Only groups=1 is currently supported");
-        assert_eq!(config.dilation, 1, "Only dilation=1 is currently supported");
+        assert!(config.groups >= 1, "groups must be >= 1");
+        assert_eq!(
+            config.dilation, 1,
+            "Conv1d dilation > 1 is not yet implemented"
+        );
+        assert_eq!(
+            out_channels % config.groups,
+            0,
+            "out_channels ({out_channels}) must be divisible by groups ({})",
+            config.groups
+        );
 
         if let Some(ref b) = bias {
             assert_eq!(
@@ -99,12 +110,46 @@ where
         crate::AddOp: fusor_cpu::SimdBinaryOp<D>,
         fusor_cpu::SumOp: fusor_cpu::SimdReduceOp<D>,
     {
-        input.conv(
-            &self.weight,
-            self.bias.as_ref(),
-            [self.config.padding],
-            [self.config.stride],
-        )
+        if self.config.groups == 1 {
+            return input.conv(
+                &self.weight,
+                self.bias.as_ref(),
+                [self.config.padding],
+                [self.config.stride],
+            );
+        }
+
+        let g = self.config.groups;
+        let in_ch_per_group = self.in_channels / g;
+        let out_ch_per_group = self.out_channels / g;
+        let mut group_outputs = Vec::with_capacity(g);
+        for i in 0..g {
+            let input_slice: Tensor<3, D, ConcreteTensor<D, 3>> = input
+                .narrow(1, i * in_ch_per_group, in_ch_per_group)
+                .to_concrete();
+            let weight_slice: Tensor<3, D, ConcreteTensor<D, 3>> = self
+                .weight
+                .narrow(0, i * out_ch_per_group, out_ch_per_group)
+                .to_concrete();
+            let group_out: Tensor<3, D, ConcreteTensor<D, 3>> = input_slice.conv(
+                &weight_slice,
+                None::<&Tensor<1, D, ConcreteTensor<D, 1>>>,
+                [self.config.padding],
+                [self.config.stride],
+            );
+            group_outputs.push(group_out);
+        }
+        let cat = Tensor::cat(group_outputs, 1);
+        if let Some(bias) = &self.bias {
+            let out_len = cat.shape()[2];
+            let bias_3d: Tensor<3, D> = bias
+                .reshape([1, self.out_channels, 1])
+                .broadcast_as([cat.shape()[0], self.out_channels, out_len])
+                .to_concrete();
+            (cat + bias_3d).to_concrete()
+        } else {
+            cat.to_concrete()
+        }
     }
 
     /// Get the configuration.

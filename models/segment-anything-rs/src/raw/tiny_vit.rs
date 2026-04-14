@@ -12,7 +12,6 @@ const MBCONV_EXPAND_RATIO: usize = 4;
 const MLP_RATIO: usize = 4;
 const LOCAL_CONV_SIZE: usize = 3;
 const IMG_SIZE: usize = 1024;
-const IN_CHANNELS: usize = 3;
 
 /// Conv2d with fused BatchNorm (BN fused into weights at conversion time).
 /// At runtime, this is just a Conv2d with no bias (bias comes from fused BN).
@@ -112,17 +111,22 @@ struct PatchMerging {
 }
 
 impl PatchMerging {
+    /// `spatial_stride` is the stride of the depthwise conv: 2 when this
+    /// PatchMerging is meant to halve the spatial resolution, 1 when it should
+    /// keep it unchanged (used for the channel-only transition into TinyViT's
+    /// final stage). Previously this was inferred by checking whether `out`
+    /// matched a hard-coded list of last-stage embed dims, which broke for any
+    /// TinyViT variant outside Mobile-SAM 5m.
     fn load(
         device: &Device,
         vb: &mut VarBuilder,
         input_resolution: (usize, usize),
-        _dim: usize,
         out: usize,
+        spatial_stride: usize,
     ) -> Result<Self> {
-        let stride = if [320, 448, 576].contains(&out) { 1 } else { 2 };
         let cfg_dw = Conv2dConfig {
             padding: [1, 1],
-            stride: [stride, stride],
+            stride: [spatial_stride, spatial_stride],
             groups: out,
         };
         let conv1 = Conv2dBN::load(device, &mut vb.pp("conv1"), Conv2dConfig::default())?;
@@ -171,6 +175,9 @@ pub(crate) struct ConvLayerConfig {
     pub depth: usize,
     pub downsample: bool,
     pub conv_expand_ratio: usize,
+    /// Spatial stride of the depthwise downsample conv (2 = halve resolution,
+    /// 1 = channel-only transition).
+    pub downsample_spatial_stride: usize,
 }
 
 pub(crate) struct ConvLayer {
@@ -187,6 +194,7 @@ impl ConvLayer {
             depth,
             downsample,
             conv_expand_ratio,
+            downsample_spatial_stride,
         } = cfg;
         let mut blocks = Vec::with_capacity(depth);
         for i in 0..depth {
@@ -204,8 +212,8 @@ impl ConvLayer {
                 device,
                 &mut vb.pp("downsample"),
                 input_resolution,
-                dim,
                 out,
+                downsample_spatial_stride,
             )?)
         } else {
             None
@@ -511,6 +519,9 @@ pub(crate) struct BasicLayerConfig {
     pub window_size: usize,
     pub downsample: bool,
     pub out: usize,
+    /// Spatial stride of the depthwise downsample conv (2 = halve resolution,
+    /// 1 = channel-only transition into the final TinyViT stage).
+    pub downsample_spatial_stride: usize,
 }
 
 pub(crate) struct BasicLayer {
@@ -528,6 +539,7 @@ impl BasicLayer {
             window_size,
             downsample,
             out,
+            downsample_spatial_stride,
         } = cfg;
         let mut blocks = Vec::with_capacity(depth);
         for i in 0..depth {
@@ -546,8 +558,8 @@ impl BasicLayer {
                 device,
                 &mut vb.pp("downsample"),
                 input_resolution,
-                dim,
                 out,
+                downsample_spatial_stride,
             )?)
         } else {
             None
@@ -567,6 +579,11 @@ impl BasicLayer {
     }
 }
 
+/// TinyViT image encoder used by Mobile-SAM.
+///
+/// `forward` takes a `(B, 3, IMG_SIZE, IMG_SIZE)` input and returns
+/// `(B, neck_dim, IMG_SIZE/16, IMG_SIZE/16)` features — same output shape as
+/// the standard `ImageEncoderViT` so both can plug into the prompt encoder.
 pub struct TinyViT {
     pub(crate) patch_embed: PatchEmbed,
     pub(crate) layer0: ConvLayer,
@@ -589,6 +606,8 @@ impl TinyViT {
         let patch_embed = PatchEmbed::load(device, &mut vb.pp("patch_embed"), embed_dims[0])?;
         let patches_resolution = IMG_SIZE / 4;
 
+        let num_layers = embed_dims.len();
+
         let layer0 = ConvLayer::load(
             device,
             &mut vb.pp("layers.0"),
@@ -599,13 +618,20 @@ impl TinyViT {
                 depth: depths[0],
                 downsample: true,
                 conv_expand_ratio: MBCONV_EXPAND_RATIO,
+                // ConvLayer always feeds a transformer stage that expects half
+                // the spatial resolution.
+                downsample_spatial_stride: 2,
             },
         )?;
 
-        let num_layers = embed_dims.len();
         let mut layers = Vec::with_capacity(num_layers - 1);
         for i_layer in 1..num_layers {
             let patches_resolution = patches_resolution / (1 << usize::min(i_layer, 2));
+            // The last PatchMerging in TinyViT is a channel-only transition
+            // into the final stage and must keep the spatial resolution.
+            // Detect it positionally instead of by checking the resulting
+            // embed_dim against a hard-coded list of model-specific values.
+            let downsample_spatial_stride = if i_layer + 2 < num_layers { 2 } else { 1 };
             let layer = BasicLayer::load(
                 device,
                 &mut vb.pp(format!("layers.{i_layer}")),
@@ -617,12 +643,12 @@ impl TinyViT {
                     window_size: window_sizes[i_layer],
                     downsample: i_layer < num_layers - 1,
                     out: embed_dims[usize::min(i_layer + 1, num_layers - 1)],
+                    downsample_spatial_stride,
                 },
             )?;
             layers.push(layer);
         }
 
-        let _last_embed_dim = embed_dims[embed_dims.len() - 1];
         let neck_conv1 =
             Conv2d::load_no_bias(device, &mut vb.pp("neck.0"), Conv2dConfig::default())?;
         let neck_ln1 = LayerNorm2d::load(device, &mut vb.pp("neck.1"), 1e-6)?;
@@ -659,13 +685,22 @@ impl TinyViT {
             xs = layer.forward(&xs);
         }
 
-        // Reshape to (B, 64, 64, C) then permute to (B, C, 64, 64)
+        // Reshape from BLC to BCHW. After all stages, L = (IMG_SIZE / total_stride)^2.
+        // We assume a square spatial layout (h == w) and derive it from L at
+        // runtime rather than hard-coding 64×64 for the 1024-px Mobile-SAM.
         let shape = xs.shape();
         let b = shape[0];
+        let l = shape[1];
         let c = shape[2];
-        let xs_reshaped = xs.reshape([b, 64, 64, c]);
-        let xs_t1 = xs_reshaped.transpose(2, 3); // (B, 64, C, 64)
-        let xs = xs_t1.transpose(1, 2); // (B, C, 64, 64)
+        let s = (l as f64).sqrt() as usize;
+        assert_eq!(
+            s * s,
+            l,
+            "TinyViT output token count ({l}) must be a perfect square"
+        );
+        let xs_reshaped = xs.reshape([b, s, s, c]);
+        let xs_t1 = xs_reshaped.transpose(2, 3); // (B, s, C, s)
+        let xs = xs_t1.transpose(1, 2); // (B, C, s, s)
 
         // Neck
         let xs = self.neck_conv1.forward(&xs);

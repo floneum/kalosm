@@ -14,10 +14,13 @@ struct Attention {
 }
 
 impl Attention {
+    /// Load Q/K/V/out projections. `embedding_dim` is asserted against the
+    /// loaded shapes; `downsample_rate` matches the SAM constructor signature
+    /// but is currently unused (the projection layout encodes the downsample).
     fn load(
         device: &Device,
         vb: &mut VarBuilder,
-        _embedding_dim: usize,
+        embedding_dim: usize,
         num_heads: usize,
         _downsample_rate: usize,
     ) -> Result<Self> {
@@ -25,6 +28,10 @@ impl Attention {
         let k_proj = Linear::load(device, &mut vb.pp("k_proj"))?;
         let v_proj = Linear::load(device, &mut vb.pp("v_proj"))?;
         let out_proj = Linear::load(device, &mut vb.pp("out_proj"))?;
+        debug_assert_eq!(q_proj.in_features(), embedding_dim, "Q proj dim mismatch");
+        debug_assert_eq!(k_proj.in_features(), embedding_dim, "K proj dim mismatch");
+        debug_assert_eq!(v_proj.in_features(), embedding_dim, "V proj dim mismatch");
+        debug_assert_eq!(out_proj.out_features(), embedding_dim, "out proj mismatch");
         Ok(Self {
             q_proj,
             k_proj,
@@ -128,8 +135,8 @@ impl TwoWayAttentionBlock {
         let mlp = MlpBlock::load(
             device,
             &mut vb.pp("mlp"),
-            embedding_dim,
-            mlp_dim,
+            Some(embedding_dim),
+            Some(mlp_dim),
             Activation::Relu,
         )?;
         Ok(Self {
@@ -185,6 +192,10 @@ impl TwoWayAttentionBlock {
     }
 }
 
+/// Two-way attention transformer used inside `MaskDecoder`. Alternates
+/// token→image and image→token cross-attention. `forward` takes
+/// `(image_embedding: (B, C, H, W), image_pe: (B, C, H, W), point_embedding:
+/// (B, N, C))` and returns the updated `(queries, keys)` 3D tensors.
 pub struct TwoWayTransformer {
     layers: Vec<TwoWayAttentionBlock>,
     final_attn_token_to_image: Attention,

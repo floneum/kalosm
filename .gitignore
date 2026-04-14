@@ -1,5 +1,6 @@
 /sandbox
 /target
+.claude/
 /db
 /documents
 /plugin/target

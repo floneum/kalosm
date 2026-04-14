@@ -52,6 +52,20 @@ impl<T: DataType + SimdElement + Default> Linear<T> {
     }
 }
 
+/// Run `q_mat_mul(weight)` over a 3D input by flattening (batch, seq, in) to
+/// (batch * seq, in), multiplying, then reshaping back. Shared by both the f32
+/// and the cast-via-f32 forward paths.
+fn q_mat_mul_3d(input: &Tensor<3, f32>, weight: &QMatrix) -> Tensor<3, f32> {
+    let [batch, seq_len, in_features] = input.shape();
+    let out_features = weight.shape()[0];
+
+    let input_2d: Tensor<2, f32> = input.reshape([batch * seq_len, in_features]).to_concrete();
+    let output_2d = input_2d.q_mat_mul(weight);
+    output_2d
+        .reshape([batch, seq_len, out_features])
+        .to_concrete()
+}
+
 // f32-specific implementations for loading and forward
 impl Linear<f32> {
     /// Load a Linear layer from a VarBuilder.
@@ -73,21 +87,8 @@ impl Linear<f32> {
     where
         B: fusor_cpu::TensorBacking<3, Elem = f32>,
     {
-        let shape = input.shape();
-        let batch = shape[0];
-        let seq_len = shape[1];
-        let in_features = shape[2];
-        let out_features = self.out_features();
-
-        // Flatten to 2D: (batch * seq_len, in_features)
-        let input_2d: Tensor<2, f32> = input.reshape([batch * seq_len, in_features]).to_concrete();
-        let output_2d = input_2d.q_mat_mul(&self.weight);
-
-        // Reshape back to 3D: (batch, seq_len, out_features)
-        let output: Tensor<3, f32> = output_2d
-            .reshape([batch, seq_len, out_features])
-            .to_concrete();
-
+        let input_concrete = input.to_concrete();
+        let output = q_mat_mul_3d(&input_concrete, &self.weight);
         if let Some(bias) = &self.bias {
             output.add_(bias)
         } else {
@@ -125,35 +126,14 @@ where
     where
         B: fusor_cpu::TensorBacking<3, Elem = T>,
     {
-        // Cast input to f32
         let input_f32 = input.cast::<f32>();
-
-        let shape = input_f32.shape();
-        let batch = shape[0];
-        let seq_len = shape[1];
-        let in_features = shape[2];
-        let out_features = self.weight.shape()[0];
-
-        // Flatten to 2D: (batch * seq_len, in_features)
-        let input_2d: Tensor<2, f32> = input_f32
-            .reshape([batch * seq_len, in_features])
-            .to_concrete();
-        let output_2d = input_2d.q_mat_mul(&self.weight);
-
-        // Reshape back to 3D: (batch, seq_len, out_features)
-        let output_f32: Tensor<3, f32> = output_2d
-            .reshape([batch, seq_len, out_features])
-            .to_concrete();
-
-        // Add bias if present (in f32)
+        let output_f32 = q_mat_mul_3d(&input_f32, &self.weight);
         let output_f32 = if let Some(bias) = &self.bias {
             let bias_f32: Tensor<1, f32> = bias.cast();
             output_f32.add_(&bias_f32)
         } else {
             output_f32
         };
-
-        // Cast back to T
         output_f32.cast()
     }
 }

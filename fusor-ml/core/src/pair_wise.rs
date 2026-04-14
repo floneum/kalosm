@@ -420,62 +420,50 @@ macro_rules! impl_pairwise_method {
 
 impl_pairwise_method!(pow, "pow(a, b)", "pow", pow_, |a, b| a.pow(&b));
 
-// Tensor-tensor comparison operations
-// These use format! instead of the macro because they need runtime type name insertion
+// Tensor-tensor comparison operations.
+//
+// These can't go through `impl_pairwise_method!` because the WGSL body needs
+// `T::WGSL_TYPE` interpolated at runtime (the macro uses a `&'static str`).
 impl<const R: usize, T: DataType> Tensor<R, T> {
-    /// Element-wise equality comparison between two tensors.
-    /// Returns 1.0 where elements are equal, 0.0 otherwise.
-    pub fn eq_tensor(&self, other: &Self) -> Self {
+    /// Element-wise comparison helper. Emits `output = T(a OP b);` in WGSL,
+    /// returning 1 where the predicate holds and 0 otherwise (cast back to T).
+    fn cmp_tensor(&self, other: &Self, op: &str, name: &'static str) -> Self {
         let datatype = T::WGSL_TYPE;
         self.pair_wise(
             other,
-            PairWiseFunction::new(format!("let output = {datatype}(a == b);"), T::WGSL_TYPE)
-                .with_name("eq_tensor"),
+            PairWiseFunction::new(format!("let output = {datatype}(a {op} b);"), T::WGSL_TYPE)
+                .with_name(name),
         )
+    }
+
+    /// Element-wise equality comparison between two tensors.
+    /// Returns 1 (in T) where elements are equal, 0 otherwise.
+    pub fn eq_tensor(&self, other: &Self) -> Self {
+        self.cmp_tensor(other, "==", "eq_tensor")
     }
 
     /// Element-wise less-than comparison between two tensors.
-    /// Returns 1.0 where self < other, 0.0 otherwise.
+    /// Returns 1 (in T) where self < other, 0 otherwise.
     pub fn lt_tensor(&self, other: &Self) -> Self {
-        let datatype = T::WGSL_TYPE;
-        self.pair_wise(
-            other,
-            PairWiseFunction::new(format!("let output = {datatype}(a < b);"), T::WGSL_TYPE)
-                .with_name("lt_tensor"),
-        )
+        self.cmp_tensor(other, "<", "lt_tensor")
     }
 
     /// Element-wise less-than-or-equal comparison between two tensors.
-    /// Returns 1.0 where self <= other, 0.0 otherwise.
+    /// Returns 1 (in T) where self <= other, 0 otherwise.
     pub fn lte_tensor(&self, other: &Self) -> Self {
-        let datatype = T::WGSL_TYPE;
-        self.pair_wise(
-            other,
-            PairWiseFunction::new(format!("let output = {datatype}(a <= b);"), T::WGSL_TYPE)
-                .with_name("lte_tensor"),
-        )
+        self.cmp_tensor(other, "<=", "lte_tensor")
     }
 
     /// Element-wise greater-than comparison between two tensors.
-    /// Returns 1.0 where self > other, 0.0 otherwise.
+    /// Returns 1 (in T) where self > other, 0 otherwise.
     pub fn gt_tensor(&self, other: &Self) -> Self {
-        let datatype = T::WGSL_TYPE;
-        self.pair_wise(
-            other,
-            PairWiseFunction::new(format!("let output = {datatype}(a > b);"), T::WGSL_TYPE)
-                .with_name("gt_tensor"),
-        )
+        self.cmp_tensor(other, ">", "gt_tensor")
     }
 
     /// Element-wise greater-than-or-equal comparison between two tensors.
-    /// Returns 1.0 where self >= other, 0.0 otherwise.
+    /// Returns 1 (in T) where self >= other, 0 otherwise.
     pub fn gte_tensor(&self, other: &Self) -> Self {
-        let datatype = T::WGSL_TYPE;
-        self.pair_wise(
-            other,
-            PairWiseFunction::new(format!("let output = {datatype}(a >= b);"), T::WGSL_TYPE)
-                .with_name("gte_tensor"),
-        )
+        self.cmp_tensor(other, ">=", "gte_tensor")
     }
 }
 

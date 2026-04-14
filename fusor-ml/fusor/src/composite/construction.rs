@@ -139,6 +139,23 @@ where
         }
     }
 
+    /// Create a tensor filled with ones on the specified device.
+    pub fn ones(device: &Device, shape: [usize; R]) -> Self {
+        Self::splat(device, D::one(), shape)
+    }
+
+    /// Create a tensor filled with ones that has the same shape as this tensor.
+    pub fn ones_like(&self) -> Self {
+        match self {
+            Tensor::Cpu(t) => {
+                let shape: [usize; R] = t.shape();
+                let n: usize = shape.iter().product();
+                Tensor::Cpu(fusor_cpu::Tensor::from_slice(shape, &vec![D::one(); n]))
+            }
+            Tensor::Gpu(t) => Tensor::Gpu(t.ones_like()),
+        }
+    }
+
     /// Create a tensor filled with a specific value.
     pub fn splat(device: &Device, value: D, shape: [usize; R]) -> Self {
         match device {
