@@ -37,12 +37,10 @@ use kalosm::vision::*;
 async fn main() {
     let model = SegmentAnything::builder().build().await.unwrap();
     let image = image::open("examples/landscape.jpg").unwrap();
-    let x = image.width() / 2;
-    let y = image.height() / 4;
     let images = model
         .segment_from_points(
             SegmentAnythingInferenceSettings::new(image)
-                .add_goal_point(x, y),
+                .add_goal_point(0.5, 0.25),
         )
         .await
         .unwrap();
