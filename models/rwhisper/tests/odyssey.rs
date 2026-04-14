@@ -6,8 +6,7 @@ use std::{io::Cursor, time::Duration};
 async fn transcribe_the_odyssey() -> Result<(), anyhow::Error> {
     tracing_subscriber::fmt::init();
     // First download the audio file from the internet
-    let url =
-        "https://archive.org/download/odyssey_2409_librivox/odyssey_00_homer.mp3";
+    let url = "https://archive.org/download/odyssey_2409_librivox/odyssey_00_homer.mp3";
     let response = reqwest::get(url).await?;
     let content = response.bytes().await?;
 
