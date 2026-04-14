@@ -18,7 +18,19 @@
       "Bash(GLINER_MODEL=/Users/evanalmloff/Desktop/Github/ner/models/rgliner/weights/gliner-relex-multi-v1.0.gguf cargo run:*)",
       "Bash(GLINER_MODEL=./weights/gliner-relex-multi-v1.0.gguf cargo run:*)",
       "Bash(cargo add:*)",
-      "Bash(pip install:*)"
+      "Bash(pip install:*)",
+      "Bash(mkdir -p /tmp/gguf-backup)",
+      "Bash(mv models/rgliner/weights/gliner-relex-base-v1.0.gguf /tmp/gguf-backup/)",
+      "Bash(mv models/rgliner/weights/gliner-relex-large-v0.5.gguf /tmp/gguf-backup/)",
+      "Bash(mv models/rgliner/weights/gliner-relex-large-v1.0.gguf /tmp/gguf-backup/)",
+      "Bash(mv models/rgliner/weights/gliner-relex-multi-v1.0.gguf /tmp/gguf-backup/)",
+      "Bash(mv models/rgliner/weights/gliner-relex-multi-v1.0.gguf /tmp/gguf-backup/gliner-relex-multi-v1.0.gguf.restored)",
+      "Bash(git filter-repo:*)",
+      "Bash(git filter-branch:*)",
+      "Bash(git stash:*)",
+      "Bash(FILTER_BRANCH_SQUELCH_WARNING=1 git filter-branch -f --index-filter 'git rm --cached --ignore-unmatch models/rgliner/weights/gliner-relex-multi-v1.0.gguf' d6d5c674..HEAD)",
+      "Bash(git ls-tree:*)",
+      "Bash(git push:*)"
     ]
   }
 }

@@ -109,6 +109,25 @@ impl GlinerRelExSource {
         }
     }
 
+    /// GLiNER-RelEx Large v1.0 source.
+    ///
+    /// English-only variant built on `deberta-v3-large` with `span_mode = markerV0`
+    /// and a 1024→768 projection between the encoder and downstream heads.
+    /// The most accurate variant but also the largest.
+    ///
+    /// Tokenizer and config are embedded in the GGUF file.
+    pub fn relex_large() -> Self {
+        Self {
+            model: FileSource::huggingface(
+                "knowledgator/gliner-relex-large-v1.0-gguf".to_string(),
+                "main".to_string(),
+                "gliner-relex-large-v1.0-Q8_0.gguf".to_string(),
+            ),
+            tokenizer: None,
+            config: None,
+        }
+    }
+
     /// Create a source from a local GGUF file.
     ///
     /// The tokenizer and config are expected to be embedded in the GGUF
