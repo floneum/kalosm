@@ -136,31 +136,6 @@ impl RelativePositionEmbedding {
             self.embeddings.to_concrete()
         }
     }
-
-    /// Get relative position embeddings for the given indices (legacy method).
-    /// Input: indices [seq_len, seq_len]
-    /// Output: embeddings [seq_len, seq_len, hidden_size]
-    pub fn forward(&self, indices: &Tensor<2, u32>) -> Tensor<3, f32> {
-        let [seq_len, _] = indices.shape();
-        let [_num_positions, hidden_size] = self.embeddings.shape();
-
-        // Get normalized embeddings
-        let normalized_embeddings = self.get_embeddings();
-
-        // Flatten indices and gather
-        let flat_indices = indices.reshape([seq_len * seq_len]).to_concrete();
-        let gathered = normalized_embeddings.index_select(0, &flat_indices);
-
-        // Reshape back to [seq_len, seq_len, hidden_size]
-        gathered
-            .reshape([seq_len, seq_len, hidden_size])
-            .to_concrete()
-    }
-
-    /// Get the maximum relative positions setting.
-    pub fn max_relative_positions(&self) -> usize {
-        self.max_relative_positions
-    }
 }
 
 /// mDeBERTa disentangled self-attention with shared key attention (share_att_key=True).
@@ -216,51 +191,42 @@ impl MDebertaAttention {
         rel_pos_indices: &Tensor<2, u32>,
         attention_mask: Option<&Tensor<2, u32>>,
     ) -> Tensor<3, f32> {
-        let [b_sz, seq_len, _] = hidden_states.shape();
-        let hidden_size = self.num_heads * self.head_dim;
-        let [num_positions, _] = rel_pos_emb.shape();
+        use super::super::utils::split_heads;
 
-        // Compute Q, K, V projections for content
-        let query = self.query.forward(hidden_states);
-        let key = self.key.forward(hidden_states);
-        let value = self.value.forward(hidden_states);
-
-        // Reshape to [batch, num_heads, seq_len, head_dim]
-        let query = query
-            .reshape([b_sz, seq_len, self.num_heads, self.head_dim])
-            .transpose(1, 2)
-            .to_concrete();
-        let key = key
-            .reshape([b_sz, seq_len, self.num_heads, self.head_dim])
-            .transpose(1, 2)
-            .to_concrete();
-        let value = value
-            .reshape([b_sz, seq_len, self.num_heads, self.head_dim])
-            .transpose(1, 2)
-            .to_concrete();
+        // Compute Q, K, V projections for content and reshape to
+        // [batch, num_heads, seq_len, head_dim].
+        let query = split_heads(
+            &self.query.forward(hidden_states),
+            self.num_heads,
+            self.head_dim,
+        );
+        let key = split_heads(
+            &self.key.forward(hidden_states),
+            self.num_heads,
+            self.head_dim,
+        );
+        let value = split_heads(
+            &self.value.forward(hidden_states),
+            self.num_heads,
+            self.head_dim,
+        );
 
         // === Content-to-Content attention ===
-        // c2c = Q @ K^T
         let c2c_scores = query.mat_mul(&key.transpose(2, 3));
 
         // === Position attention with shared Q/K projections ===
-        // Project position embeddings using the same Q and K projections
         // rel_pos_emb: [2*max_pos, hidden_size] -> [1, 2*max_pos, hidden_size]
         let rel_emb_3d: Tensor<3, f32> = rel_pos_emb.unsqueeze(0).to_concrete();
-
-        // pos_query = query_proj(rel_emb): [1, 2*max_pos, hidden] -> [1, heads, 2*max_pos, head_dim]
-        let pos_query = self.query.forward(&rel_emb_3d);
-        let pos_query = pos_query
-            .reshape([1, num_positions, self.num_heads, self.head_dim])
-            .transpose(1, 2)
-            .to_concrete();
-
-        // pos_key = key_proj(rel_emb): [1, 2*max_pos, hidden] -> [1, heads, 2*max_pos, head_dim]
-        let pos_key = self.key.forward(&rel_emb_3d);
-        let pos_key = pos_key
-            .reshape([1, num_positions, self.num_heads, self.head_dim])
-            .transpose(1, 2)
-            .to_concrete();
+        let pos_query = split_heads(
+            &self.query.forward(&rel_emb_3d),
+            self.num_heads,
+            self.head_dim,
+        );
+        let pos_key = split_heads(
+            &self.key.forward(&rel_emb_3d),
+            self.num_heads,
+            self.head_dim,
+        );
 
         // === Content-to-Position attention ===
         // c2p = Q @ pos_key^T -> [batch, heads, seq, 2*max_pos]
@@ -280,14 +246,9 @@ impl MDebertaAttention {
             .add_(&p2c_scores)
             .mul_scalar(self.scale);
 
-        // Apply attention mask
+        // Apply attention mask (broadcast bias to [batch, 1, 1, seq_len])
         let attn_scores = if let Some(mask) = attention_mask {
-            const MASK_NEG_VALUE: f32 = -10000.0;
-            let mask_f32: Tensor<2, f32> = mask.cast();
-            let zeros = mask_f32.zeros_like();
-            let ones = (zeros + 1.0f32).to_concrete();
-            let mask_bias = ((ones - mask_f32) * MASK_NEG_VALUE).to_concrete();
-            // Broadcast mask to [batch, 1, 1, seq_len]
+            let mask_bias = super::super::utils::attention_mask_to_bias(mask);
             let mask_bias_3d: Tensor<3, f32> = mask_bias.unsqueeze(1).to_concrete();
             let mask_bias_4d: Tensor<4, f32> = mask_bias_3d.unsqueeze(1).to_concrete();
             attn_scores.add_(&mask_bias_4d)
@@ -298,17 +259,9 @@ impl MDebertaAttention {
         // Softmax
         let attn_probs = attn_scores.softmax_last_dim::<3>();
 
-        // Apply attention to values
+        // Apply attention to values and merge heads back to [batch, seq_len, hidden].
         let context = attn_probs.mat_mul(&value);
-
-        // Reshape back to [batch, seq_len, hidden_size]
-        let context = context
-            .transpose(1, 2)
-            .to_concrete()
-            .reshape([b_sz, seq_len, hidden_size])
-            .to_concrete();
-
-        // Output projection
+        let context = super::super::utils::merge_heads(&context);
         self.output.forward(&context)
     }
 
@@ -410,65 +363,6 @@ impl MDebertaAttention {
             .reshape([b_sz, num_heads, seq_len, seq_len])
             .to_concrete()
     }
-
-    /// Legacy forward pass (for compatibility).
-    pub fn forward(
-        &self,
-        hidden_states: &Tensor<3, f32>,
-        rel_pos_emb: Option<&Tensor<3, f32>>,
-        attention_mask: Option<&Tensor<2, u32>>,
-    ) -> Tensor<3, f32> {
-        // This method is kept for backward compatibility but shouldn't be used
-        // with the new architecture
-        if rel_pos_emb.is_some() {
-            panic!("Use forward_with_indices for proper position attention");
-        }
-
-        let [b_sz, seq_len, _] = hidden_states.shape();
-        let hidden_size = self.num_heads * self.head_dim;
-
-        let query = self.query.forward(hidden_states);
-        let key = self.key.forward(hidden_states);
-        let value = self.value.forward(hidden_states);
-
-        let query = query
-            .reshape([b_sz, seq_len, self.num_heads, self.head_dim])
-            .transpose(1, 2)
-            .to_concrete();
-        let key = key
-            .reshape([b_sz, seq_len, self.num_heads, self.head_dim])
-            .transpose(1, 2)
-            .to_concrete();
-        let value = value
-            .reshape([b_sz, seq_len, self.num_heads, self.head_dim])
-            .transpose(1, 2)
-            .to_concrete();
-
-        let c2c_scores = query.mat_mul(&key.transpose(2, 3));
-        let attn_scores = c2c_scores.mul_scalar(1.0 / (self.head_dim as f32).sqrt());
-
-        let attn_scores = if let Some(mask) = attention_mask {
-            const MASK_NEG_VALUE: f32 = -10000.0;
-            let mask_f32: Tensor<2, f32> = mask.cast();
-            let zeros = mask_f32.zeros_like();
-            let ones = (zeros + 1.0f32).to_concrete();
-            let mask_bias = ((ones - mask_f32) * MASK_NEG_VALUE).to_concrete();
-            let mask_bias_3d: Tensor<3, f32> = mask_bias.unsqueeze(1).to_concrete();
-            let mask_bias_4d: Tensor<4, f32> = mask_bias_3d.unsqueeze(1).to_concrete();
-            attn_scores.add_(&mask_bias_4d)
-        } else {
-            attn_scores
-        };
-
-        let attn_probs = attn_scores.softmax_last_dim::<3>();
-        let context = attn_probs.mat_mul(&value);
-        let context = context
-            .transpose(1, 2)
-            .to_concrete()
-            .reshape([b_sz, seq_len, hidden_size])
-            .to_concrete();
-        self.output.forward(&context)
-    }
 }
 
 /// Shared relative position embedding layer (used across all layers in DeBERTa).
@@ -501,15 +395,5 @@ impl DisentangledSelfAttention {
             rel_pos_indices,
             attention_mask,
         )
-    }
-
-    pub fn forward(
-        &self,
-        hidden_states: &Tensor<3, f32>,
-        rel_pos_emb: Option<&Tensor<3, f32>>,
-        attention_mask: Option<&Tensor<2, u32>>,
-    ) -> Tensor<3, f32> {
-        self.attention
-            .forward(hidden_states, rel_pos_emb, attention_mask)
     }
 }

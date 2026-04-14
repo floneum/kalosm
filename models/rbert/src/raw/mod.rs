@@ -19,6 +19,7 @@ use intermediate_layer::*;
 pub mod mdeberta;
 pub mod modern_bert;
 pub mod qwen;
+mod utils;
 
 pub use mdeberta::{MDebertaConfig, MDebertaModel};
 pub use modern_bert::{ModernBertConfig, ModernBertModel};

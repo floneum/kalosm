@@ -71,24 +71,4 @@ impl MDebertaLayer {
         let ffn_output = self.feed_forward.forward(&hidden_states);
         self.output_norm.forward(&hidden_states.add_(&ffn_output))
     }
-
-    /// Legacy forward pass (for compatibility).
-    pub fn forward(
-        &self,
-        hidden_states: &Tensor<3, f32>,
-        rel_pos_emb: Option<&Tensor<3, f32>>,
-        attention_mask: Option<&Tensor<2, u32>>,
-    ) -> Tensor<3, f32> {
-        // Self-attention + residual + norm
-        let attn_output = self
-            .attention
-            .forward(hidden_states, rel_pos_emb, attention_mask);
-        let hidden_states = self
-            .attention_norm
-            .forward(&hidden_states.add_(&attn_output));
-
-        // FFN + residual + norm
-        let ffn_output = self.feed_forward.forward(&hidden_states);
-        self.output_norm.forward(&hidden_states.add_(&ffn_output))
-    }
 }

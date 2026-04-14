@@ -2,6 +2,8 @@
 
 use fusor::{Result, VarBuilder};
 
+use super::super::utils::{load_f32_or, load_u32, load_u32_or};
+
 /// Configuration for ModernBERT loaded from GGUF metadata.
 #[derive(Debug, Clone)]
 pub struct ModernBertConfig {
@@ -28,29 +30,10 @@ pub struct ModernBertConfig {
 impl ModernBertConfig {
     /// Load configuration from GGUF metadata.
     pub fn from_gguf(vb: &VarBuilder) -> Result<Self> {
-        let num_heads = vb
-            .get_metadata(".attention.head_count")
-            .and_then(|v| v.to_u32().ok())
-            .ok_or_else(|| {
-                fusor::Error::msg("Missing required GGUF metadata: .attention.head_count")
-            })? as usize;
-
-        let num_kv_heads = vb
-            .get_metadata(".attention.head_count_kv")
-            .and_then(|v| v.to_u32().ok())
-            .unwrap_or(num_heads as u32) as usize;
-
-        let num_layers = vb
-            .get_metadata(".block_count")
-            .and_then(|v| v.to_u32().ok())
-            .ok_or_else(|| fusor::Error::msg("Missing required GGUF metadata: .block_count"))?
-            as usize;
-
-        let hidden_size = vb
-            .get_metadata(".embedding_length")
-            .and_then(|v| v.to_u32().ok())
-            .ok_or_else(|| fusor::Error::msg("Missing required GGUF metadata: .embedding_length"))?
-            as usize;
+        let num_heads = load_u32(vb, ".attention.head_count")? as usize;
+        let num_kv_heads = load_u32_or(vb, ".attention.head_count_kv", num_heads as u32) as usize;
+        let num_layers = load_u32(vb, ".block_count")? as usize;
+        let hidden_size = load_u32(vb, ".embedding_length")? as usize;
 
         if hidden_size % num_heads != 0 {
             return Err(fusor::Error::msg(format!(
@@ -58,33 +41,20 @@ impl ModernBertConfig {
             )));
         }
 
-        let intermediate_size = vb
-            .get_metadata(".feed_forward_length")
-            .and_then(|v| v.to_u32().ok())
-            .unwrap_or((hidden_size * 4) as u32) as usize;
+        let intermediate_size =
+            load_u32_or(vb, ".feed_forward_length", (hidden_size * 4) as u32) as usize;
+        let context_length = load_u32_or(vb, ".context_length", 8192) as usize;
+        let rope_theta = load_f32_or(vb, ".rope.freq_base", 10000.0);
+        let norm_eps = load_f32_or(vb, ".attention.layer_norm_rms_epsilon", 1e-6);
 
-        let context_length = vb
-            .get_metadata(".context_length")
-            .and_then(|v| v.to_u32().ok())
-            .unwrap_or(8192) as usize;
-
-        let rope_theta = vb
-            .get_metadata(".rope.freq_base")
-            .and_then(|v| v.to_f32().ok())
-            .unwrap_or(10000.0);
-
-        let norm_eps = vb
-            .get_metadata(".attention.layer_norm_rms_epsilon")
-            .and_then(|v| v.to_f32().ok())
-            .unwrap_or(1e-6);
-
-        // Use attention.key_length for head dimension
-        // Fall back to hidden_size / num_heads if not present
-        let head_dimension = vb
-            .get_metadata(".attention.key_length")
-            .and_then(|v| v.to_u32().ok())
-            .map(|x| x as usize)
-            .unwrap_or_else(|| hidden_size / num_heads);
+        // Use attention.key_length for head dimension; fall back to
+        // hidden_size / num_heads if not present.
+        let head_dimension = load_u32_or(vb, ".attention.key_length", 0);
+        let head_dimension = if head_dimension == 0 {
+            hidden_size / num_heads
+        } else {
+            head_dimension as usize
+        };
 
         Ok(Self {
             num_heads,

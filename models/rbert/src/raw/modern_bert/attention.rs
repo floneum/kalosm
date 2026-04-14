@@ -40,30 +40,28 @@ impl ModernBertAttention {
         rope_cache: &RopeCache,
         attention_mask: Option<&Tensor<2, u32>>,
     ) -> Tensor<3, f32> {
-        let [b_sz, seq_len, _hidden_size] = hidden_states.shape();
         let hidden_size = self.num_heads * self.head_dim;
 
         // Compute fused QKV projection: [batch, seq_len, 3 * hidden_size]
         let qkv = hidden_states.q_mat_mul(&self.wqkv).to_concrete();
 
-        // Split into Q, K, V - each [batch, seq_len, hidden_size]
-        let query_states = qkv
-            .narrow(2, 0, hidden_size)
-            .reshape([b_sz, seq_len, self.num_heads, self.head_dim])
-            .transpose(1, 2)
-            .to_concrete();
-
-        let key_states = qkv
-            .narrow(2, hidden_size, hidden_size)
-            .reshape([b_sz, seq_len, self.num_kv_heads, self.head_dim])
-            .transpose(1, 2)
-            .to_concrete();
-
-        let value_states = qkv
-            .narrow(2, 2 * hidden_size, hidden_size)
-            .reshape([b_sz, seq_len, self.num_kv_heads, self.head_dim])
-            .transpose(1, 2)
-            .to_concrete();
+        // Split into Q, K, V - each [batch, num_heads (or kv_heads), seq_len, head_dim]
+        use super::super::utils::split_heads;
+        let query_states = split_heads(
+            &qkv.narrow(2, 0, hidden_size).to_concrete(),
+            self.num_heads,
+            self.head_dim,
+        );
+        let key_states = split_heads(
+            &qkv.narrow(2, hidden_size, hidden_size).to_concrete(),
+            self.num_kv_heads,
+            self.head_dim,
+        );
+        let value_states = split_heads(
+            &qkv.narrow(2, 2 * hidden_size, hidden_size).to_concrete(),
+            self.num_kv_heads,
+            self.head_dim,
+        );
 
         // Apply RoPE to Q and K
         let (query_states, key_states) = rope_cache.forward(&query_states, &key_states, 0);
@@ -71,14 +69,7 @@ impl ModernBertAttention {
         // Scaled dot-product attention
         let scale = 1.0 / (self.head_dim as f32).sqrt();
 
-        // Convert attention mask for flash attention if provided
-        const MASK_NEG_VALUE: f32 = -10000.0;
-        let mask: Option<Tensor<2, f32>> = attention_mask.map(|m| {
-            let mask_f32: Tensor<2, f32> = m.cast();
-            let zeros = mask_f32.zeros_like();
-            let ones = (zeros + 1.0f32).to_concrete();
-            ((ones - mask_f32) * MASK_NEG_VALUE).to_concrete()
-        });
+        let mask = attention_mask.map(super::super::utils::attention_mask_to_bias);
 
         let attn_output = query_states.flash_attention(
             &key_states,
@@ -87,13 +78,8 @@ impl ModernBertAttention {
             mask.as_ref().map(|m| (m, fusor::MaskKind::BatchKeyMask)),
         );
 
-        // Reshape and project output
-        let attn_output = attn_output.transpose(1, 2);
-        let attn_output = attn_output
-            .to_concrete()
-            .reshape([b_sz, seq_len, hidden_size])
-            .to_concrete();
-
+        // Merge heads and project output
+        let attn_output = super::super::utils::merge_heads(&attn_output);
         attn_output.q_mat_mul(&self.wo)
     }
 }

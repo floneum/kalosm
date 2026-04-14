@@ -34,15 +34,7 @@ impl BertSelfAttention {
     }
 
     pub(crate) fn transpose_for_scores(&self, xs: &Tensor<3, f32>) -> Tensor<4, f32> {
-        let shape = xs.shape();
-        let new_x_shape = [
-            shape[0],
-            shape[1],
-            self.num_attention_heads,
-            self.attention_head_size,
-        ];
-
-        xs.reshape(new_x_shape).transpose(1, 2).to_concrete()
+        super::utils::split_heads(xs, self.num_attention_heads, self.attention_head_size)
     }
 
     pub(crate) fn forward(
@@ -60,13 +52,7 @@ impl BertSelfAttention {
         let value_layer = self.transpose_for_scores(&value_layer);
 
         let scale = 1.0 / (self.attention_head_size as f32).sqrt();
-        const MASK_NEG_VALUE: f32 = -10000.0;
-        let mask: Option<Tensor<2, f32>> = attention_mask.map(|m| {
-            let mask_f32: Tensor<2, f32> = m.cast();
-            let zeros = mask_f32.zeros_like();
-            let ones = (zeros + 1.0f32).to_concrete();
-            ((ones - mask_f32) * MASK_NEG_VALUE).to_concrete()
-        });
+        let mask = attention_mask.map(super::utils::attention_mask_to_bias);
 
         let context_layer = {
             let _enter_sm = self.span_softmax.enter();
@@ -101,13 +87,7 @@ impl BertSelfAttention {
         let value_layer = self.transpose_for_scores(&value_layer);
 
         let scale = 1.0 / (self.attention_head_size as f32).sqrt();
-        const MASK_NEG_VALUE: f32 = -10000.0;
-        let mask: Option<Tensor<2, f32>> = attention_mask.map(|m| {
-            let mask_f32: Tensor<2, f32> = m.cast();
-            let zeros = mask_f32.zeros_like();
-            let ones = (zeros + 1.0f32).to_concrete();
-            ((ones - mask_f32) * MASK_NEG_VALUE).to_concrete()
-        });
+        let mask = attention_mask.map(super::utils::attention_mask_to_bias);
 
         let context_layer = {
             let _enter_sm = self.span_softmax.enter();
