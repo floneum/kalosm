@@ -13,14 +13,32 @@ This script converts both:
 import argparse
 import json
 import os
+import shutil
 import struct
+import subprocess
 import sys
+import tempfile
 from pathlib import Path
 from typing import Any, Dict, List, Tuple
 
 import numpy as np
 import torch
 from huggingface_hub import hf_hub_download, snapshot_download
+
+
+# Quantization targets. In-process ones are packed directly by `gguf.quants.quantize`;
+# k-quants are produced by shelling out to `llama-quantize` post-hoc.
+IN_PROCESS_QUANTS = {
+    "f32", "f16", "bf16",
+    "q4_0", "q4_1", "q5_0", "q5_1", "q8_0",
+}
+LLAMA_QUANT_TYPES = {
+    "q2_k", "q3_k", "q3_k_s", "q3_k_m", "q3_k_l",
+    "q4_k", "q4_k_s", "q4_k_m",
+    "q5_k", "q5_k_s", "q5_k_m",
+    "q6_k",
+}
+QUANT_TYPES = IN_PROCESS_QUANTS | LLAMA_QUANT_TYPES
 
 
 # GGUF constants
@@ -54,21 +72,73 @@ GGML_TYPE_Q8_1 = 9
 GGML_TYPE_BF16 = 30
 
 
+def _ggml_type_for(quant: str) -> int:
+    return {
+        "f32": GGML_TYPE_F32,
+        "f16": GGML_TYPE_F16,
+        "bf16": GGML_TYPE_BF16,
+        "q4_0": GGML_TYPE_Q4_0,
+        "q4_1": GGML_TYPE_Q4_1,
+        "q5_0": GGML_TYPE_Q5_0,
+        "q5_1": GGML_TYPE_Q5_1,
+        "q8_0": GGML_TYPE_Q8_0,
+    }[quant]
+
+
+def _name_for_type(ggml_type: int) -> str:
+    return {
+        GGML_TYPE_F32: "F32",
+        GGML_TYPE_F16: "F16",
+        GGML_TYPE_BF16: "BF16",
+        GGML_TYPE_Q4_0: "Q4_0",
+        GGML_TYPE_Q4_1: "Q4_1",
+        GGML_TYPE_Q5_0: "Q5_0",
+        GGML_TYPE_Q5_1: "Q5_1",
+        GGML_TYPE_Q8_0: "Q8_0",
+    }.get(ggml_type, f"type={ggml_type}")
+
+
+def _gguf_block_quant(data: np.ndarray, quant: str) -> np.ndarray:
+    """Return the packed byte array for a block-quantised tensor."""
+    import gguf
+    qtype = {
+        "q4_0": gguf.GGMLQuantizationType.Q4_0,
+        "q4_1": gguf.GGMLQuantizationType.Q4_1,
+        "q5_0": gguf.GGMLQuantizationType.Q5_0,
+        "q5_1": gguf.GGMLQuantizationType.Q5_1,
+        "q8_0": gguf.GGMLQuantizationType.Q8_0,
+    }[quant]
+    return gguf.quants.quantize(data, qtype)
+
+
+class _U32(int):
+    """Force a metadata int to be written as GGUF u32 (required by llama-quantize's arch loader)."""
+
+
 class GGUFWriter:
     """Simple GGUF file writer."""
 
     def __init__(self, path: str):
         self.path = path
         self.metadata: Dict[str, Any] = {}
-        self.tensors: List[Tuple[str, np.ndarray, int]] = []  # (name, data, ggml_type)
+        # (name, data, ggml_type, logical_shape)
+        self.tensors: List[Tuple[str, np.ndarray, int, Tuple[int, ...]]] = []
 
     def add_metadata(self, key: str, value: Any):
         """Add metadata key-value pair."""
         self.metadata[key] = value
 
-    def add_tensor(self, name: str, data: np.ndarray, ggml_type: int = GGML_TYPE_F32):
-        """Add a tensor."""
-        self.tensors.append((name, data, ggml_type))
+    def add_tensor(
+        self,
+        name: str,
+        data: np.ndarray,
+        ggml_type: int = GGML_TYPE_F32,
+        shape: Tuple[int, ...] = None,
+    ):
+        """Add a tensor. `shape` is the logical (un-packed) shape; defaults to data.shape."""
+        if shape is None:
+            shape = tuple(data.shape)
+        self.tensors.append((name, data, ggml_type, tuple(shape)))
 
     def _write_string(self, f, s: str):
         """Write a GGUF string (length-prefixed UTF-8)."""
@@ -81,6 +151,9 @@ class GGUFWriter:
         if isinstance(value, bool):
             f.write(struct.pack('<I', GGUF_TYPE_BOOL))
             f.write(struct.pack('<B', 1 if value else 0))
+        elif isinstance(value, _U32):
+            f.write(struct.pack('<I', GGUF_TYPE_UINT32))
+            f.write(struct.pack('<I', int(value)))
         elif isinstance(value, int):
             if value < 0:
                 f.write(struct.pack('<I', GGUF_TYPE_INT64))
@@ -137,7 +210,7 @@ class GGUFWriter:
             tensor_data_offset = 0
             tensor_infos = []
 
-            for name, data, ggml_type in self.tensors:
+            for name, data, ggml_type, shape in self.tensors:
                 # Ensure contiguous and correct dtype
                 if ggml_type == GGML_TYPE_F32:
                     data = np.ascontiguousarray(data, dtype=np.float32)
@@ -153,8 +226,8 @@ class GGUFWriter:
                 # GGUF stores dimensions in reverse order (column-major)
                 # Reader reverses them back, so we write reversed to get original order
                 self._write_string(f, name)
-                f.write(struct.pack('<I', len(data.shape)))  # n_dims
-                for dim in reversed(data.shape):
+                f.write(struct.pack('<I', len(shape)))
+                for dim in reversed(shape):
                     f.write(struct.pack('<Q', dim))
                 f.write(struct.pack('<I', ggml_type))
                 f.write(struct.pack('<Q', tensor_data_offset))
@@ -172,7 +245,7 @@ class GGUFWriter:
             f.write(b'\x00' * padding_needed)
 
             # Tensor data
-            for (data, _), (name, _, ggml_type) in zip(tensor_infos, self.tensors):
+            for (data, _), (name, _, ggml_type, _shape) in zip(tensor_infos, self.tensors):
                 f.write(data.tobytes())
                 # Align to 32 bytes
                 padding = (32 - (data.nbytes % 32)) % 32

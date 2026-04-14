@@ -716,8 +716,16 @@ mod gpu_parity_tests {
         .unwrap();
 
         let single_label = ["organization"];
-        let cpu_single_label_embeddings = cpu.label_encoder.encode_labels(&single_label).await.unwrap();
-        let gpu_single_label_embeddings = gpu.label_encoder.encode_labels(&single_label).await.unwrap();
+        let cpu_single_label_embeddings = cpu
+            .label_encoder
+            .encode_labels(&single_label)
+            .await
+            .unwrap();
+        let gpu_single_label_embeddings = gpu
+            .label_encoder
+            .encode_labels(&single_label)
+            .await
+            .unwrap();
         let _ = print_diff(
             "single_label_embeddings",
             &cpu_single_label_embeddings,
@@ -749,9 +757,16 @@ mod gpu_parity_tests {
         .await
         .unwrap();
 
-        let (cpu_label_states, _) = cpu.label_encoder.debug_sentence_hidden_states(&labels).unwrap();
-        let (gpu_label_states, _) = gpu.label_encoder.debug_sentence_hidden_states(&labels).unwrap();
-        for (idx, (cpu_state, gpu_state)) in cpu_label_states.iter().zip(&gpu_label_states).enumerate()
+        let (cpu_label_states, _) = cpu
+            .label_encoder
+            .debug_sentence_hidden_states(&labels)
+            .unwrap();
+        let (gpu_label_states, _) = gpu
+            .label_encoder
+            .debug_sentence_hidden_states(&labels)
+            .unwrap();
+        for (idx, (cpu_state, gpu_state)) in
+            cpu_label_states.iter().zip(&gpu_label_states).enumerate()
         {
             let name = if idx == 0 {
                 "label_post_embeddings".to_string()
@@ -762,9 +777,13 @@ mod gpu_parity_tests {
         }
 
         let (cpu_label_layer0_attention, cpu_label_layer0_intermediate, cpu_label_layer0_output) =
-            cpu.label_encoder.debug_sentence_first_layer(&labels).unwrap();
+            cpu.label_encoder
+                .debug_sentence_first_layer(&labels)
+                .unwrap();
         let (gpu_label_layer0_attention, gpu_label_layer0_intermediate, gpu_label_layer0_output) =
-            gpu.label_encoder.debug_sentence_first_layer(&labels).unwrap();
+            gpu.label_encoder
+                .debug_sentence_first_layer(&labels)
+                .unwrap();
         let _ = print_diff(
             "label_layer0_attention_output",
             &cpu_label_layer0_attention,
@@ -886,9 +905,13 @@ mod gpu_parity_tests {
 
         let cpu_label_embeddings = cpu.label_encoder.encode_labels(&labels).await.unwrap();
         let gpu_label_embeddings = gpu.label_encoder.encode_labels(&labels).await.unwrap();
-        let _ = print_diff("label_embeddings", &cpu_label_embeddings, &gpu_label_embeddings)
-            .await
-            .unwrap();
+        let _ = print_diff(
+            "label_embeddings",
+            &cpu_label_embeddings,
+            &gpu_label_embeddings,
+        )
+        .await
+        .unwrap();
 
         let (cpu_token_ids, cpu_attention_mask) = build_text_inputs(&cpu_tokenized, &cpu_device);
         let (gpu_token_ids, gpu_attention_mask) = build_text_inputs(&gpu_tokenized, &gpu_device);
@@ -906,7 +929,8 @@ mod gpu_parity_tests {
             .text_encoder
             .debug_hidden_states(&gpu_token_ids, Some(&gpu_attention_mask));
 
-        for (idx, (cpu_state, gpu_state)) in cpu_text_states.iter().zip(&gpu_text_states).enumerate()
+        for (idx, (cpu_state, gpu_state)) in
+            cpu_text_states.iter().zip(&gpu_text_states).enumerate()
         {
             let name = if idx + 1 == cpu_text_states.len() {
                 "text_final_norm_output".to_string()
@@ -983,32 +1007,62 @@ mod gpu_parity_tests {
         let [b_sz, seq_len, _] = cpu_layer0_qkv_projection.shape();
         let cpu_query_states = cpu_layer0_qkv_projection
             .narrow(2, 0, hidden_size)
-            .reshape([b_sz, seq_len, text_config.num_heads, text_config.head_dimension])
+            .reshape([
+                b_sz,
+                seq_len,
+                text_config.num_heads,
+                text_config.head_dimension,
+            ])
             .transpose(1, 2)
             .to_concrete();
         let cpu_key_states = cpu_layer0_qkv_projection
             .narrow(2, hidden_size, hidden_size)
-            .reshape([b_sz, seq_len, text_config.num_kv_heads, text_config.head_dimension])
+            .reshape([
+                b_sz,
+                seq_len,
+                text_config.num_kv_heads,
+                text_config.head_dimension,
+            ])
             .transpose(1, 2)
             .to_concrete();
         let cpu_value_states = cpu_layer0_qkv_projection
             .narrow(2, 2 * hidden_size, hidden_size)
-            .reshape([b_sz, seq_len, text_config.num_kv_heads, text_config.head_dimension])
+            .reshape([
+                b_sz,
+                seq_len,
+                text_config.num_kv_heads,
+                text_config.head_dimension,
+            ])
             .transpose(1, 2)
             .to_concrete();
         let gpu_query_states = gpu_layer0_qkv_projection
             .narrow(2, 0, hidden_size)
-            .reshape([b_sz, seq_len, text_config.num_heads, text_config.head_dimension])
+            .reshape([
+                b_sz,
+                seq_len,
+                text_config.num_heads,
+                text_config.head_dimension,
+            ])
             .transpose(1, 2)
             .to_concrete();
         let gpu_key_states = gpu_layer0_qkv_projection
             .narrow(2, hidden_size, hidden_size)
-            .reshape([b_sz, seq_len, text_config.num_kv_heads, text_config.head_dimension])
+            .reshape([
+                b_sz,
+                seq_len,
+                text_config.num_kv_heads,
+                text_config.head_dimension,
+            ])
             .transpose(1, 2)
             .to_concrete();
         let gpu_value_states = gpu_layer0_qkv_projection
             .narrow(2, 2 * hidden_size, hidden_size)
-            .reshape([b_sz, seq_len, text_config.num_kv_heads, text_config.head_dimension])
+            .reshape([
+                b_sz,
+                seq_len,
+                text_config.num_kv_heads,
+                text_config.head_dimension,
+            ])
             .transpose(1, 2)
             .to_concrete();
 
@@ -1217,32 +1271,62 @@ mod gpu_parity_tests {
 
         let cpu_layer2_query_states = cpu_layer2_qkv_projection
             .narrow(2, 0, hidden_size)
-            .reshape([b_sz, seq_len, text_config.num_heads, text_config.head_dimension])
+            .reshape([
+                b_sz,
+                seq_len,
+                text_config.num_heads,
+                text_config.head_dimension,
+            ])
             .transpose(1, 2)
             .to_concrete();
         let cpu_layer2_key_states = cpu_layer2_qkv_projection
             .narrow(2, hidden_size, hidden_size)
-            .reshape([b_sz, seq_len, text_config.num_kv_heads, text_config.head_dimension])
+            .reshape([
+                b_sz,
+                seq_len,
+                text_config.num_kv_heads,
+                text_config.head_dimension,
+            ])
             .transpose(1, 2)
             .to_concrete();
         let cpu_layer2_value_states = cpu_layer2_qkv_projection
             .narrow(2, 2 * hidden_size, hidden_size)
-            .reshape([b_sz, seq_len, text_config.num_kv_heads, text_config.head_dimension])
+            .reshape([
+                b_sz,
+                seq_len,
+                text_config.num_kv_heads,
+                text_config.head_dimension,
+            ])
             .transpose(1, 2)
             .to_concrete();
         let gpu_layer2_query_states = gpu_layer2_qkv_projection
             .narrow(2, 0, hidden_size)
-            .reshape([b_sz, seq_len, text_config.num_heads, text_config.head_dimension])
+            .reshape([
+                b_sz,
+                seq_len,
+                text_config.num_heads,
+                text_config.head_dimension,
+            ])
             .transpose(1, 2)
             .to_concrete();
         let gpu_layer2_key_states = gpu_layer2_qkv_projection
             .narrow(2, hidden_size, hidden_size)
-            .reshape([b_sz, seq_len, text_config.num_kv_heads, text_config.head_dimension])
+            .reshape([
+                b_sz,
+                seq_len,
+                text_config.num_kv_heads,
+                text_config.head_dimension,
+            ])
             .transpose(1, 2)
             .to_concrete();
         let gpu_layer2_value_states = gpu_layer2_qkv_projection
             .narrow(2, 2 * hidden_size, hidden_size)
-            .reshape([b_sz, seq_len, text_config.num_kv_heads, text_config.head_dimension])
+            .reshape([
+                b_sz,
+                seq_len,
+                text_config.num_kv_heads,
+                text_config.head_dimension,
+            ])
             .transpose(1, 2)
             .to_concrete();
 
@@ -1381,10 +1465,12 @@ mod gpu_parity_tests {
             "ffn_gate_up.weight",
             &gpu_device,
         );
-        let cpu_layer2_ffn_gate_up_proj =
-            cpu_layer2_ffn_input.q_mat_mul(&cpu_layer2_ffn_gate_up).to_concrete();
-        let gpu_layer2_ffn_gate_up_proj =
-            gpu_layer2_ffn_input.q_mat_mul(&gpu_layer2_ffn_gate_up).to_concrete();
+        let cpu_layer2_ffn_gate_up_proj = cpu_layer2_ffn_input
+            .q_mat_mul(&cpu_layer2_ffn_gate_up)
+            .to_concrete();
+        let gpu_layer2_ffn_gate_up_proj = gpu_layer2_ffn_input
+            .q_mat_mul(&gpu_layer2_ffn_gate_up)
+            .to_concrete();
         let _ = print_diff(
             "text_layer2_ffn_gate_up_projection",
             &cpu_layer2_ffn_gate_up_proj,
@@ -1397,13 +1483,19 @@ mod gpu_parity_tests {
         let cpu_layer2_gate = cpu_layer2_ffn_gate_up_proj
             .narrow(2, 0, layer2_intermediate_size)
             .to_concrete();
-        let cpu_layer2_up = cpu_layer2_ffn_gate_up_proj
-            .narrow(2, layer2_intermediate_size, layer2_intermediate_size);
+        let cpu_layer2_up = cpu_layer2_ffn_gate_up_proj.narrow(
+            2,
+            layer2_intermediate_size,
+            layer2_intermediate_size,
+        );
         let gpu_layer2_gate = gpu_layer2_ffn_gate_up_proj
             .narrow(2, 0, layer2_intermediate_size)
             .to_concrete();
-        let gpu_layer2_up = gpu_layer2_ffn_gate_up_proj
-            .narrow(2, layer2_intermediate_size, layer2_intermediate_size);
+        let gpu_layer2_up = gpu_layer2_ffn_gate_up_proj.narrow(
+            2,
+            layer2_intermediate_size,
+            layer2_intermediate_size,
+        );
         let cpu_layer2_ffn_activated = cpu_layer2_gate.gelu().mul_(&cpu_layer2_up);
         let gpu_layer2_ffn_activated = gpu_layer2_gate.gelu().mul_(&gpu_layer2_up);
         let _ = print_diff(
@@ -1442,26 +1534,38 @@ mod gpu_parity_tests {
             .await
             .unwrap();
 
-        let _ = print_diff("token_embeddings", &cpu_token_embeddings, &gpu_token_embeddings)
-            .await
-            .unwrap();
+        let _ = print_diff(
+            "token_embeddings",
+            &cpu_token_embeddings,
+            &gpu_token_embeddings,
+        )
+        .await
+        .unwrap();
 
         let (cpu_word_embeddings, _) =
             first_subtoken_pooling(&cpu_token_embeddings, &[cpu_tokenized.clone()], &cpu_device);
         let (gpu_word_embeddings, _) =
             first_subtoken_pooling(&gpu_token_embeddings, &[gpu_tokenized.clone()], &gpu_device);
-        let _ = print_diff("word_embeddings", &cpu_word_embeddings, &gpu_word_embeddings)
-            .await
-            .unwrap();
+        let _ = print_diff(
+            "word_embeddings",
+            &cpu_word_embeddings,
+            &gpu_word_embeddings,
+        )
+        .await
+        .unwrap();
 
         let (cpu_span_embeddings, cpu_span_indices) =
             cpu.span_layer.forward(&cpu_word_embeddings, &cpu_device);
         let (gpu_span_embeddings, gpu_span_indices) =
             gpu.span_layer.forward(&gpu_word_embeddings, &gpu_device);
         assert_eq!(cpu_span_indices, gpu_span_indices);
-        let _ = print_diff("span_embeddings", &cpu_span_embeddings, &gpu_span_embeddings)
-            .await
-            .unwrap();
+        let _ = print_diff(
+            "span_embeddings",
+            &cpu_span_embeddings,
+            &gpu_span_embeddings,
+        )
+        .await
+        .unwrap();
 
         let cpu_scores = Scorer::forward(&cpu_span_embeddings, &cpu_label_embeddings);
         let gpu_scores = Scorer::forward(&gpu_span_embeddings, &gpu_label_embeddings);

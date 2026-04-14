@@ -28,12 +28,8 @@ impl MDebertaLayer {
         head_dim: usize,
         eps: f32,
     ) -> Result<Self> {
-        let attention = DisentangledSelfAttention::load(
-            device,
-            &mut vb.pp("attention"),
-            num_heads,
-            head_dim,
-        )?;
+        let attention =
+            DisentangledSelfAttention::load(device, &mut vb.pp("attention"), num_heads, head_dim)?;
         let attention_norm = LayerNorm::load(device, &mut vb.pp("attention_norm"), eps)?;
         let feed_forward = MDebertaFeedForward::load(device, &mut vb.pp("ffn"))?;
         let output_norm = LayerNorm::load(device, &mut vb.pp("output_norm"), eps)?;
@@ -61,8 +57,15 @@ impl MDebertaLayer {
         attention_mask: Option<&Tensor<2, u32>>,
     ) -> Tensor<3, f32> {
         // Self-attention + residual + norm
-        let attn_output = self.attention.forward_with_rel(hidden_states, rel_pos_emb, rel_pos_indices, attention_mask);
-        let hidden_states = self.attention_norm.forward(&hidden_states.add_(&attn_output));
+        let attn_output = self.attention.forward_with_rel(
+            hidden_states,
+            rel_pos_emb,
+            rel_pos_indices,
+            attention_mask,
+        );
+        let hidden_states = self
+            .attention_norm
+            .forward(&hidden_states.add_(&attn_output));
 
         // FFN + residual + norm
         let ffn_output = self.feed_forward.forward(&hidden_states);
@@ -77,8 +80,12 @@ impl MDebertaLayer {
         attention_mask: Option<&Tensor<2, u32>>,
     ) -> Tensor<3, f32> {
         // Self-attention + residual + norm
-        let attn_output = self.attention.forward(hidden_states, rel_pos_emb, attention_mask);
-        let hidden_states = self.attention_norm.forward(&hidden_states.add_(&attn_output));
+        let attn_output = self
+            .attention
+            .forward(hidden_states, rel_pos_emb, attention_mask);
+        let hidden_states = self
+            .attention_norm
+            .forward(&hidden_states.add_(&attn_output));
 
         // FFN + residual + norm
         let ffn_output = self.feed_forward.forward(&hidden_states);

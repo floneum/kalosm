@@ -131,7 +131,11 @@ impl RelationDecoder {
         }
 
         // Sort by score descending
-        relations.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+        relations.sort_by(|a, b| {
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
 
         relations
     }
@@ -144,7 +148,11 @@ impl RelationDecoder {
     ///
     /// # Returns
     /// Vector of (head_idx, tail_idx) pairs above the adjacency threshold
-    pub fn filter_pairs(&self, adjacency_scores: &[f32], num_entities: usize) -> Vec<(usize, usize)> {
+    pub fn filter_pairs(
+        &self,
+        adjacency_scores: &[f32],
+        num_entities: usize,
+    ) -> Vec<(usize, usize)> {
         let mut pairs = Vec::new();
 
         for i in 0..num_entities {
@@ -250,8 +258,7 @@ mod tests {
 
     #[test]
     fn test_decode_relations() {
-        let decoder = RelationDecoder::new()
-            .with_relation_threshold(0.7);
+        let decoder = RelationDecoder::new().with_relation_threshold(0.7);
 
         let entities = vec![
             make_entity(0, 1, "organization"),
@@ -264,9 +271,9 @@ mod tests {
 
         // Relation scores: 3 pairs x 2 relations
         let relation_scores = vec![
-            0.85, 0.3,  // pair (0,1): "founded by" = 0.85, "located in" = 0.3
-            0.2, 0.9,   // pair (0,2): "founded by" = 0.2, "located in" = 0.9
-            0.1, 0.4,   // pair (1,2): both below threshold
+            0.85, 0.3, // pair (0,1): "founded by" = 0.85, "located in" = 0.3
+            0.2, 0.9, // pair (0,2): "founded by" = 0.2, "located in" = 0.9
+            0.1, 0.4, // pair (1,2): both below threshold
         ];
 
         let relation_labels = &["founded by", "located in"];

@@ -179,7 +179,12 @@ pub(crate) fn sgemv(
 }
 
 /// Calculate the number of N-dimension workgroups based on matrix type
-pub(crate) fn n_workgroups(op: &QMatMulOperation, matrix: &QMatrix, n: u32, device: &Device) -> u32 {
+pub(crate) fn n_workgroups(
+    op: &QMatMulOperation,
+    matrix: &QMatrix,
+    n: u32,
+    device: &Device,
+) -> u32 {
     // Only use specialized dispatch sizes if we can use specialized SGEMV
     if use_specialized_sgemv(op, device) {
         if matrix.datatype == GgmlType::Q6K {

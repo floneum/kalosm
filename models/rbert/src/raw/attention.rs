@@ -47,8 +47,9 @@ impl BertAttention {
         Tensor<3, f32>,
     ) {
         let _enter = self.span.enter();
-        let (query_layer, key_layer, value_layer, self_outputs) =
-            self.self_attention.debug_forward(hidden_states, attention_mask);
+        let (query_layer, key_layer, value_layer, self_outputs) = self
+            .self_attention
+            .debug_forward(hidden_states, attention_mask);
         let attention_output = self.self_output.forward(&self_outputs, hidden_states);
         (
             query_layer,

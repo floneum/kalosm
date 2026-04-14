@@ -85,7 +85,12 @@ impl BertSelfAttention {
         &self,
         hidden_states: &Tensor<3, f32>,
         attention_mask: Option<&Tensor<2, u32>>,
-    ) -> (Tensor<4, f32>, Tensor<4, f32>, Tensor<4, f32>, Tensor<3, f32>) {
+    ) -> (
+        Tensor<4, f32>,
+        Tensor<4, f32>,
+        Tensor<4, f32>,
+        Tensor<3, f32>,
+    ) {
         let _enter = self.span.enter();
         let query_layer = self.query.forward(hidden_states);
         let key_layer = self.key.forward(hidden_states);

@@ -36,7 +36,10 @@ impl RelativePositionEmbedding {
         let embeddings = if dim0 > dim1 {
             // Shape is [hidden_size, positions] - need to transpose
             #[cfg(debug_assertions)]
-            eprintln!("[DEBUG] Transposing rel_pos_embd from [{}, {}] to [{}, {}]", dim0, dim1, dim1, dim0);
+            eprintln!(
+                "[DEBUG] Transposing rel_pos_embd from [{}, {}] to [{}, {}]",
+                dim0, dim1, dim1, dim0
+            );
             embeddings_raw.transpose(0, 1).to_concrete()
         } else {
             embeddings_raw
@@ -56,7 +59,13 @@ impl RelativePositionEmbedding {
     /// Apply log-bucket position encoding (matches Python make_log_bucket_position).
     /// positions close to 0 use linear indexing, far positions are log-bucketed.
     fn make_log_bucket_position(rel_pos: i32, bucket_size: i32, max_position: i32) -> i32 {
-        let sign = if rel_pos > 0 { 1 } else if rel_pos < 0 { -1 } else { 0 };
+        let sign = if rel_pos > 0 {
+            1
+        } else if rel_pos < 0 {
+            -1
+        } else {
+            0
+        };
         let mid = bucket_size / 2;
         let abs_pos = if rel_pos < mid && rel_pos > -mid {
             mid - 1
@@ -108,7 +117,9 @@ impl RelativePositionEmbedding {
             }
         }
 
-        Tensor::new(device, &indices).reshape([seq_len, seq_len]).to_concrete()
+        Tensor::new(device, &indices)
+            .reshape([seq_len, seq_len])
+            .to_concrete()
     }
 
     /// Get the raw relative position embedding table (normalized).
@@ -141,7 +152,9 @@ impl RelativePositionEmbedding {
         let gathered = normalized_embeddings.index_select(0, &flat_indices);
 
         // Reshape back to [seq_len, seq_len, hidden_size]
-        gathered.reshape([seq_len, seq_len, hidden_size]).to_concrete()
+        gathered
+            .reshape([seq_len, seq_len, hidden_size])
+            .to_concrete()
     }
 
     /// Get the maximum relative positions setting.
@@ -418,9 +431,18 @@ impl MDebertaAttention {
         let key = self.key.forward(hidden_states);
         let value = self.value.forward(hidden_states);
 
-        let query = query.reshape([b_sz, seq_len, self.num_heads, self.head_dim]).transpose(1, 2).to_concrete();
-        let key = key.reshape([b_sz, seq_len, self.num_heads, self.head_dim]).transpose(1, 2).to_concrete();
-        let value = value.reshape([b_sz, seq_len, self.num_heads, self.head_dim]).transpose(1, 2).to_concrete();
+        let query = query
+            .reshape([b_sz, seq_len, self.num_heads, self.head_dim])
+            .transpose(1, 2)
+            .to_concrete();
+        let key = key
+            .reshape([b_sz, seq_len, self.num_heads, self.head_dim])
+            .transpose(1, 2)
+            .to_concrete();
+        let value = value
+            .reshape([b_sz, seq_len, self.num_heads, self.head_dim])
+            .transpose(1, 2)
+            .to_concrete();
 
         let c2c_scores = query.mat_mul(&key.transpose(2, 3));
         let attn_scores = c2c_scores.mul_scalar(1.0 / (self.head_dim as f32).sqrt());
@@ -440,7 +462,11 @@ impl MDebertaAttention {
 
         let attn_probs = attn_scores.softmax_last_dim::<3>();
         let context = attn_probs.mat_mul(&value);
-        let context = context.transpose(1, 2).to_concrete().reshape([b_sz, seq_len, hidden_size]).to_concrete();
+        let context = context
+            .transpose(1, 2)
+            .to_concrete()
+            .reshape([b_sz, seq_len, hidden_size])
+            .to_concrete();
         self.output.forward(&context)
     }
 }
@@ -469,7 +495,12 @@ impl DisentangledSelfAttention {
         rel_pos_indices: &Tensor<2, u32>,
         attention_mask: Option<&Tensor<2, u32>>,
     ) -> Tensor<3, f32> {
-        self.attention.forward_with_indices(hidden_states, rel_pos_emb, rel_pos_indices, attention_mask)
+        self.attention.forward_with_indices(
+            hidden_states,
+            rel_pos_emb,
+            rel_pos_indices,
+            attention_mask,
+        )
     }
 
     pub fn forward(
@@ -478,6 +509,7 @@ impl DisentangledSelfAttention {
         rel_pos_emb: Option<&Tensor<3, f32>>,
         attention_mask: Option<&Tensor<2, u32>>,
     ) -> Tensor<3, f32> {
-        self.attention.forward(hidden_states, rel_pos_emb, attention_mask)
+        self.attention
+            .forward(hidden_states, rel_pos_emb, attention_mask)
     }
 }

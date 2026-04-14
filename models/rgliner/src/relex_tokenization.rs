@@ -47,9 +47,8 @@ impl SpecialTokenIds {
     /// where `<<ENT>>` is id 250102 vs 128001). Falls back to the corresponding
     /// field in `fallback` if the tokenizer doesn't contain a particular token.
     pub fn from_tokenizer(tokenizer: &tokenizers::Tokenizer, fallback: Self) -> Self {
-        let lookup = |tok: &str, default: u32| -> u32 {
-            tokenizer.token_to_id(tok).unwrap_or(default)
-        };
+        let lookup =
+            |tok: &str, default: u32| -> u32 { tokenizer.token_to_id(tok).unwrap_or(default) };
         Self {
             cls_id: lookup("[CLS]", fallback.cls_id),
             sep_id: lookup("[SEP]", fallback.sep_id),
@@ -227,7 +226,10 @@ impl RelExTokenizer {
                 }
                 // Try to extend with (-|_)\w+ groups (greedy)
                 loop {
-                    if i + 1 < n && (bytes[i] == b'-' || bytes[i] == b'_') && is_word_char(bytes[i + 1]) {
+                    if i + 1 < n
+                        && (bytes[i] == b'-' || bytes[i] == b'_')
+                        && is_word_char(bytes[i + 1])
+                    {
                         i += 1;
                         while i < n && is_word_char(bytes[i]) {
                             i += 1;

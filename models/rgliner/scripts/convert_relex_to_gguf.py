@@ -16,10 +16,45 @@ This script converts the GLiNER-RelEx model including:
 import argparse
 import json
 import os
+import shutil
 import struct
+import subprocess
 import sys
+import tempfile
 from pathlib import Path
 from typing import Any, Dict, List, Tuple
+
+# In-process formats: we quantise per-tensor via `gguf.quants.quantize` so the
+# file layout is byte-identical to what fusor expects.
+IN_PROCESS_QUANTS = {
+    "f32",
+    "f16",
+    "bf16",
+    "q4_0",
+    "q4_1",
+    "q5_0",
+    "q5_1",
+    "q8_0",
+}
+# k-quants (Q4_K, Q5_K, Q6_K) need `llama-quantize` - the Python `gguf` package
+# doesn't implement their `quantize_blocks` path. We write an f32 GGUF (with a
+# temporary `general.architecture = "bert"` masquerade and the minimal bert.*
+# metadata llama-quantize's loader validates) and then shell out to the binary.
+LLAMA_QUANT_TYPES = {
+    "q2_k",
+    "q3_k",
+    "q3_k_s",
+    "q3_k_m",
+    "q3_k_l",
+    "q4_k",
+    "q4_k_s",
+    "q4_k_m",
+    "q5_k",
+    "q5_k_s",
+    "q5_k_m",
+    "q6_k",
+}
+QUANT_TYPES = IN_PROCESS_QUANTS | LLAMA_QUANT_TYPES
 
 import numpy as np
 import torch
@@ -45,8 +80,47 @@ GGUF_TYPE_FLOAT64 = 12
 
 GGML_TYPE_F32 = 0
 GGML_TYPE_F16 = 1
+GGML_TYPE_Q4_0 = 2
+GGML_TYPE_Q4_1 = 3
+GGML_TYPE_Q5_0 = 6
+GGML_TYPE_Q5_1 = 7
 GGML_TYPE_Q8_0 = 8
 GGML_TYPE_BF16 = 30
+
+
+def _ggml_type_for(quant: str) -> int:
+    return {
+        "f32": GGML_TYPE_F32,
+        "f16": GGML_TYPE_F16,
+        "bf16": GGML_TYPE_BF16,
+        "q4_0": GGML_TYPE_Q4_0,
+        "q4_1": GGML_TYPE_Q4_1,
+        "q5_0": GGML_TYPE_Q5_0,
+        "q5_1": GGML_TYPE_Q5_1,
+        "q8_0": GGML_TYPE_Q8_0,
+    }[quant]
+
+
+def _gguf_block_quant(data: np.ndarray, quant: str) -> np.ndarray:
+    """Return the packed byte array for a block-quantised tensor.
+
+    Uses `gguf.quants.quantize` (Python package from llama.cpp). The inner row
+    dimension must be a multiple of 32 for q4_0/q5_0/q8_0, else we fall back to
+    f16 for that tensor (caller decides).
+    """
+    import gguf  # Deferred import - only needed for block quants.
+    qtype = {
+        "q4_0": gguf.GGMLQuantizationType.Q4_0,
+        "q4_1": gguf.GGMLQuantizationType.Q4_1,
+        "q5_0": gguf.GGMLQuantizationType.Q5_0,
+        "q5_1": gguf.GGMLQuantizationType.Q5_1,
+        "q8_0": gguf.GGMLQuantizationType.Q8_0,
+    }[quant]
+    return gguf.quants.quantize(data, qtype)
+
+
+class _U32(int):
+    """Force a metadata int to be written as GGUF u32 (needed by llama-quantize for some keys)."""
 
 
 class GGUFWriter:
@@ -60,8 +134,17 @@ class GGUFWriter:
     def add_metadata(self, key: str, value: Any):
         self.metadata[key] = value
 
-    def add_tensor(self, name: str, data: np.ndarray, ggml_type: int = GGML_TYPE_F32):
-        self.tensors.append((name, data, ggml_type))
+    def add_tensor(
+        self,
+        name: str,
+        data: np.ndarray,
+        ggml_type: int = GGML_TYPE_F32,
+        shape: Tuple[int, ...] = None,
+    ):
+        """Add a tensor. `shape` is the logical (un-packed) shape; defaults to data.shape."""
+        if shape is None:
+            shape = tuple(data.shape)
+        self.tensors.append((name, data, ggml_type, tuple(shape)))
 
     def _write_string(self, f, s: str):
         encoded = s.encode('utf-8')
@@ -72,6 +155,9 @@ class GGUFWriter:
         if isinstance(value, bool):
             f.write(struct.pack('<I', GGUF_TYPE_BOOL))
             f.write(struct.pack('<B', 1 if value else 0))
+        elif isinstance(value, _U32):
+            f.write(struct.pack('<I', GGUF_TYPE_UINT32))
+            f.write(struct.pack('<I', int(value)))
         elif isinstance(value, int):
             if value < 0:
                 f.write(struct.pack('<I', GGUF_TYPE_INT64))
@@ -122,7 +208,7 @@ class GGUFWriter:
             tensor_data_offset = 0
             tensor_infos = []
 
-            for name, data, ggml_type in self.tensors:
+            for name, data, ggml_type, shape in self.tensors:
                 if ggml_type == GGML_TYPE_F32:
                     data = np.ascontiguousarray(data, dtype=np.float32)
                 elif ggml_type == GGML_TYPE_F16:
@@ -133,8 +219,8 @@ class GGUFWriter:
                     data = ((data >> 16) & 0xFFFF).astype(np.uint16)
 
                 self._write_string(f, name)
-                f.write(struct.pack('<I', len(data.shape)))
-                for dim in reversed(data.shape):
+                f.write(struct.pack('<I', len(shape)))
+                for dim in reversed(shape):
                     f.write(struct.pack('<Q', dim))
                 f.write(struct.pack('<I', ggml_type))
                 f.write(struct.pack('<Q', tensor_data_offset))
@@ -149,7 +235,7 @@ class GGUFWriter:
             padding_needed = (alignment - (current_pos % alignment)) % alignment
             f.write(b'\x00' * padding_needed)
 
-            for (data, _), (name, _, ggml_type) in zip(tensor_infos, self.tensors):
+            for (data, _), (name, _, ggml_type, _shape) in zip(tensor_infos, self.tensors):
                 f.write(data.tobytes())
                 padding = (32 - (data.nbytes % 32)) % 32
                 f.write(b'\x00' * padding)
@@ -252,6 +338,29 @@ def map_relex_weight_name(pytorch_name: str) -> str:
     return name
 
 
+def _llama_quantize(f32_path: str, output_path: str, quant_type: str) -> None:
+    """Run `llama-quantize` to convert an f32 GGUF to a k-quant type."""
+    binary = shutil.which("llama-quantize")
+    if binary is None:
+        raise RuntimeError(
+            "`llama-quantize` not found in PATH. Install llama.cpp to use k-quant types:\n"
+            "    brew install llama.cpp        # macOS\n"
+            "    or build from https://github.com/ggml-org/llama.cpp"
+        )
+    cmd = [binary]
+    # Keep `scorer.out_mlp.3.weight` at F32 - fusor's quantised matmul produces
+    # NaN on all-but-first rows when the output dim is tiny (shape is [3, 3072]).
+    cmd += ["--tensor-type", "scorer.out_mlp.3.weight=f32"]
+    cmd += [f32_path, output_path, quant_type.upper()]
+    print(f"\n$ {' '.join(cmd)}")
+    result = subprocess.run(cmd)
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"llama-quantize failed (exit {result.returncode}) for {quant_type!r}. "
+            f"See output above. The f32 GGUF was kept at {f32_path} for inspection."
+        )
+
+
 def convert_relex_to_gguf(
     model_id: str,
     output_path: str,
@@ -266,19 +375,35 @@ def convert_relex_to_gguf(
     for name, tensor in state_dict.items():
         print(f"  {name}: {tensor.shape} {tensor.dtype}")
 
-    if quantize == "f32":
-        ggml_type = GGML_TYPE_F32
-    elif quantize == "f16":
-        ggml_type = GGML_TYPE_F16
-    elif quantize == "bf16":
-        ggml_type = GGML_TYPE_BF16
-    else:
-        raise ValueError(f"Unsupported quantization: {quantize}")
+    quantize = quantize.lower()
+    if quantize not in QUANT_TYPES:
+        raise ValueError(
+            f"Unsupported quantization: {quantize!r}. Supported: {', '.join(sorted(QUANT_TYPES))}"
+        )
+    post_quant = None
+    if quantize in LLAMA_QUANT_TYPES:
+        post_quant = quantize
+        quantize = "f32"
+    default_ggml_type = _ggml_type_for(quantize)
+
+    # For k-quant targets, write f32 first to a temp path then shell out.
+    final_output_path = output_path
+    if post_quant is not None:
+        tmp = tempfile.NamedTemporaryFile(
+            prefix=os.path.basename(output_path).rsplit(".", 1)[0] + ".f32.",
+            suffix=".gguf",
+            delete=False,
+            dir=os.path.dirname(os.path.abspath(output_path)) or None,
+        )
+        output_path = tmp.name
+        tmp.close()
 
     writer = GGUFWriter(output_path)
 
-    # Add metadata
-    writer.add_metadata("general.architecture", "gliner-relex")
+    # Masquerade as `bert` when we'll feed this to llama-quantize so its loader
+    # accepts the custom arch. rgliner doesn't read general.architecture.
+    arch = "bert" if post_quant is not None else "gliner-relex"
+    writer.add_metadata("general.architecture", arch)
     writer.add_metadata("general.name", model_id.split("/")[-1])
     writer.add_metadata("general.quantization_version", 2)
 
@@ -327,8 +452,26 @@ def convert_relex_to_gguf(
     writer.add_metadata("gliner.tokenizer_json", tokenizer_json)
     writer.add_metadata("gliner.config_json", gliner_config_json)
 
+    # When we're masquerading as `bert` for llama-quantize, mirror the required
+    # arch-scoped keys so its loader validates. llama.cpp's BERT loader expects
+    # u32 (not u64) for these fields; rgliner never reads them.
+    if post_quant is not None:
+        writer.add_metadata("bert.context_length", _U32(context_length))
+        writer.add_metadata("bert.embedding_length", _U32(hidden_size))
+        writer.add_metadata("bert.feed_forward_length", _U32(intermediate_size))
+        writer.add_metadata("bert.block_count", _U32(num_layers))
+        writer.add_metadata("bert.attention.head_count", _U32(num_heads))
+        writer.add_metadata("bert.attention.layer_norm_epsilon", 1e-7)
+
     # Convert tensors
-    print(f"\nConverting {len(state_dict)} tensors to GGUF...")
+    print(f"\nConverting {len(state_dict)} tensors to GGUF ({quantize.upper()})...")
+
+    block_quant = quantize.startswith("q")
+    # Allow debugging by overriding via env var:
+    #   GLINER_QUANT_INCLUDE="text.blk.0.ffn" -> only quantise tensors containing this substring
+    #   GLINER_QUANT_EXCLUDE="token_embd" -> never quantise tensors containing this substring
+    quant_include = os.environ.get("GLINER_QUANT_INCLUDE")
+    quant_exclude = os.environ.get("GLINER_QUANT_EXCLUDE")
 
     for pytorch_name, tensor in state_dict.items():
         gguf_name = map_relex_weight_name(pytorch_name)
@@ -343,13 +486,73 @@ def convert_relex_to_gguf(
                 dtype=np.float32
             ).reshape(t.shape)
 
-        print(f"  {pytorch_name} -> {gguf_name} {data.shape}")
-        writer.add_tensor(gguf_name, data, ggml_type)
+        logical_shape = tuple(data.shape)
+        tensor_type = default_ggml_type
+
+        should_quant = block_quant
+        if should_quant and quant_include is not None and quant_include not in gguf_name:
+            should_quant = False
+        if should_quant and quant_exclude is not None and quant_exclude in gguf_name:
+            should_quant = False
+
+        if should_quant:
+            # Row-wise block quantisation requires the inner dim to be a
+            # multiple of 32. 1-D tensors (biases, norms) and non-conforming
+            # tensors (odd vocab sizes etc.) stay at F32.
+            #
+            # Additional constraint: fusor's quantised matmul kernel produces
+            # NaN for all but the first output row when the output dimension
+            # is very small (the classifier head `scorer.out_mlp.3.weight` is
+            # [3, 3072]). Keep these tiny-output tensors at F32 - they're
+            # negligible bytes anyway.
+            MIN_OUT_DIM_FOR_QUANT = 32
+            if (
+                data.ndim >= 2
+                and data.shape[-1] % 32 == 0
+                and data.shape[0] >= MIN_OUT_DIM_FOR_QUANT
+            ):
+                data = _gguf_block_quant(data, quantize)
+                tensor_type = default_ggml_type
+            else:
+                data = np.ascontiguousarray(data, dtype=np.float32)
+                tensor_type = GGML_TYPE_F32
+        else:
+            data = np.ascontiguousarray(data, dtype=np.float32)
+            tensor_type = GGML_TYPE_F32
+
+        print(f"  {pytorch_name} -> {gguf_name} {logical_shape}  [{_name_for_type(tensor_type)}]")
+        writer.add_tensor(gguf_name, data, tensor_type, shape=logical_shape)
 
     writer.write()
     print(f"\nOutput: {output_path}")
     print(f"Size: {os.path.getsize(output_path) / 1024 / 1024:.2f} MB")
+
+    if post_quant is not None:
+        print(f"\nQuantizing to {post_quant.upper()} via llama-quantize...")
+        try:
+            _llama_quantize(output_path, final_output_path, post_quant)
+        finally:
+            try:
+                os.remove(output_path)
+            except OSError:
+                pass
+        print(f"\nFinal output: {final_output_path}")
+        print(f"Final size: {os.path.getsize(final_output_path) / 1024 / 1024:.2f} MB")
+
     print("\nConversion complete!")
+
+
+def _name_for_type(ggml_type: int) -> str:
+    return {
+        GGML_TYPE_F32: "F32",
+        GGML_TYPE_F16: "F16",
+        GGML_TYPE_BF16: "BF16",
+        GGML_TYPE_Q4_0: "Q4_0",
+        GGML_TYPE_Q4_1: "Q4_1",
+        GGML_TYPE_Q5_0: "Q5_0",
+        GGML_TYPE_Q5_1: "Q5_1",
+        GGML_TYPE_Q8_0: "Q8_0",
+    }.get(ggml_type, f"type={ggml_type}")
 
 
 def main():
@@ -370,8 +573,13 @@ def main():
         "--quantize", "-q",
         type=str,
         default="f32",
-        choices=["f32", "f16", "bf16"],
-        help="Quantization type (default: f32)"
+        choices=sorted(QUANT_TYPES),
+        help=(
+            "Quantization type (default: f32). "
+            "All quantisation is done in-process via the `gguf` Python package. "
+            "k-quants (q4_k, q5_k, q6_k) aren't in this list - they are not "
+            "round-trip compatible with fusor's current quantised tensor reader."
+        ),
     )
     parser.add_argument(
         "--cache-dir",

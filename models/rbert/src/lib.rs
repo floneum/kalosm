@@ -698,8 +698,11 @@ impl Bert {
         match &*self.model {
             EmbeddingModel::Bert(model) => {
                 let token_type_ids = token_ids.zeros_like();
-                model.debug_first_layer(&token_ids, &token_type_ids, Some(&attention_mask))
-                    .ok_or_else(|| BertError::Fusor(fusor::Error::msg("BERT encoder has no layers")))
+                model
+                    .debug_first_layer(&token_ids, &token_type_ids, Some(&attention_mask))
+                    .ok_or_else(|| {
+                        BertError::Fusor(fusor::Error::msg("BERT encoder has no layers"))
+                    })
             }
             EmbeddingModel::Qwen(_) => Err(BertError::Fusor(fusor::Error::msg(
                 "debug_batch_first_layer is only implemented for BERT models",
@@ -757,8 +760,11 @@ impl Bert {
         match &*self.model {
             EmbeddingModel::Bert(model) => {
                 let token_type_ids = token_ids.zeros_like();
-                model.debug_first_layer_attention(&token_ids, &token_type_ids, Some(&attention_mask))
-                    .ok_or_else(|| BertError::Fusor(fusor::Error::msg("BERT encoder has no layers")))
+                model
+                    .debug_first_layer_attention(&token_ids, &token_type_ids, Some(&attention_mask))
+                    .ok_or_else(|| {
+                        BertError::Fusor(fusor::Error::msg("BERT encoder has no layers"))
+                    })
             }
             EmbeddingModel::Qwen(_) => Err(BertError::Fusor(fusor::Error::msg(
                 "debug_batch_first_layer_attention is only implemented for BERT models",

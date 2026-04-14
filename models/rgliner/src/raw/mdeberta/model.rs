@@ -115,8 +115,12 @@ impl MDebertaModel {
             let data = pollster::block_on(hidden_states.clone().as_slice()).unwrap();
             let slice = data.as_slice();
             let mean: f32 = slice.iter().sum::<f32>() / slice.len() as f32;
-            let std: f32 = (slice.iter().map(|x| (x - mean).powi(2)).sum::<f32>() / slice.len() as f32).sqrt();
-            eprintln!("[DEBUG] After token_embeddings: mean={:.6}, std={:.6}", mean, std);
+            let std: f32 =
+                (slice.iter().map(|x| (x - mean).powi(2)).sum::<f32>() / slice.len() as f32).sqrt();
+            eprintln!(
+                "[DEBUG] After token_embeddings: mean={:.6}, std={:.6}",
+                mean, std
+            );
         }
 
         // Apply embedding LayerNorm
@@ -128,8 +132,12 @@ impl MDebertaModel {
             let slice = data.as_slice();
             let hidden_size = self.config.hidden_size;
             let mean: f32 = slice.iter().sum::<f32>() / slice.len() as f32;
-            let std: f32 = (slice.iter().map(|x| (x - mean).powi(2)).sum::<f32>() / slice.len() as f32).sqrt();
-            eprintln!("[DEBUG] After embedding_norm: mean={:.6}, std={:.6}", mean, std);
+            let std: f32 =
+                (slice.iter().map(|x| (x - mean).powi(2)).sum::<f32>() / slice.len() as f32).sqrt();
+            eprintln!(
+                "[DEBUG] After embedding_norm: mean={:.6}, std={:.6}",
+                mean, std
+            );
             // Print raw embeddings at <<ENT>> positions (1, 3, 5) and others
             eprintln!("[DEBUG] Raw embeddings at positions (first 5 values):");
             for pos in [0, 1, 2, 3, 4, 5, 10, 17] {
@@ -142,20 +150,28 @@ impl MDebertaModel {
         }
 
         // Compute relative position indices and get embedding table
-        let rel_indices = self.rel_pos_embedding.compute_relative_indices(seq_len, &self.device);
+        let rel_indices = self
+            .rel_pos_embedding
+            .compute_relative_indices(seq_len, &self.device);
         let rel_pos_emb = self.rel_pos_embedding.get_embeddings();
 
         // Pass through transformer layers with proper position attention
         for (i, layer) in self.layers.iter().enumerate() {
-            hidden_states = layer.forward_with_rel(&hidden_states, &rel_pos_emb, &rel_indices, attention_mask);
+            hidden_states =
+                layer.forward_with_rel(&hidden_states, &rel_pos_emb, &rel_indices, attention_mask);
 
             #[cfg(debug_assertions)]
             if i == 0 || i == 11 {
                 let data = pollster::block_on(hidden_states.clone().as_slice()).unwrap();
                 let slice = data.as_slice();
                 let mean: f32 = slice.iter().sum::<f32>() / slice.len() as f32;
-                let std: f32 = (slice.iter().map(|x| (x - mean).powi(2)).sum::<f32>() / slice.len() as f32).sqrt();
-                eprintln!("[DEBUG] After layer {}: mean={:.6}, std={:.6}", i, mean, std);
+                let std: f32 = (slice.iter().map(|x| (x - mean).powi(2)).sum::<f32>()
+                    / slice.len() as f32)
+                    .sqrt();
+                eprintln!(
+                    "[DEBUG] After layer {}: mean={:.6}, std={:.6}",
+                    i, mean, std
+                );
             }
         }
 
@@ -164,8 +180,12 @@ impl MDebertaModel {
             let data = pollster::block_on(hidden_states.clone().as_slice()).unwrap();
             let slice = data.as_slice();
             let mean: f32 = slice.iter().sum::<f32>() / slice.len() as f32;
-            let std: f32 = (slice.iter().map(|x| (x - mean).powi(2)).sum::<f32>() / slice.len() as f32).sqrt();
-            eprintln!("[DEBUG] Encoder output (pre-projection): mean={:.6}, std={:.6}", mean, std);
+            let std: f32 =
+                (slice.iter().map(|x| (x - mean).powi(2)).sum::<f32>() / slice.len() as f32).sqrt();
+            eprintln!(
+                "[DEBUG] Encoder output (pre-projection): mean={:.6}, std={:.6}",
+                mean, std
+            );
         }
 
         // Apply optional post-encoder projection (large variants).
@@ -177,7 +197,9 @@ impl MDebertaModel {
                 let data = pollster::block_on(hidden_states.clone().as_slice()).unwrap();
                 let slice = data.as_slice();
                 let mean: f32 = slice.iter().sum::<f32>() / slice.len() as f32;
-                let std: f32 = (slice.iter().map(|x| (x - mean).powi(2)).sum::<f32>() / slice.len() as f32).sqrt();
+                let std: f32 = (slice.iter().map(|x| (x - mean).powi(2)).sum::<f32>()
+                    / slice.len() as f32)
+                    .sqrt();
                 eprintln!(
                     "[DEBUG] Encoder output (post-projection): mean={:.6}, std={:.6}",
                     mean, std

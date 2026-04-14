@@ -11,10 +11,10 @@ use fusor::{Device, Result, Tensor, VarBuilder};
 /// and concatenates the outputs.
 pub struct BiLstm {
     // Forward LSTM weights
-    weight_ih_f: Tensor<2, f32>,  // [4*hidden, input_size]
-    weight_hh_f: Tensor<2, f32>,  // [4*hidden, hidden_size]
-    bias_ih_f: Tensor<1, f32>,    // [4*hidden]
-    bias_hh_f: Tensor<1, f32>,    // [4*hidden]
+    weight_ih_f: Tensor<2, f32>, // [4*hidden, input_size]
+    weight_hh_f: Tensor<2, f32>, // [4*hidden, hidden_size]
+    bias_ih_f: Tensor<1, f32>,   // [4*hidden]
+    bias_hh_f: Tensor<1, f32>,   // [4*hidden]
     // Backward LSTM weights
     weight_ih_b: Tensor<2, f32>,
     weight_hh_b: Tensor<2, f32>,
@@ -191,7 +191,11 @@ impl BiLstm {
             }
 
             // Store output in correct position
-            let store_pos = if reverse { seq_len - 1 - out_idx } else { out_idx };
+            let store_pos = if reverse {
+                seq_len - 1 - out_idx
+            } else {
+                out_idx
+            };
             for i in 0..hidden_size {
                 outputs[store_pos * hidden_size + i] = h[i];
             }

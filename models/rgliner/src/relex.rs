@@ -51,7 +51,9 @@ use tokenizers::Tokenizer;
 use crate::decoding::Entity;
 use crate::error::{GlinerError, GlinerLoadingError};
 use crate::raw::mdeberta::MDebertaModel;
-use crate::raw::{BiLstm, JointScorer, PairProjector, PromptRepLayer, RelationsRepLayer, SpanLayer};
+use crate::raw::{
+    BiLstm, JointScorer, PairProjector, PromptRepLayer, RelationsRepLayer, SpanLayer,
+};
 use crate::relation_decoding::{Relation, RelationDecoder, RelationDecoderConfig};
 use crate::relex_tokenization::{RelExTokenizer, SpecialTokenIds};
 
@@ -392,10 +394,8 @@ impl GlinerRelEx {
         let mut effective_config = config;
         effective_config.special_tokens =
             SpecialTokenIds::from_tokenizer(&tokenizer, effective_config.special_tokens);
-        let relex_tokenizer = RelExTokenizer::with_special_tokens(
-            tokenizer,
-            effective_config.special_tokens.clone(),
-        );
+        let relex_tokenizer =
+            RelExTokenizer::with_special_tokens(tokenizer, effective_config.special_tokens.clone());
         let config = effective_config;
 
         // Load encoder (mDeBERTa)
@@ -462,17 +462,24 @@ impl GlinerRelEx {
         relation_labels: &[&str],
     ) -> Result<(Vec<Entity>, Vec<Relation>), GlinerError> {
         // 1. Tokenize with special tokens
-        let tokenized = self.tokenizer.tokenize(text, entity_labels, relation_labels)?;
+        let tokenized = self
+            .tokenizer
+            .tokenize(text, entity_labels, relation_labels)?;
 
         #[cfg(debug_assertions)]
         {
-            eprintln!("[DEBUG] Tokenized: {} tokens, {} words",
-                      tokenized.token_ids.len(), tokenized.num_words);
+            eprintln!(
+                "[DEBUG] Tokenized: {} tokens, {} words",
+                tokenized.token_ids.len(),
+                tokenized.num_words
+            );
             eprintln!("[DEBUG] ent_positions: {:?}", tokenized.ent_positions);
             eprintln!("[DEBUG] rel_positions: {:?}", tokenized.rel_positions);
             eprintln!("[DEBUG] text_positions: {:?}", tokenized.text_positions);
-            eprintln!("[DEBUG] token_ids (first 20): {:?}",
-                      &tokenized.token_ids[..20.min(tokenized.token_ids.len())]);
+            eprintln!(
+                "[DEBUG] token_ids (first 20): {:?}",
+                &tokenized.token_ids[..20.min(tokenized.token_ids.len())]
+            );
         }
 
         if tokenized.num_words == 0 {
@@ -494,11 +501,15 @@ impl GlinerRelEx {
             let enc_data = encoder_output.clone().as_slice().await.unwrap();
             let enc_slice = enc_data.as_slice();
             let mean: f32 = enc_slice.iter().sum::<f32>() / enc_slice.len() as f32;
-            let variance: f32 = enc_slice.iter().map(|x| (x - mean).powi(2)).sum::<f32>() / enc_slice.len() as f32;
-            eprintln!("[DEBUG] Encoder output stats: mean={:.6}, var={:.6}, min={:.6}, max={:.6}",
-                      mean, variance,
-                      enc_slice.iter().cloned().fold(f32::INFINITY, f32::min),
-                      enc_slice.iter().cloned().fold(f32::NEG_INFINITY, f32::max));
+            let variance: f32 =
+                enc_slice.iter().map(|x| (x - mean).powi(2)).sum::<f32>() / enc_slice.len() as f32;
+            eprintln!(
+                "[DEBUG] Encoder output stats: mean={:.6}, var={:.6}, min={:.6}, max={:.6}",
+                mean,
+                variance,
+                enc_slice.iter().cloned().fold(f32::INFINITY, f32::min),
+                enc_slice.iter().cloned().fold(f32::NEG_INFINITY, f32::max)
+            );
 
             // Check encoder output at specific positions (for <<ENT>> tokens)
             let hidden_size = self.config.hidden_size;
@@ -521,7 +532,8 @@ impl GlinerRelEx {
 
         // 4. Extract word-level embeddings from encoder output, THEN apply BiLSTM
         // (Python applies BiLSTM to word-level embeddings, not the full token sequence.)
-        let word_encoder_embs = self.gather_at_positions(&encoder_output, &tokenized.text_positions);
+        let word_encoder_embs =
+            self.gather_at_positions(&encoder_output, &tokenized.text_positions);
         let lstm_output = self.bilstm.forward(&word_encoder_embs).await;
 
         #[cfg(debug_assertions)]
@@ -551,7 +563,10 @@ impl GlinerRelEx {
             for l in 0..tokenized.ent_positions.len() {
                 let start = l * hidden_size;
                 let vals: Vec<f32> = (0..5).map(|i| raw_slice[start + i]).collect();
-                eprintln!("  label {} (pos {}): {:?}", l, tokenized.ent_positions[l], vals);
+                eprintln!(
+                    "  label {} (pos {}): {:?}",
+                    l, tokenized.ent_positions[l], vals
+                );
             }
         }
 
@@ -563,11 +578,15 @@ impl GlinerRelEx {
             let ent_slice = ent_data.as_slice();
             let hidden_size = self.config.hidden_size;
             let mean: f32 = ent_slice.iter().sum::<f32>() / ent_slice.len() as f32;
-            let variance: f32 = ent_slice.iter().map(|x| (x - mean).powi(2)).sum::<f32>() / ent_slice.len() as f32;
-            eprintln!("[DEBUG] Entity label embs stats: mean={:.6}, var={:.6}, min={:.6}, max={:.6}",
-                      mean, variance,
-                      ent_slice.iter().cloned().fold(f32::INFINITY, f32::min),
-                      ent_slice.iter().cloned().fold(f32::NEG_INFINITY, f32::max));
+            let variance: f32 =
+                ent_slice.iter().map(|x| (x - mean).powi(2)).sum::<f32>() / ent_slice.len() as f32;
+            eprintln!(
+                "[DEBUG] Entity label embs stats: mean={:.6}, var={:.6}, min={:.6}, max={:.6}",
+                mean,
+                variance,
+                ent_slice.iter().cloned().fold(f32::INFINITY, f32::min),
+                ent_slice.iter().cloned().fold(f32::NEG_INFINITY, f32::max)
+            );
             // Print projected values per label (compare with Python)
             eprintln!("[DEBUG] Projected entity embeddings (first 5 values per label):");
             for l in 0..entity_labels.len() {
@@ -589,11 +608,15 @@ impl GlinerRelEx {
             let text_data = text_embs.clone().as_slice().await.unwrap();
             let text_slice = text_data.as_slice();
             let mean: f32 = text_slice.iter().sum::<f32>() / text_slice.len() as f32;
-            let variance: f32 = text_slice.iter().map(|x| (x - mean).powi(2)).sum::<f32>() / text_slice.len() as f32;
-            eprintln!("[DEBUG] Text token embs stats: mean={:.6}, var={:.6}, min={:.6}, max={:.6}",
-                      mean, variance,
-                      text_slice.iter().cloned().fold(f32::INFINITY, f32::min),
-                      text_slice.iter().cloned().fold(f32::NEG_INFINITY, f32::max));
+            let variance: f32 = text_slice.iter().map(|x| (x - mean).powi(2)).sum::<f32>()
+                / text_slice.len() as f32;
+            eprintln!(
+                "[DEBUG] Text token embs stats: mean={:.6}, var={:.6}, min={:.6}, max={:.6}",
+                mean,
+                variance,
+                text_slice.iter().cloned().fold(f32::INFINITY, f32::min),
+                text_slice.iter().cloned().fold(f32::NEG_INFINITY, f32::max)
+            );
         }
 
         // 7–8. Decode entities using the mode matching the trained head.
@@ -601,9 +624,7 @@ impl GlinerRelEx {
         let entities = match self.span_mode {
             SpanMode::TokenLevel => {
                 let scorer = self.scorer.as_ref().expect("token_level requires scorer");
-                let token_scores = scorer
-                    .forward_entity_scores(&text_embs, &ent_embs_2d)
-                    .await;
+                let token_scores = scorer.forward_entity_scores(&text_embs, &ent_embs_2d).await;
                 self.decode_entities_from_tokens(
                     &token_scores,
                     entity_labels,
@@ -636,7 +657,9 @@ impl GlinerRelEx {
             .iter()
             .map(|e| (e.start_word, e.end_word))
             .collect();
-        let span_reps = self.span_layer.forward_for_spans(&text_embs, &entity_spans, &self.device);
+        let span_reps = self
+            .span_layer
+            .forward_for_spans(&text_embs, &entity_spans, &self.device);
         // span_reps shape: [num_entities, hidden]
 
         #[cfg(debug_assertions)]
@@ -648,7 +671,10 @@ impl GlinerRelEx {
             for (i, e) in entities.iter().enumerate() {
                 let start = i * hidden;
                 let vals: Vec<f32> = (0..5).map(|k| sr[start + k]).collect();
-                eprintln!("  {} ({}, {}): {:?}", e.text, e.start_word, e.end_word, vals);
+                eprintln!(
+                    "  {} ({}, {}): {:?}",
+                    e.text, e.start_word, e.end_word, vals
+                );
             }
             // Print rel_embs
             let re_data = rel_embs.clone().as_slice().await?;
@@ -710,14 +736,20 @@ impl GlinerRelEx {
         {
             eprintln!(
                 "[DEBUG] Relation scoring: {} pairs, {} relations, threshold={}",
-                candidate_pairs.len(), n_rels, threshold);
+                candidate_pairs.len(),
+                n_rels,
+                threshold
+            );
             for (pair_idx, &(h, t)) in candidate_pairs.iter().enumerate().take(6) {
                 let base = pair_idx * n_rels;
-                let raw: Vec<f32> = (0..n_rels).map(|c| rel_scores_slice.as_slice()[base + c]).collect();
+                let raw: Vec<f32> = (0..n_rels)
+                    .map(|c| rel_scores_slice.as_slice()[base + c])
+                    .collect();
                 let sig: Vec<f32> = raw.iter().map(|x| 1.0 / (1.0 + (-x).exp())).collect();
                 eprintln!(
                     "  pair ({}->{}) [{} -> {}]: raw={:?}, sig={:?}",
-                    h, t, entities[h].text, entities[t].text, raw, sig);
+                    h, t, entities[h].text, entities[t].text, raw, sig
+                );
             }
         }
 
@@ -738,7 +770,11 @@ impl GlinerRelEx {
         }
 
         // Sort by score descending
-        relations.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+        relations.sort_by(|a, b| {
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
 
         Ok((entities, relations))
     }
@@ -835,7 +871,11 @@ impl GlinerRelEx {
         }
 
         // Ensure output is sorted by score descending for presentation.
-        entities.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+        entities.sort_by(|a, b| {
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
         let _ = hidden;
         Ok(entities)
     }
@@ -860,16 +900,23 @@ impl GlinerRelEx {
 
         #[cfg(debug_assertions)]
         {
-            eprintln!("[DEBUG] Entity decoding: num_tokens={}, num_labels={}, threshold={}",
-                      num_tokens, num_labels, threshold);
+            eprintln!(
+                "[DEBUG] Entity decoding: num_tokens={}, num_labels={}, threshold={}",
+                num_tokens, num_labels, threshold
+            );
             eprintln!("[DEBUG] Sigmoid scores [start, end, inside] (first 5 tokens):");
             for t in 0..5.min(num_tokens) {
                 for l in 0..num_labels {
                     let base = t * num_labels * 3 + l * 3;
                     eprintln!(
                         "  token {} label {} ({}): start={:.4}, end={:.4}, inside={:.4}",
-                        t, l, entity_labels[l],
-                        scores[base], scores[base + 1], scores[base + 2]);
+                        t,
+                        l,
+                        entity_labels[l],
+                        scores[base],
+                        scores[base + 1],
+                        scores[base + 2]
+                    );
                 }
             }
         }
@@ -884,21 +931,32 @@ impl GlinerRelEx {
         for label_idx in 0..num_labels {
             for start_tok in 0..num_tokens {
                 let start_score = score_at(start_tok, label_idx, 0);
-                if start_score < threshold { continue; }
+                if start_score < threshold {
+                    continue;
+                }
 
                 for end_tok in start_tok..num_tokens {
                     let end_score = score_at(end_tok, label_idx, 1);
-                    if end_score < threshold { continue; }
+                    if end_score < threshold {
+                        continue;
+                    }
 
                     // Check all inside scores from start_tok to end_tok
                     let mut min_score = start_score.min(end_score);
                     let mut valid = true;
                     for t in start_tok..=end_tok {
                         let inside = score_at(t, label_idx, 2);
-                        if inside < threshold { valid = false; break; }
-                        if inside < min_score { min_score = inside; }
+                        if inside < threshold {
+                            valid = false;
+                            break;
+                        }
+                        if inside < min_score {
+                            min_score = inside;
+                        }
                     }
-                    if !valid { continue; }
+                    if !valid {
+                        continue;
+                    }
 
                     candidates.push((start_tok, end_tok, label_idx, min_score));
                 }
@@ -913,7 +971,9 @@ impl GlinerRelEx {
         let mut entities = Vec::new();
         for (start_tok, end_tok, label_idx, score) in candidates {
             let overlap = taken.iter().any(|&(a, b)| !(end_tok < a || start_tok > b));
-            if overlap { continue; }
+            if overlap {
+                continue;
+            }
             taken.push((start_tok, end_tok));
 
             if start_tok < word_offsets.len() && end_tok < word_offsets.len() {
@@ -932,7 +992,11 @@ impl GlinerRelEx {
         }
 
         // Sort by score descending
-        entities.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+        entities.sort_by(|a, b| {
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
 
         Ok(entities)
     }

@@ -46,14 +46,16 @@ impl MDebertaConfig {
         let num_layers = vb
             .get_metadata("gliner.block_count")
             .and_then(|v| v.to_u32().ok())
-            .ok_or_else(|| fusor::Error::msg("Missing required GGUF metadata: gliner.block_count"))?
-            as usize;
+            .ok_or_else(|| {
+                fusor::Error::msg("Missing required GGUF metadata: gliner.block_count")
+            })? as usize;
 
         let hidden_size = vb
             .get_metadata("gliner.embedding_length")
             .and_then(|v| v.to_u32().ok())
-            .ok_or_else(|| fusor::Error::msg("Missing required GGUF metadata: gliner.embedding_length"))?
-            as usize;
+            .ok_or_else(|| {
+                fusor::Error::msg("Missing required GGUF metadata: gliner.embedding_length")
+            })? as usize;
 
         if hidden_size % num_heads != 0 {
             return Err(fusor::Error::msg(format!(

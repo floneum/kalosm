@@ -17,7 +17,7 @@ use fusor::{Device, Result, Tensor, VarBuilder};
 /// raw token embeddings with projected labels for the MLP input.
 pub struct JointScorer {
     #[allow(dead_code)]
-    proj_token: Linear<f32>,  // Not used in main scoring path
+    proj_token: Linear<f32>, // Not used in main scoring path
     proj_label: Linear<f32>,
     out_fc1: Linear<f32>,
     out_fc2: Linear<f32>,
@@ -34,14 +34,29 @@ impl JointScorer {
         #[cfg(debug_assertions)]
         {
             eprintln!("[DEBUG] JointScorer loaded:");
-            eprintln!("  proj_label: in={}, out={}", proj_label.in_features(), proj_label.out_features());
-            eprintln!("  out_fc1: in={}, out={}", out_fc1.in_features(), out_fc1.out_features());
-            eprintln!("  out_fc2: in={}, out={}", out_fc2.in_features(), out_fc2.out_features());
+            eprintln!(
+                "  proj_label: in={}, out={}",
+                proj_label.in_features(),
+                proj_label.out_features()
+            );
+            eprintln!(
+                "  out_fc1: in={}, out={}",
+                out_fc1.in_features(),
+                out_fc1.out_features()
+            );
+            eprintln!(
+                "  out_fc2: in={}, out={}",
+                out_fc2.in_features(),
+                out_fc2.out_features()
+            );
             // Print fc2 bias values (these are the biases for O, B, I classes)
             if let Some(bias) = out_fc2.bias() {
                 let bias_data = pollster::block_on(bias.clone().as_slice()).unwrap();
                 let b = bias_data.as_slice();
-                eprintln!("  out_fc2 bias: O={:.6}, B={:.6}, I={:.6}", b[0], b[1], b[2]);
+                eprintln!(
+                    "  out_fc2 bias: O={:.6}, B={:.6}, I={:.6}",
+                    b[0], b[1], b[2]
+                );
             }
         }
 
@@ -77,8 +92,10 @@ impl JointScorer {
         let [n_labels, _] = label_embs.shape();
 
         #[cfg(debug_assertions)]
-        eprintln!("[DEBUG] scorer.forward: batch={}, seq_len={}, hidden_dim={}, n_labels={}",
-                  batch_size, seq_len, hidden_dim, n_labels);
+        eprintln!(
+            "[DEBUG] scorer.forward: batch={}, seq_len={}, hidden_dim={}, n_labels={}",
+            batch_size, seq_len, hidden_dim, n_labels
+        );
 
         // Project both token and label embeddings
         // token: [batch, seq, hidden] -> [batch, seq, hidden*2]
@@ -94,8 +111,14 @@ impl JointScorer {
             let output_data = proj_tokens.clone().as_slice().await.unwrap();
             let output_slice = output_data.as_slice();
             eprintln!("[DEBUG] proj_token input[0,0,:5]: {:?}", &input_slice[0..5]);
-            eprintln!("[DEBUG] proj_token output[0,0,:5]: {:?}", &output_slice[0..5]);
-            eprintln!("[DEBUG] proj_token output[0,0,768:773]: {:?}", &output_slice[768..773]);
+            eprintln!(
+                "[DEBUG] proj_token output[0,0,:5]: {:?}",
+                &output_slice[0..5]
+            );
+            eprintln!(
+                "[DEBUG] proj_token output[0,0,768:773]: {:?}",
+                &output_slice[768..773]
+            );
         }
 
         // label: [n_labels, hidden] -> [n_labels, hidden*2]
@@ -104,15 +127,20 @@ impl JointScorer {
         let proj_labels: Tensor<2, f32> = proj_labels.squeeze(0).to_concrete();
 
         #[cfg(debug_assertions)]
-        eprintln!("[DEBUG] proj_tokens shape: [{}, {}, {}], proj_labels shape: [{}, {}], half_proj={}",
-                  batch_size, seq_len, proj_dim, n_labels, proj_dim, half_proj);
+        eprintln!(
+            "[DEBUG] proj_tokens shape: [{}, {}, {}], proj_labels shape: [{}, {}], half_proj={}",
+            batch_size, seq_len, proj_dim, n_labels, proj_dim, half_proj
+        );
 
         // Split and combine: token_first + label_first + (token_second * label_second)
         // MLP input dimension = half_proj + half_proj + half_proj = 3 * half_proj
         let mlp_input_dim = 3 * half_proj;
 
         #[cfg(debug_assertions)]
-        eprintln!("[DEBUG] mlp_input_dim={} (3 * {})", mlp_input_dim, half_proj);
+        eprintln!(
+            "[DEBUG] mlp_input_dim={} (3 * {})",
+            mlp_input_dim, half_proj
+        );
 
         // Get raw data slices (without expansion - we'll handle broadcast manually)
         // proj_tokens shape: [batch, seq, proj_dim]
@@ -120,8 +148,8 @@ impl JointScorer {
         let tokens_data = proj_tokens.clone().as_slice().await.unwrap();
         let labels_data = proj_labels.clone().as_slice().await.unwrap();
 
-        let tokens_slice = tokens_data.as_slice();  // [batch * seq * proj_dim]
-        let labels_slice = labels_data.as_slice();  // [n_labels * proj_dim]
+        let tokens_slice = tokens_data.as_slice(); // [batch * seq * proj_dim]
+        let labels_slice = labels_data.as_slice(); // [n_labels * proj_dim]
 
         #[cfg(debug_assertions)]
         {
@@ -138,7 +166,9 @@ impl JointScorer {
             for t in 0..5.min(seq_len) {
                 let start = t * proj_dim;
                 let vals: Vec<f32> = (0..5).map(|i| tokens_slice[start + i]).collect();
-                let vals_second: Vec<f32> = (0..5).map(|i| tokens_slice[start + half_proj + i]).collect();
+                let vals_second: Vec<f32> = (0..5)
+                    .map(|i| tokens_slice[start + half_proj + i])
+                    .collect();
                 eprintln!("  token {}: first={:?}, second={:?}", t, vals, vals_second);
             }
         }
@@ -216,8 +246,14 @@ impl JointScorer {
             for s in 0..3.min(seq_len) {
                 for l in 0..n_labels {
                     let idx = s * n_labels * num_classes + l * num_classes;
-                    eprintln!("  token {} label {}: start={:.4}, end={:.4}, inside={:.4}",
-                              s, l, data[idx], data[idx+1], data[idx+2]);
+                    eprintln!(
+                        "  token {} label {}: start={:.4}, end={:.4}, inside={:.4}",
+                        s,
+                        l,
+                        data[idx],
+                        data[idx + 1],
+                        data[idx + 2]
+                    );
                 }
             }
         }
@@ -250,8 +286,16 @@ impl PromptRepLayer {
         #[cfg(debug_assertions)]
         {
             eprintln!("[DEBUG] PromptRepLayer loaded:");
-            eprintln!("  fc1: in={}, out={}", fc1.in_features(), fc1.out_features());
-            eprintln!("  fc2: in={}, out={}", fc2.in_features(), fc2.out_features());
+            eprintln!(
+                "  fc1: in={}, out={}",
+                fc1.in_features(),
+                fc1.out_features()
+            );
+            eprintln!(
+                "  fc2: in={}, out={}",
+                fc2.in_features(),
+                fc2.out_features()
+            );
         }
 
         Ok(Self { fc1, fc2 })

@@ -136,6 +136,8 @@ impl RelationScorer {
         let scores = flat_pairs.mat_mul(&rel_t);
 
         // Reshape back: [batch, num_pairs, num_relations]
-        scores.reshape([batch_size, num_pairs, num_relations]).to_concrete()
+        scores
+            .reshape([batch_size, num_pairs, num_relations])
+            .to_concrete()
     }
 }

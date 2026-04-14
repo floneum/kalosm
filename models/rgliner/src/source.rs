@@ -130,11 +130,7 @@ impl GlinerSource {
     /// `Demonthos/gliner-gguf`.
     pub fn demonthos_edge() -> Self {
         Self {
-            model: Self::huggingface_or_cached(
-                "Demonthos/gliner-gguf",
-                "main",
-                "gliner-edge.gguf",
-            ),
+            model: Self::huggingface_or_cached("Demonthos/gliner-gguf", "main", "gliner-edge.gguf"),
             label_encoder: Self::huggingface_or_cached(
                 "Demonthos/gliner-gguf",
                 "main",
@@ -208,11 +204,7 @@ impl GlinerSource {
     /// `Demonthos/gliner-gguf`.
     pub fn demonthos_base() -> Self {
         Self {
-            model: Self::huggingface_or_cached(
-                "Demonthos/gliner-gguf",
-                "main",
-                "gliner-base.gguf",
-            ),
+            model: Self::huggingface_or_cached("Demonthos/gliner-gguf", "main", "gliner-base.gguf"),
             label_encoder: Self::huggingface_or_cached(
                 "Demonthos/gliner-gguf",
                 "main",
