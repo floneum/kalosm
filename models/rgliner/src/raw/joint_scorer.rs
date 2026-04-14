@@ -31,35 +31,6 @@ impl JointScorer {
         let out_fc1 = Linear::load(device, &mut vb.pp("out_mlp.0"))?;
         let out_fc2 = Linear::load(device, &mut vb.pp("out_mlp.3"))?;
 
-        #[cfg(debug_assertions)]
-        {
-            eprintln!("[DEBUG] JointScorer loaded:");
-            eprintln!(
-                "  proj_label: in={}, out={}",
-                proj_label.in_features(),
-                proj_label.out_features()
-            );
-            eprintln!(
-                "  out_fc1: in={}, out={}",
-                out_fc1.in_features(),
-                out_fc1.out_features()
-            );
-            eprintln!(
-                "  out_fc2: in={}, out={}",
-                out_fc2.in_features(),
-                out_fc2.out_features()
-            );
-            // Print fc2 bias values (these are the biases for O, B, I classes)
-            if let Some(bias) = out_fc2.bias() {
-                let bias_data = pollster::block_on(bias.clone().as_slice()).unwrap();
-                let b = bias_data.as_slice();
-                eprintln!(
-                    "  out_fc2 bias: O={:.6}, B={:.6}, I={:.6}",
-                    b[0], b[1], b[2]
-                );
-            }
-        }
-
         Ok(Self {
             proj_token,
             proj_label,
@@ -88,14 +59,8 @@ impl JointScorer {
         token_embs: &Tensor<3, f32>,
         label_embs: &Tensor<2, f32>,
     ) -> Tensor<4, f32> {
-        let [batch_size, seq_len, hidden_dim] = token_embs.shape();
+        let [batch_size, seq_len, _hidden_dim] = token_embs.shape();
         let [n_labels, _] = label_embs.shape();
-
-        #[cfg(debug_assertions)]
-        eprintln!(
-            "[DEBUG] scorer.forward: batch={}, seq_len={}, hidden_dim={}, n_labels={}",
-            batch_size, seq_len, hidden_dim, n_labels
-        );
 
         // Project both token and label embeddings
         // token: [batch, seq, hidden] -> [batch, seq, hidden*2]
@@ -103,44 +68,14 @@ impl JointScorer {
         let [_, _, proj_dim] = proj_tokens.shape();
         let half_proj = proj_dim / 2;
 
-        #[cfg(debug_assertions)]
-        {
-            // Verify proj_token computation
-            let input_data = token_embs.clone().as_slice().await.unwrap();
-            let input_slice = input_data.as_slice();
-            let output_data = proj_tokens.clone().as_slice().await.unwrap();
-            let output_slice = output_data.as_slice();
-            eprintln!("[DEBUG] proj_token input[0,0,:5]: {:?}", &input_slice[0..5]);
-            eprintln!(
-                "[DEBUG] proj_token output[0,0,:5]: {:?}",
-                &output_slice[0..5]
-            );
-            eprintln!(
-                "[DEBUG] proj_token output[0,0,768:773]: {:?}",
-                &output_slice[768..773]
-            );
-        }
-
         // label: [n_labels, hidden] -> [n_labels, hidden*2]
         let label_embs_3d: Tensor<3, f32> = label_embs.unsqueeze(0).to_concrete();
         let proj_labels = self.proj_label.forward(&label_embs_3d);
         let proj_labels: Tensor<2, f32> = proj_labels.squeeze(0).to_concrete();
 
-        #[cfg(debug_assertions)]
-        eprintln!(
-            "[DEBUG] proj_tokens shape: [{}, {}, {}], proj_labels shape: [{}, {}], half_proj={}",
-            batch_size, seq_len, proj_dim, n_labels, proj_dim, half_proj
-        );
-
         // Split and combine: token_first + label_first + (token_second * label_second)
         // MLP input dimension = half_proj + half_proj + half_proj = 3 * half_proj
         let mlp_input_dim = 3 * half_proj;
-
-        #[cfg(debug_assertions)]
-        eprintln!(
-            "[DEBUG] mlp_input_dim={} (3 * {})",
-            mlp_input_dim, half_proj
-        );
 
         // Get raw data slices (without expansion - we'll handle broadcast manually)
         // proj_tokens shape: [batch, seq, proj_dim]
@@ -150,28 +85,6 @@ impl JointScorer {
 
         let tokens_slice = tokens_data.as_slice(); // [batch * seq * proj_dim]
         let labels_slice = labels_data.as_slice(); // [n_labels * proj_dim]
-
-        #[cfg(debug_assertions)]
-        {
-            // Check if label projections are different for each label
-            eprintln!("[DEBUG] Label projection check (first 5 values per label):");
-            for l in 0..n_labels {
-                let start = l * proj_dim;
-                let vals: Vec<f32> = (0..5).map(|i| labels_slice[start + i]).collect();
-                eprintln!("  label {}: {:?}", l, vals);
-            }
-
-            // Check token projections for different tokens
-            eprintln!("[DEBUG] Token projection check (first 5 tokens, first 5 values):");
-            for t in 0..5.min(seq_len) {
-                let start = t * proj_dim;
-                let vals: Vec<f32> = (0..5).map(|i| tokens_slice[start + i]).collect();
-                let vals_second: Vec<f32> = (0..5)
-                    .map(|i| tokens_slice[start + half_proj + i])
-                    .collect();
-                eprintln!("  token {}: first={:?}, second={:?}", t, vals, vals_second);
-            }
-        }
 
         // Build combined features with manual broadcasting
         // Output: [batch, seq, n_labels, mlp_input_dim]
@@ -235,28 +148,7 @@ impl JointScorer {
         label_embs: &Tensor<2, f32>,
     ) -> Tensor<4, f32> {
         let logits = self.forward(token_embs, label_embs).await;
-        let [_batch_size, seq_len, n_labels, num_classes] = logits.shape();
-
         let logits_data = logits.clone().as_slice().await.unwrap();
-
-        #[cfg(debug_assertions)]
-        {
-            let data = logits_data.as_slice();
-            eprintln!("[DEBUG] Raw logits (first 3 tokens, all labels) [start, end, inside]:");
-            for s in 0..3.min(seq_len) {
-                for l in 0..n_labels {
-                    let idx = s * n_labels * num_classes + l * num_classes;
-                    eprintln!(
-                        "  token {} label {}: start={:.4}, end={:.4}, inside={:.4}",
-                        s,
-                        l,
-                        data[idx],
-                        data[idx + 1],
-                        data[idx + 2]
-                    );
-                }
-            }
-        }
 
         // Apply sigmoid to each value independently (NOT softmax).
         let data = logits_data.as_slice();
@@ -282,21 +174,6 @@ impl PromptRepLayer {
     pub fn load(device: &Device, vb: &mut VarBuilder) -> Result<Self> {
         let fc1 = Linear::load(device, &mut vb.pp("0"))?;
         let fc2 = Linear::load(device, &mut vb.pp("3"))?;
-
-        #[cfg(debug_assertions)]
-        {
-            eprintln!("[DEBUG] PromptRepLayer loaded:");
-            eprintln!(
-                "  fc1: in={}, out={}",
-                fc1.in_features(),
-                fc1.out_features()
-            );
-            eprintln!(
-                "  fc2: in={}, out={}",
-                fc2.in_features(),
-                fc2.out_features()
-            );
-        }
 
         Ok(Self { fc1, fc2 })
     }

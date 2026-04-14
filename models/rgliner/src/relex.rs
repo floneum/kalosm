@@ -466,22 +466,6 @@ impl GlinerRelEx {
             .tokenizer
             .tokenize(text, entity_labels, relation_labels)?;
 
-        #[cfg(debug_assertions)]
-        {
-            eprintln!(
-                "[DEBUG] Tokenized: {} tokens, {} words",
-                tokenized.token_ids.len(),
-                tokenized.num_words
-            );
-            eprintln!("[DEBUG] ent_positions: {:?}", tokenized.ent_positions);
-            eprintln!("[DEBUG] rel_positions: {:?}", tokenized.rel_positions);
-            eprintln!("[DEBUG] text_positions: {:?}", tokenized.text_positions);
-            eprintln!(
-                "[DEBUG] token_ids (first 20): {:?}",
-                &tokenized.token_ids[..20.min(tokenized.token_ids.len())]
-            );
-        }
-
         if tokenized.num_words == 0 {
             return Ok((Vec::new(), Vec::new()));
         }
@@ -496,105 +480,17 @@ impl GlinerRelEx {
         // 3. Forward pass through encoder
         let encoder_output = self.encoder.forward(&token_ids, Some(&attention_mask));
 
-        #[cfg(debug_assertions)]
-        {
-            let enc_data = encoder_output.clone().as_slice().await.unwrap();
-            let enc_slice = enc_data.as_slice();
-            let mean: f32 = enc_slice.iter().sum::<f32>() / enc_slice.len() as f32;
-            let variance: f32 =
-                enc_slice.iter().map(|x| (x - mean).powi(2)).sum::<f32>() / enc_slice.len() as f32;
-            eprintln!(
-                "[DEBUG] Encoder output stats: mean={:.6}, var={:.6}, min={:.6}, max={:.6}",
-                mean,
-                variance,
-                enc_slice.iter().cloned().fold(f32::INFINITY, f32::min),
-                enc_slice.iter().cloned().fold(f32::NEG_INFINITY, f32::max)
-            );
-
-            // Check encoder output at specific positions (for <<ENT>> tokens)
-            let hidden_size = self.config.hidden_size;
-            eprintln!("[DEBUG] Encoder output at <<ENT>> positions (first 5 values):");
-            for &pos in &tokenized.ent_positions {
-                let start = pos * hidden_size;
-                let vals: Vec<f32> = (0..5).map(|i| enc_slice[start + i]).collect();
-                eprintln!("  pos {}: {:?}", pos, vals);
-            }
-            // Also check a few other positions for comparison
-            eprintln!("[DEBUG] Encoder output at other positions:");
-            for &pos in &[0, 2, 4, 10, 17] {
-                if pos < tokenized.token_ids.len() {
-                    let start = pos * hidden_size;
-                    let vals: Vec<f32> = (0..5).map(|i| enc_slice[start + i]).collect();
-                    eprintln!("  pos {}: {:?}", pos, vals);
-                }
-            }
-        }
-
         // 4. Extract word-level embeddings from encoder output, THEN apply BiLSTM
         // (Python applies BiLSTM to word-level embeddings, not the full token sequence.)
         let word_encoder_embs =
             self.gather_at_positions(&encoder_output, &tokenized.text_positions);
         let lstm_output = self.bilstm.forward(&word_encoder_embs).await;
 
-        #[cfg(debug_assertions)]
-        {
-            let lstm_data = lstm_output.clone().as_slice().await.unwrap();
-            let lstm_slice = lstm_data.as_slice();
-            let hidden_size = self.config.hidden_size;
-            eprintln!("[DEBUG] Word-level BiLSTM output (first 5 values per word):");
-            for w in 0..tokenized.num_words {
-                let start = w * hidden_size;
-                let vals: Vec<f32> = (0..5).map(|i| lstm_slice[start + i]).collect();
-                eprintln!("  word {}: {:?}", w, vals);
-            }
-        }
-
         // 5. Extract label embeddings at marker positions from ENCODER output and project them
         // (Labels are extracted from encoder output, text tokens from BiLSTM output)
         // Entity label embeddings: hidden states at <<ENT>> positions
         let ent_embs_raw = self.gather_at_positions(&encoder_output, &tokenized.ent_positions);
-
-        #[cfg(debug_assertions)]
-        {
-            let raw_data = ent_embs_raw.clone().as_slice().await.unwrap();
-            let raw_slice = raw_data.as_slice();
-            let hidden_size = self.config.hidden_size;
-            eprintln!("[DEBUG] Raw entity embeddings check (first 5 values per label):");
-            for l in 0..tokenized.ent_positions.len() {
-                let start = l * hidden_size;
-                let vals: Vec<f32> = (0..5).map(|i| raw_slice[start + i]).collect();
-                eprintln!(
-                    "  label {} (pos {}): {:?}",
-                    l, tokenized.ent_positions[l], vals
-                );
-            }
-        }
-
         let ent_embs = self.prompt_rep_layer.forward_3d(&ent_embs_raw);
-
-        #[cfg(debug_assertions)]
-        {
-            let ent_data = ent_embs.clone().as_slice().await.unwrap();
-            let ent_slice = ent_data.as_slice();
-            let hidden_size = self.config.hidden_size;
-            let mean: f32 = ent_slice.iter().sum::<f32>() / ent_slice.len() as f32;
-            let variance: f32 =
-                ent_slice.iter().map(|x| (x - mean).powi(2)).sum::<f32>() / ent_slice.len() as f32;
-            eprintln!(
-                "[DEBUG] Entity label embs stats: mean={:.6}, var={:.6}, min={:.6}, max={:.6}",
-                mean,
-                variance,
-                ent_slice.iter().cloned().fold(f32::INFINITY, f32::min),
-                ent_slice.iter().cloned().fold(f32::NEG_INFINITY, f32::max)
-            );
-            // Print projected values per label (compare with Python)
-            eprintln!("[DEBUG] Projected entity embeddings (first 5 values per label):");
-            for l in 0..entity_labels.len() {
-                let start = l * hidden_size;
-                let vals: Vec<f32> = (0..5).map(|i| ent_slice[start + i]).collect();
-                eprintln!("  {}: {:?}", entity_labels[l], vals);
-            }
-        }
 
         // Relation label embeddings: raw hidden states at <<REL>> positions
         // (unlike entity labels, relation labels are NOT projected through prompt_rep_layer)
@@ -602,22 +498,6 @@ impl GlinerRelEx {
 
         // 6. Text embeddings = BiLSTM output (already at word level)
         let text_embs = lstm_output.clone();
-
-        #[cfg(debug_assertions)]
-        {
-            let text_data = text_embs.clone().as_slice().await.unwrap();
-            let text_slice = text_data.as_slice();
-            let mean: f32 = text_slice.iter().sum::<f32>() / text_slice.len() as f32;
-            let variance: f32 = text_slice.iter().map(|x| (x - mean).powi(2)).sum::<f32>()
-                / text_slice.len() as f32;
-            eprintln!(
-                "[DEBUG] Text token embs stats: mean={:.6}, var={:.6}, min={:.6}, max={:.6}",
-                mean,
-                variance,
-                text_slice.iter().cloned().fold(f32::INFINITY, f32::min),
-                text_slice.iter().cloned().fold(f32::NEG_INFINITY, f32::max)
-            );
-        }
 
         // 7–8. Decode entities using the mode matching the trained head.
         let ent_embs_2d: Tensor<2, f32> = ent_embs.squeeze(0).to_concrete();
@@ -661,31 +541,6 @@ impl GlinerRelEx {
             .span_layer
             .forward_for_spans(&text_embs, &entity_spans, &self.device);
         // span_reps shape: [num_entities, hidden]
-
-        #[cfg(debug_assertions)]
-        {
-            let sr_data = span_reps.clone().as_slice().await?;
-            let sr = sr_data.as_slice();
-            let hidden = self.config.hidden_size;
-            eprintln!("[DEBUG] Span reps (first 5 values per entity):");
-            for (i, e) in entities.iter().enumerate() {
-                let start = i * hidden;
-                let vals: Vec<f32> = (0..5).map(|k| sr[start + k]).collect();
-                eprintln!(
-                    "  {} ({}, {}): {:?}",
-                    e.text, e.start_word, e.end_word, vals
-                );
-            }
-            // Print rel_embs
-            let re_data = rel_embs.clone().as_slice().await?;
-            let re = re_data.as_slice();
-            eprintln!("[DEBUG] Rel embs (first 5 values per label):");
-            for (i, l) in relation_labels.iter().enumerate() {
-                let start = i * hidden;
-                let vals: Vec<f32> = (0..5).map(|k| re[start + k]).collect();
-                eprintln!("  {}: {:?}", l, vals);
-            }
-        }
 
         let num_entities = entities.len();
         let hidden_size = self.config.hidden_size;
@@ -731,27 +586,6 @@ impl GlinerRelEx {
         let n_rels = relation_labels.len();
         let mut relations = Vec::new();
         let threshold = self.config.relation_threshold;
-
-        #[cfg(debug_assertions)]
-        {
-            eprintln!(
-                "[DEBUG] Relation scoring: {} pairs, {} relations, threshold={}",
-                candidate_pairs.len(),
-                n_rels,
-                threshold
-            );
-            for (pair_idx, &(h, t)) in candidate_pairs.iter().enumerate().take(6) {
-                let base = pair_idx * n_rels;
-                let raw: Vec<f32> = (0..n_rels)
-                    .map(|c| rel_scores_slice.as_slice()[base + c])
-                    .collect();
-                let sig: Vec<f32> = raw.iter().map(|x| 1.0 / (1.0 + (-x).exp())).collect();
-                eprintln!(
-                    "  pair ({}->{}) [{} -> {}]: raw={:?}, sig={:?}",
-                    h, t, entities[h].text, entities[t].text, raw, sig
-                );
-            }
-        }
 
         for (pair_idx, &(head_idx, tail_idx)) in candidate_pairs.iter().enumerate() {
             let base = pair_idx * n_rels;
@@ -824,14 +658,6 @@ impl GlinerRelEx {
         let logits_data = logits.clone().as_slice().await?;
         let logits_slice = logits_data.as_slice();
 
-        #[cfg(debug_assertions)]
-        eprintln!(
-            "[DEBUG] markerV0 decoding: {} spans x {} labels, threshold={}",
-            spans.len(),
-            n_labels,
-            threshold,
-        );
-
         // Candidate (start, end, label, score) above threshold.
         let mut candidates: Vec<(usize, usize, usize, f32)> = Vec::new();
         for (span_idx, &(s, e)) in spans.iter().enumerate() {
@@ -897,29 +723,6 @@ impl GlinerRelEx {
         let scores = scores_data.as_slice();
 
         let threshold = self.config.entity_threshold;
-
-        #[cfg(debug_assertions)]
-        {
-            eprintln!(
-                "[DEBUG] Entity decoding: num_tokens={}, num_labels={}, threshold={}",
-                num_tokens, num_labels, threshold
-            );
-            eprintln!("[DEBUG] Sigmoid scores [start, end, inside] (first 5 tokens):");
-            for t in 0..5.min(num_tokens) {
-                for l in 0..num_labels {
-                    let base = t * num_labels * 3 + l * 3;
-                    eprintln!(
-                        "  token {} label {} ({}): start={:.4}, end={:.4}, inside={:.4}",
-                        t,
-                        l,
-                        entity_labels[l],
-                        scores[base],
-                        scores[base + 1],
-                        scores[base + 2]
-                    );
-                }
-            }
-        }
 
         // Candidate spans: (start, end, label, score)
         let mut candidates: Vec<(usize, usize, usize, f32)> = Vec::new();

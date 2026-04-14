@@ -39,16 +39,6 @@ impl BiLstm {
         // hidden_size is 4*hidden (for i,f,g,o gates), so actual hidden = shape[0]/4
         let hidden_size = weight_ih_f.shape()[0] / 4;
 
-        #[cfg(debug_assertions)]
-        {
-            eprintln!("[DEBUG] BiLstm loaded:");
-            eprintln!("  weight_ih_f shape: {:?}", weight_ih_f.shape());
-            eprintln!("  weight_hh_f shape: {:?}", weight_hh_f.shape());
-            eprintln!("  bias_ih_f shape: {:?}", bias_ih_f.shape());
-            eprintln!("  computed hidden_size: {}", hidden_size);
-            eprintln!("  output_dim: {}", 2 * hidden_size);
-        }
-
         Ok(Self {
             weight_ih_f,
             weight_hh_f,

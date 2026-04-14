@@ -34,20 +34,10 @@ impl RelativePositionEmbedding {
         // GGUF stores shape as [hidden_size, 2*max_pos] but we need [2*max_pos, hidden_size]
         let [dim0, dim1] = embeddings_raw.shape();
         let embeddings = if dim0 > dim1 {
-            // Shape is [hidden_size, positions] - need to transpose
-            #[cfg(debug_assertions)]
-            eprintln!(
-                "[DEBUG] Transposing rel_pos_embd from [{}, {}] to [{}, {}]",
-                dim0, dim1, dim1, dim0
-            );
             embeddings_raw.transpose(0, 1).to_concrete()
         } else {
             embeddings_raw
         };
-
-        #[cfg(debug_assertions)]
-        eprintln!("[DEBUG] RelativePositionEmbedding loaded: shape={:?}, max_relative_positions={}, has_layer_norm={}",
-                  embeddings.shape(), max_relative_positions, layer_norm.is_some());
 
         Ok(Self {
             embeddings,

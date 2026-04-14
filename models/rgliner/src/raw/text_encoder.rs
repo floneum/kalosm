@@ -24,15 +24,6 @@ impl TextEncoder {
         // Optional output projection (small/base/large v2.0 variants).
         let output_proj = Linear::load(device, &mut text_vb.pp("output_proj")).ok();
 
-        #[cfg(debug_assertions)]
-        if let Some(ref p) = output_proj {
-            eprintln!(
-                "[DEBUG] TextEncoder output projection loaded: {} -> {}",
-                p.in_features(),
-                p.out_features()
-            );
-        }
-
         Ok(Self { model, output_proj })
     }
 
