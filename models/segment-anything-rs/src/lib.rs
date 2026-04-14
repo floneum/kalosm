@@ -629,22 +629,14 @@ fn low_res_crop_extent(original_len: usize, low_res_len: usize) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
 
-    fn load_model_with_device(
-        gguf_path: &Path,
-        device: Device,
-        tiny: bool,
-    ) -> Result<SegmentAnything, LoadSegmentAnythingError> {
-        let mut reader = std::io::BufReader::new(std::fs::File::open(gguf_path)?);
-        let mut vb = VarBuilder::from_gguf(&mut reader)
-            .map_err(|e| fusor::Error::msg(format!("Failed to read GGUF: {e}")))?;
-        let sam = if tiny {
-            raw::sam::Sam::load_tiny(&device, &mut vb)?
-        } else {
-            raw::sam::Sam::load_vit_b(&device, &mut vb)?
-        };
-        Ok(SegmentAnything { sam, device })
+    fn fetch_tiny_gguf_path() -> PathBuf {
+        let source = SegmentAnythingSource::tiny();
+        let api = hf_hub::api::sync::Api::new().expect("create hf api");
+        api.model(source.model)
+            .get(&source.filename)
+            .expect("download tiny SAM gguf")
     }
 
     fn f_to_vec<const R: usize>(t: &Tensor<R, f32>) -> Vec<f32> {
@@ -668,12 +660,8 @@ mod tests {
     /// End-to-end smoke test: load model, run inference, verify mask is non-trivial.
     #[tokio::test]
     async fn test_load_tiny_model() {
-        let gguf_path = Path::new("/tmp/mobile_sam-tiny-vitt.gguf");
-        if !gguf_path.exists() {
-            return;
-        }
-
-        let model = SegmentAnything::from_gguf_path(gguf_path, true)
+        let model = SegmentAnything::builder()
+            .build()
             .await
             .expect("Failed to load model");
 
@@ -704,12 +692,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_load_tiny_model_cpu_runtime() {
-        let gguf_path = Path::new("/tmp/mobile_sam-tiny-vitt.gguf");
-        if !gguf_path.exists() {
-            return;
-        }
-
-        let model = load_model_with_device(gguf_path, Device::cpu(), true)
+        let model = SegmentAnything::builder()
+            .device(Device::cpu())
+            .build()
+            .await
             .expect("Failed to load model on CPU");
 
         let image_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/landscape.jpg");
@@ -732,17 +718,14 @@ mod tests {
     async fn test_mask_decoder_cpu_vs_gpu() {
         use fusor::{Device, Tensor, VarBuilder};
 
-        let gguf_path = Path::new("/tmp/mobile_sam-tiny-vitt.gguf");
-        if !gguf_path.exists() {
-            return;
-        }
+        let gguf_path = fetch_tiny_gguf_path();
 
         let cpu = Device::cpu();
         let gpu = Device::new().await.unwrap();
-        let mut cpu_reader = std::io::BufReader::new(std::fs::File::open(gguf_path).unwrap());
+        let mut cpu_reader = std::io::BufReader::new(std::fs::File::open(&gguf_path).unwrap());
         let mut cpu_vb = VarBuilder::from_gguf(&mut cpu_reader).unwrap();
         let cpu_sam = raw::sam::Sam::load_tiny(&cpu, &mut cpu_vb).unwrap();
-        let mut gpu_reader = std::io::BufReader::new(std::fs::File::open(gguf_path).unwrap());
+        let mut gpu_reader = std::io::BufReader::new(std::fs::File::open(&gguf_path).unwrap());
         let mut gpu_vb = VarBuilder::from_gguf(&mut gpu_reader).unwrap();
         let gpu_sam = raw::sam::Sam::load_tiny(&gpu, &mut gpu_vb).unwrap();
 
@@ -813,19 +796,16 @@ mod tests {
     async fn test_dual_consumer_gpu_bug() {
         use fusor::{ConcreteTensor, Device, Tensor};
 
-        let gguf_path = Path::new("/tmp/mobile_sam-tiny-vitt.gguf");
-        if !gguf_path.exists() {
-            return;
-        }
+        let gguf_path = fetch_tiny_gguf_path();
 
         let cpu = Device::cpu();
         let gpu = Device::new().await.unwrap();
 
         // Load full model to warm up GPU buffer pool and get GGUF gaussian matrix.
-        let mut cpu_reader = std::io::BufReader::new(std::fs::File::open(gguf_path).unwrap());
+        let mut cpu_reader = std::io::BufReader::new(std::fs::File::open(&gguf_path).unwrap());
         let mut cpu_vb = VarBuilder::from_gguf(&mut cpu_reader).unwrap();
         let cpu_sam = raw::sam::Sam::load_tiny(&cpu, &mut cpu_vb).unwrap();
-        let mut gpu_reader = std::io::BufReader::new(std::fs::File::open(gguf_path).unwrap());
+        let mut gpu_reader = std::io::BufReader::new(std::fs::File::open(&gguf_path).unwrap());
         let mut gpu_vb = VarBuilder::from_gguf(&mut gpu_reader).unwrap();
         let gpu_sam = raw::sam::Sam::load_tiny(&gpu, &mut gpu_vb).unwrap();
 
@@ -923,12 +903,12 @@ mod tests {
         use candle_transformers::models::segment_anything::sam::Sam as CSam;
         use std::time::Instant;
 
-        let gguf_path = Path::new("/tmp/mobile_sam-tiny-vitt.gguf");
-        let safetensors_path = std::path::Path::new(&std::env::var("HOME").unwrap())
-            .join(".cache/huggingface/hub/models--lmz--candle-sam/snapshots/8b4cb7c743f3b3cb8afd212a86ae15b1bbfdac97/mobile_sam-tiny-vitt.safetensors");
-        if !gguf_path.exists() || !safetensors_path.exists() {
-            return;
-        }
+        let gguf_path = fetch_tiny_gguf_path();
+        let safetensors_path = hf_hub::api::sync::Api::new()
+            .expect("create hf api")
+            .model("lmz/candle-sam".to_string())
+            .get("mobile_sam-tiny-vitt.safetensors")
+            .expect("download candle SAM safetensors");
 
         let image_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/landscape.jpg");
         let image = image::open(&image_path).expect("open image");
@@ -973,7 +953,7 @@ mod tests {
         let candle_per_iter = t0.elapsed() / n_iters as u32;
 
         // --- Fusor (GPU) ---
-        let f_model = SegmentAnything::from_gguf_path(gguf_path, true)
+        let f_model = SegmentAnything::from_gguf_path(&gguf_path, true)
             .await
             .expect("load fusor");
         let f_image_tensor = f_model.image_to_tensor(image.clone());
@@ -1098,12 +1078,8 @@ mod tests {
     /// Uses the exact same reshape+as_slice reading pattern as segment_everything.
     #[tokio::test]
     async fn test_batched_vs_unbatched() {
-        let gguf_path = Path::new("/tmp/mobile_sam-tiny-vitt.gguf");
-        if !gguf_path.exists() {
-            return;
-        }
-
-        let model = SegmentAnything::from_gguf_path(gguf_path, true)
+        let model = SegmentAnything::builder()
+            .build()
             .await
             .expect("Failed to load model");
 
