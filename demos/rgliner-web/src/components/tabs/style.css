@@ -1,0 +1,72 @@
+.tabs {
+    display: flex;
+    width: 100%;
+    flex-direction: column;
+    gap: 0.5rem;
+}
+
+.tabs-list {
+    display: flex;
+    width: fit-content;
+    box-sizing: border-box;
+    flex: 1;
+    flex-direction: row;
+    padding: 0.25rem;
+    border: none;
+    border-radius: 0.5rem;
+    gap: 0.25rem;
+}
+
+[data-variant="default"] .tabs-list {
+    background: var(--light, var(--primary-color-3))
+        var(--dark, var(--primary-color-5));
+}
+
+.tabs-trigger {
+    padding: 4px 8px;
+    border: none;
+    border-radius: calc(0.5rem - 0.25rem);
+    background: none;
+    color: var(--secondary-color-5);
+    cursor: pointer;
+}
+
+[data-variant="default"] .tabs-trigger[data-state="active"] {
+    background-color: var(--light, var(--primary-color))
+        var(--dark, var(--primary-color-6));
+    box-shadow: var(--dark, inset 0 0 0 1px var(--primary-color-7))
+        var(--light, 0 1px 2px rgb(0 0 0 / 18%));
+}
+
+.tabs-trigger[data-state="active"] {
+    color: var(--secondary-color-1);
+}
+
+.tabs-trigger[data-disabled="true"] {
+    color: var(--secondary-color-5);
+    cursor: not-allowed;
+}
+
+.tabs-trigger:hover:not([data-disabled="true"]),
+.tabs-trigger:focus-visible {
+    color: var(--secondary-color-3);
+}
+
+.tabs-content {
+    width: 100%;
+    box-sizing: border-box;
+    padding: 0.25rem;
+}
+
+[data-variant="default"] .tabs-content-themed {
+    border: 1px solid var(--light, var(--primary-color-6))
+        var(--dark, var(--primary-color-7));
+    border-radius: 0.5rem;
+    background: var(--light, var(--primary-color))
+        var(--dark, var(--primary-color-3));
+    box-shadow: var(--light, 0 1px 2px rgb(0 0 0 / 18%)) var(--dark, none);
+}
+
+.tabs-content[data-state="inactive"] {
+    display: none;
+}

@@ -1,3 +1,15 @@
+mod components;
+
+use components::badge::{Badge, BadgeVariant};
+use components::button::Button;
+use components::card::{Card, CardContent, CardDescription, CardHeader, CardTitle};
+use components::input::Input;
+use components::label::Label;
+use components::select::{
+    Select, SelectItemIndicator, SelectList, SelectOption, SelectTrigger, SelectValue,
+};
+use components::tabs::{TabContent, TabList, TabTrigger, Tabs};
+use components::textarea::Textarea;
 use dioxus::prelude::*;
 use rgliner::{
     relation_decoding::Relation,
@@ -22,6 +34,22 @@ enum Mode {
     Relex,
 }
 
+impl Mode {
+    fn value(self) -> &'static str {
+        match self {
+            Mode::Ner => "ner",
+            Mode::Relex => "relex",
+        }
+    }
+
+    fn from_value(v: &str) -> Mode {
+        match v {
+            "relex" => Mode::Relex,
+            _ => Mode::Ner,
+        }
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum ModelChoice {
     Edge,
@@ -44,31 +72,6 @@ impl ModelChoice {
             ModelChoice::RelexBase => "relex-base · English",
             ModelChoice::RelexLarge => "relex-large · English · best",
         }
-    }
-
-    fn value(self) -> &'static str {
-        match self {
-            ModelChoice::Edge => "edge",
-            ModelChoice::Small => "small",
-            ModelChoice::Base => "base",
-            ModelChoice::Large => "large",
-            ModelChoice::RelexMulti => "relex-multi",
-            ModelChoice::RelexBase => "relex-base",
-            ModelChoice::RelexLarge => "relex-large",
-        }
-    }
-
-    fn from_value(v: &str) -> Option<Self> {
-        Some(match v {
-            "edge" => ModelChoice::Edge,
-            "small" => ModelChoice::Small,
-            "base" => ModelChoice::Base,
-            "large" => ModelChoice::Large,
-            "relex-multi" => ModelChoice::RelexMulti,
-            "relex-base" => ModelChoice::RelexBase,
-            "relex-large" => ModelChoice::RelexLarge,
-            _ => return None,
-        })
     }
 
     fn default_for(mode: Mode) -> Self {
@@ -96,14 +99,8 @@ impl ModelChoice {
 }
 
 enum LoadedModel {
-    Ner {
-        choice: ModelChoice,
-        inner: Gliner,
-    },
-    Relex {
-        choice: ModelChoice,
-        inner: GlinerRelEx,
-    },
+    Ner { choice: ModelChoice, inner: Gliner },
+    Relex { choice: ModelChoice, inner: GlinerRelEx },
 }
 
 impl LoadedModel {
@@ -129,8 +126,7 @@ fn App() -> Element {
         "Apple Inc. was founded by Steve Jobs in California. Microsoft is headquartered in Redmond."
             .to_string()
     });
-    let mut entity_labels =
-        use_signal(|| "person, organization, location".to_string());
+    let mut entity_labels = use_signal(|| "person, organization, location".to_string());
     let mut relation_labels = use_signal(|| "founded by, located in".to_string());
 
     let mut model = use_signal(|| None::<LoadedModel>);
@@ -141,7 +137,8 @@ fn App() -> Element {
     let mut relex_out = use_signal(RelexResult::default);
     let mut status = use_signal(|| "No model loaded".to_string());
 
-    let mut on_mode_change = move |new_mode: Mode| {
+    let on_mode_change = move |v: String| {
+        let new_mode = Mode::from_value(&v);
         if mode() != new_mode {
             mode.set(new_mode);
             choice.set(ModelChoice::default_for(new_mode));
@@ -237,7 +234,11 @@ fn App() -> Element {
         .map(|m| m.choice() != choice())
         .unwrap_or(true);
 
+    let current_mode = mode();
+    let current_choice = choice();
+
     rsx! {
+        document::Link { rel: "stylesheet", href: asset!("/assets/dx-components-theme.css") }
         document::Link { rel: "stylesheet", href: asset!("/assets/style.css") }
         div { class: "app",
             header { class: "site-header",
@@ -254,100 +255,129 @@ fn App() -> Element {
                 }
             }
 
-            div { class: "tabs",
-                button {
-                    class: if mode() == Mode::Ner { "tab active" } else { "tab" },
-                    onclick: move |_| on_mode_change(Mode::Ner),
-                    "NER"
+            Tabs {
+                default_value: current_mode.value().to_string(),
+                horizontal: true,
+                on_value_change: on_mode_change,
+                TabList {
+                    TabTrigger { value: "ner".to_string(), index: 0usize, "NER" }
+                    TabTrigger { value: "relex".to_string(), index: 1usize, "NER + Relations" }
                 }
-                button {
-                    class: if mode() == Mode::Relex { "tab active" } else { "tab" },
-                    onclick: move |_| on_mode_change(Mode::Relex),
-                    "NER + Relations"
-                }
+                TabContent { index: 0usize, value: "ner".to_string(), "" }
+                TabContent { index: 1usize, value: "relex".to_string(), "" }
             }
 
             if let Some(e) = error() {
                 div { class: "err-banner", "{e}" }
             }
 
-            div { class: "panel",
-                label { "Model" }
-                div { class: "row",
-                    select {
-                        value: "{choice().value()}",
-                        onchange: move |ev| {
-                            if let Some(c) = ModelChoice::from_value(&ev.value()) {
-                                choice.set(c);
+            Card {
+                CardHeader {
+                    CardTitle { "Model" }
+                    CardDescription {
+                        "First load fetches GGUF weights (60 MB – 500 MB) from HuggingFace and caches them in the browser's Origin Private File System."
+                    }
+                }
+                CardContent {
+                    div { class: "row",
+                        div { style: "min-width: 16rem;",
+                            Select::<ModelChoice> {
+                                key: "{current_mode.value()}",
+                                placeholder: "Select a model...",
+                                default_value: current_choice,
+                                on_value_change: move |v: Option<ModelChoice>| {
+                                    if let Some(c) = v {
+                                        choice.set(c);
+                                    }
+                                },
+                                SelectTrigger { aria_label: "Model", SelectValue {} }
+                                SelectList { aria_label: "Models",
+                                    for (i, c) in ModelChoice::for_mode(current_mode).iter().copied().enumerate() {
+                                        SelectOption::<ModelChoice> {
+                                            index: i,
+                                            value: c,
+                                            text_value: c.label().to_string(),
+                                            "{c.label()}"
+                                            SelectItemIndicator {}
+                                        }
+                                    }
+                                }
                             }
-                        },
-                        for c in ModelChoice::for_mode(mode()) {
-                            option { value: "{c.value()}", "{c.label()}" }
                         }
-                    }
-                    button {
-                        class: "primary",
-                        disabled: loading() || running() || (has_model && !model_mismatch),
-                        onclick: on_load,
-                        if loading() { "Loading…" }
-                        else if has_model && !model_mismatch { "Loaded" }
-                        else if has_model { "Reload" }
-                        else { "Load model" }
-                    }
-                    span {
-                        class: if error().is_some() { "status err" } else if has_model { "status ok" } else { "status" },
-                        "{status()}"
-                    }
-                }
-                p { class: "muted",
-                    "First load fetches the GGUF weights (60 MB – 500 MB) from HuggingFace and caches them in the browser's Origin Private File System. Subsequent loads are instant."
-                }
-            }
-
-            div { class: "panel",
-                label { "Text" }
-                textarea {
-                    value: "{text}",
-                    oninput: move |e| text.set(e.value()),
-                }
-            }
-
-            div { class: "panel",
-                label { "Entity labels (comma-separated)" }
-                input {
-                    r#type: "text",
-                    value: "{entity_labels}",
-                    oninput: move |e| entity_labels.set(e.value()),
-                }
-                if mode() == Mode::Relex {
-                    div { style: "margin-top: 0.75rem;",
-                        label { "Relation labels (comma-separated)" }
-                        input {
-                            r#type: "text",
-                            value: "{relation_labels}",
-                            oninput: move |e| relation_labels.set(e.value()),
+                        Button {
+                            disabled: loading() || running() || (has_model && !model_mismatch),
+                            onclick: on_load,
+                            if loading() {
+                                "Loading…"
+                            } else if has_model && !model_mismatch {
+                                "Loaded"
+                            } else if has_model {
+                                "Reload"
+                            } else {
+                                "Load model"
+                            }
+                        }
+                        span {
+                            class: if error().is_some() { "status err" } else if has_model { "status ok" } else { "status" },
+                            "{status()}"
                         }
                     }
                 }
             }
 
-            div { class: "panel",
-                div { class: "row",
-                    button {
-                        class: "primary",
-                        disabled: !has_model || running() || loading() || model_mismatch,
-                        onclick: on_extract,
-                        if running() { "Extracting…" } else { "Extract" }
+            Card {
+                CardHeader { CardTitle { "Text" } }
+                CardContent {
+                    Textarea {
+                        value: "{text}",
+                        rows: "4",
+                        oninput: move |e: FormEvent| text.set(e.value()),
                     }
-                    if model_mismatch && has_model {
-                        span { class: "status",
-                            "Model selection changed — reload to use it."
+                }
+            }
+
+            Card {
+                CardHeader { CardTitle { "Labels" } }
+                CardContent {
+                    Label { html_for: "entity-labels", "Entity labels (comma-separated)" }
+                    Input {
+                        id: "entity-labels",
+                        r#type: "text",
+                        value: "{entity_labels}",
+                        oninput: move |e: FormEvent| entity_labels.set(e.value()),
+                    }
+                    if current_mode == Mode::Relex {
+                        div { style: "margin-top: 0.75rem;",
+                            Label { html_for: "relation-labels", "Relation labels (comma-separated)" }
+                            Input {
+                                id: "relation-labels",
+                                r#type: "text",
+                                value: "{relation_labels}",
+                                oninput: move |e: FormEvent| relation_labels.set(e.value()),
+                            }
                         }
                     }
                 }
             }
 
-            { render_results(mode(), text(), ner_out(), relex_out()) }
+            Card {
+                CardContent {
+                    div { class: "row",
+                        Button {
+                            disabled: !has_model || running() || loading() || model_mismatch,
+                            onclick: on_extract,
+                            if running() { "Extracting…" } else { "Extract" }
+                        }
+                        if model_mismatch && has_model {
+                            span { class: "status",
+                                "Model selection changed — reload to use it."
+                            }
+                        }
+                    }
+                }
+            }
+
+            { render_results(current_mode, text(), ner_out(), relex_out()) }
         }
     }
 }
@@ -360,14 +390,9 @@ fn parse_labels(raw: &str) -> Vec<String> {
         .collect()
 }
 
-async fn build_model(
-    choice: ModelChoice,
-) -> Result<LoadedModel, String> {
+async fn build_model(choice: ModelChoice) -> Result<LoadedModel, String> {
     match choice {
-        ModelChoice::Edge
-        | ModelChoice::Small
-        | ModelChoice::Base
-        | ModelChoice::Large => {
+        ModelChoice::Edge | ModelChoice::Small | ModelChoice::Base | ModelChoice::Large => {
             let source = match choice {
                 ModelChoice::Edge => GlinerSource::edge(),
                 ModelChoice::Small => GlinerSource::small(),
@@ -458,45 +483,53 @@ fn render_results(
 
     if entities.is_empty() && relations.is_empty() {
         return rsx! {
-            div { class: "panel",
-                p { class: "muted", "Run extraction to see results." }
+            Card {
+                CardContent {
+                    p { class: "muted", "Run extraction to see results." }
+                }
             }
         };
     }
 
     rsx! {
-        div { class: "panel",
-            div { class: "results",
-                { highlighted_text(text.clone(), entities.clone()) }
-            }
+        Card {
+            CardHeader { CardTitle { "Results" } }
+            CardContent {
+                div { class: "results",
+                    { highlighted_text(text.clone(), entities.clone()) }
+                }
 
-            if !entities.is_empty() {
-                ul { class: "entity-list",
-                    for (i, ent) in entities.iter().enumerate() {
-                        li { key: "{i}",
-                            span { class: "label", style: "color: {hsl_for(&ent.label)};", "{ent.label}" }
-                            " · "
-                            span { "{ent.text:?}" }
-                            " "
-                            span { class: "score", "{format_score(ent.score)}" }
+                if !entities.is_empty() {
+                    ul { class: "entity-list",
+                        for (i, ent) in entities.iter().enumerate() {
+                            li { key: "{i}",
+                                Badge {
+                                    variant: BadgeVariant::Outline,
+                                    span { style: "color: {hsl_for(&ent.label)};", "{ent.label}" }
+                                }
+                                " · "
+                                span { "{ent.text:?}" }
+                                " "
+                                span { class: "score", "{format_score(ent.score)}" }
+                            }
                         }
                     }
                 }
-            }
 
-            if !relations.is_empty() {
-                div { style: "margin-top: 1rem;",
-                    label { "Relations" }
-                    ul { class: "relation-list",
-                        for (i, rel) in relations.iter().enumerate() {
-                            li { key: "rel-{i}",
-                                span { class: "label", "{rel.head.text}" }
-                                " --["
-                                span { style: "color: var(--accent);", "{rel.relation}" }
-                                "]--> "
-                                span { class: "label", "{rel.tail.text}" }
-                                " "
-                                span { class: "score", "{format_score(rel.score)}" }
+                if !relations.is_empty() {
+                    div { style: "margin-top: 1rem;",
+                        Label { html_for: "relations-list", "Relations" }
+                        ul { class: "relation-list",
+                            for (i, rel) in relations.iter().enumerate() {
+                                li { key: "rel-{i}",
+                                    Badge { "{rel.head.text}" }
+                                    " --["
+                                    span { style: "color: var(--accent);", "{rel.relation}" }
+                                    "]--> "
+                                    Badge { "{rel.tail.text}" }
+                                    " "
+                                    span { class: "score", "{format_score(rel.score)}" }
+                                }
                             }
                         }
                     }

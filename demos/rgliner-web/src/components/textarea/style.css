@@ -1,0 +1,84 @@
+/* Base */
+.textarea {
+  width: 100%;
+  min-height: 4rem;
+  box-sizing: border-box;
+  padding: 8px 12px;
+  border: none;
+  border-radius: 0.5rem;
+  margin: 0;
+  appearance: none;
+  background: none;
+  color: var(--secondary-color-4);
+  font-family: inherit;
+  line-height: 1.5;
+  outline: none;
+  resize: vertical;
+  transition: background-color 100ms ease-out, border-color 100ms ease-out, box-shadow 100ms ease-out;
+}
+
+.textarea:disabled {
+  color: var(--secondary-color-5);
+  cursor: not-allowed;
+}
+
+.textarea::placeholder {
+  color: var(--secondary-color-5);
+}
+
+/* Default Variant */
+.textarea[data-style="default"] {
+  background: var(--light, var(--primary-color)) var(--dark, var(--primary-color-3));
+  box-shadow: inset 0 0 0 1px var(--light, var(--primary-color-6)) var(--dark, var(--primary-color-7));
+}
+
+.textarea[data-style="default"]:hover:not(:disabled),
+.textarea[data-style="default"]:focus {
+  background: var(--light, var(--primary-color-4)) var(--dark, var(--primary-color-5));
+  color: var(--secondary-color-1);
+}
+
+/* Fade Variant */
+.textarea[data-style="fade"] {
+  background: var(--light, var(--primary-color)) var(--dark, var(--primary-color-3));
+}
+
+.textarea[data-style="fade"]:hover:not(:disabled),
+.textarea[data-style="fade"]:focus {
+  background: var(--light, var(--primary-color-4)) var(--dark, var(--primary-color-5));
+  color: var(--secondary-color-1);
+}
+
+/* Outline Variant */
+.textarea[data-style="outline"] {
+  border: 1px solid var(--primary-color-6);
+  background-color: var(--light, var(--primary-color))
+    var(--dark, var(--primary-color-3));
+}
+
+.textarea[data-style="outline"]:hover:not(:disabled, :focus) {
+  border-color: var(--primary-color-7);
+}
+
+.textarea[data-style="outline"]:focus {
+  border-color: var(--focused-border-color);
+}
+
+.textarea[data-style="outline"]:invalid,
+.textarea[data-style="outline"][aria-invalid="true"] {
+  border-color: var(--primary-error-color);
+}
+
+/* Ghost Variant */
+.textarea[data-style="ghost"] {
+  background-color: transparent;
+}
+
+.textarea[data-style="ghost"]:hover:not(:disabled) {
+  background-color: var(--primary-color-5);
+  color: var(--secondary-color-1);
+}
+
+.textarea[data-style="ghost"]:focus {
+  border-color: var(--focused-border-color);
+}

@@ -1,0 +1,42 @@
+.badge-example {
+  display: flex;
+  align-items: center;
+  gap: 1rem;
+}
+
+.badge {
+  display: inline-flex;
+  min-width: 20px;
+  height: 20px;
+  align-items: center;
+  justify-content: center;
+  border-radius: 10px;
+  box-shadow: 0 0 0 1px var(--primary-color-2);
+  font-size: 12px;
+  gap: 4px
+}
+
+.badge[padding="true"] {
+  padding: 0 8px;
+}
+
+.badge[data-style="primary"] {
+  background-color: var(--secondary-color-2);
+  color: var(--primary-color);
+}
+
+.badge[data-style="secondary"] {
+  background-color: var(--primary-color-5);
+  color: var(--secondary-color-1);
+}
+
+.badge[data-style="outline"] {
+  border: 1px solid var(--primary-color-6);
+  background-color: var(--light, var(--primary-color)) var(--dark, var(--primary-color-3));
+  color: var(--secondary-color-4);
+}
+
+.badge[data-style="destructive"] {
+  background-color: var(--primary-error-color);
+  color: var(--contrast-error-color);
+}
