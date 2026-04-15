@@ -5044,6 +5044,7 @@ dependencies = [
  "byteorder",
  "cpal",
  "dasp",
+ "fusor",
  "futures-channel",
  "futures-core",
  "futures-util",
@@ -5833,9 +5834,7 @@ dependencies = [
 
 [[package]]
 name = "nnnoiseless"
-version = "0.5.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "805d5964d1e7a0006a7fdced7dae75084d66d18b35f1dfe81bd76929b1f8da0c"
+version = "0.5.1"
 dependencies = [
  "anyhow",
  "clap 3.2.25",
@@ -5843,6 +5842,7 @@ dependencies = [
  "dasp_interpolate",
  "dasp_ring_buffer",
  "easyfft",
+ "fusor",
  "hound",
  "once_cell",
 ]
