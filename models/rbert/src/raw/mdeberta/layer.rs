@@ -54,12 +54,12 @@ impl MDebertaLayer {
         hidden_states: &Tensor<3, f32>,
         rel_pos_emb: &Tensor<2, f32>,
         gather_idx: &GatherIndices,
-        attention_mask: Option<&Tensor<2, u32>>,
+        attention_bias: Option<&Tensor<4, f32>>,
     ) -> Tensor<3, f32> {
         // Self-attention + residual + norm
         let attn_output =
             self.attention
-                .forward_with_rel(hidden_states, rel_pos_emb, gather_idx, attention_mask);
+                .forward_with_rel(hidden_states, rel_pos_emb, gather_idx, attention_bias);
         let hidden_states = self
             .attention_norm
             .forward(&hidden_states.add_(&attn_output));

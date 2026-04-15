@@ -226,7 +226,7 @@ impl MDebertaAttention {
         hidden_states: &Tensor<3, f32>,
         rel_pos_emb: &Tensor<2, f32>,
         gather_idx: &GatherIndices,
-        attention_mask: Option<&Tensor<2, u32>>,
+        attention_bias: Option<&Tensor<4, f32>>,
     ) -> Tensor<3, f32> {
         use super::super::utils::split_heads;
 
@@ -302,11 +302,8 @@ impl MDebertaAttention {
             .mul_scalar(self.scale);
 
         // Apply attention mask (broadcast bias to [batch, 1, 1, seq_len])
-        let attn_scores = if let Some(mask) = attention_mask {
-            let mask_bias = super::super::utils::attention_mask_to_bias(mask);
-            let mask_bias_3d: Tensor<3, f32> = mask_bias.unsqueeze(1).to_concrete();
-            let mask_bias_4d: Tensor<4, f32> = mask_bias_3d.unsqueeze(1).to_concrete();
-            attn_scores.add_(&mask_bias_4d)
+        let attn_scores = if let Some(mask_bias) = attention_bias {
+            attn_scores.add_(mask_bias)
         } else {
             attn_scores
         };
@@ -361,9 +358,9 @@ impl DisentangledSelfAttention {
         hidden_states: &Tensor<3, f32>,
         rel_pos_emb: &Tensor<2, f32>,
         gather_idx: &GatherIndices,
-        attention_mask: Option<&Tensor<2, u32>>,
+        attention_bias: Option<&Tensor<4, f32>>,
     ) -> Tensor<3, f32> {
         self.attention
-            .forward_with_indices(hidden_states, rel_pos_emb, gather_idx, attention_mask)
+            .forward_with_indices(hidden_states, rel_pos_emb, gather_idx, attention_bias)
     }
 }

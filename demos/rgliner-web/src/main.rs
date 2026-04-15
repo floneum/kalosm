@@ -116,15 +116,15 @@ fn App() -> Element {
     let mut relation_labels = use_signal(|| "founded by, located in, headquartered in".to_string());
 
     let mut model = use_signal(|| None::<LoadedModel>);
+    // Explicit presence flag — written only on load/unload, never by the
+    // extraction pipeline. Subscribing to `model` directly would loop, since
+    // the extractor `model.set(Some(_))`s after every run.
+    let mut has_model = use_signal(|| false);
     let mut loading = use_signal(|| false);
     let mut running = use_signal(|| false);
     let mut error = use_signal(|| None::<String>);
     let mut extraction = use_signal(Extraction::default);
     let mut status = use_signal(|| "idle".to_string());
-
-    // Memoised so the effect below only re-runs when a model appears or
-    // disappears, not every time `run_extraction` writes the model back.
-    let model_ready = use_memo(move || model.read().is_some());
 
     // One extraction pipeline: watch the inputs, debounce, run.
     // `use_resource` re-runs the async body whenever any tracked signal
@@ -134,7 +134,7 @@ fn App() -> Element {
         let cur_text = text();
         let ent_raw = entity_labels();
         let rel_raw = relation_labels();
-        let ready = model_ready();
+        let ready = has_model();
         tracing::info!("pipeline tick: ready={ready} text_len={}", cur_text.len());
         if !ready {
             return;
@@ -202,6 +202,7 @@ fn App() -> Element {
         choice.set(c);
         // Unload the current model; user will see a "load" hint.
         *model.write() = None;
+        has_model.set(false);
         extraction.set(Extraction::default());
     };
 
@@ -217,6 +218,7 @@ fn App() -> Element {
             match build_model(selected).await {
                 Ok(m) => {
                     model.set(Some(m));
+                    has_model.set(true);
                     status.set("ready".to_string());
                 }
                 Err(e) => {
@@ -228,7 +230,7 @@ fn App() -> Element {
         });
     };
 
-    let has_model = model.read().is_some();
+    let is_loaded = has_model();
     let model_matches = model
         .read()
         .as_ref()
@@ -268,13 +270,13 @@ fn App() -> Element {
                     }
                     button {
                         class: "load",
-                        disabled: loading() || (has_model && model_matches),
+                        disabled: loading() || (is_loaded && model_matches),
                         onclick: on_load,
                         if loading() {
                             "loading…"
-                        } else if has_model && model_matches {
+                        } else if is_loaded && model_matches {
                             "loaded"
-                        } else if has_model {
+                        } else if is_loaded {
                             "reload"
                         } else {
                             "load"
@@ -308,7 +310,7 @@ fn App() -> Element {
             }
 
             div { class: "status-line",
-                span { class: "dot", class: if running() || loading() { "busy" } else if error().is_some() { "err" } else if has_model { "ok" } else { "idle" } }
+                span { class: "dot", class: if running() || loading() { "busy" } else if error().is_some() { "err" } else if is_loaded { "ok" } else { "idle" } }
                 span { class: "msg", "{status()}" }
                 if let Some(e) = error() {
                     span { class: "err-text", " · {e}" }
@@ -323,7 +325,7 @@ fn App() -> Element {
                     oninput: move |e: FormEvent| text.set(e.value()),
                 }
                 article { class: "article",
-                    if has_model {
+                    if is_loaded {
                         { render_article(&current_text, &cur_extraction) }
                     } else {
                         div { class: "placeholder",

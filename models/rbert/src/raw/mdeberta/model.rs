@@ -104,10 +104,19 @@ impl MDebertaModel {
             &self.device,
         );
         let rel_pos_emb = self.rel_pos_embedding.get_embeddings();
+        let attention_bias = attention_mask.map(|mask| {
+            let mask_bias = super::super::utils::attention_mask_to_bias(mask);
+            mask_bias.unsqueeze(1).unsqueeze(1).to_concrete()
+        });
 
         for layer in &self.layers {
             hidden_states =
-                layer.forward_with_rel(&hidden_states, &rel_pos_emb, &gather_idx, attention_mask);
+                layer.forward_with_rel(
+                    &hidden_states,
+                    &rel_pos_emb,
+                    &gather_idx,
+                    attention_bias.as_ref(),
+                );
         }
 
         if let Some(ref proj) = self.output_proj {
@@ -137,7 +146,16 @@ impl MDebertaModel {
             &self.device,
         );
         let rel_pos_emb = self.rel_pos_embedding.get_embeddings();
-        self.layers[0].forward_with_rel(hidden_states, &rel_pos_emb, &gather_idx, attention_mask)
+        let attention_bias = attention_mask.map(|mask| {
+            let mask_bias = super::super::utils::attention_mask_to_bias(mask);
+            mask_bias.unsqueeze(1).unsqueeze(1).to_concrete()
+        });
+        self.layers[0].forward_with_rel(
+            hidden_states,
+            &rel_pos_emb,
+            &gather_idx,
+            attention_bias.as_ref(),
+        )
     }
 
     /// Get the embedding dimension.
