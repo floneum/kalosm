@@ -6,7 +6,7 @@ use components::select::{
     Select, SelectItemIndicator, SelectList, SelectOption, SelectTrigger, SelectValue,
 };
 use dioxus::prelude::*;
-use pulldown_cmark::{Event, HeadingLevel, Options, Parser, Tag, TagEnd};
+use pulldown_cmark::{Event, HeadingLevel, Options, Parser, Tag};
 use std::iter::Peekable;
 use std::ops::Range;
 use rgliner::{
@@ -127,26 +127,32 @@ fn App() -> Element {
     let model_ready = use_memo(move || model.read().is_some());
 
     // One extraction pipeline: watch the inputs, debounce, run.
-    // `use_future` cancels and restarts whenever any tracked signal changes,
-    // which gives us the debounce for free.
-    use_future(move || async move {
+    // `use_resource` re-runs the async body whenever any tracked signal
+    // changes, cancelling the previous invocation — the debounce falls
+    // out of that cancellation behavior.
+    use_resource(move || async move {
         let cur_text = text();
         let ent_raw = entity_labels();
         let rel_raw = relation_labels();
-        if !model_ready() {
+        let ready = model_ready();
+        tracing::info!("pipeline tick: ready={ready} text_len={}", cur_text.len());
+        if !ready {
             return;
         }
 
         // Cancelled if any of the above change during the wait.
         sleep_ms(DEBOUNCE_MS).await;
+        tracing::info!("pipeline: debounce survived, kicking extraction");
 
         // Detach the extraction so cancellation can't drop it mid-run
         // (which would lose the model we've taken out of the signal).
         spawn(async move {
             if running() {
+                tracing::info!("extraction already running, skipping");
                 return;
             }
             let Some(mut taken) = model.write().take() else {
+                tracing::warn!("no model in slot at extract-time");
                 return;
             };
             running.set(true);
@@ -156,11 +162,21 @@ fn App() -> Element {
             let ent = parse_labels(&ent_raw);
             let rel = parse_labels(&rel_raw);
             let mode = taken.choice().mode();
+            let mode_name = match mode {
+                Mode::Ner => "ner",
+                Mode::Relex => "relex",
+            };
+            tracing::info!("extracting: mode={mode_name} ent={} rel={}", ent.len(), rel.len());
             let outcome = run_extraction(&mut taken, mode, &cur_text, &ent, &rel).await;
             model.set(Some(taken));
 
             match outcome {
                 Ok(e) => {
+                    tracing::info!(
+                        "extraction done: {} entities, {} relations",
+                        e.entities.len(),
+                        e.relations.len()
+                    );
                     status.set(format!(
                         "{} entities · {} relations",
                         e.entities.len(),
@@ -169,6 +185,7 @@ fn App() -> Element {
                     extraction.set(e);
                 }
                 Err(e) => {
+                    tracing::warn!("extraction error: {e}");
                     error.set(Some(e));
                     status.set("error".to_string());
                 }
@@ -405,33 +422,19 @@ async fn run_extraction(
 }
 
 #[derive(Clone, PartialEq)]
-struct EntityView {
-    text: String,
+struct EntitySpan {
+    byte_start: usize,
+    byte_end: usize,
     label: String,
     color: String,
     rels: Vec<(String, String, String)>,
 }
 
-#[derive(Clone, PartialEq, Default)]
-struct Article {
-    source: String,
-    entities: Vec<EntityView>,
-}
-
-/// Splice `<Entity i="N"/>` markers into the markdown source at each entity
-/// boundary, and collect the per-entity view the custom component renders.
-fn build_article(text: &str, ex: &Extraction) -> Article {
-    if ex.entities.is_empty() {
-        return Article {
-            source: text.to_string(),
-            entities: Vec::new(),
-        };
-    }
+fn collect_entity_spans(text: &str, ex: &Extraction) -> Vec<EntitySpan> {
     let mut sorted: Vec<&Entity> = ex.entities.iter().collect();
     sorted.sort_by_key(|e| e.start_char);
 
-    let mut source = String::with_capacity(text.len() + sorted.len() * 20);
-    let mut entities: Vec<EntityView> = Vec::new();
+    let mut spans = Vec::new();
     let mut cursor = 0usize;
     let len = text.len();
 
@@ -444,10 +447,6 @@ fn build_article(text: &str, ex: &Extraction) -> Article {
         if !text.is_char_boundary(start) || !text.is_char_boundary(end) {
             continue;
         }
-        source.push_str(&text[cursor..start]);
-        let idx = entities.len();
-        source.push_str(&format!("<Entity i=\"{idx}\"/>"));
-
         let ent_text = &text[start..end];
         let rels: Vec<(String, String, String)> = ex
             .relations
@@ -455,32 +454,190 @@ fn build_article(text: &str, ex: &Extraction) -> Article {
             .filter(|r| r.head.text == ent_text || r.tail.text == ent_text)
             .map(|r| (r.head.text.clone(), r.relation.clone(), r.tail.text.clone()))
             .collect();
-
-        entities.push(EntityView {
-            text: ent_text.to_string(),
+        spans.push(EntitySpan {
+            byte_start: start,
+            byte_end: end,
             label: ent.label.clone(),
             color: underline_color(&ent.label),
             rels,
         });
         cursor = end;
     }
-    if cursor < len {
-        source.push_str(&text[cursor..]);
-    }
-    Article { source, entities }
+    spans
 }
 
-fn render_entity(view: EntityView) -> Element {
-    let has_rels = !view.rels.is_empty();
+/// Render the markdown article, wrapping entity byte-ranges in interactive
+/// spans at the text-event level. We walk pulldown-cmark's flat event stream
+/// and build rsx! directly — no HTML serialisation, no custom-component dance.
+fn render_article(text: &str, ex: &Extraction) -> Element {
+    let spans = collect_entity_spans(text, ex);
+    let mut opts = Options::empty();
+    opts.insert(Options::ENABLE_STRIKETHROUGH);
+    opts.insert(Options::ENABLE_TABLES);
+    let parser = Parser::new_ext(text, opts).into_offset_iter();
+    let mut r = Renderer {
+        source: text,
+        spans: &spans,
+        events: parser.peekable(),
+    };
+    let nodes = r.render_until_end(false);
+    rsx! { {nodes.into_iter()} }
+}
+
+struct Renderer<'a, I: Iterator<Item = (Event<'a>, Range<usize>)>> {
+    source: &'a str,
+    spans: &'a [EntitySpan],
+    events: Peekable<I>,
+}
+
+impl<'a, I: Iterator<Item = (Event<'a>, Range<usize>)>> Renderer<'a, I> {
+    /// Consume events until `End(_)` (if `scoped`) or EOF, returning the
+    /// rsx! elements they expand to.
+    fn render_until_end(&mut self, scoped: bool) -> Vec<Element> {
+        let mut nodes: Vec<Element> = Vec::new();
+        while let Some((event, range)) = self.events.next() {
+            match event {
+                Event::Start(tag) => nodes.push(self.render_tag(tag)),
+                Event::End(_) if scoped => return nodes,
+                Event::End(_) => continue,
+                Event::Text(_) => nodes.push(self.render_text_range(range)),
+                Event::Code(s) => {
+                    let s = s.to_string();
+                    nodes.push(rsx! { code { "{s}" } });
+                }
+                Event::SoftBreak => nodes.push(rsx! { " " }),
+                Event::HardBreak => nodes.push(rsx! { br {} }),
+                Event::Rule => nodes.push(rsx! { hr {} }),
+                Event::Html(s) | Event::InlineHtml(s) => {
+                    // Treat raw HTML as literal text — safer than dangerous_inner_html.
+                    let s = s.to_string();
+                    nodes.push(rsx! { "{s}" });
+                }
+                Event::FootnoteReference(_) => {}
+                Event::TaskListMarker(done) => nodes.push(rsx! {
+                    input { r#type: "checkbox", checked: done, disabled: true }
+                }),
+                _ => {}
+            }
+        }
+        nodes
+    }
+
+    fn render_tag(&mut self, tag: Tag<'a>) -> Element {
+        match tag {
+            Tag::Paragraph => {
+                let children = self.render_until_end(true);
+                rsx! { p { {children.into_iter()} } }
+            }
+            Tag::Heading { level, .. } => {
+                let children = self.render_until_end(true);
+                match level {
+                    HeadingLevel::H1 => rsx! { h1 { {children.into_iter()} } },
+                    HeadingLevel::H2 => rsx! { h2 { {children.into_iter()} } },
+                    HeadingLevel::H3 => rsx! { h3 { {children.into_iter()} } },
+                    HeadingLevel::H4 => rsx! { h4 { {children.into_iter()} } },
+                    HeadingLevel::H5 => rsx! { h5 { {children.into_iter()} } },
+                    HeadingLevel::H6 => rsx! { h6 { {children.into_iter()} } },
+                }
+            }
+            Tag::BlockQuote(_) => {
+                let children = self.render_until_end(true);
+                rsx! { blockquote { {children.into_iter()} } }
+            }
+            Tag::CodeBlock(_) => {
+                let children = self.render_until_end(true);
+                rsx! { pre { code { {children.into_iter()} } } }
+            }
+            Tag::List(Some(_start)) => {
+                let children = self.render_until_end(true);
+                rsx! { ol { {children.into_iter()} } }
+            }
+            Tag::List(None) => {
+                let children = self.render_until_end(true);
+                rsx! { ul { {children.into_iter()} } }
+            }
+            Tag::Item => {
+                let children = self.render_until_end(true);
+                rsx! { li { {children.into_iter()} } }
+            }
+            Tag::Emphasis => {
+                let children = self.render_until_end(true);
+                rsx! { em { {children.into_iter()} } }
+            }
+            Tag::Strong => {
+                let children = self.render_until_end(true);
+                rsx! { strong { {children.into_iter()} } }
+            }
+            Tag::Strikethrough => {
+                let children = self.render_until_end(true);
+                rsx! { s { {children.into_iter()} } }
+            }
+            Tag::Link { dest_url, title, .. } => {
+                let children = self.render_until_end(true);
+                let href = dest_url.to_string();
+                let title = title.to_string();
+                rsx! { a { href: "{href}", title: "{title}", {children.into_iter()} } }
+            }
+            Tag::Image { dest_url, title, .. } => {
+                // Consume inner events (alt text) without rendering them separately.
+                let _ = self.render_until_end(true);
+                let src = dest_url.to_string();
+                let title = title.to_string();
+                rsx! { img { src: "{src}", title: "{title}" } }
+            }
+            _ => {
+                let children = self.render_until_end(true);
+                rsx! { span { {children.into_iter()} } }
+            }
+        }
+    }
+
+    /// Render the text at `range`, splitting on any entity spans that overlap it.
+    fn render_text_range(&self, range: Range<usize>) -> Element {
+        let mut parts: Vec<Element> = Vec::new();
+        let mut cursor = range.start;
+        let slice_end = range.end;
+
+        for span in self.spans.iter() {
+            if span.byte_end <= cursor {
+                continue;
+            }
+            if span.byte_start >= slice_end {
+                break;
+            }
+            let s = span.byte_start.max(cursor);
+            let e = span.byte_end.min(slice_end);
+            if s > cursor {
+                let plain = self.source[cursor..s].to_string();
+                parts.push(rsx! { "{plain}" });
+            }
+            let ent_text = self.source[s..e].to_string();
+            parts.push(render_entity(&ent_text, span));
+            cursor = e;
+        }
+        if cursor < slice_end {
+            let tail = self.source[cursor..slice_end].to_string();
+            parts.push(rsx! { "{tail}" });
+        }
+        rsx! { {parts.into_iter()} }
+    }
+}
+
+fn render_entity(text: &str, span: &EntitySpan) -> Element {
+    let text = text.to_string();
+    let label = span.label.clone();
+    let color = span.color.clone();
+    let rels = span.rels.clone();
+    let has_rels = !rels.is_empty();
     rsx! {
         span {
             class: "entity",
-            style: "--ec: {view.color};",
-            "{view.text}"
+            style: "--ec: {color};",
+            "{text}"
             span { class: "pop",
-                span { class: "pop-label", "{view.label}" }
+                span { class: "pop-label", "{label}" }
                 if has_rels {
-                    for (i, (head, rel, tail)) in view.rels.iter().cloned().enumerate() {
+                    for (i, (head, rel, tail)) in rels.into_iter().enumerate() {
                         span { key: "r-{i}", class: "pop-rel",
                             "{head}"
                             span { class: "arrow", " → " }

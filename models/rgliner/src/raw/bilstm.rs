@@ -244,17 +244,42 @@ fn run_direction(
     reverse: bool,
     lengths: &[usize],
 ) -> Tensor<3, f32> {
-    let [batch, seq_len, _] = input.shape();
+    let [batch, seq_len, input_size] = input.shape();
 
     let mut h: Tensor<2, f32> = Tensor::zeros(device, [batch, hidden_size]);
     let mut c: Tensor<2, f32> = Tensor::zeros(device, [batch, hidden_size]);
     let mut outputs: Tensor<3, f32> = Tensor::zeros(device, [batch, seq_len, hidden_size]);
+    let all_active = lengths.iter().all(|&length| length >= seq_len);
 
     let bias_broadcast: Tensor<2, f32> = dir
         .bias
         .unsqueeze(0)
         .broadcast_as([batch, 4 * hidden_size])
         .to_concrete();
+    let input_gates: Tensor<3, f32> = input
+        .reshape([batch * seq_len, input_size])
+        .to_concrete()
+        .mat_mul(&dir.w_ih_t)
+        .reshape([batch, seq_len, 4 * hidden_size])
+        .to_concrete();
+    let active_masks = if all_active {
+        None
+    } else {
+        Some(
+            Tensor::new(
+                device,
+                &lengths
+                    .iter()
+                    .flat_map(|&length| {
+                        (0..seq_len)
+                            .flat_map(move |t| std::iter::repeat_n(if t < length { 1.0 } else { 0.0 }, hidden_size))
+                    })
+                    .collect::<Vec<_>>(),
+            )
+            .reshape([batch, seq_len, hidden_size])
+            .to_concrete(),
+        )
+    };
 
     let iter: Box<dyn Iterator<Item = usize>> = if reverse {
         Box::new((0..seq_len).rev())
@@ -263,14 +288,14 @@ fn run_direction(
     };
 
     for t in iter {
-        let x_t: Tensor<2, f32> = input
+        let x_gates_t: Tensor<2, f32> = input_gates
             .narrow(1, t, 1)
-            .reshape([batch, input.shape()[2]])
+            .reshape([batch, 4 * hidden_size])
             .to_concrete();
 
         // gates_pre = x_t @ W_ih^T + h @ W_hh^T + bias, shape [batch, 4*hidden]
         let gates_pre: Tensor<2, f32> =
-            (x_t.mat_mul(&dir.w_ih_t) + h.mat_mul(&dir.w_hh_t) + bias_broadcast.clone())
+            (x_gates_t + h.mat_mul(&dir.w_hh_t) + bias_broadcast.clone())
                 .to_concrete();
 
         let i_raw: Tensor<2, f32> = gates_pre.narrow(1, 0, hidden_size).to_concrete();
@@ -290,17 +315,24 @@ fn run_direction(
         let next_c = (f_gate * c.clone() + i_gate * g_gate).to_concrete();
         let next_h = (o_gate * next_c.clone().tanh()).to_concrete();
 
-        let active_mask_2d = timestep_mask_2d(device, batch, hidden_size, lengths, t);
-        c = active_mask_2d.where_cond(&next_c, &c).to_concrete();
-        h = active_mask_2d.where_cond(&next_h, &h).to_concrete();
+        if let Some(active_masks) = &active_masks {
+            let active_mask_2d = active_masks
+                .narrow(1, t, 1)
+                .reshape([batch, hidden_size])
+                .to_concrete();
+            c = active_mask_2d.where_cond(&next_c, &c).to_concrete();
+            h = active_mask_2d.where_cond(&next_h, &h).to_concrete();
+        } else {
+            c = next_c;
+            h = next_h;
+        }
+        h = h.materialized();
+        c = c.materialized();
 
-        let output_t = h.clone().unsqueeze(1).to_concrete().materialized();
-        outputs = outputs
-            .slice_assign([0..batch, t..(t + 1), 0..hidden_size], &output_t)
-            .materialized();
+        let output_t = h.clone().unsqueeze(1).to_concrete();
+        outputs = outputs.slice_assign([0..batch, t..(t + 1), 0..hidden_size], &output_t);
     }
 
-    let all_active = lengths.iter().all(|&length| length >= seq_len);
     if all_active {
         outputs
     } else {
