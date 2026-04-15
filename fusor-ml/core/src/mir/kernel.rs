@@ -134,10 +134,9 @@ impl GenericKernel {
                 ) if new_info.rank > existing_info.rank => {
                     existing_info.rank = new_info.rank;
                 }
-                (
-                    KernelInputType::QInfo(existing_info),
-                    KernelInputType::QInfo(new_info),
-                ) if new_info.rank > existing_info.rank => {
+                (KernelInputType::QInfo(existing_info), KernelInputType::QInfo(new_info))
+                    if new_info.rank > existing_info.rank =>
+                {
                     existing_info.rank = new_info.rank;
                 }
                 _ => {}

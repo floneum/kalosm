@@ -30,6 +30,11 @@ impl<T: DataType + SimdElement + Default> Linear<T> {
         self.bias.as_ref()
     }
 
+    /// Get the quantized weight matrix.
+    pub fn weight(&self) -> &QMatrix {
+        &self.weight
+    }
+
     /// Get the input features size.
     pub fn in_features(&self) -> usize {
         self.weight.shape()[1]

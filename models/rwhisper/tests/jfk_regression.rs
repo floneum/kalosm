@@ -1,8 +1,4 @@
-use std::{
-    fs,
-    io::Cursor,
-    path::Path,
-};
+use std::{fs, io::Cursor, path::Path};
 
 use anyhow::{Context, Result};
 use futures_channel::mpsc;
@@ -270,8 +266,7 @@ async fn moonshine_tiny_streaming_emits_before_the_clip_ends() -> Result<()> {
 
 #[tokio::test]
 async fn cohere_transcribe_matches_the_jfk_reference() -> Result<()> {
-    let transcript =
-        transcribe_jfk_sample(WhisperSource::cohere_transcribe_03_2026()).await?;
+    let transcript = transcribe_jfk_sample(WhisperSource::cohere_transcribe_03_2026()).await?;
     assert_eq!(
         normalize_text(&transcript),
         normalize_text(JFK_REFERENCE),

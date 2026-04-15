@@ -146,6 +146,31 @@ fn causal_mask(device: &Device, seq_len: usize) -> Tensor<4, f32> {
     Tensor::from_slice(device, [1, 1, seq_len, seq_len], &data)
 }
 
+fn stable_gelu_3d<B>(x: &Tensor<3, f32, B>) -> Tensor<3, f32>
+where
+    B: fusor::TensorBacking<3, Elem = f32>,
+{
+    let x = x.to_materialized_blocking();
+    let x_squared = x.mul_(&x).to_materialized_blocking();
+    let inner_factor = x_squared
+        .mul_scalar(0.044715)
+        .add_scalar(1.0)
+        .to_materialized_blocking();
+    let inner = x.mul_(&inner_factor).to_materialized_blocking();
+    let tanh_input = inner
+        .mul_scalar((2.0 / std::f32::consts::PI).sqrt())
+        .to_materialized_blocking();
+    let tanh_input = tanh_input.clamp(-10.0, 10.0).to_materialized_blocking();
+    let tanh_result = tanh_input
+        .tanh()
+        .clamp(-1.0, 1.0)
+        .to_materialized_blocking();
+    let one_plus_tanh = tanh_result.add_scalar(1.0).to_materialized_blocking();
+    x.mul_(&one_plus_tanh)
+        .mul_scalar(0.5)
+        .to_materialized_blocking()
+}
+
 struct UnitOffsetLayerNorm {
     norm: LayerNorm<1, f32>,
     gamma: Tensor<1, f32>,
@@ -232,6 +257,7 @@ impl MoonshineAttention {
     fn flatten_heads(&self, x: Tensor<4, f32>) -> Tensor<3, f32> {
         let [batch, _, seq_len, _] = x.shape();
         x.transpose(1, 2)
+            .to_concrete()
             .reshape([batch, seq_len, self.num_heads * self.head_dim])
             .to_concrete()
     }
@@ -316,6 +342,7 @@ impl MoonshineAttention {
         attention_mask: Option<&Tensor<4, f32>>,
         attention_output: Option<&mut Vec<Tensor<4, f32>>>,
     ) -> Result<Tensor<3, f32>> {
+        let [batch, q_len, _] = q.shape();
         let q = self.reshape_heads(q);
         let k = self.reshape_heads(k);
         let v = self.reshape_heads(v);
@@ -327,8 +354,14 @@ impl MoonshineAttention {
         if let Some(outputs) = attention_output {
             outputs.push(scores.clone());
         }
-        let weights = scores.softmax_last_dim_fused();
-        let context = weights.mat_mul(&v).transpose(1, 2).flatten_last_n::<1, _>();
+        let scores = scores.to_concrete();
+        let weights = scores.softmax_last_dim_fused().to_concrete();
+        let context = weights
+            .mat_mul(&v)
+            .transpose(1, 2)
+            .to_concrete()
+            .reshape([batch, q_len, self.num_heads * self.head_dim])
+            .to_concrete();
         Ok(self.o_proj.forward(&context))
     }
 
@@ -345,7 +378,7 @@ impl MoonshineAttention {
         let k = self.reshape_heads(k);
         let v = self.reshape_heads(v);
 
-        if attention_output.is_none() {
+        if attention_output.is_none() && !q.is_gpu() {
             let mask = attention_mask.map(|mask| (mask.mask(), MaskKind::QKMask));
             let context = q
                 .flash_attention(&k, &v, self.scale.powf(-0.5), mask)
@@ -357,17 +390,29 @@ impl MoonshineAttention {
 
         let k_t = k.transpose(2, 3).to_concrete();
         let mut scores = q.mat_mul(&k_t).mul_scalar(self.scale.powf(-0.5));
-        if let Some(mask) = attention_mask {
+        if q.is_gpu() {
+            if let Some(mask) = attention_mask {
+                let mask = mask
+                    .mask()
+                    .clone()
+                    .unsqueeze(0)
+                    .unsqueeze(0)
+                    .to_concrete();
+                scores = scores.add_(&mask).to_concrete();
+            }
+        } else if let Some(mask) = attention_mask {
             mask.forward(&mut scores);
         }
         if let Some(output) = attention_output {
             let last_query = scores.narrow(2, q_len.saturating_sub(1), 1).to_concrete();
             output.append(&q.device(), &last_query);
         }
-        let weights = scores.softmax_last_dim_fused();
+        let scores = scores.to_concrete();
+        let weights = scores.softmax_last_dim_fused().to_concrete();
         let context = weights
             .mat_mul(&v)
             .transpose(1, 2)
+            .to_concrete()
             .reshape([batch, q_len, self.num_heads * self.head_dim])
             .to_concrete();
         Ok(self.o_proj.forward(&context))
@@ -380,9 +425,13 @@ impl MoonshineAttention {
         attention_mask: Option<&Tensor<4, f32>>,
         attention_output: Option<&mut Vec<Tensor<4, f32>>>,
     ) -> Result<Tensor<3, f32>> {
-        let query_states = self.q_proj.forward(hidden_states);
+        let query_states = self.q_proj.forward(hidden_states).to_concrete();
         let (key_states, value_states) = self.project_kv(key_value_states);
+        let key_states = key_states.to_concrete();
+        let value_states = value_states.to_concrete();
         let (query_states, key_states) = self.apply_rope_3d(query_states, key_states, 0);
+        let query_states = query_states.to_concrete();
+        let key_states = key_states.to_concrete();
         self.qkv_attention_dense(
             &query_states,
             &key_states,
@@ -400,8 +449,10 @@ impl MoonshineAttention {
         attention_mask: Option<&AttentionMask<f32>>,
         attention_output: Option<&mut TensorCache<4, f32>>,
     ) -> Result<Tensor<3, f32>> {
-        let query_states = self.q_proj.forward(hidden_states);
+        let query_states = self.q_proj.forward(hidden_states).to_concrete();
         let (key_states, value_states) = kv;
+        let key_states = key_states.to_concrete();
+        let value_states = value_states.to_concrete();
         self.qkv_attention_masked(
             &query_states,
             &key_states,
@@ -426,7 +477,9 @@ impl MoonshineEncoderMlp {
     }
 
     fn forward(&self, x: &Tensor<3, f32>) -> Tensor<3, f32> {
-        self.fc2.forward(&self.fc1.forward(x).gelu())
+        let hidden = self.fc1.forward(x).to_materialized_blocking();
+        let hidden = stable_gelu_3d(&hidden);
+        self.fc2.forward(&hidden)
     }
 }
 
@@ -446,12 +499,13 @@ impl MoonshineDecoderMlp {
     }
 
     fn forward(&self, x: &Tensor<3, f32>) -> Tensor<3, f32> {
-        let hidden = self.fc1.forward(x);
+        let hidden = self.fc1.forward(x).to_concrete();
         let states = hidden.narrow(2, 0, self.intermediate_size).to_concrete();
         let gate = hidden
             .narrow(2, self.intermediate_size, self.intermediate_size)
             .to_concrete()
-            .silu();
+            .silu()
+            .to_concrete();
         self.fc2.forward(&states.mul_(&gate).to_concrete())
     }
 }
@@ -525,9 +579,11 @@ impl MoonshineEncoderLayer {
         let attn = self
             .self_attn
             .forward(&attn_in, &attn_in, Some(attention_mask), None)?;
+        materialize_if_gpu(&attn);
         let hidden_states = (hidden_states + &attn).to_concrete();
         let mlp_in = self.post_attention_layernorm.forward(&hidden_states);
         let mlp = self.mlp.forward(&mlp_in);
+        materialize_if_gpu(&mlp);
         Ok((hidden_states + mlp).to_concrete())
     }
 
@@ -617,9 +673,11 @@ impl MoonshineEncoderLayer {
             Some(&attention_mask),
             None,
         )?;
+        materialize_if_gpu(&attn);
         let hidden_states = (residual_inputs + &attn).to_concrete();
         let mlp_in = self.post_attention_layernorm.forward(&hidden_states);
         let mlp = self.mlp.forward(&mlp_in);
+        materialize_if_gpu(&mlp);
         Ok(Some((hidden_states + mlp).to_concrete()))
     }
 }
@@ -685,6 +743,7 @@ impl MoonshineDecoderLayer {
         let self_attn =
             self.self_attn
                 .forward(&self_attn_in, &self_attn_in, Some(causal_mask), None)?;
+        materialize_if_gpu(&self_attn);
         let hidden_states = (hidden_states + &self_attn).to_concrete();
 
         let cross_attn_in = self.post_attention_layernorm.forward_fused(&hidden_states);
@@ -694,10 +753,12 @@ impl MoonshineDecoderLayer {
             None,
             attention_output,
         )?;
+        materialize_if_gpu(&cross_attn);
         let hidden_states = (hidden_states + &cross_attn).to_concrete();
 
         let mlp_in = self.final_layernorm.forward_fused(&hidden_states);
         let mlp = self.mlp.forward(&mlp_in);
+        materialize_if_gpu(&mlp);
         Ok((hidden_states + mlp).to_concrete())
     }
 
@@ -725,6 +786,7 @@ impl MoonshineDecoderLayer {
             Some(self_attention_mask),
             None,
         )?;
+        materialize_if_gpu(&self_attn);
         let hidden_states = (hidden_states + &self_attn).to_concrete();
 
         let cross_attn_in = self.post_attention_layernorm.forward_fused(&hidden_states);
@@ -734,10 +796,12 @@ impl MoonshineDecoderLayer {
             None,
             attention_output,
         )?;
+        materialize_if_gpu(&cross_attn);
         let hidden_states = (hidden_states + &cross_attn).to_concrete();
 
         let mlp_in = self.final_layernorm.forward_fused(&hidden_states);
         let mlp = self.mlp.forward(&mlp_in);
+        materialize_if_gpu(&mlp);
         Ok((hidden_states + mlp).to_concrete())
     }
 }

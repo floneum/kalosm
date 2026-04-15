@@ -147,7 +147,9 @@
       "Bash(awk '/=== fusor shader ===/{n++; out=\"\"; next} /=== end shader ===/{last=out; next} /invalid accessor/{print last; exit} {out=out \"\\\\n\" $0}')",
       "Bash(FUSOR_USE_GPU=1 cargo test -p rwhisper --test jfk_regression -r moonshine_tiny_streaming_matches_the_jfk_reference)",
       "Bash(FUSOR_USE_GPU=1 cargo test -p rwhisper --lib quantized::moonshine::tests::cached_decode_matches_full_decode -- --nocapture)",
-      "Bash(FUSOR_USE_GPU=1 cargo test -p rwhisper --lib quantized::moonshine::tests::streaming_encoder_matches_full_encoder_on_jfk -- --nocapture)"
+      "Bash(FUSOR_USE_GPU=1 cargo test -p rwhisper --lib quantized::moonshine::tests::streaming_encoder_matches_full_encoder_on_jfk -- --nocapture)",
+      "Bash(awk 'NR<1357 || NR>1544' models/rwhisper/src/quantized/moonshine.rs)",
+      "Bash(awk 'NR<=1352 || NR>=1469' models/rwhisper/src/quantized/moonshine.rs)"
     ],
     "deny": [],
     "additionalDirectories": [
