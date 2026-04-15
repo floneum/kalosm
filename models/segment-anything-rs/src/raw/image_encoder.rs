@@ -1,12 +1,12 @@
 //! ViT-based image encoder for SAM.
 
-use fusor::layers::{Conv2d, Conv2dConfig, LayerNorm, LayerNorm2d, Linear};
+use fusor::layers::{ConvNd, ConvNdConfig, LayerNormNd, Linear};
 use fusor::{ConcreteTensor, Device, Tensor, TensorBacking, VarBuilder};
 
 use super::{Activation, MlpBlock, Result};
 
 struct PatchEmbed {
-    proj: Conv2d<f32>,
+    proj: ConvNd<2, 4, f32>,
 }
 
 impl PatchEmbed {
@@ -16,12 +16,12 @@ impl PatchEmbed {
         patch_size: usize,
         padding: usize,
     ) -> Result<Self> {
-        let cfg = Conv2dConfig {
+        let cfg = ConvNdConfig {
             padding: [padding, padding],
             stride: [patch_size, patch_size],
             groups: 1,
         };
-        let proj = Conv2d::load(device, &mut vb.pp("proj"), cfg)?;
+        let proj = ConvNd::<2, 4, f32>::load(device, &mut vb.pp("proj"), cfg)?;
         Ok(Self { proj })
     }
 
@@ -206,9 +206,9 @@ fn get_rel_pos(
 }
 
 struct Block {
-    norm1: LayerNorm<1, f32>,
+    norm1: LayerNormNd<3, f32>,
     attn: Attention,
-    norm2: LayerNorm<1, f32>,
+    norm2: LayerNormNd<3, f32>,
     mlp: MlpBlock,
     window_size: usize,
 }
@@ -223,8 +223,8 @@ impl Block {
         window_size: usize,
         input_size: (usize, usize),
     ) -> Result<Self> {
-        let norm1 = LayerNorm::load(device, &mut vb.pp("norm1"), 1e-6)?;
-        let norm2 = LayerNorm::load(device, &mut vb.pp("norm2"), 1e-6)?;
+        let norm1 = LayerNormNd::load(device, &mut vb.pp("norm1"), 1e-6)?;
+        let norm2 = LayerNormNd::load(device, &mut vb.pp("norm2"), 1e-6)?;
         let input_size_attn = if window_size == 0 {
             input_size
         } else {
@@ -260,7 +260,7 @@ impl Block {
         let h = shape[1];
         let w = shape[2];
 
-        // LayerNorm over last dim
+        // LayerNormNd<4, f32> over last dim
         let xs = layer_norm_bhwc(&self.norm1, xs);
 
         let (xs, pad_hw) = if self.window_size > 0 {
@@ -369,10 +369,10 @@ fn window_unpartition(
 pub struct ImageEncoderViT {
     patch_embed: PatchEmbed,
     blocks: Vec<Block>,
-    neck_conv1: Conv2d<f32>,
-    neck_ln1: LayerNorm2d,
-    neck_conv2: Conv2d<f32>,
-    neck_ln2: LayerNorm2d,
+    neck_conv1: ConvNd<2, 4, f32>,
+    neck_ln1: LayerNormNd<4, f32>,
+    neck_conv2: ConvNd<2, 4, f32>,
+    neck_ln2: LayerNormNd<4, f32>,
     pos_embed: Option<Tensor<4, f32, ConcreteTensor<f32, 4>>>,
 }
 
@@ -415,15 +415,15 @@ impl ImageEncoderViT {
         }
 
         let neck_conv1 =
-            Conv2d::load_no_bias(device, &mut vb.pp("neck.0"), Conv2dConfig::default())?;
-        let neck_ln1 = LayerNorm2d::load(device, &mut vb.pp("neck.1"), 1e-6)?;
-        let cfg_pad1 = Conv2dConfig {
+            ConvNd::<2, 4, f32>::load_no_bias(device, &mut vb.pp("neck.0"), ConvNdConfig::default())?;
+        let neck_ln1 = LayerNormNd::<4, f32>::load_over_axis(device, &mut vb.pp("neck.1"), 1, 1e-6)?;
+        let cfg_pad1 = ConvNdConfig {
             padding: [1, 1],
             stride: [1, 1],
             groups: 1,
         };
-        let neck_conv2 = Conv2d::load_no_bias(device, &mut vb.pp("neck.2"), cfg_pad1)?;
-        let neck_ln2 = LayerNorm2d::load(device, &mut vb.pp("neck.3"), 1e-6)?;
+        let neck_conv2 = ConvNd::<2, 4, f32>::load_no_bias(device, &mut vb.pp("neck.2"), cfg_pad1)?;
+        let neck_ln2 = LayerNormNd::<4, f32>::load_over_axis(device, &mut vb.pp("neck.3"), 1, 1e-6)?;
 
         let pos_embed = if use_abs_pos {
             let p: Tensor<4, f32> = vb.get("pos_embed", device)?.dequantize();
@@ -472,9 +472,9 @@ impl ImageEncoderViT {
     }
 }
 
-/// LayerNorm helper for BHWC tensors (normalizes last dim).
+/// LayerNormNd<4, f32> helper for BHWC tensors (normalizes last dim).
 fn layer_norm_bhwc(
-    norm: &LayerNorm<1, f32>,
+    norm: &LayerNormNd<3, f32>,
     input: &Tensor<4, f32, impl TensorBacking<4, Elem = f32>>,
 ) -> Tensor<4, f32, ConcreteTensor<f32, 4>> {
     let [b, h, w, c] = input.shape();

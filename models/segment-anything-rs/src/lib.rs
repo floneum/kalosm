@@ -701,7 +701,8 @@ mod tests {
         let image = image::open(&image_path).expect("Failed to open test image");
         let (w, h) = (image.width(), image.height());
 
-        let settings = SegmentAnythingInferenceSettings::new(image).add_goal_point_normalized(0.5, 0.25);
+        let settings =
+            SegmentAnythingInferenceSettings::new(image).add_goal_point_normalized(0.5, 0.25);
 
         let mask = model
             .segment_from_points(settings)

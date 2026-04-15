@@ -1,6 +1,6 @@
 //! Prompt encoder: encodes points, boxes, and masks into embeddings.
 
-use fusor::layers::{Conv2d, Conv2dConfig, Embedding, LayerNorm2d};
+use fusor::layers::{ConvNd, ConvNdConfig, Embedding, LayerNormNd};
 use fusor::{ConcreteTensor, Device, Tensor, TensorBacking, VarBuilder};
 
 use super::Result;
@@ -99,11 +99,11 @@ pub struct PromptEncoder {
     pub(crate) pe_layer: PositionEmbeddingRandom,
     point_embeddings: Vec<Embedding<f32>>,
     not_a_point_embed: Embedding<f32>,
-    mask_downscaling_conv1: Conv2d<f32>,
-    mask_downscaling_ln1: LayerNorm2d,
-    mask_downscaling_conv2: Conv2d<f32>,
-    mask_downscaling_ln2: LayerNorm2d,
-    mask_downscaling_conv3: Conv2d<f32>,
+    mask_downscaling_conv1: ConvNd<2, 4, f32>,
+    mask_downscaling_ln1: LayerNormNd<4, f32>,
+    mask_downscaling_conv2: ConvNd<2, 4, f32>,
+    mask_downscaling_ln2: LayerNormNd<4, f32>,
+    mask_downscaling_conv3: ConvNd<2, 4, f32>,
     no_mask_embed: Embedding<f32>,
     image_embedding_size: (usize, usize),
     input_image_size: (usize, usize),
@@ -122,23 +122,23 @@ impl PromptEncoder {
         let not_a_point_embed = Embedding::load(device, &mut vb.pp("not_a_point_embed"))?;
         let no_mask_embed = Embedding::load(device, &mut vb.pp("no_mask_embed"))?;
 
-        let cfg_s2 = Conv2dConfig {
+        let cfg_s2 = ConvNdConfig {
             padding: [0, 0],
             stride: [2, 2],
             groups: 1,
         };
         let mask_downscaling_conv1 =
-            Conv2d::load(device, &mut vb.pp("mask_downscaling.0"), cfg_s2)?;
+            ConvNd::<2, 4, f32>::load(device, &mut vb.pp("mask_downscaling.0"), cfg_s2)?;
         let mask_downscaling_ln1 =
-            LayerNorm2d::load(device, &mut vb.pp("mask_downscaling.1"), 1e-6)?;
+            LayerNormNd::<4, f32>::load_over_axis(device, &mut vb.pp("mask_downscaling.1"), 1, 1e-6)?;
         let mask_downscaling_conv2 =
-            Conv2d::load(device, &mut vb.pp("mask_downscaling.3"), cfg_s2)?;
+            ConvNd::<2, 4, f32>::load(device, &mut vb.pp("mask_downscaling.3"), cfg_s2)?;
         let mask_downscaling_ln2 =
-            LayerNorm2d::load(device, &mut vb.pp("mask_downscaling.4"), 1e-6)?;
-        let mask_downscaling_conv3 = Conv2d::load(
+            LayerNormNd::<4, f32>::load_over_axis(device, &mut vb.pp("mask_downscaling.4"), 1, 1e-6)?;
+        let mask_downscaling_conv3 = ConvNd::<2, 4, f32>::load(
             device,
             &mut vb.pp("mask_downscaling.6"),
-            Conv2dConfig::default(),
+            ConvNdConfig::default(),
         )?;
 
         // SAM's prompt encoder learns four point-type embeddings:

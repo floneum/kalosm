@@ -1,9 +1,9 @@
 //! TinyViT image encoder for MobileSAM.
 //!
 //! BatchNorm is fused into conv weights at GGUF conversion time,
-//! so Conv2dBN becomes plain Conv2d here.
+//! so ConvNdBN becomes plain ConvNd here.
 
-use fusor::layers::{Conv2d, Conv2dConfig, LayerNorm, LayerNorm2d, Linear};
+use fusor::layers::{ConvNd, ConvNdConfig, LayerNormNd, Linear};
 use fusor::{ConcreteTensor, Device, Tensor, TensorBacking, VarBuilder};
 
 use super::Result;
@@ -13,17 +13,17 @@ const MLP_RATIO: usize = 4;
 const LOCAL_CONV_SIZE: usize = 3;
 const IMG_SIZE: usize = 1024;
 
-/// Conv2d with fused BatchNorm (BN fused into weights at conversion time).
-/// At runtime, this is just a Conv2d with no bias (bias comes from fused BN).
-struct Conv2dBN {
-    conv: Conv2d<f32>,
+/// ConvNd with fused BatchNorm (BN fused into weights at conversion time).
+/// At runtime, this is just a ConvNd with no bias (bias comes from fused BN).
+struct ConvNdBN {
+    conv: ConvNd<2, 4, f32>,
 }
 
-impl Conv2dBN {
-    fn load(device: &Device, vb: &mut VarBuilder, cfg: Conv2dConfig) -> Result<Self> {
+impl ConvNdBN {
+    fn load(device: &Device, vb: &mut VarBuilder, cfg: ConvNdConfig<2>) -> Result<Self> {
         // BN is fused into the conv at GGUF conversion time, so we load
         // a regular conv from the "c" sub-namespace with fused weights.
-        let conv = Conv2d::load(device, &mut vb.pp("c"), cfg)?;
+        let conv = ConvNd::<2, 4, f32>::load(device, &mut vb.pp("c"), cfg)?;
         Ok(Self { conv })
     }
 
@@ -33,19 +33,19 @@ impl Conv2dBN {
 }
 
 pub(crate) struct PatchEmbed {
-    conv1: Conv2dBN,
-    conv2: Conv2dBN,
+    conv1: ConvNdBN,
+    conv2: ConvNdBN,
 }
 
 impl PatchEmbed {
     fn load(device: &Device, vb: &mut VarBuilder, _embed_dim: usize) -> Result<Self> {
-        let cfg = Conv2dConfig {
+        let cfg = ConvNdConfig {
             padding: [1, 1],
             stride: [2, 2],
             groups: 1,
         };
-        let conv1 = Conv2dBN::load(device, &mut vb.pp("seq.0"), cfg)?;
-        let conv2 = Conv2dBN::load(device, &mut vb.pp("seq.2"), cfg)?;
+        let conv1 = ConvNdBN::load(device, &mut vb.pp("seq.0"), cfg)?;
+        let conv2 = ConvNdBN::load(device, &mut vb.pp("seq.2"), cfg)?;
         Ok(Self { conv1, conv2 })
     }
 
@@ -60,9 +60,9 @@ impl PatchEmbed {
 }
 
 struct MBConv {
-    conv1: Conv2dBN,
-    conv2: Conv2dBN,
-    conv3: Conv2dBN,
+    conv1: ConvNdBN,
+    conv2: ConvNdBN,
+    conv3: ConvNdBN,
 }
 
 impl MBConv {
@@ -74,14 +74,14 @@ impl MBConv {
         expand_ratio: usize,
     ) -> Result<Self> {
         let hidden = in_ * expand_ratio;
-        let cfg_dw = Conv2dConfig {
+        let cfg_dw = ConvNdConfig {
             padding: [1, 1],
             stride: [1, 1],
             groups: hidden,
         };
-        let conv1 = Conv2dBN::load(device, &mut vb.pp("conv1"), Conv2dConfig::default())?;
-        let conv2 = Conv2dBN::load(device, &mut vb.pp("conv2"), cfg_dw)?;
-        let conv3 = Conv2dBN::load(device, &mut vb.pp("conv3"), Conv2dConfig::default())?;
+        let conv1 = ConvNdBN::load(device, &mut vb.pp("conv1"), ConvNdConfig::default())?;
+        let conv2 = ConvNdBN::load(device, &mut vb.pp("conv2"), cfg_dw)?;
+        let conv3 = ConvNdBN::load(device, &mut vb.pp("conv3"), ConvNdConfig::default())?;
         Ok(Self {
             conv1,
             conv2,
@@ -104,9 +104,9 @@ impl MBConv {
 }
 
 struct PatchMerging {
-    conv1: Conv2dBN,
-    conv2: Conv2dBN,
-    conv3: Conv2dBN,
+    conv1: ConvNdBN,
+    conv2: ConvNdBN,
+    conv3: ConvNdBN,
     input_resolution: (usize, usize),
 }
 
@@ -124,14 +124,14 @@ impl PatchMerging {
         out: usize,
         spatial_stride: usize,
     ) -> Result<Self> {
-        let cfg_dw = Conv2dConfig {
+        let cfg_dw = ConvNdConfig {
             padding: [1, 1],
             stride: [spatial_stride, spatial_stride],
             groups: out,
         };
-        let conv1 = Conv2dBN::load(device, &mut vb.pp("conv1"), Conv2dConfig::default())?;
-        let conv2 = Conv2dBN::load(device, &mut vb.pp("conv2"), cfg_dw)?;
-        let conv3 = Conv2dBN::load(device, &mut vb.pp("conv3"), Conv2dConfig::default())?;
+        let conv1 = ConvNdBN::load(device, &mut vb.pp("conv1"), ConvNdConfig::default())?;
+        let conv2 = ConvNdBN::load(device, &mut vb.pp("conv2"), cfg_dw)?;
+        let conv3 = ConvNdBN::load(device, &mut vb.pp("conv3"), ConvNdConfig::default())?;
         Ok(Self {
             conv1,
             conv2,
@@ -242,9 +242,9 @@ impl ConvLayer {
     }
 }
 
-/// MLP for TinyViTBlock: LayerNorm -> Linear -> GELU -> Linear
+/// MLP for TinyViTBlock: LayerNormNd<4, f32> -> Linear -> GELU -> Linear
 struct TinyMlp {
-    norm: LayerNorm<1, f32>,
+    norm: LayerNormNd<3, f32>,
     fc1: Linear<f32>,
     fc2: Linear<f32>,
 }
@@ -256,7 +256,7 @@ impl TinyMlp {
         _in_features: usize,
         _hidden: usize,
     ) -> Result<Self> {
-        let norm = LayerNorm::load(device, &mut vb.pp("norm"), 1e-5)?;
+        let norm = LayerNormNd::load(device, &mut vb.pp("norm"), 1e-5)?;
         let fc1 = Linear::load(device, &mut vb.pp("fc1"))?;
         let fc2 = Linear::load(device, &mut vb.pp("fc2"))?;
         Ok(Self { norm, fc1, fc2 })
@@ -273,7 +273,7 @@ impl TinyMlp {
 /// Attention module for TinyViTBlock.
 /// Uses pre-computed attention biases (indexed at load time).
 struct TinyAttention {
-    norm: LayerNorm<1, f32>,
+    norm: LayerNormNd<3, f32>,
     qkv: Linear<f32>,
     proj: Linear<f32>,
     ab: Tensor<3, f32, ConcreteTensor<f32, 3>>, // (num_heads, n_points, n_points)
@@ -299,7 +299,7 @@ impl TinyAttention {
         let nh_kd = key_dim * num_heads;
         let _h = dh + nh_kd * 2;
 
-        let norm = LayerNorm::load(device, &mut vb.pp("norm"), 1e-5)?;
+        let norm = LayerNormNd::load(device, &mut vb.pp("norm"), 1e-5)?;
         let qkv = Linear::load(device, &mut vb.pp("qkv"))?;
         let proj = Linear::load(device, &mut vb.pp("proj"))?;
 
@@ -391,7 +391,7 @@ impl TinyAttention {
 
 struct TinyViTBlock {
     attn: TinyAttention,
-    local_conv: Conv2dBN,
+    local_conv: ConvNdBN,
     mlp: TinyMlp,
     window_size: usize,
     input_resolution: (usize, usize),
@@ -417,12 +417,12 @@ impl TinyViTBlock {
             (window_size, window_size),
         )?;
         let mlp = TinyMlp::load(device, &mut vb.pp("mlp"), dim, dim * MLP_RATIO)?;
-        let cfg_local = Conv2dConfig {
+        let cfg_local = ConvNdConfig {
             padding: [LOCAL_CONV_SIZE / 2, LOCAL_CONV_SIZE / 2],
             stride: [1, 1],
             groups: dim,
         };
-        let local_conv = Conv2dBN::load(device, &mut vb.pp("local_conv"), cfg_local)?;
+        let local_conv = ConvNdBN::load(device, &mut vb.pp("local_conv"), cfg_local)?;
         Ok(Self {
             attn,
             local_conv,
@@ -588,10 +588,10 @@ pub struct TinyViT {
     pub(crate) patch_embed: PatchEmbed,
     pub(crate) layer0: ConvLayer,
     pub(crate) layers: Vec<BasicLayer>,
-    neck_conv1: Conv2d<f32>,
-    neck_ln1: LayerNorm2d,
-    neck_conv2: Conv2d<f32>,
-    neck_ln2: LayerNorm2d,
+    neck_conv1: ConvNd<2, 4, f32>,
+    neck_ln1: LayerNormNd<4, f32>,
+    neck_conv2: ConvNd<2, 4, f32>,
+    neck_ln2: LayerNormNd<4, f32>,
 }
 
 impl TinyViT {
@@ -650,15 +650,15 @@ impl TinyViT {
         }
 
         let neck_conv1 =
-            Conv2d::load_no_bias(device, &mut vb.pp("neck.0"), Conv2dConfig::default())?;
-        let neck_ln1 = LayerNorm2d::load(device, &mut vb.pp("neck.1"), 1e-6)?;
-        let cfg_pad1 = Conv2dConfig {
+            ConvNd::<2, 4, f32>::load_no_bias(device, &mut vb.pp("neck.0"), ConvNdConfig::default())?;
+        let neck_ln1 = LayerNormNd::<4, f32>::load_over_axis(device, &mut vb.pp("neck.1"), 1, 1e-6)?;
+        let cfg_pad1 = ConvNdConfig {
             padding: [1, 1],
             stride: [1, 1],
             groups: 1,
         };
-        let neck_conv2 = Conv2d::load_no_bias(device, &mut vb.pp("neck.2"), cfg_pad1)?;
-        let neck_ln2 = LayerNorm2d::load(device, &mut vb.pp("neck.3"), 1e-6)?;
+        let neck_conv2 = ConvNd::<2, 4, f32>::load_no_bias(device, &mut vb.pp("neck.2"), cfg_pad1)?;
+        let neck_ln2 = LayerNormNd::<4, f32>::load_over_axis(device, &mut vb.pp("neck.3"), 1, 1e-6)?;
 
         Ok(Self {
             patch_embed,

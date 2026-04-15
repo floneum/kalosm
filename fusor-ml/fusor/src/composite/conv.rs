@@ -535,7 +535,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_conv_2d_depthwise_cpu() {
-        use crate::layers::{Conv2d, Conv2dConfig};
+        use crate::layers::{ConvNd, ConvNdConfig};
 
         // Input: (batch=1, channels=2, height=4, width=4)
         // Channel 0: 0..15, Channel 1: 100..115
@@ -557,12 +557,12 @@ mod tests {
         let weight: Tensor<4, f32, ConcreteTensor<f32, 4>> =
             Tensor::Cpu(fusor_cpu::Tensor::from_slice([2, 1, 3, 3], &weight_data));
 
-        let config = Conv2dConfig {
+        let config = ConvNdConfig::<2> {
             padding: [0, 0],
             stride: [1, 1],
             groups: 2,
         };
-        let conv = Conv2d::new(weight, None, config);
+        let conv = ConvNd::<2, 4, _>::new(weight, None, config);
         let output = conv.forward(&input);
         assert_eq!(output.shape(), [1, 2, 2, 2]);
 
@@ -624,7 +624,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_conv_2d_depthwise_with_padding_cpu() {
-        use crate::layers::{Conv2d, Conv2dConfig};
+        use crate::layers::{ConvNd, ConvNdConfig};
 
         // Input: (batch=1, channels=2, height=3, width=3)
         let input_data: Vec<f32> = vec![
@@ -639,12 +639,12 @@ mod tests {
         let weight: Tensor<4, f32, ConcreteTensor<f32, 4>> =
             Tensor::Cpu(fusor_cpu::Tensor::from_slice([2, 1, 3, 3], &weight_data));
 
-        let config = Conv2dConfig {
+        let config = ConvNdConfig::<2> {
             padding: [1, 1],
             stride: [1, 1],
             groups: 2,
         };
-        let conv = Conv2d::new(weight, None, config);
+        let conv = ConvNd::<2, 4, _>::new(weight, None, config);
         let output = conv.forward(&input);
         assert_eq!(output.shape(), [1, 2, 3, 3]);
 

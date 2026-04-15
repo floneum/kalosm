@@ -1,6 +1,6 @@
 //! TwoWayTransformer for cross-attention between queries and image embeddings.
 
-use fusor::layers::{LayerNorm, Linear};
+use fusor::layers::{LayerNormNd, Linear};
 use fusor::{ConcreteTensor, Device, Tensor, TensorBacking, VarBuilder};
 
 use super::{Activation, MlpBlock, Result};
@@ -93,12 +93,12 @@ impl Attention {
 
 struct TwoWayAttentionBlock {
     self_attn: Attention,
-    norm1: LayerNorm<1, f32>,
+    norm1: LayerNormNd<3, f32>,
     cross_attn_token_to_image: Attention,
-    norm2: LayerNorm<1, f32>,
+    norm2: LayerNormNd<3, f32>,
     mlp: MlpBlock,
-    norm3: LayerNorm<1, f32>,
-    norm4: LayerNorm<1, f32>,
+    norm3: LayerNormNd<3, f32>,
+    norm4: LayerNormNd<3, f32>,
     cross_attn_image_to_token: Attention,
     skip_first_layer_pe: bool,
 }
@@ -112,10 +112,10 @@ impl TwoWayAttentionBlock {
         mlp_dim: usize,
         skip_first_layer_pe: bool,
     ) -> Result<Self> {
-        let norm1 = LayerNorm::load(device, &mut vb.pp("norm1"), 1e-5)?;
-        let norm2 = LayerNorm::load(device, &mut vb.pp("norm2"), 1e-5)?;
-        let norm3 = LayerNorm::load(device, &mut vb.pp("norm3"), 1e-5)?;
-        let norm4 = LayerNorm::load(device, &mut vb.pp("norm4"), 1e-5)?;
+        let norm1 = LayerNormNd::load(device, &mut vb.pp("norm1"), 1e-5)?;
+        let norm2 = LayerNormNd::load(device, &mut vb.pp("norm2"), 1e-5)?;
+        let norm3 = LayerNormNd::load(device, &mut vb.pp("norm3"), 1e-5)?;
+        let norm4 = LayerNormNd::load(device, &mut vb.pp("norm4"), 1e-5)?;
         let self_attn =
             Attention::load(device, &mut vb.pp("self_attn"), embedding_dim, num_heads, 1)?;
         let cross_attn_token_to_image = Attention::load(
@@ -199,7 +199,7 @@ impl TwoWayAttentionBlock {
 pub struct TwoWayTransformer {
     layers: Vec<TwoWayAttentionBlock>,
     final_attn_token_to_image: Attention,
-    norm_final_attn: LayerNorm<1, f32>,
+    norm_final_attn: LayerNormNd<3, f32>,
 }
 
 impl TwoWayTransformer {
@@ -230,7 +230,7 @@ impl TwoWayTransformer {
             num_heads,
             2,
         )?;
-        let norm_final_attn = LayerNorm::load(device, &mut vb.pp("norm_final_attn"), 1e-5)?;
+        let norm_final_attn = LayerNormNd::load(device, &mut vb.pp("norm_final_attn"), 1e-5)?;
         Ok(Self {
             layers,
             final_attn_token_to_image,

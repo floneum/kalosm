@@ -219,8 +219,8 @@ impl Sam {
         let device = img_embeddings.device();
         let image_pe = self.prompt_encoder.get_dense_pe();
 
-        let points_data =
-            (!points.is_empty()).then(|| build_point_tensors(&device, points, original_h, original_w, 1));
+        let points_data = (!points.is_empty())
+            .then(|| build_point_tensors(&device, points, original_h, original_w, 1));
 
         let points_ref = points_data
             .as_ref()
@@ -259,8 +259,7 @@ impl Sam {
         let image_pe = self.prompt_encoder.get_dense_pe();
         let batch_size = points.len();
 
-        let (pts, lbls) =
-            build_point_tensors(&device, points, original_h, original_w, batch_size);
+        let (pts, lbls) = build_point_tensors(&device, points, original_h, original_w, batch_size);
 
         let (sparse_prompt_embeddings, dense_prompt_embeddings) =
             self.prompt_encoder.forward(Some((&pts, &lbls)), None, None);

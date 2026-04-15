@@ -58,10 +58,6 @@ name = "qmatmul"
 harness = false
 
 [[bench]]
-name = "linear"
-harness = false
-
-[[bench]]
 name = "elementwise"
 harness = false
 
@@ -79,10 +75,6 @@ harness = false
 
 [[bench]]
 name = "softmax"
-harness = false
-
-[[bench]]
-name = "bert_layer"
 harness = false
 
 [[bench]]
