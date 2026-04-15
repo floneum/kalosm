@@ -76,11 +76,40 @@ impl BiLstm {
     /// # Returns
     /// Output tensor [batch, seq_len, 2*hidden_size]
     pub async fn forward(&self, input: &Tensor<3, f32>) -> Tensor<3, f32> {
+        let [_batch, seq_len, _input_size] = input.shape();
+        let lengths = vec![seq_len; input.shape()[0]];
+        self.forward_with_lengths(input, &lengths).await
+    }
+
+    /// Forward pass through BiLSTM with explicit per-item sequence lengths.
+    ///
+    /// Padded timesteps are masked out so shorter sequences in a batch do not
+    /// corrupt the backward direction state.
+    pub async fn forward_with_lengths(
+        &self,
+        input: &Tensor<3, f32>,
+        lengths: &[usize],
+    ) -> Tensor<3, f32> {
         let [batch, seq_len, _input_size] = input.shape();
+        assert_eq!(lengths.len(), batch, "lengths must match batch size");
         let device = input.device();
 
-        let fwd_out = run_direction(input, &self.forward, self.hidden_size, &device, false);
-        let bwd_out = run_direction(input, &self.backward, self.hidden_size, &device, true);
+        let fwd_out = run_direction(
+            input,
+            &self.forward,
+            self.hidden_size,
+            &device,
+            false,
+            lengths,
+        );
+        let bwd_out = run_direction(
+            input,
+            &self.backward,
+            self.hidden_size,
+            &device,
+            true,
+            lengths,
+        );
 
         // Concatenate forward and backward along the feature dim -> [batch, seq, 2*hidden]
         Tensor::cat([fwd_out, bwd_out], 2)
@@ -97,6 +126,7 @@ fn run_direction(
     hidden_size: usize,
     device: &Device,
     reverse: bool,
+    lengths: &[usize],
 ) -> Tensor<3, f32> {
     let [batch, seq_len, _] = input.shape();
 
@@ -107,6 +137,7 @@ fn run_direction(
     // dim 1 so that a final cat along dim 1 yields [batch, seq_len, hidden].
     let mut outputs: Vec<Tensor<3, f32>> = Vec::with_capacity(seq_len);
     outputs.resize_with(seq_len, || Tensor::zeros(device, [batch, 1, hidden_size]));
+    let zero_output: Tensor<3, f32> = Tensor::zeros(device, [batch, 1, hidden_size]);
 
     let bias_broadcast: Tensor<2, f32> = dir
         .bias
@@ -145,14 +176,54 @@ fn run_direction(
         let g_gate = g_raw.tanh();
         let o_gate = sigmoid_2d(&o_raw);
 
-        c = (f_gate * c + i_gate * g_gate).to_concrete();
-        h = (o_gate * c.clone().tanh()).to_concrete();
+        let next_c = (f_gate * c.clone() + i_gate * g_gate).to_concrete();
+        let next_h = (o_gate * next_c.clone().tanh()).to_concrete();
 
-        outputs[t] = h.clone().unsqueeze(1).to_concrete();
+        let active_mask_2d = timestep_mask_2d(device, batch, hidden_size, lengths, t);
+        c = active_mask_2d.where_cond(&next_c, &c).to_concrete();
+        h = active_mask_2d.where_cond(&next_h, &h).to_concrete();
+
+        let active_mask_3d = timestep_mask_3d(device, batch, hidden_size, lengths, t);
+        let output_t = h.clone().unsqueeze(1).to_concrete();
+        outputs[t] = active_mask_3d.where_cond(&output_t, &zero_output).to_concrete();
     }
 
     Tensor::cat(outputs, 1)
         .reshape([batch, seq_len, hidden_size])
+        .to_concrete()
+}
+
+fn timestep_mask_2d(
+    device: &Device,
+    batch: usize,
+    hidden_size: usize,
+    lengths: &[usize],
+    timestep: usize,
+) -> Tensor<2, f32> {
+    let mask_data: Vec<f32> = lengths
+        .iter()
+        .map(|&length| if timestep < length { 1.0 } else { 0.0 })
+        .collect();
+    Tensor::new(device, &mask_data)
+        .reshape([batch, 1])
+        .broadcast_as([batch, hidden_size])
+        .to_concrete()
+}
+
+fn timestep_mask_3d(
+    device: &Device,
+    batch: usize,
+    hidden_size: usize,
+    lengths: &[usize],
+    timestep: usize,
+) -> Tensor<3, f32> {
+    let mask_data: Vec<f32> = lengths
+        .iter()
+        .map(|&length| if timestep < length { 1.0 } else { 0.0 })
+        .collect();
+    Tensor::new(device, &mask_data)
+        .reshape([batch, 1, 1])
+        .broadcast_as([batch, 1, hidden_size])
         .to_concrete()
 }
 

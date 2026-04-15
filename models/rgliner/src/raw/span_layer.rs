@@ -173,11 +173,36 @@ impl SpanLayer {
         spans: &[(usize, usize)],
         device: &Device,
     ) -> Tensor<2, f32> {
-        let [batch_size, num_words, hidden_dim] = word_embeddings.shape();
-        assert_eq!(batch_size, 1, "only batch_size=1 supported");
-        let num_spans = spans.len();
+        let (batched, counts) =
+            self.forward_for_spans_batched(word_embeddings, &[spans.to_vec()], device);
+        let _count = counts.first().copied().unwrap_or(0);
+        batched
+    }
 
-        // Apply project_start and project_end to the full word embeddings
+    /// Compute span representations for a batch of per-item span lists.
+    ///
+    /// Returns:
+    /// - flattened span embeddings in batch-major order
+    /// - one count per batch item so the caller can slice the flattened output
+    pub fn forward_for_spans_batched(
+        &self,
+        word_embeddings: &Tensor<3, f32>,
+        spans_per_batch: &[Vec<(usize, usize)>],
+        device: &Device,
+    ) -> (Tensor<2, f32>, Vec<usize>) {
+        let [batch_size, num_words, hidden_dim] = word_embeddings.shape();
+        assert_eq!(
+            batch_size,
+            spans_per_batch.len(),
+            "spans_per_batch must match batch size"
+        );
+
+        let span_counts: Vec<usize> = spans_per_batch.iter().map(Vec::len).collect();
+        let total_spans: usize = span_counts.iter().sum();
+        if total_spans == 0 {
+            return (Tensor::zeros(device, [1, hidden_dim]), span_counts);
+        }
+
         let start_rep = self
             .start_fc2
             .forward(&self.start_fc1.forward(word_embeddings).relu());
@@ -185,32 +210,35 @@ impl SpanLayer {
             .end_fc2
             .forward(&self.end_fc1.forward(word_embeddings).relu());
 
-        // Gather at span positions
-        let start_rep_2d = start_rep.squeeze(0).to_concrete();
-        let end_rep_2d = end_rep.squeeze(0).to_concrete();
-        let _ = num_words;
+        let start_rep_flat = start_rep
+            .to_concrete()
+            .reshape([batch_size * num_words, hidden_dim])
+            .to_concrete();
+        let end_rep_flat = end_rep
+            .to_concrete()
+            .reshape([batch_size * num_words, hidden_dim])
+            .to_concrete();
 
-        let start_indices: Vec<u32> = spans.iter().map(|(s, _)| *s as u32).collect();
-        let end_indices: Vec<u32> = spans.iter().map(|(_, e)| *e as u32).collect();
-        let start_idx_tensor = Tensor::new(device, &start_indices);
-        let end_idx_tensor = Tensor::new(device, &end_indices);
+        let mut start_offset_indices: Vec<u32> = Vec::with_capacity(total_spans);
+        let mut end_offset_indices: Vec<u32> = Vec::with_capacity(total_spans);
+        for (batch_idx, spans) in spans_per_batch.iter().enumerate() {
+            let offset = (batch_idx * num_words) as u32;
+            for &(start, end) in spans {
+                start_offset_indices.push(start as u32 + offset);
+                end_offset_indices.push(end as u32 + offset);
+            }
+        }
 
-        let start_gathered = start_rep_2d.index_select(0, &start_idx_tensor);
-        let end_gathered = end_rep_2d.index_select(0, &end_idx_tensor);
+        let start_idx_tensor = Tensor::new(device, &start_offset_indices);
+        let end_idx_tensor = Tensor::new(device, &end_offset_indices);
 
-        // Concat along last dim: [num_spans, hidden*2]
-        let start_3d: Tensor<3, f32> = start_gathered.unsqueeze(0).to_concrete();
-        let end_3d: Tensor<3, f32> = end_gathered.unsqueeze(0).to_concrete();
-        let combined = Tensor::cat([start_3d, end_3d], 2).relu();
-
-        // Apply out_project: Linear -> ReLU -> Linear
+        let start_gathered = start_rep_flat.index_select(0, &start_idx_tensor);
+        let end_gathered = end_rep_flat.index_select(0, &end_idx_tensor);
+        let combined = Tensor::cat([start_gathered, end_gathered], 1).relu();
         let hidden = self.out_fc1.forward(&combined).relu();
         let out = self.out_fc2.forward(&hidden);
 
-        // [1, num_spans, hidden] -> [num_spans, hidden]
-        let _ = num_spans;
-        let _ = hidden_dim;
-        out.squeeze(0).to_concrete()
+        (out.to_concrete(), span_counts)
     }
 
     fn gather_span_embeddings(

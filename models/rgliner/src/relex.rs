@@ -594,6 +594,101 @@ impl GlinerRelEx {
         Ok((entities, relations))
     }
 
+    /// Extract entities and relations from text, chunking the input first so long
+    /// documents that would otherwise be truncated by the encoder's context window
+    /// still get full coverage.
+    ///
+    /// Uses the model's own tokenizer to pack whole words into chunks of at most
+    /// `token_budget` subtokens with ~15% overlap between adjacent chunks. Each
+    /// chunk is scored independently; entity and relation byte offsets are remapped
+    /// back into the original text and deduped across overlapping windows (keeping
+    /// the highest score per span+label / head+tail+label).
+    ///
+    /// `token_budget` defaults to 128.
+    pub async fn extract_auto(
+        &self,
+        text: &str,
+        entity_labels: &[&str],
+        relation_labels: &[&str],
+        token_budget: Option<usize>,
+    ) -> Result<(Vec<Entity>, Vec<Relation>), GlinerError> {
+        let budget = token_budget.unwrap_or(128);
+        let ranges = crate::tokenization::token_packed_ranges(
+            self.tokenizer.tokenizer(),
+            text,
+            budget,
+            budget / 7,
+        )?;
+        if ranges.len() <= 1 {
+            return self.extract(text, entity_labels, relation_labels).await;
+        }
+
+        let shift = |ent: &mut Entity, offset: usize| {
+            ent.start_char += offset;
+            ent.end_char += offset;
+        };
+
+        let mut all_entities: Vec<Entity> = Vec::new();
+        let mut all_relations: Vec<Relation> = Vec::new();
+        for range in &ranges {
+            let chunk = &text[range.clone()];
+            let (entities, relations) =
+                self.extract(chunk, entity_labels, relation_labels).await?;
+            let offset = range.start;
+            for mut ent in entities {
+                shift(&mut ent, offset);
+                all_entities.push(ent);
+            }
+            for mut rel in relations {
+                shift(&mut rel.head, offset);
+                shift(&mut rel.tail, offset);
+                all_relations.push(rel);
+            }
+        }
+
+        all_entities.sort_by(|a, b| {
+            a.start_char
+                .cmp(&b.start_char)
+                .then_with(|| a.end_char.cmp(&b.end_char))
+                .then_with(|| a.label.cmp(&b.label))
+        });
+        all_entities.dedup_by(|b, a| {
+            if a.start_char == b.start_char && a.end_char == b.end_char && a.label == b.label {
+                if b.score > a.score {
+                    a.score = b.score;
+                }
+                true
+            } else {
+                false
+            }
+        });
+
+        all_relations.sort_by(|a, b| {
+            a.head
+                .start_char
+                .cmp(&b.head.start_char)
+                .then_with(|| a.tail.start_char.cmp(&b.tail.start_char))
+                .then_with(|| a.relation.cmp(&b.relation))
+        });
+        all_relations.dedup_by(|b, a| {
+            if a.head.start_char == b.head.start_char
+                && a.head.end_char == b.head.end_char
+                && a.tail.start_char == b.tail.start_char
+                && a.tail.end_char == b.tail.end_char
+                && a.relation == b.relation
+            {
+                if b.score > a.score {
+                    a.score = b.score;
+                }
+                true
+            } else {
+                false
+            }
+        });
+
+        Ok((all_entities, all_relations))
+    }
+
     /// Decode entities for `span_mode = markerV0` (used by the `large` variants).
     ///
     /// Enumerates every `(start, end)` pair up to `config.max_width` words,
@@ -817,5 +912,505 @@ impl GlinerRelEx {
     /// Get the configuration.
     pub fn config(&self) -> &GlinerRelExConfig {
         &self.config
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+    use std::time::{Duration, Instant};
+
+    const PROFILE_TEXT: &str = "Apple Inc. was founded by Steve Jobs in Cupertino, California. \
+Microsoft was founded by Bill Gates in Albuquerque, New Mexico. \
+Google was founded by Larry Page and Sergey Brin in Menlo Park, California. \
+Amazon was founded by Jeff Bezos in Bellevue, Washington. \
+Meta Platforms was founded by Mark Zuckerberg in Cambridge, Massachusetts.";
+    const ENTITY_LABELS: &[&str] = &["organization", "person", "location"];
+    const RELATION_LABELS: &[&str] = &["founded by", "located in"];
+
+    #[derive(Debug, Clone)]
+    struct ExtractProfile {
+        variant: &'static str,
+        device: &'static str,
+        span_mode: SpanMode,
+        seq_len: usize,
+        num_words: usize,
+        entity_labels: usize,
+        relation_labels: usize,
+        entity_count: usize,
+        relation_count: usize,
+        span_count: usize,
+        candidate_pairs: usize,
+        cold_total: Duration,
+        warm_total: Duration,
+        tokenize_cpu: Duration,
+        input_prep_cpu: Duration,
+        entity_span_prep_cpu: Duration,
+        entity_sync: Duration,
+        entity_decode_cpu: Duration,
+        relation_span_sync: Duration,
+        relation_pair_pack_cpu: Duration,
+        relation_score_sync: Duration,
+        relation_decode_cpu: Duration,
+    }
+
+    impl ExtractProfile {
+        fn print(&self) {
+            println!(
+                "PROFILE variant={} device={} span_mode={:?} seq_len={} words={} ent_labels={} rel_labels={} entities={} relations={} spans={} pairs={}",
+                self.variant,
+                self.device,
+                self.span_mode,
+                self.seq_len,
+                self.num_words,
+                self.entity_labels,
+                self.relation_labels,
+                self.entity_count,
+                self.relation_count,
+                self.span_count,
+                self.candidate_pairs
+            );
+            println!(
+                "  cold_total_ms={:.2} warm_total_ms={:.2}",
+                self.cold_total.as_secs_f64() * 1000.0,
+                self.warm_total.as_secs_f64() * 1000.0
+            );
+            println!(
+                "  tokenize_cpu_ms={:.2} input_prep_cpu_ms={:.2} entity_span_prep_cpu_ms={:.2}",
+                self.tokenize_cpu.as_secs_f64() * 1000.0,
+                self.input_prep_cpu.as_secs_f64() * 1000.0,
+                self.entity_span_prep_cpu.as_secs_f64() * 1000.0
+            );
+            println!(
+                "  entity_sync_ms={:.2} entity_decode_cpu_ms={:.2}",
+                self.entity_sync.as_secs_f64() * 1000.0,
+                self.entity_decode_cpu.as_secs_f64() * 1000.0
+            );
+            println!(
+                "  relation_span_sync_ms={:.2} relation_pair_pack_cpu_ms={:.2}",
+                self.relation_span_sync.as_secs_f64() * 1000.0,
+                self.relation_pair_pack_cpu.as_secs_f64() * 1000.0
+            );
+            println!(
+                "  relation_score_sync_ms={:.2} relation_decode_cpu_ms={:.2}",
+                self.relation_score_sync.as_secs_f64() * 1000.0,
+                self.relation_decode_cpu.as_secs_f64() * 1000.0
+            );
+        }
+    }
+
+    fn weights_path(file_name: &str) -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("weights")
+            .join(file_name)
+    }
+
+    async fn load_local_relex(
+        model_path: PathBuf,
+        device: Device,
+    ) -> Result<GlinerRelEx, GlinerLoadingError> {
+        GlinerRelEx::builder()
+            .with_source(GlinerRelExSource::local(model_path))
+            .with_device(device)
+            .build_with_loading_handler(|_| {})
+            .await
+    }
+
+    async fn profile_extract(
+        model: &GlinerRelEx,
+        variant: &'static str,
+        cold_total: Duration,
+    ) -> Result<ExtractProfile, GlinerError> {
+        let total_start = Instant::now();
+
+        let tokenize_start = Instant::now();
+        let tokenized = model
+            .tokenizer
+            .tokenize(PROFILE_TEXT, ENTITY_LABELS, RELATION_LABELS)?;
+        let tokenize_cpu = tokenize_start.elapsed();
+
+        let seq_len = tokenized.token_ids.len();
+        let num_words = tokenized.num_words;
+
+        let input_start = Instant::now();
+        let token_ids = Tensor::new(&model.device, &tokenized.token_ids);
+        let token_ids: Tensor<2, u32> = token_ids.unsqueeze(0).to_concrete();
+
+        let attention_mask = Tensor::new(&model.device, &tokenized.attention_mask);
+        let attention_mask: Tensor<2, u32> = attention_mask.unsqueeze(0).to_concrete();
+        let input_prep_cpu = input_start.elapsed();
+
+        let entity_compute_start = Instant::now();
+        let encoder_output = model.encoder.forward(&token_ids, Some(&attention_mask));
+        let word_encoder_embs =
+            model.gather_at_positions(&encoder_output, &tokenized.text_positions);
+        let lstm_output = model.bilstm.forward(&word_encoder_embs).await;
+        let ent_embs_raw = model.gather_at_positions(&encoder_output, &tokenized.ent_positions);
+        let ent_embs = model.prompt_rep_layer.forward_3d(&ent_embs_raw);
+        let rel_embs = model.gather_at_positions(&encoder_output, &tokenized.rel_positions);
+        let text_embs = lstm_output.clone();
+        let ent_embs_2d: Tensor<2, f32> = ent_embs.squeeze(0).to_concrete();
+
+        let (entities, span_count, entity_span_prep_cpu, entity_sync, entity_decode_cpu) =
+            match model.span_mode {
+                SpanMode::TokenLevel => {
+                    let scorer = model
+                        .scorer
+                        .as_ref()
+                        .expect("token_level requires scorer");
+                    let token_scores = scorer.forward_entity_scores(&text_embs, &ent_embs_2d);
+                    let (entities, entity_sync, entity_decode_cpu) =
+                        profile_decode_entities_from_tokens(
+                            model,
+                            &token_scores,
+                            ENTITY_LABELS,
+                            &tokenized.word_offsets,
+                            PROFILE_TEXT,
+                            entity_compute_start,
+                        )
+                        .await?;
+                    (
+                        entities,
+                        0,
+                        Duration::ZERO,
+                        entity_sync,
+                        entity_decode_cpu,
+                    )
+                }
+                SpanMode::MarkerV0 => {
+                    profile_decode_entities_marker_v0(
+                        model,
+                        &text_embs,
+                        &ent_embs_2d,
+                        ENTITY_LABELS,
+                        &tokenized.word_offsets,
+                        tokenized.num_words,
+                        PROFILE_TEXT,
+                        entity_compute_start,
+                    )
+                    .await?
+                }
+            };
+
+        let mut relation_span_sync = Duration::ZERO;
+        let mut relation_pair_pack_cpu = Duration::ZERO;
+        let mut relation_score_sync = Duration::ZERO;
+        let mut relation_decode_cpu = Duration::ZERO;
+        let mut candidate_pairs = 0usize;
+        let mut relation_count = 0usize;
+
+        if entities.len() >= 2 && !RELATION_LABELS.is_empty() {
+            let relation_span_start = Instant::now();
+            let entity_spans: Vec<(usize, usize)> = entities
+                .iter()
+                .map(|e| (e.start_word, e.end_word))
+                .collect();
+            let span_reps = model
+                .span_layer
+                .forward_for_spans(&text_embs, &entity_spans, &model.device);
+            let span_reps_data = span_reps.clone().as_slice().await?;
+            relation_span_sync = relation_span_start.elapsed();
+
+            let pair_pack_start = Instant::now();
+            let num_entities = entities.len();
+            let hidden_size = model.config.hidden_size;
+            let span_reps_slice = span_reps_data.as_slice();
+
+            let mut pairs: Vec<(usize, usize)> = Vec::new();
+            for head in 0..num_entities {
+                for tail in 0..num_entities {
+                    if head != tail {
+                        pairs.push((head, tail));
+                    }
+                }
+            }
+            candidate_pairs = pairs.len();
+
+            let mut head_embs = Vec::with_capacity(candidate_pairs * hidden_size);
+            let mut tail_embs = Vec::with_capacity(candidate_pairs * hidden_size);
+            for &(head_idx, tail_idx) in &pairs {
+                let h_start = head_idx * hidden_size;
+                let t_start = tail_idx * hidden_size;
+                head_embs.extend_from_slice(&span_reps_slice[h_start..h_start + hidden_size]);
+                tail_embs.extend_from_slice(&span_reps_slice[t_start..t_start + hidden_size]);
+            }
+
+            let head_tensor = Tensor::new(&model.device, &head_embs)
+                .reshape([candidate_pairs, hidden_size])
+                .to_concrete();
+            let tail_tensor = Tensor::new(&model.device, &tail_embs)
+                .reshape([candidate_pairs, hidden_size])
+                .to_concrete();
+            relation_pair_pack_cpu = pair_pack_start.elapsed();
+
+            let relation_score_start = Instant::now();
+            let pair_embs = model.pair_projector.forward(&head_tensor, &tail_tensor);
+            let rel_embs_squeezed: Tensor<2, f32> = rel_embs.squeeze(0).to_concrete();
+            let rel_scores = pair_embs.mat_mul(&rel_embs_squeezed.transpose(0, 1));
+            let rel_scores_slice = rel_scores.clone().as_slice().await?;
+            relation_score_sync = relation_score_start.elapsed();
+
+            let relation_decode_start = Instant::now();
+            let n_rels = RELATION_LABELS.len();
+            let threshold = model.config.relation_threshold;
+            let mut relations = Vec::new();
+            for (pair_idx, &(head_idx, tail_idx)) in pairs.iter().enumerate() {
+                let base = pair_idx * n_rels;
+                for rel_idx in 0..n_rels {
+                    let raw = rel_scores_slice.as_slice()[base + rel_idx];
+                    let prob = 1.0 / (1.0 + (-raw).exp());
+                    if prob > threshold {
+                        relations.push(Relation {
+                            head: entities[head_idx].clone(),
+                            tail: entities[tail_idx].clone(),
+                            relation: RELATION_LABELS[rel_idx].to_string(),
+                            score: prob,
+                        });
+                    }
+                }
+            }
+            relations.sort_by(|a, b| {
+                b.score
+                    .partial_cmp(&a.score)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+            relation_count = relations.len();
+            relation_decode_cpu = relation_decode_start.elapsed();
+        }
+
+        let warm_total = total_start.elapsed();
+        Ok(ExtractProfile {
+            variant,
+            device: if model.device.is_gpu() { "gpu" } else { "cpu" },
+            span_mode: model.span_mode,
+            seq_len,
+            num_words,
+            entity_labels: ENTITY_LABELS.len(),
+            relation_labels: RELATION_LABELS.len(),
+            entity_count: entities.len(),
+            relation_count,
+            span_count,
+            candidate_pairs,
+            cold_total,
+            warm_total,
+            tokenize_cpu,
+            input_prep_cpu,
+            entity_span_prep_cpu,
+            entity_sync,
+            entity_decode_cpu,
+            relation_span_sync,
+            relation_pair_pack_cpu,
+            relation_score_sync,
+            relation_decode_cpu,
+        })
+    }
+
+    async fn profile_decode_entities_marker_v0(
+        model: &GlinerRelEx,
+        text_embs: &Tensor<3, f32>,
+        ent_embs_2d: &Tensor<2, f32>,
+        entity_labels: &[&str],
+        word_offsets: &[(usize, usize)],
+        num_words: usize,
+        text: &str,
+        entity_compute_start: Instant,
+    ) -> Result<(Vec<Entity>, usize, Duration, Duration, Duration), GlinerError> {
+        let threshold = model.config.entity_threshold;
+        let max_width = model.config.max_width;
+        let n_labels = entity_labels.len();
+
+        if num_words == 0 || n_labels == 0 {
+            return Ok((Vec::new(), 0, Duration::ZERO, Duration::ZERO, Duration::ZERO));
+        }
+
+        let span_prep_start = Instant::now();
+        let mut spans: Vec<(usize, usize)> = Vec::new();
+        for start in 0..num_words {
+            for width in 1..=max_width.min(num_words - start) {
+                spans.push((start, start + width - 1));
+            }
+        }
+        let entity_span_prep_cpu = span_prep_start.elapsed();
+
+        let span_reps = model
+            .span_layer
+            .forward_for_spans(text_embs, &spans, &model.device);
+        let label_rep_t: Tensor<2, f32> = ent_embs_2d.transpose(0, 1).to_concrete();
+        let logits = span_reps.mat_mul(&label_rep_t);
+        let logits_data = logits.clone().as_slice().await?;
+        let entity_sync = entity_compute_start.elapsed();
+
+        let decode_start = Instant::now();
+        let logits_slice = logits_data.as_slice();
+        let mut candidates: Vec<(usize, usize, usize, f32)> = Vec::new();
+        for (span_idx, &(s, e)) in spans.iter().enumerate() {
+            for l in 0..n_labels {
+                let raw = logits_slice[span_idx * n_labels + l];
+                let prob = 1.0 / (1.0 + (-raw).exp());
+                if prob >= threshold {
+                    candidates.push((s, e, l, prob));
+                }
+            }
+        }
+
+        candidates.sort_by(|a, b| b.3.partial_cmp(&a.3).unwrap_or(std::cmp::Ordering::Equal));
+
+        let mut taken: Vec<(usize, usize)> = Vec::new();
+        let mut entities = Vec::new();
+        for (s, e, l, score) in candidates {
+            let overlap = taken.iter().any(|&(a, b)| !(e < a || s > b));
+            if overlap {
+                continue;
+            }
+            taken.push((s, e));
+            if s < word_offsets.len() && e < word_offsets.len() {
+                let (start_char, _) = word_offsets[s];
+                let (_, end_char) = word_offsets[e];
+                entities.push(Entity {
+                    text: text[start_char..end_char].to_string(),
+                    label: entity_labels[l].to_string(),
+                    start_char,
+                    end_char,
+                    start_word: s,
+                    end_word: e,
+                    score,
+                });
+            }
+        }
+        entities.sort_by(|a, b| {
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        let entity_decode_cpu = decode_start.elapsed();
+
+        Ok((
+            entities,
+            spans.len(),
+            entity_span_prep_cpu,
+            entity_sync,
+            entity_decode_cpu,
+        ))
+    }
+
+    async fn profile_decode_entities_from_tokens(
+        model: &GlinerRelEx,
+        token_scores: &Tensor<4, f32>,
+        entity_labels: &[&str],
+        word_offsets: &[(usize, usize)],
+        text: &str,
+        entity_compute_start: Instant,
+    ) -> Result<(Vec<Entity>, Duration, Duration), GlinerError> {
+        let [_batch_size, num_tokens, num_labels, num_channels] = token_scores.shape();
+        assert_eq!(num_channels, 3, "expected [start, end, inside]");
+        let scores_data = token_scores.clone().as_slice().await?;
+        let entity_sync = entity_compute_start.elapsed();
+
+        let decode_start = Instant::now();
+        let scores = scores_data.as_slice();
+        let threshold = model.config.entity_threshold;
+        let mut candidates: Vec<(usize, usize, usize, f32)> = Vec::new();
+
+        let score_at = |tok: usize, lab: usize, ch: usize| -> f32 {
+            scores[tok * num_labels * 3 + lab * 3 + ch]
+        };
+
+        for label_idx in 0..num_labels {
+            for start_tok in 0..num_tokens {
+                let start_score = score_at(start_tok, label_idx, 0);
+                if start_score < threshold {
+                    continue;
+                }
+
+                for end_tok in start_tok..num_tokens {
+                    let end_score = score_at(end_tok, label_idx, 1);
+                    if end_score < threshold {
+                        continue;
+                    }
+
+                    let mut min_score = start_score.min(end_score);
+                    let mut valid = true;
+                    for t in start_tok..=end_tok {
+                        let inside = score_at(t, label_idx, 2);
+                        if inside < threshold {
+                            valid = false;
+                            break;
+                        }
+                        if inside < min_score {
+                            min_score = inside;
+                        }
+                    }
+                    if valid {
+                        candidates.push((start_tok, end_tok, label_idx, min_score));
+                    }
+                }
+            }
+        }
+
+        candidates.sort_by(|a, b| b.3.partial_cmp(&a.3).unwrap_or(std::cmp::Ordering::Equal));
+
+        let mut taken: Vec<(usize, usize)> = Vec::new();
+        let mut entities = Vec::new();
+        for (start_tok, end_tok, label_idx, score) in candidates {
+            let overlap = taken.iter().any(|&(a, b)| !(end_tok < a || start_tok > b));
+            if overlap {
+                continue;
+            }
+            taken.push((start_tok, end_tok));
+
+            if start_tok < word_offsets.len() && end_tok < word_offsets.len() {
+                let (start_char, _) = word_offsets[start_tok];
+                let (_, end_char) = word_offsets[end_tok];
+                entities.push(Entity {
+                    text: text[start_char..end_char].to_string(),
+                    label: entity_labels[label_idx].to_string(),
+                    start_char,
+                    end_char,
+                    start_word: start_tok,
+                    end_word: end_tok,
+                    score,
+                });
+            }
+        }
+
+        entities.sort_by(|a, b| {
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        let entity_decode_cpu = decode_start.elapsed();
+
+        Ok((entities, entity_sync, entity_decode_cpu))
+    }
+
+    #[tokio::test]
+    #[ignore = "diagnostic profile for rel-ex forward-pass stage breakdowns"]
+    async fn profile_relex_variants() -> Result<(), Box<dyn std::error::Error>> {
+        let device = match std::panic::catch_unwind(Device::gpu_blocking) {
+            Ok(Ok(device)) => device,
+            _ => Device::cpu(),
+        };
+
+        let variants = [
+            ("multi", "gliner-relex-multi-v1.0-Q4_K.gguf"),
+            ("base", "gliner-relex-base-v1.0-Q4_K.gguf"),
+            ("large", "gliner-relex-large-v1.0-Q4_K.gguf"),
+        ];
+
+        for (variant, file_name) in variants {
+            let model = load_local_relex(weights_path(file_name), device.clone()).await?;
+
+            let cold_start = Instant::now();
+            let _ = model
+                .extract(PROFILE_TEXT, ENTITY_LABELS, RELATION_LABELS)
+                .await?;
+            let cold_total = cold_start.elapsed();
+
+            let profile = profile_extract(&model, variant, cold_total).await?;
+            profile.print();
+        }
+
+        Ok(())
     }
 }

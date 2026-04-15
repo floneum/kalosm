@@ -18,12 +18,11 @@ use crate::context::Document;
 
 use super::Chunk;
 
+pub use kalosm_chunking::{ChunkStrategy, DefaultSentenceChunker, SentenceChunker};
 mod chunking;
-pub use chunking::*;
 mod task;
 pub use task::*;
 mod sentence;
-pub use sentence::*;
 mod semantic;
 pub use semantic::*;
 mod html;

@@ -5,6 +5,8 @@ use rgliner::{
     DecodingMode, Entity, Gliner, GlinerSource,
 };
 
+const TOKEN_BUDGET: usize = 128;
+
 fn main() {
     #[cfg(target_arch = "wasm32")]
     {
@@ -376,7 +378,7 @@ async fn build_model(
             let inner = Gliner::builder()
                 .with_source(source)
                 .with_decoding_mode(DecodingMode::Flat)
-                .with_threshold(0.3)
+                .with_threshold(0.05)
                 .build_with_loading_handler(|_| {})
                 .await
                 .map_err(|e| format!("{e}"))?;
@@ -420,7 +422,7 @@ async fn run_extraction(
     match (mode, model) {
         (Mode::Ner, LoadedModel::Ner { inner, .. }) => {
             let entities = inner
-                .extract(text, &ent_refs)
+                .extract_auto(text, &ent_refs, Some(TOKEN_BUDGET))
                 .await
                 .map_err(|e| format!("{e}"))?;
             Ok(ExtractionOutput::Ner(entities))
@@ -431,7 +433,7 @@ async fn run_extraction(
                 return Err("Add at least one relation label.".to_string());
             }
             let (entities, relations) = inner
-                .extract(text, &ent_refs, &rel_refs)
+                .extract_auto(text, &ent_refs, &rel_refs, Some(TOKEN_BUDGET))
                 .await
                 .map_err(|e| format!("{e}"))?;
             Ok(ExtractionOutput::Relex(RelexResult {
@@ -510,24 +512,23 @@ fn highlighted_text(text: String, entities: Vec<Entity>) -> Element {
 
     let mut segments: Vec<(bool, String, Option<String>)> = Vec::new();
     let mut cursor = 0usize;
+    let len = text.len();
     for ent in sorted.iter() {
-        if ent.start_char < cursor {
+        let start = ent.start_char.min(len);
+        let end = ent.end_char.min(len);
+        if start < cursor || end <= start {
             continue;
         }
-        if ent.start_char > cursor {
-            segments.push((false, text[cursor..ent.start_char].to_string(), None));
+        if !text.is_char_boundary(start) || !text.is_char_boundary(end) {
+            continue;
         }
-        let end = ent.end_char.min(text.len());
-        if end > ent.start_char {
-            segments.push((
-                true,
-                text[ent.start_char..end].to_string(),
-                Some(ent.label.clone()),
-            ));
+        if start > cursor {
+            segments.push((false, text[cursor..start].to_string(), None));
         }
+        segments.push((true, text[start..end].to_string(), Some(ent.label.clone())));
         cursor = end;
     }
-    if cursor < text.len() {
+    if cursor < len {
         segments.push((false, text[cursor..].to_string(), None));
     }
 

@@ -22,7 +22,7 @@ pub struct TokenizedText {
 
 /// Word-level tokenizer wrapper.
 pub struct WordTokenizer {
-    tokenizer: Tokenizer,
+    pub(crate) tokenizer: Tokenizer,
     add_special_tokens: bool,
 }
 
@@ -82,6 +82,57 @@ impl WordTokenizer {
             word_offsets,
         })
     }
+}
+
+/// Pack `text` into token-budgeted byte ranges using the supplied tokenizer.
+///
+/// Splits the input on GLiNER-style word boundaries, encodes each word to count
+/// subtokens, and greedily fills windows of at most `token_budget` subtokens with
+/// `overlap_tokens` of trailing-token overlap between adjacent windows.
+pub(crate) fn token_packed_ranges(
+    tokenizer: &Tokenizer,
+    text: &str,
+    token_budget: usize,
+    overlap_tokens: usize,
+) -> Result<Vec<std::ops::Range<usize>>, GlinerError> {
+    let words = split_words(text);
+    if words.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut word_token_counts = Vec::with_capacity(words.len());
+    for (w, _) in &words {
+        let enc = tokenizer
+            .encode(w.clone(), false)
+            .map_err(GlinerError::Tokenizer)?;
+        word_token_counts.push(enc.get_ids().len().max(1));
+    }
+
+    let mut ranges = Vec::new();
+    let mut word = 0usize;
+    while word < words.len() {
+        let mut end_word = word;
+        let mut tokens = 0usize;
+        while end_word < words.len() && tokens + word_token_counts[end_word] <= token_budget {
+            tokens += word_token_counts[end_word];
+            end_word += 1;
+        }
+        if end_word == word {
+            end_word = word + 1;
+        }
+        ranges.push(words[word].1 .0..words[end_word - 1].1 .1);
+        if end_word == words.len() {
+            break;
+        }
+        let mut back_tokens = 0usize;
+        let mut next = end_word;
+        while next > word + 1 && back_tokens < overlap_tokens {
+            next -= 1;
+            back_tokens += word_token_counts[next];
+        }
+        word = next.max(word + 1);
+    }
+    Ok(ranges)
 }
 
 fn split_words(text: &str) -> Vec<(String, (usize, usize))> {

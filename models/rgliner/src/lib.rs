@@ -89,6 +89,28 @@ pub use error::{GlinerError, GlinerLoadingError};
 pub use rbert::raw::{ModernBertConfig, ModernBertModel};
 pub use source::GlinerSource;
 
+/// Deduplicate entities appearing in more than one overlapping chunk, keeping the
+/// highest-scoring occurrence and sorting by span position.
+fn merge_entities(entities: &mut Vec<Entity>) {
+    entities.sort_by(|a, b| {
+        a.start_char
+            .cmp(&b.start_char)
+            .then_with(|| a.end_char.cmp(&b.end_char))
+            .then_with(|| a.label.cmp(&b.label))
+    });
+    entities.dedup_by(|b, a| {
+        if a.start_char == b.start_char && a.end_char == b.end_char && a.label == b.label {
+            if b.score > a.score {
+                a.score = b.score;
+            }
+            true
+        } else {
+            false
+        }
+    });
+}
+
+
 use fusor::{Device, Tensor, VarBuilder};
 use kalosm_common::Cache;
 use kalosm_model_types::ModelLoadingProgress;
@@ -331,6 +353,52 @@ impl Gliner {
     ) -> Result<Vec<Entity>, GlinerError> {
         let mut results = self.extract_batch(&[text], labels).await?;
         Ok(results.pop().unwrap_or_default())
+    }
+
+    /// Extract named entities from text, chunking the input first so long documents
+    /// that would otherwise be truncated by the text encoder's context window still
+    /// get full coverage.
+    ///
+    /// Uses the model's own tokenizer to pack whole words into chunks of at most
+    /// `token_budget` subtokens, with roughly 15% token overlap between adjacent
+    /// chunks. Each chunk is scored independently; entity offsets are remapped back
+    /// into the original text and deduped across overlapping windows (keeping the
+    /// highest score per span+label).
+    ///
+    /// `token_budget` defaults to 128 — empirically the sweet spot for the edge
+    /// variant's span-scoring quality. Larger budgets approach the context limit
+    /// but hurt F1; much smaller budgets hurt recall.
+    pub async fn extract_auto(
+        &mut self,
+        text: &str,
+        labels: &[&str],
+        token_budget: Option<usize>,
+    ) -> Result<Vec<Entity>, GlinerError> {
+        let budget = token_budget.unwrap_or(128);
+        let ranges = crate::tokenization::token_packed_ranges(
+            &self.tokenizer.tokenizer,
+            text,
+            budget,
+            budget / 7,
+        )?;
+        if ranges.len() <= 1 {
+            return self.extract(text, labels).await;
+        }
+
+        let chunk_texts: Vec<&str> = ranges.iter().map(|r| &text[r.clone()]).collect();
+        let per_chunk = self.extract_batch(&chunk_texts, labels).await?;
+
+        let mut all: Vec<Entity> = Vec::new();
+        for (range, entities) in ranges.iter().zip(per_chunk) {
+            let offset = range.start;
+            for mut ent in entities {
+                ent.start_char += offset;
+                ent.end_char += offset;
+                all.push(ent);
+            }
+        }
+        merge_entities(&mut all);
+        Ok(all)
     }
 
     /// Extract named entities using cached labels.

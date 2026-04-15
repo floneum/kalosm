@@ -5624,6 +5624,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "kalosm-chunking"
+version = "0.4.0"
+dependencies = [
+ "srx",
+ "whatlang",
+]
+
+[[package]]
 name = "kalosm-common"
 version = "0.4.0"
 dependencies = [
@@ -5662,6 +5670,7 @@ dependencies = [
  "heed",
  "image 0.24.9",
  "kalosm",
+ "kalosm-chunking",
  "kalosm-language-model",
  "kalosm-llama",
  "kalosm-sample",
