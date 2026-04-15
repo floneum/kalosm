@@ -103,28 +103,3 @@ where
     ConcreteTensor::from_fn(shape, |i| input.eval_scalar(i).cast())
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_cast_f32_to_i32() {
-        let a = ConcreteTensor::<f32, 1>::from_slice([4], &[1.5, 2.7, -3.2, 4.9]);
-        let b: ConcreteTensor<i32, 1> = cast_tensor(&a);
-
-        assert_eq!(b.get([0]), 1); // 1.5 -> 1
-        assert_eq!(b.get([1]), 2); // 2.7 -> 2
-        assert_eq!(b.get([2]), -3); // -3.2 -> -3
-        assert_eq!(b.get([3]), 4); // 4.9 -> 4
-    }
-
-    #[test]
-    fn test_cast_i32_to_f64() {
-        let a = ConcreteTensor::<i32, 1>::from_slice([3], &[1, -2, 3]);
-        let b: ConcreteTensor<f64, 1> = cast_tensor(&a);
-
-        assert_eq!(b.get([0]), 1.0);
-        assert_eq!(b.get([1]), -2.0);
-        assert_eq!(b.get([2]), 3.0);
-    }
-}

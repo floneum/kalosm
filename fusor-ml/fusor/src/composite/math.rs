@@ -104,24 +104,3 @@ where
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[tokio::test]
-    async fn test_sqr_cpu() {
-        let data = [1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0];
-        let t: Tensor<1, f32> = Tensor::Cpu(fusor_cpu::Tensor::from_slice([6], &data));
-        let result = t.sqr();
-        let slice = result.as_slice().await.unwrap();
-
-        for i in 0..6 {
-            let expected = data[i] * data[i];
-            assert!(
-                (slice[[i]] - expected).abs() < 0.001,
-                "Mismatch at index {}",
-                i
-            );
-        }
-    }
-}

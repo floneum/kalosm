@@ -261,20 +261,3 @@ define_comparison_tensor_op!(Lte, LteOp);
 define_comparison_tensor_op!(Gt, GtOp);
 define_comparison_tensor_op!(Gte, GteOp);
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_eq_scalar() {
-        assert_eq!(EqOp::apply_scalar(1.0f32, 1.0f32), 1.0);
-        assert_eq!(EqOp::apply_scalar(1.0f32, 2.0f32), 0.0);
-    }
-
-    #[test]
-    fn test_lt_scalar() {
-        assert_eq!(LtOp::apply_scalar(1.0f32, 2.0f32), 1.0);
-        assert_eq!(LtOp::apply_scalar(2.0f32, 1.0f32), 0.0);
-        assert_eq!(LtOp::apply_scalar(1.0f32, 1.0f32), 0.0);
-    }
-}

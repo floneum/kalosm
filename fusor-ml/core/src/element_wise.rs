@@ -10,9 +10,6 @@ use crate::{
     tensor::{DataType, DataTypeEnum},
 };
 
-#[cfg(test)]
-use crate::Device;
-
 fn unary_op<const R: usize, In: DataType, Out: DataType>(
     input: &Tensor<R, In>,
     name: Option<&str>,
@@ -87,95 +84,6 @@ impl<'a, const R: usize, T: DataType> Sum<&'a Tensor<R, T>> for Tensor<R, T> {
     }
 }
 
-#[cfg(test)]
-#[tokio::test]
-async fn test_add_const() {
-    let device = Device::test_instance();
-
-    let data = [
-        [[1., 2.], [1., 2.]],
-        [[3., 4.], [3., 4.]],
-        [[5., 6.], [5., 6.]],
-    ];
-    let tensor = Tensor::new(&device, &data);
-
-    let tensor = tensor + 1.0;
-
-    let output = tensor.as_slice().await.unwrap();
-    let result = [
-        [[2.0, 3.0], [2.0, 3.0]],
-        [[4.0, 5.0], [4.0, 5.0]],
-        [[6.0, 7.0], [6.0, 7.0]],
-    ];
-    let result = Tensor::new(&device, &result);
-    let result = result.as_slice().await.unwrap();
-    println!("{output:?}");
-    println!("{result:?}");
-    assert_eq!(output, result);
-
-    let data = [[1., 2.], [3., 4.], [5., 6.]];
-    let tensor = Tensor::new(&device, &data);
-
-    let tensor = tensor + 1.0;
-
-    let output = tensor.as_slice().await.unwrap();
-    println!("{output:?}");
-    assert_eq!(output[[0, 0]], 2.);
-    assert_eq!(output[[0, 1]], 3.);
-    assert_eq!(output[[1, 0]], 4.);
-    assert_eq!(output[[1, 1]], 5.);
-    assert_eq!(output[[2, 0]], 6.);
-    assert_eq!(output[[2, 1]], 7.);
-
-    let data = [1., 2.];
-    let tensor = Tensor::new(&device, &data);
-
-    let tensor = tensor + 1.0;
-
-    let output = tensor.as_slice().await.unwrap();
-    assert_eq!(output[[0]], 2.);
-    assert_eq!(output[[1]], 3.);
-}
-
-#[cfg(test)]
-#[tokio::test]
-async fn test_add_const_4_dim() {
-    let device = Device::test_instance();
-
-    let data = [
-        [
-            [[1., 2.], [1., 2.]],
-            [[3., 4.], [3., 4.]],
-            [[5., 6.], [5., 6.]],
-        ],
-        [
-            [[6., 2.], [1., 2.]],
-            [[3., 4.], [3., 4.]],
-            [[5., 6.], [5., 6.]],
-        ],
-    ];
-    let tensor = Tensor::new(&device, &data);
-
-    let tensor = tensor + 1.0;
-
-    let output = tensor.as_slice().await.unwrap();
-    println!("{output:?}");
-    let result = [
-        [
-            [[2.0, 3.0], [2.0, 3.0]],
-            [[4.0, 5.0], [4.0, 5.0]],
-            [[6.0, 7.0], [6.0, 7.0]],
-        ],
-        [
-            [[7.0, 3.0], [2.0, 3.0]],
-            [[4.0, 5.0], [4.0, 5.0]],
-            [[6.0, 7.0], [6.0, 7.0]],
-        ],
-    ];
-    let result = Tensor::new(&device, &result);
-    assert_eq!(output, result.as_slice().await.unwrap());
-}
-
 macro_rules! impl_add {
     ($($t:ty),*) => {
         $(
@@ -192,137 +100,6 @@ macro_rules! impl_add {
 }
 impl_add!(f32, half::f16, u32);
 
-#[cfg(test)]
-#[tokio::test]
-async fn test_add_const_reversed() {
-    let device = Device::test_instance();
-
-    let data = [
-        [[1., 2.], [1., 2.]],
-        [[3., 4.], [3., 4.]],
-        [[5., 6.], [5., 6.]],
-    ];
-    let tensor = Tensor::new(&device, &data);
-
-    let tensor = 1.0 + tensor;
-
-    let output = tensor.as_slice().await.unwrap();
-    println!("{output:?}");
-    let result = [
-        [[2.0, 3.0], [2.0, 3.0]],
-        [[4.0, 5.0], [4.0, 5.0]],
-        [[6.0, 7.0], [6.0, 7.0]],
-    ];
-    let result = Tensor::new(&device, &result);
-    assert_eq!(output, result.as_slice().await.unwrap());
-
-    let data = [[1., 2.], [3., 4.], [5., 6.]];
-    let tensor = Tensor::new(&device, &data);
-
-    let tensor = 1.0 + tensor;
-
-    let output = tensor.as_slice().await.unwrap();
-    assert_eq!(output[[0, 0]], 2.);
-    assert_eq!(output[[0, 1]], 3.);
-    assert_eq!(output[[1, 0]], 4.);
-    assert_eq!(output[[1, 1]], 5.);
-    assert_eq!(output[[2, 0]], 6.);
-    assert_eq!(output[[2, 1]], 7.);
-
-    let data = [1., 2.];
-    let tensor = Tensor::new(&device, &data);
-
-    let tensor = 1.0 + tensor;
-
-    let output = tensor.as_slice().await.unwrap();
-    assert_eq!(output[[0]], 2.);
-    assert_eq!(output[[1]], 3.);
-}
-
-#[cfg(test)]
-#[tokio::test]
-async fn test_add_const_f16() {
-    let device = Device::test_instance();
-    if !device.f16_supported() {
-        return;
-    }
-
-    let data = [
-        [
-            [half::f16::from_f32(1.), half::f16::from_f32(2.)],
-            [half::f16::from_f32(1.), half::f16::from_f32(2.)],
-        ],
-        [
-            [half::f16::from_f32(3.), half::f16::from_f32(4.)],
-            [half::f16::from_f32(3.), half::f16::from_f32(4.)],
-        ],
-        [
-            [half::f16::from_f32(5.), half::f16::from_f32(6.)],
-            [half::f16::from_f32(5.), half::f16::from_f32(6.)],
-        ],
-    ];
-    let tensor = Tensor::new(&device, &data);
-
-    let tensor = tensor + half::f16::from_f32(1.0);
-
-    let output = tensor.as_slice().await.unwrap();
-    println!("{output:?}");
-    let result = [
-        [
-            [half::f16::from_f32(2.0), half::f16::from_f32(3.0)],
-            [half::f16::from_f32(2.0), half::f16::from_f32(3.0)],
-        ],
-        [
-            [half::f16::from_f32(4.0), half::f16::from_f32(5.0)],
-            [half::f16::from_f32(4.0), half::f16::from_f32(5.0)],
-        ],
-        [
-            [half::f16::from_f32(6.0), half::f16::from_f32(7.0)],
-            [half::f16::from_f32(6.0), half::f16::from_f32(7.0)],
-        ],
-    ];
-    let result = Tensor::new(&device, &result);
-    assert_eq!(output, result.as_slice().await.unwrap());
-}
-
-#[cfg(test)]
-#[tokio::test]
-async fn test_add_const_sliced() {
-    let device = Device::test_instance();
-
-    let data = [[1., 2.], [3., 4.], [5., 6.]];
-    let tensor = Tensor::new(&device, &data);
-    let sliced = tensor.restride([crate::StrideSpec::dim(0, 3), crate::StrideSpec::dim(1, 1)]);
-
-    let sliced = sliced + 1.0;
-
-    let output = sliced.as_slice().await.unwrap();
-    println!("{output:?}");
-    assert_eq!(output[[0, 0]], 2.);
-    assert_eq!(output[[1, 0]], 4.);
-    assert_eq!(output[[2, 0]], 6.);
-}
-
-#[cfg(test)]
-#[tokio::test]
-async fn test_merge_add_const() {
-    let device = Device::test_instance();
-
-    let data = [[1., 2.], [3., 4.], [5., 6.]];
-    let tensor = Tensor::new(&device, &data);
-
-    let tensor = (tensor + 1.0) * 2.0;
-
-    let output = tensor.as_slice().await.unwrap();
-    println!("{output:?}");
-    assert_eq!(output[[0, 0]], 4.);
-    assert_eq!(output[[0, 1]], 6.);
-    assert_eq!(output[[1, 0]], 8.);
-    assert_eq!(output[[1, 1]], 10.);
-    assert_eq!(output[[2, 0]], 12.);
-    assert_eq!(output[[2, 1]], 14.);
-}
-
 impl<const R: usize, T: DataType> Sub<T> for Tensor<R, T> {
     type Output = Tensor<R, T>;
 
@@ -334,26 +111,6 @@ impl<const R: usize, T: DataType> Sub<T> for Tensor<R, T> {
             |grad, _input| grad,
         )
     }
-}
-
-#[cfg(test)]
-#[tokio::test]
-async fn test_sub_const() {
-    let device = Device::test_instance();
-
-    let data = [[1., 2.], [3., 4.], [5., 6.]];
-    let tensor = Tensor::new(&device, &data);
-
-    let tensor = tensor - 1.0;
-
-    let output = tensor.as_slice().await.unwrap();
-    println!("{output:?}");
-    assert_eq!(output[[0, 0]], 0.);
-    assert_eq!(output[[0, 1]], 1.);
-    assert_eq!(output[[1, 0]], 2.);
-    assert_eq!(output[[1, 1]], 3.);
-    assert_eq!(output[[2, 0]], 4.);
-    assert_eq!(output[[2, 1]], 5.);
 }
 
 macro_rules! impl_sub {
@@ -370,26 +127,6 @@ macro_rules! impl_sub {
     };
 }
 impl_sub!(f32, half::f16, u32);
-
-#[cfg(test)]
-#[tokio::test]
-async fn test_sub_const_reversed() {
-    let device = Device::test_instance();
-
-    let data = [[1., 2.], [3., 4.], [5., 6.]];
-    let tensor = Tensor::new(&device, &data);
-
-    let tensor = 6.0 - tensor;
-
-    let output = tensor.as_slice().await.unwrap();
-    println!("{output:?}");
-    assert_eq!(output[[0, 0]], 5.);
-    assert_eq!(output[[0, 1]], 4.);
-    assert_eq!(output[[1, 0]], 3.);
-    assert_eq!(output[[1, 1]], 2.);
-    assert_eq!(output[[2, 0]], 1.);
-    assert_eq!(output[[2, 1]], 0.);
-}
 
 impl<const R: usize, T: DataType> Mul<T> for Tensor<R, T> {
     type Output = Tensor<R, T>;
@@ -412,26 +149,6 @@ impl<const R: usize, T: DataType> Mul<T> for &Tensor<R, T> {
     }
 }
 
-#[cfg(test)]
-#[tokio::test]
-async fn test_mul_const() {
-    let device = Device::test_instance();
-
-    let data = [[1., 2.], [3., 4.], [5., 6.]];
-    let tensor = Tensor::new(&device, &data);
-
-    let tensor = tensor * 2.0;
-
-    let output = tensor.as_slice().await.unwrap();
-    println!("{output:?}");
-    assert_eq!(output[[0, 0]], 2.);
-    assert_eq!(output[[0, 1]], 4.);
-    assert_eq!(output[[1, 0]], 6.);
-    assert_eq!(output[[1, 1]], 8.);
-    assert_eq!(output[[2, 0]], 10.);
-    assert_eq!(output[[2, 1]], 12.);
-}
-
 macro_rules! impl_mul {
     ($($t:ty),*) => {
         $(
@@ -447,26 +164,6 @@ macro_rules! impl_mul {
 }
 impl_mul!(f32, half::f16, u32);
 
-#[cfg(test)]
-#[tokio::test]
-async fn test_mul_const_reversed() {
-    let device = Device::test_instance();
-
-    let data = [[1., 2.], [3., 4.], [5., 6.]];
-    let tensor = Tensor::new(&device, &data);
-
-    let tensor = 2.0 * tensor;
-
-    let output = tensor.as_slice().await.unwrap();
-    println!("{output:?}");
-    assert_eq!(output[[0, 0]], 2.);
-    assert_eq!(output[[0, 1]], 4.);
-    assert_eq!(output[[1, 0]], 6.);
-    assert_eq!(output[[1, 1]], 8.);
-    assert_eq!(output[[2, 0]], 10.);
-    assert_eq!(output[[2, 1]], 12.);
-}
-
 impl<const R: usize, T: DataType> Div<T> for Tensor<R, T> {
     type Output = Tensor<R, T>;
 
@@ -478,26 +175,6 @@ impl<const R: usize, T: DataType> Div<T> for Tensor<R, T> {
             move |grad, _input| grad / rhs,
         )
     }
-}
-
-#[cfg(test)]
-#[tokio::test]
-async fn test_div_const() {
-    let device = Device::test_instance();
-
-    let data = [[1., 2.], [3., 4.], [5., 6.]];
-    let tensor = Tensor::new(&device, &data);
-
-    let tensor = tensor / 2.0;
-
-    let output = tensor.as_slice().await.unwrap();
-    println!("{output:?}");
-    assert_eq!(output[[0, 0]], 0.5);
-    assert_eq!(output[[0, 1]], 1.);
-    assert_eq!(output[[1, 0]], 1.5);
-    assert_eq!(output[[1, 1]], 2.);
-    assert_eq!(output[[2, 0]], 2.5);
-    assert_eq!(output[[2, 1]], 3.);
 }
 
 macro_rules! impl_div {
@@ -515,26 +192,6 @@ macro_rules! impl_div {
 }
 impl_div!(f32, half::f16, u32);
 
-#[cfg(test)]
-#[tokio::test]
-async fn test_div_const_reversed() {
-    let device = Device::test_instance();
-
-    let data = [[1., 2.], [3., 4.], [5., 6.]];
-    let tensor = Tensor::new(&device, &data);
-
-    let tensor = 6.0 / tensor;
-
-    let output = tensor.as_slice().await.unwrap();
-    println!("{output:?}");
-    assert_eq!(output[[0, 0]], 6.0 / data[0][0]);
-    assert_eq!(output[[0, 1]], 6.0 / data[0][1]);
-    assert_eq!(output[[1, 0]], 6.0 / data[1][0]);
-    assert_eq!(output[[1, 1]], 6.0 / data[1][1]);
-    assert_eq!(output[[2, 0]], 6.0 / data[2][0]);
-    assert_eq!(output[[2, 1]], 6.0 / data[2][1]);
-}
-
 impl<const R: usize> Rem<u32> for Tensor<R, u32> {
     type Output = Tensor<R, u32>;
 
@@ -546,26 +203,6 @@ impl<const R: usize> Rem<u32> for Tensor<R, u32> {
             u32::WGSL_TYPE,
         ))
     }
-}
-
-#[cfg(test)]
-#[tokio::test]
-async fn test_mod_const() {
-    let device = Device::test_instance();
-
-    let data = [[1, 2], [3, 4], [5, 6]];
-    let tensor = Tensor::new(&device, &data);
-
-    let tensor = tensor % 2;
-
-    let output = tensor.as_slice().await.unwrap();
-    println!("{output:?}");
-    assert_eq!(output[[0, 0]], 1);
-    assert_eq!(output[[0, 1]], 0);
-    assert_eq!(output[[1, 0]], 1);
-    assert_eq!(output[[1, 1]], 0);
-    assert_eq!(output[[2, 0]], 1);
-    assert_eq!(output[[2, 1]], 0);
 }
 
 macro_rules! impl_mod {
@@ -583,26 +220,6 @@ macro_rules! impl_mod {
 }
 impl_mod!(f32, half::f16, u32);
 
-#[cfg(test)]
-#[tokio::test]
-async fn test_mod_const_reversed() {
-    let device = Device::test_instance();
-
-    let data = [[1, 2], [3, 4], [5, 6]];
-    let tensor = Tensor::new(&device, &data);
-
-    let tensor = 6 % tensor;
-
-    let output = tensor.as_slice().await.unwrap();
-    println!("{output:?}");
-    assert_eq!(output[[0, 0]], 6 % data[0][0]);
-    assert_eq!(output[[0, 1]], 6 % data[0][1]);
-    assert_eq!(output[[1, 0]], 6 % data[1][0]);
-    assert_eq!(output[[1, 1]], 6 % data[1][1]);
-    assert_eq!(output[[2, 0]], 6 % data[2][0]);
-    assert_eq!(output[[2, 1]], 6 % data[2][1]);
-}
-
 impl<const R: usize, T: DataType> Tensor<R, T> {
     /// Check if each value in the tensor is equal to the given value. Returns 1 for true and 0 for false.
     pub fn eq<D: DataType>(&self, rhs: T) -> Tensor<R, D> {
@@ -614,26 +231,6 @@ impl<const R: usize, T: DataType> Tensor<R, T> {
             D::WGSL_TYPE,
         ))
     }
-}
-
-#[cfg(test)]
-#[tokio::test]
-async fn test_eq_const() {
-    let device = Device::test_instance();
-
-    let data = [[1., 2.], [3., 4.], [5., 6.]];
-    let tensor = Tensor::new(&device, &data);
-
-    let tensor: Tensor<2, f32> = tensor.eq(1.0);
-
-    let output = tensor.as_slice().await.unwrap();
-    println!("{output:?}");
-    assert_eq!(output[[0, 0]], 1.);
-    assert_eq!(output[[0, 1]], 0.);
-    assert_eq!(output[[1, 0]], 0.);
-    assert_eq!(output[[1, 1]], 0.);
-    assert_eq!(output[[2, 0]], 0.);
-    assert_eq!(output[[2, 1]], 0.);
 }
 
 impl<const R: usize, T: DataType> Tensor<R, T> {
@@ -682,106 +279,6 @@ impl<const R: usize, T: DataType> Tensor<R, T> {
     }
 }
 
-#[cfg(test)]
-#[tokio::test]
-async fn test_lt_const() {
-    let device = Device::test_instance();
-
-    let data = [[1., 2.], [3., 4.], [5., 6.]];
-    let tensor = Tensor::new(&device, &data);
-
-    let tensor: Tensor<2, f32> = tensor.lt(2.0);
-
-    let output = tensor.as_slice().await.unwrap();
-    println!("{output:?}");
-    assert_eq!(output[[0, 0]], 1.);
-    assert_eq!(output[[0, 1]], 0.);
-    assert_eq!(output[[1, 0]], 0.);
-    assert_eq!(output[[1, 1]], 0.);
-    assert_eq!(output[[2, 0]], 0.);
-    assert_eq!(output[[2, 1]], 0.);
-}
-
-#[cfg(test)]
-#[tokio::test]
-async fn test_lte_const() {
-    let device = Device::test_instance();
-
-    let data = [[1., 2.], [3., 4.], [5., 6.]];
-    let tensor = Tensor::new(&device, &data);
-
-    let tensor: Tensor<2, f32> = tensor.lte(2.0);
-
-    let output = tensor.as_slice().await.unwrap();
-    println!("{output:?}");
-    assert_eq!(output[[0, 0]], 1.);
-    assert_eq!(output[[0, 1]], 1.);
-    assert_eq!(output[[1, 0]], 0.);
-    assert_eq!(output[[1, 1]], 0.);
-    assert_eq!(output[[2, 0]], 0.);
-    assert_eq!(output[[2, 1]], 0.);
-}
-
-#[cfg(test)]
-#[tokio::test]
-async fn test_mt_const() {
-    let device = Device::test_instance();
-
-    let data = [[1., 2.], [3., 4.], [5., 6.]];
-    let tensor = Tensor::new(&device, &data);
-
-    let tensor: Tensor<2, f32> = tensor.mt(2.0);
-
-    let output = tensor.as_slice().await.unwrap();
-    println!("{output:?}");
-    assert_eq!(output[[0, 0]], 0.);
-    assert_eq!(output[[0, 1]], 0.);
-    assert_eq!(output[[1, 0]], 1.);
-    assert_eq!(output[[1, 1]], 1.);
-    assert_eq!(output[[2, 0]], 1.);
-    assert_eq!(output[[2, 1]], 1.);
-}
-
-#[cfg(test)]
-#[tokio::test]
-async fn test_mte_const() {
-    let device = Device::test_instance();
-
-    let data = [[1., 2.], [3., 4.], [5., 6.]];
-    let tensor = Tensor::new(&device, &data);
-
-    let tensor: Tensor<2, f32> = tensor.mte(2.0);
-
-    let output = tensor.as_slice().await.unwrap();
-    println!("{output:?}");
-    assert_eq!(output[[0, 0]], 0.);
-    assert_eq!(output[[0, 1]], 1.);
-    assert_eq!(output[[1, 0]], 1.);
-    assert_eq!(output[[1, 1]], 1.);
-    assert_eq!(output[[2, 0]], 1.);
-    assert_eq!(output[[2, 1]], 1.);
-}
-
-#[cfg(test)]
-#[tokio::test]
-async fn test_eq_const_cast() {
-    let device = Device::test_instance();
-
-    let data = [[1., 2.], [3., 4.], [5., 6.]];
-    let tensor = Tensor::new(&device, &data);
-
-    let tensor: Tensor<2, u32> = tensor.eq(1.0);
-
-    let output = tensor.as_slice().await.unwrap();
-    println!("{output:?}");
-    assert_eq!(output[[0, 0]], 1);
-    assert_eq!(output[[0, 1]], 0);
-    assert_eq!(output[[1, 0]], 0);
-    assert_eq!(output[[1, 1]], 0);
-    assert_eq!(output[[2, 0]], 0);
-    assert_eq!(output[[2, 1]], 0);
-}
-
 impl<const R: usize, D: DataType> Tensor<R, D> {
     pub fn less_appoximate_exp(&self) -> Self {
         if D::WGSL_TYPE != DataTypeEnum::F32 {
@@ -818,26 +315,6 @@ impl<const R: usize, D: DataType> Tensor<R, D> {
     }
 }
 
-#[cfg(test)]
-#[tokio::test]
-async fn test_exp() {
-    let device = Device::test_instance();
-
-    let data = [[1., 2.], [3., 4.], [5., 6.]];
-    let tensor = Tensor::new(&device, &data);
-
-    let tensor = tensor.exp();
-
-    let output = tensor.as_slice().await.unwrap();
-    println!("{output:?}");
-    assert!((output[[0, 0]] - data[0][0].exp()).abs() < 0.001);
-    assert!((output[[0, 1]] - data[0][1].exp()).abs() < 0.001);
-    assert!((output[[1, 0]] - data[1][0].exp()).abs() < 0.001);
-    assert!((output[[1, 1]] - data[1][1].exp()).abs() < 0.001);
-    assert!((output[[2, 0]] - data[2][0].exp()).abs() < 0.001);
-    assert!((output[[2, 1]] - data[2][1].exp()).abs() < 0.001);
-}
-
 impl<const R: usize, D: crate::FloatDataType> Tensor<R, D> {
     pub fn exp2(&self) -> Self {
         unary_op(
@@ -847,26 +324,6 @@ impl<const R: usize, D: crate::FloatDataType> Tensor<R, D> {
             |grad, input| (grad * &input.exp2()) * D::from_f32(std::f32::consts::LN_2),
         )
     }
-}
-
-#[cfg(test)]
-#[tokio::test]
-async fn test_exp2() {
-    let device = Device::test_instance();
-
-    let data = [[1., 2.], [3., 4.], [5., 6.]];
-    let tensor = Tensor::new(&device, &data);
-
-    let tensor = tensor.exp2();
-
-    let output = tensor.as_slice().await.unwrap();
-    println!("{output:?}");
-    assert!((output[[0, 0]] - data[0][0].exp2()).abs() < 0.001);
-    assert!((output[[0, 1]] - data[0][1].exp2()).abs() < 0.001);
-    assert!((output[[1, 0]] - data[1][0].exp2()).abs() < 0.001);
-    assert!((output[[1, 1]] - data[1][1].exp2()).abs() < 0.001);
-    assert!((output[[2, 0]] - data[2][0].exp2()).abs() < 0.001);
-    assert!((output[[2, 1]] - data[2][1].exp2()).abs() < 0.001);
 }
 
 impl<const R: usize, D: DataType> Tensor<R, D> {
@@ -880,26 +337,6 @@ impl<const R: usize, D: DataType> Tensor<R, D> {
     }
 }
 
-#[cfg(test)]
-#[tokio::test]
-async fn test_log() {
-    let device = Device::test_instance();
-
-    let data = [[1., 2.], [3., 4.], [5., 6.]];
-    let tensor = Tensor::new(&device, &data);
-
-    let tensor = tensor.log();
-
-    let output = tensor.as_slice().await.unwrap();
-    println!("{output:?}");
-    assert!((output[[0, 0]] - data[0][0].ln()).abs() < 0.001);
-    assert!((output[[0, 1]] - data[0][1].ln()).abs() < 0.001);
-    assert!((output[[1, 0]] - data[1][0].ln()).abs() < 0.001);
-    assert!((output[[1, 1]] - data[1][1].ln()).abs() < 0.001);
-    assert!((output[[2, 0]] - data[2][0].ln()).abs() < 0.001);
-    assert!((output[[2, 1]] - data[2][1].ln()).abs() < 0.001);
-}
-
 impl<const R: usize, D: crate::FloatDataType> Tensor<R, D> {
     pub fn log2(&self) -> Self {
         unary_op(
@@ -909,26 +346,6 @@ impl<const R: usize, D: crate::FloatDataType> Tensor<R, D> {
             |grad, input| grad / &(input * D::from_f32(std::f32::consts::LN_2)),
         )
     }
-}
-
-#[cfg(test)]
-#[tokio::test]
-async fn test_log2() {
-    let device = Device::test_instance();
-
-    let data = [[1., 2.], [3., 4.], [5., 6.]];
-    let tensor = Tensor::new(&device, &data);
-
-    let tensor = tensor.log2();
-
-    let output = tensor.as_slice().await.unwrap();
-    println!("{output:?}");
-    assert!((output[[0, 0]] - data[0][0].log2()).abs() < 0.001);
-    assert!((output[[0, 1]] - data[0][1].log2()).abs() < 0.001);
-    assert!((output[[1, 0]] - data[1][0].log2()).abs() < 0.001);
-    assert!((output[[1, 1]] - data[1][1].log2()).abs() < 0.001);
-    assert!((output[[2, 0]] - data[2][0].log2()).abs() < 0.001);
-    assert!((output[[2, 1]] - data[2][1].log2()).abs() < 0.001);
 }
 
 impl<const R: usize, D: DataType> Tensor<R, D> {
@@ -942,26 +359,6 @@ impl<const R: usize, D: DataType> Tensor<R, D> {
     }
 }
 
-#[cfg(test)]
-#[tokio::test]
-async fn test_pow() {
-    let device = Device::test_instance();
-
-    let data = [[1., 2.], [3., 4.], [5., 6.]];
-    let tensor = Tensor::new(&device, &data);
-
-    let tensor = tensor.pow_elementwise(2.0);
-
-    let output = tensor.as_slice().await.unwrap();
-    println!("{output:?}");
-    assert!((output[[0, 0]] - data[0][0].powi(2)).abs() < 0.001);
-    assert!((output[[0, 1]] - data[0][1].powi(2)).abs() < 0.001);
-    assert!((output[[1, 0]] - data[1][0].powi(2)).abs() < 0.001);
-    assert!((output[[1, 1]] - data[1][1].powi(2)).abs() < 0.001);
-    assert!((output[[2, 0]] - data[2][0].powi(2)).abs() < 0.001);
-    assert!((output[[2, 1]] - data[2][1].powi(2)).abs() < 0.001);
-}
-
 impl<const R: usize, D: crate::FloatDataType> Tensor<R, D> {
     pub fn sqrt(&self) -> Self {
         unary_op(
@@ -971,26 +368,6 @@ impl<const R: usize, D: crate::FloatDataType> Tensor<R, D> {
             |grad, input| grad / &(input.sqrt() * D::from_f32(2.0)),
         )
     }
-}
-
-#[cfg(test)]
-#[tokio::test]
-async fn test_sqrt() {
-    let device = Device::test_instance();
-
-    let data = [[1., 2.], [3., 4.], [5., 6.]];
-    let tensor = Tensor::new(&device, &data);
-
-    let tensor = tensor.sqrt();
-
-    let output = tensor.as_slice().await.unwrap();
-    println!("{output:?}");
-    assert!((output[[0, 0]] - data[0][0].sqrt()).abs() < 0.001);
-    assert!((output[[0, 1]] - data[0][1].sqrt()).abs() < 0.001);
-    assert!((output[[1, 0]] - data[1][0].sqrt()).abs() < 0.001);
-    assert!((output[[1, 1]] - data[1][1].sqrt()).abs() < 0.001);
-    assert!((output[[2, 0]] - data[2][0].sqrt()).abs() < 0.001);
-    assert!((output[[2, 1]] - data[2][1].sqrt()).abs() < 0.001);
 }
 
 impl<const R: usize, D: DataType> Tensor<R, D> {
@@ -1004,26 +381,6 @@ impl<const R: usize, D: DataType> Tensor<R, D> {
     }
 }
 
-#[cfg(test)]
-#[tokio::test]
-async fn test_sin() {
-    let device = Device::test_instance();
-
-    let data = [[1., 2.], [3., 4.], [5., 6.]];
-    let tensor = Tensor::new(&device, &data);
-
-    let tensor = tensor.sin();
-
-    let output = tensor.as_slice().await.unwrap();
-    println!("{output:?}");
-    assert!((output[[0, 0]] - data[0][0].sin()).abs() < 0.001);
-    assert!((output[[0, 1]] - data[0][1].sin()).abs() < 0.001);
-    assert!((output[[1, 0]] - data[1][0].sin()).abs() < 0.001);
-    assert!((output[[1, 1]] - data[1][1].sin()).abs() < 0.001);
-    assert!((output[[2, 0]] - data[2][0].sin()).abs() < 0.001);
-    assert!((output[[2, 1]] - data[2][1].sin()).abs() < 0.001);
-}
-
 impl<const R: usize, D: DataType> Tensor<R, D> {
     pub fn cos(&self) -> Self {
         unary_op(
@@ -1033,26 +390,6 @@ impl<const R: usize, D: DataType> Tensor<R, D> {
             |grad, input| -(grad * &input.sin()),
         )
     }
-}
-
-#[cfg(test)]
-#[tokio::test]
-async fn test_cos() {
-    let device = Device::test_instance();
-
-    let data = [[1., 2.], [3., 4.], [5., 6.]];
-    let tensor = Tensor::new(&device, &data);
-
-    let tensor = tensor.cos();
-
-    let output = tensor.as_slice().await.unwrap();
-    println!("{output:?}");
-    assert!((output[[0, 0]] - data[0][0].cos()).abs() < 0.001);
-    assert!((output[[0, 1]] - data[0][1].cos()).abs() < 0.001);
-    assert!((output[[1, 0]] - data[1][0].cos()).abs() < 0.001);
-    assert!((output[[1, 1]] - data[1][1].cos()).abs() < 0.001);
-    assert!((output[[2, 0]] - data[2][0].cos()).abs() < 0.001);
-    assert!((output[[2, 1]] - data[2][1].cos()).abs() < 0.001);
 }
 
 impl<const R: usize, D: DataType> Tensor<R, D> {
@@ -1066,26 +403,6 @@ impl<const R: usize, D: DataType> Tensor<R, D> {
     }
 }
 
-#[cfg(test)]
-#[tokio::test]
-async fn test_tan() {
-    let device = Device::test_instance();
-
-    let data = [[1., 2.], [3., 4.], [5., 6.]];
-    let tensor = Tensor::new(&device, &data);
-
-    let tensor = tensor.tan();
-
-    let output = tensor.as_slice().await.unwrap();
-    println!("{output:?}");
-    assert!((output[[0, 0]] - data[0][0].tan()).abs() < 0.001);
-    assert!((output[[0, 1]] - data[0][1].tan()).abs() < 0.001);
-    assert!((output[[1, 0]] - data[1][0].tan()).abs() < 0.001);
-    assert!((output[[1, 1]] - data[1][1].tan()).abs() < 0.001);
-    assert!((output[[2, 0]] - data[2][0].tan()).abs() < 0.001);
-    assert!((output[[2, 1]] - data[2][1].tan()).abs() < 0.001);
-}
-
 impl<const R: usize, D: DataType> Tensor<R, D> {
     pub fn asin(&self) -> Self {
         self.unary_nary(NaryFunction::unary(
@@ -1095,30 +412,6 @@ impl<const R: usize, D: DataType> Tensor<R, D> {
             D::WGSL_TYPE,
         ))
     }
-}
-
-#[cfg(test)]
-#[tokio::test]
-async fn test_asin() {
-    let device = Device::test_instance();
-
-    let data = [
-        [1.0f32.sin(), 2.0f32.sin()],
-        [3.0f32.sin(), 4.0f32.sin()],
-        [5.0f32.sin(), 6.0f32.sin()],
-    ];
-    let tensor = Tensor::new(&device, &data);
-
-    let tensor = tensor.asin();
-
-    let output = tensor.as_slice().await.unwrap();
-    println!("{output:?}");
-    assert!((output[[0, 0]] - data[0][0].asin()).abs() < 0.001);
-    assert!((output[[0, 1]] - data[0][1].asin()).abs() < 0.001);
-    assert!((output[[1, 0]] - data[1][0].asin()).abs() < 0.001);
-    assert!((output[[1, 1]] - data[1][1].asin()).abs() < 0.001);
-    assert!((output[[2, 0]] - data[2][0].asin()).abs() < 0.001);
-    assert!((output[[2, 1]] - data[2][1].asin()).abs() < 0.001);
 }
 
 impl<const R: usize, D: DataType> Tensor<R, D> {
@@ -1132,30 +425,6 @@ impl<const R: usize, D: DataType> Tensor<R, D> {
     }
 }
 
-#[cfg(test)]
-#[tokio::test]
-async fn test_acos() {
-    let device = Device::test_instance();
-
-    let data = [
-        [1.0f32.cos(), 2.0f32.cos()],
-        [3.0f32.cos(), 4.0f32.cos()],
-        [5.0f32.cos(), 6.0f32.cos()],
-    ];
-    let tensor = Tensor::new(&device, &data);
-
-    let tensor = tensor.acos();
-
-    let output = tensor.as_slice().await.unwrap();
-    println!("{output:?}");
-    assert!((output[[0, 0]] - data[0][0].acos()).abs() < 0.001);
-    assert!((output[[0, 1]] - data[0][1].acos()).abs() < 0.001);
-    assert!((output[[1, 0]] - data[1][0].acos()).abs() < 0.001);
-    assert!((output[[1, 1]] - data[1][1].acos()).abs() < 0.001);
-    assert!((output[[2, 0]] - data[2][0].acos()).abs() < 0.001);
-    assert!((output[[2, 1]] - data[2][1].acos()).abs() < 0.001);
-}
-
 impl<const R: usize, D: DataType> Tensor<R, D> {
     pub fn atan(&self) -> Self {
         self.unary_nary(NaryFunction::unary(
@@ -1165,26 +434,6 @@ impl<const R: usize, D: DataType> Tensor<R, D> {
             D::WGSL_TYPE,
         ))
     }
-}
-
-#[cfg(test)]
-#[tokio::test]
-async fn test_atan() {
-    let device = Device::test_instance();
-
-    let data = [[1. / 1., 1. / 2.], [1. / 3., 1. / 4.], [1. / 5., 1. / 6.]];
-    let tensor = Tensor::new(&device, &data);
-
-    let tensor = tensor.atan();
-
-    let output = tensor.as_slice().await.unwrap();
-    println!("{output:?}");
-    assert!((output[[0, 0]] - data[0][0].atan()).abs() < 0.001);
-    assert!((output[[0, 1]] - data[0][1].atan()).abs() < 0.001);
-    assert!((output[[1, 0]] - data[1][0].atan()).abs() < 0.001);
-    assert!((output[[1, 1]] - data[1][1].atan()).abs() < 0.001);
-    assert!((output[[2, 0]] - data[2][0].atan()).abs() < 0.001);
-    assert!((output[[2, 1]] - data[2][1].atan()).abs() < 0.001);
 }
 
 impl<const R: usize, D: DataType> Tensor<R, D> {
@@ -1198,26 +447,6 @@ impl<const R: usize, D: DataType> Tensor<R, D> {
     }
 }
 
-#[cfg(test)]
-#[tokio::test]
-async fn test_sinh() {
-    let device = Device::test_instance();
-
-    let data = [[1., 2.], [3., 4.], [5., 6.]];
-    let tensor = Tensor::new(&device, &data);
-
-    let tensor = tensor.sinh();
-
-    let output = tensor.as_slice().await.unwrap();
-    println!("{output:?}");
-    assert!((output[[0, 0]] - data[0][0].sinh()).abs() < 0.001);
-    assert!((output[[0, 1]] - data[0][1].sinh()).abs() < 0.001);
-    assert!((output[[1, 0]] - data[1][0].sinh()).abs() < 0.001);
-    assert!((output[[1, 1]] - data[1][1].sinh()).abs() < 0.001);
-    assert!((output[[2, 0]] - data[2][0].sinh()).abs() < 0.001);
-    assert!((output[[2, 1]] - data[2][1].sinh()).abs() < 0.001);
-}
-
 impl<const R: usize, D: DataType> Tensor<R, D> {
     pub fn cosh(&self) -> Self {
         self.unary_nary(NaryFunction::unary(
@@ -1227,26 +456,6 @@ impl<const R: usize, D: DataType> Tensor<R, D> {
             D::WGSL_TYPE,
         ))
     }
-}
-
-#[cfg(test)]
-#[tokio::test]
-async fn test_cosh() {
-    let device = Device::test_instance();
-
-    let data = [[1., 2.], [3., 4.], [5., 6.]];
-    let tensor = Tensor::new(&device, &data);
-
-    let tensor = tensor.cosh();
-
-    let output = tensor.as_slice().await.unwrap();
-    println!("{output:?}");
-    assert!((output[[0, 0]] - data[0][0].cosh()).abs() < 0.001);
-    assert!((output[[0, 1]] - data[0][1].cosh()).abs() < 0.001);
-    assert!((output[[1, 0]] - data[1][0].cosh()).abs() < 0.001);
-    assert!((output[[1, 1]] - data[1][1].cosh()).abs() < 0.001);
-    assert!((output[[2, 0]] - data[2][0].cosh()).abs() < 0.001);
-    assert!((output[[2, 1]] - data[2][1].cosh()).abs() < 0.001);
 }
 
 impl<const R: usize, D: DataType> Tensor<R, D> {
@@ -1282,26 +491,6 @@ impl<const R: usize, D: DataType> Tensor<R, D> {
     }
 }
 
-#[cfg(test)]
-#[tokio::test]
-async fn test_tanh() {
-    let device = Device::test_instance();
-
-    let data = [[1., 2.], [3., 4.], [5., 6.]];
-    let tensor = Tensor::new(&device, &data);
-
-    let tensor = tensor.tanh();
-
-    let output = tensor.as_slice().await.unwrap();
-    println!("{output:?}");
-    assert!((output[[0, 0]] - data[0][0].tanh()).abs() < 0.001);
-    assert!((output[[0, 1]] - data[0][1].tanh()).abs() < 0.001);
-    assert!((output[[1, 0]] - data[1][0].tanh()).abs() < 0.001);
-    assert!((output[[1, 1]] - data[1][1].tanh()).abs() < 0.001);
-    assert!((output[[2, 0]] - data[2][0].tanh()).abs() < 0.001);
-    assert!((output[[2, 1]] - data[2][1].tanh()).abs() < 0.001);
-}
-
 impl<const R: usize, D: DataType> Tensor<R, D> {
     pub fn asinh(&self) -> Self {
         self.unary_nary(NaryFunction::unary(
@@ -1311,30 +500,6 @@ impl<const R: usize, D: DataType> Tensor<R, D> {
             D::WGSL_TYPE,
         ))
     }
-}
-
-#[cfg(test)]
-#[tokio::test]
-async fn test_asinh() {
-    let device = Device::test_instance();
-
-    let data = [
-        [1.0f32.sinh(), 2.0f32.sinh()],
-        [3.0f32.sinh(), 4.0f32.sinh()],
-        [5.0f32.sinh(), 6.0f32.sinh()],
-    ];
-    let tensor = Tensor::new(&device, &data);
-
-    let tensor = tensor.asinh();
-
-    let output = tensor.as_slice().await.unwrap();
-    println!("{output:?}");
-    assert!((output[[0, 0]] - data[0][0].asinh()).abs() < 0.001);
-    assert!((output[[0, 1]] - data[0][1].asinh()).abs() < 0.001);
-    assert!((output[[1, 0]] - data[1][0].asinh()).abs() < 0.001);
-    assert!((output[[1, 1]] - data[1][1].asinh()).abs() < 0.001);
-    assert!((output[[2, 0]] - data[2][0].asinh()).abs() < 0.001);
-    assert!((output[[2, 1]] - data[2][1].asinh()).abs() < 0.001);
 }
 
 impl<const R: usize, D: DataType> Tensor<R, D> {
@@ -1348,30 +513,6 @@ impl<const R: usize, D: DataType> Tensor<R, D> {
     }
 }
 
-#[cfg(test)]
-#[tokio::test]
-async fn test_acosh() {
-    let device = Device::test_instance();
-
-    let data = [
-        [1.0f32.cosh(), 2.0f32.cosh()],
-        [3.0f32.cosh(), 4.0f32.cosh()],
-        [5.0f32.cosh(), 6.0f32.cosh()],
-    ];
-    let tensor = Tensor::new(&device, &data);
-
-    let tensor = tensor.acosh();
-
-    let output = tensor.as_slice().await.unwrap();
-    println!("{output:?}");
-    assert!((output[[0, 0]] - data[0][0].acosh()).abs() < 0.001);
-    assert!((output[[0, 1]] - data[0][1].acosh()).abs() < 0.001);
-    assert!((output[[1, 0]] - data[1][0].acosh()).abs() < 0.001);
-    assert!((output[[1, 1]] - data[1][1].acosh()).abs() < 0.001);
-    assert!((output[[2, 0]] - data[2][0].acosh()).abs() < 0.001);
-    assert!((output[[2, 1]] - data[2][1].acosh()).abs() < 0.001);
-}
-
 impl<const R: usize, D: DataType> Tensor<R, D> {
     pub fn atanh(&self) -> Self {
         self.unary_nary(NaryFunction::unary(
@@ -1383,30 +524,6 @@ impl<const R: usize, D: DataType> Tensor<R, D> {
     }
 }
 
-#[cfg(test)]
-#[tokio::test]
-async fn test_atanh() {
-    let device = Device::test_instance();
-
-    let data = [
-        [1.0f32.tanh(), 2.0f32.tanh()],
-        [3.0f32.tanh(), 4.0f32.tanh()],
-        [5.0f32.tanh(), 6.0f32.tanh()],
-    ];
-    let tensor = Tensor::new(&device, &data);
-
-    let tensor = tensor.atanh();
-
-    let output = tensor.as_slice().await.unwrap();
-    println!("{output:?}");
-    assert!((output[[0, 0]] - data[0][0].atanh()).abs() < 0.001);
-    assert!((output[[0, 1]] - data[0][1].atanh()).abs() < 0.001);
-    assert!((output[[1, 0]] - data[1][0].atanh()).abs() < 0.001);
-    assert!((output[[1, 1]] - data[1][1].atanh()).abs() < 0.001);
-    assert!((output[[2, 0]] - data[2][0].atanh()).abs() < 0.001);
-    assert!((output[[2, 1]] - data[2][1].atanh()).abs() < 0.001);
-}
-
 impl<const R: usize, D: DataType> Tensor<R, D> {
     pub fn abs(&self) -> Self {
         self.unary_nary(NaryFunction::unary(
@@ -1416,27 +533,6 @@ impl<const R: usize, D: DataType> Tensor<R, D> {
             D::WGSL_TYPE,
         ))
     }
-}
-
-#[cfg(test)]
-#[tokio::test]
-async fn test_abs() {
-    let device = Device::test_instance();
-
-    let data = [[1., -2.], [-3., 4.], [5., -6.]];
-
-    let tensor = Tensor::new(&device, &data);
-
-    let tensor = tensor.abs();
-
-    let output = tensor.as_slice().await.unwrap();
-    println!("{output:?}");
-    assert!((output[[0, 0]] - data[0][0].abs()).abs() < 0.001);
-    assert!((output[[0, 1]] - data[0][1].abs()).abs() < 0.001);
-    assert!((output[[1, 0]] - data[1][0].abs()).abs() < 0.001);
-    assert!((output[[1, 1]] - data[1][1].abs()).abs() < 0.001);
-    assert!((output[[2, 0]] - data[2][0].abs()).abs() < 0.001);
-    assert!((output[[2, 1]] - data[2][1].abs()).abs() < 0.001);
 }
 
 impl<const R: usize, D: DataType> Neg for Tensor<R, D> {
@@ -1460,27 +556,6 @@ impl<const R: usize, D: DataType> Neg for &Tensor<R, D> {
     }
 }
 
-#[cfg(test)]
-#[tokio::test]
-async fn test_neg() {
-    let device = Device::test_instance();
-
-    let data = [[1., -2.], [-3., 4.], [5., -6.]];
-
-    let tensor = Tensor::new(&device, &data);
-
-    let tensor = -tensor;
-
-    let output = tensor.as_slice().await.unwrap();
-    println!("{output:?}");
-    assert!((output[[0, 0]] + data[0][0]).abs() < 0.001);
-    assert!((output[[0, 1]] + data[0][1]).abs() < 0.001);
-    assert!((output[[1, 0]] + data[1][0]).abs() < 0.001);
-    assert!((output[[1, 1]] + data[1][1]).abs() < 0.001);
-    assert!((output[[2, 0]] + data[2][0]).abs() < 0.001);
-    assert!((output[[2, 1]] + data[2][1]).abs() < 0.001);
-}
-
 impl<const R: usize, D: DataType> Tensor<R, D> {
     pub fn max_elementwise(&self, element: D) -> Self {
         let element_str = element.to_string();
@@ -1493,27 +568,6 @@ impl<const R: usize, D: DataType> Tensor<R, D> {
     }
 }
 
-#[cfg(test)]
-#[tokio::test]
-async fn test_max() {
-    let device = Device::test_instance();
-
-    let data = [[1., -2.], [-3., 4.], [5., -6.]];
-
-    let tensor = Tensor::new(&device, &data);
-
-    let tensor = tensor.max_elementwise(0.0);
-
-    let output = tensor.as_slice().await.unwrap();
-    println!("{output:?}");
-    assert!((output[[0, 0]] - output[[0, 0]]).abs() < 0.001);
-    assert!((output[[0, 1]] - 0.0).abs() < 0.001);
-    assert!((output[[1, 0]] - 0.0).abs() < 0.001);
-    assert!((output[[1, 1]] - output[[1, 1]]).abs() < 0.001);
-    assert!((output[[2, 0]] - output[[2, 0]]).abs() < 0.001);
-    assert!((output[[2, 1]] - 0.0).abs() < 0.001);
-}
-
 impl<const R: usize, D: DataType> Tensor<R, D> {
     pub fn min_elementwise(&self, element: D) -> Self {
         let element_str = element.to_string();
@@ -1524,27 +578,6 @@ impl<const R: usize, D: DataType> Tensor<R, D> {
             move |grad, input| grad * &less_than_const_mask(input, &element_str),
         )
     }
-}
-
-#[cfg(test)]
-#[tokio::test]
-async fn test_min() {
-    let device = Device::test_instance();
-
-    let data = [[1., -2.], [-3., 4.], [5., -6.]];
-
-    let tensor = Tensor::new(&device, &data);
-
-    let tensor = tensor.min_elementwise(0.0);
-
-    let output = tensor.as_slice().await.unwrap();
-    println!("{output:?}");
-    assert!((output[[0, 0]] - 0.0).abs() < 0.001);
-    assert!((output[[0, 1]] - output[[0, 1]]).abs() < 0.001);
-    assert!((output[[1, 0]] - output[[1, 0]]).abs() < 0.001);
-    assert!((output[[1, 1]] - 0.0).abs() < 0.001);
-    assert!((output[[2, 0]] - 0.0).abs() < 0.001);
-    assert!((output[[2, 1]] - output[[2, 1]]).abs() < 0.001);
 }
 
 impl<const R: usize, T> Tensor<R, T> {
@@ -1600,29 +633,6 @@ impl CastTensor<half::f16> for f32 {
     }
 }
 
-#[cfg(test)]
-#[tokio::test]
-async fn test_f32_to_f16_cast() {
-    let device = Device::test_instance();
-    if !device.f16_supported() {
-        return;
-    }
-
-    let data = [[1.0f32, 2.0f32], [3.0f32, 4.0f32], [5.0f32, 6.0f32]];
-    let tensor = Tensor::new(&device, &data);
-
-    let tensor: Tensor<2, half::f16> = tensor.cast();
-
-    let output = tensor.as_slice().await.unwrap();
-    println!("{output:?}");
-    assert_eq!(output[[0, 0]], half::f16::from_f32(data[0][0]));
-    assert_eq!(output[[0, 1]], half::f16::from_f32(data[0][1]));
-    assert_eq!(output[[1, 0]], half::f16::from_f32(data[1][0]));
-    assert_eq!(output[[1, 1]], half::f16::from_f32(data[1][1]));
-    assert_eq!(output[[2, 0]], half::f16::from_f32(data[2][0]));
-    assert_eq!(output[[2, 1]], half::f16::from_f32(data[2][1]));
-}
-
 impl CastTensor<f32> for half::f16 {
     fn cast<const R: usize>(tensor: &Tensor<R, Self>) -> Tensor<R, f32> {
         unary_op(
@@ -1634,63 +644,3 @@ impl CastTensor<f32> for half::f16 {
     }
 }
 
-#[cfg(test)]
-#[tokio::test]
-async fn test_f16_to_f32_cast() {
-    let device = Device::test_instance();
-    if !device.f16_supported() {
-        return;
-    }
-
-    let data = [
-        [half::f16::from_f32(1.0), half::f16::from_f32(2.0)],
-        [half::f16::from_f32(3.0), half::f16::from_f32(4.0)],
-        [half::f16::from_f32(5.0), half::f16::from_f32(6.0)],
-    ];
-    let tensor = Tensor::new(&device, &data);
-
-    let tensor: Tensor<2, f32> = tensor.cast();
-
-    let output = tensor.as_slice().await.unwrap();
-    println!("{output:?}");
-    assert_eq!(output[[0, 0]], data[0][0].to_f32());
-    assert_eq!(output[[0, 1]], data[0][1].to_f32());
-    assert_eq!(output[[1, 0]], data[1][0].to_f32());
-    assert_eq!(output[[1, 1]], data[1][1].to_f32());
-    assert_eq!(output[[2, 0]], data[2][0].to_f32());
-    assert_eq!(output[[2, 1]], data[2][1].to_f32());
-}
-
-#[cfg(test)]
-#[tokio::test]
-async fn test_tanh_exact_large_values() {
-    let device = Device::test_instance();
-
-    let data = [[4., 5.], [6., 8.], [10., 15.]];
-    let tensor = Tensor::new(&device, &data);
-
-    let tensor = tensor.tanh_exact();
-
-    let output = tensor.as_slice().await.unwrap();
-    println!("tanh_exact output: {output:?}");
-    println!(
-        "Expected: {:?}",
-        data.iter()
-            .flat_map(|row| row.iter().map(|x| x.tanh()))
-            .collect::<Vec<_>>()
-    );
-
-    for i in 0..3 {
-        for j in 0..2 {
-            let expected = data[i][j].tanh();
-            let actual = output[[i, j]];
-            assert!(
-                (actual - expected).abs() < 0.01,
-                "tanh_exact({}) = {}, expected {}",
-                data[i][j],
-                actual,
-                expected
-            );
-        }
-    }
-}

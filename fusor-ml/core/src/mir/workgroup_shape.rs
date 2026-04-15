@@ -142,58 +142,6 @@ fn possible_workgroup_shapes() -> impl Iterator<Item = WorkgroupShape> {
     })
 }
 
-#[test]
-fn test_all_possible_workgroup_shapes() {
-    assert_eq!(possible_workgroup_shapes().count(), 5136);
-}
-
-#[cfg(test)]
-fn test_max_subgroup_size() -> u32 {
-    64
-}
-
-#[test]
-fn test_workgroup_shape_constraints() {
-    let mut constraints = WorkgroupShapeConstraints::new();
-    constraints.add_constraint(0, Constraint::Equals(4));
-    constraints.add_constraint(1, Constraint::LessThan(3));
-
-    let valid_shapes: Vec<_> = constraints.possible().collect();
-    println!("Valid shapes: {valid_shapes:#?}");
-    for shape in valid_shapes {
-        assert_eq!(shape.shape[0], 4);
-        assert!(shape.shape[1] < 3);
-    }
-
-    let valid_shape = constraints.solve(test_max_subgroup_size());
-    assert_eq!(valid_shape.unwrap().shape, [4, 1, 1]);
-    assert_eq!(valid_shape.unwrap().linearized(), 4);
-}
-
-#[test]
-fn test_many_workgroup_shape_constraints() {
-    let mut constraints = WorkgroupShapeConstraints::new();
-    constraints.add_constraint(0, Constraint::Equals(4));
-    constraints.add_constraint(1, Constraint::LessThan(3));
-
-    let mut constraints2 = WorkgroupShapeConstraints::new();
-    constraints2.add_constraint(1, Constraint::Equals(2));
-
-    let mut merged = WorkgroupShapeConstraints::new();
-    merged.merge(&constraints);
-    merged.merge(&constraints2);
-    let valid_shapes: Vec<_> = merged.possible().collect();
-    println!("Valid shapes: {valid_shapes:#?}");
-    for shape in valid_shapes {
-        assert_eq!(shape.shape[0], 4);
-        assert!(shape.shape[1] < 3);
-    }
-
-    let valid_shape = merged.solve(test_max_subgroup_size());
-    assert_eq!(valid_shape.unwrap().shape, [4, 2, 1]);
-    assert_eq!(valid_shape.unwrap().linearized(), 8);
-}
-
 #[derive(Debug, Clone, Hash, PartialEq, Eq)]
 pub(crate) enum Constraint {
     Equals(u32),

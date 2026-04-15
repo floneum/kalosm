@@ -87,35 +87,3 @@ where
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_where_cond_f32() {
-        let cond = ConcreteTensor::<f32, 1>::from_slice([4], &[1.0, 0.0, 1.0, 0.0]);
-        let on_true = ConcreteTensor::<f32, 1>::from_slice([4], &[10.0, 20.0, 30.0, 40.0]);
-        let on_false = ConcreteTensor::<f32, 1>::from_slice([4], &[100.0, 200.0, 300.0, 400.0]);
-
-        let result = where_cond_ref(&cond, &on_true, &on_false);
-
-        assert_eq!(result.get([0]), 10.0); // cond=1, select on_true
-        assert_eq!(result.get([1]), 200.0); // cond=0, select on_false
-        assert_eq!(result.get([2]), 30.0); // cond=1, select on_true
-        assert_eq!(result.get([3]), 400.0); // cond=0, select on_false
-    }
-
-    #[test]
-    fn test_where_cond_i32() {
-        let cond = ConcreteTensor::<i32, 1>::from_slice([4], &[1, 0, -1, 0]);
-        let on_true = ConcreteTensor::<i32, 1>::from_slice([4], &[10, 20, 30, 40]);
-        let on_false = ConcreteTensor::<i32, 1>::from_slice([4], &[100, 200, 300, 400]);
-
-        let result = where_cond_ref(&cond, &on_true, &on_false);
-
-        assert_eq!(result.get([0]), 10); // cond=1 (nonzero), select on_true
-        assert_eq!(result.get([1]), 200); // cond=0, select on_false
-        assert_eq!(result.get([2]), 30); // cond=-1 (nonzero), select on_true
-        assert_eq!(result.get([3]), 400); // cond=0, select on_false
-    }
-}

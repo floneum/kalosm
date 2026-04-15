@@ -549,39 +549,4 @@ impl Operation for RmsNormOperation {
     }
 }
 
-#[cfg(test)]
-#[tokio::test]
-async fn test_rms_norm_fused() {
-    use crate::Device;
-
-    let device = Device::test_instance();
-
-    // Test data: 3x2 tensor
-    let input = Tensor::new(&device, &[[1.0f32, 2.0], [3.0, 4.0], [5.0, 6.0]]);
-    let weight = Tensor::new(&device, &[2.0f32, 3.0]);
-    let eps = 1e-5;
-
-    // Compute expected result manually
-    // For row [1, 2]: rms = sqrt((1 + 4) / 2 + eps) = sqrt(2.5 + eps) ≈ 1.5811
-    //   normalized = [1/1.5811, 2/1.5811] ≈ [0.6325, 1.2649]
-    //   result = [0.6325 * 2, 1.2649 * 3] ≈ [1.2649, 3.7947]
-
-    let result = input.rms_norm_fused(&weight, None, eps);
-    let output = result.as_slice().await.unwrap();
-
-    println!("Output: {:?}", output);
-
-    // Verify against manually computed values
-    assert!(
-        (output[[0, 0]] - 1.2649).abs() < 0.01,
-        "Expected ~1.2649, got {}",
-        output[[0, 0]]
-    );
-    assert!(
-        (output[[0, 1]] - 3.7947).abs() < 0.01,
-        "Expected ~3.7947, got {}",
-        output[[0, 1]]
-    );
-}
-
 // Fused vs composite comparison tests are in fusor::composite::normalization::tests

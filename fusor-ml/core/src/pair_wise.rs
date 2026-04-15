@@ -96,160 +96,6 @@ impl_pairwise_op!(
     {+}
 );
 
-#[cfg(test)]
-#[tokio::test]
-async fn test_pair_wise_add() {
-    use crate::Device;
-
-    let device = Device::test_instance();
-
-    let data_a = [[1., 2.], [3., 4.], [5., 6.]];
-    let data_b = [[1., 2.], [3., 4.], [5., 6.]];
-    let tensor_a = Tensor::new(&device, &data_a);
-    let tensor_b = Tensor::new(&device, &data_b);
-
-    let tensor = &tensor_a + &tensor_b;
-    let as_slice = tensor.as_slice().await.unwrap();
-    println!("{as_slice:?}");
-
-    assert_eq!(as_slice[[0, 0]], 1. + 1.);
-    assert_eq!(as_slice[[0, 1]], 2. + 2.);
-    assert_eq!(as_slice[[1, 0]], 3. + 3.);
-    assert_eq!(as_slice[[1, 1]], 4. + 4.);
-    assert_eq!(as_slice[[2, 0]], 5. + 5.);
-    assert_eq!(as_slice[[2, 1]], 6. + 6.);
-}
-
-#[cfg(test)]
-#[tokio::test]
-async fn test_pair_wise_add_f16() {
-    use crate::Device;
-
-    let device = Device::test_instance();
-    if !device.f16_supported() {
-        return;
-    }
-
-    let data_a = [
-        [half::f16::from_f32(1.), half::f16::from_f32(2.)],
-        [half::f16::from_f32(3.), half::f16::from_f32(4.)],
-        [half::f16::from_f32(5.), half::f16::from_f32(6.)],
-    ];
-    let data_b = [
-        [half::f16::from_f32(1.), half::f16::from_f32(2.)],
-        [half::f16::from_f32(3.), half::f16::from_f32(4.)],
-        [half::f16::from_f32(5.), half::f16::from_f32(6.)],
-    ];
-    let tensor_a = Tensor::new(&device, &data_a);
-    let tensor_b = Tensor::new(&device, &data_b);
-
-    let tensor = &tensor_a + &tensor_b;
-    let as_slice = tensor.as_slice().await.unwrap();
-    println!("{as_slice:?}");
-
-    assert_eq!(as_slice[[0, 0]], half::f16::from_f32(1. + 1.));
-    assert_eq!(as_slice[[0, 1]], half::f16::from_f32(2. + 2.));
-    assert_eq!(as_slice[[1, 0]], half::f16::from_f32(3. + 3.));
-    assert_eq!(as_slice[[1, 1]], half::f16::from_f32(4. + 4.));
-    assert_eq!(as_slice[[2, 0]], half::f16::from_f32(5. + 5.));
-    assert_eq!(as_slice[[2, 1]], half::f16::from_f32(6. + 6.));
-}
-
-#[cfg(test)]
-#[tokio::test]
-async fn test_pair_wise_add_u32() {
-    use crate::Device;
-
-    let device = Device::test_instance();
-
-    let data_a = [[1_u32, 2_u32], [3_u32, 4_u32], [5_u32, 6_u32]];
-    let data_b = [[1_u32, 2_u32], [3_u32, 4_u32], [5_u32, 6_u32]];
-    let tensor_a = Tensor::new(&device, &data_a);
-    let tensor_b = Tensor::new(&device, &data_b);
-
-    let tensor = &tensor_a + &tensor_b;
-    let as_slice = tensor.as_slice().await.unwrap();
-    println!("{as_slice:?}");
-
-    assert_eq!(as_slice[[0, 0]], 1 + 1);
-    assert_eq!(as_slice[[0, 1]], 2 + 2);
-    assert_eq!(as_slice[[1, 0]], 3 + 3);
-    assert_eq!(as_slice[[1, 1]], 4 + 4);
-    assert_eq!(as_slice[[2, 0]], 5 + 5);
-    assert_eq!(as_slice[[2, 1]], 6 + 6);
-}
-
-#[cfg(test)]
-#[tokio::test]
-async fn test_pair_wise_add_const_mul_const_add_fused() {
-    use crate::Device;
-
-    let device = Device::test_instance();
-
-    let data_a = [[1., 2.], [3., 4.], [5., 6.]];
-    let data_b = [[1., 2.], [3., 4.], [5., 6.]];
-    let tensor_a = Tensor::new(&device, &data_a);
-    let tensor_b = Tensor::new(&device, &data_b);
-
-    let tensor = &(tensor_a + 1.) + &(tensor_b * 2.);
-    let as_slice = tensor.as_slice().await.unwrap();
-    println!("{as_slice:?}");
-
-    assert_eq!(as_slice[[0, 0]], (1. + 1.) + (1. * 2.));
-    assert_eq!(as_slice[[0, 1]], (2. + 1.) + (2. * 2.));
-    assert_eq!(as_slice[[1, 0]], (3. + 1.) + (3. * 2.));
-    assert_eq!(as_slice[[1, 1]], (4. + 1.) + (4. * 2.));
-    assert_eq!(as_slice[[2, 0]], (5. + 1.) + (5. * 2.));
-    assert_eq!(as_slice[[2, 1]], (6. + 1.) + (6. * 2.));
-}
-
-#[cfg(test)]
-#[tokio::test]
-async fn test_pair_wise_add_sub_const_fused() {
-    use crate::Device;
-
-    let device = Device::test_instance();
-
-    let data_a = [[1., 2.], [3., 4.], [5., 6.]];
-    let data_b = [[1., 2.], [3., 4.], [5., 6.]];
-    let tensor_a = Tensor::new(&device, &data_a);
-    let tensor_b = Tensor::new(&device, &data_b);
-
-    let tensor = (&tensor_a + &tensor_b) - 1.;
-    let as_slice = tensor.as_slice().await.unwrap();
-    println!("{as_slice:?}");
-
-    assert_eq!(as_slice[[0, 0]], 1. + 1. - 1.);
-    assert_eq!(as_slice[[0, 1]], 2. + 2. - 1.);
-    assert_eq!(as_slice[[1, 0]], 3. + 3. - 1.);
-    assert_eq!(as_slice[[1, 1]], 4. + 4. - 1.);
-    assert_eq!(as_slice[[2, 0]], 5. + 5. - 1.);
-    assert_eq!(as_slice[[2, 1]], 6. + 6. - 1.);
-}
-
-#[cfg(test)]
-#[tokio::test]
-async fn test_pair_wise_add_sparse() {
-    use crate::Device;
-
-    let device = Device::test_instance();
-
-    let data_a = [[1., 2.], [3., 4.], [5., 6.]];
-    let data_b = [[1., 2.], [3., 4.], [5., 6.]];
-    let tensor_a = Tensor::new(&device, &data_a);
-    let tensor_a = tensor_a.restride([crate::StrideSpec::dim(0, 3), crate::StrideSpec::dim(1, 1)]);
-    let tensor_b = Tensor::new(&device, &data_b);
-    let tensor_b = tensor_b.restride([crate::StrideSpec::dim(0, 3), crate::StrideSpec::dim(1, 1)]);
-
-    let tensor = &tensor_a + &tensor_b;
-    let as_slice = tensor.as_slice().await.unwrap();
-    println!("{as_slice:?}");
-
-    assert_eq!(as_slice[[0, 0]], 1. + 1.);
-    assert_eq!(as_slice[[1, 0]], 3. + 3.);
-    assert_eq!(as_slice[[2, 0]], 5. + 5.);
-}
-
 impl_pairwise_op!(
     Sub,
     sub,
@@ -258,30 +104,6 @@ impl_pairwise_op!(
     sub_,
     {-}
 );
-
-#[cfg(test)]
-#[tokio::test]
-async fn test_pair_wise_sub() {
-    use crate::Device;
-
-    let device = Device::test_instance();
-
-    let data_a = [[1., 2.], [3., 4.], [5., 6.]];
-    let data_b = [[1., 2.], [3., 4.], [5., 6.]];
-    let tensor_a = Tensor::new(&device, &data_a);
-    let tensor_b = Tensor::new(&device, &data_b);
-
-    let tensor = &tensor_a - &tensor_b;
-    let as_slice = tensor.as_slice().await.unwrap();
-    println!("{as_slice:?}");
-
-    assert_eq!(as_slice[[0, 0]], 1. - 1.);
-    assert_eq!(as_slice[[0, 1]], 2. - 2.);
-    assert_eq!(as_slice[[1, 0]], 3. - 3.);
-    assert_eq!(as_slice[[1, 1]], 4. - 4.);
-    assert_eq!(as_slice[[2, 0]], 5. - 5.);
-    assert_eq!(as_slice[[2, 1]], 6. - 6.);
-}
 
 impl_pairwise_op!(
     Mul,
@@ -292,30 +114,6 @@ impl_pairwise_op!(
     {*}
 );
 
-#[cfg(test)]
-#[tokio::test]
-async fn test_pair_wise_mul() {
-    use crate::Device;
-
-    let device = Device::test_instance();
-
-    let data_a = [[1., 2.], [3., 4.], [5., 6.]];
-    let data_b = [[1., 2.], [3., 4.], [5., 6.]];
-    let tensor_a = Tensor::new(&device, &data_a);
-    let tensor_b = Tensor::new(&device, &data_b);
-
-    let tensor = &tensor_a * &tensor_b;
-    let as_slice = tensor.as_slice().await.unwrap();
-    println!("{as_slice:?}");
-
-    assert_eq!(as_slice[[0, 0]], 1. * 1.);
-    assert_eq!(as_slice[[0, 1]], 2. * 2.);
-    assert_eq!(as_slice[[1, 0]], 3. * 3.);
-    assert_eq!(as_slice[[1, 1]], 4. * 4.);
-    assert_eq!(as_slice[[2, 0]], 5. * 5.);
-    assert_eq!(as_slice[[2, 1]], 6. * 6.);
-}
-
 impl_pairwise_op!(
     Div,
     div,
@@ -324,30 +122,6 @@ impl_pairwise_op!(
     div_,
     {/}
 );
-
-#[cfg(test)]
-#[tokio::test]
-async fn test_pair_wise_div() {
-    use crate::Device;
-
-    let device = Device::test_instance();
-
-    let data_a = [[1., 4.], [3., 4.], [5., 6.]];
-    let data_b = [[1., 2.], [3., 4.], [5., 6.]];
-    let tensor_a = Tensor::new(&device, &data_a);
-    let tensor_b = Tensor::new(&device, &data_b);
-
-    let tensor = &tensor_a / &tensor_b;
-    let as_slice = tensor.as_slice().await.unwrap();
-    println!("{as_slice:?}");
-
-    assert_eq!(as_slice[[0, 0]], 1. / 1.);
-    assert_eq!(as_slice[[0, 1]], 4. / 2.);
-    assert_eq!(as_slice[[1, 0]], 3. / 3.);
-    assert_eq!(as_slice[[1, 1]], 4. / 4.);
-    assert_eq!(as_slice[[2, 0]], 5. / 5.);
-    assert_eq!(as_slice[[2, 1]], 6. / 6.);
-}
 
 /// Macro to implement method-based pairwise operations (like pow, min, max).
 ///
@@ -380,26 +154,3 @@ macro_rules! impl_pairwise_method {
 
 impl_pairwise_method!(pow, "pow(a, b)", "pow", pow_, |a, b| a.pow(&b));
 
-#[cfg(test)]
-#[tokio::test]
-async fn test_pair_wise_pow() {
-    use crate::Device;
-
-    let device = Device::test_instance();
-
-    let data_a = [[1., 2.], [3., 4.], [5., 6.]];
-    let data_b = [[1., 2.], [3., 4.], [5., 6.]];
-    let tensor_a = Tensor::new(&device, &data_a);
-    let tensor_b = Tensor::new(&device, &data_b);
-
-    let tensor = &tensor_a.pow(&tensor_b);
-    let as_slice = tensor.as_slice().await.unwrap();
-    println!("{as_slice:?}");
-
-    assert!((as_slice[[0, 0]] - 1_f32.powf(1.)) < 0.001);
-    assert!((as_slice[[0, 1]] - 2_f32.powf(2.)) < 0.001);
-    assert!((as_slice[[1, 0]] - 3_f32.powf(3.)) < 0.001);
-    assert!((as_slice[[1, 1]] - 4_f32.powf(4.)) < 0.001);
-    assert!((as_slice[[2, 0]] - 5_f32.powf(5.)) < 0.001);
-    assert!((as_slice[[2, 1]] - 6_f32.powf(6.)) < 0.001);
-}

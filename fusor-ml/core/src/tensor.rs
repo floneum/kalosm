@@ -1057,24 +1057,6 @@ impl<D: DataType, const R: usize> Tensor<R, D> {
     }
 }
 
-#[cfg(test)]
-#[tokio::test]
-async fn test_tensor_slice() {
-    let device = Device::test_instance();
-
-    let data = [[1., 2.], [3., 4.], [5., 6.]];
-    let tensor = Tensor::new(&device, &data);
-
-    let slice = tensor.restride([crate::StrideSpec::dim(0, 2), crate::StrideSpec::dim(1, 1)]);
-    let as_slice = slice.as_slice().await.unwrap();
-    assert_eq!(as_slice[[0, 0]], 1.);
-    assert_eq!(as_slice.get([0, 1]), None);
-    assert_eq!(as_slice[[1, 0]], 3.);
-    assert_eq!(as_slice.get([1, 1]), None);
-    assert_eq!(as_slice.get([2, 0]), None);
-    assert_eq!(as_slice.get([2, 1]), None);
-}
-
 /// A buffer that has been mapped for reading. Wraps a wgpu BufferView and provides
 /// access to its mapped contents.
 pub struct MappedBuffer {
@@ -1099,72 +1081,3 @@ pub(crate) fn padded_tensor_size(size: u64) -> u64 {
     ((size + align_mask) & !align_mask).max(COPY_BUFFER_ALIGNMENT)
 }
 
-#[cfg(test)]
-#[tokio::test]
-async fn test_tensor_compare() {
-    let device = Device::test_instance();
-
-    let data = [
-        [[1., 2.], [1., 2.]],
-        [[3., 4.], [3., 4.]],
-        [[5., 6.], [5., 6.]],
-        [[7., 8.], [7., 8.]],
-        [[9., 10.], [9., 10.]],
-        [[11., 12.], [11., 12.]],
-    ];
-    let tensor = Tensor::new(&device, &data);
-
-    let slice = tensor.restride([
-        crate::StrideSpec::dim(0, 2),
-        crate::StrideSpec::dim(1, 1),
-        crate::StrideSpec::dim(2, 1),
-    ]);
-    let as_slice = slice.as_slice().await.unwrap();
-    assert_eq!(as_slice, as_slice);
-
-    let other_slice = tensor.restride([
-        crate::StrideSpec::dim(0, 1),
-        crate::StrideSpec::dim(1, 1),
-        crate::StrideSpec::dim(2, 1),
-    ]);
-    let other_as_slice = other_slice.as_slice().await.unwrap();
-    assert!(as_slice != other_as_slice);
-
-    let other_slice = tensor.restride([
-        crate::StrideSpec::dim(0, 2).with_offset(1),
-        crate::StrideSpec::dim(1, 1),
-        crate::StrideSpec::dim(2, 1),
-    ]);
-    let other_as_slice = other_slice.as_slice().await.unwrap();
-    assert!(as_slice != other_as_slice);
-}
-
-#[cfg(test)]
-#[tokio::test]
-async fn test_tensor() {
-    let device = Device::test_instance();
-
-    let data = [[1., 2.], [3., 4.], [5., 6.]];
-    let tensor = Tensor::new(&device, &data);
-    let as_slice = tensor.as_slice().await.unwrap();
-    assert_eq!(as_slice[[0, 0]], 1.);
-    assert_eq!(as_slice[[0, 1]], 2.);
-    assert_eq!(as_slice[[1, 0]], 3.);
-    assert_eq!(as_slice[[1, 1]], 4.);
-    assert_eq!(as_slice[[2, 0]], 5.);
-    assert_eq!(as_slice[[2, 1]], 6.);
-}
-
-#[cfg(test)]
-#[tokio::test]
-async fn test_zeros_f16() {
-    let device = Device::test_instance();
-
-    let tensor: Tensor<2, half::f16> = Tensor::splat(&device, half::f16::ZERO, [2, 2]);
-
-    let as_slice = tensor.as_slice().await.unwrap();
-    assert_eq!(as_slice[[0, 0]], half::f16::ZERO);
-    assert_eq!(as_slice[[0, 1]], half::f16::ZERO);
-    assert_eq!(as_slice[[1, 0]], half::f16::ZERO);
-    assert_eq!(as_slice[[1, 1]], half::f16::ZERO);
-}

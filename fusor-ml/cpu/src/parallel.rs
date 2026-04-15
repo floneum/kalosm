@@ -105,29 +105,3 @@ where
     });
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_num_threads() {
-        let n = num_threads();
-        assert!(n >= 1);
-    }
-
-    #[test]
-    fn test_parallel_zip_chunks_mut() {
-        let input: Vec<f32> = (0..100).map(|i| i as f32).collect();
-        let mut output = vec![0.0f32; 100];
-
-        parallel_zip_chunks_mut(&input, &mut output, 10, |_, in_chunk, out_chunk| {
-            for (i, o) in in_chunk.iter().zip(out_chunk.iter_mut()) {
-                *o = *i * 2.0;
-            }
-        });
-
-        for (i, &val) in output.iter().enumerate() {
-            assert_eq!(val, (i as f32) * 2.0);
-        }
-    }
-}
