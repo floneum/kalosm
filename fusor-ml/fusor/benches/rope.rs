@@ -3,7 +3,7 @@ use std::time::Duration;
 
 use candle_core::backend::BackendDevice;
 use criterion::BatchSize;
-use fusor_core::{Device, Tensor};
+use fusor::{Device, Tensor};
 use futures::executor::block_on;
 
 use criterion::BenchmarkId;
@@ -13,7 +13,6 @@ use criterion::{criterion_group, criterion_main};
 use criterion::async_executor::FuturesExecutor;
 
 // Sizes: [batch_size, num_heads, seq_len, head_dim]
-// Testing various common configurations
 const SIZES: [[usize; 4]; 8] = [
     [1, 32, 128, 64],  // Small sequence
     [1, 32, 512, 64],  // Medium sequence
@@ -33,36 +32,28 @@ async fn setup_fusor_tensors(
     head_dim: usize,
 ) -> (Tensor<4, f32>, Tensor<2, f32>, Tensor<2, f32>) {
     let pos_shape = [seq_len * 2, head_dim / 2];
-    let cos_data = (0..pos_shape[0])
-        .map(|i| {
-            (0..pos_shape[1])
-                .map(|j| ((i as f32) / 10000f32.powf((2 * (j / 2)) as f32 / head_dim as f32)).cos())
-                .collect::<Vec<_>>()
-        })
-        .collect::<Vec<_>>();
-    let sin_data = (0..pos_shape[0])
-        .map(|i| {
-            (0..pos_shape[1])
-                .map(|j| ((i as f32) / 10000f32.powf((2 * (j / 2)) as f32 / head_dim as f32)).sin())
-                .collect::<Vec<_>>()
-        })
-        .collect::<Vec<_>>();
-
-    let cos = Tensor::new(device, &cos_data);
-    let sin = Tensor::new(device, &sin_data);
-
-    let input_data: Vec<Vec<Vec<Vec<f32>>>> = (0..batch)
-        .map(|_| {
-            (0..heads)
-                .map(|_| {
-                    (0..seq_len)
-                        .map(|_| (0..head_dim).map(|_| 1.0f32).collect())
-                        .collect()
-                })
-                .collect()
+    let cos_flat: Vec<f32> = (0..pos_shape[0])
+        .flat_map(|i| {
+            (0..pos_shape[1]).map(move |j| {
+                ((i as f32) / 10000f32.powf((2 * (j / 2)) as f32 / head_dim as f32)).cos()
+            })
         })
         .collect();
-    let input = Tensor::new(device, &input_data);
+    let sin_flat: Vec<f32> = (0..pos_shape[0])
+        .flat_map(|i| {
+            (0..pos_shape[1]).map(move |j| {
+                ((i as f32) / 10000f32.powf((2 * (j / 2)) as f32 / head_dim as f32)).sin()
+            })
+        })
+        .collect();
+
+    let cos: Tensor<2, f32> = Tensor::from_slice(device, [pos_shape[0], pos_shape[1]], &cos_flat);
+    let sin: Tensor<2, f32> = Tensor::from_slice(device, [pos_shape[0], pos_shape[1]], &sin_flat);
+
+    let numel = batch * heads * seq_len * head_dim;
+    let input_flat: Vec<f32> = (0..numel).map(|_| 1.0f32).collect();
+    let input: Tensor<4, f32> =
+        Tensor::from_slice(device, [batch, heads, seq_len, head_dim], &input_flat);
 
     // Ensure materialization
     _ = input.as_slice().await.unwrap();
@@ -73,13 +64,11 @@ async fn setup_fusor_tensors(
 }
 
 fn rope_benchmark(c: &mut Criterion) {
-    let mut group = c.benchmark_group("rope-fusor-wgpu");
-    let device = block_on(Device::new()).unwrap();
+    let mut group = c.benchmark_group("rope-fusor");
 
     for [batch, heads, seq_len, head_dim] in SIZES {
-        let device = device.clone();
-
-        // Original Interleaved
+        // Composite interleaved (CPU or GPU composite path)
+        let device = block_on(async { Device::new().await.unwrap() });
         let device_ref = device.clone();
         group.bench_with_input(
             BenchmarkId::new(
@@ -100,7 +89,7 @@ fn rope_benchmark(c: &mut Criterion) {
                             for _ in 0..iters {
                                 let start = std::time::Instant::now();
                                 let result = input.rope_interleaved(&cos, &sin);
-                                result.materialize().await;
+                                result.as_gpu().unwrap().materialize().await;
                                 sum += start.elapsed();
                             }
                         }
@@ -111,6 +100,7 @@ fn rope_benchmark(c: &mut Criterion) {
         );
 
         // Fused
+        let device = block_on(async { Device::new().await.unwrap() });
         let device_ref = device.clone();
         group.bench_with_input(
             BenchmarkId::new(
@@ -131,7 +121,7 @@ fn rope_benchmark(c: &mut Criterion) {
                             for _ in 0..iters {
                                 let start = std::time::Instant::now();
                                 let result = input.rope_fused(&cos, &sin);
-                                result.materialize().await;
+                                result.as_gpu().unwrap().materialize().await;
                                 sum += start.elapsed();
                             }
                         }
@@ -174,7 +164,6 @@ fn bench_candle_rope(candle_device: candle_core::Device, name: &str, c: &mut Cri
                     {
                         let candle_device = candle_device.clone();
                         move || {
-                            // Create cos and sin tables
                             let pos_shape = [seq_len * 2, head_dim / 2];
                             let cos_data = (0..pos_shape[0])
                                 .map(|i| {
@@ -204,7 +193,6 @@ fn bench_candle_rope(candle_device: candle_core::Device, name: &str, c: &mut Cri
                             let cos = candle_core::Tensor::new(cos_data, &candle_device).unwrap();
                             let sin = candle_core::Tensor::new(sin_data, &candle_device).unwrap();
 
-                            // Create input tensor
                             let input_data: Vec<Vec<Vec<Vec<f32>>>> = (0..batch)
                                 .map(|_| {
                                     (0..heads)

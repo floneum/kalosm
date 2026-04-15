@@ -17,6 +17,14 @@ use criterion::async_executor::FuturesExecutor;
 
 const SIZES: [usize; 3] = [100, 1000, 4000];
 
+fn softmax_slow(tensor: &Tensor<2, f32>) -> Tensor<2, f32> {
+    let max = tensor.max_keepdim::<1>(1);
+    let shifted = tensor - &max;
+    let exp = shifted.exp();
+    let sum = exp.sum_keepdim::<1>(1);
+    &exp / &sum
+}
+
 fn bench_softmax(c: &mut Criterion) {
     {
         let mut group = c.benchmark_group("softmax-slow-wgpu");
@@ -38,7 +46,7 @@ fn bench_softmax(c: &mut Criterion) {
                             for _ in 0..iters {
                                 let tensor = Tensor::new(&device, &random_data);
                                 _ = tensor.as_slice().await.unwrap();
-                                let new = tensor.softmax_slow_last_dim();
+                                let new = softmax_slow(&tensor);
                                 let start = std::time::Instant::now();
                                 new.materialize().await;
                                 sum += start.elapsed();

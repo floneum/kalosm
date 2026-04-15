@@ -120,6 +120,8 @@ pub(crate) fn q_8_0_sgemv(
         writeln!(kernel, "var block_offset = row_block_offset + i;").unwrap();
         for offset in 0..Q_8_0_SGEMV_CHUNK_SIZE {
             writeln!(kernel, "{{").unwrap();
+            writeln!(kernel, "let output_index = row + {offset}u;").unwrap();
+            writeln!(kernel, "if output_index < {n_size} {{").unwrap();
 
             writeln!(kernel, "var local_sum = {dtype}();").unwrap();
             for data_offset in 0..(STEP_SIZE / 4) {
@@ -138,6 +140,7 @@ pub(crate) fn q_8_0_sgemv(
             )
             .unwrap();
 
+            writeln!(kernel, "}}").unwrap();
             writeln!(kernel, "block_offset += k_block_size;").unwrap();
             writeln!(kernel, "}}").unwrap();
         }
@@ -156,13 +159,17 @@ pub(crate) fn q_8_0_sgemv(
 
     for offset in 0..Q_8_0_SGEMV_CHUNK_SIZE {
         writeln!(kernel, "{{").unwrap();
+        writeln!(kernel, "let output_index = row + {offset}u;").unwrap();
 
         // If this is not the first simd thread in the workgroup, we can return early
-        writeln!(kernel, "if {subgroup_local_index} == 0u {{").unwrap();
+        writeln!(
+            kernel,
+            "if output_index < {n_size} && {subgroup_local_index} == 0u {{"
+        )
+        .unwrap();
         {
             // Write the output to the output tensor if this is the first thread in the workgroup
             write!(kernel, "{output}[").unwrap();
-            let index = format!("row + {offset}");
             let mut output_indices = Vec::new();
             // Add batch indices first
             for dim in (0..output.rank()).rev().skip(2) {
@@ -170,7 +177,7 @@ pub(crate) fn q_8_0_sgemv(
             }
             // Then add M and N indices
             output_indices.push("m_idx".to_string());
-            output_indices.push(index);
+            output_indices.push("output_index".to_string());
             output.strided_index(kernel, output_indices);
             let indexed = maybe_vec_storage_index(Q_8_0_SGEMV_CHUNK_SIZE, "sum", offset);
             writeln!(kernel, "] = {indexed};").unwrap();

@@ -283,7 +283,7 @@ impl<const R: usize, T: crate::DataType> Tensor<R, T> {
             if i == 0 {
                 self.shape()[..=FROM_START].iter().product()
             } else {
-                self.shape()[i - FROM_START]
+                self.shape()[i + FROM_START]
             }
         });
         self.reshape(new_shape)

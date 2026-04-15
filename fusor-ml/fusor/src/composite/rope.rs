@@ -62,18 +62,9 @@ where
         let sin: Tensor<4, D, _> = sin_unsqueezed.unsqueeze(0);
 
         let rotated = rotate_half(self);
-        self.dispatch_quad(
-            &cos,
-            &sin,
-            &rotated,
-            |s, c, sn, r| {
-                // Use broadcasting mul_ and add_
-                let sc = s.as_ref().mul_(c.as_ref());
-                let rsn = r.as_ref().mul_(sn.as_ref());
-                sc.add_(rsn)
-            },
-            |s, c, sn, r| s.mul_(c) + r.mul_(sn),
-        )
+        let sc: Tensor<4, D> = self.mul_(&cos);
+        let rsn: Tensor<4, D> = rotated.mul_(&sin);
+        sc.add_(&rsn)
     }
 
     /// Apply interleaved rotary position embedding.
@@ -105,30 +96,13 @@ where
         let x0 = x.narrow(4, 0, 1);
         let x1 = x.narrow(4, 1, 1);
 
-        let y0 = x0.dispatch_quad(
-            &cos,
-            &x1,
-            &sin,
-            |a, c, b, s| {
-                // Use broadcasting mul_ and sub_
-                let ac = a.as_ref().mul_(c.as_ref());
-                let bs = b.as_ref().mul_(s.as_ref());
-                ac.sub_(bs)
-            },
-            |a, c, b, s| &a.mul_(c) - &b.mul_(s),
-        );
-        let y1 = x0.dispatch_quad(
-            &sin,
-            &x1,
-            &cos,
-            |a, s, b, c| {
-                // Use broadcasting mul_ and add_
-                let as_ = a.as_ref().mul_(s.as_ref());
-                let bc = b.as_ref().mul_(c.as_ref());
-                as_.add_(bc)
-            },
-            |a, s, b, c| &a.mul_(s) + &b.mul_(c),
-        );
+        let ac: Tensor<5, D> = x0.mul_(&cos);
+        let bs: Tensor<5, D> = x1.mul_(&sin);
+        let y0: Tensor<5, D> = ac.sub_(&bs);
+
+        let as_: Tensor<5, D> = x0.mul_(&sin);
+        let bc: Tensor<5, D> = x1.mul_(&cos);
+        let y1: Tensor<5, D> = as_.add_(&bc);
 
         crate::cat([y0, y1], 4).flatten_last_n::<1, 4>()
     }
@@ -142,13 +116,20 @@ where
         cos: &Tensor<2, D, ConcreteTensor<D, 2>>,
         sin: &Tensor<2, D, ConcreteTensor<D, 2>>,
     ) -> Self {
-        match (self, cos, sin) {
+        let sequence_length = self.shape()[2];
+        let cos_narrow: Tensor<2, D, ConcreteTensor<D, 2>> =
+            cos.narrow(0, 0, sequence_length).to_concrete();
+        let sin_narrow: Tensor<2, D, ConcreteTensor<D, 2>> =
+            sin.narrow(0, 0, sequence_length).to_concrete();
+        match (self, &cos_narrow, &sin_narrow) {
             // GPU path - use the optimized fused kernel
             (Tensor::Gpu(x), Tensor::Gpu(cos), Tensor::Gpu(sin)) => {
                 Tensor::Gpu(x.rope_fused(cos, sin))
             }
             // CPU path - use composite operations
-            (Tensor::Cpu(_), Tensor::Cpu(_), Tensor::Cpu(_)) => self.rope_interleaved(cos, sin),
+            (Tensor::Cpu(_), Tensor::Cpu(_), Tensor::Cpu(_)) => {
+                self.rope_interleaved(&cos_narrow, &sin_narrow)
+            }
             _ => panic!("All tensors must be on the same device"),
         }
     }
@@ -162,13 +143,18 @@ where
         cos: &Tensor<2, D, ConcreteTensor<D, 2>>,
         sin: &Tensor<2, D, ConcreteTensor<D, 2>>,
     ) -> Self {
-        match (self, cos, sin) {
+        let sequence_length = self.shape()[2];
+        let cos_narrow: Tensor<2, D, ConcreteTensor<D, 2>> =
+            cos.narrow(0, 0, sequence_length).to_concrete();
+        let sin_narrow: Tensor<2, D, ConcreteTensor<D, 2>> =
+            sin.narrow(0, 0, sequence_length).to_concrete();
+        match (self, &cos_narrow, &sin_narrow) {
             // GPU path - use the optimized fused kernel
             (Tensor::Gpu(x), Tensor::Gpu(cos), Tensor::Gpu(sin)) => {
                 Tensor::Gpu(x.rope_normal_fused(cos, sin))
             }
             // CPU path - use composite operations
-            (Tensor::Cpu(_), Tensor::Cpu(_), Tensor::Cpu(_)) => self.rope(cos, sin),
+            (Tensor::Cpu(_), Tensor::Cpu(_), Tensor::Cpu(_)) => self.rope(&cos_narrow, &sin_narrow),
             _ => panic!("All tensors must be on the same device"),
         }
     }
@@ -342,6 +328,146 @@ mod tests {
                             s,
                             d,
                             val
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_rope_fused_interleaved_cpu_vs_gpu() {
+        let pos_shape = [11, 32]; // seq_len=11, head_dim/2=32 -> head_dim=64
+        let cos_flat: Vec<f32> = (0..pos_shape[0])
+            .flat_map(|i| {
+                (0..pos_shape[1]).map(move |j| {
+                    ((i as f32) / 10000f32.powf((2 * j) as f32 / (pos_shape[1] * 2) as f32)).cos()
+                })
+            })
+            .collect();
+        let sin_flat: Vec<f32> = (0..pos_shape[0])
+            .flat_map(|i| {
+                (0..pos_shape[1]).map(move |j| {
+                    ((i as f32) / 10000f32.powf((2 * j) as f32 / (pos_shape[1] * 2) as f32)).sin()
+                })
+            })
+            .collect();
+
+        let shape = [1, 3, 11, 64];
+        let data: Vec<f32> = (0..shape.iter().product::<usize>())
+            .map(|k| ((k % 64) as f32).sin())
+            .collect();
+
+        // CPU: composite rope_interleaved
+        let cpu_cos: Tensor<2, f32> = Tensor::Cpu(fusor_cpu::Tensor::from_slice(
+            [pos_shape[0], pos_shape[1]],
+            &cos_flat,
+        ));
+        let cpu_sin: Tensor<2, f32> = Tensor::Cpu(fusor_cpu::Tensor::from_slice(
+            [pos_shape[0], pos_shape[1]],
+            &sin_flat,
+        ));
+        let cpu_x: Tensor<4, f32> = Tensor::Cpu(fusor_cpu::Tensor::from_slice(shape, &data));
+        let cpu_result = cpu_x.rope_interleaved(&cpu_cos, &cpu_sin);
+        let cpu_output = cpu_result.as_slice().await.unwrap();
+
+        // GPU: fused kernel via rope_fused
+        let gpu_device = Device::new().await.expect("GPU required for this test");
+        let gpu_cos: Tensor<2, f32> =
+            Tensor::from_slice(&gpu_device, [pos_shape[0], pos_shape[1]], &cos_flat);
+        let gpu_sin: Tensor<2, f32> =
+            Tensor::from_slice(&gpu_device, [pos_shape[0], pos_shape[1]], &sin_flat);
+        let gpu_x: Tensor<4, f32> = Tensor::from_slice(&gpu_device, shape, &data);
+        let gpu_result = gpu_x.rope_fused(&gpu_cos, &gpu_sin);
+        let gpu_output = gpu_result.as_slice().await.unwrap();
+
+        for b in 0..shape[0] {
+            for h in 0..shape[1] {
+                for s in 0..shape[2] {
+                    for d in 0..shape[3] {
+                        let cpu_val = cpu_output[[b, h, s, d]];
+                        let gpu_val = gpu_output[[b, h, s, d]];
+                        let diff = (cpu_val - gpu_val).abs();
+                        assert!(
+                            diff < 1e-4,
+                            "Interleaved fused mismatch at [{},{},{},{}]: cpu {} vs gpu {}, diff {}",
+                            b,
+                            h,
+                            s,
+                            d,
+                            cpu_val,
+                            gpu_val,
+                            diff
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_rope_fused_normal_cpu_vs_gpu() {
+        let pos_shape = [11, 32];
+        let cos_flat: Vec<f32> = (0..pos_shape[0])
+            .flat_map(|i| {
+                (0..pos_shape[1]).map(move |j| {
+                    ((i as f32) / 10000f32.powf((2 * j) as f32 / (pos_shape[1] * 2) as f32)).cos()
+                })
+            })
+            .collect();
+        let sin_flat: Vec<f32> = (0..pos_shape[0])
+            .flat_map(|i| {
+                (0..pos_shape[1]).map(move |j| {
+                    ((i as f32) / 10000f32.powf((2 * j) as f32 / (pos_shape[1] * 2) as f32)).sin()
+                })
+            })
+            .collect();
+
+        let shape = [1, 3, 11, 64];
+        let data: Vec<f32> = (0..shape.iter().product::<usize>())
+            .map(|k| ((k % 64) as f32).sin())
+            .collect();
+
+        // CPU: composite rope
+        let cpu_cos: Tensor<2, f32> = Tensor::Cpu(fusor_cpu::Tensor::from_slice(
+            [pos_shape[0], pos_shape[1]],
+            &cos_flat,
+        ));
+        let cpu_sin: Tensor<2, f32> = Tensor::Cpu(fusor_cpu::Tensor::from_slice(
+            [pos_shape[0], pos_shape[1]],
+            &sin_flat,
+        ));
+        let cpu_x: Tensor<4, f32> = Tensor::Cpu(fusor_cpu::Tensor::from_slice(shape, &data));
+        let cpu_result = cpu_x.rope(&cpu_cos, &cpu_sin);
+        let cpu_output = cpu_result.as_slice().await.unwrap();
+
+        // GPU: fused kernel via rope_normal_fused
+        let gpu_device = Device::new().await.expect("GPU required for this test");
+        let gpu_cos: Tensor<2, f32> =
+            Tensor::from_slice(&gpu_device, [pos_shape[0], pos_shape[1]], &cos_flat);
+        let gpu_sin: Tensor<2, f32> =
+            Tensor::from_slice(&gpu_device, [pos_shape[0], pos_shape[1]], &sin_flat);
+        let gpu_x: Tensor<4, f32> = Tensor::from_slice(&gpu_device, shape, &data);
+        let gpu_result = gpu_x.rope_normal_fused(&gpu_cos, &gpu_sin);
+        let gpu_output = gpu_result.as_slice().await.unwrap();
+
+        for b in 0..shape[0] {
+            for h in 0..shape[1] {
+                for s in 0..shape[2] {
+                    for d in 0..shape[3] {
+                        let cpu_val = cpu_output[[b, h, s, d]];
+                        let gpu_val = gpu_output[[b, h, s, d]];
+                        let diff = (cpu_val - gpu_val).abs();
+                        assert!(
+                            diff < 1e-4,
+                            "Normal fused mismatch at [{},{},{},{}]: cpu {} vs gpu {}, diff {}",
+                            b,
+                            h,
+                            s,
+                            d,
+                            cpu_val,
+                            gpu_val,
+                            diff
                         );
                     }
                 }

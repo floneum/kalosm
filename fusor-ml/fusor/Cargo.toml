@@ -19,3 +19,34 @@ half = "2.4"
 [dev-dependencies]
 tokio = { version = "1.43.0", features = ["full"] }
 half = "2.4"
+criterion = { version = "0.3", features = ["async_futures"] }
+candle-core = { workspace = true }
+candle-nn = { workspace = true }
+candle-transformers = { workspace = true }
+kalosm-common = { workspace = true, features = ["tokio"] }
+kalosm-model-types.workspace = true
+rand.workspace = true
+futures = "0.3.31"
+fusor-core = { path = "../core" }
+fusor-gguf = { path = "../gguf" }
+
+[target.'cfg(target_os = "macos")'.dev-dependencies]
+candle-core = { workspace = true, features = ["metal"] }
+candle-nn = { workspace = true, features = ["metal"] }
+candle-transformers = { workspace = true, features = ["metal"] }
+
+[[bench]]
+name = "bert_layer"
+harness = false
+
+[[bench]]
+name = "linear"
+harness = false
+
+[[bench]]
+name = "rope"
+harness = false
+
+[[bench]]
+name = "attention_comparison"
+harness = false

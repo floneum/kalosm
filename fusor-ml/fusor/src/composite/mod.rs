@@ -21,5 +21,6 @@ mod where_cond;
 
 pub use flash_attention::MaskKind;
 pub use rope::{RopeCache, base_inverse_frequency};
+pub(crate) use shape::broadcast_shapes;
 pub use shape::{arange, arange_step, cat, stack};
-pub use to_vec::{ToVec1, ToVec2, ToVec3};
+pub use to_vec::{ToVec, ToVec1, ToVec2, ToVec3};

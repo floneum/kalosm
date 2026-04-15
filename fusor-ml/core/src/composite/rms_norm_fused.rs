@@ -135,6 +135,7 @@ impl RmsNormOperation {
         // Hidden dimension size and stride
         let reduce_size = kernel.add_integer_input();
         let reduce_stride = kernel.add_integer_input();
+        let output_reduce_stride = kernel.add_integer_input();
         // Epsilon uniform
         let eps_input = kernel.add_float_input();
 
@@ -357,7 +358,7 @@ impl RmsNormOperation {
                 let component = ["result.x", "result.y", "result.z", "result.w"][i];
                 writeln!(
                     kernel,
-                    "{output_tensor}[out_start_offset + (out_index + {i}u) * {reduce_stride}] = {input_dtype}({component});"
+                    "{output_tensor}[out_start_offset + (out_index + {i}u) * {output_reduce_stride}] = {input_dtype}({component});"
                 )
                 .unwrap();
             }
@@ -383,7 +384,7 @@ impl RmsNormOperation {
 
         writeln!(
             kernel,
-            "{output_tensor}[out_start_offset + out_index * {reduce_stride}] = {input_dtype}(result);"
+            "{output_tensor}[out_start_offset + out_index * {output_reduce_stride}] = {input_dtype}(result);"
         )
         .unwrap();
         writeln!(kernel, "out_index += 1u;").unwrap();
@@ -505,6 +506,9 @@ impl Operation for RmsNormOperation {
         inputs.push(MirValue::Integer(
             input_tensor.layout().strides()[hidden_dim] as u32,
         ));
+        inputs.push(MirValue::Integer(
+            shape[hidden_dim + 1..].iter().product::<usize>().max(1) as u32,
+        ));
         // Add epsilon
         inputs.push(MirValue::Float(self.eps));
 
@@ -580,130 +584,4 @@ async fn test_rms_norm_fused() {
     );
 }
 
-#[cfg(test)]
-#[tokio::test]
-async fn test_rms_norm_fused_vs_composite() {
-    use crate::Device;
-
-    let device = Device::test_instance();
-
-    // Test with random-ish data
-    let input = Tensor::new(&device, &[[1.0f32, 2.0, 3.0, 4.0], [5.0, 6.0, 7.0, 8.0]]);
-    let weight = Tensor::new(&device, &[1.0f32, 1.0, 1.0, 1.0]);
-    let eps = 1e-5;
-
-    // Compute using composite implementation
-    let composite_result = input.layer_norm(&weight, None, eps, false);
-    let composite_output = composite_result.as_slice().await.unwrap();
-
-    // Compute using fused implementation
-    let fused_result = input.rms_norm_fused(&weight, None, eps);
-    let fused_output = fused_result.as_slice().await.unwrap();
-
-    println!("Composite: {:?}", composite_output);
-    println!("Fused: {:?}", fused_output);
-
-    // Verify they match
-    for i in 0..2 {
-        for j in 0..4 {
-            assert!(
-                (composite_output[[i, j]] - fused_output[[i, j]]).abs() < 0.001,
-                "Mismatch at [{}, {}]: composite={}, fused={}",
-                i,
-                j,
-                composite_output[[i, j]],
-                fused_output[[i, j]]
-            );
-        }
-    }
-}
-
-#[cfg(test)]
-#[tokio::test]
-async fn test_rms_norm_fused_with_bias() {
-    use crate::Device;
-
-    let device = Device::test_instance();
-
-    let input = Tensor::new(&device, &[[1.0f32, 2.0], [3.0, 4.0]]);
-    let weight = Tensor::new(&device, &[2.0f32, 3.0]);
-    let bias = Tensor::new(&device, &[0.5f32, 0.5]);
-    let eps = 1e-5;
-
-    // Compute using composite implementation
-    let composite_result = input.layer_norm(&weight, Some(&bias), eps, false);
-    let composite_output = composite_result.as_slice().await.unwrap();
-
-    // Compute using fused implementation
-    let fused_result = input.rms_norm_fused(&weight, Some(&bias), eps);
-    let fused_output = fused_result.as_slice().await.unwrap();
-
-    println!("Composite with bias: {:?}", composite_output);
-    println!("Fused with bias: {:?}", fused_output);
-
-    // Verify they match
-    for i in 0..2 {
-        for j in 0..2 {
-            assert!(
-                (composite_output[[i, j]] - fused_output[[i, j]]).abs() < 0.001,
-                "Mismatch at [{}, {}]: composite={}, fused={}",
-                i,
-                j,
-                composite_output[[i, j]],
-                fused_output[[i, j]]
-            );
-        }
-    }
-}
-
-#[cfg(test)]
-#[tokio::test]
-async fn test_rms_norm_fused_large() {
-    use crate::Device;
-
-    let device = Device::test_instance();
-
-    // Test with a larger hidden dimension (512)
-    let hidden_size = 512;
-    let batch_size = 4;
-
-    // Create input as a 2D array
-    let input_data: Vec<Vec<f32>> = (0..batch_size)
-        .map(|b| {
-            (0..hidden_size)
-                .map(|h| (((b * hidden_size + h) % 10) as f32) * 0.1)
-                .collect()
-        })
-        .collect();
-    let weight_data: Vec<f32> = (0..hidden_size).map(|_| 1.0).collect();
-
-    let input: Tensor<2, f32> = Tensor::new(&device, &input_data);
-    let weight: Tensor<1, f32> = Tensor::new(&device, &weight_data);
-    let eps = 1e-5;
-
-    // Compute using composite implementation
-    let composite_result = input.layer_norm(&weight, None, eps, false);
-    let composite_output = composite_result.as_slice().await.unwrap();
-
-    // Compute using fused implementation
-    let fused_result = input.rms_norm_fused(&weight, None, eps);
-    let fused_output = fused_result.as_slice().await.unwrap();
-
-    // Verify they match
-    for i in 0..batch_size {
-        for j in 0..hidden_size {
-            let diff = (composite_output[[i, j]] - fused_output[[i, j]]).abs();
-            assert!(
-                diff < 0.01,
-                "Mismatch at [{}, {}]: composite={}, fused={}, diff={}",
-                i,
-                j,
-                composite_output[[i, j]],
-                fused_output[[i, j]],
-                diff
-            );
-        }
-    }
-
-    println!("Large RMSNorm test passed!");
-}
+// Fused vs composite comparison tests are in fusor::composite::normalization::tests

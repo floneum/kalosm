@@ -217,7 +217,7 @@ async fn test_slice_assign_nonzero_offset() {
     let device = Device::test_instance();
 
     // Create a 3x5 zeros tensor and assign a 2x2 value at offset [1, 3]
-    let zeros: Tensor<2, f32> = Tensor::zeros(&device, [3, 5]);
+    let zeros: Tensor<2, f32> = Tensor::splat(&device, 0.0f32, [3, 5]);
     let value_tensor = Tensor::new(&device, &[[10., 20.], [30., 40.]]);
     let result = zeros.slice_assign([1..3, 3..5], &value_tensor);
     let as_slice = result.as_slice().await.unwrap();

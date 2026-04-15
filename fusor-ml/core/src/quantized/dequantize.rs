@@ -5,8 +5,8 @@ use crate::mir::inputs::MirValue;
 use crate::mir::operation::Operation;
 use crate::mir::workgroup_shape::WorkgroupShapeConstraints;
 use crate::{
-    DataType, DataTypeEnum, Device, ElementWiseFunctions, LazyTensorData, Tensor, TensorData,
-    TensorInfo, mir::kernel::GenericKernel,
+    DataType, DataTypeEnum, Device, LazyTensorData, Tensor, TensorData, TensorInfo,
+    mir::kernel::GenericKernel, nary_wise::UnaryFunctionChain,
 };
 use std::fmt::Write;
 
@@ -16,7 +16,7 @@ use super::{QMatrix, dequantize_block};
 pub(crate) struct DequantizeOperation {
     pub(crate) matrix: QMatrix,
     pub(crate) datatype: DataTypeEnum,
-    pub(crate) post_dequantize: ElementWiseFunctions,
+    pub(crate) post_dequantize: UnaryFunctionChain,
 }
 
 impl DequantizeOperation {
@@ -24,7 +24,7 @@ impl DequantizeOperation {
         DequantizeOperation {
             matrix,
             datatype,
-            post_dequantize: ElementWiseFunctions::empty(datatype),
+            post_dequantize: UnaryFunctionChain::empty(datatype),
         }
     }
 

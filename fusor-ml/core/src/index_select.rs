@@ -1,65 +1,41 @@
-use crate::{DataTypeEnum, Tensor, compute_graph::NodeIndex};
+use crate::{
+    Tensor,
+    nary_wise::{NaryExpr, NaryOperation},
+};
 
-#[derive(Debug, Clone)]
-pub(crate) struct IndexSelectOperation {
-    pub(crate) input: NodeIndex,
-    pub(crate) indexes: NodeIndex,
-    pub(crate) datatype: DataTypeEnum,
-    pub(crate) dimension: usize,
-    pub(crate) value_shape: Box<[usize]>,
-    pub(crate) indexes_shape: Box<[usize]>,
-}
-
-impl IndexSelectOperation {
-    pub fn new(
-        input: NodeIndex,
-        indexes: NodeIndex,
-        datatype: DataTypeEnum,
-        dimension: usize,
-        value_shape: &[usize],
-        indexes_shape: &[usize],
-    ) -> Self {
-        Self {
-            input,
-            indexes,
-            datatype,
-            dimension,
-            value_shape: value_shape.to_vec().into_boxed_slice(),
-            indexes_shape: indexes_shape.to_vec().into_boxed_slice(),
-        }
-    }
-
-    pub(crate) fn rank(&self) -> usize {
-        self.value_shape.len()
-    }
-
-    pub(crate) fn output_shape(&self) -> Box<[usize]> {
-        Self::calc_output_shape(self.dimension, &self.value_shape, &self.indexes_shape)
-    }
-
-    pub(crate) fn calc_output_shape(
-        dimension: usize,
-        value_shape: &[usize],
-        indexes_shape: &[usize],
-    ) -> Box<[usize]> {
-        value_shape
-            .iter()
-            .enumerate()
-            .map(|(i, dim)| {
-                if i == dimension {
-                    indexes_shape[0]
-                } else {
-                    *dim
-                }
-            })
-            .collect()
-    }
+/// Compute the output shape for an index_select operation.
+pub(crate) fn index_select_output_shape(
+    dimension: usize,
+    value_shape: &[usize],
+    indexes_shape: &[usize],
+) -> Box<[usize]> {
+    value_shape
+        .iter()
+        .enumerate()
+        .map(|(i, dim)| {
+            if i == dimension {
+                indexes_shape[0]
+            } else {
+                *dim
+            }
+        })
+        .collect()
 }
 
 impl<const R: usize, T: crate::DataType> Tensor<R, T> {
     pub fn index_select(&self, dimension: usize, indexes: &Tensor<1, u32>) -> Self {
         assert!(dimension < R);
-        self.add_index_select(dimension, indexes)
+        let output_shape = index_select_output_shape(dimension, self.shape(), indexes.shape());
+        let nary = NaryOperation {
+            inputs: vec![self.key(), indexes.key()],
+            expression: NaryExpr::index_select(R, dimension),
+            shape: output_shape.clone(),
+            output_datatype: T::WGSL_TYPE,
+        };
+        let device = self.device().clone();
+        let info = crate::tensor::TensorInfo::new(output_shape, T::WGSL_TYPE);
+        let key = device.compute_graph().create_nary(nary);
+        Self::from_parts(crate::tensor::LazyTensorData::from_parts(device, info, key))
     }
 }
 

@@ -10,7 +10,8 @@ use lru::LruCache;
 use parking_lot::RwLock;
 use rustc_hash::FxBuildHasher;
 use wgpu::{
-    BackendOptions, BindGroupLayout, BufferUsages, Dx12BackendOptions, PipelineLayout, ShaderModule,
+    BackendOptions, BindGroupLayout, BufferUsages, COPY_BUFFER_ALIGNMENT, Dx12BackendOptions,
+    PipelineLayout, ShaderModule,
 };
 
 use crate::compute_graph::ComputeGraph;
@@ -19,6 +20,87 @@ use crate::compute_graph::ComputeGraph;
 struct CachedBuffer {
     writen: bool,
     buffer: Arc<wgpu::Buffer>,
+}
+
+const MAX_FREE_BUFFERS_PER_BUCKET: usize = 4;
+const BIND_GROUP_LAYOUT_CACHE_SIZE: usize = 256;
+const PIPELINE_LAYOUT_CACHE_SIZE: usize = 256;
+const SHADER_MODULE_CACHE_SIZE: usize = 128;
+const COMPUTE_PIPELINE_CACHE_SIZE: usize = 128;
+
+fn padded_copy_size(size: u64) -> u64 {
+    let align_mask = COPY_BUFFER_ALIGNMENT - 1;
+    ((size + align_mask) & !align_mask).max(COPY_BUFFER_ALIGNMENT)
+}
+
+async fn select_adapter(
+    instance: &wgpu::Instance,
+    backends: wgpu::Backends,
+) -> Result<wgpu::Adapter, crate::Error> {
+    let desired_adapter_name = std::env::var("WGPU_ADAPTER_NAME")
+        .ok()
+        .map(|name| name.to_ascii_lowercase());
+
+    let mut adapters = instance.enumerate_adapters(backends).await;
+    if let Some(desired_adapter_name) = desired_adapter_name {
+        return adapters
+            .into_iter()
+            .find(|adapter| {
+                adapter
+                    .get_info()
+                    .name
+                    .to_ascii_lowercase()
+                    .contains(&desired_adapter_name)
+            })
+            .ok_or_else(|| {
+                crate::Error::msg(format!(
+                    "WGPU_ADAPTER_NAME={desired_adapter_name:?} did not match any available adapter"
+                ))
+            });
+    }
+
+    if !adapters.is_empty() {
+        adapters.sort_by_key(|adapter| adapter_preference_rank(adapter));
+        return Ok(adapters.remove(0));
+    }
+
+    let preferred = wgpu::PowerPreference::from_env().unwrap_or_default();
+    let mut last_error = None;
+    for power_preference in [
+        preferred,
+        wgpu::PowerPreference::HighPerformance,
+        wgpu::PowerPreference::LowPower,
+        wgpu::PowerPreference::None,
+    ] {
+        match instance
+            .request_adapter(&wgpu::RequestAdapterOptions {
+                power_preference,
+                force_fallback_adapter: false,
+                compatible_surface: None,
+            })
+            .await
+        {
+            Ok(adapter) => return Ok(adapter),
+            Err(error) => last_error = Some(error),
+        }
+    }
+
+    let detail = last_error
+        .map(|error| error.to_string())
+        .unwrap_or_else(|| "no adapter returned".to_string());
+    Err(crate::Error::msg(format!(
+        "failed to find a suitable GPU adapter: {detail}"
+    )))
+}
+
+fn adapter_preference_rank(adapter: &wgpu::Adapter) -> u8 {
+    match adapter.get_info().device_type {
+        wgpu::DeviceType::DiscreteGpu => 0,
+        wgpu::DeviceType::IntegratedGpu => 1,
+        wgpu::DeviceType::VirtualGpu => 2,
+        wgpu::DeviceType::Other => 3,
+        wgpu::DeviceType::Cpu => 4,
+    }
 }
 
 impl CachedBuffer {
@@ -63,6 +145,21 @@ impl Debug for DeviceInner {
     }
 }
 
+impl Drop for DeviceInner {
+    fn drop(&mut self) {
+        // Flush pipeline cache to disk on shutdown
+        if let (Some(pipeline_cache), Some(cache_file)) =
+            (self.cache.as_ref(), self.cache_file.as_ref())
+        {
+            if let Some(data) = pipeline_cache.get_data() {
+                let temp_file = cache_file.with_extension("temp");
+                let _ = std::fs::write(&temp_file, &data);
+                let _ = std::fs::rename(&temp_file, cache_file);
+            }
+        }
+    }
+}
+
 /// A weak reference to a [`Device`] that does not prevent cleanup.
 ///
 /// Used internally to break reference cycles (e.g., between Device and ComputeGraph).
@@ -99,9 +196,7 @@ impl Device {
             },
             ..Default::default()
         });
-        let adapter = wgpu::util::initialize_adapter_from_env_or_default(&instance, None)
-            .await
-            .expect("Failed to find a suitable GPU adapter");
+        let adapter = select_adapter(&instance, backends).await?;
         let mut required_features = wgpu::Features::empty();
         if adapter.features().contains(wgpu::Features::SUBGROUP) {
             required_features |= wgpu::Features::SUBGROUP;
@@ -109,11 +204,21 @@ impl Device {
         if adapter.features().contains(wgpu::Features::SHADER_F16) {
             required_features |= wgpu::Features::SHADER_F16;
         }
+        let mut experimental_features = wgpu::ExperimentalFeatures::default();
+        if adapter
+            .features()
+            .contains(wgpu::Features::EXPERIMENTAL_COOPERATIVE_MATRIX)
+        {
+            required_features |= wgpu::Features::EXPERIMENTAL_COOPERATIVE_MATRIX;
+            // SAFETY: cooperative matrix is an experimental feature that requires opting in
+            experimental_features = unsafe { wgpu::ExperimentalFeatures::enabled() };
+        }
         let (device, queue) = adapter
             .request_device(&wgpu::DeviceDescriptor {
                 label: Some("Fusor ML Device"),
                 required_features,
                 required_limits: adapter.limits(),
+                experimental_features,
                 ..Default::default()
             })
             .await?;
@@ -138,15 +243,22 @@ impl Device {
             (None, None)
         };
 
-        let cache_size = const { NonZeroUsize::new(2048).unwrap() };
-        let bind_group_layout_cache =
-            RwLock::new(LruCache::with_hasher(cache_size, Default::default()));
-        let pipeline_layout_cache =
-            RwLock::new(LruCache::with_hasher(cache_size, Default::default()));
-        let shader_module_cache =
-            RwLock::new(LruCache::with_hasher(cache_size, Default::default()));
-        let compute_pipeline_cache =
-            RwLock::new(LruCache::with_hasher(cache_size, Default::default()));
+        let bind_group_layout_cache = RwLock::new(LruCache::with_hasher(
+            NonZeroUsize::new(BIND_GROUP_LAYOUT_CACHE_SIZE).unwrap(),
+            Default::default(),
+        ));
+        let pipeline_layout_cache = RwLock::new(LruCache::with_hasher(
+            NonZeroUsize::new(PIPELINE_LAYOUT_CACHE_SIZE).unwrap(),
+            Default::default(),
+        ));
+        let shader_module_cache = RwLock::new(LruCache::with_hasher(
+            NonZeroUsize::new(SHADER_MODULE_CACHE_SIZE).unwrap(),
+            Default::default(),
+        ));
+        let compute_pipeline_cache = RwLock::new(LruCache::with_hasher(
+            NonZeroUsize::new(COMPUTE_PIPELINE_CACHE_SIZE).unwrap(),
+            Default::default(),
+        ));
         let buffer_allocation_cache = RwLock::new(LruCache::with_hasher(
             const { NonZeroUsize::new(128).unwrap() },
             Default::default(),
@@ -207,10 +319,7 @@ impl Device {
         }
     }
 
-    pub(crate) fn create_shader_module<'a>(
-        &self,
-        source: impl Into<Cow<'a, str>>,
-    ) -> wgpu::ShaderModule {
+    pub fn create_shader_module<'a>(&self, source: impl Into<Cow<'a, str>>) -> wgpu::ShaderModule {
         // SAFTEY: All kernels don't access memory outside of bounds and don't have unbounded loops
         unsafe {
             self.inner.device.create_shader_module_trusted(
@@ -247,6 +356,11 @@ impl Device {
         self.features().contains(wgpu::Features::SHADER_F16)
     }
 
+    pub fn cooperative_matrix_supported(&self) -> bool {
+        self.features()
+            .contains(wgpu::Features::EXPERIMENTAL_COOPERATIVE_MATRIX)
+    }
+
     pub fn wgpu_adapter(&self) -> &wgpu::Adapter {
         &self.inner.adapter
     }
@@ -255,17 +369,22 @@ impl Device {
         &self.inner.device
     }
 
-    pub(crate) fn wgpu_queue(&self) -> &wgpu::Queue {
+    pub fn wgpu_queue(&self) -> &wgpu::Queue {
         &self.inner.queue
+    }
+
+    /// Block until all submitted GPU work has completed.
+    pub fn poll_wait(&self) {
+        self.inner
+            .device
+            .poll(wgpu::PollType::wait_indefinitely())
+            .expect("Failed to poll GPU device");
     }
 
     pub(crate) fn wgpu_cache(&self) -> Option<&wgpu::PipelineCache> {
         self.inner.cache.as_ref()
     }
 
-    pub(crate) fn wgpu_cache_file(&self) -> Option<&PathBuf> {
-        self.inner.cache_file.as_ref()
-    }
 
     pub(crate) fn bind_group_layout_cache(
         &self,
@@ -296,9 +415,10 @@ impl Device {
     pub fn reset_initialized_buffers(&self) {
         let mut cache = self.inner.buffer_allocation_cache.write();
         for (_, buffers) in cache.iter_mut() {
-            for buffer in buffers {
+            for buffer in buffers.iter_mut() {
                 buffer.writen = false;
             }
+            prune_cached_buffers(buffers);
         }
     }
 
@@ -349,6 +469,14 @@ impl Device {
                     .write()
                     .get_or_insert_mut((size, usage), Vec::new)
                     .push(CachedBuffer::new(buffer.clone(), to_initilize));
+                if let Some(buffers) = self
+                    .inner
+                    .buffer_allocation_cache
+                    .write()
+                    .get_mut(&(size, usage))
+                {
+                    prune_cached_buffers(buffers);
+                }
                 buffer
             })
     }
@@ -360,8 +488,14 @@ impl Device {
 
     /// Get or create a buffer of the specified size.
     pub fn create_buffer_init(&self, data: &[u8], usage: wgpu::BufferUsages) -> Arc<wgpu::Buffer> {
-        let buffer = self.create_buffer_inner(data.len() as u64, usage, true);
-        self.wgpu_queue().write_buffer(&buffer, 0, data);
+        let padded_len = padded_copy_size(data.len() as u64);
+        let buffer = self.create_buffer_inner(padded_len, usage, true);
+        let mut write = self
+            .wgpu_queue()
+            .write_buffer_with(&buffer, 0, NonZeroU64::new(padded_len).unwrap())
+            .expect("failed to map buffer for writing");
+        write[..data.len()].copy_from_slice(data);
+        write[data.len()..].fill(0);
         buffer
     }
 
@@ -373,10 +507,13 @@ impl Device {
         len: u64,
     ) -> Arc<wgpu::Buffer> {
         let mut iter = data.into_iter();
-        let buffer = self.create_buffer_inner(len, usage, true);
+        let padded_len = padded_copy_size(len);
+        let buffer = self.create_buffer_inner(padded_len, usage, true);
         if let Some(len) = NonZeroU64::new(buffer.size()) {
             if let Some(mut write) = self.wgpu_queue().write_buffer_with(&buffer, 0, len) {
-                write.iter_mut().zip(&mut iter).for_each(|(a, b)| *a = b);
+                for byte in write.iter_mut() {
+                    *byte = iter.next().unwrap_or(0);
+                }
             } else {
                 panic!("Failed to map buffer for writing");
             }
@@ -392,6 +529,31 @@ impl Device {
             .get()
             .expect("compute_graph should be initialized")
     }
+
+    /// Resolve multiple compute-graph nodes in a single pass. All targets share
+    /// one execution graph so intermediate results can be freed as soon as every
+    /// consumer within the batch has been computed. This keeps peak GPU memory
+    /// much lower than resolving targets one-by-one.
+    pub fn resolve_batch(&self, keys: &[crate::compute_graph::NodeIndex]) {
+        self.compute_graph().resolve_batch(keys);
+    }
+}
+
+fn prune_cached_buffers(buffers: &mut Vec<CachedBuffer>) {
+    let mut kept_free_buffers = 0;
+    buffers.retain(|cached| {
+        let is_free = Arc::strong_count(&cached.buffer) == 1;
+        if !is_free {
+            return true;
+        }
+
+        if kept_free_buffers < MAX_FREE_BUFFERS_PER_BUCKET {
+            kept_free_buffers += 1;
+            true
+        } else {
+            false
+        }
+    });
 }
 
 #[cfg(test)]

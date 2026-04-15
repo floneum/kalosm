@@ -7,6 +7,12 @@ use bytemuck::{AnyBitPattern, NoUninit};
 use fusor_core::TensorSlice;
 
 /// Extension trait for TensorSlice to convert to Vec types
+pub trait ToVec {
+    type Output;
+    fn to_vec(&self) -> Self::Output;
+}
+
+/// Extension trait for TensorSlice to convert to Vec types
 pub trait ToVec1<D> {
     fn to_vec1(&self) -> Vec<D>;
 }
@@ -37,6 +43,17 @@ impl<D: NoUninit + AnyBitPattern + Copy, Bytes: Deref<Target = [u8]>> ToVec1<D>
     }
 }
 
+impl<D: NoUninit + AnyBitPattern + Copy, Bytes: Deref<Target = [u8]>> ToVec
+    for TensorSlice<1, D, Bytes>
+{
+    type Output = Vec<D>;
+
+    /// Convert a 1D tensor slice to a `Vec<D>`
+    fn to_vec(&self) -> Self::Output {
+        self.to_vec1()
+    }
+}
+
 impl<D: NoUninit + AnyBitPattern + Copy, Bytes: Deref<Target = [u8]>> ToVec2<D>
     for TensorSlice<2, D, Bytes>
 {
@@ -55,6 +72,17 @@ impl<D: NoUninit + AnyBitPattern + Copy, Bytes: Deref<Target = [u8]>> ToVec2<D>
             result.push(row);
         }
         result
+    }
+}
+
+impl<D: NoUninit + AnyBitPattern + Copy, Bytes: Deref<Target = [u8]>> ToVec
+    for TensorSlice<2, D, Bytes>
+{
+    type Output = Vec<Vec<D>>;
+
+    /// Convert a 2D tensor slice to a `Vec<Vec<D>>`
+    fn to_vec(&self) -> Self::Output {
+        self.to_vec2()
     }
 }
 
@@ -81,6 +109,17 @@ impl<D: NoUninit + AnyBitPattern + Copy, Bytes: Deref<Target = [u8]>> ToVec3<D>
             result.push(layer);
         }
         result
+    }
+}
+
+impl<D: NoUninit + AnyBitPattern + Copy, Bytes: Deref<Target = [u8]>> ToVec
+    for TensorSlice<3, D, Bytes>
+{
+    type Output = Vec<Vec<Vec<D>>>;
+
+    /// Convert a 3D tensor slice to a `Vec<Vec<Vec<D>>>`
+    fn to_vec(&self) -> Self::Output {
+        self.to_vec3()
     }
 }
 

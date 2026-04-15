@@ -3,11 +3,10 @@ use std::time::Duration;
 
 use candle_core::MetalDevice;
 use candle_core::backend::BackendDevice;
-use candle_nn::{Module, VarBuilder};
+use candle_nn::Module;
 use criterion::BatchSize;
-use fusor_core::QMatrix;
-use fusor_core::layers::Linear;
-use fusor_core::{Device, Tensor};
+use fusor::layers::Linear;
+use fusor::{Device, Tensor, VarBuilder};
 use futures::executor::block_on;
 
 use criterion::BenchmarkId;
@@ -20,9 +19,6 @@ use kalosm_model_types::FileSource;
 
 // Benchmark LayerNorm operation
 fn layer_norm(c: &mut Criterion) {
-    use crate::Device;
-    use crate::Tensor;
-
     let source = FileSource::HuggingFace {
         model_id: "CompendiumLabs/bge-large-en-v1.5-gguf".to_string(),
         revision: "main".to_string(),
@@ -41,7 +37,6 @@ fn layer_norm(c: &mut Criterion) {
     for batch_size in [1, 32, 512] {
         for seq_len in [13, 128, 512] {
             if batch_size * seq_len >= 512 * 128 {
-                // Skip too large combinations for LayerNorm
                 continue;
             }
             let hidden_size = 1024;
@@ -56,8 +51,8 @@ fn layer_norm(c: &mut Criterion) {
             // Fusor LayerNorm benchmark
             {
                 let mut reader = std::io::Cursor::new(&bytes);
-                let mut var_builder = fusor_core::VarBuilder::from_gguf(&mut reader).unwrap();
-                let device = block_on(Device::new()).unwrap();
+                let mut var_builder = VarBuilder::from_gguf(&mut reader).unwrap();
+                let device = block_on(async { Device::new().await.unwrap() });
 
                 // Load layer norm weights from the model
                 let weight: Tensor<1, f32> = var_builder
@@ -83,15 +78,30 @@ fn layer_norm(c: &mut Criterion) {
                         let device = device.clone();
                         let random_data = random_data.clone();
                         b.to_async(FuturesExecutor).iter_custom(async |iters| {
-                            let tensor = Tensor::new(&device, &random_data);
-                            tensor.materialize().await;
+                            let tensor: Tensor<3, f32> = Tensor::from_slice(
+                                &device,
+                                [batch_size, seq_len, 1024],
+                                &random_data
+                                    .iter()
+                                    .flat_map(|b| b.iter().flat_map(|s| s.iter().copied()))
+                                    .collect::<Vec<_>>(),
+                            );
+                            tensor.as_gpu().unwrap().materialize().await;
+                            let weight_broadcast = weight.broadcast_as([batch_size, seq_len, 1024]);
+                            let bias_broadcast = bias
+                                .as_ref()
+                                .map(|b| b.broadcast_as([batch_size, seq_len, 1024]));
                             let mut sum = Duration::ZERO;
                             while sum.is_zero() {
                                 for _ in 0..iters {
                                     let start = std::time::Instant::now();
-                                    let normalized =
-                                        tensor.layer_norm(&weight, bias.as_ref(), 1e-12, true);
-                                    normalized.materialize().await;
+                                    let normalized = tensor.layer_norm(
+                                        &weight_broadcast,
+                                        bias_broadcast.as_ref(),
+                                        1e-12,
+                                        true,
+                                    );
+                                    normalized.as_gpu().unwrap().materialize().await;
                                     sum += start.elapsed();
                                 }
                             }
@@ -200,9 +210,6 @@ fn bench_candle_layer_norm(
 
 // Benchmark Self-Attention operation
 fn self_attention(c: &mut Criterion) {
-    use crate::Device;
-    use crate::Tensor;
-
     let source = FileSource::HuggingFace {
         model_id: "CompendiumLabs/bge-large-en-v1.5-gguf".to_string(),
         revision: "main".to_string(),
@@ -238,10 +245,9 @@ fn self_attention(c: &mut Criterion) {
             // Fusor Self-Attention benchmark
             {
                 let mut reader = std::io::Cursor::new(&bytes);
-                let mut var_builder = fusor_core::VarBuilder::from_gguf(&mut reader).unwrap();
-                let device = block_on(Device::new()).unwrap();
+                let mut var_builder = VarBuilder::from_gguf(&mut reader).unwrap();
+                let device = block_on(async { Device::new().await.unwrap() });
 
-                // Load Q, K, V weights from the model
                 let query = Linear::load(&device, &mut var_builder.pp("blk.0.attn_q")).unwrap();
                 let key = Linear::load(&device, &mut var_builder.pp("blk.0.attn_k")).unwrap();
                 let value = Linear::load(&device, &mut var_builder.pp("blk.0.attn_v")).unwrap();
@@ -259,39 +265,40 @@ fn self_attention(c: &mut Criterion) {
                         let random_data = random_data.clone();
 
                         b.to_async(FuturesExecutor).iter_custom(async |iters| {
-                            let tensor = Tensor::new(&device, &random_data);
-                            tensor.materialize().await;
+                            let tensor: Tensor<3, f32> = Tensor::from_slice(
+                                &device,
+                                [batch_size, seq_len, hidden_size],
+                                &random_data
+                                    .iter()
+                                    .flat_map(|b| b.iter().flat_map(|s| s.iter().copied()))
+                                    .collect::<Vec<_>>(),
+                            );
+                            tensor.as_gpu().unwrap().materialize().await;
                             let mut sum = Duration::ZERO;
                             while sum.is_zero() {
                                 for _ in 0..iters {
                                     let start = std::time::Instant::now();
 
-                                    // Q, K, V projections
                                     let q = query.forward(&tensor);
                                     let k = key.forward(&tensor);
                                     let v = value.forward(&tensor);
 
-                                    // Transpose for multi-head attention
-                                    let q = q
-                                        .reshape([batch_size, seq_len, num_heads, head_size])
-                                        .transpose(1, 2);
-                                    let k = k
-                                        .reshape([batch_size, seq_len, num_heads, head_size])
-                                        .transpose(1, 2);
-                                    let v = v
-                                        .reshape([batch_size, seq_len, num_heads, head_size])
-                                        .transpose(1, 2);
+                                    let q = q.reshape([batch_size, seq_len, num_heads, head_size]);
+                                    let q = q.transpose(1, 2);
+                                    let k = k.reshape([batch_size, seq_len, num_heads, head_size]);
+                                    let k = k.transpose(1, 2);
+                                    let v = v.reshape([batch_size, seq_len, num_heads, head_size]);
+                                    let v = v.transpose(1, 2);
 
-                                    // Attention scores
-                                    let scores = q.mat_mul(&k.t()) / (head_size as f32).sqrt();
-                                    let probs = scores.softmax_last_dim();
+                                    let scores =
+                                        q.mat_mul(&k.t()).div_scalar((head_size as f32).sqrt());
+                                    let probs = scores.softmax_last_dim::<3>();
 
-                                    // Context layer
                                     let context = probs.mat_mul(&v);
                                     let context = context.transpose(1, 2);
                                     let output = context.flatten_last_n::<1, _>();
 
-                                    output.materialize().await;
+                                    output.as_gpu().unwrap().materialize().await;
                                     sum += start.elapsed();
                                 }
                             }
@@ -420,12 +427,10 @@ fn bench_candle_self_attention(
                     )
                 },
                 |(tensor, q_linear, k_linear, v_linear, candle_device)| async move {
-                    // Q, K, V projections
                     let q = q_linear.forward(&tensor).unwrap();
                     let k = k_linear.forward(&tensor).unwrap();
                     let v = v_linear.forward(&tensor).unwrap();
 
-                    // Reshape for multi-head attention
                     let q = q
                         .reshape(&[batch_size, seq_len, num_heads, head_size])
                         .unwrap()
@@ -448,14 +453,11 @@ fn bench_candle_self_attention(
                         .contiguous()
                         .unwrap();
 
-                    // Attention scores
-                    // k is [batch, heads, seq, head_dim], transpose to [batch, heads, head_dim, seq]
                     let k_t = k.transpose(2, 3).unwrap().contiguous().unwrap();
                     let scores = q.matmul(&k_t).unwrap();
                     let scores = (scores / (head_size as f64).sqrt()).unwrap();
                     let probs = candle_nn::ops::softmax_last_dim(&scores).unwrap();
 
-                    // Context layer
                     let context = probs.matmul(&v).unwrap();
                     let context = context.transpose(1, 2).unwrap().contiguous().unwrap();
                     let output = context.flatten_from(2).unwrap();
@@ -470,9 +472,6 @@ fn bench_candle_self_attention(
 
 // Benchmark FFN (Feed-Forward Network) block
 fn ffn_block(c: &mut Criterion) {
-    use crate::Device;
-    use crate::Tensor;
-
     let source = FileSource::HuggingFace {
         model_id: "CompendiumLabs/bge-large-en-v1.5-gguf".to_string(),
         revision: "main".to_string(),
@@ -491,11 +490,9 @@ fn ffn_block(c: &mut Criterion) {
     for batch_size in [1, 32, 512] {
         for seq_len in [13, 128] {
             if batch_size * seq_len >= 512 * 128 {
-                // Skip too large combinations for FFN
                 continue;
             }
             let hidden_size = 1024;
-            let intermediate_size = 4096;
 
             let random_data: Vec<Vec<Vec<f32>>> = (0..batch_size)
                 .map(|_| {
@@ -508,10 +505,9 @@ fn ffn_block(c: &mut Criterion) {
             // Fusor FFN benchmark
             {
                 let mut reader = std::io::Cursor::new(&bytes);
-                let mut var_builder = fusor_core::VarBuilder::from_gguf(&mut reader).unwrap();
-                let device = block_on(Device::new()).unwrap();
+                let mut var_builder = VarBuilder::from_gguf(&mut reader).unwrap();
+                let device = block_on(async { Device::new().await.unwrap() });
 
-                // Load FFN weights from the model
                 let ffn_up = Linear::load(&device, &mut var_builder.pp("blk.0.ffn_up")).unwrap();
                 let ffn_down =
                     Linear::load(&device, &mut var_builder.pp("blk.0.ffn_down")).unwrap();
@@ -529,21 +525,26 @@ fn ffn_block(c: &mut Criterion) {
                         let random_data = random_data.clone();
 
                         b.to_async(FuturesExecutor).iter_custom(async |iters| {
-                            let tensor = Tensor::new(&device, &random_data);
-                            tensor.materialize().await;
+                            let tensor: Tensor<3, f32> = Tensor::from_slice(
+                                &device,
+                                [batch_size, seq_len, hidden_size],
+                                &random_data
+                                    .iter()
+                                    .flat_map(|b| b.iter().flat_map(|s| s.iter().copied()))
+                                    .collect::<Vec<_>>(),
+                            );
+                            tensor.as_gpu().unwrap().materialize().await;
                             let mut sum = Duration::ZERO;
                             while sum.is_zero() {
                                 for _ in 0..iters {
                                     let start = std::time::Instant::now();
 
-                                    // Intermediate (up projection + GELU)
                                     let intermediate = ffn_up.forward(&tensor);
                                     let intermediate = intermediate.gelu();
 
-                                    // Output (down projection)
                                     let output = ffn_down.forward(&intermediate);
 
-                                    output.materialize().await;
+                                    output.as_gpu().unwrap().materialize().await;
                                     sum += start.elapsed();
                                 }
                             }
@@ -655,11 +656,9 @@ fn bench_candle_ffn(
                     )
                 },
                 |(tensor, up_linear, down_linear, candle_device)| async move {
-                    // Intermediate (up projection + GELU)
                     let intermediate = up_linear.forward(&tensor).unwrap();
                     let intermediate = intermediate.gelu().unwrap();
 
-                    // Output (down projection)
                     let output = down_linear.forward(&intermediate).unwrap();
 
                     candle_device.synchronize().unwrap();

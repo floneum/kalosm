@@ -3,11 +3,10 @@ use std::time::Duration;
 
 use candle_core::MetalDevice;
 use candle_core::backend::BackendDevice;
-use candle_nn::{Module, VarBuilder};
+use candle_nn::Module;
 use criterion::BatchSize;
-use fusor_core::QMatrix;
-use fusor_core::layers::Linear;
-use fusor_core::{Device, Tensor};
+use fusor::layers::Linear;
+use fusor::{Device, Tensor, VarBuilder};
 use futures::executor::block_on;
 
 use criterion::BenchmarkId;
@@ -19,8 +18,6 @@ use kalosm_common::Cache;
 use kalosm_model_types::FileSource;
 
 fn linear(c: &mut Criterion) {
-    use crate::Device;
-    use crate::Tensor;
     use candle_core::Module;
     use fusor_gguf::GgufMetadata;
 
@@ -47,8 +44,8 @@ fn linear(c: &mut Criterion) {
 
             {
                 let mut reader = std::io::Cursor::new(&bytes);
-                let mut var_builder = fusor_core::VarBuilder::from_gguf(&mut reader).unwrap();
-                let device = block_on(Device::new()).unwrap();
+                let mut var_builder = VarBuilder::from_gguf(&mut reader).unwrap();
+                let device = block_on(async { Device::new().await.unwrap() });
                 let linear = Linear::load(&device, &mut var_builder.pp(name)).unwrap();
                 let quantization = linear.quantization();
 
@@ -63,14 +60,17 @@ fn linear(c: &mut Criterion) {
                         let device = device.clone();
                         let random_data = random_data.clone();
                         b.to_async(FuturesExecutor).iter_custom(async |iters| {
-                            let tensor = Tensor::new(&device, &random_data);
-                            tensor.materialize().await;
+                            let flat_data: Vec<f32> =
+                                random_data.iter().flat_map(|r| r.iter().copied()).collect();
+                            let tensor: Tensor<2, f32> =
+                                Tensor::from_slice(&device, [size, width], &flat_data);
+                            tensor.as_gpu().unwrap().materialize().await;
                             let mut sum = Duration::ZERO;
                             while sum.is_zero() {
                                 for _ in 0..iters {
                                     let start = std::time::Instant::now();
-                                    let new = linear.forward(&tensor.unsqueeze(0));
-                                    new.materialize().await;
+                                    let new = linear.forward(&tensor.unsqueeze::<3>(0));
+                                    new.as_gpu().unwrap().materialize().await;
                                     sum += start.elapsed();
                                 }
                             }
@@ -124,7 +124,6 @@ fn bench_candle_with_device(
     c: &mut Criterion,
 ) {
     use candle_transformers::quantized_nn::{Linear, linear};
-    let mut reader = std::io::Cursor::new(&bytes);
     let var_builder = candle_transformers::quantized_var_builder::VarBuilder::from_gguf_buffer(
         bytes,
         &candle_device,

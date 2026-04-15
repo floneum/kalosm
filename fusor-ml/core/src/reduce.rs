@@ -1,12 +1,13 @@
 use std::fmt::{Display, Write};
 
 use crate::{
-    Dim, ElementWiseFunctions, LastRank, LastRankInner, NextRankInner,
+    Dim, LastRank, LastRankInner, NextRankInner,
     mir::{
         globals::KernelGlobalSpace,
         operation::Operation,
         workgroup_shape::{Constraint, WorkgroupShape, WorkgroupShapeConstraints},
     },
+    nary_wise::UnaryFunctionChain,
     visit_tiled::distribute_workgroups,
 };
 use crate::{
@@ -16,12 +17,32 @@ use crate::{
     tensor::{DataType, DataTypeEnum, TensorData},
 };
 
+/// Unsqueeze a reduced tensor back to its original rank by inserting a size-1 dim.
+/// This is equivalent to `tensor.unsqueeze(dim)` but implemented inline to avoid
+/// depending on the removed composite unsqueeze operation.
+fn unsqueeze_dim<const N: usize, const O: usize, D: DataType>(
+    tensor: &Tensor<O, D>,
+    dim_idx: usize,
+) -> Tensor<N, D> {
+    let old_shape = tensor.shape();
+    let new_shape: [usize; N] = std::array::from_fn(|i| {
+        if i < dim_idx {
+            old_shape[i]
+        } else if i == dim_idx {
+            1
+        } else {
+            old_shape[i - 1]
+        }
+    });
+    tensor.reshape(new_shape)
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct ReduceOperation {
     pub(crate) value: NodeIndex,
-    pub(crate) pre_element_wise: ElementWiseFunctions,
+    pub(crate) pre_element_wise: UnaryFunctionChain,
     pub(crate) function: ReduceFunction,
-    pub(crate) post_element_wise: ElementWiseFunctions,
+    pub(crate) post_element_wise: UnaryFunctionChain,
     pub(crate) axis: usize,
     pub(crate) shape: Box<[usize]>,
 }
@@ -31,9 +52,9 @@ impl ReduceOperation {
         let datatype = function.datatype();
         Self {
             value,
-            pre_element_wise: ElementWiseFunctions::empty(datatype),
+            pre_element_wise: UnaryFunctionChain::empty(datatype),
             function,
-            post_element_wise: ElementWiseFunctions::empty(datatype),
+            post_element_wise: UnaryFunctionChain::empty(datatype),
             axis,
             shape: shape.into(),
         }
@@ -503,7 +524,9 @@ impl<const N: usize, D: DataType> Tensor<N, D> {
         Self: LastRank<O, D>,
         <Self as LastRankInner>::LastRank: NextRankInner<NextRank = Self>,
     {
-        self.sum(dim).unsqueeze(dim)
+        let dim_idx = dim.resolve();
+        let reduced = self.sum(dim);
+        unsqueeze_dim::<N, O, D>(&reduced, dim_idx)
     }
 }
 
@@ -603,7 +626,7 @@ async fn test_reduce_sliced_sum() {
 
     let data = [[1., 2.], [3., 4.], [5., 6.]];
     let tensor = Tensor::new(&device, &data);
-    let tensor = tensor.slice([0..3, 0..1]);
+    let tensor = tensor.restride([crate::StrideSpec::dim(0, 3), crate::StrideSpec::dim(1, 1)]);
 
     let output = tensor.sum(0);
 
@@ -757,7 +780,9 @@ impl<const N: usize, T: DataType> Tensor<N, T> {
         Self: LastRank<O, T>,
         <Self as LastRankInner>::LastRank: NextRankInner<NextRank = Self>,
     {
-        self.max(dim).unsqueeze(dim)
+        let dim_idx = dim.resolve();
+        let reduced = self.max(dim);
+        unsqueeze_dim::<N, O, T>(&reduced, dim_idx)
     }
 }
 
@@ -818,7 +843,9 @@ impl<const N: usize, D: DataType> Tensor<N, D> {
         Self: LastRank<O, D>,
         <Self as LastRankInner>::LastRank: NextRankInner<NextRank = Self>,
     {
-        self.min(dim).unsqueeze(dim)
+        let dim_idx = dim.resolve();
+        let reduced = self.min(dim);
+        unsqueeze_dim::<N, O, D>(&reduced, dim_idx)
     }
 }
 
@@ -881,7 +908,9 @@ impl<const N: usize, D: DataType> Tensor<N, D> {
         Self: LastRank<O, D>,
         <Self as LastRankInner>::LastRank: NextRankInner<NextRank = Self>,
     {
-        self.product(dim).unsqueeze(dim)
+        let dim_idx = dim.resolve();
+        let reduced = self.product(dim);
+        unsqueeze_dim::<N, O, D>(&reduced, dim_idx)
     }
 }
 

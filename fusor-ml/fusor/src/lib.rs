@@ -23,12 +23,12 @@ pub use quantized::{CpuF32Tensor, QMatrix};
 use std::ops::{Deref, Range};
 
 pub use composite::{
-    MaskKind, RopeCache, ToVec1, ToVec2, ToVec3, arange, arange_step, base_inverse_frequency, cat,
-    stack,
+    MaskKind, RopeCache, ToVec, ToVec1, ToVec2, ToVec3, arange, arange_step,
+    base_inverse_frequency, cat, stack,
 };
 pub use device::Device;
 pub use error::Error;
-pub use fusor_types::FromArray;
+pub use fusor_types::{FromArray, Layout};
 
 /// Result type for fusor operations.
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -112,7 +112,7 @@ pub use fusor_core::Tensor as GpuTensor;
 // Re-export from fusor-core for GPU types
 pub use fusor_core::{
     CastTensor, D, DataType, Dim, FloatDataType, GgufReadError, LastRank, LastRankInner, MaxRank,
-    NextRank, NextRankInner, SmallerRank, WasmNotSend, WasmNotSync,
+    NextRank, NextRankInner, NodeIndex, SmallerRank, WasmNotSend, WasmNotSync,
 };
 
 /// Runtime dispatch wrapper - holds either CPU or GPU version of an operation/tensor type.
@@ -388,7 +388,7 @@ where
         }
     }
 
-    pub async fn as_slice(self) -> Result<TensorSlice<R, D, EitherMappedBuffer>, Error>
+    pub async fn as_slice(&self) -> Result<TensorSlice<R, D, EitherMappedBuffer>, Error>
     where
         B: TensorBacking<R>,
         D: fusor_cpu::SimdElement + DataType,
@@ -653,7 +653,9 @@ where
     }
 }
 
-// Broadcasting binary operations that can work with tensors of different ranks
+// Broadcasting binary operations that can work with tensors of different ranks.
+// Broadcasting is done at the fusor level using broadcast_as (which dispatches to
+// backend restride), then same-rank operators are applied.
 impl<const R: usize, D, B> Tensor<R, D, B>
 where
     D: SimdElement + DataType + Default,
@@ -663,7 +665,7 @@ where
     pub fn add_<const R2: usize, const R3: usize, B2>(
         &self,
         second: &Tensor<R2, D, B2>,
-    ) -> Tensor<R3, D, ConcreteTensor<D, R3>>
+    ) -> Tensor<R3, D>
     where
         (fusor_core::Tensor<R, D>, fusor_core::Tensor<R2, D>): fusor_core::MaxRank<R3, D>,
         (ConcreteTensor<D, R>, ConcreteTensor<D, R2>): fusor_cpu::MaxRank<R3, D>,
@@ -671,14 +673,17 @@ where
         AddOp: SimdBinaryOp<D>,
         B2: TensorBacking<R2, Elem = D>,
     {
-        self.dispatch_pair(second, |a, b| a.as_ref().add_(b.as_ref()), |a, b| a.add_(b))
+        let out_shape: [usize; R3] = composite::broadcast_shapes(&self.shape(), &second.shape());
+        let a = self.broadcast_as(out_shape);
+        let b = second.broadcast_as(out_shape);
+        (&a + &b).to_concrete()
     }
 
     /// Broadcasting subtract: broadcasts both tensors to a common shape and subtracts them.
     pub fn sub_<const R2: usize, const R3: usize, B2>(
         &self,
         second: &Tensor<R2, D, B2>,
-    ) -> Tensor<R3, D, ConcreteTensor<D, R3>>
+    ) -> Tensor<R3, D>
     where
         (fusor_core::Tensor<R, D>, fusor_core::Tensor<R2, D>): fusor_core::MaxRank<R3, D>,
         (ConcreteTensor<D, R>, ConcreteTensor<D, R2>): fusor_cpu::MaxRank<R3, D>,
@@ -686,14 +691,17 @@ where
         SubOp: SimdBinaryOp<D>,
         B2: TensorBacking<R2, Elem = D>,
     {
-        self.dispatch_pair(second, |a, b| a.as_ref().sub_(b.as_ref()), |a, b| a.sub_(b))
+        let out_shape: [usize; R3] = composite::broadcast_shapes(&self.shape(), &second.shape());
+        let a = self.broadcast_as(out_shape);
+        let b = second.broadcast_as(out_shape);
+        (&a - &b).to_concrete()
     }
 
     /// Broadcasting multiply: broadcasts both tensors to a common shape and multiplies them.
     pub fn mul_<const R2: usize, const R3: usize, B2>(
         &self,
         second: &Tensor<R2, D, B2>,
-    ) -> Tensor<R3, D, ConcreteTensor<D, R3>>
+    ) -> Tensor<R3, D>
     where
         (fusor_core::Tensor<R, D>, fusor_core::Tensor<R2, D>): fusor_core::MaxRank<R3, D>,
         (ConcreteTensor<D, R>, ConcreteTensor<D, R2>): fusor_cpu::MaxRank<R3, D>,
@@ -701,14 +709,17 @@ where
         MulOp: SimdBinaryOp<D>,
         B2: TensorBacking<R2, Elem = D>,
     {
-        self.dispatch_pair(second, |a, b| a.as_ref().mul_(b.as_ref()), |a, b| a.mul_(b))
+        let out_shape: [usize; R3] = composite::broadcast_shapes(&self.shape(), &second.shape());
+        let a = self.broadcast_as(out_shape);
+        let b = second.broadcast_as(out_shape);
+        (&a * &b).to_concrete()
     }
 
     /// Broadcasting divide: broadcasts both tensors to a common shape and divides them.
     pub fn div_<const R2: usize, const R3: usize, B2>(
         &self,
         second: &Tensor<R2, D, B2>,
-    ) -> Tensor<R3, D, ConcreteTensor<D, R3>>
+    ) -> Tensor<R3, D>
     where
         (fusor_core::Tensor<R, D>, fusor_core::Tensor<R2, D>): fusor_core::MaxRank<R3, D>,
         (ConcreteTensor<D, R>, ConcreteTensor<D, R2>): fusor_cpu::MaxRank<R3, D>,
@@ -716,21 +727,42 @@ where
         DivOp: SimdBinaryOp<D>,
         B2: TensorBacking<R2, Elem = D>,
     {
-        self.dispatch_pair(second, |a, b| a.as_ref().div_(b.as_ref()), |a, b| a.div_(b))
+        let out_shape: [usize; R3] = composite::broadcast_shapes(&self.shape(), &second.shape());
+        let a = self.broadcast_as(out_shape);
+        let b = second.broadcast_as(out_shape);
+        (&a / &b).to_concrete()
     }
 
     /// Broadcasting power: broadcasts both tensors to a common shape and computes power.
     pub fn pow_<const R2: usize, const R3: usize, B2>(
         &self,
         second: &Tensor<R2, D, B2>,
-    ) -> Tensor<R3, D, ConcreteTensor<D, R3>>
+    ) -> Tensor<R3, D>
     where
         (fusor_core::Tensor<R, D>, fusor_core::Tensor<R2, D>): fusor_core::MaxRank<R3, D>,
         (ConcreteTensor<D, R>, ConcreteTensor<D, R2>): fusor_cpu::MaxRank<R3, D>,
         D: FloatDataType + FloatOps,
         B2: TensorBacking<R2, Elem = D>,
     {
-        self.dispatch_pair(second, |a, b| a.as_ref().pow_(b.as_ref()), |a, b| a.pow_(b))
+        let out_shape: [usize; R3] = composite::broadcast_shapes(&self.shape(), &second.shape());
+        let a = self.broadcast_as(out_shape).to_concrete();
+        let b = second.broadcast_as(out_shape).to_concrete();
+        match (&a, &b) {
+            (Tensor::Cpu(a), Tensor::Cpu(b)) => {
+                let result: Vec<D> = a
+                    .inner()
+                    .data()
+                    .iter()
+                    .zip(b.inner().data().iter())
+                    .map(|(x, y)| x.powf(*y))
+                    .collect();
+                Tensor::Cpu(fusor_cpu::Tensor::new(ConcreteTensor::from_slice(
+                    out_shape, &result,
+                )))
+            }
+            (Tensor::Gpu(a), Tensor::Gpu(b)) => Tensor::Gpu(a.pow_(b)),
+            _ => panic!("Cannot mix CPU and GPU tensors"),
+        }
     }
 }
 
@@ -1075,83 +1107,31 @@ where
             (Tensor::Cpu(lhs), QMatrix::CpuQ6K(rhs)) => Tensor::Cpu(fusor_cpu::Tensor::new(
                 lhs.to_concrete().inner().q_mat_mul(rhs),
             )),
-            // F32 is not quantized, use regular matmul with transpose
-            // Weight is [N, K] (out_features, in_features), we need input @ weight.T
-            (Tensor::Cpu(lhs), QMatrix::CpuF32(t)) => {
-                let shape = t.shape();
-                let n = shape[0]; // out_features
-                let k = shape[1]; // in_features
-
-                // Create 2D ConcreteTensor from data and shape
-                let rhs_concrete: fusor_cpu::ConcreteTensor<f32, 2> =
-                    fusor_cpu::ConcreteTensor::from_parts(
-                        fusor_cpu::Layout::contiguous(&[n, k]),
-                        t.data().clone(),
-                    );
-
-                // Transpose weight from [N, K] to [K, N]
-                let rhs_tensor = fusor_cpu::Tensor::new(rhs_concrete);
-                let rhs_transposed = rhs_tensor.transpose(0, 1);
-
-                // Reshape to R dimensions: [1, 1, ..., K, N]
+            // F16/F32 are not quantized — dequantize, transpose, and use regular matmul
+            (_, QMatrix::CpuF32(_))
+            | (_, QMatrix::CpuF16(_))
+            | (Tensor::Gpu(_), QMatrix::Gpu(_))
+                if weights.ggml_type() == fusor_gguf::GgmlType::F16
+                    || weights.ggml_type() == fusor_gguf::GgmlType::F32 =>
+            {
+                let n = weights.shape()[0]; // out_features
+                let k = weights.shape()[1]; // in_features
+                let dequantized: Tensor<2, f32> = weights.dequantize();
+                let weight_t = dequantized.transpose(0, 1);
                 let weight_shape: [usize; R] = std::array::from_fn(|i| {
                     if i < R - 2 {
-                        1 // Broadcast batch dimensions
+                        1
                     } else if i == R - 2 {
-                        k // K dimension
+                        k
                     } else {
-                        n // N dimension
+                        n
                     }
                 });
-                let rhs_broadcast = rhs_transposed.reshape(weight_shape);
-
-                // Do regular matmul
-                let lhs_eval = lhs.to_concrete();
-                let result = lhs_eval.matmul(rhs_broadcast);
-                Tensor::Cpu(result)
+                let weight_broadcast = weight_t.reshape(weight_shape);
+                self.mat_mul(&weight_broadcast)
             }
 
-            // F16 is not quantized, convert to f32 and use regular matmul with transpose
-            (Tensor::Cpu(lhs), QMatrix::CpuF16(t)) => {
-                let shape = t.shape();
-                let n = shape[0]; // out_features
-                let k = shape[1]; // in_features
-
-                // Convert f16 data to f32
-                let f32_data: Vec<f32> = t.data().iter().map(|v| v.to_f32()).collect();
-                let mut data = fusor_cpu::AVec::<f32>::with_capacity(64, f32_data.len());
-                data.extend_from_slice(&f32_data);
-
-                // Create 2D ConcreteTensor from data and shape
-                let rhs_concrete: fusor_cpu::ConcreteTensor<f32, 2> =
-                    fusor_cpu::ConcreteTensor::from_parts(
-                        fusor_cpu::Layout::contiguous(&[n, k]),
-                        data.into_boxed_slice(),
-                    );
-
-                // Transpose weight from [N, K] to [K, N]
-                let rhs_tensor = fusor_cpu::Tensor::new(rhs_concrete);
-                let rhs_transposed = rhs_tensor.transpose(0, 1);
-
-                // Reshape to R dimensions: [1, 1, ..., K, N]
-                let weight_shape: [usize; R] = std::array::from_fn(|i| {
-                    if i < R - 2 {
-                        1 // Broadcast batch dimensions
-                    } else if i == R - 2 {
-                        k // K dimension
-                    } else {
-                        n // N dimension
-                    }
-                });
-                let rhs_broadcast = rhs_transposed.reshape(weight_shape);
-
-                // Do regular matmul
-                let lhs_eval = lhs.to_concrete();
-                let result = lhs_eval.matmul(rhs_broadcast);
-                Tensor::Cpu(result)
-            }
-
-            // GPU path
+            // GPU path - quantized types
             (Tensor::Gpu(lhs), QMatrix::Gpu(rhs)) => Tensor::Gpu(lhs.q_mat_mul(rhs)),
 
             // Mixed - panic
@@ -1180,25 +1160,17 @@ where
     where
         fusor_core::Tensor<R, D>: fusor_core::SmallerRank<FROM_END, R2, D>,
     {
-        match self {
-            Tensor::Cpu(t) => {
-                // CPU flatten_last_n takes N where output = input - N + 1
-                // So we need CPU_N = FROM_END + 1 to match GPU semantics
-                // Calculate new shape manually since we can't do const arithmetic
-                let shape = t.shape();
-                let new_shape: [usize; R2] = std::array::from_fn(|i| {
-                    if i < R - 1 - FROM_END {
-                        shape[i]
-                    } else if i == R - 1 - FROM_END {
-                        shape[R - 1 - FROM_END..].iter().product()
-                    } else {
-                        1
-                    }
-                });
-                Tensor::Cpu(t.as_ref().reshape(new_shape).to_concrete())
+        let shape = self.shape();
+        let new_shape: [usize; R2] = std::array::from_fn(|i| {
+            if i < R - 1 - FROM_END {
+                shape[i]
+            } else if i == R - 1 - FROM_END {
+                shape[R - 1 - FROM_END..].iter().product()
+            } else {
+                1
             }
-            Tensor::Gpu(t) => Tensor::Gpu(t.flatten_last_n::<FROM_END, R2>()),
-        }
+        });
+        self.reshape(new_shape).to_concrete()
     }
 
     /// Flatten the first FROM_START+1 dimensions into one.
@@ -1215,22 +1187,15 @@ where
     where
         fusor_core::Tensor<R, D>: fusor_core::SmallerRank<FROM_START, R2, D>,
     {
-        match self {
-            Tensor::Cpu(t) => {
-                // Calculate new shape: first element is product of first FROM_START+1 dims
-                // remaining elements are the rest of the dimensions
-                let shape = t.shape();
-                let new_shape: [usize; R2] = std::array::from_fn(|i| {
-                    if i == 0 {
-                        shape[..=FROM_START].iter().product()
-                    } else {
-                        shape[i + FROM_START]
-                    }
-                });
-                Tensor::Cpu(t.as_ref().reshape(new_shape).to_concrete())
+        let shape = self.shape();
+        let new_shape: [usize; R2] = std::array::from_fn(|i| {
+            if i == 0 {
+                shape[..=FROM_START].iter().product()
+            } else {
+                shape[i + FROM_START]
             }
-            Tensor::Gpu(t) => Tensor::Gpu(t.flatten_first_n::<FROM_START, R2>()),
-        }
+        });
+        self.reshape(new_shape).to_concrete()
     }
 }
 
@@ -1253,6 +1218,14 @@ where
     #[inline]
     pub const fn rank(&self) -> usize {
         R
+    }
+
+    /// Return the GPU compute-graph node index, if this is a GPU tensor.
+    pub fn gpu_key(&self) -> Option<NodeIndex> {
+        match self {
+            Tensor::Gpu(t) => Some(t.key()),
+            Tensor::Cpu(_) => None,
+        }
     }
 }
 
