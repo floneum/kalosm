@@ -38,4 +38,31 @@ impl BertLayer {
         let intermediate_output = self.intermediate.forward(&attention_output);
         self.output.forward(&intermediate_output, &attention_output)
     }
+
+    pub(crate) fn debug_forward(
+        &self,
+        hidden_states: &Tensor<3, f32>,
+        attention_mask: Option<&Tensor<2, u32>>,
+    ) -> (Tensor<3, f32>, Tensor<3, f32>, Tensor<3, f32>) {
+        let _enter = self.span.enter();
+        let attention_output = self.attention.forward(hidden_states, attention_mask);
+        let intermediate_output = self.intermediate.forward(&attention_output);
+        let layer_output = self.output.forward(&intermediate_output, &attention_output);
+        (attention_output, intermediate_output, layer_output)
+    }
+
+    pub(crate) fn debug_attention_forward(
+        &self,
+        hidden_states: &Tensor<3, f32>,
+        attention_mask: Option<&Tensor<2, u32>>,
+    ) -> (
+        Tensor<4, f32>,
+        Tensor<4, f32>,
+        Tensor<4, f32>,
+        Tensor<3, f32>,
+        Tensor<3, f32>,
+    ) {
+        let _enter = self.span.enter();
+        self.attention.debug_forward(hidden_states, attention_mask)
+    }
 }

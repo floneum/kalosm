@@ -1,0 +1,87 @@
+/* This file contains the global styles for the styled dioxus components. You only
+ * need to import this file once in your project root.
+ */
+@import url("https://fonts.googleapis.com/css2?family=Inter:ital,opsz,wght@0,14..32,100..900;1,14..32,100..900&display=swap");
+
+body {
+  color: var(--secondary-color-4);
+  font-family: Inter, sans-serif;
+  font-optical-sizing: auto;
+  font-style: normal;
+  font-weight: 400;
+}
+
+html[data-theme="dark"] {
+  --dark: initial;
+  --light: ;
+}
+
+html[data-theme="light"] {
+  --dark: ;
+  --light: initial;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --dark: initial;
+    --light: ;
+  }
+}
+
+@media (prefers-color-scheme: light) {
+  :root {
+    --dark: ;
+    --light: initial;
+  }
+}
+
+:root {
+  /* Primary colors */
+  --primary-color: var(--dark, #000) var(--light, #fff);
+  --primary-color-1: var(--dark, #0e0e0e) var(--light, #fbfbfb);
+  --primary-color-2: var(--dark, #0a0a0a) var(--light, #fff);
+  --primary-color-3: var(--dark, #141313) var(--light, #f8f8f8);
+  --primary-color-4: var(--dark, #1a1a1a) var(--light, #f8f8f8);
+  --primary-color-5: var(--dark, #262626) var(--light, #f5f5f5);
+  --primary-color-6: var(--dark, #232323) var(--light, #e5e5e5);
+  --primary-color-7: var(--dark, #3e3e3e) var(--light, #b0b0b0);
+
+  /* Secondary colors */
+  --secondary-color: var(--dark, #fff) var(--light, #000);
+  --secondary-color-1: var(--dark, #fafafa) var(--light, #000);
+  --secondary-color-2: var(--dark, #e6e6e6) var(--light, #0d0d0d);
+  --secondary-color-3: var(--dark, #dcdcdc) var(--light, #2b2b2b);
+  --secondary-color-4: var(--dark, #d4d4d4) var(--light, #111);
+  --secondary-color-5: var(--dark, #a1a1a1) var(--light, #848484);
+  --secondary-color-6: var(--dark, #5d5d5d) var(--light, #d0d0d0);
+
+  /* Highlight colors */
+  --focused-border-color: var(--dark, #2b7fff) var(--light, #2b7fff);
+  --primary-success-color: var(--dark, #02271c) var(--light, #ecfdf5);
+  --secondary-success-color: var(--dark, #b6fae3) var(--light, #10b981);
+  --primary-warning-color: var(--dark, #342203) var(--light, #fffbeb);
+  --secondary-warning-color: var(--dark, #feeac7) var(--light, #f59e0b);
+  --primary-error-color: var(--dark, #a22e2e) var(--light, #dc2626);
+  --secondary-error-color: var(--dark, #9b1c1c) var(--light, #ef4444);
+  --contrast-error-color: var(--dark, var(--secondary-color-3)) var(--light, var(--primary-color));
+  --primary-info-color: var(--dark, var(--primary-color-5)) var(--light, var(--primary-color));
+  --secondary-info-color: var(--dark, var(--primary-color-7)) var(--light, var(--secondary-color-3));
+}
+
+/* Modern browsers with `scrollbar-*` support */
+@supports (scrollbar-width: auto) {
+  :not(:hover) {
+    scrollbar-color: rgb(0 0 0 / 0%) rgb(0 0 0 / 0%);
+  }
+
+  :hover {
+    scrollbar-color: var(--secondary-color-2) rgb(0 0 0 / 0%);
+  }
+}
+
+/* Legacy browsers with `::-webkit-scrollbar-*` support */
+@supports selector(::-webkit-scrollbar) {
+  :root::-webkit-scrollbar-track {
+    background: transparent;
+  }
+}

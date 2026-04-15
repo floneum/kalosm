@@ -1,0 +1,19 @@
+[package]
+name = "rgliner-web"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+dioxus = { version = "=0.7.2", features = ["web"] }
+rgliner = { path = "../../models/rgliner", default-features = false }
+getrandom = { version = "0.3", features = ["wasm_js"] }
+tracing = "0.1"
+dioxus-primitives = { git = "https://github.com/DioxusLabs/components", version = "0.0.1", default-features = false }
+pulldown-cmark = { version = "0.13", default-features = false }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+console_error_panic_hook = "0.1"
+tracing-wasm = "0.2"
+wasm-bindgen-futures = "0.4"
+gloo-timers = { version = "0.3", features = ["futures"] }

@@ -65,7 +65,15 @@ pub(super) fn build_kernel(
     let block_k_size = parameters.block_k_size;
     let thread_m_size = parameters.thread_m_size;
     let thread_n_size = parameters.thread_n_size;
-    let double_buffer = parameters.double_buffer;
+    // WebGPU guarantees only 16KB of workgroup storage on many adapters and caps it
+    // at 32KB. Disable double-buffering when it would push us past that budget.
+    const PADDING: u32 = 1;
+    const MAX_WORKGROUP_STORAGE_BYTES: u32 = 32768;
+    let dtype_bytes = matmul.matmul_dtype().element_size() as u32;
+    let single_buffer_bytes =
+        (block_m_size + block_n_size) * (block_k_size + PADDING) * dtype_bytes;
+    let double_buffer =
+        parameters.double_buffer && single_buffer_bytes * 2 <= MAX_WORKGROUP_STORAGE_BYTES;
     let threads_per_workgroup: u32 =
         (block_m_size * block_n_size) / (thread_m_size * thread_n_size);
     let threads_per_k_a: u32 = threads_per_workgroup / block_k_size;
@@ -115,7 +123,6 @@ pub(super) fn build_kernel(
     let output =
         kernel.add_tensor_input(matmul.rank(), true, matmul.post_element_wise.out_datatype());
 
-    const PADDING: u32 = 1; // Add padding for bank conflict avoidance
     let cache_dtype = matmul.matmul_dtype();
     let cache_a_size = if double_buffer { 2 } else { 1 } * block_m_size * (block_k_size + PADDING);
     let cache_a = kernel.add_global_array(

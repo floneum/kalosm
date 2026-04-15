@@ -13,6 +13,7 @@ bench = false
 [workspace]
 members = [
     "models/rbert",
+    "models/rgliner",
     "models/kalosm-llama",
     "models/rwhisper",
     "models/rwuerstchen",
@@ -29,6 +30,7 @@ members = [
     "interfaces/kalosm-learning-macro",
     "interfaces/kalosm-parse-macro",
     "interfaces/kalosm-common",
+    "interfaces/kalosm-chunking",
     "interfaces/kalosm-model-types",
     "fusor-ml/core",
     "fusor-ml/gguf",
@@ -36,6 +38,7 @@ members = [
     "fusor-ml/cpu",
     "fusor-ml/fusor",
     "fusor-ml/types",
+    "demos/rgliner-web",
 ]
 
 [workspace.dependencies]
@@ -46,6 +49,7 @@ kalosm = { path = "./interfaces/kalosm", version = "0.4.0" }
 kalosm-sample = { path = "./interfaces/kalosm-sample", version = "0.4.0" }
 kalosm-parse-macro = { path = "./interfaces/kalosm-parse-macro", version = "0.4.0" }
 kalosm-common = { path = "./interfaces/kalosm-common", version = "0.4.0" }
+kalosm-chunking = { path = "./interfaces/kalosm-chunking", version = "0.4.0" }
 kalosm-model-types = { path = "./interfaces/kalosm-model-types", version = "0.4.0" }
 kalosm-language-model = { path = "./interfaces/language-model", version = "0.4.0" }
 kalosm-streams = { path = "./interfaces/kalosm-streams", version = "0.4.0" }
@@ -55,6 +59,7 @@ kalosm-vision = { path = "./interfaces/kalosm-vision", version = "0.4.0" }
 kalosm-learning = { path = "./interfaces/kalosm-learning", version = "0.4.0" }
 kalosm-learning-macro = { path = "./interfaces/kalosm-learning-macro", version = "0.4.0" }
 rbert = { path = "./models/rbert", version = "0.4.0" }
+rgliner = { path = "./models/rgliner", version = "0.4.0" }
 kalosm-llama = { path = "./models/kalosm-llama", version = "0.4.0" }
 rwhisper = { path = "./models/rwhisper", version = "0.4.0" }
 rwuerstchen = { path = "./models/rwuerstchen", version = "0.4.0" }

@@ -808,7 +808,7 @@ impl Operation for QMatMulOperation {
             .product();
 
         if self.sgemv() {
-            sgemv::dispatch_size(&self.matrix, n, m, batch_size)
+            sgemv::dispatch_size(self, n, m, batch_size, &self.matrix.device)
         } else {
             sgemm::dispatch_size(self, workgroup_shape, &self.matrix, n, m, batch_size)
         }

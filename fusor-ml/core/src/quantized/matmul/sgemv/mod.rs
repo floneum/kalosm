@@ -77,6 +77,20 @@ fn can_use_specialized_sgemv(device: &Device) -> bool {
     device.max_subgroup_size() >= 2 * device.min_subgroup_size()
 }
 
+fn batch_size(op: &QMatMulOperation) -> u32 {
+    op.in_shape
+        .iter()
+        .rev()
+        .skip(2)
+        .map(|x| *x as u32)
+        .product::<u32>()
+        .max(1)
+}
+
+fn use_specialized_sgemv(op: &QMatMulOperation, device: &Device) -> bool {
+    batch_size(op) == 1 && can_use_specialized_sgemv(device)
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn sgemv(
     op: &QMatMulOperation,
@@ -92,7 +106,7 @@ pub(crate) fn sgemv(
 ) {
     let device = graph.device();
     // Check if we can use specialized SGEMV (requires 2 subgroups per workgroup)
-    let use_specialized = can_use_specialized_sgemv(&device);
+    let use_specialized = use_specialized_sgemv(op, &device);
     match op.matrix.datatype {
         GgmlType::Q6K if use_specialized => q6k_sgemv(
             op,
@@ -165,9 +179,14 @@ pub(crate) fn sgemv(
 }
 
 /// Calculate the number of N-dimension workgroups based on matrix type
-pub(crate) fn n_workgroups(matrix: &QMatrix, n: u32) -> u32 {
+pub(crate) fn n_workgroups(
+    op: &QMatMulOperation,
+    matrix: &QMatrix,
+    n: u32,
+    device: &Device,
+) -> u32 {
     // Only use specialized dispatch sizes if we can use specialized SGEMV
-    if can_use_specialized_sgemv(&matrix.device) {
+    if use_specialized_sgemv(op, device) {
         if matrix.datatype == GgmlType::Q6K {
             n.div_ceil(Q6K_SGEMV_CHUNK_SIZE * 2)
         } else if matrix.datatype == GgmlType::Q4K {
@@ -186,10 +205,16 @@ pub(crate) fn n_workgroups(matrix: &QMatrix, n: u32) -> u32 {
     }
 }
 
-pub(crate) fn dispatch_size(matrix: &QMatrix, n: u32, m: u32, batch_size: u32) -> [u32; 3] {
+pub(crate) fn dispatch_size(
+    op: &QMatMulOperation,
+    n: u32,
+    m: u32,
+    batch_size: u32,
+    device: &Device,
+) -> [u32; 3] {
     // Calculate total workgroups: n_workgroups * m * batch
     // Use distribute_workgroups to spread across all 3 dimensions if needed
-    let n_wg = n_workgroups(matrix, n);
+    let n_wg = n_workgroups(op, &op.matrix, n, device);
     let total_workgroups = n_wg * m * batch_size;
     distribute_workgroups(total_workgroups)
 }

@@ -49,7 +49,8 @@ use std::sync::{Arc, RwLock};
 use tokenizers::{Encoding, PaddingDirection, PaddingParams, Tokenizer};
 
 mod language_model;
-mod raw;
+/// Low-level encoder implementations (standard BERT, Qwen, ModernBERT, mDeBERTa-v3).
+pub mod raw;
 mod source;
 
 pub use crate::language_model::*;
@@ -376,6 +377,15 @@ impl Bert {
         sentences: Vec<&str>,
         pooling: Pooling,
     ) -> Result<Vec<Tensor<2, f32>>, BertError> {
+        self.embed_batch_raw_with_options(sentences, pooling, true)
+    }
+
+    pub(crate) fn embed_batch_raw_with_options(
+        &self,
+        sentences: Vec<&str>,
+        pooling: Pooling,
+        normalize: bool,
+    ) -> Result<Vec<Tensor<2, f32>>, BertError> {
         let embedding_dim = self.model.embedding_dim();
         // Approximates the quadratic attention memory cost (seq_len^2).
         // Batches are split so that total work stays below this threshold.
@@ -424,7 +434,7 @@ impl Bert {
         }
 
         for (indices, encodings) in chunks {
-            let embeddings = self.embed_batch_raw_inner(encodings, pooling)?;
+            let embeddings = self.embed_batch_raw_inner(encodings, pooling, normalize)?;
             for (i, embedding) in indices.iter().zip(embeddings) {
                 combined[*i] = Some(embedding);
             }
@@ -436,6 +446,7 @@ impl Bert {
         &self,
         mut tokens: Vec<Encoding>,
         pooling: Pooling,
+        normalize: bool,
     ) -> Result<Vec<Tensor<2, f32>>, BertError> {
         if tokens.is_empty() {
             return Ok(Vec::new());
@@ -485,13 +496,19 @@ impl Bert {
                 // Cast mask u32→f32, unsqueeze to [batch, seq_len, 1] for broadcasting
                 let mask_f32: Tensor<2, f32> = attention_mask.cast();
                 let mask_3d: Tensor<3, f32, _> = mask_f32.unsqueeze(2).to_concrete();
+                // Broadcast mask to match embedding shape [batch, seq, hidden]
+                let mask_3d: Tensor<3, f32> = mask_3d.broadcast_as(shape).to_concrete();
                 // Zero out padding positions, sum along seq dim → [batch, hidden_dim]
                 let masked_embeddings = (embeddings * mask_3d).to_concrete();
                 let summed = masked_embeddings.sum::<2>(1);
                 // Divide by valid token count [batch, 1] — broadcasts with [batch, hidden_dim]
                 let valid_count = mask_f32.sum_keepdim::<1>(1);
                 let embeddings = summed.div_(&valid_count);
-                let embeddings = normalize_l2(&embeddings);
+                let embeddings = if normalize {
+                    normalize_l2(&embeddings)
+                } else {
+                    embeddings
+                };
                 Ok(embeddings
                     .chunk(n_sentences, 0)
                     .into_iter()
@@ -510,13 +527,249 @@ impl Bert {
             Pooling::Last => {
                 // With left padding, the last token is always at the final position
                 let indexed_embeddings = embeddings.to_concrete().i((.., n_tokens - 1, ..));
-                let normalized = normalize_l2(&indexed_embeddings);
+                let normalized = if normalize {
+                    normalize_l2(&indexed_embeddings)
+                } else {
+                    indexed_embeddings
+                };
                 Ok(normalized
                     .chunk(n_sentences, 0)
                     .into_iter()
                     .map(|c| c.to_concrete())
                     .collect())
             }
+        }
+    }
+
+    #[doc(hidden)]
+    pub fn debug_batch_forward(
+        &self,
+        sentences: Vec<String>,
+    ) -> Result<(Tensor<3, f32>, Tensor<2, u32>), BertError> {
+        let mut tokens = {
+            let tokenizer_read = self.tokenizer.read().unwrap();
+            tokenizer_read.encode_batch(sentences, true)
+        }
+        .map_err(BertError::TokenizerError)?;
+
+        let pp = PaddingParams {
+            strategy: tokenizers::PaddingStrategy::BatchLongest,
+            direction: PaddingDirection::Right,
+            ..Default::default()
+        };
+        tokenizers::pad_encodings(&mut tokens, &pp).map_err(BertError::TokenizerError)?;
+
+        let device = self.model.device();
+        let max_seq_len = self.model.max_seq_len();
+        let token_ids = tokens.iter().map(|tokens| {
+            let tokens = tokens.get_ids().to_vec();
+            Tensor::new(
+                device,
+                &tokens.as_slice()[..max_seq_len.min(tokens.as_slice().len())],
+            )
+        });
+        let token_ids = Tensor::stack(token_ids, 0);
+
+        let attention_masks = tokens.iter().map(|tokens| {
+            let attention_mask = tokens.get_attention_mask();
+            Tensor::new(
+                device,
+                &attention_mask[..max_seq_len.min(attention_mask.len())],
+            )
+        });
+        let attention_mask = Tensor::stack(attention_masks, 0);
+
+        let embeddings = self.model.forward(&token_ids, Some(&attention_mask));
+        Ok((embeddings, attention_mask))
+    }
+
+    #[doc(hidden)]
+    pub fn debug_batch_mean_pool(
+        &self,
+        sentences: Vec<String>,
+        normalize: bool,
+    ) -> Result<Tensor<2, f32>, BertError> {
+        let (embeddings, attention_mask) = self.debug_batch_forward(sentences)?;
+        let shape = embeddings.shape();
+        let mask_f32: Tensor<2, f32> = attention_mask.cast();
+        let mask_3d: Tensor<3, f32, _> = mask_f32.unsqueeze(2).to_concrete();
+        let mask_3d: Tensor<3, f32> = mask_3d.broadcast_as(shape).to_concrete();
+        let masked_embeddings = (embeddings * mask_3d).to_concrete();
+        let summed = masked_embeddings.sum::<2>(1);
+        let valid_count = mask_f32.sum_keepdim::<1>(1);
+        let pooled = summed.div_(&valid_count);
+        Ok(if normalize {
+            normalize_l2(&pooled)
+        } else {
+            pooled
+        })
+    }
+
+    #[doc(hidden)]
+    pub fn debug_batch_hidden_states(
+        &self,
+        sentences: Vec<String>,
+    ) -> Result<(Vec<Tensor<3, f32>>, Tensor<2, u32>), BertError> {
+        let mut tokens = {
+            let tokenizer_read = self.tokenizer.read().unwrap();
+            tokenizer_read.encode_batch(sentences, true)
+        }
+        .map_err(BertError::TokenizerError)?;
+
+        let pp = PaddingParams {
+            strategy: tokenizers::PaddingStrategy::BatchLongest,
+            direction: PaddingDirection::Right,
+            ..Default::default()
+        };
+        tokenizers::pad_encodings(&mut tokens, &pp).map_err(BertError::TokenizerError)?;
+
+        let device = self.model.device();
+        let max_seq_len = self.model.max_seq_len();
+        let token_ids = tokens.iter().map(|tokens| {
+            let tokens = tokens.get_ids().to_vec();
+            Tensor::new(
+                device,
+                &tokens.as_slice()[..max_seq_len.min(tokens.as_slice().len())],
+            )
+        });
+        let token_ids = Tensor::stack(token_ids, 0);
+
+        let attention_masks = tokens.iter().map(|tokens| {
+            let attention_mask = tokens.get_attention_mask();
+            Tensor::new(
+                device,
+                &attention_mask[..max_seq_len.min(attention_mask.len())],
+            )
+        });
+        let attention_mask = Tensor::stack(attention_masks, 0);
+
+        let states = match &*self.model {
+            EmbeddingModel::Bert(model) => {
+                let token_type_ids = token_ids.zeros_like();
+                model.debug_hidden_states(&token_ids, &token_type_ids, Some(&attention_mask))
+            }
+            EmbeddingModel::Qwen(_) => {
+                return Err(BertError::Fusor(fusor::Error::msg(
+                    "debug_batch_hidden_states is only implemented for BERT models",
+                )));
+            }
+        };
+
+        Ok((states, attention_mask))
+    }
+
+    #[doc(hidden)]
+    pub fn debug_batch_first_layer(
+        &self,
+        sentences: Vec<String>,
+    ) -> Result<(Tensor<3, f32>, Tensor<3, f32>, Tensor<3, f32>), BertError> {
+        let mut tokens = {
+            let tokenizer_read = self.tokenizer.read().unwrap();
+            tokenizer_read.encode_batch(sentences, true)
+        }
+        .map_err(BertError::TokenizerError)?;
+
+        let pp = PaddingParams {
+            strategy: tokenizers::PaddingStrategy::BatchLongest,
+            direction: PaddingDirection::Right,
+            ..Default::default()
+        };
+        tokenizers::pad_encodings(&mut tokens, &pp).map_err(BertError::TokenizerError)?;
+
+        let device = self.model.device();
+        let max_seq_len = self.model.max_seq_len();
+        let token_ids = tokens.iter().map(|tokens| {
+            let tokens = tokens.get_ids().to_vec();
+            Tensor::new(
+                device,
+                &tokens.as_slice()[..max_seq_len.min(tokens.as_slice().len())],
+            )
+        });
+        let token_ids = Tensor::stack(token_ids, 0);
+
+        let attention_masks = tokens.iter().map(|tokens| {
+            let attention_mask = tokens.get_attention_mask();
+            Tensor::new(
+                device,
+                &attention_mask[..max_seq_len.min(attention_mask.len())],
+            )
+        });
+        let attention_mask = Tensor::stack(attention_masks, 0);
+
+        match &*self.model {
+            EmbeddingModel::Bert(model) => {
+                let token_type_ids = token_ids.zeros_like();
+                model
+                    .debug_first_layer(&token_ids, &token_type_ids, Some(&attention_mask))
+                    .ok_or_else(|| {
+                        BertError::Fusor(fusor::Error::msg("BERT encoder has no layers"))
+                    })
+            }
+            EmbeddingModel::Qwen(_) => Err(BertError::Fusor(fusor::Error::msg(
+                "debug_batch_first_layer is only implemented for BERT models",
+            ))),
+        }
+    }
+
+    #[doc(hidden)]
+    pub fn debug_batch_first_layer_attention(
+        &self,
+        sentences: Vec<String>,
+    ) -> Result<
+        (
+            Tensor<4, f32>,
+            Tensor<4, f32>,
+            Tensor<4, f32>,
+            Tensor<3, f32>,
+            Tensor<3, f32>,
+        ),
+        BertError,
+    > {
+        let mut tokens = {
+            let tokenizer_read = self.tokenizer.read().unwrap();
+            tokenizer_read.encode_batch(sentences, true)
+        }
+        .map_err(BertError::TokenizerError)?;
+
+        let pp = PaddingParams {
+            strategy: tokenizers::PaddingStrategy::BatchLongest,
+            direction: PaddingDirection::Right,
+            ..Default::default()
+        };
+        tokenizers::pad_encodings(&mut tokens, &pp).map_err(BertError::TokenizerError)?;
+
+        let device = self.model.device();
+        let max_seq_len = self.model.max_seq_len();
+        let token_ids = tokens.iter().map(|tokens| {
+            let tokens = tokens.get_ids().to_vec();
+            Tensor::new(
+                device,
+                &tokens.as_slice()[..max_seq_len.min(tokens.as_slice().len())],
+            )
+        });
+        let token_ids = Tensor::stack(token_ids, 0);
+
+        let attention_masks = tokens.iter().map(|tokens| {
+            let attention_mask = tokens.get_attention_mask();
+            Tensor::new(
+                device,
+                &attention_mask[..max_seq_len.min(attention_mask.len())],
+            )
+        });
+        let attention_mask = Tensor::stack(attention_masks, 0);
+
+        match &*self.model {
+            EmbeddingModel::Bert(model) => {
+                let token_type_ids = token_ids.zeros_like();
+                model
+                    .debug_first_layer_attention(&token_ids, &token_type_ids, Some(&attention_mask))
+                    .ok_or_else(|| {
+                        BertError::Fusor(fusor::Error::msg("BERT encoder has no layers"))
+                    })
+            }
+            EmbeddingModel::Qwen(_) => Err(BertError::Fusor(fusor::Error::msg(
+                "debug_batch_first_layer_attention is only implemented for BERT models",
+            ))),
         }
     }
 }

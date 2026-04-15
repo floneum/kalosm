@@ -73,12 +73,27 @@ impl Linear<f32> {
     where
         B: fusor_cpu::TensorBacking<3, Elem = f32>,
     {
-        let output = input.q_mat_mul(&self.weight);
+        let [batch_size, seq_len, _in_features] = input.shape();
+        let out_features = self.weight.shape()[0];
+        let flattened_input: Tensor<2, f32> = input
+            .reshape([batch_size * seq_len, self.weight.shape()[1]])
+            .to_concrete();
+        let output = flattened_input.q_mat_mul(&self.weight);
 
         if let Some(bias) = &self.bias {
-            output.add_(bias)
+            let bias_broadcast: Tensor<2, f32> = bias
+                .unsqueeze(0)
+                .to_concrete()
+                .broadcast_as(output.shape())
+                .to_concrete();
+            output
+                .add_(&bias_broadcast)
+                .reshape([batch_size, seq_len, out_features])
+                .to_concrete()
         } else {
             output
+                .reshape([batch_size, seq_len, out_features])
+                .to_concrete()
         }
     }
 }
@@ -96,21 +111,34 @@ where
     where
         B: fusor_cpu::TensorBacking<3, Elem = T>,
     {
+        let [batch_size, seq_len, _in_features] = input.shape();
+        let out_features = self.weight.shape()[0];
         // Cast input to f32
         let input_f32 = input.cast::<f32>();
+        let flattened_input: Tensor<2, f32> = input_f32
+            .reshape([batch_size * seq_len, self.weight.shape()[1]])
+            .to_concrete();
 
         // Do quantized matmul in f32
-        let output_f32 = input_f32.q_mat_mul(&self.weight);
+        let output_f32 = flattened_input.q_mat_mul(&self.weight);
 
         // Add bias if present (in f32)
         let output_f32 = if let Some(bias) = &self.bias {
             let bias_f32: Tensor<1, f32> = bias.cast();
-            output_f32.add_(&bias_f32)
+            let bias_broadcast: Tensor<2, f32> = bias_f32
+                .unsqueeze(0)
+                .to_concrete()
+                .broadcast_as(output_f32.shape())
+                .to_concrete();
+            output_f32.add_(&bias_broadcast)
         } else {
             output_f32
         };
 
         // Cast back to T
-        output_f32.cast()
+        output_f32
+            .reshape([batch_size, seq_len, out_features])
+            .to_concrete()
+            .cast()
     }
 }

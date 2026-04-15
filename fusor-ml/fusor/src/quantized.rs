@@ -446,4 +446,87 @@ mod tests {
             result_1
         );
     }
+
+    #[test]
+    fn test_cpu_f32_qmatmul_broadcasts_batch_dims() {
+        let shape = [2, 4]; // [N, K] = [out_features, in_features]
+        let weight_data: Vec<f32> = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0];
+        let weight_bytes: Vec<u8> = weight_data.iter().flat_map(|f| f.to_le_bytes()).collect();
+
+        let qmatrix: QMatrix =
+            QMatrix::from_raw_bytes(&Device::Cpu, shape, &weight_bytes, GgmlType::F32).unwrap();
+
+        let input_data: Vec<f32> = vec![
+            1.0, 1.0, 1.0, 1.0, 0.0, 1.0, 0.0, 1.0, 2.0, 0.0, 0.0, 0.0, 1.0, 0.0, 1.0, 0.0, 0.0,
+            0.0, 1.0, 1.0, 3.0, 1.0, 0.0, 0.0,
+        ];
+        let input: Tensor<3, f32> = Tensor::from_slice(&Device::Cpu, [2, 3, 4], &input_data);
+
+        let output = input.q_mat_mul(&qmatrix).unwrap_cpu();
+        assert_eq!(output.shape(), [2, 3, 2]);
+
+        let expected = [
+            [[10.0, 26.0], [6.0, 14.0], [2.0, 10.0]],
+            [[4.0, 12.0], [7.0, 15.0], [5.0, 21.0]],
+        ];
+
+        for batch in 0..2 {
+            for row in 0..3 {
+                for col in 0..2 {
+                    let actual = output.get([batch, row, col]);
+                    let expected = expected[batch][row][col];
+                    assert!(
+                        (actual - expected).abs() < 0.1,
+                        "output[{batch}, {row}, {col}] = {actual}, expected {expected}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_cpu_f16_qmatmul_broadcasts_batch_dims() {
+        let shape = [2, 4]; // [N, K] = [out_features, in_features]
+        let weight_data: Vec<f16> = vec![
+            f16::from_f32(1.0),
+            f16::from_f32(2.0),
+            f16::from_f32(3.0),
+            f16::from_f32(4.0),
+            f16::from_f32(5.0),
+            f16::from_f32(6.0),
+            f16::from_f32(7.0),
+            f16::from_f32(8.0),
+        ];
+        let weight_bytes: Vec<u8> = weight_data.iter().flat_map(|f| f.to_le_bytes()).collect();
+
+        let qmatrix: QMatrix =
+            QMatrix::from_raw_bytes(&Device::Cpu, shape, &weight_bytes, GgmlType::F16).unwrap();
+
+        let input_data: Vec<f32> = vec![
+            1.0, 1.0, 1.0, 1.0, 0.0, 1.0, 0.0, 1.0, 2.0, 0.0, 0.0, 0.0, 1.0, 0.0, 1.0, 0.0, 0.0,
+            0.0, 1.0, 1.0, 3.0, 1.0, 0.0, 0.0,
+        ];
+        let input: Tensor<3, f32> = Tensor::from_slice(&Device::Cpu, [2, 3, 4], &input_data);
+
+        let output = input.q_mat_mul(&qmatrix).unwrap_cpu();
+        assert_eq!(output.shape(), [2, 3, 2]);
+
+        let expected = [
+            [[10.0, 26.0], [6.0, 14.0], [2.0, 10.0]],
+            [[4.0, 12.0], [7.0, 15.0], [5.0, 21.0]],
+        ];
+
+        for batch in 0..2 {
+            for row in 0..3 {
+                for col in 0..2 {
+                    let actual = output.get([batch, row, col]);
+                    let expected = expected[batch][row][col];
+                    assert!(
+                        (actual - expected).abs() < 0.1,
+                        "output[{batch}, {row}, {col}] = {actual}, expected {expected}"
+                    );
+                }
+            }
+        }
+    }
 }

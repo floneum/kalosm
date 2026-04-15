@@ -16,18 +16,30 @@ mod self_output;
 use self_output::*;
 mod intermediate_layer;
 use intermediate_layer::*;
+/// mDeBERTa-v3 raw encoder.
+pub mod mdeberta;
+/// ModernBERT raw encoder.
+pub mod modern_bert;
+/// Qwen embedding model raw implementation.
 pub mod qwen;
+mod utils;
 
+pub use mdeberta::{MDebertaConfig, MDebertaModel};
+pub use modern_bert::{ModernBertConfig, ModernBertModel};
 pub use qwen::QwenEmbeddingModel;
 
 use fusor::{Device, Result, Tensor, VarBuilder};
 use serde::Deserialize;
 use std::fmt::Debug;
 
+/// Non-linear activation applied between the intermediate and output dense
+/// layers of each [`BertLayer`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum HiddenAct {
+    /// Gaussian Error Linear Unit.
     Gelu,
+    /// Rectified Linear Unit.
     Relu,
 }
 
@@ -143,6 +155,55 @@ impl BertModel {
         let _enter = self.span.enter();
         let embedding_output = self.embeddings.forward(input_ids, token_type_ids);
         self.encoder.forward(&embedding_output, attention_mask)
+    }
+
+    #[doc(hidden)]
+    pub fn debug_hidden_states(
+        &self,
+        input_ids: &Tensor<2, u32>,
+        token_type_ids: &Tensor<2, u32>,
+        attention_mask: Option<&Tensor<2, u32>>,
+    ) -> Vec<Tensor<3, f32>> {
+        let _enter = self.span.enter();
+        let embedding_output = self.embeddings.forward(input_ids, token_type_ids);
+        let mut states = vec![embedding_output.clone()];
+        states.extend(
+            self.encoder
+                .debug_hidden_states(&embedding_output, attention_mask),
+        );
+        states
+    }
+
+    #[doc(hidden)]
+    pub fn debug_first_layer(
+        &self,
+        input_ids: &Tensor<2, u32>,
+        token_type_ids: &Tensor<2, u32>,
+        attention_mask: Option<&Tensor<2, u32>>,
+    ) -> Option<(Tensor<3, f32>, Tensor<3, f32>, Tensor<3, f32>)> {
+        let _enter = self.span.enter();
+        let embedding_output = self.embeddings.forward(input_ids, token_type_ids);
+        self.encoder
+            .debug_first_layer(&embedding_output, attention_mask)
+    }
+
+    #[doc(hidden)]
+    pub fn debug_first_layer_attention(
+        &self,
+        input_ids: &Tensor<2, u32>,
+        token_type_ids: &Tensor<2, u32>,
+        attention_mask: Option<&Tensor<2, u32>>,
+    ) -> Option<(
+        Tensor<4, f32>,
+        Tensor<4, f32>,
+        Tensor<4, f32>,
+        Tensor<3, f32>,
+        Tensor<3, f32>,
+    )> {
+        let _enter = self.span.enter();
+        let embedding_output = self.embeddings.forward(input_ids, token_type_ids);
+        self.encoder
+            .debug_first_layer_attention(&embedding_output, attention_mask)
     }
 
     pub(crate) fn max_seq_len(&self) -> usize {

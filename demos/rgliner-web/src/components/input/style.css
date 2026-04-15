@@ -1,0 +1,39 @@
+/* Input Styles */
+.input {
+  position: relative;
+  display: flex;
+  box-sizing: border-box;
+  flex-direction: row;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0.25rem;
+  padding: 8px 12px;
+  border: none;
+  border-radius: 0.5rem;
+  border-radius: calc(0.5rem);
+  background: none;
+  background-color: var(--light, var(--primary-color)) var(--dark, color-mix(in oklab, #FFFFFF26 30%, transparent));
+  box-shadow: inset 0 0 0 1px var(--light, var(--primary-color-6))
+    var(--dark, var(--primary-color-7));
+  color: var(--secondary-color-4);
+  cursor: pointer;
+  gap: 0.25rem;
+  transition: background-color 100ms ease-out;
+}
+
+.input::placeholder {
+  color: var(--secondary-color-5);
+}
+
+.input:disabled {
+  color: var(--secondary-color-5);
+  cursor: not-allowed;
+}
+
+.input:hover:not(:disabled),
+.input:focus-visible {
+  background: var(--light, var(--primary-color-4))
+    var(--dark, color-mix(in oklab, #FFFFFF26 50%, transparent));
+  color: var(--secondary-color-1);
+  outline: none;
+}

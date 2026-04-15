@@ -353,6 +353,20 @@ impl ComputeGraphInner {
             .and_then(|n| n.cached.as_ref())
     }
 
+    pub(crate) fn debug_node_state(&self, key: NodeIndex) -> String {
+        self.nodes
+            .nodes
+            .node_weight(key)
+            .map(|n| {
+                format!(
+                    "variant={:?} cached={}",
+                    n.variant,
+                    n.cached.is_some()
+                )
+            })
+            .unwrap_or_else(|| "missing".to_string())
+    }
+
     #[cfg(feature = "extra_assertions")]
     fn contains_key(&self, key: NodeIndex) -> bool {
         self.nodes.nodes.contains_node(key)

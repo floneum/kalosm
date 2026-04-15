@@ -37,6 +37,7 @@ docx-rs = "0.4.7"
 lopdf = { version = "0.35.0", features = ["async"] }
 convert_case = "0.6.0"
 kalosm-sample = { workspace = true }
+kalosm-chunking = { workspace = true }
 ego-tree = "0.6.2"
 image = { version = "0.24.7", optional = true }
 whatlang = "0.16.3"

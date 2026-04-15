@@ -1,0 +1,60 @@
+.button {
+  padding: 8px 18px;
+  border: none;
+  border-radius: 0.5rem;
+  cursor: pointer;
+  font-size: 1rem;
+  transition: background-color 0.2s ease, color 0.2s ease;
+}
+
+.button:focus-visible {
+  box-shadow: 0 0 0 2px var(--focused-border-color);
+}
+
+.button[data-style="primary"] {
+  background-color: var(--secondary-color-2);
+  color: var(--primary-color);
+}
+
+.button[data-style="primary"]:hover {
+  background-color: var(--secondary-color-1);
+}
+
+.button[data-style="secondary"] {
+  background-color: var(--primary-color-5);
+  color: var(--secondary-color-1);
+}
+
+.button[data-style="secondary"]:hover {
+  background-color: var(--primary-color-4);
+}
+
+.button[data-style="ghost"] {
+  background-color: transparent;
+  color: var(--secondary-color-4);
+}
+
+.button[data-style="ghost"]:hover {
+  background-color: var(--primary-color-5);
+  color: var(--secondary-color-1);
+}
+
+.button[data-style="outline"] {
+  border: 1px solid var(--primary-color-6);
+  background-color: var(--light, var(--primary-color))
+    var(--dark, var(--primary-color-3));
+  color: var(--secondary-color-4);
+}
+
+.button[data-style="outline"]:hover {
+  background-color: var(--primary-color-4);
+}
+
+.button[data-style="destructive"] {
+  background-color: var(--primary-error-color);
+  color: var(--contrast-error-color);
+}
+
+.button[data-style="destructive"]:hover {
+  background-color: var(--secondary-error-color);
+}
