@@ -296,7 +296,7 @@ where
                 .sampler
                 .take()
                 .expect("TextCompletionBuilder cannot be turned into a future twice");
-            let (mut tx, rx) = futures_channel::mpsc::unbounded();
+            let (tx, rx) = futures_channel::mpsc::unbounded();
             let (result_tx, result_rx) = futures_channel::oneshot::channel();
             self.queued_tokens = Some(rx);
             self.result = Some(result_rx);
@@ -305,7 +305,7 @@ where
                 let all_text = all_text.clone();
                 move |tok: String| {
                     all_text.lock().unwrap().push_str(&tok);
-                    _ = tx.start_send(tok);
+                    _ = tx.unbounded_send(tok);
                     Ok(())
                 }
             };
@@ -344,11 +344,13 @@ where
     ) -> std::task::Poll<Option<Self::Item>> {
         let myself = Pin::get_mut(self);
         myself.ensure_unstructured_task_started();
-        {
-            if let Some(token) = &mut myself.queued_tokens {
-                if let Poll::Ready(Some(token)) = token.poll_next_unpin(cx) {
+        if let Some(token) = &mut myself.queued_tokens {
+            match token.poll_next_unpin(cx) {
+                Poll::Ready(Some(token)) => {
                     return Poll::Ready(Some(token));
                 }
+                Poll::Ready(None) => {}
+                Poll::Pending => {}
             }
         }
         let mut task = myself.task.get().unwrap().write().unwrap();
@@ -401,12 +403,12 @@ where
                 .constraints
                 .take()
                 .expect("TextCompletionBuilder cannot be turned into a future twice");
-            let (mut tx, rx) = futures_channel::mpsc::unbounded();
+            let (tx, rx) = futures_channel::mpsc::unbounded();
             let (result_tx, result_rx) = futures_channel::oneshot::channel();
             self.queued_tokens = Some(rx);
             self.result = Some(result_rx);
             let on_token = move |tok: String| {
-                _ = tx.start_send(tok);
+                _ = tx.unbounded_send(tok);
                 Ok(())
             };
             let future = async move {

@@ -680,6 +680,105 @@ async fn test_fuzz_q_mat_mul_q4k() {
     }
 }
 
+#[cfg(test)]
+#[tokio::test]
+async fn test_fuzz_q_mat_mul_q5k() {
+    use crate::Tensor;
+    use candle_core::Module;
+    use fusor_gguf::GgufMetadata;
+    use kalosm_common::Cache;
+
+    // Phi-4 Q5_K_M model has Q5K matrices in attention weights
+    let source = kalosm_model_types::FileSource::HuggingFace {
+        model_id: "unsloth/Phi-4-mini-instruct-GGUF".to_string(),
+        revision: "main".to_string(),
+        file: "Phi-4-mini-instruct-Q5_K_M.gguf".to_string(),
+    };
+
+    // First find a Q5K tensor
+    let cache = Cache::default();
+    let bytes = cache.get_bytes(&source.clone(), |_| {}).await.unwrap();
+    let mut reader = std::io::Cursor::new(&bytes);
+    let metadata = GgufMetadata::read(&mut reader).unwrap();
+
+    // Find a Q5K tensor
+    let q5k_tensor = metadata
+        .tensor_infos
+        .iter()
+        .find(|(_, info)| info.ty == fusor_gguf::GgmlType::Q5K)
+        .map(|(name, _)| name.clone());
+
+    let tensor_name = match q5k_tensor {
+        Some(name) => {
+            println!("Found Q5K tensor: {name}");
+            name
+        }
+        None => {
+            println!("No Q5K tensors found in model, skipping test");
+            return;
+        }
+    };
+
+    let (device, q_matrix, candle_q_matrix) =
+        setup_smol_lm_matrix_with_source(&tensor_name, source).await;
+
+    // Make sure it's actually Q5K
+    assert_eq!(q_matrix.datatype, fusor_gguf::GgmlType::Q5K);
+
+    // Test various widths
+    let mut widths = vec![1, 256];
+    widths.extend((2..10).map(|_| rand::random_range(1..=64)));
+
+    let k_size = q_matrix.shape[1];
+    let n_size = q_matrix.shape[0];
+
+    for width in widths {
+        let batch = (rand::random::<u32>() as usize % 2) + 1;
+        let random_data: Vec<Vec<Vec<f32>>> = (0..batch)
+            .map(|_| {
+                (0..width)
+                    .map(|_| (0..k_size).map(|_| rand::random()).collect())
+                    .collect()
+            })
+            .collect();
+        let tensor = Tensor::<3, f32>::new(&device, &random_data);
+
+        let result = tensor.q_mat_mul(&q_matrix);
+        let fusor_shape = result.shape();
+        let result = result.as_slice().await.unwrap();
+
+        let candle_b = candle_core::Tensor::from_iter(
+            random_data
+                .iter()
+                .flat_map(|x| x.iter().flat_map(|x| x.iter().copied())),
+            &candle_core::Device::Cpu,
+        )
+        .unwrap()
+        .reshape(&[batch, width, k_size])
+        .unwrap();
+        let candle_result = candle_q_matrix.forward(&candle_b).unwrap();
+        assert_eq!(candle_result.shape().dims(), &[batch, width, n_size]);
+        let candle_result = candle_result.to_vec3::<f32>().unwrap();
+
+        assert_eq!(fusor_shape, &[batch, width, n_size]);
+
+        for batch in 0..batch {
+            for x in 0..width {
+                for y in 0..n_size {
+                    let expected = candle_result[batch][x][y];
+                    let actual = result[[batch, x, y]];
+                    if (expected - actual).abs() > 1.0 {
+                        println!("width: {width}");
+                        println!("Expected: {candle_result:?}");
+                        println!("Actual: {result:?}");
+                        panic!("expected: {expected}, actual: {actual}");
+                    }
+                }
+            }
+        }
+    }
+}
+
 impl Operation for QMatMulOperation {
     fn workgroup_shape_constraints(
         &self,

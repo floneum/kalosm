@@ -37,7 +37,7 @@ mod fusor_impl {
     };
     use std::sync::Arc;
 
-    type InitFuture = Pin<Box<dyn Future<Output = fusor_core::Result<FusorRnnoise>>>>;
+    type InitFuture = Pin<Box<dyn Future<Output = fusor::Result<FusorRnnoise>>>>;
 
     /// A stream of [`SamplesBuffer`]s with voice activity detection information.
     ///

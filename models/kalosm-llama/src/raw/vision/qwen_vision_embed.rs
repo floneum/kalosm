@@ -1,4 +1,7 @@
-use fusor_core::{CastTensor, Device, FloatDataType, Tensor, VarBuilder};
+use fusor::{
+    AddOp, CastTensor, CastTo, Device, FloatDataType, FloatOps, MatmulImpl, MulOp, SimdBinaryOp,
+    SimdElement, SimdReduceOp, SumOp, Tensor, VarBuilder,
+};
 
 #[derive(Debug, Clone, Copy)]
 pub struct Conv3dConfig {
@@ -15,13 +18,18 @@ impl Default for Conv3dConfig {
     }
 }
 
-pub struct Conv3d<T> {
+pub struct Conv3d<T: fusor::DataType + SimdElement> {
     weight: Tensor<5, T>, // (out_channels, in_channels, kernel_h, kernel_w, temporal)
     bias: Option<Tensor<1, T>>, // (out_channels,)
     config: Conv3dConfig,
 }
 
-impl<T: fusor_core::DataType> Conv3d<T> {
+impl<T: FloatDataType + SimdElement + FloatOps + MatmulImpl> Conv3d<T>
+where
+    MulOp: SimdBinaryOp<T>,
+    AddOp: SimdBinaryOp<T>,
+    SumOp: SimdReduceOp<T>,
+{
     pub fn new(weight: Tensor<5, T>, bias: Option<Tensor<1, T>>, config: Conv3dConfig) -> Self {
         Self {
             weight,
@@ -44,7 +52,7 @@ impl<T: fusor_core::DataType> Conv3d<T> {
     }
 }
 
-pub(crate) struct Qwen2_5VisionPatchEmbed<F: FloatDataType> {
+pub(crate) struct Qwen2_5VisionPatchEmbed<F: FloatDataType + SimdElement> {
     patch_size: usize,
     temporal_patch_size: usize,
     in_channels: usize,
@@ -52,9 +60,13 @@ pub(crate) struct Qwen2_5VisionPatchEmbed<F: FloatDataType> {
     conv: Conv3d<F>,
 }
 
-impl<F: FloatDataType> Qwen2_5VisionPatchEmbed<F>
+impl<F: FloatDataType + SimdElement + FloatOps + MatmulImpl> Qwen2_5VisionPatchEmbed<F>
 where
-    f32: CastTensor<F>,
+    F: CastTo<f32> + CastTensor<f32>,
+    f32: CastTo<F> + CastTensor<F>,
+    MulOp: SimdBinaryOp<F>,
+    AddOp: SimdBinaryOp<F>,
+    SumOp: SimdReduceOp<F>,
 {
     pub fn new(
         patch_size: usize,
@@ -63,7 +75,7 @@ where
         hidden_size: usize,
         vb: &mut VarBuilder,
         device: &Device,
-    ) -> fusor_core::Result<Self> {
+    ) -> fusor::Result<Self> {
         // GGUF stores Conv3D weights split into two Conv2D tensors along the temporal dimension
         // - "weight" contains temporal slice 0: [out_channels, in_channels, kernel_h, kernel_w]
         // - "weight.1" contains temporal slice 1: [out_channels, in_channels, kernel_h, kernel_w]
@@ -76,9 +88,9 @@ where
         let weight_0 = vb.get("weight", device)?;
         let weight_1 = vb.get("weight.1", device)?;
 
-        // Dequantize to 4D tensors
-        let weight_0: Tensor<4, F> = weight_0.dequantize();
-        let weight_1: Tensor<4, F> = weight_1.dequantize();
+        // Dequantize to 4D f32 tensors then cast to F
+        let weight_0: Tensor<4, F> = weight_0.dequantize().cast();
+        let weight_1: Tensor<4, F> = weight_1.dequantize().cast();
 
         // Stack along the temporal dimension (dim 2) to create 5D tensor
         // [out_channels, in_channels, kernel_h, kernel_w] -> [out_channels, in_channels, 2, kernel_h, kernel_w]
@@ -102,27 +114,36 @@ where
         self.temporal_patch_size
     }
 
-    pub fn forward(&self, hidden_states: &Tensor<2, F>) -> fusor_core::Result<Tensor<2, F>> {
-        let [num_patches, _] = *hidden_states.shape();
+    pub fn forward(&self, hidden_states: &Tensor<2, F>) -> fusor::Result<Tensor<2, F>> {
+        let [num_patches, _] = hidden_states.shape();
 
         // Input: (num_patches, in_channels * temporal * patch * patch)
         // Reshape to (num_patches, in_channels, temporal, patch, patch)
-        let x = hidden_states.reshape([
-            num_patches,
-            self.in_channels,
-            self.temporal_patch_size,
-            self.patch_size,
-            self.patch_size,
-        ]);
+        let x = hidden_states
+            .reshape([
+                num_patches,
+                self.in_channels,
+                self.temporal_patch_size,
+                self.patch_size,
+                self.patch_size,
+            ])
+            .to_concrete();
 
         let out = self.conv.forward(&x);
-        Ok(out.reshape(((), self.embed_dim)))
+        Ok(out
+            .reshape([
+                out.shape().iter().product::<usize>() / self.embed_dim,
+                self.embed_dim,
+            ])
+            .to_concrete())
     }
 }
 
 #[cfg(test)]
 #[tokio::test]
 async fn test_vision_patch_embed() {
+    use fusor::ToVec2;
+
     let embed_dim = 4;
     let in_channels = 3;
     let temporal_patch_size = 2;
@@ -214,10 +235,11 @@ async fn test_vision_patch_embed() {
     let input = Tensor::new(&device, &input);
 
     let output = patch_embed
-        .forward(&input.reshape((1, ())))
+        .forward(&input.reshape((1, ())).to_concrete())
         .unwrap()
         .cast::<f32>();
-    let output_vec = output.to_vec2().await.unwrap();
+    let output_slice = output.as_slice().await.unwrap();
+    let output_vec = output_slice.to_vec2();
     println!("Output: {output_vec:?}");
     let expected_output = [[0.3058, 0.6866, -0.7391, -0.6952]];
     assert_2d_vec_eq(output_vec, expected_output, 1e-2);

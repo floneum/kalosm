@@ -101,7 +101,7 @@ impl<I> TestCases<I> {
                 score: distance,
             });
         }
-        values.sort_by(|a, b| a.score.partial_cmp(&b.score).unwrap());
+        values.sort_by(|a, b| f64::total_cmp(&b.score, &a.score));
         EvaluationResult {
             name: self.name.clone(),
             histogram: OnceLock::new(),

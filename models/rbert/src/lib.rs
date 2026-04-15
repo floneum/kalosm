@@ -1,6 +1,6 @@
 //! # rbert
 //!
-//! A Rust wrapper for [bert sentence transformers](https://arxiv.org/abs/1908.10084) implemented in [Candle](https://github.com/huggingface/candle)
+//! A Rust embedding model library supporting BERT and Qwen architectures.
 //!
 //! ## Usage
 //!
@@ -42,18 +42,18 @@
 
 #![warn(missing_docs)]
 
-use fusor_core::{DataType, Device, Tensor, VarBuilder};
+use fusor::{Device, Tensor, VarBuilder};
 use kalosm_common::*;
 use kalosm_model_types::ModelLoadingProgress;
 use std::sync::{Arc, RwLock};
-use tokenizers::{Encoding, PaddingParams, Tokenizer};
+use tokenizers::{Encoding, PaddingDirection, PaddingParams, Tokenizer};
 
 mod language_model;
 mod raw;
 mod source;
 
 pub use crate::language_model::*;
-pub use crate::raw::{BertModel, Config};
+pub use crate::raw::{BertModel, Config, QwenEmbeddingModel};
 pub use crate::source::*;
 
 /// A builder for a [`Bert`] model
@@ -61,6 +61,7 @@ pub use crate::source::*;
 pub struct BertBuilder {
     source: BertSource,
     cache: kalosm_common::Cache,
+    device: Option<Device>,
 }
 
 impl BertBuilder {
@@ -74,6 +75,12 @@ impl BertBuilder {
     pub async fn build(self) -> Result<Bert, BertLoadingError> {
         self.build_with_loading_handler(ModelLoadingProgress::multi_bar_loading_indicator())
             .await
+    }
+
+    /// Set the device to use for the model. If not set, the best available device is selected automatically.
+    pub fn with_device(mut self, device: Device) -> Self {
+        self.device = Some(device);
+        self
     }
 
     #[cfg(feature = "tokio")]
@@ -123,7 +130,7 @@ pub enum BertLoadingError {
     DownloadingError(#[from] CacheError),
     /// An error that can occur when trying to load a Bert model.
     #[error("Failed to load model into device: {0}")]
-    LoadModel(#[from] fusor_core::Error),
+    LoadModel(#[from] fusor::Error),
     /// An IO error that can occur when trying to load a bert model.
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
@@ -143,7 +150,7 @@ pub enum BertLoadingError {
 pub enum BertError {
     /// An error that can occur when trying to run a Bert model.
     #[error("Failed to run model: {0}")]
-    Fusor(#[from] fusor_core::Error),
+    Fusor(#[from] fusor::Error),
     /// An error that can occur when tokenizing or detokenizing text.
     #[error("Failed to tokenize: {0}")]
     TokenizerError(tokenizers::Error),
@@ -156,9 +163,69 @@ pub enum Pooling {
     Mean,
     /// Take the embedding of the CLS token for each sequence
     CLS,
+    /// Take the embedding of the last token for each sequence (used by Qwen)
+    Last,
 }
 
-/// A bert embedding model. The main interface for this model is [`EmbedderExt`].
+/// An embedding model that can be either BERT or Qwen
+pub enum EmbeddingModel {
+    /// A BERT-style embedding model
+    Bert(BertModel),
+    /// A Qwen-style embedding model
+    Qwen(QwenEmbeddingModel),
+}
+
+impl EmbeddingModel {
+    /// Get the device the model is running on
+    pub fn device(&self) -> &Device {
+        match self {
+            EmbeddingModel::Bert(model) => &model.device,
+            EmbeddingModel::Qwen(model) => &model.device,
+        }
+    }
+
+    /// Get the maximum sequence length
+    pub fn max_seq_len(&self) -> usize {
+        match self {
+            EmbeddingModel::Bert(model) => model.max_seq_len(),
+            EmbeddingModel::Qwen(model) => model.max_seq_len(),
+        }
+    }
+
+    /// Get the embedding dimension
+    pub fn embedding_dim(&self) -> usize {
+        match self {
+            EmbeddingModel::Bert(model) => model.embedding_dim(),
+            EmbeddingModel::Qwen(model) => model.embedding_dim(),
+        }
+    }
+
+    /// Get the default pooling strategy for this model
+    pub fn default_pooling(&self) -> Pooling {
+        match self {
+            EmbeddingModel::Bert(_) => Pooling::CLS,
+            EmbeddingModel::Qwen(_) => Pooling::Last,
+        }
+    }
+
+    /// Forward pass through the model
+    pub fn forward(
+        &self,
+        input_ids: &Tensor<2, u32>,
+        attention_mask: Option<&Tensor<2, u32>>,
+    ) -> Tensor<3, f32> {
+        match self {
+            EmbeddingModel::Bert(model) => {
+                let token_type_ids = input_ids.zeros_like();
+                model.forward(input_ids, &token_type_ids, attention_mask)
+            }
+            EmbeddingModel::Qwen(model) => model.forward(input_ids, attention_mask),
+        }
+    }
+}
+
+/// An embedding model supporting BERT and Qwen architectures.
+/// The main interface for this model is [`EmbedderExt`].
 ///
 /// # Example
 /// ```rust, no_run
@@ -199,7 +266,7 @@ pub enum Pooling {
 #[derive(Clone)]
 pub struct Bert {
     embedding_search_prefix: Arc<Option<String>>,
-    model: Arc<BertModel>,
+    model: Arc<EmbeddingModel>,
     tokenizer: Arc<RwLock<Tokenizer>>,
 }
 
@@ -226,7 +293,11 @@ impl Bert {
         builder: BertBuilder,
         mut progress_handler: impl FnMut(ModelLoadingProgress) + Send + 'static,
     ) -> Result<Self, BertLoadingError> {
-        let BertBuilder { source, cache } = builder;
+        let BertBuilder {
+            source,
+            cache,
+            device,
+        } = builder;
         let BertSource {
             config,
             tokenizer,
@@ -234,13 +305,19 @@ impl Bert {
             search_embedding_prefix,
         } = source;
 
-        let source = format!("Config ({config})");
-        let mut create_progress = ModelLoadingProgress::downloading_progress(source);
-        let config = cache
-            .get_bytes(&config, |progress| {
-                progress_handler(create_progress(progress))
-            })
-            .await?;
+        let config_bytes = if let Some(config) = config {
+            let source = format!("Config ({config})");
+            let mut create_progress = ModelLoadingProgress::downloading_progress(source);
+            Some(
+                cache
+                    .get_bytes(&config, |progress| {
+                        progress_handler(create_progress(progress))
+                    })
+                    .await?,
+            )
+        } else {
+            None
+        };
         let tokenizer_source = format!("Tokenizer ({tokenizer})");
         let mut create_progress = ModelLoadingProgress::downloading_progress(tokenizer_source);
         let tokenizer_bytes = cache
@@ -256,14 +333,32 @@ impl Bert {
             })
             .await?;
 
-        let config: Config =
-            serde_json::from_slice(&config).map_err(BertLoadingError::LoadConfig)?;
-
-        let device = Device::new().await?;
+        let device = match device {
+            Some(device) => device,
+            None => Device::auto().await,
+        };
         let mut weights = std::io::Cursor::new(&weights_bytes);
         let mut vb = VarBuilder::from_gguf(&mut weights)
-            .map_err(|err| BertLoadingError::LoadModel(err.into()))?;
-        let model = BertModel::load(&device, &mut vb, &config)?;
+            .map_err(|err| BertLoadingError::LoadModel(fusor::Error::from(err)))?;
+
+        // Detect architecture from GGUF metadata
+        let architecture = vb.architecture();
+        let model = match architecture.as_deref() {
+            Some("qwen3") | Some("qwen2") => {
+                // Load Qwen embedding model
+                let qwen_model = QwenEmbeddingModel::load(&device, &mut vb)?;
+                EmbeddingModel::Qwen(qwen_model)
+            }
+            _ => {
+                // Load BERT model (default)
+                let config_bytes = config_bytes.ok_or(BertLoadingError::ConfigNotFound)?;
+                let config: Config =
+                    serde_json::from_slice(&config_bytes).map_err(BertLoadingError::LoadConfig)?;
+                let bert_model = BertModel::load(&device, &mut vb, &config)?;
+                EmbeddingModel::Bert(bert_model)
+            }
+        };
+
         let mut tokenizer =
             Tokenizer::from_bytes(&tokenizer_bytes).map_err(BertLoadingError::LoadTokenizer)?;
         tokenizer.with_padding(None);
@@ -282,8 +377,10 @@ impl Bert {
         pooling: Pooling,
     ) -> Result<Vec<Tensor<2, f32>>, BertError> {
         let embedding_dim = self.model.embedding_dim();
-        // The batch size limit (input length * memory per token)
-        let limit = embedding_dim * 512usize.pow(2) * 2;
+        // Approximates the quadratic attention memory cost (seq_len^2).
+        // Batches are split so that total work stays below this threshold.
+        const MAX_BATCH_TOKENS_SQUARED: usize = 512 * 512;
+        let limit = embedding_dim * MAX_BATCH_TOKENS_SQUARED * 2;
 
         // The sentences we are embedding may have a very different length. First we sort them so that similar length sentences are grouped together in the same batch to reduce the overhead of padding.
         let encodings = {
@@ -343,9 +440,16 @@ impl Bert {
         if tokens.is_empty() {
             return Ok(Vec::new());
         }
-        let device = &self.model.device;
+        let device = self.model.device();
+        // Qwen models use last-token pooling and require left padding so the
+        // last position always contains the final content token.
+        let padding_direction = match pooling {
+            Pooling::Last => PaddingDirection::Left,
+            _ => PaddingDirection::Right,
+        };
         let pp = PaddingParams {
             strategy: tokenizers::PaddingStrategy::BatchLongest,
+            direction: padding_direction,
             ..Default::default()
         };
         tokenizers::pad_encodings(&mut tokens, &pp).map_err(BertError::TokenizerError)?;
@@ -370,11 +474,7 @@ impl Bert {
         });
         let attention_mask = Tensor::stack(attention_masks, 0);
 
-        // The token type ids are only used for next sentence prediction. We can just set them to zero for embedding tasks.
-        let token_type_ids = token_ids.zeros_like();
-        let embeddings = self
-            .model
-            .forward(&token_ids, &token_type_ids, Some(&attention_mask));
+        let embeddings = self.model.forward(&token_ids, Some(&attention_mask));
 
         let shape = embeddings.shape();
         let n_tokens = shape[1];
@@ -382,20 +482,47 @@ impl Bert {
         match pooling {
             Pooling::Mean => {
                 // Take the mean embedding value for all tokens (except padding)
-                // For now, skip masking and just compute the mean
-                let embeddings = embeddings.sum(1) / (n_tokens as f32);
+                // Cast mask u32→f32, unsqueeze to [batch, seq_len, 1] for broadcasting
+                let mask_f32: Tensor<2, f32> = attention_mask.cast();
+                let mask_3d: Tensor<3, f32, _> = mask_f32.unsqueeze(2).to_concrete();
+                // Zero out padding positions, sum along seq dim → [batch, hidden_dim]
+                let masked_embeddings = (embeddings * mask_3d).to_concrete();
+                let summed = masked_embeddings.sum::<2>(1);
+                // Divide by valid token count [batch, 1] — broadcasts with [batch, hidden_dim]
+                let valid_count = mask_f32.sum_keepdim::<1>(1);
+                let embeddings = summed.div_(&valid_count);
                 let embeddings = normalize_l2(&embeddings);
-                Ok(embeddings.chunk(n_sentences, 0)?)
+                Ok(embeddings
+                    .chunk(n_sentences, 0)
+                    .into_iter()
+                    .map(|c| c.to_concrete())
+                    .collect())
             }
             Pooling::CLS => {
                 // Index into the first token of each sentence which is the CLS token that contains the sentence embedding
-                let indexed_embeddings = embeddings.i((.., 0, ..));
-                Ok(indexed_embeddings.chunk(n_sentences, 0)?)
+                let indexed_embeddings = embeddings.to_concrete().i((.., 0, ..));
+                Ok(indexed_embeddings
+                    .chunk(n_sentences, 0)
+                    .into_iter()
+                    .map(|c| c.to_concrete())
+                    .collect())
+            }
+            Pooling::Last => {
+                // With left padding, the last token is always at the final position
+                let indexed_embeddings = embeddings.to_concrete().i((.., n_tokens - 1, ..));
+                let normalized = normalize_l2(&indexed_embeddings);
+                Ok(normalized
+                    .chunk(n_sentences, 0)
+                    .into_iter()
+                    .map(|c| c.to_concrete())
+                    .collect())
             }
         }
     }
 }
 
-fn normalize_l2<D: DataType>(v: &Tensor<2, D>) -> Tensor<2, D> {
-    v.div_(&v.sqr().sum_keepdim(1).sqrt())
+fn normalize_l2(v: &Tensor<2, f32>) -> Tensor<2, f32> {
+    let v_sqr = v.sqr().to_concrete();
+    let sum_sq = v_sqr.sum_keepdim::<1>(1);
+    v.div_(&(sum_sq + 1e-12f32).to_concrete().sqrt())
 }

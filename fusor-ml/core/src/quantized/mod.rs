@@ -1,12 +1,13 @@
 use crate::{
     DataTypeEnum, Device,
     quantized_types_wgsl::{
-        write_q4_0_type, write_q4_k_type, write_q5_0_type, write_q6_k_type, write_q8_0_type,
+        write_q4_0_type, write_q4_k_type, write_q5_0_type, write_q5_k_type, write_q6_k_type,
+        write_q8_0_type,
     },
 };
 use fusor_gguf::{
-    BlockQ4_0, BlockQ4K, BlockQ5_0, BlockQ6K, BlockQ8_0, GgmlType, GgufBlock, GgufMetadata,
-    GgufReadError, GgufTensorMetadata,
+    BlockQ4_0, BlockQ4K, BlockQ5_0, BlockQ5K, BlockQ6K, BlockQ8_0, GgmlType, GgufBlock,
+    GgufMetadata, GgufReadError, GgufTensorMetadata,
 };
 use std::{
     fmt::{Display, Write},
@@ -63,7 +64,14 @@ impl QMatrix {
         QMatrix::from_parts(device, &bytes, shape, ty)
     }
 
-    pub(crate) fn from_parts(
+    /// Create a QMatrix from raw quantized bytes.
+    ///
+    /// # Arguments
+    /// * `device` - The GPU device to create the matrix on
+    /// * `bytes` - Raw quantized bytes
+    /// * `shape` - The logical shape in elements (not blocks)
+    /// * `ty` - The quantization type
+    pub fn from_parts(
         device: &Device,
         bytes: &[u8],
         shape: Box<[usize]>,
@@ -123,6 +131,22 @@ impl QMatrix {
                         .collect()
                 }
             }
+            GgmlType::Q5K => {
+                let slice = bytemuck::cast_slice::<_, BlockQ5K>(bytes);
+                if use_f16 {
+                    slice
+                        .iter()
+                        .copied()
+                        .flat_map(BlockQ5K::into_wgsl_bytes)
+                        .collect()
+                } else {
+                    slice
+                        .iter()
+                        .copied()
+                        .flat_map(BlockQ5K::into_wgsl_bytes_f32)
+                        .collect()
+                }
+            }
             GgmlType::Q6K => {
                 let map = if use_f16 {
                     BlockQ6K::into_wgsl_bytes
@@ -178,11 +202,13 @@ impl QMatrix {
         &self.shape
     }
 
-    pub(crate) fn device(&self) -> &Device {
+    /// Returns the device this matrix is on.
+    pub fn device(&self) -> &Device {
         &self.device
     }
 
-    pub(crate) fn datatype(&self) -> GgmlType {
+    /// Returns the quantization type.
+    pub fn datatype(&self) -> GgmlType {
         self.datatype
     }
 }
@@ -199,6 +225,7 @@ pub(crate) fn dequantize_block<W: Write>(
         GgmlType::Q5_0 => BlockQ5_0::dequantize_block(chunk, datatype, process_element, kernel),
         GgmlType::Q8_0 => BlockQ8_0::dequantize_block(chunk, datatype, process_element, kernel),
         GgmlType::Q4K => BlockQ4K::dequantize_block(chunk, datatype, process_element, kernel),
+        GgmlType::Q5K => BlockQ5K::dequantize_block(chunk, datatype, process_element, kernel),
         GgmlType::Q6K => BlockQ6K::dequantize_block(chunk, datatype, process_element, kernel),
         GgmlType::F16 | GgmlType::F32 => {
             process_element("0".to_string(), format!("{datatype}({chunk})"), kernel);
@@ -228,6 +255,9 @@ pub(crate) fn unrolled_dequantize_block<W: Write>(
         GgmlType::Q4K => {
             BlockQ4K::unrolled_dequantize_block(chunk, datatype, process_element, kernel)
         }
+        GgmlType::Q5K => {
+            BlockQ5K::unrolled_dequantize_block(chunk, datatype, process_element, kernel)
+        }
         GgmlType::Q6K => {
             BlockQ6K::unrolled_dequantize_block(chunk, datatype, process_element, kernel)
         }
@@ -256,6 +286,7 @@ pub(crate) fn dequantize_vec4_block<W: Write>(
             BlockQ8_0::dequantize_vec4_block(chunk, datatype, process_element, kernel)
         }
         GgmlType::Q4K => BlockQ4K::dequantize_vec4_block(chunk, datatype, process_element, kernel),
+        GgmlType::Q5K => BlockQ5K::dequantize_vec4_block(chunk, datatype, process_element, kernel),
         GgmlType::Q6K => BlockQ6K::dequantize_vec4_block(chunk, datatype, process_element, kernel),
         _ => todo!(),
     }
@@ -286,6 +317,10 @@ pub(crate) fn dequantize_mat4x4_block<W: Write>(
             BlockQ4K::dequantize_4x4_block(index, chunk, datatype, process_element, kernel);
             true
         }
+        GgmlType::Q5K => {
+            BlockQ5K::dequantize_4x4_block(index, chunk, datatype, process_element, kernel);
+            true
+        }
         GgmlType::Q6K => {
             BlockQ6K::dequantize_4x4_block(index, chunk, datatype, process_element, kernel);
             true
@@ -300,6 +335,7 @@ pub(crate) fn dequantize_mat4x4_block_count(ty: GgmlType) -> usize {
         GgmlType::Q5_0 => BlockQ5_0::MATRIX_BLOCKS,
         GgmlType::Q8_0 => BlockQ8_0::MATRIX_BLOCKS,
         GgmlType::Q4K => BlockQ4K::MATRIX_BLOCKS,
+        GgmlType::Q5K => BlockQ5K::MATRIX_BLOCKS,
         GgmlType::Q6K => BlockQ6K::MATRIX_BLOCKS,
         _ => 0,
     }
@@ -1223,6 +1259,454 @@ impl WgslQuantizedType for BlockQ4K {
     }
 }
 
+impl WgslQuantizedType for BlockQ5K {
+    const GGML_TYPE: GgmlType = GgmlType::Q5K;
+
+    const MATRIX_BLOCKS: usize = 16;
+
+    fn dequantize_block<W: Write>(
+        chunk: String,
+        datatype: DataTypeEnum,
+        mut process_element: impl FnMut(String, String, &mut W),
+        code: &mut W,
+    ) {
+        writeln!(code, "let super_block_scale = {datatype}({chunk}.scale);").unwrap();
+        writeln!(code, "let super_block_min = {datatype}({chunk}.min);").unwrap();
+
+        writeln!(code, "let first_four_bytes = {chunk}.scales[0];").unwrap();
+        writeln!(code, "let middle_four_bytes = {chunk}.scales[1];").unwrap();
+        writeln!(code, "let last_four_bytes = {chunk}.scales[2];").unwrap();
+
+        // Extract scales and offsets (same as Q4K)
+        writeln!(
+            code,
+            "let first_scales = first_four_bytes & {SIX_BITS_MASK};"
+        )
+        .unwrap();
+        writeln!(
+            code,
+            "let first_offsets = middle_four_bytes & {SIX_BITS_MASK};"
+        )
+        .unwrap();
+
+        writeln!(
+            code,
+            "let msb_scales = (first_four_bytes & {MSB_TWO_BITS_MASK}) >> 2;"
+        )
+        .unwrap();
+        writeln!(
+            code,
+            "let lsb_scales = last_four_bytes & {MSB_SCALES_MASK};"
+        )
+        .unwrap();
+        writeln!(code, "let second_scales = msb_scales | lsb_scales;").unwrap();
+        writeln!(
+            code,
+            "let msb_offsets = (middle_four_bytes & {MSB_TWO_BITS_MASK}) >> 2;"
+        )
+        .unwrap();
+        writeln!(
+            code,
+            "let lsb_offsets = (last_four_bytes & {MSB_OFFSET_MASK}) >> 4;"
+        )
+        .unwrap();
+        writeln!(code, "let second_offsets = msb_offsets | lsb_offsets;").unwrap();
+
+        writeln!(code, "var qs_index = 0u;").unwrap();
+        writeln!(code, "var output_index = 0u;").unwrap();
+
+        // Process each of the 4 chunks
+        // Each chunk uses a pair of bits from qh:
+        // Chunk 0: bits 0,1; Chunk 1: bits 2,3; Chunk 2: bits 4,5; Chunk 3: bits 6,7
+        let mut run_single_chunk =
+            |scales: &str, offsets: &str, suffix: &str, bit_pos_low: u32, bit_pos_high: u32| {
+                writeln!(code, "{{").unwrap();
+                writeln!(
+                    code,
+                    "let chunk_scales = vec4<{datatype}>(unpack4xU8({scales})) * super_block_scale;"
+                )
+                .unwrap();
+                writeln!(code, "let low_scale = chunk_scales.{suffix};").unwrap();
+                // Q5K uses sequential scale indices without division (unlike Q4K)
+                let high_suffix = if suffix == "x" { "y" } else { "w" };
+                writeln!(code, "let high_scale = chunk_scales.{high_suffix};").unwrap();
+                writeln!(
+                    code,
+                    "let chunk_offsets = vec4<{datatype}>(unpack4xU8({offsets})) * super_block_min;"
+                )
+                .unwrap();
+                writeln!(code, "let low_offset = chunk_offsets.{suffix};").unwrap();
+                writeln!(code, "let high_offset = chunk_offsets.{high_suffix};").unwrap();
+
+                writeln!(code, "for (var i = 0u; i < 32u; i += 4) {{").unwrap();
+                writeln!(code, "let qs_chunk = {chunk}.qs[qs_index];").unwrap();
+                writeln!(code, "let qh_chunk = {chunk}.qh[i / 4u];").unwrap();
+
+                // Extract low 4 bits and high 4 bits from qs
+                writeln!(code, "let qs_low = unpack4xU8(qs_chunk & {LOW_FOUR_BITS});").unwrap();
+                // High nibbles need to be shifted right by 4 to get values 0-15
+                writeln!(
+                    code,
+                    "let qs_high = unpack4xU8(qs_chunk & {HIGH_FOUR_BITS}) >> vec4<u32>(4u);"
+                )
+                .unwrap();
+
+                // Extract high bits from qh for low and high nibbles
+                // Each byte's bit at position bit_pos_* determines if we add 16
+                writeln!(code, "let qh_bytes = unpack4xU8(qh_chunk);").unwrap();
+                writeln!(
+                    code,
+                    "let qh_low = ((qh_bytes >> vec4<u32>({bit_pos_low}u)) & vec4<u32>(1u)) * 16u;"
+                )
+                .unwrap();
+                writeln!(
+                code,
+                "let qh_high = ((qh_bytes >> vec4<u32>({bit_pos_high}u)) & vec4<u32>(1u)) * 16u;"
+            )
+            .unwrap();
+
+                // Combine: value = (qs_nibble + high_bit * 16)
+                writeln!(
+                    code,
+                    "let weight_chunk_low = vec4<{datatype}>(qs_low + qh_low);"
+                )
+                .unwrap();
+                writeln!(
+                    code,
+                    "let weight_chunk_high = vec4<{datatype}>(qs_high + qh_high);"
+                )
+                .unwrap();
+
+                writeln!(
+                    code,
+                    "let low_result = weight_chunk_low * low_scale - low_offset;"
+                )
+                .unwrap();
+                writeln!(
+                    code,
+                    "let high_result = weight_chunk_high * high_scale - high_offset;"
+                )
+                .unwrap();
+                for i in 0..4 {
+                    process_element(
+                        format!("output_index + i + {i}u"),
+                        format!("low_result[{i}]"),
+                        code,
+                    );
+                    process_element(
+                        format!("output_index + i + {i}u + 32u"),
+                        format!("high_result[{i}]"),
+                        code,
+                    );
+                }
+                writeln!(code, "qs_index += 1;").unwrap();
+                writeln!(code, "}}").unwrap();
+                writeln!(code, "output_index += 64;").unwrap();
+                writeln!(code, "}}").unwrap();
+            };
+
+        // Chunk 0: first_scales.x/y, bits 0,1
+        run_single_chunk("first_scales", "first_offsets", "x", 0, 1);
+        // Chunk 1: first_scales.z/w, bits 2,3
+        run_single_chunk("first_scales", "first_offsets", "z", 2, 3);
+        // Chunk 2: second_scales.x/y, bits 4,5
+        run_single_chunk("second_scales", "second_offsets", "x", 4, 5);
+        // Chunk 3: second_scales.z/w, bits 6,7
+        run_single_chunk("second_scales", "second_offsets", "z", 6, 7);
+    }
+
+    fn unrolled_dequantize_block<W: Write>(
+        chunk: String,
+        datatype: DataTypeEnum,
+        mut process_element: impl FnMut(u32, String, &mut W),
+        code: &mut W,
+    ) {
+        writeln!(code, "let super_block_scale = {datatype}({chunk}.scale);").unwrap();
+        writeln!(code, "let super_block_min = {datatype}({chunk}.min);").unwrap();
+
+        writeln!(code, "let first_four_bytes = {chunk}.scales[0];").unwrap();
+        writeln!(code, "let middle_four_bytes = {chunk}.scales[1];").unwrap();
+        writeln!(code, "let last_four_bytes = {chunk}.scales[2];").unwrap();
+
+        writeln!(
+            code,
+            "let first_scales = first_four_bytes & {SIX_BITS_MASK};"
+        )
+        .unwrap();
+        writeln!(
+            code,
+            "let first_offsets = middle_four_bytes & {SIX_BITS_MASK};"
+        )
+        .unwrap();
+
+        writeln!(
+            code,
+            "let msb_scales = (first_four_bytes & {MSB_TWO_BITS_MASK}) >> 2;"
+        )
+        .unwrap();
+        writeln!(
+            code,
+            "let lsb_scales = last_four_bytes & {MSB_SCALES_MASK};"
+        )
+        .unwrap();
+        writeln!(code, "let second_scales = msb_scales | lsb_scales;").unwrap();
+        writeln!(
+            code,
+            "let msb_offsets = (middle_four_bytes & {MSB_TWO_BITS_MASK}) >> 2;"
+        )
+        .unwrap();
+        writeln!(
+            code,
+            "let lsb_offsets = (last_four_bytes & {MSB_OFFSET_MASK}) >> 4;"
+        )
+        .unwrap();
+        writeln!(code, "let second_offsets = msb_offsets | lsb_offsets;").unwrap();
+
+        let mut qs_index = 0;
+        let mut output_index = 0;
+
+        let mut run_chunk = |scales: &str,
+                             offsets: &str,
+                             suffix: &str,
+                             bit_pos_low: u32,
+                             bit_pos_high: u32,
+                             output_index: &mut u32,
+                             qs_index: &mut u32| {
+            writeln!(
+                code,
+                "let scales_{suffix} = vec4<{datatype}>(unpack4xU8({scales})) * super_block_scale;"
+            )
+            .unwrap();
+            // Q5K uses scales without division - each scale is used as-is
+            writeln!(code, "let low_scales_{suffix} = scales_{suffix}.xz;").unwrap();
+            writeln!(code, "let high_scales_{suffix} = scales_{suffix}.yw;").unwrap();
+            writeln!(
+                code,
+                "let offsets_{suffix} = vec4<{datatype}>(unpack4xU8({offsets})) * super_block_min;"
+            )
+            .unwrap();
+            writeln!(code, "let low_offsets_{suffix} = offsets_{suffix}.xz;").unwrap();
+            writeln!(code, "let high_offsets_{suffix} = offsets_{suffix}.yw;").unwrap();
+
+            for (i, local_suffix) in ["x", "y"].iter().enumerate() {
+                // Bit positions for this sub-chunk
+                let sub_bit_low = bit_pos_low + i as u32 * 2;
+                let sub_bit_high = bit_pos_high + i as u32 * 2;
+                for index in (0..32).step_by(4) {
+                    let qh_idx = index / 4;
+                    writeln!(
+                        code,
+                        "let qs_chunk_{local_suffix}_{suffix}_{index} = {chunk}.qs[{qs_index}];"
+                    )
+                    .unwrap();
+                    writeln!(
+                        code,
+                        "let qh_chunk_{local_suffix}_{suffix}_{index} = {chunk}.qh[{qh_idx}];"
+                    )
+                    .unwrap();
+                    writeln!(code, "let qs_low_{local_suffix}_{suffix}_{index} = unpack4xU8(qs_chunk_{local_suffix}_{suffix}_{index} & {LOW_FOUR_BITS});").unwrap();
+                    // High nibbles need to be shifted right by 4
+                    writeln!(code, "let qs_high_{local_suffix}_{suffix}_{index} = unpack4xU8(qs_chunk_{local_suffix}_{suffix}_{index} & {HIGH_FOUR_BITS}) >> vec4<u32>(4u);").unwrap();
+                    // Extract qh bits per byte using proper bit extraction
+                    writeln!(code, "let qh_bytes_{local_suffix}_{suffix}_{index} = unpack4xU8(qh_chunk_{local_suffix}_{suffix}_{index});").unwrap();
+                    writeln!(code, "let qh_low_{local_suffix}_{suffix}_{index} = ((qh_bytes_{local_suffix}_{suffix}_{index} >> vec4<u32>({sub_bit_low}u)) & vec4<u32>(1u)) * 16u;").unwrap();
+                    writeln!(code, "let qh_high_{local_suffix}_{suffix}_{index} = ((qh_bytes_{local_suffix}_{suffix}_{index} >> vec4<u32>({sub_bit_high}u)) & vec4<u32>(1u)) * 16u;").unwrap();
+                    writeln!(code, "let weight_chunk_low_{local_suffix}_{suffix}_{index} = vec4<{datatype}>(qs_low_{local_suffix}_{suffix}_{index} + qh_low_{local_suffix}_{suffix}_{index});").unwrap();
+                    writeln!(code, "let weight_chunk_high_{local_suffix}_{suffix}_{index} = vec4<{datatype}>(qs_high_{local_suffix}_{suffix}_{index} + qh_high_{local_suffix}_{suffix}_{index});").unwrap();
+                    writeln!(code, "let low_result_{local_suffix}_{suffix}_{index} = weight_chunk_low_{local_suffix}_{suffix}_{index} * low_scales_{suffix}.{local_suffix} - low_offsets_{suffix}.{local_suffix};").unwrap();
+                    writeln!(code, "let high_result_{local_suffix}_{suffix}_{index} = weight_chunk_high_{local_suffix}_{suffix}_{index} * high_scales_{suffix}.{local_suffix} - high_offsets_{suffix}.{local_suffix};").unwrap();
+                    for i in 0..4 {
+                        process_element(
+                            *output_index + i + index,
+                            format!("low_result_{local_suffix}_{suffix}_{index}[{i}]"),
+                            code,
+                        );
+                        process_element(
+                            *output_index + i + index + 32,
+                            format!("high_result_{local_suffix}_{suffix}_{index}[{i}]"),
+                            code,
+                        );
+                    }
+                    *qs_index += 1;
+                }
+                *output_index += 64;
+            }
+        };
+
+        // First call handles chunks 0 and 1 (outputs 0..127)
+        // Chunk 0: bits 0,1; Chunk 1: bits 2,3
+        run_chunk(
+            "first_scales",
+            "first_offsets",
+            "first",
+            0, // bit_pos_low for chunk 0
+            1, // bit_pos_high for chunk 0
+            &mut output_index,
+            &mut qs_index,
+        );
+        // Second call handles chunks 2 and 3 (outputs 128..255)
+        // Chunk 2: bits 4,5; Chunk 3: bits 6,7
+        run_chunk(
+            "second_scales",
+            "second_offsets",
+            "second",
+            4, // bit_pos_low for chunk 2
+            5, // bit_pos_high for chunk 2
+            &mut output_index,
+            &mut qs_index,
+        );
+    }
+
+    fn dequantize_4x4_block<W: Write>(
+        index: &str,
+        chunk: String,
+        datatype: DataTypeEnum,
+        process_element: impl FnOnce(String, &mut W),
+        code: &mut W,
+    ) {
+        writeln!(code, "let super_block_scale = {datatype}({chunk}.scale);").unwrap();
+        writeln!(code, "let super_block_min = {datatype}({chunk}.min);").unwrap();
+
+        // Determine which of the 4 64-element groups this index belongs to
+        writeln!(code, "let scale_group = {index} / 4u;").unwrap();
+        writeln!(code, "let sub_chunk = {index} % 4u;").unwrap();
+
+        // Select the appropriate scales and offsets
+        {
+            writeln!(code, "let first_four_bytes = {chunk}.scales[0];").unwrap();
+            writeln!(code, "let middle_four_bytes = {chunk}.scales[1];").unwrap();
+            writeln!(code, "let last_four_bytes = {chunk}.scales[2];").unwrap();
+
+            writeln!(
+                code,
+                "let first_scales = first_four_bytes & {SIX_BITS_MASK};"
+            )
+            .unwrap();
+            writeln!(
+                code,
+                "let first_offsets = middle_four_bytes & {SIX_BITS_MASK};"
+            )
+            .unwrap();
+
+            writeln!(
+                code,
+                "let msb_scales = (first_four_bytes & {MSB_TWO_BITS_MASK}) >> 2;"
+            )
+            .unwrap();
+            writeln!(
+                code,
+                "let lsb_scales = last_four_bytes & {MSB_SCALES_MASK};"
+            )
+            .unwrap();
+            writeln!(code, "let second_scales = msb_scales | lsb_scales;").unwrap();
+            writeln!(
+                code,
+                "let msb_offsets = (middle_four_bytes & {MSB_TWO_BITS_MASK}) >> 2;"
+            )
+            .unwrap();
+            writeln!(
+                code,
+                "let lsb_offsets = (last_four_bytes & {MSB_OFFSET_MASK}) >> 4;"
+            )
+            .unwrap();
+            writeln!(code, "let second_offsets = msb_offsets | lsb_offsets;").unwrap();
+            writeln!(
+                code,
+                "let scales_u32 = select(first_scales, second_scales, scale_group >= 2u);"
+            )
+            .unwrap();
+            writeln!(
+                code,
+                "let offsets_u32 = select(first_offsets, second_offsets, scale_group >= 2u);"
+            )
+            .unwrap();
+        }
+        writeln!(code, "let scale_component_idx = scale_group % 2u;").unwrap();
+
+        writeln!(
+            code,
+            "let scales_vec = vec4<{datatype}>(unpack4xU8(scales_u32)) * super_block_scale;"
+        )
+        .unwrap();
+        writeln!(
+            code,
+            "let offsets_vec = vec4<{datatype}>(unpack4xU8(offsets_u32)) * super_block_min;"
+        )
+        .unwrap();
+
+        // Q5K uses separate scales for low and high nibbles without division
+        writeln!(
+            code,
+            "let scale = scales_vec[sub_chunk / 2 + (scale_group % 2)*2];"
+        )
+        .unwrap();
+        writeln!(
+            code,
+            "let offset = offsets_vec[sub_chunk / 2 + (scale_group % 2)*2];",
+        )
+        .unwrap();
+
+        // Calculate the weight base index for qs array
+        writeln!(
+            code,
+            "let qs_base = (scale_group * 8u) + ((sub_chunk & 1u) * 4u);"
+        )
+        .unwrap();
+
+        writeln!(code, "let is_high = sub_chunk >= 2u;").unwrap();
+
+        // Calculate qh_base: which 16-byte section of qh we're processing
+        // sub_chunk 0,2 -> qh bytes 0..15 (qh u32 indices 0..3)
+        // sub_chunk 1,3 -> qh bytes 16..31 (qh u32 indices 4..7)
+        writeln!(code, "let qh_base = (sub_chunk & 1u) * 4u;").unwrap();
+
+        // Calculate high bit shift based on scale_group and whether we're processing high nibbles
+        // scale_group 0: low=bit 0, high=bit 1
+        // scale_group 1: low=bit 2, high=bit 3
+        // scale_group 2: low=bit 4, high=bit 5
+        // scale_group 3: low=bit 6, high=bit 7
+        writeln!(
+            code,
+            "let qh_bit_pos = scale_group * 2u + select(0u, 1u, is_high);"
+        )
+        .unwrap();
+
+        // Load and process each of the 4 u32 values from qs and qh
+        for i in 0..4 {
+            writeln!(code, "let qs_val_{i} = {chunk}.qs[qs_base + {i}u];").unwrap();
+            writeln!(code, "let qh_val_{i} = {chunk}.qh[qh_base + {i}u];").unwrap();
+            // Extract nibbles: low or high, with proper shift for high nibbles
+            writeln!(code, "let qs_nibble_{i} = select(qs_val_{i} & {LOW_FOUR_BITS}u, (qs_val_{i} & {HIGH_FOUR_BITS}u) >> 4u, is_high);").unwrap();
+            // Extract qh bits per byte: unpack to get individual bytes, then extract the specific bit
+            writeln!(code, "let qh_bytes_{i} = unpack4xU8(qh_val_{i});").unwrap();
+            writeln!(
+                code,
+                "let qh_bits_{i} = ((qh_bytes_{i} >> vec4<u32>(qh_bit_pos)) & vec4<u32>(1u)) * 16u;"
+            )
+            .unwrap();
+            writeln!(
+                code,
+                "let vec_{i} = vec4<{datatype}>(unpack4xU8(qs_nibble_{i}) + qh_bits_{i});"
+            )
+            .unwrap();
+            writeln!(code, "let result_{i} = vec_{i} * scale - offset;").unwrap();
+        }
+
+        // Construct the mat4x4 from the 4 vec4s
+        writeln!(
+            code,
+            "let result = mat4x4<{datatype}>(result_0, result_1, result_2, result_3);"
+        )
+        .unwrap();
+
+        process_element("result".to_string(), code);
+    }
+
+    fn write_type<W: Write>(f: &mut W, use_f16: bool) -> std::fmt::Result {
+        write_q5_k_type(f, use_f16)
+    }
+}
+
 const CENTER_SIX_BIT: i8 = center_of_bit_space(6) as i8;
 const FIRST_TWO_BITS: u8 = 0b11000000;
 const SECOND_TWO_BITS: u8 = 0b00110000;
@@ -1599,6 +2083,12 @@ async fn test_fuzz_de_quantize_6_k_block() {
 }
 
 #[cfg(test)]
+#[tokio::test]
+async fn test_fuzz_de_quantize_5_k_block() {
+    fuzz_de_quantize::<BlockQ5K>().await;
+}
+
+#[cfg(test)]
 async fn fuzz_de_quantize<B: WgslQuantizedType + PartialEq + std::fmt::Debug>()
 where
     rand::distr::StandardUniform:
@@ -1721,7 +2211,7 @@ where
                 .wgpu_device()
                 .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
                     label: None,
-                    bind_group_layouts: &[&bind_group_layout],
+                    bind_group_layouts: &[Some(&bind_group_layout)],
                     immediate_size: 0,
                 });
         let module = device.create_shader_module(kernel);
@@ -1937,7 +2427,7 @@ where
                 .wgpu_device()
                 .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
                     label: None,
-                    bind_group_layouts: &[&bind_group_layout],
+                    bind_group_layouts: &[Some(&bind_group_layout)],
                     immediate_size: 0,
                 });
         let module = device.create_shader_module(kernel);

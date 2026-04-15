@@ -1,9 +1,10 @@
-use fusor_core::{
-    cache::KvCache, CastTensor, Device, FloatDataType, Result, Tensor, VarBuilder, D,
+use fusor::{
+    arange, cache::KvCache, CastTensor, CastTo, Device, FloatDataType, FloatOps, MatmulImpl,
+    Result, SimdElement, Tensor, VarBuilder,
 };
 use fusor_gguf::GgufMetadata;
 
-use crate::raw::rope::RopeCache;
+use fusor::RopeCache;
 
 use super::{
     qwen_image_processing::process_image,
@@ -15,7 +16,7 @@ use super::{
     QWEN_EPS,
 };
 
-pub(crate) struct QwenVisionTransformer<F: FloatDataType = f32> {
+pub(crate) struct QwenVisionTransformer<F: FloatDataType + SimdElement = f32> {
     pub(crate) spacial_merge_size: usize,
     patch_size: usize,
     temporal_patch_size: usize,
@@ -31,10 +32,13 @@ pub(crate) struct QwenVisionTransformer<F: FloatDataType = f32> {
     device: Device,
 }
 
-impl<F: FloatDataType> QwenVisionTransformer<F>
+impl<F: FloatDataType + SimdElement + FloatOps + MatmulImpl> QwenVisionTransformer<F>
 where
-    f32: CastTensor<F>,
-    F: CastTensor<f32>,
+    F: CastTo<f32> + CastTensor<f32>,
+    f32: CastTo<F> + CastTensor<F>,
+    fusor::MulOp: fusor::SimdBinaryOp<F>,
+    fusor::AddOp: fusor::SimdBinaryOp<F>,
+    fusor::SumOp: fusor::SimdReduceOp<F>,
 {
     pub(crate) fn from_gguf(
         vision_ct: GgufMetadata,
@@ -201,7 +205,7 @@ where
         let device = &self.device;
         let mut pos_ids = vec![];
         for [t, h, w] in grid_thw {
-            let hpos_ids = Tensor::arange(device, 0, *h)
+            let hpos_ids = arange(device, 0u32, *h)
                 .unsqueeze(1)
                 .expand([*h as usize, *w as usize])
                 .reshape([
@@ -211,9 +215,10 @@ where
                     self.spacial_merge_size,
                 ])
                 .permute([0, 2, 1, 3])
-                .flatten_all();
+                .flatten_all()
+                .to_concrete();
 
-            let wpos_ids = Tensor::arange(device, 0, *w)
+            let wpos_ids = arange(device, 0u32, *w)
                 .unsqueeze(0)
                 .expand([*h as usize, *w as usize])
                 .reshape([
@@ -223,8 +228,12 @@ where
                     self.spacial_merge_size,
                 ])
                 .permute([0, 2, 1, 3])
-                .flatten_all();
-            let pos_id = Tensor::stack([hpos_ids, wpos_ids], D::Minus1).repeat([*t as usize, 1]);
+                .flatten_all()
+                .to_concrete();
+            // Stack along last dimension (dimension 1 for 2D result)
+            let pos_id = Tensor::stack([hpos_ids, wpos_ids], 1)
+                .repeat([*t as usize, 1])
+                .to_concrete();
             pos_ids.push(pos_id);
         }
         let pos_ids = Tensor::cat(pos_ids, 0);
@@ -235,11 +244,14 @@ where
             .unwrap_or_default();
         let rotary_pos_emb_full = self.rotary_pos_emb.make_embeds(max_grid_size)?;
 
-        let rotary_pos_emb_0 = rotary_pos_emb_full.index_select(0, &pos_ids.i((.., 0)));
+        let rotary_pos_emb_0 =
+            rotary_pos_emb_full.index_select(0, &pos_ids.i((.., 0)).to_concrete());
 
-        let rotary_pos_emb_1 = rotary_pos_emb_full.index_select(0, &pos_ids.i((.., 1)));
+        let rotary_pos_emb_1 =
+            rotary_pos_emb_full.index_select(0, &pos_ids.i((.., 1)).to_concrete());
 
-        let rotary_pos_emb = Tensor::cat([rotary_pos_emb_0, rotary_pos_emb_1], D::Minus1);
+        // Cat along last dimension (dimension 1 for 2D result)
+        let rotary_pos_emb = Tensor::cat([rotary_pos_emb_0, rotary_pos_emb_1], 1);
 
         Ok(rotary_pos_emb)
     }
@@ -289,7 +301,8 @@ where
                 .collect::<Vec<_>>(),
         )
         .reshape(((), 3))
-        .t();
+        .t()
+        .to_concrete();
 
         Ok((tensor, max_time_index))
     }
@@ -306,7 +319,7 @@ where
         &self,
         hidden_states: &Tensor<2, F>,
         grid_thw: &Vec<[u32; 3]>,
-        mut cache: Option<&mut KvCache<F>>,
+        mut cache: Option<&mut KvCache<f32>>,
     ) -> Result<Tensor<2, F>> {
         let hidden_states = self.patch_embed.forward(hidden_states)?;
         let rotary_pos_emb = self.rot_pos_emb(grid_thw)?;
@@ -329,22 +342,25 @@ where
             true
         });
 
-        let seq_len = hidden_states.shape()[0];
-        let hidden_states = hidden_states.reshape((
-            seq_len / self.spacial_merge_unit,
-            self.spacial_merge_unit,
-            (),
-        ));
+        let seq_len: usize = hidden_states.shape()[0];
+        let dim1 = seq_len / self.spacial_merge_unit;
+        let dim2 = self.spacial_merge_unit;
+        let hidden_states = hidden_states.reshape([dim1, dim2, hidden_states.shape()[1]]);
         let hidden_states = hidden_states.index_select(0, &window_index);
-        let mut hidden_states = hidden_states.reshape((seq_len, ()));
-        let rotary_pos_emb = rotary_pos_emb.reshape((
-            seq_len / self.spacial_merge_unit,
-            self.spacial_merge_unit,
-            (),
-        ));
+        let mut hidden_states = hidden_states
+            .reshape([seq_len, hidden_states.shape()[2]])
+            .to_concrete();
+        let rotary_pos_emb = rotary_pos_emb.reshape([dim1, dim2, rotary_pos_emb.shape()[1]]);
         let rotary_pos_emb = rotary_pos_emb.index_select(0, &window_index);
-        let rotary_pos_emb = rotary_pos_emb.reshape((seq_len, ()));
-        let rope_cache = RopeCache::from_parts(rotary_pos_emb.cos(), rotary_pos_emb.sin());
+        let rotary_pos_emb = rotary_pos_emb
+            .reshape([seq_len, rotary_pos_emb.shape()[2]])
+            .to_concrete();
+        // Work in f32 for cos/sin operations
+        let rotary_pos_emb_f32: Tensor<2, f32> = rotary_pos_emb.cast();
+        let rope_cache = RopeCache::from_parts(
+            rotary_pos_emb_f32.cos().to_concrete(),
+            rotary_pos_emb_f32.sin().to_concrete(),
+        );
 
         let cu_seqlens = grid_thw
             .iter()
@@ -375,9 +391,12 @@ where
 
         let hidden_states = self.merger.forward(&hidden_states);
         let reverse_indices = {
-            let indices_flat = window_index.reshape([window_index.shape().iter().product(), 1]);
-            let indices_vec2 = pollster::block_on(indices_flat.to_vec2())?;
-            let indices: Vec<u32> = indices_vec2.into_iter().map(|v| v[0]).collect();
+            // Get indices as flat slice using tensor access
+            let indices_flat = window_index
+                .reshape([window_index.shape().iter().product::<usize>()])
+                .to_concrete();
+            let slice = pollster::block_on(indices_flat.as_slice())?;
+            let indices: Vec<u32> = slice.as_slice().to_vec();
             let mut indices_with_pos: Vec<_> = indices.iter().enumerate().collect();
             indices_with_pos.sort_by_key(|&(_, &val)| val);
             let sorted_indices: Vec<u32> = indices_with_pos
@@ -395,10 +414,10 @@ where
 #[cfg(test)]
 #[tokio::test]
 async fn test_loading_qwen_vision() {
+    use fusor::ToVec2;
     use kalosm_common::Cache;
 
-    // Skip in macOS CI
-    #[cfg(target_os = "macos")]
+    // Skip in CI
     if std::env::var("CI").is_ok() {
         return;
     }
@@ -448,9 +467,10 @@ async fn test_loading_qwen_vision() {
     .unwrap();
 
     let out = qwen_vision.rot_pos_emb(&vec![[2, 4, 4]]).unwrap();
-    println!("Rotary Pos Emb: {out:?}");
-    let out_first_5_by_5 = out.i((0..5, 0..5));
-    let out_first_5_by_5: Vec<Vec<f32>> = out_first_5_by_5.to_vec2().await.unwrap();
+    let out_first_5_by_5 = out.slice([0..5, 0..5]).to_concrete();
+    let out_slice = out_first_5_by_5.as_slice().await.unwrap();
+    let out_first_5_by_5: Vec<Vec<f32>> = out_slice.to_vec2();
+    println!("Rotary Pos Emb first 5x5: {:?}", out_first_5_by_5);
 
     let expected: [[f32; 5]; 5] = [
         [0.0, 0.0, 0.0, 0.0, 0.0],
@@ -467,16 +487,17 @@ async fn test_loading_qwen_vision() {
 
     // Create random tensor using fusor-core
     let hidden_states_data: Vec<f32> = (0..1944 * 1176).map(|_| rand::random()).collect();
-    let hidden_states = Tensor::new(&device, &hidden_states_data).reshape([1944, 1176]);
+    let hidden_states: Tensor<2, f32> = Tensor::new(&device, &hidden_states_data)
+        .reshape([1944, 1176])
+        .to_concrete();
 
     let grid_thw = vec![[1, 36, 54]];
     let out = qwen_vision
         .forward(&hidden_states, &grid_thw, None)
         .unwrap();
-    println!(
-        "Qwen Vision: {:?}",
-        out.i((0..5, 0..5)).to_vec2().await.unwrap()
-    );
+    let out_first_5_by_5 = out.slice([0..5, 0..5]).to_concrete();
+    let out_slice = out_first_5_by_5.as_slice().await.unwrap();
+    println!("Qwen Vision: {:?}", out_slice.to_vec2());
 
     // download image from https://qianwen-res.oss-cn-beijing.aliyuncs.com/Qwen-VL/assets/demo.jpeg
     let image_bytes =
@@ -492,10 +513,9 @@ async fn test_loading_qwen_vision() {
         .preprocess_image(&image, Some(256 * 28 * 28), Some(512 * 28 * 28))
         .unwrap();
     let out = qwen_vision.forward_image(&pixels, grid).unwrap();
-    println!(
-        "Qwen Vision: {:?}",
-        out.i((0..5, 0..5)).to_vec2().await.unwrap()
-    );
+    let out_first_5_by_5 = out.slice([0..5, 0..5]).to_concrete();
+    let out_slice = out_first_5_by_5.as_slice().await.unwrap();
+    println!("Qwen Vision Image: {:?}", out_slice.to_vec2());
 }
 
 fn generate_full_attention_blocks(block_count: usize, n_wa_pattern: u64) -> Vec<usize> {

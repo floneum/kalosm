@@ -1,6 +1,6 @@
-use fusor_core::layers::Linear;
-use fusor_core::{Device, VarBuilder};
-use fusor_core::{Result, Tensor};
+use fusor::layers::Linear;
+use fusor::{Device, VarBuilder};
+use fusor::{Result, Tensor};
 
 use super::HiddenActLayer;
 

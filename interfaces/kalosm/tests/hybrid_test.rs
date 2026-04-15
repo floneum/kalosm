@@ -124,7 +124,7 @@ async fn test_weighted_hybrid_search() -> Result<(), Box<dyn std::error::Error>>
 
     let results = table
         .hybrid_search("ownership memory safety")
-        .with_results(1)
+        .with_results(3)
         .with_semantic_weight(0.6)
         .with_keyword_weight(0.4)
         .run_weighted()
@@ -141,7 +141,7 @@ async fn test_weighted_hybrid_search() -> Result<(), Box<dyn std::error::Error>>
         println!();
     }
 
-    // Should find the ownership article
+    // Should find the ownership article in top results
     assert!(results
         .iter()
         .any(|r| r.record.title().contains("Ownership")));

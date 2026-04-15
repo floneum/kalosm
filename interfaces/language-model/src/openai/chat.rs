@@ -1,7 +1,7 @@
 use super::{NoOpenAIAPIKeyError, OpenAICompatibleClient};
 use crate::{
     ChatModel, ChatSession, ContentChunk, CreateChatSession, CreateDefaultChatConstraintsForType,
-    GenerationParameters, ModelConstraints, StructuredChatModel,
+    GenerationParameters, SchemaParser, StructuredChatModel,
 };
 use futures_util::StreamExt;
 use kalosm_model_types::{ModelBuilder, ModelLoadingProgress};
@@ -117,7 +117,7 @@ pub enum OpenAICompatibleChatModelError {
     ReqwestError(#[from] reqwest::Error),
     /// An error occurred while receiving server side events from the OpenAI API.
     #[error("Error receiving server side events: {0}")]
-    EventSourceError(#[from] reqwest_eventsource::Error),
+    EventSourceError(Box<reqwest_eventsource::Error>),
     /// OpenAI API returned no message choices in the response.
     #[error("OpenAI API returned no message choices in the response")]
     NoMessageChoices,
@@ -130,6 +130,12 @@ pub enum OpenAICompatibleChatModelError {
     /// Function calls are not yet supported in kalosm with the OpenAI API.
     #[error("Function calls are not yet supported in kalosm with the OpenAI API")]
     FunctionCallsNotSupported,
+}
+
+impl From<reqwest_eventsource::Error> for OpenAICompatibleChatModelError {
+    fn from(e: reqwest_eventsource::Error) -> Self {
+        Self::EventSourceError(Box::new(e))
+    }
 }
 
 /// A chat session for the OpenAI compatible chat model.
@@ -213,9 +219,11 @@ impl ChatModel<GenerationParameters> for OpenAICompatibleChatModel {
             "messages": messages,
             "model": myself.model,
             "stream": true,
-            "top_p": sampler.top_p,
             "temperature": sampler.temperature,
         });
+        if let Some(top_p) = sampler.top_p {
+            json["top_p"] = serde_json::json!(top_p);
+        }
         if let Some(repetition_penalty) = sampler.repetition_penalty {
             json["frequency_penalty"] = serde_json::json!(repetition_penalty);
         }
@@ -280,38 +288,13 @@ impl ChatModel<GenerationParameters> for OpenAICompatibleChatModel {
             }
 
             let new_message =
-                crate::ChatMessage::new(crate::MessageType::UserMessage, new_message_text);
+                crate::ChatMessage::new(crate::MessageType::ModelAnswer, new_message_text);
 
             session.messages.push(new_message);
 
             Ok(())
         }
     }
-}
-
-/// A parser for any type that implements the [`Schema`] trait and [`Deserialize`].
-#[derive(Debug, Clone, Copy)]
-pub struct SchemaParser<P> {
-    phantom: std::marker::PhantomData<P>,
-}
-
-impl<P> Default for SchemaParser<P> {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl<P> SchemaParser<P> {
-    /// Create a new parser for the given schema.
-    pub const fn new() -> Self {
-        Self {
-            phantom: std::marker::PhantomData,
-        }
-    }
-}
-
-impl<P> ModelConstraints for SchemaParser<P> {
-    type Output = P;
 }
 
 impl<T: Schema + DeserializeOwned> CreateDefaultChatConstraintsForType<T>
@@ -339,52 +322,8 @@ where
         let schema = P::schema();
         let mut schema: serde_json::Result<serde_json::Value> =
             serde_json::from_str(&schema.to_string());
-        fn remove_unsupported_properties(schema: &mut serde_json::Value) {
-            match schema {
-                serde_json::Value::Null => {}
-                serde_json::Value::Bool(_) => {}
-                serde_json::Value::Number(_) => {}
-                serde_json::Value::String(_) => {}
-                serde_json::Value::Array(array) => {
-                    for item in array {
-                        remove_unsupported_properties(item);
-                    }
-                }
-                serde_json::Value::Object(map) => {
-                    map.retain(|key, value| {
-                        const OPEN_AI_UNSUPPORTED_PROPERTIES: [&str; 19] = [
-                            "minLength",
-                            "maxLength",
-                            "pattern",
-                            "format",
-                            "minimum",
-                            "maximum",
-                            "multipleOf",
-                            "patternProperties",
-                            "unevaluatedProperties",
-                            "propertyNames",
-                            "minProperties",
-                            "maxProperties",
-                            "unevaluatedItems",
-                            "contains",
-                            "minContains",
-                            "maxContains",
-                            "minItems",
-                            "maxItems",
-                            "uniqueItems",
-                        ];
-                        if OPEN_AI_UNSUPPORTED_PROPERTIES.contains(&key.as_str()) {
-                            return false;
-                        }
-
-                        remove_unsupported_properties(value);
-                        true
-                    });
-                }
-            }
-        }
         if let Ok(schema) = &mut schema {
-            remove_unsupported_properties(schema);
+            crate::remove_unsupported_schema_properties(schema);
         }
 
         let myself = &*self.inner;
@@ -394,7 +333,6 @@ where
                 "messages": messages,
                 "model": myself.model,
                 "stream": true,
-                "top_p": sampler.top_p,
                 "temperature": sampler.temperature,
                 "response_format": {
                     "type": "json_schema",
@@ -405,6 +343,9 @@ where
                     }
                 }
             });
+            if let Some(top_p) = sampler.top_p {
+                json["top_p"] = serde_json::json!(top_p);
+            }
             if let Some(repetition_penalty) = sampler.repetition_penalty {
                 json["frequency_penalty"] = serde_json::json!(repetition_penalty);
             }
@@ -484,7 +425,7 @@ where
             })?;
 
             let new_message =
-                crate::ChatMessage::new(crate::MessageType::UserMessage, new_message_text);
+                crate::ChatMessage::new(crate::MessageType::ModelAnswer, new_message_text);
 
             session.messages.push(new_message);
 
@@ -543,8 +484,9 @@ mod tests {
 
     use super::{
         ChatModel, CreateChatSession, GenerationParameters, OpenAICompatibleChatModelBuilder,
-        SchemaParser, StructuredChatModel,
+        StructuredChatModel,
     };
+    use crate::SchemaParser;
 
     #[tokio::test]
     async fn test_gpt_5_mini() {

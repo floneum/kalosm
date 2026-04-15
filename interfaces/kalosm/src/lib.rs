@@ -18,7 +18,7 @@ pub mod language {
     };
     #[cfg(feature = "llama")]
     pub use kalosm_language::kalosm_llama::{
-        Llama, LlamaBuilder, LlamaChatSession, LlamaSession, LlamaSource,
+        Device, Llama, LlamaBuilder, LlamaChatSession, LlamaSession, LlamaSource,
     };
     pub use kalosm_language::kalosm_sample::{self, *};
     pub use kalosm_language::prelude::Html;

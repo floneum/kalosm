@@ -179,7 +179,7 @@ impl Chunker for SemanticChunker {
                 let c1_score = self.score_merge(c1, &chunks[index + 1]);
                 let c2_score = self.score_merge(c2, &chunks[index2 + 1]);
 
-                c1_score.partial_cmp(&c2_score).unwrap()
+                f32::total_cmp(&c1_score, &c2_score)
             })
         {
             let second_chunk = &chunks[index + 1];

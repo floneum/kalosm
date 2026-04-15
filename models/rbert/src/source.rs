@@ -3,10 +3,13 @@ use kalosm_model_types::FileSource;
 const SNOWFLAKE_EMBEDDING_PREFIX: &str =
     "Represent this sentence for searching relevant passages: ";
 
-/// A the source of a [`crate::Bert`] model
+const QWEN3_EMBEDDING_PREFIX: &str =
+    "Instruct: Given a web search query, retrieve relevant passages that answer the query\nQuery: ";
+
+/// The source of a [`crate::Bert`] model
 pub struct BertSource {
     pub(crate) search_embedding_prefix: Option<String>,
-    pub(crate) config: FileSource,
+    pub(crate) config: Option<FileSource>,
     pub(crate) tokenizer: FileSource,
     pub(crate) model: FileSource,
 }
@@ -36,15 +39,12 @@ impl BertSource {
 
     /// Set the config to use
     pub fn with_config(mut self, config: FileSource) -> Self {
-        self.config = config;
+        self.config = Some(config);
         self
     }
 
     /// Set the prefix to use when embedding search queries
-    pub(crate) fn with_search_embedding_prefix(
-        mut self,
-        prefix: impl Into<Option<String>>,
-    ) -> Self {
+    pub fn with_search_embedding_prefix(mut self, prefix: impl Into<Option<String>>) -> Self {
         self.search_embedding_prefix = prefix.into();
         self
     }
@@ -95,11 +95,11 @@ impl BertSource {
     pub fn bge_small_en() -> Self {
         // https://huggingface.co/CompendiumLabs/bge-small-en-v1.5-gguf/blob/main/bge-small-en-v1.5-q4_k_m.gguf
         Self {
-            config: FileSource::huggingface(
+            config: Some(FileSource::huggingface(
                 "BAAI/bge-small-en-v1.5".to_string(),
                 "main".to_string(),
                 "config.json".to_string(),
-            ),
+            )),
             tokenizer: FileSource::huggingface(
                 "BAAI/bge-small-en-v1.5".to_string(),
                 "main".to_string(),
@@ -136,114 +136,135 @@ impl BertSource {
 
     /// Create a new [`BertSource`] with the [snowflake-arctic-embed-xs](https://huggingface.co/Snowflake/snowflake-arctic-embed-xs) model
     pub fn snowflake_arctic_embed_extra_small() -> Self {
-        // https://huggingface.co/ChristianAzinn/snowflake-arctic-embed-xs-gguf/blob/main/snowflake-arctic-embed-xs--Q4_K_M.GGUF
-        Self::default()
-            .with_config(FileSource::huggingface(
-                "Snowflake/snowflake-arctic-embed-xs".to_string(),
-                "main".to_string(),
-                "config.json".to_string(),
-            ))
-            .with_tokenizer(FileSource::huggingface(
-                "Snowflake/snowflake-arctic-embed-xs".to_string(),
-                "main".to_string(),
-                "tokenizer.json".to_string(),
-            ))
-            .with_model(FileSource::huggingface(
-                "ChristianAzinn/snowflake-arctic-embed-xs-gguf".to_string(),
-                "main".to_string(),
-                "snowflake-arctic-embed-xs--Q4_K_M.GGUF".to_string(),
-            ))
-            .with_search_embedding_prefix(SNOWFLAKE_EMBEDDING_PREFIX.to_string())
+        snowflake_source(
+            "Snowflake/snowflake-arctic-embed-xs",
+            "ChristianAzinn/snowflake-arctic-embed-xs-gguf",
+            "snowflake-arctic-embed-xs--Q4_K_M.GGUF",
+        )
     }
 
     /// Create a new [`BertSource`] with the [snowflake-arctic-embed-s](https://huggingface.co/Snowflake/snowflake-arctic-embed-s) model
     pub fn snowflake_arctic_embed_small() -> Self {
-        // https://huggingface.co/ChristianAzinn/snowflake-arctic-embed-s-gguf/blob/main/snowflake-arctic-embed-s--Q4_K_M.GGUF
-        Self::default()
-            .with_model(FileSource::huggingface(
-                "ChristianAzinn/snowflake-arctic-embed-s-gguf".to_string(),
-                "main".to_string(),
-                "snowflake-arctic-embed-s--Q4_K_M.GGUF".to_string(),
-            ))
-            .with_tokenizer(FileSource::huggingface(
-                "Snowflake/snowflake-arctic-embed-s".to_string(),
-                "main".to_string(),
-                "tokenizer.json".to_string(),
-            ))
-            .with_config(FileSource::huggingface(
-                "Snowflake/snowflake-arctic-embed-s".to_string(),
-                "main".to_string(),
-                "config.json".to_string(),
-            ))
-            .with_search_embedding_prefix(SNOWFLAKE_EMBEDDING_PREFIX.to_string())
+        snowflake_source(
+            "Snowflake/snowflake-arctic-embed-s",
+            "ChristianAzinn/snowflake-arctic-embed-s-gguf",
+            "snowflake-arctic-embed-s--Q4_K_M.GGUF",
+        )
     }
 
     /// Create a new [`BertSource`] with the [snowflake-arctic-embed-m](https://huggingface.co/Snowflake/snowflake-arctic-embed-m) model
     pub fn snowflake_arctic_embed_medium() -> Self {
-        // https://huggingface.co/ChristianAzinn/snowflake-arctic-embed-m-gguf/blob/main/snowflake-arctic-embed-m--Q4_K_M.GGUF
-        Self::default()
-            .with_model(FileSource::huggingface(
-                "ChristianAzinn/snowflake-arctic-embed-m-gguf".to_string(),
-                "main".to_string(),
-                "snowflake-arctic-embed-m--Q4_K_M.GGUF".to_string(),
-            ))
-            .with_config(FileSource::huggingface(
-                "Snowflake/snowflake-arctic-embed-m".to_string(),
-                "main".to_string(),
-                "config.json".to_string(),
-            ))
-            .with_tokenizer(FileSource::huggingface(
-                "Snowflake/snowflake-arctic-embed-m".to_string(),
-                "main".to_string(),
-                "tokenizer.json".to_string(),
-            ))
-            .with_search_embedding_prefix(SNOWFLAKE_EMBEDDING_PREFIX.to_string())
+        snowflake_source(
+            "Snowflake/snowflake-arctic-embed-m",
+            "ChristianAzinn/snowflake-arctic-embed-m-gguf",
+            "snowflake-arctic-embed-m--Q4_K_M.GGUF",
+        )
     }
 
     /// Create a new [`BertSource`] with the [snowflake-arctic-embed-m-long](https://huggingface.co/Snowflake/snowflake-arctic-embed-m-long) model
     ///
     /// This model is slightly larger than [`Self::snowflake_arctic_embed_medium`] and supports longer contexts (up to 2048 tokens).
     pub fn snowflake_arctic_embed_medium_long() -> Self {
-        // https://huggingface.co/ChristianAzinn/snowflake-arctic-embed-m-long-GGUF/blob/main/snowflake-arctic-embed-m-long--Q4_K_M.GGUF
-        Self::default()
-            .with_model(FileSource::huggingface(
-                "ChristianAzinn/snowflake-arctic-embed-m-long-GGUF".to_string(),
-                "main".to_string(),
-                "snowflake-arctic-embed-m-long--Q4_K_M.GGUF".to_string(),
-            ))
-            .with_tokenizer(FileSource::huggingface(
-                "Snowflake/snowflake-arctic-embed-m-long".to_string(),
-                "main".to_string(),
-                "tokenizer.json".to_string(),
-            ))
-            .with_config(FileSource::huggingface(
-                "Snowflake/snowflake-arctic-embed-m-long".to_string(),
-                "main".to_string(),
-                "config.json".to_string(),
-            ))
-            .with_search_embedding_prefix(SNOWFLAKE_EMBEDDING_PREFIX.to_string())
+        snowflake_source(
+            "Snowflake/snowflake-arctic-embed-m-long",
+            "ChristianAzinn/snowflake-arctic-embed-m-long-GGUF",
+            "snowflake-arctic-embed-m-long--Q4_K_M.GGUF",
+        )
     }
 
     /// Create a new [`BertSource`] with the [snowflake-arctic-embed-l](https://huggingface.co/Snowflake/snowflake-arctic-embed-l) model
     pub fn snowflake_arctic_embed_large() -> Self {
-        // https://huggingface.co/ChristianAzinn/snowflake-arctic-embed-l-gguf/blob/main/snowflake-arctic-embed-l--Q4_K_M.GGUF
-        Self::default()
-            .with_model(FileSource::huggingface(
-                "ChristianAzinn/snowflake-arctic-embed-l-gguf".to_string(),
-                "main".to_string(),
-                "snowflake-arctic-embed-l--Q4_K_M.GGUF".to_string(),
-            ))
-            .with_tokenizer(FileSource::huggingface(
-                "Snowflake/snowflake-arctic-embed-l".to_string(),
-                "main".to_string(),
-                "tokenizer.json".to_string(),
-            ))
-            .with_config(FileSource::huggingface(
-                "Snowflake/snowflake-arctic-embed-l".to_string(),
-                "main".to_string(),
-                "config.json".to_string(),
-            ))
-            .with_search_embedding_prefix(SNOWFLAKE_EMBEDDING_PREFIX.to_string())
+        snowflake_source(
+            "Snowflake/snowflake-arctic-embed-l",
+            "ChristianAzinn/snowflake-arctic-embed-l-gguf",
+            "snowflake-arctic-embed-l--Q4_K_M.GGUF",
+        )
+    }
+
+    /// Create a new [`BertSource`] with the [Qwen3-Embedding-0.6B](https://huggingface.co/Qwen/Qwen3-Embedding-0.6B-GGUF) model
+    ///
+    /// This model uses the Qwen3 architecture and supports:
+    /// - 100+ languages
+    /// - 32K context length
+    /// - 1024 embedding dimensions
+    /// - Last-token pooling (automatic)
+    pub fn qwen3_embedding_0_6b() -> Self {
+        qwen3_source(
+            "Qwen/Qwen3-Embedding-0.6B",
+            "Qwen/Qwen3-Embedding-0.6B-GGUF",
+            "Qwen3-Embedding-0.6B-Q8_0.gguf",
+        )
+    }
+
+    /// Create a new [`BertSource`] with the [Qwen3-Embedding-4B](https://huggingface.co/Qwen/Qwen3-Embedding-4B-GGUF) model
+    ///
+    /// This model uses the Qwen3 architecture and supports:
+    /// - 100+ languages
+    /// - 32K context length
+    /// - 2560 embedding dimensions
+    /// - Last-token pooling (automatic)
+    ///
+    /// This is a larger model than [`Self::qwen3_embedding_0_6b`] with higher quality embeddings.
+    pub fn qwen3_embedding_4b() -> Self {
+        qwen3_source(
+            "Qwen/Qwen3-Embedding-4B",
+            "Qwen/Qwen3-Embedding-4B-GGUF",
+            "Qwen3-Embedding-4B-Q8_0.gguf",
+        )
+    }
+
+    /// Create a new [`BertSource`] with the [Qwen3-Embedding-8B](https://huggingface.co/Qwen/Qwen3-Embedding-8B-GGUF) model
+    ///
+    /// This model uses the Qwen3 architecture and supports:
+    /// - 100+ languages
+    /// - 32K context length
+    /// - 4096 embedding dimensions
+    /// - Last-token pooling (automatic)
+    ///
+    /// This is the largest Qwen3 embedding model with the highest quality embeddings.
+    pub fn qwen3_embedding_8b() -> Self {
+        qwen3_source(
+            "Qwen/Qwen3-Embedding-8B",
+            "Qwen/Qwen3-Embedding-8B-GGUF",
+            "Qwen3-Embedding-8B-Q8_0.gguf",
+        )
+    }
+}
+
+fn snowflake_source(snowflake_repo: &str, gguf_repo: &str, gguf_file: &str) -> BertSource {
+    BertSource::default()
+        .with_config(FileSource::huggingface(
+            snowflake_repo.to_string(),
+            "main".to_string(),
+            "config.json".to_string(),
+        ))
+        .with_tokenizer(FileSource::huggingface(
+            snowflake_repo.to_string(),
+            "main".to_string(),
+            "tokenizer.json".to_string(),
+        ))
+        .with_model(FileSource::huggingface(
+            gguf_repo.to_string(),
+            "main".to_string(),
+            gguf_file.to_string(),
+        ))
+        .with_search_embedding_prefix(SNOWFLAKE_EMBEDDING_PREFIX.to_string())
+}
+
+fn qwen3_source(model_repo: &str, gguf_repo: &str, gguf_file: &str) -> BertSource {
+    BertSource {
+        config: None,
+        tokenizer: FileSource::huggingface(
+            model_repo.to_string(),
+            "main".to_string(),
+            "tokenizer.json".to_string(),
+        ),
+        model: FileSource::huggingface(
+            gguf_repo.to_string(),
+            "main".to_string(),
+            gguf_file.to_string(),
+        ),
+        search_embedding_prefix: Some(QWEN3_EMBEDDING_PREFIX.to_string()),
     }
 }
 

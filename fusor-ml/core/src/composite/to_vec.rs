@@ -1,3 +1,7 @@
+use std::ops::Deref;
+
+use bytemuck::{AnyBitPattern, NoUninit};
+
 use crate::{DataType, Tensor, TensorSlice};
 
 impl<D: DataType> Tensor<1, D> {
@@ -24,9 +28,26 @@ impl<D: DataType> Tensor<3, D> {
     }
 }
 
-impl<D: DataType> TensorSlice<1, D> {
+/// Extension trait for TensorSlice to convert to Vec types
+pub trait ToVec1<D> {
+    fn to_vec1(&self) -> Vec<D>;
+}
+
+/// Extension trait for TensorSlice to convert to Vec types
+pub trait ToVec2<D> {
+    fn to_vec2(&self) -> Vec<Vec<D>>;
+}
+
+/// Extension trait for TensorSlice to convert to Vec types
+pub trait ToVec3<D> {
+    fn to_vec3(&self) -> Vec<Vec<Vec<D>>>;
+}
+
+impl<D: NoUninit + AnyBitPattern + Copy, Bytes: Deref<Target = [u8]>> ToVec1<D>
+    for TensorSlice<1, D, Bytes>
+{
     /// Convert a 1D tensor slice to a `Vec<D>`
-    pub fn to_vec1(&self) -> Vec<D> {
+    fn to_vec1(&self) -> Vec<D> {
         let shape = self.shape();
         let len = shape[0];
 
@@ -38,9 +59,11 @@ impl<D: DataType> TensorSlice<1, D> {
     }
 }
 
-impl<D: DataType> TensorSlice<2, D> {
+impl<D: NoUninit + AnyBitPattern + Copy, Bytes: Deref<Target = [u8]>> ToVec2<D>
+    for TensorSlice<2, D, Bytes>
+{
     /// Convert a 2D tensor slice to a `Vec<Vec<D>>`
-    pub fn to_vec2(&self) -> Vec<Vec<D>> {
+    fn to_vec2(&self) -> Vec<Vec<D>> {
         let shape = self.shape();
         let rows = shape[0];
         let cols = shape[1];
@@ -57,9 +80,11 @@ impl<D: DataType> TensorSlice<2, D> {
     }
 }
 
-impl<D: DataType> TensorSlice<3, D> {
+impl<D: NoUninit + AnyBitPattern + Copy, Bytes: Deref<Target = [u8]>> ToVec3<D>
+    for TensorSlice<3, D, Bytes>
+{
     /// Convert a 3D tensor slice to a `Vec<Vec<Vec<D>>>`
-    pub fn to_vec3(&self) -> Vec<Vec<Vec<D>>> {
+    fn to_vec3(&self) -> Vec<Vec<Vec<D>>> {
         let shape = self.shape();
         let dim0 = shape[0];
         let dim1 = shape[1];

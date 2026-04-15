@@ -15,8 +15,8 @@ pub struct GenerationParameters {
     pub(crate) tau: f32,
     pub(crate) eta: f32,
     pub(crate) mu: f32,
-    pub(crate) top_p: f64,
-    pub(crate) top_k: u32,
+    pub(crate) top_p: Option<f64>,
+    pub(crate) top_k: Option<u32>,
     pub(crate) repetition_penalty: Option<f32>,
     pub(crate) repetition_penalty_range: u32,
     pub(crate) max_length: u32,
@@ -97,8 +97,8 @@ impl GenerationParameters {
             eta: 0.1,
             tau: 5.,
             mu: 10.,
-            top_p: 1.0,
-            top_k: 1,
+            top_p: None,
+            top_k: None,
             repetition_penalty: None,
             repetition_penalty_range: 64,
             max_length: u32::MAX,
@@ -119,7 +119,8 @@ impl GenerationParameters {
             .hash(&mut hash);
         self.repetition_penalty_range.hash(&mut hash);
         self.tau.to_le_bytes().hash(&mut hash);
-        self.top_p.to_le_bytes().hash(&mut hash);
+        self.top_p.map(|f| f.to_le_bytes()).hash(&mut hash);
+        self.top_k.hash(&mut hash);
         self.temperature.to_le_bytes().hash(&mut hash);
         self.max_length.hash(&mut hash);
         let hash = hash.finish();
@@ -192,13 +193,13 @@ impl GenerationParameters {
 
     /// Set the top_p parameter to the generation parameters (only used by the OpenAI API).
     pub fn with_top_p(mut self, top_p: f64) -> Self {
-        self.top_p = top_p;
+        self.top_p = Some(top_p);
         self
     }
 
     /// Set the top_k parameter to the generation parameters (only used by the Anthropic API).
     pub fn with_top_k(mut self, top_k: u32) -> Self {
-        self.top_k = top_k;
+        self.top_k = Some(top_k);
         self
     }
 

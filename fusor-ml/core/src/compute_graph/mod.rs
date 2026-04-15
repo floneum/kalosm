@@ -27,7 +27,7 @@ pub(crate) struct ComputeGraph {
 }
 
 impl ComputeGraph {
-    pub(crate) fn new(device: Device) -> Self {
+    pub(crate) fn new(device: &Device) -> Self {
         let inner = Arc::new(RwLock::new(ComputeGraphInner::new(device)));
         Self { inner }
     }
@@ -217,16 +217,24 @@ impl ComputeGraphNodeVariant {
 }
 
 pub(crate) struct ComputeGraphInner {
-    pub(crate) device: Device,
+    pub(crate) device: crate::WeakDevice,
     pub(crate) nodes: ComputeGraphNodes,
 }
 
 impl ComputeGraphInner {
-    fn new(device: Device) -> Self {
+    fn new(device: &Device) -> Self {
         Self {
-            device,
+            device: device.downgrade(),
             nodes: ComputeGraphNodes::default(),
         }
+    }
+
+    /// Upgrade the weak device reference to a strong one.
+    /// Panics if the device has been dropped (should not happen during normal operation).
+    pub(crate) fn device(&self) -> Device {
+        self.device
+            .upgrade()
+            .expect("Device was dropped while ComputeGraph is still in use")
     }
 
     fn create_node(&mut self, node: ComputeGraphNodeVariant) -> NodeIndex {

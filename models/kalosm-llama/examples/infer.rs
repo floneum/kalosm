@@ -1,3 +1,4 @@
+use fusor::Device;
 use kalosm_llama::prelude::*;
 use std::io::Write;
 
@@ -5,7 +6,8 @@ use std::io::Write;
 async fn main() {
     tracing_subscriber::fmt::init();
     let model = Llama::builder()
-        .with_source(LlamaSource::qwen_2_5_7b_instruct())
+        .with_source(LlamaSource::qwen_2_5_0_5b_instruct())
+        .with_device(Device::cpu())
         .build()
         .await
         .unwrap();
@@ -18,15 +20,13 @@ async fn main() {
         print!("{}", token);
         std::io::stdout().flush().unwrap();
         tokens += 1;
-        let elapsed = start.elapsed();
-        if elapsed.as_secs() > 0 {
-            let tokens_per_second = tokens as f64 / elapsed.as_secs_f64();
-            println!(
-                "\n{} tokens in {:.2} seconds ({:.2} tokens/second)",
-                tokens,
-                elapsed.as_secs_f64(),
-                tokens_per_second
-            );
-        }
     }
+    let elapsed = start.elapsed();
+    println!();
+    println!(
+        "{} tokens in {:.2} seconds ({:.2} tokens/second)",
+        tokens,
+        elapsed.as_secs_f64(),
+        tokens as f64 / elapsed.as_secs_f64()
+    );
 }

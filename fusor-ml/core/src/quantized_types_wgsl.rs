@@ -1,6 +1,6 @@
 use std::fmt::Write;
 
-use fusor_gguf::{BlockQ4_0, BlockQ4K, BlockQ5_0, BlockQ6K, BlockQ8_0, GgmlType};
+use fusor_gguf::{BlockQ4_0, BlockQ4K, BlockQ5_0, BlockQ5K, BlockQ6K, BlockQ8_0, GgmlType};
 
 fn byte_array_array_u32<W: Write>(f: &mut W, name: &str, byte_size: usize) -> std::fmt::Result {
     assert!(byte_size.is_multiple_of(4));
@@ -54,6 +54,20 @@ pub(crate) fn write_q4_k_type<W: Write>(f: &mut W, use_f16: bool) -> std::fmt::R
     writeln!(f, "    min: {float_type},")?;
     byte_array_array_u32(f, "scales", BlockQ4K::SCALES_SIZE)?;
     byte_array_array_u32(f, "data", BlockQ4K::WEIGHTS_SIZE)?;
+    writeln!(f, "}};")?;
+
+    Ok(())
+}
+
+pub(crate) fn write_q5_k_type<W: Write>(f: &mut W, use_f16: bool) -> std::fmt::Result {
+    let q5_k = GgmlType::Q5K;
+    let float_type = float_type(use_f16);
+    writeln!(f, "struct {q5_k} {{")?;
+    writeln!(f, "    scale: {float_type},")?;
+    writeln!(f, "    min: {float_type},")?;
+    byte_array_array_u32(f, "scales", BlockQ5K::SCALES_SIZE)?;
+    byte_array_array_u32(f, "qh", BlockQ5K::QH_SIZE)?;
+    byte_array_array_u32(f, "qs", BlockQ5K::QS_SIZE)?;
     writeln!(f, "}};")?;
 
     Ok(())

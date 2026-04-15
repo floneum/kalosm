@@ -1,5 +1,8 @@
 use crate::Tensor;
 
+// Re-export dimension helpers from fusor-types
+pub use fusor_types::{D, Dim};
+
 pub trait NextRankInner {
     type NextRank: LastRankInner + NextRankInner;
 }
@@ -153,45 +156,4 @@ mod impls {
     impl_next_last!(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, [18], 19, 20);
     impl_next_last!(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, [19], 20);
     impl_next_last!(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, [20]);
-}
-
-pub trait Dim<const R: usize>: Copy {
-    fn resolve(self) -> usize;
-}
-
-impl<const R: usize> Dim<R> for usize {
-    fn resolve(self) -> usize {
-        self
-    }
-}
-
-/// Dimension helpers
-#[allow(non_snake_case)]
-pub mod D {
-    use super::*;
-    /// The last dim
-    #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
-    pub struct Minus1;
-
-    impl<const R: usize> Dim<R> for Minus1 {
-        fn resolve(self) -> usize {
-            const {
-                assert!(R > 0);
-            }
-            R - 1
-        }
-    }
-
-    /// The second to last dim
-    #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
-    pub struct Minus2;
-
-    impl<const R: usize> Dim<R> for Minus2 {
-        fn resolve(self) -> usize {
-            const {
-                assert!(R > 1);
-            }
-            R - 2
-        }
-    }
 }

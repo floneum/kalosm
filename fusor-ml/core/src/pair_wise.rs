@@ -87,33 +87,76 @@ impl PairWiseFunction {
     }
 }
 
-impl<const R: usize, T: DataType> Add<Tensor<R, T>> for Tensor<R, T> {
-    type Output = Tensor<R, T>;
+/// Macro to implement pairwise operators (Add, Sub, Mul, Div) for Tensor.
+///
+/// Generates all four combinations of owned/reference implementations:
+/// - `Tensor op Tensor` (owned + owned)
+/// - `&Tensor op &Tensor` (ref + ref) - core implementation
+/// - `Tensor op &Tensor` (owned + ref)
+/// - `&Tensor op Tensor` (ref + owned)
+///
+/// Also generates a broadcast method `op_()` for tensors of different ranks.
+macro_rules! impl_pairwise_op {
+    ($trait:ident, $method:ident, $op_str:literal, $op_name:literal, $broadcast_method:ident, {$op:tt}) => {
+        // Owned + Owned: delegates to ref + ref
+        impl<const R: usize, T: DataType> $trait<Tensor<R, T>> for Tensor<R, T> {
+            type Output = Tensor<R, T>;
 
-    fn add(self, rhs: Tensor<R, T>) -> Self::Output {
-        &self + &rhs
-    }
+            fn $method(self, rhs: Tensor<R, T>) -> Self::Output {
+                (&self).$method(&rhs)
+            }
+        }
+
+        // Ref + Ref: core implementation
+        impl<const R: usize, T: DataType> $trait<&Tensor<R, T>> for &Tensor<R, T> {
+            type Output = Tensor<R, T>;
+
+            fn $method(self, rhs: &Tensor<R, T>) -> Self::Output {
+                self.pair_wise(
+                    rhs,
+                    PairWiseFunction::new(
+                        concat!("let output = a ", $op_str, " b;"),
+                        T::WGSL_TYPE,
+                    )
+                    .with_name($op_name),
+                )
+            }
+        }
+
+        // Owned + Ref: delegates to ref + ref
+        impl<const R: usize, T: DataType> $trait<&Tensor<R, T>> for Tensor<R, T> {
+            type Output = Tensor<R, T>;
+
+            fn $method(self, rhs: &Tensor<R, T>) -> Self::Output {
+                (&self).$method(rhs)
+            }
+        }
+
+        // Ref + Owned: delegates to ref + ref
+        impl<const R: usize, T: DataType> $trait<Tensor<R, T>> for &Tensor<R, T> {
+            type Output = Tensor<R, T>;
+
+            fn $method(self, rhs: Tensor<R, T>) -> Self::Output {
+                self.$method(&rhs)
+            }
+        }
+
+        // Broadcast method for tensors of different ranks
+        impl<const R: usize, T: DataType> Tensor<R, T> {
+            pub fn $broadcast_method<const R2: usize, const R3: usize>(
+                &self,
+                second: &Tensor<R2, T>,
+            ) -> Tensor<R3, T>
+            where
+                (Tensor<R, T>, Tensor<R2, T>): MaxRank<R3, T>,
+            {
+                Self::broadcast_then_elementwise_op(self, second, |a, b| a $op b)
+            }
+        }
+    };
 }
 
-impl<const R: usize, T: DataType> Add<&Tensor<R, T>> for &Tensor<R, T> {
-    type Output = Tensor<R, T>;
-
-    fn add(self, rhs: &Tensor<R, T>) -> Self::Output {
-        self.pair_wise(
-            rhs,
-            PairWiseFunction::new("let output = a + b;".to_string(), T::WGSL_TYPE).with_name("add"),
-        )
-    }
-}
-
-impl<const R: usize, T: DataType> Tensor<R, T> {
-    pub fn add_<const R2: usize, const R3: usize>(&self, second: &Tensor<R2, T>) -> Tensor<R3, T>
-    where
-        (Tensor<R, T>, Tensor<R2, T>): MaxRank<R3, T>,
-    {
-        Self::broadcast_then_elementwise_op(self, second, |a, b| a + b)
-    }
-}
+impl_pairwise_op!(Add, add, "+", "add", add_, {+});
 
 #[cfg(test)]
 #[tokio::test]
@@ -269,33 +312,7 @@ async fn test_pair_wise_add_sparse() {
     assert_eq!(as_slice[[2, 0]], 5. + 5.);
 }
 
-impl<const R: usize, T: DataType> Sub<Tensor<R, T>> for Tensor<R, T> {
-    type Output = Tensor<R, T>;
-
-    fn sub(self, rhs: Tensor<R, T>) -> Self::Output {
-        &self - &rhs
-    }
-}
-
-impl<const R: usize, T: DataType> Sub<&Tensor<R, T>> for &Tensor<R, T> {
-    type Output = Tensor<R, T>;
-
-    fn sub(self, rhs: &Tensor<R, T>) -> Self::Output {
-        self.pair_wise(
-            rhs,
-            PairWiseFunction::new("let output = a - b;".to_string(), T::WGSL_TYPE).with_name("sub"),
-        )
-    }
-}
-
-impl<const R: usize, T: DataType> Tensor<R, T> {
-    pub fn sub_<const R2: usize, const R3: usize>(&self, second: &Tensor<R2, T>) -> Tensor<R3, T>
-    where
-        (Tensor<R, T>, Tensor<R2, T>): MaxRank<R3, T>,
-    {
-        Self::broadcast_then_elementwise_op(self, second, |a, b| a - b)
-    }
-}
+impl_pairwise_op!(Sub, sub, "-", "sub", sub_, {-});
 
 #[cfg(test)]
 #[tokio::test]
@@ -321,33 +338,7 @@ async fn test_pair_wise_sub() {
     assert_eq!(as_slice[[2, 1]], 6. - 6.);
 }
 
-impl<const R: usize, T: DataType> Mul<Tensor<R, T>> for Tensor<R, T> {
-    type Output = Tensor<R, T>;
-
-    fn mul(self, rhs: Tensor<R, T>) -> Self::Output {
-        &self * &rhs
-    }
-}
-
-impl<const R: usize, T: DataType> Mul<&Tensor<R, T>> for &Tensor<R, T> {
-    type Output = Tensor<R, T>;
-
-    fn mul(self, rhs: &Tensor<R, T>) -> Self::Output {
-        self.pair_wise(
-            rhs,
-            PairWiseFunction::new("let output = a * b;".to_string(), T::WGSL_TYPE).with_name("mul"),
-        )
-    }
-}
-
-impl<const R: usize, T: DataType> Tensor<R, T> {
-    pub fn mul_<const R2: usize, const R3: usize>(&self, second: &Tensor<R2, T>) -> Tensor<R3, T>
-    where
-        (Tensor<R, T>, Tensor<R2, T>): MaxRank<R3, T>,
-    {
-        Self::broadcast_then_elementwise_op(self, second, |a, b| a * b)
-    }
-}
+impl_pairwise_op!(Mul, mul, "*", "mul", mul_, {*});
 
 #[cfg(test)]
 #[tokio::test]
@@ -373,33 +364,7 @@ async fn test_pair_wise_mul() {
     assert_eq!(as_slice[[2, 1]], 6. * 6.);
 }
 
-impl<const R: usize, T: DataType> Div<Tensor<R, T>> for Tensor<R, T> {
-    type Output = Tensor<R, T>;
-
-    fn div(self, rhs: Tensor<R, T>) -> Self::Output {
-        &self / &rhs
-    }
-}
-
-impl<const R: usize, T: DataType> Div<&Tensor<R, T>> for &Tensor<R, T> {
-    type Output = Tensor<R, T>;
-
-    fn div(self, rhs: &Tensor<R, T>) -> Self::Output {
-        self.pair_wise(
-            rhs,
-            PairWiseFunction::new("let output = a / b;".to_string(), T::WGSL_TYPE).with_name("div"),
-        )
-    }
-}
-
-impl<const R: usize, T: DataType> Tensor<R, T> {
-    pub fn div_<const R2: usize, const R3: usize>(&self, second: &Tensor<R2, T>) -> Tensor<R3, T>
-    where
-        (Tensor<R, T>, Tensor<R2, T>): MaxRank<R3, T>,
-    {
-        Self::broadcast_then_elementwise_op(self, second, |a, b| a / b)
-    }
-}
+impl_pairwise_op!(Div, div, "/", "div", div_, {/});
 
 #[cfg(test)]
 #[tokio::test]
@@ -425,24 +390,35 @@ async fn test_pair_wise_div() {
     assert_eq!(as_slice[[2, 1]], 6. / 6.);
 }
 
-impl<const R: usize, T: DataType> Tensor<R, T> {
-    pub fn pow(&self, other: &Self) -> Self {
-        self.pair_wise(
-            other,
-            PairWiseFunction::new("let output = pow(a, b);".to_string(), T::WGSL_TYPE)
-                .with_name("pow"),
-        )
-    }
+/// Macro to implement method-based pairwise operations (like pow, min, max).
+///
+/// Unlike `impl_pairwise_op!` which implements std::ops traits, this macro generates
+/// regular methods on Tensor for operations that don't have corresponding operators.
+macro_rules! impl_pairwise_method {
+    ($method:ident, $wgsl_op:literal, $op_name:literal, $broadcast_method:ident, |$a:ident, $b:ident| $expr:expr) => {
+        impl<const R: usize, T: DataType> Tensor<R, T> {
+            pub fn $method(&self, other: &Self) -> Self {
+                self.pair_wise(
+                    other,
+                    PairWiseFunction::new(concat!("let output = ", $wgsl_op, ";"), T::WGSL_TYPE)
+                        .with_name($op_name),
+                )
+            }
+
+            pub fn $broadcast_method<const R2: usize, const R3: usize>(
+                &self,
+                second: &Tensor<R2, T>,
+            ) -> Tensor<R3, T>
+            where
+                (Tensor<R, T>, Tensor<R2, T>): MaxRank<R3, T>,
+            {
+                Self::broadcast_then_elementwise_op(self, second, |$a, $b| $expr)
+            }
+        }
+    };
 }
 
-impl<const R: usize, T: DataType> Tensor<R, T> {
-    pub fn pow_<const R2: usize, const R3: usize>(&self, second: &Tensor<R2, T>) -> Tensor<R3, T>
-    where
-        (Tensor<R, T>, Tensor<R2, T>): MaxRank<R3, T>,
-    {
-        Self::broadcast_then_elementwise_op(self, second, |a, b| a.pow(&b))
-    }
-}
+impl_pairwise_method!(pow, "pow(a, b)", "pow", pow_, |a, b| a.pow(&b));
 
 #[cfg(test)]
 #[tokio::test]

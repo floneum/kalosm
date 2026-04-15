@@ -13,6 +13,34 @@ pub use boxed::*;
 
 use crate::MessageContent;
 
+/// A parser for any type that implements the [`Schema`](kalosm_sample::Schema) trait and [`Deserialize`](serde::Deserialize).
+///
+/// Used by remote chat model adapters (e.g. OpenAI, Anthropic) to enforce structured
+/// JSON schema generation at the API level.
+#[derive(Debug, Clone, Copy)]
+pub struct SchemaParser<P> {
+    phantom: std::marker::PhantomData<P>,
+}
+
+impl<P> Default for SchemaParser<P> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl<P> SchemaParser<P> {
+    /// Create a new parser for the given schema.
+    pub const fn new() -> Self {
+        Self {
+            phantom: std::marker::PhantomData,
+        }
+    }
+}
+
+impl<P> ModelConstraints for SchemaParser<P> {
+    type Output = P;
+}
+
 #[doc = include_str!("../../docs/completion_session.md")]
 pub trait TextCompletionSession {
     /// The type of error the session may return during operations.
@@ -206,4 +234,52 @@ pub trait StructuredTextCompletionModel<
         parser: Constraints,
         on_token: impl FnMut(String) -> Result<(), Self::Error> + WasmNotSendSync + 'static,
     ) -> impl Future<Output = Result<Constraints::Output, Self::Error>> + WasmNotSend + 'a;
+}
+
+/// Remove JSON Schema properties that are not supported by structured output APIs
+/// (e.g. Anthropic, OpenAI). This strips validation-only keywords like `minLength`,
+/// `pattern`, `minimum`, `maxItems`, etc. that would cause API errors.
+#[cfg(any(feature = "anthropic", feature = "openai"))]
+pub(crate) fn remove_unsupported_schema_properties(schema: &mut serde_json::Value) {
+    match schema {
+        serde_json::Value::Null
+        | serde_json::Value::Bool(_)
+        | serde_json::Value::Number(_)
+        | serde_json::Value::String(_) => {}
+        serde_json::Value::Array(array) => {
+            for item in array {
+                remove_unsupported_schema_properties(item);
+            }
+        }
+        serde_json::Value::Object(map) => {
+            map.retain(|key, value| {
+                const UNSUPPORTED_PROPERTIES: [&str; 19] = [
+                    "minLength",
+                    "maxLength",
+                    "pattern",
+                    "format",
+                    "minimum",
+                    "maximum",
+                    "multipleOf",
+                    "patternProperties",
+                    "unevaluatedProperties",
+                    "propertyNames",
+                    "minProperties",
+                    "maxProperties",
+                    "unevaluatedItems",
+                    "contains",
+                    "minContains",
+                    "maxContains",
+                    "minItems",
+                    "maxItems",
+                    "uniqueItems",
+                ];
+                if UNSUPPORTED_PROPERTIES.contains(&key.as_str()) {
+                    return false;
+                }
+                remove_unsupported_schema_properties(value);
+                true
+            });
+        }
+    }
 }

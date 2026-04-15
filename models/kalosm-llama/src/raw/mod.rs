@@ -11,15 +11,24 @@ use attention_layer::GroupedAttention;
 use attention_layer::LlamaFeedForward;
 use attention_layer::PhiFeedForward;
 use attention_layer::SeparateAttention;
-use fusor_core::cache::MaskCache;
-use fusor_core::layers::Embedding;
-use fusor_core::layers::Linear;
-use fusor_core::layers::RmsNorm;
-use fusor_core::CastTensor;
-use fusor_core::FloatDataType;
-use fusor_core::QMatrix;
-use fusor_core::ShardedVarBuilder;
-use fusor_core::{Device, Result, Tensor};
+use fusor::cache::MaskCache;
+use fusor::layers::Embedding;
+use fusor::layers::Linear;
+use fusor::layers::RmsNorm;
+use fusor::AddOp;
+use fusor::CastTensor;
+use fusor::CastTo;
+use fusor::FloatDataType;
+use fusor::FloatOps;
+use fusor::MatmulImpl;
+use fusor::MulOp;
+use fusor::QMatrix;
+use fusor::ShardedVarBuilder;
+use fusor::SimdBinaryOp;
+use fusor::SimdElement;
+use fusor::SimdReduceOp;
+use fusor::SumOp;
+use fusor::{Device, Result, Tensor};
 use fusor_gguf::GgufMetadata;
 use fusor_gguf::GgufValue;
 
@@ -36,7 +45,7 @@ pub const GEMMA_DEFAULT_SLIDING_WINDOW_TYPE: usize = 6;
 pub const GEMMA_DEFAULT_ROPE_FREQUENCY_SLIDING: f32 = 10_000.;
 
 /// The configuration of a Llama model.
-pub struct LlamaConfig<F: FloatDataType = f32> {
+pub struct LlamaConfig<F: FloatDataType + SimdElement = f32> {
     pub(crate) rope_freq_weight: Option<Tensor<1, F>>,
     pub(crate) rope_theta: f32,
     pub(crate) context_length: usize,
@@ -57,7 +66,7 @@ pub struct LlamaConfig<F: FloatDataType = f32> {
     pub(crate) mrope_sections: Option<Vec<usize>>,
 }
 
-impl<F: FloatDataType> LlamaConfig<F> {
+impl<F: FloatDataType + SimdElement> LlamaConfig<F> {
     fn hidden_size(&self) -> usize {
         self.head_dimension * self.n_head
     }
@@ -95,17 +104,23 @@ pub struct RopeScalingConfig {
     pub(crate) original_max_position_embeddings: usize,
 }
 
-pub struct Model<F: FloatDataType = f32> {
+pub struct Model<F: FloatDataType + SimdElement = f32> {
     pub(crate) config: Arc<LlamaConfig<F>>,
     vision_encoder: Option<vision::QwenVisionTransformer<F>>,
     tok_embeddings: Embedding<F>,
     layers: Vec<LlamaAttention<F>>,
     norm: RmsNorm<1, F>,
     output: QMatrix,
-    masks: MaskCache<F>,
+    /// Mask cache always uses f32 for SIMD compatibility
+    masks: MaskCache<f32>,
 }
 
-impl<F: FloatDataType> Model<F> {
+impl<F: FloatDataType + SimdElement + FloatOps + MatmulImpl> Model<F>
+where
+    MulOp: SimdBinaryOp<F>,
+    AddOp: SimdBinaryOp<F>,
+    SumOp: SimdReduceOp<F>,
+{
     pub fn from_gguf<R: std::io::Seek + std::io::Read>(
         source: &mut ShardedVarBuilder<R>,
         vision_ct: Option<GgufMetadata>,
@@ -116,11 +131,33 @@ impl<F: FloatDataType> Model<F> {
         rope_scaling: Option<RopeScalingConfig>,
     ) -> std::result::Result<Self, LlamaSourceError>
     where
-        f32: CastTensor<F>,
-        F: CastTensor<f32>,
+        f32: CastTensor<F> + CastTo<F>,
+        F: CastTensor<f32> + CastTo<f32>,
     {
+        // Helper to dequantize a QMatrix to 1D tensor
+        // VarBuilder preserves original shapes, so 1D tensors stay 1D
+        let dequantize_1d = |qmatrix: QMatrix| -> Tensor<1, F> {
+            let shape = qmatrix.shape();
+            if shape.len() == 1 {
+                // Already 1D, dequantize directly
+                let w1d: Tensor<1, f32> = qmatrix.dequantize();
+                w1d.cast()
+            } else if shape.len() == 2 {
+                // 2D tensor, reshape to 1D (for backwards compatibility)
+                let w2d: Tensor<2, f32> = qmatrix.dequantize();
+                w2d.reshape([w2d.shape()[0] * w2d.shape()[1]])
+                    .to_concrete()
+                    .cast()
+            } else {
+                panic!(
+                    "Expected 1D or 2D tensor for dequantize_1d, got {}D",
+                    shape.len()
+                )
+            }
+        };
+
         let decode_norm = |qmatrix: QMatrix, eps: f64| -> Result<RmsNorm<1, F>> {
-            let weight = qmatrix.dequantize();
+            let weight = dequantize_1d(qmatrix);
             Ok(RmsNorm::new(weight, None, eps as f32))
         };
 
@@ -210,10 +247,10 @@ impl<F: FloatDataType> Model<F> {
             .map(|x| x as usize)
             .unwrap_or_else(|| embedding_length / head_count);
 
-        let rope_freq_weight = source
+        let rope_freq_weight: Option<Tensor<1, F>> = source
             .tensor("rope_freqs.weight", device)
             .ok()
-            .map(|q| q.dequantize());
+            .map(&dequantize_1d);
 
         let config = LlamaConfig {
             rope_freq_weight,
@@ -257,19 +294,21 @@ impl<F: FloatDataType> Model<F> {
         };
         let config = Arc::new(config);
 
-        let rope = rope::RopeImplementation::new(&config, config.rope_theta, device)?;
-        let sliding_rope = rope_freq_base_sliding
+        let rope: RopeImplementation<F> =
+            rope::RopeImplementation::new(&config, config.rope_theta, device)?;
+        let sliding_rope: Option<RopeImplementation<F>> = rope_freq_base_sliding
             .map(|rope_freq_base_sliding| {
                 RopeImplementation::new(&config, rope_freq_base_sliding, device)
             })
             .transpose()?;
 
         let tok_embeddings_q = source.tensor("token_embd.weight", device)?;
-        let mut tok_embeddings = tok_embeddings_q.dequantize();
+        let mut tok_embeddings: Tensor<2, f32> = tok_embeddings_q.dequantize();
         // if this is gemma3, scale the tok_embeddings by sqrt(embedding_length)
         if &*architecture == "gemma3" {
-            tok_embeddings = tok_embeddings * F::from_f32((embedding_length as f32).sqrt());
+            tok_embeddings = (tok_embeddings * (embedding_length as f32).sqrt()).to_concrete();
         }
+        let tok_embeddings: Tensor<2, F> = tok_embeddings.cast();
         let tok_embeddings = Embedding::new_from_tensor(tok_embeddings);
 
         let norm = source.tensor("output_norm.weight", device)?;
@@ -295,9 +334,9 @@ impl<F: FloatDataType> Model<F> {
                     source.tensor(&format!("{prefix}.attn_v.bias"), device),
                 ) {
                     Some(AttentionBias::new(
-                        bias_q.dequantize(),
-                        bias_k.dequantize(),
-                        bias_v.dequantize(),
+                        dequantize_1d(bias_q),
+                        dequantize_1d(bias_k),
+                        dequantize_1d(bias_v),
                     ))
                 } else {
                     None
@@ -334,11 +373,11 @@ impl<F: FloatDataType> Model<F> {
                 let feed_forward_w2 =
                     source.tensor(&format!("{prefix}.ffn_down.weight"), device)?;
                 let feed_forward_w3 = source.tensor(&format!("{prefix}.ffn_up.weight"), device)?;
-                FeedForwardVariant::Llama(LlamaFeedForward::new(
+                FeedForwardVariant::Llama(Box::new(LlamaFeedForward::new(
                     feed_forward_w1,
                     feed_forward_w2,
                     feed_forward_w3,
-                ))
+                )))
             } else {
                 // Otherwise, try to read from the up, and down weights
                 let up = source.tensor(&format!("{prefix}.ffn_up.weight"), device)?;
@@ -427,10 +466,13 @@ impl<F: FloatDataType> Model<F> {
     }
 }
 
-impl<F: FloatDataType> Model<F>
+impl<F: FloatDataType + SimdElement + Default + FloatOps + MatmulImpl> Model<F>
 where
-    F: CastTensor<f32>,
-    f32: CastTensor<F>,
+    F: CastTo<f32> + CastTensor<f32>,
+    f32: CastTo<F> + CastTensor<F>,
+    MulOp: SimdBinaryOp<F>,
+    AddOp: SimdBinaryOp<F>,
+    SumOp: SimdReduceOp<F>,
 {
     #[allow(clippy::type_complexity)]
     pub fn encode_tokens(
@@ -438,7 +480,7 @@ where
         raw_tokens: &[u32],
         raw_images: &[(image::DynamicImage, MediaHints)],
         device: &Device,
-        mut cache: Option<&mut LlamaCache<F>>,
+        mut cache: Option<&mut LlamaCache>,
     ) -> Result<(Tensor<3, F>, usize, usize, Option<Tensor<2, F>>)> {
         let mut grid_thw = Vec::new();
         let mut images = Vec::new();
@@ -472,9 +514,7 @@ where
                         Some(next) if next == image_pad_token => {
                             // Push a pad token for every image token
                             let grid = image_iter.next().ok_or_else(|| {
-                                std::io::Error::other(
-                                    "Image pad token found without matching image.".to_string(),
-                                )
+                                fusor::Error::msg("Image pad token found without matching image.")
                             })?;
                             for _ in 0..grid.iter().product::<u32>()
                                 / (vision.spacial_merge_size as u32).pow(2)
@@ -527,7 +567,8 @@ where
             }
             (tokens, index_pos, start_time)
         };
-        let x = Tensor::new(device, tokens.as_slice()).unsqueeze(0);
+        let x_base = Tensor::new(device, tokens.as_slice());
+        let x = x_base.unsqueeze(0);
 
         let mut embeddings = self.tok_embeddings.forward(&x);
         let mut pos_ids = None;
@@ -536,7 +577,8 @@ where
 
         if let Some(vision_encoder) = &self.vision_encoder {
             for ((pixels, grid), range) in images.iter().zip(&grid_thw).zip(image_token_ranges) {
-                let image_embeds = vision_encoder.forward_image(&pixels.cast(), *grid)?;
+                let pixels_f: Tensor<2, F> = pixels.cast();
+                let image_embeds = vision_encoder.forward_image(&pixels_f, *grid)?;
                 embeddings = embeddings.slice_assign(
                     [0..batch_size, range, 0..embed_dim],
                     &image_embeds.unsqueeze(0),
@@ -547,7 +589,9 @@ where
             if let Some(cache) = cache.as_mut() {
                 cache.start_time = new_start_time;
             }
-            pos_ids = Some(new_pos_ids.cast::<f32>().cast());
+            let pos_f32: Tensor<2, f32> = new_pos_ids.cast();
+            let pos_f: Tensor<2, F> = pos_f32.cast();
+            pos_ids = Some(pos_f);
         }
 
         Ok((embeddings, seq_len, index_pos, pos_ids))
@@ -558,15 +602,19 @@ where
         tokens: &[u32],
         images: &[(image::DynamicImage, MediaHints)],
         device: &Device,
-        mut cache: Option<&mut LlamaCache<F>>,
-    ) -> Result<Tensor<2, F>> {
+        mut cache: Option<&mut LlamaCache>,
+    ) -> Result<Tensor<2, F>>
+    where
+        F: CastTo<f32> + CastTensor<f32> + Default,
+        f32: CastTo<F> + CastTensor<F>,
+    {
         let (mut layer_in, seq_len, index_pos, pos_ids) =
             self.encode_tokens(tokens, images, device, cache.as_deref_mut())?;
 
         for (i, layer) in self.layers.iter().enumerate() {
             let x = layer_in;
-            let residual = x.clone();
-            let x = layer.attention_norm.forward(&x);
+            let residual: Tensor<3, f32> = x.cast();
+            let x = layer.attention_norm.forward_generic(&x);
             let mask = self
                 .masks
                 .get_mask(seq_len, index_pos, layer.sliding_window_size, device);
@@ -578,25 +626,28 @@ where
                 cache.as_mut().map(|c| &mut c.blocks[i]),
             );
             if let Some(post_attention_norm) = &layer.post_attention_norm {
-                attn = post_attention_norm.forward(&attn);
+                attn = post_attention_norm.forward_generic(&attn);
             }
-            let x = attn + residual;
+            // Work in f32 for tensor addition
+            let attn_f32: Tensor<3, f32> = attn.cast();
+            let x_f32: Tensor<3, F> = (attn_f32 + residual).cast();
 
             // MLP
-            let residual = x.clone();
-            let x = layer.ffn_norm.forward(&x);
+            let residual: Tensor<3, f32> = x_f32.cast();
+            let x = layer.ffn_norm.forward_generic(&x_f32);
             let mut x = layer.feed_forward_variant.forward(&x);
             if let Some(post_ffn_norm) = &layer.post_ffn_norm {
-                x = post_ffn_norm.forward(&x);
+                x = post_ffn_norm.forward_generic(&x);
             }
-            layer_in = x + residual;
-            const FORCE_MATERIALIZE_EVERY_N_LAYERS: usize = 2;
-            if i % FORCE_MATERIALIZE_EVERY_N_LAYERS == 0 {
-                _ = layer_in.materialize();
-            }
+            // Work in f32 for tensor addition
+            let x_f32: Tensor<3, f32> = x.cast();
+            layer_in = (x_f32 + residual).cast();
         }
-        let x = self.norm.forward(&layer_in);
+        let x = self.norm.forward_generic(&layer_in);
         let x = x.i((.., seq_len - 1, ..));
-        Ok(x.q_mat_mul(&self.output))
+        // Do final matmul in f32 and cast back
+        let x_f32 = x.cast::<f32>();
+        let result_f32 = x_f32.q_mat_mul(&self.output);
+        Ok(result_f32.cast())
     }
 }

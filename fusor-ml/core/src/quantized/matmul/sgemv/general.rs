@@ -34,7 +34,7 @@ pub(crate) fn general_sgemv(
     let dtype = op.input_datatype;
     let workgroup_local_index = kernel.workgroup_local_index();
     let elements_per_block = op.elements_per_block();
-    let device = &graph.device;
+    let device = graph.device();
 
     // Calculate n_workgroups for decomposing the linearized workgroup index
     let n_workgroups = format!("(({n_size} + {SGEMV_CHUNK_SIZE} - 1) / {SGEMV_CHUNK_SIZE})");
@@ -179,7 +179,7 @@ pub(crate) fn general_sgemv(
         .unwrap();
 
         // We don't need to synchronize between the whole workgroup if there is only one subgroup
-        let subgroup_size = graph.device.max_subgroup_size();
+        let subgroup_size = device.max_subgroup_size();
         if blocksize > subgroup_size {
             let local_data = kernel.add_global_array(
                 KernelGlobalSpace::Workgroup,

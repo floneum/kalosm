@@ -86,7 +86,7 @@ pub enum LlamaSourceError {
     GgufRead(#[from] GgufReadError),
     /// An error occurred while loading the model onto the device.
     #[error("Failed to load the model onto the device: {0}")]
-    Device(#[from] fusor_core::Error),
+    Device(#[from] fusor::Error),
     /// No stop token was found.
     #[error("No stop token was found")]
     NoStopToken,

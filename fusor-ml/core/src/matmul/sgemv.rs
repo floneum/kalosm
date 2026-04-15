@@ -31,7 +31,7 @@ pub(crate) fn sgemv(
     let dtype = op.matmul_dtype();
     let workgroup_index = kernel.workgroup_index();
     let workgroup_local_index = kernel.workgroup_local_index();
-    let device = &graph.device;
+    let device = graph.device();
 
     let chunk_size = params.chunk_size;
     let vector_size = params.vector_size;
@@ -175,7 +175,7 @@ pub(crate) fn sgemv(
         .unwrap();
 
         // We don't need to synchronize between the whole workgroup if there is only one subgroup
-        let subgroup_size = graph.device.min_subgroup_size();
+        let subgroup_size = device.min_subgroup_size();
         if blocksize > subgroup_size {
             let local_data = kernel.add_global_array(
                 KernelGlobalSpace::Workgroup,

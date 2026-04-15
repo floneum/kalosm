@@ -1,7 +1,7 @@
 // Based on https://github.com/nicksenger/candle/tree/feat/whisper-dtw with some optimizations and refactoring
 // https://rtavenar.github.io/blog/dtw.html is a good resource for understanding the dtw algorithm
 
-use fusor_core::Tensor;
+use fusor::Tensor;
 use std::num::NonZeroUsize;
 
 use crate::config::{HOP_LENGTH, N_FRAMES, SAMPLE_RATE};
@@ -14,17 +14,19 @@ pub(super) async fn extract_timestamps(
     filter_width: NonZeroUsize,
     n_frames: usize,
     mask: Vec<Vec<bool>>,
-) -> fusor_core::Result<Vec<Vec<crate::WhisperDType>>> {
+) -> fusor::Result<Vec<Vec<crate::WhisperDType>>> {
     // Select relevant cross-attention heads
-    let weights = Tensor::stack(
-        alignment_heads.iter().copied().filter_map(|[layer, head]| {
-            let attn = cross_attentions.get(layer)?;
-            Some(attn.narrow(1, head, 1).squeeze(1))
-        }),
-        0,
-    )
-    .permute([1, 0, 2, 3])
-    .narrow(3, 0, n_frames.min(N_FRAMES) / 2);
+    let mut tensors_to_stack = Vec::new();
+    for [layer, head] in alignment_heads.iter().copied() {
+        if let Some(attn) = cross_attentions.get(layer) {
+            let narrowed = attn.narrow(1, head, 1);
+            let squeezed = narrowed.squeeze(1);
+            tensors_to_stack.push(squeezed.to_concrete());
+        }
+    }
+    let stacked = Tensor::stack(tensors_to_stack.into_iter(), 0);
+    let permuted = stacked.permute([1, 0, 2, 3]);
+    let weights = permuted.narrow(3, 0, n_frames.min(N_FRAMES) / 2);
 
     if weights.shape().contains(&0) {
         // No tokens to be aligned
@@ -35,11 +37,12 @@ pub(super) async fn extract_timestamps(
     let weights = weights.softmax_last_dim();
 
     // Smooth
+    let var_sqrt = weights.var_keepdim(weights.rank() - 2).sqrt().to_concrete();
     let weights = &median_filter(
         filter_width,
         weights
             .sub_(&weights.mean_keepdim(weights.rank() - 2))
-            .div_(&weights.var_keepdim(weights.rank() - 2).sqrt()),
+            .div_(&var_sqrt),
     )?;
 
     let cost = weights.mean(1);
@@ -48,7 +51,8 @@ pub(super) async fn extract_timestamps(
     let mut results = Vec::new();
     for batch_idx in 0..weights.shape()[0] {
         // Exclude any tokens in the mask
-        let batch_index_cost_3d = (-cost.clone())
+        let neg_cost = (-cost.clone()).to_concrete();
+        let batch_index_cost_3d: fusor::Tensor<2, crate::WhisperDType> = neg_cost
             .narrow(0, batch_idx, 1)
             .squeeze(0)
             .cast::<crate::WhisperDType>();
@@ -102,7 +106,7 @@ pub(super) async fn extract_timestamps(
 /// Computes the lowest cost warping path through the provided cost matrix
 fn dynamic_time_warp(
     matrix: Vec<Vec<crate::WhisperDType>>,
-) -> fusor_core::Result<(Vec<crate::WhisperDType>, Vec<crate::WhisperDType>)> {
+) -> fusor::Result<(Vec<crate::WhisperDType>, Vec<crate::WhisperDType>)> {
     #[derive(Debug, Clone, Copy)]
     enum Action {
         Match,
@@ -190,7 +194,7 @@ fn dynamic_time_warp(
 fn median_filter(
     _filter_width: NonZeroUsize,
     weights: Tensor<4, crate::WhisperDType>,
-) -> fusor_core::Result<Tensor<4, crate::WhisperDType>> {
+) -> fusor::Result<Tensor<4, crate::WhisperDType>> {
     // TODO: Implement proper median filtering for timestamp smoothing
     // For now, return the weights unchanged
     Ok(weights)

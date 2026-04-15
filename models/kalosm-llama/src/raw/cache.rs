@@ -1,5 +1,5 @@
-use fusor_core::cache::KvCache;
-use fusor_core::DataType;
+use fusor::cache::KvCache;
+use fusor::SimdElement;
 
 use super::LlamaConfig;
 
@@ -7,16 +7,20 @@ use super::LlamaConfig;
 const CONCAT_DIMENSION: usize = 2;
 
 /// A cache for llama inference. This cache will speed up generation of sequential text significantly.
+///
+/// Note: The KV cache internally uses f32 for SIMD compatibility, regardless of the model's
+/// storage type F. This enables f16 models to work with f32 computation.
 #[derive(Clone)]
-pub struct LlamaCache<F: DataType = f32> {
+pub struct LlamaCache {
     pub(crate) start_time: u32,
     pub(crate) tokens: Vec<u32>,
-    pub(crate) blocks: Vec<KvCache<F>>,
+    /// KV cache blocks - always f32 for SIMD operations
+    pub(crate) blocks: Vec<KvCache<f32>>,
 }
 
-impl<F: DataType> LlamaCache<F> {
+impl LlamaCache {
     /// Create a new cache for a model
-    pub fn new<G: fusor_core::FloatDataType>(config: &LlamaConfig<G>) -> Self {
+    pub fn new<G: fusor::FloatDataType + SimdElement>(config: &LlamaConfig<G>) -> Self {
         let max_seq_len = config.context_length;
         let mut blocks = Vec::with_capacity(config.n_layer);
         for layer_idx in 0..config.n_layer {

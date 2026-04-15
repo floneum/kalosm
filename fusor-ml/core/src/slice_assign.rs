@@ -1,9 +1,8 @@
 use std::{fmt::Write, ops::Range};
 
 use crate::{
-    Tensor, TensorData,
+    TILE_SIZE, Tensor, TensorData,
     compute_graph::{ComputeGraphInner, NodeIndex},
-    layout::TILE_SIZE,
     mir::{
         inputs::MirValue,
         kernel::GenericKernel,
@@ -94,7 +93,7 @@ impl Operation for SliceAssignOperation {
         let slices = self.slices.clone();
 
         build_visit_tiled_kernel(
-            &graph.device,
+            &graph.device(),
             &self.input_shape,
             TILE_SIZE,
             tiled_inputs,

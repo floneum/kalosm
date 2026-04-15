@@ -1,9 +1,8 @@
 use std::fmt::Write;
 
 use crate::{
-    ElementWiseFunction, ElementWiseOperation,
+    ElementWiseFunction, ElementWiseOperation, TILE_SIZE,
     compute_graph::{ComputeGraphInner, NodeIndex},
-    layout::TILE_SIZE,
     mir::{function::Function, inputs::MirValue, kernel::GenericKernel, operation::Operation},
     tensor::{DataTypeEnum, TensorData},
     visit_tiled::{
@@ -624,8 +623,9 @@ impl Operation for NaryOperation {
 
         let mut functions_cache: Vec<(String, Vec<DataTypeEnum>, Function)> = Vec::new();
 
+        let device = graph.device();
         build_visit_tiled_kernel(
-            &graph.device,
+            &device,
             &self.shape,
             TILE_SIZE,
             tiled_inputs,

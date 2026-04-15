@@ -1,0 +1,35 @@
+[package]
+name = "fusor-cpu"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+aligned-vec = "0.6.4"
+bytemuck = "1.14"
+generativity = "1.1.0"
+pulp = "0.22.2"
+gemm = "0.18"
+rayon = "1.10"
+fusor-gguf = { path = "../gguf" }
+fusor-types = { path = "../types" }
+half = "2.6"
+
+[dev-dependencies]
+criterion = "0.5"
+candle-core = "0.8"
+
+# [[bench]]
+# name = "tensor_ops"
+# harness = false
+
+[[bench]]
+name = "comparison"
+harness = false
+
+[[bench]]
+name = "fusion"
+harness = false
+
+[[bench]]
+name = "qmatmul"
+harness = false

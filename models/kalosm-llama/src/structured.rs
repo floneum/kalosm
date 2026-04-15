@@ -1,4 +1,7 @@
-use fusor_core::{CastTensor, FloatDataType, WasmNotSend, WasmNotSync};
+use fusor::{
+    AddOp, CastTensor, CastTo, FloatDataType, FloatOps, MatmulImpl, MulOp, SimdBinaryOp,
+    SimdElement, SimdReduceOp, SumOp, WasmNotSend, WasmNotSync,
+};
 use kalosm_language_model::{ContentChunk, MessageContent};
 use kalosm_sample::CreateParserState;
 use kalosm_sample::{LiteralParser, ParseStatus, Parser, ParserExt};
@@ -29,8 +32,20 @@ pub(crate) async fn generate_structured<F, P: Parser>(
     seed: Option<u64>,
 ) -> Result<P::Output, LlamaModelError>
 where
-    F: FloatDataType + CastTensor<f32> + WasmNotSend + WasmNotSync + 'static,
-    f32: CastTensor<F>,
+    F: FloatDataType
+        + SimdElement
+        + Default
+        + CastTo<f32>
+        + CastTensor<f32>
+        + WasmNotSend
+        + WasmNotSync
+        + FloatOps
+        + MatmulImpl
+        + 'static,
+    f32: CastTo<F> + CastTensor<F>,
+    MulOp: SimdBinaryOp<F>,
+    AddOp: SimdBinaryOp<F>,
+    SumOp: SimdReduceOp<F>,
 {
     let eos_token = llm.model.config.stop_token_string.clone();
     let mut on_token = move |tok: String| {
@@ -273,10 +288,7 @@ where
 }
 
 fn cmp_logits(a: &Logit, b: &Logit) -> std::cmp::Ordering {
-    // SAFETY: Logits should never be NaN or Inf
-    let compare = b.logit.partial_cmp(&a.logit);
-    debug_assert!(compare.is_some());
-    unsafe { compare.unwrap_unchecked() }
+    f32::total_cmp(&b.logit, &a.logit)
 }
 
 #[allow(unused, clippy::all)]

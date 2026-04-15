@@ -3,9 +3,13 @@ name = "fusor-gguf"
 version = "0.1.0"
 edition = "2024"
 
+[build-dependencies]
+rustversion = "1.0"
+
 [dependencies]
 bytemuck = { version = "1.22.0", features = ["derive"] }
 half = { version = "2.4.1", features = ["bytemuck"] }
+paste = "1"
 rustc-hash = "2.1.1"
 thiserror.workspace = true
 enumset = "1.1.5"

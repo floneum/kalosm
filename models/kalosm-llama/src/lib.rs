@@ -40,7 +40,10 @@ mod token_stream;
 pub use crate::chat::LlamaChatSession;
 use crate::model::LlamaModel;
 pub use crate::session::LlamaSession;
-use fusor_core::{Device, WasmNotSend, WasmNotSync};
+use fusor::{
+    AddOp, CastTo, FloatOps, MatmulImpl, MulOp, SimdBinaryOp, SimdReduceOp, SumOp, WasmNotSend,
+    WasmNotSync,
+};
 use futures::FutureExt;
 use kalosm_language_model::{MediaHints, TextCompletionBuilder, TextCompletionModelExt};
 pub use kalosm_model_types::FileSource;
@@ -60,8 +63,8 @@ use tokenizers::Tokenizer;
 /// Re-export half::f16 for users who want to use f16 activation types
 pub use half::f16;
 
-/// Re-export fusor_core types needed for the activation type generic
-pub use fusor_core::{CastTensor, FloatDataType};
+/// Re-export fusor types needed for the activation type generic
+pub use fusor::{CastTensor, Device, FloatDataType, SimdElement};
 
 /// A prelude of commonly used items in kalosm-llama.
 pub mod prelude {
@@ -89,36 +92,36 @@ type BoxedRunner<F> = Box<
 type BoxedRunner<F> =
     Box<dyn for<'a> FnOnce(&'a LlamaModel<F>) -> Pin<Box<dyn Future<Output = ()> + 'a>>>;
 
-enum Task<F: FloatDataType = half::f16> {
+enum Task<F: FloatDataType + SimdElement = f32> {
     UnstructuredGeneration(UnstructuredGenerationTask<F>),
     StructuredGeneration(StructuredGenerationTask<F>),
 }
 
 #[allow(clippy::type_complexity)]
-struct StructuredGenerationTask<F: FloatDataType = half::f16> {
+struct StructuredGenerationTask<F: FloatDataType + SimdElement = f32> {
     runner: BoxedRunner<F>,
 }
 
-struct UnstructuredGenerationTask<F: FloatDataType = half::f16> {
+struct UnstructuredGenerationTask<F: FloatDataType + SimdElement = f32> {
     settings: InferenceSettings<F>,
     on_token: BoxedTokenCallback,
     finished: futures::channel::oneshot::Sender<Result<(), LlamaModelError>>,
 }
 
-struct LlamaTask<F: FloatDataType = half::f16> {
+struct LlamaTask<F: FloatDataType + SimdElement = f32> {
     sender: futures::channel::mpsc::UnboundedSender<Task<F>>,
     task: Mutex<Pin<Box<dyn FutureWasmNotSend<Output = ()> + 'static>>>,
 }
 
 /// A future that polls the background Llama task when awaited.
-pub(crate) struct LlamaResultFuture<F: FloatDataType, T> {
+pub(crate) struct LlamaResultFuture<F: FloatDataType + SimdElement, T> {
     llama: Llama<F>,
     receiver: futures::channel::oneshot::Receiver<T>,
 }
 
 impl<F, T> Future for LlamaResultFuture<F, T>
 where
-    F: FloatDataType,
+    F: FloatDataType + SimdElement,
 {
     type Output = Result<T, futures::channel::oneshot::Canceled>;
 
@@ -137,13 +140,13 @@ where
 }
 
 /// A quantized Llama language model with support for streaming generation.
-pub struct Llama<F: FloatDataType = half::f16> {
+pub struct Llama<F: FloatDataType + SimdElement = f32> {
     config: Arc<LlamaConfig<F>>,
     tokenizer: Arc<Tokenizer>,
     inner: Arc<LlamaTask<F>>,
 }
 
-impl<F: FloatDataType> Clone for Llama<F> {
+impl<F: FloatDataType + SimdElement> Clone for Llama<F> {
     fn clone(&self) -> Self {
         Self {
             config: self.config.clone(),
@@ -186,8 +189,20 @@ impl Llama {
 
 impl<F> Llama<F>
 where
-    F: FloatDataType + CastTensor<f32> + WasmNotSend + WasmNotSync + 'static,
-    f32: CastTensor<F>,
+    F: FloatDataType
+        + SimdElement
+        + Default
+        + CastTo<f32>
+        + CastTensor<f32>
+        + WasmNotSend
+        + WasmNotSync
+        + FloatOps
+        + MatmulImpl
+        + 'static,
+    f32: CastTo<F> + CastTensor<F>,
+    MulOp: SimdBinaryOp<F>,
+    AddOp: SimdBinaryOp<F>,
+    SumOp: SimdReduceOp<F>,
 {
     /// Get the tokenizer for the model.
     pub fn tokenizer(&self) -> &Arc<Tokenizer> {
@@ -251,8 +266,20 @@ where
 
 impl<F> Deref for Llama<F>
 where
-    F: FloatDataType + CastTensor<f32> + WasmNotSend + WasmNotSync + 'static,
-    f32: CastTensor<F>,
+    F: FloatDataType
+        + SimdElement
+        + Default
+        + CastTo<f32>
+        + CastTensor<f32>
+        + WasmNotSend
+        + WasmNotSync
+        + FloatOps
+        + MatmulImpl
+        + 'static,
+    f32: CastTo<F> + CastTensor<F>,
+    MulOp: SimdBinaryOp<F>,
+    AddOp: SimdBinaryOp<F>,
+    SumOp: SimdReduceOp<F>,
 {
     type Target = dyn Fn(&str) -> TextCompletionBuilder<Self>;
 
@@ -293,14 +320,14 @@ where
 }
 
 /// A builder with configuration for a Llama model.
-pub struct LlamaBuilder<F: FloatDataType = half::f16> {
+pub struct LlamaBuilder<F: FloatDataType + SimdElement = f32> {
     source: source::LlamaSource,
     device: Option<Device>,
     flash_attn: bool,
     _marker: std::marker::PhantomData<F>,
 }
 
-impl<F: FloatDataType> Default for LlamaBuilder<F> {
+impl<F: FloatDataType + SimdElement> Default for LlamaBuilder<F> {
     fn default() -> Self {
         Self {
             source: Default::default(),
@@ -311,7 +338,7 @@ impl<F: FloatDataType> Default for LlamaBuilder<F> {
     }
 }
 
-impl<F: FloatDataType> LlamaBuilder<F> {
+impl<F: FloatDataType + SimdElement> LlamaBuilder<F> {
     /// Create a new Llama builder with default settings.
     pub fn new() -> Self {
         Self::default()
@@ -336,18 +363,21 @@ impl<F: FloatDataType> LlamaBuilder<F> {
     }
 
     /// Get the device or the default device if not set.
-    pub(crate) async fn get_device(&self) -> Result<Device, LlamaSourceError> {
+    pub(crate) async fn get_device(&self) -> Device {
         match self.device.clone() {
-            Some(device) => Ok(device),
-            None => Ok(Device::new().await?),
+            Some(device) => device,
+            None => Device::auto().await,
         }
     }
 }
 
-impl<F: FloatDataType> LlamaBuilder<F>
+impl<F: FloatDataType + SimdElement + Default + FloatOps + MatmulImpl> LlamaBuilder<F>
 where
-    F: CastTensor<f32> + WasmNotSend + WasmNotSync + 'static,
-    f32: CastTensor<F>,
+    F: CastTo<f32> + CastTensor<f32> + WasmNotSend + WasmNotSync + 'static,
+    f32: CastTo<F> + CastTensor<F>,
+    MulOp: SimdBinaryOp<F>,
+    AddOp: SimdBinaryOp<F>,
+    SumOp: SimdReduceOp<F>,
 {
     /// Build the model with a handler for progress as the download and loading progresses.
     ///
@@ -392,7 +422,7 @@ where
     }
 }
 
-pub(crate) struct InferenceSettings<F: FloatDataType = half::f16> {
+pub(crate) struct InferenceSettings<F: FloatDataType + SimdElement = f32> {
     /// The prompt to use.
     prompt: String,
 
@@ -415,7 +445,7 @@ pub(crate) struct InferenceSettings<F: FloatDataType = half::f16> {
     seed: Option<u64>,
 }
 
-impl<F: FloatDataType> InferenceSettings<F> {
+impl<F: FloatDataType + SimdElement> InferenceSettings<F> {
     pub fn new(
         prompt: impl ToString,
         images: Vec<(image::DynamicImage, MediaHints)>,

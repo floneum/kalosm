@@ -1,4 +1,7 @@
-use fusor_core::{CastTensor, FloatDataType, WasmNotSync};
+use fusor::{
+    AddOp, CastTensor, CastTo, FloatDataType, FloatOps, MatmulImpl, MulOp, SimdBinaryOp,
+    SimdElement, SimdReduceOp, SumOp, WasmNotSync,
+};
 use kalosm_language_model::{
     ContentChunk, CreateDefaultChatConstraintsForType, CreateDefaultCompletionConstraintsForType,
     CreateTextCompletionSession, GenerationParameters, MessageContent,
@@ -19,10 +22,14 @@ use crate::{
     Task, UnstructuredGenerationTask,
 };
 
-impl<F: FloatDataType> ModelBuilder for LlamaBuilder<F>
+impl<F: FloatDataType + SimdElement + Default + FloatOps + MatmulImpl> ModelBuilder
+    for LlamaBuilder<F>
 where
-    F: CastTensor<f32> + WasmNotSend + WasmNotSync + 'static,
-    f32: CastTensor<F>,
+    F: CastTo<f32> + CastTensor<f32> + WasmNotSend + WasmNotSync + 'static,
+    f32: CastTo<F> + CastTensor<F>,
+    MulOp: SimdBinaryOp<F>,
+    AddOp: SimdBinaryOp<F>,
+    SumOp: SimdReduceOp<F>,
 {
     type Model = Llama<F>;
     type Error = LlamaSourceError;
@@ -46,10 +53,14 @@ where
     }
 }
 
-impl<F: FloatDataType> CreateTextCompletionSession for Llama<F>
+impl<F: FloatDataType + SimdElement + Default + FloatOps + MatmulImpl> CreateTextCompletionSession
+    for Llama<F>
 where
-    F: CastTensor<f32> + WasmNotSend + WasmNotSync + 'static,
-    f32: CastTensor<F>,
+    F: CastTo<f32> + CastTensor<f32> + WasmNotSend + WasmNotSync + 'static,
+    f32: CastTo<F> + CastTensor<F>,
+    MulOp: SimdBinaryOp<F>,
+    AddOp: SimdBinaryOp<F>,
+    SumOp: SimdReduceOp<F>,
 {
     type Session = LlamaSession<F>;
     type Error = LlamaModelError;
@@ -59,10 +70,14 @@ where
     }
 }
 
-impl<F: FloatDataType, S: Sampler + 'static> TextCompletionModel<S> for Llama<F>
+impl<F: FloatDataType + SimdElement + Default + FloatOps + MatmulImpl, S: Sampler + 'static>
+    TextCompletionModel<S> for Llama<F>
 where
-    F: CastTensor<f32> + WasmNotSend + WasmNotSync + 'static,
-    f32: CastTensor<F>,
+    F: CastTo<f32> + CastTensor<f32> + WasmNotSend + WasmNotSync + 'static,
+    f32: CastTo<F> + CastTensor<F>,
+    MulOp: SimdBinaryOp<F>,
+    AddOp: SimdBinaryOp<F>,
+    SumOp: SimdReduceOp<F>,
 {
     async fn stream_text_with_callback<'a>(
         &'a self,
@@ -96,8 +111,10 @@ where
         }
         self.inner
             .sender
-            .unbounded_send(Task::UnstructuredGeneration(UnstructuredGenerationTask {
-                settings: InferenceSettings::new(
+            .unbounded_send(Task::UnstructuredGeneration(UnstructuredGenerationTask::<
+                F,
+            > {
+                settings: InferenceSettings::<F>::new(
                     text,
                     images,
                     session.clone(),
@@ -122,10 +139,14 @@ where
     }
 }
 
-impl<F: FloatDataType, T: Parse + 'static> CreateDefaultChatConstraintsForType<T> for Llama<F>
+impl<F: FloatDataType + SimdElement + Default + FloatOps + MatmulImpl, T: Parse + 'static>
+    CreateDefaultChatConstraintsForType<T> for Llama<F>
 where
-    F: CastTensor<f32> + WasmNotSend + WasmNotSync + 'static,
-    f32: CastTensor<F>,
+    F: CastTo<f32> + CastTensor<f32> + WasmNotSend + WasmNotSync + 'static,
+    f32: CastTo<F> + CastTensor<F>,
+    MulOp: SimdBinaryOp<F>,
+    AddOp: SimdBinaryOp<F>,
+    SumOp: SimdReduceOp<F>,
 {
     type DefaultConstraints = ArcParser<T>;
 
@@ -134,10 +155,14 @@ where
     }
 }
 
-impl<F: FloatDataType, T: Parse + 'static> CreateDefaultCompletionConstraintsForType<T> for Llama<F>
+impl<F: FloatDataType + SimdElement + Default + FloatOps + MatmulImpl, T: Parse + 'static>
+    CreateDefaultCompletionConstraintsForType<T> for Llama<F>
 where
-    F: CastTensor<f32> + WasmNotSend + WasmNotSync + 'static,
-    f32: CastTensor<F>,
+    F: CastTo<f32> + CastTensor<f32> + WasmNotSend + WasmNotSync + 'static,
+    f32: CastTo<F> + CastTensor<F>,
+    MulOp: SimdBinaryOp<F>,
+    AddOp: SimdBinaryOp<F>,
+    SumOp: SimdReduceOp<F>,
 {
     type DefaultConstraints = ArcParser<T>;
 
@@ -146,10 +171,14 @@ where
     }
 }
 
-impl<F: FloatDataType, S, Constraints> StructuredTextCompletionModel<Constraints, S> for Llama<F>
+impl<F: FloatDataType + SimdElement + Default + FloatOps + MatmulImpl, S, Constraints>
+    StructuredTextCompletionModel<Constraints, S> for Llama<F>
 where
-    F: CastTensor<f32> + WasmNotSend + WasmNotSync + 'static,
-    f32: CastTensor<F>,
+    F: CastTo<f32> + CastTensor<f32> + WasmNotSend + WasmNotSync + 'static,
+    f32: CastTo<F> + CastTensor<F>,
+    MulOp: SimdBinaryOp<F>,
+    AddOp: SimdBinaryOp<F>,
+    SumOp: SimdReduceOp<F>,
     <Constraints as Parser>::Output: WasmNotSend,
     <Constraints as Parser>::PartialState: WasmNotSend,
     Constraints: CreateParserState + WasmNotSend + 'static,

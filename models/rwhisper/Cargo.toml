@@ -11,7 +11,7 @@ keywords = ["ai", "whisper", "transcription"]
 [dependencies]
 cpal = "0.15.1"
 rand.workspace = true
-fusor-core.workspace = true
+fusor.workspace = true
 fusor-gguf.workspace = true
 byteorder = "1.4.3"
 hf-hub = { version = "0.4.0", default-features = false }

@@ -4,10 +4,12 @@
 
 pub use device::*;
 pub use element_wise::CastTensor;
-pub use layout::*;
+pub use fusor_gguf::GgufReadError;
+pub use fusor_types::{Layout, SlidingWindow, TILE_SIZE, TensorSlice, slice_shape, slice_strides};
 pub use quantized::*;
 pub use rank::*;
 pub use reduce::*;
+pub use tensor::MappedBuffer;
 pub use tensor::*;
 
 // Re-export wasm-compatible Send/Sync traits
@@ -21,6 +23,7 @@ pub use varbuilder::{ShardedVarBuilder, VarBuilder};
 
 pub mod cache;
 mod composite;
+pub use composite::{ToVec1, ToVec2, ToVec3};
 mod compute_graph;
 mod device;
 mod element_wise;

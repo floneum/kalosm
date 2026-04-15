@@ -2,7 +2,7 @@ use std::{
     fmt::{Debug, Display},
     marker::PhantomData,
     num::NonZeroU64,
-    ops::{Add, AddAssign, Deref, Div, DivAssign, Index, Mul, MulAssign, Range, Sub, SubAssign},
+    ops::{Add, AddAssign, Div, DivAssign, Mul, MulAssign, Range, Sub, SubAssign},
     sync::Arc,
 };
 
@@ -11,17 +11,18 @@ use tabbycat::Graph;
 use wgpu::COPY_BUFFER_ALIGNMENT;
 
 use crate::{
-    Device, Dim, ElementWiseOperation, MatMulOperation, MatMulParams, PairWiseFunction,
+    Device, Dim, ElementWiseOperation, Layout, MatMulOperation, MatMulParams, PairWiseFunction,
     PairWiseOperation, ReduceFunction, ReduceOperation,
     compute_graph::NodeIndex,
     index_select::IndexSelectOperation,
-    layout::Layout,
     map_layout::MapLayoutOperation,
     mir::operation::Operation,
     quantized::{QMatrix, matmul::QMatMulOperation},
     resize::ResizeOperation,
     slice_assign::SliceAssignOperation,
 };
+
+pub use fusor_types::TensorSlice;
 
 pub trait DataType:
     Add<Output = Self>
@@ -311,7 +312,10 @@ impl LazyTensorData {
 
     pub(crate) fn map_layout(&self, op: MapLayoutOperation) -> Self {
         let device = self.device.clone();
-        let info = TensorInfo::new((op.map_size)(self.info.shape()), self.info.datatype());
+        // Compute output shape by applying the layout transformation to a temporary layout
+        let temp_layout = Layout::contiguous(self.info.shape());
+        let new_layout = op.map_layout(&temp_layout);
+        let info = TensorInfo::new(new_layout.shape().into(), self.info.datatype());
         let key = device.compute_graph().create_map_layout(op);
 
         Self::from_parts(device, info, key)
@@ -544,35 +548,31 @@ impl<const R: usize, D> Clone for Tensor<R, D> {
     }
 }
 
-pub trait IntoTensor<const R: usize, D> {
-    fn into_tensor(self, device: &Device) -> Tensor<R, D>;
-}
-
-impl<D: DataType> IntoTensor<0, D> for () {
-    fn into_tensor(self, device: &Device) -> Tensor<0, D> {
+impl<D: DataType> fusor_types::FromArray<0, D, (), Device> for Tensor<0, D> {
+    fn from_array(_data: (), device: &Device) -> Self {
         let iter = std::iter::empty();
         Tensor::new_inner(device, iter, [])
     }
 }
 
-impl<'a, I, D: DataType> IntoTensor<1, D> for I
+impl<'a, I, D: DataType> fusor_types::FromArray<1, D, I, Device> for Tensor<1, D>
 where
     I: IntoIterator<Item = &'a D, IntoIter: ExactSizeIterator>,
 {
-    fn into_tensor(self, device: &Device) -> Tensor<1, D> {
-        let iter = self.into_iter();
+    fn from_array(data: I, device: &Device) -> Self {
+        let iter = data.into_iter();
         let size = iter.len();
         Tensor::new_inner(device, iter, [size])
     }
 }
 
-impl<'a, I, I2, D: DataType> IntoTensor<2, D> for I
+impl<'a, I, I2, D: DataType> fusor_types::FromArray<2, D, I, Device> for Tensor<2, D>
 where
     I: IntoIterator<Item = I2, IntoIter: ExactSizeIterator>,
     I2: IntoIterator<Item = &'a D, IntoIter: ExactSizeIterator>,
 {
-    fn into_tensor(self, device: &Device) -> Tensor<2, D> {
-        let mut iter = self.into_iter().map(IntoIterator::into_iter).peekable();
+    fn from_array(data: I, device: &Device) -> Self {
+        let mut iter = data.into_iter().map(IntoIterator::into_iter).peekable();
         let size = iter.len();
         let second_size = iter.peek().map(ExactSizeIterator::len).unwrap_or_default();
         let iter = iter.flat_map(|i| {
@@ -586,14 +586,14 @@ where
     }
 }
 
-impl<'a, I, I2, I3, D: DataType> IntoTensor<3, D> for I
+impl<'a, I, I2, I3, D: DataType> fusor_types::FromArray<3, D, I, Device> for Tensor<3, D>
 where
     I: IntoIterator<Item = I2, IntoIter: ExactSizeIterator>,
     I2: IntoIterator<Item = I3, IntoIter: ExactSizeIterator>,
     I3: IntoIterator<Item = &'a D, IntoIter: ExactSizeIterator>,
 {
-    fn into_tensor(self, device: &Device) -> Tensor<3, D> {
-        let mut iter = self
+    fn from_array(data: I, device: &Device) -> Self {
+        let mut iter = data
             .into_iter()
             .map(|i| i.into_iter().map(IntoIterator::into_iter).peekable())
             .peekable();
@@ -627,15 +627,15 @@ where
     }
 }
 
-impl<'a, I, I2, I3, I4, D: DataType> IntoTensor<4, D> for I
+impl<'a, I, I2, I3, I4, D: DataType> fusor_types::FromArray<4, D, I, Device> for Tensor<4, D>
 where
     I: IntoIterator<Item = I2, IntoIter: ExactSizeIterator>,
     I2: IntoIterator<Item = I3, IntoIter: ExactSizeIterator>,
     I3: IntoIterator<Item = I4, IntoIter: ExactSizeIterator>,
     I4: IntoIterator<Item = &'a D, IntoIter: ExactSizeIterator>,
 {
-    fn into_tensor(self, device: &Device) -> Tensor<4, D> {
-        let mut iter = self
+    fn from_array(data: I, device: &Device) -> Self {
+        let mut iter = data
             .into_iter()
             .map(|i| {
                 i.into_iter()
@@ -684,7 +684,7 @@ where
     }
 }
 
-impl<'a, I, I2, I3, I4, I5, D: DataType> IntoTensor<5, D> for I
+impl<'a, I, I2, I3, I4, I5, D: DataType> fusor_types::FromArray<5, D, I, Device> for Tensor<5, D>
 where
     I: IntoIterator<Item = I2, IntoIter: ExactSizeIterator>,
     I2: IntoIterator<Item = I3, IntoIter: ExactSizeIterator>,
@@ -692,8 +692,8 @@ where
     I4: IntoIterator<Item = I5, IntoIter: ExactSizeIterator>,
     I5: IntoIterator<Item = &'a D, IntoIter: ExactSizeIterator>,
 {
-    fn into_tensor(self, device: &Device) -> Tensor<5, D> {
-        let mut iter = self
+    fn from_array(data: I, device: &Device) -> Self {
+        let mut iter = data
             .into_iter()
             .map(|i| {
                 i.into_iter()
@@ -758,8 +758,11 @@ where
 }
 
 impl<D: DataType, const R: usize> Tensor<R, D> {
-    pub fn new(device: &Device, data: impl IntoTensor<R, D>) -> Self {
-        data.into_tensor(device)
+    pub fn new<T>(device: &Device, data: T) -> Self
+    where
+        Self: fusor_types::FromArray<R, D, T, Device>,
+    {
+        fusor_types::FromArray::from_array(data, device)
     }
 
     pub fn splat(device: &Device, value: D, shape: [usize; R]) -> Self {
@@ -793,7 +796,7 @@ impl<D: DataType, const R: usize> Tensor<R, D> {
 
     async fn as_slice_from_tensor_data(
         tensor: &TensorData,
-    ) -> Result<TensorSlice<R, D>, wgpu::BufferAsyncError> {
+    ) -> Result<TensorSlice<R, D, MappedBuffer>, wgpu::BufferAsyncError> {
         let buffer = tensor.buffer();
         let device = tensor.device.wgpu_device();
         let queue = tensor.device.wgpu_queue();
@@ -847,13 +850,13 @@ impl<D: DataType, const R: usize> Tensor<R, D> {
             {
                 let mut contains_non_finite = false;
                 if D::WGSL_TYPE == DataTypeEnum::F32 {
-                    let data: TensorSlice<R, f32> =
+                    let data: TensorSlice<R, f32, MappedBuffer> =
                         Tensor::as_slice_from_tensor_data(&data).await.unwrap();
                     data.visit_items(|item| {
                         contains_non_finite |= !item.is_finite();
                     });
                 } else if D::WGSL_TYPE == DataTypeEnum::F16 {
-                    let data: TensorSlice<R, half::f16> =
+                    let data: TensorSlice<R, half::f16, MappedBuffer> =
                         Tensor::as_slice_from_tensor_data(&data).await.unwrap();
                     data.visit_items(|item| {
                         contains_non_finite |= !item.is_finite();
@@ -876,7 +879,9 @@ impl<D: DataType, const R: usize> Tensor<R, D> {
         count
     }
 
-    pub async fn as_slice(&self) -> Result<TensorSlice<R, D>, wgpu::BufferAsyncError> {
+    pub async fn as_slice(
+        &self,
+    ) -> Result<TensorSlice<R, D, MappedBuffer>, wgpu::BufferAsyncError> {
         #[cfg(not(target_arch = "wasm32"))]
         let start_time = std::time::Instant::now();
         let (tensor, _) = self.data.materialize();
@@ -1067,160 +1072,6 @@ impl std::ops::Deref for MappedBuffer {
     }
 }
 
-pub struct TensorSlice<const R: usize, D> {
-    buffer: MappedBuffer,
-    layout: Layout,
-    datatype: PhantomData<D>,
-}
-
-impl<D: DataType + Debug> Debug for TensorSlice<0, D> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        self.get([]).fmt(f)
-    }
-}
-
-impl<D: DataType + Debug> Debug for TensorSlice<1, D> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let shape = self.layout.shape();
-        let vec = (0..shape[0])
-            .map(|i| self.get([i]).unwrap())
-            .collect::<Vec<_>>();
-        vec.fmt(f)
-    }
-}
-
-impl<D: DataType + Debug> Debug for TensorSlice<2, D> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let shape = self.layout.shape();
-        let vec = (0..shape[0])
-            .map(|i| {
-                (0..shape[1])
-                    .map(|j| self.get([i, j]).unwrap())
-                    .collect::<Vec<_>>()
-            })
-            .collect::<Vec<_>>();
-        vec.fmt(f)
-    }
-}
-
-impl<D: DataType + Debug> Debug for TensorSlice<3, D> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let shape = self.layout.shape();
-        let vec = (0..shape[0])
-            .map(|i| {
-                (0..shape[1])
-                    .map(|j| {
-                        (0..shape[2])
-                            .map(|k| self.get([i, j, k]).unwrap())
-                            .collect::<Vec<_>>()
-                    })
-                    .collect::<Vec<_>>()
-            })
-            .collect::<Vec<_>>();
-        vec.fmt(f)
-    }
-}
-
-impl<D: DataType + Debug> Debug for TensorSlice<4, D> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let shape = self.layout.shape();
-        let vec = (0..shape[0])
-            .map(|i| {
-                (0..shape[1])
-                    .map(|j| {
-                        (0..shape[2])
-                            .map(|k| {
-                                (0..shape[3])
-                                    .map(|l| self.get([i, j, k, l]).unwrap())
-                                    .collect::<Vec<_>>()
-                            })
-                            .collect::<Vec<_>>()
-                    })
-                    .collect::<Vec<_>>()
-            })
-            .collect::<Vec<_>>();
-        vec.fmt(f)
-    }
-}
-
-impl<const R: usize, D: DataType + PartialEq> PartialEq for TensorSlice<R, D> {
-    fn eq(&self, other: &Self) -> bool {
-        let self_shape = self.layout.shape();
-        let other_shape = other.layout.shape();
-        if self_shape != other_shape {
-            return false;
-        }
-        if R == 0 {
-            return true;
-        }
-        let mut matches = true;
-        self.visit_indexes(|index| {
-            matches &= self.get(index) == other.get(index);
-        });
-        matches
-    }
-}
-
-impl<const R: usize, D: DataType> TensorSlice<R, D> {
-    fn visit_indexes(&self, mut visitor: impl FnMut([usize; R])) {
-        let self_shape = self.layout.shape();
-        let mut index = [0; R];
-        loop {
-            index[0] += 1;
-            for i in 0..R {
-                if index[i] >= self_shape[i] {
-                    index[i] = 0;
-                    if i == R - 1 {
-                        return;
-                    }
-                    index[i + 1] += 1;
-                } else {
-                    break;
-                }
-            }
-            visitor(index);
-        }
-    }
-
-    fn as_scalar(&self) -> D
-    where
-        D: Copy,
-    {
-        self.as_slice()[0]
-    }
-
-    #[cfg(feature = "extra_assertions")]
-    fn visit_items(&self, mut visitor: impl FnMut(&D)) {
-        self.visit_indexes(|index| {
-            visitor(self.get(index).unwrap());
-        });
-    }
-}
-
-impl<'a, D: DataType> PartialEq<&'a [D]> for TensorSlice<1, D> {
-    fn eq(&self, other: &&'a [D]) -> bool {
-        self.as_slice() == *other
-    }
-}
-
-impl<const N: usize, D: DataType> PartialEq<[D; N]> for TensorSlice<1, D> {
-    fn eq(&self, other: &[D; N]) -> bool {
-        self.as_slice() == *other
-    }
-}
-
-impl<D: DataType> PartialEq<TensorSlice<1, D>> for &[D] {
-    fn eq(&self, other: &TensorSlice<1, D>) -> bool {
-        *self == other.as_slice()
-    }
-}
-
-impl<const N: usize, D: DataType> PartialEq<TensorSlice<1, D>> for &[D; N] {
-    fn eq(&self, other: &TensorSlice<1, D>) -> bool {
-        *self == other.as_slice()
-    }
-}
-
 pub(crate) fn padded_tensor_size(size: u64) -> u64 {
     // Valid vulkan usage is
     // 1. buffer size must be a multiple of COPY_BUFFER_ALIGNMENT.
@@ -1257,49 +1108,6 @@ async fn test_tensor_compare() {
     let other_slice = tensor.slice([1..3, 0..1, 0..1]);
     let other_as_slice = other_slice.as_slice().await.unwrap();
     assert!(as_slice != other_as_slice);
-}
-
-impl<D: DataType, const R: usize> TensorSlice<R, D> {
-    fn new(buffer: MappedBuffer, layout: Layout) -> Self {
-        Self {
-            buffer,
-            layout,
-            datatype: PhantomData,
-        }
-    }
-
-    fn as_slice(&self) -> &[D] {
-        bytemuck::cast_slice(&self.buffer.deref()[self.layout.offset() * size_of::<D>()..])
-    }
-}
-
-impl<D: DataType, const R: usize> TensorSlice<R, D> {
-    pub fn shape(&self) -> &[usize] {
-        self.layout.shape()
-    }
-
-    fn get(&self, index: [usize; R]) -> Option<&D> {
-        let mut index_sum = 0;
-        let layout = &self.layout;
-        for ((index_component, &stride), &size) in
-            index.into_iter().zip(layout.strides()).zip(layout.shape())
-        {
-            if index_component >= size {
-                return None;
-            }
-            index_sum += stride * index_component;
-        }
-
-        self.as_slice().get(index_sum)
-    }
-}
-
-impl<D: DataType, const R: usize> Index<[usize; R]> for TensorSlice<R, D> {
-    type Output = D;
-
-    fn index(&self, index: [usize; R]) -> &Self::Output {
-        self.get(index).unwrap()
-    }
 }
 
 #[cfg(test)]

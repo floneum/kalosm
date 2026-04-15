@@ -63,6 +63,22 @@ impl Debug for DeviceInner {
     }
 }
 
+/// A weak reference to a [`Device`] that does not prevent cleanup.
+///
+/// Used internally to break reference cycles (e.g., between Device and ComputeGraph).
+#[derive(Clone, Debug)]
+pub struct WeakDevice {
+    inner: std::sync::Weak<DeviceInner>,
+}
+
+impl WeakDevice {
+    /// Attempt to upgrade to a strong [`Device`] reference.
+    /// Returns `None` if the device has already been dropped.
+    pub fn upgrade(&self) -> Option<Device> {
+        self.inner.upgrade().map(|inner| Device { inner })
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct Device {
     inner: Arc<DeviceInner>,
@@ -71,7 +87,9 @@ pub struct Device {
 impl Device {
     pub async fn new() -> Result<Self, crate::Error> {
         let dx_compiler = wgpu::Dx12Compiler::from_env().unwrap_or(wgpu::Dx12Compiler::StaticDxc);
-        let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
+        let backends = wgpu::Backends::from_env().unwrap_or(wgpu::Backends::all());
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
+            backends,
             backend_options: BackendOptions {
                 dx12: Dx12BackendOptions {
                     shader_compiler: dx_compiler,
@@ -81,7 +99,9 @@ impl Device {
             },
             ..Default::default()
         });
-        let adapter = instance.request_adapter(&Default::default()).await.unwrap();
+        let adapter = wgpu::util::initialize_adapter_from_env_or_default(&instance, None)
+            .await
+            .expect("Failed to find a suitable GPU adapter");
         let mut required_features = wgpu::Features::empty();
         if adapter.features().contains(wgpu::Features::SUBGROUP) {
             required_features |= wgpu::Features::SUBGROUP;
@@ -153,7 +173,7 @@ impl Device {
         // Initialize the compute graph now that we have a valid device
         inner
             .compute_graph
-            .set(ComputeGraph::new(device.clone()))
+            .set(ComputeGraph::new(&device))
             .ok()
             .expect("compute_graph should only be set once");
 
@@ -161,12 +181,14 @@ impl Device {
 
         #[cfg(not(target_arch = "wasm32"))]
         std::thread::spawn({
-            let device = device.clone();
+            let weak_inner = Arc::downgrade(&device.inner);
             move || loop {
-                let Ok(status) = device
-                    .wgpu_device()
-                    .poll(wgpu::PollType::wait_indefinitely())
-                else {
+                let Some(inner) = weak_inner.upgrade() else {
+                    break;
+                };
+                let result = inner.device.poll(wgpu::PollType::wait_indefinitely());
+                drop(inner);
+                let Ok(status) = result else {
                     break;
                 };
                 if status == wgpu::PollStatus::QueueEmpty {
@@ -176,6 +198,13 @@ impl Device {
         });
 
         Ok(device)
+    }
+
+    /// Create a weak reference to this device that doesn't prevent cleanup.
+    pub fn downgrade(&self) -> WeakDevice {
+        WeakDevice {
+            inner: Arc::downgrade(&self.inner),
+        }
     }
 
     pub(crate) fn create_shader_module<'a>(

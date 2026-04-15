@@ -1,13 +1,11 @@
-use fusor_core::layers::Linear;
-use fusor_core::{Device, VarBuilder};
-use fusor_core::{Result, Tensor};
-
-use crate::raw::layer_norm::{layer_norm, LayerNorm};
+use fusor::layers::{LayerNorm, Linear};
+use fusor::{Device, VarBuilder};
+use fusor::{Result, Tensor};
 
 // https://github.com/huggingface/transformers/blob/6eedfa6dd15dc1e22a55ae036f681914e5a0d9a1/src/transformers/models/bert/modeling_bert.py#L456
 pub(crate) struct BertOutput {
     dense: Linear<f32>,
-    layer_norm: LayerNorm<1>,
+    layer_norm: LayerNorm<1, f32>,
     span: tracing::Span,
 }
 
@@ -18,7 +16,7 @@ impl BertOutput {
         config: &super::Config,
     ) -> Result<Self> {
         let dense = Linear::load(device, &mut vb.pp("ffn_down"))?;
-        let layer_norm = layer_norm(
+        let layer_norm = LayerNorm::load(
             device,
             &mut vb.pp("layer_output_norm"),
             config.layer_norm_eps as _,

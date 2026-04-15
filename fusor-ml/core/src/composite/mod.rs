@@ -20,6 +20,7 @@ mod softmax;
 mod sqr;
 mod squeeze;
 mod to_vec;
+pub use to_vec::{ToVec1, ToVec2, ToVec3};
 mod unsqueeze;
 mod variance;
 pub(crate) mod where_cond;

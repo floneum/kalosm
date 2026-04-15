@@ -84,7 +84,7 @@ impl Operation for DequantizeOperation {
     fn inputs(&self, nodes: &crate::compute_graph::ComputeGraphInner) -> Vec<MirValue> {
         let shape = &self.matrix.shape;
         let datatype = self.datatype;
-        let output_tensor = TensorData::new_for_shape(&nodes.device, shape, datatype);
+        let output_tensor = TensorData::new_for_shape(&nodes.device(), shape, datatype);
         vec![MirValue::from(self.matrix.clone()), output_tensor.into()]
     }
 

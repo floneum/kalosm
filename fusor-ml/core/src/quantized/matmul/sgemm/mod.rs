@@ -29,7 +29,7 @@ pub(crate) fn sgemm(
     graph: &crate::compute_graph::ComputeGraphInner,
 ) {
     // Use chunked sgemm for all types that support mat4x4 dequantization
-    if dequantize_mat4x4_block_count(input_b.datatype) > 0 && graph.device.subgroups_supported() {
+    if dequantize_mat4x4_block_count(input_b.datatype) > 0 && graph.device().subgroups_supported() {
         let config = op.chunked_config.unwrap_or(ChunkedSgemmConfig::default());
         chunked_sgemm_with_config(op, generic_kernel, input_a, input_b, output, k_size, config);
     } else {

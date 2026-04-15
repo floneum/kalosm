@@ -9,7 +9,7 @@ authors = ["Evan Almloff <evanalmloff@gmail.com>"]
 keywords = ["llm", "llama", "mistral", "agents", "nlp"]
 
 [dependencies]
-fusor-core = { workspace = true }
+fusor = { workspace = true }
 fusor-gguf = { workspace = true }
 tokenizers = { workspace = true, features = ["fancy-regex"] }
 

@@ -2,18 +2,16 @@
 //!
 //! Bert embeddings contain word embeddings, embeddings about the token type and position information.
 
-use fusor_core::{Device, VarBuilder};
-use fusor_core::{Result, Tensor};
-
-use crate::raw::embedding::{embedding, Embedding};
-use crate::raw::layer_norm::{layer_norm, LayerNorm};
+use fusor::layers::{Embedding, LayerNorm};
+use fusor::{Device, VarBuilder};
+use fusor::{Result, Tensor};
 
 // https://github.com/huggingface/transformers/blob/6eedfa6dd15dc1e22a55ae036f681914e5a0d9a1/src/transformers/models/bert/modeling_bert.py#L180
 pub(crate) struct BertEmbeddings {
-    word_embeddings: Embedding,
-    position_embeddings: Option<Embedding>,
-    token_type_embeddings: Embedding,
-    layer_norm: LayerNorm<1>,
+    word_embeddings: Embedding<f32>,
+    position_embeddings: Option<Embedding<f32>>,
+    token_type_embeddings: Embedding<f32>,
+    layer_norm: LayerNorm<1, f32>,
     span: tracing::Span,
 }
 
@@ -23,10 +21,10 @@ impl BertEmbeddings {
         vb: &mut VarBuilder,
         config: &super::Config,
     ) -> Result<Self> {
-        let word_embeddings = embedding(device, &mut vb.pp("token_embd"))?;
-        let position_embeddings = embedding(device, &mut vb.pp("position_embd"))?;
-        let token_type_embeddings = embedding(device, &mut vb.pp("token_types"))?;
-        let layer_norm = layer_norm(
+        let word_embeddings = Embedding::load(device, &mut vb.pp("token_embd"))?;
+        let position_embeddings = Embedding::load(device, &mut vb.pp("position_embd"))?;
+        let token_type_embeddings = Embedding::load(device, &mut vb.pp("token_types"))?;
+        let layer_norm = LayerNorm::load(
             device,
             &mut vb.pp("token_embd_norm"),
             config.layer_norm_eps as _,
@@ -46,12 +44,14 @@ impl BertEmbeddings {
         token_type_ids: &Tensor<2, u32>,
     ) -> Tensor<3, f32> {
         let _enter = self.span.enter();
-        let [_bsize, seq_len] = *input_ids.shape();
+        let [_bsize, seq_len] = input_ids.shape();
         let input_embeddings = self.word_embeddings.forward(input_ids);
         let token_type_embeddings = self.token_type_embeddings.forward(token_type_ids);
-        let mut embeddings = &input_embeddings + &token_type_embeddings;
+        let mut embeddings: Tensor<3, f32> =
+            (&input_embeddings + &token_type_embeddings).to_concrete();
         if let Some(position_embeddings) = &self.position_embeddings {
-            let position_ids = Tensor::arange(input_ids.device(), 0, seq_len as u32);
+            let device = input_ids.device();
+            let position_ids = fusor::arange(&device, 0u32, seq_len as u32);
             let pos_emb = position_embeddings.forward(&position_ids);
             embeddings = embeddings.add_(&pos_emb)
         }
@@ -59,13 +59,13 @@ impl BertEmbeddings {
     }
 
     pub(crate) fn embedding_dim(&self) -> usize {
-        self.word_embeddings.hidden_size()
+        self.word_embeddings.embedding_dim()
     }
 
     pub(crate) fn max_seq_len(&self) -> usize {
         self.position_embeddings
             .as_ref()
-            .map(|p| p.embeddings().shape()[0])
+            .map(|p| p.num_embeddings())
             .unwrap_or(0)
     }
 }

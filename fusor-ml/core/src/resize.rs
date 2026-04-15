@@ -1,7 +1,7 @@
 use std::fmt::Write;
 
 use crate::{
-    DataTypeEnum, SmallerRank, TILE_SIZE, Tensor, TensorData,
+    DataTypeEnum, Layout, SmallerRank, TILE_SIZE, Tensor, TensorData,
     compute_graph::NodeIndex,
     map_layout::MapLayoutOperation,
     mir::{
@@ -97,11 +97,9 @@ impl ResizeOperation {
         }
         new_strides.reverse();
 
-        Some(MapLayoutOperation::new(
-            self.input,
-            move |_| new_shape.clone(),
-            move |_, _| (offset, new_strides.as_slice().into()),
-        ))
+        Some(MapLayoutOperation::new(self.input, move |_layout| {
+            Layout::from_parts(offset, new_shape.clone(), new_strides.as_slice().into())
+        }))
     }
 
     fn kernel(

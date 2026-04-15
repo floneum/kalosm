@@ -29,11 +29,11 @@ voice_activity_detector = { version = "0.2.0", features = ["async"], optional = 
 ort = { version = "=2.0.0-rc.10", optional = true }
 ort-sys = { version = "=2.0.0-rc.10", optional = true }
 nnnoiseless = { path = "/Users/evanalmloff/Desktop/Github/nnnoiseless", features = ["fusor"], optional = true }
-fusor-core = { workspace = true, optional = true }
+fusor = { workspace = true, optional = true }
 
 [features]
 default = ["denoise"]
-denoise = ["dep:nnnoiseless", "dep:fusor-core"]
+denoise = ["dep:nnnoiseless", "dep:fusor"]
 voice-detection = ["dep:voice_activity_detector", "dep:ort", "dep:ort-sys"]
 source = ["dep:tokio", "dep:cpal"]
 

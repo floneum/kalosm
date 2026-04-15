@@ -82,6 +82,30 @@ impl<'a> VarBuilder<'a> {
             .map(|k| k.to_string())
             .collect()
     }
+
+    /// Get a metadata value by key
+    ///
+    /// If the key starts with '.', it will try to find a key that ends with the given suffix
+    /// and return the value with the shortest matching key.
+    pub fn get_metadata(&self, name: &str) -> crate::Result<&GgufValue> {
+        self.metadata.get_value(name).ok_or_else(|| {
+            crate::Error::VarBuilder(format!("Key '{}' not found in GGUF metadata", name))
+        })
+    }
+
+    /// Get the architecture from GGUF metadata
+    pub fn architecture(&self) -> Option<String> {
+        self.metadata.architecture()
+    }
+
+    /// List all metadata keys (for debugging)
+    pub fn list_metadata_keys(&self) -> Vec<String> {
+        self.metadata
+            .metadata
+            .keys()
+            .map(|s| s.to_string())
+            .collect()
+    }
 }
 
 pub struct ShardedVarBuilder<R: std::io::Read + std::io::Seek> {
@@ -94,21 +118,9 @@ impl<R: std::io::Read + std::io::Seek> ShardedVarBuilder<R> {
     }
 
     pub fn get(&self, name: &str) -> crate::Result<&GgufValue> {
-        if name.starts_with('.') {
-            if let Some(value) = self
-                .contents
-                .iter()
-                .flat_map(|(k, _)| k.metadata.iter().filter(|(k, _)| k.ends_with(name)))
-                .min_by_key(|(k, _)| k.len())
-                .map(|(_, v)| v)
-            {
+        for (content, _) in &self.contents {
+            if let Some(value) = content.get_value(name) {
                 return Ok(value);
-            }
-        } else {
-            for (content, _) in &self.contents {
-                if let Some(value) = content.metadata.get(name) {
-                    return Ok(value);
-                }
             }
         }
         Err(crate::Error::VarBuilder(format!(

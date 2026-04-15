@@ -16,10 +16,11 @@ mod self_output;
 use self_output::*;
 mod intermediate_layer;
 use intermediate_layer::*;
-mod embedding;
-mod layer_norm;
+pub mod qwen;
 
-use fusor_core::{Device, FloatDataType, Result, Tensor, VarBuilder};
+pub use qwen::QwenEmbeddingModel;
+
+use fusor::{Device, Result, Tensor, VarBuilder};
 use serde::Deserialize;
 use std::fmt::Debug;
 
@@ -41,7 +42,7 @@ impl HiddenActLayer {
         Self { act, span }
     }
 
-    fn forward<const R: usize, D: FloatDataType>(&self, xs: &Tensor<R, D>) -> Tensor<R, D> {
+    fn forward(&self, xs: &Tensor<3, f32>) -> Tensor<3, f32> {
         let _enter = self.span.enter();
         match self.act {
             // https://github.com/huggingface/transformers/blob/cd4584e3c809bb9e1392ccd3fe38b40daba5519a/src/transformers/activations.py#L213

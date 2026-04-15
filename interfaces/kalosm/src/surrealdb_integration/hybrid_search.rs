@@ -817,11 +817,7 @@ impl<'a, C: Connection, R, M: Embedder, K: Chunker> HybridSearchBuilder<'a, C, R
             });
         }
 
-        combined_results.sort_by(|a, b| {
-            b.score
-                .partial_cmp(&a.score)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
+        combined_results.sort_by(|a, b| f32::total_cmp(&b.score, &a.score));
         combined_results.truncate(self.results);
 
         Ok(combined_results)
@@ -948,11 +944,7 @@ impl<'a, C: Connection, R, M: Embedder, K: Chunker> HybridSearchBuilder<'a, C, R
         }
 
         // Sort and truncate
-        rrf_results.sort_by(|a, b| {
-            b.score
-                .partial_cmp(&a.score)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
+        rrf_results.sort_by(|a, b| f32::total_cmp(&b.score, &a.score));
         rrf_results.truncate(self.results);
 
         Ok(rrf_results)

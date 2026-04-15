@@ -20,10 +20,8 @@ use super::Chunk;
 
 mod chunking;
 pub use chunking::*;
-mod hypothetical;
-pub use hypothetical::*;
-mod summary;
-pub use summary::*;
+mod task;
+pub use task::*;
 mod sentence;
 pub use sentence::*;
 mod semantic;

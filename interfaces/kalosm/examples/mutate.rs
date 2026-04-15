@@ -164,7 +164,7 @@ async fn eval_with_prompt(llm: Llama, prompt: &str) -> anyhow::Result<f64> {
     println!("evaluating prompt: {prompt}");
 
     let hypothetical = Hypothetical::builder(llm)
-        .with_task_description(prompt.into())
+        .with_task_description(prompt)
         .build();
 
     let mut llama_test_cases = TestCases::new();

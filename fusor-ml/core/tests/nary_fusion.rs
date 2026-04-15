@@ -111,3 +111,46 @@ async fn test_nary_where_cond_basic() {
     assert_eq!(output[[1, 0]], 30.); // condition=1 -> on_true
     assert_eq!(output[[1, 1]], 4.); // condition=0 -> on_false
 }
+
+#[tokio::test]
+async fn test_nary_fusion_respects_binding_limit() {
+    let device = Device::new().await.unwrap();
+
+    // Get the actual GPU storage buffer limit
+    let max_storage_buffers = device.limits().max_storage_buffers_per_shader_stage as usize;
+
+    // Create enough tensors to exceed the limit
+    // We need max_storage_buffers + 1 unique inputs to exceed the limit
+    // (since we also need 1 binding for output)
+    let num_tensors = max_storage_buffers + 1;
+
+    let tensors: Vec<_> = (0..num_tensors)
+        .map(|i| {
+            Tensor::new(
+                &device,
+                &[[i as f32, (i + 1) as f32], [(i + 2) as f32, (i + 3) as f32]],
+            )
+        })
+        .collect();
+
+    // Add all tensors together in a chain
+    // This requires num_tensors input bindings + 1 output = num_tensors + 1 bindings
+    // which exceeds the max_storage_buffers limit
+    let result: Tensor<2, _> = tensors.iter().sum();
+
+    // The number of kernels should be more than 1 due to the binding limit
+    let kernel_count = result.count_kernels_to_resolve();
+    assert!(
+        kernel_count > 1,
+        "Expected more than 1 kernel due to storage binding limit (max_storage_buffers={}), got {}",
+        max_storage_buffers,
+        kernel_count
+    );
+
+    // Verify the result is still correct
+    let output = result.as_slice().await.unwrap();
+    let expected_00: f32 = (0..num_tensors).map(|i| i as f32).sum();
+    let expected_11: f32 = (0..num_tensors).map(|i| (i + 3) as f32).sum();
+    assert_eq!(output[[0, 0]], expected_00);
+    assert_eq!(output[[1, 1]], expected_11);
+}

@@ -4,11 +4,20 @@ use crate::raw::Model;
 use crate::token_stream::TokenOutputStream;
 use crate::token_stream::TokenOutputStreamError;
 use crate::LlamaConfigJson;
-use fusor_core::CastTensor;
-use fusor_core::Device;
-use fusor_core::FloatDataType;
-use fusor_core::ShardedVarBuilder;
-use fusor_core::{WasmNotSend, WasmNotSync};
+use fusor::AddOp;
+use fusor::CastTensor;
+use fusor::CastTo;
+use fusor::Device;
+use fusor::FloatDataType;
+use fusor::FloatOps;
+use fusor::MatmulImpl;
+use fusor::MulOp;
+use fusor::ShardedVarBuilder;
+use fusor::SimdBinaryOp;
+use fusor::SimdElement;
+use fusor::SimdReduceOp;
+use fusor::SumOp;
+use fusor::{WasmNotSend, WasmNotSync};
 use fusor_gguf::GgufMetadata;
 use fusor_gguf::GgufValue;
 use kalosm_language_model::ImageFetchError;
@@ -28,7 +37,7 @@ use crate::{InferenceSettings, LlamaSourceError};
 pub enum LlamaModelError {
     /// An error from candle while running the model.
     #[error("Candle error: {0}")]
-    Candle(#[from] fusor_core::Error),
+    Candle(#[from] fusor::Error),
 
     /// An error from tokenizers while running the model.
     #[error("Tokenizer error: {0}")]
@@ -78,23 +87,26 @@ impl From<image::ImageError> for LlamaModelError {
 }
 
 /// The inner, synchronous Llama model.
-pub(crate) struct LlamaModel<F: FloatDataType = half::f16> {
+pub(crate) struct LlamaModel<F: FloatDataType + SimdElement = f32> {
     pub(crate) model: Model<F>,
     pub(crate) device: Device,
     pub(crate) tokenizer: Arc<Tokenizer>,
 }
 
-impl<F: FloatDataType> LlamaModel<F>
+impl<F: FloatDataType + SimdElement + Default + FloatOps + MatmulImpl> LlamaModel<F>
 where
-    F: CastTensor<f32> + WasmNotSend + WasmNotSync + 'static,
-    f32: CastTensor<F>,
+    F: CastTo<f32> + CastTensor<f32> + WasmNotSend + WasmNotSync + 'static,
+    f32: CastTo<F> + CastTensor<F>,
+    MulOp: SimdBinaryOp<F>,
+    AddOp: SimdBinaryOp<F>,
+    SumOp: SimdReduceOp<F>,
 {
     pub(crate) fn forward(
         model: &Model<F>,
         device: &Device,
         tokens: &[u32],
         images: &[(image::DynamicImage, MediaHints)],
-        cache: Option<&mut LlamaCache<F>>,
+        cache: Option<&mut LlamaCache>,
         #[allow(unused)] tokenizer: &Tokenizer,
     ) -> impl kalosm_model_types::FutureWasmNotSend<Output = Result<Vec<f32>, LlamaModelError>>
     {
@@ -119,14 +131,12 @@ where
 
         let logits = model.forward(tokens, images, device, cache);
         Box::pin(async move {
-            let logits = logits?.squeeze(0);
+            let logits = logits?;
+            let logits = logits.squeeze(0);
             // Cast logits back to f32 for sampling
-            let logits: fusor_core::Tensor<1, f32> = logits.cast();
+            let logits: fusor::Tensor<1, f32> = logits.cast();
             let len = logits.shape()[0];
-            let logits = logits
-                .as_slice()
-                .await
-                .map_err(fusor_core::Error::BufferAsyncError)?;
+            let logits = logits.as_slice().await?;
             let mut logits_vec = Vec::with_capacity(len);
             for i in 0..len {
                 let logit = logits[[i]];
@@ -142,7 +152,7 @@ where
         builder: crate::LlamaBuilder<F>,
         mut handler: impl FnMut(ModelLoadingProgress) + WasmNotSend + WasmNotSync + 'static,
     ) -> Result<Self, LlamaSourceError> {
-        let device = builder.get_device().await?;
+        let device = builder.get_device().await;
 
         // Download the model and tokenizer. These are relatively cheap operations that can be run in the async runtime
         let tokenizer_source = match &builder.source.tokenizer {
@@ -486,6 +496,21 @@ where
             }
             logits = Logits::try_from_iter_top_k(logit_probs, 512)
                 .expect("model output should be valid logits");
+            // Yield control to allow the stream to deliver tokens
+            {
+                use std::sync::atomic::{AtomicBool, Ordering};
+                let yielded = AtomicBool::new(false);
+                std::future::poll_fn(|cx| {
+                    if yielded.load(Ordering::Relaxed) {
+                        std::task::Poll::Ready(())
+                    } else {
+                        yielded.store(true, Ordering::Relaxed);
+                        cx.waker().wake_by_ref();
+                        std::task::Poll::Pending
+                    }
+                })
+                .await;
+            }
         }
 
         // Flush the queued text

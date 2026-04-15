@@ -1,12 +1,10 @@
-use fusor_core::layers::Linear;
-use fusor_core::{Device, VarBuilder};
-use fusor_core::{Result, Tensor};
-
-use crate::raw::layer_norm::{layer_norm, LayerNorm};
+use fusor::layers::{LayerNorm, Linear};
+use fusor::{Device, VarBuilder};
+use fusor::{Result, Tensor};
 
 pub(crate) struct BertSelfOutput {
     dense: Linear<f32>,
-    layer_norm: LayerNorm<1>,
+    layer_norm: LayerNorm<1, f32>,
     span: tracing::Span,
 }
 
@@ -17,7 +15,7 @@ impl BertSelfOutput {
         config: &super::Config,
     ) -> Result<Self> {
         let dense = Linear::load(device, &mut vb.pp("attn_output"))?;
-        let layer_norm = layer_norm(
+        let layer_norm = LayerNorm::load(
             device,
             &mut vb.pp("attn_output_norm"),
             config.layer_norm_eps as _,

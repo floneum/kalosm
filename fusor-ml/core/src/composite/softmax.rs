@@ -489,7 +489,7 @@ impl Operation for SoftmaxOperation {
         kernel: &mut GenericKernel,
     ) {
         let max_blocksize = workgroup_shape.x();
-        self.kernel(workgroup_shape, max_blocksize, kernel, &graph.device);
+        self.kernel(workgroup_shape, max_blocksize, kernel, &graph.device());
     }
 
     fn output(&self, _: &crate::compute_graph::ComputeGraphInner, inputs: &[MirValue]) -> MirValue {

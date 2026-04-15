@@ -2,17 +2,15 @@ use std::{fmt::Debug, ops::Range, sync::Arc};
 
 use crate::{
     D, DataType, Dim, Layout, MaxRank, Tensor, TensorData, compute_graph::NodeIndex,
-    mir::operation::Operation, slice_shape, slice_strides,
+    mir::operation::Operation,
 };
 
-type MapSize = Arc<dyn Fn(&[usize]) -> Box<[usize]> + Send + Sync>;
-type MapStride = Arc<dyn Fn(usize, &[usize]) -> (usize, Box<[usize]>) + Send + Sync>;
+type MapLayout = Arc<dyn Fn(&Layout) -> Layout + Send + Sync>;
 
 #[derive(Clone)]
 pub(crate) struct MapLayoutOperation {
     pub(crate) input: NodeIndex,
-    pub(crate) map_size: MapSize,
-    pub(crate) map_stride: MapStride,
+    pub(crate) map_layout_fn: MapLayout,
 }
 
 impl Debug for MapLayoutOperation {
@@ -26,13 +24,11 @@ impl Debug for MapLayoutOperation {
 impl MapLayoutOperation {
     pub fn new(
         input: NodeIndex,
-        map_size: impl Fn(&[usize]) -> Box<[usize]> + Send + Sync + 'static,
-        map_stride: impl Fn(usize, &[usize]) -> (usize, Box<[usize]>) + Send + Sync + 'static,
+        map_layout_fn: impl Fn(&Layout) -> Layout + Send + Sync + 'static,
     ) -> Self {
         Self {
             input,
-            map_size: Arc::new(map_size),
-            map_stride: Arc::new(map_stride),
+            map_layout_fn: Arc::new(map_layout_fn),
         }
     }
 
@@ -46,8 +42,7 @@ impl MapLayoutOperation {
     }
 
     pub fn map_layout(&self, layout: &Layout) -> Layout {
-        let (offset, strides) = (self.map_stride)(layout.offset(), layout.strides());
-        Layout::from_parts(offset, (self.map_size)(layout.shape()), strides)
+        (self.map_layout_fn)(layout)
     }
 
     pub fn run(&self, graph: &mut crate::compute_graph::ComputeGraphInner) -> TensorData {
@@ -108,53 +103,23 @@ impl Operation for MapLayoutOperation {
 
 impl<const R: usize, T: DataType> Tensor<R, T> {
     pub fn slice(&self, slices: [Range<usize>; R]) -> Tensor<R, T> {
-        self.add_map_layout(MapLayoutOperation::new(
-            self.key(),
-            {
-                let slices = slices.clone();
-                move |shape| slice_shape(&slices, shape)
-            },
-            move |offset, strides| slice_strides(&slices, offset, strides),
-        ))
+        self.add_map_layout(MapLayoutOperation::new(self.key(), move |layout| {
+            layout.slice(&slices)
+        }))
     }
 
     pub fn permute(&self, axes: [usize; R]) -> Tensor<R, T> {
-        for &axis in &axes {
-            assert!(axis < self.rank());
-        }
-        for i in 0..R {
-            for j in (i + 1)..R {
-                assert!(axes[i] != axes[j], "Axes must be unique");
-            }
-        }
-        self.add_map_layout(MapLayoutOperation::new(
-            self.key(),
-            move |shape| (0..R).map(|i| shape[axes[i]]).collect::<Box<[usize]>>(),
-            move |offset, strides| {
-                let new_strides = (0..R).map(|i| strides[axes[i]]).collect::<Box<[usize]>>();
-                (offset, new_strides)
-            },
-        ))
+        self.add_map_layout(MapLayoutOperation::new(self.key(), move |layout| {
+            layout.permute(&axes)
+        }))
     }
 
     pub fn transpose(&self, first_axis: impl Dim<R>, second_axis: impl Dim<R>) -> Tensor<R, T> {
         let first_axis = first_axis.resolve();
         let second_axis = second_axis.resolve();
-        assert!(first_axis < self.rank());
-        assert!(second_axis < self.rank());
-        self.add_map_layout(MapLayoutOperation::new(
-            self.key(),
-            move |shape| {
-                let mut shape: Box<[usize]> = shape.into();
-                shape.swap(first_axis, second_axis);
-                shape
-            },
-            move |offset, strides| {
-                let mut strides: Box<[usize]> = strides.into();
-                strides.swap(first_axis, second_axis);
-                (offset, strides)
-            },
-        ))
+        self.add_map_layout(MapLayoutOperation::new(self.key(), move |layout| {
+            layout.transpose(first_axis, second_axis)
+        }))
     }
 
     pub fn t(&self) -> Tensor<R, T> {
@@ -180,37 +145,9 @@ impl<const R: usize, T: DataType> Tensor<R, T> {
             )
         };
 
-        let current_shape = *self.shape();
-
-        self.add_map_layout(MapLayoutOperation::new(
-            self.key(),
-            move |_| out_shape.into(),
-            move |offset, strides| {
-                let mut new_strides = [0; R2];
-                let mut current_shape_iter = current_shape.into_iter().rev().peekable();
-                let mut strides_iter = strides.iter().rev();
-
-                for (new_strides_fill, new_shape) in out_shape.into_iter().enumerate().rev() {
-                    let stride = if let Some(current_dim) = current_shape_iter.next_if(|&current_dim|current_dim == new_shape || (current_dim == 1 && new_shape > 1 )) {
-                        let stride = *strides_iter.next().unwrap();
-                        // Matching dim, use the same stride
-                        if current_dim == new_shape {
-                            stride
-                        }
-                        // Broadcasted dim, set stride to 0
-                        else {
-                            0
-                        }
-                    } else {
-                        // New dimension
-                        0
-                    };
-                    new_strides[new_strides_fill] = stride;
-                }
-                assert_eq!(current_shape_iter.len(), 0, "failed to broadcast tensor: input shape {current_shape:?} is not compatible with output shape {out_shape:?}");
-                (offset, new_strides.into())
-            },
-        ))
+        self.add_map_layout(MapLayoutOperation::new(self.key(), move |layout| {
+            layout.broadcast_to(&out_shape)
+        }))
     }
 
     pub(crate) fn broadcast_together<const R2: usize, const R3: usize>(
