@@ -4,7 +4,7 @@ use fusor::{Result, Tensor};
 
 pub(crate) struct BertSelfOutput {
     dense: Linear<f32>,
-    layer_norm: LayerNormNd<3, f32>,
+    layer_norm: LayerNormNd<f32>,
     span: tracing::Span,
 }
 

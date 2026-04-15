@@ -100,9 +100,9 @@ pub struct PromptEncoder {
     point_embeddings: Vec<Embedding<f32>>,
     not_a_point_embed: Embedding<f32>,
     mask_downscaling_conv1: ConvNd<2, 4, f32>,
-    mask_downscaling_ln1: LayerNormNd<4, f32>,
+    mask_downscaling_ln1: LayerNormNd<f32>,
     mask_downscaling_conv2: ConvNd<2, 4, f32>,
-    mask_downscaling_ln2: LayerNormNd<4, f32>,
+    mask_downscaling_ln2: LayerNormNd<f32>,
     mask_downscaling_conv3: ConvNd<2, 4, f32>,
     no_mask_embed: Embedding<f32>,
     image_embedding_size: (usize, usize),
@@ -129,12 +129,20 @@ impl PromptEncoder {
         };
         let mask_downscaling_conv1 =
             ConvNd::<2, 4, f32>::load(device, &mut vb.pp("mask_downscaling.0"), cfg_s2)?;
-        let mask_downscaling_ln1 =
-            LayerNormNd::<4, f32>::load_over_axis(device, &mut vb.pp("mask_downscaling.1"), 1, 1e-6)?;
+        let mask_downscaling_ln1 = LayerNormNd::<f32>::load_over_axis(
+            device,
+            &mut vb.pp("mask_downscaling.1"),
+            1,
+            1e-6,
+        )?;
         let mask_downscaling_conv2 =
             ConvNd::<2, 4, f32>::load(device, &mut vb.pp("mask_downscaling.3"), cfg_s2)?;
-        let mask_downscaling_ln2 =
-            LayerNormNd::<4, f32>::load_over_axis(device, &mut vb.pp("mask_downscaling.4"), 1, 1e-6)?;
+        let mask_downscaling_ln2 = LayerNormNd::<f32>::load_over_axis(
+            device,
+            &mut vb.pp("mask_downscaling.4"),
+            1,
+            1e-6,
+        )?;
         let mask_downscaling_conv3 = ConvNd::<2, 4, f32>::load(
             device,
             &mut vb.pp("mask_downscaling.6"),

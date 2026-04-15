@@ -1,72 +1,27 @@
 use fusor::{
-    AddOp, CastTensor, CastTo, Device, FloatDataType, FloatOps, MatmulImpl, MulOp, SimdBinaryOp,
-    SimdElement, SimdReduceOp, SumOp, Tensor, VarBuilder,
+    AddOp, CastTensor, CastTo, ConcreteTensor, CoreLargerRank, CpuLargerRank, Device, FloatDataType,
+    FloatOps, GpuTensor, MatmulImpl, MulOp, SimdBinaryOp, SimdElement, SimdReduceOp, SumOp, Tensor,
+    VarBuilder,
+    layers::{ConvNd, ConvNdConfig},
 };
-
-#[derive(Debug, Clone, Copy)]
-pub struct Conv3dConfig {
-    pub padding: usize,
-    pub stride: usize,
-}
-
-impl Default for Conv3dConfig {
-    fn default() -> Self {
-        Self {
-            padding: 0,
-            stride: 1,
-        }
-    }
-}
-
-pub struct Conv3d<T: fusor::DataType + SimdElement> {
-    weight: Tensor<5, T>, // (out_channels, in_channels, kernel_h, kernel_w, temporal)
-    bias: Option<Tensor<1, T>>, // (out_channels,)
-    config: Conv3dConfig,
-}
-
-impl<T: FloatDataType + SimdElement + FloatOps + MatmulImpl> Conv3d<T>
-where
-    MulOp: SimdBinaryOp<T>,
-    AddOp: SimdBinaryOp<T>,
-    SumOp: SimdReduceOp<T>,
-{
-    pub fn new(weight: Tensor<5, T>, bias: Option<Tensor<1, T>>, config: Conv3dConfig) -> Self {
-        Self {
-            weight,
-            bias,
-            config,
-        }
-    }
-
-    pub fn forward(&self, input: &Tensor<5, T>) -> Tensor<5, T> {
-        input.conv(
-            &self.weight,
-            self.bias.as_ref(),
-            [
-                self.config.padding,
-                self.config.padding,
-                self.config.padding,
-            ],
-            [self.config.stride, self.config.stride, self.config.stride],
-        )
-    }
-}
 
 pub(crate) struct Qwen2_5VisionPatchEmbed<F: FloatDataType + SimdElement> {
     patch_size: usize,
     temporal_patch_size: usize,
     in_channels: usize,
     embed_dim: usize,
-    conv: Conv3d<F>,
+    conv: ConvNd<3, 5, F>,
 }
 
-impl<F: FloatDataType + SimdElement + FloatOps + MatmulImpl> Qwen2_5VisionPatchEmbed<F>
+impl<F: FloatDataType + SimdElement + FloatOps + MatmulImpl + Default> Qwen2_5VisionPatchEmbed<F>
 where
     F: CastTo<f32> + CastTensor<f32>,
     f32: CastTo<F> + CastTensor<F>,
     MulOp: SimdBinaryOp<F>,
     AddOp: SimdBinaryOp<F>,
     SumOp: SimdReduceOp<F>,
+    ConcreteTensor<F, 5>: CpuLargerRank<8, 3, F>,
+    GpuTensor<5, F>: CoreLargerRank<3, 8, F>,
 {
     pub fn new(
         patch_size: usize,
@@ -96,9 +51,10 @@ where
         // [out_channels, in_channels, kernel_h, kernel_w] -> [out_channels, in_channels, 2, kernel_h, kernel_w]
         let weight: Tensor<5, F> = Tensor::stack([weight_0, weight_1], 2);
 
-        let cfg = Conv3dConfig {
-            stride: patch_size,
-            ..Default::default()
+        let cfg = ConvNdConfig {
+            padding: [0; 3],
+            stride: [patch_size; 3],
+            groups: 1,
         };
 
         Ok(Self {
@@ -106,7 +62,7 @@ where
             temporal_patch_size,
             in_channels,
             embed_dim: hidden_size,
-            conv: Conv3d::new(weight, None, cfg),
+            conv: ConvNd::new(weight.to_concrete(), None, cfg),
         })
     }
 
@@ -217,12 +173,13 @@ async fn test_vision_patch_embed() {
         temporal_patch_size,
         in_channels,
         embed_dim,
-        conv: Conv3d::new(
-            weight,
+        conv: ConvNd::new(
+            weight.to_concrete(),
             None,
-            Conv3dConfig {
-                stride: patch_size,
-                ..Default::default()
+            ConvNdConfig {
+                padding: [0; 3],
+                stride: [patch_size; 3],
+                groups: 1,
             },
         ),
     };

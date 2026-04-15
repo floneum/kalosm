@@ -93,12 +93,12 @@ impl Attention {
 
 struct TwoWayAttentionBlock {
     self_attn: Attention,
-    norm1: LayerNormNd<3, f32>,
+    norm1: LayerNormNd<f32>,
     cross_attn_token_to_image: Attention,
-    norm2: LayerNormNd<3, f32>,
+    norm2: LayerNormNd<f32>,
     mlp: MlpBlock,
-    norm3: LayerNormNd<3, f32>,
-    norm4: LayerNormNd<3, f32>,
+    norm3: LayerNormNd<f32>,
+    norm4: LayerNormNd<f32>,
     cross_attn_image_to_token: Attention,
     skip_first_layer_pe: bool,
 }
@@ -199,7 +199,7 @@ impl TwoWayAttentionBlock {
 pub struct TwoWayTransformer {
     layers: Vec<TwoWayAttentionBlock>,
     final_attn_token_to_image: Attention,
-    norm_final_attn: LayerNormNd<3, f32>,
+    norm_final_attn: LayerNormNd<f32>,
 }
 
 impl TwoWayTransformer {

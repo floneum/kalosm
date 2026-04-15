@@ -5,7 +5,7 @@ use fusor::{Result, Tensor};
 // https://github.com/huggingface/transformers/blob/6eedfa6dd15dc1e22a55ae036f681914e5a0d9a1/src/transformers/models/bert/modeling_bert.py#L456
 pub(crate) struct BertOutput {
     dense: Linear<f32>,
-    layer_norm: LayerNormNd<3, f32>,
+    layer_norm: LayerNormNd<f32>,
     span: tracing::Span,
 }
 

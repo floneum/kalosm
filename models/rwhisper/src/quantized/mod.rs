@@ -211,11 +211,11 @@ struct ResidualAttentionBlockCache {
 // https://github.com/openai/whisper/blob/f572f2161ba831bae131364c3bffdead7af6d210/whisper/model.py#L111
 struct ResidualAttentionBlock {
     attn: MultiHeadAttention,
-    attn_ln: LayerNormNd<3, crate::WhisperDType>,
-    cross_attn: Option<(MultiHeadAttention, LayerNormNd<3, crate::WhisperDType>)>,
+    attn_ln: LayerNormNd<crate::WhisperDType>,
+    cross_attn: Option<(MultiHeadAttention, LayerNormNd<crate::WhisperDType>)>,
     mlp_linear1: Linear<crate::WhisperDType>,
     mlp_linear2: Linear<crate::WhisperDType>,
-    mlp_ln: LayerNormNd<3, crate::WhisperDType>,
+    mlp_ln: LayerNormNd<crate::WhisperDType>,
     span: tracing::Span,
 }
 
@@ -314,7 +314,7 @@ pub struct AudioEncoder {
     conv2: ConvNd<1, 3, crate::WhisperDType>,
     positional_embedding: Tensor<2, crate::WhisperDType>,
     blocks: Vec<ResidualAttentionBlock>,
-    ln_post: LayerNormNd<3, crate::WhisperDType>,
+    ln_post: LayerNormNd<crate::WhisperDType>,
     span: tracing::Span,
     conv1_span: tracing::Span,
     conv2_span: tracing::Span,
@@ -411,7 +411,7 @@ pub struct TextDecoder {
     token_embedding: Embedding<crate::WhisperDType>,
     positional_embedding: Tensor<2, crate::WhisperDType>,
     blocks: Vec<ResidualAttentionBlock>,
-    ln: LayerNormNd<3, crate::WhisperDType>,
+    ln: LayerNormNd<crate::WhisperDType>,
     max_target_positions: usize,
     mask_cache: Arc<MaskCache<crate::WhisperDType>>,
     span: tracing::Span,

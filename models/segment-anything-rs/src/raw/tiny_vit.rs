@@ -242,9 +242,9 @@ impl ConvLayer {
     }
 }
 
-/// MLP for TinyViTBlock: LayerNormNd<4, f32> -> Linear -> GELU -> Linear
+/// MLP for TinyViTBlock: LayerNormNd<f32> -> Linear -> GELU -> Linear
 struct TinyMlp {
-    norm: LayerNormNd<3, f32>,
+    norm: LayerNormNd<f32>,
     fc1: Linear<f32>,
     fc2: Linear<f32>,
 }
@@ -273,7 +273,7 @@ impl TinyMlp {
 /// Attention module for TinyViTBlock.
 /// Uses pre-computed attention biases (indexed at load time).
 struct TinyAttention {
-    norm: LayerNormNd<3, f32>,
+    norm: LayerNormNd<f32>,
     qkv: Linear<f32>,
     proj: Linear<f32>,
     ab: Tensor<3, f32, ConcreteTensor<f32, 3>>, // (num_heads, n_points, n_points)
@@ -589,9 +589,9 @@ pub struct TinyViT {
     pub(crate) layer0: ConvLayer,
     pub(crate) layers: Vec<BasicLayer>,
     neck_conv1: ConvNd<2, 4, f32>,
-    neck_ln1: LayerNormNd<4, f32>,
+    neck_ln1: LayerNormNd<f32>,
     neck_conv2: ConvNd<2, 4, f32>,
-    neck_ln2: LayerNormNd<4, f32>,
+    neck_ln2: LayerNormNd<f32>,
 }
 
 impl TinyViT {
@@ -649,16 +649,21 @@ impl TinyViT {
             layers.push(layer);
         }
 
-        let neck_conv1 =
-            ConvNd::<2, 4, f32>::load_no_bias(device, &mut vb.pp("neck.0"), ConvNdConfig::default())?;
-        let neck_ln1 = LayerNormNd::<4, f32>::load_over_axis(device, &mut vb.pp("neck.1"), 1, 1e-6)?;
+        let neck_conv1 = ConvNd::<2, 4, f32>::load_no_bias(
+            device,
+            &mut vb.pp("neck.0"),
+            ConvNdConfig::default(),
+        )?;
+        let neck_ln1 =
+            LayerNormNd::<f32>::load_over_axis(device, &mut vb.pp("neck.1"), 1, 1e-6)?;
         let cfg_pad1 = ConvNdConfig {
             padding: [1, 1],
             stride: [1, 1],
             groups: 1,
         };
         let neck_conv2 = ConvNd::<2, 4, f32>::load_no_bias(device, &mut vb.pp("neck.2"), cfg_pad1)?;
-        let neck_ln2 = LayerNormNd::<4, f32>::load_over_axis(device, &mut vb.pp("neck.3"), 1, 1e-6)?;
+        let neck_ln2 =
+            LayerNormNd::<f32>::load_over_axis(device, &mut vb.pp("neck.3"), 1, 1e-6)?;
 
         Ok(Self {
             patch_embed,

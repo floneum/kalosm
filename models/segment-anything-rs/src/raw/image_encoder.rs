@@ -206,9 +206,9 @@ fn get_rel_pos(
 }
 
 struct Block {
-    norm1: LayerNormNd<3, f32>,
+    norm1: LayerNormNd<f32>,
     attn: Attention,
-    norm2: LayerNormNd<3, f32>,
+    norm2: LayerNormNd<f32>,
     mlp: MlpBlock,
     window_size: usize,
 }
@@ -260,7 +260,7 @@ impl Block {
         let h = shape[1];
         let w = shape[2];
 
-        // LayerNormNd<4, f32> over last dim
+        // LayerNormNd<f32> over last dim
         let xs = layer_norm_bhwc(&self.norm1, xs);
 
         let (xs, pad_hw) = if self.window_size > 0 {
@@ -370,9 +370,9 @@ pub struct ImageEncoderViT {
     patch_embed: PatchEmbed,
     blocks: Vec<Block>,
     neck_conv1: ConvNd<2, 4, f32>,
-    neck_ln1: LayerNormNd<4, f32>,
+    neck_ln1: LayerNormNd<f32>,
     neck_conv2: ConvNd<2, 4, f32>,
-    neck_ln2: LayerNormNd<4, f32>,
+    neck_ln2: LayerNormNd<f32>,
     pos_embed: Option<Tensor<4, f32, ConcreteTensor<f32, 4>>>,
 }
 
@@ -414,16 +414,21 @@ impl ImageEncoderViT {
             blocks.push(block);
         }
 
-        let neck_conv1 =
-            ConvNd::<2, 4, f32>::load_no_bias(device, &mut vb.pp("neck.0"), ConvNdConfig::default())?;
-        let neck_ln1 = LayerNormNd::<4, f32>::load_over_axis(device, &mut vb.pp("neck.1"), 1, 1e-6)?;
+        let neck_conv1 = ConvNd::<2, 4, f32>::load_no_bias(
+            device,
+            &mut vb.pp("neck.0"),
+            ConvNdConfig::default(),
+        )?;
+        let neck_ln1 =
+            LayerNormNd::<f32>::load_over_axis(device, &mut vb.pp("neck.1"), 1, 1e-6)?;
         let cfg_pad1 = ConvNdConfig {
             padding: [1, 1],
             stride: [1, 1],
             groups: 1,
         };
         let neck_conv2 = ConvNd::<2, 4, f32>::load_no_bias(device, &mut vb.pp("neck.2"), cfg_pad1)?;
-        let neck_ln2 = LayerNormNd::<4, f32>::load_over_axis(device, &mut vb.pp("neck.3"), 1, 1e-6)?;
+        let neck_ln2 =
+            LayerNormNd::<f32>::load_over_axis(device, &mut vb.pp("neck.3"), 1, 1e-6)?;
 
         let pos_embed = if use_abs_pos {
             let p: Tensor<4, f32> = vb.get("pos_embed", device)?.dequantize();
@@ -472,9 +477,9 @@ impl ImageEncoderViT {
     }
 }
 
-/// LayerNormNd<4, f32> helper for BHWC tensors (normalizes last dim).
+/// LayerNormNd<f32> helper for BHWC tensors (normalizes last dim).
 fn layer_norm_bhwc(
-    norm: &LayerNormNd<3, f32>,
+    norm: &LayerNormNd<f32>,
     input: &Tensor<4, f32, impl TensorBacking<4, Elem = f32>>,
 ) -> Tensor<4, f32, ConcreteTensor<f32, 4>> {
     let [b, h, w, c] = input.shape();

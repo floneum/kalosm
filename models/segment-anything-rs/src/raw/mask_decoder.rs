@@ -136,7 +136,7 @@ pub struct MaskDecoder {
     mask_tokens: Embedding<f32>,
     iou_prediction_head: MlpMaskDecoder,
     output_upscaling_conv1: SamUpscale2x2,
-    output_upscaling_ln: LayerNormNd<4, f32>,
+    output_upscaling_ln: LayerNormNd<f32>,
     output_upscaling_conv2: SamUpscale2x2,
     num_mask_tokens: usize,
     output_hypernetworks_mlps: Vec<MlpMaskDecoder>,
@@ -161,8 +161,12 @@ impl MaskDecoder {
         let iou_token = Embedding::load(device, &mut vb.pp("iou_token"))?;
         let mask_tokens = Embedding::load(device, &mut vb.pp("mask_tokens"))?;
         let output_upscaling_conv1 = SamUpscale2x2::load(device, &mut vb.pp("output_upscaling.0"))?;
-        let output_upscaling_ln =
-            LayerNormNd::<4, f32>::load_over_axis(device, &mut vb.pp("output_upscaling.1"), 1, 1e-6)?;
+        let output_upscaling_ln = LayerNormNd::<f32>::load_over_axis(
+            device,
+            &mut vb.pp("output_upscaling.1"),
+            1,
+            1e-6,
+        )?;
         let output_upscaling_conv2 = SamUpscale2x2::load(device, &mut vb.pp("output_upscaling.3"))?;
         let mut output_hypernetworks_mlps = Vec::with_capacity(num_mask_tokens);
         for i in 0..num_mask_tokens {
@@ -275,7 +279,7 @@ impl MaskDecoder {
 
         // Upscale mask embeddings
         // Process each batch item individually through the upscaling pipeline.
-        // The SAM-specific upscaler and LayerNormNd<4, f32> are only exercised here.
+        // The SAM-specific upscaler and LayerNormNd<f32> are only exercised here.
         let src: Tensor<4, f32> = src
             .transpose(1, 2)
             .to_concrete()
@@ -283,7 +287,7 @@ impl MaskDecoder {
             .to_concrete();
 
         // Run the upscaling pipeline per batch item. Batched conv2d through
-        // the SAM-specific upscaler hits an issue with `LayerNormNd<4, f32>` on some
+        // the SAM-specific upscaler hits an issue with `LayerNormNd<f32>` on some
         // backends, so we always slice per item; for `batch_size == 1` this
         // is a single narrow + cat with negligible overhead.
         let mut upscaled_items = Vec::with_capacity(batch_size);

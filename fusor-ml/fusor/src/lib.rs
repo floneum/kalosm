@@ -111,9 +111,11 @@ pub use fusor_core::Tensor as GpuTensor;
 
 // Re-export from fusor-core for GPU types
 pub use fusor_core::{
-    CastTensor, D, DataType, Dim, FloatDataType, GgufReadError, LastRank, LastRankInner, MaxRank,
-    NextRank, NextRankInner, SmallerRank, WasmNotSend, WasmNotSync,
+    CastTensor, D, DataType, Dim, FloatDataType, GgufReadError, LargerRank as CoreLargerRank,
+    LastRank, LastRankInner, MaxRank, NextRank, NextRankInner, SmallerRank, WasmNotSend,
+    WasmNotSync,
 };
+pub use fusor_cpu::LargerRank as CpuLargerRank;
 
 /// Runtime dispatch wrapper - holds either CPU or GPU version of an operation/tensor type.
 ///

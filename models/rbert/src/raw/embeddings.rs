@@ -11,7 +11,7 @@ pub(crate) struct BertEmbeddings {
     word_embeddings: Embedding<f32>,
     position_embeddings: Option<Embedding<f32>>,
     token_type_embeddings: Embedding<f32>,
-    layer_norm: LayerNormNd<3, f32>,
+    layer_norm: LayerNormNd<f32>,
     span: tracing::Span,
 }
 

@@ -295,8 +295,7 @@ mod tests {
         let weight_gpu: Tensor<3, f32> =
             Tensor::from_slice(&gpu_device, [384, 80, 3], &weight_data);
         let bias_gpu: Tensor<1, f32> = Tensor::from_slice(&gpu_device, [384], &bias_data);
-        let input_gpu: Tensor<3, f32> =
-            Tensor::from_slice(&gpu_device, [1, 80, 3000], &input_data);
+        let input_gpu: Tensor<3, f32> = Tensor::from_slice(&gpu_device, [1, 80, 3000], &input_data);
         let conv_gpu = ConvNd::<1, 3, _>::new(weight_gpu, Some(bias_gpu), config);
         let output_gpu = conv_gpu.forward(&input_gpu);
         let result_gpu = output_gpu.as_slice().await.unwrap();
