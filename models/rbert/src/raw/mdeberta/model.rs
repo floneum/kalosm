@@ -117,6 +117,29 @@ impl MDebertaModel {
         hidden_states
     }
 
+    #[doc(hidden)]
+    pub fn debug_after_embedding_norm(&self, input_ids: &Tensor<2, u32>) -> Tensor<3, f32> {
+        let hidden_states = self.token_embeddings.forward(input_ids);
+        self.embedding_norm.forward(&hidden_states)
+    }
+
+    #[doc(hidden)]
+    pub fn debug_first_layer_output(
+        &self,
+        hidden_states: &Tensor<3, f32>,
+        attention_mask: Option<&Tensor<2, u32>>,
+    ) -> Tensor<3, f32> {
+        let [b_sz, seq_len, _] = hidden_states.shape();
+        let gather_idx = self.rel_pos_embedding.compute_gather_indices(
+            b_sz,
+            self.config.num_heads,
+            seq_len,
+            &self.device,
+        );
+        let rel_pos_emb = self.rel_pos_embedding.get_embeddings();
+        self.layers[0].forward_with_rel(hidden_states, &rel_pos_emb, &gather_idx, attention_mask)
+    }
+
     /// Get the embedding dimension.
     pub fn embedding_dim(&self) -> usize {
         self.config.hidden_size

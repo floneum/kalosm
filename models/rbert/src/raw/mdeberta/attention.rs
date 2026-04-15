@@ -247,6 +247,7 @@ impl MDebertaAttention {
             self.num_heads,
             self.head_dim,
         );
+        let [batch_size, _, _, _] = query.shape();
 
         // === Content-to-Content attention ===
         let c2c_scores = query.mat_mul(&key.transpose(2, 3));
@@ -264,6 +265,23 @@ impl MDebertaAttention {
             self.num_heads,
             self.head_dim,
         );
+        let num_relative_positions = pos_query.shape()[2];
+        let pos_query = pos_query
+            .broadcast_as([
+                batch_size,
+                self.num_heads,
+                num_relative_positions,
+                self.head_dim,
+            ])
+            .to_concrete();
+        let pos_key = pos_key
+            .broadcast_as([
+                batch_size,
+                self.num_heads,
+                num_relative_positions,
+                self.head_dim,
+            ])
+            .to_concrete();
 
         // === Content-to-Position attention ===
         // c2p = Q @ pos_key^T -> [batch, heads, seq, 2*max_pos]

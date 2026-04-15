@@ -1,16 +1,12 @@
 mod components;
 
-use components::badge::{Badge, BadgeVariant};
-use components::button::Button;
-use components::card::{Card, CardContent, CardDescription, CardHeader, CardTitle};
 use components::input::Input;
 use components::label::Label;
 use components::select::{
     Select, SelectItemIndicator, SelectList, SelectOption, SelectTrigger, SelectValue,
 };
-use components::tabs::{TabContent, TabList, TabTrigger, Tabs};
-use components::textarea::Textarea;
 use dioxus::prelude::*;
+use dioxus_markdown::Markdown;
 use rgliner::{
     relation_decoding::Relation,
     relex::{GlinerRelEx, GlinerRelExSource},
@@ -18,6 +14,15 @@ use rgliner::{
 };
 
 const TOKEN_BUDGET: usize = 128;
+const DEBOUNCE_MS: u32 = 500;
+
+#[cfg(target_arch = "wasm32")]
+async fn sleep_ms(ms: u32) {
+    gloo_timers::future::TimeoutFuture::new(ms).await;
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+async fn sleep_ms(_ms: u32) {}
 
 fn main() {
     #[cfg(target_arch = "wasm32")]
@@ -34,22 +39,6 @@ enum Mode {
     Relex,
 }
 
-impl Mode {
-    fn value(self) -> &'static str {
-        match self {
-            Mode::Ner => "ner",
-            Mode::Relex => "relex",
-        }
-    }
-
-    fn from_value(v: &str) -> Mode {
-        match v {
-            "relex" => Mode::Relex,
-            _ => Mode::Ner,
-        }
-    }
-}
-
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum ModelChoice {
     Edge,
@@ -64,37 +53,35 @@ enum ModelChoice {
 impl ModelChoice {
     fn label(self) -> &'static str {
         match self {
-            ModelChoice::Edge => "edge · 60M · fastest",
-            ModelChoice::Small => "small · 108M",
-            ModelChoice::Base => "base · 194M",
-            ModelChoice::Large => "large · 530M · best NER",
-            ModelChoice::RelexMulti => "relex-multi · multilingual",
-            ModelChoice::RelexBase => "relex-base · English",
-            ModelChoice::RelexLarge => "relex-large · English · best",
+            ModelChoice::Edge => "edge · entities · 60M",
+            ModelChoice::Small => "small · entities · 108M",
+            ModelChoice::Base => "base · entities · 194M",
+            ModelChoice::Large => "large · entities · 530M",
+            ModelChoice::RelexMulti => "relex-multi · entities + relations",
+            ModelChoice::RelexBase => "relex-base · entities + relations · EN",
+            ModelChoice::RelexLarge => "relex-large · entities + relations · EN",
         }
     }
 
-    fn default_for(mode: Mode) -> Self {
-        match mode {
-            Mode::Ner => ModelChoice::Edge,
-            Mode::Relex => ModelChoice::RelexMulti,
+    fn mode(self) -> Mode {
+        match self {
+            ModelChoice::Edge | ModelChoice::Small | ModelChoice::Base | ModelChoice::Large => {
+                Mode::Ner
+            }
+            _ => Mode::Relex,
         }
     }
 
-    fn for_mode(mode: Mode) -> &'static [ModelChoice] {
-        match mode {
-            Mode::Ner => &[
-                ModelChoice::Edge,
-                ModelChoice::Small,
-                ModelChoice::Base,
-                ModelChoice::Large,
-            ],
-            Mode::Relex => &[
-                ModelChoice::RelexMulti,
-                ModelChoice::RelexBase,
-                ModelChoice::RelexLarge,
-            ],
-        }
+    fn all() -> &'static [ModelChoice] {
+        &[
+            ModelChoice::Edge,
+            ModelChoice::Small,
+            ModelChoice::Base,
+            ModelChoice::Large,
+            ModelChoice::RelexMulti,
+            ModelChoice::RelexBase,
+            ModelChoice::RelexLarge,
+        ]
     }
 }
 
@@ -112,39 +99,98 @@ impl LoadedModel {
 }
 
 #[derive(Clone, Default)]
-struct RelexResult {
+struct Extraction {
     entities: Vec<Entity>,
     relations: Vec<Relation>,
 }
 
+const DEFAULT_TEXT: &str = "# Silicon Valley, Briefly\n\n*Apple Inc.* was founded by **Steve Jobs** in California. **Microsoft** is headquartered in Redmond, and was founded by Bill Gates.\n\nOpenAI operates out of San Francisco.";
+
 #[component]
 fn App() -> Element {
-    let mut mode = use_signal(|| Mode::Ner);
     let mut choice = use_signal(|| ModelChoice::Edge);
-
-    let mut text = use_signal(|| {
-        "Apple Inc. was founded by Steve Jobs in California. Microsoft is headquartered in Redmond."
-            .to_string()
-    });
+    let mut text = use_signal(|| DEFAULT_TEXT.to_string());
     let mut entity_labels = use_signal(|| "person, organization, location".to_string());
-    let mut relation_labels = use_signal(|| "founded by, located in".to_string());
+    let mut relation_labels = use_signal(|| "founded by, located in, headquartered in".to_string());
 
     let mut model = use_signal(|| None::<LoadedModel>);
     let mut loading = use_signal(|| false);
     let mut running = use_signal(|| false);
     let mut error = use_signal(|| None::<String>);
-    let mut ner_out = use_signal(Vec::<Entity>::new);
-    let mut relex_out = use_signal(RelexResult::default);
-    let mut status = use_signal(|| "No model loaded".to_string());
+    let mut extraction = use_signal(Extraction::default);
+    let mut status = use_signal(|| "idle".to_string());
+    let mut schedule = use_signal(|| 0u64);
 
-    let on_mode_change = move |v: String| {
-        let new_mode = Mode::from_value(&v);
-        if mode() != new_mode {
-            mode.set(new_mode);
-            choice.set(ModelChoice::default_for(new_mode));
-            ner_out.write().clear();
-            *relex_out.write() = RelexResult::default();
+    // Bump the schedule whenever any input that affects extraction changes.
+    // Do NOT read `model` here — the extractor writes it back on every run,
+    // which would re-trigger this effect in an endless loop.
+    use_effect(move || {
+        let _ = text();
+        let _ = entity_labels();
+        let _ = relation_labels();
+        schedule.with_mut(|s| *s += 1);
+    });
+
+    // React to schedule changes: debounce, then extract.
+    use_effect(move || {
+        let current = schedule();
+        if current == 0 {
+            return;
         }
+        spawn(async move {
+            sleep_ms(DEBOUNCE_MS).await;
+            if schedule() != current {
+                return;
+            }
+            // Wait for any in-flight extraction to finish; bail if a newer change arrives.
+            while running() {
+                sleep_ms(80).await;
+                if schedule() != current {
+                    return;
+                }
+            }
+            let Some(mut taken) = model.write().take() else {
+                return;
+            };
+            running.set(true);
+            error.set(None);
+            status.set("extracting…".to_string());
+
+            let ent_labels = parse_labels(&entity_labels());
+            let rel_labels = parse_labels(&relation_labels());
+            let cur_text = text();
+            let mode = taken.choice().mode();
+            let outcome =
+                run_extraction(&mut taken, mode, &cur_text, &ent_labels, &rel_labels).await;
+            model.set(Some(taken));
+
+            match outcome {
+                Ok(e) => {
+                    status.set(format!(
+                        "{} entities · {} relations",
+                        e.entities.len(),
+                        e.relations.len()
+                    ));
+                    extraction.set(e);
+                }
+                Err(e) => {
+                    error.set(Some(e));
+                    status.set("error".to_string());
+                }
+            }
+            running.set(false);
+        });
+    });
+
+    let on_choice_change = move |v: Option<ModelChoice>| {
+        let Some(c) = v else { return };
+        if choice() == c {
+            return;
+        }
+        choice.set(c);
+        // Unload the current model; user will see a "load" hint.
+        *model.write() = None;
+        extraction.set(Extraction::default());
     };
 
     let on_load = move |_| {
@@ -154,201 +200,92 @@ fn App() -> Element {
         let selected = choice();
         loading.set(true);
         error.set(None);
-        status.set(format!("Loading {}…", selected.label()));
+        status.set(format!("loading {}…", selected.label()));
         spawn(async move {
             match build_model(selected).await {
                 Ok(m) => {
-                    let dev = match &m {
-                        LoadedModel::Ner { inner, .. } => {
-                            if inner.device().is_gpu() { "GPU" } else { "CPU" }
-                        }
-                        LoadedModel::Relex { inner, .. } => {
-                            if inner.device().is_gpu() { "GPU" } else { "CPU" }
-                        }
-                    };
                     model.set(Some(m));
-                    status.set(format!("{} ready on {dev}", selected.label()));
+                    status.set("ready".to_string());
+                    // Kick an extraction now that a model is available.
+                    schedule.with_mut(|s| *s += 1);
                 }
                 Err(e) => {
                     error.set(Some(format!("{e}")));
-                    status.set("Load failed".to_string());
+                    status.set("load failed".to_string());
                 }
             }
             loading.set(false);
         });
     };
 
-    let on_extract = move |_| {
-        if running() {
-            return;
-        }
-        let current_text = text();
-        let ent_labels = parse_labels(&entity_labels());
-        let rel_labels = parse_labels(&relation_labels());
-        let current_mode = mode();
-
-        running.set(true);
-        error.set(None);
-
-        let Some(mut taken) = model.write().take() else {
-            error.set(Some("Load a model first.".to_string()));
-            running.set(false);
-            return;
-        };
-
-        spawn(async move {
-            let outcome = run_extraction(
-                &mut taken,
-                current_mode,
-                &current_text,
-                &ent_labels,
-                &rel_labels,
-            )
-            .await;
-
-            match outcome {
-                Ok(ExtractionOutput::Ner(entities)) => {
-                    status.set(format!("Extracted {} entities", entities.len()));
-                    ner_out.set(entities);
-                }
-                Ok(ExtractionOutput::Relex(result)) => {
-                    status.set(format!(
-                        "Extracted {} entities, {} relations",
-                        result.entities.len(),
-                        result.relations.len()
-                    ));
-                    relex_out.set(result);
-                }
-                Err(e) => error.set(Some(e)),
-            }
-
-            model.set(Some(taken));
-            running.set(false);
-        });
-    };
-
     let has_model = model.read().is_some();
-    let model_mismatch = model
+    let model_matches = model
         .read()
         .as_ref()
-        .map(|m| m.choice() != choice())
-        .unwrap_or(true);
+        .map(|m| m.choice() == choice())
+        .unwrap_or(false);
 
-    let current_mode = mode();
     let current_choice = choice();
+    let current_text = text();
+    let cur_extraction = extraction();
 
     rsx! {
         document::Link { rel: "stylesheet", href: asset!("/assets/dx-components-theme.css") }
         document::Link { rel: "stylesheet", href: asset!("/assets/style.css") }
-        div { class: "app",
-            header { class: "site-header",
-                div {
-                    h1 { "rgliner" }
-                    div { class: "tag",
-                        "GLiNER NER & relation extraction — running locally in your browser with WebGPU."
-                    }
+        main { class: "reader",
+            header { class: "masthead",
+                div { class: "wordmark",
+                    span { class: "mark", "rgliner" }
+                    span { class: "byline", "a reader for named entities & their relations" }
                 }
-                a {
-                    href: "https://github.com/floneum/floneum",
-                    target: "_blank",
-                    "GitHub"
-                }
-            }
-
-            Tabs {
-                default_value: current_mode.value().to_string(),
-                horizontal: true,
-                on_value_change: on_mode_change,
-                TabList {
-                    TabTrigger { value: "ner".to_string(), index: 0usize, "NER" }
-                    TabTrigger { value: "relex".to_string(), index: 1usize, "NER + Relations" }
-                }
-                TabContent { index: 0usize, value: "ner".to_string(), "" }
-                TabContent { index: 1usize, value: "relex".to_string(), "" }
-            }
-
-            if let Some(e) = error() {
-                div { class: "err-banner", "{e}" }
-            }
-
-            Card {
-                CardHeader {
-                    CardTitle { "Model" }
-                    CardDescription {
-                        "First load fetches GGUF weights (60 MB – 500 MB) from HuggingFace and caches them in the browser's Origin Private File System."
-                    }
-                }
-                CardContent {
-                    div { class: "row",
-                        div { style: "min-width: 16rem;",
-                            Select::<ModelChoice> {
-                                key: "{current_mode.value()}",
-                                placeholder: "Select a model...",
-                                default_value: current_choice,
-                                on_value_change: move |v: Option<ModelChoice>| {
-                                    if let Some(c) = v {
-                                        choice.set(c);
-                                    }
-                                },
-                                SelectTrigger { aria_label: "Model", SelectValue {} }
-                                SelectList { aria_label: "Models",
-                                    for (i, c) in ModelChoice::for_mode(current_mode).iter().copied().enumerate() {
-                                        SelectOption::<ModelChoice> {
-                                            index: i,
-                                            value: c,
-                                            text_value: c.label().to_string(),
-                                            "{c.label()}"
-                                            SelectItemIndicator {}
-                                        }
-                                    }
+                div { class: "picker",
+                    Select::<ModelChoice> {
+                        placeholder: "choose a model",
+                        default_value: current_choice,
+                        on_value_change: on_choice_change,
+                        SelectTrigger { aria_label: "Model", SelectValue {} }
+                        SelectList { aria_label: "Models",
+                            for (i, c) in ModelChoice::all().iter().copied().enumerate() {
+                                SelectOption::<ModelChoice> {
+                                    index: i,
+                                    value: c,
+                                    text_value: c.label().to_string(),
+                                    "{c.label()}"
+                                    SelectItemIndicator {}
                                 }
                             }
                         }
-                        Button {
-                            disabled: loading() || running() || (has_model && !model_mismatch),
-                            onclick: on_load,
-                            if loading() {
-                                "Loading…"
-                            } else if has_model && !model_mismatch {
-                                "Loaded"
-                            } else if has_model {
-                                "Reload"
-                            } else {
-                                "Load model"
-                            }
-                        }
-                        span {
-                            class: if error().is_some() { "status err" } else if has_model { "status ok" } else { "status" },
-                            "{status()}"
+                    }
+                    button {
+                        class: "load",
+                        disabled: loading() || (has_model && model_matches),
+                        onclick: on_load,
+                        if loading() {
+                            "loading…"
+                        } else if has_model && model_matches {
+                            "loaded"
+                        } else if has_model {
+                            "reload"
+                        } else {
+                            "load"
                         }
                     }
                 }
             }
 
-            Card {
-                CardHeader { CardTitle { "Text" } }
-                CardContent {
-                    Textarea {
-                        value: "{text}",
-                        rows: "4",
-                        oninput: move |e: FormEvent| text.set(e.value()),
-                    }
-                }
-            }
-
-            Card {
-                CardHeader { CardTitle { "Labels" } }
-                CardContent {
-                    Label { html_for: "entity-labels", "Entity labels (comma-separated)" }
+            details { class: "settings",
+                summary { "labels" }
+                div { class: "settings-body",
+                    Label { html_for: "entity-labels", "entities" }
                     Input {
                         id: "entity-labels",
                         r#type: "text",
                         value: "{entity_labels}",
                         oninput: move |e: FormEvent| entity_labels.set(e.value()),
                     }
-                    if current_mode == Mode::Relex {
+                    if current_choice.mode() == Mode::Relex {
                         div { style: "margin-top: 0.75rem;",
-                            Label { html_for: "relation-labels", "Relation labels (comma-separated)" }
+                            Label { html_for: "relation-labels", "relations" }
                             Input {
                                 id: "relation-labels",
                                 r#type: "text",
@@ -360,24 +297,31 @@ fn App() -> Element {
                 }
             }
 
-            Card {
-                CardContent {
-                    div { class: "row",
-                        Button {
-                            disabled: !has_model || running() || loading() || model_mismatch,
-                            onclick: on_extract,
-                            if running() { "Extracting…" } else { "Extract" }
-                        }
-                        if model_mismatch && has_model {
-                            span { class: "status",
-                                "Model selection changed — reload to use it."
-                            }
+            div { class: "status-line",
+                span { class: "dot", class: if running() || loading() { "busy" } else if error().is_some() { "err" } else if has_model { "ok" } else { "idle" } }
+                span { class: "msg", "{status()}" }
+                if let Some(e) = error() {
+                    span { class: "err-text", " · {e}" }
+                }
+            }
+
+            div { class: "split",
+                textarea {
+                    class: "editor",
+                    spellcheck: "false",
+                    value: "{current_text}",
+                    oninput: move |e: FormEvent| text.set(e.value()),
+                }
+                article { class: "article",
+                    if has_model {
+                        { render_article(&current_text, &cur_extraction) }
+                    } else {
+                        div { class: "placeholder",
+                            "load a model to begin reading."
                         }
                     }
                 }
             }
-
-            { render_results(current_mode, text(), ner_out(), relex_out()) }
         }
     }
 }
@@ -426,23 +370,17 @@ async fn build_model(choice: ModelChoice) -> Result<LoadedModel, String> {
     }
 }
 
-enum ExtractionOutput {
-    Ner(Vec<Entity>),
-    Relex(RelexResult),
-}
-
 async fn run_extraction(
     model: &mut LoadedModel,
     mode: Mode,
     text: &str,
     entity_labels: &[String],
     relation_labels: &[String],
-) -> Result<ExtractionOutput, String> {
-    let ent_refs: Vec<&str> = entity_labels.iter().map(|s| s.as_str()).collect();
-
-    if ent_refs.is_empty() {
-        return Err("Add at least one entity label.".to_string());
+) -> Result<Extraction, String> {
+    if entity_labels.is_empty() {
+        return Err("add at least one entity label".to_string());
     }
+    let ent_refs: Vec<&str> = entity_labels.iter().map(|s| s.as_str()).collect();
 
     match (mode, model) {
         (Mode::Ner, LoadedModel::Ner { inner, .. }) => {
@@ -450,103 +388,50 @@ async fn run_extraction(
                 .extract_auto(text, &ent_refs, Some(TOKEN_BUDGET))
                 .await
                 .map_err(|e| format!("{e}"))?;
-            Ok(ExtractionOutput::Ner(entities))
+            Ok(Extraction {
+                entities,
+                relations: Vec::new(),
+            })
         }
         (Mode::Relex, LoadedModel::Relex { inner, .. }) => {
-            let rel_refs: Vec<&str> = relation_labels.iter().map(|s| s.as_str()).collect();
-            if rel_refs.is_empty() {
-                return Err("Add at least one relation label.".to_string());
+            if relation_labels.is_empty() {
+                return Err("add at least one relation label".to_string());
             }
+            let rel_refs: Vec<&str> = relation_labels.iter().map(|s| s.as_str()).collect();
             let (entities, relations) = inner
                 .extract_auto(text, &ent_refs, &rel_refs, Some(TOKEN_BUDGET))
                 .await
                 .map_err(|e| format!("{e}"))?;
-            Ok(ExtractionOutput::Relex(RelexResult {
+            Ok(Extraction {
                 entities,
                 relations,
-            }))
+            })
         }
-        _ => Err("Loaded model doesn't match the current tab. Reload the model.".to_string()),
+        _ => Err("loaded model doesn't match the selection".to_string()),
     }
 }
 
-fn render_results(
-    mode: Mode,
-    text: String,
-    ner_out: Vec<Entity>,
-    relex_out: RelexResult,
-) -> Element {
-    let (entities, relations): (Vec<Entity>, Vec<Relation>) = match mode {
-        Mode::Ner => (ner_out, Vec::new()),
-        Mode::Relex => (relex_out.entities, relex_out.relations),
-    };
-
-    if entities.is_empty() && relations.is_empty() {
-        return rsx! {
-            Card {
-                CardContent {
-                    p { class: "muted", "Run extraction to see results." }
-                }
-            }
-        };
-    }
-
+fn render_article(text: &str, ex: &Extraction) -> Element {
+    let spliced = splice_entities(text, &ex.entities, &ex.relations);
     rsx! {
-        Card {
-            CardHeader { CardTitle { "Results" } }
-            CardContent {
-                div { class: "results",
-                    { highlighted_text(text.clone(), entities.clone()) }
-                }
-
-                if !entities.is_empty() {
-                    ul { class: "entity-list",
-                        for (i, ent) in entities.iter().enumerate() {
-                            li { key: "{i}",
-                                Badge {
-                                    variant: BadgeVariant::Outline,
-                                    span { style: "color: {hsl_for(&ent.label)};", "{ent.label}" }
-                                }
-                                " · "
-                                span { "{ent.text:?}" }
-                                " "
-                                span { class: "score", "{format_score(ent.score)}" }
-                            }
-                        }
-                    }
-                }
-
-                if !relations.is_empty() {
-                    div { style: "margin-top: 1rem;",
-                        Label { html_for: "relations-list", "Relations" }
-                        ul { class: "relation-list",
-                            for (i, rel) in relations.iter().enumerate() {
-                                li { key: "rel-{i}",
-                                    Badge { "{rel.head.text}" }
-                                    " --["
-                                    span { style: "color: var(--accent);", "{rel.relation}" }
-                                    "]--> "
-                                    Badge { "{rel.tail.text}" }
-                                    " "
-                                    span { class: "score", "{format_score(rel.score)}" }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
+        Markdown { src: spliced }
     }
 }
 
-fn highlighted_text(text: String, entities: Vec<Entity>) -> Element {
-    let mut sorted = entities.clone();
+/// Splice `<span class="entity">…</span>` into the markdown source at each
+/// entity boundary. The nested `.rels` span renders on hover.
+fn splice_entities(text: &str, entities: &[Entity], relations: &[Relation]) -> String {
+    if entities.is_empty() {
+        return text.to_string();
+    }
+    let mut sorted: Vec<&Entity> = entities.iter().collect();
     sorted.sort_by_key(|e| e.start_char);
 
-    let mut segments: Vec<(bool, String, Option<String>)> = Vec::new();
+    let mut out = String::with_capacity(text.len() + entities.len() * 64);
     let mut cursor = 0usize;
     let len = text.len();
-    for ent in sorted.iter() {
+
+    for ent in sorted {
         let start = ent.start_char.min(len);
         let end = ent.end_char.min(len);
         if start < cursor || end <= start {
@@ -555,47 +440,67 @@ fn highlighted_text(text: String, entities: Vec<Entity>) -> Element {
         if !text.is_char_boundary(start) || !text.is_char_boundary(end) {
             continue;
         }
-        if start > cursor {
-            segments.push((false, text[cursor..start].to_string(), None));
+        out.push_str(&text[cursor..start]);
+        let color = underline_color(&ent.label);
+        out.push_str(&format!(
+            r#"<span class="entity" style="--ec: {color}" data-label="{label}">"#,
+            color = color,
+            label = escape_attr(&ent.label)
+        ));
+        // The entity surface text.
+        out.push_str(&escape_html_content(&text[start..end]));
+        // Popover: label + relations involving this entity.
+        out.push_str(r#"<span class="pop">"#);
+        out.push_str(r#"<span class="pop-label">"#);
+        out.push_str(&escape_html_content(&ent.label));
+        out.push_str("</span>");
+
+        let ent_text = &text[start..end];
+        let mut rel_lines = 0usize;
+        for rel in relations {
+            if rel.head.text == ent_text || rel.tail.text == ent_text {
+                out.push_str(r#"<span class="pop-rel">"#);
+                out.push_str(&escape_html_content(&rel.head.text));
+                out.push_str(r#"<span class="arrow"> → </span>"#);
+                out.push_str(r#"<span class="rel-name">"#);
+                out.push_str(&escape_html_content(&rel.relation));
+                out.push_str("</span>");
+                out.push_str(r#"<span class="arrow"> → </span>"#);
+                out.push_str(&escape_html_content(&rel.tail.text));
+                out.push_str("</span>");
+                rel_lines += 1;
+            }
         }
-        segments.push((true, text[start..end].to_string(), Some(ent.label.clone())));
+        if rel_lines == 0 && !relations.is_empty() {
+            out.push_str(r#"<span class="pop-empty">no relations</span>"#);
+        }
+        out.push_str("</span>");
+        out.push_str("</span>");
         cursor = end;
     }
     if cursor < len {
-        segments.push((false, text[cursor..].to_string(), None));
+        out.push_str(&text[cursor..]);
     }
-
-    rsx! {
-        for (i, (is_entity, content, label)) in segments.into_iter().enumerate() {
-            if is_entity {
-                {
-                    let label_text = label.clone().unwrap_or_default();
-                    let color = hsl_for(&label_text);
-                    rsx! {
-                        span {
-                            key: "seg-{i}",
-                            class: "entity",
-                            style: "background-color: {color};",
-                            "{content}"
-                            span { class: "chip", "{label_text}" }
-                        }
-                    }
-                }
-            } else {
-                span { key: "seg-{i}", "{content}" }
-            }
-        }
-    }
+    out
 }
 
-fn hsl_for(label: &str) -> String {
+fn escape_html_content(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+}
+
+fn escape_attr(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('"', "&quot;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+}
+
+fn underline_color(label: &str) -> String {
     let hash: u32 = label
         .bytes()
         .fold(0u32, |acc, b| acc.wrapping_mul(31).wrapping_add(b as u32));
     let hue = hash % 360;
-    format!("hsl({hue}, 70%, 72%)")
-}
-
-fn format_score(score: f32) -> String {
-    format!("{:.2}", score)
+    format!("hsl({hue}, 75%, 42%)")
 }

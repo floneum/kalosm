@@ -234,11 +234,18 @@ impl SpanLayer {
 
         let start_gathered = start_rep_flat.index_select(0, &start_idx_tensor);
         let end_gathered = end_rep_flat.index_select(0, &end_idx_tensor);
-        let combined = Tensor::cat([start_gathered, end_gathered], 1).relu();
+        let combined = Tensor::cat([start_gathered, end_gathered], 1)
+            .reshape([1, total_spans, hidden_dim * 2])
+            .to_concrete()
+            .relu();
         let hidden = self.out_fc1.forward(&combined).relu();
-        let out = self.out_fc2.forward(&hidden);
+        let out = self
+            .out_fc2
+            .forward(&hidden)
+            .reshape([total_spans, hidden_dim])
+            .to_concrete();
 
-        (out.to_concrete(), span_counts)
+        (out, span_counts)
     }
 
     fn gather_span_embeddings(

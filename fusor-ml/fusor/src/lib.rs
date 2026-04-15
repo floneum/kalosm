@@ -417,6 +417,39 @@ where
         }
     }
 
+    /// Materialize pending work for this tensor.
+    ///
+    /// On CPU this evaluates lazy expressions; on GPU it waits for queued work
+    /// associated with the tensor to complete.
+    pub async fn materialize(&self)
+    where
+        B: TensorBacking<R>,
+        D: SimdElement + DataType,
+    {
+        match self {
+            Tensor::Cpu(t) => {
+                let _ = t.to_concrete();
+            }
+            Tensor::Gpu(t) => t.materialize().await,
+        }
+    }
+
+    /// Resolve this tensor into a new concrete tensor.
+    ///
+    /// For CPU tensors this evaluates lazy expressions. For GPU tensors this
+    /// returns a tensor backed by the resolved output buffer, so later ops do
+    /// not keep extending the original lazy graph.
+    pub fn materialized(&self) -> Tensor<R, D>
+    where
+        B: TensorBacking<R>,
+        D: SimdElement + DataType,
+    {
+        match self {
+            Tensor::Cpu(t) => Tensor::Cpu(t.to_concrete()),
+            Tensor::Gpu(t) => Tensor::Gpu(t.materialized()),
+        }
+    }
+
     /// Returns the shape of the tensor.
     pub fn shape(&self) -> [usize; R]
     where

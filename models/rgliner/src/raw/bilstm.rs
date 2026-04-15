@@ -116,6 +116,122 @@ impl BiLstm {
             .reshape([batch, seq_len, 2 * self.hidden_size])
             .to_concrete()
     }
+
+    #[cfg(test)]
+    #[doc(hidden)]
+    pub fn debug_forward_direction(
+        &self,
+        input: &Tensor<3, f32>,
+        lengths: &[usize],
+        reverse: bool,
+    ) -> Tensor<3, f32> {
+        run_direction(
+            input,
+            if reverse {
+                &self.backward
+            } else {
+                &self.forward
+            },
+            self.hidden_size,
+            &input.device(),
+            reverse,
+            lengths,
+        )
+    }
+
+    #[cfg(test)]
+    #[doc(hidden)]
+    pub fn debug_first_step_gates(
+        &self,
+        input: &Tensor<3, f32>,
+        reverse: bool,
+    ) -> Tensor<2, f32> {
+        let [batch, seq_len, input_size] = input.shape();
+        let hidden_size = self.hidden_size;
+        let dir = if reverse {
+            &self.backward
+        } else {
+            &self.forward
+        };
+        let t = if reverse { seq_len - 1 } else { 0 };
+        let h: Tensor<2, f32> = Tensor::zeros(&input.device(), [batch, hidden_size]);
+        let x_t: Tensor<2, f32> = input
+            .narrow(1, t, 1)
+            .reshape([batch, input_size])
+            .to_concrete();
+        let bias_broadcast: Tensor<2, f32> = dir
+            .bias
+            .unsqueeze(0)
+            .broadcast_as([batch, 4 * hidden_size])
+            .to_concrete();
+        (x_t.mat_mul(&dir.w_ih_t) + h.mat_mul(&dir.w_hh_t) + bias_broadcast).to_concrete()
+    }
+
+    #[cfg(test)]
+    #[doc(hidden)]
+    pub fn debug_forward_direction_state_only(
+        &self,
+        input: &Tensor<3, f32>,
+        lengths: &[usize],
+        reverse: bool,
+    ) -> Tensor<2, f32> {
+        let [batch, seq_len, input_size] = input.shape();
+        let hidden_size = self.hidden_size;
+        let device = input.device();
+        let dir = if reverse {
+            &self.backward
+        } else {
+            &self.forward
+        };
+
+        let mut h: Tensor<2, f32> = Tensor::zeros(&device, [batch, hidden_size]);
+        let mut c: Tensor<2, f32> = Tensor::zeros(&device, [batch, hidden_size]);
+        let bias_broadcast: Tensor<2, f32> = dir
+            .bias
+            .unsqueeze(0)
+            .broadcast_as([batch, 4 * hidden_size])
+            .to_concrete();
+
+        let iter: Box<dyn Iterator<Item = usize>> = if reverse {
+            Box::new((0..seq_len).rev())
+        } else {
+            Box::new(0..seq_len)
+        };
+
+        for t in iter {
+            let x_t: Tensor<2, f32> = input
+                .narrow(1, t, 1)
+                .reshape([batch, input_size])
+                .to_concrete();
+            let gates_pre: Tensor<2, f32> =
+                (x_t.mat_mul(&dir.w_ih_t) + h.mat_mul(&dir.w_hh_t) + bias_broadcast.clone())
+                    .to_concrete();
+
+            let i_raw: Tensor<2, f32> = gates_pre.narrow(1, 0, hidden_size).to_concrete();
+            let f_raw: Tensor<2, f32> =
+                gates_pre.narrow(1, hidden_size, hidden_size).to_concrete();
+            let g_raw: Tensor<2, f32> = gates_pre
+                .narrow(1, 2 * hidden_size, hidden_size)
+                .to_concrete();
+            let o_raw: Tensor<2, f32> = gates_pre
+                .narrow(1, 3 * hidden_size, hidden_size)
+                .to_concrete();
+
+            let i_gate = sigmoid_2d(&i_raw);
+            let f_gate = sigmoid_2d(&f_raw);
+            let g_gate = g_raw.tanh();
+            let o_gate = sigmoid_2d(&o_raw);
+
+            let next_c = (f_gate * c.clone() + i_gate * g_gate).to_concrete();
+            let next_h = (o_gate * next_c.clone().tanh()).to_concrete();
+
+            let active_mask_2d = timestep_mask_2d(&device, batch, hidden_size, lengths, t);
+            c = active_mask_2d.where_cond(&next_c, &c).to_concrete();
+            h = active_mask_2d.where_cond(&next_h, &h).to_concrete();
+        }
+
+        h
+    }
 }
 
 /// Run one direction of the LSTM. Sequential over time; every timestep's gate
@@ -132,12 +248,7 @@ fn run_direction(
 
     let mut h: Tensor<2, f32> = Tensor::zeros(device, [batch, hidden_size]);
     let mut c: Tensor<2, f32> = Tensor::zeros(device, [batch, hidden_size]);
-
-    // outputs[t] holds the hidden state at timestep t, already unsqueezed on
-    // dim 1 so that a final cat along dim 1 yields [batch, seq_len, hidden].
-    let mut outputs: Vec<Tensor<3, f32>> = Vec::with_capacity(seq_len);
-    outputs.resize_with(seq_len, || Tensor::zeros(device, [batch, 1, hidden_size]));
-    let zero_output: Tensor<3, f32> = Tensor::zeros(device, [batch, 1, hidden_size]);
+    let mut outputs: Tensor<3, f32> = Tensor::zeros(device, [batch, seq_len, hidden_size]);
 
     let bias_broadcast: Tensor<2, f32> = dir
         .bias
@@ -183,14 +294,27 @@ fn run_direction(
         c = active_mask_2d.where_cond(&next_c, &c).to_concrete();
         h = active_mask_2d.where_cond(&next_h, &h).to_concrete();
 
-        let active_mask_3d = timestep_mask_3d(device, batch, hidden_size, lengths, t);
-        let output_t = h.clone().unsqueeze(1).to_concrete();
-        outputs[t] = active_mask_3d.where_cond(&output_t, &zero_output).to_concrete();
+        let output_t = h.clone().unsqueeze(1).to_concrete().materialized();
+        outputs = outputs
+            .slice_assign([0..batch, t..(t + 1), 0..hidden_size], &output_t)
+            .materialized();
     }
 
-    Tensor::cat(outputs, 1)
-        .reshape([batch, seq_len, hidden_size])
-        .to_concrete()
+    let all_active = lengths.iter().all(|&length| length >= seq_len);
+    if all_active {
+        outputs
+    } else {
+        let mask_data: Vec<f32> = lengths
+            .iter()
+            .flat_map(|&length| (0..seq_len).map(move |t| if t < length { 1.0 } else { 0.0 }))
+            .collect();
+        let mask: Tensor<3, f32> = Tensor::new(device, &mask_data)
+            .reshape([batch, seq_len, 1])
+            .broadcast_as([batch, seq_len, hidden_size])
+            .to_concrete();
+        let zeros: Tensor<3, f32> = Tensor::zeros(device, [batch, seq_len, hidden_size]);
+        mask.where_cond(&outputs, &zeros).to_concrete()
+    }
 }
 
 fn timestep_mask_2d(
@@ -207,23 +331,6 @@ fn timestep_mask_2d(
     Tensor::new(device, &mask_data)
         .reshape([batch, 1])
         .broadcast_as([batch, hidden_size])
-        .to_concrete()
-}
-
-fn timestep_mask_3d(
-    device: &Device,
-    batch: usize,
-    hidden_size: usize,
-    lengths: &[usize],
-    timestep: usize,
-) -> Tensor<3, f32> {
-    let mask_data: Vec<f32> = lengths
-        .iter()
-        .map(|&length| if timestep < length { 1.0 } else { 0.0 })
-        .collect();
-    Tensor::new(device, &mask_data)
-        .reshape([batch, 1, 1])
-        .broadcast_as([batch, 1, hidden_size])
         .to_concrete()
 }
 

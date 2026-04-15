@@ -82,6 +82,16 @@ impl WordTokenizer {
             word_offsets,
         })
     }
+
+    /// Tokenize a batch of texts.
+    pub fn tokenize_batch(&self, texts: &[&str]) -> Result<Vec<TokenizedText>, GlinerError> {
+        texts.iter().map(|text| self.tokenize(text)).collect()
+    }
+
+    /// Resolve the tokenizer's padding ID.
+    pub fn pad_id(&self) -> u32 {
+        self.tokenizer.token_to_id("[PAD]").unwrap_or(0)
+    }
 }
 
 /// Pack `text` into token-budgeted byte ranges using the supplied tokenizer.

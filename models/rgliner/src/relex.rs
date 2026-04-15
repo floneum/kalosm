@@ -52,7 +52,7 @@ use crate::decoding::Entity;
 use crate::error::{GlinerError, GlinerLoadingError};
 use crate::raw::{BiLstm, JointScorer, PairProjector, PromptRepLayer, SpanLayer};
 use crate::relation_decoding::Relation;
-use crate::relex_tokenization::{RelExTokenizer, SpecialTokenIds};
+use crate::relex_tokenization::{RelExTokenizedInput, RelExTokenizer, SpecialTokenIds};
 use rbert::raw::MDebertaModel;
 
 /// Source configuration for GLiNER-RelEx models.
@@ -442,156 +442,97 @@ impl GlinerRelEx {
         entity_labels: &[&str],
         relation_labels: &[&str],
     ) -> Result<(Vec<Entity>, Vec<Relation>), GlinerError> {
-        // 1. Tokenize with special tokens
-        let tokenized = self
-            .tokenizer
-            .tokenize(text, entity_labels, relation_labels)?;
+        let mut results = self.extract_batch(&[text], entity_labels, relation_labels).await?;
+        Ok(results.pop().unwrap_or_default())
+    }
 
-        if tokenized.num_words == 0 {
-            return Ok((Vec::new(), Vec::new()));
+    /// Extract entities and relations from a batch of texts.
+    pub async fn extract_batch(
+        &self,
+        texts: &[&str],
+        entity_labels: &[&str],
+        relation_labels: &[&str],
+    ) -> Result<Vec<(Vec<Entity>, Vec<Relation>)>, GlinerError> {
+        if texts.is_empty() {
+            return Ok(Vec::new());
         }
 
-        // 2. Prepare input tensors
-        let token_ids = Tensor::new(&self.device, &tokenized.token_ids);
-        let token_ids: Tensor<2, u32> = token_ids.unsqueeze(0).to_concrete();
-
-        let attention_mask = Tensor::new(&self.device, &tokenized.attention_mask);
-        let attention_mask: Tensor<2, u32> = attention_mask.unsqueeze(0).to_concrete();
-
-        // 3. Forward pass through encoder
+        let tokenized = self
+            .tokenizer
+            .tokenize_batch(texts, entity_labels, relation_labels)?;
+        let (token_ids, attention_mask) = self.build_batched_inputs(&tokenized);
         let encoder_output = self.encoder.forward(&token_ids, Some(&attention_mask));
 
-        // 4. Extract word-level embeddings from encoder output, THEN apply BiLSTM
-        // (Python applies BiLSTM to word-level embeddings, not the full token sequence.)
+        let text_positions: Vec<Vec<usize>> = tokenized
+            .iter()
+            .map(|item| item.text_positions.clone())
+            .collect();
         let word_encoder_embs =
-            self.gather_at_positions(&encoder_output, &tokenized.text_positions);
-        let lstm_output = self.bilstm.forward(&word_encoder_embs).await;
+            self.gather_at_positions_batched(&encoder_output, &text_positions);
+        let word_lengths: Vec<usize> = tokenized.iter().map(|item| item.num_words).collect();
+        let text_embs = self
+            .bilstm
+            .forward_with_lengths(&word_encoder_embs, &word_lengths)
+            .await;
 
-        // 5. Extract label embeddings at marker positions from ENCODER output and project them
-        // (Labels are extracted from encoder output, text tokens from BiLSTM output)
-        // Entity label embeddings: hidden states at <<ENT>> positions
-        let ent_embs_raw = self.gather_at_positions(&encoder_output, &tokenized.ent_positions);
+        let ent_positions: Vec<Vec<usize>> = tokenized
+            .iter()
+            .map(|item| item.ent_positions.clone())
+            .collect();
+        let ent_embs_raw = self.gather_at_positions_batched(&encoder_output, &ent_positions);
         let ent_embs = self.prompt_rep_layer.forward_3d(&ent_embs_raw);
 
-        // Relation label embeddings: raw hidden states at <<REL>> positions
-        // (unlike entity labels, relation labels are NOT projected through prompt_rep_layer)
-        let rel_embs = self.gather_at_positions(&encoder_output, &tokenized.rel_positions);
+        let rel_positions: Vec<Vec<usize>> = tokenized
+            .iter()
+            .map(|item| item.rel_positions.clone())
+            .collect();
+        let rel_embs = self.gather_at_positions_batched(&encoder_output, &rel_positions);
 
-        // 6. Text embeddings = BiLSTM output (already at word level)
-        let text_embs = lstm_output.clone();
-
-        // 7–8. Decode entities using the mode matching the trained head.
-        let ent_embs_2d: Tensor<2, f32> = ent_embs.squeeze(0).to_concrete();
-        let entities = match self.span_mode {
+        let entities_per_item = match self.span_mode {
             SpanMode::TokenLevel => {
                 let scorer = self.scorer.as_ref().expect("token_level requires scorer");
-                let token_scores = scorer.forward_entity_scores(&text_embs, &ent_embs_2d);
-                self.decode_entities_from_tokens(
+                let token_scores = scorer.forward_entity_scores(&text_embs, &ent_embs);
+                self.decode_entities_from_tokens_batch(
                     &token_scores,
                     entity_labels,
-                    &tokenized.word_offsets,
-                    text,
+                    &tokenized,
+                    texts,
                 )
                 .await?
             }
             SpanMode::MarkerV0 => {
-                self.decode_entities_marker_v0(
+                self.decode_entities_marker_v0_batch(
                     &text_embs,
-                    &ent_embs_2d,
+                    &ent_embs,
                     entity_labels,
-                    &tokenized.word_offsets,
-                    tokenized.num_words,
-                    text,
+                    &tokenized,
+                    texts,
                 )
                 .await?
             }
         };
 
-        // If no entities or no relation labels, return early
-        if entities.len() < 2 || relation_labels.is_empty() {
-            return Ok((entities, Vec::new()));
+        let mut results = Vec::with_capacity(texts.len());
+        for (batch_idx, entities) in entities_per_item.into_iter().enumerate() {
+            let relations = if entities.len() < 2 || relation_labels.is_empty() {
+                Vec::new()
+            } else {
+                let text_embs_item: Tensor<3, f32> =
+                    text_embs.narrow(0, batch_idx, 1).to_concrete();
+                let rel_embs_item: Tensor<3, f32> =
+                    rel_embs.narrow(0, batch_idx, 1).to_concrete();
+                self.decode_relations(
+                    &text_embs_item,
+                    &rel_embs_item,
+                    &entities,
+                    relation_labels,
+                )
+                .await?
+            };
+            results.push((entities, relations));
         }
 
-        // 9. Compute span representations for each entity using span_layer
-        // (matches Python's TokenMarker: project_start/project_end MLPs + out_project MLP)
-        let entity_spans: Vec<(usize, usize)> = entities
-            .iter()
-            .map(|e| (e.start_word, e.end_word))
-            .collect();
-        let span_reps = self
-            .span_layer
-            .forward_for_spans(&text_embs, &entity_spans, &self.device);
-        // span_reps shape: [num_entities, hidden]
-
-        let num_entities = entities.len();
-        let hidden_size = self.config.hidden_size;
-
-        // 10. Build all entity pairs (head, tail) with head != tail
-        let mut candidate_pairs: Vec<(usize, usize)> = Vec::new();
-        for head in 0..num_entities {
-            for tail in 0..num_entities {
-                if head != tail {
-                    candidate_pairs.push((head, tail));
-                }
-            }
-        }
-
-        // 11. Gather head and tail span reps using index_select
-        let span_reps_data = span_reps.clone().as_slice().await?;
-        let span_reps_slice = span_reps_data.as_slice();
-        let mut head_embs = Vec::with_capacity(candidate_pairs.len() * hidden_size);
-        let mut tail_embs = Vec::with_capacity(candidate_pairs.len() * hidden_size);
-        for &(head_idx, tail_idx) in &candidate_pairs {
-            let h_start = head_idx * hidden_size;
-            let t_start = tail_idx * hidden_size;
-            head_embs.extend_from_slice(&span_reps_slice[h_start..h_start + hidden_size]);
-            tail_embs.extend_from_slice(&span_reps_slice[t_start..t_start + hidden_size]);
-        }
-
-        let head_tensor = Tensor::new(&self.device, &head_embs)
-            .reshape([candidate_pairs.len(), hidden_size])
-            .to_concrete();
-        let tail_tensor = Tensor::new(&self.device, &tail_embs)
-            .reshape([candidate_pairs.len(), hidden_size])
-            .to_concrete();
-
-        // 12. Apply pair_projector: concat(head, tail) -> MLP -> pair_rep
-        let pair_embs = self.pair_projector.forward(&head_tensor, &tail_tensor);
-
-        // 13. Score pairs against relation labels via dot product (no sigmoid yet)
-        let rel_embs_squeezed: Tensor<2, f32> = rel_embs.squeeze(0).to_concrete();
-        let rel_scores = pair_embs.mat_mul(&rel_embs_squeezed.transpose(0, 1));
-
-        // 14. Apply sigmoid and filter by relation_threshold
-        let rel_scores_slice = rel_scores.clone().as_slice().await?;
-        let n_rels = relation_labels.len();
-        let mut relations = Vec::new();
-        let threshold = self.config.relation_threshold;
-
-        for (pair_idx, &(head_idx, tail_idx)) in candidate_pairs.iter().enumerate() {
-            let base = pair_idx * n_rels;
-            for rel_idx in 0..n_rels {
-                let raw = rel_scores_slice.as_slice()[base + rel_idx];
-                let prob = 1.0 / (1.0 + (-raw).exp());
-                if prob > threshold {
-                    relations.push(Relation {
-                        head: entities[head_idx].clone(),
-                        tail: entities[tail_idx].clone(),
-                        relation: relation_labels[rel_idx].to_string(),
-                        score: prob,
-                    });
-                }
-            }
-        }
-
-        // Sort by score descending
-        relations.sort_by(|a, b| {
-            b.score
-                .partial_cmp(&a.score)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
-
-        Ok((entities, relations))
+        Ok(results)
     }
 
     /// Extract entities and relations from text, chunking the input first so long
@@ -628,12 +569,14 @@ impl GlinerRelEx {
             ent.end_char += offset;
         };
 
+        let chunk_texts: Vec<&str> = ranges.iter().map(|range| &text[range.clone()]).collect();
+        let per_chunk = self
+            .extract_batch(&chunk_texts, entity_labels, relation_labels)
+            .await?;
+
         let mut all_entities: Vec<Entity> = Vec::new();
         let mut all_relations: Vec<Relation> = Vec::new();
-        for range in &ranges {
-            let chunk = &text[range.clone()];
-            let (entities, relations) =
-                self.extract(chunk, entity_labels, relation_labels).await?;
+        for (range, (entities, relations)) in ranges.iter().zip(per_chunk) {
             let offset = range.start;
             for mut ent in entities {
                 shift(&mut ent, offset);
@@ -689,13 +632,170 @@ impl GlinerRelEx {
         Ok((all_entities, all_relations))
     }
 
-    /// Decode entities for `span_mode = markerV0` (used by the `large` variants).
-    ///
-    /// Enumerates every `(start, end)` pair up to `config.max_width` words,
-    /// computes the span representation via `SpanLayer::forward_for_spans`,
-    /// scores each span against every projected entity prompt via a dot
-    /// product, applies sigmoid + `entity_threshold`, and greedy-filters
-    /// overlapping spans (keeping the highest-scoring one).
+    fn build_batched_inputs(
+        &self,
+        tokenized: &[RelExTokenizedInput],
+    ) -> (Tensor<2, u32>, Tensor<2, u32>) {
+        let batch_size = tokenized.len();
+        let max_seq_len = tokenized
+            .iter()
+            .map(|item| item.token_ids.len())
+            .max()
+            .unwrap_or(1)
+            .max(1);
+        let pad_id = self.tokenizer.special_tokens().pad_id;
+
+        let mut token_ids = vec![pad_id; batch_size * max_seq_len];
+        let mut attention_mask = vec![0u32; batch_size * max_seq_len];
+        for (batch_idx, item) in tokenized.iter().enumerate() {
+            let offset = batch_idx * max_seq_len;
+            let len = item.token_ids.len();
+            token_ids[offset..offset + len].copy_from_slice(&item.token_ids);
+            attention_mask[offset..offset + len].copy_from_slice(&item.attention_mask);
+        }
+
+        let token_ids = Tensor::new(&self.device, &token_ids)
+            .reshape([batch_size, max_seq_len])
+            .to_concrete();
+        let attention_mask = Tensor::new(&self.device, &attention_mask)
+            .reshape([batch_size, max_seq_len])
+            .to_concrete();
+        (token_ids, attention_mask)
+    }
+
+    async fn decode_relations(
+        &self,
+        text_embs: &Tensor<3, f32>,
+        rel_embs: &Tensor<3, f32>,
+        entities: &[Entity],
+        relation_labels: &[&str],
+    ) -> Result<Vec<Relation>, GlinerError> {
+        if entities.len() < 2 || relation_labels.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let entity_spans: Vec<(usize, usize)> = entities
+            .iter()
+            .map(|e| (e.start_word, e.end_word))
+            .collect();
+        let span_reps = self
+            .span_layer
+            .forward_for_spans(text_embs, &entity_spans, &self.device);
+
+        let num_entities = entities.len();
+        let hidden_size = self.config.hidden_size;
+        let mut candidate_pairs: Vec<(usize, usize)> = Vec::new();
+        for head in 0..num_entities {
+            for tail in 0..num_entities {
+                if head != tail {
+                    candidate_pairs.push((head, tail));
+                }
+            }
+        }
+
+        let span_reps_data = span_reps.clone().as_slice().await?;
+        let span_reps_slice = span_reps_data.as_slice();
+        let mut head_embs = Vec::with_capacity(candidate_pairs.len() * hidden_size);
+        let mut tail_embs = Vec::with_capacity(candidate_pairs.len() * hidden_size);
+        for &(head_idx, tail_idx) in &candidate_pairs {
+            let h_start = head_idx * hidden_size;
+            let t_start = tail_idx * hidden_size;
+            head_embs.extend_from_slice(&span_reps_slice[h_start..h_start + hidden_size]);
+            tail_embs.extend_from_slice(&span_reps_slice[t_start..t_start + hidden_size]);
+        }
+
+        let head_tensor = Tensor::new(&self.device, &head_embs)
+            .reshape([candidate_pairs.len(), hidden_size])
+            .to_concrete();
+        let tail_tensor = Tensor::new(&self.device, &tail_embs)
+            .reshape([candidate_pairs.len(), hidden_size])
+            .to_concrete();
+        let pair_embs = self.pair_projector.forward(&head_tensor, &tail_tensor);
+
+        let rel_embs_squeezed: Tensor<2, f32> = rel_embs.squeeze(0).to_concrete();
+        let rel_scores = pair_embs.mat_mul(&rel_embs_squeezed.transpose(0, 1));
+        let rel_scores_slice = rel_scores.clone().as_slice().await?;
+        let n_rels = relation_labels.len();
+        let threshold = self.config.relation_threshold;
+
+        let mut relations = Vec::new();
+        for (pair_idx, &(head_idx, tail_idx)) in candidate_pairs.iter().enumerate() {
+            let base = pair_idx * n_rels;
+            for rel_idx in 0..n_rels {
+                let raw = rel_scores_slice.as_slice()[base + rel_idx];
+                let prob = 1.0 / (1.0 + (-raw).exp());
+                if prob > threshold {
+                    relations.push(Relation {
+                        head: entities[head_idx].clone(),
+                        tail: entities[tail_idx].clone(),
+                        relation: relation_labels[rel_idx].to_string(),
+                        score: prob,
+                    });
+                }
+            }
+        }
+
+        relations.sort_by(|a, b| {
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        Ok(relations)
+    }
+
+    async fn decode_entities_marker_v0_batch(
+        &self,
+        text_embs: &Tensor<3, f32>,
+        ent_embs: &Tensor<3, f32>,
+        entity_labels: &[&str],
+        tokenized: &[RelExTokenizedInput],
+        texts: &[&str],
+    ) -> Result<Vec<Vec<Entity>>, GlinerError> {
+        let spans_per_batch: Vec<Vec<(usize, usize)>> = tokenized
+            .iter()
+            .map(|item| {
+                let mut spans = Vec::new();
+                for start in 0..item.num_words {
+                    for width in 1..=self.config.max_width.min(item.num_words - start) {
+                        spans.push((start, start + width - 1));
+                    }
+                }
+                spans
+            })
+            .collect();
+
+        let (flat_span_reps, span_counts) =
+            self.span_layer
+                .forward_for_spans_batched(text_embs, &spans_per_batch, &self.device);
+
+        let mut offset = 0usize;
+        let mut results = Vec::with_capacity(tokenized.len());
+        for batch_idx in 0..tokenized.len() {
+            let span_count = span_counts[batch_idx];
+            let entities = if span_count == 0 || entity_labels.is_empty() {
+                Vec::new()
+            } else {
+                let span_reps: Tensor<2, f32> =
+                    flat_span_reps.narrow(0, offset, span_count).to_concrete();
+                let ent_embs_2d: Tensor<2, f32> =
+                    ent_embs.narrow(0, batch_idx, 1).squeeze(0).to_concrete();
+                self.decode_entities_marker_v0_from_span_reps(
+                    &span_reps,
+                    &spans_per_batch[batch_idx],
+                    &ent_embs_2d,
+                    entity_labels,
+                    &tokenized[batch_idx].word_offsets,
+                    texts[batch_idx],
+                )
+                .await?
+            };
+            results.push(entities);
+            offset += span_count;
+        }
+
+        Ok(results)
+    }
+
     async fn decode_entities_marker_v0(
         &self,
         text_embs: &Tensor<3, f32>,
@@ -705,36 +805,51 @@ impl GlinerRelEx {
         num_words: usize,
         text: &str,
     ) -> Result<Vec<Entity>, GlinerError> {
-        let threshold = self.config.entity_threshold;
-        let max_width = self.config.max_width;
-        let hidden = self.config.hidden_size;
-        let n_labels = entity_labels.len();
-
-        if num_words == 0 || n_labels == 0 {
+        if num_words == 0 || entity_labels.is_empty() {
             return Ok(Vec::new());
         }
 
-        // Enumerate spans: (start, end) with end-start+1 <= max_width.
-        let mut spans: Vec<(usize, usize)> = Vec::new();
+        let mut spans = Vec::new();
         for start in 0..num_words {
-            for width in 1..=max_width.min(num_words - start) {
+            for width in 1..=self.config.max_width.min(num_words - start) {
                 spans.push((start, start + width - 1));
             }
         }
 
-        // Compute span reps [num_spans, hidden].
         let span_reps = self
             .span_layer
             .forward_for_spans(text_embs, &spans, &self.device);
+        self.decode_entities_marker_v0_from_span_reps(
+            &span_reps,
+            &spans,
+            ent_embs_2d,
+            entity_labels,
+            word_offsets,
+            text,
+        )
+        .await
+    }
 
-        // Score: [num_spans, hidden] @ [hidden, n_labels] -> [num_spans, n_labels].
+    async fn decode_entities_marker_v0_from_span_reps(
+        &self,
+        span_reps: &Tensor<2, f32>,
+        spans: &[(usize, usize)],
+        ent_embs_2d: &Tensor<2, f32>,
+        entity_labels: &[&str],
+        word_offsets: &[(usize, usize)],
+        text: &str,
+    ) -> Result<Vec<Entity>, GlinerError> {
+        let threshold = self.config.entity_threshold;
+        let n_labels = entity_labels.len();
+        if spans.is_empty() || n_labels == 0 {
+            return Ok(Vec::new());
+        }
+
         let label_rep_t: Tensor<2, f32> = ent_embs_2d.transpose(0, 1).to_concrete();
         let logits = span_reps.mat_mul(&label_rep_t);
-
         let logits_data = logits.clone().as_slice().await?;
         let logits_slice = logits_data.as_slice();
 
-        // Candidate (start, end, label, score) above threshold.
         let mut candidates: Vec<(usize, usize, usize, f32)> = Vec::new();
         for (span_idx, &(s, e)) in spans.iter().enumerate() {
             for l in 0..n_labels {
@@ -746,7 +861,6 @@ impl GlinerRelEx {
             }
         }
 
-        // Sort by score descending and greedy non-overlapping filter.
         candidates.sort_by(|a, b| b.3.partial_cmp(&a.3).unwrap_or(std::cmp::Ordering::Equal));
 
         let mut taken: Vec<(usize, usize)> = Vec::new();
@@ -772,20 +886,45 @@ impl GlinerRelEx {
             }
         }
 
-        // Ensure output is sorted by score descending for presentation.
         entities.sort_by(|a, b| {
             b.score
                 .partial_cmp(&a.score)
                 .unwrap_or(std::cmp::Ordering::Equal)
         });
-        let _ = hidden;
         Ok(entities)
     }
 
+    async fn decode_entities_from_tokens_batch(
+        &self,
+        token_scores: &Tensor<4, f32>,
+        entity_labels: &[&str],
+        tokenized: &[RelExTokenizedInput],
+        texts: &[&str],
+    ) -> Result<Vec<Vec<Entity>>, GlinerError> {
+        let [batch_size, padded_tokens, num_labels, num_channels] = token_scores.shape();
+        assert_eq!(num_channels, 3, "expected [start, end, inside]");
+        assert_eq!(batch_size, tokenized.len(), "tokenized batch size mismatch");
+        let scores_data = token_scores.clone().as_slice().await?;
+        let scores = scores_data.as_slice();
+        let batch_stride = padded_tokens * num_labels * 3;
+
+        let mut results = Vec::with_capacity(batch_size);
+        for batch_idx in 0..batch_size {
+            let start = batch_idx * batch_stride;
+            let end = start + batch_stride;
+            results.push(self.decode_entities_from_tokens_slice(
+                &scores[start..end],
+                tokenized[batch_idx].num_words,
+                num_labels,
+                entity_labels,
+                &tokenized[batch_idx].word_offsets,
+                texts[batch_idx],
+            ));
+        }
+        Ok(results)
+    }
+
     /// Decode entities using span-boundary detection with start/end/inside scores.
-    ///
-    /// `token_scores` has shape [batch, seq_len, n_labels, 3] where the last dim
-    /// is [start, end, inside] sigmoid probabilities.
     async fn decode_entities_from_tokens(
         &self,
         token_scores: &Tensor<4, f32>,
@@ -796,11 +935,26 @@ impl GlinerRelEx {
         let [_batch_size, num_tokens, num_labels, num_channels] = token_scores.shape();
         assert_eq!(num_channels, 3, "expected [start, end, inside]");
         let scores_data = token_scores.clone().as_slice().await?;
-        let scores = scores_data.as_slice();
+        Ok(self.decode_entities_from_tokens_slice(
+            scores_data.as_slice(),
+            num_tokens,
+            num_labels,
+            entity_labels,
+            word_offsets,
+            text,
+        ))
+    }
 
+    fn decode_entities_from_tokens_slice(
+        &self,
+        scores: &[f32],
+        num_tokens: usize,
+        num_labels: usize,
+        entity_labels: &[&str],
+        word_offsets: &[(usize, usize)],
+        text: &str,
+    ) -> Vec<Entity> {
         let threshold = self.config.entity_threshold;
-
-        // Candidate spans: (start, end, label, score)
         let mut candidates: Vec<(usize, usize, usize, f32)> = Vec::new();
 
         let score_at = |tok: usize, lab: usize, ch: usize| -> f32 {
@@ -820,7 +974,6 @@ impl GlinerRelEx {
                         continue;
                     }
 
-                    // Check all inside scores from start_tok to end_tok
                     let mut min_score = start_score.min(end_score);
                     let mut valid = true;
                     for t in start_tok..=end_tok {
@@ -833,19 +986,15 @@ impl GlinerRelEx {
                             min_score = inside;
                         }
                     }
-                    if !valid {
-                        continue;
+                    if valid {
+                        candidates.push((start_tok, end_tok, label_idx, min_score));
                     }
-
-                    candidates.push((start_tok, end_tok, label_idx, min_score));
                 }
             }
         }
 
-        // Sort candidates by score descending
         candidates.sort_by(|a, b| b.3.partial_cmp(&a.3).unwrap_or(std::cmp::Ordering::Equal));
 
-        // Greedy filter non-overlapping spans (flat_ner equivalent)
         let mut taken: Vec<(usize, usize)> = Vec::new();
         let mut entities = Vec::new();
         for (start_tok, end_tok, label_idx, score) in candidates {
@@ -870,14 +1019,51 @@ impl GlinerRelEx {
             }
         }
 
-        // Sort by score descending
         entities.sort_by(|a, b| {
             b.score
                 .partial_cmp(&a.score)
                 .unwrap_or(std::cmp::Ordering::Equal)
         });
+        entities
+    }
 
-        Ok(entities)
+    /// Gather hidden states at specific positions for a whole batch.
+    fn gather_at_positions_batched(
+        &self,
+        hidden_states: &Tensor<3, f32>,
+        positions_per_batch: &[Vec<usize>],
+    ) -> Tensor<3, f32> {
+        let [batch_size, seq_len, hidden_size] = hidden_states.shape();
+        assert_eq!(
+            batch_size,
+            positions_per_batch.len(),
+            "positions_per_batch must match batch size"
+        );
+
+        let max_positions = positions_per_batch.iter().map(Vec::len).max().unwrap_or(0);
+        if max_positions == 0 {
+            return Tensor::zeros(&self.device, [batch_size, 1, hidden_size]);
+        }
+
+        let hidden_flat = hidden_states
+            .to_concrete()
+            .reshape([batch_size * seq_len, hidden_size])
+            .to_concrete();
+
+        let mut offset_indices = Vec::with_capacity(batch_size * max_positions);
+        for (batch_idx, positions) in positions_per_batch.iter().enumerate() {
+            let offset = (batch_idx * seq_len) as u32;
+            for pos_idx in 0..max_positions {
+                let pos = positions.get(pos_idx).copied().unwrap_or(0) as u32;
+                offset_indices.push(pos + offset);
+            }
+        }
+
+        let offset_indices = Tensor::new(&self.device, &offset_indices);
+        hidden_flat
+            .index_select(0, &offset_indices)
+            .reshape([batch_size, max_positions, hidden_size])
+            .to_concrete()
     }
 
     /// Gather hidden states at specific positions.
@@ -886,22 +1072,7 @@ impl GlinerRelEx {
         hidden_states: &Tensor<3, f32>,
         positions: &[usize],
     ) -> Tensor<3, f32> {
-        let [batch_size, _seq_len, hidden_size] = hidden_states.shape();
-        let num_positions = positions.len();
-
-        if num_positions == 0 {
-            return Tensor::zeros(&self.device, [batch_size, 1, hidden_size]);
-        }
-
-        // Build index tensor
-        let indices: Vec<u32> = positions.iter().map(|&p| p as u32).collect();
-        let index_tensor = Tensor::new(&self.device, &indices);
-
-        // For batch size 1, we can use index_select
-        let hidden_2d = hidden_states.squeeze(0).to_concrete();
-        let gathered = hidden_2d.index_select(0, &index_tensor);
-
-        gathered.unsqueeze(0).to_concrete()
+        self.gather_at_positions_batched(hidden_states, &[positions.to_vec()])
     }
 
     /// Get the device.
@@ -918,7 +1089,6 @@ impl GlinerRelEx {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::PathBuf;
     use std::time::{Duration, Instant};
 
     const PROFILE_TEXT: &str = "Apple Inc. was founded by Steve Jobs in Cupertino, California. \
@@ -1000,18 +1170,12 @@ Meta Platforms was founded by Mark Zuckerberg in Cambridge, Massachusetts.";
         }
     }
 
-    fn weights_path(file_name: &str) -> PathBuf {
-        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("weights")
-            .join(file_name)
-    }
-
-    async fn load_local_relex(
-        model_path: PathBuf,
+    async fn load_relex(
+        source: GlinerRelExSource,
         device: Device,
     ) -> Result<GlinerRelEx, GlinerLoadingError> {
         GlinerRelEx::builder()
-            .with_source(GlinerRelExSource::local(model_path))
+            .with_source(source)
             .with_device(device)
             .build_with_loading_handler(|_| {})
             .await
@@ -1050,7 +1214,6 @@ Meta Platforms was founded by Mark Zuckerberg in Cambridge, Massachusetts.";
         let ent_embs = model.prompt_rep_layer.forward_3d(&ent_embs_raw);
         let rel_embs = model.gather_at_positions(&encoder_output, &tokenized.rel_positions);
         let text_embs = lstm_output.clone();
-        let ent_embs_2d: Tensor<2, f32> = ent_embs.squeeze(0).to_concrete();
 
         let (entities, span_count, entity_span_prep_cpu, entity_sync, entity_decode_cpu) =
             match model.span_mode {
@@ -1059,7 +1222,7 @@ Meta Platforms was founded by Mark Zuckerberg in Cambridge, Massachusetts.";
                         .scorer
                         .as_ref()
                         .expect("token_level requires scorer");
-                    let token_scores = scorer.forward_entity_scores(&text_embs, &ent_embs_2d);
+                    let token_scores = scorer.forward_entity_scores(&text_embs, &ent_embs);
                     let (entities, entity_sync, entity_decode_cpu) =
                         profile_decode_entities_from_tokens(
                             model,
@@ -1079,6 +1242,7 @@ Meta Platforms was founded by Mark Zuckerberg in Cambridge, Massachusetts.";
                     )
                 }
                 SpanMode::MarkerV0 => {
+                    let ent_embs_2d: Tensor<2, f32> = ent_embs.squeeze(0).to_concrete();
                     profile_decode_entities_marker_v0(
                         model,
                         &text_embs,
@@ -1393,13 +1557,13 @@ Meta Platforms was founded by Mark Zuckerberg in Cambridge, Massachusetts.";
         };
 
         let variants = [
-            ("multi", "gliner-relex-multi-v1.0-Q4_K.gguf"),
-            ("base", "gliner-relex-base-v1.0-Q4_K.gguf"),
-            ("large", "gliner-relex-large-v1.0-Q4_K.gguf"),
+            ("multi", GlinerRelExSource::relex_multi()),
+            ("base", GlinerRelExSource::relex_base()),
+            ("large", GlinerRelExSource::relex_large()),
         ];
 
-        for (variant, file_name) in variants {
-            let model = load_local_relex(weights_path(file_name), device.clone()).await?;
+        for (variant, source) in variants {
+            let model = load_relex(source, device.clone()).await?;
 
             let cold_start = Instant::now();
             let _ = model
@@ -1410,6 +1574,342 @@ Meta Platforms was founded by Mark Zuckerberg in Cambridge, Massachusetts.";
             let profile = profile_extract(&model, variant, cold_total).await?;
             profile.print();
         }
+
+        Ok(())
+    }
+
+    fn entity_signature(entities: &[Entity]) -> Vec<(String, String, usize, usize, usize, usize)> {
+        entities
+            .iter()
+            .map(|entity| {
+                (
+                    entity.label.clone(),
+                    entity.text.clone(),
+                    entity.start_char,
+                    entity.end_char,
+                    entity.start_word,
+                    entity.end_word,
+                )
+            })
+            .collect()
+    }
+
+    fn relation_signature(
+        relations: &[Relation],
+    ) -> Vec<(String, String, String, usize, usize, usize, usize)> {
+        relations
+            .iter()
+            .map(|relation| {
+                (
+                    relation.head.text.clone(),
+                    relation.tail.text.clone(),
+                    relation.relation.clone(),
+                    relation.head.start_char,
+                    relation.head.end_char,
+                    relation.tail.start_char,
+                    relation.tail.end_char,
+                )
+            })
+            .collect()
+    }
+
+    async fn assert_batch_matches_serial_extract(
+        variant: &'static str,
+        source: GlinerRelExSource,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let device = Device::gpu().await.unwrap_or_else(|_| Device::cpu());
+        let texts = [
+            "Apple was founded by Steve Jobs.",
+            "Google was founded by Larry Page in Mountain View.",
+        ];
+        let model = load_relex(source, device).await?;
+
+        let mut serial_results = Vec::with_capacity(texts.len());
+        for text in texts.iter().copied() {
+            serial_results.push(model.extract(text, ENTITY_LABELS, RELATION_LABELS).await?);
+        }
+        let batched_results = model
+            .extract_batch(&texts, ENTITY_LABELS, RELATION_LABELS)
+            .await?;
+
+        assert_eq!(
+            serial_results.len(),
+            batched_results.len(),
+            "batch size mismatch for {variant}"
+        );
+
+        for ((serial_entities, serial_relations), (batched_entities, batched_relations)) in
+            serial_results.iter().zip(&batched_results)
+        {
+            assert_eq!(
+                entity_signature(serial_entities),
+                entity_signature(batched_entities),
+                "entity mismatch for {variant}"
+            );
+            assert_eq!(
+                relation_signature(serial_relations),
+                relation_signature(batched_relations),
+                "relation mismatch for {variant}"
+            );
+            assert_eq!(
+                serial_entities.len(),
+                batched_entities.len(),
+                "entity count mismatch for {variant}"
+            );
+            assert_eq!(
+                serial_relations.len(),
+                batched_relations.len(),
+                "relation count mismatch for {variant}"
+            );
+
+            for (serial_entity, batched_entity) in serial_entities.iter().zip(batched_entities.iter())
+            {
+                assert!(
+                    (serial_entity.score - batched_entity.score).abs() < 1e-5,
+                    "entity score mismatch for {variant}: serial={:.6} batched={:.6}",
+                    serial_entity.score,
+                    batched_entity.score
+                );
+            }
+            for (serial_relation, batched_relation) in
+                serial_relations.iter().zip(batched_relations.iter())
+            {
+                assert!(
+                    (serial_relation.score - batched_relation.score).abs() < 1e-5,
+                    "relation score mismatch for {variant}: serial={:.6} batched={:.6}",
+                    serial_relation.score,
+                    batched_relation.score
+                );
+            }
+        }
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn extract_batch_matches_serial_extract_for_remote_multi(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        assert_batch_matches_serial_extract("multi", GlinerRelExSource::relex_multi()).await
+    }
+
+    #[tokio::test]
+    async fn extract_batch_matches_serial_extract_for_remote_large(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        assert_batch_matches_serial_extract("large", GlinerRelExSource::relex_large()).await
+    }
+
+    #[tokio::test]
+    #[ignore = "expensive remote coverage across all rel-ex variants"]
+    async fn extract_batch_matches_serial_extract_for_remote_variants(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        for (variant, source) in [
+            ("multi", GlinerRelExSource::relex_multi()),
+            ("base", GlinerRelExSource::relex_base()),
+            ("large", GlinerRelExSource::relex_large()),
+        ] {
+            assert_batch_matches_serial_extract(variant, source).await?;
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[ignore = "cache the remote rel-ex checkpoints"]
+    async fn cache_remote_relex_variants() -> Result<(), Box<dyn std::error::Error>> {
+        let device = Device::gpu().await.unwrap_or_else(|_| Device::cpu());
+        for source in [
+            GlinerRelExSource::relex_multi(),
+            GlinerRelExSource::relex_base(),
+            GlinerRelExSource::relex_large(),
+        ] {
+            let _model = load_relex(source, device.clone()).await?;
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[ignore = "smoke-test batched rel-ex on GPU"]
+    async fn extract_batch_remote_multi_gpu_smoke() -> Result<(), Box<dyn std::error::Error>> {
+        let device = Device::gpu().await?;
+        let model = load_relex(GlinerRelExSource::relex_multi(), device).await?;
+        let texts = [
+            "Apple was founded by Steve Jobs.",
+            "Google was founded by Larry Page in Mountain View.",
+        ];
+
+        let results = model
+            .extract_batch(&texts, ENTITY_LABELS, RELATION_LABELS)
+            .await?;
+        assert_eq!(results.len(), texts.len());
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[ignore = "diagnose first failing GPU stage for remote rel-ex multi"]
+    async fn debug_remote_multi_gpu_stage_cutoff() -> Result<(), Box<dyn std::error::Error>> {
+        let device = Device::gpu().await?;
+        let model = load_relex(GlinerRelExSource::relex_multi(), device.clone()).await?;
+        let tokenized = model
+            .tokenizer
+            .tokenize(PROFILE_TEXT, ENTITY_LABELS, RELATION_LABELS)?;
+
+        println!(
+            "stage_cutoff: device={} seq_len={} words={} ents={} rels={}",
+            if device.is_gpu() { "gpu" } else { "cpu" },
+            tokenized.token_ids.len(),
+            tokenized.num_words,
+            tokenized.num_entity_labels,
+            tokenized.num_relation_labels
+        );
+
+        let token_ids = Tensor::new(&device, &tokenized.token_ids);
+        let token_ids: Tensor<2, u32> = token_ids.unsqueeze(0).to_concrete();
+
+        let attention_mask = Tensor::new(&device, &tokenized.attention_mask);
+        let attention_mask: Tensor<2, u32> = attention_mask.unsqueeze(0).to_concrete();
+
+        println!("stage_cutoff: materializing post-embedding-norm");
+        let post_embedding = model.encoder.debug_after_embedding_norm(&token_ids);
+        let _ = post_embedding.clone().as_slice().await?;
+        println!("stage_cutoff: post-embedding-norm ok");
+
+        println!("stage_cutoff: materializing first encoder layer");
+        let first_layer = model
+            .encoder
+            .debug_first_layer_output(&post_embedding, Some(&attention_mask));
+        let _ = first_layer.clone().as_slice().await?;
+        println!("stage_cutoff: first encoder layer ok");
+
+        println!("stage_cutoff: materializing full encoder");
+        let full_encoder = model.encoder.forward(&token_ids, Some(&attention_mask));
+        let _ = full_encoder.as_slice().await?;
+        println!("stage_cutoff: full encoder ok");
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[ignore = "diagnose first failing GPU stage for batched remote rel-ex multi"]
+    async fn debug_remote_multi_gpu_batched_stage_cutoff(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let device = Device::gpu().await?;
+        let model = load_relex(GlinerRelExSource::relex_multi(), device.clone()).await?;
+        let texts = [
+            "Apple was founded by Steve Jobs.",
+            "Google was founded by Larry Page in Mountain View.",
+        ];
+        let tokenized = model
+            .tokenizer
+            .tokenize_batch(&texts, ENTITY_LABELS, RELATION_LABELS)?;
+        let seq_lens: Vec<usize> = tokenized.iter().map(|item| item.token_ids.len()).collect();
+        let word_lengths: Vec<usize> = tokenized.iter().map(|item| item.num_words).collect();
+        println!(
+            "batched_stage_cutoff: device={} batch={} seq_lens={seq_lens:?} word_lengths={word_lengths:?}",
+            if device.is_gpu() { "gpu" } else { "cpu" },
+            texts.len(),
+        );
+
+        let (token_ids, attention_mask) = model.build_batched_inputs(&tokenized);
+
+        println!("batched_stage_cutoff: materializing encoder output");
+        let encoder_output = model.encoder.forward(&token_ids, Some(&attention_mask));
+        let _ = encoder_output.clone().as_slice().await?;
+        println!("batched_stage_cutoff: encoder output ok");
+
+        let text_positions: Vec<Vec<usize>> = tokenized
+            .iter()
+            .map(|item| item.text_positions.clone())
+            .collect();
+        println!("batched_stage_cutoff: materializing word encoder embeddings");
+        let word_encoder_embs = model.gather_at_positions_batched(&encoder_output, &text_positions);
+        let _ = word_encoder_embs.clone().as_slice().await?;
+        println!("batched_stage_cutoff: word encoder embeddings ok");
+
+        println!("batched_stage_cutoff: materializing BiLSTM output");
+        let uniform_lengths = vec![word_lengths.iter().copied().max().unwrap_or(0); word_lengths.len()];
+        println!(
+            "batched_stage_cutoff: materializing BiLSTM output with uniform lengths {uniform_lengths:?}"
+        );
+        println!("batched_stage_cutoff: materializing first-step gates only");
+        let first_step_gates = model
+            .bilstm
+            .debug_first_step_gates(&word_encoder_embs, false);
+        let _ = first_step_gates.as_slice().await?;
+        println!("batched_stage_cutoff: first-step gates ok");
+
+        println!("batched_stage_cutoff: materializing forward direction state-only");
+        let fwd_state = model
+            .bilstm
+            .debug_forward_direction_state_only(&word_encoder_embs, &uniform_lengths, false);
+        let _ = fwd_state.clone().as_slice().await?;
+        println!("batched_stage_cutoff: forward direction state-only ok");
+
+        println!("batched_stage_cutoff: materializing repeated slice_assign only");
+        let hidden = fwd_state.shape()[1];
+        let mut stitched: Tensor<3, f32> =
+            Tensor::zeros(&device, [texts.len(), uniform_lengths[0], hidden]);
+        let zero_step: Tensor<3, f32> = Tensor::zeros(&device, [texts.len(), 1, hidden]);
+        for t in 0..uniform_lengths[0] {
+            stitched = stitched.slice_assign([0..texts.len(), t..(t + 1), 0..hidden], &zero_step);
+        }
+        let _ = stitched.as_slice().await?;
+        println!("batched_stage_cutoff: repeated slice_assign ok");
+
+        println!("batched_stage_cutoff: materializing forward direction only");
+        let fwd_only = model
+            .bilstm
+            .debug_forward_direction(&word_encoder_embs, &uniform_lengths, false);
+        let _ = fwd_only.clone().as_slice().await?;
+        println!("batched_stage_cutoff: forward direction ok");
+
+        println!("batched_stage_cutoff: materializing backward direction only");
+        let bwd_only = model
+            .bilstm
+            .debug_forward_direction(&word_encoder_embs, &uniform_lengths, true);
+        let _ = bwd_only.clone().as_slice().await?;
+        println!("batched_stage_cutoff: backward direction ok");
+
+        println!("batched_stage_cutoff: materializing full BiLSTM with uniform lengths");
+        let uniform_text_embs = model
+            .bilstm
+            .forward_with_lengths(&word_encoder_embs, &uniform_lengths)
+            .await;
+        let _ = uniform_text_embs.clone().as_slice().await?;
+        println!("batched_stage_cutoff: full BiLSTM with uniform lengths ok");
+
+        println!(
+            "batched_stage_cutoff: materializing BiLSTM output with actual lengths {word_lengths:?}"
+        );
+        let text_embs = model
+            .bilstm
+            .forward_with_lengths(&word_encoder_embs, &word_lengths)
+            .await;
+        let _ = text_embs.clone().as_slice().await?;
+        println!("batched_stage_cutoff: BiLSTM output ok");
+
+        let ent_positions: Vec<Vec<usize>> = tokenized
+            .iter()
+            .map(|item| item.ent_positions.clone())
+            .collect();
+        println!("batched_stage_cutoff: materializing entity prompt embeddings");
+        let ent_embs_raw = model.gather_at_positions_batched(&encoder_output, &ent_positions);
+        let ent_embs = model.prompt_rep_layer.forward_3d(&ent_embs_raw);
+        let _ = ent_embs.clone().as_slice().await?;
+        println!("batched_stage_cutoff: entity prompt embeddings ok");
+
+        let rel_positions: Vec<Vec<usize>> = tokenized
+            .iter()
+            .map(|item| item.rel_positions.clone())
+            .collect();
+        println!("batched_stage_cutoff: materializing relation embeddings");
+        let rel_embs = model.gather_at_positions_batched(&encoder_output, &rel_positions);
+        let _ = rel_embs.clone().as_slice().await?;
+        println!("batched_stage_cutoff: relation embeddings ok");
+
+        println!("batched_stage_cutoff: materializing token scores");
+        let scorer = model.scorer.as_ref().expect("token_level requires scorer");
+        let token_scores = scorer.forward_entity_scores(&text_embs, &ent_embs);
+        let _ = token_scores.clone().as_slice().await?;
+        println!("batched_stage_cutoff: token scores ok");
 
         Ok(())
     }

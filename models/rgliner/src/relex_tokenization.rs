@@ -191,6 +191,18 @@ impl RelExTokenizer {
         })
     }
 
+    /// Tokenize a batch of texts with a shared label prompt.
+    pub fn tokenize_batch(
+        &self,
+        texts: &[&str],
+        entity_labels: &[&str],
+        relation_labels: &[&str],
+    ) -> Result<Vec<RelExTokenizedInput>, GlinerError> {
+        texts.iter()
+            .map(|text| self.tokenize(text, entity_labels, relation_labels))
+            .collect()
+    }
+
     /// Split text into words with character offsets.
     ///
     /// Matches Python GLiNER's `WhitespaceTokenSplitter` regex:

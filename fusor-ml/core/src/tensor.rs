@@ -873,6 +873,16 @@ impl<D: DataType, const R: usize> Tensor<R, D> {
         }
     }
 
+    /// Resolve this tensor's pending compute graph into a new concrete tensor.
+    ///
+    /// Unlike [`materialize`], which only waits for queued work, this returns a
+    /// tensor backed by the resolved output buffer so subsequent ops no longer
+    /// extend the original lazy graph.
+    pub fn materialized(&self) -> Self {
+        let (tensor, _) = self.data.materialize();
+        Self::from(tensor)
+    }
+
     /// How many kernel calls are needed to fully resolve this tensor
     pub fn count_kernels_to_resolve(&self) -> usize {
         let (_, count) = self.data.materialize();

@@ -43,7 +43,7 @@ impl JointScorer {
     ///
     /// # Arguments
     /// * `token_embs` - Token embeddings [batch, seq_len, hidden_dim]
-    /// * `label_embs` - Label embeddings [n_labels, hidden_dim]
+    /// * `label_embs` - Label embeddings [batch, n_labels, hidden_dim]
     ///
     /// # Returns
     /// Scores [batch, seq_len, n_labels, 3] (3 classes: O, B, I)
@@ -57,26 +57,28 @@ impl JointScorer {
     pub fn forward(
         &self,
         token_embs: &Tensor<3, f32>,
-        label_embs: &Tensor<2, f32>,
+        label_embs: &Tensor<3, f32>,
     ) -> Tensor<4, f32> {
         let [batch_size, seq_len, _hidden_dim] = token_embs.shape();
-        let [n_labels, _] = label_embs.shape();
+        let [label_batch_size, n_labels, _] = label_embs.shape();
+        assert_eq!(
+            batch_size, label_batch_size,
+            "label batch size must match token batch size"
+        );
 
         // Project tokens: [batch, seq, hidden] -> [batch, seq, 2*half]
         let proj_tokens = self.proj_token.forward(token_embs);
         let [_, _, proj_dim] = proj_tokens.shape();
         let half = proj_dim / 2;
 
-        // Project labels: [n_labels, hidden] -> [n_labels, 2*half]
-        let label_embs_3d: Tensor<3, f32> = label_embs.unsqueeze(0).to_concrete();
-        let proj_labels = self.proj_label.forward(&label_embs_3d);
-        let proj_labels: Tensor<2, f32> = proj_labels.squeeze(0).to_concrete();
+        // Project labels: [batch, n_labels, hidden] -> [batch, n_labels, 2*half]
+        let proj_labels = self.proj_label.forward(label_embs);
 
         // Split projections into first/second halves along the feature dim.
         let tokens_first = proj_tokens.narrow(2, 0, half).to_concrete(); // [b, s, half]
         let tokens_second = proj_tokens.narrow(2, half, half).to_concrete(); // [b, s, half]
-        let labels_first = proj_labels.narrow(1, 0, half).to_concrete(); // [n, half]
-        let labels_second = proj_labels.narrow(1, half, half).to_concrete(); // [n, half]
+        let labels_first = proj_labels.narrow(2, 0, half).to_concrete(); // [b, n, half]
+        let labels_second = proj_labels.narrow(2, half, half).to_concrete(); // [b, n, half]
 
         // Broadcast to [batch, seq, n_labels, half] and build the three concatenation parts:
         //   [token_first, label_first, token_second * label_second]
@@ -88,13 +90,11 @@ impl JointScorer {
             .broadcast_as(target)
             .to_concrete();
         let lab_first_4d: Tensor<4, f32> = labels_first
-            .unsqueeze(0)
-            .unsqueeze(0)
+            .unsqueeze(1)
             .broadcast_as(target)
             .to_concrete();
         let lab_second_4d: Tensor<4, f32> = labels_second
-            .unsqueeze(0)
-            .unsqueeze(0)
+            .unsqueeze(1)
             .broadcast_as(target)
             .to_concrete();
 
@@ -126,7 +126,7 @@ impl JointScorer {
     pub fn forward_entity_scores(
         &self,
         token_embs: &Tensor<3, f32>,
-        label_embs: &Tensor<2, f32>,
+        label_embs: &Tensor<3, f32>,
     ) -> Tensor<4, f32> {
         let logits = self.forward(token_embs, label_embs);
         // sigmoid(x) = 0.5 * (tanh(x / 2) + 1); stays on-device and avoids needing

@@ -81,6 +81,8 @@ impl<'a> Resolver<'a> {
 
         // Pass 2: Apply Rewrite Rules
         self.optimize(graph);
+        self.rebuild_execution_edges(graph);
+        self.prune_unreachable_from_target();
 
         // Pass 3: Topological Sort
         let sorted_nodes = toposort(&self.execution_graph, None)
@@ -396,26 +398,77 @@ impl<'a> Resolver<'a> {
     }
 
     fn remove_node_if_dead(&mut self, node_idx: ExecutionNodeIndex) {
-        if !self.execution_graph.contains_node(node_idx) {
-            return;
+        let _ = node_idx;
+        // Defer dead-node pruning until rewrites are complete. During optimization,
+        // later rewrite passes may still need to reconnect nodes that temporarily
+        // have no outgoing edges.
+    }
+
+    fn rebuild_execution_edges(&mut self, graph: &ComputeGraphInner) {
+        let edge_indices: Vec<_> = self.execution_graph.edge_indices().collect();
+        for edge in edge_indices {
+            self.execution_graph.remove_edge(edge);
         }
-        if self
-            .execution_graph
-            .neighbors_directed(node_idx, petgraph::Direction::Outgoing)
-            .count()
-            == 0
-        {
-            // Collect incoming neighbors before removing
-            let incoming: Vec<_> = self
-                .execution_graph
-                .neighbors_directed(node_idx, petgraph::Direction::Incoming)
-                .collect();
-            self.execution_graph.remove_node(node_idx);
-            // Recursively check if dependencies are now dead
-            for dep in incoming {
-                self.remove_node_if_dead(dep);
+
+        let node_indices: Vec<_> = self.execution_graph.node_indices().collect();
+        for node_idx in node_indices {
+            if !self.execution_graph.contains_node(node_idx) {
+                continue;
+            }
+            let variant = self.execution_graph[node_idx].variant.clone();
+            let mut dependencies = Vec::new();
+            variant.visit_dependencies(&mut |dependency| {
+                dependencies.push(dependency);
+            });
+
+            for dependency in dependencies {
+                if self.check_cached(graph, dependency) {
+                    continue;
+                }
+                let Some(dep_exec_idx) = self.get_input_node_in_exec_graph(dependency) else {
+                    continue;
+                };
+                if !self.execution_graph.contains_node(dep_exec_idx) || dep_exec_idx == node_idx {
+                    continue;
+                }
+                if self.execution_graph.find_edge(dep_exec_idx, node_idx).is_none() {
+                    self.execution_graph.add_edge(dep_exec_idx, node_idx, ());
+                }
             }
         }
+    }
+
+    fn prune_unreachable_from_target(&mut self) {
+        let Some(&target_exec) = self.node_mapping.get(&self.target) else {
+            return;
+        };
+        if !self.execution_graph.contains_node(target_exec) {
+            return;
+        }
+
+        let mut reachable = FxHashSet::default();
+        let mut stack = vec![target_exec];
+        while let Some(node_idx) = stack.pop() {
+            if !reachable.insert(node_idx) {
+                continue;
+            }
+            for dependency in self
+                .execution_graph
+                .neighbors_directed(node_idx, petgraph::Direction::Incoming)
+            {
+                stack.push(dependency);
+            }
+        }
+
+        let all_nodes: Vec<_> = self.execution_graph.node_indices().collect();
+        for node_idx in all_nodes {
+            if !reachable.contains(&node_idx) {
+                self.execution_graph.remove_node(node_idx);
+            }
+        }
+
+        self.node_mapping
+            .retain(|_, exec_idx| self.execution_graph.contains_node(*exec_idx));
     }
 
     // Rules
@@ -596,6 +649,7 @@ impl<'a> Resolver<'a> {
             }
             for &new_input in &new_inputs {
                 if let Some(exec) = self.get_input_node_in_exec_graph(new_input)
+                    && self.execution_graph.contains_node(exec)
                     && self.execution_graph.find_edge(exec, node_idx).is_none()
                 {
                     self.execution_graph.add_edge(exec, node_idx, ());
