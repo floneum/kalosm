@@ -50,7 +50,6 @@ impl Attention {
         dim: usize,
         num_heads: usize,
         use_rel_pos: bool,
-        _input_size: (usize, usize),
     ) -> Result<Self> {
         let qkv = Linear::load(device, &mut vb.pp("qkv"))?;
         let proj = Linear::load(device, &mut vb.pp("proj"))?;
@@ -221,23 +220,10 @@ impl Block {
         num_heads: usize,
         use_rel_pos: bool,
         window_size: usize,
-        input_size: (usize, usize),
     ) -> Result<Self> {
         let norm1 = LayerNormNd::load(device, &mut vb.pp("norm1"), 1e-6)?;
         let norm2 = LayerNormNd::load(device, &mut vb.pp("norm2"), 1e-6)?;
-        let input_size_attn = if window_size == 0 {
-            input_size
-        } else {
-            (window_size, window_size)
-        };
-        let attn = Attention::load(
-            device,
-            &mut vb.pp("attn"),
-            dim,
-            num_heads,
-            use_rel_pos,
-            input_size_attn,
-        )?;
+        let attn = Attention::load(device, &mut vb.pp("attn"), dim, num_heads, use_rel_pos)?;
         let mlp = MlpBlock::load(
             device,
             &mut vb.pp("mlp"),
@@ -381,7 +367,7 @@ impl ImageEncoderViT {
     pub fn load(
         device: &Device,
         vb: &mut VarBuilder,
-        img_size: usize,
+        _img_size: usize,
         patch_size: usize,
         embed_dim: usize,
         depth: usize,
@@ -393,7 +379,6 @@ impl ImageEncoderViT {
         global_attn_indexes: &[usize],
     ) -> Result<Self> {
         let patch_embed = PatchEmbed::load(device, &mut vb.pp("patch_embed"), patch_size, 0)?;
-        let grid_size = img_size / patch_size;
 
         let mut blocks = Vec::with_capacity(depth);
         for i in 0..depth {
@@ -409,7 +394,6 @@ impl ImageEncoderViT {
                 num_heads,
                 use_rel_pos,
                 ws,
-                (grid_size, grid_size),
             )?;
             blocks.push(block);
         }

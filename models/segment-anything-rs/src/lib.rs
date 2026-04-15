@@ -30,6 +30,9 @@ use raw::sam::{
     STABILITY_SCORE_OFFSET, STABILITY_SCORE_THRESHOLD,
 };
 
+/// Number of grid points evaluated per forward pass in `segment_everything`.
+const SEGMENT_EVERYTHING_BATCH_SIZE: usize = 64;
+
 /// A builder for [`SegmentAnything`].
 #[derive(Default)]
 pub struct SegmentAnythingBuilder {
@@ -398,9 +401,7 @@ impl SegmentAnything {
 
         let mut candidates: Vec<MaskCandidate> = Vec::new();
 
-        const BATCH_SIZE: usize = 64;
-
-        for chunk in point_grid.chunks(BATCH_SIZE) {
+        for chunk in point_grid.chunks(SEGMENT_EVERYTHING_BATCH_SIZE) {
             let batch_points: Vec<(f64, f64, bool)> =
                 chunk.iter().map(|&(px, py)| (px, py, true)).collect();
 
@@ -437,51 +438,16 @@ impl SegmentAnything {
             let iou_slice = iou_flat.as_slice().await?;
             let iou_vec = iou_slice.as_slice();
 
-            for point_idx in 0..batch {
-                for mask_idx in 0..n_masks_per_point {
-                    let flat_idx = point_idx * n_masks_per_point + mask_idx;
-                    let iou = iou_vec[flat_idx];
-                    if iou < PRED_IOU_THRESH {
-                        continue;
-                    }
-
-                    let mask_start = flat_idx * mask_pixels;
-
-                    // Crop the mask to the actual image region (remove padding)
-                    let mut cropped_mask = Vec::with_capacity(crop_h * crop_w);
-                    for y in 0..crop_h {
-                        let row_start = mask_start + y * mask_w;
-                        cropped_mask.extend_from_slice(&masks_vec[row_start..row_start + crop_w]);
-                    }
-
-                    // Compute stability score on the cropped mask
-                    let hi_thresh = MODEL_MASK_THRESHOLD + STABILITY_SCORE_OFFSET;
-                    let lo_thresh = MODEL_MASK_THRESHOLD - STABILITY_SCORE_OFFSET;
-                    let intersections =
-                        cropped_mask.iter().filter(|&&v| v >= hi_thresh).count() as f32;
-                    let unions = cropped_mask.iter().filter(|&&v| v >= lo_thresh).count() as f32;
-                    let stability_score = if unions > 0.0 {
-                        intersections / unions
-                    } else {
-                        0.0
-                    };
-                    if stability_score < STABILITY_SCORE_THRESHOLD {
-                        continue;
-                    }
-
-                    if let Some((mask, bbox)) =
-                        BinaryMask::from_thresholded(&cropped_mask, crop_w, MODEL_MASK_THRESHOLD)
-                    {
-                        candidates.push(MaskCandidate {
-                            mask,
-                            bbox,
-                            score: iou,
-                            h: crop_h,
-                            w: crop_w,
-                        });
-                    }
-                }
-            }
+            collect_mask_candidates(
+                masks_vec,
+                iou_vec,
+                batch,
+                n_masks_per_point,
+                mask_w,
+                crop_h,
+                crop_w,
+                &mut candidates,
+            );
         }
 
         let candidates = non_maximum_suppression(candidates, CROP_NMS_THRESH);
@@ -658,6 +624,67 @@ fn low_res_crop_extent(original_len: usize, low_res_len: usize) -> usize {
         .min(low_res_len)
 }
 
+/// Filter a batch of low-res masks by IoU and stability score and push the survivors
+/// into `candidates`. The masks in `masks_vec` are laid out as
+/// `[batch, n_masks_per_point, mask_h, mask_w]` (row-major), but we only read the
+/// top-left `crop_h × crop_w` region of each mask (the part that corresponds to the
+/// actual image rather than the padded 1024×1024 input).
+#[allow(clippy::too_many_arguments)]
+fn collect_mask_candidates(
+    masks_vec: &[f32],
+    iou_vec: &[f32],
+    batch: usize,
+    n_masks_per_point: usize,
+    mask_w: usize,
+    crop_h: usize,
+    crop_w: usize,
+    candidates: &mut Vec<MaskCandidate>,
+) {
+    let mask_pixels = masks_vec.len() / (batch * n_masks_per_point);
+    let hi_thresh = MODEL_MASK_THRESHOLD + STABILITY_SCORE_OFFSET;
+    let lo_thresh = MODEL_MASK_THRESHOLD - STABILITY_SCORE_OFFSET;
+
+    for point_idx in 0..batch {
+        for mask_idx in 0..n_masks_per_point {
+            let flat_idx = point_idx * n_masks_per_point + mask_idx;
+            let iou = iou_vec[flat_idx];
+            if iou < PRED_IOU_THRESH {
+                continue;
+            }
+
+            let mask_start = flat_idx * mask_pixels;
+            let mut cropped_mask = Vec::with_capacity(crop_h * crop_w);
+            for y in 0..crop_h {
+                let row_start = mask_start + y * mask_w;
+                cropped_mask.extend_from_slice(&masks_vec[row_start..row_start + crop_w]);
+            }
+
+            let intersections = cropped_mask.iter().filter(|&&v| v >= hi_thresh).count() as f32;
+            let unions = cropped_mask.iter().filter(|&&v| v >= lo_thresh).count() as f32;
+            let stability_score = if unions > 0.0 {
+                intersections / unions
+            } else {
+                0.0
+            };
+            if stability_score < STABILITY_SCORE_THRESHOLD {
+                continue;
+            }
+
+            if let Some((mask, bbox)) =
+                BinaryMask::from_thresholded(&cropped_mask, crop_w, MODEL_MASK_THRESHOLD)
+            {
+                candidates.push(MaskCandidate {
+                    mask,
+                    bbox,
+                    score: iou,
+                    h: crop_h,
+                    w: crop_w,
+                });
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -671,14 +698,20 @@ mod tests {
             .expect("download tiny SAM gguf")
     }
 
-    fn f_to_vec<const R: usize>(t: &Tensor<R, f32>) -> Vec<f32> {
+    async fn f_to_vec<const R: usize>(t: &Tensor<R, f32>) -> Vec<f32> {
         let shape = t.shape();
         let n: usize = shape.iter().product();
         let ones: Tensor<R, f32> = Tensor::from_slice(&t.device(), shape, &vec![1.0f32; n]);
         let materialized = t * ones;
         let flat = materialized.reshape([n]);
-        let s = pollster::block_on(flat.as_slice()).unwrap();
+        let s = flat.as_slice().await.unwrap();
         s.as_slice().to_vec()
+    }
+
+    fn load_tiny_sam(device: &Device, gguf_path: &Path) -> raw::sam::Sam {
+        let mut reader = std::io::BufReader::new(std::fs::File::open(gguf_path).unwrap());
+        let mut vb = VarBuilder::from_gguf(&mut reader).unwrap();
+        raw::sam::Sam::load_tiny(device, &mut vb).unwrap()
     }
 
     fn max_diff(a: &[f32], b: &[f32]) -> f32 {
@@ -749,30 +782,28 @@ mod tests {
     /// CPU vs GPU mask decoder: dense PE, prompt encoder, transformer, masks, IoU.
     #[tokio::test]
     async fn test_mask_decoder_cpu_vs_gpu() {
-        use fusor::{Device, Tensor, VarBuilder};
+        use fusor::{Device, Tensor};
 
         let gguf_path = fetch_tiny_gguf_path();
 
         let cpu = Device::cpu();
         let gpu = Device::new().await.unwrap();
-        let mut cpu_reader = std::io::BufReader::new(std::fs::File::open(&gguf_path).unwrap());
-        let mut cpu_vb = VarBuilder::from_gguf(&mut cpu_reader).unwrap();
-        let cpu_sam = raw::sam::Sam::load_tiny(&cpu, &mut cpu_vb).unwrap();
-        let mut gpu_reader = std::io::BufReader::new(std::fs::File::open(&gguf_path).unwrap());
-        let mut gpu_vb = VarBuilder::from_gguf(&mut gpu_reader).unwrap();
-        let gpu_sam = raw::sam::Sam::load_tiny(&gpu, &mut gpu_vb).unwrap();
+        let cpu_sam = load_tiny_sam(&cpu, &gguf_path);
+        let gpu_sam = load_tiny_sam(&gpu, &gguf_path);
 
         // Dense PE
         let cpu_pe = cpu_sam.prompt_encoder.get_dense_pe();
         let gpu_pe = gpu_sam.prompt_encoder.get_dense_pe();
-        let pe_diff = max_diff(&f_to_vec(&cpu_pe), &f_to_vec(&gpu_pe));
+        let pe_diff = max_diff(&f_to_vec(&cpu_pe).await, &f_to_vec(&gpu_pe).await);
         assert!(pe_diff < 0.001, "dense PE diverged: {}", pe_diff);
 
-        // Prompt encoder
+        // Prompt encoder — scale normalized points by the padded SAM input size for x,
+        // and by the landscape.jpg test-image height for y.
         let points = [(0.5, 0.25, true)];
+        const TEST_IMAGE_HEIGHT: f32 = 771.0;
         let xys: Vec<f32> = points
             .iter()
-            .flat_map(|(x, y, _)| [(*x as f32) * 1024.0, (*y as f32) * 771.0])
+            .flat_map(|(x, y, _)| [(*x as f32) * IMAGE_SIZE as f32, (*y as f32) * TEST_IMAGE_HEIGHT])
             .collect();
         let labels: Vec<f32> = points
             .iter()
@@ -791,7 +822,7 @@ mod tests {
                 .prompt_encoder
                 .forward(Some((&gpu_pts, &gpu_lbls)), None, None);
         assert!(
-            max_diff(&f_to_vec(&cpu_sparse), &f_to_vec(&gpu_sparse)) < 0.001,
+            max_diff(&(f_to_vec(&cpu_sparse).await), &(f_to_vec(&gpu_sparse).await)) < 0.001,
             "sparse prompt diverged"
         );
 
@@ -811,11 +842,11 @@ mod tests {
                 .mask_decoder
                 .forward(&gpu_emb, &gpu_pe, &gpu_sparse, &gpu_dense, false);
         assert!(
-            max_diff(&f_to_vec(&cpu_masks), &f_to_vec(&gpu_masks)) < 0.01,
+            max_diff(&f_to_vec(&cpu_masks).await, &f_to_vec(&gpu_masks).await) < 0.01,
             "mask output diverged"
         );
         assert!(
-            max_diff(&f_to_vec(&cpu_iou), &f_to_vec(&gpu_iou)) < 0.01,
+            max_diff(&f_to_vec(&cpu_iou).await, &f_to_vec(&gpu_iou).await) < 0.01,
             "IoU prediction diverged"
         );
     }
@@ -835,12 +866,8 @@ mod tests {
         let gpu = Device::new().await.unwrap();
 
         // Load full model to warm up GPU buffer pool and get GGUF gaussian matrix.
-        let mut cpu_reader = std::io::BufReader::new(std::fs::File::open(&gguf_path).unwrap());
-        let mut cpu_vb = VarBuilder::from_gguf(&mut cpu_reader).unwrap();
-        let cpu_sam = raw::sam::Sam::load_tiny(&cpu, &mut cpu_vb).unwrap();
-        let mut gpu_reader = std::io::BufReader::new(std::fs::File::open(&gguf_path).unwrap());
-        let mut gpu_vb = VarBuilder::from_gguf(&mut gpu_reader).unwrap();
-        let gpu_sam = raw::sam::Sam::load_tiny(&gpu, &mut gpu_vb).unwrap();
+        let cpu_sam = load_tiny_sam(&cpu, &gguf_path);
+        let gpu_sam = load_tiny_sam(&gpu, &gguf_path);
 
         let h = 64usize;
         let w = 64usize;
@@ -913,14 +940,18 @@ mod tests {
         let gpu_shared = build_pe_shared(&gpu, gpu_gm, h, w);
         let gpu_separate = build_pe_separate(&gpu, gpu_gm, h, w);
 
-        let diff_separate = max_diff(&f_to_vec(&cpu_result), &f_to_vec(&gpu_separate));
+        let cpu_result_vec = f_to_vec(&cpu_result).await;
+        let gpu_shared_vec = f_to_vec(&gpu_shared).await;
+        let gpu_separate_vec = f_to_vec(&gpu_separate).await;
+
+        let diff_separate = max_diff(&cpu_result_vec, &gpu_separate_vec);
         assert!(
             diff_separate < 0.001,
             "separate consumers diverged (unexpected): {}",
             diff_separate
         );
 
-        let diff_shared = max_diff(&f_to_vec(&cpu_result), &f_to_vec(&gpu_shared));
+        let diff_shared = max_diff(&cpu_result_vec, &gpu_shared_vec);
         assert!(
             diff_shared < 0.01,
             "shared consumers diverged: {}",

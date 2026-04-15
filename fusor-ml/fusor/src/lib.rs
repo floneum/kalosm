@@ -1029,6 +1029,43 @@ where
     }
 }
 
+/// CPU path for `q_mat_mul` when the weight is a non-quantized f32 matrix.
+///
+/// Takes an already-materialized lhs and a weight in `[N, K]` layout, transposes the
+/// weight to `[K, N]`, reshapes/broadcasts it to match the lhs batch dimensions, and
+/// performs a regular matmul.
+fn cpu_q_mat_mul_f32_weight<const R: usize>(
+    lhs_eval: fusor_cpu::Tensor<R, fusor_cpu::ConcreteTensor<f32, R>>,
+    rhs_nk: fusor_cpu::ConcreteTensor<f32, 2>,
+    n: usize,
+    k: usize,
+) -> fusor_cpu::Tensor<R, fusor_cpu::ConcreteTensor<f32, R>> {
+    let rhs_transposed = fusor_cpu::Tensor::new(rhs_nk).transpose(0, 1);
+    let lhs_shape = lhs_eval.inner().layout().shape().to_vec();
+    let weight_shape: [usize; R] = std::array::from_fn(|i| {
+        if i < R - 2 {
+            1
+        } else if i == R - 2 {
+            k
+        } else {
+            n
+        }
+    });
+    let broadcast_shape: [usize; R] = std::array::from_fn(|i| {
+        if i < R - 2 {
+            lhs_shape[i]
+        } else if i == R - 2 {
+            k
+        } else {
+            n
+        }
+    });
+    let rhs_broadcast = rhs_transposed
+        .reshape(weight_shape)
+        .broadcast_as(broadcast_shape);
+    lhs_eval.matmul(rhs_broadcast)
+}
+
 // Quantized matrix multiplication for Tensor<R, f32>
 impl<const R: usize, B> Tensor<R, f32, B>
 where
@@ -1078,106 +1115,29 @@ where
             (Tensor::Cpu(lhs), QMatrix::CpuQ6K(rhs)) => Tensor::Cpu(fusor_cpu::Tensor::new(
                 lhs.to_concrete().inner().q_mat_mul(rhs),
             )),
-            // F32 is not quantized, use regular matmul with transpose
-            // Weight is [N, K] (out_features, in_features), we need input @ weight.T
+            // F32 is not quantized, use regular matmul with transpose.
+            // Weight is [N, K] (out_features, in_features), we need input @ weight.T.
             (Tensor::Cpu(lhs), QMatrix::CpuF32(t)) => {
                 let shape = t.shape();
-                let n = shape[0]; // out_features
-                let k = shape[1]; // in_features
-
-                // Create 2D ConcreteTensor from data and shape
-                let rhs_concrete: fusor_cpu::ConcreteTensor<f32, 2> =
-                    fusor_cpu::ConcreteTensor::from_parts(
-                        fusor_cpu::Layout::contiguous(&[n, k]),
-                        t.data().clone(),
-                    );
-
-                // Transpose weight from [N, K] to [K, N]
-                let rhs_tensor = fusor_cpu::Tensor::new(rhs_concrete);
-                let rhs_transposed = rhs_tensor.transpose(0, 1);
-
-                // Reshape to R dimensions: [1, 1, ..., K, N]
-                let lhs_eval = lhs.to_concrete();
-                let lhs_shape = lhs_eval.inner().layout().shape().to_vec();
-                let weight_shape: [usize; R] = std::array::from_fn(|i| {
-                    if i < R - 2 {
-                        1
-                    } else if i == R - 2 {
-                        k
-                    } else {
-                        n
-                    }
-                });
-                let rhs_reshaped = rhs_transposed.reshape(weight_shape);
-
-                // Broadcast to match lhs batch dimensions
-                let broadcast_shape: [usize; R] = std::array::from_fn(|i| {
-                    if i < R - 2 {
-                        lhs_shape[i]
-                    } else if i == R - 2 {
-                        k
-                    } else {
-                        n
-                    }
-                });
-                let rhs_broadcast = rhs_reshaped.broadcast_as(broadcast_shape);
-
-                // Do regular matmul
-                let result = lhs_eval.matmul(rhs_broadcast);
-                Tensor::Cpu(result)
+                let rhs_nk = fusor_cpu::ConcreteTensor::from_parts(
+                    fusor_cpu::Layout::contiguous(&[shape[0], shape[1]]),
+                    t.data().clone(),
+                );
+                Tensor::Cpu(cpu_q_mat_mul_f32_weight(lhs.to_concrete(), rhs_nk, shape[0], shape[1]))
             }
 
-            // F16 is not quantized, convert to f32 and use regular matmul with transpose
+            // F16 weight: convert to f32 then reuse the f32 path.
             (Tensor::Cpu(lhs), QMatrix::CpuF16(t)) => {
                 let shape = t.shape();
-                let n = shape[0]; // out_features
-                let k = shape[1]; // in_features
-
-                // Convert f16 data to f32
+                let (n, k) = (shape[0], shape[1]);
                 let f32_data: Vec<f32> = t.data().iter().map(|v| v.to_f32()).collect();
                 let mut data = fusor_cpu::AVec::<f32>::with_capacity(64, f32_data.len());
                 data.extend_from_slice(&f32_data);
-
-                // Create 2D ConcreteTensor from data and shape
-                let rhs_concrete: fusor_cpu::ConcreteTensor<f32, 2> =
-                    fusor_cpu::ConcreteTensor::from_parts(
-                        fusor_cpu::Layout::contiguous(&[n, k]),
-                        data.into_boxed_slice(),
-                    );
-
-                // Transpose weight from [N, K] to [K, N]
-                let rhs_tensor = fusor_cpu::Tensor::new(rhs_concrete);
-                let rhs_transposed = rhs_tensor.transpose(0, 1);
-
-                // Reshape to R dimensions: [1, 1, ..., K, N]
-                let lhs_eval = lhs.to_concrete();
-                let lhs_shape = lhs_eval.inner().layout().shape().to_vec();
-                let weight_shape: [usize; R] = std::array::from_fn(|i| {
-                    if i < R - 2 {
-                        1
-                    } else if i == R - 2 {
-                        k
-                    } else {
-                        n
-                    }
-                });
-                let rhs_reshaped = rhs_transposed.reshape(weight_shape);
-
-                // Broadcast to match lhs batch dimensions
-                let broadcast_shape: [usize; R] = std::array::from_fn(|i| {
-                    if i < R - 2 {
-                        lhs_shape[i]
-                    } else if i == R - 2 {
-                        k
-                    } else {
-                        n
-                    }
-                });
-                let rhs_broadcast = rhs_reshaped.broadcast_as(broadcast_shape);
-
-                // Do regular matmul
-                let result = lhs_eval.matmul(rhs_broadcast);
-                Tensor::Cpu(result)
+                let rhs_nk = fusor_cpu::ConcreteTensor::from_parts(
+                    fusor_cpu::Layout::contiguous(&[n, k]),
+                    data.into_boxed_slice(),
+                );
+                Tensor::Cpu(cpu_q_mat_mul_f32_weight(lhs.to_concrete(), rhs_nk, n, k))
             }
 
             // GPU path

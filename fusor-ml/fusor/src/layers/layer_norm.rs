@@ -95,6 +95,8 @@ where
             return input.layer_norm(&weight_b, bias_b.as_ref(), D::from_f32(self.eps), true);
         }
 
+        // Arbitrary-axis path: mean/variance/normalization are computed as separate
+        // ops rather than going through the fused `layer_norm` kernel above.
         let num_features = shape[axis];
 
         let mean: Tensor<N, D> = input.mean_keepdim::<OUT_RANK>(axis);
