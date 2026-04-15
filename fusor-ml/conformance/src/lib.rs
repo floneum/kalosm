@@ -461,10 +461,15 @@ impl ItemMismatchError {
 
 impl Display for ItemMismatchError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let position = if self.position.is_empty() {
+            String::from("<scalar>")
+        } else {
+            format!("{:?}", self.position)
+        };
         write!(
             f,
-            "Item mismatch on device {:?}: expected {}, got {}",
-            self.device, self.expected, self.actual
+            "Item mismatch on device {:?} at {}: expected {}, got {}",
+            self.device, position, self.expected, self.actual
         )
     }
 }
