@@ -62,6 +62,12 @@ fn word_error_rate(reference: &str, hypothesis: &str) -> f32 {
 }
 
 fn moonshine_source(size: &str) -> WhisperSource {
+    let local = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("artifacts")
+        .join(format!("moonshine-streaming-{size}.gguf"));
+    if local.exists() {
+        return WhisperSource::moonshine_streaming_local(local);
+    }
     match size {
         "tiny" => WhisperSource::moonshine_streaming_tiny(),
         "small" => WhisperSource::moonshine_streaming_small(),
@@ -244,7 +250,7 @@ async fn moonshine_tiny_streaming_short_prefix_smoke() -> Result<()> {
         transcribe_jfk_sample_streaming(moonshine_source("tiny"), 1_000, Some(2.0)).await?;
     assert_eq!(
         normalize_text(&transcript),
-        "and so my fellow america",
+        "and so my fellow americans",
         "unexpected short Moonshine streaming transcript: {transcript}"
     );
     Ok(())

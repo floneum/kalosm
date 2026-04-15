@@ -70,7 +70,7 @@ impl WhisperSource {
         let source = FileSource::huggingface(
             "Demonthos/cohere-transcribe-03-2026-gguf".to_owned(),
             "main".to_owned(),
-            "model.gguf".to_owned(),
+            "cohere-transcribe-03-2026.gguf".to_owned(),
         );
         Self::new_with_family(
             source.clone(),

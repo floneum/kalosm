@@ -28,7 +28,7 @@ pub use composite::{
 };
 pub use device::Device;
 pub use error::Error;
-pub use fusor_types::FromArray;
+pub use fusor_types::{FromArray, SlidingWindow};
 
 /// Result type for fusor operations.
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -405,15 +405,18 @@ where
     /// Materialize the tensor to a concrete form.
     ///
     /// For CPU tensors, this evaluates any lazy expressions.
-    /// For GPU tensors, this is a no-op as GPU tensors are already concrete.
+    /// For GPU tensors, this materializes a strided view into a contiguous
+    /// buffer so subsequent ops (and direct buffer reads via `as_slice`)
+    /// observe data in logical-shape order. This matches the CPU semantics
+    /// of `to_concrete`.
     pub fn to_concrete(&self) -> Tensor<R, D>
     where
         B: TensorBacking<R>,
-        D: SimdElement,
+        D: SimdElement + DataType,
     {
         match self {
             Tensor::Cpu(t) => Tensor::Cpu(t.to_concrete()),
-            Tensor::Gpu(t) => Tensor::Gpu(t.clone()),
+            Tensor::Gpu(t) => Tensor::Gpu(t.clone().contiguous()),
         }
     }
 

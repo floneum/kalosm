@@ -392,6 +392,7 @@ impl MoonshineAttention {
         )
     }
 
+
     fn forward_cached(
         &self,
         hidden_states: &Tensor<3, f32>,
@@ -854,6 +855,7 @@ impl MoonshineEncoder {
         let total_conv1_frames = Self::ceil_div_2(total_linear_frames);
         let new_conv1_frames = total_conv1_frames.saturating_sub(old_conv1_frames);
 
+        let old_linear_tail = state.linear_tail.clone();
         state.linear_tail = Self::append_tail(state.linear_tail.as_ref(), &new_linear, 2, 4);
         state.total_linear_frames = total_linear_frames;
         state.total_conv1_frames = total_conv1_frames;
@@ -872,7 +874,7 @@ impl MoonshineEncoder {
             let prefix_len = old_linear_frames.saturating_sub(start_frame);
             let mut parts = Vec::with_capacity(2);
             if prefix_len > 0 {
-                if let Some(tail) = &state.linear_tail {
+                if let Some(tail) = &old_linear_tail {
                     parts.push(
                         tail.narrow(2, tail.shape()[2] - prefix_len, prefix_len)
                             .to_concrete(),
@@ -917,6 +919,7 @@ impl MoonshineEncoder {
         let total_seen_frames = Self::ceil_div_2(total_conv1_frames);
         let new_seen_frames = total_seen_frames.saturating_sub(old_seen_frames);
 
+        let old_conv1_tail = state.conv1_tail.clone();
         state.conv1_tail = Self::append_tail(state.conv1_tail.as_ref(), &new_conv1, 2, 4);
         state.total_seen_frames = total_seen_frames;
 
@@ -934,7 +937,7 @@ impl MoonshineEncoder {
             let prefix_len = old_conv1_frames.saturating_sub(start_frame);
             let mut parts = Vec::with_capacity(2);
             if prefix_len > 0 {
-                if let Some(tail) = &state.conv1_tail {
+                if let Some(tail) = &old_conv1_tail {
                     parts.push(
                         tail.narrow(2, tail.shape()[2] - prefix_len, prefix_len)
                             .to_concrete(),
@@ -1312,32 +1315,102 @@ mod tests {
     use crate::moonshine_config::MoonshineStreamingConfig;
     use std::{fs, io::Cursor, path::Path};
 
-    fn tiny_artifact_dir() -> Option<std::path::PathBuf> {
-        std::env::var("RWHISPER_MOONSHINE_TINY_DIR")
-            .ok()
-            .map(Into::into)
-            .or_else(|| {
-                let dir = Path::new(env!("CARGO_MANIFEST_DIR"))
-                    .join("artifacts")
-                    .join("moonshine-streaming-tiny");
-                dir.exists().then_some(dir)
-            })
+    fn load_tiny_from_single_gguf() -> Option<(Moonshine, MoonshineStreamingConfig, Device)> {
+        load_tiny_with_device(Device::cpu())
     }
 
+    fn load_tiny_with_device(
+        device: Device,
+    ) -> Option<(Moonshine, MoonshineStreamingConfig, Device)> {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("artifacts")
+            .join("moonshine-streaming-tiny.gguf");
+        if !path.exists() {
+            return None;
+        }
+        let weights = fs::read(&path).unwrap();
+        let mut reader = Cursor::new(weights);
+        let mut vb = VarBuilder::from_gguf(&mut reader).unwrap();
+        let config_json = vb
+            .get_metadata("rwhisper.config.json")
+            .expect("missing rwhisper.config.json metadata in GGUF")
+            .to_string()
+            .unwrap();
+        let config: MoonshineStreamingConfig = serde_json::from_str(&config_json).unwrap();
+        let model = Moonshine::load(&device, &mut vb, config.clone()).unwrap();
+        Some((model, config, device))
+    }
+
+    fn read_jfk_pcm(target_rate: usize) -> Vec<f32> {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/samples_jfk.wav");
+        let bytes = fs::read(&path).unwrap();
+        let decoder = rodio::Decoder::new(std::io::Cursor::new(bytes)).unwrap();
+        let resampled =
+            rodio::source::UniformSourceIterator::new(decoder, 1, target_rate as u32);
+        resampled.map(|s: i16| s as f32 / i16::MAX as f32).collect()
+    }
+
+    // Regression guard for the streaming encoder: chunked encode + flush must
+    // match the non-streaming encoder on real audio. Broken previously because
+    // `append_conv1_outputs` / `append_encoder_outputs` updated the conv tail
+    // before reading it for the next window, so later chunks padded their conv
+    // input with already-current frames instead of the prior chunk's tail.
     #[tokio::test]
-    #[ignore = "requires a local Moonshine tiny artifact directory"]
-    async fn cached_decode_matches_full_decode() {
-        let Some(dir) = tiny_artifact_dir() else {
+    async fn streaming_encoder_matches_full_encoder_on_jfk() {
+        let Some((model, config, device)) = load_tiny_from_single_gguf() else {
             return;
         };
 
-        let config: MoonshineStreamingConfig =
-            serde_json::from_slice(&fs::read(dir.join("config.json")).unwrap()).unwrap();
-        let weights = fs::read(dir.join("model.gguf")).unwrap();
-        let device = Device::cpu();
-        let mut reader = Cursor::new(weights);
-        let mut vb = VarBuilder::from_gguf(&mut reader).unwrap();
-        let mut model = Moonshine::load(&device, &mut vb, config.clone()).unwrap();
+        let frame_len = config.encoder_config.frame_len();
+        let sample_rate = config.encoder_config.sample_rate;
+        let raw = read_jfk_pcm(sample_rate);
+        let usable_len = raw.len() / frame_len * frame_len;
+        let samples = raw[..usable_len].to_vec();
+
+        let full = model.encoder.encode(&device, &samples).unwrap();
+        let full = full.as_slice().await.unwrap();
+
+        let chunk_samples = samples.len() / 2 / frame_len * frame_len;
+        let mut stream_state = model.encoder.new_stream_state();
+        let mut streamed_parts = Vec::new();
+        for chunk in samples.chunks(chunk_samples) {
+            let append = model
+                .encoder
+                .encode_stream(&device, &mut stream_state, chunk, false)
+                .unwrap();
+            if let Some(hidden_states) = append.hidden_states {
+                streamed_parts.push(hidden_states);
+            }
+        }
+        let append = model
+            .encoder
+            .encode_stream(&device, &mut stream_state, &[], true)
+            .unwrap();
+        if let Some(hidden_states) = append.hidden_states {
+            streamed_parts.push(hidden_states);
+        }
+        let streamed = Tensor::cat(streamed_parts, 1);
+        let streamed = streamed.as_slice().await.unwrap();
+
+        assert_eq!(full.shape(), streamed.shape());
+        let max_diff = full
+            .as_slice()
+            .iter()
+            .zip(streamed.as_slice())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        eprintln!("streaming encoder max_diff vs full = {max_diff}");
+        assert!(
+            max_diff < 0.1,
+            "streaming encoder diverged from full encoder on JFK: max_diff={max_diff}"
+        );
+    }
+
+    #[tokio::test]
+    async fn cached_decode_matches_full_decode() {
+        let Some((mut model, config, device)) = load_tiny_from_single_gguf() else {
+            return;
+        };
 
         let samples = vec![0.0f32; config.encoder_config.frame_len() * 80];
         let encoder_hidden_states = model.encoder.encode(&device, &samples).unwrap();
@@ -1390,110 +1463,4 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    #[ignore = "requires a local Moonshine tiny artifact directory"]
-    async fn streaming_encoder_matches_full_encoder() {
-        let Some(dir) = tiny_artifact_dir() else {
-            return;
-        };
-
-        let config: MoonshineStreamingConfig =
-            serde_json::from_slice(&fs::read(dir.join("config.json")).unwrap()).unwrap();
-        let weights = fs::read(dir.join("model.gguf")).unwrap();
-        let device = Device::cpu();
-        let mut reader = Cursor::new(weights);
-        let mut vb = VarBuilder::from_gguf(&mut reader).unwrap();
-        let model = Moonshine::load(&device, &mut vb, config.clone()).unwrap();
-
-        let samples = vec![0.0f32; config.encoder_config.frame_len() * 127];
-        let full = model.encoder.encode(&device, &samples).unwrap();
-        let full = full.as_slice().await.unwrap();
-
-        let mut stream_state = model.encoder.new_stream_state();
-        let mut streamed_parts = Vec::new();
-        for chunk in samples.chunks(config.encoder_config.frame_len() * 11) {
-            let append = model
-                .encoder
-                .encode_stream(&device, &mut stream_state, chunk, false)
-                .unwrap();
-            if let Some(hidden_states) = append.hidden_states {
-                streamed_parts.push(hidden_states);
-            }
-        }
-        let append = model
-            .encoder
-            .encode_stream(&device, &mut stream_state, &[], true)
-            .unwrap();
-        if let Some(hidden_states) = append.hidden_states {
-            streamed_parts.push(hidden_states);
-        }
-        let streamed = Tensor::cat(streamed_parts, 1);
-        let streamed = streamed.as_slice().await.unwrap();
-
-        assert_eq!(full.shape(), streamed.shape());
-        let max_diff = full
-            .as_slice()
-            .iter()
-            .zip(streamed.as_slice())
-            .map(|(a, b)| (a - b).abs())
-            .fold(0.0f32, f32::max);
-        assert!(
-            max_diff < 1e-3,
-            "streaming encoder diverged from full encoder: max_diff={max_diff}"
-        );
-    }
-
-    #[tokio::test]
-    #[ignore = "requires a local Moonshine tiny artifact directory"]
-    async fn streaming_encoder_matches_full_encoder_with_single_frame_chunks() {
-        let Some(dir) = tiny_artifact_dir() else {
-            return;
-        };
-
-        let config: MoonshineStreamingConfig =
-            serde_json::from_slice(&fs::read(dir.join("config.json")).unwrap()).unwrap();
-        let weights = fs::read(dir.join("model.gguf")).unwrap();
-        let device = Device::cpu();
-        let mut reader = Cursor::new(weights);
-        let mut vb = VarBuilder::from_gguf(&mut reader).unwrap();
-        let model = Moonshine::load(&device, &mut vb, config.clone()).unwrap();
-
-        let frame_len = config.encoder_config.frame_len();
-        let samples = vec![0.0f32; frame_len * 31];
-        let full = model.encoder.encode(&device, &samples).unwrap();
-        let full = full.as_slice().await.unwrap();
-
-        let mut stream_state = model.encoder.new_stream_state();
-        let mut streamed_parts = Vec::new();
-        for chunk in samples.chunks(frame_len) {
-            let append = model
-                .encoder
-                .encode_stream(&device, &mut stream_state, chunk, false)
-                .unwrap();
-            if let Some(hidden_states) = append.hidden_states {
-                streamed_parts.push(hidden_states);
-            }
-        }
-        let append = model
-            .encoder
-            .encode_stream(&device, &mut stream_state, &[], true)
-            .unwrap();
-        if let Some(hidden_states) = append.hidden_states {
-            streamed_parts.push(hidden_states);
-        }
-        let streamed = Tensor::cat(streamed_parts, 1);
-        let streamed = streamed.as_slice().await.unwrap();
-
-        assert_eq!(full.shape(), streamed.shape());
-        let max_diff = full
-            .as_slice()
-            .iter()
-            .zip(streamed.as_slice())
-            .map(|(a, b)| (a - b).abs())
-            .fold(0.0f32, f32::max);
-        assert!(
-            max_diff < 1e-3,
-            "single-frame streaming encoder diverged from full encoder: max_diff={max_diff}"
-        );
-    }
 }

@@ -118,6 +118,30 @@ impl GenericKernel {
         };
         if binding >= self.inputs.len() as u32 {
             self.inputs.push(or(binding));
+        } else {
+            // Binding is already claimed by another op in this fused kernel.
+            // Multiple ops can view the same underlying tensor through different
+            // "kernel ranks" (e.g. softmax treats a rank-4 tensor as rank-3 by
+            // factoring out the reduce axis). The info struct shared on the GPU
+            // must expose enough fields for the op with the highest rank so
+            // every op's shape_{i}/stride_{i} access is valid.
+            let new_input = or(binding);
+            let existing = &mut self.inputs[binding as usize];
+            match (&mut existing.ty, &new_input.ty) {
+                (
+                    KernelInputType::TensorInfo(existing_info),
+                    KernelInputType::TensorInfo(new_info),
+                ) if new_info.rank > existing_info.rank => {
+                    existing_info.rank = new_info.rank;
+                }
+                (
+                    KernelInputType::QInfo(existing_info),
+                    KernelInputType::QInfo(new_info),
+                ) if new_info.rank > existing_info.rank => {
+                    existing_info.rank = new_info.rank;
+                }
+                _ => {}
+            }
         }
         binding
     }

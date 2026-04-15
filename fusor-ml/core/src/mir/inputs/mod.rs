@@ -107,8 +107,15 @@ impl Display for KernelInput {
             KernelInputType::QInfo(matrix) => {
                 let info_index = matrix.info_binding;
                 writeln!(f, "struct Tensor{info_index}Info {{")?;
-                for i in 0..matrix.rank {
-                    writeln!(f, "    shape_{i}: u32,")?;
+                if matrix.rank == 0 {
+                    // WGSL structs must have at least one member; the field is
+                    // unused for scalar tensors but keeps the type definition
+                    // valid.
+                    writeln!(f, "    _unused: u32,")?;
+                } else {
+                    for i in 0..matrix.rank {
+                        writeln!(f, "    shape_{i}: u32,")?;
+                    }
                 }
                 writeln!(f, "}};")?;
 

@@ -50,6 +50,16 @@ where
         + std::ops::Mul<Output = D>
         + std::ops::Add<Output = D>,
 {
+    /// Read-only access to the loaded weight tensor (out_channels, in_channels, kernel_size).
+    pub fn weight(&self) -> &Tensor<3, D, ConcreteTensor<D, 3>> {
+        &self.weight
+    }
+
+    /// Read-only access to the loaded bias tensor.
+    pub fn bias(&self) -> Option<&Tensor<1, D, ConcreteTensor<D, 1>>> {
+        self.bias.as_ref()
+    }
+
     /// Create a new Conv1d layer with given weights and configuration.
     ///
     /// Weight shape: (out_channels, in_channels, kernel_size)
