@@ -6,7 +6,9 @@ use components::select::{
     Select, SelectItemIndicator, SelectList, SelectOption, SelectTrigger, SelectValue,
 };
 use dioxus::prelude::*;
-use dioxus_markdown::Markdown;
+use pulldown_cmark::{Event, HeadingLevel, Options, Parser, Tag, TagEnd};
+use std::iter::Peekable;
+use std::ops::Range;
 use rgliner::{
     relation_decoding::Relation,
     relex::{GlinerRelEx, GlinerRelExSource},
@@ -119,35 +121,30 @@ fn App() -> Element {
     let mut error = use_signal(|| None::<String>);
     let mut extraction = use_signal(Extraction::default);
     let mut status = use_signal(|| "idle".to_string());
-    let mut schedule = use_signal(|| 0u64);
 
-    // Bump the schedule whenever any input that affects extraction changes.
-    // Do NOT read `model` here — the extractor writes it back on every run,
-    // which would re-trigger this effect in an endless loop.
-    use_effect(move || {
-        let _ = text();
-        let _ = entity_labels();
-        let _ = relation_labels();
-        schedule.with_mut(|s| *s += 1);
-    });
+    // Memoised so the effect below only re-runs when a model appears or
+    // disappears, not every time `run_extraction` writes the model back.
+    let model_ready = use_memo(move || model.read().is_some());
 
-    // React to schedule changes: debounce, then extract.
-    use_effect(move || {
-        let current = schedule();
-        if current == 0 {
+    // One extraction pipeline: watch the inputs, debounce, run.
+    // `use_future` cancels and restarts whenever any tracked signal changes,
+    // which gives us the debounce for free.
+    use_future(move || async move {
+        let cur_text = text();
+        let ent_raw = entity_labels();
+        let rel_raw = relation_labels();
+        if !model_ready() {
             return;
         }
+
+        // Cancelled if any of the above change during the wait.
+        sleep_ms(DEBOUNCE_MS).await;
+
+        // Detach the extraction so cancellation can't drop it mid-run
+        // (which would lose the model we've taken out of the signal).
         spawn(async move {
-            sleep_ms(DEBOUNCE_MS).await;
-            if schedule() != current {
+            if running() {
                 return;
-            }
-            // Wait for any in-flight extraction to finish; bail if a newer change arrives.
-            while running() {
-                sleep_ms(80).await;
-                if schedule() != current {
-                    return;
-                }
             }
             let Some(mut taken) = model.write().take() else {
                 return;
@@ -156,12 +153,10 @@ fn App() -> Element {
             error.set(None);
             status.set("extracting…".to_string());
 
-            let ent_labels = parse_labels(&entity_labels());
-            let rel_labels = parse_labels(&relation_labels());
-            let cur_text = text();
+            let ent = parse_labels(&ent_raw);
+            let rel = parse_labels(&rel_raw);
             let mode = taken.choice().mode();
-            let outcome =
-                run_extraction(&mut taken, mode, &cur_text, &ent_labels, &rel_labels).await;
+            let outcome = run_extraction(&mut taken, mode, &cur_text, &ent, &rel).await;
             model.set(Some(taken));
 
             match outcome {
@@ -206,8 +201,6 @@ fn App() -> Element {
                 Ok(m) => {
                     model.set(Some(m));
                     status.set("ready".to_string());
-                    // Kick an extraction now that a model is available.
-                    schedule.with_mut(|s| *s += 1);
                 }
                 Err(e) => {
                     error.set(Some(format!("{e}")));
@@ -411,23 +404,34 @@ async fn run_extraction(
     }
 }
 
-fn render_article(text: &str, ex: &Extraction) -> Element {
-    let spliced = splice_entities(text, &ex.entities, &ex.relations);
-    rsx! {
-        Markdown { src: spliced }
-    }
+#[derive(Clone, PartialEq)]
+struct EntityView {
+    text: String,
+    label: String,
+    color: String,
+    rels: Vec<(String, String, String)>,
 }
 
-/// Splice `<span class="entity">…</span>` into the markdown source at each
-/// entity boundary. The nested `.rels` span renders on hover.
-fn splice_entities(text: &str, entities: &[Entity], relations: &[Relation]) -> String {
-    if entities.is_empty() {
-        return text.to_string();
+#[derive(Clone, PartialEq, Default)]
+struct Article {
+    source: String,
+    entities: Vec<EntityView>,
+}
+
+/// Splice `<Entity i="N"/>` markers into the markdown source at each entity
+/// boundary, and collect the per-entity view the custom component renders.
+fn build_article(text: &str, ex: &Extraction) -> Article {
+    if ex.entities.is_empty() {
+        return Article {
+            source: text.to_string(),
+            entities: Vec::new(),
+        };
     }
-    let mut sorted: Vec<&Entity> = entities.iter().collect();
+    let mut sorted: Vec<&Entity> = ex.entities.iter().collect();
     sorted.sort_by_key(|e| e.start_char);
 
-    let mut out = String::with_capacity(text.len() + entities.len() * 64);
+    let mut source = String::with_capacity(text.len() + sorted.len() * 20);
+    let mut entities: Vec<EntityView> = Vec::new();
     let mut cursor = 0usize;
     let len = text.len();
 
@@ -440,61 +444,55 @@ fn splice_entities(text: &str, entities: &[Entity], relations: &[Relation]) -> S
         if !text.is_char_boundary(start) || !text.is_char_boundary(end) {
             continue;
         }
-        out.push_str(&text[cursor..start]);
-        let color = underline_color(&ent.label);
-        out.push_str(&format!(
-            r#"<span class="entity" style="--ec: {color}" data-label="{label}">"#,
-            color = color,
-            label = escape_attr(&ent.label)
-        ));
-        // The entity surface text.
-        out.push_str(&escape_html_content(&text[start..end]));
-        // Popover: label + relations involving this entity.
-        out.push_str(r#"<span class="pop">"#);
-        out.push_str(r#"<span class="pop-label">"#);
-        out.push_str(&escape_html_content(&ent.label));
-        out.push_str("</span>");
+        source.push_str(&text[cursor..start]);
+        let idx = entities.len();
+        source.push_str(&format!("<Entity i=\"{idx}\"/>"));
 
         let ent_text = &text[start..end];
-        let mut rel_lines = 0usize;
-        for rel in relations {
-            if rel.head.text == ent_text || rel.tail.text == ent_text {
-                out.push_str(r#"<span class="pop-rel">"#);
-                out.push_str(&escape_html_content(&rel.head.text));
-                out.push_str(r#"<span class="arrow"> → </span>"#);
-                out.push_str(r#"<span class="rel-name">"#);
-                out.push_str(&escape_html_content(&rel.relation));
-                out.push_str("</span>");
-                out.push_str(r#"<span class="arrow"> → </span>"#);
-                out.push_str(&escape_html_content(&rel.tail.text));
-                out.push_str("</span>");
-                rel_lines += 1;
-            }
-        }
-        if rel_lines == 0 && !relations.is_empty() {
-            out.push_str(r#"<span class="pop-empty">no relations</span>"#);
-        }
-        out.push_str("</span>");
-        out.push_str("</span>");
+        let rels: Vec<(String, String, String)> = ex
+            .relations
+            .iter()
+            .filter(|r| r.head.text == ent_text || r.tail.text == ent_text)
+            .map(|r| (r.head.text.clone(), r.relation.clone(), r.tail.text.clone()))
+            .collect();
+
+        entities.push(EntityView {
+            text: ent_text.to_string(),
+            label: ent.label.clone(),
+            color: underline_color(&ent.label),
+            rels,
+        });
         cursor = end;
     }
     if cursor < len {
-        out.push_str(&text[cursor..]);
+        source.push_str(&text[cursor..]);
     }
-    out
+    Article { source, entities }
 }
 
-fn escape_html_content(s: &str) -> String {
-    s.replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
-}
-
-fn escape_attr(s: &str) -> String {
-    s.replace('&', "&amp;")
-        .replace('"', "&quot;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
+fn render_entity(view: EntityView) -> Element {
+    let has_rels = !view.rels.is_empty();
+    rsx! {
+        span {
+            class: "entity",
+            style: "--ec: {view.color};",
+            "{view.text}"
+            span { class: "pop",
+                span { class: "pop-label", "{view.label}" }
+                if has_rels {
+                    for (i, (head, rel, tail)) in view.rels.iter().cloned().enumerate() {
+                        span { key: "r-{i}", class: "pop-rel",
+                            "{head}"
+                            span { class: "arrow", " → " }
+                            span { class: "rel-name", "{rel}" }
+                            span { class: "arrow", " → " }
+                            "{tail}"
+                        }
+                    }
+                }
+            }
+        }
+    }
 }
 
 fn underline_color(label: &str) -> String {

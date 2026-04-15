@@ -1578,6 +1578,93 @@ Meta Platforms was founded by Mark Zuckerberg in Cambridge, Massachusetts.";
         Ok(())
     }
 
+    fn speedup(cpu: Duration, gpu: Duration) -> f64 {
+        cpu.as_secs_f64() / gpu.as_secs_f64()
+    }
+
+    fn print_profile_comparison(variant: &str, cpu: &ExtractProfile, gpu: &ExtractProfile) {
+        println!(
+            "COMPARE variant={variant} warm_total_ms cpu={:.2} gpu={:.2} speedup={:.2}x",
+            cpu.warm_total.as_secs_f64() * 1000.0,
+            gpu.warm_total.as_secs_f64() * 1000.0,
+            speedup(cpu.warm_total, gpu.warm_total),
+        );
+        println!(
+            "  cold_total_ms cpu={:.2} gpu={:.2} speedup={:.2}x",
+            cpu.cold_total.as_secs_f64() * 1000.0,
+            gpu.cold_total.as_secs_f64() * 1000.0,
+            speedup(cpu.cold_total, gpu.cold_total),
+        );
+        println!(
+            "  entity_sync_ms cpu={:.2} gpu={:.2} speedup={:.2}x",
+            cpu.entity_sync.as_secs_f64() * 1000.0,
+            gpu.entity_sync.as_secs_f64() * 1000.0,
+            speedup(cpu.entity_sync, gpu.entity_sync),
+        );
+        println!(
+            "  relation_span_sync_ms cpu={:.2} gpu={:.2} speedup={:.2}x",
+            cpu.relation_span_sync.as_secs_f64() * 1000.0,
+            gpu.relation_span_sync.as_secs_f64() * 1000.0,
+            speedup(cpu.relation_span_sync, gpu.relation_span_sync),
+        );
+        println!(
+            "  relation_score_sync_ms cpu={:.2} gpu={:.2} speedup={:.2}x",
+            cpu.relation_score_sync.as_secs_f64() * 1000.0,
+            gpu.relation_score_sync.as_secs_f64() * 1000.0,
+            speedup(cpu.relation_score_sync, gpu.relation_score_sync),
+        );
+        println!(
+            "  tokenize_cpu_ms cpu={:.2} gpu={:.2}",
+            cpu.tokenize_cpu.as_secs_f64() * 1000.0,
+            gpu.tokenize_cpu.as_secs_f64() * 1000.0,
+        );
+        println!(
+            "  relation_pair_pack_cpu_ms cpu={:.2} gpu={:.2}",
+            cpu.relation_pair_pack_cpu.as_secs_f64() * 1000.0,
+            gpu.relation_pair_pack_cpu.as_secs_f64() * 1000.0,
+        );
+        println!(
+            "  relation_decode_cpu_ms cpu={:.2} gpu={:.2}",
+            cpu.relation_decode_cpu.as_secs_f64() * 1000.0,
+            gpu.relation_decode_cpu.as_secs_f64() * 1000.0,
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "compare cpu vs gpu rel-ex throughput on remote checkpoints"]
+    async fn compare_relex_cpu_vs_gpu() -> Result<(), Box<dyn std::error::Error>> {
+        let gpu_device = Device::gpu().await?;
+        let cpu_device = Device::cpu();
+
+        let variants = [
+            ("multi", GlinerRelExSource::relex_multi as fn() -> GlinerRelExSource),
+            ("base", GlinerRelExSource::relex_base as fn() -> GlinerRelExSource),
+            ("large", GlinerRelExSource::relex_large as fn() -> GlinerRelExSource),
+        ];
+
+        for (variant, source) in variants {
+            let cpu_model = load_relex(source(), cpu_device.clone()).await?;
+            let cpu_cold_start = Instant::now();
+            let _ = cpu_model
+                .extract(PROFILE_TEXT, ENTITY_LABELS, RELATION_LABELS)
+                .await?;
+            let cpu_cold_total = cpu_cold_start.elapsed();
+            let cpu_profile = profile_extract(&cpu_model, variant, cpu_cold_total).await?;
+
+            let gpu_model = load_relex(source(), gpu_device.clone()).await?;
+            let gpu_cold_start = Instant::now();
+            let _ = gpu_model
+                .extract(PROFILE_TEXT, ENTITY_LABELS, RELATION_LABELS)
+                .await?;
+            let gpu_cold_total = gpu_cold_start.elapsed();
+            let gpu_profile = profile_extract(&gpu_model, variant, gpu_cold_total).await?;
+
+            print_profile_comparison(variant, &cpu_profile, &gpu_profile);
+        }
+
+        Ok(())
+    }
+
     fn entity_signature(entities: &[Entity]) -> Vec<(String, String, usize, usize, usize, usize)> {
         entities
             .iter()
