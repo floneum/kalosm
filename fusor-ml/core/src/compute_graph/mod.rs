@@ -276,50 +276,52 @@ impl ComputeGraphInner {
     }
 
     fn check_life(&mut self, key: NodeIndex) {
-        // Check the reference count
-        let ref_count = self.nodes.nodes.node_weight(key).map(|n| n.reference_count);
-        match ref_count {
-            Some(count) if count > 0 => {
-                // The node still has references, so it is alive
-                return;
-            }
-            None => {
-                // The node is already dead
-                return;
-            }
-            _ => {}
-        }
-
-        // Check if any of the nodes that depend on this key are alive
-        let dependents: Vec<_> = self
-            .nodes
-            .nodes
-            .neighbors_directed(key, petgraph::Direction::Outgoing)
-            .collect();
-
-        for dependant in dependents {
-            // If the dependant still exists and it hasn't been computed yet
-            // keep this node alive
-            if let Some(dep_node) = self.nodes.nodes.node_weight(dependant) {
-                let computed = dep_node.cached.is_some();
-                if !computed {
-                    return;
+        // Iterative worklist: a deeply-chained expression (e.g. a ViT-scale image
+        // encoder) can produce a dependency graph hundreds of nodes deep. Recursing
+        // through it overflows the default test-thread stack, so we walk it via an
+        // explicit stack instead.
+        let mut to_check = vec![key];
+        while let Some(key) = to_check.pop() {
+            // Check the reference count
+            let ref_count = self.nodes.nodes.node_weight(key).map(|n| n.reference_count);
+            match ref_count {
+                Some(count) if count > 0 => {
+                    // The node still has references, so it is alive
+                    continue;
                 }
+                None => {
+                    // The node is already dead
+                    continue;
+                }
+                _ => {}
             }
-        }
 
-        let mut dependencies = Vec::new();
-        self.visit_dependencies(key, &mut |dependency| {
-            dependencies.push(dependency);
-        });
+            // Check if any of the nodes that depend on this key are alive
+            let dependents: Vec<_> = self
+                .nodes
+                .nodes
+                .neighbors_directed(key, petgraph::Direction::Outgoing)
+                .collect();
 
-        // If no other nodes depend on this key and it has zero references, it is dead
-        // remove it from the graph
-        self.remove_key(key);
+            let keep_alive = dependents.into_iter().any(|dependant| {
+                // If the dependant still exists and it hasn't been computed yet
+                // keep this node alive
+                self.nodes
+                    .nodes
+                    .node_weight(dependant)
+                    .is_some_and(|n| n.cached.is_none())
+            });
+            if keep_alive {
+                continue;
+            }
 
-        // Then check if any nodes it depends on are alive
-        for dependency in dependencies {
-            self.check_life(dependency);
+            self.visit_dependencies(key, &mut |dependency| {
+                to_check.push(dependency);
+            });
+
+            // If no other nodes depend on this key and it has zero references, it is dead
+            // remove it from the graph
+            self.remove_key(key);
         }
     }
 

@@ -22,15 +22,14 @@ impl PositionEmbeddingRandom {
     fn pe_encoding(&self, coords: &Tensor<3, f32>) -> Tensor<3, f32> {
         // coords * 2 - 1
         let coords = coords.mul_scalar(2.0) + (-1.0f32);
-        // coords @ gaussian_matrix: (B, N, 2) @ (2, D) -> need to broadcast gaussian to (B, 2, D)
         let shape = coords.shape();
         let b = shape[0];
-        let gm_shape = self.positional_encoding_gaussian_matrix.shape();
-        let gm = self
-            .positional_encoding_gaussian_matrix
-            .reshape([1, gm_shape[0], gm_shape[1]]);
-        let gm = gm.broadcast_as([b, gm_shape[0], gm_shape[1]]);
-        let coords = coords.mat_mul(&gm);
+        let n = shape[1];
+        let d = self.positional_encoding_gaussian_matrix.shape()[1];
+        // Flatten to a 2D matmul so we avoid broadcasted batched matmul on GPU.
+        let coords = coords.reshape([b * n, shape[2]]);
+        let coords_mm = coords.mat_mul(&self.positional_encoding_gaussian_matrix);
+        let coords = coords_mm.reshape([b, n, d]);
         // coords * 2 * pi
         let coords = coords.mul_scalar(2.0 * std::f32::consts::PI);
         // cat([sin, cos], last_dim)

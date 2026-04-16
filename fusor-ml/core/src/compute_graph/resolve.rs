@@ -199,42 +199,70 @@ impl<'a> Resolver<'a> {
     fn build_execution_graph(
         &mut self,
         graph: &ComputeGraphInner,
-        node: NodeIndex,
+        root: NodeIndex,
     ) -> Option<ExecutionNodeIndex> {
-        if self.resolved_set.contains(&node) {
+        // Iterative DFS: a ViT-scale expression produces a dependency graph hundreds
+        // of nodes deep, so we use an explicit stack to avoid overflowing the caller's
+        // stack. Each node is visited twice — once on entry (to enqueue its
+        // dependencies) and once on finish (to add it to the execution graph after all
+        // dependencies have been added, ensuring edges can link to them).
+        enum Frame {
+            Enter(NodeIndex),
+            Finish(NodeIndex),
+        }
+
+        if self.resolved_set.contains(&root) {
             return None;
         }
-        if let Some(&idx) = self.node_mapping.get(&node) {
+        if let Some(&idx) = self.node_mapping.get(&root) {
             return Some(idx);
         }
 
-        let node_data = graph
-            .nodes
-            .nodes
-            .node_weight(node)
-            .expect("Node not found in graph");
-        let variant = node_data.variant.clone();
+        let mut stack = vec![Frame::Enter(root)];
+        while let Some(frame) = stack.pop() {
+            match frame {
+                Frame::Enter(node) => {
+                    if self.resolved_set.contains(&node) || self.node_mapping.contains_key(&node) {
+                        continue;
+                    }
+                    // Push Finish first so it runs after all dependencies are finished.
+                    stack.push(Frame::Finish(node));
+                    let node_data = graph
+                        .nodes
+                        .nodes
+                        .node_weight(node)
+                        .expect("Node not found in graph");
+                    node_data.variant.visit_dependencies(&mut |dependency| {
+                        stack.push(Frame::Enter(dependency));
+                    });
+                }
+                Frame::Finish(node) => {
+                    if self.node_mapping.contains_key(&node) {
+                        // Already finished via another path.
+                        continue;
+                    }
+                    let node_data = graph
+                        .nodes
+                        .nodes
+                        .node_weight(node)
+                        .expect("Node not found in graph");
+                    let variant = node_data.variant.clone();
+                    let exec_idx = self.execution_graph.add_node(ExecutionNode {
+                        inner_idx: node,
+                        variant: variant.clone(),
+                    });
+                    self.node_mapping.insert(node, exec_idx);
 
-        // Add to execution graph
-        let exec_idx = self.execution_graph.add_node(ExecutionNode {
-            inner_idx: node,
-            variant: variant.clone(),
-        });
-        self.node_mapping.insert(node, exec_idx);
-
-        // Find dependencies
-        let mut dependencies = Vec::new();
-        variant.visit_dependencies(&mut |dependency| {
-            dependencies.push(dependency);
-        });
-
-        for dependency in dependencies {
-            if let Some(dep_exec_idx) = self.build_execution_graph(graph, dependency) {
-                self.execution_graph.add_edge(dep_exec_idx, exec_idx, ());
+                    variant.visit_dependencies(&mut |dependency| {
+                        if let Some(&dep_exec_idx) = self.node_mapping.get(&dependency) {
+                            self.execution_graph.add_edge(dep_exec_idx, exec_idx, ());
+                        }
+                    });
+                }
             }
         }
 
-        Some(exec_idx)
+        self.node_mapping.get(&root).copied()
     }
 
     fn lower_node(&self, node: &ExecutionNode) -> Option<Arc<dyn Operation>> {
@@ -396,25 +424,26 @@ impl<'a> Resolver<'a> {
     }
 
     fn remove_node_if_dead(&mut self, node_idx: ExecutionNodeIndex) {
-        if !self.execution_graph.contains_node(node_idx) {
-            return;
-        }
-        if self
-            .execution_graph
-            .neighbors_directed(node_idx, petgraph::Direction::Outgoing)
-            .count()
-            == 0
-        {
-            // Collect incoming neighbors before removing
+        // Iterative worklist — see `build_execution_graph` for rationale.
+        let mut stack = vec![node_idx];
+        while let Some(node_idx) = stack.pop() {
+            if !self.execution_graph.contains_node(node_idx) {
+                continue;
+            }
+            if self
+                .execution_graph
+                .neighbors_directed(node_idx, petgraph::Direction::Outgoing)
+                .count()
+                != 0
+            {
+                continue;
+            }
             let incoming: Vec<_> = self
                 .execution_graph
                 .neighbors_directed(node_idx, petgraph::Direction::Incoming)
                 .collect();
             self.execution_graph.remove_node(node_idx);
-            // Recursively check if dependencies are now dead
-            for dep in incoming {
-                self.remove_node_if_dead(dep);
-            }
+            stack.extend(incoming);
         }
     }
 

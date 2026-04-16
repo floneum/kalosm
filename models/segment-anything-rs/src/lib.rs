@@ -729,7 +729,6 @@ mod tests {
             .build()
             .await
             .expect("Failed to load model");
-
         let image_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/landscape.jpg");
         let image = image::open(&image_path).expect("Failed to open test image");
         let (w, h) = (image.width(), image.height());
@@ -890,9 +889,10 @@ mod tests {
             let yu = y_broadcast.reshape([h, w, 1]);
             let coords = Tensor::cat([xu, yu], 2).mul_scalar(2.0) + (-1.0f32);
             let gm_shape = gm.shape();
-            let gm_reshaped = gm.reshape([1, gm_shape[0], gm_shape[1]]);
-            let gm3 = gm_reshaped.broadcast_as([h, gm_shape[0], gm_shape[1]]);
-            let scaled = coords.mat_mul(&gm3).mul_scalar(2.0 * std::f32::consts::PI);
+            let coords_2d = coords.reshape([h * w, 2]);
+            let mm_2d = coords_2d.mat_mul(gm);
+            let mm = mm_2d.reshape([h, w, gm_shape[1]]);
+            let scaled = mm.mul_scalar(2.0 * std::f32::consts::PI);
             // Dual consumer: sin() and cos() both read from `scaled`
             Tensor::cat([scaled.sin().to_concrete(), scaled.cos().to_concrete()], 2)
         }
@@ -915,9 +915,9 @@ mod tests {
             let yu = y_broadcast.reshape([h, w, 1]);
             let coords = Tensor::cat([xu, yu], 2).mul_scalar(2.0) + (-1.0f32);
             let gm_shape = gm.shape();
-            let gm_reshaped = gm.reshape([1, gm_shape[0], gm_shape[1]]);
-            let gm3 = gm_reshaped.broadcast_as([h, gm_shape[0], gm_shape[1]]);
-            let mm = coords.mat_mul(&gm3);
+            let coords_2d = coords.reshape([h * w, 2]);
+            let mm_2d = coords_2d.mat_mul(gm);
+            let mm = mm_2d.reshape([h, w, gm_shape[1]]);
             // Control path: force distinct mul_scalar nodes for comparison.
             let for_sin = mm.mul_scalar(2.0 * std::f32::consts::PI);
             let for_cos = mm.mul_scalar(2.0 * std::f32::consts::PI);
@@ -957,6 +957,97 @@ mod tests {
             "shared consumers diverged: {}",
             diff_shared
         );
+    }
+
+    #[tokio::test]
+    async fn test_position_encoding_intermediates_cpu_vs_gpu() {
+        use fusor::{Device, Tensor};
+
+        let gguf_path = fetch_tiny_gguf_path();
+
+        let cpu = Device::cpu();
+        let gpu = Device::new().await.unwrap();
+
+        let cpu_sam = load_tiny_sam(&cpu, &gguf_path);
+        let gpu_sam = load_tiny_sam(&gpu, &gguf_path);
+
+        let h = 64usize;
+        let w = 64usize;
+
+        let cpu_gm = &cpu_sam
+            .prompt_encoder
+            .pe_layer
+            .positional_encoding_gaussian_matrix;
+        let gpu_gm = &gpu_sam
+            .prompt_encoder
+            .pe_layer
+            .positional_encoding_gaussian_matrix;
+
+        let gm_diff = max_diff(&f_to_vec(cpu_gm).await, &f_to_vec(gpu_gm).await);
+        assert!(gm_diff < 0.001, "gaussian matrix diverged: {}", gm_diff);
+
+        let cpu_x: Tensor<1, f32> =
+            fusor::arange_step::<f32>(&cpu, 0.5, w as f32 + 0.5, 1.0).div_scalar(w as f32);
+        let gpu_x: Tensor<1, f32> =
+            fusor::arange_step::<f32>(&gpu, 0.5, w as f32 + 0.5, 1.0).div_scalar(w as f32);
+        let x_diff = max_diff(&f_to_vec(&cpu_x).await, &f_to_vec(&gpu_x).await);
+        assert!(x_diff < 0.001, "x grid diverged: {}", x_diff);
+
+        let cpu_y: Tensor<1, f32> =
+            fusor::arange_step::<f32>(&cpu, 0.5, h as f32 + 0.5, 1.0).div_scalar(h as f32);
+        let gpu_y: Tensor<1, f32> =
+            fusor::arange_step::<f32>(&gpu, 0.5, h as f32 + 0.5, 1.0).div_scalar(h as f32);
+        let y_diff = max_diff(&f_to_vec(&cpu_y).await, &f_to_vec(&gpu_y).await);
+        assert!(y_diff < 0.001, "y grid diverged: {}", y_diff);
+
+        let cpu_x_2d = cpu_x.reshape([1, w]);
+        let cpu_x_broadcast = cpu_x_2d.broadcast_as([h, w]);
+        let cpu_x = cpu_x_broadcast.reshape([h, w, 1]);
+        let gpu_x_2d = gpu_x.reshape([1, w]);
+        let gpu_x_broadcast = gpu_x_2d.broadcast_as([h, w]);
+        let gpu_x = gpu_x_broadcast.reshape([h, w, 1]);
+        let cpu_y_2d = cpu_y.reshape([h, 1]);
+        let cpu_y_broadcast = cpu_y_2d.broadcast_as([h, w]);
+        let cpu_y = cpu_y_broadcast.reshape([h, w, 1]);
+        let gpu_y_2d = gpu_y.reshape([h, 1]);
+        let gpu_y_broadcast = gpu_y_2d.broadcast_as([h, w]);
+        let gpu_y = gpu_y_broadcast.reshape([h, w, 1]);
+        let cpu_coords: Tensor<3, f32> = Tensor::cat([cpu_x, cpu_y], 2);
+        let gpu_coords: Tensor<3, f32> = Tensor::cat([gpu_x, gpu_y], 2);
+
+        let coords_diff = max_diff(&f_to_vec(&cpu_coords).await, &f_to_vec(&gpu_coords).await);
+        assert!(coords_diff < 0.001, "coords diverged: {}", coords_diff);
+
+        let cpu_coords = (cpu_coords.mul_scalar(2.0) + (-1.0f32)).to_concrete();
+        let gpu_coords = (gpu_coords.mul_scalar(2.0) + (-1.0f32)).to_concrete();
+        let centered_diff = max_diff(&f_to_vec(&cpu_coords).await, &f_to_vec(&gpu_coords).await);
+        assert!(centered_diff < 0.001, "centered coords diverged: {}", centered_diff);
+
+        let cpu_gm_shape = cpu_gm.shape();
+        let gpu_gm_shape = gpu_gm.shape();
+        let cpu_coords_2d = cpu_coords.reshape([h * w, 2]);
+        let cpu_mm_2d = cpu_coords_2d.mat_mul(cpu_gm);
+        let cpu_mm = cpu_mm_2d.reshape([h, w, cpu_gm_shape[1]]).to_concrete();
+        let gpu_coords_2d = gpu_coords.reshape([h * w, 2]);
+        let gpu_mm_2d = gpu_coords_2d.mat_mul(gpu_gm);
+        let gpu_mm = gpu_mm_2d.reshape([h, w, gpu_gm_shape[1]]).to_concrete();
+        let mm_diff = max_diff(&f_to_vec(&cpu_mm).await, &f_to_vec(&gpu_mm).await);
+        assert!(mm_diff < 0.001, "matmul diverged: {}", mm_diff);
+
+        let cpu_scaled = cpu_mm.mul_scalar(2.0 * std::f32::consts::PI);
+        let gpu_scaled = gpu_mm.mul_scalar(2.0 * std::f32::consts::PI);
+        let scaled_diff = max_diff(&f_to_vec(&cpu_scaled).await, &f_to_vec(&gpu_scaled).await);
+        assert!(scaled_diff < 0.001, "scaled diverged: {}", scaled_diff);
+
+        let cpu_sin = cpu_scaled.sin().to_concrete();
+        let gpu_sin = gpu_scaled.sin().to_concrete();
+        let sin_diff = max_diff(&f_to_vec(&cpu_sin).await, &f_to_vec(&gpu_sin).await);
+        assert!(sin_diff < 0.001, "sin diverged: {}", sin_diff);
+
+        let cpu_cos = cpu_scaled.cos().to_concrete();
+        let gpu_cos = gpu_scaled.cos().to_concrete();
+        let cos_diff = max_diff(&f_to_vec(&cpu_cos).await, &f_to_vec(&gpu_cos).await);
+        assert!(cos_diff < 0.001, "cos diverged: {}", cos_diff);
     }
 
     /// Compare batched vs unbatched forward_for_embeddings to verify numerical equivalence.
