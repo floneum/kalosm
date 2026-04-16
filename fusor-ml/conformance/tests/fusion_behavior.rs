@@ -1,7 +1,22 @@
 use fusor::{Device, Tensor};
+use fusor_conformance::approx_eq;
 
 async fn gpu_device() -> Option<Device> {
     Device::gpu().await.ok()
+}
+
+fn matrix_data(shape: [usize; 2], offset: f32) -> Vec<f32> {
+    let total = shape[0] * shape[1];
+    (0..total)
+        .map(|i| (((i % 13) as f32) - 6.0) * 0.2 + offset)
+        .collect()
+}
+
+fn condition_data(shape: [usize; 2]) -> Vec<f32> {
+    let total = shape[0] * shape[1];
+    (0..total)
+        .map(|i| if (i + shape[0]) % 3 == 0 { 1.0 } else { 0.0 })
+        .collect()
 }
 
 #[tokio::test]
@@ -10,15 +25,26 @@ async fn gpu_nary_triple_add_fuses_into_one_kernel() {
         return;
     };
 
-    let a: Tensor<2, f32> = Tensor::new(&device, &[[1.0, 2.0], [3.0, 4.0]]);
-    let b: Tensor<2, f32> = Tensor::new(&device, &[[5.0, 6.0], [7.0, 8.0]]);
-    let c: Tensor<2, f32> = Tensor::new(&device, &[[9.0, 10.0], [11.0, 12.0]]);
+    for shape in [[2, 2], [3, 5], [4, 3]] {
+        let a_data = matrix_data(shape, -0.3);
+        let b_data = matrix_data(shape, 0.8);
+        let c_data = matrix_data(shape, 1.7);
+        let a = Tensor::from_slice(&device, shape, &a_data);
+        let b = Tensor::from_slice(&device, shape, &b_data);
+        let c = Tensor::from_slice(&device, shape, &c_data);
 
-    let sum = &a + &b;
-    let result = &sum + &c;
-    assert_eq!(result.as_gpu().unwrap().count_kernels_to_resolve(), 1);
-    let output = result.as_slice().await.unwrap();
-    assert_eq!(output[[0, 0]], 15.0);
+        let sum = &a + &b;
+        let result = &sum + &c;
+        assert_eq!(result.as_gpu().unwrap().count_kernels_to_resolve(), 1);
+        let actual = result.to_concrete();
+
+        let cpu_a = Tensor::from_slice(&Device::Cpu, shape, &a_data);
+        let cpu_b = Tensor::from_slice(&Device::Cpu, shape, &b_data);
+        let cpu_c = Tensor::from_slice(&Device::Cpu, shape, &c_data);
+        let cpu_sum = &cpu_a + &cpu_b;
+        let expected = (&cpu_sum + &cpu_c).to_concrete();
+        approx_eq(&actual, &expected, 1e-6).await.unwrap();
+    }
 }
 
 #[tokio::test]
@@ -27,15 +53,23 @@ async fn gpu_nary_unary_chain_fuses_into_one_kernel() {
         return;
     };
 
-    let a: Tensor<2, f32> = Tensor::new(&device, &[[1.0, 2.0], [3.0, 4.0]]);
-    let b: Tensor<2, f32> = Tensor::new(&device, &[[0.5, 0.5], [0.5, 0.5]]);
+    for shape in [[2, 2], [3, 4], [2, 7]] {
+        let a_data = matrix_data(shape, 0.1);
+        let b_data = matrix_data(shape, -0.4);
+        let a = Tensor::from_slice(&device, shape, &a_data);
+        let b = Tensor::from_slice(&device, shape, &b_data);
 
-    let sum = (-a.clone()) + b.sin();
-    let result = sum.cos() + 1.0;
-    assert_eq!(result.as_gpu().unwrap().count_kernels_to_resolve(), 1);
-    let output = result.as_slice().await.unwrap();
-    let expected_00 = ((-1.0_f32) + 0.5_f32.sin()).cos() + 1.0;
-    assert!((output[[0, 0]] - expected_00).abs() < 0.001);
+        let sum = (-a.clone()) + b.sin();
+        let result = sum.cos() + 1.0;
+        assert_eq!(result.as_gpu().unwrap().count_kernels_to_resolve(), 1);
+        let actual = result.to_concrete();
+
+        let cpu_a = Tensor::from_slice(&Device::Cpu, shape, &a_data);
+        let cpu_b = Tensor::from_slice(&Device::Cpu, shape, &b_data);
+        let cpu_sum = (-cpu_a.clone()) + cpu_b.sin();
+        let expected = (cpu_sum.cos() + 1.0).to_concrete();
+        approx_eq(&actual, &expected, 1e-6).await.unwrap();
+    }
 }
 
 #[tokio::test]
@@ -44,13 +78,19 @@ async fn gpu_nary_same_input_multiple_times_deduplicates_bindings() {
         return;
     };
 
-    let a: Tensor<2, f32> = Tensor::new(&device, &[[1.0, 2.0], [3.0, 4.0]]);
-    let sum = &a + &a;
-    let result = &sum + &a;
-    assert_eq!(result.as_gpu().unwrap().count_kernels_to_resolve(), 1);
-    let output = result.as_slice().await.unwrap();
-    assert_eq!(output[[0, 0]], 3.0);
-    assert_eq!(output[[1, 1]], 12.0);
+    for shape in [[2, 2], [4, 3], [3, 6]] {
+        let a_data = matrix_data(shape, 0.6);
+        let a = Tensor::from_slice(&device, shape, &a_data);
+        let sum = &a + &a;
+        let result = &sum + &a;
+        assert_eq!(result.as_gpu().unwrap().count_kernels_to_resolve(), 1);
+        let actual = result.to_concrete();
+
+        let cpu_a = Tensor::from_slice(&Device::Cpu, shape, &a_data);
+        let cpu_sum = &cpu_a + &cpu_a;
+        let expected = (&cpu_sum + &cpu_a).to_concrete();
+        approx_eq(&actual, &expected, 1e-6).await.unwrap();
+    }
 }
 
 #[tokio::test]
@@ -59,17 +99,26 @@ async fn gpu_nary_where_cond_fuses_into_one_kernel() {
         return;
     };
 
-    let condition: Tensor<2, f32> = Tensor::new(&device, &[[0.0, 1.0], [1.0, 0.0]]);
-    let on_true: Tensor<2, f32> = Tensor::new(&device, &[[10.0, 20.0], [30.0, 40.0]]);
-    let on_false: Tensor<2, f32> = Tensor::new(&device, &[[1.0, 2.0], [3.0, 4.0]]);
+    for shape in [[2, 2], [3, 5], [4, 4]] {
+        let condition_values = condition_data(shape);
+        let on_true_data = matrix_data(shape, 2.0);
+        let on_false_data = matrix_data(shape, -1.0);
+        let condition = Tensor::from_slice(&device, shape, &condition_values);
+        let on_true = Tensor::from_slice(&device, shape, &on_true_data);
+        let on_false = Tensor::from_slice(&device, shape, &on_false_data);
 
-    let result = condition.where_cond(&on_true, &on_false);
-    assert_eq!(result.as_gpu().unwrap().count_kernels_to_resolve(), 1);
-    let output = result.as_slice().await.unwrap();
-    assert_eq!(output[[0, 0]], 1.0);
-    assert_eq!(output[[0, 1]], 20.0);
-    assert_eq!(output[[1, 0]], 30.0);
-    assert_eq!(output[[1, 1]], 4.0);
+        let result = condition.where_cond(&on_true, &on_false);
+        assert_eq!(result.as_gpu().unwrap().count_kernels_to_resolve(), 1);
+        let actual = result.to_concrete();
+
+        let cpu_condition = Tensor::from_slice(&Device::Cpu, shape, &condition_values);
+        let cpu_on_true = Tensor::from_slice(&Device::Cpu, shape, &on_true_data);
+        let cpu_on_false = Tensor::from_slice(&Device::Cpu, shape, &on_false_data);
+        let expected = cpu_condition
+            .where_cond(&cpu_on_true, &cpu_on_false)
+            .to_concrete();
+        approx_eq(&actual, &expected, 1e-6).await.unwrap();
+    }
 }
 
 #[tokio::test]
@@ -78,6 +127,7 @@ async fn gpu_nary_fusion_respects_binding_limit() {
         return;
     };
 
+    let shape = [3, 4];
     let max_storage_buffers = device
         .as_gpu()
         .unwrap()
@@ -86,12 +136,7 @@ async fn gpu_nary_fusion_respects_binding_limit() {
     let num_tensors = max_storage_buffers + 1;
 
     let tensors: Vec<Tensor<2, f32>> = (0..num_tensors)
-        .map(|i| {
-            Tensor::new(
-                &device,
-                &[[i as f32, (i + 1) as f32], [(i + 2) as f32, (i + 3) as f32]],
-            )
-        })
+        .map(|i| Tensor::from_slice(&device, shape, &matrix_data(shape, i as f32 * 0.3)))
         .collect();
 
     let mut iter = tensors.iter();
@@ -105,9 +150,15 @@ async fn gpu_nary_fusion_respects_binding_limit() {
         kernel_count
     );
 
-    let output = result.as_slice().await.unwrap();
-    let expected_00: f32 = (0..num_tensors).map(|i| i as f32).sum();
-    let expected_11: f32 = (0..num_tensors).map(|i| (i + 3) as f32).sum();
-    assert_eq!(output[[0, 0]], expected_00);
-    assert_eq!(output[[1, 1]], expected_11);
+    let cpu_tensors: Vec<Tensor<2, f32>> = (0..num_tensors)
+        .map(|i| Tensor::from_slice(&Device::Cpu, shape, &matrix_data(shape, i as f32 * 0.3)))
+        .collect();
+    let mut cpu_iter = cpu_tensors.iter();
+    let cpu_first = cpu_iter.next().unwrap().clone();
+    let expected = cpu_iter
+        .fold(cpu_first, |acc, tensor| (&acc + tensor).to_concrete())
+        .to_concrete();
+    approx_eq(&result.to_concrete(), &expected, 1e-6)
+        .await
+        .unwrap();
 }
