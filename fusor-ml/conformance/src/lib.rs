@@ -7,15 +7,16 @@ use std::{
     error::Error,
     fmt::{Debug, Display},
     ops::Sub,
+    ops::{Range, RangeInclusive},
     pin::Pin,
     sync::Arc,
 };
 
 use fusor::{DataType, Device, FromArray, SimdElement, Tensor};
 use rand::{
-    RngCore, SeedableRng,
     distr::{Distribution, StandardUniform, Uniform},
     rngs::StdRng,
+    RngCore, SeedableRng,
 };
 use thiserror::Error;
 
@@ -116,34 +117,155 @@ pub fn sequential_tensor<const R: usize, T: DataType + SimdElement + From<u16>>(
     Tensor::from_slice(device, shape, &data)
 }
 
+#[derive(Clone, Debug)]
+pub enum FuzzSizeSpec {
+    Fixed(usize),
+    Choices(Arc<[usize]>),
+    Range { start: usize, end_exclusive: usize },
+}
+
+impl FuzzSizeSpec {
+    fn sample(&self, rng: &mut StdRng) -> usize {
+        match self {
+            FuzzSizeSpec::Fixed(size) => *size,
+            FuzzSizeSpec::Choices(choices) => {
+                assert!(
+                    !choices.is_empty(),
+                    "fuzz size choice list must contain at least one size"
+                );
+                let index = (rng.next_u64() as usize) % choices.len();
+                choices[index]
+            }
+            FuzzSizeSpec::Range {
+                start,
+                end_exclusive,
+            } => {
+                assert!(
+                    start < end_exclusive,
+                    "fuzz size range must not be empty: {start}..{end_exclusive}"
+                );
+                Uniform::new(*start, *end_exclusive)
+                    .expect("validated non-empty size range")
+                    .sample(rng)
+            }
+        }
+    }
+}
+
+impl From<usize> for FuzzSizeSpec {
+    fn from(value: usize) -> Self {
+        Self::Fixed(value)
+    }
+}
+
+impl<const N: usize> From<[usize; N]> for FuzzSizeSpec {
+    fn from(value: [usize; N]) -> Self {
+        Self::Choices(Arc::from(value))
+    }
+}
+
+impl From<Vec<usize>> for FuzzSizeSpec {
+    fn from(value: Vec<usize>) -> Self {
+        Self::Choices(Arc::from(value.into_boxed_slice()))
+    }
+}
+
+impl From<Box<[usize]>> for FuzzSizeSpec {
+    fn from(value: Box<[usize]>) -> Self {
+        Self::Choices(Arc::from(value))
+    }
+}
+
+impl From<Range<usize>> for FuzzSizeSpec {
+    fn from(value: Range<usize>) -> Self {
+        Self::Range {
+            start: value.start,
+            end_exclusive: value.end,
+        }
+    }
+}
+
+impl From<RangeInclusive<usize>> for FuzzSizeSpec {
+    fn from(value: RangeInclusive<usize>) -> Self {
+        let (start, end) = value.into_inner();
+        Self::Range {
+            start,
+            end_exclusive: end
+                .checked_add(1)
+                .expect("inclusive fuzz size range upper bound overflowed"),
+        }
+    }
+}
+
+pub trait IntoFuzzShape<const R: usize> {
+    fn into_shape_specs(self) -> [FuzzSizeSpec; R];
+}
+
+impl<const R: usize> IntoFuzzShape<R> for [usize; R] {
+    fn into_shape_specs(self) -> [FuzzSizeSpec; R] {
+        self.map(FuzzSizeSpec::from)
+    }
+}
+
+impl<const R: usize> IntoFuzzShape<R> for [FuzzSizeSpec; R] {
+    fn into_shape_specs(self) -> [FuzzSizeSpec; R] {
+        self
+    }
+}
+
+impl<const R: usize, const N: usize> IntoFuzzShape<R> for [[usize; N]; R] {
+    fn into_shape_specs(self) -> [FuzzSizeSpec; R] {
+        self.map(FuzzSizeSpec::from)
+    }
+}
+
+impl<const R: usize> IntoFuzzShape<R> for [Range<usize>; R] {
+    fn into_shape_specs(self) -> [FuzzSizeSpec; R] {
+        self.map(FuzzSizeSpec::from)
+    }
+}
+
+impl<const R: usize> IntoFuzzShape<R> for [RangeInclusive<usize>; R] {
+    fn into_shape_specs(self) -> [FuzzSizeSpec; R] {
+        self.map(FuzzSizeSpec::from)
+    }
+}
+
 #[derive(Clone)]
 pub struct FuzzGenerator<const R: usize, T: SimdElement> {
-    seed: u64,
+    value_seed: u64,
+    shape_seed: u64,
     distribution: Arc<dyn Fn(&mut rand::rngs::StdRng) -> T + Send + Sync>,
-    shape: [usize; R],
+    shape_specs: [FuzzSizeSpec; R],
     phantom: std::marker::PhantomData<T>,
 }
 
 impl<const R: usize, T: SimdElement + DataType> FuzzGenerator<R, T> {
-    pub fn new(shape: [usize; R]) -> Self
+    pub fn new(shape: impl IntoFuzzShape<R>) -> Self
     where
         StandardUniform: rand::distr::Distribution<T>,
     {
         Self {
-            seed: 0,
+            value_seed: 0,
+            shape_seed: 0,
             distribution: Arc::new(move |rng| StandardUniform.sample(rng)),
-            shape,
+            shape_specs: shape.into_shape_specs(),
             phantom: std::marker::PhantomData,
         }
     }
 
     pub fn with_seed(mut self, seed: u64) -> Self {
-        self.seed = seed;
+        self.value_seed = seed;
         self
     }
 
     pub fn with_rng(mut self, mut rng: impl RngCore) -> Self {
-        self.seed = rng.next_u64();
+        self.value_seed = rng.next_u64();
+        self
+    }
+
+    pub fn with_shape_seed(mut self, seed: u64) -> Self {
+        self.shape_seed = seed;
         self
     }
 
@@ -155,16 +277,35 @@ impl<const R: usize, T: SimdElement + DataType> FuzzGenerator<R, T> {
         self
     }
 
-    fn seed_for_run(&self, run: usize) -> u64 {
-        // Stable run-dependent mixing so every backend sees identical samples.
-        self.seed
+    fn value_seed_for_run(&self, run: usize) -> u64 {
+        self.value_seed
             ^ (run as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15)
             ^ (R as u64).wrapping_mul(0xBF58_476D_1CE4_E5B9)
     }
 
+    fn shape_seed_for_run(&self, run: usize) -> u64 {
+        self.shape_seed
+            ^ (run as u64).wrapping_mul(0xD6E8_FEB8_6659_FD93)
+            ^ (R as u64).wrapping_mul(0x94D0_49BB_1331_11EB)
+    }
+
+    fn sample_shape(&self, rng: &mut StdRng) -> [usize; R] {
+        self.shape_specs
+            .clone()
+            .map(|shape_spec| shape_spec.sample(rng))
+    }
+
+    #[cfg(test)]
+    fn shape_for_run(&self, run: usize) -> [usize; R] {
+        let mut rng = rand::rngs::StdRng::seed_from_u64(self.shape_seed_for_run(run));
+        self.sample_shape(&mut rng)
+    }
+
     fn generate_for_run(&self, device: &Device, run: usize) -> Tensor<R, T> {
-        let mut rng = rand::rngs::StdRng::seed_from_u64(self.seed_for_run(run));
-        let base = random_tensor(device, self.shape, &mut rng, &*self.distribution);
+        let mut shape_rng = rand::rngs::StdRng::seed_from_u64(self.shape_seed_for_run(run));
+        let shape = self.sample_shape(&mut shape_rng);
+        let mut rng = rand::rngs::StdRng::seed_from_u64(self.value_seed_for_run(run));
+        let base = random_tensor(device, shape, &mut rng, &*self.distribution);
         // Vary layout based on run index: even runs stay contiguous, odd runs
         // get a non-contiguous layout so operations are tested with both.
         let strategy = run % 3;
@@ -583,9 +724,9 @@ impl<T, U, Generators, Compare> AssertBuilder<T, U, Generators, Compare> {
     pub fn equal_to_resolved_with_device(
         self,
         mut other: impl AsyncFnMutTuple<<T::Output as PushTuple<Device>>::Output, Output = U>
-        + Copy
-        + Send
-        + 'static,
+            + Copy
+            + Send
+            + 'static,
     ) -> Self
     where
         T: ResolveTensorTuple,
@@ -702,7 +843,7 @@ pub trait IntoCompare<U> {
         &'a U,
     )
         -> Pin<Box<dyn std::future::Future<Output = Result<(), Self::Error>> + 'a>>
-    + 'static;
+           + 'static;
 }
 
 impl<U, Cmp, E: Error> IntoCompare<U> for Cmp
@@ -719,7 +860,7 @@ where
         &'a U,
     )
         -> Pin<Box<dyn std::future::Future<Output = Result<(), Self::Error>> + 'a>>
-    + 'static {
+           + 'static {
         self
     }
 }
@@ -734,7 +875,7 @@ impl<const R: usize> IntoCompare<Tensor<R, u32>> for () {
         &'a Tensor<R, u32>,
     )
         -> Pin<Box<dyn std::future::Future<Output = Result<(), Self::Error>> + 'a>>
-    + 'static {
+           + 'static {
         |a, b| Box::pin(exact_eq(a, b))
     }
 }
@@ -749,7 +890,7 @@ impl<const R: usize> IntoCompare<Tensor<R, f32>> for () {
         &'a Tensor<R, f32>,
     )
         -> Pin<Box<dyn std::future::Future<Output = Result<(), Self::Error>> + 'a>>
-    + 'static {
+           + 'static {
         |a, b| Box::pin(approx_eq(a, b, 1e-5))
     }
 }
@@ -757,9 +898,8 @@ impl<const R: usize> IntoCompare<Tensor<R, f32>> for () {
 pub fn exact_compare<const R: usize, T>() -> impl for<'a> Fn(
     &'a Tensor<R, T>,
     &'a Tensor<R, T>,
-) -> Pin<
-    Box<dyn std::future::Future<Output = Result<(), ItemMismatchError>> + 'a>,
-> + Clone
+) -> Pin<Box<dyn std::future::Future<Output = Result<(), ItemMismatchError>> + 'a>>
+       + Clone
 where
     T: DataType + SimdElement + PartialEq,
 {
@@ -772,7 +912,7 @@ pub fn approx_compare<const R: usize, T>(
     &'a Tensor<R, T>,
     &'a Tensor<R, T>,
 ) -> Pin<Box<dyn std::future::Future<Output = Result<(), ItemMismatchError>> + 'a>>
-+ Clone
+       + Clone
 where
     T: Sub<Output = T> + PartialOrd + DataType + SimdElement + Copy,
 {
@@ -787,12 +927,12 @@ pub fn assert<T, U>(op: impl AsyncFnMutTuple<T, Output = U> + 'static) -> Assert
 mod api_tests {
     use fusor::{Device, Tensor};
 
-    use crate::FuzzGenerator;
+    use crate::{FuzzGenerator, FuzzSizeSpec};
 
     #[tokio::test]
     async fn test_api() {
         crate::assert(async |x: fusor::Tensor<1, f32>| x.sin().to_concrete())
-            .arg(FuzzGenerator::<1, f32>::new([64; 1]))
+            .arg(FuzzGenerator::<1, f32>::new([63..=65]))
             .equal_to_resolved_with_device(async |vec: Vec<f32>, device: Device| {
                 let expected = vec.iter().map(|&v| v.sin()).collect::<Vec<_>>();
                 Tensor::new(&device, &expected)
@@ -800,5 +940,43 @@ mod api_tests {
             .runs(10)
             .await
             .unwrap();
+    }
+
+    #[test]
+    fn fuzz_generator_accepts_size_choices_and_ranges() {
+        let choice_generator =
+            FuzzGenerator::<2, f32>::new([[255, 256, 257], [31, 32, 33]]).with_seed(1234);
+        for run in 0..24 {
+            let shape = choice_generator.shape_for_run(run);
+            assert!([255, 256, 257].contains(&shape[0]));
+            assert!([31, 32, 33].contains(&shape[1]));
+        }
+
+        let range_generator = FuzzGenerator::<2, f32>::new([255..=257, 31..=33]).with_seed(5678);
+        for run in 0..24 {
+            let shape = range_generator.shape_for_run(run);
+            assert!((255..=257).contains(&shape[0]));
+            assert!((31..=33).contains(&shape[1]));
+        }
+
+        let mixed_generator = FuzzGenerator::<2, f32>::new([
+            FuzzSizeSpec::from([255, 256, 257]),
+            FuzzSizeSpec::from(63..=65),
+        ])
+        .with_seed(9012);
+        for run in 0..24 {
+            let shape = mixed_generator.shape_for_run(run);
+            assert!([255, 256, 257].contains(&shape[0]));
+            assert!((63..=65).contains(&shape[1]));
+        }
+    }
+
+    #[test]
+    fn fuzz_generator_shapes_do_not_depend_on_value_seed() {
+        let first = FuzzGenerator::<2, f32>::new([255..=257, 63..=65]).with_seed(1);
+        let second = FuzzGenerator::<2, f32>::new([255..=257, 63..=65]).with_seed(2);
+        for run in 0..24 {
+            assert_eq!(first.shape_for_run(run), second.shape_for_run(run));
+        }
     }
 }

@@ -2,13 +2,11 @@ mod common;
 
 use common::{binary_map2, unary_map2, where_cond2};
 use fusor::{Device, Tensor};
-use fusor_conformance::{FuzzGenerator, approx_compare};
+use fusor_conformance::{approx_compare, FuzzGenerator};
 use rand::distr::Uniform;
 
-const SHAPE: [usize; 2] = [4, 5];
-
 fn fuzz(seed: u64) -> FuzzGenerator<2, f32> {
-    FuzzGenerator::<2, f32>::new(SHAPE)
+    FuzzGenerator::<2, f32>::new([16..=17, 16..=17])
         .with_seed(seed)
         .with_distribution(Uniform::new(-3.0, 3.0).unwrap())
 }
@@ -98,7 +96,7 @@ async fn nary_nested_pairwise_fuzzed() {
 #[tokio::test]
 async fn nary_unary_in_middle_fuzzed() {
     // (-a + sin(b)).cos() + 1.0
-    let fuzz_b = FuzzGenerator::<2, f32>::new(SHAPE)
+    let fuzz_b = FuzzGenerator::<2, f32>::new([16..=17, 16..=17])
         .with_seed(31)
         .with_distribution(Uniform::new(-1.0, 1.0).unwrap());
 
@@ -126,7 +124,7 @@ async fn nary_unary_in_middle_fuzzed() {
 #[tokio::test]
 async fn nary_chain_then_pairwise_fuzzed() {
     // (a + 1).exp() + sin(b)
-    let fuzz_a = FuzzGenerator::<2, f32>::new(SHAPE)
+    let fuzz_a = FuzzGenerator::<2, f32>::new([16..=17, 16..=17])
         .with_seed(40)
         .with_distribution(Uniform::new(-2.0, 2.0).unwrap());
 
@@ -169,7 +167,7 @@ async fn nary_same_input_fuzzed() {
 
 #[tokio::test]
 async fn nary_where_cond_fuzzed() {
-    let fuzz_cond = FuzzGenerator::<2, f32>::new(SHAPE)
+    let fuzz_cond = FuzzGenerator::<2, f32>::new([16..=17, 16..=17])
         .with_seed(60)
         .with_distribution(Uniform::new(-1.0, 1.0).unwrap());
 
@@ -201,8 +199,7 @@ async fn nary_where_cond_fuzzed() {
 async fn fused_cached_results_fuzzed() {
     // (tensor * 2 + 1).sum(0) then branch into *2 and *3
     // Tests that caching/sharing of intermediate results works correctly.
-    const SHAPE_3D: [usize; 3] = [3, 4, 5];
-    let fuzz_3d = FuzzGenerator::<3, f32>::new(SHAPE_3D)
+    let fuzz_3d = FuzzGenerator::<3, f32>::new([3..=4, 16..=17, 16..=17])
         .with_seed(70)
         .with_distribution(Uniform::new(-2.0, 2.0).unwrap());
 
@@ -215,8 +212,8 @@ async fn fused_cached_results_fuzzed() {
     .arg(fuzz_3d.clone())
     .equal_to_resolved_with_device(async |v: Vec<Vec<Vec<f32>>>, device: Device| {
         // manual: (data*2+1).sum(axis=0) * 2
-        let rows = SHAPE_3D[1];
-        let cols = SHAPE_3D[2];
+        let rows = v[0].len();
+        let cols = v[0][0].len();
         let mut summed = vec![vec![0.0f32; cols]; rows];
         for slice in &v {
             for (r, row) in slice.iter().enumerate() {
@@ -241,8 +238,8 @@ async fn fused_cached_results_fuzzed() {
     })
     .arg(fuzz_3d)
     .equal_to_resolved_with_device(async |v: Vec<Vec<Vec<f32>>>, device: Device| {
-        let rows = SHAPE_3D[1];
-        let cols = SHAPE_3D[2];
+        let rows = v[0].len();
+        let cols = v[0][0].len();
         let mut summed = vec![vec![0.0f32; cols]; rows];
         for slice in &v {
             for (r, row) in slice.iter().enumerate() {

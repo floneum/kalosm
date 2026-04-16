@@ -2,7 +2,7 @@ mod common;
 
 use common::{conv1d_ncw, matmul2, pool1d_ncw};
 use fusor::{Device, Tensor};
-use fusor_conformance::{FuzzGenerator, approx_compare};
+use fusor_conformance::{approx_compare, FuzzGenerator};
 use rand::distr::Uniform;
 
 #[tokio::test]
@@ -55,8 +55,7 @@ async fn matmul_small_fixed_regression() {
 #[tokio::test]
 async fn conv_and_pool_match_host_reference() {
     // Conv1D with fuzzed input
-    const CONV_SHAPE: [usize; 3] = [1, 1, 7];
-    let gen_conv = FuzzGenerator::<3, f32>::new(CONV_SHAPE)
+    let gen_conv = FuzzGenerator::<3, f32>::new([1..=1, 1..=1, 255..=257])
         .with_seed(310)
         .with_distribution(Uniform::new(-3.0, 3.0).unwrap());
 
@@ -79,8 +78,7 @@ async fn conv_and_pool_match_host_reference() {
     .unwrap();
 
     // Pool: pool_max with fuzzed input
-    const POOL_SHAPE: [usize; 3] = [1, 2, 8];
-    let gen_pool = FuzzGenerator::<3, f32>::new(POOL_SHAPE)
+    let gen_pool = FuzzGenerator::<3, f32>::new([1..=1, 2..=2, 255..=257])
         .with_seed(320)
         .with_distribution(Uniform::new(-4.0, 12.0).unwrap());
 
