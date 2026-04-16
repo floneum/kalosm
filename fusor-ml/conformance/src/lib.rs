@@ -14,9 +14,9 @@ use std::{
 
 use fusor::{DataType, Device, FromArray, SimdElement, Tensor};
 use rand::{
+    RngCore, SeedableRng,
     distr::{Distribution, StandardUniform, Uniform},
     rngs::StdRng,
-    RngCore, SeedableRng,
 };
 use thiserror::Error;
 
@@ -724,9 +724,9 @@ impl<T, U, Generators, Compare> AssertBuilder<T, U, Generators, Compare> {
     pub fn equal_to_resolved_with_device(
         self,
         mut other: impl AsyncFnMutTuple<<T::Output as PushTuple<Device>>::Output, Output = U>
-            + Copy
-            + Send
-            + 'static,
+        + Copy
+        + Send
+        + 'static,
     ) -> Self
     where
         T: ResolveTensorTuple,
@@ -843,7 +843,7 @@ pub trait IntoCompare<U> {
         &'a U,
     )
         -> Pin<Box<dyn std::future::Future<Output = Result<(), Self::Error>> + 'a>>
-           + 'static;
+    + 'static;
 }
 
 impl<U, Cmp, E: Error> IntoCompare<U> for Cmp
@@ -860,7 +860,7 @@ where
         &'a U,
     )
         -> Pin<Box<dyn std::future::Future<Output = Result<(), Self::Error>> + 'a>>
-           + 'static {
+    + 'static {
         self
     }
 }
@@ -875,7 +875,7 @@ impl<const R: usize> IntoCompare<Tensor<R, u32>> for () {
         &'a Tensor<R, u32>,
     )
         -> Pin<Box<dyn std::future::Future<Output = Result<(), Self::Error>> + 'a>>
-           + 'static {
+    + 'static {
         |a, b| Box::pin(exact_eq(a, b))
     }
 }
@@ -890,7 +890,7 @@ impl<const R: usize> IntoCompare<Tensor<R, f32>> for () {
         &'a Tensor<R, f32>,
     )
         -> Pin<Box<dyn std::future::Future<Output = Result<(), Self::Error>> + 'a>>
-           + 'static {
+    + 'static {
         |a, b| Box::pin(approx_eq(a, b, 1e-5))
     }
 }
@@ -898,8 +898,9 @@ impl<const R: usize> IntoCompare<Tensor<R, f32>> for () {
 pub fn exact_compare<const R: usize, T>() -> impl for<'a> Fn(
     &'a Tensor<R, T>,
     &'a Tensor<R, T>,
-) -> Pin<Box<dyn std::future::Future<Output = Result<(), ItemMismatchError>> + 'a>>
-       + Clone
+) -> Pin<
+    Box<dyn std::future::Future<Output = Result<(), ItemMismatchError>> + 'a>,
+> + Clone
 where
     T: DataType + SimdElement + PartialEq,
 {
@@ -912,7 +913,7 @@ pub fn approx_compare<const R: usize, T>(
     &'a Tensor<R, T>,
     &'a Tensor<R, T>,
 ) -> Pin<Box<dyn std::future::Future<Output = Result<(), ItemMismatchError>> + 'a>>
-       + Clone
++ Clone
 where
     T: Sub<Output = T> + PartialOrd + DataType + SimdElement + Copy,
 {

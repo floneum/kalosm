@@ -2,7 +2,7 @@ mod common;
 
 use common::{layer_norm_last_dim_3d, rms_norm_last_dim_3d, softmax_last_dim_2d};
 use fusor::{Device, Tensor};
-use fusor_conformance::{approx_compare, FuzzGenerator};
+use fusor_conformance::{FuzzGenerator, approx_compare};
 use rand::distr::Uniform;
 
 fn norm_weight(feature_count: usize) -> Vec<f32> {

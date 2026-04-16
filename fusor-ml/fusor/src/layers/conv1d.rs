@@ -127,4 +127,3 @@ where
         self.kernel_size
     }
 }
-

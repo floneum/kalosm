@@ -195,4 +195,3 @@ impl Operation for QMatMulOperation {
         )
     }
 }
-

@@ -311,4 +311,3 @@ impl<const R: usize, T: DataType> Tensor<R, T> {
         self.add_mat_mul(other, Some(parameters))
     }
 }
-

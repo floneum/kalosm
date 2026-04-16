@@ -643,4 +643,3 @@ impl CastTensor<f32> for half::f16 {
         )
     }
 }
-

@@ -122,4 +122,3 @@ impl<D: NoUninit + AnyBitPattern + Copy, Bytes: Deref<Target = [u8]>> ToVec
         self.to_vec3()
     }
 }
-

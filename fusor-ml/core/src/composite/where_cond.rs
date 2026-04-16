@@ -29,4 +29,3 @@ impl<const R: usize, D: DataType> Tensor<R, D> {
         Tensor::from_parts(crate::tensor::LazyTensorData::from_parts(device, info, key))
     }
 }
-

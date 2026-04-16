@@ -509,6 +509,14 @@ fn f32_weight_bytes() -> Vec<u8> {
         .collect()
 }
 
+fn f16_weight_bytes() -> Vec<u8> {
+    let mut bytes = Vec::new();
+    for value in f32_weight_rows().into_iter().flatten() {
+        push_f16(&mut bytes, value);
+    }
+    bytes
+}
+
 #[tokio::test]
 async fn f32_q_matrix_q_mat_mul_matches_host_reference() {
     assert_q_mat_mul_matches_host_reference(
@@ -520,6 +528,21 @@ async fn f32_q_matrix_q_mat_mul_matches_host_reference() {
         820,
         Uniform::new(-0.5, 0.5).unwrap(),
         1e-6,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn f16_q_matrix_q_mat_mul_matches_host_reference() {
+    assert_q_mat_mul_matches_host_reference(
+        GgmlType::F16,
+        [2, 4],
+        f16_weight_bytes(),
+        f32_weight_rows(),
+        2,
+        821,
+        Uniform::new(-0.5, 0.5).unwrap(),
+        1e-3,
     )
     .await;
 }

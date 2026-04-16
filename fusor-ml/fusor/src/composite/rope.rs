@@ -260,4 +260,3 @@ impl RopeCache {
         &self.cos
     }
 }
-

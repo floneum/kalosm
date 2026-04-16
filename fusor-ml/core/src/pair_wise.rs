@@ -153,4 +153,3 @@ macro_rules! impl_pairwise_method {
 }
 
 impl_pairwise_method!(pow, "pow(a, b)", "pow", pow_, |a, b| a.pow(&b));
-

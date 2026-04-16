@@ -145,4 +145,3 @@ pub(crate) fn linear_to_indices<const R: usize>(
 
     indices
 }
-

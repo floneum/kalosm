@@ -131,4 +131,3 @@ where
         result_f32.cast()
     }
 }
-

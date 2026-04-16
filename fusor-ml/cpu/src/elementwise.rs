@@ -339,4 +339,3 @@ define_unary_tensor_op!(Cosh, CoshOp);
 define_unary_tensor_op!(Asinh, AsinhOp);
 define_unary_tensor_op!(Acosh, AcoshOp);
 define_unary_tensor_op!(Atanh, AtanhOp);
-

@@ -121,4 +121,3 @@ where
         self.pool(pools, Tensor::min)
     }
 }
-

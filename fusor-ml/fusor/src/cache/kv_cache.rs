@@ -66,4 +66,3 @@ where
         self.key.current_seq_len()
     }
 }
-

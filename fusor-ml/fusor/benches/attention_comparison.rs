@@ -176,14 +176,7 @@ fn bench_attention_comparison(c: &mut Criterion) {
 
         if let Some(device) = gpu_device.as_ref() {
             bench_backend(
-                &mut group,
-                "gpu",
-                device,
-                shape,
-                &size_str,
-                &q_data,
-                &k_data,
-                &v_data,
+                &mut group, "gpu", device, shape, &size_str, &q_data, &k_data, &v_data,
             );
         }
     }

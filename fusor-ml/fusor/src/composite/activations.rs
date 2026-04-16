@@ -77,4 +77,3 @@ where
         (product * D::from_f32(0.5)).to_concrete()
     }
 }
-

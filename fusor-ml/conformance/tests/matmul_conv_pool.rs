@@ -2,7 +2,7 @@ mod common;
 
 use common::{conv1d_ncw, matmul2, pool1d_ncw};
 use fusor::{Device, Tensor};
-use fusor_conformance::{approx_compare, FuzzGenerator};
+use fusor_conformance::{FuzzGenerator, approx_compare};
 use rand::distr::Uniform;
 
 #[tokio::test]

@@ -221,4 +221,3 @@ impl QMatrix {
         Tensor::from_parts(data)
     }
 }
-

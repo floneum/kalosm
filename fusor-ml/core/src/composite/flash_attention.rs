@@ -555,4 +555,3 @@ impl Operation for FlashAttentionOperation {
         input_layout.clone()
     }
 }
-

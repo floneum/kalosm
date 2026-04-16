@@ -1080,4 +1080,3 @@ pub(crate) fn padded_tensor_size(size: u64) -> u64 {
 
     ((size + align_mask) & !align_mask).max(COPY_BUFFER_ALIGNMENT)
 }
-

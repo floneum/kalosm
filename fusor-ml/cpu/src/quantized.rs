@@ -758,4 +758,3 @@ where
 
     <SumOp as SimdReduceOp<f32>>::reduce_simd_vec(simd, acc) + scalar_acc
 }
-

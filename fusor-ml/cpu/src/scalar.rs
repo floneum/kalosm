@@ -113,4 +113,3 @@ impl<E: SimdElement + Default, const R: usize> TensorBacking<R> for Broadcast<E,
         materialize_expr(self, self.shape)
     }
 }
-

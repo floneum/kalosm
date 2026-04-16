@@ -225,4 +225,3 @@ where
         self.gte_scalar(rhs)
     }
 }
-

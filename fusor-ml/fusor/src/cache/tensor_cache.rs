@@ -122,4 +122,3 @@ where
         self.current_seq_len
     }
 }
-

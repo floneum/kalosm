@@ -1,7 +1,7 @@
 use std::{fmt::Debug, sync::Arc};
 
 use crate::{
-     DataType, Layout, MaxRank, Tensor, TensorData, compute_graph::NodeIndex,
+    DataType, Layout, MaxRank, Tensor, TensorData, compute_graph::NodeIndex,
     mir::operation::Operation,
 };
 
@@ -176,4 +176,3 @@ impl<const R: usize, T: DataType> Tensor<R, T> {
         op(b1, b2)
     }
 }
-

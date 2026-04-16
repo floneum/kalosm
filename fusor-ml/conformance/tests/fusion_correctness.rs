@@ -2,7 +2,7 @@ mod common;
 
 use common::{binary_map2, unary_map2, where_cond2};
 use fusor::{Device, Tensor};
-use fusor_conformance::{approx_compare, FuzzGenerator};
+use fusor_conformance::{FuzzGenerator, approx_compare};
 use rand::distr::Uniform;
 
 fn fuzz(seed: u64) -> FuzzGenerator<2, f32> {

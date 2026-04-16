@@ -424,4 +424,3 @@ impl_shape_with_one_hole!(A, B, C, D, E, F, G);
 impl_shape_with_one_hole!(A, B, C, D, E, F, G, H);
 impl_shape_with_one_hole!(A, B, C, D, E, F, G, H, I);
 impl_shape_with_one_hole!(A, B, C, D, E, F, G, H, I, J);
-

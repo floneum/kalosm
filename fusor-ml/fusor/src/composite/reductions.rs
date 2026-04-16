@@ -202,4 +202,3 @@ where
         (&mean_x2 - &mean_x_sq).to_concrete()
     }
 }
-

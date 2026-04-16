@@ -2051,4 +2051,3 @@ fn write_q6_k_dequant<W: Write>(
     process_element("scaled".to_string(), code);
     Ok(())
 }
-

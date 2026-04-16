@@ -492,4 +492,3 @@ impl Operation for SoftmaxOperation {
         input_layout.clone()
     }
 }
-

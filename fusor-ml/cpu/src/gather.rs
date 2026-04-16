@@ -184,4 +184,3 @@ where
     let (simd_vec, _) = T::as_simd::<S>(&temp[..lane_count]);
     simd_vec[0]
 }
-

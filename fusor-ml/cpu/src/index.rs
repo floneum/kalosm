@@ -73,4 +73,3 @@ where
 
     ConcreteTensor::from_parts(layout, vec.into_boxed_slice())
 }
-

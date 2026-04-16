@@ -102,4 +102,3 @@ where
         .expect("Shape length mismatch");
     ConcreteTensor::from_fn(shape, |i| input.eval_scalar(i).cast())
 }
-

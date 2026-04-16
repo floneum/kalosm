@@ -115,4 +115,3 @@ where
         AttentionMask::new(mask)
     }
 }
-

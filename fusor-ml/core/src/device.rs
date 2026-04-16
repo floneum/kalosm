@@ -554,4 +554,3 @@ fn prune_cached_buffers(buffers: &mut Vec<CachedBuffer>) {
         }
     });
 }
-

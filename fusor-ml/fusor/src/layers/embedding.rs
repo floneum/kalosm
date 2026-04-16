@@ -155,4 +155,3 @@ impl Embedding<f32> {
             .expect("No quantized embeddings available")
     }
 }
-
