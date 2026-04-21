@@ -264,6 +264,12 @@ where
     /// # Arguments
     /// * `repeats` - Number of times to repeat along each dimension
     pub fn repeat(&self, repeats: [usize; R]) -> Tensor<R, D> {
+        if repeats.iter().any(|&repeat| repeat == 0) {
+            let input_shape = self.shape();
+            let output_shape = std::array::from_fn(|i| input_shape[i] * repeats[i]);
+            return Tensor::zeros(&self.device(), output_shape);
+        }
+
         // Concatenate copies along each dimension
         let mut result: Tensor<R, D> = self.to_concrete();
         for dim in 0..R {

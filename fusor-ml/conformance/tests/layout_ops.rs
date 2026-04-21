@@ -129,6 +129,16 @@ async fn shape_and_layout_ops_match_host_reference() {
         .await
         .unwrap();
 
+    fusor_conformance::assert(async |x: Tensor<2, f32>| x.repeat([0, 3]))
+        .arg(gen_2x2)
+        .equal_to_resolved_with_device(async |_v: Vec<Vec<f32>>, device: Device| {
+            Tensor::<2, f32>::zeros(&device, [0, 6])
+        })
+        .compare_with(approx_compare::<2, f32>(0.0))
+        .runs(1)
+        .await
+        .unwrap();
+
     // unsqueeze
     fusor_conformance::assert(async |x: Tensor<2, f32>| x.unsqueeze::<3>(1).to_concrete())
         .arg(gen_2x3.clone())

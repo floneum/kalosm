@@ -20,11 +20,26 @@ use rand::{
 };
 use thiserror::Error;
 
+fn require_gpu() -> bool {
+    std::env::var("FUSOR_CONFORMANCE_REQUIRE_GPU")
+        .map(|value| {
+            let value = value.trim();
+            !value.is_empty() && value != "0" && !value.eq_ignore_ascii_case("false")
+        })
+        .unwrap_or(false)
+}
+
 /// Return all available devices: always CPU, plus GPU if available.
 pub async fn available_devices() -> Vec<Device> {
     let mut devs = vec![Device::Cpu];
-    if let Ok(gpu) = Device::gpu().await {
-        devs.push(gpu);
+    match Device::gpu().await {
+        Ok(gpu) => devs.push(gpu),
+        Err(err) => {
+            assert!(
+                !require_gpu(),
+                "GPU conformance is required but no GPU device was available: {err}"
+            );
+        }
     }
     devs
 }
