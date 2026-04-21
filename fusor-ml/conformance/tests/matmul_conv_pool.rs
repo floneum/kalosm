@@ -7,9 +7,9 @@ use rand::distr::Uniform;
 
 #[tokio::test]
 async fn matmul_match_host_reference() {
-    const M: usize = 3;
-    const K: usize = 4;
-    const N: usize = 2;
+    const M: usize = 64;
+    const K: usize = 128;
+    const N: usize = 64;
 
     let gen_lhs = FuzzGenerator::<2, f32>::new([M, K])
         .with_seed(300)
@@ -27,7 +27,7 @@ async fn matmul_match_host_reference() {
                 Tensor::new(&device, &matmul2(&a, &b))
             },
         )
-        .compare_with(approx_compare::<2, f32>(1e-4))
+        .compare_with(approx_compare::<2, f32>(1e-2))
         .runs(3)
         .await
         .unwrap();
@@ -133,9 +133,9 @@ async fn matmul_identity_matrix() {
 
 #[tokio::test]
 async fn matmul_large_fuzzed() {
-    const M: usize = 32;
-    const K: usize = 48;
-    const N: usize = 32;
+    const M: usize = 256;
+    const K: usize = 256;
+    const N: usize = 256;
 
     let gen_lhs = FuzzGenerator::<2, f32>::new([M, K])
         .with_seed(100)

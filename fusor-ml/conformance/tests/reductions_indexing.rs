@@ -8,7 +8,7 @@ use rand::distr::Uniform;
 
 #[tokio::test]
 async fn reductions_match_host_reference() {
-    const SHAPE: [usize; 2] = [3, 4];
+    const SHAPE: [usize; 2] = [45, 45];
     let fuzz = FuzzGenerator::<2, f32>::new(SHAPE)
         .with_seed(200)
         .with_distribution(Uniform::new(-5.0, 5.0).unwrap());
@@ -175,7 +175,7 @@ async fn reductions_match_host_reference() {
 #[tokio::test]
 async fn indexing_cast_and_rank_specific_indexing_match_reference() {
     // index_select, slice_assign, and cast use fuzzed data
-    const SHAPE: [usize; 2] = [4, 4];
+    const SHAPE: [usize; 2] = [45, 45];
     let fuzz = FuzzGenerator::<2, f32>::new(SHAPE)
         .with_seed(210)
         .with_distribution(Uniform::new(-5.0, 5.0).unwrap());
@@ -237,7 +237,7 @@ async fn indexing_cast_and_rank_specific_indexing_match_reference() {
 #[tokio::test]
 async fn full_tensor_reductions_fuzzed() {
     // 2D reductions with fuzzed data + non-contiguous layouts
-    const SHAPE: [usize; 2] = [8, 16];
+    const SHAPE: [usize; 2] = [45, 45];
     let fuzz = FuzzGenerator::<2, f32>::new(SHAPE)
         .with_seed(42)
         .with_distribution(Uniform::new(-5.0, 5.0).unwrap());
@@ -358,7 +358,7 @@ async fn index_select_fuzzed() {
     static DUP_INDICES: &[u32] = &[0, 0, 2, 2, 1, 1];
 
     // 1D index_select with fuzzed data, dim=0
-    const SHAPE_1D: [usize; 1] = [32];
+    const SHAPE_1D: [usize; 1] = [2048];
     let gen_1d = FuzzGenerator::<1, f32>::new(SHAPE_1D).with_seed(50);
 
     fusor_conformance::assert(async |x: Tensor<1, f32>| {
@@ -376,7 +376,7 @@ async fn index_select_fuzzed() {
     .unwrap();
 
     // 2D index_select dim=0 with fuzzed data
-    const SHAPE_2D: [usize; 2] = [8, 6];
+    const SHAPE_2D: [usize; 2] = [45, 45];
     let gen_2d = FuzzGenerator::<2, f32>::new(SHAPE_2D).with_seed(51);
 
     fusor_conformance::assert(async |x: Tensor<2, f32>| {

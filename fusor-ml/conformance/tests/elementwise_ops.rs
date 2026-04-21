@@ -5,7 +5,7 @@ use fusor::{Device, Tensor};
 use fusor_conformance::{FuzzGenerator, approx_compare};
 use rand::distr::Uniform;
 
-const SHAPE: [usize; 2] = [4, 5];
+const SHAPE: [usize; 2] = [45, 45];
 
 fn signed() -> FuzzGenerator<2, f32> {
     FuzzGenerator::<2, f32>::new(SHAPE)
@@ -691,7 +691,7 @@ async fn same_shape_binary_ops_match_host_reference() {
 
 #[tokio::test]
 async fn large_tensor_binary_and_conditional_regressions() {
-    const LARGE_SHAPE_1D: [usize; 1] = [1024];
+    const LARGE_SHAPE_1D: [usize; 1] = [2048];
 
     let gen_binary_a = FuzzGenerator::<1, f32>::new(LARGE_SHAPE_1D)
         .with_seed(140)
@@ -800,7 +800,7 @@ async fn large_tensor_binary_and_conditional_regressions() {
 
 #[tokio::test]
 async fn where_cond_fuzzed() {
-    const SHAPE_1D: [usize; 1] = [32];
+    const SHAPE_1D: [usize; 1] = [2048];
     // Condition: values in -1..1 so we get a mix of positive and non-positive
     let gen_cond = FuzzGenerator::<1, f32>::new(SHAPE_1D)
         .with_seed(10)
@@ -835,7 +835,7 @@ async fn where_cond_fuzzed() {
 
 #[tokio::test]
 async fn large_tensor_unary_ops_fuzzed() {
-    const LARGE_SHAPE: [usize; 2] = [32, 32];
+    const LARGE_SHAPE: [usize; 2] = [45, 45];
 
     // sin
     fusor_conformance::assert(async |x: Tensor<2, f32>| x.sin().to_concrete())

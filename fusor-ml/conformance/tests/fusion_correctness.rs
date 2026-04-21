@@ -6,7 +6,7 @@ use fusor_conformance::{FuzzGenerator, approx_compare};
 use rand::distr::Uniform;
 
 fn fuzz(seed: u64) -> FuzzGenerator<2, f32> {
-    FuzzGenerator::<2, f32>::new([16..=17, 16..=17])
+    FuzzGenerator::<2, f32>::new([16..=45, 16..=45])
         .with_seed(seed)
         .with_distribution(Uniform::new(-3.0, 3.0).unwrap())
 }
@@ -96,7 +96,7 @@ async fn nary_nested_pairwise_fuzzed() {
 #[tokio::test]
 async fn nary_unary_in_middle_fuzzed() {
     // (-a + sin(b)).cos() + 1.0
-    let fuzz_b = FuzzGenerator::<2, f32>::new([16..=17, 16..=17])
+    let fuzz_b = FuzzGenerator::<2, f32>::new([16..=45, 16..=45])
         .with_seed(31)
         .with_distribution(Uniform::new(-1.0, 1.0).unwrap());
 
@@ -124,7 +124,7 @@ async fn nary_unary_in_middle_fuzzed() {
 #[tokio::test]
 async fn nary_chain_then_pairwise_fuzzed() {
     // (a + 1).exp() + sin(b)
-    let fuzz_a = FuzzGenerator::<2, f32>::new([16..=17, 16..=17])
+    let fuzz_a = FuzzGenerator::<2, f32>::new([16..=45, 16..=45])
         .with_seed(40)
         .with_distribution(Uniform::new(-2.0, 2.0).unwrap());
 
@@ -167,7 +167,7 @@ async fn nary_same_input_fuzzed() {
 
 #[tokio::test]
 async fn nary_where_cond_fuzzed() {
-    let fuzz_cond = FuzzGenerator::<2, f32>::new([16..=17, 16..=17])
+    let fuzz_cond = FuzzGenerator::<2, f32>::new([16..=45, 16..=45])
         .with_seed(60)
         .with_distribution(Uniform::new(-1.0, 1.0).unwrap());
 
@@ -199,7 +199,7 @@ async fn nary_where_cond_fuzzed() {
 async fn fused_cached_results_fuzzed() {
     // (tensor * 2 + 1).sum(0) then branch into *2 and *3
     // Tests that caching/sharing of intermediate results works correctly.
-    let fuzz_3d = FuzzGenerator::<3, f32>::new([3..=4, 16..=17, 16..=17])
+    let fuzz_3d = FuzzGenerator::<3, f32>::new([3..=4, 16..=22, 16..=22])
         .with_seed(70)
         .with_distribution(Uniform::new(-2.0, 2.0).unwrap());
 
@@ -261,7 +261,7 @@ async fn fused_cached_results_fuzzed() {
 async fn inplace_clone_immutability_fuzzed() {
     // Verify that tensor + 1.0 gives correct values and cloning preserves immutability.
     // Running the same operation twice on a cloned tensor should give the same result.
-    const SHAPE_3D: [usize; 3] = [3, 2, 4];
+    const SHAPE_3D: [usize; 3] = [4, 16, 32];
     let fuzz_3d = FuzzGenerator::<3, f32>::new(SHAPE_3D)
         .with_seed(80)
         .with_distribution(Uniform::new(-5.0, 5.0).unwrap());

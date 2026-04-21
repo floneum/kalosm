@@ -20,7 +20,7 @@ fn norm_bias(feature_count: usize) -> Vec<f32> {
 #[tokio::test]
 async fn softmax_and_normalization_match_reference_paths() {
     // Softmax with fuzzed input
-    let gen_softmax = FuzzGenerator::<2, f32>::new([16..=17, 16..=17])
+    let gen_softmax = FuzzGenerator::<2, f32>::new([16..=45, 16..=45])
         .with_seed(400)
         .with_distribution(Uniform::new(-4.0, 4.0).unwrap());
 
