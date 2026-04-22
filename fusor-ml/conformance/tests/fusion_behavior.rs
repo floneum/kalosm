@@ -162,3 +162,45 @@ async fn gpu_nary_fusion_respects_binding_limit() {
         .await
         .unwrap();
 }
+
+#[tokio::test]
+async fn gpu_gelu_lowers_to_one_kernel() {
+    let Some(device) = gpu_device().await else {
+        return;
+    };
+
+    for shape in [[2, 2], [3, 5], [4, 3]] {
+        let data = matrix_data(shape, -0.4);
+        let tensor = Tensor::from_slice(&device, shape, &data);
+        let result = tensor.gelu();
+        assert_eq!(result.as_gpu().unwrap().count_kernels_to_resolve(), 1);
+
+        let cpu = Tensor::from_slice(&Device::Cpu, shape, &data);
+        let expected = cpu.gelu().to_concrete();
+        approx_eq(&result.to_concrete(), &expected, 1e-3)
+            .await
+            .unwrap();
+    }
+}
+
+#[tokio::test]
+async fn gpu_reduce_then_gelu_uses_two_kernels() {
+    let Some(device) = gpu_device().await else {
+        return;
+    };
+
+    for shape in [[2, 4], [3, 6], [4, 5]] {
+        let data = matrix_data(shape, 0.2);
+        let tensor = Tensor::from_slice(&device, shape, &data);
+        let reduced = tensor.sum_keepdim::<1>(0);
+        let result = reduced.gelu();
+        // Resize between Reduce and Gelu prevents fusion of the two kernels.
+        assert_eq!(result.as_gpu().unwrap().count_kernels_to_resolve(), 2);
+
+        let cpu = Tensor::from_slice(&Device::Cpu, shape, &data);
+        let expected = cpu.sum_keepdim::<1>(0).gelu().to_concrete();
+        approx_eq(&result.to_concrete(), &expected, 1e-3)
+            .await
+            .unwrap();
+    }
+}

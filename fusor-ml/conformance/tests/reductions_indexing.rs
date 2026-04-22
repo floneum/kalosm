@@ -2,7 +2,7 @@ mod common;
 
 use common::{index_select1, index_select2, keepdim2, mean_axis2, reduce_axis2, var_axis2};
 use fusor::{Device, Tensor, arange};
-use fusor_conformance::{FuzzGenerator, approx_compare};
+use fusor_conformance::{FuzzGenerator, approx_compare, relative_compare};
 use half::f16;
 use rand::distr::Uniform;
 
@@ -63,7 +63,11 @@ async fn reductions_match_host_reference() {
         .equal_to_resolved_with_device(async |v: Vec<Vec<f32>>, device: Device| {
             Tensor::from_slice(&device, [SHAPE[0]], &reduce_axis2(&v, 1, 1.0, |a, b| a * b))
         })
-        .compare_with(approx_compare::<1, f32>(1e-3))
+        // Product of 45 values in [0.5, 2.0] grows to ~1e5 in some seeds;
+        // an absolute 1e-3 tolerance becomes meaningless. 0.01% relative
+        // catches accuracy regressions while accommodating GPU-vs-host
+        // accumulation order.
+        .compare_with(relative_compare::<1>(1e-4))
         .runs(3)
         .await
         .unwrap();
@@ -122,7 +126,7 @@ async fn reductions_match_host_reference() {
                 &keepdim2(&reduce_axis2(&v, 1, 1.0, |a, b| a * b), 1),
             )
         })
-        .compare_with(approx_compare::<2, f32>(1e-3))
+        .compare_with(relative_compare::<2>(1e-4))
         .runs(3)
         .await
         .unwrap();

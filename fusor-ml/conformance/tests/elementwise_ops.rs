@@ -911,3 +911,36 @@ async fn large_tensor_unary_ops_fuzzed() {
         .await
         .unwrap();
 }
+
+#[tokio::test]
+async fn tanh_exact_saturation_at_large_magnitudes() {
+    // The default fuzz distribution rarely produces |x| > 4, but `tanh_exact`
+    // must remain accurate when the input saturates the function. This pins
+    // the saturation regression that the per-op test
+    // `core/src/element_wise.rs::test_tanh_exact_large_values` used to cover.
+    const SHAPE: [usize; 2] = [3, 2];
+    let positive: Vec<Vec<f32>> = (0..SHAPE[0])
+        .map(|row| {
+            (0..SHAPE[1])
+                .map(|col| 4.0 + (row * SHAPE[1] + col) as f32 * 1.5)
+                .collect()
+        })
+        .collect();
+    let negative: Vec<Vec<f32>> = positive
+        .iter()
+        .map(|row| row.iter().map(|x| -x).collect())
+        .collect();
+
+    for samples in [&positive, &negative] {
+        let flat: Vec<f32> = samples.iter().flatten().copied().collect();
+        let expected: Vec<f32> = flat.iter().map(|x| x.tanh()).collect();
+        for device in fusor_conformance::available_devices().await {
+            let input = Tensor::from_slice(&device, SHAPE, &flat);
+            let actual = input.tanh_exact().to_concrete();
+            let expected_tensor = Tensor::from_slice(&device, SHAPE, &expected);
+            fusor_conformance::approx_eq(&actual, &expected_tensor, 1e-6)
+                .await
+                .unwrap();
+        }
+    }
+}

@@ -238,6 +238,53 @@ async fn flash_attention_gqa_matches_cpu_reference_on_varied_shapes() {
 }
 
 #[tokio::test]
+async fn flash_attention_with_kv_cache_matches_cpu_reference_on_varied_shapes() {
+    // KV-cache regression: short Q sequence with a longer K/V sequence — the
+    // typical autoregressive decode shape after appending to a KvCache.
+    // Replaces the deleted `core/src/composite/flash_attention.rs::test_flash_attention_kv_cache_fuzz`.
+    for case in [
+        FlashCase {
+            batch: 1,
+            num_heads: 1,
+            num_kv_heads: 1,
+            q_seq_len: 1,
+            kv_seq_len: 5,
+            head_dim: 4,
+        },
+        FlashCase {
+            batch: 2,
+            num_heads: 4,
+            num_kv_heads: 4,
+            q_seq_len: 1,
+            kv_seq_len: 16,
+            head_dim: 8,
+        },
+        FlashCase {
+            batch: 2,
+            num_heads: 8,
+            num_kv_heads: 8,
+            q_seq_len: 2,
+            kv_seq_len: 17,
+            head_dim: 16,
+        },
+        FlashCase {
+            batch: 1,
+            num_heads: 6,
+            num_kv_heads: 2,
+            q_seq_len: 3,
+            kv_seq_len: 32,
+            head_dim: 12,
+        },
+    ] {
+        // No-op mask exercises the KV-cache path through the QKMask code with
+        // an all-zero mask, mirroring the pre-migration test.
+        let mask = vec![0.0f32; case.q_seq_len * case.kv_seq_len];
+        let shape = [case.q_seq_len, case.kv_seq_len];
+        assert_flash_attention_case(case, Some((mask, MaskKind::QKMask, shape)), 1e-3).await;
+    }
+}
+
+#[tokio::test]
 async fn flash_attention_with_batch_key_mask_matches_cpu_reference_on_varied_shapes() {
     for case in [
         FlashCase {

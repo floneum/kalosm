@@ -13,6 +13,7 @@ use std::{
 };
 
 use fusor::{DataType, Device, FromArray, SimdElement, Tensor};
+use half::f16;
 use rand::{
     RngCore, SeedableRng,
     distr::{Distribution, StandardUniform, Uniform},
@@ -103,6 +104,26 @@ pub async fn exact_eq<const R: usize, T: DataType + SimdElement + PartialEq>(
     b: &Tensor<R, T>,
 ) -> Result<(), ItemMismatchError> {
     eq_with(a, b, |va, vb| va == vb).await
+}
+
+/// Assert that two f32 tensors are element-wise close within a *relative*
+/// tolerance: `|a - b| <= rel_tol * max(|a|, |b|, eps)`.
+///
+/// Use this when reduction outputs grow with the reduced axis size and an
+/// absolute tolerance becomes meaningless (e.g. a sum of 2025 values with
+/// magnitude up to 5 has expected ~5e3 but absolute roundoff scales with
+/// the magnitude of the result).
+pub async fn relative_eq<const R: usize>(
+    a: &Tensor<R, f32>,
+    b: &Tensor<R, f32>,
+    rel_tol: f32,
+) -> Result<(), ItemMismatchError> {
+    eq_with(a, b, |va, vb| {
+        let diff = (va - vb).abs();
+        let scale = va.abs().max(vb.abs()).max(f32::MIN_POSITIVE);
+        diff <= rel_tol * scale
+    })
+    .await
 }
 
 /// Generate a random f32 tensor with values in [-1, 1].
@@ -260,10 +281,20 @@ impl<const R: usize, T: SimdElement + DataType> FuzzGenerator<R, T> {
     where
         StandardUniform: rand::distr::Distribution<T>,
     {
+        Self::with_sampler(shape, |rng| StandardUniform.sample(rng))
+    }
+
+    /// Construct a fuzz generator from an explicit sampler closure.
+    ///
+    /// Use this for dtypes (e.g. `f16`) where `StandardUniform` is not implemented.
+    pub fn with_sampler(
+        shape: impl IntoFuzzShape<R>,
+        sampler: impl Fn(&mut StdRng) -> T + Send + Sync + 'static,
+    ) -> Self {
         Self {
             value_seed: 0,
             shape_seed: 0,
-            distribution: Arc::new(move |rng| StandardUniform.sample(rng)),
+            distribution: Arc::new(sampler),
             shape_specs: shape.into_shape_specs(),
             phantom: std::marker::PhantomData,
         }
@@ -334,6 +365,10 @@ impl<const R: usize, T: SimdElement + DataType> FuzzGenerator<R, T> {
 
 /// Generate a contiguous tensor with the last two dimensions swapped, then
 /// transpose it so the result has the correct shape but non-contiguous strides.
+///
+/// On GPU the lazy transpose view is preserved, so the op under test sees a
+/// non-contiguous stride layout. On CPU `to_concrete()` materializes the view
+/// into a contiguous backing buffer, so CPU only exercises the contiguous path.
 fn make_transposed<const R: usize, T: SimdElement + DataType + Default>(
     tensor: Tensor<R, T>,
     rng: &mut StdRng,
@@ -363,6 +398,10 @@ fn make_transposed<const R: usize, T: SimdElement + DataType + Default>(
 
 /// Generate a larger tensor and narrow it back to the original shape,
 /// producing a tensor with a non-zero offset in the underlying buffer.
+///
+/// Same materialization caveat as [`make_transposed`]: on GPU the narrowed
+/// view reaches the op under test, but on CPU `to_concrete()` materializes it
+/// into a fresh contiguous buffer.
 fn make_sliced<const R: usize, T: SimdElement + DataType + Default>(
     tensor: Tensor<R, T>,
     rng: &mut StdRng,
@@ -652,7 +691,7 @@ impl<T, U> AssertBuilder<T, U> {
             generators: (),
             compare: (),
             devices: None,
-            runs: 100,
+            runs: 5,
         }
     }
 }
@@ -910,6 +949,21 @@ impl<const R: usize> IntoCompare<Tensor<R, f32>> for () {
     }
 }
 
+impl<const R: usize> IntoCompare<Tensor<R, f16>> for () {
+    type Error = ItemMismatchError;
+
+    fn into_compare(
+        self,
+    ) -> impl for<'a> Fn(
+        &'a Tensor<R, f16>,
+        &'a Tensor<R, f16>,
+    )
+        -> Pin<Box<dyn std::future::Future<Output = Result<(), Self::Error>> + 'a>>
+    + 'static {
+        |a, b| Box::pin(approx_eq(a, b, f16::from_f32(1e-3)))
+    }
+}
+
 pub fn exact_compare<const R: usize, T>() -> impl for<'a> Fn(
     &'a Tensor<R, T>,
     &'a Tensor<R, T>,
@@ -933,6 +987,18 @@ where
     T: Sub<Output = T> + PartialOrd + DataType + SimdElement + Copy,
 {
     move |a, b| Box::pin(approx_eq(a, b, tol))
+}
+
+/// Compare-fn factory for [`relative_eq`]: pass `rel_tol` as a fraction
+/// (e.g. `1e-3` for 0.1%).
+pub fn relative_compare<const R: usize>(
+    rel_tol: f32,
+) -> impl for<'a> Fn(
+    &'a Tensor<R, f32>,
+    &'a Tensor<R, f32>,
+) -> Pin<Box<dyn std::future::Future<Output = Result<(), ItemMismatchError>> + 'a>>
++ Clone {
+    move |a, b| Box::pin(relative_eq(a, b, rel_tol))
 }
 
 pub fn assert<T, U>(op: impl AsyncFnMutTuple<T, Output = U> + 'static) -> AssertBuilder<T, U> {

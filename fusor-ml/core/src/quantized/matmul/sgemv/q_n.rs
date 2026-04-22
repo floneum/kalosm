@@ -236,21 +236,13 @@ pub(crate) fn q_n_sgemv(
 }
 
 fn block_dot(kernel: &mut GenericKernel, op: &QMatMulOperation, input_b: &QMatrixInput) {
+    // q_n_sgemv is only dispatched for Q4_0 and Q5_0 (see
+    // sgemv/mod.rs). Everything else routes elsewhere; if a new caller
+    // routes another GgmlType here, this is the place that needs an impl.
     match op.matrix.datatype {
-        fusor_gguf::GgmlType::F32 => todo!(),
-        fusor_gguf::GgmlType::F16 => todo!(),
         fusor_gguf::GgmlType::Q4_0 => block_dot_q4_0(kernel, input_b),
-        fusor_gguf::GgmlType::Q4_1 => todo!(),
         fusor_gguf::GgmlType::Q5_0 => block_dot_q5_0(kernel, op, input_b),
-        fusor_gguf::GgmlType::Q5_1 => todo!(),
-        fusor_gguf::GgmlType::Q8_0 => todo!(),
-        fusor_gguf::GgmlType::Q8_1 => todo!(),
-        fusor_gguf::GgmlType::Q2K => todo!(),
-        fusor_gguf::GgmlType::Q3K => todo!(),
-        fusor_gguf::GgmlType::Q4K => todo!(),
-        fusor_gguf::GgmlType::Q5K => todo!(),
-        fusor_gguf::GgmlType::Q6K => todo!(),
-        fusor_gguf::GgmlType::Q8K => todo!(),
+        other => unreachable!("q_n_sgemv block_dot does not handle {other:?}"),
     }
 }
 

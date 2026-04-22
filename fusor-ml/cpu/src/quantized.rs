@@ -535,40 +535,6 @@ where
     }
 }
 
-/// Process a range of output columns for m=1 parallelization using integer dot products.
-/// Uses NEON intrinsics on aarch64 for efficient i8 x i8 -> i32 computation.
-#[allow(dead_code)]
-#[inline(always)]
-fn process_row_integer_range<B: GgufBlock>(
-    lhs_row: &[f32],
-    rhs_blocks: &[B],
-    out_chunk: &mut [f32],
-    start_n: usize,
-    chunk_n: usize,
-    blocks_per_weight_row: usize,
-) where
-    B::ActivationBlock: Pod,
-{
-    // Quantize activations once for all output columns
-    let act_blocks: Vec<B::ActivationBlock> = (0..blocks_per_weight_row)
-        .map(|block_idx| {
-            let start = block_idx * B::BLOCK_SIZE;
-            let chunk = &lhs_row[start..start + B::BLOCK_SIZE];
-            B::quantize_activation(chunk)
-        })
-        .collect();
-
-    for (i, out_elem) in out_chunk.iter_mut().enumerate().take(chunk_n) {
-        let n_out = start_n + i;
-        let mut sum = 0.0f32;
-        for (block_idx, act_block) in act_blocks.iter().enumerate() {
-            let weight_block_idx = n_out * blocks_per_weight_row + block_idx;
-            sum += rhs_blocks[weight_block_idx].vec_dot(act_block);
-        }
-        *out_elem = sum;
-    }
-}
-
 /// Process a range of output columns for m=1 parallelization
 #[inline(always)]
 fn process_row_simd_range<B: GgufBlock, S: Simd>(
@@ -586,59 +552,6 @@ fn process_row_simd_range<B: GgufBlock, S: Simd>(
         let n_out = start_n + i;
         *out_elem =
             compute_dot_product::<B, S>(simd, lhs_row, rhs_blocks, n_out, blocks_per_weight_row);
-    }
-}
-
-/// Process a single output row using integer dot products with 4-way tiling.
-/// Uses NEON intrinsics on aarch64 for efficient i8 x i8 -> i32 computation.
-#[allow(dead_code)]
-#[inline(always)]
-fn process_row_integer_tiled<B: GgufBlock>(
-    lhs_row: &[f32],
-    rhs_blocks: &[B],
-    out_row: &mut [f32],
-    n: usize,
-    blocks_per_weight_row: usize,
-) where
-    B::ActivationBlock: Pod,
-{
-    // Step 1: Quantize activations to Q8 blocks (once per row)
-    let mut act_blocks: Vec<B::ActivationBlock> = Vec::with_capacity(blocks_per_weight_row);
-    for block_idx in 0..blocks_per_weight_row {
-        let start = block_idx * B::BLOCK_SIZE;
-        let chunk = &lhs_row[start..start + B::BLOCK_SIZE];
-        act_blocks.push(B::quantize_activation(chunk));
-    }
-
-    // Step 2: 4-way tiled output loop using integer dot products
-    const TILE: usize = 4;
-    let n_tiles = n / TILE;
-
-    for tile in 0..n_tiles {
-        let base = tile * TILE;
-        let mut acc = [0.0f32; TILE];
-
-        for block_idx in 0..blocks_per_weight_row {
-            let act = &act_blocks[block_idx];
-
-            // Compute 4 dot products
-            acc[0] += rhs_blocks[base * blocks_per_weight_row + block_idx].vec_dot(act);
-            acc[1] += rhs_blocks[(base + 1) * blocks_per_weight_row + block_idx].vec_dot(act);
-            acc[2] += rhs_blocks[(base + 2) * blocks_per_weight_row + block_idx].vec_dot(act);
-            acc[3] += rhs_blocks[(base + 3) * blocks_per_weight_row + block_idx].vec_dot(act);
-        }
-
-        out_row[base..base + TILE].copy_from_slice(&acc);
-    }
-
-    // Handle remainder
-    for j in (n_tiles * TILE)..n {
-        let mut sum = 0.0f32;
-        for block_idx in 0..blocks_per_weight_row {
-            sum +=
-                rhs_blocks[j * blocks_per_weight_row + block_idx].vec_dot(&act_blocks[block_idx]);
-        }
-        out_row[j] = sum;
     }
 }
 
