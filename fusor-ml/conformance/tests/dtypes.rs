@@ -7,7 +7,7 @@
 //! `f64`/`i32`/`i64`/`u8` are not part of the unified `fusor::Tensor` enum
 //! and are out of scope here.
 
-use fusor::Tensor;
+use fusor::{Device, Tensor};
 use fusor_conformance::{approx_eq, available_devices, exact_eq};
 use half::f16;
 
@@ -17,6 +17,23 @@ fn f16s(values: &[f32]) -> Vec<f16> {
 
 async fn assert_approx_f16<const R: usize>(a: &Tensor<R, f16>, b: &Tensor<R, f16>, tol: f16) {
     fusor_conformance::approx_eq(a, b, tol).await.unwrap();
+}
+
+/// Devices on which f16 shader ops are runnable.
+///
+/// `available_devices()` returns CPU + every GPU adapter, but not every GPU
+/// adapter exposes `wgpu::Features::SHADER_F16` (lavapipe in Linux CI does
+/// not). Filter those out so the f16 tests stay green on CPU + capable GPUs
+/// without claiming coverage we don't have on non-capable GPUs.
+async fn f16_capable_devices() -> Vec<Device> {
+    available_devices()
+        .await
+        .into_iter()
+        .filter(|d| match d {
+            Device::Cpu => true,
+            Device::Gpu(gpu) => gpu.f16_supported(),
+        })
+        .collect()
 }
 
 // ---- u32 ----
@@ -41,7 +58,7 @@ async fn u32_pairwise_add_matches_host_reference() {
 #[tokio::test]
 async fn f32_to_f16_round_trip_preserves_value() {
     let values = [0.0f32, 0.5, 1.25, -2.5, 3.75];
-    for device in available_devices().await {
+    for device in f16_capable_devices().await {
         let input: Tensor<1, f32> = Tensor::from_slice(&device, [5], &values);
         let round_tripped = input.cast::<f16>().cast::<f32>().to_concrete();
         let expected_values: Vec<f32> = values.iter().map(|x| f16::from_f32(*x).to_f32()).collect();
@@ -57,7 +74,7 @@ async fn f16_unary_ops_match_host_reference() {
     let inputs = [0.5f32, 1.0, 1.5, 2.0, -0.5, -1.0];
     let pos_inputs: Vec<f32> = inputs.iter().map(|x| x.abs() + 0.5).collect();
 
-    for device in available_devices().await {
+    for device in f16_capable_devices().await {
         let input: Tensor<1, f16> = Tensor::from_slice(&device, [6], &f16s(&inputs));
 
         // abs
@@ -119,7 +136,7 @@ async fn f16_pairwise_ops_match_host_reference() {
     let prods: Vec<f32> = lhs.iter().zip(rhs.iter()).map(|(a, b)| a * b).collect();
     let quots: Vec<f32> = lhs.iter().zip(rhs.iter()).map(|(a, b)| a / b).collect();
 
-    for device in available_devices().await {
+    for device in f16_capable_devices().await {
         let l: Tensor<2, f16> = Tensor::from_slice(&device, [3, 2], &f16s(&lhs));
         let r: Tensor<2, f16> = Tensor::from_slice(&device, [3, 2], &f16s(&rhs));
 
@@ -145,7 +162,7 @@ async fn f16_pairwise_ops_match_host_reference() {
 
 #[tokio::test]
 async fn f16_zeros_matches_expected() {
-    for device in available_devices().await {
+    for device in f16_capable_devices().await {
         let zeros: Tensor<2, f16> = Tensor::<2, f16>::zeros(&device, [2, 3]);
         let expected: Tensor<2, f16> = Tensor::from_slice(&device, [2, 3], &f16s(&[0.0; 6]));
         exact_eq(&zeros, &expected).await.unwrap();
@@ -159,7 +176,7 @@ async fn f16_matmul_matches_host_reference() {
     let rhs = [1.0f32, 2.0];
     let expected_vals = [1.0f32, 2.0, 3.0, 6.0];
 
-    for device in available_devices().await {
+    for device in f16_capable_devices().await {
         let l: Tensor<2, f16> = Tensor::from_slice(&device, [2, 1], &f16s(&lhs));
         let r: Tensor<2, f16> = Tensor::from_slice(&device, [1, 2], &f16s(&rhs));
         let actual = l.matmul(&r).to_concrete();
@@ -179,7 +196,7 @@ async fn f16_reductions_match_host_reference() {
     let max_axis0 = [5.0f32, 6.0];
     let min_axis0 = [1.0f32, 2.0];
 
-    for device in available_devices().await {
+    for device in f16_capable_devices().await {
         let input: Tensor<2, f16> = Tensor::from_slice(&device, [3, 2], &f16s(&data));
 
         let actual = input.sum::<1>(0);
