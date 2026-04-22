@@ -45,8 +45,8 @@ fn bench_qmatmul(c: &mut Criterion) {
                 let mut blocks_vec: AVec<BlockQ8_0> = AVec::with_capacity(64, num_blocks);
                 for i in 0..num_blocks {
                     let mut data = [0i8; 32];
-                    for j in 0..32 {
-                        data[j] = ((i + j) % 100) as i8 - 50;
+                    for (j, slot) in data.iter_mut().enumerate() {
+                        *slot = ((i + j) % 100) as i8 - 50;
                     }
                     blocks_vec.push(make_q8_0_block(0.1, data));
                 }
@@ -70,8 +70,8 @@ fn bench_qmatmul(c: &mut Criterion) {
                 let mut blocks_vec: AVec<BlockQ8_0> = AVec::with_capacity(64, num_blocks);
                 for i in 0..num_blocks {
                     let mut data = [0i8; 32];
-                    for j in 0..32 {
-                        data[j] = ((i + j) % 100) as i8 - 50;
+                    for (j, slot) in data.iter_mut().enumerate() {
+                        *slot = ((i + j) % 100) as i8 - 50;
                     }
                     blocks_vec.push(make_q8_0_block(0.1, data));
                 }

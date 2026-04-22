@@ -15,7 +15,7 @@ fn matrix_data(shape: [usize; 2], offset: f32) -> Vec<f32> {
 fn condition_data(shape: [usize; 2]) -> Vec<f32> {
     let total = shape[0] * shape[1];
     (0..total)
-        .map(|i| if (i + shape[0]) % 3 == 0 { 1.0 } else { 0.0 })
+        .map(|i| if (i + shape[0]).is_multiple_of(3) { 1.0 } else { 0.0 })
         .collect()
 }
 

@@ -63,6 +63,7 @@ where
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn bench_backend(
     group: &mut criterion::BenchmarkGroup<'_, criterion::measurement::WallTime>,
     backend: &'static str,

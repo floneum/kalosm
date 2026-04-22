@@ -112,6 +112,7 @@ async fn assert_dequantize_matches_host_reference(
     .unwrap();
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn assert_q_mat_mul_matches_host_reference(
     ty: GgmlType,
     weight_shape: [usize; 2],
@@ -170,9 +171,7 @@ fn q5_0_raw_bytes(shape: [usize; 2]) -> Vec<u8> {
     let mut bytes = raw_bytes_buffer::<BlockQ5_0>(shape);
     for block in 0..block_count(shape, BlockQ5_0::BLOCK_SIZE) {
         push_f16(&mut bytes, 0.02 + block as f32 * 0.0025);
-        for _ in 0..4 {
-            bytes.push(0xFF);
-        }
+        bytes.extend(std::iter::repeat_n(0xFF, 4));
         for i in 0..16 {
             bytes.push(packed_nibble_byte(
                 4 + ((block + i * 3) % 8),
@@ -221,9 +220,7 @@ fn q5k_raw_bytes(shape: [usize; 2]) -> Vec<u8> {
         for i in 0..BlockQ5K::SCALES_SIZE {
             bytes.push((((block * 7 + i * 2) % 24) + 1) as u8);
         }
-        for _ in 0..BlockQ5K::QH_SIZE {
-            bytes.push(0xFF);
-        }
+        bytes.extend(std::iter::repeat_n(0xFF, BlockQ5K::QH_SIZE));
         for i in 0..BlockQ5K::QS_SIZE {
             bytes.push(packed_nibble_byte(
                 8 + ((block + i * 3) % 8),

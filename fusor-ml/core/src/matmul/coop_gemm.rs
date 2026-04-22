@@ -442,6 +442,7 @@ pub(super) fn build_kernel(
 }
 
 /// Emit MMA inner loop: process all k-substeps within a k-tile
+#[allow(clippy::too_many_arguments)]
 fn emit_mma_block(
     kernel: &mut GenericKernel,
     tile_a: &crate::mir::globals::KernelGlobal,
@@ -480,6 +481,7 @@ fn emit_mma_block(
 /// Row-major layout: tile_a[m * stride_a + k] where stride_a = block_k + 1
 /// Vec4 loads: each thread reads 4 consecutive K values from global memory
 /// Thread assignment: lid % block_m → m_in_tile, lid / block_m → k_group
+#[allow(clippy::too_many_arguments)]
 fn emit_tile_a_load_row_major(
     kernel: &mut GenericKernel,
     tile: &crate::mir::globals::KernelGlobal,
@@ -546,6 +548,7 @@ fn emit_tile_a_load_row_major(
 
 /// Emit tile B load from global → shared memory.
 /// Row-major layout: tile_b[k * stride_b + n] where stride_b = block_k + 1
+#[allow(clippy::too_many_arguments)]
 fn emit_tile_b_load(
     kernel: &mut GenericKernel,
     tile: &crate::mir::globals::KernelGlobal,

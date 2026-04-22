@@ -890,6 +890,7 @@ where
 pub trait IntoCompare<U> {
     type Error: Error;
 
+    #[allow(clippy::type_complexity)]
     fn into_compare(
         self,
     ) -> impl for<'a> Fn(
@@ -964,6 +965,7 @@ impl<const R: usize> IntoCompare<Tensor<R, f16>> for () {
     }
 }
 
+#[allow(clippy::type_complexity)]
 pub fn exact_compare<const R: usize, T>() -> impl for<'a> Fn(
     &'a Tensor<R, T>,
     &'a Tensor<R, T>,
@@ -976,6 +978,7 @@ where
     |a, b| Box::pin(exact_eq(a, b))
 }
 
+#[allow(clippy::type_complexity)]
 pub fn approx_compare<const R: usize, T>(
     tol: T,
 ) -> impl for<'a> Fn(
@@ -991,6 +994,7 @@ where
 
 /// Compare-fn factory for [`relative_eq`]: pass `rel_tol` as a fraction
 /// (e.g. `1e-3` for 0.1%).
+#[allow(clippy::type_complexity)]
 pub fn relative_compare<const R: usize>(
     rel_tol: f32,
 ) -> impl for<'a> Fn(

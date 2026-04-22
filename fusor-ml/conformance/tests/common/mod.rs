@@ -1,4 +1,4 @@
-#![allow(dead_code)]
+#![allow(dead_code, clippy::needless_range_loop)]
 
 use fusor::{DataType, Device, SimdElement, Tensor};
 use fusor_conformance::{approx_compare, available_devices, exact_compare};

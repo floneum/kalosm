@@ -272,9 +272,9 @@ where
 
         // Concatenate copies along each dimension
         let mut result: Tensor<R, D> = self.to_concrete();
-        for dim in 0..R {
-            if repeats[dim] > 1 {
-                let copies: Vec<Tensor<R, D>> = (0..repeats[dim]).map(|_| result.clone()).collect();
+        for (dim, &count) in repeats.iter().enumerate() {
+            if count > 1 {
+                let copies: Vec<Tensor<R, D>> = (0..count).map(|_| result.clone()).collect();
                 result = cat(copies, dim);
             }
         }

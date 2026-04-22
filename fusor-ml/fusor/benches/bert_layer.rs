@@ -145,6 +145,7 @@ fn layer_norm(c: &mut Criterion) {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn bench_candle_layer_norm(
     bytes: &[u8],
     batch_size: usize,
@@ -343,6 +344,7 @@ fn self_attention(c: &mut Criterion) {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn bench_candle_self_attention(
     bytes: &[u8],
     batch_size: usize,
@@ -587,6 +589,7 @@ fn ffn_block(c: &mut Criterion) {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn bench_candle_ffn(
     bytes: &[u8],
     batch_size: usize,

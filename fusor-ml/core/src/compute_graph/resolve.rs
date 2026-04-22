@@ -1037,6 +1037,7 @@ impl Resolver {
         queued_operations.push((key, operation));
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn flush_operations(
         graph: &mut ComputeGraphInner,
         mut kernel: &mut GenericKernel,
