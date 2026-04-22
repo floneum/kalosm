@@ -532,9 +532,7 @@ impl NaryOperation {
                             Err(std::fmt::Error)
                         }
                     }
-                    NaryExpr::DimIndex(_) => {
-                        Err(std::fmt::Error)
-                    }
+                    NaryExpr::DimIndex(_) => Err(std::fmt::Error),
                 }
             }
 

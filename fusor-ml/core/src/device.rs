@@ -150,11 +150,12 @@ impl Drop for DeviceInner {
         // Flush pipeline cache to disk on shutdown
         if let (Some(pipeline_cache), Some(cache_file)) =
             (self.cache.as_ref(), self.cache_file.as_ref())
-            && let Some(data) = pipeline_cache.get_data() {
-                let temp_file = cache_file.with_extension("temp");
-                let _ = std::fs::write(&temp_file, &data);
-                let _ = std::fs::rename(&temp_file, cache_file);
-            }
+            && let Some(data) = pipeline_cache.get_data()
+        {
+            let temp_file = cache_file.with_extension("temp");
+            let _ = std::fs::write(&temp_file, &data);
+            let _ = std::fs::rename(&temp_file, cache_file);
+        }
     }
 }
 
