@@ -886,36 +886,27 @@ where
     }
 }
 
+/// Boxed future returned by a comparator: `&'a U, &'a U -> Result<(), E>`.
+/// Aliased so the comparator type signatures stay readable.
+pub type CompareFut<'a, E> = Pin<Box<dyn std::future::Future<Output = Result<(), E>> + 'a>>;
+
 #[doc(hidden)]
 pub trait IntoCompare<U> {
     type Error: Error;
 
-    #[allow(clippy::type_complexity)]
-    fn into_compare(
-        self,
-    ) -> impl for<'a> Fn(
-        &'a U,
-        &'a U,
-    )
-        -> Pin<Box<dyn std::future::Future<Output = Result<(), Self::Error>> + 'a>>
-    + 'static;
+    fn into_compare(self)
+    -> impl for<'a> Fn(&'a U, &'a U) -> CompareFut<'a, Self::Error> + 'static;
 }
 
 impl<U, Cmp, E: Error> IntoCompare<U> for Cmp
 where
-    Cmp: for<'a> Fn(&'a U, &'a U) -> Pin<Box<dyn std::future::Future<Output = Result<(), E>> + 'a>>
-        + 'static,
+    Cmp: for<'a> Fn(&'a U, &'a U) -> CompareFut<'a, E> + 'static,
 {
     type Error = E;
 
     fn into_compare(
         self,
-    ) -> impl for<'a> Fn(
-        &'a U,
-        &'a U,
-    )
-        -> Pin<Box<dyn std::future::Future<Output = Result<(), Self::Error>> + 'a>>
-    + 'static {
+    ) -> impl for<'a> Fn(&'a U, &'a U) -> CompareFut<'a, Self::Error> + 'static {
         self
     }
 }
@@ -925,12 +916,8 @@ impl<const R: usize> IntoCompare<Tensor<R, u32>> for () {
 
     fn into_compare(
         self,
-    ) -> impl for<'a> Fn(
-        &'a Tensor<R, u32>,
-        &'a Tensor<R, u32>,
-    )
-        -> Pin<Box<dyn std::future::Future<Output = Result<(), Self::Error>> + 'a>>
-    + 'static {
+    ) -> impl for<'a> Fn(&'a Tensor<R, u32>, &'a Tensor<R, u32>) -> CompareFut<'a, Self::Error> + 'static
+    {
         |a, b| Box::pin(exact_eq(a, b))
     }
 }
@@ -940,12 +927,8 @@ impl<const R: usize> IntoCompare<Tensor<R, f32>> for () {
 
     fn into_compare(
         self,
-    ) -> impl for<'a> Fn(
-        &'a Tensor<R, f32>,
-        &'a Tensor<R, f32>,
-    )
-        -> Pin<Box<dyn std::future::Future<Output = Result<(), Self::Error>> + 'a>>
-    + 'static {
+    ) -> impl for<'a> Fn(&'a Tensor<R, f32>, &'a Tensor<R, f32>) -> CompareFut<'a, Self::Error> + 'static
+    {
         |a, b| Box::pin(approx_eq(a, b, 1e-5))
     }
 }
@@ -955,37 +938,23 @@ impl<const R: usize> IntoCompare<Tensor<R, f16>> for () {
 
     fn into_compare(
         self,
-    ) -> impl for<'a> Fn(
-        &'a Tensor<R, f16>,
-        &'a Tensor<R, f16>,
-    )
-        -> Pin<Box<dyn std::future::Future<Output = Result<(), Self::Error>> + 'a>>
-    + 'static {
+    ) -> impl for<'a> Fn(&'a Tensor<R, f16>, &'a Tensor<R, f16>) -> CompareFut<'a, Self::Error> + 'static
+    {
         |a, b| Box::pin(approx_eq(a, b, f16::from_f32(1e-3)))
     }
 }
 
-#[allow(clippy::type_complexity)]
-pub fn exact_compare<const R: usize, T>() -> impl for<'a> Fn(
-    &'a Tensor<R, T>,
-    &'a Tensor<R, T>,
-) -> Pin<
-    Box<dyn std::future::Future<Output = Result<(), ItemMismatchError>> + 'a>,
-> + Clone
+pub fn exact_compare<const R: usize, T>()
+-> impl for<'a> Fn(&'a Tensor<R, T>, &'a Tensor<R, T>) -> CompareFut<'a, ItemMismatchError> + Clone
 where
     T: DataType + SimdElement + PartialEq,
 {
     |a, b| Box::pin(exact_eq(a, b))
 }
 
-#[allow(clippy::type_complexity)]
 pub fn approx_compare<const R: usize, T>(
     tol: T,
-) -> impl for<'a> Fn(
-    &'a Tensor<R, T>,
-    &'a Tensor<R, T>,
-) -> Pin<Box<dyn std::future::Future<Output = Result<(), ItemMismatchError>> + 'a>>
-+ Clone
+) -> impl for<'a> Fn(&'a Tensor<R, T>, &'a Tensor<R, T>) -> CompareFut<'a, ItemMismatchError> + Clone
 where
     T: Sub<Output = T> + PartialOrd + DataType + SimdElement + Copy,
 {
@@ -994,14 +963,10 @@ where
 
 /// Compare-fn factory for [`relative_eq`]: pass `rel_tol` as a fraction
 /// (e.g. `1e-3` for 0.1%).
-#[allow(clippy::type_complexity)]
 pub fn relative_compare<const R: usize>(
     rel_tol: f32,
-) -> impl for<'a> Fn(
-    &'a Tensor<R, f32>,
-    &'a Tensor<R, f32>,
-) -> Pin<Box<dyn std::future::Future<Output = Result<(), ItemMismatchError>> + 'a>>
-+ Clone {
+) -> impl for<'a> Fn(&'a Tensor<R, f32>, &'a Tensor<R, f32>) -> CompareFut<'a, ItemMismatchError> + Clone
+{
     move |a, b| Box::pin(relative_eq(a, b, rel_tol))
 }
 

@@ -12,7 +12,7 @@ use crate::{
         inputs::{KernelInputValue, MirValue},
         kernel::GenericKernel,
         operation::Operation,
-        workgroup_shape::{self, WorkgroupShapeConstraints},
+        workgroup_shape::{WorkgroupShape, WorkgroupShapeConstraints},
     },
     nary_wise::{ExtractedUnaryChain, NaryExpr, NaryOperation, UnaryFunctionChain},
     quantized::matmul::QMatMulOperation,
@@ -24,6 +24,16 @@ use super::{ComputeGraphInner, ComputeGraphNode, ComputeGraphNodeVariant, NodeIn
 pub(crate) struct ResolverResult {
     pub(crate) data: TensorData,
     pub(crate) total_kernels: usize,
+}
+
+/// Inputs to a single `flush_operations` call: the set of queued ops, their
+/// per-op input values, the kernel's flat input list, and the workgroup
+/// shape they share. Bundled to keep `flush_operations` under the 7-arg limit.
+struct FlushBatch<'a> {
+    queued_operations: &'a [(NodeIndex, Arc<dyn Operation>)],
+    inputs: &'a [Vec<MirValue>],
+    all_input_values: &'a [KernelInputValue],
+    workgroup_shape: WorkgroupShape,
 }
 
 #[derive(Debug, Clone)]
@@ -156,10 +166,12 @@ impl Resolver {
                     Self::flush_operations(
                         graph,
                         &mut kernel,
-                        &pending_operations,
-                        &inputs,
-                        &all_input_values,
-                        old_best,
+                        FlushBatch {
+                            queued_operations: &pending_operations,
+                            inputs: &inputs,
+                            all_input_values: &all_input_values,
+                            workgroup_shape: old_best,
+                        },
                         removed,
                         &mut command_encoder,
                     );
@@ -235,10 +247,12 @@ impl Resolver {
             Self::flush_operations(
                 graph,
                 &mut kernel,
-                &pending_operations,
-                &inputs,
-                &all_input_values,
-                old_best,
+                FlushBatch {
+                    queued_operations: &pending_operations,
+                    inputs: &inputs,
+                    all_input_values: &all_input_values,
+                    workgroup_shape: old_best,
+                },
                 removed,
                 &mut command_encoder,
             );
@@ -1037,19 +1051,21 @@ impl Resolver {
         queued_operations.push((key, operation));
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn flush_operations(
         graph: &mut ComputeGraphInner,
         mut kernel: &mut GenericKernel,
-        queued_operations: &[(NodeIndex, Arc<dyn Operation>)],
-        inputs: &[Vec<MirValue>],
-        all_input_values: &[KernelInputValue],
-        workgroup_shape: workgroup_shape::WorkgroupShape,
+        batch: FlushBatch<'_>,
         removed: &mut Vec<ComputeGraphNode>,
         command_encoder: &mut CommandEncoder,
     ) {
+        let FlushBatch {
+            queued_operations,
+            inputs: batched_inputs,
+            all_input_values,
+            workgroup_shape,
+        } = batch;
         let mut max_dispatch_size = [0; 3];
-        for ((key, operation), inputs) in queued_operations.iter().zip(inputs) {
+        for ((key, operation), inputs) in queued_operations.iter().zip(batched_inputs) {
             // Map layout isn't really a kernel. Skip it
             if let Some(node) = graph.nodes.nodes.node_weight(*key)
                 && matches!(node.variant, ComputeGraphNodeVariant::MapLayout(_))

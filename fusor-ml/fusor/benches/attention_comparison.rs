@@ -63,17 +63,25 @@ where
     }
 }
 
-#[allow(clippy::too_many_arguments)]
+/// q/k/v inputs for one attention shape; bundled to keep `bench_backend` under
+/// the 7-arg clippy limit.
+struct AttentionInputs<'a> {
+    q: &'a [f32],
+    k: &'a [f32],
+    v: &'a [f32],
+}
+
 fn bench_backend(
     group: &mut criterion::BenchmarkGroup<'_, criterion::measurement::WallTime>,
     backend: &'static str,
     device: &Device,
     shape: [usize; 4],
     size_str: &str,
-    q_data: &[f32],
-    k_data: &[f32],
-    v_data: &[f32],
+    inputs: &AttentionInputs<'_>,
 ) {
+    let q_data = inputs.q;
+    let k_data = inputs.k;
+    let v_data = inputs.v;
     let [_, _, _, head_dim] = shape;
 
     let device_standard = device.clone();
@@ -164,21 +172,15 @@ fn bench_attention_comparison(c: &mut Criterion) {
         let size_str = format!("{}x{}x{}x{}", shape[0], shape[1], shape[2], shape[3]);
         let (q_data, k_data, v_data) = attention_inputs(shape);
 
-        bench_backend(
-            &mut group,
-            "cpu",
-            &cpu_device,
-            shape,
-            &size_str,
-            &q_data,
-            &k_data,
-            &v_data,
-        );
+        let inputs = AttentionInputs {
+            q: &q_data,
+            k: &k_data,
+            v: &v_data,
+        };
+        bench_backend(&mut group, "cpu", &cpu_device, shape, &size_str, &inputs);
 
         if let Some(device) = gpu_device.as_ref() {
-            bench_backend(
-                &mut group, "gpu", device, shape, &size_str, &q_data, &k_data, &v_data,
-            );
+            bench_backend(&mut group, "gpu", device, shape, &size_str, &inputs);
         }
     }
 

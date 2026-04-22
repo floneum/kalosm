@@ -112,17 +112,21 @@ async fn assert_dequantize_matches_host_reference(
     .unwrap();
 }
 
-#[allow(clippy::too_many_arguments)]
-async fn assert_q_mat_mul_matches_host_reference(
-    ty: GgmlType,
-    weight_shape: [usize; 2],
-    raw_bytes: Vec<u8>,
-    expected_weights: Vec<Vec<f32>>,
-    input_row_count: usize,
+/// Fuzz configuration for input rows in `assert_q_mat_mul_matches_host_reference`.
+struct QMatMulFuzz {
     seed: u64,
     distribution: Uniform<f32>,
-    q_mat_mul_tol: f32,
-) {
+}
+
+async fn assert_q_mat_mul_matches_host_reference(fixture: &QuantizedFixture, fuzz: QMatMulFuzz) {
+    let ty = fixture.ty;
+    let weight_shape = fixture.weight_shape;
+    let raw_bytes = fixture.raw_bytes.clone();
+    let expected_weights = fixture.dequantized.clone();
+    let input_row_count = fixture.input_row_count;
+    let q_mat_mul_tol = fixture.q_mat_mul_tol;
+    let QMatMulFuzz { seed, distribution } = fuzz;
+
     fusor_conformance::assert(move |input: Tensor<2, f32>| {
         let raw_bytes = raw_bytes.clone();
         async move {
@@ -400,24 +404,13 @@ macro_rules! quantized_q_mat_mul_test {
     ($test_name:ident, $fixture_fn:ident, $seed:expr) => {
         #[tokio::test]
         async fn $test_name() {
-            let QuantizedFixture {
-                ty,
-                weight_shape,
-                raw_bytes,
-                input_row_count,
-                dequantized,
-                q_mat_mul_tol,
-                ..
-            } = $fixture_fn();
+            let fixture = $fixture_fn();
             assert_q_mat_mul_matches_host_reference(
-                ty,
-                weight_shape,
-                raw_bytes,
-                dequantized,
-                input_row_count,
-                $seed,
-                Uniform::new(-0.25, 0.25).unwrap(),
-                q_mat_mul_tol,
+                &fixture,
+                QMatMulFuzz {
+                    seed: $seed,
+                    distribution: Uniform::new(-0.25, 0.25).unwrap(),
+                },
             )
             .await;
         }
@@ -516,30 +509,42 @@ fn f16_weight_bytes() -> Vec<u8> {
 
 #[tokio::test]
 async fn f32_q_matrix_q_mat_mul_matches_host_reference() {
+    let fixture = QuantizedFixture {
+        ty: GgmlType::F32,
+        weight_shape: [2, 4],
+        raw_bytes: f32_weight_bytes(),
+        input_row_count: 2,
+        dequantized: f32_weight_rows(),
+        dequantize_tol: 1e-6,
+        q_mat_mul_tol: 1e-6,
+    };
     assert_q_mat_mul_matches_host_reference(
-        GgmlType::F32,
-        [2, 4],
-        f32_weight_bytes(),
-        f32_weight_rows(),
-        2,
-        820,
-        Uniform::new(-0.5, 0.5).unwrap(),
-        1e-6,
+        &fixture,
+        QMatMulFuzz {
+            seed: 820,
+            distribution: Uniform::new(-0.5, 0.5).unwrap(),
+        },
     )
     .await;
 }
 
 #[tokio::test]
 async fn f16_q_matrix_q_mat_mul_matches_host_reference() {
+    let fixture = QuantizedFixture {
+        ty: GgmlType::F16,
+        weight_shape: [2, 4],
+        raw_bytes: f16_weight_bytes(),
+        input_row_count: 2,
+        dequantized: f32_weight_rows(),
+        dequantize_tol: 1e-3,
+        q_mat_mul_tol: 1e-3,
+    };
     assert_q_mat_mul_matches_host_reference(
-        GgmlType::F16,
-        [2, 4],
-        f16_weight_bytes(),
-        f32_weight_rows(),
-        2,
-        821,
-        Uniform::new(-0.5, 0.5).unwrap(),
-        1e-3,
+        &fixture,
+        QMatMulFuzz {
+            seed: 821,
+            distribution: Uniform::new(-0.5, 0.5).unwrap(),
+        },
     )
     .await;
 }

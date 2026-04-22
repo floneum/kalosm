@@ -239,54 +239,47 @@ pub(super) fn build_kernel(
     )
     .unwrap();
 
-    // === First K-tile of the pair (into buffer 0) ===
-    writeln!(kernel, "    let k_base_0 = t_pair * 2u * {block_k}u;").unwrap();
-    emit_tile_a_load_row_major(
-        kernel,
-        &tile_a0,
-        &input_a,
-        "a_start_index",
-        &a_row_stride,
-        &a_col_stride,
-        &m_size,
-        &k_size,
+    let tile_a_ctx = TileALoadCtx {
+        input: &input_a,
+        start_index: "a_start_index",
+        row_stride: &a_row_stride,
+        col_stride: &a_col_stride,
+        m_size: &m_size,
+        k_size: &k_size,
         block_m,
         block_k,
-        stride_a,
+        tile_stride: stride_a,
         wg_threads,
-        "k_base_0",
-    );
-    emit_tile_b_load(
-        kernel,
-        &tile_b0,
-        &input_b,
-        "b_start_index",
-        &b_row_stride,
-        &b_col_stride,
-        &k_size,
-        &n_size,
+    };
+    let tile_b_ctx = TileBLoadCtx {
+        input: &input_b,
+        start_index: "b_start_index",
+        row_stride: &b_row_stride,
+        col_stride: &b_col_stride,
+        k_size: &k_size,
+        n_size: &n_size,
         block_k,
         bn_pass,
-        stride_b,
+        tile_stride: stride_b,
         wg_threads,
-        "k_base_0",
-        "n_base",
-    );
-    writeln!(kernel, "    workgroupBarrier();").unwrap();
-
-    // MMA for first k-tile
-    emit_mma_block(
-        kernel,
-        &tile_a0,
-        &tile_b0,
+    };
+    let mma_params = MmaParams {
         stride_a,
         stride_b,
         m_subtiles_per_sg,
         n_subtiles,
         k_substeps,
         mma_size,
-        "p0",
-    );
+    };
+
+    // === First K-tile of the pair (into buffer 0) ===
+    writeln!(kernel, "    let k_base_0 = t_pair * 2u * {block_k}u;").unwrap();
+    emit_tile_a_load_row_major(kernel, &tile_a0, "k_base_0", &tile_a_ctx);
+    emit_tile_b_load(kernel, &tile_b0, "k_base_0", "n_base", &tile_b_ctx);
+    writeln!(kernel, "    workgroupBarrier();").unwrap();
+
+    // MMA for first k-tile
+    emit_mma_block(kernel, &tile_a0, &tile_b0, "p0", &mma_params);
 
     writeln!(kernel, "    workgroupBarrier();").unwrap();
 
@@ -296,52 +289,12 @@ pub(super) fn build_kernel(
         "    let k_base_1 = (t_pair * 2u + 1u) * {block_k}u;"
     )
     .unwrap();
-    emit_tile_a_load_row_major(
-        kernel,
-        &tile_a1,
-        &input_a,
-        "a_start_index",
-        &a_row_stride,
-        &a_col_stride,
-        &m_size,
-        &k_size,
-        block_m,
-        block_k,
-        stride_a,
-        wg_threads,
-        "k_base_1",
-    );
-    emit_tile_b_load(
-        kernel,
-        &tile_b1,
-        &input_b,
-        "b_start_index",
-        &b_row_stride,
-        &b_col_stride,
-        &k_size,
-        &n_size,
-        block_k,
-        bn_pass,
-        stride_b,
-        wg_threads,
-        "k_base_1",
-        "n_base",
-    );
+    emit_tile_a_load_row_major(kernel, &tile_a1, "k_base_1", &tile_a_ctx);
+    emit_tile_b_load(kernel, &tile_b1, "k_base_1", "n_base", &tile_b_ctx);
     writeln!(kernel, "    workgroupBarrier();").unwrap();
 
     // MMA for second k-tile
-    emit_mma_block(
-        kernel,
-        &tile_a1,
-        &tile_b1,
-        stride_a,
-        stride_b,
-        m_subtiles_per_sg,
-        n_subtiles,
-        k_substeps,
-        mma_size,
-        "p1",
-    );
+    emit_mma_block(kernel, &tile_a1, &tile_b1, "p1", &mma_params);
 
     writeln!(kernel, "    workgroupBarrier();").unwrap();
 
@@ -441,20 +394,34 @@ pub(super) fn build_kernel(
     writeln!(kernel, "}}").unwrap(); // end N-pass loop
 }
 
-/// Emit MMA inner loop: process all k-substeps within a k-tile
-#[allow(clippy::too_many_arguments)]
-fn emit_mma_block(
-    kernel: &mut GenericKernel,
-    tile_a: &crate::mir::globals::KernelGlobal,
-    tile_b: &crate::mir::globals::KernelGlobal,
+/// Stable parameters for a single MMA inner loop. The same values are reused
+/// for every k-pair iteration; bundling them keeps callers below the 7-arg
+/// clippy limit and makes the emit signature describe the variation.
+struct MmaParams {
     stride_a: u32,
     stride_b: u32,
     m_subtiles_per_sg: u32,
     n_subtiles: u32,
     k_substeps: u32,
     mma_size: u32,
+}
+
+/// Emit MMA inner loop: process all k-substeps within a k-tile
+fn emit_mma_block(
+    kernel: &mut GenericKernel,
+    tile_a: &crate::mir::globals::KernelGlobal,
+    tile_b: &crate::mir::globals::KernelGlobal,
     prefix: &str,
+    params: &MmaParams,
 ) {
+    let MmaParams {
+        stride_a,
+        stride_b,
+        m_subtiles_per_sg,
+        n_subtiles,
+        k_substeps,
+        mma_size,
+    } = *params;
     for k_sub in 0..k_substeps {
         // Load A subtiles from row-major MxK shared storage.
         for sm in 0..m_subtiles_per_sg {
@@ -477,26 +444,45 @@ fn emit_mma_block(
     }
 }
 
-/// Emit tile A load from global → shared memory.
-/// Row-major layout: tile_a[m * stride_a + k] where stride_a = block_k + 1
-/// Vec4 loads: each thread reads 4 consecutive K values from global memory
-/// Thread assignment: lid % block_m → m_in_tile, lid / block_m → k_group
-#[allow(clippy::too_many_arguments)]
-fn emit_tile_a_load_row_major(
-    kernel: &mut GenericKernel,
-    tile: &crate::mir::globals::KernelGlobal,
-    input: &TensorInput,
-    start_index: &str,
-    row_stride: &dyn std::fmt::Display, // M stride in global memory
-    col_stride: &dyn std::fmt::Display, // K stride in global memory
-    m_size: &dyn std::fmt::Display,
-    k_size: &dyn std::fmt::Display,
+/// Stable layout/global-memory descriptors for a tile-A load. Identical
+/// across every k-pair, so bundling them keeps `emit_tile_a_load_row_major`
+/// below the 7-arg clippy limit.
+#[derive(Clone, Copy)]
+struct TileALoadCtx<'a> {
+    input: &'a TensorInput,
+    start_index: &'a str,
+    row_stride: &'a dyn std::fmt::Display, // M stride in global memory
+    col_stride: &'a dyn std::fmt::Display, // K stride in global memory
+    m_size: &'a dyn std::fmt::Display,
+    k_size: &'a dyn std::fmt::Display,
     block_m: u32,
     block_k: u32,
     tile_stride: u32, // = block_k + 1
     wg_threads: u32,
+}
+
+/// Emit tile A load from global → shared memory.
+/// Row-major layout: tile_a[m * stride_a + k] where stride_a = block_k + 1
+/// Vec4 loads: each thread reads 4 consecutive K values from global memory
+/// Thread assignment: lid % block_m → m_in_tile, lid / block_m → k_group
+fn emit_tile_a_load_row_major(
+    kernel: &mut GenericKernel,
+    tile: &crate::mir::globals::KernelGlobal,
     k_base: &str,
+    ctx: &TileALoadCtx<'_>,
 ) {
+    let TileALoadCtx {
+        input,
+        start_index,
+        row_stride,
+        col_stride,
+        m_size,
+        k_size,
+        block_m,
+        block_k,
+        tile_stride,
+        wg_threads,
+    } = *ctx;
     // Each thread loads 4 K values (vec4). Total coverage: wg_threads threads × 4 K values each
     // threads_per_m_row = wg_threads, but we tile as: m = lid % block_m, k_group = lid / block_m
     // With 256 threads and block_m=128: k_group ∈ {0, 1} for first pass, need block_k/4 = 4 k-groups total
@@ -546,25 +532,42 @@ fn emit_tile_a_load_row_major(
     writeln!(kernel, "    }}").unwrap();
 }
 
-/// Emit tile B load from global → shared memory.
-/// Row-major layout: tile_b[k * stride_b + n] where stride_b = block_k + 1
-#[allow(clippy::too_many_arguments)]
-fn emit_tile_b_load(
-    kernel: &mut GenericKernel,
-    tile: &crate::mir::globals::KernelGlobal,
-    input: &TensorInput,
-    start_index: &str,
-    row_stride: &dyn std::fmt::Display,
-    col_stride: &dyn std::fmt::Display,
-    k_size: &dyn std::fmt::Display,
-    n_size: &dyn std::fmt::Display,
+/// Stable layout/global-memory descriptors for a tile-B load.
+#[derive(Clone, Copy)]
+struct TileBLoadCtx<'a> {
+    input: &'a TensorInput,
+    start_index: &'a str,
+    row_stride: &'a dyn std::fmt::Display,
+    col_stride: &'a dyn std::fmt::Display,
+    k_size: &'a dyn std::fmt::Display,
+    n_size: &'a dyn std::fmt::Display,
     block_k: u32,
     bn_pass: u32,
     tile_stride: u32,
     wg_threads: u32,
+}
+
+/// Emit tile B load from global → shared memory.
+/// Row-major layout: tile_b[k * stride_b + n] where stride_b = block_k + 1
+fn emit_tile_b_load(
+    kernel: &mut GenericKernel,
+    tile: &crate::mir::globals::KernelGlobal,
     k_base: &str,
     n_base: &str,
+    ctx: &TileBLoadCtx<'_>,
 ) {
+    let TileBLoadCtx {
+        input,
+        start_index,
+        row_stride,
+        col_stride,
+        k_size,
+        n_size,
+        block_k,
+        bn_pass,
+        tile_stride,
+        wg_threads,
+    } = *ctx;
     if bn_pass.is_multiple_of(4) {
         let total_vec4_groups = block_k * (bn_pass / 4);
         let vec4_groups_per_thread = total_vec4_groups.div_ceil(wg_threads);

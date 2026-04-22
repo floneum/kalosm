@@ -1,4 +1,4 @@
-#![allow(dead_code, clippy::needless_range_loop)]
+#![allow(dead_code)]
 
 use fusor::{DataType, Device, SimdElement, Tensor};
 use fusor_conformance::{approx_compare, available_devices, exact_compare};
@@ -123,14 +123,14 @@ pub fn permute3(input: &[Vec<Vec<f32>>], axes: [usize; 3]) -> Vec<Vec<Vec<f32>>>
     let shape = [input.len(), input[0].len(), input[0][0].len()];
     let out_shape = [shape[axes[0]], shape[axes[1]], shape[axes[2]]];
     let mut out = vec![vec![vec![0.0; out_shape[2]]; out_shape[1]]; out_shape[0]];
-    for i in 0..out_shape[0] {
-        for j in 0..out_shape[1] {
-            for k in 0..out_shape[2] {
+    for (i, plane) in out.iter_mut().enumerate() {
+        for (j, row) in plane.iter_mut().enumerate() {
+            for (k, slot) in row.iter_mut().enumerate() {
                 let mut src = [0usize; 3];
                 src[axes[0]] = i;
                 src[axes[1]] = j;
                 src[axes[2]] = k;
-                out[i][j][k] = input[src[0]][src[1]][src[2]];
+                *slot = input[src[0]][src[1]][src[2]];
             }
         }
     }
@@ -187,12 +187,12 @@ pub fn sliding_window_1d_ncw(
     let channels = input[0].len();
     let out_len = (input[0][0].len() - size) / stride + 1;
     let mut out = vec![vec![vec![vec![0.0; size]; out_len]; channels]; batch];
-    for b in 0..batch {
-        for c in 0..channels {
-            for out_idx in 0..out_len {
+    for (b, batch_out) in out.iter_mut().enumerate() {
+        for (c, channel_out) in batch_out.iter_mut().enumerate() {
+            for (out_idx, window) in channel_out.iter_mut().enumerate() {
                 let start = out_idx * stride;
-                for i in 0..size {
-                    out[b][c][out_idx][i] = input[b][c][start + i];
+                for (i, slot) in window.iter_mut().enumerate() {
+                    *slot = input[b][c][start + i];
                 }
             }
         }
@@ -468,23 +468,23 @@ pub fn conv1d_ncw(
     let padded_len = input[0][0].len() + 2 * padding;
     let out_len = (padded_len - kernel) / stride + 1;
     let mut out = vec![vec![vec![0.0; out_len]; out_channels]; batch];
-    for b in 0..batch {
-        for oc in 0..out_channels {
-            for out_idx in 0..out_len {
+    for (b, batch_out) in out.iter_mut().enumerate() {
+        for (oc, channel_out) in batch_out.iter_mut().enumerate() {
+            for (out_idx, slot) in channel_out.iter_mut().enumerate() {
                 let start = out_idx * stride;
                 let mut acc = bias.map_or(0.0, |bias| bias[oc]);
                 for ic in 0..in_channels {
-                    for k in 0..kernel {
+                    for (k, w) in weight[oc][ic].iter().enumerate() {
                         let src = start + k;
                         let value = if src < padding || src >= padding + input[b][ic].len() {
                             0.0
                         } else {
                             input[b][ic][src - padding]
                         };
-                        acc += value * weight[oc][ic][k];
+                        acc += value * w;
                     }
                 }
-                out[b][oc][out_idx] = acc;
+                *slot = acc;
             }
         }
     }
@@ -502,15 +502,14 @@ pub fn pool1d_ncw(
     let channels = input[0].len();
     let out_len = (input[0][0].len() - size) / stride + 1;
     let mut out = vec![vec![vec![0.0; out_len]; channels]; batch];
-    for b in 0..batch {
-        for c in 0..channels {
-            for out_idx in 0..out_len {
+    for (b, batch_out) in out.iter_mut().enumerate() {
+        for (c, channel_out) in batch_out.iter_mut().enumerate() {
+            for (out_idx, slot) in channel_out.iter_mut().enumerate() {
                 let start = out_idx * stride;
-                let value = input[b][c][start..start + size]
+                *slot = input[b][c][start..start + size]
                     .iter()
                     .copied()
                     .fold(init, reduce);
-                out[b][c][out_idx] = value;
             }
         }
     }

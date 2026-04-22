@@ -112,13 +112,16 @@ fn layer_norm(c: &mut Criterion) {
             }
 
             // Candle LayerNorm benchmark
+            let layer_norm_shape = BertShape {
+                batch_size,
+                seq_len,
+                hidden_size: 1024,
+            };
             {
                 let candle_device = candle_core::Device::Cpu;
                 bench_candle_layer_norm(
                     &bytes,
-                    batch_size,
-                    seq_len,
-                    1024,
+                    layer_norm_shape,
                     random_data.clone(),
                     candle_device,
                     "layer_norm-candle-cpu",
@@ -132,9 +135,7 @@ fn layer_norm(c: &mut Criterion) {
                 let candle_device = candle_core::Device::Metal(MetalDevice::new(0).unwrap());
                 bench_candle_layer_norm(
                     &bytes,
-                    batch_size,
-                    seq_len,
-                    1024,
+                    layer_norm_shape,
                     random_data.clone(),
                     candle_device,
                     "layer_norm-candle-metal",
@@ -145,17 +146,28 @@ fn layer_norm(c: &mut Criterion) {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-fn bench_candle_layer_norm(
-    bytes: &[u8],
+/// Common shape parameters for the BERT block benches; bundled to keep
+/// the candle bench helpers under the 7-arg clippy limit.
+#[derive(Clone, Copy)]
+struct BertShape {
     batch_size: usize,
     seq_len: usize,
     hidden_size: usize,
+}
+
+fn bench_candle_layer_norm(
+    bytes: &[u8],
+    shape: BertShape,
     random_data: Vec<Vec<Vec<f32>>>,
     candle_device: candle_core::Device,
     name: &str,
     c: &mut Criterion,
 ) {
+    let BertShape {
+        batch_size,
+        seq_len,
+        hidden_size,
+    } = shape;
     use candle_nn::LayerNorm;
 
     let var_builder = candle_transformers::quantized_var_builder::VarBuilder::from_gguf_buffer(
@@ -310,14 +322,17 @@ fn self_attention(c: &mut Criterion) {
             }
 
             // Candle Self-Attention benchmark
+            let attn_shape = BertShape {
+                batch_size,
+                seq_len,
+                hidden_size,
+            };
             #[cfg(target_os = "macos")]
             {
                 let candle_device = candle_core::Device::Metal(MetalDevice::new(0).unwrap());
                 bench_candle_self_attention(
                     &bytes,
-                    batch_size,
-                    seq_len,
-                    hidden_size,
+                    attn_shape,
                     num_heads,
                     random_data.clone(),
                     candle_device,
@@ -330,9 +345,7 @@ fn self_attention(c: &mut Criterion) {
                 let candle_device = candle_core::Device::Cpu;
                 bench_candle_self_attention(
                     &bytes,
-                    batch_size,
-                    seq_len,
-                    hidden_size,
+                    attn_shape,
                     num_heads,
                     random_data.clone(),
                     candle_device,
@@ -344,18 +357,20 @@ fn self_attention(c: &mut Criterion) {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 fn bench_candle_self_attention(
     bytes: &[u8],
-    batch_size: usize,
-    seq_len: usize,
-    hidden_size: usize,
+    shape: BertShape,
     num_heads: usize,
     random_data: Vec<Vec<Vec<f32>>>,
     candle_device: candle_core::Device,
     name: &str,
     c: &mut Criterion,
 ) {
+    let BertShape {
+        batch_size,
+        seq_len,
+        hidden_size,
+    } = shape;
     use candle_transformers::quantized_nn::Linear;
 
     let var_builder = candle_transformers::quantized_var_builder::VarBuilder::from_gguf_buffer(
@@ -557,14 +572,17 @@ fn ffn_block(c: &mut Criterion) {
             }
 
             // Candle FFN benchmark
+            let ffn_shape = BertShape {
+                batch_size,
+                seq_len,
+                hidden_size,
+            };
             #[cfg(target_os = "macos")]
             {
                 let candle_device = candle_core::Device::Metal(MetalDevice::new(0).unwrap());
                 bench_candle_ffn(
                     &bytes,
-                    batch_size,
-                    seq_len,
-                    hidden_size,
+                    ffn_shape,
                     random_data.clone(),
                     candle_device,
                     "ffn_block-candle-metal",
@@ -576,9 +594,7 @@ fn ffn_block(c: &mut Criterion) {
                 let candle_device = candle_core::Device::Cpu;
                 bench_candle_ffn(
                     &bytes,
-                    batch_size,
-                    seq_len,
-                    hidden_size,
+                    ffn_shape,
                     random_data.clone(),
                     candle_device,
                     "ffn_block-candle-cpu",
@@ -589,17 +605,19 @@ fn ffn_block(c: &mut Criterion) {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 fn bench_candle_ffn(
     bytes: &[u8],
-    batch_size: usize,
-    seq_len: usize,
-    hidden_size: usize,
+    shape: BertShape,
     random_data: Vec<Vec<Vec<f32>>>,
     candle_device: candle_core::Device,
     name: &str,
     c: &mut Criterion,
 ) {
+    let BertShape {
+        batch_size,
+        seq_len,
+        hidden_size,
+    } = shape;
     use candle_transformers::quantized_nn::Linear;
 
     let var_builder = candle_transformers::quantized_var_builder::VarBuilder::from_gguf_buffer(
