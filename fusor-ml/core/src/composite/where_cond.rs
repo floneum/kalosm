@@ -19,7 +19,7 @@ impl<const R: usize, D: DataType> Tensor<R, D> {
                 self.datatype(),
                 on_true.datatype(),
             ),
-            shape: shape,
+            shape,
             output_datatype: on_true.datatype(),
         };
         let device = on_true.device().clone();

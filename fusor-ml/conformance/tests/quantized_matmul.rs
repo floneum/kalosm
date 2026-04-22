@@ -644,7 +644,10 @@ async fn q_mat_mul_transposed_input_matches_host_reference() {
         let data = deterministic_input(&shape, 1100 + batch as u32);
 
         let cpu_input: Tensor<3, f32> = Tensor::from_slice(&Device::Cpu, shape, &data);
-        let cpu_result = cpu_input.transpose(0, 2).q_mat_mul(&cpu_weights).to_concrete();
+        let cpu_result = cpu_input
+            .transpose(0, 2)
+            .q_mat_mul(&cpu_weights)
+            .to_concrete();
 
         // Build expected via the transposed input layout.
         let mut expected_rows = Vec::with_capacity(batch);

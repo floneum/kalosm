@@ -264,7 +264,7 @@ where
     /// # Arguments
     /// * `repeats` - Number of times to repeat along each dimension
     pub fn repeat(&self, repeats: [usize; R]) -> Tensor<R, D> {
-        if repeats.iter().any(|&repeat| repeat == 0) {
+        if repeats.contains(&0) {
             let input_shape = self.shape();
             let output_shape = std::array::from_fn(|i| input_shape[i] * repeats[i]);
             return Tensor::zeros(&self.device(), output_shape);

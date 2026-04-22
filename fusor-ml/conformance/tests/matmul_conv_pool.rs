@@ -284,15 +284,13 @@ async fn matmul_transposed_operand_matches_host_reference() {
     })
     .arg(gen_lhs)
     .arg(gen_rhs_pre_t)
-    .equal_to_resolved_with_device(
-        async |a: Vec<Vec<f32>>, b: Vec<Vec<f32>>, device: Device| {
-            // Transpose the host reference too.
-            let b_t: Vec<Vec<f32>> = (0..b[0].len())
-                .map(|col| b.iter().map(|row| row[col]).collect())
-                .collect();
-            Tensor::new(&device, &matmul2(&a, &b_t))
-        },
-    )
+    .equal_to_resolved_with_device(async |a: Vec<Vec<f32>>, b: Vec<Vec<f32>>, device: Device| {
+        // Transpose the host reference too.
+        let b_t: Vec<Vec<f32>> = (0..b[0].len())
+            .map(|col| b.iter().map(|row| row[col]).collect())
+            .collect();
+        Tensor::new(&device, &matmul2(&a, &b_t))
+    })
     .compare_with(approx_compare::<2, f32>(1e-4))
     .runs(3)
     .await
@@ -316,12 +314,10 @@ async fn matmul_non_contiguous_input_matches_host_reference() {
     })
     .arg(gen_lhs_padded)
     .arg(gen_rhs)
-    .equal_to_resolved_with_device(
-        async |a: Vec<Vec<f32>>, b: Vec<Vec<f32>>, device: Device| {
-            let a_slice: Vec<Vec<f32>> = a.iter().map(|row| row[2..10].to_vec()).collect();
-            Tensor::new(&device, &matmul2(&a_slice, &b))
-        },
-    )
+    .equal_to_resolved_with_device(async |a: Vec<Vec<f32>>, b: Vec<Vec<f32>>, device: Device| {
+        let a_slice: Vec<Vec<f32>> = a.iter().map(|row| row[2..10].to_vec()).collect();
+        Tensor::new(&device, &matmul2(&a_slice, &b))
+    })
     .compare_with(approx_compare::<2, f32>(1e-4))
     .runs(3)
     .await

@@ -204,8 +204,7 @@ async fn shape_and_layout_ops_match_host_reference() {
 async fn tensor_i_op_matches_expected_views() {
     // 2D row select via PyTorch-style `i((row, ..))`
     for device in available_devices().await {
-        let matrix: Tensor<2, f32> =
-            Tensor::new(&device, &[[1.0f32, 2.0], [3.0, 4.0], [5.0, 6.0]]);
+        let matrix: Tensor<2, f32> = Tensor::new(&device, &[[1.0f32, 2.0], [3.0, 4.0], [5.0, 6.0]]);
         let row1 = matrix.i((1, ..));
         let expected = Tensor::new(&device, &[3.0f32, 4.0]);
         assert_approx_tensors(row1, expected, 0.0).await;
@@ -220,10 +219,7 @@ async fn tensor_i_op_matches_expected_views() {
     for device in available_devices().await {
         let cube: Tensor<3, f32> = Tensor::new(
             &device,
-            &[
-                [[1.0f32, 2.0], [3.0, 4.0]],
-                [[5.0, 6.0], [7.0, 8.0]],
-            ],
+            &[[[1.0f32, 2.0], [3.0, 4.0]], [[5.0, 6.0], [7.0, 8.0]]],
         );
         let mid0 = cube.i((.., 0, ..));
         let expected = Tensor::new(&device, &[[1.0f32, 2.0], [5.0, 6.0]]);
@@ -234,10 +230,7 @@ async fn tensor_i_op_matches_expected_views() {
     for device in available_devices().await {
         let tesseract: Tensor<4, f32> = Tensor::new(
             &device,
-            &[[
-                [[1.0f32, 2.0], [3.0, 4.0]],
-                [[5.0, 6.0], [7.0, 8.0]],
-            ]],
+            &[[[[1.0f32, 2.0], [3.0, 4.0]], [[5.0, 6.0], [7.0, 8.0]]]],
         );
         let outer = tesseract.i((0, .., .., ..));
         let expected = Tensor::new(
@@ -253,10 +246,12 @@ async fn broadcast_as_non_contiguous_input_matches_expected_view() {
     for device in available_devices().await {
         // Build a 2x3 tensor, slice the middle column out, and broadcast along
         // a new last axis. The slice gives the broadcast a non-contiguous source.
-        let source: Tensor<2, f32> =
-            Tensor::new(&device, &[[1.0f32, 2.0, 3.0], [4.0, 5.0, 6.0]]);
+        let source: Tensor<2, f32> = Tensor::new(&device, &[[1.0f32, 2.0, 3.0], [4.0, 5.0, 6.0]]);
         let sliced = source.slice([0..2, 1..3]).to_concrete();
-        let broadcast = sliced.unsqueeze::<3>(2).broadcast_as([2, 2, 4]).to_concrete();
+        let broadcast = sliced
+            .unsqueeze::<3>(2)
+            .broadcast_as([2, 2, 4])
+            .to_concrete();
 
         let expected_rows: Vec<Vec<Vec<f32>>> = vec![
             vec![vec![2.0; 4], vec![3.0; 4]],

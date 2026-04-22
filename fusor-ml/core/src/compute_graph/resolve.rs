@@ -310,11 +310,10 @@ impl Resolver {
             for dep in deps {
                 if let Some(count) = remaining_consumers.get_mut(&dep) {
                     *count = count.saturating_sub(1);
-                    if *count == 0 && !targets.contains(&dep) {
-                        if let Some(node) = graph.nodes.nodes.node_weight_mut(dep) {
+                    if *count == 0 && !targets.contains(&dep)
+                        && let Some(node) = graph.nodes.nodes.node_weight_mut(dep) {
                             node.cached = None;
                         }
-                    }
                 }
             }
         }

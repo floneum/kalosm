@@ -21,8 +21,8 @@ pub fn get_optimal_params(m: usize, n: usize, k: usize, device: &Device) -> MatM
         && m >= coop.block_m as usize
         && n >= coop.block_n as usize
         && k >= coop.block_k as usize
-        && m % coop.block_m as usize == 0
-        && n % coop.block_n as usize == 0
+        && m.is_multiple_of(coop.block_m as usize)
+        && n.is_multiple_of(coop.block_n as usize)
     {
         return MatMulParams::CoopMatMul(coop);
     }

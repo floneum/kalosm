@@ -562,7 +562,7 @@ fn emit_tile_b_load(
     k_base: &str,
     n_base: &str,
 ) {
-    if bn_pass % 4 == 0 {
+    if bn_pass.is_multiple_of(4) {
         let total_vec4_groups = block_k * (bn_pass / 4);
         let vec4_groups_per_thread = total_vec4_groups.div_ceil(wg_threads);
 

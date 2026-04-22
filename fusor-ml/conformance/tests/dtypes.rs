@@ -15,11 +15,7 @@ fn f16s(values: &[f32]) -> Vec<f16> {
     values.iter().copied().map(f16::from_f32).collect()
 }
 
-async fn assert_approx_f16<const R: usize>(
-    a: &Tensor<R, f16>,
-    b: &Tensor<R, f16>,
-    tol: f16,
-) {
+async fn assert_approx_f16<const R: usize>(a: &Tensor<R, f16>, b: &Tensor<R, f16>, tol: f16) {
     fusor_conformance::approx_eq(a, b, tol).await.unwrap();
 }
 
@@ -66,33 +62,48 @@ async fn f16_unary_ops_match_host_reference() {
 
         // abs
         let actual = input.abs().to_concrete();
-        let expected: Tensor<1, f16> =
-            Tensor::from_slice(&device, [6], &f16s(&inputs.iter().map(|x| x.abs()).collect::<Vec<_>>()));
+        let expected: Tensor<1, f16> = Tensor::from_slice(
+            &device,
+            [6],
+            &f16s(&inputs.iter().map(|x| x.abs()).collect::<Vec<_>>()),
+        );
         assert_approx_f16(&actual, &expected, f16::from_f32(1e-3)).await;
 
         // sin
         let actual = input.sin().to_concrete();
-        let expected: Tensor<1, f16> =
-            Tensor::from_slice(&device, [6], &f16s(&inputs.iter().map(|x| x.sin()).collect::<Vec<_>>()));
+        let expected: Tensor<1, f16> = Tensor::from_slice(
+            &device,
+            [6],
+            &f16s(&inputs.iter().map(|x| x.sin()).collect::<Vec<_>>()),
+        );
         assert_approx_f16(&actual, &expected, f16::from_f32(2e-3)).await;
 
         // cos
         let actual = input.cos().to_concrete();
-        let expected: Tensor<1, f16> =
-            Tensor::from_slice(&device, [6], &f16s(&inputs.iter().map(|x| x.cos()).collect::<Vec<_>>()));
+        let expected: Tensor<1, f16> = Tensor::from_slice(
+            &device,
+            [6],
+            &f16s(&inputs.iter().map(|x| x.cos()).collect::<Vec<_>>()),
+        );
         assert_approx_f16(&actual, &expected, f16::from_f32(2e-3)).await;
 
         // exp
         let actual = input.exp().to_concrete();
-        let expected: Tensor<1, f16> =
-            Tensor::from_slice(&device, [6], &f16s(&inputs.iter().map(|x| x.exp()).collect::<Vec<_>>()));
+        let expected: Tensor<1, f16> = Tensor::from_slice(
+            &device,
+            [6],
+            &f16s(&inputs.iter().map(|x| x.exp()).collect::<Vec<_>>()),
+        );
         assert_approx_f16(&actual, &expected, f16::from_f32(1e-2)).await;
 
         // sqrt (positive domain)
         let pos_input: Tensor<1, f16> = Tensor::from_slice(&device, [6], &f16s(&pos_inputs));
         let actual = pos_input.sqrt().to_concrete();
-        let expected: Tensor<1, f16> =
-            Tensor::from_slice(&device, [6], &f16s(&pos_inputs.iter().map(|x| x.sqrt()).collect::<Vec<_>>()));
+        let expected: Tensor<1, f16> = Tensor::from_slice(
+            &device,
+            [6],
+            &f16s(&pos_inputs.iter().map(|x| x.sqrt()).collect::<Vec<_>>()),
+        );
         assert_approx_f16(&actual, &expected, f16::from_f32(2e-3)).await;
     }
 }
@@ -136,8 +147,7 @@ async fn f16_pairwise_ops_match_host_reference() {
 async fn f16_zeros_matches_expected() {
     for device in available_devices().await {
         let zeros: Tensor<2, f16> = Tensor::<2, f16>::zeros(&device, [2, 3]);
-        let expected: Tensor<2, f16> =
-            Tensor::from_slice(&device, [2, 3], &f16s(&[0.0; 6]));
+        let expected: Tensor<2, f16> = Tensor::from_slice(&device, [2, 3], &f16s(&[0.0; 6]));
         exact_eq(&zeros, &expected).await.unwrap();
     }
 }
@@ -153,8 +163,7 @@ async fn f16_matmul_matches_host_reference() {
         let l: Tensor<2, f16> = Tensor::from_slice(&device, [2, 1], &f16s(&lhs));
         let r: Tensor<2, f16> = Tensor::from_slice(&device, [1, 2], &f16s(&rhs));
         let actual = l.matmul(&r).to_concrete();
-        let expected: Tensor<2, f16> =
-            Tensor::from_slice(&device, [2, 2], &f16s(&expected_vals));
+        let expected: Tensor<2, f16> = Tensor::from_slice(&device, [2, 2], &f16s(&expected_vals));
         assert_approx_f16(&actual, &expected, f16::from_f32(1e-2)).await;
     }
 }

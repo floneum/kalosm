@@ -529,11 +529,11 @@ impl NaryOperation {
                         if NaryExpr::is_elementwise_indices(indices) {
                             writeln!(function_body, "let output_{this_output} = input;")
                         } else {
-                            return Err(std::fmt::Error);
+                            Err(std::fmt::Error)
                         }
                     }
                     NaryExpr::DimIndex(_) => {
-                        return Err(std::fmt::Error);
+                        Err(std::fmt::Error)
                     }
                 }
             }

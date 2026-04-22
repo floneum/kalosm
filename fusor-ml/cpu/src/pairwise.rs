@@ -157,14 +157,12 @@ macro_rules! impl_f16_binary_op {
 impl_f16_binary_op!(AddOp, |a: half::f16, b: half::f16| a + b);
 impl_f16_binary_op!(SubOp, |a: half::f16, b: half::f16| a - b);
 impl_f16_binary_op!(MulOp, |a: half::f16, b: half::f16| a * b);
-impl_f16_binary_op!(
-    DivOp,
-    |a: half::f16, b: half::f16| half::f16::from_f32(a.to_f32() / b.to_f32())
-);
-impl_f16_binary_op!(
-    RemOp,
-    |a: half::f16, b: half::f16| half::f16::from_f32(a.to_f32() % b.to_f32())
-);
+impl_f16_binary_op!(DivOp, |a: half::f16, b: half::f16| half::f16::from_f32(
+    a.to_f32() / b.to_f32()
+));
+impl_f16_binary_op!(RemOp, |a: half::f16, b: half::f16| half::f16::from_f32(
+    a.to_f32() % b.to_f32()
+));
 
 /// Macro to define binary tensor operations (Add, Sub, Mul, Div)
 macro_rules! define_binary_tensor_op {
