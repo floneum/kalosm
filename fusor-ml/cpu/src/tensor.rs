@@ -651,6 +651,21 @@ impl FloatOps for f64 {
     }
 }
 
+impl FloatOps for half::f16 {
+    #[inline(always)]
+    fn powf(self, exp: Self) -> Self {
+        half::f16::from_f32(self.to_f32().powf(exp.to_f32()))
+    }
+    #[inline(always)]
+    fn float_max(self, other: Self) -> Self {
+        if self >= other { self } else { other }
+    }
+    #[inline(always)]
+    fn float_min(self, other: Self) -> Self {
+        if self <= other { self } else { other }
+    }
+}
+
 // Lazy unary operations
 impl<const R: usize, E, T> Tensor<R, T>
 where

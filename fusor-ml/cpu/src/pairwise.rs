@@ -130,6 +130,42 @@ impl_rem_op_scalar!(u64);
 impl_rem_op_scalar!(i32);
 impl_rem_op_scalar!(i64);
 
+// f16 binary ops: f16 has no native pulp SIMD, so `f16::Simd<S> = F16Scalar`
+// (single-lane wrapper). Each op forwards through f32 for math correctness.
+macro_rules! impl_f16_binary_op {
+    ($op:ty, $f:expr) => {
+        impl SimdBinaryOp<half::f16> for $op {
+            #[inline(always)]
+            fn apply_simd_vec<S: Simd>(
+                _simd: S,
+                a: crate::F16Scalar,
+                b: crate::F16Scalar,
+            ) -> crate::F16Scalar {
+                let f: fn(half::f16, half::f16) -> half::f16 = $f;
+                crate::F16Scalar(f(a.0, b.0))
+            }
+
+            #[inline(always)]
+            fn apply_scalar(a: half::f16, b: half::f16) -> half::f16 {
+                let f: fn(half::f16, half::f16) -> half::f16 = $f;
+                f(a, b)
+            }
+        }
+    };
+}
+
+impl_f16_binary_op!(AddOp, |a: half::f16, b: half::f16| a + b);
+impl_f16_binary_op!(SubOp, |a: half::f16, b: half::f16| a - b);
+impl_f16_binary_op!(MulOp, |a: half::f16, b: half::f16| a * b);
+impl_f16_binary_op!(
+    DivOp,
+    |a: half::f16, b: half::f16| half::f16::from_f32(a.to_f32() / b.to_f32())
+);
+impl_f16_binary_op!(
+    RemOp,
+    |a: half::f16, b: half::f16| half::f16::from_f32(a.to_f32() % b.to_f32())
+);
+
 /// Macro to define binary tensor operations (Add, Sub, Mul, Div)
 macro_rules! define_binary_tensor_op {
     ($name:ident, $std_trait:ident, $simd_op:ty, $error_msg:literal) => {
