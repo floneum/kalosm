@@ -1,0 +1,51 @@
+name: Criterion Compare
+description: Run Criterion on the PR and base branch, then compare baselines with critcmp.
+
+inputs:
+  branchName:
+    description: Base branch to compare against.
+    required: true
+  cwd:
+    description: Directory where the benchmark crate lives.
+    required: true
+  benchName:
+    description: Criterion benchmark target to run.
+    required: true
+
+runs:
+  using: composite
+  steps:
+    - name: Install critcmp
+      shell: bash
+      run: cargo install critcmp
+
+    - name: Benchmark changes
+      shell: bash
+      working-directory: ${{ inputs.cwd }}
+      run: cargo bench --bench "${{ inputs.benchName }}" -- --save-baseline changes
+
+    - name: Fetch base branch
+      shell: bash
+      run: git fetch --depth=1 origin "${{ inputs.branchName }}"
+
+    - name: Check out base branch
+      shell: bash
+      run: git checkout --detach FETCH_HEAD
+
+    - name: Benchmark base
+      shell: bash
+      working-directory: ${{ inputs.cwd }}
+      run: cargo bench --bench "${{ inputs.benchName }}" -- --save-baseline base
+
+    - name: Compare baselines
+      shell: bash
+      working-directory: ${{ inputs.cwd }}
+      run: |
+        set -o pipefail
+        {
+          echo "### Benchmark comparison: ${{ inputs.benchName }}"
+          echo
+          echo '```'
+          critcmp base changes
+          echo '```'
+        } | tee -a "$GITHUB_STEP_SUMMARY"

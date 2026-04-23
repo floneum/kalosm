@@ -9,7 +9,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - uses: actions/checkout@v6
-      - uses: boa-dev/criterion-compare-action@v3
+      - uses: ./.github/actions/criterion-compare
         with:
           cwd: "fusor-ml/core"
           benchName: "qmatmul"
@@ -22,7 +22,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - uses: actions/checkout@v6
-      - uses: boa-dev/criterion-compare-action@v3
+      - uses: ./.github/actions/criterion-compare
         with:
           cwd: "fusor-ml/core"
           benchName: "matmul"
@@ -35,7 +35,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - uses: actions/checkout@v6
-      - uses: boa-dev/criterion-compare-action@v3
+      - uses: ./.github/actions/criterion-compare
         with:
           cwd: "fusor-ml/core"
           benchName: "elementwise"
@@ -48,7 +48,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - uses: actions/checkout@v6
-      - uses: boa-dev/criterion-compare-action@v3
+      - uses: ./.github/actions/criterion-compare
         with:
           cwd: "fusor-ml/core"
           benchName: "fused"
@@ -61,7 +61,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - uses: actions/checkout@v6
-      - uses: boa-dev/criterion-compare-action@v3
+      - uses: ./.github/actions/criterion-compare
         with:
           cwd: "fusor-ml/core"
           benchName: "reduce"
@@ -74,7 +74,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - uses: actions/checkout@v6
-      - uses: boa-dev/criterion-compare-action@v3
+      - uses: ./.github/actions/criterion-compare
         with:
           cwd: "fusor-ml/core"
           benchName: "pairwise"
