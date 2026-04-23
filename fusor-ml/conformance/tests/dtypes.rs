@@ -7,8 +7,8 @@
 //! `f64`/`i32`/`i64`/`u8` are not part of the unified `fusor::Tensor` enum
 //! and are out of scope here.
 
-use fusor::{Device, Tensor};
-use fusor_conformance::{approx_eq, available_devices, exact_eq};
+use fusor::Tensor;
+use fusor_conformance::{approx_eq, available_devices, exact_eq, f16_capable_devices};
 use half::f16;
 
 fn f16s(values: &[f32]) -> Vec<f16> {
@@ -17,23 +17,6 @@ fn f16s(values: &[f32]) -> Vec<f16> {
 
 async fn assert_approx_f16<const R: usize>(a: &Tensor<R, f16>, b: &Tensor<R, f16>, tol: f16) {
     fusor_conformance::approx_eq(a, b, tol).await.unwrap();
-}
-
-/// Devices on which f16 shader ops are runnable.
-///
-/// `available_devices()` returns CPU + every GPU adapter, but not every GPU
-/// adapter exposes `wgpu::Features::SHADER_F16` (lavapipe in Linux CI does
-/// not). Filter those out so the f16 tests stay green on CPU + capable GPUs
-/// without claiming coverage we don't have on non-capable GPUs.
-async fn f16_capable_devices() -> Vec<Device> {
-    available_devices()
-        .await
-        .into_iter()
-        .filter(|d| match d {
-            Device::Cpu => true,
-            Device::Gpu(gpu) => gpu.f16_supported(),
-        })
-        .collect()
 }
 
 // ---- u32 ----

@@ -2,7 +2,7 @@ mod common;
 
 use common::{index_select1, index_select2, keepdim2, mean_axis2, reduce_axis2, var_axis2};
 use fusor::{Device, Tensor, arange};
-use fusor_conformance::{FuzzGenerator, approx_compare, relative_compare};
+use fusor_conformance::{FuzzGenerator, approx_compare, f16_capable_devices, relative_compare};
 use half::f16;
 use rand::distr::Uniform;
 
@@ -225,6 +225,7 @@ async fn indexing_cast_and_rank_specific_indexing_match_reference() {
         x.cast::<f16>().cast::<f32>().to_concrete()
     })
     .arg(fuzz)
+    .devices(f16_capable_devices().await)
     .equal_to_resolved_with_device(async |v: Vec<Vec<f32>>, device: Device| {
         let out: Vec<Vec<f32>> = v
             .iter()

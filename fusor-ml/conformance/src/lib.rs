@@ -45,6 +45,21 @@ pub async fn available_devices() -> Vec<Device> {
     devs
 }
 
+/// Return devices that can run f16 tensor operations.
+///
+/// CPU uses the scalar f16 fallback. GPUs must expose
+/// `wgpu::Features::SHADER_F16`; lavapipe in Linux CI does not.
+pub async fn f16_capable_devices() -> Vec<Device> {
+    available_devices()
+        .await
+        .into_iter()
+        .filter(|d| match d {
+            Device::Cpu => true,
+            Device::Gpu(gpu) => gpu.f16_supported(),
+        })
+        .collect()
+}
+
 fn index_iter<const R: usize>(shape: [usize; R]) -> impl Iterator<Item = [usize; R]> {
     let total: usize = shape.iter().product();
     (0..total).map(move |flat| {
