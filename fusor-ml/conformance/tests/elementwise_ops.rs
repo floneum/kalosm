@@ -113,13 +113,16 @@ async fn unary_math_ops_match_host_reference() {
         1e-4
     );
 
+    // Windows WARP's native tanh path drifts from libm by ~1.1e-4 in CI.
+    // Keep this tight enough to catch algorithmic errors while covering
+    // backend transcendental precision differences.
     // tanh
     fuzz_unary!(
         _tanh,
         signed(),
         |x: Tensor<2, f32>| x.tanh().to_concrete(),
         f32::tanh,
-        1e-4
+        2e-4
     );
 
     // atan
@@ -290,8 +293,8 @@ async fn activation_and_scalar_ops_match_host_reference() {
     // silu
     fuzz_unary!(_silu, signed(), |x: Tensor<2, f32>| x.silu(), silu, 1e-5);
 
-    // gelu
-    fuzz_unary!(_gelu, signed(), |x: Tensor<2, f32>| x.gelu(), gelu, 2e-4);
+    // gelu compounds the same WARP tanh drift in its polynomial approximation.
+    fuzz_unary!(_gelu, signed(), |x: Tensor<2, f32>| x.gelu(), gelu, 1e-3);
 
     // add_scalar
     fuzz_unary!(
