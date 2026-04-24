@@ -28,6 +28,7 @@ pub(crate) fn general_sgemv(
     workgroup_size: &WorkgroupShape,
     input_a: &TensorInput,
     input_b: &QMatrixInput,
+    bias: Option<&TensorInput>,
     output: &TensorInput,
     n_size: &str,
     m_size: &str,
@@ -327,11 +328,12 @@ pub(crate) fn general_sgemv(
         output.strided_index(kernel, output_indices);
         // Convert from f32 accumulator to output dtype (single element per iteration)
         let acc_val = maybe_vec_storage_index(SGEMV_CHUNK_SIZE, "acc", "acc_offset");
-        let result = post_fns
-            .iter()
-            .fold(format!("{input_datatype}({acc_val})"), |acc, f| {
-                f.call(vec![acc])
-            });
+        let result = op.apply_bias_and_post(
+            bias,
+            "output_index",
+            format!("{input_datatype}({acc_val})"),
+            post_fns,
+        );
         writeln!(kernel, "] = {result};").unwrap();
     };
 

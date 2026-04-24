@@ -8,16 +8,6 @@ use fusor::{
 
 use crate::moonshine_config::{MoonshineStreamingConfig, MoonshineStreamingEncoderConfig};
 
-fn materialize_if_gpu<const R: usize, D, B>(tensor: &Tensor<R, D, B>)
-where
-    B: fusor::TensorBacking<R, Elem = D>,
-    D: fusor::SimdElement + fusor::DataType + 'static,
-{
-    if tensor.is_gpu() {
-        tensor.materialize_blocking();
-    }
-}
-
 fn tensor1d(device: &Device, vb: &mut VarBuilder, name: &str) -> Result<Tensor<1, f32>> {
     let q = vb.get(name, device)?;
     let shape = q.shape();
@@ -150,25 +140,17 @@ fn stable_gelu_3d<B>(x: &Tensor<3, f32, B>) -> Tensor<3, f32>
 where
     B: fusor::TensorBacking<3, Elem = f32>,
 {
-    let x = x.to_materialized_blocking();
-    let x_squared = x.mul_(&x).to_materialized_blocking();
-    let inner_factor = x_squared
-        .mul_scalar(0.044715)
-        .add_scalar(1.0)
-        .to_materialized_blocking();
-    let inner = x.mul_(&inner_factor).to_materialized_blocking();
+    let x = x.to_concrete();
+    let x_squared = x.mul_(&x).to_concrete();
+    let inner_factor = x_squared.mul_scalar(0.044715).add_scalar(1.0).to_concrete();
+    let inner = x.mul_(&inner_factor).to_concrete();
     let tanh_input = inner
         .mul_scalar((2.0 / std::f32::consts::PI).sqrt())
-        .to_materialized_blocking();
-    let tanh_input = tanh_input.clamp(-10.0, 10.0).to_materialized_blocking();
-    let tanh_result = tanh_input
-        .tanh()
-        .clamp(-1.0, 1.0)
-        .to_materialized_blocking();
-    let one_plus_tanh = tanh_result.add_scalar(1.0).to_materialized_blocking();
-    x.mul_(&one_plus_tanh)
-        .mul_scalar(0.5)
-        .to_materialized_blocking()
+        .to_concrete();
+    let tanh_input = tanh_input.clamp(-10.0, 10.0).to_concrete();
+    let tanh_result = tanh_input.tanh().clamp(-1.0, 1.0).to_concrete();
+    let one_plus_tanh = tanh_result.add_scalar(1.0).to_concrete();
+    x.mul_(&one_plus_tanh).mul_scalar(0.5).to_concrete()
 }
 
 struct UnitOffsetLayerNorm {
@@ -193,7 +175,7 @@ impl UnitOffsetLayerNorm {
     where
         B: fusor::TensorBacking<3, Elem = f32>,
     {
-        let normed = self.norm.forward_fused(x);
+        let normed = self.norm.forward(x);
         let gamma = self.gamma.add_scalar(self.unit_offset);
         let weight = gamma.broadcast_as(normed.shape());
         normed.mul_(&weight).to_concrete()
@@ -273,6 +255,9 @@ impl MoonshineAttention {
         };
         if self.rotary_dim == 0 {
             return (q, k);
+        }
+        if self.rotary_dim < self.head_dim {
+            return cache.forward_interleaved_partial(&q, &k, start_pos, self.rotary_dim);
         }
         let q_rot = q.narrow(3, 0, self.rotary_dim).to_concrete();
         let k_rot = k.narrow(3, 0, self.rotary_dim).to_concrete();
@@ -378,7 +363,7 @@ impl MoonshineAttention {
         let k = self.reshape_heads(k);
         let v = self.reshape_heads(v);
 
-        if attention_output.is_none() && !q.is_gpu() {
+        if attention_output.is_none() {
             let mask = attention_mask.map(|mask| (mask.mask(), MaskKind::QKMask));
             let context = q
                 .flash_attention(&k, &v, self.scale.powf(-0.5), mask)
@@ -471,7 +456,7 @@ impl MoonshineEncoderMlp {
     }
 
     fn forward(&self, x: &Tensor<3, f32>) -> Tensor<3, f32> {
-        let hidden = self.fc1.forward(x).to_materialized_blocking();
+        let hidden = self.fc1.forward(x).to_concrete();
         let hidden = stable_gelu_3d(&hidden);
         self.fc2.forward(&hidden)
     }
@@ -494,13 +479,8 @@ impl MoonshineDecoderMlp {
 
     fn forward(&self, x: &Tensor<3, f32>) -> Tensor<3, f32> {
         let hidden = self.fc1.forward(x).to_concrete();
-        let states = hidden.narrow(2, 0, self.intermediate_size).to_concrete();
-        let gate = hidden
-            .narrow(2, self.intermediate_size, self.intermediate_size)
-            .to_concrete()
-            .silu()
-            .to_concrete();
-        self.fc2.forward(&states.mul_(&gate).to_concrete())
+        self.fc2
+            .forward(&hidden.swiglu_split(self.intermediate_size))
     }
 }
 
@@ -573,11 +553,9 @@ impl MoonshineEncoderLayer {
         let attn = self
             .self_attn
             .forward(&attn_in, &attn_in, Some(attention_mask), None)?;
-        materialize_if_gpu(&attn);
         let hidden_states = (hidden_states + &attn).to_concrete();
         let mlp_in = self.post_attention_layernorm.forward(&hidden_states);
         let mlp = self.mlp.forward(&mlp_in);
-        materialize_if_gpu(&mlp);
         Ok((hidden_states + mlp).to_concrete())
     }
 
@@ -619,7 +597,7 @@ impl MoonshineEncoderLayer {
         if let Some(new_hidden_states) = new_hidden_states {
             parts.push(new_hidden_states);
         }
-        let combined_inputs = Tensor::cat(parts, 1).to_materialized_blocking();
+        let combined_inputs = Tensor::cat(parts, 1).to_concrete();
 
         let emit_len = if flush {
             working_len
@@ -631,7 +609,7 @@ impl MoonshineEncoderLayer {
         state.pending_inputs = (pending_len > 0).then(|| {
             combined_inputs
                 .narrow(1, pending_start, pending_len)
-                .to_materialized_blocking()
+                .to_concrete()
         });
 
         let finalized_input_end = left_context_len + emit_len;
@@ -639,7 +617,7 @@ impl MoonshineEncoderLayer {
         state.left_context_inputs = (keep_left > 0).then(|| {
             combined_inputs
                 .narrow(1, finalized_input_end - keep_left, keep_left)
-                .to_materialized_blocking()
+                .to_concrete()
         });
 
         if emit_len == 0 {
@@ -667,11 +645,9 @@ impl MoonshineEncoderLayer {
             Some(&attention_mask),
             None,
         )?;
-        materialize_if_gpu(&attn);
         let hidden_states = (residual_inputs + &attn).to_concrete();
         let mlp_in = self.post_attention_layernorm.forward(&hidden_states);
         let mlp = self.mlp.forward(&mlp_in);
-        materialize_if_gpu(&mlp);
         Ok(Some((hidden_states + mlp).to_concrete()))
     }
 }
@@ -737,7 +713,6 @@ impl MoonshineDecoderLayer {
         let self_attn =
             self.self_attn
                 .forward(&self_attn_in, &self_attn_in, Some(causal_mask), None)?;
-        materialize_if_gpu(&self_attn);
         let hidden_states = (hidden_states + &self_attn).to_concrete();
 
         let cross_attn_in = self.post_attention_layernorm.forward_fused(&hidden_states);
@@ -747,12 +722,10 @@ impl MoonshineDecoderLayer {
             None,
             attention_output,
         )?;
-        materialize_if_gpu(&cross_attn);
         let hidden_states = (hidden_states + &cross_attn).to_concrete();
 
         let mlp_in = self.final_layernorm.forward_fused(&hidden_states);
         let mlp = self.mlp.forward(&mlp_in);
-        materialize_if_gpu(&mlp);
         Ok((hidden_states + mlp).to_concrete())
     }
 
@@ -780,7 +753,6 @@ impl MoonshineDecoderLayer {
             Some(self_attention_mask),
             None,
         )?;
-        materialize_if_gpu(&self_attn);
         let hidden_states = (hidden_states + &self_attn).to_concrete();
 
         let cross_attn_in = self.post_attention_layernorm.forward_fused(&hidden_states);
@@ -790,12 +762,10 @@ impl MoonshineDecoderLayer {
             None,
             attention_output,
         )?;
-        materialize_if_gpu(&cross_attn);
         let hidden_states = (hidden_states + &cross_attn).to_concrete();
 
         let mlp_in = self.final_layernorm.forward_fused(&hidden_states);
         let mlp = self.mlp.forward(&mlp_in);
-        materialize_if_gpu(&mlp);
         Ok((hidden_states + mlp).to_concrete())
     }
 }
@@ -881,7 +851,7 @@ impl MoonshineEncoder {
         (len > 0).then(|| {
             tensor
                 .narrow(dim, tensor.shape()[dim] - len, len)
-                .to_materialized_blocking()
+                .to_concrete()
         })
     }
 
@@ -957,7 +927,7 @@ impl MoonshineEncoder {
         Some(
             output
                 .narrow(2, output.shape()[2] - new_conv1_frames, new_conv1_frames)
-                .to_materialized_blocking(),
+                .to_concrete(),
         )
     }
 
@@ -1020,7 +990,7 @@ impl MoonshineEncoder {
         Some(
             output
                 .narrow(1, output.shape()[1] - new_seen_frames, new_seen_frames)
-                .to_materialized_blocking(),
+                .to_concrete(),
         )
     }
 
@@ -1060,18 +1030,10 @@ impl MoonshineEncoder {
                 window[1],
                 flush,
             )?;
-            if let Some(layer_hidden_states) = &hidden_states {
-                if (idx + 1) % 4 == 0 {
-                    materialize_if_gpu(layer_hidden_states);
-                }
-            }
         }
 
-        let finalized_hidden_states = hidden_states.map(|hidden_states| {
-            self.final_norm
-                .forward(&hidden_states)
-                .to_materialized_blocking()
-        });
+        let finalized_hidden_states = hidden_states
+            .map(|hidden_states| self.final_norm.forward(&hidden_states).to_concrete());
         if let Some(finalized_hidden_states) = &finalized_hidden_states {
             state.total_finalized_frames += finalized_hidden_states.shape()[1];
         }
@@ -1114,9 +1076,6 @@ impl MoonshineEncoder {
             let window = self.config.sliding_windows[idx];
             let mask = sliding_window_mask(device, seq_len, window[0], window[1]);
             hidden_states = layer.forward(&hidden_states, &mask)?;
-            if (idx + 1) % 4 == 0 {
-                materialize_if_gpu(&hidden_states);
-            }
         }
 
         Ok(self.final_norm.forward(&hidden_states))
@@ -1216,7 +1175,7 @@ impl MoonshineDecoder {
     ) -> Result<Tensor<3, f32>> {
         Ok(self
             .adapt_encoder(encoder_hidden_states, start_pos)?
-            .to_materialized_blocking())
+            .to_concrete())
     }
 
     pub fn decode_prepared(
@@ -1266,16 +1225,13 @@ impl MoonshineDecoder {
         let token_tensor: Tensor<1, u32> = Tensor::new(&device, tokens);
         let token_tensor = token_tensor.unsqueeze(0).to_concrete();
         let mut hidden_states: Tensor<3, f32> = self.token_embedding.forward(&token_tensor);
-        materialize_if_gpu(&hidden_states);
 
         for (i, layer) in self.layers.iter_mut().enumerate() {
             if cache.layers.len() <= i {
                 let cross_attn_kv = layer.encoder_attn.project_kv(encoder_hidden_states);
-                let materialized =
-                    Tensor::to_materialized_many_blocking(&[&cross_attn_kv.0, &cross_attn_kv.1]);
                 cache.layers.push(MoonshineDecoderLayerCache {
                     self_attn: MoonshineAttentionCache::new(self.max_target_positions),
-                    cross_attn_kv: (materialized[0].clone(), materialized[1].clone()),
+                    cross_attn_kv,
                 });
             }
 
@@ -1286,12 +1242,19 @@ impl MoonshineDecoder {
                 &mut cache.layers[i],
                 None,
             )?;
-            materialize_if_gpu(&hidden_states);
         }
 
         cache.encoder_seq_len = encoder_hidden_states.shape()[1];
         let hidden_states = self.norm.forward_fused(&hidden_states);
         Ok(self.output.forward(&hidden_states))
+    }
+
+    pub fn prepare_cross_attention_cache(
+        &mut self,
+        encoder_hidden_states: &Tensor<3, f32>,
+        cache: &mut MoonshineDecoderCache,
+    ) -> Result<()> {
+        self.sync_cross_attention_kv(encoder_hidden_states, cache)
     }
 
     pub fn decode(
@@ -1314,7 +1277,18 @@ impl MoonshineDecoder {
             cache.encoder_seq_len = 0;
             return Ok(());
         }
-        if cache.layers.is_empty() || cache.encoder_seq_len >= encoder_seq_len {
+        if cache.layers.is_empty() {
+            for layer in self.layers.iter_mut() {
+                let cross_attn_kv = layer.encoder_attn.project_kv(encoder_hidden_states);
+                cache.layers.push(MoonshineDecoderLayerCache {
+                    self_attn: MoonshineAttentionCache::new(self.max_target_positions),
+                    cross_attn_kv,
+                });
+            }
+            cache.encoder_seq_len = encoder_seq_len;
+            return Ok(());
+        }
+        if cache.encoder_seq_len >= encoder_seq_len {
             return Ok(());
         }
 
@@ -1324,24 +1298,20 @@ impl MoonshineDecoder {
                 cache.encoder_seq_len,
                 encoder_seq_len - cache.encoder_seq_len,
             )
-            .to_materialized_blocking();
+            .to_concrete();
         for (layer, layer_cache) in self.layers.iter_mut().zip(cache.layers.iter_mut()) {
             let new_cross_attn_kv = layer.encoder_attn.project_kv(&new_encoder_hidden_states);
-            let materialized = Tensor::to_materialized_many_blocking(&[
-                &new_cross_attn_kv.0,
-                &new_cross_attn_kv.1,
-            ]);
             layer_cache.cross_attn_kv = (
                 Tensor::cat(
-                    [layer_cache.cross_attn_kv.0.clone(), materialized[0].clone()],
+                    [layer_cache.cross_attn_kv.0.clone(), new_cross_attn_kv.0],
                     1,
                 )
-                .to_materialized_blocking(),
+                .to_concrete(),
                 Tensor::cat(
-                    [layer_cache.cross_attn_kv.1.clone(), materialized[1].clone()],
+                    [layer_cache.cross_attn_kv.1.clone(), new_cross_attn_kv.1],
                     1,
                 )
-                .to_materialized_blocking(),
+                .to_concrete(),
             );
         }
         cache.encoder_seq_len = encoder_seq_len;
@@ -1371,7 +1341,7 @@ impl Moonshine {
 mod tests {
     use super::*;
     use crate::moonshine_config::MoonshineStreamingConfig;
-    use std::{fs, io::Cursor, path::Path};
+    use std::{fs, io::Cursor, path::Path, path::PathBuf};
 
     fn load_tiny_from_single_gguf() -> Option<(Moonshine, MoonshineStreamingConfig, Device)> {
         load_tiny_with_device(Device::cpu())
@@ -1383,6 +1353,13 @@ mod tests {
         let path = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("artifacts")
             .join("moonshine-streaming-tiny.gguf");
+        let path = if path.exists() {
+            path
+        } else if let Ok(path) = std::env::var("RWHISPER_MOONSHINE_GGUF") {
+            PathBuf::from(path)
+        } else {
+            path
+        };
         if !path.exists() {
             return None;
         }
@@ -1460,6 +1437,107 @@ mod tests {
         assert!(
             max_diff < 0.1,
             "streaming encoder diverged from full encoder on JFK: max_diff={max_diff}"
+        );
+    }
+
+    #[tokio::test]
+    async fn gpu_encoder_matches_cpu_on_zeros() {
+        let Some((cpu_model, config, cpu_device)) = load_tiny_with_device(Device::cpu()) else {
+            return;
+        };
+        let Ok(gpu_device) = Device::new().await else {
+            return;
+        };
+        let Some((gpu_model, _, gpu_device)) = load_tiny_with_device(gpu_device) else {
+            return;
+        };
+
+        let samples = vec![0.0f32; config.encoder_config.frame_len() * 80];
+        let cpu = cpu_model.encoder.encode(&cpu_device, &samples).unwrap();
+        let gpu = gpu_model.encoder.encode(&gpu_device, &samples).unwrap();
+
+        let cpu = cpu.as_slice().await.unwrap();
+        let gpu = gpu.as_slice().await.unwrap();
+        assert_eq!(cpu.shape(), gpu.shape());
+        let max_diff = cpu
+            .as_slice()
+            .iter()
+            .zip(gpu.as_slice())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        eprintln!("moonshine GPU encoder max_diff vs CPU = {max_diff}");
+        assert!(
+            max_diff < 0.1,
+            "GPU encoder diverged from CPU encoder: max_diff={max_diff}"
+        );
+    }
+
+    #[tokio::test]
+    async fn gpu_cached_decode_matches_cpu_on_zeros() {
+        let Some((mut cpu_model, config, cpu_device)) = load_tiny_with_device(Device::cpu()) else {
+            return;
+        };
+        let Ok(gpu_device) = Device::new().await else {
+            return;
+        };
+        let Some((mut gpu_model, _, gpu_device)) = load_tiny_with_device(gpu_device) else {
+            return;
+        };
+
+        let samples = vec![0.0f32; config.encoder_config.frame_len() * 80];
+        let cpu_encoder_hidden_states = cpu_model.encoder.encode(&cpu_device, &samples).unwrap();
+        let gpu_encoder_hidden_states = gpu_model.encoder.encode(&gpu_device, &samples).unwrap();
+        let cpu_prepared = cpu_model
+            .decoder
+            .prepare_encoder_hidden_states(&cpu_encoder_hidden_states)
+            .unwrap();
+        let gpu_prepared = gpu_model
+            .decoder
+            .prepare_encoder_hidden_states(&gpu_encoder_hidden_states)
+            .unwrap();
+
+        let tokens = [
+            config.decoder_start_token(),
+            123,
+            456,
+            config.eos_token_id.saturating_sub(1),
+        ];
+        let mut cpu_cache = MoonshineDecoderCache::default();
+        let mut gpu_cache = MoonshineDecoderCache::default();
+        let mut cpu_logits = cpu_model
+            .decoder
+            .decode_cached(&tokens[..1], &cpu_prepared, &mut cpu_cache)
+            .unwrap();
+        let mut gpu_logits = gpu_model
+            .decoder
+            .decode_cached(&tokens[..1], &gpu_prepared, &mut gpu_cache)
+            .unwrap();
+        for token in &tokens[1..] {
+            cpu_logits = cpu_model
+                .decoder
+                .decode_cached(&[*token], &cpu_prepared, &mut cpu_cache)
+                .unwrap();
+            gpu_logits = gpu_model
+                .decoder
+                .decode_cached(&[*token], &gpu_prepared, &mut gpu_cache)
+                .unwrap();
+        }
+
+        let cpu_last = cpu_logits.squeeze(0).squeeze(0).to_concrete();
+        let gpu_last = gpu_logits.squeeze(0).squeeze(0).to_concrete();
+        let cpu_last = cpu_last.as_slice().await.unwrap();
+        let gpu_last = gpu_last.as_slice().await.unwrap();
+        assert_eq!(cpu_last.shape(), gpu_last.shape());
+        let max_diff = cpu_last
+            .as_slice()
+            .iter()
+            .zip(gpu_last.as_slice())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        eprintln!("moonshine GPU cached decode max_diff vs CPU = {max_diff}");
+        assert!(
+            max_diff < 0.1,
+            "GPU cached decode diverged from CPU: max_diff={max_diff}"
         );
     }
 

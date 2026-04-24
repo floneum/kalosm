@@ -63,6 +63,7 @@ pub fn chunked_sgemm_with_config(
     kernel: &mut GenericKernel,
     input_a: &TensorInput,
     input_b: &QMatrixInput,
+    bias: Option<&TensorInput>,
     output: &TensorInput,
     k_size: &str,
     config: ChunkedSgemmConfig,
@@ -385,12 +386,13 @@ pub fn chunked_sgemm_with_config(
     }
     writeln!(kernel, "}}").unwrap();
 
-    write_acc_back(kernel, op, output, output_offset, &config).unwrap();
+    write_acc_back(kernel, op, bias, output, output_offset, &config).unwrap();
 }
 
 fn write_acc_back(
     kernel: &mut GenericKernel,
     op: &QMatMulOperation,
+    bias: Option<&TensorInput>,
     output: &TensorInput,
     output_offset: &str,
     config: &ChunkedSgemmConfig,
@@ -425,12 +427,14 @@ fn write_acc_back(
                     write!(kernel, "let output_index = ")?;
                     output.strided_index(kernel, output_indices.iter().cloned());
                     writeln!(kernel, ";")?;
-                    let result = post_element_wise_functions.iter().fold(
+                    let result = op.apply_bias_and_post(
+                        bias,
+                        &format!("{output_offset}.y + {tile_n} * 4u + y_offset"),
                         format!(
                             "{}(acc[{tile_m}][{tile_n}][y_offset][x_offset])",
                             op.input_datatype
                         ),
-                        |acc, f| f.call(vec![acc]),
+                        &post_element_wise_functions,
                     );
                     writeln!(kernel, "{output}[output_index] = {result};")?;
                     std::fmt::Result::Ok(())

@@ -42,9 +42,11 @@ fn generate_row_computation(
 
 /// Generate WGSL for writing one row's output
 fn generate_row_output(
+    op: &QMatMulOperation,
     kernel: &mut GenericKernel,
     offset: u32,
     input_datatype: DataTypeEnum,
+    bias: Option<&TensorInput>,
     output: &TensorInput,
     post_element_wise_functions: &[crate::mir::function::Function],
 ) {
@@ -57,11 +59,12 @@ fn generate_row_output(
     output_indices.push("row_index".to_string());
     output.strided_index(kernel, output_indices);
     let indexed = maybe_vec_storage_index(Q_8_0_SGEMV_CHUNK_SIZE, "sum", offset);
-    let result = post_element_wise_functions
-        .iter()
-        .fold(format!("{input_datatype}({indexed})"), |acc, f| {
-            f.call(vec![acc])
-        });
+    let result = op.apply_bias_and_post(
+        bias,
+        "row_index",
+        format!("{input_datatype}({indexed})"),
+        post_element_wise_functions,
+    );
     writeln!(kernel, "] = {result};").unwrap();
 }
 
@@ -73,6 +76,7 @@ pub(crate) fn q_8_0_sgemv(
     workgroup_shape: &WorkgroupShape,
     input_a: &TensorInput,
     input_b: &QMatrixInput,
+    bias: Option<&TensorInput>,
     output: &TensorInput,
     n_size: &str,
     m_size: &str,
@@ -227,7 +231,7 @@ pub(crate) fn q_8_0_sgemv(
         writeln!(kernel, "{{").unwrap();
         writeln!(kernel, "if {subgroup_local_index} == 0u {{").unwrap();
         writeln!(kernel, "let row_index = row + {offset}u;").unwrap();
-        generate_row_output(kernel, offset, input_datatype, output, post_fns);
+        generate_row_output(op, kernel, offset, input_datatype, bias, output, post_fns);
         writeln!(kernel, "}}").unwrap();
         writeln!(kernel, "}}").unwrap();
     }
@@ -238,7 +242,7 @@ pub(crate) fn q_8_0_sgemv(
         writeln!(kernel, "if {subgroup_local_index} == 0u {{").unwrap();
         writeln!(kernel, "let row_index = row + {offset}u;").unwrap();
         writeln!(kernel, "if row_index < {n_size} {{").unwrap();
-        generate_row_output(kernel, offset, input_datatype, output, post_fns);
+        generate_row_output(op, kernel, offset, input_datatype, bias, output, post_fns);
         writeln!(kernel, "}}").unwrap();
         writeln!(kernel, "}}").unwrap();
         writeln!(kernel, "}}").unwrap();

@@ -120,6 +120,26 @@ where
         crate::AddOp: fusor_cpu::SimdBinaryOp<D>,
         fusor_cpu::SumOp: fusor_cpu::SimdReduceOp<D>,
     {
+        if let Tensor::Gpu(input) = input {
+            let Tensor::Gpu(weight) = &self.weight else {
+                panic!("Conv1d input and weight must be on the same device");
+            };
+            let bias = self.bias.as_ref().map(|bias| {
+                let Tensor::Gpu(bias) = bias else {
+                    panic!("Conv1d input and bias must be on the same device");
+                };
+                bias
+            });
+
+            return Tensor::Gpu(input.conv1d_grouped(
+                weight,
+                bias,
+                self.config.padding,
+                self.config.stride,
+                self.config.groups,
+            ));
+        }
+
         if self.config.groups == 1 {
             return input.conv(
                 &self.weight,
@@ -305,6 +325,62 @@ mod tests {
         assert!((result[[0, 1, 1]] - -10.0).abs() < 1e-5);
         assert!((result[[0, 1, 2]] - -10.0).abs() < 1e-5);
         assert!((result[[0, 1, 3]] - 15.0).abs() < 1e-5);
+    }
+
+    #[tokio::test]
+    async fn test_conv1d_depthwise_groups_cpu_vs_gpu_single_kernel() {
+        use crate::Device;
+
+        let config = Conv1dConfig {
+            padding: 1,
+            stride: 1,
+            groups: 2,
+            dilation: 1,
+        };
+
+        let input_data = [
+            1.0f32, 2.0, 3.0, 4.0, //
+            10.0, 20.0, 30.0, 40.0,
+        ];
+        let weight_data = [
+            1.0f32, 0.0, -1.0, //
+            0.5, 0.25, -0.5,
+        ];
+        let bias_data = [0.5f32, -1.0];
+
+        let input_cpu: Tensor<3, f32> =
+            Tensor::Cpu(fusor_cpu::Tensor::from_slice([1, 2, 4], &input_data));
+        let weight_cpu: Tensor<3, f32> =
+            Tensor::Cpu(fusor_cpu::Tensor::from_slice([2, 1, 3], &weight_data));
+        let bias_cpu: Tensor<1, f32> = Tensor::Cpu(fusor_cpu::Tensor::from_slice([2], &bias_data));
+        let conv_cpu = Conv1d::new(weight_cpu, Some(bias_cpu), config);
+        let output_cpu = conv_cpu.forward(&input_cpu);
+        let result_cpu = output_cpu.as_slice().await.unwrap();
+
+        let gpu_device = Device::new().await.expect("GPU required for this test");
+        let input_gpu: Tensor<3, f32> = Tensor::from_slice(&gpu_device, [1, 2, 4], &input_data);
+        let weight_gpu: Tensor<3, f32> = Tensor::from_slice(&gpu_device, [2, 1, 3], &weight_data);
+        let bias_gpu: Tensor<1, f32> = Tensor::from_slice(&gpu_device, [2], &bias_data);
+        let conv_gpu = Conv1d::new(weight_gpu, Some(bias_gpu), config);
+        let output_gpu = conv_gpu.forward(&input_gpu);
+        if let Tensor::Gpu(output) = &output_gpu {
+            assert_eq!(output.count_kernels_to_resolve(), 1);
+        }
+        let result_gpu = output_gpu.as_slice().await.unwrap();
+
+        assert_eq!(result_cpu.shape(), result_gpu.shape());
+        for batch in 0..1 {
+            for channel in 0..2 {
+                for position in 0..4 {
+                    let cpu_val = result_cpu[[batch, channel, position]];
+                    let gpu_val = result_gpu[[batch, channel, position]];
+                    assert!(
+                        (cpu_val - gpu_val).abs() < 1e-5,
+                        "Mismatch at [{batch}, {channel}, {position}]: cpu={cpu_val}, gpu={gpu_val}"
+                    );
+                }
+            }
+        }
     }
 
     #[tokio::test]

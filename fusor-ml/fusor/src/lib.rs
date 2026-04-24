@@ -404,11 +404,9 @@ where
 
     /// Materialize the tensor to a concrete form.
     ///
-    /// For CPU tensors, this evaluates any lazy expressions.
-    /// For GPU tensors, this materializes a strided view into a contiguous
-    /// buffer so subsequent ops (and direct buffer reads via `as_slice`)
-    /// observe data in logical-shape order. This matches the CPU semantics
-    /// of `to_concrete`.
+    /// For CPU tensors, this evaluates any lazy expressions. GPU tensors stay
+    /// lazy so graph resolution can keep the full operation chain in one
+    /// deferred GPU pass.
     pub fn to_concrete(&self) -> Tensor<R, D>
     where
         B: TensorBacking<R>,
@@ -416,7 +414,7 @@ where
     {
         match self {
             Tensor::Cpu(t) => Tensor::Cpu(t.to_concrete()),
-            Tensor::Gpu(t) => Tensor::Gpu(t.clone().contiguous()),
+            Tensor::Gpu(t) => Tensor::Gpu(t.clone()),
         }
     }
 
@@ -1252,6 +1250,34 @@ where
 
             // Mixed - panic
             _ => panic!("Cannot mix CPU and GPU tensors in q_mat_mul"),
+        }
+    }
+
+    pub fn q_mat_mul_bias<B2>(
+        &self,
+        weights: &crate::QMatrix,
+        bias: &Tensor<1, f32, B2>,
+    ) -> Tensor<R, f32>
+    where
+        B2: TensorBacking<1, Elem = f32>,
+        (fusor_core::Tensor<R, f32>, fusor_core::Tensor<1, f32>): fusor_core::MaxRank<R, f32>,
+        (ConcreteTensor<f32, R>, ConcreteTensor<f32, 1>): fusor_cpu::MaxRank<R, f32>,
+        AddOp: SimdBinaryOp<f32>,
+    {
+        use crate::QMatrix;
+        use fusor_gguf::GgmlType;
+
+        if matches!(weights.ggml_type(), GgmlType::F16 | GgmlType::F32) {
+            return self.q_mat_mul(weights).add_(bias);
+        }
+
+        match (self, weights, bias) {
+            (Tensor::Gpu(lhs), QMatrix::Gpu(rhs), Tensor::Gpu(bias)) => {
+                let bias = bias.clone();
+                Tensor::Gpu(lhs.q_mat_mul_bias(rhs, &bias))
+            }
+            (Tensor::Cpu(_), _, _) => self.q_mat_mul(weights).add_(bias),
+            _ => panic!("Cannot mix CPU and GPU tensors in q_mat_mul_bias"),
         }
     }
 }

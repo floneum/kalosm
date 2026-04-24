@@ -13,6 +13,10 @@ use crate::{
 };
 use fusor::{Device, Tensor, VarBuilder};
 
+fn moonshine_profile() -> bool {
+    std::env::var("RWHISPER_MOONSHINE_PROFILE").ok().as_deref() == Some("1")
+}
+
 #[derive(Clone)]
 struct CandidateDecode {
     tokens: Vec<u32>,
@@ -27,6 +31,7 @@ struct MoonshineStreamState {
     last_candidate: Option<CandidateDecode>,
     encoder_state: MoonshineEncoderStreamState,
     prepared_encoder_hidden_states: Option<Tensor<3, f32>>,
+    decoder_cross_cache: MoonshineDecoderCache,
     decoder_prefix_cache: MoonshineDecoderCache,
     decoder_prefix_tokens: Vec<u32>,
     last_decoded_finalized_frames: usize,
@@ -155,11 +160,15 @@ impl MoonshineRuntime {
         encoder_hidden_states: &Tensor<3, f32>,
         max_new_tokens: usize,
     ) -> Result<Vec<u32>, crate::model::WhisperError> {
+        let profile = moonshine_profile();
+        let started = profile.then(std::time::Instant::now);
         let mut decoder_cache = MoonshineDecoderCache::default();
         let mut decoder_inputs = vec![self.start_token];
         let mut generated = Vec::new();
+        let mut steps = 0usize;
 
         for _ in 0..max_new_tokens.max(1) {
+            steps += 1;
             let logits = self
                 .model
                 .decoder
@@ -171,21 +180,21 @@ impl MoonshineRuntime {
                 .squeeze(1)
                 .squeeze(0)
                 .to_concrete();
-            let logits = last_logits.as_slice().await?;
-            let mut best_token = 0u32;
-            let mut best_logit = f32::NEG_INFINITY;
-            for (token, value) in logits.as_slice().iter().copied().enumerate() {
-                if value > best_logit {
-                    best_logit = value;
-                    best_token = token as u32;
-                }
-            }
+            let best_token = last_logits.argmax_last_dim::<0>().to_scalar().await?;
             if best_token == self.eos_token {
                 break;
             }
             generated.push(best_token);
             decoder_inputs.clear();
             decoder_inputs.push(best_token);
+        }
+
+        if let Some(started) = started {
+            eprintln!(
+                "moonshine profile greedy_generate steps={steps} generated={} max_new_tokens={max_new_tokens} elapsed_ms={:.2}",
+                generated.len(),
+                started.elapsed().as_secs_f64() * 1000.0
+            );
         }
 
         Ok(generated)
@@ -198,6 +207,8 @@ impl MoonshineRuntime {
         encoder_hidden_states: &Tensor<3, f32>,
         max_new_tokens: usize,
     ) -> Result<Vec<u32>, crate::model::WhisperError> {
+        let profile = moonshine_profile();
+        let started = profile.then(std::time::Instant::now);
         let mut decoder_cache = prefix_cache.clone();
         let mut generated = prefix_tokens.to_vec();
         if prefix_tokens.len() >= max_new_tokens {
@@ -205,7 +216,9 @@ impl MoonshineRuntime {
         }
 
         let mut decoder_inputs = vec![prefix_tokens.last().copied().unwrap_or(self.start_token)];
+        let mut steps = 0usize;
         for _ in 0..max_new_tokens.saturating_sub(prefix_tokens.len()).max(1) {
+            steps += 1;
             let logits = self
                 .model
                 .decoder
@@ -217,21 +230,22 @@ impl MoonshineRuntime {
                 .squeeze(1)
                 .squeeze(0)
                 .to_concrete();
-            let logits = last_logits.as_slice().await?;
-            let mut best_token = 0u32;
-            let mut best_logit = f32::NEG_INFINITY;
-            for (token, value) in logits.as_slice().iter().copied().enumerate() {
-                if value > best_logit {
-                    best_logit = value;
-                    best_token = token as u32;
-                }
-            }
+            let best_token = last_logits.argmax_last_dim::<0>().to_scalar().await?;
             if best_token == self.eos_token {
                 break;
             }
             generated.push(best_token);
             decoder_inputs.clear();
             decoder_inputs.push(best_token);
+        }
+
+        if let Some(started) = started {
+            eprintln!(
+                "moonshine profile greedy_generate_from_prefix prefix={} steps={steps} generated={} max_new_tokens={max_new_tokens} elapsed_ms={:.2}",
+                prefix_tokens.len(),
+                generated.len(),
+                started.elapsed().as_secs_f64() * 1000.0
+            );
         }
 
         Ok(generated)
@@ -290,6 +304,8 @@ impl MoonshineRuntime {
             return Ok(None);
         }
 
+        let profile = moonshine_profile();
+        let started = profile.then(std::time::Instant::now);
         let max_new_tokens = self.max_new_tokens(usable_samples);
         let generated = if let Some(reuse_prefix_cache) = reuse_prefix_cache {
             self.greedy_generate_from_prefix(
@@ -314,6 +330,17 @@ impl MoonshineRuntime {
         } else {
             Vec::new()
         };
+
+        if let Some(started) = started {
+            eprintln!(
+                "moonshine profile decode_candidate frames={total_frames} usable_s={:.3} reuse_prefix={} generated={} max_new_tokens={max_new_tokens} timestamps={} elapsed_ms={:.2}",
+                usable_samples as f32 / self.sample_rate as f32,
+                reuse_prefix_tokens.len(),
+                generated.len(),
+                compute_timestamps,
+                started.elapsed().as_secs_f64() * 1000.0
+            );
+        }
 
         Ok(Some(CandidateDecode {
             tokens: generated,
@@ -344,7 +371,7 @@ impl MoonshineRuntime {
             self.common_prefix_len(&state.decoder_prefix_tokens, target_cache_tokens);
         if common_prefix < state.decoder_prefix_tokens.len() {
             state.decoder_prefix_tokens.clear();
-            state.decoder_prefix_cache = MoonshineDecoderCache::default();
+            state.decoder_prefix_cache = state.decoder_cross_cache.clone();
         }
 
         let mut tokens_to_append = Vec::with_capacity(
@@ -354,6 +381,7 @@ impl MoonshineRuntime {
                 + 1,
         );
         if state.decoder_prefix_cache.tokens.is_empty() {
+            state.decoder_prefix_cache = state.decoder_cross_cache.clone();
             tokens_to_append.push(self.start_token);
         }
         tokens_to_append
@@ -404,11 +432,23 @@ impl MoonshineRuntime {
         samples: &[f32],
         flush: bool,
     ) -> Result<Option<CandidateDecode>, crate::model::WhisperError> {
+        let profile = moonshine_profile();
+        let started = profile.then(std::time::Instant::now);
         let encoder_append = self
             .model
             .encoder
             .encode_stream(&self.device, &mut state.encoder_state, samples, flush)
             .map_err(crate::model::WhisperError::Fusor)?;
+        if let Some(started) = started {
+            eprintln!(
+                "moonshine profile encode_stream samples={} flush={flush} hidden={} total_seen={} total_finalized={} elapsed_ms={:.2}",
+                samples.len(),
+                encoder_append.hidden_states.as_ref().map(|t| t.shape()[1]).unwrap_or(0),
+                encoder_append.total_seen_frames,
+                encoder_append.total_finalized_frames,
+                started.elapsed().as_secs_f64() * 1000.0
+            );
+        }
 
         let finalized_encoder_frames = state
             .prepared_encoder_hidden_states
@@ -434,9 +474,7 @@ impl MoonshineRuntime {
                 .map_err(crate::model::WhisperError::Fusor)?;
             state.prepared_encoder_hidden_states =
                 Some(match state.prepared_encoder_hidden_states.take() {
-                    Some(existing) => {
-                        Tensor::cat([existing, prepared], 1).to_materialized_blocking()
-                    }
+                    Some(existing) => Tensor::cat([existing, prepared], 1).to_concrete(),
                     None => prepared,
                 });
         }
@@ -452,6 +490,13 @@ impl MoonshineRuntime {
         if !flush && newly_finalized_frames < self.stream_decode_interval_frames {
             return Ok(state.last_candidate.clone());
         }
+        self.model
+            .decoder
+            .prepare_cross_attention_cache(
+                &prepared_encoder_hidden_states,
+                &mut state.decoder_cross_cache,
+            )
+            .map_err(crate::model::WhisperError::Fusor)?;
 
         let clip_end_s = if encoder_append.total_seen_frames == 0 {
             0.0
@@ -474,8 +519,11 @@ impl MoonshineRuntime {
                 &prepared_encoder_hidden_states,
             )?;
         }
-        let reuse_prefix_cache =
-            (!reuse_prefix_tokens.is_empty()).then_some(state.decoder_prefix_cache.clone());
+        let reuse_prefix_cache = Some(if !reuse_prefix_tokens.is_empty() {
+            state.decoder_prefix_cache.clone()
+        } else {
+            state.decoder_cross_cache.clone()
+        });
         let candidate = self
             .decode_candidate_from_prepared(
                 &prepared_encoder_hidden_states,
@@ -715,6 +763,7 @@ impl MoonshineRuntime {
                 last_candidate: None,
                 encoder_state: self.model.encoder.new_stream_state(),
                 prepared_encoder_hidden_states: None,
+                decoder_cross_cache: MoonshineDecoderCache::default(),
                 decoder_prefix_cache: MoonshineDecoderCache::default(),
                 decoder_prefix_tokens: Vec::new(),
                 last_decoded_finalized_frames: 0,

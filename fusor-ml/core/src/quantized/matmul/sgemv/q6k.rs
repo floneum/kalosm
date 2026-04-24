@@ -22,6 +22,7 @@ pub(crate) fn q6k_sgemv(
     workgroup_shape: &WorkgroupShape,
     input_a: &TensorInput,
     input_b: &QMatrixInput,
+    bias: Option<&TensorInput>,
     output: &TensorInput,
     n_size: &str,
     m_size: &str,
@@ -325,9 +326,8 @@ pub(crate) fn q6k_sgemv(
         output_indices.push("row_index".to_string());
         output.strided_index(kernel, output_indices);
         let indexed = maybe_vec_storage_index(Q6K_SGEMV_CHUNK_SIZE, "sum", "offset");
-        let result = post_fns
-            .iter()
-            .fold(format!("{dtype}({indexed})"), |acc, f| f.call(vec![acc]));
+        let result =
+            op.apply_bias_and_post(bias, "row_index", format!("{dtype}({indexed})"), post_fns);
         writeln!(kernel, "] = {result};").unwrap();
     };
 

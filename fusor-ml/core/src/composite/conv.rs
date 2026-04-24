@@ -1,4 +1,322 @@
-use crate::{DataType, LargerRank, Tensor};
+use std::{fmt::Write, sync::Arc};
+
+use crate::{
+    DataType, DataTypeEnum, LargerRank, Layout, LazyTensorData, TILE_SIZE, Tensor, TensorData,
+    TensorInfo, TensorLayoutInfo,
+    compute_graph::{ComputeGraphInner, NodeIndex},
+    mir::{
+        inputs::MirValue,
+        kernel::GenericKernel,
+        operation::Operation,
+        workgroup_shape::{WorkgroupShape, WorkgroupShapeConstraints},
+    },
+    visit_tiled::{
+        MaybeQTensorInput, VisitTiledInput, build_visit_tiled_kernel, titled_map_dispatch_size,
+        titled_map_workgroup_size_constraints,
+    },
+};
+
+#[derive(Debug, Clone)]
+struct GroupedConv1dOperation {
+    input: NodeIndex,
+    weight: NodeIndex,
+    bias: Option<NodeIndex>,
+    datatype: DataTypeEnum,
+    input_shape: [usize; 3],
+    weight_shape: [usize; 3],
+    output_shape: [usize; 3],
+    padding: usize,
+    stride: usize,
+    groups: usize,
+}
+
+impl GroupedConv1dOperation {
+    #[allow(clippy::too_many_arguments)]
+    fn new(
+        input: NodeIndex,
+        weight: NodeIndex,
+        bias: Option<NodeIndex>,
+        datatype: DataTypeEnum,
+        input_shape: [usize; 3],
+        weight_shape: [usize; 3],
+        output_shape: [usize; 3],
+        padding: usize,
+        stride: usize,
+        groups: usize,
+    ) -> Self {
+        Self {
+            input,
+            weight,
+            bias,
+            datatype,
+            input_shape,
+            weight_shape,
+            output_shape,
+            padding,
+            stride,
+            groups,
+        }
+    }
+
+    fn zero_literal(&self) -> &'static str {
+        match self.datatype {
+            DataTypeEnum::F32 => "0.0",
+            DataTypeEnum::F16 => "f16(0.0)",
+            DataTypeEnum::U32 => "0u",
+        }
+    }
+}
+
+impl Operation for GroupedConv1dOperation {
+    fn workgroup_shape_constraints(&self, device: &crate::Device) -> WorkgroupShapeConstraints {
+        titled_map_workgroup_size_constraints(&self.output_shape, device)
+    }
+
+    fn dispatch_size(&self, workgroup_shape: &WorkgroupShape, _inputs: &[MirValue]) -> [u32; 3] {
+        titled_map_dispatch_size(TILE_SIZE, *workgroup_shape, &self.output_shape)
+    }
+
+    fn visit_dependencies(&self, f: &mut dyn FnMut(NodeIndex)) {
+        f(self.input);
+        f(self.weight);
+        if let Some(bias) = self.bias {
+            f(bias);
+        }
+    }
+
+    fn inputs(&self, nodes: &ComputeGraphInner) -> Vec<MirValue> {
+        let input = nodes.get_cached_result(self.input).unwrap();
+        let weight = nodes.get_cached_result(self.weight).unwrap();
+        let output = TensorData::new_for_shape(input.device(), &self.output_shape, self.datatype);
+
+        let mut inputs = Vec::with_capacity(if self.bias.is_some() { 4 } else { 3 });
+        inputs.push(input.clone().into());
+        inputs.push(weight.clone().into());
+        if let Some(bias) = self.bias {
+            inputs.push(nodes.get_cached_result(bias).unwrap().clone().into());
+        }
+        inputs.push(output.into());
+        inputs
+    }
+
+    fn build_kernel(
+        &self,
+        graph: &ComputeGraphInner,
+        _workgroup_shape: &WorkgroupShape,
+        inputs: &[MirValue],
+        kernel: &mut GenericKernel,
+    ) {
+        let output_tensor_idx = inputs.len() - 1;
+        let has_bias = self.bias.is_some();
+        let input_rank = self.input_shape.len() as u32;
+        let weight_rank = self.weight_shape.len() as u32;
+        let output_rank = self.output_shape.len() as u32;
+        let input_len = self.input_shape[2];
+        let in_channels_per_group = self.weight_shape[1];
+        let out_channels_per_group = self.output_shape[1] / self.groups;
+        let kernel_size = self.weight_shape[2];
+        let dtype = self.datatype;
+        let zero = self.zero_literal();
+
+        let mut tiled_inputs = vec![
+            VisitTiledInput::new(dtype.into(), input_rank),
+            VisitTiledInput::new(dtype.into(), weight_rank),
+        ];
+        if has_bias {
+            tiled_inputs.push(VisitTiledInput::new(dtype.into(), 1));
+        }
+        tiled_inputs.push(VisitTiledInput::new(dtype.into(), output_rank));
+
+        build_visit_tiled_kernel(
+            &graph.device(),
+            &self.output_shape,
+            TILE_SIZE,
+            tiled_inputs,
+            output_tensor_idx,
+            |kernel, indexes, tensors, _values| {
+                let input_tensor = match &tensors[0] {
+                    MaybeQTensorInput::Tensor(tensor) => tensor,
+                    MaybeQTensorInput::QTensor(_) => {
+                        panic!("Grouped conv input cannot be quantized")
+                    }
+                };
+                let weight_tensor = match &tensors[1] {
+                    MaybeQTensorInput::Tensor(tensor) => tensor,
+                    MaybeQTensorInput::QTensor(_) => {
+                        panic!("Grouped conv weight cannot be quantized")
+                    }
+                };
+                let bias_tensor = if has_bias {
+                    match &tensors[2] {
+                        MaybeQTensorInput::Tensor(tensor) => Some(tensor),
+                        MaybeQTensorInput::QTensor(_) => {
+                            panic!("Grouped conv bias cannot be quantized")
+                        }
+                    }
+                } else {
+                    None
+                };
+                let output_tensor = match &tensors[output_tensor_idx] {
+                    MaybeQTensorInput::Tensor(tensor) => tensor,
+                    MaybeQTensorInput::QTensor(_) => {
+                        panic!("Grouped conv output cannot be quantized")
+                    }
+                };
+
+                if let Some(bias_tensor) = bias_tensor {
+                    write!(kernel, "var acc: {dtype} = {bias_tensor}[").unwrap();
+                    bias_tensor.strided_index(kernel, ["dim_1"]);
+                    writeln!(kernel, "];").unwrap();
+                } else {
+                    writeln!(kernel, "var acc: {dtype} = {zero};").unwrap();
+                }
+
+                writeln!(
+                    kernel,
+                    "let conv_group = dim_1 / {out_channels_per_group}u;"
+                )
+                .unwrap();
+                writeln!(
+                    kernel,
+                    "for (var ic_local = 0u; ic_local < {in_channels_per_group}u; ic_local++) {{"
+                )
+                .unwrap();
+                writeln!(
+                    kernel,
+                    "    let input_channel = conv_group * {in_channels_per_group}u + ic_local;"
+                )
+                .unwrap();
+                writeln!(
+                    kernel,
+                    "    for (var kernel_index = 0u; kernel_index < {kernel_size}u; kernel_index++) {{"
+                )
+                .unwrap();
+                writeln!(
+                    kernel,
+                    "        let padded_pos = dim_2 * {}u + kernel_index;",
+                    self.stride
+                )
+                .unwrap();
+                writeln!(
+                    kernel,
+                    "        if (padded_pos >= {}u && padded_pos < {}u) {{",
+                    self.padding,
+                    self.padding + input_len
+                )
+                .unwrap();
+                writeln!(
+                    kernel,
+                    "            let input_pos = padded_pos - {}u;",
+                    self.padding
+                )
+                .unwrap();
+                write!(kernel, "            let input_value = {input_tensor}[").unwrap();
+                input_tensor.strided_index(kernel, ["dim_0", "input_channel", "input_pos"]);
+                writeln!(kernel, "];").unwrap();
+                write!(kernel, "            let weight_value = {weight_tensor}[").unwrap();
+                weight_tensor.strided_index(kernel, ["dim_1", "ic_local", "kernel_index"]);
+                writeln!(kernel, "];").unwrap();
+                writeln!(kernel, "            acc += input_value * weight_value;").unwrap();
+                writeln!(kernel, "        }}").unwrap();
+                writeln!(kernel, "    }}").unwrap();
+                writeln!(kernel, "}}").unwrap();
+
+                format!("{output_tensor}[{}] = acc;", indexes[output_tensor_idx])
+            },
+            kernel,
+        );
+    }
+
+    fn output(&self, _nodes: &ComputeGraphInner, inputs: &[MirValue]) -> MirValue {
+        inputs.last().unwrap().clone()
+    }
+
+    fn name(&self) -> String {
+        format!(
+            "conv1d_grouped_{}_{}x{}x{}_groups_{}",
+            self.datatype,
+            self.input_shape[1],
+            self.output_shape[1],
+            self.weight_shape[2],
+            self.groups
+        )
+    }
+
+    fn output_layout(
+        &self,
+        _map: &rustc_hash::FxHashMap<NodeIndex, TensorLayoutInfo>,
+    ) -> TensorLayoutInfo {
+        TensorLayoutInfo::new(Layout::contiguous(&self.output_shape), self.datatype)
+    }
+}
+
+impl<D: DataType> Tensor<3, D> {
+    pub fn conv1d_grouped(
+        &self,
+        weight: &Tensor<3, D>,
+        bias: Option<&Tensor<1, D>>,
+        padding: usize,
+        stride: usize,
+        groups: usize,
+    ) -> Self {
+        assert!(groups > 0, "groups must be greater than zero");
+        assert!(stride > 0, "stride must be greater than zero");
+
+        let input_shape = *self.shape();
+        let weight_shape = *weight.shape();
+        let in_channels = input_shape[1];
+        let out_channels = weight_shape[0];
+        let in_channels_per_group = weight_shape[1];
+        let kernel_size = weight_shape[2];
+
+        assert_eq!(
+            in_channels,
+            in_channels_per_group * groups,
+            "weight in_channels per group must match input channels / groups"
+        );
+        assert_eq!(
+            out_channels % groups,
+            0,
+            "out_channels ({out_channels}) must be divisible by groups ({groups})"
+        );
+        assert!(
+            input_shape[2] + 2 * padding >= kernel_size,
+            "kernel size ({kernel_size}) cannot exceed padded input length ({})",
+            input_shape[2] + 2 * padding
+        );
+
+        if let Some(bias) = bias {
+            assert_eq!(
+                bias.shape()[0],
+                out_channels,
+                "bias shape must match out_channels"
+            );
+        }
+
+        let output_length = (input_shape[2] + 2 * padding - kernel_size) / stride + 1;
+        let output_shape = [input_shape[0], out_channels, output_length];
+        let operation = GroupedConv1dOperation::new(
+            self.key(),
+            weight.key(),
+            bias.map(|bias| bias.key()),
+            self.datatype(),
+            input_shape,
+            weight_shape,
+            output_shape,
+            padding,
+            stride,
+            groups,
+        );
+        let device = self.device().clone();
+        let key = device.compute_graph().create_custom(Arc::new(operation));
+
+        Tensor::from_parts(LazyTensorData::from_parts(
+            device,
+            TensorInfo::new(output_shape.to_vec().into_boxed_slice(), self.datatype()),
+            key,
+        ))
+    }
+}
 
 impl<const R: usize, D: DataType> Tensor<R, D> {
     /// Pad a specific axis with zeros on both sides
@@ -348,6 +666,191 @@ mod tests {
                         candle_val
                     );
                 }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_grouped_conv_1d_depthwise_single_kernel() {
+        let device = Device::test_instance();
+
+        let input_data = [[[1.0f32, 2.0, 3.0, 4.0], [10.0f32, 20.0, 30.0, 40.0]]];
+        let input = Tensor::new(&device, &input_data);
+        let weight_data = [[[1.0f32, 0.0, -1.0]], [[0.5f32, 0.25, -0.5]]];
+        let weight = Tensor::new(&device, &weight_data);
+        let bias = Tensor::new(&device, &[0.5f32, -1.0]);
+
+        let output = input.conv1d_grouped(&weight, Some(&bias), 1, 1, 2);
+        assert_eq!(output.count_kernels_to_resolve(), 1);
+
+        let result = output.as_slice().await.unwrap();
+        assert_eq!(result.shape(), &[1, 2, 4]);
+        let expected = [[[-1.5f32, -1.5, -1.5, 3.5], [-8.5f32, -6.0, -3.5, 24.0]]];
+        for batch in 0..1 {
+            for channel in 0..2 {
+                for position in 0..4 {
+                    let actual = result[[batch, channel, position]];
+                    let expected = expected[batch][channel][position];
+                    assert!(
+                        (actual - expected).abs() < 1e-5,
+                        "Mismatch at [{batch}, {channel}, {position}]: got {actual}, expected {expected}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_conv_1d_moonshine_conv2_shape_matches_cpu_reference() {
+        let device = Device::test_instance();
+        let batch = 1;
+        let in_channels = 640;
+        let out_channels = 320;
+        let input_len = 204;
+        let kernel = 5;
+        let stride = 2;
+
+        let input_data: Vec<f32> = (0..batch * in_channels * input_len)
+            .map(|i| ((i % 101) as f32 - 50.0) * 0.002)
+            .collect();
+        let weight_data: Vec<f32> = (0..out_channels * in_channels * kernel)
+            .map(|i| ((i % 103) as f32 - 51.0) * 0.001)
+            .collect();
+        let bias_data: Vec<f32> = (0..out_channels)
+            .map(|i| ((i % 17) as f32 - 8.0) * 0.001)
+            .collect();
+
+        let input_nested: Vec<Vec<Vec<f32>>> = input_data
+            .chunks_exact(in_channels * input_len)
+            .map(|batch| {
+                batch
+                    .chunks_exact(input_len)
+                    .map(|channel| channel.to_vec())
+                    .collect()
+            })
+            .collect();
+        let weight_nested: Vec<Vec<Vec<f32>>> = weight_data
+            .chunks_exact(in_channels * kernel)
+            .map(|out_channel| {
+                out_channel
+                    .chunks_exact(kernel)
+                    .map(|channel| channel.to_vec())
+                    .collect()
+            })
+            .collect();
+
+        let input = Tensor::new(&device, &input_nested);
+        let weight = Tensor::new(&device, &weight_nested);
+        let bias = Tensor::new(&device, &bias_data);
+        let result = input
+            .conv(&weight, Some(&bias), [0], [stride])
+            .as_slice()
+            .await
+            .unwrap();
+
+        let check_positions = [
+            (0, 0, 0),
+            (0, 0, result.shape()[2] - 1),
+            (0, out_channels / 2, result.shape()[2] / 2),
+            (0, out_channels - 1, 0),
+            (0, out_channels - 1, result.shape()[2] - 1),
+        ];
+
+        for (batch_idx, out_channel, out_pos) in check_positions {
+            let mut expected = bias_data[out_channel];
+            for in_channel in 0..in_channels {
+                for kernel_idx in 0..kernel {
+                    let input_pos = out_pos * stride + kernel_idx;
+                    expected += input_data
+                        [batch_idx * in_channels * input_len + in_channel * input_len + input_pos]
+                        * weight_data
+                            [out_channel * in_channels * kernel + in_channel * kernel + kernel_idx];
+                }
+            }
+            let actual = result[[batch_idx, out_channel, out_pos]];
+            assert!(
+                (actual - expected).abs() < 1e-3,
+                "Mismatch at [{batch_idx}, {out_channel}, {out_pos}]: actual={actual}, expected={expected}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_conv_1d_after_zero_cat_uses_materialized_layout() {
+        let device = Device::test_instance();
+        let batch = 1;
+        let in_channels = 64;
+        let out_channels = 32;
+        let input_len = 17;
+        let pad = 4;
+        let padded_len = input_len + pad;
+        let kernel = 5;
+        let stride = 2;
+
+        let input_data: Vec<f32> = (0..batch * in_channels * input_len)
+            .map(|i| ((i % 101) as f32 - 50.0) * 0.002)
+            .collect();
+        let weight_data: Vec<f32> = (0..out_channels * in_channels * kernel)
+            .map(|i| ((i % 103) as f32 - 51.0) * 0.001)
+            .collect();
+        let bias_data: Vec<f32> = (0..out_channels)
+            .map(|i| ((i % 17) as f32 - 8.0) * 0.001)
+            .collect();
+
+        let input_nested: Vec<Vec<Vec<f32>>> = input_data
+            .chunks_exact(in_channels * input_len)
+            .map(|batch| {
+                batch
+                    .chunks_exact(input_len)
+                    .map(|channel| channel.to_vec())
+                    .collect()
+            })
+            .collect();
+        let weight_nested: Vec<Vec<Vec<f32>>> = weight_data
+            .chunks_exact(in_channels * kernel)
+            .map(|out_channel| {
+                out_channel
+                    .chunks_exact(kernel)
+                    .map(|channel| channel.to_vec())
+                    .collect()
+            })
+            .collect();
+
+        let input = Tensor::new(&device, &input_nested);
+        let padded = Tensor::cat(
+            [Tensor::zeros(&device, [batch, in_channels, pad]), input],
+            2,
+        );
+        let weight = Tensor::new(&device, &weight_nested);
+        let bias = Tensor::new(&device, &bias_data);
+        let result = padded
+            .conv(&weight, Some(&bias), [0], [stride])
+            .as_slice()
+            .await
+            .unwrap();
+
+        for out_channel in [0, out_channels / 2, out_channels - 1] {
+            for out_pos in [0, result.shape()[2] / 2, result.shape()[2] - 1] {
+                let mut expected = bias_data[out_channel];
+                for in_channel in 0..in_channels {
+                    for kernel_idx in 0..kernel {
+                        let padded_pos = out_pos * stride + kernel_idx;
+                        let input_value = if padded_pos < pad {
+                            0.0
+                        } else {
+                            input_data[in_channel * input_len + padded_pos - pad]
+                        };
+                        expected += input_value
+                            * weight_data[out_channel * in_channels * kernel
+                                + in_channel * kernel
+                                + kernel_idx];
+                    }
+                }
+                let actual = result[[0, out_channel, out_pos]];
+                assert!(
+                    (actual - expected).abs() < 1e-3,
+                    "Mismatch at [0, {out_channel}, {out_pos}] with padded_len={padded_len}: actual={actual}, expected={expected}"
+                );
             }
         }
     }

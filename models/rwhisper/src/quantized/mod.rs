@@ -15,16 +15,6 @@ pub(crate) mod cohere;
 pub(crate) mod moonshine;
 pub(crate) mod timestamps;
 
-fn materialize_if_gpu<const R: usize, D, B>(tensor: &Tensor<R, D, B>)
-where
-    B: fusor::TensorBacking<R, Elem = D>,
-    D: fusor::SimdElement + fusor::DataType + 'static,
-{
-    if tensor.is_gpu() {
-        tensor.materialize_blocking();
-    }
-}
-
 fn conv1d(
     config: Conv1dConfig,
     device: &Device,
@@ -404,16 +394,11 @@ impl AudioEncoder {
 
         let positional_embedding = self.positional_embedding.narrow(0, 0, seq_len);
         let mut x = x.add_(&positional_embedding);
-        materialize_if_gpu(&x);
 
-        for (i, block) in self.blocks.iter_mut().enumerate() {
+        for block in self.blocks.iter_mut() {
             x = block.forward(None, &x, None, None, None)?;
-            if (i + 1) % 4 == 0 {
-                materialize_if_gpu(&x);
-            }
         }
         let x = self.ln_post.forward_fused(&x);
-        materialize_if_gpu(&x);
 
         Ok(x)
     }
@@ -502,19 +487,13 @@ impl TextDecoder {
 
         // Add batch dimension to audio_features for forward_kv
         let audio_features_batched = audio_features.unsqueeze(0).to_concrete();
-        materialize_if_gpu(&audio_features_batched);
 
         for (i, block) in self.blocks.iter_mut().enumerate() {
             if cache.blocks.len() <= i {
-                let feature_attn_cache = block.cross_attn.as_ref().and_then(|(attn, _)| {
-                    attn.forward_kv(&audio_features_batched, None).ok().map(
-                        |(key_states, value_states)| {
-                            materialize_if_gpu(&key_states);
-                            materialize_if_gpu(&value_states);
-                            (key_states, value_states)
-                        },
-                    )
-                });
+                let feature_attn_cache = block
+                    .cross_attn
+                    .as_ref()
+                    .and_then(|(attn, _)| attn.forward_kv(&audio_features_batched, None).ok());
                 cache.blocks.push(ResidualAttentionBlockCache {
                     attn: MultiHeadAttentionCache::new(self.max_target_positions),
                     feature_attn_cache,
@@ -527,7 +506,6 @@ impl TextDecoder {
         }
 
         let out = self.ln.forward_fused(&x);
-        materialize_if_gpu(&out);
 
         Ok(out)
     }

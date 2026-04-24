@@ -380,9 +380,6 @@ impl Decoder {
         let tensor = match &mut self.model {
             ModelType::Quantized(model) => model.encoder.forward(mel)?,
         };
-        if tensor.is_gpu() {
-            tensor.materialize_blocking();
-        }
 
         Ok(tensor)
     }
@@ -754,9 +751,6 @@ impl Decoder {
 
                 // Squeeze the batch dimension since decode_with_fallback expects 2D tensor
                 let audio_features_2d = audio_features.squeeze(0).to_concrete();
-                if audio_features_2d.is_gpu() {
-                    audio_features_2d.materialize_blocking();
-                }
 
                 let mut dr = self
                     .decode_with_fallback(

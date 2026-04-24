@@ -1100,6 +1100,14 @@ impl<D: DataType, const R: usize> Tensor<R, D> {
         Self::from_parts(self.data.q_mat_mul(operation))
     }
 
+    pub(crate) fn add_q_mat_mul_bias(&self, other: &QMatrix, bias: &Tensor<1, D>) -> Self {
+        let operation =
+            QMatMulOperation::new(self.datatype(), self.shape(), self.data.key, other.clone())
+                .with_bias(bias);
+
+        Self::from_parts(self.data.q_mat_mul(operation))
+    }
+
     pub(crate) fn add_resize<const R2: usize>(&self, op: ResizeOperation) -> Tensor<R2, D> {
         Tensor {
             data: self.data.resize(op),

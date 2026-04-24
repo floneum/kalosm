@@ -61,7 +61,7 @@ where
                 tensors.push(
                     all_data
                         .narrow(self.concat_dim, new_start, self.current_seq_len - new_start)
-                        .to_materialized_blocking(),
+                        .to_concrete(),
                 );
             }
             tensors.push(v.clone());
@@ -70,7 +70,7 @@ where
             self.all_data = Some(
                 all_data
                     .narrow(self.concat_dim, all_data_len - max_seq_len, max_seq_len)
-                    .to_materialized_blocking(),
+                    .to_concrete(),
             );
             self.current_seq_len = max_seq_len;
             self.allocated_seq_len = max_seq_len;
@@ -92,8 +92,7 @@ where
                 });
                 // Allocate new tensor with larger size
                 let new_data = Tensor::zeros(device, new_data_shape);
-                *cached =
-                    cat([cached.clone(), new_data], self.concat_dim).to_materialized_blocking();
+                *cached = cat([cached.clone(), new_data], self.concat_dim);
             }
             // Assign the new data into the cached tensor
             let slice: [std::ops::Range<usize>; R] = std::array::from_fn(|i| {
@@ -103,16 +102,16 @@ where
                     0..v_shape[i]
                 }
             });
-            *cached = cached.slice_assign(slice, v).to_materialized_blocking();
+            *cached = cached.slice_assign(slice, v);
             self.current_seq_len = required_seq_len;
             // Return only the valid portion of the cache, not the full allocated tensor
             let current = cached
                 .narrow(self.concat_dim, 0, self.current_seq_len)
-                .to_materialized_blocking();
+                .to_concrete();
             current
         } else {
             // First append - just store it
-            let current = v.to_materialized_blocking();
+            let current = v.to_concrete();
             self.all_data = Some(current.clone());
             self.current_seq_len = seq_len;
             self.allocated_seq_len = seq_len;
@@ -241,6 +240,35 @@ mod tests {
                         }
                     }
                 }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_tensor_cache_gpu_lazy_trim_without_intermediate_reads() {
+        let gpu = Device::new().await.expect("GPU required for this test");
+        let mut cache: TensorCache<4, f32> = TensorCache::new(1, 3);
+
+        let chunks = [[1.0f32, 2.0], [3.0f32, 4.0], [5.0f32, 6.0], [7.0f32, 8.0]];
+
+        let mut result = None;
+        for chunk in chunks {
+            let tensor: Tensor<4, f32> = Tensor::from_slice(&gpu, [1, 1, 1, 2], &chunk);
+            result = Some(cache.append(&gpu, &tensor));
+        }
+
+        let result = result.unwrap();
+        assert_eq!(result.shape(), [1, 3, 1, 2]);
+
+        let output = result.as_slice().await.unwrap();
+        let expected = [[3.0f32, 4.0], [5.0, 6.0], [7.0, 8.0]];
+        for (seq, values) in expected.iter().enumerate() {
+            for (dim, expected) in values.iter().copied().enumerate() {
+                let actual = output[[0, seq, 0, dim]];
+                assert!(
+                    (actual - expected).abs() < 1e-6,
+                    "mismatch at sequence {seq}, dim {dim}: expected {expected}, got {actual}"
+                );
             }
         }
     }

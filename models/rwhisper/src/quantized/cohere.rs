@@ -13,16 +13,6 @@ use std::time::Instant;
 
 static COHERE_ENCODER_LAYER_CALLS: AtomicUsize = AtomicUsize::new(0);
 
-fn materialize_if_gpu<const R: usize, D, B>(tensor: &Tensor<R, D, B>)
-where
-    B: fusor::TensorBacking<R, Elem = D>,
-    D: fusor::SimdElement + fusor::DataType + 'static,
-{
-    if tensor.is_gpu() {
-        tensor.materialize_blocking();
-    }
-}
-
 fn profile_enabled() -> bool {
     std::env::var("RWHISPER_COHERE_PROFILE").ok().as_deref() == Some("1")
 }
@@ -886,7 +876,6 @@ impl TransformerDecoderLayer {
         let profile = profile_enabled();
         let start = profile.then(Instant::now);
         let ln1 = cohere_layer_norm_3d(&self.layer_norm_1, hidden_states);
-        materialize_if_gpu(&ln1);
         if let Some(start) = start {
             eprintln!(
                 "cohere decoder layer cached ln1: {:.3}s",
@@ -908,7 +897,6 @@ impl TransformerDecoderLayer {
                 .first_sub_layer
                 .forward(&ln1, self_kv, Some(self_attention_mask), None))
         .to_concrete();
-        materialize_if_gpu(&hidden_states);
         if let Some(start) = start {
             eprintln!(
                 "cohere decoder layer cached self attn: {:.3}s",
@@ -925,7 +913,6 @@ impl TransformerDecoderLayer {
                 attention_output,
             ))
         .to_concrete();
-        materialize_if_gpu(&hidden_states);
         if let Some(start) = start {
             eprintln!(
                 "cohere decoder layer cached cross attn: {:.3}s",
@@ -939,7 +926,6 @@ impl TransformerDecoderLayer {
                 .third_sub_layer
                 .forward(&cohere_layer_norm_3d(&self.layer_norm_3, &hidden_states)))
         .to_concrete();
-        materialize_if_gpu(&hidden_states);
         if let Some(start) = start {
             eprintln!(
                 "cohere decoder layer cached mlp: {:.3}s",
@@ -1077,7 +1063,6 @@ impl TransformerDecoder {
         let positions: Vec<u32> = (index_pos as u32..(index_pos + seq_len) as u32).collect();
         let positions = Tensor::from_slice(&device, [1, seq_len], &positions);
         let mut hidden_states = self.embedding.forward(&token_tensor, &positions);
-        materialize_if_gpu(&hidden_states);
         if let Some(start) = start {
             eprintln!(
                 "cohere decoder embedding: {:.3}s",
@@ -1093,71 +1078,9 @@ impl TransformerDecoder {
                         start.elapsed().as_secs_f32()
                     );
                 }
-                let cross_attn_kv = if start.is_some() {
-                    let key_proj = layer
-                        .second_sub_layer
-                        .key_net
-                        .forward_no_bias(encoder_hidden_states)
-                        .add_scalar(0.0);
-                    if let Some(start) = start {
-                        eprintln!(
-                            "cohere decoder layer {i} cache init key proj forward: {:.3}s",
-                            start.elapsed().as_secs_f32()
-                        );
-                    }
-                    let key_proj = key_proj.to_materialized_blocking();
-                    if let Some(start) = start {
-                        eprintln!(
-                            "cohere decoder layer {i} cache init key proj materialized: {:.3}s",
-                            start.elapsed().as_secs_f32()
-                        );
-                    }
-                    let key_states = layer
-                        .second_sub_layer
-                        .key_net
-                        .forward(encoder_hidden_states);
-                    if let Some(start) = start {
-                        eprintln!(
-                            "cohere decoder layer {i} cache init key forward: {:.3}s",
-                            start.elapsed().as_secs_f32()
-                        );
-                    }
-                    let key_states = key_states.to_materialized_blocking();
-                    if let Some(start) = start {
-                        eprintln!(
-                            "cohere decoder layer {i} cache init key materialized: {:.3}s",
-                            start.elapsed().as_secs_f32()
-                        );
-                    }
-
-                    let value_states = layer
-                        .second_sub_layer
-                        .value_net
-                        .forward(encoder_hidden_states);
-                    if let Some(start) = start {
-                        eprintln!(
-                            "cohere decoder layer {i} cache init value forward: {:.3}s",
-                            start.elapsed().as_secs_f32()
-                        );
-                    }
-                    let value_states = value_states.to_materialized_blocking();
-                    if let Some(start) = start {
-                        eprintln!(
-                            "cohere decoder layer {i} cache init value materialized: {:.3}s",
-                            start.elapsed().as_secs_f32()
-                        );
-                    }
-                    (key_states, value_states)
-                } else {
-                    let cross_attn_kv = layer
-                        .second_sub_layer
-                        .forward_kv(encoder_hidden_states, None);
-                    let materialized = Tensor::to_materialized_many_blocking(&[
-                        &cross_attn_kv.0,
-                        &cross_attn_kv.1,
-                    ]);
-                    (materialized[0].clone(), materialized[1].clone())
-                };
+                let cross_attn_kv = layer
+                    .second_sub_layer
+                    .forward_kv(encoder_hidden_states, None);
                 cache.layers.push(TransformerDecoderLayerCache {
                     self_attn: DecoderAttentionCache::new(self.max_target_positions),
                     cross_attn_kv,
@@ -1173,7 +1096,6 @@ impl TransformerDecoder {
             let attention_output = attention_output.as_mut().map(|outputs| &mut outputs[i]);
             hidden_states =
                 layer.forward_cached(&hidden_states, &self_mask, layer_cache, attention_output);
-            materialize_if_gpu(&hidden_states);
             if let Some(start) = start {
                 eprintln!(
                     "cohere decoder layer {i} forward: {:.3}s",
@@ -1183,7 +1105,6 @@ impl TransformerDecoder {
         }
 
         let hidden_states = cohere_layer_norm_3d(&self.final_layer_norm, &hidden_states);
-        materialize_if_gpu(&hidden_states);
         if let Some(start) = start {
             eprintln!(
                 "cohere decoder final ln: {:.3}s",
@@ -1460,8 +1381,6 @@ mod tests {
             &features,
         );
         let prompt_ids = [7_u32, 4, 16, 62, 62, 5, 9, 11, 13];
-        let cpu_input_ids = Tensor::from_slice(&cpu_device, [1, prompt_ids.len()], &prompt_ids);
-        let gpu_input_ids = Tensor::from_slice(&gpu_device, [1, prompt_ids.len()], &prompt_ids);
 
         let (cpu_pre, cpu_pre_len) = cpu_model
             .encoder

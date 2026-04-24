@@ -256,6 +256,61 @@ where
     }
 }
 
+impl<const R: usize, B> Tensor<R, f32, B>
+where
+    B: TensorBacking<R, Elem = f32>,
+{
+    pub fn argmax_last_dim<const OUT_RANK: usize>(&self) -> Tensor<OUT_RANK, u32>
+    where
+        ConcreteTensor<u32, OUT_RANK>: TensorBacking<OUT_RANK, Elem = u32>,
+    {
+        assert_eq!(R, OUT_RANK + 1);
+
+        match self {
+            Tensor::Cpu(t) => {
+                let concrete = t.as_ref().to_concrete();
+                let shape = concrete.shape();
+                let reduce_size = shape[R - 1];
+                let output_shape: [usize; OUT_RANK] = std::array::from_fn(|i| shape[i]);
+                let output_elements = output_shape.iter().product();
+                let mut output = ConcreteTensor::<u32, OUT_RANK>::zeros(output_shape);
+
+                for linear_index in 0..output_elements {
+                    let mut remaining = linear_index;
+                    let output_index: [usize; OUT_RANK] = std::array::from_fn(|i| {
+                        let stride = output_shape[i + 1..].iter().product::<usize>();
+                        let index = remaining / stride.max(1);
+                        remaining %= stride.max(1);
+                        index
+                    });
+
+                    let mut best_index = 0u32;
+                    let mut best_value = f32::NEG_INFINITY;
+                    for axis_index in 0..reduce_size {
+                        let input_index: [usize; R] = std::array::from_fn(|i| {
+                            if i < OUT_RANK {
+                                output_index[i]
+                            } else {
+                                axis_index
+                            }
+                        });
+                        let value = concrete.get(input_index);
+                        if value > best_value {
+                            best_value = value;
+                            best_index = axis_index as u32;
+                        }
+                    }
+
+                    output.set(output_index, best_index);
+                }
+
+                Tensor::Cpu(fusor_cpu::Tensor::new(output))
+            }
+            Tensor::Gpu(t) => Tensor::Gpu(t.argmax_last_dim::<OUT_RANK>()),
+        }
+    }
+}
+
 /// Helper function to unsqueeze a reduced tensor back to original rank with size 1 at the axis.
 /// The reduced tensor has OUT_RANK dimensions (one less than original R).
 /// The result has R dimensions with size 1 at the reduced axis (standard keepdim semantics).
@@ -435,5 +490,27 @@ mod tests {
         let expected = 2.0 / 3.0;
         assert!((slice[[0, 0]] - expected).abs() < 0.001);
         assert!((slice[[1, 0]] - expected).abs() < 0.001);
+    }
+
+    #[tokio::test]
+    async fn test_argmax_last_dim_cpu_and_gpu() {
+        let cpu: Tensor<2, f32> = Tensor::Cpu(fusor_cpu::Tensor::from_slice(
+            [2, 4],
+            &[1.0, 5.0, 2.0, 5.0, 3.0, 0.0, 4.0, 1.0],
+        ));
+        let cpu_output = cpu.argmax_last_dim::<1>();
+        let cpu_output = cpu_output.as_slice().await.unwrap();
+        assert_eq!(cpu_output[[0]], 1);
+        assert_eq!(cpu_output[[1]], 2);
+
+        let device = crate::Device::new()
+            .await
+            .expect("GPU required for this test");
+        let gpu: Tensor<2, f32> =
+            Tensor::new(&device, &[[1.0, 5.0, 2.0, 5.0], [3.0, 0.0, 4.0, 1.0]]);
+        let gpu_output = gpu.argmax_last_dim::<1>();
+        let gpu_output = gpu_output.as_slice().await.unwrap();
+        assert_eq!(gpu_output[[0]], 1);
+        assert_eq!(gpu_output[[1]], 2);
     }
 }

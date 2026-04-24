@@ -447,6 +447,52 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_gpu_qmatmul_bias_matches_unfused_add() {
+        let gpu_device = Device::new().await.expect("GPU required for this test");
+
+        let shape = [2, 32];
+        let block_size_bytes = 34;
+        let mut raw_bytes = vec![0u8; 2 * block_size_bytes];
+
+        let scale_f16 = half::f16::from_f32(1.0);
+        raw_bytes[0..2].copy_from_slice(&scale_f16.to_le_bytes());
+        for i in 0..32 {
+            raw_bytes[2 + i] = 1i8 as u8;
+        }
+
+        raw_bytes[block_size_bytes..block_size_bytes + 2].copy_from_slice(&scale_f16.to_le_bytes());
+        for i in 0..32 {
+            raw_bytes[block_size_bytes + 2 + i] = 2i8 as u8;
+        }
+
+        let qmatrix =
+            QMatrix::from_raw_bytes(&gpu_device, shape, &raw_bytes, GgmlType::Q8_0).unwrap();
+        let input_data: Vec<Vec<Vec<f32>>> = vec![
+            (0..5)
+                .map(|row| vec![0.25f32 * (row as f32 + 1.0); 32])
+                .collect(),
+        ];
+        let input: Tensor<3, f32> = Tensor::new(&gpu_device, &input_data);
+        let bias: Tensor<1, f32> = Tensor::new(&gpu_device, &[0.5, -1.25]);
+
+        let fused = input.q_mat_mul_bias(&qmatrix, &bias);
+        let fused = fused.as_slice().await.unwrap();
+        let expected = input.q_mat_mul(&qmatrix).add_(&bias);
+        let expected = expected.as_slice().await.unwrap();
+
+        for row in 0..5 {
+            for col in 0..2 {
+                let expected = expected[[0, row, col]];
+                let actual = fused[[0, row, col]];
+                assert!(
+                    (expected - actual).abs() < 0.1,
+                    "row {row} col {col}: expected {expected}, got {actual}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn test_gpu_qmatmul_materialized_many_matches_individual() {
         let gpu_device = Device::new().await.expect("GPU required for this test");
         let cpu_device = Device::Cpu;

@@ -40,6 +40,10 @@ struct ExecutionNode {
 type ExecutionGraph = StableGraph<ExecutionNode, ()>;
 type ExecutionNodeIndex = petgraph::graph::NodeIndex;
 
+const MAX_FUSED_NARY_INPUTS: usize = 8;
+const MAX_FUSED_NARY_EXPR_NODES: usize = 128;
+const MAX_BATCHED_STORAGE_BUFFERS: usize = 16;
+
 pub(crate) struct Resolver {
     device: Device,
     command_encoder: CommandEncoder,
@@ -91,6 +95,8 @@ impl Resolver {
     fn execute(&mut self, graph: &mut ComputeGraphInner) -> usize {
         let device = graph.device();
         let max_subgroup_size = device.max_subgroup_size();
+        let max_storage_buffers = (device.limits().max_storage_buffers_per_shader_stage as usize)
+            .min(MAX_BATCHED_STORAGE_BUFFERS);
 
         // Pass 1: Build execution graph
         for target in self.targets.clone() {
@@ -124,12 +130,14 @@ impl Resolver {
         let mut current_constraints = WorkgroupShapeConstraints::new();
         let mut pending_operations = Vec::new();
         let mut inputs = Vec::new();
+        let mut outputs = Vec::new();
         let mut all_input_values = Vec::new();
         let mut kernel = GenericKernel::new();
         let mut total_kernels = 0;
 
         for (node, operation) in queued_operations {
             let new_inputs = operation.inputs(graph);
+            let new_output = operation.output(graph, &new_inputs);
             let constraint = operation.workgroup_shape_constraints(&device);
             let mut new_merged = current_constraints.clone();
             new_merged.merge(&constraint);
@@ -138,7 +146,9 @@ impl Resolver {
                     "Failed to find a valid workgroup shape for constraints {current_constraints:?}"
                 )
             });
-            let mut extend = self.should_extend_kernel(new_inputs.clone(), &inputs);
+            let mut extend = self.should_extend_kernel(&new_inputs, &new_output, &inputs, &outputs);
+            extend &= Self::combined_storage_buffer_count(&all_input_values, &new_inputs)
+                <= max_storage_buffers;
             extend &= new_merged.solve(max_subgroup_size).is_some();
             if extend {
                 current_constraints = new_merged;
@@ -154,6 +164,7 @@ impl Resolver {
                         old_best,
                     );
                     pending_operations.clear();
+                    outputs.clear();
                     all_input_values.clear();
                     inputs.clear();
                     kernel.clear();
@@ -182,7 +193,9 @@ impl Resolver {
                     &mut kernel,
                     node,
                     operation,
+                    new_output,
                     &mut inputs,
+                    &mut outputs,
                     &mut all_input_values,
                     &mut pending_operations,
                 );
@@ -622,6 +635,12 @@ impl Resolver {
                     // Skip fusion - would exceed GPU binding limit
                     continue;
                 }
+                if unique_inputs.len() > MAX_FUSED_NARY_INPUTS {
+                    continue;
+                }
+                if Self::nary_expr_node_count(&new_expression) > MAX_FUSED_NARY_EXPR_NODES {
+                    continue;
+                }
 
                 expression = new_expression;
                 all_inputs.extend(input_nary.inputs.iter().copied());
@@ -837,6 +856,24 @@ impl Resolver {
                 }
             }
             NaryExpr::DimIndex(_) => {}
+        }
+    }
+
+    fn nary_expr_node_count(expr: &NaryExpr) -> usize {
+        match expr {
+            NaryExpr::Op { children, .. } => {
+                1 + children
+                    .iter()
+                    .map(Self::nary_expr_node_count)
+                    .sum::<usize>()
+            }
+            NaryExpr::IndexedInput { indices, .. } => {
+                1 + indices
+                    .iter()
+                    .map(Self::nary_expr_node_count)
+                    .sum::<usize>()
+            }
+            NaryExpr::DimIndex(_) => 1,
         }
     }
 
@@ -1140,41 +1177,82 @@ impl Resolver {
 
     fn should_extend_kernel(
         &mut self,
-        new_inputs: Vec<MirValue>,
+        new_inputs: &[MirValue],
+        new_output: &MirValue,
         inputs: &[Vec<MirValue>],
+        outputs: &[MirValue],
     ) -> bool {
-        fn is_tensor_output(values: &[MirValue], index: usize) -> bool {
-            index + 1 == values.len() && values[index].as_tensor().is_some()
-        }
+        let new_output_tensor = new_output.as_tensor();
 
-        for (new_index, input) in new_inputs.iter().enumerate() {
+        for input in new_inputs {
             let Some(input_tensor) = input.as_tensor() else {
                 continue;
             };
-            for pending in inputs {
-                for (pending_index, other) in pending.iter().enumerate() {
-                    let Some(other_tensor) = other.as_tensor() else {
-                        continue;
-                    };
+            for pending_output in outputs {
+                let Some(pending_output_tensor) = pending_output.as_tensor() else {
+                    continue;
+                };
 
-                    // Read/read aliasing is safe. We only need to split dispatches
-                    // when a pending write aliases a later read or write.
-                    let new_writes = is_tensor_output(&new_inputs, new_index);
-                    let pending_writes = is_tensor_output(pending, pending_index);
-                    if !new_writes && !pending_writes {
-                        continue;
-                    }
-
-                    // Views created by reshape/transpose share the same storage, so extending
-                    // across a write/read or write/write dependency can observe incomplete data
-                    // from another invocation in the same dispatch.
-                    if std::sync::Arc::ptr_eq(input_tensor.buffer(), other_tensor.buffer()) {
-                        return false;
-                    }
+                // A later read of a pending write needs a dispatch boundary;
+                // otherwise workgroups can observe incomplete output data.
+                if std::sync::Arc::ptr_eq(input_tensor.buffer(), pending_output_tensor.buffer()) {
+                    return false;
                 }
             }
         }
+
+        let Some(new_output_tensor) = new_output_tensor else {
+            return true;
+        };
+
+        for pending_output in outputs {
+            let Some(pending_output_tensor) = pending_output.as_tensor() else {
+                continue;
+            };
+            // Two writes to the same storage need to be ordered.
+            if std::sync::Arc::ptr_eq(new_output_tensor.buffer(), pending_output_tensor.buffer()) {
+                return false;
+            }
+        }
+
+        for pending in inputs {
+            for input in pending {
+                let Some(input_tensor) = input.as_tensor() else {
+                    continue;
+                };
+
+                // A later write that aliases an earlier read also needs a boundary.
+                if std::sync::Arc::ptr_eq(new_output_tensor.buffer(), input_tensor.buffer()) {
+                    return false;
+                }
+            }
+        }
+
         true
+    }
+
+    fn combined_storage_buffer_count(
+        all_input_values: &[KernelInputValue],
+        new_inputs: &[MirValue],
+    ) -> usize {
+        let mut combined = all_input_values.to_vec();
+        for input in new_inputs {
+            input.visit_input_values(|value| {
+                if !combined.iter().any(|existing| *existing == value) {
+                    combined.push(value);
+                }
+            });
+        }
+
+        combined
+            .iter()
+            .filter(|value| {
+                matches!(
+                    value,
+                    KernelInputValue::TensorBuffer(_) | KernelInputValue::QBuffer(_)
+                )
+            })
+            .count()
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1185,7 +1263,9 @@ impl Resolver {
         kernel: &mut GenericKernel,
         key: NodeIndex,
         operation: Arc<dyn Operation>,
+        result: MirValue,
         inputs: &mut Vec<Vec<MirValue>>,
+        outputs: &mut Vec<MirValue>,
         all_input_values: &mut Vec<KernelInputValue>,
         queued_operations: &mut Vec<(NodeIndex, Arc<dyn Operation>)>,
     ) {
@@ -1199,13 +1279,14 @@ impl Resolver {
                 }
             });
         }
-        let result = operation.output(graph, &new_inputs);
         let MirValue::Tensor(resolved) = result else {
             panic!("Kernel input value is not a tensor");
         };
+        let output = resolved.clone();
         // Cache the result
         graph.set_cached_result(key, resolved);
         inputs.push(new_inputs);
+        outputs.push(MirValue::Tensor(output));
         queued_operations.push((key, operation));
     }
 
@@ -1258,7 +1339,7 @@ impl Resolver {
         }
         kernel.set_workgroup_size(workgroup_shape);
         let device = graph.device();
-        let profile = std::env::var_os("RWHISPER_COHERE_PROFILE").is_some();
+        let profile = std::env::var_os("FUSOR_RESOLVER_PROFILE").is_some();
         if profile {
             let names = queued_operations
                 .iter()
@@ -1298,7 +1379,7 @@ impl Resolver {
 
 #[cfg(test)]
 mod tests {
-    use crate::{DataTypeEnum, Device, TensorData};
+    use crate::{DataTypeEnum, Device, Tensor, TensorData};
 
     use super::*;
 
@@ -1314,11 +1395,16 @@ mod tests {
         let new_output = TensorData::new_for_shape(&device, &[4, 4], DataTypeEnum::F32);
 
         assert!(resolver.should_extend_kernel(
-            vec![MirValue::Tensor(new_tensor), MirValue::Tensor(new_output)],
+            &[
+                MirValue::Tensor(new_tensor),
+                MirValue::Tensor(new_output.clone())
+            ],
+            &MirValue::Tensor(new_output),
             &[vec![
                 MirValue::Tensor(pending_tensor),
-                MirValue::Tensor(pending_output),
+                MirValue::Tensor(pending_output.clone()),
             ]],
+            &[MirValue::Tensor(pending_output)],
         ));
     }
 
@@ -1333,14 +1419,16 @@ mod tests {
         let new_output = TensorData::new_for_shape(&device, &[4, 4], DataTypeEnum::F32);
 
         assert!(resolver.should_extend_kernel(
-            vec![
+            &[
                 MirValue::Tensor(shared_input.clone()),
-                MirValue::Tensor(new_output),
+                MirValue::Tensor(new_output.clone()),
             ],
+            &MirValue::Tensor(new_output),
             &[vec![
                 MirValue::Tensor(shared_input),
-                MirValue::Tensor(pending_output),
+                MirValue::Tensor(pending_output.clone()),
             ]],
+            &[MirValue::Tensor(pending_output)],
         ));
     }
 
@@ -1356,11 +1444,58 @@ mod tests {
         let new_output = TensorData::new_for_shape(&device, &[2, 4], DataTypeEnum::F32);
 
         assert!(!resolver.should_extend_kernel(
-            vec![MirValue::Tensor(aliased_view), MirValue::Tensor(new_output)],
+            &[
+                MirValue::Tensor(aliased_view),
+                MirValue::Tensor(new_output.clone())
+            ],
+            &MirValue::Tensor(new_output),
             &[vec![
                 MirValue::Tensor(pending_input),
-                MirValue::Tensor(pending_output),
+                MirValue::Tensor(pending_output.clone()),
             ]],
+            &[MirValue::Tensor(pending_output)],
         ));
+    }
+
+    #[tokio::test]
+    async fn test_nary_fusion_caps_large_input_accumulator() {
+        let device = Device::test_instance();
+        let tensors = (0..(MAX_FUSED_NARY_INPUTS + 4))
+            .map(|_| Tensor::splat(&device, 1.0f32, [4]))
+            .collect::<Vec<_>>();
+        let mut sum = tensors[0].clone();
+        for tensor in &tensors[1..] {
+            sum = &sum + tensor;
+        }
+
+        let kernels = sum.count_kernels_to_resolve();
+        assert!(
+            kernels > 1,
+            "large n-ary accumulators should be split before they become oversized kernels"
+        );
+
+        let result = sum.as_slice().await.unwrap();
+        for index in 0..4 {
+            assert_eq!(result[[index]], tensors.len() as f32);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_many_independent_slice_assigns_respect_storage_binding_limit() {
+        let device = Device::test_instance();
+        let mut outputs = Vec::new();
+        for index in 0..12 {
+            let input = Tensor::splat(&device, index as f32, [1, 1]);
+            let value = Tensor::splat(&device, (100 + index) as f32, [1, 1]);
+            outputs.push(input.slice_assign([0..1, 0..1], &value));
+        }
+
+        let output_refs = outputs.iter().collect::<Vec<_>>();
+        let resolved = Tensor::materialized_many(&output_refs).await;
+
+        for (index, output) in resolved.iter().enumerate() {
+            let result = output.as_slice().await.unwrap();
+            assert_eq!(result[[0, 0]], (100 + index) as f32);
+        }
     }
 }

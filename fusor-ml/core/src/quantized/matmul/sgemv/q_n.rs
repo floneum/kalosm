@@ -12,7 +12,18 @@ use crate::{
 use std::fmt::Write;
 use std::sync::OnceLock;
 
-pub(crate) const Q_N_SGEMV_CHUNK_SIZE: u32 = 4; // This is the size of the chunk each thread will process at a time
+const Q_N_SGEMV_SMALL_CHUNK_SIZE: u32 = 8;
+const Q_N_SGEMV_LARGE_CHUNK_SIZE: u32 = 32;
+const Q_N_SGEMV_LARGE_N_THRESHOLD: u32 = 1024;
+
+pub(crate) fn q_n_sgemv_chunk_size(n: u32) -> u32 {
+    if n >= Q_N_SGEMV_LARGE_N_THRESHOLD {
+        Q_N_SGEMV_LARGE_CHUNK_SIZE
+    } else {
+        Q_N_SGEMV_SMALL_CHUNK_SIZE
+    }
+}
+
 const SUBGROUP_COUNT: u32 = 2;
 const SUBGROUP_SIZE: u32 = 32;
 
@@ -24,6 +35,7 @@ pub(crate) fn q_n_sgemv(
     workgroup_shape: &WorkgroupShape,
     input_a: &TensorInput,
     input_b: &QMatrixInput,
+    bias: Option<&TensorInput>,
     output: &TensorInput,
     n_size: &str,
     m_size: &str,
@@ -33,11 +45,12 @@ pub(crate) fn q_n_sgemv(
     let subgroup_index = kernel.subgroup_index();
     let subgroup_local_index = kernel.subgroup_local_index();
     let elements_per_block = op.elements_per_block();
+    let row_chunk_size = q_n_sgemv_chunk_size(op.n_size());
     let pre_element_wise_functions = OnceLock::new();
     let post_element_wise_functions = OnceLock::new();
 
-    // Calculate n_workgroups for this kernel type (SUBGROUP_COUNT subgroups per workgroup, Q_N_SGEMV_CHUNK_SIZE per subgroup)
-    let chunk_size = Q_N_SGEMV_CHUNK_SIZE * SUBGROUP_COUNT;
+    // Calculate n_workgroups for this kernel type (SUBGROUP_COUNT subgroups per workgroup, row_chunk_size per subgroup)
+    let chunk_size = row_chunk_size * SUBGROUP_COUNT;
     let n_workgroups = format!("(({n_size} + {chunk_size} - 1) / {chunk_size})");
 
     // Decompose linearized workgroup index into (n_workgroup_idx, m_idx, batch_idx)
@@ -70,14 +83,14 @@ pub(crate) fn q_n_sgemv(
     writeln!(kernel, "let workgroup_offset = n_workgroup_idx;").unwrap();
     writeln!(
         kernel,
-        "let row = ({SUBGROUP_COUNT} * workgroup_offset + {subgroup_index}) * {Q_N_SGEMV_CHUNK_SIZE};"
+        "let row = ({SUBGROUP_COUNT} * workgroup_offset + {subgroup_index}) * {row_chunk_size};"
     )
     .unwrap();
 
     // Fast path check: if all rows in this tile are valid, skip per-row bounds checks
     writeln!(
         kernel,
-        "let is_full_tile = row + {Q_N_SGEMV_CHUNK_SIZE} <= {n_size};"
+        "let is_full_tile = row + {row_chunk_size} <= {n_size};"
     )
     .unwrap();
 
@@ -95,7 +108,7 @@ pub(crate) fn q_n_sgemv(
     .unwrap();
 
     // Always accumulate in f32 to avoid overflow, then convert to output dtype at the end
-    let sum_storage_type = maybe_vec_storage_type(Q_N_SGEMV_CHUNK_SIZE, DataTypeEnum::F32);
+    let sum_storage_type = maybe_vec_storage_type(row_chunk_size, DataTypeEnum::F32);
     writeln!(kernel, "var sum = {sum_storage_type}();",).unwrap();
 
     writeln!(kernel, "var cached_a_values = array<f32, 16>();",).unwrap();
@@ -176,29 +189,29 @@ pub(crate) fn q_n_sgemv(
 
         // Fast path: all rows in tile are valid, no bounds checks needed
         writeln!(kernel, "if is_full_tile {{").unwrap();
-        if Q_N_SGEMV_CHUNK_SIZE > 1 {
+        if row_chunk_size > 1 {
             writeln!(
                 kernel,
-                "for (var offset = 0u; offset < {Q_N_SGEMV_CHUNK_SIZE}; offset += 1u) {{"
+                "for (var offset = 0u; offset < {row_chunk_size}; offset += 1u) {{"
             )
             .unwrap();
         }
         {
             writeln!(kernel, "let row_index = row + offset;").unwrap();
             block_dot(kernel, op, input_b);
-            let indexed = maybe_vec_storage_index(Q_N_SGEMV_CHUNK_SIZE, "sum", "offset");
+            let indexed = maybe_vec_storage_index(row_chunk_size, "sum", "offset");
             writeln!(kernel, "{indexed} += product;").unwrap();
         }
-        if Q_N_SGEMV_CHUNK_SIZE > 1 {
+        if row_chunk_size > 1 {
             writeln!(kernel, "block_offset += k_block_size;").unwrap();
             writeln!(kernel, "}}").unwrap();
         }
         writeln!(kernel, "}} else {{").unwrap();
         // Slow path: check bounds for each row
-        if Q_N_SGEMV_CHUNK_SIZE > 1 {
+        if row_chunk_size > 1 {
             writeln!(
                 kernel,
-                "for (var offset = 0u; offset < {Q_N_SGEMV_CHUNK_SIZE}; offset += 1u) {{"
+                "for (var offset = 0u; offset < {row_chunk_size}; offset += 1u) {{"
             )
             .unwrap();
         }
@@ -206,11 +219,11 @@ pub(crate) fn q_n_sgemv(
             writeln!(kernel, "let row_index = row + offset;").unwrap();
             writeln!(kernel, "if row_index < {n_size} {{").unwrap();
             block_dot(kernel, op, input_b);
-            let indexed = maybe_vec_storage_index(Q_N_SGEMV_CHUNK_SIZE, "sum", "offset");
+            let indexed = maybe_vec_storage_index(row_chunk_size, "sum", "offset");
             writeln!(kernel, "{indexed} += product;").unwrap();
             writeln!(kernel, "}}").unwrap();
         }
-        if Q_N_SGEMV_CHUNK_SIZE > 1 {
+        if row_chunk_size > 1 {
             writeln!(kernel, "block_offset += k_block_size;").unwrap();
             writeln!(kernel, "}}").unwrap();
         }
@@ -224,7 +237,7 @@ pub(crate) fn q_n_sgemv(
     writeln!(
         kernel,
         "sum = {};",
-        maybe_vec_storage_subgroup_add(Q_N_SGEMV_CHUNK_SIZE, "sum")
+        maybe_vec_storage_subgroup_add(row_chunk_size, "sum")
     )
     .unwrap();
 
@@ -244,25 +257,24 @@ pub(crate) fn q_n_sgemv(
         output_indices.push("m_idx".to_string());
         output_indices.push("row_index".to_string());
         output.strided_index(kernel, output_indices);
-        let indexed = maybe_vec_storage_index(Q_N_SGEMV_CHUNK_SIZE, "sum", "offset");
-        let result = post_fns
-            .iter()
-            .fold(format!("{dtype}({indexed})"), |acc, f| f.call(vec![acc]));
+        let indexed = maybe_vec_storage_index(row_chunk_size, "sum", "offset");
+        let result =
+            op.apply_bias_and_post(bias, "row_index", format!("{dtype}({indexed})"), post_fns);
         writeln!(kernel, "] = {result};").unwrap();
     };
 
     // Fast path: all rows in tile are valid, no bounds checks needed
     writeln!(kernel, "if is_full_tile {{").unwrap();
-    if Q_N_SGEMV_CHUNK_SIZE > 1 {
+    if row_chunk_size > 1 {
         writeln!(
             kernel,
-            "for (var offset = 0u; offset < {Q_N_SGEMV_CHUNK_SIZE}; offset += 1u) {{"
+            "for (var offset = 0u; offset < {row_chunk_size}; offset += 1u) {{"
         )
         .unwrap();
     }
     {
         writeln!(kernel, "if {subgroup_local_index} == 0u {{").unwrap();
-        let index = if Q_N_SGEMV_CHUNK_SIZE > 1 {
+        let index = if row_chunk_size > 1 {
             "row + offset".to_string()
         } else {
             "row".to_string()
@@ -271,21 +283,21 @@ pub(crate) fn q_n_sgemv(
         generate_row_output(kernel);
         writeln!(kernel, "}}").unwrap();
     }
-    if Q_N_SGEMV_CHUNK_SIZE > 1 {
+    if row_chunk_size > 1 {
         writeln!(kernel, "}}").unwrap();
     }
     writeln!(kernel, "}} else {{").unwrap();
     // Slow path: check bounds for each row
-    if Q_N_SGEMV_CHUNK_SIZE > 1 {
+    if row_chunk_size > 1 {
         writeln!(
             kernel,
-            "for (var offset = 0u; offset < {Q_N_SGEMV_CHUNK_SIZE}; offset += 1u) {{"
+            "for (var offset = 0u; offset < {row_chunk_size}; offset += 1u) {{"
         )
         .unwrap();
     }
     {
         writeln!(kernel, "if {subgroup_local_index} == 0u {{").unwrap();
-        let index = if Q_N_SGEMV_CHUNK_SIZE > 1 {
+        let index = if row_chunk_size > 1 {
             "row + offset".to_string()
         } else {
             "row".to_string()
@@ -296,7 +308,7 @@ pub(crate) fn q_n_sgemv(
         writeln!(kernel, "}}").unwrap();
         writeln!(kernel, "}}").unwrap();
     }
-    if Q_N_SGEMV_CHUNK_SIZE > 1 {
+    if row_chunk_size > 1 {
         writeln!(kernel, "}}").unwrap();
     }
     writeln!(kernel, "}}").unwrap();

@@ -1,9 +1,15 @@
 use crate::{
     DataType, DataTypeEnum, Device, ElementWiseFunctions, Tensor, TensorData,
     compute_graph::NodeIndex,
-    mir::{inputs::MirValue, kernel::GenericKernel, operation::Operation},
+    mir::{
+        function::Function,
+        inputs::{MirValue, TensorInput},
+        kernel::GenericKernel,
+        operation::Operation,
+    },
 };
 use fusor_gguf::GgmlType;
+use std::fmt::Write;
 
 use super::QMatrix;
 
@@ -16,6 +22,8 @@ pub use sgemm::{ChunkedSgemmConfig, GeneralSgemmConfig};
 pub(crate) struct QMatMulOperation {
     pub(crate) input_datatype: DataTypeEnum,
     pub(crate) input: NodeIndex,
+    pub(crate) bias: Option<NodeIndex>,
+    pub(crate) bias_datatype: Option<DataTypeEnum>,
     pub(crate) matrix: QMatrix,
     pub(crate) in_shape: Box<[usize]>,
     pub(crate) out_shape: Box<[usize]>,
@@ -40,6 +48,8 @@ impl QMatMulOperation {
         QMatMulOperation {
             input_datatype,
             input,
+            bias: None,
+            bias_datatype: None,
             matrix,
             in_shape: input_shape.into(),
             out_shape,
@@ -48,6 +58,39 @@ impl QMatMulOperation {
             chunked_config: None,
             general_config: None,
         }
+    }
+
+    pub(crate) fn with_bias<T: DataType>(mut self, bias: &Tensor<1, T>) -> Self {
+        assert_eq!(
+            bias.shape()[0],
+            self.out_shape[self.out_shape.len() - 1],
+            "q_mat_mul bias shape must match output features"
+        );
+        self.bias = Some(bias.key());
+        self.bias_datatype = Some(bias.datatype());
+        self
+    }
+
+    pub(crate) fn apply_bias_and_post(
+        &self,
+        bias: Option<&TensorInput>,
+        n_index: &str,
+        value_expr: String,
+        post_fns: &[Function],
+    ) -> String {
+        let value_expr = if let Some(bias) = bias {
+            let mut bias_expr = String::new();
+            write!(&mut bias_expr, "{bias}[").unwrap();
+            bias.strided_index(&mut bias_expr, [n_index.to_string()]);
+            write!(&mut bias_expr, "]").unwrap();
+            let bias_datatype = self.bias_datatype.unwrap_or(self.input_datatype);
+            format!("({value_expr} + {}({bias_expr}))", bias_datatype)
+        } else {
+            value_expr
+        };
+        post_fns
+            .iter()
+            .fold(value_expr, |acc, function| function.call(vec![acc]))
     }
 
     fn elements_per_block(&self) -> u32 {
@@ -105,6 +148,14 @@ impl<const R: usize, T: DataType> Tensor<R, T> {
         }
 
         self.add_q_mat_mul(other)
+    }
+
+    pub fn q_mat_mul_bias(&self, other: &QMatrix, bias: &Tensor<1, T>) -> Self {
+        assert!(
+            !matches!(other.datatype(), GgmlType::F16 | GgmlType::F32),
+            "q_mat_mul_bias only supports quantized matrices"
+        );
+        self.add_q_mat_mul_bias(other, bias)
     }
 }
 
@@ -818,6 +869,9 @@ impl Operation for QMatMulOperation {
 
     fn visit_dependencies(&self, f: &mut dyn FnMut(NodeIndex)) {
         f(self.input);
+        if let Some(bias) = self.bias {
+            f(bias);
+        }
     }
 
     fn inputs(&self, nodes: &crate::compute_graph::ComputeGraphInner) -> Vec<MirValue> {
@@ -829,7 +883,12 @@ impl Operation for QMatMulOperation {
             &self.out_shape,
             self.post_element_wise.out_datatype(),
         );
-        vec![input.into(), q_matrix.into(), output_tensor.into()]
+        let mut inputs = vec![input.into(), q_matrix.into()];
+        if let Some(bias) = self.bias {
+            inputs.push(nodes.get_result(bias).unwrap().into());
+        }
+        inputs.push(output_tensor.into());
+        inputs
     }
 
     // Related files/PRs in llama.cpp for reference:
@@ -850,6 +909,13 @@ impl Operation for QMatMulOperation {
 
         let input_a = generic_kernel.add_tensor_input(rank, false, datatype);
         let input_b = generic_kernel.add_q_matrix_input(matrix_rank, self.matrix.datatype);
+        let bias = self.bias.map(|_| {
+            generic_kernel.add_tensor_input(
+                1,
+                false,
+                self.bias_datatype.unwrap_or(self.input_datatype),
+            )
+        });
         let output =
             generic_kernel.add_tensor_input(rank, true, self.post_element_wise.out_datatype());
 
@@ -871,6 +937,7 @@ impl Operation for QMatMulOperation {
             workgroup_shape,
             &input_a,
             &input_b,
+            bias.as_ref(),
             &output,
             &n_size,
             &m_size,
@@ -880,7 +947,7 @@ impl Operation for QMatMulOperation {
     }
 
     fn output(&self, _: &crate::compute_graph::ComputeGraphInner, inputs: &[MirValue]) -> MirValue {
-        let output_tensor = inputs[2].as_tensor().unwrap();
+        let output_tensor = inputs.last().unwrap().as_tensor().unwrap();
         output_tensor.clone().into()
     }
 
@@ -1124,6 +1191,295 @@ fn q8_test_input_with_rows(device: &Device, rows: usize) -> Tensor<3, f32> {
 #[cfg(test)]
 fn q8_test_input(device: &Device) -> Tensor<3, f32> {
     q8_test_input_with_rows(device, 17)
+}
+
+#[cfg(test)]
+fn q4_0_matrix_from_nibbles(device: &Device, rows: usize, cols: usize) -> (QMatrix, Vec<u8>) {
+    assert_eq!(cols % 32, 0, "Q4_0 rows must be a multiple of 32 elements");
+
+    let block_size_bytes = 18;
+    let blocks_per_row = cols / 32;
+    let mut raw_bytes = vec![0u8; rows * blocks_per_row * block_size_bytes];
+
+    for row in 0..rows {
+        for block in 0..blocks_per_row {
+            let offset = (row * blocks_per_row + block) * block_size_bytes;
+            let scale = half::f16::from_f32(0.015625 * (1 + (row + block) % 7) as f32);
+            raw_bytes[offset..offset + 2].copy_from_slice(&scale.to_le_bytes());
+            for byte in 0..16 {
+                let low = ((row * 3 + block * 5 + byte) % 16) as u8;
+                let high = ((row * 7 + block * 11 + byte * 3 + 1) % 16) as u8;
+                raw_bytes[offset + 2 + byte] = low | (high << 4);
+            }
+        }
+    }
+
+    let matrix = QMatrix::from_parts(
+        device,
+        &raw_bytes,
+        vec![rows, cols].into_boxed_slice(),
+        GgmlType::Q4_0,
+    )
+    .unwrap();
+
+    (matrix, raw_bytes)
+}
+
+#[cfg(test)]
+fn q4_0_integer_reference(
+    input: &[Vec<Vec<f32>>],
+    raw_bytes: &[u8],
+    n: usize,
+) -> Vec<Vec<Vec<f32>>> {
+    use fusor_gguf::{BlockQ4_0, BlockQ8_0, GgufBlock};
+
+    let batch = input.len();
+    let m = input[0].len();
+    let k = input[0][0].len();
+    let blocks_per_row = k / BlockQ4_0::BLOCK_SIZE;
+    let blocks: &[BlockQ4_0] = bytemuck::cast_slice(raw_bytes);
+    let mut output = vec![vec![vec![0.0f32; n]; m]; batch];
+
+    for batch_idx in 0..batch {
+        for row in 0..m {
+            for col in 0..n {
+                let mut acc = 0.0f32;
+                for block_idx in 0..blocks_per_row {
+                    let start = block_idx * BlockQ4_0::BLOCK_SIZE;
+                    let activation: [f32; 32] = input[batch_idx][row]
+                        [start..start + BlockQ4_0::BLOCK_SIZE]
+                        .try_into()
+                        .unwrap();
+                    let activation = BlockQ8_0::quantize(&activation);
+                    let weight_block = &blocks[col * blocks_per_row + block_idx];
+                    acc += weight_block.vec_dot(&activation);
+                }
+                output[batch_idx][row][col] = acc;
+            }
+        }
+    }
+
+    output
+}
+
+#[cfg(test)]
+fn q4_0_test_input(batch: usize, rows: usize, cols: usize) -> Vec<Vec<Vec<f32>>> {
+    (0..batch)
+        .map(|batch_idx| {
+            (0..rows)
+                .map(|row| {
+                    (0..cols)
+                        .map(|col| {
+                            let value = ((batch_idx * 17 + row * 13 + col * 7) % 101) as f32;
+                            (value - 50.0) * 0.017
+                        })
+                        .collect()
+                })
+                .collect()
+        })
+        .collect()
+}
+
+#[cfg(test)]
+fn q4k_matrix_from_bytes(device: &Device, rows: usize, cols: usize) -> (QMatrix, Vec<u8>) {
+    use fusor_gguf::BlockQ4K;
+
+    assert_eq!(
+        cols % BlockQ4K::BLOCK_SIZE,
+        0,
+        "Q4_K rows must be a multiple of 256 elements"
+    );
+
+    let block_size_bytes = std::mem::size_of::<BlockQ4K>();
+    let blocks_per_row = cols / BlockQ4K::BLOCK_SIZE;
+    let mut raw_bytes = vec![0u8; rows * blocks_per_row * block_size_bytes];
+
+    for row in 0..rows {
+        for block in 0..blocks_per_row {
+            let offset = (row * blocks_per_row + block) * block_size_bytes;
+            let scale = half::f16::from_f32(0.0025 * (1 + (row + block) % 9) as f32);
+            let min = half::f16::from_f32(0.0015 * (1 + (row * 3 + block) % 7) as f32);
+            raw_bytes[offset..offset + 2].copy_from_slice(&scale.to_le_bytes());
+            raw_bytes[offset + 2..offset + 4].copy_from_slice(&min.to_le_bytes());
+            for index in 0..12 {
+                raw_bytes[offset + 4 + index] = ((row * 19 + block * 23 + index * 29) % 251) as u8;
+            }
+            for index in 0..BlockQ4K::WEIGHTS_SIZE {
+                let low = ((row * 5 + block * 7 + index) % 16) as u8;
+                let high = ((row * 11 + block * 13 + index * 3 + 2) % 16) as u8;
+                raw_bytes[offset + 16 + index] = low | (high << 4);
+            }
+        }
+    }
+
+    let matrix = QMatrix::from_parts(
+        device,
+        &raw_bytes,
+        vec![rows, cols].into_boxed_slice(),
+        GgmlType::Q4K,
+    )
+    .unwrap();
+
+    (matrix, raw_bytes)
+}
+
+#[cfg(test)]
+fn q4k_integer_reference(
+    input: &[Vec<Vec<f32>>],
+    raw_bytes: &[u8],
+    n: usize,
+) -> Vec<Vec<Vec<f32>>> {
+    use fusor_gguf::{BlockQ4K, BlockQ8K, GgufBlock};
+
+    let batch = input.len();
+    let m = input[0].len();
+    let k = input[0][0].len();
+    let blocks_per_row = k / BlockQ4K::BLOCK_SIZE;
+    let blocks: &[BlockQ4K] = bytemuck::cast_slice(raw_bytes);
+    let mut output = vec![vec![vec![0.0f32; n]; m]; batch];
+
+    for batch_idx in 0..batch {
+        for row in 0..m {
+            for col in 0..n {
+                let mut acc = 0.0f32;
+                for block_idx in 0..blocks_per_row {
+                    let start = block_idx * BlockQ4K::BLOCK_SIZE;
+                    let activation: [f32; 256] = input[batch_idx][row]
+                        [start..start + BlockQ4K::BLOCK_SIZE]
+                        .try_into()
+                        .unwrap();
+                    let activation = BlockQ8K::quantize(&activation);
+                    let weight_block = &blocks[col * blocks_per_row + block_idx];
+                    acc += weight_block.vec_dot(&activation);
+                }
+                output[batch_idx][row][col] = acc;
+            }
+        }
+    }
+
+    output
+}
+
+#[cfg(test)]
+#[tokio::test]
+async fn test_q4_0_sgemm_matches_integer_activation_reference() {
+    let device = Device::test_instance();
+    let rows = 32;
+    let cols = 64;
+    let m = 24;
+    let (q_matrix, raw_bytes) = q4_0_matrix_from_nibbles(&device, rows, cols);
+    let input_data = q4_0_test_input(1, m, cols);
+    let input = Tensor::<3, f32>::new(&device, &input_data);
+
+    let result = input.q_mat_mul(&q_matrix);
+    assert_eq!(
+        device.compute_graph().node_variant_name(result.key()),
+        "QMatMul"
+    );
+    let result = result.as_slice().await.unwrap();
+    let expected = q4_0_integer_reference(&input_data, &raw_bytes, rows);
+
+    for row in 0..m {
+        for col in 0..rows {
+            let actual = result[[0, row, col]];
+            let expected = expected[0][row][col];
+            assert!(
+                (actual - expected).abs() <= 1e-3,
+                "mismatch at [0, {row}, {col}]: expected {expected}, got {actual}"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+#[tokio::test]
+async fn test_q4_0_q_mat_mul_bias_matches_unfused_add() {
+    let device = Device::test_instance();
+    let rows = 32;
+    let cols = 64;
+    let m = 7;
+    let (q_matrix, _) = q4_0_matrix_from_nibbles(&device, rows, cols);
+    let input_data = q4_0_test_input(1, m, cols);
+    let input = Tensor::<3, f32>::new(&device, &input_data);
+    let bias_data = (0..rows)
+        .map(|index| (index as f32 - 11.0) * 0.03125)
+        .collect::<Vec<_>>();
+    let bias = Tensor::<1, f32>::new(&device, &bias_data);
+
+    let fused = input.q_mat_mul_bias(&q_matrix, &bias);
+    assert_eq!(
+        device.compute_graph().node_variant_name(fused.key()),
+        "QMatMul"
+    );
+    let bias = bias.reshape([1, 1, rows]).broadcast_as([1, m, rows]);
+    let expected = input.q_mat_mul(&q_matrix) + bias;
+    assert_close_3d(&fused, &expected).await;
+}
+
+#[cfg(test)]
+#[tokio::test]
+async fn test_q4k_sgemm_matches_integer_activation_reference() {
+    let device = Device::test_instance();
+    let rows = 16;
+    let cols = 256;
+    let m = 20;
+    let (q_matrix, raw_bytes) = q4k_matrix_from_bytes(&device, rows, cols);
+    let input_data = q4_0_test_input(1, m, cols);
+    let input = Tensor::<3, f32>::new(&device, &input_data);
+
+    let result = input.q_mat_mul(&q_matrix);
+    assert_eq!(
+        device.compute_graph().node_variant_name(result.key()),
+        "QMatMul"
+    );
+    let result = result.as_slice().await.unwrap();
+    let expected = q4k_integer_reference(&input_data, &raw_bytes, rows);
+
+    for row in 0..m {
+        for col in 0..rows {
+            let actual = result[[0, row, col]];
+            let expected = expected[0][row][col];
+            assert!(
+                (actual - expected).abs() <= 1e-3,
+                "mismatch at [0, {row}, {col}]: expected {expected}, got {actual}"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+#[tokio::test]
+async fn test_q4_0_projection_matmul_matches_materialized_barrier() {
+    let device = Device::test_instance();
+    let rows = 32;
+    let cols = 64;
+    let m = 24;
+    let (q_matrix, _) = q4_0_matrix_from_nibbles(&device, rows, cols);
+    let (k_matrix, _) = q4_0_matrix_from_nibbles(&device, rows, cols);
+    let input_data = q4_0_test_input(1, m, cols);
+    let input = Tensor::<3, f32>::new(&device, &input_data);
+
+    let q = input.clone().q_mat_mul(&q_matrix);
+    let k = input.clone().q_mat_mul(&k_matrix);
+    let direct = q.mat_mul(&k.transpose(1, 2));
+
+    let q_barrier: Tensor<3, f32> = input.clone().q_mat_mul(&q_matrix).materialized().await;
+    let k_barrier: Tensor<3, f32> = input.q_mat_mul(&k_matrix).materialized().await;
+    let expected = q_barrier.mat_mul(&k_barrier.transpose(1, 2));
+
+    let direct = direct.as_slice().await.unwrap();
+    let expected = expected.as_slice().await.unwrap();
+    assert_eq!(direct.shape(), expected.shape());
+    for row in 0..m {
+        for col in 0..m {
+            let actual = direct[[0, row, col]];
+            let expected = expected[[0, row, col]];
+            assert!(
+                (actual - expected).abs() <= 1e-3,
+                "mismatch at [0, {row}, {col}]: expected {expected}, got {actual}"
+            );
+        }
+    }
 }
 
 #[cfg(test)]

@@ -86,14 +86,13 @@ impl Linear<f32> {
     where
         B: fusor_cpu::TensorBacking<3, Elem = f32>,
     {
-        let output = self.forward_no_bias(input);
-
         if let Some(bias) = &self.bias {
-            output.add_(bias)
+            input.q_mat_mul_bias(&self.weight, bias)
         } else {
-            output
+            self.forward_no_bias(input)
         }
     }
+
 }
 
 // Generic forward implementations for Linear<T> where T can be cast to/from f32

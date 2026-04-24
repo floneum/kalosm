@@ -197,9 +197,11 @@ fn generate_row_computation(kernel: &mut GenericKernel, offset: u32, input_b: &Q
 
 /// Generate WGSL for writing one row's output
 fn generate_row_output(
+    op: &QMatMulOperation,
     kernel: &mut GenericKernel,
     offset: u32,
     dtype: DataTypeEnum,
+    bias: Option<&TensorInput>,
     output: &TensorInput,
     post_element_wise_functions: &[Function],
 ) {
@@ -212,9 +214,12 @@ fn generate_row_output(
     output_indices.push("row_index".to_string());
     output.strided_index(kernel, output_indices);
     let indexed = maybe_vec_storage_index(Q5K_SGEMV_CHUNK_SIZE, "sum", offset);
-    let result = post_element_wise_functions
-        .iter()
-        .fold(format!("{dtype}({indexed})"), |acc, f| f.call(vec![acc]));
+    let result = op.apply_bias_and_post(
+        bias,
+        "row_index",
+        format!("{dtype}({indexed})"),
+        post_element_wise_functions,
+    );
     writeln!(kernel, "] = {result};").unwrap();
 }
 
@@ -239,6 +244,7 @@ pub(crate) fn q5k_sgemv(
     workgroup_shape: &WorkgroupShape,
     input_a: &TensorInput,
     input_b: &QMatrixInput,
+    bias: Option<&TensorInput>,
     output: &TensorInput,
     n_size: &str,
     m_size: &str,
@@ -432,7 +438,7 @@ pub(crate) fn q5k_sgemv(
         writeln!(kernel, "{{").unwrap();
         writeln!(kernel, "if {subgroup_local_index} == 0u {{").unwrap();
         writeln!(kernel, "let row_index = row + {offset}u;").unwrap();
-        generate_row_output(kernel, offset, dtype, output, post_fns);
+        generate_row_output(op, kernel, offset, dtype, bias, output, post_fns);
         writeln!(kernel, "}}").unwrap();
         writeln!(kernel, "}}").unwrap();
     }
@@ -443,7 +449,7 @@ pub(crate) fn q5k_sgemv(
         writeln!(kernel, "if {subgroup_local_index} == 0u {{").unwrap();
         writeln!(kernel, "let row_index = row + {offset}u;").unwrap();
         writeln!(kernel, "if row_index < {n_size} {{").unwrap();
-        generate_row_output(kernel, offset, dtype, output, post_fns);
+        generate_row_output(op, kernel, offset, dtype, bias, output, post_fns);
         writeln!(kernel, "}}").unwrap();
         writeln!(kernel, "}}").unwrap();
         writeln!(kernel, "}}").unwrap();

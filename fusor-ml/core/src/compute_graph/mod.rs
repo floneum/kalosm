@@ -242,7 +242,7 @@ impl ComputeGraphNodeVariant {
                 f(op.second);
             }
             ComputeGraphNodeVariant::QMatMul(op) => {
-                f(op.input);
+                op.visit_dependencies(f);
             }
             ComputeGraphNodeVariant::Reduce(op) => f(op.value),
             ComputeGraphNodeVariant::MapLayout(op) => f(op.input),

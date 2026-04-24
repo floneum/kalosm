@@ -480,6 +480,21 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_to_concrete_gpu_preserves_non_contiguous_view() {
+        let device = Device::new().await.expect("GPU required for this test");
+        let data = [[1.0f32, 2.0, 3.0], [4.0, 5.0, 6.0]];
+        let tensor = Tensor::from_slice(&device, [2, 3], data.as_flattened());
+
+        let concrete = tensor.narrow(1, 1, 2).to_concrete();
+        let slice = concrete.as_slice().await.unwrap();
+
+        assert_eq!(slice[[0, 0]], 2.0);
+        assert_eq!(slice[[0, 1]], 3.0);
+        assert_eq!(slice[[1, 0]], 5.0);
+        assert_eq!(slice[[1, 1]], 6.0);
+    }
+
+    #[tokio::test]
     async fn test_chunk_cpu() {
         let data = [1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0];
         let t: Tensor<1, f32> = Tensor::Cpu(fusor_cpu::Tensor::from_slice([6], &data));

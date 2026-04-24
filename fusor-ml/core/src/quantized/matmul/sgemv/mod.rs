@@ -20,7 +20,7 @@ use crate::{
 use crate::{
     QMatrix,
     quantized::matmul::sgemv::{
-        q_8_0::Q_8_0_SGEMV_CHUNK_SIZE, q_n::Q_N_SGEMV_CHUNK_SIZE, q4k::Q4K_SGEMV_CHUNK_SIZE,
+        q_8_0::Q_8_0_SGEMV_CHUNK_SIZE, q_n::q_n_sgemv_chunk_size, q4k::Q4K_SGEMV_CHUNK_SIZE,
         q5k::Q5K_SGEMV_CHUNK_SIZE, q6k::Q6K_SGEMV_CHUNK_SIZE,
     },
     visit_tiled::distribute_workgroups,
@@ -105,6 +105,7 @@ pub(crate) fn sgemv(
     workgroup_size: &WorkgroupShape,
     input_a: &TensorInput,
     input_b: &QMatrixInput,
+    bias: Option<&TensorInput>,
     output: &TensorInput,
     _n_size: &str,
     _m_size: &str,
@@ -121,6 +122,7 @@ pub(crate) fn sgemv(
             workgroup_size,
             input_a,
             input_b,
+            bias,
             output,
             _n_size,
             _m_size,
@@ -132,6 +134,7 @@ pub(crate) fn sgemv(
             workgroup_size,
             input_a,
             input_b,
+            bias,
             output,
             _n_size,
             _m_size,
@@ -143,6 +146,7 @@ pub(crate) fn sgemv(
             workgroup_size,
             input_a,
             input_b,
+            bias,
             output,
             _n_size,
             _m_size,
@@ -154,6 +158,7 @@ pub(crate) fn sgemv(
             workgroup_size,
             input_a,
             input_b,
+            bias,
             output,
             _n_size,
             _m_size,
@@ -165,6 +170,7 @@ pub(crate) fn sgemv(
             workgroup_size,
             input_a,
             input_b,
+            bias,
             output,
             _n_size,
             _m_size,
@@ -176,6 +182,7 @@ pub(crate) fn sgemv(
             workgroup_size,
             input_a,
             input_b,
+            bias,
             output,
             _n_size,
             _m_size,
@@ -196,7 +203,7 @@ pub(crate) fn n_workgroups(matrix: &QMatrix, n: u32) -> u32 {
         } else if matrix.datatype == GgmlType::Q5K {
             n.div_ceil(Q5K_SGEMV_CHUNK_SIZE * 2)
         } else if matches!(matrix.datatype, GgmlType::Q4_0 | GgmlType::Q5_0) {
-            n.div_ceil(Q_N_SGEMV_CHUNK_SIZE * 2)
+            n.div_ceil(q_n_sgemv_chunk_size(n) * 2)
         } else if matches!(matrix.datatype, GgmlType::Q8_0) {
             n.div_ceil(Q_8_0_SGEMV_CHUNK_SIZE * 2)
         } else {
