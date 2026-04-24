@@ -2,7 +2,7 @@ mod common;
 
 use common::{binary_map2, unary_map2, where_cond1, where_cond2};
 use fusor::{Device, Tensor};
-use fusor_conformance::{FuzzGenerator, approx_compare};
+use fusor_conformance::{FuzzGenerator, approx_compare, approx_or_relative_compare};
 use rand::distr::Uniform;
 
 const SHAPE: [usize; 2] = [45, 45];
@@ -45,12 +45,18 @@ fn acosh_domain() -> FuzzGenerator<2, f32> {
 
 macro_rules! fuzz_unary {
     ($name:ident, $gen:expr, $op:expr, $ref_fn:expr, $tol:expr) => {
+        fuzz_unary_compare!($name, $gen, $op, $ref_fn, approx_compare::<2, f32>($tol));
+    };
+}
+
+macro_rules! fuzz_unary_compare {
+    ($name:ident, $gen:expr, $op:expr, $ref_fn:expr, $compare:expr) => {
         fusor_conformance::assert(async |x: Tensor<2, f32>| ($op)(x))
             .arg($gen)
             .equal_to_resolved_with_device(async |v: Vec<Vec<f32>>, device: Device| {
                 Tensor::new(&device, &unary_map2(&v, $ref_fn))
             })
-            .compare_with(approx_compare::<2, f32>($tol))
+            .compare_with($compare)
             .runs(3)
             .await
             .unwrap();
@@ -138,21 +144,21 @@ async fn unary_math_ops_match_host_reference() {
     );
 
     // sinh
-    fuzz_unary!(
+    fuzz_unary_compare!(
         _sinh,
         signed(),
         |x: Tensor<2, f32>| x.sinh().to_concrete(),
         f32::sinh,
-        2e-3
+        approx_or_relative_compare::<2>(1e-4, 2e-4)
     );
 
     // cosh
-    fuzz_unary!(
+    fuzz_unary_compare!(
         _cosh,
         signed(),
         |x: Tensor<2, f32>| x.cosh().to_concrete(),
         f32::cosh,
-        2e-3
+        approx_or_relative_compare::<2>(1e-4, 2e-4)
     );
 
     // asinh

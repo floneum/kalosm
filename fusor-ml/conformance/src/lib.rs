@@ -141,6 +141,25 @@ pub async fn relative_eq<const R: usize>(
     .await
 }
 
+/// Assert that two f32 tensors are element-wise close within either an
+/// absolute tolerance or a relative tolerance.
+///
+/// Use this for outputs that can be near zero for some inputs but grow large
+/// enough elsewhere that absolute roundoff alone becomes brittle.
+pub async fn approx_or_relative_eq<const R: usize>(
+    a: &Tensor<R, f32>,
+    b: &Tensor<R, f32>,
+    abs_tol: f32,
+    rel_tol: f32,
+) -> Result<(), ItemMismatchError> {
+    eq_with(a, b, |va, vb| {
+        let diff = (va - vb).abs();
+        let scale = va.abs().max(vb.abs()).max(f32::MIN_POSITIVE);
+        diff <= abs_tol || diff <= rel_tol * scale
+    })
+    .await
+}
+
 /// Generate a random f32 tensor with values in [-1, 1].
 pub fn random_tensor<const R: usize, T: DataType + SimdElement>(
     device: &Device,
@@ -983,6 +1002,14 @@ pub fn relative_compare<const R: usize>(
 ) -> impl for<'a> Fn(&'a Tensor<R, f32>, &'a Tensor<R, f32>) -> CompareFut<'a, ItemMismatchError> + Clone
 {
     move |a, b| Box::pin(relative_eq(a, b, rel_tol))
+}
+
+pub fn approx_or_relative_compare<const R: usize>(
+    abs_tol: f32,
+    rel_tol: f32,
+) -> impl for<'a> Fn(&'a Tensor<R, f32>, &'a Tensor<R, f32>) -> CompareFut<'a, ItemMismatchError> + Clone
+{
+    move |a, b| Box::pin(approx_or_relative_eq(a, b, abs_tol, rel_tol))
 }
 
 pub fn assert<T, U>(op: impl AsyncFnMutTuple<T, Output = U> + 'static) -> AssertBuilder<T, U> {
