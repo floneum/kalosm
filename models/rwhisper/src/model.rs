@@ -749,7 +749,6 @@ impl Decoder {
                 let start = range.start;
                 let end = range.end;
                 let start_time_offset = (start * HOP_LENGTH) as f64 / SAMPLE_RATE as f64;
-                let time_offset = (end * HOP_LENGTH) as f64 / SAMPLE_RATE as f64;
 
                 let segment_duration = (segment_size * HOP_LENGTH) as f64 / SAMPLE_RATE as f64;
 
@@ -807,7 +806,7 @@ impl Decoder {
                 let segment = Segment {
                     sample_range: (range.start * HOP_LENGTH)
                         ..audio_frames.min(range.end * HOP_LENGTH),
-                    start: time_offset,
+                    start: start_time_offset,
                     duration: segment_duration,
                     remaining_time: remaining,
                     elapsed_time: elapsed,

@@ -392,12 +392,7 @@ impl MoonshineAttention {
         let mut scores = q.mat_mul(&k_t).mul_scalar(self.scale.powf(-0.5));
         if q.is_gpu() {
             if let Some(mask) = attention_mask {
-                let mask = mask
-                    .mask()
-                    .clone()
-                    .unsqueeze(0)
-                    .unsqueeze(0)
-                    .to_concrete();
+                let mask = mask.mask().clone().unsqueeze(0).unsqueeze(0).to_concrete();
                 scores = scores.add_(&mask).to_concrete();
             }
         } else if let Some(mask) = attention_mask {
@@ -440,7 +435,6 @@ impl MoonshineAttention {
             attention_output,
         )
     }
-
 
     fn forward_cached(
         &self,
@@ -1409,8 +1403,7 @@ mod tests {
         let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/samples_jfk.wav");
         let bytes = fs::read(&path).unwrap();
         let decoder = rodio::Decoder::new(std::io::Cursor::new(bytes)).unwrap();
-        let resampled =
-            rodio::source::UniformSourceIterator::new(decoder, 1, target_rate as u32);
+        let resampled = rodio::source::UniformSourceIterator::new(decoder, 1, target_rate as u32);
         resampled.map(|s: i16| s as f32 / i16::MAX as f32).collect()
     }
 
@@ -1526,5 +1519,4 @@ mod tests {
             "cached decode diverged from full decode: max_diff={max_diff}"
         );
     }
-
 }

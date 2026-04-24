@@ -789,19 +789,15 @@ impl MoonshineRuntime {
             return Ok(());
         };
         let mut state = state;
-        let Some(mut candidate) = self.update_stream_candidate(&mut state, &[], true).await?
-        else {
+        let Some(mut candidate) = self.update_stream_candidate(&mut state, &[], true).await? else {
             return Ok(());
         };
         if state.word_timestamps {
             if let Some(prepared_encoder_hidden_states) =
                 state.prepared_encoder_hidden_states.as_ref()
             {
-                self.populate_candidate_timestamps(
-                    &mut candidate,
-                    prepared_encoder_hidden_states,
-                )
-                .await?;
+                self.populate_candidate_timestamps(&mut candidate, prepared_encoder_hidden_states)
+                    .await?;
             }
         }
         if let Some(segment) = self.segment_from_token_range(

@@ -211,6 +211,24 @@ impl CohereRuntime {
             }
         }
 
+        if current_text.is_empty() && !processed_tokens.is_empty() {
+            current_text = self
+                .tokenizer
+                .decode(&processed_tokens, true)
+                .map_err(crate::model::WhisperError::Tokenizer)?;
+            if !current_text.is_empty() {
+                let timestamp = token_timestamps.as_ref().and_then(|timestamps| {
+                    let start = timestamp_start.or_else(|| timestamps.first().copied())?;
+                    let end = timestamps.last().copied().unwrap_or(clip_end);
+                    Some(start..end)
+                });
+                chunks.push(TokenChunk {
+                    text_range: 0..current_text.len(),
+                    timestamp,
+                });
+            }
+        }
+
         Ok(DecodingResult {
             text: current_text,
             avg_logprob: 0.0,
