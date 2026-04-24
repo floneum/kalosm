@@ -63,9 +63,11 @@ where
         // sqrt(2/pi) * (x * (1 + 0.044715 * x^2))
         let tanh_input = inner * coeff;
 
-        // tanh(...) - clamp output to [-1, 1] for compatibility with software renderers (WARP)
-        // that have buggy built-in tanh() returning values > 1 for large inputs
-        let tanh_result = tanh_input.tanh().clamp(D::from_f32(-1.0), D::from_f32(1.0));
+        // Avoid native tanh here: software renderers (WARP) can under-saturate
+        // on GELU's negative tail, leaving visible non-zero outputs.
+        let tanh_result = tanh_input
+            .tanh_exact()
+            .clamp(D::from_f32(-1.0), D::from_f32(1.0));
 
         // 1 + tanh(...)
         let one_plus_tanh = &tanh_result + D::from_f32(1.0);

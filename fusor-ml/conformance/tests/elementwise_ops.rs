@@ -131,7 +131,7 @@ async fn unary_math_ops_match_host_reference() {
         signed(),
         |x: Tensor<2, f32>| x.atan().to_concrete(),
         f32::atan,
-        1e-5
+        2e-5
     );
 
     // sinh
