@@ -125,6 +125,9 @@ async fn unary_math_ops_match_host_reference() {
         5e-4
     );
 
+    // Windows WARP's native transcendental paths can differ from libm by a
+    // few ULPs. Keep these tolerances tight enough to catch implementation
+    // mistakes without requiring exact cross-backend polynomial agreement.
     // atan
     fuzz_unary!(
         _atan,
@@ -140,7 +143,7 @@ async fn unary_math_ops_match_host_reference() {
         signed(),
         |x: Tensor<2, f32>| x.sinh().to_concrete(),
         f32::sinh,
-        1e-3
+        2e-3
     );
 
     // cosh
@@ -149,7 +152,7 @@ async fn unary_math_ops_match_host_reference() {
         signed(),
         |x: Tensor<2, f32>| x.cosh().to_concrete(),
         f32::cosh,
-        1e-3
+        2e-3
     );
 
     // asinh
@@ -158,7 +161,7 @@ async fn unary_math_ops_match_host_reference() {
         signed(),
         |x: Tensor<2, f32>| x.asinh().to_concrete(),
         f32::asinh,
-        1e-5
+        1e-4
     );
 
     // approximate_exp

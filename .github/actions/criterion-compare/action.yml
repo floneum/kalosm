@@ -11,6 +11,10 @@ inputs:
   benchName:
     description: Criterion benchmark target to run.
     required: true
+  criterionArgs:
+    description: Extra arguments to pass to Criterion after `--`.
+    required: false
+    default: ""
 
 runs:
   using: composite
@@ -22,7 +26,7 @@ runs:
     - name: Benchmark changes
       shell: bash
       working-directory: ${{ inputs.cwd }}
-      run: cargo bench --bench "${{ inputs.benchName }}" -- --save-baseline changes
+      run: cargo bench --bench "${{ inputs.benchName }}" -- ${{ inputs.criterionArgs }} --save-baseline changes
 
     - name: Fetch base branch
       shell: bash
@@ -35,7 +39,7 @@ runs:
     - name: Benchmark base
       shell: bash
       working-directory: ${{ inputs.cwd }}
-      run: cargo bench --bench "${{ inputs.benchName }}" -- --save-baseline base
+      run: cargo bench --bench "${{ inputs.benchName }}" -- ${{ inputs.criterionArgs }} --save-baseline base
 
     - name: Compare baselines
       shell: bash

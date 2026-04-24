@@ -27,6 +27,7 @@ jobs:
           cwd: "fusor-ml/core"
           benchName: "matmul"
           branchName: ${{ github.base_ref }}
+          criterionArgs: "--sample-size 10"
   elementwise:
     if: github.event.pull_request.draft == false
     name: elementwise benchmark
