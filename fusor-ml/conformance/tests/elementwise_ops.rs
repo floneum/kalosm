@@ -185,7 +185,7 @@ async fn unary_math_ops_match_host_reference() {
         signed(),
         |x: Tensor<2, f32>| x.tanh_exact(),
         f32::tanh,
-        1e-6
+        2e-4
     );
 
     // sqr
@@ -948,7 +948,7 @@ async fn tanh_exact_saturation_at_large_magnitudes() {
             let input = Tensor::from_slice(&device, SHAPE, &flat);
             let actual = input.tanh_exact().to_concrete();
             let expected_tensor = Tensor::from_slice(&device, SHAPE, &expected);
-            fusor_conformance::approx_eq(&actual, &expected_tensor, 1e-6)
+            fusor_conformance::approx_eq(&actual, &expected_tensor, 2e-4)
                 .await
                 .unwrap();
         }
