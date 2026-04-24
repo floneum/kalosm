@@ -20,6 +20,9 @@ pub(crate) struct ResizeOperation {
     pub(crate) current_shape: Box<[usize]>,
     pub(crate) new_shape: Box<[usize]>,
     pub(crate) fill_shape: Box<[usize]>,
+    /// Forbid layout-only lowering; always run the copy kernel. Used by
+    /// `contiguous()` to materialize a strided view into row-major memory.
+    pub(crate) force_copy: bool,
 }
 
 impl ResizeOperation {
@@ -34,6 +37,22 @@ impl ResizeOperation {
             current_shape,
             new_shape,
             fill_shape,
+            force_copy: false,
+        }
+    }
+
+    pub fn new_force_copy(
+        input: NodeIndex,
+        current_shape: Box<[usize]>,
+        new_shape: Box<[usize]>,
+        fill_shape: Box<[usize]>,
+    ) -> Self {
+        Self {
+            input,
+            current_shape,
+            new_shape,
+            fill_shape,
+            force_copy: true,
         }
     }
 }
@@ -43,6 +62,9 @@ impl ResizeOperation {
         &self,
         graph: &crate::compute_graph::ComputeGraphInner,
     ) -> Option<MapLayoutOperation> {
+        if self.force_copy {
+            return None;
+        }
         let full_fill = self.fill_shape == self.new_shape;
         let matching_size = self.current_shape.iter().product::<usize>()
             == self.new_shape.iter().product::<usize>();
@@ -236,6 +258,20 @@ impl<const R: usize, T: crate::DataType> Tensor<R, T> {
             (*self.shape()).into(),
             new_shape,
             (*self.shape()).into(),
+        ))
+    }
+
+    /// Materialize this tensor into a row-major contiguous buffer. Always
+    /// runs a copy kernel so subsequent ops (and `as_slice` reads) observe
+    /// data in logical shape order.
+    pub fn contiguous(&self) -> Tensor<R, T> {
+        let shape: Box<[usize]> = (*self.shape()).as_slice().into();
+        let input = self.key();
+        self.add_resize(ResizeOperation::new_force_copy(
+            input,
+            shape.clone(),
+            shape.clone(),
+            shape,
         ))
     }
 

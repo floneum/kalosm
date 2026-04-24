@@ -1,0 +1,19 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(cargo check:*)",
+      "Read(//Users/evanalmloff/Desktop/Github/floneum/fusor-ml/core/src/**)",
+      "Read(//Users/evanalmloff/Desktop/Github/floneum/**)",
+      "Read(//Users/evanalmloff/Desktop/Github/floneum/fusor-ml/core/src/**)",
+      "Bash(cargo test)",
+      "Bash(cargo test:*)",
+      "Bash(RUST_BACKTRACE=1 cargo run --example embed)",
+      "Bash(cargo run:*)"
+    ],
+    "deny": [],
+    "ask": [],
+    "additionalDirectories": [
+      "/Users/evanalmloff/Desktop/Github/floneum/fusor-ml/core"
+    ]
+  }
+}

@@ -153,6 +153,35 @@ where
         }
     }
 
+    /// Apply fused interleaved RoPE to the first `rotary_dim` elements and pass the rest through.
+    pub fn rope_partial_fused(
+        &self,
+        cos: &Tensor<2, D, ConcreteTensor<D, 2>>,
+        sin: &Tensor<2, D, ConcreteTensor<D, 2>>,
+        rotary_dim: usize,
+    ) -> Self {
+        match (self, cos, sin) {
+            (Tensor::Gpu(x), Tensor::Gpu(cos), Tensor::Gpu(sin)) => {
+                Tensor::Gpu(x.rope_partial_fused(cos, sin, rotary_dim))
+            }
+            (Tensor::Cpu(_), Tensor::Cpu(_), Tensor::Cpu(_)) => {
+                let [_bz, _n_head, _sequence_length, head_dim] = self.shape();
+                if rotary_dim == head_dim {
+                    return self.rope_interleaved(cos, sin);
+                }
+                let rotated = self
+                    .narrow(3, 0, rotary_dim)
+                    .to_concrete()
+                    .rope_interleaved(cos, sin);
+                let pass = self
+                    .narrow(3, rotary_dim, head_dim - rotary_dim)
+                    .to_concrete();
+                crate::cat([rotated, pass], 3)
+            }
+            _ => panic!("All tensors must be on the same device"),
+        }
+    }
+
     /// Apply fused normal RoPE (rotary position embedding).
     /// This pairs first half with second half: (0, head_dim/2), (1, head_dim/2+1), etc.
     ///
@@ -260,6 +289,24 @@ impl RopeCache {
 
         let q = q.rope_fused(&cos, &sin);
         let k = k.rope_fused(&cos, &sin);
+
+        (q, k)
+    }
+
+    /// Apply interleaved RoPE to a prefix of query and key tensors.
+    pub fn forward_interleaved_partial(
+        &self,
+        q: &Tensor<4, f32>,
+        k: &Tensor<4, f32>,
+        start_pos: usize,
+        rotary_dim: usize,
+    ) -> (Tensor<4, f32>, Tensor<4, f32>) {
+        let [_b_sz, _n_head, seq_len, _n_embd] = q.shape();
+        let cos = self.cos.narrow(0, start_pos, seq_len).to_concrete();
+        let sin = self.sin.narrow(0, start_pos, seq_len).to_concrete();
+
+        let q = q.rope_partial_fused(&cos, &sin, rotary_dim);
+        let k = k.rope_partial_fused(&cos, &sin, rotary_dim);
 
         (q, k)
     }

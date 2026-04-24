@@ -8,13 +8,23 @@ impl<D: DataType> Tensor<4, D> {
     /// Apply fused interleaved RoPE (rotary position embedding).
     /// This pairs adjacent elements: (0, 1), (2, 3), etc.
     pub fn rope_fused(&self, cos: &Tensor<2, D>, sin: &Tensor<2, D>) -> Tensor<4, D> {
-        self.rope_fused_impl(cos, sin, RopeMode::Interleaved)
+        self.rope_fused_impl(cos, sin, RopeMode::Interleaved, None)
+    }
+
+    /// Apply fused interleaved RoPE to the first `rotary_dim` elements and pass the rest through.
+    pub fn rope_partial_fused(
+        &self,
+        cos: &Tensor<2, D>,
+        sin: &Tensor<2, D>,
+        rotary_dim: usize,
+    ) -> Tensor<4, D> {
+        self.rope_fused_impl(cos, sin, RopeMode::Interleaved, Some(rotary_dim))
     }
 
     /// Apply fused normal RoPE (rotary position embedding).
     /// This pairs first half with second half: (0, head_dim/2), (1, head_dim/2+1), etc.
     pub fn rope_normal_fused(&self, cos: &Tensor<2, D>, sin: &Tensor<2, D>) -> Tensor<4, D> {
-        self.rope_fused_impl(cos, sin, RopeMode::Normal)
+        self.rope_fused_impl(cos, sin, RopeMode::Normal, None)
     }
 
     fn rope_fused_impl(
@@ -22,8 +32,12 @@ impl<D: DataType> Tensor<4, D> {
         cos: &Tensor<2, D>,
         sin: &Tensor<2, D>,
         mode: RopeMode,
+        rotary_dim: Option<usize>,
     ) -> Tensor<4, D> {
         let [_, _, sequence_length, head_dim] = *self.shape();
+        let rotary_dim = rotary_dim.unwrap_or(head_dim);
+        assert!(rotary_dim <= head_dim);
+        assert_eq!(rotary_dim % 2, 0);
         // Narrow cos/sin to the sequence length
         let cos = cos.narrow(0, 0, sequence_length);
         let sin = sin.narrow(0, 0, sequence_length);
@@ -36,6 +50,7 @@ impl<D: DataType> Tensor<4, D> {
             shape: (*self.shape()).into(),
             mode,
             head_dim,
+            rotary_dim,
         }
         .to_nary();
 
@@ -61,6 +76,7 @@ struct RopeFusedOperation {
     shape: Box<[usize]>,
     mode: RopeMode,
     head_dim: usize,
+    rotary_dim: usize,
 }
 
 impl RopeFusedOperation {
@@ -108,9 +124,27 @@ impl RopeFusedOperation {
         );
 
         // Final expression: input * cos + neighbor * sin_with_sign
-        let input_times_cos = NaryExpr::mul(input_val, cos_val, self.datatype);
+        let input_times_cos = NaryExpr::mul(input_val.clone(), cos_val, self.datatype);
         let neighbor_times_sin = NaryExpr::mul(neighbor_val, sin_with_sign, self.datatype);
-        NaryExpr::add(input_times_cos, neighbor_times_sin, self.datatype)
+        let rotated = NaryExpr::add(input_times_cos, neighbor_times_sin, self.datatype);
+        if self.rotary_dim == self.head_dim {
+            rotated
+        } else {
+            let in_rotary = NaryExpr::unary_op(
+                NaryExpr::DimIndex(dim_last_idx),
+                "lt_rotary",
+                format!("let output = select(0u, 1u, input < {}u);", self.rotary_dim),
+                DataTypeEnum::U32,
+                DataTypeEnum::U32,
+            );
+            NaryExpr::select(
+                in_rotary,
+                rotated,
+                input_val,
+                DataTypeEnum::U32,
+                self.datatype,
+            )
+        }
     }
 
     /// Build the index expressions for accessing cos/sin values (returns Vec for indexed_input)
@@ -120,13 +154,25 @@ impl RopeFusedOperation {
 
         let cos_sin_dim = match self.mode {
             // Interleaved: index = dim_last / 2
-            RopeMode::Interleaved => NaryExpr::unary_op(
-                dim_last,
-                "div2",
-                "let output = input / 2u;",
-                DataTypeEnum::U32,
-                DataTypeEnum::U32,
-            ),
+            RopeMode::Interleaved => {
+                if self.rotary_dim == self.head_dim {
+                    NaryExpr::unary_op(
+                        dim_last,
+                        "div2",
+                        "let output = input / 2u;",
+                        DataTypeEnum::U32,
+                        DataTypeEnum::U32,
+                    )
+                } else {
+                    NaryExpr::unary_op(
+                        dim_last,
+                        "partial_div2",
+                        format!("let output = min(input, {}u) / 2u;", self.rotary_dim - 1),
+                        DataTypeEnum::U32,
+                        DataTypeEnum::U32,
+                    )
+                }
+            }
             // Normal: index = dim_last % half
             RopeMode::Normal => {
                 let half = self.head_dim / 2;
@@ -292,6 +338,39 @@ mod tests {
                     }
                 }
             }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_rope_partial_fused_interleaved() {
+        let device = Device::test_instance();
+        let cos = Tensor::new(
+            &device,
+            &[[1.0, 0.5], [0.75, 0.25], [0.25, 0.125], [0.9, 0.33]],
+        );
+        let sin = Tensor::new(
+            &device,
+            &[[0.0, 0.25], [0.5, 0.75], [0.125, 0.875], [0.1, 0.66]],
+        );
+        let x = Tensor::new(
+            &device,
+            &[[[
+                [1.0, 2.0, 3.0, 4.0, 50.0, 60.0],
+                [5.0, 6.0, 7.0, 8.0, 70.0, 80.0],
+                [9.0, 10.0, 11.0, 12.0, 90.0, 100.0],
+                [13.0, 14.0, 15.0, 16.0, 110.0, 120.0],
+            ]]],
+        );
+
+        let rotated = x.narrow(3, 0, 4).rope_fused(&cos, &sin);
+        let pass = x.narrow(3, 4, 2);
+        let expected = Tensor::cat([rotated, pass], 3);
+        let fused = x.rope_partial_fused(&cos, &sin, 4);
+
+        let expected = expected.as_slice().await.unwrap();
+        let fused = fused.as_slice().await.unwrap();
+        for (actual, expected) in fused.as_slice().iter().zip(expected.as_slice()) {
+            assert!((actual - expected).abs() < 1e-5);
         }
     }
 

@@ -1,0 +1,7 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(alias rt='cargo nextest run')"
+    ]
+  }
+}

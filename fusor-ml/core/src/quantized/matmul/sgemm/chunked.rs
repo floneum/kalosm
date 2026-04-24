@@ -8,6 +8,7 @@ use crate::{
     quantized::matmul::QMatMulOperation,
 };
 use std::fmt::Write;
+use std::sync::OnceLock;
 
 /// Size of the chunk we will dot at a time
 const MATRIX_ELEMENTS: u32 = 16;
@@ -62,6 +63,7 @@ pub fn chunked_sgemm_with_config(
     kernel: &mut GenericKernel,
     input_a: &TensorInput,
     input_b: &QMatrixInput,
+    bias: Option<&TensorInput>,
     output: &TensorInput,
     k_size: &str,
     config: ChunkedSgemmConfig,
@@ -84,6 +86,7 @@ pub fn chunked_sgemm_with_config(
     let sgemm_m_results_per_thread = config.m_results_per_thread;
     let cache_datatype = config.cache_datatype;
     let shuffled_loads = config.shuffled_loads;
+    let pre_element_wise_functions = OnceLock::new();
 
     let cache_a_size = (sgemm_input_k_elements / 4) * (sgemm_input_m_elements / 4);
     let cache_a = kernel.add_global_array(
@@ -238,12 +241,19 @@ pub fn chunked_sgemm_with_config(
                         kernel,
                         indices.iter().cloned(),
                         |kernel: &mut GenericKernel| {
+                            let pre_element_wise_functions = pre_element_wise_functions
+                                .get_or_init(|| op.pre_element_wise.add_functions(kernel));
+                            let mut raw_input = String::new();
+                            write!(&mut raw_input, "{input_a}[")?;
+                            input_a.strided_index(&mut raw_input, indices.iter().cloned());
+                            write!(&mut raw_input, "]")?;
+                            let processed = pre_element_wise_functions
+                                .iter()
+                                .fold(raw_input, |acc, f| f.call(vec![acc]));
                             write!(
                                 kernel,
-                                "{cache_a}[chunk_index][col_index][row_index] = {cache_datatype}({input_a}["
+                                "{cache_a}[chunk_index][col_index][row_index] = {cache_datatype}({processed});"
                             )?;
-                            input_a.strided_index(kernel, indices.iter().cloned());
-                            write!(kernel, "]);")?;
                             std::fmt::Result::Ok(())
                         },
                     )
@@ -376,17 +386,20 @@ pub fn chunked_sgemm_with_config(
     }
     writeln!(kernel, "}}").unwrap();
 
-    write_acc_back(kernel, output, output_offset, &config).unwrap();
+    write_acc_back(kernel, op, bias, output, output_offset, &config).unwrap();
 }
 
 fn write_acc_back(
     kernel: &mut GenericKernel,
+    op: &QMatMulOperation,
+    bias: Option<&TensorInput>,
     output: &TensorInput,
     output_offset: &str,
     config: &ChunkedSgemmConfig,
 ) -> std::fmt::Result {
     let sgemm_n_results_per_thread = config.n_results_per_thread;
     let sgemm_m_results_per_thread = config.m_results_per_thread;
+    let post_element_wise_functions = op.post_element_wise.add_functions(kernel);
     for tile_m in 0..sgemm_m_results_per_thread {
         for tile_n in 0..sgemm_n_results_per_thread {
             writeln!(
@@ -414,10 +427,16 @@ fn write_acc_back(
                     write!(kernel, "let output_index = ")?;
                     output.strided_index(kernel, output_indices.iter().cloned());
                     writeln!(kernel, ";")?;
-                    writeln!(
-                        kernel,
-                        "{output}[output_index] = acc[{tile_m}][{tile_n}][y_offset][x_offset];"
-                    )?;
+                    let result = op.apply_bias_and_post(
+                        bias,
+                        &format!("{output_offset}.y + {tile_n} * 4u + y_offset"),
+                        format!(
+                            "{}(acc[{tile_m}][{tile_n}][y_offset][x_offset])",
+                            op.input_datatype
+                        ),
+                        &post_element_wise_functions,
+                    );
+                    writeln!(kernel, "{output}[output_index] = {result};")?;
                     std::fmt::Result::Ok(())
                 },
             )?;

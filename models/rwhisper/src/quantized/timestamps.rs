@@ -4,29 +4,43 @@
 use fusor::Tensor;
 use std::num::NonZeroUsize;
 
-use crate::config::{HOP_LENGTH, N_FRAMES, SAMPLE_RATE};
-
 /// Returns the token-level timestamps as a tensor of shape batch x timestamps
-pub(super) async fn extract_timestamps(
-    // A list of (layer, head) pairs to use for timestamp determination
-    alignment_heads: &[[usize; 2]],
+pub(crate) async fn extract_timestamps(
+    // A list of (layer, head) pairs to use for timestamp determination.
+    // If omitted, all available heads from all layers are used.
+    alignment_heads: Option<&[[usize; 2]]>,
     cross_attentions: &[Tensor<4, crate::WhisperDType>],
     filter_width: NonZeroUsize,
     n_frames: usize,
+    seconds_per_frame: crate::WhisperDType,
     mask: Vec<Vec<bool>>,
 ) -> fusor::Result<Vec<Vec<crate::WhisperDType>>> {
     // Select relevant cross-attention heads
     let mut tensors_to_stack = Vec::new();
-    for [layer, head] in alignment_heads.iter().copied() {
-        if let Some(attn) = cross_attentions.get(layer) {
-            let narrowed = attn.narrow(1, head, 1);
-            let squeezed = narrowed.squeeze(1);
-            tensors_to_stack.push(squeezed.to_concrete());
+    if let Some(alignment_heads) = alignment_heads {
+        for [layer, head] in alignment_heads.iter().copied() {
+            if let Some(attn) = cross_attentions.get(layer) {
+                let narrowed = attn.narrow(1, head, 1);
+                let squeezed = narrowed.squeeze(1);
+                tensors_to_stack.push(squeezed.to_concrete());
+            }
         }
+    } else {
+        for attn in cross_attentions {
+            let heads = attn.shape()[1];
+            for head in 0..heads {
+                let narrowed = attn.narrow(1, head, 1);
+                let squeezed = narrowed.squeeze(1);
+                tensors_to_stack.push(squeezed.to_concrete());
+            }
+        }
+    }
+    if tensors_to_stack.is_empty() {
+        return Ok(Vec::new());
     }
     let stacked = Tensor::stack(tensors_to_stack.into_iter(), 0);
     let permuted = stacked.permute([1, 0, 2, 3]);
-    let weights = permuted.narrow(3, 0, n_frames.min(N_FRAMES) / 2);
+    let weights = permuted.narrow(3, 0, n_frames.min(permuted.shape()[3]));
 
     if weights.shape().contains(&0) {
         // No tokens to be aligned
@@ -89,10 +103,7 @@ pub(super) async fn extract_timestamps(
             .zip(time_indices)
             .filter_map(|(is_jump, time_index)| {
                 if is_jump {
-                    Some(
-                        time_index
-                            / crate::WhisperDType::from((SAMPLE_RATE / (HOP_LENGTH * 2)) as f32),
-                    )
+                    Some(time_index * seconds_per_frame)
                 } else {
                     None
                 }

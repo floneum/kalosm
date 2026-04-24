@@ -30,6 +30,11 @@ impl<T: DataType + SimdElement + Default> Linear<T> {
         self.bias.as_ref()
     }
 
+    /// Get the quantized weight matrix.
+    pub fn weight(&self) -> &QMatrix {
+        &self.weight
+    }
+
     /// Get the input features size.
     pub fn in_features(&self) -> usize {
         self.weight.shape()[1]
@@ -54,6 +59,14 @@ impl<T: DataType + SimdElement + Default> Linear<T> {
 
 // f32-specific implementations for loading and forward
 impl Linear<f32> {
+    /// Forward pass without applying bias.
+    pub fn forward_no_bias<B>(&self, input: &Tensor<3, f32, B>) -> Tensor<3, f32>
+    where
+        B: fusor_cpu::TensorBacking<3, Elem = f32>,
+    {
+        input.q_mat_mul(&self.weight)
+    }
+
     /// Load a Linear layer from a VarBuilder.
     ///
     /// Expects:
@@ -73,14 +86,13 @@ impl Linear<f32> {
     where
         B: fusor_cpu::TensorBacking<3, Elem = f32>,
     {
-        let output = input.q_mat_mul(&self.weight);
-
         if let Some(bias) = &self.bias {
-            output.add_(bias)
+            input.q_mat_mul_bias(&self.weight, bias)
         } else {
-            output
+            self.forward_no_bias(input)
         }
     }
+
 }
 
 // Generic forward implementations for Linear<T> where T can be cast to/from f32

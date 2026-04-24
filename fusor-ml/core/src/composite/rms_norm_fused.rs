@@ -40,6 +40,37 @@ impl<const R: usize, T: DataType> Tensor<R, T> {
             self.shape(),
             weight.shape(),
             eps,
+            false,
+        );
+        let data = self.data();
+
+        Self::from_parts(data.custom(Arc::new(operation)))
+    }
+
+    /// Fused LayerNorm kernel that performs mean, variance, scale, and bias in one launch.
+    ///
+    /// Formula: output = (input - mean(input)) / sqrt(var(input) + eps) * weight + bias
+    pub fn layer_norm_fused<const W: usize>(
+        &self,
+        weight: &Tensor<W, T>,
+        bias: Option<&Tensor<W, T>>,
+        eps: f32,
+    ) -> Self
+    where
+        T: CastTensor<f32>,
+        f32: CastTensor<T>,
+        (Tensor<R, T>, Tensor<W, T>): MaxRank<R, T>,
+    {
+        let operation = RmsNormOperation::new(
+            self.key(),
+            weight.key(),
+            bias.map(|b| b.key()),
+            self.datatype(),
+            weight.datatype(),
+            self.shape(),
+            weight.shape(),
+            eps,
+            true,
         );
         let data = self.data();
 
@@ -73,6 +104,8 @@ struct RmsNormOperation {
     input_shape: Box<[usize]>,
     /// Epsilon for numerical stability
     eps: f32,
+    /// Whether to subtract the mean and normalize by variance instead of RMS.
+    remove_mean: bool,
 }
 
 impl RmsNormOperation {
@@ -86,6 +119,7 @@ impl RmsNormOperation {
         input_shape: &[usize],
         _weight_shape: &[usize],
         eps: f32,
+        remove_mean: bool,
     ) -> Self {
         Self {
             input,
@@ -95,6 +129,7 @@ impl RmsNormOperation {
             weight_dtype,
             input_shape: input_shape.into(),
             eps,
+            remove_mean,
         }
     }
 
@@ -119,6 +154,7 @@ impl RmsNormOperation {
         let hidden_size = self.hidden_size();
         let large_reduction = hidden_size > 256;
         let has_bias = self.bias.is_some();
+        let remove_mean = self.remove_mean;
 
         // Input tensor (without the last dimension in the layout for workgroup indexing)
         let input_tensor = kernel.add_tensor_input(output_rank, false, input_dtype);
@@ -165,7 +201,10 @@ impl RmsNormOperation {
         writeln!(kernel, ";").unwrap();
         writeln!(kernel).unwrap();
 
-        // Phase 1: Compute sum of squares
+        // Phase 1: Compute row statistics
+        if remove_mean {
+            writeln!(kernel, "var sum = f32(0.0);").unwrap();
+        }
         writeln!(kernel, "var sum_sq = f32(0.0);").unwrap();
 
         // Divide work among threads in the workgroup
@@ -204,6 +243,13 @@ impl RmsNormOperation {
 
             // Convert to f32 and compute squared values
             writeln!(kernel, "let f32_data = vec4<f32>(data);").unwrap();
+            if remove_mean {
+                writeln!(
+                    kernel,
+                    "sum += f32_data.x + f32_data.y + f32_data.z + f32_data.w;"
+                )
+                .unwrap();
+            }
             writeln!(kernel, "let sq_data = f32_data * f32_data;").unwrap();
             writeln!(
                 kernel,
@@ -223,13 +269,21 @@ impl RmsNormOperation {
             "let data = f32({input_tensor}[in_start_offset + index * {reduce_stride}]);"
         )
         .unwrap();
+        if remove_mean {
+            writeln!(kernel, "sum += data;").unwrap();
+        }
         writeln!(kernel, "sum_sq += data * data;").unwrap();
         writeln!(kernel, "index += 1u;").unwrap();
         writeln!(kernel, "}}").unwrap();
         writeln!(kernel).unwrap();
 
-        // Phase 2: Reduce sum_sq across the workgroup
+        // Phase 2: Reduce row statistics across the workgroup
         let global_rms = kernel.add_global_value(KernelGlobalSpace::Workgroup, DataTypeEnum::F32);
+        let global_mean = if remove_mean {
+            Some(kernel.add_global_value(KernelGlobalSpace::Workgroup, DataTypeEnum::F32))
+        } else {
+            None
+        };
         if device.subgroups_supported() {
             let max_subgroup_size = device.max_subgroup_size();
             let local_data = kernel.add_global_array(
@@ -237,15 +291,30 @@ impl RmsNormOperation {
                 DataTypeEnum::F32,
                 max_subgroup_size.to_string(),
             );
+            let local_sum_data = if remove_mean {
+                Some(kernel.add_global_array(
+                    KernelGlobalSpace::Workgroup,
+                    DataTypeEnum::F32,
+                    max_subgroup_size.to_string(),
+                ))
+            } else {
+                None
+            };
             let subgroup_id = kernel.subgroup_index();
             let subgroup_local_id = kernel.subgroup_local_index();
             let subgroups_per_workgroup = kernel.subgroups_per_workgroup();
 
             // First: reduce within each subgroup
             writeln!(kernel, "sum_sq = subgroupAdd(sum_sq);").unwrap();
+            if remove_mean {
+                writeln!(kernel, "sum = subgroupAdd(sum);").unwrap();
+            }
 
             // Write subgroup results to shared memory
             writeln!(kernel, "{local_data}[{subgroup_id}] = sum_sq;").unwrap();
+            if let Some(local_sum_data) = &local_sum_data {
+                writeln!(kernel, "{local_sum_data}[{subgroup_id}] = sum;").unwrap();
+            }
             writeln!(kernel, "workgroupBarrier();").unwrap();
 
             // Final reduction across subgroups (only first subgroup participates)
@@ -255,20 +324,39 @@ impl RmsNormOperation {
             )
             .unwrap();
             writeln!(kernel, "sum_sq = {local_data}[{subgroup_local_id}];").unwrap();
+            if let Some(local_sum_data) = &local_sum_data {
+                writeln!(kernel, "sum = {local_sum_data}[{subgroup_local_id}];").unwrap();
+            }
             writeln!(kernel, "}}").unwrap();
             writeln!(kernel, "else {{").unwrap();
             writeln!(kernel, "sum_sq = f32(0.0);").unwrap();
+            if remove_mean {
+                writeln!(kernel, "sum = f32(0.0);").unwrap();
+            }
             writeln!(kernel, "}}").unwrap();
             writeln!(kernel, "sum_sq = subgroupAdd(sum_sq);").unwrap();
+            if remove_mean {
+                writeln!(kernel, "sum = subgroupAdd(sum);").unwrap();
+            }
 
-            // Thread 0 now has the final sum_sq, compute RMS
+            // Thread 0 now has the final row statistics.
             writeln!(kernel, "if {subgroup_id} == 0u {{").unwrap();
-            // Store to shared memory for other subgroups to read
-            writeln!(
-                kernel,
-                "{global_rms} = sqrt(sum_sq / f32({reduce_size}) + {eps_input});"
-            )
-            .unwrap();
+            if let Some(global_mean) = &global_mean {
+                writeln!(kernel, "let mean = sum / f32({reduce_size});").unwrap();
+                writeln!(
+                    kernel,
+                    "let variance = max(sum_sq / f32({reduce_size}) - mean * mean, f32(0.0));"
+                )
+                .unwrap();
+                writeln!(kernel, "{global_mean} = mean;").unwrap();
+                writeln!(kernel, "{global_rms} = sqrt(variance + {eps_input});").unwrap();
+            } else {
+                writeln!(
+                    kernel,
+                    "{global_rms} = sqrt(sum_sq / f32({reduce_size}) + {eps_input});"
+                )
+                .unwrap();
+            }
             writeln!(kernel, "}}").unwrap();
         } else {
             // Fallback: shared memory reduction
@@ -277,9 +365,21 @@ impl RmsNormOperation {
                 DataTypeEnum::F32,
                 blocksize.to_string(),
             );
+            let local_sum_data = if remove_mean {
+                Some(kernel.add_global_array(
+                    KernelGlobalSpace::Workgroup,
+                    DataTypeEnum::F32,
+                    blocksize.to_string(),
+                ))
+            } else {
+                None
+            };
             let mut offset = blocksize;
             while offset > 1 {
                 writeln!(kernel, "{local_data}[{workgroup_local_index}] = sum_sq;").unwrap();
+                if let Some(local_sum_data) = &local_sum_data {
+                    writeln!(kernel, "{local_sum_data}[{workgroup_local_index}] = sum;").unwrap();
+                }
                 writeln!(kernel, "workgroupBarrier();").unwrap();
                 offset /= 2;
                 // Only threads in the first half do the reduction to avoid OOB reads
@@ -291,17 +391,156 @@ impl RmsNormOperation {
                 )
                 .unwrap();
                 writeln!(kernel, "sum_sq += neighbor;").unwrap();
+                if let Some(local_sum_data) = &local_sum_data {
+                    writeln!(
+                        kernel,
+                        "let neighbor_sum = {local_sum_data}[{workgroup_local_index} + {offset}u];"
+                    )
+                    .unwrap();
+                    writeln!(kernel, "sum += neighbor_sum;").unwrap();
+                }
                 writeln!(kernel, "}}").unwrap();
             }
 
-            // Compute RMS and store in shared memory
+            // Compute denominator and store it in shared memory.
             writeln!(kernel, "if {workgroup_local_index} == 0u {{").unwrap();
-            writeln!(kernel, "let mean_sq = sum_sq / f32({reduce_size});").unwrap();
-            writeln!(kernel, "{global_rms} = sqrt(mean_sq + {eps_input});").unwrap();
+            if let Some(global_mean) = &global_mean {
+                writeln!(kernel, "let mean = sum / f32({reduce_size});").unwrap();
+                writeln!(
+                    kernel,
+                    "let variance = max(sum_sq / f32({reduce_size}) - mean * mean, f32(0.0));"
+                )
+                .unwrap();
+                writeln!(kernel, "{global_mean} = mean;").unwrap();
+                writeln!(kernel, "{global_rms} = sqrt(variance + {eps_input});").unwrap();
+            } else {
+                writeln!(kernel, "let mean_sq = sum_sq / f32({reduce_size});").unwrap();
+                writeln!(kernel, "{global_rms} = sqrt(mean_sq + {eps_input});").unwrap();
+            }
             writeln!(kernel, "}}").unwrap();
         }
         writeln!(kernel, "workgroupBarrier();").unwrap();
-        // Read RMS from shared memory
+        // Read normalization parameters from shared memory.
+        if let Some(global_mean) = &global_mean {
+            writeln!(kernel, "let mean = {global_mean};").unwrap();
+
+            // Recompute variance from centered values. This preserves LayerNorm's
+            // two-pass numerical behavior while still keeping the whole op in one kernel.
+            writeln!(kernel, "var variance_sum = f32(0.0);").unwrap();
+            writeln!(kernel, "var variance_index = base_axis_index;").unwrap();
+            if large_reduction {
+                writeln!(kernel, "while (variance_index + 4u <= end_axis_index) {{").unwrap();
+                write!(kernel, "let variance_data = vec4<{input_dtype}>(").unwrap();
+                for i in 0..4 {
+                    if i > 0 {
+                        write!(kernel, ", ").unwrap();
+                    }
+                    write!(
+                        kernel,
+                        "{input_tensor}[in_start_offset + (variance_index + {i}u) * {reduce_stride}]"
+                    )
+                    .unwrap();
+                }
+                writeln!(kernel, ");").unwrap();
+                writeln!(
+                    kernel,
+                    "let variance_diff = vec4<f32>(variance_data) - vec4<f32>(mean);"
+                )
+                .unwrap();
+                writeln!(kernel, "let variance_sq = variance_diff * variance_diff;").unwrap();
+                writeln!(
+                    kernel,
+                    "variance_sum += variance_sq.x + variance_sq.y + variance_sq.z + variance_sq.w;"
+                )
+                .unwrap();
+                writeln!(kernel, "variance_index += 4u;").unwrap();
+                writeln!(kernel, "}}").unwrap();
+            }
+            writeln!(kernel, "while (variance_index < end_axis_index) {{").unwrap();
+            writeln!(
+                kernel,
+                "let variance_data = f32({input_tensor}[in_start_offset + variance_index * {reduce_stride}]);"
+            )
+            .unwrap();
+            writeln!(kernel, "let variance_diff = variance_data - mean;").unwrap();
+            writeln!(kernel, "variance_sum += variance_diff * variance_diff;").unwrap();
+            writeln!(kernel, "variance_index += 1u;").unwrap();
+            writeln!(kernel, "}}").unwrap();
+
+            if device.subgroups_supported() {
+                let max_subgroup_size = device.max_subgroup_size();
+                let local_variance_data = kernel.add_global_array(
+                    KernelGlobalSpace::Workgroup,
+                    DataTypeEnum::F32,
+                    max_subgroup_size.to_string(),
+                );
+                let subgroup_id = kernel.subgroup_index();
+                let subgroup_local_id = kernel.subgroup_local_index();
+                let subgroups_per_workgroup = kernel.subgroups_per_workgroup();
+
+                writeln!(kernel, "variance_sum = subgroupAdd(variance_sum);").unwrap();
+                writeln!(
+                    kernel,
+                    "{local_variance_data}[{subgroup_id}] = variance_sum;"
+                )
+                .unwrap();
+                writeln!(kernel, "workgroupBarrier();").unwrap();
+                writeln!(
+                    kernel,
+                    "if {subgroup_local_id} < {subgroups_per_workgroup} {{"
+                )
+                .unwrap();
+                writeln!(
+                    kernel,
+                    "variance_sum = {local_variance_data}[{subgroup_local_id}];"
+                )
+                .unwrap();
+                writeln!(kernel, "}}").unwrap();
+                writeln!(kernel, "else {{").unwrap();
+                writeln!(kernel, "variance_sum = f32(0.0);").unwrap();
+                writeln!(kernel, "}}").unwrap();
+                writeln!(kernel, "variance_sum = subgroupAdd(variance_sum);").unwrap();
+                writeln!(kernel, "if {subgroup_id} == 0u {{").unwrap();
+                writeln!(
+                    kernel,
+                    "{global_rms} = sqrt(variance_sum / f32({reduce_size}) + {eps_input});"
+                )
+                .unwrap();
+                writeln!(kernel, "}}").unwrap();
+            } else {
+                let local_variance_data = kernel.add_global_array(
+                    KernelGlobalSpace::Workgroup,
+                    DataTypeEnum::F32,
+                    blocksize.to_string(),
+                );
+                let mut offset = blocksize;
+                while offset > 1 {
+                    writeln!(
+                        kernel,
+                        "{local_variance_data}[{workgroup_local_index}] = variance_sum;"
+                    )
+                    .unwrap();
+                    writeln!(kernel, "workgroupBarrier();").unwrap();
+                    offset /= 2;
+                    writeln!(kernel, "if {workgroup_local_index} < {offset}u {{").unwrap();
+                    writeln!(
+                        kernel,
+                        "let variance_neighbor = {local_variance_data}[{workgroup_local_index} + {offset}u];"
+                    )
+                    .unwrap();
+                    writeln!(kernel, "variance_sum += variance_neighbor;").unwrap();
+                    writeln!(kernel, "}}").unwrap();
+                }
+                writeln!(kernel, "if {workgroup_local_index} == 0u {{").unwrap();
+                writeln!(
+                    kernel,
+                    "{global_rms} = sqrt(variance_sum / f32({reduce_size}) + {eps_input});"
+                )
+                .unwrap();
+                writeln!(kernel, "}}").unwrap();
+            }
+            writeln!(kernel, "workgroupBarrier();").unwrap();
+        }
         writeln!(kernel, "let rms = {global_rms};").unwrap();
 
         // Phase 3: Normalize and apply weight/bias
@@ -335,8 +574,15 @@ impl RmsNormOperation {
             }
             writeln!(kernel, ");").unwrap();
 
-            // Normalize: (input / rms) * weight
-            writeln!(kernel, "let normalized = vec4<f32>(data) / rms;").unwrap();
+            if remove_mean {
+                writeln!(
+                    kernel,
+                    "let normalized = (vec4<f32>(data) - vec4<f32>(mean)) / rms;"
+                )
+                .unwrap();
+            } else {
+                writeln!(kernel, "let normalized = vec4<f32>(data) / rms;").unwrap();
+            }
             writeln!(kernel, "var result = normalized * vec4<f32>(w);").unwrap();
 
             // Add bias if present
@@ -375,7 +621,11 @@ impl RmsNormOperation {
         )
         .unwrap();
         writeln!(kernel, "let w = f32({weight_tensor}[out_index]);").unwrap();
-        writeln!(kernel, "var result = (data / rms) * w;").unwrap();
+        if remove_mean {
+            writeln!(kernel, "var result = ((data - mean) / rms) * w;").unwrap();
+        } else {
+            writeln!(kernel, "var result = (data / rms) * w;").unwrap();
+        }
 
         if let Some(bias_tensor) = &bias_tensor {
             writeln!(kernel, "result += f32({bias_tensor}[out_index]);").unwrap();
@@ -529,7 +779,12 @@ impl Operation for RmsNormOperation {
 
     fn name(&self) -> String {
         format!(
-            "rms_norm_fused_{}_{}{}",
+            "{}_{}_{}{}",
+            if self.remove_mean {
+                "layer_norm_fused"
+            } else {
+                "rms_norm_fused"
+            },
             self.rank(),
             self.input_dtype,
             if self.bias.is_some() { "_bias" } else { "" }
@@ -541,7 +796,7 @@ impl Operation for RmsNormOperation {
         map: &rustc_hash::FxHashMap<NodeIndex, crate::TensorLayoutInfo>,
     ) -> crate::TensorLayoutInfo {
         let input_layout = map.get(&self.input).unwrap();
-        input_layout.clone()
+        crate::TensorLayoutInfo::new(Layout::contiguous(input_layout.shape()), self.input_dtype)
     }
 }
 
@@ -613,6 +868,195 @@ async fn test_rms_norm_fused_vs_composite() {
                 j,
                 composite_output[[i, j]],
                 fused_output[[i, j]]
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+#[tokio::test]
+async fn test_layer_norm_fused_vs_composite() {
+    use crate::Device;
+
+    let device = Device::test_instance();
+
+    let input = Tensor::new(&device, &[[1.0f32, 2.0, 3.0, 4.0], [5.0, 7.0, 11.0, 13.0]]);
+    let weight = Tensor::new(&device, &[1.0f32, 0.5, 2.0, -1.0]);
+    let bias = Tensor::new(&device, &[0.0f32, 0.25, -0.5, 1.0]);
+    let eps = 1e-5;
+
+    let composite_result = input.layer_norm(&weight, Some(&bias), eps, true);
+    let composite_output = composite_result.as_slice().await.unwrap();
+
+    let fused_result = input.layer_norm_fused(&weight, Some(&bias), eps);
+    let fused_output = fused_result.as_slice().await.unwrap();
+
+    for i in 0..2 {
+        for j in 0..4 {
+            let diff = (composite_output[[i, j]] - fused_output[[i, j]]).abs();
+            assert!(
+                diff < 0.001,
+                "Mismatch at [{}, {}]: composite={}, fused={}, diff={}",
+                i,
+                j,
+                composite_output[[i, j]],
+                fused_output[[i, j]],
+                diff
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+#[tokio::test]
+async fn test_layer_norm_fused_large() {
+    use crate::Device;
+
+    let device = Device::test_instance();
+
+    let hidden_size = 320;
+    let rows = 5;
+    let input_data: Vec<Vec<f32>> = (0..rows)
+        .map(|row| {
+            (0..hidden_size)
+                .map(|col| (((row * 17 + col * 13) % 29) as f32 - 14.0) * 0.125)
+                .collect()
+        })
+        .collect();
+    let weight_data: Vec<f32> = (0..hidden_size)
+        .map(|col| 0.75 + (col % 7) as f32 * 0.05)
+        .collect();
+
+    let input: Tensor<2, f32> = Tensor::new(&device, &input_data);
+    let weight: Tensor<1, f32> = Tensor::new(&device, &weight_data);
+    let eps = 1e-5;
+
+    let composite_result = input.layer_norm(&weight, None, eps, true);
+    let composite_output = composite_result.as_slice().await.unwrap();
+
+    let fused_result = input.layer_norm_fused(&weight, None, eps);
+    let fused_output = fused_result.as_slice().await.unwrap();
+
+    for row in 0..rows {
+        for col in 0..hidden_size {
+            let diff = (composite_output[[row, col]] - fused_output[[row, col]]).abs();
+            assert!(
+                diff < 0.001,
+                "Mismatch at [{}, {}]: composite={}, fused={}, diff={}",
+                row,
+                col,
+                composite_output[[row, col]],
+                fused_output[[row, col]],
+                diff
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+#[tokio::test]
+async fn test_layer_norm_fused_non_contiguous_input_layout() {
+    use crate::Device;
+
+    let device = Device::test_instance();
+
+    let input = Tensor::new(
+        &device,
+        &[
+            [
+                [1.0f32, 2.0, 3.0, 4.0],
+                [5.0, 7.0, 11.0, 13.0],
+                [-4.0, -1.0, 0.5, 3.0],
+                [8.0, 6.0, 4.0, 2.0],
+            ],
+            [
+                [0.25, 0.5, 1.0, 2.0],
+                [3.0, 1.5, 0.75, 0.25],
+                [9.0, 10.0, 12.0, 15.0],
+                [-8.0, -4.0, -2.0, -1.0],
+            ],
+        ],
+    )
+    .narrow(1, 1, 2);
+    let weight = Tensor::new(&device, &[1.0f32, 0.5, 2.0, -1.0]);
+    let eps = 1e-5;
+
+    let composite_result = input.layer_norm(&weight, None, eps, true);
+    let composite_output = composite_result.as_slice().await.unwrap();
+
+    let fused_result = input.layer_norm_fused(&weight, None, eps);
+    let fused_output = fused_result.as_slice().await.unwrap();
+
+    assert_eq!(fused_output.shape(), &[2, 2, 4]);
+    for batch in 0..2 {
+        for row in 0..2 {
+            for col in 0..4 {
+                let diff =
+                    (composite_output[[batch, row, col]] - fused_output[[batch, row, col]]).abs();
+                assert!(
+                    diff < 0.001,
+                    "Mismatch at [{}, {}, {}]: composite={}, fused={}, diff={}",
+                    batch,
+                    row,
+                    col,
+                    composite_output[[batch, row, col]],
+                    fused_output[[batch, row, col]],
+                    diff
+                );
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+#[tokio::test]
+async fn test_layer_norm_fused_matmul_chain_matches_composite() {
+    use crate::Device;
+
+    let device = Device::test_instance();
+
+    let rows = 7;
+    let hidden = 320;
+    let out = 13;
+    let input_data: Vec<Vec<f32>> = (0..rows)
+        .map(|row| {
+            (0..hidden + 3)
+                .map(|col| (((row * 19 + col * 11) % 37) as f32 - 18.0) * 0.03125)
+                .collect()
+        })
+        .collect();
+    let proj_data: Vec<Vec<f32>> = (0..hidden)
+        .map(|row| {
+            (0..out)
+                .map(|col| (((row * 7 + col * 5) % 23) as f32 - 11.0) * 0.015625)
+                .collect()
+        })
+        .collect();
+    let norm_weight: Vec<f32> = (0..hidden)
+        .map(|col| 0.9 + (col % 5) as f32 * 0.025)
+        .collect();
+
+    let input = Tensor::new(&device, &input_data).narrow(1, 0, hidden);
+    let weight = Tensor::new(&device, &norm_weight);
+    let proj = Tensor::new(&device, &proj_data);
+    let eps = 1e-5;
+
+    let composite = input.layer_norm(&weight, None, eps, true).mat_mul(&proj);
+    let fused = input.layer_norm_fused(&weight, None, eps).mat_mul(&proj);
+    let composite = composite.as_slice().await.unwrap();
+    let fused = fused.as_slice().await.unwrap();
+
+    for row in 0..rows {
+        for col in 0..out {
+            let diff = (composite[[row, col]] - fused[[row, col]]).abs();
+            assert!(
+                diff < 0.001,
+                "Mismatch at [{}, {}]: composite={}, fused={}, diff={}",
+                row,
+                col,
+                composite[[row, col]],
+                fused[[row, col]],
+                diff
             );
         }
     }

@@ -111,15 +111,29 @@ where
         });
         let windows_tensor: Tensor<R2, D, _> = padded.sliding_window_view(windows);
 
-        // Step 3: Prepare for matmul by reshaping and transposing
+        // Step 3: Prepare for matmul by reshaping and permuting.
+        //
+        // `sliding_window_view` produces:
+        //   (batch, in_channels, out_spatial..., kernel...)
+        // We need:
+        //   (batch, out_spatial..., in_channels, kernel...)
+        // before flattening to rows. A single transpose is only correct for 1D.
         let kernel_size: usize = weight_shape[spatial_start..].iter().product();
 
-        // Transpose to move in_channels after spatial
-        let windows_transposed = windows_tensor.transpose(in_channels_axis, spatial_start);
+        let mut window_axes = [0usize; R2];
+        window_axes[batch_axis] = batch_axis;
+        for i in 0..DIFF {
+            window_axes[1 + i] = spatial_start + i;
+        }
+        window_axes[1 + DIFF] = in_channels_axis;
+        for i in 0..DIFF {
+            window_axes[2 + DIFF + i] = R + i;
+        }
+        let windows_permuted = windows_tensor.permute(window_axes).to_concrete();
 
         // Flatten to (batch * out_spatial_size, in_channels * kernel_size)
         let windows_flat: Tensor<2, D, _> =
-            windows_transposed.reshape([batch * out_spatial_size, in_channels * kernel_size]);
+            windows_permuted.reshape([batch * out_spatial_size, in_channels * kernel_size]);
 
         // Step 4: Reshape weight for matmul
         let weight_reshaped: Tensor<2, D, _> =
@@ -130,27 +144,38 @@ where
         // Step 5: Matrix multiplication
         let output = windows_flat.mat_mul(&weight_t);
 
-        // Step 6: Reshape and transpose back to (batch, out_channels, ...out_spatial...)
-        let output_reshaped: Tensor<3, D, _> =
-            output.reshape([batch, out_spatial_size, out_channels]);
-        let output_transposed = output_reshaped.transpose(in_channels_axis, spatial_start);
-
-        // Reshape to (batch, out_channels, ...out_spatial_dims...)
-        let mut output_shape = input_shape;
-        output_shape[in_channels_axis] = out_channels;
+        // Step 6: Reshape and permute back to (batch, out_channels, ...out_spatial...)
+        let mut output_spatial = [0usize; DIFF];
         for i in 0..DIFF {
             let padded_len = input_shape[spatial_start + i] + 2 * padding[i];
             let kernel_len = weight_shape[spatial_start + i];
-            output_shape[spatial_start + i] = (padded_len - kernel_len) / strides[i] + 1;
+            output_spatial[i] = (padded_len - kernel_len) / strides[i] + 1;
         }
-        let output_final = output_transposed.reshape(output_shape);
+
+        let mut output_reshape_shape = [0usize; R];
+        output_reshape_shape[batch_axis] = batch;
+        for i in 0..DIFF {
+            output_reshape_shape[1 + i] = output_spatial[i];
+        }
+        output_reshape_shape[R - 1] = out_channels;
+
+        let output_reshaped: Tensor<R, D, _> = output.reshape(output_reshape_shape);
+        let mut output_axes = [0usize; R];
+        output_axes[batch_axis] = batch_axis;
+        output_axes[in_channels_axis] = R - 1;
+        for i in 0..DIFF {
+            output_axes[spatial_start + i] = 1 + i;
+        }
+        let output_final = output_reshaped.permute(output_axes).to_concrete();
 
         // Step 7: Add bias if present
         if let Some(bias) = bias {
             // Bias shape: (out_channels,)
-            // Need to broadcast to (batch, out_channels, ...spatial...)
-            // Broadcast bias to the FULL output shape for correct addition
-            let bias_broadcast: Tensor<R, D, _> = bias.broadcast_as(output_shape);
+            // Need to broadcast along the channel axis, not the trailing axis.
+            let mut bias_shape = [1; R];
+            bias_shape[in_channels_axis] = out_channels;
+            let bias_unsqueezed = bias.unsqueeze(0);
+            let bias_broadcast: Tensor<R, D, _> = bias_unsqueezed.reshape(bias_shape);
             output_final.add_(&bias_broadcast)
         } else {
             output_final.to_concrete()
@@ -334,5 +359,46 @@ mod tests {
         assert!((result[[0, 2, 0]] - 14.0).abs() < 1e-5);
         assert!((result[[0, 2, 1]] - 18.0).abs() < 1e-5);
         assert!((result[[0, 2, 2]] - 22.0).abs() < 1e-5);
+    }
+
+    #[tokio::test]
+    async fn test_pad_axis_gpu_matches_cpu_4d() {
+        let gpu = crate::Device::new()
+            .await
+            .expect("GPU required for this test");
+
+        let input_data = vec![
+            1.0f32, 2.0, 3.0, 4.0, //
+            5.0, 6.0, 7.0, 8.0, //
+            9.0, 10.0, 11.0, 12.0, //
+            13.0, 14.0, 15.0, 16.0,
+        ];
+        let cpu_input: Tensor<4, f32> =
+            Tensor::Cpu(fusor_cpu::Tensor::from_slice([1, 1, 4, 4], &input_data));
+        let gpu_input: Tensor<4, f32> = Tensor::from_slice(&gpu, [1, 1, 4, 4], &input_data);
+
+        let cpu_padded = cpu_input
+            .pad_axis(2, 1)
+            .pad_axis(3, 1)
+            .as_slice()
+            .await
+            .unwrap();
+        let gpu_padded = gpu_input
+            .pad_axis(2, 1)
+            .pad_axis(3, 1)
+            .as_slice()
+            .await
+            .unwrap();
+
+        for h in 0..cpu_padded.shape()[2] {
+            for w in 0..cpu_padded.shape()[3] {
+                let expected = cpu_padded[[0, 0, h, w]];
+                let actual = gpu_padded[[0, 0, h, w]];
+                assert!(
+                    (expected - actual).abs() < 1e-6,
+                    "mismatch at [{h}, {w}]: expected {expected}, got {actual}"
+                );
+            }
+        }
     }
 }

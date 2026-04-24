@@ -20,7 +20,7 @@ use crate::{
 use crate::{
     QMatrix,
     quantized::matmul::sgemv::{
-        q_8_0::Q_8_0_SGEMV_CHUNK_SIZE, q_n::Q_N_SGEMV_CHUNK_SIZE, q4k::Q4K_SGEMV_CHUNK_SIZE,
+        q_8_0::Q_8_0_SGEMV_CHUNK_SIZE, q_n::q_n_sgemv_chunk_size, q4k::Q4K_SGEMV_CHUNK_SIZE,
         q5k::Q5K_SGEMV_CHUNK_SIZE, q6k::Q6K_SGEMV_CHUNK_SIZE,
     },
     visit_tiled::distribute_workgroups,
@@ -68,13 +68,34 @@ pub(crate) fn decompose_workgroup_index(
 /// Check if the device can support specialized SGEMV kernels that require 2 subgroups per workgroup.
 /// This requires the workgroup to be large enough to fit 2 subgroups, which means:
 /// max_subgroup_size >= 2 * min_subgroup_size
+pub(crate) fn quantized_sgemv_subgroups_supported(device: &Device) -> bool {
+    device.subgroups_supported()
+}
+
 fn can_use_specialized_sgemv(device: &Device) -> bool {
-    if !device.subgroups_supported() {
+    if !quantized_sgemv_subgroups_supported(device) {
         return false;
     }
     // The workgroup is constrained to be <= max_subgroup_size, so we need
     // max_subgroup_size >= 2 * min_subgroup_size to fit 2 subgroups
     device.max_subgroup_size() >= 2 * device.min_subgroup_size()
+}
+
+fn can_use_specialized_q8_0_sgemv(device: &Device) -> bool {
+    can_use_specialized_sgemv(device)
+}
+
+#[cfg(test)]
+pub(crate) fn selected_sgemv_kernel_kind(op: &QMatMulOperation, device: &Device) -> &'static str {
+    let use_specialized = can_use_specialized_sgemv(device);
+    match op.matrix.datatype {
+        GgmlType::Q6K if use_specialized => "q6k",
+        GgmlType::Q4K if use_specialized => "q4k",
+        GgmlType::Q5K if use_specialized => "q5k",
+        GgmlType::Q4_0 | GgmlType::Q5_0 if use_specialized => "q_n",
+        GgmlType::Q8_0 if can_use_specialized_q8_0_sgemv(device) => "q_8_0",
+        _ => "general",
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -84,6 +105,7 @@ pub(crate) fn sgemv(
     workgroup_size: &WorkgroupShape,
     input_a: &TensorInput,
     input_b: &QMatrixInput,
+    bias: Option<&TensorInput>,
     output: &TensorInput,
     _n_size: &str,
     _m_size: &str,
@@ -100,6 +122,7 @@ pub(crate) fn sgemv(
             workgroup_size,
             input_a,
             input_b,
+            bias,
             output,
             _n_size,
             _m_size,
@@ -111,6 +134,7 @@ pub(crate) fn sgemv(
             workgroup_size,
             input_a,
             input_b,
+            bias,
             output,
             _n_size,
             _m_size,
@@ -122,6 +146,7 @@ pub(crate) fn sgemv(
             workgroup_size,
             input_a,
             input_b,
+            bias,
             output,
             _n_size,
             _m_size,
@@ -133,17 +158,19 @@ pub(crate) fn sgemv(
             workgroup_size,
             input_a,
             input_b,
+            bias,
             output,
             _n_size,
             _m_size,
             k_size,
         ),
-        GgmlType::Q8_0 if use_specialized => q_8_0_sgemv(
+        GgmlType::Q8_0 if can_use_specialized_q8_0_sgemv(&device) => q_8_0_sgemv(
             op,
             generic_kernel,
             workgroup_size,
             input_a,
             input_b,
+            bias,
             output,
             _n_size,
             _m_size,
@@ -155,6 +182,7 @@ pub(crate) fn sgemv(
             workgroup_size,
             input_a,
             input_b,
+            bias,
             output,
             _n_size,
             _m_size,
@@ -175,7 +203,7 @@ pub(crate) fn n_workgroups(matrix: &QMatrix, n: u32) -> u32 {
         } else if matrix.datatype == GgmlType::Q5K {
             n.div_ceil(Q5K_SGEMV_CHUNK_SIZE * 2)
         } else if matches!(matrix.datatype, GgmlType::Q4_0 | GgmlType::Q5_0) {
-            n.div_ceil(Q_N_SGEMV_CHUNK_SIZE * 2)
+            n.div_ceil(q_n_sgemv_chunk_size(n) * 2)
         } else if matches!(matrix.datatype, GgmlType::Q8_0) {
             n.div_ceil(Q_8_0_SGEMV_CHUNK_SIZE * 2)
         } else {
@@ -199,7 +227,7 @@ pub(crate) fn workgroup_shape_constraints(
     device: &Device,
 ) -> crate::mir::workgroup_shape::WorkgroupShapeConstraints {
     let mut constraints = crate::mir::workgroup_shape::WorkgroupShapeConstraints::default();
-    if device.subgroups_supported() {
+    if quantized_sgemv_subgroups_supported(device) {
         constraints.add_constraint(
             0,
             crate::mir::workgroup_shape::Constraint::more_than_or_equals(

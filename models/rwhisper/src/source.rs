@@ -1,4 +1,19 @@
 use kalosm_model_types::FileSource;
+use std::path::PathBuf;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ModelFamily {
+    Whisper {
+        multilingual: bool,
+        heads: Option<&'static [[usize; 2]]>,
+        apply_speech_filter: bool,
+    },
+    CohereTranscribe,
+    MoonshineStreaming {
+        heads: Option<&'static [[usize; 2]]>,
+        apply_speech_filter: bool,
+    },
+}
 
 /// Predefined Whisper model sources
 #[derive(Debug, Clone)]
@@ -6,8 +21,7 @@ pub struct WhisperSource {
     pub(crate) model: FileSource,
     pub(crate) tokenizer: FileSource,
     pub(crate) config: FileSource,
-    pub(crate) multilingual: bool,
-    pub(crate) heads: Option<&'static [[usize; 2]]>,
+    pub(crate) family: ModelFamily,
 }
 
 impl Default for WhisperSource {
@@ -25,13 +39,103 @@ impl WhisperSource {
         multilingual: bool,
         heads: Option<&'static [[usize; 2]]>,
     ) -> Self {
+        Self::new_with_family(
+            model,
+            tokenizer,
+            config,
+            ModelFamily::Whisper {
+                multilingual,
+                heads,
+                apply_speech_filter: true,
+            },
+        )
+    }
+
+    pub(crate) fn new_with_family(
+        model: FileSource,
+        tokenizer: FileSource,
+        config: FileSource,
+        family: ModelFamily,
+    ) -> Self {
         Self {
             model,
             tokenizer,
             config,
-            multilingual,
-            heads,
+            family,
         }
+    }
+
+    /// Cohere Transcribe 03/2026
+    pub fn cohere_transcribe_03_2026() -> Self {
+        let source = FileSource::huggingface(
+            "Demonthos/cohere-transcribe-03-2026-gguf".to_owned(),
+            "main".to_owned(),
+            "cohere-transcribe-03-2026.gguf".to_owned(),
+        );
+        Self::new_with_family(
+            source.clone(),
+            source.clone(),
+            source,
+            ModelFamily::CohereTranscribe,
+        )
+    }
+
+    /// Cohere Transcribe 03/2026 from a local GGUF file. Tokenizer and config
+    /// metadata must be embedded in the GGUF (all files produced by
+    /// `scripts/quantize_cohere_transcribe.py` embed them).
+    pub fn cohere_transcribe_03_2026_local(path: impl Into<PathBuf>) -> Self {
+        let source = FileSource::local(path.into());
+        Self::new_with_family(
+            source.clone(),
+            source.clone(),
+            source,
+            ModelFamily::CohereTranscribe,
+        )
+    }
+
+    /// Moonshine streaming tiny English model.
+    pub fn moonshine_streaming_tiny() -> Self {
+        Self::moonshine_streaming_remote("moonshine-streaming-tiny.gguf")
+    }
+
+    /// Moonshine streaming small English model.
+    pub fn moonshine_streaming_small() -> Self {
+        Self::moonshine_streaming_remote("moonshine-streaming-small.gguf")
+    }
+
+    /// Moonshine streaming medium English model.
+    pub fn moonshine_streaming_medium() -> Self {
+        Self::moonshine_streaming_remote("moonshine-streaming-medium.gguf")
+    }
+
+    fn moonshine_streaming_remote(file: &str) -> Self {
+        let repo = "Demonthos/moonshot-gguf".to_owned();
+        let source = FileSource::huggingface(repo, "main".to_owned(), file.to_owned());
+        Self::new_with_family(
+            source.clone(),
+            source.clone(),
+            source,
+            ModelFamily::MoonshineStreaming {
+                heads: None,
+                apply_speech_filter: false,
+            },
+        )
+    }
+
+    /// Moonshine streaming English model from a local GGUF file. Tokenizer
+    /// and config metadata must be embedded in the GGUF (all files produced
+    /// by `scripts/quantize_moonshine_streaming.py` embed them).
+    pub fn moonshine_streaming_local(path: impl Into<PathBuf>) -> Self {
+        let source = FileSource::local(path.into());
+        Self::new_with_family(
+            source.clone(),
+            source.clone(),
+            source,
+            ModelFamily::MoonshineStreaming {
+                heads: None,
+                apply_speech_filter: false,
+            },
+        )
     }
 
     /// Tiny english model

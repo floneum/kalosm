@@ -5,12 +5,14 @@ use std::{num::NonZeroUsize, sync::Arc};
 use fusor::{
     cache::{AttentionMask, KvCache, MaskCache, TensorCache},
     layers::{Conv1d, Conv1dConfig, Embedding, LayerNorm, Linear},
-    Device, Error, Result, Tensor, VarBuilder,
+    Device, Error, MaskKind, Result, Tensor, VarBuilder,
 };
 use timestamps::extract_timestamps;
 
-use crate::config::Config;
+use crate::config::{Config, HOP_LENGTH, N_FRAMES, SAMPLE_RATE};
 
+pub(crate) mod cohere;
+pub(crate) mod moonshine;
 pub(crate) mod timestamps;
 
 fn conv1d(
@@ -155,23 +157,29 @@ impl MultiHeadAttention {
         let [n_batch, n_ctx_q, n_state] = q.shape();
         let [_, n_ctx_kv, _] = k.shape();
         let head_dim = n_state / self.n_head;
-        let scale = crate::WhisperDType::from((head_dim as f32).powf(-0.25));
+        let scale = (head_dim as f32).powf(-0.5);
 
         // Reshape Q: [n_batch, n_ctx_q, n_state] -> [n_batch, n_head, n_ctx_q, head_dim]
         let q_target_dims = [n_batch, n_ctx_q, self.n_head, head_dim];
         let q_reshaped = q.reshape(q_target_dims);
-        let q_transposed = q_reshaped.transpose(1, 2);
-        let q = q_transposed.mul_scalar(scale);
+        let q = q_reshaped.transpose(1, 2).to_concrete();
 
         // Reshape K/V: [n_batch, n_ctx_kv, n_state] -> [n_batch, n_head, n_ctx_kv, head_dim]
         // For self-attention n_ctx_kv == n_ctx_q, for cross-attention they differ
         let kv_target_dims = [n_batch, n_ctx_kv, self.n_head, head_dim];
         let k_reshaped = k.reshape(kv_target_dims);
-        let k_transposed = k_reshaped.transpose(1, 2);
-        let k_transposed2 = k_transposed.transpose(2, 3);
-        let k = k_transposed2.mul_scalar(scale);
-        let v_reshaped = v.reshape(kv_target_dims);
-        let v = v_reshaped.transpose(1, 2);
+        let k = k_reshaped.transpose(1, 2).to_concrete();
+        let v = v.reshape(kv_target_dims).transpose(1, 2).to_concrete();
+
+        // When we do not need the raw attention scores for timestamp extraction, route through
+        // the fused attention kernel to avoid materializing the full QK matrix on GPU.
+        if attention_output.is_none() {
+            let mask = mask.map(|mask| (mask.mask(), MaskKind::QKMask));
+            let wv = q.flash_attention(&k, &v, scale, mask);
+            return Ok(wv.transpose(1, 2).flatten_last_n::<1, _>());
+        }
+
+        let k = k.transpose(2, 3).to_concrete();
 
         let mut qk = {
             let _enter = self.matmul_span.enter();
@@ -482,12 +490,13 @@ impl TextDecoder {
 
         for (i, block) in self.blocks.iter_mut().enumerate() {
             if cache.blocks.len() <= i {
+                let feature_attn_cache = block
+                    .cross_attn
+                    .as_ref()
+                    .and_then(|(attn, _)| attn.forward_kv(&audio_features_batched, None).ok());
                 cache.blocks.push(ResidualAttentionBlockCache {
                     attn: MultiHeadAttentionCache::new(self.max_target_positions),
-                    feature_attn_cache: block
-                        .cross_attn
-                        .as_ref()
-                        .and_then(|(attn, _)| attn.forward_kv(&audio_features_batched, None).ok()),
+                    feature_attn_cache,
                 });
             }
             let block_cache = &mut cache.blocks[i];
@@ -557,10 +566,11 @@ impl Whisper {
         }
 
         extract_timestamps(
-            attention_heads,
+            Some(attention_heads),
             &attention_output_tensor,
             filter_width,
-            n_frames,
+            n_frames.min(N_FRAMES) / 2,
+            crate::WhisperDType::from((HOP_LENGTH * 2) as f32 / SAMPLE_RATE as f32),
             mask,
         )
         .await

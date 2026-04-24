@@ -8,7 +8,10 @@ use crate::{
     },
     quantized::matmul::{
         QMatMulOperation,
-        sgemv::{SGEMV_CHUNK_SIZE, SGEMV_VECTOR_SIZE, decompose_workgroup_index},
+        sgemv::{
+            SGEMV_CHUNK_SIZE, SGEMV_VECTOR_SIZE, decompose_workgroup_index,
+            quantized_sgemv_subgroups_supported,
+        },
     },
     util::{
         maybe_vec_storage_add, maybe_vec_storage_index, maybe_vec_storage_subgroup_add,
@@ -16,6 +19,7 @@ use crate::{
     },
 };
 use std::fmt::Write;
+use std::sync::OnceLock;
 
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn general_sgemv(
@@ -24,6 +28,7 @@ pub(crate) fn general_sgemv(
     workgroup_size: &WorkgroupShape,
     input_a: &TensorInput,
     input_b: &QMatrixInput,
+    bias: Option<&TensorInput>,
     output: &TensorInput,
     n_size: &str,
     m_size: &str,
@@ -31,10 +36,12 @@ pub(crate) fn general_sgemv(
     graph: &crate::compute_graph::ComputeGraphInner,
 ) {
     let blocksize = workgroup_size.x();
-    let dtype = op.input_datatype;
+    let input_datatype = op.input_datatype;
     let workgroup_local_index = kernel.workgroup_local_index();
     let elements_per_block = op.elements_per_block();
     let device = graph.device();
+    let pre_element_wise_functions = OnceLock::new();
+    let post_element_wise_functions = OnceLock::new();
 
     // Calculate n_workgroups for decomposing the linearized workgroup index
     let n_workgroups = format!("(({n_size} + {SGEMV_CHUNK_SIZE} - 1) / {SGEMV_CHUNK_SIZE})");
@@ -66,6 +73,13 @@ pub(crate) fn general_sgemv(
     )
     .unwrap();
 
+    // Fast path check: if all rows in this tile are valid, skip per-row bounds checks
+    writeln!(
+        kernel,
+        "let is_full_tile = workgroup_offset + {SGEMV_CHUNK_SIZE} <= {n_size};"
+    )
+    .unwrap();
+
     // Always accumulate in f32 for precision, convert to output dtype at the end
     let acc_storage_type = maybe_vec_storage_type(SGEMV_CHUNK_SIZE, DataTypeEnum::F32);
 
@@ -87,7 +101,7 @@ pub(crate) fn general_sgemv(
     debug_assert!(elements_per_block.is_multiple_of(SGEMV_VECTOR_SIZE));
     writeln!(
         kernel,
-        "var a_cache = array<vec{SGEMV_VECTOR_SIZE}<{dtype}>, {chunk_blocks}>();"
+        "var a_cache = array<vec{SGEMV_VECTOR_SIZE}<f32>, {chunk_blocks}>();"
     )
     .unwrap();
 
@@ -98,9 +112,12 @@ pub(crate) fn general_sgemv(
         writeln!(kernel, "for (var i = 0u; i < {chunk_blocks}; i += 1u) {{").unwrap();
         {
             // Get the values first
+            let pre_element_wise_functions = pre_element_wise_functions
+                .get_or_init(|| op.pre_element_wise.add_functions(kernel));
             for i in 0..SGEMV_VECTOR_SIZE {
                 writeln!(kernel, "let input_a_{i}_index = index * {elements_per_block} + i * {SGEMV_VECTOR_SIZE} + {i};").unwrap();
-                write!(kernel, "let input_a_{i} = {input_a}[").unwrap();
+                let mut raw_input = String::new();
+                write!(&mut raw_input, "{input_a}[").unwrap();
                 let mut indices = Vec::new();
                 // Add batch indices first
                 for dim in (0..input_a.rank()).rev().skip(2) {
@@ -109,8 +126,12 @@ pub(crate) fn general_sgemv(
                 // Then add M and K indices
                 indices.push("m_idx".to_string());
                 indices.push(format!("input_a_{i}_index"));
-                input_a.strided_index(kernel, indices);
-                writeln!(kernel, "];").unwrap();
+                input_a.strided_index(&mut raw_input, indices);
+                write!(&mut raw_input, "]").unwrap();
+                let processed = pre_element_wise_functions
+                    .iter()
+                    .fold(raw_input, |acc, f| f.call(vec![acc]));
+                writeln!(kernel, "let input_a_{i} = f32({processed});").unwrap();
             }
             // The pack them into a vector and write to the cache
             write!(kernel, "a_cache[i] = vec{SGEMV_VECTOR_SIZE}(").unwrap();
@@ -124,6 +145,49 @@ pub(crate) fn general_sgemv(
         }
         writeln!(kernel, "}}").unwrap();
 
+        // Generate the computation body for one row
+        let generate_row_computation =
+            |kernel: &mut GenericKernel, op: &QMatMulOperation, input_b: &QMatrixInput| {
+                let index = if SGEMV_CHUNK_SIZE > 1 {
+                    "(workgroup_offset + acc_offset)"
+                } else {
+                    "workgroup_offset"
+                };
+                writeln!(
+                    kernel,
+                    "let chunk = &{input_b}[{index} * k_block_size + index];"
+                )
+                .unwrap();
+
+                let acc_indexed = maybe_vec_storage_index(SGEMV_CHUNK_SIZE, "acc", "acc_offset");
+                // Always convert a_cache to f32 for the dot product since dequantize outputs f32
+                // and we accumulate in f32 for precision
+                dequantize_vec4_block(
+                    kernel,
+                    op.matrix.datatype,
+                    "chunk".to_string(),
+                    DataTypeEnum::F32,
+                    |index, data, code| {
+                        writeln!(code, "{acc_indexed} += dot(a_cache[{index}], {data});").unwrap();
+                    },
+                );
+            };
+
+        // Fast path: all rows in tile are valid, no bounds checks needed
+        writeln!(kernel, "if is_full_tile {{").unwrap();
+        if SGEMV_CHUNK_SIZE > 1 {
+            writeln!(
+                kernel,
+                "for (var acc_offset = 0u; acc_offset < {SGEMV_CHUNK_SIZE}; acc_offset += 1u) {{"
+            )
+            .unwrap();
+        }
+        generate_row_computation(kernel, op, input_b);
+        if SGEMV_CHUNK_SIZE > 1 {
+            writeln!(kernel, "}}").unwrap();
+        }
+        writeln!(kernel, "}} else {{").unwrap();
+        // Slow path: check bounds for each row
         if SGEMV_CHUNK_SIZE > 1 {
             writeln!(
                 kernel,
@@ -136,32 +200,14 @@ pub(crate) fn general_sgemv(
         } else {
             "workgroup_offset"
         };
-        writeln!(
-            kernel,
-            "let chunk = &{input_b}[{index} * k_block_size + index];"
-        )
-        .unwrap();
-
-        let acc_indexed = maybe_vec_storage_index(SGEMV_CHUNK_SIZE, "acc", "acc_offset");
-        // Always convert a_cache to f32 for the dot product since dequantize outputs f32
-        // and we accumulate in f32 for precision
-        dequantize_vec4_block(
-            kernel,
-            op.matrix.datatype,
-            "chunk".to_string(),
-            DataTypeEnum::F32,
-            |index, data, code| {
-                writeln!(
-                    code,
-                    "{acc_indexed} += dot(vec4<f32>(a_cache[{index}]), {data});"
-                )
-                .unwrap();
-            },
-        );
-
+        writeln!(kernel, "let row_in_bounds = {index} < {n_size};").unwrap();
+        writeln!(kernel, "if row_in_bounds {{").unwrap();
+        generate_row_computation(kernel, op, input_b);
+        writeln!(kernel, "}}").unwrap();
         if SGEMV_CHUNK_SIZE > 1 {
             writeln!(kernel, "}}").unwrap();
         }
+        writeln!(kernel, "}}").unwrap();
 
         writeln!(kernel, "index += {blocksize}u;").unwrap();
     }
@@ -169,7 +215,7 @@ pub(crate) fn general_sgemv(
     writeln!(kernel, "}}").unwrap();
 
     // Reduce with subgroup operations if the device supports subgroups
-    if device.subgroups_supported() {
+    if quantized_sgemv_subgroups_supported(&device) {
         // Get the sum among all threads in the subgroup
         writeln!(
             kernel,
@@ -264,7 +310,36 @@ pub(crate) fn general_sgemv(
     // If this is not the first simd thread in the workgroup, we can return early
     writeln!(kernel, "if {workgroup_local_index} != 0u {{ return; }}").unwrap();
 
+    // Initialize post element-wise functions once before the loop
+    let post_fns =
+        post_element_wise_functions.get_or_init(|| op.post_element_wise.add_functions(kernel));
+
+    // Generate the output body for one row
+    let generate_row_output = |kernel: &mut GenericKernel| {
+        write!(kernel, "{output}[").unwrap();
+        let mut output_indices = Vec::new();
+        // Add batch indices first
+        for dim in (0..output.rank()).rev().skip(2) {
+            output_indices.push(format!("batch_idx_{dim}"));
+        }
+        // Then add M and N indices
+        output_indices.push("m_idx".to_string());
+        output_indices.push("output_index".to_string());
+        output.strided_index(kernel, output_indices);
+        // Convert from f32 accumulator to output dtype (single element per iteration)
+        let acc_val = maybe_vec_storage_index(SGEMV_CHUNK_SIZE, "acc", "acc_offset");
+        let result = op.apply_bias_and_post(
+            bias,
+            "output_index",
+            format!("{input_datatype}({acc_val})"),
+            post_fns,
+        );
+        writeln!(kernel, "] = {result};").unwrap();
+    };
+
     // Write the output to the output tensor if this is the first thread in the workgroup
+    // Fast path: all rows in tile are valid, no bounds checks needed
+    writeln!(kernel, "if is_full_tile {{").unwrap();
     if SGEMV_CHUNK_SIZE > 1 {
         writeln!(
             kernel,
@@ -278,21 +353,31 @@ pub(crate) fn general_sgemv(
         } else {
             writeln!(kernel, "let output_index = workgroup_offset;").unwrap();
         }
-        write!(kernel, "{output}[").unwrap();
-        let mut output_indices = Vec::new();
-        // Add batch indices first
-        for dim in (0..output.rank()).rev().skip(2) {
-            output_indices.push(format!("batch_idx_{dim}"));
-        }
-        // Then add M and N indices
-        output_indices.push("m_idx".to_string());
-        output_indices.push("output_index".to_string());
-        output.strided_index(kernel, output_indices);
-        // Convert from f32 accumulator to output dtype (single element per iteration)
-        let acc_val = maybe_vec_storage_index(SGEMV_CHUNK_SIZE, "acc", "acc_offset");
-        writeln!(kernel, "] = {dtype}({acc_val});").unwrap();
+        generate_row_output(kernel);
     }
     if SGEMV_CHUNK_SIZE > 1 {
         writeln!(kernel, "}}").unwrap();
     }
+    writeln!(kernel, "}} else {{").unwrap();
+    // Slow path: check bounds for each row
+    if SGEMV_CHUNK_SIZE > 1 {
+        writeln!(
+            kernel,
+            "for (var acc_offset = 0u; acc_offset < {SGEMV_CHUNK_SIZE}; acc_offset += 1u) {{"
+        )
+        .unwrap();
+    }
+    {
+        if SGEMV_CHUNK_SIZE > 1 {
+            writeln!(kernel, "let output_index = workgroup_offset + acc_offset;").unwrap();
+        } else {
+            writeln!(kernel, "let output_index = workgroup_offset;").unwrap();
+        }
+        writeln!(kernel, "if output_index >= {n_size} {{ continue; }}").unwrap();
+        generate_row_output(kernel);
+    }
+    if SGEMV_CHUNK_SIZE > 1 {
+        writeln!(kernel, "}}").unwrap();
+    }
+    writeln!(kernel, "}}").unwrap();
 }

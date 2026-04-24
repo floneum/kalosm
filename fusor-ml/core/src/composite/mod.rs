@@ -1,4 +1,5 @@
 mod arange;
+mod argmax;
 mod cat;
 mod chunk;
 mod conv;
@@ -19,6 +20,7 @@ mod sliding_window_view;
 mod softmax;
 mod sqr;
 mod squeeze;
+mod swiglu;
 mod to_vec;
 pub use to_vec::{ToVec1, ToVec2, ToVec3};
 mod unsqueeze;

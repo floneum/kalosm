@@ -28,7 +28,7 @@ pub use composite::{
 };
 pub use device::Device;
 pub use error::Error;
-pub use fusor_types::FromArray;
+pub use fusor_types::{FromArray, SlidingWindow};
 
 /// Result type for fusor operations.
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -404,16 +404,110 @@ where
 
     /// Materialize the tensor to a concrete form.
     ///
-    /// For CPU tensors, this evaluates any lazy expressions.
-    /// For GPU tensors, this is a no-op as GPU tensors are already concrete.
+    /// For CPU tensors, this evaluates any lazy expressions. GPU tensors stay
+    /// lazy so graph resolution can keep the full operation chain in one
+    /// deferred GPU pass.
     pub fn to_concrete(&self) -> Tensor<R, D>
     where
         B: TensorBacking<R>,
-        D: SimdElement,
+        D: SimdElement + DataType,
     {
         match self {
             Tensor::Cpu(t) => Tensor::Cpu(t.to_concrete()),
             Tensor::Gpu(t) => Tensor::Gpu(t.clone()),
+        }
+    }
+
+    /// Ensure any deferred GPU work for this tensor is submitted and resolved.
+    ///
+    /// This is primarily useful when a long-lived tensor would otherwise keep a
+    /// growing compute graph alive across many incremental decode steps.
+    pub fn materialize_blocking(&self)
+    where
+        B: TensorBacking<R>,
+        D: SimdElement + DataType + 'static,
+    {
+        match self {
+            Tensor::Cpu(_) => {}
+            #[cfg(not(target_arch = "wasm32"))]
+            Tensor::Gpu(t) => pollster::block_on(t.materialize()),
+            #[cfg(target_arch = "wasm32")]
+            Tensor::Gpu(_) => {}
+        }
+    }
+
+    pub fn to_materialized_blocking(&self) -> Tensor<R, D>
+    where
+        B: TensorBacking<R>,
+        D: SimdElement + DataType + 'static,
+    {
+        match self {
+            Tensor::Cpu(t) => Tensor::Cpu(t.to_concrete()),
+            #[cfg(not(target_arch = "wasm32"))]
+            Tensor::Gpu(t) => Tensor::Gpu(pollster::block_on(t.materialized())),
+            #[cfg(target_arch = "wasm32")]
+            Tensor::Gpu(t) => Tensor::Gpu(t.clone()),
+        }
+    }
+
+    pub fn materialize_many_blocking(tensors: &[&Self])
+    where
+        B: TensorBacking<R>,
+        D: SimdElement + DataType + 'static,
+    {
+        if tensors.is_empty() {
+            return;
+        }
+
+        match tensors[0] {
+            Tensor::Cpu(_) => {}
+            #[cfg(not(target_arch = "wasm32"))]
+            Tensor::Gpu(_) => {
+                let gpu_tensors: Vec<_> = tensors
+                    .iter()
+                    .map(|tensor| match tensor {
+                        Tensor::Gpu(t) => t,
+                        Tensor::Cpu(_) => {
+                            panic!("cannot mix CPU and GPU tensors in materialize_many_blocking")
+                        }
+                    })
+                    .collect();
+                pollster::block_on(fusor_core::Tensor::materialize_many(&gpu_tensors));
+            }
+            #[cfg(target_arch = "wasm32")]
+            Tensor::Gpu(_) => {}
+        }
+    }
+
+    pub fn to_materialized_many_blocking(tensors: &[&Self]) -> Vec<Tensor<R, D>>
+    where
+        B: TensorBacking<R>,
+        D: SimdElement + DataType + 'static,
+    {
+        if tensors.is_empty() {
+            return Vec::new();
+        }
+
+        match tensors[0] {
+            Tensor::Cpu(_) => tensors.iter().map(|tensor| tensor.to_concrete()).collect(),
+            #[cfg(not(target_arch = "wasm32"))]
+            Tensor::Gpu(_) => {
+                let gpu_tensors: Vec<_> = tensors
+                    .iter()
+                    .map(|tensor| match tensor {
+                        Tensor::Gpu(t) => t,
+                        Tensor::Cpu(_) => panic!(
+                            "cannot mix CPU and GPU tensors in to_materialized_many_blocking"
+                        ),
+                    })
+                    .collect();
+                pollster::block_on(fusor_core::Tensor::materialized_many(&gpu_tensors))
+                    .into_iter()
+                    .map(Tensor::Gpu)
+                    .collect()
+            }
+            #[cfg(target_arch = "wasm32")]
+            Tensor::Gpu(_) => tensors.iter().map(|tensor| tensor.to_concrete()).collect(),
         }
     }
 
@@ -1156,6 +1250,34 @@ where
 
             // Mixed - panic
             _ => panic!("Cannot mix CPU and GPU tensors in q_mat_mul"),
+        }
+    }
+
+    pub fn q_mat_mul_bias<B2>(
+        &self,
+        weights: &crate::QMatrix,
+        bias: &Tensor<1, f32, B2>,
+    ) -> Tensor<R, f32>
+    where
+        B2: TensorBacking<1, Elem = f32>,
+        (fusor_core::Tensor<R, f32>, fusor_core::Tensor<1, f32>): fusor_core::MaxRank<R, f32>,
+        (ConcreteTensor<f32, R>, ConcreteTensor<f32, 1>): fusor_cpu::MaxRank<R, f32>,
+        AddOp: SimdBinaryOp<f32>,
+    {
+        use crate::QMatrix;
+        use fusor_gguf::GgmlType;
+
+        if matches!(weights.ggml_type(), GgmlType::F16 | GgmlType::F32) {
+            return self.q_mat_mul(weights).add_(bias);
+        }
+
+        match (self, weights, bias) {
+            (Tensor::Gpu(lhs), QMatrix::Gpu(rhs), Tensor::Gpu(bias)) => {
+                let bias = bias.clone();
+                Tensor::Gpu(lhs.q_mat_mul_bias(rhs, &bias))
+            }
+            (Tensor::Cpu(_), _, _) => self.q_mat_mul(weights).add_(bias),
+            _ => panic!("Cannot mix CPU and GPU tensors in q_mat_mul_bias"),
         }
     }
 }

@@ -5,7 +5,6 @@ pub(crate) use petgraph::graph::NodeIndex;
 use petgraph::prelude::StableGraph;
 use resolve::Resolver;
 use tabbycat::Graph;
-use wgpu::CommandEncoderDescriptor;
 
 mod layout_pass;
 mod queue;
@@ -14,11 +13,19 @@ mod visualize;
 
 use crate::{
     DataTypeEnum, Device, ElementWiseOperation, MatMulOperation, PairWiseOperation, QMatrix,
-    ReduceOperation, composite::where_cond::WhereCondOperation,
-    compute_graph::resolve::ResolverResult, dequantize::DequantizeOperation,
-    index_select::IndexSelectOperation, map_layout::MapLayoutOperation, mir::operation::Operation,
-    nary_wise::NaryOperation, quantized::matmul::QMatMulOperation, resize::ResizeOperation,
-    slice_assign::SliceAssignOperation, tensor::TensorData, visit_tiled::MaybeQData,
+    ReduceOperation,
+    composite::where_cond::WhereCondOperation,
+    compute_graph::resolve::{ResolverManyResult, ResolverResult},
+    dequantize::DequantizeOperation,
+    index_select::IndexSelectOperation,
+    map_layout::MapLayoutOperation,
+    mir::operation::Operation,
+    nary_wise::NaryOperation,
+    quantized::matmul::QMatMulOperation,
+    resize::ResizeOperation,
+    slice_assign::SliceAssignOperation,
+    tensor::TensorData,
+    visit_tiled::MaybeQData,
 };
 
 #[derive(Clone)]
@@ -101,16 +108,10 @@ impl ComputeGraph {
     }
 
     pub(crate) fn resolve(&self, key: NodeIndex, device: &Device) -> ResolverResult {
-        let mut encoder = device
-            .wgpu_device()
-            .create_command_encoder(&CommandEncoderDescriptor {
-                label: Some("ComputeGraph Encoder"),
-            });
         let data = self.with_mut(|inner| {
-            let mut resolver = Resolver::new(inner, key, &mut encoder);
+            let mut resolver = Resolver::new(inner, key, device);
             resolver.run(inner)
         });
-        device.wgpu_queue().submit(Some(encoder.finish()));
         // Reset the written flag on all buffers
         device.reset_initialized_buffers();
 
@@ -129,8 +130,56 @@ impl ComputeGraph {
         data
     }
 
+    pub(crate) fn resolve_many(&self, keys: &[NodeIndex], device: &Device) -> ResolverManyResult {
+        let data = self.with_mut(|inner| {
+            let mut resolver = Resolver::new_many(inner, keys, device);
+            resolver.run_many(inner)
+        });
+        device.reset_initialized_buffers();
+
+        if let (Some(pipeline_cache), Some(cache_file)) =
+            (device.wgpu_cache(), device.wgpu_cache_file())
+        {
+            let data = pipeline_cache.get_data();
+            if let Some(data) = data {
+                let temp_file = cache_file.with_extension("temp");
+                std::fs::write(&temp_file, &data).unwrap();
+                std::fs::rename(&temp_file, cache_file).unwrap();
+            }
+        }
+
+        data
+    }
+
     pub(crate) fn graphvis(&self, root: NodeIndex) -> Graph {
         self.with_mut(|inner| inner.graphvis(root))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn node_variant_name(&self, key: NodeIndex) -> &'static str {
+        self.with_mut(|inner| {
+            let node = inner
+                .nodes
+                .nodes
+                .node_weight(key)
+                .expect("Node not found in graph");
+            match &node.variant {
+                ComputeGraphNodeVariant::ElementWise(_) => "ElementWise",
+                ComputeGraphNodeVariant::PairWise(_) => "PairWise",
+                ComputeGraphNodeVariant::Nary(_) => "Nary",
+                ComputeGraphNodeVariant::SliceAssign(_) => "SliceAssign",
+                ComputeGraphNodeVariant::Resize(_) => "Resize",
+                ComputeGraphNodeVariant::MapLayout(_) => "MapLayout",
+                ComputeGraphNodeVariant::Dequantize(_) => "Dequantize",
+                ComputeGraphNodeVariant::MatMul(_) => "MatMul",
+                ComputeGraphNodeVariant::QMatMul(_) => "QMatMul",
+                ComputeGraphNodeVariant::Tensor(_) => "Tensor",
+                ComputeGraphNodeVariant::Reduce(_) => "Reduce",
+                ComputeGraphNodeVariant::IndexSelect(_) => "IndexSelect",
+                ComputeGraphNodeVariant::WhereCond(_) => "WhereCond",
+                ComputeGraphNodeVariant::Custom(_) => "Custom",
+            }
+        })
     }
 
     pub(crate) fn add_reference(&self, key: NodeIndex) {
@@ -139,6 +188,10 @@ impl ComputeGraph {
 
     pub(crate) fn remove_reference(&self, key: NodeIndex) {
         self.with_mut(|inner| inner.remove_reference(key));
+    }
+
+    pub(crate) fn is_cached(&self, key: NodeIndex) -> bool {
+        self.with_mut(|inner| inner.get_cached_result(key).is_some())
     }
 }
 
@@ -189,7 +242,7 @@ impl ComputeGraphNodeVariant {
                 f(op.second);
             }
             ComputeGraphNodeVariant::QMatMul(op) => {
-                f(op.input);
+                op.visit_dependencies(f);
             }
             ComputeGraphNodeVariant::Reduce(op) => f(op.value),
             ComputeGraphNodeVariant::MapLayout(op) => f(op.input),

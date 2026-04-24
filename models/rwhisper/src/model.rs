@@ -15,7 +15,9 @@ use tokenizers::Tokenizer;
 
 use super::{DecodingResult, Segment};
 use crate::{
-    audio, config::*, quantized::TextDecoderCache, Task, TaskType, TokenChunk, WhisperBuilder,
+    audio, cohere_config::CohereConfig, cohere_runtime::CohereRuntime, config::*,
+    moonshine_config::MoonshineStreamingConfig, moonshine_runtime::MoonshineRuntime,
+    quantized::TextDecoderCache, source::ModelFamily, Task, TaskType, TokenChunk, WhisperBuilder,
     WhisperLanguage,
 };
 use kalosm_common::CacheError;
@@ -55,6 +57,9 @@ pub enum WhisperLoadingError {
     /// An error that can occur when trying to load the whisper config.
     #[error("Failed to load config: {0}")]
     LoadConfig(serde_json::Error),
+    /// An error that can occur when trying to read embedded GGUF metadata.
+    #[error("Failed to read embedded GGUF metadata: {0}")]
+    EmbeddedMetadata(fusor::GgufReadError),
     /// Unsupported mel filter length
     #[error("Unsupported mel filter length: {0}; only 80 and 128 are supported")]
     UnsupportedMelFilterLength(usize),
@@ -77,11 +82,17 @@ pub enum WhisperError {
     Compression(std::io::Error),
 }
 
-pub(crate) struct WhisperInner {
+pub(crate) struct WhisperRuntime {
     mel_filters: Vec<f32>,
     device: Device,
     decoder: Decoder,
     config: Config,
+}
+
+pub(crate) enum WhisperInner {
+    Whisper(WhisperRuntime),
+    Cohere(CohereRuntime),
+    Moonshine(MoonshineRuntime),
 }
 
 impl WhisperInner {
@@ -91,7 +102,7 @@ impl WhisperInner {
         tokenizer: &[u8],
         config: &[u8],
     ) -> Result<Self, WhisperLoadingError> {
-        // Set FUSOR_USE_GPU=1 to use GPU, otherwise CPU
+        // Set FUSOR_USE_GPU=1 to use GPU, otherwise CPU.
         let use_gpu = std::env::var("FUSOR_USE_GPU")
             .map(|v| v == "1")
             .unwrap_or(false);
@@ -101,48 +112,62 @@ impl WhisperInner {
             Device::cpu()
         };
 
-        let tokenizer =
-            Tokenizer::from_bytes(tokenizer).map_err(WhisperLoadingError::LoadTokenizer)?;
-        let config: Config =
-            serde_json::from_slice(config).map_err(WhisperLoadingError::LoadConfig)?;
+        match settings.model.family {
+            ModelFamily::Whisper {
+                multilingual,
+                heads,
+                ..
+            } => {
+                let tokenizer =
+                    Tokenizer::from_bytes(tokenizer).map_err(WhisperLoadingError::LoadTokenizer)?;
+                let config: Config =
+                    serde_json::from_slice(config).map_err(WhisperLoadingError::LoadConfig)?;
 
-        let mel_bytes = match config.num_mel_bins {
-            80 => include_bytes!("melfilters.bytes").as_slice(),
-            128 => include_bytes!("melfilters128.bytes").as_slice(),
-            nmel => return Err(WhisperLoadingError::UnsupportedMelFilterLength(nmel)),
-        };
-        let mut mel_filters = vec![0f32; mel_bytes.len() / 4];
-        <byteorder::LittleEndian as byteorder::ByteOrder>::read_f32_into(
-            mel_bytes,
-            &mut mel_filters,
-        );
-        let attention_heads = settings.model.heads;
+                let mel_bytes = match config.num_mel_bins {
+                    80 => include_bytes!("melfilters.bytes").as_slice(),
+                    128 => include_bytes!("melfilters128.bytes").as_slice(),
+                    nmel => return Err(WhisperLoadingError::UnsupportedMelFilterLength(nmel)),
+                };
+                let mut mel_filters = vec![0f32; mel_bytes.len() / 4];
+                <byteorder::LittleEndian as byteorder::ByteOrder>::read_f32_into(
+                    mel_bytes,
+                    &mut mel_filters,
+                );
 
-        let model = ModelType::load(weights, &device, config.clone())?;
-        let language_token = if settings.model.multilingual {
-            let language = settings.language.unwrap_or(WhisperLanguage::English);
-            match token_id(&tokenizer, &format!("<|{language}|>")) {
-                Ok(token_id) => Some(token_id),
-                Err(_) => return Err(WhisperLoadingError::UnsupportedLanguage(language)),
+                let model = ModelType::load(weights, &device, config.clone())?;
+                let language_token = if multilingual {
+                    let language = settings.language.unwrap_or(WhisperLanguage::English);
+                    match token_id(&tokenizer, &format!("<|{language}|>")) {
+                        Ok(token_id) => Some(token_id),
+                        Err(_) => return Err(WhisperLoadingError::UnsupportedLanguage(language)),
+                    }
+                } else {
+                    None
+                };
+                let decoder = Decoder::new(model, tokenizer, 0, &device, language_token, heads)?;
+
+                Ok(Self::Whisper(WhisperRuntime {
+                    mel_filters,
+                    device,
+                    decoder,
+                    config,
+                }))
             }
-        } else {
-            None
-        };
-        let decoder = Decoder::new(
-            model,
-            tokenizer,
-            0,
-            &device,
-            language_token,
-            attention_heads,
-        )?;
-
-        Ok(Self {
-            mel_filters,
-            device,
-            decoder,
-            config,
-        })
+            ModelFamily::CohereTranscribe => {
+                let config: CohereConfig =
+                    serde_json::from_slice(config).map_err(WhisperLoadingError::LoadConfig)?;
+                Ok(Self::Cohere(CohereRuntime::new(
+                    device, weights, tokenizer, config,
+                )?))
+            }
+            ModelFamily::MoonshineStreaming { heads, .. } => {
+                let config: MoonshineStreamingConfig =
+                    serde_json::from_slice(config).map_err(WhisperLoadingError::LoadConfig)?;
+                Ok(Self::Moonshine(MoonshineRuntime::new(
+                    device, weights, tokenizer, config, heads,
+                )?))
+            }
+        }
     }
 
     pub(crate) async fn transcribe(
@@ -152,36 +177,96 @@ impl WhisperInner {
         language: Option<WhisperLanguage>,
         result: UnboundedSender<Segment>,
     ) {
-        let mel = audio::pcm_to_mel(&self.config, &pcm_data, &self.mel_filters);
-        let mel_len = mel.len();
-        let mel = Tensor::new(&self.device, &mel)
-            .reshape([self.config.num_mel_bins, mel_len / self.config.num_mel_bins])
-            .to_concrete()
-            .cast();
+        match self {
+            Self::Whisper(runtime) => {
+                let mel = audio::pcm_to_mel(&runtime.config, &pcm_data, &runtime.mel_filters);
+                let mel_len = mel.len();
+                let mel = Tensor::new(&runtime.device, &mel)
+                    .reshape([
+                        runtime.config.num_mel_bins,
+                        mel_len / runtime.config.num_mel_bins,
+                    ])
+                    .to_concrete()
+                    .cast();
 
-        if let Some(language) = language {
-            if let Err(err) = self.decoder.set_language_token(language) {
-                // Log error or send error message to result channel
-                // Continue with default language
-                tracing::error!("Error updating language token: {err}");
+                if let Some(language) = language {
+                    if let Err(err) = runtime.decoder.set_language_token(language) {
+                        tracing::error!("Error updating language token: {err}");
+                    }
+                }
+
+                if let Err(err) = runtime
+                    .decoder
+                    .run(
+                        &mel,
+                        pcm_data.len(),
+                        Task {
+                            task_type: TaskType::Unset,
+                            word_level_time_stamps,
+                            without_timestamps: true,
+                        },
+                        result,
+                    )
+                    .await
+                {
+                    tracing::error!("Error transcribing audio: {err}");
+                }
+            }
+            Self::Cohere(runtime) => {
+                if let Err(err) = runtime
+                    .transcribe(pcm_data, language, word_level_time_stamps, result)
+                    .await
+                {
+                    tracing::error!("Error transcribing audio: {err}");
+                }
+            }
+            Self::Moonshine(runtime) => {
+                if let Err(err) = runtime
+                    .transcribe(pcm_data, language, word_level_time_stamps, result)
+                    .await
+                {
+                    tracing::error!("Error transcribing audio: {err}");
+                }
             }
         }
+    }
 
-        if let Err(err) = self
-            .decoder
-            .run(
-                &mel,
-                pcm_data.len(),
-                Task {
-                    task_type: TaskType::Unset,
-                    word_level_time_stamps,
-                    without_timestamps: true,
-                },
-                result,
-            )
-            .await
-        {
-            tracing::error!("Error transcribing audio: {err}");
+    pub(crate) fn start_stream(
+        &mut self,
+        session_id: u64,
+        word_level_time_stamps: bool,
+        language: Option<WhisperLanguage>,
+        sender: UnboundedSender<Segment>,
+    ) -> Result<(), WhisperLoadingError> {
+        match self {
+            Self::Moonshine(runtime) => {
+                runtime.start_stream(session_id, language, word_level_time_stamps, sender)
+            }
+            _ => Err(WhisperLoadingError::LoadModel(fusor::Error::msg(
+                "streaming is only supported for moonshine models",
+            ))),
+        }
+    }
+
+    pub(crate) async fn push_stream_audio(
+        &mut self,
+        session_id: u64,
+        samples: Vec<f32>,
+    ) -> Result<(), WhisperError> {
+        match self {
+            Self::Moonshine(runtime) => runtime.push_stream_audio(session_id, samples).await,
+            _ => Err(WhisperError::Fusor(fusor::Error::msg(
+                "streaming is only supported for moonshine models",
+            ))),
+        }
+    }
+
+    pub(crate) async fn finish_stream(&mut self, session_id: u64) -> Result<(), WhisperError> {
+        match self {
+            Self::Moonshine(runtime) => runtime.finish_stream(session_id).await,
+            _ => Err(WhisperError::Fusor(fusor::Error::msg(
+                "streaming is only supported for moonshine models",
+            ))),
         }
     }
 }
@@ -661,7 +746,6 @@ impl Decoder {
                 let start = range.start;
                 let end = range.end;
                 let start_time_offset = (start * HOP_LENGTH) as f64 / SAMPLE_RATE as f64;
-                let time_offset = (end * HOP_LENGTH) as f64 / SAMPLE_RATE as f64;
 
                 let segment_duration = (segment_size * HOP_LENGTH) as f64 / SAMPLE_RATE as f64;
 
@@ -716,7 +800,7 @@ impl Decoder {
                 let segment = Segment {
                     sample_range: (range.start * HOP_LENGTH)
                         ..audio_frames.min(range.end * HOP_LENGTH),
-                    start: time_offset,
+                    start: start_time_offset,
                     duration: segment_duration,
                     remaining_time: remaining,
                     elapsed_time: elapsed,

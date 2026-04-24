@@ -5,10 +5,10 @@ use std::sync::Arc;
 use petgraph::algo::toposort;
 use petgraph::stable_graph::StableGraph;
 use rustc_hash::{FxHashMap, FxHashSet};
-use wgpu::CommandEncoder;
+use wgpu::{CommandEncoder, CommandEncoderDescriptor};
 
 use crate::{
-    ElementWiseFunctions,
+    Device, ElementWiseFunctions,
     mir::{
         inputs::{KernelInputValue, MirValue},
         kernel::GenericKernel,
@@ -16,7 +16,6 @@ use crate::{
         workgroup_shape::{self, WorkgroupShapeConstraints},
     },
     nary_wise::{NaryExpr, NaryOperation},
-    quantized::matmul::QMatMulOperation,
     tensor::TensorData,
 };
 
@@ -24,6 +23,11 @@ use super::{ComputeGraphInner, ComputeGraphNodeVariant, NodeIndex};
 
 pub(crate) struct ResolverResult {
     pub(crate) data: TensorData,
+    pub(crate) total_kernels: usize,
+}
+
+pub(crate) struct ResolverManyResult {
+    pub(crate) data: Vec<TensorData>,
     pub(crate) total_kernels: usize,
 }
 
@@ -36,19 +40,29 @@ struct ExecutionNode {
 type ExecutionGraph = StableGraph<ExecutionNode, ()>;
 type ExecutionNodeIndex = petgraph::graph::NodeIndex;
 
-pub(crate) struct Resolver<'a> {
-    command_encoder: &'a mut CommandEncoder,
+const MAX_FUSED_NARY_INPUTS: usize = 8;
+const MAX_FUSED_NARY_EXPR_NODES: usize = 128;
+const MAX_BATCHED_STORAGE_BUFFERS: usize = 16;
+
+pub(crate) struct Resolver {
+    device: Device,
+    command_encoder: CommandEncoder,
     execution_graph: ExecutionGraph,
     node_mapping: FxHashMap<NodeIndex, ExecutionNodeIndex>,
-    target: NodeIndex,
+    targets: Vec<NodeIndex>,
     resolved_set: FxHashSet<NodeIndex>,
+    dispatched_kernels_since_submit: usize,
 }
 
-impl<'a> Resolver<'a> {
-    pub(crate) fn new(
+impl Resolver {
+    pub(crate) fn new(graph: &mut ComputeGraphInner, target: NodeIndex, device: &Device) -> Self {
+        Self::new_many(graph, &[target], device)
+    }
+
+    pub(crate) fn new_many(
         graph: &mut ComputeGraphInner,
-        target: NodeIndex,
-        command_encoder: &'a mut CommandEncoder,
+        targets: &[NodeIndex],
+        device: &Device,
     ) -> Self {
         let resolved_set = graph
             .nodes
@@ -64,20 +78,30 @@ impl<'a> Resolver<'a> {
             })
             .collect();
         Self {
-            command_encoder,
-            target,
+            device: device.clone(),
+            command_encoder: device.wgpu_device().create_command_encoder(
+                &CommandEncoderDescriptor {
+                    label: Some("ComputeGraph Resolver Encoder"),
+                },
+            ),
+            targets: targets.to_vec(),
             execution_graph: Default::default(),
             node_mapping: Default::default(),
             resolved_set,
+            dispatched_kernels_since_submit: 0,
         }
     }
 
-    pub(crate) fn run(&mut self, graph: &mut ComputeGraphInner) -> ResolverResult {
+    fn execute(&mut self, graph: &mut ComputeGraphInner) -> usize {
         let device = graph.device();
         let max_subgroup_size = device.max_subgroup_size();
+        let max_storage_buffers = (device.limits().max_storage_buffers_per_shader_stage as usize)
+            .min(MAX_BATCHED_STORAGE_BUFFERS);
 
         // Pass 1: Build execution graph
-        self.build_execution_graph(graph, self.target);
+        for target in self.targets.clone() {
+            self.build_execution_graph(graph, target);
+        }
 
         // Pass 2: Apply Rewrite Rules
         self.optimize(graph);
@@ -106,12 +130,14 @@ impl<'a> Resolver<'a> {
         let mut current_constraints = WorkgroupShapeConstraints::new();
         let mut pending_operations = Vec::new();
         let mut inputs = Vec::new();
+        let mut outputs = Vec::new();
         let mut all_input_values = Vec::new();
         let mut kernel = GenericKernel::new();
         let mut total_kernels = 0;
 
         for (node, operation) in queued_operations {
             let new_inputs = operation.inputs(graph);
+            let new_output = operation.output(graph, &new_inputs);
             let constraint = operation.workgroup_shape_constraints(&device);
             let mut new_merged = current_constraints.clone();
             new_merged.merge(&constraint);
@@ -120,7 +146,9 @@ impl<'a> Resolver<'a> {
                     "Failed to find a valid workgroup shape for constraints {current_constraints:?}"
                 )
             });
-            let mut extend = self.should_extend_kernel(new_inputs.clone(), &inputs);
+            let mut extend = self.should_extend_kernel(&new_inputs, &new_output, &inputs, &outputs);
+            extend &= Self::combined_storage_buffer_count(&all_input_values, &new_inputs)
+                <= max_storage_buffers;
             extend &= new_merged.solve(max_subgroup_size).is_some();
             if extend {
                 current_constraints = new_merged;
@@ -136,9 +164,11 @@ impl<'a> Resolver<'a> {
                         old_best,
                     );
                     pending_operations.clear();
+                    outputs.clear();
                     all_input_values.clear();
                     inputs.clear();
                     kernel.clear();
+                    self.dispatched_kernels_since_submit += 1;
                 }
                 current_constraints = constraint;
             }
@@ -163,7 +193,9 @@ impl<'a> Resolver<'a> {
                     &mut kernel,
                     node,
                     operation,
+                    new_output,
                     &mut inputs,
+                    &mut outputs,
                     &mut all_input_values,
                     &mut pending_operations,
                 );
@@ -185,15 +217,56 @@ impl<'a> Resolver<'a> {
                 &all_input_values,
                 old_best,
             );
+            self.dispatched_kernels_since_submit += 1;
         }
 
+        self.submit_encoder();
+
         let data = graph
-            .get_result(self.target)
+            .get_result(self.targets[0])
+            .expect("Target result not cached");
+        graph.set_cached_result(self.targets[0], data.clone());
+        total_kernels
+    }
+
+    pub(crate) fn run(&mut self, graph: &mut ComputeGraphInner) -> ResolverResult {
+        let total_kernels = self.execute(graph);
+        let data = graph
+            .get_result(self.targets[0])
             .expect("Target result not cached");
         ResolverResult {
             data,
             total_kernels,
         }
+    }
+
+    pub(crate) fn run_many(&mut self, graph: &mut ComputeGraphInner) -> ResolverManyResult {
+        let total_kernels = self.execute(graph);
+        let data = self
+            .targets
+            .iter()
+            .map(|target| graph.get_result(*target).expect("Target result not cached"))
+            .collect();
+        ResolverManyResult {
+            data,
+            total_kernels,
+        }
+    }
+
+    fn submit_encoder(&mut self) {
+        if self.dispatched_kernels_since_submit == 0 {
+            return;
+        }
+        let encoder = std::mem::replace(
+            &mut self.command_encoder,
+            self.device
+                .wgpu_device()
+                .create_command_encoder(&CommandEncoderDescriptor {
+                    label: Some("ComputeGraph Resolver Encoder"),
+                }),
+        );
+        self.device.wgpu_queue().submit(Some(encoder.finish()));
+        self.dispatched_kernels_since_submit = 0;
     }
 
     fn build_execution_graph(
@@ -296,12 +369,7 @@ impl<'a> Resolver<'a> {
                 };
                 Some(Arc::new(nary))
             }
-            ComputeGraphNodeVariant::QMatMul(op) => Some(Arc::new(QMatMulOperation::new(
-                op.input_datatype,
-                &op.in_shape,
-                op.input,
-                op.matrix.clone(),
-            ))),
+            ComputeGraphNodeVariant::QMatMul(op) => Some(Arc::new(op.clone())),
             ComputeGraphNodeVariant::Dequantize(op) => Some(Arc::new(op.clone())),
             ComputeGraphNodeVariant::WhereCond(op) => Some(Arc::new(op.to_nary())),
             ComputeGraphNodeVariant::Tensor(_) => None, // Handled in execution loop
@@ -341,6 +409,7 @@ impl<'a> Resolver<'a> {
                 || self.try_fuse_naries(graph, node_idx)
                 || self.try_fuse_into_reduce(graph, node_idx)
                 || self.try_fuse_into_matmul(graph, node_idx)
+                || self.try_fuse_into_q_matmul(graph, node_idx)
                 || self.try_fuse_into_dequantize(graph, node_idx);
 
             if changed {
@@ -566,6 +635,12 @@ impl<'a> Resolver<'a> {
                     // Skip fusion - would exceed GPU binding limit
                     continue;
                 }
+                if unique_inputs.len() > MAX_FUSED_NARY_INPUTS {
+                    continue;
+                }
+                if Self::nary_expr_node_count(&new_expression) > MAX_FUSED_NARY_EXPR_NODES {
+                    continue;
+                }
 
                 expression = new_expression;
                 all_inputs.extend(input_nary.inputs.iter().copied());
@@ -781,6 +856,24 @@ impl<'a> Resolver<'a> {
                 }
             }
             NaryExpr::DimIndex(_) => {}
+        }
+    }
+
+    fn nary_expr_node_count(expr: &NaryExpr) -> usize {
+        match expr {
+            NaryExpr::Op { children, .. } => {
+                1 + children
+                    .iter()
+                    .map(Self::nary_expr_node_count)
+                    .sum::<usize>()
+            }
+            NaryExpr::IndexedInput { indices, .. } => {
+                1 + indices
+                    .iter()
+                    .map(Self::nary_expr_node_count)
+                    .sum::<usize>()
+            }
+            NaryExpr::DimIndex(_) => 1,
         }
     }
 
@@ -1006,9 +1099,160 @@ impl<'a> Resolver<'a> {
         true
     }
 
-    fn should_extend_kernel(&mut self, _: Vec<MirValue>, _: &[Vec<MirValue>]) -> bool {
-        // TODO: Restore with better testing. This passes all tests in fusor, but breaks rbert and rwhisper
-        false
+    fn try_fuse_into_q_matmul(
+        &mut self,
+        graph: &mut ComputeGraphInner,
+        node_idx: ExecutionNodeIndex,
+    ) -> bool {
+        let node_variant = self.execution_graph[node_idx].variant.clone();
+
+        // Post-op: fuse elementwise after qmatmul
+        if let Some(el_op) = Self::try_get_elementwise(&node_variant) {
+            let input_inner = el_op.value;
+            if !self.check_cached(graph, input_inner)
+                && let Some(input_exec_idx) = self.get_input_node_in_exec_graph(input_inner)
+            {
+                let input_variant = self.execution_graph[input_exec_idx].variant.clone();
+                if let ComputeGraphNodeVariant::QMatMul(q_mat_mul_op) = input_variant {
+                    let mut new_q_mat_mul = q_mat_mul_op.clone();
+                    let mut existing_post = new_q_mat_mul.post_element_wise.functions.clone();
+                    existing_post.extend(el_op.functions.functions.iter().cloned());
+                    new_q_mat_mul.post_element_wise = ElementWiseFunctions::new(
+                        existing_post,
+                        q_mat_mul_op.post_element_wise.input_datatype(),
+                    );
+
+                    self.execution_graph[node_idx].variant =
+                        ComputeGraphNodeVariant::QMatMul(new_q_mat_mul.clone());
+
+                    let input_inner = q_mat_mul_op.input;
+                    if let Some(idx) = self.get_input_node_in_exec_graph(input_inner) {
+                        self.execution_graph.add_edge(idx, node_idx, ());
+                    }
+                    if let Some(edge) = self.execution_graph.find_edge(input_exec_idx, node_idx) {
+                        self.execution_graph.remove_edge(edge);
+                    }
+                    self.add_physical_dependencies(graph, node_idx, &[input_inner]);
+                    self.remove_node_if_dead(input_exec_idx);
+                    return true;
+                }
+            }
+        }
+
+        // Pre-op: fuse elementwise before qmatmul input
+        let ComputeGraphNodeVariant::QMatMul(q_mat_mul_op) = &node_variant else {
+            return false;
+        };
+
+        if self.check_cached(graph, q_mat_mul_op.input) {
+            return false;
+        }
+
+        let Some(input_exec_idx) = self.get_input_node_in_exec_graph(q_mat_mul_op.input) else {
+            return false;
+        };
+        let Some(el_op) = Self::try_get_elementwise(&self.execution_graph[input_exec_idx].variant)
+        else {
+            return false;
+        };
+
+        let mut new_q_mat_mul = q_mat_mul_op.clone();
+        new_q_mat_mul.input = el_op.value;
+        new_q_mat_mul.pre_element_wise = el_op.functions.clone();
+
+        self.execution_graph[node_idx].variant =
+            ComputeGraphNodeVariant::QMatMul(new_q_mat_mul.clone());
+
+        if let Some(edge) = self.execution_graph.find_edge(input_exec_idx, node_idx) {
+            self.execution_graph.remove_edge(edge);
+        }
+        if let Some(new_input_exec_idx) = self.get_input_node_in_exec_graph(new_q_mat_mul.input) {
+            self.execution_graph
+                .add_edge(new_input_exec_idx, node_idx, ());
+        }
+        self.add_physical_dependencies(graph, node_idx, &[new_q_mat_mul.input]);
+        self.remove_node_if_dead(input_exec_idx);
+        true
+    }
+
+    fn should_extend_kernel(
+        &mut self,
+        new_inputs: &[MirValue],
+        new_output: &MirValue,
+        inputs: &[Vec<MirValue>],
+        outputs: &[MirValue],
+    ) -> bool {
+        let new_output_tensor = new_output.as_tensor();
+
+        for input in new_inputs {
+            let Some(input_tensor) = input.as_tensor() else {
+                continue;
+            };
+            for pending_output in outputs {
+                let Some(pending_output_tensor) = pending_output.as_tensor() else {
+                    continue;
+                };
+
+                // A later read of a pending write needs a dispatch boundary;
+                // otherwise workgroups can observe incomplete output data.
+                if std::sync::Arc::ptr_eq(input_tensor.buffer(), pending_output_tensor.buffer()) {
+                    return false;
+                }
+            }
+        }
+
+        let Some(new_output_tensor) = new_output_tensor else {
+            return true;
+        };
+
+        for pending_output in outputs {
+            let Some(pending_output_tensor) = pending_output.as_tensor() else {
+                continue;
+            };
+            // Two writes to the same storage need to be ordered.
+            if std::sync::Arc::ptr_eq(new_output_tensor.buffer(), pending_output_tensor.buffer()) {
+                return false;
+            }
+        }
+
+        for pending in inputs {
+            for input in pending {
+                let Some(input_tensor) = input.as_tensor() else {
+                    continue;
+                };
+
+                // A later write that aliases an earlier read also needs a boundary.
+                if std::sync::Arc::ptr_eq(new_output_tensor.buffer(), input_tensor.buffer()) {
+                    return false;
+                }
+            }
+        }
+
+        true
+    }
+
+    fn combined_storage_buffer_count(
+        all_input_values: &[KernelInputValue],
+        new_inputs: &[MirValue],
+    ) -> usize {
+        let mut combined = all_input_values.to_vec();
+        for input in new_inputs {
+            input.visit_input_values(|value| {
+                if !combined.iter().any(|existing| *existing == value) {
+                    combined.push(value);
+                }
+            });
+        }
+
+        combined
+            .iter()
+            .filter(|value| {
+                matches!(
+                    value,
+                    KernelInputValue::TensorBuffer(_) | KernelInputValue::QBuffer(_)
+                )
+            })
+            .count()
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1019,7 +1263,9 @@ impl<'a> Resolver<'a> {
         kernel: &mut GenericKernel,
         key: NodeIndex,
         operation: Arc<dyn Operation>,
+        result: MirValue,
         inputs: &mut Vec<Vec<MirValue>>,
+        outputs: &mut Vec<MirValue>,
         all_input_values: &mut Vec<KernelInputValue>,
         queued_operations: &mut Vec<(NodeIndex, Arc<dyn Operation>)>,
     ) {
@@ -1033,13 +1279,14 @@ impl<'a> Resolver<'a> {
                 }
             });
         }
-        let result = operation.output(graph, &new_inputs);
         let MirValue::Tensor(resolved) = result else {
             panic!("Kernel input value is not a tensor");
         };
+        let output = resolved.clone();
         // Cache the result
         graph.set_cached_result(key, resolved);
         inputs.push(new_inputs);
+        outputs.push(MirValue::Tensor(output));
         queued_operations.push((key, operation));
     }
 
@@ -1092,12 +1339,24 @@ impl<'a> Resolver<'a> {
         }
         kernel.set_workgroup_size(workgroup_shape);
         let device = graph.device();
+        let profile = std::env::var_os("FUSOR_RESOLVER_PROFILE").is_some();
+        if profile {
+            let names = queued_operations
+                .iter()
+                .map(|(key, operation)| format!("{}#{key:?}", operation.name()))
+                .collect::<Vec<_>>()
+                .join(" | ");
+            eprintln!("resolver kernel start: {names}");
+        }
         kernel.run(
             &device,
             all_input_values,
-            self.command_encoder,
+            &mut self.command_encoder,
             max_dispatch_size,
         );
+        if profile {
+            eprintln!("resolver kernel queued");
+        }
     }
 
     /// Wrap an expression with element-wise functions (each becomes a unary Op node)
@@ -1115,5 +1374,128 @@ impl<'a> Resolver<'a> {
             current_input_type = func.datatype;
         }
         expr
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::{DataTypeEnum, Device, Tensor, TensorData};
+
+    use super::*;
+
+    #[test]
+    fn test_should_extend_kernel_allows_disjoint_tensor_buffers() {
+        let device = Device::test_instance();
+        let mut graph = ComputeGraphInner::new(&device);
+        let mut resolver = Resolver::new_many(&mut graph, &[], &device);
+
+        let pending_tensor = TensorData::new_for_shape(&device, &[4, 4], DataTypeEnum::F32);
+        let new_tensor = TensorData::new_for_shape(&device, &[4, 4], DataTypeEnum::F32);
+        let pending_output = TensorData::new_for_shape(&device, &[4, 4], DataTypeEnum::F32);
+        let new_output = TensorData::new_for_shape(&device, &[4, 4], DataTypeEnum::F32);
+
+        assert!(resolver.should_extend_kernel(
+            &[
+                MirValue::Tensor(new_tensor),
+                MirValue::Tensor(new_output.clone())
+            ],
+            &MirValue::Tensor(new_output),
+            &[vec![
+                MirValue::Tensor(pending_tensor),
+                MirValue::Tensor(pending_output.clone()),
+            ]],
+            &[MirValue::Tensor(pending_output)],
+        ));
+    }
+
+    #[test]
+    fn test_should_extend_kernel_allows_shared_read_only_inputs() {
+        let device = Device::test_instance();
+        let mut graph = ComputeGraphInner::new(&device);
+        let mut resolver = Resolver::new_many(&mut graph, &[], &device);
+
+        let shared_input = TensorData::new_for_shape(&device, &[4, 4], DataTypeEnum::F32);
+        let pending_output = TensorData::new_for_shape(&device, &[4, 4], DataTypeEnum::F32);
+        let new_output = TensorData::new_for_shape(&device, &[4, 4], DataTypeEnum::F32);
+
+        assert!(resolver.should_extend_kernel(
+            &[
+                MirValue::Tensor(shared_input.clone()),
+                MirValue::Tensor(new_output.clone()),
+            ],
+            &MirValue::Tensor(new_output),
+            &[vec![
+                MirValue::Tensor(shared_input),
+                MirValue::Tensor(pending_output.clone()),
+            ]],
+            &[MirValue::Tensor(pending_output)],
+        ));
+    }
+
+    #[test]
+    fn test_should_extend_kernel_blocks_output_to_view_dependency() {
+        let device = Device::test_instance();
+        let mut graph = ComputeGraphInner::new(&device);
+        let mut resolver = Resolver::new_many(&mut graph, &[], &device);
+
+        let pending_input = TensorData::new_for_shape(&device, &[4, 4], DataTypeEnum::F32);
+        let pending_output = TensorData::new_for_shape(&device, &[4, 4], DataTypeEnum::F32);
+        let aliased_view = pending_output.slice(&[1..3, 0..4]);
+        let new_output = TensorData::new_for_shape(&device, &[2, 4], DataTypeEnum::F32);
+
+        assert!(!resolver.should_extend_kernel(
+            &[
+                MirValue::Tensor(aliased_view),
+                MirValue::Tensor(new_output.clone())
+            ],
+            &MirValue::Tensor(new_output),
+            &[vec![
+                MirValue::Tensor(pending_input),
+                MirValue::Tensor(pending_output.clone()),
+            ]],
+            &[MirValue::Tensor(pending_output)],
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_nary_fusion_caps_large_input_accumulator() {
+        let device = Device::test_instance();
+        let tensors = (0..(MAX_FUSED_NARY_INPUTS + 4))
+            .map(|_| Tensor::splat(&device, 1.0f32, [4]))
+            .collect::<Vec<_>>();
+        let mut sum = tensors[0].clone();
+        for tensor in &tensors[1..] {
+            sum = &sum + tensor;
+        }
+
+        let kernels = sum.count_kernels_to_resolve();
+        assert!(
+            kernels > 1,
+            "large n-ary accumulators should be split before they become oversized kernels"
+        );
+
+        let result = sum.as_slice().await.unwrap();
+        for index in 0..4 {
+            assert_eq!(result[[index]], tensors.len() as f32);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_many_independent_slice_assigns_respect_storage_binding_limit() {
+        let device = Device::test_instance();
+        let mut outputs = Vec::new();
+        for index in 0..12 {
+            let input = Tensor::splat(&device, index as f32, [1, 1]);
+            let value = Tensor::splat(&device, (100 + index) as f32, [1, 1]);
+            outputs.push(input.slice_assign([0..1, 0..1], &value));
+        }
+
+        let output_refs = outputs.iter().collect::<Vec<_>>();
+        let resolved = Tensor::materialized_many(&output_refs).await;
+
+        for (index, output) in resolved.iter().enumerate() {
+            let result = output.as_slice().await.unwrap();
+            assert_eq!(result[[0, 0]], (100 + index) as f32);
+        }
     }
 }

@@ -78,6 +78,28 @@ where
     }
 }
 
+impl Tensor<3, f32> {
+    pub fn swiglu_split(&self, intermediate_size: usize) -> Tensor<3, f32> {
+        assert_eq!(
+            self.shape()[2],
+            intermediate_size * 2,
+            "swiglu_split expects the last dimension to be 2 * intermediate_size"
+        );
+        match self {
+            Tensor::Cpu(_) => {
+                let states = self.narrow(2, 0, intermediate_size).to_concrete();
+                let gate = self
+                    .narrow(2, intermediate_size, intermediate_size)
+                    .to_concrete()
+                    .silu()
+                    .to_concrete();
+                states.mul_(&gate).to_concrete()
+            }
+            Tensor::Gpu(t) => Tensor::Gpu(t.swiglu_split(intermediate_size)),
+        }
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::identity_op, clippy::useless_conversion)]
 mod tests {
@@ -117,6 +139,40 @@ mod tests {
                 "Mismatch at index {}",
                 i
             );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_swiglu_split_cpu_and_gpu() {
+        let data = [[
+            [1.0, -2.0, 0.5, -0.25, 0.1, 1.5],
+            [3.0, 0.25, -1.0, 2.0, -0.5, 0.75],
+        ]];
+        let cpu: Tensor<3, f32> = Tensor::Cpu(fusor_cpu::Tensor::from_slice(
+            [1, 2, 6],
+            &[
+                1.0, -2.0, 0.5, -0.25, 0.1, 1.5, 3.0, 0.25, -1.0, 2.0, -0.5, 0.75,
+            ],
+        ));
+        let expected = cpu
+            .narrow(2, 0, 3)
+            .to_concrete()
+            .mul_(&cpu.narrow(2, 3, 3).to_concrete().silu().to_concrete())
+            .to_concrete();
+        let cpu_output = cpu.swiglu_split(3);
+        let expected = expected.as_slice().await.unwrap();
+        let cpu_output = cpu_output.as_slice().await.unwrap();
+        for (actual, expected) in cpu_output.as_slice().iter().zip(expected.as_slice()) {
+            assert!((actual - expected).abs() < 1e-6);
+        }
+
+        let device = crate::Device::new()
+            .await
+            .expect("GPU required for this test");
+        let gpu: Tensor<3, f32> = Tensor::new(&device, &data);
+        let gpu_output = gpu.swiglu_split(3).as_slice().await.unwrap();
+        for (actual, expected) in gpu_output.as_slice().iter().zip(expected.as_slice()) {
+            assert!((actual - expected).abs() < 1e-6);
         }
     }
 

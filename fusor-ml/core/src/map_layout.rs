@@ -33,12 +33,16 @@ impl MapLayoutOperation {
     }
 
     pub fn map_tensor(&self, tensor: &TensorData) -> TensorData {
-        TensorData::new_from_parts(
+        let mut out = TensorData::new_from_parts(
             tensor.device(),
             tensor.buffer().clone(),
             self.map_layout(tensor.layout()),
             tensor.datatype(),
-        )
+        );
+        if tensor.is_zero_splat() {
+            out.mark_zero_splat();
+        }
+        out
     }
 
     pub fn map_layout(&self, layout: &Layout) -> Layout {

@@ -211,12 +211,16 @@ impl Device {
         &self,
         source: impl Into<Cow<'a, str>>,
     ) -> wgpu::ShaderModule {
+        let source: Cow<'a, str> = source.into();
+        if std::env::var("FUSOR_DUMP_SHADERS").ok().as_deref() == Some("1") {
+            eprintln!("=== fusor shader ===\n{source}\n=== end shader ===");
+        }
         // SAFTEY: All kernels don't access memory outside of bounds and don't have unbounded loops
         unsafe {
             self.inner.device.create_shader_module_trusted(
                 wgpu::ShaderModuleDescriptor {
                     label: Some("Fusor ML Shader Module"),
-                    source: wgpu::ShaderSource::Wgsl(source.into()),
+                    source: wgpu::ShaderSource::Wgsl(source),
                 },
                 wgpu::ShaderRuntimeChecks::unchecked(),
             )
@@ -333,9 +337,41 @@ impl Device {
         usage: wgpu::BufferUsages,
         to_initilize: bool,
     ) -> Arc<wgpu::Buffer> {
+        // wgpu's copy / write APIs require the buffer size to respect
+        // `COPY_BUFFER_ALIGNMENT` (4 bytes) and reject zero-sized buffers.
+        // Round up at allocation time so small tensors (e.g. scalar F16 params
+        // or empty-iter uniforms) don't trip validation later.
+        let size = size
+            .max(wgpu::COPY_BUFFER_ALIGNMENT)
+            .next_multiple_of(wgpu::COPY_BUFFER_ALIGNMENT);
+        let disable_cache =
+            std::env::var("FUSOR_DISABLE_BUFFER_CACHE").ok().as_deref() == Some("1");
+        let log_allocations = std::env::var("FUSOR_LOG_BUFFER_ALLOCATIONS")
+            .ok()
+            .as_deref()
+            == Some("1");
+
+        if disable_cache {
+            if log_allocations {
+                eprintln!(
+                    "fusor buffer alloc uncached: {} bytes usage={usage:?}",
+                    size
+                );
+            }
+            return Arc::new(self.wgpu_device().create_buffer(&wgpu::BufferDescriptor {
+                label: Some("Tensor Buffer"),
+                size,
+                usage,
+                mapped_at_creation: false,
+            }));
+        }
+
         // Try to get a buffer from the cache first
         self.get_cached_buffer(size, usage, to_initilize)
             .unwrap_or_else(|| {
+                if log_allocations {
+                    eprintln!("fusor buffer alloc cached: {} bytes usage={usage:?}", size);
+                }
                 let new_buffer = self.wgpu_device().create_buffer(&wgpu::BufferDescriptor {
                     label: Some("Tensor Buffer"),
                     size,
@@ -361,7 +397,18 @@ impl Device {
     /// Get or create a buffer of the specified size.
     pub fn create_buffer_init(&self, data: &[u8], usage: wgpu::BufferUsages) -> Arc<wgpu::Buffer> {
         let buffer = self.create_buffer_inner(data.len() as u64, usage, true);
-        self.wgpu_queue().write_buffer(&buffer, 0, data);
+        let align = wgpu::COPY_BUFFER_ALIGNMENT as usize;
+        let padded_len = data.len().next_multiple_of(align);
+        if padded_len == data.len() {
+            self.wgpu_queue().write_buffer(&buffer, 0, data);
+        } else {
+            // `write_buffer` copy size must respect `COPY_BUFFER_ALIGNMENT`;
+            // the underlying buffer is already padded to that size above.
+            let mut padded = Vec::with_capacity(padded_len);
+            padded.extend_from_slice(data);
+            padded.resize(padded_len, 0);
+            self.wgpu_queue().write_buffer(&buffer, 0, &padded);
+        }
         buffer
     }
 

@@ -105,15 +105,17 @@ where
             *cached = cached.slice_assign(slice, v);
             self.current_seq_len = required_seq_len;
             // Return only the valid portion of the cache, not the full allocated tensor
-            cached
+            let current = cached
                 .narrow(self.concat_dim, 0, self.current_seq_len)
-                .to_concrete()
+                .to_concrete();
+            current
         } else {
             // First append - just store it
-            self.all_data = Some(v.clone());
+            let current = v.to_concrete();
+            self.all_data = Some(current.clone());
             self.current_seq_len = seq_len;
             self.allocated_seq_len = seq_len;
-            v.clone()
+            current
         }
     }
 
@@ -183,5 +185,91 @@ mod tests {
 
         assert_eq!(cache.current_seq_len(), 0);
         assert!(cache.current_data().is_none());
+    }
+
+    #[tokio::test]
+    async fn test_tensor_cache_gpu_matches_cpu_multiple_appends() {
+        let cpu = Device::cpu();
+        let gpu = Device::new().await.expect("GPU required for this test");
+
+        let mut cpu_cache: TensorCache<4, f32> = TensorCache::new(1, 16);
+        let mut gpu_cache: TensorCache<4, f32> = TensorCache::new(1, 16);
+
+        let chunks = [
+            vec![0.1f32, 0.2, 0.3, 0.4],
+            vec![0.5f32, 0.6, 0.7, 0.8],
+            vec![0.9f32, 1.0, 1.1, 1.2],
+        ];
+
+        for chunk in chunks {
+            let cpu_tensor: Tensor<4, f32> = Tensor::from_slice(&cpu, [1, 1, 1, 4], &chunk);
+            let gpu_tensor: Tensor<4, f32> = Tensor::from_slice(&gpu, [1, 1, 1, 4], &chunk);
+
+            let gpu_direct = gpu_tensor.clone().as_slice().await.unwrap();
+            for d in 0..4 {
+                assert!(
+                    (gpu_direct[[0, 0, 0, d]] - chunk[d]).abs() < 1e-6,
+                    "direct gpu mismatch at {d}: expected {}, got {}",
+                    chunk[d],
+                    gpu_direct[[0, 0, 0, d]]
+                );
+            }
+
+            let cpu_result = cpu_cache
+                .append(&cpu, &cpu_tensor)
+                .as_slice()
+                .await
+                .unwrap();
+            let gpu_result = gpu_cache
+                .append(&gpu, &gpu_tensor)
+                .as_slice()
+                .await
+                .unwrap();
+
+            let shape = cpu_result.shape();
+            for b in 0..shape[0] {
+                for s in 0..shape[1] {
+                    for t in 0..shape[2] {
+                        for d in 0..shape[3] {
+                            assert!(
+                                (cpu_result[[b, s, t, d]] - gpu_result[[b, s, t, d]]).abs() < 1e-6,
+                                "mismatch at [{b}, {s}, {t}, {d}]: expected {}, got {}",
+                                cpu_result[[b, s, t, d]],
+                                gpu_result[[b, s, t, d]]
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_tensor_cache_gpu_lazy_trim_without_intermediate_reads() {
+        let gpu = Device::new().await.expect("GPU required for this test");
+        let mut cache: TensorCache<4, f32> = TensorCache::new(1, 3);
+
+        let chunks = [[1.0f32, 2.0], [3.0f32, 4.0], [5.0f32, 6.0], [7.0f32, 8.0]];
+
+        let mut result = None;
+        for chunk in chunks {
+            let tensor: Tensor<4, f32> = Tensor::from_slice(&gpu, [1, 1, 1, 2], &chunk);
+            result = Some(cache.append(&gpu, &tensor));
+        }
+
+        let result = result.unwrap();
+        assert_eq!(result.shape(), [1, 3, 1, 2]);
+
+        let output = result.as_slice().await.unwrap();
+        let expected = [[3.0f32, 4.0], [5.0, 6.0], [7.0, 8.0]];
+        for (seq, values) in expected.iter().enumerate() {
+            for (dim, expected) in values.iter().copied().enumerate() {
+                let actual = output[[0, seq, 0, dim]];
+                assert!(
+                    (actual - expected).abs() < 1e-6,
+                    "mismatch at sequence {seq}, dim {dim}: expected {expected}, got {actual}"
+                );
+            }
+        }
     }
 }

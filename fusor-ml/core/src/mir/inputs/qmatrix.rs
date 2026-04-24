@@ -28,6 +28,10 @@ impl QMatrixInput {
         write: &mut impl std::fmt::Write,
         indexes: impl IntoIterator<Item = String>,
     ) {
+        if self.rank == 0 {
+            write!(write, "0u").unwrap();
+            return;
+        }
         let mut strides = Vec::new();
         let mut product = "1".to_string();
         for i in (0..self.rank).rev() {

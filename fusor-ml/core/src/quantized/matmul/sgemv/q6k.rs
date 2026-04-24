@@ -9,6 +9,7 @@ use crate::{
     util::{maybe_vec_storage_index, maybe_vec_storage_subgroup_add, maybe_vec_storage_type},
 };
 use std::fmt::Write;
+use std::sync::OnceLock;
 
 pub(crate) const Q6K_SGEMV_CHUNK_SIZE: u32 = 2; // This is the size of the chunk each thread will process at a time
 const PRELOAD: bool = false;
@@ -21,6 +22,7 @@ pub(crate) fn q6k_sgemv(
     workgroup_shape: &WorkgroupShape,
     input_a: &TensorInput,
     input_b: &QMatrixInput,
+    bias: Option<&TensorInput>,
     output: &TensorInput,
     n_size: &str,
     m_size: &str,
@@ -30,6 +32,8 @@ pub(crate) fn q6k_sgemv(
     let subgroup_index = kernel.subgroup_index();
     let subgroup_local_index = kernel.subgroup_local_index();
     let elements_per_block = op.elements_per_block();
+    let pre_element_wise_functions = OnceLock::new();
+    let post_element_wise_functions = OnceLock::new();
 
     // Calculate n_workgroups for this kernel type (2 subgroups per workgroup, Q6K_SGEMV_CHUNK_SIZE per subgroup)
     let n_workgroups = format!(
@@ -69,6 +73,13 @@ pub(crate) fn q6k_sgemv(
     writeln!(
         kernel,
         "let row = (2 * workgroup_offset + {subgroup_index}) * {Q6K_SGEMV_CHUNK_SIZE};"
+    )
+    .unwrap();
+
+    // Fast path check: if all rows in this tile are valid, skip per-row bounds checks
+    writeln!(
+        kernel,
+        "let is_full_tile = row + {Q6K_SGEMV_CHUNK_SIZE} <= {n_size};"
     )
     .unwrap();
 
@@ -128,7 +139,10 @@ pub(crate) fn q6k_sgemv(
         )
         .unwrap();
         let load_value = |kernel: &mut GenericKernel, j: &str, offset: u32| {
-            write!(kernel, "f32({input_a}[").unwrap();
+            let pre_element_wise_functions = pre_element_wise_functions
+                .get_or_init(|| op.pre_element_wise.add_functions(kernel));
+            let mut raw_input = String::new();
+            write!(&mut raw_input, "{input_a}[").unwrap();
             let mut indices = Vec::new();
             // Add batch indices first
             for dim in (0..input_a.rank()).rev().skip(2) {
@@ -137,8 +151,12 @@ pub(crate) fn q6k_sgemv(
             // Then add M and K indices
             indices.push("m_idx".to_string());
             indices.push(format!("{j} + vector_offset + {}", offset * 32));
-            input_a.strided_index(kernel, indices);
-            write!(kernel, "])").unwrap();
+            input_a.strided_index(&mut raw_input, indices);
+            write!(&mut raw_input, "]").unwrap();
+            let processed = pre_element_wise_functions
+                .iter()
+                .fold(raw_input, |acc, f| f.call(vec![acc]));
+            write!(kernel, "f32({processed})").unwrap();
         };
         if PRELOAD {
             writeln!(kernel, "for (var j = 0u; j < 4; j += 1u) {{").unwrap();
@@ -150,6 +168,90 @@ pub(crate) fn q6k_sgemv(
             writeln!(kernel, "}}").unwrap();
         }
 
+        // Generate the computation body for one row
+        let generate_row_computation =
+            |kernel: &mut GenericKernel, load_value: &dyn Fn(&mut GenericKernel, &str, u32)| {
+                if Q6K_SGEMV_CHUNK_SIZE > 1 {
+                    writeln!(
+                        kernel,
+                        "let local_block_offset = i + block_offset + offset * k_block_size;"
+                    )
+                    .unwrap();
+                } else {
+                    writeln!(kernel, "let local_block_offset = i + block_offset;").unwrap();
+                }
+                writeln!(kernel, "let low_offset_1 = q_offset_l;").unwrap();
+                writeln!(
+                    kernel,
+                    "let low_bytes_1 = unpack4xU8({input_b}[local_block_offset].data_low_bits[low_offset_1]);"
+                )
+                .unwrap();
+                writeln!(kernel, "let low_offset_2 = q_offset_l + 8;").unwrap();
+                writeln!(kernel, "let low_bytes_2 = unpack4xU8({input_b}[local_block_offset].data_low_bits[low_offset_2]);").unwrap();
+                writeln!(kernel, "let high_offset = q_offset_h;").unwrap();
+                writeln!(
+                    kernel,
+                    "let high_bytes = unpack4xU8({input_b}[local_block_offset].data_high_bits[high_offset]);"
+                )
+                .unwrap();
+                writeln!(kernel, "let scale_offset = scale_index_offset;").unwrap();
+                writeln!(
+                    kernel,
+                    "let scale_chunk_1 = unpack4xI8({input_b}[local_block_offset].scales[scale_offset]);"
+                )
+                .unwrap();
+                writeln!(
+                    kernel,
+                    "let scale_chunk_2 = unpack4xI8({input_b}[local_block_offset].scales[scale_offset + 1]);"
+                )
+                .unwrap();
+                writeln!(
+                    kernel,
+                    "let scales = vec4<f32>(f32(scale_chunk_1[scale_pair_offset]), f32(scale_chunk_1[2 + scale_pair_offset]), f32(scale_chunk_2[scale_pair_offset]), f32(scale_chunk_2[2 + scale_pair_offset]));"
+                )
+                .unwrap();
+
+                writeln!(
+                    kernel,
+                    "let scale = f32({input_b}[local_block_offset].scale);"
+                )
+                .unwrap();
+
+                writeln!(kernel, "var sums = vec4<f32>();").unwrap();
+                writeln!(kernel, "for (var j = 0u; j < 4u; j += 1u) {{").unwrap();
+                {
+                    let first_four_bytes = 0b00001111u8;
+                    let first_two_bytes = 0b00000011u8;
+                    let second_two_bytes = 0b00001100u8;
+                    let third_two_bytes = 0b00110000u8;
+                    let fourth_two_bytes = 0b11000000u8;
+                    let get_value = |kernel: &mut GenericKernel, j: &str, offset: u32| {
+                        if PRELOAD {
+                            write!(kernel, "cached_a_values[{j} + {offset}]").unwrap();
+                        } else {
+                            load_value(kernel, j, offset);
+                        }
+                    };
+                    write!(kernel, "sums[0] += ").unwrap();
+                    get_value(kernel, "j", 0);
+                    writeln!(kernel,"* f32(i32((low_bytes_1[j] & {first_four_bytes}) | ((high_bytes[j] & {first_two_bytes})  << 4)) - 32);").unwrap();
+                    write!(kernel, "sums[1] += ").unwrap();
+                    get_value(kernel, "j", 1);
+                    writeln!(kernel,"* f32(i32((low_bytes_2[j] & {first_four_bytes}) | ((high_bytes[j] & {second_two_bytes}) << 2)) - 32);").unwrap();
+                    write!(kernel, "sums[2] += ").unwrap();
+                    get_value(kernel, "j", 2);
+                    writeln!(kernel,"* f32(i32((low_bytes_1[j]                 >> 4) | ((high_bytes[j] & {third_two_bytes})  << 0)) - 32);").unwrap();
+                    write!(kernel, "sums[3] += ").unwrap();
+                    get_value(kernel, "j", 3);
+                    writeln!(kernel,"* f32(i32((low_bytes_2[j]                 >> 4) | ((high_bytes[j] & {fourth_two_bytes}) >> 2)) - 32);").unwrap();
+                }
+                writeln!(kernel, "}}").unwrap();
+                let indexed = maybe_vec_storage_index(Q6K_SGEMV_CHUNK_SIZE, "sum", "offset");
+                writeln!(kernel, "{indexed} += scale * dot(sums, scales);").unwrap();
+            };
+
+        // Fast path: all rows in tile are valid, no bounds checks needed
+        writeln!(kernel, "if is_full_tile {{").unwrap();
         if Q6K_SGEMV_CHUNK_SIZE > 1 {
             writeln!(
                 kernel,
@@ -158,87 +260,41 @@ pub(crate) fn q6k_sgemv(
             .unwrap();
         }
         {
-            if Q6K_SGEMV_CHUNK_SIZE > 1 {
-                writeln!(
-                    kernel,
-                    "let local_block_offset = i + block_offset + offset * k_block_size;"
-                )
-                .unwrap();
+            let row_index = if Q6K_SGEMV_CHUNK_SIZE > 1 {
+                "row + offset"
             } else {
-                writeln!(kernel, "let local_block_offset = i + block_offset;").unwrap();
-            }
-            writeln!(kernel, "let low_offset_1 = q_offset_l;").unwrap();
-            writeln!(
-                kernel,
-                "let low_bytes_1 = unpack4xU8({input_b}[local_block_offset].data_low_bits[low_offset_1]);"
-            )
-            .unwrap();
-            writeln!(kernel, "let low_offset_2 = q_offset_l + 8;").unwrap();
-            writeln!(kernel, "let low_bytes_2 = unpack4xU8({input_b}[local_block_offset].data_low_bits[low_offset_2]);").unwrap();
-            writeln!(kernel, "let high_offset = q_offset_h;").unwrap();
-            writeln!(
-                kernel,
-                "let high_bytes = unpack4xU8({input_b}[local_block_offset].data_high_bits[high_offset]);"
-            )
-            .unwrap();
-            writeln!(kernel, "let scale_offset = scale_index_offset;").unwrap();
-            writeln!(
-                kernel,
-                "let scale_chunk_1 = unpack4xI8({input_b}[local_block_offset].scales[scale_offset]);"
-            )
-            .unwrap();
-            writeln!(
-                kernel,
-                "let scale_chunk_2 = unpack4xI8({input_b}[local_block_offset].scales[scale_offset + 1]);"
-            )
-            .unwrap();
-            writeln!(
-                kernel,
-                "let scales = vec4<f32>(f32(scale_chunk_1[scale_pair_offset]), f32(scale_chunk_1[2 + scale_pair_offset]), f32(scale_chunk_2[scale_pair_offset]), f32(scale_chunk_2[2 + scale_pair_offset]));"
-            )
-            .unwrap();
-
-            writeln!(
-                kernel,
-                "let scale = f32({input_b}[local_block_offset].scale);"
-            )
-            .unwrap();
-
-            writeln!(kernel, "var sums = vec4<f32>();").unwrap();
-            writeln!(kernel, "for (var j = 0u; j < 4u; j += 1u) {{").unwrap();
-            {
-                let first_four_bytes = 0b00001111u8;
-                let first_two_bytes = 0b00000011u8;
-                let second_two_bytes = 0b00001100u8;
-                let third_two_bytes = 0b00110000u8;
-                let fourth_two_bytes = 0b11000000u8;
-                let get_value = |kernel: &mut GenericKernel, j: &str, offset: u32| {
-                    if PRELOAD {
-                        write!(kernel, "cached_a_values[{j} + {offset}]").unwrap();
-                    } else {
-                        load_value(kernel, j, offset);
-                    }
-                };
-                write!(kernel, "sums[0] += ").unwrap();
-                get_value(kernel, "j", 0);
-                writeln!(kernel,"* f32(i32((low_bytes_1[j] & {first_four_bytes}) | ((high_bytes[j] & {first_two_bytes})  << 4)) - 32);").unwrap();
-                write!(kernel, "sums[1] += ").unwrap();
-                get_value(kernel, "j", 1);
-                writeln!(kernel,"* f32(i32((low_bytes_2[j] & {first_four_bytes}) | ((high_bytes[j] & {second_two_bytes}) << 2)) - 32);").unwrap();
-                write!(kernel, "sums[2] += ").unwrap();
-                get_value(kernel, "j", 2);
-                writeln!(kernel,"* f32(i32((low_bytes_1[j]                 >> 4) | ((high_bytes[j] & {third_two_bytes})  << 0)) - 32);").unwrap();
-                write!(kernel, "sums[3] += ").unwrap();
-                get_value(kernel, "j", 3);
-                writeln!(kernel,"* f32(i32((low_bytes_2[j]                 >> 4) | ((high_bytes[j] & {fourth_two_bytes}) >> 2)) - 32);").unwrap();
-            }
-            writeln!(kernel, "}}").unwrap();
-            let indexed = maybe_vec_storage_index(Q6K_SGEMV_CHUNK_SIZE, "sum", "offset");
-            writeln!(kernel, "{indexed} += scale * dot(sums, scales);").unwrap();
+                "row"
+            };
+            writeln!(kernel, "let row_index = {row_index};").unwrap();
+            generate_row_computation(kernel, &load_value);
         }
         if Q6K_SGEMV_CHUNK_SIZE > 1 {
             writeln!(kernel, "}}").unwrap();
         }
+        writeln!(kernel, "}} else {{").unwrap();
+        // Slow path: check bounds for each row
+        if Q6K_SGEMV_CHUNK_SIZE > 1 {
+            writeln!(
+                kernel,
+                "for (var offset = 0u; offset < {Q6K_SGEMV_CHUNK_SIZE}; offset += 1u) {{"
+            )
+            .unwrap();
+        }
+        {
+            let row_index = if Q6K_SGEMV_CHUNK_SIZE > 1 {
+                "row + offset"
+            } else {
+                "row"
+            };
+            writeln!(kernel, "let row_index = {row_index};").unwrap();
+            writeln!(kernel, "if row_index < {n_size} {{").unwrap();
+            generate_row_computation(kernel, &load_value);
+            writeln!(kernel, "}}").unwrap();
+        }
+        if Q6K_SGEMV_CHUNK_SIZE > 1 {
+            writeln!(kernel, "}}").unwrap();
+        }
+        writeln!(kernel, "}}").unwrap();
     }
     writeln!(kernel, "}}").unwrap();
 
@@ -253,6 +309,30 @@ pub(crate) fn q6k_sgemv(
     // If this is not the first simd thread in the workgroup, we can return early
     writeln!(kernel, "if {subgroup_local_index} != 0u {{ return; }}").unwrap();
 
+    // Initialize post element-wise functions once before the loop
+    let post_fns =
+        post_element_wise_functions.get_or_init(|| op.post_element_wise.add_functions(kernel));
+
+    // Generate the output body for one row
+    let generate_row_output = |kernel: &mut GenericKernel| {
+        write!(kernel, "{output}[").unwrap();
+        let mut output_indices = Vec::new();
+        // Add batch indices first
+        for dim in (0..output.rank()).rev().skip(2) {
+            output_indices.push(format!("batch_idx_{dim}"));
+        }
+        // Then add M and N indices
+        output_indices.push("m_idx".to_string());
+        output_indices.push("row_index".to_string());
+        output.strided_index(kernel, output_indices);
+        let indexed = maybe_vec_storage_index(Q6K_SGEMV_CHUNK_SIZE, "sum", "offset");
+        let result =
+            op.apply_bias_and_post(bias, "row_index", format!("{dtype}({indexed})"), post_fns);
+        writeln!(kernel, "] = {result};").unwrap();
+    };
+
+    // Fast path: all rows in tile are valid, no bounds checks needed
+    writeln!(kernel, "if is_full_tile {{").unwrap();
     if Q6K_SGEMV_CHUNK_SIZE > 1 {
         writeln!(
             kernel,
@@ -261,26 +341,39 @@ pub(crate) fn q6k_sgemv(
         .unwrap();
     }
     {
-        // Write the output to the output tensor if this is the first thread in the workgroup
-        write!(kernel, "{output}[").unwrap();
         let index = if Q6K_SGEMV_CHUNK_SIZE > 1 {
             "row + offset".to_string()
         } else {
             "row".to_string()
         };
-        let mut output_indices = Vec::new();
-        // Add batch indices first
-        for dim in (0..output.rank()).rev().skip(2) {
-            output_indices.push(format!("batch_idx_{dim}"));
-        }
-        // Then add M and N indices
-        output_indices.push("m_idx".to_string());
-        output_indices.push(index);
-        output.strided_index(kernel, output_indices);
-        let indexed = maybe_vec_storage_index(Q6K_SGEMV_CHUNK_SIZE, "sum", "offset");
-        writeln!(kernel, "] = {dtype}({indexed});").unwrap();
+        writeln!(kernel, "let row_index = {index};").unwrap();
+        generate_row_output(kernel);
     }
     if Q6K_SGEMV_CHUNK_SIZE > 1 {
         writeln!(kernel, "}}").unwrap();
     }
+    writeln!(kernel, "}} else {{").unwrap();
+    // Slow path: check bounds for each row
+    if Q6K_SGEMV_CHUNK_SIZE > 1 {
+        writeln!(
+            kernel,
+            "for (var offset = 0u; offset < {Q6K_SGEMV_CHUNK_SIZE}; offset += 1u) {{"
+        )
+        .unwrap();
+    }
+    {
+        let index = if Q6K_SGEMV_CHUNK_SIZE > 1 {
+            "row + offset".to_string()
+        } else {
+            "row".to_string()
+        };
+        writeln!(kernel, "let row_index = {index};").unwrap();
+        writeln!(kernel, "if row_index < {n_size} {{").unwrap();
+        generate_row_output(kernel);
+        writeln!(kernel, "}}").unwrap();
+    }
+    if Q6K_SGEMV_CHUNK_SIZE > 1 {
+        writeln!(kernel, "}}").unwrap();
+    }
+    writeln!(kernel, "}}").unwrap();
 }

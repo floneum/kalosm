@@ -321,6 +321,87 @@ async fn test_matrix_vector_mul_non_contiguous() {
 
 #[cfg(test)]
 #[tokio::test]
+async fn test_large_skinny_k_matmul_matches_cpu_reference() {
+    let device = Device::test_instance();
+    let m = 100;
+    let k = 3200;
+    let n = 320;
+
+    let lhs_data: Vec<f32> = (0..m * k)
+        .map(|i| ((i % 97) as f32 - 48.0) * 0.001)
+        .collect();
+    let rhs_data: Vec<f32> = (0..k * n)
+        .map(|i| ((i % 89) as f32 - 44.0) * 0.0015)
+        .collect();
+    let lhs_nested: Vec<Vec<f32>> = lhs_data.chunks_exact(k).map(|row| row.to_vec()).collect();
+    let rhs_nested: Vec<Vec<f32>> = rhs_data.chunks_exact(n).map(|row| row.to_vec()).collect();
+    let lhs = Tensor::new(&device, &lhs_nested);
+    let rhs = Tensor::new(&device, &rhs_nested);
+    let result = lhs.mat_mul(&rhs).as_slice().await.unwrap();
+
+    let check_positions = [
+        (0, 0),
+        (0, n - 1),
+        (m / 2, n / 2),
+        (m - 1, 0),
+        (m - 1, n - 1),
+    ];
+
+    for (row, col) in check_positions {
+        let expected = (0..k)
+            .map(|idx| lhs_data[row * k + idx] * rhs_data[idx * n + col])
+            .sum::<f32>();
+        let actual = result[[row, col]];
+        assert!(
+            (actual - expected).abs() < 1e-3,
+            "Mismatch at [{row}, {col}]: actual={actual}, expected={expected}"
+        );
+    }
+}
+
+#[cfg(test)]
+#[tokio::test]
+async fn test_moonshine_attention_projection_matmul_matches_cpu_reference() {
+    let device = Device::test_instance();
+    let batch = 1;
+    let m = 100;
+    let k = 320;
+    let n = 320;
+
+    let lhs_data: Vec<f32> = (0..batch * m * k)
+        .map(|i| ((i % 97) as f32 - 48.0) * 0.002)
+        .collect();
+    let rhs_data: Vec<f32> = (0..batch * k * n)
+        .map(|i| ((i % 89) as f32 - 44.0) * 0.0015)
+        .collect();
+    let lhs_nested: Vec<Vec<Vec<f32>>> = lhs_data
+        .chunks_exact(m * k)
+        .map(|batch| batch.chunks_exact(k).map(|row| row.to_vec()).collect())
+        .collect();
+    let rhs_nested: Vec<Vec<Vec<f32>>> = rhs_data
+        .chunks_exact(k * n)
+        .map(|batch| batch.chunks_exact(n).map(|row| row.to_vec()).collect())
+        .collect();
+    let lhs = Tensor::new(&device, &lhs_nested);
+    let rhs = Tensor::new(&device, &rhs_nested);
+    let result = lhs.mat_mul(&rhs).as_slice().await.unwrap();
+
+    for row in [0, m / 2, m - 1] {
+        for col in [0, n / 2, n - 1] {
+            let expected = (0..k)
+                .map(|idx| lhs_data[row * k + idx] * rhs_data[idx * n + col])
+                .sum::<f32>();
+            let actual = result[[0, row, col]];
+            assert!(
+                (actual - expected).abs() < 1e-3,
+                "Mismatch at [0, {row}, {col}]: actual={actual}, expected={expected}"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+#[tokio::test]
 async fn test_multi_row_matrix_vector_mul() {
     let device = Device::test_instance();
 
@@ -493,6 +574,129 @@ async fn test_transposed_matmul() {
             }
         }
     }
+}
+
+#[cfg(test)]
+#[tokio::test]
+async fn test_attention_chain_single_resolution_matches_staged() {
+    let device = Device::test_instance();
+    let batch = 1;
+    let seq_len = 20;
+    let heads = 8;
+    let head_dim = 40;
+    let hidden = heads * head_dim;
+
+    fn tensor3(
+        device: &Device,
+        batch: usize,
+        seq_len: usize,
+        hidden: usize,
+        seed: usize,
+    ) -> Tensor<3, f32> {
+        let data = (0..batch)
+            .map(|batch_idx| {
+                (0..seq_len)
+                    .map(|seq_idx| {
+                        (0..hidden)
+                            .map(|hidden_idx| {
+                                let value =
+                                    (batch_idx * 131 + seq_idx * 17 + hidden_idx * 7 + seed) % 97;
+                                (value as f32 - 48.0) * 0.01
+                            })
+                            .collect::<Vec<_>>()
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        Tensor::new(device, &data)
+    }
+
+    fn tensor4_mask(device: &Device, batch: usize, heads: usize, seq_len: usize) -> Tensor<4, f32> {
+        let data = (0..batch)
+            .map(|_| {
+                (0..heads)
+                    .map(|_| {
+                        (0..seq_len)
+                            .map(|q_idx| {
+                                (0..seq_len)
+                                    .map(|k_idx| if k_idx <= q_idx { 0.0 } else { -1.0e9 })
+                                    .collect::<Vec<_>>()
+                            })
+                            .collect::<Vec<_>>()
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        Tensor::new(device, &data)
+    }
+
+    fn attention(
+        q: &Tensor<3, f32>,
+        k: &Tensor<3, f32>,
+        v: &Tensor<3, f32>,
+        mask: &Tensor<4, f32>,
+        heads: usize,
+        head_dim: usize,
+    ) -> Tensor<3, f32> {
+        let [batch, seq_len, _] = *q.shape();
+        let q = q.reshape([batch, seq_len, heads, head_dim]).transpose(1, 2);
+        let k = k.reshape([batch, seq_len, heads, head_dim]).transpose(1, 2);
+        let v = v.reshape([batch, seq_len, heads, head_dim]).transpose(1, 2);
+        let k_t = k.transpose(2, 3);
+        let scores = q.mat_mul(&k_t) * (head_dim as f32).powf(-0.5);
+        let scores = scores.add_(mask);
+        let weights = scores.softmax_last_dim::<3>();
+        weights
+            .mat_mul(&v)
+            .transpose(1, 2)
+            .reshape([batch, seq_len, heads * head_dim])
+    }
+
+    let q = tensor3(&device, batch, seq_len, hidden, 3);
+    let k = tensor3(&device, batch, seq_len, hidden, 11);
+    let v = tensor3(&device, batch, seq_len, hidden, 19);
+    let mask = tensor4_mask(&device, batch, heads, seq_len);
+
+    let single_pass = attention(&q, &k, &v, &mask, heads, head_dim);
+    let single_pass = single_pass.as_slice().await.unwrap();
+
+    let q_heads = q.reshape([batch, seq_len, heads, head_dim]).transpose(1, 2);
+    drop(q_heads.as_slice().await.unwrap());
+    let k_heads = k.reshape([batch, seq_len, heads, head_dim]).transpose(1, 2);
+    drop(k_heads.as_slice().await.unwrap());
+    let v_heads = v.reshape([batch, seq_len, heads, head_dim]).transpose(1, 2);
+    drop(v_heads.as_slice().await.unwrap());
+    let k_t = k_heads.transpose(2, 3);
+    drop(k_t.as_slice().await.unwrap());
+    let scores = q_heads.mat_mul(&k_t) * (head_dim as f32).powf(-0.5);
+    drop(scores.as_slice().await.unwrap());
+    let scores = scores.add_(&mask);
+    drop(scores.as_slice().await.unwrap());
+    let weights = scores.softmax_last_dim::<3>();
+    drop(weights.as_slice().await.unwrap());
+    let staged = weights
+        .mat_mul(&v_heads)
+        .transpose(1, 2)
+        .reshape([batch, seq_len, hidden]);
+    let staged = staged.as_slice().await.unwrap();
+
+    assert_eq!(single_pass.shape(), staged.shape());
+    let mut max_diff = 0.0f32;
+    for batch_idx in 0..batch {
+        for seq_idx in 0..seq_len {
+            for hidden_idx in 0..hidden {
+                max_diff = max_diff.max(
+                    (single_pass[[batch_idx, seq_idx, hidden_idx]]
+                        - staged[[batch_idx, seq_idx, hidden_idx]])
+                    .abs(),
+                );
+            }
+        }
+    }
+    assert!(
+        max_diff < 1e-4,
+        "single-pass attention chain diverged from staged execution: max_diff={max_diff}"
+    );
 }
 
 #[cfg(test)]

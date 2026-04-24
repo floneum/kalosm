@@ -1,6 +1,7 @@
 use crate::{
     DataTypeEnum,
     mir::{
+        function::Function,
         inputs::{QMatrixInput, TensorInput},
         kernel::GenericKernel,
         workgroup_shape::WorkgroupShape,
@@ -10,6 +11,7 @@ use crate::{
     util::{maybe_vec_storage_index, maybe_vec_storage_subgroup_add, maybe_vec_storage_type},
 };
 use std::fmt::Write;
+use std::sync::OnceLock;
 
 pub(crate) const Q4K_SGEMV_CHUNK_SIZE: u32 = 4; // This is the size of the chunk each thread will process at a time
 const SUBGROUP_COUNT: u32 = 2;
@@ -17,6 +19,165 @@ const SUBGROUP_COUNT: u32 = 2;
 const MASK1: u32 = 0b0011111100111111;
 const MASK2: u32 = 0b0000111100001111;
 const MASK3: u32 = 0b1100000011000000;
+
+/// Generate WGSL for computing one row's contribution in the Q4K inner loop
+fn generate_row_computation(kernel: &mut GenericKernel, offset: u32, input_b: &QMatrixInput) {
+    // Fetch and unpack the two sets of values from the cache
+    writeln!(kernel, "let first_values_offset = data_offset;").unwrap();
+    writeln!(kernel, "let second_values_offset = data_offset + 16u;").unwrap();
+
+    // Keep track of the sum of each chunk
+    writeln!(kernel, "var first_sums = vec4<f32>();").unwrap();
+    writeln!(kernel, "var second_sums = vec4<f32>();").unwrap();
+
+    // Perform the dot product of the values and scales
+    for j in 0..2 {
+        for (sum, cache, values) in [
+            ("first_sums", "cached_a_low_values", "first_values_offset"),
+            (
+                "second_sums",
+                "cached_a_high_values",
+                "second_values_offset",
+            ),
+        ] {
+            writeln!(
+                kernel,
+                "let value_u32_{values}_{j} = {input_b}[local_block_offset].data[{values} + {j}];"
+            )
+            .unwrap();
+            writeln!(
+                kernel,
+                "let first_four_values_{values}_{j} = vec4<f32>({cache}[{j}*4 + 0], {cache}[{j}*4 + 1], {cache}[{j}*4 + 2], {cache}[{j}*4 + 3]);"
+            )
+            .unwrap();
+            writeln!(
+                kernel,
+                "let second_four_values_{values}_{j} = vec4<f32>({cache}[{j}*4 + 8], {cache}[{j}*4 + 9], {cache}[{j}*4 + 10], {cache}[{j}*4 + 11]);"
+            )
+            .unwrap();
+            writeln!(
+                kernel,
+                "{sum} += vec4<f32>(first_four_values_{values}_{j}.x * f32(value_u32_{values}_{j} & 0x000F), first_four_values_{values}_{j}.y * f32(value_u32_{values}_{j} & 0x0F00), second_four_values_{values}_{j}.x * f32(value_u32_{values}_{j} & 0x00F0), second_four_values_{values}_{j}.y * f32(value_u32_{values}_{j} & 0xF000));"
+            )
+            .unwrap();
+            let shift_right_16 = shift_right_scale(16);
+            writeln!(
+                kernel,
+                "{sum} += vec4<f32>(first_four_values_{values}_{j}.z * f32(value_u32_{values}_{j} & 0x000F0000), first_four_values_{values}_{j}.w * f32(value_u32_{values}_{j} & 0x0F000000), second_four_values_{values}_{j}.z * f32(value_u32_{values}_{j} & 0x00F00000), second_four_values_{values}_{j}.w * f32(value_u32_{values}_{j} & 0xF0000000)) * f32({shift_right_16});"
+            )
+            .unwrap();
+        }
+    }
+
+    // Load the block scale and min
+    writeln!(
+        kernel,
+        "let block_scale = f32({input_b}[local_block_offset].scale);"
+    )
+    .unwrap();
+    writeln!(
+        kernel,
+        "let block_min = f32({input_b}[local_block_offset].min);"
+    )
+    .unwrap();
+    // Load 8 scales into a cache
+    writeln!(
+        kernel,
+        "let first_32_scale_bits = {input_b}[local_block_offset].scales[0] >> (16 * scale_offset);"
+    )
+    .unwrap();
+    writeln!(
+        kernel,
+        "let second_32_scale_bits = {input_b}[local_block_offset].scales[1] >> (16 * scale_offset);"
+    )
+    .unwrap();
+    writeln!(
+        kernel,
+        "let third_32_scale_bits = {input_b}[local_block_offset].scales[2] >> (16 * scale_offset);"
+    )
+    .unwrap();
+    // Extract the scales from the bits into cached_scales
+    writeln!(
+        kernel,
+        "let first_two_scales = first_32_scale_bits & {MASK1};"
+    )
+    .unwrap();
+    writeln!(
+        kernel,
+        "let second_two_scales = second_32_scale_bits & {MASK1};"
+    )
+    .unwrap();
+
+    writeln!(kernel, "let third_two_scales = ((third_32_scale_bits >> 0) & {MASK2}) | ((first_32_scale_bits & {MASK3}) >> 2);").unwrap();
+    writeln!(kernel, "let fourth_two_scales = ((third_32_scale_bits >> 4) & {MASK2}) | ((second_32_scale_bits & {MASK3}) >> 2);").unwrap();
+
+    writeln!(
+        kernel,
+        "let odd_scales_unpacked = vec4<f32>(unpack4xU8(first_two_scales | (third_two_scales << 16)));"
+    )
+    .unwrap();
+    writeln!(
+        kernel,
+        "let even_scales_unpacked = vec4<f32>(unpack4xU8(second_two_scales | (fourth_two_scales << 16)));"
+    )
+    .unwrap();
+
+    // Add the sums to the total sum
+    let indexed_sum = maybe_vec_storage_index(Q4K_SGEMV_CHUNK_SIZE, "sum", offset);
+    let shift_right_8 = shift_right_scale(8);
+    let shift_right_4 = shift_right_scale(4);
+    writeln!(
+        kernel,
+        "let small_shift_sums = vec4<f32>(first_sums[0], first_sums[2], second_sums[0], second_sums[2]);"
+    )
+    .unwrap();
+    writeln!(
+        kernel,
+        "let large_shift_sums = vec4<f32>(first_sums[1], first_sums[3], second_sums[1], second_sums[3]);"
+    )
+    .unwrap();
+    writeln!(
+        kernel,
+        "let shift_4 = vec4<f32>(1.0, {shift_right_4}, 1.0, {shift_right_4});"
+    )
+    .unwrap();
+    writeln!(
+        kernel,
+        r#"{indexed_sum} += block_scale * dot((small_shift_sums + f32({shift_right_8}) * large_shift_sums) * odd_scales_unpacked, shift_4) -
+                                                    block_min * dot(vector_sum, even_scales_unpacked);"#
+    )
+    .unwrap();
+    // Move forward the block offset by one row
+    writeln!(kernel, "local_block_offset += k_block_size;").unwrap();
+}
+
+/// Generate WGSL for writing one row's output
+fn generate_row_output(
+    op: &QMatMulOperation,
+    kernel: &mut GenericKernel,
+    offset: u32,
+    dtype: DataTypeEnum,
+    bias: Option<&TensorInput>,
+    output: &TensorInput,
+    post_element_wise_functions: &[Function],
+) {
+    write!(kernel, "{output}[").unwrap();
+    let mut output_indices = Vec::new();
+    for dim in (0..output.rank()).rev().skip(2) {
+        output_indices.push(format!("batch_idx_{dim}"));
+    }
+    output_indices.push("m_idx".to_string());
+    output_indices.push("row_index".to_string());
+    output.strided_index(kernel, output_indices);
+    let indexed = maybe_vec_storage_index(Q4K_SGEMV_CHUNK_SIZE, "sum", offset);
+    let result = op.apply_bias_and_post(
+        bias,
+        "row_index",
+        format!("{dtype}({indexed})"),
+        post_element_wise_functions,
+    );
+    writeln!(kernel, "] = {result};").unwrap();
+}
 
 // https://github.com/ggml-org/llama.cpp/blob/6efcd65945a98cf6883cdd9de4c8ccd8c79d219a/ggml/src/ggml-metal/ggml-metal.metal#L5311
 #[allow(clippy::too_many_arguments)]
@@ -26,6 +187,7 @@ pub(crate) fn q4k_sgemv(
     workgroup_shape: &WorkgroupShape,
     input_a: &TensorInput,
     input_b: &QMatrixInput,
+    bias: Option<&TensorInput>,
     output: &TensorInput,
     n_size: &str,
     m_size: &str,
@@ -35,6 +197,8 @@ pub(crate) fn q4k_sgemv(
     let subgroup_index = kernel.subgroup_index();
     let subgroup_local_index = kernel.subgroup_local_index();
     let elements_per_block = op.elements_per_block();
+    let pre_element_wise_functions = OnceLock::new();
+    let post_element_wise_functions = OnceLock::new();
 
     // Calculate n_workgroups for this kernel type (SUBGROUP_COUNT subgroups per workgroup, Q4K_SGEMV_CHUNK_SIZE per subgroup)
     let chunk_size = Q4K_SGEMV_CHUNK_SIZE * SUBGROUP_COUNT;
@@ -74,6 +238,13 @@ pub(crate) fn q4k_sgemv(
     )
     .unwrap();
 
+    // Fast path check: if all rows in this tile are valid, skip per-row bounds checks
+    writeln!(
+        kernel,
+        "let is_full_tile = row + {Q4K_SGEMV_CHUNK_SIZE} <= {n_size};"
+    )
+    .unwrap();
+
     writeln!(kernel, "let thread_id = {subgroup_local_index} >> 3;").unwrap();
     writeln!(kernel, "let thread_local_id = {subgroup_local_index} & 7;").unwrap();
     writeln!(kernel, "let half_subgroup_id = thread_local_id >> 2;").unwrap();
@@ -103,7 +274,10 @@ pub(crate) fn q4k_sgemv(
         for j in 0..8 {
             // Load all 4 values using strided indexing
             for (idx, offset) in [(0, 0), (1, 32), (2, 128), (3, 160)] {
-                write!(kernel, "let a_val_{j}_{idx} = {input_a}[").unwrap();
+                let pre_element_wise_functions = pre_element_wise_functions
+                    .get_or_init(|| op.pre_element_wise.add_functions(kernel));
+                let mut raw_input = String::new();
+                write!(&mut raw_input, "{input_a}[").unwrap();
                 let mut indices = Vec::new();
                 // Add batch indices first
                 for dim in (0..input_a.rank()).rev().skip(2) {
@@ -112,8 +286,12 @@ pub(crate) fn q4k_sgemv(
                 // Then add M and K indices
                 indices.push("m_idx".to_string());
                 indices.push(format!("vector_offset + {j} + {offset}"));
-                input_a.strided_index(kernel, indices);
-                writeln!(kernel, "];").unwrap();
+                input_a.strided_index(&mut raw_input, indices);
+                write!(&mut raw_input, "]").unwrap();
+                let processed = pre_element_wise_functions
+                    .iter()
+                    .fold(raw_input, |acc, f| f.call(vec![acc]));
+                writeln!(kernel, "let a_val_{j}_{idx} = f32({processed});").unwrap();
             }
 
             writeln!(
@@ -138,146 +316,24 @@ pub(crate) fn q4k_sgemv(
 
         writeln!(kernel, "var local_block_offset = block_offset + i;").unwrap();
 
+        // Fast path: all rows in tile are valid, no bounds checks needed
+        writeln!(kernel, "if is_full_tile {{").unwrap();
         for offset in 0..Q4K_SGEMV_CHUNK_SIZE {
             writeln!(kernel, "{{").unwrap();
-            // Fetch and unpack the two sets of values from the cache
-            writeln!(kernel, "let first_values_offset = data_offset;").unwrap();
-            writeln!(kernel, "let second_values_offset = data_offset + 16u;").unwrap();
-
-            // Keep track of the sum of each chunk
-            writeln!(kernel, "var first_sums = vec4<f32>();").unwrap();
-            writeln!(kernel, "var second_sums = vec4<f32>();").unwrap();
-
-            // Perform the dot product of the values and scales
-            for j in 0..2 {
-                for (sum, cache, values) in [
-                    ("first_sums", "cached_a_low_values", "first_values_offset"),
-                    (
-                        "second_sums",
-                        "cached_a_high_values",
-                        "second_values_offset",
-                    ),
-                ] {
-                    // Note: We add the values with a mask **without** shifting them
-                    // this means the sums in the first_sums and second_sums
-                    // will be scaled by different values. We correct this below
-                    // by multiplying by the floating point values that correspond to the
-                    // bit shifts.
-                    writeln!(
-                        kernel,
-                        "let value_u32_{values}_{j} = {input_b}[local_block_offset].data[{values} + {j}];"
-                    )
-                    .unwrap();
-                    writeln!(
-                        kernel,
-                        "let first_four_values_{values}_{j} = vec4<f32>({cache}[{j}*4 + 0], {cache}[{j}*4 + 1], {cache}[{j}*4 + 2], {cache}[{j}*4 + 3]);"
-                    )
-                    .unwrap();
-                    writeln!(
-                        kernel,
-                        "let second_four_values_{values}_{j} = vec4<f32>({cache}[{j}*4 + 8], {cache}[{j}*4 + 9], {cache}[{j}*4 + 10], {cache}[{j}*4 + 11]);"
-                    )
-                    .unwrap();
-                    writeln!(
-                        kernel,
-                        "{sum} += vec4<f32>(first_four_values_{values}_{j}.x * f32(value_u32_{values}_{j} & 0x000F), first_four_values_{values}_{j}.y * f32(value_u32_{values}_{j} & 0x0F00), second_four_values_{values}_{j}.x * f32(value_u32_{values}_{j} & 0x00F0), second_four_values_{values}_{j}.y * f32(value_u32_{values}_{j} & 0xF000));"
-                    )
-                    .unwrap();
-                    let shift_right_16 = shift_right_scale(16);
-                    writeln!(
-                        kernel,
-                        "{sum} += vec4<f32>(first_four_values_{values}_{j}.z * f32(value_u32_{values}_{j} & 0x000F0000), first_four_values_{values}_{j}.w * f32(value_u32_{values}_{j} & 0x0F000000), second_four_values_{values}_{j}.z * f32(value_u32_{values}_{j} & 0x00F00000), second_four_values_{values}_{j}.w * f32(value_u32_{values}_{j} & 0xF0000000)) * f32({shift_right_16});"
-                    )
-                    .unwrap();
-                }
-            }
-
-            // Load the block scale and min
-            writeln!(
-                kernel,
-                "let block_scale = f32({input_b}[local_block_offset].scale);"
-            )
-            .unwrap();
-            writeln!(
-                kernel,
-                "let block_min = f32({input_b}[local_block_offset].min);"
-            )
-            .unwrap();
-            // Load 8 scales into a cache
-            writeln!(
-                kernel,
-                "let first_32_scale_bits = {input_b}[local_block_offset].scales[0] >> (16 * scale_offset);"
-            )
-            .unwrap();
-            writeln!(
-                kernel,
-                "let second_32_scale_bits = {input_b}[local_block_offset].scales[1] >> (16 * scale_offset);"
-            )
-            .unwrap();
-            writeln!(
-                kernel,
-                "let third_32_scale_bits = {input_b}[local_block_offset].scales[2] >> (16 * scale_offset);"
-            )
-            .unwrap();
-            // Extract the scales from the bits into cached_scales
-            writeln!(
-                kernel,
-                "let first_two_scales = first_32_scale_bits & {MASK1};"
-            )
-            .unwrap();
-            writeln!(
-                kernel,
-                "let second_two_scales = second_32_scale_bits & {MASK1};"
-            )
-            .unwrap();
-
-            writeln!(kernel, "let third_two_scales = ((third_32_scale_bits >> 0) & {MASK2}) | ((first_32_scale_bits & {MASK3}) >> 2);").unwrap();
-            writeln!(kernel, "let fourth_two_scales = ((third_32_scale_bits >> 4) & {MASK2}) | ((second_32_scale_bits & {MASK3}) >> 2);").unwrap();
-
-            writeln!(
-                kernel,
-                "let odd_scales_unpacked = vec4<f32>(unpack4xU8(first_two_scales | (third_two_scales << 16)));"
-            )
-            .unwrap();
-            writeln!(
-                kernel,
-                "let even_scales_unpacked = vec4<f32>(unpack4xU8(second_two_scales | (fourth_two_scales << 16)));"
-            )
-            .unwrap();
-
-            // Add the sums to the total sum
-            let indexed_sum = maybe_vec_storage_index(Q4K_SGEMV_CHUNK_SIZE, "sum", offset);
-            // *_sums[0] needs to be shifted by 0 bits
-            // *_sums[1] needs to be shifted by 8 bits
-            // *_sums[2] needs to be shifted by 4 bits
-            // *_sums[3] needs to be shifted by 12 bits
-            let shift_right_8 = shift_right_scale(8);
-            let shift_right_4 = shift_right_scale(4);
-            writeln!(
-                kernel,
-                "let small_shift_sums = vec4<f32>(first_sums[0], first_sums[2], second_sums[0], second_sums[2]);"
-            )
-            .unwrap();
-            writeln!(
-                kernel,
-                "let large_shift_sums = vec4<f32>(first_sums[1], first_sums[3], second_sums[1], second_sums[3]);"
-            )
-            .unwrap();
-            writeln!(
-                kernel,
-                "let shift_4 = vec4<f32>(1.0, {shift_right_4}, 1.0, {shift_right_4});"
-            )
-            .unwrap();
-            writeln!(
-                kernel,
-                r#"{indexed_sum} += block_scale * dot((small_shift_sums + f32({shift_right_8}) * large_shift_sums) * odd_scales_unpacked, shift_4) -
-                                                            block_min * dot(vector_sum, even_scales_unpacked);"#
-            )
-            .unwrap();
-            // Move forward the block offset by one row
-            writeln!(kernel, "local_block_offset += k_block_size;").unwrap();
+            generate_row_computation(kernel, offset, input_b);
             writeln!(kernel, "}}").unwrap();
         }
+        writeln!(kernel, "}} else {{").unwrap();
+        // Slow path: check bounds for each row
+        for offset in 0..Q4K_SGEMV_CHUNK_SIZE {
+            writeln!(kernel, "{{").unwrap();
+            writeln!(kernel, "let row_index = row + {offset};").unwrap();
+            writeln!(kernel, "if row_index < {n_size} {{").unwrap();
+            generate_row_computation(kernel, offset, input_b);
+            writeln!(kernel, "}}").unwrap();
+            writeln!(kernel, "}}").unwrap();
+        }
+        writeln!(kernel, "}}").unwrap();
 
         // move forward the vector offset
         writeln!(kernel, "vector_offset += 4 * {elements_per_block};").unwrap();
@@ -292,26 +348,27 @@ pub(crate) fn q4k_sgemv(
     )
     .unwrap();
 
+    // Initialize post element-wise functions once before the loop
+    let post_fns =
+        post_element_wise_functions.get_or_init(|| op.post_element_wise.add_functions(kernel));
+
+    // Fast path: all rows in tile are valid, no bounds checks needed
+    writeln!(kernel, "if is_full_tile {{").unwrap();
     for offset in 0..Q4K_SGEMV_CHUNK_SIZE {
-        // If this is not the first simd thread in the workgroup, we can return early
         writeln!(kernel, "if {subgroup_local_index} == 0u {{").unwrap();
-        {
-            // Write the output to the output tensor if this is the first thread in the workgroup
-            // Convert from f32 accumulator to output dtype
-            write!(kernel, "{output}[").unwrap();
-            let index = format!("row + {offset}");
-            let mut output_indices = Vec::new();
-            // Add batch indices first
-            for dim in (0..output.rank()).rev().skip(2) {
-                output_indices.push(format!("batch_idx_{dim}"));
-            }
-            // Then add M and N indices
-            output_indices.push("m_idx".to_string());
-            output_indices.push(index);
-            output.strided_index(kernel, output_indices);
-            let indexed = maybe_vec_storage_index(Q4K_SGEMV_CHUNK_SIZE, "sum", offset);
-            writeln!(kernel, "] = {dtype}({indexed});").unwrap();
-        }
+        writeln!(kernel, "let row_index = row + {offset}u;").unwrap();
+        generate_row_output(op, kernel, offset, dtype, bias, output, post_fns);
         writeln!(kernel, "}}").unwrap();
     }
+    writeln!(kernel, "}} else {{").unwrap();
+    // Slow path: check bounds for each row
+    for offset in 0..Q4K_SGEMV_CHUNK_SIZE {
+        writeln!(kernel, "if {subgroup_local_index} == 0u {{").unwrap();
+        writeln!(kernel, "let row_index = row + {offset}u;").unwrap();
+        writeln!(kernel, "if row_index < {n_size} {{").unwrap();
+        generate_row_output(op, kernel, offset, dtype, bias, output, post_fns);
+        writeln!(kernel, "}}").unwrap();
+        writeln!(kernel, "}}").unwrap();
+    }
+    writeln!(kernel, "}}").unwrap();
 }
