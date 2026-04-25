@@ -80,12 +80,7 @@ impl Attention {
         let c_per_head = q.shape()[3];
         let scale = 1.0 / (c_per_head as f32).sqrt();
 
-        // attn = (q * scale) @ k^T
-        let q_scaled = q.mul_scalar(scale);
-        let attn = q_scaled.mat_mul(&k.transpose(2, 3));
-        let attn: Tensor<4, f32> = attn.softmax_last_dim::<3>();
-
-        let out = attn.mat_mul(&v);
+        let out = q.flash_attention(&k, &v, scale, None);
         let out = self.recombine_heads(&out);
         self.out_proj.forward(&out)
     }
