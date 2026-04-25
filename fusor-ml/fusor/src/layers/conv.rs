@@ -128,44 +128,20 @@ where
         let input = input.to_concrete();
 
         if self.config.groups == 1 {
-            return input.conv(
+            input.conv(
                 &self.weight,
                 self.bias.as_ref(),
                 self.config.padding,
                 self.config.stride,
-            );
-        }
-
-        let g = self.config.groups;
-        let in_ch_per_group = self.in_channels / g;
-        let out_ch_per_group = self.out_channels / g;
-        let mut group_outputs = Vec::with_capacity(g);
-        for i in 0..g {
-            let input_slice: Tensor<RANK, D, ConcreteTensor<D, RANK>> = input
-                .narrow(1, i * in_ch_per_group, in_ch_per_group)
-                .to_concrete();
-            let weight_slice: Tensor<RANK, D, ConcreteTensor<D, RANK>> = self
-                .weight
-                .narrow(0, i * out_ch_per_group, out_ch_per_group)
-                .to_concrete();
-            let group_out: Tensor<RANK, D, ConcreteTensor<D, RANK>> = input_slice.conv(
-                &weight_slice,
-                None::<&Tensor<1, D, ConcreteTensor<D, 1>>>,
+            )
+        } else {
+            input.grouped_conv(
+                &self.weight,
+                self.bias.as_ref(),
                 self.config.padding,
                 self.config.stride,
-            );
-            group_outputs.push(group_out);
-        }
-        let cat = Tensor::cat(group_outputs, 1);
-        if let Some(bias) = &self.bias {
-            let out_shape = cat.shape();
-            let mut bias_shape = [1usize; RANK];
-            bias_shape[1] = self.out_channels;
-            let bias_reshaped = bias.reshape(bias_shape);
-            let bias_nd: Tensor<RANK, D, _> = bias_reshaped.broadcast_as(out_shape);
-            (cat + bias_nd).to_concrete()
-        } else {
-            cat.to_concrete()
+                self.config.groups,
+            )
         }
     }
 }

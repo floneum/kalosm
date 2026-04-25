@@ -109,16 +109,34 @@ impl ResizeOperation {
         tile_size: u32,
         kernel: &mut GenericKernel,
     ) {
-        let global_id = kernel.global_id();
         let input = kernel.add_tensor_input(input_rank, true, datatype);
         let output = kernel.add_tensor_input(self.new_shape.len() as u32, true, datatype);
+
+        // Compute a flat thread index across all three dispatch dimensions.
+        // `distribute_workgroups` spreads workgroups across y/z when the total
+        // exceeds MAX_DISPATCH_DIM, so reading `global_id.x` alone misses
+        // workgroups in those dims and leaves the tail of the output buffer
+        // uninitialized.
+        let num_workgroups = kernel.num_workgroups();
+        let workgroup_id = kernel.workgroup_index();
+        let local_id = kernel.workgroup_local_index();
+        writeln!(
+            kernel,
+            "let workgroup_flat_id = {workgroup_id}.x + {workgroup_id}.y * {num_workgroups}.x + {workgroup_id}.z * {num_workgroups}.x * {num_workgroups}.y;"
+        )
+        .unwrap();
+        writeln!(
+            kernel,
+            "let global_thread_id = workgroup_flat_id * {BLOCKSIZE}u + {local_id};"
+        )
+        .unwrap();
 
         for local_index in 0..tile_size {
             writeln!(kernel, "{{").unwrap();
             for (prefix, tensor) in [("input", &input), ("output", &output)] {
                 writeln!(
                     kernel,
-                    "var {prefix}_remaining_index = {global_id}.x * {tile_size} + {local_index};"
+                    "var {prefix}_remaining_index = global_thread_id * {tile_size}u + {local_index}u;"
                 )
                 .unwrap();
                 for i in (0..tensor.rank()).rev() {

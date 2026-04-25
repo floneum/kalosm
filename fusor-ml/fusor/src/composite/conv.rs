@@ -210,6 +210,128 @@ where
             output_final.to_concrete()
         }
     }
+
+    /// Grouped convolution lowered to a single sliding_window_view + batched matmul.
+    /// Weight is in PyTorch grouped layout: `(out_channels, in_channels / groups, ...kernel)`.
+    pub fn grouped_conv<const WEIGHT_RANK: usize, const DIFF: usize, const R2: usize>(
+        &self,
+        weight: &Tensor<WEIGHT_RANK, D, ConcreteTensor<D, WEIGHT_RANK>>,
+        bias: Option<&Tensor<1, D, ConcreteTensor<D, 1>>>,
+        padding: [usize; DIFF],
+        strides: [usize; DIFF],
+        groups: usize,
+    ) -> Self
+    where
+        ConcreteTensor<D, R>: fusor_cpu::LargerRank<R2, DIFF, D>,
+        fusor_core::Tensor<R, D>: fusor_core::LargerRank<DIFF, R2, D>,
+        crate::MulOp: fusor_cpu::SimdBinaryOp<D>,
+        crate::AddOp: fusor_cpu::SimdBinaryOp<D>,
+        fusor_cpu::SumOp: fusor_cpu::SimdReduceOp<D>,
+    {
+        let input_shape = self.shape();
+        let weight_shape = weight.shape();
+        let spatial_start = R - DIFF;
+
+        assert_eq!(R, 2 + DIFF);
+        let batch = input_shape[0];
+        let in_channels = input_shape[1];
+        let out_channels = weight_shape[0];
+        assert_eq!(in_channels % groups, 0);
+        assert_eq!(out_channels % groups, 0);
+        let in_ch_per_group = in_channels / groups;
+        let out_ch_per_group = out_channels / groups;
+        assert_eq!(weight_shape[1], in_ch_per_group);
+
+        let padded = if padding.iter().any(|&p| p > 0) {
+            let mut result = self.clone();
+            for (i, padding) in padding.iter().copied().enumerate() {
+                let axis = R - DIFF + i;
+                if padding > 0 {
+                    result = result.pad_axis(axis, padding);
+                }
+            }
+            result
+        } else {
+            self.clone()
+        };
+
+        let mut out_spatial_size = 1;
+        for i in 0..DIFF {
+            let padded_len = input_shape[spatial_start + i] + 2 * padding[i];
+            let kernel_len = weight_shape[spatial_start + i];
+            let out_len = (padded_len - kernel_len) / strides[i] + 1;
+            out_spatial_size *= out_len;
+        }
+
+        let windows: [SlidingWindow; DIFF] = std::array::from_fn(|i| {
+            let axis = R - DIFF + i;
+            let kernel_size = weight_shape[spatial_start + i];
+            SlidingWindow::new(axis, kernel_size, strides[i])
+        });
+        let windows_tensor: Tensor<R2, D, _> = padded.sliding_window_view(windows);
+
+        let kernel_size: usize = weight_shape[spatial_start..].iter().product();
+
+        // Permute and flatten exactly like the groups=1 path. Materialize
+        // before the rank-3 split so the channel-dim split is over actual
+        // contiguous memory rather than a permuted strided view.
+        let windows_transposed = windows_tensor.permute(Self::window_permutation::<R2, DIFF>());
+        let windows_flat: Tensor<2, D, _> = windows_transposed
+            .reshape([batch * out_spatial_size, in_channels * kernel_size])
+            .to_concrete();
+
+        // Split inner dim into (groups, in_ch_per_group * kernel_size).
+        let windows_3d: Tensor<3, D, _> = windows_flat
+            .reshape([batch * out_spatial_size, groups, in_ch_per_group * kernel_size])
+            .to_concrete();
+        let windows_grouped = windows_3d.transpose(0, 1).to_concrete();
+        // (groups, batch * out_spatial, in_ch_per_group * kernel_size)
+
+        // Weight: (out_channels, ipg, ...kernel) -> (groups, opg, ipg * kernel_size)
+        let weight_grouped: Tensor<3, D, _> = weight
+            .reshape([groups, out_ch_per_group, in_ch_per_group * kernel_size])
+            .to_concrete();
+        let weight_grouped_t = weight_grouped.transpose(1, 2).to_concrete();
+
+        let output_grouped = windows_grouped.mat_mul(&weight_grouped_t).to_concrete();
+        // (groups, batch * out_spatial, out_ch_per_group)
+
+        let output_t = output_grouped.transpose(0, 1).to_concrete();
+        let output: Tensor<2, D, _> = output_t
+            .reshape([batch * out_spatial_size, out_channels])
+            .to_concrete();
+
+        let output_reshaped: Tensor<R, D, _> = output.reshape(std::array::from_fn(|axis| {
+            if axis == 0 {
+                batch
+            } else if axis <= DIFF {
+                let spatial_axis = spatial_start + axis - 1;
+                let padded_len = input_shape[spatial_axis] + 2 * padding[axis - 1];
+                let kernel_len = weight_shape[spatial_axis];
+                (padded_len - kernel_len) / strides[axis - 1] + 1
+            } else {
+                out_channels
+            }
+        }));
+        let output_transposed = output_reshaped.permute(Self::output_permutation::<DIFF>());
+
+        let mut output_shape = input_shape;
+        output_shape[1] = out_channels;
+        for i in 0..DIFF {
+            let padded_len = input_shape[spatial_start + i] + 2 * padding[i];
+            let kernel_len = weight_shape[spatial_start + i];
+            output_shape[spatial_start + i] = (padded_len - kernel_len) / strides[i] + 1;
+        }
+        let output_final = output_transposed.reshape(output_shape);
+
+        if let Some(bias) = bias {
+            let bias_reshaped = bias.reshape(Self::bias_broadcast_shape(out_channels));
+            let bias_broadcast: Tensor<R, D, _> = bias_reshaped.broadcast_as(output_shape);
+            output_final.add_(&bias_broadcast)
+        } else {
+            output_final.to_concrete()
+        }
+    }
 }
 
 #[cfg(test)]
@@ -858,5 +980,561 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// Compares `grouped_conv` on GPU against the per-group narrow + conv + cat
+    /// reference on CPU. Mirrors TinyViT MBConv conv2: depthwise (groups=channels),
+    /// 3x3 kernel, padding=1, stride=1.
+    #[tokio::test]
+    async fn test_grouped_conv_gpu_vs_per_group_reference() {
+        use crate::Device;
+
+        let groups = 8usize;
+        let ipg = 1usize;
+        let opg = 1usize;
+        let in_channels = groups * ipg;
+        let out_channels = groups * opg;
+        let h = 7usize;
+        let w = 9usize;
+        let kh = 3usize;
+        let kw = 3usize;
+
+        let weight_data: Vec<f32> = (0..out_channels * ipg * kh * kw)
+            .map(|i| (i as f32 * 0.05).sin() * 0.4)
+            .collect();
+        let bias_data: Vec<f32> = (0..out_channels).map(|i| i as f32 * 0.1 - 0.3).collect();
+        let input_data: Vec<f32> = (0..in_channels * h * w)
+            .map(|i| (i as f32 * 0.07).cos() * 0.5)
+            .collect();
+
+        // Reference on CPU using per-group narrow + conv + cat.
+        let weight_cpu: Tensor<4, f32> = Tensor::Cpu(fusor_cpu::Tensor::from_slice(
+            [out_channels, ipg, kh, kw],
+            &weight_data,
+        ));
+        let bias_cpu: Tensor<1, f32> =
+            Tensor::Cpu(fusor_cpu::Tensor::from_slice([out_channels], &bias_data));
+        let input_cpu: Tensor<4, f32> = Tensor::Cpu(fusor_cpu::Tensor::from_slice(
+            [1, in_channels, h, w],
+            &input_data,
+        ));
+        let mut group_outputs: Vec<Tensor<4, f32, ConcreteTensor<f32, 4>>> =
+            Vec::with_capacity(groups);
+        for g in 0..groups {
+            let input_slice = input_cpu.narrow(1, g * ipg, ipg).to_concrete();
+            let weight_slice = weight_cpu.narrow(0, g * opg, opg).to_concrete();
+            let group_out: Tensor<4, f32, ConcreteTensor<f32, 4>> = input_slice.conv(
+                &weight_slice,
+                None::<&Tensor<1, f32, ConcreteTensor<f32, 1>>>,
+                [1, 1],
+                [1, 1],
+            );
+            group_outputs.push(group_out);
+        }
+        let cat: Tensor<4, f32> = Tensor::cat(group_outputs, 1);
+        let cat_shape = cat.shape();
+        let bias_reshaped = bias_cpu.reshape([1, out_channels, 1, 1]);
+        let bias_b = bias_reshaped.broadcast_as(cat_shape);
+        let reference: Tensor<4, f32, ConcreteTensor<f32, 4>> = (cat + bias_b).to_concrete();
+        let reference_slice = reference.as_slice().await.unwrap();
+
+        // Now run grouped_conv on GPU.
+        let gpu = Device::new().await.expect("GPU required for this test");
+        let weight_gpu: Tensor<4, f32> =
+            Tensor::from_slice(&gpu, [out_channels, ipg, kh, kw], &weight_data);
+        let bias_gpu: Tensor<1, f32> = Tensor::from_slice(&gpu, [out_channels], &bias_data);
+        let input_gpu: Tensor<4, f32> =
+            Tensor::from_slice(&gpu, [1, in_channels, h, w], &input_data);
+        let actual: Tensor<4, f32, ConcreteTensor<f32, 4>> =
+            input_gpu.grouped_conv(&weight_gpu, Some(&bias_gpu), [1, 1], [1, 1], groups);
+        let actual_slice = actual.as_slice().await.unwrap();
+
+        assert_eq!(actual.shape(), reference.shape());
+        let [_, oc, oh, ow] = actual.shape();
+        let mut max_diff = 0.0f32;
+        for c in 0..oc {
+            for i in 0..oh {
+                for j in 0..ow {
+                    let a: f32 = actual_slice[[0, c, i, j]].into();
+                    let r: f32 = reference_slice[[0, c, i, j]].into();
+                    let d = (a - r).abs();
+                    if d > max_diff {
+                        eprintln!("[{c},{i},{j}] gpu={a} cpu_ref={r} diff={d}");
+                    }
+                    max_diff = max_diff.max(d);
+                }
+            }
+        }
+        assert!(
+            max_diff < 1e-3,
+            "grouped_conv GPU vs per-group reference diverged: max_diff={max_diff}"
+        );
+    }
+
+    /// Larger depthwise case mirroring SAM TinyViT MBConv ConvLayer0 dims.
+    /// Uses groups=256 (matching MBCONV_EXPAND_RATIO * 64) but a smaller
+    /// spatial extent to keep the test fast.
+    #[tokio::test]
+    async fn test_grouped_conv_gpu_vs_per_group_reference_large_groups() {
+        use crate::Device;
+
+        let groups = 256usize;
+        let ipg = 1usize;
+        let opg = 1usize;
+        let in_channels = groups * ipg;
+        let out_channels = groups * opg;
+        let h = 16usize;
+        let w = 16usize;
+        let kh = 3usize;
+        let kw = 3usize;
+
+        let weight_data: Vec<f32> = (0..out_channels * ipg * kh * kw)
+            .map(|i| (i as f32 * 0.013).sin() * 0.4)
+            .collect();
+        let input_data: Vec<f32> = (0..in_channels * h * w)
+            .map(|i| (i as f32 * 0.0091).cos() * 0.5)
+            .collect();
+
+        let weight_cpu: Tensor<4, f32> = Tensor::Cpu(fusor_cpu::Tensor::from_slice(
+            [out_channels, ipg, kh, kw],
+            &weight_data,
+        ));
+        let input_cpu: Tensor<4, f32> = Tensor::Cpu(fusor_cpu::Tensor::from_slice(
+            [1, in_channels, h, w],
+            &input_data,
+        ));
+        let mut group_outputs: Vec<Tensor<4, f32, ConcreteTensor<f32, 4>>> =
+            Vec::with_capacity(groups);
+        for g in 0..groups {
+            let input_slice = input_cpu.narrow(1, g * ipg, ipg).to_concrete();
+            let weight_slice = weight_cpu.narrow(0, g * opg, opg).to_concrete();
+            let group_out: Tensor<4, f32, ConcreteTensor<f32, 4>> = input_slice.conv(
+                &weight_slice,
+                None::<&Tensor<1, f32, ConcreteTensor<f32, 1>>>,
+                [1, 1],
+                [1, 1],
+            );
+            group_outputs.push(group_out);
+        }
+        let reference: Tensor<4, f32, ConcreteTensor<f32, 4>> =
+            Tensor::cat(group_outputs, 1).to_concrete();
+        let reference_slice = reference.as_slice().await.unwrap();
+
+        let gpu = Device::new().await.expect("GPU required for this test");
+        let weight_gpu: Tensor<4, f32> =
+            Tensor::from_slice(&gpu, [out_channels, ipg, kh, kw], &weight_data);
+        let input_gpu: Tensor<4, f32> =
+            Tensor::from_slice(&gpu, [1, in_channels, h, w], &input_data);
+        let actual: Tensor<4, f32, ConcreteTensor<f32, 4>> = input_gpu.grouped_conv(
+            &weight_gpu,
+            None::<&Tensor<1, f32, ConcreteTensor<f32, 1>>>,
+            [1, 1],
+            [1, 1],
+            groups,
+        );
+        let actual_slice = actual.as_slice().await.unwrap();
+
+        assert_eq!(actual.shape(), reference.shape());
+        let [_, oc, oh, ow] = actual.shape();
+        let mut max_diff = 0.0f32;
+        let mut first_mismatch: Option<(usize, usize, usize, f32, f32)> = None;
+        for c in 0..oc {
+            for i in 0..oh {
+                for j in 0..ow {
+                    let a: f32 = actual_slice[[0, c, i, j]].into();
+                    let r: f32 = reference_slice[[0, c, i, j]].into();
+                    let d = (a - r).abs();
+                    if d > 1e-3 && first_mismatch.is_none() {
+                        first_mismatch = Some((c, i, j, a, r));
+                    }
+                    if d > max_diff {
+                        max_diff = d;
+                    }
+                }
+            }
+        }
+        assert!(
+            max_diff < 1e-3,
+            "large-groups grouped_conv GPU vs reference diverged: max_diff={max_diff}, first_mismatch={first_mismatch:?}"
+        );
+    }
+
+    /// Bisects whether the bug is in the bmm itself with strided A, or in
+    /// the surrounding conv layout chain.
+    #[tokio::test]
+    async fn test_batched_matmul_strided_a_at_scale() {
+        use crate::Device;
+        let gpu = Device::new().await.expect("GPU required");
+
+        let groups = 64usize;
+        let k = 9usize;
+        for m in [256usize, 1024, 4096, 16384, 65536] {
+            let a_data: Vec<f32> = (0..m * groups * k)
+                .map(|i| (i as f32 * 0.0091).cos() * 0.5)
+                .collect();
+            let b_data: Vec<f32> = (0..groups * k)
+                .map(|i| (i as f32 * 0.013).sin() * 0.4)
+                .collect();
+
+            let a_flat_gpu: Tensor<2, f32> =
+                Tensor::from_slice(&gpu, [m, groups * k], &a_data);
+            let a_3d_gpu = a_flat_gpu.reshape([m, groups, k]).to_concrete();
+            let a_grouped_gpu = a_3d_gpu.transpose(0, 1).to_concrete();
+
+            let b_gpu: Tensor<3, f32> = Tensor::from_slice(&gpu, [groups, k, 1], &b_data);
+            let out_gpu = a_grouped_gpu.mat_mul(&b_gpu).to_concrete();
+            let out_slice = out_gpu.as_slice().await.unwrap();
+
+            let a_flat_cpu: Tensor<2, f32> =
+                Tensor::Cpu(fusor_cpu::Tensor::from_slice([m, groups * k], &a_data));
+            let a_3d_cpu: Tensor<3, f32> = a_flat_cpu.reshape([m, groups, k]).to_concrete();
+            let a_grouped_cpu = a_3d_cpu.transpose(0, 1).to_concrete();
+            let b_cpu: Tensor<3, f32> =
+                Tensor::Cpu(fusor_cpu::Tensor::from_slice([groups, k, 1], &b_data));
+            let out_cpu = a_grouped_cpu.mat_mul(&b_cpu).to_concrete();
+            let ref_slice = out_cpu.as_slice().await.unwrap();
+
+            let mut max_diff = 0.0f32;
+            let mut first: Option<(usize, usize, f32, f32)> = None;
+            for g in 0..groups {
+                for mi in 0..m {
+                    let a: f32 = out_slice[[g, mi, 0]].into();
+                    let r: f32 = ref_slice[[g, mi, 0]].into();
+                    let d = (a - r).abs();
+                    if d > 1e-3 && first.is_none() {
+                        first = Some((g, mi, a, r));
+                    }
+                    max_diff = max_diff.max(d);
+                }
+            }
+            eprintln!("m={m} max_diff={max_diff} first_mismatch={first:?}");
+            assert!(
+                max_diff < 1e-3,
+                "bmm strided a failed at m={m}: max_diff={max_diff}, first={first:?}"
+            );
+        }
+    }
+
+    /// Same chain as grouped_conv up to the matmul, then matmuls with a tensor
+    /// constructed exactly like weight_grouped_t. Isolates whether the bug is in
+    /// the matmul's handling of an A input that's deep in a lazy graph.
+    #[tokio::test]
+    async fn test_grouped_conv_bmm_isolated() {
+        use crate::Device;
+
+        let groups = 64usize;
+        let h = 200usize;
+        let w = 200usize;
+        let kh = 3usize;
+        let kw = 3usize;
+        let pad = 1usize;
+        let in_channels = groups;
+        let kernel_size = kh * kw;
+        let out_h = h + 2 * pad - kh + 1;
+        let out_w = w + 2 * pad - kw + 1;
+        let out_spatial = out_h * out_w;
+
+        let input_data: Vec<f32> = (0..in_channels * h * w)
+            .map(|i| (i as f32 * 0.0091).cos() * 0.5)
+            .collect();
+        let weight_data: Vec<f32> = (0..groups * kernel_size)
+            .map(|i| (i as f32 * 0.013).sin() * 0.4)
+            .collect();
+
+        let gpu = Device::new().await.expect("GPU required");
+        let input_gpu: Tensor<4, f32> =
+            Tensor::from_slice(&gpu, [1, in_channels, h, w], &input_data);
+        let weight_gpu: Tensor<4, f32> =
+            Tensor::from_slice(&gpu, [groups, 1, kh, kw], &weight_data);
+
+        let padded_gpu = input_gpu.pad_axis(2, pad).pad_axis(3, pad);
+        let windows_gpu = padded_gpu.sliding_window_view([
+            SlidingWindow::new(2, kh, 1),
+            SlidingWindow::new(3, kw, 1),
+        ]);
+        let permuted_gpu = windows_gpu.permute([0, 2, 3, 1, 4, 5]);
+        let flat_gpu: Tensor<2, f32> = permuted_gpu
+            .reshape([out_spatial, in_channels * kernel_size])
+            .to_concrete();
+        let windows_3d_gpu = flat_gpu.reshape([out_spatial, groups, kernel_size]).to_concrete();
+        let windows_grouped_gpu = windows_3d_gpu.transpose(0, 1).to_concrete();
+        let weight_grouped_gpu = weight_gpu.reshape([groups, 1, kernel_size]).to_concrete();
+        let weight_grouped_t_gpu = weight_grouped_gpu.transpose(1, 2).to_concrete();
+
+        let bmm_out_gpu = windows_grouped_gpu
+            .mat_mul(&weight_grouped_t_gpu)
+            .to_concrete();
+        // Mirror the post-matmul rearrangement that grouped_conv does.
+        let output_t_gpu = bmm_out_gpu.transpose(0, 1).to_concrete();
+        let output_2d_gpu: Tensor<2, f32> =
+            output_t_gpu.reshape([out_spatial, groups]).to_concrete();
+        let output_4d_gpu: Tensor<4, f32> = output_2d_gpu
+            .reshape([1, out_h, out_w, groups])
+            .to_concrete();
+        let output_permuted_gpu = output_4d_gpu.permute([0, 3, 1, 2]).to_concrete();
+        // grouped_conv reshapes the permuted output to its target shape (which
+        // is identical) — replicate that here.
+        let output_final_gpu: Tensor<4, f32> = output_permuted_gpu
+            .reshape([1, groups, out_h, out_w])
+            .to_concrete();
+        let bmm_flat_gpu: Tensor<1, f32> = output_final_gpu
+            .reshape([groups * out_spatial])
+            .to_concrete();
+        let actual_slice = bmm_flat_gpu.as_slice().await.unwrap();
+        let actual = actual_slice.as_slice();
+
+        // CPU reference via per-group narrow + conv.
+        let weight_cpu: Tensor<4, f32> =
+            Tensor::Cpu(fusor_cpu::Tensor::from_slice([groups, 1, kh, kw], &weight_data));
+        let input_cpu: Tensor<4, f32> = Tensor::Cpu(fusor_cpu::Tensor::from_slice(
+            [1, in_channels, h, w],
+            &input_data,
+        ));
+        let mut group_outputs: Vec<Tensor<4, f32, ConcreteTensor<f32, 4>>> =
+            Vec::with_capacity(groups);
+        for g in 0..groups {
+            let input_slice = input_cpu.narrow(1, g, 1).to_concrete();
+            let weight_slice = weight_cpu.narrow(0, g, 1).to_concrete();
+            let group_out = input_slice.conv(
+                &weight_slice,
+                None::<&Tensor<1, f32, ConcreteTensor<f32, 1>>>,
+                [pad, pad],
+                [1, 1],
+            );
+            group_outputs.push(group_out);
+        }
+        let cat: Tensor<4, f32> = Tensor::cat(group_outputs, 1).to_concrete();
+        let cat_slice = cat.as_slice().await.unwrap();
+
+        let mut max_diff = 0.0f32;
+        let mut first: Option<(usize, usize, usize, f32, f32)> = None;
+        for c in 0..groups {
+            for hi in 0..out_h {
+                for wi in 0..out_w {
+                    let mi = hi * out_w + wi;
+                    let actual_idx = c * out_spatial + mi;
+                    let a = actual[actual_idx];
+                    let r: f32 = cat_slice[[0, c, hi, wi]].into();
+                    let d = (a - r).abs();
+                    if d > 1e-3 && first.is_none() {
+                        first = Some((c, hi, wi, a, r));
+                    }
+                    max_diff = max_diff.max(d);
+                }
+            }
+        }
+        assert!(
+            max_diff < 1e-3,
+            "isolated bmm chain diverged: max_diff={max_diff}, first={first:?}"
+        );
+
+        // Now run the actual grouped_conv on the SAME inputs and compare to
+        // the manual chain we just verified. This pins down where grouped_conv
+        // diverges from the manual decomposition.
+        let gc_out: Tensor<4, f32> = input_gpu.grouped_conv(
+            &weight_gpu,
+            None::<&Tensor<1, f32, ConcreteTensor<f32, 1>>>,
+            [pad, pad],
+            [1, 1],
+            groups,
+        );
+        let gc_flat: Tensor<1, f32> =
+            gc_out.reshape([groups * out_spatial]).to_concrete();
+        let gc_slice = gc_flat.as_slice().await.unwrap();
+        let gc = gc_slice.as_slice();
+
+        let mut gc_max = 0.0f32;
+        let mut gc_first: Option<(usize, usize, usize, f32, f32)> = None;
+        for c in 0..groups {
+            for hi in 0..out_h {
+                for wi in 0..out_w {
+                    let actual_idx = c * out_spatial + hi * out_w + wi;
+                    let manual = actual[actual_idx];
+                    let gc_val = gc[actual_idx];
+                    let d = (gc_val - manual).abs();
+                    if d > 1e-3 && gc_first.is_none() {
+                        gc_first = Some((c, hi, wi, gc_val, manual));
+                    }
+                    gc_max = gc_max.max(d);
+                }
+            }
+        }
+        assert!(
+            gc_max < 1e-3,
+            "grouped_conv diverges from manual chain: max_diff={gc_max}, first={gc_first:?}"
+        );
+    }
+
+    /// Materializes `windows_grouped` (the rank-3 BMM A input from grouped_conv)
+    /// to CPU and compares element-wise with a CPU-side construction. Isolates
+    /// whether the bug is in the windows pipeline (sliding_window_view +
+    /// permute + reshape + transpose) or in the matmul itself.
+    #[tokio::test]
+    async fn test_windows_grouped_at_sam_scale() {
+        use crate::Device;
+
+        let groups = 64usize;
+        let h = 200usize;
+        let w = 200usize;
+        let kh = 3usize;
+        let kw = 3usize;
+        let pad = 1usize;
+        let in_channels = groups;
+        let out_h = h + 2 * pad - kh + 1;
+        let out_w = w + 2 * pad - kw + 1;
+        let out_spatial = out_h * out_w;
+
+        let input_data: Vec<f32> = (0..in_channels * h * w)
+            .map(|i| (i as f32 * 0.0091).cos() * 0.5)
+            .collect();
+
+        let gpu = Device::new().await.expect("GPU required");
+        let input_gpu: Tensor<4, f32> =
+            Tensor::from_slice(&gpu, [1, in_channels, h, w], &input_data);
+        let padded_gpu = input_gpu.pad_axis(2, pad).pad_axis(3, pad);
+        let windows_gpu = padded_gpu.sliding_window_view([
+            SlidingWindow::new(2, kh, 1),
+            SlidingWindow::new(3, kw, 1),
+        ]);
+        let permuted_gpu = windows_gpu.permute([0, 2, 3, 1, 4, 5]);
+        let flat_gpu: Tensor<2, f32> = permuted_gpu
+            .reshape([out_spatial, in_channels * kh * kw])
+            .to_concrete();
+        let windows_3d_gpu = flat_gpu.reshape([out_spatial, groups, kh * kw]).to_concrete();
+        let windows_grouped_gpu = windows_3d_gpu.transpose(0, 1).to_concrete();
+        // Materialize via as_slice — the only way to actually read GPU data.
+        let windows_grouped_flat: Tensor<1, f32> = windows_grouped_gpu
+            .reshape([groups * out_spatial * kh * kw])
+            .to_concrete();
+        let actual_slice = windows_grouped_flat.as_slice().await.unwrap();
+        let actual = actual_slice.as_slice();
+
+        // CPU reference: sliding window indexed manually.
+        let mut expected = vec![0.0f32; groups * out_spatial * kh * kw];
+        for c in 0..in_channels {
+            for oh_i in 0..out_h {
+                for ow_i in 0..out_w {
+                    for ki in 0..kh {
+                        for kj in 0..kw {
+                            let in_h = oh_i + ki;
+                            let in_w = ow_i + kj;
+                            let in_h_p = in_h as isize - pad as isize;
+                            let in_w_p = in_w as isize - pad as isize;
+                            let val = if in_h_p >= 0
+                                && in_h_p < h as isize
+                                && in_w_p >= 0
+                                && in_w_p < w as isize
+                            {
+                                input_data[c * h * w + in_h_p as usize * w + in_w_p as usize]
+                            } else {
+                                0.0
+                            };
+                            // After transpose to (groups, out_spatial, kh*kw):
+                            let out_idx =
+                                c * out_spatial * kh * kw + (oh_i * out_w + ow_i) * kh * kw + ki * kw + kj;
+                            expected[out_idx] = val;
+                        }
+                    }
+                }
+            }
+        }
+
+        let mut max_diff = 0.0f32;
+        let mut first_mismatch: Option<(usize, f32, f32)> = None;
+        for i in 0..actual.len() {
+            let a = actual[i];
+            let e = expected[i];
+            let d = (a - e).abs();
+            if d > 1e-3 && first_mismatch.is_none() {
+                first_mismatch = Some((i, a, e));
+            }
+            max_diff = max_diff.max(d);
+        }
+        assert!(
+            max_diff < 1e-3,
+            "windows_grouped at SAM scale diverged: max_diff={max_diff}, first_mismatch={first_mismatch:?}"
+        );
+    }
+
+    /// SAM-scale depthwise: 256 channels at 64×64 spatial. Mirrors what SAM's
+    /// TinyViT MBConv depthwise conv actually runs. Reproduces the bug that
+    /// breaks SAM masks while smaller-scale tests above pass.
+    #[tokio::test]
+    async fn test_grouped_conv_gpu_sam_scale_depthwise() {
+        use crate::Device;
+
+        let groups = 64usize;
+        let h = 200usize;
+        let w = 200usize;
+        let kh = 3usize;
+        let kw = 3usize;
+
+        let weight_data: Vec<f32> = (0..groups * kh * kw)
+            .map(|i| (i as f32 * 0.013).sin() * 0.4)
+            .collect();
+        let input_data: Vec<f32> = (0..groups * h * w)
+            .map(|i| (i as f32 * 0.0091).cos() * 0.5)
+            .collect();
+
+        let weight_cpu: Tensor<4, f32> =
+            Tensor::Cpu(fusor_cpu::Tensor::from_slice([groups, 1, kh, kw], &weight_data));
+        let input_cpu: Tensor<4, f32> = Tensor::Cpu(fusor_cpu::Tensor::from_slice(
+            [1, groups, h, w],
+            &input_data,
+        ));
+        let mut group_outputs: Vec<Tensor<4, f32, ConcreteTensor<f32, 4>>> =
+            Vec::with_capacity(groups);
+        for g in 0..groups {
+            let input_slice = input_cpu.narrow(1, g, 1).to_concrete();
+            let weight_slice = weight_cpu.narrow(0, g, 1).to_concrete();
+            let group_out: Tensor<4, f32, ConcreteTensor<f32, 4>> = input_slice.conv(
+                &weight_slice,
+                None::<&Tensor<1, f32, ConcreteTensor<f32, 1>>>,
+                [1, 1],
+                [1, 1],
+            );
+            group_outputs.push(group_out);
+        }
+        let reference: Tensor<4, f32, ConcreteTensor<f32, 4>> =
+            Tensor::cat(group_outputs, 1).to_concrete();
+        let reference_slice = reference.as_slice().await.unwrap();
+
+        let gpu = Device::new().await.expect("GPU required for this test");
+
+        let weight_gpu: Tensor<4, f32> =
+            Tensor::from_slice(&gpu, [groups, 1, kh, kw], &weight_data);
+        let input_gpu: Tensor<4, f32> = Tensor::from_slice(&gpu, [1, groups, h, w], &input_data);
+        let actual: Tensor<4, f32, ConcreteTensor<f32, 4>> = input_gpu.grouped_conv(
+            &weight_gpu,
+            None::<&Tensor<1, f32, ConcreteTensor<f32, 1>>>,
+            [1, 1],
+            [1, 1],
+            groups,
+        );
+        let actual_slice = actual.as_slice().await.unwrap();
+
+        assert_eq!(actual.shape(), reference.shape());
+        let [_, oc, oh, ow] = actual.shape();
+        let mut max_diff = 0.0f32;
+        let mut first_mismatch: Option<(usize, usize, usize, f32, f32)> = None;
+        for c in 0..oc {
+            for i in 0..oh {
+                for j in 0..ow {
+                    let a: f32 = actual_slice[[0, c, i, j]].into();
+                    let r: f32 = reference_slice[[0, c, i, j]].into();
+                    let d = (a - r).abs();
+                    if d > 1e-3 && first_mismatch.is_none() {
+                        first_mismatch = Some((c, i, j, a, r));
+                    }
+                    if d > max_diff {
+                        max_diff = d;
+                    }
+                }
+            }
+        }
+        assert!(
+            max_diff < 1e-3,
+            "SAM-scale grouped_conv GPU vs reference diverged: max_diff={max_diff}, first_mismatch={first_mismatch:?}"
+        );
     }
 }

@@ -38,7 +38,8 @@ where
         NegOp: SimdUnaryOp<D>,
         ExpOp: SimdUnaryOp<D>,
     {
-        let one_plus_exp = ((-self).exp() + D::from_f32(1.0)).to_concrete();
+        let neg_self = -self;
+        let one_plus_exp = neg_self.exp() + D::from_f32(1.0);
         (self.ones_like() / one_plus_exp).to_concrete()
     }
 

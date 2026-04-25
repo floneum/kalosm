@@ -122,34 +122,20 @@ where
             return input.layer_norm(&weight_b, bias_b.as_ref(), D::from_f32(self.eps), true);
         }
 
-        // Arbitrary-axis path: mean/variance/normalization are computed as separate
-        // ops rather than going through the fused `layer_norm` kernel above.
-        let num_features = shape[axis];
-
-        let mean: Tensor<N, D> = input.mean_keepdim::<OUT_RANK>(axis);
-        let mean_b: Tensor<N, D> = mean.broadcast_as(shape).to_concrete();
-        let centered: Tensor<N, D> = (input - &mean_b).to_concrete();
-        let var: Tensor<N, D> = (&centered * &centered)
-            .to_concrete()
-            .mean_keepdim::<OUT_RANK>(axis);
-        let var_eps = var.to_concrete().add_scalar(D::from_f32(self.eps));
-        let denom: Tensor<N, D> = var_eps.sqrt().broadcast_as(shape).to_concrete();
-        let normed: Tensor<N, D> = (&centered / denom).to_concrete();
-
-        let mut affine_shape = [1usize; N];
-        affine_shape[axis] = num_features;
-        let w: Tensor<N, D> = self
-            .weight
-            .reshape(affine_shape)
-            .broadcast_as(shape)
-            .to_concrete();
-        let scaled = (normed * w).to_concrete();
-        if let Some(bias) = &self.bias {
-            let b: Tensor<N, D> = bias.reshape(affine_shape).broadcast_as(shape).to_concrete();
-            scaled.add_(&b)
-        } else {
-            scaled
-        }
+        // Arbitrary-axis path: transpose target axis to last, run the fused
+        // last-dim kernel, then transpose back. Avoids the explicit
+        // mean/var/centered/divide decomposition, which on GPU costs ~9 kernel
+        // launches and several intermediate materializations.
+        let mut permuted_shape = shape;
+        permuted_shape.swap(axis, N - 1);
+        let permuted: Tensor<N, D, ConcreteTensor<D, N>> =
+            input.transpose(axis, N - 1).to_concrete();
+        let weight_b: Tensor<N, D, _> = self.weight.broadcast_as(permuted_shape);
+        let bias_b: Option<Tensor<N, D, _>> =
+            self.bias.as_ref().map(|b| b.broadcast_as(permuted_shape));
+        let normed: Tensor<N, D> =
+            permuted.layer_norm(&weight_b, bias_b.as_ref(), D::from_f32(self.eps), true);
+        normed.transpose(axis, N - 1).to_concrete()
     }
 }
 
