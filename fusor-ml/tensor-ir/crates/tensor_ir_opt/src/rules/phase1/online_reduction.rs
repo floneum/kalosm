@@ -15,8 +15,8 @@ use ordered_float::OrderedFloat;
 use crate::analysis::{NormalizedWeightInfo, TensorAnalysis};
 use crate::applier::SimpleEclassSearcher;
 use crate::language::{
-    add_list, try_add_value_addr_dispatch, try_extract_list, DispatchNode, HighLevelNode, SimdNode,
-    TensorIr,
+    DispatchNode, HighLevelNode, SimdNode, TensorIr, add_list, try_add_value_addr_dispatch,
+    try_extract_list,
 };
 use crate::rules::RunnerConfig;
 use crate::types::{
@@ -24,8 +24,8 @@ use crate::types::{
 };
 
 use super::recursive_dispatch_lowering::{
-    build_reduce_input_indices, collect_underlying_inputs, lower_tensor_point,
-    selected_high_level_node, shape_of, EvalContext,
+    EvalContext, build_reduce_input_indices, collect_underlying_inputs, lower_tensor_point,
+    selected_high_level_node, shape_of,
 };
 use super::{compute_flat_addr, compute_strided_addr, decompose_flat_index};
 

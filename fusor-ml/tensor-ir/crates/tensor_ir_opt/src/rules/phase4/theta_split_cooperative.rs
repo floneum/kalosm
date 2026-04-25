@@ -429,8 +429,7 @@ fn is_flat_thread_output_addr(
                 let TensorIr::BinOp(BinaryOp::Mul, mul_args) = mul_node else {
                     continue;
                 };
-                for (workgroup, width) in [(mul_args[0], mul_args[1]), (mul_args[1], mul_args[0])]
-                {
+                for (workgroup, width) in [(mul_args[0], mul_args[1]), (mul_args[1], mul_args[0])] {
                     if dispatch_var(egraph, workgroup, slots::DISPATCH_WORKGROUP)
                         && u32_const(egraph, width) == Some(simd_width)
                     {

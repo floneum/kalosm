@@ -36,10 +36,7 @@ impl CodegenCtx<'_> {
     pub(super) fn lower_reduce_simd(&mut self, op: ReduceOp, src_id: Id) -> Handle<Expression> {
         let src = self.lower_expr(src_id);
 
-        let dtype = self.egraph[src_id]
-            .data
-            .dtype
-            .unwrap_or(DType::F32);
+        let dtype = self.egraph[src_id].data.dtype.unwrap_or(DType::F32);
         let sg_op = match (op, dtype) {
             (ReduceOp::Add, DType::F16 | DType::F32 | DType::I32 | DType::U32) => {
                 SubgroupOperation::Add

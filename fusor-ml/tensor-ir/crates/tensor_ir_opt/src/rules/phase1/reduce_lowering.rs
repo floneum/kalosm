@@ -2,7 +2,7 @@ use egg::{EGraph, Id, Rewrite};
 
 use crate::analysis::TensorAnalysis;
 use crate::applier::SimpleEclassSearcher;
-use crate::language::{add_list, extract_list, DispatchNode, HighLevelNode, SimdNode, TensorIr};
+use crate::language::{DispatchNode, HighLevelNode, SimdNode, TensorIr, add_list, extract_list};
 use crate::rules::RunnerConfig;
 use crate::types::{
     BinaryOp, BufferRef, DType, Dim, IndexLevel, LoweringOptions, MemTier, ReduceOp, ScalarValue,

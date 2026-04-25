@@ -19,6 +19,7 @@ pub use tensor_ir_egraph::tensor_expr_to_recexpr;
 pub struct StageConfig {
     pub runner: RunnerConfig,
     pub beam: BeamConfig,
+    pub candidate_limit: Option<usize>,
 }
 
 /// Structured diagnostics for one lowering attempt.
@@ -297,6 +298,9 @@ pub fn lower_tensor_expr_with_report(
             &beam,
             &config.runner.device,
             config.runner.lowering,
+            config
+                .candidate_limit
+                .unwrap_or_else(|| beam.beam_width.max(16)),
         )
     });
     report.extraction = Some(extraction_report);
@@ -423,9 +427,9 @@ fn select_kernel_candidate_with_report(
     beam: &BeamConfig,
     device: &DeviceProfile,
     lowering: LoweringOptions,
+    candidate_limit: usize,
 ) -> (Result<(f64, RecExpr<TensorIr>), String>, ExtractionReport) {
     let start = std::time::Instant::now();
-    let candidate_limit = beam.beam_width.max(16);
     let (candidates, candidate_validation) =
         crate::skeleton::beam_extract_valid_candidates_with_report(
             egraph,

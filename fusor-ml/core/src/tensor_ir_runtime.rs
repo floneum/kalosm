@@ -47,6 +47,7 @@ pub(crate) fn execute(
     config.runner.iter_limit = 10;
     config.runner.node_limit = 50_000;
     config.runner.time_limit_secs = 30;
+    config.candidate_limit = Some(1);
     let pipeline = StagedPipeline::new(config);
     let (simd, mut wgsl) =
         lower_valid_simd_program(&pipeline, expr, output_datatype).map_err(|error| {

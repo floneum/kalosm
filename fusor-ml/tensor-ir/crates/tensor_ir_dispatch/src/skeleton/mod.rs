@@ -1513,6 +1513,11 @@ pub fn beam_extract_valid_candidates_with_report(
         );
     }
 
+    let mut report = CandidateValidationReport {
+        requested_limit: limit,
+        ..CandidateValidationReport::default()
+    };
+
     // Over-sample from the raw beam so we have headroom when filtering drops
     // structurally-broken candidates. The cap keeps the per-call cost bounded
     // when the beam would otherwise flood us with near-duplicates.
@@ -1520,47 +1525,46 @@ pub fn beam_extract_valid_candidates_with_report(
     const MAX_RAW: usize = 256;
     let raw_limit = limit.saturating_mul(OVER_SAMPLE).min(MAX_RAW).max(limit);
     let mut raw = beam_extract_candidates(egraph, root, config, raw_limit);
+    let greedy = greedy_candidate_pool(egraph, root);
+    for candidate in greedy {
+        push_unique_candidate(&mut raw, candidate);
+    }
+    report.raw_candidate_limit = raw_limit;
+    report.raw_candidates += raw.len();
+    let selected = validate_candidate_exprs(raw, egraph, device, lowering, limit, &mut report);
+    (selected, report)
+}
+
+fn greedy_candidate_pool(
+    egraph: &EGraph<TensorIr, TensorAnalysis>,
+    root: Id,
+) -> Vec<(f64, RecExpr<TensorIr>)> {
+    let mut raw = Vec::new();
     let greedy_dispatch = {
         let extractor = Extractor::new(egraph, DispatchPreferredCost);
         extractor.find_best(root)
     };
-    if !raw.iter().any(|(_, expr)| expr == &greedy_dispatch.1) {
-        raw.push(greedy_dispatch);
-    }
+    push_unique_candidate(&mut raw, greedy_dispatch);
     let greedy_tiled_dispatch = {
         let extractor = Extractor::new(egraph, TiledDispatchPreferredCost);
         extractor.find_best(root)
     };
-    if !raw.iter().any(|(_, expr)| expr == &greedy_tiled_dispatch.1) {
-        raw.push(greedy_tiled_dispatch);
-    }
+    push_unique_candidate(&mut raw, greedy_tiled_dispatch);
     let greedy_blocked_dispatch = {
         let extractor = Extractor::new(egraph, BlockedDispatchPreferredCost);
         extractor.find_best(root)
     };
-    if !raw
-        .iter()
-        .any(|(_, expr)| expr == &greedy_blocked_dispatch.1)
-    {
-        raw.push(greedy_blocked_dispatch);
-    }
+    push_unique_candidate(&mut raw, greedy_blocked_dispatch);
     let greedy_single_dispatch = {
         let extractor = Extractor::new(egraph, SingleDispatchPreferredCost);
         extractor.find_best(root)
     };
-    if !raw
-        .iter()
-        .any(|(_, expr)| expr == &greedy_single_dispatch.1)
-    {
-        raw.push(greedy_single_dispatch);
-    }
+    push_unique_candidate(&mut raw, greedy_single_dispatch);
     let greedy_composite = {
         let extractor = Extractor::new(egraph, CompositePreferredCost);
         extractor.find_best(root)
     };
-    if !raw.iter().any(|(_, expr)| expr == &greedy_composite.1) {
-        raw.push(greedy_composite);
-    }
+    push_unique_candidate(&mut raw, greedy_composite);
     // Dispatch with bias toward `ReduceSimd` / short inner Thetas. Gives
     // `theta_inner_cooperative` rewrites a shot at the top of the list when
     // their Dispatch-level cost is otherwise a wash against the non-coop
@@ -1569,20 +1573,30 @@ pub fn beam_extract_valid_candidates_with_report(
         let extractor = Extractor::new(egraph, ReduceSimdPreferredCost);
         extractor.find_best(root)
     };
-    if !raw.iter().any(|(_, expr)| expr == &greedy_reduce_simd.1) {
-        raw.push(greedy_reduce_simd);
-    }
+    push_unique_candidate(&mut raw, greedy_reduce_simd);
     for forced in forced_root_dispatch_candidates(egraph, root) {
-        if !raw.iter().any(|(_, expr)| expr == &forced.1) {
-            raw.push(forced);
-        }
+        push_unique_candidate(&mut raw, forced);
     }
-    let mut report = CandidateValidationReport {
-        requested_limit: limit,
-        raw_candidate_limit: raw_limit,
-        raw_candidates: raw.len(),
-        ..CandidateValidationReport::default()
-    };
+    raw
+}
+
+fn push_unique_candidate(
+    raw: &mut Vec<(f64, RecExpr<TensorIr>)>,
+    candidate: (f64, RecExpr<TensorIr>),
+) {
+    if !raw.iter().any(|(_, expr)| expr == &candidate.1) {
+        raw.push(candidate);
+    }
+}
+
+fn validate_candidate_exprs(
+    raw: Vec<(f64, RecExpr<TensorIr>)>,
+    egraph: &EGraph<TensorIr, TensorAnalysis>,
+    device: &DeviceProfile,
+    lowering: &LoweringOptions,
+    limit: usize,
+    report: &mut CandidateValidationReport,
+) -> Vec<(f64, RecExpr<TensorIr>)> {
     let mut valid = Vec::with_capacity(limit);
     for (cost, expr) in raw {
         if !recexpr_has_valid_var_scopes(&expr) {
@@ -1664,7 +1678,7 @@ pub fn beam_extract_valid_candidates_with_report(
         .map(|(_, _, _, _, _, _, _, cost, expr)| (cost, expr))
         .collect::<Vec<_>>();
     report.returned = selected.len();
-    (selected, report)
+    selected
 }
 
 fn forced_root_dispatch_candidates(

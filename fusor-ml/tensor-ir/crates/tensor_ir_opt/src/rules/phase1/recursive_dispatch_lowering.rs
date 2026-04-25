@@ -22,7 +22,7 @@ use tensor_ir_egraph::binding;
 
 use crate::analysis::TensorAnalysis;
 use crate::applier::SimpleEclassSearcher;
-use crate::language::{add_list, extract_list, DispatchNode, HighLevelNode, SimdNode, TensorIr};
+use crate::language::{DispatchNode, HighLevelNode, SimdNode, TensorIr, add_list, extract_list};
 use crate::rules::RunnerConfig;
 use crate::types::{
     BinaryOp, BinderKind, BufferRef, DType, Dim, IndexLevel, MemTier, ScalarValue, Shape, VarRef,
