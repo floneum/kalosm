@@ -1,5 +1,9 @@
 //! Standalone reproduction of the wgpu `encode_commands` slowdown seen in SAM's
 //! ImageEncoderViT. Narrows down to `cat` / `slice_assign`.
+//!
+//! Each test asserts result correctness so regressions in the underlying
+//! cat/slice_assign paths fail CI, while the timings remain on stderr as a
+//! lightweight perf trace.
 
 use fusor::{Device, Tensor};
 use std::time::Instant;
@@ -13,8 +17,13 @@ async fn wide_concat_timings() {
         let parts: Vec<Tensor<2, f32>> = (0..n).map(|_| a.mat_mul(&b)).collect();
         let cat = Tensor::cat(parts, 0);
         let t = Instant::now();
-        let _ = cat.as_slice().await.unwrap();
+        let slice = cat.as_slice().await.unwrap();
         eprintln!("wide cat  n={n:>4}  as_slice={:?}", t.elapsed());
+
+        // Each row is the result of [1; 16] @ [1; 16]^T summed across 16, so 16.0.
+        assert_eq!(slice.shape(), &[n * 16, 16]);
+        assert_eq!(slice[[0, 0]], 16.0);
+        assert_eq!(slice[[n * 16 - 1, 15]], 16.0);
     }
 }
 
@@ -32,11 +41,23 @@ async fn two_input_cat_in_chain() {
             x = Tensor::cat([pad.clone(), x, pad], 0);
         }
         let t = Instant::now();
-        let _ = x.as_slice().await.unwrap();
+        let slice = x.as_slice().await.unwrap();
         eprintln!(
             "binary cat chain n={n:>4}  total={:?}  final_rows={}",
             t.elapsed(),
             x.shape()[0]
+        );
+
+        // After n rounds of cat([pad, x, pad]) over a starting 16-row tensor,
+        // there are n pads on each side flanking the original 16 rows.
+        let expected_rows = 16 + 2 * n;
+        assert_eq!(slice.shape(), &[expected_rows, 16]);
+        assert_eq!(slice[[0, 0]], 0.0, "leading pad should be zero");
+        assert_eq!(slice[[n, 0]], 1.0, "first original row should be one");
+        assert_eq!(
+            slice[[expected_rows - 1, 0]],
+            0.0,
+            "trailing pad should be zero"
         );
     }
 }
@@ -61,10 +82,16 @@ async fn pure_slice_assign_cost() {
         }
         let build = t.elapsed();
         let t = Instant::now();
-        let _ = buf.as_slice().await.unwrap();
+        let slice = buf.as_slice().await.unwrap();
         eprintln!(
             "slice_assign n={n:>4} size={size}  build={build:?}  as_slice={:?}",
             t.elapsed()
         );
+
+        // Every slot should have been overwritten with the piece value.
+        assert_eq!(slice.shape(), &[size * n]);
+        assert_eq!(slice[[0]], 1.0);
+        assert_eq!(slice[[size * n - 1]], 1.0);
+        assert_eq!(slice[[size * n / 2]], 1.0);
     }
 }

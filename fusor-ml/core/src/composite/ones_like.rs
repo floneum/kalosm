@@ -8,21 +8,25 @@ impl<const R: usize, D: DataType> Tensor<R, D> {
 }
 
 #[cfg(test)]
-#[tokio::test]
-async fn test_ones_like() {
-    use crate::Device;
+mod tests {
+    use super::*;
 
-    let device = Device::new().await.unwrap();
+    #[tokio::test]
+    async fn test_ones_like() {
+        use crate::Device;
 
-    let data = [[1., 2.], [3., 4.]];
-    let tensor = Tensor::new(&device, &data);
-    let ones = tensor.ones_like();
+        let device = Device::new().await.unwrap();
 
-    assert_eq!(ones.shape(), tensor.shape());
+        let data = [[1., 2.], [3., 4.]];
+        let tensor = Tensor::new(&device, &data);
+        let ones = tensor.ones_like();
 
-    let ones_slice = ones.as_slice().await.unwrap();
-    assert_eq!(ones_slice[[0, 0]], 1.);
-    assert_eq!(ones_slice[[0, 1]], 1.);
-    assert_eq!(ones_slice[[1, 0]], 1.);
-    assert_eq!(ones_slice[[1, 1]], 1.);
+        assert_eq!(ones.shape(), tensor.shape());
+
+        let ones_slice = ones.as_slice().await.unwrap();
+        assert_eq!(ones_slice[[0, 0]], 1.);
+        assert_eq!(ones_slice[[0, 1]], 1.);
+        assert_eq!(ones_slice[[1, 0]], 1.);
+        assert_eq!(ones_slice[[1, 1]], 1.);
+    }
 }
