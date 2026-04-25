@@ -2,7 +2,7 @@ mod common;
 
 use common::{conv1d_ncw, matmul2, pool1d_ncw};
 use fusor::{Device, Tensor};
-use fusor_conformance::{FuzzGenerator, approx_compare};
+use fusor_conformance::{FuzzGenerator, approx_compare, approx_eq};
 use rand::distr::Uniform;
 
 #[tokio::test]
@@ -160,6 +160,47 @@ async fn matmul_batched_3d_matches_host_reference() {
         )
         .compare_with(approx_compare::<3, f32>(1e-3))
         .runs(3)
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn gpu_batched_matmul_scaled_input_fuses_and_matches_cpu() {
+    let Ok(device) = Device::gpu().await else {
+        return;
+    };
+
+    const LHS_SHAPE: [usize; 3] = [2, 128, 16];
+    const RHS_SHAPE: [usize; 3] = [2, 16, 64];
+    const SCALE: f32 = 0.125;
+
+    fn data(shape: [usize; 3], seed: usize) -> Vec<f32> {
+        let total: usize = shape.iter().product();
+        (0..total)
+            .map(|i| {
+                let v = ((i * 17 + seed) % 41) as f32;
+                (v - 20.0) * 0.025
+            })
+            .collect()
+    }
+
+    let lhs_data = data(LHS_SHAPE, 3);
+    let rhs_data = data(RHS_SHAPE, 11);
+    let lhs = Tensor::from_slice(&device, LHS_SHAPE, &lhs_data);
+    let rhs = Tensor::from_slice(&device, RHS_SHAPE, &rhs_data);
+
+    let actual = (lhs * SCALE).matmul(&rhs);
+    assert_eq!(
+        actual.as_gpu().unwrap().count_kernels_to_resolve(),
+        1,
+        "scaled rank-3 matmul input should fuse into the matmul kernel"
+    );
+
+    let cpu_lhs = Tensor::from_slice(&Device::Cpu, LHS_SHAPE, &lhs_data);
+    let cpu_rhs = Tensor::from_slice(&Device::Cpu, RHS_SHAPE, &rhs_data);
+    let expected = (cpu_lhs * SCALE).matmul(&cpu_rhs).to_concrete();
+
+    approx_eq(&actual.to_concrete(), &expected, 1e-3)
         .await
         .unwrap();
 }

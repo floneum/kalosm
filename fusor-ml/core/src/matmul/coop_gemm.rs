@@ -1,8 +1,7 @@
 use std::{fmt::Write, sync::OnceLock};
 
 use crate::MatMulOperation;
-use crate::mir::globals::KernelGlobalSpace;
-use crate::mir::inputs::TensorInput;
+use crate::mir::{function::Function, globals::KernelGlobalSpace, inputs::TensorInput};
 use crate::{Device, mir::kernel::GenericKernel};
 
 /// Parameters for cooperative matrix matmul.
@@ -75,6 +74,7 @@ pub(super) fn build_kernel(
     let input_a_tensor = input_a.as_tensor().unwrap();
     let input_b_tensor = input_b.as_tensor().unwrap();
     let use_direct_store = matmul.post_element_wise.functions.is_empty();
+    let pre_element_wise_functions: OnceLock<[Vec<Function>; 2]> = OnceLock::new();
     let post_element_wise_functions = OnceLock::new();
 
     kernel.enable_cooperative_matrix();
@@ -195,6 +195,8 @@ pub(super) fn build_kernel(
     let b_col_stride = input_b.stride_binding(matmul.rank() - 1);
     let out_row_stride = output.stride_binding(matmul.rank() - 2);
     let out_col_stride = output.stride_binding(matmul.rank() - 1);
+    let pre_element_wise_functions = pre_element_wise_functions
+        .get_or_init(|| std::array::from_fn(|i| matmul.pre_element_wise[i].add_functions(kernel)));
 
     // Number of K-tile pairs (egging processes 2 k-tiles per loop iteration for double buffering)
     writeln!(
@@ -250,6 +252,7 @@ pub(super) fn build_kernel(
         block_k,
         tile_stride: stride_a,
         wg_threads,
+        pre_element_wise: &pre_element_wise_functions[0],
     };
     let tile_b_ctx = TileBLoadCtx {
         input: &input_b,
@@ -262,6 +265,7 @@ pub(super) fn build_kernel(
         bn_pass,
         tile_stride: stride_b,
         wg_threads,
+        pre_element_wise: &pre_element_wise_functions[1],
     };
     let mma_params = MmaParams {
         stride_a,
@@ -459,6 +463,13 @@ struct TileALoadCtx<'a> {
     block_k: u32,
     tile_stride: u32, // = block_k + 1
     wg_threads: u32,
+    pre_element_wise: &'a [Function],
+}
+
+fn apply_pre_element_wise(functions: &[Function], value: impl Into<String>) -> String {
+    functions
+        .iter()
+        .fold(value.into(), |acc, function| function.call(vec![acc]))
 }
 
 /// Emit tile A load from global → shared memory.
@@ -482,6 +493,7 @@ fn emit_tile_a_load_row_major(
         block_k,
         tile_stride,
         wg_threads,
+        pre_element_wise,
     } = *ctx;
     // Each thread loads 4 K values (vec4). Total coverage: wg_threads threads × 4 K values each
     // threads_per_m_row = wg_threads, but we tile as: m = lid % block_m, k_group = lid / block_m
@@ -523,10 +535,14 @@ fn emit_tile_a_load_row_major(
             "        let a_values = vec4<f32>({input}[a_addr + 0u * {col_stride}], {input}[a_addr + 1u * {col_stride}], {input}[a_addr + 2u * {col_stride}], {input}[a_addr + 3u * {col_stride}]);"
         )
         .unwrap();
-        writeln!(kernel, "        {tile}[a_m * {tile_stride}u + (a_k_group * 4u + 0u)] = select(0.0, a_values.x, m_in_bounds && (global_k + 0u) < {k_size});").unwrap();
-        writeln!(kernel, "        {tile}[a_m * {tile_stride}u + (a_k_group * 4u + 1u)] = select(0.0, a_values.y, m_in_bounds && (global_k + 1u) < {k_size});").unwrap();
-        writeln!(kernel, "        {tile}[a_m * {tile_stride}u + (a_k_group * 4u + 2u)] = select(0.0, a_values.z, m_in_bounds && (global_k + 2u) < {k_size});").unwrap();
-        writeln!(kernel, "        {tile}[a_m * {tile_stride}u + (a_k_group * 4u + 3u)] = select(0.0, a_values.w, m_in_bounds && (global_k + 3u) < {k_size});").unwrap();
+        let a_value_x = apply_pre_element_wise(pre_element_wise, "a_values.x");
+        let a_value_y = apply_pre_element_wise(pre_element_wise, "a_values.y");
+        let a_value_z = apply_pre_element_wise(pre_element_wise, "a_values.z");
+        let a_value_w = apply_pre_element_wise(pre_element_wise, "a_values.w");
+        writeln!(kernel, "        {tile}[a_m * {tile_stride}u + (a_k_group * 4u + 0u)] = select(0.0, {a_value_x}, m_in_bounds && (global_k + 0u) < {k_size});").unwrap();
+        writeln!(kernel, "        {tile}[a_m * {tile_stride}u + (a_k_group * 4u + 1u)] = select(0.0, {a_value_y}, m_in_bounds && (global_k + 1u) < {k_size});").unwrap();
+        writeln!(kernel, "        {tile}[a_m * {tile_stride}u + (a_k_group * 4u + 2u)] = select(0.0, {a_value_z}, m_in_bounds && (global_k + 2u) < {k_size});").unwrap();
+        writeln!(kernel, "        {tile}[a_m * {tile_stride}u + (a_k_group * 4u + 3u)] = select(0.0, {a_value_w}, m_in_bounds && (global_k + 3u) < {k_size});").unwrap();
         writeln!(kernel, "      }}").unwrap();
     }
     writeln!(kernel, "    }}").unwrap();
@@ -545,6 +561,7 @@ struct TileBLoadCtx<'a> {
     bn_pass: u32,
     tile_stride: u32,
     wg_threads: u32,
+    pre_element_wise: &'a [Function],
 }
 
 /// Emit tile B load from global → shared memory.
@@ -567,6 +584,7 @@ fn emit_tile_b_load(
         bn_pass,
         tile_stride,
         wg_threads,
+        pre_element_wise,
     } = *ctx;
     if bn_pass.is_multiple_of(4) {
         let total_vec4_groups = block_k * (bn_pass / 4);
@@ -596,10 +614,14 @@ fn emit_tile_b_load(
                 "        let b_values = vec4<f32>({input}[b_addr + 0u * {col_stride}], {input}[b_addr + 1u * {col_stride}], {input}[b_addr + 2u * {col_stride}], {input}[b_addr + 3u * {col_stride}]);"
             )
             .unwrap();
-            writeln!(kernel, "        {tile}[tile_k * {tile_stride}u + (tile_n_group * 4u + 0u)] = select(0.0, b_values.x, k_in_bounds && (global_n + 0u) < {n_size});").unwrap();
-            writeln!(kernel, "        {tile}[tile_k * {tile_stride}u + (tile_n_group * 4u + 1u)] = select(0.0, b_values.y, k_in_bounds && (global_n + 1u) < {n_size});").unwrap();
-            writeln!(kernel, "        {tile}[tile_k * {tile_stride}u + (tile_n_group * 4u + 2u)] = select(0.0, b_values.z, k_in_bounds && (global_n + 2u) < {n_size});").unwrap();
-            writeln!(kernel, "        {tile}[tile_k * {tile_stride}u + (tile_n_group * 4u + 3u)] = select(0.0, b_values.w, k_in_bounds && (global_n + 3u) < {n_size});").unwrap();
+            let b_value_x = apply_pre_element_wise(pre_element_wise, "b_values.x");
+            let b_value_y = apply_pre_element_wise(pre_element_wise, "b_values.y");
+            let b_value_z = apply_pre_element_wise(pre_element_wise, "b_values.z");
+            let b_value_w = apply_pre_element_wise(pre_element_wise, "b_values.w");
+            writeln!(kernel, "        {tile}[tile_k * {tile_stride}u + (tile_n_group * 4u + 0u)] = select(0.0, {b_value_x}, k_in_bounds && (global_n + 0u) < {n_size});").unwrap();
+            writeln!(kernel, "        {tile}[tile_k * {tile_stride}u + (tile_n_group * 4u + 1u)] = select(0.0, {b_value_y}, k_in_bounds && (global_n + 1u) < {n_size});").unwrap();
+            writeln!(kernel, "        {tile}[tile_k * {tile_stride}u + (tile_n_group * 4u + 2u)] = select(0.0, {b_value_z}, k_in_bounds && (global_n + 2u) < {n_size});").unwrap();
+            writeln!(kernel, "        {tile}[tile_k * {tile_stride}u + (tile_n_group * 4u + 3u)] = select(0.0, {b_value_w}, k_in_bounds && (global_n + 3u) < {n_size});").unwrap();
             writeln!(kernel, "      }}").unwrap();
         }
     } else {
@@ -620,7 +642,17 @@ fn emit_tile_b_load(
                 "        let in_bounds_b = global_k < {k_size} && global_n < {n_size};"
             )
             .unwrap();
-            writeln!(kernel, "        let b_val = select(0.0, {input}[{start_index} + min(global_k, {k_size} - 1u) * {row_stride} + min(global_n, {n_size} - 1u) * {col_stride}], in_bounds_b);").unwrap();
+            let b_value = apply_pre_element_wise(
+                pre_element_wise,
+                format!(
+                    "{input}[{start_index} + min(global_k, {k_size} - 1u) * {row_stride} + min(global_n, {n_size} - 1u) * {col_stride}]"
+                ),
+            );
+            writeln!(
+                kernel,
+                "        let b_val = select(0.0, {b_value}, in_bounds_b);"
+            )
+            .unwrap();
             writeln!(
                 kernel,
                 "        {tile}[tile_k * {tile_stride}u + tile_n] = b_val;"
