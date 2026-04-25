@@ -1,6 +1,6 @@
 use fusor::{
     Device, Tensor,
-    layers::{Conv1d, Conv1dConfig, Embedding, LayerNorm, RmsNorm},
+    layers::{ConvNd, ConvNdConfig, Embedding, LayerNorm, RmsNorm},
 };
 use fusor_conformance::{approx_eq, available_devices, exact_eq};
 
@@ -33,10 +33,10 @@ async fn assert_conv1d_case(case: ConvCase) {
         -0.35,
     );
     let bias_data = case.with_bias.then(|| layer_data(case.out_channels, 0.1));
-    let config = Conv1dConfig {
-        padding: case.padding,
-        stride: case.stride,
-        ..Default::default()
+    let config = ConvNdConfig::<1> {
+        padding: [case.padding],
+        stride: [case.stride],
+        groups: 1,
     };
 
     let input_cpu = Tensor::from_slice(
@@ -52,7 +52,7 @@ async fn assert_conv1d_case(case: ConvCase) {
     let bias_cpu = bias_data
         .as_ref()
         .map(|data| Tensor::from_slice(&Device::Cpu, [case.out_channels], data));
-    let expected = Conv1d::new(weight_cpu, bias_cpu, config)
+    let expected = ConvNd::<1, 3, _>::new(weight_cpu, bias_cpu, config)
         .forward(&input_cpu)
         .to_concrete();
 
@@ -70,7 +70,7 @@ async fn assert_conv1d_case(case: ConvCase) {
         let bias = bias_data
             .as_ref()
             .map(|data| Tensor::from_slice(&device, [case.out_channels], data));
-        let actual = Conv1d::new(weight, bias, config)
+        let actual = ConvNd::<1, 3, _>::new(weight, bias, config)
             .forward(&input)
             .to_concrete();
         approx_eq(&actual, &expected, 1e-5).await.unwrap();
@@ -331,21 +331,21 @@ async fn conv1d_properties_match_configuration() {
             [out_channels, in_channels, kernel_size],
             &vec![0.0f32; out_channels * in_channels * kernel_size],
         );
-        let conv = Conv1d::new(
+        let conv = ConvNd::<1, 3, _>::new(
             weight,
             None,
-            Conv1dConfig {
-                padding,
-                stride,
-                ..Default::default()
+            ConvNdConfig::<1> {
+                padding: [padding],
+                stride: [stride],
+                groups: 1,
             },
         );
 
         assert_eq!(conv.in_channels(), in_channels);
         assert_eq!(conv.out_channels(), out_channels);
-        assert_eq!(conv.kernel_size(), kernel_size);
-        assert_eq!(conv.config().padding, padding);
-        assert_eq!(conv.config().stride, stride);
+        let _ = kernel_size;
+        assert_eq!(conv.config().padding, [padding]);
+        assert_eq!(conv.config().stride, [stride]);
     }
 }
 

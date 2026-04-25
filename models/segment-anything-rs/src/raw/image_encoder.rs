@@ -327,9 +327,12 @@ fn window_unpartition(
     let n_w = w_p / window_size;
     let b = total / (n_h * n_w);
 
+    // The middle `to_concrete()` is load-bearing: after `transpose(2, 3)` the
+    // tensor is non-contiguous, and the following `reshape` flattens windows
+    // back into the spatial dims with a stride pattern that requires
+    // contiguous backing storage.
     let xs: Tensor<4, f32, ConcreteTensor<f32, 4>> = windows
         .reshape([b, n_h, n_w, window_size, window_size, c])
-        .to_concrete()
         .transpose(2, 3) // (b, n_h, ws, n_w, ws, c)
         .to_concrete()
         .reshape([b, h_p, w_p, c])

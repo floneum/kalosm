@@ -8,18 +8,6 @@ repository = "https://github.com/floneum/floneum"
 authors = ["Evan Almloff <evanalmloff@gmail.com>"]
 keywords = ["ai", "segment-anything", "segmentation", "computer-vision"]
 
-[features]
-# Backward-compat stubs. Device selection is now runtime via fusor's
-# `Device::auto()`; these features are accepted but no longer affect the build.
-metal = []
-cuda = []
-cudnn = []
-cublas = []
-mkl = []
-accelerate = []
-flash = []
-nccl = []
-
 [dependencies]
 fusor = { workspace = true }
 fusor-gguf = { workspace = true }

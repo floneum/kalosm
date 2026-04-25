@@ -195,7 +195,6 @@ impl PromptEncoder {
         let device = points.device();
         let points_shape = points.shape();
         let batch = points_shape[0];
-        let _labels_shape = labels.shape();
 
         let (points, labels) = if pad {
             let padding_point: Tensor<3, f32> = Tensor::zeros(&device, [batch, 1, 2]);

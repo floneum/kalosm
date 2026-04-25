@@ -234,18 +234,34 @@ mod tests {
     async fn test_gelu_large_values() {
         use crate::Device;
 
-        let data = [10.0f32, 100.0, 500.0, 1000.0, 2725.0, -10.0, -100.0, -500.0];
+        // Without the TANH_INPUT_CLAMP, WGSL's `(e^x - e^-x) / (e^x + e^-x)`
+        // overflows to NaN for x > ~88. The values below all push past that
+        // threshold; if the clamp regresses, gelu(x) will return NaN and the
+        // assertion below will fail.
+        let positive = [50.0f32, 100.0, 500.0, 1000.0, 2725.0];
+        let negative = [-50.0f32, -100.0, -500.0, -1000.0];
 
         let gpu_device = Device::new().await.expect("GPU required for this test");
-        let gpu_tensor: Tensor<1, f32> = Tensor::from_slice(&gpu_device, [8], &data);
-        let gpu_slice = gpu_tensor.gelu().as_slice().await.unwrap();
 
-        // For large positive x, gelu(x) ≈ x.
-        assert!(
-            (gpu_slice[[4]] - 2725.0).abs() < 1.0,
-            "GPU gelu(2725) should be ~2725, got {}",
-            gpu_slice[[4]]
-        );
+        let pos_tensor: Tensor<1, f32> = Tensor::from_slice(&gpu_device, [5], &positive);
+        let pos_slice = pos_tensor.gelu().as_slice().await.unwrap();
+        for (i, &x) in positive.iter().enumerate() {
+            let got: f32 = pos_slice[[i]].into();
+            assert!(
+                (got - x).abs() < 0.01,
+                "gelu({x}) ≈ {x} (within 0.01), got {got}",
+            );
+        }
+
+        let neg_tensor: Tensor<1, f32> = Tensor::from_slice(&gpu_device, [4], &negative);
+        let neg_slice = neg_tensor.gelu().as_slice().await.unwrap();
+        for (i, &x) in negative.iter().enumerate() {
+            let got: f32 = neg_slice[[i]].into();
+            assert!(
+                got.abs() < 0.01,
+                "gelu({x}) ≈ 0 (within 0.01), got {got}",
+            );
+        }
     }
 
     #[cfg(not(target_os = "windows"))]

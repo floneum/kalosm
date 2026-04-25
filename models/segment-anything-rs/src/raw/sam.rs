@@ -279,6 +279,14 @@ impl Sam {
         let c = shape[0];
         let h = shape[1];
         let w = shape[2];
+        // Callers (`image_to_tensor`) resize so the longer side is exactly
+        // IMAGE_SIZE; assert here so a mistake elsewhere fails loudly instead
+        // of producing a `pad_with_zeros(.., IMAGE_SIZE.wrapping_sub(h))` panic
+        // deep in the tensor stack.
+        assert!(
+            h <= IMAGE_SIZE && w <= IMAGE_SIZE,
+            "preprocess input ({h}x{w}) exceeds IMAGE_SIZE ({IMAGE_SIZE}); resize before calling",
+        );
         let device = img.device();
 
         // Create mean and std tensors: (3, 1, 1) broadcast to (3, H, W)
@@ -308,8 +316,13 @@ impl Sam {
 /// `(batch_size, n_points_per_batch, 2)` xy tensor and `(batch_size,
 /// n_points_per_batch)` label tensor expected by the prompt encoder.
 ///
-/// `points.len()` is interpreted as either `batch_size` (one point per batch)
-/// or `1 * n_points` (one batch with N points), depending on `batch_size`.
+/// The two callers use this in different modes:
+/// - `forward_for_embeddings` passes `batch_size = 1`, so `points` is laid out
+///   as `[1, points.len(), 2]` (one prompt with N points).
+/// - `forward_for_embeddings_batched` passes `batch_size = points.len()`, so
+///   `points` is laid out as `[N, 1, 2]` (N prompts with one point each).
+///
+/// `points.len()` must equal `batch_size * n_points_per_batch` exactly.
 fn build_point_tensors(
     device: &Device,
     points: &[(f64, f64, bool)],
@@ -317,6 +330,11 @@ fn build_point_tensors(
     original_w: usize,
     batch_size: usize,
 ) -> (Tensor<3, f32>, Tensor<2, f32>) {
+    assert!(
+        batch_size > 0 && points.len() % batch_size == 0,
+        "build_point_tensors: points.len() ({}) must be a multiple of batch_size ({batch_size})",
+        points.len(),
+    );
     let n_per_batch = points.len() / batch_size;
     let xys: Vec<f32> = points
         .iter()

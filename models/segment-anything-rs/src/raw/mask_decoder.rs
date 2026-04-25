@@ -14,20 +14,28 @@ const TRANSFORMER_NUM_HEADS: usize = 8;
 const TRANSFORMER_MLP_DIM: usize = 2048;
 /// Hyper-network MLPs that turn each mask token into a per-pixel kernel.
 const HYPER_MLP_LAYERS: usize = 3;
-/// Expected upscaling kernel shape (2x2 stride-2 transposed conv).
+/// Expected upscaling kernel shape. SAM stores this layer in checkpoints as
+/// a 2x2 stride-2 `ConvTranspose2d`; because stride == kernel and there is no
+/// kernel overlap in the output, the math is equivalent to (and implemented
+/// here as) a `(in_ch, out_ch * 4)` matmul followed by a pixel-shuffle.
 const UPSCALE_KERNEL_HW: [usize; 2] = [2, 2];
 
-/// Private 2x2 stride-2 learned upsampler used by the SAM output head.
+/// Private 2x2 stride-2 pixel-shuffle upsampler used by the SAM output head.
+///
+/// Mathematically equivalent to `ConvTranspose2d(in, out, kernel=2, stride=2)`,
+/// but implemented as a `(in_ch, out_ch * 4)` matmul followed by a
+/// pixel-shuffle because stride == kernel means output windows never overlap
+/// (so no per-pixel accumulation is required). The equivalence to
+/// `ConvTranspose2d` is locked down by `test_upscale_matches_conv_transpose`.
 ///
 /// This is intentionally local to the SAM port rather than exposed as a generic
-/// `fusor` layer. The implementation relies on the exact kernel/stride pattern
-/// used by SAM and reorders the result into image space with a pixel-shuffle.
-struct SamUpscale2x2 {
+/// `fusor` layer.
+struct SamPixelShuffleUpscale2x2 {
     weight: Tensor<4, f32, ConcreteTensor<f32, 4>>,
     bias: Option<Tensor<1, f32, ConcreteTensor<f32, 1>>>,
 }
 
-impl SamUpscale2x2 {
+impl SamPixelShuffleUpscale2x2 {
     fn load(device: &Device, vb: &mut VarBuilder) -> Result<Self> {
         let weight: Tensor<4, f32> = vb.get("weight", device)?.dequantize();
         let bias: Option<Tensor<1, f32, ConcreteTensor<f32, 1>>> =
@@ -135,9 +143,9 @@ pub struct MaskDecoder {
     iou_token: Embedding<f32>,
     mask_tokens: Embedding<f32>,
     iou_prediction_head: MlpMaskDecoder,
-    output_upscaling_conv1: SamUpscale2x2,
+    output_upscaling_conv1: SamPixelShuffleUpscale2x2,
     output_upscaling_ln: LayerNormNd<f32>,
-    output_upscaling_conv2: SamUpscale2x2,
+    output_upscaling_conv2: SamPixelShuffleUpscale2x2,
     num_mask_tokens: usize,
     output_hypernetworks_mlps: Vec<MlpMaskDecoder>,
     transformer: TwoWayTransformer,
@@ -160,10 +168,10 @@ impl MaskDecoder {
         )?;
         let iou_token = Embedding::load(device, &mut vb.pp("iou_token"))?;
         let mask_tokens = Embedding::load(device, &mut vb.pp("mask_tokens"))?;
-        let output_upscaling_conv1 = SamUpscale2x2::load(device, &mut vb.pp("output_upscaling.0"))?;
+        let output_upscaling_conv1 = SamPixelShuffleUpscale2x2::load(device, &mut vb.pp("output_upscaling.0"))?;
         let output_upscaling_ln =
             LayerNormNd::<f32>::load_over_axis(device, &mut vb.pp("output_upscaling.1"), 1, 1e-6)?;
-        let output_upscaling_conv2 = SamUpscale2x2::load(device, &mut vb.pp("output_upscaling.3"))?;
+        let output_upscaling_conv2 = SamPixelShuffleUpscale2x2::load(device, &mut vb.pp("output_upscaling.3"))?;
         let mut output_hypernetworks_mlps = Vec::with_capacity(num_mask_tokens);
         for i in 0..num_mask_tokens {
             let mlp = MlpMaskDecoder::load(
@@ -377,7 +385,7 @@ mod tests {
             .map(|i| (i as f32 * 0.0625).cos() * 0.25)
             .collect();
         let conv1_bias_data: Vec<f32> = (0..MID_CH).map(|i| i as f32 * 0.1 - 0.15).collect();
-        let conv1 = SamUpscale2x2 {
+        let conv1 = SamPixelShuffleUpscale2x2 {
             weight: Tensor::from_slice(&device, [IN_CH, MID_CH, 2, 2], &conv1_weight_data)
                 .to_concrete(),
             bias: Some(Tensor::from_slice(&device, [MID_CH], &conv1_bias_data).to_concrete()),
@@ -396,7 +404,7 @@ mod tests {
             .map(|i| (i as f32 * 0.046875).sin() * 0.2)
             .collect();
         let conv2_bias_data: Vec<f32> = (0..OUT_CH).map(|i| i as f32 * 0.08 - 0.04).collect();
-        let conv2 = SamUpscale2x2 {
+        let conv2 = SamPixelShuffleUpscale2x2 {
             weight: Tensor::from_slice(&device, [MID_CH, OUT_CH, 2, 2], &conv2_weight_data)
                 .to_concrete(),
             bias: Some(Tensor::from_slice(&device, [OUT_CH], &conv2_bias_data).to_concrete()),
@@ -430,6 +438,94 @@ mod tests {
         assert!(
             max_diff < 0.001,
             "batched upscaling diverged from per-item path: {max_diff}",
+        );
+    }
+
+    /// Reference ConvTranspose2d with stride == kernel == 2, no overlap.
+    /// Output[b, oc, oh, ow] = sum over ic of
+    ///   input[b, ic, oh / 2, ow / 2] * weight[ic, oc, oh % 2, ow % 2] + bias[oc].
+    fn conv_transpose_2x2_stride2_reference(
+        input: &[f32],
+        weight: &[f32],
+        bias: &[f32],
+        b: usize,
+        in_ch: usize,
+        out_ch: usize,
+        h: usize,
+        w: usize,
+    ) -> Vec<f32> {
+        let out_h = h * 2;
+        let out_w = w * 2;
+        let mut out = vec![0.0f32; b * out_ch * out_h * out_w];
+        for bi in 0..b {
+            for oc in 0..out_ch {
+                for oh in 0..out_h {
+                    for ow in 0..out_w {
+                        let ih = oh / 2;
+                        let iw = ow / 2;
+                        let kh = oh % 2;
+                        let kw = ow % 2;
+                        let mut acc = bias[oc];
+                        for ic in 0..in_ch {
+                            let in_idx = ((bi * in_ch + ic) * h + ih) * w + iw;
+                            // Weight layout: (in_ch, out_ch, kh, kw)
+                            let w_idx = ((ic * out_ch + oc) * 2 + kh) * 2 + kw;
+                            acc += input[in_idx] * weight[w_idx];
+                        }
+                        let out_idx = ((bi * out_ch + oc) * out_h + oh) * out_w + ow;
+                        out[out_idx] = acc;
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    #[tokio::test]
+    async fn test_upscale_matches_conv_transpose() {
+        let device = Device::new().await.unwrap();
+
+        const B: usize = 2;
+        const IN_CH: usize = 3;
+        const OUT_CH: usize = 4;
+        const H: usize = 5;
+        const W: usize = 6;
+
+        let input_data: Vec<f32> = (0..B * IN_CH * H * W)
+            .map(|i| (i as f32 * 0.07).sin())
+            .collect();
+        let weight_data: Vec<f32> = (0..IN_CH * OUT_CH * 2 * 2)
+            .map(|i| ((i as f32 * 0.13).cos() - 0.5) * 0.4)
+            .collect();
+        let bias_data: Vec<f32> = (0..OUT_CH).map(|i| i as f32 * 0.05 - 0.1).collect();
+
+        let input: Tensor<4, f32> = Tensor::from_slice(&device, [B, IN_CH, H, W], &input_data);
+        let upscaler = SamPixelShuffleUpscale2x2 {
+            weight: Tensor::from_slice(&device, [IN_CH, OUT_CH, 2, 2], &weight_data).to_concrete(),
+            bias: Some(Tensor::from_slice(&device, [OUT_CH], &bias_data).to_concrete()),
+        };
+        let actual = upscaler.forward(&input.to_concrete());
+        let actual_vec = to_vec(&actual).await;
+
+        let expected = conv_transpose_2x2_stride2_reference(
+            &input_data,
+            &weight_data,
+            &bias_data,
+            B,
+            IN_CH,
+            OUT_CH,
+            H,
+            W,
+        );
+
+        let max_diff = actual_vec
+            .iter()
+            .zip(expected.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            max_diff < 1e-4,
+            "pixel-shuffle upscale diverged from ConvTranspose2d reference: {max_diff}",
         );
     }
 }

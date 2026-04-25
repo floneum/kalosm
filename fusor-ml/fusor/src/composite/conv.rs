@@ -84,7 +84,7 @@ where
     /// Unified convolution method that handles different tensor formats:
     /// - Multi-channel convolution (R = 2 + DIFF): (batch, channels, ...spatial) format
     ///
-    /// For Conv1d: R=3, DIFF=1 gives (batch, in_channels, length) -> (batch, out_channels, out_length)
+    /// For 1D conv: R=3, DIFF=1 gives (batch, in_channels, length) -> (batch, out_channels, out_length)
     pub fn conv<const WEIGHT_RANK: usize, const DIFF: usize, const R2: usize>(
         &self,
         weight: &Tensor<WEIGHT_RANK, D, ConcreteTensor<D, WEIGHT_RANK>>,
@@ -215,6 +215,64 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn test_pad_with_zeros_asymmetric_cpu() {
+        // Asymmetric padding: 2 zeros on the left, 1 on the right, axis=1.
+        let data: Vec<f32> = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
+        let input: Tensor<2, f32> = Tensor::Cpu(fusor_cpu::Tensor::from_slice([2, 3], &data));
+        let padded = input.pad_with_zeros(1, 2, 1);
+
+        assert_eq!(padded.shape(), [2, 6]);
+        let result = padded.as_slice().await.unwrap();
+        let expected = [
+            [0.0, 0.0, 1.0, 2.0, 3.0, 0.0],
+            [0.0, 0.0, 4.0, 5.0, 6.0, 0.0],
+        ];
+        for r in 0..2 {
+            for c in 0..6 {
+                assert_eq!(result[[r, c]], expected[r][c], "mismatch at [{r},{c}]");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_pad_with_zeros_left_only_cpu() {
+        let data: Vec<f32> = vec![7.0, 8.0, 9.0];
+        let input: Tensor<1, f32> = Tensor::Cpu(fusor_cpu::Tensor::from_slice([3], &data));
+        let padded = input.pad_with_zeros(0, 3, 0);
+
+        assert_eq!(padded.shape(), [6]);
+        let result = padded.as_slice().await.unwrap();
+        for (i, &expect) in [0.0, 0.0, 0.0, 7.0, 8.0, 9.0].iter().enumerate() {
+            assert_eq!(result[[i]], expect, "left-only pad mismatch at {i}");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_pad_with_zeros_right_only_cpu() {
+        let data: Vec<f32> = vec![1.0, 2.0];
+        let input: Tensor<1, f32> = Tensor::Cpu(fusor_cpu::Tensor::from_slice([2], &data));
+        let padded = input.pad_with_zeros(0, 0, 4);
+
+        assert_eq!(padded.shape(), [6]);
+        let result = padded.as_slice().await.unwrap();
+        for (i, &expect) in [1.0, 2.0, 0.0, 0.0, 0.0, 0.0].iter().enumerate() {
+            assert_eq!(result[[i]], expect, "right-only pad mismatch at {i}");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_pad_with_zeros_zero_returns_self_cpu() {
+        let data: Vec<f32> = vec![5.0, 6.0, 7.0];
+        let input: Tensor<1, f32> = Tensor::Cpu(fusor_cpu::Tensor::from_slice([3], &data));
+        let padded = input.pad_with_zeros(0, 0, 0);
+        assert_eq!(padded.shape(), [3]);
+        let result = padded.as_slice().await.unwrap();
+        for (i, &expect) in [5.0, 6.0, 7.0].iter().enumerate() {
+            assert_eq!(result[[i]], expect, "zero-pad should be identity at {i}");
+        }
+    }
 
     #[tokio::test]
     async fn test_conv_1d_cpu() {

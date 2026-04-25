@@ -48,11 +48,12 @@ where
         bias: Option<Tensor<1, D, ConcreteTensor<D, 1>>>,
         config: ConvNdConfig<SPATIAL>,
     ) -> Self {
-        assert_eq!(
-            RANK,
-            SPATIAL + 2,
-            "ConvNd requires RANK = SPATIAL + 2 (batch + channels + spatial)"
-        );
+        // RANK = SPATIAL + 2 (batch + channels + spatial). Compile-time so a
+        // misuse like `ConvNd::<2, 5, _>::new(...)` is rejected at the type
+        // level rather than panicking at runtime.
+        const {
+            assert!(RANK == SPATIAL + 2);
+        }
         let shape = weight.shape();
         let out_channels = shape[0];
         let in_channels = shape[1] * config.groups;

@@ -948,9 +948,11 @@ impl Resolver {
 
         // Pre-op: fuse elementwise before matmul inputs
         if let ComputeGraphNodeVariant::MatMul(matmul_op) = &node_variant {
-            // Batched matmul still has correctness issues when scalar elementwise ops
-            // are fused into an input tensor. Keep the fast path for rank-2 matmul and
-            // materialize the elementwise input first for batched kernels.
+            // TODO(fusor#batched-matmul-fuse): batched matmul produces wrong
+            // outputs when scalar elementwise ops are fused into an input
+            // tensor. Surfaced by the SAM port (vit attention with rank-3 q/k
+            // matmul + scalar scale). Until the kernel is fixed, fall back to
+            // materializing the elementwise input first for rank > 2.
             if matmul_op.rank() > 2 {
                 return false;
             }

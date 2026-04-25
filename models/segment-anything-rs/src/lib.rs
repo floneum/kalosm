@@ -469,32 +469,6 @@ impl SegmentAnything {
         Ok(masks)
     }
 
-    /// Load from a local GGUF file path. `tiny` selects between the TinyViT
-    /// (Mobile-SAM) and ViT-B architectures.
-    ///
-    /// Deprecated: prefer
-    /// `SegmentAnything::builder().source(SegmentAnythingSource::tiny()).gguf_path(path).build().await`
-    /// — the builder respects `device(...)` and gives consistent error
-    /// handling. This shim will be removed in a future release.
-    #[deprecated(
-        since = "0.5.0",
-        note = "Use `SegmentAnything::builder().source(...).gguf_path(path).build().await`"
-    )]
-    pub async fn from_gguf_path(
-        path: &std::path::Path,
-        tiny: bool,
-    ) -> Result<Self, LoadSegmentAnythingError> {
-        let source = if tiny {
-            SegmentAnythingSource::tiny()
-        } else {
-            SegmentAnythingSource::medium()
-        };
-        SegmentAnything::builder()
-            .source(source)
-            .gguf_path(path)
-            .build()
-            .await
-    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1154,6 +1128,39 @@ mod tests {
             iou_diff < 0.01,
             "Batched vs unbatched IoU divergence too large: {iou_diff}"
         );
+    }
+
+    #[test]
+    fn test_build_point_grid_matches_expected_layout() {
+        let grid = build_point_grid(4);
+        assert_eq!(grid.len(), 16);
+
+        // Offset is 1 / (2 * 4) = 0.125, then step by 1/4 = 0.25.
+        let coord = |i: usize| 0.125 + i as f64 * 0.25;
+        // Implementation iterates `i_x` in the outer loop and `i_y` inner,
+        // so points are emitted column-major (all y for x=0, then x=1, …).
+        let expected: Vec<(f64, f64)> = (0..4)
+            .flat_map(|ix| (0..4).map(move |iy| (coord(ix), coord(iy))))
+            .collect();
+
+        for (got, want) in grid.iter().zip(expected.iter()) {
+            assert!(
+                (got.0 - want.0).abs() < 1e-9 && (got.1 - want.1).abs() < 1e-9,
+                "got {got:?} want {want:?}",
+            );
+        }
+
+        // Every coordinate should fall inside (0, 1).
+        for &(x, y) in &grid {
+            assert!(x > 0.0 && x < 1.0, "x out of range: {x}");
+            assert!(y > 0.0 && y < 1.0, "y out of range: {y}");
+        }
+    }
+
+    #[test]
+    fn test_nms_handles_empty_input() {
+        let kept = non_maximum_suppression(Vec::new(), 0.5);
+        assert!(kept.is_empty());
     }
 
     #[test]
