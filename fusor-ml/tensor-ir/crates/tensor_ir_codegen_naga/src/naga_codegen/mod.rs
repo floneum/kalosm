@@ -22,7 +22,11 @@ use crate::{Verified, verify};
 
 pub(super) const MAX_DISPATCH_WORKGROUPS_PER_DIMENSION: u32 = 65_535;
 
-/// Cached type handles used throughout codegen.
+/// Lazy interner for Naga module type declarations.
+///
+/// The cache key is the full [`Type`] value, so named structs and every
+/// [`TypeInner`] variant can share the same path instead of needing one field
+/// per type shape that codegen happens to use today.
 #[derive(Default)]
 struct TypeCache {
     handles: HashMap<Type, Handle<Type>>,
