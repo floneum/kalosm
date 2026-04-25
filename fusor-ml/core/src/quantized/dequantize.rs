@@ -5,8 +5,8 @@ use crate::mir::inputs::MirValue;
 use crate::mir::operation::Operation;
 use crate::mir::workgroup_shape::WorkgroupShapeConstraints;
 use crate::{
-    DataType, DataTypeEnum, Device, ElementWiseFunctions, LazyTensorData, Tensor, TensorData,
-    TensorInfo, mir::kernel::GenericKernel,
+    DataType, DataTypeEnum, Device, LazyTensorData, Tensor, TensorData, TensorInfo,
+    mir::kernel::GenericKernel, nary_wise::UnaryFunctionChain,
 };
 use std::fmt::Write;
 
@@ -16,7 +16,7 @@ use super::{QMatrix, dequantize_block};
 pub(crate) struct DequantizeOperation {
     pub(crate) matrix: QMatrix,
     pub(crate) datatype: DataTypeEnum,
-    pub(crate) post_dequantize: ElementWiseFunctions,
+    pub(crate) post_dequantize: UnaryFunctionChain,
 }
 
 impl DequantizeOperation {
@@ -24,7 +24,7 @@ impl DequantizeOperation {
         DequantizeOperation {
             matrix,
             datatype,
-            post_dequantize: ElementWiseFunctions::empty(datatype),
+            post_dequantize: UnaryFunctionChain::empty(datatype),
         }
     }
 
@@ -219,116 +219,5 @@ impl QMatrix {
         );
 
         Tensor::from_parts(data)
-    }
-}
-
-#[cfg(test)]
-#[tokio::test]
-async fn test_dequantize_smol_lm() {
-    use crate::Device;
-    use fusor_gguf::GgufMetadata;
-
-    let device = Device::test_instance();
-
-    let url = "https://huggingface.co/unsloth/SmolLM2-135M-Instruct-GGUF/resolve/main/SmolLM2-135M-Instruct-Q4_K_M.gguf";
-    let bytes = reqwest::get(url).await.unwrap().bytes().await.unwrap();
-    let mut reader = std::io::Cursor::new(&bytes);
-    let metadata = GgufMetadata::read(&mut reader).unwrap();
-    let mut reader = std::io::Cursor::new(&bytes);
-    let candle_metadata = candle_core::quantized::gguf_file::Content::read(&mut reader).unwrap();
-
-    for (name, candle_q_matrix_metadata) in candle_metadata.tensor_infos {
-        let tensor = metadata.tensor_infos.get(&*name).unwrap();
-        println!("{name}: {tensor:?}");
-
-        let candle_q_tensor = candle_q_matrix_metadata
-            .read(
-                &mut reader,
-                candle_metadata.tensor_data_offset,
-                &candle_core::Device::Cpu,
-            )
-            .unwrap();
-        let candle_result = candle_q_tensor
-            .dequantize(&candle_core::Device::Cpu)
-            .unwrap();
-
-        let candle_result_doubled = (&candle_result * 2.0).unwrap();
-
-        let q_matrix_metadata = metadata.tensor_infos.get(&*name).unwrap();
-
-        let q_matrix = QMatrix::read(
-            &device,
-            q_matrix_metadata,
-            &mut reader,
-            metadata.tensor_data_offset,
-        )
-        .unwrap();
-        assert_eq!(candle_result.shape().dims(), q_matrix.shape());
-
-        match candle_result.rank() {
-            1 => {
-                let fusor_result = q_matrix.dequantize::<1, f32>();
-                let candle_result = candle_result.to_vec1::<f32>().unwrap();
-                let result = fusor_result.as_slice().await.unwrap();
-                for i in 0..candle_result.len() {
-                    let expected = candle_result[i];
-                    let actual = result[[i]];
-                    if (expected - actual).abs() > 0.01 {
-                        assert_eq!(
-                            expected, actual,
-                            "Mismatch at ({i}) - expected: {expected}, actual: {actual}"
-                        );
-                    }
-                }
-
-                let fusor_result = q_matrix.dequantize::<1, f32>() * 2.0;
-                let candle_result = candle_result_doubled.to_vec1::<f32>().unwrap();
-                let result = fusor_result.as_slice().await.unwrap();
-                for i in 0..candle_result.len() {
-                    let expected = candle_result[i];
-                    let actual = result[[i]];
-                    if (expected - actual).abs() > 0.01 {
-                        assert_eq!(
-                            expected, actual,
-                            "Mismatch at ({i}) - expected: {expected}, actual: {actual}"
-                        );
-                    }
-                }
-            }
-            2 => {
-                let fusor_result = q_matrix.dequantize::<2, f32>();
-                let candle_result = candle_result.to_vec2::<f32>().unwrap();
-                let result = fusor_result.as_slice().await.unwrap();
-                for x in 0..candle_result.len() {
-                    for y in 0..candle_result[0].len() {
-                        let expected = candle_result[x][y];
-                        let actual = result[[x, y]];
-                        if (expected - actual).abs() > 0.01 {
-                            assert_eq!(
-                                expected, actual,
-                                "Mismatch at ({x}, {y}) - expected: {expected}, actual: {actual}"
-                            );
-                        }
-                    }
-                }
-
-                let fusor_result = q_matrix.dequantize::<2, f32>() * 2.0;
-                let candle_result = candle_result_doubled.to_vec2::<f32>().unwrap();
-                let result = fusor_result.as_slice().await.unwrap();
-                for x in 0..candle_result.len() {
-                    for y in 0..candle_result[0].len() {
-                        let expected = candle_result[x][y];
-                        let actual = result[[x, y]];
-                        if (expected - actual).abs() > 0.01 {
-                            assert_eq!(
-                                expected, actual,
-                                "Mismatch at ({x}, {y}) - expected: {expected}, actual: {actual}"
-                            );
-                        }
-                    }
-                }
-            }
-            _ => todo!(),
-        }
     }
 }

@@ -60,8 +60,8 @@ where
 
     /// Slow softmax using composite operations (non-fused).
     ///
-    /// This is provided for API parity with fusor-core. On CPU, this is the same
-    /// as `softmax`. On GPU, fusor-core has an optimized fused kernel.
+    /// This uses the same composite implementation for both CPU and GPU:
+    /// softmax(x) = exp(x - max(x)) / sum(exp(x - max(x)))
     pub fn softmax_slow<const OUT_RANK: usize>(&self, axis: usize) -> Tensor<R, D>
     where
         ConcreteTensor<D, R>: CpuLastRank<OUT_RANK, D>,
@@ -75,10 +75,8 @@ where
         DivOp: SimdBinaryOp<D>,
         ExpOp: SimdUnaryOp<D>,
     {
-        match self {
-            Tensor::Cpu(_) => self.softmax_cpu_impl(axis),
-            Tensor::Gpu(t) => Tensor::Gpu(t.softmax_slow(axis)),
-        }
+        // Unified implementation using composite ops for both backends
+        self.softmax_cpu_impl(axis)
     }
 
     /// Slow softmax along the last dimension using composite operations.
@@ -407,12 +405,93 @@ where
     }
 }
 
-// Specialized f32 implementation with fused softmax
+// Specialized f32 implementation with fused normalization helpers
 impl<const R: usize, B> Tensor<R, f32, B>
 where
     B: TensorBacking<R, Elem = f32>,
     fusor_core::Tensor<R, f32>: fusor_core::LastRankInner,
 {
+    /// Optimized fused layer norm along the last dimension for f32.
+    ///
+    /// `weight` and `bias` are expected to contain exactly one row of parameters
+    /// for the last dimension. On CPU this uses the SIMD fused kernel after
+    /// reshaping those parameters to `[1, ..., 1, last_dim]` and making them
+    /// contiguous. On GPU it falls back to the common composite layer norm
+    /// implementation after broadcasting the parameters to the input shape.
+    pub fn layer_norm_last_dim_fused<const OUT_RANK: usize, const W: usize, B2, B3>(
+        &self,
+        weight: &Tensor<W, f32, B2>,
+        bias: Option<&Tensor<W, f32, B3>>,
+        eps: f32,
+    ) -> Tensor<R, f32>
+    where
+        ConcreteTensor<f32, R>: CpuLastRank<OUT_RANK, f32>,
+        fusor_core::Tensor<R, f32>: GpuLastRank<OUT_RANK, f32>,
+        <fusor_core::Tensor<R, f32> as fusor_core::LastRankInner>::LastRank:
+            GpuNextRankInner<NextRank = fusor_core::Tensor<R, f32>>,
+        SumOp: SimdReduceOp<f32>,
+        AddOp: SimdBinaryOp<f32>,
+        SubOp: SimdBinaryOp<f32>,
+        MulOp: SimdBinaryOp<f32>,
+        DivOp: SimdBinaryOp<f32>,
+        SqrtOp: SimdUnaryOp<f32>,
+        B2: TensorBacking<W, Elem = f32>,
+        B3: TensorBacking<W, Elem = f32>,
+    {
+        let last_dim = self.shape()[R - 1];
+        let weight_elements = weight.shape().iter().product::<usize>();
+        assert_eq!(
+            weight_elements, last_dim,
+            "layer_norm_last_dim_fused expects weight to contain exactly the last dimension"
+        );
+        if let Some(bias) = bias {
+            let bias_elements = bias.shape().iter().product::<usize>();
+            assert_eq!(
+                bias_elements, last_dim,
+                "layer_norm_last_dim_fused expects bias to contain exactly the last dimension"
+            );
+        }
+
+        let mut param_shape = [1; R];
+        param_shape[R - 1] = last_dim;
+
+        match (self, weight) {
+            (Tensor::Cpu(input), Tensor::Cpu(weight)) => {
+                let input = input.as_ref().make_contiguous();
+                let weight = weight.as_ref().reshape(param_shape).make_contiguous();
+                let bias = match bias {
+                    Some(Tensor::Cpu(bias)) => {
+                        Some(bias.as_ref().reshape(param_shape).make_contiguous())
+                    }
+                    Some(Tensor::Gpu(_)) => {
+                        panic!("Layer norm requires tensors on the same backend")
+                    }
+                    None => None,
+                };
+                let result = fusor_cpu::layer_norm_last_dim_fused(
+                    input.inner(),
+                    weight.inner(),
+                    bias.as_ref().map(|bias| bias.inner()),
+                    eps,
+                );
+                Tensor::Cpu(fusor_cpu::Tensor::new(result))
+            }
+            (Tensor::Gpu(_), Tensor::Gpu(_)) => {
+                if matches!(bias, Some(Tensor::Cpu(_))) {
+                    panic!("Layer norm requires tensors on the same backend");
+                }
+                let weight_params = weight.reshape(param_shape);
+                let weight = weight_params.broadcast_as(self.shape());
+                let bias_params = bias.map(|bias| bias.reshape(param_shape));
+                let bias = bias_params
+                    .as_ref()
+                    .map(|bias| bias.broadcast_as(self.shape()));
+                self.layer_norm::<OUT_RANK, _, _>(&weight, bias.as_ref(), eps, true)
+            }
+            _ => panic!("Layer norm requires tensors on the same backend"),
+        }
+    }
+
     /// Optimized fused softmax along the last dimension for f32.
     ///
     /// This performs the entire softmax (max, exp, sum, normalize) in a single
@@ -424,7 +503,7 @@ where
         self.dispatch_ref(
             |t| {
                 // Make contiguous if needed, then use fused kernel
-                let contiguous = t.to_concrete();
+                let contiguous = t.as_ref().make_contiguous();
                 let result = fusor_cpu::softmax_last_dim_fused(contiguous.inner());
                 fusor_cpu::Tensor::new(result)
             },

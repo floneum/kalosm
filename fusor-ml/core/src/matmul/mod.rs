@@ -2,18 +2,30 @@ use crate::matmul::sgemm_params::gemm_parameters;
 use crate::matmul::sgemv_params::gemv_parameters;
 use crate::mir::operation::Operation;
 use crate::{
-    Device, ElementWiseFunctions, Tensor,
+    Device, Tensor,
     compute_graph::NodeIndex,
     mir::kernel::GenericKernel,
+    nary_wise::UnaryFunctionChain,
     tensor::{DataType, DataTypeEnum, TensorData},
 };
 
+pub mod coop_gemm;
 pub mod sgemm;
 mod sgemm_params;
 pub mod sgemv;
 mod sgemv_params;
 
-pub fn get_optimal_params(m: usize, n: usize, k: usize) -> MatMulParams {
+pub fn get_optimal_params(m: usize, n: usize, k: usize, device: &Device) -> MatMulParams {
+    let coop = coop_gemm::CoopGemmParams::default();
+    if device.cooperative_matrix_supported()
+        && m >= coop.block_m as usize
+        && n >= coop.block_n as usize
+        && k >= coop.block_k as usize
+        && m.is_multiple_of(coop.block_m as usize)
+        && n.is_multiple_of(coop.block_n as usize)
+    {
+        return MatMulParams::CoopMatMul(coop);
+    }
     match (m, n, k) {
         (_, 0..=64, _) => MatMulParams::Vector(gemv_parameters(m, n, k)),
         (_, _, _) => MatMulParams::MatMul(gemm_parameters(m, n, k)),
@@ -24,6 +36,7 @@ pub fn get_optimal_params(m: usize, n: usize, k: usize) -> MatMulParams {
 pub enum MatMulParams {
     Vector(sgemv::SgemvParams),
     MatMul(sgemm::SgemmParams),
+    CoopMatMul(coop_gemm::CoopGemmParams),
 }
 
 #[derive(Debug, Clone)]
@@ -34,8 +47,8 @@ pub(crate) struct MatMulOperation {
     pub(crate) first_shape: Box<[usize]>,
     pub(crate) second_shape: Box<[usize]>,
     pub(crate) out_shape: Box<[usize]>,
-    pub(crate) pre_element_wise: [ElementWiseFunctions; 2],
-    pub(crate) post_element_wise: ElementWiseFunctions,
+    pub(crate) pre_element_wise: [UnaryFunctionChain; 2],
+    pub(crate) post_element_wise: UnaryFunctionChain,
     pub(crate) parameters: MatMulParams,
 }
 
@@ -47,13 +60,13 @@ impl MatMulOperation {
         first_shape: &[usize],
         second_shape: &[usize],
         parameters: Option<MatMulParams>,
+        device: &Device,
     ) -> Self {
-        // Check if this is a matrix-vector multiplication (second matrix has 1 column and first matrix has multiple rows)
         let parameters = parameters.unwrap_or_else(|| {
             let n = second_shape[second_shape.len() - 1];
             let m = first_shape[first_shape.len() - 2];
             let k = first_shape[first_shape.len() - 1];
-            get_optimal_params(m, n, k)
+            get_optimal_params(m, n, k, device)
         });
         Self::new_with_parameters(
             datatype,
@@ -96,10 +109,10 @@ impl MatMulOperation {
             out_shape: out_shape.into(),
             datatype,
             pre_element_wise: [
-                ElementWiseFunctions::empty(datatype),
-                ElementWiseFunctions::empty(datatype),
+                UnaryFunctionChain::empty(datatype),
+                UnaryFunctionChain::empty(datatype),
             ],
-            post_element_wise: ElementWiseFunctions::empty(datatype),
+            post_element_wise: UnaryFunctionChain::empty(datatype),
             parameters,
         }
     }
@@ -124,6 +137,9 @@ impl Operation for MatMulOperation {
             }
             MatMulParams::MatMul(sgemm_params) => {
                 sgemm::workgroup_shape_constraints(self, device, sgemm_params)
+            }
+            MatMulParams::CoopMatMul(coop_params) => {
+                coop_gemm::workgroup_shape_constraints(self, device, coop_params)
             }
         }
     }
@@ -160,6 +176,13 @@ impl Operation for MatMulOperation {
                 batch_size,
                 workgroup_shape,
                 sgemm_params,
+            ),
+            MatMulParams::CoopMatMul(coop_params) => coop_gemm::dispatch_size(
+                last_dim_size,
+                second_to_last_dim_size,
+                batch_size,
+                workgroup_shape,
+                coop_params,
             ),
         }
     }
@@ -241,6 +264,14 @@ impl Operation for MatMulOperation {
                 generic_kernel,
                 sgemm_params,
             ),
+            MatMulParams::CoopMatMul(coop_params) => coop_gemm::build_kernel(
+                self,
+                graph,
+                workgroup_shape,
+                inputs,
+                generic_kernel,
+                coop_params,
+            ),
         }
     }
 
@@ -278,564 +309,5 @@ impl<const R: usize, T: DataType> Tensor<R, T> {
 
     pub fn mat_mul_with_parameters(&self, other: &Self, parameters: MatMulParams) -> Self {
         self.add_mat_mul(other, Some(parameters))
-    }
-}
-
-#[cfg(test)]
-#[tokio::test]
-async fn test_matrix_vector_mul() {
-    let device = Device::test_instance();
-
-    // Test matrix-vector multiplication: [2x3] * [3x1] = [2x1]
-    let matrix = [[1., 2., 3.], [4., 5., 6.]];
-    let vector = [[7.], [8.], [9.]];
-    let tensor_matrix = Tensor::new(&device, &matrix);
-    let tensor_vector = Tensor::new(&device, &vector);
-    let result = tensor_matrix.mat_mul(&tensor_vector);
-    let as_slice = result.as_slice().await.unwrap();
-
-    // Expected: [1*7 + 2*8 + 3*9, 4*7 + 5*8 + 6*9] = [50, 122]
-    assert_eq!(as_slice[[0, 0]], 50.);
-    assert_eq!(as_slice[[1, 0]], 122.);
-}
-
-#[cfg(test)]
-#[tokio::test]
-async fn test_matrix_vector_mul_non_contiguous() {
-    let device = Device::test_instance();
-
-    // Test with non-contiguous tensors
-    let matrix = [[1., 2., 3., 10.], [4., 5., 6., 11.]];
-    let vector = [[7.], [8.], [9.]];
-
-    // Take a slice of the matrix to make it non-contiguous
-    let tensor_matrix = Tensor::new(&device, &matrix).narrow(1, 0, 3);
-    let tensor_vector = Tensor::new(&device, &vector);
-    let result = tensor_matrix.mat_mul(&tensor_vector);
-    let as_slice = result.as_slice().await.unwrap();
-
-    // Expected: same as before since we removed the last column
-    assert_eq!(as_slice[[0, 0]], 50.);
-    assert_eq!(as_slice[[1, 0]], 122.);
-}
-
-#[cfg(test)]
-#[tokio::test]
-async fn test_multi_row_matrix_vector_mul() {
-    let device = Device::test_instance();
-
-    // Test matrix-vector multiplication with multiple rows: [3x2] * [2x1] = [3x1]
-    let matrix = [[1., 2.], [3., 4.], [5., 6.]];
-    let vector = [[7.], [8.]];
-    let tensor_matrix = Tensor::new(&device, &matrix);
-    let tensor_vector = Tensor::new(&device, &vector);
-    let result = tensor_matrix.mat_mul(&tensor_vector);
-    let as_slice = result.as_slice().await.unwrap();
-
-    // Expected: [1*7 + 2*8, 3*7 + 4*8, 5*7 + 6*8] = [23, 53, 83]
-    assert_eq!(as_slice[[0, 0]], 23.);
-    assert_eq!(as_slice[[1, 0]], 53.);
-    assert_eq!(as_slice[[2, 0]], 83.);
-}
-
-#[cfg(test)]
-#[tokio::test]
-async fn test_batched_matrix_vector_mul() {
-    let device = Device::test_instance();
-
-    // Test simpler batched case first: [1x2x3] * [1x3x1] = [1x2x1]
-    let matrices = [[[1., 2., 3.], [4., 5., 6.]]];
-    let vectors = [[[7.], [8.], [9.]]];
-
-    let tensor_matrices = Tensor::new(&device, &matrices);
-    let tensor_vectors = Tensor::new(&device, &vectors);
-    let result = tensor_matrices.mat_mul(&tensor_vectors);
-    let as_slice = result.as_slice().await.unwrap();
-
-    // Expected: [1*7 + 2*8 + 3*9, 4*7 + 5*8 + 6*9] = [50, 122]
-    assert_eq!(as_slice[[0, 0, 0]], 50.);
-    assert_eq!(as_slice[[0, 1, 0]], 122.);
-}
-
-#[cfg(test)]
-#[tokio::test]
-async fn test_full_batched_matrix_vector_mul() {
-    let device = Device::test_instance();
-
-    // Test batched matrix-vector multiplication: [2x2x3] * [2x3x1] = [2x2x1]
-    let matrices = [
-        [[1., 2., 3.], [4., 5., 6.]],
-        [[7., 8., 9.], [10., 11., 12.]],
-    ];
-    let vectors = [[[13.], [14.], [15.]], [[16.], [17.], [18.]]];
-
-    let tensor_matrices = Tensor::new(&device, &matrices);
-    let tensor_vectors = Tensor::new(&device, &vectors);
-    let result = tensor_matrices.mat_mul(&tensor_vectors);
-    let as_slice = result.as_slice().await.unwrap();
-
-    // First batch: [1*13 + 2*14 + 3*15, 4*13 + 5*14 + 6*15] = [86, 212]
-    assert_eq!(as_slice[[0, 0, 0]], 86.);
-    assert_eq!(as_slice[[0, 1, 0]], 212.);
-
-    // Second batch: [7*16 + 8*17 + 9*18, 10*16 + 11*17 + 12*18] = [410, 563]
-    assert_eq!(as_slice[[1, 0, 0]], 410.);
-    assert_eq!(as_slice[[1, 1, 0]], 563.);
-}
-
-#[cfg(test)]
-#[tokio::test]
-async fn test_batched_matmul_broadcast_rhs() {
-    let device = Device::test_instance();
-
-    let lhs = [[[1.0f32, 2.0], [3.0, 4.0]], [[5.0, 6.0], [7.0, 8.0]]];
-    let rhs = [[1.0f32, 2.0, 3.0], [4.0, 5.0, 6.0]];
-
-    let lhs = Tensor::new(&device, &lhs);
-    let rhs = Tensor::new(&device, &rhs);
-    let rhs = rhs.reshape([1, 2, 3]).broadcast_as([2, 2, 3]);
-
-    let result = lhs.mat_mul(&rhs);
-    let as_slice = result.as_slice().await.unwrap();
-
-    let expected = [
-        [[9.0f32, 12.0, 15.0], [19.0, 26.0, 33.0]],
-        [[29.0f32, 40.0, 51.0], [39.0, 54.0, 69.0]],
-    ];
-
-    for b in 0..2 {
-        for i in 0..2 {
-            for j in 0..3 {
-                assert!(
-                    (as_slice[[b, i, j]] - expected[b][i][j]).abs() < 0.001,
-                    "mismatch at [{b}, {i}, {j}]: got {} expected {}",
-                    as_slice[[b, i, j]],
-                    expected[b][i][j],
-                );
-            }
-        }
-    }
-}
-
-#[cfg(test)]
-#[tokio::test]
-async fn test_batched_matmul_broadcast_rhs_large_vector_path() {
-    let device = Device::test_instance();
-
-    const BATCH: usize = 8;
-    const M: usize = 64;
-    const K: usize = 2;
-    const N: usize = 64;
-
-    let lhs_data: [[[f32; K]; M]; BATCH] = std::array::from_fn(|b| {
-        std::array::from_fn(|row| {
-            [
-                (b as f32 * 0.5) + row as f32 * 0.01 + 0.25,
-                (b as f32 * 0.25) - row as f32 * 0.02 + 0.75,
-            ]
-        })
-    });
-    let rhs_data: [[f32; N]; K] = std::array::from_fn(|row| {
-        std::array::from_fn(|col| row as f32 * 0.5 + col as f32 * 0.03125 - 1.0)
-    });
-
-    let lhs = Tensor::new(&device, &lhs_data);
-    let rhs = Tensor::new(&device, &rhs_data);
-
-    let rhs_broadcast = rhs.reshape([1, K, N]).broadcast_as([BATCH, K, N]);
-    let batched = lhs.mat_mul(&rhs_broadcast);
-    let flattened = lhs
-        .reshape([BATCH * M, K])
-        .mat_mul(&rhs)
-        .reshape([BATCH, M, N]);
-
-    let batched_slice = batched.as_slice().await.unwrap();
-    let flattened_slice = flattened.as_slice().await.unwrap();
-
-    for b in 0..BATCH {
-        for row in 0..M {
-            for col in 0..N {
-                assert!(
-                    (batched_slice[[b, row, col]] - flattened_slice[[b, row, col]]).abs() < 0.001,
-                    "mismatch at [{b}, {row}, {col}]: got {} expected {}",
-                    batched_slice[[b, row, col]],
-                    flattened_slice[[b, row, col]],
-                );
-            }
-        }
-    }
-}
-
-#[cfg(test)]
-#[tokio::test]
-async fn test_batched_matmul_broadcast_rhs_with_lazy_input() {
-    let device = Device::test_instance();
-
-    const H: usize = 64;
-    const W: usize = 64;
-    const D: usize = 64;
-
-    let x: Tensor<1, f32> = Tensor::arange_step(&device, 0.5f32, W as f32 + 0.5, 1.0) / W as f32;
-    let y: Tensor<1, f32> = Tensor::arange_step(&device, 0.5f32, H as f32 + 0.5, 1.0) / H as f32;
-
-    let x = x.reshape([1, W]).broadcast_as([H, W]).reshape([H, W, 1]);
-    let y = y.reshape([H, 1]).broadcast_as([H, W]).reshape([H, W, 1]);
-    let coords: Tensor<3, f32> = Tensor::cat([x, y], 2) * 2.0 + (-1.0f32);
-
-    let gm_data: [[f32; D]; 2] = std::array::from_fn(|row| {
-        std::array::from_fn(|col| row as f32 * 0.5 + col as f32 * 0.03125 - 1.0)
-    });
-    let gm = Tensor::new(&device, &gm_data);
-    let gm_broadcast = gm.reshape([1, 2, D]).broadcast_as([H, 2, D]);
-
-    let batched: Tensor<3, f32> = coords.mat_mul(&gm_broadcast);
-    let flattened: Tensor<3, f32> = coords.reshape([H * W, 2]).mat_mul(&gm).reshape([H, W, D]);
-
-    let batched_slice = batched.as_slice().await.unwrap();
-    let flattened_slice = flattened.as_slice().await.unwrap();
-
-    for h in 0..H {
-        for w in 0..W {
-            for d in 0..D {
-                assert!(
-                    (batched_slice[[h, w, d]] - flattened_slice[[h, w, d]]).abs() < 0.001,
-                    "mismatch at [{h}, {w}, {d}]: got {} expected {}",
-                    batched_slice[[h, w, d]],
-                    flattened_slice[[h, w, d]],
-                );
-            }
-        }
-    }
-}
-
-#[cfg(test)]
-#[tokio::test]
-async fn test_matmul() {
-    let device = Device::test_instance();
-
-    let data_a = [[1.], [3.]];
-    let data_b = [[1., 2.]];
-    let tensor_a = Tensor::new(&device, &data_a);
-    let tensor_b = Tensor::new(&device, &data_b);
-    let tensor = tensor_a.mat_mul(&tensor_b);
-    let as_slice = tensor.as_slice().await.unwrap();
-    println!("{as_slice:?}");
-
-    assert_eq!(as_slice[[0, 0]], 1.);
-    assert_eq!(as_slice[[0, 1]], 2.);
-    assert_eq!(as_slice[[1, 0]], 3.);
-    assert_eq!(as_slice[[1, 1]], 6.);
-}
-
-#[cfg(test)]
-#[tokio::test]
-async fn test_asymetric_matmul() {
-    let device = Device::test_instance();
-
-    let data_a = [[1., 2.], [3., 4.], [5., 6.]];
-    let data_b = [[1., 2.], [3., 4.]];
-    let tensor_a = Tensor::new(&device, &data_a);
-    let tensor_b = Tensor::new(&device, &data_b);
-    let tensor = tensor_a.mat_mul(&tensor_b);
-    let as_slice = tensor.as_slice().await.unwrap();
-    println!("{as_slice:?}");
-
-    assert_eq!(as_slice[[0, 0]], 1. * 1. + 2. * 3.);
-    assert_eq!(as_slice[[0, 1]], 1. * 2. + 2. * 4.);
-    assert_eq!(as_slice[[1, 0]], 3. * 1. + 4. * 3.);
-    assert_eq!(as_slice[[1, 1]], 3. * 2. + 4. * 4.);
-    assert_eq!(as_slice[[2, 0]], 5. * 1. + 6. * 3.);
-    assert_eq!(as_slice[[2, 1]], 5. * 2. + 6. * 4.);
-}
-
-#[cfg(test)]
-#[tokio::test]
-async fn test_matmul_fused() {
-    let device = Device::test_instance();
-
-    let data_a = [[1.], [3.]];
-    let data_b = [[1., 2.]];
-    let tensor_a = Tensor::new(&device, &data_a) * 2.;
-    let tensor_b = Tensor::new(&device, &data_b);
-    let tensor = tensor_a.mat_mul(&tensor_b) / 4.;
-    let as_slice = tensor.as_slice().await.unwrap();
-    println!("{as_slice:?}");
-
-    assert_eq!(as_slice[[0, 0]], 1. / 2.);
-    assert_eq!(as_slice[[0, 1]], 2. / 2.);
-    assert_eq!(as_slice[[1, 0]], 3. / 2.);
-    assert_eq!(as_slice[[1, 1]], 6. / 2.);
-}
-
-#[cfg(test)]
-#[tokio::test]
-async fn test_transposed_matmul() {
-    use candle_core::IndexOp;
-
-    let device = Device::test_instance();
-    // This test uses regular tensor ops, not quantized matmul, so CPU is fine
-    let candle_device = candle_core::Device::Cpu;
-
-    let data_a = [[1.], [3.]];
-    let data_b = [[1., 2.]];
-    let tensor_a = Tensor::new(&device, &data_a).t();
-    let tensor_b = Tensor::new(&device, &data_b).t();
-    let tensor = tensor_a.mat_mul(&tensor_b);
-    let as_slice = tensor.as_slice().await.unwrap();
-    println!("{as_slice:?}");
-
-    assert_eq!(as_slice[[0, 0]], 7.);
-
-    let data_a = [[[[1., 2.], [3., 4.]], [[5., 6.], [7., 8.]]]];
-    let data_b = [[[[9., 10.], [11., 12.]], [[13., 14.], [15., 16.]]]];
-    let tensor_a = Tensor::new(&device, &data_a).transpose(1, 2);
-    let tensor_b = Tensor::new(&device, &data_b).transpose(1, 2).t();
-    let candle_tensor_a = candle_core::Tensor::new(&data_a, &candle_device)
-        .unwrap()
-        .transpose(1, 2)
-        .unwrap();
-    let candle_tensor_b = candle_core::Tensor::new(&data_b, &candle_device)
-        .unwrap()
-        .transpose(1, 2)
-        .unwrap()
-        .t()
-        .unwrap();
-    let tensor = tensor_a.mat_mul(&tensor_b);
-    let candle_tensor = candle_tensor_a.matmul(&candle_tensor_b).unwrap();
-    let candle_as_slice = candle_tensor
-        .i((0, .., .., ..))
-        .unwrap()
-        .to_vec3::<f32>()
-        .unwrap();
-    let as_slice = tensor.as_slice().await.unwrap();
-    println!("fusor: {as_slice:?}");
-    println!("candle: {candle_as_slice:?}");
-
-    for z in 0..2 {
-        for y in 0..2 {
-            for x in 0..2 {
-                assert_eq!(as_slice[[0, z, y, x]], candle_as_slice[z][y][x]);
-            }
-        }
-    }
-}
-
-#[cfg(test)]
-#[tokio::test]
-async fn test_batched_matmul() {
-    let device = Device::test_instance();
-
-    let data_a = [[[1.], [3.]], [[2.], [6.]]];
-    let data_b = [[[1., 2.]], [[2., 4.]]];
-    let tensor_a = Tensor::new(&device, &data_a);
-    let tensor_b = Tensor::new(&device, &data_b);
-    let tensor = tensor_a.mat_mul(&tensor_b);
-    let as_slice = tensor.as_slice().await.unwrap();
-    println!("{as_slice:?}");
-
-    assert_eq!(as_slice[[0, 0, 0]], 1.);
-    assert_eq!(as_slice[[0, 0, 1]], 2.);
-    assert_eq!(as_slice[[0, 1, 0]], 3.);
-    assert_eq!(as_slice[[0, 1, 1]], 6.);
-
-    assert_eq!(as_slice[[1, 0, 0]], 4.);
-    assert_eq!(as_slice[[1, 0, 1]], 8.);
-    assert_eq!(as_slice[[1, 1, 0]], 12.);
-    assert_eq!(as_slice[[1, 1, 1]], 24.);
-}
-
-#[cfg(test)]
-#[tokio::test]
-async fn test_matmul_f16() {
-    let device = Device::test_instance();
-    if !device.f16_supported() {
-        return;
-    }
-
-    let data_a = [[half::f16::from_f32(1.)], [half::f16::from_f32(3.)]];
-    let data_b = [[half::f16::from_f32(1.), half::f16::from_f32(2.)]];
-    let tensor_a = Tensor::new(&device, &data_a);
-    let tensor_b = Tensor::new(&device, &data_b);
-
-    let tensor = tensor_a.mat_mul(&tensor_b);
-    let as_slice = tensor.as_slice().await.unwrap();
-    println!("{as_slice:?}");
-
-    assert_eq!(as_slice[[0, 0]], half::f16::from_f32(1.));
-    assert_eq!(as_slice[[0, 1]], half::f16::from_f32(2.));
-    assert_eq!(as_slice[[1, 0]], half::f16::from_f32(3.));
-    assert_eq!(as_slice[[1, 1]], half::f16::from_f32(6.));
-}
-
-#[cfg(test)]
-#[tokio::test]
-async fn fuzz_matmul() {
-    use rand::Rng;
-
-    let device = Device::test_instance();
-
-    let min_size = 1;
-    let max_size = 512;
-    let iterations = if cfg!(debug_assertions) { 10 } else { 100 };
-
-    for _ in 0..iterations {
-        let size1 = rand::rng().random_range(min_size..max_size);
-        let size2 = rand::rng().random_range(min_size..max_size);
-        let size3 = rand::rng().random_range(min_size..max_size);
-
-        let data_a: Vec<Vec<f32>> = (0..size1)
-            .map(|_| (0..size2).map(|_| rand::random()).collect())
-            .collect();
-        let data_b: Vec<Vec<f32>> = (0..size2)
-            .map(|_| (0..size3).map(|_| rand::random()).collect())
-            .collect();
-
-        let tensor_a = Tensor::new(&device, &data_a);
-        let tensor_b = Tensor::new(&device, &data_b);
-
-        let mut ndarray_a = ndarray::Array2::zeros((size1, size2));
-        for i in 0..size1 {
-            for j in 0..size2 {
-                ndarray_a[[i, j]] = data_a[i][j];
-            }
-        }
-        let mut ndarray_b = ndarray::Array2::zeros((size2, size3));
-        for i in 0..size2 {
-            for j in 0..size3 {
-                ndarray_b[[i, j]] = data_b[i][j];
-            }
-        }
-
-        let dot = ndarray_a.dot(&ndarray_b);
-
-        let tensor = tensor_a.mat_mul(&tensor_b);
-        let as_slice = tensor.as_slice().await.unwrap();
-        for i in 0..size1 {
-            for j in 0..size3 {
-                if (as_slice[[i, j]] - dot[[i, j]]).abs() > 0.001 {
-                    println!(
-                        "Mismatch at ({}, {}): {} != {}",
-                        i,
-                        j,
-                        as_slice[[i, j]],
-                        dot[[i, j]]
-                    );
-                    panic!("fuzz failed with size ({size1}x{size2})*({size2}x{size3})");
-                }
-            }
-        }
-    }
-}
-
-#[cfg(test)]
-#[tokio::test]
-async fn fuzz_batched_matmul() {
-    use rand::Rng;
-    let device = Device::test_instance();
-
-    let min_batch_size = 2;
-    let max_batch_size = 4;
-    let min_size = 1;
-    let max_size = 512;
-    let iterations = if cfg!(debug_assertions) { 10 } else { 100 };
-
-    for _ in 0..iterations {
-        let batch_size_1 = rand::rng().random_range(min_batch_size..max_batch_size);
-        let batch_size_2 = rand::rng().random_range(min_batch_size..max_batch_size);
-        let size1 = rand::rng().random_range(min_size..max_size);
-        let size2 = rand::rng().random_range(min_size..max_size);
-        let size3 = rand::rng().random_range(min_size..max_size);
-
-        let data_a: Vec<Vec<Vec<Vec<f32>>>> = (0..batch_size_1)
-            .map(|_| {
-                (0..batch_size_2)
-                    .map(|_| {
-                        (0..size1)
-                            .map(|_| (0..size2).map(|_| rand::random()).collect())
-                            .collect()
-                    })
-                    .collect()
-            })
-            .collect();
-        let data_b: Vec<Vec<Vec<Vec<f32>>>> = (0..batch_size_1)
-            .map(|_| {
-                (0..batch_size_2)
-                    .map(|_| {
-                        (0..size2)
-                            .map(|_| (0..size3).map(|_| rand::random()).collect())
-                            .collect()
-                    })
-                    .collect()
-            })
-            .collect();
-
-        let tensor_a = Tensor::new(&device, &data_a);
-        let tensor_b = Tensor::new(&device, &data_b);
-
-        let ndarray_a = (0..batch_size_1)
-            .map(|i_1| {
-                (0..batch_size_2)
-                    .map(|i_2| {
-                        let mut array = ndarray::Array2::zeros((size1, size2));
-                        for j in 0..size1 {
-                            for k in 0..size2 {
-                                array[[j, k]] = data_a[i_1][i_2][j][k];
-                            }
-                        }
-                        array
-                    })
-                    .collect::<Vec<_>>()
-            })
-            .collect::<Vec<_>>();
-
-        let ndarray_b = (0..batch_size_1)
-            .map(|i_1| {
-                (0..batch_size_2)
-                    .map(|i_2| {
-                        let mut array = ndarray::Array2::zeros((size2, size3));
-                        for j in 0..size2 {
-                            for k in 0..size3 {
-                                array[[j, k]] = data_b[i_1][i_2][j][k];
-                            }
-                        }
-                        array
-                    })
-                    .collect::<Vec<_>>()
-            })
-            .collect::<Vec<_>>();
-        let dot = ndarray_a
-            .iter()
-            .zip(ndarray_b.iter())
-            .map(|(a, b)| {
-                a.iter()
-                    .zip(b.iter())
-                    .map(|(a, b)| a.dot(b))
-                    .collect::<Vec<_>>()
-            })
-            .collect::<Vec<_>>();
-
-        let tensor = tensor_a.mat_mul(&tensor_b);
-        let as_slice = tensor.as_slice().await.unwrap();
-        for batch_1 in 0..batch_size_1 {
-            for batch_2 in 0..batch_size_2 {
-                for i in 0..size1 {
-                    for j in 0..size3 {
-                        if (as_slice[[batch_1, batch_2, i, j]] - dot[batch_1][batch_2][[i, j]])
-                            .abs()
-                            > 0.001
-                        {
-                            println!(
-                                "Mismatch at ({}, {}): {} != {}",
-                                i,
-                                j,
-                                as_slice[[batch_1, batch_2, i, j]],
-                                dot[batch_1][batch_2][[i, j]]
-                            );
-                            panic!("fuzz failed with size ({size1}x{size2})*({size2}x{size3})");
-                        }
-                    }
-                }
-            }
-        }
     }
 }

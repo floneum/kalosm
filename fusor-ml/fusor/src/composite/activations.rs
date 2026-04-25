@@ -91,7 +91,11 @@ where
             D::from_f32(-TANH_INPUT_CLAMP),
             D::from_f32(TANH_INPUT_CLAMP),
         );
-        let tanh_result = tanh_input.tanh();
+        // Avoid native tanh here: software renderers (WARP) can under-saturate
+        // on GELU's negative tail, leaving visible non-zero outputs.
+        let tanh_result = tanh_input
+            .tanh_exact()
+            .clamp(D::from_f32(-1.0), D::from_f32(1.0));
 
         // 1 + tanh(...) — mathematically in [0, 2]. Clamp defensively against
         // driver-specific tanh precision that can return values slightly outside [-1, 1].

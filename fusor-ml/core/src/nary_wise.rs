@@ -1,7 +1,7 @@
 use std::fmt::Write;
 
 use crate::{
-    ElementWiseFunction, ElementWiseOperation, TILE_SIZE,
+    TILE_SIZE,
     compute_graph::{ComputeGraphInner, NodeIndex},
     mir::{function::Function, inputs::MirValue, kernel::GenericKernel, operation::Operation},
     tensor::{DataTypeEnum, TensorData},
@@ -28,6 +28,103 @@ impl NaryFunction {
     pub fn name(&self) -> &str {
         self.name.as_deref().unwrap_or("op")
     }
+
+    /// Create a unary NaryFunction from WGSL operation code.
+    pub fn unary(
+        name: Option<String>,
+        operation: String,
+        input_type: DataTypeEnum,
+        output_type: DataTypeEnum,
+    ) -> Self {
+        Self {
+            name,
+            operation,
+            input_names: vec!["input".to_string()],
+            input_types: vec![input_type],
+            output_type,
+        }
+    }
+
+    /// Create a binary NaryFunction from WGSL operation code.
+    /// The operation should use `a` and `b` as input variable names.
+    pub fn binary(
+        name: Option<String>,
+        operation: String,
+        input_a_type: DataTypeEnum,
+        input_b_type: DataTypeEnum,
+        output_type: DataTypeEnum,
+    ) -> Self {
+        Self {
+            name,
+            operation,
+            input_names: vec!["a".to_string(), "b".to_string()],
+            input_types: vec![input_a_type, input_b_type],
+            output_type,
+        }
+    }
+}
+
+/// A chain of unary functions used for pre/post processing in reduce/matmul/dequantize.
+/// Each function takes a single input and produces a single output; the chain is applied sequentially.
+#[derive(Clone, Debug)]
+pub(crate) struct UnaryFunctionChain {
+    input_datatype: DataTypeEnum,
+    pub(crate) functions: Vec<NaryFunction>,
+}
+
+impl UnaryFunctionChain {
+    pub fn new(functions: Vec<NaryFunction>, input_datatype: DataTypeEnum) -> Self {
+        Self {
+            input_datatype,
+            functions,
+        }
+    }
+
+    pub fn empty(input_datatype: DataTypeEnum) -> Self {
+        Self {
+            input_datatype,
+            functions: Vec::new(),
+        }
+    }
+
+    pub fn add_functions(
+        &self,
+        kernel: &mut crate::mir::kernel::GenericKernel,
+    ) -> Vec<crate::mir::function::Function> {
+        let mut input_datatype = self.input_datatype;
+        self.functions
+            .iter()
+            .rev()
+            .map(|f| {
+                let function = kernel.add_function(
+                    f.output_type,
+                    f.operation.clone(),
+                    [("input".to_string(), input_datatype.to_string())],
+                );
+                input_datatype = f.output_type;
+                function
+            })
+            .collect()
+    }
+
+    pub fn input_datatype(&self) -> DataTypeEnum {
+        self.input_datatype
+    }
+
+    pub fn out_datatype(&self) -> DataTypeEnum {
+        if let Some(first) = self.functions.first() {
+            first.output_type
+        } else {
+            self.input_datatype
+        }
+    }
+}
+
+/// Result of extracting a unary function chain from an NaryOperation.
+/// Used by the resolver to fuse unary ops into reduce/matmul/dequantize.
+pub(crate) struct ExtractedUnaryChain {
+    pub(crate) value: crate::compute_graph::NodeIndex,
+    pub(crate) functions: UnaryFunctionChain,
 }
 
 /// Expression tree node supporting any arity operations
@@ -383,22 +480,16 @@ impl NaryOperation {
         }
     }
 
-    /// Attempt to convert this NaryOperation into an ElementwiseOperation. This will only succeed
-    /// if there is only a single input to the operation
-    pub(crate) fn try_into_elementwise_op(&self) -> Option<ElementWiseOperation> {
+    /// Attempt to extract a unary function chain from this NaryOperation.
+    /// This will only succeed if there is only a single input to the operation.
+    pub(crate) fn try_extract_unary_chain(&self) -> Option<ExtractedUnaryChain> {
         if self.inputs.len() == 1 {
             let output_datatype = self.output_datatype;
             let value = self.inputs[0];
             let input_datatype = match &self.expression {
                 NaryExpr::Op { function, .. } => function.input_types[0],
-                NaryExpr::IndexedInput { .. } => {
-                    // For ElementWise, we need the datatype from the first input
-                    // This is a limitation - we can't easily get it without graph access
-                    output_datatype
-                }
-                NaryExpr::DimIndex(_) => {
-                    panic!("DimIndex cannot be the root expression for ElementWise conversion");
-                }
+                NaryExpr::IndexedInput { .. } => output_datatype,
+                NaryExpr::DimIndex(_) => return None,
             };
 
             fn collect_functions(
@@ -415,7 +506,6 @@ impl NaryOperation {
                             inputs.push(*out_id);
                             collect_functions(child, function_body, out_id)?;
                         }
-                        // TODO: this isn't a great way to handle this. Refactor once we get rid of elementwise and pairwise ops
                         let default_value = match function.output_type {
                             DataTypeEnum::F32 => "0.0",
                             DataTypeEnum::F16 => "f16(0.0)",
@@ -436,34 +526,29 @@ impl NaryOperation {
                         Ok(())
                     }
                     NaryExpr::IndexedInput { indices, .. } => {
-                        // Only element-wise access can be converted
                         if NaryExpr::is_elementwise_indices(indices) {
                             writeln!(function_body, "let output_{this_output} = input;")
                         } else {
-                            panic!(
-                                "IndexedInput with custom indices cannot be converted to ElementWise operation"
-                            );
+                            Err(std::fmt::Error)
                         }
                     }
-                    NaryExpr::DimIndex(_) => {
-                        panic!("DimIndex cannot be converted to ElementWise operation");
-                    }
+                    NaryExpr::DimIndex(_) => Err(std::fmt::Error),
                 }
             }
 
             let mut function_body = String::new();
             let mut out_id = 0;
-            collect_functions(&self.expression, &mut function_body, &mut out_id).unwrap();
+            if collect_functions(&self.expression, &mut function_body, &mut out_id).is_err() {
+                return None;
+            }
             writeln!(function_body, "let output = output_0;").unwrap();
-            let functions = ElementWiseFunction::new(function_body, output_datatype);
+            let nary_func =
+                NaryFunction::unary(None, function_body, input_datatype, output_datatype);
 
-            let shape = self.shape.clone();
-            Some(ElementWiseOperation::new(
-                input_datatype,
+            Some(ExtractedUnaryChain {
                 value,
-                functions,
-                shape,
-            ))
+                functions: UnaryFunctionChain::new(vec![nary_func], input_datatype),
+            })
         } else {
             None
         }

@@ -16,6 +16,8 @@ pub struct LayerNormNd<D: SimdElement = f32> {
     eps: f32,
 }
 
+pub type LayerNorm<D = f32> = LayerNormNd<D>;
+
 impl<D> LayerNormNd<D>
 where
     D: SimdElement + DataType + FloatDataType + FloatOps + Default,
@@ -59,6 +61,32 @@ where
 
     pub fn eps(&self) -> f32 {
         self.eps
+    }
+
+    /// Forward pass for 2D input (batch, features).
+    pub fn forward_2d<B>(&self, input: &Tensor<2, D, B>) -> Tensor<2, D, ConcreteTensor<D, 2>>
+    where
+        D: std::ops::Add<Output = D>
+            + std::ops::Sub<Output = D>
+            + std::ops::Mul<Output = D>
+            + std::ops::Div<Output = D>,
+        crate::AddOp: fusor_cpu::SimdBinaryOp<D>,
+        crate::SubOp: fusor_cpu::SimdBinaryOp<D>,
+        crate::MulOp: fusor_cpu::SimdBinaryOp<D>,
+        crate::DivOp: fusor_cpu::SimdBinaryOp<D>,
+        fusor_cpu::SumOp: fusor_cpu::SimdReduceOp<D>,
+        fusor_cpu::SqrtOp: fusor_cpu::SimdUnaryOp<D>,
+        B: TensorBacking<2, Elem = D>,
+    {
+        let weight_broadcast: Tensor<2, D, _> = self.weight.broadcast_as(input.shape());
+        let bias_broadcast: Option<Tensor<2, D, _>> =
+            self.bias.as_ref().map(|b| b.broadcast_as(input.shape()));
+        input.layer_norm(
+            &weight_broadcast,
+            bias_broadcast.as_ref(),
+            D::from_f32(self.eps),
+            true,
+        )
     }
 
     /// Forward pass for any input rank. `OUT_RANK` equals `N - 1` and is

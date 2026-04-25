@@ -51,6 +51,36 @@ where
         + std::ops::Mul<Output = D>
         + std::ops::Add<Output = D>,
 {
+    fn bias_broadcast_shape(out_channels: usize) -> [usize; R] {
+        std::array::from_fn(|axis| if axis == 1 { out_channels } else { 1 })
+    }
+
+    fn window_permutation<const R2: usize, const DIFF: usize>() -> [usize; R2] {
+        std::array::from_fn(|index| {
+            if index == 0 {
+                0
+            } else if index <= DIFF {
+                index + 1
+            } else if index == DIFF + 1 {
+                1
+            } else {
+                index
+            }
+        })
+    }
+
+    fn output_permutation<const DIFF: usize>() -> [usize; R] {
+        std::array::from_fn(|index| {
+            if index == 0 {
+                0
+            } else if index == 1 {
+                DIFF + 1
+            } else {
+                index - 1
+            }
+        })
+    }
+
     /// Unified convolution method that handles different tensor formats:
     /// - Multi-channel convolution (R = 2 + DIFF): (batch, channels, ...spatial) format
     ///
@@ -127,28 +157,13 @@ where
         // Step 3: Prepare for matmul by reshaping and transposing
         let kernel_size: usize = weight_shape[spatial_start..].iter().product();
 
-        // Sliding window appends kernel dims at the end:
-        //   (B, C, oD1, oD2, ..., oDn, kD1, kD2, ..., kDn)
-        // We need: (B, oD1, oD2, ..., oDn, C, kD1, kD2, ..., kDn)
-        // for correct reshape to (B*out_spatial, C*kernel_size)
-        //
-        // Since oD dims are contiguous at positions 2..2+DIFF, we can bubble
-        // C (axis 1) past each oD with successive adjacent transpositions:
-        //   swap(1,2): (B, oD1, C, oD2, ..., oDn, kD1, ...)
-        //   swap(2,3): (B, oD1, oD2, C, ..., oDn, kD1, ...)
-        //   ...
-        //   swap(DIFF, DIFF+1): (B, oD1, ..., oDn, C, kD1, ...)
+        // Move the output spatial dimensions in front of channels so each output location
+        // becomes one matmul row after flattening.
+        let windows_transposed = windows_tensor.permute(Self::window_permutation::<R2, DIFF>());
 
-        let mut windows_permuted: Tensor<R2, D, ConcreteTensor<D, R2>> =
-            windows_tensor.to_concrete();
-        for i in 0..DIFF {
-            windows_permuted = windows_permuted.transpose(1 + i, 2 + i).to_concrete();
-        }
-
-        // Now layout is: (B, oD1, oD2, ..., oDn, C, kD1, kD2, ..., kDn)
         // Flatten to (batch * out_spatial_size, in_channels * kernel_size)
         let windows_flat: Tensor<2, D, _> =
-            windows_permuted.reshape([batch * out_spatial_size, in_channels * kernel_size]);
+            windows_transposed.reshape([batch * out_spatial_size, in_channels * kernel_size]);
 
         // Step 4: Reshape weight for matmul
         let weight_reshaped: Tensor<2, D, _> =
@@ -159,10 +174,20 @@ where
         // Step 5: Matrix multiplication
         let output = windows_flat.mat_mul(&weight_t);
 
-        // Step 6: Reshape and transpose back to (batch, out_channels, ...out_spatial...)
-        let output_reshaped: Tensor<3, D, _> =
-            output.reshape([batch, out_spatial_size, out_channels]);
-        let output_transposed = output_reshaped.transpose(in_channels_axis, spatial_start);
+        // Step 6: Reshape and permute back to (batch, out_channels, ...out_spatial...)
+        let output_reshaped: Tensor<R, D, _> = output.reshape(std::array::from_fn(|axis| {
+            if axis == 0 {
+                batch
+            } else if axis <= DIFF {
+                let spatial_axis = spatial_start + axis - 1;
+                let padded_len = input_shape[spatial_axis] + 2 * padding[axis - 1];
+                let kernel_len = weight_shape[spatial_axis];
+                (padded_len - kernel_len) / strides[axis - 1] + 1
+            } else {
+                out_channels
+            }
+        }));
+        let output_transposed = output_reshaped.permute(Self::output_permutation::<DIFF>());
 
         // Reshape to (batch, out_channels, ...out_spatial_dims...)
         let mut output_shape = input_shape;
@@ -177,12 +202,8 @@ where
         // Step 7: Add bias if present
         if let Some(bias) = bias {
             // Bias shape: (out_channels,)
-            // Need to reshape to (1, out_channels, 1, 1, ...) for correct channel-dim broadcasting.
-            // Default broadcast_as would right-align, matching out_channels against the last
-            // spatial dim instead of the channel dim (axis 1).
-            let mut bias_shape = [1usize; R];
-            bias_shape[1] = out_channels;
-            let bias_reshaped: Tensor<R, D, _> = bias.reshape(bias_shape);
+            // Broadcast along the channel axis, leaving batch/spatial dims singleton.
+            let bias_reshaped = bias.reshape(Self::bias_broadcast_shape(out_channels));
             let bias_broadcast: Tensor<R, D, _> = bias_reshaped.broadcast_as(output_shape);
             output_final.add_(&bias_broadcast)
         } else {

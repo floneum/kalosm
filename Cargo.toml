@@ -34,6 +34,7 @@ members = [
     "fusor-ml/gguf",
     "fusor-ml/cli",
     "fusor-ml/cpu",
+    "fusor-ml/conformance",
     "fusor-ml/fusor",
     "fusor-ml/types",
 ]

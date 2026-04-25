@@ -4,7 +4,7 @@
 
 use crate::{SimdElement, Tensor};
 use fusor_core::DataType;
-use fusor_cpu::{EqOp, GtOp, GteOp, LtOp, LteOp, SimdBinaryOp};
+use fusor_cpu::{EqOp, GtOp, GteOp, LtOp, LteOp, NeOp, SimdBinaryOp};
 
 impl<const R: usize, D, B> Tensor<R, D, B>
 where
@@ -23,6 +23,17 @@ where
             |a, b| a.as_ref().eq(b.as_ref()).to_concrete(),
             |a, b| a.eq_tensor(b),
         )
+    }
+
+    /// Element-wise inequality comparison between two tensors.
+    ///
+    /// Returns 1.0 where elements are not equal, 0.0 otherwise.
+    /// Note: GPU comparison is only available for CPU tensors at this time.
+    pub fn ne_tensor(&self, rhs: &Self) -> Tensor<R, D>
+    where
+        NeOp: SimdBinaryOp<D>,
+    {
+        self.dispatch_cpu_only_pair(rhs, |a, b| a.as_ref().ne(b.as_ref()).to_concrete())
     }
 
     /// Element-wise less-than comparison between two tensors.
@@ -94,6 +105,22 @@ where
         )
     }
 
+    /// Element-wise inequality comparison with a scalar.
+    ///
+    /// Returns 1.0 where elements are not equal to the scalar, 0.0 otherwise.
+    pub fn ne_scalar(&self, scalar: D) -> Tensor<R, D>
+    where
+        NeOp: SimdBinaryOp<D>,
+    {
+        self.dispatch_ref(
+            |t| t.as_ref().ne_scalar(scalar).to_concrete(),
+            |t| {
+                let eq: fusor_core::Tensor<R, D> = t.eq(scalar);
+                eq.eq(D::zero())
+            },
+        )
+    }
+
     /// Element-wise less-than comparison with a scalar.
     ///
     /// Returns 1.0 where self < scalar, 0.0 otherwise.
@@ -157,6 +184,17 @@ where
         self.eq_scalar(rhs)
     }
 
+    /// Element-wise inequality comparison with a scalar (fusor-core compatible API).
+    ///
+    /// Returns 1.0 where elements are not equal to the scalar, 0.0 otherwise.
+    /// This is an alias for `ne_scalar`.
+    pub fn ne(&self, rhs: D) -> Tensor<R, D>
+    where
+        NeOp: SimdBinaryOp<D>,
+    {
+        self.ne_scalar(rhs)
+    }
+
     /// Element-wise less-than comparison with a scalar (fusor-core compatible API).
     ///
     /// Returns 1.0 where self < scalar, 0.0 otherwise.
@@ -201,118 +239,5 @@ where
         GteOp: SimdBinaryOp<D>,
     {
         self.gte_scalar(rhs)
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[tokio::test]
-    async fn test_eq_tensor_cpu() {
-        let a: Tensor<1, f32> =
-            Tensor::Cpu(fusor_cpu::Tensor::from_slice([4], &[1.0, 2.0, 3.0, 4.0]));
-        let b: Tensor<1, f32> =
-            Tensor::Cpu(fusor_cpu::Tensor::from_slice([4], &[1.0, 3.0, 3.0, 5.0]));
-
-        let result = a.eq_tensor(&b);
-        let slice = result.as_slice().await.unwrap();
-
-        assert_eq!(slice[[0]], 1.0); // 1 == 1
-        assert_eq!(slice[[1]], 0.0); // 2 != 3
-        assert_eq!(slice[[2]], 1.0); // 3 == 3
-        assert_eq!(slice[[3]], 0.0); // 4 != 5
-    }
-
-    #[tokio::test]
-    async fn test_lt_tensor_cpu() {
-        let a: Tensor<1, f32> =
-            Tensor::Cpu(fusor_cpu::Tensor::from_slice([4], &[1.0, 2.0, 3.0, 4.0]));
-        let b: Tensor<1, f32> =
-            Tensor::Cpu(fusor_cpu::Tensor::from_slice([4], &[2.0, 2.0, 2.0, 2.0]));
-
-        let result = a.lt_tensor(&b);
-        let slice = result.as_slice().await.unwrap();
-
-        assert_eq!(slice[[0]], 1.0); // 1 < 2
-        assert_eq!(slice[[1]], 0.0); // 2 < 2
-        assert_eq!(slice[[2]], 0.0); // 3 < 2
-        assert_eq!(slice[[3]], 0.0); // 4 < 2
-    }
-
-    #[tokio::test]
-    async fn test_gt_tensor_cpu() {
-        let a: Tensor<1, f32> =
-            Tensor::Cpu(fusor_cpu::Tensor::from_slice([4], &[1.0, 2.0, 3.0, 4.0]));
-        let b: Tensor<1, f32> =
-            Tensor::Cpu(fusor_cpu::Tensor::from_slice([4], &[2.0, 2.0, 2.0, 2.0]));
-
-        let result = a.gt_tensor(&b);
-        let slice = result.as_slice().await.unwrap();
-
-        assert_eq!(slice[[0]], 0.0); // 1 > 2
-        assert_eq!(slice[[1]], 0.0); // 2 > 2
-        assert_eq!(slice[[2]], 1.0); // 3 > 2
-        assert_eq!(slice[[3]], 1.0); // 4 > 2
-    }
-
-    #[tokio::test]
-    async fn test_lte_tensor_cpu() {
-        let a: Tensor<1, f32> =
-            Tensor::Cpu(fusor_cpu::Tensor::from_slice([4], &[1.0, 2.0, 3.0, 4.0]));
-        let b: Tensor<1, f32> =
-            Tensor::Cpu(fusor_cpu::Tensor::from_slice([4], &[2.0, 2.0, 2.0, 2.0]));
-
-        let result = a.lte_tensor(&b);
-        let slice = result.as_slice().await.unwrap();
-
-        assert_eq!(slice[[0]], 1.0); // 1 <= 2
-        assert_eq!(slice[[1]], 1.0); // 2 <= 2
-        assert_eq!(slice[[2]], 0.0); // 3 <= 2
-        assert_eq!(slice[[3]], 0.0); // 4 <= 2
-    }
-
-    #[tokio::test]
-    async fn test_gte_tensor_cpu() {
-        let a: Tensor<1, f32> =
-            Tensor::Cpu(fusor_cpu::Tensor::from_slice([4], &[1.0, 2.0, 3.0, 4.0]));
-        let b: Tensor<1, f32> =
-            Tensor::Cpu(fusor_cpu::Tensor::from_slice([4], &[2.0, 2.0, 2.0, 2.0]));
-
-        let result = a.gte_tensor(&b);
-        let slice = result.as_slice().await.unwrap();
-
-        assert_eq!(slice[[0]], 0.0); // 1 >= 2
-        assert_eq!(slice[[1]], 1.0); // 2 >= 2
-        assert_eq!(slice[[2]], 1.0); // 3 >= 2
-        assert_eq!(slice[[3]], 1.0); // 4 >= 2
-    }
-
-    #[tokio::test]
-    async fn test_eq_scalar_cpu() {
-        let a: Tensor<1, f32> =
-            Tensor::Cpu(fusor_cpu::Tensor::from_slice([4], &[1.0, 2.0, 2.0, 4.0]));
-
-        let result = a.eq_scalar(2.0);
-        let slice = result.as_slice().await.unwrap();
-
-        assert_eq!(slice[[0]], 0.0);
-        assert_eq!(slice[[1]], 1.0);
-        assert_eq!(slice[[2]], 1.0);
-        assert_eq!(slice[[3]], 0.0);
-    }
-
-    #[tokio::test]
-    async fn test_lt_scalar_cpu() {
-        let a: Tensor<1, f32> =
-            Tensor::Cpu(fusor_cpu::Tensor::from_slice([4], &[1.0, 2.0, 3.0, 4.0]));
-
-        let result = a.lt_scalar(2.5);
-        let slice = result.as_slice().await.unwrap();
-
-        assert_eq!(slice[[0]], 1.0); // 1 < 2.5
-        assert_eq!(slice[[1]], 1.0); // 2 < 2.5
-        assert_eq!(slice[[2]], 0.0); // 3 < 2.5
-        assert_eq!(slice[[3]], 0.0); // 4 < 2.5
     }
 }

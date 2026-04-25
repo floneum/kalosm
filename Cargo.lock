@@ -2984,13 +2984,21 @@ name = "fusor"
 version = "0.1.0"
 dependencies = [
  "bytemuck",
+ "candle-core 0.9.2",
+ "candle-nn",
+ "candle-transformers",
+ "criterion 0.3.6",
  "fusor-core",
  "fusor-cpu",
  "fusor-gguf",
  "fusor-types",
+ "futures",
  "half 2.7.1",
+ "kalosm-common",
+ "kalosm-model-types",
  "paste",
  "pollster",
+ "rand 0.9.2",
  "tokio",
 ]
 
@@ -3002,6 +3010,20 @@ dependencies = [
  "fusor-gguf",
  "nom 8.0.0",
  "serde_json",
+]
+
+[[package]]
+name = "fusor-conformance"
+version = "0.1.0"
+dependencies = [
+ "fusor",
+ "fusor-core",
+ "fusor-cpu",
+ "fusor-types",
+ "half 2.7.1",
+ "rand 0.9.2",
+ "thiserror 2.0.18",
+ "tokio",
 ]
 
 [[package]]
