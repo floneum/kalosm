@@ -331,7 +331,7 @@ fn build_point_tensors(
     batch_size: usize,
 ) -> (Tensor<3, f32>, Tensor<2, f32>) {
     assert!(
-        batch_size > 0 && points.len() % batch_size == 0,
+        batch_size > 0 && points.len().is_multiple_of(batch_size),
         "build_point_tensors: points.len() ({}) must be a multiple of batch_size ({batch_size})",
         points.len(),
     );

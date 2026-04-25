@@ -1,9 +1,8 @@
 use crate::{
-    DataType, DataTypeEnum, Device, Layout, Tensor, TensorData,
+    DataType, DataTypeEnum, Device, Tensor, TensorData,
     compute_graph::NodeIndex,
     mir::{inputs::MirValue, kernel::GenericKernel, operation::Operation},
 };
-use fusor_gguf::GgmlType;
 
 use super::QMatrix;
 
@@ -75,44 +74,6 @@ impl QMatMulOperation {
 
 impl<const R: usize, T: DataType> Tensor<R, T> {
     pub fn q_mat_mul(&self, other: &QMatrix) -> Self {
-        // For F16/F32 matrices, dequantize and use regular mat_mul
-        // because they don't have block structure like quantized types
-        if matches!(other.datatype(), GgmlType::F16 | GgmlType::F32) {
-            let dequantized: Tensor<2, T> = other.dequantize();
-
-            // The weight matrix is [out_features, in_features], need to transpose for mat_mul
-            // self: [..., M, K] @ weight.T: [K, N] -> [..., M, N]
-            // Reshape weight to add batch dimensions: [1, 1, ..., K, N]
-            let weight_t: Tensor<2, T> =
-                dequantized.restride_layout(Layout::contiguous(other.shape()).transpose(0, 1));
-
-            // Create batch dimensions for the weight
-            let weight_shape: [usize; R] = std::array::from_fn(|i| {
-                if i < R - 2 {
-                    1 // Broadcast batch dimensions
-                } else if i == R - 2 {
-                    other.shape()[1] // K dimension
-                } else {
-                    other.shape()[0] // N dimension
-                }
-            });
-            let weight_reshaped: Tensor<R, T> = weight_t.reshape(weight_shape);
-
-            // Broadcast to match input batch dimensions
-            let self_shape = self.shape();
-            let broadcast_shape: [usize; R] = std::array::from_fn(|i| {
-                if i < R - 2 {
-                    self_shape[i] // Match input batch dimensions
-                } else if i == R - 2 {
-                    other.shape()[1] // K dimension
-                } else {
-                    other.shape()[0] // N dimension
-                }
-            });
-            let weight_broadcast: Tensor<R, T> = weight_reshaped.broadcast_as(broadcast_shape);
-
-            return self.mat_mul(&weight_broadcast);
-        }
         self.add_q_mat_mul(other)
     }
 }

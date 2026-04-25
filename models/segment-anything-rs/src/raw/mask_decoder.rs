@@ -168,10 +168,12 @@ impl MaskDecoder {
         )?;
         let iou_token = Embedding::load(device, &mut vb.pp("iou_token"))?;
         let mask_tokens = Embedding::load(device, &mut vb.pp("mask_tokens"))?;
-        let output_upscaling_conv1 = SamPixelShuffleUpscale2x2::load(device, &mut vb.pp("output_upscaling.0"))?;
+        let output_upscaling_conv1 =
+            SamPixelShuffleUpscale2x2::load(device, &mut vb.pp("output_upscaling.0"))?;
         let output_upscaling_ln =
             LayerNormNd::<f32>::load_over_axis(device, &mut vb.pp("output_upscaling.1"), 1, 1e-6)?;
-        let output_upscaling_conv2 = SamPixelShuffleUpscale2x2::load(device, &mut vb.pp("output_upscaling.3"))?;
+        let output_upscaling_conv2 =
+            SamPixelShuffleUpscale2x2::load(device, &mut vb.pp("output_upscaling.3"))?;
         let mut output_hypernetworks_mlps = Vec::with_capacity(num_mask_tokens);
         for i in 0..num_mask_tokens {
             let mlp = MlpMaskDecoder::load(

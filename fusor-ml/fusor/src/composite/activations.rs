@@ -258,10 +258,7 @@ mod tests {
         let neg_slice = neg_tensor.gelu().as_slice().await.unwrap();
         for (i, &x) in negative.iter().enumerate() {
             let got: f32 = neg_slice[[i]].into();
-            assert!(
-                got.abs() < 0.01,
-                "gelu({x}) ≈ 0 (within 0.01), got {got}",
-            );
+            assert!(got.abs() < 0.01, "gelu({x}) ≈ 0 (within 0.01), got {got}",);
         }
     }
 

@@ -468,7 +468,6 @@ impl SegmentAnything {
 
         Ok(masks)
     }
-
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

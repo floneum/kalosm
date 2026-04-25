@@ -282,7 +282,11 @@ where
 
         // Split inner dim into (groups, in_ch_per_group * kernel_size).
         let windows_3d: Tensor<3, D, _> = windows_flat
-            .reshape([batch * out_spatial_size, groups, in_ch_per_group * kernel_size])
+            .reshape([
+                batch * out_spatial_size,
+                groups,
+                in_ch_per_group * kernel_size,
+            ])
             .to_concrete();
         let windows_grouped = windows_3d.transpose(0, 1).to_concrete();
         // (groups, batch * out_spatial, in_ch_per_group * kernel_size)
@@ -1176,8 +1180,7 @@ mod tests {
                 .map(|i| (i as f32 * 0.013).sin() * 0.4)
                 .collect();
 
-            let a_flat_gpu: Tensor<2, f32> =
-                Tensor::from_slice(&gpu, [m, groups * k], &a_data);
+            let a_flat_gpu: Tensor<2, f32> = Tensor::from_slice(&gpu, [m, groups * k], &a_data);
             let a_3d_gpu = a_flat_gpu.reshape([m, groups, k]).to_concrete();
             let a_grouped_gpu = a_3d_gpu.transpose(0, 1).to_concrete();
 
@@ -1248,15 +1251,15 @@ mod tests {
             Tensor::from_slice(&gpu, [groups, 1, kh, kw], &weight_data);
 
         let padded_gpu = input_gpu.pad_axis(2, pad).pad_axis(3, pad);
-        let windows_gpu = padded_gpu.sliding_window_view([
-            SlidingWindow::new(2, kh, 1),
-            SlidingWindow::new(3, kw, 1),
-        ]);
+        let windows_gpu = padded_gpu
+            .sliding_window_view([SlidingWindow::new(2, kh, 1), SlidingWindow::new(3, kw, 1)]);
         let permuted_gpu = windows_gpu.permute([0, 2, 3, 1, 4, 5]);
         let flat_gpu: Tensor<2, f32> = permuted_gpu
             .reshape([out_spatial, in_channels * kernel_size])
             .to_concrete();
-        let windows_3d_gpu = flat_gpu.reshape([out_spatial, groups, kernel_size]).to_concrete();
+        let windows_3d_gpu = flat_gpu
+            .reshape([out_spatial, groups, kernel_size])
+            .to_concrete();
         let windows_grouped_gpu = windows_3d_gpu.transpose(0, 1).to_concrete();
         let weight_grouped_gpu = weight_gpu.reshape([groups, 1, kernel_size]).to_concrete();
         let weight_grouped_t_gpu = weight_grouped_gpu.transpose(1, 2).to_concrete();
@@ -1284,8 +1287,10 @@ mod tests {
         let actual = actual_slice.as_slice();
 
         // CPU reference via per-group narrow + conv.
-        let weight_cpu: Tensor<4, f32> =
-            Tensor::Cpu(fusor_cpu::Tensor::from_slice([groups, 1, kh, kw], &weight_data));
+        let weight_cpu: Tensor<4, f32> = Tensor::Cpu(fusor_cpu::Tensor::from_slice(
+            [groups, 1, kh, kw],
+            &weight_data,
+        ));
         let input_cpu: Tensor<4, f32> = Tensor::Cpu(fusor_cpu::Tensor::from_slice(
             [1, in_channels, h, w],
             &input_data,
@@ -1338,8 +1343,7 @@ mod tests {
             [1, 1],
             groups,
         );
-        let gc_flat: Tensor<1, f32> =
-            gc_out.reshape([groups * out_spatial]).to_concrete();
+        let gc_flat: Tensor<1, f32> = gc_out.reshape([groups * out_spatial]).to_concrete();
         let gc_slice = gc_flat.as_slice().await.unwrap();
         let gc = gc_slice.as_slice();
 
@@ -1392,15 +1396,15 @@ mod tests {
         let input_gpu: Tensor<4, f32> =
             Tensor::from_slice(&gpu, [1, in_channels, h, w], &input_data);
         let padded_gpu = input_gpu.pad_axis(2, pad).pad_axis(3, pad);
-        let windows_gpu = padded_gpu.sliding_window_view([
-            SlidingWindow::new(2, kh, 1),
-            SlidingWindow::new(3, kw, 1),
-        ]);
+        let windows_gpu = padded_gpu
+            .sliding_window_view([SlidingWindow::new(2, kh, 1), SlidingWindow::new(3, kw, 1)]);
         let permuted_gpu = windows_gpu.permute([0, 2, 3, 1, 4, 5]);
         let flat_gpu: Tensor<2, f32> = permuted_gpu
             .reshape([out_spatial, in_channels * kh * kw])
             .to_concrete();
-        let windows_3d_gpu = flat_gpu.reshape([out_spatial, groups, kh * kw]).to_concrete();
+        let windows_3d_gpu = flat_gpu
+            .reshape([out_spatial, groups, kh * kw])
+            .to_concrete();
         let windows_grouped_gpu = windows_3d_gpu.transpose(0, 1).to_concrete();
         // Materialize via as_slice — the only way to actually read GPU data.
         let windows_grouped_flat: Tensor<1, f32> = windows_grouped_gpu
@@ -1430,8 +1434,10 @@ mod tests {
                                 0.0
                             };
                             // After transpose to (groups, out_spatial, kh*kw):
-                            let out_idx =
-                                c * out_spatial * kh * kw + (oh_i * out_w + ow_i) * kh * kw + ki * kw + kj;
+                            let out_idx = c * out_spatial * kh * kw
+                                + (oh_i * out_w + ow_i) * kh * kw
+                                + ki * kw
+                                + kj;
                             expected[out_idx] = val;
                         }
                     }
@@ -1476,8 +1482,10 @@ mod tests {
             .map(|i| (i as f32 * 0.0091).cos() * 0.5)
             .collect();
 
-        let weight_cpu: Tensor<4, f32> =
-            Tensor::Cpu(fusor_cpu::Tensor::from_slice([groups, 1, kh, kw], &weight_data));
+        let weight_cpu: Tensor<4, f32> = Tensor::Cpu(fusor_cpu::Tensor::from_slice(
+            [groups, 1, kh, kw],
+            &weight_data,
+        ));
         let input_cpu: Tensor<4, f32> = Tensor::Cpu(fusor_cpu::Tensor::from_slice(
             [1, groups, h, w],
             &input_data,
