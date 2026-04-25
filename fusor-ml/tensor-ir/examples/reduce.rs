@@ -3,16 +3,11 @@
 use egg::Language;
 use tensor_ir::*;
 
-const ROWS: u32 = 32;
-const COLS: u32 = 64;
-
 fn main() {
     let mut builder = TensorExprBuilder::new();
-    let a = builder.input(
-        0,
-        Shape(vec![Dim::Const(ROWS), Dim::Const(COLS)]),
-        DType::F32,
-    );
+    let rows = Dim::Symbol(0);
+    let cols = Dim::Symbol(1);
+    let a = builder.input(0, Shape(vec![rows, cols]), DType::F32);
     let reduce = builder.reduce(a, 1, ReduceOp::Add);
     let expr = builder.build(reduce).expect("valid tensor expression");
 

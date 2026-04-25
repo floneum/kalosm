@@ -22,16 +22,6 @@ use std::path::{Path, PathBuf};
 
 use tensor_ir::*;
 
-const M: u32 = 8;
-const N: u32 = 8;
-const K: u32 = 8;
-
-/// Sequence length and head dim for the flash-attention scenario. Small on
-/// purpose — the attention expression has two matmuls + a softmax, so even
-/// 4×4 produces a substantial graph by phase 3.
-const ATTN_SEQ: u32 = 4;
-const ATTN_D: u32 = 4;
-
 struct Scenario {
     name: &'static str,
     description: &'static str,
@@ -357,19 +347,22 @@ fn escape_html(s: &str) -> String {
 
 fn build_matmul_expr() -> egg::RecExpr<TensorIr> {
     let mut b = IrBuilder::new();
-    let a = b.input(0, Shape(vec![Dim::Const(M), Dim::Const(K)]), DType::F32);
-    let rhs = b.input(1, Shape(vec![Dim::Const(K), Dim::Const(N)]), DType::F32);
+    let m = Dim::Symbol(0);
+    let n = Dim::Symbol(1);
+    let k = Dim::Symbol(2);
+    let a = b.input(0, Shape(vec![m.clone(), k.clone()]), DType::F32);
+    let rhs = b.input(1, Shape(vec![k.clone(), n.clone()]), DType::F32);
 
-    let tile_shape = Shape(vec![Dim::Const(M), Dim::Const(N), Dim::Const(K)]);
+    let tile_shape = Shape(vec![m, n.clone(), k.clone()]);
     let a_r = b.restride(
         a,
         tile_shape.clone(),
-        Strides(vec![Dim::Const(K), Dim::Const(0), Dim::Const(1)]),
+        Strides(vec![k.clone(), Dim::Const(0), Dim::Const(1)]),
     );
     let b_r = b.restride(
         rhs,
         tile_shape.clone(),
-        Strides(vec![Dim::Const(0), Dim::Const(1), Dim::Const(N)]),
+        Strides(vec![Dim::Const(0), Dim::Const(1), n]),
     );
 
     let arg0 = b.scalar_arg(0);
@@ -387,25 +380,25 @@ fn build_matmul_expr() -> egg::RecExpr<TensorIr> {
 /// workload.
 fn build_attention_expr() -> egg::RecExpr<TensorIr> {
     let mut b = IrBuilder::new();
-    let seq = ATTN_SEQ;
-    let d = ATTN_D;
+    let seq = Dim::Symbol(0);
+    let d = Dim::Symbol(1);
 
-    let q = b.input(0, Shape(vec![Dim::Const(seq), Dim::Const(d)]), DType::F32);
-    let k = b.input(1, Shape(vec![Dim::Const(seq), Dim::Const(d)]), DType::F32);
-    let v = b.input(2, Shape(vec![Dim::Const(seq), Dim::Const(d)]), DType::F32);
+    let q = b.input(0, Shape(vec![seq.clone(), d.clone()]), DType::F32);
+    let k = b.input(1, Shape(vec![seq.clone(), d.clone()]), DType::F32);
+    let v = b.input(2, Shape(vec![seq.clone(), d.clone()]), DType::F32);
 
     // S = Q · Kᵀ: reduce over d. In the [seq, seq, d] tile, Q[i, k] has
     // strides [d, 0, 1]; Kᵀ viewed from K[j, k] has strides [0, d, 1].
-    let qk_tile = Shape(vec![Dim::Const(seq), Dim::Const(seq), Dim::Const(d)]);
+    let qk_tile = Shape(vec![seq.clone(), seq.clone(), d.clone()]);
     let q_r = b.restride(
         q,
         qk_tile.clone(),
-        Strides(vec![Dim::Const(d), Dim::Const(0), Dim::Const(1)]),
+        Strides(vec![d.clone(), Dim::Const(0), Dim::Const(1)]),
     );
     let k_r = b.restride(
         k,
         qk_tile.clone(),
-        Strides(vec![Dim::Const(0), Dim::Const(d), Dim::Const(1)]),
+        Strides(vec![Dim::Const(0), d.clone(), Dim::Const(1)]),
     );
     let arg0 = b.scalar_arg(0);
     let arg1 = b.scalar_arg(1);
@@ -415,21 +408,21 @@ fn build_attention_expr() -> egg::RecExpr<TensorIr> {
 
     // P = softmax(scores, axis=1). Kept decomposed so the generic softmax
     // lowering and subsequent memory/reduction rewrites stay visible.
-    let scores_shape = Shape(vec![Dim::Const(seq), Dim::Const(seq)]);
+    let scores_shape = Shape(vec![seq.clone(), seq.clone()]);
     let probs = b.softmax(scores, scores_shape, 1);
 
     // O = P · V: reduce over the inner seq axis. In the [seq, d, seq] tile,
     // P[i, k] has strides [seq, 0, 1]; V[k, j] has strides [0, 1, d].
-    let pv_tile = Shape(vec![Dim::Const(seq), Dim::Const(d), Dim::Const(seq)]);
+    let pv_tile = Shape(vec![seq.clone(), d.clone(), seq.clone()]);
     let p_r = b.restride(
         probs,
         pv_tile.clone(),
-        Strides(vec![Dim::Const(seq), Dim::Const(0), Dim::Const(1)]),
+        Strides(vec![seq, Dim::Const(0), Dim::Const(1)]),
     );
     let v_r = b.restride(
         v,
         pv_tile.clone(),
-        Strides(vec![Dim::Const(0), Dim::Const(1), Dim::Const(d)]),
+        Strides(vec![Dim::Const(0), Dim::Const(1), d]),
     );
     let arg0 = b.scalar_arg(0);
     let arg1 = b.scalar_arg(1);

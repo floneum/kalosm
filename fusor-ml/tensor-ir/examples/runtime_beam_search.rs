@@ -144,6 +144,7 @@ impl BenchmarkHarness {
         &self,
         program: &DispatchProgram,
         inputs: &[&[f32]],
+        shape_params: &ShapeParams,
         expected: &[f32],
         warmup_runs: u32,
         timing_runs: u32,
@@ -183,7 +184,6 @@ impl BenchmarkHarness {
         let mut pipelines = Vec::new();
         let mut bind_groups = Vec::new();
         let mut output_buffers = Vec::new();
-        let shape_params = ShapeParams::default();
         let shape_param_words = shape_params.storage_words();
         let shape_params_buffer =
             self.device
@@ -208,7 +208,7 @@ impl BenchmarkHarness {
             .map_err(format_panic_payload)?;
 
             let dispatch_workgroups =
-                dispatch.workgroups.eval_u32(&shape_params).ok_or_else(|| {
+                dispatch.workgroups.eval_u32(shape_params).ok_or_else(|| {
                     format!("missing shape parameter for dispatch {dispatch_index} workgroups")
                 })?;
             let dispatch_elems =
@@ -326,7 +326,7 @@ impl BenchmarkHarness {
                 // Physical workgroups = virtual workgroups / simdgroups.
                 // Each physical workgroup contains `simdgroups` simdgroups.
                 let dispatch_workgroups =
-                    dispatch.workgroups.eval_u32(&shape_params).ok_or_else(|| {
+                    dispatch.workgroups.eval_u32(shape_params).ok_or_else(|| {
                         format!("missing shape parameter for dispatch {dispatch_index} workgroups")
                     })?;
                 let physical_workgroups = dispatch_workgroups.div_ceil(dispatch.simdgroups.max(1));
@@ -796,6 +796,7 @@ fn main() {
         match harness.benchmark(
             &candidate.program,
             &input_refs,
+            &workload.shape_params,
             expected,
             warmup_runs,
             timing_runs,

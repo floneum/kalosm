@@ -109,12 +109,13 @@ fn time_tir_gpu(
     ctx: &GpuContext,
     program: &DispatchProgram,
     inputs: &[&[f32]],
+    shape_params: &ShapeParams,
     cfg: RunCfg,
 ) -> Result<Stats, String> {
     let result = ctx.benchmark(
         program,
         inputs,
-        &ShapeParams::default(),
+        shape_params,
         ProgramBenchmarkConfig {
             warmup_runs: cfg.warmup,
             timing_runs: cfg.timing,
@@ -132,12 +133,13 @@ fn time_tir_host(
     ctx: &GpuContext,
     program: &DispatchProgram,
     inputs: &[&[f32]],
+    shape_params: &ShapeParams,
     cfg: RunCfg,
 ) -> Result<Stats, String> {
     let result = ctx.benchmark_host(
         program,
         inputs,
-        &ShapeParams::default(),
+        shape_params,
         ProgramBenchmarkConfig {
             warmup_runs: cfg.warmup,
             timing_runs: cfg.timing,
@@ -156,12 +158,13 @@ fn time_tir_host_batched(
     ctx: &GpuContext,
     program: &DispatchProgram,
     inputs: &[&[f32]],
+    shape_params: &ShapeParams,
     cfg: RunCfg,
 ) -> Result<Stats, String> {
     let result = ctx.benchmark_host_batched(
         program,
         inputs,
-        &ShapeParams::default(),
+        shape_params,
         ProgramBenchmarkConfig {
             warmup_runs: cfg.warmup,
             timing_runs: cfg.timing,
@@ -226,13 +229,18 @@ fn signed_seq_f32(len: usize, modulus: usize) -> Vec<f32> {
 /// Quick tuning benchmark on a candidate. Returns median GPU µs so a single
 /// timestamp outlier can't flip the selection order.
 #[cfg(all(feature = "runtime", feature = "candle"))]
-fn quick_time_us(ctx: &GpuContext, program: &DispatchProgram, inputs: &[&[f32]]) -> Option<f64> {
+fn quick_time_us(
+    ctx: &GpuContext,
+    program: &DispatchProgram,
+    inputs: &[&[f32]],
+    shape_params: &ShapeParams,
+) -> Option<f64> {
     use std::panic::{self, AssertUnwindSafe};
     let result = panic::catch_unwind(AssertUnwindSafe(|| {
         ctx.benchmark(
             program,
             inputs,
-            &ShapeParams::default(),
+            shape_params,
             ProgramBenchmarkConfig {
                 warmup_runs: 3,
                 timing_runs: 15,
@@ -277,6 +285,7 @@ fn compile_tensor_ir(
     ctx: &GpuContext,
     expr: &TensorExprProgram,
     inputs: &[&[f32]],
+    shape_params: &ShapeParams,
     expected: &[f32],
 ) -> Result<(DispatchProgram, Vec<f32>), String> {
     use std::panic::{self, AssertUnwindSafe};
@@ -293,13 +302,13 @@ fn compile_tensor_ir(
     let debug_candidates = std::env::var_os("TIR_DUMP_CANDIDATES").is_some();
     let mut consider = |label: &str, program: DispatchProgram, ctx: &GpuContext| {
         let out = panic::catch_unwind(AssertUnwindSafe(|| {
-            ctx.execute(&program, inputs, &ShapeParams::default())
+            ctx.execute(&program, inputs, shape_params)
         }));
         let Ok(out) = out else { return };
         if !tolerance_ok(&out) {
             return;
         }
-        let Some(us) = quick_time_us(ctx, &program, inputs) else {
+        let Some(us) = quick_time_us(ctx, &program, inputs, shape_params) else {
             return;
         };
         if debug_candidates {
@@ -380,21 +389,24 @@ fn compile_tensor_ir(
 #[cfg(all(feature = "runtime", feature = "candle"))]
 fn build_sgemm_expr(m: u32, n: u32, k: u32) -> TensorExprProgram {
     let mut b = TensorExprBuilder::new();
-    let a = b.input(0, Shape(vec![Dim::Const(m), Dim::Const(k)]), DType::F32);
-    let rhs = b.input(1, Shape(vec![Dim::Const(k), Dim::Const(n)]), DType::F32);
+    let m_dim = Dim::Symbol(0);
+    let n_dim = Dim::Symbol(1);
+    let k_dim = Dim::Symbol(2);
+    let a = b.input(0, Shape(vec![m_dim.clone(), k_dim.clone()]), DType::F32);
+    let rhs = b.input(1, Shape(vec![k_dim.clone(), n_dim.clone()]), DType::F32);
     let a0 = b.scalar_arg(0);
     let a1 = b.scalar_arg(1);
     let body = b.scalar_binop(BinaryOp::Mul, [a0, a1]);
     let root = b.contraction(
-        Shape(vec![Dim::Const(m), Dim::Const(n), Dim::Const(k)]),
+        Shape(vec![m_dim, n_dim.clone(), k_dim.clone()]),
         &[
             (
                 a,
-                Strides(vec![Dim::Const(k), Dim::Const(0), Dim::Const(1)]),
+                Strides(vec![k_dim, Dim::Const(0), Dim::Const(1)]),
             ),
             (
                 rhs,
-                Strides(vec![Dim::Const(0), Dim::Const(1), Dim::Const(n)]),
+                Strides(vec![Dim::Const(0), Dim::Const(1), n_dim]),
             ),
         ],
         body,
@@ -406,17 +418,19 @@ fn build_sgemm_expr(m: u32, n: u32, k: u32) -> TensorExprProgram {
 #[cfg(all(feature = "runtime", feature = "candle"))]
 fn build_sgemv_expr(m: u32, k: u32) -> TensorExprProgram {
     let mut b = TensorExprBuilder::new();
-    let a = b.input(0, Shape(vec![Dim::Const(m), Dim::Const(k)]), DType::F32);
-    let x = b.input(1, Shape(vec![Dim::Const(k), Dim::Const(1)]), DType::F32);
+    let m_dim = Dim::Symbol(0);
+    let k_dim = Dim::Symbol(1);
+    let a = b.input(0, Shape(vec![m_dim.clone(), k_dim.clone()]), DType::F32);
+    let x = b.input(1, Shape(vec![k_dim.clone(), Dim::Const(1)]), DType::F32);
     let a0 = b.scalar_arg(0);
     let a1 = b.scalar_arg(1);
     let body = b.scalar_binop(BinaryOp::Mul, [a0, a1]);
     let root = b.contraction(
-        Shape(vec![Dim::Const(m), Dim::Const(1), Dim::Const(k)]),
+        Shape(vec![m_dim, Dim::Const(1), k_dim.clone()]),
         &[
             (
                 a,
-                Strides(vec![Dim::Const(k), Dim::Const(0), Dim::Const(1)]),
+                Strides(vec![k_dim, Dim::Const(0), Dim::Const(1)]),
             ),
             (
                 x,
@@ -432,7 +446,7 @@ fn build_sgemv_expr(m: u32, k: u32) -> TensorExprProgram {
 #[cfg(all(feature = "runtime", feature = "candle"))]
 fn build_add_expr(rows: u32, cols: u32) -> TensorExprProgram {
     let mut b = TensorExprBuilder::new();
-    let shape = Shape(vec![Dim::Const(rows), Dim::Const(cols)]);
+    let shape = Shape(vec![Dim::Symbol(0), Dim::Symbol(1)]);
     let a = b.input(0, shape.clone(), DType::F32);
     let r = b.input(1, shape.clone(), DType::F32);
     let a0 = b.scalar_arg(0);
@@ -445,11 +459,7 @@ fn build_add_expr(rows: u32, cols: u32) -> TensorExprProgram {
 #[cfg(all(feature = "runtime", feature = "candle"))]
 fn build_reduce_sum_expr(rows: u32, cols: u32) -> TensorExprProgram {
     let mut b = TensorExprBuilder::new();
-    let x = b.input(
-        0,
-        Shape(vec![Dim::Const(rows), Dim::Const(cols)]),
-        DType::F32,
-    );
+    let x = b.input(0, Shape(vec![Dim::Symbol(0), Dim::Symbol(1)]), DType::F32);
     let root = b.reduce(x, 1, ReduceOp::Add);
     b.build(root).expect("valid reduce_sum expr")
 }
@@ -457,20 +467,22 @@ fn build_reduce_sum_expr(rows: u32, cols: u32) -> TensorExprProgram {
 #[cfg(all(feature = "runtime", feature = "candle"))]
 fn build_attention_expr(seq: u32, d: u32) -> TensorExprProgram {
     let mut b = TensorExprBuilder::new();
-    let q = b.input(0, Shape(vec![Dim::Const(seq), Dim::Const(d)]), DType::F32);
-    let k = b.input(1, Shape(vec![Dim::Const(seq), Dim::Const(d)]), DType::F32);
-    let v = b.input(2, Shape(vec![Dim::Const(seq), Dim::Const(d)]), DType::F32);
+    let seq_dim = Dim::Symbol(0);
+    let d_dim = Dim::Symbol(1);
+    let q = b.input(0, Shape(vec![seq_dim.clone(), d_dim.clone()]), DType::F32);
+    let k = b.input(1, Shape(vec![seq_dim.clone(), d_dim.clone()]), DType::F32);
+    let v = b.input(2, Shape(vec![seq_dim.clone(), d_dim.clone()]), DType::F32);
 
-    let qk_tile = Shape(vec![Dim::Const(seq), Dim::Const(seq), Dim::Const(d)]);
+    let qk_tile = Shape(vec![seq_dim.clone(), seq_dim.clone(), d_dim.clone()]);
     let q_r = b.restride(
         q,
         qk_tile.clone(),
-        Strides(vec![Dim::Const(d), Dim::Const(0), Dim::Const(1)]),
+        Strides(vec![d_dim.clone(), Dim::Const(0), Dim::Const(1)]),
     );
     let k_r = b.restride(
         k,
         qk_tile.clone(),
-        Strides(vec![Dim::Const(0), Dim::Const(d), Dim::Const(1)]),
+        Strides(vec![Dim::Const(0), d_dim.clone(), Dim::Const(1)]),
     );
     let arg0 = b.scalar_arg(0);
     let arg1 = b.scalar_arg(1);
@@ -478,19 +490,19 @@ fn build_attention_expr(seq: u32, d: u32) -> TensorExprProgram {
     let qk_mul = b.elementwise(qk_tile, &[q_r, k_r], mul_body);
     let scores = b.reduce(qk_mul, 2, ReduceOp::Add);
 
-    let scores_shape = Shape(vec![Dim::Const(seq), Dim::Const(seq)]);
+    let scores_shape = Shape(vec![seq_dim.clone(), seq_dim.clone()]);
     let probs = b.softmax(scores, scores_shape, 1);
 
-    let pv_tile = Shape(vec![Dim::Const(seq), Dim::Const(d), Dim::Const(seq)]);
+    let pv_tile = Shape(vec![seq_dim.clone(), d_dim.clone(), seq_dim.clone()]);
     let p_r = b.restride(
         probs,
         pv_tile.clone(),
-        Strides(vec![Dim::Const(seq), Dim::Const(0), Dim::Const(1)]),
+        Strides(vec![seq_dim, Dim::Const(0), Dim::Const(1)]),
     );
     let v_r = b.restride(
         v,
         pv_tile.clone(),
-        Strides(vec![Dim::Const(0), Dim::Const(1), Dim::Const(d)]),
+        Strides(vec![Dim::Const(0), Dim::Const(1), d_dim]),
     );
     let arg0 = b.scalar_arg(0);
     let arg1 = b.scalar_arg(1);
@@ -603,11 +615,12 @@ fn run_sgemm(
     k: u32,
 ) -> Result<Row, String> {
     let expr = build_sgemm_expr(m, n, k);
+    let shape_params = ShapeParams::from([m, n, k]);
     let a = seq_f32((m * k) as usize, 17);
     let b_data = seq_f32((k * n) as usize, 31);
     let inputs: Vec<&[f32]> = vec![&a, &b_data];
     let reference = cpu_matmul_reference(m, n, k, &a, &b_data);
-    let (program, tir_out) = compile_tensor_ir(ctx, &expr, &inputs, &reference)?;
+    let (program, tir_out) = compile_tensor_ir(ctx, &expr, &inputs, &shape_params, &reference)?;
     let tir_err = validate_err("sgemm", "tensor_ir", &tir_out, &reference)?;
 
     let ta = Tensor::from_slice(&a, (m as usize, k as usize), device).map_err(|e| e.to_string())?;
@@ -620,9 +633,9 @@ fn run_sgemm(
         .map_err(|e| e.to_string())?;
     let candle_err = validate_err("sgemm", "candle", &candle_out, &reference)?;
 
-    let tir_gpu_stats = time_tir_gpu(ctx, &program, &inputs, cfg)?;
-    let tir_host_stats = time_tir_host(ctx, &program, &inputs, cfg)?;
-    let tir_batched_stats = time_tir_host_batched(ctx, &program, &inputs, cfg)?;
+    let tir_gpu_stats = time_tir_gpu(ctx, &program, &inputs, &shape_params, cfg)?;
+    let tir_host_stats = time_tir_host(ctx, &program, &inputs, &shape_params, cfg)?;
+    let tir_batched_stats = time_tir_host_batched(ctx, &program, &inputs, &shape_params, cfg)?;
     let candle_stats = time_runs(cfg, || {
         let c = ta.matmul(&tb).expect("candle matmul");
         drop(c);
@@ -651,11 +664,12 @@ fn run_sgemv(
     k: u32,
 ) -> Result<Row, String> {
     let expr = build_sgemv_expr(m, k);
+    let shape_params = ShapeParams::from([m, k]);
     let a = seq_f32((m * k) as usize, 17);
     let x = seq_f32(k as usize, 31);
     let inputs: Vec<&[f32]> = vec![&a, &x];
     let reference = cpu_matmul_reference(m, 1, k, &a, &x);
-    let (program, tir_out) = compile_tensor_ir(ctx, &expr, &inputs, &reference)?;
+    let (program, tir_out) = compile_tensor_ir(ctx, &expr, &inputs, &shape_params, &reference)?;
     let tir_err = validate_err("sgemv", "tensor_ir", &tir_out, &reference)?;
 
     let ta = Tensor::from_slice(&a, (m as usize, k as usize), device).map_err(|e| e.to_string())?;
@@ -667,9 +681,9 @@ fn run_sgemv(
         .map_err(|e| e.to_string())?;
     let candle_err = validate_err("sgemv", "candle", &candle_out, &reference)?;
 
-    let tir_gpu_stats = time_tir_gpu(ctx, &program, &inputs, cfg)?;
-    let tir_host_stats = time_tir_host(ctx, &program, &inputs, cfg)?;
-    let tir_batched_stats = time_tir_host_batched(ctx, &program, &inputs, cfg)?;
+    let tir_gpu_stats = time_tir_gpu(ctx, &program, &inputs, &shape_params, cfg)?;
+    let tir_host_stats = time_tir_host(ctx, &program, &inputs, &shape_params, cfg)?;
+    let tir_batched_stats = time_tir_host_batched(ctx, &program, &inputs, &shape_params, cfg)?;
     let candle_stats = time_runs(cfg, || {
         let c = ta.matmul(&tx).expect("candle sgemv");
         drop(c);
@@ -697,6 +711,7 @@ fn run_softmax(
     rows: u32,
     cols: u32,
 ) -> Result<Row, String> {
+    let shape_params = ShapeParams::from([rows, cols]);
     let input = signed_seq_f32((rows * cols) as usize, 7);
     let inputs: Vec<&[f32]> = vec![&input];
     let reference = cpu_softmax_reference(rows, cols, &input);
@@ -705,7 +720,7 @@ fn run_softmax(
     // `runtime_beam_search` used, which finds a valid Dispatch candidate at
     // this shape.
     let program = compile_softmax_via_irbuilder(ctx, rows, cols, &inputs, &reference)?;
-    let tir_out = ctx.execute(&program, &inputs, &ShapeParams::default());
+    let tir_out = ctx.execute(&program, &inputs, &shape_params);
     let tir_err = validate_err("softmax", "tensor_ir", &tir_out, &reference)?;
 
     let tx = Tensor::from_slice(&input, (rows as usize, cols as usize), device)
@@ -716,9 +731,9 @@ fn run_softmax(
         .map_err(|e| e.to_string())?;
     let candle_err = validate_err("softmax", "candle", &candle_out, &reference)?;
 
-    let tir_gpu_stats = time_tir_gpu(ctx, &program, &inputs, cfg)?;
-    let tir_host_stats = time_tir_host(ctx, &program, &inputs, cfg)?;
-    let tir_batched_stats = time_tir_host_batched(ctx, &program, &inputs, cfg)?;
+    let tir_gpu_stats = time_tir_gpu(ctx, &program, &inputs, &shape_params, cfg)?;
+    let tir_host_stats = time_tir_host(ctx, &program, &inputs, &shape_params, cfg)?;
+    let tir_batched_stats = time_tir_host_batched(ctx, &program, &inputs, &shape_params, cfg)?;
     let candle_stats = time_runs(cfg, || {
         let o = candle_softmax(&tx).expect("candle softmax");
         drop(o);
@@ -748,13 +763,14 @@ fn compile_softmax_via_irbuilder(
 ) -> Result<DispatchProgram, String> {
     use std::panic::{self, AssertUnwindSafe};
 
+    let shape_params = ShapeParams::from([rows, cols]);
     let hook = panic::take_hook();
     panic::set_hook(Box::new(|_| {}));
 
     let result = panic::catch_unwind(AssertUnwindSafe(|| -> Result<DispatchProgram, String> {
         let make_recexpr = || {
             let mut builder = IrBuilder::new();
-            let shape = Shape(vec![Dim::Const(rows), Dim::Const(cols)]);
+            let shape = Shape(vec![Dim::Symbol(0), Dim::Symbol(1)]);
             let x = builder.input(0, shape.clone(), DType::F32);
             let _ = builder.softmax(x, shape, 1);
             builder.expr
@@ -800,9 +816,8 @@ fn compile_softmax_via_irbuilder(
                 if program.dispatches.is_empty() {
                     continue;
                 }
-                let out = panic::catch_unwind(AssertUnwindSafe(|| {
-                    ctx.execute(&program, inputs, &ShapeParams::default())
-                }));
+                let out =
+                    panic::catch_unwind(AssertUnwindSafe(|| ctx.execute(&program, inputs, &shape_params)));
                 let Ok(out) = out else { continue };
                 if out.len() < expected.len() {
                     continue;
@@ -811,7 +826,7 @@ fn compile_softmax_via_irbuilder(
                 if !err.is_finite() || err >= 1e-2 {
                     continue;
                 }
-                let Some(us) = quick_time_us(ctx, &program, inputs) else {
+                let Some(us) = quick_time_us(ctx, &program, inputs, &shape_params) else {
                     continue;
                 };
                 match &best {
@@ -872,25 +887,28 @@ fn compile_attention_via_irbuilder(
 ) -> Result<DispatchProgram, String> {
     use std::panic::{self, AssertUnwindSafe};
 
+    let shape_params = ShapeParams::from([seq, d]);
     let hook = panic::take_hook();
     panic::set_hook(Box::new(|_| {}));
 
     let result = panic::catch_unwind(AssertUnwindSafe(|| -> Result<DispatchProgram, String> {
         let mut builder = IrBuilder::new();
-        let q = builder.input(0, Shape(vec![Dim::Const(seq), Dim::Const(d)]), DType::F32);
-        let k = builder.input(1, Shape(vec![Dim::Const(seq), Dim::Const(d)]), DType::F32);
-        let v = builder.input(2, Shape(vec![Dim::Const(seq), Dim::Const(d)]), DType::F32);
+        let seq_dim = Dim::Symbol(0);
+        let d_dim = Dim::Symbol(1);
+        let q = builder.input(0, Shape(vec![seq_dim.clone(), d_dim.clone()]), DType::F32);
+        let k = builder.input(1, Shape(vec![seq_dim.clone(), d_dim.clone()]), DType::F32);
+        let v = builder.input(2, Shape(vec![seq_dim.clone(), d_dim.clone()]), DType::F32);
 
-        let qk_tile = Shape(vec![Dim::Const(seq), Dim::Const(seq), Dim::Const(d)]);
+        let qk_tile = Shape(vec![seq_dim.clone(), seq_dim.clone(), d_dim.clone()]);
         let q_r = builder.restride(
             q,
             qk_tile.clone(),
-            Strides(vec![Dim::Const(d), Dim::Const(0), Dim::Const(1)]),
+            Strides(vec![d_dim.clone(), Dim::Const(0), Dim::Const(1)]),
         );
         let k_r = builder.restride(
             k,
             qk_tile.clone(),
-            Strides(vec![Dim::Const(0), Dim::Const(d), Dim::Const(1)]),
+            Strides(vec![Dim::Const(0), d_dim.clone(), Dim::Const(1)]),
         );
         let arg0 = builder.scalar_arg(0);
         let arg1 = builder.scalar_arg(1);
@@ -898,19 +916,19 @@ fn compile_attention_via_irbuilder(
         let qk_mul = builder.elementwise(qk_tile, &[q_r, k_r], mul_body);
         let scores = builder.reduce(qk_mul, 2, ReduceOp::Add);
 
-        let scores_shape = Shape(vec![Dim::Const(seq), Dim::Const(seq)]);
+        let scores_shape = Shape(vec![seq_dim.clone(), seq_dim.clone()]);
         let probs = builder.softmax(scores, scores_shape, 1);
 
-        let pv_tile = Shape(vec![Dim::Const(seq), Dim::Const(d), Dim::Const(seq)]);
+        let pv_tile = Shape(vec![seq_dim.clone(), d_dim.clone(), seq_dim.clone()]);
         let p_r = builder.restride(
             probs,
             pv_tile.clone(),
-            Strides(vec![Dim::Const(seq), Dim::Const(0), Dim::Const(1)]),
+            Strides(vec![seq_dim, Dim::Const(0), Dim::Const(1)]),
         );
         let v_r = builder.restride(
             v,
             pv_tile.clone(),
-            Strides(vec![Dim::Const(0), Dim::Const(1), Dim::Const(d)]),
+            Strides(vec![Dim::Const(0), Dim::Const(1), d_dim]),
         );
         let arg0 = builder.scalar_arg(0);
         let arg1 = builder.scalar_arg(1);
@@ -956,9 +974,8 @@ fn compile_attention_via_irbuilder(
                 if program.dispatches.is_empty() {
                     continue;
                 }
-                let out = panic::catch_unwind(AssertUnwindSafe(|| {
-                    ctx.execute(&program, inputs, &ShapeParams::default())
-                }));
+                let out =
+                    panic::catch_unwind(AssertUnwindSafe(|| ctx.execute(&program, inputs, &shape_params)));
                 let Ok(out) = out else { continue };
                 if out.len() < expected.len() {
                     continue;
@@ -967,7 +984,7 @@ fn compile_attention_via_irbuilder(
                 if !err.is_finite() || err >= 1e-2 {
                     continue;
                 }
-                let Some(us) = quick_time_us(ctx, &program, inputs) else {
+                let Some(us) = quick_time_us(ctx, &program, inputs, &shape_params) else {
                     continue;
                 };
                 match &best {
@@ -1048,35 +1065,46 @@ fn run_flash_attention_staged_tir(
     let probs_ref = cpu_softmax_reference(seq, seq, &scores_ref);
 
     let qk_expr = build_sgemm_expr(seq, seq, d);
+    let qk_params = ShapeParams::from([seq, seq, d]);
     let qk_inputs: Vec<&[f32]> = vec![q, &kt];
-    let (qk_program, qk_out) = compile_tensor_ir(ctx, &qk_expr, &qk_inputs, &scores_ref)?;
+    let (qk_program, qk_out) =
+        compile_tensor_ir(ctx, &qk_expr, &qk_inputs, &qk_params, &scores_ref)?;
     let _ = validate_err("flash_attn/qk", "tensor_ir", &qk_out, &scores_ref)?;
     let scores = qk_out[..scores_ref.len()].to_vec();
 
     let softmax_inputs: Vec<&[f32]> = vec![&scores_ref];
+    let softmax_params = ShapeParams::from([seq, seq]);
     let softmax_program =
         compile_softmax_via_irbuilder(ctx, seq, seq, &softmax_inputs, &probs_ref)?;
-    let probs_out = ctx.execute(&softmax_program, &[&scores], &ShapeParams::default());
+    let probs_out = ctx.execute(&softmax_program, &[&scores], &softmax_params);
     let _ = validate_err("flash_attn/softmax", "tensor_ir", &probs_out, &probs_ref)?;
     let probs = probs_out[..probs_ref.len()].to_vec();
 
     let pv_expr = build_sgemm_expr(seq, d, seq);
+    let pv_params = ShapeParams::from([seq, d, seq]);
     let pv_inputs: Vec<&[f32]> = vec![&probs_ref, v];
-    let (pv_program, _) = compile_tensor_ir(ctx, &pv_expr, &pv_inputs, reference)?;
-    let tir_out = ctx.execute(&pv_program, &[&probs, v], &ShapeParams::default());
+    let (pv_program, _) = compile_tensor_ir(ctx, &pv_expr, &pv_inputs, &pv_params, reference)?;
+    let tir_out = ctx.execute(&pv_program, &[&probs, v], &pv_params);
     let err = validate_err("flash_attn", "tensor_ir", &tir_out, reference)?;
 
-    let qk_gpu = time_tir_gpu(ctx, &qk_program, &qk_inputs, cfg)?;
-    let softmax_gpu = time_tir_gpu(ctx, &softmax_program, &softmax_inputs, cfg)?;
-    let pv_gpu = time_tir_gpu(ctx, &pv_program, &pv_inputs, cfg)?;
+    let qk_gpu = time_tir_gpu(ctx, &qk_program, &qk_inputs, &qk_params, cfg)?;
+    let softmax_gpu = time_tir_gpu(ctx, &softmax_program, &softmax_inputs, &softmax_params, cfg)?;
+    let pv_gpu = time_tir_gpu(ctx, &pv_program, &pv_inputs, &pv_params, cfg)?;
 
-    let qk_host = time_tir_host(ctx, &qk_program, &qk_inputs, cfg)?;
-    let softmax_host = time_tir_host(ctx, &softmax_program, &softmax_inputs, cfg)?;
-    let pv_host = time_tir_host(ctx, &pv_program, &pv_inputs, cfg)?;
+    let qk_host = time_tir_host(ctx, &qk_program, &qk_inputs, &qk_params, cfg)?;
+    let softmax_host =
+        time_tir_host(ctx, &softmax_program, &softmax_inputs, &softmax_params, cfg)?;
+    let pv_host = time_tir_host(ctx, &pv_program, &pv_inputs, &pv_params, cfg)?;
 
-    let qk_batched = time_tir_host_batched(ctx, &qk_program, &qk_inputs, cfg)?;
-    let softmax_batched = time_tir_host_batched(ctx, &softmax_program, &softmax_inputs, cfg)?;
-    let pv_batched = time_tir_host_batched(ctx, &pv_program, &pv_inputs, cfg)?;
+    let qk_batched = time_tir_host_batched(ctx, &qk_program, &qk_inputs, &qk_params, cfg)?;
+    let softmax_batched = time_tir_host_batched(
+        ctx,
+        &softmax_program,
+        &softmax_inputs,
+        &softmax_params,
+        cfg,
+    )?;
+    let pv_batched = time_tir_host_batched(ctx, &pv_program, &pv_inputs, &pv_params, cfg)?;
 
     Ok(TirBenchResult {
         gpu: sum_stats(&[qk_gpu, softmax_gpu, pv_gpu]),
@@ -1184,11 +1212,12 @@ fn run_elementwise_add(
     cols: u32,
 ) -> Result<Row, String> {
     let expr = build_add_expr(rows, cols);
+    let shape_params = ShapeParams::from([rows, cols]);
     let a = seq_f32((rows * cols) as usize, 13);
     let b = seq_f32((rows * cols) as usize, 29);
     let inputs: Vec<&[f32]> = vec![&a, &b];
     let reference: Vec<f32> = a.iter().zip(&b).map(|(x, y)| x + y).collect();
-    let (program, tir_out) = compile_tensor_ir(ctx, &expr, &inputs, &reference)?;
+    let (program, tir_out) = compile_tensor_ir(ctx, &expr, &inputs, &shape_params, &reference)?;
     let tir_err = validate_err("elementwise", "tensor_ir", &tir_out, &reference)?;
 
     let ta = Tensor::from_slice(&a, (rows as usize, cols as usize), device)
@@ -1202,9 +1231,9 @@ fn run_elementwise_add(
         .map_err(|e| e.to_string())?;
     let candle_err = validate_err("elementwise", "candle", &candle_out, &reference)?;
 
-    let tir_gpu_stats = time_tir_gpu(ctx, &program, &inputs, cfg)?;
-    let tir_host_stats = time_tir_host(ctx, &program, &inputs, cfg)?;
-    let tir_batched_stats = time_tir_host_batched(ctx, &program, &inputs, cfg)?;
+    let tir_gpu_stats = time_tir_gpu(ctx, &program, &inputs, &shape_params, cfg)?;
+    let tir_host_stats = time_tir_host(ctx, &program, &inputs, &shape_params, cfg)?;
+    let tir_batched_stats = time_tir_host_batched(ctx, &program, &inputs, &shape_params, cfg)?;
     let candle_stats = time_runs(cfg, || {
         let c = ta.add(&tb).expect("candle add");
         drop(c);
@@ -1233,10 +1262,11 @@ fn run_reduce_sum(
     cols: u32,
 ) -> Result<Row, String> {
     let expr = build_reduce_sum_expr(rows, cols);
+    let shape_params = ShapeParams::from([rows, cols]);
     let input = seq_f32((rows * cols) as usize, 19);
     let inputs: Vec<&[f32]> = vec![&input];
     let reference = cpu_reduce_sum_reference(rows, cols, &input);
-    let (program, tir_out) = compile_tensor_ir(ctx, &expr, &inputs, &reference)?;
+    let (program, tir_out) = compile_tensor_ir(ctx, &expr, &inputs, &shape_params, &reference)?;
     let tir_err = validate_err("reduce_sum", "tensor_ir", &tir_out, &reference)?;
 
     let tx = Tensor::from_slice(&input, (rows as usize, cols as usize), device)
@@ -1248,9 +1278,9 @@ fn run_reduce_sum(
         .map_err(|e| e.to_string())?;
     let candle_err = validate_err("reduce_sum", "candle", &candle_out, &reference)?;
 
-    let tir_gpu_stats = time_tir_gpu(ctx, &program, &inputs, cfg)?;
-    let tir_host_stats = time_tir_host(ctx, &program, &inputs, cfg)?;
-    let tir_batched_stats = time_tir_host_batched(ctx, &program, &inputs, cfg)?;
+    let tir_gpu_stats = time_tir_gpu(ctx, &program, &inputs, &shape_params, cfg)?;
+    let tir_host_stats = time_tir_host(ctx, &program, &inputs, &shape_params, cfg)?;
+    let tir_batched_stats = time_tir_host_batched(ctx, &program, &inputs, &shape_params, cfg)?;
     let candle_stats = time_runs(cfg, || {
         let o = tx.sum(1).expect("candle reduce_sum");
         drop(o);

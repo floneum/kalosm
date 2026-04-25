@@ -3,27 +3,26 @@
 use egg::Language;
 use tensor_ir::*;
 
-const M: u32 = 64;
-const N: u32 = 64;
-const K: u32 = 64;
-
 fn main() {
     let mut builder = TensorExprBuilder::new();
-    let a = builder.input(0, Shape(vec![Dim::Const(M), Dim::Const(K)]), DType::F32);
-    let b = builder.input(1, Shape(vec![Dim::Const(K), Dim::Const(N)]), DType::F32);
+    let m = Dim::Symbol(0);
+    let n = Dim::Symbol(1);
+    let k = Dim::Symbol(2);
+    let a = builder.input(0, Shape(vec![m.clone(), k.clone()]), DType::F32);
+    let b = builder.input(1, Shape(vec![k.clone(), n.clone()]), DType::F32);
     let arg0 = builder.scalar_arg(0);
     let arg1 = builder.scalar_arg(1);
     let body = builder.scalar_binop(BinaryOp::Mul, [arg0, arg1]);
     let matmul = builder.contraction(
-        Shape(vec![Dim::Const(M), Dim::Const(N), Dim::Const(K)]),
+        Shape(vec![m, n.clone(), k.clone()]),
         &[
             (
                 a,
-                Strides(vec![Dim::Const(K), Dim::Const(0), Dim::Const(1)]),
+                Strides(vec![k, Dim::Const(0), Dim::Const(1)]),
             ),
             (
                 b,
-                Strides(vec![Dim::Const(0), Dim::Const(1), Dim::Const(N)]),
+                Strides(vec![Dim::Const(0), Dim::Const(1), n]),
             ),
         ],
         body,

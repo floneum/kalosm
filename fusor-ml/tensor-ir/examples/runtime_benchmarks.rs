@@ -34,6 +34,7 @@ fn catch_quiet_unwind<T>(f: impl FnOnce() -> T) -> std::thread::Result<T> {
 struct BenchmarkCase {
     name: &'static str,
     expr: TensorExprProgram,
+    shape_params: ShapeParams,
     inputs: Vec<Vec<f32>>,
     expected: Option<Vec<f32>>,
 }
@@ -84,7 +85,7 @@ fn main() {
         match ctx.benchmark(
             &program,
             &inputs,
-            &ShapeParams::default(),
+            &case.shape_params,
             ProgramBenchmarkConfig {
                 warmup_runs,
                 timing_runs,
@@ -188,7 +189,7 @@ fn build_dispatch_program(
             continue;
         };
         let gpu_result =
-            match catch_quiet_unwind(|| ctx.execute(&program, &inputs, &ShapeParams::default())) {
+            match catch_quiet_unwind(|| ctx.execute(&program, &inputs, &case.shape_params)) {
                 Ok(result) => result,
                 Err(_) => continue,
             };
@@ -211,7 +212,7 @@ fn build_dispatch_program(
             );
         }
         let result = match catch_quiet_unwind(|| {
-            ctx.benchmark(&program, &inputs, &ShapeParams::default(), tuning_config)
+            ctx.benchmark(&program, &inputs, &case.shape_params, tuning_config)
         }) {
             Ok(Ok(result)) => result,
             Ok(Err(_)) | Err(_) => continue,
@@ -219,7 +220,7 @@ fn build_dispatch_program(
 
         let physical_workgroups = dispatch
             .workgroups
-            .as_const()
+            .eval_u32(&case.shape_params)
             .unwrap()
             .div_ceil(dispatch.simdgroups.max(1));
         let score = result.median_gpu_us;
@@ -278,21 +279,24 @@ fn benchmark_cases() -> Vec<BenchmarkCase> {
 #[cfg(feature = "runtime")]
 fn build_matmul_case(m: u32, n: u32, k: u32) -> BenchmarkCase {
     let mut builder = TensorExprBuilder::new();
-    let a = builder.input(0, Shape(vec![Dim::Const(m), Dim::Const(k)]), DType::F32);
-    let b = builder.input(1, Shape(vec![Dim::Const(k), Dim::Const(n)]), DType::F32);
+    let m_dim = Dim::Symbol(0);
+    let n_dim = Dim::Symbol(1);
+    let k_dim = Dim::Symbol(2);
+    let a = builder.input(0, Shape(vec![m_dim.clone(), k_dim.clone()]), DType::F32);
+    let b = builder.input(1, Shape(vec![k_dim.clone(), n_dim.clone()]), DType::F32);
     let arg0 = builder.scalar_arg(0);
     let arg1 = builder.scalar_arg(1);
     let body = builder.scalar_binop(BinaryOp::Mul, [arg0, arg1]);
     let root = builder.contraction(
-        Shape(vec![Dim::Const(m), Dim::Const(n), Dim::Const(k)]),
+        Shape(vec![m_dim, n_dim.clone(), k_dim.clone()]),
         &[
             (
                 a,
-                Strides(vec![Dim::Const(k), Dim::Const(0), Dim::Const(1)]),
+                Strides(vec![k_dim, Dim::Const(0), Dim::Const(1)]),
             ),
             (
                 b,
-                Strides(vec![Dim::Const(0), Dim::Const(1), Dim::Const(n)]),
+                Strides(vec![Dim::Const(0), Dim::Const(1), n_dim]),
             ),
         ],
         body,
@@ -303,6 +307,7 @@ fn build_matmul_case(m: u32, n: u32, k: u32) -> BenchmarkCase {
     BenchmarkCase {
         name: "matmul",
         expr: builder.build(root).expect("valid matmul benchmark"),
+        shape_params: ShapeParams::from([m, n, k]),
         inputs: vec![input_a.clone(), input_b.clone()],
         expected: Some(cpu_matmul_reference(m, n, k, &input_a, &input_b)),
     }
@@ -311,16 +316,13 @@ fn build_matmul_case(m: u32, n: u32, k: u32) -> BenchmarkCase {
 #[cfg(feature = "runtime")]
 fn build_reduce_sum_case(rows: u32, cols: u32) -> BenchmarkCase {
     let mut builder = TensorExprBuilder::new();
-    let x = builder.input(
-        0,
-        Shape(vec![Dim::Const(rows), Dim::Const(cols)]),
-        DType::F32,
-    );
+    let x = builder.input(0, Shape(vec![Dim::Symbol(0), Dim::Symbol(1)]), DType::F32);
     let root = builder.reduce(x, 1, ReduceOp::Add);
     let input = seq_f32((rows * cols) as usize, 19);
     BenchmarkCase {
         name: "reduce_sum",
         expr: builder.build(root).expect("valid reduce benchmark"),
+        shape_params: ShapeParams::from([rows, cols]),
         expected: Some(cpu_reduce_sum_reference(rows, cols, &input)),
         inputs: vec![input],
     }
@@ -329,15 +331,12 @@ fn build_reduce_sum_case(rows: u32, cols: u32) -> BenchmarkCase {
 #[cfg(feature = "runtime")]
 fn build_reduce_max_case(rows: u32, cols: u32) -> BenchmarkCase {
     let mut builder = TensorExprBuilder::new();
-    let x = builder.input(
-        0,
-        Shape(vec![Dim::Const(rows), Dim::Const(cols)]),
-        DType::F32,
-    );
+    let x = builder.input(0, Shape(vec![Dim::Symbol(0), Dim::Symbol(1)]), DType::F32);
     let root = builder.reduce(x, 1, ReduceOp::Max);
     BenchmarkCase {
         name: "reduce_max",
         expr: builder.build(root).expect("valid reduce benchmark"),
+        shape_params: ShapeParams::from([rows, cols]),
         inputs: vec![signed_seq_f32((rows * cols) as usize, 23)],
         expected: None,
     }
@@ -346,7 +345,7 @@ fn build_reduce_max_case(rows: u32, cols: u32) -> BenchmarkCase {
 #[cfg(feature = "runtime")]
 fn build_elementwise_add_case(rows: u32, cols: u32) -> BenchmarkCase {
     let mut builder = TensorExprBuilder::new();
-    let shape = Shape(vec![Dim::Const(rows), Dim::Const(cols)]);
+    let shape = Shape(vec![Dim::Symbol(0), Dim::Symbol(1)]);
     let a = builder.input(0, shape.clone(), DType::F32);
     let b = builder.input(1, shape.clone(), DType::F32);
     let arg0 = builder.scalar_arg(0);
@@ -356,6 +355,7 @@ fn build_elementwise_add_case(rows: u32, cols: u32) -> BenchmarkCase {
     BenchmarkCase {
         name: "elementwise_add",
         expr: builder.build(root).expect("valid add benchmark"),
+        shape_params: ShapeParams::from([rows, cols]),
         inputs: vec![
             seq_f32((rows * cols) as usize, 13),
             seq_f32((rows * cols) as usize, 29),
@@ -367,7 +367,7 @@ fn build_elementwise_add_case(rows: u32, cols: u32) -> BenchmarkCase {
 #[cfg(feature = "runtime")]
 fn build_elementwise_mul_case(rows: u32, cols: u32) -> BenchmarkCase {
     let mut builder = TensorExprBuilder::new();
-    let shape = Shape(vec![Dim::Const(rows), Dim::Const(cols)]);
+    let shape = Shape(vec![Dim::Symbol(0), Dim::Symbol(1)]);
     let a = builder.input(0, shape.clone(), DType::F32);
     let b = builder.input(1, shape.clone(), DType::F32);
     let arg0 = builder.scalar_arg(0);
@@ -377,6 +377,7 @@ fn build_elementwise_mul_case(rows: u32, cols: u32) -> BenchmarkCase {
     BenchmarkCase {
         name: "elementwise_mul",
         expr: builder.build(root).expect("valid mul benchmark"),
+        shape_params: ShapeParams::from([rows, cols]),
         inputs: vec![
             seq_f32((rows * cols) as usize, 37),
             seq_f32((rows * cols) as usize, 41),
@@ -388,7 +389,7 @@ fn build_elementwise_mul_case(rows: u32, cols: u32) -> BenchmarkCase {
 #[cfg(feature = "runtime")]
 fn build_relu_case(rows: u32, cols: u32) -> BenchmarkCase {
     let mut builder = TensorExprBuilder::new();
-    let shape = Shape(vec![Dim::Const(rows), Dim::Const(cols)]);
+    let shape = Shape(vec![Dim::Symbol(0), Dim::Symbol(1)]);
     let x = builder.input(0, shape.clone(), DType::F32);
     let arg0 = builder.scalar_arg(0);
     let zero = builder.scalar_f32(0.0);
@@ -397,6 +398,7 @@ fn build_relu_case(rows: u32, cols: u32) -> BenchmarkCase {
     BenchmarkCase {
         name: "relu",
         expr: builder.build(root).expect("valid relu benchmark"),
+        shape_params: ShapeParams::from([rows, cols]),
         inputs: vec![signed_seq_f32((rows * cols) as usize, 11)],
         expected: None,
     }
@@ -405,13 +407,14 @@ fn build_relu_case(rows: u32, cols: u32) -> BenchmarkCase {
 #[cfg(feature = "runtime")]
 fn build_softmax_case(rows: u32, cols: u32) -> BenchmarkCase {
     let mut builder = TensorExprBuilder::new();
-    let shape = Shape(vec![Dim::Const(rows), Dim::Const(cols)]);
+    let shape = Shape(vec![Dim::Symbol(0), Dim::Symbol(1)]);
     let x = builder.input(0, shape.clone(), DType::F32);
     let root = builder.softmax(x, shape, 1);
     let input = signed_seq_f32((rows * cols) as usize, 7);
     BenchmarkCase {
         name: "softmax",
         expr: builder.build(root).expect("valid softmax benchmark"),
+        shape_params: ShapeParams::from([rows, cols]),
         expected: Some(cpu_softmax_reference(rows, cols, &input)),
         inputs: vec![input],
     }
@@ -422,21 +425,23 @@ fn build_attention_case(seq: u32, d: u32) -> BenchmarkCase {
     // softmax(Q · Kᵀ, axis=1) · V, expressed as two matmul decompositions with
     // an intermediate softmax — mirrors examples/egraph_visualize.rs:385.
     let mut builder = TensorExprBuilder::new();
-    let q = builder.input(0, Shape(vec![Dim::Const(seq), Dim::Const(d)]), DType::F32);
-    let k = builder.input(1, Shape(vec![Dim::Const(seq), Dim::Const(d)]), DType::F32);
-    let v = builder.input(2, Shape(vec![Dim::Const(seq), Dim::Const(d)]), DType::F32);
+    let seq_dim = Dim::Symbol(0);
+    let d_dim = Dim::Symbol(1);
+    let q = builder.input(0, Shape(vec![seq_dim.clone(), d_dim.clone()]), DType::F32);
+    let k = builder.input(1, Shape(vec![seq_dim.clone(), d_dim.clone()]), DType::F32);
+    let v = builder.input(2, Shape(vec![seq_dim.clone(), d_dim.clone()]), DType::F32);
 
     // Scores = Q · Kᵀ over tile [seq, seq, d], reducing the d axis.
-    let qk_tile = Shape(vec![Dim::Const(seq), Dim::Const(seq), Dim::Const(d)]);
+    let qk_tile = Shape(vec![seq_dim.clone(), seq_dim.clone(), d_dim.clone()]);
     let q_r = builder.restride(
         q,
         qk_tile.clone(),
-        Strides(vec![Dim::Const(d), Dim::Const(0), Dim::Const(1)]),
+        Strides(vec![d_dim.clone(), Dim::Const(0), Dim::Const(1)]),
     );
     let k_r = builder.restride(
         k,
         qk_tile.clone(),
-        Strides(vec![Dim::Const(0), Dim::Const(d), Dim::Const(1)]),
+        Strides(vec![Dim::Const(0), d_dim.clone(), Dim::Const(1)]),
     );
     let arg0 = builder.scalar_arg(0);
     let arg1 = builder.scalar_arg(1);
@@ -445,20 +450,20 @@ fn build_attention_case(seq: u32, d: u32) -> BenchmarkCase {
     let scores = builder.reduce(qk_mul, 2, ReduceOp::Add);
 
     // Probs = softmax(Scores, axis=1) over [seq, seq].
-    let scores_shape = Shape(vec![Dim::Const(seq), Dim::Const(seq)]);
+    let scores_shape = Shape(vec![seq_dim.clone(), seq_dim.clone()]);
     let probs = builder.softmax(scores, scores_shape, 1);
 
     // Output = Probs · V over tile [seq, d, seq], reducing the inner seq axis.
-    let pv_tile = Shape(vec![Dim::Const(seq), Dim::Const(d), Dim::Const(seq)]);
+    let pv_tile = Shape(vec![seq_dim.clone(), d_dim.clone(), seq_dim.clone()]);
     let p_r = builder.restride(
         probs,
         pv_tile.clone(),
-        Strides(vec![Dim::Const(seq), Dim::Const(0), Dim::Const(1)]),
+        Strides(vec![seq_dim, Dim::Const(0), Dim::Const(1)]),
     );
     let v_r = builder.restride(
         v,
         pv_tile.clone(),
-        Strides(vec![Dim::Const(0), Dim::Const(1), Dim::Const(d)]),
+        Strides(vec![Dim::Const(0), Dim::Const(1), d_dim]),
     );
     let arg0 = builder.scalar_arg(0);
     let arg1 = builder.scalar_arg(1);
@@ -473,6 +478,7 @@ fn build_attention_case(seq: u32, d: u32) -> BenchmarkCase {
     BenchmarkCase {
         name: "attention",
         expr: builder.build(root).expect("valid attention benchmark"),
+        shape_params: ShapeParams::from([seq, d]),
         inputs: vec![q_input, k_input, v_input],
         expected: Some(expected),
     }
