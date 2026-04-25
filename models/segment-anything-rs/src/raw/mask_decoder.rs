@@ -446,6 +446,7 @@ mod tests {
     /// Reference ConvTranspose2d with stride == kernel == 2, no overlap.
     /// Output[b, oc, oh, ow] = sum over ic of
     ///   input[b, ic, oh / 2, ow / 2] * weight[ic, oc, oh % 2, ow % 2] + bias[oc].
+    #[allow(clippy::too_many_arguments, clippy::needless_range_loop)]
     fn conv_transpose_2x2_stride2_reference(
         input: &[f32],
         weight: &[f32],

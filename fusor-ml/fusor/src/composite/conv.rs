@@ -1059,8 +1059,8 @@ mod tests {
         for c in 0..oc {
             for i in 0..oh {
                 for j in 0..ow {
-                    let a: f32 = actual_slice[[0, c, i, j]].into();
-                    let r: f32 = reference_slice[[0, c, i, j]].into();
+                    let a: f32 = actual_slice[[0, c, i, j]];
+                    let r: f32 = reference_slice[[0, c, i, j]];
                     let d = (a - r).abs();
                     if d > max_diff {
                         eprintln!("[{c},{i},{j}] gpu={a} cpu_ref={r} diff={d}");
@@ -1145,8 +1145,8 @@ mod tests {
         for c in 0..oc {
             for i in 0..oh {
                 for j in 0..ow {
-                    let a: f32 = actual_slice[[0, c, i, j]].into();
-                    let r: f32 = reference_slice[[0, c, i, j]].into();
+                    let a: f32 = actual_slice[[0, c, i, j]];
+                    let r: f32 = reference_slice[[0, c, i, j]];
                     let d = (a - r).abs();
                     if d > 1e-3 && first_mismatch.is_none() {
                         first_mismatch = Some((c, i, j, a, r));
@@ -1201,8 +1201,8 @@ mod tests {
             let mut first: Option<(usize, usize, f32, f32)> = None;
             for g in 0..groups {
                 for mi in 0..m {
-                    let a: f32 = out_slice[[g, mi, 0]].into();
-                    let r: f32 = ref_slice[[g, mi, 0]].into();
+                    let a: f32 = out_slice[[g, mi, 0]];
+                    let r: f32 = ref_slice[[g, mi, 0]];
                     let d = (a - r).abs();
                     if d > 1e-3 && first.is_none() {
                         first = Some((g, mi, a, r));
@@ -1319,7 +1319,7 @@ mod tests {
                     let mi = hi * out_w + wi;
                     let actual_idx = c * out_spatial + mi;
                     let a = actual[actual_idx];
-                    let r: f32 = cat_slice[[0, c, hi, wi]].into();
+                    let r: f32 = cat_slice[[0, c, hi, wi]];
                     let d = (a - r).abs();
                     if d > 1e-3 && first.is_none() {
                         first = Some((c, hi, wi, a, r));
@@ -1528,8 +1528,8 @@ mod tests {
         for c in 0..oc {
             for i in 0..oh {
                 for j in 0..ow {
-                    let a: f32 = actual_slice[[0, c, i, j]].into();
-                    let r: f32 = reference_slice[[0, c, i, j]].into();
+                    let a: f32 = actual_slice[[0, c, i, j]];
+                    let r: f32 = reference_slice[[0, c, i, j]];
                     let d = (a - r).abs();
                     if d > 1e-3 && first_mismatch.is_none() {
                         first_mismatch = Some((c, i, j, a, r));

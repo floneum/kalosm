@@ -77,6 +77,7 @@ async fn pure_slice_assign_cost() {
         let piece: Tensor<1, f32> = Tensor::new(&device, vec![1.0f32; size].as_slice());
         let t = Instant::now();
         for i in 0..n {
+            #[allow(clippy::single_range_in_vec_init)]
             let range = [(i * size)..((i + 1) * size)];
             buf = buf.slice_assign(range, &piece);
         }
