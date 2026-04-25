@@ -1,8 +1,8 @@
 use fusor::{
-    AddOp, CastTensor, CastTo, ConcreteTensor, CoreLargerRank, CpuLargerRank, Device, FloatDataType,
-    FloatOps, GpuTensor, MatmulImpl, MulOp, SimdBinaryOp, SimdElement, SimdReduceOp, SumOp, Tensor,
-    VarBuilder,
     layers::{ConvNd, ConvNdConfig},
+    AddOp, CastTensor, CastTo, ConcreteTensor, CoreLargerRank, CpuLargerRank, Device,
+    FloatDataType, FloatOps, GpuTensor, MatmulImpl, MulOp, SimdBinaryOp, SimdElement, SimdReduceOp,
+    SumOp, Tensor, VarBuilder,
 };
 
 pub(crate) struct Qwen2_5VisionPatchEmbed<F: FloatDataType + SimdElement> {

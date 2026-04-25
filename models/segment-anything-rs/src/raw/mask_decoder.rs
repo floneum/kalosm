@@ -161,12 +161,8 @@ impl MaskDecoder {
         let iou_token = Embedding::load(device, &mut vb.pp("iou_token"))?;
         let mask_tokens = Embedding::load(device, &mut vb.pp("mask_tokens"))?;
         let output_upscaling_conv1 = SamUpscale2x2::load(device, &mut vb.pp("output_upscaling.0"))?;
-        let output_upscaling_ln = LayerNormNd::<f32>::load_over_axis(
-            device,
-            &mut vb.pp("output_upscaling.1"),
-            1,
-            1e-6,
-        )?;
+        let output_upscaling_ln =
+            LayerNormNd::<f32>::load_over_axis(device, &mut vb.pp("output_upscaling.1"), 1, 1e-6)?;
         let output_upscaling_conv2 = SamUpscale2x2::load(device, &mut vb.pp("output_upscaling.3"))?;
         let mut output_hypernetworks_mlps = Vec::with_capacity(num_mask_tokens);
         for i in 0..num_mask_tokens {
@@ -277,30 +273,17 @@ impl MaskDecoder {
             .to_concrete();
         let mask_tokens_out: Tensor<3, f32> = hs.narrow(1, 1, self.num_mask_tokens).to_concrete();
 
-        // Upscale mask embeddings
-        // Process each batch item individually through the upscaling pipeline.
-        // The SAM-specific upscaler and LayerNormNd<f32> are only exercised here.
+        // Upscale mask embeddings for the whole prompt batch at once.
         let src: Tensor<4, f32> = src
             .transpose(1, 2)
             .to_concrete()
             .reshape([batch_size, c, h, w])
             .to_concrete();
-
-        // Run the upscaling pipeline per batch item. Batched conv2d through
-        // the SAM-specific upscaler hits an issue with `LayerNormNd<f32>` on some
-        // backends, so we always slice per item; for `batch_size == 1` this
-        // is a single narrow + cat with negligible overhead.
-        let mut upscaled_items = Vec::with_capacity(batch_size);
-        for i in 0..batch_size {
-            let src_i: Tensor<4, f32> = src.narrow(0, i, 1).to_concrete();
-            let up_i = self.output_upscaling_conv1.forward(&src_i);
-            let up_i = self.output_upscaling_ln.forward(&up_i);
-            let up_i = up_i.gelu();
-            let up_i = self.output_upscaling_conv2.forward(&up_i.to_concrete());
-            let up_i = up_i.gelu();
-            upscaled_items.push(up_i.to_concrete());
-        }
-        let upscaled: Tensor<4, f32> = Tensor::cat(upscaled_items, 0).to_concrete();
+        let upscaled = self.output_upscaling_conv1.forward(&src);
+        let upscaled = self.output_upscaling_ln.forward(&upscaled);
+        let upscaled = upscaled.gelu().to_concrete();
+        let upscaled = self.output_upscaling_conv2.forward(&upscaled);
+        let upscaled: Tensor<4, f32> = upscaled.gelu().to_concrete();
 
         // Predict masks using hypernetwork MLPs
         let mut hyper_in_list = Vec::with_capacity(self.num_mask_tokens);
@@ -356,4 +339,97 @@ fn repeat_interleave_4d(
         .to_concrete()
         .reshape([b * repeats, c, h, w])
         .to_concrete()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    async fn to_vec<const R: usize>(tensor: &Tensor<R, f32, ConcreteTensor<f32, R>>) -> Vec<f32> {
+        let len = tensor.shape().iter().product::<usize>();
+        tensor
+            .reshape([len])
+            .to_concrete()
+            .as_slice()
+            .await
+            .unwrap()
+            .as_slice()
+            .to_vec()
+    }
+
+    #[tokio::test]
+    async fn test_upscaling_batched_matches_per_item() {
+        let device = Device::new().await.unwrap();
+
+        const BATCH: usize = 4;
+        const IN_CH: usize = 8;
+        const MID_CH: usize = 4;
+        const OUT_CH: usize = 2;
+        const H: usize = 3;
+        const W: usize = 5;
+
+        let input_data: Vec<f32> = (0..BATCH * IN_CH * H * W)
+            .map(|i| (i as f32 * 0.03125).sin())
+            .collect();
+        let input: Tensor<4, f32> = Tensor::from_slice(&device, [BATCH, IN_CH, H, W], &input_data);
+
+        let conv1_weight_data: Vec<f32> = (0..IN_CH * MID_CH * 2 * 2)
+            .map(|i| (i as f32 * 0.0625).cos() * 0.25)
+            .collect();
+        let conv1_bias_data: Vec<f32> = (0..MID_CH).map(|i| i as f32 * 0.1 - 0.15).collect();
+        let conv1 = SamUpscale2x2 {
+            weight: Tensor::from_slice(&device, [IN_CH, MID_CH, 2, 2], &conv1_weight_data)
+                .to_concrete(),
+            bias: Some(Tensor::from_slice(&device, [MID_CH], &conv1_bias_data).to_concrete()),
+        };
+
+        let ln_weight_data: Vec<f32> = (0..MID_CH).map(|i| 0.75 + i as f32 * 0.1).collect();
+        let ln_bias_data: Vec<f32> = (0..MID_CH).map(|i| -0.2 + i as f32 * 0.05).collect();
+        let ln = LayerNormNd::new_over_axis(
+            Tensor::from_slice(&device, [MID_CH], &ln_weight_data).to_concrete(),
+            Some(Tensor::from_slice(&device, [MID_CH], &ln_bias_data).to_concrete()),
+            1,
+            1e-6,
+        );
+
+        let conv2_weight_data: Vec<f32> = (0..MID_CH * OUT_CH * 2 * 2)
+            .map(|i| (i as f32 * 0.046875).sin() * 0.2)
+            .collect();
+        let conv2_bias_data: Vec<f32> = (0..OUT_CH).map(|i| i as f32 * 0.08 - 0.04).collect();
+        let conv2 = SamUpscale2x2 {
+            weight: Tensor::from_slice(&device, [MID_CH, OUT_CH, 2, 2], &conv2_weight_data)
+                .to_concrete(),
+            bias: Some(Tensor::from_slice(&device, [OUT_CH], &conv2_bias_data).to_concrete()),
+        };
+
+        let batched = conv1.forward(&input.to_concrete());
+        let batched = ln.forward(&batched);
+        let batched = batched.gelu().to_concrete();
+        let batched = conv2.forward(&batched);
+        let batched: Tensor<4, f32> = batched.gelu().to_concrete();
+
+        let mut per_item = Vec::with_capacity(BATCH);
+        for i in 0..BATCH {
+            let item: Tensor<4, f32> = input.narrow(0, i, 1).to_concrete();
+            let item = conv1.forward(&item);
+            let item = ln.forward(&item);
+            let item = item.gelu().to_concrete();
+            let item = conv2.forward(&item);
+            per_item.push(item.gelu().to_concrete());
+        }
+        let per_item: Tensor<4, f32> = Tensor::cat(per_item, 0).to_concrete();
+
+        let batched_vec = to_vec(&batched.to_concrete()).await;
+        let per_item_vec = to_vec(&per_item.to_concrete()).await;
+        let max_diff = batched_vec
+            .iter()
+            .zip(per_item_vec.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+
+        assert!(
+            max_diff < 0.001,
+            "batched upscaling diverged from per-item path: {max_diff}",
+        );
+    }
 }

@@ -1123,7 +1123,12 @@ where
                     fusor_cpu::Layout::contiguous(&[shape[0], shape[1]]),
                     t.data().clone(),
                 );
-                Tensor::Cpu(cpu_q_mat_mul_f32_weight(lhs.to_concrete(), rhs_nk, shape[0], shape[1]))
+                Tensor::Cpu(cpu_q_mat_mul_f32_weight(
+                    lhs.to_concrete(),
+                    rhs_nk,
+                    shape[0],
+                    shape[1],
+                ))
             }
 
             // F16 weight: convert to f32 then reuse the f32 path.

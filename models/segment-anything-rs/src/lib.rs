@@ -802,7 +802,12 @@ mod tests {
         const TEST_IMAGE_HEIGHT: f32 = 771.0;
         let xys: Vec<f32> = points
             .iter()
-            .flat_map(|(x, y, _)| [(*x as f32) * IMAGE_SIZE as f32, (*y as f32) * TEST_IMAGE_HEIGHT])
+            .flat_map(|(x, y, _)| {
+                [
+                    (*x as f32) * IMAGE_SIZE as f32,
+                    (*y as f32) * TEST_IMAGE_HEIGHT,
+                ]
+            })
             .collect();
         let labels: Vec<f32> = points
             .iter()
@@ -821,7 +826,10 @@ mod tests {
                 .prompt_encoder
                 .forward(Some((&gpu_pts, &gpu_lbls)), None, None);
         assert!(
-            max_diff(&(f_to_vec(&cpu_sparse).await), &(f_to_vec(&gpu_sparse).await)) < 0.001,
+            max_diff(
+                &(f_to_vec(&cpu_sparse).await),
+                &(f_to_vec(&gpu_sparse).await)
+            ) < 0.001,
             "sparse prompt diverged"
         );
 
@@ -889,9 +897,9 @@ mod tests {
             let yu = y_broadcast.reshape([h, w, 1]);
             let coords = Tensor::cat([xu, yu], 2).mul_scalar(2.0) + (-1.0f32);
             let gm_shape = gm.shape();
-            let coords_2d = coords.reshape([h * w, 2]);
-            let mm_2d = coords_2d.mat_mul(gm);
-            let mm = mm_2d.reshape([h, w, gm_shape[1]]);
+            let gm_broadcast = gm.reshape([1, gm_shape[0], gm_shape[1]]);
+            let gm_broadcast = gm_broadcast.broadcast_as([h, gm_shape[0], gm_shape[1]]);
+            let mm = coords.mat_mul(&gm_broadcast);
             let scaled = mm.mul_scalar(2.0 * std::f32::consts::PI);
             // Dual consumer: sin() and cos() both read from `scaled`
             Tensor::cat([scaled.sin().to_concrete(), scaled.cos().to_concrete()], 2)
@@ -915,9 +923,9 @@ mod tests {
             let yu = y_broadcast.reshape([h, w, 1]);
             let coords = Tensor::cat([xu, yu], 2).mul_scalar(2.0) + (-1.0f32);
             let gm_shape = gm.shape();
-            let coords_2d = coords.reshape([h * w, 2]);
-            let mm_2d = coords_2d.mat_mul(gm);
-            let mm = mm_2d.reshape([h, w, gm_shape[1]]);
+            let gm_broadcast = gm.reshape([1, gm_shape[0], gm_shape[1]]);
+            let gm_broadcast = gm_broadcast.broadcast_as([h, gm_shape[0], gm_shape[1]]);
+            let mm = coords.mat_mul(&gm_broadcast);
             // Control path: force distinct mul_scalar nodes for comparison.
             let for_sin = mm.mul_scalar(2.0 * std::f32::consts::PI);
             let for_cos = mm.mul_scalar(2.0 * std::f32::consts::PI);
@@ -1021,16 +1029,20 @@ mod tests {
         let cpu_coords = (cpu_coords.mul_scalar(2.0) + (-1.0f32)).to_concrete();
         let gpu_coords = (gpu_coords.mul_scalar(2.0) + (-1.0f32)).to_concrete();
         let centered_diff = max_diff(&f_to_vec(&cpu_coords).await, &f_to_vec(&gpu_coords).await);
-        assert!(centered_diff < 0.001, "centered coords diverged: {}", centered_diff);
+        assert!(
+            centered_diff < 0.001,
+            "centered coords diverged: {}",
+            centered_diff
+        );
 
         let cpu_gm_shape = cpu_gm.shape();
         let gpu_gm_shape = gpu_gm.shape();
-        let cpu_coords_2d = cpu_coords.reshape([h * w, 2]);
-        let cpu_mm_2d = cpu_coords_2d.mat_mul(cpu_gm);
-        let cpu_mm = cpu_mm_2d.reshape([h, w, cpu_gm_shape[1]]).to_concrete();
-        let gpu_coords_2d = gpu_coords.reshape([h * w, 2]);
-        let gpu_mm_2d = gpu_coords_2d.mat_mul(gpu_gm);
-        let gpu_mm = gpu_mm_2d.reshape([h, w, gpu_gm_shape[1]]).to_concrete();
+        let cpu_gm_broadcast = cpu_gm.reshape([1, cpu_gm_shape[0], cpu_gm_shape[1]]);
+        let cpu_gm_broadcast = cpu_gm_broadcast.broadcast_as([h, cpu_gm_shape[0], cpu_gm_shape[1]]);
+        let gpu_gm_broadcast = gpu_gm.reshape([1, gpu_gm_shape[0], gpu_gm_shape[1]]);
+        let gpu_gm_broadcast = gpu_gm_broadcast.broadcast_as([h, gpu_gm_shape[0], gpu_gm_shape[1]]);
+        let cpu_mm = cpu_coords.mat_mul(&cpu_gm_broadcast).to_concrete();
+        let gpu_mm = gpu_coords.mat_mul(&gpu_gm_broadcast).to_concrete();
         let mm_diff = max_diff(&f_to_vec(&cpu_mm).await, &f_to_vec(&gpu_mm).await);
         assert!(mm_diff < 0.001, "matmul diverged: {}", mm_diff);
 

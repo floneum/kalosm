@@ -940,6 +940,13 @@ impl<'a> Resolver<'a> {
 
         // Pre-op: fuse elementwise before matmul inputs
         if let ComputeGraphNodeVariant::MatMul(matmul_op) = &node_variant {
+            // Batched matmul still has correctness issues when scalar elementwise ops
+            // are fused into an input tensor. Keep the fast path for rank-2 matmul and
+            // materialize the elementwise input first for batched kernels.
+            if matmul_op.rank() > 2 {
+                return false;
+            }
+
             let mut new_matmul = matmul_op.clone();
             let mut changed = false;
 

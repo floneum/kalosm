@@ -11,8 +11,8 @@ async fn time_one_point_segment() {
     let model = SegmentAnything::builder().build().await.unwrap();
     eprintln!("builder.build: {:?}", t.elapsed());
 
-    let image_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("examples/landscape.jpg");
+    let image_path =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/landscape.jpg");
     let image = image::open(&image_path).unwrap();
     let settings =
         SegmentAnythingInferenceSettings::new(image).add_goal_point_normalized(0.5, 0.25);
@@ -33,8 +33,8 @@ async fn gpu_smoke_one_point_segment() {
         .unwrap();
     eprintln!("builder.build (gpu): {:?}", t.elapsed());
 
-    let image_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("examples/landscape.jpg");
+    let image_path =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/landscape.jpg");
     let image = image::open(&image_path).unwrap();
     let (w, h) = (image.width(), image.height());
     let settings =
@@ -42,7 +42,10 @@ async fn gpu_smoke_one_point_segment() {
 
     let t = Instant::now();
     let mask = model.segment_from_points(settings).await.unwrap();
-    eprintln!("segment_from_points gpu (encoder + decoder): {:?}", t.elapsed());
+    eprintln!(
+        "segment_from_points gpu (encoder + decoder): {:?}",
+        t.elapsed()
+    );
 
     assert_eq!(mask.width(), w);
     assert_eq!(mask.height(), h);

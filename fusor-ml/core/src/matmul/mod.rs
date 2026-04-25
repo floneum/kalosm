@@ -385,6 +385,131 @@ async fn test_full_batched_matrix_vector_mul() {
 
 #[cfg(test)]
 #[tokio::test]
+async fn test_batched_matmul_broadcast_rhs() {
+    let device = Device::test_instance();
+
+    let lhs = [[[1.0f32, 2.0], [3.0, 4.0]], [[5.0, 6.0], [7.0, 8.0]]];
+    let rhs = [[1.0f32, 2.0, 3.0], [4.0, 5.0, 6.0]];
+
+    let lhs = Tensor::new(&device, &lhs);
+    let rhs = Tensor::new(&device, &rhs);
+    let rhs = rhs.reshape([1, 2, 3]).broadcast_as([2, 2, 3]);
+
+    let result = lhs.mat_mul(&rhs);
+    let as_slice = result.as_slice().await.unwrap();
+
+    let expected = [
+        [[9.0f32, 12.0, 15.0], [19.0, 26.0, 33.0]],
+        [[29.0f32, 40.0, 51.0], [39.0, 54.0, 69.0]],
+    ];
+
+    for b in 0..2 {
+        for i in 0..2 {
+            for j in 0..3 {
+                assert!(
+                    (as_slice[[b, i, j]] - expected[b][i][j]).abs() < 0.001,
+                    "mismatch at [{b}, {i}, {j}]: got {} expected {}",
+                    as_slice[[b, i, j]],
+                    expected[b][i][j],
+                );
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+#[tokio::test]
+async fn test_batched_matmul_broadcast_rhs_large_vector_path() {
+    let device = Device::test_instance();
+
+    const BATCH: usize = 8;
+    const M: usize = 64;
+    const K: usize = 2;
+    const N: usize = 64;
+
+    let lhs_data: [[[f32; K]; M]; BATCH] = std::array::from_fn(|b| {
+        std::array::from_fn(|row| {
+            [
+                (b as f32 * 0.5) + row as f32 * 0.01 + 0.25,
+                (b as f32 * 0.25) - row as f32 * 0.02 + 0.75,
+            ]
+        })
+    });
+    let rhs_data: [[f32; N]; K] = std::array::from_fn(|row| {
+        std::array::from_fn(|col| row as f32 * 0.5 + col as f32 * 0.03125 - 1.0)
+    });
+
+    let lhs = Tensor::new(&device, &lhs_data);
+    let rhs = Tensor::new(&device, &rhs_data);
+
+    let rhs_broadcast = rhs.reshape([1, K, N]).broadcast_as([BATCH, K, N]);
+    let batched = lhs.mat_mul(&rhs_broadcast);
+    let flattened = lhs
+        .reshape([BATCH * M, K])
+        .mat_mul(&rhs)
+        .reshape([BATCH, M, N]);
+
+    let batched_slice = batched.as_slice().await.unwrap();
+    let flattened_slice = flattened.as_slice().await.unwrap();
+
+    for b in 0..BATCH {
+        for row in 0..M {
+            for col in 0..N {
+                assert!(
+                    (batched_slice[[b, row, col]] - flattened_slice[[b, row, col]]).abs() < 0.001,
+                    "mismatch at [{b}, {row}, {col}]: got {} expected {}",
+                    batched_slice[[b, row, col]],
+                    flattened_slice[[b, row, col]],
+                );
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+#[tokio::test]
+async fn test_batched_matmul_broadcast_rhs_with_lazy_input() {
+    let device = Device::test_instance();
+
+    const H: usize = 64;
+    const W: usize = 64;
+    const D: usize = 64;
+
+    let x: Tensor<1, f32> = Tensor::arange_step(&device, 0.5f32, W as f32 + 0.5, 1.0) / W as f32;
+    let y: Tensor<1, f32> = Tensor::arange_step(&device, 0.5f32, H as f32 + 0.5, 1.0) / H as f32;
+
+    let x = x.reshape([1, W]).broadcast_as([H, W]).reshape([H, W, 1]);
+    let y = y.reshape([H, 1]).broadcast_as([H, W]).reshape([H, W, 1]);
+    let coords: Tensor<3, f32> = Tensor::cat([x, y], 2) * 2.0 + (-1.0f32);
+
+    let gm_data: [[f32; D]; 2] = std::array::from_fn(|row| {
+        std::array::from_fn(|col| row as f32 * 0.5 + col as f32 * 0.03125 - 1.0)
+    });
+    let gm = Tensor::new(&device, &gm_data);
+    let gm_broadcast = gm.reshape([1, 2, D]).broadcast_as([H, 2, D]);
+
+    let batched: Tensor<3, f32> = coords.mat_mul(&gm_broadcast);
+    let flattened: Tensor<3, f32> = coords.reshape([H * W, 2]).mat_mul(&gm).reshape([H, W, D]);
+
+    let batched_slice = batched.as_slice().await.unwrap();
+    let flattened_slice = flattened.as_slice().await.unwrap();
+
+    for h in 0..H {
+        for w in 0..W {
+            for d in 0..D {
+                assert!(
+                    (batched_slice[[h, w, d]] - flattened_slice[[h, w, d]]).abs() < 0.001,
+                    "mismatch at [{h}, {w}, {d}]: got {} expected {}",
+                    batched_slice[[h, w, d]],
+                    flattened_slice[[h, w, d]],
+                );
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+#[tokio::test]
 async fn test_matmul() {
     let device = Device::test_instance();
 

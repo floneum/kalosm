@@ -24,12 +24,12 @@ impl PositionEmbeddingRandom {
         let coords = coords.mul_scalar(2.0) + (-1.0f32);
         let shape = coords.shape();
         let b = shape[0];
-        let n = shape[1];
         let d = self.positional_encoding_gaussian_matrix.shape()[1];
-        // Flatten to a 2D matmul so we avoid broadcasted batched matmul on GPU.
-        let coords = coords.reshape([b * n, shape[2]]);
-        let coords_mm = coords.mat_mul(&self.positional_encoding_gaussian_matrix);
-        let coords = coords_mm.reshape([b, n, d]);
+        let gm = self
+            .positional_encoding_gaussian_matrix
+            .reshape([1, shape[2], d]);
+        let gm = gm.broadcast_as([b, shape[2], d]);
+        let coords = coords.mat_mul(&gm);
         // coords * 2 * pi
         let coords = coords.mul_scalar(2.0 * std::f32::consts::PI);
         // cat([sin, cos], last_dim)
@@ -128,20 +128,12 @@ impl PromptEncoder {
         };
         let mask_downscaling_conv1 =
             ConvNd::<2, 4, f32>::load(device, &mut vb.pp("mask_downscaling.0"), cfg_s2)?;
-        let mask_downscaling_ln1 = LayerNormNd::<f32>::load_over_axis(
-            device,
-            &mut vb.pp("mask_downscaling.1"),
-            1,
-            1e-6,
-        )?;
+        let mask_downscaling_ln1 =
+            LayerNormNd::<f32>::load_over_axis(device, &mut vb.pp("mask_downscaling.1"), 1, 1e-6)?;
         let mask_downscaling_conv2 =
             ConvNd::<2, 4, f32>::load(device, &mut vb.pp("mask_downscaling.3"), cfg_s2)?;
-        let mask_downscaling_ln2 = LayerNormNd::<f32>::load_over_axis(
-            device,
-            &mut vb.pp("mask_downscaling.4"),
-            1,
-            1e-6,
-        )?;
+        let mask_downscaling_ln2 =
+            LayerNormNd::<f32>::load_over_axis(device, &mut vb.pp("mask_downscaling.4"), 1, 1e-6)?;
         let mask_downscaling_conv3 = ConvNd::<2, 4, f32>::load(
             device,
             &mut vb.pp("mask_downscaling.6"),

@@ -33,7 +33,11 @@ async fn two_input_cat_in_chain() {
         }
         let t = Instant::now();
         let _ = x.as_slice().await.unwrap();
-        eprintln!("binary cat chain n={n:>4}  total={:?}  final_rows={}", t.elapsed(), x.shape()[0]);
+        eprintln!(
+            "binary cat chain n={n:>4}  total={:?}  final_rows={}",
+            t.elapsed(),
+            x.shape()[0]
+        );
     }
 }
 
@@ -41,7 +45,13 @@ async fn two_input_cat_in_chain() {
 async fn pure_slice_assign_cost() {
     // Measure whether the slice_assign itself is the quadratic term.
     let device = Device::new().await.unwrap();
-    for &(size, n) in &[(1024usize, 8usize), (1024, 32), (1024, 64), (1024, 128), (1024, 256)] {
+    for &(size, n) in &[
+        (1024usize, 8usize),
+        (1024, 32),
+        (1024, 64),
+        (1024, 128),
+        (1024, 256),
+    ] {
         let mut buf: Tensor<1, f32> = Tensor::zeros(&device, [size * n]);
         let piece: Tensor<1, f32> = Tensor::new(&device, vec![1.0f32; size].as_slice());
         let t = Instant::now();

@@ -90,8 +90,7 @@ where
 
         if axis == N - 1 {
             let weight_b: Tensor<N, D, _> = self.weight.broadcast_as(shape);
-            let bias_b: Option<Tensor<N, D, _>> =
-                self.bias.as_ref().map(|b| b.broadcast_as(shape));
+            let bias_b: Option<Tensor<N, D, _>> = self.bias.as_ref().map(|b| b.broadcast_as(shape));
             return input.layer_norm(&weight_b, bias_b.as_ref(), D::from_f32(self.eps), true);
         }
 
@@ -118,10 +117,7 @@ where
             .to_concrete();
         let scaled = (normed * w).to_concrete();
         if let Some(bias) = &self.bias {
-            let b: Tensor<N, D> = bias
-                .reshape(affine_shape)
-                .broadcast_as(shape)
-                .to_concrete();
+            let b: Tensor<N, D> = bias.reshape(affine_shape).broadcast_as(shape).to_concrete();
             scaled.add_(&b)
         } else {
             scaled
