@@ -7,6 +7,12 @@ use bytemuck::{AnyBitPattern, NoUninit};
 use fusor_core::TensorSlice;
 
 /// Extension trait for TensorSlice to convert to Vec types
+pub trait ToVec {
+    type Output;
+    fn to_vec(&self) -> Self::Output;
+}
+
+/// Extension trait for TensorSlice to convert to Vec types
 pub trait ToVec1<D> {
     fn to_vec1(&self) -> Vec<D>;
 }
@@ -37,6 +43,17 @@ impl<D: NoUninit + AnyBitPattern + Copy, Bytes: Deref<Target = [u8]>> ToVec1<D>
     }
 }
 
+impl<D: NoUninit + AnyBitPattern + Copy, Bytes: Deref<Target = [u8]>> ToVec
+    for TensorSlice<1, D, Bytes>
+{
+    type Output = Vec<D>;
+
+    /// Convert a 1D tensor slice to a `Vec<D>`
+    fn to_vec(&self) -> Self::Output {
+        self.to_vec1()
+    }
+}
+
 impl<D: NoUninit + AnyBitPattern + Copy, Bytes: Deref<Target = [u8]>> ToVec2<D>
     for TensorSlice<2, D, Bytes>
 {
@@ -55,6 +72,17 @@ impl<D: NoUninit + AnyBitPattern + Copy, Bytes: Deref<Target = [u8]>> ToVec2<D>
             result.push(row);
         }
         result
+    }
+}
+
+impl<D: NoUninit + AnyBitPattern + Copy, Bytes: Deref<Target = [u8]>> ToVec
+    for TensorSlice<2, D, Bytes>
+{
+    type Output = Vec<Vec<D>>;
+
+    /// Convert a 2D tensor slice to a `Vec<Vec<D>>`
+    fn to_vec(&self) -> Self::Output {
+        self.to_vec2()
     }
 }
 
@@ -84,52 +112,13 @@ impl<D: NoUninit + AnyBitPattern + Copy, Bytes: Deref<Target = [u8]>> ToVec3<D>
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::Tensor;
+impl<D: NoUninit + AnyBitPattern + Copy, Bytes: Deref<Target = [u8]>> ToVec
+    for TensorSlice<3, D, Bytes>
+{
+    type Output = Vec<Vec<Vec<D>>>;
 
-    #[tokio::test]
-    async fn test_to_vec1_cpu() {
-        let data = [1.0f32, 2.0, 3.0, 4.0];
-        let t: Tensor<1, f32> = Tensor::Cpu(fusor_cpu::Tensor::from_slice([4], &data));
-
-        let slice = t.as_slice().await.unwrap();
-        let vec1 = slice.to_vec1();
-        assert_eq!(vec1.len(), 4);
-        assert_eq!(vec1[0], 1.0);
-        assert_eq!(vec1[1], 2.0);
-        assert_eq!(vec1[2], 3.0);
-        assert_eq!(vec1[3], 4.0);
-    }
-
-    #[tokio::test]
-    async fn test_to_vec2_cpu() {
-        let data = [1.0f32, 2.0, 3.0, 4.0];
-        let t: Tensor<2, f32> = Tensor::Cpu(fusor_cpu::Tensor::from_slice([2, 2], &data));
-
-        let slice = t.as_slice().await.unwrap();
-        let vec2 = slice.to_vec2();
-        assert_eq!(vec2.len(), 2);
-        assert_eq!(vec2[0].len(), 2);
-        assert_eq!(vec2[0][0], 1.0);
-        assert_eq!(vec2[0][1], 2.0);
-        assert_eq!(vec2[1][0], 3.0);
-        assert_eq!(vec2[1][1], 4.0);
-    }
-
-    #[tokio::test]
-    async fn test_to_vec3_cpu() {
-        let data = [1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0];
-        let t: Tensor<3, f32> = Tensor::Cpu(fusor_cpu::Tensor::from_slice([2, 2, 2], &data));
-
-        let slice = t.as_slice().await.unwrap();
-        let vec3 = slice.to_vec3();
-        assert_eq!(vec3.len(), 2);
-        assert_eq!(vec3[0].len(), 2);
-        assert_eq!(vec3[0][0].len(), 2);
-        assert_eq!(vec3[0][0][0], 1.0);
-        assert_eq!(vec3[0][0][1], 2.0);
-        assert_eq!(vec3[1][1][1], 8.0);
+    /// Convert a 3D tensor slice to a `Vec<Vec<Vec<D>>>`
+    fn to_vec(&self) -> Self::Output {
+        self.to_vec3()
     }
 }

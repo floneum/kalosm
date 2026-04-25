@@ -140,6 +140,8 @@ pub(crate) fn q4k_sgemv(
 
         for offset in 0..Q4K_SGEMV_CHUNK_SIZE {
             writeln!(kernel, "{{").unwrap();
+            writeln!(kernel, "let output_index = row + {offset}u;").unwrap();
+            writeln!(kernel, "if output_index < {n_size} {{").unwrap();
             // Fetch and unpack the two sets of values from the cache
             writeln!(kernel, "let first_values_offset = data_offset;").unwrap();
             writeln!(kernel, "let second_values_offset = data_offset + 16u;").unwrap();
@@ -275,6 +277,7 @@ pub(crate) fn q4k_sgemv(
             )
             .unwrap();
             // Move forward the block offset by one row
+            writeln!(kernel, "}}").unwrap();
             writeln!(kernel, "local_block_offset += k_block_size;").unwrap();
             writeln!(kernel, "}}").unwrap();
         }
@@ -293,13 +296,18 @@ pub(crate) fn q4k_sgemv(
     .unwrap();
 
     for offset in 0..Q4K_SGEMV_CHUNK_SIZE {
+        writeln!(kernel, "{{").unwrap();
+        writeln!(kernel, "let output_index = row + {offset}u;").unwrap();
         // If this is not the first simd thread in the workgroup, we can return early
-        writeln!(kernel, "if {subgroup_local_index} == 0u {{").unwrap();
+        writeln!(
+            kernel,
+            "if output_index < {n_size} && {subgroup_local_index} == 0u {{"
+        )
+        .unwrap();
         {
             // Write the output to the output tensor if this is the first thread in the workgroup
             // Convert from f32 accumulator to output dtype
             write!(kernel, "{output}[").unwrap();
-            let index = format!("row + {offset}");
             let mut output_indices = Vec::new();
             // Add batch indices first
             for dim in (0..output.rank()).rev().skip(2) {
@@ -307,11 +315,12 @@ pub(crate) fn q4k_sgemv(
             }
             // Then add M and N indices
             output_indices.push("m_idx".to_string());
-            output_indices.push(index);
+            output_indices.push("output_index".to_string());
             output.strided_index(kernel, output_indices);
             let indexed = maybe_vec_storage_index(Q4K_SGEMV_CHUNK_SIZE, "sum", offset);
             writeln!(kernel, "] = {dtype}({indexed});").unwrap();
         }
+        writeln!(kernel, "}}").unwrap();
         writeln!(kernel, "}}").unwrap();
     }
 }

@@ -164,9 +164,16 @@ pub(crate) fn q_n_sgemv(
             .unwrap();
         }
         {
+            if Q_N_SGEMV_CHUNK_SIZE > 1 {
+                writeln!(kernel, "let output_index = row + offset;").unwrap();
+            } else {
+                writeln!(kernel, "let output_index = row;").unwrap();
+            }
+            writeln!(kernel, "if output_index < {n_size} {{").unwrap();
             block_dot(kernel, op, input_b);
             let indexed = maybe_vec_storage_index(Q_N_SGEMV_CHUNK_SIZE, "sum", "offset");
             writeln!(kernel, "{indexed} += product;").unwrap();
+            writeln!(kernel, "}}").unwrap();
         }
         if Q_N_SGEMV_CHUNK_SIZE > 1 {
             writeln!(kernel, "block_offset += k_block_size;").unwrap();
@@ -195,16 +202,20 @@ pub(crate) fn q_n_sgemv(
         .unwrap();
     }
     {
-        writeln!(kernel, "if {subgroup_local_index} == 0u {{").unwrap();
+        if Q_N_SGEMV_CHUNK_SIZE > 1 {
+            writeln!(kernel, "let output_index = row + offset;").unwrap();
+        } else {
+            writeln!(kernel, "let output_index = row;").unwrap();
+        }
+        writeln!(
+            kernel,
+            "if output_index < {n_size} && {subgroup_local_index} == 0u {{"
+        )
+        .unwrap();
         {
             // Write the output to the output tensor if this is the first thread in the workgroup
             // Convert from f32 accumulator to output dtype
             write!(kernel, "{output}[").unwrap();
-            let index = if Q_N_SGEMV_CHUNK_SIZE > 1 {
-                "row + offset".to_string()
-            } else {
-                "row".to_string()
-            };
             let mut output_indices = Vec::new();
             // Add batch indices first
             for dim in (0..output.rank()).rev().skip(2) {
@@ -212,7 +223,7 @@ pub(crate) fn q_n_sgemv(
             }
             // Then add M and N indices
             output_indices.push("m_idx".to_string());
-            output_indices.push(index);
+            output_indices.push("output_index".to_string());
             output.strided_index(kernel, output_indices);
             let indexed = maybe_vec_storage_index(Q_N_SGEMV_CHUNK_SIZE, "sum", "offset");
             writeln!(kernel, "] = {dtype}({indexed});").unwrap();
@@ -225,21 +236,13 @@ pub(crate) fn q_n_sgemv(
 }
 
 fn block_dot(kernel: &mut GenericKernel, op: &QMatMulOperation, input_b: &QMatrixInput) {
+    // q_n_sgemv is only dispatched for Q4_0 and Q5_0 (see
+    // sgemv/mod.rs). Everything else routes elsewhere; if a new caller
+    // routes another GgmlType here, this is the place that needs an impl.
     match op.matrix.datatype {
-        fusor_gguf::GgmlType::F32 => todo!(),
-        fusor_gguf::GgmlType::F16 => todo!(),
         fusor_gguf::GgmlType::Q4_0 => block_dot_q4_0(kernel, input_b),
-        fusor_gguf::GgmlType::Q4_1 => todo!(),
         fusor_gguf::GgmlType::Q5_0 => block_dot_q5_0(kernel, op, input_b),
-        fusor_gguf::GgmlType::Q5_1 => todo!(),
-        fusor_gguf::GgmlType::Q8_0 => todo!(),
-        fusor_gguf::GgmlType::Q8_1 => todo!(),
-        fusor_gguf::GgmlType::Q2K => todo!(),
-        fusor_gguf::GgmlType::Q3K => todo!(),
-        fusor_gguf::GgmlType::Q4K => todo!(),
-        fusor_gguf::GgmlType::Q5K => todo!(),
-        fusor_gguf::GgmlType::Q6K => todo!(),
-        fusor_gguf::GgmlType::Q8K => todo!(),
+        other => unreachable!("q_n_sgemv block_dot does not handle {other:?}"),
     }
 }
 

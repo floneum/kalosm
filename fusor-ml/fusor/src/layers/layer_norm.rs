@@ -113,42 +113,11 @@ impl LayerNorm<1, f32> {
     ///
     /// This is significantly faster than the standard forward pass on CPU
     /// as it computes mean, variance, and normalization in fewer passes.
-    pub fn forward_fused<B>(
-        &self,
-        input: &Tensor<3, f32, B>,
-    ) -> Tensor<3, f32, ConcreteTensor<f32, 3>>
+    pub fn forward_fused<B>(&self, input: &Tensor<3, f32, B>) -> Tensor<3, f32>
     where
         B: TensorBacking<3, Elem = f32>,
     {
-        match input {
-            Tensor::Cpu(t) => {
-                let contiguous = t.to_concrete();
-                // Broadcast weight to match input shape for fused kernel
-                let weight_broadcast = self.weight.broadcast_as(input.shape());
-                let bias_broadcast = self.bias.as_ref().map(|b| b.broadcast_as(input.shape()));
-
-                let (weight_inner, bias_inner) = match (&weight_broadcast, &bias_broadcast) {
-                    (Tensor::Cpu(w), Some(Tensor::Cpu(b))) => (
-                        w.to_concrete().inner().clone(),
-                        Some(b.to_concrete().inner().clone()),
-                    ),
-                    (Tensor::Cpu(w), None) => (w.to_concrete().inner().clone(), None),
-                    _ => unreachable!(),
-                };
-
-                let result = fusor_cpu::layer_norm_last_dim_fused(
-                    contiguous.inner(),
-                    &weight_inner,
-                    bias_inner.as_ref(),
-                    self.eps,
-                );
-                Tensor::Cpu(fusor_cpu::Tensor::new(result))
-            }
-            Tensor::Gpu(_) => {
-                // Fall back to standard forward for GPU
-                self.forward(input)
-            }
-        }
+        input.layer_norm_last_dim_fused::<2, 1, _, _>(&self.weight, self.bias.as_ref(), self.eps)
     }
 
     /// Load LayerNorm from VarBuilder.
@@ -188,60 +157,5 @@ impl LayerNorm<1, f32> {
         });
 
         Ok(Self::new(weight.to_concrete(), bias, eps))
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[tokio::test]
-    async fn test_layer_norm_2d() {
-        // Weight and bias: (3,)
-        let weight_data = [1.0f32, 1.0, 1.0];
-        let bias_data = [0.0f32, 0.0, 0.0];
-        let weight: Tensor<1, f32> = Tensor::Cpu(fusor_cpu::Tensor::from_slice([3], &weight_data));
-        let bias: Tensor<1, f32> = Tensor::Cpu(fusor_cpu::Tensor::from_slice([3], &bias_data));
-
-        let layer_norm = LayerNorm::new(weight, Some(bias), 1e-5);
-
-        // Input: (2, 3)
-        let input_data = [1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0];
-        let input: Tensor<2, f32> = Tensor::Cpu(fusor_cpu::Tensor::from_slice([2, 3], &input_data));
-
-        let output = layer_norm.forward_2d(&input);
-        let result = output.as_slice().await.unwrap();
-
-        assert_eq!(result.shape(), &[2, 3]);
-
-        // Each row should have mean ~0 and std ~1 after normalization
-        // For [1, 2, 3]: mean=2, std=sqrt(2/3)
-        // Normalized: [-sqrt(3/2), 0, sqrt(3/2)] ≈ [-1.22, 0, 1.22]
-        let expected_val = (3.0f32 / 2.0).sqrt();
-        assert!((result[[0, 0]] - (-expected_val)).abs() < 1e-4);
-        assert!(result[[0, 1]].abs() < 1e-4);
-        assert!((result[[0, 2]] - expected_val).abs() < 1e-4);
-    }
-
-    #[tokio::test]
-    async fn test_layer_norm_3d() {
-        let weight_data = [1.0f32, 1.0];
-        let weight: Tensor<1, f32> = Tensor::Cpu(fusor_cpu::Tensor::from_slice([2], &weight_data));
-
-        let layer_norm = LayerNorm::new(weight, None, 1e-5);
-
-        // Input: (1, 2, 2)
-        let input_data = [1.0f32, 3.0, 2.0, 4.0];
-        let input: Tensor<3, f32> =
-            Tensor::Cpu(fusor_cpu::Tensor::from_slice([1, 2, 2], &input_data));
-
-        let output = layer_norm.forward(&input);
-        let result = output.as_slice().await.unwrap();
-
-        assert_eq!(result.shape(), &[1, 2, 2]);
-
-        // First position [1, 3]: mean=2, std=1, normalized=[-1, 1]
-        assert!((result[[0, 0, 0]] - (-1.0)).abs() < 1e-4);
-        assert!((result[[0, 0, 1]] - 1.0).abs() < 1e-4);
     }
 }

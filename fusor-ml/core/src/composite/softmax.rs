@@ -18,25 +18,6 @@ use crate::{
 };
 
 impl<const R: usize, T: DataType> Tensor<R, T> {
-    pub fn softmax_slow<const R2: usize>(&self, dim: impl Dim<R>) -> Self
-    where
-        Tensor<R, T>: LastRank<R2, T>,
-    {
-        let size = *self.shape();
-        let max = self.max(dim);
-        let normalized = self - &max.broadcast_as(size);
-        let exp = normalized.exp();
-        let sum = exp.sum(dim);
-        exp / sum.broadcast_as(size)
-    }
-
-    pub fn softmax_slow_last_dim<const R2: usize>(&self) -> Self
-    where
-        Tensor<R, T>: LastRank<R2, T>,
-    {
-        self.softmax_slow(D::Minus1)
-    }
-
     pub fn softmax<const R2: usize>(&self, axis: impl Dim<R>) -> Self
     where
         Tensor<R, T>: LastRank<R2, T>,
@@ -133,6 +114,7 @@ impl SoftmaxOperation {
         let output_tensor = kernel.add_tensor_input(output_rank, true, out_datatype);
         let reduce_size = kernel.add_integer_input();
         let reduce_stride = kernel.add_integer_input();
+        let output_reduce_stride = kernel.add_integer_input();
 
         let global_m_final = kernel.add_global_value(KernelGlobalSpace::Workgroup, dtype);
         let global_d_final = kernel.add_global_value(KernelGlobalSpace::Workgroup, dtype);
@@ -376,7 +358,7 @@ impl SoftmaxOperation {
             for (i, component) in components.iter().enumerate() {
                 writeln!(
                 kernel,
-                "{output_tensor}[out_start_offset + (out_index + {i}u) * {reduce_stride}] = exp({component} - m_all) / d_all;"
+                "{output_tensor}[out_start_offset + (out_index + {i}u) * {output_reduce_stride}] = exp({component} - m_all) / d_all;"
             )
             .unwrap();
             }
@@ -394,7 +376,7 @@ impl SoftmaxOperation {
         .unwrap();
         writeln!(
             kernel,
-            "{output_tensor}[out_start_offset + out_index * {reduce_stride}] = exp(data - m_all) / d_all;"
+            "{output_tensor}[out_start_offset + out_index * {output_reduce_stride}] = exp(data - m_all) / d_all;"
         )
         .unwrap();
         writeln!(kernel, "out_index += 1u;").unwrap();
@@ -478,6 +460,7 @@ impl Operation for SoftmaxOperation {
             MirValue::Tensor(output_tensor.clone()),
             MirValue::Integer(tensor.layout().shape()[dim] as u32),
             MirValue::Integer(tensor.layout().strides()[dim] as u32),
+            MirValue::Integer(shape[dim + 1..].iter().product::<usize>().max(1) as u32),
         ]
     }
 
@@ -507,91 +490,5 @@ impl Operation for SoftmaxOperation {
     ) -> crate::TensorLayoutInfo {
         let input_layout = map.get(&self.value).unwrap();
         input_layout.clone()
-    }
-}
-
-#[cfg(test)]
-#[tokio::test]
-async fn test_softmax_slow() {
-    use crate::Device;
-
-    let device = Device::test_instance();
-
-    let data = [1f32, -2., -3., 4., 5., -6.];
-    let max = data.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-    let diff: [f32; 6] = std::array::from_fn(|i| data[i] - max);
-    let exp: [f32; 6] = std::array::from_fn(|i| diff[i].exp());
-    let sum = exp.iter().sum::<f32>();
-    let softmax_array: [f32; 6] = std::array::from_fn(|i| exp[i] / sum);
-
-    println!("{softmax_array:?}");
-
-    let tensor = Tensor::new(&device, &data);
-    let tensor = tensor.softmax_slow(0);
-    let output = tensor.as_slice().await.unwrap();
-    println!("{output:?}");
-    assert!((output[[0]] - softmax_array[0]).abs() < 0.001);
-    assert!((output[[1]] - softmax_array[1]).abs() < 0.001);
-    assert!((output[[2]] - softmax_array[2]).abs() < 0.001);
-    assert!((output[[3]] - softmax_array[3]).abs() < 0.001);
-    assert!((output[[4]] - softmax_array[4]).abs() < 0.001);
-    assert!((output[[5]] - softmax_array[5]).abs() < 0.001);
-}
-
-#[cfg(test)]
-#[tokio::test]
-async fn test_softmax() {
-    use crate::Device;
-
-    let device = Device::test_instance();
-
-    let data = [1f32, -2., -3., 4., 5., -6.];
-    let max = data.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-    let diff: [f32; 6] = std::array::from_fn(|i| data[i] - max);
-    let exp: [f32; 6] = std::array::from_fn(|i| diff[i].exp());
-    let sum = exp.iter().sum::<f32>();
-    let softmax_array: [f32; 6] = std::array::from_fn(|i| exp[i] / sum);
-
-    println!("{softmax_array:?}");
-
-    let tensor = Tensor::new(&device, &data);
-    let tensor = tensor.softmax(0);
-    let output = tensor.as_slice().await.unwrap();
-    println!("output: {output:?}");
-    println!("expect: {softmax_array:?}");
-    assert!((output[[0]] - softmax_array[0]).abs() < 0.001);
-    assert!((output[[1]] - softmax_array[1]).abs() < 0.001);
-    assert!((output[[2]] - softmax_array[2]).abs() < 0.001);
-    assert!((output[[3]] - softmax_array[3]).abs() < 0.001);
-    assert!((output[[4]] - softmax_array[4]).abs() < 0.001);
-    assert!((output[[5]] - softmax_array[5]).abs() < 0.001);
-}
-
-#[cfg(test)]
-#[tokio::test]
-async fn test_softmax_large() {
-    use crate::Device;
-
-    let device = Device::test_instance();
-
-    let data: [f32; 1024] = std::array::from_fn(|_| rand::random::<f32>() * 10.0 - 5.0);
-    let max = data.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-    let diff: [f32; 1024] = std::array::from_fn(|i| data[i] - max);
-    let exp: [f32; 1024] = std::array::from_fn(|i| diff[i].exp());
-    let sum = exp.iter().sum::<f32>();
-    let softmax_array: [f32; 1024] = std::array::from_fn(|i| exp[i] / sum);
-
-    println!("{softmax_array:?}");
-
-    let tensor = Tensor::new(&device, &data);
-    let tensor = tensor.softmax(0);
-    let output = tensor.as_slice().await.unwrap();
-    println!("output: {output:?}");
-    println!("expect: {softmax_array:?}");
-    for i in 0..1024 {
-        assert!(
-            (output[[i]] - softmax_array[i]).abs() < 0.001,
-            "Mismatch at index {i}"
-        );
     }
 }

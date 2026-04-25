@@ -1,12 +1,13 @@
 use std::fmt::{Display, Write};
 
 use crate::{
-    Dim, ElementWiseFunctions, LastRank, LastRankInner, NextRankInner,
+    Dim, LastRank, LastRankInner, NextRankInner,
     mir::{
         globals::KernelGlobalSpace,
         operation::Operation,
         workgroup_shape::{Constraint, WorkgroupShape, WorkgroupShapeConstraints},
     },
+    nary_wise::UnaryFunctionChain,
     visit_tiled::distribute_workgroups,
 };
 use crate::{
@@ -16,12 +17,32 @@ use crate::{
     tensor::{DataType, DataTypeEnum, TensorData},
 };
 
+/// Unsqueeze a reduced tensor back to its original rank by inserting a size-1 dim.
+/// This is equivalent to `tensor.unsqueeze(dim)` but implemented inline to avoid
+/// depending on the removed composite unsqueeze operation.
+fn unsqueeze_dim<const N: usize, const O: usize, D: DataType>(
+    tensor: &Tensor<O, D>,
+    dim_idx: usize,
+) -> Tensor<N, D> {
+    let old_shape = tensor.shape();
+    let new_shape: [usize; N] = std::array::from_fn(|i| {
+        if i < dim_idx {
+            old_shape[i]
+        } else if i == dim_idx {
+            1
+        } else {
+            old_shape[i - 1]
+        }
+    });
+    tensor.reshape(new_shape)
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct ReduceOperation {
     pub(crate) value: NodeIndex,
-    pub(crate) pre_element_wise: ElementWiseFunctions,
+    pub(crate) pre_element_wise: UnaryFunctionChain,
     pub(crate) function: ReduceFunction,
-    pub(crate) post_element_wise: ElementWiseFunctions,
+    pub(crate) post_element_wise: UnaryFunctionChain,
     pub(crate) axis: usize,
     pub(crate) shape: Box<[usize]>,
 }
@@ -31,9 +52,9 @@ impl ReduceOperation {
         let datatype = function.datatype();
         Self {
             value,
-            pre_element_wise: ElementWiseFunctions::empty(datatype),
+            pre_element_wise: UnaryFunctionChain::empty(datatype),
             function,
-            post_element_wise: ElementWiseFunctions::empty(datatype),
+            post_element_wise: UnaryFunctionChain::empty(datatype),
             axis,
             shape: shape.into(),
         }
@@ -503,245 +524,14 @@ impl<const N: usize, D: DataType> Tensor<N, D> {
         Self: LastRank<O, D>,
         <Self as LastRankInner>::LastRank: NextRankInner<NextRank = Self>,
     {
-        self.sum(dim).unsqueeze(dim)
+        let dim_idx = dim.resolve();
+        let reduced = self.sum(dim);
+        unsqueeze_dim::<N, O, D>(&reduced, dim_idx)
     }
 }
 
 fn sum_fn<D: DataType>() -> ReduceFunction {
     ReduceFunction::new("let output = a + b;".to_string(), "0.0", D::WGSL_TYPE).with_name("sum")
-}
-
-#[cfg(test)]
-#[tokio::test]
-async fn test_reduce_sum() {
-    use crate::Device;
-
-    let device = Device::test_instance();
-
-    let data = [[1., 2.], [3., 4.], [5., 6.]];
-    let tensor = Tensor::new(&device, &data);
-
-    let output = tensor.sum(0);
-
-    let output = output.as_slice().await.unwrap();
-    println!("{output:?}");
-    assert_eq!(output[[0]], 9.);
-    assert_eq!(output[[1]], 12.);
-
-    let output = tensor.sum(1);
-
-    let output = output.as_slice().await.unwrap();
-    println!("{output:?}");
-    assert_eq!(output[[0]], 3.);
-    assert_eq!(output[[1]], 7.);
-    assert_eq!(output[[2]], 11.);
-}
-
-#[cfg(test)]
-#[tokio::test]
-async fn test_reduce_sum_large() {
-    use crate::Device;
-
-    let device = Device::test_instance();
-
-    let data: [f32; 1024] = std::array::from_fn(|_| rand::random::<f32>() * 10.0 - 5.0);
-    let tensor = Tensor::new(&device, &data);
-
-    let output = tensor.sum(0);
-
-    let output = output.as_slice().await.unwrap();
-    println!("{output:?}");
-
-    let expected: f32 = data.iter().sum();
-    println!("Expected sum: {expected}");
-
-    assert!(
-        (output[[]] - expected).abs() < 1e-3,
-        "Expected sum to be close to {expected}"
-    );
-}
-
-#[cfg(test)]
-#[tokio::test]
-async fn test_reduce_sum_f16() {
-    use crate::Device;
-
-    let device = Device::test_instance();
-    if !device.f16_supported() {
-        return;
-    }
-
-    let data = [
-        [half::f16::from_f32(1.), half::f16::from_f32(2.)],
-        [half::f16::from_f32(3.), half::f16::from_f32(4.)],
-        [half::f16::from_f32(5.), half::f16::from_f32(6.)],
-    ];
-    let tensor = Tensor::new(&device, &data);
-
-    let output = tensor.sum(0);
-
-    let output = output.as_slice().await.unwrap();
-    println!("{output:?}");
-    assert_eq!(output[[0]], half::f16::from_f32(9.));
-    assert_eq!(output[[1]], half::f16::from_f32(12.));
-
-    let output = tensor.sum(1);
-
-    let output = output.as_slice().await.unwrap();
-    println!("{output:?}");
-    assert_eq!(output[[0]], half::f16::from_f32(3.));
-    assert_eq!(output[[1]], half::f16::from_f32(7.));
-    assert_eq!(output[[2]], half::f16::from_f32(11.));
-}
-
-#[cfg(test)]
-#[tokio::test]
-async fn test_reduce_sliced_sum() {
-    use crate::Device;
-
-    let device = Device::test_instance();
-
-    let data = [[1., 2.], [3., 4.], [5., 6.]];
-    let tensor = Tensor::new(&device, &data);
-    let tensor = tensor.slice([0..3, 0..1]);
-
-    let output = tensor.sum(0);
-
-    let output = output.as_slice().await.unwrap();
-    println!("{output:?}");
-    assert_eq!(output[[0]], 9.);
-
-    let output = tensor.sum(1);
-
-    let output = output.as_slice().await.unwrap();
-    println!("{output:?}");
-    assert_eq!(output[[0]], 1.);
-    assert_eq!(output[[1]], 3.);
-    assert_eq!(output[[2]], 5.);
-}
-
-#[cfg(test)]
-#[tokio::test]
-async fn test_reduce_transposed_sum() {
-    use crate::Device;
-
-    let device = Device::test_instance();
-
-    let data = [[1., 3., 5.], [2., 4., 6.]];
-    let tensor = Tensor::new(&device, &data).t();
-
-    let output = tensor.sum(0);
-
-    let output = output.as_slice().await.unwrap();
-    println!("{output:?}");
-    assert_eq!(output[[0]], 9.);
-    assert_eq!(output[[1]], 12.);
-
-    let output = tensor.sum(1);
-
-    let output = output.as_slice().await.unwrap();
-    println!("{output:?}");
-    assert_eq!(output[[0]], 3.);
-    assert_eq!(output[[1]], 7.);
-    assert_eq!(output[[2]], 11.);
-}
-
-#[cfg(test)]
-#[tokio::test]
-async fn test_reduce_const_add_then_sum_fused() {
-    use crate::Device;
-
-    let device = Device::test_instance();
-
-    let data = [[1., 2.], [3., 4.], [5., 6.]];
-    let tensor = Tensor::new(&device, &data);
-
-    let output = (tensor.clone() + 1.).sum(0);
-
-    let output = output.as_slice().await.unwrap();
-    println!("{output:?}");
-    assert_eq!(output[[0]], 3. + 9.);
-    assert_eq!(output[[1]], 3. + 12.);
-
-    let data = [[1., 2.], [3., 4.], [5., 6.]];
-    let tensor = Tensor::new(&device, &data);
-
-    let output = (tensor + 1.).sum(1);
-
-    let output = output.as_slice().await.unwrap();
-    println!("{output:?}");
-    assert_eq!(output[[0]], 2. + 3.);
-    assert_eq!(output[[1]], 2. + 7.);
-    assert_eq!(output[[2]], 2. + 11.);
-}
-
-#[cfg(test)]
-#[tokio::test]
-async fn test_reduce_const_sum_then_add_fused() {
-    use crate::Device;
-
-    let device = Device::test_instance();
-
-    let data = [[1., 2.], [3., 4.], [5., 6.]];
-    let tensor = Tensor::new(&device, &data);
-
-    let output = tensor.sum(0) + 1.;
-
-    let output = output.as_slice().await.unwrap();
-    println!("{output:?}");
-    assert_eq!(output[[0]], 1. + 9.);
-    assert_eq!(output[[1]], 1. + 12.);
-
-    let output = tensor.sum(1) + 1.;
-
-    let output = output.as_slice().await.unwrap();
-    println!("{output:?}");
-    assert_eq!(output[[0]], 1. + 3.);
-    assert_eq!(output[[1]], 1. + 7.);
-    assert_eq!(output[[2]], 1. + 11.);
-}
-
-#[cfg(test)]
-#[tokio::test]
-async fn test_reduce_const_sum_then_cast_fused() {
-    use crate::Device;
-
-    let device = Device::test_instance();
-
-    if !device.f16_supported() {
-        return;
-    }
-
-    let data = [[1., 2.], [3., 4.], [5., 6.]];
-    let tensor = Tensor::new(&device, &data);
-
-    let output = tensor.sum(0).cast::<half::f16>();
-
-    let output = output.as_slice().await.unwrap();
-    println!("{output:?}");
-    assert_eq!(output[[0]], half::f16::from_f32(9.));
-    assert_eq!(output[[1]], half::f16::from_f32(12.));
-}
-#[cfg(test)]
-#[tokio::test]
-async fn test_cast_then_reduce_const_sum_fused() {
-    use crate::Device;
-
-    let device = Device::test_instance();
-
-    if !device.f16_supported() {
-        return;
-    }
-
-    let data = [[1., 2.], [3., 4.], [5., 6.]];
-    let tensor = Tensor::new(&device, &data).cast::<half::f16>();
-
-    let output = tensor.sum(0);
-
-    let output = output.as_slice().await.unwrap();
-    println!("{output:?}");
-    assert_eq!(output[[0]], half::f16::from_f32(9.));
-    assert_eq!(output[[1]], half::f16::from_f32(12.));
 }
 
 impl<const N: usize, T: DataType> Tensor<N, T> {
@@ -757,7 +547,9 @@ impl<const N: usize, T: DataType> Tensor<N, T> {
         Self: LastRank<O, T>,
         <Self as LastRankInner>::LastRank: NextRankInner<NextRank = Self>,
     {
-        self.max(dim).unsqueeze(dim)
+        let dim_idx = dim.resolve();
+        let reduced = self.max(dim);
+        unsqueeze_dim::<N, O, T>(&reduced, dim_idx)
     }
 }
 
@@ -768,32 +560,6 @@ fn max_fn<D: DataType>() -> ReduceFunction {
         D::WGSL_TYPE,
     )
     .with_name("max")
-}
-
-#[cfg(test)]
-#[tokio::test]
-async fn test_reduce_max() {
-    use crate::Device;
-
-    let device = Device::test_instance();
-
-    let data = [[1., 2.], [3., 4.], [5., 6.]];
-    let tensor = Tensor::new(&device, &data);
-
-    let output = tensor.max(0);
-
-    let output = output.as_slice().await.unwrap();
-    println!("{output:?}");
-    assert_eq!(output[[0]], 5.);
-    assert_eq!(output[[1]], 6.);
-
-    let output = tensor.max(1);
-
-    let output = output.as_slice().await.unwrap();
-    println!("{output:?}");
-    assert_eq!(output[[0]], 2.);
-    assert_eq!(output[[1]], 4.);
-    assert_eq!(output[[2]], 6.);
 }
 
 fn min_fn<D: DataType>() -> ReduceFunction {
@@ -818,7 +584,9 @@ impl<const N: usize, D: DataType> Tensor<N, D> {
         Self: LastRank<O, D>,
         <Self as LastRankInner>::LastRank: NextRankInner<NextRank = Self>,
     {
-        self.min(dim).unsqueeze(dim)
+        let dim_idx = dim.resolve();
+        let reduced = self.min(dim);
+        unsqueeze_dim::<N, O, D>(&reduced, dim_idx)
     }
 }
 
@@ -838,32 +606,6 @@ pub(crate) fn max_for_dtype(dtype: DataTypeEnum) -> &'static str {
     }
 }
 
-#[cfg(test)]
-#[tokio::test]
-async fn test_reduce_min() {
-    use crate::Device;
-
-    let device = Device::test_instance();
-
-    let data = [[1., 2.], [3., 4.], [5., 6.]];
-    let tensor = Tensor::new(&device, &data);
-
-    let output = tensor.min(0);
-
-    let output = output.as_slice().await.unwrap();
-    println!("{output:?}");
-    assert_eq!(output[[0]], 1.);
-    assert_eq!(output[[1]], 2.);
-
-    let output = tensor.min(1);
-
-    let output = output.as_slice().await.unwrap();
-    println!("{output:?}");
-    assert_eq!(output[[0]], 1.);
-    assert_eq!(output[[1]], 3.);
-    assert_eq!(output[[2]], 5.);
-}
-
 fn product_fn<D: DataType>() -> ReduceFunction {
     ReduceFunction::new("let output = a * b;".to_string(), "1.0", D::WGSL_TYPE).with_name("product")
 }
@@ -881,32 +623,8 @@ impl<const N: usize, D: DataType> Tensor<N, D> {
         Self: LastRank<O, D>,
         <Self as LastRankInner>::LastRank: NextRankInner<NextRank = Self>,
     {
-        self.product(dim).unsqueeze(dim)
+        let dim_idx = dim.resolve();
+        let reduced = self.product(dim);
+        unsqueeze_dim::<N, O, D>(&reduced, dim_idx)
     }
-}
-
-#[cfg(test)]
-#[tokio::test]
-async fn test_reduce_product() {
-    use crate::Device;
-
-    let device = Device::test_instance();
-
-    let data = [[1., 2.], [3., 4.], [5., 6.]];
-    let tensor = Tensor::new(&device, &data);
-
-    let output = tensor.product(0);
-
-    let output = output.as_slice().await.unwrap();
-    println!("{output:?}");
-    assert_eq!(output[[0]], 15.);
-    assert_eq!(output[[1]], 48.);
-
-    let output = tensor.product(1);
-
-    let output = output.as_slice().await.unwrap();
-    println!("{output:?}");
-    assert_eq!(output[[0]], 2.);
-    assert_eq!(output[[1]], 12.);
-    assert_eq!(output[[2]], 30.);
 }

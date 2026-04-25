@@ -1,7 +1,7 @@
-use std::{fmt::Debug, ops::Range, sync::Arc};
+use std::{fmt::Debug, sync::Arc};
 
 use crate::{
-    D, DataType, Dim, Layout, MaxRank, Tensor, TensorData, compute_graph::NodeIndex,
+    DataType, Layout, MaxRank, Tensor, TensorData, compute_graph::NodeIndex,
     mir::operation::Operation,
 };
 
@@ -102,42 +102,19 @@ impl Operation for MapLayoutOperation {
 }
 
 impl<const R: usize, T: DataType> Tensor<R, T> {
-    pub fn slice(&self, slices: [Range<usize>; R]) -> Tensor<R, T> {
+    pub fn restride<const R2: usize>(&self, specs: [crate::StrideSpec; R2]) -> Tensor<R2, T> {
         self.add_map_layout(MapLayoutOperation::new(self.key(), move |layout| {
-            layout.slice(&slices)
+            layout.restride(&specs)
         }))
     }
 
-    pub fn permute(&self, axes: [usize; R]) -> Tensor<R, T> {
-        self.add_map_layout(MapLayoutOperation::new(self.key(), move |layout| {
-            layout.permute(&axes)
+    pub fn restride_layout<const R2: usize>(&self, new_layout: Layout) -> Tensor<R2, T> {
+        self.add_map_layout(MapLayoutOperation::new(self.key(), move |_| {
+            new_layout.clone()
         }))
     }
 
-    pub fn transpose(&self, first_axis: impl Dim<R>, second_axis: impl Dim<R>) -> Tensor<R, T> {
-        let first_axis = first_axis.resolve();
-        let second_axis = second_axis.resolve();
-        self.add_map_layout(MapLayoutOperation::new(self.key(), move |layout| {
-            layout.transpose(first_axis, second_axis)
-        }))
-    }
-
-    pub fn t(&self) -> Tensor<R, T> {
-        const {
-            assert!(
-                R >= 2,
-                "The tensor must have at least 2 dimensions to transpose"
-            )
-        };
-        self.transpose(D::Minus1, D::Minus2)
-    }
-
-    /// Alias for [`broadcast_as`](Tensor::broadcast_as)
-    pub fn expand<const R2: usize>(&self, out_shape: [usize; R2]) -> Tensor<R2, T> {
-        self.broadcast_as(out_shape)
-    }
-
-    pub fn broadcast_as<const R2: usize>(&self, out_shape: [usize; R2]) -> Tensor<R2, T> {
+    pub(crate) fn broadcast_as<const R2: usize>(&self, out_shape: [usize; R2]) -> Tensor<R2, T> {
         const {
             assert!(
                 R2 >= R,
@@ -145,9 +122,21 @@ impl<const R: usize, T: DataType> Tensor<R, T> {
             )
         };
 
-        self.add_map_layout(MapLayoutOperation::new(self.key(), move |layout| {
-            layout.broadcast_to(&out_shape)
-        }))
+        let shape = self.shape();
+        let specs: [crate::StrideSpec; R2] = std::array::from_fn(|out_i| {
+            let in_i = out_i as isize - (R2 as isize - R as isize);
+            if in_i < 0 {
+                crate::StrideSpec::dim_with(0, out_shape[out_i], 0)
+            } else {
+                let in_i = in_i as usize;
+                if shape[in_i] == 1 && out_shape[out_i] > 1 {
+                    crate::StrideSpec::dim_with(in_i, out_shape[out_i], 0)
+                } else {
+                    crate::StrideSpec::dim(in_i, out_shape[out_i])
+                }
+            }
+        });
+        self.restride(specs)
     }
 
     pub(crate) fn broadcast_together<const R2: usize, const R3: usize>(
@@ -186,156 +175,4 @@ impl<const R: usize, T: DataType> Tensor<R, T> {
         assert_eq!(b1.shape(), b2.shape());
         op(b1, b2)
     }
-}
-
-#[cfg(test)]
-#[tokio::test]
-async fn test_transpose() {
-    use crate::Device;
-
-    let device = Device::test_instance();
-
-    let data = [[1., 2.], [3., 4.], [5., 6.]];
-    let tensor = Tensor::new(&device, &data);
-    let transposed = tensor.transpose(0, 1);
-    let as_slice = transposed.as_slice().await.unwrap();
-    println!("{as_slice:?}");
-    assert_eq!(as_slice[[0, 0]], 1.);
-    assert_eq!(as_slice[[0, 1]], 3.);
-    assert_eq!(as_slice[[0, 2]], 5.);
-    assert_eq!(as_slice[[1, 0]], 2.);
-    assert_eq!(as_slice[[1, 1]], 4.);
-    assert_eq!(as_slice[[1, 2]], 6.);
-}
-
-#[cfg(test)]
-#[tokio::test]
-async fn test_broadcast_as() {
-    use crate::Device;
-
-    let device = Device::test_instance();
-
-    let data = [[1., 2.], [3., 4.]];
-    let tensor = Tensor::new(&device, &data);
-    let broadcasted = tensor.broadcast_as([2, 2, 3]);
-    println!("{broadcasted:?}");
-    let as_slice = broadcasted.as_slice().await.unwrap();
-    println!("{as_slice:?}");
-    for i in 0..2 {
-        assert_eq!(as_slice[[0, 0, i]], 1.);
-        assert_eq!(as_slice[[0, 1, i]], 2.);
-        assert_eq!(as_slice[[1, 0, i]], 3.);
-        assert_eq!(as_slice[[1, 1, i]], 4.);
-    }
-}
-
-#[cfg(test)]
-#[tokio::test]
-async fn test_broadcast_as_non_continuous() {
-    use crate::Device;
-
-    let device = Device::test_instance();
-
-    let data = [[1., 2., -1.], [3., 4., -1.]];
-    let tensor = Tensor::new(&device, &data);
-    println!("tensor: {tensor:?}");
-    let sliced = tensor.slice([0..2, 0..2]);
-    println!("sliced: {sliced:?}");
-    let broadcasted = sliced.broadcast_as([2, 2, 3]);
-    println!("{broadcasted:?}");
-    let as_slice = broadcasted.as_slice().await.unwrap();
-    println!("{as_slice:?}");
-    for i in 0..2 {
-        assert_eq!(as_slice[[0, 0, i]], 1.);
-        assert_eq!(as_slice[[0, 1, i]], 2.);
-        assert_eq!(as_slice[[1, 0, i]], 3.);
-        assert_eq!(as_slice[[1, 1, i]], 4.);
-    }
-}
-
-#[cfg(test)]
-#[tokio::test]
-async fn test_broadcast_together_first_larger() {
-    use crate::Device;
-
-    let device = Device::test_instance();
-
-    let data1 = [[1., 2.], [3., 4.]];
-    let tensor1 = Tensor::new(&device, &data1);
-    let data2 = [10., 20.];
-    let tensor2 = Tensor::new(&device, &data2);
-    let (b1, b2) = Tensor::broadcast_together(&tensor1, &tensor2);
-    println!("{b1:?}");
-    println!("{b2:?}");
-    let as_slice1 = b1.as_slice().await.unwrap();
-    let as_slice2 = b2.as_slice().await.unwrap();
-    println!("{as_slice1:?}");
-    println!("{as_slice2:?}");
-    assert_eq!(as_slice1[[0, 0]], 1.);
-    assert_eq!(as_slice1[[0, 1]], 2.);
-    assert_eq!(as_slice1[[1, 0]], 3.);
-    assert_eq!(as_slice1[[1, 1]], 4.);
-
-    assert_eq!(as_slice2[[0, 0]], 10.);
-    assert_eq!(as_slice2[[0, 1]], 20.);
-    assert_eq!(as_slice2[[1, 0]], 10.);
-    assert_eq!(as_slice2[[1, 1]], 20.);
-}
-
-#[cfg(test)]
-#[tokio::test]
-async fn test_broadcast_together_second_larger() {
-    use crate::Device;
-
-    let device = Device::test_instance();
-
-    let data1 = [[1., 2.], [3., 4.]];
-    let tensor1 = Tensor::new(&device, &data1);
-    let data2 = [10., 20.];
-    let tensor2 = Tensor::new(&device, &data2);
-    let (b2, b1) = Tensor::broadcast_together(&tensor2, &tensor1);
-    println!("{b1:?}");
-    println!("{b2:?}");
-    let as_slice1 = b1.as_slice().await.unwrap();
-    let as_slice2 = b2.as_slice().await.unwrap();
-    println!("{as_slice1:?}");
-    println!("{as_slice2:?}");
-    assert_eq!(as_slice1[[0, 0]], 1.);
-    assert_eq!(as_slice1[[0, 1]], 2.);
-    assert_eq!(as_slice1[[1, 0]], 3.);
-    assert_eq!(as_slice1[[1, 1]], 4.);
-
-    assert_eq!(as_slice2[[0, 0]], 10.);
-    assert_eq!(as_slice2[[0, 1]], 20.);
-    assert_eq!(as_slice2[[1, 0]], 10.);
-    assert_eq!(as_slice2[[1, 1]], 20.);
-}
-
-#[cfg(test)]
-#[tokio::test]
-async fn test_broadcast_together_same_size() {
-    use crate::Device;
-
-    let device = Device::test_instance();
-
-    let data1 = [[1.], [2.]];
-    let tensor1 = Tensor::new(&device, &data1);
-    let data2 = [[10., 20.]];
-    let tensor2 = Tensor::new(&device, &data2);
-    let (b2, b1) = Tensor::broadcast_together(&tensor2, &tensor1);
-    println!("{b1:?}");
-    println!("{b2:?}");
-    let as_slice1 = b1.as_slice().await.unwrap();
-    let as_slice2 = b2.as_slice().await.unwrap();
-    println!("{as_slice1:?}");
-    println!("{as_slice2:?}");
-    assert_eq!(as_slice1[[0, 0]], 1.);
-    assert_eq!(as_slice1[[0, 1]], 1.);
-    assert_eq!(as_slice1[[1, 0]], 2.);
-    assert_eq!(as_slice1[[1, 1]], 2.);
-
-    assert_eq!(as_slice2[[0, 0]], 10.);
-    assert_eq!(as_slice2[[0, 1]], 20.);
-    assert_eq!(as_slice2[[1, 0]], 10.);
-    assert_eq!(as_slice2[[1, 1]], 20.);
 }

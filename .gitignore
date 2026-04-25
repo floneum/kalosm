@@ -17,3 +17,4 @@ tokenizer.json
 out.txt
 todo.md
 rust-analyzer
+/.claude

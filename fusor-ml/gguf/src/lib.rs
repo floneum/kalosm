@@ -877,6 +877,10 @@ impl GgufBlock for BlockQ4_0 {
     }
 }
 
+// Used by both the x86_64 AVX2 fallback path and the generic "neither
+// aarch64-nightly nor x86_64" platform path. Skipped only on aarch64+nightly
+// where the NEON intrinsics path doesn't need it.
+#[cfg(not(all(target_arch = "aarch64", nightly)))]
 #[inline(always)]
 fn q4_0_vec_dot_scalar(data: &[u8; 16], y_data: &[i8; 32]) -> i32 {
     const CENTER: i8 = 8;
@@ -1303,6 +1307,10 @@ impl GgufBlock for BlockQ8_0 {
     }
 }
 
+// Used by both the x86_64 AVX2 fallback path and the generic "neither
+// aarch64-nightly nor x86_64" platform path. Skipped only on aarch64+nightly
+// where the NEON intrinsics path doesn't need it.
+#[cfg(not(all(target_arch = "aarch64", nightly)))]
 #[inline(always)]
 fn q8_0_vec_dot_scalar(x_data: &[i8; 32], y_data: &[i8; 32]) -> i32 {
     let mut sum: i32 = 0;

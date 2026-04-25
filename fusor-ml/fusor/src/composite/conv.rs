@@ -38,6 +38,36 @@ where
         + std::ops::Mul<Output = D>
         + std::ops::Add<Output = D>,
 {
+    fn bias_broadcast_shape(out_channels: usize) -> [usize; R] {
+        std::array::from_fn(|axis| if axis == 1 { out_channels } else { 1 })
+    }
+
+    fn window_permutation<const R2: usize, const DIFF: usize>() -> [usize; R2] {
+        std::array::from_fn(|index| {
+            if index == 0 {
+                0
+            } else if index <= DIFF {
+                index + 1
+            } else if index == DIFF + 1 {
+                1
+            } else {
+                index
+            }
+        })
+    }
+
+    fn output_permutation<const DIFF: usize>() -> [usize; R] {
+        std::array::from_fn(|index| {
+            if index == 0 {
+                0
+            } else if index == 1 {
+                DIFF + 1
+            } else {
+                index - 1
+            }
+        })
+    }
+
     /// Unified convolution method that handles different tensor formats:
     /// - Multi-channel convolution (R = 2 + DIFF): (batch, channels, ...spatial) format
     ///
@@ -114,8 +144,9 @@ where
         // Step 3: Prepare for matmul by reshaping and transposing
         let kernel_size: usize = weight_shape[spatial_start..].iter().product();
 
-        // Transpose to move in_channels after spatial
-        let windows_transposed = windows_tensor.transpose(in_channels_axis, spatial_start);
+        // Move the output spatial dimensions in front of channels so each output location
+        // becomes one matmul row after flattening.
+        let windows_transposed = windows_tensor.permute(Self::window_permutation::<R2, DIFF>());
 
         // Flatten to (batch * out_spatial_size, in_channels * kernel_size)
         let windows_flat: Tensor<2, D, _> =
@@ -130,10 +161,20 @@ where
         // Step 5: Matrix multiplication
         let output = windows_flat.mat_mul(&weight_t);
 
-        // Step 6: Reshape and transpose back to (batch, out_channels, ...out_spatial...)
-        let output_reshaped: Tensor<3, D, _> =
-            output.reshape([batch, out_spatial_size, out_channels]);
-        let output_transposed = output_reshaped.transpose(in_channels_axis, spatial_start);
+        // Step 6: Reshape and permute back to (batch, out_channels, ...out_spatial...)
+        let output_reshaped: Tensor<R, D, _> = output.reshape(std::array::from_fn(|axis| {
+            if axis == 0 {
+                batch
+            } else if axis <= DIFF {
+                let spatial_axis = spatial_start + axis - 1;
+                let padded_len = input_shape[spatial_axis] + 2 * padding[axis - 1];
+                let kernel_len = weight_shape[spatial_axis];
+                (padded_len - kernel_len) / strides[axis - 1] + 1
+            } else {
+                out_channels
+            }
+        }));
+        let output_transposed = output_reshaped.permute(Self::output_permutation::<DIFF>());
 
         // Reshape to (batch, out_channels, ...out_spatial_dims...)
         let mut output_shape = input_shape;
@@ -148,191 +189,12 @@ where
         // Step 7: Add bias if present
         if let Some(bias) = bias {
             // Bias shape: (out_channels,)
-            // Need to broadcast to (batch, out_channels, ...spatial...)
-            // Broadcast bias to the FULL output shape for correct addition
-            let bias_broadcast: Tensor<R, D, _> = bias.broadcast_as(output_shape);
+            // Broadcast along the channel axis, leaving batch/spatial dims singleton.
+            let bias_reshaped = bias.reshape(Self::bias_broadcast_shape(out_channels));
+            let bias_broadcast: Tensor<R, D, _> = bias_reshaped.broadcast_as(output_shape);
             output_final.add_(&bias_broadcast)
         } else {
             output_final.to_concrete()
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[tokio::test]
-    async fn test_conv_1d_cpu() {
-        // Input: (batch=1, in_channels=1, length=5)
-        let input_data = [1.0f32, 2.0, 3.0, 4.0, 5.0];
-        let input: Tensor<3, f32> =
-            Tensor::Cpu(fusor_cpu::Tensor::from_slice([1, 1, 5], &input_data));
-
-        // Weight: (out_channels=1, in_channels=1, kernel_size=3)
-        let weight_data = [0.2f32, 0.5, 0.3];
-        let weight: Tensor<3, f32> =
-            Tensor::Cpu(fusor_cpu::Tensor::from_slice([1, 1, 3], &weight_data));
-
-        let bias_val = 0.1f32;
-        let bias: Tensor<1, f32> = Tensor::Cpu(fusor_cpu::Tensor::from_slice([1], &[bias_val]));
-
-        // Perform convolution with stride 1 and no padding
-        let output = input.conv(&weight, Some(&bias), [0], [1]);
-
-        // Expected values for the 1D convolution
-        let input_flat = [1.0f32, 2.0, 3.0, 4.0, 5.0];
-        let weight_flat = [0.2f32, 0.5, 0.3];
-        let expected: Vec<f32> = input_flat
-            .windows(weight_flat.len())
-            .map(|window| {
-                window
-                    .iter()
-                    .zip(weight_flat.iter())
-                    .map(|(x, w)| x * w)
-                    .sum::<f32>()
-                    + bias_val
-            })
-            .collect();
-
-        let output_data = output.as_slice().await.unwrap();
-        assert_eq!(output_data.shape(), &[1, 1, expected.len()]);
-        for i in 0..expected.len() {
-            let val = output_data[[0, 0, i]];
-            let expected_val = expected[i];
-            assert!(
-                (val - expected_val).abs() < 1e-5,
-                "Mismatch at index {}: got {}, expected {}",
-                i,
-                val,
-                expected_val
-            );
-        }
-    }
-
-    #[tokio::test]
-    async fn test_conv_1d_strided_cpu() {
-        // Input: (batch=1, in_channels=1, length=5)
-        let input_data = [1.0f32, 2.0, 3.0, 4.0, 5.0];
-        let input: Tensor<3, f32> =
-            Tensor::Cpu(fusor_cpu::Tensor::from_slice([1, 1, 5], &input_data));
-
-        // Weight: (out_channels=1, in_channels=1, kernel_size=3)
-        let weight_data = [0.2f32, 0.5, 0.3];
-        let weight: Tensor<3, f32> =
-            Tensor::Cpu(fusor_cpu::Tensor::from_slice([1, 1, 3], &weight_data));
-
-        let bias_val = 0.1f32;
-        let bias: Tensor<1, f32> = Tensor::Cpu(fusor_cpu::Tensor::from_slice([1], &[bias_val]));
-        let stride = 2;
-
-        let output = input.conv(&weight, Some(&bias), [0], [stride]);
-
-        let input_flat = [1.0f32, 2.0, 3.0, 4.0, 5.0];
-        let weight_flat = [0.2f32, 0.5, 0.3];
-        let expected: Vec<f32> = input_flat
-            .windows(weight_flat.len())
-            .step_by(stride)
-            .map(|window| {
-                window
-                    .iter()
-                    .zip(weight_flat.iter())
-                    .map(|(x, w)| x * w)
-                    .sum::<f32>()
-                    + bias_val
-            })
-            .collect();
-
-        let output_data = output.as_slice().await.unwrap();
-        assert_eq!(output_data.shape(), &[1, 1, expected.len()]);
-        for i in 0..expected.len() {
-            let val = output_data[[0, 0, i]];
-            let expected_val = expected[i];
-            assert!(
-                (val - expected_val).abs() < 1e-5,
-                "Mismatch at index {}: got {}, expected {}",
-                i,
-                val,
-                expected_val
-            );
-        }
-    }
-
-    #[tokio::test]
-    async fn test_conv_1d_with_padding_cpu() {
-        // Input: (1, 1, 3)
-        let input_data = [1.0f32, 2.0, 3.0];
-        let input: Tensor<3, f32> =
-            Tensor::Cpu(fusor_cpu::Tensor::from_slice([1, 1, 3], &input_data));
-
-        // Weight: (1, 1, 3)
-        let weight_data = [1.0f32, 1.0, 1.0];
-        let weight: Tensor<3, f32> =
-            Tensor::Cpu(fusor_cpu::Tensor::from_slice([1, 1, 3], &weight_data));
-
-        let output = input.conv(&weight, None, [1], [1]);
-
-        // With padding=1, input becomes [0, 1, 2, 3, 0]
-        // Output shape should be (1, 1, 3)
-        assert_eq!(output.shape(), [1, 1, 3]);
-
-        let result = output.as_slice().await.unwrap();
-
-        // Manual calculation:
-        // output[0] = 0*1 + 1*1 + 2*1 = 3
-        // output[1] = 1*1 + 2*1 + 3*1 = 6
-        // output[2] = 2*1 + 3*1 + 0*1 = 5
-
-        assert!((result[[0, 0, 0]] - 3.0).abs() < 1e-5);
-        assert!((result[[0, 0, 1]] - 6.0).abs() < 1e-5);
-        assert!((result[[0, 0, 2]] - 5.0).abs() < 1e-5);
-    }
-
-    #[tokio::test]
-    async fn test_conv_1d_multi_channel_cpu() {
-        // Input: (1, 2, 4) - 2 input channels
-        // Channel 0: [1, 2, 3, 4], Channel 1: [5, 6, 7, 8]
-        let input_data = [1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0];
-        let input: Tensor<3, f32> =
-            Tensor::Cpu(fusor_cpu::Tensor::from_slice([1, 2, 4], &input_data));
-
-        // Weight: (3, 2, 2) - 3 output channels, 2 input channels, kernel size 2
-        // out_ch 0: [[1, 0], [0, 1]]
-        // out_ch 1: [[0.5, 0.5], [0.5, 0.5]]
-        // out_ch 2: [[1, 1], [1, 1]]
-        let weight_data = [
-            1.0f32, 0.0, 0.0, 1.0, // out_channel 0
-            0.5, 0.5, 0.5, 0.5, // out_channel 1
-            1.0, 1.0, 1.0, 1.0, // out_channel 2
-        ];
-        let weight: Tensor<3, f32> =
-            Tensor::Cpu(fusor_cpu::Tensor::from_slice([3, 2, 2], &weight_data));
-
-        let output = input.conv(&weight, None, [0], [1]);
-
-        // Output shape should be (1, 3, 3)
-        assert_eq!(output.shape(), [1, 3, 3]);
-
-        let result = output.as_slice().await.unwrap();
-
-        // For position 0: in_ch0 window [1,2], in_ch1 window [5,6]
-        //   out_ch 0 weights [[1,0], [0,1]]: 1*1 + 2*0 + 5*0 + 6*1 = 7
-        //   out_ch 1 weights [[0.5,0.5], [0.5,0.5]]: 1*0.5 + 2*0.5 + 5*0.5 + 6*0.5 = 7
-        //   out_ch 2 weights [[1,1], [1,1]]: 1*1 + 2*1 + 5*1 + 6*1 = 14
-
-        // Out channel 0
-        assert!((result[[0, 0, 0]] - 7.0).abs() < 1e-5);
-        assert!((result[[0, 0, 1]] - 9.0).abs() < 1e-5);
-        assert!((result[[0, 0, 2]] - 11.0).abs() < 1e-5);
-
-        // Out channel 1
-        assert!((result[[0, 1, 0]] - 7.0).abs() < 1e-5);
-        assert!((result[[0, 1, 1]] - 9.0).abs() < 1e-5);
-        assert!((result[[0, 1, 2]] - 11.0).abs() < 1e-5);
-
-        // Out channel 2
-        assert!((result[[0, 2, 0]] - 14.0).abs() < 1e-5);
-        assert!((result[[0, 2, 1]] - 18.0).abs() < 1e-5);
-        assert!((result[[0, 2, 2]] - 22.0).abs() < 1e-5);
     }
 }

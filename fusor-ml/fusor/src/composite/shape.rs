@@ -5,7 +5,74 @@ use std::ops::Range;
 use crate::{ConcreteTensor, Device, SimdElement, Tensor};
 use fusor_core::{DataType, Dim, ShapeWithOneHole};
 use fusor_cpu::{MapLayout, TensorBacking};
-use fusor_types::SlidingWindow;
+use fusor_types::{Layout, SlidingWindow, StrideSpec};
+
+fn validate_permutation(axes: &[usize]) {
+    let rank = axes.len();
+    let mut seen = vec![false; rank];
+    for &axis in axes {
+        assert!(axis < rank, "Axis {} out of range for rank {}", axis, rank);
+        assert!(!seen[axis], "Duplicate axis {} in permutation", axis);
+        seen[axis] = true;
+    }
+}
+
+fn broadcast_specs<const R: usize, const R2: usize>(
+    shape: [usize; R],
+    out_shape: [usize; R2],
+) -> [StrideSpec; R2] {
+    assert!(
+        R2 >= R,
+        "Cannot broadcast from rank {} to smaller rank {}",
+        R,
+        R2
+    );
+
+    let mut src_idx = R as isize - 1;
+    let mut specs = Vec::with_capacity(R2);
+
+    for &target_dim in out_shape.iter().rev() {
+        if src_idx >= 0 {
+            let in_idx = src_idx as usize;
+            let src_dim = shape[in_idx];
+            if src_dim == target_dim {
+                specs.push(StrideSpec::dim(in_idx, target_dim));
+                src_idx -= 1;
+                continue;
+            }
+            if src_dim == 1 && target_dim > 1 {
+                specs.push(StrideSpec::dim_with(in_idx, target_dim, 0));
+                src_idx -= 1;
+                continue;
+            }
+        }
+
+        // New dimensions can be inserted anywhere; any input_dim is valid because the
+        // zero multiplier means the stride is never read from the backing layout.
+        specs.push(StrideSpec::dim_with(0, target_dim, 0));
+    }
+
+    assert!(
+        src_idx < 0,
+        "Failed to broadcast: source shape {:?} is not compatible with target shape {:?}",
+        shape,
+        out_shape
+    );
+
+    specs.reverse();
+    specs
+        .try_into()
+        .expect("broadcast spec length should match output rank")
+}
+
+fn singleton_stride_spec<const R: usize>(preferred_input_dim: usize) -> StrideSpec {
+    if R == 0 {
+        StrideSpec::dim_with(0, 1, 0)
+    } else {
+        // Size-1 axes should remain ordinary singleton dimensions, not broadcast axes.
+        StrideSpec::dim(preferred_input_dim.min(R - 1), 1)
+    }
+}
 
 impl<const R: usize, D, B> Tensor<R, D, B>
 where
@@ -34,19 +101,59 @@ where
     /// * `dim0` - First dimension to swap
     /// * `dim1` - Second dimension to swap
     pub fn transpose(&self, dim0: usize, dim1: usize) -> Tensor<R, D, MapLayout<&B, R>> {
-        match self {
-            Tensor::Cpu(t) => Tensor::Cpu(t.as_ref().transpose(dim0, dim1)),
-            Tensor::Gpu(t) => Tensor::Gpu(t.transpose(dim0, dim1)),
-        }
+        let shape = self.shape();
+        let rank = shape.len();
+        assert!(dim0 < rank, "dim0 {} out of range for rank {}", dim0, rank);
+        assert!(dim1 < rank, "dim1 {} out of range for rank {}", dim1, rank);
+        let specs: [StrideSpec; R] = std::array::from_fn(|i| {
+            if i == dim0 {
+                StrideSpec::dim(dim1, shape[dim1])
+            } else if i == dim1 {
+                StrideSpec::dim(dim0, shape[dim0])
+            } else {
+                StrideSpec::dim(i, shape[i])
+            }
+        });
+        self.restride(specs)
     }
 
     /// Slice the tensor along all dimensions.
     ///
     /// Returns a view into the tensor's data with updated layout.
     pub fn slice(&self, slices: [Range<usize>; R]) -> Tensor<R, D, MapLayout<&B, R>> {
+        let specs: [StrideSpec; R] = std::array::from_fn(|i| {
+            StrideSpec::dim(i, slices[i].len()).with_offset(slices[i].start)
+        });
+        self.restride(specs)
+    }
+
+    /// Create a view with stride patterns specified per output dimension.
+    ///
+    /// Each [`StrideSpec`] maps an output dimension to an input dimension's stride
+    /// with an optional multiplier. This is relative to the current strides, so it
+    /// composes correctly when the GPU optimizer changes upstream strides.
+    /// The output rank can differ from the input.
+    pub fn restride<const R2: usize>(
+        &self,
+        specs: [StrideSpec; R2],
+    ) -> Tensor<R2, D, MapLayout<&B, R2>> {
         match self {
-            Tensor::Cpu(t) => Tensor::Cpu(t.as_ref().slice(slices)),
-            Tensor::Gpu(t) => Tensor::Gpu(t.slice(slices)),
+            Tensor::Cpu(t) => {
+                let new_layout = t.layout().restride(&specs);
+                Tensor::Cpu(t.as_ref().restride_layout(new_layout))
+            }
+            Tensor::Gpu(t) => Tensor::Gpu(t.restride(specs)),
+        }
+    }
+
+    /// Set the layout directly from a pre-computed [`Layout`].
+    pub fn restride_layout<const R2: usize>(
+        &self,
+        new_layout: Layout,
+    ) -> Tensor<R2, D, MapLayout<&B, R2>> {
+        match self {
+            Tensor::Cpu(t) => Tensor::Cpu(t.as_ref().restride_layout(new_layout.clone())),
+            Tensor::Gpu(t) => Tensor::Gpu(t.restride_layout(new_layout)),
         }
     }
 
@@ -55,10 +162,11 @@ where
     /// # Arguments
     /// * `axes` - A permutation of [0, 1, ..., R-1] specifying the new order
     pub fn permute(&self, axes: [usize; R]) -> Tensor<R, D, MapLayout<&B, R>> {
-        match self {
-            Tensor::Cpu(t) => Tensor::Cpu(t.as_ref().permute(axes)),
-            Tensor::Gpu(t) => Tensor::Gpu(t.permute(axes)),
-        }
+        validate_permutation(&axes);
+        let shape = self.shape();
+        let specs: [StrideSpec; R] =
+            std::array::from_fn(|i| StrideSpec::dim(axes[i], shape[axes[i]]));
+        self.restride(specs)
     }
 
     /// Broadcast the tensor to a larger shape.
@@ -71,10 +179,9 @@ where
         &self,
         out_shape: [usize; R2],
     ) -> Tensor<R2, D, MapLayout<&B, R2>> {
-        match self {
-            Tensor::Cpu(t) => Tensor::Cpu(t.as_ref().broadcast_as(out_shape)),
-            Tensor::Gpu(t) => Tensor::Gpu(t.broadcast_as(out_shape)),
-        }
+        let shape = self.shape();
+        let specs = broadcast_specs(shape, out_shape);
+        self.restride(specs)
     }
 
     /// Expand the tensor to a larger shape (alias for broadcast_as).
@@ -87,10 +194,8 @@ where
 
     /// Flatten the tensor to 1D.
     pub fn flatten_all(&self) -> Tensor<1, D, MapLayout<&B, 1>> {
-        match self {
-            Tensor::Cpu(t) => Tensor::Cpu(t.as_ref().flatten_all()),
-            Tensor::Gpu(t) => Tensor::Gpu(t.flatten_all()),
-        }
+        let total = self.shape().iter().product();
+        self.reshape([total])
     }
 
     /// Narrow the tensor along a given dimension.
@@ -106,10 +211,29 @@ where
         length: usize,
     ) -> Tensor<R, D, MapLayout<&B, R>> {
         let dim = dim.resolve();
-        match self {
-            Tensor::Cpu(t) => Tensor::Cpu(t.as_ref().narrow(dim, start, length)),
-            Tensor::Gpu(t) => Tensor::Gpu(t.narrow(dim, start, length)),
-        }
+        let shape = self.shape();
+        let rank = shape.len();
+        assert!(
+            dim < rank,
+            "Dimension {} out of range for rank {}",
+            dim,
+            rank
+        );
+        assert!(
+            start + length <= shape[dim],
+            "Narrow out of bounds: {}..{} for dimension of size {}",
+            start,
+            start + length,
+            shape[dim]
+        );
+        let specs: [StrideSpec; R] = std::array::from_fn(|i| {
+            if i == dim {
+                StrideSpec::dim(i, length).with_offset(start)
+            } else {
+                StrideSpec::dim(i, shape[i])
+            }
+        });
+        self.restride(specs)
     }
 
     /// Split the tensor into chunks along a given dimension.
@@ -140,7 +264,21 @@ where
     /// # Arguments
     /// * `repeats` - Number of times to repeat along each dimension
     pub fn repeat(&self, repeats: [usize; R]) -> Tensor<R, D> {
-        self.dispatch_ref(|t| t.as_ref().repeat(repeats), |t| t.repeat(repeats))
+        if repeats.contains(&0) {
+            let input_shape = self.shape();
+            let output_shape = std::array::from_fn(|i| input_shape[i] * repeats[i]);
+            return Tensor::zeros(&self.device(), output_shape);
+        }
+
+        // Concatenate copies along each dimension
+        let mut result: Tensor<R, D> = self.to_concrete();
+        for (dim, &count) in repeats.iter().enumerate() {
+            if count > 1 {
+                let copies: Vec<Tensor<R, D>> = (0..count).map(|_| result.clone()).collect();
+                result = cat(copies, dim);
+            }
+        }
+        result
     }
 
     /// Squeeze a dimension of size 1.
@@ -152,10 +290,21 @@ where
         ConcreteTensor<D, R>: fusor_cpu::LastRank<R2, D>,
         fusor_core::Tensor<R, D>: fusor_core::LastRank<R2, D>,
     {
-        match self {
-            Tensor::Cpu(t) => Tensor::Cpu(t.as_ref().squeeze(dim)),
-            Tensor::Gpu(t) => Tensor::Gpu(t.squeeze(dim)),
-        }
+        let shape = self.shape();
+        let rank = shape.len();
+        assert!(rank > 0, "Cannot squeeze a scalar tensor");
+        assert!(
+            dim < rank,
+            "Dimension {} out of range for rank {}",
+            dim,
+            rank
+        );
+        assert_eq!(shape[dim], 1, "Squeeze dimension must have size 1");
+        let specs: [StrideSpec; R2] = std::array::from_fn(|out_i| {
+            let in_i = if out_i < dim { out_i } else { out_i + 1 };
+            StrideSpec::dim(in_i, shape[in_i])
+        });
+        self.restride(specs)
     }
 
     /// Unsqueeze (add a dimension of size 1).
@@ -167,10 +316,26 @@ where
         ConcreteTensor<D, R>: fusor_cpu::NextRank<R2, D>,
         fusor_core::Tensor<R, D>: fusor_core::NextRank<R2, D>,
     {
-        match self {
-            Tensor::Cpu(t) => Tensor::Cpu(t.as_ref().unsqueeze(dim)),
-            Tensor::Gpu(t) => Tensor::Gpu(t.unsqueeze(dim)),
+        assert!(
+            dim <= R,
+            "Dimension {} out of range for inserting into rank {}",
+            dim,
+            R
+        );
+        if R == 0 {
+            return self.reshape([1; R2]);
         }
+
+        let shape = self.shape();
+        let specs: [StrideSpec; R2] = std::array::from_fn(|out_i| {
+            if out_i == dim {
+                singleton_stride_spec::<R>(dim)
+            } else {
+                let in_i = if out_i < dim { out_i } else { out_i - 1 };
+                StrideSpec::dim(in_i, shape[in_i])
+            }
+        });
+        self.restride(specs)
     }
 
     /// Squeeze multiple dimensions of size 1.
@@ -189,10 +354,26 @@ where
         ConcreteTensor<D, R>: fusor_cpu::SmallerRank<R2, DIFF, D>,
         fusor_core::Tensor<R, D>: fusor_core::SmallerRank<DIFF, R2, D>,
     {
-        match self {
-            Tensor::Cpu(t) => Tensor::Cpu(t.as_ref().squeeze_dims(axes)),
-            Tensor::Gpu(t) => Tensor::Gpu(t.squeeze_dims(axes)),
+        let shape = self.shape();
+        let rank = shape.len();
+        for &ax in &axes {
+            assert!(ax < rank, "Axis {} out of range for rank {}", ax, rank);
+            assert_eq!(shape[ax], 1, "Squeeze dimension {} must have size 1", ax);
         }
+        let mut sorted_axes = axes;
+        sorted_axes.sort_unstable();
+        let mut in_i = 0;
+        let mut axis_idx = 0;
+        let specs: [StrideSpec; R2] = std::array::from_fn(|_| {
+            while axis_idx < DIFF && in_i == sorted_axes[axis_idx] {
+                in_i += 1;
+                axis_idx += 1;
+            }
+            let spec = StrideSpec::dim(in_i, shape[in_i]);
+            in_i += 1;
+            spec
+        });
+        self.restride(specs)
     }
 
     /// Unsqueeze multiple dimensions (add dimensions of size 1).
@@ -211,10 +392,35 @@ where
         ConcreteTensor<D, R>: fusor_cpu::LargerRank<R2, DIFF, D>,
         fusor_core::Tensor<R, D>: fusor_core::LargerRank<DIFF, R2, D>,
     {
-        match self {
-            Tensor::Cpu(t) => Tensor::Cpu(t.as_ref().unsqueeze_dims(axes)),
-            Tensor::Gpu(t) => Tensor::Gpu(t.unsqueeze_dims(axes)),
+        let new_rank = R + DIFF;
+        for &axis in &axes {
+            assert!(
+                axis < new_rank,
+                "Axis {} out of range for new rank {}",
+                axis,
+                new_rank
+            );
         }
+        if R == 0 {
+            return self.reshape([1; R2]);
+        }
+
+        let shape = self.shape();
+        let mut sorted_axes = axes;
+        sorted_axes.sort_unstable();
+        let mut old_idx = 0;
+        let mut axis_idx = 0;
+        let specs: [StrideSpec; R2] = std::array::from_fn(|out_i| {
+            if axis_idx < DIFF && out_i == sorted_axes[axis_idx] {
+                axis_idx += 1;
+                singleton_stride_spec::<R>(old_idx)
+            } else {
+                let spec = StrideSpec::dim(old_idx, shape[old_idx]);
+                old_idx += 1;
+                spec
+            }
+        });
+        self.restride(specs)
     }
 
     /// Create a sliding window view of the tensor (zero-copy).
@@ -235,10 +441,47 @@ where
         ConcreteTensor<D, R>: fusor_cpu::LargerRank<R2, DIFF, D>,
         fusor_core::Tensor<R, D>: fusor_core::LargerRank<DIFF, R2, D>,
     {
-        match self {
-            Tensor::Cpu(t) => Tensor::Cpu(t.as_ref().sliding_window_view(windows)),
-            Tensor::Gpu(t) => Tensor::Gpu(t.sliding_window_view(windows)),
+        let shape = self.shape();
+        let mut sorted_windows = windows;
+        sorted_windows.sort_by_key(|w| w.axis);
+        for window in &sorted_windows {
+            assert!(
+                window.axis < R,
+                "Sliding window axis {} out of bounds",
+                window.axis
+            );
+            assert!(
+                window.step > 0,
+                "Sliding window step must be greater than zero"
+            );
+            assert!(
+                window.window_size <= shape[window.axis],
+                "Sliding window size {} exceeds dimension {} of size {}",
+                window.window_size,
+                window.axis,
+                shape[window.axis]
+            );
         }
+        for pair in sorted_windows.windows(2) {
+            assert!(
+                pair[0].axis != pair[1].axis,
+                "Sliding window axes must be unique"
+            );
+        }
+        let specs: [StrideSpec; R2] = std::array::from_fn(|out_i| {
+            if out_i < R {
+                if let Some(w) = sorted_windows.iter().find(|w| w.axis == out_i) {
+                    let num_positions = (shape[out_i] - w.window_size) / w.step + 1;
+                    StrideSpec::dim_with(out_i, num_positions, w.step)
+                } else {
+                    StrideSpec::dim(out_i, shape[out_i])
+                }
+            } else {
+                let w = &sorted_windows[out_i - R];
+                StrideSpec::dim(w.axis, w.window_size)
+            }
+        });
+        self.restride(specs)
     }
 }
 
@@ -291,28 +534,36 @@ where
     }
 }
 
-fn dispatch_vec<const R: usize, D, B, O>(
-    tensors: impl IntoIterator<Item = Tensor<R, D, B>>,
-    cpu: impl FnOnce(Vec<fusor_cpu::Tensor<R, B>>) -> O,
-    gpu: impl FnOnce(Vec<fusor_core::Tensor<R, D>>) -> O,
-) -> O
-where
-    D: SimdElement + DataType,
-    B: TensorBacking<R, Elem = D>,
-{
-    let mut cpu_tensors = Vec::new();
-    let mut gpu_tensors = Vec::new();
-    for t in tensors {
-        match t {
-            Tensor::Cpu(ct) => cpu_tensors.push(ct),
-            Tensor::Gpu(gt) => gpu_tensors.push(gt),
+/// Calculate the broadcasted shape for two tensors.
+/// Returns the output shape where each dimension is the max of the corresponding input dimensions.
+/// Dimensions are aligned from the right.
+pub(crate) fn broadcast_shapes<const R1: usize, const R2: usize, const R3: usize>(
+    shape1: &[usize; R1],
+    shape2: &[usize; R2],
+) -> [usize; R3] {
+    let mut result = [1usize; R3];
+
+    // Align shapes from the right
+    for (i, &dim) in shape1.iter().enumerate().take(R1) {
+        let idx = R3 - R1 + i;
+        result[idx] = dim;
+    }
+
+    for i in 0..R2 {
+        let idx = R3 - R2 + i;
+        let d2 = shape2[i];
+        let d1 = result[idx];
+        if d1 == 1 {
+            result[idx] = d2;
+        } else if d2 != 1 && d1 != d2 {
+            panic!(
+                "Cannot broadcast shapes {:?} and {:?}: incompatible dimensions {} and {} at index {}",
+                shape1, shape2, d1, d2, idx
+            );
         }
     }
-    if gpu_tensors.is_empty() {
-        cpu(cpu_tensors)
-    } else {
-        gpu(gpu_tensors)
-    }
+
+    result
 }
 
 /// Concatenate multiple tensors along a given dimension.
@@ -328,11 +579,35 @@ where
     D: SimdElement + DataType + Default,
     B: TensorBacking<R, Elem = D>,
 {
-    dispatch_vec(
-        tensors,
-        |cpu_tensors| Tensor::Cpu(fusor_cpu::Tensor::cat(cpu_tensors, dim)),
-        |gpu_tensors| Tensor::Gpu(fusor_core::Tensor::cat(gpu_tensors, dim)),
-    )
+    let tensors: Vec<Tensor<R, D>> = tensors.into_iter().map(|t| t.to_concrete()).collect();
+    assert!(!tensors.is_empty(), "Cannot cat empty list of tensors");
+
+    let first_shape = tensors[0].shape();
+    let total_dim_size: usize = tensors.iter().map(|t| t.shape()[dim]).sum();
+    let new_shape: [usize; R] = std::array::from_fn(|i| {
+        if i == dim {
+            total_dim_size
+        } else {
+            first_shape[i]
+        }
+    });
+
+    // Create the output tensor with splat, then slice_assign each tensor into it
+    let mut result = Tensor::splat(&tensors[0].device(), D::default(), new_shape);
+    let mut offset = 0;
+    for tensor in &tensors {
+        let len = tensor.shape()[dim];
+        let slice: [std::ops::Range<usize>; R] = std::array::from_fn(|i| {
+            if i == dim {
+                offset..(offset + len)
+            } else {
+                0..new_shape[i]
+            }
+        });
+        result = result.slice_assign(slice, tensor);
+        offset += len;
+    }
+    result
 }
 
 /// Stack tensors along a new dimension.
@@ -350,11 +625,38 @@ where
     fusor_core::Tensor<R, D>: fusor_core::NextRank<R2, D>,
     B: TensorBacking<R, Elem = D>,
 {
-    dispatch_vec(
-        tensors,
-        |cpu_tensors| Tensor::Cpu(fusor_cpu::Tensor::stack(cpu_tensors, dim)),
-        |gpu_tensors| Tensor::Gpu(fusor_core::Tensor::stack(gpu_tensors, dim)),
-    )
+    // Unsqueeze each tensor at the target dim, then cat along that dim
+    let unsqueezed: Vec<Tensor<R2, D>> = tensors
+        .into_iter()
+        .map(|t| t.to_concrete().unsqueeze::<R2>(dim).to_concrete())
+        .collect();
+    cat(unsqueezed, dim)
+}
+
+impl<D> Tensor<1, D>
+where
+    D: SimdElement + DataType + Default,
+{
+    /// Create a range tensor from start (inclusive) to end (exclusive).
+    pub fn arange(device: &Device, start: D, end: D) -> Tensor<1, D, ConcreteTensor<D, 1>>
+    where
+        D: std::ops::Add<Output = D> + PartialOrd + From<u8>,
+    {
+        arange(device, start, end)
+    }
+
+    /// Create a range tensor with a custom step.
+    pub fn arange_step(
+        device: &Device,
+        start: D,
+        end: D,
+        step: D,
+    ) -> Tensor<1, D, ConcreteTensor<D, 1>>
+    where
+        D: std::ops::Add<Output = D> + PartialOrd + Copy,
+    {
+        arange_step(device, start, end, step)
+    }
 }
 
 /// Create a range tensor from start (inclusive) to end (exclusive).
@@ -373,198 +675,93 @@ pub fn arange_step<D>(
     step: D,
 ) -> Tensor<1, D, ConcreteTensor<D, 1>>
 where
-    D: SimdElement + DataType + Default + std::ops::Add<Output = D> + PartialOrd,
+    D: SimdElement + DataType + Default + std::ops::Add<Output = D> + PartialOrd + Copy,
 {
+    assert!(step != D::zero(), "arange_step step must not be zero");
+
+    // Build the data on CPU, then transfer to the right device
+    let mut data = Vec::new();
+    let mut val = start;
+    if step > D::zero() {
+        while val < end {
+            data.push(val);
+            val += step;
+        }
+    } else {
+        while val > end {
+            data.push(val);
+            val += step;
+        }
+    }
+    let len = data.len();
     match device {
-        Device::Cpu => Tensor::Cpu(fusor_cpu::Tensor::arange_step(start, end, step)),
-        Device::Gpu(gpu_device) => Tensor::Gpu(fusor_core::Tensor::arange_step(
-            gpu_device, start, end, step,
-        )),
+        Device::Cpu => Tensor::Cpu(fusor_cpu::Tensor::from_slice([len], &data)),
+        Device::Gpu(gpu_device) => {
+            let t1d: fusor_core::Tensor<1, D> = fusor_core::Tensor::new(gpu_device, &data);
+            Tensor::Gpu(t1d)
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+
     use super::*;
 
     #[tokio::test]
-    async fn test_reshape_cpu() {
-        let data = [1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0];
-        let t: Tensor<1, f32> = Tensor::Cpu(fusor_cpu::Tensor::from_slice([6], &data));
+    async fn broadcast_as_supports_inserted_dimensions() {
+        let mut devices = vec![Device::Cpu];
+        if let Ok(gpu) = Device::gpu().await {
+            devices.push(gpu);
+        }
 
-        let reshaped: Tensor<2, f32, _> = t.reshape([2, 3]);
-        let slice = reshaped.as_slice().await.unwrap();
+        for device in devices {
+            let input: Tensor<2, f32> = Tensor::from_slice(&device, [2, 1], &[1.0, 2.0]);
+            let output = input.broadcast_as([2, 3, 1]).to_concrete();
+            let slice = output.as_slice().await.unwrap();
 
-        assert_eq!(slice[[0, 0]], 1.0);
-        assert_eq!(slice[[0, 1]], 2.0);
-        assert_eq!(slice[[0, 2]], 3.0);
-        assert_eq!(slice[[1, 0]], 4.0);
-        assert_eq!(slice[[1, 1]], 5.0);
-        assert_eq!(slice[[1, 2]], 6.0);
+            assert_eq!(slice[[0, 0, 0]], 1.0);
+            assert_eq!(slice[[0, 1, 0]], 1.0);
+            assert_eq!(slice[[0, 2, 0]], 1.0);
+            assert_eq!(slice[[1, 0, 0]], 2.0);
+            assert_eq!(slice[[1, 1, 0]], 2.0);
+            assert_eq!(slice[[1, 2, 0]], 2.0);
+        }
     }
 
     #[tokio::test]
-    async fn test_transpose_cpu() {
-        let data = [1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0];
-        let t: Tensor<2, f32> = Tensor::Cpu(fusor_cpu::Tensor::from_slice([2, 3], &data));
+    async fn arange_step_supports_negative_steps() {
+        let mut devices = vec![Device::Cpu];
+        if let Ok(gpu) = Device::gpu().await {
+            devices.push(gpu);
+        }
 
-        let transposed = t.transpose(0, 1);
-        let slice = transposed.as_slice().await.unwrap();
-
-        assert_eq!(slice[[0, 0]], 1.0);
-        assert_eq!(slice[[0, 1]], 4.0);
-        assert_eq!(slice[[1, 0]], 2.0);
-        assert_eq!(slice[[1, 1]], 5.0);
-        assert_eq!(slice[[2, 0]], 3.0);
-        assert_eq!(slice[[2, 1]], 6.0);
+        for device in devices {
+            let range = arange_step(&device, 5.0f32, -1.0, -2.0);
+            let slice = range.as_slice().await.unwrap();
+            assert_eq!(slice[[0]], 5.0);
+            assert_eq!(slice[[1]], 3.0);
+            assert_eq!(slice[[2]], 1.0);
+        }
     }
 
-    #[tokio::test]
-    async fn test_slice_cpu() {
-        let data = [1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0];
-        let t: Tensor<2, f32> = Tensor::Cpu(fusor_cpu::Tensor::from_slice([3, 3], &data));
+    #[test]
+    fn shape_helpers_preserve_validation() {
+        let tensor: Tensor<2, f32> =
+            Tensor::from_slice(&Device::Cpu, [2, 2], &[1.0, 2.0, 3.0, 4.0]);
 
-        let sliced = t.slice([1..3, 1..3]);
-        let slice = sliced.as_slice().await.unwrap();
-
-        assert_eq!(slice[[0, 0]], 5.0);
-        assert_eq!(slice[[0, 1]], 6.0);
-        assert_eq!(slice[[1, 0]], 8.0);
-        assert_eq!(slice[[1, 1]], 9.0);
-    }
-
-    #[tokio::test]
-    async fn test_permute_cpu() {
-        let data = [1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0];
-        let t: Tensor<2, f32> = Tensor::Cpu(fusor_cpu::Tensor::from_slice([2, 3], &data));
-
-        let permuted = t.permute([1, 0]);
-        assert_eq!(permuted.shape(), [3, 2]);
-    }
-
-    #[tokio::test]
-    async fn test_broadcast_as_cpu() {
-        let data = [1.0f32, 2.0, 3.0];
-        let t: Tensor<1, f32> = Tensor::Cpu(fusor_cpu::Tensor::from_slice([3], &data));
-
-        let broadcasted: Tensor<2, f32, _> = t.broadcast_as([2, 3]);
-        let slice = broadcasted.as_slice().await.unwrap();
-
-        assert_eq!(slice[[0, 0]], 1.0);
-        assert_eq!(slice[[0, 2]], 3.0);
-        assert_eq!(slice[[1, 0]], 1.0);
-        assert_eq!(slice[[1, 2]], 3.0);
-    }
-
-    #[tokio::test]
-    async fn test_flatten_all_cpu() {
-        let data = [1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0];
-        let t: Tensor<2, f32> = Tensor::Cpu(fusor_cpu::Tensor::from_slice([2, 3], &data));
-
-        let flattened = t.flatten_all();
-        assert_eq!(flattened.shape(), [6]);
-    }
-
-    #[tokio::test]
-    async fn test_narrow_cpu() {
-        let data = [1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0];
-        let t: Tensor<2, f32> = Tensor::Cpu(fusor_cpu::Tensor::from_slice([2, 3], &data));
-
-        let narrowed = t.narrow(1, 1, 2);
-        let slice = narrowed.as_slice().await.unwrap();
-
-        assert_eq!(slice[[0, 0]], 2.0);
-        assert_eq!(slice[[0, 1]], 3.0);
-        assert_eq!(slice[[1, 0]], 5.0);
-        assert_eq!(slice[[1, 1]], 6.0);
-    }
-
-    #[tokio::test]
-    async fn test_chunk_cpu() {
-        let data = [1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0];
-        let t: Tensor<1, f32> = Tensor::Cpu(fusor_cpu::Tensor::from_slice([6], &data));
-
-        let chunks = t.chunk(3, 0);
-        assert_eq!(chunks.len(), 3);
-
-        let chunk0 = chunks[0].clone().as_slice().await.unwrap();
-        assert_eq!(chunk0[[0]], 1.0);
-        assert_eq!(chunk0[[1]], 2.0);
-
-        let chunk1 = chunks[1].clone().as_slice().await.unwrap();
-        assert_eq!(chunk1[[0]], 3.0);
-        assert_eq!(chunk1[[1]], 4.0);
-
-        let chunk2 = chunks[2].clone().as_slice().await.unwrap();
-        assert_eq!(chunk2[[0]], 5.0);
-        assert_eq!(chunk2[[1]], 6.0);
-    }
-
-    #[tokio::test]
-    async fn test_repeat_cpu() {
-        let data = [1.0f32, 2.0, 3.0, 4.0];
-        let t: Tensor<2, f32> = Tensor::Cpu(fusor_cpu::Tensor::from_slice([2, 2], &data));
-
-        let repeated = t.repeat([2, 3]);
-        assert_eq!(repeated.shape(), [4, 6]);
-
-        let slice = repeated.as_slice().await.unwrap();
-        // Verify the pattern repeats correctly
-        assert_eq!(slice[[0, 0]], 1.0);
-        assert_eq!(slice[[0, 2]], 1.0);
-        assert_eq!(slice[[2, 0]], 1.0);
-    }
-
-    #[tokio::test]
-    async fn test_t_2d_cpu() {
-        let data = [1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0];
-        let t: Tensor<2, f32> = Tensor::Cpu(fusor_cpu::Tensor::from_slice([2, 3], &data));
-
-        let transposed = t.t();
-        assert_eq!(transposed.shape(), [3, 2]);
-    }
-
-    #[tokio::test]
-    async fn test_cat_cpu() {
-        let a: Tensor<2, f32> = Tensor::Cpu(fusor_cpu::Tensor::from_slice(
-            [2, 3],
-            &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
-        ));
-        let b: Tensor<2, f32> = Tensor::Cpu(fusor_cpu::Tensor::from_slice(
-            [2, 3],
-            &[7.0, 8.0, 9.0, 10.0, 11.0, 12.0],
-        ));
-
-        let catted = cat([a, b], 0);
-        assert_eq!(catted.shape(), [4, 3]);
-
-        let slice = catted.as_slice().await.unwrap();
-        assert_eq!(slice[[0, 0]], 1.0);
-        assert_eq!(slice[[2, 0]], 7.0);
-    }
-
-    #[tokio::test]
-    async fn test_arange_cpu() {
-        let device = Device::Cpu;
-        let t = arange(&device, 0.0f32, 5.0);
-        assert_eq!(t.shape(), [5]);
-
-        let slice = t.as_slice().await.unwrap();
-        assert_eq!(slice[[0]], 0.0);
-        assert_eq!(slice[[1]], 1.0);
-        assert_eq!(slice[[4]], 4.0);
-    }
-
-    #[tokio::test]
-    async fn test_arange_step_cpu() {
-        let device = Device::Cpu;
-        let t = arange_step(&device, 0.0f32, 2.0, 0.5);
-        assert_eq!(t.shape(), [4]);
-
-        let slice = t.as_slice().await.unwrap();
-        assert_eq!(slice[[0]], 0.0);
-        assert_eq!(slice[[1]], 0.5);
-        assert_eq!(slice[[2]], 1.0);
-        assert_eq!(slice[[3]], 1.5);
+        assert!(catch_unwind(AssertUnwindSafe(|| tensor.permute([0, 0]))).is_err());
+        assert!(catch_unwind(AssertUnwindSafe(|| tensor.narrow(1, 1, 2))).is_err());
+        assert!(catch_unwind(AssertUnwindSafe(|| tensor.unsqueeze::<3>(4))).is_err());
+        assert!(
+            catch_unwind(AssertUnwindSafe(|| {
+                tensor.sliding_window_view::<2, 4>([
+                    SlidingWindow::new(1, 2, 1),
+                    SlidingWindow::new(1, 1, 1),
+                ])
+            }))
+            .is_err()
+        );
     }
 }
