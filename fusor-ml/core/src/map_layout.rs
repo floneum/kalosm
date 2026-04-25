@@ -66,6 +66,14 @@ impl Operation for MapLayoutOperation {
     fn name(&self) -> String {
         "map_layout".to_string()
     }
+
+    fn build_tensor_ir(
+        &self,
+        _nodes: &crate::compute_graph::ComputeGraphInner,
+        _inputs: &[crate::mir::inputs::MirValue],
+    ) -> Result<crate::mir::operation::TensorIrLowering, String> {
+        Err("map_layout is resolved as a metadata-only layout view".to_string())
+    }
 }
 
 impl<const R: usize, T: DataType> Tensor<R, T> {

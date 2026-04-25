@@ -7,7 +7,6 @@ use wgpu::CommandEncoder;
 
 use crate::{
     mir::{inputs::MirValue, operation::Operation},
-    quantized::matmul::QMatMulOperation,
     tensor::TensorData,
 };
 
@@ -261,13 +260,6 @@ impl Resolver {
             ComputeGraphNodeVariant::MapLayout(op) => Some(Arc::new(op.clone())),
             ComputeGraphNodeVariant::Resize(op) => Some(Arc::new(op.clone())),
             ComputeGraphNodeVariant::SliceAssign(op) => Some(Arc::new(op.clone())),
-            ComputeGraphNodeVariant::QMatMul(op) => Some(Arc::new(QMatMulOperation::new(
-                op.input_datatype,
-                &op.in_shape,
-                op.input,
-                op.matrix.clone(),
-            ))),
-            ComputeGraphNodeVariant::Dequantize(op) => Some(Arc::new(op.clone())),
             ComputeGraphNodeVariant::Tensor(_) => None,
             ComputeGraphNodeVariant::Custom(op) => Some(op.clone()),
         }

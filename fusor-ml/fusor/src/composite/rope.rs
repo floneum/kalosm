@@ -110,7 +110,7 @@ where
     /// Apply fused interleaved RoPE (rotary position embedding).
     /// This pairs adjacent elements: (0, 1), (2, 3), etc.
     ///
-    /// On GPU, this uses an optimized fused kernel. On CPU, it delegates to `rope_interleaved`.
+    /// Uses a fused tensor_ir expression on GPU and composite tensor ops on CPU.
     pub fn rope_fused(
         &self,
         cos: &Tensor<2, D, ConcreteTensor<D, 2>>,
@@ -122,11 +122,9 @@ where
         let sin_narrow: Tensor<2, D, ConcreteTensor<D, 2>> =
             sin.narrow(0, 0, sequence_length).to_concrete();
         match (self, &cos_narrow, &sin_narrow) {
-            // GPU path - use the optimized fused kernel
             (Tensor::Gpu(x), Tensor::Gpu(cos), Tensor::Gpu(sin)) => {
                 Tensor::Gpu(x.rope_fused(cos, sin))
             }
-            // CPU path - use composite operations
             (Tensor::Cpu(_), Tensor::Cpu(_), Tensor::Cpu(_)) => {
                 self.rope_interleaved(&cos_narrow, &sin_narrow)
             }
@@ -137,7 +135,7 @@ where
     /// Apply fused normal RoPE (rotary position embedding).
     /// This pairs first half with second half: (0, head_dim/2), (1, head_dim/2+1), etc.
     ///
-    /// On GPU, this uses an optimized fused kernel. On CPU, it delegates to `rope`.
+    /// Uses a fused tensor_ir expression on GPU and composite tensor ops on CPU.
     pub fn rope_normal_fused(
         &self,
         cos: &Tensor<2, D, ConcreteTensor<D, 2>>,
@@ -149,11 +147,9 @@ where
         let sin_narrow: Tensor<2, D, ConcreteTensor<D, 2>> =
             sin.narrow(0, 0, sequence_length).to_concrete();
         match (self, &cos_narrow, &sin_narrow) {
-            // GPU path - use the optimized fused kernel
             (Tensor::Gpu(x), Tensor::Gpu(cos), Tensor::Gpu(sin)) => {
                 Tensor::Gpu(x.rope_normal_fused(cos, sin))
             }
-            // CPU path - use composite operations
             (Tensor::Cpu(_), Tensor::Cpu(_), Tensor::Cpu(_)) => self.rope(&cos_narrow, &sin_narrow),
             _ => panic!("All tensors must be on the same device"),
         }

@@ -5,8 +5,8 @@ use crate::applier::SimpleEclassSearcher;
 use crate::language::{DispatchNode, HighLevelNode, SimdNode, TensorIr, add_list, extract_list};
 use crate::rules::RunnerConfig;
 use crate::types::{
-    BinaryOp, BufferRef, Dim, IndexLevel, LoweringOptions, MemTier, ReduceOp, ScalarValue, Shape,
-    TernaryOp, VarRef,
+    BinaryOp, BufferRef, DType, Dim, IndexLevel, LoweringOptions, MemTier, ReduceOp, ScalarValue,
+    Shape, TernaryOp, VarRef,
 };
 use crate::unroll::unroll_fold_direct;
 
@@ -21,6 +21,16 @@ const fn cooperative_reduce_unroll(lowering: &LoweringOptions) -> u32 {
         COOPERATIVE_REDUCE_UNROLL
     } else {
         1
+    }
+}
+
+fn reduce_identity(op: ReduceOp, dtype: DType) -> ScalarValue {
+    match dtype {
+        DType::F16 => ScalarValue::F16(ordered_float::OrderedFloat(op.identity_f16())),
+        DType::F32 => ScalarValue::F32(ordered_float::OrderedFloat(op.identity_f32())),
+        DType::U32 => ScalarValue::U32(op.identity_u32()),
+        DType::I32 => ScalarValue::I32(op.identity_i32()),
+        DType::Bool => ScalarValue::Bool(false),
     }
 }
 
@@ -326,7 +336,8 @@ impl crate::applier::TypedApplier for ReduceApplier {
             return vec![];
         }
 
-        let identity = ScalarValue::F32(ordered_float::OrderedFloat(op.identity_f32()));
+        let input_dtype = egraph[expr].data.dtype.unwrap_or(DType::F32);
+        let identity = reduce_identity(op, input_dtype);
         let init = egraph.add(TensorIr::Const(identity));
         let mut results = vec![];
         let wg = egraph.add(TensorIr::Simd(SimdNode::Var(VarRef::thread(

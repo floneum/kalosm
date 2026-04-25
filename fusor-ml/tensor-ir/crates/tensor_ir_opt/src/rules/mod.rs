@@ -152,6 +152,7 @@ pub fn saturate_phases_reported(
     for phase in phases {
         egraph.rebuild();
         let rules = phase_rules(*phase, config);
+        let rule_count = rules.len();
         let span = tracing::info_span!(
             "saturate_phase",
             phase = ?phase,
@@ -190,7 +191,7 @@ pub fn saturate_phases_reported(
 
         report.phases.push(SaturationPhaseReport {
             phase: *phase,
-            rule_count: rules.len(),
+            rule_count,
             iter_limit: config.iter_limit,
             node_limit: config.node_limit,
             time_limit_secs: config.time_limit_secs,

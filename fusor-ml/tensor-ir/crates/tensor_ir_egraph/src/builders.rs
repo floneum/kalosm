@@ -80,6 +80,36 @@ impl IrBuilder {
         }))
     }
 
+    pub fn slice_assign(
+        &mut self,
+        input: Id,
+        value: Id,
+        output_shape: Shape,
+        slices: Vec<(u32, u32)>,
+    ) -> Id {
+        self.add(TensorIr::HighLevel(HighLevelNode::SliceAssign {
+            output_shape,
+            slices,
+            children: [input, value],
+        }))
+    }
+
+    pub fn index_select(&mut self, input: Id, indices: Id, output_shape: Shape, axis: u32) -> Id {
+        self.add(TensorIr::HighLevel(HighLevelNode::IndexSelect {
+            output_shape,
+            axis,
+            children: [input, indices],
+        }))
+    }
+
+    pub fn resize(&mut self, input: Id, input_shape: Shape, output_shape: Shape) -> Id {
+        self.add(TensorIr::HighLevel(HighLevelNode::Resize {
+            input_shape,
+            output_shape,
+            expr: input,
+        }))
+    }
+
     pub fn reduce(&mut self, expr: Id, axis: u32, op: ReduceOp) -> Id {
         self.add(TensorIr::HighLevel(HighLevelNode::Reduce {
             axis,
@@ -123,6 +153,18 @@ impl IrBuilder {
 
     pub fn scalar_arg(&mut self, i: u32) -> Id {
         self.add(TensorIr::HighLevel(HighLevelNode::Param(i)))
+    }
+
+    pub fn scalar_index(&mut self, i: u32) -> Id {
+        self.add(TensorIr::HighLevel(HighLevelNode::Index(i)))
+    }
+
+    pub fn indexed_arg(&mut self, i: u32, indices: &[Id]) -> Id {
+        let children_list = self.list(indices);
+        self.add(TensorIr::HighLevel(HighLevelNode::IndexedParam {
+            index: i,
+            children_list,
+        }))
     }
 
     pub fn bin_op(&mut self, op: BinaryOp, lhs: Id, rhs: Id) -> Id {
@@ -256,8 +298,11 @@ impl IrBuilder {
         let arg0 = self.scalar_arg(0);
         let arg1 = self.scalar_arg(1);
         let sub_body = self.bin_op(BinaryOp::Sub, arg0, arg1);
-        let mut broadcast_strides = vec![1i64; shape.rank()];
-        broadcast_strides[axis as usize] = 0;
+        let reduced_shape = shape.remove_axis(axis as usize);
+        let mut broadcast_strides = Strides::row_major_for_shape(&reduced_shape)
+            .map(|strides| strides.0)
+            .unwrap_or_else(|| vec![1i64; reduced_shape.rank()]);
+        broadcast_strides.insert(axis as usize, 0);
         let max_broadcast =
             self.restride(max_val, shape.clone(), Strides(broadcast_strides.clone()));
         let shifted = self.elementwise(shape.clone(), &[x, max_broadcast], sub_body);

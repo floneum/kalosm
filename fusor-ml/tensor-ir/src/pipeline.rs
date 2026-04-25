@@ -501,18 +501,18 @@ fn validate_tensor_expr_lowering_contract(
     if summary.output_shape.is_none() {
         return Err("backend lowering requires a tensor-shaped output".into());
     }
-    if summary.dtype != Some(DType::F32) {
+    if !matches!(summary.dtype, Some(DType::F16 | DType::F32 | DType::U32)) {
         return Err(format!(
-            "Naga backend currently supports only f32 tensor outputs, found {:?}",
+            "Naga backend currently supports f16/f32/u32 tensor outputs, found {:?}",
             summary.dtype
         ));
     }
     for (idx, node) in expr.nodes().iter().enumerate() {
         if let TensorExprNode::Input { dtype, .. } = node
-            && *dtype != DType::F32
+            && !matches!(dtype, DType::F16 | DType::F32 | DType::U32)
         {
             return Err(format!(
-                "Naga backend currently supports only f32 tensor inputs; input node {idx} has {dtype}"
+                "Naga backend currently supports f16/f32/u32 tensor inputs; input node {idx} has {dtype}"
             ));
         }
     }
@@ -569,6 +569,9 @@ fn validate_kernel_expr(expr: &RecExpr<TensorIr>) -> Result<(), String> {
             TensorIr::HighLevel(
                 HighLevelNode::Restride { .. }
                     | HighLevelNode::Elementwise { .. }
+                    | HighLevelNode::Resize { .. }
+                    | HighLevelNode::IndexSelect { .. }
+                    | HighLevelNode::SliceAssign { .. }
                     | HighLevelNode::Reduce { .. }
             )
         ) {

@@ -201,6 +201,33 @@ async fn matmul_attention_4d_matches_host_reference() {
 }
 
 #[tokio::test]
+async fn matmul_attention_batched_skinny_m_4d_matches_host_reference() {
+    use fusor_conformance::available_devices;
+    const LHS_SHAPE: [usize; 4] = [2, 4, 1, 16];
+    const RHS_SHAPE: [usize; 4] = [2, 4, 16, 8];
+
+    let lhs_data = (0..LHS_SHAPE.iter().product::<usize>())
+        .map(|i| (((i % 19) as f32) - 9.0) * 0.07)
+        .collect::<Vec<_>>();
+    let rhs_data = (0..RHS_SHAPE.iter().product::<usize>())
+        .map(|i| (((i % 23) as f32) - 11.0) * 0.05)
+        .collect::<Vec<_>>();
+
+    let cpu_lhs = Tensor::from_slice(&Device::Cpu, LHS_SHAPE, &lhs_data);
+    let cpu_rhs = Tensor::from_slice(&Device::Cpu, RHS_SHAPE, &rhs_data);
+    let expected = cpu_lhs.matmul(&cpu_rhs).to_concrete();
+
+    for device in available_devices().await {
+        let lhs = Tensor::from_slice(&device, LHS_SHAPE, &lhs_data);
+        let rhs = Tensor::from_slice(&device, RHS_SHAPE, &rhs_data);
+        let actual = lhs.matmul(&rhs).to_concrete();
+        fusor_conformance::approx_eq(&actual, &expected, 1e-3)
+            .await
+            .unwrap();
+    }
+}
+
+#[tokio::test]
 async fn matmul_sgemv_variants_match_host_reference() {
     // [M, K] @ [K, 1] -> [M, 1] : single-output gemv
     let gen_mat = FuzzGenerator::<2, f32>::new([8, 12])

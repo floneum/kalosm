@@ -1,11 +1,13 @@
 use std::{collections::HashMap, sync::Arc};
 
 use tensor_ir::{
-    DispatchProgram, StageConfig, StagedPipeline, TensorExprProgram, TensorIr, lower_to_wgsl,
+    DType, DispatchProgram, StageConfig, StagedPipeline, TensorExprProgram, TensorIr, lower_to_wgsl,
 };
 use wgpu::{Buffer, CommandEncoder, ComputePipeline};
 
 use crate::{DataTypeEnum, Device, TensorData};
+
+const MAX_DISPATCH_WORKGROUPS_PER_DIMENSION: u32 = 65_535;
 
 pub(crate) fn device_profile(device: &Device) -> tensor_ir::DeviceProfile {
     let limits = device.limits();
@@ -17,7 +19,10 @@ pub(crate) fn device_profile(device: &Device) -> tensor_ir::DeviceProfile {
     tensor_ir::DeviceProfile {
         simd_width,
         max_threadgroup_bytes: limits.max_compute_workgroup_storage_size,
-        max_registers_per_lane: 128,
+        // Keep Fusor on single-output dispatches until tensor_ir's generic
+        // register blocking handles batched contractions with broadcasted
+        // operands soundly.
+        max_registers_per_lane: 1,
         max_simdgroups,
         max_workgroup_size: limits.max_compute_invocations_per_workgroup,
     }
@@ -31,22 +36,18 @@ pub(crate) fn execute(
     output_datatype: DataTypeEnum,
     command_encoder: &mut CommandEncoder,
 ) -> Result<TensorData, String> {
-    if output_datatype != DataTypeEnum::F32 {
-        return Err(format!(
-            "tensor_ir runtime currently requires f32 outputs, got {output_datatype}"
-        ));
-    }
-    if inputs
-        .iter()
-        .any(|input| input.datatype() != DataTypeEnum::F32)
-    {
-        return Err("tensor_ir runtime currently requires f32 tensor inputs".to_string());
+    ensure_device_supports_dtype(device, output_datatype)?;
+    for input in inputs {
+        ensure_device_supports_dtype(device, input.datatype())?;
     }
 
     let mut config = StageConfig::default();
     config.runner.device = device_profile(device);
+    config.runner.iter_limit = 10;
+    config.runner.node_limit = 50_000;
+    config.runner.time_limit_secs = 30;
     let pipeline = StagedPipeline::new(config);
-    let kernel = pipeline.lower_with_report(expr).map_err(|error| {
+    let kernel = lower_with_report(&pipeline, expr).map_err(|error| {
         let extraction = error
             .report
             .extraction
@@ -57,7 +58,17 @@ pub(crate) fn execute(
     })?;
     let simd = pipeline.compile(kernel.0)?;
     let program = simd.dispatch_program();
-
+    let final_dispatch_index = program
+        .dispatches
+        .len()
+        .checked_sub(1)
+        .ok_or_else(|| "tensor_ir program produced no dispatches".to_string())?;
+    let final_datatype = dispatch_output_datatype(program, final_dispatch_index)?;
+    if final_datatype != output_datatype {
+        return Err(format!(
+            "tensor_ir output dtype mismatch: program produced {final_datatype}, caller expected {output_datatype}"
+        ));
+    }
     let wgsl = lower_to_wgsl(program)?;
     let shader = device.create_shader_module(wgsl);
 
@@ -77,6 +88,7 @@ pub(crate) fn execute(
                     cache: None,
                 });
 
+        let dispatch_datatype = dispatch_output_datatype(program, dispatch_index)?;
         let output_buffer = if dispatch_index + 1 == program.dispatches.len() {
             let required_elems =
                 (dispatch.workgroups * program.device.simd_width) as usize * dispatch.outputs.len();
@@ -87,7 +99,7 @@ pub(crate) fn execute(
         } else {
             let output_elems =
                 (dispatch.workgroups * program.device.simd_width) as usize * dispatch.outputs.len();
-            TensorData::new_for_shape(device, &[output_elems], output_datatype)
+            TensorData::new_for_shape(device, &[output_elems], dispatch_datatype)
                 .buffer()
                 .clone()
         };
@@ -110,7 +122,8 @@ pub(crate) fn execute(
             pass.set_pipeline(&pipeline);
             pass.set_bind_group(0, &bind_group, &[]);
             let physical_workgroups = dispatch.workgroups / dispatch.simdgroups.max(1);
-            pass.dispatch_workgroups(physical_workgroups, 1, 1);
+            let (x, y, z) = dispatch_grid(physical_workgroups);
+            pass.dispatch_workgroups(x, y, z);
         }
 
         produced_buffers.insert(
@@ -130,6 +143,87 @@ pub(crate) fn execute(
         output_shape,
         output_datatype,
     ))
+}
+
+fn dispatch_grid(physical_workgroups: u32) -> (u32, u32, u32) {
+    if physical_workgroups <= MAX_DISPATCH_WORKGROUPS_PER_DIMENSION {
+        return (physical_workgroups, 1, 1);
+    }
+
+    let y = physical_workgroups.div_ceil(MAX_DISPATCH_WORKGROUPS_PER_DIMENSION);
+    (MAX_DISPATCH_WORKGROUPS_PER_DIMENSION, y, 1)
+}
+
+fn ensure_device_supports_dtype(device: &Device, datatype: DataTypeEnum) -> Result<(), String> {
+    if datatype == DataTypeEnum::F16 && !device.f16_supported() {
+        return Err("tensor_ir runtime requires SHADER_F16 for f16 tensors".to_string());
+    }
+    Ok(())
+}
+
+fn dtype_to_datatype(dtype: DType) -> Result<DataTypeEnum, String> {
+    match dtype {
+        DType::F16 => Ok(DataTypeEnum::F16),
+        DType::F32 => Ok(DataTypeEnum::F32),
+        DType::U32 => Ok(DataTypeEnum::U32),
+        DType::I32 | DType::Bool => Err(format!(
+            "fusor tensor_ir runtime cannot materialize {dtype} tensors"
+        )),
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn lower_with_report(
+    pipeline: &StagedPipeline,
+    expr: &TensorExprProgram,
+) -> Result<(tensor_ir::KernelProgram, tensor_ir::LoweringReport), tensor_ir::LoweringError> {
+    let pipeline = pipeline.clone();
+    let expr = expr.clone();
+    let expr_nodes = expr.nodes().len();
+    std::thread::Builder::new()
+        .name("fusor-tensor-ir-lowering".to_string())
+        .stack_size(128 * 1024 * 1024)
+        .spawn(move || pipeline.lower_with_report(&expr))
+        .map_err(|error| {
+            tensor_ir::LoweringError::new(
+                format!("failed to spawn tensor_ir lowering thread: {error}"),
+                tensor_ir::LoweringReport::new(expr_nodes),
+            )
+        })?
+        .join()
+        .map_err(|_| {
+            tensor_ir::LoweringError::new(
+                "tensor_ir lowering thread panicked".to_string(),
+                tensor_ir::LoweringReport::new(expr_nodes),
+            )
+        })?
+}
+
+#[cfg(target_arch = "wasm32")]
+fn lower_with_report(
+    pipeline: &StagedPipeline,
+    expr: &TensorExprProgram,
+) -> Result<(tensor_ir::KernelProgram, tensor_ir::LoweringReport), tensor_ir::LoweringError> {
+    pipeline.lower_with_report(expr)
+}
+
+fn dispatch_output_datatype(
+    program: &DispatchProgram,
+    dispatch_index: usize,
+) -> Result<DataTypeEnum, String> {
+    let dispatch = &program.dispatches[dispatch_index];
+    let dtype = program.egraph[program.egraph.find(dispatch.semantic_output_id)]
+        .data
+        .dtype
+        .or_else(|| {
+            dispatch.outputs.first().and_then(|output| {
+                program.egraph[program.egraph.find(output.value_id)]
+                    .data
+                    .dtype
+            })
+        })
+        .unwrap_or(DType::F32);
+    dtype_to_datatype(dtype)
 }
 
 fn create_bind_group(

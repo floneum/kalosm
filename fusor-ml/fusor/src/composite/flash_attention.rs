@@ -56,20 +56,7 @@ where
         scale: f32,
         mask: Option<(&Tensor<2, D, ConcreteTensor<D, 2>>, MaskKind)>,
     ) -> Self {
-        match (self, k, v) {
-            // GPU path - use the optimized fused kernel (QKMask only)
-            (Tensor::Gpu(q), Tensor::Gpu(k), Tensor::Gpu(v))
-                if !matches!(mask, Some((_, MaskKind::BatchKeyMask))) =>
-            {
-                let gpu_mask = mask.map(|(m, _kind)| match m {
-                    Tensor::Gpu(mask) => mask,
-                    _ => panic!("Mask must be on the same device as other tensors"),
-                });
-                Tensor::Gpu(q.flash_attention(k, v, scale, gpu_mask))
-            }
-            // CPU path and GPU+BatchKeyMask fallback - use composite operations via Tensor methods
-            _ => self.flash_attention_composite_impl(k, v, scale, mask),
-        }
+        self.flash_attention_composite_impl(k, v, scale, mask)
     }
 
     /// Implementation of flash attention using Tensor composite operations.
@@ -179,21 +166,7 @@ where
             scores_scaled
         };
 
-        // Softmax along last dimension
-        // max(scores) for numerical stability
-        let scores_shape = scores_masked.shape();
-        let max_scores = scores_masked
-            .max_keepdim::<3>(3)
-            .broadcast_as(scores_shape)
-            .to_concrete();
-        let scores_shifted = scores_masked - max_scores;
-        // Materialize exp_scores since sum_keepdim is a reduction that needs concrete data
-        let exp_scores = scores_shifted.exp();
-        let sum_exp = exp_scores
-            .sum_keepdim::<3>(3)
-            .broadcast_as(scores_shape)
-            .to_concrete();
-        let attn_weights = exp_scores / sum_exp;
+        let attn_weights = scores_masked.softmax::<3>(3);
 
         // attn_weights @ V -> [batch, num_heads, q_seq_len, head_dim]
         attn_weights.mat_mul(&v_expanded)

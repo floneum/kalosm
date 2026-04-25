@@ -7,6 +7,7 @@ publish = false
 [dependencies]
 naga = { git = "https://github.com/ealmloff/wgpu", branch = "yield-now", features = ["wgsl-out", "msl-out"] }
 egg = "0.10.0"
+half = "2.4.1"
 tensor_ir_frontend = { path = "../tensor_ir_frontend" }
 tensor_ir_egraph = { path = "../tensor_ir_egraph" }
 tensor_ir_dispatch = { path = "../tensor_ir_dispatch" }

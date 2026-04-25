@@ -16,7 +16,7 @@ use fusor_types::Layout;
 
 use crate::expr::materialize_expr;
 use crate::reduce::{SimdReduceOp, SumOp};
-use crate::{ConcreteTensor, MAX_SIMD_LANES, ResolvedTensor, SimdElement, TensorBacking};
+use crate::{ConcreteTensor, MAX_SIMD_LANES, ResolvedTensor, SimdElement, Tensor, TensorBacking};
 
 /// A tensor storing quantized blocks.
 ///
@@ -357,6 +357,80 @@ impl<const R: usize> ConcreteTensor<f32, R> {
                     batch_indices[d] = 0;
                 }
             }
+        }
+
+        output
+    }
+}
+
+impl<const R: usize, T> Tensor<R, T>
+where
+    T: TensorBacking<R, Elem = f32>,
+{
+    /// Matrix multiplication against quantized weights while preserving lazy input layouts.
+    pub fn q_mat_mul<B: GgufBlock + Sync>(&self, rhs: &QuantizedTensor<B>) -> ConcreteTensor<f32, R>
+    where
+        B::Dequantized: AsRef<[f32]>,
+        B::ActivationBlock: Pod + Send + Sync,
+    {
+        const { assert!(R >= 2, "q_mat_mul requires at least 2 dimensions") };
+
+        let rhs_shape = rhs.element_shape();
+        assert_eq!(
+            rhs_shape.len(),
+            2,
+            "q_mat_mul requires 2D weight tensor, got {}D",
+            rhs_shape.len()
+        );
+
+        let lhs_shape = self.shape();
+        let m = lhs_shape[R - 2];
+        let k = lhs_shape[R - 1];
+        let n = rhs_shape[0];
+        let k2 = rhs_shape[1];
+
+        assert_eq!(
+            k, k2,
+            "Matrix dimension mismatch: lhs columns ({}) != weight in_features ({})",
+            k, k2
+        );
+
+        let mut out_shape = lhs_shape;
+        out_shape[R - 1] = n;
+        let mut output = ConcreteTensor::<f32, R>::zeros(out_shape);
+
+        let batch_size: usize = if R > 2 {
+            lhs_shape[..R - 2].iter().product()
+        } else {
+            1
+        };
+
+        let lhs_matrix_size = m * k;
+        let out_matrix_size = m * n;
+        let blocks_per_weight_row = k / B::BLOCK_SIZE;
+
+        for b in 0..batch_size {
+            let mut lhs_batch = vec![0.0f32; lhs_matrix_size];
+            let batch_base = b * lhs_matrix_size;
+            for i in 0..m {
+                for l in 0..k {
+                    let logical_idx = batch_base + i * k + l;
+                    lhs_batch[i * k + l] = self.inner().eval_scalar(logical_idx);
+                }
+            }
+
+            let out_slice = &mut output.data_mut()[b * out_matrix_size..(b + 1) * out_matrix_size];
+
+            pulp::Arch::new().dispatch(QMatmulSimd {
+                lhs_data: &lhs_batch,
+                rhs_blocks: rhs.blocks(),
+                out_data: out_slice,
+                m,
+                k,
+                n,
+                blocks_per_weight_row,
+                _phantom: std::marker::PhantomData::<B>,
+            });
         }
 
         output

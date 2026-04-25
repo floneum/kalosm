@@ -13,12 +13,51 @@ pub struct QMatrix {
     device: Device,
     shape: Box<[usize]>,
     buffer: Arc<wgpu::Buffer>,
+    dequantized_f32: Arc<wgpu::Buffer>,
     datatype: GgmlType,
 }
 
 impl PartialEq for QMatrix {
     fn eq(&self, other: &Self) -> bool {
-        self.shape == other.shape && self.datatype == other.datatype && self.buffer == other.buffer
+        self.shape == other.shape
+            && self.datatype == other.datatype
+            && self.buffer == other.buffer
+            && self.dequantized_f32 == other.dequantized_f32
+    }
+}
+
+fn dequantize_blocks<B>(bytes: &[u8]) -> Vec<f32>
+where
+    B: GgufBlock,
+    B::Dequantized: AsRef<[f32]>,
+{
+    bytemuck::cast_slice::<_, B>(bytes)
+        .iter()
+        .flat_map(|block| {
+            block
+                .dequantize()
+                .as_ref()
+                .iter()
+                .copied()
+                .collect::<Vec<_>>()
+        })
+        .collect()
+}
+
+fn dequantize_bytes_to_f32(bytes: &[u8], ty: GgmlType) -> Vec<f32> {
+    match ty {
+        GgmlType::Q4_0 => dequantize_blocks::<BlockQ4_0>(bytes),
+        GgmlType::Q5_0 => dequantize_blocks::<BlockQ5_0>(bytes),
+        GgmlType::Q8_0 => dequantize_blocks::<BlockQ8_0>(bytes),
+        GgmlType::Q4K => dequantize_blocks::<BlockQ4K>(bytes),
+        GgmlType::Q5K => dequantize_blocks::<BlockQ5K>(bytes),
+        GgmlType::Q6K => dequantize_blocks::<BlockQ6K>(bytes),
+        GgmlType::F16 => bytemuck::cast_slice::<_, half::f16>(bytes)
+            .iter()
+            .map(|value| value.to_f32())
+            .collect(),
+        GgmlType::F32 => bytemuck::cast_slice::<_, f32>(bytes).to_vec(),
+        _ => todo!(),
     }
 }
 
@@ -61,108 +100,16 @@ impl QMatrix {
         shape: Box<[usize]>,
         ty: GgmlType,
     ) -> Result<Self, GgufReadError> {
-        let use_f16 = device.f16_supported();
-        let bytes: Box<[u8]> = match ty {
-            GgmlType::Q4_0 => {
-                let map = if use_f16 {
-                    BlockQ4_0::into_wgsl_bytes
-                } else {
-                    BlockQ4_0::into_wgsl_bytes_f32
-                };
-                bytemuck::cast_slice::<_, BlockQ4_0>(bytes)
-                    .iter()
-                    .copied()
-                    .flat_map(map)
-                    .collect()
-            }
-            GgmlType::Q5_0 => {
-                let map = if use_f16 {
-                    BlockQ5_0::into_wgsl_bytes
-                } else {
-                    BlockQ5_0::into_wgsl_bytes_f32
-                };
-                bytemuck::cast_slice::<_, BlockQ5_0>(bytes)
-                    .iter()
-                    .copied()
-                    .flat_map(map)
-                    .collect()
-            }
-            GgmlType::Q8_0 => {
-                let map = if use_f16 {
-                    BlockQ8_0::into_wgsl_bytes
-                } else {
-                    BlockQ8_0::into_wgsl_bytes_f32
-                };
-                bytemuck::cast_slice::<_, BlockQ8_0>(bytes)
-                    .iter()
-                    .copied()
-                    .flat_map(map)
-                    .collect()
-            }
-            GgmlType::Q4K => {
-                let slice = bytemuck::cast_slice::<_, BlockQ4K>(bytes);
-                if use_f16 {
-                    slice
-                        .iter()
-                        .copied()
-                        .flat_map(BlockQ4K::into_wgsl_bytes)
-                        .collect()
-                } else {
-                    slice
-                        .iter()
-                        .copied()
-                        .flat_map(BlockQ4K::into_wgsl_bytes_f32)
-                        .collect()
-                }
-            }
-            GgmlType::Q5K => {
-                let slice = bytemuck::cast_slice::<_, BlockQ5K>(bytes);
-                if use_f16 {
-                    slice
-                        .iter()
-                        .copied()
-                        .flat_map(BlockQ5K::into_wgsl_bytes)
-                        .collect()
-                } else {
-                    slice
-                        .iter()
-                        .copied()
-                        .flat_map(BlockQ5K::into_wgsl_bytes_f32)
-                        .collect()
-                }
-            }
-            GgmlType::Q6K => {
-                let map = if use_f16 {
-                    BlockQ6K::into_wgsl_bytes
-                } else {
-                    BlockQ6K::into_wgsl_bytes_f32
-                };
-                bytemuck::cast_slice::<_, BlockQ6K>(bytes)
-                    .iter()
-                    .copied()
-                    .flat_map(map)
-                    .collect()
-            }
-            GgmlType::F16 => {
-                if use_f16 {
-                    bytes.into()
-                } else {
-                    bytemuck::cast_slice::<_, half::f16>(bytes)
-                        .iter()
-                        .flat_map(|f| f.to_f32().to_le_bytes())
-                        .collect()
-                }
-            }
-            GgmlType::F32 => bytes.into(),
-            _ => todo!(),
-        };
-        let datatype = if ty == GgmlType::F16 && !use_f16 {
-            GgmlType::F32
-        } else {
-            ty
-        };
+        let dequantized = dequantize_bytes_to_f32(bytes, ty);
+        assert_eq!(dequantized.len(), shape.iter().product::<usize>());
+        let dequantized_f32 = device.create_buffer_init(
+            bytemuck::cast_slice(&dequantized),
+            wgpu::BufferUsages::STORAGE
+                | wgpu::BufferUsages::COPY_SRC
+                | wgpu::BufferUsages::COPY_DST,
+        );
         let buffer = device.create_buffer_init(
-            &bytes,
+            bytes,
             wgpu::BufferUsages::STORAGE
                 | wgpu::BufferUsages::COPY_SRC
                 | wgpu::BufferUsages::COPY_DST,
@@ -172,7 +119,8 @@ impl QMatrix {
             device: device.clone(),
             shape,
             buffer,
-            datatype,
+            dequantized_f32,
+            datatype: ty,
         })
     }
 
@@ -186,5 +134,9 @@ impl QMatrix {
 
     pub fn datatype(&self) -> GgmlType {
         self.datatype
+    }
+
+    pub(crate) fn dequantized_f32_buffer(&self) -> Arc<wgpu::Buffer> {
+        self.dequantized_f32.clone()
     }
 }

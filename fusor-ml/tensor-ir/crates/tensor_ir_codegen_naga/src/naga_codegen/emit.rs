@@ -16,10 +16,10 @@ impl CodegenCtx<'_> {
         let lane = self.lower_expr(lane_id);
 
         // Allocate result expression first.
-        let result = self.expressions.append(
-            Expression::SubgroupOperationResult { ty: self.types.f32 },
-            Span::UNDEFINED,
-        );
+        let ty = self.infer_expr_type(src_id);
+        let result = self
+            .expressions
+            .append(Expression::SubgroupOperationResult { ty }, Span::UNDEFINED);
 
         self.body.push(
             Statement::SubgroupGather {
@@ -43,10 +43,10 @@ impl CodegenCtx<'_> {
             ReduceOp::Min => SubgroupOperation::Min,
         };
 
-        let result = self.expressions.append(
-            Expression::SubgroupOperationResult { ty: self.types.f32 },
-            Span::UNDEFINED,
-        );
+        let ty = self.infer_expr_type(src_id);
+        let result = self
+            .expressions
+            .append(Expression::SubgroupOperationResult { ty }, Span::UNDEFINED);
 
         self.body.push(
             Statement::SubgroupCollectiveOperation {

@@ -1,6 +1,8 @@
 use std::{cmp::Reverse, collections::HashMap};
 
-use crate::types::{BinaryOp, DType, ReduceOp, ScalarValue, Shape, Strides, TernaryOp, UnaryOp};
+use crate::types::{
+    BinaryOp, DType, Dim, ReduceOp, ScalarValue, Shape, Strides, TernaryOp, UnaryOp,
+};
 
 /// Stable identifier for a node in a `TensorExprProgram`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -34,23 +36,46 @@ pub enum TensorExprNode {
         inputs: Vec<ExprId>,
         body: ExprId,
     },
+    SliceAssign {
+        input: ExprId,
+        value: ExprId,
+        output_shape: Shape,
+        slices: Vec<(u32, u32)>,
+    },
+    IndexSelect {
+        input: ExprId,
+        indices: ExprId,
+        output_shape: Shape,
+        axis: u32,
+    },
+    Resize {
+        input: ExprId,
+        input_shape: Shape,
+        output_shape: Shape,
+    },
     Reduce {
         expr: ExprId,
         axis: u32,
         op: ReduceOp,
     },
-    BinOp(BinaryOp, [ExprId; 2]),
     UnOp(UnaryOp, ExprId),
+    BinOp(BinaryOp, [ExprId; 2]),
     TernOp(TernaryOp, [ExprId; 3]),
     Const(ScalarValue),
     Arg(u32),
+    Index(u32),
+    IndexedArg {
+        index: u32,
+        indices: Vec<ExprId>,
+    },
 }
 
 impl TensorExprNode {
     #[must_use]
     pub fn children(&self) -> Vec<ExprId> {
         match self {
-            Self::Input { .. } | Self::Const(_) | Self::Arg(_) => Vec::new(),
+            Self::Input { .. } | Self::Const(_) | Self::Arg(_) | Self::Index(_) => Vec::new(),
+            Self::IndexedArg { indices, .. } => indices.clone(),
             Self::Restride { expr, .. } | Self::UnOp(_, expr) | Self::Reduce { expr, .. } => {
                 vec![*expr]
             }
@@ -59,6 +84,9 @@ impl TensorExprNode {
                 children.push(*body);
                 children
             }
+            Self::SliceAssign { input, value, .. } => vec![*input, *value],
+            Self::IndexSelect { input, indices, .. } => vec![*input, *indices],
+            Self::Resize { input, .. } => vec![*input],
             Self::BinOp(_, children) => children.to_vec(),
             Self::TernOp(_, children) => children.to_vec(),
         }
@@ -121,6 +149,128 @@ impl TensorExprProgram {
                         "reduce node {idx} uses axis {axis} on rank-{} input",
                         shape.rank()
                     ));
+                }
+            }
+
+            if let TensorExprNode::SliceAssign {
+                value,
+                output_shape,
+                slices,
+                ..
+            } = node
+            {
+                if slices.len() != output_shape.rank() {
+                    return Err(format!(
+                        "slice assign node {idx} has {} slices for rank-{} output",
+                        slices.len(),
+                        output_shape.rank()
+                    ));
+                }
+                for (axis, ((start, end), dim)) in
+                    slices.iter().zip(output_shape.0.iter()).enumerate()
+                {
+                    let Dim::Lit(dim) = dim else {
+                        continue;
+                    };
+                    if start > end || end > dim {
+                        return Err(format!(
+                            "slice assign node {idx} has invalid slice {start}..{end} on axis {axis} with dim {dim}"
+                        ));
+                    }
+                }
+                if let Some(value_shape) = self.infer_node_shape(*value) {
+                    if value_shape.rank() != slices.len() {
+                        return Err(format!(
+                            "slice assign node {idx} value rank {} does not match slice rank {}",
+                            value_shape.rank(),
+                            slices.len()
+                        ));
+                    }
+                    for (axis, ((start, end), dim)) in
+                        slices.iter().zip(value_shape.0.iter()).enumerate()
+                    {
+                        let Dim::Lit(dim) = dim else {
+                            continue;
+                        };
+                        let expected = end - start;
+                        if *dim != expected {
+                            return Err(format!(
+                                "slice assign node {idx} value axis {axis} has dim {dim}, expected {expected}"
+                            ));
+                        }
+                    }
+                }
+            }
+
+            if let TensorExprNode::Resize {
+                input,
+                input_shape,
+                output_shape,
+            } = node
+            {
+                if input_shape.static_numel() != output_shape.static_numel()
+                    && input_shape.rank() != output_shape.rank()
+                {
+                    return Err(format!(
+                        "size-changing resize node {idx} changes rank from {} to {}",
+                        input_shape.rank(),
+                        output_shape.rank()
+                    ));
+                }
+                if let Some(inferred) = self.infer_node_shape(*input)
+                    && inferred != *input_shape
+                {
+                    return Err(format!(
+                        "resize node {idx} input shape {:?} does not match declared {:?}",
+                        inferred, input_shape
+                    ));
+                }
+            }
+
+            if let TensorExprNode::IndexSelect {
+                input,
+                indices,
+                output_shape,
+                axis,
+            } = node
+            {
+                let axis = *axis as usize;
+                if axis >= output_shape.rank() {
+                    return Err(format!(
+                        "index select node {idx} uses axis {axis} on rank-{} output",
+                        output_shape.rank()
+                    ));
+                }
+                if let Some(input_shape) = self.infer_node_shape(*input) {
+                    if input_shape.rank() != output_shape.rank() {
+                        return Err(format!(
+                            "index select node {idx} input rank {} does not match output rank {}",
+                            input_shape.rank(),
+                            output_shape.rank()
+                        ));
+                    }
+                    for dim in 0..output_shape.rank() {
+                        if dim != axis && input_shape.0[dim] != output_shape.0[dim] {
+                            return Err(format!(
+                                "index select node {idx} output dim {dim} {:?} does not match input dim {:?}",
+                                output_shape.0[dim], input_shape.0[dim]
+                            ));
+                        }
+                    }
+                }
+                if let Some(indices_shape) = self.infer_node_shape(*indices) {
+                    if indices_shape.rank() != 1 {
+                        return Err(format!(
+                            "index select node {idx} index tensor must be rank 1, got rank {}",
+                            indices_shape.rank()
+                        ));
+                    }
+                    if indices_shape.0[0] != output_shape.0[axis] {
+                        return Err(format!(
+                            "index select node {idx} output axis {axis} {:?} does not match index len {:?}",
+                            output_shape.0[axis], indices_shape.0[0]
+                        ));
+                    }
                 }
             }
         }
@@ -189,6 +339,9 @@ impl TensorExprProgram {
                 TensorExprNode::Input { shape, .. } => Some(shape.clone()),
                 TensorExprNode::Restride { new_shape, .. } => Some(new_shape.clone()),
                 TensorExprNode::Elementwise { index_space, .. } => Some(index_space.clone()),
+                TensorExprNode::SliceAssign { output_shape, .. } => Some(output_shape.clone()),
+                TensorExprNode::IndexSelect { output_shape, .. } => Some(output_shape.clone()),
+                TensorExprNode::Resize { output_shape, .. } => Some(output_shape.clone()),
                 TensorExprNode::Reduce { expr, axis, .. } => {
                     infer(program, *expr, cache).map(|shape| shape.remove_axis(*axis as usize))
                 }
@@ -196,7 +349,9 @@ impl TensorExprProgram {
                 | TensorExprNode::UnOp(..)
                 | TensorExprNode::TernOp(..)
                 | TensorExprNode::Const(_)
-                | TensorExprNode::Arg(_) => None,
+                | TensorExprNode::Arg(_)
+                | TensorExprNode::Index(_)
+                | TensorExprNode::IndexedArg { .. } => None,
             };
 
             cache.insert(id, shape.clone());
@@ -208,29 +363,71 @@ impl TensorExprProgram {
     }
 
     fn infer_node_dtype(&self, id: ExprId) -> Option<DType> {
+        fn unary_dtype(op: UnaryOp, input: Option<DType>) -> Option<DType> {
+            match op {
+                UnaryOp::CastF16 => Some(DType::F16),
+                UnaryOp::CastF32 => Some(DType::F32),
+                UnaryOp::CastI32 => Some(DType::I32),
+                UnaryOp::CastU32 => Some(DType::U32),
+                UnaryOp::CastBool | UnaryOp::Not => Some(DType::Bool),
+                _ => input,
+            }
+        }
+
         fn infer(
             program: &TensorExprProgram,
             id: ExprId,
             cache: &mut HashMap<ExprId, Option<DType>>,
+            params: Option<&[DType]>,
         ) -> Option<DType> {
-            if let Some(dtype) = cache.get(&id) {
+            if params.is_none()
+                && let Some(dtype) = cache.get(&id)
+            {
                 return *dtype;
             }
 
             let dtype = match program.node(id) {
                 TensorExprNode::Input { dtype, .. } => Some(*dtype),
                 TensorExprNode::Restride { expr, .. } | TensorExprNode::Reduce { expr, .. } => {
-                    infer(program, *expr, cache)
+                    infer(program, *expr, cache, params)
                 }
-                TensorExprNode::Elementwise { inputs, body, .. } => inputs
-                    .first()
-                    .and_then(|input| infer(program, *input, cache))
-                    .or_else(|| infer(program, *body, cache)),
-                TensorExprNode::BinOp(..)
-                | TensorExprNode::UnOp(..)
-                | TensorExprNode::TernOp(..)
-                | TensorExprNode::Arg(_) => None,
+                TensorExprNode::SliceAssign { input, .. } => infer(program, *input, cache, params),
+                TensorExprNode::IndexSelect { input, .. } => infer(program, *input, cache, params),
+                TensorExprNode::Resize { input, .. } => infer(program, *input, cache, params),
+                TensorExprNode::Elementwise { inputs, body, .. } => {
+                    let input_dtypes = inputs
+                        .iter()
+                        .map(|input| infer(program, *input, cache, params))
+                        .collect::<Option<Vec<_>>>();
+                    input_dtypes
+                        .as_deref()
+                        .and_then(|input_dtypes| infer(program, *body, cache, Some(input_dtypes)))
+                }
+                TensorExprNode::BinOp(op, children) => match op {
+                    BinaryOp::Lt
+                    | BinaryOp::Le
+                    | BinaryOp::Gt
+                    | BinaryOp::Ge
+                    | BinaryOp::Eq
+                    | BinaryOp::Neq => Some(DType::Bool),
+                    _ => infer(program, children[0], cache, params),
+                },
+                TensorExprNode::UnOp(op, child) => {
+                    unary_dtype(*op, infer(program, *child, cache, params))
+                }
+                TensorExprNode::TernOp(op, children) => match op {
+                    TernaryOp::Fma => infer(program, children[0], cache, params),
+                    TernaryOp::Select => infer(program, children[1], cache, params),
+                },
+                TensorExprNode::Arg(index) => {
+                    params.and_then(|params| params.get(*index as usize).copied())
+                }
+                TensorExprNode::Index(_) => Some(DType::U32),
+                TensorExprNode::IndexedArg { index, .. } => {
+                    params.and_then(|params| params.get(*index as usize).copied())
+                }
                 TensorExprNode::Const(value) => Some(match value {
+                    ScalarValue::F16(_) => DType::F16,
                     ScalarValue::F32(_) => DType::F32,
                     ScalarValue::I32(_) => DType::I32,
                     ScalarValue::U32(_) => DType::U32,
@@ -238,12 +435,14 @@ impl TensorExprProgram {
                 }),
             };
 
-            cache.insert(id, dtype);
+            if params.is_none() {
+                cache.insert(id, dtype);
+            }
             dtype
         }
 
         let mut cache = HashMap::new();
-        infer(self, id, &mut cache)
+        infer(self, id, &mut cache, None)
     }
 }
 
@@ -296,6 +495,44 @@ impl TensorExprBuilder {
         })
     }
 
+    pub fn slice_assign(
+        &mut self,
+        input: ExprId,
+        value: ExprId,
+        output_shape: Shape,
+        slices: Vec<(u32, u32)>,
+    ) -> ExprId {
+        self.add(TensorExprNode::SliceAssign {
+            input,
+            value,
+            output_shape,
+            slices,
+        })
+    }
+
+    pub fn index_select(
+        &mut self,
+        input: ExprId,
+        indices: ExprId,
+        output_shape: Shape,
+        axis: u32,
+    ) -> ExprId {
+        self.add(TensorExprNode::IndexSelect {
+            input,
+            indices,
+            output_shape,
+            axis,
+        })
+    }
+
+    pub fn resize(&mut self, input: ExprId, input_shape: Shape, output_shape: Shape) -> ExprId {
+        self.add(TensorExprNode::Resize {
+            input,
+            input_shape,
+            output_shape,
+        })
+    }
+
     pub fn reduce(&mut self, expr: ExprId, axis: u32, op: ReduceOp) -> ExprId {
         self.add(TensorExprNode::Reduce { expr, axis, op })
     }
@@ -318,6 +555,14 @@ impl TensorExprBuilder {
 
     pub fn scalar_arg(&mut self, index: u32) -> ExprId {
         self.add(TensorExprNode::Arg(index))
+    }
+
+    pub fn scalar_index(&mut self, index: u32) -> ExprId {
+        self.add(TensorExprNode::Index(index))
+    }
+
+    pub fn indexed_arg(&mut self, index: u32, indices: Vec<ExprId>) -> ExprId {
+        self.add(TensorExprNode::IndexedArg { index, indices })
     }
 
     pub fn scalar_binop(&mut self, op: BinaryOp, args: [ExprId; 2]) -> ExprId {
@@ -370,8 +615,11 @@ impl TensorExprBuilder {
         let arg0 = self.scalar_arg(0);
         let arg1 = self.scalar_arg(1);
         let sub_body = self.scalar_binop(BinaryOp::Sub, [arg0, arg1]);
-        let mut broadcast_strides = vec![1i64; shape.rank()];
-        broadcast_strides[axis as usize] = 0;
+        let reduced_shape = shape.remove_axis(axis as usize);
+        let mut broadcast_strides = Strides::row_major_for_shape(&reduced_shape)
+            .map(|strides| strides.0)
+            .unwrap_or_else(|| vec![1i64; reduced_shape.rank()]);
+        broadcast_strides.insert(axis as usize, 0);
         let max_broadcast =
             self.restride(max_value, shape.clone(), Strides(broadcast_strides.clone()));
         let shifted = self.elementwise(shape.clone(), &[x, max_broadcast], sub_body);

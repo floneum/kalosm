@@ -3,7 +3,7 @@ use egg::{Analysis, DidMerge, EGraph, Id, Language};
 use crate::language::{DispatchNode, HighLevelNode, SimdNode, TensorIr};
 use crate::types::{
     AddressProfile, BinaryOp, BinderKind, DType, DepSet, MemTier, ReduceOp, ScalarValue, Shape,
-    Strides, UnaryOp, VarDepSet, VarRef, index_level_from_slot,
+    Strides, TernaryOp, UnaryOp, VarDepSet, VarRef, index_level_from_slot,
 };
 
 /// Analysis facts for the generic whole-expression composite-dispatch lowering.
@@ -241,10 +241,61 @@ fn outer_theta_count(egraph: &EGraph<TensorIr, TensorAnalysis>, root: Id) -> Opt
 fn copy_child_tensor_data(child: &TensorData) -> TensorData {
     TensorData {
         dep: child.dep,
+        dtype: child.dtype,
         var_dep: child.var_dep.clone(),
         free_var_dep: child.free_var_dep.clone(),
         ..Default::default()
     }
+}
+
+fn unary_output_dtype(op: UnaryOp, input: Option<DType>) -> Option<DType> {
+    match op {
+        UnaryOp::CastF16 => Some(DType::F16),
+        UnaryOp::CastF32 => Some(DType::F32),
+        UnaryOp::CastI32 => Some(DType::I32),
+        UnaryOp::CastU32 => Some(DType::U32),
+        UnaryOp::CastBool | UnaryOp::Not => Some(DType::Bool),
+        _ => input,
+    }
+}
+
+fn scalar_expr_dtype(
+    egraph: &EGraph<TensorIr, TensorAnalysis>,
+    id: Id,
+    params: &[DType],
+) -> Option<DType> {
+    if let Some(dtype) = egraph[id].data.dtype {
+        return Some(dtype);
+    }
+    egraph[id].iter().find_map(|node| match node {
+        TensorIr::HighLevel(HighLevelNode::Param(index)) => params.get(*index as usize).copied(),
+        TensorIr::HighLevel(HighLevelNode::Index(_)) => Some(DType::U32),
+        TensorIr::HighLevel(HighLevelNode::IndexedParam { index, .. }) => {
+            params.get(*index as usize).copied()
+        }
+        TensorIr::Const(value) => Some(match value {
+            ScalarValue::F16(_) => DType::F16,
+            ScalarValue::F32(_) => DType::F32,
+            ScalarValue::I32(_) => DType::I32,
+            ScalarValue::U32(_) => DType::U32,
+            ScalarValue::Bool(_) => DType::Bool,
+        }),
+        TensorIr::BinOp(op, args) => match op {
+            BinaryOp::Lt
+            | BinaryOp::Le
+            | BinaryOp::Gt
+            | BinaryOp::Ge
+            | BinaryOp::Eq
+            | BinaryOp::Neq => Some(DType::Bool),
+            _ => scalar_expr_dtype(egraph, args[0], params),
+        },
+        TensorIr::UnOp(op, arg) => unary_output_dtype(*op, scalar_expr_dtype(egraph, *arg, params)),
+        TensorIr::TernOp(op, args) => match op {
+            TernaryOp::Fma => scalar_expr_dtype(egraph, args[0], params),
+            TernaryOp::Select => scalar_expr_dtype(egraph, args[1], params),
+        },
+        _ => None,
+    })
 }
 
 fn list_tensor_data(egraph: &EGraph<TensorIr, TensorAnalysis>, list_id: Id) -> TensorData {
@@ -304,6 +355,16 @@ fn make_high_level_data(
                 let inputs_lowerable = children[..children.len().saturating_sub(1)]
                     .iter()
                     .all(|child| egraph[*child].data.composite_dispatch.lowerable);
+                let input_count = (*num_inputs as usize).min(children.len());
+                let input_dtypes = children[..input_count]
+                    .iter()
+                    .map(|child| egraph[*child].data.dtype)
+                    .collect::<Option<Vec<_>>>();
+                data.dtype = input_dtypes.as_deref().and_then(|input_dtypes| {
+                    children
+                        .last()
+                        .and_then(|body| scalar_expr_dtype(egraph, *body, input_dtypes))
+                });
                 data.composite_dispatch = CompositeDispatchInfo {
                     lowerable: has_literal_shape(index_space) && inputs_lowerable,
                 };
@@ -317,6 +378,74 @@ fn make_high_level_data(
                     detect_normalized_weight(egraph, index_space, *num_inputs, &children);
             }
             data
+        }
+        HighLevelNode::SliceAssign {
+            output_shape,
+            children,
+            ..
+        } => {
+            let input = &egraph[children[0]].data;
+            let value = &egraph[children[1]].data;
+            TensorData {
+                shape: Some(output_shape.clone()),
+                dtype: input.dtype,
+                stride_profile: Strides::row_major_for_shape(output_shape),
+                dep: input.dep.union(value.dep),
+                var_dep: input.var_dep.clone().union(&value.var_dep),
+                free_var_dep: input.free_var_dep.clone().union(&value.free_var_dep),
+                composite_dispatch: CompositeDispatchInfo {
+                    lowerable: has_literal_shape(output_shape)
+                        && input.composite_dispatch.lowerable
+                        && value.composite_dispatch.lowerable,
+                },
+                reduction_depth: input.reduction_depth.max(value.reduction_depth),
+                ..Default::default()
+            }
+        }
+        HighLevelNode::IndexSelect {
+            output_shape,
+            children,
+            ..
+        } => {
+            let input = &egraph[children[0]].data;
+            let indices = &egraph[children[1]].data;
+            TensorData {
+                shape: Some(output_shape.clone()),
+                dtype: input.dtype,
+                stride_profile: Strides::row_major_for_shape(output_shape),
+                dep: input.dep.union(indices.dep),
+                var_dep: input.var_dep.clone().union(&indices.var_dep),
+                free_var_dep: input.free_var_dep.clone().union(&indices.free_var_dep),
+                composite_dispatch: CompositeDispatchInfo {
+                    lowerable: has_literal_shape(output_shape)
+                        && input.composite_dispatch.lowerable
+                        && indices.composite_dispatch.lowerable,
+                },
+                reduction_depth: input.reduction_depth.max(indices.reduction_depth),
+                ..Default::default()
+            }
+        }
+        HighLevelNode::Resize {
+            input_shape,
+            output_shape,
+            expr,
+        } => {
+            let child = &egraph[*expr].data;
+            TensorData {
+                shape: Some(output_shape.clone()),
+                dtype: child.dtype,
+                stride_profile: Strides::row_major_for_shape(output_shape),
+                dep: child.dep,
+                var_dep: child.var_dep.clone(),
+                free_var_dep: child.free_var_dep.clone(),
+                composite_dispatch: CompositeDispatchInfo {
+                    lowerable: child.composite_dispatch.lowerable
+                        && has_literal_shape(input_shape)
+                        && has_literal_shape(output_shape),
+                },
+                reduction_depth: child.reduction_depth,
+                ..Default::default()
+            }
         }
         HighLevelNode::Reduce { axis, expr, .. } => {
             let child = &egraph[*expr].data;
@@ -345,7 +474,9 @@ fn make_high_level_data(
                 ..Default::default()
             }
         }
-        HighLevelNode::Param(_) => empty_tensor_data(),
+        HighLevelNode::Param(_) | HighLevelNode::Index(_) | HighLevelNode::IndexedParam { .. } => {
+            empty_tensor_data()
+        }
     }
 }
 
@@ -503,6 +634,12 @@ fn make_dispatch_data(
         } = node
         {
             data.dispatch_shape = Some(make_dispatch_shape(egraph, *children_list, *num_inputs));
+            if let Some(children) = crate::language::try_extract_list(egraph, *children_list) {
+                let first_value_index = (*num_inputs as usize).min(children.len());
+                if let Some(value_id) = children.get(first_value_index) {
+                    data.dtype = egraph[*value_id].data.dtype;
+                }
+            }
         }
         return data;
     }
@@ -681,6 +818,13 @@ impl Analysis<TensorIr> for TensorAnalysis {
                 }
             }
             TensorIr::Const(v) => TensorData {
+                dtype: Some(match v {
+                    ScalarValue::F16(_) => DType::F16,
+                    ScalarValue::F32(_) => DType::F32,
+                    ScalarValue::I32(_) => DType::I32,
+                    ScalarValue::U32(_) => DType::U32,
+                    ScalarValue::Bool(_) => DType::Bool,
+                }),
                 constant: Some(v.clone()),
                 address_profile: match v {
                     ScalarValue::U32(u) => Some(AddressProfile::from_const(*u)),
@@ -694,6 +838,15 @@ impl Analysis<TensorIr> for TensorAnalysis {
                 let address_profile = combine_address_profile(*name, args, egraph);
                 TensorData {
                     dep,
+                    dtype: match name {
+                        BinaryOp::Lt
+                        | BinaryOp::Le
+                        | BinaryOp::Gt
+                        | BinaryOp::Ge
+                        | BinaryOp::Eq
+                        | BinaryOp::Neq => Some(DType::Bool),
+                        _ => args.first().and_then(|arg| egraph[*arg].data.dtype),
+                    },
                     constant,
                     var_dep: child_var_dep_union(egraph, args),
                     free_var_dep: child_free_var_dep_union(egraph, args),
@@ -702,9 +855,17 @@ impl Analysis<TensorIr> for TensorAnalysis {
                     ..Default::default()
                 }
             }
-            TensorIr::UnOp(_name, id) => copy_child_tensor_data(&egraph[*id].data),
-            TensorIr::TernOp(_name, args) => TensorData {
+            TensorIr::UnOp(name, id) => {
+                let mut data = copy_child_tensor_data(&egraph[*id].data);
+                data.dtype = unary_output_dtype(*name, egraph[*id].data.dtype);
+                data
+            }
+            TensorIr::TernOp(name, args) => TensorData {
                 dep: child_dep_union(egraph, args),
+                dtype: match name {
+                    TernaryOp::Fma => egraph[args[0]].data.dtype,
+                    TernaryOp::Select => egraph[args[1]].data.dtype,
+                },
                 var_dep: child_var_dep_union(egraph, args),
                 free_var_dep: child_free_var_dep_union(egraph, args),
                 ..Default::default()
@@ -913,6 +1074,29 @@ fn fold_bin_op(op: BinaryOp, args: &[&ScalarValue]) -> Option<ScalarValue> {
     };
 
     match (op, a, b) {
+        // f16 (tracked as f32 values rounded by backend literal emission)
+        (BinaryOp::Add, ScalarValue::F16(a), ScalarValue::F16(b)) => {
+            Some(ScalarValue::F16(OrderedFloat(a.0 + b.0)))
+        }
+        (BinaryOp::Sub, ScalarValue::F16(a), ScalarValue::F16(b)) => {
+            Some(ScalarValue::F16(OrderedFloat(a.0 - b.0)))
+        }
+        (BinaryOp::Mul, ScalarValue::F16(a), ScalarValue::F16(b)) => {
+            Some(ScalarValue::F16(OrderedFloat(a.0 * b.0)))
+        }
+        (BinaryOp::Div, ScalarValue::F16(a), ScalarValue::F16(b)) => {
+            Some(ScalarValue::F16(OrderedFloat(a.0 / b.0)))
+        }
+        (BinaryOp::Pow, ScalarValue::F16(a), ScalarValue::F16(b)) => {
+            Some(ScalarValue::F16(OrderedFloat(a.0.powf(b.0))))
+        }
+        (BinaryOp::Max, ScalarValue::F16(a), ScalarValue::F16(b)) => {
+            Some(ScalarValue::F16(OrderedFloat(a.0.max(b.0))))
+        }
+        (BinaryOp::Min, ScalarValue::F16(a), ScalarValue::F16(b)) => {
+            Some(ScalarValue::F16(OrderedFloat(a.0.min(b.0))))
+        }
+
         // i32
         (BinaryOp::Add, ScalarValue::I32(a), ScalarValue::I32(b)) => Some(ScalarValue::I32(a + b)),
         (BinaryOp::Sub, ScalarValue::I32(a), ScalarValue::I32(b)) => Some(ScalarValue::I32(a - b)),
@@ -955,6 +1139,9 @@ fn fold_bin_op(op: BinaryOp, args: &[&ScalarValue]) -> Option<ScalarValue> {
         }
         (BinaryOp::Div, ScalarValue::F32(a), ScalarValue::F32(b)) => {
             Some(ScalarValue::F32(OrderedFloat(a.0 / b.0)))
+        }
+        (BinaryOp::Pow, ScalarValue::F32(a), ScalarValue::F32(b)) => {
+            Some(ScalarValue::F32(OrderedFloat(a.0.powf(b.0))))
         }
         (BinaryOp::Max, ScalarValue::F32(a), ScalarValue::F32(b)) => {
             Some(ScalarValue::F32(OrderedFloat(a.0.max(b.0))))

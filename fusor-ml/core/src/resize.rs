@@ -123,17 +123,31 @@ impl Operation for ResizeOperation {
                 .join("x")
         )
     }
+
+    fn build_tensor_ir(
+        &self,
+        _nodes: &crate::compute_graph::ComputeGraphInner,
+        inputs: &[crate::mir::inputs::MirValue],
+    ) -> Result<crate::mir::operation::TensorIrLowering, String> {
+        crate::tensor_ir_lowering::resize(self, inputs)
+    }
 }
 
 impl<const R: usize, T: crate::DataType> Tensor<R, T> {
     pub fn resize(&self, new_shape: [usize; R]) -> Tensor<R, T> {
+        let fill_shape = self
+            .shape()
+            .iter()
+            .zip(new_shape.iter())
+            .map(|(current, new)| (*current).min(*new))
+            .collect::<Box<[_]>>();
         let new_shape = new_shape.into();
         let input = self.key();
         self.add_resize(ResizeOperation::new(
             input,
             (*self.shape()).into(),
             new_shape,
-            (*self.shape()).into(),
+            fill_shape,
         ))
     }
 

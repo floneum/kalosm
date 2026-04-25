@@ -26,13 +26,11 @@ impl LayoutPass {
             match &node_data.variant {
                 ComputeGraphNodeVariant::Nary(op) => self.visit_nary(node, op),
                 ComputeGraphNodeVariant::MatMul(op) => self.visit_mat_mul(node, op),
-                ComputeGraphNodeVariant::QMatMul(op) => self.visit_q_mat_mul(node, op),
                 ComputeGraphNodeVariant::Reduce(op) => self.visit_reduce(node, op),
                 ComputeGraphNodeVariant::MapLayout(op) => self.visit_map_layout(node, op),
                 ComputeGraphNodeVariant::Resize(op) => self.visit_resize(node, op),
                 ComputeGraphNodeVariant::SliceAssign(op) => self.visit_slice_assign(node, op),
                 ComputeGraphNodeVariant::Tensor(op) => self.visit_tensor(node, op),
-                ComputeGraphNodeVariant::Dequantize(op) => self.visit_dequantize(node, op),
                 ComputeGraphNodeVariant::Custom(op) => self.visit_custom(node, op),
             }
         }
@@ -67,23 +65,6 @@ impl LayoutPass {
         };
         let output_shape = &operation.out_shape;
         let output_layout = Layout::contiguous(output_shape);
-        self.output_layout.insert(
-            key,
-            TensorLayoutInfo::new(output_layout, first_layout.datatype()),
-        );
-    }
-
-    fn visit_q_mat_mul(
-        &mut self,
-        key: NodeIndex,
-        operation: &crate::quantized::matmul::QMatMulOperation,
-    ) {
-        let Some(first_layout) = self.output_layout.get(&operation.input) else {
-            self.queue.push_back(operation.input);
-            self.queue.push_back(key);
-            return;
-        };
-        let output_layout = Layout::contiguous(&operation.out_shape);
         self.output_layout.insert(
             key,
             TensorLayoutInfo::new(output_layout, first_layout.datatype()),
@@ -162,17 +143,6 @@ impl LayoutPass {
     fn visit_tensor(&mut self, key: NodeIndex, operation: &crate::tensor::TensorData) {
         let info = operation.info();
         self.output_layout.insert(key, info.clone());
-    }
-
-    fn visit_dequantize(
-        &mut self,
-        key: NodeIndex,
-        operation: &crate::dequantize::DequantizeOperation,
-    ) {
-        let matrix = &operation.matrix;
-        let new_layout = Layout::contiguous(matrix.shape());
-        self.output_layout
-            .insert(key, TensorLayoutInfo::new(new_layout, operation.datatype));
     }
 
     fn visit_custom(

@@ -50,25 +50,6 @@ impl GraphVisPass {
         self.identities.insert(key, id.clone());
     }
 
-    fn visit_q_mat_mul(
-        &mut self,
-        key: NodeIndex,
-        operation: &crate::quantized::matmul::QMatMulOperation,
-    ) {
-        let input = self.identities.get(&operation.input).unwrap();
-        let output_layout = self.layout_pass.output_layout.get(&key).unwrap();
-        let id = Identity::quoted(format!("qmatmul ({}) #{:?}", output_layout, key));
-        self.statements.push(Stmt::Node {
-            id: id.clone(),
-            port: None,
-            attr: None,
-        });
-        self.statements.push(Stmt::Edge(
-            Edge::head_node(input.clone(), None).arrow_to_node(id.clone(), None),
-        ));
-        self.identities.insert(key, id.clone());
-    }
-
     fn visit_reduce(&mut self, key: NodeIndex, operation: &crate::ReduceOperation) {
         let input = self.identities.get(&operation.value).unwrap();
         let output_layout = self.layout_pass.output_layout.get(&key).unwrap();
@@ -143,21 +124,6 @@ impl GraphVisPass {
         self.statements.push(Stmt::Edge(
             Edge::head_node(value.clone(), None).arrow_to_node(id.clone(), None),
         ));
-        self.identities.insert(key, id.clone());
-    }
-
-    fn visit_dequantize(
-        &mut self,
-        key: NodeIndex,
-        _operation: &crate::dequantize::DequantizeOperation,
-    ) {
-        let output_layout = self.layout_pass.output_layout.get(&key).unwrap();
-        let id = Identity::quoted(format!("dequantize ({}) #{:?}", output_layout, key));
-        self.statements.push(Stmt::Node {
-            id: id.clone(),
-            port: None,
-            attr: None,
-        });
         self.identities.insert(key, id.clone());
     }
 
@@ -238,7 +204,6 @@ impl ComputeGraphInner {
             match &node_data.variant {
                 ComputeGraphNodeVariant::Nary(op) => graph_vis_pass.visit_nary(node, op),
                 ComputeGraphNodeVariant::MatMul(op) => graph_vis_pass.visit_mat_mul(node, op),
-                ComputeGraphNodeVariant::QMatMul(op) => graph_vis_pass.visit_q_mat_mul(node, op),
                 ComputeGraphNodeVariant::Reduce(op) => graph_vis_pass.visit_reduce(node, op),
                 ComputeGraphNodeVariant::MapLayout(op) => graph_vis_pass.visit_map_layout(node, op),
                 ComputeGraphNodeVariant::Resize(op) => graph_vis_pass.visit_resize(node, op),
@@ -246,9 +211,6 @@ impl ComputeGraphInner {
                     graph_vis_pass.visit_slice_assign(node, op)
                 }
                 ComputeGraphNodeVariant::Tensor(op) => graph_vis_pass.visit_tensor(node, op),
-                ComputeGraphNodeVariant::Dequantize(op) => {
-                    graph_vis_pass.visit_dequantize(node, op)
-                }
                 ComputeGraphNodeVariant::Custom(op) => graph_vis_pass.visit_custom(node, op),
             }
         }

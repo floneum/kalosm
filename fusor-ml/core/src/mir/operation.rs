@@ -22,11 +22,9 @@ pub(crate) trait Operation: Debug {
 
     fn build_tensor_ir(
         &self,
-        _nodes: &ComputeGraphInner,
-        _inputs: &[MirValue],
-    ) -> Result<TensorIrLowering, String> {
-        Err(format!("{} cannot lower to tensor_ir yet", self.name()))
-    }
+        nodes: &ComputeGraphInner,
+        inputs: &[MirValue],
+    ) -> Result<TensorIrLowering, String>;
 }
 
 pub(crate) struct TensorIrLowering {

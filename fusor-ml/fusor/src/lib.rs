@@ -1089,24 +1089,24 @@ where
         match (self, weights) {
             // CPU path - dispatch based on block type
             // eval() returns Tensor<R, ConcreteTensor>, so we need .inner() to get ConcreteTensor
-            (Tensor::Cpu(lhs), QMatrix::CpuQ4_0(rhs)) => Tensor::Cpu(fusor_cpu::Tensor::new(
-                lhs.to_concrete().inner().q_mat_mul(rhs),
-            )),
-            (Tensor::Cpu(lhs), QMatrix::CpuQ5_0(rhs)) => Tensor::Cpu(fusor_cpu::Tensor::new(
-                lhs.to_concrete().inner().q_mat_mul(rhs),
-            )),
-            (Tensor::Cpu(lhs), QMatrix::CpuQ8_0(rhs)) => Tensor::Cpu(fusor_cpu::Tensor::new(
-                lhs.to_concrete().inner().q_mat_mul(rhs),
-            )),
-            (Tensor::Cpu(lhs), QMatrix::CpuQ4K(rhs)) => Tensor::Cpu(fusor_cpu::Tensor::new(
-                lhs.to_concrete().inner().q_mat_mul(rhs),
-            )),
-            (Tensor::Cpu(lhs), QMatrix::CpuQ5K(rhs)) => Tensor::Cpu(fusor_cpu::Tensor::new(
-                lhs.to_concrete().inner().q_mat_mul(rhs),
-            )),
-            (Tensor::Cpu(lhs), QMatrix::CpuQ6K(rhs)) => Tensor::Cpu(fusor_cpu::Tensor::new(
-                lhs.to_concrete().inner().q_mat_mul(rhs),
-            )),
+            (Tensor::Cpu(lhs), QMatrix::CpuQ4_0(rhs)) => {
+                Tensor::Cpu(fusor_cpu::Tensor::new(lhs.q_mat_mul(rhs)))
+            }
+            (Tensor::Cpu(lhs), QMatrix::CpuQ5_0(rhs)) => {
+                Tensor::Cpu(fusor_cpu::Tensor::new(lhs.q_mat_mul(rhs)))
+            }
+            (Tensor::Cpu(lhs), QMatrix::CpuQ8_0(rhs)) => {
+                Tensor::Cpu(fusor_cpu::Tensor::new(lhs.q_mat_mul(rhs)))
+            }
+            (Tensor::Cpu(lhs), QMatrix::CpuQ4K(rhs)) => {
+                Tensor::Cpu(fusor_cpu::Tensor::new(lhs.q_mat_mul(rhs)))
+            }
+            (Tensor::Cpu(lhs), QMatrix::CpuQ5K(rhs)) => {
+                Tensor::Cpu(fusor_cpu::Tensor::new(lhs.q_mat_mul(rhs)))
+            }
+            (Tensor::Cpu(lhs), QMatrix::CpuQ6K(rhs)) => {
+                Tensor::Cpu(fusor_cpu::Tensor::new(lhs.q_mat_mul(rhs)))
+            }
             // F16/F32 are not quantized — dequantize, transpose, and use regular matmul
             (_, QMatrix::CpuF32(_))
             | (_, QMatrix::CpuF16(_))

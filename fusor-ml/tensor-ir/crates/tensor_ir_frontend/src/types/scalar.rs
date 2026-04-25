@@ -56,6 +56,7 @@ impl DType {
 /// Scalar literal value.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum ScalarValue {
+    F16(OrderedFloat<f32>),
     F32(OrderedFloat<f32>),
     I32(i32),
     U32(u32),
@@ -65,6 +66,7 @@ pub enum ScalarValue {
 impl fmt::Display for ScalarValue {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::F16(v) => write!(f, "{v}h"),
             Self::F32(v) => write!(f, "{v}f"),
             Self::I32(v) => write!(f, "{v}i"),
             Self::U32(v) => write!(f, "{v}u"),
@@ -87,6 +89,12 @@ impl FromStr for ScalarValue {
                 .parse::<f32>()
                 .map(|v| Self::F32(OrderedFloat(v)))
                 .map_err(|e| format!("bad f32: {e}"));
+        }
+        if let Some(rest) = s.strip_suffix('h') {
+            return rest
+                .parse::<f32>()
+                .map(|v| Self::F16(OrderedFloat(v)))
+                .map_err(|e| format!("bad f16: {e}"));
         }
         if let Some(rest) = s.strip_suffix('u') {
             return rest
@@ -114,6 +122,7 @@ pub enum BinaryOp {
     Mod,
     Max,
     Min,
+    Pow,
     And,
     Or,
     Xor,
@@ -137,6 +146,7 @@ impl fmt::Display for BinaryOp {
             Self::Mod => "mod",
             Self::Max => "max",
             Self::Min => "min",
+            Self::Pow => "pow",
             Self::And => "and",
             Self::Or => "or",
             Self::Xor => "xor",
@@ -182,6 +192,7 @@ impl FromStr for BinaryOp {
             "mod" => Ok(Self::Mod),
             "max" => Ok(Self::Max),
             "min" => Ok(Self::Min),
+            "pow" => Ok(Self::Pow),
             "and" => Ok(Self::And),
             "or" => Ok(Self::Or),
             "xor" => Ok(Self::Xor),
@@ -204,7 +215,9 @@ pub enum UnaryOp {
     Neg,
     Not,
     Exp,
+    Exp2,
     Log,
+    Log2,
     Sin,
     Cos,
     Tan,
@@ -232,7 +245,9 @@ impl fmt::Display for UnaryOp {
             Self::Neg => "neg",
             Self::Not => "not",
             Self::Exp => "exp",
+            Self::Exp2 => "exp2",
             Self::Log => "log",
+            Self::Log2 => "log2",
             Self::Sin => "sin",
             Self::Cos => "cos",
             Self::Tan => "tan",
@@ -264,7 +279,9 @@ impl FromStr for UnaryOp {
             "neg" => Ok(Self::Neg),
             "not" => Ok(Self::Not),
             "exp" => Ok(Self::Exp),
+            "exp2" => Ok(Self::Exp2),
             "log" => Ok(Self::Log),
+            "log2" => Ok(Self::Log2),
             "sin" => Ok(Self::Sin),
             "cos" => Ok(Self::Cos),
             "tan" => Ok(Self::Tan),
@@ -328,6 +345,16 @@ pub enum ReduceOp {
 
 impl ReduceOp {
     #[must_use]
+    pub fn identity_f16(&self) -> f32 {
+        match self {
+            Self::Add => 0.0,
+            Self::Mul => 1.0,
+            Self::Max => -65_504.0,
+            Self::Min => 65_504.0,
+        }
+    }
+
+    #[must_use]
     pub fn identity_f32(&self) -> f32 {
         match self {
             Self::Add => 0.0,
@@ -336,6 +363,16 @@ impl ReduceOp {
             // Use the largest finite sentinels instead.
             Self::Max => -f32::MAX,
             Self::Min => f32::MAX,
+        }
+    }
+
+    #[must_use]
+    pub const fn identity_u32(&self) -> u32 {
+        match self {
+            Self::Add => 0,
+            Self::Mul => 1,
+            Self::Max => u32::MIN,
+            Self::Min => u32::MAX,
         }
     }
 

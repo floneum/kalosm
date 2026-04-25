@@ -1891,6 +1891,7 @@ fn execution_weighted_expr_cost(expr: &RecExpr<TensorIr>, device: &DeviceProfile
                     + child_score(nodes, children[2], multiplier, device, seen)
             }
             TensorIr::HighLevel(HighLevelNode::Restride { expr, .. })
+            | TensorIr::HighLevel(HighLevelNode::Resize { expr, .. })
             | TensorIr::HighLevel(HighLevelNode::Reduce { expr, .. }) => {
                 child_score(nodes, *expr, multiplier, device, seen)
             }
@@ -1900,10 +1901,26 @@ fn execution_weighted_expr_cost(expr: &RecExpr<TensorIr>, device: &DeviceProfile
                     .map(|child| child_score(nodes, child, multiplier, device, seen))
                     .sum()
             }
+            TensorIr::HighLevel(HighLevelNode::SliceAssign { children, .. }) => {
+                child_score(nodes, children[0], multiplier, device, seen)
+                    + child_score(nodes, children[1], multiplier, device, seen)
+            }
+            TensorIr::HighLevel(HighLevelNode::IndexSelect { children, .. }) => {
+                child_score(nodes, children[0], multiplier, device, seen)
+                    + child_score(nodes, children[1], multiplier, device, seen)
+            }
+            TensorIr::HighLevel(HighLevelNode::IndexedParam { children_list, .. }) => {
+                extract_recexpr_list(nodes, *children_list)
+                    .into_iter()
+                    .map(|child| child_score(nodes, child, multiplier, device, seen))
+                    .sum()
+            }
             TensorIr::Nil
             | TensorIr::Cons(_)
             | TensorIr::Const(_)
-            | TensorIr::HighLevel(HighLevelNode::Input { .. } | HighLevelNode::Param(_))
+            | TensorIr::HighLevel(
+                HighLevelNode::Input { .. } | HighLevelNode::Param(_) | HighLevelNode::Index(_),
+            )
             | TensorIr::Dispatch(DispatchNode::Token)
             | TensorIr::Simd(SimdNode::Var(_)) => 0.0,
         }
@@ -1984,6 +2001,9 @@ impl CostFunction<TensorIr> for DispatchPreferredCost {
         // threadgroup buffers for arbitrary nested TG-load representatives.
         let base: f64 = match enode {
             TensorIr::HighLevel(HighLevelNode::Elementwise { .. })
+            | TensorIr::HighLevel(HighLevelNode::Resize { .. })
+            | TensorIr::HighLevel(HighLevelNode::IndexSelect { .. })
+            | TensorIr::HighLevel(HighLevelNode::SliceAssign { .. })
             | TensorIr::HighLevel(HighLevelNode::Reduce { .. }) => 1_000_000.0,
             TensorIr::HighLevel(HighLevelNode::Restride { .. }) => 100.0,
             TensorIr::Simd(SimdNode::Load {
@@ -2041,6 +2061,9 @@ impl CostFunction<TensorIr> for ReduceSimdPreferredCost {
         // form that later fails skeleton build.
         let base: f64 = match enode {
             TensorIr::HighLevel(HighLevelNode::Elementwise { .. })
+            | TensorIr::HighLevel(HighLevelNode::Resize { .. })
+            | TensorIr::HighLevel(HighLevelNode::IndexSelect { .. })
+            | TensorIr::HighLevel(HighLevelNode::SliceAssign { .. })
             | TensorIr::HighLevel(HighLevelNode::Reduce { .. }) => HIGHLEVEL_PENALTY,
             TensorIr::HighLevel(HighLevelNode::Restride { .. }) => 100.0,
             TensorIr::Simd(SimdNode::Load { .. }) => 1.0,
@@ -2068,6 +2091,9 @@ impl CostFunction<TensorIr> for BlockedDispatchPreferredCost {
     {
         let base: f64 = match enode {
             TensorIr::HighLevel(HighLevelNode::Elementwise { .. })
+            | TensorIr::HighLevel(HighLevelNode::Resize { .. })
+            | TensorIr::HighLevel(HighLevelNode::IndexSelect { .. })
+            | TensorIr::HighLevel(HighLevelNode::SliceAssign { .. })
             | TensorIr::HighLevel(HighLevelNode::Reduce { .. }) => 1.0e30,
             TensorIr::HighLevel(HighLevelNode::Restride { .. }) => 100.0,
             TensorIr::Simd(SimdNode::Load {
@@ -2100,6 +2126,9 @@ impl CostFunction<TensorIr> for SingleDispatchPreferredCost {
     {
         let base: f64 = match enode {
             TensorIr::HighLevel(HighLevelNode::Elementwise { .. })
+            | TensorIr::HighLevel(HighLevelNode::Resize { .. })
+            | TensorIr::HighLevel(HighLevelNode::IndexSelect { .. })
+            | TensorIr::HighLevel(HighLevelNode::SliceAssign { .. })
             | TensorIr::HighLevel(HighLevelNode::Reduce { .. }) => 1.0e12,
             TensorIr::HighLevel(HighLevelNode::Restride { .. }) => 100.0,
             TensorIr::Simd(SimdNode::Load { .. }) => 1.0,
@@ -2127,6 +2156,9 @@ impl CostFunction<TensorIr> for CompositePreferredCost {
     {
         let base: f64 = match enode {
             TensorIr::HighLevel(HighLevelNode::Elementwise { .. })
+            | TensorIr::HighLevel(HighLevelNode::Resize { .. })
+            | TensorIr::HighLevel(HighLevelNode::IndexSelect { .. })
+            | TensorIr::HighLevel(HighLevelNode::SliceAssign { .. })
             | TensorIr::HighLevel(HighLevelNode::Reduce { .. }) => 1_000_000.0,
             TensorIr::HighLevel(HighLevelNode::Restride { .. }) => 100.0,
             TensorIr::Simd(SimdNode::Load {

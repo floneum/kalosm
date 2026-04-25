@@ -17,18 +17,46 @@ use naga::{
 use crate::analysis::TensorAnalysis;
 use crate::language::TensorIr;
 use crate::skeleton::{DispatchInfo, DispatchProgram, OutputElement};
-use crate::types::{BinderKind, BufferRef, IndexLevel, MemTier};
+use crate::types::{BinderKind, BufferRef, DType, IndexLevel, MemTier};
 use crate::{Verified, verify};
+
+pub(super) const MAX_DISPATCH_WORKGROUPS_PER_DIMENSION: u32 = 65_535;
 
 /// Cached type handles used throughout codegen.
 struct TypeCache {
+    f16: Handle<Type>,
     f32: Handle<Type>,
     u32: Handle<Type>,
     i32: Handle<Type>,
     bool: Handle<Type>,
     vec3_u32: Handle<Type>,
-    /// `array<f32>` — runtime-sized storage buffer element type.
+    /// Runtime-sized storage buffer element types.
+    rt_array_f16: Handle<Type>,
     rt_array_f32: Handle<Type>,
+    rt_array_u32: Handle<Type>,
+    rt_array_i32: Handle<Type>,
+}
+
+impl TypeCache {
+    fn scalar(&self, dtype: DType) -> Handle<Type> {
+        match dtype {
+            DType::F16 => self.f16,
+            DType::F32 => self.f32,
+            DType::U32 => self.u32,
+            DType::I32 => self.i32,
+            DType::Bool => self.bool,
+        }
+    }
+
+    fn runtime_array(&self, dtype: DType) -> Handle<Type> {
+        match dtype {
+            DType::F16 => self.rt_array_f16,
+            DType::F32 => self.rt_array_f32,
+            DType::U32 => self.rt_array_u32,
+            DType::I32 => self.rt_array_i32,
+            DType::Bool => self.rt_array_u32,
+        }
+    }
 }
 
 /// Per-dispatch codegen context.
@@ -78,6 +106,9 @@ struct CodegenCtx<'a> {
 
     /// Buffer handles: typed `MemTier` → (`global_var` handle, `is_workgroup`).
     buffer_map: HashMap<MemTier, (Handle<GlobalVariable>, bool)>,
+
+    /// Scalar element dtype for each buffer visible to this dispatch.
+    buffer_dtypes: HashMap<MemTier, DType>,
 
     /// Per-simdgroup read stride for scaled tg buffers, keyed on the
     /// threadgroup-tier `BufferRef`.
@@ -254,6 +285,16 @@ pub fn module_to_msl(module: &Module) -> Result<String, String> {
 // ═══════════════════════════════════════════════════════════════
 
 fn register_types(module: &mut Module) -> TypeCache {
+    let f16 = module.types.insert(
+        Type {
+            name: None,
+            inner: TypeInner::Scalar(Scalar {
+                kind: ScalarKind::Float,
+                width: 2,
+            }),
+        },
+        Span::UNDEFINED,
+    );
     let f32 = module.types.insert(
         Type {
             name: None,
@@ -307,6 +348,17 @@ fn register_types(module: &mut Module) -> TypeCache {
         },
         Span::UNDEFINED,
     );
+    let rt_array_f16 = module.types.insert(
+        Type {
+            name: None,
+            inner: TypeInner::Array {
+                base: f16,
+                size: ArraySize::Dynamic,
+                stride: 2,
+            },
+        },
+        Span::UNDEFINED,
+    );
     let rt_array_f32 = module.types.insert(
         Type {
             name: None,
@@ -318,14 +370,40 @@ fn register_types(module: &mut Module) -> TypeCache {
         },
         Span::UNDEFINED,
     );
+    let rt_array_u32 = module.types.insert(
+        Type {
+            name: None,
+            inner: TypeInner::Array {
+                base: u32_ty,
+                size: ArraySize::Dynamic,
+                stride: 4,
+            },
+        },
+        Span::UNDEFINED,
+    );
+    let rt_array_i32 = module.types.insert(
+        Type {
+            name: None,
+            inner: TypeInner::Array {
+                base: i32_ty,
+                size: ArraySize::Dynamic,
+                stride: 4,
+            },
+        },
+        Span::UNDEFINED,
+    );
 
     TypeCache {
+        f16,
         f32,
         u32: u32_ty,
         i32: i32_ty,
         bool: bool_ty,
         vec3_u32,
+        rt_array_f16,
         rt_array_f32,
+        rt_array_u32,
+        rt_array_i32,
     }
 }
 
@@ -343,9 +421,26 @@ fn lower_single_dispatch(
     simd_width: u32,
 ) {
     let mut buffer_map = HashMap::new();
-    let output_binding = register_input_buffers(module, dispatch, types, &mut buffer_map);
-    let output_gv = register_output_buffer(module, types, &mut buffer_map, output_binding);
-    declare_workgroup_buffers(module, dispatch, types, &mut buffer_map);
+    let input_dtypes = dispatch
+        .inputs
+        .iter()
+        .map(|input| dtype_for_id(egraph, *input))
+        .collect::<Vec<_>>();
+    let output_dtype = dispatch_output_dtype(egraph, dispatch);
+    let mut buffer_dtypes = build_buffer_dtypes(dispatch, &input_dtypes, output_dtype);
+    let output_binding =
+        register_input_buffers(module, dispatch, types, &input_dtypes, &mut buffer_map);
+    let output_gv =
+        register_output_buffer(module, types, output_dtype, &mut buffer_map, output_binding);
+    declare_workgroup_buffers(
+        module,
+        dispatch,
+        types,
+        &input_dtypes,
+        output_dtype,
+        &mut buffer_map,
+        &mut buffer_dtypes,
+    );
 
     let mut ctx = build_codegen_ctx(
         egraph,
@@ -353,9 +448,11 @@ fn lower_single_dispatch(
         types,
         chosen_nodes,
         buffer_map,
+        buffer_dtypes,
         simd_width,
     );
     emit_dispatch_outputs(&mut ctx, &dispatch.outputs, output_gv);
+    emit_dispatch_bounds_guard(&mut ctx, dispatch);
     module.entry_points.push(build_dispatch_entry_point(
         ctx,
         dispatch_idx,
@@ -365,16 +462,65 @@ fn lower_single_dispatch(
     ));
 }
 
+fn dtype_for_id(egraph: &EGraph<TensorIr, TensorAnalysis>, id: Id) -> DType {
+    egraph[egraph.find(id)].data.dtype.unwrap_or(DType::F32)
+}
+
+fn dispatch_output_dtype(
+    egraph: &EGraph<TensorIr, TensorAnalysis>,
+    dispatch: &DispatchInfo,
+) -> DType {
+    egraph[egraph.find(dispatch.semantic_output_id)]
+        .data
+        .dtype
+        .or_else(|| {
+            dispatch
+                .outputs
+                .first()
+                .and_then(|output| egraph[egraph.find(output.value_id)].data.dtype)
+        })
+        .unwrap_or(DType::F32)
+}
+
+fn dtype_for_buffer_ref(input_dtypes: &[DType], output_dtype: DType, buffer: BufferRef) -> DType {
+    match buffer {
+        BufferRef::Input(index) => input_dtypes
+            .get(index as usize)
+            .copied()
+            .unwrap_or(DType::F32),
+        BufferRef::Output(_) => output_dtype,
+    }
+}
+
+fn build_buffer_dtypes(
+    dispatch: &DispatchInfo,
+    input_dtypes: &[DType],
+    output_dtype: DType,
+) -> HashMap<MemTier, DType> {
+    let mut dtypes = HashMap::new();
+    for (index, dtype) in input_dtypes.iter().enumerate() {
+        dtypes.insert(MemTier::Device(BufferRef::Input(index as u32)), *dtype);
+    }
+    dtypes.insert(MemTier::Device(BufferRef::Output(0)), output_dtype);
+    for buffer in &dispatch.tg_buffers {
+        let dtype = dtype_for_buffer_ref(input_dtypes, output_dtype, buffer.device_name);
+        dtypes.insert(MemTier::Threadgroup(buffer.tg_name), dtype);
+    }
+    dtypes
+}
+
 fn register_input_buffers(
     module: &mut Module,
     dispatch: &DispatchInfo,
     types: &TypeCache,
+    input_dtypes: &[DType],
     buffer_map: &mut HashMap<MemTier, (Handle<GlobalVariable>, bool)>,
 ) -> u32 {
     let mut binding_idx = 0;
     for (index, _) in dispatch.inputs.iter().enumerate() {
         let slot = u32::try_from(index).expect("input slot fits in u32");
         let buf_ref = BufferRef::Input(slot);
+        let dtype = input_dtypes.get(index).copied().unwrap_or(DType::F32);
         let gv = module.global_variables.append(
             GlobalVariable {
                 name: Some(format!("input_{index}")),
@@ -385,7 +531,7 @@ fn register_input_buffers(
                     group: 0,
                     binding: binding_idx,
                 }),
-                ty: types.rt_array_f32,
+                ty: types.runtime_array(dtype),
                 init: None,
             },
             Span::UNDEFINED,
@@ -399,6 +545,7 @@ fn register_input_buffers(
 fn register_output_buffer(
     module: &mut Module,
     types: &TypeCache,
+    output_dtype: DType,
     buffer_map: &mut HashMap<MemTier, (Handle<GlobalVariable>, bool)>,
     binding_idx: u32,
 ) -> Handle<GlobalVariable> {
@@ -412,7 +559,7 @@ fn register_output_buffer(
                 group: 0,
                 binding: binding_idx,
             }),
-            ty: types.rt_array_f32,
+            ty: types.runtime_array(output_dtype),
             init: None,
         },
         Span::UNDEFINED,
@@ -427,6 +574,7 @@ fn build_codegen_ctx<'a>(
     types: &'a TypeCache,
     chosen_nodes: &'a HashMap<Id, TensorIr>,
     buffer_map: HashMap<MemTier, (Handle<GlobalVariable>, bool)>,
+    buffer_dtypes: HashMap<MemTier, DType>,
     simd_width: u32,
 ) -> CodegenCtx<'a> {
     let mut expressions = Arena::new();
@@ -454,6 +602,7 @@ fn build_codegen_ctx<'a>(
         theta_acc_ptrs: HashMap::new(),
         binder_stack: Vec::new(),
         buffer_map,
+        buffer_dtypes,
         tg_sg_read_strides,
         local_invocation_id,
         workgroup_id,
@@ -486,6 +635,26 @@ fn emit_dispatch_outputs(
     for output in outputs {
         emit_output_store(ctx, out_gv_expr, output);
     }
+}
+
+fn emit_dispatch_bounds_guard(ctx: &mut CodegenCtx<'_>, dispatch: &DispatchInfo) {
+    let physical_workgroups = dispatch.workgroups / dispatch.simdgroups.max(1);
+    if physical_workgroups <= MAX_DISPATCH_WORKGROUPS_PER_DIMENSION {
+        return;
+    }
+
+    let workgroup = ctx.lower_index(IndexLevel::Workgroup);
+    let bound = ctx.emit_literal(Literal::U32(dispatch.workgroups));
+    let in_bounds = ctx.emit_binary(BinaryOperator::Less, workgroup, bound);
+    let accept = std::mem::replace(&mut ctx.body, Block::new());
+    ctx.body.push(
+        Statement::If {
+            condition: in_bounds,
+            accept,
+            reject: Block::new(),
+        },
+        Span::UNDEFINED,
+    );
 }
 
 fn emit_output_store(
@@ -597,22 +766,26 @@ fn declare_workgroup_buffers(
     module: &mut Module,
     dispatch: &DispatchInfo,
     types: &TypeCache,
+    input_dtypes: &[DType],
+    output_dtype: DType,
     buf_map: &mut HashMap<MemTier, (Handle<GlobalVariable>, bool)>,
+    dtype_map: &mut HashMap<MemTier, DType>,
 ) {
     for buf_info in &dispatch.tg_buffers {
         let key = MemTier::Threadgroup(buf_info.tg_name);
         if buf_map.contains_key(&key) {
             continue;
         }
+        let dtype = dtype_for_buffer_ref(input_dtypes, output_dtype, buf_info.device_name);
         let fixed_arr = module.types.insert(
             Type {
                 name: None,
                 inner: TypeInner::Array {
-                    base: types.f32,
+                    base: types.scalar(dtype),
                     size: ArraySize::Constant(
                         std::num::NonZeroU32::new(buf_info.size.max(1)).unwrap(),
                     ),
-                    stride: 4,
+                    stride: dtype.byte_size(),
                 },
             },
             Span::UNDEFINED,
@@ -628,6 +801,7 @@ fn declare_workgroup_buffers(
             Span::UNDEFINED,
         );
         buf_map.insert(key, (gv, true));
+        dtype_map.insert(key, dtype);
     }
 }
 

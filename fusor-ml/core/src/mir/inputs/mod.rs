@@ -1,17 +1,10 @@
-use crate::{QMatrix, TensorData};
+use crate::TensorData;
 
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum MirValue {
-    QMatrix(QMatrix),
     Tensor(TensorData),
     Integer(u32),
     Float(f32),
-}
-
-impl From<QMatrix> for MirValue {
-    fn from(value: QMatrix) -> Self {
-        Self::QMatrix(value)
-    }
 }
 
 impl From<TensorData> for MirValue {

@@ -59,6 +59,14 @@ impl Operation for SliceAssignOperation {
         // Output has the same layout as input
         map.get(&self.input).unwrap().clone()
     }
+
+    fn build_tensor_ir(
+        &self,
+        _nodes: &ComputeGraphInner,
+        inputs: &[MirValue],
+    ) -> Result<crate::mir::operation::TensorIrLowering, String> {
+        crate::tensor_ir_lowering::slice_assign(self, inputs)
+    }
 }
 
 impl<const R: usize, T: crate::DataType> Tensor<R, T> {

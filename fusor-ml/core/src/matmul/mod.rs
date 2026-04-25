@@ -26,20 +26,22 @@ impl MatMulOperation {
         first_shape: &[usize],
         second_shape: &[usize],
     ) -> Self {
+        assert_eq!(first_shape.len(), second_shape.len());
         let last_dim = first_shape.len() - 1;
         let second_to_last_dim = first_shape.len() - 2;
         let mut out_shape = first_shape.to_vec();
         out_shape[second_to_last_dim] = first_shape[second_to_last_dim];
         out_shape[last_dim] = second_shape[last_dim];
         assert_eq!(first_shape[last_dim], second_shape[second_to_last_dim]);
-        assert!(
-            first_shape
-                .iter()
-                .rev()
-                .skip(2)
-                .zip(second_shape.iter().rev().skip(2))
-                .all(|(a, b)| a == b)
-        );
+        for axis in 0..second_to_last_dim {
+            let lhs = first_shape[axis];
+            let rhs = second_shape[axis];
+            assert!(
+                lhs == rhs || lhs == 1 || rhs == 1,
+                "matmul batch dimension {axis} cannot broadcast {lhs} and {rhs}"
+            );
+            out_shape[axis] = lhs.max(rhs);
+        }
 
         Self {
             first,
@@ -78,7 +80,7 @@ impl Operation for MatMulOperation {
         let device = a.device();
         let a_shape = a.layout().shape();
         let b_shape = b.layout().shape();
-        let mut out_shape = a_shape.to_vec();
+        let mut out_shape = self.out_shape.to_vec();
         out_shape[second_to_last_dim] = a_shape[second_to_last_dim];
         out_shape[last_dim] = b_shape[last_dim];
         let output_tensor =

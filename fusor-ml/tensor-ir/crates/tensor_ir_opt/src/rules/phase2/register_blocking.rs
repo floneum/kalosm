@@ -107,6 +107,8 @@ impl crate::applier::TypedApplier for RegisterBlockingApplier {
             let factor_lit = egraph.add(TensorIr::Const(ScalarValue::U32(self.factor)));
 
             let mut new_children = inputs;
+            let mut value_classes = std::collections::HashSet::new();
+            let mut values_are_distinct = true;
             for i in 0..self.factor {
                 // Build the replacement workgroup index: new_wg * factor + i.
                 let wg_var = egraph.add(TensorIr::Simd(crate::language::SimdNode::Var(
@@ -129,6 +131,10 @@ impl crate::applier::TypedApplier for RegisterBlockingApplier {
                     0,
                     replacement,
                 );
+                if !value_classes.insert(egraph.find(new_value)) {
+                    values_are_distinct = false;
+                    break;
+                }
                 let new_addr = binding::subst(
                     egraph,
                     orig_addr,
@@ -139,6 +145,9 @@ impl crate::applier::TypedApplier for RegisterBlockingApplier {
                 );
                 new_children.push(new_value);
                 new_children.push(new_addr);
+            }
+            if !values_are_distinct {
+                continue;
             }
 
             let Some(blocked) =

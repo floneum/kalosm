@@ -18,7 +18,6 @@
 use std::collections::{HashMap, HashSet};
 
 use egg::{EGraph, Id, Rewrite};
-use ordered_float::OrderedFloat;
 use tensor_ir_egraph::binding;
 
 use crate::analysis::TensorAnalysis;
@@ -26,10 +25,30 @@ use crate::applier::SimpleEclassSearcher;
 use crate::language::{DispatchNode, HighLevelNode, SimdNode, TensorIr, add_list, extract_list};
 use crate::rules::RunnerConfig;
 use crate::types::{
-    BinaryOp, BinderKind, BufferRef, Dim, IndexLevel, MemTier, ScalarValue, Shape, VarRef,
+    BinaryOp, BinderKind, BufferRef, DType, Dim, IndexLevel, MemTier, ScalarValue, Shape, VarRef,
 };
 
 use super::{compute_flat_addr, compute_strided_addr, decompose_flat_index};
+
+fn reduce_identity(op: crate::types::ReduceOp, dtype: DType) -> ScalarValue {
+    match dtype {
+        DType::F16 => ScalarValue::F16(ordered_float::OrderedFloat(op.identity_f16())),
+        DType::F32 => ScalarValue::F32(ordered_float::OrderedFloat(op.identity_f32())),
+        DType::U32 => ScalarValue::U32(op.identity_u32()),
+        DType::I32 => ScalarValue::I32(op.identity_i32()),
+        DType::Bool => ScalarValue::Bool(false),
+    }
+}
+
+fn zero_value(dtype: DType) -> ScalarValue {
+    match dtype {
+        DType::F16 => ScalarValue::F16(ordered_float::OrderedFloat(0.0)),
+        DType::F32 => ScalarValue::F32(ordered_float::OrderedFloat(0.0)),
+        DType::U32 => ScalarValue::U32(0),
+        DType::I32 => ScalarValue::I32(0),
+        DType::Bool => ScalarValue::Bool(false),
+    }
+}
 
 pub(super) fn build(config: &RunnerConfig) -> Rewrite<TensorIr, TensorAnalysis> {
     let simd_width = config.device.simd_width;
@@ -66,12 +85,22 @@ pub(super) fn selected_high_level_node(
         };
         match high {
             HighLevelNode::Input { .. } => Some(high.clone()),
-            HighLevelNode::Restride { expr, .. } | HighLevelNode::Reduce { expr, .. } => egraph
-                [egraph.find(*expr)]
-            .data
-            .composite_dispatch
-            .lowerable
-            .then_some(high.clone()),
+            HighLevelNode::Restride { expr, .. }
+            | HighLevelNode::Resize { expr, .. }
+            | HighLevelNode::Reduce { expr, .. } => egraph[egraph.find(*expr)]
+                .data
+                .composite_dispatch
+                .lowerable
+                .then_some(high.clone()),
+            HighLevelNode::IndexSelect { children, .. } => children
+                .iter()
+                .all(|child| {
+                    egraph[egraph.find(*child)]
+                        .data
+                        .composite_dispatch
+                        .lowerable
+                })
+                .then_some(high.clone()),
             HighLevelNode::Elementwise { children_list, .. } => {
                 let children = extract_list(egraph, *children_list);
                 children[..children.len().saturating_sub(1)]
@@ -84,7 +113,10 @@ pub(super) fn selected_high_level_node(
                     })
                     .then_some(high.clone())
             }
-            HighLevelNode::Param(_) => None,
+            HighLevelNode::SliceAssign { .. } => None,
+            HighLevelNode::Param(_)
+            | HighLevelNode::Index(_)
+            | HighLevelNode::IndexedParam { .. } => None,
         }
     })
 }
@@ -95,9 +127,15 @@ fn find_lowerable_high_level(
 ) -> Option<HighLevelNode> {
     selected_high_level_node(egraph, eclass).and_then(|node| match node {
         HighLevelNode::Restride { .. }
+        | HighLevelNode::Resize { .. }
+        | HighLevelNode::IndexSelect { .. }
         | HighLevelNode::Elementwise { .. }
         | HighLevelNode::Reduce { .. } => Some(node),
-        HighLevelNode::Input { .. } | HighLevelNode::Param(_) => None,
+        HighLevelNode::SliceAssign { .. }
+        | HighLevelNode::Input { .. }
+        | HighLevelNode::Param(_)
+        | HighLevelNode::Index(_)
+        | HighLevelNode::IndexedParam { .. } => None,
     })
 }
 
@@ -142,7 +180,9 @@ fn collect_inputs_rec(
                 inputs.push(canonical);
             }
         }
-        HighLevelNode::Restride { expr, .. } | HighLevelNode::Reduce { expr, .. } => {
+        HighLevelNode::Restride { expr, .. }
+        | HighLevelNode::Resize { expr, .. }
+        | HighLevelNode::Reduce { expr, .. } => {
             collect_inputs_rec(egraph, expr, seen_exprs, seen_inputs, inputs);
         }
         HighLevelNode::Elementwise { children_list, .. } => {
@@ -151,7 +191,12 @@ fn collect_inputs_rec(
                 collect_inputs_rec(egraph, *child, seen_exprs, seen_inputs, inputs);
             }
         }
-        HighLevelNode::Param(_) => {}
+        HighLevelNode::IndexSelect { children, .. } => {
+            collect_inputs_rec(egraph, children[0], seen_exprs, seen_inputs, inputs);
+            collect_inputs_rec(egraph, children[1], seen_exprs, seen_inputs, inputs);
+        }
+        HighLevelNode::SliceAssign { .. } => {}
+        HighLevelNode::Param(_) | HighLevelNode::Index(_) | HighLevelNode::IndexedParam { .. } => {}
     }
 }
 
@@ -218,6 +263,9 @@ pub(super) fn lower_scalar_with_values(
     egraph: &mut EGraph<TensorIr, TensorAnalysis>,
     body: Id,
     values: &[Id],
+    ewise_inputs: &[Id],
+    indices: &[Id],
+    ctx: &EvalContext,
 ) -> Option<Id> {
     let canonical = egraph.find(body);
     let node = egraph[canonical]
@@ -225,8 +273,11 @@ pub(super) fn lower_scalar_with_values(
         .find(|node| {
             matches!(
                 node,
-                TensorIr::HighLevel(HighLevelNode::Param(_))
-                    | TensorIr::Const(_)
+                TensorIr::HighLevel(
+                    HighLevelNode::Param(_)
+                        | HighLevelNode::Index(_)
+                        | HighLevelNode::IndexedParam { .. }
+                ) | TensorIr::Const(_)
                     | TensorIr::BinOp(_, _)
                     | TensorIr::UnOp(_, _)
                     | TensorIr::TernOp(_, _)
@@ -236,20 +287,40 @@ pub(super) fn lower_scalar_with_values(
 
     match node {
         TensorIr::HighLevel(HighLevelNode::Param(i)) => values.get(i as usize).copied(),
+        TensorIr::HighLevel(HighLevelNode::Index(dim)) => indices.get(dim as usize).copied(),
+        TensorIr::HighLevel(HighLevelNode::IndexedParam {
+            index,
+            children_list,
+        }) => {
+            let source = *ewise_inputs.get(index as usize)?;
+            let indexed_children = extract_list(egraph, children_list);
+            let mut indexed_indices = Vec::with_capacity(indexed_children.len());
+            for child in indexed_children {
+                indexed_indices.push(lower_scalar_with_values(
+                    egraph,
+                    child,
+                    values,
+                    ewise_inputs,
+                    indices,
+                    ctx,
+                )?);
+            }
+            lower_tensor_point(egraph, source, &indexed_indices, ctx)
+        }
         TensorIr::Const(v) => Some(egraph.add(TensorIr::Const(v))),
         TensorIr::BinOp(op, [lhs, rhs]) => {
-            let lhs = lower_scalar_with_values(egraph, lhs, values)?;
-            let rhs = lower_scalar_with_values(egraph, rhs, values)?;
+            let lhs = lower_scalar_with_values(egraph, lhs, values, ewise_inputs, indices, ctx)?;
+            let rhs = lower_scalar_with_values(egraph, rhs, values, ewise_inputs, indices, ctx)?;
             Some(egraph.add(TensorIr::BinOp(op, [lhs, rhs])))
         }
         TensorIr::UnOp(op, arg) => {
-            let arg = lower_scalar_with_values(egraph, arg, values)?;
+            let arg = lower_scalar_with_values(egraph, arg, values, ewise_inputs, indices, ctx)?;
             Some(egraph.add(TensorIr::UnOp(op, arg)))
         }
         TensorIr::TernOp(op, [a, b, c]) => {
-            let a = lower_scalar_with_values(egraph, a, values)?;
-            let b = lower_scalar_with_values(egraph, b, values)?;
-            let c = lower_scalar_with_values(egraph, c, values)?;
+            let a = lower_scalar_with_values(egraph, a, values, ewise_inputs, indices, ctx)?;
+            let b = lower_scalar_with_values(egraph, b, values, ewise_inputs, indices, ctx)?;
+            let c = lower_scalar_with_values(egraph, c, values, ewise_inputs, indices, ctx)?;
             Some(egraph.add(TensorIr::TernOp(op, [a, b, c])))
         }
         _ => None,
@@ -293,6 +364,44 @@ pub(super) fn lower_tensor_point(
             let source_indices = decompose_flat_index(egraph, flat, &source_shape);
             lower_tensor_point(egraph, source, &source_indices, ctx)
         }
+        HighLevelNode::Resize {
+            input_shape,
+            output_shape,
+            expr: source,
+        } => {
+            if input_shape.static_numel() == output_shape.static_numel() {
+                let flat = compute_flat_addr(egraph, indices, &output_shape);
+                let source_indices = decompose_flat_index(egraph, flat, &input_shape);
+                return lower_tensor_point(egraph, source, &source_indices, ctx);
+            }
+            if input_shape.rank() != output_shape.rank() {
+                return None;
+            }
+
+            let mut in_bounds = egraph.add(TensorIr::Const(ScalarValue::Bool(true)));
+            let mut source_indices = Vec::with_capacity(indices.len());
+            for (idx, dim) in indices.iter().zip(input_shape.0.iter()) {
+                let Dim::Lit(limit) = dim else {
+                    return None;
+                };
+                let limit = egraph.add(TensorIr::Const(ScalarValue::U32(*limit)));
+                let axis_in_bounds = egraph.add(TensorIr::BinOp(BinaryOp::Lt, [*idx, limit]));
+                in_bounds = egraph.add(TensorIr::BinOp(BinaryOp::And, [in_bounds, axis_in_bounds]));
+                let zero = egraph.add(TensorIr::Const(ScalarValue::U32(0)));
+                source_indices.push(egraph.add(TensorIr::TernOp(
+                    crate::types::TernaryOp::Select,
+                    [axis_in_bounds, *idx, zero],
+                )));
+            }
+
+            let value = lower_tensor_point(egraph, source, &source_indices, ctx)?;
+            let dtype = egraph[canonical].data.dtype.or(egraph[source].data.dtype)?;
+            let zero = egraph.add(TensorIr::Const(zero_value(dtype)));
+            Some(egraph.add(TensorIr::TernOp(
+                crate::types::TernaryOp::Select,
+                [in_bounds, value, zero],
+            )))
+        }
         HighLevelNode::Elementwise {
             num_inputs,
             children_list,
@@ -305,7 +414,14 @@ pub(super) fn lower_tensor_point(
             for input in inputs {
                 values.push(lower_tensor_point(egraph, *input, indices, ctx)?);
             }
-            lower_scalar_with_values(egraph, body, &values)
+            lower_scalar_with_values(egraph, body, &values, inputs, indices, ctx)
+        }
+        HighLevelNode::IndexSelect { axis, children, .. } => {
+            let axis = axis as usize;
+            let selected = lower_tensor_point(egraph, children[1], &[indices[axis]], ctx)?;
+            let mut source_indices = indices.to_vec();
+            source_indices[axis] = selected;
+            lower_tensor_point(egraph, children[0], &source_indices, ctx)
         }
         HighLevelNode::Reduce {
             axis,
@@ -327,9 +443,8 @@ pub(super) fn lower_tensor_point(
                 build_reduce_input_indices(&source_shape, axis, &shifted_indices, k_var);
             let inner = lower_tensor_point(egraph, source, &source_indices, ctx)?;
 
-            let init = egraph.add(TensorIr::Const(ScalarValue::F32(OrderedFloat(
-                op.identity_f32(),
-            ))));
+            let source_dtype = egraph[source].data.dtype.unwrap_or(DType::F32);
+            let init = egraph.add(TensorIr::Const(reduce_identity(op, source_dtype)));
             let count = egraph.add(TensorIr::Const(ScalarValue::U32(reduce_dim)));
             let acc = egraph.add(TensorIr::Simd(SimdNode::Var(VarRef::acc(0))));
             let update = egraph.add(TensorIr::BinOp(op.bin_op(), [acc, inner]));
@@ -341,7 +456,10 @@ pub(super) fn lower_tensor_point(
                 children: [init, count, update],
             })))
         }
-        HighLevelNode::Param(_) => None,
+        HighLevelNode::SliceAssign { .. } => None,
+        HighLevelNode::Param(_) | HighLevelNode::Index(_) | HighLevelNode::IndexedParam { .. } => {
+            None
+        }
     }
 }
 

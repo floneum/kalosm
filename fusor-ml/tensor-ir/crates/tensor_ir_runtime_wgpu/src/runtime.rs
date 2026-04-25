@@ -6,6 +6,8 @@ use std::collections::HashMap;
 use std::time::Instant;
 use wgpu::util::DeviceExt;
 
+const MAX_DISPATCH_WORKGROUPS_PER_DIMENSION: u32 = 65_535;
+
 /// A GPU context that can execute `DispatchProgram`s.
 pub struct GpuContext {
     device: wgpu::Device,
@@ -551,9 +553,19 @@ impl GpuContext {
             pass.set_pipeline(pipeline);
             pass.set_bind_group(0, bind_group, &[]);
             let physical_workgroups = dispatch.workgroups / dispatch.simdgroups.max(1);
-            pass.dispatch_workgroups(physical_workgroups, 1, 1);
+            let (x, y, z) = dispatch_grid(physical_workgroups);
+            pass.dispatch_workgroups(x, y, z);
         }
     }
+}
+
+fn dispatch_grid(physical_workgroups: u32) -> (u32, u32, u32) {
+    if physical_workgroups <= MAX_DISPATCH_WORKGROUPS_PER_DIMENSION {
+        return (physical_workgroups, 1, 1);
+    }
+
+    let y = physical_workgroups.div_ceil(MAX_DISPATCH_WORKGROUPS_PER_DIMENSION);
+    (MAX_DISPATCH_WORKGROUPS_PER_DIMENSION, y, 1)
 }
 
 impl Default for GpuContext {

@@ -21,22 +21,6 @@ fn binary_op<const R: usize, T: DataType>(
     )
 }
 
-fn unsupported_binary_op<const R: usize, T: DataType>(
-    lhs: &Tensor<R, T>,
-    rhs: &Tensor<R, T>,
-    name: &str,
-) -> Tensor<R, T> {
-    lhs.binary_nary(
-        rhs,
-        NaryFunction::unsupported_binary(
-            Some(name.to_string()),
-            T::WGSL_TYPE,
-            T::WGSL_TYPE,
-            T::WGSL_TYPE,
-        ),
-    )
-}
-
 /// Macro to implement pairwise operators (Add, Sub, Mul, Div) for Tensor.
 ///
 /// Generates all four combinations of owned/reference implementations:
@@ -140,10 +124,10 @@ impl_pairwise_op!(
 /// Unlike `impl_pairwise_op!` which implements std::ops traits, this macro generates
 /// regular methods on Tensor for operations that don't have corresponding operators.
 macro_rules! impl_pairwise_method {
-    ($method:ident, $op_name:literal, $broadcast_method:ident, |$a:ident, $b:ident| $expr:expr) => {
+    ($method:ident, $op_name:literal, $ir_op:expr, $broadcast_method:ident, |$a:ident, $b:ident| $expr:expr) => {
         impl<const R: usize, T: DataType> Tensor<R, T> {
             pub fn $method(&self, other: &Self) -> Self {
-                unsupported_binary_op(self, other, $op_name)
+                binary_op(self, other, $op_name, $ir_op)
             }
 
             pub fn $broadcast_method<const R2: usize, const R3: usize>(
@@ -159,4 +143,4 @@ macro_rules! impl_pairwise_method {
     };
 }
 
-impl_pairwise_method!(pow, "pow", pow_, |a, b| a.pow(&b));
+impl_pairwise_method!(pow, "pow", BinaryOp::Pow, pow_, |a, b| a.pow(&b));

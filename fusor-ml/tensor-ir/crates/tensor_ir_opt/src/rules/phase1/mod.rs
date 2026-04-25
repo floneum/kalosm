@@ -30,11 +30,12 @@ mod exp_algebra;
 mod online_reduction;
 mod recursive_dispatch_lowering;
 mod reduce_lowering;
+mod slice_assign_lowering;
 
 use egg::{EGraph, Id, Rewrite};
 
 use crate::analysis::TensorAnalysis;
-use crate::language::{DispatchNode, HighLevelNode, SimdNode, TensorIr};
+use crate::language::{DispatchNode, HighLevelNode, SimdNode, TensorIr, extract_list};
 use crate::rules::RunnerConfig;
 use crate::types::{BinaryOp, BufferRef, Dim, MemTier, ScalarValue, Shape};
 
@@ -47,6 +48,7 @@ pub fn rules(config: &RunnerConfig) -> Vec<Rewrite<TensorIr, TensorAnalysis>> {
     let mut rules = vec![
         reduce_lowering::build(config),
         elementwise_lowering::build(config),
+        slice_assign_lowering::build(config),
         recursive_dispatch_lowering::build(config),
         online_reduction::build(config),
         ewise_fusion::build(config),
@@ -147,6 +149,34 @@ pub(super) fn lower_scalar_body_strided(
                 addr = egraph.add(TensorIr::BinOp(crate::types::BinaryOp::Add, [addr, offset]));
             }
             let buf_ref = BufferRef::Input(i);
+            let state = egraph.add(TensorIr::Dispatch(DispatchNode::Token));
+            egraph.add(TensorIr::Simd(SimdNode::Load {
+                tier: MemTier::Device(buf_ref),
+                children: [addr, state],
+            }))
+        }
+        TensorIr::HighLevel(HighLevelNode::Index(dim)) => {
+            indices.get(dim as usize).copied().unwrap_or(body_id)
+        }
+        TensorIr::HighLevel(HighLevelNode::IndexedParam {
+            index,
+            children_list,
+        }) => {
+            let input_id = ewise_inputs[index as usize];
+            let (strides, offset) = get_restride_layout(egraph, input_id);
+            let indexed_children = extract_list(egraph, children_list);
+            let indexed_indices = indexed_children
+                .into_iter()
+                .map(|child| lower_scalar_body_strided(egraph, child, ewise_inputs, indices))
+                .collect::<Vec<_>>();
+            let mut addr = compute_strided_addr(egraph, &indexed_indices, &strides);
+            if offset != 0 {
+                let offset = egraph.add(TensorIr::Const(crate::types::ScalarValue::U32(
+                    u32::try_from(offset).expect("offset fits in u32"),
+                )));
+                addr = egraph.add(TensorIr::BinOp(crate::types::BinaryOp::Add, [addr, offset]));
+            }
+            let buf_ref = BufferRef::Input(index);
             let state = egraph.add(TensorIr::Dispatch(DispatchNode::Token));
             egraph.add(TensorIr::Simd(SimdNode::Load {
                 tier: MemTier::Device(buf_ref),

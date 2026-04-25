@@ -128,19 +128,6 @@ impl NaryFunction {
             output_type,
         }
     }
-
-    pub fn unsupported_binary(
-        name: Option<String>,
-        _input_a_type: DataTypeEnum,
-        _input_b_type: DataTypeEnum,
-        output_type: DataTypeEnum,
-    ) -> Self {
-        Self {
-            name,
-            kind: NaryFunctionKind::Unsupported,
-            output_type,
-        }
-    }
 }
 
 /// A chain of unary functions used for pre/post processing in reduce/matmul/dequantize.
@@ -439,16 +426,12 @@ impl Operation for NaryOperation {
             .iter()
             .enumerate()
             .map(|(i, idx)| {
-                // If this input uses custom indexing, we need the dequantized tensor,
-                // not the raw QMatrix (custom indexing doesn't work on quantized data)
                 if self.expression.uses_custom_indexing_for_input(i) {
-                    // Try to get the cached (dequantized) result first
                     if let Some(cached) = nodes.get_result(*idx) {
                         return cached.into();
                     }
                 }
-                // Otherwise use the normal path which may return QMatrix for Dequantize nodes
-                nodes.get_result_or_qmatrix(*idx).unwrap().into()
+                nodes.get_result_or_tensor(*idx).unwrap().into()
             })
             .collect();
 
@@ -462,7 +445,7 @@ impl Operation for NaryOperation {
                 return None;
             }
             if let Ok(data) = std::convert::TryInto::<MaybeQData>::try_into(input.clone())
-                && data.datatype() == self.output_datatype.into()
+                && data.datatype() == self.output_datatype
                 && data.owned()
                 && !data.layout().allocation_overlaps()
             {

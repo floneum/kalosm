@@ -2,7 +2,7 @@ mod common;
 
 use common::{layer_norm_last_dim_3d, rms_norm_last_dim_3d, softmax_last_dim_2d};
 use fusor::{Device, Tensor};
-use fusor_conformance::{FuzzGenerator, approx_compare};
+use fusor_conformance::{FuzzGenerator, approx_compare, available_devices};
 use rand::distr::Uniform;
 
 fn norm_weight(feature_count: usize) -> Vec<f32> {
@@ -15,6 +15,45 @@ fn norm_bias(feature_count: usize) -> Vec<f32> {
     (0..feature_count)
         .map(|i| ((i % 7) as f32 - 3.0) * 0.1)
         .collect()
+}
+
+fn softmax_last_dim_4d(shape: [usize; 4], input: &[f32]) -> Vec<f32> {
+    let outer = shape[0] * shape[1] * shape[2];
+    let cols = shape[3];
+    let mut output = vec![0.0; input.len()];
+    for row in 0..outer {
+        let start = row * cols;
+        let row_values = &input[start..start + cols];
+        let max = row_values.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+        let mut sum = 0.0;
+        for col in 0..cols {
+            let value = (row_values[col] - max).exp();
+            output[start + col] = value;
+            sum += value;
+        }
+        for col in 0..cols {
+            output[start + col] /= sum;
+        }
+    }
+    output
+}
+
+#[tokio::test]
+async fn softmax_last_dim_rank4_matches_host_reference() {
+    for shape in [[2, 4, 1, 16], [2, 1, 3, 3]] {
+        let data = (0..shape.iter().product::<usize>())
+            .map(|i| (((i % 29) as f32) - 14.0) * 0.11)
+            .collect::<Vec<_>>();
+        let expected_data = softmax_last_dim_4d(shape, &data);
+        for device in available_devices().await {
+            let input = Tensor::from_slice(&device, shape, &data);
+            let actual = input.softmax::<3>(3).to_concrete();
+            let expected = Tensor::from_slice(&device, shape, &expected_data);
+            fusor_conformance::approx_eq(&actual, &expected, 1e-5)
+                .await
+                .unwrap();
+        }
+    }
 }
 
 #[tokio::test]

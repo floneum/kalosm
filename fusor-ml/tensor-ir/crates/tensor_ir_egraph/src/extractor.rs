@@ -72,7 +72,11 @@ impl SyntheticCostModel {
         match node {
             // High-level nodes have high cost to prefer lowered versions
             TensorIr::HighLevel(
-                HighLevelNode::Elementwise { .. } | HighLevelNode::Reduce { .. },
+                HighLevelNode::Elementwise { .. }
+                | HighLevelNode::Resize { .. }
+                | HighLevelNode::IndexSelect { .. }
+                | HighLevelNode::SliceAssign { .. }
+                | HighLevelNode::Reduce { .. },
             ) => 1000.0,
 
             // Scalar expressions and structural nodes.
@@ -194,7 +198,11 @@ impl SyntheticCostModel {
             TensorIr::Simd(SimdNode::Barrier { .. }) => self.barrier_cost,
             TensorIr::HighLevel(HighLevelNode::Input { .. } | HighLevelNode::Restride { .. })
             | TensorIr::Const(_)
-            | TensorIr::HighLevel(HighLevelNode::Param(_))
+            | TensorIr::HighLevel(
+                HighLevelNode::Param(_)
+                | HighLevelNode::Index(_)
+                | HighLevelNode::IndexedParam { .. },
+            )
             | TensorIr::Nil
             | TensorIr::Cons(_)
             | TensorIr::Dispatch(

@@ -265,12 +265,12 @@ where
         }
     }
 
-    /// Fused RMSNorm kernel that performs the entire normalization in a single kernel launch (GPU).
+    /// RMSNorm entry point kept for API compatibility.
     ///
     /// Formula: output = input / sqrt(mean(input^2) + eps) * weight + bias
     ///
-    /// On GPU, this is more efficient than the composite implementation which requires multiple
-    /// kernel launches. On CPU, this delegates to the composite operations.
+    /// Both backends lower through ordinary tensor operations. The GPU graph is
+    /// compiled by fusor-core's tensor_ir path at execution time.
     ///
     /// # Type Parameters
     /// * `W` - Rank of the weight/bias tensor (typically 1 for per-feature weights)
@@ -303,15 +303,18 @@ where
         (fusor_core::Tensor<R, D>, fusor_core::Tensor<W, D>): fusor_core::MaxRank<R, D>,
     {
         match (self, weight, bias) {
-            // GPU path - use the optimized fused kernel
-            (Tensor::Gpu(input), Tensor::Gpu(weight), bias_opt) => {
-                let gpu_bias = bias_opt.map(|b| match b {
-                    Tensor::Gpu(bias) => bias,
-                    _ => panic!("Bias must be on GPU when input is on GPU"),
-                });
-                Tensor::Gpu(input.rms_norm_fused(weight, gpu_bias, eps))
+            (Tensor::Gpu(_), Tensor::Gpu(_), None)
+            | (Tensor::Gpu(_), Tensor::Gpu(_), Some(Tensor::Gpu(_))) => {
+                let input_shape = self.shape();
+                let weight_broadcast = weight.broadcast_as(input_shape);
+                let normalized = self.rms_norm::<OUT_RANK, _>(&weight_broadcast, D::from_f32(eps));
+                if let Some(bias) = bias {
+                    let bias_broadcast = bias.broadcast_as(input_shape);
+                    (&normalized + &bias_broadcast).to_concrete()
+                } else {
+                    normalized
+                }
             }
-            // CPU path - use composite operations
             (Tensor::Cpu(_), Tensor::Cpu(_), _) => {
                 self.rms_norm_fused_cpu_impl::<W, OUT_RANK>(weight, bias, eps)
             }

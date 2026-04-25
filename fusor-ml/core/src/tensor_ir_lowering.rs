@@ -8,13 +8,15 @@ use crate::{
     composite::SoftmaxOperation,
     mir::{inputs::MirValue, operation::TensorIrLowering},
     nary_wise::{NaryExpr, NaryFunction, NaryFunctionKind, NaryOperation},
+    resize::ResizeOperation,
+    slice_assign::SliceAssignOperation,
 };
 
 fn dtype(ty: DataTypeEnum) -> Result<DType, String> {
     match ty {
         DataTypeEnum::F32 => Ok(DType::F32),
-        DataTypeEnum::F16 => Err("tensor_ir lowering does not support f16 yet".to_string()),
-        DataTypeEnum::U32 => Err("tensor_ir lowering does not support u32 tensors yet".to_string()),
+        DataTypeEnum::F16 => Ok(DType::F16),
+        DataTypeEnum::U32 => Ok(DType::U32),
     }
 }
 
@@ -70,7 +72,7 @@ fn add_tensor_input(
             IrDim::Sym(_) => 0,
         })
         .collect::<Vec<_>>();
-    if tensor.layout().shape() == index_dims.as_slice() {
+    if tensor.layout().offset() == 0 && tensor.layout().shape() == index_dims.as_slice() {
         let row_major = Strides::row_major_for_shape(index_space);
         let tensor_strides = strides(tensor.layout())?;
         if row_major.as_ref() == Some(&tensor_strides) {
@@ -87,6 +89,10 @@ fn add_tensor_input(
 }
 
 pub(crate) fn nary(op: &NaryOperation, inputs: &[MirValue]) -> Result<TensorIrLowering, String> {
+    if let Some(lowered) = try_index_select_nary(op, inputs)? {
+        return Ok(lowered);
+    }
+
     let mut tensors = tensor_inputs(inputs, op.inputs.len())?;
     let index_space = shape(&op.shape)?;
     let mut builder = TensorExprBuilder::new();
@@ -114,6 +120,84 @@ pub(crate) fn nary(op: &NaryOperation, inputs: &[MirValue]) -> Result<TensorIrLo
     })
 }
 
+fn try_index_select_nary(
+    op: &NaryOperation,
+    inputs: &[MirValue],
+) -> Result<Option<TensorIrLowering>, String> {
+    let NaryExpr::IndexedInput { input_idx, indices } = &op.expression else {
+        return Ok(None);
+    };
+    if *input_idx != 0 || op.inputs.len() < 2 {
+        return Ok(None);
+    }
+
+    let mut select_axis = None;
+    for (axis, index) in indices.iter().enumerate() {
+        match index {
+            NaryExpr::DimIndex(dim) if *dim == axis => {}
+            NaryExpr::IndexedInput {
+                input_idx: 1,
+                indices: index_indices,
+            } if index_indices.len() == 1 => {
+                let NaryExpr::DimIndex(dim) = index_indices[0] else {
+                    return Ok(None);
+                };
+                if dim != axis || select_axis.replace(axis).is_some() {
+                    return Ok(None);
+                }
+            }
+            _ => return Ok(None),
+        }
+    }
+
+    let Some(axis) = select_axis else {
+        return Ok(None);
+    };
+    let tensors = tensor_inputs(inputs, 2)?;
+    let input = &tensors[0];
+    let indices = &tensors[1];
+    if indices.datatype() != DataTypeEnum::U32 {
+        return Err(format!(
+            "tensor_ir index_select expected u32 indices, got {}",
+            indices.datatype()
+        ));
+    }
+    if indices.layout().rank() != 1 {
+        return Err(format!(
+            "tensor_ir index_select expected rank-1 indices, got rank {}",
+            indices.layout().rank()
+        ));
+    }
+    if input.layout().rank() != op.shape.len() {
+        return Err(format!(
+            "tensor_ir index_select input rank {} does not match output rank {}",
+            input.layout().rank(),
+            op.shape.len()
+        ));
+    }
+
+    let mut builder = TensorExprBuilder::new();
+    let input_shape = shape(input.layout().shape())?;
+    let indices_shape = shape(indices.layout().shape())?;
+    let input_id = add_tensor_input(&mut builder, 0, input, &input_shape)?;
+    let indices_id = add_tensor_input(&mut builder, 1, indices, &indices_shape)?;
+    let output_shape = shape(&op.shape)?;
+    let root = builder.index_select(
+        input_id,
+        indices_id,
+        output_shape,
+        u32::try_from(axis).map_err(|_| format!("index_select axis {axis} exceeds u32"))?,
+    );
+    let program = builder.build(root)?;
+
+    Ok(Some(TensorIrLowering {
+        program,
+        inputs: tensors,
+        output_shape: op.shape.clone(),
+        output_datatype: op.output_datatype,
+    }))
+}
+
 fn lower_nary_expr(
     builder: &mut TensorExprBuilder,
     expr: &NaryExpr,
@@ -124,14 +208,27 @@ fn lower_nary_expr(
 ) -> Result<ExprId, String> {
     match expr {
         NaryExpr::IndexedInput { input_idx, indices } => {
-            if !NaryExpr::is_elementwise_indices(indices) {
-                return Err("tensor_ir lowering does not support custom nary indexing yet".into());
+            if NaryExpr::is_elementwise_indices(indices) {
+                return Ok(builder.scalar_arg(*input_idx as u32));
             }
-            Ok(builder.scalar_arg(*input_idx as u32))
+            let indices = indices
+                .iter()
+                .map(|index| {
+                    lower_nary_expr(
+                        builder,
+                        index,
+                        tensors,
+                        ir_inputs,
+                        index_space,
+                        output_shape,
+                    )
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(builder.indexed_arg(*input_idx as u32, indices))
         }
-        NaryExpr::DimIndex(_) => {
-            Err("tensor_ir lowering does not support dimension-index scalar expressions yet".into())
-        }
+        NaryExpr::DimIndex(dim) => Ok(builder.scalar_index(
+            u32::try_from(*dim).map_err(|_| format!("dimension index {dim} exceeds u32"))?,
+        )),
         NaryExpr::Op { children, function } => {
             let children = children
                 .iter()
@@ -187,34 +284,35 @@ fn lower_nary_function(
             },
             [a],
         ) => {
-            let constant = add_f32_splat_input(
+            let constant = add_splat_input(
                 builder,
                 tensors,
                 ir_inputs,
                 index_space,
                 output_shape,
                 constant,
+                function.output_type,
             )?;
             lower_const_binop(builder, *op, *a, constant, *input_first)
         }
         (NaryFunctionKind::CompareConst { op, constant }, [a]) => {
-            let constant = add_f32_splat_input(
+            let constant = add_splat_input(
                 builder,
                 tensors,
                 ir_inputs,
                 index_space,
                 output_shape,
                 constant,
+                function.output_type,
             )?;
             lower_const_compare(builder, *op, *a, constant)
         }
         (NaryFunctionKind::Cast(output_type), [a]) => {
             Ok(builder.scalar_unop(cast_op(*output_type)?, *a))
         }
-        (NaryFunctionKind::Unsupported, _) => Err(format!(
-            "tensor_ir lowering does not support nary function {} yet",
-            function.name()
-        )),
+        (NaryFunctionKind::Unsupported, [a]) => {
+            lower_named_index_function(builder, function.name(), *a, output_shape)
+        }
         (kind, children) => Err(format!(
             "tensor_ir lowering got invalid arity {} for nary function {} ({kind:?})",
             children.len(),
@@ -223,13 +321,59 @@ fn lower_nary_function(
     }
 }
 
-fn add_f32_splat_input(
+fn lower_named_index_function(
+    builder: &mut TensorExprBuilder,
+    name: &str,
+    input: ExprId,
+    output_shape: &[usize],
+) -> Result<ExprId, String> {
+    let last_dim = output_shape
+        .last()
+        .copied()
+        .ok_or_else(|| "index helper requires a non-scalar output shape".to_string())?;
+    let half = u32::try_from(last_dim / 2)
+        .map_err(|_| format!("last dimension {last_dim} exceeds u32"))?;
+    let one = builder.scalar_u32(1);
+    let two = builder.scalar_u32(2);
+    let half_lit = builder.scalar_u32(half);
+
+    Ok(match name {
+        "div2" => builder.scalar_binop(BinaryOp::Div, [input, two]),
+        "mod2" => builder.scalar_binop(BinaryOp::Mod, [input, two]),
+        "mod_half" => builder.scalar_binop(BinaryOp::Mod, [input, half_lit]),
+        "div_half" => builder.scalar_binop(BinaryOp::Div, [input, half_lit]),
+        "neighbor_interleaved_idx" => {
+            let parity = builder.scalar_binop(BinaryOp::Mod, [input, two]);
+            let zero = builder.scalar_u32(0);
+            let is_odd = builder.scalar_binop(BinaryOp::Neq, [parity, zero]);
+            let prev = builder.scalar_binop(BinaryOp::Sub, [input, one]);
+            let next = builder.scalar_binop(BinaryOp::Add, [input, one]);
+            builder.scalar_ternop(TernaryOp::Select, [is_odd, prev, next])
+        }
+        "neighbor_half_idx" => {
+            let side = builder.scalar_binop(BinaryOp::Div, [input, half_lit]);
+            let zero = builder.scalar_u32(0);
+            let is_upper_half = builder.scalar_binop(BinaryOp::Neq, [side, zero]);
+            let prev = builder.scalar_binop(BinaryOp::Sub, [input, half_lit]);
+            let next = builder.scalar_binop(BinaryOp::Add, [input, half_lit]);
+            builder.scalar_ternop(TernaryOp::Select, [is_upper_half, prev, next])
+        }
+        _ => {
+            return Err(format!(
+                "tensor_ir lowering does not support nary function {name} yet"
+            ));
+        }
+    })
+}
+
+fn add_splat_input(
     builder: &mut TensorExprBuilder,
     tensors: &mut Vec<TensorData>,
     ir_inputs: &mut Vec<ExprId>,
     index_space: &Shape,
     output_shape: &[usize],
     constant: &str,
+    datatype: DataTypeEnum,
 ) -> Result<ExprId, String> {
     let value = parse_f32_literal(constant)?;
     let device = tensors
@@ -237,7 +381,13 @@ fn add_f32_splat_input(
         .ok_or_else(|| "constant nary op requires at least one tensor input".to_string())?
         .device()
         .clone();
-    let tensor = TensorData::new_splat(&device, output_shape, value);
+    let tensor = match datatype {
+        DataTypeEnum::F32 => TensorData::new_splat(&device, output_shape, value),
+        DataTypeEnum::F16 => {
+            TensorData::new_splat(&device, output_shape, half::f16::from_f32(value))
+        }
+        DataTypeEnum::U32 => TensorData::new_splat(&device, output_shape, value as u32),
+    };
     let input_id = u32::try_from(tensors.len()).map_err(|_| "too many tensor_ir inputs")?;
     let ir_input = add_tensor_input(builder, input_id, &tensor, index_space)?;
     tensors.push(tensor);
@@ -400,12 +550,6 @@ pub(crate) fn matmul(
     inputs: &[MirValue],
 ) -> Result<TensorIrLowering, String> {
     let tensors = tensor_inputs(inputs, 2)?;
-    if op.datatype != DataTypeEnum::F32 {
-        return Err(format!(
-            "tensor_ir matmul only supports f32, got {}",
-            op.datatype
-        ));
-    }
     if !op.pre_element_wise[0].functions.is_empty()
         || !op.pre_element_wise[1].functions.is_empty()
         || !op.post_element_wise.functions.is_empty()
@@ -416,6 +560,7 @@ pub(crate) fn matmul(
     let lhs = &tensors[0];
     let rhs = &tensors[1];
     let out_shape = op.out_shape.clone();
+    let ir_dtype = dtype(op.datatype)?;
     let rank = out_shape.len();
     let m = out_shape[rank - 2];
     let n = out_shape[rank - 1];
@@ -426,11 +571,11 @@ pub(crate) fn matmul(
     let index_space = shape(&index_dims)?;
 
     let mut builder = TensorExprBuilder::new();
-    let lhs_id = builder.input(0, shape(lhs.layout().shape())?, DType::F32);
-    let rhs_id = builder.input(1, shape(rhs.layout().shape())?, DType::F32);
+    let lhs_id = builder.input(0, shape(lhs.layout().shape())?, ir_dtype);
+    let rhs_id = builder.input(1, shape(rhs.layout().shape())?, ir_dtype);
 
-    let lhs_strides = matmul_lhs_strides(lhs.layout())?;
-    let rhs_strides = matmul_rhs_strides(rhs.layout())?;
+    let lhs_strides = matmul_lhs_strides(lhs.layout(), &out_shape)?;
+    let rhs_strides = matmul_rhs_strides(rhs.layout(), &out_shape)?;
     let lhs_id = builder.restride_with_offset(
         lhs_id,
         index_space.clone(),
@@ -460,11 +605,162 @@ pub(crate) fn matmul(
     })
 }
 
-fn matmul_lhs_strides(layout: &Layout) -> Result<Vec<i64>, String> {
+pub(crate) fn slice_assign(
+    op: &SliceAssignOperation,
+    inputs: &[MirValue],
+) -> Result<TensorIrLowering, String> {
+    let [MirValue::Tensor(input), MirValue::Tensor(value), _] = inputs else {
+        return Err("tensor_ir slice_assign expected [input, value, output]".to_string());
+    };
+    if input.datatype() != value.datatype() {
+        return Err(format!(
+            "slice_assign input datatype {} does not match value datatype {}",
+            input.datatype(),
+            value.datatype()
+        ));
+    }
+    if op.slices.len() != input.layout().rank() {
+        return Err(format!(
+            "slice_assign got {} slices for rank-{} input",
+            op.slices.len(),
+            input.layout().rank()
+        ));
+    }
+    if value.layout().rank() != op.slices.len() {
+        return Err(format!(
+            "slice_assign value rank {} does not match slice rank {}",
+            value.layout().rank(),
+            op.slices.len()
+        ));
+    }
+    for (axis, (slice, value_dim)) in op
+        .slices
+        .iter()
+        .zip(value.layout().shape().iter())
+        .enumerate()
+    {
+        let input_dim = input.layout().shape()[axis];
+        if slice.start > slice.end || slice.end > input_dim {
+            return Err(format!(
+                "slice_assign slice {:?} is invalid for axis {axis} with dim {input_dim}",
+                slice
+            ));
+        }
+        let slice_len = slice.end - slice.start;
+        if slice_len != *value_dim {
+            return Err(format!(
+                "slice_assign value axis {axis} has dim {value_dim}, expected {slice_len}"
+            ));
+        }
+    }
+
+    let output_shape = shape(input.layout().shape())?;
+    let mut builder = TensorExprBuilder::new();
+    let input_id = add_tensor_input(&mut builder, 0, input, &output_shape)?;
+    let value_shape = shape(value.layout().shape())?;
+    let raw_value = builder.input(1, value_shape.clone(), dtype(value.datatype())?);
+    let value_id = {
+        let row_major = Strides::row_major_for_shape(&value_shape);
+        let value_strides = strides(value.layout())?;
+        if value.layout().offset() == 0 && row_major.as_ref() == Some(&value_strides) {
+            raw_value
+        } else {
+            builder.restride_with_offset(
+                raw_value,
+                value_shape,
+                value_strides,
+                i64::try_from(value.layout().offset()).map_err(|_| {
+                    format!("tensor offset {} exceeds i64", value.layout().offset())
+                })?,
+            )
+        }
+    };
+    let slices = op
+        .slices
+        .iter()
+        .map(|slice| {
+            let start = u32::try_from(slice.start)
+                .map_err(|_| format!("slice start {} exceeds u32", slice.start))?;
+            let end = u32::try_from(slice.end)
+                .map_err(|_| format!("slice end {} exceeds u32", slice.end))?;
+            Ok((start, end))
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    let root = builder.slice_assign(input_id, value_id, output_shape, slices);
+    let program = builder.build(root)?;
+
+    Ok(TensorIrLowering {
+        program,
+        inputs: vec![input.clone(), value.clone()],
+        output_shape: input.layout().shape().into(),
+        output_datatype: input.datatype(),
+    })
+}
+
+pub(crate) fn resize(
+    op: &ResizeOperation,
+    inputs: &[MirValue],
+) -> Result<TensorIrLowering, String> {
+    let [MirValue::Tensor(input), _] = inputs else {
+        return Err("tensor_ir resize expected [input, output_slice]".to_string());
+    };
+    let current_elems = op.current_shape.iter().product::<usize>();
+    let new_elems = op.new_shape.iter().product::<usize>();
+    if op.fill_shape == op.new_shape && current_elems != new_elems {
+        return Err(format!(
+            "tensor_ir resize cannot change element count from {current_elems} to {new_elems}"
+        ));
+    }
+    if op.fill_shape != op.new_shape {
+        if op.current_shape.len() != op.new_shape.len() || op.fill_shape.len() != op.new_shape.len()
+        {
+            return Err(format!(
+                "tensor_ir resize expected matching ranks, got current {}, fill {}, new {}",
+                op.current_shape.len(),
+                op.fill_shape.len(),
+                op.new_shape.len()
+            ));
+        }
+        for (axis, ((fill, current), new)) in op
+            .fill_shape
+            .iter()
+            .zip(op.current_shape.iter())
+            .zip(op.new_shape.iter())
+            .enumerate()
+        {
+            if *fill > *current || *fill > *new {
+                return Err(format!(
+                    "tensor_ir resize fill dim {fill} on axis {axis} exceeds current {current} or new {new}"
+                ));
+            }
+        }
+    }
+
+    let input_shape = shape(&op.current_shape)?;
+    let output_shape = shape(&op.new_shape)?;
+    let mut builder = TensorExprBuilder::new();
+    let input_id = add_tensor_input(&mut builder, 0, input, &input_shape)?;
+    let root = builder.resize(input_id, input_shape, output_shape);
+    let program = builder.build(root)?;
+
+    Ok(TensorIrLowering {
+        program,
+        inputs: vec![input.clone()],
+        output_shape: op.new_shape.clone(),
+        output_datatype: input.datatype(),
+    })
+}
+
+fn matmul_lhs_strides(layout: &Layout, out_shape: &[usize]) -> Result<Vec<i64>, String> {
     let rank = layout.rank();
     let mut result = Vec::with_capacity(rank + 1);
     for axis in 0..rank - 2 {
-        result.push(i64::try_from(layout.strides()[axis]).map_err(|e| e.to_string())?);
+        let stride = if layout.shape()[axis] == 1 && out_shape[axis] > 1 {
+            0
+        } else {
+            layout.strides()[axis]
+        };
+        result.push(i64::try_from(stride).map_err(|e| e.to_string())?);
     }
     result.push(i64::try_from(layout.strides()[rank - 2]).map_err(|e| e.to_string())?);
     result.push(0);
@@ -472,11 +768,16 @@ fn matmul_lhs_strides(layout: &Layout) -> Result<Vec<i64>, String> {
     Ok(result)
 }
 
-fn matmul_rhs_strides(layout: &Layout) -> Result<Vec<i64>, String> {
+fn matmul_rhs_strides(layout: &Layout, out_shape: &[usize]) -> Result<Vec<i64>, String> {
     let rank = layout.rank();
     let mut result = Vec::with_capacity(rank + 1);
     for axis in 0..rank - 2 {
-        result.push(i64::try_from(layout.strides()[axis]).map_err(|e| e.to_string())?);
+        let stride = if layout.shape()[axis] == 1 && out_shape[axis] > 1 {
+            0
+        } else {
+            layout.strides()[axis]
+        };
+        result.push(i64::try_from(stride).map_err(|e| e.to_string())?);
     }
     result.push(0);
     result.push(i64::try_from(layout.strides()[rank - 1]).map_err(|e| e.to_string())?);

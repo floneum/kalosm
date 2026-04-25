@@ -140,14 +140,14 @@ impl RopeFusedOperation {
             // Interleaved: neighbor at dim_last ± 1 based on parity
             RopeMode::Interleaved => NaryExpr::unsupported_unary(
                 dim_last,
-                "neighbor_idx",
+                "neighbor_interleaved_idx",
                 DataTypeEnum::U32,
                 DataTypeEnum::U32,
             ),
             // Normal: neighbor at dim_last ± half based on position
             RopeMode::Normal => NaryExpr::unsupported_unary(
                 dim_last,
-                "neighbor_idx",
+                "neighbor_half_idx",
                 DataTypeEnum::U32,
                 DataTypeEnum::U32,
             ),

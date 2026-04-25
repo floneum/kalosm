@@ -8,10 +8,13 @@ use naga::{
 
 use crate::language::{DispatchNode, SimdNode, TensorIr, extract_list};
 use crate::types::{
-    BinaryOp, BinderKind, IndexLevel, MemTier, ScalarValue, TernaryOp, UnaryOp, VarRef, slots,
+    BinaryOp, BinderKind, DType, IndexLevel, MemTier, ScalarValue, TernaryOp, UnaryOp, VarRef,
+    slots,
 };
 
-use super::{BinderFrame, CodegenCtx, ThetaFrame, binary_args};
+use super::{
+    BinderFrame, CodegenCtx, MAX_DISPATCH_WORKGROUPS_PER_DIMENSION, ThetaFrame, binary_args,
+};
 
 impl CodegenCtx<'_> {
     /// Find the `depth`-th frame of the given `kind` on the binder stack,
@@ -319,6 +322,7 @@ impl CodegenCtx<'_> {
 
     pub(super) fn lower_scalar_literal(&mut self, v: &ScalarValue) -> Handle<Expression> {
         let lit = match v {
+            ScalarValue::F16(f) => Literal::F16(half::f16::from_f32(f.0)),
             ScalarValue::F32(f) => Literal::F32(f.0),
             ScalarValue::I32(i) => Literal::I32(*i),
             ScalarValue::U32(u) => Literal::U32(*u),
@@ -348,20 +352,24 @@ impl CodegenCtx<'_> {
                 self.emit_binary(BinaryOperator::Divide, lid_x, sw)
             }
             IndexLevel::Workgroup => {
+                let wg_x = self.emit_access_index(self.workgroup_id, 0);
+                let wg_y = self.emit_access_index(self.workgroup_id, 1);
+                let stride = self.emit_literal(Literal::U32(MAX_DISPATCH_WORKGROUPS_PER_DIMENSION));
+                let wg_y_offset = self.emit_binary(BinaryOperator::Multiply, wg_y, stride);
+                let physical_wg = self.emit_binary(BinaryOperator::Add, wg_y_offset, wg_x);
                 if self.simdgroups > 1 {
-                    // Virtual workgroup index: workgroup_id.x * simdgroups + simdgroup_in_wg
-                    // This maps each simdgroup to its own "virtual workgroup" so the
-                    // IR addressing (which uses one workgroup per simdgroup) stays correct.
-                    let wg_x = self.emit_access_index(self.workgroup_id, 0);
+                    // Virtual workgroup index: physical_workgroup * simdgroups + simdgroup_in_wg.
+                    // The physical workgroup index is linearized from x/y so runtimes can split
+                    // large launches across WebGPU's per-dimension dispatch limit.
                     let sg_lit = self.emit_literal(Literal::U32(self.simdgroups));
-                    let wg_times_sg = self.emit_binary(BinaryOperator::Multiply, wg_x, sg_lit);
+                    let wg_times_sg =
+                        self.emit_binary(BinaryOperator::Multiply, physical_wg, sg_lit);
                     let lid_x = self.emit_access_index(self.local_invocation_id, 0);
                     let sw = self.emit_literal(Literal::U32(self.simd_width));
                     let sg_in_wg = self.emit_binary(BinaryOperator::Divide, lid_x, sw);
                     self.emit_binary(BinaryOperator::Add, wg_times_sg, sg_in_wg)
                 } else {
-                    // workgroup_id.x
-                    self.emit_access_index(self.workgroup_id, 0)
+                    physical_wg
                 }
             }
         }
@@ -375,7 +383,9 @@ impl CodegenCtx<'_> {
             UnaryOp::Neg => self.emit_unary(UnaryOperator::Negate, arg),
             UnaryOp::Not => self.emit_unary(UnaryOperator::LogicalNot, arg),
             UnaryOp::Exp => self.emit_math1(MathFunction::Exp, arg),
+            UnaryOp::Exp2 => self.emit_math1(MathFunction::Exp2, arg),
             UnaryOp::Log => self.emit_math1(MathFunction::Log, arg),
+            UnaryOp::Log2 => self.emit_math1(MathFunction::Log2, arg),
             UnaryOp::Sin => self.emit_math1(MathFunction::Sin, arg),
             UnaryOp::Cos => self.emit_math1(MathFunction::Cos, arg),
             UnaryOp::Tan => self.emit_math1(MathFunction::Tan, arg),
@@ -422,6 +432,7 @@ impl CodegenCtx<'_> {
             BinaryOp::Shr => self.emit_binary(BinaryOperator::ShiftRight, lhs, rhs),
             BinaryOp::Max => self.emit_math2(MathFunction::Max, lhs, rhs),
             BinaryOp::Min => self.emit_math2(MathFunction::Min, lhs, rhs),
+            BinaryOp::Pow => self.emit_math2(MathFunction::Pow, lhs, rhs),
         }
     }
 
@@ -758,10 +769,22 @@ impl CodegenCtx<'_> {
         }
     }
 
+    fn type_for_dtype(&self, dtype: DType) -> Handle<Type> {
+        self.types.scalar(dtype)
+    }
+
+    fn dtype_for_tier(&self, tier: &MemTier) -> DType {
+        self.buffer_dtypes.get(tier).copied().unwrap_or(DType::F32)
+    }
+
     pub(super) fn infer_expr_type(&self, id: Id) -> Handle<Type> {
         let canonical = self.egraph.find(id);
+        if let Some(dtype) = self.egraph[canonical].data.dtype {
+            return self.type_for_dtype(dtype);
+        }
         match self.select_lowering_node(canonical) {
             TensorIr::Const(value) => match value {
+                ScalarValue::F16(_) => self.types.f16,
                 ScalarValue::F32(_) => self.types.f32,
                 ScalarValue::I32(_) => self.types.i32,
                 ScalarValue::U32(_) => self.types.u32,
@@ -776,9 +799,23 @@ impl CodegenCtx<'_> {
                 // Iter index (Theta) and thread indices (Dispatch) are u32.
                 _ => self.types.u32,
             },
-            TensorIr::Simd(
-                SimdNode::Load { .. } | SimdNode::ReduceSimd { .. } | SimdNode::Shuffle(_),
-            ) => self.types.f32,
+            TensorIr::Simd(SimdNode::Load { tier, .. }) => {
+                self.type_for_dtype(self.dtype_for_tier(&tier))
+            }
+            TensorIr::Simd(SimdNode::ReduceSimd { src, .. }) => self.infer_expr_type(src),
+            TensorIr::Simd(SimdNode::Shuffle([src, _])) => self.infer_expr_type(src),
+            TensorIr::UnOp(op, arg) => match op {
+                UnaryOp::CastF16 => self.types.f16,
+                UnaryOp::CastF32 => self.types.f32,
+                UnaryOp::CastI32 => self.types.i32,
+                UnaryOp::CastU32 => self.types.u32,
+                UnaryOp::CastBool | UnaryOp::Not => self.types.bool,
+                _ => self.infer_expr_type(arg),
+            },
+            TensorIr::TernOp(op, args) => match op {
+                TernaryOp::Fma => self.infer_expr_type(args[0]),
+                TernaryOp::Select => self.infer_expr_type(args[1]),
+            },
             TensorIr::BinOp(name, args) => match name {
                 BinaryOp::Lt
                 | BinaryOp::Le

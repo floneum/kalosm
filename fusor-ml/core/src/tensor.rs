@@ -16,7 +16,6 @@ use crate::{
     map_layout::MapLayoutOperation,
     mir::operation::Operation,
     nary_wise::{NaryExpr, NaryFunction, NaryOperation},
-    quantized::{QMatrix, matmul::QMatMulOperation},
     resize::ResizeOperation,
     slice_assign::SliceAssignOperation,
 };
@@ -297,15 +296,6 @@ impl LazyTensorData {
         let mut info = self.info.clone();
         info.shape = function.out_shape.clone();
         let key = device.compute_graph().create_mat_mul(function);
-
-        Self::from_parts(device, info, key)
-    }
-
-    pub(crate) fn q_mat_mul(&self, function: QMatMulOperation) -> Self {
-        let device = self.device.clone();
-        let mut info = self.info.clone();
-        info.shape = function.out_shape.clone();
-        let key = device.compute_graph().create_q_mat_mul(function);
 
         Self::from_parts(device, info, key)
     }
@@ -965,13 +955,6 @@ impl<D: DataType, const R: usize> Tensor<R, D> {
         );
 
         Self::from_parts(self.data.mat_mul(operation))
-    }
-
-    pub(crate) fn add_q_mat_mul(&self, other: &QMatrix) -> Self {
-        let operation =
-            QMatMulOperation::new(self.datatype(), self.shape(), self.data.key, other.clone());
-
-        Self::from_parts(self.data.q_mat_mul(operation))
     }
 
     pub(crate) fn add_resize<const R2: usize>(&self, op: ResizeOperation) -> Tensor<R2, D> {

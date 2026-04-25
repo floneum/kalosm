@@ -24,17 +24,6 @@ fn unary_op<const R: usize, In: DataType, Out: DataType>(
     ))
 }
 
-fn unsupported_unary_op<const R: usize, In: DataType, Out: DataType>(
-    input: &Tensor<R, In>,
-    name: Option<&str>,
-) -> Tensor<R, Out> {
-    input.unary_nary(NaryFunction::unsupported_unary(
-        name.map(|s| s.to_string()),
-        In::WGSL_TYPE,
-        Out::WGSL_TYPE,
-    ))
-}
-
 fn binary_const_op<const R: usize, T: DataType>(
     input: &Tensor<R, T>,
     name: Option<&str>,
@@ -245,17 +234,18 @@ impl<const R: usize, T: DataType> Tensor<R, T> {
 
 impl<const R: usize, D: DataType> Tensor<R, D> {
     pub fn less_appoximate_exp(&self) -> Self {
-        if D::WGSL_TYPE != DataTypeEnum::F32 {
-            return self.exp();
-        }
-        unsupported_unary_op(self, Some("less_appoximate_exp"))
+        unary_op(
+            self,
+            Some("less_appoximate_exp"),
+            UnaryOp::Exp,
+            |grad, input| grad * &input.exp(),
+        )
     }
 
     pub fn appoximate_exp(&self) -> Self {
-        if D::WGSL_TYPE != DataTypeEnum::F32 {
-            return self.exp();
-        }
-        unsupported_unary_op(self, Some("appoximate_exp"))
+        unary_op(self, Some("appoximate_exp"), UnaryOp::Exp, |grad, input| {
+            grad * &input.exp()
+        })
     }
 
     pub fn exp(&self) -> Self {
@@ -267,7 +257,7 @@ impl<const R: usize, D: DataType> Tensor<R, D> {
 
 impl<const R: usize, D: crate::FloatDataType> Tensor<R, D> {
     pub fn exp2(&self) -> Self {
-        unsupported_unary_op(self, Some("exp2"))
+        unary_op(self, Some("exp2"), UnaryOp::Exp2, |grad, _input| grad)
     }
 }
 
@@ -279,14 +269,15 @@ impl<const R: usize, D: DataType> Tensor<R, D> {
 
 impl<const R: usize, D: crate::FloatDataType> Tensor<R, D> {
     pub fn log2(&self) -> Self {
-        unsupported_unary_op(self, Some("log2"))
+        unary_op(self, Some("log2"), UnaryOp::Log2, |grad, input| {
+            grad / input
+        })
     }
 }
 
 impl<const R: usize, D: DataType> Tensor<R, D> {
     pub fn pow_elementwise(&self, exponent: D) -> Self {
-        let _ = exponent;
-        unsupported_unary_op(self, Some("pow"))
+        binary_const_op(self, Some("pow"), BinaryOp::Pow, exponent, true)
     }
 }
 
