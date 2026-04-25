@@ -6,7 +6,7 @@ use naga::{
     Span, Statement, SubgroupOperation, UnaryOperator,
 };
 
-use crate::types::ReduceOp;
+use crate::types::{DType, ReduceOp};
 
 use super::CodegenCtx;
 
@@ -36,11 +36,29 @@ impl CodegenCtx<'_> {
     pub(super) fn lower_reduce_simd(&mut self, op: ReduceOp, src_id: Id) -> Handle<Expression> {
         let src = self.lower_expr(src_id);
 
-        let sg_op = match op {
-            ReduceOp::Add => SubgroupOperation::Add,
-            ReduceOp::Mul => SubgroupOperation::Mul,
-            ReduceOp::Max => SubgroupOperation::Max,
-            ReduceOp::Min => SubgroupOperation::Min,
+        let dtype = self.egraph[src_id]
+            .data
+            .dtype
+            .unwrap_or(DType::F32);
+        let sg_op = match (op, dtype) {
+            (ReduceOp::Add, DType::F16 | DType::F32 | DType::I32 | DType::U32) => {
+                SubgroupOperation::Add
+            }
+            (ReduceOp::Mul, DType::F16 | DType::F32 | DType::I32 | DType::U32) => {
+                SubgroupOperation::Mul
+            }
+            (ReduceOp::Max, DType::F16 | DType::F32 | DType::I32 | DType::U32) => {
+                SubgroupOperation::Max
+            }
+            (ReduceOp::Min, DType::F16 | DType::F32 | DType::I32 | DType::U32) => {
+                SubgroupOperation::Min
+            }
+            (ReduceOp::And, DType::Bool) => SubgroupOperation::All,
+            (ReduceOp::Or, DType::Bool) => SubgroupOperation::Any,
+            (ReduceOp::And, DType::I32 | DType::U32) => SubgroupOperation::And,
+            (ReduceOp::Or, DType::I32 | DType::U32) => SubgroupOperation::Or,
+            (ReduceOp::Xor, DType::I32 | DType::U32) => SubgroupOperation::Xor,
+            _ => panic!("unsupported ReduceSimd op/dtype combination: {op:?} over {dtype:?}"),
         };
 
         let ty = self.infer_expr_type(src_id);

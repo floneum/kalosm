@@ -112,7 +112,7 @@ impl Resolver {
             let map_layout = graph.nodes.nodes.node_weight(node).and_then(|node_data| {
                 match &node_data.variant {
                     ComputeGraphNodeVariant::MapLayout(map_layout) => Some(map_layout.clone()),
-                    ComputeGraphNodeVariant::Resize(resize) => resize.lower(graph),
+                    ComputeGraphNodeVariant::TensorExpr(op) => op.try_metadata_lower(graph),
                     _ => None,
                 }
             });
@@ -254,12 +254,8 @@ impl Resolver {
 
     fn lower_node(&self, node: &ExecutionNode) -> Option<Arc<dyn Operation>> {
         match &node.variant {
-            ComputeGraphNodeVariant::Nary(op) => Some(Arc::new(op.clone())),
-            ComputeGraphNodeVariant::MatMul(op) => Some(Arc::new(op.clone())),
-            ComputeGraphNodeVariant::Reduce(op) => Some(Arc::new(op.clone())),
+            ComputeGraphNodeVariant::TensorExpr(op) => Some(Arc::new(op.clone())),
             ComputeGraphNodeVariant::MapLayout(op) => Some(Arc::new(op.clone())),
-            ComputeGraphNodeVariant::Resize(op) => Some(Arc::new(op.clone())),
-            ComputeGraphNodeVariant::SliceAssign(op) => Some(Arc::new(op.clone())),
             ComputeGraphNodeVariant::Tensor(_) => None,
             ComputeGraphNodeVariant::Custom(op) => Some(op.clone()),
         }

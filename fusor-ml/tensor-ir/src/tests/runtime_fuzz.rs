@@ -4,7 +4,7 @@ use std::panic::{self, AssertUnwindSafe};
 
 use crate::extractor::BeamConfig;
 use crate::language::TensorIr;
-use crate::rules::{self, Phase, RunnerConfig};
+use crate::rules::{self, Phase, RunnerConfig, SaturationReport};
 use crate::skeleton::{beam_extract_valid_candidates, build_dispatch_program_from_extracted};
 use crate::types::{DType, DeviceProfile, Dim, LoweringOptions, Shape};
 
@@ -53,7 +53,11 @@ fn max_abs_err(lhs: &[f32], rhs: &[f32]) -> f32 {
 fn matmul_candidates(
     case: MatmulCase,
     candidate_limit: usize,
-) -> (crate::TensorEGraph, Vec<(f64, egg::RecExpr<TensorIr>)>) {
+) -> (
+    crate::TensorEGraph,
+    SaturationReport,
+    Vec<(f64, egg::RecExpr<TensorIr>)>,
+) {
     let mut builder = crate::IrBuilder::new();
     let lhs = builder.input(
         0,
@@ -71,13 +75,13 @@ fn matmul_candidates(
     let root = egraph.add_expr(&builder.expr);
     egraph.rebuild();
     let runner = RunnerConfig {
-        iter_limit: 10,
-        node_limit: 80_000,
-        time_limit_secs: 30,
+        iter_limit: 30,
+        node_limit: 100_000,
+        time_limit_secs: 60,
         device: DeviceProfile::default(),
         lowering: LoweringOptions::default(),
     };
-    let egraph = rules::saturate_phases(egraph, &[Phase::Lowering], &runner);
+    let (egraph, saturation) = rules::saturate_phases_reported(egraph, Phase::all(), &runner);
     let beam = BeamConfig {
         beam_width: 24,
         ..BeamConfig::default()
@@ -90,7 +94,7 @@ fn matmul_candidates(
         &LoweringOptions::default(),
         candidate_limit,
     );
-    (egraph, candidates)
+    (egraph, saturation, candidates)
 }
 
 #[test]
@@ -124,6 +128,30 @@ fn run_matmul_candidate_fuzz() {
             k: 16,
             seed: 0x0000_f00d,
         },
+        MatmulCase {
+            m: 8,
+            n: 8,
+            k: 7,
+            seed: 0x0000_0007,
+        },
+        MatmulCase {
+            m: 8,
+            n: 8,
+            k: 13,
+            seed: 0x0000_0013,
+        },
+        MatmulCase {
+            m: 8,
+            n: 8,
+            k: 31,
+            seed: 0x0000_0031,
+        },
+        MatmulCase {
+            m: 8,
+            n: 4,
+            k: 257,
+            seed: 0x0000_0257,
+        },
     ];
     const CANDIDATE_LIMIT: usize = 16;
     const TOLERANCE: f32 = 1e-3;
@@ -131,10 +159,16 @@ fn run_matmul_candidate_fuzz() {
     let ctx = crate::runtime::GpuContext::new();
 
     for case in CASES {
-        let (egraph, candidates) = matmul_candidates(*case, CANDIDATE_LIMIT);
+        let (egraph, saturation, candidates) = matmul_candidates(*case, CANDIDATE_LIMIT);
+        let stop_reasons = saturation
+            .phases
+            .iter()
+            .map(|phase| format!("{:?}: {}", phase.phase, phase.stop_reason))
+            .collect::<Vec<_>>()
+            .join(", ");
         assert!(
             !candidates.is_empty(),
-            "expected at least one runnable candidate for {case:?}"
+            "expected at least one runnable candidate for {case:?}; stop_reasons=[{stop_reasons}]"
         );
 
         let lhs = fuzz_data(case.m * case.k, case.seed ^ 0xa5a5_5a5a);
@@ -170,7 +204,7 @@ fn run_matmul_candidate_fuzz() {
             let max_err = max_abs_err(&gpu_output[..expected.len()], &expected);
             assert!(
                 max_err.is_finite() && max_err < TOLERANCE,
-                "candidate {candidate_index} for {case:?} differed from original implementation: max_err={max_err}"
+                "candidate {candidate_index} for {case:?} differed from original implementation: max_err={max_err}; stop_reasons=[{stop_reasons}]"
             );
             checked += 1;
         }

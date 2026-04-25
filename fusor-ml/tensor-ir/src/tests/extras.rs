@@ -71,6 +71,106 @@ fn test_theta_split_cooperative() {
     );
 }
 
+fn has_reduce_simd_op(egraph: &egg::EGraph<TensorIr, TensorAnalysis>, op: ReduceOp) -> bool {
+    egraph.classes().any(
+        |class: &egg::EClass<TensorIr, <TensorAnalysis as egg::Analysis<TensorIr>>::Data>| {
+            class.iter().any(|n| {
+                matches!(
+                    n,
+                    TensorIr::Simd(SimdNode::ReduceSimd { op: found, .. }) if *found == op
+                )
+            })
+        },
+    )
+}
+
+#[test]
+fn test_bool_and_theta_reduces_with_reduce_simd() {
+    let mut egraph = egg::EGraph::<TensorIr, TensorAnalysis>::default();
+    let init = egraph.add(TensorIr::Const(ScalarValue::Bool(true)));
+    let count = egraph.add(TensorIr::Const(ScalarValue::U32(
+        DeviceProfile::default().simd_width,
+    )));
+    let acc = egraph.add(TensorIr::Simd(SimdNode::Var(VarRef::acc(0))));
+    let value = egraph.add(TensorIr::Const(ScalarValue::Bool(false)));
+    let update = egraph.add(TensorIr::BinOp(BinaryOp::And, [acc, value]));
+    let _theta = egraph.add(TensorIr::Simd(SimdNode::Theta {
+        children: [init, count, update],
+    }));
+
+    let config = RunnerConfig {
+        iter_limit: 10,
+        node_limit: 50_000,
+        time_limit_secs: 10,
+        device: DeviceProfile::default(),
+        lowering: LoweringOptions::default(),
+    };
+    let egraph = rules::saturate_phases(egraph, &[Phase::LateDispatch], &config);
+
+    assert!(
+        has_reduce_simd_op(&egraph, ReduceOp::And),
+        "bool BinaryOp::And should become ReduceSimd::And"
+    );
+}
+
+#[test]
+fn test_u32_xor_theta_reduces_with_reduce_simd() {
+    let mut egraph = egg::EGraph::<TensorIr, TensorAnalysis>::default();
+    let init = egraph.add(TensorIr::Const(ScalarValue::U32(0)));
+    let count = egraph.add(TensorIr::Const(ScalarValue::U32(
+        DeviceProfile::default().simd_width,
+    )));
+    let acc = egraph.add(TensorIr::Simd(SimdNode::Var(VarRef::acc(0))));
+    let value = egraph.add(TensorIr::Const(ScalarValue::U32(7)));
+    let update = egraph.add(TensorIr::BinOp(BinaryOp::Xor, [acc, value]));
+    let _theta = egraph.add(TensorIr::Simd(SimdNode::Theta {
+        children: [init, count, update],
+    }));
+
+    let config = RunnerConfig {
+        iter_limit: 10,
+        node_limit: 50_000,
+        time_limit_secs: 10,
+        device: DeviceProfile::default(),
+        lowering: LoweringOptions::default(),
+    };
+    let egraph = rules::saturate_phases(egraph, &[Phase::LateDispatch], &config);
+
+    assert!(
+        has_reduce_simd_op(&egraph, ReduceOp::Xor),
+        "u32 BinaryOp::Xor should become ReduceSimd::Xor"
+    );
+}
+
+#[test]
+fn test_bool_xor_theta_does_not_reduce_simd() {
+    let mut egraph = egg::EGraph::<TensorIr, TensorAnalysis>::default();
+    let init = egraph.add(TensorIr::Const(ScalarValue::Bool(false)));
+    let count = egraph.add(TensorIr::Const(ScalarValue::U32(
+        DeviceProfile::default().simd_width,
+    )));
+    let acc = egraph.add(TensorIr::Simd(SimdNode::Var(VarRef::acc(0))));
+    let value = egraph.add(TensorIr::Const(ScalarValue::Bool(true)));
+    let update = egraph.add(TensorIr::BinOp(BinaryOp::Xor, [acc, value]));
+    let _theta = egraph.add(TensorIr::Simd(SimdNode::Theta {
+        children: [init, count, update],
+    }));
+
+    let config = RunnerConfig {
+        iter_limit: 10,
+        node_limit: 50_000,
+        time_limit_secs: 10,
+        device: DeviceProfile::default(),
+        lowering: LoweringOptions::default(),
+    };
+    let egraph = rules::saturate_phases(egraph, &[Phase::LateDispatch], &config);
+
+    assert!(
+        !has_reduce_simd_op(&egraph, ReduceOp::Xor),
+        "bool BinaryOp::Xor has no native ReduceSimd mapping"
+    );
+}
+
 #[test]
 fn test_theta_split_cooperative_with_tail() {
     let mut b = IrBuilder::new();
@@ -111,6 +211,72 @@ fn test_theta_split_cooperative_with_tail() {
     assert!(
         has_select_guard,
         "tail-handling cooperative reduction should guard out-of-bounds lanes with select"
+    );
+}
+
+#[test]
+fn test_theta_split_small_k_matmul_remaps_output_owner() {
+    const M: u32 = 8;
+    const N: u32 = 8;
+    const K: u32 = 16;
+    let simd_width = DeviceProfile::default().simd_width;
+
+    let mut b = IrBuilder::new();
+    let a = b.input(0, Shape(vec![Dim::Lit(M), Dim::Lit(K)]), DType::F32);
+    let x = b.input(1, Shape(vec![Dim::Lit(K), Dim::Lit(N)]), DType::F32);
+    let _y = super::build_binary_mul_add_contraction_ir(&mut b, a, x, M, N, K);
+
+    let mut egraph = egg::EGraph::<TensorIr, TensorAnalysis>::default();
+    let _root = egraph.add_expr(&b.expr);
+    let config = RunnerConfig {
+        iter_limit: 10,
+        node_limit: 50_000,
+        time_limit_secs: 10,
+        device: DeviceProfile::default(),
+        lowering: LoweringOptions::default(),
+    };
+    let egraph = rules::saturate_phases(egraph, &[Phase::Lowering, Phase::LateDispatch], &config);
+
+    let has_split_dispatch = egraph.classes().any(|class| {
+        class.iter().any(|node| {
+            let TensorIr::Dispatch(DispatchNode::Dispatch {
+                workgroups,
+                num_inputs,
+                children_list,
+            }) = node
+            else {
+                return false;
+            };
+            if *workgroups != M * N {
+                return false;
+            }
+            let children = extract_list(&egraph, *children_list);
+            let value_idx = *num_inputs as usize;
+            if value_idx + 1 >= children.len() {
+                return false;
+            }
+            let value = children[value_idx];
+            let addr = children[value_idx + 1];
+            let value_is_reduce_simd = egraph[egraph.find(value)]
+                .iter()
+                .any(|n| matches!(n, TensorIr::Simd(SimdNode::ReduceSimd { .. })));
+            let addr_is_workgroup = egraph[egraph.find(addr)].iter().any(|n| {
+                matches!(
+                    n,
+                    TensorIr::Simd(SimdNode::Var(VarRef::Bound {
+                        kind: BinderKind::Dispatch,
+                        slot: slots::DISPATCH_WORKGROUP,
+                        depth: 0,
+                    }))
+                )
+            });
+            value_is_reduce_simd && addr_is_workgroup
+        })
+    });
+
+    assert!(
+        has_split_dispatch,
+        "small-K matmul should produce a theta-split dispatch with {simd_width}-lane cooperative K and workgroup-owned output"
     );
 }
 

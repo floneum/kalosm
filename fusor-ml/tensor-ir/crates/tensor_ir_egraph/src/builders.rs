@@ -87,27 +87,112 @@ impl IrBuilder {
         output_shape: Shape,
         slices: Vec<(u32, u32)>,
     ) -> Id {
-        self.add(TensorIr::HighLevel(HighLevelNode::SliceAssign {
-            output_shape,
-            slices,
-            children: [input, value],
-        }))
+        assert_eq!(
+            output_shape.rank(),
+            slices.len(),
+            "slice_assign slices must match output rank"
+        );
+
+        let mut in_slice = self.scalar_lit(ScalarValue::Bool(true));
+        let mut relative_indices = Vec::with_capacity(slices.len());
+        let mut axis_in_slice = Vec::with_capacity(slices.len());
+        for (axis, (start, end)) in slices.iter().copied().enumerate() {
+            let index = self.scalar_index(axis as u32);
+            let full_axis = matches!(output_shape.0[axis], crate::types::Dim::Lit(dim) if start == 0 && end == dim);
+            if full_axis {
+                relative_indices.push(index);
+                axis_in_slice.push(self.scalar_lit(ScalarValue::Bool(true)));
+                continue;
+            }
+
+            let start_lit = self.scalar_u32(start);
+            let end_lit = self.scalar_u32(end);
+            let ge_start = self.bin_op(BinaryOp::Ge, index, start_lit);
+            let lt_end = self.bin_op(BinaryOp::Lt, index, end_lit);
+            let axis_in_range = self.bin_op(BinaryOp::And, ge_start, lt_end);
+            in_slice = self.bin_op(BinaryOp::And, in_slice, axis_in_range);
+            axis_in_slice.push(axis_in_range);
+
+            let relative = if start == 0 {
+                index
+            } else {
+                self.bin_op(BinaryOp::Sub, index, start_lit)
+            };
+            relative_indices.push(relative);
+        }
+
+        let zero = self.scalar_u32(0);
+        let safe_indices = relative_indices
+            .into_iter()
+            .zip(axis_in_slice)
+            .map(|(index, axis_in_range)| {
+                if matches!(
+                    self.expr.as_ref()[usize::from(axis_in_range)],
+                    TensorIr::Const(ScalarValue::Bool(true))
+                ) {
+                    index
+                } else {
+                    self.tern_op(TernaryOp::Select, axis_in_range, index, zero)
+                }
+            })
+            .collect::<Vec<_>>();
+        let replacement = self.indexed_arg(1, &safe_indices);
+        let original = self.scalar_arg(0);
+        let body = self.tern_op(TernaryOp::Select, in_slice, replacement, original);
+        self.elementwise(output_shape, &[input, value], body)
     }
 
     pub fn index_select(&mut self, input: Id, indices: Id, output_shape: Shape, axis: u32) -> Id {
-        self.add(TensorIr::HighLevel(HighLevelNode::IndexSelect {
-            output_shape,
-            axis,
-            children: [input, indices],
-        }))
+        assert!(
+            (axis as usize) < output_shape.rank(),
+            "index_select axis must be in bounds"
+        );
+        let source_indices = (0..output_shape.rank())
+            .map(|dim| {
+                if dim == axis as usize {
+                    let index = self.scalar_index(axis);
+                    self.indexed_arg(1, &[index])
+                } else {
+                    self.scalar_index(dim as u32)
+                }
+            })
+            .collect::<Vec<_>>();
+        let body = self.indexed_arg(0, &source_indices);
+        self.elementwise(output_shape, &[input, indices], body)
     }
 
     pub fn resize(&mut self, input: Id, input_shape: Shape, output_shape: Shape) -> Id {
-        self.add(TensorIr::HighLevel(HighLevelNode::Resize {
-            input_shape,
-            output_shape,
-            expr: input,
-        }))
+        if input_shape.static_numel() == output_shape.static_numel() {
+            let strides = Strides::row_major_for_shape(&output_shape)
+                .expect("literal resize output shape has row-major strides");
+            return self.restride_with_offset(input, output_shape, strides, 0);
+        }
+
+        assert_eq!(
+            input_shape.rank(),
+            output_shape.rank(),
+            "size-changing resize must preserve rank"
+        );
+
+        let mut in_bounds = self.scalar_lit(ScalarValue::Bool(true));
+        let mut safe_indices = Vec::with_capacity(output_shape.rank());
+        for (axis, dim) in input_shape.0.iter().enumerate() {
+            let crate::types::Dim::Lit(limit) = dim else {
+                panic!("resize currently requires literal input dimensions");
+            };
+            let index = self.scalar_index(axis as u32);
+            let limit = self.scalar_u32(*limit);
+            let axis_in_bounds = self.bin_op(BinaryOp::Lt, index, limit);
+            in_bounds = self.bin_op(BinaryOp::And, in_bounds, axis_in_bounds);
+            let zero = self.scalar_u32(0);
+            safe_indices.push(self.tern_op(TernaryOp::Select, axis_in_bounds, index, zero));
+        }
+
+        let value = self.indexed_arg(0, &safe_indices);
+        let dtype = self.infer_expr_dtype(input, None).unwrap_or(DType::F32);
+        let zero = self.zero_for_dtype(dtype);
+        let body = self.tern_op(TernaryOp::Select, in_bounds, value, zero);
+        self.elementwise(output_shape, &[input], body)
     }
 
     pub fn reduce(&mut self, expr: Id, axis: u32, op: ReduceOp) -> Id {
@@ -177,6 +262,81 @@ impl IrBuilder {
 
     pub fn tern_op(&mut self, op: TernaryOp, a: Id, b: Id, c: Id) -> Id {
         self.add(TensorIr::TernOp(op, [a, b, c]))
+    }
+
+    fn zero_for_dtype(&mut self, dtype: DType) -> Id {
+        let value = match dtype {
+            DType::F16 => ScalarValue::F16(ordered_float::OrderedFloat(0.0)),
+            DType::F32 => ScalarValue::F32(ordered_float::OrderedFloat(0.0)),
+            DType::U32 => ScalarValue::U32(0),
+            DType::I32 => ScalarValue::I32(0),
+            DType::Bool => ScalarValue::Bool(false),
+        };
+        self.scalar_lit(value)
+    }
+
+    fn infer_expr_dtype(&self, id: Id, params: Option<&[DType]>) -> Option<DType> {
+        fn unary_dtype(op: UnaryOp, input: Option<DType>) -> Option<DType> {
+            match op {
+                UnaryOp::CastF16 => Some(DType::F16),
+                UnaryOp::CastF32 => Some(DType::F32),
+                UnaryOp::CastI32 => Some(DType::I32),
+                UnaryOp::CastU32 => Some(DType::U32),
+                UnaryOp::CastBool | UnaryOp::Not => Some(DType::Bool),
+                _ => input,
+            }
+        }
+
+        let node = self.expr.as_ref().get(usize::from(id))?;
+        match node {
+            TensorIr::HighLevel(HighLevelNode::Input { dtype, .. }) => Some(*dtype),
+            TensorIr::HighLevel(HighLevelNode::Restride { expr, .. })
+            | TensorIr::HighLevel(HighLevelNode::Reduce { expr, .. }) => {
+                self.infer_expr_dtype(*expr, params)
+            }
+            TensorIr::HighLevel(HighLevelNode::Elementwise {
+                children_list,
+                num_inputs,
+                ..
+            }) => {
+                let children =
+                    crate::language::extract_recexpr_list(self.expr.as_ref(), *children_list);
+                let input_dtypes = children[..(*num_inputs as usize).min(children.len())]
+                    .iter()
+                    .map(|input| self.infer_expr_dtype(*input, params))
+                    .collect::<Option<Vec<_>>>()?;
+                children
+                    .last()
+                    .and_then(|body| self.infer_expr_dtype(*body, Some(&input_dtypes)))
+            }
+            TensorIr::BinOp(op, children) => match op {
+                BinaryOp::Lt
+                | BinaryOp::Le
+                | BinaryOp::Gt
+                | BinaryOp::Ge
+                | BinaryOp::Eq
+                | BinaryOp::Neq => Some(DType::Bool),
+                _ => self.infer_expr_dtype(children[0], params),
+            },
+            TensorIr::UnOp(op, child) => unary_dtype(*op, self.infer_expr_dtype(*child, params)),
+            TensorIr::TernOp(op, children) => match op {
+                TernaryOp::Fma => self.infer_expr_dtype(children[0], params),
+                TernaryOp::Select => self.infer_expr_dtype(children[1], params),
+            },
+            TensorIr::Const(value) => Some(match value {
+                ScalarValue::F16(_) => DType::F16,
+                ScalarValue::F32(_) => DType::F32,
+                ScalarValue::I32(_) => DType::I32,
+                ScalarValue::U32(_) => DType::U32,
+                ScalarValue::Bool(_) => DType::Bool,
+            }),
+            TensorIr::HighLevel(HighLevelNode::Param(index))
+            | TensorIr::HighLevel(HighLevelNode::IndexedParam { index, .. }) => {
+                params.and_then(|params| params.get(*index as usize).copied())
+            }
+            TensorIr::HighLevel(HighLevelNode::Index(_)) => Some(DType::U32),
+            TensorIr::Dispatch(_) | TensorIr::Simd(_) | TensorIr::Nil | TensorIr::Cons(_) => None,
+        }
     }
 
     // ═══════════════════════════════════════════════════════

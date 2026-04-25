@@ -4,7 +4,7 @@ use crate::analysis::TensorAnalysis;
 use crate::applier::SimpleEclassSearcher;
 use crate::language::{SimdNode, TensorIr};
 use crate::rules::RunnerConfig;
-use crate::types::{BinaryOp, IndexLevel, ScalarValue, VarRef};
+use crate::types::{BinaryOp, DType, IndexLevel, ScalarValue, VarRef};
 
 pub(super) fn build(config: &RunnerConfig) -> Rewrite<TensorIr, TensorAnalysis> {
     Rewrite::new(
@@ -50,7 +50,10 @@ impl crate::applier::TypedApplier for ReduceSimdToShuffleApplier {
         let lane = egraph.add(TensorIr::Simd(SimdNode::Var(VarRef::thread(
             IndexLevel::Lane,
         ))));
-        let op_name = op.bin_op();
+        let dtype = egraph[src].data.dtype.unwrap_or(DType::F32);
+        let Some(op_name) = op.bin_op_for_dtype(dtype) else {
+            return vec![];
+        };
         let mut current = src;
         for i in 0..steps {
             let offset = 1u32 << i;

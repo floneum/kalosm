@@ -53,17 +53,31 @@ fn tensor_inputs(inputs: &[MirValue], count: usize) -> Result<Vec<TensorData>, S
         .collect()
 }
 
+fn storage_shape(tensor: &TensorData) -> Result<Shape, String> {
+    let elements = tensor.buffer().size()
+        / u64::try_from(tensor.datatype().element_size()).map_err(|e| e.to_string())?;
+    let elements = usize::try_from(elements)
+        .map_err(|_| format!("tensor buffer length {elements} exceeds usize"))?;
+    shape(&[elements])
+}
+
+fn input_shape_for_restrided_view(tensor: &TensorData) -> Result<Shape, String> {
+    let logical_shape = shape(tensor.layout().shape())?;
+    let row_major = Strides::row_major_for_shape(&logical_shape);
+    let tensor_strides = strides(tensor.layout())?;
+    if tensor.layout().offset() == 0 && row_major.as_ref() == Some(&tensor_strides) {
+        Ok(logical_shape)
+    } else {
+        storage_shape(tensor)
+    }
+}
+
 fn add_tensor_input(
     builder: &mut TensorExprBuilder,
     input_id: u32,
     tensor: &TensorData,
     index_space: &Shape,
 ) -> Result<ExprId, String> {
-    let input = builder.input(
-        input_id,
-        shape(tensor.layout().shape())?,
-        dtype(tensor.datatype())?,
-    );
     let index_dims = index_space
         .0
         .iter()
@@ -76,9 +90,15 @@ fn add_tensor_input(
         let row_major = Strides::row_major_for_shape(index_space);
         let tensor_strides = strides(tensor.layout())?;
         if row_major.as_ref() == Some(&tensor_strides) {
+            let input = builder.input(
+                input_id,
+                shape(tensor.layout().shape())?,
+                dtype(tensor.datatype())?,
+            );
             return Ok(input);
         }
     }
+    let input = builder.input(input_id, storage_shape(tensor)?, dtype(tensor.datatype())?);
     Ok(builder.restride_with_offset(
         input,
         index_space.clone(),
@@ -442,21 +462,8 @@ pub(crate) fn reduce(
 ) -> Result<TensorIrLowering, String> {
     let input = reduce_input_view(op, inputs)?;
     let mut builder = TensorExprBuilder::new();
-    let input_id = builder.input(0, shape(input.layout().shape())?, dtype(input.datatype())?);
     let input_shape = shape(input.layout().shape())?;
-    let row_major = Strides::row_major_for_shape(&input_shape);
-    let input_strides = strides(input.layout())?;
-    let input_id = if input.layout().offset() == 0 && row_major.as_ref() == Some(&input_strides) {
-        input_id
-    } else {
-        builder.restride_with_offset(
-            input_id,
-            input_shape,
-            input_strides,
-            i64::try_from(input.layout().offset())
-                .map_err(|_| format!("tensor offset {} exceeds i64", input.layout().offset()))?,
-        )
-    };
+    let input_id = add_tensor_input(&mut builder, 0, &input, &input_shape)?;
     if !op.pre_element_wise.functions.is_empty() || !op.post_element_wise.functions.is_empty() {
         return Err("tensor_ir reduce lowering does not support legacy fused unary chains".into());
     }
@@ -571,8 +578,8 @@ pub(crate) fn matmul(
     let index_space = shape(&index_dims)?;
 
     let mut builder = TensorExprBuilder::new();
-    let lhs_id = builder.input(0, shape(lhs.layout().shape())?, ir_dtype);
-    let rhs_id = builder.input(1, shape(rhs.layout().shape())?, ir_dtype);
+    let lhs_id = builder.input(0, input_shape_for_restrided_view(lhs)?, ir_dtype);
+    let rhs_id = builder.input(1, input_shape_for_restrided_view(rhs)?, ir_dtype);
 
     let lhs_strides = matmul_lhs_strides(lhs.layout(), &out_shape)?;
     let rhs_strides = matmul_rhs_strides(rhs.layout(), &out_shape)?;
@@ -658,23 +665,7 @@ pub(crate) fn slice_assign(
     let mut builder = TensorExprBuilder::new();
     let input_id = add_tensor_input(&mut builder, 0, input, &output_shape)?;
     let value_shape = shape(value.layout().shape())?;
-    let raw_value = builder.input(1, value_shape.clone(), dtype(value.datatype())?);
-    let value_id = {
-        let row_major = Strides::row_major_for_shape(&value_shape);
-        let value_strides = strides(value.layout())?;
-        if value.layout().offset() == 0 && row_major.as_ref() == Some(&value_strides) {
-            raw_value
-        } else {
-            builder.restride_with_offset(
-                raw_value,
-                value_shape,
-                value_strides,
-                i64::try_from(value.layout().offset()).map_err(|_| {
-                    format!("tensor offset {} exceeds i64", value.layout().offset())
-                })?,
-            )
-        }
-    };
+    let value_id = add_tensor_input(&mut builder, 1, value, &value_shape)?;
     let slices = op
         .slices
         .iter()

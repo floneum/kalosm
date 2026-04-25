@@ -1,6 +1,6 @@
 use rustc_hash::FxHashMap;
 
-use crate::{Layout, TensorLayoutInfo, nary_wise::NaryOperation};
+use crate::{TensorLayoutInfo, mir::operation::Operation};
 
 use super::{ComputeGraphNodeVariant, NodeIndex, queue::ComputeQueue};
 
@@ -24,72 +24,29 @@ impl LayoutPass {
                 continue;
             }
             match &node_data.variant {
-                ComputeGraphNodeVariant::Nary(op) => self.visit_nary(node, op),
-                ComputeGraphNodeVariant::MatMul(op) => self.visit_mat_mul(node, op),
-                ComputeGraphNodeVariant::Reduce(op) => self.visit_reduce(node, op),
+                ComputeGraphNodeVariant::TensorExpr(op) => self.visit_tensor_expr(node, op),
                 ComputeGraphNodeVariant::MapLayout(op) => self.visit_map_layout(node, op),
-                ComputeGraphNodeVariant::Resize(op) => self.visit_resize(node, op),
-                ComputeGraphNodeVariant::SliceAssign(op) => self.visit_slice_assign(node, op),
                 ComputeGraphNodeVariant::Tensor(op) => self.visit_tensor(node, op),
                 ComputeGraphNodeVariant::Custom(op) => self.visit_custom(node, op),
             }
         }
     }
 
-    fn visit_nary(&mut self, key: NodeIndex, operation: &NaryOperation) {
+    fn visit_tensor_expr(&mut self, key: NodeIndex, operation: &crate::TensorExprOperation) {
         // Ensure all inputs have been visited
-        for input in &operation.inputs {
-            if !self.output_layout.contains_key(input) {
-                self.queue.push_back(*input);
+        let mut dependencies = Vec::new();
+        operation.visit_dependencies(&mut |dep| {
+            dependencies.push(dep);
+        });
+        for input in dependencies {
+            if !self.output_layout.contains_key(&input) {
+                self.queue.push_back(input);
                 self.queue.push_back(key);
                 return;
             }
         }
-        let output_layout = Layout::contiguous(&operation.shape);
-        self.output_layout.insert(
-            key,
-            TensorLayoutInfo::new(output_layout, operation.output_datatype),
-        );
-    }
-
-    fn visit_mat_mul(&mut self, key: NodeIndex, operation: &crate::MatMulOperation) {
-        let Some(first_layout) = self.output_layout.get(&operation.first) else {
-            self.queue.push_back(operation.first);
-            self.queue.push_back(key);
-            return;
-        };
-        let Some(_) = self.output_layout.get(&operation.second) else {
-            self.queue.push_back(operation.second);
-            self.queue.push_back(key);
-            return;
-        };
-        let output_shape = &operation.out_shape;
-        let output_layout = Layout::contiguous(output_shape);
-        self.output_layout.insert(
-            key,
-            TensorLayoutInfo::new(output_layout, first_layout.datatype()),
-        );
-    }
-
-    fn visit_reduce(&mut self, key: NodeIndex, operation: &crate::ReduceOperation) {
-        let dim = operation.axis;
-        let Some(input_layout) = self.output_layout.get(&operation.value) else {
-            self.queue.push_back(operation.value);
-            self.queue.push_back(key);
-            return;
-        };
-        let new_shape = input_layout
-            .layout()
-            .shape()
-            .iter()
-            .enumerate()
-            .filter_map(|(i, x)| (i != dim).then_some(*x))
-            .collect::<Vec<_>>();
-        let new_layout = Layout::contiguous(&new_shape);
-        self.output_layout.insert(
-            key,
-            TensorLayoutInfo::new(new_layout, input_layout.datatype()),
-        );
+        self.output_layout
+            .insert(key, operation.output_layout(&self.output_layout));
     }
 
     fn visit_map_layout(
@@ -107,37 +64,6 @@ impl LayoutPass {
             key,
             TensorLayoutInfo::new(new_layout, input_layout.datatype()),
         );
-    }
-
-    fn visit_resize(&mut self, key: NodeIndex, operation: &crate::resize::ResizeOperation) {
-        let Some(input_layout) = self.output_layout.get(&operation.input) else {
-            self.queue.push_back(operation.input);
-            self.queue.push_back(key);
-            return;
-        };
-        let new_layout = Layout::contiguous(&operation.new_shape);
-        self.output_layout.insert(
-            key,
-            TensorLayoutInfo::new(new_layout, input_layout.datatype()),
-        );
-    }
-
-    fn visit_slice_assign(
-        &mut self,
-        key: NodeIndex,
-        operation: &crate::slice_assign::SliceAssignOperation,
-    ) {
-        let Some(input_layout) = self.output_layout.get(&operation.input) else {
-            self.queue.push_back(operation.input);
-            self.queue.push_back(key);
-            return;
-        };
-        let Some(_) = self.output_layout.get(&operation.value) else {
-            self.queue.push_back(operation.value);
-            self.queue.push_back(key);
-            return;
-        };
-        self.output_layout.insert(key, input_layout.clone());
     }
 
     fn visit_tensor(&mut self, key: NodeIndex, operation: &crate::tensor::TensorData) {

@@ -72,11 +72,7 @@ impl SyntheticCostModel {
         match node {
             // High-level nodes have high cost to prefer lowered versions
             TensorIr::HighLevel(
-                HighLevelNode::Elementwise { .. }
-                | HighLevelNode::Resize { .. }
-                | HighLevelNode::IndexSelect { .. }
-                | HighLevelNode::SliceAssign { .. }
-                | HighLevelNode::Reduce { .. },
+                HighLevelNode::Elementwise { .. } | HighLevelNode::Reduce { .. },
             ) => 1000.0,
 
             // Scalar expressions and structural nodes.

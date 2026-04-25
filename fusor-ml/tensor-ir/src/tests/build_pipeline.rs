@@ -8,7 +8,7 @@ use crate::pipeline::{
     StageConfig, StagedPipeline, compile_kernel, lower_tensor_expr, lower_tensor_expr_with_report,
 };
 use crate::rules::{self, Phase, RunnerConfig};
-use crate::stages::TensorExprBuilder;
+use crate::stages::{TensorExprBuilder, TensorExprNode};
 use crate::types::*;
 use egg::Language;
 
@@ -62,6 +62,61 @@ fn test_tensor_expr_summary_tracks_lowering_inputs() {
     assert_eq!(summary.input_count, 2);
     assert!(summary.has_reduce);
     assert!(summary.has_elementwise);
+}
+
+#[test]
+fn test_special_tensor_builders_expand_to_canonical_elementwise() {
+    let mut b = TensorExprBuilder::new();
+    let input = b.input(0, Shape(vec![Dim::Lit(8), Dim::Lit(8)]), DType::F32);
+    let value = b.input(1, Shape(vec![Dim::Lit(4), Dim::Lit(3)]), DType::F32);
+    let root = b.slice_assign(
+        input,
+        value,
+        Shape(vec![Dim::Lit(8), Dim::Lit(8)]),
+        vec![(2, 6), (1, 4)],
+    );
+    let expr = b.build(root).expect("valid canonical slice_assign");
+    assert!(matches!(
+        expr.node(expr.root()),
+        TensorExprNode::Elementwise { .. }
+    ));
+
+    let mut b = TensorExprBuilder::new();
+    let input = b.input(0, Shape(vec![Dim::Lit(8), Dim::Lit(8)]), DType::F32);
+    let indices = b.input(1, Shape(vec![Dim::Lit(4)]), DType::U32);
+    let root = b.index_select(input, indices, Shape(vec![Dim::Lit(8), Dim::Lit(4)]), 1);
+    let expr = b.build(root).expect("valid canonical index_select");
+    assert!(matches!(
+        expr.node(expr.root()),
+        TensorExprNode::Elementwise { .. }
+    ));
+
+    let mut b = TensorExprBuilder::new();
+    let input = b.input(0, Shape(vec![Dim::Lit(4), Dim::Lit(4)]), DType::F32);
+    let root = b.resize(
+        input,
+        Shape(vec![Dim::Lit(4), Dim::Lit(4)]),
+        Shape(vec![Dim::Lit(6), Dim::Lit(6)]),
+    );
+    let expr = b.build(root).expect("valid canonical resize");
+    assert!(matches!(
+        expr.node(expr.root()),
+        TensorExprNode::Elementwise { .. }
+    ));
+}
+
+#[test]
+fn test_elementwise_indexed_input_can_have_different_shape() {
+    let mut b = TensorExprBuilder::new();
+    let input = b.input(0, Shape(vec![Dim::Lit(32), Dim::Lit(16)]), DType::F32);
+    let indices = b.input(1, Shape(vec![Dim::Lit(8)]), DType::U32);
+    let root = b.index_select(input, indices, Shape(vec![Dim::Lit(32), Dim::Lit(8)]), 1);
+    let expr = b.build(root).expect("valid indexed elementwise");
+
+    let mut config = StageConfig::default();
+    config.runner.device.simd_width = 1;
+    config.runner.device.max_simdgroups = 1;
+    lower_tensor_expr(&expr, &config).expect("indexed elementwise lowers");
 }
 
 #[test]
@@ -165,13 +220,13 @@ fn test_scalar_lane_3d_elementwise_lowering() {
 #[test]
 fn test_lower_tensor_expr_error_carries_partial_report() {
     let mut b = TensorExprBuilder::new();
-    let root = b.input(0, Shape(vec![Dim::Lit(4)]), DType::U32);
+    let root = b.input(0, Shape(vec![Dim::Lit(4)]), DType::I32);
     let expr = b.build(root).expect("valid tensor expr");
 
     let err = lower_tensor_expr_with_report(&expr, &StageConfig::default())
-        .expect_err("u32 backend unsupported");
+        .expect_err("i32 backend unsupported");
 
-    assert!(err.message.contains("supports only f32"));
+    assert!(err.message.contains("supports f16/f32/u32"));
     assert_eq!(err.report.error.as_deref(), Some(err.message.as_str()));
     assert_eq!(err.report.input_nodes, expr.nodes().len());
     assert!(err.report.saturation.phases.is_empty());
@@ -181,13 +236,13 @@ fn test_lower_tensor_expr_error_carries_partial_report() {
 #[test]
 fn test_lower_tensor_expr_rejects_non_f32_tensor_inputs() {
     let mut b = TensorExprBuilder::new();
-    let root = b.input(0, Shape(vec![Dim::Lit(64)]), DType::U32);
+    let root = b.input(0, Shape(vec![Dim::Lit(64)]), DType::I32);
     let expr = b.build(root).expect("valid tensor expr");
 
     let pipeline = StagedPipeline::default();
-    let err = lower_tensor_expr(&expr, pipeline.config()).expect_err("u32 backend unsupported");
+    let err = lower_tensor_expr(&expr, pipeline.config()).expect_err("i32 backend unsupported");
     assert!(
-        err.contains("f32"),
+        err.contains("f16/f32/u32"),
         "error should describe the backend dtype restriction, got: {err}"
     );
 }

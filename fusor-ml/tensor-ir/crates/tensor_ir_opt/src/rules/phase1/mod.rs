@@ -20,17 +20,18 @@
 //! - `commutative-binop-swap`: exposes equivalent operand orders for
 //!   commutative scalar ops so shape-specific operand order is not baked into
 //!   later rewrites.
+//! - `associative-binop-rotate-right`: exposes equivalent groupings for
+//!   associative scalar ops.
 //! - `arith-identity`: scalar identity folding (U32 only for now).
 
 mod arithmetic_identity;
+mod associativity;
 mod commutativity;
-mod elementwise_lowering;
 mod ewise_fusion;
 mod exp_algebra;
 mod online_reduction;
 mod recursive_dispatch_lowering;
 mod reduce_lowering;
-mod slice_assign_lowering;
 
 use egg::{EGraph, Id, Rewrite};
 
@@ -47,12 +48,11 @@ use crate::types::{BinaryOp, BufferRef, Dim, MemTier, ScalarValue, Shape};
 pub fn rules(config: &RunnerConfig) -> Vec<Rewrite<TensorIr, TensorAnalysis>> {
     let mut rules = vec![
         reduce_lowering::build(config),
-        elementwise_lowering::build(config),
-        slice_assign_lowering::build(config),
         recursive_dispatch_lowering::build(config),
         online_reduction::build(config),
         ewise_fusion::build(config),
         commutativity::build(config),
+        associativity::build(config),
     ];
     rules.extend(exp_algebra::build_all(config));
     rules.extend(arithmetic_identity::build_all());

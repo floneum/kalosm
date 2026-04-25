@@ -209,10 +209,8 @@ fn theta_qualifies(
     egraph[update].iter().any(|u| {
         matches!(
             u,
-            TensorIr::BinOp(
-                BinaryOp::Add | BinaryOp::Mul | BinaryOp::Max | BinaryOp::Min,
-                _,
-            )
+            TensorIr::BinOp(name, args)
+                if args.len() == 2 && reduce_op_for_dtype(egraph, *name, init).is_some()
         )
     })
 }
@@ -311,13 +309,7 @@ fn build_reduce_simd_for(
         if let TensorIr::BinOp(name, args) = u
             && args.len() == 2
         {
-            match name {
-                BinaryOp::Add => Some(ReduceOp::Add),
-                BinaryOp::Mul => Some(ReduceOp::Mul),
-                BinaryOp::Max => Some(ReduceOp::Max),
-                BinaryOp::Min => Some(ReduceOp::Min),
-                _ => None,
-            }
+            reduce_op_for_dtype(egraph, *name, init)
         } else {
             None
         }
@@ -346,4 +338,14 @@ fn build_reduce_simd_for(
         children: [init, new_count, remapped_update],
     }));
     Some(egraph.add(TensorIr::Simd(SimdNode::ReduceSimd { op, src: new_theta })))
+}
+
+fn reduce_op_for_dtype(
+    egraph: &EGraph<TensorIr, TensorAnalysis>,
+    op_name: BinaryOp,
+    init: Id,
+) -> Option<ReduceOp> {
+    let op = ReduceOp::from_bin_op(op_name)?;
+    let dtype = egraph[init].data.dtype?;
+    op.supports_dtype(dtype).then_some(op)
 }

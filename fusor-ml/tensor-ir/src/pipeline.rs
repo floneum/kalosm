@@ -569,9 +569,6 @@ fn validate_kernel_expr(expr: &RecExpr<TensorIr>) -> Result<(), String> {
             TensorIr::HighLevel(
                 HighLevelNode::Restride { .. }
                     | HighLevelNode::Elementwise { .. }
-                    | HighLevelNode::Resize { .. }
-                    | HighLevelNode::IndexSelect { .. }
-                    | HighLevelNode::SliceAssign { .. }
                     | HighLevelNode::Reduce { .. }
             )
         ) {

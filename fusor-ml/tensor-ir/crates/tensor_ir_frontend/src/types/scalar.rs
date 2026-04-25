@@ -179,6 +179,14 @@ impl BinaryOp {
                 | Self::Neq
         )
     }
+
+    #[must_use]
+    pub const fn is_associative(self) -> bool {
+        matches!(
+            self,
+            Self::Add | Self::Mul | Self::Max | Self::Min | Self::And | Self::Or | Self::Xor
+        )
+    }
 }
 
 impl FromStr for BinaryOp {
@@ -341,9 +349,82 @@ pub enum ReduceOp {
     Mul,
     Max,
     Min,
+    And,
+    Or,
+    Xor,
 }
 
 impl ReduceOp {
+    #[must_use]
+    pub const fn from_bin_op(op: BinaryOp) -> Option<Self> {
+        match op {
+            BinaryOp::Add => Some(Self::Add),
+            BinaryOp::Mul => Some(Self::Mul),
+            BinaryOp::Max => Some(Self::Max),
+            BinaryOp::Min => Some(Self::Min),
+            BinaryOp::And => Some(Self::And),
+            BinaryOp::Or => Some(Self::Or),
+            BinaryOp::Xor => Some(Self::Xor),
+            _ => None,
+        }
+    }
+
+    #[must_use]
+    pub const fn supports_dtype(&self, dtype: DType) -> bool {
+        match (self, dtype) {
+            (Self::Add | Self::Mul | Self::Max | Self::Min, DType::F16 | DType::F32) => true,
+            (Self::Add | Self::Mul | Self::Max | Self::Min, DType::I32 | DType::U32) => true,
+            (Self::And | Self::Or, DType::Bool | DType::I32 | DType::U32) => true,
+            (Self::Xor, DType::I32 | DType::U32) => true,
+            _ => false,
+        }
+    }
+
+    #[must_use]
+    pub fn identity(&self, dtype: DType) -> Option<ScalarValue> {
+        match (self, dtype) {
+            (Self::Add, DType::F16) => Some(ScalarValue::F16(ordered_float::OrderedFloat(0.0))),
+            (Self::Mul, DType::F16) => Some(ScalarValue::F16(ordered_float::OrderedFloat(1.0))),
+            (Self::Max, DType::F16) => {
+                Some(ScalarValue::F16(ordered_float::OrderedFloat(-65_504.0)))
+            }
+            (Self::Min, DType::F16) => {
+                Some(ScalarValue::F16(ordered_float::OrderedFloat(65_504.0)))
+            }
+            (Self::Add, DType::F32) => Some(ScalarValue::F32(ordered_float::OrderedFloat(0.0))),
+            (Self::Mul, DType::F32) => Some(ScalarValue::F32(ordered_float::OrderedFloat(1.0))),
+            (Self::Max, DType::F32) => {
+                Some(ScalarValue::F32(ordered_float::OrderedFloat(-f32::MAX)))
+            }
+            (Self::Min, DType::F32) => {
+                Some(ScalarValue::F32(ordered_float::OrderedFloat(f32::MAX)))
+            }
+            (Self::Add, DType::U32) => Some(ScalarValue::U32(0)),
+            (Self::Mul, DType::U32) => Some(ScalarValue::U32(1)),
+            (Self::Max, DType::U32) => Some(ScalarValue::U32(u32::MIN)),
+            (Self::Min, DType::U32) => Some(ScalarValue::U32(u32::MAX)),
+            (Self::And, DType::U32) => Some(ScalarValue::U32(u32::MAX)),
+            (Self::Or | Self::Xor, DType::U32) => Some(ScalarValue::U32(0)),
+            (Self::Add, DType::I32) => Some(ScalarValue::I32(0)),
+            (Self::Mul, DType::I32) => Some(ScalarValue::I32(1)),
+            (Self::Max, DType::I32) => Some(ScalarValue::I32(i32::MIN)),
+            (Self::Min, DType::I32) => Some(ScalarValue::I32(i32::MAX)),
+            (Self::And, DType::I32) => Some(ScalarValue::I32(-1)),
+            (Self::Or | Self::Xor, DType::I32) => Some(ScalarValue::I32(0)),
+            (Self::And, DType::Bool) => Some(ScalarValue::Bool(true)),
+            (Self::Or, DType::Bool) => Some(ScalarValue::Bool(false)),
+            _ => None,
+        }
+    }
+
+    #[must_use]
+    pub const fn bin_op_for_dtype(&self, dtype: DType) -> Option<BinaryOp> {
+        if !self.supports_dtype(dtype) {
+            return None;
+        }
+        Some(self.bin_op())
+    }
+
     #[must_use]
     pub fn identity_f16(&self) -> f32 {
         match self {
@@ -351,6 +432,9 @@ impl ReduceOp {
             Self::Mul => 1.0,
             Self::Max => -65_504.0,
             Self::Min => 65_504.0,
+            Self::And | Self::Or | Self::Xor => {
+                panic!("logical and bitwise reductions have no f16 identity")
+            }
         }
     }
 
@@ -363,6 +447,9 @@ impl ReduceOp {
             // Use the largest finite sentinels instead.
             Self::Max => -f32::MAX,
             Self::Min => f32::MAX,
+            Self::And | Self::Or | Self::Xor => {
+                panic!("logical and bitwise reductions have no f32 identity")
+            }
         }
     }
 
@@ -373,6 +460,8 @@ impl ReduceOp {
             Self::Mul => 1,
             Self::Max => u32::MIN,
             Self::Min => u32::MAX,
+            Self::And => u32::MAX,
+            Self::Or | Self::Xor => 0,
         }
     }
 
@@ -383,6 +472,8 @@ impl ReduceOp {
             Self::Mul => 1,
             Self::Max => i32::MIN,
             Self::Min => i32::MAX,
+            Self::And => -1,
+            Self::Or | Self::Xor => 0,
         }
     }
 
@@ -393,6 +484,9 @@ impl ReduceOp {
             Self::Mul => BinaryOp::Mul,
             Self::Max => BinaryOp::Max,
             Self::Min => BinaryOp::Min,
+            Self::And => BinaryOp::And,
+            Self::Or => BinaryOp::Or,
+            Self::Xor => BinaryOp::Xor,
         }
     }
 }
@@ -404,6 +498,9 @@ impl fmt::Display for ReduceOp {
             Self::Mul => write!(f, "mul"),
             Self::Max => write!(f, "max"),
             Self::Min => write!(f, "min"),
+            Self::And => write!(f, "and"),
+            Self::Or => write!(f, "or"),
+            Self::Xor => write!(f, "xor"),
         }
     }
 }
@@ -416,6 +513,9 @@ impl FromStr for ReduceOp {
             "mul" => Ok(Self::Mul),
             "max" => Ok(Self::Max),
             "min" => Ok(Self::Min),
+            "and" => Ok(Self::And),
+            "or" => Ok(Self::Or),
+            "xor" => Ok(Self::Xor),
             _ => Err(format!("unknown reduce op: {s}")),
         }
     }

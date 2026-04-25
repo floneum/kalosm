@@ -36,23 +36,6 @@ pub enum TensorExprNode {
         inputs: Vec<ExprId>,
         body: ExprId,
     },
-    SliceAssign {
-        input: ExprId,
-        value: ExprId,
-        output_shape: Shape,
-        slices: Vec<(u32, u32)>,
-    },
-    IndexSelect {
-        input: ExprId,
-        indices: ExprId,
-        output_shape: Shape,
-        axis: u32,
-    },
-    Resize {
-        input: ExprId,
-        input_shape: Shape,
-        output_shape: Shape,
-    },
     Reduce {
         expr: ExprId,
         axis: u32,
@@ -84,9 +67,6 @@ impl TensorExprNode {
                 children.push(*body);
                 children
             }
-            Self::SliceAssign { input, value, .. } => vec![*input, *value],
-            Self::IndexSelect { input, indices, .. } => vec![*input, *indices],
-            Self::Resize { input, .. } => vec![*input],
             Self::BinOp(_, children) => children.to_vec(),
             Self::TernOp(_, children) => children.to_vec(),
         }
@@ -149,128 +129,6 @@ impl TensorExprProgram {
                         "reduce node {idx} uses axis {axis} on rank-{} input",
                         shape.rank()
                     ));
-                }
-            }
-
-            if let TensorExprNode::SliceAssign {
-                value,
-                output_shape,
-                slices,
-                ..
-            } = node
-            {
-                if slices.len() != output_shape.rank() {
-                    return Err(format!(
-                        "slice assign node {idx} has {} slices for rank-{} output",
-                        slices.len(),
-                        output_shape.rank()
-                    ));
-                }
-                for (axis, ((start, end), dim)) in
-                    slices.iter().zip(output_shape.0.iter()).enumerate()
-                {
-                    let Dim::Lit(dim) = dim else {
-                        continue;
-                    };
-                    if start > end || end > dim {
-                        return Err(format!(
-                            "slice assign node {idx} has invalid slice {start}..{end} on axis {axis} with dim {dim}"
-                        ));
-                    }
-                }
-                if let Some(value_shape) = self.infer_node_shape(*value) {
-                    if value_shape.rank() != slices.len() {
-                        return Err(format!(
-                            "slice assign node {idx} value rank {} does not match slice rank {}",
-                            value_shape.rank(),
-                            slices.len()
-                        ));
-                    }
-                    for (axis, ((start, end), dim)) in
-                        slices.iter().zip(value_shape.0.iter()).enumerate()
-                    {
-                        let Dim::Lit(dim) = dim else {
-                            continue;
-                        };
-                        let expected = end - start;
-                        if *dim != expected {
-                            return Err(format!(
-                                "slice assign node {idx} value axis {axis} has dim {dim}, expected {expected}"
-                            ));
-                        }
-                    }
-                }
-            }
-
-            if let TensorExprNode::Resize {
-                input,
-                input_shape,
-                output_shape,
-            } = node
-            {
-                if input_shape.static_numel() != output_shape.static_numel()
-                    && input_shape.rank() != output_shape.rank()
-                {
-                    return Err(format!(
-                        "size-changing resize node {idx} changes rank from {} to {}",
-                        input_shape.rank(),
-                        output_shape.rank()
-                    ));
-                }
-                if let Some(inferred) = self.infer_node_shape(*input)
-                    && inferred != *input_shape
-                {
-                    return Err(format!(
-                        "resize node {idx} input shape {:?} does not match declared {:?}",
-                        inferred, input_shape
-                    ));
-                }
-            }
-
-            if let TensorExprNode::IndexSelect {
-                input,
-                indices,
-                output_shape,
-                axis,
-            } = node
-            {
-                let axis = *axis as usize;
-                if axis >= output_shape.rank() {
-                    return Err(format!(
-                        "index select node {idx} uses axis {axis} on rank-{} output",
-                        output_shape.rank()
-                    ));
-                }
-                if let Some(input_shape) = self.infer_node_shape(*input) {
-                    if input_shape.rank() != output_shape.rank() {
-                        return Err(format!(
-                            "index select node {idx} input rank {} does not match output rank {}",
-                            input_shape.rank(),
-                            output_shape.rank()
-                        ));
-                    }
-                    for dim in 0..output_shape.rank() {
-                        if dim != axis && input_shape.0[dim] != output_shape.0[dim] {
-                            return Err(format!(
-                                "index select node {idx} output dim {dim} {:?} does not match input dim {:?}",
-                                output_shape.0[dim], input_shape.0[dim]
-                            ));
-                        }
-                    }
-                }
-                if let Some(indices_shape) = self.infer_node_shape(*indices) {
-                    if indices_shape.rank() != 1 {
-                        return Err(format!(
-                            "index select node {idx} index tensor must be rank 1, got rank {}",
-                            indices_shape.rank()
-                        ));
-                    }
-                    if indices_shape.0[0] != output_shape.0[axis] {
-                        return Err(format!(
-                            "index select node {idx} output axis {axis} {:?} does not match index len {:?}",
-                            output_shape.0[axis], indices_shape.0[0]
-                        ));
-                    }
                 }
             }
         }
@@ -339,9 +197,6 @@ impl TensorExprProgram {
                 TensorExprNode::Input { shape, .. } => Some(shape.clone()),
                 TensorExprNode::Restride { new_shape, .. } => Some(new_shape.clone()),
                 TensorExprNode::Elementwise { index_space, .. } => Some(index_space.clone()),
-                TensorExprNode::SliceAssign { output_shape, .. } => Some(output_shape.clone()),
-                TensorExprNode::IndexSelect { output_shape, .. } => Some(output_shape.clone()),
-                TensorExprNode::Resize { output_shape, .. } => Some(output_shape.clone()),
                 TensorExprNode::Reduce { expr, axis, .. } => {
                     infer(program, *expr, cache).map(|shape| shape.remove_axis(*axis as usize))
                 }
@@ -391,9 +246,6 @@ impl TensorExprProgram {
                 TensorExprNode::Restride { expr, .. } | TensorExprNode::Reduce { expr, .. } => {
                     infer(program, *expr, cache, params)
                 }
-                TensorExprNode::SliceAssign { input, .. } => infer(program, *input, cache, params),
-                TensorExprNode::IndexSelect { input, .. } => infer(program, *input, cache, params),
-                TensorExprNode::Resize { input, .. } => infer(program, *input, cache, params),
                 TensorExprNode::Elementwise { inputs, body, .. } => {
                     let input_dtypes = inputs
                         .iter()
@@ -502,12 +354,60 @@ impl TensorExprBuilder {
         output_shape: Shape,
         slices: Vec<(u32, u32)>,
     ) -> ExprId {
-        self.add(TensorExprNode::SliceAssign {
-            input,
-            value,
-            output_shape,
-            slices,
-        })
+        assert_eq!(
+            output_shape.rank(),
+            slices.len(),
+            "slice_assign slices must match output rank"
+        );
+
+        let mut in_slice = self.scalar_lit(ScalarValue::Bool(true));
+        let mut relative_indices = Vec::with_capacity(slices.len());
+        let mut axis_in_slice = Vec::with_capacity(slices.len());
+        for (axis, (start, end)) in slices.iter().copied().enumerate() {
+            let index = self.scalar_index(axis as u32);
+            let full_axis =
+                matches!(output_shape.0[axis], Dim::Lit(dim) if start == 0 && end == dim);
+            if full_axis {
+                relative_indices.push(index);
+                axis_in_slice.push(self.scalar_lit(ScalarValue::Bool(true)));
+                continue;
+            }
+
+            let start_lit = self.scalar_u32(start);
+            let end_lit = self.scalar_u32(end);
+            let ge_start = self.scalar_binop(BinaryOp::Ge, [index, start_lit]);
+            let lt_end = self.scalar_binop(BinaryOp::Lt, [index, end_lit]);
+            let axis_in_range = self.scalar_binop(BinaryOp::And, [ge_start, lt_end]);
+            in_slice = self.scalar_binop(BinaryOp::And, [in_slice, axis_in_range]);
+            axis_in_slice.push(axis_in_range);
+
+            let relative = if start == 0 {
+                index
+            } else {
+                self.scalar_binop(BinaryOp::Sub, [index, start_lit])
+            };
+            relative_indices.push(relative);
+        }
+
+        let zero = self.scalar_u32(0);
+        let safe_indices = relative_indices
+            .into_iter()
+            .zip(axis_in_slice)
+            .map(|(index, axis_in_range)| {
+                if matches!(
+                    self.nodes[axis_in_range.0],
+                    TensorExprNode::Const(ScalarValue::Bool(true))
+                ) {
+                    index
+                } else {
+                    self.scalar_ternop(TernaryOp::Select, [axis_in_range, index, zero])
+                }
+            })
+            .collect::<Vec<_>>();
+        let replacement = self.indexed_arg(1, safe_indices);
+        let original = self.scalar_arg(0);
+        let body = self.scalar_ternop(TernaryOp::Select, [in_slice, replacement, original]);
+        self.elementwise(output_shape, &[input, value], body)
     }
 
     pub fn index_select(
@@ -517,20 +417,56 @@ impl TensorExprBuilder {
         output_shape: Shape,
         axis: u32,
     ) -> ExprId {
-        self.add(TensorExprNode::IndexSelect {
-            input,
-            indices,
-            output_shape,
-            axis,
-        })
+        assert!(
+            (axis as usize) < output_shape.rank(),
+            "index_select axis must be in bounds"
+        );
+        let source_indices = (0..output_shape.rank())
+            .map(|dim| {
+                if dim == axis as usize {
+                    let index = self.scalar_index(axis);
+                    self.indexed_arg(1, vec![index])
+                } else {
+                    self.scalar_index(dim as u32)
+                }
+            })
+            .collect::<Vec<_>>();
+        let body = self.indexed_arg(0, source_indices);
+        self.elementwise(output_shape, &[input, indices], body)
     }
 
     pub fn resize(&mut self, input: ExprId, input_shape: Shape, output_shape: Shape) -> ExprId {
-        self.add(TensorExprNode::Resize {
-            input,
-            input_shape,
-            output_shape,
-        })
+        if input_shape.static_numel() == output_shape.static_numel() {
+            let strides = Strides::row_major_for_shape(&output_shape)
+                .expect("literal resize output shape has row-major strides");
+            return self.restride_with_offset(input, output_shape, strides, 0);
+        }
+
+        assert_eq!(
+            input_shape.rank(),
+            output_shape.rank(),
+            "size-changing resize must preserve rank"
+        );
+
+        let mut in_bounds = self.scalar_lit(ScalarValue::Bool(true));
+        let mut safe_indices = Vec::with_capacity(output_shape.rank());
+        for (axis, dim) in input_shape.0.iter().enumerate() {
+            let Dim::Lit(limit) = dim else {
+                panic!("resize currently requires literal input dimensions");
+            };
+            let index = self.scalar_index(axis as u32);
+            let limit = self.scalar_u32(*limit);
+            let axis_in_bounds = self.scalar_binop(BinaryOp::Lt, [index, limit]);
+            in_bounds = self.scalar_binop(BinaryOp::And, [in_bounds, axis_in_bounds]);
+            let zero = self.scalar_u32(0);
+            safe_indices.push(self.scalar_ternop(TernaryOp::Select, [axis_in_bounds, index, zero]));
+        }
+
+        let value = self.indexed_arg(0, safe_indices);
+        let dtype = self.infer_expr_dtype(input, None).unwrap_or(DType::F32);
+        let zero = self.zero_for_dtype(dtype);
+        let body = self.scalar_ternop(TernaryOp::Select, [in_bounds, value, zero]);
+        self.elementwise(output_shape, &[input], body)
     }
 
     pub fn reduce(&mut self, expr: ExprId, axis: u32, op: ReduceOp) -> ExprId {
@@ -575,6 +511,71 @@ impl TensorExprBuilder {
 
     pub fn scalar_ternop(&mut self, op: TernaryOp, args: [ExprId; 3]) -> ExprId {
         self.add(TensorExprNode::TernOp(op, args))
+    }
+
+    fn zero_for_dtype(&mut self, dtype: DType) -> ExprId {
+        let value = match dtype {
+            DType::F16 => ScalarValue::F16(ordered_float::OrderedFloat(0.0)),
+            DType::F32 => ScalarValue::F32(ordered_float::OrderedFloat(0.0)),
+            DType::U32 => ScalarValue::U32(0),
+            DType::I32 => ScalarValue::I32(0),
+            DType::Bool => ScalarValue::Bool(false),
+        };
+        self.scalar_lit(value)
+    }
+
+    fn infer_expr_dtype(&self, id: ExprId, params: Option<&[DType]>) -> Option<DType> {
+        fn unary_dtype(op: UnaryOp, input: Option<DType>) -> Option<DType> {
+            match op {
+                UnaryOp::CastF16 => Some(DType::F16),
+                UnaryOp::CastF32 => Some(DType::F32),
+                UnaryOp::CastI32 => Some(DType::I32),
+                UnaryOp::CastU32 => Some(DType::U32),
+                UnaryOp::CastBool | UnaryOp::Not => Some(DType::Bool),
+                _ => input,
+            }
+        }
+
+        match self.nodes.get(id.0)? {
+            TensorExprNode::Input { dtype, .. } => Some(*dtype),
+            TensorExprNode::Restride { expr, .. } | TensorExprNode::Reduce { expr, .. } => {
+                self.infer_expr_dtype(*expr, params)
+            }
+            TensorExprNode::Elementwise { inputs, body, .. } => {
+                let input_dtypes = inputs
+                    .iter()
+                    .map(|input| self.infer_expr_dtype(*input, params))
+                    .collect::<Option<Vec<_>>>()?;
+                self.infer_expr_dtype(*body, Some(&input_dtypes))
+            }
+            TensorExprNode::BinOp(op, children) => match op {
+                BinaryOp::Lt
+                | BinaryOp::Le
+                | BinaryOp::Gt
+                | BinaryOp::Ge
+                | BinaryOp::Eq
+                | BinaryOp::Neq => Some(DType::Bool),
+                _ => self.infer_expr_dtype(children[0], params),
+            },
+            TensorExprNode::UnOp(op, child) => {
+                unary_dtype(*op, self.infer_expr_dtype(*child, params))
+            }
+            TensorExprNode::TernOp(op, children) => match op {
+                TernaryOp::Fma => self.infer_expr_dtype(children[0], params),
+                TernaryOp::Select => self.infer_expr_dtype(children[1], params),
+            },
+            TensorExprNode::Const(value) => Some(match value {
+                ScalarValue::F16(_) => DType::F16,
+                ScalarValue::F32(_) => DType::F32,
+                ScalarValue::I32(_) => DType::I32,
+                ScalarValue::U32(_) => DType::U32,
+                ScalarValue::Bool(_) => DType::Bool,
+            }),
+            TensorExprNode::Arg(index) | TensorExprNode::IndexedArg { index, .. } => {
+                params.and_then(|params| params.get(*index as usize).copied())
+            }
+            TensorExprNode::Index(_) => Some(DType::U32),
+        }
     }
 
     /// Build an arbitrary literal-rank contraction from restrided inputs, a

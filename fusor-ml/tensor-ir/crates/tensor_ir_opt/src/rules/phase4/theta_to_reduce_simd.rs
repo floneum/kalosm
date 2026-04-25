@@ -7,7 +7,7 @@ use crate::applier::SimpleEclassSearcher;
 use crate::binding;
 use crate::language::{SimdNode, TensorIr};
 use crate::rules::RunnerConfig;
-use crate::types::{BinaryOp, BinderKind, IndexLevel, ReduceOp, ScalarValue, VarRef, slots};
+use crate::types::{BinderKind, IndexLevel, ReduceOp, ScalarValue, VarRef, slots};
 
 pub(super) fn build(config: &RunnerConfig) -> Rewrite<TensorIr, TensorAnalysis> {
     let simd_width = config.device.simd_width;
@@ -39,9 +39,13 @@ pub(super) fn build(config: &RunnerConfig) -> Rewrite<TensorIr, TensorAnalysis> 
                 if subtree_contains_dispatch_lane(egraph, *update) {
                     return false;
                 }
-                egraph[*update]
-                    .iter()
-                    .any(|n| matches!(n, TensorIr::BinOp(_, args) if args.len() == 2))
+                egraph[*update].iter().any(|n| {
+                    matches!(
+                        n,
+                        TensorIr::BinOp(name, args)
+                            if args.len() == 2 && reduce_op_for_dtype(egraph, *name, *init).is_some()
+                    )
+                })
             })
         }),
         crate::applier::AdaptedApplier(ThetaToReduceSimdApplier),
@@ -84,7 +88,7 @@ impl crate::applier::TypedApplier for ThetaToReduceSimdApplier {
             .cloned();
 
         let Some(TensorIr::Simd(SimdNode::Theta {
-            children: [_, _, update],
+            children: [init, _, update],
             ..
         })) = node
         else {
@@ -103,12 +107,8 @@ impl crate::applier::TypedApplier for ThetaToReduceSimdApplier {
             return vec![];
         };
 
-        let op = match name {
-            BinaryOp::Add => ReduceOp::Add,
-            BinaryOp::Mul => ReduceOp::Mul,
-            BinaryOp::Max => ReduceOp::Max,
-            BinaryOp::Min => ReduceOp::Min,
-            _ => return vec![],
+        let Some(op) = reduce_op_for_dtype(egraph, name, init) else {
+            return vec![];
         };
 
         if args.len() != 2 {
@@ -124,4 +124,14 @@ impl crate::applier::TypedApplier for ThetaToReduceSimdApplier {
         egraph.union(eclass, rsimd);
         vec![rsimd]
     }
+}
+
+fn reduce_op_for_dtype(
+    egraph: &EGraph<TensorIr, TensorAnalysis>,
+    op_name: crate::types::BinaryOp,
+    init: Id,
+) -> Option<ReduceOp> {
+    let op = ReduceOp::from_bin_op(op_name)?;
+    let dtype = egraph[init].data.dtype?;
+    op.supports_dtype(dtype).then_some(op)
 }

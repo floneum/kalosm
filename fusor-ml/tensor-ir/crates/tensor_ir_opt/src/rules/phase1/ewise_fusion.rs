@@ -25,7 +25,7 @@ use egg::{EGraph, Id, Rewrite};
 
 use crate::analysis::TensorAnalysis;
 use crate::applier::SimpleEclassSearcher;
-use crate::language::{HighLevelNode, TensorIr, add_list, extract_list};
+use crate::language::{add_list, extract_list, HighLevelNode, TensorIr};
 use crate::rules::RunnerConfig;
 
 pub(super) fn build(_config: &RunnerConfig) -> Rewrite<TensorIr, TensorAnalysis> {

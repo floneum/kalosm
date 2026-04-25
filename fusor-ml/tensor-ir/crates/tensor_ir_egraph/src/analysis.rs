@@ -121,6 +121,9 @@ pub struct TensorData {
     /// be swapped without changing semantics. Rewrites use this as a cheap
     /// analysis gate before materializing alternate operand orders.
     pub has_commutative_binop: bool,
+    /// True when this e-class contains a scalar binary op whose nested groups
+    /// may be rotated without changing semantics.
+    pub has_associative_binop: bool,
     /// True when this e-class contains `exp(x - reduce_max(x))` along an axis.
     pub exp_max: Option<ExpMaxInfo>,
     /// True when this e-class is a tensor normalized by a reduction along an
@@ -148,6 +151,7 @@ impl Default for TensorData {
             dispatch_shape: None,
             reduction_depth: 0,
             has_commutative_binop: false,
+            has_associative_binop: false,
             exp_max: None,
             normalized_weight: None,
         }
@@ -378,74 +382,6 @@ fn make_high_level_data(
                     detect_normalized_weight(egraph, index_space, *num_inputs, &children);
             }
             data
-        }
-        HighLevelNode::SliceAssign {
-            output_shape,
-            children,
-            ..
-        } => {
-            let input = &egraph[children[0]].data;
-            let value = &egraph[children[1]].data;
-            TensorData {
-                shape: Some(output_shape.clone()),
-                dtype: input.dtype,
-                stride_profile: Strides::row_major_for_shape(output_shape),
-                dep: input.dep.union(value.dep),
-                var_dep: input.var_dep.clone().union(&value.var_dep),
-                free_var_dep: input.free_var_dep.clone().union(&value.free_var_dep),
-                composite_dispatch: CompositeDispatchInfo {
-                    lowerable: has_literal_shape(output_shape)
-                        && input.composite_dispatch.lowerable
-                        && value.composite_dispatch.lowerable,
-                },
-                reduction_depth: input.reduction_depth.max(value.reduction_depth),
-                ..Default::default()
-            }
-        }
-        HighLevelNode::IndexSelect {
-            output_shape,
-            children,
-            ..
-        } => {
-            let input = &egraph[children[0]].data;
-            let indices = &egraph[children[1]].data;
-            TensorData {
-                shape: Some(output_shape.clone()),
-                dtype: input.dtype,
-                stride_profile: Strides::row_major_for_shape(output_shape),
-                dep: input.dep.union(indices.dep),
-                var_dep: input.var_dep.clone().union(&indices.var_dep),
-                free_var_dep: input.free_var_dep.clone().union(&indices.free_var_dep),
-                composite_dispatch: CompositeDispatchInfo {
-                    lowerable: has_literal_shape(output_shape)
-                        && input.composite_dispatch.lowerable
-                        && indices.composite_dispatch.lowerable,
-                },
-                reduction_depth: input.reduction_depth.max(indices.reduction_depth),
-                ..Default::default()
-            }
-        }
-        HighLevelNode::Resize {
-            input_shape,
-            output_shape,
-            expr,
-        } => {
-            let child = &egraph[*expr].data;
-            TensorData {
-                shape: Some(output_shape.clone()),
-                dtype: child.dtype,
-                stride_profile: Strides::row_major_for_shape(output_shape),
-                dep: child.dep,
-                var_dep: child.var_dep.clone(),
-                free_var_dep: child.free_var_dep.clone(),
-                composite_dispatch: CompositeDispatchInfo {
-                    lowerable: child.composite_dispatch.lowerable
-                        && has_literal_shape(input_shape)
-                        && has_literal_shape(output_shape),
-                },
-                reduction_depth: child.reduction_depth,
-                ..Default::default()
-            }
         }
         HighLevelNode::Reduce { axis, expr, .. } => {
             let child = &egraph[*expr].data;
@@ -788,6 +724,7 @@ fn make_simd_data(egraph: &EGraph<TensorIr, TensorAnalysis>, node: &SimdNode) ->
                 .union(&update_data.free_var_dep.ascend_theta());
             TensorData {
                 dep,
+                dtype: init_data.dtype,
                 var_dep,
                 free_var_dep,
                 ..Default::default()
@@ -852,6 +789,7 @@ impl Analysis<TensorIr> for TensorAnalysis {
                     free_var_dep: child_free_var_dep_union(egraph, args),
                     address_profile,
                     has_commutative_binop: name.is_commutative(),
+                    has_associative_binop: name.is_associative(),
                     ..Default::default()
                 }
             }
@@ -1016,6 +954,10 @@ impl Analysis<TensorIr> for TensorAnalysis {
             a.has_commutative_binop = true;
             changed = true;
         }
+        if b.has_associative_binop && !a.has_associative_binop {
+            a.has_associative_binop = true;
+            changed = true;
+        }
         if a.exp_max.is_none() && b.exp_max.is_some() {
             a.exp_max = b.exp_max;
             changed = true;
@@ -1115,11 +1057,15 @@ fn fold_bin_op(op: BinaryOp, args: &[&ScalarValue]) -> Option<ScalarValue> {
         }
 
         // u32
-        (BinaryOp::Add, ScalarValue::U32(a), ScalarValue::U32(b)) => Some(ScalarValue::U32(a + b)),
+        (BinaryOp::Add, ScalarValue::U32(a), ScalarValue::U32(b)) => {
+            Some(ScalarValue::U32(a.wrapping_add(*b)))
+        }
         (BinaryOp::Sub, ScalarValue::U32(a), ScalarValue::U32(b)) => {
             Some(ScalarValue::U32(a.wrapping_sub(*b)))
         }
-        (BinaryOp::Mul, ScalarValue::U32(a), ScalarValue::U32(b)) => Some(ScalarValue::U32(a * b)),
+        (BinaryOp::Mul, ScalarValue::U32(a), ScalarValue::U32(b)) => {
+            Some(ScalarValue::U32(a.wrapping_mul(*b)))
+        }
         (BinaryOp::Div, ScalarValue::U32(a), ScalarValue::U32(b)) if *b != 0 => {
             Some(ScalarValue::U32(a / b))
         }

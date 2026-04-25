@@ -1,8 +1,8 @@
 use std::{collections::HashMap, sync::Arc};
 
 use tensor_ir::{
-    DType, DispatchProgram, StageConfig, StagedPipeline, TensorExprProgram, TensorIr,
-    lower_dispatch_program, verify,
+    DType, DispatchProgram, LoweringOptions, SimdProgram, StageConfig, StagedPipeline,
+    TensorExprProgram, TensorIr, lower_dispatch_program, module_to_wgsl, verify,
 };
 use wgpu::{Buffer, CommandEncoder, ComputePipeline};
 
@@ -48,16 +48,22 @@ pub(crate) fn execute(
     config.runner.node_limit = 50_000;
     config.runner.time_limit_secs = 30;
     let pipeline = StagedPipeline::new(config);
-    let kernel = lower_with_report(&pipeline, expr).map_err(|error| {
-        let extraction = error
-            .report
-            .extraction
-            .as_ref()
-            .map(|extraction| format!("{:?}", extraction.candidate_validation))
-            .unwrap_or_else(|| "no extraction report".to_string());
-        format!("{} ({extraction})", error.message)
-    })?;
-    let simd = pipeline.compile(kernel.0)?;
+    let (simd, mut wgsl) =
+        lower_valid_simd_program(&pipeline, expr, output_datatype).map_err(|error| {
+            let extraction = error
+                .report
+                .extraction
+                .as_ref()
+                .map(|extraction| format!("{:?}", extraction.candidate_validation))
+                .unwrap_or_else(|| "no extraction report".to_string());
+            format!("{} ({extraction})", error.message)
+        })?;
+    if wgsl.contains("f16") && !wgsl.contains("enable f16;") {
+        if !device.f16_supported() {
+            return Err("tensor_ir runtime requires SHADER_F16 for f16 shader operations".into());
+        }
+        wgsl = format!("enable f16;\n{wgsl}");
+    }
     let program = simd.dispatch_program();
     let final_dispatch_index = program
         .dispatches
@@ -70,9 +76,7 @@ pub(crate) fn execute(
             "tensor_ir output dtype mismatch: program produced {final_datatype}, caller expected {output_datatype}"
         ));
     }
-    let verified = verify(program).map_err(|error| format!("verification error: {error}"))?;
-    let module = lower_dispatch_program(verified);
-    let shader = device.create_naga_shader_module(module);
+    let shader = device.create_shader_module(wgsl);
 
     let mut produced_buffers: HashMap<egg::Id, Arc<Buffer>> = HashMap::default();
     let mut final_output = None;
@@ -145,6 +149,91 @@ pub(crate) fn execute(
         output_shape,
         output_datatype,
     ))
+}
+
+fn lower_valid_simd_program(
+    pipeline: &StagedPipeline,
+    expr: &TensorExprProgram,
+    output_datatype: DataTypeEnum,
+) -> Result<(SimdProgram, String), tensor_ir::LoweringError> {
+    let (kernel, report) = lower_with_report(pipeline, expr)?;
+    let mut errors = Vec::new();
+    match compile_valid_candidate(pipeline, kernel, output_datatype) {
+        Ok(compiled) => return Ok(compiled),
+        Err(error) => errors.push(error),
+    }
+
+    match pipeline.lower_candidates(expr, 16) {
+        Ok(candidates) => {
+            for candidate in candidates {
+                match compile_valid_candidate(pipeline, candidate, output_datatype) {
+                    Ok(compiled) => return Ok(compiled),
+                    Err(error) => errors.push(error),
+                }
+            }
+        }
+        Err(error) => errors.push(error),
+    }
+
+    let mut fallback_config = pipeline.config().clone();
+    fallback_config.runner.lowering = LoweringOptions::readable();
+    fallback_config.runner.iter_limit = 1;
+    let fallback = StagedPipeline::new(fallback_config);
+    if fallback.config().runner.lowering != pipeline.config().runner.lowering {
+        match lower_with_report(&fallback, expr) {
+            Ok((candidate, _)) => {
+                match compile_valid_candidate(&fallback, candidate, output_datatype) {
+                    Ok(compiled) => return Ok(compiled),
+                    Err(error) => errors.push(error),
+                }
+            }
+            Err(error) => errors.push(error.message),
+        }
+        match fallback.lower_candidates(expr, 16) {
+            Ok(candidates) => {
+                for candidate in candidates {
+                    match compile_valid_candidate(&fallback, candidate, output_datatype) {
+                        Ok(compiled) => return Ok(compiled),
+                        Err(error) => errors.push(error),
+                    }
+                }
+            }
+            Err(error) => errors.push(error),
+        }
+    }
+
+    let message = format!(
+        "no tensor_ir candidate produced a valid WGSL shader: {}",
+        errors
+            .last()
+            .cloned()
+            .unwrap_or_else(|| "no candidates returned".to_string())
+    );
+    Err(tensor_ir::LoweringError::new(message, report))
+}
+
+fn compile_valid_candidate(
+    pipeline: &StagedPipeline,
+    kernel: tensor_ir::KernelProgram,
+    output_datatype: DataTypeEnum,
+) -> Result<(SimdProgram, String), String> {
+    let simd = pipeline.compile(kernel)?;
+    let program = simd.dispatch_program();
+    let final_dispatch_index = program
+        .dispatches
+        .len()
+        .checked_sub(1)
+        .ok_or_else(|| "tensor_ir program produced no dispatches".to_string())?;
+    let final_datatype = dispatch_output_datatype(program, final_dispatch_index)?;
+    if final_datatype != output_datatype {
+        return Err(format!(
+            "tensor_ir output dtype mismatch: program produced {final_datatype}, caller expected {output_datatype}"
+        ));
+    }
+    let verified = verify(program).map_err(|error| format!("verification error: {error}"))?;
+    let module = lower_dispatch_program(verified);
+    let wgsl = module_to_wgsl(&module)?;
+    Ok((simd, wgsl))
 }
 
 fn dispatch_grid(physical_workgroups: u32) -> (u32, u32, u32) {

@@ -7,6 +7,170 @@ use crate::language::*;
 use crate::rules::{self, Phase, RunnerConfig};
 use crate::types::*;
 
+fn has_binop(
+    egraph: &egg::EGraph<TensorIr, TensorAnalysis>,
+    id: egg::Id,
+    op: BinaryOp,
+    lhs: egg::Id,
+    rhs: egg::Id,
+) -> bool {
+    let lhs = egraph.find(lhs);
+    let rhs = egraph.find(rhs);
+    egraph[egraph.find(id)].iter().any(|node| {
+        matches!(
+            node,
+            TensorIr::BinOp(name, [a, b])
+                if *name == op && egraph.find(*a) == lhs && egraph.find(*b) == rhs
+        )
+    })
+}
+
+fn has_right_rotation(
+    egraph: &egg::EGraph<TensorIr, TensorAnalysis>,
+    root: egg::Id,
+    op: BinaryOp,
+    a: egg::Id,
+    b: egg::Id,
+    c: egg::Id,
+) -> bool {
+    let a = egraph.find(a);
+    egraph[egraph.find(root)].iter().any(|node| {
+        let TensorIr::BinOp(name, [lhs, rhs]) = node else {
+            return false;
+        };
+        *name == op && egraph.find(*lhs) == a && has_binop(egraph, *rhs, op, b, c)
+    })
+}
+
+#[test]
+fn test_binary_op_associativity_metadata() {
+    for op in [
+        BinaryOp::Add,
+        BinaryOp::Mul,
+        BinaryOp::Max,
+        BinaryOp::Min,
+        BinaryOp::And,
+        BinaryOp::Or,
+        BinaryOp::Xor,
+    ] {
+        assert!(op.is_associative(), "{op} should be associative");
+    }
+
+    for op in [
+        BinaryOp::Sub,
+        BinaryOp::Div,
+        BinaryOp::Mod,
+        BinaryOp::Pow,
+        BinaryOp::Shl,
+        BinaryOp::Shr,
+        BinaryOp::Eq,
+        BinaryOp::Neq,
+        BinaryOp::Lt,
+        BinaryOp::Le,
+        BinaryOp::Gt,
+        BinaryOp::Ge,
+    ] {
+        assert!(!op.is_associative(), "{op} should not be associative");
+    }
+
+    assert_eq!(ReduceOp::from_bin_op(BinaryOp::Add), Some(ReduceOp::Add));
+    assert_eq!(ReduceOp::from_bin_op(BinaryOp::Mul), Some(ReduceOp::Mul));
+    assert_eq!(ReduceOp::from_bin_op(BinaryOp::Max), Some(ReduceOp::Max));
+    assert_eq!(ReduceOp::from_bin_op(BinaryOp::Min), Some(ReduceOp::Min));
+    assert_eq!(ReduceOp::from_bin_op(BinaryOp::And), Some(ReduceOp::And));
+    assert_eq!(ReduceOp::from_bin_op(BinaryOp::Or), Some(ReduceOp::Or));
+    assert_eq!(ReduceOp::from_bin_op(BinaryOp::Xor), Some(ReduceOp::Xor));
+    assert_eq!(
+        ReduceOp::And.identity(DType::Bool),
+        Some(ScalarValue::Bool(true))
+    );
+    assert_eq!(
+        ReduceOp::Or.identity(DType::Bool),
+        Some(ScalarValue::Bool(false))
+    );
+    assert_eq!(ReduceOp::Xor.identity(DType::Bool), None);
+    assert_eq!(
+        ReduceOp::And.identity(DType::U32),
+        Some(ScalarValue::U32(u32::MAX))
+    );
+    assert_eq!(
+        ReduceOp::Xor.identity(DType::U32),
+        Some(ScalarValue::U32(0))
+    );
+}
+
+#[test]
+fn test_phase1_associative_binop_rotate_right_add() {
+    let mut egraph = egg::EGraph::<TensorIr, TensorAnalysis>::default();
+    let a = egraph.add(TensorIr::Const(ScalarValue::U32(2)));
+    let b = egraph.add(TensorIr::Const(ScalarValue::U32(3)));
+    let c = egraph.add(TensorIr::Const(ScalarValue::U32(4)));
+    let lhs = egraph.add(TensorIr::BinOp(BinaryOp::Add, [a, b]));
+    let root = egraph.add(TensorIr::BinOp(BinaryOp::Add, [lhs, c]));
+
+    let config = RunnerConfig {
+        iter_limit: 4,
+        node_limit: 10_000,
+        time_limit_secs: 10,
+        device: DeviceProfile::default(),
+        lowering: LoweringOptions::default(),
+    };
+    let egraph = rules::saturate_phases(egraph, &[Phase::Lowering], &config);
+
+    assert!(
+        has_right_rotation(&egraph, root, BinaryOp::Add, a, b, c),
+        "associativity should add a + (b + c)"
+    );
+}
+
+#[test]
+fn test_phase1_associative_binop_rotate_right_and() {
+    let mut egraph = egg::EGraph::<TensorIr, TensorAnalysis>::default();
+    let a = egraph.add(TensorIr::Const(ScalarValue::Bool(true)));
+    let b = egraph.add(TensorIr::Const(ScalarValue::Bool(false)));
+    let c = egraph.add(TensorIr::Const(ScalarValue::Bool(true)));
+    let lhs = egraph.add(TensorIr::BinOp(BinaryOp::And, [a, b]));
+    let root = egraph.add(TensorIr::BinOp(BinaryOp::And, [lhs, c]));
+
+    let config = RunnerConfig {
+        iter_limit: 4,
+        node_limit: 10_000,
+        time_limit_secs: 10,
+        device: DeviceProfile::default(),
+        lowering: LoweringOptions::default(),
+    };
+    let egraph = rules::saturate_phases(egraph, &[Phase::Lowering], &config);
+
+    assert!(
+        has_right_rotation(&egraph, root, BinaryOp::And, a, b, c),
+        "associativity should add a & (b & c)"
+    );
+}
+
+#[test]
+fn test_phase1_associative_binop_does_not_rotate_sub() {
+    let mut egraph = egg::EGraph::<TensorIr, TensorAnalysis>::default();
+    let a = egraph.add(TensorIr::Const(ScalarValue::U32(8)));
+    let b = egraph.add(TensorIr::Const(ScalarValue::U32(3)));
+    let c = egraph.add(TensorIr::Const(ScalarValue::U32(1)));
+    let lhs = egraph.add(TensorIr::BinOp(BinaryOp::Sub, [a, b]));
+    let root = egraph.add(TensorIr::BinOp(BinaryOp::Sub, [lhs, c]));
+
+    let config = RunnerConfig {
+        iter_limit: 4,
+        node_limit: 10_000,
+        time_limit_secs: 10,
+        device: DeviceProfile::default(),
+        lowering: LoweringOptions::default(),
+    };
+    let egraph = rules::saturate_phases(egraph, &[Phase::Lowering], &config);
+
+    assert!(
+        !has_right_rotation(&egraph, root, BinaryOp::Sub, a, b, c),
+        "non-associative sub should not add a - (b - c)"
+    );
+}
+
 /// Test that Phase 1 lowering produces Dispatch nodes.
 #[test]
 fn test_phase1_elementwise_lowering() {

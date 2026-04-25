@@ -26,21 +26,6 @@ pub enum HighLevelNode {
         num_inputs: u32,
         children_list: Id,
     },
-    SliceAssign {
-        output_shape: Shape,
-        slices: Vec<(u32, u32)>,
-        children: [Id; 2],
-    },
-    IndexSelect {
-        output_shape: Shape,
-        axis: u32,
-        children: [Id; 2],
-    },
-    Resize {
-        input_shape: Shape,
-        output_shape: Shape,
-        expr: Id,
-    },
     Reduce {
         axis: u32,
         op: ReduceOp,
@@ -190,42 +175,6 @@ fn matches_high_level(lhs: &HighLevelNode, rhs: &HighLevelNode) -> bool {
                 ..
             },
         ) => lhs_axis == rhs_axis && lhs_op == rhs_op,
-        (
-            HighLevelNode::SliceAssign {
-                output_shape: lhs_output_shape,
-                slices: lhs_slices,
-                ..
-            },
-            HighLevelNode::SliceAssign {
-                output_shape: rhs_output_shape,
-                slices: rhs_slices,
-                ..
-            },
-        ) => lhs_output_shape == rhs_output_shape && lhs_slices == rhs_slices,
-        (
-            HighLevelNode::IndexSelect {
-                output_shape: lhs_output_shape,
-                axis: lhs_axis,
-                ..
-            },
-            HighLevelNode::IndexSelect {
-                output_shape: rhs_output_shape,
-                axis: rhs_axis,
-                ..
-            },
-        ) => lhs_output_shape == rhs_output_shape && lhs_axis == rhs_axis,
-        (
-            HighLevelNode::Resize {
-                input_shape: lhs_input_shape,
-                output_shape: lhs_output_shape,
-                ..
-            },
-            HighLevelNode::Resize {
-                input_shape: rhs_input_shape,
-                output_shape: rhs_output_shape,
-                ..
-            },
-        ) => lhs_input_shape == rhs_input_shape && lhs_output_shape == rhs_output_shape,
         (HighLevelNode::Param(lhs_p), HighLevelNode::Param(rhs_p)) => lhs_p == rhs_p,
         (HighLevelNode::Index(lhs_i), HighLevelNode::Index(rhs_i)) => lhs_i == rhs_i,
         (
@@ -301,12 +250,10 @@ const fn high_level_children(node: &HighLevelNode) -> &[Id] {
     match node {
         HighLevelNode::Input { .. } | HighLevelNode::Param(_) | HighLevelNode::Index(_) => &[],
         HighLevelNode::IndexedParam { children_list, .. } => std::slice::from_ref(children_list),
-        HighLevelNode::Restride { expr, .. }
-        | HighLevelNode::Resize { expr, .. }
-        | HighLevelNode::Reduce { expr, .. } => std::slice::from_ref(expr),
+        HighLevelNode::Restride { expr, .. } | HighLevelNode::Reduce { expr, .. } => {
+            std::slice::from_ref(expr)
+        }
         HighLevelNode::Elementwise { children_list, .. } => std::slice::from_ref(children_list),
-        HighLevelNode::SliceAssign { children, .. }
-        | HighLevelNode::IndexSelect { children, .. } => children,
     }
 }
 
@@ -325,12 +272,10 @@ const fn high_level_children_mut(node: &mut HighLevelNode) -> &mut [Id] {
     match node {
         HighLevelNode::Input { .. } | HighLevelNode::Param(_) | HighLevelNode::Index(_) => &mut [],
         HighLevelNode::IndexedParam { children_list, .. } => std::slice::from_mut(children_list),
-        HighLevelNode::Restride { expr, .. }
-        | HighLevelNode::Resize { expr, .. }
-        | HighLevelNode::Reduce { expr, .. } => std::slice::from_mut(expr),
+        HighLevelNode::Restride { expr, .. } | HighLevelNode::Reduce { expr, .. } => {
+            std::slice::from_mut(expr)
+        }
         HighLevelNode::Elementwise { children_list, .. } => std::slice::from_mut(children_list),
-        HighLevelNode::SliceAssign { children, .. }
-        | HighLevelNode::IndexSelect { children, .. } => children,
     }
 }
 
@@ -544,9 +489,6 @@ impl fmt::Display for TensorIr {
                 HighLevelNode::Elementwise { num_inputs, .. } => {
                     write!(f, "Elementwise×{num_inputs}")
                 }
-                HighLevelNode::SliceAssign { .. } => write!(f, "SliceAssign"),
-                HighLevelNode::IndexSelect { axis, .. } => write!(f, "IndexSelect@{axis}"),
-                HighLevelNode::Resize { .. } => write!(f, "Resize"),
                 HighLevelNode::Reduce { axis, op, .. } => write!(f, "Reduce/{op}@{axis}"),
                 HighLevelNode::Param(i) => write!(f, "Param({i})"),
                 HighLevelNode::Index(i) => write!(f, "Index({i})"),

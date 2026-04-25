@@ -2,7 +2,7 @@ use egg::{EGraph, Id, Rewrite};
 
 use crate::analysis::TensorAnalysis;
 use crate::applier::SimpleEclassSearcher;
-use crate::language::{DispatchNode, HighLevelNode, SimdNode, TensorIr, add_list, extract_list};
+use crate::language::{add_list, extract_list, DispatchNode, HighLevelNode, SimdNode, TensorIr};
 use crate::rules::RunnerConfig;
 use crate::types::{
     BinaryOp, BufferRef, DType, Dim, IndexLevel, LoweringOptions, MemTier, ReduceOp, ScalarValue,
@@ -21,16 +21,6 @@ const fn cooperative_reduce_unroll(lowering: &LoweringOptions) -> u32 {
         COOPERATIVE_REDUCE_UNROLL
     } else {
         1
-    }
-}
-
-fn reduce_identity(op: ReduceOp, dtype: DType) -> ScalarValue {
-    match dtype {
-        DType::F16 => ScalarValue::F16(ordered_float::OrderedFloat(op.identity_f16())),
-        DType::F32 => ScalarValue::F32(ordered_float::OrderedFloat(op.identity_f32())),
-        DType::U32 => ScalarValue::U32(op.identity_u32()),
-        DType::I32 => ScalarValue::I32(op.identity_i32()),
-        DType::Bool => ScalarValue::Bool(false),
     }
 }
 
@@ -124,7 +114,11 @@ fn build_elementwise_reduce_dispatch(
     let lowered_body =
         lower_scalar_body_strided(egraph, ewise_body, ewise_inputs, spec.input_indices);
     let acc_var = egraph.add(TensorIr::Simd(SimdNode::Var(VarRef::acc(0))));
-    let update = egraph.add(TensorIr::BinOp(spec.op.bin_op(), [acc_var, lowered_body]));
+    let dtype = egraph[lowered_body].data.dtype.unwrap_or(DType::F32);
+    let Some(op_name) = spec.op.bin_op_for_dtype(dtype) else {
+        return None;
+    };
+    let update = egraph.add(TensorIr::BinOp(op_name, [acc_var, lowered_body]));
     let theta = egraph.add(TensorIr::Simd(SimdNode::Theta {
         children: [spec.init, spec.count, update],
     }));
@@ -148,7 +142,7 @@ fn build_cooperative_reduce_dispatch(
     egraph: &mut EGraph<TensorIr, TensorAnalysis>,
     spec: &CooperativeReduceDispatchSpec<'_>,
     simd_width: u32,
-) -> Id {
+) -> Option<Id> {
     let coop_workgroups = spec.output_elements;
     let coop_out_indices = decompose_flat_index(egraph, spec.wg, spec.output_shape);
     let unroll_factor = cooperative_reduce_unroll(spec.lowering);
@@ -183,6 +177,9 @@ fn build_cooperative_reduce_dispatch(
     } else {
         None
     };
+    if ewise_ctx.is_some() && needs_tail_guards {
+        return None;
+    }
 
     let theta = unroll_fold_direct(
         egraph,
@@ -193,12 +190,22 @@ fn build_cooperative_reduce_dispatch(
             let chunk_offset = egraph.add(TensorIr::Const(ScalarValue::U32(unroll * simd_width)));
             let lane_offset = egraph.add(TensorIr::BinOp(BinaryOp::Add, [spec.lane, chunk_offset]));
             let k_remapped = egraph.add(TensorIr::BinOp(BinaryOp::Add, [k_base, lane_offset]));
+            let in_bounds = egraph.add(TensorIr::BinOp(BinaryOp::Lt, [k_remapped, k_total]));
+            let safe_k = if needs_tail_guards {
+                let zero = egraph.add(TensorIr::Const(ScalarValue::U32(0)));
+                egraph.add(TensorIr::TernOp(
+                    TernaryOp::Select,
+                    [in_bounds, k_remapped, zero],
+                ))
+            } else {
+                k_remapped
+            };
 
             let mut coop_input_indices = Vec::with_capacity(spec.input_shape.rank());
             let mut out_idx = 0;
             for dim_idx in 0..spec.input_shape.rank() {
                 if dim_idx == spec.axis as usize {
-                    coop_input_indices.push(k_remapped);
+                    coop_input_indices.push(safe_k);
                 } else if out_idx < coop_out_indices.len() {
                     coop_input_indices.push(coop_out_indices[out_idx]);
                     out_idx += 1;
@@ -219,7 +226,6 @@ fn build_cooperative_reduce_dispatch(
                 }
             };
             let guarded_val = if needs_tail_guards {
-                let in_bounds = egraph.add(TensorIr::BinOp(BinaryOp::Lt, [k_remapped, k_total]));
                 egraph.add(TensorIr::TernOp(
                     TernaryOp::Select,
                     [in_bounds, load_val, spec.init],
@@ -227,7 +233,12 @@ fn build_cooperative_reduce_dispatch(
             } else {
                 load_val
             };
-            egraph.add(TensorIr::BinOp(spec.op.bin_op(), [acc, guarded_val]))
+            let dtype = egraph[guarded_val].data.dtype.unwrap_or(DType::F32);
+            let op_name = spec
+                .op
+                .bin_op_for_dtype(dtype)
+                .expect("reduce identity should guarantee supported update dtype");
+            egraph.add(TensorIr::BinOp(op_name, [acc, guarded_val]))
         },
     );
     let reduced = egraph.add(TensorIr::Simd(SimdNode::ReduceSimd {
@@ -247,11 +258,11 @@ fn build_cooperative_reduce_dispatch(
         }
         None => (add_list(egraph, &[spec.expr, reduced, spec.wg]), 1),
     };
-    egraph.add(TensorIr::Dispatch(DispatchNode::Dispatch {
+    Some(egraph.add(TensorIr::Dispatch(DispatchNode::Dispatch {
         workgroups: coop_workgroups,
         num_inputs,
         children_list: dispatch_children,
-    }))
+    })))
 }
 
 fn build_simple_reduce_dispatch(
@@ -266,7 +277,12 @@ fn build_simple_reduce_dispatch(
         children: [in_addr, state],
     }));
     let acc_var = egraph.add(TensorIr::Simd(SimdNode::Var(VarRef::acc(0))));
-    let update = egraph.add(TensorIr::BinOp(spec.op.bin_op(), [acc_var, load_val]));
+    let dtype = egraph[load_val].data.dtype.unwrap_or(DType::F32);
+    let op_name = spec
+        .op
+        .bin_op_for_dtype(dtype)
+        .expect("reduce identity should guarantee supported update dtype");
+    let update = egraph.add(TensorIr::BinOp(op_name, [acc_var, load_val]));
     let theta = egraph.add(TensorIr::Simd(SimdNode::Theta {
         children: [spec.init, spec.count, update],
     }));
@@ -337,7 +353,9 @@ impl crate::applier::TypedApplier for ReduceApplier {
         }
 
         let input_dtype = egraph[expr].data.dtype.unwrap_or(DType::F32);
-        let identity = reduce_identity(op, input_dtype);
+        let Some(identity) = op.identity(input_dtype) else {
+            return vec![];
+        };
         let init = egraph.add(TensorIr::Const(identity));
         let mut results = vec![];
         let wg = egraph.add(TensorIr::Simd(SimdNode::Var(VarRef::thread(
@@ -389,8 +407,10 @@ impl crate::applier::TypedApplier for ReduceApplier {
                 },
                 self.simd_width,
             );
-            egraph.union(eclass, dispatch);
-            results.push(dispatch);
+            if let Some(dispatch) = dispatch {
+                egraph.union(eclass, dispatch);
+                results.push(dispatch);
+            }
         } else {
             let dispatch = build_simple_reduce_dispatch(
                 egraph,

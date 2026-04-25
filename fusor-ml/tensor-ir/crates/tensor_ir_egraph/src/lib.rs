@@ -91,34 +91,6 @@ pub fn tensor_expr_to_recexpr(expr: &TensorExprProgram) -> Result<RecExpr<Tensor
                 let lowered_body = lower_node(program, *body, builder, memo)?;
                 builder.elementwise(index_space.clone(), &lowered_inputs, lowered_body)
             }
-            TensorExprNode::SliceAssign {
-                input,
-                value,
-                output_shape,
-                slices,
-            } => {
-                let input = lower_node(program, *input, builder, memo)?;
-                let value = lower_node(program, *value, builder, memo)?;
-                builder.slice_assign(input, value, output_shape.clone(), slices.clone())
-            }
-            TensorExprNode::IndexSelect {
-                input,
-                indices,
-                output_shape,
-                axis,
-            } => {
-                let input = lower_node(program, *input, builder, memo)?;
-                let indices = lower_node(program, *indices, builder, memo)?;
-                builder.index_select(input, indices, output_shape.clone(), *axis)
-            }
-            TensorExprNode::Resize {
-                input,
-                input_shape,
-                output_shape,
-            } => {
-                let input = lower_node(program, *input, builder, memo)?;
-                builder.resize(input, input_shape.clone(), output_shape.clone())
-            }
             TensorExprNode::Reduce {
                 expr: source,
                 axis,
