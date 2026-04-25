@@ -7,7 +7,7 @@ use crate::{
     mir::{
         kernel::GenericKernel,
         operation::Operation,
-        workgroup_shape::{Constraint, WorkgroupShapeConstraints},
+        workgroup_shape::{Constraint, WorkgroupShape, WorkgroupShapeConstraints},
     },
     visit_tiled::distribute_workgroups,
 };
@@ -107,24 +107,15 @@ impl ResizeOperation {
         input_rank: u32,
         datatype: DataTypeEnum,
         tile_size: u32,
+        workgroup_shape: &WorkgroupShape,
         kernel: &mut GenericKernel,
     ) {
         let input = kernel.add_tensor_input(input_rank, true, datatype);
         let output = kernel.add_tensor_input(self.new_shape.len() as u32, true, datatype);
 
-        // Compute a flat thread index across all three dispatch dimensions.
-        // `distribute_workgroups` spreads workgroups across y/z when the total
-        // exceeds MAX_DISPATCH_DIM, so reading `global_id.x` alone misses
-        // workgroups in those dims and leaves the tail of the output buffer
-        // uninitialized.
-        let num_workgroups = kernel.num_workgroups();
-        let workgroup_id = kernel.workgroup_index();
+        let workgroup_flat_id = workgroup_shape.linearized_workgroup_index(kernel);
         let local_id = kernel.workgroup_local_index();
-        writeln!(
-            kernel,
-            "let workgroup_flat_id = {workgroup_id}.x + {workgroup_id}.y * {num_workgroups}.x + {workgroup_id}.z * {num_workgroups}.x * {num_workgroups}.y;"
-        )
-        .unwrap();
+        writeln!(kernel, "let workgroup_flat_id = {workgroup_flat_id};").unwrap();
         writeln!(
             kernel,
             "let global_thread_id = workgroup_flat_id * {BLOCKSIZE}u + {local_id};"
@@ -203,14 +194,14 @@ impl Operation for ResizeOperation {
     fn build_kernel(
         &self,
         _: &crate::compute_graph::ComputeGraphInner,
-        _: &crate::mir::workgroup_shape::WorkgroupShape,
+        workgroup_shape: &crate::mir::workgroup_shape::WorkgroupShape,
         inputs: &[crate::mir::inputs::MirValue],
         kernel: &mut GenericKernel,
     ) {
         let input = inputs[0].as_tensor().unwrap();
         let rank = input.layout().rank() as u32;
         let datatype = input.datatype();
-        self.kernel(rank, datatype, TILE_SIZE, kernel);
+        self.kernel(rank, datatype, TILE_SIZE, workgroup_shape, kernel);
     }
 
     fn output(
