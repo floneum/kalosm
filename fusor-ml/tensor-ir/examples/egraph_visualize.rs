@@ -357,12 +357,20 @@ fn escape_html(s: &str) -> String {
 
 fn build_matmul_expr() -> egg::RecExpr<TensorIr> {
     let mut b = IrBuilder::new();
-    let a = b.input(0, Shape(vec![Dim::Lit(M), Dim::Lit(K)]), DType::F32);
-    let rhs = b.input(1, Shape(vec![Dim::Lit(K), Dim::Lit(N)]), DType::F32);
+    let a = b.input(0, Shape(vec![Dim::Const(M), Dim::Const(K)]), DType::F32);
+    let rhs = b.input(1, Shape(vec![Dim::Const(K), Dim::Const(N)]), DType::F32);
 
-    let tile_shape = Shape(vec![Dim::Lit(M), Dim::Lit(N), Dim::Lit(K)]);
-    let a_r = b.restride(a, tile_shape.clone(), Strides(vec![i64::from(K), 0, 1]));
-    let b_r = b.restride(rhs, tile_shape.clone(), Strides(vec![0, 1, i64::from(N)]));
+    let tile_shape = Shape(vec![Dim::Const(M), Dim::Const(N), Dim::Const(K)]);
+    let a_r = b.restride(
+        a,
+        tile_shape.clone(),
+        Strides(vec![Dim::Const(K), Dim::Const(0), Dim::Const(1)]),
+    );
+    let b_r = b.restride(
+        rhs,
+        tile_shape.clone(),
+        Strides(vec![Dim::Const(0), Dim::Const(1), Dim::Const(N)]),
+    );
 
     let arg0 = b.scalar_arg(0);
     let arg1 = b.scalar_arg(1);
@@ -382,15 +390,23 @@ fn build_attention_expr() -> egg::RecExpr<TensorIr> {
     let seq = ATTN_SEQ;
     let d = ATTN_D;
 
-    let q = b.input(0, Shape(vec![Dim::Lit(seq), Dim::Lit(d)]), DType::F32);
-    let k = b.input(1, Shape(vec![Dim::Lit(seq), Dim::Lit(d)]), DType::F32);
-    let v = b.input(2, Shape(vec![Dim::Lit(seq), Dim::Lit(d)]), DType::F32);
+    let q = b.input(0, Shape(vec![Dim::Const(seq), Dim::Const(d)]), DType::F32);
+    let k = b.input(1, Shape(vec![Dim::Const(seq), Dim::Const(d)]), DType::F32);
+    let v = b.input(2, Shape(vec![Dim::Const(seq), Dim::Const(d)]), DType::F32);
 
     // S = Q · Kᵀ: reduce over d. In the [seq, seq, d] tile, Q[i, k] has
     // strides [d, 0, 1]; Kᵀ viewed from K[j, k] has strides [0, d, 1].
-    let qk_tile = Shape(vec![Dim::Lit(seq), Dim::Lit(seq), Dim::Lit(d)]);
-    let q_r = b.restride(q, qk_tile.clone(), Strides(vec![i64::from(d), 0, 1]));
-    let k_r = b.restride(k, qk_tile.clone(), Strides(vec![0, i64::from(d), 1]));
+    let qk_tile = Shape(vec![Dim::Const(seq), Dim::Const(seq), Dim::Const(d)]);
+    let q_r = b.restride(
+        q,
+        qk_tile.clone(),
+        Strides(vec![Dim::Const(d), Dim::Const(0), Dim::Const(1)]),
+    );
+    let k_r = b.restride(
+        k,
+        qk_tile.clone(),
+        Strides(vec![Dim::Const(0), Dim::Const(d), Dim::Const(1)]),
+    );
     let arg0 = b.scalar_arg(0);
     let arg1 = b.scalar_arg(1);
     let mul_body = b.bin_op(BinaryOp::Mul, arg0, arg1);
@@ -399,14 +415,22 @@ fn build_attention_expr() -> egg::RecExpr<TensorIr> {
 
     // P = softmax(scores, axis=1). Kept decomposed so the generic softmax
     // lowering and subsequent memory/reduction rewrites stay visible.
-    let scores_shape = Shape(vec![Dim::Lit(seq), Dim::Lit(seq)]);
+    let scores_shape = Shape(vec![Dim::Const(seq), Dim::Const(seq)]);
     let probs = b.softmax(scores, scores_shape, 1);
 
     // O = P · V: reduce over the inner seq axis. In the [seq, d, seq] tile,
     // P[i, k] has strides [seq, 0, 1]; V[k, j] has strides [0, 1, d].
-    let pv_tile = Shape(vec![Dim::Lit(seq), Dim::Lit(d), Dim::Lit(seq)]);
-    let p_r = b.restride(probs, pv_tile.clone(), Strides(vec![i64::from(seq), 0, 1]));
-    let v_r = b.restride(v, pv_tile.clone(), Strides(vec![0, 1, i64::from(d)]));
+    let pv_tile = Shape(vec![Dim::Const(seq), Dim::Const(d), Dim::Const(seq)]);
+    let p_r = b.restride(
+        probs,
+        pv_tile.clone(),
+        Strides(vec![Dim::Const(seq), Dim::Const(0), Dim::Const(1)]),
+    );
+    let v_r = b.restride(
+        v,
+        pv_tile.clone(),
+        Strides(vec![Dim::Const(0), Dim::Const(1), Dim::Const(d)]),
+    );
     let arg0 = b.scalar_arg(0);
     let arg1 = b.scalar_arg(1);
     let mul_body = b.bin_op(BinaryOp::Mul, arg0, arg1);

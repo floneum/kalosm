@@ -157,7 +157,7 @@ fn is_bcast_on_axis(egraph: &EGraph<TensorIr, TensorAnalysis>, id: Id, axis: u32
             return false;
         };
         let Strides(s) = strides;
-        (axis as usize) < s.len() && s[axis as usize] == 0
+        (axis as usize) < s.len() && s[axis as usize].as_const() == Some(0)
     })
 }
 

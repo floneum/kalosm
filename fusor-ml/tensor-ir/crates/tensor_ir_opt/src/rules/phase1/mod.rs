@@ -73,21 +73,68 @@ pub(super) fn decompose_flat_index(
     let mut remaining = flat;
 
     for i in (0..rank).rev() {
-        let dim_size = match &shape.0[i] {
-            Dim::Lit(v) => *v,
-            Dim::Sym(_) => return vec![flat; rank],
-        };
-        let dim_lit = egraph.add(TensorIr::Const(ScalarValue::U32(dim_size)));
+        let dim_value = dim_to_ir(egraph, &shape.0[i]);
 
         if i == 0 {
             indices[i] = remaining;
         } else {
-            indices[i] = egraph.add(TensorIr::BinOp(BinaryOp::Mod, [remaining, dim_lit]));
-            remaining = egraph.add(TensorIr::BinOp(BinaryOp::Div, [remaining, dim_lit]));
+            indices[i] = egraph.add(TensorIr::BinOp(BinaryOp::Mod, [remaining, dim_value]));
+            remaining = egraph.add(TensorIr::BinOp(BinaryOp::Div, [remaining, dim_value]));
         }
     }
 
     indices
+}
+
+pub(super) fn dim_to_ir(egraph: &mut EGraph<TensorIr, TensorAnalysis>, dim: &Dim) -> Id {
+    match dim {
+        Dim::Const(value) => egraph.add(TensorIr::Const(ScalarValue::U32(*value))),
+        Dim::Symbol(index) => egraph.add(TensorIr::ShapeParam(*index)),
+        Dim::Add(lhs, rhs) => {
+            let lhs = dim_to_ir(egraph, lhs);
+            let rhs = dim_to_ir(egraph, rhs);
+            egraph.add(TensorIr::BinOp(BinaryOp::Add, [lhs, rhs]))
+        }
+        Dim::Sub(lhs, rhs) => {
+            let lhs = dim_to_ir(egraph, lhs);
+            let rhs = dim_to_ir(egraph, rhs);
+            egraph.add(TensorIr::BinOp(BinaryOp::Sub, [lhs, rhs]))
+        }
+        Dim::Mul(lhs, rhs) => {
+            let lhs = dim_to_ir(egraph, lhs);
+            let rhs = dim_to_ir(egraph, rhs);
+            egraph.add(TensorIr::BinOp(BinaryOp::Mul, [lhs, rhs]))
+        }
+        Dim::Div(lhs, rhs) => {
+            let lhs = dim_to_ir(egraph, lhs);
+            let rhs = dim_to_ir(egraph, rhs);
+            egraph.add(TensorIr::BinOp(BinaryOp::Div, [lhs, rhs]))
+        }
+        Dim::Mod(lhs, rhs) => {
+            let lhs = dim_to_ir(egraph, lhs);
+            let rhs = dim_to_ir(egraph, rhs);
+            egraph.add(TensorIr::BinOp(BinaryOp::Mod, [lhs, rhs]))
+        }
+        Dim::CeilDiv(lhs, rhs) => {
+            let lhs = dim_to_ir(egraph, lhs);
+            let rhs = dim_to_ir(egraph, rhs);
+            let one = egraph.add(TensorIr::Const(ScalarValue::U32(1)));
+            let numerator = egraph.add(TensorIr::BinOp(BinaryOp::Add, [lhs, rhs]));
+            let numerator = egraph.add(TensorIr::BinOp(BinaryOp::Sub, [numerator, one]));
+            let quotient = egraph.add(TensorIr::BinOp(BinaryOp::Div, [numerator, rhs]));
+            quotient
+        }
+        Dim::Min(lhs, rhs) => {
+            let lhs = dim_to_ir(egraph, lhs);
+            let rhs = dim_to_ir(egraph, rhs);
+            egraph.add(TensorIr::BinOp(BinaryOp::Min, [lhs, rhs]))
+        }
+        Dim::Max(lhs, rhs) => {
+            let lhs = dim_to_ir(egraph, lhs);
+            let rhs = dim_to_ir(egraph, rhs);
+            egraph.add(TensorIr::BinOp(BinaryOp::Max, [lhs, rhs]))
+        }
+    }
 }
 
 pub(super) fn compute_flat_addr(
@@ -104,17 +151,14 @@ pub(super) fn compute_flat_addr(
 
     let mut terms = Vec::with_capacity(indices.len());
     for (i, idx) in indices.iter().enumerate() {
-        let mut stride: u32 = 1;
-        for dim in &shape.0[i + 1..] {
-            let Dim::Lit(v) = dim else {
-                return indices[0];
-            };
-            stride *= v;
-        }
-        if stride == 1 {
+        let stride = shape.0[i + 1..]
+            .iter()
+            .cloned()
+            .fold(Dim::Const(1), Dim::mul);
+        if stride == Dim::Const(1) {
             terms.push(*idx);
         } else {
-            let stride_lit = egraph.add(TensorIr::Const(ScalarValue::U32(stride)));
+            let stride_lit = dim_to_ir(egraph, &stride);
             terms.push(egraph.add(TensorIr::BinOp(BinaryOp::Mul, [*idx, stride_lit])));
         }
     }
@@ -184,6 +228,7 @@ pub(super) fn lower_scalar_body_strided(
             }))
         }
         TensorIr::Const(v) => egraph.add(TensorIr::Const(v)),
+        TensorIr::ShapeParam(index) => egraph.add(TensorIr::ShapeParam(index)),
         TensorIr::BinOp(name, args) => {
             let lhs = lower_scalar_body_strided(egraph, args[0], ewise_inputs, indices);
             let rhs = lower_scalar_body_strided(egraph, args[1], ewise_inputs, indices);
@@ -206,7 +251,7 @@ pub(super) fn lower_scalar_body_strided(
 pub(super) fn get_restride_layout(
     egraph: &EGraph<TensorIr, TensorAnalysis>,
     id: Id,
-) -> (Vec<i64>, i64) {
+) -> (Vec<Dim>, i64) {
     for node in egraph[id].iter() {
         if let TensorIr::HighLevel(HighLevelNode::Restride {
             strides, offset, ..
@@ -216,15 +261,7 @@ pub(super) fn get_restride_layout(
         }
     }
     if let Some(shape) = &egraph[id].data.shape {
-        let mut row_major = vec![1i64; shape.rank()];
-        for i in (0..shape.rank().saturating_sub(1)).rev() {
-            let next_dim = match &shape.0[i + 1] {
-                Dim::Lit(v) => i64::from(*v),
-                Dim::Sym(_) => return (vec![], 0),
-            };
-            row_major[i] = row_major[i + 1] * next_dim;
-        }
-        return (row_major, 0);
+        return (crate::types::Strides::row_major_for_shape(shape).0, 0);
     }
     (vec![], 0)
 }
@@ -232,19 +269,17 @@ pub(super) fn get_restride_layout(
 pub(super) fn compute_strided_addr(
     egraph: &mut EGraph<TensorIr, TensorAnalysis>,
     indices: &[Id],
-    strides: &[i64],
+    strides: &[Dim],
 ) -> Id {
     let mut terms: Vec<Id> = Vec::new();
     for (idx, stride) in indices.iter().zip(strides.iter()) {
-        if *stride == 0 {
+        if stride.as_const() == Some(0) {
             continue;
         }
-        if *stride == 1 {
+        if stride.as_const() == Some(1) {
             terms.push(*idx);
         } else {
-            let stride_value =
-                u32::try_from(*stride).expect("strided address components must fit in u32");
-            let s = egraph.add(TensorIr::Const(ScalarValue::U32(stride_value)));
+            let s = dim_to_ir(egraph, stride);
             let scaled = egraph.add(TensorIr::BinOp(BinaryOp::Mul, [*idx, s]));
             terms.push(scaled);
         }

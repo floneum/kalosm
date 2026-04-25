@@ -4,6 +4,7 @@ use crate::{DispatchProgram, TensorIr, naga_codegen};
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::time::Instant;
+use tensor_ir_frontend::types::ShapeParams;
 use wgpu::util::DeviceExt;
 
 const MAX_DISPATCH_WORKGROUPS_PER_DIMENSION: u32 = 65_535;
@@ -160,6 +161,7 @@ impl GpuContext {
         &self,
         program: &DispatchProgram,
         inputs: &[&[f32]],
+        shape_params: &ShapeParams,
         config: ProgramBenchmarkConfig,
     ) -> Result<GpuBenchmarkResult, String> {
         if program.dispatches.is_empty() {
@@ -176,7 +178,7 @@ impl GpuContext {
             return Err("TIMESTAMP_QUERY is not supported by this GPU/device".into());
         }
 
-        let prepared = self.prepare_program(program, inputs, false)?;
+        let prepared = self.prepare_program(program, inputs, shape_params, false)?;
         for _ in 0..config.warmup_runs {
             self.submit_program(program, &prepared, None)?;
         }
@@ -234,6 +236,7 @@ impl GpuContext {
         &self,
         program: &DispatchProgram,
         inputs: &[&[f32]],
+        shape_params: &ShapeParams,
         config: ProgramBenchmarkConfig,
     ) -> Result<HostBenchmarkResult, String> {
         if program.dispatches.is_empty() {
@@ -243,7 +246,7 @@ impl GpuContext {
             return Err("timing_runs must be greater than zero".into());
         }
 
-        let prepared = self.prepare_program(program, inputs, false)?;
+        let prepared = self.prepare_program(program, inputs, shape_params, false)?;
         for _ in 0..config.warmup_runs {
             self.submit_program(program, &prepared, None)?;
         }
@@ -275,6 +278,7 @@ impl GpuContext {
         &self,
         program: &DispatchProgram,
         inputs: &[&[f32]],
+        shape_params: &ShapeParams,
         config: ProgramBenchmarkConfig,
         batch_size: u32,
     ) -> Result<HostBenchmarkResult, String> {
@@ -288,7 +292,7 @@ impl GpuContext {
             return Err("batch_size must be greater than zero".into());
         }
 
-        let prepared = self.prepare_program(program, inputs, false)?;
+        let prepared = self.prepare_program(program, inputs, shape_params, false)?;
         for _ in 0..config.warmup_runs {
             self.submit_program_repeated(program, &prepared, batch_size)?;
         }
@@ -318,14 +322,19 @@ impl GpuContext {
     /// reference the same semantic e-class (see `resolve_dispatch_input_buffer`).
     ///
     /// Returns the final dispatch's output buffer contents as `Vec<f32>`.
-    pub fn execute(&self, program: &DispatchProgram, inputs: &[&[f32]]) -> Vec<f32> {
+    pub fn execute(
+        &self,
+        program: &DispatchProgram,
+        inputs: &[&[f32]],
+        shape_params: &ShapeParams,
+    ) -> Vec<f32> {
         assert!(
             !program.dispatches.is_empty(),
             "dispatch program must contain at least one dispatch"
         );
 
         let prepared = self
-            .prepare_program(program, inputs, true)
+            .prepare_program(program, inputs, shape_params, true)
             .expect("failed to prepare dispatch program");
         let final_output = prepared
             .final_output_buffer
@@ -368,6 +377,7 @@ impl GpuContext {
         &self,
         program: &DispatchProgram,
         inputs: &[&[f32]],
+        shape_params: &ShapeParams,
         readback_final_output: bool,
     ) -> Result<PreparedDispatchProgram, String> {
         let module =
@@ -392,9 +402,19 @@ impl GpuContext {
             })
             .collect();
 
+        let shape_param_words = shape_params.storage_words();
+        let shape_params_buffer =
+            self.device
+                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("shape_params"),
+                    contents: bytemuck::cast_slice(&shape_param_words),
+                    usage: wgpu::BufferUsages::STORAGE,
+                });
+
         let mut produced_buffers: HashMap<egg::Id, wgpu::Buffer> = HashMap::new();
         let mut pipelines = Vec::with_capacity(program.dispatches.len());
         let mut bind_groups = Vec::with_capacity(program.dispatches.len());
+        let mut physical_workgroups = Vec::with_capacity(program.dispatches.len());
         let mut final_output_buffer = None;
 
         for (dispatch_index, dispatch) in program.dispatches.iter().enumerate() {
@@ -409,8 +429,13 @@ impl GpuContext {
                     cache: None,
                 });
 
+            let workgroups = dispatch.workgroups.eval_u32(shape_params).ok_or_else(|| {
+                format!(
+                    "missing shape parameter while evaluating dispatch {dispatch_index} workgroups"
+                )
+            })?;
             let output_elems =
-                (dispatch.workgroups * program.device.simd_width) as usize * dispatch.outputs.len();
+                (workgroups * program.device.simd_width) as usize * dispatch.outputs.len();
             let output_bytes = (output_elems * std::mem::size_of::<f32>()) as u64;
             let mut output_usage = wgpu::BufferUsages::STORAGE;
             if readback_final_output && dispatch_index + 1 == program.dispatches.len() {
@@ -445,6 +470,10 @@ impl GpuContext {
                 binding: dispatch.inputs.len() as u32,
                 resource: output_buffer.as_entire_binding(),
             });
+            entries.push(wgpu::BindGroupEntry {
+                binding: dispatch.inputs.len() as u32 + 1,
+                resource: shape_params_buffer.as_entire_binding(),
+            });
 
             let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some("tensor_ir bind group"),
@@ -461,6 +490,7 @@ impl GpuContext {
             }
             pipelines.push(pipeline);
             bind_groups.push(bind_group);
+            physical_workgroups.push(workgroups.div_ceil(dispatch.simdgroups.max(1)));
         }
 
         let staging_buffer = if readback_final_output {
@@ -480,6 +510,7 @@ impl GpuContext {
         Ok(PreparedDispatchProgram {
             pipelines,
             bind_groups,
+            physical_workgroups,
             final_output_buffer,
             staging_buffer,
         })
@@ -530,7 +561,7 @@ impl GpuContext {
     ) {
         let timestamps_per_run = (program.dispatches.len() as u32) * 2;
 
-        for (dispatch_index, ((dispatch, pipeline), bind_group)) in program
+        for (dispatch_index, ((_dispatch, pipeline), bind_group)) in program
             .dispatches
             .iter()
             .zip(prepared.pipelines.iter())
@@ -552,8 +583,7 @@ impl GpuContext {
             });
             pass.set_pipeline(pipeline);
             pass.set_bind_group(0, bind_group, &[]);
-            let physical_workgroups = dispatch.workgroups / dispatch.simdgroups.max(1);
-            let (x, y, z) = dispatch_grid(physical_workgroups);
+            let (x, y, z) = dispatch_grid(prepared.physical_workgroups[dispatch_index]);
             pass.dispatch_workgroups(x, y, z);
         }
     }
@@ -577,6 +607,7 @@ impl Default for GpuContext {
 struct PreparedDispatchProgram {
     pipelines: Vec<wgpu::ComputePipeline>,
     bind_groups: Vec<wgpu::BindGroup>,
+    physical_workgroups: Vec<u32>,
     final_output_buffer: Option<wgpu::Buffer>,
     staging_buffer: Option<wgpu::Buffer>,
 }

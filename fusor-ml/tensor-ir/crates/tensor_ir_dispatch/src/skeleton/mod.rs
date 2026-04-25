@@ -10,7 +10,7 @@ use crate::language::{
     DispatchNode, HighLevelNode, SimdNode, TensorIr, add_list, extract_list, extract_recexpr_list,
 };
 use crate::types::{
-    BinaryOp, BufferRef, DType, DeviceProfile, LoweringOptions, MemTier, ScalarValue, VarRef,
+    BinaryOp, BufferRef, DType, DeviceProfile, Dim, LoweringOptions, MemTier, ScalarValue, VarRef,
 };
 pub use tensor_ir_egraph::add_and_choose;
 
@@ -72,7 +72,7 @@ pub struct DispatchInfo {
     pub inputs: Vec<Id>,
     /// Number of virtual workgroups (one per simdgroup) to launch.
     /// Physical workgroups = workgroups / simdgroups.
-    pub workgroups: u32,
+    pub workgroups: Dim,
     /// Number of simdgroups per physical workgroup.
     /// For non-tiled dispatches this is 1 (32 threads per workgroup).
     /// For tiled dispatches this can be up to `MAX_SIMDGROUPS` (8),
@@ -828,7 +828,7 @@ pub fn build_dispatch_program_from_extracted(
 /// output arity is the length of `body_addr_pairs` — no separate
 /// `reg_m` / `reg_n` tag.
 pub(crate) struct RecexprDispatchLayout {
-    workgroups: u32,
+    workgroups: Dim,
     input_ids: Vec<Id>,
     body_addr_pairs: Vec<(usize, Id)>,
 }
@@ -856,7 +856,6 @@ pub(super) fn extract_recexpr_dispatch_layout(
     };
 
     let num_inputs = *num_inputs as usize;
-    let workgroups = *workgroups;
     let children = extract_recexpr_list(nodes, *children);
     // Output arity = (children.len() - num_inputs) / 2. Structural, no
     // separate reg_m/reg_n fields to consult.
@@ -882,7 +881,7 @@ pub(super) fn extract_recexpr_dispatch_layout(
     }
 
     Some(RecexprDispatchLayout {
-        workgroups,
+        workgroups: workgroups.clone(),
         input_ids,
         body_addr_pairs,
     })
@@ -1011,7 +1010,7 @@ pub(super) fn build_tiled_dispatch_info(
 ) -> DispatchInfo {
     let simdgroups = compute_simdgroups_for_tiled(
         tg_buffers,
-        layout.workgroups,
+        layout.workgroups.representative_u32(),
         layout.num_outputs_u32(),
         device,
     );
@@ -1028,7 +1027,7 @@ pub(super) fn build_tiled_dispatch_info(
     );
     DispatchInfo {
         inputs: layout.input_ids.clone(),
-        workgroups: layout.workgroups,
+        workgroups: layout.workgroups.clone(),
         simdgroups,
         outputs,
         tg_buffers: scaled_tg,
@@ -1152,14 +1151,14 @@ pub(super) fn build_plain_dispatch_from_recexpr(
         .collect::<Vec<_>>();
     let simdgroups = compute_simdgroups_for_independent_subgroups(
         &outputs,
-        layout.workgroups,
+        layout.workgroups.representative_u32(),
         egraph,
         chosen,
         device,
     );
     DispatchInfo {
         inputs: layout.input_ids.clone(),
-        workgroups: layout.workgroups,
+        workgroups: layout.workgroups.clone(),
         simdgroups,
         outputs,
         tg_buffers: Vec::new(),
@@ -1185,9 +1184,10 @@ fn try_fuse_linear_pipeline_dispatches(
         return None;
     }
 
-    let workgroups = stage_dispatches[0].workgroups;
+    let workgroups_dim = stage_dispatches[0].workgroups.clone();
+    let workgroups = workgroups_dim.as_const()?;
     if stage_dispatches.iter().any(|dispatch| {
-        dispatch.workgroups != workgroups
+        dispatch.workgroups != workgroups_dim
             || dispatch.outputs.len() != 1
             || !dispatch.tg_buffers.is_empty()
             || dispatch.simdgroups != 1
@@ -1270,7 +1270,7 @@ fn try_fuse_linear_pipeline_dispatches(
 
     Some(DispatchInfo {
         inputs: external_inputs,
-        workgroups,
+        workgroups: workgroups_dim,
         simdgroups,
         outputs,
         tg_buffers: Vec::new(),
@@ -1803,8 +1803,9 @@ fn execution_weighted_expr_cost(expr: &RecExpr<TensorIr>, device: &DeviceProfile
                 // `[inputs (num_inputs), (value, addr) pairs ...]`.
                 let outputs = children.len().saturating_sub(num_inputs) / 2;
                 let launch_multiplier = multiplier.min(MAX_EXEC_MULTIPLIER);
+                let workgroups = workgroups.representative_u32().max(1);
                 let body_multiplier =
-                    (launch_multiplier * f64::from(*workgroups)).min(MAX_EXEC_MULTIPLIER);
+                    (launch_multiplier * f64::from(workgroups)).min(MAX_EXEC_MULTIPLIER);
 
                 let mut score = DISPATCH_LAUNCH_COST * launch_multiplier;
                 for child in &children[..num_inputs.min(children.len())] {
@@ -1922,6 +1923,7 @@ fn execution_weighted_expr_cost(expr: &RecExpr<TensorIr>, device: &DeviceProfile
             TensorIr::Nil
             | TensorIr::Cons(_)
             | TensorIr::Const(_)
+            | TensorIr::ShapeParam(_)
             | TensorIr::HighLevel(
                 HighLevelNode::Input { .. } | HighLevelNode::Param(_) | HighLevelNode::Index(_),
             )
@@ -2098,7 +2100,7 @@ impl CostFunction<TensorIr> for BlockedDispatchPreferredCost {
             }) => 10_000.0,
             TensorIr::Simd(SimdNode::Load { .. }) => 1.0,
             TensorIr::Dispatch(DispatchNode::Dispatch { workgroups, .. }) => {
-                1.0e6 / f64::from((*workgroups).max(1))
+                1.0e6 / f64::from(workgroups.representative_u32().max(1))
             }
             TensorIr::Dispatch(DispatchNode::Seq(_) | DispatchNode::Pipeline(_)) => 1.0e9,
             _ => 1.0,
@@ -2357,15 +2359,17 @@ fn all_output_addrs_in_bounds(
     use crate::skeleton::substitute::compute_addr_interval_bounded;
 
     let output_count = u32::try_from(dispatch.outputs.len()).expect("output count fits in u32");
+    let workgroups = dispatch.workgroups.representative_u32();
     let output_len = dispatch
         .workgroups
+        .representative_u32()
         .saturating_mul(device.simd_width)
         .saturating_mul(output_count);
     if output_len == 0 {
         return false;
     }
 
-    let workgroup_bound = dispatch.workgroups.saturating_sub(1);
+    let workgroup_bound = workgroups.saturating_sub(1);
     let simdgroup_bound = dispatch.simdgroups.saturating_sub(1);
     let var_bound = output_len.max(1);
     dispatch.outputs.iter().all(|output| {
@@ -2411,7 +2415,7 @@ fn all_tg_loads_in_bounds(
     // (either `dispatch.workgroups` total, when there's a single tile, or
     // `wgs_per_tile` consecutive values within one tile otherwise), and
     // the Load's address must fit the buffer for every such value.
-    let workgroup_bound = dispatch.workgroups.saturating_sub(1);
+    let workgroup_bound = dispatch.workgroups.representative_u32().saturating_sub(1);
     let simdgroup_bound = dispatch.simdgroups.saturating_sub(1);
 
     for output in &dispatch.outputs {

@@ -1,7 +1,5 @@
 use std::sync::Arc;
 
-use petgraph::algo::toposort;
-use petgraph::stable_graph::StableGraph;
 use rustc_hash::{FxHashMap, FxHashSet};
 use wgpu::CommandEncoder;
 
@@ -17,18 +15,7 @@ pub(crate) struct ResolverResult {
     pub(crate) total_kernels: usize,
 }
 
-#[derive(Debug, Clone)]
-struct ExecutionNode {
-    inner_idx: NodeIndex,
-    variant: ComputeGraphNodeVariant,
-}
-
-type ExecutionGraph = StableGraph<ExecutionNode, ()>;
-type ExecutionNodeIndex = petgraph::graph::NodeIndex;
-
 pub(crate) struct Resolver {
-    execution_graph: ExecutionGraph,
-    node_mapping: FxHashMap<NodeIndex, ExecutionNodeIndex>,
     targets: Vec<NodeIndex>,
     resolved_set: FxHashSet<NodeIndex>,
 }
@@ -54,8 +41,6 @@ impl Resolver {
             .collect();
         Self {
             targets,
-            execution_graph: Default::default(),
-            node_mapping: Default::default(),
             resolved_set,
         }
     }
@@ -67,28 +52,40 @@ impl Resolver {
     ) -> ResolverResult {
         let device = graph.device();
 
+        let mut sorted_nodes = Vec::new();
+        let mut visiting = FxHashSet::default();
+        let mut visited = FxHashSet::default();
         let targets = self.targets.clone();
         for &target in &targets {
-            self.build_execution_graph(graph, target);
+            self.visit_execution_order(
+                graph,
+                target,
+                &mut visiting,
+                &mut visited,
+                &mut sorted_nodes,
+            );
         }
 
         // Tensor IR owns rewrite/fusion now. The resolver only preserves graph
         // semantics, resolves non-kernel layout changes, and executes lowered IR.
-        let sorted_nodes = toposort(&self.execution_graph, None)
-            .unwrap_or_else(|_| panic!("Cycle detected in execution graph"));
-
         let target_set: FxHashSet<NodeIndex> = self.targets.iter().copied().collect();
         let mut queued_operations = Vec::with_capacity(sorted_nodes.len());
 
-        for idx in sorted_nodes {
-            let node = &self.execution_graph[idx];
-            if let ComputeGraphNodeVariant::Tensor(data) = &node.variant {
-                graph.set_cached_result(node.inner_idx, data.clone());
+        for node in sorted_nodes {
+            let variant = graph
+                .nodes
+                .nodes
+                .node_weight(node)
+                .expect("Node not found in graph")
+                .variant
+                .clone();
+            if let ComputeGraphNodeVariant::Tensor(data) = variant {
+                graph.set_cached_result(node, data);
                 continue;
             }
 
-            if let Some(op) = self.lower_node(node) {
-                queued_operations.push((node.inner_idx, op));
+            if let Some(op) = Self::lower_variant(&variant) {
+                queued_operations.push((node, op));
             }
         }
 
@@ -112,7 +109,7 @@ impl Resolver {
             let map_layout = graph.nodes.nodes.node_weight(node).and_then(|node_data| {
                 match &node_data.variant {
                     ComputeGraphNodeVariant::MapLayout(map_layout) => Some(map_layout.clone()),
-                    ComputeGraphNodeVariant::TensorExpr(op) => op.try_metadata_lower(graph),
+                    ComputeGraphNodeVariant::Custom(op) => op.try_metadata_lower(graph),
                     _ => None,
                 }
             });
@@ -213,48 +210,46 @@ impl Resolver {
         }
     }
 
-    fn build_execution_graph(
+    fn visit_execution_order(
         &mut self,
         graph: &ComputeGraphInner,
         node: NodeIndex,
-    ) -> Option<ExecutionNodeIndex> {
+        visiting: &mut FxHashSet<NodeIndex>,
+        visited: &mut FxHashSet<NodeIndex>,
+        sorted: &mut Vec<NodeIndex>,
+    ) {
         if self.resolved_set.contains(&node) {
-            return None;
+            return;
         }
-        if let Some(&idx) = self.node_mapping.get(&node) {
-            return Some(idx);
+        if visiting.contains(&node) {
+            panic!("Cycle detected in execution graph");
         }
+        if !visited.insert(node) {
+            return;
+        }
+        visiting.insert(node);
 
         let node_data = graph
             .nodes
             .nodes
             .node_weight(node)
             .expect("Node not found in graph");
-        let variant = node_data.variant.clone();
-
-        let exec_idx = self.execution_graph.add_node(ExecutionNode {
-            inner_idx: node,
-            variant: variant.clone(),
-        });
-        self.node_mapping.insert(node, exec_idx);
 
         let mut dependencies = Vec::new();
-        variant.visit_dependencies(&mut |dependency| {
+        node_data.variant.visit_dependencies(&mut |dependency| {
             dependencies.push(dependency);
         });
 
         for dependency in dependencies {
-            if let Some(dep_exec_idx) = self.build_execution_graph(graph, dependency) {
-                self.execution_graph.add_edge(dep_exec_idx, exec_idx, ());
-            }
+            self.visit_execution_order(graph, dependency, visiting, visited, sorted);
         }
 
-        Some(exec_idx)
+        visiting.remove(&node);
+        sorted.push(node);
     }
 
-    fn lower_node(&self, node: &ExecutionNode) -> Option<Arc<dyn Operation>> {
-        match &node.variant {
-            ComputeGraphNodeVariant::TensorExpr(op) => Some(Arc::new(op.clone())),
+    fn lower_variant(variant: &ComputeGraphNodeVariant) -> Option<Arc<dyn Operation>> {
+        match variant {
             ComputeGraphNodeVariant::MapLayout(op) => Some(Arc::new(op.clone())),
             ComputeGraphNodeVariant::Tensor(_) => None,
             ComputeGraphNodeVariant::Custom(op) => Some(op.clone()),

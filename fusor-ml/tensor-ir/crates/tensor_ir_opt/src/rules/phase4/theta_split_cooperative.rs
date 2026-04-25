@@ -280,6 +280,9 @@ impl crate::applier::TypedApplier for ThetaSplitApplier {
         else {
             return vec![];
         };
+        let Some(workgroups) = workgroups.as_const() else {
+            return vec![];
+        };
         let children = extract_list(egraph, children);
         let body_idx = num_inputs as usize;
         let body_id = children[body_idx];

@@ -3,6 +3,7 @@ use std::sync::Arc;
 use crate::{
     DataType, Tensor, compute_graph::NodeIndex, nary_wise::NaryExpr, tensor::DataTypeEnum,
 };
+use tensor_ir::BinaryOp;
 
 impl<D: DataType> Tensor<4, D> {
     /// Apply fused interleaved RoPE (rotary position embedding).
@@ -114,17 +115,19 @@ impl RopeFusedOperation {
     fn build_cos_sin_indices(&self, dim_seq_idx: usize, dim_last_idx: usize) -> Vec<NaryExpr> {
         let dim_seq = NaryExpr::DimIndex(dim_seq_idx);
         let dim_last = NaryExpr::DimIndex(dim_last_idx);
+        let half = self.shape[dim_last_idx] / 2;
 
         let cos_sin_dim = match self.mode {
             // Interleaved: index = dim_last / 2
             RopeMode::Interleaved => {
-                NaryExpr::unsupported_unary(dim_last, "div2", DataTypeEnum::U32, DataTypeEnum::U32)
+                NaryExpr::binary_const(dim_last, BinaryOp::Div, 2u32, true, DataTypeEnum::U32)
             }
             // Normal: index = dim_last % half
-            RopeMode::Normal => NaryExpr::unsupported_unary(
+            RopeMode::Normal => NaryExpr::binary_const(
                 dim_last,
-                "mod_half",
-                DataTypeEnum::U32,
+                BinaryOp::Mod,
+                half as u32,
+                true,
                 DataTypeEnum::U32,
             ),
         };
@@ -135,39 +138,70 @@ impl RopeFusedOperation {
     /// Build the expression for computing the neighbor's last dimension index
     fn build_neighbor_index_component(&self, dim_last_idx: usize) -> NaryExpr {
         let dim_last = NaryExpr::DimIndex(dim_last_idx);
+        let one = 1u32;
+        let two = 2u32;
+        let half = (self.shape[dim_last_idx] / 2) as u32;
 
         match self.mode {
             // Interleaved: neighbor at dim_last ± 1 based on parity
-            RopeMode::Interleaved => NaryExpr::unsupported_unary(
-                dim_last,
-                "neighbor_interleaved_idx",
-                DataTypeEnum::U32,
-                DataTypeEnum::U32,
-            ),
+            RopeMode::Interleaved => {
+                let parity = NaryExpr::binary_const(
+                    dim_last.clone(),
+                    BinaryOp::Mod,
+                    two,
+                    true,
+                    DataTypeEnum::U32,
+                );
+                let prev = NaryExpr::binary_const(
+                    dim_last.clone(),
+                    BinaryOp::Sub,
+                    one,
+                    true,
+                    DataTypeEnum::U32,
+                );
+                let next =
+                    NaryExpr::binary_const(dim_last, BinaryOp::Add, one, true, DataTypeEnum::U32);
+                NaryExpr::select(parity, prev, next, DataTypeEnum::U32, DataTypeEnum::U32)
+            }
             // Normal: neighbor at dim_last ± half based on position
-            RopeMode::Normal => NaryExpr::unsupported_unary(
-                dim_last,
-                "neighbor_half_idx",
-                DataTypeEnum::U32,
-                DataTypeEnum::U32,
-            ),
+            RopeMode::Normal => {
+                let side = NaryExpr::binary_const(
+                    dim_last.clone(),
+                    BinaryOp::Div,
+                    half,
+                    true,
+                    DataTypeEnum::U32,
+                );
+                let prev = NaryExpr::binary_const(
+                    dim_last.clone(),
+                    BinaryOp::Sub,
+                    half,
+                    true,
+                    DataTypeEnum::U32,
+                );
+                let next =
+                    NaryExpr::binary_const(dim_last, BinaryOp::Add, half, true, DataTypeEnum::U32);
+                NaryExpr::select(side, prev, next, DataTypeEnum::U32, DataTypeEnum::U32)
+            }
         }
     }
 
     /// Build the condition expression for selecting sin sign
     fn build_sign_condition(&self, dim_last_idx: usize) -> NaryExpr {
         let dim_last = NaryExpr::DimIndex(dim_last_idx);
+        let half = self.shape[dim_last_idx] / 2;
 
         match self.mode {
             // Interleaved: sign based on dim_last % 2 (even = -sin, odd = +sin)
             RopeMode::Interleaved => {
-                NaryExpr::unsupported_unary(dim_last, "mod2", DataTypeEnum::U32, DataTypeEnum::U32)
+                NaryExpr::binary_const(dim_last, BinaryOp::Mod, 2u32, true, DataTypeEnum::U32)
             }
             // Normal: sign based on dim_last / half (first half = -sin, second half = +sin)
-            RopeMode::Normal => NaryExpr::unsupported_unary(
+            RopeMode::Normal => NaryExpr::binary_const(
                 dim_last,
-                "div_half",
-                DataTypeEnum::U32,
+                BinaryOp::Div,
+                half as u32,
+                true,
                 DataTypeEnum::U32,
             ),
         }

@@ -39,8 +39,6 @@ mod reduce;
 mod resize;
 mod slice_assign;
 mod tensor;
-mod tensor_expr;
-pub(crate) use tensor_expr::TensorExprOperation;
 mod tensor_ir_lowering;
 mod tensor_ir_runtime;
 mod varbuilder;

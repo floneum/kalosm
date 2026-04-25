@@ -32,12 +32,21 @@ use crate::types::{DeviceProfile, LoweringOptions};
 pub fn all_rules(config: &RunnerConfig) -> Vec<Rewrite<TensorIr, TensorAnalysis>> {
     let mut rules = Vec::new();
     rules.extend(phase1::rules(config));
+    if scalar_only(config) {
+        return rules;
+    }
     rules.extend(phase2::rules(config));
     rules.extend(phase3::rules(config));
     rules.extend(phase4::rules(config));
     rules.extend(phase5::rules(config));
     rules.extend(phase6::rules(config));
     rules
+}
+
+fn scalar_only(config: &RunnerConfig) -> bool {
+    config.device.simd_width <= 1
+        && config.device.max_simdgroups <= 1
+        && config.device.max_registers_per_lane <= 1
 }
 
 /// Configuration for the equality saturation runner.
@@ -211,6 +220,7 @@ pub fn saturate_phases_reported(
 fn phase_rules(phase: Phase, config: &RunnerConfig) -> Vec<Rewrite<TensorIr, TensorAnalysis>> {
     match phase {
         Phase::Lowering => phase1::rules(config),
+        Phase::LateDispatch if scalar_only(config) => Vec::new(),
         Phase::LateDispatch => {
             // Union of every rewrite that participates in dispatch-shape
             // selection. Running them in one saturation gives the

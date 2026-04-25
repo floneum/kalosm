@@ -1,6 +1,6 @@
 use crate::mir::operation::Operation;
 use crate::{
-    Tensor,
+    Layout, Tensor, TensorLayoutInfo,
     compute_graph::NodeIndex,
     nary_wise::UnaryFunctionChain,
     tensor::{DataType, DataTypeEnum, TensorData},
@@ -103,6 +103,17 @@ impl Operation for MatMulOperation {
                 .collect::<Vec<_>>()
                 .join("x")
         )
+    }
+
+    fn output_layout(
+        &self,
+        layouts: &rustc_hash::FxHashMap<NodeIndex, TensorLayoutInfo>,
+    ) -> TensorLayoutInfo {
+        let datatype = layouts
+            .get(&self.first)
+            .map(TensorLayoutInfo::datatype)
+            .unwrap_or(self.datatype);
+        TensorLayoutInfo::new(Layout::contiguous(&self.out_shape), datatype)
     }
 
     fn build_tensor_ir(

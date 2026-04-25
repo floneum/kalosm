@@ -12,11 +12,19 @@ const K: u32 = 64;
 
 fn build_matmul() -> egg::RecExpr<TensorIr> {
     let mut b = IrBuilder::new();
-    let a = b.input(0, Shape(vec![Dim::Lit(M), Dim::Lit(K)]), DType::F32);
-    let rhs = b.input(1, Shape(vec![Dim::Lit(K), Dim::Lit(N)]), DType::F32);
-    let tile = Shape(vec![Dim::Lit(M), Dim::Lit(N), Dim::Lit(K)]);
-    let a_r = b.restride(a, tile.clone(), Strides(vec![i64::from(K), 0, 1]));
-    let b_r = b.restride(rhs, tile.clone(), Strides(vec![0, 1, i64::from(N)]));
+    let a = b.input(0, Shape(vec![Dim::Const(M), Dim::Const(K)]), DType::F32);
+    let rhs = b.input(1, Shape(vec![Dim::Const(K), Dim::Const(N)]), DType::F32);
+    let tile = Shape(vec![Dim::Const(M), Dim::Const(N), Dim::Const(K)]);
+    let a_r = b.restride(
+        a,
+        tile.clone(),
+        Strides(vec![Dim::Const(K), Dim::Const(0), Dim::Const(1)]),
+    );
+    let b_r = b.restride(
+        rhs,
+        tile.clone(),
+        Strides(vec![Dim::Const(0), Dim::Const(1), Dim::Const(N)]),
+    );
     let arg0 = b.scalar_arg(0);
     let arg1 = b.scalar_arg(1);
     let mul_body = b.bin_op(BinaryOp::Mul, arg0, arg1);
@@ -91,16 +99,22 @@ fn main() {
     // config to show the kernel the backend actually receives.
     println!("=== Full pipeline (expr -> lower -> compile) ===");
     let mut builder = TensorExprBuilder::new();
-    let a = builder.input(0, Shape(vec![Dim::Lit(M), Dim::Lit(K)]), DType::F32);
-    let b = builder.input(1, Shape(vec![Dim::Lit(K), Dim::Lit(N)]), DType::F32);
+    let a = builder.input(0, Shape(vec![Dim::Const(M), Dim::Const(K)]), DType::F32);
+    let b = builder.input(1, Shape(vec![Dim::Const(K), Dim::Const(N)]), DType::F32);
     let arg0 = builder.scalar_arg(0);
     let arg1 = builder.scalar_arg(1);
     let body = builder.scalar_binop(BinaryOp::Mul, [arg0, arg1]);
     let matmul = builder.contraction(
-        Shape(vec![Dim::Lit(M), Dim::Lit(N), Dim::Lit(K)]),
+        Shape(vec![Dim::Const(M), Dim::Const(N), Dim::Const(K)]),
         &[
-            (a, Strides(vec![i64::from(K), 0, 1])),
-            (b, Strides(vec![0, 1, i64::from(N)])),
+            (
+                a,
+                Strides(vec![Dim::Const(K), Dim::Const(0), Dim::Const(1)]),
+            ),
+            (
+                b,
+                Strides(vec![Dim::Const(0), Dim::Const(1), Dim::Const(N)]),
+            ),
         ],
         body,
         &[(2, ReduceOp::Add)],

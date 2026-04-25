@@ -3,7 +3,7 @@ use crate::{
     nary_wise::UnaryFunctionChain,
 };
 use crate::{
-    Layout, Tensor,
+    Layout, Tensor, TensorLayoutInfo,
     compute_graph::NodeIndex,
     mir::inputs::MirValue,
     tensor::{DataType, DataTypeEnum, TensorData},
@@ -109,6 +109,23 @@ impl Operation for ReduceOperation {
 
     fn name(&self) -> String {
         format!("reduce_{}", self.function.name())
+    }
+
+    fn output_layout(
+        &self,
+        map: &rustc_hash::FxHashMap<NodeIndex, TensorLayoutInfo>,
+    ) -> TensorLayoutInfo {
+        let input = map
+            .get(&self.value)
+            .expect("reduce input layout is available");
+        let new_shape = input
+            .layout()
+            .shape()
+            .iter()
+            .enumerate()
+            .filter_map(|(i, dim)| (i != self.axis).then_some(*dim))
+            .collect::<Vec<_>>();
+        TensorLayoutInfo::new(Layout::contiguous(&new_shape), self.out_datatype())
     }
 
     fn build_tensor_ir(

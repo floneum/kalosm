@@ -13,7 +13,7 @@ mod resolve;
 mod visualize;
 
 use crate::{
-    Device, MatMulOperation, ReduceOperation, TensorExprOperation,
+    Device, MatMulOperation, ReduceOperation,
     compute_graph::resolve::ResolverResult,
     map_layout::MapLayoutOperation,
     mir::operation::Operation,
@@ -52,22 +52,16 @@ impl ComputeGraph {
     pub(crate) fn create_nary(&self, op: NaryOperation) -> NodeIndex {
         self.with_mut(|inner| {
             let op = inner.fuse_nary_operation(op);
-            inner.create_node(ComputeGraphNodeVariant::TensorExpr(
-                TensorExprOperation::from_nary(op),
-            ))
+            inner.create_node(ComputeGraphNodeVariant::Custom(Arc::new(op)))
         })
     }
 
     pub(crate) fn create_mat_mul(&self, op: MatMulOperation) -> NodeIndex {
-        self.create_node(ComputeGraphNodeVariant::TensorExpr(
-            TensorExprOperation::from_matmul(op),
-        ))
+        self.create_node(ComputeGraphNodeVariant::Custom(Arc::new(op)))
     }
 
     pub(crate) fn create_reduce(&self, op: ReduceOperation) -> NodeIndex {
-        self.create_node(ComputeGraphNodeVariant::TensorExpr(
-            TensorExprOperation::from_reduce(op),
-        ))
+        self.create_node(ComputeGraphNodeVariant::Custom(Arc::new(op)))
     }
 
     pub(crate) fn create_map_layout(&self, op: MapLayoutOperation) -> NodeIndex {
@@ -75,15 +69,11 @@ impl ComputeGraph {
     }
 
     pub(crate) fn create_resize(&self, op: ResizeOperation) -> NodeIndex {
-        self.create_node(ComputeGraphNodeVariant::TensorExpr(
-            TensorExprOperation::from_resize(op),
-        ))
+        self.create_node(ComputeGraphNodeVariant::Custom(Arc::new(op)))
     }
 
     pub(crate) fn create_slice_assign(&self, op: SliceAssignOperation) -> NodeIndex {
-        self.create_node(ComputeGraphNodeVariant::TensorExpr(
-            TensorExprOperation::from_slice_assign(op),
-        ))
+        self.create_node(ComputeGraphNodeVariant::Custom(Arc::new(op)))
     }
 
     pub(crate) fn create_tensor(&self, op: TensorData) -> NodeIndex {
@@ -170,7 +160,6 @@ pub(crate) struct ComputeGraphNode {
 
 #[derive(Clone, Debug)]
 pub(crate) enum ComputeGraphNodeVariant {
-    TensorExpr(TensorExprOperation),
     MapLayout(MapLayoutOperation),
     Tensor(TensorData),
     Custom(Arc<dyn Operation + Send + Sync>),
@@ -179,7 +168,6 @@ pub(crate) enum ComputeGraphNodeVariant {
 impl ComputeGraphNodeVariant {
     fn visit_dependencies(&self, f: &mut dyn FnMut(NodeIndex)) {
         match &self {
-            ComputeGraphNodeVariant::TensorExpr(op) => op.visit_dependencies(f),
             ComputeGraphNodeVariant::MapLayout(op) => f(op.input),
             ComputeGraphNodeVariant::Tensor(_) => {}
             ComputeGraphNodeVariant::Custom(op) => {
@@ -286,7 +274,7 @@ impl ComputeGraphInner {
         if node.cached.is_some() {
             return None;
         }
-        let ComputeGraphNodeVariant::TensorExpr(child_op) = &node.variant else {
+        let ComputeGraphNodeVariant::Custom(child_op) = &node.variant else {
             return None;
         };
         let child = child_op.as_fusable_nary()?;

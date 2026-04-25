@@ -143,6 +143,7 @@ struct CodegenCtx<'a> {
 
     /// Buffer handles: typed `MemTier` → (`global_var` handle, `is_workgroup`).
     buffer_map: HashMap<MemTier, (Handle<GlobalVariable>, bool)>,
+    shape_params_gv: Handle<GlobalVariable>,
 
     /// Scalar element dtype for each buffer visible to this dispatch.
     buffer_dtypes: HashMap<MemTier, DType>,
@@ -218,7 +219,7 @@ impl BinderFrame {
 /// `&DispatchProgram`.
 ///
 /// Each dispatch becomes a compute entry point named `dispatch_0`, `dispatch_1`, etc.
-/// Storage buffers are bound at `group=0, binding=0..n` (inputs then output).
+/// Storage buffers are bound at `group=0` as inputs, output, then shape params.
 #[must_use]
 pub fn lower_dispatch_program(verified: Verified<'_>) -> Module {
     let program = verified.program();
@@ -341,6 +342,7 @@ fn lower_single_dispatch(
         register_input_buffers(module, dispatch, types, &input_dtypes, &mut buffer_map);
     let output_gv =
         register_output_buffer(module, types, output_dtype, &mut buffer_map, output_binding);
+    let shape_params_gv = register_shape_params_buffer(module, types, output_binding + 1);
     declare_workgroup_buffers(
         module,
         dispatch,
@@ -358,6 +360,7 @@ fn lower_single_dispatch(
         types,
         chosen_nodes,
         buffer_map,
+        shape_params_gv,
         buffer_dtypes,
         simd_width,
     );
@@ -475,6 +478,29 @@ fn register_output_buffer(
     output_gv
 }
 
+fn register_shape_params_buffer(
+    module: &mut Module,
+    types: &mut TypeCache,
+    binding_idx: u32,
+) -> Handle<GlobalVariable> {
+    let ty = types.runtime_array(module, DType::U32);
+    module.global_variables.append(
+        GlobalVariable {
+            name: Some("shape_params".into()),
+            space: AddressSpace::Storage {
+                access: StorageAccess::LOAD,
+            },
+            binding: Some(ResourceBinding {
+                group: 0,
+                binding: binding_idx,
+            }),
+            ty,
+            init: None,
+        },
+        Span::UNDEFINED,
+    )
+}
+
 fn build_codegen_ctx<'a>(
     module: &'a mut Module,
     egraph: &'a EGraph<TensorIr, TensorAnalysis>,
@@ -482,6 +508,7 @@ fn build_codegen_ctx<'a>(
     types: &'a mut TypeCache,
     chosen_nodes: &'a HashMap<Id, TensorIr>,
     buffer_map: HashMap<MemTier, (Handle<GlobalVariable>, bool)>,
+    shape_params_gv: Handle<GlobalVariable>,
     buffer_dtypes: HashMap<MemTier, DType>,
     simd_width: u32,
 ) -> CodegenCtx<'a> {
@@ -511,6 +538,7 @@ fn build_codegen_ctx<'a>(
         theta_acc_ptrs: HashMap::new(),
         binder_stack: Vec::new(),
         buffer_map,
+        shape_params_gv,
         buffer_dtypes,
         tg_sg_read_strides,
         local_invocation_id,
@@ -547,13 +575,16 @@ fn emit_dispatch_outputs(
 }
 
 fn emit_dispatch_bounds_guard(ctx: &mut CodegenCtx<'_>, dispatch: &DispatchInfo) {
-    let physical_workgroups = dispatch.workgroups / dispatch.simdgroups.max(1);
+    let Some(workgroups) = dispatch.workgroups.as_const() else {
+        return;
+    };
+    let physical_workgroups = workgroups.div_ceil(dispatch.simdgroups.max(1));
     if physical_workgroups <= MAX_DISPATCH_WORKGROUPS_PER_DIMENSION {
         return;
     }
 
     let workgroup = ctx.lower_index(IndexLevel::Workgroup);
-    let bound = ctx.emit_literal(Literal::U32(dispatch.workgroups));
+    let bound = ctx.lower_dim(&dispatch.workgroups);
     let in_bounds = ctx.emit_binary(BinaryOperator::Less, workgroup, bound);
     let accept = std::mem::replace(&mut ctx.body, Block::new());
     ctx.body.push(

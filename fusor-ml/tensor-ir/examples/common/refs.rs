@@ -96,16 +96,22 @@ pub fn build_workload(kind: &str, m: u32, n: u32, k: u32) -> Result<Workload, St
     match kind {
         "matmul" => {
             let mut builder = IrBuilder::new();
-            let a = builder.input(0, Shape(vec![Dim::Lit(m), Dim::Lit(k)]), DType::F32);
-            let b = builder.input(1, Shape(vec![Dim::Lit(k), Dim::Lit(n)]), DType::F32);
+            let a = builder.input(0, Shape(vec![Dim::Const(m), Dim::Const(k)]), DType::F32);
+            let b = builder.input(1, Shape(vec![Dim::Const(k), Dim::Const(n)]), DType::F32);
             let arg0 = builder.scalar_arg(0);
             let arg1 = builder.scalar_arg(1);
             let body = builder.bin_op(BinaryOp::Mul, arg0, arg1);
             let _ = builder.contraction(
-                Shape(vec![Dim::Lit(m), Dim::Lit(n), Dim::Lit(k)]),
+                Shape(vec![Dim::Const(m), Dim::Const(n), Dim::Const(k)]),
                 &[
-                    (a, Strides(vec![i64::from(k), 0, 1])),
-                    (b, Strides(vec![0, 1, i64::from(n)])),
+                    (
+                        a,
+                        Strides(vec![Dim::Const(k), Dim::Const(0), Dim::Const(1)]),
+                    ),
+                    (
+                        b,
+                        Strides(vec![Dim::Const(0), Dim::Const(1), Dim::Const(n)]),
+                    ),
                 ],
                 body,
                 &[(2, ReduceOp::Add)],
@@ -123,7 +129,11 @@ pub fn build_workload(kind: &str, m: u32, n: u32, k: u32) -> Result<Workload, St
         "reduce_sum" => {
             let (rows, cols) = (m, k);
             let mut builder = IrBuilder::new();
-            let x = builder.input(0, Shape(vec![Dim::Lit(rows), Dim::Lit(cols)]), DType::F32);
+            let x = builder.input(
+                0,
+                Shape(vec![Dim::Const(rows), Dim::Const(cols)]),
+                DType::F32,
+            );
             let _ = builder.reduce(x, 1, ReduceOp::Add);
             let input: Vec<f32> = (0..rows * cols).map(|i| (i % 11) as f32 * 0.1).collect();
             let expected = cpu_reduce_sum_reference(rows, cols, &input);
@@ -137,7 +147,7 @@ pub fn build_workload(kind: &str, m: u32, n: u32, k: u32) -> Result<Workload, St
         "softmax" => {
             let (rows, cols) = (m, k);
             let mut builder = IrBuilder::new();
-            let shape = Shape(vec![Dim::Lit(rows), Dim::Lit(cols)]);
+            let shape = Shape(vec![Dim::Const(rows), Dim::Const(cols)]);
             let x = builder.input(0, shape.clone(), DType::F32);
             let _ = builder.softmax(x, shape, 1);
             let input: Vec<f32> = (0..rows * cols)
@@ -154,22 +164,38 @@ pub fn build_workload(kind: &str, m: u32, n: u32, k: u32) -> Result<Workload, St
         "attention" => {
             let (seq, d) = (m, k);
             let mut builder = IrBuilder::new();
-            let q = builder.input(0, Shape(vec![Dim::Lit(seq), Dim::Lit(d)]), DType::F32);
-            let kk = builder.input(1, Shape(vec![Dim::Lit(seq), Dim::Lit(d)]), DType::F32);
-            let v = builder.input(2, Shape(vec![Dim::Lit(seq), Dim::Lit(d)]), DType::F32);
-            let qk_tile = Shape(vec![Dim::Lit(seq), Dim::Lit(seq), Dim::Lit(d)]);
-            let q_r = builder.restride(q, qk_tile.clone(), Strides(vec![i64::from(d), 0, 1]));
-            let k_r = builder.restride(kk, qk_tile.clone(), Strides(vec![0, i64::from(d), 1]));
+            let q = builder.input(0, Shape(vec![Dim::Const(seq), Dim::Const(d)]), DType::F32);
+            let kk = builder.input(1, Shape(vec![Dim::Const(seq), Dim::Const(d)]), DType::F32);
+            let v = builder.input(2, Shape(vec![Dim::Const(seq), Dim::Const(d)]), DType::F32);
+            let qk_tile = Shape(vec![Dim::Const(seq), Dim::Const(seq), Dim::Const(d)]);
+            let q_r = builder.restride(
+                q,
+                qk_tile.clone(),
+                Strides(vec![Dim::Const(d), Dim::Const(0), Dim::Const(1)]),
+            );
+            let k_r = builder.restride(
+                kk,
+                qk_tile.clone(),
+                Strides(vec![Dim::Const(0), Dim::Const(d), Dim::Const(1)]),
+            );
             let arg0 = builder.scalar_arg(0);
             let arg1 = builder.scalar_arg(1);
             let mul_body = builder.bin_op(BinaryOp::Mul, arg0, arg1);
             let qk_mul = builder.elementwise(qk_tile, &[q_r, k_r], mul_body);
             let scores = builder.reduce(qk_mul, 2, ReduceOp::Add);
-            let scores_shape = Shape(vec![Dim::Lit(seq), Dim::Lit(seq)]);
+            let scores_shape = Shape(vec![Dim::Const(seq), Dim::Const(seq)]);
             let probs = builder.softmax(scores, scores_shape, 1);
-            let pv_tile = Shape(vec![Dim::Lit(seq), Dim::Lit(d), Dim::Lit(seq)]);
-            let p_r = builder.restride(probs, pv_tile.clone(), Strides(vec![i64::from(seq), 0, 1]));
-            let v_r = builder.restride(v, pv_tile.clone(), Strides(vec![0, 1, i64::from(d)]));
+            let pv_tile = Shape(vec![Dim::Const(seq), Dim::Const(d), Dim::Const(seq)]);
+            let p_r = builder.restride(
+                probs,
+                pv_tile.clone(),
+                Strides(vec![Dim::Const(seq), Dim::Const(0), Dim::Const(1)]),
+            );
+            let v_r = builder.restride(
+                v,
+                pv_tile.clone(),
+                Strides(vec![Dim::Const(0), Dim::Const(1), Dim::Const(d)]),
+            );
             let arg0 = builder.scalar_arg(0);
             let arg1 = builder.scalar_arg(1);
             let mul_body = builder.bin_op(BinaryOp::Mul, arg0, arg1);

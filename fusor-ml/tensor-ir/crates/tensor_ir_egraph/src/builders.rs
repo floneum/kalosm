@@ -98,7 +98,8 @@ impl IrBuilder {
         let mut axis_in_slice = Vec::with_capacity(slices.len());
         for (axis, (start, end)) in slices.iter().copied().enumerate() {
             let index = self.scalar_index(axis as u32);
-            let full_axis = matches!(output_shape.0[axis], crate::types::Dim::Lit(dim) if start == 0 && end == dim);
+            let full_axis =
+                matches!(output_shape.0[axis].as_const(), Some(dim) if start == 0 && end == dim);
             if full_axis {
                 relative_indices.push(index);
                 axis_in_slice.push(self.scalar_lit(ScalarValue::Bool(true)));
@@ -163,8 +164,7 @@ impl IrBuilder {
 
     pub fn resize(&mut self, input: Id, input_shape: Shape, output_shape: Shape) -> Id {
         if input_shape.static_numel() == output_shape.static_numel() {
-            let strides = Strides::row_major_for_shape(&output_shape)
-                .expect("literal resize output shape has row-major strides");
+            let strides = Strides::row_major_for_shape(&output_shape);
             return self.restride_with_offset(input, output_shape, strides, 0);
         }
 
@@ -177,11 +177,11 @@ impl IrBuilder {
         let mut in_bounds = self.scalar_lit(ScalarValue::Bool(true));
         let mut safe_indices = Vec::with_capacity(output_shape.rank());
         for (axis, dim) in input_shape.0.iter().enumerate() {
-            let crate::types::Dim::Lit(limit) = dim else {
+            let Some(limit) = dim.as_const() else {
                 panic!("resize currently requires literal input dimensions");
             };
             let index = self.scalar_index(axis as u32);
-            let limit = self.scalar_u32(*limit);
+            let limit = self.scalar_u32(limit);
             let axis_in_bounds = self.bin_op(BinaryOp::Lt, index, limit);
             in_bounds = self.bin_op(BinaryOp::And, in_bounds, axis_in_bounds);
             let zero = self.scalar_u32(0);
@@ -330,6 +330,7 @@ impl IrBuilder {
                 ScalarValue::U32(_) => DType::U32,
                 ScalarValue::Bool(_) => DType::Bool,
             }),
+            TensorIr::ShapeParam(_) => Some(DType::U32),
             TensorIr::HighLevel(HighLevelNode::Param(index))
             | TensorIr::HighLevel(HighLevelNode::IndexedParam { index, .. }) => {
                 params.and_then(|params| params.get(*index as usize).copied())
@@ -394,13 +395,18 @@ impl IrBuilder {
     /// # Panics
     ///
     /// Panics if `inputs.len()` does not fit in `u32`.
-    pub fn dispatch(&mut self, inputs: &[Id], workgroups: u32, body: Id) -> Id {
+    pub fn dispatch(
+        &mut self,
+        inputs: &[Id],
+        workgroups: impl Into<crate::types::Dim>,
+        body: Id,
+    ) -> Id {
         let num_inputs = u32::try_from(inputs.len()).expect("dispatch inputs must fit in u32");
         let mut children = inputs.to_vec();
         children.push(body);
         let children_list = self.list(&children);
         self.add(TensorIr::Dispatch(DispatchNode::Dispatch {
-            workgroups,
+            workgroups: workgroups.into(),
             num_inputs,
             children_list,
         }))
@@ -459,10 +465,8 @@ impl IrBuilder {
         let arg1 = self.scalar_arg(1);
         let sub_body = self.bin_op(BinaryOp::Sub, arg0, arg1);
         let reduced_shape = shape.remove_axis(axis as usize);
-        let mut broadcast_strides = Strides::row_major_for_shape(&reduced_shape)
-            .map(|strides| strides.0)
-            .unwrap_or_else(|| vec![1i64; reduced_shape.rank()]);
-        broadcast_strides.insert(axis as usize, 0);
+        let mut broadcast_strides = Strides::row_major_for_shape(&reduced_shape).0;
+        broadcast_strides.insert(axis as usize, crate::types::Dim::Const(0));
         let max_broadcast =
             self.restride(max_val, shape.clone(), Strides(broadcast_strides.clone()));
         let shifted = self.elementwise(shape.clone(), &[x, max_broadcast], sub_body);

@@ -76,7 +76,7 @@ pub(super) fn extract_dispatch_rewrite_layout(
         })
         .collect();
     Some(DispatchRewriteLayout {
-        workgroups: *workgroups,
+        workgroups: workgroups.as_const()?,
         num_inputs,
         input_ids: children[..num_inputs].to_vec(),
         body_addr_pairs,

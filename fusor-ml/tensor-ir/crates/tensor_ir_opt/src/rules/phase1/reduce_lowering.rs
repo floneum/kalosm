@@ -132,7 +132,7 @@ fn build_elementwise_reduce_dispatch(
 
     let dispatch_children = add_list(egraph, &dispatch_children);
     Some(egraph.add(TensorIr::Dispatch(DispatchNode::Dispatch {
-        workgroups: spec.workgroups,
+        workgroups: Dim::Const(spec.workgroups),
         num_inputs: ewise_num_inputs,
         children_list: dispatch_children,
     })))
@@ -259,7 +259,7 @@ fn build_cooperative_reduce_dispatch(
         None => (add_list(egraph, &[spec.expr, reduced, spec.wg]), 1),
     };
     Some(egraph.add(TensorIr::Dispatch(DispatchNode::Dispatch {
-        workgroups: coop_workgroups,
+        workgroups: Dim::Const(coop_workgroups),
         num_inputs,
         children_list: dispatch_children,
     })))
@@ -288,7 +288,7 @@ fn build_simple_reduce_dispatch(
     }));
     let dispatch_children = add_list(egraph, &[spec.expr, theta, spec.out_flat]);
     egraph.add(TensorIr::Dispatch(DispatchNode::Dispatch {
-        workgroups: spec.workgroups,
+        workgroups: Dim::Const(spec.workgroups),
         num_inputs: 1,
         children_list: dispatch_children,
     }))
@@ -336,9 +336,8 @@ impl crate::applier::TypedApplier for ReduceApplier {
             None => return vec![],
         };
 
-        let reduce_dim = match &input_shape.0[axis as usize] {
-            Dim::Lit(v) => *v,
-            Dim::Sym(_) => return vec![],
+        let Some(reduce_dim) = input_shape.0[axis as usize].as_const() else {
+            return vec![];
         };
 
         let output_shape = input_shape.remove_axis(axis as usize);

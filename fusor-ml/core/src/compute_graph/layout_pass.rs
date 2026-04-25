@@ -1,6 +1,6 @@
 use rustc_hash::FxHashMap;
 
-use crate::{TensorLayoutInfo, mir::operation::Operation};
+use crate::TensorLayoutInfo;
 
 use super::{ComputeGraphNodeVariant, NodeIndex, queue::ComputeQueue};
 
@@ -24,29 +24,11 @@ impl LayoutPass {
                 continue;
             }
             match &node_data.variant {
-                ComputeGraphNodeVariant::TensorExpr(op) => self.visit_tensor_expr(node, op),
                 ComputeGraphNodeVariant::MapLayout(op) => self.visit_map_layout(node, op),
                 ComputeGraphNodeVariant::Tensor(op) => self.visit_tensor(node, op),
                 ComputeGraphNodeVariant::Custom(op) => self.visit_custom(node, op),
             }
         }
-    }
-
-    fn visit_tensor_expr(&mut self, key: NodeIndex, operation: &crate::TensorExprOperation) {
-        // Ensure all inputs have been visited
-        let mut dependencies = Vec::new();
-        operation.visit_dependencies(&mut |dep| {
-            dependencies.push(dep);
-        });
-        for input in dependencies {
-            if !self.output_layout.contains_key(&input) {
-                self.queue.push_back(input);
-                self.queue.push_back(key);
-                return;
-            }
-        }
-        self.output_layout
-            .insert(key, operation.output_layout(&self.output_layout));
     }
 
     fn visit_map_layout(

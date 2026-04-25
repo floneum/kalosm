@@ -9,7 +9,11 @@ use egg::{EGraph, Id, Language, RecExpr};
 
 use crate::analysis::TensorAnalysis;
 use crate::language::{DispatchNode, HighLevelNode, SimdNode, TensorIr};
-use crate::types::{BinderKind, DeviceProfile, MemTier, ScalarValue, VarRef};
+use crate::types::{BinderKind, DeviceProfile, Dim, MemTier, ScalarValue, VarRef};
+
+fn dim_cost_value(dim: &Dim) -> f64 {
+    f64::from(dim.as_const().unwrap_or(1024))
+}
 
 /// Synthetic cost model for scoring candidate programs.
 #[derive(Debug, Clone)]
@@ -95,7 +99,8 @@ impl SyntheticCostModel {
                 let children = crate::language::extract_list(egraph, *children_list);
                 let num_outputs = children.len().saturating_sub(*num_inputs as usize) / 2;
                 let num_outputs_u32 = u32::try_from(num_outputs).unwrap_or(1).max(1);
-                let covered_outputs = f64::from(*workgroups) * f64::from(num_outputs_u32);
+                let workgroups_cost = dim_cost_value(workgroups);
+                let covered_outputs = workgroups_cost * f64::from(num_outputs_u32);
                 // "Composite" = value subtree contains a nested Theta chain.
                 // Checked via analysis data on any value child (all value
                 // children share the same structural property for a
@@ -107,7 +112,7 @@ impl SyntheticCostModel {
                     .any(|value| egraph[*value].data.contains_theta);
                 let dispatch_bias = if is_composite { 6.0 } else { 10.0 };
                 let base = 0.001f64.mul_add(
-                    f64::from(*workgroups),
+                    workgroups_cost,
                     0.004f64.mul_add(covered_outputs, dispatch_bias),
                 );
 
@@ -194,6 +199,7 @@ impl SyntheticCostModel {
             TensorIr::Simd(SimdNode::Barrier { .. }) => self.barrier_cost,
             TensorIr::HighLevel(HighLevelNode::Input { .. } | HighLevelNode::Restride { .. })
             | TensorIr::Const(_)
+            | TensorIr::ShapeParam(_)
             | TensorIr::HighLevel(
                 HighLevelNode::Param(_)
                 | HighLevelNode::Index(_)
@@ -800,7 +806,7 @@ fn weighted_child_edges(
             // the per-lane register block size.
             let num_outputs = children.len().saturating_sub(input_count) / 2;
             let num_outputs_u32 = u32::try_from(num_outputs).unwrap_or(1).max(1);
-            let body_multiplier = f64::from(*workgroups) * f64::from(num_outputs_u32);
+            let body_multiplier = dim_cost_value(workgroups) * f64::from(num_outputs_u32);
 
             let mut edges = Vec::with_capacity(children.len() + 1);
             edges.push((*children_list, STRUCTURAL_EDGE_WEIGHT));

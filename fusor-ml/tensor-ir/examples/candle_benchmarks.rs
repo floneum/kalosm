@@ -114,6 +114,7 @@ fn time_tir_gpu(
     let result = ctx.benchmark(
         program,
         inputs,
+        &ShapeParams::default(),
         ProgramBenchmarkConfig {
             warmup_runs: cfg.warmup,
             timing_runs: cfg.timing,
@@ -136,6 +137,7 @@ fn time_tir_host(
     let result = ctx.benchmark_host(
         program,
         inputs,
+        &ShapeParams::default(),
         ProgramBenchmarkConfig {
             warmup_runs: cfg.warmup,
             timing_runs: cfg.timing,
@@ -159,6 +161,7 @@ fn time_tir_host_batched(
     let result = ctx.benchmark_host_batched(
         program,
         inputs,
+        &ShapeParams::default(),
         ProgramBenchmarkConfig {
             warmup_runs: cfg.warmup,
             timing_runs: cfg.timing,
@@ -229,6 +232,7 @@ fn quick_time_us(ctx: &GpuContext, program: &DispatchProgram, inputs: &[&[f32]])
         ctx.benchmark(
             program,
             inputs,
+            &ShapeParams::default(),
             ProgramBenchmarkConfig {
                 warmup_runs: 3,
                 timing_runs: 15,
@@ -288,7 +292,9 @@ fn compile_tensor_ir(
     };
     let debug_candidates = std::env::var_os("TIR_DUMP_CANDIDATES").is_some();
     let mut consider = |label: &str, program: DispatchProgram, ctx: &GpuContext| {
-        let out = panic::catch_unwind(AssertUnwindSafe(|| ctx.execute(&program, inputs)));
+        let out = panic::catch_unwind(AssertUnwindSafe(|| {
+            ctx.execute(&program, inputs, &ShapeParams::default())
+        }));
         let Ok(out) = out else { return };
         if !tolerance_ok(&out) {
             return;
@@ -374,16 +380,22 @@ fn compile_tensor_ir(
 #[cfg(all(feature = "runtime", feature = "candle"))]
 fn build_sgemm_expr(m: u32, n: u32, k: u32) -> TensorExprProgram {
     let mut b = TensorExprBuilder::new();
-    let a = b.input(0, Shape(vec![Dim::Lit(m), Dim::Lit(k)]), DType::F32);
-    let rhs = b.input(1, Shape(vec![Dim::Lit(k), Dim::Lit(n)]), DType::F32);
+    let a = b.input(0, Shape(vec![Dim::Const(m), Dim::Const(k)]), DType::F32);
+    let rhs = b.input(1, Shape(vec![Dim::Const(k), Dim::Const(n)]), DType::F32);
     let a0 = b.scalar_arg(0);
     let a1 = b.scalar_arg(1);
     let body = b.scalar_binop(BinaryOp::Mul, [a0, a1]);
     let root = b.contraction(
-        Shape(vec![Dim::Lit(m), Dim::Lit(n), Dim::Lit(k)]),
+        Shape(vec![Dim::Const(m), Dim::Const(n), Dim::Const(k)]),
         &[
-            (a, Strides(vec![i64::from(k), 0, 1])),
-            (rhs, Strides(vec![0, 1, i64::from(n)])),
+            (
+                a,
+                Strides(vec![Dim::Const(k), Dim::Const(0), Dim::Const(1)]),
+            ),
+            (
+                rhs,
+                Strides(vec![Dim::Const(0), Dim::Const(1), Dim::Const(n)]),
+            ),
         ],
         body,
         &[(2, ReduceOp::Add)],
@@ -394,16 +406,22 @@ fn build_sgemm_expr(m: u32, n: u32, k: u32) -> TensorExprProgram {
 #[cfg(all(feature = "runtime", feature = "candle"))]
 fn build_sgemv_expr(m: u32, k: u32) -> TensorExprProgram {
     let mut b = TensorExprBuilder::new();
-    let a = b.input(0, Shape(vec![Dim::Lit(m), Dim::Lit(k)]), DType::F32);
-    let x = b.input(1, Shape(vec![Dim::Lit(k), Dim::Lit(1)]), DType::F32);
+    let a = b.input(0, Shape(vec![Dim::Const(m), Dim::Const(k)]), DType::F32);
+    let x = b.input(1, Shape(vec![Dim::Const(k), Dim::Const(1)]), DType::F32);
     let a0 = b.scalar_arg(0);
     let a1 = b.scalar_arg(1);
     let body = b.scalar_binop(BinaryOp::Mul, [a0, a1]);
     let root = b.contraction(
-        Shape(vec![Dim::Lit(m), Dim::Lit(1), Dim::Lit(k)]),
+        Shape(vec![Dim::Const(m), Dim::Const(1), Dim::Const(k)]),
         &[
-            (a, Strides(vec![i64::from(k), 0, 1])),
-            (x, Strides(vec![0, 1, 1])),
+            (
+                a,
+                Strides(vec![Dim::Const(k), Dim::Const(0), Dim::Const(1)]),
+            ),
+            (
+                x,
+                Strides(vec![Dim::Const(0), Dim::Const(1), Dim::Const(1)]),
+            ),
         ],
         body,
         &[(2, ReduceOp::Add)],
@@ -414,7 +432,7 @@ fn build_sgemv_expr(m: u32, k: u32) -> TensorExprProgram {
 #[cfg(all(feature = "runtime", feature = "candle"))]
 fn build_add_expr(rows: u32, cols: u32) -> TensorExprProgram {
     let mut b = TensorExprBuilder::new();
-    let shape = Shape(vec![Dim::Lit(rows), Dim::Lit(cols)]);
+    let shape = Shape(vec![Dim::Const(rows), Dim::Const(cols)]);
     let a = b.input(0, shape.clone(), DType::F32);
     let r = b.input(1, shape.clone(), DType::F32);
     let a0 = b.scalar_arg(0);
@@ -427,7 +445,11 @@ fn build_add_expr(rows: u32, cols: u32) -> TensorExprProgram {
 #[cfg(all(feature = "runtime", feature = "candle"))]
 fn build_reduce_sum_expr(rows: u32, cols: u32) -> TensorExprProgram {
     let mut b = TensorExprBuilder::new();
-    let x = b.input(0, Shape(vec![Dim::Lit(rows), Dim::Lit(cols)]), DType::F32);
+    let x = b.input(
+        0,
+        Shape(vec![Dim::Const(rows), Dim::Const(cols)]),
+        DType::F32,
+    );
     let root = b.reduce(x, 1, ReduceOp::Add);
     b.build(root).expect("valid reduce_sum expr")
 }
@@ -435,25 +457,41 @@ fn build_reduce_sum_expr(rows: u32, cols: u32) -> TensorExprProgram {
 #[cfg(all(feature = "runtime", feature = "candle"))]
 fn build_attention_expr(seq: u32, d: u32) -> TensorExprProgram {
     let mut b = TensorExprBuilder::new();
-    let q = b.input(0, Shape(vec![Dim::Lit(seq), Dim::Lit(d)]), DType::F32);
-    let k = b.input(1, Shape(vec![Dim::Lit(seq), Dim::Lit(d)]), DType::F32);
-    let v = b.input(2, Shape(vec![Dim::Lit(seq), Dim::Lit(d)]), DType::F32);
+    let q = b.input(0, Shape(vec![Dim::Const(seq), Dim::Const(d)]), DType::F32);
+    let k = b.input(1, Shape(vec![Dim::Const(seq), Dim::Const(d)]), DType::F32);
+    let v = b.input(2, Shape(vec![Dim::Const(seq), Dim::Const(d)]), DType::F32);
 
-    let qk_tile = Shape(vec![Dim::Lit(seq), Dim::Lit(seq), Dim::Lit(d)]);
-    let q_r = b.restride(q, qk_tile.clone(), Strides(vec![i64::from(d), 0, 1]));
-    let k_r = b.restride(k, qk_tile.clone(), Strides(vec![0, i64::from(d), 1]));
+    let qk_tile = Shape(vec![Dim::Const(seq), Dim::Const(seq), Dim::Const(d)]);
+    let q_r = b.restride(
+        q,
+        qk_tile.clone(),
+        Strides(vec![Dim::Const(d), Dim::Const(0), Dim::Const(1)]),
+    );
+    let k_r = b.restride(
+        k,
+        qk_tile.clone(),
+        Strides(vec![Dim::Const(0), Dim::Const(d), Dim::Const(1)]),
+    );
     let arg0 = b.scalar_arg(0);
     let arg1 = b.scalar_arg(1);
     let mul_body = b.scalar_binop(BinaryOp::Mul, [arg0, arg1]);
     let qk_mul = b.elementwise(qk_tile, &[q_r, k_r], mul_body);
     let scores = b.reduce(qk_mul, 2, ReduceOp::Add);
 
-    let scores_shape = Shape(vec![Dim::Lit(seq), Dim::Lit(seq)]);
+    let scores_shape = Shape(vec![Dim::Const(seq), Dim::Const(seq)]);
     let probs = b.softmax(scores, scores_shape, 1);
 
-    let pv_tile = Shape(vec![Dim::Lit(seq), Dim::Lit(d), Dim::Lit(seq)]);
-    let p_r = b.restride(probs, pv_tile.clone(), Strides(vec![i64::from(seq), 0, 1]));
-    let v_r = b.restride(v, pv_tile.clone(), Strides(vec![0, 1, i64::from(d)]));
+    let pv_tile = Shape(vec![Dim::Const(seq), Dim::Const(d), Dim::Const(seq)]);
+    let p_r = b.restride(
+        probs,
+        pv_tile.clone(),
+        Strides(vec![Dim::Const(seq), Dim::Const(0), Dim::Const(1)]),
+    );
+    let v_r = b.restride(
+        v,
+        pv_tile.clone(),
+        Strides(vec![Dim::Const(0), Dim::Const(1), Dim::Const(d)]),
+    );
     let arg0 = b.scalar_arg(0);
     let arg1 = b.scalar_arg(1);
     let mul_body = b.scalar_binop(BinaryOp::Mul, [arg0, arg1]);
@@ -667,7 +705,7 @@ fn run_softmax(
     // `runtime_beam_search` used, which finds a valid Dispatch candidate at
     // this shape.
     let program = compile_softmax_via_irbuilder(ctx, rows, cols, &inputs, &reference)?;
-    let tir_out = ctx.execute(&program, &inputs);
+    let tir_out = ctx.execute(&program, &inputs, &ShapeParams::default());
     let tir_err = validate_err("softmax", "tensor_ir", &tir_out, &reference)?;
 
     let tx = Tensor::from_slice(&input, (rows as usize, cols as usize), device)
@@ -716,7 +754,7 @@ fn compile_softmax_via_irbuilder(
     let result = panic::catch_unwind(AssertUnwindSafe(|| -> Result<DispatchProgram, String> {
         let make_recexpr = || {
             let mut builder = IrBuilder::new();
-            let shape = Shape(vec![Dim::Lit(rows), Dim::Lit(cols)]);
+            let shape = Shape(vec![Dim::Const(rows), Dim::Const(cols)]);
             let x = builder.input(0, shape.clone(), DType::F32);
             let _ = builder.softmax(x, shape, 1);
             builder.expr
@@ -762,7 +800,9 @@ fn compile_softmax_via_irbuilder(
                 if program.dispatches.is_empty() {
                     continue;
                 }
-                let out = panic::catch_unwind(AssertUnwindSafe(|| ctx.execute(&program, inputs)));
+                let out = panic::catch_unwind(AssertUnwindSafe(|| {
+                    ctx.execute(&program, inputs, &ShapeParams::default())
+                }));
                 let Ok(out) = out else { continue };
                 if out.len() < expected.len() {
                     continue;
@@ -837,25 +877,41 @@ fn compile_attention_via_irbuilder(
 
     let result = panic::catch_unwind(AssertUnwindSafe(|| -> Result<DispatchProgram, String> {
         let mut builder = IrBuilder::new();
-        let q = builder.input(0, Shape(vec![Dim::Lit(seq), Dim::Lit(d)]), DType::F32);
-        let k = builder.input(1, Shape(vec![Dim::Lit(seq), Dim::Lit(d)]), DType::F32);
-        let v = builder.input(2, Shape(vec![Dim::Lit(seq), Dim::Lit(d)]), DType::F32);
+        let q = builder.input(0, Shape(vec![Dim::Const(seq), Dim::Const(d)]), DType::F32);
+        let k = builder.input(1, Shape(vec![Dim::Const(seq), Dim::Const(d)]), DType::F32);
+        let v = builder.input(2, Shape(vec![Dim::Const(seq), Dim::Const(d)]), DType::F32);
 
-        let qk_tile = Shape(vec![Dim::Lit(seq), Dim::Lit(seq), Dim::Lit(d)]);
-        let q_r = builder.restride(q, qk_tile.clone(), Strides(vec![i64::from(d), 0, 1]));
-        let k_r = builder.restride(k, qk_tile.clone(), Strides(vec![0, i64::from(d), 1]));
+        let qk_tile = Shape(vec![Dim::Const(seq), Dim::Const(seq), Dim::Const(d)]);
+        let q_r = builder.restride(
+            q,
+            qk_tile.clone(),
+            Strides(vec![Dim::Const(d), Dim::Const(0), Dim::Const(1)]),
+        );
+        let k_r = builder.restride(
+            k,
+            qk_tile.clone(),
+            Strides(vec![Dim::Const(0), Dim::Const(d), Dim::Const(1)]),
+        );
         let arg0 = builder.scalar_arg(0);
         let arg1 = builder.scalar_arg(1);
         let mul_body = builder.bin_op(BinaryOp::Mul, arg0, arg1);
         let qk_mul = builder.elementwise(qk_tile, &[q_r, k_r], mul_body);
         let scores = builder.reduce(qk_mul, 2, ReduceOp::Add);
 
-        let scores_shape = Shape(vec![Dim::Lit(seq), Dim::Lit(seq)]);
+        let scores_shape = Shape(vec![Dim::Const(seq), Dim::Const(seq)]);
         let probs = builder.softmax(scores, scores_shape, 1);
 
-        let pv_tile = Shape(vec![Dim::Lit(seq), Dim::Lit(d), Dim::Lit(seq)]);
-        let p_r = builder.restride(probs, pv_tile.clone(), Strides(vec![i64::from(seq), 0, 1]));
-        let v_r = builder.restride(v, pv_tile.clone(), Strides(vec![0, 1, i64::from(d)]));
+        let pv_tile = Shape(vec![Dim::Const(seq), Dim::Const(d), Dim::Const(seq)]);
+        let p_r = builder.restride(
+            probs,
+            pv_tile.clone(),
+            Strides(vec![Dim::Const(seq), Dim::Const(0), Dim::Const(1)]),
+        );
+        let v_r = builder.restride(
+            v,
+            pv_tile.clone(),
+            Strides(vec![Dim::Const(0), Dim::Const(1), Dim::Const(d)]),
+        );
         let arg0 = builder.scalar_arg(0);
         let arg1 = builder.scalar_arg(1);
         let mul_body = builder.bin_op(BinaryOp::Mul, arg0, arg1);
@@ -900,7 +956,9 @@ fn compile_attention_via_irbuilder(
                 if program.dispatches.is_empty() {
                     continue;
                 }
-                let out = panic::catch_unwind(AssertUnwindSafe(|| ctx.execute(&program, inputs)));
+                let out = panic::catch_unwind(AssertUnwindSafe(|| {
+                    ctx.execute(&program, inputs, &ShapeParams::default())
+                }));
                 let Ok(out) = out else { continue };
                 if out.len() < expected.len() {
                     continue;
@@ -998,14 +1056,14 @@ fn run_flash_attention_staged_tir(
     let softmax_inputs: Vec<&[f32]> = vec![&scores_ref];
     let softmax_program =
         compile_softmax_via_irbuilder(ctx, seq, seq, &softmax_inputs, &probs_ref)?;
-    let probs_out = ctx.execute(&softmax_program, &[&scores]);
+    let probs_out = ctx.execute(&softmax_program, &[&scores], &ShapeParams::default());
     let _ = validate_err("flash_attn/softmax", "tensor_ir", &probs_out, &probs_ref)?;
     let probs = probs_out[..probs_ref.len()].to_vec();
 
     let pv_expr = build_sgemm_expr(seq, d, seq);
     let pv_inputs: Vec<&[f32]> = vec![&probs_ref, v];
     let (pv_program, _) = compile_tensor_ir(ctx, &pv_expr, &pv_inputs, reference)?;
-    let tir_out = ctx.execute(&pv_program, &[&probs, v]);
+    let tir_out = ctx.execute(&pv_program, &[&probs, v], &ShapeParams::default());
     let err = validate_err("flash_attn", "tensor_ir", &tir_out, reference)?;
 
     let qk_gpu = time_tir_gpu(ctx, &qk_program, &qk_inputs, cfg)?;
@@ -1065,7 +1123,7 @@ fn run_flash_attention(
     if tir_options.is_empty()
         && let Ok(program) = compile_attention_via_irbuilder(ctx, seq, d, &inputs, &reference)
     {
-        let tir_out = ctx.execute(&program, &inputs);
+        let tir_out = ctx.execute(&program, &inputs, &ShapeParams::default());
         let err = validate_err("flash_attn", "tensor_ir", &tir_out, &reference)?;
         tir_options.push(TirBenchResult {
             gpu: time_tir_gpu(ctx, &program, &inputs, cfg)?,

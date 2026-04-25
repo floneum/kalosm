@@ -110,8 +110,8 @@ fn test_gpu_matmul() {
 
     // ── Build IR and optimize ──
     let mut b = IrBuilder::new();
-    let a = b.input(0, Shape(vec![Dim::Lit(M), Dim::Lit(K)]), DType::F32);
-    let b_in = b.input(1, Shape(vec![Dim::Lit(K), Dim::Lit(N)]), DType::F32);
+    let a = b.input(0, Shape(vec![Dim::Const(M), Dim::Const(K)]), DType::F32);
+    let b_in = b.input(1, Shape(vec![Dim::Const(K), Dim::Const(N)]), DType::F32);
     let _mm = super::build_binary_mul_add_contraction_ir(&mut b, a, b_in, M, N, K);
 
     let mut egraph = egg::EGraph::<TensorIr, TensorAnalysis>::default();
@@ -163,7 +163,7 @@ fn test_gpu_matmul() {
                 return None;
             }
             let gpu_result = match panic::catch_unwind(AssertUnwindSafe(|| {
-                ctx.execute(&program, &[&a_data, &b_data])
+                ctx.execute(&program, &[&a_data, &b_data], &ShapeParams::default())
             })) {
                 Ok(result) => result,
                 Err(_) => return None,
@@ -218,7 +218,8 @@ fn test_gpu_matmul() {
 
     // ── Output + staging buffers ──
     let num_inputs = dispatch.inputs.len();
-    let output_elems = (dispatch.workgroups * SIMD_WIDTH) as usize * dispatch.outputs.len();
+    let output_elems =
+        (dispatch.workgroups.as_const().unwrap() * SIMD_WIDTH) as usize * dispatch.outputs.len();
     let output_bytes = (output_elems * size_of::<f32>()) as u64;
 
     let buf_out = device.create_buffer(&wgpu::BufferDescriptor {
@@ -232,6 +233,12 @@ fn test_gpu_matmul() {
         size: output_bytes,
         usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
         mapped_at_creation: false,
+    });
+    let shape_param_words = ShapeParams::default().storage_words();
+    let buf_shape_params = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("shape_params"),
+        contents: bytemuck::cast_slice(&shape_param_words),
+        usage: wgpu::BufferUsages::STORAGE,
     });
 
     // ── Pipeline + bind group ──
@@ -256,6 +263,10 @@ fn test_gpu_matmul() {
         binding: num_inputs as u32,
         resource: buf_out.as_entire_binding(),
     });
+    entries.push(wgpu::BindGroupEntry {
+        binding: num_inputs as u32 + 1,
+        resource: buf_shape_params.as_entire_binding(),
+    });
 
     let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: Some("matmul_bind_group"),
@@ -274,7 +285,11 @@ fn test_gpu_matmul() {
         });
         pass.set_pipeline(&pipeline);
         pass.set_bind_group(0, &bind_group, &[]);
-        let physical_wgs = dispatch.workgroups / dispatch.simdgroups.max(1);
+        let physical_wgs = dispatch
+            .workgroups
+            .as_const()
+            .unwrap()
+            .div_ceil(dispatch.simdgroups.max(1));
         pass.dispatch_workgroups(physical_wgs, 1, 1);
     }
     encoder.copy_buffer_to_buffer(&buf_out, 0, &buf_staging, 0, output_bytes);
@@ -311,8 +326,8 @@ fn test_runtime_beam_candidate_smoke() {
     const K: u32 = 64;
 
     let mut b = IrBuilder::new();
-    let a = b.input(0, Shape(vec![Dim::Lit(M), Dim::Lit(K)]), DType::F32);
-    let b_in = b.input(1, Shape(vec![Dim::Lit(K), Dim::Lit(N)]), DType::F32);
+    let a = b.input(0, Shape(vec![Dim::Const(M), Dim::Const(K)]), DType::F32);
+    let b_in = b.input(1, Shape(vec![Dim::Const(K), Dim::Const(N)]), DType::F32);
     let _mm = super::build_binary_mul_add_contraction_ir(&mut b, a, b_in, M, N, K);
 
     let mut egraph = egg::EGraph::<TensorIr, TensorAnalysis>::default();
@@ -366,7 +381,7 @@ fn test_runtime_beam_candidate_smoke() {
             "WGSL should contain compute entry point"
         );
 
-        let gpu_result = ctx.execute(&program, &[&a_data, &b_data]);
+        let gpu_result = ctx.execute(&program, &[&a_data, &b_data], &ShapeParams::default());
         let max_err = gpu_result[..cpu_result.len()]
             .iter()
             .zip(&cpu_result)
@@ -394,12 +409,12 @@ fn test_runtime_selected_softmax_weighted_reduce_is_correct() {
     let mut b = IrBuilder::new();
     let scores = b.input(
         0,
-        Shape(vec![Dim::Lit(ROWS), Dim::Lit(WEIGHTS)]),
+        Shape(vec![Dim::Const(ROWS), Dim::Const(WEIGHTS)]),
         DType::F32,
     );
     let values = b.input(
         1,
-        Shape(vec![Dim::Lit(WEIGHTS), Dim::Lit(OUTPUTS)]),
+        Shape(vec![Dim::Const(WEIGHTS), Dim::Const(OUTPUTS)]),
         DType::F32,
     );
     let _weighted =
@@ -452,7 +467,11 @@ fn test_runtime_selected_softmax_weighted_reduce_is_correct() {
         softmax_weighted_reduce_reference(&scores_data, &values_data, ROWS, WEIGHTS, OUTPUTS);
 
     let ctx = crate::runtime::GpuContext::new();
-    let gpu_result = ctx.execute(&program, &[&scores_data, &values_data]);
+    let gpu_result = ctx.execute(
+        &program,
+        &[&scores_data, &values_data],
+        &ShapeParams::default(),
+    );
     let max_err = max_abs_err(&gpu_result[..expected.len()], &expected);
     assert!(
         max_err < 1e-4,
@@ -467,9 +486,9 @@ fn test_runtime_selected_attention_is_correct() {
     const D: u32 = 32;
 
     let mut b = IrBuilder::new();
-    let q = b.input(0, Shape(vec![Dim::Lit(SEQ), Dim::Lit(D)]), DType::F32);
-    let k = b.input(1, Shape(vec![Dim::Lit(SEQ), Dim::Lit(D)]), DType::F32);
-    let v = b.input(2, Shape(vec![Dim::Lit(SEQ), Dim::Lit(D)]), DType::F32);
+    let q = b.input(0, Shape(vec![Dim::Const(SEQ), Dim::Const(D)]), DType::F32);
+    let k = b.input(1, Shape(vec![Dim::Const(SEQ), Dim::Const(D)]), DType::F32);
+    let v = b.input(2, Shape(vec![Dim::Const(SEQ), Dim::Const(D)]), DType::F32);
     let _attention = super::build_attention_ir(&mut b, q, k, v, SEQ, D);
 
     let mut egraph = egg::EGraph::<TensorIr, TensorAnalysis>::default();
@@ -521,7 +540,11 @@ fn test_runtime_selected_attention_is_correct() {
     let expected = attention_reference(&q_data, &k_data, &v_data, SEQ, D);
 
     let ctx = crate::runtime::GpuContext::new();
-    let gpu_result = ctx.execute(&program, &[&q_data, &k_data, &v_data]);
+    let gpu_result = ctx.execute(
+        &program,
+        &[&q_data, &k_data, &v_data],
+        &ShapeParams::default(),
+    );
     let max_err = max_abs_err(&gpu_result[..expected.len()], &expected);
     assert!(
         max_err < 1e-4,
@@ -541,7 +564,7 @@ fn test_gpu_elementwise_add() {
 
     // ── Build IR: C = A + B ──
     let mut b = IrBuilder::new();
-    let shape = Shape(vec![Dim::Lit(ROWS), Dim::Lit(COLS)]);
+    let shape = Shape(vec![Dim::Const(ROWS), Dim::Const(COLS)]);
     let a = b.input(0, shape.clone(), DType::F32);
     let b_in = b.input(1, shape.clone(), DType::F32);
     let arg0 = b.scalar_arg(0);
@@ -605,7 +628,8 @@ fn test_gpu_elementwise_add() {
         usage: wgpu::BufferUsages::STORAGE,
     });
 
-    let output_elems = (dispatch.workgroups * SIMD_WIDTH) as usize * dispatch.outputs.len();
+    let output_elems =
+        (dispatch.workgroups.as_const().unwrap() * SIMD_WIDTH) as usize * dispatch.outputs.len();
     let output_bytes = (output_elems * size_of::<f32>()) as u64;
 
     let buf_out = device.create_buffer(&wgpu::BufferDescriptor {
@@ -619,6 +643,12 @@ fn test_gpu_elementwise_add() {
         size: output_bytes,
         usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
         mapped_at_creation: false,
+    });
+    let shape_param_words = ShapeParams::default().storage_words();
+    let buf_shape_params = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("shape_params"),
+        contents: bytemuck::cast_slice(&shape_param_words),
+        usage: wgpu::BufferUsages::STORAGE,
     });
 
     let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
@@ -646,6 +676,10 @@ fn test_gpu_elementwise_add() {
                 binding: 2,
                 resource: buf_out.as_entire_binding(),
             },
+            wgpu::BindGroupEntry {
+                binding: 3,
+                resource: buf_shape_params.as_entire_binding(),
+            },
         ],
     });
 
@@ -659,7 +693,11 @@ fn test_gpu_elementwise_add() {
         });
         pass.set_pipeline(&pipeline);
         pass.set_bind_group(0, &bind_group, &[]);
-        let physical_wgs = dispatch.workgroups / dispatch.simdgroups.max(1);
+        let physical_wgs = dispatch
+            .workgroups
+            .as_const()
+            .unwrap()
+            .div_ceil(dispatch.simdgroups.max(1));
         pass.dispatch_workgroups(physical_wgs, 1, 1);
     }
     encoder.copy_buffer_to_buffer(&buf_out, 0, &buf_staging, 0, output_bytes);
@@ -692,14 +730,88 @@ fn test_gpu_elementwise_add() {
 
 #[test]
 #[cfg(feature = "runtime")]
+fn test_runtime_symbolic_elementwise_reuses_program_with_different_shape_params() {
+    let shape = Shape(vec![Dim::Symbol(0), Dim::Symbol(1)]);
+    let mut b = crate::TensorExprBuilder::new();
+    let input = b.input(0, shape.clone(), DType::F32);
+    let arg = b.scalar_arg(0);
+    let one = b.scalar_f32(1.0);
+    let body = b.scalar_binop(BinaryOp::Add, [arg, one]);
+    let root = b.elementwise(shape, &[input], body);
+    let expr = b
+        .build(root)
+        .expect("symbolic elementwise expr should validate");
+
+    let mut config = crate::StageConfig::default();
+    config.runner.iter_limit = 6;
+    config.runner.node_limit = 20_000;
+    config.candidate_limit = Some(1);
+    let kernel =
+        crate::lower_tensor_expr(&expr, &config).expect("symbolic elementwise expr should lower");
+    let simd = crate::compile_kernel(kernel).expect("symbolic elementwise kernel should compile");
+    let program = simd.dispatch_program();
+
+    let ctx = crate::runtime::GpuContext::new();
+    for dims in [[3_u32, 5_u32], [4, 7]] {
+        let len = (dims[0] * dims[1]) as usize;
+        let input = (0..len).map(|i| i as f32 * 0.25).collect::<Vec<_>>();
+        let output = ctx.execute(&program, &[&input], &ShapeParams::from(dims));
+        for (actual, expected) in output[..len]
+            .iter()
+            .zip(input.iter().map(|value| value + 1.0))
+        {
+            assert!((actual - expected).abs() < 1e-5);
+        }
+    }
+}
+
+#[test]
+#[cfg(feature = "runtime")]
+fn test_runtime_symbolic_reduce_reuses_program_with_different_shape_params() {
+    let shape = Shape(vec![Dim::Symbol(0), Dim::Symbol(1)]);
+    let mut b = crate::TensorExprBuilder::new();
+    let input = b.input(0, shape, DType::F32);
+    let root = b.reduce(input, 1, ReduceOp::Add);
+    let expr = b.build(root).expect("symbolic reduce expr should validate");
+
+    let mut config = crate::StageConfig::default();
+    config.runner.iter_limit = 8;
+    config.runner.node_limit = 30_000;
+    config.candidate_limit = Some(1);
+    let kernel =
+        crate::lower_tensor_expr(&expr, &config).expect("symbolic reduce expr should lower");
+    let simd = crate::compile_kernel(kernel).expect("symbolic reduce kernel should compile");
+    let program = simd.dispatch_program();
+
+    let ctx = crate::runtime::GpuContext::new();
+    for dims in [[3_u32, 4_u32], [2, 5]] {
+        let rows = dims[0] as usize;
+        let cols = dims[1] as usize;
+        let input = (0..rows * cols)
+            .map(|i| (i % 7) as f32 * 0.5)
+            .collect::<Vec<_>>();
+        let output = ctx.execute(&program, &[&input], &ShapeParams::from(dims));
+        let expected = input
+            .chunks(cols)
+            .map(|row| row.iter().sum::<f32>())
+            .collect::<Vec<_>>();
+
+        for (actual, expected) in output[..rows].iter().zip(expected) {
+            assert!((actual - expected).abs() < 1e-4);
+        }
+    }
+}
+
+#[test]
+#[cfg(feature = "runtime")]
 fn test_runtime_blocked_beam_candidate_lowers() {
     const M: u32 = 64;
     const N: u32 = 64;
     const K: u32 = 64;
 
     let mut b = IrBuilder::new();
-    let a = b.input(0, Shape(vec![Dim::Lit(M), Dim::Lit(K)]), DType::F32);
-    let b_in = b.input(1, Shape(vec![Dim::Lit(K), Dim::Lit(N)]), DType::F32);
+    let a = b.input(0, Shape(vec![Dim::Const(M), Dim::Const(K)]), DType::F32);
+    let b_in = b.input(1, Shape(vec![Dim::Const(K), Dim::Const(N)]), DType::F32);
     let _mm = super::build_binary_mul_add_contraction_ir(&mut b, a, b_in, M, N, K);
 
     let mut egraph = egg::EGraph::<TensorIr, TensorAnalysis>::default();
@@ -750,8 +862,8 @@ fn test_runtime_benchmark_selected_matmul_is_correct() {
 
     let target_valid_candidates = 8usize;
     let mut legacy_builder = IrBuilder::new();
-    let lhs = legacy_builder.input(0, Shape(vec![Dim::Lit(M), Dim::Lit(K)]), DType::F32);
-    let rhs = legacy_builder.input(1, Shape(vec![Dim::Lit(K), Dim::Lit(N)]), DType::F32);
+    let lhs = legacy_builder.input(0, Shape(vec![Dim::Const(M), Dim::Const(K)]), DType::F32);
+    let rhs = legacy_builder.input(1, Shape(vec![Dim::Const(K), Dim::Const(N)]), DType::F32);
     let _mm = super::build_binary_mul_add_contraction_ir(&mut legacy_builder, lhs, rhs, M, N, K);
 
     let mut egraph = crate::TensorEGraph::default();
@@ -805,11 +917,12 @@ fn test_runtime_benchmark_selected_matmul_is_correct() {
         let Some(dispatch) = program.dispatches.first() else {
             continue;
         };
-        let gpu_result =
-            match panic::catch_unwind(AssertUnwindSafe(|| ctx.execute(&program, &inputs))) {
-                Ok(result) => result,
-                Err(_) => continue,
-            };
+        let gpu_result = match panic::catch_unwind(AssertUnwindSafe(|| {
+            ctx.execute(&program, &inputs, &ShapeParams::default())
+        })) {
+            Ok(result) => result,
+            Err(_) => continue,
+        };
         let max_err = gpu_result[..expected.len()]
             .iter()
             .zip(&expected)
@@ -821,12 +934,16 @@ fn test_runtime_benchmark_selected_matmul_is_correct() {
         valid_candidates += 1;
 
         let result = match panic::catch_unwind(AssertUnwindSafe(|| {
-            ctx.benchmark(&program, &inputs, tuning_config)
+            ctx.benchmark(&program, &inputs, &ShapeParams::default(), tuning_config)
         })) {
             Ok(Ok(result)) => result,
             Ok(Err(_)) | Err(_) => continue,
         };
-        let physical_workgroups = dispatch.workgroups / dispatch.simdgroups.max(1);
+        let physical_workgroups = dispatch
+            .workgroups
+            .as_const()
+            .unwrap()
+            .div_ceil(dispatch.simdgroups.max(1));
         let tg_buffer_count = dispatch.tg_buffers.len();
         let output_count = dispatch.outputs.len();
         let score = result.median_gpu_us;
@@ -859,7 +976,7 @@ fn test_runtime_benchmark_selected_matmul_is_correct() {
 
     let (_, _, _, _, program) =
         selected.expect("expected runtime benchmark to select a valid matmul candidate");
-    let gpu_result = ctx.execute(&program, &[&input_a, &input_b]);
+    let gpu_result = ctx.execute(&program, &[&input_a, &input_b], &ShapeParams::default());
 
     let max_err = gpu_result[..expected.len()]
         .iter()
@@ -881,8 +998,8 @@ fn test_runtime_cooperative_scalar_matmul_candidate_is_correct() {
     const K: u32 = 256;
 
     let mut legacy_builder = IrBuilder::new();
-    let lhs = legacy_builder.input(0, Shape(vec![Dim::Lit(M), Dim::Lit(K)]), DType::F32);
-    let rhs = legacy_builder.input(1, Shape(vec![Dim::Lit(K), Dim::Lit(N)]), DType::F32);
+    let lhs = legacy_builder.input(0, Shape(vec![Dim::Const(M), Dim::Const(K)]), DType::F32);
+    let rhs = legacy_builder.input(1, Shape(vec![Dim::Const(K), Dim::Const(N)]), DType::F32);
     let _mm = super::build_binary_mul_add_contraction_ir(&mut legacy_builder, lhs, rhs, M, N, K);
 
     let mut egraph = crate::TensorEGraph::default();
@@ -937,7 +1054,7 @@ fn test_runtime_cooperative_scalar_matmul_candidate_is_correct() {
         }
 
         let gpu_result = match panic::catch_unwind(AssertUnwindSafe(|| {
-            ctx.execute(&program, &[&input_a, &input_b])
+            ctx.execute(&program, &[&input_a, &input_b], &ShapeParams::default())
         })) {
             Ok(result) => result,
             Err(_) => continue,
@@ -971,7 +1088,11 @@ fn test_gpu_sum_reduce() {
 
     // ── Build IR: out[row] = sum(A[row, :]) ──
     let mut b = IrBuilder::new();
-    let a = b.input(0, Shape(vec![Dim::Lit(ROWS), Dim::Lit(COLS)]), DType::F32);
+    let a = b.input(
+        0,
+        Shape(vec![Dim::Const(ROWS), Dim::Const(COLS)]),
+        DType::F32,
+    );
     let _red = b.reduce(a, 1, ReduceOp::Add);
 
     let mut egraph = egg::EGraph::<TensorIr, TensorAnalysis>::default();
@@ -1024,7 +1145,7 @@ fn test_gpu_sum_reduce() {
         usage: wgpu::BufferUsages::STORAGE,
     });
 
-    let output_elems = (dispatch.workgroups * SIMD_WIDTH) as usize;
+    let output_elems = (dispatch.workgroups.as_const().unwrap() * SIMD_WIDTH) as usize;
     let output_bytes = (output_elems * size_of::<f32>()) as u64;
 
     let buf_out = device.create_buffer(&wgpu::BufferDescriptor {
@@ -1038,6 +1159,12 @@ fn test_gpu_sum_reduce() {
         size: output_bytes,
         usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
         mapped_at_creation: false,
+    });
+    let shape_param_words = ShapeParams::default().storage_words();
+    let buf_shape_params = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("shape_params"),
+        contents: bytemuck::cast_slice(&shape_param_words),
+        usage: wgpu::BufferUsages::STORAGE,
     });
 
     let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
@@ -1061,6 +1188,10 @@ fn test_gpu_sum_reduce() {
                 binding: 1,
                 resource: buf_out.as_entire_binding(),
             },
+            wgpu::BindGroupEntry {
+                binding: 2,
+                resource: buf_shape_params.as_entire_binding(),
+            },
         ],
     });
 
@@ -1074,7 +1205,11 @@ fn test_gpu_sum_reduce() {
         });
         pass.set_pipeline(&pipeline);
         pass.set_bind_group(0, &bind_group, &[]);
-        let physical_wgs = dispatch.workgroups / dispatch.simdgroups.max(1);
+        let physical_wgs = dispatch
+            .workgroups
+            .as_const()
+            .unwrap()
+            .div_ceil(dispatch.simdgroups.max(1));
         pass.dispatch_workgroups(physical_wgs, 1, 1);
     }
     encoder.copy_buffer_to_buffer(&buf_out, 0, &buf_staging, 0, output_bytes);

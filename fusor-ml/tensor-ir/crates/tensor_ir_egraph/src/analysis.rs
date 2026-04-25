@@ -274,6 +274,7 @@ fn scalar_expr_dtype(
     egraph[id].iter().find_map(|node| match node {
         TensorIr::HighLevel(HighLevelNode::Param(index)) => params.get(*index as usize).copied(),
         TensorIr::HighLevel(HighLevelNode::Index(_)) => Some(DType::U32),
+        TensorIr::ShapeParam(_) => Some(DType::U32),
         TensorIr::HighLevel(HighLevelNode::IndexedParam { index, .. }) => {
             params.get(*index as usize).copied()
         }
@@ -310,14 +311,14 @@ fn make_high_level_data(
     egraph: &EGraph<TensorIr, TensorAnalysis>,
     node: &HighLevelNode,
 ) -> TensorData {
-    let has_literal_shape = |shape: &Shape| shape.static_numel().is_some_and(|numel| numel > 0);
+    let has_nonzero_shape = |shape: &Shape| !matches!(shape.static_numel(), Some(0));
     match node {
         HighLevelNode::Input { shape, dtype, .. } => TensorData {
             shape: Some(shape.clone()),
             dtype: Some(*dtype),
-            stride_profile: Strides::row_major_for_shape(shape),
+            stride_profile: Some(Strides::row_major_for_shape(shape)),
             composite_dispatch: CompositeDispatchInfo {
-                lowerable: has_literal_shape(shape),
+                lowerable: has_nonzero_shape(shape),
             },
             ..empty_tensor_data()
         },
@@ -336,7 +337,7 @@ fn make_high_level_data(
                 var_dep: child.var_dep.clone(),
                 free_var_dep: child.free_var_dep.clone(),
                 composite_dispatch: CompositeDispatchInfo {
-                    lowerable: child.composite_dispatch.lowerable && has_literal_shape(new_shape),
+                    lowerable: child.composite_dispatch.lowerable && has_nonzero_shape(new_shape),
                 },
                 reduction_depth: child.reduction_depth,
                 ..Default::default()
@@ -349,7 +350,7 @@ fn make_high_level_data(
         } => {
             let mut data = list_tensor_data(egraph, *children_list);
             data.shape = Some(index_space.clone());
-            data.stride_profile = Strides::row_major_for_shape(index_space);
+            data.stride_profile = Some(Strides::row_major_for_shape(index_space));
             // During mid-construction passes (e.g. `build_dispatch_program_from_extracted`
             // adding nodes one at a time) `children_list` may briefly resolve to a
             // class whose first form isn't Cons/Nil because of e-class merges.
@@ -370,7 +371,7 @@ fn make_high_level_data(
                         .and_then(|body| scalar_expr_dtype(egraph, *body, input_dtypes))
                 });
                 data.composite_dispatch = CompositeDispatchInfo {
-                    lowerable: has_literal_shape(index_space) && inputs_lowerable,
+                    lowerable: has_nonzero_shape(index_space) && inputs_lowerable,
                 };
                 data.reduction_depth = children[..children.len().saturating_sub(1)]
                     .iter()
@@ -404,7 +405,7 @@ fn make_high_level_data(
                 free_var_dep: child.free_var_dep.clone(),
                 composite_dispatch: CompositeDispatchInfo {
                     lowerable: child.composite_dispatch.lowerable
-                        && reduced_shape.as_ref().is_some_and(has_literal_shape),
+                        && reduced_shape.as_ref().is_some_and(has_nonzero_shape),
                 },
                 reduction_depth: child.reduction_depth.saturating_add(1),
                 ..Default::default()
@@ -486,7 +487,7 @@ fn match_broadcast_reduce(
             .0
             .iter()
             .enumerate()
-            .find_map(|(axis, stride)| (*stride == 0).then_some(axis as u32))?;
+            .find_map(|(axis, stride)| (stride.as_const() == Some(0)).then_some(axis as u32))?;
         egraph[egraph.find(*expr)].iter().find_map(|node| {
             let TensorIr::HighLevel(HighLevelNode::Reduce {
                 axis,
@@ -767,6 +768,10 @@ impl Analysis<TensorIr> for TensorAnalysis {
                     ScalarValue::U32(u) => Some(AddressProfile::from_const(*u)),
                     _ => None,
                 },
+                ..empty_tensor_data()
+            },
+            TensorIr::ShapeParam(_) => TensorData {
+                dtype: Some(DType::U32),
                 ..empty_tensor_data()
             },
             TensorIr::BinOp(name, args) => {

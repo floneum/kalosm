@@ -28,7 +28,7 @@ use crate::types::{
     BinaryOp, BinderKind, BufferRef, DType, Dim, IndexLevel, MemTier, ScalarValue, Shape, VarRef,
 };
 
-use super::{compute_flat_addr, compute_strided_addr, decompose_flat_index};
+use super::{compute_flat_addr, compute_strided_addr, decompose_flat_index, dim_to_ir};
 
 pub(super) fn build(config: &RunnerConfig) -> Rewrite<TensorIr, TensorAnalysis> {
     let simd_width = config.device.simd_width;
@@ -37,8 +37,7 @@ pub(super) fn build(config: &RunnerConfig) -> Rewrite<TensorIr, TensorAnalysis> 
         SimpleEclassSearcher::new(move |egraph, eclass| {
             let data = &egraph[egraph.find(eclass)].data;
             data.composite_dispatch.lowerable
-                && output_elements(egraph, eclass)
-                    .is_some_and(|n| n >= simd_width && n % simd_width == 0)
+                && output_elements(egraph, eclass).is_some_and(|n| n.as_const() != Some(0))
         }),
         crate::applier::AdaptedApplier(RecursiveDispatchApplier { simd_width }),
     )
@@ -109,8 +108,8 @@ pub(super) fn shape_of(egraph: &EGraph<TensorIr, TensorAnalysis>, id: Id) -> Opt
     egraph[egraph.find(id)].data.shape.clone()
 }
 
-fn output_elements(egraph: &EGraph<TensorIr, TensorAnalysis>, id: Id) -> Option<u32> {
-    shape_of(egraph, id)?.static_numel().filter(|n| *n > 0)
+fn output_elements(egraph: &EGraph<TensorIr, TensorAnalysis>, id: Id) -> Option<Dim> {
+    Some(shape_of(egraph, id)?.numel())
 }
 
 pub(super) fn collect_underlying_inputs(
@@ -168,7 +167,7 @@ fn has_flat_external_input_dispatch(
     egraph: &EGraph<TensorIr, TensorAnalysis>,
     eclass: Id,
     num_inputs: u32,
-    workgroups: u32,
+    workgroups: &Dim,
 ) -> bool {
     let canonical = egraph.find(eclass);
     egraph[canonical].iter().any(|node| {
@@ -180,7 +179,7 @@ fn has_flat_external_input_dispatch(
         else {
             return false;
         };
-        if *existing_inputs != num_inputs || *existing_workgroups != workgroups {
+        if *existing_inputs != num_inputs || existing_workgroups != workgroups {
             return false;
         }
 
@@ -236,6 +235,7 @@ pub(super) fn lower_scalar_with_values(
                         | HighLevelNode::Index(_)
                         | HighLevelNode::IndexedParam { .. }
                 ) | TensorIr::Const(_)
+                    | TensorIr::ShapeParam(_)
                     | TensorIr::BinOp(_, _)
                     | TensorIr::UnOp(_, _)
                     | TensorIr::TernOp(_, _)
@@ -268,6 +268,7 @@ pub(super) fn lower_scalar_with_values(
             lower_tensor_point(egraph, source, &indexed_indices, ctx)
         }
         TensorIr::Const(v) => Some(egraph.add(TensorIr::Const(v))),
+        TensorIr::ShapeParam(index) => Some(egraph.add(TensorIr::ShapeParam(index))),
         TensorIr::BinOp(op, [lhs, rhs]) => {
             let lhs = lower_scalar_with_values(egraph, lhs, ewise_inputs, indices, ctx)?;
             let rhs = lower_scalar_with_values(egraph, rhs, ewise_inputs, indices, ctx)?;
@@ -340,10 +341,7 @@ pub(super) fn lower_tensor_point(
             expr: source,
         } => {
             let source_shape = shape_of(egraph, source)?;
-            let reduce_dim = match &source_shape.0[axis as usize] {
-                Dim::Lit(v) => *v,
-                Dim::Sym(_) => return None,
-            };
+            let reduce_dim = source_shape.0[axis as usize].clone();
 
             let mut shifted_indices = Vec::with_capacity(indices.len());
             for id in indices {
@@ -356,7 +354,7 @@ pub(super) fn lower_tensor_point(
 
             let source_dtype = egraph[source].data.dtype.unwrap_or(DType::F32);
             let init = egraph.add(TensorIr::Const(op.identity(source_dtype)?));
-            let count = egraph.add(TensorIr::Const(ScalarValue::U32(reduce_dim)));
+            let count = dim_to_ir(egraph, &reduce_dim);
             let acc = egraph.add(TensorIr::Simd(SimdNode::Var(VarRef::acc(0))));
             let update = egraph.add(TensorIr::BinOp(
                 op.bin_op_for_dtype(source_dtype)?,
@@ -388,19 +386,19 @@ impl crate::applier::TypedApplier for RecursiveDispatchApplier {
             Some(shape) => shape,
             None => return vec![],
         };
-        let output_elements = match output_shape.static_numel() {
-            Some(n) if n >= self.simd_width && n % self.simd_width == 0 => n,
-            _ => return vec![],
-        };
+        let output_elements = output_shape.numel();
+        if output_elements.as_const() == Some(0) {
+            return vec![];
+        }
 
         let input_ids = collect_underlying_inputs(egraph, eclass);
         if input_ids.is_empty() {
             return vec![];
         }
 
-        let workgroups = output_elements / self.simd_width;
+        let workgroups = Dim::ceil_div(output_elements, Dim::Const(self.simd_width));
         let num_inputs = u32::try_from(input_ids.len()).expect("input count fits in u32");
-        if has_flat_external_input_dispatch(egraph, eclass, num_inputs, workgroups) {
+        if has_flat_external_input_dispatch(egraph, eclass, num_inputs, &workgroups) {
             return vec![];
         }
 

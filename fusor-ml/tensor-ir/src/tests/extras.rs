@@ -24,7 +24,7 @@ fn test_theta_split_cooperative() {
     // Phase 1 creates Theta(init, 128, ...) which is > SIMD_WIDTH=32.
     // Phase 4 should split into Theta(init, 4, ...) + ReduceSimd.
     let mut b = IrBuilder::new();
-    let a = b.input(0, Shape(vec![Dim::Lit(128), Dim::Lit(128)]), DType::F32);
+    let a = b.input(0, Shape(vec![Dim::Const(128), Dim::Const(128)]), DType::F32);
     let _red = b.reduce(a, 1, ReduceOp::Add);
 
     let mut egraph = egg::EGraph::<TensorIr, TensorAnalysis>::default();
@@ -174,7 +174,7 @@ fn test_bool_xor_theta_does_not_reduce_simd() {
 #[test]
 fn test_theta_split_cooperative_with_tail() {
     let mut b = IrBuilder::new();
-    let a = b.input(0, Shape(vec![Dim::Lit(128), Dim::Lit(100)]), DType::F32);
+    let a = b.input(0, Shape(vec![Dim::Const(128), Dim::Const(100)]), DType::F32);
     let _red = b.reduce(a, 1, ReduceOp::Add);
 
     let mut egraph = egg::EGraph::<TensorIr, TensorAnalysis>::default();
@@ -222,8 +222,8 @@ fn test_theta_split_small_k_matmul_remaps_output_owner() {
     let simd_width = DeviceProfile::default().simd_width;
 
     let mut b = IrBuilder::new();
-    let a = b.input(0, Shape(vec![Dim::Lit(M), Dim::Lit(K)]), DType::F32);
-    let x = b.input(1, Shape(vec![Dim::Lit(K), Dim::Lit(N)]), DType::F32);
+    let a = b.input(0, Shape(vec![Dim::Const(M), Dim::Const(K)]), DType::F32);
+    let x = b.input(1, Shape(vec![Dim::Const(K), Dim::Const(N)]), DType::F32);
     let _y = super::build_binary_mul_add_contraction_ir(&mut b, a, x, M, N, K);
 
     let mut egraph = egg::EGraph::<TensorIr, TensorAnalysis>::default();
@@ -292,7 +292,11 @@ fn test_gpu_cooperative_reduce() {
 
     // ── Build IR: out[row] = sum(A[row, :]) ──
     let mut b = IrBuilder::new();
-    let a = b.input(0, Shape(vec![Dim::Lit(ROWS), Dim::Lit(COLS)]), DType::F32);
+    let a = b.input(
+        0,
+        Shape(vec![Dim::Const(ROWS), Dim::Const(COLS)]),
+        DType::F32,
+    );
     let _red = b.reduce(a, 1, ReduceOp::Add);
 
     let mut egraph = egg::EGraph::<TensorIr, TensorAnalysis>::default();
@@ -367,7 +371,7 @@ fn test_gpu_cooperative_reduce() {
         usage: wgpu::BufferUsages::STORAGE,
     });
 
-    let output_elems = (dispatch.workgroups * 32) as usize;
+    let output_elems = (dispatch.workgroups.as_const().unwrap() * 32) as usize;
     let output_bytes = (output_elems * size_of::<f32>()) as u64;
 
     let buf_out = device.create_buffer(&wgpu::BufferDescriptor {
@@ -381,6 +385,12 @@ fn test_gpu_cooperative_reduce() {
         size: output_bytes,
         usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
         mapped_at_creation: false,
+    });
+    let shape_param_words = ShapeParams::default().storage_words();
+    let buf_shape_params = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("shape_params"),
+        contents: bytemuck::cast_slice(&shape_param_words),
+        usage: wgpu::BufferUsages::STORAGE,
     });
 
     let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
@@ -404,6 +414,10 @@ fn test_gpu_cooperative_reduce() {
                 binding: 1,
                 resource: buf_out.as_entire_binding(),
             },
+            wgpu::BindGroupEntry {
+                binding: 2,
+                resource: buf_shape_params.as_entire_binding(),
+            },
         ],
     });
 
@@ -417,7 +431,11 @@ fn test_gpu_cooperative_reduce() {
         });
         pass.set_pipeline(&pipeline);
         pass.set_bind_group(0, &bind_group, &[]);
-        let physical_wgs = dispatch.workgroups / dispatch.simdgroups.max(1);
+        let physical_wgs = dispatch
+            .workgroups
+            .as_const()
+            .unwrap()
+            .div_ceil(dispatch.simdgroups.max(1));
         pass.dispatch_workgroups(physical_wgs, 1, 1);
     }
     encoder.copy_buffer_to_buffer(&buf_out, 0, &buf_staging, 0, output_bytes);
@@ -466,8 +484,8 @@ fn test_gpu_cooperative_sgemv() {
     // The matmul builder creates Reduce(axis=2, Elementwise([M,1,K], mul(A,x)))
     // Rule 2b fuses this into a single Dispatch with K-loop Theta.
     let mut b = IrBuilder::new();
-    let a = b.input(0, Shape(vec![Dim::Lit(M), Dim::Lit(K)]), DType::F32);
-    let x = b.input(1, Shape(vec![Dim::Lit(K), Dim::Lit(1)]), DType::F32);
+    let a = b.input(0, Shape(vec![Dim::Const(M), Dim::Const(K)]), DType::F32);
+    let x = b.input(1, Shape(vec![Dim::Const(K), Dim::Const(1)]), DType::F32);
     let _y = super::build_binary_mul_add_contraction_ir(&mut b, a, x, M, 1, K);
 
     let mut egraph = egg::EGraph::<TensorIr, TensorAnalysis>::default();
@@ -545,7 +563,7 @@ fn test_gpu_cooperative_sgemv() {
     let a_data: Vec<f32> = (0..M * K).map(|i| (i % 7) as f32 * 0.1).collect();
     let x_data: Vec<f32> = (0..K).map(|i| (i % 5) as f32 * 0.2).collect();
 
-    let gpu_result = ctx.execute(&program, &[&a_data, &x_data]);
+    let gpu_result = ctx.execute(&program, &[&a_data, &x_data], &ShapeParams::default());
 
     // ── CPU reference: y[m] = sum_k A[m,k] * x[k] ──
     let mut cpu_result = vec![0.0f32; M as usize];
@@ -577,8 +595,8 @@ fn test_sgemv_vector_broadcast_promotion() {
     const K: u32 = 32;
 
     let mut b = IrBuilder::new();
-    let a = b.input(0, Shape(vec![Dim::Lit(M), Dim::Lit(K)]), DType::F32);
-    let x = b.input(1, Shape(vec![Dim::Lit(K), Dim::Lit(1)]), DType::F32);
+    let a = b.input(0, Shape(vec![Dim::Const(M), Dim::Const(K)]), DType::F32);
+    let x = b.input(1, Shape(vec![Dim::Const(K), Dim::Const(1)]), DType::F32);
     let _y = super::build_binary_mul_add_contraction_ir(&mut b, a, x, M, 1, K);
 
     let mut egraph = egg::EGraph::<TensorIr, TensorAnalysis>::default();

@@ -18,5 +18,5 @@ pub use device::DeviceProfile;
 pub use lowering::LoweringOptions;
 pub use memory::{BufferRef, IndexLevel, MemTier};
 pub use scalar::{BinaryOp, DType, ReduceOp, ScalarValue, TernaryOp, UnaryOp};
-pub use shape::{Dim, Shape, Strides};
+pub use shape::{Dim, Shape, ShapeParams, Strides};
 pub use var::{VarRef, index_level_from_slot};

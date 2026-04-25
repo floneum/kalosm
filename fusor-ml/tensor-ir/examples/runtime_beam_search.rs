@@ -183,6 +183,15 @@ impl BenchmarkHarness {
         let mut pipelines = Vec::new();
         let mut bind_groups = Vec::new();
         let mut output_buffers = Vec::new();
+        let shape_params = ShapeParams::default();
+        let shape_param_words = shape_params.storage_words();
+        let shape_params_buffer =
+            self.device
+                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("shape_params"),
+                    contents: bytemuck::cast_slice(&shape_param_words),
+                    usage: wgpu::BufferUsages::STORAGE,
+                });
 
         for (dispatch_index, dispatch) in program.dispatches.iter().enumerate() {
             let pipeline = panic::catch_unwind(AssertUnwindSafe(|| {
@@ -198,8 +207,12 @@ impl BenchmarkHarness {
             }))
             .map_err(format_panic_payload)?;
 
+            let dispatch_workgroups =
+                dispatch.workgroups.eval_u32(&shape_params).ok_or_else(|| {
+                    format!("missing shape parameter for dispatch {dispatch_index} workgroups")
+                })?;
             let dispatch_elems =
-                (dispatch.workgroups * SIMD_WIDTH) as usize * dispatch.outputs.len();
+                (dispatch_workgroups * SIMD_WIDTH) as usize * dispatch.outputs.len();
             let output_elems = dispatch_elems.max(expected.len());
             let output_bytes = (output_elems * std::mem::size_of::<f32>()) as u64;
             let output_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
@@ -230,6 +243,10 @@ impl BenchmarkHarness {
             entries.push(wgpu::BindGroupEntry {
                 binding: dispatch.inputs.len() as u32,
                 resource: output_buffer.as_entire_binding(),
+            });
+            entries.push(wgpu::BindGroupEntry {
+                binding: dispatch.inputs.len() as u32 + 1,
+                resource: shape_params_buffer.as_entire_binding(),
             });
             let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some("runtime_beam_bind_group"),
@@ -308,7 +325,11 @@ impl BenchmarkHarness {
                 pass.set_bind_group(0, bind_group, &[]);
                 // Physical workgroups = virtual workgroups / simdgroups.
                 // Each physical workgroup contains `simdgroups` simdgroups.
-                let physical_workgroups = dispatch.workgroups / dispatch.simdgroups.max(1);
+                let dispatch_workgroups =
+                    dispatch.workgroups.eval_u32(&shape_params).ok_or_else(|| {
+                        format!("missing shape parameter for dispatch {dispatch_index} workgroups")
+                    })?;
+                let physical_workgroups = dispatch_workgroups.div_ceil(dispatch.simdgroups.max(1));
                 pass.dispatch_workgroups(physical_workgroups, 1, 1);
             }
             if read_back {

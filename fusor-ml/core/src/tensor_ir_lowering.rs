@@ -24,7 +24,7 @@ fn shape(dims: &[usize]) -> Result<Shape, String> {
     dims.iter()
         .map(|dim| {
             u32::try_from(*dim)
-                .map(IrDim::Lit)
+                .map(IrDim::Const)
                 .map_err(|_| format!("tensor dimension {dim} exceeds u32"))
         })
         .collect::<Result<Vec<_>, _>>()
@@ -36,7 +36,9 @@ fn strides(layout: &Layout) -> Result<Strides, String> {
         .strides()
         .iter()
         .map(|stride| {
-            i64::try_from(*stride).map_err(|_| format!("tensor stride {stride} exceeds i64"))
+            u32::try_from(*stride)
+                .map(IrDim::Const)
+                .map_err(|_| format!("tensor stride {stride} exceeds u32"))
         })
         .collect::<Result<Vec<_>, _>>()
         .map(Strides)
@@ -65,7 +67,7 @@ fn input_shape_for_restrided_view(tensor: &TensorData) -> Result<Shape, String> 
     let logical_shape = shape(tensor.layout().shape())?;
     let row_major = Strides::row_major_for_shape(&logical_shape);
     let tensor_strides = strides(tensor.layout())?;
-    if tensor.layout().offset() == 0 && row_major.as_ref() == Some(&tensor_strides) {
+    if tensor.layout().offset() == 0 && row_major == tensor_strides {
         Ok(logical_shape)
     } else {
         storage_shape(tensor)
@@ -82,14 +84,15 @@ fn add_tensor_input(
         .0
         .iter()
         .map(|dim| match dim {
-            IrDim::Lit(value) => *value as usize,
-            IrDim::Sym(_) => 0,
+            IrDim::Const(value) => *value as usize,
+            IrDim::Symbol(_) => 0,
+            _ => 0,
         })
         .collect::<Vec<_>>();
     if tensor.layout().offset() == 0 && tensor.layout().shape() == index_dims.as_slice() {
         let row_major = Strides::row_major_for_shape(index_space);
         let tensor_strides = strides(tensor.layout())?;
-        if row_major.as_ref() == Some(&tensor_strides) {
+        if row_major == tensor_strides {
             let input = builder.input(
                 input_id,
                 shape(tensor.layout().shape())?,
@@ -113,22 +116,15 @@ pub(crate) fn nary(op: &NaryOperation, inputs: &[MirValue]) -> Result<TensorIrLo
         return Ok(lowered);
     }
 
-    let mut tensors = tensor_inputs(inputs, op.inputs.len())?;
+    let tensors = tensor_inputs(inputs, op.inputs.len())?;
     let index_space = shape(&op.shape)?;
     let mut builder = TensorExprBuilder::new();
-    let mut ir_inputs = tensors
+    let ir_inputs = tensors
         .iter()
         .enumerate()
         .map(|(index, tensor)| add_tensor_input(&mut builder, index as u32, tensor, &index_space))
         .collect::<Result<Vec<_>, _>>()?;
-    let body = lower_nary_expr(
-        &mut builder,
-        &op.expression,
-        &mut tensors,
-        &mut ir_inputs,
-        &index_space,
-        &op.shape,
-    )?;
+    let body = lower_nary_expr(&mut builder, &op.expression)?;
     let root = builder.elementwise(index_space, &ir_inputs, body);
     let program = builder.build(root)?;
 
@@ -218,14 +214,7 @@ fn try_index_select_nary(
     }))
 }
 
-fn lower_nary_expr(
-    builder: &mut TensorExprBuilder,
-    expr: &NaryExpr,
-    tensors: &mut Vec<TensorData>,
-    ir_inputs: &mut Vec<ExprId>,
-    index_space: &Shape,
-    output_shape: &[usize],
-) -> Result<ExprId, String> {
+fn lower_nary_expr(builder: &mut TensorExprBuilder, expr: &NaryExpr) -> Result<ExprId, String> {
     match expr {
         NaryExpr::IndexedInput { input_idx, indices } => {
             if NaryExpr::is_elementwise_indices(indices) {
@@ -233,16 +222,7 @@ fn lower_nary_expr(
             }
             let indices = indices
                 .iter()
-                .map(|index| {
-                    lower_nary_expr(
-                        builder,
-                        index,
-                        tensors,
-                        ir_inputs,
-                        index_space,
-                        output_shape,
-                    )
-                })
+                .map(|index| lower_nary_expr(builder, index))
                 .collect::<Result<Vec<_>, _>>()?;
             Ok(builder.indexed_arg(*input_idx as u32, indices))
         }
@@ -252,26 +232,9 @@ fn lower_nary_expr(
         NaryExpr::Op { children, function } => {
             let children = children
                 .iter()
-                .map(|child| {
-                    lower_nary_expr(
-                        builder,
-                        child,
-                        tensors,
-                        ir_inputs,
-                        index_space,
-                        output_shape,
-                    )
-                })
+                .map(|child| lower_nary_expr(builder, child))
                 .collect::<Result<Vec<_>, _>>()?;
-            lower_nary_function(
-                builder,
-                function,
-                &children,
-                tensors,
-                ir_inputs,
-                index_space,
-                output_shape,
-            )
+            lower_nary_function(builder, function, &children)
         }
     }
 }
@@ -280,10 +243,6 @@ fn lower_nary_function(
     builder: &mut TensorExprBuilder,
     function: &NaryFunction,
     children: &[ExprId],
-    tensors: &mut Vec<TensorData>,
-    ir_inputs: &mut Vec<ExprId>,
-    index_space: &Shape,
-    output_shape: &[usize],
 ) -> Result<ExprId, String> {
     match (&function.kind, children) {
         (NaryFunctionKind::Unary(op), [a]) => Ok(builder.scalar_unop(*op, *a)),
@@ -304,34 +263,15 @@ fn lower_nary_function(
             },
             [a],
         ) => {
-            let constant = add_splat_input(
-                builder,
-                tensors,
-                ir_inputs,
-                index_space,
-                output_shape,
-                constant,
-                function.output_type,
-            )?;
+            let constant = builder.scalar_lit(constant.clone());
             lower_const_binop(builder, *op, *a, constant, *input_first)
         }
         (NaryFunctionKind::CompareConst { op, constant }, [a]) => {
-            let constant = add_splat_input(
-                builder,
-                tensors,
-                ir_inputs,
-                index_space,
-                output_shape,
-                constant,
-                function.output_type,
-            )?;
+            let constant = builder.scalar_lit(constant.clone());
             lower_const_compare(builder, *op, *a, constant)
         }
         (NaryFunctionKind::Cast(output_type), [a]) => {
             Ok(builder.scalar_unop(cast_op(*output_type)?, *a))
-        }
-        (NaryFunctionKind::Unsupported, [a]) => {
-            lower_named_index_function(builder, function.name(), *a, output_shape)
         }
         (kind, children) => Err(format!(
             "tensor_ir lowering got invalid arity {} for nary function {} ({kind:?})",
@@ -339,80 +279,6 @@ fn lower_nary_function(
             function.name()
         )),
     }
-}
-
-fn lower_named_index_function(
-    builder: &mut TensorExprBuilder,
-    name: &str,
-    input: ExprId,
-    output_shape: &[usize],
-) -> Result<ExprId, String> {
-    let last_dim = output_shape
-        .last()
-        .copied()
-        .ok_or_else(|| "index helper requires a non-scalar output shape".to_string())?;
-    let half = u32::try_from(last_dim / 2)
-        .map_err(|_| format!("last dimension {last_dim} exceeds u32"))?;
-    let one = builder.scalar_u32(1);
-    let two = builder.scalar_u32(2);
-    let half_lit = builder.scalar_u32(half);
-
-    Ok(match name {
-        "div2" => builder.scalar_binop(BinaryOp::Div, [input, two]),
-        "mod2" => builder.scalar_binop(BinaryOp::Mod, [input, two]),
-        "mod_half" => builder.scalar_binop(BinaryOp::Mod, [input, half_lit]),
-        "div_half" => builder.scalar_binop(BinaryOp::Div, [input, half_lit]),
-        "neighbor_interleaved_idx" => {
-            let parity = builder.scalar_binop(BinaryOp::Mod, [input, two]);
-            let zero = builder.scalar_u32(0);
-            let is_odd = builder.scalar_binop(BinaryOp::Neq, [parity, zero]);
-            let prev = builder.scalar_binop(BinaryOp::Sub, [input, one]);
-            let next = builder.scalar_binop(BinaryOp::Add, [input, one]);
-            builder.scalar_ternop(TernaryOp::Select, [is_odd, prev, next])
-        }
-        "neighbor_half_idx" => {
-            let side = builder.scalar_binop(BinaryOp::Div, [input, half_lit]);
-            let zero = builder.scalar_u32(0);
-            let is_upper_half = builder.scalar_binop(BinaryOp::Neq, [side, zero]);
-            let prev = builder.scalar_binop(BinaryOp::Sub, [input, half_lit]);
-            let next = builder.scalar_binop(BinaryOp::Add, [input, half_lit]);
-            builder.scalar_ternop(TernaryOp::Select, [is_upper_half, prev, next])
-        }
-        _ => {
-            return Err(format!(
-                "tensor_ir lowering does not support nary function {name} yet"
-            ));
-        }
-    })
-}
-
-fn add_splat_input(
-    builder: &mut TensorExprBuilder,
-    tensors: &mut Vec<TensorData>,
-    ir_inputs: &mut Vec<ExprId>,
-    index_space: &Shape,
-    output_shape: &[usize],
-    constant: &str,
-    datatype: DataTypeEnum,
-) -> Result<ExprId, String> {
-    let value = parse_f32_literal(constant)?;
-    let device = tensors
-        .first()
-        .ok_or_else(|| "constant nary op requires at least one tensor input".to_string())?
-        .device()
-        .clone();
-    let tensor = match datatype {
-        DataTypeEnum::F32 => TensorData::new_splat(&device, output_shape, value),
-        DataTypeEnum::F16 => {
-            TensorData::new_splat(&device, output_shape, half::f16::from_f32(value))
-        }
-        DataTypeEnum::U32 => TensorData::new_splat(&device, output_shape, value as u32),
-    };
-    let input_id = u32::try_from(tensors.len()).map_err(|_| "too many tensor_ir inputs")?;
-    let ir_input = add_tensor_input(builder, input_id, &tensor, index_space)?;
-    tensors.push(tensor);
-    ir_inputs.push(ir_input);
-    Ok(builder.scalar_arg(input_id))
 }
 
 fn cast_op(output_type: DataTypeEnum) -> Result<UnaryOp, String> {
@@ -446,14 +312,6 @@ fn lower_const_compare(
 ) -> Result<ExprId, String> {
     let compared = builder.scalar_binop(op, [input, constant]);
     Ok(builder.scalar_unop(UnaryOp::CastF32, compared))
-}
-
-fn parse_f32_literal(source: &str) -> Result<f32, String> {
-    source
-        .trim()
-        .trim_end_matches('f')
-        .parse::<f32>()
-        .map_err(|e| format!("could not parse f32 literal {source:?}: {e}"))
 }
 
 pub(crate) fn reduce(
@@ -742,7 +600,7 @@ pub(crate) fn resize(
     })
 }
 
-fn matmul_lhs_strides(layout: &Layout, out_shape: &[usize]) -> Result<Vec<i64>, String> {
+fn matmul_lhs_strides(layout: &Layout, out_shape: &[usize]) -> Result<Vec<IrDim>, String> {
     let rank = layout.rank();
     let mut result = Vec::with_capacity(rank + 1);
     for axis in 0..rank - 2 {
@@ -751,15 +609,21 @@ fn matmul_lhs_strides(layout: &Layout, out_shape: &[usize]) -> Result<Vec<i64>, 
         } else {
             layout.strides()[axis]
         };
-        result.push(i64::try_from(stride).map_err(|e| e.to_string())?);
+        result.push(IrDim::Const(
+            u32::try_from(stride).map_err(|e| e.to_string())?,
+        ));
     }
-    result.push(i64::try_from(layout.strides()[rank - 2]).map_err(|e| e.to_string())?);
-    result.push(0);
-    result.push(i64::try_from(layout.strides()[rank - 1]).map_err(|e| e.to_string())?);
+    result.push(IrDim::Const(
+        u32::try_from(layout.strides()[rank - 2]).map_err(|e| e.to_string())?,
+    ));
+    result.push(IrDim::Const(0));
+    result.push(IrDim::Const(
+        u32::try_from(layout.strides()[rank - 1]).map_err(|e| e.to_string())?,
+    ));
     Ok(result)
 }
 
-fn matmul_rhs_strides(layout: &Layout, out_shape: &[usize]) -> Result<Vec<i64>, String> {
+fn matmul_rhs_strides(layout: &Layout, out_shape: &[usize]) -> Result<Vec<IrDim>, String> {
     let rank = layout.rank();
     let mut result = Vec::with_capacity(rank + 1);
     for axis in 0..rank - 2 {
@@ -768,10 +632,16 @@ fn matmul_rhs_strides(layout: &Layout, out_shape: &[usize]) -> Result<Vec<i64>, 
         } else {
             layout.strides()[axis]
         };
-        result.push(i64::try_from(stride).map_err(|e| e.to_string())?);
+        result.push(IrDim::Const(
+            u32::try_from(stride).map_err(|e| e.to_string())?,
+        ));
     }
-    result.push(0);
-    result.push(i64::try_from(layout.strides()[rank - 1]).map_err(|e| e.to_string())?);
-    result.push(i64::try_from(layout.strides()[rank - 2]).map_err(|e| e.to_string())?);
+    result.push(IrDim::Const(0));
+    result.push(IrDim::Const(
+        u32::try_from(layout.strides()[rank - 1]).map_err(|e| e.to_string())?,
+    ));
+    result.push(IrDim::Const(
+        u32::try_from(layout.strides()[rank - 2]).map_err(|e| e.to_string())?,
+    ));
     Ok(result)
 }

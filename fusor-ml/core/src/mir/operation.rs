@@ -5,6 +5,8 @@ use rustc_hash::FxHashMap;
 use crate::{
     DataTypeEnum, TensorData, TensorLayoutInfo,
     compute_graph::{ComputeGraphInner, NodeIndex},
+    map_layout::MapLayoutOperation,
+    nary_wise::NaryOperation,
 };
 
 use super::inputs::MirValue;
@@ -18,6 +20,14 @@ pub(crate) trait Operation: Debug {
 
     fn output_layout(&self, _: &FxHashMap<NodeIndex, TensorLayoutInfo>) -> TensorLayoutInfo {
         todo!()
+    }
+
+    fn try_metadata_lower(&self, _: &ComputeGraphInner) -> Option<MapLayoutOperation> {
+        None
+    }
+
+    fn as_fusable_nary(&self) -> Option<&NaryOperation> {
+        None
     }
 
     fn build_tensor_ir(

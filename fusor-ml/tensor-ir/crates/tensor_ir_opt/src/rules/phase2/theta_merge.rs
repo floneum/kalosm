@@ -43,6 +43,7 @@ use crate::language::{
     DispatchNode, SimdNode, TensorIr, add_list, extract_list, try_add_value_addr_dispatch,
 };
 use crate::rules::RunnerConfig;
+use crate::types::Dim;
 pub(super) fn build(_config: &RunnerConfig) -> Rewrite<TensorIr, TensorAnalysis> {
     Rewrite::new(
         "theta-merge-reduction",
@@ -75,7 +76,7 @@ fn dispatch_is_merge_candidate(egraph: &EGraph<TensorIr, TensorAnalysis>, node: 
 
 /// Cheap view over a Dispatch's fields.
 struct DispatchView {
-    workgroups: u32,
+    workgroups: Dim,
     num_inputs: u32,
     inputs: Vec<Id>,
     output_pairs: Vec<(Id, Id)>,
@@ -109,7 +110,7 @@ impl DispatchView {
             })
             .collect();
         Some(Self {
-            workgroups: *workgroups,
+            workgroups: workgroups.clone(),
             num_inputs: *num_inputs,
             inputs,
             output_pairs,
@@ -293,5 +294,10 @@ fn build_merged_dispatch(
     // Output arity = 2 is encoded structurally: two (value, addr) pairs
     // after the input list. Readers that need the count derive it from
     // `(children.len() - num_inputs) / 2`.
-    try_add_value_addr_dispatch(egraph, primary.workgroups, primary.num_inputs, &children)
+    try_add_value_addr_dispatch(
+        egraph,
+        primary.workgroups.clone(),
+        primary.num_inputs,
+        &children,
+    )
 }

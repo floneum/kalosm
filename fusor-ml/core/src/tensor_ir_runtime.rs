@@ -1,7 +1,7 @@
 use std::{collections::HashMap, sync::Arc};
 
 use tensor_ir::{
-    DType, DispatchProgram, LoweringOptions, SimdProgram, StageConfig, StagedPipeline,
+    DType, DispatchProgram, ShapeParams, SimdProgram, StageConfig, StagedPipeline,
     TensorExprProgram, TensorIr, lower_dispatch_program, module_to_wgsl, verify,
 };
 use wgpu::{Buffer, CommandEncoder, ComputePipeline};
@@ -81,6 +81,12 @@ pub(crate) fn execute(
 
     let mut produced_buffers: HashMap<egg::Id, Arc<Buffer>> = HashMap::default();
     let mut final_output = None;
+    let shape_params = ShapeParams::default();
+    let shape_param_words = shape_params.storage_words();
+    let shape_params_buffer = device.create_buffer_init(
+        bytemuck::cast_slice(&shape_param_words),
+        wgpu::BufferUsages::STORAGE,
+    );
 
     for (dispatch_index, dispatch) in program.dispatches.iter().enumerate() {
         let pipeline =
@@ -96,16 +102,19 @@ pub(crate) fn execute(
                 });
 
         let dispatch_datatype = dispatch_output_datatype(program, dispatch_index)?;
+        let dispatch_workgroups = dispatch.workgroups.eval_u32(&shape_params).ok_or_else(|| {
+            "fusor tensor_ir runtime is missing shape parameters for dynamic workgroups".to_string()
+        })?;
         let output_buffer = if dispatch_index + 1 == program.dispatches.len() {
             let required_elems =
-                (dispatch.workgroups * program.device.simd_width) as usize * dispatch.outputs.len();
+                (dispatch_workgroups * program.device.simd_width) as usize * dispatch.outputs.len();
             let shape_elems = output_shape.iter().product::<usize>();
             TensorData::new_for_shape(device, &[required_elems.max(shape_elems)], output_datatype)
                 .buffer()
                 .clone()
         } else {
             let output_elems =
-                (dispatch.workgroups * program.device.simd_width) as usize * dispatch.outputs.len();
+                (dispatch_workgroups * program.device.simd_width) as usize * dispatch.outputs.len();
             TensorData::new_for_shape(device, &[output_elems], dispatch_datatype)
                 .buffer()
                 .clone()
@@ -119,6 +128,7 @@ pub(crate) fn execute(
             &pipeline,
             dispatch_index,
             output_buffer.clone(),
+            shape_params_buffer.as_ref(),
         )?;
 
         {
@@ -128,7 +138,7 @@ pub(crate) fn execute(
             });
             pass.set_pipeline(&pipeline);
             pass.set_bind_group(0, &bind_group, &[]);
-            let physical_workgroups = dispatch.workgroups / dispatch.simdgroups.max(1);
+            let physical_workgroups = dispatch_workgroups.div_ceil(dispatch.simdgroups.max(1));
             let (x, y, z) = dispatch_grid(physical_workgroups);
             pass.dispatch_workgroups(x, y, z);
         }
@@ -157,12 +167,7 @@ fn lower_valid_simd_program(
     expr: &TensorExprProgram,
     output_datatype: DataTypeEnum,
 ) -> Result<(SimdProgram, String), tensor_ir::LoweringError> {
-    let (kernel, report) = lower_with_report(pipeline, expr)?;
     let mut errors = Vec::new();
-    match compile_valid_candidate(pipeline, kernel, output_datatype) {
-        Ok(compiled) => return Ok(compiled),
-        Err(error) => errors.push(error),
-    }
 
     match pipeline.lower_candidates(expr, 16) {
         Ok(candidates) => {
@@ -176,33 +181,9 @@ fn lower_valid_simd_program(
         Err(error) => errors.push(error),
     }
 
-    let mut fallback_config = pipeline.config().clone();
-    fallback_config.runner.lowering = LoweringOptions::readable();
-    fallback_config.runner.iter_limit = 1;
-    let fallback = StagedPipeline::new(fallback_config);
-    if fallback.config().runner.lowering != pipeline.config().runner.lowering {
-        match lower_with_report(&fallback, expr) {
-            Ok((candidate, _)) => {
-                match compile_valid_candidate(&fallback, candidate, output_datatype) {
-                    Ok(compiled) => return Ok(compiled),
-                    Err(error) => errors.push(error),
-                }
-            }
-            Err(error) => errors.push(error.message),
-        }
-        match fallback.lower_candidates(expr, 16) {
-            Ok(candidates) => {
-                for candidate in candidates {
-                    match compile_valid_candidate(&fallback, candidate, output_datatype) {
-                        Ok(compiled) => return Ok(compiled),
-                        Err(error) => errors.push(error),
-                    }
-                }
-            }
-            Err(error) => errors.push(error),
-        }
-    }
-
+    let report = lower_with_report(pipeline, expr)
+        .map(|(_, report)| report)
+        .unwrap_or_else(|error| error.report);
     let message = format!(
         "no tensor_ir candidate produced a valid WGSL shader: {}",
         errors
@@ -326,6 +307,7 @@ fn create_bind_group(
     pipeline: &ComputePipeline,
     dispatch_index: usize,
     output_buffer: Arc<Buffer>,
+    shape_params_buffer: &Buffer,
 ) -> Result<wgpu::BindGroup, String> {
     let dispatch = &program.dispatches[dispatch_index];
     let input_buffers = dispatch
@@ -344,6 +326,10 @@ fn create_bind_group(
     entries.push(wgpu::BindGroupEntry {
         binding: dispatch.inputs.len() as u32,
         resource: output_buffer.as_entire_binding(),
+    });
+    entries.push(wgpu::BindGroupEntry {
+        binding: dispatch.inputs.len() as u32 + 1,
+        resource: shape_params_buffer.as_entire_binding(),
     });
 
     Ok(device

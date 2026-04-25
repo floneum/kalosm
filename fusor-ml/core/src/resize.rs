@@ -1,5 +1,5 @@
 use crate::{
-    Layout, SmallerRank, Tensor, TensorData, compute_graph::NodeIndex,
+    Layout, SmallerRank, Tensor, TensorData, TensorLayoutInfo, compute_graph::NodeIndex,
     map_layout::MapLayoutOperation, mir::operation::Operation,
 };
 
@@ -122,6 +122,24 @@ impl Operation for ResizeOperation {
                 .collect::<Vec<_>>()
                 .join("x")
         )
+    }
+
+    fn output_layout(
+        &self,
+        layouts: &rustc_hash::FxHashMap<NodeIndex, TensorLayoutInfo>,
+    ) -> TensorLayoutInfo {
+        let datatype = layouts
+            .get(&self.input)
+            .expect("resize input layout is available")
+            .datatype();
+        TensorLayoutInfo::new(Layout::contiguous(&self.new_shape), datatype)
+    }
+
+    fn try_metadata_lower(
+        &self,
+        graph: &crate::compute_graph::ComputeGraphInner,
+    ) -> Option<MapLayoutOperation> {
+        self.lower(graph)
     }
 
     fn build_tensor_ir(

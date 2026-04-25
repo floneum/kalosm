@@ -8,7 +8,11 @@ const COLS: u32 = 64;
 
 fn main() {
     let mut builder = TensorExprBuilder::new();
-    let a = builder.input(0, Shape(vec![Dim::Lit(ROWS), Dim::Lit(COLS)]), DType::F32);
+    let a = builder.input(
+        0,
+        Shape(vec![Dim::Const(ROWS), Dim::Const(COLS)]),
+        DType::F32,
+    );
     let reduce = builder.reduce(a, 1, ReduceOp::Add);
     let expr = builder.build(reduce).expect("valid tensor expression");
 

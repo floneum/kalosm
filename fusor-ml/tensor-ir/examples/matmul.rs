@@ -9,16 +9,22 @@ const K: u32 = 64;
 
 fn main() {
     let mut builder = TensorExprBuilder::new();
-    let a = builder.input(0, Shape(vec![Dim::Lit(M), Dim::Lit(K)]), DType::F32);
-    let b = builder.input(1, Shape(vec![Dim::Lit(K), Dim::Lit(N)]), DType::F32);
+    let a = builder.input(0, Shape(vec![Dim::Const(M), Dim::Const(K)]), DType::F32);
+    let b = builder.input(1, Shape(vec![Dim::Const(K), Dim::Const(N)]), DType::F32);
     let arg0 = builder.scalar_arg(0);
     let arg1 = builder.scalar_arg(1);
     let body = builder.scalar_binop(BinaryOp::Mul, [arg0, arg1]);
     let matmul = builder.contraction(
-        Shape(vec![Dim::Lit(M), Dim::Lit(N), Dim::Lit(K)]),
+        Shape(vec![Dim::Const(M), Dim::Const(N), Dim::Const(K)]),
         &[
-            (a, Strides(vec![i64::from(K), 0, 1])),
-            (b, Strides(vec![0, 1, i64::from(N)])),
+            (
+                a,
+                Strides(vec![Dim::Const(K), Dim::Const(0), Dim::Const(1)]),
+            ),
+            (
+                b,
+                Strides(vec![Dim::Const(0), Dim::Const(1), Dim::Const(N)]),
+            ),
         ],
         body,
         &[(2, ReduceOp::Add)],

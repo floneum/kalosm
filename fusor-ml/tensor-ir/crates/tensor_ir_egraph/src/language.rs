@@ -3,8 +3,8 @@ use std::{collections::HashSet, fmt};
 use egg::{Id, Language};
 
 use crate::types::{
-    BinaryOp, BinderInfo, BinderKind, BufferRef, DType, HasBinder, MemTier, ReduceOp, ScalarValue,
-    Shape, Strides, TernaryOp, UnaryOp, VarRef,
+    BinaryOp, BinderInfo, BinderKind, BufferRef, DType, Dim, HasBinder, MemTier, ReduceOp,
+    ScalarValue, Shape, Strides, TernaryOp, UnaryOp, VarRef,
 };
 
 /// Domain-specific nodes for high-level tensor operations.
@@ -53,7 +53,7 @@ pub enum DispatchNode {
     /// (contains a nested Theta chain) is read from analysis data
     /// (`TensorData::contains_theta`) instead of stored as a tag.
     Dispatch {
-        workgroups: u32,
+        workgroups: Dim,
         num_inputs: u32,
         children_list: Id,
     },
@@ -117,6 +117,7 @@ pub enum TensorIr {
     UnOp(UnaryOp, Id),
     TernOp(TernaryOp, [Id; 3]),
     Const(ScalarValue),
+    ShapeParam(u32),
 
     // Structural List (for representing arrays of items cleanly)
     Nil,
@@ -306,6 +307,7 @@ impl Language for TensorIr {
             (Self::UnOp(a_op, _), Self::UnOp(b_op, _)) => a_op == b_op,
             (Self::TernOp(a_op, _), Self::TernOp(b_op, _)) => a_op == b_op,
             (Self::Const(a_v), Self::Const(b_v)) => a_v == b_v,
+            (Self::ShapeParam(a), Self::ShapeParam(b)) => a == b,
             (Self::Nil, Self::Nil) | (Self::Cons(_), Self::Cons(_)) => true,
             _ => false,
         }
@@ -328,7 +330,7 @@ impl Language for TensorIr {
             Self::BinOp(_, ids) | Self::Cons(ids) => ids,
             Self::UnOp(_, id) => std::slice::from_ref(id),
             Self::TernOp(_, ids) => ids,
-            Self::Const(_) | Self::Nil => &[],
+            Self::Const(_) | Self::ShapeParam(_) | Self::Nil => &[],
         }
     }
 
@@ -349,7 +351,7 @@ impl Language for TensorIr {
             Self::BinOp(_, ids) | Self::Cons(ids) => ids,
             Self::UnOp(_, id) => std::slice::from_mut(id),
             Self::TernOp(_, ids) => ids,
-            Self::Const(_) | Self::Nil => &mut [],
+            Self::Const(_) | Self::ShapeParam(_) | Self::Nil => &mut [],
         }
     }
 }
@@ -444,7 +446,7 @@ pub fn dispatch_children_have_unique_output_addrs<A: egg::Analysis<TensorIr>>(
 /// output addresses would create ambiguous stores and are rejected here.
 pub fn try_add_value_addr_dispatch<A: egg::Analysis<TensorIr>>(
     egraph: &mut egg::EGraph<TensorIr, A>,
-    workgroups: u32,
+    workgroups: impl Into<Dim>,
     num_inputs: u32,
     children: &[Id],
 ) -> Option<Id> {
@@ -453,7 +455,7 @@ pub fn try_add_value_addr_dispatch<A: egg::Analysis<TensorIr>>(
     }
     let children_list = add_list(egraph, children);
     Some(egraph.add(TensorIr::Dispatch(DispatchNode::Dispatch {
-        workgroups,
+        workgroups: workgroups.into(),
         num_inputs,
         children_list,
     })))
@@ -518,6 +520,7 @@ impl fmt::Display for TensorIr {
             Self::UnOp(op, _) => write!(f, "{op}"),
             Self::TernOp(op, _) => write!(f, "{op}"),
             Self::Const(v) => write!(f, "{v}"),
+            Self::ShapeParam(index) => write!(f, "ShapeParam({index})"),
             Self::Nil => write!(f, "Nil"),
             Self::Cons(_) => write!(f, "::"),
         }

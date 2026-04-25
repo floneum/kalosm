@@ -8,7 +8,7 @@ use naga::{
 
 use crate::language::{DispatchNode, SimdNode, TensorIr, extract_list};
 use crate::types::{
-    BinaryOp, BinderKind, DType, IndexLevel, MemTier, ScalarValue, TernaryOp, UnaryOp, VarRef,
+    BinaryOp, BinderKind, DType, Dim, IndexLevel, MemTier, ScalarValue, TernaryOp, UnaryOp, VarRef,
     slots,
 };
 
@@ -243,6 +243,7 @@ impl CodegenCtx<'_> {
 
             // ── Literals ──
             TensorIr::Const(v) => self.lower_scalar_literal(v),
+            TensorIr::ShapeParam(index) => self.lower_shape_param(*index),
 
             // ── Variables ──
             TensorIr::Simd(SimdNode::Var(var)) => {
@@ -329,6 +330,67 @@ impl CodegenCtx<'_> {
             ScalarValue::Bool(b) => Literal::Bool(*b),
         };
         self.emit_literal(lit)
+    }
+
+    pub(super) fn lower_shape_param(&mut self, index: u32) -> Handle<Expression> {
+        let gv = self.expressions.append(
+            Expression::GlobalVariable(self.shape_params_gv),
+            Span::UNDEFINED,
+        );
+        let index = self.emit_literal(Literal::U32(index));
+        let ptr = self.emit_access(gv, index);
+        self.emit_load(ptr)
+    }
+
+    pub(super) fn lower_dim(&mut self, dim: &Dim) -> Handle<Expression> {
+        match dim {
+            Dim::Const(value) => self.emit_literal(Literal::U32(*value)),
+            Dim::Symbol(index) => self.lower_shape_param(*index),
+            Dim::Add(lhs, rhs) => {
+                let lhs = self.lower_dim(lhs);
+                let rhs = self.lower_dim(rhs);
+                self.emit_binary(BinaryOperator::Add, lhs, rhs)
+            }
+            Dim::Sub(lhs, rhs) => {
+                let lhs = self.lower_dim(lhs);
+                let rhs = self.lower_dim(rhs);
+                self.emit_binary(BinaryOperator::Subtract, lhs, rhs)
+            }
+            Dim::Mul(lhs, rhs) => {
+                let lhs = self.lower_dim(lhs);
+                let rhs = self.lower_dim(rhs);
+                self.emit_binary(BinaryOperator::Multiply, lhs, rhs)
+            }
+            Dim::Div(lhs, rhs) => {
+                let lhs = self.lower_dim(lhs);
+                let rhs = self.lower_dim(rhs);
+                self.emit_binary(BinaryOperator::Divide, lhs, rhs)
+            }
+            Dim::Mod(lhs, rhs) => {
+                let lhs = self.lower_dim(lhs);
+                let rhs = self.lower_dim(rhs);
+                self.emit_binary(BinaryOperator::Modulo, lhs, rhs)
+            }
+            Dim::CeilDiv(lhs, rhs) => {
+                let lhs = self.lower_dim(lhs);
+                let rhs = self.lower_dim(rhs);
+                let one = self.emit_literal(Literal::U32(1));
+                let numerator = self.emit_binary(BinaryOperator::Add, lhs, rhs);
+                let numerator = self.emit_binary(BinaryOperator::Subtract, numerator, one);
+                let quotient = self.emit_binary(BinaryOperator::Divide, numerator, rhs);
+                quotient
+            }
+            Dim::Min(lhs, rhs) => {
+                let lhs = self.lower_dim(lhs);
+                let rhs = self.lower_dim(rhs);
+                self.emit_math2(MathFunction::Min, lhs, rhs)
+            }
+            Dim::Max(lhs, rhs) => {
+                let lhs = self.lower_dim(lhs);
+                let rhs = self.lower_dim(rhs);
+                self.emit_math2(MathFunction::Max, lhs, rhs)
+            }
+        }
     }
 
     pub(super) fn lower_index(&mut self, level: IndexLevel) -> Handle<Expression> {

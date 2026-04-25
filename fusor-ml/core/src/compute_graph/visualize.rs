@@ -2,7 +2,6 @@ use rustc_hash::FxHashMap;
 
 use super::queue::ComputeQueue;
 use super::{ComputeGraphInner, ComputeGraphNodeVariant, NodeIndex, layout_pass};
-use crate::mir::operation::Operation;
 use tabbycat::Graph;
 use tabbycat::{Edge, GraphBuilder, GraphType, Identity, Stmt, StmtList};
 
@@ -15,23 +14,6 @@ struct GraphVisPass {
 }
 
 impl GraphVisPass {
-    fn visit_tensor_expr(&mut self, key: NodeIndex, operation: &crate::TensorExprOperation) {
-        let output_layout = self.layout_pass.output_layout.get(&key).unwrap();
-        let id = Identity::quoted(format!("tensor_expr ({}) #{:?}", output_layout, key));
-        self.statements.push(Stmt::Node {
-            id: id.clone(),
-            port: None,
-            attr: None,
-        });
-        operation.visit_dependencies(&mut |input| {
-            let input_id = self.identities.get(&input).unwrap();
-            self.statements.push(Stmt::Edge(
-                Edge::head_node(input_id.clone(), None).arrow_to_node(id.clone(), None),
-            ));
-        });
-        self.identities.insert(key, id.clone());
-    }
-
     fn visit_map_layout(
         &mut self,
         key: NodeIndex,
@@ -126,9 +108,6 @@ impl ComputeGraphInner {
 
             let node_data = self.nodes.nodes.node_weight(node).expect("Node not found");
             match &node_data.variant {
-                ComputeGraphNodeVariant::TensorExpr(op) => {
-                    graph_vis_pass.visit_tensor_expr(node, op)
-                }
                 ComputeGraphNodeVariant::MapLayout(op) => graph_vis_pass.visit_map_layout(node, op),
                 ComputeGraphNodeVariant::Tensor(op) => graph_vis_pass.visit_tensor(node, op),
                 ComputeGraphNodeVariant::Custom(op) => graph_vis_pass.visit_custom(node, op),

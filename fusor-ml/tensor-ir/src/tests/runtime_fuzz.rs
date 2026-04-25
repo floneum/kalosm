@@ -6,7 +6,7 @@ use crate::extractor::BeamConfig;
 use crate::language::TensorIr;
 use crate::rules::{self, Phase, RunnerConfig, SaturationReport};
 use crate::skeleton::{beam_extract_valid_candidates, build_dispatch_program_from_extracted};
-use crate::types::{DType, DeviceProfile, Dim, LoweringOptions, Shape};
+use crate::types::{DType, DeviceProfile, Dim, LoweringOptions, Shape, ShapeParams};
 
 #[derive(Clone, Copy, Debug)]
 struct MatmulCase {
@@ -61,12 +61,12 @@ fn matmul_candidates(
     let mut builder = crate::IrBuilder::new();
     let lhs = builder.input(
         0,
-        Shape(vec![Dim::Lit(case.m), Dim::Lit(case.k)]),
+        Shape(vec![Dim::Const(case.m), Dim::Const(case.k)]),
         DType::F32,
     );
     let rhs = builder.input(
         1,
-        Shape(vec![Dim::Lit(case.k), Dim::Lit(case.n)]),
+        Shape(vec![Dim::Const(case.k), Dim::Const(case.n)]),
         DType::F32,
     );
     super::build_binary_mul_add_contraction_ir(&mut builder, lhs, rhs, case.m, case.n, case.k);
@@ -188,11 +188,12 @@ fn run_matmul_candidate_fuzz() {
                 !program.dispatches.is_empty(),
                 "candidate {candidate_index} for {case:?} had no runnable dispatches"
             );
-            let gpu_output =
-                panic::catch_unwind(AssertUnwindSafe(|| ctx.execute(&program, &inputs)))
-                    .unwrap_or_else(|_| {
-                        panic!("candidate {candidate_index} for {case:?} panicked while running")
-                    });
+            let gpu_output = panic::catch_unwind(AssertUnwindSafe(|| {
+                ctx.execute(&program, &inputs, &ShapeParams::default())
+            }))
+            .unwrap_or_else(|_| {
+                panic!("candidate {candidate_index} for {case:?} panicked while running")
+            });
 
             assert!(
                 gpu_output.len() >= expected.len(),

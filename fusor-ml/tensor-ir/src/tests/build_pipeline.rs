@@ -16,10 +16,10 @@ use egg::Language;
 #[test]
 fn test_build_elementwise() {
     let mut b = IrBuilder::new();
-    let a = b.input(0, Shape(vec![Dim::Lit(64), Dim::Lit(128)]), DType::F32);
+    let a = b.input(0, Shape(vec![Dim::Const(64), Dim::Const(128)]), DType::F32);
     let arg0 = b.scalar_arg(0);
     let body = b.un_op(UnaryOp::Exp, arg0);
-    let _ewise = b.elementwise(Shape(vec![Dim::Lit(64), Dim::Lit(128)]), &[a], body);
+    let _ewise = b.elementwise(Shape(vec![Dim::Const(64), Dim::Const(128)]), &[a], body);
 
     let mut egraph = egg::EGraph::<TensorIr, TensorAnalysis>::default();
     let _root = egraph.add_expr(&b.expr);
@@ -30,8 +30,8 @@ fn test_build_elementwise() {
 #[test]
 fn test_build_matmul() {
     let mut b = IrBuilder::new();
-    let a = b.input(0, Shape(vec![Dim::Lit(64), Dim::Lit(128)]), DType::F32);
-    let b_input = b.input(1, Shape(vec![Dim::Lit(128), Dim::Lit(256)]), DType::F32);
+    let a = b.input(0, Shape(vec![Dim::Const(64), Dim::Const(128)]), DType::F32);
+    let b_input = b.input(1, Shape(vec![Dim::Const(128), Dim::Const(256)]), DType::F32);
     let _mm = super::build_binary_mul_add_contraction_ir(&mut b, a, b_input, 64, 256, 128);
 
     let mut egraph = egg::EGraph::<TensorIr, TensorAnalysis>::default();
@@ -49,15 +49,15 @@ fn test_build_matmul() {
 #[test]
 fn test_tensor_expr_summary_tracks_lowering_inputs() {
     let mut b = TensorExprBuilder::new();
-    let a = b.input(0, Shape(vec![Dim::Lit(64), Dim::Lit(128)]), DType::F32);
-    let b_in = b.input(1, Shape(vec![Dim::Lit(128), Dim::Lit(256)]), DType::F32);
+    let a = b.input(0, Shape(vec![Dim::Const(64), Dim::Const(128)]), DType::F32);
+    let b_in = b.input(1, Shape(vec![Dim::Const(128), Dim::Const(256)]), DType::F32);
     let mm = super::build_binary_mul_add_contraction_expr(&mut b, a, b_in, 64, 256, 128);
     let expr = b.build(mm).expect("valid tensor expr");
 
     let summary = expr.summary().expect("summary");
     assert_eq!(
         summary.output_shape,
-        Some(Shape(vec![Dim::Lit(64), Dim::Lit(256)]))
+        Some(Shape(vec![Dim::Const(64), Dim::Const(256)]))
     );
     assert_eq!(summary.input_count, 2);
     assert!(summary.has_reduce);
@@ -67,12 +67,12 @@ fn test_tensor_expr_summary_tracks_lowering_inputs() {
 #[test]
 fn test_special_tensor_builders_expand_to_canonical_elementwise() {
     let mut b = TensorExprBuilder::new();
-    let input = b.input(0, Shape(vec![Dim::Lit(8), Dim::Lit(8)]), DType::F32);
-    let value = b.input(1, Shape(vec![Dim::Lit(4), Dim::Lit(3)]), DType::F32);
+    let input = b.input(0, Shape(vec![Dim::Const(8), Dim::Const(8)]), DType::F32);
+    let value = b.input(1, Shape(vec![Dim::Const(4), Dim::Const(3)]), DType::F32);
     let root = b.slice_assign(
         input,
         value,
-        Shape(vec![Dim::Lit(8), Dim::Lit(8)]),
+        Shape(vec![Dim::Const(8), Dim::Const(8)]),
         vec![(2, 6), (1, 4)],
     );
     let expr = b.build(root).expect("valid canonical slice_assign");
@@ -82,9 +82,9 @@ fn test_special_tensor_builders_expand_to_canonical_elementwise() {
     ));
 
     let mut b = TensorExprBuilder::new();
-    let input = b.input(0, Shape(vec![Dim::Lit(8), Dim::Lit(8)]), DType::F32);
-    let indices = b.input(1, Shape(vec![Dim::Lit(4)]), DType::U32);
-    let root = b.index_select(input, indices, Shape(vec![Dim::Lit(8), Dim::Lit(4)]), 1);
+    let input = b.input(0, Shape(vec![Dim::Const(8), Dim::Const(8)]), DType::F32);
+    let indices = b.input(1, Shape(vec![Dim::Const(4)]), DType::U32);
+    let root = b.index_select(input, indices, Shape(vec![Dim::Const(8), Dim::Const(4)]), 1);
     let expr = b.build(root).expect("valid canonical index_select");
     assert!(matches!(
         expr.node(expr.root()),
@@ -92,11 +92,11 @@ fn test_special_tensor_builders_expand_to_canonical_elementwise() {
     ));
 
     let mut b = TensorExprBuilder::new();
-    let input = b.input(0, Shape(vec![Dim::Lit(4), Dim::Lit(4)]), DType::F32);
+    let input = b.input(0, Shape(vec![Dim::Const(4), Dim::Const(4)]), DType::F32);
     let root = b.resize(
         input,
-        Shape(vec![Dim::Lit(4), Dim::Lit(4)]),
-        Shape(vec![Dim::Lit(6), Dim::Lit(6)]),
+        Shape(vec![Dim::Const(4), Dim::Const(4)]),
+        Shape(vec![Dim::Const(6), Dim::Const(6)]),
     );
     let expr = b.build(root).expect("valid canonical resize");
     assert!(matches!(
@@ -108,9 +108,14 @@ fn test_special_tensor_builders_expand_to_canonical_elementwise() {
 #[test]
 fn test_elementwise_indexed_input_can_have_different_shape() {
     let mut b = TensorExprBuilder::new();
-    let input = b.input(0, Shape(vec![Dim::Lit(32), Dim::Lit(16)]), DType::F32);
-    let indices = b.input(1, Shape(vec![Dim::Lit(8)]), DType::U32);
-    let root = b.index_select(input, indices, Shape(vec![Dim::Lit(32), Dim::Lit(8)]), 1);
+    let input = b.input(0, Shape(vec![Dim::Const(32), Dim::Const(16)]), DType::F32);
+    let indices = b.input(1, Shape(vec![Dim::Const(8)]), DType::U32);
+    let root = b.index_select(
+        input,
+        indices,
+        Shape(vec![Dim::Const(32), Dim::Const(8)]),
+        1,
+    );
     let expr = b.build(root).expect("valid indexed elementwise");
 
     let mut config = StageConfig::default();
@@ -122,8 +127,8 @@ fn test_elementwise_indexed_input_can_have_different_shape() {
 #[test]
 fn test_staged_pipeline_produces_kernel_without_high_level_ops() {
     let mut b = TensorExprBuilder::new();
-    let a = b.input(0, Shape(vec![Dim::Lit(64), Dim::Lit(64)]), DType::F32);
-    let b_in = b.input(1, Shape(vec![Dim::Lit(64), Dim::Lit(64)]), DType::F32);
+    let a = b.input(0, Shape(vec![Dim::Const(64), Dim::Const(64)]), DType::F32);
+    let b_in = b.input(1, Shape(vec![Dim::Const(64), Dim::Const(64)]), DType::F32);
     let mm = super::build_binary_mul_add_contraction_expr(&mut b, a, b_in, 64, 64, 64);
     let expr = b.build(mm).expect("valid tensor expr");
 
@@ -148,10 +153,10 @@ fn test_staged_pipeline_produces_kernel_without_high_level_ops() {
 #[test]
 fn test_lower_tensor_expr_with_report_records_phase_and_candidate_stats() {
     let mut b = TensorExprBuilder::new();
-    let a = b.input(0, Shape(vec![Dim::Lit(128)]), DType::F32);
+    let a = b.input(0, Shape(vec![Dim::Const(128)]), DType::F32);
     let arg = b.scalar_arg(0);
     let body = b.scalar_unop(UnaryOp::Exp, arg);
-    let root = b.elementwise(Shape(vec![Dim::Lit(128)]), &[a], body);
+    let root = b.elementwise(Shape(vec![Dim::Const(128)]), &[a], body);
     let expr = b.build(root).expect("valid tensor expr");
 
     let mut config = StageConfig::default();
@@ -189,24 +194,24 @@ fn test_scalar_lane_3d_elementwise_lowering() {
     let mut b = TensorExprBuilder::new();
     let a = b.input(
         0,
-        Shape(vec![Dim::Lit(3), Dim::Lit(16), Dim::Lit(16)]),
+        Shape(vec![Dim::Const(3), Dim::Const(16), Dim::Const(16)]),
         DType::F32,
     );
     let c = b.input(
         1,
-        Shape(vec![Dim::Lit(3), Dim::Lit(16), Dim::Lit(16)]),
+        Shape(vec![Dim::Const(3), Dim::Const(16), Dim::Const(16)]),
         DType::F32,
     );
     let c = b.restride(
         c,
-        Shape(vec![Dim::Lit(3), Dim::Lit(16), Dim::Lit(16)]),
-        Strides(vec![0, 0, 0]),
+        Shape(vec![Dim::Const(3), Dim::Const(16), Dim::Const(16)]),
+        Strides(vec![Dim::Const(0), Dim::Const(0), Dim::Const(0)]),
     );
     let arg0 = b.scalar_arg(0);
     let arg1 = b.scalar_arg(1);
     let body = b.scalar_binop(BinaryOp::Mul, [arg0, arg1]);
     let root = b.elementwise(
-        Shape(vec![Dim::Lit(3), Dim::Lit(16), Dim::Lit(16)]),
+        Shape(vec![Dim::Const(3), Dim::Const(16), Dim::Const(16)]),
         &[a, c],
         body,
     );
@@ -220,7 +225,7 @@ fn test_scalar_lane_3d_elementwise_lowering() {
 #[test]
 fn test_lower_tensor_expr_error_carries_partial_report() {
     let mut b = TensorExprBuilder::new();
-    let root = b.input(0, Shape(vec![Dim::Lit(4)]), DType::I32);
+    let root = b.input(0, Shape(vec![Dim::Const(4)]), DType::I32);
     let expr = b.build(root).expect("valid tensor expr");
 
     let err = lower_tensor_expr_with_report(&expr, &StageConfig::default())
@@ -236,7 +241,7 @@ fn test_lower_tensor_expr_error_carries_partial_report() {
 #[test]
 fn test_lower_tensor_expr_rejects_non_f32_tensor_inputs() {
     let mut b = TensorExprBuilder::new();
-    let root = b.input(0, Shape(vec![Dim::Lit(64)]), DType::I32);
+    let root = b.input(0, Shape(vec![Dim::Const(64)]), DType::I32);
     let expr = b.build(root).expect("valid tensor expr");
 
     let pipeline = StagedPipeline::default();
@@ -250,10 +255,10 @@ fn test_lower_tensor_expr_rejects_non_f32_tensor_inputs() {
 #[test]
 fn test_lower_tensor_expr_errors_when_no_executable_rewrite_candidate_exists() {
     let mut b = TensorExprBuilder::new();
-    let a = b.input(0, Shape(vec![Dim::Lit(64)]), DType::F32);
+    let a = b.input(0, Shape(vec![Dim::Const(64)]), DType::F32);
     let arg0 = b.scalar_arg(0);
     let body = b.scalar_unop(UnaryOp::Exp, arg0);
-    let ewise = b.elementwise(Shape(vec![Dim::Lit(64)]), &[a], body);
+    let ewise = b.elementwise(Shape(vec![Dim::Const(64)]), &[a], body);
     let expr = b.build(ewise).expect("valid tensor expr");
 
     let mut config = StageConfig::default();
@@ -279,8 +284,8 @@ fn test_lower_tensor_expr_errors_when_no_executable_rewrite_candidate_exists() {
 #[test]
 fn test_device_budget_constrains_lowering() {
     let mut b = TensorExprBuilder::new();
-    let a = b.input(0, Shape(vec![Dim::Lit(64), Dim::Lit(64)]), DType::F32);
-    let b_in = b.input(1, Shape(vec![Dim::Lit(64), Dim::Lit(64)]), DType::F32);
+    let a = b.input(0, Shape(vec![Dim::Const(64), Dim::Const(64)]), DType::F32);
+    let b_in = b.input(1, Shape(vec![Dim::Const(64), Dim::Const(64)]), DType::F32);
     let mm = super::build_binary_mul_add_contraction_expr(&mut b, a, b_in, 64, 64, 64);
     let expr = b.build(mm).expect("valid tensor expr");
 
@@ -327,7 +332,7 @@ fn test_device_budget_constrains_lowering() {
 #[test]
 fn test_build_softmax() {
     let mut b = IrBuilder::new();
-    let shape = Shape(vec![Dim::Lit(32), Dim::Lit(128)]);
+    let shape = Shape(vec![Dim::Const(32), Dim::Const(128)]);
     let x = b.input(0, shape.clone(), DType::F32);
     let _sm = b.softmax(x, shape, 1);
 
@@ -342,7 +347,11 @@ fn test_composite_dispatch_analysis_marks_generic_nested_reduce_tree() {
     let cols = 64u32;
 
     let mut b = IrBuilder::new();
-    let x = b.input(0, Shape(vec![Dim::Lit(rows), Dim::Lit(cols)]), DType::F32);
+    let x = b.input(
+        0,
+        Shape(vec![Dim::Const(rows), Dim::Const(cols)]),
+        DType::F32,
+    );
     let _expr = super::build_centered_row_sum_ir(&mut b, x, rows, cols);
 
     let mut egraph = egg::EGraph::<TensorIr, TensorAnalysis>::default();
@@ -396,13 +405,16 @@ fn test_shape_propagation() {
 
     let input = egraph.add(TensorIr::HighLevel(HighLevelNode::Input {
         id: 0,
-        shape: Shape(vec![Dim::Lit(64), Dim::Lit(128)]),
+        shape: Shape(vec![Dim::Const(64), Dim::Const(128)]),
         dtype: DType::F32,
     }));
     egraph.rebuild();
 
     let data = &egraph[input].data;
-    assert_eq!(data.shape, Some(Shape(vec![Dim::Lit(64), Dim::Lit(128)])));
+    assert_eq!(
+        data.shape,
+        Some(Shape(vec![Dim::Const(64), Dim::Const(128)]))
+    );
     assert_eq!(data.dtype, Some(DType::F32));
 }
 
@@ -423,10 +435,10 @@ fn test_constant_folding() {
 #[test]
 fn test_greedy_extraction() {
     let mut b = IrBuilder::new();
-    let a = b.input(0, Shape(vec![Dim::Lit(32)]), DType::F32);
+    let a = b.input(0, Shape(vec![Dim::Const(32)]), DType::F32);
     let arg0 = b.scalar_arg(0);
     let body = b.un_op(UnaryOp::Exp, arg0);
-    let _ewise = b.elementwise(Shape(vec![Dim::Lit(32)]), &[a], body);
+    let _ewise = b.elementwise(Shape(vec![Dim::Const(32)]), &[a], body);
 
     let mut egraph = egg::EGraph::<TensorIr, TensorAnalysis>::default();
     let root = egraph.add_expr(&b.expr);
@@ -441,10 +453,10 @@ fn test_greedy_extraction() {
 #[test]
 fn test_beam_extraction() {
     let mut b = IrBuilder::new();
-    let a = b.input(0, Shape(vec![Dim::Lit(32)]), DType::F32);
+    let a = b.input(0, Shape(vec![Dim::Const(32)]), DType::F32);
     let arg0 = b.scalar_arg(0);
     let body = b.un_op(UnaryOp::Exp, arg0);
-    let _ewise = b.elementwise(Shape(vec![Dim::Lit(32)]), &[a], body);
+    let _ewise = b.elementwise(Shape(vec![Dim::Const(32)]), &[a], body);
 
     let mut egraph = egg::EGraph::<TensorIr, TensorAnalysis>::default();
     let root = egraph.add_expr(&b.expr);
@@ -461,8 +473,8 @@ fn test_beam_extraction() {
 #[test]
 fn test_beam_extract_candidates_order_and_uniqueness() {
     let mut b = IrBuilder::new();
-    let a = b.input(0, Shape(vec![Dim::Lit(64), Dim::Lit(64)]), DType::F32);
-    let b_in = b.input(1, Shape(vec![Dim::Lit(64), Dim::Lit(64)]), DType::F32);
+    let a = b.input(0, Shape(vec![Dim::Const(64), Dim::Const(64)]), DType::F32);
+    let b_in = b.input(1, Shape(vec![Dim::Const(64), Dim::Const(64)]), DType::F32);
     let _mm = super::build_binary_mul_add_contraction_ir(&mut b, a, b_in, 64, 64, 64);
 
     let mut egraph = egg::EGraph::<TensorIr, TensorAnalysis>::default();
@@ -508,8 +520,8 @@ fn test_beam_extract_candidates_are_acyclic_for_tiled_kernels() {
     let cases = [(64, 64, 64), (128, 1, 256)];
     for (m, n, k) in cases {
         let mut b = IrBuilder::new();
-        let a = b.input(0, Shape(vec![Dim::Lit(m), Dim::Lit(k)]), DType::F32);
-        let b_in = b.input(1, Shape(vec![Dim::Lit(k), Dim::Lit(n)]), DType::F32);
+        let a = b.input(0, Shape(vec![Dim::Const(m), Dim::Const(k)]), DType::F32);
+        let b_in = b.input(1, Shape(vec![Dim::Const(k), Dim::Const(n)]), DType::F32);
         let _kernel = super::build_binary_mul_add_contraction_ir(&mut b, a, b_in, m, n, k);
 
         let mut egraph = egg::EGraph::<TensorIr, TensorAnalysis>::default();
@@ -613,13 +625,13 @@ fn test_beam_extract_accounts_for_dispatch_execution_multiplicity() {
 
     let slow_children = add_list(&mut egraph, &[expensive_body, zero]);
     let slow_dispatch = egraph.add(TensorIr::Dispatch(DispatchNode::Dispatch {
-        workgroups: 1,
+        workgroups: Dim::Const(1),
         num_inputs: 0,
         children_list: slow_children,
     }));
     let fast_children = add_list(&mut egraph, &[cheap_body, zero]);
     let fast_dispatch = egraph.add(TensorIr::Dispatch(DispatchNode::Dispatch {
-        workgroups: 128,
+        workgroups: Dim::Const(128),
         num_inputs: 0,
         children_list: fast_children,
     }));

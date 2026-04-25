@@ -175,10 +175,10 @@ fn test_phase1_associative_binop_does_not_rotate_sub() {
 #[test]
 fn test_phase1_elementwise_lowering() {
     let mut b = IrBuilder::new();
-    let a = b.input(0, Shape(vec![Dim::Lit(1024)]), DType::F32);
+    let a = b.input(0, Shape(vec![Dim::Const(1024)]), DType::F32);
     let arg0 = b.scalar_arg(0);
     let body = b.un_op(UnaryOp::Exp, arg0);
-    let _ewise = b.elementwise(Shape(vec![Dim::Lit(1024)]), &[a], body);
+    let _ewise = b.elementwise(Shape(vec![Dim::Const(1024)]), &[a], body);
 
     let mut egraph = egg::EGraph::<TensorIr, TensorAnalysis>::default();
     let root = egraph.add_expr(&b.expr);
@@ -207,10 +207,14 @@ fn test_phase1_elementwise_lowering() {
 #[test]
 fn test_phase1_elementwise_register_blocking() {
     let mut b = IrBuilder::new();
-    let a = b.input(0, Shape(vec![Dim::Lit(1024), Dim::Lit(1024)]), DType::F32);
+    let a = b.input(
+        0,
+        Shape(vec![Dim::Const(1024), Dim::Const(1024)]),
+        DType::F32,
+    );
     let arg0 = b.scalar_arg(0);
     let body = b.un_op(UnaryOp::Exp, arg0);
-    let _ewise = b.elementwise(Shape(vec![Dim::Lit(1024), Dim::Lit(1024)]), &[a], body);
+    let _ewise = b.elementwise(Shape(vec![Dim::Const(1024), Dim::Const(1024)]), &[a], body);
 
     let mut egraph = egg::EGraph::<TensorIr, TensorAnalysis>::default();
     let root = egraph.add_expr(&b.expr);
@@ -471,26 +475,26 @@ fn test_stride_table_three_operand_gemm_family() {
     let k = 32u32;
 
     // Inputs. A: [M, K]; B: [K, N]; w: [K].
-    let a_in = b.input(0, Shape(vec![Dim::Lit(m), Dim::Lit(k)]), DType::F32);
-    let b_in = b.input(1, Shape(vec![Dim::Lit(k), Dim::Lit(n)]), DType::F32);
-    let w_in = b.input(2, Shape(vec![Dim::Lit(k)]), DType::F32);
+    let a_in = b.input(0, Shape(vec![Dim::Const(m), Dim::Const(k)]), DType::F32);
+    let b_in = b.input(1, Shape(vec![Dim::Const(k), Dim::Const(n)]), DType::F32);
+    let w_in = b.input(2, Shape(vec![Dim::Const(k)]), DType::F32);
 
     // Broadcast each to [M, N, K] via Restride with stride-0 slots on
     // the axes this operand doesn't depend on.
     let a_restrided = b.restride(
         a_in,
-        Shape(vec![Dim::Lit(m), Dim::Lit(n), Dim::Lit(k)]),
-        Strides(vec![i64::from(k), 0, 1]),
+        Shape(vec![Dim::Const(m), Dim::Const(n), Dim::Const(k)]),
+        Strides(vec![Dim::Const(k), Dim::Const(0), Dim::Const(1)]),
     );
     let b_restrided = b.restride(
         b_in,
-        Shape(vec![Dim::Lit(m), Dim::Lit(n), Dim::Lit(k)]),
-        Strides(vec![0, 1, i64::from(n)]),
+        Shape(vec![Dim::Const(m), Dim::Const(n), Dim::Const(k)]),
+        Strides(vec![Dim::Const(0), Dim::Const(1), Dim::Const(n)]),
     );
     let w_restrided = b.restride(
         w_in,
-        Shape(vec![Dim::Lit(m), Dim::Lit(n), Dim::Lit(k)]),
-        Strides(vec![0, 0, 1]),
+        Shape(vec![Dim::Const(m), Dim::Const(n), Dim::Const(k)]),
+        Strides(vec![Dim::Const(0), Dim::Const(0), Dim::Const(1)]),
     );
 
     // Body: arg0 * arg1 * arg2
@@ -501,7 +505,7 @@ fn test_stride_table_three_operand_gemm_family() {
     let body = b.bin_op(BinaryOp::Mul, ab, arg2);
 
     let ewise = b.elementwise(
-        Shape(vec![Dim::Lit(m), Dim::Lit(n), Dim::Lit(k)]),
+        Shape(vec![Dim::Const(m), Dim::Const(n), Dim::Const(k)]),
         &[a_restrided, b_restrided, w_restrided],
         body,
     );
@@ -551,31 +555,56 @@ fn test_batched_contraction_lowering() {
 
     let a_in = b.input(
         0,
-        Shape(vec![Dim::Lit(batch), Dim::Lit(m), Dim::Lit(k)]),
+        Shape(vec![Dim::Const(batch), Dim::Const(m), Dim::Const(k)]),
         DType::F32,
     );
     let b_in = b.input(
         1,
-        Shape(vec![Dim::Lit(batch), Dim::Lit(k), Dim::Lit(n)]),
+        Shape(vec![Dim::Const(batch), Dim::Const(k), Dim::Const(n)]),
         DType::F32,
     );
 
     let a_restrided = b.restride(
         a_in,
-        Shape(vec![Dim::Lit(batch), Dim::Lit(m), Dim::Lit(n), Dim::Lit(k)]),
-        Strides(vec![i64::from(m * k), i64::from(k), 0, 1]),
+        Shape(vec![
+            Dim::Const(batch),
+            Dim::Const(m),
+            Dim::Const(n),
+            Dim::Const(k),
+        ]),
+        Strides(vec![
+            Dim::Const(m * k),
+            Dim::Const(k),
+            Dim::Const(0),
+            Dim::Const(1),
+        ]),
     );
     let b_restrided = b.restride(
         b_in,
-        Shape(vec![Dim::Lit(batch), Dim::Lit(m), Dim::Lit(n), Dim::Lit(k)]),
-        Strides(vec![i64::from(k * n), 0, 1, i64::from(n)]),
+        Shape(vec![
+            Dim::Const(batch),
+            Dim::Const(m),
+            Dim::Const(n),
+            Dim::Const(k),
+        ]),
+        Strides(vec![
+            Dim::Const(k * n),
+            Dim::Const(0),
+            Dim::Const(1),
+            Dim::Const(n),
+        ]),
     );
 
     let lhs = b.scalar_arg(0);
     let rhs = b.scalar_arg(1);
     let body = b.bin_op(BinaryOp::Mul, lhs, rhs);
     let ewise = b.elementwise(
-        Shape(vec![Dim::Lit(batch), Dim::Lit(m), Dim::Lit(n), Dim::Lit(k)]),
+        Shape(vec![
+            Dim::Const(batch),
+            Dim::Const(m),
+            Dim::Const(n),
+            Dim::Const(k),
+        ]),
         &[a_restrided, b_restrided],
         body,
     );
@@ -632,31 +661,56 @@ fn test_multi_axis_contraction_lowering() {
 
     let a_in = b.input(
         0,
-        Shape(vec![Dim::Lit(m), Dim::Lit(k0), Dim::Lit(k1)]),
+        Shape(vec![Dim::Const(m), Dim::Const(k0), Dim::Const(k1)]),
         DType::F32,
     );
     let b_in = b.input(
         1,
-        Shape(vec![Dim::Lit(k0), Dim::Lit(k1), Dim::Lit(n)]),
+        Shape(vec![Dim::Const(k0), Dim::Const(k1), Dim::Const(n)]),
         DType::F32,
     );
 
     let a_restrided = b.restride(
         a_in,
-        Shape(vec![Dim::Lit(m), Dim::Lit(n), Dim::Lit(k0), Dim::Lit(k1)]),
-        Strides(vec![i64::from(k0 * k1), 0, i64::from(k1), 1]),
+        Shape(vec![
+            Dim::Const(m),
+            Dim::Const(n),
+            Dim::Const(k0),
+            Dim::Const(k1),
+        ]),
+        Strides(vec![
+            Dim::Const(k0 * k1),
+            Dim::Const(0),
+            Dim::Const(k1),
+            Dim::Const(1),
+        ]),
     );
     let b_restrided = b.restride(
         b_in,
-        Shape(vec![Dim::Lit(m), Dim::Lit(n), Dim::Lit(k0), Dim::Lit(k1)]),
-        Strides(vec![0, 1, i64::from(k1 * n), i64::from(n)]),
+        Shape(vec![
+            Dim::Const(m),
+            Dim::Const(n),
+            Dim::Const(k0),
+            Dim::Const(k1),
+        ]),
+        Strides(vec![
+            Dim::Const(0),
+            Dim::Const(1),
+            Dim::Const(k1 * n),
+            Dim::Const(n),
+        ]),
     );
 
     let lhs = b.scalar_arg(0);
     let rhs = b.scalar_arg(1);
     let body = b.bin_op(BinaryOp::Mul, lhs, rhs);
     let ewise = b.elementwise(
-        Shape(vec![Dim::Lit(m), Dim::Lit(n), Dim::Lit(k0), Dim::Lit(k1)]),
+        Shape(vec![
+            Dim::Const(m),
+            Dim::Const(n),
+            Dim::Const(k0),
+            Dim::Const(k1),
+        ]),
         &[a_restrided, b_restrided],
         body,
     );
@@ -705,31 +759,56 @@ fn test_multi_axis_contraction_mixed_reduce_ops_fallback() {
 
     let a_in = b.input(
         0,
-        Shape(vec![Dim::Lit(m), Dim::Lit(k0), Dim::Lit(k1)]),
+        Shape(vec![Dim::Const(m), Dim::Const(k0), Dim::Const(k1)]),
         DType::F32,
     );
     let b_in = b.input(
         1,
-        Shape(vec![Dim::Lit(k0), Dim::Lit(k1), Dim::Lit(n)]),
+        Shape(vec![Dim::Const(k0), Dim::Const(k1), Dim::Const(n)]),
         DType::F32,
     );
 
     let a_restrided = b.restride(
         a_in,
-        Shape(vec![Dim::Lit(m), Dim::Lit(n), Dim::Lit(k0), Dim::Lit(k1)]),
-        Strides(vec![i64::from(k0 * k1), 0, i64::from(k1), 1]),
+        Shape(vec![
+            Dim::Const(m),
+            Dim::Const(n),
+            Dim::Const(k0),
+            Dim::Const(k1),
+        ]),
+        Strides(vec![
+            Dim::Const(k0 * k1),
+            Dim::Const(0),
+            Dim::Const(k1),
+            Dim::Const(1),
+        ]),
     );
     let b_restrided = b.restride(
         b_in,
-        Shape(vec![Dim::Lit(m), Dim::Lit(n), Dim::Lit(k0), Dim::Lit(k1)]),
-        Strides(vec![0, 1, i64::from(k1 * n), i64::from(n)]),
+        Shape(vec![
+            Dim::Const(m),
+            Dim::Const(n),
+            Dim::Const(k0),
+            Dim::Const(k1),
+        ]),
+        Strides(vec![
+            Dim::Const(0),
+            Dim::Const(1),
+            Dim::Const(k1 * n),
+            Dim::Const(n),
+        ]),
     );
 
     let lhs = b.scalar_arg(0);
     let rhs = b.scalar_arg(1);
     let body = b.bin_op(BinaryOp::Mul, lhs, rhs);
     let ewise = b.elementwise(
-        Shape(vec![Dim::Lit(m), Dim::Lit(n), Dim::Lit(k0), Dim::Lit(k1)]),
+        Shape(vec![
+            Dim::Const(m),
+            Dim::Const(n),
+            Dim::Const(k0),
+            Dim::Const(k1),
+        ]),
         &[a_restrided, b_restrided],
         body,
     );
@@ -765,8 +844,8 @@ fn test_multi_axis_contraction_mixed_reduce_ops_fallback() {
 #[test]
 fn test_matmul_end_to_end() {
     let mut b = IrBuilder::new();
-    let a = b.input(0, Shape(vec![Dim::Lit(64), Dim::Lit(32)]), DType::F32);
-    let b_in = b.input(1, Shape(vec![Dim::Lit(32), Dim::Lit(64)]), DType::F32);
+    let a = b.input(0, Shape(vec![Dim::Const(64), Dim::Const(32)]), DType::F32);
+    let b_in = b.input(1, Shape(vec![Dim::Const(32), Dim::Const(64)]), DType::F32);
     let _mm = super::build_binary_mul_add_contraction_ir(&mut b, a, b_in, 64, 64, 32);
 
     let mut egraph = egg::EGraph::<TensorIr, TensorAnalysis>::default();
@@ -798,8 +877,8 @@ fn test_matmul_end_to_end() {
 #[test]
 fn test_register_blocking_dispatch() {
     let mut b = IrBuilder::new();
-    let a = b.input(0, Shape(vec![Dim::Lit(64), Dim::Lit(64)]), DType::F32);
-    let b_in = b.input(1, Shape(vec![Dim::Lit(64), Dim::Lit(64)]), DType::F32);
+    let a = b.input(0, Shape(vec![Dim::Const(64), Dim::Const(64)]), DType::F32);
+    let b_in = b.input(1, Shape(vec![Dim::Const(64), Dim::Const(64)]), DType::F32);
     let _mm = super::build_binary_mul_add_contraction_ir(&mut b, a, b_in, 64, 64, 64);
 
     let mut egraph = egg::EGraph::<TensorIr, TensorAnalysis>::default();
@@ -842,8 +921,8 @@ fn test_register_blocking_dispatch() {
 #[test]
 fn test_fused_matmul_lowering() {
     let mut b = IrBuilder::new();
-    let a = b.input(0, Shape(vec![Dim::Lit(64), Dim::Lit(64)]), DType::F32);
-    let b_in = b.input(1, Shape(vec![Dim::Lit(64), Dim::Lit(64)]), DType::F32);
+    let a = b.input(0, Shape(vec![Dim::Const(64), Dim::Const(64)]), DType::F32);
+    let b_in = b.input(1, Shape(vec![Dim::Const(64), Dim::Const(64)]), DType::F32);
     let _mm = super::build_binary_mul_add_contraction_ir(&mut b, a, b_in, 64, 64, 64);
 
     let mut egraph = egg::EGraph::<TensorIr, TensorAnalysis>::default();
@@ -863,7 +942,7 @@ fn test_fused_matmul_lowering() {
     let root = egraph.find(root);
     let tiled_dispatch = egraph[root].iter().find(|n| {
         if let TensorIr::Dispatch(DispatchNode::Dispatch { workgroups, .. }) = n {
-            *workgroups <= 128
+            workgroups.as_const().is_some_and(|w| w <= 128)
         } else {
             false
         }
@@ -878,8 +957,8 @@ fn test_fused_matmul_lowering() {
 #[test]
 fn test_tiled_matmul_k_tiling() {
     let mut b = IrBuilder::new();
-    let a = b.input(0, Shape(vec![Dim::Lit(64), Dim::Lit(64)]), DType::F32);
-    let b_in = b.input(1, Shape(vec![Dim::Lit(64), Dim::Lit(64)]), DType::F32);
+    let a = b.input(0, Shape(vec![Dim::Const(64), Dim::Const(64)]), DType::F32);
+    let b_in = b.input(1, Shape(vec![Dim::Const(64), Dim::Const(64)]), DType::F32);
     let _mm = super::build_binary_mul_add_contraction_ir(&mut b, a, b_in, 64, 64, 64);
 
     let mut egraph = egg::EGraph::<TensorIr, TensorAnalysis>::default();
@@ -927,14 +1006,14 @@ fn test_cost_model_prefers_tiled() {
 
     // Tiled dispatch: 16 workgroups
     let tiled = TensorIr::Dispatch(DispatchNode::Dispatch {
-        workgroups: 16,
+        workgroups: Dim::Const(16),
         num_inputs: 2,
         children_list: placeholder,
     });
 
     // Naive dispatch: 8192 workgroups
     let naive = TensorIr::Dispatch(DispatchNode::Dispatch {
-        workgroups: 8192,
+        workgroups: Dim::Const(8192),
         num_inputs: 2,
         children_list: placeholder,
     });
@@ -967,12 +1046,12 @@ fn test_phase6_seq_lowers_to_pipeline() {
     let mut egraph = egg::EGraph::<TensorIr, TensorAnalysis>::default();
     let placeholder = egraph.add(TensorIr::Nil);
     let d0 = egraph.add(TensorIr::Dispatch(DispatchNode::Dispatch {
-        workgroups: 8,
+        workgroups: Dim::Const(8),
         num_inputs: 0,
         children_list: placeholder,
     }));
     let d1 = egraph.add(TensorIr::Dispatch(DispatchNode::Dispatch {
-        workgroups: 8,
+        workgroups: Dim::Const(8),
         num_inputs: 0,
         children_list: placeholder,
     }));
@@ -1019,7 +1098,7 @@ fn test_cost_model_prefers_register_blocking_when_it_reduces_workgroups() {
     // Scalar dispatch: 32_768 workgroups × 1 output pair.
     let scalar_children = add_list(&mut egraph, &[dummy_val, dummy_val, dummy_val, dummy_addr]);
     let scalar = TensorIr::Dispatch(DispatchNode::Dispatch {
-        workgroups: 32_768,
+        workgroups: Dim::Const(32_768),
         num_inputs: 2,
         children_list: scalar_children,
     });
@@ -1034,7 +1113,7 @@ fn test_cost_model_prefers_register_blocking_when_it_reduces_workgroups() {
         ],
     );
     let blocked = TensorIr::Dispatch(DispatchNode::Dispatch {
-        workgroups: 8_192,
+        workgroups: Dim::Const(8_192),
         num_inputs: 2,
         children_list: blocked_children,
     });
@@ -1052,8 +1131,8 @@ fn test_cost_model_prefers_register_blocking_when_it_reduces_workgroups() {
 #[test]
 fn test_tiled_matmul_end_to_end() {
     let mut b = IrBuilder::new();
-    let a = b.input(0, Shape(vec![Dim::Lit(64), Dim::Lit(64)]), DType::F32);
-    let b_in = b.input(1, Shape(vec![Dim::Lit(64), Dim::Lit(64)]), DType::F32);
+    let a = b.input(0, Shape(vec![Dim::Const(64), Dim::Const(64)]), DType::F32);
+    let b_in = b.input(1, Shape(vec![Dim::Const(64), Dim::Const(64)]), DType::F32);
     let _mm = super::build_binary_mul_add_contraction_ir(&mut b, a, b_in, 64, 64, 64);
 
     let mut egraph = egg::EGraph::<TensorIr, TensorAnalysis>::default();
@@ -1094,12 +1173,12 @@ fn test_softmax_weighted_reduce_extracts_as_single_dispatch() {
     let mut b = IrBuilder::new();
     let scores = b.input(
         0,
-        Shape(vec![Dim::Lit(rows), Dim::Lit(weights)]),
+        Shape(vec![Dim::Const(rows), Dim::Const(weights)]),
         DType::F32,
     );
     let values = b.input(
         1,
-        Shape(vec![Dim::Lit(weights), Dim::Lit(outputs)]),
+        Shape(vec![Dim::Const(weights), Dim::Const(outputs)]),
         DType::F32,
     );
     let _weighted =
@@ -1156,7 +1235,11 @@ fn test_recursive_dispatch_extracts_nested_reduce_elementwise() {
     let cols = 32u32;
 
     let mut b = IrBuilder::new();
-    let x = b.input(0, Shape(vec![Dim::Lit(rows), Dim::Lit(cols)]), DType::F32);
+    let x = b.input(
+        0,
+        Shape(vec![Dim::Const(rows), Dim::Const(cols)]),
+        DType::F32,
+    );
     let _expr = super::build_centered_row_sum_ir(&mut b, x, rows, cols);
 
     let mut egraph = egg::EGraph::<TensorIr, TensorAnalysis>::default();
@@ -1206,9 +1289,9 @@ fn test_attention_extracts_as_lowered_dispatch_candidate() {
     let d = 32u32;
 
     let mut b = IrBuilder::new();
-    let q = b.input(0, Shape(vec![Dim::Lit(seq), Dim::Lit(d)]), DType::F32);
-    let k = b.input(1, Shape(vec![Dim::Lit(seq), Dim::Lit(d)]), DType::F32);
-    let v = b.input(2, Shape(vec![Dim::Lit(seq), Dim::Lit(d)]), DType::F32);
+    let q = b.input(0, Shape(vec![Dim::Const(seq), Dim::Const(d)]), DType::F32);
+    let k = b.input(1, Shape(vec![Dim::Const(seq), Dim::Const(d)]), DType::F32);
+    let v = b.input(2, Shape(vec![Dim::Const(seq), Dim::Const(d)]), DType::F32);
     let _attn = super::build_attention_ir(&mut b, q, k, v, seq, d);
 
     let mut egraph = egg::EGraph::<TensorIr, TensorAnalysis>::default();
@@ -1291,14 +1374,101 @@ fn test_attention_extracts_as_lowered_dispatch_candidate() {
 /// Test as_3d_lit helper.
 #[test]
 fn test_shape_as_3d_lit() {
-    let s = Shape(vec![Dim::Lit(64), Dim::Lit(32), Dim::Lit(16)]);
+    let s = Shape(vec![Dim::Const(64), Dim::Const(32), Dim::Const(16)]);
     assert_eq!(s.as_3d_lit(), Some((64, 32, 16)));
 
-    let s2 = Shape(vec![Dim::Lit(64), Dim::Lit(32)]);
+    let s2 = Shape(vec![Dim::Const(64), Dim::Const(32)]);
     assert_eq!(s2.as_3d_lit(), None);
 
-    let s3 = Shape(vec![Dim::Lit(64), Dim::Sym(0), Dim::Lit(16)]);
+    let s3 = Shape(vec![Dim::Const(64), Dim::Symbol(0), Dim::Const(16)]);
     assert_eq!(s3.as_3d_lit(), None);
+}
+
+#[test]
+fn test_symbolic_shape_numel_and_row_major_strides() {
+    let shape = Shape(vec![Dim::Symbol(0), Dim::Symbol(1), Dim::Symbol(2)]);
+    let strides = Strides::row_major_for_shape(&shape);
+    let params = ShapeParams::from([2, 3, 4]);
+
+    assert_eq!(shape.numel().as_const(), None);
+    assert_eq!(shape.numel().eval_u32(&params), Some(24));
+    assert_eq!(
+        strides
+            .0
+            .iter()
+            .map(|stride| stride.eval_u32(&params).unwrap())
+            .collect::<Vec<_>>(),
+        vec![12, 4, 1]
+    );
+}
+
+#[test]
+fn test_phase1_symbolic_elementwise_uses_algebraic_workgroups() {
+    let shape = Shape(vec![Dim::Symbol(0), Dim::Symbol(1)]);
+    let mut b = IrBuilder::new();
+    let input = b.input(0, shape.clone(), DType::F32);
+    let body = b.scalar_arg(0);
+    let _ewise = b.elementwise(shape, &[input], body);
+
+    let mut egraph = egg::EGraph::<TensorIr, TensorAnalysis>::default();
+    let root = egraph.add_expr(&b.expr);
+    let config = RunnerConfig {
+        iter_limit: 5,
+        node_limit: 10_000,
+        time_limit_secs: 10,
+        device: DeviceProfile::default(),
+        lowering: LoweringOptions::default(),
+    };
+    let egraph = rules::saturate_phases(egraph, &[Phase::Lowering], &config);
+    let params = ShapeParams::from([7, 9]);
+
+    let has_symbolic_dispatch = egraph[egraph.find(root)].iter().any(|node| {
+        matches!(
+            node,
+            TensorIr::Dispatch(DispatchNode::Dispatch { workgroups, .. })
+                if workgroups.as_const().is_none() && workgroups.eval_u32(&params) == Some(2)
+        )
+    });
+    assert!(
+        has_symbolic_dispatch,
+        "symbolic [M,N] elementwise lowering should keep workgroups algebraic"
+    );
+}
+
+#[test]
+fn test_symbolic_elementwise_codegen_reads_shape_params() {
+    let shape = Shape(vec![Dim::Symbol(0), Dim::Symbol(1)]);
+    let mut b = crate::TensorExprBuilder::new();
+    let input = b.input(0, shape.clone(), DType::F32);
+    let body = b.scalar_arg(0);
+    let root = b.elementwise(shape, &[input], body);
+    let expr = b.build(root).expect("symbolic tensor expr should validate");
+
+    let mut config = crate::StageConfig::default();
+    config.runner.iter_limit = 6;
+    config.runner.node_limit = 20_000;
+    config.candidate_limit = Some(1);
+
+    let kernel = crate::lower_tensor_expr(&expr, &config)
+        .expect("symbolic elementwise expression should lower");
+    let simd = crate::compile_kernel(kernel).expect("symbolic kernel should compile");
+    let program = simd.dispatch_program();
+    let wgsl = crate::lower_to_wgsl(&program).expect("symbolic program should lower to WGSL");
+    let params = ShapeParams::from([8, 9]);
+
+    assert!(wgsl.contains("shape_params"));
+    assert!(
+        !wgsl.contains("Symbol"),
+        "WGSL should load runtime dimensions, not print symbolic placeholders"
+    );
+    assert!(
+        program
+            .dispatches
+            .iter()
+            .any(|dispatch| dispatch.workgroups.as_const().is_none()
+                && dispatch.workgroups.eval_u32(&params) == Some(3)),
+        "compiled dispatch should retain algebraic ceildiv(M*N, simd_width) workgroups"
+    );
 }
 
 // ═══════════════════════════════════════════════════════
@@ -1313,7 +1483,7 @@ fn test_shape_as_3d_lit() {
 fn test_phase2_theta_merge_independent_reduces() {
     // reduce_dim=32 hits the simple-reduce path in reduce_lowering
     // (cooperative kicks in only when reduce_dim > simd_width).
-    let shape = Shape(vec![Dim::Lit(128), Dim::Lit(32)]);
+    let shape = Shape(vec![Dim::Const(128), Dim::Const(32)]);
     let mut b = IrBuilder::new();
     let a = b.input(0, shape.clone(), DType::F32);
     let _rmax = b.reduce(a, 1, ReduceOp::Max);
@@ -1377,13 +1547,13 @@ fn test_phase2_theta_merge_independent_reduces() {
 #[test]
 fn test_phase1_exp_sub_split() {
     let mut b = IrBuilder::new();
-    let a = b.input(0, Shape(vec![Dim::Lit(64)]), DType::F32);
-    let bcast = b.input(1, Shape(vec![Dim::Lit(64)]), DType::F32);
+    let a = b.input(0, Shape(vec![Dim::Const(64)]), DType::F32);
+    let bcast = b.input(1, Shape(vec![Dim::Const(64)]), DType::F32);
     let arg0 = b.scalar_arg(0);
     let arg1 = b.scalar_arg(1);
     let sub = b.bin_op(BinaryOp::Sub, arg0, arg1);
     let body = b.un_op(UnaryOp::Exp, sub);
-    let _ewise = b.elementwise(Shape(vec![Dim::Lit(64)]), &[a, bcast], body);
+    let _ewise = b.elementwise(Shape(vec![Dim::Const(64)]), &[a, bcast], body);
 
     let mut egraph = egg::EGraph::<TensorIr, TensorAnalysis>::default();
     let _ = egraph.add_expr(&b.expr);
@@ -1429,13 +1599,17 @@ fn test_phase1_exp_sub_split() {
 /// P1))` — `c` factored out of the sum since it's axis-invariant.
 #[test]
 fn test_phase1_factor_reduce_mul_bcast() {
-    let shape = Shape(vec![Dim::Lit(32), Dim::Lit(64)]);
+    let shape = Shape(vec![Dim::Const(32), Dim::Const(64)]);
     let mut b = IrBuilder::new();
     let x = b.input(0, shape.clone(), DType::F32);
-    let c = b.input(1, Shape(vec![Dim::Lit(32)]), DType::F32);
+    let c = b.input(1, Shape(vec![Dim::Const(32)]), DType::F32);
     // bcast c over axis 1: stride [1, 0] so axis-1 accesses all the
     // same scalar.
-    let c_bcast = b.restride(c, shape.clone(), Strides(vec![1, 0]));
+    let c_bcast = b.restride(
+        c,
+        shape.clone(),
+        Strides(vec![Dim::Const(1), Dim::Const(0)]),
+    );
     let p0 = b.scalar_arg(0);
     let p1 = b.scalar_arg(1);
     let body = b.bin_op(BinaryOp::Mul, p0, p1);
@@ -1498,15 +1672,15 @@ fn test_phase1_factor_reduce_mul_bcast() {
 /// Add over exp(x)) → `theta-merge-reduction`.
 #[test]
 fn test_e2e_softmax_denominator_decouples_to_running_reduction() {
-    let shape = Shape(vec![Dim::Lit(128), Dim::Lit(32)]);
+    let shape = Shape(vec![Dim::Const(128), Dim::Const(32)]);
     let axis = 1;
     let mut b = IrBuilder::new();
     let x = b.input(0, shape.clone(), DType::F32);
     // max = Reduce(a, Max, x)
     let max = b.reduce(x, axis, ReduceOp::Max);
     // bcast max over axis
-    let mut bcast_strides = vec![1i64; shape.rank()];
-    bcast_strides[axis as usize] = 0;
+    let mut bcast_strides = vec![Dim::Const(1); shape.rank()];
+    bcast_strides[axis as usize] = Dim::Const(0);
     let max_bcast = b.restride(max, shape.clone(), Strides(bcast_strides));
     // shifted = Elementwise([x, max_bcast], Sub(P0, P1))
     let p0 = b.scalar_arg(0);

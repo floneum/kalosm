@@ -23,7 +23,7 @@ use crate::applier::SimpleEclassSearcher;
 use crate::binding;
 use crate::language::{DispatchNode, TensorIr, extract_list, try_add_value_addr_dispatch};
 use crate::rules::RunnerConfig;
-use crate::types::{BinaryOp, BinderKind, DeviceProfile, ScalarValue, slots};
+use crate::types::{BinaryOp, BinderKind, DeviceProfile, Dim, ScalarValue, slots};
 
 /// Build a register-blocking rewrite for the given blocking factor.
 ///
@@ -103,7 +103,7 @@ impl crate::applier::TypedApplier for RegisterBlockingApplier {
             let orig_value = children[num_inputs_us];
             let orig_addr = children[num_inputs_us + 1];
 
-            let new_workgroups = workgroups / self.factor;
+            let new_workgroups = Dim::div(workgroups.clone(), Dim::Const(self.factor));
             let factor_lit = egraph.add(TensorIr::Const(ScalarValue::U32(self.factor)));
 
             let mut new_children = inputs;

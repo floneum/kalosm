@@ -175,9 +175,7 @@ fn reduce_axis_maps_to_normalized_axis(
     let Some(weight_shape) = shape_of(egraph, weight_source) else {
         return false;
     };
-    let Some(row_major) = Strides::row_major_for_shape(&weight_shape) else {
-        return false;
-    };
+    let row_major = Strides::row_major_for_shape(&weight_shape);
     let reduce_axis = reduce_axis as usize;
     let normalized_axis = normalized_axis as usize;
     reduce_axis < weight_strides.0.len()
@@ -193,7 +191,7 @@ fn source_and_strides(egraph: &EGraph<TensorIr, TensorAnalysis>, id: Id) -> Opti
         }
     }
     let shape = shape_of(egraph, canonical)?;
-    Some((canonical, Strides::row_major_for_shape(&shape)?))
+    Some((canonical, Strides::row_major_for_shape(&shape)))
 }
 
 fn build_online_dispatch(
@@ -327,7 +325,8 @@ fn has_online_dispatch(
         else {
             return false;
         };
-        if *workgroups != pattern.workgroups || *node_inputs != num_inputs {
+        if *workgroups != crate::types::Dim::Const(pattern.workgroups) || *node_inputs != num_inputs
+        {
             return false;
         }
         let Some(children) = try_extract_list(egraph, *children_list) else {
@@ -356,7 +355,7 @@ fn lower_tensor_point_prefer_lane_reduce(
     }) = selected_high_level_node(egraph, expr)
     {
         let source_shape = shape_of(egraph, source)?;
-        let Dim::Lit(reduce_dim) = source_shape.0.get(axis as usize)? else {
+        let Dim::Const(reduce_dim) = source_shape.0.get(axis as usize)? else {
             return None;
         };
         if *reduce_dim == simd_width {
@@ -384,7 +383,7 @@ fn insert_axis(indices: &[Id], axis: u32, value: Id) -> Vec<Id> {
 }
 
 fn index_dim(shape: &Shape, axis: u32) -> Option<u32> {
-    let Dim::Lit(value) = shape.0.get(axis as usize)? else {
+    let Dim::Const(value) = shape.0.get(axis as usize)? else {
         return None;
     };
     Some(*value)

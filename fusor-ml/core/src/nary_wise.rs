@@ -1,10 +1,12 @@
 use crate::{
     compute_graph::{ComputeGraphInner, NodeIndex},
     mir::{inputs::MirValue, operation::Operation},
-    tensor::{DataTypeEnum, TensorData},
+    tensor::{DataTypeEnum, TensorData, TensorLayoutInfo},
     visit_tiled::MaybeQData,
 };
-use tensor_ir::{BinaryOp, UnaryOp};
+use std::str::FromStr;
+
+use tensor_ir::{BinaryOp, ScalarValue, UnaryOp};
 
 #[derive(Clone, Debug)]
 pub(crate) enum NaryFunctionKind {
@@ -15,15 +17,14 @@ pub(crate) enum NaryFunctionKind {
     },
     BinaryConst {
         op: BinaryOp,
-        constant: String,
+        constant: ScalarValue,
         input_first: bool,
     },
     CompareConst {
         op: BinaryOp,
-        constant: String,
+        constant: ScalarValue,
     },
     Cast(DataTypeEnum),
-    Unsupported,
 }
 
 #[derive(Clone, Debug)]
@@ -78,14 +79,14 @@ impl NaryFunction {
         op: BinaryOp,
         constant: impl ToString,
         input_first: bool,
-        _input_type: DataTypeEnum,
+        input_type: DataTypeEnum,
         output_type: DataTypeEnum,
     ) -> Self {
         Self {
             name,
             kind: NaryFunctionKind::BinaryConst {
                 op,
-                constant: constant.to_string(),
+                constant: scalar_value_from_constant(constant, input_type),
                 input_first,
             },
             output_type,
@@ -96,14 +97,14 @@ impl NaryFunction {
         name: Option<String>,
         op: BinaryOp,
         constant: impl ToString,
-        _input_type: DataTypeEnum,
+        input_type: DataTypeEnum,
         output_type: DataTypeEnum,
     ) -> Self {
         Self {
             name,
             kind: NaryFunctionKind::CompareConst {
                 op,
-                constant: constant.to_string(),
+                constant: scalar_value_from_constant(constant, input_type),
             },
             output_type,
         }
@@ -116,18 +117,17 @@ impl NaryFunction {
             output_type,
         }
     }
+}
 
-    pub fn unsupported_unary(
-        name: Option<String>,
-        _input_type: DataTypeEnum,
-        output_type: DataTypeEnum,
-    ) -> Self {
-        Self {
-            name,
-            kind: NaryFunctionKind::Unsupported,
-            output_type,
-        }
-    }
+fn scalar_value_from_constant(constant: impl ToString, datatype: DataTypeEnum) -> ScalarValue {
+    let source = constant.to_string();
+    let literal = match datatype {
+        DataTypeEnum::F32 => format!("{}f", source.trim().trim_end_matches('f')),
+        DataTypeEnum::F16 => format!("{}h", source.trim().trim_end_matches('h')),
+        DataTypeEnum::U32 => format!("{}u", source.trim().trim_end_matches('u')),
+    };
+    ScalarValue::from_str(&literal)
+        .unwrap_or_else(|error| panic!("could not parse scalar constant {source:?}: {error}"))
 }
 
 /// A chain of unary functions used for pre/post processing in reduce/matmul/dequantize.
@@ -264,19 +264,22 @@ impl NaryExpr {
         }
     }
 
-    /// Create a unary expression that must be taught to tensor_ir before execution.
-    pub fn unsupported_unary(
+    pub fn binary_const(
         a: NaryExpr,
-        name: &str,
-        input_type: DataTypeEnum,
-        output_type: DataTypeEnum,
+        op: BinaryOp,
+        constant: impl ToString,
+        input_first: bool,
+        datatype: DataTypeEnum,
     ) -> NaryExpr {
         NaryExpr::Op {
             children: vec![a],
-            function: NaryFunction::unsupported_unary(
-                Some(name.to_string()),
-                input_type,
-                output_type,
+            function: NaryFunction::binary_const(
+                None,
+                op,
+                constant,
+                input_first,
+                datatype,
+                datatype,
             ),
         }
     }
@@ -475,6 +478,17 @@ impl Operation for NaryOperation {
                 .collect::<Vec<_>>()
                 .join("x")
         )
+    }
+
+    fn output_layout(
+        &self,
+        _: &rustc_hash::FxHashMap<NodeIndex, TensorLayoutInfo>,
+    ) -> TensorLayoutInfo {
+        TensorLayoutInfo::new(crate::Layout::contiguous(&self.shape), self.output_datatype)
+    }
+
+    fn as_fusable_nary(&self) -> Option<&NaryOperation> {
+        Some(self)
     }
 
     fn build_tensor_ir(

@@ -84,6 +84,7 @@ fn main() {
         match ctx.benchmark(
             &program,
             &inputs,
+            &ShapeParams::default(),
             ProgramBenchmarkConfig {
                 warmup_runs,
                 timing_runs,
@@ -186,10 +187,11 @@ fn build_dispatch_program(
         let Some(dispatch) = program.dispatches.first() else {
             continue;
         };
-        let gpu_result = match catch_quiet_unwind(|| ctx.execute(&program, &inputs)) {
-            Ok(result) => result,
-            Err(_) => continue,
-        };
+        let gpu_result =
+            match catch_quiet_unwind(|| ctx.execute(&program, &inputs, &ShapeParams::default())) {
+                Ok(result) => result,
+                Err(_) => continue,
+            };
         let max_err = gpu_result[..expected.len()]
             .iter()
             .zip(expected)
@@ -208,12 +210,18 @@ fn build_dispatch_program(
                 case.name, valid_candidates, target_valid_candidates
             );
         }
-        let result = match catch_quiet_unwind(|| ctx.benchmark(&program, &inputs, tuning_config)) {
+        let result = match catch_quiet_unwind(|| {
+            ctx.benchmark(&program, &inputs, &ShapeParams::default(), tuning_config)
+        }) {
             Ok(Ok(result)) => result,
             Ok(Err(_)) | Err(_) => continue,
         };
 
-        let physical_workgroups = dispatch.workgroups / dispatch.simdgroups.max(1);
+        let physical_workgroups = dispatch
+            .workgroups
+            .as_const()
+            .unwrap()
+            .div_ceil(dispatch.simdgroups.max(1));
         let score = result.median_gpu_us;
 
         match &best {
@@ -270,16 +278,22 @@ fn benchmark_cases() -> Vec<BenchmarkCase> {
 #[cfg(feature = "runtime")]
 fn build_matmul_case(m: u32, n: u32, k: u32) -> BenchmarkCase {
     let mut builder = TensorExprBuilder::new();
-    let a = builder.input(0, Shape(vec![Dim::Lit(m), Dim::Lit(k)]), DType::F32);
-    let b = builder.input(1, Shape(vec![Dim::Lit(k), Dim::Lit(n)]), DType::F32);
+    let a = builder.input(0, Shape(vec![Dim::Const(m), Dim::Const(k)]), DType::F32);
+    let b = builder.input(1, Shape(vec![Dim::Const(k), Dim::Const(n)]), DType::F32);
     let arg0 = builder.scalar_arg(0);
     let arg1 = builder.scalar_arg(1);
     let body = builder.scalar_binop(BinaryOp::Mul, [arg0, arg1]);
     let root = builder.contraction(
-        Shape(vec![Dim::Lit(m), Dim::Lit(n), Dim::Lit(k)]),
+        Shape(vec![Dim::Const(m), Dim::Const(n), Dim::Const(k)]),
         &[
-            (a, Strides(vec![i64::from(k), 0, 1])),
-            (b, Strides(vec![0, 1, i64::from(n)])),
+            (
+                a,
+                Strides(vec![Dim::Const(k), Dim::Const(0), Dim::Const(1)]),
+            ),
+            (
+                b,
+                Strides(vec![Dim::Const(0), Dim::Const(1), Dim::Const(n)]),
+            ),
         ],
         body,
         &[(2, ReduceOp::Add)],
@@ -297,7 +311,11 @@ fn build_matmul_case(m: u32, n: u32, k: u32) -> BenchmarkCase {
 #[cfg(feature = "runtime")]
 fn build_reduce_sum_case(rows: u32, cols: u32) -> BenchmarkCase {
     let mut builder = TensorExprBuilder::new();
-    let x = builder.input(0, Shape(vec![Dim::Lit(rows), Dim::Lit(cols)]), DType::F32);
+    let x = builder.input(
+        0,
+        Shape(vec![Dim::Const(rows), Dim::Const(cols)]),
+        DType::F32,
+    );
     let root = builder.reduce(x, 1, ReduceOp::Add);
     let input = seq_f32((rows * cols) as usize, 19);
     BenchmarkCase {
@@ -311,7 +329,11 @@ fn build_reduce_sum_case(rows: u32, cols: u32) -> BenchmarkCase {
 #[cfg(feature = "runtime")]
 fn build_reduce_max_case(rows: u32, cols: u32) -> BenchmarkCase {
     let mut builder = TensorExprBuilder::new();
-    let x = builder.input(0, Shape(vec![Dim::Lit(rows), Dim::Lit(cols)]), DType::F32);
+    let x = builder.input(
+        0,
+        Shape(vec![Dim::Const(rows), Dim::Const(cols)]),
+        DType::F32,
+    );
     let root = builder.reduce(x, 1, ReduceOp::Max);
     BenchmarkCase {
         name: "reduce_max",
@@ -324,7 +346,7 @@ fn build_reduce_max_case(rows: u32, cols: u32) -> BenchmarkCase {
 #[cfg(feature = "runtime")]
 fn build_elementwise_add_case(rows: u32, cols: u32) -> BenchmarkCase {
     let mut builder = TensorExprBuilder::new();
-    let shape = Shape(vec![Dim::Lit(rows), Dim::Lit(cols)]);
+    let shape = Shape(vec![Dim::Const(rows), Dim::Const(cols)]);
     let a = builder.input(0, shape.clone(), DType::F32);
     let b = builder.input(1, shape.clone(), DType::F32);
     let arg0 = builder.scalar_arg(0);
@@ -345,7 +367,7 @@ fn build_elementwise_add_case(rows: u32, cols: u32) -> BenchmarkCase {
 #[cfg(feature = "runtime")]
 fn build_elementwise_mul_case(rows: u32, cols: u32) -> BenchmarkCase {
     let mut builder = TensorExprBuilder::new();
-    let shape = Shape(vec![Dim::Lit(rows), Dim::Lit(cols)]);
+    let shape = Shape(vec![Dim::Const(rows), Dim::Const(cols)]);
     let a = builder.input(0, shape.clone(), DType::F32);
     let b = builder.input(1, shape.clone(), DType::F32);
     let arg0 = builder.scalar_arg(0);
@@ -366,7 +388,7 @@ fn build_elementwise_mul_case(rows: u32, cols: u32) -> BenchmarkCase {
 #[cfg(feature = "runtime")]
 fn build_relu_case(rows: u32, cols: u32) -> BenchmarkCase {
     let mut builder = TensorExprBuilder::new();
-    let shape = Shape(vec![Dim::Lit(rows), Dim::Lit(cols)]);
+    let shape = Shape(vec![Dim::Const(rows), Dim::Const(cols)]);
     let x = builder.input(0, shape.clone(), DType::F32);
     let arg0 = builder.scalar_arg(0);
     let zero = builder.scalar_f32(0.0);
@@ -383,7 +405,7 @@ fn build_relu_case(rows: u32, cols: u32) -> BenchmarkCase {
 #[cfg(feature = "runtime")]
 fn build_softmax_case(rows: u32, cols: u32) -> BenchmarkCase {
     let mut builder = TensorExprBuilder::new();
-    let shape = Shape(vec![Dim::Lit(rows), Dim::Lit(cols)]);
+    let shape = Shape(vec![Dim::Const(rows), Dim::Const(cols)]);
     let x = builder.input(0, shape.clone(), DType::F32);
     let root = builder.softmax(x, shape, 1);
     let input = signed_seq_f32((rows * cols) as usize, 7);
@@ -400,14 +422,22 @@ fn build_attention_case(seq: u32, d: u32) -> BenchmarkCase {
     // softmax(Q · Kᵀ, axis=1) · V, expressed as two matmul decompositions with
     // an intermediate softmax — mirrors examples/egraph_visualize.rs:385.
     let mut builder = TensorExprBuilder::new();
-    let q = builder.input(0, Shape(vec![Dim::Lit(seq), Dim::Lit(d)]), DType::F32);
-    let k = builder.input(1, Shape(vec![Dim::Lit(seq), Dim::Lit(d)]), DType::F32);
-    let v = builder.input(2, Shape(vec![Dim::Lit(seq), Dim::Lit(d)]), DType::F32);
+    let q = builder.input(0, Shape(vec![Dim::Const(seq), Dim::Const(d)]), DType::F32);
+    let k = builder.input(1, Shape(vec![Dim::Const(seq), Dim::Const(d)]), DType::F32);
+    let v = builder.input(2, Shape(vec![Dim::Const(seq), Dim::Const(d)]), DType::F32);
 
     // Scores = Q · Kᵀ over tile [seq, seq, d], reducing the d axis.
-    let qk_tile = Shape(vec![Dim::Lit(seq), Dim::Lit(seq), Dim::Lit(d)]);
-    let q_r = builder.restride(q, qk_tile.clone(), Strides(vec![i64::from(d), 0, 1]));
-    let k_r = builder.restride(k, qk_tile.clone(), Strides(vec![0, i64::from(d), 1]));
+    let qk_tile = Shape(vec![Dim::Const(seq), Dim::Const(seq), Dim::Const(d)]);
+    let q_r = builder.restride(
+        q,
+        qk_tile.clone(),
+        Strides(vec![Dim::Const(d), Dim::Const(0), Dim::Const(1)]),
+    );
+    let k_r = builder.restride(
+        k,
+        qk_tile.clone(),
+        Strides(vec![Dim::Const(0), Dim::Const(d), Dim::Const(1)]),
+    );
     let arg0 = builder.scalar_arg(0);
     let arg1 = builder.scalar_arg(1);
     let mul_body = builder.scalar_binop(BinaryOp::Mul, [arg0, arg1]);
@@ -415,13 +445,21 @@ fn build_attention_case(seq: u32, d: u32) -> BenchmarkCase {
     let scores = builder.reduce(qk_mul, 2, ReduceOp::Add);
 
     // Probs = softmax(Scores, axis=1) over [seq, seq].
-    let scores_shape = Shape(vec![Dim::Lit(seq), Dim::Lit(seq)]);
+    let scores_shape = Shape(vec![Dim::Const(seq), Dim::Const(seq)]);
     let probs = builder.softmax(scores, scores_shape, 1);
 
     // Output = Probs · V over tile [seq, d, seq], reducing the inner seq axis.
-    let pv_tile = Shape(vec![Dim::Lit(seq), Dim::Lit(d), Dim::Lit(seq)]);
-    let p_r = builder.restride(probs, pv_tile.clone(), Strides(vec![i64::from(seq), 0, 1]));
-    let v_r = builder.restride(v, pv_tile.clone(), Strides(vec![0, 1, i64::from(d)]));
+    let pv_tile = Shape(vec![Dim::Const(seq), Dim::Const(d), Dim::Const(seq)]);
+    let p_r = builder.restride(
+        probs,
+        pv_tile.clone(),
+        Strides(vec![Dim::Const(seq), Dim::Const(0), Dim::Const(1)]),
+    );
+    let v_r = builder.restride(
+        v,
+        pv_tile.clone(),
+        Strides(vec![Dim::Const(0), Dim::Const(1), Dim::Const(d)]),
+    );
     let arg0 = builder.scalar_arg(0);
     let arg1 = builder.scalar_arg(1);
     let mul_body = builder.scalar_binop(BinaryOp::Mul, [arg0, arg1]);

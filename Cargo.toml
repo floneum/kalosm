@@ -37,12 +37,6 @@ members = [
     "fusor-ml/conformance",
     "fusor-ml/fusor",
     "fusor-ml/tensor-ir",
-    "fusor-ml/tensor-ir/crates/tensor_ir_frontend",
-    "fusor-ml/tensor-ir/crates/tensor_ir_egraph",
-    "fusor-ml/tensor-ir/crates/tensor_ir_opt",
-    "fusor-ml/tensor-ir/crates/tensor_ir_dispatch",
-    "fusor-ml/tensor-ir/crates/tensor_ir_codegen_naga",
-    "fusor-ml/tensor-ir/crates/tensor_ir_runtime_wgpu",
     "fusor-ml/types",
 ]
 
