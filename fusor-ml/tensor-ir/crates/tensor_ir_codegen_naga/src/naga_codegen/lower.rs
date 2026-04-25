@@ -2,8 +2,8 @@
 
 use egg::{Id, Language};
 use naga::{
-    BinaryOperator, Block, Expression, Handle, Literal, LocalVariable, MathFunction, ScalarKind,
-    Span, Statement, Type, UnaryOperator,
+    BinaryOperator, Block, Expression, Handle, Literal, LocalVariable, MathFunction, Scalar,
+    ScalarKind, Span, Statement, Type, UnaryOperator,
 };
 
 use crate::language::{DispatchNode, SimdNode, TensorIr, extract_list};
@@ -692,7 +692,7 @@ impl CodegenCtx<'_> {
         let ctr_var = self.local_variables.append(
             LocalVariable {
                 name: Some("k".into()),
-                ty: self.types.u32,
+                ty: self.types.scalar(self.module, Scalar::U32),
                 init: None,
             },
             Span::UNDEFINED,
@@ -769,35 +769,41 @@ impl CodegenCtx<'_> {
         }
     }
 
-    fn type_for_dtype(&self, dtype: DType) -> Handle<Type> {
-        self.types.scalar(dtype)
+    fn type_for_dtype(&mut self, dtype: DType) -> Handle<Type> {
+        self.types.scalar_for_dtype(self.module, dtype)
     }
 
     fn dtype_for_tier(&self, tier: &MemTier) -> DType {
         self.buffer_dtypes.get(tier).copied().unwrap_or(DType::F32)
     }
 
-    pub(super) fn infer_expr_type(&self, id: Id) -> Handle<Type> {
+    pub(super) fn infer_expr_type(&mut self, id: Id) -> Handle<Type> {
         let canonical = self.egraph.find(id);
         if let Some(dtype) = self.egraph[canonical].data.dtype {
             return self.type_for_dtype(dtype);
         }
         match self.select_lowering_node(canonical) {
             TensorIr::Const(value) => match value {
-                ScalarValue::F16(_) => self.types.f16,
-                ScalarValue::F32(_) => self.types.f32,
-                ScalarValue::I32(_) => self.types.i32,
-                ScalarValue::U32(_) => self.types.u32,
-                ScalarValue::Bool(_) => self.types.bool,
+                ScalarValue::F16(_) => self.types.scalar(self.module, Scalar::F16),
+                ScalarValue::F32(_) => self.types.scalar(self.module, Scalar::F32),
+                ScalarValue::I32(_) => self.types.scalar(self.module, Scalar::I32),
+                ScalarValue::U32(_) => self.types.scalar(self.module, Scalar::U32),
+                ScalarValue::Bool(_) => self.types.scalar(self.module, Scalar::BOOL),
             },
             TensorIr::Simd(SimdNode::Var(var)) => match var {
                 VarRef::Bound {
                     kind: BinderKind::Theta,
                     slot: slots::THETA_ACC,
                     ..
-                } => self.lookup_var_scalar_type(&var).unwrap_or(self.types.f32),
+                } => {
+                    if let Some(ty) = self.lookup_var_scalar_type(&var) {
+                        ty
+                    } else {
+                        self.types.scalar(self.module, Scalar::F32)
+                    }
+                }
                 // Iter index (Theta) and thread indices (Dispatch) are u32.
-                _ => self.types.u32,
+                _ => self.types.scalar(self.module, Scalar::U32),
             },
             TensorIr::Simd(SimdNode::Load { tier, .. }) => {
                 self.type_for_dtype(self.dtype_for_tier(&tier))
@@ -805,11 +811,11 @@ impl CodegenCtx<'_> {
             TensorIr::Simd(SimdNode::ReduceSimd { src, .. }) => self.infer_expr_type(src),
             TensorIr::Simd(SimdNode::Shuffle([src, _])) => self.infer_expr_type(src),
             TensorIr::UnOp(op, arg) => match op {
-                UnaryOp::CastF16 => self.types.f16,
-                UnaryOp::CastF32 => self.types.f32,
-                UnaryOp::CastI32 => self.types.i32,
-                UnaryOp::CastU32 => self.types.u32,
-                UnaryOp::CastBool | UnaryOp::Not => self.types.bool,
+                UnaryOp::CastF16 => self.types.scalar(self.module, Scalar::F16),
+                UnaryOp::CastF32 => self.types.scalar(self.module, Scalar::F32),
+                UnaryOp::CastI32 => self.types.scalar(self.module, Scalar::I32),
+                UnaryOp::CastU32 => self.types.scalar(self.module, Scalar::U32),
+                UnaryOp::CastBool | UnaryOp::Not => self.types.scalar(self.module, Scalar::BOOL),
                 _ => self.infer_expr_type(arg),
             },
             TensorIr::TernOp(op, args) => match op {
@@ -822,8 +828,8 @@ impl CodegenCtx<'_> {
                 | BinaryOp::Gt
                 | BinaryOp::Ge
                 | BinaryOp::Eq
-                | BinaryOp::Neq => self.types.bool,
-                _ if args.is_empty() => self.types.u32,
+                | BinaryOp::Neq => self.types.scalar(self.module, Scalar::BOOL),
+                _ if args.is_empty() => self.types.scalar(self.module, Scalar::U32),
                 _ => self.infer_expr_type(args[0]),
             },
             TensorIr::Dispatch(DispatchNode::Extract { index, tuple }) => {
@@ -835,24 +841,26 @@ impl CodegenCtx<'_> {
                     TensorIr::Simd(SimdNode::Var(var)) => self
                         .lookup_var_tuple_types(&var)
                         .and_then(|types| types.get(index as usize).copied())
-                        .unwrap_or(self.types.u32),
+                        .unwrap_or_else(|| self.types.scalar(self.module, Scalar::U32)),
                     TensorIr::Simd(SimdNode::Theta {
                         children: [init, ..],
                         ..
                     }) => {
                         let init_parts = self.theta_parts(init);
-                        init_parts
-                            .get(index as usize)
-                            .map_or(self.types.u32, |part| self.infer_expr_type(*part))
+                        if let Some(part) = init_parts.get(index as usize) {
+                            self.infer_expr_type(*part)
+                        } else {
+                            self.types.scalar(self.module, Scalar::U32)
+                        }
                     }
-                    _ => self.types.u32,
+                    _ => self.types.scalar(self.module, Scalar::U32),
                 }
             }
             TensorIr::Simd(SimdNode::Theta {
                 children: [init, ..],
                 ..
             }) => self.infer_expr_type(init),
-            _ => self.types.u32,
+            _ => self.types.scalar(self.module, Scalar::U32),
         }
     }
 

@@ -286,12 +286,25 @@ impl Device {
     }
 
     pub fn create_shader_module<'a>(&self, source: impl Into<Cow<'a, str>>) -> wgpu::ShaderModule {
-        // SAFTEY: All kernels don't access memory outside of bounds and don't have unbounded loops
+        // SAFETY: All kernels don't access memory outside of bounds and don't have unbounded loops
         unsafe {
             self.inner.device.create_shader_module_trusted(
                 wgpu::ShaderModuleDescriptor {
                     label: Some("Fusor ML Shader Module"),
                     source: wgpu::ShaderSource::Wgsl(source.into()),
+                },
+                wgpu::ShaderRuntimeChecks::unchecked(),
+            )
+        }
+    }
+
+    pub fn create_naga_shader_module(&self, module: wgpu::naga::Module) -> wgpu::ShaderModule {
+        // SAFETY: All kernels don't access memory outside of bounds and don't have unbounded loops
+        unsafe {
+            self.inner.device.create_shader_module_trusted(
+                wgpu::ShaderModuleDescriptor {
+                    label: Some("Fusor ML Shader Module"),
+                    source: wgpu::ShaderSource::Naga(Cow::Owned(module)),
                 },
                 wgpu::ShaderRuntimeChecks::unchecked(),
             )

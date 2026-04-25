@@ -1,7 +1,8 @@
 use std::{collections::HashMap, sync::Arc};
 
 use tensor_ir::{
-    DType, DispatchProgram, StageConfig, StagedPipeline, TensorExprProgram, TensorIr, lower_to_wgsl,
+    DType, DispatchProgram, StageConfig, StagedPipeline, TensorExprProgram, TensorIr,
+    lower_dispatch_program, verify,
 };
 use wgpu::{Buffer, CommandEncoder, ComputePipeline};
 
@@ -69,8 +70,9 @@ pub(crate) fn execute(
             "tensor_ir output dtype mismatch: program produced {final_datatype}, caller expected {output_datatype}"
         ));
     }
-    let wgsl = lower_to_wgsl(program)?;
-    let shader = device.create_shader_module(wgsl);
+    let verified = verify(program).map_err(|error| format!("verification error: {error}"))?;
+    let module = lower_dispatch_program(verified);
+    let shader = device.create_naga_shader_module(module);
 
     let mut produced_buffers: HashMap<egg::Id, Arc<Buffer>> = HashMap::default();
     let mut final_output = None;

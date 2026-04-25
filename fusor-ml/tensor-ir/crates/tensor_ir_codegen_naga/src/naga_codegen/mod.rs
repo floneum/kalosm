@@ -10,8 +10,8 @@ use egg::{EGraph, Id};
 use naga::{
     AddressSpace, Arena, ArraySize, BinaryOperator, Binding, Block, BuiltIn, EntryPoint,
     Expression, Function, FunctionArgument, GlobalVariable, Handle, Literal, LocalVariable, Module,
-    ResourceBinding, Scalar, ScalarKind, ShaderStage, Span, Statement, StorageAccess, Type,
-    TypeInner, VectorSize,
+    ResourceBinding, Scalar, ShaderStage, Span, Statement, StorageAccess, Type, TypeInner,
+    VectorSize,
 };
 
 use crate::analysis::TensorAnalysis;
@@ -23,38 +23,70 @@ use crate::{Verified, verify};
 pub(super) const MAX_DISPATCH_WORKGROUPS_PER_DIMENSION: u32 = 65_535;
 
 /// Cached type handles used throughout codegen.
+#[derive(Default)]
 struct TypeCache {
-    f16: Handle<Type>,
-    f32: Handle<Type>,
-    u32: Handle<Type>,
-    i32: Handle<Type>,
-    bool: Handle<Type>,
-    vec3_u32: Handle<Type>,
-    /// Runtime-sized storage buffer element types.
-    rt_array_f16: Handle<Type>,
-    rt_array_f32: Handle<Type>,
-    rt_array_u32: Handle<Type>,
-    rt_array_i32: Handle<Type>,
+    handles: HashMap<Type, Handle<Type>>,
 }
 
 impl TypeCache {
-    fn scalar(&self, dtype: DType) -> Handle<Type> {
+    fn get(&mut self, module: &mut Module, ty: Type) -> Handle<Type> {
+        if let Some(&handle) = self.handles.get(&ty) {
+            return handle;
+        }
+
+        let handle = module.types.insert(ty.clone(), Span::UNDEFINED);
+        self.handles.insert(ty, handle);
+        handle
+    }
+
+    fn unnamed(&mut self, module: &mut Module, inner: TypeInner) -> Handle<Type> {
+        self.get(module, Type { name: None, inner })
+    }
+
+    fn scalar(&mut self, module: &mut Module, scalar: Scalar) -> Handle<Type> {
+        self.unnamed(module, TypeInner::Scalar(scalar))
+    }
+
+    fn scalar_for_dtype(&mut self, module: &mut Module, dtype: DType) -> Handle<Type> {
+        self.scalar(module, Self::dtype_scalar(dtype))
+    }
+
+    fn vector(&mut self, module: &mut Module, size: VectorSize, scalar: Scalar) -> Handle<Type> {
+        self.unnamed(module, TypeInner::Vector { size, scalar })
+    }
+
+    fn array(
+        &mut self,
+        module: &mut Module,
+        base: Handle<Type>,
+        size: ArraySize,
+        stride: u32,
+    ) -> Handle<Type> {
+        self.unnamed(module, TypeInner::Array { base, size, stride })
+    }
+
+    fn runtime_array(&mut self, module: &mut Module, dtype: DType) -> Handle<Type> {
+        let scalar = Self::storage_scalar(dtype);
+        let base = self.scalar(module, scalar);
+        self.array(module, base, ArraySize::Dynamic, dtype.byte_size())
+    }
+
+    const fn dtype_scalar(dtype: DType) -> Scalar {
         match dtype {
-            DType::F16 => self.f16,
-            DType::F32 => self.f32,
-            DType::U32 => self.u32,
-            DType::I32 => self.i32,
-            DType::Bool => self.bool,
+            DType::F16 => Scalar::F16,
+            DType::F32 => Scalar::F32,
+            DType::U32 => Scalar::U32,
+            DType::I32 => Scalar::I32,
+            DType::Bool => Scalar::BOOL,
         }
     }
 
-    fn runtime_array(&self, dtype: DType) -> Handle<Type> {
+    const fn storage_scalar(dtype: DType) -> Scalar {
         match dtype {
-            DType::F16 => self.rt_array_f16,
-            DType::F32 => self.rt_array_f32,
-            DType::U32 => self.rt_array_u32,
-            DType::I32 => self.rt_array_i32,
-            DType::Bool => self.rt_array_u32,
+            // Naga/WGSL bools are not host-shareable, so bool tensor storage
+            // uses the same 32-bit word representation as `DType::byte_size`.
+            DType::Bool => Scalar::U32,
+            _ => Self::dtype_scalar(dtype),
         }
     }
 }
@@ -64,8 +96,9 @@ impl TypeCache {
 /// Holds the Naga function being built (expressions, locals, body) plus
 /// mappings from e-graph Ids and Var names to Naga expression handles.
 struct CodegenCtx<'a> {
+    module: &'a mut Module,
     egraph: &'a EGraph<TensorIr, TensorAnalysis>,
-    types: &'a TypeCache,
+    types: &'a mut TypeCache,
 
     /// Number of simdgroups per physical workgroup for this dispatch.
     simdgroups: u32,
@@ -186,8 +219,7 @@ impl BinderFrame {
 pub fn lower_dispatch_program(verified: Verified<'_>) -> Module {
     let program = verified.program();
     let mut module = Module::default();
-
-    let types = register_types(&mut module);
+    let mut types = TypeCache::default();
 
     for (i, dispatch) in program.dispatches.iter().enumerate() {
         lower_single_dispatch(
@@ -195,7 +227,7 @@ pub fn lower_dispatch_program(verified: Verified<'_>) -> Module {
             &program.egraph,
             dispatch,
             i,
-            &types,
+            &mut types,
             &program.chosen_nodes,
             program.device.simd_width,
         );
@@ -281,133 +313,6 @@ pub fn module_to_msl(module: &Module) -> Result<String, String> {
 }
 
 // ═══════════════════════════════════════════════════════════════
-// Type registration
-// ═══════════════════════════════════════════════════════════════
-
-fn register_types(module: &mut Module) -> TypeCache {
-    let f16 = module.types.insert(
-        Type {
-            name: None,
-            inner: TypeInner::Scalar(Scalar {
-                kind: ScalarKind::Float,
-                width: 2,
-            }),
-        },
-        Span::UNDEFINED,
-    );
-    let f32 = module.types.insert(
-        Type {
-            name: None,
-            inner: TypeInner::Scalar(Scalar {
-                kind: ScalarKind::Float,
-                width: 4,
-            }),
-        },
-        Span::UNDEFINED,
-    );
-    let u32_ty = module.types.insert(
-        Type {
-            name: None,
-            inner: TypeInner::Scalar(Scalar {
-                kind: ScalarKind::Uint,
-                width: 4,
-            }),
-        },
-        Span::UNDEFINED,
-    );
-    let i32_ty = module.types.insert(
-        Type {
-            name: None,
-            inner: TypeInner::Scalar(Scalar {
-                kind: ScalarKind::Sint,
-                width: 4,
-            }),
-        },
-        Span::UNDEFINED,
-    );
-    let bool_ty = module.types.insert(
-        Type {
-            name: None,
-            inner: TypeInner::Scalar(Scalar {
-                kind: ScalarKind::Bool,
-                width: 1,
-            }),
-        },
-        Span::UNDEFINED,
-    );
-    let vec3_u32 = module.types.insert(
-        Type {
-            name: None,
-            inner: TypeInner::Vector {
-                size: VectorSize::Tri,
-                scalar: Scalar {
-                    kind: ScalarKind::Uint,
-                    width: 4,
-                },
-            },
-        },
-        Span::UNDEFINED,
-    );
-    let rt_array_f16 = module.types.insert(
-        Type {
-            name: None,
-            inner: TypeInner::Array {
-                base: f16,
-                size: ArraySize::Dynamic,
-                stride: 2,
-            },
-        },
-        Span::UNDEFINED,
-    );
-    let rt_array_f32 = module.types.insert(
-        Type {
-            name: None,
-            inner: TypeInner::Array {
-                base: f32,
-                size: ArraySize::Dynamic,
-                stride: 4,
-            },
-        },
-        Span::UNDEFINED,
-    );
-    let rt_array_u32 = module.types.insert(
-        Type {
-            name: None,
-            inner: TypeInner::Array {
-                base: u32_ty,
-                size: ArraySize::Dynamic,
-                stride: 4,
-            },
-        },
-        Span::UNDEFINED,
-    );
-    let rt_array_i32 = module.types.insert(
-        Type {
-            name: None,
-            inner: TypeInner::Array {
-                base: i32_ty,
-                size: ArraySize::Dynamic,
-                stride: 4,
-            },
-        },
-        Span::UNDEFINED,
-    );
-
-    TypeCache {
-        f16,
-        f32,
-        u32: u32_ty,
-        i32: i32_ty,
-        bool: bool_ty,
-        vec3_u32,
-        rt_array_f16,
-        rt_array_f32,
-        rt_array_u32,
-        rt_array_i32,
-    }
-}
-
-// ═══════════════════════════════════════════════════════════════
 // Per-dispatch lowering
 // ═══════════════════════════════════════════════════════════════
 
@@ -416,7 +321,7 @@ fn lower_single_dispatch(
     egraph: &EGraph<TensorIr, TensorAnalysis>,
     dispatch: &DispatchInfo,
     dispatch_idx: usize,
-    types: &TypeCache,
+    types: &mut TypeCache,
     chosen_nodes: &HashMap<Id, TensorIr>,
     simd_width: u32,
 ) {
@@ -443,6 +348,7 @@ fn lower_single_dispatch(
     );
 
     let mut ctx = build_codegen_ctx(
+        module,
         egraph,
         dispatch,
         types,
@@ -453,13 +359,8 @@ fn lower_single_dispatch(
     );
     emit_dispatch_outputs(&mut ctx, &dispatch.outputs, output_gv);
     emit_dispatch_bounds_guard(&mut ctx, dispatch);
-    module.entry_points.push(build_dispatch_entry_point(
-        ctx,
-        dispatch_idx,
-        dispatch,
-        types,
-        simd_width,
-    ));
+    let entry_point = build_dispatch_entry_point(ctx, dispatch_idx, dispatch, simd_width);
+    module.entry_points.push(entry_point);
 }
 
 fn dtype_for_id(egraph: &EGraph<TensorIr, TensorAnalysis>, id: Id) -> DType {
@@ -512,7 +413,7 @@ fn build_buffer_dtypes(
 fn register_input_buffers(
     module: &mut Module,
     dispatch: &DispatchInfo,
-    types: &TypeCache,
+    types: &mut TypeCache,
     input_dtypes: &[DType],
     buffer_map: &mut HashMap<MemTier, (Handle<GlobalVariable>, bool)>,
 ) -> u32 {
@@ -521,6 +422,7 @@ fn register_input_buffers(
         let slot = u32::try_from(index).expect("input slot fits in u32");
         let buf_ref = BufferRef::Input(slot);
         let dtype = input_dtypes.get(index).copied().unwrap_or(DType::F32);
+        let ty = types.runtime_array(module, dtype);
         let gv = module.global_variables.append(
             GlobalVariable {
                 name: Some(format!("input_{index}")),
@@ -531,7 +433,7 @@ fn register_input_buffers(
                     group: 0,
                     binding: binding_idx,
                 }),
-                ty: types.runtime_array(dtype),
+                ty,
                 init: None,
             },
             Span::UNDEFINED,
@@ -544,11 +446,12 @@ fn register_input_buffers(
 
 fn register_output_buffer(
     module: &mut Module,
-    types: &TypeCache,
+    types: &mut TypeCache,
     output_dtype: DType,
     buffer_map: &mut HashMap<MemTier, (Handle<GlobalVariable>, bool)>,
     binding_idx: u32,
 ) -> Handle<GlobalVariable> {
+    let ty = types.runtime_array(module, output_dtype);
     let output_gv = module.global_variables.append(
         GlobalVariable {
             name: Some("output".into()),
@@ -559,7 +462,7 @@ fn register_output_buffer(
                 group: 0,
                 binding: binding_idx,
             }),
-            ty: types.runtime_array(output_dtype),
+            ty,
             init: None,
         },
         Span::UNDEFINED,
@@ -569,9 +472,10 @@ fn register_output_buffer(
 }
 
 fn build_codegen_ctx<'a>(
+    module: &'a mut Module,
     egraph: &'a EGraph<TensorIr, TensorAnalysis>,
     dispatch: &DispatchInfo,
-    types: &'a TypeCache,
+    types: &'a mut TypeCache,
     chosen_nodes: &'a HashMap<Id, TensorIr>,
     buffer_map: HashMap<MemTier, (Handle<GlobalVariable>, bool)>,
     buffer_dtypes: HashMap<MemTier, DType>,
@@ -588,6 +492,7 @@ fn build_codegen_ctx<'a>(
         .collect();
 
     CodegenCtx {
+        module,
         egraph,
         types,
         simdgroups: dispatch.simdgroups,
@@ -713,20 +618,20 @@ fn build_dispatch_entry_point(
     ctx: CodegenCtx<'_>,
     dispatch_idx: usize,
     dispatch: &DispatchInfo,
-    types: &TypeCache,
     simd_width: u32,
 ) -> EntryPoint {
+    let vec3_u32 = ctx.types.vector(ctx.module, VectorSize::Tri, Scalar::U32);
     let function = Function {
         name: Some(format!("dispatch_{dispatch_idx}")),
         arguments: vec![
             FunctionArgument {
                 name: Some("local_invocation_id".into()),
-                ty: types.vec3_u32,
+                ty: vec3_u32,
                 binding: Some(Binding::BuiltIn(BuiltIn::LocalInvocationId)),
             },
             FunctionArgument {
                 name: Some("workgroup_id".into()),
-                ty: types.vec3_u32,
+                ty: vec3_u32,
                 binding: Some(Binding::BuiltIn(BuiltIn::WorkGroupId)),
             },
         ],
@@ -765,7 +670,7 @@ fn binary_args(args: &[Id]) -> Option<[Id; 2]> {
 fn declare_workgroup_buffers(
     module: &mut Module,
     dispatch: &DispatchInfo,
-    types: &TypeCache,
+    types: &mut TypeCache,
     input_dtypes: &[DType],
     output_dtype: DType,
     buf_map: &mut HashMap<MemTier, (Handle<GlobalVariable>, bool)>,
@@ -777,18 +682,12 @@ fn declare_workgroup_buffers(
             continue;
         }
         let dtype = dtype_for_buffer_ref(input_dtypes, output_dtype, buf_info.device_name);
-        let fixed_arr = module.types.insert(
-            Type {
-                name: None,
-                inner: TypeInner::Array {
-                    base: types.scalar(dtype),
-                    size: ArraySize::Constant(
-                        std::num::NonZeroU32::new(buf_info.size.max(1)).unwrap(),
-                    ),
-                    stride: dtype.byte_size(),
-                },
-            },
-            Span::UNDEFINED,
+        let base = types.scalar_for_dtype(module, dtype);
+        let fixed_arr = types.array(
+            module,
+            base,
+            ArraySize::Constant(std::num::NonZeroU32::new(buf_info.size.max(1)).unwrap()),
+            dtype.byte_size(),
         );
         let gv = module.global_variables.append(
             GlobalVariable {
@@ -811,3 +710,81 @@ fn declare_workgroup_buffers(
 
 mod emit;
 mod lower;
+
+#[cfg(test)]
+mod tests {
+    use std::num::NonZeroU32;
+
+    use super::*;
+
+    #[test]
+    fn type_cache_is_lazy_and_dedupes_types() {
+        let mut module = Module::default();
+        let mut cache = TypeCache::default();
+
+        assert_eq!(module.types.len(), 0);
+
+        let f32_a = cache.scalar(&mut module, Scalar::F32);
+        let f32_b = cache.scalar(&mut module, Scalar::F32);
+        assert_eq!(f32_a, f32_b);
+        assert_eq!(module.types.len(), 1);
+
+        let array_a = cache.array(
+            &mut module,
+            f32_a,
+            ArraySize::Constant(NonZeroU32::new(4).unwrap()),
+            4,
+        );
+        let array_b = cache.array(
+            &mut module,
+            f32_a,
+            ArraySize::Constant(NonZeroU32::new(4).unwrap()),
+            4,
+        );
+        assert_eq!(array_a, array_b);
+        assert_eq!(module.types.len(), 2);
+    }
+
+    #[test]
+    fn type_cache_keys_include_the_full_type() {
+        let mut module = Module::default();
+        let mut cache = TypeCache::default();
+
+        let u32_ty = cache.scalar(&mut module, Scalar::U32);
+        let inner = TypeInner::Struct {
+            members: vec![naga::StructMember {
+                name: Some("value".into()),
+                ty: u32_ty,
+                binding: None,
+                offset: 0,
+            }],
+            span: 4,
+        };
+
+        let named_a = cache.get(
+            &mut module,
+            Type {
+                name: Some("A".into()),
+                inner: inner.clone(),
+            },
+        );
+        let named_a_again = cache.get(
+            &mut module,
+            Type {
+                name: Some("A".into()),
+                inner: inner.clone(),
+            },
+        );
+        let named_b = cache.get(
+            &mut module,
+            Type {
+                name: Some("B".into()),
+                inner,
+            },
+        );
+
+        assert_eq!(named_a, named_a_again);
+        assert_ne!(named_a, named_b);
+        assert_eq!(module.types.len(), 3);
+    }
+}
