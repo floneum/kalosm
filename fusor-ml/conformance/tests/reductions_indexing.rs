@@ -233,7 +233,9 @@ async fn indexing_cast_and_rank_specific_indexing_match_reference() {
             .collect();
         Tensor::new(&device, &out)
     })
-    .compare_with(approx_compare::<2, f32>(1e-6))
+    // WARP/DX12 can round f32 -> f16 one half-precision ULP differently
+    // from the CPU reference in this value range.
+    .compare_with(approx_compare::<2, f32>(5e-3))
     .runs(3)
     .await
     .unwrap();

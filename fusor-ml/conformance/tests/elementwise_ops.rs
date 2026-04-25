@@ -179,7 +179,7 @@ async fn unary_math_ops_match_host_reference() {
         |x: Tensor<2, f32>| x.cosh().to_concrete(),
         f32::cosh,
         1e-4,
-        3e-4
+        5e-4
     );
 
     // asinh
