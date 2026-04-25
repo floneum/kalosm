@@ -27,8 +27,6 @@ impl<D: DataType> Tensor<4, D> {
         sin: &Tensor<2, D>,
         mode: RopeMode,
     ) -> Tensor<4, D> {
-        let [_, _, _, head_dim] = *self.shape();
-
         let operation = RopeFusedOperation {
             input: self.key(),
             cos: cos.key(),
@@ -36,7 +34,6 @@ impl<D: DataType> Tensor<4, D> {
             datatype: self.datatype(),
             shape: (*self.shape()).into(),
             mode,
-            head_dim,
         }
         .to_nary();
 
@@ -61,7 +58,6 @@ struct RopeFusedOperation {
     datatype: DataTypeEnum,
     shape: Box<[usize]>,
     mode: RopeMode,
-    head_dim: usize,
 }
 
 impl RopeFusedOperation {
@@ -121,24 +117,16 @@ impl RopeFusedOperation {
 
         let cos_sin_dim = match self.mode {
             // Interleaved: index = dim_last / 2
-            RopeMode::Interleaved => NaryExpr::unary_op(
+            RopeMode::Interleaved => {
+                NaryExpr::unsupported_unary(dim_last, "div2", DataTypeEnum::U32, DataTypeEnum::U32)
+            }
+            // Normal: index = dim_last % half
+            RopeMode::Normal => NaryExpr::unsupported_unary(
                 dim_last,
-                "div2",
-                "let output = input / 2u;",
+                "mod_half",
                 DataTypeEnum::U32,
                 DataTypeEnum::U32,
             ),
-            // Normal: index = dim_last % half
-            RopeMode::Normal => {
-                let half = self.head_dim / 2;
-                NaryExpr::unary_op(
-                    dim_last,
-                    "mod_half",
-                    format!("let output = input % {}u;", half),
-                    DataTypeEnum::U32,
-                    DataTypeEnum::U32,
-                )
-            }
         };
 
         vec![dim_seq, cos_sin_dim]
@@ -150,27 +138,19 @@ impl RopeFusedOperation {
 
         match self.mode {
             // Interleaved: neighbor at dim_last ± 1 based on parity
-            RopeMode::Interleaved => NaryExpr::unary_op(
+            RopeMode::Interleaved => NaryExpr::unsupported_unary(
                 dim_last,
                 "neighbor_idx",
-                "let output = select(input - 1u, input + 1u, (input % 2u) == 0u);",
                 DataTypeEnum::U32,
                 DataTypeEnum::U32,
             ),
             // Normal: neighbor at dim_last ± half based on position
-            RopeMode::Normal => {
-                let half = self.head_dim / 2;
-                NaryExpr::unary_op(
-                    dim_last,
-                    "neighbor_idx",
-                    format!(
-                        "let output = select(input - {}u, input + {}u, input < {}u);",
-                        half, half, half
-                    ),
-                    DataTypeEnum::U32,
-                    DataTypeEnum::U32,
-                )
-            }
+            RopeMode::Normal => NaryExpr::unsupported_unary(
+                dim_last,
+                "neighbor_idx",
+                DataTypeEnum::U32,
+                DataTypeEnum::U32,
+            ),
         }
     }
 
@@ -180,24 +160,16 @@ impl RopeFusedOperation {
 
         match self.mode {
             // Interleaved: sign based on dim_last % 2 (even = -sin, odd = +sin)
-            RopeMode::Interleaved => NaryExpr::unary_op(
+            RopeMode::Interleaved => {
+                NaryExpr::unsupported_unary(dim_last, "mod2", DataTypeEnum::U32, DataTypeEnum::U32)
+            }
+            // Normal: sign based on dim_last / half (first half = -sin, second half = +sin)
+            RopeMode::Normal => NaryExpr::unsupported_unary(
                 dim_last,
-                "mod2",
-                "let output = input % 2u;",
+                "div_half",
                 DataTypeEnum::U32,
                 DataTypeEnum::U32,
             ),
-            // Normal: sign based on dim_last / half (first half = -sin, second half = +sin)
-            RopeMode::Normal => {
-                let half = self.head_dim / 2;
-                NaryExpr::unary_op(
-                    dim_last,
-                    "div_half",
-                    format!("let output = input / {}u;", half),
-                    DataTypeEnum::U32,
-                    DataTypeEnum::U32,
-                )
-            }
         }
     }
 

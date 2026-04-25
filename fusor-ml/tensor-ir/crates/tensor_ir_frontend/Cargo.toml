@@ -1,0 +1,8 @@
+[package]
+name = "tensor_ir_frontend"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+ordered-float = "5.0.0"

@@ -17,7 +17,6 @@ pub use tensor::*;
 // Re-export wasm-compatible Send/Sync traits
 pub use wgpu::{WasmNotSend, WasmNotSendSync, WasmNotSync};
 
-pub use matmul::*;
 pub use resize::ShapeWithOneHole;
 pub use varbuilder::{ShardedVarBuilder, VarBuilder};
 
@@ -29,18 +28,19 @@ mod element_wise;
 mod index_select;
 mod layout;
 mod map_layout;
-pub mod matmul;
+mod matmul;
+pub(crate) use matmul::MatMulOperation;
 mod mir;
 mod nary_wise;
 mod pair_wise;
 mod quantized;
-mod quantized_types_wgsl;
 mod rank;
 mod reduce;
 mod resize;
 mod slice_assign;
 mod tensor;
-mod util;
+mod tensor_ir_lowering;
+mod tensor_ir_runtime;
 mod varbuilder;
 mod visit_tiled;
 

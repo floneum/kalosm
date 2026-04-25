@@ -1,0 +1,12 @@
+[package]
+name = "tensor_ir_opt"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+egg = "0.10.0"
+ordered-float = "5.0.0"
+tracing = "0.1"
+tensor_ir_frontend = { path = "../tensor_ir_frontend" }
+tensor_ir_egraph = { path = "../tensor_ir_egraph" }

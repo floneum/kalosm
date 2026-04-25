@@ -2553,6 +2553,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "egg"
+version = "0.10.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "abb749745461743bb477fba3ef87c663d5965876155c676c9489cfe0963de5ab"
+dependencies = [
+ "env_logger 0.9.3",
+ "hashbrown 0.15.5",
+ "indexmap 2.13.0",
+ "log",
+ "num-bigint",
+ "num-traits",
+ "quanta",
+ "rustc-hash 2.1.1",
+ "saturating",
+ "smallvec 1.15.1",
+ "symbol_table",
+ "symbolic_expressions",
+ "thiserror 1.0.69",
+]
+
+[[package]]
 name = "ego-tree"
 version = "0.6.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2657,6 +2678,15 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.117",
+]
+
+[[package]]
+name = "env_logger"
+version = "0.9.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a12e6657c4c97ebab115a42dcee77225f7f482cdd841cf7088c657a42e9e00e7"
+dependencies = [
+ "log",
 ]
 
 [[package]]
@@ -3035,8 +3065,9 @@ dependencies = [
  "candle-nn",
  "candle-transformers",
  "criterion 0.3.6",
+ "egg",
  "enumset",
- "env_logger",
+ "env_logger 0.10.2",
  "fusor-gguf",
  "fusor-types",
  "futures",
@@ -3056,6 +3087,7 @@ dependencies = [
  "reqwest 0.12.28",
  "rustc-hash 2.1.1",
  "tabbycat",
+ "tensor_ir",
  "thiserror 2.0.18",
  "tokio",
  "tracing",
@@ -7024,6 +7056,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "quanta"
+version = "0.12.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f3ab5a9d756f0d97bdc89019bd2e4ea098cf9cde50ee7564dde6b81ccc8f06c7"
+dependencies = [
+ "crossbeam-utils",
+ "libc",
+ "once_cell",
+ "raw-cpuid 11.6.0",
+ "wasi",
+ "web-sys",
+ "winapi",
+]
+
+[[package]]
 name = "quick-error"
 version = "2.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -8106,6 +8153,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "saturating"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ece8e78b2f38ec51c51f5d475df0a7187ba5111b2a28bdc761ee05b075d40a71"
+
+[[package]]
 name = "schannel"
 version = "0.1.29"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -8945,6 +8998,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "symbol_table"
+version = "0.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f19bffd69fb182e684d14e3c71d04c0ef33d1641ac0b9e81c712c734e83703bc"
+dependencies = [
+ "crossbeam-utils",
+ "foldhash 0.1.5",
+ "hashbrown 0.15.5",
+]
+
+[[package]]
+name = "symbolic_expressions"
+version = "5.0.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7c68d531d83ec6c531150584c42a4290911964d5f0d79132b193b67252a23b71"
+
+[[package]]
 name = "symphonia"
 version = "0.5.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -9184,6 +9254,89 @@ dependencies = [
  "futf",
  "mac",
  "utf-8",
+]
+
+[[package]]
+name = "tensor_ir"
+version = "0.1.0"
+dependencies = [
+ "bytemuck",
+ "candle-core 0.9.2",
+ "egg",
+ "naga",
+ "ordered-float 5.1.0",
+ "pollster",
+ "tensor_ir_codegen_naga",
+ "tensor_ir_dispatch",
+ "tensor_ir_egraph",
+ "tensor_ir_frontend",
+ "tensor_ir_opt",
+ "tensor_ir_runtime_wgpu",
+ "tracing",
+ "wgpu",
+]
+
+[[package]]
+name = "tensor_ir_codegen_naga"
+version = "0.1.0"
+dependencies = [
+ "egg",
+ "naga",
+ "tensor_ir_dispatch",
+ "tensor_ir_egraph",
+ "tensor_ir_frontend",
+]
+
+[[package]]
+name = "tensor_ir_dispatch"
+version = "0.1.0"
+dependencies = [
+ "egg",
+ "tensor_ir_egraph",
+ "tensor_ir_frontend",
+ "tracing",
+]
+
+[[package]]
+name = "tensor_ir_egraph"
+version = "0.1.0"
+dependencies = [
+ "egg",
+ "ordered-float 5.1.0",
+ "tensor_ir_frontend",
+ "tracing",
+]
+
+[[package]]
+name = "tensor_ir_frontend"
+version = "0.1.0"
+dependencies = [
+ "ordered-float 5.1.0",
+]
+
+[[package]]
+name = "tensor_ir_opt"
+version = "0.1.0"
+dependencies = [
+ "egg",
+ "ordered-float 5.1.0",
+ "tensor_ir_egraph",
+ "tensor_ir_frontend",
+ "tracing",
+]
+
+[[package]]
+name = "tensor_ir_runtime_wgpu"
+version = "0.1.0"
+dependencies = [
+ "bytemuck",
+ "egg",
+ "pollster",
+ "tensor_ir_codegen_naga",
+ "tensor_ir_dispatch",
+ "tensor_ir_egraph",
+ "tensor_ir_frontend",
+ "wgpu",
 ]
 
 [[package]]

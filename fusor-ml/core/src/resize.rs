@@ -1,18 +1,7 @@
-use std::fmt::Write;
-
 use crate::{
-    DataTypeEnum, Layout, SmallerRank, TILE_SIZE, Tensor, TensorData,
-    compute_graph::NodeIndex,
-    map_layout::MapLayoutOperation,
-    mir::{
-        kernel::GenericKernel,
-        operation::Operation,
-        workgroup_shape::{Constraint, WorkgroupShapeConstraints},
-    },
-    visit_tiled::distribute_workgroups,
+    Layout, SmallerRank, Tensor, TensorData, compute_graph::NodeIndex,
+    map_layout::MapLayoutOperation, mir::operation::Operation,
 };
-
-const BLOCKSIZE: u32 = 256;
 
 #[derive(Debug, Clone)]
 pub(crate) struct ResizeOperation {
@@ -101,72 +90,9 @@ impl ResizeOperation {
             Layout::from_parts(offset, new_shape.clone(), new_strides.as_slice().into())
         }))
     }
-
-    fn kernel(
-        &self,
-        input_rank: u32,
-        datatype: DataTypeEnum,
-        tile_size: u32,
-        kernel: &mut GenericKernel,
-    ) {
-        let global_id = kernel.global_id();
-        let input = kernel.add_tensor_input(input_rank, true, datatype);
-        let output = kernel.add_tensor_input(self.new_shape.len() as u32, true, datatype);
-
-        for local_index in 0..tile_size {
-            writeln!(kernel, "{{").unwrap();
-            for (prefix, tensor) in [("input", &input), ("output", &output)] {
-                writeln!(
-                    kernel,
-                    "var {prefix}_remaining_index = {global_id}.x * {tile_size} + {local_index};"
-                )
-                .unwrap();
-                for i in (0..tensor.rank()).rev() {
-                    let shape_i = tensor.shape_binding(i);
-                    writeln!(
-                        kernel,
-                        "let {prefix}_index_{i} = {prefix}_remaining_index % {shape_i};",
-                    )
-                    .unwrap();
-                    writeln!(kernel, "{prefix}_remaining_index /= {shape_i};",).unwrap();
-                }
-            }
-            write!(kernel, "let input_index = ").unwrap();
-            input.strided_index(kernel, (0..).map(|i| format!("input_index_{i}")));
-            writeln!(kernel, ";").unwrap();
-            write!(kernel, "let output_index = ").unwrap();
-            output.strided_index(kernel, (0..).map(|i| format!("output_index_{i}")));
-            writeln!(kernel, ";").unwrap();
-            writeln!(kernel, "{output}[output_index] = {input}[input_index];").unwrap();
-
-            writeln!(kernel, "}}").unwrap();
-        }
-    }
 }
 
 impl Operation for ResizeOperation {
-    fn workgroup_shape_constraints(
-        &self,
-        _: &crate::Device,
-    ) -> crate::mir::workgroup_shape::WorkgroupShapeConstraints {
-        let mut constraints = WorkgroupShapeConstraints::new();
-        constraints.add_constraint(0, Constraint::equals(BLOCKSIZE));
-        constraints.add_constraint(1, Constraint::equals(1));
-        constraints.add_constraint(2, Constraint::equals(1));
-        constraints
-    }
-
-    fn dispatch_size(
-        &self,
-        _: &crate::mir::workgroup_shape::WorkgroupShape,
-        inputs: &[crate::mir::inputs::MirValue],
-    ) -> [u32; 3] {
-        let input = inputs[1].as_tensor().unwrap();
-        let total_workgroups = (input.layout().shape().iter().product::<usize>() as u32)
-            .div_ceil(TILE_SIZE * BLOCKSIZE);
-        distribute_workgroups(total_workgroups)
-    }
-
     fn visit_dependencies(&self, f: &mut dyn FnMut(NodeIndex)) {
         f(self.input);
     }
@@ -180,34 +106,6 @@ impl Operation for ResizeOperation {
         let output_sliced =
             output.slice(&self.fill_shape.iter().map(|x| 0..*x).collect::<Vec<_>>());
         vec![input.into(), output_sliced.into()]
-    }
-
-    fn build_kernel(
-        &self,
-        _: &crate::compute_graph::ComputeGraphInner,
-        _: &crate::mir::workgroup_shape::WorkgroupShape,
-        inputs: &[crate::mir::inputs::MirValue],
-        kernel: &mut GenericKernel,
-    ) {
-        let input = inputs[0].as_tensor().unwrap();
-        let rank = input.layout().rank() as u32;
-        let datatype = input.datatype();
-        self.kernel(rank, datatype, TILE_SIZE, kernel);
-    }
-
-    fn output(
-        &self,
-        _: &crate::compute_graph::ComputeGraphInner,
-        inputs: &[crate::mir::inputs::MirValue],
-    ) -> crate::mir::inputs::MirValue {
-        let output = inputs[1].as_tensor().unwrap();
-        TensorData::new_from_buffer(
-            output.device(),
-            output.buffer().clone(),
-            &self.new_shape,
-            output.datatype(),
-        )
-        .into()
     }
 
     fn name(&self) -> String {

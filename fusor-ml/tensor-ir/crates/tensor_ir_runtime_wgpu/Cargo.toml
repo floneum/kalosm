@@ -1,0 +1,15 @@
+[package]
+name = "tensor_ir_runtime_wgpu"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+egg = "0.10.0"
+wgpu = { git = "https://github.com/ealmloff/wgpu", branch = "yield-now", features = ["naga-ir"] }
+pollster = "0.4"
+bytemuck = { version = "1", features = ["derive"] }
+tensor_ir_frontend = { path = "../tensor_ir_frontend" }
+tensor_ir_egraph = { path = "../tensor_ir_egraph" }
+tensor_ir_dispatch = { path = "../tensor_ir_dispatch" }
+tensor_ir_codegen_naga = { path = "../tensor_ir_codegen_naga" }

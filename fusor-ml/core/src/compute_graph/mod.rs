@@ -14,10 +14,16 @@ mod visualize;
 
 use crate::{
     DataTypeEnum, Device, MatMulOperation, QMatrix, ReduceOperation,
-    compute_graph::resolve::ResolverResult, dequantize::DequantizeOperation,
-    map_layout::MapLayoutOperation, mir::operation::Operation, nary_wise::NaryOperation,
-    quantized::matmul::QMatMulOperation, resize::ResizeOperation,
-    slice_assign::SliceAssignOperation, tensor::TensorData, visit_tiled::MaybeQData,
+    compute_graph::resolve::ResolverResult,
+    dequantize::DequantizeOperation,
+    map_layout::MapLayoutOperation,
+    mir::operation::Operation,
+    nary_wise::{NaryInputReplacement, NaryOperation},
+    quantized::matmul::QMatMulOperation,
+    resize::ResizeOperation,
+    slice_assign::SliceAssignOperation,
+    tensor::TensorData,
+    visit_tiled::MaybeQData,
 };
 
 #[derive(Clone)]
@@ -46,7 +52,10 @@ impl ComputeGraph {
     }
 
     pub(crate) fn create_nary(&self, op: NaryOperation) -> NodeIndex {
-        self.create_node(ComputeGraphNodeVariant::Nary(op))
+        self.with_mut(|inner| {
+            let op = inner.fuse_nary_operation(op);
+            inner.create_node(ComputeGraphNodeVariant::Nary(op))
+        })
     }
 
     pub(crate) fn create_mat_mul(&self, op: MatMulOperation) -> NodeIndex {
@@ -211,6 +220,16 @@ pub(crate) struct ComputeGraphInner {
     pub(crate) nodes: ComputeGraphNodes,
 }
 
+fn add_unique_input(inputs: &mut Vec<NodeIndex>, input: NodeIndex) -> usize {
+    if let Some(index) = inputs.iter().position(|existing| *existing == input) {
+        index
+    } else {
+        let index = inputs.len();
+        inputs.push(input);
+        index
+    }
+}
+
 impl ComputeGraphInner {
     fn new(device: &Device) -> Self {
         Self {
@@ -235,6 +254,71 @@ impl ComputeGraphInner {
         });
         self.add_dependency_edges(node);
         node
+    }
+
+    fn fuse_nary_operation(&self, op: NaryOperation) -> NaryOperation {
+        let original = op.clone();
+        let max_inputs = self
+            .device()
+            .limits()
+            .max_storage_buffers_per_shader_stage
+            .saturating_sub(2)
+            .min(16) as usize;
+        let mut inputs = Vec::new();
+        let mut replacements = Vec::with_capacity(op.inputs.len());
+
+        for (input_pos, input_key) in op.inputs.iter().copied().enumerate() {
+            if let Some(child) = self.fusable_nary_input(&op, input_pos, input_key) {
+                let child_replacements = child
+                    .inputs
+                    .iter()
+                    .map(|child_input| {
+                        NaryInputReplacement::Leaf(add_unique_input(&mut inputs, *child_input))
+                    })
+                    .collect::<Vec<_>>();
+                replacements.push(NaryInputReplacement::Expr(
+                    child.expression.substitute_inputs(&child_replacements),
+                ));
+            } else {
+                replacements.push(NaryInputReplacement::Leaf(add_unique_input(
+                    &mut inputs,
+                    input_key,
+                )));
+            }
+
+            if inputs.len() > max_inputs {
+                return original;
+            }
+        }
+
+        NaryOperation {
+            inputs,
+            expression: op.expression.substitute_inputs(&replacements),
+            shape: op.shape,
+            output_datatype: op.output_datatype,
+        }
+    }
+
+    fn fusable_nary_input(
+        &self,
+        parent: &NaryOperation,
+        input_pos: usize,
+        input_key: NodeIndex,
+    ) -> Option<NaryOperation> {
+        if parent.expression.uses_custom_indexing_for_input(input_pos) {
+            return None;
+        }
+        let node = self.nodes.nodes.node_weight(input_key)?;
+        if node.cached.is_some() {
+            return None;
+        }
+        let ComputeGraphNodeVariant::Nary(child) = &node.variant else {
+            return None;
+        };
+        if child.shape != parent.shape || child.expression.uses_any_custom_indexing() {
+            return None;
+        }
+        Some(child.clone())
     }
 
     fn add_reference(&mut self, key: NodeIndex) {

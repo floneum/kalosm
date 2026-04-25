@@ -1,0 +1,12 @@
+[package]
+name = "tensor_ir_codegen_naga"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+naga = { git = "https://github.com/ealmloff/wgpu", branch = "yield-now", features = ["wgsl-out", "msl-out"] }
+egg = "0.10.0"
+tensor_ir_frontend = { path = "../tensor_ir_frontend" }
+tensor_ir_egraph = { path = "../tensor_ir_egraph" }
+tensor_ir_dispatch = { path = "../tensor_ir_dispatch" }

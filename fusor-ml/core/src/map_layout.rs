@@ -52,21 +52,6 @@ impl MapLayoutOperation {
 }
 
 impl Operation for MapLayoutOperation {
-    fn workgroup_shape_constraints(
-        &self,
-        _: &crate::Device,
-    ) -> crate::mir::workgroup_shape::WorkgroupShapeConstraints {
-        Default::default()
-    }
-
-    fn dispatch_size(
-        &self,
-        _: &crate::mir::workgroup_shape::WorkgroupShape,
-        _: &[crate::mir::inputs::MirValue],
-    ) -> [u32; 3] {
-        [1, 1, 1]
-    }
-
     fn visit_dependencies(&self, f: &mut dyn FnMut(NodeIndex)) {
         f(self.input);
     }
@@ -76,24 +61,6 @@ impl Operation for MapLayoutOperation {
         nodes: &crate::compute_graph::ComputeGraphInner,
     ) -> Vec<crate::mir::inputs::MirValue> {
         vec![nodes.get_result(self.input).unwrap().into()]
-    }
-
-    fn output(
-        &self,
-        _: &crate::compute_graph::ComputeGraphInner,
-        inputs: &[crate::mir::inputs::MirValue],
-    ) -> crate::mir::inputs::MirValue {
-        let input = inputs[0].as_tensor().unwrap();
-        self.map_tensor(input).into()
-    }
-
-    fn build_kernel(
-        &self,
-        _: &crate::compute_graph::ComputeGraphInner,
-        _: &crate::mir::workgroup_shape::WorkgroupShape,
-        _: &[crate::mir::inputs::MirValue],
-        _: &mut crate::mir::kernel::GenericKernel,
-    ) {
     }
 
     fn name(&self) -> String {

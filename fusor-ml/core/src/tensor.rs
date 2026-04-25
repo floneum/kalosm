@@ -11,7 +11,7 @@ use tabbycat::Graph;
 use wgpu::COPY_BUFFER_ALIGNMENT;
 
 use crate::{
-    Device, Dim, Layout, MatMulOperation, MatMulParams, ReduceFunction, ReduceOperation,
+    Device, Dim, Layout, MatMulOperation, ReduceFunction, ReduceOperation,
     compute_graph::NodeIndex,
     map_layout::MapLayoutOperation,
     mir::operation::Operation,
@@ -948,17 +948,6 @@ impl<D: DataType, const R: usize> Tensor<R, D> {
     }
 
     pub(crate) fn binary_nary(&self, other: &Self, function: NaryFunction) -> Self {
-        // If the two tensors are the same, we can lower this to a cheaper unary operation
-        if self.data.key == other.data.key {
-            let unary = NaryFunction::unary(
-                function.name.clone(),
-                format!("let a = input;\nlet b = input;\n{}", function.operation),
-                function.input_types[0],
-                function.output_type,
-            );
-            return self.unary_nary(unary);
-        }
-
         assert_eq!(self.shape(), other.shape());
         Self::from_parts(
             self.data
@@ -966,15 +955,13 @@ impl<D: DataType, const R: usize> Tensor<R, D> {
         )
     }
 
-    pub(crate) fn add_mat_mul(&self, other: &Self, parameters: Option<MatMulParams>) -> Self {
+    pub(crate) fn add_mat_mul(&self, other: &Self) -> Self {
         let operation = MatMulOperation::new(
             self.datatype(),
             self.data.key,
             other.data.key,
             self.shape(),
             other.shape(),
-            parameters,
-            &self.data.device,
         );
 
         Self::from_parts(self.data.mat_mul(operation))
@@ -995,9 +982,7 @@ impl<D: DataType, const R: usize> Tensor<R, D> {
     }
 
     pub(crate) fn add_slice_assign(&self, other: &Self, slices: [Range<usize>; R]) -> Self {
-        let input_shape: Box<[usize]> = self.shape().to_vec().into_boxed_slice();
-        let op =
-            SliceAssignOperation::new(self.data.key, other.data.key, slices.into(), input_shape);
+        let op = SliceAssignOperation::new(self.data.key, other.data.key, slices.into());
         Self::from_parts(self.data.slice_assign(op))
     }
 

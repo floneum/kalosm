@@ -9,10 +9,7 @@ use std::{
 use lru::LruCache;
 use parking_lot::RwLock;
 use rustc_hash::FxBuildHasher;
-use wgpu::{
-    BackendOptions, BindGroupLayout, BufferUsages, COPY_BUFFER_ALIGNMENT, Dx12BackendOptions,
-    PipelineLayout, ShaderModule,
-};
+use wgpu::{BackendOptions, BufferUsages, COPY_BUFFER_ALIGNMENT, Dx12BackendOptions};
 
 use crate::compute_graph::ComputeGraph;
 
@@ -23,10 +20,6 @@ struct CachedBuffer {
 }
 
 const MAX_FREE_BUFFERS_PER_BUCKET: usize = 4;
-const BIND_GROUP_LAYOUT_CACHE_SIZE: usize = 256;
-const PIPELINE_LAYOUT_CACHE_SIZE: usize = 256;
-const SHADER_MODULE_CACHE_SIZE: usize = 128;
-const COMPUTE_PIPELINE_CACHE_SIZE: usize = 128;
 
 fn padded_copy_size(size: u64) -> u64 {
     let align_mask = COPY_BUFFER_ALIGNMENT - 1;
@@ -123,12 +116,6 @@ struct DeviceInner {
     queue: wgpu::Queue,
     cache: Option<wgpu::PipelineCache>,
     cache_file: Option<PathBuf>,
-    bind_group_layout_cache:
-        RwLock<LruCache<Vec<wgpu::BindGroupLayoutEntry>, BindGroupLayout, FxBuildHasher>>,
-    pipeline_layout_cache: RwLock<LruCache<BindGroupLayout, wgpu::PipelineLayout, FxBuildHasher>>,
-    shader_module_cache: RwLock<LruCache<String, wgpu::ShaderModule, FxBuildHasher>>,
-    compute_pipeline_cache:
-        RwLock<LruCache<(PipelineLayout, ShaderModule), wgpu::ComputePipeline, FxBuildHasher>>,
     // Cache for buffer allocations, keyed by size in bytes
     buffer_allocation_cache:
         RwLock<LruCache<(u64, BufferUsages), Vec<CachedBuffer>, FxBuildHasher>>,
@@ -242,22 +229,6 @@ impl Device {
             (None, None)
         };
 
-        let bind_group_layout_cache = RwLock::new(LruCache::with_hasher(
-            NonZeroUsize::new(BIND_GROUP_LAYOUT_CACHE_SIZE).unwrap(),
-            Default::default(),
-        ));
-        let pipeline_layout_cache = RwLock::new(LruCache::with_hasher(
-            NonZeroUsize::new(PIPELINE_LAYOUT_CACHE_SIZE).unwrap(),
-            Default::default(),
-        ));
-        let shader_module_cache = RwLock::new(LruCache::with_hasher(
-            NonZeroUsize::new(SHADER_MODULE_CACHE_SIZE).unwrap(),
-            Default::default(),
-        ));
-        let compute_pipeline_cache = RwLock::new(LruCache::with_hasher(
-            NonZeroUsize::new(COMPUTE_PIPELINE_CACHE_SIZE).unwrap(),
-            Default::default(),
-        ));
         let buffer_allocation_cache = RwLock::new(LruCache::with_hasher(
             const { NonZeroUsize::new(128).unwrap() },
             Default::default(),
@@ -269,10 +240,6 @@ impl Device {
             queue,
             cache,
             cache_file,
-            bind_group_layout_cache,
-            pipeline_layout_cache,
-            shader_module_cache,
-            compute_pipeline_cache,
             buffer_allocation_cache,
             compute_graph: OnceLock::new(),
         });
@@ -378,35 +345,6 @@ impl Device {
             .device
             .poll(wgpu::PollType::wait_indefinitely())
             .expect("Failed to poll GPU device");
-    }
-
-    pub(crate) fn wgpu_cache(&self) -> Option<&wgpu::PipelineCache> {
-        self.inner.cache.as_ref()
-    }
-
-    pub(crate) fn bind_group_layout_cache(
-        &self,
-    ) -> &RwLock<LruCache<Vec<wgpu::BindGroupLayoutEntry>, BindGroupLayout, FxBuildHasher>> {
-        &self.inner.bind_group_layout_cache
-    }
-
-    pub(crate) fn pipeline_layout_cache(
-        &self,
-    ) -> &RwLock<LruCache<BindGroupLayout, wgpu::PipelineLayout, FxBuildHasher>> {
-        &self.inner.pipeline_layout_cache
-    }
-
-    pub(crate) fn shader_module_cache(
-        &self,
-    ) -> &RwLock<LruCache<String, wgpu::ShaderModule, FxBuildHasher>> {
-        &self.inner.shader_module_cache
-    }
-
-    pub(crate) fn compute_pipeline_cache(
-        &self,
-    ) -> &RwLock<LruCache<(PipelineLayout, ShaderModule), wgpu::ComputePipeline, FxBuildHasher>>
-    {
-        &self.inner.compute_pipeline_cache
     }
 
     /// Reset the initialized flag on all cached buffers.
