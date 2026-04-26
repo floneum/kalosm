@@ -1164,213 +1164,6 @@ fn test_tiled_matmul_end_to_end() {
     );
 }
 
-#[test]
-fn test_softmax_weighted_reduce_extracts_as_single_dispatch() {
-    let rows = 32u32;
-    let weights = 32u32;
-    let outputs = 32u32;
-
-    let mut b = IrBuilder::new();
-    let scores = b.input(
-        0,
-        Shape(vec![Dim::Const(rows), Dim::Const(weights)]),
-        DType::F32,
-    );
-    let values = b.input(
-        1,
-        Shape(vec![Dim::Const(weights), Dim::Const(outputs)]),
-        DType::F32,
-    );
-    let _weighted =
-        super::build_softmax_weighted_reduce_ir(&mut b, scores, values, rows, outputs, weights);
-
-    let mut egraph = egg::EGraph::<TensorIr, TensorAnalysis>::default();
-    let root = egraph.add_expr(&b.expr);
-
-    let config = RunnerConfig {
-        iter_limit: 10,
-        node_limit: 100_000,
-        time_limit_secs: 30,
-        device: DeviceProfile::default(),
-        lowering: LoweringOptions::default(),
-    };
-    let egraph = rules::saturate(egraph, &config);
-    let root_class = egraph.find(root);
-    assert!(
-        egraph[root_class].iter().any(|n| matches!(
-            n,
-            TensorIr::Dispatch(DispatchNode::Dispatch { num_inputs: 2, .. })
-        )),
-        "recursive dispatch lowering should insert a 2-input Dispatch into the root e-class"
-    );
-
-    let beam_cfg = BeamConfig {
-        beam_width: 32,
-        ..Default::default()
-    };
-    let (_cost, extracted) = crate::skeleton::beam_extract_valid_candidates(
-        &egraph,
-        root,
-        &beam_cfg,
-        &DeviceProfile::default(),
-        &LoweringOptions::default(),
-        1,
-    )
-    .into_iter()
-    .next()
-    .expect("expected a lowerable recursive dispatch candidate");
-    let root_node = extracted.as_ref().last().unwrap();
-    assert!(
-        matches!(
-            root_node,
-            TensorIr::Dispatch(DispatchNode::Dispatch { num_inputs: 2, .. })
-        ),
-        "softmax-weighted reduction should extract as one 2-input Dispatch via recursive lowering, got {root_node:?}"
-    );
-}
-
-#[test]
-fn test_recursive_dispatch_extracts_nested_reduce_elementwise() {
-    let rows = 32u32;
-    let cols = 32u32;
-
-    let mut b = IrBuilder::new();
-    let x = b.input(
-        0,
-        Shape(vec![Dim::Const(rows), Dim::Const(cols)]),
-        DType::F32,
-    );
-    let _expr = super::build_centered_row_sum_ir(&mut b, x, rows, cols);
-
-    let mut egraph = egg::EGraph::<TensorIr, TensorAnalysis>::default();
-    let root = egraph.add_expr(&b.expr);
-
-    let config = RunnerConfig {
-        iter_limit: 10,
-        node_limit: 100_000,
-        time_limit_secs: 30,
-        device: DeviceProfile::default(),
-        lowering: LoweringOptions::default(),
-    };
-    let egraph = rules::saturate(egraph, &config);
-
-    let beam_cfg = BeamConfig {
-        beam_width: 32,
-        ..Default::default()
-    };
-    let (_cost, extracted) = crate::skeleton::beam_extract_valid_candidates(
-        &egraph,
-        root,
-        &beam_cfg,
-        &DeviceProfile::default(),
-        &LoweringOptions::default(),
-        1,
-    )
-    .into_iter()
-    .next()
-    .expect("expected a lowerable recursive dispatch candidate");
-    let root_node = extracted.as_ref().last().unwrap();
-    let program = crate::skeleton::build_dispatch_program_from_extracted(
-        &extracted,
-        egraph.clone(),
-        &DeviceProfile::default(),
-        &LoweringOptions::default(),
-    );
-    assert!(
-        matches!(root_node, TensorIr::Dispatch(DispatchNode::Dispatch { .. })),
-        "nested reduce+elementwise expression should extract to a Dispatch root, got {root_node:?}"
-    );
-    assert_eq!(program.dispatches.len(), 1);
-}
-
-#[test]
-fn test_attention_extracts_as_lowered_dispatch_candidate() {
-    let seq = 32u32;
-    let d = 32u32;
-
-    let mut b = IrBuilder::new();
-    let q = b.input(0, Shape(vec![Dim::Const(seq), Dim::Const(d)]), DType::F32);
-    let k = b.input(1, Shape(vec![Dim::Const(seq), Dim::Const(d)]), DType::F32);
-    let v = b.input(2, Shape(vec![Dim::Const(seq), Dim::Const(d)]), DType::F32);
-    let _attn = super::build_attention_ir(&mut b, q, k, v, seq, d);
-
-    let mut egraph = egg::EGraph::<TensorIr, TensorAnalysis>::default();
-    let root = egraph.add_expr(&b.expr);
-
-    let config = RunnerConfig {
-        iter_limit: 10,
-        node_limit: 100_000,
-        time_limit_secs: 30,
-        device: DeviceProfile::default(),
-        lowering: LoweringOptions::default(),
-    };
-    let egraph = rules::saturate(egraph, &config);
-    let root_class = egraph.find(root);
-    assert!(
-        egraph[root_class]
-            .iter()
-            .any(|n| matches!(n, TensorIr::Dispatch(DispatchNode::Dispatch { .. }))),
-        "attention lowering should insert at least one Dispatch into the root e-class"
-    );
-    for node in egraph[root_class].iter() {
-        let TensorIr::Dispatch(DispatchNode::Dispatch {
-            num_inputs,
-            children_list,
-            ..
-        }) = node
-        else {
-            continue;
-        };
-        let children = extract_list(&egraph, *children_list);
-        let body_len = children.len().saturating_sub(*num_inputs as usize);
-        if body_len <= 2 || !body_len.is_multiple_of(2) {
-            continue;
-        }
-        let mut seen = std::collections::HashSet::new();
-        for output in 0..(body_len / 2) {
-            let addr = children[*num_inputs as usize + output * 2 + 1];
-            assert!(
-                seen.insert(egraph.find(addr)),
-                "multi-output attention dispatch should not repeat an output address"
-            );
-        }
-    }
-
-    let beam_cfg = BeamConfig {
-        beam_width: 32,
-        ..Default::default()
-    };
-    let (_cost, extracted) = crate::skeleton::beam_extract_valid_candidates(
-        &egraph,
-        root,
-        &beam_cfg,
-        &DeviceProfile::default(),
-        &LoweringOptions::default(),
-        1,
-    )
-    .into_iter()
-    .next()
-    .expect("expected a lowerable recursive dispatch candidate");
-    let root_node = extracted.as_ref().last().unwrap();
-    assert!(
-        matches!(root_node, TensorIr::Dispatch(DispatchNode::Dispatch { .. })),
-        "attention should extract as a lowered Dispatch candidate, got {root_node:?}"
-    );
-    let program = crate::skeleton::build_dispatch_program_from_extracted(
-        &extracted,
-        egraph.clone(),
-        &DeviceProfile::default(),
-        &LoweringOptions::default(),
-    );
-    assert_eq!(program.dispatches.len(), 1);
-    assert_eq!(program.dispatches[0].outputs.len(), 1);
-    let value = program.dispatches[0].outputs[0].value_id;
-    assert!(
-        program.egraph[value].data.contains_reduce_simd,
-        "attention should select the cooperative online-softmax dispatch"
-    );
-}
-
 /// Test as_3d_lit helper.
 #[test]
 fn test_shape_as_3d_lit() {
@@ -1451,9 +1244,7 @@ fn test_symbolic_elementwise_codegen_reads_shape_params() {
 
     let kernel = crate::lower_tensor_expr(&expr, &config)
         .expect("symbolic elementwise expression should lower");
-    let simd = crate::compile_kernel(kernel).expect("symbolic kernel should compile");
-    let program = simd.dispatch_program();
-    let wgsl = crate::lower_to_wgsl(&program).expect("symbolic program should lower to WGSL");
+    let wgsl = crate::lower_to_wgsl(&kernel).expect("symbolic program should lower to WGSL");
     let params = ShapeParams::from([8, 9]);
 
     assert!(wgsl.contains("shape_params"));
@@ -1462,11 +1253,11 @@ fn test_symbolic_elementwise_codegen_reads_shape_params() {
         "WGSL should load runtime dimensions, not print symbolic placeholders"
     );
     assert!(
-        program
-            .dispatches
-            .iter()
-            .any(|dispatch| dispatch.workgroups.as_const().is_none()
-                && dispatch.workgroups.eval_u32(&params) == Some(3)),
+        kernel.extracted().as_ref().iter().any(|node| matches!(
+            node,
+            TensorIr::Effect(EffectNode::Dispatch { workgroups, .. })
+                if workgroups.as_const().is_none() && workgroups.eval_u32(&params) == Some(3)
+        )),
         "compiled dispatch should retain algebraic ceildiv(M*N, simd_width) workgroups"
     );
 }

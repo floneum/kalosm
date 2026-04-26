@@ -61,9 +61,8 @@ pub struct RunnerConfig {
     /// Hardware/runtime parameters used by device-aware rules and the cost
     /// model. Phases that don't need it can ignore it.
     pub device: DeviceProfile,
-    /// Structural lowering toggles (e.g. inner-loop unrolling) shared with
-    /// the post-extraction skeleton builder. Customize to trade perf for IR
-    /// readability.
+    /// Structural lowering toggles (e.g. inner-loop unrolling). Customize to
+    /// trade perf for IR readability.
     pub lowering: LoweringOptions,
 }
 

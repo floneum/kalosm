@@ -18,14 +18,10 @@ tensor_ir_dispatch = { path = "crates/tensor_ir_dispatch" }
 tensor_ir_codegen_naga = { path = "crates/tensor_ir_codegen_naga" }
 tensor_ir_runtime_wgpu = { path = "crates/tensor_ir_runtime_wgpu", optional = true }
 candle-core = { version = "0.9", features = ["metal"], optional = true }
+naga = { git = "https://github.com/ealmloff/wgpu", branch = "yield-now", features = ["wgsl-out", "msl-out"] }
 
 [dev-dependencies]
 bytemuck = { version = "1", features = ["derive"] }
-naga = { git = "https://github.com/ealmloff/wgpu", branch = "yield-now", features = ["wgsl-out", "msl-out"] }
 ordered-float = "5.0.0"
 pollster = "0.4"
 wgpu = { git = "https://github.com/ealmloff/wgpu", branch = "yield-now", features = ["naga-ir"] }
-
-[[example]]
-name = "candle_benchmarks"
-required-features = ["runtime", "candle"]

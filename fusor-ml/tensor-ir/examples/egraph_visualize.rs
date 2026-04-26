@@ -1,9 +1,11 @@
 //! Visualize the e-graph as several expressions progress through each
 //! optimization phase.
 //!
-//! For each scenario, runs the phase's rules on the running e-graph and writes
-//! a GraphViz `.dot` and rendered `.svg` to `target/egraph_phases/`, then emits
-//! a self-contained `index.html` report with all SVGs inlined.
+//! For each scenario, runs the phase's rules on the running e-graph, then
+//! materializes the executable `EffectNode::Program` alternatives into that
+//! same e-graph. Each step writes a GraphViz `.dot` and rendered `.svg` to
+//! `target/egraph_phases/`, then emits a self-contained `index.html` report
+//! with all SVGs inlined.
 //!
 //! Two scenarios:
 //!   1. A full matmul run through every `Phase` — rules mostly rewrite semantic
@@ -84,7 +86,7 @@ fn main() -> std::io::Result<()> {
     let mut groups = Vec::new();
     for scenario in &scenarios {
         let mut egraph = TensorEGraph::default();
-        let _root = egraph.add_expr(&(scenario.build)());
+        let root = egraph.add_expr(&(scenario.build)());
         egraph.rebuild();
 
         let mut snapshots = Vec::new();
@@ -102,6 +104,16 @@ fn main() -> std::io::Result<()> {
             let label = format!("{phase:?}");
             snapshots.push(snapshot(&egraph, out_dir, scenario.name, &tag, &label)?);
         }
+        let _effect_root =
+            tensor_ir::pipeline::materialize_effect_programs_in_egraph(&mut egraph, root);
+        egraph.rebuild();
+        snapshots.push(snapshot(
+            &egraph,
+            out_dir,
+            scenario.name,
+            "effect",
+            "EffectProgram",
+        )?);
         groups.push((scenario, snapshots));
     }
 
@@ -133,6 +145,9 @@ fn snapshot(
 
     let description = match label {
         "initial" => "Input expression before any rewrite rules fire.".to_string(),
+        "EffectProgram" => {
+            "Executable effect program materialized inside the e-graph: Program/Seq/Dispatch/Store/Barrier nodes with explicit BufferRef::Tensor outputs.".to_string()
+        }
         _ => {
             if let Ok(phase) = parse_phase(label) {
                 phase_description(phase).to_string()

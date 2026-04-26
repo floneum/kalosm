@@ -67,18 +67,7 @@ fn main() {
 
     for (i, phase) in Phase::all().iter().enumerate() {
         egraph = saturate_phases(egraph, &[*phase], &config);
-        let extracted = beam_extract_valid_candidates(
-            &egraph,
-            root,
-            &beam,
-            &config.device,
-            &config.lowering,
-            1,
-        )
-        .into_iter()
-        .next()
-        .map(|(_c, e)| e)
-        .unwrap_or_else(|| beam_extract(&egraph, root, &beam).1);
+        let extracted = beam_extract(&egraph, root, &beam).1;
         let label = format!("phase{}: {phase:?}", i + 1);
 
         // Per-phase e-graph stats (what the phase ADDED, even if the
@@ -96,7 +85,7 @@ fn main() {
 
     // Finally: run the full tensor-expression pipeline with its beam-tuned
     // config to show the kernel the backend actually receives.
-    println!("=== Full pipeline (expr -> lower -> compile) ===");
+    println!("=== Full pipeline (expr -> lower) ===");
     let mut builder = TensorExprBuilder::new();
     let m = Dim::Symbol(0);
     let n = Dim::Symbol(1);
@@ -109,14 +98,8 @@ fn main() {
     let matmul = builder.contraction(
         Shape(vec![m, n.clone(), k.clone()]),
         &[
-            (
-                a,
-                Strides(vec![k, Dim::Const(0), Dim::Const(1)]),
-            ),
-            (
-                b,
-                Strides(vec![Dim::Const(0), Dim::Const(1), n]),
-            ),
+            (a, Strides(vec![k, Dim::Const(0), Dim::Const(1)])),
+            (b, Strides(vec![Dim::Const(0), Dim::Const(1), n])),
         ],
         body,
         &[(2, ReduceOp::Add)],

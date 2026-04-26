@@ -5,7 +5,7 @@
 //! - **Direct** (phase1 lowering): builds the loop body as a function of
 //!   the iteration index via `egraph.add`, with no `chosen` override and
 //!   no `iter(0)` substitution. Use [`unroll_fold_direct`].
-//! - **Substituted** (skeleton tiled lowering): has a pre-built body that
+//! - **Substituted** (tiled lowering): has a pre-built body that
 //!   references `VarRef::iter(0)`; each step substitutes a fresh literal,
 //!   tracked through the `chosen` extraction-override map. Use
 //!   [`unroll_fold_substituted`] (with [`k_step_lit`] for the shared

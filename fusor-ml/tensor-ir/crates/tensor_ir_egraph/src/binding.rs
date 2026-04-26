@@ -318,7 +318,7 @@ mod tests {
 
     use super::*;
     use crate::language::{DispatchNode, SimdNode};
-    use crate::types::{IndexLevel, ScalarValue};
+    use crate::types::{Dim, IndexLevel, ScalarValue};
 
     fn var(egraph: &mut EGraph<TensorIr, TensorAnalysis>, v: VarRef) -> Id {
         egraph.add(TensorIr::Simd(SimdNode::Var(v)))
@@ -398,7 +398,7 @@ mod tests {
         let nil = egraph.add(TensorIr::Nil);
         let list = egraph.add(TensorIr::Cons([theta, nil]));
         let dispatch = egraph.add(TensorIr::Dispatch(DispatchNode::Dispatch {
-            workgroups: 1,
+            workgroups: Dim::Const(1),
             num_inputs: 0,
             children_list: list,
         }));

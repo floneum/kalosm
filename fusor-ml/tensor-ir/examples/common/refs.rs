@@ -108,14 +108,8 @@ pub fn build_workload(kind: &str, m: u32, n: u32, k: u32) -> Result<Workload, St
             let _ = builder.contraction(
                 Shape(vec![m_dim, n_dim.clone(), k_dim.clone()]),
                 &[
-                    (
-                        a,
-                        Strides(vec![k_dim, Dim::Const(0), Dim::Const(1)]),
-                    ),
-                    (
-                        b,
-                        Strides(vec![Dim::Const(0), Dim::Const(1), n_dim]),
-                    ),
+                    (a, Strides(vec![k_dim, Dim::Const(0), Dim::Const(1)])),
+                    (b, Strides(vec![Dim::Const(0), Dim::Const(1), n_dim])),
                 ],
                 body,
                 &[(2, ReduceOp::Add)],

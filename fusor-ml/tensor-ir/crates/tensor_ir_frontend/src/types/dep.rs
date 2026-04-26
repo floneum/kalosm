@@ -12,7 +12,7 @@ use super::var::VarRef;
 /// Populated bottom-up by `TensorAnalysis` for the cases it can prove tight:
 /// `Const`, `BinOp(Add, ..)`, `BinOp(Mul, ..)`. The bound is an inclusive
 /// upper bound on what the expression can evaluate to at runtime; consumers
-/// (skeleton tg-buffer sizing, codegen) use it instead of walking the
+/// (threadgroup sizing, codegen) use it instead of walking the
 /// expression subtree to recompute the same fact.
 ///
 /// `None` for any expression containing a `Var` reference (the bound depends

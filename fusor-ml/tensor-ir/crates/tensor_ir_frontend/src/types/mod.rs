@@ -16,7 +16,7 @@ pub use binder::{BinderInfo, BinderKind, HasBinder, slots};
 pub use dep::{AddressProfile, DepSet, VarDepSet};
 pub use device::DeviceProfile;
 pub use lowering::LoweringOptions;
-pub use memory::{BufferRef, IndexLevel, MemTier};
+pub use memory::{BufferRef, IndexLevel, MemTier, TensorId, TgRef};
 pub use scalar::{BinaryOp, DType, ReduceOp, ScalarValue, TernaryOp, UnaryOp};
 pub use shape::{Dim, Shape, ShapeParams, Strides};
 pub use var::{VarRef, index_level_from_slot};

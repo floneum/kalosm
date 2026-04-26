@@ -13,14 +13,13 @@ fn main() {
 
     let pipeline = StagedPipeline::default();
     let kernel = pipeline.lower(&expr).expect("kernel lowering");
-    let simd = pipeline.compile(kernel).expect("simd lowering");
 
     println!("=== Tensor Summary ===");
     println!("summary: {:?}", expr.summary().expect("summary"));
     println!();
 
     println!("=== Kernel ===");
-    for (i, node) in simd.kernel().extracted().as_ref().iter().enumerate() {
+    for (i, node) in kernel.extracted().as_ref().iter().enumerate() {
         let children: Vec<String> = node
             .children()
             .iter()
@@ -34,10 +33,7 @@ fn main() {
     }
     println!();
 
-    println!("=== Dispatch Skeleton ===");
-    println!("{}", simd.dispatch_program());
-
-    match lower_to_wgsl(simd.dispatch_program()) {
+    match lower_to_wgsl(&kernel) {
         Ok(wgsl) => println!("{wgsl}"),
         Err(err) => eprintln!("WGSL generation failed: {err}"),
     }

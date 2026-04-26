@@ -2,7 +2,7 @@ use std::cmp::Reverse;
 
 use egg::{Id, RecExpr};
 
-use crate::language::{DispatchNode, HighLevelNode, SimdNode, TensorIr};
+use crate::language::{DispatchNode, EffectNode, HighLevelNode, SimdNode, TensorIr};
 use crate::types::{
     BinaryOp, DType, IndexLevel, MemTier, ReduceOp, ScalarValue, Shape, Strides, TernaryOp,
     UnaryOp, VarRef,
@@ -336,7 +336,11 @@ impl IrBuilder {
                 params.and_then(|params| params.get(*index as usize).copied())
             }
             TensorIr::HighLevel(HighLevelNode::Index(_)) => Some(DType::U32),
-            TensorIr::Dispatch(_) | TensorIr::Simd(_) | TensorIr::Nil | TensorIr::Cons(_) => None,
+            TensorIr::Dispatch(_)
+            | TensorIr::Effect(_)
+            | TensorIr::Simd(_)
+            | TensorIr::Nil
+            | TensorIr::Cons(_) => None,
         }
     }
 
@@ -409,6 +413,62 @@ impl IrBuilder {
             workgroups: workgroups.into(),
             num_inputs,
             children_list,
+        }))
+    }
+
+    pub fn effect_token(&mut self) -> Id {
+        self.add(TensorIr::Effect(EffectNode::Token))
+    }
+
+    pub fn effect_store(&mut self, tier: MemTier, addr: Id, value: Id, state: Id) -> Id {
+        self.add(TensorIr::Effect(EffectNode::Store {
+            tier,
+            children: [addr, value, state],
+        }))
+    }
+
+    pub fn effect_store_if(
+        &mut self,
+        tier: MemTier,
+        cond: Id,
+        addr: Id,
+        value: Id,
+        state: Id,
+    ) -> Id {
+        self.add(TensorIr::Effect(EffectNode::StoreIf {
+            tier,
+            children: [cond, addr, value, state],
+        }))
+    }
+
+    pub fn effect_barrier(&mut self, regions: Vec<crate::types::BufferRef>, state: Id) -> Id {
+        self.add(TensorIr::Effect(EffectNode::Barrier { regions, state }))
+    }
+
+    pub fn effect_dispatch(
+        &mut self,
+        workgroups: impl Into<crate::types::Dim>,
+        simdgroups: u32,
+        state: Id,
+        body: Id,
+    ) -> Id {
+        self.add(TensorIr::Effect(EffectNode::Dispatch {
+            workgroups: workgroups.into(),
+            simdgroups,
+            children: [state, body],
+        }))
+    }
+
+    pub fn effect_seq(&mut self, steps: &[Id]) -> Id {
+        let list = self.list(steps);
+        self.add(TensorIr::Effect(EffectNode::Seq(list)))
+    }
+
+    pub fn effect_program(&mut self, buffers: &[Id], body: Id, outputs: &[Id]) -> Id {
+        let buffers = self.list(buffers);
+        let outputs = self.list(outputs);
+        self.add(TensorIr::Effect(EffectNode::Program {
+            children: [buffers, body, outputs],
         }))
     }
 

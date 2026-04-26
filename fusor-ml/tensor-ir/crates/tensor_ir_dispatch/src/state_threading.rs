@@ -3,7 +3,7 @@ use egg::{BackoffScheduler, EGraph, Id, Rewrite, Runner};
 use crate::analysis::TensorAnalysis;
 use crate::applier::SimpleEclassSearcher;
 use crate::language::{DispatchNode, TensorIr};
-use crate::skeleton::{dispatch_node_is_state_threaded, rewrite_dispatch_node};
+use crate::state_threading_impl::{dispatch_node_is_state_threaded, rewrite_dispatch_node};
 use crate::types::{DeviceProfile, LoweringOptions};
 
 fn build(device: DeviceProfile, lowering: LoweringOptions) -> Rewrite<TensorIr, TensorAnalysis> {

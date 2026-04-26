@@ -12,8 +12,7 @@ use crate::types::{DeviceProfile, LoweringOptions, VarRef};
 
 use super::*;
 use super::{
-    DispatchInfo, DispatchProgram, OutputElement, collect_tg_buffer_info_from_egraph,
-    dispatch_node_is_state_threaded,
+    StateThreadedOutput, collect_threadgroup_tile_info_from_egraph, dispatch_node_is_state_threaded,
 };
 
 pub(crate) fn rewrite_dispatch_node(
@@ -30,13 +29,13 @@ pub(crate) fn rewrite_dispatch_node(
     if let Some(dispatch_id) = try_rewrite_tiled_dispatch(egraph, &layout, device, lowering) {
         return Some(dispatch_id);
     }
-    if collect_tg_buffer_info_from_egraph(layout.body_addr_pairs[0].0, egraph).is_empty() {
+    if collect_threadgroup_tile_info_from_egraph(layout.body_addr_pairs[0].0, egraph).is_empty() {
         return None;
     }
     try_rewrite_recovered_tiled_dispatch(egraph, &layout, device, lowering)
 }
 
-pub(in crate::skeleton) struct DispatchRewriteLayout {
+pub(in crate::state_threading_impl) struct DispatchRewriteLayout {
     workgroups: u32,
     num_inputs: usize,
     input_ids: Vec<Id>,
@@ -169,7 +168,7 @@ pub(super) fn collect_egraph_tiled_outputs(
 pub(super) fn rebuild_dispatch_with_outputs(
     egraph: &mut EGraph<TensorIr, TensorAnalysis>,
     layout: &DispatchRewriteLayout,
-    outputs: Vec<OutputElement>,
+    outputs: Vec<StateThreadedOutput>,
 ) -> Option<Id> {
     let mut children = layout.input_ids.clone();
     for output in outputs {
@@ -218,7 +217,7 @@ pub(super) fn try_rewrite_tiled_dispatch(
     let tile_k = get_u32_lit_from_egraph(egraph, body_theta.1)?;
     let tiled_outputs =
         collect_egraph_tiled_outputs(egraph, &layout.body_addr_pairs, outer_k, tile_k)?;
-    let tg_buffers = collect_tg_buffer_info_with_device_addrs(
+    let tg_buffers = collect_threadgroup_tile_info_with_device_addrs(
         &tiled_outputs
             .iter()
             .map(|output| output.value_id)
@@ -296,48 +295,4 @@ pub(super) fn try_rewrite_recovered_tiled_dispatch(
         lowering,
     );
     rebuild_dispatch_with_outputs(egraph, layout, outputs)
-}
-
-// ═══════════════════════════════════════════════════════════════
-// Display implementations
-// ═══════════════════════════════════════════════════════════════
-
-impl fmt::Display for DispatchInfo {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        writeln!(
-            f,
-            "Dispatch {{ workgroups: {}, simdgroups: {}, inputs: {}, outputs: {}, pipeline: {:?}, stage: {} }}",
-            self.workgroups,
-            self.simdgroups,
-            self.inputs.len(),
-            self.outputs.len(),
-            self.pipeline_index,
-            self.pipeline_stage,
-        )?;
-        if !self.tg_buffers.is_empty() {
-            let names: Vec<String> = self
-                .tg_buffers
-                .iter()
-                .map(|b| b.tg_name.to_string())
-                .collect();
-            writeln!(f, "  tg_buffers: {}", names.join(", "))?;
-        }
-        Ok(())
-    }
-}
-
-impl fmt::Display for DispatchProgram {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        writeln!(
-            f,
-            "DispatchProgram ({} dispatches, {} pipelines)",
-            self.dispatches.len(),
-            self.pipelines.len()
-        )?;
-        for (i, dispatch) in self.dispatches.iter().enumerate() {
-            writeln!(f, "--- Dispatch {i} ---")?;
-            write!(f, "{dispatch}")?;
-        }
-        Ok(())
-    }
 }

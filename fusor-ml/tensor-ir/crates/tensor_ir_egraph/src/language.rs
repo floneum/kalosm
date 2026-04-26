@@ -105,12 +105,43 @@ pub enum SimdNode {
     },
 }
 
+/// Effectful program nodes. These nodes make launch order, dispatch state,
+/// stores, and barriers explicit in the e-graph.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum EffectNode {
+    Program {
+        /// `[buffers, body, outputs]`
+        children: [Id; 3],
+    },
+    Seq(Id),
+    Dispatch {
+        workgroups: Dim,
+        simdgroups: u32,
+        /// `[state, body]`
+        children: [Id; 2],
+    },
+    Token,
+    Store {
+        tier: MemTier,
+        children: [Id; 3],
+    },
+    StoreIf {
+        tier: MemTier,
+        children: [Id; 4],
+    },
+    Barrier {
+        regions: Vec<BufferRef>,
+        state: Id,
+    },
+}
+
 /// Unified language for the tensor IR e-graph.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum TensorIr {
     HighLevel(HighLevelNode),
     Dispatch(DispatchNode),
     Simd(SimdNode),
+    Effect(EffectNode),
 
     // Operations (shared across levels)
     BinOp(BinaryOp, [Id; 2]),
@@ -247,6 +278,42 @@ fn matches_simd(lhs: &SimdNode, rhs: &SimdNode) -> bool {
     }
 }
 
+fn matches_effect(lhs: &EffectNode, rhs: &EffectNode) -> bool {
+    match (lhs, rhs) {
+        (EffectNode::Program { .. }, EffectNode::Program { .. })
+        | (EffectNode::Seq(_), EffectNode::Seq(_))
+        | (EffectNode::Token, EffectNode::Token) => true,
+        (
+            EffectNode::Dispatch {
+                workgroups: lhs_workgroups,
+                simdgroups: lhs_simdgroups,
+                ..
+            },
+            EffectNode::Dispatch {
+                workgroups: rhs_workgroups,
+                simdgroups: rhs_simdgroups,
+                ..
+            },
+        ) => lhs_workgroups == rhs_workgroups && lhs_simdgroups == rhs_simdgroups,
+        (EffectNode::Store { tier: lhs_tier, .. }, EffectNode::Store { tier: rhs_tier, .. })
+        | (
+            EffectNode::StoreIf { tier: lhs_tier, .. },
+            EffectNode::StoreIf { tier: rhs_tier, .. },
+        ) => lhs_tier == rhs_tier,
+        (
+            EffectNode::Barrier {
+                regions: lhs_regions,
+                ..
+            },
+            EffectNode::Barrier {
+                regions: rhs_regions,
+                ..
+            },
+        ) => lhs_regions == rhs_regions,
+        _ => false,
+    }
+}
+
 const fn high_level_children(node: &HighLevelNode) -> &[Id] {
     match node {
         HighLevelNode::Input { .. } | HighLevelNode::Param(_) | HighLevelNode::Index(_) => &[],
@@ -266,6 +333,18 @@ const fn dispatch_children(node: &DispatchNode) -> &[Id] {
             std::slice::from_ref(children_list)
         }
         DispatchNode::Extract { tuple, .. } => std::slice::from_ref(tuple),
+    }
+}
+
+const fn effect_children(node: &EffectNode) -> &[Id] {
+    match node {
+        EffectNode::Program { children } => children,
+        EffectNode::Seq(list) => std::slice::from_ref(list),
+        EffectNode::Dispatch { children, .. } => children,
+        EffectNode::Token => &[],
+        EffectNode::Store { children, .. } => children,
+        EffectNode::StoreIf { children, .. } => children,
+        EffectNode::Barrier { state, .. } => std::slice::from_ref(state),
     }
 }
 
@@ -291,6 +370,18 @@ const fn dispatch_children_mut(node: &mut DispatchNode) -> &mut [Id] {
     }
 }
 
+const fn effect_children_mut(node: &mut EffectNode) -> &mut [Id] {
+    match node {
+        EffectNode::Program { children } => children,
+        EffectNode::Dispatch { children, .. } => children,
+        EffectNode::Seq(list) => std::slice::from_mut(list),
+        EffectNode::Token => &mut [],
+        EffectNode::Store { children, .. } => children,
+        EffectNode::StoreIf { children, .. } => children,
+        EffectNode::Barrier { state, .. } => std::slice::from_mut(state),
+    }
+}
+
 impl Language for TensorIr {
     type Discriminant = std::mem::Discriminant<Self>;
 
@@ -303,6 +394,7 @@ impl Language for TensorIr {
             (Self::HighLevel(lhs), Self::HighLevel(rhs)) => matches_high_level(lhs, rhs),
             (Self::Dispatch(lhs), Self::Dispatch(rhs)) => matches_dispatch(lhs, rhs),
             (Self::Simd(lhs), Self::Simd(rhs)) => matches_simd(lhs, rhs),
+            (Self::Effect(lhs), Self::Effect(rhs)) => matches_effect(lhs, rhs),
             (Self::BinOp(a_op, _), Self::BinOp(b_op, _)) => a_op == b_op,
             (Self::UnOp(a_op, _), Self::UnOp(b_op, _)) => a_op == b_op,
             (Self::TernOp(a_op, _), Self::TernOp(b_op, _)) => a_op == b_op,
@@ -317,6 +409,7 @@ impl Language for TensorIr {
         match self {
             Self::HighLevel(hl) => high_level_children(hl),
             Self::Dispatch(dp) => dispatch_children(dp),
+            Self::Effect(effect) => effect_children(effect),
             Self::Simd(s) => match s {
                 SimdNode::Var(_) => &[],
                 SimdNode::Load { children, .. } => children,
@@ -338,6 +431,7 @@ impl Language for TensorIr {
         match self {
             Self::HighLevel(hl) => high_level_children_mut(hl),
             Self::Dispatch(dp) => dispatch_children_mut(dp),
+            Self::Effect(effect) => effect_children_mut(effect),
             Self::Simd(s) => match s {
                 SimdNode::Var(_) => &mut [],
                 SimdNode::Load { children, .. } => children,
@@ -476,6 +570,12 @@ impl HasBinder for TensorIr {
                 // body, which sees the Dispatch thread-index bindings.
                 body_mask: 0b001,
             }),
+            Self::Effect(EffectNode::Dispatch { .. }) => Some(BinderInfo {
+                kind: BinderKind::Dispatch,
+                // Children order is [state, body]. Only the body sees the
+                // dispatch thread-index bindings.
+                body_mask: 0b10,
+            }),
             _ => None,
         }
     }
@@ -515,6 +615,21 @@ impl fmt::Display for TensorIr {
                 SimdNode::Store { tier, .. } => write!(f, "Store@{tier}"),
                 SimdNode::StoreIf { tier, .. } => write!(f, "StoreIf@{tier}"),
                 SimdNode::Barrier { regions, .. } => write!(f, "Barrier[{}]", regions.len()),
+            },
+            Self::Effect(effect) => match effect {
+                EffectNode::Program { .. } => write!(f, "Program"),
+                EffectNode::Seq(_) => write!(f, "EffectSeq"),
+                EffectNode::Dispatch {
+                    workgroups,
+                    simdgroups,
+                    ..
+                } => write!(f, "EffectDispatch[wg={workgroups},sg={simdgroups}]"),
+                EffectNode::Token => write!(f, "EffectToken"),
+                EffectNode::Store { tier, .. } => write!(f, "EffectStore@{tier}"),
+                EffectNode::StoreIf { tier, .. } => write!(f, "EffectStoreIf@{tier}"),
+                EffectNode::Barrier { regions, .. } => {
+                    write!(f, "EffectBarrier[{}]", regions.len())
+                }
             },
             Self::BinOp(op, _) => write!(f, "{op}"),
             Self::UnOp(op, _) => write!(f, "{op}"),

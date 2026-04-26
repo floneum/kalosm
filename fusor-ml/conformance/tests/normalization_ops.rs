@@ -78,6 +78,9 @@ async fn softmax_and_normalization_match_reference_paths() {
     let gen_norm = FuzzGenerator::<3, f32>::new([2..=3, 16..=17, 255..=257])
         .with_seed(410)
         .with_distribution(Uniform::new(-4.0, 4.0).unwrap());
+    let gen_layer_norm = FuzzGenerator::<3, f32>::new([2..=3, 16..=17, 16..=17])
+        .with_seed(411)
+        .with_distribution(Uniform::new(-4.0, 4.0).unwrap());
 
     // rms_norm vs host reference
     fusor_conformance::assert(async |x: Tensor<3, f32>| {
@@ -116,7 +119,7 @@ async fn softmax_and_normalization_match_reference_paths() {
             .to_concrete();
         x.layer_norm::<2, _, _>(&weight, Some(&bias), 1e-5, true)
     })
-    .arg(gen_norm.clone())
+    .arg(gen_layer_norm)
     .equal_to_resolved_with_device(async |v: Vec<Vec<Vec<f32>>>, device: Device| {
         let feature_count = v[0][0].len();
         let weight_data = norm_weight(feature_count);

@@ -9283,7 +9283,6 @@ dependencies = [
  "egg",
  "half 2.7.1",
  "naga",
- "tensor_ir_dispatch",
  "tensor_ir_egraph",
  "tensor_ir_frontend",
 ]
@@ -9334,7 +9333,6 @@ dependencies = [
  "egg",
  "pollster",
  "tensor_ir_codegen_naga",
- "tensor_ir_dispatch",
  "tensor_ir_egraph",
  "tensor_ir_frontend",
  "wgpu",

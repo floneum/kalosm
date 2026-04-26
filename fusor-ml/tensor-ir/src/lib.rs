@@ -42,8 +42,7 @@
 //!
 //! The public architecture is split into explicit stages:
 //! - `TensorExprProgram`: pure tensor semantics
-//! - `KernelProgram`: validated dispatch/SIMD kernel form
-//! - `SimdProgram`: backend-facing dispatch skeleton for codegen/runtime
+//! - `KernelProgram`: validated effectful e-graph program form
 //!
 //! Internally, lowering uses an e-graph representation as a backend
 //! implementation detail separate from the public architectural model.
@@ -181,9 +180,6 @@ pub mod rules {
 pub mod runtime {
     pub use tensor_ir_runtime_wgpu::*;
 }
-pub mod skeleton {
-    pub use tensor_ir_dispatch::skeleton::*;
-}
 pub mod stages {
     pub use tensor_ir_frontend::stages::*;
 }
@@ -198,13 +194,10 @@ pub use extractor::{
 };
 #[doc(hidden)]
 pub use language::{DispatchNode, HighLevelNode, SimdNode, TensorIr};
-pub use naga_codegen::{
-    Verified, VerifyError, lower_dispatch_program, lower_to_msl, lower_to_wgsl, module_to_msl,
-    module_to_wgsl, verify,
-};
+pub use naga_codegen::{module_to_msl, module_to_wgsl};
 pub use pipeline::{
-    ExtractionReport, KernelProgram, LoweringError, LoweringReport, SimdProgram, StageConfig,
-    StagedPipeline, compile_kernel, lower_tensor_expr, lower_tensor_expr_candidates,
+    CandidateValidationReport, ExtractedProgram, ExtractionReport, KernelProgram, LoweringError,
+    LoweringReport, StageConfig, StagedPipeline, lower_tensor_expr, lower_tensor_expr_candidates,
     lower_tensor_expr_with_report, tensor_expr_to_recexpr,
 };
 pub use rules::{
@@ -213,14 +206,74 @@ pub use rules::{
 };
 #[cfg(feature = "runtime")]
 pub use runtime::{GpuBenchmarkResult, GpuContext, ProgramBenchmarkConfig};
-pub use skeleton::{
-    CandidateValidationReport, DispatchInfo, DispatchProgram, PipelineInfo, TgBufferInfo,
-    beam_extract_valid_candidates, beam_extract_valid_candidates_with_report,
-    build_dispatch_program_from_extracted, collect_tg_buffer_info,
-};
 pub use stages::{ExprId, TensorExprBuilder, TensorExprNode, TensorExprProgram, TensorExprSummary};
 pub use tensor_ir_egraph::{TensorEGraph, TensorRewrite, TensorRunner};
 pub use types::*;
+
+/// Witness that a [`KernelProgram`] has passed program verification.
+pub struct VerifiedProgram<'a> {
+    kernel: &'a KernelProgram,
+}
+
+impl<'a> VerifiedProgram<'a> {
+    #[must_use]
+    pub const fn kernel(&self) -> &'a KernelProgram {
+        self.kernel
+    }
+}
+
+/// Verify an effectful [`KernelProgram`].
+///
+/// # Errors
+///
+/// Returns a verification error if the chosen extraction has unbound vars,
+/// malformed tuple extracts, or a recursive chosen-node cycle.
+pub fn verify_program(kernel: &KernelProgram) -> Result<VerifiedProgram<'_>, String> {
+    pipeline::validate_kernel_expr(kernel.extracted())?;
+    pipeline::enforce_effect_threadgroup_budget(
+        kernel.extracted_program(),
+        kernel.egraph(),
+        kernel.device(),
+    )?;
+    Ok(VerifiedProgram { kernel })
+}
+
+/// Lower a verified effectful program to Naga.
+///
+/// # Errors
+///
+/// Returns a codegen error if the verified effect program is malformed for
+/// the Naga backend.
+pub fn lower_program(verified: VerifiedProgram<'_>) -> Result<naga::Module, String> {
+    tensor_ir_codegen_naga::lower_effect_program(
+        verified.kernel.extracted(),
+        verified.kernel.device(),
+    )
+}
+
+/// Verify, lower, and emit WGSL from an effectful [`KernelProgram`].
+///
+/// # Errors
+///
+/// Returns an error if verification, Naga validation, or WGSL writing fails.
+pub fn lower_to_wgsl(kernel: &KernelProgram) -> Result<String, String> {
+    let verified =
+        verify_program(kernel).map_err(|error| format!("verification error: {error}"))?;
+    let module = lower_program(verified).map_err(|error| format!("codegen error: {error}"))?;
+    module_to_wgsl(&module)
+}
+
+/// Verify, lower, and emit MSL from an effectful [`KernelProgram`].
+///
+/// # Errors
+///
+/// Returns an error if verification, Naga validation, or MSL writing fails.
+pub fn lower_to_msl(kernel: &KernelProgram) -> Result<String, String> {
+    let verified =
+        verify_program(kernel).map_err(|error| format!("verification error: {error}"))?;
+    let module = lower_program(verified).map_err(|error| format!("codegen error: {error}"))?;
+    module_to_msl(&module)
+}
 
 #[cfg(test)]
 mod tests;

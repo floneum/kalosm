@@ -8,7 +8,7 @@ use std::collections::{HashMap, HashSet};
 use egg::{EGraph, Id, Language, RecExpr};
 
 use crate::analysis::TensorAnalysis;
-use crate::language::{DispatchNode, HighLevelNode, SimdNode, TensorIr};
+use crate::language::{DispatchNode, EffectNode, HighLevelNode, SimdNode, TensorIr};
 use crate::types::{BinderKind, DeviceProfile, Dim, MemTier, ScalarValue, VarRef};
 
 fn dim_cost_value(dim: &Dim) -> f64 {
@@ -30,9 +30,7 @@ pub struct SyntheticCostModel {
     pub barrier_cost: f64,
     /// Quadratic penalty as estimated threadgroup memory usage approaches
     /// `DeviceProfile::max_threadgroup_bytes`. Currently applied indirectly
-    /// (favoring threadgroup loads over device loads); a precise per-Dispatch
-    /// budget check follows in Stage 1 once the skeleton's tile-shape
-    /// derivation is exposed via Analysis.
+    /// by favoring threadgroup loads over device loads.
     pub threadgroup_pressure_penalty: f64,
     /// Quadratic penalty for `Dispatch` nodes whose register block
     /// (`reg_m * reg_n * dtype_bytes`) exceeds
@@ -76,8 +74,10 @@ impl SyntheticCostModel {
         match node {
             // High-level nodes have high cost to prefer lowered versions
             TensorIr::HighLevel(
-                HighLevelNode::Elementwise { .. } | HighLevelNode::Reduce { .. },
-            ) => 1000.0,
+                HighLevelNode::Restride { .. }
+                | HighLevelNode::Elementwise { .. }
+                | HighLevelNode::Reduce { .. },
+            ) => 1.0e9,
 
             // Scalar expressions and structural nodes.
             TensorIr::BinOp(..) | TensorIr::UnOp(..) | TensorIr::TernOp(..) => self.arithmetic_cost,
@@ -179,6 +179,20 @@ impl SyntheticCostModel {
             // Pipeline candidate over multiple independent dispatches.
             TensorIr::Dispatch(DispatchNode::Seq(_)) => 100.0,
             TensorIr::Dispatch(DispatchNode::Pipeline(_)) => 60.0,
+            TensorIr::Effect(EffectNode::Program { .. }) => 0.0,
+            TensorIr::Effect(EffectNode::Seq(_)) => 20.0,
+            TensorIr::Effect(EffectNode::Dispatch {
+                workgroups,
+                simdgroups,
+                ..
+            }) => 0.004 * dim_cost_value(workgroups) / f64::from((*simdgroups).max(1)),
+            TensorIr::Effect(EffectNode::Token) => 0.0,
+            TensorIr::Effect(EffectNode::Store { tier, .. })
+            | TensorIr::Effect(EffectNode::StoreIf { tier, .. }) => match tier {
+                MemTier::Device(_) => self.device_load_cost,
+                MemTier::Threadgroup(_) => self.threadgroup_load_cost - self.threadgroup_use_bonus,
+            },
+            TensorIr::Effect(EffectNode::Barrier { .. }) => self.barrier_cost,
             TensorIr::Simd(SimdNode::Load { tier, .. }) => match tier {
                 MemTier::Device(_) => self.device_load_cost,
                 // Bonus on top of the base cost — kernels that use TG memory
@@ -197,7 +211,7 @@ impl SyntheticCostModel {
                 }
             }
             TensorIr::Simd(SimdNode::Barrier { .. }) => self.barrier_cost,
-            TensorIr::HighLevel(HighLevelNode::Input { .. } | HighLevelNode::Restride { .. })
+            TensorIr::HighLevel(HighLevelNode::Input { .. })
             | TensorIr::Const(_)
             | TensorIr::ShapeParam(_)
             | TensorIr::HighLevel(

@@ -11,5 +11,4 @@ pollster = "0.4"
 bytemuck = { version = "1", features = ["derive"] }
 tensor_ir_frontend = { path = "../tensor_ir_frontend" }
 tensor_ir_egraph = { path = "../tensor_ir_egraph" }
-tensor_ir_dispatch = { path = "../tensor_ir_dispatch" }
 tensor_ir_codegen_naga = { path = "../tensor_ir_codegen_naga" }

@@ -14,7 +14,7 @@ use crate::types::{
 use crate::unroll::{k_step_lit, unroll_fold_substituted};
 
 use super::*;
-use super::{OutputElement, TgBufferInfo, add_and_choose};
+use super::{StateThreadedOutput, ThreadgroupTileInfo, add_and_choose};
 
 /// Compute the number of simdgroups per physical workgroup for a tiled dispatch.
 ///
@@ -26,12 +26,12 @@ use super::{OutputElement, TgBufferInfo, add_and_choose};
 /// iterations: simdgroups = `min(device.max_simdgroups, max_tg_buf_size / SIMD_WIDTH)`.
 /// Must also divide workgroups evenly.
 pub(super) fn compute_simdgroups_for_tiled(
-    tg_buffers: &[TgBufferInfo],
+    tg_buffers: &[ThreadgroupTileInfo],
     workgroups: u32,
     _num_outputs: u32,
     device: &DeviceProfile,
 ) -> u32 {
-    fn scaling_fits_u32(buf: &TgBufferInfo, num_simdgroups: u32) -> bool {
+    fn scaling_fits_u32(buf: &ThreadgroupTileInfo, num_simdgroups: u32) -> bool {
         let tile_rows_needed = u64::from(buf.tile_rows.max(1));
         let num_simdgroups = u64::from(num_simdgroups.max(1));
         let per_sg_rows = tile_rows_needed.div_ceil(num_simdgroups).max(1);
@@ -108,7 +108,7 @@ pub(crate) struct TiledOutput {
     pub(super) state_slot: Option<usize>,
 }
 
-/// Build a skeleton body for a tiled dispatch with cooperative loading.
+/// Build a state-threaded body for a tiled dispatch with cooperative loading.
 ///
 /// Produces:
 /// ```text
@@ -328,7 +328,7 @@ pub(super) fn remap_threadgroup_load_state(
 
 pub(super) fn build_cooperative_load_state(
     state_in: Id,
-    buf_info: &TgBufferInfo,
+    buf_info: &ThreadgroupTileInfo,
     num_simdgroups: u32,
     egraph: &mut EGraph<TensorIr, TensorAnalysis>,
     chosen: &mut HashMap<Id, TensorIr>,
@@ -470,97 +470,13 @@ pub(super) fn build_tiled_inner_theta(
     )
 }
 
-/// Substitute `Workgroup` binder with `Simdgroup` inside every
-/// `Load(Threadgroup, addr, state)` node reachable from `root`, rebuilding
-/// the surrounding expression around the rewritten Loads. Other nodes keep
-/// their `Workgroup` references intact (output addresses still use the
-/// absolute workgroup id to write the correct device location).
-pub(super) fn rewrite_tg_load_workgroup_to_simdgroup(
-    root: Id,
-    egraph: &mut EGraph<TensorIr, TensorAnalysis>,
-    chosen: &mut HashMap<Id, TensorIr>,
-) -> Id {
-    let mut memo: HashMap<Id, Id> = HashMap::new();
-    rewrite_tg_load_rec(root, egraph, chosen, &mut memo)
-}
-
-fn rewrite_tg_load_rec(
-    id: Id,
-    egraph: &mut EGraph<TensorIr, TensorAnalysis>,
-    chosen: &mut HashMap<Id, TensorIr>,
-    memo: &mut HashMap<Id, Id>,
-) -> Id {
-    let canonical = egraph.find(id);
-    if let Some(&cached) = memo.get(&canonical) {
-        return cached;
-    }
-    // Tentatively memoize to the input id so recursive cycles terminate —
-    // updated once we've rebuilt this node.
-    memo.insert(canonical, id);
-
-    let Some(node) = select_substitution_node(egraph, chosen, canonical) else {
-        return id;
-    };
-
-    // Special case: Threadgroup Load → rewrite its address (and only its
-    // address) by substituting Workgroup → Simdgroup.
-    if let TensorIr::Simd(SimdNode::Load {
-        tier: MemTier::Threadgroup(_),
-        children,
-    }) = &node
-    {
-        let workgroup_var = VarRef::thread(IndexLevel::Workgroup);
-        let simdgroup_var = VarRef::thread(IndexLevel::Simdgroup);
-        let sg_var_id =
-            add_and_choose(egraph, chosen, TensorIr::Simd(SimdNode::Var(simdgroup_var)));
-        let rewritten_addr =
-            substitute_var_with_id(egraph, chosen, children[0], workgroup_var, sg_var_id);
-        if rewritten_addr == children[0] {
-            return id;
-        }
-        let new_state = rewrite_tg_load_rec(children[1], egraph, chosen, memo);
-        let mut rebuilt = node.clone();
-        if let TensorIr::Simd(SimdNode::Load { children: c, .. }) = &mut rebuilt {
-            c[0] = rewritten_addr;
-            c[1] = new_state;
-        }
-        let new_id = egraph.add(rebuilt.clone());
-        let new_canonical = egraph.find(new_id);
-        chosen.insert(new_canonical, rebuilt);
-        memo.insert(canonical, new_id);
-        return new_id;
-    }
-
-    // Generic recursive rebuild.
-    if node.children().is_empty() {
-        return id;
-    }
-    let mut rebuilt = node.clone();
-    let mut changed = false;
-    for child in rebuilt.children_mut() {
-        let new_child = rewrite_tg_load_rec(*child, egraph, chosen, memo);
-        if new_child != *child {
-            changed = true;
-        }
-        *child = new_child;
-    }
-    if !changed {
-        return id;
-    }
-    let new_id = egraph.add(rebuilt.clone());
-    let new_canonical = egraph.find(new_id);
-    chosen.insert(new_canonical, rebuilt);
-    memo.insert(canonical, new_id);
-    new_id
-}
-
 pub(super) fn scale_tg_buffers_for_simdgroups(
-    tg_buffers: &[TgBufferInfo],
+    tg_buffers: &[ThreadgroupTileInfo],
     num_simdgroups: u32,
     egraph: &mut EGraph<TensorIr, TensorAnalysis>,
     chosen: &mut HashMap<Id, TensorIr>,
     _device: &DeviceProfile,
-) -> Vec<TgBufferInfo> {
+) -> Vec<ThreadgroupTileInfo> {
     if num_simdgroups <= 1 {
         return tg_buffers.to_vec();
     }
@@ -613,7 +529,7 @@ pub(super) fn scale_tg_buffers_for_simdgroups(
                 )
             });
 
-            TgBufferInfo {
+            ThreadgroupTileInfo {
                 tg_name: buf.tg_name,
                 device_name: buf.device_name,
                 size: full_size,
@@ -623,7 +539,6 @@ pub(super) fn scale_tg_buffers_for_simdgroups(
                 device_row_base,
                 device_col_base: buf.device_col_base,
                 device_row_stride: buf.device_row_stride,
-                sg_read_stride: per_sg_rows * buf.tile_cols,
             }
         })
         .collect()
@@ -655,7 +570,7 @@ pub(super) fn init_tiled_carry_state(
 
 pub(super) fn apply_tiled_load_prologue(
     mut state: Id,
-    scaled_tg_buffers: &[TgBufferInfo],
+    scaled_tg_buffers: &[ThreadgroupTileInfo],
     num_simdgroups: u32,
     egraph: &mut EGraph<TensorIr, TensorAnalysis>,
     chosen: &mut HashMap<Id, TensorIr>,
@@ -778,10 +693,10 @@ pub(super) fn build_tiled_output_elements(
     tiled_outputs: &[TiledOutput],
     egraph: &mut EGraph<TensorIr, TensorAnalysis>,
     chosen: &mut HashMap<Id, TensorIr>,
-) -> Vec<OutputElement> {
+) -> Vec<StateThreadedOutput> {
     tiled_outputs
         .iter()
-        .map(|output| OutputElement {
+        .map(|output| StateThreadedOutput {
             value_id: make_extract(egraph, chosen, outer_theta, output.result_slot),
             addr_id: output.addr_id,
         })
@@ -796,13 +711,13 @@ pub(super) fn build_tiled_outputs(
     outer_count: u32,
     tile_k: Option<u32>,
     tiled_outputs: &[TiledOutput],
-    tg_buffers: &[TgBufferInfo],
+    tg_buffers: &[ThreadgroupTileInfo],
     num_simdgroups: u32,
     egraph: &mut EGraph<TensorIr, TensorAnalysis>,
     chosen: &mut HashMap<Id, TensorIr>,
     device: &DeviceProfile,
     lowering: &LoweringOptions,
-) -> (Vec<OutputElement>, Vec<TgBufferInfo>) {
+) -> (Vec<StateThreadedOutput>, Vec<ThreadgroupTileInfo>) {
     let scaled_tg_buffers =
         scale_tg_buffers_for_simdgroups(tg_buffers, num_simdgroups, egraph, chosen, device);
 
@@ -853,7 +768,7 @@ pub(super) fn build_tiled_outputs(
             }),
         );
         return (
-            vec![OutputElement {
+            vec![StateThreadedOutput {
                 value_id: make_extract(egraph, chosen, outer_theta, output.result_slot),
                 addr_id: output.addr_id,
             }],

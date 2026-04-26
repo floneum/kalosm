@@ -9,7 +9,7 @@ use crate::language::{SimdNode, TensorIr};
 use crate::types::{BinaryOp, BufferRef, DeviceProfile, IndexLevel, MemTier, ScalarValue, VarRef};
 
 use super::*;
-use super::{TgBufferInfo, add_and_choose, dtype_bytes_for_device_buffer};
+use super::{ThreadgroupTileInfo, add_and_choose, dtype_bytes_for_device_buffer};
 
 #[derive(Debug, Clone, Copy)]
 pub(super) struct DeviceAddressLayout {
@@ -32,7 +32,7 @@ pub(super) fn find_nested_theta_in_egraph(
     egraph: &mut EGraph<TensorIr, TensorAnalysis>,
     chosen: &mut HashMap<Id, TensorIr>,
     device: &DeviceProfile,
-) -> Option<(u32, Id, Id, Vec<TgBufferInfo>)> {
+) -> Option<(u32, Id, Id, Vec<ThreadgroupTileInfo>)> {
     let canonical = egraph.find(output_id);
     // Clone outer nodes to avoid borrow conflicts.
     let outer_nodes: Vec<TensorIr> = egraph[canonical].iter().cloned().collect();
@@ -61,7 +61,7 @@ pub(super) fn find_nested_theta_in_egraph(
                     let has_tg =
                         egraph_subtree_has_tg_loads(egraph, *inner_update, inner_canonical);
                     if has_tg {
-                        let tg_bufs = collect_tg_buffer_info_with_device_addrs(
+                        let tg_bufs = collect_threadgroup_tile_info_with_device_addrs(
                             &[inner_canonical],
                             egraph,
                             chosen,
@@ -86,20 +86,20 @@ pub(super) fn find_nested_theta_in_egraph(
     None
 }
 
-/// Collect `TgBufferInfo` from the e-graph, including device address decomposition.
+/// Collect `ThreadgroupTileInfo` from the e-graph, including device address decomposition.
 ///
 /// For each Load(Threadgroup(name), `tg_addr`) reachable from the inner Theta,
 /// finds the sibling Load(Device(name), `dev_addr`) in the same e-class. The
 /// device address is decomposed into row/col components to populate the
-/// `TgBufferInfo` with device address mapping for cooperative loads.
-pub(super) fn collect_tg_buffer_info_with_device_addrs(
+/// `ThreadgroupTileInfo` with device address mapping for cooperative loads.
+pub(super) fn collect_threadgroup_tile_info_with_device_addrs(
     inner_theta_ids: &[Id],
     egraph: &mut EGraph<TensorIr, TensorAnalysis>,
     chosen: &mut HashMap<Id, TensorIr>,
     tile_k: u32,
     device: &DeviceProfile,
-) -> Option<Vec<TgBufferInfo>> {
-    let mut merged: Vec<TgBufferInfo> = Vec::new();
+) -> Option<Vec<ThreadgroupTileInfo>> {
+    let mut merged: Vec<ThreadgroupTileInfo> = Vec::new();
     for &inner_theta_id in inner_theta_ids {
         let mut results = Vec::new();
         let mut visited = HashSet::new();
@@ -130,8 +130,8 @@ pub(super) fn collect_tg_buffer_info_with_device_addrs(
 
 pub(super) fn merge_tg_buffer_info(
     egraph: &EGraph<TensorIr, TensorAnalysis>,
-    dst: &mut TgBufferInfo,
-    src: &TgBufferInfo,
+    dst: &mut ThreadgroupTileInfo,
+    src: &ThreadgroupTileInfo,
 ) {
     if dst.device_name != src.device_name || dst.device_row_stride != src.device_row_stride {
         return;
@@ -186,7 +186,7 @@ pub(super) fn merge_tg_buffer_info(
     dst.size = dst.size.max(dst.tile_rows.saturating_mul(dst.tile_cols));
 }
 
-pub(super) fn collect_tg_buffer_info_for_load(
+pub(super) fn collect_threadgroup_tile_info_for_load(
     canonical: Id,
     tg_name: BufferRef,
     tg_addr: Id,
@@ -194,7 +194,7 @@ pub(super) fn collect_tg_buffer_info_for_load(
     chosen: &mut HashMap<Id, TensorIr>,
     tile_k: u32,
     device: &DeviceProfile,
-) -> Option<TgBufferInfo> {
+) -> Option<ThreadgroupTileInfo> {
     // Device-tier counterpart of a threadgroup buffer is the same `BufferRef`.
     let dev_name = tg_name;
     // Size the buffer against the *worst-case* simdgroup promotion. The
@@ -288,10 +288,10 @@ pub(super) fn collect_tg_buffer_info_for_load(
 
     if std::env::var("TENSOR_IR_DEBUG_TG").is_ok() {
         eprintln!(
-            "collect_tg_buffer_info_for_load: tg={tg_name:?} expected_size={expected_size} tile_rows={tile_rows} tile_cols={tile_cols}"
+            "collect_threadgroup_tile_info_for_load: tg={tg_name:?} expected_size={expected_size} tile_rows={tile_rows} tile_cols={tile_cols}"
         );
     }
-    Some(TgBufferInfo {
+    Some(ThreadgroupTileInfo {
         tg_name,
         device_name: dev_name,
         size: expected_size,
@@ -301,7 +301,6 @@ pub(super) fn collect_tg_buffer_info_for_load(
         device_row_base: row_base,
         device_col_base: col_base,
         device_row_stride,
-        sg_read_stride: 0,
     })
 }
 
@@ -313,7 +312,7 @@ pub(super) fn collect_tg_with_device_rec(
     theta_class: Id,
     tile_k: u32,
     device: &DeviceProfile,
-    results: &mut Vec<TgBufferInfo>,
+    results: &mut Vec<ThreadgroupTileInfo>,
     visited: &mut HashSet<Id>,
 ) -> Option<()> {
     let canonical = egraph.find(id);
@@ -333,7 +332,7 @@ pub(super) fn collect_tg_with_device_rec(
     {
         let tg_addr = children[0];
         if !results.iter().any(|b| b.tg_name == *tg_name) {
-            results.push(collect_tg_buffer_info_for_load(
+            results.push(collect_threadgroup_tile_info_for_load(
                 canonical, *tg_name, tg_addr, egraph, chosen, tile_k, device,
             )?);
         }

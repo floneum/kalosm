@@ -1,12 +1,10 @@
-//! Lowering options shared between the saturation runner and the skeleton
-//! builder.
+//! Lowering options shared by saturation and effect-program construction.
 //!
 //! These toggles control structural choices (loop unrolling, inlining, etc.)
-//! that need to stay consistent across the lowering rules and the post-
-//! extraction skeleton — so the same struct is read by both.
+//! that need to stay consistent across lowering rules and effect IR creation.
 
-/// Knobs that affect how lowering rules and the skeleton builder shape the
-/// generated kernel. Customize to trade kernel performance for IR readability.
+/// Knobs that affect how lowering rules shape the generated kernel. Customize
+/// to trade kernel performance for IR readability.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LoweringOptions {
     /// Expand fixed-iteration inner loops into straight-line code. When

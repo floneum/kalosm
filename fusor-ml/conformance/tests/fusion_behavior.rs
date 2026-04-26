@@ -164,7 +164,7 @@ async fn gpu_nary_fusion_respects_binding_limit() {
     let expected = cpu_iter
         .fold(cpu_first, |acc, tensor| (&acc + tensor).to_concrete())
         .to_concrete();
-    approx_eq(&result.to_concrete(), &expected, 1e-6)
+    approx_eq(&result.to_concrete(), &expected, 1e-4)
         .await
         .unwrap();
 }

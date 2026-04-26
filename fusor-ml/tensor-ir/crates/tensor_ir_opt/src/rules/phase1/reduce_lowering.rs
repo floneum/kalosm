@@ -410,7 +410,7 @@ impl crate::applier::TypedApplier for ReduceApplier {
                 egraph.union(eclass, dispatch);
                 results.push(dispatch);
             }
-        } else {
+        } else if results.is_empty() {
             let dispatch = build_simple_reduce_dispatch(
                 egraph,
                 &SimpleReduceDispatchSpec {

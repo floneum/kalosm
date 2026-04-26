@@ -3,13 +3,16 @@ use egg::{EGraph, Id, Rewrite};
 use crate::analysis::TensorAnalysis;
 use crate::applier::SimpleEclassSearcher;
 use crate::language::TensorIr;
-use crate::types::{BinaryOp, ScalarValue};
+use crate::types::{BinaryOp, DType, ScalarValue};
 
 pub(super) fn build_all() -> Vec<Rewrite<TensorIr, TensorAnalysis>> {
     vec![
         Rewrite::new(
             "arith-identity",
             SimpleEclassSearcher::new(|egraph, eclass| {
+                if egraph[egraph.find(eclass)].data.dtype != Some(DType::U32) {
+                    return false;
+                }
                 egraph[eclass].iter().any(|node| {
                     let TensorIr::BinOp(name, args) = node else {
                         return false;
@@ -45,6 +48,10 @@ struct ArithIdentityApplier;
 
 impl crate::applier::TypedApplier for ArithIdentityApplier {
     fn apply(&self, egraph: &mut EGraph<TensorIr, TensorAnalysis>, eclass: Id) -> Vec<Id> {
+        if egraph[egraph.find(eclass)].data.dtype != Some(DType::U32) {
+            return vec![];
+        }
+
         let node = egraph[eclass]
             .iter()
             .find(|n| matches!(n, TensorIr::BinOp(_, args) if args.len() == 2))

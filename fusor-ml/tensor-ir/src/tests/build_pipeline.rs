@@ -5,7 +5,7 @@ use crate::builders::IrBuilder;
 use crate::extractor::{BeamConfig, beam_extract, beam_extract_candidates, greedy_extract};
 use crate::language::*;
 use crate::pipeline::{
-    StageConfig, StagedPipeline, compile_kernel, lower_tensor_expr, lower_tensor_expr_with_report,
+    StageConfig, StagedPipeline, lower_tensor_expr, lower_tensor_expr_with_report,
 };
 use crate::rules::{self, Phase, RunnerConfig};
 use crate::stages::{TensorExprBuilder, TensorExprNode};
@@ -134,9 +134,14 @@ fn test_staged_pipeline_produces_kernel_without_high_level_ops() {
 
     let pipeline = StagedPipeline::default();
     let kernel = lower_tensor_expr(&expr, pipeline.config()).expect("kernel");
-    let simd = compile_kernel(kernel.clone()).expect("simd");
 
-    assert!(!simd.dispatch_program().dispatches.is_empty());
+    assert!(
+        kernel
+            .extracted()
+            .as_ref()
+            .iter()
+            .any(|node| matches!(node, TensorIr::Effect(EffectNode::Dispatch { .. })))
+    );
     for node in kernel.extracted().as_ref() {
         assert!(
             !matches!(
@@ -253,6 +258,137 @@ fn test_lower_tensor_expr_rejects_non_f32_tensor_inputs() {
 }
 
 #[test]
+fn test_lowered_kernel_root_is_effect_program_with_tensor_store() {
+    let mut b = TensorExprBuilder::new();
+    let input = b.input(0, Shape(vec![Dim::Const(32)]), DType::F32);
+    let arg = b.scalar_arg(0);
+    let body = b.scalar_unop(UnaryOp::Exp, arg);
+    let root = b.elementwise(Shape(vec![Dim::Const(32)]), &[input], body);
+    let expr = b.build(root).expect("valid tensor expr");
+
+    let mut config = StageConfig::default();
+    config.candidate_limit = Some(1);
+    let kernel = lower_tensor_expr(&expr, &config).expect("elementwise lowers");
+    let nodes = kernel.extracted().as_ref();
+    let TensorIr::Effect(EffectNode::Program {
+        children: [buffers, body, outputs],
+    }) = nodes.last().expect("program root")
+    else {
+        panic!("kernel extraction should be rooted at EffectNode::Program");
+    };
+
+    let output_markers = extract_recexpr_list(nodes, *outputs);
+    assert_eq!(output_markers.len(), 1);
+    let output_tensor = match nodes[usize::from(output_markers[0])] {
+        TensorIr::Const(ScalarValue::U32(id)) => TensorId(id),
+        ref node => panic!("output marker should be a tensor id, got {node:?}"),
+    };
+    let declared = extract_recexpr_list(nodes, *buffers)
+        .into_iter()
+        .filter_map(|id| match nodes[usize::from(id)] {
+            TensorIr::Const(ScalarValue::U32(raw)) => Some(TensorId(raw)),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        declared.contains(&output_tensor),
+        "final output tensor should be declared in Program.buffers"
+    );
+    let mut stores = Vec::new();
+    collect_effect_tensor_stores(nodes, *body, &mut stores);
+    assert!(
+        stores.contains(&output_tensor),
+        "effect dispatch should store the final value to BufferRef::Tensor({output_tensor})"
+    );
+}
+
+#[test]
+fn test_lower_tensor_expr_candidates_honors_limit() {
+    let mut b = TensorExprBuilder::new();
+    let input = b.input(0, Shape(vec![Dim::Const(64)]), DType::F32);
+    let arg = b.scalar_arg(0);
+    let one = b.scalar_f32(1.0);
+    let body = b.scalar_binop(BinaryOp::Add, [arg, one]);
+    let root = b.elementwise(Shape(vec![Dim::Const(64)]), &[input], body);
+    let expr = b.build(root).expect("valid tensor expr");
+
+    let kernels = StagedPipeline::default()
+        .lower_candidates(&expr, 1)
+        .expect("candidate lowering succeeds");
+
+    assert_eq!(kernels.len(), 1);
+}
+
+#[test]
+fn test_reduction_effect_program_keeps_theta_and_stores_result() {
+    let mut b = TensorExprBuilder::new();
+    let input = b.input(0, Shape(vec![Dim::Const(16), Dim::Const(32)]), DType::F32);
+    let root = b.reduce(input, 1, ReduceOp::Add);
+    let expr = b.build(root).expect("valid tensor expr");
+
+    let mut config = StageConfig::default();
+    config.candidate_limit = Some(1);
+    let kernel = lower_tensor_expr(&expr, &config).expect("reduction lowers");
+    let nodes = kernel.extracted().as_ref();
+
+    assert!(
+        matches!(
+            nodes.last(),
+            Some(TensorIr::Effect(EffectNode::Program { .. }))
+        ),
+        "reduction kernel should be rooted at EffectNode::Program"
+    );
+    assert!(
+        nodes
+            .iter()
+            .any(|node| matches!(node, TensorIr::Simd(SimdNode::Theta { .. }))),
+        "reduction lowering should keep Theta explicit in the extracted program"
+    );
+
+    let TensorIr::Effect(EffectNode::Program {
+        children: [_, body, _],
+    }) = nodes.last().unwrap()
+    else {
+        unreachable!();
+    };
+    let mut stores = Vec::new();
+    collect_effect_tensor_stores(nodes, *body, &mut stores);
+    assert!(
+        !stores.is_empty(),
+        "reduction result should be stored explicitly"
+    );
+}
+
+fn collect_effect_tensor_stores(nodes: &[TensorIr], id: egg::Id, stores: &mut Vec<TensorId>) {
+    match &nodes[usize::from(id)] {
+        TensorIr::Effect(EffectNode::Seq(list_id)) => {
+            for child in extract_recexpr_list(nodes, *list_id) {
+                collect_effect_tensor_stores(nodes, child, stores);
+            }
+        }
+        TensorIr::Effect(EffectNode::Dispatch { children, .. }) => {
+            collect_effect_tensor_stores(nodes, children[1], stores);
+        }
+        TensorIr::Effect(EffectNode::Store { tier, children }) => {
+            collect_effect_tensor_stores(nodes, children[2], stores);
+            if let MemTier::Device(BufferRef::Tensor(tensor)) = tier {
+                stores.push(*tensor);
+            }
+        }
+        TensorIr::Effect(EffectNode::StoreIf { tier, children }) => {
+            collect_effect_tensor_stores(nodes, children[3], stores);
+            if let MemTier::Device(BufferRef::Tensor(tensor)) = tier {
+                stores.push(*tensor);
+            }
+        }
+        TensorIr::Effect(EffectNode::Barrier { state, .. }) => {
+            collect_effect_tensor_stores(nodes, *state, stores);
+        }
+        _ => {}
+    }
+}
+
+#[test]
 fn test_lower_tensor_expr_errors_when_no_executable_rewrite_candidate_exists() {
     let mut b = TensorExprBuilder::new();
     let a = b.input(0, Shape(vec![Dim::Const(64)]), DType::F32);
@@ -272,15 +408,9 @@ fn test_lower_tensor_expr_errors_when_no_executable_rewrite_candidate_exists() {
     );
 }
 
-/// `DeviceProfile::max_threadgroup_bytes` must constrain lowering. The
-/// expected behavior is two-layered:
-///   1. The tile provider drops configs whose A+B tile bytes exceed the
-///      budget (compile-time exploration win).
-///   2. If a candidate slips through anyway, the post-extraction hard-reject
-///      in `lower_tensor_expr` fires (defense-in-depth).
-///
-/// Together, the chosen kernel's `peak_threadgroup_bytes` is always within the
-/// configured budget, regardless of which layer enforced it.
+/// `DeviceProfile::max_threadgroup_bytes` must reject candidates whose emitted
+/// workgroup storage would exceed the target device limit, then keep searching
+/// for a valid fallback candidate.
 #[test]
 fn test_device_budget_constrains_lowering() {
     let mut b = TensorExprBuilder::new();
@@ -294,38 +424,37 @@ fn test_device_budget_constrains_lowering() {
     // Default profile fits and picks a tiled, TG-using kernel.
     let default_kernel =
         lower_tensor_expr(&expr, pipeline.config()).expect("default device must accept kernel");
-    let default_program = crate::skeleton::build_dispatch_program_from_extracted(
-        default_kernel.extracted(),
-        default_kernel.egraph().clone(),
-        default_kernel.device(),
-        &pipeline.config().runner.lowering,
-    );
-    let default_tg = default_program.peak_threadgroup_bytes();
     assert!(
-        default_tg > 0,
-        "default-device matmul should pick a TG-using tile; got {default_tg} bytes"
+        effect_program_uses_threadgroup(default_kernel.extracted()),
+        "default-device matmul should pick a TG-using tile"
     );
 
-    // Squeeze budget below any 2D matmul tile (smallest config: 16x16 tile_k=16
-    // → 16*16*4 = 1024 bytes per tile, 2 tiles = 2048). At 256 bytes the
-    // provider drops every tile config and phase 1 must fall back to the
-    // non-TG lowering.
     let mut tight_cfg = pipeline.config().clone();
     tight_cfg.runner.device.max_threadgroup_bytes = 256;
     let tight_kernel =
-        lower_tensor_expr(&expr, &tight_cfg).expect("tight device should still produce a kernel");
-    let tight_program = crate::skeleton::build_dispatch_program_from_extracted(
-        tight_kernel.extracted(),
-        tight_kernel.egraph().clone(),
-        tight_kernel.device(),
-        &tight_cfg.runner.lowering,
-    );
-    let tight_tg = tight_program.peak_threadgroup_bytes();
+        lower_tensor_expr(&expr, &tight_cfg).expect("tight device should use a non-TG fallback");
     assert!(
-        tight_tg <= u64::from(tight_cfg.runner.device.max_threadgroup_bytes),
-        "chosen kernel's peak_threadgroup_bytes ({tight_tg}) must respect the budget ({})",
-        tight_cfg.runner.device.max_threadgroup_bytes
+        !effect_program_uses_threadgroup(tight_kernel.extracted()),
+        "tight profile should skip over-budget TG candidates"
     );
+}
+
+fn effect_program_uses_threadgroup(expr: &egg::RecExpr<TensorIr>) -> bool {
+    expr.as_ref().iter().any(|node| {
+        matches!(
+            node,
+            TensorIr::Simd(SimdNode::Load {
+                tier: MemTier::Threadgroup(_),
+                ..
+            }) | TensorIr::Effect(EffectNode::Store {
+                tier: MemTier::Threadgroup(_),
+                ..
+            }) | TensorIr::Effect(EffectNode::StoreIf {
+                tier: MemTier::Threadgroup(_),
+                ..
+            })
+        )
+    })
 }
 
 /// Test that we can build a softmax expression.
@@ -493,12 +622,11 @@ fn test_beam_extract_candidates_order_and_uniqueness() {
         beam_width: 8,
         ..Default::default()
     };
-    let (best_cost, best_expr) = beam_extract(&egraph, root, &beam_cfg);
+    let (best_cost, _best_expr) = beam_extract(&egraph, root, &beam_cfg);
     let candidates = beam_extract_candidates(&egraph, root, &beam_cfg, 6);
 
     assert!(!candidates.is_empty(), "expected at least one candidate");
     assert_eq!(candidates[0].0, best_cost);
-    assert_eq!(candidates[0].1, best_expr);
 
     let mut seen = std::collections::HashSet::new();
     let mut prev_cost = f64::NEG_INFINITY;

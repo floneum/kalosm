@@ -16,14 +16,8 @@ fn main() {
     let matmul = builder.contraction(
         Shape(vec![m, n.clone(), k.clone()]),
         &[
-            (
-                a,
-                Strides(vec![k, Dim::Const(0), Dim::Const(1)]),
-            ),
-            (
-                b,
-                Strides(vec![Dim::Const(0), Dim::Const(1), n]),
-            ),
+            (a, Strides(vec![k, Dim::Const(0), Dim::Const(1)])),
+            (b, Strides(vec![Dim::Const(0), Dim::Const(1), n])),
         ],
         body,
         &[(2, ReduceOp::Add)],
@@ -62,11 +56,7 @@ fn main() {
     }
     println!();
 
-    let simd = pipeline.compile(kernel).expect("simd lowering");
-    println!("=== Dispatch Skeleton ===");
-    println!("{}", simd.dispatch_program());
-
-    match lower_to_wgsl(simd.dispatch_program()) {
+    match lower_to_wgsl(&kernel) {
         Ok(wgsl) => {
             println!("=== WGSL ===");
             println!("{wgsl}");
@@ -74,7 +64,7 @@ fn main() {
         Err(err) => eprintln!("WGSL generation failed: {err}"),
     }
 
-    match lower_to_msl(simd.dispatch_program()) {
+    match lower_to_msl(&kernel) {
         Ok(msl) => {
             println!("=== MSL ===");
             println!("{msl}");

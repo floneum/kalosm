@@ -250,13 +250,9 @@ impl CodegenCtx<'_> {
                 if let Some(handle) = self.lookup_var(var) {
                     handle
                 } else {
-                    // Invariant: pre-codegen `verify::verify` checks every
+                    // Invariant: program validation checks every
                     // `Var(Bound { depth, .. })` against its enclosing
-                    // binder count. `lower_dispatch_program` accepts only
-                    // `Verified<'_>`, so an unbound `Var` here would
-                    // indicate either a verifier bug or an out-of-scope
-                    // construction. Encode via `unreachable!` to make the
-                    // structural guarantee explicit.
+                    // binder count before the effect program reaches codegen.
                     unreachable!(
                         "unbound variable {var:?} reached codegen; verifier should have rejected"
                     )

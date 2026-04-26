@@ -1,6 +1,6 @@
 use egg::{Analysis, DidMerge, EGraph, Id, Language};
 
-use crate::language::{DispatchNode, HighLevelNode, SimdNode, TensorIr};
+use crate::language::{DispatchNode, EffectNode, HighLevelNode, SimdNode, TensorIr};
 use crate::types::{
     AddressProfile, BinaryOp, BinderKind, DType, DepSet, MemTier, ReduceOp, ScalarValue, Shape,
     Strides, TernaryOp, UnaryOp, VarDepSet, VarRef, index_level_from_slot,
@@ -71,7 +71,7 @@ pub struct TensorData {
     pub dtype_bytes: Option<u32>,
     /// Canonical strides for tensor-typed eclasses. Populated for `Input`
     /// (row-major) and `Restride` (the explicit strides), propagated through
-    /// `Reduce` (axis dropped). Lets phase3/skeleton stop walking the e-graph
+    /// `Reduce` (axis dropped). Lets lowering and validation stop walking the e-graph
     /// to reconstruct strides. `None` if unknown or eclass members disagree.
     pub stride_profile: Option<Strides>,
     /// Dependence set: which GPU hierarchy levels this value depends on.
@@ -84,7 +84,7 @@ pub struct TensorData {
     pub free_var_dep: VarDepSet,
     /// Static bound on a scalar/address expression's runtime value. Populated
     /// for `Const`/`Add`/`Mul` subtrees that don't depend on a `Var`. Lets
-    /// skeleton avoid re-walking address expressions to size threadgroup
+    /// effect lowering avoid re-walking address expressions to size threadgroup
     /// buffers. `None` if any subterm is `Var`-dependent or eclass members
     /// disagree.
     pub address_profile: Option<AddressProfile>,
@@ -218,7 +218,9 @@ const fn node_is_tg_memory(node: &TensorIr) -> bool {
     match node {
         TensorIr::Simd(SimdNode::Load { tier, .. })
         | TensorIr::Simd(SimdNode::Store { tier, .. })
-        | TensorIr::Simd(SimdNode::StoreIf { tier, .. }) => {
+        | TensorIr::Simd(SimdNode::StoreIf { tier, .. })
+        | TensorIr::Effect(EffectNode::Store { tier, .. })
+        | TensorIr::Effect(EffectNode::StoreIf { tier, .. }) => {
             matches!(tier, MemTier::Threadgroup(_))
         }
         _ => false,
@@ -351,7 +353,7 @@ fn make_high_level_data(
             let mut data = list_tensor_data(egraph, *children_list);
             data.shape = Some(index_space.clone());
             data.stride_profile = Some(Strides::row_major_for_shape(index_space));
-            // During mid-construction passes (e.g. `build_dispatch_program_from_extracted`
+            // During mid-construction passes that add nodes incrementally,
             // adding nodes one at a time) `children_list` may briefly resolve to a
             // class whose first form isn't Cons/Nil because of e-class merges.
             // Surface default composite-dispatch / reduction-depth facts in that
@@ -595,7 +597,7 @@ fn make_dispatch_data(
 
 /// Derive `DispatchShapeFacts` for a `Dispatch` e-node from its children list.
 ///
-/// When the analysis runs mid-construction — e.g. `build_dispatch_program_from_extracted`
+/// When the analysis runs mid-construction while new nodes are being added,
 /// adding a Dispatch whose `children_list` has been merged with non-list nodes by
 /// downstream rules — the list may not be walkable. In that case we surface default
 /// shape facts and let the caller reject the malformed dispatch, rather than
@@ -737,6 +739,26 @@ fn make_simd_data(egraph: &EGraph<TensorIr, TensorAnalysis>, node: &SimdNode) ->
     }
 }
 
+fn make_effect_data(egraph: &EGraph<TensorIr, TensorAnalysis>, node: &EffectNode) -> TensorData {
+    match node {
+        EffectNode::Token => empty_tensor_data(),
+        EffectNode::Program { children } => {
+            make_simd_child_data(egraph, children, child_dep_union(egraph, children))
+        }
+        EffectNode::Dispatch { children, .. } => {
+            make_simd_child_data(egraph, children, child_dep_union(egraph, children))
+        }
+        EffectNode::Seq(list_id) => list_tensor_data(egraph, *list_id),
+        EffectNode::Store { children, .. } => {
+            make_simd_child_data(egraph, children, child_dep_union(egraph, children))
+        }
+        EffectNode::StoreIf { children, .. } => {
+            make_simd_child_data(egraph, children, child_dep_union(egraph, children))
+        }
+        EffectNode::Barrier { state, .. } => copy_child_tensor_data(&egraph[*state].data),
+    }
+}
+
 impl Analysis<TensorIr> for TensorAnalysis {
     type Data = TensorData;
 
@@ -744,6 +766,7 @@ impl Analysis<TensorIr> for TensorAnalysis {
         let mut data = match enode {
             TensorIr::HighLevel(node) => make_high_level_data(egraph, node),
             TensorIr::Dispatch(node) => make_dispatch_data(egraph, node),
+            TensorIr::Effect(node) => make_effect_data(egraph, node),
             TensorIr::Nil => TensorData::default(),
             TensorIr::Cons([head, tail]) => {
                 let h = &egraph[*head].data;
