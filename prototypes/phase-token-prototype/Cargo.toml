@@ -1,0 +1,13 @@
+[package]
+name = "phase-token-prototype"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[workspace]
+
+[lib]
+doctest = true
+
+[dependencies]
+naga = { version = "29.0.1", features = ["wgsl-out"] }
