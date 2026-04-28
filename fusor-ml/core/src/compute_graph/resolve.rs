@@ -16,13 +16,12 @@ use crate::{
     },
     nary_wise::{ExtractedUnaryChain, NaryExpr, NaryOperation, UnaryFunctionChain},
     quantized::matmul::QMatMulOperation,
-    tensor::TensorData,
 };
 
 use super::{ComputeGraphInner, ComputeGraphNode, ComputeGraphNodeVariant, NodeIndex};
 
 pub(crate) struct ResolverResult {
-    pub(crate) data: TensorData,
+    pub(crate) data: crate::tensor::TensorData,
     pub(crate) total_kernels: usize,
 }
 
@@ -102,7 +101,6 @@ impl Resolver {
 
         // Pass 4: Execution
         // Extract operations in order.
-        let target_set: FxHashSet<NodeIndex> = self.targets.iter().copied().collect();
         let mut queued_operations = Vec::with_capacity(sorted_nodes.len());
 
         for idx in sorted_nodes {
@@ -118,20 +116,9 @@ impl Resolver {
             }
         }
 
-        // Build a remaining-consumer count. For each queued operation, we use
-        // the Operation's visit_dependencies (which reflects post-optimization
-        // fused dependencies) to count how many future operations read each
-        // inner NodeIndex.
-        let mut remaining_consumers: FxHashMap<NodeIndex, usize> = FxHashMap::default();
-        for (_, op) in &queued_operations {
-            op.visit_dependencies(&mut |dep| {
-                *remaining_consumers.entry(dep).or_insert(0) += 1;
-            });
-        }
-
         // Create the first command encoder. We submit and recreate it after
-        // each kernel flush so that the GPU can reclaim freed intermediate
-        // buffers instead of accumulating all commands in one giant encoder.
+        // each kernel flush so command buffers stay bounded during large
+        // resolves. Cached TensorData remains alive through the resolve.
         let mut command_encoder =
             device
                 .wgpu_device()
@@ -175,19 +162,7 @@ impl Resolver {
                         removed,
                         &mut command_encoder,
                     );
-                    // Submit the current command encoder before releasing
-                    // cached TensorData. Encoded commands still reference those
-                    // buffers; dropping them first lets the allocation cache
-                    // hand the same storage to later kernels too early.
-                    device.wgpu_queue().submit(Some(command_encoder.finish()));
-                    // After submission, free intermediate cached results whose
-                    // consumers within this execution are all satisfied.
-                    Self::release_dead_intermediates(
-                        graph,
-                        &pending_operations,
-                        &mut remaining_consumers,
-                        &target_set,
-                    );
+                    device.submit(command_encoder.finish());
                     device.reset_initialized_buffers();
                     command_encoder = device.wgpu_device().create_command_encoder(
                         &wgpu::CommandEncoderDescriptor {
@@ -215,16 +190,6 @@ impl Resolver {
                 let result = map_layout.run(graph);
                 // Cache the result
                 graph.set_cached_result(node, result);
-                // Map-layout nodes are resolved immediately — release any
-                // input buffers that are no longer needed.
-                // Use graph.visit_dependencies for map_layout since they
-                // are not lowered to Operations.
-                Self::release_dead_intermediates_from_graph(
-                    graph,
-                    &[node],
-                    &mut remaining_consumers,
-                    &target_set,
-                );
             } else {
                 self.push_operation(
                     graph,
@@ -239,7 +204,6 @@ impl Resolver {
             };
         }
 
-        let mut final_pending_operations = None;
         if !pending_operations.is_empty() {
             let old_best = current_constraints.solve(max_subgroup_size).unwrap_or_else(|| {
                 panic!(
@@ -259,19 +223,10 @@ impl Resolver {
                 removed,
                 &mut command_encoder,
             );
-            final_pending_operations = Some(pending_operations.clone());
         }
 
-        // Submit any remaining commands before releasing the buffers they use.
-        device.wgpu_queue().submit(Some(command_encoder.finish()));
-        if let Some(pending_operations) = final_pending_operations.as_ref() {
-            Self::release_dead_intermediates(
-                graph,
-                pending_operations,
-                &mut remaining_consumers,
-                &target_set,
-            );
-        }
+        // Submit any remaining commands before reusing cached allocations.
+        device.submit(command_encoder.finish());
         device.reset_initialized_buffers();
 
         let data = graph
@@ -281,40 +236,6 @@ impl Resolver {
             data,
             total_kernels,
         }
-    }
-
-    /// After a kernel flush produces cached results for a set of nodes,
-    /// decrement the remaining-consumer count for each of their inputs. When
-    /// an input's count reaches zero and it is not a target node, drop its
-    /// cached result to free the GPU buffer.
-    ///
-    /// Uses `op.visit_dependencies()` to match the post-optimization
-    /// dependencies that were used to build the consumer counts.
-    fn release_dead_intermediates(
-        graph: &mut ComputeGraphInner,
-        produced_ops: &[(NodeIndex, Arc<dyn Operation>)],
-        remaining_consumers: &mut FxHashMap<NodeIndex, usize>,
-        targets: &FxHashSet<NodeIndex>,
-    ) {
-        // Keep cached TensorData alive for the full resolve. Dropping an
-        // intermediate after encoding a kernel but before all submitted GPU
-        // work is complete can make later allocations reuse storage that is
-        // still referenced by queued commands.
-        let _ = (graph, produced_ops, remaining_consumers, targets);
-    }
-
-    /// Like `release_dead_intermediates` but uses the compute graph's
-    /// `visit_dependencies` instead of an Operation's. Used for map-layout
-    /// and resize nodes that are resolved immediately without being lowered
-    /// to an Operation.
-    fn release_dead_intermediates_from_graph(
-        graph: &mut ComputeGraphInner,
-        produced_nodes: &[NodeIndex],
-        remaining_consumers: &mut FxHashMap<NodeIndex, usize>,
-        targets: &FxHashSet<NodeIndex>,
-    ) {
-        // See release_dead_intermediates.
-        let _ = (graph, produced_nodes, remaining_consumers, targets);
     }
 
     fn build_execution_graph(

@@ -3,7 +3,10 @@ use std::{
     fmt::Debug,
     num::{NonZeroU64, NonZeroUsize},
     path::PathBuf,
-    sync::{Arc, OnceLock},
+    sync::{
+        Arc, OnceLock, Weak,
+        atomic::{AtomicU64, Ordering},
+    },
 };
 
 use lru::LruCache;
@@ -19,6 +22,7 @@ use crate::compute_graph::ComputeGraph;
 #[derive(Debug)]
 struct CachedBuffer {
     writen: bool,
+    submitted_after: u64,
     buffer: Arc<wgpu::Buffer>,
 }
 
@@ -103,10 +107,13 @@ fn adapter_preference_rank(adapter: &wgpu::Adapter) -> u8 {
     }
 }
 
-#[allow(dead_code)]
 impl CachedBuffer {
     fn new(buffer: Arc<wgpu::Buffer>, writen: bool) -> Self {
-        Self { writen, buffer }
+        Self {
+            writen,
+            submitted_after: 0,
+            buffer,
+        }
     }
 
     fn initialized(&self) -> bool {
@@ -115,6 +122,10 @@ impl CachedBuffer {
 
     fn set_initialized(&mut self) {
         self.writen = true;
+    }
+
+    fn in_flight(&self, completed_submission: u64) -> bool {
+        self.submitted_after > completed_submission
     }
 }
 
@@ -133,6 +144,8 @@ struct DeviceInner {
     // Cache for buffer allocations, keyed by size in bytes
     buffer_allocation_cache:
         RwLock<LruCache<(u64, BufferUsages), Vec<CachedBuffer>, FxBuildHasher>>,
+    next_submission_id: AtomicU64,
+    completed_submission_id: AtomicU64,
     // Single compute graph shared by all tensors on this device
     compute_graph: OnceLock<ComputeGraph>,
 }
@@ -275,6 +288,8 @@ impl Device {
             shader_module_cache,
             compute_pipeline_cache,
             buffer_allocation_cache,
+            next_submission_id: AtomicU64::new(0),
+            completed_submission_id: AtomicU64::new(0),
             compute_graph: OnceLock::new(),
         });
 
@@ -373,6 +388,33 @@ impl Device {
         &self.inner.queue
     }
 
+    pub(crate) fn submit(&self, command_buffer: wgpu::CommandBuffer) {
+        let submission_id = self
+            .inner
+            .next_submission_id
+            .fetch_add(1, Ordering::Relaxed)
+            + 1;
+        {
+            let mut cache = self.inner.buffer_allocation_cache.write();
+            for (_, buffers) in cache.iter_mut() {
+                for buffer in buffers.iter_mut() {
+                    buffer.submitted_after = submission_id;
+                }
+            }
+        }
+
+        self.inner.queue.submit(Some(command_buffer));
+
+        let weak_inner: Weak<DeviceInner> = Arc::downgrade(&self.inner);
+        self.inner.queue.on_submitted_work_done(move || {
+            if let Some(inner) = weak_inner.upgrade() {
+                inner
+                    .completed_submission_id
+                    .fetch_max(submission_id, Ordering::Release);
+            }
+        });
+    }
+
     /// Block until all submitted GPU work has completed.
     pub fn poll_wait(&self) {
         self.inner
@@ -412,27 +454,28 @@ impl Device {
 
     /// Reset the initialized flag on all cached buffers.
     pub fn reset_initialized_buffers(&self) {
+        let completed_submission = self.inner.completed_submission_id.load(Ordering::Acquire);
         let mut cache = self.inner.buffer_allocation_cache.write();
         for (_, buffers) in cache.iter_mut() {
             for buffer in buffers.iter_mut() {
                 buffer.writen = false;
             }
-            prune_cached_buffers(buffers);
+            prune_cached_buffers(buffers, completed_submission);
         }
     }
 
     /// Try to get a buffer from the allocation cache. Returns None if no buffer of the requested size is available.
-    #[allow(dead_code)]
     pub(crate) fn get_cached_buffer(
         &self,
         size: u64,
         usage: wgpu::BufferUsages,
         to_initilize: bool,
     ) -> Option<Arc<wgpu::Buffer>> {
+        let completed_submission = self.inner.completed_submission_id.load(Ordering::Acquire);
         let mut cache = self.inner.buffer_allocation_cache.write();
         let items = cache.get_mut(&(size, usage))?;
         items.iter_mut().find_map(|a| {
-            if Arc::strong_count(&a.buffer) == 1 {
+            if Arc::strong_count(&a.buffer) == 1 && !a.in_flight(completed_submission) {
                 if to_initilize {
                     if a.initialized() {
                         return None;
@@ -453,16 +496,35 @@ impl Device {
         usage: wgpu::BufferUsages,
         to_initilize: bool,
     ) -> Arc<wgpu::Buffer> {
-        let _ = to_initilize;
-        // Do not recycle GPU buffers here. Reusing a buffer after the last
-        // Rust Arc is dropped is not enough to prove all previously submitted
-        // GPU work that references it has completed.
-        Arc::new(self.wgpu_device().create_buffer(&wgpu::BufferDescriptor {
-            label: Some("Tensor Buffer"),
-            size,
-            usage,
-            mapped_at_creation: false,
-        }))
+        // Try to get a buffer from the cache first
+        self.get_cached_buffer(size, usage, to_initilize)
+            .unwrap_or_else(|| {
+                let new_buffer = self.wgpu_device().create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("Tensor Buffer"),
+                    size,
+                    usage,
+                    mapped_at_creation: false,
+                });
+
+                let buffer = Arc::new(new_buffer);
+                self.inner
+                    .buffer_allocation_cache
+                    .write()
+                    .get_or_insert_mut((size, usage), Vec::new)
+                    .push(CachedBuffer::new(buffer.clone(), to_initilize));
+                if let Some(buffers) = self
+                    .inner
+                    .buffer_allocation_cache
+                    .write()
+                    .get_mut(&(size, usage))
+                {
+                    prune_cached_buffers(
+                        buffers,
+                        self.inner.completed_submission_id.load(Ordering::Acquire),
+                    );
+                }
+                buffer
+            })
     }
 
     /// Get or create a buffer of the specified size.
@@ -523,10 +585,13 @@ impl Device {
     }
 }
 
-fn prune_cached_buffers(buffers: &mut Vec<CachedBuffer>) {
+fn prune_cached_buffers(buffers: &mut Vec<CachedBuffer>, completed_submission: u64) {
     let mut kept_free_buffers = 0;
     buffers.retain(|cached| {
         let is_free = Arc::strong_count(&cached.buffer) == 1;
+        if cached.in_flight(completed_submission) {
+            return true;
+        }
         if !is_free {
             return true;
         }
