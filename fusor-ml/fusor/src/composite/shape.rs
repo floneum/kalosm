@@ -731,6 +731,55 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn reshape_after_broadcast_preserves_logical_values() {
+        let mut devices = vec![Device::Cpu];
+        if let Ok(gpu) = Device::gpu().await {
+            devices.push(gpu);
+        }
+
+        for device in devices {
+            let input: Tensor<2, f32> = Tensor::from_slice(&device, [1, 4], &[1.0, 2.0, 3.0, 4.0]);
+            let output = input
+                .reshape([1, 1, 4])
+                .broadcast_as([1, 3, 4])
+                .to_concrete()
+                .reshape([12])
+                .to_concrete();
+            let slice = output.as_slice().await.unwrap();
+
+            assert_eq!(
+                slice.as_slice(),
+                &[1.0, 2.0, 3.0, 4.0, 1.0, 2.0, 3.0, 4.0, 1.0, 2.0, 3.0, 4.0]
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn broadcast_repeat_reshape_preserves_logical_values() {
+        let mut devices = vec![Device::Cpu];
+        if let Ok(gpu) = Device::gpu().await {
+            devices.push(gpu);
+        }
+
+        for device in devices {
+            let input_data: Vec<f32> = (0..8).map(|i| i as f32 + 1.0).collect();
+            let input: Tensor<4, f32> = Tensor::from_slice(&device, [1, 2, 2, 2], &input_data);
+            let output = input
+                .reshape([1, 1, 2, 2, 2])
+                .broadcast_as([1, 3, 2, 2, 2])
+                .to_concrete()
+                .reshape([3, 2, 2, 2])
+                .to_concrete()
+                .reshape([24])
+                .to_concrete();
+            let slice = output.as_slice().await.unwrap();
+
+            let expected: Vec<f32> = (0..3).flat_map(|_| input_data.iter().copied()).collect();
+            assert_eq!(slice.as_slice(), expected.as_slice());
+        }
+    }
+
+    #[tokio::test]
     async fn arange_step_supports_negative_steps() {
         let mut devices = vec![Device::Cpu];
         if let Ok(gpu) = Device::gpu().await {

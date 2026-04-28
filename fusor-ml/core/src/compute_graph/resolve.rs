@@ -175,7 +175,12 @@ impl Resolver {
                         removed,
                         &mut command_encoder,
                     );
-                    // After flushing, free intermediate cached results whose
+                    // Submit the current command encoder before releasing
+                    // cached TensorData. Encoded commands still reference those
+                    // buffers; dropping them first lets the allocation cache
+                    // hand the same storage to later kernels too early.
+                    device.wgpu_queue().submit(Some(command_encoder.finish()));
+                    // After submission, free intermediate cached results whose
                     // consumers within this execution are all satisfied.
                     Self::release_dead_intermediates(
                         graph,
@@ -183,9 +188,6 @@ impl Resolver {
                         &mut remaining_consumers,
                         &target_set,
                     );
-                    // Submit the current command encoder so the GPU can
-                    // reclaim buffers we just freed, then start a new one.
-                    device.wgpu_queue().submit(Some(command_encoder.finish()));
                     device.reset_initialized_buffers();
                     command_encoder = device.wgpu_device().create_command_encoder(
                         &wgpu::CommandEncoderDescriptor {
@@ -237,6 +239,7 @@ impl Resolver {
             };
         }
 
+        let mut final_pending_operations = None;
         if !pending_operations.is_empty() {
             let old_best = current_constraints.solve(max_subgroup_size).unwrap_or_else(|| {
                 panic!(
@@ -256,16 +259,19 @@ impl Resolver {
                 removed,
                 &mut command_encoder,
             );
+            final_pending_operations = Some(pending_operations.clone());
+        }
+
+        // Submit any remaining commands before releasing the buffers they use.
+        device.wgpu_queue().submit(Some(command_encoder.finish()));
+        if let Some(pending_operations) = final_pending_operations.as_ref() {
             Self::release_dead_intermediates(
                 graph,
-                &pending_operations,
+                pending_operations,
                 &mut remaining_consumers,
                 &target_set,
             );
         }
-
-        // Submit any remaining commands.
-        device.wgpu_queue().submit(Some(command_encoder.finish()));
         device.reset_initialized_buffers();
 
         let data = graph
@@ -290,20 +296,11 @@ impl Resolver {
         remaining_consumers: &mut FxHashMap<NodeIndex, usize>,
         targets: &FxHashSet<NodeIndex>,
     ) {
-        for (_, op) in produced_ops {
-            op.visit_dependencies(&mut |dep| {
-                if let Some(count) = remaining_consumers.get_mut(&dep) {
-                    *count = count.saturating_sub(1);
-                    if *count == 0 && !targets.contains(&dep) {
-                        // All consumers within this execution have been
-                        // processed — free the cached buffer.
-                        if let Some(node) = graph.nodes.nodes.node_weight_mut(dep) {
-                            node.cached = None;
-                        }
-                    }
-                }
-            });
-        }
+        // Keep cached TensorData alive for the full resolve. Dropping an
+        // intermediate after encoding a kernel but before all submitted GPU
+        // work is complete can make later allocations reuse storage that is
+        // still referenced by queued commands.
+        let _ = (graph, produced_ops, remaining_consumers, targets);
     }
 
     /// Like `release_dead_intermediates` but uses the compute graph's
@@ -316,23 +313,8 @@ impl Resolver {
         remaining_consumers: &mut FxHashMap<NodeIndex, usize>,
         targets: &FxHashSet<NodeIndex>,
     ) {
-        for &produced in produced_nodes {
-            let mut deps = Vec::new();
-            graph.visit_dependencies(produced, &mut |dep| {
-                deps.push(dep);
-            });
-            for dep in deps {
-                if let Some(count) = remaining_consumers.get_mut(&dep) {
-                    *count = count.saturating_sub(1);
-                    if *count == 0
-                        && !targets.contains(&dep)
-                        && let Some(node) = graph.nodes.nodes.node_weight_mut(dep)
-                    {
-                        node.cached = None;
-                    }
-                }
-            }
-        }
+        // See release_dead_intermediates.
+        let _ = (graph, produced_nodes, remaining_consumers, targets);
     }
 
     fn build_execution_graph(

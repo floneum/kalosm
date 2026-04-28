@@ -325,3 +325,89 @@ async fn flash_attention_with_batch_key_mask_matches_cpu_reference_on_varied_sha
         .await;
     }
 }
+
+#[tokio::test]
+async fn flash_attention_batched_matches_per_item() {
+    let Ok(device) = Device::gpu().await else {
+        return;
+    };
+
+    for case in [
+        FlashCase {
+            batch: 4,
+            num_heads: 2,
+            num_kv_heads: 2,
+            q_seq_len: 5,
+            kv_seq_len: 7,
+            head_dim: 8,
+        },
+        FlashCase {
+            batch: 8,
+            num_heads: 8,
+            num_kv_heads: 8,
+            q_seq_len: 6,
+            kv_seq_len: 256,
+            head_dim: 32,
+        },
+        FlashCase {
+            batch: 8,
+            num_heads: 8,
+            num_kv_heads: 8,
+            q_seq_len: 256,
+            kv_seq_len: 6,
+            head_dim: 32,
+        },
+    ] {
+        let q_data = attention_data(
+            case.batch * case.num_heads * case.q_seq_len * case.head_dim,
+            0.1,
+        );
+        let k_data = attention_data(
+            case.batch * case.num_kv_heads * case.kv_seq_len * case.head_dim,
+            -0.15,
+        );
+        let v_data = attention_data(
+            case.batch * case.num_kv_heads * case.kv_seq_len * case.head_dim,
+            0.35,
+        );
+        let scale = 1.0 / (case.head_dim as f32).sqrt();
+
+        let q = Tensor::from_slice(
+            &device,
+            [case.batch, case.num_heads, case.q_seq_len, case.head_dim],
+            &q_data,
+        );
+        let k = Tensor::from_slice(
+            &device,
+            [
+                case.batch,
+                case.num_kv_heads,
+                case.kv_seq_len,
+                case.head_dim,
+            ],
+            &k_data,
+        );
+        let v = Tensor::from_slice(
+            &device,
+            [
+                case.batch,
+                case.num_kv_heads,
+                case.kv_seq_len,
+                case.head_dim,
+            ],
+            &v_data,
+        );
+
+        let batched = q.flash_attention(&k, &v, scale, None).to_concrete();
+        let mut items = Vec::with_capacity(case.batch);
+        for batch in 0..case.batch {
+            let q_i = q.narrow(0, batch, 1).to_concrete();
+            let k_i = k.narrow(0, batch, 1).to_concrete();
+            let v_i = v.narrow(0, batch, 1).to_concrete();
+            items.push(q_i.flash_attention(&k_i, &v_i, scale, None).to_concrete());
+        }
+        let per_item = Tensor::cat(items, 0).to_concrete();
+
+        approx_eq(&batched, &per_item, 1e-4).await.unwrap();
+    }
+}

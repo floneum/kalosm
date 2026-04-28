@@ -721,3 +721,90 @@ async fn q_mat_mul_batched_matches_unbatched_property() {
         }
     }
 }
+
+#[tokio::test]
+async fn q_mat_mul_broadcasted_batch_matches_unbatched_property() {
+    use fusor_conformance::available_devices;
+
+    async fn assert_fixture(fixture: QuantizedFixture) {
+        use fusor_conformance::available_devices;
+
+        let batch = 8;
+        let input_rows = 6;
+        let shape = [1, input_rows, fixture.weight_shape[1]];
+        let data = deterministic_input(&shape, 1400 + fixture.weight_shape[1] as u32);
+
+        for device in available_devices().await {
+            let weights = qmatrix_from_raw_bytes(
+                &device,
+                fixture.weight_shape,
+                &fixture.raw_bytes,
+                fixture.ty,
+            );
+            let base: Tensor<3, f32> = Tensor::from_slice(&device, shape, &data);
+            let broadcasted = base.broadcast_as([batch, input_rows, fixture.weight_shape[1]]);
+            let batched_result = broadcasted.q_mat_mul(&weights).to_concrete();
+
+            let unbatched: Tensor<2, f32> =
+                Tensor::from_slice(&device, [input_rows, fixture.weight_shape[1]], &data);
+            let unbatched_result = unbatched.q_mat_mul(&weights).to_concrete();
+
+            for b in 0..batch {
+                let batched_slice = batched_result
+                    .clone()
+                    .slice([b..b + 1, 0..input_rows, 0..fixture.weight_shape[0]])
+                    .reshape([input_rows, fixture.weight_shape[0]])
+                    .to_concrete();
+                fusor_conformance::approx_eq(&batched_slice, &unbatched_result, 1e-4)
+                    .await
+                    .unwrap();
+            }
+        }
+    }
+
+    for fixture in [
+        q4_0_fixture(),
+        q5_0_fixture(),
+        q8_0_fixture(),
+        q4k_fixture(),
+        q5k_fixture(),
+        q6k_fixture(),
+    ] {
+        assert_fixture(fixture).await;
+    }
+
+    let batch = 8;
+    let input_rows = 6;
+    let weight_shape = [2usize, 4];
+    let shape = [1, input_rows, weight_shape[1]];
+    let data = deterministic_input(&shape, 1400);
+    let f32_raw_bytes = f32_weight_bytes();
+    let f16_raw_bytes = f16_weight_bytes();
+
+    for (ty, raw_bytes) in [
+        (GgmlType::F32, f32_raw_bytes),
+        (GgmlType::F16, f16_raw_bytes),
+    ] {
+        for device in available_devices().await {
+            let weights = qmatrix_from_raw_bytes(&device, weight_shape, &raw_bytes, ty);
+            let base: Tensor<3, f32> = Tensor::from_slice(&device, shape, &data);
+            let broadcasted = base.broadcast_as([batch, input_rows, weight_shape[1]]);
+            let batched_result = broadcasted.q_mat_mul(&weights).to_concrete();
+
+            let unbatched: Tensor<2, f32> =
+                Tensor::from_slice(&device, [input_rows, weight_shape[1]], &data);
+            let unbatched_result = unbatched.q_mat_mul(&weights).to_concrete();
+
+            for b in 0..batch {
+                let batched_slice = batched_result
+                    .clone()
+                    .slice([b..b + 1, 0..input_rows, 0..weight_shape[0]])
+                    .reshape([input_rows, weight_shape[0]])
+                    .to_concrete();
+                fusor_conformance::approx_eq(&batched_slice, &unbatched_result, 1e-4)
+                    .await
+                    .unwrap();
+            }
+        }
+    }
+}

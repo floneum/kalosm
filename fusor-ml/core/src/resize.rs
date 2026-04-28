@@ -52,6 +52,9 @@ impl ResizeOperation {
 
         let input = graph.get_cached_result(self.input)?;
         let input_layout = input.layout();
+        if !input_layout.is_contiguous() {
+            return None;
+        }
 
         // Find the chunks of strides that are contiguous in the input
         let mut contiguous_stride_chunks = Vec::new();

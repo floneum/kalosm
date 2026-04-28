@@ -1169,10 +1169,22 @@ mod tests {
     async fn test_batched_matmul_strided_a_at_scale() {
         use crate::Device;
         let gpu = Device::new().await.expect("GPU required");
+        let max_binding_size = gpu
+            .as_gpu()
+            .map(|device| device.limits().max_storage_buffer_binding_size as usize)
+            .unwrap_or(usize::MAX);
 
         let groups = 64usize;
         let k = 9usize;
         for m in [256usize, 1024, 4096, 16384, 65536] {
+            let a_bytes = m * groups * k * std::mem::size_of::<f32>();
+            if a_bytes > max_binding_size {
+                eprintln!(
+                    "skipping m={m}: A binding size {a_bytes} exceeds device max {max_binding_size}"
+                );
+                continue;
+            }
+
             let a_data: Vec<f32> = (0..m * groups * k)
                 .map(|i| (i as f32 * 0.0091).cos() * 0.5)
                 .collect();

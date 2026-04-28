@@ -366,6 +366,35 @@ async fn matmul_non_contiguous_input_matches_host_reference() {
 }
 
 #[tokio::test]
+async fn matmul_batched_strided_rhs_matches_host_reference() {
+    let Ok(device) = Device::gpu().await else {
+        return;
+    };
+
+    const BATCH: usize = 3;
+    const M: usize = 4;
+    const K: usize = 32;
+    const N: usize = 1024;
+
+    let lhs_data: Vec<f32> = (0..BATCH * M * K)
+        .map(|i| (i as f32 * 0.013).sin() * 0.5)
+        .collect();
+    let rhs_base_data: Vec<f32> = (0..BATCH * N * K)
+        .map(|i| (i as f32 * 0.017).cos() * 0.25)
+        .collect();
+
+    let lhs_cpu = Tensor::from_slice(&Device::Cpu, [BATCH, M, K], &lhs_data);
+    let rhs_cpu_base = Tensor::from_slice(&Device::Cpu, [BATCH, N, K], &rhs_base_data);
+    let expected = lhs_cpu.matmul(&rhs_cpu_base.transpose(1, 2)).to_concrete();
+
+    let lhs = Tensor::from_slice(&device, [BATCH, M, K], &lhs_data);
+    let rhs_base = Tensor::from_slice(&device, [BATCH, N, K], &rhs_base_data);
+    let actual = lhs.matmul(&rhs_base.transpose(1, 2)).to_concrete();
+
+    approx_eq(&actual, &expected, 1e-3).await.unwrap();
+}
+
+#[tokio::test]
 async fn matmul_large_fuzzed() {
     const M: usize = 256;
     const K: usize = 256;

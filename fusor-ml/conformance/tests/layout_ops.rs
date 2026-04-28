@@ -286,6 +286,53 @@ async fn sliding_window_then_transpose_then_reshape_matches_expected() {
 }
 
 #[tokio::test]
+async fn transpose_then_reshape_preserves_logical_order() {
+    let input_data: Vec<f32> = (0..24).map(|i| i as f32).collect();
+    let mut expected = Vec::new();
+    for b in 0..2 {
+        for col in 0..4 {
+            for row in 0..3 {
+                expected.push(input_data[(b * 3 + row) * 4 + col]);
+            }
+        }
+    }
+
+    for device in available_devices().await {
+        let input: Tensor<3, f32> = Tensor::from_slice(&device, [2, 3, 4], &input_data);
+        let output = input
+            .transpose(1, 2)
+            .reshape([2, 12])
+            .to_concrete()
+            .reshape([24])
+            .to_concrete();
+        let expected = Tensor::from_slice(&device, [24], &expected);
+        assert_approx_tensors(output, expected, 0.0).await;
+    }
+}
+
+#[tokio::test]
+async fn broadcast_then_reshape_preserves_repeated_logical_values() {
+    let input_data: Vec<f32> = (0..24).map(|i| i as f32 * 0.25 - 3.0).collect();
+    let repeats = 5;
+    let mut expected = Vec::with_capacity(repeats * input_data.len());
+    for _ in 0..repeats {
+        expected.extend(input_data.iter().copied());
+    }
+
+    for device in available_devices().await {
+        let input: Tensor<4, f32> = Tensor::from_slice(&device, [1, 2, 3, 4], &input_data);
+        let repeated = input
+            .reshape([1, 1, 2, 3, 4])
+            .broadcast_as([1, repeats, 2, 3, 4])
+            .to_concrete()
+            .reshape([repeats, 2, 3, 4])
+            .to_concrete();
+        let expected = Tensor::from_slice(&device, [repeats, 2, 3, 4], &expected);
+        assert_approx_tensors(repeated, expected, 0.0).await;
+    }
+}
+
+#[tokio::test]
 async fn sliding_window_with_cat_padding_matches_expected() {
     use fusor_types::SlidingWindow;
     // Conv1d-style padding regression: pad an input with `cat`, then sliding-window.

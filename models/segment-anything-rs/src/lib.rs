@@ -23,7 +23,7 @@
 
 mod raw;
 
-use fusor::{ConcreteTensor, Device, Tensor, VarBuilder};
+use fusor::{ConcreteTensor, Device, Tensor, ToVec1, VarBuilder};
 use image::{DynamicImage, GenericImage, GenericImageView, ImageBuffer, Rgba};
 use raw::sam::{
     build_point_grid, Sam, CROP_NMS_THRESH, IMAGE_SIZE, MODEL_MASK_THRESHOLD, PRED_IOU_THRESH,
@@ -325,7 +325,7 @@ impl SegmentAnything {
         let mask_hwc = mask_t1.transpose(1, 2); // (H, W, 3);
         let mask_flat = mask_hwc.reshape([h * w * 3]);
         let mask_slice = mask_flat.as_slice().await?;
-        let mask_pixels: Vec<u8> = mask_slice.as_slice().iter().map(|&v| v as u8).collect();
+        let mask_pixels: Vec<u8> = mask_slice.to_vec1().iter().map(|&v| v as u8).collect();
 
         let mask_img: image::ImageBuffer<image::Rgb<u8>, Vec<u8>> =
             image::ImageBuffer::from_raw(w as u32, h as u32, mask_pixels)
@@ -431,16 +431,16 @@ impl SegmentAnything {
 
             let masks_flat = low_res_masks.reshape([total_mask_elems]);
             let masks_slice = masks_flat.as_slice().await?;
-            let masks_vec = masks_slice.as_slice();
+            let masks_vec = masks_slice.to_vec1();
 
             let total_iou_elems = batch * n_masks_per_point;
             let iou_flat = iou_preds.reshape([total_iou_elems]);
             let iou_slice = iou_flat.as_slice().await?;
-            let iou_vec = iou_slice.as_slice();
+            let iou_vec = iou_slice.to_vec1();
 
             collect_mask_candidates(
-                masks_vec,
-                iou_vec,
+                &masks_vec,
+                &iou_vec,
                 batch,
                 n_masks_per_point,
                 mask_w,
@@ -678,7 +678,7 @@ mod tests {
         let materialized = t * ones;
         let flat = materialized.reshape([n]);
         let s = flat.as_slice().await.unwrap();
-        s.as_slice().to_vec()
+        s.to_vec1()
     }
 
     fn load_tiny_sam(device: &Device, gguf_path: &Path) -> raw::sam::Sam {
@@ -1084,13 +1084,13 @@ mod tests {
         let masks_flat: Tensor<1, f32, ConcreteTensor<f32, 1>> =
             batched_masks.reshape([total_mask]).to_concrete();
         let masks_slice = masks_flat.as_slice().await.unwrap();
-        let batched_masks_data = masks_slice.as_slice();
+        let batched_masks_data = masks_slice.to_vec1();
 
         let total_iou = batch * n_masks;
         let iou_flat: Tensor<1, f32, ConcreteTensor<f32, 1>> =
             batched_iou.reshape([total_iou]).to_concrete();
         let iou_slice = iou_flat.as_slice().await.unwrap();
-        let batched_iou_data = iou_slice.as_slice();
+        let batched_iou_data = iou_slice.to_vec1();
 
         // --- Unbatched: one point at a time, read via reshape+as_slice ---
         let mut unbatched_masks_data = Vec::new();
@@ -1107,17 +1107,17 @@ mod tests {
             let m_total = ms[0] * ms[1] * ms[2] * ms[3];
             let mf: Tensor<1, f32, ConcreteTensor<f32, 1>> = masks.reshape([m_total]).to_concrete();
             let ms_data = mf.as_slice().await.unwrap();
-            unbatched_masks_data.extend_from_slice(ms_data.as_slice());
+            unbatched_masks_data.extend(ms_data.to_vec1());
 
             let is = iou.shape();
             let i_total = is[0] * is[1];
             let if_: Tensor<1, f32, ConcreteTensor<f32, 1>> = iou.reshape([i_total]).to_concrete();
             let is_data = if_.as_slice().await.unwrap();
-            unbatched_iou_data.extend_from_slice(is_data.as_slice());
+            unbatched_iou_data.extend(is_data.to_vec1());
         }
 
-        let mask_diff = max_diff(batched_masks_data, &unbatched_masks_data);
-        let iou_diff = max_diff(batched_iou_data, &unbatched_iou_data);
+        let mask_diff = max_diff(&batched_masks_data, &unbatched_masks_data);
+        let iou_diff = max_diff(&batched_iou_data, &unbatched_iou_data);
 
         assert!(
             mask_diff < 0.01,

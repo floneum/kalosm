@@ -103,6 +103,7 @@ fn adapter_preference_rank(adapter: &wgpu::Adapter) -> u8 {
     }
 }
 
+#[allow(dead_code)]
 impl CachedBuffer {
     fn new(buffer: Arc<wgpu::Buffer>, writen: bool) -> Self {
         Self { writen, buffer }
@@ -421,6 +422,7 @@ impl Device {
     }
 
     /// Try to get a buffer from the allocation cache. Returns None if no buffer of the requested size is available.
+    #[allow(dead_code)]
     pub(crate) fn get_cached_buffer(
         &self,
         size: u64,
@@ -451,32 +453,16 @@ impl Device {
         usage: wgpu::BufferUsages,
         to_initilize: bool,
     ) -> Arc<wgpu::Buffer> {
-        // Try to get a buffer from the cache first
-        self.get_cached_buffer(size, usage, to_initilize)
-            .unwrap_or_else(|| {
-                let new_buffer = self.wgpu_device().create_buffer(&wgpu::BufferDescriptor {
-                    label: Some("Tensor Buffer"),
-                    size,
-                    usage,
-                    mapped_at_creation: false,
-                });
-
-                let buffer = Arc::new(new_buffer);
-                self.inner
-                    .buffer_allocation_cache
-                    .write()
-                    .get_or_insert_mut((size, usage), Vec::new)
-                    .push(CachedBuffer::new(buffer.clone(), to_initilize));
-                if let Some(buffers) = self
-                    .inner
-                    .buffer_allocation_cache
-                    .write()
-                    .get_mut(&(size, usage))
-                {
-                    prune_cached_buffers(buffers);
-                }
-                buffer
-            })
+        let _ = to_initilize;
+        // Do not recycle GPU buffers here. Reusing a buffer after the last
+        // Rust Arc is dropped is not enough to prove all previously submitted
+        // GPU work that references it has completed.
+        Arc::new(self.wgpu_device().create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Tensor Buffer"),
+            size,
+            usage,
+            mapped_at_creation: false,
+        }))
     }
 
     /// Get or create a buffer of the specified size.
