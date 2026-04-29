@@ -46,8 +46,7 @@ impl KernelIr {
 
     /// Lower this IR into a validated Naga module.
     pub fn lower_to_naga(&self) -> Result<NagaKernel, LowerError> {
-        let expanded = self.expand_gemm_to_mma();
-        crate::lower::lower_to_naga(&expanded)
+        crate::lower::lower_to_naga(self)
     }
 
     fn expand_block_gemm_to_mma(&mut self, block: &Block) -> Block {
@@ -240,6 +239,8 @@ pub enum Op {
     Barrier(BarrierOp),
     /// High-level tiled GEMM over parent tiles/fragments.
     Gemm(GemmOp),
+    /// Row-parallel matrix-vector multiply over storage tensors.
+    Gemv(GemvOp),
     /// Matrix multiply-accumulate over tile operands.
     Mma(MmaOp),
     /// Store a tile to a storage buffer view.
@@ -320,7 +321,7 @@ impl TileRef {
 }
 
 /// A subgroup-cooperative load into a workgroup tile.
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CooperativeLoadOp {
     pub dst: TileRef,
     pub src: StorageView,
@@ -328,17 +329,98 @@ pub struct CooperativeLoadOp {
 }
 
 /// A store from a tile to storage.
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct StoreTileOp {
     pub src: TileRef,
     pub dst: StorageView,
 }
 
 /// A shaped view into a storage buffer.
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct StorageView {
     pub buffer: BufferRef,
     pub offset: u32,
+    pub layout: Layout,
+    pub dynamic_offsets: Vec<Option<DynamicOffset>>,
+}
+
+impl StorageView {
+    /// Construct a storage view with no dynamic workgroup offset.
+    pub fn root(buffer: BufferRef, layout: Layout) -> Self {
+        let dynamic_offsets = vec![None; layout.shape().rank()];
+        Self {
+            buffer,
+            offset: 0,
+            layout,
+            dynamic_offsets,
+        }
+    }
+}
+
+/// Dynamic coordinate offset used by storage views.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum DynamicOffset {
+    /// Offset derived from `@builtin(workgroup_id)`.
+    Workgroup(WorkgroupOffset),
+    /// Offset derived from the innermost IR loop induction variable.
+    Loop(LoopOffset),
+}
+
+impl From<WorkgroupOffset> for DynamicOffset {
+    fn from(offset: WorkgroupOffset) -> Self {
+        Self::Workgroup(offset)
+    }
+}
+
+impl From<LoopOffset> for DynamicOffset {
+    fn from(offset: LoopOffset) -> Self {
+        Self::Loop(offset)
+    }
+}
+
+/// Dynamic coordinate offset derived from `@builtin(workgroup_id)`.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct WorkgroupOffset {
+    pub axis: WorkgroupAxis,
+    pub scale: u32,
+}
+
+impl WorkgroupOffset {
+    /// Offset an axis by `workgroup_id.axis * scale`.
+    pub const fn new(axis: WorkgroupAxis, scale: u32) -> Self {
+        Self { axis, scale }
+    }
+}
+
+/// Dynamic coordinate offset derived from the current loop induction.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct LoopOffset {
+    pub scale: u32,
+}
+
+impl LoopOffset {
+    /// Offset an axis by `loop_index * scale`.
+    pub const fn new(scale: u32) -> Self {
+        Self { scale }
+    }
+}
+
+/// Axis of `@builtin(workgroup_id)`.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum WorkgroupAxis {
+    X,
+    Y,
+    Z,
+}
+
+impl WorkgroupAxis {
+    pub(crate) const fn index(self) -> u32 {
+        match self {
+            Self::X => 0,
+            Self::Y => 1,
+            Self::Z => 2,
+        }
+    }
 }
 
 /// Fill a tile with a scalar value.
@@ -378,6 +460,21 @@ pub struct GemmOp {
     pub acc: TileRef,
     pub tiling: GemmTiling,
     pub backend: MmaBackend,
+}
+
+/// A row-parallel GEMV operation.
+///
+/// The lowering assigns one workgroup to one output row. Invocations within the
+/// workgroup cooperatively reduce the K dimension into `partials`, then lane 0
+/// writes the row result.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GemvOp {
+    pub a: StorageView,
+    pub x: StorageView,
+    pub y: StorageView,
+    pub partials: TileRef,
+    pub rows_per_workgroup: u32,
+    pub vector_width: u32,
 }
 
 /// Concrete tiling plan used when lowering a high-level GEMM into tile MMA.
@@ -443,7 +540,7 @@ pub struct LoopOp {
 /// The loop form represented by this prototype.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum LoopKind {
-    RangeStep { induction: Dim },
+    RangeStep { induction: Dim, iterations: u32 },
 }
 
 /// A symbolic dimension used only to make the loop API look like an IR builder.
@@ -518,6 +615,23 @@ impl Layout {
     /// Total number of logical elements addressed by this layout.
     pub fn element_count(&self) -> NonZeroU32 {
         self.shape.element_count()
+    }
+
+    /// Number of elements required to back this layout, including padding
+    /// implied by non-contiguous strides.
+    pub fn allocation_element_count(&self) -> NonZeroU32 {
+        let last_index = self
+            .shape
+            .dims()
+            .iter()
+            .zip(self.strides.values())
+            .try_fold(0u32, |acc, (dim, stride)| {
+                let extent = dim.get().checked_sub(1)?;
+                acc.checked_add(extent.checked_mul(*stride)?)
+            })
+            .and_then(|index| index.checked_add(1))
+            .expect("layout allocation span overflow");
+        NonZeroU32::new(last_index).expect("layout rank is non-zero")
     }
 
     /// True when the strides match row-major contiguous order.

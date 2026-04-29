@@ -11,6 +11,6 @@ doctest = true
 
 [dependencies]
 bytemuck = "1.25.0"
-naga = { version = "29.0.1", features = ["wgsl-out"] }
+naga = { version = "29.0.1", features = ["msl-out", "wgsl-out"] }
 pollster = "0.4.0"
-wgpu = "27.0.1"
+wgpu = { version = "29.0.1", features = ["naga-ir"] }

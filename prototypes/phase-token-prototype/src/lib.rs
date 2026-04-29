@@ -153,10 +153,10 @@ pub use api::{
 };
 pub use ir::{
     BarrierOp, BarrierScope, Block, BufferAccess, BufferDecl, BufferId, BufferRef,
-    CooperativeLoadOp, Dim, ElementType, FillTileOp, FillValue, GemmOp, GemmTiling, KernelIr,
-    Layout, LoopKind, LoopOp, MemoryLevel, MmaBackend, MmaOp, Op, PartitionBinding, PartitionOp,
-    Shape, StorageView, StoreTileOp, Strides, TileDecl, TileId, TileLevel, TileOrigin, TileRef,
-    ViewMapping,
+    CooperativeLoadOp, Dim, DynamicOffset, ElementType, FillTileOp, FillValue, GemmOp, GemmTiling,
+    GemvOp, KernelIr, Layout, LoopKind, LoopOffset, LoopOp, MemoryLevel, MmaBackend, MmaOp, Op,
+    PartitionBinding, PartitionOp, Shape, StorageView, StoreTileOp, Strides, TileDecl, TileId,
+    TileLevel, TileOrigin, TileRef, ViewMapping, WorkgroupAxis, WorkgroupOffset,
 };
 pub use lower::{LowerError, NagaKernel};
 

@@ -1,5 +1,9 @@
 use super::*;
 
+fn storage_view(buffer: BufferRef, layout: Layout) -> StorageView {
+    StorageView::root(buffer, layout)
+}
+
 #[test]
 fn loop_body_must_end_with_sync_witness() {
     let shape = Shape::new([32]);
@@ -54,14 +58,14 @@ fn loop_body_must_end_with_sync_witness() {
     assert_eq!(
         ir.body(),
         &Block::from_ops(vec![Op::Loop(LoopOp {
-            kind: LoopKind::RangeStep { induction: Dim(0) },
+            kind: LoopKind::RangeStep {
+                induction: Dim(0),
+                iterations: 1,
+            },
             body: Block::from_ops(vec![
                 Op::CooperativeLoad(CooperativeLoadOp {
                     dst: tile,
-                    src: StorageView {
-                        buffer: src,
-                        offset: 0,
-                    },
+                    src: storage_view(src, Layout::contiguous(MemoryLevel::Storage, shape.clone())),
                     level: TileLevel::Workgroup,
                 }),
                 Op::Barrier(BarrierOp {
@@ -69,10 +73,7 @@ fn loop_body_must_end_with_sync_witness() {
                 }),
                 Op::StoreTile(StoreTileOp {
                     src: tile,
-                    dst: StorageView {
-                        buffer: dst,
-                        offset: 0,
-                    },
+                    dst: storage_view(dst, Layout::contiguous(MemoryLevel::Storage, shape.clone())),
                 }),
                 Op::Barrier(BarrierOp {
                     scope: BarrierScope::Workgroup,
@@ -138,24 +139,24 @@ fn outer_ready_tile_can_be_read_inside_loop_body() {
         &Block::from_ops(vec![
             Op::CooperativeLoad(CooperativeLoadOp {
                 dst: tile,
-                src: StorageView {
-                    buffer: src,
-                    offset: 0,
-                },
+                src: storage_view(src, Layout::contiguous(MemoryLevel::Storage, shape.clone())),
                 level: TileLevel::Workgroup,
             }),
             Op::Barrier(BarrierOp {
                 scope: BarrierScope::Workgroup,
             }),
             Op::Loop(LoopOp {
-                kind: LoopKind::RangeStep { induction: Dim(0) },
+                kind: LoopKind::RangeStep {
+                    induction: Dim(0),
+                    iterations: 1,
+                },
                 body: Block::from_ops(vec![
                     Op::StoreTile(StoreTileOp {
                         src: tile,
-                        dst: StorageView {
-                            buffer: dst,
-                            offset: 0,
-                        },
+                        dst: storage_view(
+                            dst,
+                            Layout::contiguous(MemoryLevel::Storage, shape.clone()),
+                        ),
                     }),
                     Op::Barrier(BarrierOp {
                         scope: BarrierScope::Workgroup,
@@ -261,22 +262,25 @@ fn matmul_tile_body_is_represented_in_the_ir() {
                 value: FillValue::Zero,
             }),
             Op::Loop(LoopOp {
-                kind: LoopKind::RangeStep { induction: Dim(0) },
+                kind: LoopKind::RangeStep {
+                    induction: Dim(0),
+                    iterations: 1,
+                },
                 body: Block::from_ops(vec![
                     Op::CooperativeLoad(CooperativeLoadOp {
                         dst: a,
-                        src: StorageView {
-                            buffer: a_buf,
-                            offset: 0,
-                        },
+                        src: storage_view(
+                            a_buf,
+                            Layout::contiguous(MemoryLevel::Storage, Shape::new([bm, bk])),
+                        ),
                         level: TileLevel::Workgroup,
                     }),
                     Op::CooperativeLoad(CooperativeLoadOp {
                         dst: b,
-                        src: StorageView {
-                            buffer: b_buf,
-                            offset: 0,
-                        },
+                        src: storage_view(
+                            b_buf,
+                            Layout::contiguous(MemoryLevel::Storage, Shape::new([bk, bn])),
+                        ),
                         level: TileLevel::Workgroup,
                     }),
                     Op::Barrier(BarrierOp {
@@ -296,10 +300,10 @@ fn matmul_tile_body_is_represented_in_the_ir() {
             }),
             Op::StoreTile(StoreTileOp {
                 src: acc,
-                dst: StorageView {
-                    buffer: c_buf,
-                    offset: 0,
-                },
+                dst: storage_view(
+                    c_buf,
+                    Layout::contiguous(MemoryLevel::Storage, Shape::new([bm, bn])),
+                ),
             }),
         ]),
     );
@@ -418,8 +422,8 @@ fn lowers_to_valid_naga_module() {
     let lowered = ir.lower_to_naga().unwrap();
     assert_eq!(lowered.module().entry_points.len(), 1);
     assert_eq!(lowered.module().global_variables.iter().count(), 3);
-    assert_eq!(lowered.module().entry_points[0].workgroup_size, [256, 1, 1]);
-    assert_eq!(lowered.module().entry_points[0].function.arguments.len(), 1);
+    assert_eq!(lowered.module().entry_points[0].workgroup_size, [16, 16, 1]);
+    assert_eq!(lowered.module().entry_points[0].function.arguments.len(), 2);
 }
 
 #[test]
@@ -513,8 +517,8 @@ fn lowers_gemm_to_naga_module() {
 
     let lowered = ir.lower_to_naga().unwrap();
     let entry = &lowered.module().entry_points[0];
-    assert_eq!(lowered.module().global_variables.iter().count(), 5);
-    assert_eq!(entry.function.local_variables.iter().count(), 7);
+    assert_eq!(lowered.module().global_variables.iter().count(), 3);
+    assert_eq!(entry.function.local_variables.iter().count(), 15);
 }
 
 #[test]
@@ -533,8 +537,17 @@ fn layout_is_structured_shape_strides_and_memory_level() {
     assert!(row_major.is_row_major());
     assert!(!row_major.is_col_major());
     assert_eq!(row_major.element_count().get(), 32);
+    assert_eq!(row_major.allocation_element_count().get(), 32);
 
     assert_eq!(col_major.strides().values(), &[1, 4]);
     assert!(col_major.is_col_major());
     assert!(!col_major.is_row_major());
+
+    let padded = Layout::strided(
+        MemoryLevel::Workgroup,
+        Shape::new([4, 8]),
+        Strides::new([12, 1]),
+    );
+    assert_eq!(padded.element_count().get(), 32);
+    assert_eq!(padded.allocation_element_count().get(), 44);
 }

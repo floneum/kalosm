@@ -3,9 +3,10 @@ use std::marker::PhantomData;
 
 use crate::{
     BarrierOp, BarrierScope, Block, BufferAccess, BufferDecl, BufferRef, CooperativeLoadOp, Dim,
-    ElementType, FillTileOp, FillValue, GemmOp, GemmTiling, KernelIr, Layout, LoopKind, LoopOp,
-    MemoryLevel, MmaBackend, MmaOp, Op, PartitionBinding, PartitionOp, Shape, StorageView,
-    StoreTileOp, TileDecl, TileLevel, TileOrigin, TileRef, ViewMapping,
+    DynamicOffset, ElementType, FillTileOp, FillValue, GemmOp, GemmTiling, GemvOp, KernelIr,
+    Layout, LoopKind, LoopOp, MemoryLevel, MmaBackend, MmaOp, Op, PartitionBinding, PartitionOp,
+    Shape, StorageView, StoreTileOp, TileDecl, TileLevel, TileOrigin, TileRef, ViewMapping,
+    WorkgroupOffset,
 };
 
 /// A sample numeric marker.
@@ -174,12 +175,45 @@ pub struct Pending2<A, B> {
 impl<'cx, 'k, 'flow> Phase<'cx, 'k, 'flow, Clean> {
     /// Declare a storage buffer tensor bound to this kernel.
     pub fn storage_tensor<T: Numeric>(&mut self, shape: Shape) -> StorageTensor<'k, T> {
-        let buffer = self.cx.alloc_buffer::<T>(
-            Layout::contiguous(MemoryLevel::Storage, shape),
-            BufferAccess::ReadWrite,
+        self.storage_tensor_with_access::<T>(shape, BufferAccess::ReadWrite)
+    }
+
+    /// Declare a read-only storage buffer tensor bound to this kernel.
+    pub fn storage_tensor_read<T: Numeric>(&mut self, shape: Shape) -> StorageTensor<'k, T> {
+        self.storage_tensor_with_access::<T>(shape, BufferAccess::Read)
+    }
+
+    /// Declare a read-only storage buffer tensor with an explicit layout.
+    pub fn storage_tensor_read_with_layout<T: Numeric>(
+        &mut self,
+        layout: Layout,
+    ) -> StorageTensor<'k, T> {
+        assert_eq!(
+            layout.memory_level(),
+            MemoryLevel::Storage,
+            "storage tensors must use MemoryLevel::Storage"
         );
+        let buffer = self
+            .cx
+            .alloc_buffer::<T>(layout.clone(), BufferAccess::Read);
         StorageTensor {
             buffer,
+            view: StorageView::root(buffer, layout),
+            _ty: PhantomData,
+            _kernel: PhantomData,
+        }
+    }
+
+    fn storage_tensor_with_access<T: Numeric>(
+        &mut self,
+        shape: Shape,
+        access: BufferAccess,
+    ) -> StorageTensor<'k, T> {
+        let layout = Layout::contiguous(MemoryLevel::Storage, shape);
+        let buffer = self.cx.alloc_buffer::<T>(layout.clone(), access);
+        StorageTensor {
+            buffer,
+            view: StorageView::root(buffer, layout),
             _ty: PhantomData,
             _kernel: PhantomData,
         }
@@ -368,6 +402,87 @@ impl<'cx, 'k, 'flow> Phase<'cx, 'k, 'flow, Clean> {
         }));
     }
 
+    /// Emit a row-parallel GEMV.
+    ///
+    /// This is not modeled as a skinny GEMM: one workgroup owns one output row,
+    /// and the workgroup lanes cooperatively reduce the K dimension through the
+    /// supplied scratch tile.
+    pub fn gemv<T: Numeric>(
+        &mut self,
+        a: &StorageTensor<'k, T>,
+        x: &StorageTensor<'k, T>,
+        y: &StorageTensor<'k, T>,
+        partials: UninitTile<'k, T>,
+    ) {
+        self.gemv_with_vector_width(a, x, y, partials, 4);
+    }
+
+    /// Emit a row-parallel GEMV with explicit per-lane K unrolling.
+    pub fn gemv_with_vector_width<T: Numeric>(
+        &mut self,
+        a: &StorageTensor<'k, T>,
+        x: &StorageTensor<'k, T>,
+        y: &StorageTensor<'k, T>,
+        partials: UninitTile<'k, T>,
+        vector_width: u32,
+    ) {
+        self.gemv_tiled(a, x, y, partials, 1, vector_width);
+    }
+
+    /// Emit a row-parallel GEMV with explicit rows per workgroup and K unroll.
+    pub fn gemv_tiled<T: Numeric>(
+        &mut self,
+        a: &StorageTensor<'k, T>,
+        x: &StorageTensor<'k, T>,
+        y: &StorageTensor<'k, T>,
+        partials: UninitTile<'k, T>,
+        rows_per_workgroup: u32,
+        vector_width: u32,
+    ) {
+        assert!(
+            rows_per_workgroup > 0,
+            "gemv rows per workgroup must be non-zero"
+        );
+        assert!(
+            rows_per_workgroup <= 4,
+            "this prototype currently lowers at most four GEMV rows per workgroup"
+        );
+        assert!(vector_width > 0, "gemv vector width must be non-zero");
+        let [m, k] = matrix_shape(&a.view.layout);
+        let [x_k, x_cols] = matrix_shape(&x.view.layout);
+        let [y_m, y_cols] = matrix_shape(&y.view.layout);
+        assert_eq!(k, x_k, "gemv K dimensions must match");
+        assert_eq!(x_cols, 1, "gemv vector must be shaped [K, 1]");
+        assert_eq!(m, y_m, "gemv output row count must match A");
+        assert_eq!(y_cols, 1, "gemv output must be shaped [M, 1]");
+        assert_eq!(
+            m % rows_per_workgroup,
+            0,
+            "gemv row count must divide rows per workgroup"
+        );
+
+        let partial_layout = self.cx.tile_layout(partials.tile);
+        assert_eq!(
+            partial_layout.memory_level(),
+            MemoryLevel::Workgroup,
+            "gemv partials must live in workgroup memory"
+        );
+        assert_eq!(
+            partial_layout.shape().rank(),
+            1,
+            "gemv partials must be rank-1"
+        );
+
+        self.cx.push_op(Op::Gemv(GemvOp {
+            a: a.view(),
+            x: x.view(),
+            y: y.view(),
+            partials: partials.tile,
+            rows_per_workgroup,
+            vector_width,
+        }));
+    }
+
     /// Emit a tile-level matrix multiply-accumulate.
     pub fn mma<'ready, TA, TB, TC>(
         &mut self,
@@ -449,7 +564,46 @@ impl<'cx, 'k, 'flow> Phase<'cx, 'k, 'flow, Clean> {
 
         let body = cx.end_block();
         cx.push_op(Op::Loop(LoopOp {
-            kind: LoopKind::RangeStep { induction: Dim(0) },
+            kind: LoopKind::RangeStep {
+                induction: Dim(0),
+                iterations: 1,
+            },
+            body,
+        }));
+
+        let after_phase = Phase {
+            cx,
+            state: Clean,
+            _phase: PhantomData,
+        };
+        after(after_phase)
+    }
+
+    /// Build a counted stepped loop with a statically known trip count.
+    pub fn range_step_count<R>(
+        self,
+        iterations: u32,
+        body: impl for<'iter, 'body> FnOnce(Phase<'body, 'k, 'iter, Clean>, Dim) -> Synced<'iter>,
+        after: impl for<'after, 'after_body> FnOnce(Phase<'after_body, 'k, 'after, Clean>) -> R,
+    ) -> R {
+        assert!(iterations > 0, "loop iteration count must be non-zero");
+        let cx = self.cx;
+        cx.begin_block();
+
+        let iter_phase = Phase {
+            cx,
+            state: Clean,
+            _phase: PhantomData,
+        };
+        let synced = body(iter_phase, Dim(0));
+        drop(synced);
+
+        let body = cx.end_block();
+        cx.push_op(Op::Loop(LoopOp {
+            kind: LoopKind::RangeStep {
+                induction: Dim(0),
+                iterations,
+            },
             body,
         }));
 
@@ -563,16 +717,55 @@ pub struct RegTile<'k, T> {
 /// A storage buffer tensor bound by the kernel.
 pub struct StorageTensor<'k, T> {
     pub(crate) buffer: BufferRef,
+    pub(crate) view: StorageView,
     _ty: PhantomData<T>,
     _kernel: PhantomData<&'k mut ()>,
 }
 
-impl<T> StorageTensor<'_, T> {
-    fn view(&self) -> StorageView {
-        StorageView {
+impl<'k, T> StorageTensor<'k, T> {
+    /// Create a rank-2 tile view whose logical origin is offset by workgroup id.
+    pub fn workgroup_tile_2d(
+        &self,
+        shape: Shape,
+        row_offset: Option<WorkgroupOffset>,
+        col_offset: Option<WorkgroupOffset>,
+    ) -> Self {
+        self.dynamic_tile_2d(
+            shape,
+            row_offset.map(DynamicOffset::Workgroup),
+            col_offset.map(DynamicOffset::Workgroup),
+        )
+    }
+
+    /// Create a rank-2 tile view whose logical origin has dynamic offsets.
+    pub fn dynamic_tile_2d(
+        &self,
+        shape: Shape,
+        row_offset: Option<DynamicOffset>,
+        col_offset: Option<DynamicOffset>,
+    ) -> Self {
+        assert_eq!(self.view.layout.shape().rank(), 2, "parent view must be 2D");
+        assert_eq!(shape.rank(), 2, "tile view must be 2D");
+        let layout = Layout::strided(
+            MemoryLevel::Storage,
+            shape,
+            self.view.layout.strides().clone(),
+        );
+        Self {
             buffer: self.buffer,
-            offset: 0,
+            view: StorageView {
+                buffer: self.buffer,
+                offset: self.view.offset,
+                layout,
+                dynamic_offsets: vec![row_offset, col_offset],
+            },
+            _ty: PhantomData,
+            _kernel: PhantomData,
         }
+    }
+
+    fn view(&self) -> StorageView {
+        self.view.clone()
     }
 }
 

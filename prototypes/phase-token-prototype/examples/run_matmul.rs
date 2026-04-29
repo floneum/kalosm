@@ -14,13 +14,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let ir = matmul_ir();
     let lowered = ir.lower_to_naga()?;
-    let wgsl = naga::back::wgsl::write_string(
-        lowered.module(),
-        lowered.info(),
-        naga::back::wgsl::WriterFlags::empty(),
-    )?;
 
-    let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor::default());
+    let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
     let adapter = instance
         .request_adapter(&wgpu::RequestAdapterOptions {
             power_preference: wgpu::PowerPreference::HighPerformance,
@@ -28,11 +23,22 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             compatible_surface: None,
         })
         .await?;
+    if !adapter
+        .features()
+        .contains(wgpu::Features::EXPERIMENTAL_COOPERATIVE_MATRIX)
+    {
+        return Err(format!(
+            "adapter {} does not expose EXPERIMENTAL_COOPERATIVE_MATRIX",
+            adapter.get_info().name
+        )
+        .into());
+    }
     let (device, queue) = adapter
         .request_device(&wgpu::DeviceDescriptor {
             label: Some("phase-token-prototype device"),
-            required_features: wgpu::Features::empty(),
+            required_features: wgpu::Features::EXPERIMENTAL_COOPERATIVE_MATRIX,
             required_limits: wgpu::Limits::default(),
+            experimental_features: unsafe { wgpu::ExperimentalFeatures::enabled() },
             ..Default::default()
         })
         .await?;
@@ -56,25 +62,33 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         mapped_at_creation: false,
     });
 
-    let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-        label: Some("lowered matmul"),
-        source: wgpu::ShaderSource::Wgsl(Cow::Owned(wgsl)),
-    });
+    let shader = unsafe {
+        device.create_shader_module_trusted(
+            wgpu::ShaderModuleDescriptor {
+                label: Some("lowered matmul"),
+                source: wgpu::ShaderSource::Naga(Cow::Owned(lowered.module().clone())),
+            },
+            wgpu::ShaderRuntimeChecks::unchecked(),
+        )
+    };
     let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
         label: Some("matmul buffers"),
         entries: &storage_bindings(3),
     });
     let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
         label: Some("matmul pipeline layout"),
-        bind_group_layouts: &[&bind_group_layout],
-        push_constant_ranges: &[],
+        bind_group_layouts: &[Some(&bind_group_layout)],
+        immediate_size: 0,
     });
     let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
         label: Some("matmul pipeline"),
         layout: Some(&pipeline_layout),
         module: &shader,
         entry_point: Some("main"),
-        compilation_options: wgpu::PipelineCompilationOptions::default(),
+        compilation_options: wgpu::PipelineCompilationOptions {
+            zero_initialize_workgroup_memory: false,
+            ..Default::default()
+        },
         cache: None,
     });
     let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
