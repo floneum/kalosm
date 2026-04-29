@@ -1,4 +1,8 @@
-use phase_token_prototype::{build, Shape, F32};
+use phase_token_prototype::{
+    build,
+    kernels::gemm::{self, GemmTilePlan},
+    Shape, F32,
+};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let ir = build(|mut phase| {
@@ -17,7 +21,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let pending = phase.cooperative_load_pair(a, &a_in, b, &b_in);
                 let (a, b, mut phase) = pending.sync_tiles();
 
-                phase.gemm(&a, &b, &mut acc);
+                gemm::tiled(
+                    &mut phase,
+                    &a,
+                    &b,
+                    &mut acc,
+                    GemmTilePlan::portable(16, 16, 8),
+                );
                 phase.sync_end()
             },
             |mut phase| {

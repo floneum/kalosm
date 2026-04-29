@@ -1,5 +1,7 @@
 use phase_token_prototype::{
-    build, DynamicOffset, KernelIr, Layout, LoopOffset, MemoryLevel, Shape, Strides, WorkgroupAxis,
+    build,
+    kernels::gemm::{self, GemmTilePlan},
+    DynamicOffset, KernelIr, Layout, LoopOffset, MemoryLevel, Shape, Strides, WorkgroupAxis,
     WorkgroupOffset, F32,
 };
 
@@ -79,7 +81,13 @@ fn matmul_ir() -> KernelIr {
                 let pending = phase.cooperative_load_pair(a, &a_in, b, &b_in);
                 let (a, b, mut phase) = pending.sync_tiles();
 
-                phase.gemm(&a, &b, &mut acc);
+                gemm::tiled(
+                    &mut phase,
+                    &a,
+                    &b,
+                    &mut acc,
+                    GemmTilePlan::portable(BM as u32, BN as u32, BK as u32),
+                );
                 phase.sync_end()
             },
             |mut phase| {

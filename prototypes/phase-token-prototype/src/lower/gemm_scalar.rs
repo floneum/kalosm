@@ -5,7 +5,7 @@ impl<'a> Lowerer<'a> {
         &self,
         expressions: &mut Arena<Expression>,
         scratch: ScratchLocals,
-        op: &GemmOp,
+        op: &GemmDescriptor,
     ) -> Result<Statement, LowerError> {
         let a_layout = self.tile_layout(op.a)?;
         let b_layout = self.tile_layout(op.b)?;
@@ -270,7 +270,7 @@ impl<'a> Lowerer<'a> {
         &self,
         expressions: &mut Arena<Expression>,
         scratch: ScratchLocals,
-        op: &GemmOp,
+        op: &GemmDescriptor,
         a_layout: &Layout,
         b_layout: &Layout,
         acc_layout: &Layout,
@@ -598,7 +598,7 @@ impl<'a> Lowerer<'a> {
         &self,
         expressions: &mut Arena<Expression>,
         scratch: ScratchLocals,
-        op: &GemmOp,
+        op: &GemmDescriptor,
         dst: &StorageView,
     ) -> Result<Statement, LowerError> {
         let a_layout = self.tile_layout(op.a)?;
@@ -759,7 +759,7 @@ impl<'a> Lowerer<'a> {
         scratch: ScratchLocals,
         a: &StorageView,
         b: &StorageView,
-        op: &GemmOp,
+        op: &GemmDescriptor,
         dst: &StorageView,
     ) -> Result<Statement, LowerError> {
         let a_layout = self.storage_layout(a)?;

@@ -4,6 +4,39 @@ fn storage_view(buffer: BufferRef, layout: Layout) -> StorageView {
     StorageView::root(buffer, layout)
 }
 
+fn block_contains_gemm(block: &Block) -> bool {
+    block.ops().iter().any(|op| match op {
+        Op::Gemm(_) => true,
+        Op::Block(op) => block_contains_gemm(&op.body),
+        Op::Loop(op) => block_contains_gemm(&op.body),
+        Op::Partition(op) => block_contains_gemm(&op.body),
+        _ => false,
+    })
+}
+
+fn count_mmas(block: &Block) -> usize {
+    block
+        .ops()
+        .iter()
+        .map(|op| match op {
+            Op::Mma(_) => 1,
+            Op::Block(op) => count_mmas(&op.body),
+            Op::Loop(op) => count_mmas(&op.body),
+            Op::Partition(op) => count_mmas(&op.body),
+            _ => 0,
+        })
+        .sum()
+}
+
+fn block_contains_partition(block: &Block) -> bool {
+    block.ops().iter().any(|op| match op {
+        Op::Partition(_) => true,
+        Op::Block(op) => block_contains_partition(&op.body),
+        Op::Loop(op) => block_contains_partition(&op.body),
+        _ => false,
+    })
+}
+
 #[test]
 fn loop_body_must_end_with_sync_witness() {
     let shape = Shape::new([32]);
@@ -195,7 +228,13 @@ fn matmul_tile_body_is_represented_in_the_ir() {
                 let pending = phase.cooperative_load_pair(a, &a_in, b, &b_in);
                 let (a, b, mut phase) = pending.sync_tiles();
 
-                phase.gemm(&a, &b, &mut acc);
+                kernels::gemm::tiled(
+                    &mut phase,
+                    &a,
+                    &b,
+                    &mut acc,
+                    kernels::gemm::GemmTilePlan::portable(bm, bn, bk),
+                );
                 phase.sync_end()
             },
             |mut phase| {
@@ -228,89 +267,55 @@ fn matmul_tile_body_is_represented_in_the_ir() {
             },
         ],
     );
+    assert_eq!(ir.tiles().len(), 54);
+    assert_eq!(ir.tiles()[0].origin, TileOrigin::Allocation);
+    assert_eq!(ir.tiles()[1].origin, TileOrigin::Allocation);
+    assert_eq!(ir.tiles()[2].origin, TileOrigin::Allocation);
+    assert!(block_contains_partition(ir.body()));
+    assert_eq!(count_mmas(ir.body()), 16);
+    assert!(!block_contains_gemm(ir.body()));
+
+    let Op::Loop(loop_op) = &ir.body().ops()[1] else {
+        panic!("expected loop after accumulator fill");
+    };
     assert_eq!(
-        ir.tiles(),
+        &loop_op.body.ops()[0..3],
         &[
-            TileDecl {
-                id: TileId(0),
-                element: ElementType::F32,
-                layout: Layout::contiguous(MemoryLevel::Private, Shape::new([bm, bn])),
-                level: TileLevel::Thread,
-                origin: TileOrigin::Allocation,
-            },
-            TileDecl {
-                id: TileId(1),
-                element: ElementType::F32,
-                layout: Layout::contiguous(MemoryLevel::Workgroup, Shape::new([bm, bk])),
+            Op::CooperativeLoad(CooperativeLoadOp {
+                dst: a,
+                src: storage_view(
+                    a_buf,
+                    Layout::contiguous(MemoryLevel::Storage, Shape::new([bm, bk])),
+                ),
                 level: TileLevel::Workgroup,
-                origin: TileOrigin::Allocation,
-            },
-            TileDecl {
-                id: TileId(2),
-                element: ElementType::F32,
-                layout: Layout::contiguous(MemoryLevel::Workgroup, Shape::new([bk, bn])),
+            }),
+            Op::CooperativeLoad(CooperativeLoadOp {
+                dst: b,
+                src: storage_view(
+                    b_buf,
+                    Layout::contiguous(MemoryLevel::Storage, Shape::new([bk, bn])),
+                ),
                 level: TileLevel::Workgroup,
-                origin: TileOrigin::Allocation,
-            },
+            }),
+            Op::Barrier(BarrierOp {
+                scope: BarrierScope::Workgroup,
+            }),
         ],
     );
     assert_eq!(
-        ir.body(),
-        &Block::from_ops(vec![
-            Op::FillTile(FillTileOp {
-                dst: acc,
-                value: FillValue::Zero,
-            }),
-            Op::Loop(LoopOp {
-                kind: LoopKind::RangeStep {
-                    induction: Dim(0),
-                    iterations: 1,
-                },
-                body: Block::from_ops(vec![
-                    Op::CooperativeLoad(CooperativeLoadOp {
-                        dst: a,
-                        src: storage_view(
-                            a_buf,
-                            Layout::contiguous(MemoryLevel::Storage, Shape::new([bm, bk])),
-                        ),
-                        level: TileLevel::Workgroup,
-                    }),
-                    Op::CooperativeLoad(CooperativeLoadOp {
-                        dst: b,
-                        src: storage_view(
-                            b_buf,
-                            Layout::contiguous(MemoryLevel::Storage, Shape::new([bk, bn])),
-                        ),
-                        level: TileLevel::Workgroup,
-                    }),
-                    Op::Barrier(BarrierOp {
-                        scope: BarrierScope::Workgroup,
-                    }),
-                    Op::Gemm(GemmOp {
-                        a,
-                        b,
-                        acc,
-                        tiling: GemmTiling::portable(bm, bn, bk),
-                        backend: MmaBackend::FmaPortable,
-                    }),
-                    Op::Barrier(BarrierOp {
-                        scope: BarrierScope::Workgroup,
-                    }),
-                ]),
-            }),
-            Op::StoreTile(StoreTileOp {
-                src: acc,
-                dst: storage_view(
-                    c_buf,
-                    Layout::contiguous(MemoryLevel::Storage, Shape::new([bm, bn])),
-                ),
-            }),
-        ]),
+        &ir.body().ops()[2],
+        &Op::StoreTile(StoreTileOp {
+            src: acc,
+            dst: storage_view(
+                c_buf,
+                Layout::contiguous(MemoryLevel::Storage, Shape::new([bm, bn])),
+            ),
+        }),
     );
 }
 
 #[test]
-fn gemm_expands_to_partitioned_mma_ir() {
+fn userland_gemm_emits_partitioned_mma_ir() {
     let bm = 16;
     let bn = 16;
     let bk = 8;
@@ -330,7 +335,13 @@ fn gemm_expands_to_partitioned_mma_ir() {
                 let pending = phase.cooperative_load_pair(a, &a_in, b, &b_in);
                 let (a, b, mut phase) = pending.sync_tiles();
 
-                phase.gemm(&a, &b, &mut acc);
+                kernels::gemm::tiled(
+                    &mut phase,
+                    &a,
+                    &b,
+                    &mut acc,
+                    kernels::gemm::GemmTilePlan::portable(bm, bn, bk),
+                );
                 phase.sync_end()
             },
             |mut phase| {
@@ -340,10 +351,9 @@ fn gemm_expands_to_partitioned_mma_ir() {
         )
     });
 
-    let expanded = ir.expand_gemm_to_mma();
-    assert_eq!(expanded.tiles().len(), 54);
+    assert_eq!(ir.tiles().len(), 54);
     assert_eq!(
-        expanded.tiles()[5].origin,
+        ir.tiles()[5].origin,
         TileOrigin::View {
             source: TileRef::new(TileId(0), ElementType::F32),
             mapping: ViewMapping::Partition {
@@ -353,7 +363,7 @@ fn gemm_expands_to_partitioned_mma_ir() {
         },
     );
     assert_eq!(
-        expanded.tiles()[8].origin,
+        ir.tiles()[8].origin,
         TileOrigin::View {
             source: TileRef::new(TileId(5), ElementType::F32),
             mapping: ViewMapping::Partition {
@@ -362,36 +372,20 @@ fn gemm_expands_to_partitioned_mma_ir() {
             },
         },
     );
-    assert_eq!(expanded.tiles()[3].layout.shape(), &Shape::new([16, 8]));
-    assert_eq!(expanded.tiles()[4].layout.shape(), &Shape::new([8, 16]));
-    assert_eq!(expanded.tiles()[5].layout.shape(), &Shape::new([16, 16]));
-    assert_eq!(expanded.tiles()[6].layout.shape(), &Shape::new([4, 8]));
-    assert_eq!(expanded.tiles()[7].layout.shape(), &Shape::new([8, 4]));
-    assert_eq!(expanded.tiles()[8].layout.shape(), &Shape::new([4, 4]));
+    assert_eq!(ir.tiles()[3].layout.shape(), &Shape::new([16, 8]));
+    assert_eq!(ir.tiles()[4].layout.shape(), &Shape::new([8, 16]));
+    assert_eq!(ir.tiles()[5].layout.shape(), &Shape::new([16, 16]));
+    assert_eq!(ir.tiles()[6].layout.shape(), &Shape::new([4, 8]));
+    assert_eq!(ir.tiles()[7].layout.shape(), &Shape::new([8, 4]));
+    assert_eq!(ir.tiles()[8].layout.shape(), &Shape::new([4, 4]));
 
-    let Op::Loop(loop_op) = &expanded.body().ops()[1] else {
+    let Op::Loop(loop_op) = &ir.body().ops()[1] else {
         panic!("expected loop after accumulator fill");
     };
-    let Op::Block(gemm_block) = &loop_op.body.ops()[3] else {
-        panic!("expected gemm to expand into a block of thread mmas");
-    };
-    assert_eq!(gemm_block.body.ops().len(), 16);
-
-    let Op::Mma(mma) = &gemm_block.body.ops()[0] else {
-        panic!("expected expanded gemm block to contain mma");
-    };
-    assert_eq!(mma.a, TileRef::new(TileId(6), ElementType::F32));
-    assert_eq!(mma.b, TileRef::new(TileId(7), ElementType::F32));
-    assert_eq!(mma.acc, TileRef::new(TileId(8), ElementType::F32));
-
-    let Op::Mma(last_mma) = &gemm_block.body.ops()[15] else {
-        panic!("expected expanded gemm block to contain mma");
-    };
-    assert_eq!(last_mma.a, TileRef::new(TileId(51), ElementType::F32));
-    assert_eq!(last_mma.b, TileRef::new(TileId(52), ElementType::F32));
-    assert_eq!(last_mma.acc, TileRef::new(TileId(53), ElementType::F32));
+    assert!(matches!(loop_op.body.ops()[3], Op::Partition(_)));
+    assert_eq!(count_mmas(&loop_op.body), 16);
     assert_eq!(
-        expanded.tiles()[53].origin,
+        ir.tiles()[53].origin,
         TileOrigin::View {
             source: TileRef::new(TileId(5), ElementType::F32),
             mapping: ViewMapping::Partition {
@@ -400,6 +394,57 @@ fn gemm_expands_to_partitioned_mma_ir() {
             },
         },
     );
+    assert!(!block_contains_gemm(ir.body()));
+}
+
+#[test]
+fn legacy_gemm_op_still_expands_to_partitioned_mma_ir() {
+    let bm = 16;
+    let bn = 16;
+    let bk = 8;
+    let a = TileRef::new(TileId(0), ElementType::F32);
+    let b = TileRef::new(TileId(1), ElementType::F32);
+    let acc = TileRef::new(TileId(2), ElementType::F32);
+    let ir = KernelIr {
+        buffers: Vec::new(),
+        tiles: vec![
+            TileDecl {
+                id: TileId(0),
+                element: ElementType::F32,
+                layout: Layout::contiguous(MemoryLevel::Workgroup, Shape::new([bm, bk])),
+                level: TileLevel::Workgroup,
+                origin: TileOrigin::Allocation,
+            },
+            TileDecl {
+                id: TileId(1),
+                element: ElementType::F32,
+                layout: Layout::contiguous(MemoryLevel::Workgroup, Shape::new([bk, bn])),
+                level: TileLevel::Workgroup,
+                origin: TileOrigin::Allocation,
+            },
+            TileDecl {
+                id: TileId(2),
+                element: ElementType::F32,
+                layout: Layout::contiguous(MemoryLevel::Private, Shape::new([bm, bn])),
+                level: TileLevel::Thread,
+                origin: TileOrigin::Allocation,
+            },
+        ],
+        body: Block::from_ops(vec![Op::Gemm(GemmOp {
+            a,
+            b,
+            acc,
+            tiling: GemmTiling::portable(bm, bn, bk),
+            backend: MmaBackend::FmaPortable,
+        })]),
+        next_buffer: 0,
+        next_tile: 3,
+    };
+
+    let expanded = ir.expand_gemm_to_mma();
+    assert_eq!(expanded.tiles().len(), 54);
+    assert_eq!(count_mmas(expanded.body()), 16);
+    assert!(!block_contains_gemm(expanded.body()));
 }
 
 #[test]
@@ -505,7 +550,13 @@ fn lowers_gemm_to_naga_module() {
                 let pending = phase.cooperative_load_pair(a, &a_in, b, &b_in);
                 let (a, b, mut phase) = pending.sync_tiles();
 
-                phase.gemm(&a, &b, &mut acc);
+                kernels::gemm::tiled(
+                    &mut phase,
+                    &a,
+                    &b,
+                    &mut acc,
+                    kernels::gemm::GemmTilePlan::portable(1, 1, 2),
+                );
                 phase.sync_end()
             },
             |mut phase| {
@@ -519,6 +570,48 @@ fn lowers_gemm_to_naga_module() {
     let entry = &lowered.module().entry_points[0];
     assert_eq!(lowered.module().global_variables.iter().count(), 3);
     assert_eq!(entry.function.local_variables.iter().count(), 15);
+}
+
+#[test]
+fn userland_gemm_triggers_cooperative_fast_path() {
+    let ir = build(|mut phase| {
+        let a_in = phase.storage_tensor::<F32>(Shape::new([16, 8]));
+        let b_in = phase.storage_tensor::<F32>(Shape::new([8, 16]));
+        let c_out = phase.storage_tensor::<F32>(Shape::new([16, 16]));
+        let mut acc = phase.alloc_fragment::<F32>(Shape::new([16, 16]));
+        phase.fill_zero(&mut acc);
+        let acc_out = acc;
+        phase.range_step(
+            |mut phase, _| {
+                let a = phase.alloc_workgroup_tile::<F32>(Shape::new([16, 8]));
+                let b = phase.alloc_workgroup_tile::<F32>(Shape::new([8, 16]));
+                let pending = phase.cooperative_load_pair(a, &a_in, b, &b_in);
+                let (a, b, mut phase) = pending.sync_tiles();
+                kernels::gemm::tiled(
+                    &mut phase,
+                    &a,
+                    &b,
+                    &mut acc,
+                    kernels::gemm::GemmTilePlan::portable(16, 16, 8),
+                );
+                phase.sync_end()
+            },
+            |mut phase| {
+                phase.store_fragment_to_storage(&acc_out, &c_out);
+                phase.finish()
+            },
+        )
+    });
+
+    let lowered = ir.lower_to_naga().unwrap();
+    assert!(
+        lowered
+            .module()
+            .types
+            .iter()
+            .any(|(_, ty)| matches!(ty.inner, naga::TypeInner::CooperativeMatrix { .. })),
+        "expected primitive userland GEMM to be recognized by the cooperative fast path"
+    );
 }
 
 #[test]
@@ -550,4 +643,136 @@ fn layout_is_structured_shape_strides_and_memory_level() {
     );
     assert_eq!(padded.element_count().get(), 32);
     assert_eq!(padded.allocation_element_count().get(), 44);
+}
+
+#[test]
+#[should_panic(expected = "gemm K dimensions must match")]
+fn userland_gemm_rejects_shape_mismatch() {
+    build(|mut phase| {
+        let a_in = phase.storage_tensor::<F32>(Shape::new([2, 3]));
+        let b_in = phase.storage_tensor::<F32>(Shape::new([2, 2]));
+        let c_out = phase.storage_tensor::<F32>(Shape::new([2, 2]));
+        let mut acc = phase.alloc_fragment::<F32>(Shape::new([2, 2]));
+        phase.fill_zero(&mut acc);
+        let acc_out = acc;
+        phase.range_step(
+            |mut phase, _| {
+                let a = phase.alloc_workgroup_tile::<F32>(Shape::new([2, 3]));
+                let b = phase.alloc_workgroup_tile::<F32>(Shape::new([2, 2]));
+                let pending = phase.cooperative_load_pair(a, &a_in, b, &b_in);
+                let (a, b, mut phase) = pending.sync_tiles();
+                kernels::gemm::tiled(
+                    &mut phase,
+                    &a,
+                    &b,
+                    &mut acc,
+                    kernels::gemm::GemmTilePlan::portable(2, 2, 3),
+                );
+                phase.sync_end()
+            },
+            |mut phase| {
+                phase.store_fragment_to_storage(&acc_out, &c_out);
+                phase.finish()
+            },
+        )
+    });
+}
+
+#[test]
+#[should_panic(expected = "M must divide subgroup_m")]
+fn userland_gemm_rejects_non_divisible_tile_plan() {
+    build(|mut phase| {
+        let a_in = phase.storage_tensor::<F32>(Shape::new([4, 4]));
+        let b_in = phase.storage_tensor::<F32>(Shape::new([4, 4]));
+        let c_out = phase.storage_tensor::<F32>(Shape::new([4, 4]));
+        let mut acc = phase.alloc_fragment::<F32>(Shape::new([4, 4]));
+        phase.fill_zero(&mut acc);
+        let acc_out = acc;
+        phase.range_step(
+            |mut phase, _| {
+                let a = phase.alloc_workgroup_tile::<F32>(Shape::new([4, 4]));
+                let b = phase.alloc_workgroup_tile::<F32>(Shape::new([4, 4]));
+                let pending = phase.cooperative_load_pair(a, &a_in, b, &b_in);
+                let (a, b, mut phase) = pending.sync_tiles();
+                kernels::gemm::tiled(
+                    &mut phase,
+                    &a,
+                    &b,
+                    &mut acc,
+                    kernels::gemm::GemmTilePlan {
+                        subgroup_m: 3,
+                        subgroup_n: 4,
+                        subgroup_k: 4,
+                        thread_m: 1,
+                        thread_n: 1,
+                        thread_k: 4,
+                    },
+                );
+                phase.sync_end()
+            },
+            |mut phase| {
+                phase.store_fragment_to_storage(&acc_out, &c_out);
+                phase.finish()
+            },
+        )
+    });
+}
+
+#[test]
+#[should_panic(expected = "partition view must stay within parent tile shape")]
+fn explicit_partition_rejects_out_of_bounds_origin() {
+    build(|mut phase| {
+        let src = phase.storage_tensor::<F32>(Shape::new([4, 4]));
+        let dst = phase.storage_tensor::<F32>(Shape::new([2, 2]));
+        phase.range_step(
+            |mut phase, _| {
+                let tile = phase.alloc_workgroup_tile::<F32>(Shape::new([4, 4]));
+                let pending = phase.cooperative_load(tile, &src);
+                let (ready, mut phase) = pending.sync_tile();
+                phase.partition_at(
+                    &ready,
+                    TileLevel::Subgroup,
+                    Shape::new([2, 2]),
+                    [3, 0],
+                    |phase, child| {
+                        phase.store_ready_to_storage(&child, &dst);
+                    },
+                );
+                phase.sync_end()
+            },
+            |phase| phase.finish(),
+        )
+    });
+}
+
+#[test]
+#[should_panic(expected = "nested dynamic storage views are not supported")]
+fn nested_dynamic_storage_views_are_rejected() {
+    build(|mut phase| {
+        let full = phase.storage_tensor::<F32>(Shape::new([64, 64]));
+        let row_tile = full.workgroup_tile_2d(
+            Shape::new([16, 64]),
+            Some(WorkgroupOffset::new(WorkgroupAxis::Y, 16)),
+            None,
+        );
+        let _k_tile = row_tile.dynamic_tile_2d(
+            Shape::new([16, 8]),
+            None,
+            Some(DynamicOffset::Loop(LoopOffset::new(8))),
+        );
+        phase.finish()
+    });
+}
+
+#[test]
+#[should_panic(expected = "gemv partials must contain 128 elements per row")]
+fn gemv_builder_rejects_wrong_scratch_tile_size() {
+    build(|mut phase| {
+        let a = phase.storage_tensor_read::<F32>(Shape::new([4, 8]));
+        let x = phase.storage_tensor_read::<F32>(Shape::new([8, 1]));
+        let y = phase.storage_tensor::<F32>(Shape::new([4, 1]));
+        let partials = phase.alloc_workgroup_tile::<F32>(Shape::new([32]));
+        phase.gemv_tiled(&a, &x, &y, partials, 1, 1);
+        phase.finish()
+    });
 }

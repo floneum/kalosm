@@ -126,6 +126,32 @@ struct Lowerer<'a> {
     uses_subgroup_id: bool,
 }
 
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+struct GemmDescriptor {
+    a: TileRef,
+    b: TileRef,
+    acc: TileRef,
+}
+
+impl From<&GemmOp> for GemmDescriptor {
+    fn from(op: &GemmOp) -> Self {
+        Self {
+            a: op.a,
+            b: op.b,
+            acc: op.acc,
+        }
+    }
+}
+
+struct FusedGemmParts<'ops> {
+    fill: &'ops crate::FillTileOp,
+    loop_op: &'ops crate::LoopOp,
+    store: &'ops crate::StoreTileOp,
+    gemm: GemmDescriptor,
+    a_load: &'ops crate::CooperativeLoadOp,
+    b_load: &'ops crate::CooperativeLoadOp,
+}
+
 #[derive(Copy, Clone)]
 struct ScratchLocals {
     tile_index: Handle<LocalVariable>,

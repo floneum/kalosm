@@ -21,18 +21,18 @@ impl<'a> Lowerer<'a> {
         if ops.len() != 3 {
             return false;
         }
-        let Some((_, loop_op, store, gemm, a_load, b_load)) = Self::fused_gemm_parts(ops, 0) else {
+        let Some(parts) = Self::fused_gemm_parts(ir, ops, 0) else {
             return false;
         };
-        let crate::LoopKind::RangeStep { iterations, .. } = loop_op.kind;
-        let Some(acc_layout) = Self::tile_layout_in_ir(ir, gemm.acc) else {
+        let crate::LoopKind::RangeStep { iterations, .. } = parts.loop_op.kind;
+        let Some(acc_layout) = Self::tile_layout_in_ir(ir, parts.gemm.acc) else {
             return false;
         };
         Self::storage_gemm_coop8_subgroups(
-            &a_load.src.layout,
-            &b_load.src.layout,
+            &parts.a_load.src.layout,
+            &parts.b_load.src.layout,
             acc_layout,
-            &store.dst.layout,
+            &parts.store.dst.layout,
             iterations,
         )
         .is_some()
@@ -57,7 +57,7 @@ impl<'a> Lowerer<'a> {
                 index += 3;
                 continue;
             }
-            if Self::is_direct_fused_gemm_pattern(ops, index) {
+            if Self::is_direct_fused_gemm_pattern(ir, ops, index) {
                 index += 3;
                 continue;
             }
@@ -94,8 +94,8 @@ impl<'a> Lowerer<'a> {
         }
     }
 
-    pub(super) fn is_direct_fused_gemm_pattern(ops: &[Op], index: usize) -> bool {
-        Self::fused_gemm_parts(ops, index).is_some()
+    pub(super) fn is_direct_fused_gemm_pattern(ir: &KernelIr, ops: &[Op], index: usize) -> bool {
+        Self::fused_gemm_parts(ir, ops, index).is_some()
     }
 
     pub(super) fn mark_shared_fused_gemm_tiles(
@@ -105,24 +105,23 @@ impl<'a> Lowerer<'a> {
         live: &mut [bool],
         workgroup_invocations: u32,
     ) -> bool {
-        let Some((_, loop_op, store, gemm, a_load, b_load)) = Self::fused_gemm_parts(ops, index)
-        else {
+        let Some(parts) = Self::fused_gemm_parts(ir, ops, index) else {
             return false;
         };
-        let crate::LoopKind::RangeStep { iterations, .. } = loop_op.kind;
+        let crate::LoopKind::RangeStep { iterations, .. } = parts.loop_op.kind;
 
         let can_lower_coop = if PREFER_COOP_MATRIX_GEMM && PREFER_SHARED_COOP_GEMM {
             match (
-                Self::tile_layout_in_ir(ir, gemm.a),
-                Self::tile_layout_in_ir(ir, gemm.b),
-                Self::tile_layout_in_ir(ir, gemm.acc),
+                Self::tile_layout_in_ir(ir, parts.gemm.a),
+                Self::tile_layout_in_ir(ir, parts.gemm.b),
+                Self::tile_layout_in_ir(ir, parts.gemm.acc),
             ) {
                 (Some(a_layout), Some(b_layout), Some(acc_layout)) => {
                     Self::can_lower_shared_gemm_coop8(
                         a_layout,
                         b_layout,
                         acc_layout,
-                        &store.dst.layout,
+                        &parts.store.dst.layout,
                         iterations,
                     )
                 }
@@ -133,27 +132,21 @@ impl<'a> Lowerer<'a> {
         };
 
         let can_lower_scalar = PREFER_SHARED_GEMM
-            && Self::can_lower_shared_gemm_4col(ir, gemm, iterations, workgroup_invocations);
+            && Self::can_lower_shared_gemm_4col(ir, &parts.gemm, iterations, workgroup_invocations);
         if !can_lower_coop && !can_lower_scalar {
             return false;
         }
 
-        Self::mark_tile_live(ir, a_load.dst, live);
-        Self::mark_tile_live(ir, b_load.dst, live);
+        Self::mark_tile_live(ir, parts.a_load.dst, live);
+        Self::mark_tile_live(ir, parts.b_load.dst, live);
         true
     }
 
     pub(super) fn fused_gemm_parts<'ops>(
+        ir: &KernelIr,
         ops: &'ops [Op],
         index: usize,
-    ) -> Option<(
-        &'ops crate::FillTileOp,
-        &'ops crate::LoopOp,
-        &'ops crate::StoreTileOp,
-        &'ops GemmOp,
-        &'ops crate::CooperativeLoadOp,
-        &'ops crate::CooperativeLoadOp,
-    )> {
+    ) -> Option<FusedGemmParts<'ops>> {
         let Some(Op::FillTile(fill)) = ops.get(index) else {
             return None;
         };
@@ -166,25 +159,181 @@ impl<'a> Lowerer<'a> {
         if fill.value != crate::FillValue::Zero || store.src != fill.dst {
             return None;
         }
-        let mut gemm = None;
         let mut loads = Vec::new();
+        let mut legacy_gemm = None;
+        let mut mmas = Vec::new();
         for op in loop_op.body.ops() {
             match op {
                 Op::CooperativeLoad(op) => loads.push(op),
                 Op::Barrier(_) => {}
-                Op::Gemm(op) if op.acc == fill.dst && gemm.is_none() => gemm = Some(op),
+                Op::Gemm(op) if op.acc == fill.dst && legacy_gemm.is_none() => {
+                    legacy_gemm = Some(GemmDescriptor::from(op));
+                }
+                Op::Block(op) => {
+                    if !Self::collect_mmas(&op.body, &mut mmas) {
+                        return None;
+                    }
+                }
+                Op::Partition(op) => {
+                    if !Self::collect_mmas(&op.body, &mut mmas) {
+                        return None;
+                    }
+                }
+                Op::Mma(op) => mmas.push(op),
                 _ => return None,
             }
         }
-        let gemm = gemm?;
+        let gemm = match (legacy_gemm, mmas.is_empty()) {
+            (Some(gemm), true) => gemm,
+            (None, false) => Self::primitive_gemm_descriptor(ir, fill.dst, &mmas)?,
+            _ => return None,
+        };
         let a_load = loads.iter().copied().find(|load| load.dst == gemm.a)?;
         let b_load = loads.iter().copied().find(|load| load.dst == gemm.b)?;
-        Some((fill, loop_op, store, gemm, a_load, b_load))
+        Some(FusedGemmParts {
+            fill,
+            loop_op,
+            store,
+            gemm,
+            a_load,
+            b_load,
+        })
+    }
+
+    fn collect_mmas<'ops>(block: &'ops crate::Block, mmas: &mut Vec<&'ops MmaOp>) -> bool {
+        for op in block.ops() {
+            match op {
+                Op::Block(op) => {
+                    if !Self::collect_mmas(&op.body, mmas) {
+                        return false;
+                    }
+                }
+                Op::Partition(op) => {
+                    if !Self::collect_mmas(&op.body, mmas) {
+                        return false;
+                    }
+                }
+                Op::Mma(op) => mmas.push(op),
+                _ => return false,
+            }
+        }
+        true
+    }
+
+    fn primitive_gemm_descriptor(
+        ir: &KernelIr,
+        acc: TileRef,
+        mmas: &[&MmaOp],
+    ) -> Option<GemmDescriptor> {
+        let first = mmas.first()?;
+        let (a_root, _, _) = Self::tile_root_rect(ir, first.a)?;
+        let (b_root, _, _) = Self::tile_root_rect(ir, first.b)?;
+        let (acc_root, _, _) = Self::tile_root_rect(ir, first.acc)?;
+        if acc_root != acc {
+            return None;
+        }
+
+        let a_layout = Self::tile_layout_in_ir(ir, a_root)?;
+        let b_layout = Self::tile_layout_in_ir(ir, b_root)?;
+        let acc_layout = Self::tile_layout_in_ir(ir, acc_root)?;
+        let [m, k_a] = Self::matrix_shape(a_layout).ok()?;
+        let [k_b, n] = Self::matrix_shape(b_layout).ok()?;
+        let [m_acc, n_acc] = Self::matrix_shape(acc_layout).ok()?;
+        if k_a != k_b || m != m_acc || n != n_acc {
+            return None;
+        }
+
+        for mma in mmas.iter().copied() {
+            let (mma_a_root, a_origin, a_shape) = Self::tile_root_rect(ir, mma.a)?;
+            let (mma_b_root, b_origin, b_shape) = Self::tile_root_rect(ir, mma.b)?;
+            let (mma_acc_root, acc_origin, acc_shape) = Self::tile_root_rect(ir, mma.acc)?;
+            if mma_a_root != a_root || mma_b_root != b_root || mma_acc_root != acc_root {
+                return None;
+            }
+            if a_origin != [acc_origin[0], 0]
+                || b_origin != [0, acc_origin[1]]
+                || a_shape != [acc_shape[0], k_a]
+                || b_shape != [k_a, acc_shape[1]]
+            {
+                return None;
+            }
+        }
+
+        Self::mmas_cover_acc(ir, acc_root, mmas).then_some(GemmDescriptor {
+            a: a_root,
+            b: b_root,
+            acc: acc_root,
+        })
+    }
+
+    fn mmas_cover_acc(ir: &KernelIr, acc: TileRef, mmas: &[&MmaOp]) -> bool {
+        let Some(layout) = Self::tile_layout_in_ir(ir, acc) else {
+            return false;
+        };
+        let Ok([rows, cols]) = Self::matrix_shape(layout) else {
+            return false;
+        };
+        let Some(total) = rows.checked_mul(cols) else {
+            return false;
+        };
+        let mut covered = vec![false; total as usize];
+        for mma in mmas.iter().copied() {
+            let Some((root, origin, shape)) = Self::tile_root_rect(ir, mma.acc) else {
+                return false;
+            };
+            if root != acc {
+                return false;
+            }
+            let [row_origin, col_origin] = origin;
+            let [tile_rows, tile_cols] = shape;
+            if row_origin
+                .checked_add(tile_rows)
+                .is_none_or(|end| end > rows)
+                || col_origin
+                    .checked_add(tile_cols)
+                    .is_none_or(|end| end > cols)
+            {
+                return false;
+            }
+            for row in row_origin..row_origin + tile_rows {
+                for col in col_origin..col_origin + tile_cols {
+                    let index = (row * cols + col) as usize;
+                    if covered[index] {
+                        return false;
+                    }
+                    covered[index] = true;
+                }
+            }
+        }
+        covered.into_iter().all(|cell| cell)
+    }
+
+    fn tile_root_rect(ir: &KernelIr, tile: TileRef) -> Option<(TileRef, [u32; 2], [u32; 2])> {
+        let decl = ir.tiles().get(tile.id.index())?;
+        if decl.element != tile.element {
+            return None;
+        }
+        let shape = Self::matrix_shape(&decl.layout).ok()?;
+        match decl.origin {
+            TileOrigin::Allocation => Some((tile, [0, 0], shape)),
+            TileOrigin::View { source, mapping } => {
+                let (root, parent_origin, _) = Self::tile_root_rect(ir, source)?;
+                let ViewMapping::Partition { origin, .. } = mapping;
+                Some((
+                    root,
+                    [
+                        parent_origin[0].checked_add(origin[0])?,
+                        parent_origin[1].checked_add(origin[1])?,
+                    ],
+                    shape,
+                ))
+            }
+        }
     }
 
     pub(super) fn can_lower_shared_gemm_4col(
         ir: &KernelIr,
-        gemm: &GemmOp,
+        gemm: &GemmDescriptor,
         outer_iterations: u32,
         workgroup_invocations: u32,
     ) -> bool {
@@ -230,33 +379,31 @@ impl<'a> Lowerer<'a> {
         let mut index = 0;
         let mut max_subgroups = 0;
         while index < ops.len() {
-            if let Some((_, loop_op, store, gemm, a_load, b_load)) =
-                Self::fused_gemm_parts(ops, index)
-            {
-                let crate::LoopKind::RangeStep { iterations, .. } = loop_op.kind;
+            if let Some(parts) = Self::fused_gemm_parts(ir, ops, index) {
+                let crate::LoopKind::RangeStep { iterations, .. } = parts.loop_op.kind;
                 if PREFER_SHARED_COOP_GEMM {
                     if let (Some(a_layout), Some(b_layout), Some(acc_layout)) = (
-                        Self::tile_layout_in_ir(ir, gemm.a),
-                        Self::tile_layout_in_ir(ir, gemm.b),
-                        Self::tile_layout_in_ir(ir, gemm.acc),
+                        Self::tile_layout_in_ir(ir, parts.gemm.a),
+                        Self::tile_layout_in_ir(ir, parts.gemm.b),
+                        Self::tile_layout_in_ir(ir, parts.gemm.acc),
                     ) {
                         if let Some(subgroups) = Self::shared_gemm_coop8_subgroups(
                             a_layout,
                             b_layout,
                             acc_layout,
-                            &store.dst.layout,
+                            &parts.store.dst.layout,
                             iterations,
                         ) {
                             max_subgroups = max_subgroups.max(subgroups);
                         }
                     }
                 }
-                if let Some(acc_layout) = Self::tile_layout_in_ir(ir, gemm.acc) {
+                if let Some(acc_layout) = Self::tile_layout_in_ir(ir, parts.gemm.acc) {
                     if let Some(subgroups) = Self::storage_gemm_coop8_subgroups(
-                        &a_load.src.layout,
-                        &b_load.src.layout,
+                        &parts.a_load.src.layout,
+                        &parts.b_load.src.layout,
                         acc_layout,
-                        &store.dst.layout,
+                        &parts.store.dst.layout,
                         iterations,
                     ) {
                         max_subgroups = max_subgroups.max(subgroups);
@@ -442,18 +589,26 @@ impl<'a> Lowerer<'a> {
         }
     }
 
-    pub(super) fn max_gemm_sums(block: &crate::Block) -> u32 {
-        block
-            .ops()
-            .iter()
-            .map(|op| match op {
+    pub(super) fn max_gemm_sums(ir: &KernelIr, block: &crate::Block) -> u32 {
+        let ops = block.ops();
+        let mut index = 0;
+        let mut max_sums = 0;
+        while index < ops.len() {
+            if Self::fused_gemm_parts(ir, ops, index).is_some() {
+                max_sums = max_sums.max(8);
+                index += 3;
+                continue;
+            }
+            let nested = match &ops[index] {
                 Op::Gemm(_) => 8,
-                Op::Block(op) => Self::max_gemm_sums(&op.body),
-                Op::Loop(op) => Self::max_gemm_sums(&op.body),
-                Op::Partition(op) => Self::max_gemm_sums(&op.body),
+                Op::Block(op) => Self::max_gemm_sums(ir, &op.body),
+                Op::Loop(op) => Self::max_gemm_sums(ir, &op.body),
+                Op::Partition(op) => Self::max_gemm_sums(ir, &op.body),
                 _ => 0,
-            })
-            .max()
-            .unwrap_or(0)
+            };
+            max_sums = max_sums.max(nested);
+            index += 1;
+        }
+        max_sums
     }
 }

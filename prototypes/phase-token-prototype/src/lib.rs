@@ -8,8 +8,8 @@
 //!   `for<'iter> FnOnce(Phase<'_, '_, 'iter>, ...) -> Synced<'iter>`.
 //! - [`Phase::partition`] runs its Rust closure once, but emits a structured
 //!   [`PartitionOp`] whose child tile views are branded to the partition body.
-//! - [`Phase::gemm`] is the higher-level TileLang/Triton-style operation; the
-//!   middle-end can expand it into partitioned [`MmaOp`]s.
+//! - Userland helpers such as [`kernels::gemm::tiled`] compose public partition
+//!   and [`MmaOp`] primitives instead of relying on a built-in GEMM operation.
 //! - [`KernelIr`] stores typed tile declarations plus a tree of [`Op`] blocks,
 //!   not a flat event log.
 //!
@@ -145,6 +145,7 @@
 
 mod api;
 mod ir;
+pub mod kernels;
 mod lower;
 
 pub use api::{

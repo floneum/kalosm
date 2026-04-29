@@ -1,6 +1,10 @@
 use std::{borrow::Cow, sync::mpsc};
 
-use phase_token_prototype::{build, KernelIr, Shape, F32};
+use phase_token_prototype::{
+    build,
+    kernels::gemm::{self, GemmTilePlan},
+    KernelIr, Shape, F32,
+};
 use wgpu::util::DeviceExt;
 
 const M: usize = 16;
@@ -156,7 +160,13 @@ fn matmul_ir() -> KernelIr {
                 let pending = phase.cooperative_load_pair(a, &a_in, b, &b_in);
                 let (a, b, mut phase) = pending.sync_tiles();
 
-                phase.gemm(&a, &b, &mut acc);
+                gemm::tiled(
+                    &mut phase,
+                    &a,
+                    &b,
+                    &mut acc,
+                    GemmTilePlan::portable(16, 16, 8),
+                );
                 phase.sync_end()
             },
             |mut phase| {

@@ -7,7 +7,7 @@ impl<'a> Lowerer<'a> {
         scratch: ScratchLocals,
         a_load: &crate::CooperativeLoadOp,
         b_load: &crate::CooperativeLoadOp,
-        op: &GemmOp,
+        op: &GemmDescriptor,
         dst: &StorageView,
         outer_iterations: u32,
     ) -> Result<Option<Statement>, LowerError> {

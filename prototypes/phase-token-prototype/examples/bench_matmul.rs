@@ -1,7 +1,9 @@
 use std::{borrow::Cow, sync::mpsc, time::Instant};
 
 use phase_token_prototype::{
-    build, DynamicOffset, KernelIr, Layout, LoopOffset, MemoryLevel, Shape, Strides, WorkgroupAxis,
+    build,
+    kernels::gemm::{self, GemmTilePlan},
+    DynamicOffset, KernelIr, Layout, LoopOffset, MemoryLevel, Shape, Strides, WorkgroupAxis,
     WorkgroupOffset, F32,
 };
 use wgpu::util::DeviceExt;
@@ -571,7 +573,13 @@ fn matmul_ir(tile: TileShape) -> KernelIr {
                 let pending = phase.cooperative_load_pair(a, &a_in, b, &b_in);
                 let (a, b, mut phase) = pending.sync_tiles();
 
-                phase.gemm(&a, &b, &mut acc);
+                gemm::tiled(
+                    &mut phase,
+                    &a,
+                    &b,
+                    &mut acc,
+                    GemmTilePlan::portable(tile.bm as u32, tile.bn as u32, tile.bk as u32),
+                );
                 phase.sync_end()
             },
             |mut phase| {

@@ -3,11 +3,12 @@ use std::marker::PhantomData;
 
 use crate::{
     BarrierOp, BarrierScope, Block, BufferAccess, BufferDecl, BufferRef, CooperativeLoadOp, Dim,
-    DynamicOffset, ElementType, FillTileOp, FillValue, GemmOp, GemmTiling, GemvOp, KernelIr,
-    Layout, LoopKind, LoopOp, MemoryLevel, MmaBackend, MmaOp, Op, PartitionBinding, PartitionOp,
-    Shape, StorageView, StoreTileOp, TileDecl, TileLevel, TileOrigin, TileRef, ViewMapping,
-    WorkgroupOffset,
+    DynamicOffset, ElementType, FillTileOp, FillValue, GemvOp, KernelIr, Layout, LoopKind, LoopOp,
+    MemoryLevel, MmaBackend, MmaOp, Op, PartitionBinding, PartitionOp, Shape, StorageView,
+    StoreTileOp, TileDecl, TileLevel, TileOrigin, TileRef, ViewMapping, WorkgroupOffset,
 };
+
+const GEMV_WORKGROUP_INVOCATIONS: u32 = 128;
 
 /// A sample numeric marker.
 #[derive(Copy, Clone, Debug)]
@@ -90,6 +91,16 @@ impl<'k> KernelBuilder<'k> {
         layout: Layout,
         level: TileLevel,
     ) -> TileRef {
+        self.alloc_tile_view_at::<T>(source, layout, level, [0, 0])
+    }
+
+    fn alloc_tile_view_at<T: Numeric>(
+        &mut self,
+        source: TileRef,
+        layout: Layout,
+        level: TileLevel,
+        origin: [u32; 2],
+    ) -> TileRef {
         let id = crate::TileId(self.ir.next_tile);
         self.ir.next_tile += 1;
         let tile = TileRef::new(id, T::ELEMENT);
@@ -100,10 +111,7 @@ impl<'k> KernelBuilder<'k> {
             level,
             origin: TileOrigin::View {
                 source,
-                mapping: ViewMapping::Partition {
-                    level,
-                    origin: [0, 0],
-                },
+                mapping: ViewMapping::Partition { level, origin },
             },
         });
         tile
@@ -379,29 +387,6 @@ impl<'cx, 'k, 'flow> Phase<'cx, 'k, 'flow, Clean> {
         }));
     }
 
-    /// Emit a high-level tiled GEMM over ready parent tiles.
-    pub fn gemm<'ready, TA, TB, TC>(
-        &mut self,
-        a: &ReadyTile<'k, 'ready, TA>,
-        b: &ReadyTile<'k, 'ready, TB>,
-        acc: &mut RegTile<'k, TC>,
-    ) {
-        let [m, k] = matrix_shape(self.cx.tile_layout(a.tile));
-        let [k_b, n] = matrix_shape(self.cx.tile_layout(b.tile));
-        let [m_acc, n_acc] = matrix_shape(self.cx.tile_layout(acc.tile));
-        assert_eq!(k, k_b, "gemm K dimensions must match");
-        assert_eq!(m, m_acc, "gemm M dimension must match accumulator");
-        assert_eq!(n, n_acc, "gemm N dimension must match accumulator");
-
-        self.cx.push_op(Op::Gemm(GemmOp {
-            a: a.tile,
-            b: b.tile,
-            acc: acc.tile,
-            tiling: GemmTiling::portable(m, n, k),
-            backend: MmaBackend::FmaPortable,
-        }));
-    }
-
     /// Emit a row-parallel GEMV.
     ///
     /// This is not modeled as a skinny GEMM: one workgroup owns one output row,
@@ -472,6 +457,11 @@ impl<'cx, 'k, 'flow> Phase<'cx, 'k, 'flow, Clean> {
             1,
             "gemv partials must be rank-1"
         );
+        assert_eq!(
+            partial_layout.element_count().get(),
+            GEMV_WORKGROUP_INVOCATIONS * rows_per_workgroup,
+            "gemv partials must contain 128 elements per row"
+        );
 
         self.cx.push_op(Op::Gemv(GemvOp {
             a: a.view(),
@@ -497,6 +487,10 @@ impl<'cx, 'k, 'flow> Phase<'cx, 'k, 'flow, Clean> {
             level: TileLevel::Thread,
             backend: MmaBackend::FmaPortable,
         }));
+    }
+
+    pub(crate) fn tile_matrix_shape(&self, tile: TileRef) -> [u32; 2] {
+        matrix_shape(self.cx.tile_layout(tile))
     }
 
     /// Partition a ready tile into a lower-level tile view.
@@ -528,6 +522,83 @@ impl<'cx, 'k, 'flow> Phase<'cx, 'k, 'flow, Clean> {
 
         self.cx.begin_block();
         body(self, ready);
+        let partition_body = self.cx.end_block();
+        self.cx.push_op(Op::Partition(PartitionOp {
+            bindings: vec![PartitionBinding {
+                source: tile.tile,
+                view,
+            }],
+            level,
+            body: partition_body,
+        }));
+    }
+
+    /// Partition a ready tile into an explicit-origin lower-level tile view.
+    pub fn partition_at<T: Numeric>(
+        &mut self,
+        tile: &ReadyTile<'k, '_, T>,
+        level: TileLevel,
+        shape: Shape,
+        origin: [u32; 2],
+        body: impl for<'part> FnOnce(&mut Self, ReadyTile<'k, 'part, T>),
+    ) {
+        let source_layout = self.cx.tile_layout(tile.tile);
+        validate_partition_view(source_layout, &shape, origin);
+        let view_layout = Layout::strided(
+            source_layout.memory_level(),
+            shape,
+            source_layout.strides().clone(),
+        );
+        let view = self
+            .cx
+            .alloc_tile_view_at::<T>(tile.tile, view_layout, level, origin);
+        let ready = ReadyTile {
+            tile: view,
+            _ty: PhantomData,
+            _kernel: PhantomData,
+            _phase: PhantomData,
+        };
+
+        self.cx.begin_block();
+        body(self, ready);
+        let partition_body = self.cx.end_block();
+        self.cx.push_op(Op::Partition(PartitionOp {
+            bindings: vec![PartitionBinding {
+                source: tile.tile,
+                view,
+            }],
+            level,
+            body: partition_body,
+        }));
+    }
+
+    /// Partition a private/register tile into an explicit-origin lower-level view.
+    pub fn partition_private_at<T: Numeric>(
+        &mut self,
+        tile: &mut RegTile<'k, T>,
+        level: TileLevel,
+        shape: Shape,
+        origin: [u32; 2],
+        body: impl FnOnce(&mut Self, RegTile<'k, T>),
+    ) {
+        let source_layout = self.cx.tile_layout(tile.tile);
+        validate_partition_view(source_layout, &shape, origin);
+        let view_layout = Layout::strided(
+            source_layout.memory_level(),
+            shape,
+            source_layout.strides().clone(),
+        );
+        let view = self
+            .cx
+            .alloc_tile_view_at::<T>(tile.tile, view_layout, level, origin);
+        let reg = RegTile {
+            tile: view,
+            _ty: PhantomData,
+            _kernel: PhantomData,
+        };
+
+        self.cx.begin_block();
+        body(self, reg);
         let partition_body = self.cx.end_block();
         self.cx.push_op(Op::Partition(PartitionOp {
             bindings: vec![PartitionBinding {
@@ -629,6 +700,21 @@ fn matrix_shape(layout: &Layout) -> [u32; 2] {
     ]
 }
 
+fn validate_partition_view(source: &Layout, shape: &Shape, origin: [u32; 2]) {
+    assert_eq!(source.shape().rank(), 2, "partition source must be rank-2");
+    assert_eq!(shape.rank(), 2, "partition view must be rank-2");
+    for (axis, (origin, dim)) in origin.iter().zip(shape.dims()).enumerate() {
+        let parent = source.shape().dims()[axis].get();
+        let end = origin
+            .checked_add(dim.get())
+            .expect("partition view origin overflow");
+        assert!(
+            end <= parent,
+            "partition view must stay within parent tile shape"
+        );
+    }
+}
+
 impl<'cx, 'k, 'flow, T> Phase<'cx, 'k, 'flow, Pending<T>> {
     /// Emit a barrier, consume the pending load, and return a ready tile plus a
     /// clean phase handle.
@@ -707,11 +793,18 @@ pub type PendingTile<'cx, 'k, 'flow, T> = Phase<'cx, 'k, 'flow, Pending<T>>;
 pub type PendingTilePair<'cx, 'k, 'flow, A, B> = Phase<'cx, 'k, 'flow, Pending2<A, B>>;
 
 /// A private/register-resident tile.
-#[derive(Copy, Clone)]
 pub struct RegTile<'k, T> {
     pub(crate) tile: TileRef,
     _ty: PhantomData<T>,
     _kernel: PhantomData<&'k mut ()>,
+}
+
+impl<'k, T> Copy for RegTile<'k, T> {}
+
+impl<'k, T> Clone for RegTile<'k, T> {
+    fn clone(&self) -> Self {
+        *self
+    }
 }
 
 /// A storage buffer tensor bound by the kernel.
@@ -746,6 +839,10 @@ impl<'k, T> StorageTensor<'k, T> {
     ) -> Self {
         assert_eq!(self.view.layout.shape().rank(), 2, "parent view must be 2D");
         assert_eq!(shape.rank(), 2, "tile view must be 2D");
+        assert!(
+            self.view.dynamic_offsets.iter().all(Option::is_none),
+            "nested dynamic storage views are not supported"
+        );
         let layout = Layout::strided(
             MemoryLevel::Storage,
             shape,

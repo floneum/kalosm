@@ -92,7 +92,7 @@ impl<'a> Lowerer<'a> {
         };
 
         let max_gemv_rows = Self::max_gemv_rows(ir.body());
-        let max_scratch_sums = max_gemv_rows.max(Self::max_gemm_sums(ir.body()));
+        let max_scratch_sums = max_gemv_rows.max(Self::max_gemm_sums(ir, ir.body()));
         let (workgroup_invocations, workgroup_size) = if max_gemv_rows > 0 {
             (GEMV_WORKGROUP_INVOCATIONS, GEMV_WORKGROUP_SIZE)
         } else if uses_coop_gemm {

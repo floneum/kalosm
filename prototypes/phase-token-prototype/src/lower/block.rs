@@ -71,7 +71,11 @@ impl<'a> Lowerer<'a> {
                     );
                 }
                 Op::Gemm(op) => {
-                    body.push(self.lower_gemm(expressions, scratch, op)?, Span::default());
+                    let gemm = GemmDescriptor::from(op);
+                    body.push(
+                        self.lower_gemm(expressions, scratch, &gemm)?,
+                        Span::default(),
+                    );
                 }
                 Op::Gemv(op) => {
                     body.push(self.lower_gemv(expressions, scratch, op)?, Span::default());
@@ -107,39 +111,20 @@ impl<'a> Lowerer<'a> {
         expressions: &mut Arena<Expression>,
         scratch: ScratchLocals,
     ) -> Result<Option<(Statement, usize)>, LowerError> {
-        let Some(Op::FillTile(fill)) = ops.get(op_index) else {
+        let Some(parts) = Self::fused_gemm_parts(self.ir, ops, op_index) else {
             return Ok(None);
         };
-        let Some(Op::Loop(loop_op)) = ops.get(op_index + 1) else {
-            return Ok(None);
-        };
-        let Some(Op::StoreTile(store)) = ops.get(op_index + 2) else {
-            return Ok(None);
-        };
-        if fill.value != crate::FillValue::Zero || store.src != fill.dst {
-            return Ok(None);
-        }
-        let crate::LoopKind::RangeStep { iterations, .. } = loop_op.kind;
+        let crate::LoopKind::RangeStep { iterations, .. } = parts.loop_op.kind;
 
-        if let Some(statement) = self.try_lower_shared_gemm_store(
-            &loop_op.body,
-            fill.dst,
-            &store.dst,
-            iterations,
-            expressions,
-            scratch,
-        )? {
+        if let Some(statement) =
+            self.try_lower_shared_gemm_store(&parts, iterations, expressions, scratch)?
+        {
             return Ok(Some((statement, 3)));
         }
 
-        if let Some(statement) = self.try_lower_direct_gemm_store(
-            &loop_op.body,
-            fill.dst,
-            &store.dst,
-            iterations,
-            expressions,
-            scratch,
-        )? {
+        if let Some(statement) =
+            self.try_lower_direct_gemm_store(&parts, iterations, expressions, scratch)?
+        {
             return Ok(Some((statement, 3)));
         }
 
@@ -149,7 +134,7 @@ impl<'a> Lowerer<'a> {
 
         let mut body = Block::new();
         let mut fused_gemm = false;
-        for op in loop_op.body.ops() {
+        for op in parts.loop_op.body.ops() {
             match op {
                 Op::CooperativeLoad(op) => {
                     body.push(
@@ -171,9 +156,10 @@ impl<'a> Lowerer<'a> {
                     };
                     body.push(Statement::ControlBarrier(barrier), Span::default());
                 }
-                Op::Gemm(op) if op.acc == fill.dst && !fused_gemm => {
+                Op::Gemm(op) if op.acc == parts.fill.dst && !fused_gemm => {
+                    let gemm = GemmDescriptor::from(op);
                     body.push(
-                        self.lower_gemm_to_storage(expressions, scratch, op, &store.dst)?,
+                        self.lower_gemm_to_storage(expressions, scratch, &gemm, &parts.store.dst)?,
                         Span::default(),
                     );
                     fused_gemm = true;
@@ -191,9 +177,7 @@ impl<'a> Lowerer<'a> {
 
     pub(super) fn try_lower_shared_gemm_store(
         &self,
-        loop_body: &crate::Block,
-        acc: TileRef,
-        dst: &StorageView,
+        parts: &FusedGemmParts<'_>,
         iterations: u32,
         expressions: &mut Arena<Expression>,
         scratch: ScratchLocals,
@@ -201,83 +185,40 @@ impl<'a> Lowerer<'a> {
         if !PREFER_SHARED_GEMM {
             return Ok(None);
         }
-        let mut loads = Vec::new();
-        let mut gemm = None;
-        for op in loop_body.ops() {
-            match op {
-                Op::CooperativeLoad(op) => loads.push(op),
-                Op::Barrier(_) => {}
-                Op::Gemm(op) if op.acc == acc && gemm.is_none() => gemm = Some(op),
-                _ => return Ok(None),
-            }
-        }
-
-        let Some(gemm) = gemm else {
-            return Ok(None);
-        };
-        let Some(a_load) = loads.iter().find(|load| load.dst == gemm.a) else {
-            return Ok(None);
-        };
-        let Some(b_load) = loads.iter().find(|load| load.dst == gemm.b) else {
-            return Ok(None);
-        };
 
         self.lower_shared_gemm_loop_to_storage_4col(
             expressions,
             scratch,
-            a_load,
-            b_load,
-            gemm,
-            dst,
+            parts.a_load,
+            parts.b_load,
+            &parts.gemm,
+            &parts.store.dst,
             iterations,
         )
     }
 
     pub(super) fn try_lower_direct_gemm_store(
         &self,
-        loop_body: &crate::Block,
-        acc: TileRef,
-        dst: &StorageView,
+        parts: &FusedGemmParts<'_>,
         iterations: u32,
         expressions: &mut Arena<Expression>,
         scratch: ScratchLocals,
     ) -> Result<Option<Statement>, LowerError> {
-        let mut loads = Vec::new();
-        let mut gemm = None;
-        for op in loop_body.ops() {
-            match op {
-                Op::CooperativeLoad(op) => loads.push(op),
-                Op::Barrier(_) => {}
-                Op::Gemm(op) if op.acc == acc && gemm.is_none() => gemm = Some(op),
-                _ => return Ok(None),
-            }
-        }
-
-        let Some(gemm) = gemm else {
-            return Ok(None);
-        };
-        let Some(a_load) = loads.iter().find(|load| load.dst == gemm.a) else {
-            return Ok(None);
-        };
-        let Some(b_load) = loads.iter().find(|load| load.dst == gemm.b) else {
-            return Ok(None);
-        };
-
         if PREFER_COOP_MATRIX_GEMM && PREFER_SHARED_COOP_GEMM {
-            let a_layout = self.tile_layout(gemm.a)?;
-            let b_layout = self.tile_layout(gemm.b)?;
-            let acc_layout = self.tile_layout(gemm.acc)?;
-            let dst_layout = self.storage_layout(dst)?;
+            let a_layout = self.tile_layout(parts.gemm.a)?;
+            let b_layout = self.tile_layout(parts.gemm.b)?;
+            let acc_layout = self.tile_layout(parts.gemm.acc)?;
+            let dst_layout = self.storage_layout(&parts.store.dst)?;
             if Self::can_lower_shared_gemm_coop8(
                 a_layout, b_layout, acc_layout, dst_layout, iterations,
             ) {
                 return Ok(Some(self.lower_shared_gemm_loop_to_storage_coop8(
                     expressions,
                     scratch,
-                    a_load,
-                    b_load,
-                    gemm,
-                    dst,
+                    parts.a_load,
+                    parts.b_load,
+                    &parts.gemm,
+                    &parts.store.dst,
                     iterations,
                 )?));
             }
@@ -286,10 +227,10 @@ impl<'a> Lowerer<'a> {
         Ok(Some(self.lower_storage_gemm_loop_to_storage(
             expressions,
             scratch,
-            &a_load.src,
-            &b_load.src,
-            gemm,
-            dst,
+            &parts.a_load.src,
+            &parts.b_load.src,
+            &parts.gemm,
+            &parts.store.dst,
             iterations,
         )?))
     }
