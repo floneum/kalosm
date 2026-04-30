@@ -129,13 +129,24 @@ where
             );
         }
 
-        let logits = model.forward(tokens, images, device, cache);
+        let mut cache = cache;
+        let logits = model.forward(tokens, images, device, cache.as_deref_mut());
+        let cache_keys = cache
+            .as_ref()
+            .map(|cache| cache.gpu_keys())
+            .unwrap_or_default();
+        let device = device.clone();
         Box::pin(async move {
             let logits = logits?;
             let logits = logits.squeeze(0);
             // Cast logits back to f32 for sampling
             let logits: fusor::Tensor<1, f32> = logits.cast();
             let len = logits.shape()[0];
+            let mut resolve_keys = cache_keys;
+            if let Some(logits_key) = logits.gpu_key() {
+                resolve_keys.push(logits_key);
+            }
+            device.resolve_batch(&resolve_keys);
             let logits = logits.as_slice().await?;
             let mut logits_vec = Vec::with_capacity(len);
             for i in 0..len {

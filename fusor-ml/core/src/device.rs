@@ -4,6 +4,7 @@ use std::{
     num::{NonZeroU64, NonZeroUsize},
     path::PathBuf,
     sync::{Arc, OnceLock},
+    time::{Duration, Instant},
 };
 
 use lru::LruCache;
@@ -28,10 +29,25 @@ const PIPELINE_LAYOUT_CACHE_SIZE: usize = 256;
 const NAGA_MODULE_CACHE_SIZE: usize = 128;
 const SHADER_MODULE_CACHE_SIZE: usize = 128;
 const COMPUTE_PIPELINE_CACHE_SIZE: usize = 128;
+const GPU_POLL_SPIN_BUDGET: Duration = Duration::from_millis(2);
 
 fn padded_copy_size(size: u64) -> u64 {
     let align_mask = COPY_BUFFER_ALIGNMENT - 1;
     ((size + align_mask) & !align_mask).max(COPY_BUFFER_ALIGNMENT)
+}
+
+fn poll_until_queue_empty(device: &wgpu::Device) -> Result<wgpu::PollStatus, wgpu::PollError> {
+    let start = Instant::now();
+    loop {
+        let status = device.poll(wgpu::PollType::Poll)?;
+        if status.is_queue_empty() {
+            return Ok(status);
+        }
+        if start.elapsed() >= GPU_POLL_SPIN_BUDGET {
+            return device.poll(wgpu::PollType::wait_indefinitely());
+        }
+        std::thread::yield_now();
+    }
 }
 
 async fn select_adapter(
@@ -304,7 +320,7 @@ impl Device {
                 let Some(inner) = weak_inner.upgrade() else {
                     break;
                 };
-                let result = inner.device.poll(wgpu::PollType::wait_indefinitely());
+                let result = poll_until_queue_empty(&inner.device);
                 drop(inner);
                 let Ok(status) = result else {
                     break;
@@ -381,10 +397,7 @@ impl Device {
 
     /// Block until all submitted GPU work has completed.
     pub fn poll_wait(&self) {
-        self.inner
-            .device
-            .poll(wgpu::PollType::wait_indefinitely())
-            .expect("Failed to poll GPU device");
+        poll_until_queue_empty(&self.inner.device).expect("Failed to poll GPU device");
     }
 
     pub(crate) fn wgpu_cache(&self) -> Option<&wgpu::PipelineCache> {
