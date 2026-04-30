@@ -20,6 +20,34 @@ impl<'a> Lowerer<'a> {
         Self::block_uses_qgemv(ir.body())
     }
 
+    pub(super) fn qgemv_workgroup_invocations(ir: &KernelIr) -> Option<u32> {
+        Self::block_qgemv_workgroup_invocations(ir.body())
+    }
+
+    fn block_qgemv_workgroup_invocations(block: &crate::Block) -> Option<u32> {
+        block
+            .ops()
+            .iter()
+            .filter_map(|op| match op {
+                Op::QMatMul(op) => {
+                    if op.use_qgemv
+                        && Self::matrix_shape(&op.a.layout)
+                            .map(|[m, _]| m == 1)
+                            .unwrap_or(false)
+                    {
+                        Some(op.b.format.qgemv_subgroups_per_workgroup() * 32)
+                    } else {
+                        None
+                    }
+                }
+                Op::Block(op) => Self::block_qgemv_workgroup_invocations(&op.body),
+                Op::Loop(op) => Self::block_qgemv_workgroup_invocations(&op.body),
+                Op::Partition(op) => Self::block_qgemv_workgroup_invocations(&op.body),
+                _ => None,
+            })
+            .max()
+    }
+
     fn block_uses_qgemv(block: &crate::Block) -> bool {
         block.ops().iter().any(|op| match op {
             Op::QMatMul(op) => {

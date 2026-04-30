@@ -110,12 +110,14 @@ impl<'a> Lowerer<'a> {
         let uses_subgroup_size = uses_qgemv;
         let uses_num_subgroups = uses_qgemv;
         let uses_subgroup_id = uses_subgroup_id || uses_qgemv;
+        let qgemv_workgroup_invocations =
+            Self::qgemv_workgroup_invocations(ir).unwrap_or(DEFAULT_WORKGROUP_INVOCATIONS);
         let (workgroup_invocations, workgroup_size) = if max_gemv_rows > 0 {
             (GEMV_WORKGROUP_INVOCATIONS, GEMV_WORKGROUP_SIZE)
         } else if uses_qgemv {
             (
-                DEFAULT_WORKGROUP_INVOCATIONS,
-                [DEFAULT_WORKGROUP_INVOCATIONS, 1, 1],
+                qgemv_workgroup_invocations,
+                [qgemv_workgroup_invocations, 1, 1],
             )
         } else if uses_coop_gemm {
             (

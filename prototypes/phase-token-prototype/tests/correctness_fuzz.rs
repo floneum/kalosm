@@ -81,6 +81,7 @@ async fn run_fuzz() -> TestResult {
                 fuzz_qgemv_case(&device, &queue, &mut rng, format, case, variant)?;
             }
         }
+        fuzz_qgemv_split_workgroups_case(&device, &queue, &mut rng, format)?;
         fuzz_qgemm_skewed_activation_case(&device, &queue, &mut rng, format)?;
         fuzz_qgemm_im2col_nhwc_case(&device, &queue, &mut rng, format)?;
     }
@@ -359,6 +360,42 @@ fn fuzz_qgemv_case(
     Ok(())
 }
 
+fn fuzz_qgemv_split_workgroups_case(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    rng: &mut FuzzRng,
+    format: GgmlQuantFormat,
+) -> TestResult {
+    let m = 1;
+    let n = qgemv_cols_per_workgroup(format) * 3 + 1;
+    let k = format.block_elements() as usize;
+    let a = random_f32s(rng, m * k, 0.25);
+    let a_layout = matrix_layout(m, k, StorageVariant::Contiguous);
+    let y_layout = matrix_layout(m, n, StorageVariant::Contiguous);
+    let a_physical = pack_f32_matrix(&a, m, k, &a_layout);
+    let (packed_b, dequantized_b) = pack_random_quantized_matrix(rng, format, k, n);
+    let expected = cpu_matmul(&a, &dequantized_b, m, k, n);
+    let ir = qmatmul_split_workgroups_ir(m, n, k, format, 2, &a_layout, &y_layout);
+    let actual_physical = run_three_buffer_kernel(
+        device,
+        queue,
+        &ir,
+        bytemuck::cast_slice(&a_physical),
+        bytemuck::cast_slice(&packed_b),
+        allocation_len(&y_layout),
+        (2, 2, 1),
+    )?;
+    let actual = gather_f32_matrix(&actual_physical, m, n, &y_layout);
+
+    assert_close(
+        &format!("split-grid qgemv {format:?} n={n} k={k}"),
+        &actual,
+        &expected,
+        3.0e-2,
+    );
+    Ok(())
+}
+
 fn gemm_ir(
     m: usize,
     n: usize,
@@ -451,6 +488,36 @@ fn qmatmul_ir(
         } else {
             phase.qmatmul(&a, &b, &y);
         }
+        phase.finish()
+    })
+}
+
+fn qmatmul_split_workgroups_ir(
+    _m: usize,
+    n: usize,
+    k: usize,
+    format: GgmlQuantFormat,
+    workgroups_x: u32,
+    a_layout: &Layout,
+    y_layout: &Layout,
+) -> KernelIr {
+    let a_layout = a_layout.clone();
+    let y_layout = y_layout.clone();
+    build(move |mut phase| {
+        let a = phase.storage_tensor_read_with_layout::<F32>(a_layout);
+        let b = phase.quantized_matrix(format, k as u32, n as u32);
+        let y = phase.storage_tensor_with_layout::<F32>(y_layout);
+        phase.qmatmul_with_tile_plan_options_and_workgroup_x(
+            &a,
+            &b,
+            &y,
+            1,
+            1,
+            1,
+            4,
+            true,
+            workgroups_x,
+        );
         phase.finish()
     })
 }
@@ -1131,20 +1198,7 @@ fn ggml_formats() -> [GgmlQuantFormat; 12] {
 }
 
 fn qgemv_cols_per_workgroup(format: GgmlQuantFormat) -> usize {
-    match format {
-        GgmlQuantFormat::Q2K
-        | GgmlQuantFormat::Q3K
-        | GgmlQuantFormat::Q4K
-        | GgmlQuantFormat::Q5K
-        | GgmlQuantFormat::Q6K
-        | GgmlQuantFormat::Q8K => 16,
-        GgmlQuantFormat::Q4_0
-        | GgmlQuantFormat::Q4_1
-        | GgmlQuantFormat::Q5_0
-        | GgmlQuantFormat::Q5_1
-        | GgmlQuantFormat::Q8_0
-        | GgmlQuantFormat::Q8_1 => 32,
-    }
+    format.qgemv_cols_per_workgroup() as usize
 }
 
 fn ceil_div(value: usize, divisor: usize) -> u32 {

@@ -672,10 +672,37 @@ impl<'cx, 'k, 'flow> Phase<'cx, 'k, 'flow, Clean> {
         vector_width: u32,
         use_qgemv: bool,
     ) {
+        self.qmatmul_with_tile_plan_options_and_workgroup_x(
+            a,
+            b,
+            y,
+            tile_m,
+            tile_n,
+            tile_k,
+            vector_width,
+            use_qgemv,
+            1,
+        );
+    }
+
+    /// Emit qmatmul with explicit qgemv X-dimension dispatch splitting.
+    pub fn qmatmul_with_tile_plan_options_and_workgroup_x(
+        &mut self,
+        a: &StorageTensor<'k, F32>,
+        b: &QuantizedMatrix,
+        y: &StorageTensor<'k, F32>,
+        tile_m: u32,
+        tile_n: u32,
+        tile_k: u32,
+        vector_width: u32,
+        use_qgemv: bool,
+        workgroups_x: u32,
+    ) {
         assert!(tile_m > 0, "qmatmul tile M must be non-zero");
         assert!(tile_n > 0, "qmatmul tile N must be non-zero");
         assert!(tile_k > 0, "qmatmul tile K must be non-zero");
         assert!(vector_width > 0, "qmatmul vector width must be non-zero");
+        assert!(workgroups_x > 0, "qmatmul workgroups_x must be non-zero");
         let [m, k] = matrix_shape(&a.view.layout);
         let [y_m, y_n] = matrix_shape(&y.view.layout);
         assert_eq!(k, b.rows, "qmatmul K dimensions must match");
@@ -700,6 +727,7 @@ impl<'cx, 'k, 'flow> Phase<'cx, 'k, 'flow, Clean> {
             tile_k,
             vector_width,
             use_qgemv,
+            workgroups_x,
         }));
     }
 

@@ -491,3 +491,36 @@ async fn index_select_single_rank_and_large_regressions() {
     .await
     .unwrap();
 }
+
+#[tokio::test]
+async fn index_select_embedding_width_regression() {
+    const SOURCE_ROWS: usize = 64;
+    const SELECTED_ROWS: usize = 48;
+    const WIDTH: usize = 4096;
+
+    fusor_conformance::assert(async |device: Device| {
+        let input: Tensor<2, f32> = arange(&device, 0.0f32, (SOURCE_ROWS * WIDTH) as f32)
+            .reshape([SOURCE_ROWS, WIDTH])
+            .to_concrete();
+        let indices: Vec<u32> = (0..SELECTED_ROWS)
+            .map(|row| ((row * 7) % SOURCE_ROWS) as u32)
+            .collect();
+        let indices = Tensor::from_slice(&device, [SELECTED_ROWS], &indices);
+        input.index_select(0, &indices)
+    })
+    .arg(|device: &Device| device.clone())
+    .equal_to(async |device: Device| {
+        let rows: Vec<Vec<f32>> = (0..SELECTED_ROWS)
+            .map(|row| {
+                let source_row = (row * 7) % SOURCE_ROWS;
+                (0..WIDTH)
+                    .map(|col| (source_row * WIDTH + col) as f32)
+                    .collect()
+            })
+            .collect();
+        Tensor::new(&device, &rows)
+    })
+    .compare_with(approx_compare::<2, f32>(0.0))
+    .await
+    .unwrap();
+}

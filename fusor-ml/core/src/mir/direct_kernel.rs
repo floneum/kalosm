@@ -22,6 +22,12 @@ pub(crate) struct DirectKernel {
     dispatch_size: [u32; 3],
 }
 
+pub(crate) fn direct_storage_array_size(_allocation_len: u32) -> wgpu::naga::ArraySize {
+    // Direct kernels bind whole storage buffers. Keep the shader type runtime-sized so Naga
+    // does not try to lay out very large model buffers as fixed-size shader types.
+    wgpu::naga::ArraySize::Dynamic
+}
+
 impl DirectKernel {
     pub(crate) fn new_with_cache_key(
         name: impl Into<String>,
@@ -152,5 +158,65 @@ impl DirectKernel {
     #[cfg(test)]
     pub(crate) fn bindings_for_test(&self) -> &[DirectKernelBinding] {
         &self.bindings
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use wgpu::naga::{
+        AddressSpace, GlobalVariable, ResourceBinding, Scalar, ScalarKind, Span, StorageAccess,
+        Type, TypeInner, valid,
+    };
+
+    use super::*;
+
+    #[test]
+    fn direct_storage_arrays_validate_above_naga_fixed_type_limit() {
+        assert!(matches!(
+            direct_storage_array_size(valid::MAX_TYPE_SIZE / 4 + 1),
+            wgpu::naga::ArraySize::Dynamic
+        ));
+
+        let mut module = wgpu::naga::Module::default();
+        let f32_ty = module.types.insert(
+            Type {
+                name: Some("f32".into()),
+                inner: TypeInner::Scalar(Scalar {
+                    kind: ScalarKind::Float,
+                    width: 4,
+                }),
+            },
+            Span::default(),
+        );
+        let buffer_ty = module.types.insert(
+            Type {
+                name: Some("HugeDirectBuffer".into()),
+                inner: TypeInner::Array {
+                    base: f32_ty,
+                    size: direct_storage_array_size(valid::MAX_TYPE_SIZE / 4 + 1),
+                    stride: 4,
+                },
+            },
+            Span::default(),
+        );
+        module.global_variables.append(
+            GlobalVariable {
+                name: Some("huge_direct_buffer".into()),
+                space: AddressSpace::Storage {
+                    access: StorageAccess::LOAD,
+                },
+                binding: Some(ResourceBinding {
+                    group: 0,
+                    binding: 0,
+                }),
+                ty: buffer_ty,
+                init: None,
+            },
+            Span::default(),
+        );
+
+        valid::Validator::new(valid::ValidationFlags::all(), valid::Capabilities::empty())
+            .validate(&module)
+            .unwrap();
     }
 }

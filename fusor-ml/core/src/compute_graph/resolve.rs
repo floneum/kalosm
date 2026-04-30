@@ -126,9 +126,9 @@ impl Resolver {
             });
         }
 
-        // Create the first command encoder. We submit and recreate it after
-        // each kernel flush so that the GPU can reclaim freed intermediate
-        // buffers instead of accumulating all commands in one giant encoder.
+        // Record all kernels for this resolve into one command encoder. The
+        // encoder is submitted once at the end so host-side materialization is
+        // the synchronization boundary.
         let mut command_encoder =
             device
                 .wgpu_device()
@@ -178,15 +178,6 @@ impl Resolver {
                         &pending_operations,
                         &mut remaining_consumers,
                         &target_set,
-                    );
-                    // Submit the current command encoder so the GPU can
-                    // reclaim buffers we just freed, then start a new one.
-                    device.wgpu_queue().submit(Some(command_encoder.finish()));
-                    device.reset_initialized_buffers();
-                    command_encoder = device.wgpu_device().create_command_encoder(
-                        &wgpu::CommandEncoderDescriptor {
-                            label: Some("Resolver Encoder"),
-                        },
                     );
                     pending_operations.clear();
                     inputs.clear();

@@ -1,16 +1,14 @@
-use std::num::NonZeroU32;
-
 use wgpu::naga::{
-    AddressSpace, Arena, ArraySize, BinaryOperator, Binding, Block, BuiltIn, EntryPoint,
-    Expression, Function, FunctionArgument, GlobalVariable, Handle, Literal, LocalVariable,
-    MathFunction, Module, Range as NagaRange, ResourceBinding, Scalar, ScalarKind, ShaderStage,
-    Span, Statement, StorageAccess, Type, TypeInner,
+    AddressSpace, Arena, BinaryOperator, Binding, Block, BuiltIn, EntryPoint, Expression, Function,
+    FunctionArgument, GlobalVariable, Handle, Literal, LocalVariable, MathFunction, Module,
+    Range as NagaRange, ResourceBinding, Scalar, ScalarKind, ShaderStage, Span, Statement,
+    StorageAccess, Type, TypeInner,
 };
 
 use crate::{
     Layout,
     mir::{
-        direct_kernel::{DirectKernel, DirectKernelBinding},
+        direct_kernel::{DirectKernel, DirectKernelBinding, direct_storage_array_size},
         inputs::MirValue,
         operation::Operation,
         workgroup_shape::WorkgroupShape,
@@ -166,7 +164,7 @@ impl<'a> ReduceDirectBuilder<'a> {
                 name: Some(format!("ReduceBuffer{binding}")),
                 inner: TypeInner::Array {
                     base,
-                    size: ArraySize::Constant(NonZeroU32::new(layout_allocation_len(layout)?)?),
+                    size: direct_storage_array_size(layout_allocation_len(layout)?),
                     stride: tensor.datatype().element_size() as u32,
                 },
             },

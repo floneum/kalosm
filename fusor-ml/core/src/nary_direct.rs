@@ -1,16 +1,14 @@
-use std::num::NonZeroU32;
-
 use wgpu::naga::{
-    AddressSpace, Arena, ArraySize, BinaryOperator, Binding, Block, BuiltIn, EntryPoint,
-    Expression, Function, FunctionArgument, GlobalVariable, Handle, Literal, MathFunction, Module,
-    Range as NagaRange, ResourceBinding, Scalar, ScalarKind, ShaderStage, Span, Statement,
-    StorageAccess, Type, TypeInner, UnaryOperator,
+    AddressSpace, Arena, BinaryOperator, Binding, Block, BuiltIn, EntryPoint, Expression, Function,
+    FunctionArgument, GlobalVariable, Handle, Literal, MathFunction, Module, Range as NagaRange,
+    ResourceBinding, Scalar, ScalarKind, ShaderStage, Span, Statement, StorageAccess, Type,
+    TypeInner, UnaryOperator,
 };
 
 use crate::{
     TILE_SIZE,
     mir::{
-        direct_kernel::{DirectKernel, DirectKernelBinding},
+        direct_kernel::{DirectKernel, DirectKernelBinding, direct_storage_array_size},
         inputs::MirValue,
         operation::Operation,
         workgroup_shape::WorkgroupShape,
@@ -185,7 +183,7 @@ impl<'a> NaryDirectBuilder<'a> {
                             DataTypeEnum::F16 => f16_ty?,
                             DataTypeEnum::U32 => u32_ty,
                         },
-                        size: ArraySize::Constant(NonZeroU32::new(allocation_len)?),
+                        size: direct_storage_array_size(allocation_len),
                         stride: tensor.datatype().element_size() as u32,
                     },
                 },

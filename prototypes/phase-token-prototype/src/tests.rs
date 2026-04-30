@@ -882,6 +882,22 @@ fn qmatmul_gemv_lowers_all_supported_ggml_formats() {
 }
 
 #[test]
+fn qmatmul_qgemv_lowers_split_output_grid() {
+    let format = GgmlQuantFormat::Q5_0;
+    let n = format.qgemv_cols_per_workgroup() * 65_536;
+    let ir = build(|mut phase| {
+        let a = phase.storage_tensor_read::<F32>(Shape::new([1, format.block_elements()]));
+        let b = phase.quantized_matrix(format, format.block_elements(), n);
+        let y = phase.storage_tensor::<F32>(Shape::new([1, n]));
+        phase.qmatmul_with_tile_plan_options_and_workgroup_x(&a, &b, &y, 1, 1, 1, 4, true, 65_535);
+        phase.finish()
+    });
+
+    ir.lower_to_naga()
+        .unwrap_or_else(|error| panic!("split-grid qgemv lowering failed: {error}"));
+}
+
+#[test]
 fn qdequantize_lowers_large_embedding_table() {
     let k = 3584;
     let n = 152064;

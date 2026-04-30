@@ -20,7 +20,6 @@ const MEASURED_BATCHES: usize = 10;
 const DISPATCHES_PER_BATCH: usize = 200;
 const TIMESTAMP_QUERIES_PER_BATCH: usize = DISPATCHES_PER_BATCH * 2;
 const USE_PER_DISPATCH_TIMESTAMPS: bool = false;
-const USE_MSL_PASSTHROUGH: bool = false;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     pollster::block_on(run())
@@ -185,9 +184,6 @@ impl Harness {
         let has_timestamp_inside_encoders = adapter
             .features()
             .contains(wgpu::Features::TIMESTAMP_QUERY_INSIDE_ENCODERS);
-        let has_passthrough = adapter
-            .features()
-            .contains(wgpu::Features::PASSTHROUGH_SHADERS);
         if !has_cooperative_matrix {
             return Err(format!(
                 "adapter {} does not expose EXPERIMENTAL_COOPERATIVE_MATRIX; properties: {:?}",
@@ -216,13 +212,6 @@ impl Harness {
             )
             .into());
         }
-        if USE_MSL_PASSTHROUGH && !has_passthrough {
-            return Err(format!(
-                "adapter {} does not expose PASSTHROUGH_SHADERS, required by this benchmark's raw MSL compiler path",
-                adapter_info.name
-            )
-            .into());
-        }
         let mut required_features = wgpu::Features::EXPERIMENTAL_COOPERATIVE_MATRIX;
         required_features |= wgpu::Features::TIMESTAMP_QUERY;
         if USE_PER_DISPATCH_TIMESTAMPS && has_timestamp_inside_passes {
@@ -230,9 +219,6 @@ impl Harness {
         }
         if USE_PER_DISPATCH_TIMESTAMPS && has_timestamp_inside_encoders {
             required_features |= wgpu::Features::TIMESTAMP_QUERY_INSIDE_ENCODERS;
-        }
-        if USE_MSL_PASSTHROUGH {
-            required_features |= wgpu::Features::PASSTHROUGH_SHADERS;
         }
         if needs_subgroups {
             required_features |= wgpu::Features::SUBGROUP;
@@ -282,29 +268,14 @@ impl Harness {
         });
         let timestamp_period_ns = queue.get_timestamp_period() as f64;
 
-        let (shader, entry_point) = if USE_MSL_PASSTHROUGH {
-            let workgroup_size = lowered.module().entry_points[0].workgroup_size;
-            let (msl, entry_point) = matmul_msl(&lowered)?;
-            let shader = unsafe {
-                device.create_shader_module_passthrough(wgpu::ShaderModuleDescriptorPassthrough {
-                    label: Some("lowered matmul msl"),
-                    num_workgroups: (workgroup_size[0], workgroup_size[1], workgroup_size[2]),
-                    msl: Some(Cow::Owned(msl)),
-                    ..Default::default()
-                })
-            };
-            (shader, entry_point)
-        } else {
-            let shader = unsafe {
-                device.create_shader_module_trusted(
-                    wgpu::ShaderModuleDescriptor {
-                        label: Some("lowered matmul"),
-                        source: wgpu::ShaderSource::Naga(Cow::Owned(lowered.module().clone())),
-                    },
-                    wgpu::ShaderRuntimeChecks::unchecked(),
-                )
-            };
-            (shader, "main".to_string())
+        let shader = unsafe {
+            device.create_shader_module_trusted(
+                wgpu::ShaderModuleDescriptor {
+                    label: Some("lowered matmul"),
+                    source: wgpu::ShaderSource::Naga(Cow::Owned(lowered.module().clone())),
+                },
+                wgpu::ShaderRuntimeChecks::unchecked(),
+            )
         };
         let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("matmul buffers"),
@@ -319,7 +290,7 @@ impl Harness {
             label: Some("matmul pipeline"),
             layout: Some(&pipeline_layout),
             module: &shader,
-            entry_point: Some(&entry_point),
+            entry_point: Some("main"),
             compilation_options: wgpu::PipelineCompilationOptions {
                 zero_initialize_workgroup_memory: false,
                 ..Default::default()
@@ -588,65 +559,6 @@ fn matmul_ir(tile: TileShape) -> KernelIr {
             },
         )
     })
-}
-
-fn matmul_msl(
-    lowered: &phase_token_prototype::NagaKernel,
-) -> Result<(String, String), Box<dyn std::error::Error>> {
-    let mut resources = naga::back::msl::BindingMap::default();
-    for binding in 0..3 {
-        resources.insert(
-            naga::ResourceBinding { group: 0, binding },
-            naga::back::msl::BindTarget {
-                buffer: Some(binding as u8),
-                ..Default::default()
-            },
-        );
-    }
-
-    let mut options = naga::back::msl::Options::default();
-    options.lang_version = (2, 3);
-    options.zero_initialize_workgroup_memory = false;
-    options.force_loop_bounding = false;
-    options.bounds_check_policies = naga::proc::BoundsCheckPolicies {
-        index: naga::proc::BoundsCheckPolicy::Unchecked,
-        buffer: naga::proc::BoundsCheckPolicy::Unchecked,
-        image_load: naga::proc::BoundsCheckPolicy::Unchecked,
-        binding_array: naga::proc::BoundsCheckPolicy::Unchecked,
-    };
-    options.per_entry_point_map = naga::back::msl::EntryPointResourceMap::from([(
-        "main".to_string(),
-        naga::back::msl::EntryPointResources {
-            resources,
-            ..Default::default()
-        },
-    )]);
-
-    let pipeline_options = naga::back::msl::PipelineOptions {
-        entry_point: Some((naga::ShaderStage::Compute, "main".into())),
-        allow_and_force_point_size: false,
-        vertex_pulling_transform: false,
-        vertex_buffer_mappings: Vec::new(),
-    };
-    let (mut msl, info) = naga::back::msl::write_string(
-        lowered.module(),
-        lowered.info(),
-        &options,
-        &pipeline_options,
-    )?;
-    msl = msl.replace(
-        "metal::simdgroup_float8x8 NagaCooperativeLoad",
-        "static inline metal::simdgroup_float8x8 NagaCooperativeLoad",
-    );
-    msl = msl.replace(
-        "metal::simdgroup_float8x8 NagaCooperativeMultiplyAdd",
-        "static inline metal::simdgroup_float8x8 NagaCooperativeMultiplyAdd",
-    );
-    let entry_point = info.entry_point_names[0]
-        .as_ref()
-        .map_err(|error| format!("MSL entry point translation failed: {error}"))?
-        .clone();
-    Ok((msl, entry_point))
 }
 
 fn parse_tile_shape() -> Result<TileShape, Box<dyn std::error::Error>> {

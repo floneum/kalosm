@@ -479,20 +479,7 @@ fn qgemm_tile_shape(format: GgmlQuantFormat) -> TilePlan {
 }
 
 fn qgemv_cols_per_workgroup(format: GgmlQuantFormat) -> usize {
-    match format {
-        GgmlQuantFormat::Q2K
-        | GgmlQuantFormat::Q3K
-        | GgmlQuantFormat::Q4K
-        | GgmlQuantFormat::Q5K
-        | GgmlQuantFormat::Q6K
-        | GgmlQuantFormat::Q8K => 16,
-        GgmlQuantFormat::Q4_0
-        | GgmlQuantFormat::Q4_1
-        | GgmlQuantFormat::Q5_0
-        | GgmlQuantFormat::Q5_1
-        | GgmlQuantFormat::Q8_0
-        | GgmlQuantFormat::Q8_1 => 32,
-    }
+    format.qgemv_cols_per_workgroup() as usize
 }
 
 fn pack_ones(format: GgmlQuantFormat, rows: usize, cols: usize) -> Vec<u32> {

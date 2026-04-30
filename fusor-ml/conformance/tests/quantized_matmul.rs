@@ -80,6 +80,15 @@ fn qmatrix_from_raw_bytes(
     QMatrix::from_raw_bytes(device, weight_shape, raw_bytes, ty).unwrap()
 }
 
+fn require_gpu_conformance() -> bool {
+    std::env::var("FUSOR_CONFORMANCE_REQUIRE_GPU")
+        .map(|value| {
+            let value = value.trim();
+            !value.is_empty() && value != "0" && !value.eq_ignore_ascii_case("false")
+        })
+        .unwrap_or(false)
+}
+
 fn q_mat_mul_input_fuzz(
     input_row_count: usize,
     weight_shape: [usize; 2],
@@ -578,6 +587,49 @@ quantized_q_mat_mul_test!(
     q8_0_single_row_wide_output_fixture,
     826
 );
+
+#[tokio::test]
+async fn q5_0_q_mat_mul_single_row_splits_large_qgemv_dispatch() {
+    use fusor_conformance::available_devices;
+
+    const Q5_0_QGEMV_COLS_PER_WORKGROUP: usize = 8;
+    let mut exercised = false;
+
+    for device in available_devices().await {
+        let Some(gpu) = device.as_gpu() else {
+            continue;
+        };
+        if !gpu.subgroups_supported() {
+            continue;
+        }
+        exercised = true;
+
+        let output_cols = gpu.limits().max_compute_workgroups_per_dimension as usize
+            * Q5_0_QGEMV_COLS_PER_WORKGROUP
+            + 1;
+        let weight_shape = [output_cols, BlockQ5_0::BLOCK_SIZE];
+        let raw_bytes =
+            vec![0u8; block_count(weight_shape, BlockQ5_0::BLOCK_SIZE) * size_of::<BlockQ5_0>()];
+        let input_values = vec![0.25f32; weight_shape[1]];
+        let weights = qmatrix_from_raw_bytes(&device, weight_shape, &raw_bytes, GgmlType::Q5_0);
+        let input: Tensor<2, f32> =
+            Tensor::from_slice(&device, [1, weight_shape[1]], &input_values);
+
+        let result = input.q_mat_mul(&weights).as_slice().await.unwrap();
+
+        assert_eq!(result.shape(), &[1, output_cols]);
+        assert!(
+            result.as_slice().iter().all(|value| *value == 0.0),
+            "zero Q5_0 weights should produce zero qgemv output"
+        );
+    }
+
+    assert!(
+        exercised || !require_gpu_conformance(),
+        "large qgemv dispatch regression requires a subgroup-capable GPU"
+    );
+}
+
 quantized_q_mat_mul_test!(
     q4k_q_mat_mul_multi_row_matches_cpu_reference,
     q4k_wide_fixture,

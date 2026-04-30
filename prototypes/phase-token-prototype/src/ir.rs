@@ -559,6 +559,31 @@ impl GgmlQuantFormat {
             Self::Q8K => 73,
         }
     }
+
+    /// Single-row qmatmul tile shape, seeded from ggml's Metal kernels and
+    /// tuned for the generated wgpu/Metal code path.
+    pub const fn qgemv_cols_per_subgroup(self) -> u32 {
+        match self {
+            Self::Q2K => 4,
+            Self::Q4_0 | Self::Q4_1 | Self::Q5_1 => 4,
+            Self::Q5_0 => 4,
+            Self::Q3K | Self::Q4K | Self::Q8K => 2,
+            Self::Q6K => 1,
+            Self::Q8_0 | Self::Q8_1 => 8,
+            Self::Q5K => 1,
+        }
+    }
+
+    pub const fn qgemv_subgroups_per_workgroup(self) -> u32 {
+        match self {
+            Self::Q4K | Self::Q8_0 | Self::Q8_1 => 4,
+            _ => 2,
+        }
+    }
+
+    pub const fn qgemv_cols_per_workgroup(self) -> u32 {
+        self.qgemv_subgroups_per_workgroup() * self.qgemv_cols_per_subgroup()
+    }
 }
 
 /// A packed quantized storage matrix.
@@ -583,6 +608,7 @@ pub struct QMatMulOp {
     pub tile_k: u32,
     pub vector_width: u32,
     pub use_qgemv: bool,
+    pub workgroups_x: u32,
 }
 
 /// Dense dequantization of a packed GGML quantized matrix.

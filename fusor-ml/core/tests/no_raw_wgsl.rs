@@ -27,6 +27,7 @@ fn workspace_sources_do_not_contain_legacy_raw_shader_text() {
     for source_root in source_roots {
         rust_sources(&source_root, &mut sources);
     }
+    sources.push(workspace_root.join("prototypes/phase-token-prototype/Cargo.toml"));
     let forbidden = [
         (
             ["ShaderSource::", "W", "g", "s", "l"].concat(),
@@ -50,6 +51,66 @@ fn workspace_sources_do_not_contain_legacy_raw_shader_text() {
         ),
         (
             ["W", "G", "S", "L"].concat(),
+            "still mentions raw shader text generation",
+        ),
+        (
+            [
+                "P", "A", "S", "S", "T", "H", "R", "O", "U", "G", "H", "_", "S", "H", "A", "D",
+                "E", "R", "S",
+            ]
+            .concat(),
+            "still requests raw shader passthrough",
+        ),
+        (
+            [
+                "ShaderModuleDescriptor",
+                "P",
+                "a",
+                "s",
+                "s",
+                "t",
+                "h",
+                "r",
+                "o",
+                "u",
+                "g",
+                "h",
+            ]
+            .concat(),
+            "still submits raw shader text directly to wgpu",
+        ),
+        (
+            [
+                "create_shader_module_",
+                "p",
+                "a",
+                "s",
+                "s",
+                "t",
+                "h",
+                "r",
+                "o",
+                "u",
+                "g",
+                "h",
+            ]
+            .concat(),
+            "still submits raw shader text directly to wgpu",
+        ),
+        (
+            ["naga::back::", "m", "s", "l"].concat(),
+            "still lowers through the raw shader-text backend",
+        ),
+        (
+            ["m", "s", "l", "-out"].concat(),
+            "still enables raw shader text output",
+        ),
+        (
+            ["M", "S", "L"].concat(),
+            "still mentions raw shader text generation",
+        ),
+        (
+            ["m", "s", "l"].concat(),
             "still mentions raw shader text generation",
         ),
     ];

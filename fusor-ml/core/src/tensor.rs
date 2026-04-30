@@ -864,15 +864,17 @@ impl<D: DataType, const R: usize> Tensor<R, D> {
 
     #[track_caller]
     pub fn materialize(&self) -> impl Future<Output = ()> + 'static {
-        #[allow(unused)]
-        let (data, _) = self.data.materialize();
+        let data = self.data.clone();
+        let device = self.device().clone();
         #[cfg(feature = "extra_assertions")]
         let caller = std::panic::Location::caller();
-        let (sender, receiver) = futures_channel::oneshot::channel();
-        self.device().wgpu_queue().on_submitted_work_done(|| {
-            _ = sender.send(());
-        });
         async move {
+            #[allow(unused)]
+            let (data, _) = data.materialize();
+            let (sender, receiver) = futures_channel::oneshot::channel();
+            device.wgpu_queue().on_submitted_work_done(|| {
+                _ = sender.send(());
+            });
             let _ = receiver.await;
             #[cfg(feature = "extra_assertions")]
             {

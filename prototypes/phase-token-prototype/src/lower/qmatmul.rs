@@ -271,30 +271,21 @@ impl<'a> Lowerer<'a> {
         k_size: u32,
         n: u32,
     ) -> Result<Statement, LowerError> {
-        const VALUES_PER_LANE: u32 = 8;
-
-        let output_cols_per_subgroup = match op.b.format {
-            GgmlQuantFormat::Q2K
-            | GgmlQuantFormat::Q3K
-            | GgmlQuantFormat::Q4K
-            | GgmlQuantFormat::Q5K
-            | GgmlQuantFormat::Q6K
-            | GgmlQuantFormat::Q8K => 2,
-            GgmlQuantFormat::Q4_0
-            | GgmlQuantFormat::Q4_1
-            | GgmlQuantFormat::Q5_0
-            | GgmlQuantFormat::Q5_1
-            | GgmlQuantFormat::Q8_0
-            | GgmlQuantFormat::Q8_1 => 4,
-        };
+        let output_cols_per_subgroup = op.b.format.qgemv_cols_per_subgroup();
+        let q5_0_packed = op.b.format == GgmlQuantFormat::Q5_0;
+        let values_per_lane = if q5_0_packed { 16 } else { 8 };
 
         let mut body = Block::new();
         let wg = expressions.append(
             Expression::FunctionArgument(WORKGROUP_ID_ARG),
             Span::default(),
         );
-        let n_group = expressions.append(
+        let wg_x = expressions.append(
             Expression::AccessIndex { base: wg, index: 0 },
+            Span::default(),
+        );
+        let wg_y = expressions.append(
+            Expression::AccessIndex { base: wg, index: 1 },
             Span::default(),
         );
         let subgroup_id = expressions.append(
@@ -314,6 +305,15 @@ impl<'a> Lowerer<'a> {
             Span::default(),
         );
         let mut emits = Vec::new();
+        let wg_y_offset =
+            self.mul_literal_u32_emitted(expressions, wg_y, op.workgroups_x, &mut emits);
+        let n_group = self.bin(
+            expressions,
+            &mut emits,
+            BinaryOperator::Add,
+            wg_x,
+            wg_y_offset,
+        );
         let cols_per_workgroup = self.mul_literal_u32_emitted(
             expressions,
             num_subgroups,
@@ -342,6 +342,8 @@ impl<'a> Lowerer<'a> {
         );
         Self::push_emits(&mut body, emits);
 
+        let full_q5_0_tile = op.b.format == GgmlQuantFormat::Q5_0
+            && n.is_multiple_of(op.b.format.qgemv_cols_per_workgroup());
         let mut cols = Vec::with_capacity(output_cols_per_subgroup as usize);
         let mut col_in_bounds = Vec::with_capacity(output_cols_per_subgroup as usize);
         for offset in 0..output_cols_per_subgroup {
@@ -356,7 +358,8 @@ impl<'a> Lowerer<'a> {
                     Span::default(),
                 );
             }
-            let in_bounds = self.bin_lit_u32(expressions, &mut body, BinaryOperator::Less, col, n);
+            let in_bounds = (!full_q5_0_tile)
+                .then(|| self.bin_lit_u32(expressions, &mut body, BinaryOperator::Less, col, n));
             cols.push(col);
             col_in_bounds.push(in_bounds);
         }
@@ -377,12 +380,28 @@ impl<'a> Lowerer<'a> {
         }
         let k_ptr = expressions.append(Expression::LocalVariable(scratch.mma_k), Span::default());
         let mut initial_k_emits = Vec::new();
-        let initial_k = self.mul_literal_u32_emitted(
-            expressions,
-            subgroup_lane,
-            VALUES_PER_LANE,
-            &mut initial_k_emits,
-        );
+        let initial_k = if q5_0_packed {
+            let block_lane = self.shr_lit(expressions, &mut initial_k_emits, subgroup_lane, 1);
+            let block_start =
+                self.mul_literal_u32_emitted(expressions, block_lane, 32, &mut initial_k_emits);
+            let half_lane = self.and_lit(expressions, &mut initial_k_emits, subgroup_lane, 1);
+            let half_start =
+                self.mul_literal_u32_emitted(expressions, half_lane, 8, &mut initial_k_emits);
+            self.bin(
+                expressions,
+                &mut initial_k_emits,
+                BinaryOperator::Add,
+                block_start,
+                half_start,
+            )
+        } else {
+            self.mul_literal_u32_emitted(
+                expressions,
+                subgroup_lane,
+                values_per_lane,
+                &mut initial_k_emits,
+            )
+        };
         Self::push_emits(&mut body, initial_k_emits);
         body.push(
             Statement::Store {
@@ -412,13 +431,23 @@ impl<'a> Lowerer<'a> {
         );
 
         let row_zero = self.u32(expressions, 0);
-        let mut a_vecs = Vec::with_capacity(2);
-        for chunk in 0..2 {
+        let mut a_scalars = Vec::with_capacity(values_per_lane as usize);
+        let mut a_vecs = Vec::with_capacity((values_per_lane / 4) as usize);
+        for chunk in 0..(values_per_lane / 4) {
             let mut a_values = Vec::with_capacity(4);
             for lane in 0..4 {
                 let mut a_emits = Vec::new();
-                let a_k =
-                    self.add_literal_u32_emitted(expressions, k, chunk * 4 + lane, &mut a_emits);
+                let offset = if q5_0_packed {
+                    let linear = chunk * 4 + lane;
+                    if linear < 8 {
+                        linear
+                    } else {
+                        linear + 8
+                    }
+                } else {
+                    chunk * 4 + lane
+                };
+                let a_k = self.add_literal_u32_emitted(expressions, k, offset, &mut a_emits);
                 let (a_index, a_index_emits) =
                     self.storage_index_from_coords(expressions, &op.a, &[row_zero, a_k])?;
                 let (a_ptr, a_ptr_emits) =
@@ -431,6 +460,7 @@ impl<'a> Lowerer<'a> {
                     Statement::Emit(Self::single_expression_range(expressions, a)),
                     Span::default(),
                 );
+                a_scalars.push(a);
                 a_values.push(a);
             }
             let a_vec = expressions.append(
@@ -446,6 +476,48 @@ impl<'a> Lowerer<'a> {
             );
             a_vecs.push(a_vec);
         }
+        let a_sum = if matches!(op.b.format, GgmlQuantFormat::Q4K | GgmlQuantFormat::Q5_0) {
+            let one = self.f32(expressions, 1.0);
+            let mut sum_emits = Vec::new();
+            let ones = self.splat4(expressions, &mut sum_emits, one);
+            Self::push_emits(&mut loop_body, sum_emits);
+            let mut sums = Vec::with_capacity(a_vecs.len());
+            for a_vec in a_vecs.iter().copied() {
+                let sum = expressions.append(
+                    Expression::Math {
+                        fun: MathFunction::Dot,
+                        arg: a_vec,
+                        arg1: Some(ones),
+                        arg2: None,
+                        arg3: None,
+                    },
+                    Span::default(),
+                );
+                loop_body.push(
+                    Statement::Emit(Self::single_expression_range(expressions, sum)),
+                    Span::default(),
+                );
+                sums.push(sum);
+            }
+            let mut sum = sums[0];
+            for next in sums.into_iter().skip(1) {
+                sum = expressions.append(
+                    Expression::Binary {
+                        op: BinaryOperator::Add,
+                        left: sum,
+                        right: next,
+                    },
+                    Span::default(),
+                );
+                loop_body.push(
+                    Statement::Emit(Self::single_expression_range(expressions, sum)),
+                    Span::default(),
+                );
+            }
+            Some(sum)
+        } else {
+            None
+        };
 
         for ((col, in_bounds), sum_local) in cols
             .iter()
@@ -454,45 +526,114 @@ impl<'a> Lowerer<'a> {
             .zip(sum_locals.iter().copied())
         {
             let mut fma_body = Block::new();
-            let (b_values, b_emits) = self.dequantize_qvalues8(expressions, &op.b, k, col)?;
-            Self::push_emits(&mut fma_body, b_emits);
-            let mut dots = Vec::with_capacity(2);
-            for (chunk, a_vec) in a_vecs.iter().copied().enumerate() {
-                let b_vec = expressions.append(
-                    Expression::Compose {
-                        ty: self.f32_vec4_ty,
-                        components: b_values[(chunk * 4)..(chunk * 4 + 4)].to_vec(),
-                    },
-                    Span::default(),
-                );
-                let dot = expressions.append(
-                    Expression::Math {
-                        fun: MathFunction::Dot,
-                        arg: a_vec,
-                        arg1: Some(b_vec),
-                        arg2: None,
-                        arg3: None,
-                    },
-                    Span::default(),
-                );
-                fma_body.push(
-                    Statement::Emit(Self::range_from(expressions, b_vec, dot)),
-                    Span::default(),
-                );
-                dots.push(dot);
-            }
-            let dot = expressions.append(
-                Expression::Binary {
-                    op: BinaryOperator::Add,
-                    left: dots[0],
-                    right: dots[1],
-                },
-                Span::default(),
-            );
-            fma_body.push(
-                Statement::Emit(Self::single_expression_range(expressions, dot)),
-                Span::default(),
-            );
+            let dot = if q5_0_packed {
+                let a_sum = a_sum.ok_or(LowerError::UnsupportedOperation(
+                    "q5_0 packed qgemv requires activation sum",
+                ))?;
+                let (dot, dot_emits) =
+                    self.q5_0_qgemv_packed_dot(expressions, &op.b, k, col, &a_scalars, a_sum)?;
+                Self::push_emits(&mut fma_body, dot_emits);
+                dot
+            } else {
+                let (b_values, b_scale, b_min, b_emits) = if op.b.format == GgmlQuantFormat::Q8_0 {
+                    let (scale, values, emits) =
+                        self.dequantize_q8_0_qgemv_values8(expressions, &op.b, k, col)?;
+                    (values, Some(scale), None, emits)
+                } else if op.b.format == GgmlQuantFormat::Q4K {
+                    let (scale, min, values, emits) =
+                        self.dequantize_q4k_qgemv_quant8(expressions, &op.b, k, col)?;
+                    (values, Some(scale), Some(min), emits)
+                } else {
+                    let (values, emits) = self.dequantize_qvalues8(expressions, &op.b, k, col)?;
+                    (values, None, None, emits)
+                };
+                Self::push_emits(&mut fma_body, b_emits);
+                let mut dots = Vec::with_capacity(a_vecs.len());
+                for (chunk, a_vec) in a_vecs.iter().copied().enumerate() {
+                    let b_vec = expressions.append(
+                        Expression::Compose {
+                            ty: self.f32_vec4_ty,
+                            components: b_values[(chunk * 4)..(chunk * 4 + 4)].to_vec(),
+                        },
+                        Span::default(),
+                    );
+                    let dot = expressions.append(
+                        Expression::Math {
+                            fun: MathFunction::Dot,
+                            arg: a_vec,
+                            arg1: Some(b_vec),
+                            arg2: None,
+                            arg3: None,
+                        },
+                        Span::default(),
+                    );
+                    fma_body.push(
+                        Statement::Emit(Self::range_from(expressions, b_vec, dot)),
+                        Span::default(),
+                    );
+                    dots.push(dot);
+                }
+                let mut dot = dots[0];
+                let mut dot_emit_start = None;
+                for next in dots.iter().copied().skip(1) {
+                    dot = expressions.append(
+                        Expression::Binary {
+                            op: BinaryOperator::Add,
+                            left: dot,
+                            right: next,
+                        },
+                        Span::default(),
+                    );
+                    dot_emit_start.get_or_insert(dot);
+                }
+                if let Some(scale) = b_scale {
+                    dot = expressions.append(
+                        Expression::Binary {
+                            op: BinaryOperator::Multiply,
+                            left: dot,
+                            right: scale,
+                        },
+                        Span::default(),
+                    );
+                    let start = dot_emit_start.unwrap_or(dot);
+                    if let Some(min) = b_min {
+                        let a_sum = a_sum.ok_or(LowerError::UnsupportedOperation(
+                            "affine qgemv correction requires activation sum",
+                        ))?;
+                        let correction = expressions.append(
+                            Expression::Binary {
+                                op: BinaryOperator::Multiply,
+                                left: a_sum,
+                                right: min,
+                            },
+                            Span::default(),
+                        );
+                        dot = expressions.append(
+                            Expression::Binary {
+                                op: BinaryOperator::Subtract,
+                                left: dot,
+                                right: correction,
+                            },
+                            Span::default(),
+                        );
+                    }
+                    fma_body.push(
+                        Statement::Emit(Self::range_from(expressions, start, dot)),
+                        Span::default(),
+                    );
+                } else if let Some(start) = dot_emit_start {
+                    fma_body.push(
+                        Statement::Emit(Self::range_from(expressions, start, dot)),
+                        Span::default(),
+                    );
+                } else {
+                    fma_body.push(
+                        Statement::Emit(Self::single_expression_range(expressions, dot)),
+                        Span::default(),
+                    );
+                }
+                dot
+            };
             let sum_ptr = expressions.append(Expression::LocalVariable(sum_local), Span::default());
             let sum = expressions.append(Expression::Load { pointer: sum_ptr }, Span::default());
             let value = expressions.append(
@@ -514,14 +655,18 @@ impl<'a> Lowerer<'a> {
                 },
                 Span::default(),
             );
-            loop_body.push(
-                Statement::If {
-                    condition: in_bounds,
-                    accept: fma_body,
-                    reject: Block::new(),
-                },
-                Span::default(),
-            );
+            if let Some(in_bounds) = in_bounds {
+                loop_body.push(
+                    Statement::If {
+                        condition: in_bounds,
+                        accept: fma_body,
+                        reject: Block::new(),
+                    },
+                    Span::default(),
+                );
+            } else {
+                loop_body.push(Statement::Block(fma_body), Span::default());
+            }
         }
 
         body.push(
@@ -531,7 +676,7 @@ impl<'a> Lowerer<'a> {
                     expressions,
                     scratch.mma_k,
                     subgroup_size,
-                    VALUES_PER_LANE,
+                    values_per_lane,
                 ),
                 break_if: None,
             },
@@ -565,18 +710,23 @@ impl<'a> Lowerer<'a> {
                 },
                 Span::default(),
             );
-            let should_store = expressions.append(
-                Expression::Binary {
-                    op: BinaryOperator::LogicalAnd,
-                    left: in_bounds,
-                    right: lane_is_first,
-                },
-                Span::default(),
-            );
-            body.push(
-                Statement::Emit(Self::single_expression_range(expressions, should_store)),
-                Span::default(),
-            );
+            let should_store = if let Some(in_bounds) = in_bounds {
+                let should_store = expressions.append(
+                    Expression::Binary {
+                        op: BinaryOperator::LogicalAnd,
+                        left: in_bounds,
+                        right: lane_is_first,
+                    },
+                    Span::default(),
+                );
+                body.push(
+                    Statement::Emit(Self::single_expression_range(expressions, should_store)),
+                    Span::default(),
+                );
+                should_store
+            } else {
+                lane_is_first
+            };
             let row_zero = self.u32(expressions, 0);
             let (y_index, y_emits) =
                 self.storage_index_from_coords(expressions, &op.y, &[row_zero, col])?;
@@ -2143,6 +2293,271 @@ impl<'a> Lowerer<'a> {
             GgmlQuantFormat::Q8K => self.dequant_q8kx8(expressions, matrix, base, q, &mut emits)?,
         };
         Ok((values, emits))
+    }
+
+    fn dequantize_q8_0_qgemv_values8(
+        &self,
+        expressions: &mut Arena<Expression>,
+        matrix: &QuantizedMatrix,
+        k_base: Handle<Expression>,
+        col: Handle<Expression>,
+    ) -> Result<
+        (
+            Handle<Expression>,
+            Vec<Handle<Expression>>,
+            Vec<Range<Expression>>,
+        ),
+        LowerError,
+    > {
+        let mut emits = Vec::new();
+        let block_elems = matrix.format.block_elements();
+        let block_words = matrix.format.block_words();
+        let block = self.div_literal_u32_emitted(expressions, k_base, block_elems, &mut emits);
+        let q = self.and_lit(expressions, &mut emits, k_base, block_elems - 1);
+        let col_block =
+            self.mul_literal_u32_emitted(expressions, col, matrix.rows / block_elems, &mut emits);
+        let block_index = self.bin(
+            expressions,
+            &mut emits,
+            BinaryOperator::Add,
+            col_block,
+            block,
+        );
+        let base = self.mul_literal_u32_emitted(expressions, block_index, block_words, &mut emits);
+        let scale_word = self.load_word(expressions, matrix, base, 0, &mut emits)?;
+        let scale = self.bitcast_f32(expressions, &mut emits, scale_word);
+        let q_word = self.shr_lit(expressions, &mut emits, q, 2);
+        let word_off = self.add_lit(expressions, &mut emits, q_word, 1);
+        let word0 = self.load_word_dynamic(expressions, matrix, base, word_off, &mut emits)?;
+        let word1_off = self.add_lit(expressions, &mut emits, word_off, 1);
+        let word1 = self.load_word_dynamic(expressions, matrix, base, word1_off, &mut emits)?;
+        let mut values = Vec::with_capacity(8);
+        for word in [word0, word1] {
+            let signed = self.unpack4x_i8(expressions, &mut emits, word);
+            let signed = self.as_f32(expressions, &mut emits, signed);
+            values.extend(
+                (0..4).map(|lane| self.vec4_component(expressions, &mut emits, signed, lane)),
+            );
+        }
+        Ok((scale, values, emits))
+    }
+
+    fn dequantize_q4k_qgemv_quant8(
+        &self,
+        e: &mut Arena<Expression>,
+        matrix: &QuantizedMatrix,
+        k_base: Handle<Expression>,
+        col: Handle<Expression>,
+    ) -> Result<
+        (
+            Handle<Expression>,
+            Handle<Expression>,
+            Vec<Handle<Expression>>,
+            Vec<Range<Expression>>,
+        ),
+        LowerError,
+    > {
+        let mut emits = Vec::new();
+        let block_elems = matrix.format.block_elements();
+        let block_words = matrix.format.block_words();
+        let block = self.div_literal_u32_emitted(e, k_base, block_elems, &mut emits);
+        let q = self.and_lit(e, &mut emits, k_base, block_elems - 1);
+        let col_block = self.mul_literal_u32_emitted(e, col, matrix.rows / block_elems, &mut emits);
+        let block_index = self.bin(e, &mut emits, BinaryOperator::Add, col_block, block);
+        let base = self.mul_literal_u32_emitted(e, block_index, block_words, &mut emits);
+
+        let d_word = self.load_word(e, matrix, base, 0, &mut emits)?;
+        let d = self.bitcast_f32(e, &mut emits, d_word);
+        let dmin_word = self.load_word(e, matrix, base, 1, &mut emits)?;
+        let dmin = self.bitcast_f32(e, &mut emits, dmin_word);
+        let group = self.shr_lit(e, &mut emits, q, 5);
+        let (scale_byte, min_byte) = self.k_scale_pair(e, matrix, base, group, &mut emits)?;
+        let scale_f = self.as_f32(e, &mut emits, scale_byte);
+        let scale = self.mul(e, &mut emits, scale_f, d);
+        let min_f = self.as_f32(e, &mut emits, min_byte);
+        let min = self.mul(e, &mut emits, min_f, dmin);
+
+        let in_group = self.and_lit(e, &mut emits, q, 31);
+        let group_pair = self.shr_lit(e, &mut emits, group, 1);
+        let group_pair_offset = self.shl_lit(e, &mut emits, group_pair, 5);
+        let byte_index = self.bin(
+            e,
+            &mut emits,
+            BinaryOperator::Add,
+            group_pair_offset,
+            in_group,
+        );
+        let data_word = self.shr_lit(e, &mut emits, byte_index, 2);
+        let data_off = self.add_lit(e, &mut emits, data_word, 5);
+        let word0 = self.load_word_dynamic(e, matrix, base, data_off, &mut emits)?;
+        let word1_off = self.add_lit(e, &mut emits, data_off, 1);
+        let word1 = self.load_word_dynamic(e, matrix, base, word1_off, &mut emits)?;
+
+        let group_low = self.and_lit(e, &mut emits, group, 1);
+        let high = self.cmp_lit(e, &mut emits, BinaryOperator::NotEqual, group_low, 0);
+
+        let mut values = Vec::with_capacity(8);
+        for word in [word0, word1] {
+            let bytes = self.unpack4x_u8(e, &mut emits, word);
+            let shift = self.u32(e, 4);
+            let shift = self.splat4(e, &mut emits, shift);
+            let byte_hi = self.shr(e, &mut emits, bytes, shift);
+            let mask = self.u32(e, 0x0f);
+            let mask = self.splat4(e, &mut emits, mask);
+            let byte_lo = self.bin(e, &mut emits, BinaryOperator::And, bytes, mask);
+            let quant = self.select(e, &mut emits, high, byte_hi, byte_lo);
+            let quant_f = self.as_f32(e, &mut emits, quant);
+            values.extend((0..4).map(|lane| self.vec4_component(e, &mut emits, quant_f, lane)));
+        }
+        Ok((scale, min, values, emits))
+    }
+
+    fn q5_0_qgemv_packed_dot(
+        &self,
+        e: &mut Arena<Expression>,
+        matrix: &QuantizedMatrix,
+        k_base: Handle<Expression>,
+        col: Handle<Expression>,
+        a_values: &[Handle<Expression>],
+        a_sum: Handle<Expression>,
+    ) -> Result<(Handle<Expression>, Vec<Range<Expression>>), LowerError> {
+        if a_values.len() != 16 {
+            return Err(LowerError::UnsupportedOperation(
+                "q5_0 packed qgemv expects sixteen activation values",
+            ));
+        }
+
+        let mut emits = Vec::new();
+        let block_elems = matrix.format.block_elements();
+        let block_words = matrix.format.block_words();
+        let block = self.div_literal_u32_emitted(e, k_base, block_elems, &mut emits);
+        let q = self.and_lit(e, &mut emits, k_base, block_elems - 1);
+        let col_block = self.mul_literal_u32_emitted(e, col, matrix.rows / block_elems, &mut emits);
+        let block_index = self.bin(e, &mut emits, BinaryOperator::Add, col_block, block);
+        let base = self.mul_literal_u32_emitted(e, block_index, block_words, &mut emits);
+
+        let scale_word = self.load_word(e, matrix, base, 0, &mut emits)?;
+        let scale = self.bitcast_f32(e, &mut emits, scale_word);
+        let qh = self.load_word(e, matrix, base, 1, &mut emits)?;
+        let q_local = self.and_lit(e, &mut emits, q, 15);
+        let q_word = self.shr_lit(e, &mut emits, q_local, 2);
+        let word_off = self.add_lit(e, &mut emits, q_word, 2);
+        let word0 = self.load_word_dynamic(e, matrix, base, word_off, &mut emits)?;
+        let word1_off = self.add_lit(e, &mut emits, word_off, 1);
+        let word1 = self.load_word_dynamic(e, matrix, base, word1_off, &mut emits)?;
+
+        let mut acc = self.f32(e, 0.0);
+        for (pair_index, (word, upper_halfword)) in
+            [(word0, false), (word0, true), (word1, false), (word1, true)]
+                .into_iter()
+                .enumerate()
+        {
+            let pair = if upper_halfword {
+                self.shr_lit(e, &mut emits, word, 16)
+            } else {
+                self.and_lit(e, &mut emits, word, 0xffff)
+            };
+            let i = (pair_index as u32) * 2;
+            acc = self.q5_0_accumulate_packed_term(
+                e,
+                &mut emits,
+                acc,
+                a_values[i as usize],
+                1.0,
+                pair,
+                0x000f,
+                qh,
+                q,
+                i,
+                4,
+                0x00010,
+            );
+            acc = self.q5_0_accumulate_packed_term(
+                e,
+                &mut emits,
+                acc,
+                a_values[i as usize + 1],
+                1.0 / 256.0,
+                pair,
+                0x0f00,
+                qh,
+                q,
+                i + 1,
+                12,
+                0x01000,
+            );
+            acc = self.q5_0_accumulate_packed_term(
+                e,
+                &mut emits,
+                acc,
+                a_values[i as usize + 8],
+                1.0 / 16.0,
+                pair,
+                0x00f0,
+                qh,
+                q,
+                i + 16,
+                8,
+                0x00100,
+            );
+            acc = self.q5_0_accumulate_packed_term(
+                e,
+                &mut emits,
+                acc,
+                a_values[i as usize + 9],
+                1.0 / 4096.0,
+                pair,
+                0xf000,
+                qh,
+                q,
+                i + 17,
+                16,
+                0x10000,
+            );
+        }
+
+        let center = self.f32(e, -16.0);
+        let centered_sum = self.mul(e, &mut emits, a_sum, center);
+        let dot = self.bin(e, &mut emits, BinaryOperator::Add, acc, centered_sum);
+        let dot = self.mul(e, &mut emits, dot, scale);
+        Ok((dot, emits))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn q5_0_accumulate_packed_term(
+        &self,
+        e: &mut Arena<Expression>,
+        emits: &mut Vec<Range<Expression>>,
+        acc: Handle<Expression>,
+        a: Handle<Expression>,
+        a_scale: f32,
+        low_pair: Handle<Expression>,
+        low_mask: u32,
+        qh: Handle<Expression>,
+        q: Handle<Expression>,
+        qh_bit_offset: u32,
+        qh_shift_left: u32,
+        high_mask: u32,
+    ) -> Handle<Expression> {
+        let low = self.and_lit(e, emits, low_pair, low_mask);
+        let bit_index = if qh_bit_offset == 0 {
+            q
+        } else {
+            self.add_lit(e, emits, q, qh_bit_offset)
+        };
+        let high = self.shr(e, emits, qh, bit_index);
+        let high = self.shl_lit(e, emits, high, qh_shift_left);
+        let high = self.and_lit(e, emits, high, high_mask);
+        let quant = self.bin(e, emits, BinaryOperator::InclusiveOr, low, high);
+        let quant = self.as_f32(e, emits, quant);
+        let a = if a_scale == 1.0 {
+            a
+        } else {
+            let scale = self.f32(e, a_scale);
+            self.mul(e, emits, a, scale)
+        };
+        let product = self.mul(e, emits, a, quant);
+        self.bin(e, emits, BinaryOperator::Add, acc, product)
     }
 
     fn dequantize_qvalues16(

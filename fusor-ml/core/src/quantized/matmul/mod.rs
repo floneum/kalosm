@@ -80,27 +80,22 @@ fn ceil_div_u32(x: u32, divisor: u32) -> u32 {
     x.div_ceil(divisor)
 }
 
-fn qgemv_cols_per_subgroup(format: tile_ir::GgmlQuantFormat) -> u32 {
-    match format {
-        tile_ir::GgmlQuantFormat::Q2K
-        | tile_ir::GgmlQuantFormat::Q3K
-        | tile_ir::GgmlQuantFormat::Q4K
-        | tile_ir::GgmlQuantFormat::Q5K
-        | tile_ir::GgmlQuantFormat::Q6K
-        | tile_ir::GgmlQuantFormat::Q8K => 2,
-        tile_ir::GgmlQuantFormat::Q4_0
-        | tile_ir::GgmlQuantFormat::Q4_1
-        | tile_ir::GgmlQuantFormat::Q5_0
-        | tile_ir::GgmlQuantFormat::Q5_1
-        | tile_ir::GgmlQuantFormat::Q8_0
-        | tile_ir::GgmlQuantFormat::Q8_1 => 4,
-    }
+fn qgemv_cols_per_workgroup(format: tile_ir::GgmlQuantFormat, _max_subgroup_size: u32) -> u32 {
+    format.qgemv_cols_per_workgroup()
 }
 
-fn qgemv_cols_per_workgroup(format: tile_ir::GgmlQuantFormat, max_subgroup_size: u32) -> u32 {
-    let subgroup_size = max_subgroup_size.clamp(1, 256);
-    let num_subgroups = (256 / subgroup_size).max(1);
-    num_subgroups * qgemv_cols_per_subgroup(format)
+fn split_workgroups_2d(
+    total_workgroups: u32,
+    max_workgroups_per_dimension: u32,
+) -> Option<[u32; 2]> {
+    if total_workgroups == 0 {
+        return Some([1, 1]);
+    }
+
+    let max_workgroups_per_dimension = max_workgroups_per_dimension.max(1);
+    let x = total_workgroups.min(max_workgroups_per_dimension);
+    let y = ceil_div_u32(total_workgroups, x);
+    (y <= max_workgroups_per_dimension).then_some([x, y])
 }
 
 impl<const R: usize> Tensor<R, f32> {
@@ -122,7 +117,11 @@ impl Operation for QMatMulOperation {
     ) -> crate::mir::workgroup_shape::WorkgroupShapeConstraints {
         let mut constraints = WorkgroupShapeConstraints::new();
         if self.m_size() == 1 && device.subgroups_supported() {
-            constraints.add_constraint(0, Constraint::Equals(256));
+            let invocations = self
+                .direct_quant_format()
+                .map(|format| format.qgemv_subgroups_per_workgroup() * 32)
+                .unwrap_or(256);
+            constraints.add_constraint(0, Constraint::Equals(invocations));
             constraints.add_constraint(1, Constraint::Equals(1));
         } else {
             constraints.add_constraint(0, Constraint::Equals(16));
@@ -207,24 +206,31 @@ impl Operation for QMatMulOperation {
             return None;
         }
 
+        let mut qmatmul_workgroups_x = 1;
         let dispatch_size = if m == 1 {
             if graph.device().subgroups_supported() {
-                [
-                    ceil_div_u32(
-                        n,
-                        qgemv_cols_per_workgroup(format, graph.device().max_subgroup_size()),
-                    ),
-                    1,
-                    1,
-                ]
+                let logical_workgroups = ceil_div_u32(
+                    n,
+                    qgemv_cols_per_workgroup(format, graph.device().max_subgroup_size()),
+                );
+                let [dispatch_x, dispatch_y] = split_workgroups_2d(
+                    logical_workgroups,
+                    graph.device().limits().max_compute_workgroups_per_dimension,
+                )?;
+                qmatmul_workgroups_x = dispatch_x;
+                [dispatch_x, dispatch_y, 1]
             } else {
-                [ceil_div_u32(n, 256), 1, 1]
+                let dispatch_x = ceil_div_u32(n, 256);
+                if dispatch_x > graph.device().limits().max_compute_workgroups_per_dimension {
+                    return None;
+                }
+                [dispatch_x, 1, 1]
             }
         } else {
             [ceil_div_u32(n, 64), ceil_div_u32(m, 32), 1]
         };
         let cache_key = format!(
-            "{}:direct:{format:?}:m={m}:k={k}:n={n}:{:?}:{:?}",
+            "{}:direct:{format:?}:m={m}:k={k}:n={n}:dispatch={dispatch_size:?}:{:?}:{:?}",
             self.name(),
             input.layout(),
             output.layout()
@@ -238,7 +244,17 @@ impl Operation for QMatMulOperation {
                     let b = phase.quantized_matrix(format, k, n);
                     let y = storage_tensor_with_direct_layout(&mut phase, y_view);
                     if m == 1 && graph.device().subgroups_supported() {
-                        phase.qmatmul(&a, &b, &y);
+                        phase.qmatmul_with_tile_plan_options_and_workgroup_x(
+                            &a,
+                            &b,
+                            &y,
+                            1,
+                            1,
+                            1,
+                            4,
+                            true,
+                            qmatmul_workgroups_x,
+                        );
                     } else if m == 1 {
                         phase.qmatmul_with_tile_plan_options(&a, &b, &y, 1, 1, 1, 4, false);
                     } else {
@@ -466,6 +482,35 @@ mod tests {
         assert_eq!(result.shape(), &[1, 2]);
         assert!((result[[0, 0]] - 30.0).abs() < 1e-4);
         assert!((result[[0, 1]] - 70.0).abs() < 1e-4);
+    }
+
+    #[tokio::test]
+    async fn q5_0_qgemv_matches_expected_values() {
+        let Ok(device) = Device::new().await else {
+            return;
+        };
+
+        fn q5_0_block(scale: f32, high_bits: [u8; 4], low_bits: u8) -> Vec<u8> {
+            let mut bytes = Vec::with_capacity(22);
+            bytes.extend_from_slice(&half::f16::from_f32(scale).to_bits().to_le_bytes());
+            bytes.extend_from_slice(&high_bits);
+            bytes.extend(std::iter::repeat_n(low_bits, 16));
+            bytes
+        }
+
+        let mut raw_bytes = Vec::new();
+        raw_bytes.extend(q5_0_block(1.0, [0xff; 4], 0x11));
+        raw_bytes.extend(q5_0_block(1.0, [0x00; 4], 0xff));
+        let matrix =
+            QMatrix::from_parts(&device, &raw_bytes, Box::new([2, 32]), GgmlType::Q5_0).unwrap();
+        let input_rows = vec![(1..=32).map(|value| value as f32).collect::<Vec<_>>()];
+        let input: Tensor<2, f32> = Tensor::new(&device, &input_rows);
+
+        let result = input.q_mat_mul(&matrix).as_slice().await.unwrap();
+
+        assert_eq!(result.shape(), &[1, 2]);
+        assert!((result[[0, 0]] - 528.0).abs() < 1e-3);
+        assert!((result[[0, 1]] + 528.0).abs() < 1e-3);
     }
 
     #[tokio::test]
