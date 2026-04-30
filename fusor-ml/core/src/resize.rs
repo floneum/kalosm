@@ -1,14 +1,14 @@
-use std::fmt::Write;
-
 use crate::{
     DataTypeEnum, Layout, SmallerRank, TILE_SIZE, Tensor, TensorData,
     compute_graph::NodeIndex,
     map_layout::MapLayoutOperation,
     mir::{
-        kernel::GenericKernel,
+        direct_kernel::DirectKernel,
+        inputs::MirValue,
         operation::Operation,
-        workgroup_shape::{Constraint, WorkgroupShapeConstraints},
+        workgroup_shape::{Constraint, WorkgroupShape, WorkgroupShapeConstraints},
     },
+    nary_wise::{NaryExpr, NaryOp, NaryOperation, NaryScalar},
     visit_tiled::distribute_workgroups,
 };
 
@@ -102,45 +102,10 @@ impl ResizeOperation {
         }))
     }
 
-    fn kernel(
-        &self,
-        input_rank: u32,
-        datatype: DataTypeEnum,
-        tile_size: u32,
-        kernel: &mut GenericKernel,
-    ) {
-        let global_id = kernel.global_id();
-        let input = kernel.add_tensor_input(input_rank, true, datatype);
-        let output = kernel.add_tensor_input(self.new_shape.len() as u32, true, datatype);
-
-        for local_index in 0..tile_size {
-            writeln!(kernel, "{{").unwrap();
-            for (prefix, tensor) in [("input", &input), ("output", &output)] {
-                writeln!(
-                    kernel,
-                    "var {prefix}_remaining_index = {global_id}.x * {tile_size} + {local_index};"
-                )
-                .unwrap();
-                for i in (0..tensor.rank()).rev() {
-                    let shape_i = tensor.shape_binding(i);
-                    writeln!(
-                        kernel,
-                        "let {prefix}_index_{i} = {prefix}_remaining_index % {shape_i};",
-                    )
-                    .unwrap();
-                    writeln!(kernel, "{prefix}_remaining_index /= {shape_i};",).unwrap();
-                }
-            }
-            write!(kernel, "let input_index = ").unwrap();
-            input.strided_index(kernel, (0..).map(|i| format!("input_index_{i}")));
-            writeln!(kernel, ";").unwrap();
-            write!(kernel, "let output_index = ").unwrap();
-            output.strided_index(kernel, (0..).map(|i| format!("output_index_{i}")));
-            writeln!(kernel, ";").unwrap();
-            writeln!(kernel, "{output}[output_index] = {input}[input_index];").unwrap();
-
-            writeln!(kernel, "}}").unwrap();
-        }
+    fn copy_expression(&self) -> Option<NaryExpr> {
+        let flat = row_major_flat_expr(&self.fill_shape)?;
+        let input_indices = row_major_indices_from_flat(flat, &self.current_shape)?;
+        Some(NaryExpr::indexed_input(0, input_indices))
     }
 }
 
@@ -182,17 +147,30 @@ impl Operation for ResizeOperation {
         vec![input.into(), output_sliced.into()]
     }
 
-    fn build_kernel(
+    fn build_direct_kernel(
         &self,
-        _: &crate::compute_graph::ComputeGraphInner,
-        _: &crate::mir::workgroup_shape::WorkgroupShape,
-        inputs: &[crate::mir::inputs::MirValue],
-        kernel: &mut GenericKernel,
-    ) {
-        let input = inputs[0].as_tensor().unwrap();
-        let rank = input.layout().rank() as u32;
-        let datatype = input.datatype();
-        self.kernel(rank, datatype, TILE_SIZE, kernel);
+        graph: &crate::compute_graph::ComputeGraphInner,
+        workgroup_shape: &WorkgroupShape,
+        inputs: &[MirValue],
+    ) -> Option<DirectKernel> {
+        let input = inputs[0].as_tensor()?;
+        let operation = NaryOperation {
+            inputs: vec![self.input],
+            expression: self.copy_expression()?,
+            shape: self.fill_shape.clone(),
+            output_datatype: input.datatype(),
+        };
+        crate::nary_direct::build_nary_direct_kernel_to_output(
+            &operation,
+            graph,
+            workgroup_shape,
+            inputs,
+            1,
+        )
+    }
+
+    fn requires_single_kernel_batch(&self) -> bool {
+        true
     }
 
     fn output(
@@ -225,6 +203,73 @@ impl Operation for ResizeOperation {
                 .join("x")
         )
     }
+
+    fn output_layout(
+        &self,
+        map: &rustc_hash::FxHashMap<NodeIndex, crate::TensorLayoutInfo>,
+    ) -> crate::TensorLayoutInfo {
+        let input_layout = map.get(&self.input).unwrap();
+        crate::TensorLayoutInfo::new(
+            crate::Layout::contiguous(&self.new_shape),
+            input_layout.datatype(),
+        )
+    }
+}
+
+fn row_major_flat_expr(shape: &[usize]) -> Option<NaryExpr> {
+    let mut flat = NaryExpr::scalar(NaryScalar::U32(0));
+    for axis in 0..shape.len() {
+        let stride = shape[axis + 1..]
+            .iter()
+            .try_fold(1u32, |acc, dim| acc.checked_mul((*dim).try_into().ok()?))?;
+        let dim = NaryExpr::DimIndex(axis);
+        let term = if stride == 1 {
+            dim
+        } else {
+            NaryExpr::unary_op(
+                dim,
+                "mul_const",
+                NaryOp::MulConst(NaryScalar::U32(stride)),
+                DataTypeEnum::U32,
+                DataTypeEnum::U32,
+            )
+        };
+        flat = NaryExpr::add(flat, term, DataTypeEnum::U32);
+    }
+    Some(flat)
+}
+
+fn row_major_indices_from_flat(flat: NaryExpr, shape: &[usize]) -> Option<Vec<NaryExpr>> {
+    let mut indices = Vec::with_capacity(shape.len());
+    for axis in 0..shape.len() {
+        let divisor = shape[axis + 1..]
+            .iter()
+            .try_fold(1u32, |acc, dim| acc.checked_mul((*dim).try_into().ok()?))?;
+        let dim = u32::try_from(shape[axis]).ok()?;
+        let quotient = if divisor == 1 {
+            flat.clone()
+        } else {
+            NaryExpr::unary_op(
+                flat.clone(),
+                "div_const",
+                NaryOp::DivConst(NaryScalar::U32(divisor)),
+                DataTypeEnum::U32,
+                DataTypeEnum::U32,
+            )
+        };
+        indices.push(if dim == 1 {
+            NaryExpr::scalar(NaryScalar::U32(0))
+        } else {
+            NaryExpr::unary_op(
+                quotient,
+                "rem_const",
+                NaryOp::RemConst(NaryScalar::U32(dim)),
+                DataTypeEnum::U32,
+                DataTypeEnum::U32,
+            )
+        });
+    }
+    Some(indices)
 }
 
 impl<const R: usize, T: crate::DataType> Tensor<R, T> {

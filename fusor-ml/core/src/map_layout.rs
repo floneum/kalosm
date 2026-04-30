@@ -87,17 +87,28 @@ impl Operation for MapLayoutOperation {
         self.map_tensor(input).into()
     }
 
-    fn build_kernel(
+    fn build_direct_kernel(
         &self,
         _: &crate::compute_graph::ComputeGraphInner,
         _: &crate::mir::workgroup_shape::WorkgroupShape,
         _: &[crate::mir::inputs::MirValue],
-        _: &mut crate::mir::kernel::GenericKernel,
-    ) {
+    ) -> Option<crate::mir::direct_kernel::DirectKernel> {
+        None
     }
 
     fn name(&self) -> String {
         "map_layout".to_string()
+    }
+
+    fn output_layout(
+        &self,
+        map: &rustc_hash::FxHashMap<NodeIndex, crate::TensorLayoutInfo>,
+    ) -> crate::TensorLayoutInfo {
+        let input_layout = map.get(&self.input).unwrap();
+        crate::TensorLayoutInfo::new(
+            self.map_layout(input_layout.layout()),
+            input_layout.datatype(),
+        )
     }
 }
 

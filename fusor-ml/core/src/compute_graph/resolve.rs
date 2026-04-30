@@ -1,5 +1,4 @@
 use std::collections::VecDeque;
-use std::fmt::Write;
 use std::sync::Arc;
 
 use petgraph::algo::toposort;
@@ -9,8 +8,7 @@ use wgpu::CommandEncoder;
 
 use crate::{
     mir::{
-        inputs::{KernelInputValue, MirValue},
-        kernel::GenericKernel,
+        inputs::MirValue,
         operation::Operation,
         workgroup_shape::{WorkgroupShape, WorkgroupShapeConstraints},
     },
@@ -32,7 +30,6 @@ pub(crate) struct ResolverResult {
 struct FlushBatch<'a> {
     queued_operations: &'a [(NodeIndex, Arc<dyn Operation>)],
     inputs: &'a [Vec<MirValue>],
-    all_input_values: &'a [KernelInputValue],
     workgroup_shape: WorkgroupShape,
 }
 
@@ -82,7 +79,7 @@ impl Resolver {
     pub(crate) fn run(
         &mut self,
         graph: &mut ComputeGraphInner,
-        removed: &mut Vec<ComputeGraphNode>,
+        _removed: &mut Vec<ComputeGraphNode>,
     ) -> ResolverResult {
         let device = graph.device();
         let max_subgroup_size = device.max_subgroup_size();
@@ -141,10 +138,8 @@ impl Resolver {
 
         // Find runs of compatible dispatch shapes
         let mut current_constraints = WorkgroupShapeConstraints::new();
-        let mut pending_operations = Vec::new();
+        let mut pending_operations: Vec<(NodeIndex, Arc<dyn Operation>)> = Vec::new();
         let mut inputs = Vec::new();
-        let mut all_input_values = Vec::new();
-        let mut kernel = GenericKernel::new();
         let mut total_kernels = 0;
         for (node, operation) in queued_operations {
             let new_inputs = operation.inputs(graph);
@@ -158,6 +153,10 @@ impl Resolver {
             });
             let mut extend = self.should_extend_kernel(new_inputs.clone(), &inputs);
             extend &= new_merged.solve(max_subgroup_size).is_some();
+            extend &= !operation.requires_single_kernel_batch();
+            extend &= !pending_operations
+                .iter()
+                .any(|(_, op)| op.requires_single_kernel_batch());
             if extend {
                 current_constraints = new_merged;
             } else {
@@ -165,14 +164,11 @@ impl Resolver {
                     total_kernels += 1;
                     Self::flush_operations(
                         graph,
-                        &mut kernel,
                         FlushBatch {
                             queued_operations: &pending_operations,
                             inputs: &inputs,
-                            all_input_values: &all_input_values,
                             workgroup_shape: old_best,
                         },
-                        removed,
                         &mut command_encoder,
                     );
                     // After flushing, free intermediate cached results whose
@@ -193,9 +189,7 @@ impl Resolver {
                         },
                     );
                     pending_operations.clear();
-                    all_input_values.clear();
                     inputs.clear();
-                    kernel.clear();
                 }
                 current_constraints = constraint;
             }
@@ -227,11 +221,9 @@ impl Resolver {
                 self.push_operation(
                     graph,
                     new_inputs,
-                    &mut kernel,
                     node,
                     operation,
                     &mut inputs,
-                    &mut all_input_values,
                     &mut pending_operations,
                 );
             };
@@ -246,14 +238,11 @@ impl Resolver {
             total_kernels += 1;
             Self::flush_operations(
                 graph,
-                &mut kernel,
                 FlushBatch {
                     queued_operations: &pending_operations,
                     inputs: &inputs,
-                    all_input_values: &all_input_values,
                     workgroup_shape: old_best,
                 },
-                removed,
                 &mut command_encoder,
             );
             Self::release_dead_intermediates(
@@ -421,8 +410,7 @@ impl Resolver {
             // 2. Try to fuse resulting nary into specialized ops (reduce, matmul, etc.)
             let changed = self.try_fuse_naries(graph, node_idx)
                 || self.try_fuse_into_reduce(graph, node_idx)
-                || self.try_fuse_into_matmul(graph, node_idx)
-                || self.try_fuse_into_dequantize(graph, node_idx);
+                || self.try_fuse_into_matmul(graph, node_idx);
 
             if changed {
                 // Re-add the current node to worklist if it still exists
@@ -635,6 +623,7 @@ impl Resolver {
                     .collect(),
             },
             NaryExpr::DimIndex(dim) => NaryExpr::DimIndex(*dim),
+            NaryExpr::Scalar(value) => NaryExpr::Scalar(*value),
         }
     }
 
@@ -746,6 +735,7 @@ impl Resolver {
                 }
             }
             NaryExpr::DimIndex(dim) => (NaryExpr::DimIndex(*dim), true),
+            NaryExpr::Scalar(value) => (NaryExpr::Scalar(*value), true),
         }
     }
 
@@ -790,6 +780,7 @@ impl Resolver {
                 }
             }
             NaryExpr::DimIndex(_) => {}
+            NaryExpr::Scalar(_) => {}
         }
     }
 
@@ -810,6 +801,7 @@ impl Resolver {
                     .collect(),
             },
             NaryExpr::DimIndex(dim) => NaryExpr::DimIndex(*dim),
+            NaryExpr::Scalar(value) => NaryExpr::Scalar(*value),
         }
     }
 
@@ -976,71 +968,20 @@ impl Resolver {
         false
     }
 
-    fn try_fuse_into_dequantize(
-        &mut self,
-        graph: &mut ComputeGraphInner,
-        node_idx: ExecutionNodeIndex,
-    ) -> bool {
-        let node_variant = self.execution_graph[node_idx].variant.clone();
-        let Some(el_op) = Self::try_get_unary_chain(&node_variant) else {
-            return false;
-        };
-
-        let input_inner = el_op.value;
-        if self.check_cached(graph, input_inner) {
-            return false;
-        }
-
-        let Some(input_exec_idx) = self.get_input_node_in_exec_graph(input_inner) else {
-            return false;
-        };
-
-        let input_variant = self.execution_graph[input_exec_idx].variant.clone();
-        let ComputeGraphNodeVariant::Dequantize(deq_op) = input_variant else {
-            return false;
-        };
-
-        let mut new_deq = deq_op.clone();
-        let mut existing_post = new_deq.post_dequantize.functions.clone();
-        existing_post.extend(el_op.functions.functions.iter().cloned());
-        new_deq.post_dequantize = UnaryFunctionChain::new(existing_post, deq_op.datatype);
-
-        self.execution_graph[node_idx].variant = ComputeGraphNodeVariant::Dequantize(new_deq);
-
-        if let Some(edge) = self.execution_graph.find_edge(input_exec_idx, node_idx) {
-            self.execution_graph.remove_edge(edge);
-        }
-        self.remove_node_if_dead(input_exec_idx);
-        true
-    }
-
     fn should_extend_kernel(&mut self, _: Vec<MirValue>, _: &[Vec<MirValue>]) -> bool {
-        // TODO: Restore with better testing. This passes all tests in fusor, but breaks rbert and rwhisper
+        // Direct Naga kernels are currently emitted one operation at a time.
         false
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn push_operation(
         &mut self,
         graph: &mut ComputeGraphInner,
         new_inputs: Vec<MirValue>,
-        kernel: &mut GenericKernel,
         key: NodeIndex,
         operation: Arc<dyn Operation>,
         inputs: &mut Vec<Vec<MirValue>>,
-        all_input_values: &mut Vec<KernelInputValue>,
         queued_operations: &mut Vec<(NodeIndex, Arc<dyn Operation>)>,
     ) {
-        for input in &new_inputs {
-            input.visit_input_values(|value| {
-                if let Some(index) = all_input_values.iter().position(|x| *x == value) {
-                    kernel.pre_register_binding(index as _);
-                } else {
-                    kernel.pre_register_binding(all_input_values.len() as _);
-                    all_input_values.push(value.clone());
-                }
-            });
-        }
         let result = operation.output(graph, &new_inputs);
         let MirValue::Tensor(resolved) = result else {
             panic!("Kernel input value is not a tensor");
@@ -1053,54 +994,28 @@ impl Resolver {
 
     fn flush_operations(
         graph: &mut ComputeGraphInner,
-        mut kernel: &mut GenericKernel,
         batch: FlushBatch<'_>,
-        removed: &mut Vec<ComputeGraphNode>,
         command_encoder: &mut CommandEncoder,
     ) {
         let FlushBatch {
             queued_operations,
             inputs: batched_inputs,
-            all_input_values,
             workgroup_shape,
         } = batch;
-        let mut max_dispatch_size = [0; 3];
-        for ((key, operation), inputs) in queued_operations.iter().zip(batched_inputs) {
-            // Map layout isn't really a kernel. Skip it
-            if let Some(node) = graph.nodes.nodes.node_weight(*key)
-                && matches!(node.variant, ComputeGraphNodeVariant::MapLayout(_))
-            {
-                continue;
-            }
-
-            let dispatch_size = operation.dispatch_size(&workgroup_shape, inputs);
-            for (new, max) in dispatch_size.iter().zip(max_dispatch_size.iter_mut()) {
-                *max = (*max).max(*new);
-            }
-            writeln!(&mut kernel, "{{").unwrap();
-            operation.build_kernel(graph, &workgroup_shape, inputs, kernel);
-            let name = kernel.name_mut();
-            if !name.is_empty() {
-                *name += "->";
-            }
-            *name += &operation.name();
-            writeln!(&mut kernel, "}}").unwrap();
-            // Check if that makes any of this node's dependencies dead
-            let mut dependencies = Vec::new();
-            graph.visit_dependencies(*key, &mut |dependent_key| {
-                dependencies.push(dependent_key);
-            });
-            for dependency in dependencies {
-                graph.check_life(dependency, removed);
-            }
+        if let [(_key, operation)] = queued_operations
+            && let [inputs] = batched_inputs
+            && let Some(direct_kernel) =
+                operation.build_direct_kernel(graph, &workgroup_shape, inputs)
+        {
+            direct_kernel.run(&graph.device(), command_encoder);
+            return;
         }
-        kernel.set_workgroup_size(workgroup_shape);
-        let device = graph.device();
-        kernel.run(
-            &device,
-            all_input_values,
-            command_encoder,
-            max_dispatch_size,
-        );
+
+        let names = queued_operations
+            .iter()
+            .map(|(_, operation)| operation.name())
+            .collect::<Vec<_>>()
+            .join(" -> ");
+        panic!("operation batch did not provide a direct kernel: {names}");
     }
 }

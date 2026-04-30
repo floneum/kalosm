@@ -30,10 +30,10 @@ impl<const R: usize, T: crate::DataType> Tensor<R, T> {
             inputs: vec![self.key(), indexes.key()],
             expression: NaryExpr::index_select(R, dimension),
             shape: output_shape.clone(),
-            output_datatype: T::WGSL_TYPE,
+            output_datatype: T::DATA_TYPE,
         };
         let device = self.device().clone();
-        let info = crate::tensor::TensorInfo::new(output_shape, T::WGSL_TYPE);
+        let info = crate::tensor::TensorInfo::new(output_shape, T::DATA_TYPE);
         let key = device.compute_graph().create_nary(nary);
         Self::from_parts(crate::tensor::LazyTensorData::from_parts(device, info, key))
     }

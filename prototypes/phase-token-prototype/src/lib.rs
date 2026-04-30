@@ -150,14 +150,16 @@ mod lower;
 
 pub use api::{
     build, Clean, KernelBuilder, KernelDone, Numeric, Pending, Pending2, PendingTile,
-    PendingTilePair, Phase, ReadyTile, RegTile, StorageTensor, Synced, UninitTile, F32,
+    PendingTilePair, Phase, ReadyTile, RegTile, StorageTensor, Synced, UninitTile, F32, U32,
 };
 pub use ir::{
     BarrierOp, BarrierScope, Block, BufferAccess, BufferDecl, BufferId, BufferRef,
-    CooperativeLoadOp, Dim, DynamicOffset, ElementType, FillTileOp, FillValue, GemmOp, GemmTiling,
-    GemvOp, KernelIr, Layout, LoopKind, LoopOffset, LoopOp, MemoryLevel, MmaBackend, MmaOp, Op,
-    PartitionBinding, PartitionOp, Shape, StorageView, StoreTileOp, Strides, TileDecl, TileId,
-    TileLevel, TileOrigin, TileRef, ViewMapping, WorkgroupAxis, WorkgroupOffset,
+    CooperativeLoadOp, Dim, DynamicOffset, ElementType, FillTileOp, FillValue, FlattenedMatrixMap,
+    GemmOp, GemmTiling, GemvOp, GgmlQuantFormat, Im2ColNhwcMap, KernelIr, Layout, LoopKind,
+    LoopOffset, LoopOp, MemoryLevel, MmaBackend, MmaOp, Op, PartitionBinding, PartitionOp,
+    QDequantizeOp, QMatMulOp, QuantizedMatrix, Shape, StorageIndexMap, StorageView, StoreTileOp,
+    Strides, TileDecl, TileId, TileLevel, TileOrigin, TileRef, ViewMapping, WorkgroupAxis,
+    WorkgroupOffset,
 };
 pub use lower::{LowerError, NagaKernel};
 

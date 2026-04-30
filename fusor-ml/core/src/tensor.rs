@@ -41,7 +41,7 @@ pub trait DataType:
     + Sync
     + 'static
 {
-    const WGSL_TYPE: DataTypeEnum;
+    const DATA_TYPE: DataTypeEnum;
 
     fn zero() -> Self;
     fn one() -> Self;
@@ -54,7 +54,7 @@ pub trait FloatDataType: DataType {
 }
 
 impl DataType for f32 {
-    const WGSL_TYPE: DataTypeEnum = DataTypeEnum::F32;
+    const DATA_TYPE: DataTypeEnum = DataTypeEnum::F32;
 
     fn zero() -> Self {
         0.
@@ -76,7 +76,7 @@ impl FloatDataType for f32 {
 }
 
 impl DataType for half::f16 {
-    const WGSL_TYPE: DataTypeEnum = DataTypeEnum::F16;
+    const DATA_TYPE: DataTypeEnum = DataTypeEnum::F16;
 
     fn zero() -> Self {
         half::f16::from_f32(0.)
@@ -98,7 +98,7 @@ impl FloatDataType for half::f16 {
 }
 
 impl DataType for u32 {
-    const WGSL_TYPE: DataTypeEnum = DataTypeEnum::U32;
+    const DATA_TYPE: DataTypeEnum = DataTypeEnum::U32;
 
     fn zero() -> Self {
         0
@@ -429,7 +429,7 @@ impl TensorData {
     }
 
     pub(crate) fn new_splat<D: DataType>(device: &Device, shape: &[usize], data: D) -> Self {
-        let datatype = D::WGSL_TYPE;
+        let datatype = D::DATA_TYPE;
         let raw_data = bytemuck::bytes_of(&data);
         let unpadded_size = raw_data.len();
         let size = padded_tensor_size(unpadded_size as u64) as usize;
@@ -483,7 +483,7 @@ impl TensorData {
             }
         }
 
-        Self::new_from_buffer(device, buffer, shape, D::WGSL_TYPE)
+        Self::new_from_buffer(device, buffer, shape, D::DATA_TYPE)
     }
 
     pub fn slice(&self, ranges: &[Range<usize>]) -> Self {
@@ -797,7 +797,7 @@ impl<D: DataType, const R: usize> Tensor<R, D> {
     }
 
     pub(crate) fn from_parts(data: LazyTensorData) -> Self {
-        debug_assert_eq!(D::WGSL_TYPE, data.info.datatype());
+        debug_assert_eq!(D::DATA_TYPE, data.info.datatype());
         Self {
             data,
             datatype: PhantomData,
@@ -877,13 +877,13 @@ impl<D: DataType, const R: usize> Tensor<R, D> {
             #[cfg(feature = "extra_assertions")]
             {
                 let mut contains_non_finite = false;
-                if D::WGSL_TYPE == DataTypeEnum::F32 {
+                if D::DATA_TYPE == DataTypeEnum::F32 {
                     let data: TensorSlice<R, f32, MappedBuffer> =
                         Tensor::as_slice_from_tensor_data(&data).await.unwrap();
                     data.visit_items(|item| {
                         contains_non_finite |= !item.is_finite();
                     });
-                } else if D::WGSL_TYPE == DataTypeEnum::F16 {
+                } else if D::DATA_TYPE == DataTypeEnum::F16 {
                     let data: TensorSlice<R, half::f16, MappedBuffer> =
                         Tensor::as_slice_from_tensor_data(&data).await.unwrap();
                     data.visit_items(|item| {
@@ -948,15 +948,23 @@ impl<D: DataType, const R: usize> Tensor<R, D> {
     }
 
     pub(crate) fn binary_nary(&self, other: &Self, function: NaryFunction) -> Self {
-        // If the two tensors are the same, we can lower this to a cheaper unary operation
+        // Keep one storage input while preserving the binary expression.
         if self.data.key == other.data.key {
-            let unary = NaryFunction::unary(
-                function.name.clone(),
-                format!("let a = input;\nlet b = input;\n{}", function.operation),
-                function.input_types[0],
-                function.output_type,
-            );
-            return self.unary_nary(unary);
+            let device = self.device().clone();
+            let mut info = self.data.info.clone();
+            info.datatype = function.output_type;
+            let rank = self.shape().len();
+            let nary = NaryOperation {
+                inputs: vec![self.data.key],
+                expression: NaryExpr::Op {
+                    children: vec![NaryExpr::input(0, rank), NaryExpr::input(0, rank)],
+                    function,
+                },
+                shape: self.shape().as_slice().into(),
+                output_datatype: info.datatype,
+            };
+            let key = device.compute_graph().create_nary(nary);
+            return Self::from_parts(LazyTensorData::from_parts(device, info, key));
         }
 
         assert_eq!(self.shape(), other.shape());

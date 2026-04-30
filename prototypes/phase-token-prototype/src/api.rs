@@ -3,8 +3,9 @@ use std::marker::PhantomData;
 
 use crate::{
     BarrierOp, BarrierScope, Block, BufferAccess, BufferDecl, BufferRef, CooperativeLoadOp, Dim,
-    DynamicOffset, ElementType, FillTileOp, FillValue, GemvOp, KernelIr, Layout, LoopKind, LoopOp,
-    MemoryLevel, MmaBackend, MmaOp, Op, PartitionBinding, PartitionOp, Shape, StorageView,
+    DynamicOffset, ElementType, FillTileOp, FillValue, GemvOp, GgmlQuantFormat, Im2ColNhwcMap,
+    KernelIr, Layout, LoopKind, LoopOp, MemoryLevel, MmaBackend, MmaOp, Op, PartitionBinding,
+    PartitionOp, QDequantizeOp, QMatMulOp, QuantizedMatrix, Shape, StorageIndexMap, StorageView,
     StoreTileOp, TileDecl, TileLevel, TileOrigin, TileRef, ViewMapping, WorkgroupOffset,
 };
 
@@ -14,6 +15,10 @@ const GEMV_WORKGROUP_INVOCATIONS: u32 = 128;
 #[derive(Copy, Clone, Debug)]
 pub struct F32;
 
+/// Packed u32 storage marker.
+#[derive(Copy, Clone, Debug)]
+pub struct U32;
+
 /// Numeric element markers that can appear in the typed IR.
 pub trait Numeric {
     const ELEMENT: ElementType;
@@ -21,6 +26,10 @@ pub trait Numeric {
 
 impl Numeric for F32 {
     const ELEMENT: ElementType = ElementType::F32;
+}
+
+impl Numeric for U32 {
+    const ELEMENT: ElementType = ElementType::U32;
 }
 
 /// Build a kernel IR with a generative kernel lifetime and entry phase.
@@ -196,17 +205,110 @@ impl<'cx, 'k, 'flow> Phase<'cx, 'k, 'flow, Clean> {
         &mut self,
         layout: Layout,
     ) -> StorageTensor<'k, T> {
+        self.storage_tensor_with_layout_and_access::<T>(layout, BufferAccess::Read)
+    }
+
+    /// Declare a read-only storage buffer tensor with an explicit layout and base offset.
+    pub fn storage_tensor_read_with_layout_offset<T: Numeric>(
+        &mut self,
+        layout: Layout,
+        offset: u32,
+    ) -> StorageTensor<'k, T> {
+        self.storage_tensor_with_layout_offset_and_access::<T>(layout, offset, BufferAccess::Read)
+    }
+
+    /// Declare a read-only storage tensor with an explicit non-affine index map.
+    pub fn storage_tensor_read_with_layout_offset_and_index_map<T: Numeric>(
+        &mut self,
+        layout: Layout,
+        offset: u32,
+        index_map: StorageIndexMap,
+    ) -> StorageTensor<'k, T> {
+        self.storage_tensor_with_layout_offset_index_map_and_access::<T>(
+            layout,
+            offset,
+            Some(index_map),
+            BufferAccess::Read,
+        )
+    }
+
+    /// Declare a read-write storage buffer tensor with an explicit layout.
+    pub fn storage_tensor_with_layout<T: Numeric>(
+        &mut self,
+        layout: Layout,
+    ) -> StorageTensor<'k, T> {
+        self.storage_tensor_with_layout_and_access::<T>(layout, BufferAccess::ReadWrite)
+    }
+
+    /// Declare a read-write storage buffer tensor with an explicit layout and base offset.
+    pub fn storage_tensor_with_layout_offset<T: Numeric>(
+        &mut self,
+        layout: Layout,
+        offset: u32,
+    ) -> StorageTensor<'k, T> {
+        self.storage_tensor_with_layout_offset_and_access::<T>(
+            layout,
+            offset,
+            BufferAccess::ReadWrite,
+        )
+    }
+
+    /// Declare a read-write storage tensor with an explicit non-affine index map.
+    pub fn storage_tensor_with_layout_offset_and_index_map<T: Numeric>(
+        &mut self,
+        layout: Layout,
+        offset: u32,
+        index_map: StorageIndexMap,
+    ) -> StorageTensor<'k, T> {
+        self.storage_tensor_with_layout_offset_index_map_and_access::<T>(
+            layout,
+            offset,
+            Some(index_map),
+            BufferAccess::ReadWrite,
+        )
+    }
+
+    fn storage_tensor_with_layout_and_access<T: Numeric>(
+        &mut self,
+        layout: Layout,
+        access: BufferAccess,
+    ) -> StorageTensor<'k, T> {
+        self.storage_tensor_with_layout_offset_and_access::<T>(layout, 0, access)
+    }
+
+    fn storage_tensor_with_layout_offset_and_access<T: Numeric>(
+        &mut self,
+        layout: Layout,
+        offset: u32,
+        access: BufferAccess,
+    ) -> StorageTensor<'k, T> {
+        self.storage_tensor_with_layout_offset_index_map_and_access::<T>(
+            layout, offset, None, access,
+        )
+    }
+
+    fn storage_tensor_with_layout_offset_index_map_and_access<T: Numeric>(
+        &mut self,
+        layout: Layout,
+        offset: u32,
+        index_map: Option<StorageIndexMap>,
+        access: BufferAccess,
+    ) -> StorageTensor<'k, T> {
         assert_eq!(
             layout.memory_level(),
             MemoryLevel::Storage,
             "storage tensors must use MemoryLevel::Storage"
         );
-        let buffer = self
-            .cx
-            .alloc_buffer::<T>(layout.clone(), BufferAccess::Read);
+        let buffer = self.cx.alloc_buffer::<T>(layout.clone(), access);
         StorageTensor {
             buffer,
-            view: StorageView::root(buffer, layout),
+            view: StorageView {
+                buffer,
+                offset,
+                dynamic_offsets: vec![None; layout.shape().rank()],
+                layout,
+                index_map,
+            },
             _ty: PhantomData,
             _kernel: PhantomData,
         }
@@ -470,6 +572,172 @@ impl<'cx, 'k, 'flow> Phase<'cx, 'k, 'flow, Clean> {
             partials: partials.tile,
             rows_per_workgroup,
             vector_width,
+        }));
+    }
+
+    /// Declare a read-only packed GGML quantized matrix.
+    pub fn quantized_matrix(
+        &mut self,
+        format: GgmlQuantFormat,
+        rows: u32,
+        cols: u32,
+    ) -> QuantizedMatrix {
+        assert!(
+            rows > 0 && cols > 0,
+            "quantized matrix shape must be non-zero"
+        );
+        assert_eq!(
+            rows % format.block_elements(),
+            0,
+            "quantized rows/K dimension must be a multiple of the format block size"
+        );
+        let blocks_per_col = rows / format.block_elements();
+        let words = blocks_per_col
+            .checked_mul(cols)
+            .and_then(|blocks| blocks.checked_mul(format.block_words()))
+            .expect("quantized matrix word count overflow");
+        let tensor = self.storage_tensor_read::<U32>(Shape::new([words]));
+        QuantizedMatrix {
+            data: tensor.view(),
+            format,
+            rows,
+            cols,
+        }
+    }
+
+    /// Emit `[M, K] f32 x [K, N] quantized -> [M, N] f32`.
+    pub fn qmatmul(
+        &mut self,
+        a: &StorageTensor<'k, F32>,
+        b: &QuantizedMatrix,
+        y: &StorageTensor<'k, F32>,
+    ) {
+        self.qmatmul_with_vector_width(a, b, y, 4);
+    }
+
+    /// Emit qmatmul with explicit per-lane K unrolling.
+    pub fn qmatmul_with_vector_width(
+        &mut self,
+        a: &StorageTensor<'k, F32>,
+        b: &QuantizedMatrix,
+        y: &StorageTensor<'k, F32>,
+        vector_width: u32,
+    ) {
+        assert!(vector_width > 0, "qmatmul vector width must be non-zero");
+        let [m, k] = matrix_shape(&a.view.layout);
+        let [y_m, y_n] = matrix_shape(&y.view.layout);
+        assert_eq!(k, b.rows, "qmatmul K dimensions must match");
+        assert_eq!(m, y_m, "qmatmul output row count must match A");
+        assert_eq!(b.cols, y_n, "qmatmul output column count must match B");
+        let (tile_m, tile_n, tile_k) = match b.format {
+            GgmlQuantFormat::Q4_0
+            | GgmlQuantFormat::Q4_1
+            | GgmlQuantFormat::Q5_0
+            | GgmlQuantFormat::Q5_1
+            | GgmlQuantFormat::Q8_0
+            | GgmlQuantFormat::Q8_1
+            | GgmlQuantFormat::Q2K
+            | GgmlQuantFormat::Q3K
+            | GgmlQuantFormat::Q4K
+            | GgmlQuantFormat::Q5K
+            | GgmlQuantFormat::Q6K
+            | GgmlQuantFormat::Q8K => (64, 64, 16),
+        };
+        self.qmatmul_with_tile_plan(a, b, y, tile_m, tile_n, tile_k, vector_width);
+    }
+
+    /// Emit qmatmul with an explicit workgroup tile plan.
+    pub fn qmatmul_with_tile_plan(
+        &mut self,
+        a: &StorageTensor<'k, F32>,
+        b: &QuantizedMatrix,
+        y: &StorageTensor<'k, F32>,
+        tile_m: u32,
+        tile_n: u32,
+        tile_k: u32,
+        vector_width: u32,
+    ) {
+        self.qmatmul_with_tile_plan_options(a, b, y, tile_m, tile_n, tile_k, vector_width, true);
+    }
+
+    /// Emit qmatmul with an explicit workgroup tile plan and qgemv selection.
+    pub fn qmatmul_with_tile_plan_options(
+        &mut self,
+        a: &StorageTensor<'k, F32>,
+        b: &QuantizedMatrix,
+        y: &StorageTensor<'k, F32>,
+        tile_m: u32,
+        tile_n: u32,
+        tile_k: u32,
+        vector_width: u32,
+        use_qgemv: bool,
+    ) {
+        assert!(tile_m > 0, "qmatmul tile M must be non-zero");
+        assert!(tile_n > 0, "qmatmul tile N must be non-zero");
+        assert!(tile_k > 0, "qmatmul tile K must be non-zero");
+        assert!(vector_width > 0, "qmatmul vector width must be non-zero");
+        let [m, k] = matrix_shape(&a.view.layout);
+        let [y_m, y_n] = matrix_shape(&y.view.layout);
+        assert_eq!(k, b.rows, "qmatmul K dimensions must match");
+        assert_eq!(m, y_m, "qmatmul output row count must match A");
+        assert_eq!(b.cols, y_n, "qmatmul output column count must match B");
+        let a_tile = self.cx.alloc_tile::<F32>(
+            Layout::contiguous(MemoryLevel::Workgroup, Shape::new([tile_m, tile_k])),
+            TileLevel::Workgroup,
+        );
+        let b_tile = self.cx.alloc_tile::<F32>(
+            Layout::contiguous(MemoryLevel::Workgroup, Shape::new([tile_k, tile_n])),
+            TileLevel::Workgroup,
+        );
+        self.cx.push_op(Op::QMatMul(QMatMulOp {
+            a: a.view(),
+            b: b.clone(),
+            y: y.view(),
+            a_tile,
+            b_tile,
+            tile_m,
+            tile_n,
+            tile_k,
+            vector_width,
+            use_qgemv,
+        }));
+    }
+
+    /// Emit packed GGML quantized -> dense f32 dequantization.
+    ///
+    /// The output is treated as row-major dense storage with `b.cols * b.rows`
+    /// elements, matching the original `[cols, rows]` logical tensor order.
+    pub fn qdequantize(&mut self, b: &QuantizedMatrix, y: &StorageTensor<'k, F32>) {
+        self.qdequantize_with_workgroup_x(b, y, 1);
+    }
+
+    /// Emit packed GGML quantized -> dense f32 dequantization with an explicit
+    /// X-dimension workgroup stride for multi-dimensional dispatch grids.
+    pub fn qdequantize_with_workgroup_x(
+        &mut self,
+        b: &QuantizedMatrix,
+        y: &StorageTensor<'k, F32>,
+        workgroups_x: u32,
+    ) {
+        assert!(
+            workgroups_x > 0,
+            "qdequantize workgroups_x must be non-zero"
+        );
+        assert_eq!(
+            y.view.layout.element_count().get(),
+            b.rows
+                .checked_mul(b.cols)
+                .expect("qdequantize output element count overflow"),
+            "qdequantize output must contain one dense f32 per quantized element"
+        );
+        assert!(
+            y.view.layout.is_row_major(),
+            "qdequantize output must be row-major"
+        );
+        self.cx.push_op(Op::QDequantize(QDequantizeOp {
+            b: b.clone(),
+            y: y.view.clone(),
+            workgroups_x,
         }));
     }
 
@@ -843,6 +1111,10 @@ impl<'k, T> StorageTensor<'k, T> {
             self.view.dynamic_offsets.iter().all(Option::is_none),
             "nested dynamic storage views are not supported"
         );
+        assert!(
+            self.view.index_map.is_none(),
+            "nested mapped storage views are not supported"
+        );
         let layout = Layout::strided(
             MemoryLevel::Storage,
             shape,
@@ -855,6 +1127,117 @@ impl<'k, T> StorageTensor<'k, T> {
                 offset: self.view.offset,
                 layout,
                 dynamic_offsets: vec![row_offset, col_offset],
+                index_map: None,
+            },
+            _ty: PhantomData,
+            _kernel: PhantomData,
+        }
+    }
+
+    /// Create a rank-2 im2col matrix view over a rank-4 NHWC tensor.
+    pub fn im2col_nhwc(
+        &self,
+        output_hw: [u32; 2],
+        kernel_hw: [u32; 2],
+        stride_hw: [u32; 2],
+        dilation_hw: [u32; 2],
+    ) -> Self {
+        assert_eq!(
+            self.view.layout.shape().rank(),
+            4,
+            "NHWC input must be rank-4"
+        );
+        assert!(
+            self.view.dynamic_offsets.iter().all(Option::is_none),
+            "im2col views do not support dynamic offsets"
+        );
+        assert!(
+            self.view.index_map.is_none(),
+            "nested mapped storage views are not supported"
+        );
+        let input_dims = self.view.layout.shape().dims();
+        let batch = input_dims[0].get();
+        let input_h = input_dims[1].get();
+        let input_w = input_dims[2].get();
+        let channels = input_dims[3].get();
+        let [out_h, out_w] = output_hw;
+        let [kernel_h, kernel_w] = kernel_hw;
+        let [stride_h, stride_w] = stride_hw;
+        let [dilation_h, dilation_w] = dilation_hw;
+        assert!(
+            out_h > 0 && out_w > 0,
+            "im2col output shape must be non-zero"
+        );
+        assert!(
+            kernel_h > 0 && kernel_w > 0,
+            "im2col kernel shape must be non-zero"
+        );
+        assert!(
+            stride_h > 0 && stride_w > 0,
+            "im2col stride must be non-zero"
+        );
+        assert!(
+            dilation_h > 0 && dilation_w > 0,
+            "im2col dilation must be non-zero"
+        );
+        let used_h = out_h
+            .checked_sub(1)
+            .and_then(|value| value.checked_mul(stride_h))
+            .and_then(|value| {
+                kernel_h
+                    .checked_sub(1)
+                    .and_then(|kernel| kernel.checked_mul(dilation_h))
+                    .and_then(|kernel| value.checked_add(kernel))
+            })
+            .and_then(|value| value.checked_add(1))
+            .expect("im2col height extent overflow");
+        let used_w = out_w
+            .checked_sub(1)
+            .and_then(|value| value.checked_mul(stride_w))
+            .and_then(|value| {
+                kernel_w
+                    .checked_sub(1)
+                    .and_then(|kernel| kernel.checked_mul(dilation_w))
+                    .and_then(|kernel| value.checked_add(kernel))
+            })
+            .and_then(|value| value.checked_add(1))
+            .expect("im2col width extent overflow");
+        assert!(used_h <= input_h, "im2col view exceeds input height");
+        assert!(used_w <= input_w, "im2col view exceeds input width");
+        let shape = Shape::new([
+            batch
+                .checked_mul(out_h)
+                .and_then(|value| value.checked_mul(out_w))
+                .expect("im2col M dimension overflow"),
+            kernel_h
+                .checked_mul(kernel_w)
+                .and_then(|value| value.checked_mul(channels))
+                .expect("im2col K dimension overflow"),
+        ]);
+        let strides = self.view.layout.strides().values();
+        let map = Im2ColNhwcMap {
+            out_h,
+            out_w,
+            kernel_h,
+            kernel_w,
+            channels,
+            stride_h,
+            stride_w,
+            dilation_h,
+            dilation_w,
+            batch_stride: strides[0],
+            row_stride: strides[1],
+            col_stride: strides[2],
+            channel_stride: strides[3],
+        };
+        Self {
+            buffer: self.buffer,
+            view: StorageView {
+                buffer: self.buffer,
+                offset: self.view.offset,
+                layout: Layout::contiguous(MemoryLevel::Storage, shape),
+                dynamic_offsets: vec![None, None],
+                index_map: Some(StorageIndexMap::Im2ColNhwc(map)),
             },
             _ty: PhantomData,
             _kernel: PhantomData,

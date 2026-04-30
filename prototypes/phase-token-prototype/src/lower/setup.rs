@@ -37,6 +37,16 @@ impl<'a> Lowerer<'a> {
             },
             Span::default(),
         );
+        let u32_vec4_ty = module.types.insert(
+            Type {
+                name: Some("PackedBytes".into()),
+                inner: TypeInner::Vector {
+                    size: VectorSize::Quad,
+                    scalar: Scalar::U32,
+                },
+            },
+            Span::default(),
+        );
 
         let coop_subgroups = if PREFER_COOP_MATRIX_GEMM {
             Self::max_coop_gemm_subgroups(ir)
@@ -92,9 +102,21 @@ impl<'a> Lowerer<'a> {
         };
 
         let max_gemv_rows = Self::max_gemv_rows(ir.body());
-        let max_scratch_sums = max_gemv_rows.max(Self::max_gemm_sums(ir, ir.body()));
+        let uses_qgemv = Self::uses_qgemv(ir);
+        let max_scratch_sums = max_gemv_rows
+            .max(Self::max_gemm_sums(ir, ir.body()))
+            .max(Self::max_qmatmul_sums(ir.body()));
+        let uses_subgroup_invocation_id = uses_qgemv;
+        let uses_subgroup_size = uses_qgemv;
+        let uses_num_subgroups = uses_qgemv;
+        let uses_subgroup_id = uses_subgroup_id || uses_qgemv;
         let (workgroup_invocations, workgroup_size) = if max_gemv_rows > 0 {
             (GEMV_WORKGROUP_INVOCATIONS, GEMV_WORKGROUP_SIZE)
+        } else if uses_qgemv {
+            (
+                DEFAULT_WORKGROUP_INVOCATIONS,
+                [DEFAULT_WORKGROUP_INVOCATIONS, 1, 1],
+            )
         } else if uses_coop_gemm {
             (
                 COOP_MATRIX_WORKGROUP_INVOCATIONS * coop_subgroups,
@@ -112,6 +134,7 @@ impl<'a> Lowerer<'a> {
             f32_vec4_ty,
             u32_ty,
             u32_vec3_ty,
+            u32_vec4_ty,
             coop_f32_a_ty,
             coop_f32_b_ty,
             coop_f32_c_ty,
@@ -126,6 +149,9 @@ impl<'a> Lowerer<'a> {
             uses_coop_gemm,
             coop_subgroups,
             uses_subgroup_id,
+            uses_subgroup_invocation_id,
+            uses_subgroup_size,
+            uses_num_subgroups,
         }
     }
 
@@ -150,6 +176,27 @@ impl<'a> Lowerer<'a> {
                 name: Some("subgroup_id".into()),
                 ty: self.u32_ty,
                 binding: Some(Binding::BuiltIn(BuiltIn::SubgroupId)),
+            });
+        }
+        if self.uses_subgroup_invocation_id {
+            arguments.push(FunctionArgument {
+                name: Some("subgroup_invocation_id".into()),
+                ty: self.u32_ty,
+                binding: Some(Binding::BuiltIn(BuiltIn::SubgroupInvocationId)),
+            });
+        }
+        if self.uses_subgroup_size {
+            arguments.push(FunctionArgument {
+                name: Some("subgroup_size".into()),
+                ty: self.u32_ty,
+                binding: Some(Binding::BuiltIn(BuiltIn::SubgroupSize)),
+            });
+        }
+        if self.uses_num_subgroups {
+            arguments.push(FunctionArgument {
+                name: Some("num_subgroups".into()),
+                ty: self.u32_ty,
+                binding: Some(Binding::BuiltIn(BuiltIn::NumSubgroups)),
             });
         }
 
@@ -183,7 +230,11 @@ impl<'a> Lowerer<'a> {
         if self.uses_coop_gemm {
             capabilities |= naga::valid::Capabilities::COOPERATIVE_MATRIX;
         }
-        if self.uses_subgroup_id {
+        if self.uses_subgroup_id
+            || self.uses_subgroup_invocation_id
+            || self.uses_subgroup_size
+            || self.uses_num_subgroups
+        {
             capabilities |= naga::valid::Capabilities::SUBGROUP;
         }
         let info = naga::valid::Validator::new(naga::valid::ValidationFlags::all(), capabilities)
@@ -214,7 +265,6 @@ impl<'a> Lowerer<'a> {
                     }),
                     ty,
                     init: None,
-                    memory_decorations: MemoryDecorations::empty(),
                 },
                 Span::default(),
             );
@@ -247,7 +297,6 @@ impl<'a> Lowerer<'a> {
                     binding: None,
                     ty,
                     init: None,
-                    memory_decorations: MemoryDecorations::empty(),
                 },
                 Span::default(),
             );
@@ -403,9 +452,9 @@ impl<'a> Lowerer<'a> {
         &mut self,
         buffer: usize,
         element: ElementType,
-        layout: &Layout,
+        _layout: &Layout,
     ) -> Handle<Type> {
-        self.array_type(format!("Buffer{buffer}"), element, layout)
+        self.array_type_with_size(format!("Buffer{buffer}"), element, ArraySize::Dynamic)
     }
 
     pub(super) fn array_type(
@@ -414,8 +463,22 @@ impl<'a> Lowerer<'a> {
         element: ElementType,
         layout: &Layout,
     ) -> Handle<Type> {
+        self.array_type_with_size(
+            name,
+            element,
+            ArraySize::Constant(layout.allocation_element_count()),
+        )
+    }
+
+    pub(super) fn array_type_with_size(
+        &mut self,
+        name: String,
+        element: ElementType,
+        size: ArraySize,
+    ) -> Handle<Type> {
         let base = match element {
             ElementType::F32 => self.f32_ty,
+            ElementType::U32 => self.u32_ty,
         };
 
         self.module.types.insert(
@@ -423,7 +486,7 @@ impl<'a> Lowerer<'a> {
                 name: Some(name),
                 inner: TypeInner::Array {
                     base,
-                    size: ArraySize::Constant(layout.allocation_element_count()),
+                    size,
                     stride: 4,
                 },
             },

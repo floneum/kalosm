@@ -7,7 +7,7 @@ edition = "2024"
 
 [dependencies]
 # Use stable when https://github.com/gfx-rs/wgpu/issues/7712 is resolved
-wgpu = { git = "https://github.com/ealmloff/wgpu", branch = "yield-now", features = ["static-dxc"] }
+wgpu = { git = "https://github.com/ealmloff/wgpu", branch = "yield-now", features = ["naga-ir", "static-dxc"] }
 env_logger = "0.10.1"
 bytemuck = { version = "1.14", features = ["derive"] }
 futures-util = "0.3.31"
@@ -25,6 +25,7 @@ tracing = "0.1.41"
 lru = "0.14.0"
 pollster = "0.4.0"
 petgraph = "0.8.3"
+phase-token-prototype = { path = "../../prototypes/phase-token-prototype" }
 
 [features]
 extra_assertions = []

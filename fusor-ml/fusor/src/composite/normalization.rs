@@ -23,6 +23,8 @@ where
     where
         ConcreteTensor<D, R>: CpuLastRank<OUT_RANK, D>,
         fusor_core::Tensor<R, D>: GpuLastRank<OUT_RANK, D>,
+        fusor_core::Tensor<R, f32>: GpuLastRank<OUT_RANK, f32>,
+        fusor_core::Tensor<R, f32>: GpuLastRank<OUT_RANK, f32>,
         <fusor_core::Tensor<R, D> as fusor_core::LastRankInner>::LastRank:
             GpuNextRankInner<NextRank = fusor_core::Tensor<R, D>>,
         MaxOp: SimdReduceOp<D>,
@@ -46,6 +48,7 @@ where
     where
         ConcreteTensor<D, R>: CpuLastRank<OUT_RANK, D>,
         fusor_core::Tensor<R, D>: GpuLastRank<OUT_RANK, D>,
+        fusor_core::Tensor<R, f32>: GpuLastRank<OUT_RANK, f32>,
         <fusor_core::Tensor<R, D> as fusor_core::LastRankInner>::LastRank:
             GpuNextRankInner<NextRank = fusor_core::Tensor<R, D>>,
         MaxOp: SimdReduceOp<D>,
@@ -66,6 +69,7 @@ where
     where
         ConcreteTensor<D, R>: CpuLastRank<OUT_RANK, D>,
         fusor_core::Tensor<R, D>: GpuLastRank<OUT_RANK, D>,
+        fusor_core::Tensor<R, f32>: GpuLastRank<OUT_RANK, f32>,
         <fusor_core::Tensor<R, D> as fusor_core::LastRankInner>::LastRank:
             GpuNextRankInner<NextRank = fusor_core::Tensor<R, D>>,
         MaxOp: SimdReduceOp<D>,
@@ -86,6 +90,7 @@ where
     where
         ConcreteTensor<D, R>: CpuLastRank<OUT_RANK, D>,
         fusor_core::Tensor<R, D>: GpuLastRank<OUT_RANK, D>,
+        fusor_core::Tensor<R, f32>: GpuLastRank<OUT_RANK, f32>,
         <fusor_core::Tensor<R, D> as fusor_core::LastRankInner>::LastRank:
             GpuNextRankInner<NextRank = fusor_core::Tensor<R, D>>,
         MaxOp: SimdReduceOp<D>,
@@ -288,6 +293,7 @@ where
     where
         ConcreteTensor<D, R>: CpuLastRank<OUT_RANK, D>,
         fusor_core::Tensor<R, D>: GpuLastRank<OUT_RANK, D>,
+        fusor_core::Tensor<R, f32>: GpuLastRank<OUT_RANK, f32>,
         <fusor_core::Tensor<R, D> as fusor_core::LastRankInner>::LastRank:
             GpuNextRankInner<NextRank = fusor_core::Tensor<R, D>>,
         SumOp: SimdReduceOp<D>,
@@ -309,7 +315,7 @@ where
                     Tensor::Gpu(bias) => bias,
                     _ => panic!("Bias must be on GPU when input is on GPU"),
                 });
-                Tensor::Gpu(input.rms_norm_fused(weight, gpu_bias, eps))
+                Tensor::Gpu(input.rms_norm_fused::<W, OUT_RANK>(weight, gpu_bias, eps))
             }
             // CPU path - use composite operations
             (Tensor::Cpu(_), Tensor::Cpu(_), _) => {
@@ -328,6 +334,7 @@ where
     where
         ConcreteTensor<D, R>: CpuLastRank<OUT_RANK, D>,
         fusor_core::Tensor<R, D>: GpuLastRank<OUT_RANK, D>,
+        fusor_core::Tensor<R, f32>: GpuLastRank<OUT_RANK, f32>,
         <fusor_core::Tensor<R, D> as fusor_core::LastRankInner>::LastRank:
             GpuNextRankInner<NextRank = fusor_core::Tensor<R, D>>,
         SumOp: SimdReduceOp<D>,

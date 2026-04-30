@@ -1,21 +1,25 @@
 use std::ops::{Add, Div, Mul, Sub};
 
-use crate::{MaxRank, Tensor, nary_wise::NaryFunction, tensor::DataType};
+use crate::{
+    MaxRank, Tensor,
+    nary_wise::{NaryFunction, NaryOp},
+    tensor::DataType,
+};
 
 fn binary_op<const R: usize, T: DataType>(
     lhs: &Tensor<R, T>,
     rhs: &Tensor<R, T>,
     name: &str,
-    operation: &str,
+    operation: NaryOp,
 ) -> Tensor<R, T> {
     lhs.binary_nary(
         rhs,
         NaryFunction::binary(
             Some(name.to_string()),
-            operation.to_string(),
-            T::WGSL_TYPE,
-            T::WGSL_TYPE,
-            T::WGSL_TYPE,
+            operation,
+            T::DATA_TYPE,
+            T::DATA_TYPE,
+            T::DATA_TYPE,
         ),
     )
 }
@@ -30,7 +34,7 @@ fn binary_op<const R: usize, T: DataType>(
 ///
 /// Also generates a broadcast method `op_()` for tensors of different ranks.
 macro_rules! impl_pairwise_op {
-    ($trait:ident, $method:ident, $op_str:literal, $op_name:literal, $broadcast_method:ident, {$op:tt}) => {
+    ($trait:ident, $method:ident, $nary_op:expr, $op_name:literal, $broadcast_method:ident, {$op:tt}) => {
         // Owned + Owned: delegates to ref + ref
         impl<const R: usize, T: DataType> $trait<Tensor<R, T>> for Tensor<R, T> {
             type Output = Tensor<R, T>;
@@ -45,12 +49,7 @@ macro_rules! impl_pairwise_op {
             type Output = Tensor<R, T>;
 
             fn $method(self, rhs: &Tensor<R, T>) -> Self::Output {
-                binary_op(
-                    self,
-                    rhs,
-                    $op_name,
-                    concat!("let output = a ", $op_str, " b;"),
-                )
+                binary_op(self, rhs, $op_name, $nary_op)
             }
         }
 
@@ -90,7 +89,7 @@ macro_rules! impl_pairwise_op {
 impl_pairwise_op!(
     Add,
     add,
-    "+",
+    NaryOp::Add,
     "add",
     add_,
     {+}
@@ -99,7 +98,7 @@ impl_pairwise_op!(
 impl_pairwise_op!(
     Sub,
     sub,
-    "-",
+    NaryOp::Sub,
     "sub",
     sub_,
     {-}
@@ -108,7 +107,7 @@ impl_pairwise_op!(
 impl_pairwise_op!(
     Mul,
     mul,
-    "*",
+    NaryOp::Mul,
     "mul",
     mul_,
     {*}
@@ -117,7 +116,7 @@ impl_pairwise_op!(
 impl_pairwise_op!(
     Div,
     div,
-    "/",
+    NaryOp::Div,
     "div",
     div_,
     {/}
@@ -128,15 +127,10 @@ impl_pairwise_op!(
 /// Unlike `impl_pairwise_op!` which implements std::ops traits, this macro generates
 /// regular methods on Tensor for operations that don't have corresponding operators.
 macro_rules! impl_pairwise_method {
-    ($method:ident, $wgsl_op:literal, $op_name:literal, $broadcast_method:ident, |$a:ident, $b:ident| $expr:expr) => {
+    ($method:ident, $nary_op:expr, $op_name:literal, $broadcast_method:ident, |$a:ident, $b:ident| $expr:expr) => {
         impl<const R: usize, T: DataType> Tensor<R, T> {
             pub fn $method(&self, other: &Self) -> Self {
-                binary_op(
-                    self,
-                    other,
-                    $op_name,
-                    concat!("let output = ", $wgsl_op, ";"),
-                )
+                binary_op(self, other, $op_name, $nary_op)
             }
 
             pub fn $broadcast_method<const R2: usize, const R3: usize>(
@@ -152,4 +146,4 @@ macro_rules! impl_pairwise_method {
     };
 }
 
-impl_pairwise_method!(pow, "pow(a, b)", "pow", pow_, |a, b| a.pow(&b));
+impl_pairwise_method!(pow, NaryOp::Pow, "pow", pow_, |a, b| a.pow(&b));

@@ -346,6 +346,16 @@ quantized_fixture_fn!(
     0.5
 );
 quantized_fixture_fn!(
+    q8_0_single_row_wide_output_fixture,
+    BlockQ8_0,
+    GgmlType::Q8_0,
+    [96, 64],
+    q8_0_raw_bytes,
+    1,
+    1e-5,
+    0.5
+);
+quantized_fixture_fn!(
     q4k_wide_fixture,
     BlockQ4K,
     GgmlType::Q4K,
@@ -372,6 +382,66 @@ quantized_fixture_fn!(
     [2, 512],
     q6k_raw_bytes,
     3,
+    1e-4,
+    1.0
+);
+quantized_fixture_fn!(
+    q4_0_tiled_fixture,
+    BlockQ4_0,
+    GgmlType::Q4_0,
+    [64, 64],
+    q4_0_raw_bytes,
+    64,
+    1e-5,
+    1.0
+);
+quantized_fixture_fn!(
+    q5_0_tiled_fixture,
+    BlockQ5_0,
+    GgmlType::Q5_0,
+    [64, 64],
+    q5_0_raw_bytes,
+    64,
+    1e-5,
+    1.0
+);
+quantized_fixture_fn!(
+    q8_0_tiled_fixture,
+    BlockQ8_0,
+    GgmlType::Q8_0,
+    [64, 64],
+    q8_0_raw_bytes,
+    64,
+    1e-5,
+    0.5
+);
+quantized_fixture_fn!(
+    q4k_tiled_fixture,
+    BlockQ4K,
+    GgmlType::Q4K,
+    [64, 512],
+    q4k_raw_bytes,
+    64,
+    1e-4,
+    2.0
+);
+quantized_fixture_fn!(
+    q5k_tiled_fixture,
+    BlockQ5K,
+    GgmlType::Q5K,
+    [64, 512],
+    q5k_raw_bytes,
+    64,
+    1e-4,
+    1.0
+);
+quantized_fixture_fn!(
+    q6k_tiled_fixture,
+    BlockQ6K,
+    GgmlType::Q6K,
+    [64, 512],
+    q6k_raw_bytes,
+    64,
     1e-4,
     1.0
 );
@@ -442,6 +512,38 @@ quantized_fixture_tests!(
     q8_0_q_mat_mul_matches_cpu_reference,
     802
 );
+
+#[tokio::test]
+async fn q8_0_dequantize_then_add_matches_cpu_reference() {
+    let QuantizedFixture {
+        ty,
+        weight_shape,
+        raw_bytes,
+        dequantized,
+        ..
+    } = q8_0_fixture();
+    let expected = dequantized
+        .iter()
+        .map(|row| row.iter().map(|value| value + 1.25).collect::<Vec<_>>())
+        .collect::<Vec<_>>();
+
+    fusor_conformance::assert(move |device: Device| {
+        let raw_bytes = raw_bytes.clone();
+        async move {
+            (qmatrix_from_raw_bytes(&device, weight_shape, &raw_bytes, ty).dequantize::<2>() + 1.25)
+                .to_concrete()
+        }
+    })
+    .arg(|device: &Device| device.clone())
+    .equal_to(move |device: Device| {
+        let expected = expected.clone();
+        async move { Tensor::new(&device, &expected) }
+    })
+    .compare_with(approx_compare::<2, f32>(1e-5))
+    .await
+    .unwrap();
+}
+
 quantized_fixture_tests!(
     q4k_fixture,
     q4k_dequantize_matches_cpu_reference,
@@ -472,6 +574,11 @@ quantized_q_mat_mul_test!(
     811
 );
 quantized_q_mat_mul_test!(
+    q8_0_q_mat_mul_single_row_wide_output_matches_cpu_reference,
+    q8_0_single_row_wide_output_fixture,
+    826
+);
+quantized_q_mat_mul_test!(
     q4k_q_mat_mul_multi_row_matches_cpu_reference,
     q4k_wide_fixture,
     812
@@ -485,6 +592,36 @@ quantized_q_mat_mul_test!(
     q6k_q_mat_mul_multi_row_matches_cpu_reference,
     q6k_wide_fixture,
     814
+);
+quantized_q_mat_mul_test!(
+    q4_0_q_mat_mul_tiled_matches_cpu_reference,
+    q4_0_tiled_fixture,
+    820
+);
+quantized_q_mat_mul_test!(
+    q5_0_q_mat_mul_tiled_matches_cpu_reference,
+    q5_0_tiled_fixture,
+    821
+);
+quantized_q_mat_mul_test!(
+    q8_0_q_mat_mul_tiled_matches_cpu_reference,
+    q8_0_tiled_fixture,
+    822
+);
+quantized_q_mat_mul_test!(
+    q4k_q_mat_mul_tiled_matches_cpu_reference,
+    q4k_tiled_fixture,
+    823
+);
+quantized_q_mat_mul_test!(
+    q5k_q_mat_mul_tiled_matches_cpu_reference,
+    q5k_tiled_fixture,
+    824
+);
+quantized_q_mat_mul_test!(
+    q6k_q_mat_mul_tiled_matches_cpu_reference,
+    q6k_tiled_fixture,
+    825
 );
 
 fn f32_weight_rows() -> Vec<Vec<f32>> {

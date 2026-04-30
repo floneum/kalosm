@@ -156,7 +156,13 @@ impl LayoutPass {
             self.queue.push_back(key);
             return;
         };
-        self.output_layout.insert(key, input_layout.clone());
+        self.output_layout.insert(
+            key,
+            TensorLayoutInfo::new(
+                Layout::contiguous(input_layout.shape()),
+                input_layout.datatype(),
+            ),
+        );
     }
 
     fn visit_tensor(&mut self, key: NodeIndex, operation: &crate::tensor::TensorData) {

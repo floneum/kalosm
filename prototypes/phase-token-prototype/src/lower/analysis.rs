@@ -16,6 +16,25 @@ impl<'a> Lowerer<'a> {
             .unwrap_or(0)
     }
 
+    pub(super) fn uses_qgemv(ir: &KernelIr) -> bool {
+        Self::block_uses_qgemv(ir.body())
+    }
+
+    fn block_uses_qgemv(block: &crate::Block) -> bool {
+        block.ops().iter().any(|op| match op {
+            Op::QMatMul(op) => {
+                op.use_qgemv
+                    && Self::matrix_shape(&op.a.layout)
+                        .map(|[m, _]| m == 1)
+                        .unwrap_or(false)
+            }
+            Op::Block(op) => Self::block_uses_qgemv(&op.body),
+            Op::Loop(op) => Self::block_uses_qgemv(&op.body),
+            Op::Partition(op) => Self::block_uses_qgemv(&op.body),
+            _ => false,
+        })
+    }
+
     pub(super) fn is_single_direct_coop_gemm(ir: &KernelIr) -> bool {
         let ops = ir.body().ops();
         if ops.len() != 3 {
@@ -82,6 +101,11 @@ impl<'a> Lowerer<'a> {
                     Self::mark_tile_live(ir, op.acc, live);
                 }
                 Op::Gemv(op) => Self::mark_tile_live(ir, op.partials, live),
+                Op::QMatMul(op) => {
+                    Self::mark_tile_live(ir, op.a_tile, live);
+                    Self::mark_tile_live(ir, op.b_tile, live);
+                }
+                Op::QDequantize(_) => {}
                 Op::Mma(op) => {
                     Self::mark_tile_live(ir, op.a, live);
                     Self::mark_tile_live(ir, op.b, live);
@@ -414,6 +438,7 @@ impl<'a> Lowerer<'a> {
             }
 
             let nested = match &ops[index] {
+                Op::QMatMul(op) => Self::qmatmul_coop8_subgroups(ir, op).unwrap_or(0),
                 Op::Block(op) => Self::block_max_coop_gemm_subgroups(ir, &op.body),
                 Op::Loop(op) => Self::block_max_coop_gemm_subgroups(ir, &op.body),
                 Op::Partition(op) => Self::block_max_coop_gemm_subgroups(ir, &op.body),
@@ -559,6 +584,70 @@ impl<'a> Lowerer<'a> {
         None
     }
 
+    pub(super) fn qmatmul_coop8_subgroups(ir: &KernelIr, op: &QMatMulOp) -> Option<u32> {
+        let a_tile = Self::tile_layout_in_ir(ir, op.a_tile)?;
+        let b_tile = Self::tile_layout_in_ir(ir, op.b_tile)?;
+        let [m, k] = Self::matrix_shape(&op.a.layout).ok()?;
+        let [y_m, n] = Self::matrix_shape(&op.y.layout).ok()?;
+        let [a_tile_m, a_tile_k] = Self::matrix_shape(a_tile).ok()?;
+        let [b_tile_k, b_tile_n] = Self::matrix_shape(b_tile).ok()?;
+        if m == 1
+            || m != y_m
+            || k != op.b.rows
+            || n != op.b.cols
+            || a_tile.memory_level() != MemoryLevel::Workgroup
+            || b_tile.memory_level() != MemoryLevel::Workgroup
+            || a_tile_m != op.tile_m
+            || a_tile_k != op.tile_k
+            || b_tile_k != op.tile_k
+            || b_tile_n != op.tile_n
+            || !op.tile_k.is_multiple_of(COOP_MATRIX_DIM)
+            || !op.tile_m.is_multiple_of(COOP_MATRIX_DIM)
+            || !op.tile_n.is_multiple_of(COOP_MATRIX_DIM)
+            || k % op.tile_k != 0
+            || m % op.tile_m != 0
+            || n % op.tile_n != 0
+        {
+            return None;
+        }
+
+        Self::coop8_subgroups_for_tile_shape(op.tile_m, op.tile_n)
+    }
+
+    pub(super) fn coop8_subgroups_for_tile_shape(m: u32, n: u32) -> Option<u32> {
+        if m == 0
+            || n == 0
+            || !m.is_multiple_of(COOP_MATRIX_DIM)
+            || !n.is_multiple_of(COOP_MATRIX_DIM)
+        {
+            return None;
+        }
+        let tile_rows = m / COOP_MATRIX_DIM;
+        let tile_cols = n / COOP_MATRIX_DIM;
+        if tile_rows * tile_cols <= 16 {
+            return Some(1);
+        }
+        if m == 32 && n.is_multiple_of(32) {
+            let subgroups = n / 32;
+            if (2..=8).contains(&subgroups) {
+                return Some(subgroups);
+            }
+        }
+        if n >= m && m <= 64 && n.is_multiple_of(16) {
+            let subgroups = n / 16;
+            if (2..=8).contains(&subgroups) {
+                return Some(subgroups);
+            }
+        }
+        if n <= 64 && m.is_multiple_of(16) {
+            let subgroups = m / 16;
+            if (2..=8).contains(&subgroups) {
+                return Some(subgroups);
+            }
+        }
+        None
+    }
+
     pub(super) fn is_row_major_storage_matrix(layout: &Layout) -> bool {
         layout.shape().rank() == 2
             && layout.strides().rank() == 2
@@ -610,5 +699,20 @@ impl<'a> Lowerer<'a> {
             index += 1;
         }
         max_sums
+    }
+
+    pub(super) fn max_qmatmul_sums(block: &crate::Block) -> u32 {
+        block
+            .ops()
+            .iter()
+            .map(|op| match op {
+                Op::QMatMul(_) => 8,
+                Op::Block(op) => Self::max_qmatmul_sums(&op.body),
+                Op::Loop(op) => Self::max_qmatmul_sums(&op.body),
+                Op::Partition(op) => Self::max_qmatmul_sums(&op.body),
+                _ => 0,
+            })
+            .max()
+            .unwrap_or(0)
     }
 }

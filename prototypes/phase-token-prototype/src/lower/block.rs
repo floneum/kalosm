@@ -80,6 +80,18 @@ impl<'a> Lowerer<'a> {
                 Op::Gemv(op) => {
                     body.push(self.lower_gemv(expressions, scratch, op)?, Span::default());
                 }
+                Op::QMatMul(op) => {
+                    body.push(
+                        self.lower_qmatmul(expressions, scratch, op)?,
+                        Span::default(),
+                    );
+                }
+                Op::QDequantize(op) => {
+                    body.push(
+                        self.lower_qdequantize(expressions, scratch, op)?,
+                        Span::default(),
+                    );
+                }
                 Op::Mma(op) => {
                     body.push(self.lower_mma(expressions, scratch, op)?, Span::default());
                 }

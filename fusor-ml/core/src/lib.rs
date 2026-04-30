@@ -31,16 +31,16 @@ mod layout;
 mod map_layout;
 pub mod matmul;
 mod mir;
+mod nary_direct;
 mod nary_wise;
 mod pair_wise;
 mod quantized;
-mod quantized_types_wgsl;
 mod rank;
 mod reduce;
+mod reduce_direct;
 mod resize;
 mod slice_assign;
 mod tensor;
-mod util;
 mod varbuilder;
 mod visit_tiled;
 
@@ -50,7 +50,7 @@ pub enum Error {
     RequestDeviceError(#[from] wgpu::RequestDeviceError),
     #[error("GGUF error {0}")]
     GgufError(#[from] fusor_gguf::GgufReadError),
-    #[error("WGSL async buffer error {0}")]
+    #[error("Buffer async error {0}")]
     BufferAsyncError(#[from] wgpu::BufferAsyncError),
     #[error("VarBuilder error {0}")]
     VarBuilder(String),

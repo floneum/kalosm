@@ -1,18 +1,16 @@
-use std::{fmt::Write, ops::Range};
+use std::ops::Range;
 
 use crate::{
-    TILE_SIZE, Tensor, TensorData,
+    DataTypeEnum, TILE_SIZE, Tensor, TensorData,
     compute_graph::{ComputeGraphInner, NodeIndex},
     mir::{
+        direct_kernel::DirectKernel,
         inputs::MirValue,
-        kernel::GenericKernel,
         operation::Operation,
         workgroup_shape::{WorkgroupShape, WorkgroupShapeConstraints},
     },
-    visit_tiled::{
-        MaybeQTensorInput, VisitTiledInput, build_visit_tiled_kernel, titled_map_dispatch_size,
-        titled_map_workgroup_size_constraints,
-    },
+    nary_wise::{NaryExpr, NaryOp, NaryOperation, NaryScalar},
+    visit_tiled::{titled_map_dispatch_size, titled_map_workgroup_size_constraints},
 };
 
 #[derive(Clone, Debug)]
@@ -36,6 +34,64 @@ impl SliceAssignOperation {
             slices,
             input_shape,
         }
+    }
+
+    fn expression(&self, datatype: DataTypeEnum) -> NaryExpr {
+        let rank = self.slices.len();
+        let mut condition = NaryExpr::scalar(NaryScalar::U32(1));
+        for (dim, slice) in self.slices.iter().enumerate() {
+            let dim_index = NaryExpr::DimIndex(dim);
+            let ge_start = NaryExpr::unary_op(
+                dim_index.clone(),
+                "ge_start",
+                NaryOp::GreaterEqualConst(NaryScalar::U32(slice.start as u32)),
+                DataTypeEnum::U32,
+                DataTypeEnum::U32,
+            );
+            let lt_end = NaryExpr::unary_op(
+                dim_index,
+                "lt_end",
+                NaryOp::LessConst(NaryScalar::U32(slice.end as u32)),
+                DataTypeEnum::U32,
+                DataTypeEnum::U32,
+            );
+            condition = NaryExpr::mul(condition, ge_start, DataTypeEnum::U32);
+            condition = NaryExpr::mul(condition, lt_end, DataTypeEnum::U32);
+        }
+
+        let value_indices = self
+            .slices
+            .iter()
+            .enumerate()
+            .map(|(dim, slice)| {
+                let shifted_index = if slice.start == 0 {
+                    NaryExpr::DimIndex(dim)
+                } else {
+                    NaryExpr::unary_op(
+                        NaryExpr::DimIndex(dim),
+                        "slice_offset",
+                        NaryOp::SubConst(NaryScalar::U32(slice.start as u32)),
+                        DataTypeEnum::U32,
+                        DataTypeEnum::U32,
+                    )
+                };
+                NaryExpr::select(
+                    condition.clone(),
+                    shifted_index,
+                    NaryExpr::scalar(NaryScalar::U32(0)),
+                    DataTypeEnum::U32,
+                    DataTypeEnum::U32,
+                )
+            })
+            .collect();
+
+        NaryExpr::select(
+            condition,
+            NaryExpr::indexed_input(1, value_indices),
+            NaryExpr::input(0, rank),
+            DataTypeEnum::U32,
+            datatype,
+        )
     }
 }
 
@@ -65,96 +121,30 @@ impl Operation for SliceAssignOperation {
         vec![input.clone().into(), value.clone().into(), output.into()]
     }
 
-    fn build_kernel(
+    fn build_direct_kernel(
         &self,
         graph: &ComputeGraphInner,
-        _workgroup_shape: &WorkgroupShape,
+        workgroup_shape: &WorkgroupShape,
         inputs: &[MirValue],
-        kernel: &mut GenericKernel,
-    ) {
-        let input = inputs[0].as_tensor().unwrap();
-        let value = inputs[1].as_tensor().unwrap();
-        let _output = inputs[2].as_tensor().unwrap();
-        let dtype = input.datatype();
-        let rank = self.slices.len() as u32;
-        let value_rank = value.layout().shape().len() as u32;
+    ) -> Option<DirectKernel> {
+        let input = inputs[0].as_tensor()?;
+        let operation = NaryOperation {
+            inputs: vec![self.input, self.value],
+            expression: self.expression(input.datatype()),
+            shape: self.input_shape.clone(),
+            output_datatype: input.datatype(),
+        };
+        crate::nary_direct::build_nary_direct_kernel_to_output(
+            &operation,
+            graph,
+            workgroup_shape,
+            inputs,
+            2,
+        )
+    }
 
-        // Build inputs for visit_tiled: input, value, output (all same dtype)
-        let tiled_inputs = vec![
-            VisitTiledInput::new(dtype.into(), rank),
-            VisitTiledInput::new(dtype.into(), value_rank),
-            VisitTiledInput::new(dtype.into(), rank),
-        ];
-
-        // Output tensor is at index 2
-        let output_tensor_idx = 2;
-
-        // Capture slice bounds for use in closure
-        let slices = self.slices.clone();
-
-        build_visit_tiled_kernel(
-            &graph.device(),
-            &self.input_shape,
-            TILE_SIZE,
-            tiled_inputs,
-            output_tensor_idx,
-            |kernel, indexes, tensors, values| {
-                let input_value = &values[0];
-                let output_index = &indexes[output_tensor_idx];
-                let output_tensor = &tensors[output_tensor_idx];
-                let value_tensor = &tensors[1];
-
-                // Build the condition: slice_start <= idx < slice_end for each dimension
-                let mut conditions = Vec::new();
-                for dim in 0..rank as usize {
-                    let start = slices[dim].start;
-                    let end = slices[dim].end;
-                    conditions.push(format!("(dim_{dim} >= {start}u && dim_{dim} < {end}u)"));
-                }
-                let in_slice_condition = conditions.join(" && ");
-
-                writeln!(kernel, "var slice_val: {};", dtype.as_str()).unwrap();
-                writeln!(kernel, "if ({}) {{", in_slice_condition).unwrap();
-
-                // Inside slice: compute value tensor index and read from value
-                for dim in 0..rank as usize {
-                    let offset = slices[dim].start;
-                    writeln!(
-                        kernel,
-                        "    let value_idx_{} = dim_{} - {}u;",
-                        dim, dim, offset
-                    )
-                    .unwrap();
-                }
-
-                // Read from value tensor with computed indices
-                write!(kernel, "    slice_val = ").unwrap();
-                match value_tensor {
-                    MaybeQTensorInput::Tensor(t) => {
-                        write!(kernel, "{t}[").unwrap();
-                        t.strided_index(
-                            kernel,
-                            (0..rank as usize).map(|d| format!("value_idx_{}", d)),
-                        );
-                        writeln!(kernel, "];").unwrap();
-                    }
-                    MaybeQTensorInput::QTensor(_) => {
-                        panic!("Value tensor cannot be quantized")
-                    }
-                }
-
-                writeln!(kernel, "}} else {{").unwrap();
-
-                // Outside slice: copy from input
-                writeln!(kernel, "    slice_val = {};", input_value).unwrap();
-
-                writeln!(kernel, "}}").unwrap();
-
-                // Return the assignment expression
-                format!("{output_tensor}[{output_index}] = slice_val;")
-            },
-            kernel,
-        );
+    fn requires_single_kernel_batch(&self) -> bool {
+        true
     }
 
     fn output(&self, _nodes: &ComputeGraphInner, inputs: &[MirValue]) -> MirValue {
@@ -177,8 +167,11 @@ impl Operation for SliceAssignOperation {
         &self,
         map: &rustc_hash::FxHashMap<NodeIndex, crate::TensorLayoutInfo>,
     ) -> crate::TensorLayoutInfo {
-        // Output has the same layout as input
-        map.get(&self.input).unwrap().clone()
+        let input_layout = map.get(&self.input).unwrap();
+        crate::TensorLayoutInfo::new(
+            crate::Layout::contiguous(input_layout.shape()),
+            input_layout.datatype(),
+        )
     }
 }
 

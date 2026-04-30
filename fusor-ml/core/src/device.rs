@@ -25,6 +25,7 @@ struct CachedBuffer {
 const MAX_FREE_BUFFERS_PER_BUCKET: usize = 4;
 const BIND_GROUP_LAYOUT_CACHE_SIZE: usize = 256;
 const PIPELINE_LAYOUT_CACHE_SIZE: usize = 256;
+const NAGA_MODULE_CACHE_SIZE: usize = 128;
 const SHADER_MODULE_CACHE_SIZE: usize = 128;
 const COMPUTE_PIPELINE_CACHE_SIZE: usize = 128;
 
@@ -126,6 +127,7 @@ struct DeviceInner {
     bind_group_layout_cache:
         RwLock<LruCache<Vec<wgpu::BindGroupLayoutEntry>, BindGroupLayout, FxBuildHasher>>,
     pipeline_layout_cache: RwLock<LruCache<BindGroupLayout, wgpu::PipelineLayout, FxBuildHasher>>,
+    naga_module_cache: RwLock<LruCache<String, wgpu::naga::Module, FxBuildHasher>>,
     shader_module_cache: RwLock<LruCache<String, wgpu::ShaderModule, FxBuildHasher>>,
     compute_pipeline_cache:
         RwLock<LruCache<(PipelineLayout, ShaderModule), wgpu::ComputePipeline, FxBuildHasher>>,
@@ -250,6 +252,10 @@ impl Device {
             NonZeroUsize::new(PIPELINE_LAYOUT_CACHE_SIZE).unwrap(),
             Default::default(),
         ));
+        let naga_module_cache = RwLock::new(LruCache::with_hasher(
+            NonZeroUsize::new(NAGA_MODULE_CACHE_SIZE).unwrap(),
+            Default::default(),
+        ));
         let shader_module_cache = RwLock::new(LruCache::with_hasher(
             NonZeroUsize::new(SHADER_MODULE_CACHE_SIZE).unwrap(),
             Default::default(),
@@ -271,6 +277,7 @@ impl Device {
             cache_file,
             bind_group_layout_cache,
             pipeline_layout_cache,
+            naga_module_cache,
             shader_module_cache,
             compute_pipeline_cache,
             buffer_allocation_cache,
@@ -318,13 +325,13 @@ impl Device {
         }
     }
 
-    pub fn create_shader_module<'a>(&self, source: impl Into<Cow<'a, str>>) -> wgpu::ShaderModule {
-        // SAFTEY: All kernels don't access memory outside of bounds and don't have unbounded loops
+    pub fn create_naga_shader_module(&self, module: wgpu::naga::Module) -> wgpu::ShaderModule {
+        // SAFETY: all kernels avoid out-of-bounds memory access and unbounded loops.
         unsafe {
             self.inner.device.create_shader_module_trusted(
                 wgpu::ShaderModuleDescriptor {
                     label: Some("Fusor ML Shader Module"),
-                    source: wgpu::ShaderSource::Wgsl(source.into()),
+                    source: wgpu::ShaderSource::Naga(Cow::Owned(module)),
                 },
                 wgpu::ShaderRuntimeChecks::unchecked(),
             )
@@ -394,6 +401,12 @@ impl Device {
         &self,
     ) -> &RwLock<LruCache<BindGroupLayout, wgpu::PipelineLayout, FxBuildHasher>> {
         &self.inner.pipeline_layout_cache
+    }
+
+    pub(crate) fn naga_module_cache(
+        &self,
+    ) -> &RwLock<LruCache<String, wgpu::naga::Module, FxBuildHasher>> {
+        &self.inner.naga_module_cache
     }
 
     pub(crate) fn shader_module_cache(

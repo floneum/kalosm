@@ -241,6 +241,10 @@ pub enum Op {
     Gemm(GemmOp),
     /// Row-parallel matrix-vector multiply over storage tensors.
     Gemv(GemvOp),
+    /// Matrix multiply where the right-hand matrix is a packed GGML quantized tensor.
+    QMatMul(QMatMulOp),
+    /// Dequantize a packed GGML quantized tensor into dense f32 storage.
+    QDequantize(QDequantizeOp),
     /// Matrix multiply-accumulate over tile operands.
     Mma(MmaOp),
     /// Store a tile to a storage buffer view.
@@ -342,6 +346,7 @@ pub struct StorageView {
     pub offset: u32,
     pub layout: Layout,
     pub dynamic_offsets: Vec<Option<DynamicOffset>>,
+    pub index_map: Option<StorageIndexMap>,
 }
 
 impl StorageView {
@@ -353,8 +358,43 @@ impl StorageView {
             offset: 0,
             layout,
             dynamic_offsets,
+            index_map: None,
         }
     }
+}
+
+/// Non-affine logical-to-storage mappings for matrix views.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum StorageIndexMap {
+    Im2ColNhwc(Im2ColNhwcMap),
+    FlattenedMatrix(FlattenedMatrixMap),
+}
+
+/// Rank-N tensor viewed as a rank-2 matrix by flattening every axis except the
+/// final column axis.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FlattenedMatrixMap {
+    pub prefix_shape: Vec<u32>,
+    pub prefix_strides: Vec<u32>,
+    pub column_stride: u32,
+}
+
+/// NHWC convolution activation view lowered as an im2col matrix.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct Im2ColNhwcMap {
+    pub out_h: u32,
+    pub out_w: u32,
+    pub kernel_h: u32,
+    pub kernel_w: u32,
+    pub channels: u32,
+    pub stride_h: u32,
+    pub stride_w: u32,
+    pub dilation_h: u32,
+    pub dilation_w: u32,
+    pub batch_stride: u32,
+    pub row_stride: u32,
+    pub col_stride: u32,
+    pub channel_stride: u32,
 }
 
 /// Dynamic coordinate offset used by storage views.
@@ -477,6 +517,82 @@ pub struct GemvOp {
     pub vector_width: u32,
 }
 
+/// GGML quantization formats represented by the prototype qmatmul path.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum GgmlQuantFormat {
+    Q4_0,
+    Q4_1,
+    Q5_0,
+    Q5_1,
+    Q8_0,
+    Q8_1,
+    Q2K,
+    Q3K,
+    Q4K,
+    Q5K,
+    Q6K,
+    Q8K,
+}
+
+impl GgmlQuantFormat {
+    pub const fn block_elements(self) -> u32 {
+        match self {
+            Self::Q4_0 | Self::Q4_1 | Self::Q5_0 | Self::Q5_1 | Self::Q8_0 | Self::Q8_1 => 32,
+            Self::Q2K | Self::Q3K | Self::Q4K | Self::Q5K | Self::Q6K | Self::Q8K => 256,
+        }
+    }
+
+    /// Number of u32 words in the f32-scale shader layout for one block.
+    pub const fn block_words(self) -> u32 {
+        match self {
+            Self::Q4_0 => 5,
+            Self::Q4_1 => 6,
+            Self::Q5_0 => 6,
+            Self::Q5_1 => 7,
+            Self::Q8_0 => 9,
+            Self::Q8_1 => 10,
+            Self::Q2K => 22,
+            Self::Q3K => 28,
+            Self::Q4K => 37,
+            Self::Q5K => 45,
+            Self::Q6K => 53,
+            Self::Q8K => 73,
+        }
+    }
+}
+
+/// A packed quantized storage matrix.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct QuantizedMatrix {
+    pub data: StorageView,
+    pub format: GgmlQuantFormat,
+    pub rows: u32,
+    pub cols: u32,
+}
+
+/// Row/column matrix multiply with an f32 activation matrix and GGML-quantized weights.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct QMatMulOp {
+    pub a: StorageView,
+    pub b: QuantizedMatrix,
+    pub y: StorageView,
+    pub a_tile: TileRef,
+    pub b_tile: TileRef,
+    pub tile_m: u32,
+    pub tile_n: u32,
+    pub tile_k: u32,
+    pub vector_width: u32,
+    pub use_qgemv: bool,
+}
+
+/// Dense dequantization of a packed GGML quantized matrix.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct QDequantizeOp {
+    pub b: QuantizedMatrix,
+    pub y: StorageView,
+    pub workgroups_x: u32,
+}
+
 /// Concrete tiling plan used when lowering a high-level GEMM into tile MMA.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct GemmTiling {
@@ -562,6 +678,7 @@ impl TileId {
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum ElementType {
     F32,
+    U32,
 }
 
 /// A concrete layout for a tile-like value.

@@ -1,15 +1,22 @@
 use crate::{
-    DataType, DataTypeEnum, Device, Tensor, TensorData,
+    DataTypeEnum, Device, Layout, Tensor, TensorData,
     compute_graph::NodeIndex,
-    mir::{inputs::MirValue, kernel::GenericKernel, operation::Operation},
+    matmul::MatMulOperation,
+    mir::{
+        direct_kernel::{DirectKernel, DirectKernelBinding},
+        inputs::MirValue,
+        operation::Operation,
+        tile_direct::{
+            flatten_matrix_layout, storage_tensor_read_with_direct_layout,
+            storage_tensor_with_direct_layout,
+        },
+        workgroup_shape::{Constraint, WorkgroupShapeConstraints},
+    },
 };
+use fusor_gguf::GgmlType;
+use phase_token_prototype as tile_ir;
 
 use super::QMatrix;
-
-mod sgemm;
-mod sgemv;
-
-pub use sgemm::{ChunkedSgemmConfig, GeneralSgemmConfig};
 
 #[derive(Debug, Clone)]
 pub(crate) struct QMatMulOperation {
@@ -18,8 +25,6 @@ pub(crate) struct QMatMulOperation {
     pub(crate) matrix: QMatrix,
     pub(crate) in_shape: Box<[usize]>,
     pub(crate) out_shape: Box<[usize]>,
-    pub(crate) chunked_config: Option<ChunkedSgemmConfig>,
-    pub(crate) general_config: Option<GeneralSgemmConfig>,
 }
 
 impl QMatMulOperation {
@@ -40,26 +45,7 @@ impl QMatMulOperation {
             matrix,
             in_shape: input_shape.into(),
             out_shape,
-            chunked_config: None,
-            general_config: None,
         }
-    }
-
-    fn elements_per_block(&self) -> u32 {
-        self.matrix.datatype.block_size() as u32
-    }
-
-    fn sgemv(&self) -> bool {
-        let m_dim_idx = self.in_shape.len() - 2;
-        let m = self.in_shape[m_dim_idx];
-        // Use SGEMV for tall and skinny matrices (small M, any K)
-        // SGEMV is more efficient when M is small because:
-        // - Each workgroup processes one M value independently
-        // - Less workgroup synchronization overhead
-        // - Better cache utilization for the K dimension
-        // SGEMM becomes more efficient for larger M where it can use
-        // tile-based processing with 16x16 workgroups
-        m <= 32
     }
 
     fn m_size(&self) -> u32 {
@@ -70,11 +56,62 @@ impl QMatMulOperation {
     fn n_size(&self) -> u32 {
         self.matrix.shape[0] as u32
     }
+
+    fn direct_quant_format(&self) -> Option<tile_ir::GgmlQuantFormat> {
+        Some(match self.matrix.datatype {
+            GgmlType::Q4_0 => tile_ir::GgmlQuantFormat::Q4_0,
+            GgmlType::Q4_1 => tile_ir::GgmlQuantFormat::Q4_1,
+            GgmlType::Q5_0 => tile_ir::GgmlQuantFormat::Q5_0,
+            GgmlType::Q5_1 => tile_ir::GgmlQuantFormat::Q5_1,
+            GgmlType::Q8_0 => tile_ir::GgmlQuantFormat::Q8_0,
+            GgmlType::Q8_1 => tile_ir::GgmlQuantFormat::Q8_1,
+            GgmlType::Q2K => tile_ir::GgmlQuantFormat::Q2K,
+            GgmlType::Q3K => tile_ir::GgmlQuantFormat::Q3K,
+            GgmlType::Q4K => tile_ir::GgmlQuantFormat::Q4K,
+            GgmlType::Q5K => tile_ir::GgmlQuantFormat::Q5K,
+            GgmlType::Q6K => tile_ir::GgmlQuantFormat::Q6K,
+            GgmlType::Q8K => tile_ir::GgmlQuantFormat::Q8K,
+            GgmlType::F16 | GgmlType::F32 => return None,
+        })
+    }
 }
 
-impl<const R: usize, T: DataType> Tensor<R, T> {
+fn ceil_div_u32(x: u32, divisor: u32) -> u32 {
+    x.div_ceil(divisor)
+}
+
+fn qgemv_cols_per_subgroup(format: tile_ir::GgmlQuantFormat) -> u32 {
+    match format {
+        tile_ir::GgmlQuantFormat::Q2K
+        | tile_ir::GgmlQuantFormat::Q3K
+        | tile_ir::GgmlQuantFormat::Q4K
+        | tile_ir::GgmlQuantFormat::Q5K
+        | tile_ir::GgmlQuantFormat::Q6K
+        | tile_ir::GgmlQuantFormat::Q8K => 2,
+        tile_ir::GgmlQuantFormat::Q4_0
+        | tile_ir::GgmlQuantFormat::Q4_1
+        | tile_ir::GgmlQuantFormat::Q5_0
+        | tile_ir::GgmlQuantFormat::Q5_1
+        | tile_ir::GgmlQuantFormat::Q8_0
+        | tile_ir::GgmlQuantFormat::Q8_1 => 4,
+    }
+}
+
+fn qgemv_cols_per_workgroup(format: tile_ir::GgmlQuantFormat, max_subgroup_size: u32) -> u32 {
+    let subgroup_size = max_subgroup_size.clamp(1, 256);
+    let num_subgroups = (256 / subgroup_size).max(1);
+    num_subgroups * qgemv_cols_per_subgroup(format)
+}
+
+impl<const R: usize> Tensor<R, f32> {
     pub fn q_mat_mul(&self, other: &QMatrix) -> Self {
         self.add_q_mat_mul(other)
+    }
+}
+
+impl<const R: usize> Tensor<R, half::f16> {
+    pub fn q_mat_mul(&self, other: &QMatrix) -> Self {
+        self.cast::<f32>().q_mat_mul(other).cast()
     }
 }
 
@@ -83,16 +120,21 @@ impl Operation for QMatMulOperation {
         &self,
         device: &Device,
     ) -> crate::mir::workgroup_shape::WorkgroupShapeConstraints {
-        if self.sgemv() {
-            sgemv::workgroup_shape_constraints(&self.matrix, device)
+        let mut constraints = WorkgroupShapeConstraints::new();
+        if self.m_size() == 1 && device.subgroups_supported() {
+            constraints.add_constraint(0, Constraint::Equals(256));
+            constraints.add_constraint(1, Constraint::Equals(1));
         } else {
-            sgemm::workgroup_shape_constraints(&self.matrix, device)
+            constraints.add_constraint(0, Constraint::Equals(16));
+            constraints.add_constraint(1, Constraint::Equals(16));
         }
+        constraints.add_constraint(2, Constraint::Equals(1));
+        constraints
     }
 
     fn dispatch_size(
         &self,
-        workgroup_shape: &crate::mir::workgroup_shape::WorkgroupShape,
+        _workgroup_shape: &crate::mir::workgroup_shape::WorkgroupShape,
         _: &[MirValue],
     ) -> [u32; 3] {
         let n = self.n_size();
@@ -106,10 +148,14 @@ impl Operation for QMatMulOperation {
             .map(|x| *x as u32)
             .product();
 
-        if self.sgemv() {
-            sgemv::dispatch_size(&self.matrix, n, m, batch_size)
+        if m == 1 {
+            let format = self.direct_quant_format();
+            let cols = format
+                .map(|format| qgemv_cols_per_workgroup(format, 32))
+                .unwrap_or(256);
+            [ceil_div_u32(n, cols), 1, batch_size]
         } else {
-            sgemm::dispatch_size(self, workgroup_shape, &self.matrix, n, m, batch_size)
+            [ceil_div_u32(n, 64), ceil_div_u32(m, 32), batch_size]
         }
     }
 
@@ -125,50 +171,117 @@ impl Operation for QMatMulOperation {
         vec![input.into(), q_matrix.into(), output_tensor.into()]
     }
 
-    // Related files/PRs in llama.cpp for reference:
-    // https://github.com/ggml-org/llama.cpp/pull/2290
-    // https://github.com/ggml-org/llama.cpp/blob/add2a3aa5a1571211aa5c7303b8e80c8d1824b91/ggml/src/ggml-metal/ggml-metal.metal#L4561
-    // https://github.com/ggml-org/llama.cpp/blob/add2a3aa5a1571211aa5c7303b8e80c8d1824b91/ggml/src/ggml-metal/ggml-metal.metal#L5881
-    // based on https://siboehm.com/articles/22/CUDA-MMM
-    fn build_kernel(
+    fn build_direct_kernel(
         &self,
         graph: &crate::compute_graph::ComputeGraphInner,
-        workgroup_shape: &crate::mir::workgroup_shape::WorkgroupShape,
-        _: &[MirValue],
-        generic_kernel: &mut GenericKernel,
-    ) {
-        let datatype = self.input_datatype;
-        let rank = self.in_shape.len() as u32;
-        let matrix_rank = self.matrix.shape.len() as u32;
-
-        let input_a = generic_kernel.add_tensor_input(rank, false, datatype);
-        let input_b = generic_kernel.add_q_matrix_input(matrix_rank, self.matrix.datatype);
-        let output = generic_kernel.add_tensor_input(rank, true, datatype);
-
-        // For batched operations, we need to get the correct dimension indices
-        let k_size = input_a.shape_binding(rank - 1).to_string(); // Last dimension is K
-        let m_size = input_a.shape_binding(rank - 2).to_string(); // Second-to-last dimension is M
-        let n_size = input_b.shape_binding(0).to_string();
-
-        // Check if this is a sgemv or sgemm operation
-        let algo = if self.sgemv() {
-            sgemv::sgemv
-        } else {
-            sgemm::sgemm
+        _: &crate::mir::workgroup_shape::WorkgroupShape,
+        inputs: &[MirValue],
+    ) -> Option<DirectKernel> {
+        let [input, matrix, output] = inputs else {
+            return None;
         };
+        let input = input.as_tensor()?;
+        let MirValue::QMatrix(matrix) = matrix else {
+            return None;
+        };
+        let output = output.as_tensor()?;
+        if input.datatype() != DataTypeEnum::F32 || output.datatype() != DataTypeEnum::F32 {
+            return None;
+        }
+        if matrix.datatype() == GgmlType::F32 {
+            return self.build_dense_direct_kernel(graph, input, matrix, output);
+        }
+        let input_rank = input.layout().shape().len();
+        if input_rank != output.layout().shape().len() {
+            return None;
+        }
 
-        algo(
-            self,
-            generic_kernel,
-            workgroup_shape,
-            &input_a,
-            &input_b,
-            &output,
-            &n_size,
-            &m_size,
-            &k_size,
-            graph,
+        let format = self.direct_quant_format()?;
+        let a_view = flatten_matrix_layout(input.layout())?;
+        let y_view = flatten_matrix_layout(output.layout())?;
+        let m = a_view.rows;
+        let k = a_view.cols;
+        let y_m = y_view.rows;
+        let n = y_view.cols;
+        if m != y_m || k != self.matrix.shape[1] as u32 || n != self.matrix.shape[0] as u32 {
+            return None;
+        }
+
+        let dispatch_size = if m == 1 {
+            if graph.device().subgroups_supported() {
+                [
+                    ceil_div_u32(
+                        n,
+                        qgemv_cols_per_workgroup(format, graph.device().max_subgroup_size()),
+                    ),
+                    1,
+                    1,
+                ]
+            } else {
+                [ceil_div_u32(n, 256), 1, 1]
+            }
+        } else {
+            [ceil_div_u32(n, 64), ceil_div_u32(m, 32), 1]
+        };
+        let cache_key = format!(
+            "{}:direct:{format:?}:m={m}:k={k}:n={n}:{:?}:{:?}",
+            self.name(),
+            input.layout(),
+            output.layout()
         );
+        let module =
+            if let Some(module) = graph.device().naga_module_cache().write().get(&cache_key) {
+                module.clone()
+            } else {
+                let ir = tile_ir::build(move |mut phase| {
+                    let a = storage_tensor_read_with_direct_layout(&mut phase, a_view);
+                    let b = phase.quantized_matrix(format, k, n);
+                    let y = storage_tensor_with_direct_layout(&mut phase, y_view);
+                    if m == 1 && graph.device().subgroups_supported() {
+                        phase.qmatmul(&a, &b, &y);
+                    } else if m == 1 {
+                        phase.qmatmul_with_tile_plan_options(&a, &b, &y, 1, 1, 1, 4, false);
+                    } else {
+                        phase.qmatmul_with_tile_plan(&a, &b, &y, 32, 64, 32, 4);
+                    }
+                    phase.finish()
+                });
+                let module = ir.lower_to_naga().ok()?.module().clone();
+                graph
+                    .device()
+                    .naga_module_cache()
+                    .write()
+                    .get_or_insert(cache_key.clone(), || module.clone())
+                    .clone()
+            };
+
+        Some(DirectKernel::new_with_cache_key(
+            self.name(),
+            cache_key,
+            module,
+            vec![
+                DirectKernelBinding::Storage {
+                    binding: 0,
+                    buffer: input.buffer().clone(),
+                    read_only: true,
+                },
+                DirectKernelBinding::Storage {
+                    binding: 1,
+                    buffer: matrix.buffer().clone(),
+                    read_only: true,
+                },
+                DirectKernelBinding::Storage {
+                    binding: 2,
+                    buffer: output.buffer().clone(),
+                    read_only: false,
+                },
+            ],
+            dispatch_size,
+        ))
+    }
+
+    fn requires_single_kernel_batch(&self) -> bool {
+        true
     }
 
     fn output(&self, _: &crate::compute_graph::ComputeGraphInner, inputs: &[MirValue]) -> MirValue {
@@ -193,5 +306,194 @@ impl Operation for QMatMulOperation {
                 .collect::<Vec<_>>()
                 .join("x")
         )
+    }
+
+    fn output_layout(
+        &self,
+        _: &rustc_hash::FxHashMap<NodeIndex, crate::TensorLayoutInfo>,
+    ) -> crate::TensorLayoutInfo {
+        crate::TensorLayoutInfo::new(
+            crate::Layout::contiguous(&self.out_shape),
+            self.input_datatype,
+        )
+    }
+}
+
+impl QMatMulOperation {
+    fn build_dense_direct_kernel(
+        &self,
+        graph: &crate::compute_graph::ComputeGraphInner,
+        input: &TensorData,
+        matrix: &QMatrix,
+        output: &TensorData,
+    ) -> Option<DirectKernel> {
+        let [n, k] = matrix.shape() else {
+            return None;
+        };
+        let (n, k) = (*n, *k);
+        let input_shape = input.layout().shape();
+        let rank = input_shape.len();
+        if rank < 2 {
+            return None;
+        }
+        let mut dense_shape = input_shape.to_vec();
+        dense_shape[rank - 2] = k;
+        dense_shape[rank - 1] = n;
+        let mut dense_strides = vec![0; rank];
+        dense_strides[rank - 2] = 1;
+        dense_strides[rank - 1] = k;
+        let dense_weight_t = TensorData::new_from_parts(
+            matrix.device(),
+            matrix.buffer().clone(),
+            Layout::from_parts(
+                0,
+                dense_shape.into_boxed_slice(),
+                dense_strides.into_boxed_slice(),
+            ),
+            DataTypeEnum::F32,
+        );
+        let device = graph.device();
+        let dense_matmul = MatMulOperation::new(
+            DataTypeEnum::F32,
+            self.input,
+            self.input,
+            input.layout().shape(),
+            dense_weight_t.layout().shape(),
+            None,
+            &device,
+        );
+        dense_matmul.build_direct_kernel(
+            graph,
+            &dense_matmul
+                .workgroup_shape_constraints(&device)
+                .solve(device.max_subgroup_size())?,
+            &[
+                input.clone().into(),
+                dense_weight_t.into(),
+                output.clone().into(),
+            ],
+        )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{mem::size_of, sync::Arc};
+
+    use fusor_gguf::{BlockQ4_0, BlockQ8_0, GgufBlock};
+
+    use super::*;
+    use crate::{
+        compute_graph::{ComputeGraphInner, ComputeGraphNodes},
+        mir::workgroup_shape::WorkgroupShape,
+    };
+
+    fn padded_copy_size(size: u64) -> u64 {
+        let align_mask = wgpu::COPY_BUFFER_ALIGNMENT - 1;
+        ((size + align_mask) & !align_mask).max(wgpu::COPY_BUFFER_ALIGNMENT)
+    }
+
+    #[tokio::test]
+    async fn qmatmul_direct_kernel_binds_compact_quantized_weight_buffer() {
+        let Ok(device) = Device::new().await else {
+            return;
+        };
+
+        let weight_shape = [128usize, 256usize];
+        let element_count = weight_shape.iter().product::<usize>();
+        let block_count = element_count / BlockQ4_0::BLOCK_SIZE;
+        let raw_bytes = vec![0; block_count * size_of::<BlockQ4_0>()];
+        let matrix =
+            QMatrix::from_parts(&device, &raw_bytes, weight_shape.into(), GgmlType::Q4_0).unwrap();
+
+        let compact_len = block_count * size_of::<<BlockQ4_0 as GgufBlock>::BytesF32>();
+        let dense_len = element_count * size_of::<f32>();
+        assert_eq!(matrix.buffer().size(), padded_copy_size(compact_len as u64));
+        assert!(matrix.buffer().size() < padded_copy_size(dense_len as u64));
+
+        let input = TensorData::new_for_shape(&device, &[1, weight_shape[1]], DataTypeEnum::F32);
+        let output = TensorData::new_for_shape(&device, &[1, weight_shape[0]], DataTypeEnum::F32);
+        let graph = ComputeGraphInner {
+            device: device.downgrade(),
+            nodes: ComputeGraphNodes::default(),
+        };
+        let operation = QMatMulOperation {
+            input_datatype: DataTypeEnum::F32,
+            input: NodeIndex::new(0),
+            matrix: matrix.clone(),
+            in_shape: Box::new([1, weight_shape[1]]),
+            out_shape: Box::new([1, weight_shape[0]]),
+        };
+        let kernel = operation
+            .build_direct_kernel(
+                &graph,
+                &WorkgroupShape::new(256, 1, 1),
+                &[input.into(), matrix.clone().into(), output.into()],
+            )
+            .expect("qmatmul should build a direct quantized kernel");
+
+        let bindings = kernel.bindings_for_test();
+        assert_eq!(bindings.len(), 3);
+        let DirectKernelBinding::Storage {
+            binding,
+            buffer,
+            read_only,
+        } = &bindings[1];
+        assert_eq!(*binding, 1);
+        assert!(*read_only);
+        assert!(Arc::ptr_eq(buffer, matrix.buffer()));
+    }
+
+    #[tokio::test]
+    async fn qmatmul_accepts_dense_f32_qmatrix_without_generic_fallback() {
+        let Ok(device) = Device::new().await else {
+            return;
+        };
+
+        let weights = [1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0];
+        let matrix = QMatrix::from_parts(
+            &device,
+            bytemuck::cast_slice(&weights),
+            Box::new([2usize, 4usize]),
+            GgmlType::F32,
+        )
+        .unwrap();
+        let input_rows = vec![vec![1.0f32, 2.0, 3.0, 4.0]];
+        let input: Tensor<2, f32> = Tensor::new(&device, &input_rows);
+
+        let result = input.q_mat_mul(&matrix).as_slice().await.unwrap();
+
+        assert_eq!(result.shape(), &[1, 2]);
+        assert!((result[[0, 0]] - 30.0).abs() < 1e-4);
+        assert!((result[[0, 1]] - 70.0).abs() < 1e-4);
+    }
+
+    #[tokio::test]
+    async fn f16_qmatmul_casts_through_f32_direct_path() {
+        let Ok(device) = Device::new().await else {
+            return;
+        };
+        if !device.f16_supported() {
+            return;
+        }
+
+        let weight_shape = [4usize, BlockQ8_0::BLOCK_SIZE];
+        let block_count = weight_shape.iter().product::<usize>() / BlockQ8_0::BLOCK_SIZE;
+        let raw_bytes = vec![0; block_count * size_of::<BlockQ8_0>()];
+        let matrix =
+            QMatrix::from_parts(&device, &raw_bytes, weight_shape.into(), GgmlType::Q8_0).unwrap();
+        let input_rows = vec![vec![half::f16::from_f32(0.25); weight_shape[1]]];
+        let input: Tensor<2, half::f16> = Tensor::new(&device, &input_rows);
+
+        let result = input.q_mat_mul(&matrix).as_slice().await.unwrap();
+
+        assert_eq!(result.shape(), &[1, weight_shape[0]]);
+        assert!(
+            result
+                .as_slice()
+                .iter()
+                .take(weight_shape[0])
+                .all(|value| *value == half::f16::from_f32(0.0))
+        );
     }
 }

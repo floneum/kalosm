@@ -398,6 +398,20 @@ impl<'a> Lowerer<'a> {
         coords: &[Handle<Expression>],
         skip_loop_offsets: bool,
     ) -> Result<(Handle<Expression>, Vec<Range<Expression>>), LowerError> {
+        if let Some(index_map) = &view.index_map {
+            if view.dynamic_offsets.iter().any(Option::is_some) {
+                return Err(LowerError::UnsupportedOperation(
+                    "mapped storage views do not support dynamic offsets",
+                ));
+            }
+            if skip_loop_offsets {
+                return Err(LowerError::UnsupportedOperation(
+                    "mapped storage views do not support partial dynamic-offset indexing",
+                ));
+            }
+            return self.storage_index_from_index_map(expressions, index_map, coords);
+        }
+
         let layout = self.storage_layout(view)?;
         if layout.strides().rank() != coords.len() {
             return Err(LowerError::UnsupportedOperation("layout rank mismatch"));
@@ -433,6 +447,177 @@ impl<'a> Lowerer<'a> {
         }
 
         Ok((index, emits))
+    }
+
+    fn storage_index_from_index_map(
+        &self,
+        expressions: &mut Arena<Expression>,
+        index_map: &StorageIndexMap,
+        coords: &[Handle<Expression>],
+    ) -> Result<(Handle<Expression>, Vec<Range<Expression>>), LowerError> {
+        match index_map {
+            StorageIndexMap::Im2ColNhwc(map) => {
+                self.storage_index_from_im2col_nhwc(expressions, *map, coords)
+            }
+            StorageIndexMap::FlattenedMatrix(map) => {
+                self.storage_index_from_flattened_matrix(expressions, map, coords)
+            }
+        }
+    }
+
+    fn storage_index_from_flattened_matrix(
+        &self,
+        expressions: &mut Arena<Expression>,
+        map: &FlattenedMatrixMap,
+        coords: &[Handle<Expression>],
+    ) -> Result<(Handle<Expression>, Vec<Range<Expression>>), LowerError> {
+        if coords.len() != 2 {
+            return Err(LowerError::UnsupportedOperation(
+                "flattened matrix storage views require matrix coordinates",
+            ));
+        }
+        if map.prefix_shape.is_empty() || map.prefix_shape.len() != map.prefix_strides.len() {
+            return Err(LowerError::UnsupportedOperation(
+                "flattened matrix prefix metadata mismatch",
+            ));
+        }
+
+        let mut emits = Vec::new();
+        let row = coords[0];
+        let col = coords[1];
+        let mut remaining = row;
+        let mut terms = Vec::with_capacity(map.prefix_shape.len() + 1);
+
+        for axis in (0..map.prefix_shape.len()).rev() {
+            let dim = map.prefix_shape[axis];
+            let coord = if axis == 0 {
+                remaining
+            } else {
+                let coord = self.mod_literal_u32_emitted(expressions, remaining, dim, &mut emits);
+                remaining = self.div_literal_u32_emitted(expressions, remaining, dim, &mut emits);
+                coord
+            };
+            let stride = map.prefix_strides[axis];
+            if stride != 0 {
+                terms.push(self.mul_literal_u32_emitted(expressions, coord, stride, &mut emits));
+            }
+        }
+
+        if map.column_stride != 0 {
+            terms.push(self.mul_literal_u32_emitted(
+                expressions,
+                col,
+                map.column_stride,
+                &mut emits,
+            ));
+        }
+
+        let mut terms = terms.into_iter();
+        let Some(mut index) = terms.next() else {
+            let zero = expressions.append(Expression::Literal(Literal::U32(0)), Span::default());
+            return Ok((zero, emits));
+        };
+        for term in terms {
+            index = Self::add_u32_expr(expressions, index, term, &mut emits);
+        }
+        Ok((index, emits))
+    }
+
+    fn storage_index_from_im2col_nhwc(
+        &self,
+        expressions: &mut Arena<Expression>,
+        map: Im2ColNhwcMap,
+        coords: &[Handle<Expression>],
+    ) -> Result<(Handle<Expression>, Vec<Range<Expression>>), LowerError> {
+        if coords.len() != 2 {
+            return Err(LowerError::UnsupportedOperation(
+                "im2col storage views require matrix coordinates",
+            ));
+        }
+
+        let mut emits = Vec::new();
+        let row = coords[0];
+        let k = coords[1];
+        let output_pixels =
+            map.out_h
+                .checked_mul(map.out_w)
+                .ok_or(LowerError::UnsupportedOperation(
+                    "im2col output shape overflow",
+                ))?;
+        let kernel_w_channels =
+            map.kernel_w
+                .checked_mul(map.channels)
+                .ok_or(LowerError::UnsupportedOperation(
+                    "im2col kernel shape overflow",
+                ))?;
+
+        let batch = self.div_literal_u32_emitted(expressions, row, output_pixels, &mut emits);
+        let output_index =
+            self.mod_literal_u32_emitted(expressions, row, output_pixels, &mut emits);
+        let out_y = self.div_literal_u32_emitted(expressions, output_index, map.out_w, &mut emits);
+        let out_x = self.mod_literal_u32_emitted(expressions, output_index, map.out_w, &mut emits);
+
+        let kernel_y = self.div_literal_u32_emitted(expressions, k, kernel_w_channels, &mut emits);
+        let kernel_xc = self.mod_literal_u32_emitted(expressions, k, kernel_w_channels, &mut emits);
+        let kernel_x =
+            self.div_literal_u32_emitted(expressions, kernel_xc, map.channels, &mut emits);
+        let channel =
+            self.mod_literal_u32_emitted(expressions, kernel_xc, map.channels, &mut emits);
+
+        let out_y = self.mul_literal_u32_emitted(expressions, out_y, map.stride_h, &mut emits);
+        let kernel_y =
+            self.mul_literal_u32_emitted(expressions, kernel_y, map.dilation_h, &mut emits);
+        let in_y = Self::add_u32_expr(expressions, out_y, kernel_y, &mut emits);
+        let out_x = self.mul_literal_u32_emitted(expressions, out_x, map.stride_w, &mut emits);
+        let kernel_x =
+            self.mul_literal_u32_emitted(expressions, kernel_x, map.dilation_w, &mut emits);
+        let in_x = Self::add_u32_expr(expressions, out_x, kernel_x, &mut emits);
+
+        let terms = [
+            (batch, map.batch_stride),
+            (in_y, map.row_stride),
+            (in_x, map.col_stride),
+            (channel, map.channel_stride),
+        ];
+        let mut index = None;
+        for (coord, stride) in terms {
+            if Self::is_u32_literal(expressions, coord, 0) || stride == 0 {
+                continue;
+            }
+            let term = self.mul_literal_u32_emitted(expressions, coord, stride, &mut emits);
+            index = Some(match index {
+                Some(index) => Self::add_u32_expr(expressions, index, term, &mut emits),
+                None => term,
+            });
+        }
+        let index = index.unwrap_or_else(|| {
+            expressions.append(Expression::Literal(Literal::U32(0)), Span::default())
+        });
+        Ok((index, emits))
+    }
+
+    fn add_u32_expr(
+        expressions: &mut Arena<Expression>,
+        left: Handle<Expression>,
+        right: Handle<Expression>,
+        emits: &mut Vec<Range<Expression>>,
+    ) -> Handle<Expression> {
+        if Self::is_u32_literal(expressions, left, 0) {
+            return right;
+        }
+        if Self::is_u32_literal(expressions, right, 0) {
+            return left;
+        }
+        let value = expressions.append(
+            Expression::Binary {
+                op: BinaryOperator::Add,
+                left,
+                right,
+            },
+            Span::default(),
+        );
+        emits.push(Self::single_expression_range(expressions, value));
+        value
     }
 
     pub(super) fn storage_index_from_flat(

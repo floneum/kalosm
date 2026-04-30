@@ -8,8 +8,8 @@ use crate::{
 };
 
 use super::{
+    direct_kernel::DirectKernel,
     inputs::MirValue,
-    kernel::GenericKernel,
     workgroup_shape::{WorkgroupShape, WorkgroupShapeConstraints},
 };
 
@@ -24,17 +24,18 @@ pub(crate) trait Operation: Debug {
 
     fn output(&self, nodes: &ComputeGraphInner, inputs: &[MirValue]) -> MirValue;
 
-    fn build_kernel(
+    fn build_direct_kernel(
         &self,
         nodes: &ComputeGraphInner,
         workgroup_shape: &WorkgroupShape,
         inputs: &[MirValue],
-        kernel: &mut GenericKernel,
-    );
+    ) -> Option<DirectKernel>;
+
+    fn requires_single_kernel_batch(&self) -> bool {
+        false
+    }
 
     fn name(&self) -> String;
 
-    fn output_layout(&self, _: &FxHashMap<NodeIndex, TensorLayoutInfo>) -> TensorLayoutInfo {
-        todo!()
-    }
+    fn output_layout(&self, inputs: &FxHashMap<NodeIndex, TensorLayoutInfo>) -> TensorLayoutInfo;
 }

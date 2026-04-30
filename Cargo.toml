@@ -37,6 +37,7 @@ members = [
     "fusor-ml/conformance",
     "fusor-ml/fusor",
     "fusor-ml/types",
+    "prototypes/phase-token-prototype",
 ]
 
 [workspace.dependencies]

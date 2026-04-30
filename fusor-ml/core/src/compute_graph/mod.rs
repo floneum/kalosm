@@ -342,10 +342,13 @@ impl ComputeGraphInner {
 
     pub(crate) fn get_result_or_qmatrix(&self, key: NodeIndex) -> Option<MaybeQData> {
         let node = self.nodes.nodes.node_weight(key)?;
+        if let Some(cached) = &node.cached {
+            return Some(cached.clone().into());
+        }
         match &node.variant {
             ComputeGraphNodeVariant::Dequantize(op) => Some(op.matrix.clone().into()),
             ComputeGraphNodeVariant::Tensor(op) => Some(op.clone().into()),
-            _ => node.cached.as_ref().map(|t| t.clone().into()),
+            _ => None,
         }
     }
 

@@ -8,8 +8,6 @@ use parking_lot::RwLock;
 use rustc_hash::FxBuildHasher;
 use std::{num::NonZeroUsize, sync::OnceLock};
 
-use crate::mir::kernel::GenericKernel;
-
 const MAX_WORKGROUP_SIZE: u32 = 256;
 
 #[derive(Debug, Clone, Copy)]
@@ -54,14 +52,6 @@ impl WorkgroupShape {
 
     pub(crate) fn shape(&self) -> [u32; 3] {
         self.shape
-    }
-
-    pub(crate) fn linearized_workgroup_index(&self, kernel: &mut GenericKernel) -> String {
-        // Use num_workgroups builtin to correctly compute flat workgroup index
-        // when workgroups are spread across multiple dispatch dimensions
-        let wg = kernel.workgroup_index();
-        let nw = kernel.num_workgroups();
-        format!("({wg}.x + {wg}.y * {nw}.x + {wg}.z * {nw}.x * {nw}.y)")
     }
 }
 

@@ -1,7 +1,10 @@
 use std::sync::Arc;
 
 use crate::{
-    DataType, Tensor, compute_graph::NodeIndex, nary_wise::NaryExpr, tensor::DataTypeEnum,
+    DataType, Tensor,
+    compute_graph::NodeIndex,
+    nary_wise::{NaryExpr, NaryOp, NaryScalar},
+    tensor::DataTypeEnum,
 };
 
 impl<D: DataType> Tensor<4, D> {
@@ -124,7 +127,7 @@ impl RopeFusedOperation {
             RopeMode::Interleaved => NaryExpr::unary_op(
                 dim_last,
                 "div2",
-                "let output = input / 2u;",
+                NaryOp::DivConst(NaryScalar::U32(2)),
                 DataTypeEnum::U32,
                 DataTypeEnum::U32,
             ),
@@ -134,7 +137,7 @@ impl RopeFusedOperation {
                 NaryExpr::unary_op(
                     dim_last,
                     "mod_half",
-                    format!("let output = input % {}u;", half),
+                    NaryOp::RemConst(NaryScalar::U32(half as u32)),
                     DataTypeEnum::U32,
                     DataTypeEnum::U32,
                 )
@@ -150,23 +153,71 @@ impl RopeFusedOperation {
 
         match self.mode {
             // Interleaved: neighbor at dim_last ± 1 based on parity
-            RopeMode::Interleaved => NaryExpr::unary_op(
-                dim_last,
-                "neighbor_idx",
-                "let output = select(input - 1u, input + 1u, (input % 2u) == 0u);",
-                DataTypeEnum::U32,
-                DataTypeEnum::U32,
-            ),
+            RopeMode::Interleaved => {
+                let parity = NaryExpr::unary_op(
+                    dim_last.clone(),
+                    "mod2",
+                    NaryOp::RemConst(NaryScalar::U32(2)),
+                    DataTypeEnum::U32,
+                    DataTypeEnum::U32,
+                );
+                let is_even = NaryExpr::unary_op(
+                    parity,
+                    "eq0",
+                    NaryOp::EqualConst(NaryScalar::U32(0)),
+                    DataTypeEnum::U32,
+                    DataTypeEnum::U32,
+                );
+                let plus_one = NaryExpr::unary_op(
+                    dim_last.clone(),
+                    "add1",
+                    NaryOp::AddConst(NaryScalar::U32(1)),
+                    DataTypeEnum::U32,
+                    DataTypeEnum::U32,
+                );
+                let minus_one = NaryExpr::unary_op(
+                    dim_last,
+                    "sub1",
+                    NaryOp::SubConst(NaryScalar::U32(1)),
+                    DataTypeEnum::U32,
+                    DataTypeEnum::U32,
+                );
+                NaryExpr::select(
+                    is_even,
+                    plus_one,
+                    minus_one,
+                    DataTypeEnum::U32,
+                    DataTypeEnum::U32,
+                )
+            }
             // Normal: neighbor at dim_last ± half based on position
             RopeMode::Normal => {
                 let half = self.head_dim / 2;
-                NaryExpr::unary_op(
+                let first_half = NaryExpr::unary_op(
+                    dim_last.clone(),
+                    "lt_half",
+                    NaryOp::LessConst(NaryScalar::U32(half as u32)),
+                    DataTypeEnum::U32,
+                    DataTypeEnum::U32,
+                );
+                let plus_half = NaryExpr::unary_op(
+                    dim_last.clone(),
+                    "add_half",
+                    NaryOp::AddConst(NaryScalar::U32(half as u32)),
+                    DataTypeEnum::U32,
+                    DataTypeEnum::U32,
+                );
+                let minus_half = NaryExpr::unary_op(
                     dim_last,
-                    "neighbor_idx",
-                    format!(
-                        "let output = select(input - {}u, input + {}u, input < {}u);",
-                        half, half, half
-                    ),
+                    "sub_half",
+                    NaryOp::SubConst(NaryScalar::U32(half as u32)),
+                    DataTypeEnum::U32,
+                    DataTypeEnum::U32,
+                );
+                NaryExpr::select(
+                    first_half,
+                    plus_half,
+                    minus_half,
                     DataTypeEnum::U32,
                     DataTypeEnum::U32,
                 )
@@ -183,7 +234,7 @@ impl RopeFusedOperation {
             RopeMode::Interleaved => NaryExpr::unary_op(
                 dim_last,
                 "mod2",
-                "let output = input % 2u;",
+                NaryOp::RemConst(NaryScalar::U32(2)),
                 DataTypeEnum::U32,
                 DataTypeEnum::U32,
             ),
@@ -193,7 +244,7 @@ impl RopeFusedOperation {
                 NaryExpr::unary_op(
                     dim_last,
                     "div_half",
-                    format!("let output = input / {}u;", half),
+                    NaryOp::DivConst(NaryScalar::U32(half as u32)),
                     DataTypeEnum::U32,
                     DataTypeEnum::U32,
                 )

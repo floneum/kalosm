@@ -4,32 +4,35 @@ use crate::mir::operation::Operation;
 use crate::{
     Device, Tensor,
     compute_graph::NodeIndex,
-    mir::kernel::GenericKernel,
+    mir::{
+        direct_kernel::{DirectKernel, DirectKernelBinding},
+        tile_direct::{
+            flatten_matrix_layout, storage_tensor_read_with_direct_layout,
+            storage_tensor_with_direct_layout,
+        },
+    },
     nary_wise::UnaryFunctionChain,
     tensor::{DataType, DataTypeEnum, TensorData},
 };
+use phase_token_prototype as tile_ir;
 
 pub mod coop_gemm;
+mod direct;
 pub mod sgemm;
 mod sgemm_params;
 pub mod sgemv;
 mod sgemv_params;
 
 pub fn get_optimal_params(m: usize, n: usize, k: usize, device: &Device) -> MatMulParams {
-    let coop = coop_gemm::CoopGemmParams::default();
-    if device.cooperative_matrix_supported()
-        && m >= coop.block_m as usize
-        && n >= coop.block_n as usize
-        && k >= coop.block_k as usize
-        && m.is_multiple_of(coop.block_m as usize)
-        && n.is_multiple_of(coop.block_n as usize)
-    {
+    if let Some(coop) = coop_gemm::optimal_params(m, n, k, device) {
         return MatMulParams::CoopMatMul(coop);
     }
-    match (m, n, k) {
-        (_, 0..=64, _) => MatMulParams::Vector(gemv_parameters(m, n, k)),
-        (_, _, _) => MatMulParams::MatMul(gemm_parameters(m, n, k)),
+
+    if m <= 32 || n <= 64 {
+        return MatMulParams::Vector(gemv_parameters(m, n, k));
     }
+
+    MatMulParams::MatMul(gemm_parameters(m, n, k))
 }
 
 #[derive(Debug, Clone)]
@@ -66,7 +69,13 @@ impl MatMulOperation {
             let n = second_shape[second_shape.len() - 1];
             let m = first_shape[first_shape.len() - 2];
             let k = first_shape[first_shape.len() - 1];
-            get_optimal_params(m, n, k, device)
+            if datatype == DataTypeEnum::F32 {
+                get_optimal_params(m, n, k, device)
+            } else if m <= 32 || n <= 64 {
+                MatMulParams::Vector(gemv_parameters(m, n, k))
+            } else {
+                MatMulParams::MatMul(gemm_parameters(m, n, k))
+            }
         });
         Self::new_with_parameters(
             datatype,
@@ -124,6 +133,248 @@ impl MatMulOperation {
     pub fn rank(&self) -> u32 {
         self.out_shape.len() as u32
     }
+
+    fn can_use_direct_tile_matmul(&self) -> bool {
+        self.datatype == DataTypeEnum::F32
+            && self
+                .pre_element_wise
+                .iter()
+                .all(|chain| chain.functions.is_empty())
+            && self.post_element_wise.functions.is_empty()
+    }
+
+    fn build_direct_tile_matmul(
+        &self,
+        device: &Device,
+        input_a: &TensorData,
+        input_b: &TensorData,
+        output: &TensorData,
+    ) -> Option<DirectKernel> {
+        let a_view = flatten_matrix_layout(input_a.layout())?;
+        let b_view = flatten_matrix_layout(input_b.layout())?;
+        let y_view = flatten_matrix_layout(output.layout())?;
+        let m = a_view.rows;
+        let k = a_view.cols;
+        let k_b = b_view.rows;
+        let n = b_view.cols;
+        if k != k_b || y_view.rows != m || y_view.cols != n {
+            return None;
+        }
+
+        enum TileMatMulPlan {
+            Gemv {
+                rows_per_workgroup: u32,
+            },
+            Gemm {
+                tile_m: u32,
+                tile_n: u32,
+                tile_k: u32,
+            },
+        }
+
+        let (plan, dispatch_size, cache_key) = if n == 1 {
+            let rows_per_workgroup = if m % 4 == 0 {
+                4
+            } else if m % 2 == 0 {
+                2
+            } else {
+                1
+            };
+            let cache_key = format!(
+                "{}:gemv-tile:{:?}:{:?}:{:?}:rows_per_workgroup={rows_per_workgroup}",
+                self.name(),
+                input_a.layout(),
+                input_b.layout(),
+                output.layout()
+            );
+            (
+                TileMatMulPlan::Gemv { rows_per_workgroup },
+                [ceil_div_u32(m, rows_per_workgroup), 1, 1],
+                cache_key,
+            )
+        } else {
+            let preferred_tiles = if (m >= 512 || n >= 512) && device.cooperative_matrix_supported()
+            {
+                Some((64, 64, 16))
+            } else {
+                match &self.parameters {
+                    MatMulParams::CoopMatMul(_) if m >= 512 || n >= 512 => Some((64, 64, 16)),
+                    MatMulParams::CoopMatMul(params) => {
+                        Some((params.block_m, params.block_n, params.block_k))
+                    }
+                    _ => None,
+                }
+            };
+            let tile_m = preferred_tiles
+                .and_then(|(tile_m, _, _)| exact_divisor(m, tile_m))
+                .or_else(|| largest_divisor_at_most(m, &[128, 64, 32, 16, 8, 4, 2, 1]))?;
+            let tile_n = preferred_tiles
+                .and_then(|(_, tile_n, _)| exact_divisor(n, tile_n))
+                .or_else(|| largest_divisor_at_most(n, &[128, 64, 32, 16, 8, 4, 2, 1]))?;
+            let tile_k = preferred_tiles
+                .and_then(|(_, _, tile_k)| exact_divisor(k, tile_k))
+                .or_else(|| largest_divisor_at_most(k, &[32, 16, 8, 4, 2, 1]))?;
+            let cache_key = format!(
+                "{}:gemm-tile:{:?}:{:?}:{:?}:{:?}:tile={tile_m}x{tile_n}x{tile_k}",
+                self.name(),
+                self.parameters,
+                input_a.layout(),
+                input_b.layout(),
+                output.layout()
+            );
+            (
+                TileMatMulPlan::Gemm {
+                    tile_m,
+                    tile_n,
+                    tile_k,
+                },
+                [n / tile_n, m / tile_m, 1],
+                cache_key,
+            )
+        };
+
+        let module = if let Some(module) = device.naga_module_cache().write().get(&cache_key) {
+            module.clone()
+        } else {
+            let ir = match plan {
+                TileMatMulPlan::Gemv { rows_per_workgroup } => tile_ir::build(move |mut phase| {
+                    let a = storage_tensor_read_with_direct_layout(&mut phase, a_view);
+                    let x = storage_tensor_read_with_direct_layout(&mut phase, b_view);
+                    let y = storage_tensor_with_direct_layout(&mut phase, y_view);
+                    let partials =
+                        phase.alloc_workgroup_tile::<tile_ir::F32>(tile_ir::Shape::new([
+                            128 * rows_per_workgroup
+                        ]));
+                    phase.gemv_tiled(&a, &x, &y, partials, rows_per_workgroup, 4);
+                    phase.finish()
+                }),
+                TileMatMulPlan::Gemm {
+                    tile_m,
+                    tile_n,
+                    tile_k,
+                } => tile_ir::build(move |mut phase| {
+                    let a_full = storage_tensor_read_with_direct_layout(&mut phase, a_view);
+                    let b_full = storage_tensor_read_with_direct_layout(&mut phase, b_view);
+                    let y_full = storage_tensor_with_direct_layout(&mut phase, y_view);
+                    let a = a_full.dynamic_tile_2d(
+                        tile_ir::Shape::new([tile_m, tile_k]),
+                        Some(tile_ir::DynamicOffset::Workgroup(
+                            tile_ir::WorkgroupOffset::new(tile_ir::WorkgroupAxis::Y, tile_m),
+                        )),
+                        Some(tile_ir::DynamicOffset::Loop(tile_ir::LoopOffset::new(
+                            tile_k,
+                        ))),
+                    );
+                    let b = b_full.dynamic_tile_2d(
+                        tile_ir::Shape::new([tile_k, tile_n]),
+                        Some(tile_ir::DynamicOffset::Loop(tile_ir::LoopOffset::new(
+                            tile_k,
+                        ))),
+                        Some(tile_ir::DynamicOffset::Workgroup(
+                            tile_ir::WorkgroupOffset::new(tile_ir::WorkgroupAxis::X, tile_n),
+                        )),
+                    );
+                    let y = y_full.workgroup_tile_2d(
+                        tile_ir::Shape::new([tile_m, tile_n]),
+                        Some(tile_ir::WorkgroupOffset::new(
+                            tile_ir::WorkgroupAxis::Y,
+                            tile_m,
+                        )),
+                        Some(tile_ir::WorkgroupOffset::new(
+                            tile_ir::WorkgroupAxis::X,
+                            tile_n,
+                        )),
+                    );
+                    let mut acc =
+                        phase.alloc_fragment::<tile_ir::F32>(tile_ir::Shape::new([tile_m, tile_n]));
+                    phase.fill_zero(&mut acc);
+                    let acc_out = acc;
+
+                    phase.range_step_count(
+                        k / tile_k,
+                        |mut phase, _| {
+                            let a_tile = phase.alloc_tile_with_layout::<tile_ir::F32>(
+                                workgroup_layout(tile_m, tile_k),
+                            );
+                            let b_tile = phase.alloc_tile_with_layout::<tile_ir::F32>(
+                                workgroup_layout(tile_k, tile_n),
+                            );
+                            let pending = phase.cooperative_load_pair(a_tile, &a, b_tile, &b);
+                            let (a_tile, b_tile, mut phase) = pending.sync_tiles();
+
+                            tile_ir::kernels::gemm::tiled(
+                                &mut phase,
+                                &a_tile,
+                                &b_tile,
+                                &mut acc,
+                                tile_ir::kernels::gemm::GemmTilePlan::portable(
+                                    tile_m, tile_n, tile_k,
+                                ),
+                            );
+                            phase.sync_end()
+                        },
+                        |mut phase| {
+                            phase.store_fragment_to_storage(&acc_out, &y);
+                            phase.finish()
+                        },
+                    )
+                }),
+            };
+            let module = ir.lower_to_naga().ok()?.module().clone();
+            device
+                .naga_module_cache()
+                .write()
+                .get_or_insert(cache_key.clone(), || module.clone())
+                .clone()
+        };
+        Some(DirectKernel::new_with_cache_key(
+            self.name(),
+            cache_key,
+            module,
+            vec![
+                DirectKernelBinding::Storage {
+                    binding: 0,
+                    buffer: input_a.buffer().clone(),
+                    read_only: true,
+                },
+                DirectKernelBinding::Storage {
+                    binding: 1,
+                    buffer: input_b.buffer().clone(),
+                    read_only: true,
+                },
+                DirectKernelBinding::Storage {
+                    binding: 2,
+                    buffer: output.buffer().clone(),
+                    read_only: false,
+                },
+            ],
+            dispatch_size,
+        ))
+    }
+}
+
+fn ceil_div_u32(x: u32, divisor: u32) -> u32 {
+    x.div_ceil(divisor)
+}
+
+fn largest_divisor_at_most(value: u32, candidates: &[u32]) -> Option<u32> {
+    candidates
+        .iter()
+        .copied()
+        .find(|candidate| *candidate <= value && value % *candidate == 0)
+}
+
+fn exact_divisor(value: u32, candidate: u32) -> Option<u32> {
+    (candidate != 0 && candidate <= value && value % candidate == 0).then_some(candidate)
+}
+
+fn workgroup_layout(rows: u32, cols: u32) -> tile_ir::Layout {
+    const SHARED_PAD: u32 = 4;
+    tile_ir::Layout::strided(
+        tile_ir::MemoryLevel::Workgroup,
+        tile_ir::Shape::new([rows, cols]),
+        tile_ir::Strides::new([cols + SHARED_PAD, 1]),
+    )
 }
 
 impl Operation for MatMulOperation {
@@ -211,68 +462,36 @@ impl Operation for MatMulOperation {
         vec![a.into(), b.into(), output_tensor.into()]
     }
 
-    // 1000x1000 dense matmul time on M2 mac pro 1.4743 ms
-    fn build_kernel(
+    fn build_direct_kernel(
         &self,
         graph: &crate::compute_graph::ComputeGraphInner,
         workgroup_shape: &crate::mir::workgroup_shape::WorkgroupShape,
         inputs: &[crate::mir::inputs::MirValue],
-        generic_kernel: &mut GenericKernel,
-    ) {
-        match &self.parameters {
-            MatMulParams::Vector(sgemv_params) => {
-                let [input_a, input_b, _] = inputs else {
-                    panic!("MatMulOperation requires 3 inputs");
-                };
-                let input_a = input_a.as_tensor().unwrap();
-                let input_b = input_b.as_tensor().unwrap();
-
-                let input_a =
-                    generic_kernel.add_tensor_input(self.rank(), false, input_a.datatype());
-                let input_b =
-                    generic_kernel.add_tensor_input(self.rank(), false, input_b.datatype());
-                let output = generic_kernel.add_tensor_input(
-                    self.rank(),
-                    true,
-                    self.post_element_wise.out_datatype(),
-                );
-
-                // Get dimension bindings
-                let k_size = input_a.shape_binding(self.rank() - 1).to_string();
-                let m_size = input_a.shape_binding(self.rank() - 2).to_string();
-                let n_size = input_b.shape_binding(self.rank() - 1).to_string();
-
-                sgemv::sgemv(
-                    self,
-                    generic_kernel,
-                    workgroup_shape,
-                    &input_a,
-                    &input_b,
-                    &output,
-                    &n_size,
-                    &m_size,
-                    &k_size,
-                    sgemv_params,
-                    graph,
-                )
-            }
-            MatMulParams::MatMul(sgemm_params) => sgemm::build_kernel(
-                self,
-                graph,
-                workgroup_shape,
-                inputs,
-                generic_kernel,
-                sgemm_params,
-            ),
-            MatMulParams::CoopMatMul(coop_params) => coop_gemm::build_kernel(
-                self,
-                graph,
-                workgroup_shape,
-                inputs,
-                generic_kernel,
-                coop_params,
-            ),
+    ) -> Option<DirectKernel> {
+        let [input_a, input_b, output] = inputs else {
+            return None;
+        };
+        let input_a = input_a.as_tensor()?;
+        let input_b = input_b.as_tensor()?;
+        let output = output.as_tensor()?;
+        if self.can_use_direct_tile_matmul()
+            && input_a.datatype() == DataTypeEnum::F32
+            && input_b.datatype() == DataTypeEnum::F32
+            && output.datatype() == DataTypeEnum::F32
+            && input_a.layout().rank() == 2
+            && input_b.layout().rank() == 2
+            && output.layout().rank() == 2
+            && let Some(kernel) =
+                self.build_direct_tile_matmul(&graph.device(), input_a, input_b, output)
+        {
+            return Some(kernel);
         }
+
+        direct::build_serial_matmul_direct_kernel(self, graph, workgroup_shape, inputs)
+    }
+
+    fn requires_single_kernel_batch(&self) -> bool {
+        true
     }
 
     fn output(
@@ -298,6 +517,16 @@ impl Operation for MatMulOperation {
                 .map(|s| s.to_string())
                 .collect::<Vec<_>>()
                 .join("x")
+        )
+    }
+
+    fn output_layout(
+        &self,
+        _: &rustc_hash::FxHashMap<NodeIndex, crate::TensorLayoutInfo>,
+    ) -> crate::TensorLayoutInfo {
+        crate::TensorLayoutInfo::new(
+            crate::Layout::contiguous(&self.out_shape),
+            self.post_element_wise.out_datatype(),
         )
     }
 }
