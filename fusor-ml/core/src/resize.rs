@@ -203,17 +203,6 @@ impl Operation for ResizeOperation {
                 .join("x")
         )
     }
-
-    fn output_layout(
-        &self,
-        map: &rustc_hash::FxHashMap<NodeIndex, crate::TensorLayoutInfo>,
-    ) -> crate::TensorLayoutInfo {
-        let input_layout = map.get(&self.input).unwrap();
-        crate::TensorLayoutInfo::new(
-            crate::Layout::contiguous(&self.new_shape),
-            input_layout.datatype(),
-        )
-    }
 }
 
 fn row_major_flat_expr(shape: &[usize]) -> Option<NaryExpr> {

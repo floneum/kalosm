@@ -1,14 +1,8 @@
-use wgpu::naga::{
-    AddressSpace, Arena, BinaryOperator, Binding, Block, BuiltIn, EntryPoint, Expression, Function,
-    FunctionArgument, GlobalVariable, Handle, Literal, LocalVariable, MathFunction, Module,
-    Range as NagaRange, ResourceBinding, Scalar, ScalarKind, ShaderStage, Span, Statement,
-    StorageAccess, Type, TypeInner,
-};
+use phase_token_prototype as tile_ir;
 
 use crate::{
-    Layout,
     mir::{
-        direct_kernel::{DirectKernel, DirectKernelBinding, direct_storage_array_size},
+        direct_kernel::{DirectKernel, DirectKernelBinding},
         inputs::MirValue,
         operation::Operation,
         workgroup_shape::WorkgroupShape,
@@ -18,13 +12,7 @@ use crate::{
     tensor::{DataTypeEnum, TensorData},
 };
 
-#[derive(Clone)]
-struct TensorView {
-    global: Handle<GlobalVariable>,
-    datatype: DataTypeEnum,
-    strides: Vec<u32>,
-    offset: u32,
-}
+const BLOCK: usize = 256;
 
 pub(crate) fn build_reduce_direct_kernel(
     operation: &ReduceOperation,
@@ -51,7 +39,7 @@ pub(crate) fn build_reduce_direct_kernel(
 
     let dispatch_size = operation.dispatch_size(workgroup_shape, inputs);
     let cache_key = format!(
-        "{}:direct:{:?}:dispatch={dispatch_size:?}:reduce={reduce_size}:stride={reduce_stride}:{:?}:{:?}:{:?}:{:?}",
+        "{}:tile-program:{:?}:dispatch={dispatch_size:?}:reduce={reduce_size}:stride={reduce_stride}:{:?}:{:?}:{:?}:{:?}",
         operation.name(),
         workgroup_shape.shape(),
         input.datatype(),
@@ -59,12 +47,25 @@ pub(crate) fn build_reduce_direct_kernel(
         output.datatype(),
         output.layout()
     );
-    let module = ReduceDirectBuilder::new(operation, input.clone(), output.clone())?.build(
-        *workgroup_shape,
-        dispatch_size,
-        reduce_size,
-        reduce_stride,
-    )?;
+    let module = if let Some(module) = graph.device().naga_module_cache().write().get(&cache_key) {
+        module.clone()
+    } else {
+        let ir = build_reduce_tile_ir(
+            operation,
+            &input,
+            &output,
+            dispatch_size,
+            reduce_size,
+            reduce_stride,
+        )?;
+        let module = ir.lower_to_naga().ok()?.module().clone();
+        graph
+            .device()
+            .naga_module_cache()
+            .write()
+            .get_or_insert(cache_key.clone(), || module.clone())
+            .clone()
+    };
 
     Some(DirectKernel::new_with_cache_key(
         operation.name(),
@@ -86,718 +87,199 @@ pub(crate) fn build_reduce_direct_kernel(
     ))
 }
 
-struct ReduceDirectBuilder<'a> {
-    module: Module,
-    u32_ty: Handle<Type>,
-    value_ty: Handle<Type>,
-    input: TensorView,
-    output: TensorView,
-    operation: &'a ReduceOperation,
+fn build_reduce_tile_ir(
+    operation: &ReduceOperation,
+    input: &TensorData,
+    output: &TensorData,
+    dispatch_size: [u32; 3],
+    reduce_size: u32,
+    reduce_stride: u32,
+) -> Option<tile_ir::KernelIr> {
+    let input_meta = TensorMeta::new(input)?;
+    let output_meta = TensorMeta::new(output)?;
+    let output_shape = output
+        .layout()
+        .shape()
+        .iter()
+        .copied()
+        .map(u32::try_from)
+        .collect::<Result<Vec<_>, _>>()
+        .ok()?;
+    let total_outputs = output_shape
+        .iter()
+        .try_fold(1u32, |acc, dim| acc.checked_mul(*dim))?;
+    let reduce_op = tile_reduce_op(operation.function.op);
+    let reduce_dtype = operation.function.datatype();
+    let initial = tile_literal(operation.function.initial_value);
+
+    Some(tile_ir::tile::build(move |phase| {
+        let input_layout = flat_layout(input_meta.allocation_len);
+        let output_layout = flat_layout(output_meta.allocation_len);
+        let input_storage =
+            phase.storage_read_element_with_layout_offset::<2>(input_meta.element, input_layout, 0);
+        let output_storage = phase.storage_write_element_with_layout_offset::<2>(
+            output_meta.element,
+            output_layout,
+            0,
+        );
+
+        phase.program_grid::<BLOCK>(dispatch_size, |program| {
+            let lane = program.arange();
+            let group = linear_group(program, dispatch_size);
+            let flat = group * BLOCK as u32 + lane.clone();
+            let in_bounds = flat.lt(total_outputs);
+            let dims =
+                output_dims_from_flat(tile_ir::tile::Tile::from_index(flat.clone()), &output_shape);
+            let base = layout_index(&input_meta, &dims);
+            let k = tile_ir::tile::Tile::from_index(program.loop_index() * reduce_stride);
+            let value_index = base + k;
+            let value = program.load_erased(
+                input_storage.at(0, value_index),
+                in_bounds.clone(),
+                zero_literal(input_meta.datatype),
+            );
+            let value = cast_tile(value, input_meta.datatype, reduce_dtype);
+            let reduced = program.loop_fold(reduce_op, reduce_size, value, initial);
+            let reduced = cast_tile(reduced, reduce_dtype, output_meta.datatype);
+            let output_index = layout_index(&output_meta, &dims);
+            program.store_erased(output_storage.at(0, output_index), reduced, in_bounds);
+        });
+    }))
 }
 
-impl<'a> ReduceDirectBuilder<'a> {
-    fn new(operation: &'a ReduceOperation, input: TensorData, output: TensorData) -> Option<Self> {
-        let mut module = Module::default();
-        let f32_ty = module.types.insert(
-            Type {
-                name: Some("f32".into()),
-                inner: TypeInner::Scalar(Self::scalar(DataTypeEnum::F32)),
-            },
-            Span::default(),
-        );
-        let u32_ty = module.types.insert(
-            Type {
-                name: Some("u32".into()),
-                inner: TypeInner::Scalar(Self::scalar(DataTypeEnum::U32)),
-            },
-            Span::default(),
-        );
-        let f16_ty = (input.datatype() == DataTypeEnum::F16
-            || output.datatype() == DataTypeEnum::F16
-            || operation.function.datatype() == DataTypeEnum::F16)
-            .then(|| {
-                module.types.insert(
-                    Type {
-                        name: Some("f16".into()),
-                        inner: TypeInner::Scalar(Self::scalar(DataTypeEnum::F16)),
-                    },
-                    Span::default(),
-                )
-            });
-
-        let value_ty = match operation.function.datatype() {
-            DataTypeEnum::F32 => f32_ty,
-            DataTypeEnum::F16 => f16_ty?,
-            DataTypeEnum::U32 => u32_ty,
-        };
-
-        let input = Self::add_tensor(&mut module, 0, &input, true, f32_ty, f16_ty, u32_ty)?;
-        let output = Self::add_tensor(&mut module, 1, &output, false, f32_ty, f16_ty, u32_ty)?;
-
-        Some(Self {
-            module,
-            u32_ty,
-            value_ty,
-            input,
-            output,
-            operation,
+fn output_dims_from_flat<const N: usize>(
+    flat: tile_ir::tile::Tile<N>,
+    shape: &[u32],
+) -> Vec<tile_ir::tile::Tile<N>> {
+    (0..shape.len())
+        .map(|axis| {
+            let divisor = shape[axis + 1..]
+                .iter()
+                .fold(1u32, |acc, dim| acc.saturating_mul(*dim));
+            let quotient = if divisor == 1 {
+                flat.clone()
+            } else {
+                flat.clone() / tile_u32(divisor)
+            };
+            let dim = shape[axis];
+            if dim == 1 {
+                tile_u32(0)
+            } else {
+                quotient % tile_u32(dim)
+            }
         })
-    }
+        .collect()
+}
 
-    fn add_tensor(
-        module: &mut Module,
-        binding: u32,
-        tensor: &TensorData,
-        read_only: bool,
-        f32_ty: Handle<Type>,
-        f16_ty: Option<Handle<Type>>,
-        u32_ty: Handle<Type>,
-    ) -> Option<TensorView> {
-        let layout = tensor.layout();
-        let base = match tensor.datatype() {
-            DataTypeEnum::F32 => f32_ty,
-            DataTypeEnum::F16 => f16_ty?,
-            DataTypeEnum::U32 => u32_ty,
-        };
-        let array_ty = module.types.insert(
-            Type {
-                name: Some(format!("ReduceBuffer{binding}")),
-                inner: TypeInner::Array {
-                    base,
-                    size: direct_storage_array_size(layout_allocation_len(layout)?),
-                    stride: tensor.datatype().element_size() as u32,
-                },
-            },
-            Span::default(),
-        );
-        let global = module.global_variables.append(
-            GlobalVariable {
-                name: Some(format!("reduce_buffer_{binding}")),
-                space: AddressSpace::Storage {
-                    access: if read_only {
-                        StorageAccess::LOAD
-                    } else {
-                        StorageAccess::LOAD | StorageAccess::STORE
-                    },
-                },
-                binding: Some(ResourceBinding { group: 0, binding }),
-                ty: array_ty,
-                init: None,
-            },
-            Span::default(),
-        );
-        Some(TensorView {
-            global,
+fn layout_index<const N: usize>(
+    meta: &TensorMeta,
+    coords: &[tile_ir::tile::Tile<N>],
+) -> tile_ir::tile::Tile<N> {
+    let mut index = tile_u32(meta.offset);
+    for (coord, stride) in coords.iter().zip(&meta.strides) {
+        if *stride != 0 {
+            index = index + coord.clone() * tile_u32(*stride);
+        }
+    }
+    index
+}
+
+fn linear_group<const N: usize>(
+    program: &tile_ir::tile::TileBlock<'_, N>,
+    dispatch_size: [u32; 3],
+) -> tile_ir::tile::ScalarIndex {
+    program.program_id(tile_ir::WorkgroupAxis::X)
+        + program.program_id(tile_ir::WorkgroupAxis::Y) * dispatch_size[0]
+        + program.program_id(tile_ir::WorkgroupAxis::Z)
+            * dispatch_size[0].saturating_mul(dispatch_size[1])
+}
+
+fn flat_layout(allocation_len: u32) -> tile_ir::Layout {
+    tile_ir::Layout::strided(
+        tile_ir::MemoryLevel::Storage,
+        tile_ir::Shape::new([1, allocation_len]),
+        tile_ir::Strides::new([0, 1]),
+    )
+}
+
+fn cast_tile<const N: usize>(
+    value: tile_ir::tile::Tile<N>,
+    source: DataTypeEnum,
+    target: DataTypeEnum,
+) -> tile_ir::tile::Tile<N> {
+    if source == target {
+        value
+    } else {
+        value.cast(tile_element(target))
+    }
+}
+
+fn tile_reduce_op(op: ReduceOp) -> tile_ir::TileReduceOp {
+    match op {
+        ReduceOp::Sum => tile_ir::TileReduceOp::Sum,
+        ReduceOp::Product => tile_ir::TileReduceOp::Product,
+        ReduceOp::Max => tile_ir::TileReduceOp::Max,
+        ReduceOp::Min => tile_ir::TileReduceOp::Min,
+    }
+}
+
+fn tile_literal(value: NaryScalar) -> tile_ir::TileLiteral {
+    match value {
+        NaryScalar::F32(value) => tile_ir::TileLiteral::F32(tile_ir::F32Bits::new(value)),
+        NaryScalar::F16(value) => tile_ir::TileLiteral::F16(value.to_bits()),
+        NaryScalar::U32(value) => tile_ir::TileLiteral::U32(value),
+    }
+}
+
+fn tile_u32<const N: usize>(value: u32) -> tile_ir::tile::Tile<N> {
+    tile_ir::tile::Tile::literal(tile_ir::TileLiteral::U32(value))
+}
+
+fn zero_literal(value: DataTypeEnum) -> tile_ir::TileLiteral {
+    match value {
+        DataTypeEnum::F32 => tile_ir::TileLiteral::F32(tile_ir::F32Bits::new(0.0)),
+        DataTypeEnum::F16 => tile_ir::TileLiteral::F16(half::f16::from_f32(0.0).to_bits()),
+        DataTypeEnum::U32 => tile_ir::TileLiteral::U32(0),
+    }
+}
+
+fn tile_element(value: DataTypeEnum) -> tile_ir::ElementType {
+    match value {
+        DataTypeEnum::F32 => tile_ir::ElementType::F32,
+        DataTypeEnum::F16 => tile_ir::ElementType::F16,
+        DataTypeEnum::U32 => tile_ir::ElementType::U32,
+    }
+}
+
+#[derive(Clone)]
+struct TensorMeta {
+    datatype: DataTypeEnum,
+    element: tile_ir::ElementType,
+    strides: Vec<u32>,
+    offset: u32,
+    allocation_len: u32,
+}
+
+impl TensorMeta {
+    fn new(tensor: &TensorData) -> Option<Self> {
+        Some(Self {
             datatype: tensor.datatype(),
-            strides: layout
+            element: tile_element(tensor.datatype()),
+            strides: tensor
+                .layout()
                 .strides()
                 .iter()
                 .copied()
                 .map(u32::try_from)
                 .collect::<Result<Vec<_>, _>>()
                 .ok()?,
-            offset: layout.offset().try_into().ok()?,
+            offset: tensor.layout().offset().try_into().ok()?,
+            allocation_len: layout_allocation_len(tensor.layout())?,
         })
-    }
-
-    fn build(
-        mut self,
-        workgroup_shape: WorkgroupShape,
-        dispatch_size: [u32; 3],
-        reduce_size: u32,
-        reduce_stride: u32,
-    ) -> Option<Module> {
-        let workgroup_id_ty = self.module.types.insert(
-            Type {
-                name: Some("ReduceWorkgroupId".into()),
-                inner: TypeInner::Vector {
-                    size: wgpu::naga::VectorSize::Tri,
-                    scalar: Self::scalar(DataTypeEnum::U32),
-                },
-            },
-            Span::default(),
-        );
-        let mut function = Function {
-            name: Some("main".into()),
-            arguments: vec![
-                FunctionArgument {
-                    name: Some("local_invocation_index".into()),
-                    ty: self.u32_ty,
-                    binding: Some(Binding::BuiltIn(BuiltIn::LocalInvocationIndex)),
-                },
-                FunctionArgument {
-                    name: Some("workgroup_id".into()),
-                    ty: workgroup_id_ty,
-                    binding: Some(Binding::BuiltIn(BuiltIn::WorkGroupId)),
-                },
-            ],
-            ..Function::default()
-        };
-
-        let merged_local = function.local_variables.append(
-            LocalVariable {
-                name: Some("merged".into()),
-                ty: self.value_ty,
-                init: None,
-            },
-            Span::default(),
-        );
-        let k_local = function.local_variables.append(
-            LocalVariable {
-                name: Some("k".into()),
-                ty: self.u32_ty,
-                init: None,
-            },
-            Span::default(),
-        );
-
-        let mut body = Block::new();
-        let wg_flat =
-            self.workgroup_flat_index(&mut function.expressions, &mut body, dispatch_size);
-        let group_base = self.mul_lit_u32(
-            &mut function.expressions,
-            &mut body,
-            wg_flat,
-            workgroup_shape.x() * workgroup_shape.y() * workgroup_shape.z(),
-        );
-        let local = self.append(&mut function.expressions, Expression::FunctionArgument(0));
-        let output_flat = self.binary(
-            &mut function.expressions,
-            &mut body,
-            BinaryOperator::Add,
-            group_base,
-            local,
-        );
-        let total_outputs = self
-            .output
-            .strides
-            .iter()
-            .zip(
-                self.operation
-                    .shape
-                    .iter()
-                    .enumerate()
-                    .filter_map(|(i, dim)| (i != self.operation.axis).then_some(*dim)),
-            )
-            .map(|(_, dim)| dim)
-            .try_fold(1u32, |acc, dim| acc.checked_mul(dim.try_into().ok()?))?;
-        let in_bounds = self.cmp_lit_u32(
-            &mut function.expressions,
-            &mut body,
-            BinaryOperator::Less,
-            output_flat,
-            total_outputs,
-        );
-
-        let mut accept = Block::new();
-        let dims =
-            self.output_dims_from_flat(&mut function.expressions, &mut accept, output_flat)?;
-        let input_base =
-            self.layout_index(&mut function.expressions, &mut accept, &self.input, &dims);
-        let output_index =
-            self.layout_index(&mut function.expressions, &mut accept, &self.output, &dims);
-        let initial = self.scalar_literal(
-            &mut function.expressions,
-            &mut accept,
-            self.operation.function.initial_value,
-        );
-        let merged_ptr = self.local_pointer(&mut function.expressions, merged_local);
-        accept.push(
-            Statement::Store {
-                pointer: merged_ptr,
-                value: initial,
-            },
-            Span::default(),
-        );
-        let zero = self.u32(&mut function.expressions, 0);
-        let k_ptr = self.local_pointer(&mut function.expressions, k_local);
-        accept.push(
-            Statement::Store {
-                pointer: k_ptr,
-                value: zero,
-            },
-            Span::default(),
-        );
-
-        let mut loop_body = Block::new();
-        let k_ptr = self.local_pointer(&mut function.expressions, k_local);
-        let k = self.emit(
-            &mut function.expressions,
-            &mut loop_body,
-            Expression::Load { pointer: k_ptr },
-        );
-        let done = self.cmp_lit_u32(
-            &mut function.expressions,
-            &mut loop_body,
-            BinaryOperator::GreaterEqual,
-            k,
-            reduce_size,
-        );
-        loop_body.push(
-            Statement::If {
-                condition: done,
-                accept: Block::from_vec(vec![Statement::Break]),
-                reject: Block::new(),
-            },
-            Span::default(),
-        );
-        let reduce_offset =
-            self.mul_lit_u32(&mut function.expressions, &mut loop_body, k, reduce_stride);
-        let input_index = self.binary(
-            &mut function.expressions,
-            &mut loop_body,
-            BinaryOperator::Add,
-            input_base,
-            reduce_offset,
-        );
-        let input_ptr = self.storage_pointer(
-            &mut function.expressions,
-            &mut loop_body,
-            &self.input,
-            input_index,
-        );
-        let value = self.emit(
-            &mut function.expressions,
-            &mut loop_body,
-            Expression::Load { pointer: input_ptr },
-        );
-        let value = self.cast_value(
-            &mut function.expressions,
-            &mut loop_body,
-            value,
-            self.input.datatype,
-            self.operation.function.datatype(),
-        );
-        let merged_ptr = self.local_pointer(&mut function.expressions, merged_local);
-        let merged = self.emit(
-            &mut function.expressions,
-            &mut loop_body,
-            Expression::Load {
-                pointer: merged_ptr,
-            },
-        );
-        let reduced = self.reduce_value(&mut function.expressions, &mut loop_body, value, merged);
-        let merged_ptr = self.local_pointer(&mut function.expressions, merged_local);
-        loop_body.push(
-            Statement::Store {
-                pointer: merged_ptr,
-                value: reduced,
-            },
-            Span::default(),
-        );
-        let next_k = self.add_lit_u32(&mut function.expressions, &mut loop_body, k, 1);
-        let k_ptr = self.local_pointer(&mut function.expressions, k_local);
-        loop_body.push(
-            Statement::Store {
-                pointer: k_ptr,
-                value: next_k,
-            },
-            Span::default(),
-        );
-        accept.push(
-            Statement::Loop {
-                body: loop_body,
-                continuing: Block::new(),
-                break_if: None,
-            },
-            Span::default(),
-        );
-
-        let merged_ptr = self.local_pointer(&mut function.expressions, merged_local);
-        let output_value = self.emit(
-            &mut function.expressions,
-            &mut accept,
-            Expression::Load {
-                pointer: merged_ptr,
-            },
-        );
-        let output_value = self.cast_value(
-            &mut function.expressions,
-            &mut accept,
-            output_value,
-            self.operation.function.datatype(),
-            self.output.datatype,
-        );
-        let output_ptr = self.storage_pointer(
-            &mut function.expressions,
-            &mut accept,
-            &self.output,
-            output_index,
-        );
-        accept.push(
-            Statement::Store {
-                pointer: output_ptr,
-                value: output_value,
-            },
-            Span::default(),
-        );
-
-        body.push(
-            Statement::If {
-                condition: in_bounds,
-                accept,
-                reject: Block::new(),
-            },
-            Span::default(),
-        );
-        body.push(Statement::Return { value: None }, Span::default());
-        function.body = body;
-        self.module.entry_points.push(EntryPoint {
-            name: "main".into(),
-            stage: ShaderStage::Compute,
-            early_depth_test: None,
-            workgroup_size: [
-                workgroup_shape.x(),
-                workgroup_shape.y(),
-                workgroup_shape.z(),
-            ],
-            workgroup_size_overrides: None,
-            function,
-            mesh_info: None,
-            task_payload: None,
-            incoming_ray_payload: None,
-        });
-
-        let mut capabilities = wgpu::naga::valid::Capabilities::empty();
-        if self.input.datatype == DataTypeEnum::F16
-            || self.output.datatype == DataTypeEnum::F16
-            || self.operation.function.datatype() == DataTypeEnum::F16
-        {
-            capabilities |= wgpu::naga::valid::Capabilities::SHADER_FLOAT16;
-        }
-        wgpu::naga::valid::Validator::new(wgpu::naga::valid::ValidationFlags::all(), capabilities)
-            .validate(&self.module)
-            .unwrap_or_else(|error| panic!("direct reduce Naga validation failed: {error:#?}"));
-        Some(self.module)
-    }
-
-    fn reduce_value(
-        &self,
-        expressions: &mut Arena<Expression>,
-        body: &mut Block,
-        left: Handle<Expression>,
-        right: Handle<Expression>,
-    ) -> Handle<Expression> {
-        match self.operation.function.op {
-            ReduceOp::Sum => self.binary(expressions, body, BinaryOperator::Add, left, right),
-            ReduceOp::Product => {
-                self.binary(expressions, body, BinaryOperator::Multiply, left, right)
-            }
-            ReduceOp::Max => self.math2(expressions, body, MathFunction::Max, left, right),
-            ReduceOp::Min => self.math2(expressions, body, MathFunction::Min, left, right),
-        }
-    }
-
-    fn output_dims_from_flat(
-        &self,
-        expressions: &mut Arena<Expression>,
-        body: &mut Block,
-        flat: Handle<Expression>,
-    ) -> Option<Vec<Handle<Expression>>> {
-        let output_shape = self
-            .operation
-            .shape
-            .iter()
-            .enumerate()
-            .filter_map(|(i, dim)| (i != self.operation.axis).then_some(*dim))
-            .collect::<Vec<_>>();
-        let mut dims = Vec::with_capacity(output_shape.len());
-        for axis in 0..output_shape.len() {
-            let divisor = output_shape[axis + 1..]
-                .iter()
-                .try_fold(1u32, |acc, dim| acc.checked_mul((*dim).try_into().ok()?))?;
-            let quotient = if divisor == 1 {
-                flat
-            } else {
-                self.div_lit_u32(expressions, body, flat, divisor)
-            };
-            let dim = u32::try_from(output_shape[axis]).ok()?;
-            dims.push(if dim == 1 {
-                self.u32(expressions, 0)
-            } else {
-                self.mod_lit_u32(expressions, body, quotient, dim)
-            });
-        }
-        Some(dims)
-    }
-
-    fn layout_index(
-        &self,
-        expressions: &mut Arena<Expression>,
-        body: &mut Block,
-        view: &TensorView,
-        coords: &[Handle<Expression>],
-    ) -> Handle<Expression> {
-        let mut index = self.u32(expressions, view.offset);
-        for (coord, stride) in coords.iter().copied().zip(&view.strides) {
-            if *stride == 0 {
-                continue;
-            }
-            let term = self.mul_lit_u32(expressions, body, coord, *stride);
-            index = self.binary(expressions, body, BinaryOperator::Add, index, term);
-        }
-        index
-    }
-
-    fn storage_pointer(
-        &self,
-        expressions: &mut Arena<Expression>,
-        body: &mut Block,
-        view: &TensorView,
-        index: Handle<Expression>,
-    ) -> Handle<Expression> {
-        let base = self.append(expressions, Expression::GlobalVariable(view.global));
-        self.emit(expressions, body, Expression::Access { base, index })
-    }
-
-    fn local_pointer(
-        &self,
-        expressions: &mut Arena<Expression>,
-        local: Handle<LocalVariable>,
-    ) -> Handle<Expression> {
-        self.append(expressions, Expression::LocalVariable(local))
-    }
-
-    fn workgroup_flat_index(
-        &self,
-        expressions: &mut Arena<Expression>,
-        body: &mut Block,
-        dispatch_size: [u32; 3],
-    ) -> Handle<Expression> {
-        let wg = self.append(expressions, Expression::FunctionArgument(1));
-        let x = self.emit(
-            expressions,
-            body,
-            Expression::AccessIndex { base: wg, index: 0 },
-        );
-        let y = self.emit(
-            expressions,
-            body,
-            Expression::AccessIndex { base: wg, index: 1 },
-        );
-        let z = self.emit(
-            expressions,
-            body,
-            Expression::AccessIndex { base: wg, index: 2 },
-        );
-        let y_term = self.mul_lit_u32(expressions, body, y, dispatch_size[0]);
-        let xy = self.binary(expressions, body, BinaryOperator::Add, x, y_term);
-        let z_term = self.mul_lit_u32(
-            expressions,
-            body,
-            z,
-            dispatch_size[0].saturating_mul(dispatch_size[1]),
-        );
-        self.binary(expressions, body, BinaryOperator::Add, xy, z_term)
-    }
-
-    fn cast_value(
-        &self,
-        expressions: &mut Arena<Expression>,
-        body: &mut Block,
-        value: Handle<Expression>,
-        source: DataTypeEnum,
-        target: DataTypeEnum,
-    ) -> Handle<Expression> {
-        if source == target {
-            return value;
-        }
-        let scalar = Self::scalar(target);
-        self.emit(
-            expressions,
-            body,
-            Expression::As {
-                expr: value,
-                kind: scalar.kind,
-                convert: Some(scalar.width),
-            },
-        )
-    }
-
-    fn scalar_literal(
-        &self,
-        expressions: &mut Arena<Expression>,
-        body: &mut Block,
-        value: NaryScalar,
-    ) -> Handle<Expression> {
-        match value {
-            NaryScalar::F32(value) => {
-                expressions.append(Expression::Literal(Literal::F32(value)), Span::default())
-            }
-            NaryScalar::F16(value) => {
-                let f32_value = expressions.append(
-                    Expression::Literal(Literal::F32(value.to_f32())),
-                    Span::default(),
-                );
-                self.emit(
-                    expressions,
-                    body,
-                    Expression::As {
-                        expr: f32_value,
-                        kind: ScalarKind::Float,
-                        convert: Some(2),
-                    },
-                )
-            }
-            NaryScalar::U32(value) => self.u32(expressions, value),
-        }
-    }
-
-    fn math2(
-        &self,
-        expressions: &mut Arena<Expression>,
-        body: &mut Block,
-        fun: MathFunction,
-        arg: Handle<Expression>,
-        arg1: Handle<Expression>,
-    ) -> Handle<Expression> {
-        self.emit(
-            expressions,
-            body,
-            Expression::Math {
-                fun,
-                arg,
-                arg1: Some(arg1),
-                arg2: None,
-                arg3: None,
-            },
-        )
-    }
-
-    fn binary(
-        &self,
-        expressions: &mut Arena<Expression>,
-        body: &mut Block,
-        op: BinaryOperator,
-        left: Handle<Expression>,
-        right: Handle<Expression>,
-    ) -> Handle<Expression> {
-        self.emit(expressions, body, Expression::Binary { op, left, right })
-    }
-
-    fn add_lit_u32(
-        &self,
-        expressions: &mut Arena<Expression>,
-        body: &mut Block,
-        value: Handle<Expression>,
-        literal: u32,
-    ) -> Handle<Expression> {
-        if literal == 0 {
-            value
-        } else {
-            let rhs = self.u32(expressions, literal);
-            self.binary(expressions, body, BinaryOperator::Add, value, rhs)
-        }
-    }
-
-    fn mul_lit_u32(
-        &self,
-        expressions: &mut Arena<Expression>,
-        body: &mut Block,
-        value: Handle<Expression>,
-        literal: u32,
-    ) -> Handle<Expression> {
-        if literal == 1 {
-            value
-        } else {
-            let rhs = self.u32(expressions, literal);
-            self.binary(expressions, body, BinaryOperator::Multiply, value, rhs)
-        }
-    }
-
-    fn div_lit_u32(
-        &self,
-        expressions: &mut Arena<Expression>,
-        body: &mut Block,
-        value: Handle<Expression>,
-        literal: u32,
-    ) -> Handle<Expression> {
-        if literal == 1 {
-            value
-        } else {
-            let rhs = self.u32(expressions, literal);
-            self.binary(expressions, body, BinaryOperator::Divide, value, rhs)
-        }
-    }
-
-    fn mod_lit_u32(
-        &self,
-        expressions: &mut Arena<Expression>,
-        body: &mut Block,
-        value: Handle<Expression>,
-        literal: u32,
-    ) -> Handle<Expression> {
-        let rhs = self.u32(expressions, literal);
-        self.binary(expressions, body, BinaryOperator::Modulo, value, rhs)
-    }
-
-    fn cmp_lit_u32(
-        &self,
-        expressions: &mut Arena<Expression>,
-        body: &mut Block,
-        op: BinaryOperator,
-        value: Handle<Expression>,
-        literal: u32,
-    ) -> Handle<Expression> {
-        let rhs = self.u32(expressions, literal);
-        self.binary(expressions, body, op, value, rhs)
-    }
-
-    fn u32(&self, expressions: &mut Arena<Expression>, value: u32) -> Handle<Expression> {
-        expressions.append(Expression::Literal(Literal::U32(value)), Span::default())
-    }
-
-    fn emit(
-        &self,
-        expressions: &mut Arena<Expression>,
-        body: &mut Block,
-        expression: Expression,
-    ) -> Handle<Expression> {
-        let handle = expressions.append(expression, Span::default());
-        body.push(
-            Statement::Emit(Self::single_expression_range(expressions, handle)),
-            Span::default(),
-        );
-        handle
-    }
-
-    fn append(
-        &self,
-        expressions: &mut Arena<Expression>,
-        expression: Expression,
-    ) -> Handle<Expression> {
-        expressions.append(expression, Span::default())
-    }
-
-    fn single_expression_range(
-        expressions: &Arena<Expression>,
-        handle: Handle<Expression>,
-    ) -> NagaRange<Expression> {
-        NagaRange::from_index_range(
-            handle.index() as u32..handle.index() as u32 + 1,
-            expressions,
-        )
-    }
-
-    fn scalar(datatype: DataTypeEnum) -> Scalar {
-        match datatype {
-            DataTypeEnum::F32 => Scalar {
-                kind: ScalarKind::Float,
-                width: 4,
-            },
-            DataTypeEnum::F16 => Scalar {
-                kind: ScalarKind::Float,
-                width: 2,
-            },
-            DataTypeEnum::U32 => Scalar {
-                kind: ScalarKind::Uint,
-                width: 4,
-            },
-        }
     }
 }
 
-fn layout_allocation_len(layout: &Layout) -> Option<u32> {
+fn layout_allocation_len(layout: &crate::Layout) -> Option<u32> {
     let max_index = layout
         .shape()
         .iter()

@@ -99,17 +99,6 @@ impl Operation for MapLayoutOperation {
     fn name(&self) -> String {
         "map_layout".to_string()
     }
-
-    fn output_layout(
-        &self,
-        map: &rustc_hash::FxHashMap<NodeIndex, crate::TensorLayoutInfo>,
-    ) -> crate::TensorLayoutInfo {
-        let input_layout = map.get(&self.input).unwrap();
-        crate::TensorLayoutInfo::new(
-            self.map_layout(input_layout.layout()),
-            input_layout.datatype(),
-        )
-    }
 }
 
 impl<const R: usize, T: DataType> Tensor<R, T> {

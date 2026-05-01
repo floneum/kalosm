@@ -1,23 +1,23 @@
 use std::{borrow::Cow, sync::mpsc, time::Instant};
 
-use phase_token_prototype::{build, KernelIr, Shape, F32};
+use phase_token_prototype::{tile, KernelIr, Shape, WorkgroupAxis, F32};
 use wgpu::util::DeviceExt;
 
-const M: usize = 4096;
-const K: usize = 4096;
-const ROWS_PER_WORKGROUP: usize = 4;
-const WORKGROUP_PARTIALS: usize = 128 * ROWS_PER_WORKGROUP;
-const VECTOR_WIDTH: u32 = 1;
-const WARMUP_BATCHES: usize = 4;
-const MEASURED_BATCHES: usize = 10;
-const DISPATCHES_PER_BATCH: usize = 100;
+const WARMUP_BATCHES: usize = 2;
+const MEASURED_BATCHES: usize = 5;
+const DISPATCHES_PER_BATCH: usize = 50;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     pollster::block_on(run())
 }
 
 async fn run() -> Result<(), Box<dyn std::error::Error>> {
-    let harness = Harness::new().await?;
+    bench::<128>(100).await?;
+    Ok(())
+}
+
+async fn bench<const BLOCK: usize>(size: usize) -> Result<(), Box<dyn std::error::Error>> {
+    let harness = Harness::new::<BLOCK>(size).await?;
 
     for _ in 0..WARMUP_BATCHES {
         harness.run_batch(DISPATCHES_PER_BATCH)?;
@@ -32,74 +32,44 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let output = harness.read_output()?;
-    let max_abs_error = sampled_max_abs_error(&output, &harness.a, &harness.x);
-    if max_abs_error > 1.0e-3 {
-        let (row, actual, expected) = first_sample_mismatch(
-            &output, &harness.a, &harness.x, 1.0e-3,
-        )
-        .unwrap_or((0, output[0], cpu_dot(&harness.a, &harness.x, 0)));
-        return Err(format!(
-            "gemv mismatch at row {row}: gpu={actual} cpu={expected} max_abs_error={max_abs_error}",
-        )
-        .into());
+    let max_abs_error = max_abs_error(&harness.input, &output, size);
+    if max_abs_error > 1.0e-5 {
+        return Err(format!("tile softmax mismatch: max_abs_error={max_abs_error}").into());
     }
 
     samples.sort_by(f64::total_cmp);
-    let total_dispatches = MEASURED_BATCHES * DISPATCHES_PER_BATCH;
     let mean_s = samples.iter().sum::<f64>() / samples.len() as f64;
     let p50_s = percentile(&samples, 0.50);
     let p90_s = percentile(&samples, 0.90);
-    let min_s = samples[0];
-    let max_s = samples[samples.len() - 1];
-    let flops_per_dispatch = 2.0 * M as f64 * K as f64;
-    let bytes_per_dispatch = ((M * K + K + M) * std::mem::size_of::<f32>()) as f64;
-
+    println!("adapter: {}", harness.adapter_info.name);
+    println!("bench_tile_softmax: {size}x{size}, BLOCK={BLOCK}");
     println!(
-        "adapter: {} ({:?})",
-        harness.adapter_info.name, harness.adapter_info.backend
+        "dispatches: {} measured, {WARMUP_BATCHES} warmup batches",
+        MEASURED_BATCHES * DISPATCHES_PER_BATCH
     );
-    println!(
-        "bench_gemv: {M}x{K} f32 matrix times {K} vector, {} workgroups per dispatch",
-        M / ROWS_PER_WORKGROUP
-    );
-    println!("dispatches: {total_dispatches} measured, {WARMUP_BATCHES} warmup batches");
     println!("max_abs_error: {max_abs_error:.6}");
-    println!("rows_per_workgroup: {ROWS_PER_WORKGROUP}");
-    println!("vector_width: {VECTOR_WIDTH}");
     println!("mean_dispatch_time_us: {:.3}", mean_s * 1.0e6);
     println!("p50_dispatch_time_us: {:.3}", p50_s * 1.0e6);
     println!("p90_dispatch_time_us: {:.3}", p90_s * 1.0e6);
-    println!("min_dispatch_time_us: {:.3}", min_s * 1.0e6);
-    println!("max_dispatch_time_us: {:.3}", max_s * 1.0e6);
-    println!(
-        "effective_gflops: {:.6}",
-        flops_per_dispatch / mean_s / 1.0e9
-    );
-    println!(
-        "effective_bandwidth_gb_s: {:.6}",
-        bytes_per_dispatch / mean_s / 1.0e9
-    );
-    println!("note: GEMV uses the typed row-parallel Gemv IR op.");
-    println!("note: this times pre-encoded batch submit-to-completion on the host.");
-
+    println!();
     Ok(())
 }
 
 struct Harness {
+    size: usize,
     adapter_info: wgpu::AdapterInfo,
     device: wgpu::Device,
     queue: wgpu::Queue,
     pipeline: wgpu::ComputePipeline,
     bind_group: wgpu::BindGroup,
-    y_buffer: wgpu::Buffer,
+    output_buffer: wgpu::Buffer,
     readback: wgpu::Buffer,
-    a: Vec<f32>,
-    x: Vec<f32>,
+    input: Vec<f32>,
 }
 
 impl Harness {
-    async fn new() -> Result<Self, Box<dyn std::error::Error>> {
-        let ir = gemv_ir();
+    async fn new<const BLOCK: usize>(size: usize) -> Result<Self, Box<dyn std::error::Error>> {
+        let ir = softmax_ir::<BLOCK>(size as u32, size as u32);
         let lowered = ir.lower_to_naga()?;
 
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::default());
@@ -113,26 +83,25 @@ impl Harness {
         let adapter_info = adapter.get_info();
         let (device, queue) = adapter
             .request_device(&wgpu::DeviceDescriptor {
-                label: Some("phase-token-prototype gemv bench device"),
+                label: Some("phase-token-prototype tile softmax bench device"),
                 required_features: wgpu::Features::empty(),
                 required_limits: wgpu::Limits::default(),
+                experimental_features: unsafe { wgpu::ExperimentalFeatures::enabled() },
                 ..Default::default()
             })
             .await?;
 
-        let a = make_a();
-        let x = make_x();
-        let a_buffer = storage_buffer(&device, "A", &a, wgpu::BufferUsages::empty());
-        let x_buffer = storage_buffer(&device, "x", &x, wgpu::BufferUsages::empty());
-        let y_buffer = storage_buffer(
+        let input = softmax_input(size);
+        let input_buffer = storage_buffer(&device, "X", &input, wgpu::BufferUsages::empty());
+        let output_buffer = storage_buffer(
             &device,
-            "y",
-            &vec![0.0_f32; M],
+            "Y",
+            &vec![0.0_f32; size * size],
             wgpu::BufferUsages::COPY_SRC,
         );
         let readback = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("y readback"),
-            size: byte_len::<f32>(M),
+            label: Some("Y readback"),
+            size: byte_len::<f32>(size * size),
             usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
@@ -140,58 +109,57 @@ impl Harness {
         let shader = unsafe {
             device.create_shader_module_trusted(
                 wgpu::ShaderModuleDescriptor {
-                    label: Some("lowered gemv"),
+                    label: Some("lowered tile softmax"),
                     source: wgpu::ShaderSource::Naga(Cow::Owned(lowered.module().clone())),
                 },
                 wgpu::ShaderRuntimeChecks::unchecked(),
             )
         };
         let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("gemv buffers"),
-            entries: &storage_bindings(&[true, true, false]),
+            label: Some("tile softmax buffers"),
+            entries: &storage_bindings(&[true, false]),
         });
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("gemv pipeline layout"),
+            label: Some("tile softmax pipeline layout"),
             bind_group_layouts: &[Some(&bind_group_layout)],
             immediate_size: 0,
         });
         let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-            label: Some("gemv pipeline"),
+            label: Some("tile softmax pipeline"),
             layout: Some(&pipeline_layout),
             module: &shader,
             entry_point: Some("main"),
-            compilation_options: wgpu::PipelineCompilationOptions::default(),
+            compilation_options: wgpu::PipelineCompilationOptions {
+                zero_initialize_workgroup_memory: false,
+                ..Default::default()
+            },
             cache: None,
         });
         let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("gemv bind group"),
+            label: Some("tile softmax bind group"),
             layout: &bind_group_layout,
             entries: &[
                 wgpu::BindGroupEntry {
                     binding: 0,
-                    resource: a_buffer.as_entire_binding(),
+                    resource: input_buffer.as_entire_binding(),
                 },
                 wgpu::BindGroupEntry {
                     binding: 1,
-                    resource: x_buffer.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 2,
-                    resource: y_buffer.as_entire_binding(),
+                    resource: output_buffer.as_entire_binding(),
                 },
             ],
         });
 
         Ok(Self {
+            size,
             adapter_info,
             device,
             queue,
             pipeline,
             bind_group,
-            y_buffer,
+            output_buffer,
             readback,
-            a,
-            x,
+            input,
         })
     }
 
@@ -204,17 +172,17 @@ impl Harness {
         let mut encoder = self
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("gemv bench encoder"),
+                label: Some("tile softmax bench encoder"),
             });
         {
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("gemv bench pass"),
+                label: Some("tile softmax bench pass"),
                 timestamp_writes: None,
             });
             pass.set_pipeline(&self.pipeline);
             pass.set_bind_group(0, &self.bind_group, &[]);
             for _ in 0..dispatches {
-                pass.dispatch_workgroups((M / ROWS_PER_WORKGROUP) as u32, 1, 1);
+                pass.dispatch_workgroups(1, self.size as u32, 1);
             }
         }
         encoder.finish()
@@ -233,9 +201,15 @@ impl Harness {
         let mut encoder = self
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("gemv readback encoder"),
+                label: Some("tile softmax readback encoder"),
             });
-        encoder.copy_buffer_to_buffer(&self.y_buffer, 0, &self.readback, 0, byte_len::<f32>(M));
+        encoder.copy_buffer_to_buffer(
+            &self.output_buffer,
+            0,
+            &self.readback,
+            0,
+            byte_len::<f32>(self.size * self.size),
+        );
         self.queue.submit(Some(encoder.finish()));
 
         let slice = self.readback.slice(..);
@@ -254,27 +228,53 @@ impl Harness {
     }
 }
 
-fn gemv_ir() -> KernelIr {
-    build(|mut phase| {
-        let a_full = phase.storage_tensor_read::<F32>(shape([M, K]));
-        let x_full = phase.storage_tensor_read::<F32>(shape([K, 1]));
-        let y_full = phase.storage_tensor::<F32>(shape([M, 1]));
-        let partials = phase.alloc_workgroup_tile::<F32>(shape([WORKGROUP_PARTIALS]));
-        phase.gemv_tiled(
-            &a_full,
-            &x_full,
-            &y_full,
-            partials,
-            ROWS_PER_WORKGROUP as u32,
-            VECTOR_WIDTH,
-        );
-        phase.finish()
+fn softmax_ir<const BLOCK: usize>(rows: u32, cols: u32) -> KernelIr {
+    assert!(cols <= BLOCK as u32, "one tile covers one row");
+    tile::build(|phase| {
+        let x = phase.storage_read::<F32, 2>(Shape::new([rows, cols]));
+        let y = phase.storage_write::<F32, 2>(Shape::new([rows, cols]));
+
+        phase.program_grid::<BLOCK>([1, rows, 1], |program| {
+            let row = program.program_id(WorkgroupAxis::Y);
+            let col = program.arange();
+            let mask = col.lt(cols);
+            let values = program.load(x.at(&row, &col), mask.clone(), -3.4028235e38);
+            let max = program.reduce_max(values.clone());
+            let exp = (values - max).exp();
+            let sum = program.reduce_sum(exp.clone());
+
+            program.store(y.at(row, col), exp / sum, mask);
+        });
     })
+}
+
+fn softmax_input(size: usize) -> Vec<f32> {
+    (0..size * size)
+        .map(|index| ((index * 13 + index / 7) % 31) as f32 / 8.0)
+        .collect()
+}
+
+fn max_abs_error(input: &[f32], output: &[f32], size: usize) -> f32 {
+    let mut max_abs = 0.0_f32;
+    for row in 0..size {
+        let row_input = &input[row * size..(row + 1) * size];
+        let row_output = &output[row * size..(row + 1) * size];
+        let max = row_input.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+        let sum = row_input
+            .iter()
+            .map(|value| (*value - max).exp())
+            .sum::<f32>();
+        for (value, actual) in row_input.iter().zip(row_output) {
+            let expected = (*value - max).exp() / sum;
+            max_abs = max_abs.max((actual - expected).abs());
+        }
+    }
+    max_abs
 }
 
 fn storage_buffer(
     device: &wgpu::Device,
-    label: &'static str,
+    label: &str,
     data: &[f32],
     extra_usage: wgpu::BufferUsages,
 ) -> wgpu::Buffer {
@@ -304,73 +304,11 @@ fn storage_bindings(read_only: &[bool]) -> Vec<wgpu::BindGroupLayoutEntry> {
         .collect()
 }
 
-fn make_a() -> Vec<f32> {
-    (0..M)
-        .flat_map(|row| {
-            (0..K).map(move |k| {
-                let value = ((row * 13 + k * 7) % 31) as i32 - 15;
-                value as f32 * 0.03125
-            })
-        })
-        .collect()
+fn byte_len<T>(elements: usize) -> u64 {
+    (elements * std::mem::size_of::<T>()) as u64
 }
 
-fn make_x() -> Vec<f32> {
-    (0..K)
-        .map(|k| {
-            let value = ((k * 11) % 29) as i32 - 14;
-            value as f32 * 0.03125
-        })
-        .collect()
-}
-
-fn sampled_max_abs_error(actual: &[f32], a: &[f32], x: &[f32]) -> f32 {
-    sample_rows()
-        .into_iter()
-        .map(|row| (actual[row] - cpu_dot(a, x, row)).abs())
-        .fold(0.0, f32::max)
-}
-
-fn first_sample_mismatch(
-    actual: &[f32],
-    a: &[f32],
-    x: &[f32],
-    tolerance: f32,
-) -> Option<(usize, f32, f32)> {
-    for row in sample_rows() {
-        let expected = cpu_dot(a, x, row);
-        if (actual[row] - expected).abs() > tolerance {
-            return Some((row, actual[row], expected));
-        }
-    }
-    None
-}
-
-fn sample_rows() -> Vec<usize> {
-    let mut rows = vec![0, 1, M / 2, M - 2, M - 1];
-    for i in 0..64 {
-        rows.push((i * 97) % M);
-    }
-    rows
-}
-
-fn cpu_dot(a: &[f32], x: &[f32], row: usize) -> f32 {
-    let mut sum = 0.0;
-    for k in 0..K {
-        sum += a[row * K + k] * x[k];
-    }
-    sum
-}
-
-fn percentile(sorted: &[f64], p: f64) -> f64 {
-    let index = ((sorted.len() - 1) as f64 * p).round() as usize;
+fn percentile(sorted: &[f64], q: f64) -> f64 {
+    let index = ((sorted.len() - 1) as f64 * q).round() as usize;
     sorted[index]
-}
-
-fn byte_len<T>(len: usize) -> u64 {
-    (len * std::mem::size_of::<T>()) as u64
-}
-
-fn shape<const R: usize>(dims: [usize; R]) -> Shape {
-    Shape::new(dims.map(|dim| dim as u32))
 }

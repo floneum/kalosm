@@ -162,17 +162,6 @@ impl Operation for SliceAssignOperation {
                 .join("_")
         )
     }
-
-    fn output_layout(
-        &self,
-        map: &rustc_hash::FxHashMap<NodeIndex, crate::TensorLayoutInfo>,
-    ) -> crate::TensorLayoutInfo {
-        let input_layout = map.get(&self.input).unwrap();
-        crate::TensorLayoutInfo::new(
-            crate::Layout::contiguous(input_layout.shape()),
-            input_layout.datatype(),
-        )
-    }
 }
 
 impl<const R: usize, T: crate::DataType> Tensor<R, T> {

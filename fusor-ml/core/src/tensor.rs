@@ -14,7 +14,6 @@ use crate::{
     Device, Dim, Layout, MatMulOperation, MatMulParams, ReduceFunction, ReduceOperation,
     compute_graph::NodeIndex,
     map_layout::MapLayoutOperation,
-    mir::operation::Operation,
     nary_wise::{NaryExpr, NaryFunction, NaryOperation},
     quantized::{QMatrix, matmul::QMatMulOperation},
     resize::ResizeOperation,
@@ -241,10 +240,10 @@ impl LazyTensorData {
         Self { device, info, key }
     }
 
-    pub(crate) fn custom(&self, custom: Arc<dyn Operation + Send + Sync>) -> Self {
+    pub(crate) fn nary(&self, nary: NaryOperation) -> Self {
         let device = self.device.clone();
         let info = self.info.clone();
-        let key = device.compute_graph().create_custom(custom);
+        let key = device.compute_graph().create_nary(nary);
 
         Self::from_parts(device, info, key)
     }

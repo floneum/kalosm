@@ -1,9 +1,7 @@
 use std::{borrow::Cow, error::Error, sync::mpsc};
 
 use phase_token_prototype::{
-    build,
-    kernels::gemm::{self, GemmTilePlan},
-    GgmlQuantFormat, KernelIr, Layout, MemoryLevel, Shape, Strides, F32,
+    tile, GgmlQuantFormat, KernelIr, Layout, MemoryLevel, Shape, Strides, F32,
 };
 use wgpu::util::DeviceExt;
 
@@ -29,7 +27,7 @@ impl StorageVariant {
 }
 
 #[test]
-#[ignore = "requires a WGPU adapter with subgroup and cooperative-matrix support"]
+#[ignore = "requires a WGPU adapter"]
 fn fuzz_gemv_gemm_qgemv_qgemm_correctness() -> TestResult {
     pollster::block_on(run_fuzz())
 }
@@ -43,8 +41,7 @@ async fn run_fuzz() -> TestResult {
             compatible_surface: None,
         })
         .await?;
-    let required_features =
-        wgpu::Features::SUBGROUP | wgpu::Features::EXPERIMENTAL_COOPERATIVE_MATRIX;
+    let required_features = wgpu::Features::empty();
 
     if !adapter.features().contains(required_features) {
         eprintln!(
@@ -110,7 +107,7 @@ fn fuzz_gemm_case(
     let a_physical = pack_f32_matrix(&a, m, k, &a_layout);
     let b_physical = pack_f32_matrix(&b, k, n, &b_layout);
     let expected = cpu_matmul(&a, &b, m, k, n);
-    let ir = gemm_ir(m, n, k, &a_layout, &b_layout, &y_layout);
+    let ir = gemm_ir(&a_layout, &b_layout, &y_layout);
     let actual_physical = run_three_buffer_kernel(
         device,
         queue,
@@ -118,7 +115,7 @@ fn fuzz_gemm_case(
         bytemuck::cast_slice(&a_physical),
         bytemuck::cast_slice(&b_physical),
         allocation_len(&y_layout),
-        (1, 1, 1),
+        (n as u32, m as u32, 1),
     )?;
     let actual = gather_f32_matrix(&actual_physical, m, n, &y_layout);
 
@@ -168,7 +165,7 @@ fn fuzz_gemv_case(
         bytemuck::cast_slice(&a_physical),
         bytemuck::cast_slice(&x_physical),
         allocation_len(&y_layout),
-        (ceil_div(m, rows_per_workgroup), 1, 1),
+        (1, m as u32, 1),
     )?;
     let actual = gather_f32_matrix(&actual_physical, m, 1, &y_layout);
 
@@ -209,7 +206,7 @@ fn fuzz_qgemm_case(
         bytemuck::cast_slice(&a_physical),
         bytemuck::cast_slice(&packed_b),
         allocation_len(&y_layout),
-        (ceil_div(n, 32), ceil_div(m, 32), 1),
+        (n as u32, m as u32, 1),
     )?;
     let actual = gather_f32_matrix(&actual_physical, m, n, &y_layout);
 
@@ -248,7 +245,7 @@ fn fuzz_qgemm_skewed_activation_case(
         bytemuck::cast_slice(&a_physical),
         bytemuck::cast_slice(&packed_b),
         allocation_len(&y_layout),
-        (ceil_div(n, 32), ceil_div(m, 32), 1),
+        (n as u32, m as u32, 1),
     )?;
     let actual = gather_f32_matrix(&actual_physical, m, n, &y_layout);
 
@@ -306,7 +303,7 @@ fn fuzz_qgemm_im2col_nhwc_case(
         bytemuck::cast_slice(&input),
         bytemuck::cast_slice(&packed_b),
         allocation_len(&y_layout),
-        (ceil_div(n, 32), ceil_div(m, 32), 1),
+        (n as u32, m as u32, 1),
     )?;
     let actual = gather_f32_matrix(&actual_physical, m, n, &y_layout);
 
@@ -344,7 +341,7 @@ fn fuzz_qgemv_case(
         bytemuck::cast_slice(&a_physical),
         bytemuck::cast_slice(&packed_b),
         allocation_len(&y_layout),
-        (ceil_div(n, qgemv_cols_per_workgroup(format)), 1, 1),
+        (1, n as u32, 1),
     )?;
     let actual = gather_f32_matrix(&actual_physical, m, n, &y_layout);
 
@@ -383,7 +380,7 @@ fn fuzz_qgemv_split_workgroups_case(
         bytemuck::cast_slice(&a_physical),
         bytemuck::cast_slice(&packed_b),
         allocation_len(&y_layout),
-        (2, 2, 1),
+        (2, n.div_ceil(2) as u32, 1),
     )?;
     let actual = gather_f32_matrix(&actual_physical, m, n, &y_layout);
 
@@ -396,54 +393,23 @@ fn fuzz_qgemv_split_workgroups_case(
     Ok(())
 }
 
-fn gemm_ir(
-    m: usize,
-    n: usize,
-    k: usize,
-    a_layout: &Layout,
-    b_layout: &Layout,
-    y_layout: &Layout,
-) -> KernelIr {
+fn gemm_ir(a_layout: &Layout, b_layout: &Layout, y_layout: &Layout) -> KernelIr {
     let a_layout = a_layout.clone();
     let b_layout = b_layout.clone();
     let y_layout = y_layout.clone();
-    build(move |mut phase| {
-        let a_in = phase.storage_tensor_read_with_layout::<F32>(a_layout);
-        let b_in = phase.storage_tensor_read_with_layout::<F32>(b_layout);
-        let y = phase.storage_tensor_with_layout::<F32>(y_layout);
-        let mut acc = phase.alloc_fragment::<F32>(shape([m, n]));
-        phase.fill_zero(&mut acc);
-        let acc_out = acc;
-
-        phase.range_step(
-            |mut phase, _| {
-                let a = phase.alloc_workgroup_tile::<F32>(shape([m, k]));
-                let b = phase.alloc_workgroup_tile::<F32>(shape([k, n]));
-                let pending = phase.cooperative_load_pair(a, &a_in, b, &b_in);
-                let (a, b, mut phase) = pending.sync_tiles();
-
-                gemm::tiled(
-                    &mut phase,
-                    &a,
-                    &b,
-                    &mut acc,
-                    GemmTilePlan::portable(m as u32, n as u32, k as u32),
-                );
-                phase.sync_end()
-            },
-            |mut phase| {
-                phase.store_fragment_to_storage(&acc_out, &y);
-                phase.finish()
-            },
-        )
+    tile::build(move |phase| {
+        let a = phase.storage_read_with_layout::<F32, 2>(a_layout);
+        let b = phase.storage_read_with_layout::<F32, 2>(b_layout);
+        let y = phase.storage_write_with_layout::<F32, 2>(y_layout);
+        phase.matmul::<256>(&a, &b, &y);
     })
 }
 
 fn gemv_ir(
     _m: usize,
     _k: usize,
-    rows_per_workgroup: usize,
-    vector_width: usize,
+    _rows_per_workgroup: usize,
+    _vector_width: usize,
     a_layout: &Layout,
     x_layout: &Layout,
     y_layout: &Layout,
@@ -451,25 +417,16 @@ fn gemv_ir(
     let a_layout = a_layout.clone();
     let x_layout = x_layout.clone();
     let y_layout = y_layout.clone();
-    build(move |mut phase| {
-        let a = phase.storage_tensor_read_with_layout::<F32>(a_layout);
-        let x = phase.storage_tensor_read_with_layout::<F32>(x_layout);
-        let y = phase.storage_tensor_with_layout::<F32>(y_layout);
-        let partials = phase.alloc_workgroup_tile::<F32>(shape([128 * rows_per_workgroup]));
-        phase.gemv_tiled(
-            &a,
-            &x,
-            &y,
-            partials,
-            rows_per_workgroup as u32,
-            vector_width as u32,
-        );
-        phase.finish()
+    tile::build(move |phase| {
+        let a = phase.storage_read_with_layout::<F32, 2>(a_layout);
+        let x = phase.storage_read_with_layout::<F32, 2>(x_layout);
+        let y = phase.storage_write_with_layout::<F32, 2>(y_layout);
+        phase.matmul::<256>(&a, &x, &y);
     })
 }
 
 fn qmatmul_ir(
-    _m: usize,
+    m: usize,
     n: usize,
     k: usize,
     format: GgmlQuantFormat,
@@ -479,16 +436,17 @@ fn qmatmul_ir(
 ) -> KernelIr {
     let a_layout = a_layout.clone();
     let y_layout = y_layout.clone();
-    build(move |mut phase| {
-        let a = phase.storage_tensor_read_with_layout::<F32>(a_layout);
+    tile::build(move |phase| {
+        let a = phase.storage_read_with_layout::<F32, 2>(a_layout);
         let b = phase.quantized_matrix(format, k as u32, n as u32);
-        let y = phase.storage_tensor_with_layout::<F32>(y_layout);
+        let y = phase.storage_write_with_layout::<F32, 2>(y_layout);
         if force_gemm {
-            phase.qmatmul_with_tile_plan(&a, &b, &y, 32, 32, 16, 4);
+            phase.qmatmul::<8, 4, 8>(&a, &b, &y, 4);
+        } else if m == 1 {
+            phase.qgemv::<4, 64>(&a, &b, &y, 4, 1);
         } else {
-            phase.qmatmul(&a, &b, &y);
+            phase.qmatmul::<8, 4, 8>(&a, &b, &y, 4);
         }
-        phase.finish()
     })
 }
 
@@ -503,22 +461,11 @@ fn qmatmul_split_workgroups_ir(
 ) -> KernelIr {
     let a_layout = a_layout.clone();
     let y_layout = y_layout.clone();
-    build(move |mut phase| {
-        let a = phase.storage_tensor_read_with_layout::<F32>(a_layout);
+    tile::build(move |phase| {
+        let a = phase.storage_read_with_layout::<F32, 2>(a_layout);
         let b = phase.quantized_matrix(format, k as u32, n as u32);
-        let y = phase.storage_tensor_with_layout::<F32>(y_layout);
-        phase.qmatmul_with_tile_plan_options_and_workgroup_x(
-            &a,
-            &b,
-            &y,
-            1,
-            1,
-            1,
-            4,
-            true,
-            workgroups_x,
-        );
-        phase.finish()
+        let y = phase.storage_write_with_layout::<F32, 2>(y_layout);
+        phase.qgemv::<4, 64>(&a, &b, &y, 4, workgroups_x);
     })
 }
 
@@ -534,8 +481,8 @@ fn qmatmul_im2col_nhwc_ir(
 ) -> KernelIr {
     let input_layout = input_layout.clone();
     let y_layout = y_layout.clone();
-    build(move |mut phase| {
-        let input = phase.storage_tensor_read_with_layout::<F32>(input_layout);
+    tile::build(move |phase| {
+        let input = phase.storage_read_with_layout::<F32, 4>(input_layout);
         let a = input.im2col_nhwc(
             [output_hw[0] as u32, output_hw[1] as u32],
             [kernel_hw[0] as u32, kernel_hw[1] as u32],
@@ -543,9 +490,8 @@ fn qmatmul_im2col_nhwc_ir(
             [1, 1],
         );
         let b = phase.quantized_matrix(format, k as u32, n as u32);
-        let y = phase.storage_tensor_with_layout::<F32>(y_layout);
-        phase.qmatmul_with_tile_plan(&a, &b, &y, 32, 32, 16, 4);
-        phase.finish()
+        let y = phase.storage_write_with_layout::<F32, 2>(y_layout);
+        phase.qmatmul::<8, 4, 8>(&a, &b, &y, 4);
     })
 }
 
@@ -556,8 +502,11 @@ fn run_three_buffer_kernel(
     first_input: &[u8],
     second_input: &[u8],
     output_len: usize,
-    dispatch: (u32, u32, u32),
+    _dispatch: (u32, u32, u32),
 ) -> TestResult<Vec<f32>> {
+    let dispatch = ir
+        .single_tile_program_grid()
+        .ok_or("correctness fuzz expects one tile program")?;
     let lowered = ir.lower_to_naga()?;
     let shader = unsafe {
         device.create_shader_module_trusted(
@@ -635,7 +584,7 @@ fn run_three_buffer_kernel(
         });
         pass.set_pipeline(&pipeline);
         pass.set_bind_group(0, &bind_group, &[]);
-        pass.dispatch_workgroups(dispatch.0, dispatch.1, dispatch.2);
+        pass.dispatch_workgroups(dispatch[0], dispatch[1], dispatch[2]);
     }
     encoder.copy_buffer_to_buffer(&output_buffer, 0, &readback_buffer, 0, output_size);
     queue.submit(Some(encoder.finish()));
@@ -1199,10 +1148,6 @@ fn ggml_formats() -> [GgmlQuantFormat; 12] {
 
 fn qgemv_cols_per_workgroup(format: GgmlQuantFormat) -> usize {
     format.qgemv_cols_per_workgroup() as usize
-}
-
-fn ceil_div(value: usize, divisor: usize) -> u32 {
-    value.div_ceil(divisor) as u32
 }
 
 fn shape<const R: usize>(dims: [usize; R]) -> Shape {

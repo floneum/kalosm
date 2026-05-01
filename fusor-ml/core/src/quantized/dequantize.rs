@@ -144,11 +144,10 @@ impl Operation for DequantizeOperation {
             if let Some(module) = graph.device().naga_module_cache().write().get(&cache_key) {
                 module.clone()
             } else {
-                let ir = tile_ir::build(move |mut phase| {
+                let ir = tile_ir::tile::build(move |phase| {
                     let q = phase.quantized_matrix(format, k, n);
-                    let y = phase.storage_tensor::<tile_ir::F32>(tile_ir::Shape::new([total]));
-                    phase.qdequantize_with_workgroup_x(&q, &y, dispatch_x);
-                    phase.finish()
+                    let y = phase.storage_write::<tile_ir::F32, 1>(tile_ir::Shape::new([total]));
+                    phase.qdequantize(&q, &y, dispatch_x);
                 });
                 let module = ir.lower_to_naga().ok()?.module().clone();
                 graph
@@ -185,16 +184,6 @@ impl Operation for DequantizeOperation {
 
     fn name(&self) -> String {
         format!("dequantize_{}_to_{}", self.matrix.datatype, self.datatype)
-    }
-
-    fn output_layout(
-        &self,
-        _: &rustc_hash::FxHashMap<crate::compute_graph::NodeIndex, crate::TensorLayoutInfo>,
-    ) -> crate::TensorLayoutInfo {
-        crate::TensorLayoutInfo::new(
-            crate::Layout::contiguous(self.matrix.shape()),
-            self.datatype,
-        )
     }
 }
 

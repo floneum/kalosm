@@ -7,8 +7,8 @@ use crate::{
         inputs::MirValue,
         operation::Operation,
         tile_direct::{
-            flatten_matrix_layout, storage_tensor_read_with_direct_layout,
-            storage_tensor_with_direct_layout,
+            flatten_matrix_layout, tile_storage_read_with_direct_layout,
+            tile_storage_write_with_direct_layout,
         },
         workgroup_shape::{Constraint, WorkgroupShapeConstraints},
     },
@@ -80,10 +80,6 @@ fn ceil_div_u32(x: u32, divisor: u32) -> u32 {
     x.div_ceil(divisor)
 }
 
-fn qgemv_cols_per_workgroup(format: tile_ir::GgmlQuantFormat, _max_subgroup_size: u32) -> u32 {
-    format.qgemv_cols_per_workgroup()
-}
-
 fn split_workgroups_2d(
     total_workgroups: u32,
     max_workgroups_per_dimension: u32,
@@ -113,20 +109,15 @@ impl<const R: usize> Tensor<R, half::f16> {
 impl Operation for QMatMulOperation {
     fn workgroup_shape_constraints(
         &self,
-        device: &Device,
+        _device: &Device,
     ) -> crate::mir::workgroup_shape::WorkgroupShapeConstraints {
         let mut constraints = WorkgroupShapeConstraints::new();
-        if self.m_size() == 1 && device.subgroups_supported() {
-            let invocations = self
-                .direct_quant_format()
-                .map(|format| format.qgemv_subgroups_per_workgroup() * 32)
-                .unwrap_or(256);
-            constraints.add_constraint(0, Constraint::Equals(invocations));
-            constraints.add_constraint(1, Constraint::Equals(1));
+        if self.m_size() == 1 {
+            constraints.add_constraint(0, Constraint::Equals(1));
         } else {
-            constraints.add_constraint(0, Constraint::Equals(16));
-            constraints.add_constraint(1, Constraint::Equals(16));
+            constraints.add_constraint(0, Constraint::Equals(32));
         }
+        constraints.add_constraint(1, Constraint::Equals(1));
         constraints.add_constraint(2, Constraint::Equals(1));
         constraints
     }
@@ -148,13 +139,9 @@ impl Operation for QMatMulOperation {
             .product();
 
         if m == 1 {
-            let format = self.direct_quant_format();
-            let cols = format
-                .map(|format| qgemv_cols_per_workgroup(format, 32))
-                .unwrap_or(256);
-            [ceil_div_u32(n, cols), 1, batch_size]
+            [n, 1, batch_size]
         } else {
-            [ceil_div_u32(n, 64), ceil_div_u32(m, 32), batch_size]
+            [n, m, batch_size]
         }
     }
 
@@ -207,28 +194,29 @@ impl Operation for QMatMulOperation {
         }
 
         let mut qmatmul_workgroups_x = 1;
-        let dispatch_size = if m == 1 {
-            if graph.device().subgroups_supported() {
-                let logical_workgroups = ceil_div_u32(
-                    n,
-                    qgemv_cols_per_workgroup(format, graph.device().max_subgroup_size()),
-                );
-                let [dispatch_x, dispatch_y] = split_workgroups_2d(
-                    logical_workgroups,
-                    graph.device().limits().max_compute_workgroups_per_dimension,
-                )?;
-                qmatmul_workgroups_x = dispatch_x;
-                [dispatch_x, dispatch_y, 1]
+        if m == 1 {
+            let qgemv_workgroups = n.div_ceil(format.qgemv_cols_per_workgroup());
+            let [dispatch_x, _] = split_workgroups_2d(
+                qgemv_workgroups,
+                graph.device().limits().max_compute_workgroups_per_dimension,
+            )?;
+            qmatmul_workgroups_x = dispatch_x;
+        }
+        let ir = tile_ir::tile::build(move |phase| {
+            let a = tile_storage_read_with_direct_layout(phase, a_view);
+            let b = phase.quantized_matrix(format, k, n);
+            let y = tile_storage_write_with_direct_layout(phase, y_view);
+            if m == 1 {
+                phase.qgemv::<4, 64>(&a, &b, &y, 4, qmatmul_workgroups_x);
             } else {
-                let dispatch_x = ceil_div_u32(n, 256);
-                if dispatch_x > graph.device().limits().max_compute_workgroups_per_dimension {
-                    return None;
-                }
-                [dispatch_x, 1, 1]
+                phase.qmatmul::<8, 4, 8>(&a, &b, &y, 4);
             }
-        } else {
-            [ceil_div_u32(n, 64), ceil_div_u32(m, 32), 1]
-        };
+        });
+        let dispatch_size = ir.single_tile_program_grid()?;
+        let max_workgroups = graph.device().limits().max_compute_workgroups_per_dimension;
+        if dispatch_size.iter().any(|dim| *dim > max_workgroups) {
+            return None;
+        }
         let cache_key = format!(
             "{}:direct:{format:?}:m={m}:k={k}:n={n}:dispatch={dispatch_size:?}:{:?}:{:?}",
             self.name(),
@@ -239,29 +227,6 @@ impl Operation for QMatMulOperation {
             if let Some(module) = graph.device().naga_module_cache().write().get(&cache_key) {
                 module.clone()
             } else {
-                let ir = tile_ir::build(move |mut phase| {
-                    let a = storage_tensor_read_with_direct_layout(&mut phase, a_view);
-                    let b = phase.quantized_matrix(format, k, n);
-                    let y = storage_tensor_with_direct_layout(&mut phase, y_view);
-                    if m == 1 && graph.device().subgroups_supported() {
-                        phase.qmatmul_with_tile_plan_options_and_workgroup_x(
-                            &a,
-                            &b,
-                            &y,
-                            1,
-                            1,
-                            1,
-                            4,
-                            true,
-                            qmatmul_workgroups_x,
-                        );
-                    } else if m == 1 {
-                        phase.qmatmul_with_tile_plan_options(&a, &b, &y, 1, 1, 1, 4, false);
-                    } else {
-                        phase.qmatmul_with_tile_plan(&a, &b, &y, 32, 64, 32, 4);
-                    }
-                    phase.finish()
-                });
                 let module = ir.lower_to_naga().ok()?.module().clone();
                 graph
                     .device()
@@ -321,16 +286,6 @@ impl Operation for QMatMulOperation {
                 .map(|x| x.to_string())
                 .collect::<Vec<_>>()
                 .join("x")
-        )
-    }
-
-    fn output_layout(
-        &self,
-        _: &rustc_hash::FxHashMap<NodeIndex, crate::TensorLayoutInfo>,
-    ) -> crate::TensorLayoutInfo {
-        crate::TensorLayoutInfo::new(
-            crate::Layout::contiguous(&self.out_shape),
-            self.input_datatype,
         )
     }
 }

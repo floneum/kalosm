@@ -518,11 +518,4 @@ impl Operation for NaryOperation {
                 .join("x")
         )
     }
-
-    fn output_layout(
-        &self,
-        _: &rustc_hash::FxHashMap<NodeIndex, crate::TensorLayoutInfo>,
-    ) -> crate::TensorLayoutInfo {
-        crate::TensorLayoutInfo::new(crate::Layout::contiguous(&self.shape), self.output_datatype)
-    }
 }

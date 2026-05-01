@@ -372,7 +372,6 @@ impl Resolver {
             ))),
             ComputeGraphNodeVariant::Dequantize(op) => Some(Arc::new(op.clone())),
             ComputeGraphNodeVariant::Tensor(_) => None, // Handled in execution loop
-            ComputeGraphNodeVariant::Custom(op) => Some(op.clone()),
         }
     }
 

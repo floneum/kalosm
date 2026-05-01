@@ -1,7 +1,7 @@
 use std::{borrow::Cow, env, sync::mpsc, time::Instant};
 
 use phase_token_prototype::{
-    build, GgmlQuantFormat, KernelIr, Layout, MemoryLevel, Shape, Strides, F32,
+    tile, GgmlQuantFormat, KernelIr, Layout, MemoryLevel, Shape, Strides, F32,
 };
 use wgpu::util::DeviceExt;
 
@@ -160,7 +160,6 @@ impl BenchMode {
 }
 
 struct Harness {
-    mode: BenchMode,
     m: usize,
     n: usize,
     k: usize,
@@ -173,6 +172,7 @@ struct Harness {
     queue: wgpu::Queue,
     pipeline: wgpu::ComputePipeline,
     bind_group: wgpu::BindGroup,
+    dispatch_grid: [u32; 3],
     y_buffer: wgpu::Buffer,
     readback: wgpu::Buffer,
     y_layout: Layout,
@@ -209,6 +209,9 @@ impl Harness {
             layout,
             tile_override.filter(|_| matches!(mode, BenchMode::Gemm)),
         );
+        let dispatch_grid = ir
+            .single_tile_program_grid()
+            .ok_or("qmatmul bench expects one tile program")?;
         let lowered = ir.lower_to_naga()?;
 
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::default());
@@ -220,34 +223,10 @@ impl Harness {
             })
             .await?;
         let adapter_info = adapter.get_info();
-        let mut required_features = wgpu::Features::empty();
-        if matches!(mode, BenchMode::Gemm) {
-            if !adapter
-                .features()
-                .contains(wgpu::Features::EXPERIMENTAL_COOPERATIVE_MATRIX)
-            {
-                return Err(format!(
-                    "adapter {} does not expose EXPERIMENTAL_COOPERATIVE_MATRIX, required by qgemm",
-                    adapter_info.name
-                )
-                .into());
-            }
-            required_features |= wgpu::Features::EXPERIMENTAL_COOPERATIVE_MATRIX;
-        }
-        if matches!(mode, BenchMode::Gemm | BenchMode::Gemv) {
-            if !adapter.features().contains(wgpu::Features::SUBGROUP) {
-                return Err(format!(
-                    "adapter {} does not expose SUBGROUP, required by qmatmul",
-                    adapter_info.name
-                )
-                .into());
-            }
-            required_features |= wgpu::Features::SUBGROUP;
-        }
         let (device, queue) = adapter
             .request_device(&wgpu::DeviceDescriptor {
                 label: Some("phase-token-prototype qmatmul bench device"),
-                required_features,
+                required_features: wgpu::Features::empty(),
                 required_limits: wgpu::Limits::default(),
                 experimental_features: unsafe { wgpu::ExperimentalFeatures::enabled() },
                 ..Default::default()
@@ -322,7 +301,6 @@ impl Harness {
         });
 
         Ok(Self {
-            mode,
             m,
             n,
             k,
@@ -335,6 +313,7 @@ impl Harness {
             queue,
             pipeline,
             bind_group,
+            dispatch_grid,
             y_buffer,
             readback,
             y_layout,
@@ -364,14 +343,8 @@ impl Harness {
             pass.set_pipeline(&self.pipeline);
             pass.set_bind_group(0, &self.bind_group, &[]);
             for _ in 0..dispatches {
-                let (x, y) = match self.mode {
-                    BenchMode::Gemm => (
-                        ceil_div(self.n, self.tile_n) as u32,
-                        ceil_div(self.m, self.tile_m) as u32,
-                    ),
-                    BenchMode::Gemv => (ceil_div(self.n, self.tile_n) as u32, 1),
-                };
-                pass.dispatch_workgroups(x, y, 1);
+                let [x, y, z] = self.dispatch_grid;
+                pass.dispatch_workgroups(x, y, z);
             }
         }
         encoder.finish()
@@ -425,10 +398,10 @@ fn qmatmul_ir(
     layout: LayoutVariant,
     tile_override: Option<TilePlan>,
 ) -> KernelIr {
-    build(move |mut phase| {
+    tile::build(move |phase| {
         let a = if matches!(layout, LayoutVariant::Im2Col) {
             let shape = im2col_shape(m, k);
-            let input = phase.storage_tensor_read_with_layout::<F32>(im2col_input_layout(&shape));
+            let input = phase.storage_read_with_layout::<F32, 4>(im2col_input_layout(&shape));
             input.im2col_nhwc(
                 [shape.out_h as u32, shape.out_w as u32],
                 [shape.kernel_h as u32, shape.kernel_w as u32],
@@ -436,24 +409,28 @@ fn qmatmul_ir(
                 [1, 1],
             )
         } else {
-            phase.storage_tensor_read_with_layout::<F32>(activation_layout(m, k, layout))
+            phase.storage_read_with_layout::<F32, 2>(activation_layout(m, k, layout))
         };
         let b = phase.quantized_matrix(format, k as u32, n as u32);
-        let y = phase.storage_tensor_with_layout::<F32>(output_layout(m, n, layout));
-        if let Some(tile) = tile_override {
-            phase.qmatmul_with_tile_plan(
-                &a,
-                &b,
-                &y,
-                tile.bm as u32,
-                tile.bn as u32,
-                tile.bk as u32,
-                4,
-            );
+        let y = phase.storage_write_with_layout::<F32, 2>(output_layout(m, n, layout));
+        if m == 1 {
+            phase.qgemv::<4, 64>(&a, &b, &y, 4, 1);
+        } else if let Some(tile) = tile_override {
+            match (tile.bm, tile.bn, tile.bk) {
+                (8, 8, 4) => phase.qmatmul::<8, 8, 4>(&a, &b, &y, 4),
+                (8, 4, 8) => phase.qmatmul::<8, 4, 8>(&a, &b, &y, 4),
+                (4, 8, 8) => phase.qmatmul::<4, 8, 8>(&a, &b, &y, 4),
+                (16, 4, 4) => phase.qmatmul::<16, 4, 4>(&a, &b, &y, 4),
+                (4, 16, 4) => phase.qmatmul::<4, 16, 4>(&a, &b, &y, 4),
+                _ => {
+                    panic!(
+                        "typed tile bench supports BM/BN/BK of 8/8/4, 8/4/8, 4/8/8, 16/4/4, or 4/16/4"
+                    )
+                }
+            }
         } else {
-            phase.qmatmul(&a, &b, &y);
+            phase.qmatmul::<8, 4, 8>(&a, &b, &y, 4);
         }
-        phase.finish()
     })
 }
 
@@ -471,9 +448,9 @@ fn qgemm_tile_shape(format: GgmlQuantFormat) -> TilePlan {
         | GgmlQuantFormat::Q5K
         | GgmlQuantFormat::Q6K
         | GgmlQuantFormat::Q8K => TilePlan {
-            bm: 64,
-            bn: 64,
-            bk: 16,
+            bm: 8,
+            bn: 4,
+            bk: 8,
         },
     }
 }
@@ -909,6 +886,15 @@ fn parse_tile_override(
         )
         .into());
     }
+    if !matches!(
+        (bm, bn, bk),
+        (8, 8, 4) | (8, 4, 8) | (4, 8, 8) | (16, 4, 4) | (4, 16, 4)
+    ) {
+        return Err(format!(
+            "typed tile bench supports BM/BN/BK of 8/8/4, 8/4/8, 4/8/8, 16/4/4, or 4/16/4; got {bm}/{bn}/{bk}",
+        )
+        .into());
+    }
     Ok(Some(TilePlan { bm, bn, bk }))
 }
 
@@ -950,10 +936,6 @@ fn all_formats() -> &'static [GgmlQuantFormat] {
 fn percentile(sorted: &[f64], p: f64) -> f64 {
     let index = ((sorted.len() - 1) as f64 * p).round() as usize;
     sorted[index]
-}
-
-fn ceil_div(value: usize, divisor: usize) -> usize {
-    value.div_ceil(divisor)
 }
 
 fn byte_len<T>(len: usize) -> u64 {

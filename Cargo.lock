@@ -6549,6 +6549,7 @@ name = "phase-token-prototype"
 version = "0.1.0"
 dependencies = [
  "bytemuck",
+ "half 2.7.1",
  "naga",
  "pollster",
  "wgpu",

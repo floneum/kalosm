@@ -7,8 +7,8 @@ use crate::{
     mir::{
         direct_kernel::{DirectKernel, DirectKernelBinding},
         tile_direct::{
-            flatten_matrix_layout, storage_tensor_read_with_direct_layout,
-            storage_tensor_with_direct_layout,
+            flatten_matrix_layout, tile_storage_read_with_direct_layout,
+            tile_storage_write_with_direct_layout,
         },
     },
     nary_wise::UnaryFunctionChain,
@@ -161,165 +161,28 @@ impl MatMulOperation {
             return None;
         }
 
-        enum TileMatMulPlan {
-            Gemv {
-                rows_per_workgroup: u32,
-            },
-            Gemm {
-                tile_m: u32,
-                tile_n: u32,
-                tile_k: u32,
-            },
+        let ir = tile_ir::tile::build(move |phase| {
+            let a = tile_storage_read_with_direct_layout(phase, a_view);
+            let b = tile_storage_read_with_direct_layout(phase, b_view);
+            let y = tile_storage_write_with_direct_layout(phase, y_view);
+            phase.matmul::<256>(&a, &b, &y);
+        });
+        let dispatch_size = ir.single_tile_program_grid()?;
+        let max_workgroups = device.limits().max_compute_workgroups_per_dimension;
+        if dispatch_size.iter().any(|dim| *dim > max_workgroups) {
+            return None;
         }
-
-        let (plan, dispatch_size, cache_key) = if n == 1 {
-            let rows_per_workgroup = if m % 4 == 0 {
-                4
-            } else if m % 2 == 0 {
-                2
-            } else {
-                1
-            };
-            let cache_key = format!(
-                "{}:gemv-tile:{:?}:{:?}:{:?}:rows_per_workgroup={rows_per_workgroup}",
-                self.name(),
-                input_a.layout(),
-                input_b.layout(),
-                output.layout()
-            );
-            (
-                TileMatMulPlan::Gemv { rows_per_workgroup },
-                [ceil_div_u32(m, rows_per_workgroup), 1, 1],
-                cache_key,
-            )
-        } else {
-            let preferred_tiles = if (m >= 512 || n >= 512) && device.cooperative_matrix_supported()
-            {
-                Some((64, 64, 16))
-            } else {
-                match &self.parameters {
-                    MatMulParams::CoopMatMul(_) if m >= 512 || n >= 512 => Some((64, 64, 16)),
-                    MatMulParams::CoopMatMul(params) => {
-                        Some((params.block_m, params.block_n, params.block_k))
-                    }
-                    _ => None,
-                }
-            };
-            let tile_m = preferred_tiles
-                .and_then(|(tile_m, _, _)| exact_divisor(m, tile_m))
-                .or_else(|| largest_divisor_at_most(m, &[128, 64, 32, 16, 8, 4, 2, 1]))?;
-            let tile_n = preferred_tiles
-                .and_then(|(_, tile_n, _)| exact_divisor(n, tile_n))
-                .or_else(|| largest_divisor_at_most(n, &[128, 64, 32, 16, 8, 4, 2, 1]))?;
-            let tile_k = preferred_tiles
-                .and_then(|(_, _, tile_k)| exact_divisor(k, tile_k))
-                .or_else(|| largest_divisor_at_most(k, &[32, 16, 8, 4, 2, 1]))?;
-            let cache_key = format!(
-                "{}:gemm-tile:{:?}:{:?}:{:?}:{:?}:tile={tile_m}x{tile_n}x{tile_k}",
-                self.name(),
-                self.parameters,
-                input_a.layout(),
-                input_b.layout(),
-                output.layout()
-            );
-            (
-                TileMatMulPlan::Gemm {
-                    tile_m,
-                    tile_n,
-                    tile_k,
-                },
-                [n / tile_n, m / tile_m, 1],
-                cache_key,
-            )
-        };
+        let cache_key = format!(
+            "{}:matmul-tile-program:{:?}:{:?}:{:?}:dispatch={dispatch_size:?}",
+            self.name(),
+            input_a.layout(),
+            input_b.layout(),
+            output.layout()
+        );
 
         let module = if let Some(module) = device.naga_module_cache().write().get(&cache_key) {
             module.clone()
         } else {
-            let ir = match plan {
-                TileMatMulPlan::Gemv { rows_per_workgroup } => tile_ir::build(move |mut phase| {
-                    let a = storage_tensor_read_with_direct_layout(&mut phase, a_view);
-                    let x = storage_tensor_read_with_direct_layout(&mut phase, b_view);
-                    let y = storage_tensor_with_direct_layout(&mut phase, y_view);
-                    let partials =
-                        phase.alloc_workgroup_tile::<tile_ir::F32>(tile_ir::Shape::new([
-                            128 * rows_per_workgroup
-                        ]));
-                    phase.gemv_tiled(&a, &x, &y, partials, rows_per_workgroup, 4);
-                    phase.finish()
-                }),
-                TileMatMulPlan::Gemm {
-                    tile_m,
-                    tile_n,
-                    tile_k,
-                } => tile_ir::build(move |mut phase| {
-                    let a_full = storage_tensor_read_with_direct_layout(&mut phase, a_view);
-                    let b_full = storage_tensor_read_with_direct_layout(&mut phase, b_view);
-                    let y_full = storage_tensor_with_direct_layout(&mut phase, y_view);
-                    let a = a_full.dynamic_tile_2d(
-                        tile_ir::Shape::new([tile_m, tile_k]),
-                        Some(tile_ir::DynamicOffset::Workgroup(
-                            tile_ir::WorkgroupOffset::new(tile_ir::WorkgroupAxis::Y, tile_m),
-                        )),
-                        Some(tile_ir::DynamicOffset::Loop(tile_ir::LoopOffset::new(
-                            tile_k,
-                        ))),
-                    );
-                    let b = b_full.dynamic_tile_2d(
-                        tile_ir::Shape::new([tile_k, tile_n]),
-                        Some(tile_ir::DynamicOffset::Loop(tile_ir::LoopOffset::new(
-                            tile_k,
-                        ))),
-                        Some(tile_ir::DynamicOffset::Workgroup(
-                            tile_ir::WorkgroupOffset::new(tile_ir::WorkgroupAxis::X, tile_n),
-                        )),
-                    );
-                    let y = y_full.workgroup_tile_2d(
-                        tile_ir::Shape::new([tile_m, tile_n]),
-                        Some(tile_ir::WorkgroupOffset::new(
-                            tile_ir::WorkgroupAxis::Y,
-                            tile_m,
-                        )),
-                        Some(tile_ir::WorkgroupOffset::new(
-                            tile_ir::WorkgroupAxis::X,
-                            tile_n,
-                        )),
-                    );
-                    let mut acc =
-                        phase.alloc_fragment::<tile_ir::F32>(tile_ir::Shape::new([tile_m, tile_n]));
-                    phase.fill_zero(&mut acc);
-                    let acc_out = acc;
-
-                    phase.range_step_count(
-                        k / tile_k,
-                        |mut phase, _| {
-                            let a_tile = phase.alloc_tile_with_layout::<tile_ir::F32>(
-                                workgroup_layout(tile_m, tile_k),
-                            );
-                            let b_tile = phase.alloc_tile_with_layout::<tile_ir::F32>(
-                                workgroup_layout(tile_k, tile_n),
-                            );
-                            let pending = phase.cooperative_load_pair(a_tile, &a, b_tile, &b);
-                            let (a_tile, b_tile, mut phase) = pending.sync_tiles();
-
-                            tile_ir::kernels::gemm::tiled(
-                                &mut phase,
-                                &a_tile,
-                                &b_tile,
-                                &mut acc,
-                                tile_ir::kernels::gemm::GemmTilePlan::portable(
-                                    tile_m, tile_n, tile_k,
-                                ),
-                            );
-                            phase.sync_end()
-                        },
-                        |mut phase| {
-                            phase.store_fragment_to_storage(&acc_out, &y);
-                            phase.finish()
-                        },
-                    )
-                }),
-            };
             let module = ir.lower_to_naga().ok()?.module().clone();
             device
                 .naga_module_cache()
@@ -351,30 +214,6 @@ impl MatMulOperation {
             dispatch_size,
         ))
     }
-}
-
-fn ceil_div_u32(x: u32, divisor: u32) -> u32 {
-    x.div_ceil(divisor)
-}
-
-fn largest_divisor_at_most(value: u32, candidates: &[u32]) -> Option<u32> {
-    candidates
-        .iter()
-        .copied()
-        .find(|candidate| *candidate <= value && value % *candidate == 0)
-}
-
-fn exact_divisor(value: u32, candidate: u32) -> Option<u32> {
-    (candidate != 0 && candidate <= value && value % candidate == 0).then_some(candidate)
-}
-
-fn workgroup_layout(rows: u32, cols: u32) -> tile_ir::Layout {
-    const SHARED_PAD: u32 = 4;
-    tile_ir::Layout::strided(
-        tile_ir::MemoryLevel::Workgroup,
-        tile_ir::Shape::new([rows, cols]),
-        tile_ir::Strides::new([cols + SHARED_PAD, 1]),
-    )
 }
 
 impl Operation for MatMulOperation {
@@ -517,16 +356,6 @@ impl Operation for MatMulOperation {
                 .map(|s| s.to_string())
                 .collect::<Vec<_>>()
                 .join("x")
-        )
-    }
-
-    fn output_layout(
-        &self,
-        _: &rustc_hash::FxHashMap<NodeIndex, crate::TensorLayoutInfo>,
-    ) -> crate::TensorLayoutInfo {
-        crate::TensorLayoutInfo::new(
-            crate::Layout::contiguous(&self.out_shape),
-            self.post_element_wise.out_datatype(),
         )
     }
 }

@@ -42,11 +42,10 @@ pub(crate) struct ReduceOperation {
     pub(crate) function: ReduceFunction,
     pub(crate) post_element_wise: UnaryFunctionChain,
     pub(crate) axis: usize,
-    pub(crate) shape: Box<[usize]>,
 }
 
 impl ReduceOperation {
-    pub fn new(value: NodeIndex, function: ReduceFunction, axis: usize, shape: &[usize]) -> Self {
+    pub fn new(value: NodeIndex, function: ReduceFunction, axis: usize, _shape: &[usize]) -> Self {
         let datatype = function.datatype();
         Self {
             value,
@@ -54,7 +53,6 @@ impl ReduceOperation {
             function,
             post_element_wise: UnaryFunctionChain::empty(datatype),
             axis,
-            shape: shape.into(),
         }
     }
 
@@ -158,19 +156,6 @@ impl Operation for ReduceOperation {
 
     fn name(&self) -> String {
         format!("reduce_{}", self.function.name())
-    }
-
-    fn output_layout(
-        &self,
-        _: &rustc_hash::FxHashMap<NodeIndex, crate::TensorLayoutInfo>,
-    ) -> crate::TensorLayoutInfo {
-        let new_shape = self
-            .shape
-            .iter()
-            .enumerate()
-            .filter_map(|(i, dim)| (i != self.axis).then_some(*dim))
-            .collect::<Vec<_>>();
-        crate::TensorLayoutInfo::new(crate::Layout::contiguous(&new_shape), self.out_datatype())
     }
 }
 

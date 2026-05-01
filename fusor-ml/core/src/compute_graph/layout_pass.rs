@@ -33,7 +33,6 @@ impl LayoutPass {
                 ComputeGraphNodeVariant::SliceAssign(op) => self.visit_slice_assign(node, op),
                 ComputeGraphNodeVariant::Tensor(op) => self.visit_tensor(node, op),
                 ComputeGraphNodeVariant::Dequantize(op) => self.visit_dequantize(node, op),
-                ComputeGraphNodeVariant::Custom(op) => self.visit_custom(node, op),
             }
         }
     }
@@ -179,26 +178,5 @@ impl LayoutPass {
         let new_layout = Layout::contiguous(matrix.shape());
         self.output_layout
             .insert(key, TensorLayoutInfo::new(new_layout, operation.datatype));
-    }
-
-    fn visit_custom(
-        &mut self,
-        key: NodeIndex,
-        operation: &std::sync::Arc<dyn crate::mir::operation::Operation + Send + Sync>,
-    ) {
-        let mut dependencies = Vec::new();
-        operation.visit_dependencies(&mut |dep| {
-            dependencies.push(dep);
-        });
-
-        for dependency in dependencies {
-            if !self.output_layout.contains_key(&dependency) {
-                self.queue.push_back(dependency);
-                self.queue.push_back(key);
-                return;
-            }
-        }
-        self.output_layout
-            .insert(key, operation.output_layout(&self.output_layout));
     }
 }

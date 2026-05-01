@@ -74,32 +74,32 @@ pub(crate) fn flatten_matrix_layout(layout: &Layout) -> Option<DirectMatrixLayou
     })
 }
 
-pub(crate) fn storage_tensor_read_with_direct_layout<'k>(
-    phase: &mut tile_ir::Phase<'_, 'k, '_, tile_ir::Clean>,
+pub(crate) fn tile_storage_read_with_direct_layout(
+    phase: &mut tile_ir::tile::Program,
     view: DirectMatrixLayout,
-) -> tile_ir::StorageTensor<'k, tile_ir::F32> {
+) -> tile_ir::tile::Storage<tile_ir::F32, 2> {
     if let Some(index_map) = view.index_map {
-        phase.storage_tensor_read_with_layout_offset_and_index_map::<tile_ir::F32>(
+        phase.storage_read_with_layout_offset_and_index_map::<tile_ir::F32, 2>(
             view.layout,
             view.offset,
             index_map,
         )
     } else {
-        phase.storage_tensor_read_with_layout_offset::<tile_ir::F32>(view.layout, view.offset)
+        phase.storage_read_with_layout_offset::<tile_ir::F32, 2>(view.layout, view.offset)
     }
 }
 
-pub(crate) fn storage_tensor_with_direct_layout<'k>(
-    phase: &mut tile_ir::Phase<'_, 'k, '_, tile_ir::Clean>,
+pub(crate) fn tile_storage_write_with_direct_layout(
+    phase: &mut tile_ir::tile::Program,
     view: DirectMatrixLayout,
-) -> tile_ir::StorageTensor<'k, tile_ir::F32> {
+) -> tile_ir::tile::Storage<tile_ir::F32, 2> {
     if let Some(index_map) = view.index_map {
-        phase.storage_tensor_with_layout_offset_and_index_map::<tile_ir::F32>(
+        phase.storage_write_with_layout_offset_and_index_map::<tile_ir::F32, 2>(
             view.layout,
             view.offset,
             index_map,
         )
     } else {
-        phase.storage_tensor_with_layout_offset::<tile_ir::F32>(view.layout, view.offset)
+        phase.storage_write_with_layout_offset::<tile_ir::F32, 2>(view.layout, view.offset)
     }
 }

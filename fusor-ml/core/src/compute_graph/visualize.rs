@@ -171,27 +171,6 @@ impl GraphVisPass {
         });
         self.identities.insert(key, id.clone());
     }
-
-    fn visit_custom(
-        &mut self,
-        key: NodeIndex,
-        operation: &std::sync::Arc<dyn crate::mir::operation::Operation + Send + Sync>,
-    ) {
-        let output_layout = self.layout_pass.output_layout.get(&key).unwrap();
-        let id = Identity::quoted(format!("custom ({}) #{:?}", output_layout, key));
-        self.statements.push(Stmt::Node {
-            id: id.clone(),
-            port: None,
-            attr: None,
-        });
-        operation.visit_dependencies(&mut |dep| {
-            let dep_id = self.identities.get(&dep).unwrap();
-            self.statements.push(Stmt::Edge(
-                Edge::head_node(dep_id.clone(), None).arrow_to_node(id.clone(), None),
-            ));
-        });
-        self.identities.insert(key, id.clone());
-    }
 }
 
 impl ComputeGraphInner {
@@ -249,7 +228,6 @@ impl ComputeGraphInner {
                 ComputeGraphNodeVariant::Dequantize(op) => {
                     graph_vis_pass.visit_dequantize(node, op)
                 }
-                ComputeGraphNodeVariant::Custom(op) => graph_vis_pass.visit_custom(node, op),
             }
         }
 

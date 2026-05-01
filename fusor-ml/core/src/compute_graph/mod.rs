@@ -15,9 +15,9 @@ mod visualize;
 use crate::{
     DataTypeEnum, Device, MatMulOperation, QMatrix, ReduceOperation,
     compute_graph::resolve::ResolverResult, dequantize::DequantizeOperation,
-    map_layout::MapLayoutOperation, mir::operation::Operation, nary_wise::NaryOperation,
-    quantized::matmul::QMatMulOperation, resize::ResizeOperation,
-    slice_assign::SliceAssignOperation, tensor::TensorData, visit_tiled::MaybeQData,
+    map_layout::MapLayoutOperation, nary_wise::NaryOperation, quantized::matmul::QMatMulOperation,
+    resize::ResizeOperation, slice_assign::SliceAssignOperation, tensor::TensorData,
+    visit_tiled::MaybeQData,
 };
 
 #[derive(Clone)]
@@ -81,10 +81,6 @@ impl ComputeGraph {
         self.create_node(ComputeGraphNodeVariant::Dequantize(
             DequantizeOperation::new(matrix, ty),
         ))
-    }
-
-    pub(crate) fn create_custom(&self, op: Arc<dyn Operation + Send + Sync>) -> NodeIndex {
-        self.create_node(ComputeGraphNodeVariant::Custom(op))
     }
 
     pub(crate) fn resolve(&self, key: NodeIndex) -> ResolverResult {
@@ -172,7 +168,6 @@ pub(crate) enum ComputeGraphNodeVariant {
     QMatMul(QMatMulOperation),
     Tensor(TensorData),
     Reduce(ReduceOperation),
-    Custom(Arc<dyn Operation + Send + Sync>),
 }
 
 impl ComputeGraphNodeVariant {
@@ -199,9 +194,6 @@ impl ComputeGraphNodeVariant {
             }
             ComputeGraphNodeVariant::Dequantize(_) => {}
             ComputeGraphNodeVariant::Tensor(_) => {}
-            ComputeGraphNodeVariant::Custom(op) => {
-                op.visit_dependencies(f);
-            }
         }
     }
 }

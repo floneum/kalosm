@@ -28,172 +28,17 @@ impl KernelIr {
         &self.body
     }
 
-    /// Expand high-level GEMM operations into nested partition/MMA operations.
-    ///
-    /// This is the prototype's split between a Triton/TileLang-like source IR
-    /// and a lower tile IR where subgroup/thread partitioning is explicit.
-    pub fn expand_gemm_to_mma(&self) -> Self {
-        let mut expanded = Self {
-            buffers: self.buffers.clone(),
-            tiles: self.tiles.clone(),
-            body: Block::new(),
-            next_buffer: self.next_buffer,
-            next_tile: self.next_tile,
-        };
-        expanded.body = expanded.expand_block_gemm_to_mma(&self.body);
-        expanded
-    }
-
     /// Lower this IR into a validated Naga module.
     pub fn lower_to_naga(&self) -> Result<NagaKernel, LowerError> {
         crate::lower::lower_to_naga(self)
     }
 
-    fn expand_block_gemm_to_mma(&mut self, block: &Block) -> Block {
-        let mut expanded = Block::new();
-        for op in block.ops() {
-            expanded.push(match op {
-                Op::Gemm(op) => self.expand_gemm_op(*op),
-                Op::Loop(op) => Op::Loop(LoopOp {
-                    kind: op.kind,
-                    body: self.expand_block_gemm_to_mma(&op.body),
-                }),
-                Op::Partition(op) => Op::Partition(PartitionOp {
-                    bindings: op.bindings.clone(),
-                    level: op.level,
-                    body: self.expand_block_gemm_to_mma(&op.body),
-                }),
-                op => op.clone(),
-            });
-        }
-        expanded
-    }
-
-    fn expand_gemm_op(&mut self, op: GemmOp) -> Op {
-        let [m, k] = self.tile_shape_2d(op.a);
-        let [k_b, n] = self.tile_shape_2d(op.b);
-        let [m_acc, n_acc] = self.tile_shape_2d(op.acc);
-        assert_eq!(k, k_b, "gemm K dimensions must match");
-        assert_eq!(m, m_acc, "gemm M dimension must match accumulator");
-        assert_eq!(n, n_acc, "gemm N dimension must match accumulator");
-        assert_eq!(m % op.tiling.subgroup_m, 0, "M must divide subgroup_m");
-        assert_eq!(n % op.tiling.subgroup_n, 0, "N must divide subgroup_n");
-        assert_eq!(
-            op.tiling.subgroup_m % op.tiling.thread_m,
-            0,
-            "subgroup_m must divide thread_m"
-        );
-        assert_eq!(
-            op.tiling.subgroup_n % op.tiling.thread_n,
-            0,
-            "subgroup_n must divide thread_n"
-        );
-
-        let mut ops = Vec::new();
-        for subgroup_m in (0..m).step_by(op.tiling.subgroup_m as usize) {
-            for subgroup_n in (0..n).step_by(op.tiling.subgroup_n as usize) {
-                let a_subgroup = self.alloc_partition_view(
-                    op.a,
-                    TileLevel::Subgroup,
-                    Shape::new([op.tiling.subgroup_m, op.tiling.subgroup_k]),
-                    [subgroup_m, 0],
-                );
-                let b_subgroup = self.alloc_partition_view(
-                    op.b,
-                    TileLevel::Subgroup,
-                    Shape::new([op.tiling.subgroup_k, op.tiling.subgroup_n]),
-                    [0, subgroup_n],
-                );
-                let acc_subgroup = self.alloc_partition_view(
-                    op.acc,
-                    TileLevel::Subgroup,
-                    Shape::new([op.tiling.subgroup_m, op.tiling.subgroup_n]),
-                    [subgroup_m, subgroup_n],
-                );
-
-                for thread_m in (0..op.tiling.subgroup_m).step_by(op.tiling.thread_m as usize) {
-                    for thread_n in (0..op.tiling.subgroup_n).step_by(op.tiling.thread_n as usize) {
-                        let a_thread = self.alloc_partition_view(
-                            a_subgroup,
-                            TileLevel::Thread,
-                            Shape::new([op.tiling.thread_m, op.tiling.thread_k]),
-                            [thread_m, 0],
-                        );
-                        let b_thread = self.alloc_partition_view(
-                            b_subgroup,
-                            TileLevel::Thread,
-                            Shape::new([op.tiling.thread_k, op.tiling.thread_n]),
-                            [0, thread_n],
-                        );
-                        let acc_thread = self.alloc_partition_view(
-                            acc_subgroup,
-                            TileLevel::Thread,
-                            Shape::new([op.tiling.thread_m, op.tiling.thread_n]),
-                            [thread_m, thread_n],
-                        );
-                        ops.push(Op::Mma(MmaOp {
-                            a: a_thread,
-                            b: b_thread,
-                            acc: acc_thread,
-                            level: TileLevel::Thread,
-                            backend: op.backend,
-                        }));
-                    }
-                }
-            }
-        }
-
-        Op::Block(BlockOp {
-            body: Block::from_ops(ops),
-        })
-    }
-
-    fn alloc_partition_view(
-        &mut self,
-        source: TileRef,
-        level: TileLevel,
-        shape: Shape,
-        origin: [u32; 2],
-    ) -> TileRef {
-        let source_decl = self.tile_decl(source);
-        let layout = Layout::strided(
-            source_decl.layout.memory_level(),
-            shape,
-            source_decl.layout.strides().clone(),
-        );
-        let element = source_decl.element;
-        let id = TileId(self.next_tile);
-        self.next_tile += 1;
-        let view = TileRef::new(id, element);
-        self.tiles.push(TileDecl {
-            id,
-            element,
-            layout,
-            level,
-            origin: TileOrigin::View {
-                source,
-                mapping: ViewMapping::Partition { level, origin },
-            },
-        });
-        view
-    }
-
-    fn tile_shape_2d(&self, tile: TileRef) -> [u32; 2] {
-        let shape = self.tile_decl(tile).layout.shape();
-        assert_eq!(shape.rank(), 2, "gemm tiles must be rank-2");
-        [shape.dims()[0].get(), shape.dims()[1].get()]
-    }
-
-    fn tile_decl(&self, tile: TileRef) -> &TileDecl {
-        let decl = self
-            .tiles
-            .get(tile.id.index())
-            .expect("tile reference must point at a declared tile");
-        assert_eq!(
-            decl.element, tile.element,
-            "tile reference element must match its declaration"
-        );
-        decl
+    /// Return the dispatch grid for kernels that lower to a single tile program.
+    pub fn single_tile_program_grid(&self) -> Option<[u32; 3]> {
+        let [Op::TileProgram(program)] = self.body.ops.as_slice() else {
+            return None;
+        };
+        Some(program.grid)
     }
 }
 
@@ -227,36 +72,8 @@ impl Block {
 /// A typed IR operation.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Op {
-    /// A structural block introduced by an expansion pass.
-    Block(BlockOp),
-    /// Fill a tile with a scalar value.
-    FillTile(FillTileOp),
-    /// A subgroup-cooperative load into a workgroup tile.
-    CooperativeLoad(CooperativeLoadOp),
-    /// A semantic partition of one or more tiles to a lower execution level.
-    Partition(PartitionOp),
-    /// A control barrier.
-    Barrier(BarrierOp),
-    /// High-level tiled GEMM over parent tiles/fragments.
-    Gemm(GemmOp),
-    /// Row-parallel matrix-vector multiply over storage tensors.
-    Gemv(GemvOp),
-    /// Matrix multiply where the right-hand matrix is a packed GGML quantized tensor.
-    QMatMul(QMatMulOp),
-    /// Dequantize a packed GGML quantized tensor into dense f32 storage.
-    QDequantize(QDequantizeOp),
-    /// Matrix multiply-accumulate over tile operands.
-    Mma(MmaOp),
-    /// Store a tile to a storage buffer view.
-    StoreTile(StoreTileOp),
-    /// A structured loop.
-    Loop(LoopOp),
-}
-
-/// A structured block operation.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct BlockOp {
-    pub body: Block,
+    /// Triton-like source tile program over one workgroup tile.
+    TileProgram(TileProgramOp),
 }
 
 /// A storage buffer declaration.
@@ -322,21 +139,6 @@ impl TileRef {
     pub const fn new(id: TileId, element: ElementType) -> Self {
         Self { id, element }
     }
-}
-
-/// A subgroup-cooperative load into a workgroup tile.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct CooperativeLoadOp {
-    pub dst: TileRef,
-    pub src: StorageView,
-    pub level: TileLevel,
-}
-
-/// A store from a tile to storage.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct StoreTileOp {
-    pub src: TileRef,
-    pub dst: StorageView,
 }
 
 /// A shaped view into a storage buffer.
@@ -463,60 +265,6 @@ impl WorkgroupAxis {
     }
 }
 
-/// Fill a tile with a scalar value.
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub struct FillTileOp {
-    pub dst: TileRef,
-    pub value: FillValue,
-}
-
-/// Literal fill values represented by the prototype IR.
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub enum FillValue {
-    Zero,
-}
-
-/// A barrier operation.
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub struct BarrierOp {
-    pub scope: BarrierScope,
-}
-
-/// Matrix multiply-accumulate over shaped tiles.
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub struct MmaOp {
-    pub a: TileRef,
-    pub b: TileRef,
-    pub acc: TileRef,
-    pub level: TileLevel,
-    pub backend: MmaBackend,
-}
-
-/// High-level GEMM over shared/block operands and an accumulator fragment.
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub struct GemmOp {
-    pub a: TileRef,
-    pub b: TileRef,
-    pub acc: TileRef,
-    pub tiling: GemmTiling,
-    pub backend: MmaBackend,
-}
-
-/// A row-parallel GEMV operation.
-///
-/// The lowering assigns one workgroup to one output row. Invocations within the
-/// workgroup cooperatively reduce the K dimension into `partials`, then lane 0
-/// writes the row result.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct GemvOp {
-    pub a: StorageView,
-    pub x: StorageView,
-    pub y: StorageView,
-    pub partials: TileRef,
-    pub rows_per_workgroup: u32,
-    pub vector_width: u32,
-}
-
 /// GGML quantization formats represented by the prototype qmatmul path.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum GgmlQuantFormat {
@@ -560,29 +308,8 @@ impl GgmlQuantFormat {
         }
     }
 
-    /// Single-row qmatmul tile shape, seeded from ggml's Metal kernels and
-    /// tuned for the generated wgpu/Metal code path.
-    pub const fn qgemv_cols_per_subgroup(self) -> u32 {
-        match self {
-            Self::Q2K => 4,
-            Self::Q4_0 | Self::Q4_1 | Self::Q5_1 => 4,
-            Self::Q5_0 => 4,
-            Self::Q3K | Self::Q4K | Self::Q8K => 2,
-            Self::Q6K => 1,
-            Self::Q8_0 | Self::Q8_1 => 8,
-            Self::Q5K => 1,
-        }
-    }
-
-    pub const fn qgemv_subgroups_per_workgroup(self) -> u32 {
-        match self {
-            Self::Q4K | Self::Q8_0 | Self::Q8_1 => 4,
-            _ => 2,
-        }
-    }
-
     pub const fn qgemv_cols_per_workgroup(self) -> u32 {
-        self.qgemv_subgroups_per_workgroup() * self.qgemv_cols_per_subgroup()
+        4
     }
 }
 
@@ -595,99 +322,221 @@ pub struct QuantizedMatrix {
     pub cols: u32,
 }
 
-/// Row/column matrix multiply with an f32 activation matrix and GGML-quantized weights.
+/// A small Triton-like source tile program.
+///
+/// The first lowering target supports one-dimensional lane tiles: each
+/// invocation owns one lane, reductions use scratch tiles, and storage accesses
+/// are expressed through typed index expressions.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct QMatMulOp {
-    pub a: StorageView,
-    pub b: QuantizedMatrix,
-    pub y: StorageView,
-    pub a_tile: TileRef,
-    pub b_tile: TileRef,
-    pub tile_m: u32,
-    pub tile_n: u32,
-    pub tile_k: u32,
-    pub vector_width: u32,
-    pub use_qgemv: bool,
-    pub workgroups_x: u32,
+pub struct TileProgramOp {
+    pub grid: [u32; 3],
+    pub block: u32,
+    pub stores: Vec<TileStoreProgramOp>,
 }
 
-/// Dense dequantization of a packed GGML quantized matrix.
+/// A masked tile store emitted by a source tile program.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct QDequantizeOp {
-    pub b: QuantizedMatrix,
-    pub y: StorageView,
-    pub workgroups_x: u32,
+pub struct TileStoreProgramOp {
+    pub dst: StorageView,
+    pub row: TileIndexExpr,
+    pub col: TileIndexExpr,
+    pub value: TileExpr,
+    pub mask: TileMaskExpr,
 }
 
-/// Concrete tiling plan used when lowering a high-level GEMM into tile MMA.
+/// Floating point literal stored by bits so IR equality remains exact.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub struct GemmTiling {
-    pub subgroup_m: u32,
-    pub subgroup_n: u32,
-    pub subgroup_k: u32,
-    pub thread_m: u32,
-    pub thread_n: u32,
-    pub thread_k: u32,
+pub struct F32Bits(pub u32);
+
+impl F32Bits {
+    pub fn new(value: f32) -> Self {
+        Self(value.to_bits())
+    }
+
+    pub fn get(self) -> f32 {
+        f32::from_bits(self.0)
+    }
 }
 
-impl GemmTiling {
-    /// A conservative portable tiling plan for the prototype FMA lowering.
-    pub fn portable(m: u32, n: u32, k: u32) -> Self {
-        let subgroup_m = m.min(16);
-        let subgroup_n = n.min(16);
-        let subgroup_k = k;
-        Self {
-            subgroup_m,
-            subgroup_n,
-            subgroup_k,
-            thread_m: subgroup_m.min(4),
-            thread_n: subgroup_n.min(4),
-            thread_k: subgroup_k,
+/// A typed scalar literal stored by bits so IR equality remains exact.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum TileLiteral {
+    F32(F32Bits),
+    F16(u16),
+    U32(u32),
+}
+
+impl TileLiteral {
+    pub const fn element(self) -> ElementType {
+        match self {
+            Self::F32(_) => ElementType::F32,
+            Self::F16(_) => ElementType::F16,
+            Self::U32(_) => ElementType::U32,
         }
     }
 }
 
-/// MMA lowering backend requested by the IR.
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub enum MmaBackend {
-    FmaPortable,
-    SubgroupMatrix,
-}
-
-/// A structured tile partition.
-///
-/// The body is emitted once by the Rust builder, but semantically describes
-/// code that runs over child tile views at `level`.
+/// A rank-1 tile expression evaluated lane-wise.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct PartitionOp {
-    pub bindings: Vec<PartitionBinding>,
-    pub level: TileLevel,
-    pub body: Block,
+pub enum TileExpr {
+    Load(TileLoadExpr),
+    QuantizedLoad(TileQuantizedLoadExpr),
+    Full(F32Bits),
+    Literal(TileLiteral),
+    Index(TileIndexExpr),
+    Scalar(TileScalarExpr),
+    Unary {
+        op: TileUnaryOp,
+        value: Box<TileExpr>,
+    },
+    Binary {
+        op: TileBinaryOp,
+        left: Box<TileExpr>,
+        right: Box<TileExpr>,
+    },
+    Cast {
+        value: Box<TileExpr>,
+        to: ElementType,
+    },
+    Select {
+        condition: Box<TileExpr>,
+        accept: Box<TileExpr>,
+        reject: Box<TileExpr>,
+    },
+    Compare {
+        op: TileCompareOp,
+        left: Box<TileExpr>,
+        right: Box<TileExpr>,
+        output: ElementType,
+    },
+    LoopFold {
+        op: TileReduceOp,
+        iterations: u32,
+        value: Box<TileExpr>,
+        initial: TileLiteral,
+    },
+    GroupReduce {
+        op: TileReduceOp,
+        value: Box<TileExpr>,
+        scratch: TileRef,
+        group_size: u32,
+    },
 }
 
-/// One source tile and the child tile view produced by a partition.
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub struct PartitionBinding {
-    pub source: TileRef,
-    pub view: TileRef,
-}
-
-/// A structured loop operation.
+/// A masked rank-1 tile load.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct LoopOp {
-    pub kind: LoopKind,
-    pub body: Block,
+pub struct TileLoadExpr {
+    pub src: StorageView,
+    pub row: TileIndexExpr,
+    pub col: TileIndexExpr,
+    pub mask: TileMaskExpr,
+    pub fill: TileLiteral,
 }
 
-/// The loop form represented by this prototype.
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub enum LoopKind {
-    RangeStep { induction: Dim, iterations: u32 },
+/// A masked dequantizing rank-1 tile load from a packed quantized matrix.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TileQuantizedLoadExpr {
+    pub src: QuantizedMatrix,
+    pub row: TileIndexExpr,
+    pub col: TileIndexExpr,
+    pub mask: TileMaskExpr,
+    pub fill: F32Bits,
 }
 
-/// A symbolic dimension used only to make the loop API look like an IR builder.
+/// A scalar value derived from a tile expression.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum TileScalarExpr {
+    Reduce {
+        op: TileReduceOp,
+        value: Box<TileExpr>,
+        scratch: TileRef,
+    },
+    LoopReduce {
+        op: TileReduceOp,
+        iterations: u32,
+        value: Box<TileExpr>,
+        scratch: TileRef,
+    },
+    Literal(TileLiteral),
+}
+
+/// Integer index expression over program ids and the current lane.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum TileIndexExpr {
+    Lane,
+    LoopIndex,
+    ProgramId(WorkgroupAxis),
+    Literal(u32),
+    Add(Box<TileIndexExpr>, Box<TileIndexExpr>),
+    Mul(Box<TileIndexExpr>, u32),
+    Div(Box<TileIndexExpr>, u32),
+    Mod(Box<TileIndexExpr>, u32),
+    Value(Box<TileExpr>),
+}
+
+/// Boolean mask expression.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum TileMaskExpr {
+    True,
+    Compare {
+        op: TileCompareOp,
+        left: TileIndexExpr,
+        right: TileIndexExpr,
+    },
+    And(Box<TileMaskExpr>, Box<TileMaskExpr>),
+}
+
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub struct Dim(pub u32);
+pub enum TileUnaryOp {
+    Exp,
+    Exp2,
+    Log,
+    Log2,
+    Sqrt,
+    Sin,
+    Cos,
+    Tan,
+    Tanh,
+    Asin,
+    Acos,
+    Atan,
+    Sinh,
+    Cosh,
+    Asinh,
+    Acosh,
+    Atanh,
+    Abs,
+    Neg,
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum TileBinaryOp {
+    Add,
+    Sub,
+    Mul,
+    Div,
+    Rem,
+    Pow,
+    Min,
+    Max,
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum TileReduceOp {
+    Sum,
+    Product,
+    Max,
+    Min,
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum TileCompareOp {
+    Lt,
+    Le,
+    Gt,
+    Ge,
+    Eq,
+}
 
 /// A tiny tile identifier for the typed IR.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -704,7 +553,37 @@ impl TileId {
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum ElementType {
     F32,
+    F16,
     U32,
+}
+
+/// A sample numeric marker.
+#[derive(Copy, Clone, Debug)]
+pub struct F32;
+
+/// Half-precision floating point storage marker.
+#[derive(Copy, Clone, Debug)]
+pub struct F16;
+
+/// Packed u32 storage marker.
+#[derive(Copy, Clone, Debug)]
+pub struct U32;
+
+/// Numeric element markers that can appear in the typed IR.
+pub trait Numeric {
+    const ELEMENT: ElementType;
+}
+
+impl Numeric for F32 {
+    const ELEMENT: ElementType = ElementType::F32;
+}
+
+impl Numeric for F16 {
+    const ELEMENT: ElementType = ElementType::F16;
+}
+
+impl Numeric for U32 {
+    const ELEMENT: ElementType = ElementType::U32;
 }
 
 /// A concrete layout for a tile-like value.
@@ -811,7 +690,7 @@ impl Shape {
         }
     }
 
-    /// Construct the default one-dimensional subgroup tile shape.
+    /// Construct the default one-dimensional tile shape.
     pub fn tile() -> Self {
         Self::new([32])
     }
@@ -895,34 +774,16 @@ pub enum MemoryLevel {
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum TileLevel {
     Workgroup,
-    Subgroup,
-    Thread,
 }
 
-/// Whether a tile declaration owns storage or is a view of another tile.
+/// Whether a tile declaration owns storage.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum TileOrigin {
     Allocation,
-    View {
-        source: TileRef,
-        mapping: ViewMapping,
-    },
-}
-
-/// How a view relates to its source tile.
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub enum ViewMapping {
-    Partition { level: TileLevel, origin: [u32; 2] },
 }
 
 impl Default for Layout {
     fn default() -> Self {
         Self::contiguous(MemoryLevel::Workgroup, Shape::tile())
     }
-}
-
-/// The synchronization scope for a barrier.
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub enum BarrierScope {
-    Workgroup,
 }

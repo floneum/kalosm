@@ -1,5 +1,3 @@
-use std::sync::Arc;
-
 use crate::{
     DataType, Tensor,
     compute_graph::NodeIndex,
@@ -43,7 +41,7 @@ impl<D: DataType> Tensor<4, D> {
         }
         .to_nary();
 
-        Tensor::from_parts(self.data().custom(Arc::new(operation)))
+        Tensor::from_parts(self.data().nary(operation))
     }
 }
 
