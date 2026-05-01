@@ -12,6 +12,14 @@ impl<'a> Lowerer<'a> {
                 "tile program block must match workgroup size",
             ));
         }
+        if let Some(accelerator) = &op.accelerator {
+            if !op.stores.is_empty() {
+                return Err(LowerError::UnsupportedOperation(
+                    "accelerated tile programs cannot mix scalar stores",
+                ));
+            }
+            return self.lower_tile_program_accelerator(expressions, scratch, accelerator);
+        }
 
         let mut body = Block::new();
         for store in &op.stores {

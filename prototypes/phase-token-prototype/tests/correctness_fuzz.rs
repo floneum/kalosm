@@ -41,13 +41,21 @@ async fn run_fuzz() -> TestResult {
             compatible_surface: None,
         })
         .await?;
-    let required_features = wgpu::Features::empty();
+    let adapter_features = adapter.features();
+    if !adapter_features.contains(wgpu::Features::SUBGROUP) {
+        eprintln!(
+            "skipping GPU correctness fuzz: adapter {:?} lacks subgroup support",
+            adapter.get_info(),
+        );
+        return Ok(());
+    }
+    let required_features = wgpu::Features::SUBGROUP;
 
-    if !adapter.features().contains(required_features) {
+    if !adapter_features.contains(required_features) {
         eprintln!(
             "skipping GPU correctness fuzz: adapter {:?} lacks {:?}",
             adapter.get_info(),
-            required_features - adapter.features()
+            required_features - adapter_features
         );
         return Ok(());
     }

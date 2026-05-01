@@ -14,11 +14,22 @@ pub(crate) enum DirectKernelBinding {
 }
 
 #[derive(Debug)]
+enum DirectKernelBindings {
+    Dynamic(Vec<DirectKernelBinding>),
+    Storage3 {
+        input: Arc<wgpu::Buffer>,
+        weight: Arc<wgpu::Buffer>,
+        output: Arc<wgpu::Buffer>,
+    },
+}
+
+#[derive(Debug)]
 pub(crate) struct DirectKernel {
     name: String,
     cache_key: String,
-    module: wgpu::naga::Module,
-    bindings: Vec<DirectKernelBinding>,
+    module: Option<wgpu::naga::Module>,
+    prepared_pipeline: Option<wgpu::ComputePipeline>,
+    bindings: DirectKernelBindings,
     dispatch_size: [u32; 3],
 }
 
@@ -33,8 +44,32 @@ impl DirectKernel {
         Self {
             name: name.into(),
             cache_key: cache_key.into(),
-            module,
-            bindings,
+            module: Some(module),
+            prepared_pipeline: None,
+            bindings: DirectKernelBindings::Dynamic(bindings),
+            dispatch_size,
+        }
+    }
+
+    pub(crate) fn new_storage3_with_prepared_pipeline(
+        name: impl Into<String>,
+        cache_key: impl Into<String>,
+        pipeline: wgpu::ComputePipeline,
+        input: Arc<wgpu::Buffer>,
+        weight: Arc<wgpu::Buffer>,
+        output: Arc<wgpu::Buffer>,
+        dispatch_size: [u32; 3],
+    ) -> Self {
+        Self {
+            name: name.into(),
+            cache_key: cache_key.into(),
+            module: None,
+            prepared_pipeline: Some(pipeline),
+            bindings: DirectKernelBindings::Storage3 {
+                input,
+                weight,
+                output,
+            },
             dispatch_size,
         }
     }
@@ -45,8 +80,44 @@ impl DirectKernel {
             return;
         }
 
-        let layout_entries = self
-            .bindings
+        if let DirectKernelBindings::Storage3 {
+            input,
+            weight,
+            output,
+        } = &self.bindings
+        {
+            let bind_group_layout = device.direct_storage3_bind_group_layout();
+            let bind_entries = [
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: input.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: weight.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: output.as_entire_binding(),
+                },
+            ];
+            let bind_group = device
+                .wgpu_device()
+                .create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some(&self.name),
+                    layout: &bind_group_layout,
+                    entries: &bind_entries,
+                });
+            let pipeline_layout = device.direct_storage3_pipeline_layout();
+            self.run_with_layout(device, command_encoder, bind_group, pipeline_layout);
+            return;
+        }
+
+        let DirectKernelBindings::Dynamic(bindings) = &self.bindings else {
+            unreachable!("storage3 direct kernels are handled above");
+        };
+
+        let layout_entries = bindings
             .iter()
             .map(|binding| match binding {
                 DirectKernelBinding::Storage {
@@ -79,8 +150,7 @@ impl DirectKernel {
             })
             .clone();
 
-        let bind_entries = self
-            .bindings
+        let bind_entries = bindings
             .iter()
             .map(|binding| match binding {
                 DirectKernelBinding::Storage {
@@ -113,32 +183,52 @@ impl DirectKernel {
             })
             .clone();
 
-        let module = device
-            .shader_module_cache()
-            .write()
-            .get_or_insert_ref(&self.cache_key, || {
-                device.create_naga_shader_module(self.module.clone())
-            })
-            .clone();
-        let pipeline = device
-            .compute_pipeline_cache()
-            .write()
-            .get_or_insert((pipeline_layout.clone(), module.clone()), || {
-                device
-                    .wgpu_device()
-                    .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-                        label: Some(&self.name),
-                        layout: Some(&pipeline_layout),
-                        module: &module,
-                        entry_point: Some("main"),
-                        cache: device.wgpu_cache(),
-                        compilation_options: PipelineCompilationOptions {
-                            zero_initialize_workgroup_memory: false,
-                            ..Default::default()
-                        },
-                    })
-            })
-            .clone();
+        self.run_with_layout(device, command_encoder, bind_group, pipeline_layout);
+    }
+
+    fn run_with_layout(
+        &self,
+        device: &Device,
+        command_encoder: &mut CommandEncoder,
+        bind_group: wgpu::BindGroup,
+        pipeline_layout: wgpu::PipelineLayout,
+    ) {
+        let [x, y, z] = self.dispatch_size;
+
+        let pipeline = if let Some(pipeline) = &self.prepared_pipeline {
+            pipeline.clone()
+        } else {
+            let module_ir = self
+                .module
+                .as_ref()
+                .expect("direct kernel without a prepared pipeline needs a naga module");
+            let module = device
+                .shader_module_cache()
+                .write()
+                .get_or_insert_ref(&self.cache_key, || {
+                    device.create_naga_shader_module(module_ir.clone())
+                })
+                .clone();
+            device
+                .compute_pipeline_cache()
+                .write()
+                .get_or_insert((pipeline_layout.clone(), module.clone()), || {
+                    device
+                        .wgpu_device()
+                        .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                            label: Some(&self.name),
+                            layout: Some(&pipeline_layout),
+                            module: &module,
+                            entry_point: Some("main"),
+                            cache: device.wgpu_cache(),
+                            compilation_options: PipelineCompilationOptions {
+                                zero_initialize_workgroup_memory: false,
+                                ..Default::default()
+                            },
+                        })
+                })
+                .clone()
+        };
 
         let mut pass = command_encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
             label: Some(&self.name),
@@ -150,7 +240,30 @@ impl DirectKernel {
     }
 
     #[cfg(test)]
-    pub(crate) fn bindings_for_test(&self) -> &[DirectKernelBinding] {
-        &self.bindings
+    pub(crate) fn bindings_for_test(&self) -> Vec<DirectKernelBinding> {
+        match &self.bindings {
+            DirectKernelBindings::Dynamic(bindings) => bindings.clone(),
+            DirectKernelBindings::Storage3 {
+                input,
+                weight,
+                output,
+            } => vec![
+                DirectKernelBinding::Storage {
+                    binding: 0,
+                    buffer: input.clone(),
+                    read_only: true,
+                },
+                DirectKernelBinding::Storage {
+                    binding: 1,
+                    buffer: weight.clone(),
+                    read_only: true,
+                },
+                DirectKernelBinding::Storage {
+                    binding: 2,
+                    buffer: output.clone(),
+                    read_only: false,
+                },
+            ],
+        }
     }
 }

@@ -1,20 +1,37 @@
-use std::sync::Arc;
+use std::{num::NonZeroUsize, sync::Arc};
 
 use crate::Device;
 use fusor_gguf::{
     BlockQ4_0, BlockQ4K, BlockQ5_0, BlockQ5K, BlockQ6K, BlockQ8_0, GgmlType, GgufBlock,
     GgufMetadata, GgufReadError, GgufTensorMetadata,
 };
+use lru::LruCache;
+use parking_lot::RwLock;
+use rustc_hash::FxBuildHasher;
 
 pub(crate) mod dequantize;
 pub(crate) mod matmul;
 
-#[derive(Clone, Debug)]
+const QMATRIX_DIRECT_PIPELINE_CACHE_SIZE: usize = 16;
+
+#[derive(Clone)]
 pub struct QMatrix {
     device: Device,
     shape: Box<[usize]>,
     buffer: Arc<wgpu::Buffer>,
     datatype: GgmlType,
+    direct_pipeline_cache: Arc<RwLock<LruCache<String, wgpu::ComputePipeline, FxBuildHasher>>>,
+}
+
+impl std::fmt::Debug for QMatrix {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("QMatrix")
+            .field("device", &self.device)
+            .field("shape", &self.shape)
+            .field("buffer", &self.buffer)
+            .field("datatype", &self.datatype)
+            .finish_non_exhaustive()
+    }
 }
 
 impl PartialEq for QMatrix {
@@ -118,11 +135,21 @@ impl QMatrix {
             shape,
             buffer,
             datatype,
+            direct_pipeline_cache: Arc::new(RwLock::new(LruCache::with_hasher(
+                NonZeroUsize::new(QMATRIX_DIRECT_PIPELINE_CACHE_SIZE).unwrap(),
+                Default::default(),
+            ))),
         })
     }
 
     pub(crate) fn buffer(&self) -> &Arc<wgpu::Buffer> {
         &self.buffer
+    }
+
+    pub(crate) fn direct_pipeline_cache(
+        &self,
+    ) -> &RwLock<LruCache<String, wgpu::ComputePipeline, FxBuildHasher>> {
+        &self.direct_pipeline_cache
     }
 
     pub fn shape(&self) -> &[usize] {

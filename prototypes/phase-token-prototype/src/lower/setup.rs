@@ -10,6 +10,16 @@ impl<'a> Lowerer<'a> {
             },
             Span::default(),
         );
+        let f32_vec4_ty = module.types.insert(
+            Type {
+                name: Some("Dot4".into()),
+                inner: TypeInner::Vector {
+                    size: VectorSize::Quad,
+                    scalar: Scalar::F32,
+                },
+            },
+            Span::default(),
+        );
         let uses_f16 = ir
             .buffers()
             .iter()
@@ -48,6 +58,58 @@ impl<'a> Lowerer<'a> {
             },
             Span::default(),
         );
+        let coop_subgroups = Self::max_tile_program_coop_subgroups(ir);
+        let uses_coop_tile_program = coop_subgroups > 0;
+        let uses_tile_qgemv = Self::uses_tile_qgemv(ir);
+        let uses_subgroup_id = coop_subgroups > 1 || uses_tile_qgemv;
+        let uses_subgroup_invocation_id = uses_tile_qgemv;
+        let uses_subgroup_size = uses_tile_qgemv;
+        let uses_num_subgroups = uses_tile_qgemv;
+        let (coop_f32_a_ty, coop_f32_b_ty, coop_f32_c_ty) = if uses_coop_tile_program {
+            let coop_f32_a_ty = module.types.insert(
+                Type {
+                    name: Some("CoopA8x8F32".into()),
+                    inner: TypeInner::CooperativeMatrix {
+                        columns: COOP_MATRIX_SIZE,
+                        rows: COOP_MATRIX_SIZE,
+                        scalar: Scalar::F32,
+                        role: CooperativeRole::A,
+                    },
+                },
+                Span::default(),
+            );
+            let coop_f32_b_ty = module.types.insert(
+                Type {
+                    name: Some("CoopB8x8F32".into()),
+                    inner: TypeInner::CooperativeMatrix {
+                        columns: COOP_MATRIX_SIZE,
+                        rows: COOP_MATRIX_SIZE,
+                        scalar: Scalar::F32,
+                        role: CooperativeRole::B,
+                    },
+                },
+                Span::default(),
+            );
+            let coop_f32_c_ty = module.types.insert(
+                Type {
+                    name: Some("CoopC8x8F32".into()),
+                    inner: TypeInner::CooperativeMatrix {
+                        columns: COOP_MATRIX_SIZE,
+                        rows: COOP_MATRIX_SIZE,
+                        scalar: Scalar::F32,
+                        role: CooperativeRole::C,
+                    },
+                },
+                Span::default(),
+            );
+            (
+                Some(coop_f32_a_ty),
+                Some(coop_f32_b_ty),
+                Some(coop_f32_c_ty),
+            )
+        } else {
+            (None, None, None)
+        };
 
         let tile_program_block = Self::max_tile_program_block(ir);
         let (workgroup_invocations, workgroup_size) = if tile_program_block > 0 {
@@ -61,9 +123,13 @@ impl<'a> Lowerer<'a> {
             ir,
             module,
             f32_ty,
+            f32_vec4_ty,
             f16_ty,
             u32_ty,
             u32_vec3_ty,
+            coop_f32_a_ty,
+            coop_f32_b_ty,
+            coop_f32_c_ty,
             buffer_globals: Vec::new(),
             tile_globals: Vec::new(),
             tile_locals: Vec::new(),
@@ -71,6 +137,12 @@ impl<'a> Lowerer<'a> {
             loop_index_local: None,
             workgroup_invocations,
             workgroup_size,
+            uses_coop_tile_program,
+            coop_subgroups,
+            uses_subgroup_id,
+            uses_subgroup_invocation_id,
+            uses_subgroup_size,
+            uses_num_subgroups,
         }
     }
 
@@ -78,20 +150,50 @@ impl<'a> Lowerer<'a> {
         self.create_storage_globals();
         self.create_workgroup_globals()?;
 
+        let mut arguments = vec![
+            FunctionArgument {
+                name: Some("local_invocation_index".into()),
+                ty: self.u32_ty,
+                binding: Some(Binding::BuiltIn(BuiltIn::LocalInvocationIndex)),
+            },
+            FunctionArgument {
+                name: Some("workgroup_id".into()),
+                ty: self.u32_vec3_ty,
+                binding: Some(Binding::BuiltIn(BuiltIn::WorkGroupId)),
+            },
+        ];
+        if self.uses_subgroup_id {
+            arguments.push(FunctionArgument {
+                name: Some("subgroup_id".into()),
+                ty: self.u32_ty,
+                binding: Some(Binding::BuiltIn(BuiltIn::SubgroupId)),
+            });
+        }
+        if self.uses_subgroup_invocation_id {
+            arguments.push(FunctionArgument {
+                name: Some("subgroup_invocation_id".into()),
+                ty: self.u32_ty,
+                binding: Some(Binding::BuiltIn(BuiltIn::SubgroupInvocationId)),
+            });
+        }
+        if self.uses_subgroup_size {
+            arguments.push(FunctionArgument {
+                name: Some("subgroup_size".into()),
+                ty: self.u32_ty,
+                binding: Some(Binding::BuiltIn(BuiltIn::SubgroupSize)),
+            });
+        }
+        if self.uses_num_subgroups {
+            arguments.push(FunctionArgument {
+                name: Some("num_subgroups".into()),
+                ty: self.u32_ty,
+                binding: Some(Binding::BuiltIn(BuiltIn::NumSubgroups)),
+            });
+        }
+
         let mut function = Function {
             name: Some("main".into()),
-            arguments: vec![
-                FunctionArgument {
-                    name: Some("local_invocation_index".into()),
-                    ty: self.u32_ty,
-                    binding: Some(Binding::BuiltIn(BuiltIn::LocalInvocationIndex)),
-                },
-                FunctionArgument {
-                    name: Some("workgroup_id".into()),
-                    ty: self.u32_vec3_ty,
-                    binding: Some(Binding::BuiltIn(BuiltIn::WorkGroupId)),
-                },
-            ],
+            arguments,
             ..Function::default()
         };
         let scratch = self.create_scratch_locals(&mut function);
@@ -118,6 +220,12 @@ impl<'a> Lowerer<'a> {
         let mut capabilities = naga::valid::Capabilities::empty();
         if self.f16_ty.is_some() {
             capabilities |= naga::valid::Capabilities::SHADER_FLOAT16;
+        }
+        if self.uses_coop_tile_program {
+            capabilities |= naga::valid::Capabilities::COOPERATIVE_MATRIX;
+        }
+        if self.uses_subgroup_id {
+            capabilities |= naga::valid::Capabilities::SUBGROUP;
         }
         let info = naga::valid::Validator::new(naga::valid::ValidationFlags::all(), capabilities)
             .validate(&self.module)
@@ -220,6 +328,13 @@ impl<'a> Lowerer<'a> {
     }
 
     pub(super) fn create_scratch_locals(&self, function: &mut Function) -> ScratchLocals {
+        let mut coop_accs = [None; 16];
+        if let Some(ty) = self.coop_f32_c_ty {
+            for (index, local) in coop_accs.iter_mut().enumerate() {
+                *local = Some(self.create_local(function, &format!("coop_acc_{index}"), ty));
+            }
+        }
+
         ScratchLocals {
             loop_index: self.create_u32_local(function, "loop_index"),
             values: [
@@ -238,6 +353,7 @@ impl<'a> Lowerer<'a> {
                     self.create_u32_local(function, &format!("tile_spill_u32_{index}"))
                 }),
             ],
+            coop_accs,
         }
     }
 
@@ -355,7 +471,17 @@ impl<'a> Lowerer<'a> {
                     || Self::tile_index_expr_uses_f16(&store.col)
                     || Self::tile_mask_expr_uses_f16(&store.mask)
                     || Self::tile_expr_uses_f16(&store.value)
-            })
+            }) || matches!(
+                &op.accelerator,
+                Some(TileProgramAccelerator::QMatmul(qmatmul))
+                    if qmatmul.a.buffer.element == ElementType::F16
+                        || qmatmul.y.buffer.element == ElementType::F16
+            ) || matches!(
+                &op.accelerator,
+                Some(TileProgramAccelerator::QGemv(qgemv))
+                    if qgemv.a.buffer.element == ElementType::F16
+                        || qgemv.y.buffer.element == ElementType::F16
+            )
         })
     }
 

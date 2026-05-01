@@ -309,7 +309,26 @@ impl GgmlQuantFormat {
     }
 
     pub const fn qgemv_cols_per_workgroup(self) -> u32 {
-        4
+        self.qgemv_subgroups_per_workgroup() * self.qgemv_cols_per_subgroup()
+    }
+
+    pub const fn qgemv_cols_per_subgroup(self) -> u32 {
+        match self {
+            Self::Q2K => 4,
+            Self::Q4_0 | Self::Q4_1 | Self::Q5_1 => 4,
+            Self::Q5_0 => 4,
+            Self::Q3K | Self::Q4K | Self::Q8K => 2,
+            Self::Q6K => 1,
+            Self::Q8_0 | Self::Q8_1 => 4,
+            Self::Q5K => 1,
+        }
+    }
+
+    pub const fn qgemv_subgroups_per_workgroup(self) -> u32 {
+        match self {
+            Self::Q4K | Self::Q8_0 | Self::Q8_1 => 4,
+            _ => 2,
+        }
     }
 }
 
@@ -332,6 +351,39 @@ pub struct TileProgramOp {
     pub grid: [u32; 3],
     pub block: u32,
     pub stores: Vec<TileStoreProgramOp>,
+    pub accelerator: Option<TileProgramAccelerator>,
+}
+
+/// A structured tile-program body lowered with backend tile acceleration.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum TileProgramAccelerator {
+    QMatmul(TileQMatmulProgramOp),
+    QGemv(TileQGemvProgramOp),
+}
+
+/// Cooperative tile qmatmul body. The operation remains inside
+/// [`Op::TileProgram`], but is kept structured so the lowerer can emit native
+/// 8x8 cooperative matrix fragments instead of scalarizing the tile program.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TileQMatmulProgramOp {
+    pub a: StorageView,
+    pub b: QuantizedMatrix,
+    pub y: StorageView,
+    pub a_tile: TileRef,
+    pub b_tile: TileRef,
+    pub tile_m: u32,
+    pub tile_n: u32,
+    pub tile_k: u32,
+}
+
+/// Subgroup tile qgemv body for the single-row qmatmul case. It is represented
+/// as a [`TileProgram`] accelerator so the public op surface stays uniform.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TileQGemvProgramOp {
+    pub a: StorageView,
+    pub b: QuantizedMatrix,
+    pub y: StorageView,
+    pub workgroups_x: u32,
 }
 
 /// A masked tile store emitted by a source tile program.

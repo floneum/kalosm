@@ -14,8 +14,9 @@ pub use ir::{
     FlattenedMatrixMap, GgmlQuantFormat, Im2ColNhwcMap, KernelIr, Layout, LoopOffset, MemoryLevel,
     Numeric, Op, QuantizedMatrix, Shape, StorageIndexMap, StorageView, Strides, TileBinaryOp,
     TileCompareOp, TileDecl, TileExpr, TileId, TileIndexExpr, TileLevel, TileLiteral, TileLoadExpr,
-    TileMaskExpr, TileOrigin, TileProgramOp, TileQuantizedLoadExpr, TileReduceOp, TileRef,
-    TileScalarExpr, TileStoreProgramOp, TileUnaryOp, WorkgroupAxis, WorkgroupOffset, F16, F32, U32,
+    TileMaskExpr, TileOrigin, TileProgramAccelerator, TileProgramOp, TileQGemvProgramOp,
+    TileQMatmulProgramOp, TileQuantizedLoadExpr, TileReduceOp, TileRef, TileScalarExpr,
+    TileStoreProgramOp, TileUnaryOp, WorkgroupAxis, WorkgroupOffset, F16, F32, U32,
 };
 pub use lower::{LowerError, NagaKernel};
 

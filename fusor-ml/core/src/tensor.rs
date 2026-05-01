@@ -870,11 +870,16 @@ impl<D: DataType, const R: usize> Tensor<R, D> {
         async move {
             #[allow(unused)]
             let (data, _) = data.materialize();
-            let (sender, receiver) = futures_channel::oneshot::channel();
-            device.wgpu_queue().on_submitted_work_done(|| {
-                _ = sender.send(());
-            });
-            let _ = receiver.await;
+            #[cfg(not(target_arch = "wasm32"))]
+            device.poll_wait();
+            #[cfg(target_arch = "wasm32")]
+            {
+                let (sender, receiver) = futures_channel::oneshot::channel();
+                device.wgpu_queue().on_submitted_work_done(|| {
+                    _ = sender.send(());
+                });
+                let _ = receiver.await;
+            }
             #[cfg(feature = "extra_assertions")]
             {
                 let mut contains_non_finite = false;

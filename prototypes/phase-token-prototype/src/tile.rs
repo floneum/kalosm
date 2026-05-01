@@ -5,9 +5,9 @@ use crate::{
     BufferAccess, BufferDecl, BufferRef, DynamicOffset, F32Bits, GgmlQuantFormat, Im2ColNhwcMap,
     KernelIr, Layout, MemoryLevel, Numeric, Op, QuantizedMatrix, Shape, StorageIndexMap,
     StorageView, TileBinaryOp, TileCompareOp, TileDecl, TileExpr, TileIndexExpr, TileLevel,
-    TileLiteral, TileLoadExpr, TileMaskExpr, TileOrigin, TileProgramOp, TileQuantizedLoadExpr,
-    TileReduceOp, TileRef, TileScalarExpr, TileStoreProgramOp, TileUnaryOp, WorkgroupAxis,
-    WorkgroupOffset, F32, U32,
+    TileLiteral, TileLoadExpr, TileMaskExpr, TileOrigin, TileProgramAccelerator, TileProgramOp,
+    TileQGemvProgramOp, TileQMatmulProgramOp, TileQuantizedLoadExpr, TileReduceOp, TileRef,
+    TileScalarExpr, TileStoreProgramOp, TileUnaryOp, WorkgroupAxis, WorkgroupOffset, F32, U32,
 };
 
 /// Build a Triton-like source tile IR.
@@ -259,13 +259,36 @@ impl Program {
         y: &Storage<F32, 2>,
         workgroups_x: u32,
     ) {
+        let [m, k] = matrix_shape(&a.view.layout);
+        assert_eq!(m, 1, "qgemv requires a single input row");
+        let large_q5_0_gemv = b.format == GgmlQuantFormat::Q5_0
+            && b.rows
+                .checked_mul(b.cols)
+                .is_some_and(|elements| elements >= 4 * 1024 * 1024);
+        let wide_q8_0_gemv = b.format == GgmlQuantFormat::Q8_0 && b.rows <= 1024 && b.cols >= 8192;
+        if b.format == GgmlQuantFormat::Q4K || large_q5_0_gemv || wide_q8_0_gemv {
+            let cols_per_workgroup = b.format.qgemv_cols_per_workgroup();
+            let total_workgroups = b.cols.div_ceil(cols_per_workgroup);
+            let dispatch_y = total_workgroups.div_ceil(workgroups_x);
+            self.ir.body.push(Op::TileProgram(TileProgramOp {
+                grid: [workgroups_x, dispatch_y, 1],
+                block: b.format.qgemv_subgroups_per_workgroup() * 32,
+                stores: Vec::new(),
+                accelerator: Some(TileProgramAccelerator::QGemv(TileQGemvProgramOp {
+                    a: a.view.clone(),
+                    b: b.clone(),
+                    y: y.view.clone(),
+                    workgroups_x,
+                })),
+            }));
+            return;
+        }
+
         const LANES: usize = 256;
         assert!(
             BN > 0 && BK > 0 && BN * BK == LANES && BN.is_power_of_two() && BK.is_power_of_two(),
             "qgemv expects BN * BK == 1024 with power-of-two column and K lane groups"
         );
-        let [m, k] = matrix_shape(&a.view.layout);
-        assert_eq!(m, 1, "qgemv requires a single input row");
         let total_workgroups = b.cols.div_ceil(BN as u32);
         let dispatch_y = total_workgroups.div_ceil(workgroups_x);
         let k_iterations = k.div_ceil(BK as u32);
@@ -301,10 +324,48 @@ impl Program {
     ) {
         const LANES: usize = 256;
         assert!(
-            BM > 0 && BN > 0 && BK > 0 && BM * BN * BK == LANES && BK.is_power_of_two(),
-            "qmatmul expects BM * BN * BK == 256 with a power-of-two K lane group"
+            BM > 0 && BN > 0 && BK > 0,
+            "qmatmul tile shape must be non-zero"
         );
         let [m, k] = matrix_shape(&a.view.layout);
+        let coop_subgroups = qmatmul_coop_subgroups(BM as u32, BN as u32);
+        if let Some(subgroups) = coop_subgroups
+            .filter(|_| BK.is_multiple_of(8))
+            .filter(|_| BK == 16 || BK == 32)
+            .filter(|_| m.is_multiple_of(BM as u32))
+            .filter(|_| b.cols.is_multiple_of(BN as u32))
+            .filter(|_| k.is_multiple_of(BK as u32))
+            .filter(|_| cooperative_store_layout_supported(&y.view.layout))
+        {
+            let a_tile = self.alloc_tile::<F32>(
+                Layout::contiguous(MemoryLevel::Workgroup, Shape::new([BM as u32, BK as u32])),
+                TileLevel::Workgroup,
+            );
+            let b_tile = self.alloc_tile::<F32>(
+                Layout::contiguous(MemoryLevel::Workgroup, Shape::new([BK as u32, BN as u32])),
+                TileLevel::Workgroup,
+            );
+            self.ir.body.push(Op::TileProgram(TileProgramOp {
+                grid: [b.cols.div_ceil(BN as u32), m.div_ceil(BM as u32), 1],
+                block: subgroups * 32,
+                stores: Vec::new(),
+                accelerator: Some(TileProgramAccelerator::QMatmul(TileQMatmulProgramOp {
+                    a: a.view.clone(),
+                    b: b.clone(),
+                    y: y.view.clone(),
+                    a_tile,
+                    b_tile,
+                    tile_m: BM as u32,
+                    tile_n: BN as u32,
+                    tile_k: BK as u32,
+                })),
+            }));
+            return;
+        }
+        if BM * BN * BK != LANES || !BK.is_power_of_two() {
+            self.qmatmul_tile::<8, 4, 8>(a, b, y);
+            return;
+        }
         let k_iterations = k.div_ceil(BK as u32);
         self.program_grid::<LANES>(
             [b.cols.div_ceil(BN as u32), m.div_ceil(BM as u32), 1],
@@ -447,6 +508,7 @@ impl Program {
             grid,
             block: BLOCK as u32,
             stores: block.stores,
+            accelerator: None,
         }));
     }
 
@@ -1347,4 +1409,50 @@ fn matrix_shape(layout: &Layout) -> [u32; 2] {
         layout.shape().dims()[0].get(),
         layout.shape().dims()[1].get(),
     ]
+}
+
+fn qmatmul_coop_subgroups(m: u32, n: u32) -> Option<u32> {
+    const COOP: u32 = 8;
+    if m == 0 || n == 0 || !m.is_multiple_of(COOP) || !n.is_multiple_of(COOP) {
+        return None;
+    }
+    let tile_rows = m / COOP;
+    let tile_cols = n / COOP;
+    if tile_rows * tile_cols <= 16 {
+        return Some(1);
+    }
+    if m == 32 && n.is_multiple_of(32) {
+        let subgroups = n / 32;
+        if (2..=8).contains(&subgroups) {
+            return Some(subgroups);
+        }
+    }
+    if n >= m && m <= 64 && n.is_multiple_of(16) {
+        let subgroups = n / 16;
+        if (2..=8).contains(&subgroups) {
+            return Some(subgroups);
+        }
+    }
+    if n <= 64 && m.is_multiple_of(16) {
+        let subgroups = m / 16;
+        if (2..=8).contains(&subgroups) {
+            return Some(subgroups);
+        }
+    }
+    if m == 128 && n == 128 {
+        return Some(16);
+    }
+    if m.is_multiple_of(32) && n.is_multiple_of(32) {
+        let subgroups = (m / 32).checked_mul(n / 32)?;
+        if (2..=16).contains(&subgroups) {
+            return Some(subgroups);
+        }
+    }
+    None
+}
+
+fn cooperative_store_layout_supported(layout: &Layout) -> bool {
+    layout.shape().rank() == 2
+        && layout.strides().rank() == 2
+        && (layout.strides().values()[0] == 1 || layout.strides().values()[1] == 1)
 }

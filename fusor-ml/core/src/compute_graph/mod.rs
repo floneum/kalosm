@@ -14,9 +14,15 @@ mod visualize;
 
 use crate::{
     DataTypeEnum, Device, MatMulOperation, QMatrix, ReduceOperation,
-    compute_graph::resolve::ResolverResult, dequantize::DequantizeOperation,
-    map_layout::MapLayoutOperation, nary_wise::NaryOperation, quantized::matmul::QMatMulOperation,
-    resize::ResizeOperation, slice_assign::SliceAssignOperation, tensor::TensorData,
+    compute_graph::resolve::ResolverResult,
+    dequantize::DequantizeOperation,
+    map_layout::MapLayoutOperation,
+    mir::{inputs::MirValue, operation::Operation},
+    nary_wise::NaryOperation,
+    quantized::matmul::QMatMulOperation,
+    resize::ResizeOperation,
+    slice_assign::SliceAssignOperation,
+    tensor::TensorData,
     visit_tiled::MaybeQData,
 };
 
@@ -84,6 +90,28 @@ impl ComputeGraph {
     }
 
     pub(crate) fn resolve(&self, key: NodeIndex) -> ResolverResult {
+        if let Some(data) = {
+            let inner = self.inner.read();
+            inner.get_cached_result(key).cloned()
+        } {
+            return ResolverResult {
+                data,
+                total_kernels: 0,
+            };
+        }
+
+        if let Some(data) = {
+            let mut inner = self.inner.write();
+            let data = inner.try_resolve_direct_qmatmul(key);
+            #[cfg(feature = "extra_assertions")]
+            {
+                inner.verify_integrity()
+            }
+            data
+        } {
+            return data;
+        }
+
         let (data, removed) = {
             let mut inner = self.inner.write();
             let mut removed = Vec::new();
@@ -249,6 +277,56 @@ impl ComputeGraphInner {
         if let Some(node) = self.nodes.nodes.node_weight(key) {
             node.variant.visit_dependencies(f);
         }
+    }
+
+    fn ensure_tensor_cached(&mut self, key: NodeIndex) -> Option<()> {
+        if self.get_cached_result(key).is_some() {
+            return Some(());
+        }
+
+        let data = match self.nodes.nodes.node_weight(key)?.variant.clone() {
+            ComputeGraphNodeVariant::Tensor(data) => data,
+            _ => return None,
+        };
+        self.set_cached_result(key, data);
+        Some(())
+    }
+
+    fn try_submit_direct_qmatmul(&mut self, operation: &QMatMulOperation) -> Option<TensorData> {
+        self.ensure_tensor_cached(operation.input)?;
+
+        let device = self.device();
+        let workgroup_shape = crate::mir::workgroup_shape::WorkgroupShape::new(1, 1, 1);
+        let inputs = operation.inputs(self);
+        let direct_kernel = operation.build_direct_kernel(self, &workgroup_shape, &inputs)?;
+        let MirValue::Tensor(output) = operation.output(self, &inputs) else {
+            return None;
+        };
+
+        let mut command_encoder =
+            device
+                .wgpu_device()
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("QMatMul Direct Encoder"),
+                });
+        direct_kernel.run(&device, &mut command_encoder);
+        device.wgpu_queue().submit(Some(command_encoder.finish()));
+        device.reset_initialized_buffers();
+
+        Some(output)
+    }
+
+    fn try_resolve_direct_qmatmul(&mut self, key: NodeIndex) -> Option<ResolverResult> {
+        let operation = match self.nodes.nodes.node_weight(key)?.variant.clone() {
+            ComputeGraphNodeVariant::QMatMul(operation) => operation,
+            _ => return None,
+        };
+        let output = self.try_submit_direct_qmatmul(&operation)?;
+        self.set_cached_result(key, output.clone());
+        Some(ResolverResult {
+            data: output,
+            total_kernels: 1,
+        })
     }
 
     fn remove_reference(&mut self, key: NodeIndex, removed: &mut Vec<ComputeGraphNode>) {

@@ -23,10 +23,11 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let mode = parse_mode()?;
     let formats = parse_formats()?;
     let (layout, layout_arg_present) = parse_layout()?;
-    let tile_override = parse_tile_override(mode, layout_arg_present)?;
+    let shape = parse_shape_override(mode, layout_arg_present)?;
+    let tile_override = parse_tile_override(mode, layout_arg_present, shape)?;
 
     for format in formats {
-        let harness = Harness::new(format, mode, layout, tile_override).await?;
+        let harness = Harness::new(format, mode, layout, shape, tile_override).await?;
 
         for _ in 0..WARMUP_BATCHES {
             harness.run_batch(mode.dispatches_per_batch())?;
@@ -87,6 +88,23 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         println!(
             "adapter: {} ({:?})",
             harness.adapter_info.name, harness.adapter_info.backend
+        );
+        println!(
+            "features: subgroup={} cooperative_matrix={} subgroup_min={} subgroup_max={}",
+            harness.device_features.contains(wgpu::Features::SUBGROUP),
+            harness
+                .device_features
+                .contains(wgpu::Features::EXPERIMENTAL_COOPERATIVE_MATRIX),
+            harness.adapter_info.subgroup_min_size,
+            harness.adapter_info.subgroup_max_size,
+        );
+        println!(
+            "limits: max_invocations={} max_workgroup_storage={}",
+            harness
+                .device
+                .limits()
+                .max_compute_invocations_per_workgroup,
+            harness.device.limits().max_compute_workgroup_storage_size,
         );
         println!(
             "bench_qmatmul_{mode:?}: {format:?} A={}x{} B={}x{} -> Y={}x{}",
@@ -168,6 +186,7 @@ struct Harness {
     tile_k: usize,
     layout: LayoutVariant,
     adapter_info: wgpu::AdapterInfo,
+    device_features: wgpu::Features,
     device: wgpu::Device,
     queue: wgpu::Queue,
     pipeline: wgpu::ComputePipeline,
@@ -187,12 +206,10 @@ impl Harness {
         format: GgmlQuantFormat,
         mode: BenchMode,
         layout: LayoutVariant,
+        shape: (usize, usize, usize),
         tile_override: Option<TilePlan>,
     ) -> Result<Self, Box<dyn std::error::Error>> {
-        let (m, n, k) = match mode {
-            BenchMode::Gemm => (GEMM_M, GEMM_N, GEMM_K),
-            BenchMode::Gemv => (1, GEMV_N, GEMV_K),
-        };
+        let (m, n, k) = shape;
         let tile_plan = match mode {
             BenchMode::Gemm => tile_override.unwrap_or_else(|| qgemm_tile_shape(format)),
             BenchMode::Gemv => TilePlan {
@@ -223,15 +240,24 @@ impl Harness {
             })
             .await?;
         let adapter_info = adapter.get_info();
+        let adapter_features = adapter.features();
+        let mut required_features = wgpu::Features::empty();
+        if adapter_features.contains(wgpu::Features::SUBGROUP) {
+            required_features |= wgpu::Features::SUBGROUP;
+        }
+        if adapter_features.contains(wgpu::Features::EXPERIMENTAL_COOPERATIVE_MATRIX) {
+            required_features |= wgpu::Features::EXPERIMENTAL_COOPERATIVE_MATRIX;
+        }
         let (device, queue) = adapter
             .request_device(&wgpu::DeviceDescriptor {
                 label: Some("phase-token-prototype qmatmul bench device"),
-                required_features: wgpu::Features::empty(),
-                required_limits: wgpu::Limits::default(),
+                required_features,
+                required_limits: adapter.limits(),
                 experimental_features: unsafe { wgpu::ExperimentalFeatures::enabled() },
                 ..Default::default()
             })
             .await?;
+        let device_features = device.features();
 
         let y_layout = output_layout(m, n, layout);
         let (a, a_physical) = activation_data(m, k, layout);
@@ -309,6 +335,7 @@ impl Harness {
             tile_k: tile_plan.bk,
             layout,
             adapter_info,
+            device_features,
             device,
             queue,
             pipeline,
@@ -417,6 +444,16 @@ fn qmatmul_ir(
             phase.qgemv::<4, 64>(&a, &b, &y, 4, 1);
         } else if let Some(tile) = tile_override {
             match (tile.bm, tile.bn, tile.bk) {
+                (32, 32, 32) => phase.qmatmul::<32, 32, 32>(&a, &b, &y, 4),
+                (32, 64, 32) => phase.qmatmul::<32, 64, 32>(&a, &b, &y, 4),
+                (64, 64, 32) => phase.qmatmul::<64, 64, 32>(&a, &b, &y, 4),
+                (32, 128, 32) => phase.qmatmul::<32, 128, 32>(&a, &b, &y, 4),
+                (64, 128, 32) => phase.qmatmul::<64, 128, 32>(&a, &b, &y, 4),
+                (128, 64, 32) => phase.qmatmul::<128, 64, 32>(&a, &b, &y, 4),
+                (128, 96, 32) => phase.qmatmul::<128, 96, 32>(&a, &b, &y, 4),
+                (64, 192, 32) => phase.qmatmul::<64, 192, 32>(&a, &b, &y, 4),
+                (128, 128, 16) => phase.qmatmul::<128, 128, 16>(&a, &b, &y, 4),
+                (128, 128, 32) => phase.qmatmul::<128, 128, 32>(&a, &b, &y, 4),
                 (8, 8, 4) => phase.qmatmul::<8, 8, 4>(&a, &b, &y, 4),
                 (8, 4, 8) => phase.qmatmul::<8, 4, 8>(&a, &b, &y, 4),
                 (4, 8, 8) => phase.qmatmul::<4, 8, 8>(&a, &b, &y, 4),
@@ -424,12 +461,12 @@ fn qmatmul_ir(
                 (4, 16, 4) => phase.qmatmul::<4, 16, 4>(&a, &b, &y, 4),
                 _ => {
                     panic!(
-                        "typed tile bench supports BM/BN/BK of 8/8/4, 8/4/8, 4/8/8, 16/4/4, or 4/16/4"
+                        "typed tile bench supports cooperative BM/BN/BK of 32/32/32, 32/64/32, 64/64/32, 32/128/32, 64/128/32, 128/64/32, 128/96/32, 64/192/32, 128/128/16, 128/128/32 or scalar 8/8/4, 8/4/8, 4/8/8, 16/4/4, 4/16/4"
                     )
                 }
             }
         } else {
-            phase.qmatmul::<8, 4, 8>(&a, &b, &y, 4);
+            phase.qmatmul::<64, 64, 32>(&a, &b, &y, 4);
         }
     })
 }
@@ -448,9 +485,9 @@ fn qgemm_tile_shape(format: GgmlQuantFormat) -> TilePlan {
         | GgmlQuantFormat::Q5K
         | GgmlQuantFormat::Q6K
         | GgmlQuantFormat::Q8K => TilePlan {
-            bm: 8,
-            bn: 4,
-            bk: 8,
+            bm: 64,
+            bn: 64,
+            bk: 32,
         },
     }
 }
@@ -859,9 +896,62 @@ fn parse_layout() -> Result<(LayoutVariant, bool), Box<dyn std::error::Error>> {
     }
 }
 
+fn parse_shape_override(
+    mode: BenchMode,
+    layout_arg_present: bool,
+) -> Result<(usize, usize, usize), Box<dyn std::error::Error>> {
+    let args = env::args().collect::<Vec<_>>();
+    let start = if layout_arg_present { 4 } else { 3 };
+    let defaults = match mode {
+        BenchMode::Gemm => (GEMM_M, GEMM_N, GEMM_K),
+        BenchMode::Gemv => (1, GEMV_N, GEMV_K),
+    };
+    if matches!(mode, BenchMode::Gemv) {
+        if args.len() <= start {
+            return Ok(defaults);
+        }
+        if args.len() != start + 3 {
+            return Err(
+                "usage: bench_qmatmul gemv [formats] [contiguous|padded|transposed|skewed|im2col] [M N K]"
+                    .into(),
+            );
+        }
+        let m = args[start].parse::<usize>()?;
+        let n = args[start + 1].parse::<usize>()?;
+        let k = args[start + 2].parse::<usize>()?;
+        if m == 0 || n == 0 || k == 0 {
+            return Err("benchmark dimensions must be non-zero".into());
+        }
+        if m != 1 {
+            return Err("gemv benchmark requires M=1".into());
+        }
+        return Ok((m, n, k));
+    }
+    if args.len() <= start + 3 {
+        return Ok(defaults);
+    }
+    if args.len() != start + 6 {
+        return Err(
+            "usage: bench_qmatmul [gemm|gemv] [formats] [contiguous|padded|transposed|skewed|im2col] [BM BN BK [M N K]]"
+                .into(),
+        );
+    }
+    let m = args[start + 3].parse::<usize>()?;
+    let n = args[start + 4].parse::<usize>()?;
+    let k = args[start + 5].parse::<usize>()?;
+    if m == 0 || n == 0 || k == 0 {
+        return Err("benchmark dimensions must be non-zero".into());
+    }
+    if matches!(mode, BenchMode::Gemv) && m != 1 {
+        return Err("gemv benchmark requires M=1".into());
+    }
+    Ok((m, n, k))
+}
+
 fn parse_tile_override(
     mode: BenchMode,
     layout_arg_present: bool,
+    shape: (usize, usize, usize),
 ) -> Result<Option<TilePlan>, Box<dyn std::error::Error>> {
     let args = env::args().collect::<Vec<_>>();
     let start = if layout_arg_present { 4 } else { 3 };
@@ -869,29 +959,41 @@ fn parse_tile_override(
         return Ok(None);
     }
     if !matches!(mode, BenchMode::Gemm) {
-        return Err("tile override is only supported for gemm mode".into());
+        return Ok(None);
     }
-    if args.len() != start + 3 {
+    if args.len() != start + 3 && args.len() != start + 6 {
         return Err(
-            "usage: bench_qmatmul [gemm|gemv] [formats] [contiguous|padded|transposed|skewed|im2col] [BM BN BK]"
+            "usage: bench_qmatmul [gemm|gemv] [formats] [contiguous|padded|transposed|skewed|im2col] [BM BN BK [M N K]]"
                 .into(),
         );
     }
     let bm = args[start].parse::<usize>()?;
     let bn = args[start + 1].parse::<usize>()?;
     let bk = args[start + 2].parse::<usize>()?;
-    if bm == 0 || bn == 0 || bk == 0 || GEMM_M % bm != 0 || GEMM_N % bn != 0 || GEMM_K % bk != 0 {
-        return Err(format!(
-            "tile must divide {GEMM_M}x{GEMM_N}x{GEMM_K}; got BM={bm} BN={bn} BK={bk}",
-        )
-        .into());
+    let (m, n, k) = shape;
+    if bm == 0 || bn == 0 || bk == 0 || m % bm != 0 || n % bn != 0 || k % bk != 0 {
+        return Err(format!("tile must divide {m}x{n}x{k}; got BM={bm} BN={bn} BK={bk}",).into());
     }
     if !matches!(
         (bm, bn, bk),
-        (8, 8, 4) | (8, 4, 8) | (4, 8, 8) | (16, 4, 4) | (4, 16, 4)
+        (32, 32, 32)
+            | (32, 64, 32)
+            | (64, 64, 32)
+            | (32, 128, 32)
+            | (64, 128, 32)
+            | (128, 64, 32)
+            | (128, 96, 32)
+            | (64, 192, 32)
+            | (128, 128, 16)
+            | (128, 128, 32)
+            | (8, 8, 4)
+            | (8, 4, 8)
+            | (4, 8, 8)
+            | (16, 4, 4)
+            | (4, 16, 4)
     ) {
         return Err(format!(
-            "typed tile bench supports BM/BN/BK of 8/8/4, 8/4/8, 4/8/8, 16/4/4, or 4/16/4; got {bm}/{bn}/{bk}",
+            "typed tile bench supports cooperative BM/BN/BK of 32/32/32, 32/64/32, 64/64/32, 32/128/32, 64/128/32, 128/64/32, 128/96/32, 64/192/32, 128/128/16, 128/128/32 or scalar 8/8/4, 8/4/8, 4/8/8, 16/4/4, 4/16/4; got {bm}/{bn}/{bk}",
         )
         .into());
     }

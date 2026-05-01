@@ -3,7 +3,10 @@ use std::{
     fmt::Debug,
     num::{NonZeroU64, NonZeroUsize},
     path::PathBuf,
-    sync::{Arc, OnceLock},
+    sync::{
+        Arc, OnceLock,
+        atomic::{AtomicBool, Ordering},
+    },
     time::{Duration, Instant},
 };
 
@@ -147,9 +150,12 @@ struct DeviceInner {
     shader_module_cache: RwLock<LruCache<String, wgpu::ShaderModule, FxBuildHasher>>,
     compute_pipeline_cache:
         RwLock<LruCache<(PipelineLayout, ShaderModule), wgpu::ComputePipeline, FxBuildHasher>>,
+    direct_storage3_bind_group_layout: OnceLock<BindGroupLayout>,
+    direct_storage3_pipeline_layout: OnceLock<PipelineLayout>,
     // Cache for buffer allocations, keyed by size in bytes
     buffer_allocation_cache:
         RwLock<LruCache<(u64, BufferUsages), Vec<CachedBuffer>, FxBuildHasher>>,
+    initialized_buffers_dirty: AtomicBool,
     // Single compute graph shared by all tensors on this device
     compute_graph: OnceLock<ComputeGraph>,
 }
@@ -296,7 +302,10 @@ impl Device {
             naga_module_cache,
             shader_module_cache,
             compute_pipeline_cache,
+            direct_storage3_bind_group_layout: OnceLock::new(),
+            direct_storage3_pipeline_layout: OnceLock::new(),
             buffer_allocation_cache,
+            initialized_buffers_dirty: AtomicBool::new(false),
             compute_graph: OnceLock::new(),
         });
 
@@ -326,7 +335,7 @@ impl Device {
                     break;
                 };
                 if status == wgpu::PollStatus::QueueEmpty {
-                    std::thread::sleep(std::time::Duration::from_nanos(10));
+                    std::thread::sleep(std::time::Duration::from_millis(1));
                 }
             }
         });
@@ -416,6 +425,65 @@ impl Device {
         &self.inner.pipeline_layout_cache
     }
 
+    pub(crate) fn direct_storage3_bind_group_layout(&self) -> BindGroupLayout {
+        self.inner
+            .direct_storage3_bind_group_layout
+            .get_or_init(|| {
+                self.wgpu_device()
+                    .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                        label: Some("direct storage3 bind group layout"),
+                        entries: &[
+                            wgpu::BindGroupLayoutEntry {
+                                binding: 0,
+                                visibility: wgpu::ShaderStages::COMPUTE,
+                                ty: wgpu::BindingType::Buffer {
+                                    ty: wgpu::BufferBindingType::Storage { read_only: true },
+                                    has_dynamic_offset: false,
+                                    min_binding_size: None,
+                                },
+                                count: None,
+                            },
+                            wgpu::BindGroupLayoutEntry {
+                                binding: 1,
+                                visibility: wgpu::ShaderStages::COMPUTE,
+                                ty: wgpu::BindingType::Buffer {
+                                    ty: wgpu::BufferBindingType::Storage { read_only: true },
+                                    has_dynamic_offset: false,
+                                    min_binding_size: None,
+                                },
+                                count: None,
+                            },
+                            wgpu::BindGroupLayoutEntry {
+                                binding: 2,
+                                visibility: wgpu::ShaderStages::COMPUTE,
+                                ty: wgpu::BindingType::Buffer {
+                                    ty: wgpu::BufferBindingType::Storage { read_only: false },
+                                    has_dynamic_offset: false,
+                                    min_binding_size: None,
+                                },
+                                count: None,
+                            },
+                        ],
+                    })
+            })
+            .clone()
+    }
+
+    pub(crate) fn direct_storage3_pipeline_layout(&self) -> PipelineLayout {
+        self.inner
+            .direct_storage3_pipeline_layout
+            .get_or_init(|| {
+                let bind_group_layout = self.direct_storage3_bind_group_layout();
+                self.wgpu_device()
+                    .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                        label: Some("direct storage3 pipeline layout"),
+                        bind_group_layouts: &[Some(&bind_group_layout)],
+                        immediate_size: 0,
+                    })
+            })
+            .clone()
+    }
+
     pub(crate) fn naga_module_cache(
         &self,
     ) -> &RwLock<LruCache<String, wgpu::naga::Module, FxBuildHasher>> {
@@ -437,6 +505,13 @@ impl Device {
 
     /// Reset the initialized flag on all cached buffers.
     pub fn reset_initialized_buffers(&self) {
+        if !self
+            .inner
+            .initialized_buffers_dirty
+            .swap(false, Ordering::AcqRel)
+        {
+            return;
+        }
         let mut cache = self.inner.buffer_allocation_cache.write();
         for (_, buffers) in cache.iter_mut() {
             for buffer in buffers.iter_mut() {
@@ -477,6 +552,11 @@ impl Device {
         usage: wgpu::BufferUsages,
         to_initilize: bool,
     ) -> Arc<wgpu::Buffer> {
+        if to_initilize {
+            self.inner
+                .initialized_buffers_dirty
+                .store(true, Ordering::Release);
+        }
         // Try to get a buffer from the cache first
         self.get_cached_buffer(size, usage, to_initilize)
             .unwrap_or_else(|| {
