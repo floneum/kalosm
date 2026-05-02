@@ -464,9 +464,12 @@ impl<'a> Lowerer<'a> {
             (GgmlQuantFormat::Q5_0, 16) => {
                 self.dequantize_q5_0_values16(expressions, src, k_base_handle, col_handle)?
             }
+            (_, 8 | 16) => {
+                self.dequantize_qvalues(expressions, src, k_base_handle, col_handle, block_n)?
+            }
             _ => {
                 return Err(LowerError::UnsupportedOperation(
-                    "quantized block dequant only supports Q8_0/Q4K/Q6K x8 and Q5_0 x16",
+                    "quantized block dequant only supports 8-wide or 16-wide blocks",
                 ));
             }
         };

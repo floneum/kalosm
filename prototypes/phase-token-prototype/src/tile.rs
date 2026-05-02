@@ -264,11 +264,13 @@ impl Program {
         let [m, _] = matrix_shape(&a.view.layout);
         assert_eq!(m, 1, "qgemv requires a single input row");
 
-        // Format-specific perf-parity path. Mirrors the cols-per-subgroup,
-        // subgroups-per-workgroup, and values-per-lane layout the old
-        // `lower_tile_qgemv_subgroup` accelerator used for these formats.
+        // Perf-path structure for every format: subgroup-partitioned columns,
+        // vectorized quantized-block loads, dot4 chunks, and subgroup reduce.
         match b.format {
             GgmlQuantFormat::Q8_0 => {
+                return self.qgemv_perf::<4, 4, 8, 128>(a, b, y, workgroups_x);
+            }
+            GgmlQuantFormat::Q8_1 => {
                 return self.qgemv_perf::<4, 4, 8, 128>(a, b, y, workgroups_x);
             }
             GgmlQuantFormat::Q4K => {
@@ -277,42 +279,19 @@ impl Program {
             GgmlQuantFormat::Q5_0 => {
                 return self.qgemv_perf::<2, 4, 16, 64>(a, b, y, workgroups_x);
             }
-            _ => {}
+            GgmlQuantFormat::Q4_0
+            | GgmlQuantFormat::Q4_1
+            | GgmlQuantFormat::Q5_1
+            | GgmlQuantFormat::Q2K => {
+                return self.qgemv_perf::<2, 4, 8, 64>(a, b, y, workgroups_x);
+            }
+            GgmlQuantFormat::Q3K | GgmlQuantFormat::Q8K => {
+                return self.qgemv_perf::<2, 2, 8, 64>(a, b, y, workgroups_x);
+            }
+            GgmlQuantFormat::Q5K | GgmlQuantFormat::Q6K => {
+                return self.qgemv_perf::<2, 1, 8, 64>(a, b, y, workgroups_x);
+            }
         }
-
-        // Scalar primitive fallback for formats without a vectorized block
-        // dequant helper.
-        let [_, k] = matrix_shape(&a.view.layout);
-        const LANES: usize = 256;
-        assert!(
-            BN > 0 && BK > 0 && BN * BK == LANES && BN.is_power_of_two() && BK.is_power_of_two(),
-            "qgemv expects BN * BK == 1024 with power-of-two column and K lane groups"
-        );
-        let total_workgroups = b.cols.div_ceil(BN as u32);
-        let dispatch_y = total_workgroups.div_ceil(workgroups_x);
-        let k_iterations = k.div_ceil(BK as u32);
-        self.program_grid::<LANES>([workgroups_x, dispatch_y, 1], |program| {
-            let tile = program.program_id(WorkgroupAxis::X)
-                + program.program_id(WorkgroupAxis::Y) * workgroups_x;
-            let lane = program.arange();
-            let col_lane = lane.clone() / BK as u32;
-            let k_lane = lane % BK as u32;
-            let col = tile * BN as u32 + col_lane;
-            let loop_index = program.loop_index();
-            let k_index = loop_index * BK as u32 + k_lane.clone();
-            let mask = col.lt(b.cols).and(k_index.lt(k));
-            let a_value = program.load(a.at(0, &k_index), mask.clone(), 0.0);
-            let b_value = program.load_quantized(b, &k_index, &col, mask.clone(), 0.0);
-            let partial = program.loop_fold(
-                TileReduceOp::Sum,
-                k_iterations,
-                a_value * b_value,
-                TileLiteral::F32(F32Bits::new(0.0)),
-            );
-            let sum = program.group_reduce_sum::<BK>(partial);
-            let store_mask = k_lane.eq(0).and(col.lt(b.cols));
-            program.store(y.at(0, col), sum, store_mask);
-        });
     }
 
     fn qgemv_perf<
@@ -330,7 +309,7 @@ impl Program {
         const SUBGROUP_SIZE: u32 = 32;
         debug_assert_eq!(SUBGROUPS * SUBGROUP_SIZE, BLOCK as u32);
         debug_assert!(VALUES_PER_LANE == 8 || VALUES_PER_LANE == 16);
-        debug_assert!(COLS_PER_SUBGROUP == 2 || COLS_PER_SUBGROUP == 4);
+        debug_assert!(COLS_PER_SUBGROUP == 1 || COLS_PER_SUBGROUP == 2 || COLS_PER_SUBGROUP == 4);
         let [_, k] = matrix_shape(&a.view.layout);
         let cols_per_workgroup = SUBGROUPS * COLS_PER_SUBGROUP as u32;
         let total_workgroups = b.cols.div_ceil(cols_per_workgroup);
@@ -1117,9 +1096,9 @@ impl<const BLOCK: usize> TileBlock<'_, BLOCK> {
     }
 
     /// Load N consecutive dequantized values from one column of a packed
-    /// quantized matrix, sharing the per-block scale lookup. The lowerer emits
-    /// the format-specific helper once per call (Q8_0/Q4K/Q6K → 8 lanes,
-    /// Q5_0 → 16 lanes) and binds each lane to a private local that subsequent
+    /// quantized matrix. The lowerer emits a format-specific helper when one
+    /// exists, otherwise it lowers the same block-shaped request as N scalar
+    /// dequantizations. Each lane is bound to a private local that subsequent
     /// references load. `k_base` must be aligned to N so the values cover one
     /// scale block.
     pub fn load_quantized_block<const N: usize>(

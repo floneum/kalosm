@@ -40,6 +40,25 @@ impl<'a> Lowerer<'a> {
         Ok((value, emits))
     }
 
+    pub(super) fn dequantize_qvalues(
+        &self,
+        expressions: &mut Arena<Expression>,
+        matrix: &QuantizedMatrix,
+        k_base: Handle<Expression>,
+        col: Handle<Expression>,
+        n: u32,
+    ) -> Result<(Vec<Handle<Expression>>, Vec<Range<Expression>>), LowerError> {
+        let mut emits = Vec::new();
+        let mut values = Vec::with_capacity(n as usize);
+        for lane in 0..n {
+            let k = self.add_literal_u32_emitted(expressions, k_base, lane, &mut emits);
+            let (value, mut value_emits) = self.dequantize_qvalue(expressions, matrix, k, col)?;
+            emits.append(&mut value_emits);
+            values.push(value);
+        }
+        Ok((values, emits))
+    }
+
     pub(super) fn dequantize_q8_0_values8(
         &self,
         expressions: &mut Arena<Expression>,
