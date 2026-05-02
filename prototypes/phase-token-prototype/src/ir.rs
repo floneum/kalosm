@@ -540,6 +540,14 @@ pub enum TileExpr {
         a: [Box<TileExpr>; 4],
         b: [Box<TileExpr>; 4],
     },
+    QuantizedQ8_0Dot8 {
+        a: [Box<TileExpr>; 8],
+        src: QuantizedMatrix,
+        k_base: TileIndexExpr,
+        col: TileIndexExpr,
+        mask: TileMaskExpr,
+        fill: F32Bits,
+    },
     /// Reference to a pinned subexpression. The first reference in a scope
     /// lowers the bound value into a private local; subsequent references in
     /// the same scope reuse it.

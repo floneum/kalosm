@@ -268,6 +268,9 @@ impl Program {
         // vectorized quantized-block loads, dot4 chunks, and subgroup reduce.
         match b.format {
             GgmlQuantFormat::Q8_0 => {
+                if b.cols >= 8192 {
+                    return self.qgemv_perf::<4, 8, 8, 128>(a, b, y, workgroups_x);
+                }
                 return self.qgemv_perf::<4, 4, 8, 128>(a, b, y, workgroups_x);
             }
             GgmlQuantFormat::Q8_1 => {
@@ -288,8 +291,11 @@ impl Program {
             GgmlQuantFormat::Q3K | GgmlQuantFormat::Q8K => {
                 return self.qgemv_perf::<2, 2, 8, 64>(a, b, y, workgroups_x);
             }
-            GgmlQuantFormat::Q5K | GgmlQuantFormat::Q6K => {
+            GgmlQuantFormat::Q5K => {
                 return self.qgemv_perf::<2, 1, 8, 64>(a, b, y, workgroups_x);
+            }
+            GgmlQuantFormat::Q6K => {
+                return self.qgemv_perf::<4, 1, 16, 128>(a, b, y, workgroups_x);
             }
         }
     }
@@ -309,7 +315,12 @@ impl Program {
         const SUBGROUP_SIZE: u32 = 32;
         debug_assert_eq!(SUBGROUPS * SUBGROUP_SIZE, BLOCK as u32);
         debug_assert!(VALUES_PER_LANE == 8 || VALUES_PER_LANE == 16);
-        debug_assert!(COLS_PER_SUBGROUP == 1 || COLS_PER_SUBGROUP == 2 || COLS_PER_SUBGROUP == 4);
+        debug_assert!(
+            COLS_PER_SUBGROUP == 1
+                || COLS_PER_SUBGROUP == 2
+                || COLS_PER_SUBGROUP == 4
+                || COLS_PER_SUBGROUP == 8
+        );
         let [_, k] = matrix_shape(&a.view.layout);
         let cols_per_workgroup = SUBGROUPS * COLS_PER_SUBGROUP as u32;
         let total_workgroups = b.cols.div_ceil(cols_per_workgroup);
@@ -352,6 +363,16 @@ impl Program {
                         std::array::from_fn(|c| {
                             let col = col0.clone() + c as u32;
                             let mask = in_bounds_k.clone().and(col.lt(n_cols));
+                            if b_cloned.format == GgmlQuantFormat::Q8_0
+                                && VALUES_PER_LANE == 8
+                                && n_cols >= 8192
+                            {
+                                let a_vec: [Tile<BLOCK>; 8] =
+                                    std::array::from_fn(|i| a_pins[i].get());
+                                return program.quantized_q8_0_dot8(
+                                    a_vec, &b_cloned, &k_base, &col, mask, 0.0,
+                                );
+                            }
                             let bs: [Tile<BLOCK>; VALUES_PER_LANE] = program
                                 .load_quantized_block::<VALUES_PER_LANE>(
                                     &b_cloned, &k_base, &col, mask, 0.0,
@@ -1195,6 +1216,28 @@ impl<const BLOCK: usize> TileBlock<'_, BLOCK> {
                     Box::new(b2.expr),
                     Box::new(b3.expr),
                 ],
+            },
+        }
+    }
+
+    pub fn quantized_q8_0_dot8(
+        &self,
+        a: [Tile<BLOCK>; 8],
+        matrix: &QuantizedMatrix,
+        k_base: impl IntoIndex<BLOCK>,
+        col: impl IntoIndex<BLOCK>,
+        mask: Mask<BLOCK>,
+        fill: f32,
+    ) -> Tile<BLOCK> {
+        let a = a.map(|value| Box::new(value.expr));
+        Tile {
+            expr: TileExpr::QuantizedQ8_0Dot8 {
+                a,
+                src: matrix.clone(),
+                k_base: k_base.into_index(),
+                col: col.into_index(),
+                mask: mask.expr,
+                fill: F32Bits::new(fill),
             },
         }
     }

@@ -9,18 +9,6 @@ pub(super) enum SubgroupIndexKind {
 }
 
 impl<'a> Lowerer<'a> {
-    pub(super) fn matrix_shape(layout: &Layout) -> Result<[u32; 2], LowerError> {
-        if layout.shape().rank() != 2 {
-            return Err(LowerError::UnsupportedOperation(
-                "expected rank-2 matrix layout",
-            ));
-        }
-        Ok([
-            layout.shape().dims()[0].get(),
-            layout.shape().dims()[1].get(),
-        ])
-    }
-
     pub(super) fn max_tile_program_block(ir: &KernelIr) -> u32 {
         ir.body()
             .ops()
@@ -191,6 +179,19 @@ impl<'a> Lowerer<'a> {
                 .iter()
                 .chain(b.iter())
                 .any(|expr| Self::tile_expr_uses_index_kind(expr, kind)),
+            TileExpr::QuantizedQ8_0Dot8 {
+                a,
+                k_base,
+                col,
+                mask,
+                ..
+            } => {
+                a.iter()
+                    .any(|expr| Self::tile_expr_uses_index_kind(expr, kind))
+                    || Self::tile_index_expr_uses_kind(k_base, kind)
+                    || Self::tile_index_expr_uses_kind(col, kind)
+                    || Self::tile_mask_expr_uses_kind(mask, kind)
+            }
             TileExpr::PinnedRef { .. } | TileExpr::LoopFoldGroupOutput { .. } => false,
             TileExpr::Index(idx) => Self::tile_index_expr_uses_kind(idx, kind),
             TileExpr::Full(_) | TileExpr::Literal(_) => false,
@@ -271,6 +272,9 @@ impl<'a> Lowerer<'a> {
                 .iter()
                 .chain(b.iter())
                 .any(|expr| Self::tile_expr_uses_subgroup_reduce(expr)),
+            TileExpr::QuantizedQ8_0Dot8 { a, .. } => a
+                .iter()
+                .any(|expr| Self::tile_expr_uses_subgroup_reduce(expr)),
             TileExpr::PinnedRef { .. } | TileExpr::LoopFoldGroupOutput { .. } => false,
             TileExpr::Scalar(expr) => match expr {
                 TileScalarExpr::Reduce { value, .. } | TileScalarExpr::LoopReduce { value, .. } => {
@@ -319,6 +323,11 @@ impl<'a> Lowerer<'a> {
             TileExpr::QuantizedBlockLane { .. } => {}
             TileExpr::Dot4 { a, b } => {
                 for expr in a.iter().chain(b.iter()) {
+                    Self::mark_tile_expr_live(ir, expr, live);
+                }
+            }
+            TileExpr::QuantizedQ8_0Dot8 { a, .. } => {
+                for expr in a {
                     Self::mark_tile_expr_live(ir, expr, live);
                 }
             }

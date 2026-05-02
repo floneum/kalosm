@@ -48,41 +48,6 @@ impl<'a> Lowerer<'a> {
         ]))
     }
 
-    pub(super) fn increment_u32_local_by_expr(
-        &self,
-        expressions: &mut Arena<Expression>,
-        local: Handle<LocalVariable>,
-        amount: Handle<Expression>,
-        multiplier: u32,
-    ) -> Statement {
-        let mut emits = Vec::new();
-        let step = self.mul_literal_u32_emitted(expressions, amount, multiplier, &mut emits);
-        let pointer = expressions.append(Expression::LocalVariable(local), Span::default());
-        let current = expressions.append(Expression::Load { pointer }, Span::default());
-        let next = expressions.append(
-            Expression::Binary {
-                op: BinaryOperator::Add,
-                left: current,
-                right: step,
-            },
-            Span::default(),
-        );
-        let mut body = Block::new();
-        Self::push_emits(&mut body, emits);
-        body.push(
-            Statement::Emit(Self::range_from(expressions, current, next)),
-            Span::default(),
-        );
-        body.push(
-            Statement::Store {
-                pointer,
-                value: next,
-            },
-            Span::default(),
-        );
-        Statement::Block(body)
-    }
-
     pub(super) fn load_u32_local(
         &self,
         expressions: &mut Arena<Expression>,

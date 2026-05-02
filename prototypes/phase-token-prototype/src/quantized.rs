@@ -53,7 +53,7 @@ impl GgmlQuantFormat {
             Self::Q4_0 | Self::Q4_1 | Self::Q5_1 => 4,
             Self::Q5_0 => 4,
             Self::Q3K | Self::Q4K | Self::Q8K => 2,
-            Self::Q6K => 1,
+            Self::Q6K => 2,
             Self::Q8_0 | Self::Q8_1 => 4,
             Self::Q5K => 1,
         }

@@ -391,7 +391,110 @@ impl<'a> Lowerer<'a> {
                 );
                 Ok(dot)
             }
+            TileExpr::QuantizedQ8_0Dot8 {
+                a,
+                src,
+                k_base,
+                col,
+                mask,
+                fill,
+            } => self.lower_tile_quantized_q8_0_dot8_expr(
+                expressions,
+                scratch,
+                body,
+                a,
+                src,
+                k_base,
+                col,
+                mask,
+                *fill,
+                GgmlQuantFormat::Q8_0,
+                spill_depth,
+            ),
         }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn lower_tile_quantized_q8_0_dot8_expr(
+        &self,
+        expressions: &mut Arena<Expression>,
+        scratch: ScratchLocals,
+        body: &mut Block,
+        a: &[Box<TileExpr>; 8],
+        src: &QuantizedMatrix,
+        k_base: &TileIndexExpr,
+        col: &TileIndexExpr,
+        mask: &TileMaskExpr,
+        fill: F32Bits,
+        format: GgmlQuantFormat,
+        spill_depth: usize,
+    ) -> Result<Handle<Expression>, LowerError> {
+        let tmp = Self::tile_value_local(scratch, ElementType::F32)?;
+        let tmp_ptr = expressions.append(Expression::LocalVariable(tmp), Span::default());
+        let fill_value = expressions.append(
+            Expression::Literal(Literal::F32(fill.get())),
+            Span::default(),
+        );
+        body.push(
+            Statement::Store {
+                pointer: tmp_ptr,
+                value: fill_value,
+            },
+            Span::default(),
+        );
+
+        let mask_handle =
+            self.lower_tile_mask_expr(expressions, scratch, body, mask, spill_depth)?;
+        let mut accept = Block::new();
+        let mut a_handles = Vec::with_capacity(8);
+        for expr in a {
+            a_handles.push(self.lower_tile_expr_lane(
+                expressions,
+                scratch,
+                &mut accept,
+                expr,
+                spill_depth + 1,
+            )?);
+        }
+        let a_handles: [Handle<Expression>; 8] = a_handles
+            .try_into()
+            .map_err(|_| LowerError::UnsupportedOperation("q8_0 dot8 expected 8 A values"))?;
+        let k_base_handle =
+            self.lower_tile_index_expr(expressions, scratch, &mut accept, k_base, spill_depth)?;
+        let col_handle =
+            self.lower_tile_index_expr(expressions, scratch, &mut accept, col, spill_depth)?;
+        let (dot, value_emits) = match format {
+            GgmlQuantFormat::Q8_0 => {
+                self.dequantize_q8_0_dot8(expressions, src, k_base_handle, col_handle, &a_handles)?
+            }
+            _ => {
+                return Err(LowerError::UnsupportedOperation(
+                    "unsupported quantized dot8 format",
+                ));
+            }
+        };
+        Self::push_emits(&mut accept, value_emits);
+        accept.push(
+            Statement::Store {
+                pointer: tmp_ptr,
+                value: dot,
+            },
+            Span::default(),
+        );
+        body.push(
+            Statement::If {
+                condition: mask_handle,
+                accept,
+                reject: Block::new(),
+            },
+            Span::default(),
+        );
+        let loaded = expressions.append(Expression::Load { pointer: tmp_ptr }, Span::default());
+        body.push(
+            Statement::Emit(Self::single_expression_range(expressions, loaded)),
+            Span::default(),
+        );
+        Ok(loaded)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -460,6 +563,9 @@ impl<'a> Lowerer<'a> {
             }
             (GgmlQuantFormat::Q6K, 8) => {
                 self.dequantize_q6k_values8(expressions, src, k_base_handle, col_handle)?
+            }
+            (GgmlQuantFormat::Q6K, 16) => {
+                self.dequantize_q6k_values16(expressions, src, k_base_handle, col_handle)?
             }
             (GgmlQuantFormat::Q5_0, 16) => {
                 self.dequantize_q5_0_values16(expressions, src, k_base_handle, col_handle)?
@@ -1614,7 +1720,7 @@ impl<'a> Lowerer<'a> {
             TileExpr::GroupReduce { scratch, .. } => Ok(scratch.element),
             TileExpr::SubgroupReduce { value, .. } => self.tile_expr_element(value),
             TileExpr::QuantizedBlockLane { .. } => Ok(ElementType::F32),
-            TileExpr::Dot4 { .. } => Ok(ElementType::F32),
+            TileExpr::Dot4 { .. } | TileExpr::QuantizedQ8_0Dot8 { .. } => Ok(ElementType::F32),
             TileExpr::PinnedRef { .. } => Ok(ElementType::F32),
             TileExpr::LoopFoldGroupOutput { group, lane } => {
                 let g = self

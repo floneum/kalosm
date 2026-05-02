@@ -107,6 +107,109 @@ impl<'a> Lowerer<'a> {
         Ok((values, emits))
     }
 
+    pub(super) fn dequantize_q8_0_dot8(
+        &self,
+        expressions: &mut Arena<Expression>,
+        matrix: &QuantizedMatrix,
+        k_base: Handle<Expression>,
+        col: Handle<Expression>,
+        a: &[Handle<Expression>; 8],
+    ) -> Result<(Handle<Expression>, Vec<Range<Expression>>), LowerError> {
+        if matrix.format != GgmlQuantFormat::Q8_0 {
+            return Err(LowerError::UnsupportedOperation(
+                "q8_0 dot8 only supports Q8_0",
+            ));
+        }
+
+        let mut emits = Vec::new();
+        let block = self.div_literal_u32_emitted(expressions, k_base, 32, &mut emits);
+        let q = self.and_lit(expressions, &mut emits, k_base, 31);
+        let col_block =
+            self.mul_literal_u32_emitted(expressions, col, matrix.rows / 32, &mut emits);
+        let block_index = self.bin(
+            expressions,
+            &mut emits,
+            BinaryOperator::Add,
+            col_block,
+            block,
+        );
+        let base = self.mul_literal_u32_emitted(expressions, block_index, 9, &mut emits);
+        let scale_word = self.load_word(expressions, matrix, base, 0, &mut emits)?;
+        let scale = self.bitcast_f32(expressions, &mut emits, scale_word);
+        let q_word = self.shr_lit(expressions, &mut emits, q, 2);
+        let word0_off = self.add_lit(expressions, &mut emits, q_word, 1);
+        let word1_off = self.add_lit(expressions, &mut emits, q_word, 2);
+        let word0 = self.load_word_dynamic(expressions, matrix, base, word0_off, &mut emits)?;
+        let word1 = self.load_word_dynamic(expressions, matrix, base, word1_off, &mut emits)?;
+
+        let mut q_components = Vec::with_capacity(8);
+        for lane in 0..8 {
+            let byte_lane = expressions.append(
+                Expression::Literal(Literal::U32((lane % 4) as u32)),
+                Span::default(),
+            );
+            let word = if lane < 4 { word0 } else { word1 };
+            let byte = self.byte_at(expressions, &mut emits, word, byte_lane);
+            q_components.push(self.signed_byte_f32(expressions, &mut emits, byte));
+        }
+        let a0 = expressions.append(
+            Expression::Compose {
+                ty: self.f32_vec4_ty,
+                components: a[..4].to_vec(),
+            },
+            Span::default(),
+        );
+        emits.push(Self::single_expression_range(expressions, a0));
+        let q0 = expressions.append(
+            Expression::Compose {
+                ty: self.f32_vec4_ty,
+                components: q_components[..4].to_vec(),
+            },
+            Span::default(),
+        );
+        emits.push(Self::single_expression_range(expressions, q0));
+        let a1 = expressions.append(
+            Expression::Compose {
+                ty: self.f32_vec4_ty,
+                components: a[4..].to_vec(),
+            },
+            Span::default(),
+        );
+        emits.push(Self::single_expression_range(expressions, a1));
+        let q1 = expressions.append(
+            Expression::Compose {
+                ty: self.f32_vec4_ty,
+                components: q_components[4..].to_vec(),
+            },
+            Span::default(),
+        );
+        emits.push(Self::single_expression_range(expressions, q1));
+        let dot0 = expressions.append(
+            Expression::Math {
+                fun: MathFunction::Dot,
+                arg: a0,
+                arg1: Some(q0),
+                arg2: None,
+                arg3: None,
+            },
+            Span::default(),
+        );
+        emits.push(Self::single_expression_range(expressions, dot0));
+        let dot1 = expressions.append(
+            Expression::Math {
+                fun: MathFunction::Dot,
+                arg: a1,
+                arg1: Some(q1),
+                arg2: None,
+                arg3: None,
+            },
+            Span::default(),
+        );
+        emits.push(Self::single_expression_range(expressions, dot1));
+        let sum = self.bin(expressions, &mut emits, BinaryOperator::Add, dot0, dot1);
+        Ok((self.mul(expressions, &mut emits, sum, scale), emits))
+    }
+
     pub(super) fn dequantize_q4k_values8(
         &self,
         expressions: &mut Arena<Expression>,
@@ -394,6 +497,23 @@ impl<'a> Lowerer<'a> {
             let centered = self.sub(expressions, &mut emits, quant_f, center);
             values.push(self.mul(expressions, &mut emits, centered, scale));
         }
+        Ok((values, emits))
+    }
+
+    pub(super) fn dequantize_q6k_values16(
+        &self,
+        expressions: &mut Arena<Expression>,
+        matrix: &QuantizedMatrix,
+        k_base: Handle<Expression>,
+        col: Handle<Expression>,
+    ) -> Result<(Vec<Handle<Expression>>, Vec<Range<Expression>>), LowerError> {
+        let (mut values, mut emits) =
+            self.dequantize_q6k_values8(expressions, matrix, k_base, col)?;
+        let k_base_hi = self.add_lit(expressions, &mut emits, k_base, 8);
+        let (hi_values, hi_emits) =
+            self.dequantize_q6k_values8(expressions, matrix, k_base_hi, col)?;
+        emits.extend(hi_emits);
+        values.extend(hi_values);
         Ok((values, emits))
     }
 

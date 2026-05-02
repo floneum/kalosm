@@ -577,6 +577,18 @@ impl<'a> Lowerer<'a> {
                 .iter()
                 .chain(b.iter())
                 .any(|expr| Self::tile_expr_uses_f16(expr)),
+            TileExpr::QuantizedQ8_0Dot8 {
+                a,
+                k_base,
+                col,
+                mask,
+                ..
+            } => {
+                a.iter().any(|expr| Self::tile_expr_uses_f16(expr))
+                    || Self::tile_index_expr_uses_f16(k_base)
+                    || Self::tile_index_expr_uses_f16(col)
+                    || Self::tile_mask_expr_uses_f16(mask)
+            }
             TileExpr::PinnedRef { .. } | TileExpr::LoopFoldGroupOutput { .. } => false,
         }
     }

@@ -34,7 +34,7 @@ extra_assertions = []
 ndarray = "0.16.1"
 rand.workspace = true
 tokio = { version = "1.43.0", features = ["full"] }
-criterion = { version = "0.3", features = ["async_futures"] }
+criterion = { version = "0.8", features = ["async_futures"] }
 pretty_assertions = "1.4.1"
 reqwest = "0.12.15"
 num-traits = "0.2.19"
