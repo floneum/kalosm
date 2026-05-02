@@ -528,11 +528,35 @@ fn emit_tile_a_load_row_major(
         writeln!(kernel, "        let global_k = {k_base} + a_k_group * 4u;").unwrap();
         // Read 4 consecutive K values from global memory, then scatter them into the
         // row-major shared tile. Keeping the loads grouped mirrors egging's fast path.
-        writeln!(kernel, "        let a_addr = {start_index} + min(global_m, {m_size} - 1u) * {row_stride} + min(global_k, {k_size} - 1u) * {col_stride};").unwrap();
+        writeln!(
+            kernel,
+            "        let a_row_safe = min(global_m, {m_size} - 1u);"
+        )
+        .unwrap();
+        writeln!(
+            kernel,
+            "        let a_k0_safe = min(global_k + 0u, {k_size} - 1u);"
+        )
+        .unwrap();
+        writeln!(
+            kernel,
+            "        let a_k1_safe = min(global_k + 1u, {k_size} - 1u);"
+        )
+        .unwrap();
+        writeln!(
+            kernel,
+            "        let a_k2_safe = min(global_k + 2u, {k_size} - 1u);"
+        )
+        .unwrap();
+        writeln!(
+            kernel,
+            "        let a_k3_safe = min(global_k + 3u, {k_size} - 1u);"
+        )
+        .unwrap();
         writeln!(kernel, "        let m_in_bounds = global_m < {m_size};").unwrap();
         writeln!(
             kernel,
-            "        let a_values = vec4<f32>({input}[a_addr + 0u * {col_stride}], {input}[a_addr + 1u * {col_stride}], {input}[a_addr + 2u * {col_stride}], {input}[a_addr + 3u * {col_stride}]);"
+            "        let a_values = vec4<f32>({input}[{start_index} + a_row_safe * {row_stride} + a_k0_safe * {col_stride}], {input}[{start_index} + a_row_safe * {row_stride} + a_k1_safe * {col_stride}], {input}[{start_index} + a_row_safe * {row_stride} + a_k2_safe * {col_stride}], {input}[{start_index} + a_row_safe * {row_stride} + a_k3_safe * {col_stride}]);"
         )
         .unwrap();
         let a_value_x = apply_pre_element_wise(pre_element_wise, "a_values.x");
@@ -607,11 +631,35 @@ fn emit_tile_b_load(
                 "        let global_n = {n_base} + tile_n_group * 4u;"
             )
             .unwrap();
-            writeln!(kernel, "        let b_addr = {start_index} + min(global_k, {k_size} - 1u) * {row_stride} + min(global_n, {n_size} - 1u) * {col_stride};").unwrap();
+            writeln!(
+                kernel,
+                "        let b_k_safe = min(global_k, {k_size} - 1u);"
+            )
+            .unwrap();
+            writeln!(
+                kernel,
+                "        let b_n0_safe = min(global_n + 0u, {n_size} - 1u);"
+            )
+            .unwrap();
+            writeln!(
+                kernel,
+                "        let b_n1_safe = min(global_n + 1u, {n_size} - 1u);"
+            )
+            .unwrap();
+            writeln!(
+                kernel,
+                "        let b_n2_safe = min(global_n + 2u, {n_size} - 1u);"
+            )
+            .unwrap();
+            writeln!(
+                kernel,
+                "        let b_n3_safe = min(global_n + 3u, {n_size} - 1u);"
+            )
+            .unwrap();
             writeln!(kernel, "        let k_in_bounds = global_k < {k_size};").unwrap();
             writeln!(
                 kernel,
-                "        let b_values = vec4<f32>({input}[b_addr + 0u * {col_stride}], {input}[b_addr + 1u * {col_stride}], {input}[b_addr + 2u * {col_stride}], {input}[b_addr + 3u * {col_stride}]);"
+                "        let b_values = vec4<f32>({input}[{start_index} + b_k_safe * {row_stride} + b_n0_safe * {col_stride}], {input}[{start_index} + b_k_safe * {row_stride} + b_n1_safe * {col_stride}], {input}[{start_index} + b_k_safe * {row_stride} + b_n2_safe * {col_stride}], {input}[{start_index} + b_k_safe * {row_stride} + b_n3_safe * {col_stride}]);"
             )
             .unwrap();
             let b_value_x = apply_pre_element_wise(pre_element_wise, "b_values.x");

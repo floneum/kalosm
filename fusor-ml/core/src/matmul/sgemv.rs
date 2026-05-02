@@ -101,11 +101,20 @@ pub(crate) fn sgemv(
         // Load vector elements into b_reg from input_b. This will be reused for each offset in the chunk
         for i in 0..vector_size {
             writeln!(kernel, "let input_b_{i}_index = index + {i};").unwrap();
+            writeln!(
+                kernel,
+                "let input_b_{i}_safe_index = min(input_b_{i}_index, {k_size} - 1u);"
+            )
+            .unwrap();
             let b_base = format!(
-                "select({input_b_datatype}(0.0), {input_b}[b_start_index + input_b_{i}_index * {b_row_stride} + col_index * {b_col_stride}], input_b_{i}_index < {k_size})"
+                "{input_b}[b_start_index + input_b_{i}_safe_index * {b_row_stride} + col_index * {b_col_stride}]"
             );
             let b_val = pef[1].iter().fold(b_base, |acc, f| f.call(vec![acc]));
-            writeln!(kernel, "let input_b_{i} = {b_val};").unwrap();
+            writeln!(
+                kernel,
+                "let input_b_{i} = select({input_b_datatype}(0.0), {b_val}, input_b_{i}_index < {k_size});"
+            )
+            .unwrap();
         }
         write!(kernel, "let reg_b = {vec_storage}(").unwrap();
         for i in 0..vector_size {
@@ -132,13 +141,28 @@ pub(crate) fn sgemv(
         // Load matrix row elements into a_reg from input_a
         for i in 0..vector_size {
             writeln!(kernel, "let input_a_{i}_index = index + {i};").unwrap();
+            writeln!(kernel, "let input_a_{i}_row_index = {row_index};").unwrap();
+            writeln!(
+                kernel,
+                "let input_a_{i}_safe_row = min(input_a_{i}_row_index, {m_size} - 1u);"
+            )
+            .unwrap();
+            writeln!(
+                kernel,
+                "let input_a_{i}_safe_col = min(input_a_{i}_index, {k_size} - 1u);"
+            )
+            .unwrap();
             let a_row_stride = input_a.stride_binding(op.rank() - 2);
             let a_col_stride = input_a.stride_binding(op.rank() - 1);
             let a_base = format!(
-                "select({input_a_datatype}(0.0), {input_a}[a_start_index + {row_index} * {a_row_stride} + input_a_{i}_index * {a_col_stride}], input_a_{i}_index < {k_size} && {row_index} < {m_size})"
+                "{input_a}[a_start_index + input_a_{i}_safe_row * {a_row_stride} + input_a_{i}_safe_col * {a_col_stride}]"
             );
             let a_val = pef[0].iter().fold(a_base, |acc, f| f.call(vec![acc]));
-            writeln!(kernel, "let input_a_{i} = {a_val};").unwrap();
+            writeln!(
+                kernel,
+                "let input_a_{i} = select({input_a_datatype}(0.0), {a_val}, input_a_{i}_index < {k_size} && input_a_{i}_row_index < {m_size});"
+            )
+            .unwrap();
         }
         // Then pack them into a vector and write to the cache
         write!(kernel, "let reg_a = {vec_storage}(").unwrap();

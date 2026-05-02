@@ -63,6 +63,7 @@ pub fn chunked_sgemm_with_config(
     input_a: &TensorInput,
     input_b: &QMatrixInput,
     output: &TensorInput,
+    n_size: &str,
     k_size: &str,
     config: ChunkedSgemmConfig,
 ) {
@@ -169,13 +170,6 @@ pub fn chunked_sgemm_with_config(
     )
     .unwrap();
 
-    // This threads b_input offset in blocks
-    writeln!(
-        kernel,
-        "let b_block_offset = (y * {sgemm_input_n_elements} + pair_index_col) * k_block_size;"
-    )
-    .unwrap();
-
     let chunks_per_block = elements_per_block / MATRIX_ELEMENTS;
 
     // Calculate one block sized group
@@ -189,9 +183,21 @@ pub fn chunked_sgemm_with_config(
         writeln!(kernel, "let k = k_start + pair_index_row;").unwrap();
         {
             // Load the b block into the cache
+            writeln!(
+                kernel,
+                "let global_n = y * {sgemm_input_n_elements} + pair_index_col;"
+            )
+            .unwrap();
+            writeln!(
+                kernel,
+                "let b_in_bounds = global_n < {n_size} && k < k_chunk_size;"
+            )
+            .unwrap();
+            let y_stride = sgemm_input_k_elements / 4;
+            writeln!(kernel, "if b_in_bounds {{").unwrap();
+            writeln!(kernel, "let b_block_offset = global_n * k_block_size;").unwrap();
             writeln!(kernel, "let b_block_index = k / {chunks_per_block};").unwrap();
             writeln!(kernel, "let b_index_within_block = k % {chunks_per_block};").unwrap();
-            let y_stride = sgemm_input_k_elements / 4;
             dequantize_mat4x4_block(
                 kernel,
                 op.matrix.datatype,
@@ -209,6 +215,15 @@ pub fn chunked_sgemm_with_config(
                     writeln!(kernel, "}}").unwrap();
                 },
             );
+            writeln!(kernel, "}} else {{").unwrap();
+            writeln!(kernel, "for (var index = 0u; index < 4u; index += 1u) {{").unwrap();
+            writeln!(
+                kernel,
+                "{cache_b}[(pair_index_col / 4) * {y_stride} + {sgemm_input_k_chunks} * pair_index_row + index][pair_index_col % 4] = vec4<{cache_datatype}>();"
+            )
+            .unwrap();
+            writeln!(kernel, "}}").unwrap();
+            writeln!(kernel, "}}").unwrap();
 
             // Load the a block into the cache
             writeln!(

@@ -268,7 +268,9 @@ mod tests {
         let output_cpu = conv_cpu.forward(&input_cpu);
         let result_cpu = output_cpu.as_slice().await.unwrap();
 
-        let gpu_device = Device::new().await.expect("GPU required for this test");
+        let Some(gpu_device) = crate::gpu_device_for_test().await else {
+            return;
+        };
         let weight_gpu: Tensor<3, f32> =
             Tensor::from_slice(&gpu_device, [384, 80, 3], &weight_data);
         let bias_gpu: Tensor<1, f32> = Tensor::from_slice(&gpu_device, [384], &bias_data);

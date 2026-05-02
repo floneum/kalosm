@@ -23,6 +23,17 @@
 
 mod raw;
 
+#[cfg(test)]
+pub(crate) async fn gpu_device_for_test() -> Option<Device> {
+    match Device::new().await {
+        Ok(device) => Some(device),
+        Err(err) => {
+            eprintln!("skipping GPU-only test: {err}");
+            None
+        }
+    }
+}
+
 use fusor::{ConcreteTensor, Device, Tensor, ToVec1, VarBuilder};
 use image::{DynamicImage, GenericImage, GenericImageView, ImageBuffer, Rgba};
 use raw::sam::{
@@ -698,7 +709,11 @@ mod tests {
     /// End-to-end smoke test: load model, run inference, verify mask is non-trivial.
     #[tokio::test]
     async fn test_load_tiny_model() {
+        let Some(device) = crate::gpu_device_for_test().await else {
+            return;
+        };
         let model = SegmentAnything::builder()
+            .device(device)
             .build()
             .await
             .expect("Failed to load model");
@@ -759,7 +774,9 @@ mod tests {
         let gguf_path = fetch_tiny_gguf_path();
 
         let cpu = Device::cpu();
-        let gpu = Device::new().await.unwrap();
+        let Some(gpu) = crate::gpu_device_for_test().await else {
+            return;
+        };
         let cpu_sam = load_tiny_sam(&cpu, &gguf_path);
         let gpu_sam = load_tiny_sam(&gpu, &gguf_path);
 
@@ -843,7 +860,9 @@ mod tests {
         let gguf_path = fetch_tiny_gguf_path();
 
         let cpu = Device::cpu();
-        let gpu = Device::new().await.unwrap();
+        let Some(gpu) = crate::gpu_device_for_test().await else {
+            return;
+        };
 
         // Load full model to warm up GPU buffer pool and get GGUF gaussian matrix.
         let cpu_sam = load_tiny_sam(&cpu, &gguf_path);
@@ -947,7 +966,9 @@ mod tests {
         let gguf_path = fetch_tiny_gguf_path();
 
         let cpu = Device::cpu();
-        let gpu = Device::new().await.unwrap();
+        let Some(gpu) = crate::gpu_device_for_test().await else {
+            return;
+        };
 
         let cpu_sam = load_tiny_sam(&cpu, &gguf_path);
         let gpu_sam = load_tiny_sam(&gpu, &gguf_path);
@@ -1039,7 +1060,11 @@ mod tests {
     /// Uses the exact same reshape+as_slice reading pattern as segment_everything.
     #[tokio::test]
     async fn test_batched_vs_unbatched() {
+        let Some(device) = crate::gpu_device_for_test().await else {
+            return;
+        };
         let model = SegmentAnything::builder()
+            .device(device)
             .build()
             .await
             .expect("Failed to load model");

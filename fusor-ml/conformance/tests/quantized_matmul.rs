@@ -623,6 +623,31 @@ async fn q_mat_mul_batched_3d_matches_host_reference() {
 }
 
 #[tokio::test]
+async fn q_mat_mul_chunked_sgemm_edge_n_matches_host_reference() {
+    use fusor::Device;
+    use fusor_conformance::available_devices;
+
+    let weight_shape = [34usize, 32];
+    let raw_bytes = q8_0_raw_bytes(weight_shape);
+    let cpu_weights =
+        qmatrix_from_raw_bytes(&Device::Cpu, weight_shape, &raw_bytes, GgmlType::Q8_0);
+
+    let shape = [2usize, 40, weight_shape[1]];
+    let data = deterministic_input(&shape, 1701);
+    let cpu_input: Tensor<3, f32> = Tensor::from_slice(&Device::Cpu, shape, &data);
+    let cpu_result = cpu_input.q_mat_mul(&cpu_weights).to_concrete();
+
+    for device in available_devices().await {
+        let weights = qmatrix_from_raw_bytes(&device, weight_shape, &raw_bytes, GgmlType::Q8_0);
+        let input: Tensor<3, f32> = Tensor::from_slice(&device, shape, &data);
+        let actual = input.q_mat_mul(&weights).to_concrete();
+        fusor_conformance::approx_eq(&actual, &cpu_result, 5e-2)
+            .await
+            .unwrap();
+    }
+}
+
+#[tokio::test]
 async fn q_mat_mul_transposed_input_matches_host_reference() {
     use fusor::Device;
     use fusor_conformance::available_devices;

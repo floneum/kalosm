@@ -8,9 +8,21 @@
 use fusor::{Device, Tensor};
 use std::time::Instant;
 
+async fn gpu_device_for_test() -> Option<Device> {
+    match Device::new().await {
+        Ok(device) => Some(device),
+        Err(err) => {
+            eprintln!("skipping GPU-only test: {err}");
+            None
+        }
+    }
+}
+
 #[tokio::test]
 async fn wide_concat_timings() {
-    let device = Device::new().await.unwrap();
+    let Some(device) = gpu_device_for_test().await else {
+        return;
+    };
     let a: Tensor<2, f32> = Tensor::new(&device, &[[1.0f32; 16]; 16]);
     let b: Tensor<2, f32> = Tensor::new(&device, &[[1.0f32; 16]; 16]);
     for &n in &[8usize, 16, 32, 64, 128, 256] {
@@ -31,7 +43,9 @@ async fn wide_concat_timings() {
 async fn two_input_cat_in_chain() {
     // What SAM actually does: many *binary* cat ops buried in a forward pass.
     // pad_with_zeros uses cat([left, self, right]) - up to 3 inputs per cat.
-    let device = Device::new().await.unwrap();
+    let Some(device) = gpu_device_for_test().await else {
+        return;
+    };
     let a: Tensor<2, f32> = Tensor::new(&device, &[[1.0f32; 16]; 16]);
     for &n in &[1usize, 4, 16, 64, 256] {
         let mut x = a.clone();
@@ -65,7 +79,9 @@ async fn two_input_cat_in_chain() {
 #[tokio::test]
 async fn pure_slice_assign_cost() {
     // Measure whether the slice_assign itself is the quadratic term.
-    let device = Device::new().await.unwrap();
+    let Some(device) = gpu_device_for_test().await else {
+        return;
+    };
     for &(size, n) in &[
         (1024usize, 8usize),
         (1024, 32),

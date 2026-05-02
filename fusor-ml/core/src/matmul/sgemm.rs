@@ -214,6 +214,15 @@ pub(super) fn build_kernel(
         DataTypeEnum::F16 => "f16(0.0)",
         _ => "0.0",
     };
+    // Make accumulator initialization explicit; some backend paths do not
+    // reliably preserve WGSL's implicit zero value for aggregate locals.
+    for res_idx_m in 0..thread_m_size {
+        writeln!(
+            kernel,
+            "threadResults[{res_idx_m}] = {thread_n_vec_type}({zero_literal});"
+        )
+        .unwrap();
+    }
 
     // Register caches
     let thread_m_dtype = maybe_vec_storage_type(thread_m_size, datatype);
@@ -651,26 +660,31 @@ pub(super) fn build_kernel(
     for res_idx_m in 0..thread_m_size {
         writeln!(
             kernel,
-            "let outRow{res_idx_m} = min(outRowOffset + {res_idx_m}, {m_size} - 1);"
+            "let outRow{res_idx_m} = outRowOffset + {res_idx_m};"
         )
         .unwrap();
     }
     for res_idx_n in 0..thread_n_size {
         writeln!(
             kernel,
-            "let outCol{res_idx_n} = min(outColOffset + {res_idx_n}, {n_size} - 1);"
+            "let outCol{res_idx_n} = outColOffset + {res_idx_n};"
         )
         .unwrap();
     }
     for res_idx_m in 0..thread_m_size {
         for res_idx_n in 0..thread_n_size {
+            writeln!(
+                kernel,
+                "if (outRow{res_idx_m} < {m_size} && outCol{res_idx_n} < {n_size}) {{"
+            )
+            .unwrap();
             let post_element_wise_functions = post_element_wise_functions
                 .get_or_init(|| matmul.post_element_wise.add_functions(kernel));
             let out_row_stride = output.stride_binding(matmul.rank() - 2);
             let out_col_stride = output.stride_binding(matmul.rank() - 1);
             write!(
                 kernel,
-                "{output}[c_start_index + outRow{res_idx_m} * {out_row_stride} + outCol{res_idx_n} * {out_col_stride}] = "
+                "    {output}[c_start_index + outRow{res_idx_m} * {out_row_stride} + outCol{res_idx_n} * {out_col_stride}] = "
             )
             .unwrap();
             let result = post_element_wise_functions.iter().fold(
@@ -678,6 +692,7 @@ pub(super) fn build_kernel(
                     |acc, f| f.call(vec![acc]),
                 );
             writeln!(kernel, "{result};").unwrap();
+            writeln!(kernel, "}}").unwrap();
         }
     }
     writeln!(kernel, "}}").unwrap();

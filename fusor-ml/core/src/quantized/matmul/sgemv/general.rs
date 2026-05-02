@@ -181,55 +181,61 @@ pub(crate) fn general_sgemv(
         .unwrap();
 
         // We don't need to synchronize between the whole workgroup if there is only one subgroup
-        let subgroup_size = device.max_subgroup_size();
+        let subgroup_size = device.min_subgroup_size();
         if blocksize > subgroup_size {
             let local_data = kernel.add_global_array(
                 KernelGlobalSpace::Workgroup,
                 maybe_vec_storage_type_enum(SGEMV_CHUNK_SIZE, DataTypeEnum::F32),
-                subgroup_size.to_string(),
+                blocksize.to_string(),
             );
             let subgroup_id = kernel.subgroup_index();
             let subgroup_local_id = kernel.subgroup_local_index();
             let subgroups_per_workgroup = kernel.subgroups_per_workgroup();
+            let subgroup_size = kernel.subgroup_size();
+            let total_workgroup_size = workgroup_size.linearized();
 
-            // Write the output to the workgroup memory if this is the first thread in the subgroup
-            writeln!(kernel, "if {subgroup_local_id} == 0u {{").unwrap();
+            writeln!(kernel, "if {total_workgroup_size} > {subgroup_size} {{").unwrap();
             {
-                writeln!(kernel, "{local_data}[{subgroup_id}] = acc;").unwrap();
-            }
-            writeln!(kernel, "}}").unwrap();
+                // Write the output to the workgroup memory if this is the first thread in the subgroup
+                writeln!(kernel, "if {subgroup_local_id} == 0u {{").unwrap();
+                {
+                    writeln!(kernel, "{local_data}[{subgroup_id}] = acc;").unwrap();
+                }
+                writeln!(kernel, "}}").unwrap();
 
-            // Wait until all threads have written to the workgroup shared memory
-            writeln!(kernel, "workgroupBarrier();").unwrap();
+                // Wait until all threads have written to the workgroup shared memory
+                writeln!(kernel, "workgroupBarrier();").unwrap();
 
-            // Then if this is the first subgroup, do one final shuffle down reduction
-            writeln!(kernel, "if {subgroup_id} == 0u {{").unwrap();
-            {
-                // Copy over the final value from each subgroup from the workgroup shared memory to the acc variable
+                // Then if this is the first subgroup, do one final shuffle down reduction
+                writeln!(kernel, "if {subgroup_id} == 0u {{").unwrap();
+                {
+                    // Copy over the final value from each subgroup from the workgroup shared memory to the acc variable
+                    writeln!(
+                        kernel,
+                        "if {subgroup_local_id} < {subgroups_per_workgroup} {{"
+                    )
+                    .unwrap();
+                    {
+                        writeln!(kernel, "acc = {local_data}[{subgroup_local_id}];").unwrap();
+                    }
+                    writeln!(kernel, "}}").unwrap();
+                    writeln!(kernel, "else {{").unwrap();
+                    {
+                        writeln!(kernel, "acc = {acc_storage_type}();").unwrap();
+                    }
+                    writeln!(kernel, "}}").unwrap();
+                }
+                writeln!(kernel, "}}").unwrap();
+
+                // Finally get the final sum across all threads in the workgroup
                 writeln!(
                     kernel,
-                    "if {subgroup_local_id} < {subgroups_per_workgroup} {{"
+                    "acc = {};",
+                    maybe_vec_storage_subgroup_add(SGEMV_CHUNK_SIZE, "acc",)
                 )
                 .unwrap();
-                {
-                    writeln!(kernel, "acc = {local_data}[{subgroup_local_id}];").unwrap();
-                }
-                writeln!(kernel, "}}").unwrap();
-                writeln!(kernel, "else {{").unwrap();
-                {
-                    writeln!(kernel, "acc = {acc_storage_type}();").unwrap();
-                }
-                writeln!(kernel, "}}").unwrap();
             }
             writeln!(kernel, "}}").unwrap();
-
-            // Finally get the final sum across all threads in the workgroup
-            writeln!(
-                kernel,
-                "acc = {};",
-                maybe_vec_storage_subgroup_add(SGEMV_CHUNK_SIZE, "acc",)
-            )
-            .unwrap();
         }
     }
     // Otherwise, reduce using workgroup memory

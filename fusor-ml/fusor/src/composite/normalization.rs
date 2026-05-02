@@ -671,8 +671,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_softmax_cpu_vs_gpu() {
-        use crate::Device;
-
         // Create random-ish data similar to attention scores
         let data: Vec<f32> = (0..1 * 8 * 100 * 100)
             .map(|i| (i as f32 * 0.001).sin() * 10.0)
@@ -685,7 +683,9 @@ mod tests {
         let cpu_slice = cpu_result.as_slice().await.unwrap();
 
         // GPU version
-        let gpu_device = Device::new().await.expect("GPU required for this test");
+        let Some(gpu_device) = crate::gpu_device_for_test().await else {
+            return;
+        };
         let gpu_tensor: Tensor<4, f32> = Tensor::from_slice(&gpu_device, [1, 8, 100, 100], &data);
         let gpu_result = gpu_tensor.softmax::<3>(3);
         let gpu_slice = gpu_result.as_slice().await.unwrap();
@@ -715,8 +715,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_layer_norm_cpu_vs_gpu() {
-        use crate::Device;
-
         // Create random-ish data similar to hidden states
         let data: Vec<f32> = (0..1 * 100 * 384)
             .map(|i| (i as f32 * 0.001).sin() * 2.0)
@@ -744,7 +742,9 @@ mod tests {
         let cpu_slice = cpu_result.as_slice().await.unwrap();
 
         // GPU version
-        let gpu_device = Device::new().await.expect("GPU required for this test");
+        let Some(gpu_device) = crate::gpu_device_for_test().await else {
+            return;
+        };
         let gpu_tensor: Tensor<3, f32> = Tensor::from_slice(&gpu_device, [1, 100, 384], &data);
         let gpu_weight_1d: Tensor<1, f32> = Tensor::from_slice(&gpu_device, [384], &weight_data);
         let gpu_weight_broadcast = gpu_weight_1d.broadcast_as([1, 100, 384]);

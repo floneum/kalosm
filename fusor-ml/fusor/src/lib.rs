@@ -1331,15 +1331,29 @@ where
 }
 
 #[cfg(test)]
+async fn gpu_device_for_test() -> Option<Device> {
+    match Device::new().await {
+        Ok(device) => Some(device),
+        Err(err) => {
+            eprintln!("skipping GPU-only test: {err}");
+            None
+        }
+    }
+}
+
+#[cfg(test)]
 #[tokio::test]
 async fn test_gpu_or_add() {
     let a_cpu: CpuTensor<1, fusor_cpu::ConcreteTensor<f32, 1>> =
         fusor_cpu::Tensor::from_slice([3], &[1.0, 2.0, 3.0]);
     let b_cpu: CpuTensor<1, fusor_cpu::ConcreteTensor<f32, 1>> =
         fusor_cpu::Tensor::from_slice([3], &[4.0, 5.0, 6.0]);
-    let device = fusor_core::Device::new().await.unwrap();
-    let a_gpu: GpuTensor<1, f32> = GpuTensor::new(&device, &[1.0, 2.0, 3.0]);
-    let b_gpu: GpuTensor<1, f32> = GpuTensor::new(&device, &[4.0, 5.0, 6.0]);
+    let Some(device) = gpu_device_for_test().await else {
+        return;
+    };
+    let device = device.as_gpu().expect("gpu_device_for_test returned CPU");
+    let a_gpu: GpuTensor<1, f32> = GpuTensor::new(device, &[1.0, 2.0, 3.0]);
+    let b_gpu: GpuTensor<1, f32> = GpuTensor::new(device, &[4.0, 5.0, 6.0]);
 
     let a_cpu_or: Tensor<1, f32> = Tensor::Cpu(a_cpu);
     let b_cpu_or: Tensor<1, f32> = Tensor::Cpu(b_cpu);
@@ -1374,7 +1388,9 @@ async fn test_matmul_cpu_vs_gpu() {
     let cpu_slice = cpu_result.as_slice().await.unwrap();
 
     // GPU version
-    let gpu_device = Device::new().await.expect("GPU required for this test");
+    let Some(gpu_device) = gpu_device_for_test().await else {
+        return;
+    };
     let gpu_a: Tensor<4, f32> = Tensor::from_slice(&gpu_device, [1, 8, 100, 64], &a_data);
     let gpu_b: Tensor<4, f32> = Tensor::from_slice(&gpu_device, [1, 8, 64, 100], &b_data);
     let gpu_result = gpu_a.matmul(&gpu_b);
@@ -1402,4 +1418,151 @@ async fn test_matmul_cpu_vs_gpu() {
         "Matmul CPU and GPU outputs differ too much: max_diff={}",
         max_diff
     );
+}
+
+#[cfg(test)]
+#[tokio::test]
+async fn test_affine_pre_fused_batched_matmul_matches_cpu() {
+    let Some(gpu_device) = gpu_device_for_test().await else {
+        return;
+    };
+
+    async fn check_shape<const N: usize>(gpu_device: &Device, batch: usize, m: usize) {
+        const K: usize = 2;
+
+        let lhs_data: Vec<f32> = (0..batch * m * K)
+            .map(|i| ((i * 17 % 251) as f32 / 250.0).fract())
+            .collect();
+        let rhs_data: Vec<f32> = (0..batch * K * N)
+            .map(|i| ((i * 29 % 257) as f32 * 0.01).sin())
+            .collect();
+
+        let cpu_lhs: Tensor<3, f32> = Tensor::from_slice(&Device::Cpu, [batch, m, K], &lhs_data);
+        let cpu_rhs: Tensor<3, f32> = Tensor::from_slice(&Device::Cpu, [batch, K, N], &rhs_data);
+        let gpu_lhs: Tensor<3, f32> = Tensor::from_slice(gpu_device, [batch, m, K], &lhs_data);
+        let gpu_rhs: Tensor<3, f32> = Tensor::from_slice(gpu_device, [batch, K, N], &rhs_data);
+
+        let cpu_result = cpu_lhs.mul_scalar(2.0).add_scalar(-1.0).matmul(&cpu_rhs);
+        let gpu_result = gpu_lhs.mul_scalar(2.0).add_scalar(-1.0).matmul(&gpu_rhs);
+
+        let cpu_slice = cpu_result.as_slice().await.unwrap();
+        let gpu_slice = gpu_result.as_slice().await.unwrap();
+        assert_eq!(cpu_slice.shape(), gpu_slice.shape());
+
+        let mut max_diff = 0.0f32;
+        for b in 0..batch {
+            for row in 0..m {
+                for col in 0..N {
+                    let cpu = cpu_slice[[b, row, col]];
+                    let gpu = gpu_slice[[b, row, col]];
+                    max_diff = max_diff.max((cpu - gpu).abs());
+                }
+            }
+        }
+
+        assert!(
+            max_diff < 0.001,
+            "affine pre-fused batched matmul diverged for [{batch}, {m}, {K}] @ [{batch}, {K}, {N}]: max_diff={max_diff}",
+        );
+    }
+
+    async fn check_position_encoding_layout(gpu_device: &Device) {
+        const H: usize = 64;
+        const W: usize = 64;
+        const K: usize = 2;
+        const N: usize = 128;
+
+        fn build(device: &Device, gm: &Tensor<2, f32>) -> Tensor<3, f32> {
+            let x: Tensor<1, f32> =
+                arange_step::<f32>(device, 0.5, W as f32 + 0.5, 1.0).div_scalar(W as f32);
+            let y: Tensor<1, f32> =
+                arange_step::<f32>(device, 0.5, H as f32 + 0.5, 1.0).div_scalar(H as f32);
+            let x_2d = x.reshape([1, W]);
+            let x_broadcast = x_2d.broadcast_as([H, W]);
+            let x = x_broadcast.reshape([H, W, 1]);
+            let y_2d = y.reshape([H, 1]);
+            let y_broadcast = y_2d.broadcast_as([H, W]);
+            let y = y_broadcast.reshape([H, W, 1]);
+            let coords = Tensor::cat([x, y], 2).mul_scalar(2.0).add_scalar(-1.0);
+            let gm_reshaped = gm.reshape([1, K, N]);
+            let gm_broadcast = gm_reshaped.broadcast_as([H, K, N]);
+            coords.matmul(&gm_broadcast)
+        }
+
+        let gm_data: Vec<f32> = (0..K * N)
+            .map(|i| ((i * 29 % 257) as f32 * 0.01).sin())
+            .collect();
+        let cpu_gm: Tensor<2, f32> = Tensor::from_slice(&Device::Cpu, [K, N], &gm_data);
+        let gpu_gm: Tensor<2, f32> = Tensor::from_slice(gpu_device, [K, N], &gm_data);
+        let cpu_result = build(&Device::Cpu, &cpu_gm);
+        let gpu_result = build(gpu_device, &gpu_gm);
+        let cpu_slice = cpu_result.as_slice().await.unwrap();
+        let gpu_slice = gpu_result.as_slice().await.unwrap();
+        assert_eq!(cpu_slice.shape(), gpu_slice.shape());
+
+        let mut max_diff = 0.0f32;
+        for h in 0..H {
+            for w in 0..W {
+                for col in 0..N {
+                    let cpu = cpu_slice[[h, w, col]];
+                    let gpu = gpu_slice[[h, w, col]];
+                    max_diff = max_diff.max((cpu - gpu).abs());
+                }
+            }
+        }
+
+        assert!(
+            max_diff < 0.001,
+            "position-encoding affine pre-fused matmul diverged: max_diff={max_diff}",
+        );
+    }
+
+    async fn check_mask_head_layout(gpu_device: &Device) {
+        const BATCH: usize = 8;
+        const M: usize = 4;
+        const K: usize = 32;
+        const N: usize = 65536;
+
+        let lhs_data: Vec<f32> = (0..BATCH * M * K)
+            .map(|i| ((i * 13 % 197) as f32 * 0.017).sin())
+            .collect();
+        let rhs_data: Vec<f32> = (0..BATCH * K * N)
+            .map(|i| ((i * 7 % 251) as f32 * 0.011).cos() * 0.125)
+            .collect();
+
+        let cpu_lhs: Tensor<3, f32> = Tensor::from_slice(&Device::Cpu, [BATCH, M, K], &lhs_data);
+        let cpu_rhs: Tensor<3, f32> = Tensor::from_slice(&Device::Cpu, [BATCH, K, N], &rhs_data);
+        let gpu_lhs: Tensor<3, f32> = Tensor::from_slice(gpu_device, [BATCH, M, K], &lhs_data);
+        let gpu_rhs: Tensor<3, f32> = Tensor::from_slice(gpu_device, [BATCH, K, N], &rhs_data);
+
+        let cpu_result = cpu_lhs.matmul(&cpu_rhs);
+        let gpu_result = gpu_lhs.matmul(&gpu_rhs);
+        let cpu_slice = cpu_result.as_slice().await.unwrap();
+        let gpu_slice = gpu_result.as_slice().await.unwrap();
+        assert_eq!(cpu_slice.shape(), gpu_slice.shape());
+
+        let mut max_diff = 0.0f32;
+        for b in 0..BATCH {
+            for row in 0..M {
+                for col in 0..N {
+                    let cpu = cpu_slice[[b, row, col]];
+                    let gpu = gpu_slice[[b, row, col]];
+                    max_diff = max_diff.max((cpu - gpu).abs());
+                }
+            }
+        }
+
+        assert!(
+            max_diff < 0.001,
+            "SAM mask-head batched matmul layout diverged: max_diff={max_diff}",
+        );
+    }
+
+    check_shape::<128>(&gpu_device, 64, 64).await;
+    check_shape::<128>(&gpu_device, 8, 2).await;
+    check_shape::<128>(&gpu_device, 1, 2).await;
+    check_shape::<127>(&gpu_device, 3, 7).await;
+    check_shape::<64>(&gpu_device, 4, 5).await;
+    check_position_encoding_layout(&gpu_device).await;
+    check_mask_head_layout(&gpu_device).await;
 }

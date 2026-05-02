@@ -861,7 +861,10 @@ impl Resolver {
                     Self::try_get_unary_chain(&self.execution_graph[first_exec].variant)
             {
                 new_matmul.first = el_op.value;
-                new_matmul.pre_element_wise[0] = el_op.functions.clone();
+                let mut functions = new_matmul.pre_element_wise[0].functions.clone();
+                functions.extend(el_op.functions.functions.iter().cloned());
+                new_matmul.pre_element_wise[0] =
+                    UnaryFunctionChain::new(functions, el_op.functions.input_datatype());
                 changed = true;
             }
 
@@ -872,7 +875,10 @@ impl Resolver {
                     Self::try_get_unary_chain(&self.execution_graph[second_exec].variant)
             {
                 new_matmul.second = el_op.value;
-                new_matmul.pre_element_wise[1] = el_op.functions.clone();
+                let mut functions = new_matmul.pre_element_wise[1].functions.clone();
+                functions.extend(el_op.functions.functions.iter().cloned());
+                new_matmul.pre_element_wise[1] =
+                    UnaryFunctionChain::new(functions, el_op.functions.input_datatype());
                 changed = true;
             }
 

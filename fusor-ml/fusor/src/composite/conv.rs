@@ -991,8 +991,6 @@ mod tests {
     /// 3x3 kernel, padding=1, stride=1.
     #[tokio::test]
     async fn test_grouped_conv_gpu_vs_per_group_reference() {
-        use crate::Device;
-
         let groups = 8usize;
         let ipg = 1usize;
         let opg = 1usize;
@@ -1043,7 +1041,9 @@ mod tests {
         let reference_slice = reference.as_slice().await.unwrap();
 
         // Now run grouped_conv on GPU.
-        let gpu = Device::new().await.expect("GPU required for this test");
+        let Some(gpu) = crate::gpu_device_for_test().await else {
+            return;
+        };
         let weight_gpu: Tensor<4, f32> =
             Tensor::from_slice(&gpu, [out_channels, ipg, kh, kw], &weight_data);
         let bias_gpu: Tensor<1, f32> = Tensor::from_slice(&gpu, [out_channels], &bias_data);
@@ -1080,8 +1080,6 @@ mod tests {
     /// spatial extent to keep the test fast.
     #[tokio::test]
     async fn test_grouped_conv_gpu_vs_per_group_reference_large_groups() {
-        use crate::Device;
-
         let groups = 256usize;
         let ipg = 1usize;
         let opg = 1usize;
@@ -1124,7 +1122,9 @@ mod tests {
             Tensor::cat(group_outputs, 1).to_concrete();
         let reference_slice = reference.as_slice().await.unwrap();
 
-        let gpu = Device::new().await.expect("GPU required for this test");
+        let Some(gpu) = crate::gpu_device_for_test().await else {
+            return;
+        };
         let weight_gpu: Tensor<4, f32> =
             Tensor::from_slice(&gpu, [out_channels, ipg, kh, kw], &weight_data);
         let input_gpu: Tensor<4, f32> =
@@ -1167,8 +1167,9 @@ mod tests {
     /// the surrounding conv layout chain.
     #[tokio::test]
     async fn test_batched_matmul_strided_a_at_scale() {
-        use crate::Device;
-        let gpu = Device::new().await.expect("GPU required");
+        let Some(gpu) = crate::gpu_device_for_test().await else {
+            return;
+        };
         let max_binding_size = gpu
             .as_gpu()
             .map(|device| device.limits().max_storage_buffer_binding_size as usize)
@@ -1235,8 +1236,6 @@ mod tests {
     /// the matmul's handling of an A input that's deep in a lazy graph.
     #[tokio::test]
     async fn test_grouped_conv_bmm_isolated() {
-        use crate::Device;
-
         let groups = 64usize;
         let h = 200usize;
         let w = 200usize;
@@ -1256,7 +1255,9 @@ mod tests {
             .map(|i| (i as f32 * 0.013).sin() * 0.4)
             .collect();
 
-        let gpu = Device::new().await.expect("GPU required");
+        let Some(gpu) = crate::gpu_device_for_test().await else {
+            return;
+        };
         let input_gpu: Tensor<4, f32> =
             Tensor::from_slice(&gpu, [1, in_channels, h, w], &input_data);
         let weight_gpu: Tensor<4, f32> =
@@ -1387,8 +1388,6 @@ mod tests {
     /// permute + reshape + transpose) or in the matmul itself.
     #[tokio::test]
     async fn test_windows_grouped_at_sam_scale() {
-        use crate::Device;
-
         let groups = 64usize;
         let h = 200usize;
         let w = 200usize;
@@ -1404,7 +1403,9 @@ mod tests {
             .map(|i| (i as f32 * 0.0091).cos() * 0.5)
             .collect();
 
-        let gpu = Device::new().await.expect("GPU required");
+        let Some(gpu) = crate::gpu_device_for_test().await else {
+            return;
+        };
         let input_gpu: Tensor<4, f32> =
             Tensor::from_slice(&gpu, [1, in_channels, h, w], &input_data);
         let padded_gpu = input_gpu.pad_axis(2, pad).pad_axis(3, pad);
@@ -1479,8 +1480,6 @@ mod tests {
     /// breaks SAM masks while smaller-scale tests above pass.
     #[tokio::test]
     async fn test_grouped_conv_gpu_sam_scale_depthwise() {
-        use crate::Device;
-
         let groups = 64usize;
         let h = 200usize;
         let w = 200usize;
@@ -1519,7 +1518,9 @@ mod tests {
             Tensor::cat(group_outputs, 1).to_concrete();
         let reference_slice = reference.as_slice().await.unwrap();
 
-        let gpu = Device::new().await.expect("GPU required for this test");
+        let Some(gpu) = crate::gpu_device_for_test().await else {
+            return;
+        };
 
         let weight_gpu: Tensor<4, f32> =
             Tensor::from_slice(&gpu, [groups, 1, kh, kw], &weight_data);

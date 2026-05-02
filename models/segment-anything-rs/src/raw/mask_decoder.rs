@@ -369,7 +369,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_upscaling_batched_matches_per_item() {
-        let device = Device::new().await.unwrap();
+        let Some(device) = crate::gpu_device_for_test().await else {
+            return;
+        };
 
         const BATCH: usize = 4;
         const IN_CH: usize = 8;
@@ -486,7 +488,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_upscale_matches_conv_transpose() {
-        let device = Device::new().await.unwrap();
+        let Some(device) = crate::gpu_device_for_test().await else {
+            return;
+        };
 
         const B: usize = 2;
         const IN_CH: usize = 3;

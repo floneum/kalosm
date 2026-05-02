@@ -164,14 +164,14 @@ mod tests {
     #[cfg(not(target_os = "windows"))]
     #[tokio::test]
     async fn test_sigmoid_cpu_vs_gpu() {
-        use crate::Device;
-
         let data: Vec<f32> = (0..256).map(|i| ((i as f32) - 128.0) * 0.1).collect();
 
         let cpu_tensor: Tensor<1, f32> = Tensor::Cpu(fusor_cpu::Tensor::from_slice([256], &data));
         let cpu_slice = cpu_tensor.sigmoid().as_slice().await.unwrap();
 
-        let gpu_device = Device::new().await.expect("GPU required for this test");
+        let Some(gpu_device) = crate::gpu_device_for_test().await else {
+            return;
+        };
         let gpu_tensor: Tensor<1, f32> = Tensor::from_slice(&gpu_device, [256], &data);
         let gpu_slice = gpu_tensor.sigmoid().as_slice().await.unwrap();
 
@@ -233,8 +233,6 @@ mod tests {
     #[cfg(not(target_os = "windows"))]
     #[tokio::test]
     async fn test_gelu_large_values() {
-        use crate::Device;
-
         // Without the TANH_INPUT_CLAMP, WGSL's `(e^x - e^-x) / (e^x + e^-x)`
         // overflows to NaN for x > ~88. The values below all push past that
         // threshold; if the clamp regresses, gelu(x) will return NaN and the
@@ -242,7 +240,9 @@ mod tests {
         let positive = [50.0f32, 100.0, 500.0, 1000.0, 2725.0];
         let negative = [-50.0f32, -100.0, -500.0, -1000.0];
 
-        let gpu_device = Device::new().await.expect("GPU required for this test");
+        let Some(gpu_device) = crate::gpu_device_for_test().await else {
+            return;
+        };
 
         let pos_tensor: Tensor<1, f32> = Tensor::from_slice(&gpu_device, [5], &positive);
         let pos_slice = pos_tensor.gelu().as_slice().await.unwrap();
@@ -265,8 +265,6 @@ mod tests {
     #[cfg(not(target_os = "windows"))]
     #[tokio::test]
     async fn test_gelu_cpu_vs_gpu() {
-        use crate::Device;
-
         let data: Vec<f32> = (0..100 * 1536)
             .map(|i| (i as f32 * 0.001).sin() * 5.0)
             .collect();
@@ -275,7 +273,9 @@ mod tests {
             Tensor::Cpu(fusor_cpu::Tensor::from_slice([1, 100, 1536], &data));
         let cpu_slice = cpu_tensor.gelu().as_slice().await.unwrap();
 
-        let gpu_device = Device::new().await.expect("GPU required for this test");
+        let Some(gpu_device) = crate::gpu_device_for_test().await else {
+            return;
+        };
         let gpu_tensor: Tensor<3, f32> = Tensor::from_slice(&gpu_device, [1, 100, 1536], &data);
         let gpu_slice = gpu_tensor.gelu().as_slice().await.unwrap();
 
