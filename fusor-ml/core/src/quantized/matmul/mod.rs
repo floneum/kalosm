@@ -228,6 +228,22 @@ impl Operation for QMatMulOperation {
             && k <= 1024
             && limits.max_compute_invocations_per_workgroup >= 512
             && limits.max_compute_workgroup_storage_size >= 32 * 1024;
+        // Larger qmatmul tile shapes for high-arithmetic-intensity GEMM. Each
+        // workgroup amortizes more arithmetic per dispatch + threadgroup-tile
+        // load, so bigger tiles win when the output dimensions allow.
+        let coop_eligible = y_supports_coop && k.is_multiple_of(32) && m > 1;
+        let use_128x128_tile = coop_eligible
+            && m.is_multiple_of(128)
+            && n.is_multiple_of(128)
+            && limits.max_compute_invocations_per_workgroup >= 512
+            && limits.max_compute_workgroup_storage_size >= 32 * 1024;
+        let use_128x64_tile =
+            coop_eligible && m.is_multiple_of(128) && n.is_multiple_of(64) && !use_128x128_tile;
+        let use_64x128_tile = coop_eligible
+            && m.is_multiple_of(64)
+            && n.is_multiple_of(128)
+            && !use_128x128_tile
+            && !use_128x64_tile;
         let fast_dispatch_size = if m == 1 {
             let qgemv_workgroups = n.div_ceil(qgemv_cols_per_workgroup);
             Some([
@@ -235,13 +251,15 @@ impl Operation for QMatMulOperation {
                 qgemv_workgroups.div_ceil(qmatmul_workgroups_x),
                 1,
             ])
-        } else if use_wide_q8_tile && y_supports_coop && k.is_multiple_of(32) {
+        } else if use_wide_q8_tile {
             Some([n / 128, m / 64, 1])
-        } else if y_supports_coop
-            && m.is_multiple_of(64)
-            && n.is_multiple_of(64)
-            && k.is_multiple_of(32)
-        {
+        } else if use_128x128_tile {
+            Some([n / 128, m / 128, 1])
+        } else if use_128x64_tile {
+            Some([n / 64, m / 128, 1])
+        } else if use_64x128_tile {
+            Some([n / 128, m / 64, 1])
+        } else if coop_eligible && m.is_multiple_of(64) && n.is_multiple_of(64) {
             Some([n / 64, m / 64, 1])
         } else {
             None
@@ -299,6 +317,12 @@ impl Operation for QMatMulOperation {
             } else if m == 1 {
                 phase.qgemv::<4, 64>(&a, &b, &y, 4, qmatmul_workgroups_x);
             } else if use_wide_q8_tile {
+                phase.qmatmul::<64, 128, 32>(&a, &b, &y, 4);
+            } else if use_128x128_tile {
+                phase.qmatmul::<128, 128, 32>(&a, &b, &y, 4);
+            } else if use_128x64_tile {
+                phase.qmatmul::<128, 64, 32>(&a, &b, &y, 4);
+            } else if use_64x128_tile {
                 phase.qmatmul::<64, 128, 32>(&a, &b, &y, 4);
             } else {
                 phase.qmatmul::<64, 64, 32>(&a, &b, &y, 4);

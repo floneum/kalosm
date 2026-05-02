@@ -12,17 +12,17 @@ impl<'a> Lowerer<'a> {
                 "tile program block must match workgroup size",
             ));
         }
-        if let Some(accelerator) = &op.accelerator {
-            if !op.stores.is_empty() {
-                return Err(LowerError::UnsupportedOperation(
-                    "accelerated tile programs cannot mix scalar stores",
-                ));
-            }
-            return self.lower_tile_program_accelerator(expressions, scratch, accelerator);
-        }
 
         let mut body = Block::new();
+        if !op.coop_body.is_empty() {
+            self.lower_subgroup_body(expressions, scratch, &mut body, &op.coop_body)?;
+        }
         for store in &op.stores {
+            self.block_dequant_cache.borrow_mut().clear();
+            self.pin_cache.borrow_mut().clear();
+            // loop_fold_group_cache is intentionally NOT cleared here — group
+            // outputs survive across stores because the K loop is emitted into
+            // the outer body block, dominated by every store that follows.
             let value =
                 self.lower_tile_expr_lane(expressions, scratch, &mut body, &store.value, 0)?;
             let mask =
@@ -262,7 +262,239 @@ impl<'a> Lowerer<'a> {
                     *group_size,
                 )
             }
+            TileExpr::SubgroupReduce { op, value } => {
+                let element = self.tile_expr_element(value)?;
+                let value =
+                    self.lower_tile_expr_lane(expressions, scratch, body, value, spill_depth)?;
+                self.lower_tile_subgroup_reduce_value(expressions, body, value, *op, element)
+            }
+            TileExpr::QuantizedBlockLane {
+                id,
+                src,
+                k_base,
+                col,
+                mask,
+                fill,
+                block_n,
+                lane,
+            } => self.lower_tile_quantized_block_lane(
+                expressions,
+                scratch,
+                body,
+                *id,
+                src,
+                k_base,
+                col,
+                mask,
+                *fill,
+                *block_n,
+                *lane,
+                spill_depth,
+            ),
+            TileExpr::PinnedRef { id } => {
+                if let Some(handle) = self.pin_cache.borrow().get(id).copied() {
+                    return Ok(handle);
+                }
+                let value_expr = self
+                    .ir
+                    .pinned_values
+                    .get(id.index())
+                    .ok_or(LowerError::UnsupportedOperation("unknown pin id"))?
+                    .clone();
+                // Lower the bound value once into the current block; cache the
+                // SSA handle. naga's dominator-based SSA validates re-use from
+                // any nested block so a single handle suffices.
+                let value = self.lower_tile_expr_lane(
+                    expressions,
+                    scratch,
+                    body,
+                    &value_expr,
+                    spill_depth,
+                )?;
+                self.pin_cache.borrow_mut().insert(*id, value);
+                Ok(value)
+            }
+            TileExpr::LoopFoldGroupOutput { group, lane } => self
+                .lower_tile_loop_fold_group_output(expressions, scratch, body, *group, *lane, spill_depth),
+            TileExpr::Dot4 { a, b } => {
+                let mut a_handles = Vec::with_capacity(4);
+                let mut b_handles = Vec::with_capacity(4);
+                for i in 0..4 {
+                    a_handles.push(self.lower_tile_expr_lane(
+                        expressions,
+                        scratch,
+                        body,
+                        &a[i],
+                        spill_depth + 1,
+                    )?);
+                }
+                for i in 0..4 {
+                    b_handles.push(self.lower_tile_expr_lane(
+                        expressions,
+                        scratch,
+                        body,
+                        &b[i],
+                        spill_depth + 1,
+                    )?);
+                }
+                let a_vec = expressions.append(
+                    Expression::Compose {
+                        ty: self.f32_vec4_ty,
+                        components: a_handles,
+                    },
+                    Span::default(),
+                );
+                let b_vec = expressions.append(
+                    Expression::Compose {
+                        ty: self.f32_vec4_ty,
+                        components: b_handles,
+                    },
+                    Span::default(),
+                );
+                body.push(
+                    Statement::Emit(Self::single_expression_range(expressions, a_vec)),
+                    Span::default(),
+                );
+                body.push(
+                    Statement::Emit(Self::single_expression_range(expressions, b_vec)),
+                    Span::default(),
+                );
+                let dot = expressions.append(
+                    Expression::Math {
+                        fun: MathFunction::Dot,
+                        arg: a_vec,
+                        arg1: Some(b_vec),
+                        arg2: None,
+                        arg3: None,
+                    },
+                    Span::default(),
+                );
+                body.push(
+                    Statement::Emit(Self::single_expression_range(expressions, dot)),
+                    Span::default(),
+                );
+                Ok(dot)
+            }
         }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn lower_tile_quantized_block_lane(
+        &self,
+        expressions: &mut Arena<Expression>,
+        scratch: ScratchLocals,
+        body: &mut Block,
+        id: BlockDequantId,
+        src: &QuantizedMatrix,
+        k_base: &TileIndexExpr,
+        col: &TileIndexExpr,
+        mask: &TileMaskExpr,
+        fill: F32Bits,
+        block_n: u32,
+        lane: u32,
+        spill_depth: usize,
+    ) -> Result<Handle<Expression>, LowerError> {
+        if lane >= block_n {
+            return Err(LowerError::UnsupportedOperation(
+                "quantized block lane out of range",
+            ));
+        }
+        if let Some(values) = self.block_dequant_cache.borrow().get(&id).cloned() {
+            return Ok(values[lane as usize]);
+        }
+
+        // First lane request: emit the shared dequant helper into a masked
+        // block. Cache the resulting per-lane handles for siblings.
+        let tmp_locals: Vec<_> = (0..block_n)
+            .map(|i| {
+                self.block_dequant_value_local(scratch, i)
+                    .ok_or(LowerError::UnsupportedOperation(
+                        "quantized block lane exceeds available scratch locals",
+                    ))
+            })
+            .collect::<Result<_, _>>()?;
+        let fill_value =
+            expressions.append(Expression::Literal(Literal::F32(fill.get())), Span::default());
+        for local in &tmp_locals {
+            let ptr = expressions.append(Expression::LocalVariable(*local), Span::default());
+            body.push(
+                Statement::Store {
+                    pointer: ptr,
+                    value: fill_value,
+                },
+                Span::default(),
+            );
+        }
+
+        let mask_handle =
+            self.lower_tile_mask_expr(expressions, scratch, body, mask, spill_depth)?;
+        let mut accept = Block::new();
+        let k_base_handle =
+            self.lower_tile_index_expr(expressions, scratch, &mut accept, k_base, spill_depth)?;
+        let col_handle =
+            self.lower_tile_index_expr(expressions, scratch, &mut accept, col, spill_depth)?;
+        let (values, value_emits) = match (src.format, block_n) {
+            (GgmlQuantFormat::Q8_0, 8) => {
+                self.dequantize_q8_0_values8(expressions, src, k_base_handle, col_handle)?
+            }
+            (GgmlQuantFormat::Q4K, 8) => {
+                self.dequantize_q4k_values8(expressions, src, k_base_handle, col_handle)?
+            }
+            (GgmlQuantFormat::Q6K, 8) => {
+                self.dequantize_q6k_values8(expressions, src, k_base_handle, col_handle)?
+            }
+            (GgmlQuantFormat::Q5_0, 16) => {
+                self.dequantize_q5_0_values16(expressions, src, k_base_handle, col_handle)?
+            }
+            _ => {
+                return Err(LowerError::UnsupportedOperation(
+                    "quantized block dequant only supports Q8_0/Q4K/Q6K x8 and Q5_0 x16",
+                ));
+            }
+        };
+        Self::push_emits(&mut accept, value_emits);
+        for (local, value) in tmp_locals.iter().zip(values.iter()) {
+            let ptr = expressions.append(Expression::LocalVariable(*local), Span::default());
+            accept.push(
+                Statement::Store {
+                    pointer: ptr,
+                    value: *value,
+                },
+                Span::default(),
+            );
+        }
+        body.push(
+            Statement::If {
+                condition: mask_handle,
+                accept,
+                reject: Block::new(),
+            },
+            Span::default(),
+        );
+
+        // Materialize the locals into SSA loads we hand back per lane.
+        let mut handles = Vec::with_capacity(block_n as usize);
+        for local in &tmp_locals {
+            let ptr = expressions.append(Expression::LocalVariable(*local), Span::default());
+            let value = expressions.append(Expression::Load { pointer: ptr }, Span::default());
+            body.push(
+                Statement::Emit(Self::single_expression_range(expressions, value)),
+                Span::default(),
+            );
+            handles.push(value);
+        }
+        self.block_dequant_cache
+            .borrow_mut()
+            .insert(id, handles.clone());
+        Ok(handles[lane as usize])
+    }
+
+    fn block_dequant_value_local(
+        &self,
+        scratch: ScratchLocals,
+        index: u32,
+    ) -> Option<Handle<LocalVariable>> {
+        scratch.block_dequant.get(index as usize).copied()
     }
 
     fn tile_expr_spill_local(
@@ -510,6 +742,11 @@ impl<'a> Lowerer<'a> {
             Span::default(),
         );
 
+        // Cache entries reference handles emitted into the outer block; they
+        // become out of scope inside this loop body. Snapshot, clear for the
+        // body, and restore on exit so callers see consistent state.
+        let saved_dequant: Vec<_> = self.block_dequant_cache.borrow_mut().drain().collect();
+        let saved_pin: Vec<_> = self.pin_cache.borrow_mut().drain().collect();
         let value = self.lower_tile_expr_lane(
             expressions,
             scratch,
@@ -517,6 +754,20 @@ impl<'a> Lowerer<'a> {
             value,
             spill_depth + 1,
         )?;
+        {
+            let mut cache = self.block_dequant_cache.borrow_mut();
+            cache.clear();
+            for (k, v) in saved_dequant {
+                cache.insert(k, v);
+            }
+        }
+        {
+            let mut cache = self.pin_cache.borrow_mut();
+            cache.clear();
+            for (k, v) in saved_pin {
+                cache.insert(k, v);
+            }
+        }
         let acc = expressions.append(Expression::Load { pointer: acc_ptr }, Span::default());
         loop_body.push(
             Statement::Emit(Self::single_expression_range(expressions, acc)),
@@ -614,6 +865,11 @@ impl<'a> Lowerer<'a> {
             Span::default(),
         );
 
+        // Cache entries reference handles emitted into the outer block; they
+        // become out of scope inside this loop body. Snapshot, clear for the
+        // body, and restore on exit so callers see consistent state.
+        let saved_dequant: Vec<_> = self.block_dequant_cache.borrow_mut().drain().collect();
+        let saved_pin: Vec<_> = self.pin_cache.borrow_mut().drain().collect();
         let value = self.lower_tile_expr_lane(
             expressions,
             scratch,
@@ -621,6 +877,20 @@ impl<'a> Lowerer<'a> {
             value,
             spill_depth + 1,
         )?;
+        {
+            let mut cache = self.block_dequant_cache.borrow_mut();
+            cache.clear();
+            for (k, v) in saved_dequant {
+                cache.insert(k, v);
+            }
+        }
+        {
+            let mut cache = self.pin_cache.borrow_mut();
+            cache.clear();
+            for (k, v) in saved_pin {
+                cache.insert(k, v);
+            }
+        }
         let acc = expressions.append(Expression::Load { pointer: acc_ptr }, Span::default());
         loop_body.push(
             Statement::Emit(Self::single_expression_range(expressions, acc)),
@@ -876,6 +1146,220 @@ impl<'a> Lowerer<'a> {
         Ok(result)
     }
 
+    fn lower_tile_loop_fold_group_output(
+        &self,
+        expressions: &mut Arena<Expression>,
+        scratch: ScratchLocals,
+        body: &mut Block,
+        group: LoopFoldGroupId,
+        lane: u32,
+        spill_depth: usize,
+    ) -> Result<Handle<Expression>, LowerError> {
+        if let Some(values) = self.loop_fold_group_cache.borrow().get(&group).cloned() {
+            return Ok(values
+                .get(lane as usize)
+                .copied()
+                .ok_or(LowerError::UnsupportedOperation("fold group lane out of range"))?);
+        }
+
+        let g = self
+            .ir
+            .loop_fold_groups
+            .get(group.index())
+            .ok_or(LowerError::UnsupportedOperation("unknown fold group"))?
+            .clone();
+        let n = g.bodies.len();
+        if g.initials.len() != n {
+            return Err(LowerError::UnsupportedOperation(
+                "fold group initial count mismatch",
+            ));
+        }
+        let offset = self
+            .fold_group_offsets
+            .get(group.index())
+            .copied()
+            .ok_or(LowerError::UnsupportedOperation("fold group offset missing"))?;
+        if offset + n > self.fold_accumulator_locals.len() {
+            return Err(LowerError::UnsupportedOperation(
+                "fold group accumulator pool exhausted",
+            ));
+        }
+        let acc_locals: Vec<_> = (0..n)
+            .map(|i| self.fold_accumulator_locals[offset + i])
+            .collect();
+
+        // Initialize accumulators.
+        for (i, local) in acc_locals.iter().enumerate() {
+            let init = expressions.append(Self::tile_literal(g.initials[i]), Span::default());
+            let ptr = expressions.append(Expression::LocalVariable(*local), Span::default());
+            body.push(
+                Statement::Store {
+                    pointer: ptr,
+                    value: init,
+                },
+                Span::default(),
+            );
+        }
+
+        // Initialize loop index.
+        let loop_ptr = expressions.append(
+            Expression::LocalVariable(scratch.loop_index),
+            Span::default(),
+        );
+        let zero = expressions.append(Expression::Literal(Literal::U32(0)), Span::default());
+        body.push(
+            Statement::Store {
+                pointer: loop_ptr,
+                value: zero,
+            },
+            Span::default(),
+        );
+
+        // Build loop body.
+        let mut loop_body = Block::new();
+        let loop_index = expressions.append(Expression::Load { pointer: loop_ptr }, Span::default());
+        loop_body.push(
+            Statement::Emit(Self::single_expression_range(expressions, loop_index)),
+            Span::default(),
+        );
+        let done = self.bin_lit_u32(
+            expressions,
+            &mut loop_body,
+            BinaryOperator::GreaterEqual,
+            loop_index,
+            g.iterations,
+        );
+        loop_body.push(
+            Statement::If {
+                condition: done,
+                accept: Block::from_vec(vec![Statement::Break]),
+                reject: Block::new(),
+            },
+            Span::default(),
+        );
+
+        // Snapshot caches that reference handles in the outer block; the loop
+        // body emits a fresh scope. Restore on exit so callers see consistent
+        // state.
+        let saved_dequant: Vec<_> = self.block_dequant_cache.borrow_mut().drain().collect();
+        let saved_pin: Vec<_> = self.pin_cache.borrow_mut().drain().collect();
+
+        // Lower each body[i] within the same loop body, accumulate into acc_locals[i].
+        for (i, body_expr) in g.bodies.iter().enumerate() {
+            let value = self.lower_tile_expr_lane(
+                expressions,
+                scratch,
+                &mut loop_body,
+                body_expr,
+                spill_depth + 1,
+            )?;
+            let acc_ptr =
+                expressions.append(Expression::LocalVariable(acc_locals[i]), Span::default());
+            let acc_load = expressions.append(
+                Expression::Load { pointer: acc_ptr },
+                Span::default(),
+            );
+            loop_body.push(
+                Statement::Emit(Self::single_expression_range(expressions, acc_load)),
+                Span::default(),
+            );
+            let reduced = self.emit_tile_expr(
+                expressions,
+                &mut loop_body,
+                Self::tile_reduce_expression(g.op, acc_load, value),
+            );
+            loop_body.push(
+                Statement::Store {
+                    pointer: acc_ptr,
+                    value: reduced,
+                },
+                Span::default(),
+            );
+        }
+
+        // Restore caches now that we're leaving the loop body scope.
+        {
+            let mut cache = self.block_dequant_cache.borrow_mut();
+            cache.clear();
+            for (k, v) in saved_dequant {
+                cache.insert(k, v);
+            }
+        }
+        {
+            let mut cache = self.pin_cache.borrow_mut();
+            cache.clear();
+            for (k, v) in saved_pin {
+                cache.insert(k, v);
+            }
+        }
+
+        loop_body.push(
+            self.increment_u32_local(expressions, scratch.loop_index, 1),
+            Span::default(),
+        );
+        body.push(
+            Statement::Loop {
+                body: loop_body,
+                continuing: Block::new(),
+                break_if: None,
+            },
+            Span::default(),
+        );
+
+        // Materialize per-accumulator final loads in the outer block; cache them.
+        let mut handles = Vec::with_capacity(n);
+        for local in &acc_locals {
+            let ptr = expressions.append(Expression::LocalVariable(*local), Span::default());
+            let value = expressions.append(Expression::Load { pointer: ptr }, Span::default());
+            body.push(
+                Statement::Emit(Self::single_expression_range(expressions, value)),
+                Span::default(),
+            );
+            handles.push(value);
+        }
+        self.loop_fold_group_cache
+            .borrow_mut()
+            .insert(group, handles.clone());
+        Ok(handles[lane as usize])
+    }
+
+    fn lower_tile_subgroup_reduce_value(
+        &self,
+        expressions: &mut Arena<Expression>,
+        body: &mut Block,
+        value: Handle<Expression>,
+        op: TileReduceOp,
+        element: ElementType,
+    ) -> Result<Handle<Expression>, LowerError> {
+        let subgroup_op = match op {
+            TileReduceOp::Sum => SubgroupOperation::Add,
+            TileReduceOp::Product => SubgroupOperation::Mul,
+            TileReduceOp::Max => SubgroupOperation::Max,
+            TileReduceOp::Min => SubgroupOperation::Min,
+        };
+        let result_ty = match element {
+            ElementType::F32 => self.f32_ty,
+            ElementType::F16 => self
+                .f16_ty
+                .ok_or(LowerError::UnsupportedOperation("subgroup reduce on f16 requires f16 capability"))?,
+            ElementType::U32 => self.u32_ty,
+        };
+        let result = expressions.append(
+            Expression::SubgroupOperationResult { ty: result_ty },
+            Span::default(),
+        );
+        body.push(
+            Statement::SubgroupCollectiveOperation {
+                op: subgroup_op,
+                collective_op: CollectiveOperation::Reduce,
+                argument: value,
+                result,
+            },
+            Span::default(),
+        );
+        Ok(result)
+    }
+
     fn tile_reduce_identity(op: TileReduceOp, element: ElementType) -> Expression {
         match op {
             TileReduceOp::Sum => Self::zero_literal(element),
@@ -928,7 +1412,7 @@ impl<'a> Lowerer<'a> {
         }
     }
 
-    fn lower_tile_index_expr(
+    pub(super) fn lower_tile_index_expr(
         &self,
         expressions: &mut Arena<Expression>,
         scratch: ScratchLocals,
@@ -967,6 +1451,22 @@ impl<'a> Lowerer<'a> {
                     },
                 )
             }
+            TileIndexExpr::SubgroupId => expressions.append(
+                Expression::FunctionArgument(SUBGROUP_ID_ARG),
+                Span::default(),
+            ),
+            TileIndexExpr::SubgroupLane => expressions.append(
+                Expression::FunctionArgument(SUBGROUP_INVOCATION_ID_ARG),
+                Span::default(),
+            ),
+            TileIndexExpr::SubgroupSize => expressions.append(
+                Expression::FunctionArgument(SUBGROUP_SIZE_ARG),
+                Span::default(),
+            ),
+            TileIndexExpr::NumSubgroups => expressions.append(
+                Expression::FunctionArgument(NUM_SUBGROUPS_ARG),
+                Span::default(),
+            ),
             TileIndexExpr::Literal(value) => {
                 expressions.append(Expression::Literal(Literal::U32(*value)), Span::default())
             }
@@ -1095,6 +1595,21 @@ impl<'a> Lowerer<'a> {
             TileExpr::Compare { output, .. } => Ok(*output),
             TileExpr::LoopFold { initial, .. } => Ok(initial.element()),
             TileExpr::GroupReduce { scratch, .. } => Ok(scratch.element),
+            TileExpr::SubgroupReduce { value, .. } => self.tile_expr_element(value),
+            TileExpr::QuantizedBlockLane { .. } => Ok(ElementType::F32),
+            TileExpr::Dot4 { .. } => Ok(ElementType::F32),
+            TileExpr::PinnedRef { .. } => Ok(ElementType::F32),
+            TileExpr::LoopFoldGroupOutput { group, lane } => {
+                let g = self
+                    .ir
+                    .loop_fold_groups
+                    .get(group.index())
+                    .ok_or(LowerError::UnsupportedOperation("unknown fold group"))?;
+                Ok(g.initials
+                    .get(*lane as usize)
+                    .map(|init| init.element())
+                    .unwrap_or(ElementType::F32))
+            }
         }
     }
 

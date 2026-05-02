@@ -10,13 +10,14 @@ mod lower;
 pub mod tile;
 
 pub use ir::{
-    Block, BufferAccess, BufferDecl, BufferId, BufferRef, DynamicOffset, ElementType, F32Bits,
-    FlattenedMatrixMap, GgmlQuantFormat, Im2ColNhwcMap, KernelIr, Layout, LoopOffset, MemoryLevel,
-    Numeric, Op, QuantizedMatrix, Shape, StorageIndexMap, StorageView, Strides, TileBinaryOp,
-    TileCompareOp, TileDecl, TileExpr, TileId, TileIndexExpr, TileLevel, TileLiteral, TileLoadExpr,
-    TileMaskExpr, TileOrigin, TileProgramAccelerator, TileProgramOp, TileQGemvProgramOp,
-    TileQMatmulProgramOp, TileQuantizedLoadExpr, TileReduceOp, TileRef, TileScalarExpr,
-    TileStoreProgramOp, TileUnaryOp, WorkgroupAxis, WorkgroupOffset, F16, F32, U32,
+    BlockDequantId, Block, BufferAccess, BufferDecl, BufferId, BufferRef, CoopAccDecl, CoopAccId,
+    CoopFragmentId, DynamicOffset, ElementType, F32Bits, FlattenedMatrixMap, GgmlQuantFormat,
+    Im2ColNhwcMap, KernelIr, Layout, LoopFoldGroup, LoopFoldGroupId, LoopOffset, MemoryLevel,
+    Numeric, Op, PinId, QuantizedMatrix, Shape, StorageIndexMap, StorageView, Strides,
+    SubgroupStmt, TileBinaryOp, TileCompareOp, TileDecl, TileExpr, TileId, TileIndexExpr, TileLevel,
+    TileLiteral, TileLoadExpr, TileMaskExpr, TileOrigin, TileProgramOp, TileQuantizedLoadExpr,
+    TileReduceOp, TileRef, TileScalarExpr, TileStoreProgramOp, TileUnaryOp, WorkgroupAxis,
+    WorkgroupOffset, F16, F32, U32,
 };
 pub use lower::{LowerError, NagaKernel};
 

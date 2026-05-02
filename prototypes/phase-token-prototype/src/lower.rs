@@ -1,19 +1,21 @@
+use std::cell::RefCell;
+use std::collections::HashMap;
 use std::fmt;
 
 use naga::{
     AddressSpace, Arena, ArraySize, Barrier, BinaryOperator, Binding, Block, BuiltIn,
-    CollectiveOperation, CooperativeData, CooperativeRole, CooperativeSize, EntryPoint, Expression,
-    Function, FunctionArgument, GlobalVariable, Handle, Literal, LocalVariable, MathFunction,
-    Module, Range, ResourceBinding, Scalar, ScalarKind, ShaderStage, Span, Statement,
-    StorageAccess, SubgroupOperation, Type, TypeInner, VectorSize,
+    CollectiveOperation, EntryPoint, Expression, Function, FunctionArgument, GlobalVariable,
+    Handle, Literal, LocalVariable, MathFunction, Module, Range, ResourceBinding, Scalar,
+    ScalarKind, ShaderStage, Span, Statement, StorageAccess, SubgroupOperation, Type, TypeInner,
+    VectorSize,
 };
 
 use crate::ir::{
-    BufferAccess, BufferId, DynamicOffset, ElementType, FlattenedMatrixMap, GgmlQuantFormat,
-    Im2ColNhwcMap, KernelIr, Layout, MemoryLevel, Op, QuantizedMatrix, StorageIndexMap,
-    StorageView, TileBinaryOp, TileCompareOp, TileExpr, TileId, TileIndexExpr, TileLiteral,
-    TileLoadExpr, TileMaskExpr, TileOrigin, TileProgramAccelerator, TileProgramOp,
-    TileQGemvProgramOp, TileQMatmulProgramOp, TileQuantizedLoadExpr, TileReduceOp, TileRef,
+    BlockDequantId, BufferAccess, BufferId, CoopAccId, CoopFragmentId, DynamicOffset, ElementType,
+    F32Bits, FlattenedMatrixMap, GgmlQuantFormat, Im2ColNhwcMap, KernelIr, Layout, LoopFoldGroupId,
+    MemoryLevel, Op, PinId, QuantizedMatrix, StorageIndexMap, StorageView, SubgroupStmt,
+    TileBinaryOp, TileCompareOp, TileExpr, TileId, TileIndexExpr, TileLiteral, TileLoadExpr,
+    TileMaskExpr, TileOrigin, TileProgramOp, TileQuantizedLoadExpr, TileReduceOp, TileRef,
     TileScalarExpr, TileUnaryOp,
 };
 
@@ -25,8 +27,6 @@ const SUBGROUP_SIZE_ARG: u32 = 4;
 const NUM_SUBGROUPS_ARG: u32 = 5;
 const DEFAULT_WORKGROUP_INVOCATIONS: u32 = 256;
 const DEFAULT_WORKGROUP_SIZE: [u32; 3] = [16, 16, 1];
-const COOP_MATRIX_DIM: u32 = 8;
-const COOP_MATRIX_SIZE: CooperativeSize = CooperativeSize::Eight;
 
 pub(crate) fn lower_to_naga(ir: &KernelIr) -> Result<NagaKernel, LowerError> {
     Lowerer::new(ir).lower()
@@ -104,9 +104,6 @@ struct Lowerer<'a> {
     f16_ty: Option<Handle<Type>>,
     u32_ty: Handle<Type>,
     u32_vec3_ty: Handle<Type>,
-    coop_f32_a_ty: Option<Handle<Type>>,
-    coop_f32_b_ty: Option<Handle<Type>>,
-    coop_f32_c_ty: Option<Handle<Type>>,
     buffer_globals: Vec<Option<Handle<GlobalVariable>>>,
     tile_globals: Vec<Option<Handle<GlobalVariable>>>,
     tile_locals: Vec<Option<Handle<LocalVariable>>>,
@@ -114,12 +111,23 @@ struct Lowerer<'a> {
     loop_index_local: Option<Handle<LocalVariable>>,
     workgroup_invocations: u32,
     workgroup_size: [u32; 3],
-    uses_coop_tile_program: bool,
-    coop_subgroups: u32,
     uses_subgroup_id: bool,
     uses_subgroup_invocation_id: bool,
     uses_subgroup_size: bool,
     uses_num_subgroups: bool,
+    block_dequant_cache: RefCell<HashMap<BlockDequantId, Vec<Handle<Expression>>>>,
+    pin_cache: RefCell<HashMap<PinId, Handle<Expression>>>,
+    loop_fold_group_cache: RefCell<HashMap<LoopFoldGroupId, Vec<Handle<Expression>>>>,
+    fold_accumulator_locals: Vec<Handle<LocalVariable>>,
+    fold_group_offsets: Vec<usize>,
+    coop_c_ty: Option<Handle<Type>>,
+    coop_acc_locals: Vec<Handle<LocalVariable>>,
+    coop_fragment_cache: RefCell<HashMap<CoopFragmentId, Handle<Expression>>>,
+    /// Latest SSA value of each cooperative accumulator. Lets MMAs chain
+    /// through SSA — `mma(c=load)` once, then `mma(c=last_ssa)` for the rest
+    /// of the scope, with a single Store at scope end.
+    coop_acc_value_cache: RefCell<HashMap<CoopAccId, Handle<Expression>>>,
+    uses_cooperative_matrix: bool,
 }
 
 #[derive(Copy, Clone)]
@@ -127,23 +135,15 @@ struct ScratchLocals {
     loop_index: Handle<LocalVariable>,
     values: [Handle<LocalVariable>; 3],
     spills: [[Handle<LocalVariable>; 32]; 3],
-    coop_accs: [Option<Handle<LocalVariable>>; 16],
-}
-
-#[derive(Copy, Clone)]
-enum CoopPartition {
-    Single,
-    Columns,
-    Rows,
-    InterleavedGrid { row_groups: u32, col_groups: u32 },
+    block_dequant: [Handle<LocalVariable>; 16],
 }
 
 mod analysis;
 mod block;
 mod control;
+mod coop;
 mod indexing;
 mod math;
 mod quantized;
 mod setup;
 mod tile_program;
-mod tile_qmatmul;

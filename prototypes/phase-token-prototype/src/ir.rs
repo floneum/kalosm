@@ -10,6 +10,88 @@ pub struct KernelIr {
     pub(crate) body: Block,
     pub(crate) next_buffer: u32,
     pub(crate) next_tile: u32,
+    pub(crate) next_block_dequant: u32,
+    /// Side table of pinned subexpressions, indexed by `PinId`. The lowerer
+    /// emits each entry into a private local on first reference and reuses the
+    /// load on subsequent references in the same scope.
+    pub(crate) pinned_values: Vec<TileExpr>,
+    /// Side table of multi-output loop-fold groups, indexed by
+    /// `LoopFoldGroupId`. Lowering materializes one Naga loop per group with N
+    /// parallel accumulators.
+    pub(crate) loop_fold_groups: Vec<LoopFoldGroup>,
+    /// Declared cooperative-matrix accumulators. Each entry maps to an 8x8 f32
+    /// CooperativeMatrix-typed function local.
+    pub(crate) coop_accs: Vec<CoopAccDecl>,
+    /// Counter for cooperative-matrix fragment SSA names.
+    pub(crate) next_coop_fragment: u32,
+}
+
+/// Identifier of a cooperative-matrix accumulator local.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+pub struct CoopAccId(pub(crate) u32);
+
+impl CoopAccId {
+    pub const fn index(self) -> usize {
+        self.0 as usize
+    }
+}
+
+/// Declaration of a cooperative-matrix accumulator. Currently only 8x8 f32
+/// `C`-role fragments are supported.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct CoopAccDecl {
+    pub id: CoopAccId,
+    pub rows: u32,
+    pub cols: u32,
+}
+
+/// Identifier of a cooperatively-loaded fragment (SSA-cached).
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+pub struct CoopFragmentId(pub(crate) u32);
+
+impl CoopFragmentId {
+    pub const fn index(self) -> usize {
+        self.0 as usize
+    }
+}
+
+/// Identifier of a pinned subexpression.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+pub struct PinId(pub(crate) u32);
+
+impl PinId {
+    pub const fn index(self) -> usize {
+        self.0 as usize
+    }
+}
+
+/// Identifier of a multi-output loop-fold group.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+pub struct LoopFoldGroupId(pub(crate) u32);
+
+impl LoopFoldGroupId {
+    pub const fn index(self) -> usize {
+        self.0 as usize
+    }
+}
+
+/// A K-loop that accumulates N parallel reductions sharing one body.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LoopFoldGroup {
+    pub iterations: u32,
+    pub op: TileReduceOp,
+    pub initials: Vec<TileLiteral>,
+    pub bodies: Vec<TileExpr>,
+}
+
+/// Identifier shared by lanes of one fused quantized-block dequant.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+pub struct BlockDequantId(pub(crate) u32);
+
+impl BlockDequantId {
+    pub const fn index(self) -> usize {
+        self.0 as usize
+    }
 }
 
 impl KernelIr {
@@ -26,6 +108,11 @@ impl KernelIr {
     /// The structured root body of the kernel.
     pub fn body(&self) -> &Block {
         &self.body
+    }
+
+    /// Cooperative-matrix accumulators declared by the kernel body.
+    pub fn coop_accs(&self) -> &[CoopAccDecl] {
+        &self.coop_accs
     }
 
     /// Lower this IR into a validated Naga module.
@@ -341,49 +428,92 @@ pub struct QuantizedMatrix {
     pub cols: u32,
 }
 
-/// A small Triton-like source tile program.
-///
-/// The first lowering target supports one-dimensional lane tiles: each
-/// invocation owns one lane, reductions use scratch tiles, and storage accesses
-/// are expressed through typed index expressions.
+/// A Triton-like source tile program. Per-lane stores live in `stores`;
+/// subgroup-collective ops (cooperative-matrix MMA, workgroup-tile copies,
+/// barriers, K loops over coop ops) live in `coop_body`. Both are produced by
+/// the user via `TileBlock` primitives — there is no hidden accelerator pass.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TileProgramOp {
     pub grid: [u32; 3],
     pub block: u32,
     pub stores: Vec<TileStoreProgramOp>,
-    pub accelerator: Option<TileProgramAccelerator>,
+    pub coop_body: Vec<SubgroupStmt>,
 }
 
-/// A structured tile-program body lowered with backend tile acceleration.
+/// One statement in the subgroup-collective body of a tile program.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum TileProgramAccelerator {
-    QMatmul(TileQMatmulProgramOp),
-    QGemv(TileQGemvProgramOp),
-}
-
-/// Cooperative tile qmatmul body. The operation remains inside
-/// [`Op::TileProgram`], but is kept structured so the lowerer can emit native
-/// 8x8 cooperative matrix fragments instead of scalarizing the tile program.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct TileQMatmulProgramOp {
-    pub a: StorageView,
-    pub b: QuantizedMatrix,
-    pub y: StorageView,
-    pub a_tile: TileRef,
-    pub b_tile: TileRef,
-    pub tile_m: u32,
-    pub tile_n: u32,
-    pub tile_k: u32,
-}
-
-/// Subgroup tile qgemv body for the single-row qmatmul case. It is represented
-/// as a [`TileProgram`] accelerator so the public op surface stays uniform.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct TileQGemvProgramOp {
-    pub a: StorageView,
-    pub b: QuantizedMatrix,
-    pub y: StorageView,
-    pub workgroups_x: u32,
+pub enum SubgroupStmt {
+    /// Zero-initialize a coop accumulator.
+    ZeroCoopAcc { id: CoopAccId },
+    /// Cooperatively copy a workgroup-tile-sized region of a storage view into
+    /// a workgroup tile (one element per invocation per pass). `row_offset`
+    /// and `col_offset` are evaluated in the surrounding scope (e.g. inside a
+    /// K loop body they may reference `loop_index`).
+    CopyToWorkgroupTile {
+        dst: TileRef,
+        src: StorageView,
+        row_offset: TileIndexExpr,
+        col_offset: TileIndexExpr,
+    },
+    /// Same as `CopyToWorkgroupTile` but dequantizing on the fly from a packed
+    /// quantized matrix. `dst` must be an f32 workgroup tile.
+    CopyQuantToWorkgroupTile {
+        dst: TileRef,
+        src: QuantizedMatrix,
+        row_offset: TileIndexExpr,
+        col_offset: TileIndexExpr,
+    },
+    /// Workgroup-scope memory barrier.
+    Barrier,
+    /// `acc += coop_load_a(a_tile, a_row, a_col) * coop_load_b(b_tile, b_row, b_col)`.
+    /// Tile coordinates are the (row, col) of the 8x8 fragment within the
+    /// respective workgroup tile.
+    MmaFromTiles {
+        acc: CoopAccId,
+        a_tile: TileRef,
+        a_row: TileIndexExpr,
+        a_col: TileIndexExpr,
+        b_tile: TileRef,
+        b_row: TileIndexExpr,
+        b_col: TileIndexExpr,
+    },
+    /// Cooperatively load an 8x8 A fragment from a workgroup tile and bind it
+    /// to `id` for subsequent `Mma` references in the same scope.
+    LoadCoopA {
+        id: CoopFragmentId,
+        tile: TileRef,
+        row: TileIndexExpr,
+        col: TileIndexExpr,
+    },
+    /// Cooperatively load an 8x8 B fragment from a workgroup tile and bind it
+    /// to `id`.
+    LoadCoopB {
+        id: CoopFragmentId,
+        tile: TileRef,
+        row: TileIndexExpr,
+        col: TileIndexExpr,
+    },
+    /// `acc += a * b` where `a`/`b` are previously loaded fragments. Letting
+    /// the user load fragments separately lets one A/B load be reused across
+    /// many MMAs (e.g. across the inner row × col grid in qmatmul).
+    Mma {
+        acc: CoopAccId,
+        a: CoopFragmentId,
+        b: CoopFragmentId,
+    },
+    /// Cooperatively store an accumulator to a global storage view.
+    StoreCoopAcc {
+        acc: CoopAccId,
+        dst: StorageView,
+        row: TileIndexExpr,
+        col: TileIndexExpr,
+    },
+    /// Fixed-iteration loop. Inside the body, `TileIndexExpr::LoopIndex`
+    /// resolves to the loop induction variable.
+    KLoop {
+        iterations: u32,
+        body: Vec<SubgroupStmt>,
+    },
 }
 
 /// A masked tile store emitted by a source tile program.
@@ -473,6 +603,43 @@ pub enum TileExpr {
         scratch: TileRef,
         group_size: u32,
     },
+    /// Reduction across the lanes of one subgroup. Lowers to
+    /// `subgroupAdd`/`subgroupMax`/`subgroupMin` — no shared-memory tree, no
+    /// workgroup-shape divisibility constraint.
+    SubgroupReduce {
+        op: TileReduceOp,
+        value: Box<TileExpr>,
+    },
+    /// One lane of a fused N-wide quantized dequant. All lanes of the same
+    /// `id` share the block scale lookup; the lowerer emits the helper once
+    /// and reuses the result across lanes.
+    QuantizedBlockLane {
+        id: BlockDequantId,
+        src: QuantizedMatrix,
+        k_base: TileIndexExpr,
+        col: TileIndexExpr,
+        mask: TileMaskExpr,
+        fill: F32Bits,
+        block_n: u32,
+        lane: u32,
+    },
+    /// Fused 4-way dot product. Lowers to a single `Math::Dot` over composed
+    /// `vec4<f32>` operands — the same pattern the qgemv accelerator emits.
+    Dot4 {
+        a: [Box<TileExpr>; 4],
+        b: [Box<TileExpr>; 4],
+    },
+    /// Reference to a pinned subexpression. The first reference in a scope
+    /// lowers the bound value into a private local; subsequent references in
+    /// the same scope reuse it.
+    PinnedRef { id: PinId },
+    /// Reference to one accumulator output of a multi-output loop-fold group.
+    /// The first reference materializes the shared K-loop; subsequent
+    /// references reuse the per-accumulator local.
+    LoopFoldGroupOutput {
+        group: LoopFoldGroupId,
+        lane: u32,
+    },
 }
 
 /// A masked rank-1 tile load.
@@ -518,6 +685,14 @@ pub enum TileIndexExpr {
     Lane,
     LoopIndex,
     ProgramId(WorkgroupAxis),
+    /// `@builtin(subgroup_id)` — index of the subgroup within the workgroup.
+    SubgroupId,
+    /// `@builtin(subgroup_invocation_id)` — lane within the current subgroup.
+    SubgroupLane,
+    /// `@builtin(subgroup_size)` — runtime subgroup size.
+    SubgroupSize,
+    /// `@builtin(num_subgroups)` — number of subgroups per workgroup.
+    NumSubgroups,
     Literal(u32),
     Add(Box<TileIndexExpr>, Box<TileIndexExpr>),
     Mul(Box<TileIndexExpr>, u32),

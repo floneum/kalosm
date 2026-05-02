@@ -58,58 +58,32 @@ impl<'a> Lowerer<'a> {
             },
             Span::default(),
         );
-        let coop_subgroups = Self::max_tile_program_coop_subgroups(ir);
-        let uses_coop_tile_program = coop_subgroups > 0;
-        let uses_tile_qgemv = Self::uses_tile_qgemv(ir);
-        let uses_subgroup_id = coop_subgroups > 1 || uses_tile_qgemv;
-        let uses_subgroup_invocation_id = uses_tile_qgemv;
-        let uses_subgroup_size = uses_tile_qgemv;
-        let uses_num_subgroups = uses_tile_qgemv;
-        let (coop_f32_a_ty, coop_f32_b_ty, coop_f32_c_ty) = if uses_coop_tile_program {
-            let coop_f32_a_ty = module.types.insert(
-                Type {
-                    name: Some("CoopA8x8F32".into()),
-                    inner: TypeInner::CooperativeMatrix {
-                        columns: COOP_MATRIX_SIZE,
-                        rows: COOP_MATRIX_SIZE,
-                        scalar: Scalar::F32,
-                        role: CooperativeRole::A,
-                    },
-                },
-                Span::default(),
-            );
-            let coop_f32_b_ty = module.types.insert(
-                Type {
-                    name: Some("CoopB8x8F32".into()),
-                    inner: TypeInner::CooperativeMatrix {
-                        columns: COOP_MATRIX_SIZE,
-                        rows: COOP_MATRIX_SIZE,
-                        scalar: Scalar::F32,
-                        role: CooperativeRole::B,
-                    },
-                },
-                Span::default(),
-            );
-            let coop_f32_c_ty = module.types.insert(
+        let uses_subgroup_reduce = Self::uses_subgroup_reduce(ir);
+        let uses_cooperative_matrix = Self::uses_cooperative_matrix(ir);
+        let uses_subgroup_id_idx = Self::uses_index_kind(ir, super::analysis::SubgroupIndexKind::SubgroupId);
+        let uses_subgroup_lane_idx = Self::uses_index_kind(ir, super::analysis::SubgroupIndexKind::SubgroupLane);
+        let uses_subgroup_size_idx = Self::uses_index_kind(ir, super::analysis::SubgroupIndexKind::SubgroupSize);
+        let uses_num_subgroups_idx = Self::uses_index_kind(ir, super::analysis::SubgroupIndexKind::NumSubgroups);
+        let uses_subgroup_id =
+            uses_subgroup_reduce || uses_subgroup_id_idx || uses_cooperative_matrix;
+        let uses_subgroup_invocation_id = uses_subgroup_lane_idx;
+        let uses_subgroup_size = uses_subgroup_size_idx;
+        let uses_num_subgroups = uses_num_subgroups_idx;
+
+        let coop_c_ty = uses_cooperative_matrix.then(|| {
+            module.types.insert(
                 Type {
                     name: Some("CoopC8x8F32".into()),
                     inner: TypeInner::CooperativeMatrix {
-                        columns: COOP_MATRIX_SIZE,
-                        rows: COOP_MATRIX_SIZE,
+                        columns: naga::CooperativeSize::Eight,
+                        rows: naga::CooperativeSize::Eight,
                         scalar: Scalar::F32,
-                        role: CooperativeRole::C,
+                        role: naga::CooperativeRole::C,
                     },
                 },
                 Span::default(),
-            );
-            (
-                Some(coop_f32_a_ty),
-                Some(coop_f32_b_ty),
-                Some(coop_f32_c_ty),
             )
-        } else {
-            (None, None, None)
-        };
+        });
 
         let tile_program_block = Self::max_tile_program_block(ir);
         let (workgroup_invocations, workgroup_size) = if tile_program_block > 0 {
@@ -127,9 +101,6 @@ impl<'a> Lowerer<'a> {
             f16_ty,
             u32_ty,
             u32_vec3_ty,
-            coop_f32_a_ty,
-            coop_f32_b_ty,
-            coop_f32_c_ty,
             buffer_globals: Vec::new(),
             tile_globals: Vec::new(),
             tile_locals: Vec::new(),
@@ -137,12 +108,20 @@ impl<'a> Lowerer<'a> {
             loop_index_local: None,
             workgroup_invocations,
             workgroup_size,
-            uses_coop_tile_program,
-            coop_subgroups,
             uses_subgroup_id,
             uses_subgroup_invocation_id,
             uses_subgroup_size,
             uses_num_subgroups,
+            block_dequant_cache: std::cell::RefCell::new(std::collections::HashMap::new()),
+            pin_cache: std::cell::RefCell::new(std::collections::HashMap::new()),
+            loop_fold_group_cache: std::cell::RefCell::new(std::collections::HashMap::new()),
+            fold_accumulator_locals: Vec::new(),
+            fold_group_offsets: Vec::new(),
+            coop_c_ty,
+            coop_acc_locals: Vec::new(),
+            coop_fragment_cache: std::cell::RefCell::new(std::collections::HashMap::new()),
+            coop_acc_value_cache: std::cell::RefCell::new(std::collections::HashMap::new()),
+            uses_cooperative_matrix,
         }
     }
 
@@ -199,6 +178,8 @@ impl<'a> Lowerer<'a> {
         let scratch = self.create_scratch_locals(&mut function);
         self.loop_index_local = Some(scratch.loop_index);
         self.create_private_locals(&mut function)?;
+        self.create_fold_group_locals(&mut function);
+        self.create_coop_acc_locals(&mut function);
 
         function.body = self.lower_block(self.ir.body(), &mut function.expressions, scratch)?;
         function
@@ -221,11 +202,11 @@ impl<'a> Lowerer<'a> {
         if self.f16_ty.is_some() {
             capabilities |= naga::valid::Capabilities::SHADER_FLOAT16;
         }
-        if self.uses_coop_tile_program {
-            capabilities |= naga::valid::Capabilities::COOPERATIVE_MATRIX;
-        }
         if self.uses_subgroup_id {
             capabilities |= naga::valid::Capabilities::SUBGROUP;
+        }
+        if self.uses_cooperative_matrix {
+            capabilities |= naga::valid::Capabilities::COOPERATIVE_MATRIX;
         }
         let info = naga::valid::Validator::new(naga::valid::ValidationFlags::all(), capabilities)
             .validate(&self.module)
@@ -328,13 +309,6 @@ impl<'a> Lowerer<'a> {
     }
 
     pub(super) fn create_scratch_locals(&self, function: &mut Function) -> ScratchLocals {
-        let mut coop_accs = [None; 16];
-        if let Some(ty) = self.coop_f32_c_ty {
-            for (index, local) in coop_accs.iter_mut().enumerate() {
-                *local = Some(self.create_local(function, &format!("coop_acc_{index}"), ty));
-            }
-        }
-
         ScratchLocals {
             loop_index: self.create_u32_local(function, "loop_index"),
             values: [
@@ -353,8 +327,36 @@ impl<'a> Lowerer<'a> {
                     self.create_u32_local(function, &format!("tile_spill_u32_{index}"))
                 }),
             ],
-            coop_accs,
+            block_dequant: std::array::from_fn(|index| {
+                self.create_f32_local(function, &format!("tile_block_dequant_{index}"))
+            }),
         }
+    }
+
+    pub(super) fn create_coop_acc_locals(&mut self, function: &mut Function) {
+        if let Some(ty) = self.coop_c_ty {
+            self.coop_acc_locals = self
+                .ir
+                .coop_accs
+                .iter()
+                .map(|decl| {
+                    self.create_local(function, &format!("coop_acc_{}", decl.id.index()), ty)
+                })
+                .collect();
+        }
+    }
+
+    pub(super) fn create_fold_group_locals(&mut self, function: &mut Function) {
+        let mut offsets = Vec::with_capacity(self.ir.loop_fold_groups.len());
+        let mut total = 0usize;
+        for group in &self.ir.loop_fold_groups {
+            offsets.push(total);
+            total += group.initials.len();
+        }
+        self.fold_group_offsets = offsets;
+        self.fold_accumulator_locals = (0..total)
+            .map(|i| self.create_f32_local(function, &format!("fold_acc_{i}")))
+            .collect();
     }
 
     pub(super) fn create_u32_local(
@@ -471,17 +473,7 @@ impl<'a> Lowerer<'a> {
                     || Self::tile_index_expr_uses_f16(&store.col)
                     || Self::tile_mask_expr_uses_f16(&store.mask)
                     || Self::tile_expr_uses_f16(&store.value)
-            }) || matches!(
-                &op.accelerator,
-                Some(TileProgramAccelerator::QMatmul(qmatmul))
-                    if qmatmul.a.buffer.element == ElementType::F16
-                        || qmatmul.y.buffer.element == ElementType::F16
-            ) || matches!(
-                &op.accelerator,
-                Some(TileProgramAccelerator::QGemv(qgemv))
-                    if qgemv.a.buffer.element == ElementType::F16
-                        || qgemv.y.buffer.element == ElementType::F16
-            )
+            })
         })
     }
 
@@ -534,6 +526,19 @@ impl<'a> Lowerer<'a> {
             TileExpr::GroupReduce { value, scratch, .. } => {
                 scratch.element == ElementType::F16 || Self::tile_expr_uses_f16(value)
             }
+            TileExpr::SubgroupReduce { value, .. } => Self::tile_expr_uses_f16(value),
+            TileExpr::QuantizedBlockLane {
+                k_base, col, mask, ..
+            } => {
+                Self::tile_index_expr_uses_f16(k_base)
+                    || Self::tile_index_expr_uses_f16(col)
+                    || Self::tile_mask_expr_uses_f16(mask)
+            }
+            TileExpr::Dot4 { a, b } => a
+                .iter()
+                .chain(b.iter())
+                .any(|expr| Self::tile_expr_uses_f16(expr)),
+            TileExpr::PinnedRef { .. } | TileExpr::LoopFoldGroupOutput { .. } => false,
         }
     }
 
@@ -552,6 +557,10 @@ impl<'a> Lowerer<'a> {
             TileIndexExpr::Lane
             | TileIndexExpr::LoopIndex
             | TileIndexExpr::ProgramId(_)
+            | TileIndexExpr::SubgroupId
+            | TileIndexExpr::SubgroupLane
+            | TileIndexExpr::SubgroupSize
+            | TileIndexExpr::NumSubgroups
             | TileIndexExpr::Literal(_) => false,
             TileIndexExpr::Add(left, right) => {
                 Self::tile_index_expr_uses_f16(left) || Self::tile_index_expr_uses_f16(right)

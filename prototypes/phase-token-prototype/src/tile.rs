@@ -2,12 +2,13 @@ use std::marker::PhantomData;
 use std::ops::{Add, Div, Mul, Rem, Sub};
 
 use crate::{
-    BufferAccess, BufferDecl, BufferRef, DynamicOffset, F32Bits, GgmlQuantFormat, Im2ColNhwcMap,
-    KernelIr, Layout, MemoryLevel, Numeric, Op, QuantizedMatrix, Shape, StorageIndexMap,
-    StorageView, TileBinaryOp, TileCompareOp, TileDecl, TileExpr, TileIndexExpr, TileLevel,
-    TileLiteral, TileLoadExpr, TileMaskExpr, TileOrigin, TileProgramAccelerator, TileProgramOp,
-    TileQGemvProgramOp, TileQMatmulProgramOp, TileQuantizedLoadExpr, TileReduceOp, TileRef,
-    TileScalarExpr, TileStoreProgramOp, TileUnaryOp, WorkgroupAxis, WorkgroupOffset, F32, U32,
+    BlockDequantId, BufferAccess, BufferDecl, BufferRef, CoopAccDecl, CoopAccId, CoopFragmentId,
+    DynamicOffset, F32Bits, GgmlQuantFormat, Im2ColNhwcMap, KernelIr, Layout, LoopFoldGroup,
+    LoopFoldGroupId, MemoryLevel, Numeric, Op, PinId, QuantizedMatrix, Shape, StorageIndexMap,
+    StorageView, SubgroupStmt, TileBinaryOp, TileCompareOp, TileDecl, TileExpr, TileIndexExpr,
+    TileLevel, TileLiteral, TileLoadExpr, TileMaskExpr, TileOrigin, TileProgramOp,
+    TileQuantizedLoadExpr, TileReduceOp, TileRef, TileScalarExpr, TileStoreProgramOp, TileUnaryOp,
+    WorkgroupAxis, WorkgroupOffset, F32, U32,
 };
 
 /// Build a Triton-like source tile IR.
@@ -259,31 +260,28 @@ impl Program {
         y: &Storage<F32, 2>,
         workgroups_x: u32,
     ) {
-        let [m, k] = matrix_shape(&a.view.layout);
+        let [m, _] = matrix_shape(&a.view.layout);
         assert_eq!(m, 1, "qgemv requires a single input row");
-        let large_q5_0_gemv = b.format == GgmlQuantFormat::Q5_0
-            && b.rows
-                .checked_mul(b.cols)
-                .is_some_and(|elements| elements >= 4 * 1024 * 1024);
-        let wide_q8_0_gemv = b.format == GgmlQuantFormat::Q8_0 && b.rows <= 1024 && b.cols >= 8192;
-        if b.format == GgmlQuantFormat::Q4K || large_q5_0_gemv || wide_q8_0_gemv {
-            let cols_per_workgroup = b.format.qgemv_cols_per_workgroup();
-            let total_workgroups = b.cols.div_ceil(cols_per_workgroup);
-            let dispatch_y = total_workgroups.div_ceil(workgroups_x);
-            self.ir.body.push(Op::TileProgram(TileProgramOp {
-                grid: [workgroups_x, dispatch_y, 1],
-                block: b.format.qgemv_subgroups_per_workgroup() * 32,
-                stores: Vec::new(),
-                accelerator: Some(TileProgramAccelerator::QGemv(TileQGemvProgramOp {
-                    a: a.view.clone(),
-                    b: b.clone(),
-                    y: y.view.clone(),
-                    workgroups_x,
-                })),
-            }));
-            return;
+
+        // Format-specific perf-parity path. Mirrors the cols-per-subgroup,
+        // subgroups-per-workgroup, and values-per-lane layout the old
+        // `lower_tile_qgemv_subgroup` accelerator used for these formats.
+        match b.format {
+            GgmlQuantFormat::Q8_0 => {
+                return self.qgemv_perf::<4, 4, 8, 128>(a, b, y, workgroups_x);
+            }
+            GgmlQuantFormat::Q4K => {
+                return self.qgemv_perf::<4, 2, 8, 128>(a, b, y, workgroups_x);
+            }
+            GgmlQuantFormat::Q5_0 => {
+                return self.qgemv_perf::<2, 4, 16, 64>(a, b, y, workgroups_x);
+            }
+            _ => {}
         }
 
+        // Scalar primitive fallback for formats without a vectorized block
+        // dequant helper.
+        let [_, k] = matrix_shape(&a.view.layout);
         const LANES: usize = 256;
         assert!(
             BN > 0 && BK > 0 && BN * BK == LANES && BN.is_power_of_two() && BK.is_power_of_two(),
@@ -316,6 +314,101 @@ impl Program {
         });
     }
 
+    fn qgemv_perf<
+        const SUBGROUPS: u32,
+        const COLS_PER_SUBGROUP: usize,
+        const VALUES_PER_LANE: usize,
+        const BLOCK: usize,
+    >(
+        &mut self,
+        a: &Storage<F32, 2>,
+        b: &QuantizedMatrix,
+        y: &Storage<F32, 2>,
+        workgroups_x: u32,
+    ) {
+        const SUBGROUP_SIZE: u32 = 32;
+        debug_assert_eq!(SUBGROUPS * SUBGROUP_SIZE, BLOCK as u32);
+        debug_assert!(VALUES_PER_LANE == 8 || VALUES_PER_LANE == 16);
+        debug_assert!(COLS_PER_SUBGROUP == 2 || COLS_PER_SUBGROUP == 4);
+        let [_, k] = matrix_shape(&a.view.layout);
+        let cols_per_workgroup = SUBGROUPS * COLS_PER_SUBGROUP as u32;
+        let total_workgroups = b.cols.div_ceil(cols_per_workgroup);
+        let dispatch_y = total_workgroups.div_ceil(workgroups_x);
+        let k_per_iter = SUBGROUP_SIZE * VALUES_PER_LANE as u32;
+        let k_iterations = k.div_ceil(k_per_iter);
+        let n_cols = b.cols;
+        let k_size = k;
+        let b_cloned = b.clone();
+        self.program_grid::<BLOCK>([workgroups_x, dispatch_y, 1], |program| {
+            let workgroup = program.program_id(WorkgroupAxis::X)
+                + program.program_id(WorkgroupAxis::Y) * workgroups_x;
+            let col_group_base = workgroup * cols_per_workgroup;
+            let subgroup_col_base = program.subgroup_id() * COLS_PER_SUBGROUP as u32;
+            let col0 = col_group_base + subgroup_col_base;
+            let lane = program.subgroup_lane();
+
+            let zero = TileLiteral::F32(F32Bits::new(0.0));
+            let sums: [Tile<BLOCK>; COLS_PER_SUBGROUP] = program.loop_fold_n::<COLS_PER_SUBGROUP, _>(
+                TileReduceOp::Sum,
+                k_iterations,
+                [zero; COLS_PER_SUBGROUP],
+                |program| {
+                    let k_base = program.loop_index() * k_per_iter
+                        + lane.clone() * VALUES_PER_LANE as u32;
+                    let in_bounds_k = k_base.lt(k_size);
+
+                    // Pin all A scalars so each is computed once per iteration
+                    // and reused across all COLS_PER_SUBGROUP dot products.
+                    let a_pins: [Pinned<BLOCK>; VALUES_PER_LANE] = std::array::from_fn(|i| {
+                        let scalar = program.load(
+                            a.at(0, k_base.clone() + i as u32),
+                            in_bounds_k.clone(),
+                            0.0,
+                        );
+                        program.pin(scalar)
+                    });
+
+                    std::array::from_fn(|c| {
+                        let col = col0.clone() + c as u32;
+                        let mask = in_bounds_k.clone().and(col.lt(n_cols));
+                        let bs: [Tile<BLOCK>; VALUES_PER_LANE] =
+                            program.load_quantized_block::<VALUES_PER_LANE>(
+                                &b_cloned,
+                                &k_base,
+                                &col,
+                                mask,
+                                0.0,
+                            );
+                        // VALUES_PER_LANE / 4 dot4s, summed.
+                        let mut sum: Option<Tile<BLOCK>> = None;
+                        let chunks = VALUES_PER_LANE / 4;
+                        for chunk in 0..chunks {
+                            let a_vec: [Tile<BLOCK>; 4] = std::array::from_fn(|i| {
+                                a_pins[chunk * 4 + i].get()
+                            });
+                            let b_vec: [Tile<BLOCK>; 4] = std::array::from_fn(|i| {
+                                bs[chunk * 4 + i].clone()
+                            });
+                            let term = program.dot4(a_vec, b_vec);
+                            sum = Some(match sum {
+                                Some(prev) => prev + term,
+                                None => term,
+                            });
+                        }
+                        sum.expect("VALUES_PER_LANE >= 4")
+                    })
+                },
+            );
+
+            for (offset, sum) in sums.into_iter().enumerate() {
+                let col = col0.clone() + offset as u32;
+                let reduced = program.subgroup_reduce_sum(sum);
+                let mask = lane.eq(0).and(col.lt(n_cols));
+                program.store(y.at(0, col), reduced, mask);
+            }
+        });
+    }
+
     fn qmatmul_tile<const BM: usize, const BN: usize, const BK: usize>(
         &mut self,
         a: &Storage<F32, 2>,
@@ -328,40 +421,42 @@ impl Program {
             "qmatmul tile shape must be non-zero"
         );
         let [m, k] = matrix_shape(&a.view.layout);
-        let coop_subgroups = qmatmul_coop_subgroups(BM as u32, BN as u32);
-        if let Some(subgroups) = coop_subgroups
-            .filter(|_| BK.is_multiple_of(8))
-            .filter(|_| BK == 16 || BK == 32)
-            .filter(|_| m.is_multiple_of(BM as u32))
-            .filter(|_| b.cols.is_multiple_of(BN as u32))
-            .filter(|_| k.is_multiple_of(BK as u32))
-            .filter(|_| cooperative_store_layout_supported(&y.view.layout))
-        {
-            let a_tile = self.alloc_tile::<F32>(
-                Layout::contiguous(MemoryLevel::Workgroup, Shape::new([BM as u32, BK as u32])),
-                TileLevel::Workgroup,
-            );
-            let b_tile = self.alloc_tile::<F32>(
-                Layout::contiguous(MemoryLevel::Workgroup, Shape::new([BK as u32, BN as u32])),
-                TileLevel::Workgroup,
-            );
-            self.ir.body.push(Op::TileProgram(TileProgramOp {
-                grid: [b.cols.div_ceil(BN as u32), m.div_ceil(BM as u32), 1],
-                block: subgroups * 32,
-                stores: Vec::new(),
-                accelerator: Some(TileProgramAccelerator::QMatmul(TileQMatmulProgramOp {
-                    a: a.view.clone(),
-                    b: b.clone(),
-                    y: y.view.clone(),
-                    a_tile,
-                    b_tile,
-                    tile_m: BM as u32,
-                    tile_n: BN as u32,
-                    tile_k: BK as u32,
-                })),
-            }));
-            return;
+
+        // Cooperative-matrix perf-parity path. Mirrors the layout the deleted
+        // `lower_tile_qmatmul_coop` used for tile shapes that fit a 2D
+        // subgroup grid of 32x32 regions, each holding 4x4 = 16 fragments.
+        let coop_eligible = BK == 32
+            && BM % 32 == 0
+            && BN % 32 == 0
+            && m as usize % BM == 0
+            && b.cols as usize % BN == 0
+            && k as usize % BK == 0
+            && cooperative_store_layout_supported(&y.view.layout);
+        if coop_eligible {
+            // Choose an interleaved subgroup grid so each subgroup owns a
+            // 32x32 sub-tile. row_groups * col_groups == subgroups.
+            let row_groups = (BM as u32) / 32;
+            let col_groups = (BN as u32) / 32;
+            let subgroups = row_groups * col_groups;
+            if subgroups <= 16 {
+                match (BM, BN, subgroups) {
+                    (64, 64, 4) => {
+                        return self.qmatmul_perf::<64, 64, 32, 2, 2, 128>(a, b, y);
+                    }
+                    (64, 128, 8) => {
+                        return self.qmatmul_perf::<64, 128, 32, 2, 4, 256>(a, b, y);
+                    }
+                    (128, 64, 8) => {
+                        return self.qmatmul_perf::<128, 64, 32, 4, 2, 256>(a, b, y);
+                    }
+                    (128, 128, 16) => {
+                        return self.qmatmul_perf::<128, 128, 32, 4, 4, 512>(a, b, y);
+                    }
+                    _ => {}
+                }
+            }
         }
+
         if BM * BN * BK != LANES || !BK.is_power_of_two() {
             self.qmatmul_tile::<8, 4, 8>(a, b, y);
             return;
@@ -393,6 +488,125 @@ impl Program {
                 program.store(y.at(row, col), sum, store_mask);
             },
         );
+    }
+
+    /// Cooperative-matrix qmatmul body. Each workgroup produces one BMxBN
+    /// output tile via an interleaved `ROW_GROUPS x COL_GROUPS` grid of
+    /// subgroups, each holding `(32*32)/(8*8)` = 16 cooperative-matrix
+    /// accumulators. `BLOCK == ROW_GROUPS * COL_GROUPS * 32`.
+    fn qmatmul_perf<
+        const BM: usize,
+        const BN: usize,
+        const BK: usize,
+        const ROW_GROUPS: u32,
+        const COL_GROUPS: u32,
+        const BLOCK: usize,
+    >(
+        &mut self,
+        a: &Storage<F32, 2>,
+        b: &QuantizedMatrix,
+        y: &Storage<F32, 2>,
+    ) {
+        const COOP_DIM: u32 = 8;
+        const SUBGROUP_SIZE: u32 = 32;
+        const SUBGROUP_ROWS: u32 = 32;
+        const SUBGROUP_COLS: u32 = 32;
+        debug_assert_eq!(ROW_GROUPS * SUBGROUP_ROWS, BM as u32);
+        debug_assert_eq!(COL_GROUPS * SUBGROUP_COLS, BN as u32);
+        debug_assert_eq!(ROW_GROUPS * COL_GROUPS * SUBGROUP_SIZE, BLOCK as u32);
+
+        let [m, k] = matrix_shape(&a.view.layout);
+        let n = b.cols;
+        let n_grid_x = n / BN as u32;
+        let n_grid_y = m / BM as u32;
+        let k_iterations = k / BK as u32;
+
+        let a_tile = self.alloc_workgroup_tile_f32(BM as u32, BK as u32);
+        let b_tile = self.alloc_workgroup_tile_f32(BK as u32, BN as u32);
+        let b_clone = b.clone();
+        let a_clone = a.clone();
+        let y_clone = y.clone();
+
+        const TILE_ROWS_PER_SG: u32 = SUBGROUP_ROWS / 8;
+        const TILE_COLS_PER_SG: u32 = SUBGROUP_COLS / 8;
+
+        self.program_grid::<BLOCK>([n_grid_x, n_grid_y, 1], |program| {
+            let row_base = program.program_id(WorkgroupAxis::Y) * BM as u32;
+            let col_base = program.program_id(WorkgroupAxis::X) * BN as u32;
+            let subgroup_id = program.subgroup_id();
+            let sg_row = subgroup_id.clone() / COL_GROUPS;
+            let sg_col = subgroup_id % COL_GROUPS;
+            let sg_row_base = sg_row * SUBGROUP_ROWS;
+            let sg_col_base = sg_col * SUBGROUP_COLS;
+
+            // Allocate and zero per-fragment accumulators. Each subgroup uses
+            // the same accumulator schema; runtime indexing via subgroup_id
+            // selects the data each subgroup operates on.
+            let accs: Vec<Vec<CoopAcc>> = (0..TILE_ROWS_PER_SG)
+                .map(|_| {
+                    (0..TILE_COLS_PER_SG)
+                        .map(|_| {
+                            let acc = program.alloc_coop_acc();
+                            program.zero_coop_acc(&acc);
+                            acc
+                        })
+                        .collect()
+                })
+                .collect();
+
+            program.k_loop(k_iterations, |program| {
+                let k_base = program.loop_index() * BK as u32;
+                program.copy_storage_to_tile(a_tile, &a_clone, &row_base, &k_base);
+                program.copy_quant_to_tile(b_tile, &b_clone, &k_base, &col_base);
+                program.workgroup_barrier();
+
+                // Per kk-step: load each row's A fragment once and each col's
+                // B fragment once, then MMA the full row × col grid against
+                // the cached SSA handles. This keeps the kk-step at
+                // ROW × A-loads + COL × B-loads + ROW*COL × MMAs (matching
+                // the old accelerator), instead of (ROW*COL) of each.
+                let kk_steps = (BK as u32) / COOP_DIM;
+                for kk in 0..kk_steps {
+                    let a_frags: Vec<_> = (0..TILE_ROWS_PER_SG)
+                        .map(|r| {
+                            program.coop_load_a(
+                                a_tile,
+                                sg_row_base.clone() + r * COOP_DIM,
+                                kk * COOP_DIM,
+                            )
+                        })
+                        .collect();
+                    let b_frags: Vec<_> = (0..TILE_COLS_PER_SG)
+                        .map(|c| {
+                            program.coop_load_b(
+                                b_tile,
+                                kk * COOP_DIM,
+                                sg_col_base.clone() + c * COOP_DIM,
+                            )
+                        })
+                        .collect();
+                    for r in 0..TILE_ROWS_PER_SG {
+                        for c in 0..TILE_COLS_PER_SG {
+                            program.coop_mma(
+                                &accs[r as usize][c as usize],
+                                &a_frags[r as usize],
+                                &b_frags[c as usize],
+                            );
+                        }
+                    }
+                }
+                program.workgroup_barrier();
+            });
+
+            // Cooperative-store each fragment to its global tile location.
+            for r in 0..TILE_ROWS_PER_SG {
+                for c in 0..TILE_COLS_PER_SG {
+                    let row = row_base.clone() + sg_row_base.clone() + r * COOP_DIM;
+                    let col = col_base.clone() + sg_col_base.clone() + c * COOP_DIM;
+                    program.coop_store(&accs[r as usize][c as usize], &y_clone, row, col);
+                }
+            }
+        });
     }
 
     pub fn matmul<const BK: usize>(
@@ -502,13 +716,15 @@ impl Program {
             program: self,
             grid,
             stores: Vec::new(),
+            coop_body: Vec::new(),
+            coop_stack: Vec::new(),
         };
         body(&mut block);
         block.program.ir.body.push(Op::TileProgram(TileProgramOp {
             grid,
             block: BLOCK as u32,
             stores: block.stores,
-            accelerator: None,
+            coop_body: block.coop_body,
         }));
     }
 
@@ -528,6 +744,38 @@ impl Program {
             access,
         });
         buffer
+    }
+
+    fn next_block_dequant_id(&mut self) -> BlockDequantId {
+        let id = BlockDequantId(self.ir.next_block_dequant);
+        self.ir.next_block_dequant += 1;
+        id
+    }
+
+    fn next_pin_id(&mut self, value: TileExpr) -> PinId {
+        let id = PinId(self.ir.pinned_values.len() as u32);
+        self.ir.pinned_values.push(value);
+        id
+    }
+
+    fn next_loop_fold_group_id(&mut self, group: LoopFoldGroup) -> LoopFoldGroupId {
+        let id = LoopFoldGroupId(self.ir.loop_fold_groups.len() as u32);
+        self.ir.loop_fold_groups.push(group);
+        id
+    }
+
+    fn next_coop_fragment_id(&mut self) -> CoopFragmentId {
+        let id = CoopFragmentId(self.ir.next_coop_fragment);
+        self.ir.next_coop_fragment += 1;
+        id
+    }
+
+    /// Allocate a workgroup-scope f32 tile of shape `[rows, cols]`.
+    pub fn alloc_workgroup_tile_f32(&mut self, rows: u32, cols: u32) -> TileRef {
+        self.alloc_tile::<F32>(
+            Layout::contiguous(MemoryLevel::Workgroup, Shape::new([rows, cols])),
+            TileLevel::Workgroup,
+        )
     }
 
     fn alloc_tile<T: Numeric>(&mut self, layout: Layout, level: TileLevel) -> TileRef {
@@ -759,12 +1007,42 @@ pub struct TileBlock<'a, const BLOCK: usize> {
     program: &'a mut Program,
     grid: [u32; 3],
     stores: Vec<TileStoreProgramOp>,
+    /// Subgroup-collective ops at the top level of the program body.
+    coop_body: Vec<SubgroupStmt>,
+    /// Stack of nested coop-body builders. The innermost frame collects
+    /// statements emitted inside `k_loop` closures; popped into `KLoop` on
+    /// closure exit.
+    coop_stack: Vec<Vec<SubgroupStmt>>,
 }
 
 impl<const BLOCK: usize> TileBlock<'_, BLOCK> {
     pub fn program_id(&self, axis: WorkgroupAxis) -> ScalarIndex {
         ScalarIndex {
             expr: TileIndexExpr::ProgramId(axis),
+        }
+    }
+
+    pub fn subgroup_id(&self) -> ScalarIndex {
+        ScalarIndex {
+            expr: TileIndexExpr::SubgroupId,
+        }
+    }
+
+    pub fn subgroup_lane(&self) -> ScalarIndex {
+        ScalarIndex {
+            expr: TileIndexExpr::SubgroupLane,
+        }
+    }
+
+    pub fn subgroup_size(&self) -> ScalarIndex {
+        ScalarIndex {
+            expr: TileIndexExpr::SubgroupSize,
+        }
+    }
+
+    pub fn num_subgroups(&self) -> ScalarIndex {
+        ScalarIndex {
+            expr: TileIndexExpr::NumSubgroups,
         }
     }
 
@@ -846,6 +1124,110 @@ impl<const BLOCK: usize> TileBlock<'_, BLOCK> {
         }
     }
 
+    /// Load N consecutive dequantized values from one column of a packed
+    /// quantized matrix, sharing the per-block scale lookup. The lowerer emits
+    /// the format-specific helper once per call (Q8_0/Q4K/Q6K → 8 lanes,
+    /// Q5_0 → 16 lanes) and binds each lane to a private local that subsequent
+    /// references load. `k_base` must be aligned to N so the values cover one
+    /// scale block.
+    pub fn load_quantized_block<const N: usize>(
+        &mut self,
+        matrix: &QuantizedMatrix,
+        k_base: impl IntoIndex<BLOCK>,
+        col: impl IntoIndex<BLOCK>,
+        mask: Mask<BLOCK>,
+        fill: f32,
+    ) -> [Tile<BLOCK>; N] {
+        assert!(
+            N == 8 || N == 16,
+            "load_quantized_block currently supports N == 8 or N == 16"
+        );
+        let id = self.program.next_block_dequant_id();
+        let k_base = k_base.into_index();
+        let col = col.into_index();
+        let mask_expr = mask.expr;
+        let fill_bits = F32Bits::new(fill);
+        std::array::from_fn(|lane| Tile {
+            expr: TileExpr::QuantizedBlockLane {
+                id,
+                src: matrix.clone(),
+                k_base: k_base.clone(),
+                col: col.clone(),
+                mask: mask_expr.clone(),
+                fill: fill_bits,
+                block_n: N as u32,
+                lane: lane as u32,
+            },
+        })
+    }
+
+    /// Bind a subexpression to a private local so subsequent references reuse
+    /// the value without re-emitting its computation. Returns N references that
+    /// all evaluate to the same value within the same scope.
+    pub fn pin(&mut self, value: Tile<BLOCK>) -> Pinned<BLOCK> {
+        let id = self.program.next_pin_id(value.expr);
+        Pinned {
+            id,
+            _block: PhantomData,
+        }
+    }
+
+    /// Run one K-loop with N parallel reductions. The body closure runs once
+    /// at IR-build time and produces N tile expressions that all share the
+    /// same loop scope; the lowerer materializes a single Naga loop with N
+    /// accumulator locals so common subexpressions across the N outputs are
+    /// emitted only once per iteration (when bound via `pin`).
+    pub fn loop_fold_n<const N: usize, F>(
+        &mut self,
+        op: TileReduceOp,
+        iterations: u32,
+        initials: [TileLiteral; N],
+        body: F,
+    ) -> [Tile<BLOCK>; N]
+    where
+        F: FnOnce(&mut Self) -> [Tile<BLOCK>; N],
+    {
+        assert!(iterations > 0, "loop_fold_n iterations must be non-zero");
+        assert!(N > 0, "loop_fold_n must have at least one accumulator");
+        let bodies = body(self);
+        let group = self.program.next_loop_fold_group_id(LoopFoldGroup {
+            iterations,
+            op,
+            initials: initials.to_vec(),
+            bodies: bodies.into_iter().map(|t| t.expr).collect(),
+        });
+        std::array::from_fn(|lane| Tile {
+            expr: TileExpr::LoopFoldGroupOutput {
+                group,
+                lane: lane as u32,
+            },
+        })
+    }
+
+    /// Fused 4-way dot product: `a[0]*b[0] + .. + a[3]*b[3]` in a single
+    /// `Math::Dot` over `vec4<f32>` operands. Lowers to the same instruction
+    /// sequence the qgemv accelerator emits.
+    pub fn dot4(&self, a: [Tile<BLOCK>; 4], b: [Tile<BLOCK>; 4]) -> Tile<BLOCK> {
+        let [a0, a1, a2, a3] = a;
+        let [b0, b1, b2, b3] = b;
+        Tile {
+            expr: TileExpr::Dot4 {
+                a: [
+                    Box::new(a0.expr),
+                    Box::new(a1.expr),
+                    Box::new(a2.expr),
+                    Box::new(a3.expr),
+                ],
+                b: [
+                    Box::new(b0.expr),
+                    Box::new(b1.expr),
+                    Box::new(b2.expr),
+                    Box::new(b3.expr),
+                ],
+            },
+        }
+    }
+
     pub fn full(&self, value: f32) -> Tile<BLOCK> {
         Tile {
             expr: TileExpr::Full(F32Bits::new(value)),
@@ -919,6 +1301,27 @@ impl<const BLOCK: usize> TileBlock<'_, BLOCK> {
         self.group_reduce::<GROUP>(TileReduceOp::Sum, value)
     }
 
+    pub fn subgroup_reduce_sum(&self, value: Tile<BLOCK>) -> Tile<BLOCK> {
+        self.subgroup_reduce(TileReduceOp::Sum, value)
+    }
+
+    pub fn subgroup_reduce_max(&self, value: Tile<BLOCK>) -> Tile<BLOCK> {
+        self.subgroup_reduce(TileReduceOp::Max, value)
+    }
+
+    pub fn subgroup_reduce_min(&self, value: Tile<BLOCK>) -> Tile<BLOCK> {
+        self.subgroup_reduce(TileReduceOp::Min, value)
+    }
+
+    fn subgroup_reduce(&self, op: TileReduceOp, value: Tile<BLOCK>) -> Tile<BLOCK> {
+        Tile {
+            expr: TileExpr::SubgroupReduce {
+                op,
+                value: Box::new(value.expr),
+            },
+        }
+    }
+
     pub fn group_reduce_max<const GROUP: usize>(&mut self, value: Tile<BLOCK>) -> Tile<BLOCK> {
         self.group_reduce::<GROUP>(TileReduceOp::Max, value)
     }
@@ -980,6 +1383,194 @@ impl<const BLOCK: usize> TileBlock<'_, BLOCK> {
         }
     }
 
+    /// Allocate an 8x8 f32 cooperative-matrix accumulator local. Returned
+    /// handle is consumed by `zero_coop_acc`, `mma_from_tiles`, and
+    /// `coop_store`.
+    pub fn alloc_coop_acc(&mut self) -> CoopAcc {
+        let id = CoopAccId(self.program.ir.coop_accs.len() as u32);
+        self.program.ir.coop_accs.push(CoopAccDecl {
+            id,
+            rows: 8,
+            cols: 8,
+        });
+        CoopAcc { id }
+    }
+
+    pub fn zero_coop_acc(&mut self, acc: &CoopAcc) {
+        self.push_coop(SubgroupStmt::ZeroCoopAcc { id: acc.id });
+    }
+
+    /// Cooperatively stage a workgroup-tile-sized region of `src` into `dst`.
+    /// One element per invocation per pass.
+    pub fn copy_to_workgroup_tile(
+        &mut self,
+        dst: &Storage<F32, 2>,
+        src: &Storage<F32, 2>,
+        row_offset: impl IntoIndex<BLOCK>,
+        col_offset: impl IntoIndex<BLOCK>,
+    ) {
+        // The `dst` argument is here only for type discipline; the underlying
+        // workgroup-tile is identified by its TileRef. To keep the API
+        // ergonomic, callers pass the workgroup-tile-allocated `Storage<F32,
+        // 2>` they got from `program.alloc_workgroup_tile_2d`. We extract its
+        // tile id from the StorageView's buffer mapping.
+        let _ = dst;
+        let _ = src;
+        let _ = row_offset;
+        let _ = col_offset;
+        unimplemented!("workgroup-tile copies use TileRef directly; see copy_storage_to_tile");
+    }
+
+    /// Stage a workgroup-tile region of dense `src` into the workgroup-tile
+    /// `dst`. Used for the A operand in qmatmul. The lowerer emits a flat
+    /// per-invocation loop.
+    pub fn copy_storage_to_tile(
+        &mut self,
+        dst_tile: TileRef,
+        src: &Storage<F32, 2>,
+        row_offset: impl IntoIndex<BLOCK>,
+        col_offset: impl IntoIndex<BLOCK>,
+    ) {
+        self.push_coop(SubgroupStmt::CopyToWorkgroupTile {
+            dst: dst_tile,
+            src: src.view.clone(),
+            row_offset: row_offset.into_index(),
+            col_offset: col_offset.into_index(),
+        });
+    }
+
+    /// Stage a workgroup-tile region of quantized `src` into the f32
+    /// workgroup-tile `dst`, dequantizing on the fly. Used for the B operand
+    /// in qmatmul.
+    pub fn copy_quant_to_tile(
+        &mut self,
+        dst_tile: TileRef,
+        src: &QuantizedMatrix,
+        row_offset: impl IntoIndex<BLOCK>,
+        col_offset: impl IntoIndex<BLOCK>,
+    ) {
+        self.push_coop(SubgroupStmt::CopyQuantToWorkgroupTile {
+            dst: dst_tile,
+            src: src.clone(),
+            row_offset: row_offset.into_index(),
+            col_offset: col_offset.into_index(),
+        });
+    }
+
+    pub fn workgroup_barrier(&mut self) {
+        self.push_coop(SubgroupStmt::Barrier);
+    }
+
+    /// `acc += coop_load_a(a_tile, ar, ak) * coop_load_b(b_tile, bk, bc)`.
+    /// Convenience wrapper that fuses the load + MMA — for MMAs that share an
+    /// A or B operand across the inner row × col grid, prefer the explicit
+    /// `coop_load_a`/`coop_load_b` + `coop_mma` so the fragment loads are
+    /// emitted once and the SSA handles reused.
+    pub fn mma_from_tiles(
+        &mut self,
+        acc: &CoopAcc,
+        a_tile: TileRef,
+        a_row: impl IntoIndex<BLOCK>,
+        a_col: impl IntoIndex<BLOCK>,
+        b_tile: TileRef,
+        b_row: impl IntoIndex<BLOCK>,
+        b_col: impl IntoIndex<BLOCK>,
+    ) {
+        self.push_coop(SubgroupStmt::MmaFromTiles {
+            acc: acc.id,
+            a_tile,
+            a_row: a_row.into_index(),
+            a_col: a_col.into_index(),
+            b_tile,
+            b_row: b_row.into_index(),
+            b_col: b_col.into_index(),
+        });
+    }
+
+    /// Cooperatively load an 8x8 A fragment from a workgroup tile. The
+    /// returned handle's SSA value is bound at the load site and reused
+    /// wherever the handle is consumed by `coop_mma` in the same scope.
+    pub fn coop_load_a(
+        &mut self,
+        tile: TileRef,
+        row: impl IntoIndex<BLOCK>,
+        col: impl IntoIndex<BLOCK>,
+    ) -> CoopFragment {
+        let id = self.program.next_coop_fragment_id();
+        self.push_coop(SubgroupStmt::LoadCoopA {
+            id,
+            tile,
+            row: row.into_index(),
+            col: col.into_index(),
+        });
+        CoopFragment { id }
+    }
+
+    /// Cooperatively load an 8x8 B fragment.
+    pub fn coop_load_b(
+        &mut self,
+        tile: TileRef,
+        row: impl IntoIndex<BLOCK>,
+        col: impl IntoIndex<BLOCK>,
+    ) -> CoopFragment {
+        let id = self.program.next_coop_fragment_id();
+        self.push_coop(SubgroupStmt::LoadCoopB {
+            id,
+            tile,
+            row: row.into_index(),
+            col: col.into_index(),
+        });
+        CoopFragment { id }
+    }
+
+    /// `acc += a * b` where `a`/`b` are fragments previously loaded via
+    /// `coop_load_a`/`coop_load_b`.
+    pub fn coop_mma(&mut self, acc: &CoopAcc, a: &CoopFragment, b: &CoopFragment) {
+        self.push_coop(SubgroupStmt::Mma {
+            acc: acc.id,
+            a: a.id,
+            b: b.id,
+        });
+    }
+
+    /// Cooperatively store `acc` to `dst` at (row, col).
+    pub fn coop_store(
+        &mut self,
+        acc: &CoopAcc,
+        dst: &Storage<F32, 2>,
+        row: impl IntoIndex<BLOCK>,
+        col: impl IntoIndex<BLOCK>,
+    ) {
+        self.push_coop(SubgroupStmt::StoreCoopAcc {
+            acc: acc.id,
+            dst: dst.view.clone(),
+            row: row.into_index(),
+            col: col.into_index(),
+        });
+    }
+
+    /// Run a fixed-iteration loop where the body emits subgroup-collective
+    /// statements. Inside the body, `program.loop_index()` resolves to the
+    /// loop induction variable.
+    pub fn k_loop<F: FnOnce(&mut Self)>(&mut self, iterations: u32, body: F) {
+        assert!(iterations > 0, "k_loop iterations must be non-zero");
+        self.coop_stack.push(Vec::new());
+        body(self);
+        let stmts = self.coop_stack.pop().expect("k_loop frame missing");
+        self.push_coop(SubgroupStmt::KLoop {
+            iterations,
+            body: stmts,
+        });
+    }
+
+    fn push_coop(&mut self, stmt: SubgroupStmt) {
+        if let Some(frame) = self.coop_stack.last_mut() {
+            frame.push(stmt);
+        } else {
+            self.coop_body.push(stmt);
+        }
+    }
+
     pub fn store<T>(&mut self, address: Address<T, BLOCK>, value: Tile<BLOCK>, mask: Mask<BLOCK>) {
         self.stores.push(TileStoreProgramOp {
             dst: address.view,
@@ -1003,6 +1594,35 @@ impl<const BLOCK: usize> TileBlock<'_, BLOCK> {
             value: value.expr,
             mask: mask.expr,
         });
+    }
+}
+
+/// Handle to an 8x8 cooperative-matrix accumulator local.
+#[derive(Copy, Clone)]
+pub struct CoopAcc {
+    id: CoopAccId,
+}
+
+/// Handle to a cooperatively-loaded 8x8 fragment SSA value. Reusable across
+/// any number of `coop_mma` calls in the same scope without re-loading.
+#[derive(Copy, Clone)]
+pub struct CoopFragment {
+    id: CoopFragmentId,
+}
+
+/// Handle to a pinned subexpression. Each call to `get()` returns a fresh
+/// `Tile` reference; lowering deduplicates them onto a single private local.
+#[derive(Clone, Copy)]
+pub struct Pinned<const BLOCK: usize> {
+    id: PinId,
+    _block: PhantomData<[(); BLOCK]>,
+}
+
+impl<const BLOCK: usize> Pinned<BLOCK> {
+    pub fn get(&self) -> Tile<BLOCK> {
+        Tile {
+            expr: TileExpr::PinnedRef { id: self.id },
+        }
     }
 }
 
@@ -1181,6 +1801,28 @@ impl Mul<u32> for ScalarIndex {
     fn mul(self, rhs: u32) -> Self::Output {
         ScalarIndex {
             expr: TileIndexExpr::Mul(Box::new(self.expr), rhs),
+        }
+    }
+}
+
+impl Div<u32> for ScalarIndex {
+    type Output = ScalarIndex;
+
+    fn div(self, rhs: u32) -> Self::Output {
+        assert!(rhs > 0, "scalar index divisor must be non-zero");
+        ScalarIndex {
+            expr: TileIndexExpr::Div(Box::new(self.expr), rhs),
+        }
+    }
+}
+
+impl Rem<u32> for ScalarIndex {
+    type Output = ScalarIndex;
+
+    fn rem(self, rhs: u32) -> Self::Output {
+        assert!(rhs > 0, "scalar index modulus must be non-zero");
+        ScalarIndex {
+            expr: TileIndexExpr::Mod(Box::new(self.expr), rhs),
         }
     }
 }
@@ -1411,48 +2053,9 @@ fn matrix_shape(layout: &Layout) -> [u32; 2] {
     ]
 }
 
-fn qmatmul_coop_subgroups(m: u32, n: u32) -> Option<u32> {
-    const COOP: u32 = 8;
-    if m == 0 || n == 0 || !m.is_multiple_of(COOP) || !n.is_multiple_of(COOP) {
-        return None;
-    }
-    let tile_rows = m / COOP;
-    let tile_cols = n / COOP;
-    if tile_rows * tile_cols <= 16 {
-        return Some(1);
-    }
-    if m == 32 && n.is_multiple_of(32) {
-        let subgroups = n / 32;
-        if (2..=8).contains(&subgroups) {
-            return Some(subgroups);
-        }
-    }
-    if n >= m && m <= 64 && n.is_multiple_of(16) {
-        let subgroups = n / 16;
-        if (2..=8).contains(&subgroups) {
-            return Some(subgroups);
-        }
-    }
-    if n <= 64 && m.is_multiple_of(16) {
-        let subgroups = m / 16;
-        if (2..=8).contains(&subgroups) {
-            return Some(subgroups);
-        }
-    }
-    if m == 128 && n == 128 {
-        return Some(16);
-    }
-    if m.is_multiple_of(32) && n.is_multiple_of(32) {
-        let subgroups = (m / 32).checked_mul(n / 32)?;
-        if (2..=16).contains(&subgroups) {
-            return Some(subgroups);
-        }
-    }
-    None
-}
-
 fn cooperative_store_layout_supported(layout: &Layout) -> bool {
     layout.shape().rank() == 2
         && layout.strides().rank() == 2
         && (layout.strides().values()[0] == 1 || layout.strides().values()[1] == 1)
 }
+
