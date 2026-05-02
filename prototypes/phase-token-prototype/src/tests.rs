@@ -28,6 +28,14 @@ fn assert_only_tile_programs(ir: &KernelIr) {
     );
 }
 
+fn tile_stmts_contain_load_role(stmts: &[TileStmt], role: CoopOperandRole) -> bool {
+    stmts.iter().any(|stmt| match stmt {
+        TileStmt::LoadCoop { role: r, .. } => *r == role,
+        TileStmt::WhileTrue { body, .. } => tile_stmts_contain_load_role(body, role),
+        _ => false,
+    })
+}
+
 #[test]
 fn layout_is_structured_shape_strides_and_memory_level() {
     let shape = Shape::new([4, 8]);
@@ -142,12 +150,23 @@ fn coop_qmatmul_q8_0_lowers_through_subgroup_dsl() {
     };
     assert_eq!(program.block, 128, "BM*BN=64*64 → 4 subgroups → 128 lanes");
     assert!(
-        !program.coop_body.is_empty(),
+        program
+            .body
+            .iter()
+            .any(|stmt| !matches!(stmt, TileStmt::Store(_))),
         "coop qmatmul must emit a subgroup-collective body"
     );
     assert!(
-        program.stores.is_empty(),
+        program
+            .body
+            .iter()
+            .all(|stmt| !matches!(stmt, TileStmt::Store(_))),
         "coop qmatmul stores via cooperative_store, not per-lane stores"
+    );
+    assert!(
+        tile_stmts_contain_load_role(&program.body, CoopOperandRole::A)
+            && tile_stmts_contain_load_role(&program.body, CoopOperandRole::B),
+        "coop qmatmul should express A and B fragment roles on LoadCoop statements"
     );
     assert!(
         !ir.coop_accs().is_empty(),
@@ -197,8 +216,7 @@ fn primitive_qgemm_q8_0_in_dsl() {
                 let k_base = program.loop_index() * K_PER_ITER + lane.clone() * VALUES_PER_LANE;
                 let mask = row.lt(M).and(col.lt(N)).and(k_base.lt(K));
 
-                let bs =
-                    program.load_quantized_block::<8>(&b, &k_base, &col, mask.clone(), 0.0);
+                let bs = program.load_quantized_block::<8>(&b, &k_base, &col, mask.clone(), 0.0);
                 let a0 = program.load(a.at(&row, k_base.clone() + 0u32), mask.clone(), 0.0);
                 let a1 = program.load(a.at(&row, k_base.clone() + 1u32), mask.clone(), 0.0);
                 let a2 = program.load(a.at(&row, k_base.clone() + 2u32), mask.clone(), 0.0);
@@ -457,7 +475,7 @@ fn qdequantize_lowers_large_embedding_table_as_tile_program() {
         panic!("qdequantize should expand to a tile program");
     };
     assert_eq!(program.block, 256);
-    let [store] = program.stores.as_slice() else {
+    let [TileStmt::Store(store)] = program.body.as_slice() else {
         panic!("qdequantize should emit one tile store");
     };
     assert!(matches!(store.value, TileExpr::QuantizedLoad(_)));

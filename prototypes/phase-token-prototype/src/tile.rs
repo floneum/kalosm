@@ -1,15 +1,16 @@
 use std::marker::PhantomData;
 use std::ops::{Add, Div, Mul, Rem, Sub};
 
-use crate::{
+use crate::ir::{
     BlockDequantId, BufferAccess, BufferDecl, BufferRef, CoopAccDecl, CoopAccId, CoopFragmentId,
-    DynamicOffset, F32Bits, GgmlQuantFormat, Im2ColNhwcMap, KernelIr, Layout, LoopFoldGroup,
-    LoopFoldGroupId, MemoryLevel, Numeric, Op, PinId, QuantizedMatrix, Shape, StorageIndexMap,
-    StorageView, SubgroupStmt, TileBinaryOp, TileCompareOp, TileDecl, TileExpr, TileIndexExpr,
-    TileLevel, TileLiteral, TileLoadExpr, TileMaskExpr, TileOrigin, TileProgramOp,
-    TileQuantizedLoadExpr, TileReduceOp, TileRef, TileScalarExpr, TileStoreProgramOp, TileUnaryOp,
-    WorkgroupAxis, WorkgroupOffset, F32, U32,
+    CoopOperandRole, DynamicOffset, F32Bits, Im2ColNhwcMap, KernelIr, Layout, LoopFoldGroup,
+    LoopFoldGroupId, MemoryLevel, Numeric, Op, PinId, Shape, StorageIndexMap, StorageView,
+    TileBinaryOp, TileCompareOp, TileDecl, TileExpr, TileIndexExpr, TileLevel, TileLiteral,
+    TileLoadExpr, TileMaskExpr, TileOrigin, TileProgramOp, TileQuantizedLoadExpr, TileReduceOp,
+    TileRef, TileScalarExpr, TileStmt, TileStoreStmt, TileUnaryOp, WorkgroupAxis, WorkgroupOffset,
+    F32, U32,
 };
+use crate::quantized::{GgmlQuantFormat, QuantizedMatrix};
 
 /// Build a Triton-like source tile IR.
 pub fn build(f: impl FnOnce(&mut Program)) -> KernelIr {
@@ -348,57 +349,52 @@ impl Program {
             let lane = program.subgroup_lane();
 
             let zero = TileLiteral::F32(F32Bits::new(0.0));
-            let sums: [Tile<BLOCK>; COLS_PER_SUBGROUP] = program.loop_fold_n::<COLS_PER_SUBGROUP, _>(
-                TileReduceOp::Sum,
-                k_iterations,
-                [zero; COLS_PER_SUBGROUP],
-                |program| {
-                    let k_base = program.loop_index() * k_per_iter
-                        + lane.clone() * VALUES_PER_LANE as u32;
-                    let in_bounds_k = k_base.lt(k_size);
+            let sums: [Tile<BLOCK>; COLS_PER_SUBGROUP] = program
+                .loop_fold_n::<COLS_PER_SUBGROUP, _>(
+                    TileReduceOp::Sum,
+                    k_iterations,
+                    [zero; COLS_PER_SUBGROUP],
+                    |program| {
+                        let k_base = program.loop_index() * k_per_iter
+                            + lane.clone() * VALUES_PER_LANE as u32;
+                        let in_bounds_k = k_base.lt(k_size);
 
-                    // Pin all A scalars so each is computed once per iteration
-                    // and reused across all COLS_PER_SUBGROUP dot products.
-                    let a_pins: [Pinned<BLOCK>; VALUES_PER_LANE] = std::array::from_fn(|i| {
-                        let scalar = program.load(
-                            a.at(0, k_base.clone() + i as u32),
-                            in_bounds_k.clone(),
-                            0.0,
-                        );
-                        program.pin(scalar)
-                    });
-
-                    std::array::from_fn(|c| {
-                        let col = col0.clone() + c as u32;
-                        let mask = in_bounds_k.clone().and(col.lt(n_cols));
-                        let bs: [Tile<BLOCK>; VALUES_PER_LANE] =
-                            program.load_quantized_block::<VALUES_PER_LANE>(
-                                &b_cloned,
-                                &k_base,
-                                &col,
-                                mask,
+                        // Pin all A scalars so each is computed once per iteration
+                        // and reused across all COLS_PER_SUBGROUP dot products.
+                        let a_pins: [Pinned<BLOCK>; VALUES_PER_LANE] = std::array::from_fn(|i| {
+                            let scalar = program.load(
+                                a.at(0, k_base.clone() + i as u32),
+                                in_bounds_k.clone(),
                                 0.0,
                             );
-                        // VALUES_PER_LANE / 4 dot4s, summed.
-                        let mut sum: Option<Tile<BLOCK>> = None;
-                        let chunks = VALUES_PER_LANE / 4;
-                        for chunk in 0..chunks {
-                            let a_vec: [Tile<BLOCK>; 4] = std::array::from_fn(|i| {
-                                a_pins[chunk * 4 + i].get()
-                            });
-                            let b_vec: [Tile<BLOCK>; 4] = std::array::from_fn(|i| {
-                                bs[chunk * 4 + i].clone()
-                            });
-                            let term = program.dot4(a_vec, b_vec);
-                            sum = Some(match sum {
-                                Some(prev) => prev + term,
-                                None => term,
-                            });
-                        }
-                        sum.expect("VALUES_PER_LANE >= 4")
-                    })
-                },
-            );
+                            program.pin(scalar)
+                        });
+
+                        std::array::from_fn(|c| {
+                            let col = col0.clone() + c as u32;
+                            let mask = in_bounds_k.clone().and(col.lt(n_cols));
+                            let bs: [Tile<BLOCK>; VALUES_PER_LANE] = program
+                                .load_quantized_block::<VALUES_PER_LANE>(
+                                    &b_cloned, &k_base, &col, mask, 0.0,
+                                );
+                            // VALUES_PER_LANE / 4 dot4s, summed.
+                            let mut sum: Option<Tile<BLOCK>> = None;
+                            let chunks = VALUES_PER_LANE / 4;
+                            for chunk in 0..chunks {
+                                let a_vec: [Tile<BLOCK>; 4] =
+                                    std::array::from_fn(|i| a_pins[chunk * 4 + i].get());
+                                let b_vec: [Tile<BLOCK>; 4] =
+                                    std::array::from_fn(|i| bs[chunk * 4 + i].clone());
+                                let term = program.dot4(a_vec, b_vec);
+                                sum = Some(match sum {
+                                    Some(prev) => prev + term,
+                                    None => term,
+                                });
+                            }
+                            sum.expect("VALUES_PER_LANE >= 4")
+                        })
+                    },
+                );
 
             for (offset, sum) in sums.into_iter().enumerate() {
                 let col = col0.clone() + offset as u32;
@@ -554,7 +550,7 @@ impl Program {
                 })
                 .collect();
 
-            program.k_loop(k_iterations, |program| {
+            program.while_true(k_iterations, |program| {
                 let k_base = program.loop_index() * BK as u32;
                 program.copy_storage_to_tile(a_tile, &a_clone, &row_base, &k_base);
                 program.copy_quant_to_tile(b_tile, &b_clone, &k_base, &col_base);
@@ -715,16 +711,14 @@ impl Program {
         let mut block = TileBlock {
             program: self,
             grid,
-            stores: Vec::new(),
-            coop_body: Vec::new(),
-            coop_stack: Vec::new(),
+            body: Vec::new(),
+            stmt_stack: Vec::new(),
         };
         body(&mut block);
         block.program.ir.body.push(Op::TileProgram(TileProgramOp {
             grid,
             block: BLOCK as u32,
-            stores: block.stores,
-            coop_body: block.coop_body,
+            body: block.body,
         }));
     }
 
@@ -1006,13 +1000,11 @@ impl<T, const R: usize> Storage<T, R> {
 pub struct TileBlock<'a, const BLOCK: usize> {
     program: &'a mut Program,
     grid: [u32; 3],
-    stores: Vec<TileStoreProgramOp>,
-    /// Subgroup-collective ops at the top level of the program body.
-    coop_body: Vec<SubgroupStmt>,
-    /// Stack of nested coop-body builders. The innermost frame collects
-    /// statements emitted inside `k_loop` closures; popped into `KLoop` on
-    /// closure exit.
-    coop_stack: Vec<Vec<SubgroupStmt>>,
+    body: Vec<TileStmt>,
+    /// Stack of nested statement builders. The innermost frame collects
+    /// statements emitted inside `while_true` closures; popped into
+    /// `WhileTrue` on closure exit.
+    stmt_stack: Vec<Vec<TileStmt>>,
 }
 
 impl<const BLOCK: usize> TileBlock<'_, BLOCK> {
@@ -1397,7 +1389,7 @@ impl<const BLOCK: usize> TileBlock<'_, BLOCK> {
     }
 
     pub fn zero_coop_acc(&mut self, acc: &CoopAcc) {
-        self.push_coop(SubgroupStmt::ZeroCoopAcc { id: acc.id });
+        self.push_stmt(TileStmt::ZeroCoopAcc { id: acc.id });
     }
 
     /// Cooperatively stage a workgroup-tile-sized region of `src` into `dst`.
@@ -1431,7 +1423,7 @@ impl<const BLOCK: usize> TileBlock<'_, BLOCK> {
         row_offset: impl IntoIndex<BLOCK>,
         col_offset: impl IntoIndex<BLOCK>,
     ) {
-        self.push_coop(SubgroupStmt::CopyToWorkgroupTile {
+        self.push_stmt(TileStmt::CopyToWorkgroupTile {
             dst: dst_tile,
             src: src.view.clone(),
             row_offset: row_offset.into_index(),
@@ -1449,7 +1441,7 @@ impl<const BLOCK: usize> TileBlock<'_, BLOCK> {
         row_offset: impl IntoIndex<BLOCK>,
         col_offset: impl IntoIndex<BLOCK>,
     ) {
-        self.push_coop(SubgroupStmt::CopyQuantToWorkgroupTile {
+        self.push_stmt(TileStmt::CopyQuantToWorkgroupTile {
             dst: dst_tile,
             src: src.clone(),
             row_offset: row_offset.into_index(),
@@ -1458,14 +1450,13 @@ impl<const BLOCK: usize> TileBlock<'_, BLOCK> {
     }
 
     pub fn workgroup_barrier(&mut self) {
-        self.push_coop(SubgroupStmt::Barrier);
+        self.push_stmt(TileStmt::Barrier);
     }
 
     /// `acc += coop_load_a(a_tile, ar, ak) * coop_load_b(b_tile, bk, bc)`.
-    /// Convenience wrapper that fuses the load + MMA — for MMAs that share an
-    /// A or B operand across the inner row × col grid, prefer the explicit
-    /// `coop_load_a`/`coop_load_b` + `coop_mma` so the fragment loads are
-    /// emitted once and the SSA handles reused.
+    /// Convenience wrapper that emits `coop_load_a`, `coop_load_b`, then
+    /// `coop_mma`. For MMAs that share an A or B operand across the inner row ×
+    /// col grid, prefer the explicit calls so fragment handles can be reused.
     pub fn mma_from_tiles(
         &mut self,
         acc: &CoopAcc,
@@ -1476,15 +1467,9 @@ impl<const BLOCK: usize> TileBlock<'_, BLOCK> {
         b_row: impl IntoIndex<BLOCK>,
         b_col: impl IntoIndex<BLOCK>,
     ) {
-        self.push_coop(SubgroupStmt::MmaFromTiles {
-            acc: acc.id,
-            a_tile,
-            a_row: a_row.into_index(),
-            a_col: a_col.into_index(),
-            b_tile,
-            b_row: b_row.into_index(),
-            b_col: b_col.into_index(),
-        });
+        let a = self.coop_load_a(a_tile, a_row, a_col);
+        let b = self.coop_load_b(b_tile, b_row, b_col);
+        self.coop_mma(acc, &a, &b);
     }
 
     /// Cooperatively load an 8x8 A fragment from a workgroup tile. The
@@ -1497,13 +1482,17 @@ impl<const BLOCK: usize> TileBlock<'_, BLOCK> {
         col: impl IntoIndex<BLOCK>,
     ) -> CoopFragment {
         let id = self.program.next_coop_fragment_id();
-        self.push_coop(SubgroupStmt::LoadCoopA {
+        self.push_stmt(TileStmt::LoadCoop {
             id,
+            role: CoopOperandRole::A,
             tile,
             row: row.into_index(),
             col: col.into_index(),
         });
-        CoopFragment { id }
+        CoopFragment {
+            id,
+            role: CoopOperandRole::A,
+        }
     }
 
     /// Cooperatively load an 8x8 B fragment.
@@ -1514,19 +1503,33 @@ impl<const BLOCK: usize> TileBlock<'_, BLOCK> {
         col: impl IntoIndex<BLOCK>,
     ) -> CoopFragment {
         let id = self.program.next_coop_fragment_id();
-        self.push_coop(SubgroupStmt::LoadCoopB {
+        self.push_stmt(TileStmt::LoadCoop {
             id,
+            role: CoopOperandRole::B,
             tile,
             row: row.into_index(),
             col: col.into_index(),
         });
-        CoopFragment { id }
+        CoopFragment {
+            id,
+            role: CoopOperandRole::B,
+        }
     }
 
     /// `acc += a * b` where `a`/`b` are fragments previously loaded via
     /// `coop_load_a`/`coop_load_b`.
     pub fn coop_mma(&mut self, acc: &CoopAcc, a: &CoopFragment, b: &CoopFragment) {
-        self.push_coop(SubgroupStmt::Mma {
+        assert_eq!(
+            a.role,
+            CoopOperandRole::A,
+            "coop_mma A operand must be an A-role fragment"
+        );
+        assert_eq!(
+            b.role,
+            CoopOperandRole::B,
+            "coop_mma B operand must be a B-role fragment"
+        );
+        self.push_stmt(TileStmt::Mma {
             acc: acc.id,
             a: a.id,
             b: b.id,
@@ -1541,7 +1544,7 @@ impl<const BLOCK: usize> TileBlock<'_, BLOCK> {
         row: impl IntoIndex<BLOCK>,
         col: impl IntoIndex<BLOCK>,
     ) {
-        self.push_coop(SubgroupStmt::StoreCoopAcc {
+        self.push_stmt(TileStmt::StoreCoopAcc {
             acc: acc.id,
             dst: dst.view.clone(),
             row: row.into_index(),
@@ -1549,36 +1552,39 @@ impl<const BLOCK: usize> TileBlock<'_, BLOCK> {
         });
     }
 
-    /// Run a fixed-iteration loop where the body emits subgroup-collective
-    /// statements. Inside the body, `program.loop_index()` resolves to the
-    /// loop induction variable.
-    pub fn k_loop<F: FnOnce(&mut Self)>(&mut self, iterations: u32, body: F) {
-        assert!(iterations > 0, "k_loop iterations must be non-zero");
-        self.coop_stack.push(Vec::new());
+    /// Emit a counted `while true` loop where `program.loop_index()` resolves
+    /// to the current iteration. This is intentionally generic while the IR's
+    /// loop-carried value model settles.
+    pub fn while_true<F: FnOnce(&mut Self)>(&mut self, max_iterations: u32, body: F) {
+        assert!(
+            max_iterations > 0,
+            "while_true max_iterations must be non-zero"
+        );
+        self.stmt_stack.push(Vec::new());
         body(self);
-        let stmts = self.coop_stack.pop().expect("k_loop frame missing");
-        self.push_coop(SubgroupStmt::KLoop {
-            iterations,
+        let stmts = self.stmt_stack.pop().expect("while_true frame missing");
+        self.push_stmt(TileStmt::WhileTrue {
+            max_iterations,
             body: stmts,
         });
     }
 
-    fn push_coop(&mut self, stmt: SubgroupStmt) {
-        if let Some(frame) = self.coop_stack.last_mut() {
+    fn push_stmt(&mut self, stmt: TileStmt) {
+        if let Some(frame) = self.stmt_stack.last_mut() {
             frame.push(stmt);
         } else {
-            self.coop_body.push(stmt);
+            self.body.push(stmt);
         }
     }
 
     pub fn store<T>(&mut self, address: Address<T, BLOCK>, value: Tile<BLOCK>, mask: Mask<BLOCK>) {
-        self.stores.push(TileStoreProgramOp {
+        self.push_stmt(TileStmt::Store(TileStoreStmt {
             dst: address.view,
             row: address.row,
             col: address.col,
             value: value.expr,
             mask: mask.expr,
-        });
+        }));
     }
 
     pub fn store_erased(
@@ -1587,13 +1593,13 @@ impl<const BLOCK: usize> TileBlock<'_, BLOCK> {
         value: Tile<BLOCK>,
         mask: Mask<BLOCK>,
     ) {
-        self.stores.push(TileStoreProgramOp {
+        self.push_stmt(TileStmt::Store(TileStoreStmt {
             dst: address.view,
             row: address.row,
             col: address.col,
             value: value.expr,
             mask: mask.expr,
-        });
+        }));
     }
 }
 
@@ -1608,6 +1614,7 @@ pub struct CoopAcc {
 #[derive(Copy, Clone)]
 pub struct CoopFragment {
     id: CoopFragmentId,
+    role: CoopOperandRole,
 }
 
 /// Handle to a pinned subexpression. Each call to `get()` returns a fresh
@@ -2058,4 +2065,3 @@ fn cooperative_store_layout_supported(layout: &Layout) -> bool {
         && layout.strides().rank() == 2
         && (layout.strides().values()[0] == 1 || layout.strides().values()[1] == 1)
 }
-

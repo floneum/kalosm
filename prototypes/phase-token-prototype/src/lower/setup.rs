@@ -60,10 +60,14 @@ impl<'a> Lowerer<'a> {
         );
         let uses_subgroup_reduce = Self::uses_subgroup_reduce(ir);
         let uses_cooperative_matrix = Self::uses_cooperative_matrix(ir);
-        let uses_subgroup_id_idx = Self::uses_index_kind(ir, super::analysis::SubgroupIndexKind::SubgroupId);
-        let uses_subgroup_lane_idx = Self::uses_index_kind(ir, super::analysis::SubgroupIndexKind::SubgroupLane);
-        let uses_subgroup_size_idx = Self::uses_index_kind(ir, super::analysis::SubgroupIndexKind::SubgroupSize);
-        let uses_num_subgroups_idx = Self::uses_index_kind(ir, super::analysis::SubgroupIndexKind::NumSubgroups);
+        let uses_subgroup_id_idx =
+            Self::uses_index_kind(ir, super::analysis::SubgroupIndexKind::SubgroupId);
+        let uses_subgroup_lane_idx =
+            Self::uses_index_kind(ir, super::analysis::SubgroupIndexKind::SubgroupLane);
+        let uses_subgroup_size_idx =
+            Self::uses_index_kind(ir, super::analysis::SubgroupIndexKind::SubgroupSize);
+        let uses_num_subgroups_idx =
+            Self::uses_index_kind(ir, super::analysis::SubgroupIndexKind::NumSubgroups);
         let uses_subgroup_id =
             uses_subgroup_reduce || uses_subgroup_id_idx || uses_cooperative_matrix;
         let uses_subgroup_invocation_id = uses_subgroup_lane_idx;
@@ -467,14 +471,49 @@ impl<'a> Lowerer<'a> {
     fn tile_programs_use_f16(ir: &KernelIr) -> bool {
         ir.body().ops().iter().any(|op| {
             let Op::TileProgram(op) = op;
-            op.stores.iter().any(|store| {
+            op.body.iter().any(Self::tile_stmt_uses_f16)
+        })
+    }
+
+    fn tile_stmt_uses_f16(stmt: &TileStmt) -> bool {
+        match stmt {
+            TileStmt::Store(store) => {
                 store.dst.buffer.element == ElementType::F16
                     || Self::tile_index_expr_uses_f16(&store.row)
                     || Self::tile_index_expr_uses_f16(&store.col)
                     || Self::tile_mask_expr_uses_f16(&store.mask)
                     || Self::tile_expr_uses_f16(&store.value)
-            })
-        })
+            }
+            TileStmt::CopyToWorkgroupTile {
+                dst,
+                src,
+                row_offset,
+                col_offset,
+            } => {
+                dst.element == ElementType::F16
+                    || src.buffer.element == ElementType::F16
+                    || Self::tile_index_expr_uses_f16(row_offset)
+                    || Self::tile_index_expr_uses_f16(col_offset)
+            }
+            TileStmt::CopyQuantToWorkgroupTile {
+                row_offset,
+                col_offset,
+                ..
+            } => {
+                Self::tile_index_expr_uses_f16(row_offset)
+                    || Self::tile_index_expr_uses_f16(col_offset)
+            }
+            TileStmt::LoadCoop { row, col, .. } => {
+                Self::tile_index_expr_uses_f16(row) || Self::tile_index_expr_uses_f16(col)
+            }
+            TileStmt::StoreCoopAcc { dst, row, col, .. } => {
+                dst.buffer.element == ElementType::F16
+                    || Self::tile_index_expr_uses_f16(row)
+                    || Self::tile_index_expr_uses_f16(col)
+            }
+            TileStmt::WhileTrue { body, .. } => body.iter().any(Self::tile_stmt_uses_f16),
+            TileStmt::ZeroCoopAcc { .. } | TileStmt::Barrier | TileStmt::Mma { .. } => false,
+        }
     }
 
     fn tile_expr_uses_f16(expr: &TileExpr) -> bool {

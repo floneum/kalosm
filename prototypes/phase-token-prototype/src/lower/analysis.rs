@@ -36,44 +36,34 @@ impl<'a> Lowerer<'a> {
         let mut live = vec![false; ir.tiles().len()];
         for op in ir.body().ops() {
             let Op::TileProgram(op) = op;
-            for store in &op.stores {
-                Self::mark_tile_expr_live(ir, &store.value, &mut live);
-            }
-            for stmt in &op.coop_body {
-                Self::mark_subgroup_stmt_tiles_live(stmt, &mut live);
+            for stmt in &op.body {
+                Self::mark_tile_stmt_live(ir, stmt, &mut live);
             }
         }
         live
     }
 
-    fn mark_subgroup_stmt_tiles_live(stmt: &SubgroupStmt, live: &mut [bool]) {
+    fn mark_tile_stmt_live(ir: &KernelIr, stmt: &TileStmt, live: &mut [bool]) {
         match stmt {
-            SubgroupStmt::CopyToWorkgroupTile { dst, .. }
-            | SubgroupStmt::CopyQuantToWorkgroupTile { dst, .. } => {
+            TileStmt::Store(store) => Self::mark_tile_expr_live(ir, &store.value, live),
+            TileStmt::CopyToWorkgroupTile { dst, .. }
+            | TileStmt::CopyQuantToWorkgroupTile { dst, .. } => {
                 if let Some(slot) = live.get_mut(dst.id.index()) {
                     *slot = true;
                 }
             }
-            SubgroupStmt::MmaFromTiles { a_tile, b_tile, .. } => {
-                if let Some(slot) = live.get_mut(a_tile.id.index()) {
-                    *slot = true;
-                }
-                if let Some(slot) = live.get_mut(b_tile.id.index()) {
-                    *slot = true;
-                }
-            }
-            SubgroupStmt::LoadCoopA { tile, .. } | SubgroupStmt::LoadCoopB { tile, .. } => {
+            TileStmt::LoadCoop { tile, .. } => {
                 if let Some(slot) = live.get_mut(tile.id.index()) {
                     *slot = true;
                 }
             }
-            SubgroupStmt::ZeroCoopAcc { .. }
-            | SubgroupStmt::Barrier
-            | SubgroupStmt::Mma { .. }
-            | SubgroupStmt::StoreCoopAcc { .. } => {}
-            SubgroupStmt::KLoop { body, .. } => {
+            TileStmt::ZeroCoopAcc { .. }
+            | TileStmt::Barrier
+            | TileStmt::Mma { .. }
+            | TileStmt::StoreCoopAcc { .. } => {}
+            TileStmt::WhileTrue { body, .. } => {
                 for s in body {
-                    Self::mark_subgroup_stmt_tiles_live(s, live);
+                    Self::mark_tile_stmt_live(ir, s, live);
                 }
             }
         }
@@ -82,30 +72,25 @@ impl<'a> Lowerer<'a> {
     pub(super) fn uses_cooperative_matrix(ir: &KernelIr) -> bool {
         ir.body().ops().iter().any(|op| {
             let Op::TileProgram(op) = op;
-            !op.coop_body.is_empty()
+            op.body.iter().any(Self::tile_stmt_uses_cooperative_matrix)
         })
     }
 
     pub(super) fn uses_subgroup_reduce(ir: &KernelIr) -> bool {
         ir.body().ops().iter().any(|op| {
             let Op::TileProgram(op) = op;
-            op.stores
-                .iter()
-                .any(|store| Self::tile_expr_uses_subgroup_reduce(&store.value))
+            op.body.iter().any(Self::tile_stmt_uses_subgroup_reduce)
         })
     }
 
     pub(super) fn uses_index_kind(ir: &KernelIr, kind: SubgroupIndexKind) -> bool {
-        let in_stores = ir.body().ops().iter().any(|op| {
+        let in_programs = ir.body().ops().iter().any(|op| {
             let Op::TileProgram(op) = op;
-            op.stores.iter().any(|store| {
-                Self::tile_index_expr_uses_kind(&store.row, kind)
-                    || Self::tile_index_expr_uses_kind(&store.col, kind)
-                    || Self::tile_mask_expr_uses_kind(&store.mask, kind)
-                    || Self::tile_expr_uses_index_kind(&store.value, kind)
-            })
+            op.body
+                .iter()
+                .any(|stmt| Self::tile_stmt_uses_index_kind(stmt, kind))
         });
-        in_stores
+        in_programs
             || ir
                 .pinned_values
                 .iter()
@@ -115,6 +100,72 @@ impl<'a> Lowerer<'a> {
                     .iter()
                     .any(|b| Self::tile_expr_uses_index_kind(b, kind))
             })
+    }
+
+    fn tile_stmt_uses_cooperative_matrix(stmt: &TileStmt) -> bool {
+        match stmt {
+            TileStmt::Store(_) | TileStmt::Barrier => false,
+            TileStmt::ZeroCoopAcc { .. }
+            | TileStmt::CopyToWorkgroupTile { .. }
+            | TileStmt::CopyQuantToWorkgroupTile { .. }
+            | TileStmt::LoadCoop { .. }
+            | TileStmt::Mma { .. }
+            | TileStmt::StoreCoopAcc { .. } => true,
+            TileStmt::WhileTrue { body, .. } => {
+                body.iter().any(Self::tile_stmt_uses_cooperative_matrix)
+            }
+        }
+    }
+
+    fn tile_stmt_uses_subgroup_reduce(stmt: &TileStmt) -> bool {
+        match stmt {
+            TileStmt::Store(store) => Self::tile_expr_uses_subgroup_reduce(&store.value),
+            TileStmt::WhileTrue { body, .. } => {
+                body.iter().any(Self::tile_stmt_uses_subgroup_reduce)
+            }
+            TileStmt::ZeroCoopAcc { .. }
+            | TileStmt::CopyToWorkgroupTile { .. }
+            | TileStmt::CopyQuantToWorkgroupTile { .. }
+            | TileStmt::Barrier
+            | TileStmt::LoadCoop { .. }
+            | TileStmt::Mma { .. }
+            | TileStmt::StoreCoopAcc { .. } => false,
+        }
+    }
+
+    fn tile_stmt_uses_index_kind(stmt: &TileStmt, kind: SubgroupIndexKind) -> bool {
+        match stmt {
+            TileStmt::Store(store) => {
+                Self::tile_index_expr_uses_kind(&store.row, kind)
+                    || Self::tile_index_expr_uses_kind(&store.col, kind)
+                    || Self::tile_mask_expr_uses_kind(&store.mask, kind)
+                    || Self::tile_expr_uses_index_kind(&store.value, kind)
+            }
+            TileStmt::CopyToWorkgroupTile {
+                row_offset,
+                col_offset,
+                ..
+            }
+            | TileStmt::CopyQuantToWorkgroupTile {
+                row_offset,
+                col_offset,
+                ..
+            } => {
+                Self::tile_index_expr_uses_kind(row_offset, kind)
+                    || Self::tile_index_expr_uses_kind(col_offset, kind)
+            }
+            TileStmt::StoreCoopAcc { row, col, .. } => {
+                Self::tile_index_expr_uses_kind(row, kind)
+                    || Self::tile_index_expr_uses_kind(col, kind)
+            }
+            TileStmt::WhileTrue { body, .. } => body
+                .iter()
+                .any(|stmt| Self::tile_stmt_uses_index_kind(stmt, kind)),
+            TileStmt::ZeroCoopAcc { .. }
+            | TileStmt::Barrier
+            | TileStmt::LoadCoop { .. }
+            | TileStmt::Mma { .. } => false,
+        }
     }
 
     fn tile_expr_uses_index_kind(expr: &TileExpr, kind: SubgroupIndexKind) -> bool {
@@ -144,8 +195,7 @@ impl<'a> Lowerer<'a> {
             TileExpr::Index(idx) => Self::tile_index_expr_uses_kind(idx, kind),
             TileExpr::Full(_) | TileExpr::Literal(_) => false,
             TileExpr::Scalar(expr) => match expr {
-                TileScalarExpr::Reduce { value, .. }
-                | TileScalarExpr::LoopReduce { value, .. } => {
+                TileScalarExpr::Reduce { value, .. } | TileScalarExpr::LoopReduce { value, .. } => {
                     Self::tile_expr_uses_index_kind(value, kind)
                 }
                 TileScalarExpr::Literal(_) => false,
@@ -223,8 +273,7 @@ impl<'a> Lowerer<'a> {
                 .any(|expr| Self::tile_expr_uses_subgroup_reduce(expr)),
             TileExpr::PinnedRef { .. } | TileExpr::LoopFoldGroupOutput { .. } => false,
             TileExpr::Scalar(expr) => match expr {
-                TileScalarExpr::Reduce { value, .. }
-                | TileScalarExpr::LoopReduce { value, .. } => {
+                TileScalarExpr::Reduce { value, .. } | TileScalarExpr::LoopReduce { value, .. } => {
                     Self::tile_expr_uses_subgroup_reduce(value)
                 }
                 TileScalarExpr::Literal(_) => false,

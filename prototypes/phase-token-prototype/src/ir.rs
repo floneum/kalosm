@@ -1,6 +1,6 @@
 use std::num::NonZeroU32;
 
-use crate::{LowerError, NagaKernel};
+use crate::{LowerError, NagaKernel, QuantizedMatrix};
 
 /// A typed kernel IR emitted by the prototype builder.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -53,6 +53,13 @@ impl CoopFragmentId {
     pub const fn index(self) -> usize {
         self.0 as usize
     }
+}
+
+/// Multiplicand role for a cooperatively-loaded matrix fragment.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+pub enum CoopOperandRole {
+    A,
+    B,
 }
 
 /// Identifier of a pinned subexpression.
@@ -352,97 +359,19 @@ impl WorkgroupAxis {
     }
 }
 
-/// GGML quantization formats represented by the prototype qmatmul path.
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub enum GgmlQuantFormat {
-    Q4_0,
-    Q4_1,
-    Q5_0,
-    Q5_1,
-    Q8_0,
-    Q8_1,
-    Q2K,
-    Q3K,
-    Q4K,
-    Q5K,
-    Q6K,
-    Q8K,
-}
-
-impl GgmlQuantFormat {
-    pub const fn block_elements(self) -> u32 {
-        match self {
-            Self::Q4_0 | Self::Q4_1 | Self::Q5_0 | Self::Q5_1 | Self::Q8_0 | Self::Q8_1 => 32,
-            Self::Q2K | Self::Q3K | Self::Q4K | Self::Q5K | Self::Q6K | Self::Q8K => 256,
-        }
-    }
-
-    /// Number of u32 words in the f32-scale shader layout for one block.
-    pub const fn block_words(self) -> u32 {
-        match self {
-            Self::Q4_0 => 5,
-            Self::Q4_1 => 6,
-            Self::Q5_0 => 6,
-            Self::Q5_1 => 7,
-            Self::Q8_0 => 9,
-            Self::Q8_1 => 10,
-            Self::Q2K => 22,
-            Self::Q3K => 28,
-            Self::Q4K => 37,
-            Self::Q5K => 45,
-            Self::Q6K => 53,
-            Self::Q8K => 73,
-        }
-    }
-
-    pub const fn qgemv_cols_per_workgroup(self) -> u32 {
-        self.qgemv_subgroups_per_workgroup() * self.qgemv_cols_per_subgroup()
-    }
-
-    pub const fn qgemv_cols_per_subgroup(self) -> u32 {
-        match self {
-            Self::Q2K => 4,
-            Self::Q4_0 | Self::Q4_1 | Self::Q5_1 => 4,
-            Self::Q5_0 => 4,
-            Self::Q3K | Self::Q4K | Self::Q8K => 2,
-            Self::Q6K => 1,
-            Self::Q8_0 | Self::Q8_1 => 4,
-            Self::Q5K => 1,
-        }
-    }
-
-    pub const fn qgemv_subgroups_per_workgroup(self) -> u32 {
-        match self {
-            Self::Q4K | Self::Q8_0 | Self::Q8_1 => 4,
-            _ => 2,
-        }
-    }
-}
-
-/// A packed quantized storage matrix.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct QuantizedMatrix {
-    pub data: StorageView,
-    pub format: GgmlQuantFormat,
-    pub rows: u32,
-    pub cols: u32,
-}
-
-/// A Triton-like source tile program. Per-lane stores live in `stores`;
-/// subgroup-collective ops (cooperative-matrix MMA, workgroup-tile copies,
-/// barriers, K loops over coop ops) live in `coop_body`. Both are produced by
-/// the user via `TileBlock` primitives — there is no hidden accelerator pass.
+/// A Triton-like source tile program over one workgroup tile.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TileProgramOp {
     pub grid: [u32; 3],
     pub block: u32,
-    pub stores: Vec<TileStoreProgramOp>,
-    pub coop_body: Vec<SubgroupStmt>,
+    pub body: Vec<TileStmt>,
 }
 
-/// One statement in the subgroup-collective body of a tile program.
+/// One ordered statement in a tile program.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum SubgroupStmt {
+pub enum TileStmt {
+    /// Per-lane masked storage write.
+    Store(TileStoreStmt),
     /// Zero-initialize a coop accumulator.
     ZeroCoopAcc { id: CoopAccId },
     /// Cooperatively copy a workgroup-tile-sized region of a storage view into
@@ -465,30 +394,11 @@ pub enum SubgroupStmt {
     },
     /// Workgroup-scope memory barrier.
     Barrier,
-    /// `acc += coop_load_a(a_tile, a_row, a_col) * coop_load_b(b_tile, b_row, b_col)`.
-    /// Tile coordinates are the (row, col) of the 8x8 fragment within the
-    /// respective workgroup tile.
-    MmaFromTiles {
-        acc: CoopAccId,
-        a_tile: TileRef,
-        a_row: TileIndexExpr,
-        a_col: TileIndexExpr,
-        b_tile: TileRef,
-        b_row: TileIndexExpr,
-        b_col: TileIndexExpr,
-    },
-    /// Cooperatively load an 8x8 A fragment from a workgroup tile and bind it
-    /// to `id` for subsequent `Mma` references in the same scope.
-    LoadCoopA {
+    /// Cooperatively load an 8x8 fragment from a workgroup tile and bind it to
+    /// `id` for subsequent `Mma` references in the same scope.
+    LoadCoop {
         id: CoopFragmentId,
-        tile: TileRef,
-        row: TileIndexExpr,
-        col: TileIndexExpr,
-    },
-    /// Cooperatively load an 8x8 B fragment from a workgroup tile and bind it
-    /// to `id`.
-    LoadCoopB {
-        id: CoopFragmentId,
+        role: CoopOperandRole,
         tile: TileRef,
         row: TileIndexExpr,
         col: TileIndexExpr,
@@ -508,17 +418,18 @@ pub enum SubgroupStmt {
         row: TileIndexExpr,
         col: TileIndexExpr,
     },
-    /// Fixed-iteration loop. Inside the body, `TileIndexExpr::LoopIndex`
-    /// resolves to the loop induction variable.
-    KLoop {
-        iterations: u32,
-        body: Vec<SubgroupStmt>,
+    /// Temporary generic loop form. Lowering emits `loop { ... }` with an
+    /// explicit top-of-loop break when `TileIndexExpr::LoopIndex` reaches
+    /// `max_iterations`.
+    WhileTrue {
+        max_iterations: u32,
+        body: Vec<TileStmt>,
     },
 }
 
 /// A masked tile store emitted by a source tile program.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct TileStoreProgramOp {
+pub struct TileStoreStmt {
     pub dst: StorageView,
     pub row: TileIndexExpr,
     pub col: TileIndexExpr,
@@ -632,7 +543,9 @@ pub enum TileExpr {
     /// Reference to a pinned subexpression. The first reference in a scope
     /// lowers the bound value into a private local; subsequent references in
     /// the same scope reuse it.
-    PinnedRef { id: PinId },
+    PinnedRef {
+        id: PinId,
+    },
     /// Reference to one accumulator output of a multi-output loop-fold group.
     /// The first reference materializes the shared K-loop; subsequent
     /// references reuse the per-accumulator local.

@@ -14,47 +14,56 @@ impl<'a> Lowerer<'a> {
         }
 
         let mut body = Block::new();
-        if !op.coop_body.is_empty() {
-            self.lower_subgroup_body(expressions, scratch, &mut body, &op.coop_body)?;
-        }
-        for store in &op.stores {
-            self.block_dequant_cache.borrow_mut().clear();
-            self.pin_cache.borrow_mut().clear();
-            // loop_fold_group_cache is intentionally NOT cleared here — group
-            // outputs survive across stores because the K loop is emitted into
-            // the outer body block, dominated by every store that follows.
-            let value =
-                self.lower_tile_expr_lane(expressions, scratch, &mut body, &store.value, 0)?;
-            let mask =
-                self.lower_tile_mask_expr(expressions, scratch, &mut body, &store.mask, 0)?;
-            let mut accept = Block::new();
-            let row =
-                self.lower_tile_index_expr(expressions, scratch, &mut accept, &store.row, 0)?;
-            let col =
-                self.lower_tile_index_expr(expressions, scratch, &mut accept, &store.col, 0)?;
-            let (dst_index, dst_index_emits) =
-                self.storage_index_from_coords(expressions, &store.dst, &[row, col])?;
-            let (dst_ptr, dst_ptr_emits) =
-                self.storage_dynamic_pointer(expressions, &store.dst, dst_index)?;
-            Self::push_emits(&mut accept, dst_index_emits);
-            Self::push_emits(&mut accept, dst_ptr_emits);
-            accept.push(
-                Statement::Store {
-                    pointer: dst_ptr,
-                    value,
-                },
-                Span::default(),
-            );
-            body.push(
-                Statement::If {
-                    condition: mask,
-                    accept,
-                    reject: Block::new(),
-                },
-                Span::default(),
-            );
+        for stmt in &op.body {
+            match stmt {
+                TileStmt::Store(store) => {
+                    self.lower_tile_store_stmt(expressions, scratch, &mut body, store)?;
+                }
+                _ => self.lower_tile_stmt(expressions, scratch, &mut body, stmt)?,
+            }
         }
         Ok(Statement::Block(body))
+    }
+
+    fn lower_tile_store_stmt(
+        &self,
+        expressions: &mut Arena<Expression>,
+        scratch: ScratchLocals,
+        body: &mut Block,
+        store: &TileStoreStmt,
+    ) -> Result<(), LowerError> {
+        self.block_dequant_cache.borrow_mut().clear();
+        self.pin_cache.borrow_mut().clear();
+        // loop_fold_group_cache is intentionally NOT cleared here — group
+        // outputs survive across stores because the K loop is emitted into
+        // the outer body block, dominated by every store that follows.
+        let value = self.lower_tile_expr_lane(expressions, scratch, body, &store.value, 0)?;
+        let mask = self.lower_tile_mask_expr(expressions, scratch, body, &store.mask, 0)?;
+        let mut accept = Block::new();
+        let row = self.lower_tile_index_expr(expressions, scratch, &mut accept, &store.row, 0)?;
+        let col = self.lower_tile_index_expr(expressions, scratch, &mut accept, &store.col, 0)?;
+        let (dst_index, dst_index_emits) =
+            self.storage_index_from_coords(expressions, &store.dst, &[row, col])?;
+        let (dst_ptr, dst_ptr_emits) =
+            self.storage_dynamic_pointer(expressions, &store.dst, dst_index)?;
+        Self::push_emits(&mut accept, dst_index_emits);
+        Self::push_emits(&mut accept, dst_ptr_emits);
+        accept.push(
+            Statement::Store {
+                pointer: dst_ptr,
+                value,
+            },
+            Span::default(),
+        );
+        body.push(
+            Statement::If {
+                condition: mask,
+                accept,
+                reject: Block::new(),
+            },
+            Span::default(),
+        );
+        Ok(())
     }
 
     fn lower_tile_expr_lane(
@@ -315,7 +324,14 @@ impl<'a> Lowerer<'a> {
                 Ok(value)
             }
             TileExpr::LoopFoldGroupOutput { group, lane } => self
-                .lower_tile_loop_fold_group_output(expressions, scratch, body, *group, *lane, spill_depth),
+                .lower_tile_loop_fold_group_output(
+                    expressions,
+                    scratch,
+                    body,
+                    *group,
+                    *lane,
+                    spill_depth,
+                ),
             TileExpr::Dot4 { a, b } => {
                 let mut a_handles = Vec::with_capacity(4);
                 let mut b_handles = Vec::with_capacity(4);
@@ -413,8 +429,10 @@ impl<'a> Lowerer<'a> {
                     ))
             })
             .collect::<Result<_, _>>()?;
-        let fill_value =
-            expressions.append(Expression::Literal(Literal::F32(fill.get())), Span::default());
+        let fill_value = expressions.append(
+            Expression::Literal(Literal::F32(fill.get())),
+            Span::default(),
+        );
         for local in &tmp_locals {
             let ptr = expressions.append(Expression::LocalVariable(*local), Span::default());
             body.push(
@@ -1156,10 +1174,9 @@ impl<'a> Lowerer<'a> {
         spill_depth: usize,
     ) -> Result<Handle<Expression>, LowerError> {
         if let Some(values) = self.loop_fold_group_cache.borrow().get(&group).cloned() {
-            return Ok(values
-                .get(lane as usize)
-                .copied()
-                .ok_or(LowerError::UnsupportedOperation("fold group lane out of range"))?);
+            return Ok(values.get(lane as usize).copied().ok_or(
+                LowerError::UnsupportedOperation("fold group lane out of range"),
+            )?);
         }
 
         let g = self
@@ -1174,11 +1191,9 @@ impl<'a> Lowerer<'a> {
                 "fold group initial count mismatch",
             ));
         }
-        let offset = self
-            .fold_group_offsets
-            .get(group.index())
-            .copied()
-            .ok_or(LowerError::UnsupportedOperation("fold group offset missing"))?;
+        let offset = self.fold_group_offsets.get(group.index()).copied().ok_or(
+            LowerError::UnsupportedOperation("fold group offset missing"),
+        )?;
         if offset + n > self.fold_accumulator_locals.len() {
             return Err(LowerError::UnsupportedOperation(
                 "fold group accumulator pool exhausted",
@@ -1217,7 +1232,8 @@ impl<'a> Lowerer<'a> {
 
         // Build loop body.
         let mut loop_body = Block::new();
-        let loop_index = expressions.append(Expression::Load { pointer: loop_ptr }, Span::default());
+        let loop_index =
+            expressions.append(Expression::Load { pointer: loop_ptr }, Span::default());
         loop_body.push(
             Statement::Emit(Self::single_expression_range(expressions, loop_index)),
             Span::default(),
@@ -1255,10 +1271,8 @@ impl<'a> Lowerer<'a> {
             )?;
             let acc_ptr =
                 expressions.append(Expression::LocalVariable(acc_locals[i]), Span::default());
-            let acc_load = expressions.append(
-                Expression::Load { pointer: acc_ptr },
-                Span::default(),
-            );
+            let acc_load =
+                expressions.append(Expression::Load { pointer: acc_ptr }, Span::default());
             loop_body.push(
                 Statement::Emit(Self::single_expression_range(expressions, acc_load)),
                 Span::default(),
@@ -1339,9 +1353,9 @@ impl<'a> Lowerer<'a> {
         };
         let result_ty = match element {
             ElementType::F32 => self.f32_ty,
-            ElementType::F16 => self
-                .f16_ty
-                .ok_or(LowerError::UnsupportedOperation("subgroup reduce on f16 requires f16 capability"))?,
+            ElementType::F16 => self.f16_ty.ok_or(LowerError::UnsupportedOperation(
+                "subgroup reduce on f16 requires f16 capability",
+            ))?,
             ElementType::U32 => self.u32_ty,
         };
         let result = expressions.append(

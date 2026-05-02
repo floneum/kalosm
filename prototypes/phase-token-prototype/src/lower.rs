@@ -11,13 +11,14 @@ use naga::{
 };
 
 use crate::ir::{
-    BlockDequantId, BufferAccess, BufferId, CoopAccId, CoopFragmentId, DynamicOffset, ElementType,
-    F32Bits, FlattenedMatrixMap, GgmlQuantFormat, Im2ColNhwcMap, KernelIr, Layout, LoopFoldGroupId,
-    MemoryLevel, Op, PinId, QuantizedMatrix, StorageIndexMap, StorageView, SubgroupStmt,
-    TileBinaryOp, TileCompareOp, TileExpr, TileId, TileIndexExpr, TileLiteral, TileLoadExpr,
-    TileMaskExpr, TileOrigin, TileProgramOp, TileQuantizedLoadExpr, TileReduceOp, TileRef,
-    TileScalarExpr, TileUnaryOp,
+    BlockDequantId, BufferAccess, BufferId, CoopAccId, CoopFragmentId, CoopOperandRole,
+    DynamicOffset, ElementType, F32Bits, FlattenedMatrixMap, Im2ColNhwcMap, KernelIr, Layout,
+    LoopFoldGroupId, MemoryLevel, Op, PinId, StorageIndexMap, StorageView, TileBinaryOp,
+    TileCompareOp, TileExpr, TileId, TileIndexExpr, TileLiteral, TileLoadExpr, TileMaskExpr,
+    TileOrigin, TileProgramOp, TileQuantizedLoadExpr, TileReduceOp, TileRef, TileScalarExpr,
+    TileStmt, TileStoreStmt, TileUnaryOp,
 };
+use crate::quantized::{GgmlQuantFormat, QuantizedMatrix};
 
 const LOCAL_INVOCATION_INDEX_ARG: u32 = 0;
 const WORKGROUP_ID_ARG: u32 = 1;
