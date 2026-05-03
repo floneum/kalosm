@@ -19,6 +19,7 @@ pub(crate) struct SliceAssignOperation {
     pub(crate) value: NodeIndex,
     pub(crate) slices: Box<[Range<usize>]>,
     pub(crate) input_shape: Box<[usize]>,
+    pub(crate) in_place: bool,
 }
 
 impl SliceAssignOperation {
@@ -33,10 +34,45 @@ impl SliceAssignOperation {
             value,
             slices,
             input_shape,
+            in_place: false,
+        }
+    }
+
+    pub fn new_in_place(
+        input: NodeIndex,
+        value: NodeIndex,
+        slices: Box<[Range<usize>]>,
+        input_shape: Box<[usize]>,
+    ) -> Self {
+        Self {
+            input,
+            value,
+            slices,
+            input_shape,
+            in_place: true,
+        }
+    }
+
+    fn value_shape(&self) -> Box<[usize]> {
+        self.slices
+            .iter()
+            .map(|slice| slice.end - slice.start)
+            .collect()
+    }
+
+    fn operation_shape(&self) -> Box<[usize]> {
+        if self.in_place {
+            self.value_shape()
+        } else {
+            self.input_shape.clone()
         }
     }
 
     fn expression(&self, datatype: DataTypeEnum) -> NaryExpr {
+        if self.in_place {
+            return NaryExpr::input(0, self.slices.len());
+        }
+
         let rank = self.slices.len();
         let mut condition = NaryExpr::scalar(NaryScalar::U32(1));
         for (dim, slice) in self.slices.iter().enumerate() {
@@ -97,11 +133,11 @@ impl SliceAssignOperation {
 
 impl Operation for SliceAssignOperation {
     fn workgroup_shape_constraints(&self, device: &crate::Device) -> WorkgroupShapeConstraints {
-        titled_map_workgroup_size_constraints(&self.input_shape, device)
+        titled_map_workgroup_size_constraints(&self.operation_shape(), device)
     }
 
     fn dispatch_size(&self, workgroup_shape: &WorkgroupShape, _inputs: &[MirValue]) -> [u32; 3] {
-        titled_map_dispatch_size(TILE_SIZE, *workgroup_shape, &self.input_shape)
+        titled_map_dispatch_size(TILE_SIZE, *workgroup_shape, &self.operation_shape())
     }
 
     fn visit_dependencies(&self, f: &mut dyn FnMut(NodeIndex)) {
@@ -113,6 +149,11 @@ impl Operation for SliceAssignOperation {
         // Pass the ORIGINAL input tensor (not sliced) and the value tensor
         let input = nodes.get_cached_result(self.input).unwrap();
         let value = nodes.get_cached_result(self.value).unwrap();
+
+        if self.in_place {
+            let output = input.slice(&self.slices);
+            return vec![input.clone().into(), value.clone().into(), output.into()];
+        }
 
         // Create output buffer with the same shape as input
         let output =
@@ -127,6 +168,23 @@ impl Operation for SliceAssignOperation {
         workgroup_shape: &WorkgroupShape,
         inputs: &[MirValue],
     ) -> Option<DirectKernel> {
+        if self.in_place {
+            let value = inputs[1].as_tensor()?;
+            let operation = NaryOperation {
+                inputs: vec![self.value],
+                expression: self.expression(value.datatype()),
+                shape: value.layout().shape().into(),
+                output_datatype: value.datatype(),
+            };
+            return crate::nary_direct::build_nary_direct_kernel_to_output(
+                &operation,
+                graph,
+                workgroup_shape,
+                &[inputs[1].clone(), inputs[2].clone()],
+                1,
+            );
+        }
+
         let input = inputs[0].as_tensor()?;
         let operation = NaryOperation {
             inputs: vec![self.input, self.value],
@@ -148,6 +206,10 @@ impl Operation for SliceAssignOperation {
     }
 
     fn output(&self, _nodes: &ComputeGraphInner, inputs: &[MirValue]) -> MirValue {
+        if self.in_place {
+            return inputs[0].clone();
+        }
+
         // Return the output tensor (last input)
         inputs[2].clone()
     }
@@ -167,5 +229,34 @@ impl Operation for SliceAssignOperation {
 impl<const R: usize, T: crate::DataType> Tensor<R, T> {
     pub fn slice_assign(&self, slices: [Range<usize>; R], value: &Self) -> Self {
         self.add_slice_assign(value, slices)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::{Device, Tensor};
+
+    #[tokio::test]
+    async fn slice_assign_in_place_updates_only_slice() {
+        let Ok(device) = Device::new().await else {
+            return;
+        };
+
+        let base_rows = vec![vec![0.0f32; 4]; 3];
+        let value_rows = vec![vec![1.0f32, 2.0], vec![3.0, 4.0]];
+        let base: Tensor<2, f32> = Tensor::new(&device, &base_rows);
+        let value: Tensor<2, f32> = Tensor::new(&device, &value_rows);
+
+        let updated = base.slice_assign_in_place([1..3, 1..3], &value);
+        let updated = updated.as_slice().await.unwrap();
+
+        assert_eq!(updated.shape(), &[3, 4]);
+        assert_eq!(updated[[0, 0]], 0.0);
+        assert_eq!(updated[[1, 0]], 0.0);
+        assert_eq!(updated[[1, 1]], 1.0);
+        assert_eq!(updated[[1, 2]], 2.0);
+        assert_eq!(updated[[2, 1]], 3.0);
+        assert_eq!(updated[[2, 2]], 4.0);
+        assert_eq!(updated[[2, 3]], 0.0);
     }
 }

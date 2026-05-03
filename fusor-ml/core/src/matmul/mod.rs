@@ -126,10 +126,6 @@ impl MatMulOperation {
         }
     }
 
-    pub fn matmul_dtype(&self) -> DataTypeEnum {
-        self.pre_element_wise[0].out_datatype()
-    }
-
     pub fn rank(&self) -> u32 {
         self.out_shape.len() as u32
     }
@@ -165,7 +161,11 @@ impl MatMulOperation {
             let a = tile_storage_read_with_direct_layout(phase, a_view);
             let b = tile_storage_read_with_direct_layout(phase, b_view);
             let y = tile_storage_write_with_direct_layout(phase, y_view);
-            phase.matmul::<256>(&a, &b, &y);
+            if n == 1 {
+                phase.gemv::<4, 4, 128>(&a, &b, &y);
+            } else {
+                phase.matmul::<256>(&a, &b, &y);
+            }
         });
         let dispatch_size = ir.single_tile_program_grid()?;
         let max_workgroups = device.limits().max_compute_workgroups_per_dimension;

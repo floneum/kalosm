@@ -8,6 +8,7 @@ use crate::{
         operation::Operation,
         workgroup_shape::WorkgroupShape,
     },
+    nary_direct::apply_unary_function_chain,
     tensor::{DataTypeEnum, TensorData},
     visit_tiled::distribute_workgroups,
 };
@@ -20,15 +21,6 @@ pub(crate) fn build_serial_matmul_direct_kernel(
     _workgroup_shape: &WorkgroupShape,
     inputs: &[MirValue],
 ) -> Option<DirectKernel> {
-    if operation
-        .pre_element_wise
-        .iter()
-        .any(|chain| !chain.functions.is_empty())
-        || !operation.post_element_wise.functions.is_empty()
-    {
-        return None;
-    }
-
     let [input_a, input_b, output] = inputs else {
         return None;
     };
@@ -57,8 +49,10 @@ pub(crate) fn build_serial_matmul_direct_kernel(
         .try_fold(1u32, |acc, dim| acc.checked_mul((*dim).try_into().ok()?))?;
     let dispatch_size = distribute_workgroups(total_outputs.div_ceil(BLOCK as u32));
     let cache_key = format!(
-        "{}:serial-tile-program:dispatch={dispatch_size:?}:{:?}:{:?}:{:?}:{:?}:{:?}:{:?}",
+        "{}:serial-tile-program:dispatch={dispatch_size:?}:pre={:?}:post={:?}:{:?}:{:?}:{:?}:{:?}:{:?}:{:?}",
         operation.name(),
+        operation.pre_element_wise,
+        operation.post_element_wise,
         input_a.datatype(),
         input_a.layout(),
         input_b.datatype(),
@@ -114,6 +108,18 @@ fn build_matmul_tile_ir(
     let a_meta = TensorMeta::new(input_a)?;
     let b_meta = TensorMeta::new(input_b)?;
     let y_meta = TensorMeta::new(output)?;
+    if operation.pre_element_wise[0].input_datatype() != a_meta.datatype
+        || operation.pre_element_wise[1].input_datatype() != b_meta.datatype
+    {
+        return None;
+    }
+    let a_product_dtype = operation.pre_element_wise[0].out_datatype();
+    let b_product_dtype = operation.pre_element_wise[1].out_datatype();
+    if a_product_dtype != b_product_dtype
+        || operation.post_element_wise.input_datatype() != a_product_dtype
+    {
+        return None;
+    }
     let out_shape = output
         .layout()
         .shape()
@@ -132,10 +138,11 @@ fn build_matmul_tile_ir(
         .last()
         .copied()
         .and_then(|value| value.try_into().ok())?;
-    let acc_dtype = match operation.matmul_dtype() {
+    let acc_dtype = match a_product_dtype {
         DataTypeEnum::U32 => DataTypeEnum::U32,
         DataTypeEnum::F32 | DataTypeEnum::F16 => DataTypeEnum::F32,
     };
+    let result_dtype = a_product_dtype;
 
     Some(tile_ir::tile::build(move |phase| {
         let a_storage = phase.storage_read_element_with_layout_offset::<2>(
@@ -179,8 +186,14 @@ fn build_matmul_tile_ir(
                 in_bounds.clone(),
                 zero_literal(b_meta.datatype),
             );
-            let a = cast_tile(a, a_meta.datatype, acc_dtype);
-            let b = cast_tile(b, b_meta.datatype, acc_dtype);
+            let (a, a_ty) =
+                apply_unary_function_chain(a, a_meta.datatype, &operation.pre_element_wise[0])
+                    .expect("validated matmul pre_element_wise[0] chain");
+            let (b, b_ty) =
+                apply_unary_function_chain(b, b_meta.datatype, &operation.pre_element_wise[1])
+                    .expect("validated matmul pre_element_wise[1] chain");
+            let a = cast_tile(a, a_ty, acc_dtype);
+            let b = cast_tile(b, b_ty, acc_dtype);
             let product = a * b;
             let sum = program.loop_fold(
                 tile_ir::TileReduceOp::Sum,
@@ -188,7 +201,11 @@ fn build_matmul_tile_ir(
                 product,
                 zero_literal(acc_dtype),
             );
-            let sum = cast_tile(sum, acc_dtype, y_meta.datatype);
+            let sum = cast_tile(sum, acc_dtype, result_dtype);
+            let (sum, sum_ty) =
+                apply_unary_function_chain(sum, result_dtype, &operation.post_element_wise)
+                    .expect("validated matmul post_element_wise chain");
+            let sum = cast_tile(sum, sum_ty, y_meta.datatype);
             program.store_erased(
                 y_storage.at(0, layout_index(&y_meta, &dims)),
                 sum,

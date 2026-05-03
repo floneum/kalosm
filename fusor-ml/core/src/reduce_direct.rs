@@ -7,6 +7,7 @@ use crate::{
         operation::Operation,
         workgroup_shape::WorkgroupShape,
     },
+    nary_direct::apply_unary_function_chain,
     nary_wise::NaryScalar,
     reduce::{ReduceOp, ReduceOperation},
     tensor::{DataTypeEnum, TensorData},
@@ -39,9 +40,11 @@ pub(crate) fn build_reduce_direct_kernel(
 
     let dispatch_size = operation.dispatch_size(workgroup_shape, inputs);
     let cache_key = format!(
-        "{}:tile-program:{:?}:dispatch={dispatch_size:?}:reduce={reduce_size}:stride={reduce_stride}:{:?}:{:?}:{:?}:{:?}",
+        "{}:tile-program:{:?}:dispatch={dispatch_size:?}:reduce={reduce_size}:stride={reduce_stride}:pre={:?}:post={:?}:{:?}:{:?}:{:?}:{:?}",
         operation.name(),
         workgroup_shape.shape(),
+        operation.pre_element_wise,
+        operation.post_element_wise,
         input.datatype(),
         input.layout(),
         output.datatype(),
@@ -97,6 +100,15 @@ fn build_reduce_tile_ir(
 ) -> Option<tile_ir::KernelIr> {
     let input_meta = TensorMeta::new(input)?;
     let output_meta = TensorMeta::new(output)?;
+    if operation.pre_element_wise.input_datatype() != input_meta.datatype {
+        return None;
+    }
+    let reduce_dtype = operation.pre_element_wise.out_datatype();
+    if reduce_dtype != operation.function.datatype()
+        || operation.post_element_wise.input_datatype() != reduce_dtype
+    {
+        return None;
+    }
     let output_shape = output
         .layout()
         .shape()
@@ -109,7 +121,6 @@ fn build_reduce_tile_ir(
         .iter()
         .try_fold(1u32, |acc, dim| acc.checked_mul(*dim))?;
     let reduce_op = tile_reduce_op(operation.function.op);
-    let reduce_dtype = operation.function.datatype();
     let initial = tile_literal(operation.function.initial_value);
 
     Some(tile_ir::tile::build(move |phase| {
@@ -138,9 +149,15 @@ fn build_reduce_tile_ir(
                 in_bounds.clone(),
                 zero_literal(input_meta.datatype),
             );
-            let value = cast_tile(value, input_meta.datatype, reduce_dtype);
+            let (value, value_ty) =
+                apply_unary_function_chain(value, input_meta.datatype, &operation.pre_element_wise)
+                    .expect("validated reduce pre_element_wise chain");
+            let value = cast_tile(value, value_ty, reduce_dtype);
             let reduced = program.loop_fold(reduce_op, reduce_size, value, initial);
-            let reduced = cast_tile(reduced, reduce_dtype, output_meta.datatype);
+            let (reduced, reduced_ty) =
+                apply_unary_function_chain(reduced, reduce_dtype, &operation.post_element_wise)
+                    .expect("validated reduce post_element_wise chain");
+            let reduced = cast_tile(reduced, reduced_ty, output_meta.datatype);
             let output_index = layout_index(&output_meta, &dims);
             program.store_erased(output_storage.at(0, output_index), reduced, in_bounds);
         });

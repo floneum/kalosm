@@ -277,7 +277,7 @@ impl Program {
                 return self.qgemv_perf::<4, 4, 8, 128>(a, b, y, workgroups_x);
             }
             GgmlQuantFormat::Q4K => {
-                return self.qgemv_perf::<4, 2, 8, 128>(a, b, y, workgroups_x);
+                return self.qgemv_perf::<4, 8, 8, 128>(a, b, y, workgroups_x);
             }
             GgmlQuantFormat::Q5_0 => {
                 return self.qgemv_perf::<2, 4, 16, 64>(a, b, y, workgroups_x);
@@ -295,7 +295,10 @@ impl Program {
                 return self.qgemv_perf::<2, 1, 8, 64>(a, b, y, workgroups_x);
             }
             GgmlQuantFormat::Q6K => {
-                return self.qgemv_perf::<4, 1, 16, 128>(a, b, y, workgroups_x);
+                if matrix_shape(&a.view.layout)[1] <= 4096 {
+                    return self.qgemv_perf::<4, 4, 8, 128>(a, b, y, workgroups_x);
+                }
+                return self.qgemv_perf::<4, 4, 16, 128>(a, b, y, workgroups_x);
             }
         }
     }
@@ -645,6 +648,80 @@ impl Program {
                 program.store(y.at(row, col), sum, mask);
             },
         );
+    }
+
+    pub fn gemv<
+        const ROWS_PER_WORKGROUP: usize,
+        const VALUES_PER_LANE: usize,
+        const BLOCK: usize,
+    >(
+        &mut self,
+        a: &Storage<F32, 2>,
+        x: &Storage<F32, 2>,
+        y: &Storage<F32, 2>,
+    ) {
+        const SUBGROUP_SIZE: u32 = 32;
+        assert!(
+            ROWS_PER_WORKGROUP > 0 && VALUES_PER_LANE > 0,
+            "gemv tile shape must be non-zero"
+        );
+        assert_eq!(
+            ROWS_PER_WORKGROUP as u32 * SUBGROUP_SIZE,
+            BLOCK as u32,
+            "gemv maps one output row to each subgroup"
+        );
+        assert!(
+            VALUES_PER_LANE % 4 == 0,
+            "gemv values per lane must be divisible by dot4 width"
+        );
+        let [m, k] = matrix_shape(&a.view.layout);
+        let [x_k, n] = matrix_shape(&x.view.layout);
+        let [y_m, y_n] = matrix_shape(&y.view.layout);
+        assert_eq!(k, x_k, "gemv K dimensions must match");
+        assert_eq!(n, 1, "gemv expects a single RHS column");
+        assert_eq!(m, y_m, "gemv output row count must match A");
+        assert_eq!(y_n, 1, "gemv output must have a single column");
+
+        let k_per_iter = SUBGROUP_SIZE * VALUES_PER_LANE as u32;
+        let k_iterations = k.div_ceil(k_per_iter);
+        self.program_grid::<BLOCK>([m.div_ceil(ROWS_PER_WORKGROUP as u32), 1, 1], |program| {
+            let row = program.program_id(WorkgroupAxis::X) * ROWS_PER_WORKGROUP as u32
+                + program.subgroup_id();
+            let lane = program.subgroup_lane();
+            let row_in_bounds = row.lt(m);
+            let zero = TileLiteral::F32(F32Bits::new(0.0));
+            let [sum] =
+                program.loop_fold_n::<1, _>(TileReduceOp::Sum, k_iterations, [zero], |program| {
+                    let k_base =
+                        program.loop_index() * k_per_iter + lane.clone() * VALUES_PER_LANE as u32;
+                    let a_values: [Tile<BLOCK>; VALUES_PER_LANE] = std::array::from_fn(|i| {
+                        let k_index = k_base.clone() + i as u32;
+                        let mask = row_in_bounds.clone().and(k_index.lt(k));
+                        program.load(a.at(&row, k_index), mask, 0.0)
+                    });
+                    let x_values: [Tile<BLOCK>; VALUES_PER_LANE] = std::array::from_fn(|i| {
+                        let k_index = k_base.clone() + i as u32;
+                        program.load(x.at(k_index.clone(), 0), k_index.lt(k), 0.0)
+                    });
+                    let mut sum: Option<Tile<BLOCK>> = None;
+                    let chunks = VALUES_PER_LANE / 4;
+                    for chunk in 0..chunks {
+                        let a_vec: [Tile<BLOCK>; 4] =
+                            std::array::from_fn(|i| a_values[chunk * 4 + i].clone());
+                        let x_vec: [Tile<BLOCK>; 4] =
+                            std::array::from_fn(|i| x_values[chunk * 4 + i].clone());
+                        let term = program.dot4(a_vec, x_vec);
+                        sum = Some(match sum {
+                            Some(prev) => prev + term,
+                            None => term,
+                        });
+                    }
+                    [sum.expect("VALUES_PER_LANE >= 4")]
+                });
+            let reduced = program.subgroup_reduce_sum(sum);
+            let mask = lane.eq(0).and(row_in_bounds);
+            program.store(y.at(row, 0), reduced, mask);
+        });
     }
 
     pub fn qdequantize(&mut self, b: &QuantizedMatrix, y: &Storage<F32, 1>, workgroups_x: u32) {

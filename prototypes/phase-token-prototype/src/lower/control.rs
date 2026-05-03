@@ -7,6 +7,32 @@ impl<'a> Lowerer<'a> {
         }
     }
 
+    pub(super) fn push_guarded_or_full_block(
+        body: &mut Block,
+        guard_emits: Vec<Range<Expression>>,
+        condition: Option<Handle<Expression>>,
+        accept: Block,
+    ) {
+        if let Some(condition) = condition {
+            Self::push_emits(body, guard_emits);
+            body.push(
+                Statement::If {
+                    condition,
+                    accept,
+                    reject: Block::new(),
+                },
+                Span::default(),
+            );
+        } else if guard_emits.is_empty() {
+            body.push(Statement::Block(accept), Span::default());
+        } else {
+            let mut block = Block::new();
+            Self::push_emits(&mut block, guard_emits);
+            block.push(Statement::Block(accept), Span::default());
+            body.push(Statement::Block(block), Span::default());
+        }
+    }
+
     pub(super) fn single_expression_range(
         _expressions: &Arena<Expression>,
         value: Handle<Expression>,

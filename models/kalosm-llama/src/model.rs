@@ -129,12 +129,12 @@ where
             );
         }
 
-        let mut cache = cache;
-        let logits = model.forward(tokens, images, device, cache.as_deref_mut());
-        let cache_keys = cache
-            .as_ref()
-            .map(|cache| cache.gpu_keys())
-            .unwrap_or_default();
+        let trace = std::env::var_os("FUSOR_TRACE_RESOLVE").is_some();
+        let build_start = trace.then(std::time::Instant::now);
+        let logits = model.forward(tokens, images, device, cache);
+        if let Some(start) = build_start {
+            eprintln!("forward_graph_build elapsed={:?}", start.elapsed());
+        }
         let device = device.clone();
         Box::pin(async move {
             let logits = logits?;
@@ -142,12 +142,18 @@ where
             // Cast logits back to f32 for sampling
             let logits: fusor::Tensor<1, f32> = logits.cast();
             let len = logits.shape()[0];
-            let mut resolve_keys = cache_keys;
             if let Some(logits_key) = logits.gpu_key() {
-                resolve_keys.push(logits_key);
+                let resolve_start = trace.then(std::time::Instant::now);
+                device.resolve_batch(&[logits_key]);
+                if let Some(start) = resolve_start {
+                    eprintln!("forward_resolve elapsed={:?}", start.elapsed());
+                }
             }
-            device.resolve_batch(&resolve_keys);
+            let download_start = trace.then(std::time::Instant::now);
             let logits = logits.as_slice().await?;
+            if let Some(start) = download_start {
+                eprintln!("forward_download elapsed={:?}", start.elapsed());
+            }
             let mut logits_vec = Vec::with_capacity(len);
             for i in 0..len {
                 let logit = logits[[i]];

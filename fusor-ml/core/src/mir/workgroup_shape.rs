@@ -117,6 +117,7 @@ impl WorkgroupShapeConstraints {
         })
     }
 
+    #[allow(dead_code)]
     pub(crate) fn merge(&mut self, other: &Self) {
         for (i, constraints) in other.shape.iter().enumerate() {
             self.shape[i].extend(constraints.clone());

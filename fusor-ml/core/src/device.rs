@@ -404,6 +404,10 @@ impl Device {
         &self.inner.queue
     }
 
+    pub(crate) fn is_same_device(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.inner, &other.inner)
+    }
+
     /// Block until all submitted GPU work has completed.
     pub fn poll_wait(&self) {
         poll_until_queue_empty(&self.inner.device).expect("Failed to poll GPU device");

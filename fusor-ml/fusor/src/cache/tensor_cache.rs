@@ -102,7 +102,12 @@ where
                     0..v_shape[i]
                 }
             });
-            *cached = cached.slice_assign(slice, v);
+            *cached = match (&*cached, v) {
+                (Tensor::Gpu(cached), Tensor::Gpu(v)) => {
+                    Tensor::Gpu(cached.slice_assign_in_place(slice, v))
+                }
+                _ => cached.slice_assign(slice, v),
+            };
             self.current_seq_len = required_seq_len;
             // Return only the valid portion of the cache, not the full allocated tensor
             cached

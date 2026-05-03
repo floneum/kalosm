@@ -52,8 +52,9 @@ impl GgmlQuantFormat {
             Self::Q2K => 4,
             Self::Q4_0 | Self::Q4_1 | Self::Q5_1 => 4,
             Self::Q5_0 => 4,
-            Self::Q3K | Self::Q4K | Self::Q8K => 2,
-            Self::Q6K => 2,
+            Self::Q3K | Self::Q8K => 2,
+            Self::Q4K => 8,
+            Self::Q6K => 4,
             Self::Q8_0 | Self::Q8_1 => 4,
             Self::Q5K => 1,
         }
@@ -61,7 +62,7 @@ impl GgmlQuantFormat {
 
     pub const fn qgemv_subgroups_per_workgroup(self) -> u32 {
         match self {
-            Self::Q4K | Self::Q8_0 | Self::Q8_1 => 4,
+            Self::Q4K | Self::Q6K | Self::Q8_0 | Self::Q8_1 => 4,
             _ => 2,
         }
     }

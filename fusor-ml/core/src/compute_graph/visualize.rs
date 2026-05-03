@@ -89,6 +89,31 @@ impl GraphVisPass {
         self.identities.insert(key, id.clone());
     }
 
+    fn visit_rms_norm(&mut self, key: NodeIndex, operation: &crate::RmsNormOperation) {
+        let input = self.identities.get(&operation.input).unwrap();
+        let weight = self.identities.get(&operation.weight).unwrap();
+        let output_layout = self.layout_pass.output_layout.get(&key).unwrap();
+        let id = Identity::quoted(format!("rms_norm ({}) #{:?}", output_layout, key));
+        self.statements.push(Stmt::Node {
+            id: id.clone(),
+            port: None,
+            attr: None,
+        });
+        self.statements.push(Stmt::Edge(
+            Edge::head_node(input.clone(), None).arrow_to_node(id.clone(), None),
+        ));
+        self.statements.push(Stmt::Edge(
+            Edge::head_node(weight.clone(), None).arrow_to_node(id.clone(), None),
+        ));
+        if let Some(bias) = operation.bias {
+            let bias = self.identities.get(&bias).unwrap();
+            self.statements.push(Stmt::Edge(
+                Edge::head_node(bias.clone(), None).arrow_to_node(id.clone(), None),
+            ));
+        }
+        self.identities.insert(key, id.clone());
+    }
+
     fn visit_map_layout(
         &mut self,
         key: NodeIndex,
@@ -161,6 +186,25 @@ impl GraphVisPass {
         self.identities.insert(key, id.clone());
     }
 
+    fn visit_q_embedding(
+        &mut self,
+        key: NodeIndex,
+        operation: &crate::quantized::embedding::QEmbeddingOperation,
+    ) {
+        let indexes = self.identities.get(&operation.indexes).unwrap();
+        let output_layout = self.layout_pass.output_layout.get(&key).unwrap();
+        let id = Identity::quoted(format!("q_embedding ({}) #{:?}", output_layout, key));
+        self.statements.push(Stmt::Node {
+            id: id.clone(),
+            port: None,
+            attr: None,
+        });
+        self.statements.push(Stmt::Edge(
+            Edge::head_node(indexes.clone(), None).arrow_to_node(id.clone(), None),
+        ));
+        self.identities.insert(key, id.clone());
+    }
+
     fn visit_tensor(&mut self, key: NodeIndex, _operation: &crate::tensor::TensorData) {
         let output_layout = self.layout_pass.output_layout.get(&key).unwrap();
         let id = Identity::quoted(format!("tensor ({}) #{:?}", output_layout, key));
@@ -218,7 +262,11 @@ impl ComputeGraphInner {
                 ComputeGraphNodeVariant::Nary(op) => graph_vis_pass.visit_nary(node, op),
                 ComputeGraphNodeVariant::MatMul(op) => graph_vis_pass.visit_mat_mul(node, op),
                 ComputeGraphNodeVariant::QMatMul(op) => graph_vis_pass.visit_q_mat_mul(node, op),
+                ComputeGraphNodeVariant::QEmbedding(op) => {
+                    graph_vis_pass.visit_q_embedding(node, op)
+                }
                 ComputeGraphNodeVariant::Reduce(op) => graph_vis_pass.visit_reduce(node, op),
+                ComputeGraphNodeVariant::RmsNorm(op) => graph_vis_pass.visit_rms_norm(node, op),
                 ComputeGraphNodeVariant::MapLayout(op) => graph_vis_pass.visit_map_layout(node, op),
                 ComputeGraphNodeVariant::Resize(op) => graph_vis_pass.visit_resize(node, op),
                 ComputeGraphNodeVariant::SliceAssign(op) => {

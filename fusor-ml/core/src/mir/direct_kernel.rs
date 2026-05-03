@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use wgpu::{CommandEncoder, PipelineCompilationOptions};
+use wgpu::{CommandEncoder, ComputePass, PipelineCompilationOptions};
 
 use crate::Device;
 
@@ -30,6 +30,12 @@ pub(crate) struct DirectKernel {
     module: Option<wgpu::naga::Module>,
     prepared_pipeline: Option<wgpu::ComputePipeline>,
     bindings: DirectKernelBindings,
+    dispatch_size: [u32; 3],
+}
+
+pub(crate) struct PreparedDirectDispatch {
+    pipeline: wgpu::ComputePipeline,
+    bind_group: wgpu::BindGroup,
     dispatch_size: [u32; 3],
 }
 
@@ -75,9 +81,20 @@ impl DirectKernel {
     }
 
     pub(crate) fn run(&self, device: &Device, command_encoder: &mut CommandEncoder) {
+        let Some(dispatch) = self.prepare_dispatch(device) else {
+            return;
+        };
+        let mut pass = command_encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some(&self.name),
+            timestamp_writes: None,
+        });
+        dispatch.run(&mut pass);
+    }
+
+    pub(crate) fn prepare_dispatch(&self, device: &Device) -> Option<PreparedDirectDispatch> {
         let [x, y, z] = self.dispatch_size;
         if x * y * z == 0 {
-            return;
+            return None;
         }
 
         if let DirectKernelBindings::Storage3 {
@@ -109,8 +126,12 @@ impl DirectKernel {
                     entries: &bind_entries,
                 });
             let pipeline_layout = device.direct_storage3_pipeline_layout();
-            self.run_with_layout(device, command_encoder, bind_group, pipeline_layout);
-            return;
+            let pipeline = self.pipeline_with_layout(device, pipeline_layout);
+            return Some(PreparedDirectDispatch {
+                pipeline,
+                bind_group,
+                dispatch_size: self.dispatch_size,
+            });
         }
 
         let DirectKernelBindings::Dynamic(bindings) = &self.bindings else {
@@ -183,19 +204,20 @@ impl DirectKernel {
             })
             .clone();
 
-        self.run_with_layout(device, command_encoder, bind_group, pipeline_layout);
+        let pipeline = self.pipeline_with_layout(device, pipeline_layout);
+        Some(PreparedDirectDispatch {
+            pipeline,
+            bind_group,
+            dispatch_size: self.dispatch_size,
+        })
     }
 
-    fn run_with_layout(
+    fn pipeline_with_layout(
         &self,
         device: &Device,
-        command_encoder: &mut CommandEncoder,
-        bind_group: wgpu::BindGroup,
         pipeline_layout: wgpu::PipelineLayout,
-    ) {
-        let [x, y, z] = self.dispatch_size;
-
-        let pipeline = if let Some(pipeline) = &self.prepared_pipeline {
+    ) -> wgpu::ComputePipeline {
+        if let Some(pipeline) = &self.prepared_pipeline {
             pipeline.clone()
         } else {
             let module_ir = self
@@ -228,15 +250,7 @@ impl DirectKernel {
                         })
                 })
                 .clone()
-        };
-
-        let mut pass = command_encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-            label: Some(&self.name),
-            timestamp_writes: None,
-        });
-        pass.set_pipeline(&pipeline);
-        pass.set_bind_group(0, &bind_group, &[]);
-        pass.dispatch_workgroups(x, y, z);
+        }
     }
 
     #[cfg(test)]
@@ -265,5 +279,14 @@ impl DirectKernel {
                 },
             ],
         }
+    }
+}
+
+impl PreparedDirectDispatch {
+    pub(crate) fn run<'a>(&'a self, pass: &mut ComputePass<'a>) {
+        let [x, y, z] = self.dispatch_size;
+        pass.set_pipeline(&self.pipeline);
+        pass.set_bind_group(0, &self.bind_group, &[]);
+        pass.dispatch_workgroups(x, y, z);
     }
 }

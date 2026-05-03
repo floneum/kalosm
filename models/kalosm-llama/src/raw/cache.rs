@@ -1,6 +1,5 @@
-use fusor::NodeIndex;
-use fusor::SimdElement;
 use fusor::cache::KvCache;
+use fusor::SimdElement;
 
 use super::LlamaConfig;
 
@@ -51,13 +50,5 @@ impl LlamaCache {
         for block in &mut self.blocks {
             block.reset()
         }
-    }
-
-    pub(crate) fn gpu_keys(&self) -> Vec<NodeIndex> {
-        self.blocks
-            .iter()
-            .flat_map(|block| [block.k(), block.v()])
-            .filter_map(|tensor| tensor.and_then(|tensor| tensor.gpu_key()))
-            .collect()
     }
 }

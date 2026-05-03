@@ -99,6 +99,18 @@ pub enum QMatrix {
 }
 
 impl QMatrix {
+    pub fn concat_rows(matrices: &[&Self]) -> Option<Self> {
+        let gpu_matrices = matrices
+            .iter()
+            .map(|matrix| match *matrix {
+                QMatrix::Gpu(matrix) => Some(matrix),
+                _ => None,
+            })
+            .collect::<Option<Vec<_>>>()?;
+
+        GpuQMatrix::concat_rows(&gpu_matrices).map(QMatrix::Gpu)
+    }
+
     /// Returns the quantization type (e.g., Q4_0, Q8_0, Q4K, etc.)
     pub fn ggml_type(&self) -> GgmlType {
         match self {

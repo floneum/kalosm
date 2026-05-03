@@ -1,4 +1,4 @@
-use std::{num::NonZeroUsize, sync::Arc};
+use std::{mem::size_of, num::NonZeroUsize, sync::Arc};
 
 use crate::Device;
 use fusor_gguf::{
@@ -10,9 +10,45 @@ use parking_lot::RwLock;
 use rustc_hash::FxBuildHasher;
 
 pub(crate) mod dequantize;
+pub(crate) mod embedding;
 pub(crate) mod matmul;
 
 const QMATRIX_DIRECT_PIPELINE_CACHE_SIZE: usize = 16;
+
+fn padded_copy_size(size: u64) -> u64 {
+    let align_mask = wgpu::COPY_BUFFER_ALIGNMENT - 1;
+    ((size + align_mask) & !align_mask).max(wgpu::COPY_BUFFER_ALIGNMENT)
+}
+
+fn quantized_storage_size<B: GgufBlock>(element_count: usize) -> Option<u64> {
+    if !element_count.is_multiple_of(B::BLOCK_SIZE) {
+        return None;
+    }
+
+    let blocks = element_count / B::BLOCK_SIZE;
+    blocks
+        .checked_mul(size_of::<B::BytesF32>())
+        .and_then(|bytes| u64::try_from(bytes).ok())
+}
+
+fn matrix_storage_size(shape: &[usize], datatype: GgmlType) -> Option<u64> {
+    let element_count = shape
+        .iter()
+        .try_fold(1usize, |acc, dim| acc.checked_mul(*dim))?;
+
+    match datatype {
+        GgmlType::Q4_0 => quantized_storage_size::<BlockQ4_0>(element_count),
+        GgmlType::Q5_0 => quantized_storage_size::<BlockQ5_0>(element_count),
+        GgmlType::Q8_0 => quantized_storage_size::<BlockQ8_0>(element_count),
+        GgmlType::Q4K => quantized_storage_size::<BlockQ4K>(element_count),
+        GgmlType::Q5K => quantized_storage_size::<BlockQ5K>(element_count),
+        GgmlType::Q6K => quantized_storage_size::<BlockQ6K>(element_count),
+        GgmlType::F32 => element_count
+            .checked_mul(size_of::<f32>())
+            .and_then(|bytes| u64::try_from(bytes).ok()),
+        _ => None,
+    }
+}
 
 #[derive(Clone)]
 pub struct QMatrix {
@@ -41,6 +77,78 @@ impl PartialEq for QMatrix {
 }
 
 impl QMatrix {
+    pub fn concat_rows(matrices: &[&Self]) -> Option<Self> {
+        let first = matrices.first().copied()?;
+        if matrices.len() == 1 {
+            return Some(first.clone());
+        }
+        if first.shape.len() != 2 {
+            return None;
+        }
+
+        let datatype = first.datatype;
+        let device = first.device.clone();
+        let columns = first.shape[1];
+        let mut rows = 0usize;
+        let mut storage_sizes = Vec::with_capacity(matrices.len());
+        let mut total_storage_size = 0u64;
+
+        for matrix in matrices {
+            if matrix.shape.len() != 2
+                || matrix.shape[1] != columns
+                || matrix.datatype != datatype
+                || !matrix.device.is_same_device(&device)
+            {
+                return None;
+            }
+
+            let storage_size = matrix_storage_size(&matrix.shape, matrix.datatype)?;
+            if storage_size > matrix.buffer.size() {
+                return None;
+            }
+
+            rows = rows.checked_add(matrix.shape[0])?;
+            total_storage_size = total_storage_size.checked_add(storage_size)?;
+            storage_sizes.push(storage_size);
+        }
+
+        let buffer = device.create_buffer(
+            padded_copy_size(total_storage_size),
+            wgpu::BufferUsages::STORAGE
+                | wgpu::BufferUsages::COPY_SRC
+                | wgpu::BufferUsages::COPY_DST,
+        );
+        let mut command_encoder =
+            device
+                .wgpu_device()
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("QMatrix row concat"),
+                });
+        let mut destination_offset = 0u64;
+        for (matrix, storage_size) in matrices.iter().zip(storage_sizes) {
+            command_encoder.copy_buffer_to_buffer(
+                &matrix.buffer,
+                0,
+                &buffer,
+                destination_offset,
+                storage_size,
+            );
+            destination_offset += storage_size;
+        }
+        device.wgpu_queue().submit(Some(command_encoder.finish()));
+
+        Some(QMatrix {
+            device,
+            shape: Box::new([rows, columns]),
+            buffer,
+            datatype,
+            direct_pipeline_cache: Arc::new(RwLock::new(LruCache::with_hasher(
+                NonZeroUsize::new(QMATRIX_DIRECT_PIPELINE_CACHE_SIZE).unwrap(),
+                Default::default(),
+            ))),
+        })
+    }
+
     pub fn read_from_file<R: std::io::Read + std::io::Seek>(
         device: &Device,
         metadata: &GgufMetadata,
@@ -162,5 +270,42 @@ impl QMatrix {
 
     pub fn datatype(&self) -> GgmlType {
         self.datatype
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn concat_rows_combines_f32_gpu_matrices() {
+        let Ok(device) = Device::new().await else {
+            return;
+        };
+
+        let first_raw: Vec<u8> = (1..=8)
+            .map(|value| value as f32)
+            .flat_map(f32::to_le_bytes)
+            .collect();
+        let second_raw: Vec<u8> = (9..=12)
+            .map(|value| value as f32)
+            .flat_map(f32::to_le_bytes)
+            .collect();
+        let first =
+            QMatrix::from_parts(&device, &first_raw, Box::new([2, 4]), GgmlType::F32).unwrap();
+        let second =
+            QMatrix::from_parts(&device, &second_raw, Box::new([1, 4]), GgmlType::F32).unwrap();
+
+        let combined = QMatrix::concat_rows(&[&first, &second]).unwrap();
+        let dequantized: crate::Tensor<2, f32> = combined.dequantize();
+        let values = dequantized.as_slice().await.unwrap();
+
+        assert_eq!(combined.shape(), &[3, 4]);
+        assert_eq!(values.shape(), &[3, 4]);
+        for row in 0..3 {
+            for col in 0..4 {
+                assert_eq!(values[[row, col]], (row * 4 + col + 1) as f32);
+            }
+        }
     }
 }

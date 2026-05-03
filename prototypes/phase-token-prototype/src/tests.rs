@@ -180,6 +180,23 @@ fn coop_qmatmul_q8_0_lowers_through_subgroup_dsl() {
 }
 
 #[test]
+fn coop_qmatmul_q5_0_large_benchmark_shape_lowers() {
+    const M: u32 = 512;
+    const K: u32 = 576;
+    const N: u32 = 1536;
+    let ir = tile::build(|phase| {
+        let a = phase.storage_read::<F32, 2>(Shape::new([M, K]));
+        let b = phase.quantized_matrix(GgmlQuantFormat::Q5_0, K, N);
+        let y = phase.storage_write::<F32, 2>(Shape::new([M, N]));
+        phase.qmatmul::<128, 128, 32>(&a, &b, &y, 4);
+    });
+
+    assert_only_tile_programs(&ir);
+    ir.lower_to_naga()
+        .unwrap_or_else(|error| panic!("large Q5_0 coop qmatmul lowering failed: {error}"));
+}
+
+#[test]
 fn primitive_qgemm_q8_0_in_dsl() {
     // Scalar qgemm expressed in primitives — one output cell per subgroup.
     // The K-axis dot product is tiled with the same vectorized dequant + dot4

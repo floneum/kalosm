@@ -168,8 +168,8 @@ impl UnaryFunctionChain {
     }
 
     pub fn out_datatype(&self) -> DataTypeEnum {
-        if let Some(first) = self.functions.first() {
-            first.output_type
+        if let Some(last) = self.functions.last() {
+            last.output_type
         } else {
             self.input_datatype
         }
@@ -391,7 +391,53 @@ impl NaryOperation {
     /// Attempt to extract a unary function chain from this NaryOperation.
     /// This will only succeed if there is only a single input to the operation.
     pub(crate) fn try_extract_unary_chain(&self) -> Option<ExtractedUnaryChain> {
-        None
+        if self.inputs.len() != 1 {
+            return None;
+        }
+
+        let mut functions = Vec::new();
+        if !Self::collect_unary_chain(&self.expression, &mut functions)? {
+            return None;
+        }
+        if functions.is_empty() {
+            return None;
+        }
+
+        let input_datatype = functions.first()?.input_types.first().copied()?;
+        let mut current = input_datatype;
+        for function in &functions {
+            if function.input_types.as_slice() != [current] {
+                return None;
+            }
+            current = function.output_type;
+        }
+        if current != self.output_datatype {
+            return None;
+        }
+
+        Some(ExtractedUnaryChain {
+            value: self.inputs[0],
+            functions: UnaryFunctionChain::new(functions, input_datatype),
+        })
+    }
+
+    fn collect_unary_chain(expr: &NaryExpr, functions: &mut Vec<NaryFunction>) -> Option<bool> {
+        match expr {
+            NaryExpr::IndexedInput { input_idx, indices } => {
+                Some(*input_idx == 0 && NaryExpr::is_elementwise_indices(indices))
+            }
+            NaryExpr::Op { children, function } => {
+                if children.len() != 1 || function.input_types.len() != 1 {
+                    return None;
+                }
+                if !Self::collect_unary_chain(&children[0], functions)? {
+                    return Some(false);
+                }
+                functions.push(function.clone());
+                Some(true)
+            }
+            NaryExpr::DimIndex(_) | NaryExpr::Scalar(_) => None,
+        }
     }
 }
 

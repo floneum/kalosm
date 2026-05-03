@@ -196,6 +196,75 @@ async fn gpu_gelu_lowers_to_one_kernel() {
 }
 
 #[tokio::test]
+async fn gpu_matmul_then_unary_chain_fuses_into_one_kernel() {
+    let Some(device) = gpu_device().await else {
+        return;
+    };
+
+    let a_shape = [2, 3];
+    let b_shape = [3, 4];
+    let a_data = matrix_data(a_shape, 0.2);
+    let b_data = matrix_data(b_shape, -0.1);
+    let a = Tensor::from_slice(&device, a_shape, &a_data);
+    let b = Tensor::from_slice(&device, b_shape, &b_data);
+
+    let matmul = a.mat_mul(&b);
+    let result = matmul.cos() + 1.0;
+    assert_eq!(result.as_gpu().unwrap().count_kernels_to_resolve(), 1);
+
+    let cpu_a = Tensor::from_slice(&Device::Cpu, a_shape, &a_data);
+    let cpu_b = Tensor::from_slice(&Device::Cpu, b_shape, &b_data);
+    let expected = (cpu_a.mat_mul(&cpu_b).cos() + 1.0).to_concrete();
+    approx_eq(&result.to_concrete(), &expected, 1e-5)
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn gpu_unary_inputs_fuse_into_matmul_kernel() {
+    let Some(device) = gpu_device().await else {
+        return;
+    };
+
+    let a_shape = [2, 3];
+    let b_shape = [3, 4];
+    let a_data = matrix_data(a_shape, 0.7);
+    let b_data = matrix_data(b_shape, 0.4);
+    let a = Tensor::from_slice(&device, a_shape, &a_data);
+    let b = Tensor::from_slice(&device, b_shape, &b_data);
+
+    let result = (-a.clone()).mat_mul(&b.sin());
+    assert_eq!(result.as_gpu().unwrap().count_kernels_to_resolve(), 1);
+
+    let cpu_a = Tensor::from_slice(&Device::Cpu, a_shape, &a_data);
+    let cpu_b = Tensor::from_slice(&Device::Cpu, b_shape, &b_data);
+    let expected = (-cpu_a.clone()).mat_mul(&cpu_b.sin()).to_concrete();
+    approx_eq(&result.to_concrete(), &expected, 1e-5)
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn gpu_reduce_then_unary_chain_fuses_into_one_kernel() {
+    let Some(device) = gpu_device().await else {
+        return;
+    };
+
+    let shape = [3, 5];
+    let data = matrix_data(shape, 0.3);
+    let tensor = Tensor::from_slice(&device, shape, &data);
+    let reduced = tensor.sum::<1>(0);
+    let result = reduced.cos() + 1.0;
+    assert_eq!(result.as_gpu().unwrap().count_kernels_to_resolve(), 1);
+
+    let cpu = Tensor::from_slice(&Device::Cpu, shape, &data);
+    let expected = (cpu.sum::<1>(0).cos() + 1.0).to_concrete();
+    approx_eq(&result.to_concrete(), &expected, 1e-5)
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
 async fn gpu_reduce_then_gelu_uses_two_kernels() {
     let Some(device) = gpu_device().await else {
         return;

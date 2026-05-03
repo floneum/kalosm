@@ -107,7 +107,8 @@ pub struct RopeScalingConfig {
 pub struct Model<F: FloatDataType + SimdElement = f32> {
     pub(crate) config: Arc<LlamaConfig<F>>,
     vision_encoder: Option<vision::QwenVisionTransformer<F>>,
-    tok_embeddings: Embedding<F>,
+    tok_embeddings: Embedding<f32>,
+    tok_embedding_scale: Option<f32>,
     layers: Vec<LlamaAttention<F>>,
     norm: RmsNorm<1, F>,
     output: QMatrix,
@@ -303,13 +304,9 @@ where
             .transpose()?;
 
         let tok_embeddings_q = source.tensor("token_embd.weight", device)?;
-        let mut tok_embeddings: Tensor<2, f32> = tok_embeddings_q.dequantize();
-        // if this is gemma3, scale the tok_embeddings by sqrt(embedding_length)
-        if &*architecture == "gemma3" {
-            tok_embeddings = (tok_embeddings * (embedding_length as f32).sqrt()).to_concrete();
-        }
-        let tok_embeddings: Tensor<2, F> = tok_embeddings.cast();
-        let tok_embeddings = Embedding::new_from_tensor(tok_embeddings);
+        let tok_embedding_scale =
+            (&*architecture == "gemma3").then(|| (embedding_length as f32).sqrt());
+        let tok_embeddings = Embedding::new(tok_embeddings_q.clone());
 
         let norm = source.tensor("output_norm.weight", device)?;
         let norm = decode_norm(norm, rms_norm_eps)?;
@@ -323,7 +320,10 @@ where
             let attention_variant = if let Ok(attention_qkv) =
                 source.tensor(&format!("{prefix}.attn_qkv.weight"), device)
             {
-                AttentionVariant::Grouped(GroupedAttention { attention_qkv })
+                AttentionVariant::Grouped(GroupedAttention {
+                    attention_qkv,
+                    interleaved_rope: false,
+                })
             } else {
                 let q = source.tensor(&format!("{prefix}.attn_q.weight"), device)?;
                 let k = source.tensor(&format!("{prefix}.attn_k.weight"), device)?;
@@ -347,22 +347,40 @@ where
                 let k_norm = source
                     .tensor(&format!("{prefix}.attn_k_norm.weight"), device)
                     .ok();
-                let separate = SeparateAttention {
-                    attention_wq: q,
-                    attention_q_norm: q_norm
-                        .map(|norm| decode_norm(norm, rms_norm_eps))
-                        .transpose()?,
-                    attention_wk: k,
-                    attention_k_norm: k_norm
-                        .map(|norm| decode_norm(norm, rms_norm_eps))
-                        .transpose()?,
-                    attention_wv: v,
-                    interleaved_rope: architecture.as_ref() != "qwen2"
-                        && architecture.as_ref() != "qwen3"
-                        && architecture.as_ref() != "gemma3",
-                    bias,
-                };
-                AttentionVariant::Separate(Box::new(separate))
+                let attention_q_norm = q_norm
+                    .map(|norm| decode_norm(norm, rms_norm_eps))
+                    .transpose()?;
+                let attention_k_norm = k_norm
+                    .map(|norm| decode_norm(norm, rms_norm_eps))
+                    .transpose()?;
+                let interleaved_rope = architecture.as_ref() != "qwen2"
+                    && architecture.as_ref() != "qwen3"
+                    && architecture.as_ref() != "gemma3";
+
+                let can_fuse_qkv = false
+                    && bias.is_none()
+                    && attention_q_norm.is_none()
+                    && attention_k_norm.is_none();
+                let fused_qkv = can_fuse_qkv
+                    .then(|| QMatrix::concat_rows(&[&q, &k, &v]))
+                    .flatten();
+                if let Some(attention_qkv) = fused_qkv {
+                    AttentionVariant::Grouped(GroupedAttention {
+                        attention_qkv,
+                        interleaved_rope,
+                    })
+                } else {
+                    let separate = SeparateAttention {
+                        attention_wq: q,
+                        attention_q_norm,
+                        attention_wk: k,
+                        attention_k_norm,
+                        attention_wv: v,
+                        interleaved_rope,
+                        bias,
+                    };
+                    AttentionVariant::Separate(Box::new(separate))
+                }
             };
             let attention_wo = source.tensor(&format!("{prefix}.attn_output.weight"), device)?;
             // Try to read from the up, down and gate weights
@@ -457,6 +475,7 @@ where
         Ok(Self {
             config,
             tok_embeddings,
+            tok_embedding_scale,
             layers,
             norm,
             output,
@@ -570,7 +589,11 @@ where
         let x_base = Tensor::new(device, tokens.as_slice());
         let x = x_base.unsqueeze(0);
 
-        let mut embeddings = self.tok_embeddings.forward(&x);
+        let mut embeddings_f32 = self.tok_embeddings.forward(&x);
+        if let Some(scale) = self.tok_embedding_scale {
+            embeddings_f32 = (embeddings_f32 * scale).to_concrete();
+        }
+        let mut embeddings: Tensor<3, F> = embeddings_f32.cast();
         let mut pos_ids = None;
         let batch_size = embeddings.shape()[0];
         let embed_dim = embeddings.shape()[2];
@@ -615,12 +638,13 @@ where
             let x = layer_in;
             let residual: Tensor<3, f32> = x.cast();
             let x = layer.attention_norm.forward_generic(&x);
-            let mask = self
-                .masks
-                .get_mask(seq_len, index_pos, layer.sliding_window_size, device);
+            let mask = (seq_len > 1 || layer.sliding_window_size.is_some()).then(|| {
+                self.masks
+                    .get_mask(seq_len, index_pos, layer.sliding_window_size, device)
+            });
             let mut attn = layer.forward(
                 &x,
-                Some(&mask),
+                mask.as_ref(),
                 index_pos,
                 pos_ids.as_ref(),
                 cache.as_mut().map(|c| &mut c.blocks[i]),

@@ -348,14 +348,24 @@ impl<'a> Lowerer<'a> {
 
         let passes = total.div_ceil(self.workgroup_invocations);
         for pass in 0..passes {
-            let mut emits = Vec::new();
+            let full_pass = (pass + 1) * self.workgroup_invocations <= total;
+            let mut guard_emits = Vec::new();
             let flat = self.add_literal_u32_emitted(
                 expressions,
                 local,
                 pass * self.workgroup_invocations,
-                &mut emits,
+                &mut guard_emits,
             );
-            let active = self.cmp_lit(expressions, &mut emits, BinaryOperator::Less, flat, total);
+            let condition = (!full_pass).then(|| {
+                self.cmp_lit(
+                    expressions,
+                    &mut guard_emits,
+                    BinaryOperator::Less,
+                    flat,
+                    total,
+                )
+            });
+            let mut emits = Vec::new();
             let local_row = self.div_literal_u32_emitted(expressions, flat, cols, &mut emits);
             let local_col = self.mod_literal_u32_emitted(expressions, flat, cols, &mut emits);
             let global_row = self.bin(
@@ -406,18 +416,7 @@ impl<'a> Lowerer<'a> {
                 Span::default(),
             );
 
-            if (pass + 1) * self.workgroup_invocations <= total {
-                body.push(Statement::Block(accept), Span::default());
-            } else {
-                body.push(
-                    Statement::If {
-                        condition: active,
-                        accept,
-                        reject: Block::new(),
-                    },
-                    Span::default(),
-                );
-            }
+            Self::push_guarded_or_full_block(body, guard_emits, condition, accept);
         }
         Ok(())
     }
@@ -455,15 +454,24 @@ impl<'a> Lowerer<'a> {
             let total = groups_per_col * cols;
             let passes = total.div_ceil(self.workgroup_invocations);
             for pass in 0..passes {
-                let mut emits = Vec::new();
+                let full_pass = (pass + 1) * self.workgroup_invocations <= total;
+                let mut guard_emits = Vec::new();
                 let flat = self.add_literal_u32_emitted(
                     expressions,
                     local,
                     pass * self.workgroup_invocations,
-                    &mut emits,
+                    &mut guard_emits,
                 );
-                let active =
-                    self.cmp_lit(expressions, &mut emits, BinaryOperator::Less, flat, total);
+                let condition = (!full_pass).then(|| {
+                    self.cmp_lit(
+                        expressions,
+                        &mut guard_emits,
+                        BinaryOperator::Less,
+                        flat,
+                        total,
+                    )
+                });
+                let mut emits = Vec::new();
                 let local_k_group =
                     self.div_literal_u32_emitted(expressions, flat, cols, &mut emits);
                 let local_col = self.mod_literal_u32_emitted(expressions, flat, cols, &mut emits);
@@ -526,18 +534,7 @@ impl<'a> Lowerer<'a> {
                         Span::default(),
                     );
                 }
-                if (pass + 1) * self.workgroup_invocations <= total {
-                    body.push(Statement::Block(accept), Span::default());
-                } else {
-                    body.push(
-                        Statement::If {
-                            condition: active,
-                            accept,
-                            reject: Block::new(),
-                        },
-                        Span::default(),
-                    );
-                }
+                Self::push_guarded_or_full_block(body, guard_emits, condition, accept);
             }
             return Ok(());
         }
@@ -546,14 +543,24 @@ impl<'a> Lowerer<'a> {
         let total = rows * cols;
         let passes = total.div_ceil(self.workgroup_invocations);
         for pass in 0..passes {
-            let mut emits = Vec::new();
+            let full_pass = (pass + 1) * self.workgroup_invocations <= total;
+            let mut guard_emits = Vec::new();
             let flat = self.add_literal_u32_emitted(
                 expressions,
                 local,
                 pass * self.workgroup_invocations,
-                &mut emits,
+                &mut guard_emits,
             );
-            let active = self.cmp_lit(expressions, &mut emits, BinaryOperator::Less, flat, total);
+            let condition = (!full_pass).then(|| {
+                self.cmp_lit(
+                    expressions,
+                    &mut guard_emits,
+                    BinaryOperator::Less,
+                    flat,
+                    total,
+                )
+            });
+            let mut emits = Vec::new();
             let local_row = self.div_literal_u32_emitted(expressions, flat, cols, &mut emits);
             let local_col = self.mod_literal_u32_emitted(expressions, flat, cols, &mut emits);
             let global_row = self.bin(
@@ -592,18 +599,7 @@ impl<'a> Lowerer<'a> {
                 },
                 Span::default(),
             );
-            if (pass + 1) * self.workgroup_invocations <= total {
-                body.push(Statement::Block(accept), Span::default());
-            } else {
-                body.push(
-                    Statement::If {
-                        condition: active,
-                        accept,
-                        reject: Block::new(),
-                    },
-                    Span::default(),
-                );
-            }
+            Self::push_guarded_or_full_block(body, guard_emits, condition, accept);
         }
         Ok(())
     }

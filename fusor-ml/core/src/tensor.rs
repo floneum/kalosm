@@ -17,6 +17,7 @@ use crate::{
     nary_wise::{NaryExpr, NaryFunction, NaryOperation},
     quantized::{QMatrix, matmul::QMatMulOperation},
     resize::ResizeOperation,
+    rms_norm::RmsNormOperation,
     slice_assign::SliceAssignOperation,
 };
 
@@ -322,6 +323,14 @@ impl LazyTensorData {
             .collect();
         info = TensorInfo::new(new_shape, info.datatype());
         let key = device.compute_graph().create_reduce(function);
+
+        Self::from_parts(device, info, key)
+    }
+
+    pub(crate) fn rms_norm(&self, function: RmsNormOperation) -> Self {
+        let device = self.device.clone();
+        let info = self.info.clone();
+        let key = device.compute_graph().create_rms_norm(function);
 
         Self::from_parts(device, info, key)
     }
@@ -842,6 +851,8 @@ impl<D: DataType, const R: usize> Tensor<R, D> {
             .map_async(wgpu::MapMode::Read, move |result| {
                 _ = sender.send(result);
             });
+        #[cfg(not(target_arch = "wasm32"))]
+        tensor.device.poll_wait();
 
         receiver.await.map_err(|_| wgpu::BufferAsyncError)??;
 
@@ -1015,6 +1026,18 @@ impl<D: DataType, const R: usize> Tensor<R, D> {
         Self::from_parts(self.data.slice_assign(op))
     }
 
+    #[doc(hidden)]
+    pub fn slice_assign_in_place(&self, slices: [Range<usize>; R], value: &Self) -> Self {
+        let input_shape: Box<[usize]> = self.shape().to_vec().into_boxed_slice();
+        let op = SliceAssignOperation::new_in_place(
+            self.data.key,
+            value.data.key,
+            slices.into(),
+            input_shape,
+        );
+        Self::from_parts(self.data.slice_assign(op))
+    }
+
     pub(crate) fn reduce<const OUT: usize>(
         &self,
         function: ReduceFunction,
@@ -1056,6 +1079,25 @@ impl<D: DataType, const R: usize> Tensor<R, D> {
 
     pub fn datatype(&self) -> DataTypeEnum {
         self.data.info.datatype()
+    }
+
+    pub(crate) fn try_rms_norm_direct<const W: usize>(
+        &self,
+        weight: &Tensor<W, D>,
+        bias: Option<&Tensor<W, D>>,
+        eps: f32,
+    ) -> Option<Self> {
+        if D::DATA_TYPE != DataTypeEnum::F32 {
+            return None;
+        }
+        let operation = RmsNormOperation::new(
+            self.data.key,
+            weight.data.key,
+            bias.map(|bias| bias.data.key),
+            self.shape(),
+            eps,
+        );
+        Some(Self::from_parts(self.data.rms_norm(operation)))
     }
 
     pub fn device(&self) -> &Device {

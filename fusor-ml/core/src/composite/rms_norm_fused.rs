@@ -12,6 +12,10 @@ impl<const R: usize, T: DataType> Tensor<R, T> {
         f32: CastTensor<T>,
         Tensor<R, f32>: LastRank<OUT_RANK, f32>,
     {
+        if let Some(output) = self.try_rms_norm_direct(weight, bias, eps) {
+            return output;
+        }
+
         let hidden_size = *self.shape().last().unwrap() as f32;
         let mut kept_shape = *self.shape();
         kept_shape[R - 1] = 1;

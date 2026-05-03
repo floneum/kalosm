@@ -7,7 +7,7 @@ use crate::{
         operation::Operation,
         workgroup_shape::WorkgroupShape,
     },
-    nary_wise::{NaryExpr, NaryFunction, NaryOp, NaryOperation, NaryScalar},
+    nary_wise::{NaryExpr, NaryFunction, NaryOp, NaryOperation, NaryScalar, UnaryFunctionChain},
     tensor::{DataTypeEnum, TensorData},
 };
 
@@ -342,6 +342,27 @@ fn emit_function<const N: usize>(
             function.output_type,
         ),
     }
+}
+
+pub(crate) fn apply_unary_function_chain<const N: usize>(
+    mut value: tile_ir::tile::Tile<N>,
+    mut value_ty: DataTypeEnum,
+    chain: &UnaryFunctionChain,
+) -> Option<(tile_ir::tile::Tile<N>, DataTypeEnum)> {
+    if chain.input_datatype() != value_ty {
+        return None;
+    }
+
+    for function in &chain.functions {
+        if function.input_types.as_slice() != [value_ty] {
+            return None;
+        }
+        let mut values = [(value, value_ty)];
+        value = emit_function(function, &mut values);
+        value_ty = function.output_type;
+    }
+
+    Some((value, value_ty))
 }
 
 fn tanh_exact<const N: usize>(value: tile_ir::tile::Tile<N>) -> tile_ir::tile::Tile<N> {

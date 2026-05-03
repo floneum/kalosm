@@ -29,6 +29,7 @@ pub(crate) trait Operation: Debug {
         inputs: &[MirValue],
     ) -> Option<DirectKernel>;
 
+    #[allow(dead_code)]
     fn requires_single_kernel_batch(&self) -> bool {
         false
     }

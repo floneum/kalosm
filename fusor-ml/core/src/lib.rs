@@ -38,11 +38,14 @@ mod quantized;
 mod rank;
 mod reduce;
 mod reduce_direct;
+mod rms_norm;
+pub(crate) use rms_norm::RmsNormOperation;
 mod resize;
 mod slice_assign;
 mod tensor;
 mod varbuilder;
 mod visit_tiled;
+
 
 #[derive(thiserror::Error, Debug)]
 pub enum Error {

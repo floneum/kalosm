@@ -13,12 +13,13 @@ mod resolve;
 mod visualize;
 
 use crate::{
-    DataTypeEnum, Device, MatMulOperation, QMatrix, ReduceOperation,
+    DataTypeEnum, Device, MatMulOperation, QMatrix, ReduceOperation, RmsNormOperation,
     compute_graph::resolve::ResolverResult,
     dequantize::DequantizeOperation,
     map_layout::MapLayoutOperation,
     mir::{inputs::MirValue, operation::Operation},
     nary_wise::NaryOperation,
+    quantized::embedding::QEmbeddingOperation,
     quantized::matmul::QMatMulOperation,
     resize::ResizeOperation,
     slice_assign::SliceAssignOperation,
@@ -63,8 +64,16 @@ impl ComputeGraph {
         self.create_node(ComputeGraphNodeVariant::QMatMul(op))
     }
 
+    pub(crate) fn create_q_embedding(&self, op: QEmbeddingOperation) -> NodeIndex {
+        self.create_node(ComputeGraphNodeVariant::QEmbedding(op))
+    }
+
     pub(crate) fn create_reduce(&self, op: ReduceOperation) -> NodeIndex {
         self.create_node(ComputeGraphNodeVariant::Reduce(op))
+    }
+
+    pub(crate) fn create_rms_norm(&self, op: RmsNormOperation) -> NodeIndex {
+        self.create_node(ComputeGraphNodeVariant::RmsNorm(op))
     }
 
     pub(crate) fn create_map_layout(&self, op: MapLayoutOperation) -> NodeIndex {
@@ -137,11 +146,21 @@ impl ComputeGraph {
         if keys.is_empty() {
             return;
         }
+        let trace = std::env::var_os("FUSOR_TRACE_RESOLVE").is_some();
+        let start = trace.then(std::time::Instant::now);
         let removed = {
             let mut inner = self.inner.write();
             let mut removed = Vec::new();
             let mut resolver = Resolver::new_batch(&mut inner, keys.to_vec());
-            let _ = resolver.run(&mut inner, &mut removed);
+            let result = resolver.run(&mut inner, &mut removed);
+            if let Some(start) = start {
+                eprintln!(
+                    "resolve_batch keys={} kernels={} elapsed={:?}",
+                    keys.len(),
+                    result.total_kernels,
+                    start.elapsed()
+                );
+            }
             #[cfg(feature = "extra_assertions")]
             {
                 inner.verify_integrity()
@@ -192,10 +211,12 @@ pub(crate) enum ComputeGraphNodeVariant {
     Resize(ResizeOperation),
     MapLayout(MapLayoutOperation),
     Dequantize(DequantizeOperation),
+    QEmbedding(QEmbeddingOperation),
     MatMul(MatMulOperation),
     QMatMul(QMatMulOperation),
     Tensor(TensorData),
     Reduce(ReduceOperation),
+    RmsNorm(RmsNormOperation),
 }
 
 impl ComputeGraphNodeVariant {
@@ -213,7 +234,17 @@ impl ComputeGraphNodeVariant {
             ComputeGraphNodeVariant::QMatMul(op) => {
                 f(op.input);
             }
+            ComputeGraphNodeVariant::QEmbedding(op) => {
+                f(op.indexes);
+            }
             ComputeGraphNodeVariant::Reduce(op) => f(op.value),
+            ComputeGraphNodeVariant::RmsNorm(op) => {
+                f(op.input);
+                f(op.weight);
+                if let Some(bias) = op.bias {
+                    f(bias);
+                }
+            }
             ComputeGraphNodeVariant::MapLayout(op) => f(op.input),
             ComputeGraphNodeVariant::Resize(op) => f(op.input),
             ComputeGraphNodeVariant::SliceAssign(op) => {
@@ -436,6 +467,14 @@ impl ComputeGraphInner {
             .nodes
             .node_weight(key)
             .and_then(|n| n.cached.as_ref())
+    }
+
+    pub(crate) fn has_live_reference(&self, key: NodeIndex) -> bool {
+        self.nodes
+            .nodes
+            .node_weight(key)
+            .map(|node| node.reference_count > 0)
+            .unwrap_or(false)
     }
 
     #[cfg(feature = "extra_assertions")]

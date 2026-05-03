@@ -1,6 +1,7 @@
 //! Embedding layer implementation.
 
 use crate::{CastTensor, CastTo, DataType, Device, QMatrix, SimdElement, Tensor, VarBuilder};
+use fusor_gguf::GgmlType;
 
 /// Embedding layer for token/position embeddings.
 ///
@@ -9,7 +10,7 @@ use crate::{CastTensor, CastTo, DataType, Device, QMatrix, SimdElement, Tensor, 
 #[derive(Clone)]
 pub struct Embedding<T: SimdElement> {
     embeddings_quantized: Option<QMatrix>,
-    embeddings: Tensor<2, T>,
+    embeddings: Option<Tensor<2, T>>,
     num_embeddings: usize,
     embedding_dim: usize,
 }
@@ -23,7 +24,7 @@ impl<T: DataType + SimdElement + Default> Embedding<T> {
 
         Self {
             embeddings_quantized: None,
-            embeddings,
+            embeddings: Some(embeddings),
             num_embeddings,
             embedding_dim,
         }
@@ -44,6 +45,7 @@ impl<T: DataType + SimdElement + Default> Embedding<T> {
     where
         B: fusor_cpu::TensorBacking<N, Elem = u32>,
         fusor_core::Tensor<N, u32>: fusor_core::NextRank<M, u32>,
+        f32: CastTensor<T> + CastTo<T>,
     {
         // Calculate final output dimensions: input_dims + [embedding_dim]
         let input_shape = indices.shape();
@@ -55,7 +57,36 @@ impl<T: DataType + SimdElement + Default> Embedding<T> {
             }
         });
 
-        match (indices, &self.embeddings) {
+        if self.embeddings.is_none()
+            && let Some(quantized) = &self.embeddings_quantized
+            && !matches!(quantized.ggml_type(), GgmlType::F16 | GgmlType::F32)
+        {
+            return match (indices, quantized) {
+                (Tensor::Cpu(cpu_indices), quantized) if quantized.is_cpu() => {
+                    let dense: Tensor<2, f32> = quantized.dequantize();
+                    let dense: Tensor<2, T> = dense.cast();
+                    let Tensor::Cpu(cpu_embeddings) = dense else {
+                        unreachable!("CPU quantized embedding dequantized to a GPU tensor");
+                    };
+                    let indices_flat = cpu_indices.as_ref().flatten_all();
+                    let values = cpu_embeddings.as_ref().index_select(0, indices_flat);
+                    Tensor::Cpu(values.reshape(final_dims).to_concrete())
+                }
+                (Tensor::Gpu(gpu_indices), QMatrix::Gpu(gpu_embeddings)) => {
+                    let indices_flat = gpu_indices.flatten_all();
+                    let values = gpu_embeddings.index_select_rows(&indices_flat);
+                    Tensor::Gpu(values.reshape(final_dims).cast())
+                }
+                _ => panic!("Indices and embeddings must be on the same device"),
+            };
+        }
+
+        let embeddings = self
+            .embeddings
+            .as_ref()
+            .expect("dense embeddings unavailable for this embedding table");
+
+        match (indices, embeddings) {
             (Tensor::Cpu(cpu_indices), Tensor::Cpu(cpu_embeddings)) => {
                 // CPU path
                 let indices_flat = cpu_indices.as_ref().flatten_all();
@@ -74,7 +105,9 @@ impl<T: DataType + SimdElement + Default> Embedding<T> {
 
     /// Get the dequantized embedding table.
     pub fn embeddings(&self) -> &Tensor<2, T> {
-        &self.embeddings
+        self.embeddings
+            .as_ref()
+            .expect("dense embeddings unavailable for this embedding table")
     }
 
     /// Get the number of embeddings.
@@ -94,7 +127,7 @@ impl<T: DataType + SimdElement + Default> Embedding<T> {
     {
         Embedding {
             embeddings_quantized: self.embeddings_quantized,
-            embeddings: self.embeddings.cast(),
+            embeddings: self.embeddings.map(|embeddings| embeddings.cast()),
             num_embeddings: self.num_embeddings,
             embedding_dim: self.embedding_dim,
         }
@@ -105,10 +138,18 @@ impl<T: DataType + SimdElement + Default> Embedding<T> {
 impl Embedding<f32> {
     /// Create a new embedding layer with the given quantized embedding table.
     pub fn new(embeddings_quantized: QMatrix) -> Self {
-        let embeddings: Tensor<2, f32> = embeddings_quantized.dequantize();
-        let shape = embeddings.shape();
+        let shape = embeddings_quantized.shape();
         let num_embeddings = shape[0];
         let embedding_dim = shape[1];
+        let embeddings = if embeddings_quantized.is_cpu()
+            || matches!(
+                embeddings_quantized.ggml_type(),
+                GgmlType::F16 | GgmlType::F32
+            ) {
+            Some(embeddings_quantized.dequantize())
+        } else {
+            None
+        };
 
         Self {
             embeddings_quantized: Some(embeddings_quantized),

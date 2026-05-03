@@ -88,6 +88,7 @@ impl PhiFeedForward {
 
 pub struct LlamaFeedForward<F: FloatDataType + SimdElement = f32> {
     gate: QMatrix,
+    gate_up: Option<QMatrix>,
     gate_bias: Option<Tensor<1, F>>,
     down: QMatrix,
     down_bias: Option<Tensor<1, F>>,
@@ -99,6 +100,7 @@ impl<F: FloatDataType + SimdElement> LlamaFeedForward<F> {
     pub(crate) fn new(gate: QMatrix, down: QMatrix, up: QMatrix) -> Self {
         Self {
             gate,
+            gate_up: None,
             down,
             up,
             gate_bias: None,
@@ -117,6 +119,7 @@ impl<F: FloatDataType + SimdElement> LlamaFeedForward<F> {
     ) -> Self {
         Self {
             gate,
+            gate_up: None,
             gate_bias,
             down,
             down_bias,
@@ -134,20 +137,33 @@ impl<F: FloatDataType + SimdElement> LlamaFeedForward<F> {
         // All computation happens in f32 for compatibility with SIMD ops
         let x_f32 = x.cast::<f32>();
 
-        let mut w1 = x_f32.q_mat_mul(&self.gate);
-        if let Some(ref bias) = self.gate_bias {
-            let bias_f32: Tensor<1, f32> = bias.cast();
-            w1 = w1.add_(&bias_f32);
-        }
-        let w1 = w1.silu();
+        let (w1, w3) =
+            if let (Some(gate_up), None, None) = (&self.gate_up, &self.gate_bias, &self.up_bias) {
+                let gate_up_states = x_f32.q_mat_mul(gate_up);
+                let gate_len = self.gate.shape()[0];
+                let up_len = self.up.shape()[0];
+                let w1 = gate_up_states.narrow(D::Minus1, 0, gate_len).to_concrete();
+                let w3 = gate_up_states
+                    .narrow(D::Minus1, gate_len, up_len)
+                    .to_concrete();
+                (w1, w3)
+            } else {
+                let mut w1 = x_f32.q_mat_mul(&self.gate);
+                if let Some(ref bias) = self.gate_bias {
+                    let bias_f32: Tensor<1, f32> = bias.cast();
+                    w1 = w1.add_(&bias_f32);
+                }
 
-        let mut w3 = x_f32.q_mat_mul(&self.up);
-        if let Some(ref bias) = self.up_bias {
-            let bias_f32: Tensor<1, f32> = bias.cast();
-            w3 = w3.add_(&bias_f32);
-        }
+                let mut w3 = x_f32.q_mat_mul(&self.up);
+                if let Some(ref bias) = self.up_bias {
+                    let bias_f32: Tensor<1, f32> = bias.cast();
+                    w3 = w3.add_(&bias_f32);
+                }
 
-        let up_result = w1 * w3;
+                (w1, w3)
+            };
+
+        let up_result = w1.silu() * w3;
         let mut up = up_result.q_mat_mul(&self.down);
         if let Some(ref bias) = self.down_bias {
             let bias_f32: Tensor<1, f32> = bias.cast();
@@ -282,6 +298,7 @@ where
 
 pub struct GroupedAttention {
     pub attention_qkv: QMatrix,
+    pub interleaved_rope: bool,
 }
 
 impl GroupedAttention {
@@ -331,8 +348,13 @@ impl GroupedAttention {
             .to_concrete()
             .cast();
 
-        let (query_states, key_states) =
-            rope_cache.forward(&query_states, &key_states, start_pos, pos_ids, false);
+        let (query_states, key_states) = rope_cache.forward(
+            &query_states,
+            &key_states,
+            start_pos,
+            pos_ids,
+            self.interleaved_rope,
+        );
 
         (query_states, key_states, value_states)
     }
