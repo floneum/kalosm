@@ -11,7 +11,8 @@ use tabbycat::Graph;
 use wgpu::COPY_BUFFER_ALIGNMENT;
 
 use crate::{
-    Device, Dim, Layout, MatMulOperation, MatMulParams, ReduceFunction, ReduceOperation,
+    Device, Dim, FlashAttentionOperation, Layout, MatMulOperation, MatMulParams, ReduceFunction,
+    ReduceOperation,
     compute_graph::NodeIndex,
     map_layout::MapLayoutOperation,
     nary_wise::{NaryExpr, NaryFunction, NaryOperation},
@@ -331,6 +332,15 @@ impl LazyTensorData {
         let device = self.device.clone();
         let info = self.info.clone();
         let key = device.compute_graph().create_rms_norm(function);
+
+        Self::from_parts(device, info, key)
+    }
+
+    pub(crate) fn flash_attention(&self, function: FlashAttentionOperation) -> Self {
+        let device = self.device.clone();
+        let mut info = self.info.clone();
+        info.shape = function.out_shape.clone();
+        let key = device.compute_graph().create_flash_attention(function);
 
         Self::from_parts(device, info, key)
     }
@@ -1098,6 +1108,89 @@ impl<D: DataType, const R: usize> Tensor<R, D> {
             eps,
         );
         Some(Self::from_parts(self.data.rms_norm(operation)))
+    }
+
+    pub(crate) fn try_rms_norm_residual_direct<const W: usize>(
+        &self,
+        residual: &Self,
+        weight: &Tensor<W, D>,
+        bias: Option<&Tensor<W, D>>,
+        eps: f32,
+    ) -> Option<Self> {
+        if D::DATA_TYPE != DataTypeEnum::F32 || self.shape() != residual.shape() {
+            return None;
+        }
+        let operation = RmsNormOperation::new_with_residual(
+            self.data.key,
+            residual.data.key,
+            weight.data.key,
+            bias.map(|bias| bias.data.key),
+            self.shape(),
+            eps,
+        );
+        Some(Self::from_parts(self.data.rms_norm(operation)))
+    }
+
+    pub(crate) fn try_flash_attention_direct(
+        &self,
+        k: &Self,
+        v: &Self,
+        scale: f32,
+        mask: Option<&Tensor<2, D>>,
+    ) -> Option<Self> {
+        if R != 4 || D::DATA_TYPE != DataTypeEnum::F32 {
+            return None;
+        }
+        let q_shape = self.shape();
+        let k_shape = k.shape();
+        let v_shape = v.shape();
+        if q_shape[0] != k_shape[0]
+            || q_shape[0] != v_shape[0]
+            || k_shape[1] != v_shape[1]
+            || k_shape[2] != v_shape[2]
+            || q_shape[3] != k_shape[3]
+            || q_shape[3] != v_shape[3]
+            || q_shape[0] == 0
+            || q_shape[1] == 0
+            || q_shape[2] == 0
+            || k_shape[1] == 0
+            || !q_shape[1].is_multiple_of(k_shape[1])
+            || q_shape[3] == 0
+            || k_shape[2] == 0
+        {
+            return None;
+        }
+        if let Some(mask) = mask
+            && *mask.shape() != [q_shape[2], k_shape[2]]
+        {
+            return None;
+        }
+        let batch = u32::try_from(q_shape[0]).ok()?;
+        let num_heads = u32::try_from(q_shape[1]).ok()?;
+        let q_seq_len = u32::try_from(q_shape[2]).ok()?;
+        let head_dim = u32::try_from(q_shape[3]).ok()?;
+        let row_dispatch = batch.checked_mul(num_heads)?.checked_mul(q_seq_len)?;
+        let x_dispatch = head_dim.div_ceil(8);
+        let max_dispatch = self
+            .data
+            .device
+            .limits()
+            .max_compute_workgroups_per_dimension;
+        if x_dispatch > max_dispatch || row_dispatch > max_dispatch {
+            return None;
+        }
+
+        let operation = FlashAttentionOperation::new(
+            self.data.key,
+            k.data.key,
+            v.data.key,
+            mask.map(|mask| mask.data.key),
+            q_shape,
+            k_shape,
+            v_shape,
+            scale,
+        );
+        Some(Self::from_parts(self.data.flash_attention(operation)))
     }
 
     pub fn device(&self) -> &Device {

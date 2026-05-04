@@ -237,7 +237,6 @@ impl QMatrix {
                 | wgpu::BufferUsages::COPY_SRC
                 | wgpu::BufferUsages::COPY_DST,
         );
-
         Ok(QMatrix {
             device: device.clone(),
             shape,

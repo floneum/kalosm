@@ -110,9 +110,22 @@ where
             };
             self.current_seq_len = required_seq_len;
             // Return only the valid portion of the cache, not the full allocated tensor
-            cached
-                .narrow(self.concat_dim, 0, self.current_seq_len)
-                .to_concrete()
+            match &*cached {
+                Tensor::Gpu(cached) => {
+                    let specs: [fusor_core::StrideSpec; R] = std::array::from_fn(|i| {
+                        let len = if i == self.concat_dim {
+                            self.current_seq_len
+                        } else {
+                            cached.shape()[i]
+                        };
+                        fusor_core::StrideSpec::dim(i, len)
+                    });
+                    Tensor::Gpu(cached.restride(specs))
+                }
+                _ => cached
+                    .narrow(self.concat_dim, 0, self.current_seq_len)
+                    .to_concrete(),
+            }
         } else {
             // First append - just store it
             self.all_data = Some(v.clone());

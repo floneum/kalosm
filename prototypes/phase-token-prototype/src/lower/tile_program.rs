@@ -34,6 +34,7 @@ impl<'a> Lowerer<'a> {
     ) -> Result<(), LowerError> {
         self.block_dequant_cache.borrow_mut().clear();
         self.pin_cache.borrow_mut().clear();
+        self.q8_activation_pack_cache.borrow_mut().clear();
         // loop_fold_group_cache is intentionally NOT cleared here — group
         // outputs survive across stores because the K loop is emitted into
         // the outer body block, dominated by every store that follows.
@@ -411,6 +412,27 @@ impl<'a> Lowerer<'a> {
                 GgmlQuantFormat::Q8_0,
                 spill_depth,
             ),
+            TileExpr::QuantizedQ8ActivationDot {
+                a,
+                src,
+                k_base,
+                col,
+                mask,
+                fill,
+                block_n,
+            } => self.lower_tile_quantized_q8_activation_dot_expr(
+                expressions,
+                scratch,
+                body,
+                a,
+                src,
+                k_base,
+                col,
+                mask,
+                *fill,
+                *block_n,
+                spill_depth,
+            ),
         }
     }
 
@@ -443,19 +465,19 @@ impl<'a> Lowerer<'a> {
             Span::default(),
         );
 
-        let mask_handle =
-            self.lower_tile_mask_expr(expressions, scratch, body, mask, spill_depth)?;
-        let mut accept = Block::new();
         let mut a_handles = Vec::with_capacity(8);
         for expr in a {
             a_handles.push(self.lower_tile_expr_lane(
                 expressions,
                 scratch,
-                &mut accept,
+                body,
                 expr,
                 spill_depth + 1,
             )?);
         }
+        let mask_handle =
+            self.lower_tile_mask_expr(expressions, scratch, body, mask, spill_depth)?;
+        let mut accept = Block::new();
         let a_handles: [Handle<Expression>; 8] = a_handles
             .try_into()
             .map_err(|_| LowerError::UnsupportedOperation("q8_0 dot8 expected 8 A values"))?;
@@ -470,6 +492,90 @@ impl<'a> Lowerer<'a> {
             _ => {
                 return Err(LowerError::UnsupportedOperation(
                     "unsupported quantized dot8 format",
+                ));
+            }
+        };
+        Self::push_emits(&mut accept, value_emits);
+        accept.push(
+            Statement::Store {
+                pointer: tmp_ptr,
+                value: dot,
+            },
+            Span::default(),
+        );
+        body.push(
+            Statement::If {
+                condition: mask_handle,
+                accept,
+                reject: Block::new(),
+            },
+            Span::default(),
+        );
+        let loaded = expressions.append(Expression::Load { pointer: tmp_ptr }, Span::default());
+        body.push(
+            Statement::Emit(Self::single_expression_range(expressions, loaded)),
+            Span::default(),
+        );
+        Ok(loaded)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn lower_tile_quantized_q8_activation_dot_expr(
+        &self,
+        expressions: &mut Arena<Expression>,
+        scratch: ScratchLocals,
+        body: &mut Block,
+        a: &[Box<TileExpr>],
+        src: &QuantizedMatrix,
+        k_base: &TileIndexExpr,
+        col: &TileIndexExpr,
+        mask: &TileMaskExpr,
+        fill: F32Bits,
+        block_n: u32,
+        spill_depth: usize,
+    ) -> Result<Handle<Expression>, LowerError> {
+        let tmp = Self::tile_value_local(scratch, ElementType::F32)?;
+        let tmp_ptr = expressions.append(Expression::LocalVariable(tmp), Span::default());
+        let fill_value = expressions.append(
+            Expression::Literal(Literal::F32(fill.get())),
+            Span::default(),
+        );
+        body.push(
+            Statement::Store {
+                pointer: tmp_ptr,
+                value: fill_value,
+            },
+            Span::default(),
+        );
+
+        let mut a_handles = Vec::with_capacity(a.len());
+        for expr in a {
+            a_handles.push(self.lower_tile_expr_lane(
+                expressions,
+                scratch,
+                body,
+                expr,
+                spill_depth + 1,
+            )?);
+        }
+        let a_packs = self.cached_q8_activation_packs(expressions, scratch, body, &a_handles)?;
+        let mask_handle =
+            self.lower_tile_mask_expr(expressions, scratch, body, mask, spill_depth)?;
+        let mut accept = Block::new();
+        let k_base_handle =
+            self.lower_tile_index_expr(expressions, scratch, &mut accept, k_base, spill_depth)?;
+        let col_handle =
+            self.lower_tile_index_expr(expressions, scratch, &mut accept, col, spill_depth)?;
+        let (dot, value_emits) = match (src.format, block_n) {
+            (GgmlQuantFormat::Q4K, 8 | 16) => {
+                self.q4k_q8_activation_dot(expressions, src, k_base_handle, col_handle, &a_packs)?
+            }
+            (GgmlQuantFormat::Q6K, 8 | 16) => {
+                self.q6k_q8_activation_dot(expressions, src, k_base_handle, col_handle, &a_packs)?
+            }
+            _ => {
+                return Err(LowerError::UnsupportedOperation(
+                    "q8 activation dot only supports Q4K/Q6K dot8/dot16",
                 ));
             }
         };
@@ -869,11 +975,12 @@ impl<'a> Lowerer<'a> {
             Span::default(),
         );
 
-        // Cache entries reference handles emitted into the outer block; they
-        // become out of scope inside this loop body. Snapshot, clear for the
-        // body, and restore on exit so callers see consistent state.
+        // Cache entries reference values scoped to the outer block. Snapshot
+        // expression-handle caches, but drop q8 activation locals because the
+        // loop body may overwrite the shared scratch slots.
         let saved_dequant: Vec<_> = self.block_dequant_cache.borrow_mut().drain().collect();
         let saved_pin: Vec<_> = self.pin_cache.borrow_mut().drain().collect();
+        self.q8_activation_pack_cache.borrow_mut().clear();
         let value = self.lower_tile_expr_lane(
             expressions,
             scratch,
@@ -895,6 +1002,7 @@ impl<'a> Lowerer<'a> {
                 cache.insert(k, v);
             }
         }
+        self.q8_activation_pack_cache.borrow_mut().clear();
         let acc = expressions.append(Expression::Load { pointer: acc_ptr }, Span::default());
         loop_body.push(
             Statement::Emit(Self::single_expression_range(expressions, acc)),
@@ -992,11 +1100,12 @@ impl<'a> Lowerer<'a> {
             Span::default(),
         );
 
-        // Cache entries reference handles emitted into the outer block; they
-        // become out of scope inside this loop body. Snapshot, clear for the
-        // body, and restore on exit so callers see consistent state.
+        // Cache entries reference values scoped to the outer block. Snapshot
+        // expression-handle caches, but drop q8 activation locals because the
+        // loop body may overwrite the shared scratch slots.
         let saved_dequant: Vec<_> = self.block_dequant_cache.borrow_mut().drain().collect();
         let saved_pin: Vec<_> = self.pin_cache.borrow_mut().drain().collect();
+        self.q8_activation_pack_cache.borrow_mut().clear();
         let value = self.lower_tile_expr_lane(
             expressions,
             scratch,
@@ -1018,6 +1127,7 @@ impl<'a> Lowerer<'a> {
                 cache.insert(k, v);
             }
         }
+        self.q8_activation_pack_cache.borrow_mut().clear();
         let acc = expressions.append(Expression::Load { pointer: acc_ptr }, Span::default());
         loop_body.push(
             Statement::Emit(Self::single_expression_range(expressions, acc)),
@@ -1364,10 +1474,11 @@ impl<'a> Lowerer<'a> {
         );
 
         // Snapshot caches that reference handles in the outer block; the loop
-        // body emits a fresh scope. Restore on exit so callers see consistent
-        // state.
+        // body emits a fresh scope. Q8 activation packs use shared scratch
+        // locals, so discard that cache around loops instead of restoring it.
         let saved_dequant: Vec<_> = self.block_dequant_cache.borrow_mut().drain().collect();
         let saved_pin: Vec<_> = self.pin_cache.borrow_mut().drain().collect();
+        self.q8_activation_pack_cache.borrow_mut().clear();
 
         // Lower each body[i] within the same loop body, accumulate into acc_locals[i].
         for (i, body_expr) in g.bodies.iter().enumerate() {
@@ -1415,6 +1526,7 @@ impl<'a> Lowerer<'a> {
                 cache.insert(k, v);
             }
         }
+        self.q8_activation_pack_cache.borrow_mut().clear();
 
         loop_body.push(
             self.increment_u32_local(expressions, scratch.loop_index, 1),
@@ -1720,8 +1832,15 @@ impl<'a> Lowerer<'a> {
             TileExpr::GroupReduce { scratch, .. } => Ok(scratch.element),
             TileExpr::SubgroupReduce { value, .. } => self.tile_expr_element(value),
             TileExpr::QuantizedBlockLane { .. } => Ok(ElementType::F32),
-            TileExpr::Dot4 { .. } | TileExpr::QuantizedQ8_0Dot8 { .. } => Ok(ElementType::F32),
-            TileExpr::PinnedRef { .. } => Ok(ElementType::F32),
+            TileExpr::Dot4 { .. }
+            | TileExpr::QuantizedQ8_0Dot8 { .. }
+            | TileExpr::QuantizedQ8ActivationDot { .. } => Ok(ElementType::F32),
+            TileExpr::PinnedRef { id } => self
+                .ir
+                .pinned_values
+                .get(id.index())
+                .map(|value| self.tile_expr_element(value).unwrap_or(ElementType::F32))
+                .ok_or(LowerError::UnsupportedOperation("unknown pin id")),
             TileExpr::LoopFoldGroupOutput { group, lane } => {
                 let g = self
                     .ir

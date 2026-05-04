@@ -87,22 +87,36 @@ impl PhiFeedForward {
 }
 
 pub struct LlamaFeedForward<F: FloatDataType + SimdElement = f32> {
-    gate: QMatrix,
+    gate: Option<QMatrix>,
+    gate_len: usize,
     gate_up: Option<QMatrix>,
     gate_bias: Option<Tensor<1, F>>,
     down: QMatrix,
     down_bias: Option<Tensor<1, F>>,
-    up: QMatrix,
+    up: Option<QMatrix>,
+    up_len: usize,
     up_bias: Option<Tensor<1, F>>,
 }
 
 impl<F: FloatDataType + SimdElement> LlamaFeedForward<F> {
     pub(crate) fn new(gate: QMatrix, down: QMatrix, up: QMatrix) -> Self {
+        let gate_len = gate.shape()[0];
+        let up_len = up.shape()[0];
+        let gate_up = fast_decode_enabled()
+            .then(|| QMatrix::concat_rows(&[&gate, &up]))
+            .flatten();
+        let (gate, up) = if gate_up.is_some() {
+            (None, None)
+        } else {
+            (Some(gate), Some(up))
+        };
         Self {
             gate,
-            gate_up: None,
+            gate_len,
+            gate_up,
             down,
             up,
+            up_len,
             gate_bias: None,
             down_bias: None,
             up_bias: None,
@@ -117,13 +131,25 @@ impl<F: FloatDataType + SimdElement> LlamaFeedForward<F> {
         up: QMatrix,
         up_bias: Option<Tensor<1, F>>,
     ) -> Self {
+        let gate_len = gate.shape()[0];
+        let up_len = up.shape()[0];
+        let gate_up = (fast_decode_enabled() && gate_bias.is_none() && up_bias.is_none())
+            .then(|| QMatrix::concat_rows(&[&gate, &up]))
+            .flatten();
+        let (gate, up) = if gate_up.is_some() {
+            (None, None)
+        } else {
+            (Some(gate), Some(up))
+        };
         Self {
             gate,
-            gate_up: None,
+            gate_len,
+            gate_up,
             gate_bias,
             down,
             down_bias,
             up,
+            up_len,
             up_bias,
         }
     }
@@ -140,21 +166,29 @@ impl<F: FloatDataType + SimdElement> LlamaFeedForward<F> {
         let (w1, w3) =
             if let (Some(gate_up), None, None) = (&self.gate_up, &self.gate_bias, &self.up_bias) {
                 let gate_up_states = x_f32.q_mat_mul(gate_up);
-                let gate_len = self.gate.shape()[0];
-                let up_len = self.up.shape()[0];
-                let w1 = gate_up_states.narrow(D::Minus1, 0, gate_len).to_concrete();
+                let w1 = gate_up_states
+                    .narrow(D::Minus1, 0, self.gate_len)
+                    .to_concrete();
                 let w3 = gate_up_states
-                    .narrow(D::Minus1, gate_len, up_len)
+                    .narrow(D::Minus1, self.gate_len, self.up_len)
                     .to_concrete();
                 (w1, w3)
             } else {
-                let mut w1 = x_f32.q_mat_mul(&self.gate);
+                let gate = self
+                    .gate
+                    .as_ref()
+                    .expect("separate gate matrix should exist without fused gate_up");
+                let mut w1 = x_f32.q_mat_mul(gate);
                 if let Some(ref bias) = self.gate_bias {
                     let bias_f32: Tensor<1, f32> = bias.cast();
                     w1 = w1.add_(&bias_f32);
                 }
 
-                let mut w3 = x_f32.q_mat_mul(&self.up);
+                let up = self
+                    .up
+                    .as_ref()
+                    .expect("separate up matrix should exist without fused gate_up");
+                let mut w3 = x_f32.q_mat_mul(up);
                 if let Some(ref bias) = self.up_bias {
                     let bias_f32: Tensor<1, f32> = bias.cast();
                     w3 = w3.add_(&bias_f32);
@@ -175,9 +209,16 @@ impl<F: FloatDataType + SimdElement> LlamaFeedForward<F> {
     }
 }
 
+fn fast_decode_enabled() -> bool {
+    std::env::var_os("KALOSM_LLAMA_FAST_DECODE")
+        .map(|value| value != "0")
+        .unwrap_or(true)
+}
+
 pub enum AttentionVariant<F: FloatDataType + SimdElement = f32> {
     Separate(Box<SeparateAttention<F>>),
     Grouped(GroupedAttention),
+    Paired(PairedAttention),
 }
 
 pub struct AttentionBias<F: FloatDataType + SimdElement = f32> {
@@ -360,6 +401,94 @@ impl GroupedAttention {
     }
 }
 
+#[derive(Clone, Copy)]
+pub enum PairedAttentionKind {
+    QueryKey,
+    QueryValue,
+    KeyValue,
+}
+
+pub struct PairedAttention {
+    pub attention_pair: QMatrix,
+    pub attention_single: QMatrix,
+    pub kind: PairedAttentionKind,
+    pub interleaved_rope: bool,
+}
+
+impl PairedAttention {
+    #[allow(clippy::too_many_arguments)]
+    fn forward<F, B>(
+        &self,
+        num_heads: usize,
+        head_dim: usize,
+        num_key_value_heads: usize,
+        x: &Tensor<3, F, B>,
+        rope_cache: &RopeImplementation<F>,
+        start_pos: usize,
+        pos_ids: Option<&Tensor<2, F>>,
+    ) -> (Tensor<4, F>, Tensor<4, F>, Tensor<4, F>)
+    where
+        F: FloatDataType + SimdElement + Default + CastTo<f32> + CastTensor<f32>,
+        f32: CastTo<F> + CastTensor<F>,
+        B: TensorBacking<3, Elem = F>,
+    {
+        let [b_sz, seq_len, _] = x.shape();
+        let query_pos = num_heads * head_dim;
+        let kv_pos = num_key_value_heads * head_dim;
+        let x_f32 = x.cast::<f32>();
+        let pair = x_f32.q_mat_mul(&self.attention_pair);
+        let single = x_f32.q_mat_mul(&self.attention_single);
+
+        let (query_states, key_states, value_states) = match self.kind {
+            PairedAttentionKind::QueryKey => {
+                let query = pair.narrow(D::Minus1, 0, query_pos);
+                let key = pair.narrow(D::Minus1, query_pos, kv_pos);
+                (query.to_concrete(), key.to_concrete(), single.to_concrete())
+            }
+            PairedAttentionKind::QueryValue => {
+                let query = pair.narrow(D::Minus1, 0, query_pos);
+                let value = pair.narrow(D::Minus1, query_pos, kv_pos);
+                (
+                    query.to_concrete(),
+                    single.to_concrete(),
+                    value.to_concrete(),
+                )
+            }
+            PairedAttentionKind::KeyValue => {
+                let key = pair.narrow(D::Minus1, 0, kv_pos);
+                let value = pair.narrow(D::Minus1, kv_pos, kv_pos);
+                (single.to_concrete(), key.to_concrete(), value.to_concrete())
+            }
+        };
+
+        let query_states: Tensor<4, F> = query_states
+            .reshape([b_sz, seq_len, num_heads, head_dim])
+            .transpose(1, 2)
+            .to_concrete()
+            .cast();
+        let key_states: Tensor<4, F> = key_states
+            .reshape([b_sz, seq_len, num_key_value_heads, head_dim])
+            .transpose(1, 2)
+            .to_concrete()
+            .cast();
+        let value_states: Tensor<4, F> = value_states
+            .reshape([b_sz, seq_len, num_key_value_heads, head_dim])
+            .transpose(1, 2)
+            .to_concrete()
+            .cast();
+
+        let (query_states, key_states) = rope_cache.forward(
+            &query_states,
+            &key_states,
+            start_pos,
+            pos_ids,
+            self.interleaved_rope,
+        );
+
+        (query_states, key_states, value_states)
+    }
+}
+
 pub struct LlamaAttention<F: FloatDataType + SimdElement = f32> {
     pub attention_variant: AttentionVariant<F>,
     pub attention_wo: Linear<F>,
@@ -409,6 +538,15 @@ where
                 pos_ids,
             ),
             AttentionVariant::Grouped(ref attention) => attention.forward(
+                num_heads,
+                head_dim,
+                num_key_value_heads,
+                hidden_states,
+                &self.rope_cache,
+                start_pos,
+                pos_ids,
+            ),
+            AttentionVariant::Paired(ref attention) => attention.forward(
                 num_heads,
                 head_dim,
                 num_key_value_heads,

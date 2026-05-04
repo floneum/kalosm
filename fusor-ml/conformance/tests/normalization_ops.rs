@@ -129,6 +129,66 @@ async fn softmax_and_normalization_match_reference_paths() {
     .await
     .unwrap();
 
+    // rms_norm_residual_fused vs host reference on input + residual
+    let gen_residual = FuzzGenerator::<3, f32>::new([2..=3, 16..=17, 255..=257])
+        .with_seed(411)
+        .with_distribution(Uniform::new(-2.0, 2.0).unwrap());
+    fusor_conformance::assert(async |x: Tensor<3, f32>, residual: Tensor<3, f32>| {
+        let device = x.device();
+        let feature_count = x.shape()[2];
+        let weight_data = norm_weight(feature_count);
+        let bias_data = norm_bias(feature_count);
+        let weight = Tensor::from_slice(&device, [feature_count], &weight_data);
+        let bias = Tensor::from_slice(&device, [feature_count], &bias_data);
+        x.rms_norm_residual_fused::<1, 2, _>(&residual, &weight, Some(&bias), 1e-5)
+    })
+    .arg(gen_norm.clone())
+    .arg(gen_residual)
+    .equal_to_resolved_with_device(
+        async |x: Vec<Vec<Vec<f32>>>, residual: Vec<Vec<Vec<f32>>>, device: Device| {
+            let feature_count = x[0][0].len();
+            let weight_data = norm_weight(feature_count);
+            let bias_data = norm_bias(feature_count);
+            let combined: Vec<Vec<Vec<f32>>> = x
+                .iter()
+                .zip(&residual)
+                .map(|(x_matrix, residual_matrix)| {
+                    x_matrix
+                        .iter()
+                        .zip(residual_matrix)
+                        .map(|(x_row, residual_row)| {
+                            x_row
+                                .iter()
+                                .zip(residual_row)
+                                .map(|(x, residual)| x + residual)
+                                .collect()
+                        })
+                        .collect()
+                })
+                .collect();
+            let rms = rms_norm_last_dim_3d(&combined, &weight_data, 1e-5);
+            let out: Vec<Vec<Vec<f32>>> = rms
+                .into_iter()
+                .map(|matrix| {
+                    matrix
+                        .into_iter()
+                        .map(|row| {
+                            row.into_iter()
+                                .zip(bias_data.iter().copied())
+                                .map(|(v, b)| v + b)
+                                .collect()
+                        })
+                        .collect()
+                })
+                .collect();
+            Tensor::new(&device, &out)
+        },
+    )
+    .compare_with(approx_compare::<3, f32>(1e-4))
+    .runs(3)
+    .await
+    .unwrap();
+
     // rms_norm_fused_no_bias vs rms_norm reference
     fusor_conformance::assert(async |x: Tensor<3, f32>| {
         let device = x.device();

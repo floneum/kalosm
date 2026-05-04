@@ -47,4 +47,23 @@ impl<const R: usize, T: DataType> Tensor<R, T> {
     {
         self.rms_norm_fused::<W, OUT_RANK>(weight, None, eps)
     }
+
+    pub fn rms_norm_residual_fused<const W: usize, const OUT_RANK: usize>(
+        &self,
+        residual: &Self,
+        weight: &Tensor<W, T>,
+        bias: Option<&Tensor<W, T>>,
+        eps: f32,
+    ) -> Self
+    where
+        T: CastTensor<f32>,
+        f32: CastTensor<T>,
+        Tensor<R, f32>: LastRank<OUT_RANK, f32>,
+    {
+        if let Some(output) = self.try_rms_norm_residual_direct(residual, weight, bias, eps) {
+            return output;
+        }
+
+        (self.clone() + residual.clone()).rms_norm_fused::<W, OUT_RANK>(weight, bias, eps)
+    }
 }

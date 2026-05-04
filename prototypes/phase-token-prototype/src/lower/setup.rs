@@ -20,6 +20,29 @@ impl<'a> Lowerer<'a> {
             },
             Span::default(),
         );
+        let i32_ty = module.types.insert(
+            Type {
+                name: Some("Signed".into()),
+                inner: TypeInner::Scalar(Scalar {
+                    kind: ScalarKind::Sint,
+                    width: 4,
+                }),
+            },
+            Span::default(),
+        );
+        let i32_vec4_ty = module.types.insert(
+            Type {
+                name: Some("PackedI8".into()),
+                inner: TypeInner::Vector {
+                    size: VectorSize::Quad,
+                    scalar: Scalar {
+                        kind: ScalarKind::Sint,
+                        width: 4,
+                    },
+                },
+            },
+            Span::default(),
+        );
         let uses_f16 = ir
             .buffers()
             .iter()
@@ -102,6 +125,8 @@ impl<'a> Lowerer<'a> {
             module,
             f32_ty,
             f32_vec4_ty,
+            i32_ty,
+            i32_vec4_ty,
             f16_ty,
             u32_ty,
             u32_vec3_ty,
@@ -118,6 +143,7 @@ impl<'a> Lowerer<'a> {
             uses_num_subgroups,
             block_dequant_cache: std::cell::RefCell::new(std::collections::HashMap::new()),
             pin_cache: std::cell::RefCell::new(std::collections::HashMap::new()),
+            q8_activation_pack_cache: std::cell::RefCell::new(std::collections::HashMap::new()),
             loop_fold_group_cache: std::cell::RefCell::new(std::collections::HashMap::new()),
             fold_accumulator_locals: Vec::new(),
             fold_group_offsets: Vec::new(),
@@ -334,6 +360,15 @@ impl<'a> Lowerer<'a> {
             block_dequant: std::array::from_fn(|index| {
                 self.create_f32_local(function, &format!("tile_block_dequant_{index}"))
             }),
+            q8_activation_scales: std::array::from_fn(|index| {
+                self.create_f32_local(function, &format!("tile_q8_activation_scale_{index}"))
+            }),
+            q8_activation_packs: std::array::from_fn(|index| {
+                self.create_u32_local(function, &format!("tile_q8_activation_pack_{index}"))
+            }),
+            q8_activation_sums_i32: std::array::from_fn(|index| {
+                self.create_i32_local(function, &format!("tile_q8_activation_sum_{index}"))
+            }),
         }
     }
 
@@ -384,6 +419,14 @@ impl<'a> Lowerer<'a> {
         name: &str,
     ) -> Handle<LocalVariable> {
         self.create_local(function, name, self.f32_ty)
+    }
+
+    pub(super) fn create_i32_local(
+        &self,
+        function: &mut Function,
+        name: &str,
+    ) -> Handle<LocalVariable> {
+        self.create_local(function, name, self.i32_ty)
     }
 
     pub(super) fn create_f16_local(
@@ -578,6 +621,18 @@ impl<'a> Lowerer<'a> {
                 .chain(b.iter())
                 .any(|expr| Self::tile_expr_uses_f16(expr)),
             TileExpr::QuantizedQ8_0Dot8 {
+                a,
+                k_base,
+                col,
+                mask,
+                ..
+            } => {
+                a.iter().any(|expr| Self::tile_expr_uses_f16(expr))
+                    || Self::tile_index_expr_uses_f16(k_base)
+                    || Self::tile_index_expr_uses_f16(col)
+                    || Self::tile_mask_expr_uses_f16(mask)
+            }
+            TileExpr::QuantizedQ8ActivationDot {
                 a,
                 k_base,
                 col,

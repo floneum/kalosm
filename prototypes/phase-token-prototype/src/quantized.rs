@@ -47,6 +47,10 @@ impl GgmlQuantFormat {
         self.qgemv_subgroups_per_workgroup() * self.qgemv_cols_per_subgroup()
     }
 
+    pub const fn qgemv_cols_per_workgroup_for_shape(self, rows: u32, cols: u32) -> u32 {
+        self.qgemv_subgroups_per_workgroup_for_shape(rows, cols) * self.qgemv_cols_per_subgroup()
+    }
+
     pub const fn qgemv_cols_per_subgroup(self) -> u32 {
         match self {
             Self::Q2K => 4,
@@ -64,6 +68,14 @@ impl GgmlQuantFormat {
         match self {
             Self::Q4K | Self::Q6K | Self::Q8_0 | Self::Q8_1 => 4,
             _ => 2,
+        }
+    }
+
+    pub const fn qgemv_subgroups_per_workgroup_for_shape(self, rows: u32, cols: u32) -> u32 {
+        match self {
+            Self::Q4K if rows > 4096 || cols >= 8192 => 8,
+            Self::Q6K if rows > 4096 => 8,
+            _ => self.qgemv_subgroups_per_workgroup(),
         }
     }
 }

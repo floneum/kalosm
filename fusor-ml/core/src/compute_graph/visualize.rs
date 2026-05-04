@@ -114,6 +114,39 @@ impl GraphVisPass {
         self.identities.insert(key, id.clone());
     }
 
+    fn visit_flash_attention(
+        &mut self,
+        key: NodeIndex,
+        operation: &crate::FlashAttentionOperation,
+    ) {
+        let q = self.identities.get(&operation.q).unwrap();
+        let k = self.identities.get(&operation.k).unwrap();
+        let v = self.identities.get(&operation.v).unwrap();
+        let output_layout = self.layout_pass.output_layout.get(&key).unwrap();
+        let id = Identity::quoted(format!("flash_attention ({}) #{:?}", output_layout, key));
+        self.statements.push(Stmt::Node {
+            id: id.clone(),
+            port: None,
+            attr: None,
+        });
+        self.statements.push(Stmt::Edge(
+            Edge::head_node(q.clone(), None).arrow_to_node(id.clone(), None),
+        ));
+        self.statements.push(Stmt::Edge(
+            Edge::head_node(k.clone(), None).arrow_to_node(id.clone(), None),
+        ));
+        self.statements.push(Stmt::Edge(
+            Edge::head_node(v.clone(), None).arrow_to_node(id.clone(), None),
+        ));
+        if let Some(mask) = operation.mask {
+            let mask = self.identities.get(&mask).unwrap();
+            self.statements.push(Stmt::Edge(
+                Edge::head_node(mask.clone(), None).arrow_to_node(id.clone(), None),
+            ));
+        }
+        self.identities.insert(key, id.clone());
+    }
+
     fn visit_map_layout(
         &mut self,
         key: NodeIndex,
@@ -267,6 +300,9 @@ impl ComputeGraphInner {
                 }
                 ComputeGraphNodeVariant::Reduce(op) => graph_vis_pass.visit_reduce(node, op),
                 ComputeGraphNodeVariant::RmsNorm(op) => graph_vis_pass.visit_rms_norm(node, op),
+                ComputeGraphNodeVariant::FlashAttention(op) => {
+                    graph_vis_pass.visit_flash_attention(node, op)
+                }
                 ComputeGraphNodeVariant::MapLayout(op) => graph_vis_pass.visit_map_layout(node, op),
                 ComputeGraphNodeVariant::Resize(op) => graph_vis_pass.visit_resize(node, op),
                 ComputeGraphNodeVariant::SliceAssign(op) => {

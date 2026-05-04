@@ -13,7 +13,8 @@ mod resolve;
 mod visualize;
 
 use crate::{
-    DataTypeEnum, Device, MatMulOperation, QMatrix, ReduceOperation, RmsNormOperation,
+    DataTypeEnum, Device, FlashAttentionOperation, MatMulOperation, QMatrix, ReduceOperation,
+    RmsNormOperation,
     compute_graph::resolve::ResolverResult,
     dequantize::DequantizeOperation,
     map_layout::MapLayoutOperation,
@@ -74,6 +75,10 @@ impl ComputeGraph {
 
     pub(crate) fn create_rms_norm(&self, op: RmsNormOperation) -> NodeIndex {
         self.create_node(ComputeGraphNodeVariant::RmsNorm(op))
+    }
+
+    pub(crate) fn create_flash_attention(&self, op: FlashAttentionOperation) -> NodeIndex {
+        self.create_node(ComputeGraphNodeVariant::FlashAttention(op))
     }
 
     pub(crate) fn create_map_layout(&self, op: MapLayoutOperation) -> NodeIndex {
@@ -142,17 +147,20 @@ impl ComputeGraph {
     /// execution graph so intermediate nodes can be freed as soon as every
     /// consumer within the batch has been computed, keeping peak GPU memory
     /// much lower than resolving targets one-by-one.
-    pub(crate) fn resolve_batch(&self, keys: &[NodeIndex]) {
+    pub(crate) fn resolve_batch(&self, keys: &[NodeIndex]) -> usize {
         if keys.is_empty() {
-            return;
+            return 0;
         }
-        let trace = std::env::var_os("FUSOR_TRACE_RESOLVE").is_some();
+        let trace = std::env::var_os("FUSOR_TRACE_DECODE").is_some()
+            || std::env::var_os("FUSOR_TRACE_RESOLVE").is_some();
         let start = trace.then(std::time::Instant::now);
+        let total_kernels;
         let removed = {
             let mut inner = self.inner.write();
             let mut removed = Vec::new();
             let mut resolver = Resolver::new_batch(&mut inner, keys.to_vec());
             let result = resolver.run(&mut inner, &mut removed);
+            total_kernels = result.total_kernels;
             if let Some(start) = start {
                 eprintln!(
                     "resolve_batch keys={} kernels={} elapsed={:?}",
@@ -168,6 +176,7 @@ impl ComputeGraph {
             removed
         };
         drop(removed);
+        total_kernels
     }
 
     pub(crate) fn graphvis(&self, root: NodeIndex) -> Graph {
@@ -217,6 +226,7 @@ pub(crate) enum ComputeGraphNodeVariant {
     Tensor(TensorData),
     Reduce(ReduceOperation),
     RmsNorm(RmsNormOperation),
+    FlashAttention(FlashAttentionOperation),
 }
 
 impl ComputeGraphNodeVariant {
@@ -240,11 +250,15 @@ impl ComputeGraphNodeVariant {
             ComputeGraphNodeVariant::Reduce(op) => f(op.value),
             ComputeGraphNodeVariant::RmsNorm(op) => {
                 f(op.input);
+                if let Some(residual) = op.residual {
+                    f(residual);
+                }
                 f(op.weight);
                 if let Some(bias) = op.bias {
                     f(bias);
                 }
             }
+            ComputeGraphNodeVariant::FlashAttention(op) => op.visit_dependencies(f),
             ComputeGraphNodeVariant::MapLayout(op) => f(op.input),
             ComputeGraphNodeVariant::Resize(op) => f(op.input),
             ComputeGraphNodeVariant::SliceAssign(op) => {

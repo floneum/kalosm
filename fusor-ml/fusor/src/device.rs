@@ -69,9 +69,11 @@ impl Device {
     /// builds one shared execution graph so intermediate buffers can be freed
     /// as soon as every consumer within the batch is computed, keeping peak
     /// memory much lower than resolving one-by-one. On CPU this is a no-op.
-    pub fn resolve_batch(&self, keys: &[fusor_core::NodeIndex]) {
+    pub fn resolve_batch(&self, keys: &[fusor_core::NodeIndex]) -> usize {
         if let Device::Gpu(device) = self {
-            device.resolve_batch(keys);
+            device.resolve_batch(keys)
+        } else {
+            0
         }
     }
 }

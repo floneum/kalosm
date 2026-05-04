@@ -117,6 +117,49 @@ where
         result_f32.cast()
     }
 
+    /// Forward pass for `input + residual` followed by RMSNorm.
+    pub fn forward_residual_generic<B1, B2>(
+        &self,
+        input: &Tensor<3, T, B1>,
+        residual: &Tensor<3, T, B2>,
+    ) -> Tensor<3, T>
+    where
+        B1: fusor_cpu::TensorBacking<3, Elem = T>,
+        B2: fusor_cpu::TensorBacking<3, Elem = T>,
+    {
+        let input_f32 = input.cast::<f32>();
+        let residual_f32 = residual.cast::<f32>();
+        let weight_f32: Tensor<1, f32> = self.weight.cast();
+        let bias_f32: Option<Tensor<1, f32>> = self.bias.as_ref().map(|b| b.cast());
+
+        let result_f32 = input_f32.rms_norm_residual_fused::<1, 2, _>(
+            &residual_f32,
+            &weight_f32,
+            bias_f32.as_ref(),
+            self.eps,
+        );
+
+        result_f32.cast()
+    }
+
+    /// Forward pass for f32 `input + residual` followed by RMSNorm, returning this layer's type.
+    pub fn forward_residual_f32<B1, B2>(
+        &self,
+        input: &Tensor<3, f32, B1>,
+        residual: &Tensor<3, f32, B2>,
+    ) -> Tensor<3, T>
+    where
+        B1: fusor_cpu::TensorBacking<3, Elem = f32>,
+        B2: fusor_cpu::TensorBacking<3, Elem = f32>,
+    {
+        let weight_f32: Tensor<1, f32> = self.weight.cast();
+        let bias_f32: Option<Tensor<1, f32>> = self.bias.as_ref().map(|b| b.cast());
+
+        input
+            .rms_norm_residual_fused::<1, 2, _>(residual, &weight_f32, bias_f32.as_ref(), self.eps)
+            .cast()
+    }
+
     /// Forward pass for 4D input with generic type.
     pub fn forward_generic_4d<B>(&self, input: &Tensor<4, T, B>) -> Tensor<4, T>
     where

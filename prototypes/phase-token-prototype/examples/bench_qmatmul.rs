@@ -28,6 +28,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     for format in formats {
         let harness = Harness::new(format, mode, layout, shape, tile_override).await?;
+        let tolerance = parse_tolerance();
 
         for _ in 0..WARMUP_BATCHES {
             harness.run_batch(mode.dispatches_per_batch())?;
@@ -50,7 +51,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             harness.n,
             harness.k,
         );
-        if max_abs_error > 1.0e-3 {
+        if max_abs_error > tolerance {
             let (row, col, actual, expected) = first_sample_mismatch(
                 &output,
                 &harness.y_layout,
@@ -58,7 +59,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 harness.m,
                 harness.n,
                 harness.k,
-                1.0e-3,
+                tolerance,
             )
             .unwrap_or((
                 0,
@@ -189,9 +190,7 @@ struct Harness {
     device_features: wgpu::Features,
     device: wgpu::Device,
     queue: wgpu::Queue,
-    pipeline: wgpu::ComputePipeline,
-    bind_group: wgpu::BindGroup,
-    dispatch_grid: [u32; 3],
+    dispatches: Vec<BenchDispatch>,
     y_buffer: wgpu::Buffer,
     readback: wgpu::Buffer,
     y_layout: Layout,
@@ -199,6 +198,12 @@ struct Harness {
     a_physical_len: usize,
     y_physical_len: usize,
     b_words: Vec<u32>,
+}
+
+struct BenchDispatch {
+    pipeline: wgpu::ComputePipeline,
+    bind_group: wgpu::BindGroup,
+    dispatch_grid: [u32; 3],
 }
 
 impl Harness {
@@ -214,23 +219,10 @@ impl Harness {
             BenchMode::Gemm => tile_override.unwrap_or_else(|| qgemm_tile_shape(format)),
             BenchMode::Gemv => TilePlan {
                 bm: 1,
-                bn: qgemv_cols_per_workgroup(format),
+                bn: qgemv_cols_per_workgroup(format, k, n),
                 bk: k,
             },
         };
-        let ir = qmatmul_ir(
-            format,
-            m,
-            n,
-            k,
-            layout,
-            tile_override.filter(|_| matches!(mode, BenchMode::Gemm)),
-        );
-        let dispatch_grid = ir
-            .single_tile_program_grid()
-            .ok_or("qmatmul bench expects one tile program")?;
-        let lowered = ir.lower_to_naga()?;
-
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::default());
         let adapter = instance
             .request_adapter(&wgpu::RequestAdapterOptions {
@@ -278,53 +270,21 @@ impl Harness {
             mapped_at_creation: false,
         });
 
-        let shader = unsafe {
-            device.create_shader_module_trusted(
-                wgpu::ShaderModuleDescriptor {
-                    label: Some("lowered qmatmul"),
-                    source: wgpu::ShaderSource::Naga(Cow::Owned(lowered.module().clone())),
-                },
-                wgpu::ShaderRuntimeChecks::unchecked(),
-            )
-        };
-        let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("qmatmul buffers"),
-            entries: &storage_bindings(&[true, true, false]),
-        });
-        let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("qmatmul pipeline layout"),
-            bind_group_layouts: &[Some(&bind_group_layout)],
-            immediate_size: 0,
-        });
-        let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-            label: Some("qmatmul pipeline"),
-            layout: Some(&pipeline_layout),
-            module: &shader,
-            entry_point: Some("main"),
-            compilation_options: wgpu::PipelineCompilationOptions {
-                zero_initialize_workgroup_memory: false,
-                ..Default::default()
-            },
-            cache: None,
-        });
-        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("qmatmul bind group"),
-            layout: &bind_group_layout,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: a_buffer.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: b_buffer.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 2,
-                    resource: y_buffer.as_entire_binding(),
-                },
-            ],
-        });
+        let ir = qmatmul_ir(
+            format,
+            m,
+            n,
+            k,
+            layout,
+            tile_override.filter(|_| matches!(mode, BenchMode::Gemm)),
+        );
+        let dispatches = vec![build_dispatch(
+            &device,
+            "qmatmul",
+            ir,
+            &[true, true, false],
+            &[&a_buffer, &b_buffer, &y_buffer],
+        )?];
 
         Ok(Self {
             m,
@@ -338,9 +298,7 @@ impl Harness {
             device_features,
             device,
             queue,
-            pipeline,
-            bind_group,
-            dispatch_grid,
+            dispatches,
             y_buffer,
             readback,
             y_layout,
@@ -367,11 +325,13 @@ impl Harness {
                 label: Some("qmatmul bench pass"),
                 timestamp_writes: None,
             });
-            pass.set_pipeline(&self.pipeline);
-            pass.set_bind_group(0, &self.bind_group, &[]);
             for _ in 0..dispatches {
-                let [x, y, z] = self.dispatch_grid;
-                pass.dispatch_workgroups(x, y, z);
+                for dispatch in &self.dispatches {
+                    pass.set_pipeline(&dispatch.pipeline);
+                    pass.set_bind_group(0, &dispatch.bind_group, &[]);
+                    let [x, y, z] = dispatch.dispatch_grid;
+                    pass.dispatch_workgroups(x, y, z);
+                }
             }
         }
         encoder.finish()
@@ -441,7 +401,9 @@ fn qmatmul_ir(
         let b = phase.quantized_matrix(format, k as u32, n as u32);
         let y = phase.storage_write_with_layout::<F32, 2>(output_layout(m, n, layout));
         if m == 1 {
-            phase.qgemv::<4, 64>(&a, &b, &y, 4, 1);
+            let cols_per_workgroup = format.qgemv_cols_per_workgroup_for_shape(k as u32, n as u32);
+            let workgroups_x = (n as u32).div_ceil(cols_per_workgroup);
+            phase.qgemv::<4, 64>(&a, &b, &y, 4, workgroups_x);
         } else if let Some(tile) = tile_override {
             match (tile.bm, tile.bn, tile.bk) {
                 (32, 32, 32) => phase.qmatmul::<32, 32, 32>(&a, &b, &y, 4),
@@ -471,6 +433,74 @@ fn qmatmul_ir(
     })
 }
 
+fn build_dispatch(
+    device: &wgpu::Device,
+    label: &'static str,
+    ir: KernelIr,
+    read_only: &[bool],
+    buffers: &[&wgpu::Buffer],
+) -> Result<BenchDispatch, Box<dyn std::error::Error>> {
+    if read_only.len() != buffers.len() {
+        return Err(format!(
+            "{label} has {} binding access flags but {} buffers",
+            read_only.len(),
+            buffers.len()
+        )
+        .into());
+    }
+    let dispatch_grid = ir
+        .single_tile_program_grid()
+        .ok_or("qmatmul bench expects one tile program per dispatch")?;
+    let lowered = ir.lower_to_naga()?;
+    let shader = unsafe {
+        device.create_shader_module_trusted(
+            wgpu::ShaderModuleDescriptor {
+                label: Some(label),
+                source: wgpu::ShaderSource::Naga(Cow::Owned(lowered.module().clone())),
+            },
+            wgpu::ShaderRuntimeChecks::unchecked(),
+        )
+    };
+    let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some(label),
+        entries: &storage_bindings(read_only),
+    });
+    let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: Some("qmatmul pipeline layout"),
+        bind_group_layouts: &[Some(&bind_group_layout)],
+        immediate_size: 0,
+    });
+    let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+        label: Some(label),
+        layout: Some(&pipeline_layout),
+        module: &shader,
+        entry_point: Some("main"),
+        compilation_options: wgpu::PipelineCompilationOptions {
+            zero_initialize_workgroup_memory: false,
+            ..Default::default()
+        },
+        cache: None,
+    });
+    let entries = buffers
+        .iter()
+        .enumerate()
+        .map(|(binding, buffer)| wgpu::BindGroupEntry {
+            binding: binding as u32,
+            resource: buffer.as_entire_binding(),
+        })
+        .collect::<Vec<_>>();
+    let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some(label),
+        layout: &bind_group_layout,
+        entries: &entries,
+    });
+    Ok(BenchDispatch {
+        pipeline,
+        bind_group,
+        dispatch_grid,
+    })
+}
+
 fn qgemm_tile_shape(format: GgmlQuantFormat) -> TilePlan {
     match format {
         GgmlQuantFormat::Q4_0
@@ -492,8 +522,8 @@ fn qgemm_tile_shape(format: GgmlQuantFormat) -> TilePlan {
     }
 }
 
-fn qgemv_cols_per_workgroup(format: GgmlQuantFormat) -> usize {
-    format.qgemv_cols_per_workgroup() as usize
+fn qgemv_cols_per_workgroup(format: GgmlQuantFormat, k: usize, n: usize) -> usize {
+    format.qgemv_cols_per_workgroup_for_shape(k as u32, n as u32) as usize
 }
 
 fn pack_ones(format: GgmlQuantFormat, rows: usize, cols: usize) -> Vec<u32> {
@@ -876,6 +906,13 @@ fn parse_mode() -> Result<BenchMode, Box<dyn std::error::Error>> {
         Some("gemv") => Ok(BenchMode::Gemv),
         Some(other) => Err(format!("unknown mode {other:?}; expected gemm or gemv").into()),
     }
+}
+
+fn parse_tolerance() -> f32 {
+    env::var("BENCH_QMATMUL_TOL")
+        .ok()
+        .and_then(|value| value.parse::<f32>().ok())
+        .unwrap_or(1.0e-3)
 }
 
 fn parse_formats() -> Result<Vec<GgmlQuantFormat>, Box<dyn std::error::Error>> {

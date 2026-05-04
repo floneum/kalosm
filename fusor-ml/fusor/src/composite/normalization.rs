@@ -352,6 +352,51 @@ where
         self.rms_norm_fused::<W, OUT_RANK>(weight, None, eps)
     }
 
+    /// Fused `(input + residual) -> RMSNorm` kernel for transformer block boundaries.
+    pub fn rms_norm_residual_fused<const W: usize, const OUT_RANK: usize, B2>(
+        &self,
+        residual: &Tensor<R, D, B2>,
+        weight: &Tensor<W, D, ConcreteTensor<D, W>>,
+        bias: Option<&Tensor<W, D, ConcreteTensor<D, W>>>,
+        eps: f32,
+    ) -> Tensor<R, D>
+    where
+        ConcreteTensor<D, R>: CpuLastRank<OUT_RANK, D>,
+        fusor_core::Tensor<R, D>: GpuLastRank<OUT_RANK, D>,
+        fusor_core::Tensor<R, f32>: GpuLastRank<OUT_RANK, f32>,
+        <fusor_core::Tensor<R, D> as fusor_core::LastRankInner>::LastRank:
+            GpuNextRankInner<NextRank = fusor_core::Tensor<R, D>>,
+        SumOp: SimdReduceOp<D>,
+        D: std::ops::Mul<Output = D>
+            + std::ops::Div<Output = D>
+            + std::ops::Add<Output = D>
+            + fusor_core::CastTensor<f32>,
+        f32: fusor_core::CastTensor<D>,
+        MulOp: SimdBinaryOp<D>,
+        DivOp: SimdBinaryOp<D>,
+        AddOp: SimdBinaryOp<D>,
+        SqrtOp: SimdUnaryOp<D>,
+        B2: TensorBacking<R, Elem = D>,
+        (fusor_core::Tensor<R, D>, fusor_core::Tensor<W, D>): fusor_core::MaxRank<R, D>,
+    {
+        match (self, residual, weight, bias) {
+            (Tensor::Gpu(input), Tensor::Gpu(residual), Tensor::Gpu(weight), bias_opt) => {
+                let gpu_bias = bias_opt.map(|b| match b {
+                    Tensor::Gpu(bias) => bias,
+                    _ => panic!("Bias must be on GPU when input is on GPU"),
+                });
+                Tensor::Gpu(
+                    input.rms_norm_residual_fused::<W, OUT_RANK>(residual, weight, gpu_bias, eps),
+                )
+            }
+            (Tensor::Cpu(_), Tensor::Cpu(_), Tensor::Cpu(_), _) => {
+                let combined = (self + residual).to_concrete();
+                combined.rms_norm_fused_cpu_impl::<W, OUT_RANK>(weight, bias, eps)
+            }
+            _ => panic!("All tensors must be on the same device"),
+        }
+    }
+
     /// CPU implementation of fused RMS norm using composite operations
     fn rms_norm_fused_cpu_impl<const W: usize, const OUT_RANK: usize>(
         &self,

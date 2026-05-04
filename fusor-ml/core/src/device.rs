@@ -32,6 +32,8 @@ const PIPELINE_LAYOUT_CACHE_SIZE: usize = 256;
 const NAGA_MODULE_CACHE_SIZE: usize = 128;
 const SHADER_MODULE_CACHE_SIZE: usize = 128;
 const COMPUTE_PIPELINE_CACHE_SIZE: usize = 128;
+const DIRECT_STORAGE3_BIND_GROUP_CACHE_SIZE: usize = 4096;
+const DIRECT_DYNAMIC_BIND_GROUP_CACHE_SIZE: usize = 4096;
 const GPU_POLL_SPIN_BUDGET: Duration = Duration::from_millis(2);
 
 fn padded_copy_size(size: u64) -> u64 {
@@ -137,6 +139,58 @@ impl CachedBuffer {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) struct DirectStorage3BindGroupKey {
+    input: usize,
+    weight: usize,
+    output: usize,
+}
+
+impl DirectStorage3BindGroupKey {
+    pub(crate) fn new(
+        input: &Arc<wgpu::Buffer>,
+        weight: &Arc<wgpu::Buffer>,
+        output: &Arc<wgpu::Buffer>,
+    ) -> Self {
+        Self {
+            input: Arc::as_ptr(input) as usize,
+            weight: Arc::as_ptr(weight) as usize,
+            output: Arc::as_ptr(output) as usize,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub(crate) struct DirectDynamicBindGroupKey {
+    entries: Vec<DirectDynamicBindGroupEntryKey>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+struct DirectDynamicBindGroupEntryKey {
+    binding: u32,
+    read_only: bool,
+    buffer: usize,
+    size: u64,
+}
+
+impl DirectDynamicBindGroupKey {
+    pub(crate) fn new(entries: impl IntoIterator<Item = (u32, bool, Arc<wgpu::Buffer>)>) -> Self {
+        Self {
+            entries: entries
+                .into_iter()
+                .map(
+                    |(binding, read_only, buffer)| DirectDynamicBindGroupEntryKey {
+                        binding,
+                        read_only,
+                        buffer: Arc::as_ptr(&buffer) as usize,
+                        size: buffer.size(),
+                    },
+                )
+                .collect(),
+        }
+    }
+}
+
 struct DeviceInner {
     device: wgpu::Device,
     adapter: wgpu::Adapter,
@@ -150,6 +204,10 @@ struct DeviceInner {
     shader_module_cache: RwLock<LruCache<String, wgpu::ShaderModule, FxBuildHasher>>,
     compute_pipeline_cache:
         RwLock<LruCache<(PipelineLayout, ShaderModule), wgpu::ComputePipeline, FxBuildHasher>>,
+    direct_dynamic_bind_group_cache:
+        RwLock<LruCache<DirectDynamicBindGroupKey, wgpu::BindGroup, FxBuildHasher>>,
+    direct_storage3_bind_group_cache:
+        RwLock<LruCache<DirectStorage3BindGroupKey, wgpu::BindGroup, FxBuildHasher>>,
     direct_storage3_bind_group_layout: OnceLock<BindGroupLayout>,
     direct_storage3_pipeline_layout: OnceLock<PipelineLayout>,
     // Cache for buffer allocations, keyed by size in bytes
@@ -220,18 +278,28 @@ impl Device {
             ..Default::default()
         });
         let adapter = select_adapter(&instance, backends).await?;
+        let adapter_features = adapter.features();
         let mut required_features = wgpu::Features::empty();
-        if adapter.features().contains(wgpu::Features::SUBGROUP) {
+        if adapter_features.contains(wgpu::Features::SUBGROUP) {
             required_features |= wgpu::Features::SUBGROUP;
         }
-        if adapter.features().contains(wgpu::Features::SHADER_F16) {
+        if adapter_features.contains(wgpu::Features::SHADER_F16) {
             required_features |= wgpu::Features::SHADER_F16;
         }
+        if std::env::var_os("FUSOR_TRACE_GPU_KERNELS").is_some() {
+            if adapter_features.contains(wgpu::Features::TIMESTAMP_QUERY) {
+                required_features |= wgpu::Features::TIMESTAMP_QUERY;
+                if adapter_features.contains(wgpu::Features::TIMESTAMP_QUERY_INSIDE_PASSES) {
+                    required_features |= wgpu::Features::TIMESTAMP_QUERY_INSIDE_PASSES;
+                }
+            } else {
+                eprintln!(
+                    "FUSOR_TRACE_GPU_KERNELS requested, but adapter does not support timestamp queries"
+                );
+            }
+        }
         let mut experimental_features = wgpu::ExperimentalFeatures::default();
-        if adapter
-            .features()
-            .contains(wgpu::Features::EXPERIMENTAL_COOPERATIVE_MATRIX)
-        {
+        if adapter_features.contains(wgpu::Features::EXPERIMENTAL_COOPERATIVE_MATRIX) {
             required_features |= wgpu::Features::EXPERIMENTAL_COOPERATIVE_MATRIX;
             // SAFETY: cooperative matrix is an experimental feature that requires opting in
             experimental_features = unsafe { wgpu::ExperimentalFeatures::enabled() };
@@ -286,6 +354,14 @@ impl Device {
             NonZeroUsize::new(COMPUTE_PIPELINE_CACHE_SIZE).unwrap(),
             Default::default(),
         ));
+        let direct_dynamic_bind_group_cache = RwLock::new(LruCache::with_hasher(
+            NonZeroUsize::new(DIRECT_DYNAMIC_BIND_GROUP_CACHE_SIZE).unwrap(),
+            Default::default(),
+        ));
+        let direct_storage3_bind_group_cache = RwLock::new(LruCache::with_hasher(
+            NonZeroUsize::new(DIRECT_STORAGE3_BIND_GROUP_CACHE_SIZE).unwrap(),
+            Default::default(),
+        ));
         let buffer_allocation_cache = RwLock::new(LruCache::with_hasher(
             const { NonZeroUsize::new(128).unwrap() },
             Default::default(),
@@ -302,6 +378,8 @@ impl Device {
             naga_module_cache,
             shader_module_cache,
             compute_pipeline_cache,
+            direct_dynamic_bind_group_cache,
+            direct_storage3_bind_group_cache,
             direct_storage3_bind_group_layout: OnceLock::new(),
             direct_storage3_pipeline_layout: OnceLock::new(),
             buffer_allocation_cache,
@@ -473,6 +551,18 @@ impl Device {
             .clone()
     }
 
+    pub(crate) fn direct_storage3_bind_group_cache(
+        &self,
+    ) -> &RwLock<LruCache<DirectStorage3BindGroupKey, wgpu::BindGroup, FxBuildHasher>> {
+        &self.inner.direct_storage3_bind_group_cache
+    }
+
+    pub(crate) fn direct_dynamic_bind_group_cache(
+        &self,
+    ) -> &RwLock<LruCache<DirectDynamicBindGroupKey, wgpu::BindGroup, FxBuildHasher>> {
+        &self.inner.direct_dynamic_bind_group_cache
+    }
+
     pub(crate) fn direct_storage3_pipeline_layout(&self) -> PipelineLayout {
         self.inner
             .direct_storage3_pipeline_layout
@@ -642,8 +732,8 @@ impl Device {
     /// one execution graph so intermediate results can be freed as soon as every
     /// consumer within the batch has been computed. This keeps peak GPU memory
     /// much lower than resolving targets one-by-one.
-    pub fn resolve_batch(&self, keys: &[crate::compute_graph::NodeIndex]) {
-        self.compute_graph().resolve_batch(keys);
+    pub fn resolve_batch(&self, keys: &[crate::compute_graph::NodeIndex]) -> usize {
+        self.compute_graph().resolve_batch(keys)
     }
 }
 

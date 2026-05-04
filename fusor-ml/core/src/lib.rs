@@ -26,6 +26,8 @@ mod compute_graph;
 pub use compute_graph::NodeIndex;
 mod device;
 mod element_wise;
+mod flash_attention;
+pub(crate) use flash_attention::FlashAttentionOperation;
 mod index_select;
 mod layout;
 mod map_layout;
@@ -45,7 +47,6 @@ mod slice_assign;
 mod tensor;
 mod varbuilder;
 mod visit_tiled;
-
 
 #[derive(thiserror::Error, Debug)]
 pub enum Error {

@@ -102,6 +102,8 @@ struct Lowerer<'a> {
     module: Module,
     f32_ty: Handle<Type>,
     f32_vec4_ty: Handle<Type>,
+    i32_ty: Handle<Type>,
+    i32_vec4_ty: Handle<Type>,
     f16_ty: Option<Handle<Type>>,
     u32_ty: Handle<Type>,
     u32_vec3_ty: Handle<Type>,
@@ -118,6 +120,7 @@ struct Lowerer<'a> {
     uses_num_subgroups: bool,
     block_dequant_cache: RefCell<HashMap<BlockDequantId, Vec<Handle<Expression>>>>,
     pin_cache: RefCell<HashMap<PinId, Handle<Expression>>>,
+    q8_activation_pack_cache: RefCell<HashMap<Vec<Handle<Expression>>, Q8ActivationPacks>>,
     loop_fold_group_cache: RefCell<HashMap<LoopFoldGroupId, Vec<Handle<Expression>>>>,
     fold_accumulator_locals: Vec<Handle<LocalVariable>>,
     fold_group_offsets: Vec<usize>,
@@ -131,12 +134,29 @@ struct Lowerer<'a> {
     uses_cooperative_matrix: bool,
 }
 
+#[derive(Clone)]
+struct Q8ActivationPacks {
+    len: usize,
+    scales: [Handle<LocalVariable>; 4],
+    packs: [Handle<LocalVariable>; 4],
+    sums_i32: [Handle<LocalVariable>; 4],
+}
+
+struct Q8ActivationPackValues {
+    scales: Vec<Handle<Expression>>,
+    packs: Vec<Handle<Expression>>,
+    sums_i32: Vec<Handle<Expression>>,
+}
+
 #[derive(Copy, Clone)]
 struct ScratchLocals {
     loop_index: Handle<LocalVariable>,
     values: [Handle<LocalVariable>; 3],
     spills: [[Handle<LocalVariable>; 32]; 3],
     block_dequant: [Handle<LocalVariable>; 16],
+    q8_activation_scales: [Handle<LocalVariable>; 4],
+    q8_activation_packs: [Handle<LocalVariable>; 4],
+    q8_activation_sums_i32: [Handle<LocalVariable>; 4],
 }
 
 mod analysis;

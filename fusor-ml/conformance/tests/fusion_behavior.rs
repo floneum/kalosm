@@ -25,6 +25,12 @@ fn condition_data(shape: [usize; 2]) -> Vec<f32> {
         .collect()
 }
 
+fn attention_data(len: usize, offset: f32) -> Vec<f32> {
+    (0..len)
+        .map(|i| (((i % 17) as f32) - 8.0) * 0.12 + offset)
+        .collect()
+}
+
 #[tokio::test]
 async fn gpu_nary_triple_add_fuses_into_one_kernel() {
     let Some(device) = gpu_device().await else {
@@ -125,6 +131,80 @@ async fn gpu_nary_where_cond_fuses_into_one_kernel() {
             .to_concrete();
         approx_eq(&actual, &expected, 1e-6).await.unwrap();
     }
+}
+
+#[tokio::test]
+async fn gpu_flash_attention_fuses_into_one_kernel() {
+    let Some(device) = gpu_device().await else {
+        return;
+    };
+
+    let q_shape = [1, 2, 3, 4];
+    let kv_shape = [1, 2, 5, 4];
+    let q_data = attention_data(q_shape.iter().product(), 0.1);
+    let k_data = attention_data(kv_shape.iter().product(), -0.15);
+    let v_data = attention_data(kv_shape.iter().product(), 0.35);
+    let scale = 1.0 / (q_shape[3] as f32).sqrt();
+
+    let q = Tensor::from_slice(&device, q_shape, &q_data);
+    let k = Tensor::from_slice(&device, kv_shape, &k_data);
+    let v = Tensor::from_slice(&device, kv_shape, &v_data);
+    let result = q.flash_attention(&k, &v, scale, None);
+
+    let gpu_result = result.as_gpu().unwrap();
+    let kernel_count = gpu_result.count_kernels_to_resolve();
+    assert_eq!(
+        kernel_count,
+        1,
+        "flash attention graph was not fused:\n{}",
+        gpu_result.graphvis()
+    );
+    let actual = result.to_concrete();
+
+    let cpu_q = Tensor::from_slice(&Device::Cpu, q_shape, &q_data);
+    let cpu_k = Tensor::from_slice(&Device::Cpu, kv_shape, &k_data);
+    let cpu_v = Tensor::from_slice(&Device::Cpu, kv_shape, &v_data);
+    let expected = cpu_q
+        .flash_attention(&cpu_k, &cpu_v, scale, None)
+        .to_concrete();
+    approx_eq(&actual, &expected, 1e-4).await.unwrap();
+}
+
+#[tokio::test]
+async fn gpu_residual_rms_norm_fuses_into_one_kernel() {
+    let Some(device) = gpu_device().await else {
+        return;
+    };
+
+    let shape = [1, 3, 256];
+    let input_data = attention_data(shape.iter().product(), 0.25);
+    let residual_data = attention_data(shape.iter().product(), -0.4);
+    let weight_data: Vec<f32> = (0..shape[2])
+        .map(|i| 0.75 + (i % 11) as f32 * 0.03)
+        .collect();
+
+    let input = Tensor::from_slice(&device, shape, &input_data);
+    let residual = Tensor::from_slice(&device, shape, &residual_data);
+    let weight = Tensor::from_slice(&device, [shape[2]], &weight_data);
+    let result = input.rms_norm_residual_fused::<1, 2, _>(&residual, &weight, None, 1e-5);
+
+    let gpu_result = result.as_gpu().unwrap();
+    let kernel_count = gpu_result.count_kernels_to_resolve();
+    assert_eq!(
+        kernel_count,
+        1,
+        "residual rms norm graph was not fused:\n{}",
+        gpu_result.graphvis()
+    );
+    let actual = result.to_concrete();
+
+    let cpu_input = Tensor::from_slice(&Device::Cpu, shape, &input_data);
+    let cpu_residual = Tensor::from_slice(&Device::Cpu, shape, &residual_data);
+    let cpu_weight = Tensor::from_slice(&Device::Cpu, [shape[2]], &weight_data);
+    let expected = (cpu_input + cpu_residual)
+        .rms_norm_fused::<1, 2>(&cpu_weight, None, 1e-5)
+        .to_concrete();
+    approx_eq(&actual, &expected, 1e-4).await.unwrap();
 }
 
 #[tokio::test]

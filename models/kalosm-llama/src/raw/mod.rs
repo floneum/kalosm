@@ -9,6 +9,8 @@ use attention_layer::AttentionVariant;
 use attention_layer::FeedForwardVariant;
 use attention_layer::GroupedAttention;
 use attention_layer::LlamaFeedForward;
+use attention_layer::PairedAttention;
+use attention_layer::PairedAttentionKind;
 use attention_layer::PhiFeedForward;
 use attention_layer::SeparateAttention;
 use fusor::cache::MaskCache;
@@ -357,7 +359,10 @@ where
                     && architecture.as_ref() != "qwen3"
                     && architecture.as_ref() != "gemma3";
 
-                let can_fuse_qkv = false
+                let fast_decode_enabled = std::env::var_os("KALOSM_LLAMA_FAST_DECODE")
+                    .map(|value| value != "0")
+                    .unwrap_or(true);
+                let can_fuse_qkv = fast_decode_enabled
                     && bias.is_none()
                     && attention_q_norm.is_none()
                     && attention_k_norm.is_none();
@@ -369,6 +374,44 @@ where
                         attention_qkv,
                         interleaved_rope,
                     })
+                } else if can_fuse_qkv {
+                    let paired_attention =
+                        if let Some(attention_pair) = QMatrix::concat_rows(&[&q, &k]) {
+                            Some(PairedAttention {
+                                attention_pair,
+                                attention_single: v.clone(),
+                                kind: PairedAttentionKind::QueryKey,
+                                interleaved_rope,
+                            })
+                        } else if let Some(attention_pair) = QMatrix::concat_rows(&[&q, &v]) {
+                            Some(PairedAttention {
+                                attention_pair,
+                                attention_single: k.clone(),
+                                kind: PairedAttentionKind::QueryValue,
+                                interleaved_rope,
+                            })
+                        } else {
+                            QMatrix::concat_rows(&[&k, &v]).map(|attention_pair| PairedAttention {
+                                attention_pair,
+                                attention_single: q.clone(),
+                                kind: PairedAttentionKind::KeyValue,
+                                interleaved_rope,
+                            })
+                        };
+                    if let Some(attention) = paired_attention {
+                        AttentionVariant::Paired(attention)
+                    } else {
+                        let separate = SeparateAttention {
+                            attention_wq: q,
+                            attention_q_norm,
+                            attention_wk: k,
+                            attention_k_norm,
+                            attention_wv: v,
+                            interleaved_rope,
+                            bias,
+                        };
+                        AttentionVariant::Separate(Box::new(separate))
+                    }
                 } else {
                     let separate = SeparateAttention {
                         attention_wq: q,
@@ -571,7 +614,10 @@ where
             };
             let start = all_tokens.len() - cutoff_len;
             seq_len = cutoff_len;
-            tracing::trace!("The context is full, trimming start of the context to fit new tokens. The first {} tokens were truncated.", start);
+            tracing::trace!(
+                "The context is full, trimming start of the context to fit new tokens. The first {} tokens were truncated.",
+                start
+            );
             let all_tokens = &all_tokens[start..];
             if let Some(cache) = cache.as_mut() {
                 cache.tokens = all_tokens.to_vec();
@@ -652,20 +698,17 @@ where
             if let Some(post_attention_norm) = &layer.post_attention_norm {
                 attn = post_attention_norm.forward_generic(&attn);
             }
-            // Work in f32 for tensor addition
             let attn_f32: Tensor<3, f32> = attn.cast();
-            let x_f32: Tensor<3, F> = (attn_f32 + residual).cast();
 
-            // MLP
-            let residual: Tensor<3, f32> = x_f32.cast();
-            let x = layer.ffn_norm.forward_generic(&x_f32);
+            // MLP over RMSNorm(attention_output + residual). The fused path avoids
+            // materializing the mid-block residual add just to feed normalization.
+            let x = layer.ffn_norm.forward_residual_f32(&attn_f32, &residual);
             let mut x = layer.feed_forward_variant.forward(&x);
             if let Some(post_ffn_norm) = &layer.post_ffn_norm {
                 x = post_ffn_norm.forward_generic(&x);
             }
-            // Work in f32 for tensor addition
             let x_f32: Tensor<3, f32> = x.cast();
-            layer_in = (x_f32 + residual).cast();
+            layer_in = (x_f32 + attn_f32 + residual).cast();
         }
         let x = self.norm.forward_generic(&layer_in);
         let x = x.i((.., seq_len - 1, ..));

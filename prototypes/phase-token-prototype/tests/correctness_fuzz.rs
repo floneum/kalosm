@@ -360,7 +360,7 @@ fn fuzz_qgemv_case(
         ),
         &actual,
         &expected,
-        3.0e-2,
+        qgemv_tolerance(format),
     );
     Ok(())
 }
@@ -396,7 +396,7 @@ fn fuzz_qgemv_split_workgroups_case(
         &format!("split-grid qgemv {format:?} n={n} k={k}"),
         &actual,
         &expected,
-        3.0e-2,
+        qgemv_tolerance(format),
     );
     Ok(())
 }
@@ -1156,6 +1156,15 @@ fn ggml_formats() -> [GgmlQuantFormat; 12] {
 
 fn qgemv_cols_per_workgroup(format: GgmlQuantFormat) -> usize {
     format.qgemv_cols_per_workgroup() as usize
+}
+
+fn qgemv_tolerance(format: GgmlQuantFormat) -> f32 {
+    match format {
+        // Q4K/Q6K qgemv intentionally quantizes activations to q8 before
+        // dot4; the CPU reference still multiplies dequantized f32 values.
+        GgmlQuantFormat::Q4K | GgmlQuantFormat::Q6K => 5.0e-2,
+        _ => 3.0e-2,
+    }
 }
 
 fn shape<const R: usize>(dims: [usize; R]) -> Shape {

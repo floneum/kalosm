@@ -1,6 +1,7 @@
 use crate::Layout;
 use phase_token_prototype as tile_ir;
 
+#[derive(Clone)]
 pub(crate) struct DirectMatrixLayout {
     pub(crate) rows: u32,
     pub(crate) cols: u32,

@@ -30,6 +30,7 @@ impl LayoutPass {
                 ComputeGraphNodeVariant::QEmbedding(op) => self.visit_q_embedding(node, op),
                 ComputeGraphNodeVariant::Reduce(op) => self.visit_reduce(node, op),
                 ComputeGraphNodeVariant::RmsNorm(op) => self.visit_rms_norm(node, op),
+                ComputeGraphNodeVariant::FlashAttention(op) => self.visit_flash_attention(node, op),
                 ComputeGraphNodeVariant::MapLayout(op) => self.visit_map_layout(node, op),
                 ComputeGraphNodeVariant::Resize(op) => self.visit_resize(node, op),
                 ComputeGraphNodeVariant::SliceAssign(op) => self.visit_slice_assign(node, op),
@@ -152,6 +153,42 @@ impl LayoutPass {
             TensorLayoutInfo::new(
                 Layout::contiguous(input_layout.shape()),
                 input_layout.datatype(),
+            ),
+        );
+    }
+
+    fn visit_flash_attention(
+        &mut self,
+        key: NodeIndex,
+        operation: &crate::FlashAttentionOperation,
+    ) {
+        let Some(q_layout) = self.output_layout.get(&operation.q) else {
+            self.queue.push_back(operation.q);
+            self.queue.push_back(key);
+            return;
+        };
+        if !self.output_layout.contains_key(&operation.k) {
+            self.queue.push_back(operation.k);
+            self.queue.push_back(key);
+            return;
+        }
+        if !self.output_layout.contains_key(&operation.v) {
+            self.queue.push_back(operation.v);
+            self.queue.push_back(key);
+            return;
+        }
+        if let Some(mask) = operation.mask
+            && !self.output_layout.contains_key(&mask)
+        {
+            self.queue.push_back(mask);
+            self.queue.push_back(key);
+            return;
+        }
+        self.output_layout.insert(
+            key,
+            TensorLayoutInfo::new(
+                Layout::contiguous(&operation.out_shape),
+                q_layout.datatype(),
             ),
         );
     }

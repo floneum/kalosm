@@ -1,6 +1,21 @@
 use super::*;
 
 impl<'a> Lowerer<'a> {
+    fn quantized_block_base(
+        &self,
+        e: &mut Arena<Expression>,
+        matrix: &QuantizedMatrix,
+        block: Handle<Expression>,
+        col: Handle<Expression>,
+        block_words: u32,
+        emits: &mut Vec<Range<Expression>>,
+    ) -> Handle<Expression> {
+        let blocks_per_col = matrix.rows / matrix.format.block_elements();
+        let col_block = self.mul_literal_u32_emitted(e, col, blocks_per_col, emits);
+        let block_index = self.bin(e, emits, BinaryOperator::Add, col_block, block);
+        self.mul_literal_u32_emitted(e, block_index, block_words, emits)
+    }
+
     pub(super) fn dequantize_qvalue(
         &self,
         expressions: &mut Arena<Expression>,
@@ -13,16 +28,8 @@ impl<'a> Lowerer<'a> {
         let block_words = matrix.format.block_words();
         let block = self.div_literal_u32_emitted(expressions, k, block_elems, &mut emits);
         let q = self.and_lit(expressions, &mut emits, k, block_elems - 1);
-        let col_block =
-            self.mul_literal_u32_emitted(expressions, col, matrix.rows / block_elems, &mut emits);
-        let block_index = self.bin(
-            expressions,
-            &mut emits,
-            BinaryOperator::Add,
-            col_block,
-            block,
-        );
-        let base = self.mul_literal_u32_emitted(expressions, block_index, block_words, &mut emits);
+        let base =
+            self.quantized_block_base(expressions, matrix, block, col, block_words, &mut emits);
         let value = match matrix.format {
             GgmlQuantFormat::Q4_0 => self.dequant_q4_0(expressions, matrix, base, q, &mut emits)?,
             GgmlQuantFormat::Q4_1 => self.dequant_q4_1(expressions, matrix, base, q, &mut emits)?,
@@ -226,16 +233,7 @@ impl<'a> Lowerer<'a> {
         let mut emits = Vec::new();
         let block = self.div_literal_u32_emitted(expressions, k_base, 256, &mut emits);
         let q_base = self.and_lit(expressions, &mut emits, k_base, 255);
-        let col_block =
-            self.mul_literal_u32_emitted(expressions, col, matrix.rows / 256, &mut emits);
-        let block_index = self.bin(
-            expressions,
-            &mut emits,
-            BinaryOperator::Add,
-            col_block,
-            block,
-        );
-        let base = self.mul_literal_u32_emitted(expressions, block_index, 37, &mut emits);
+        let base = self.quantized_block_base(expressions, matrix, block, col, 37, &mut emits);
 
         let d_word = self.load_word(expressions, matrix, base, 0, &mut emits)?;
         let d = self.bitcast_f32(expressions, &mut emits, d_word);
@@ -382,16 +380,7 @@ impl<'a> Lowerer<'a> {
         let mut emits = Vec::new();
         let block = self.div_literal_u32_emitted(expressions, k_base, 256, &mut emits);
         let q_base = self.and_lit(expressions, &mut emits, k_base, 255);
-        let col_block =
-            self.mul_literal_u32_emitted(expressions, col, matrix.rows / 256, &mut emits);
-        let block_index = self.bin(
-            expressions,
-            &mut emits,
-            BinaryOperator::Add,
-            col_block,
-            block,
-        );
-        let base = self.mul_literal_u32_emitted(expressions, block_index, 53, &mut emits);
+        let base = self.quantized_block_base(expressions, matrix, block, col, 53, &mut emits);
 
         let d_word = self.load_word(expressions, matrix, base, 52, &mut emits)?;
         let d = self.bitcast_f32(expressions, &mut emits, d_word);
@@ -515,6 +504,468 @@ impl<'a> Lowerer<'a> {
         emits.extend(hi_emits);
         values.extend(hi_values);
         Ok((values, emits))
+    }
+
+    pub(super) fn q4k_q8_activation_dot(
+        &self,
+        expressions: &mut Arena<Expression>,
+        matrix: &QuantizedMatrix,
+        k_base: Handle<Expression>,
+        col: Handle<Expression>,
+        a: &Q8ActivationPacks,
+    ) -> Result<(Handle<Expression>, Vec<Range<Expression>>), LowerError> {
+        if a.len == 0 || !a.len.is_multiple_of(2) {
+            return Err(LowerError::UnsupportedOperation(
+                "q4k x q8 activation dot requires an even number of activation packs",
+            ));
+        }
+
+        let mut emits = Vec::new();
+        let mut total = self.f32(expressions, 0.0);
+        for pack_offset in (0..a.len).step_by(2) {
+            let k = self.add_lit(expressions, &mut emits, k_base, (pack_offset * 4) as u32);
+            let (chunk, chunk_emits) =
+                self.q4k_q8_activation_dot8(expressions, matrix, k, col, a, pack_offset)?;
+            emits.extend(chunk_emits);
+            total = self.bin(expressions, &mut emits, BinaryOperator::Add, total, chunk);
+        }
+        Ok((total, emits))
+    }
+
+    fn q4k_q8_activation_dot8(
+        &self,
+        expressions: &mut Arena<Expression>,
+        matrix: &QuantizedMatrix,
+        k_base: Handle<Expression>,
+        col: Handle<Expression>,
+        a: &Q8ActivationPacks,
+        pack_offset: usize,
+    ) -> Result<(Handle<Expression>, Vec<Range<Expression>>), LowerError> {
+        if matrix.format != GgmlQuantFormat::Q4K || a.len < pack_offset + 2 {
+            return Err(LowerError::UnsupportedOperation(
+                "q4k x q8 activation dot requires Q4K and two activation packs",
+            ));
+        }
+
+        let mut emits = Vec::new();
+        let (b_scale, b_min, b_packs) =
+            self.q4k_quant_packs8(expressions, matrix, k_base, col, &mut emits)?;
+        let mut total = self.f32(expressions, 0.0);
+        for i in 0..2 {
+            let a_pack_index = pack_offset + i;
+            let a_pack = self.load_local(expressions, &mut emits, a.packs[a_pack_index]);
+            let dot = self.dot4_i8_packed(expressions, &mut emits, a_pack, b_packs[i]);
+            let scaled_dot = self.mul(expressions, &mut emits, dot, b_scale);
+            let a_sum_i32 = self.load_local(expressions, &mut emits, a.sums_i32[a_pack_index]);
+            let a_sum = self.as_f32(expressions, &mut emits, a_sum_i32);
+            let min_term = self.mul(expressions, &mut emits, a_sum, b_min);
+            let unscaled = self.sub(expressions, &mut emits, scaled_dot, min_term);
+            let a_scale = self.load_local(expressions, &mut emits, a.scales[a_pack_index]);
+            let chunk = self.mul(expressions, &mut emits, unscaled, a_scale);
+            total = self.bin(expressions, &mut emits, BinaryOperator::Add, total, chunk);
+        }
+        Ok((total, emits))
+    }
+
+    pub(super) fn q6k_q8_activation_dot(
+        &self,
+        expressions: &mut Arena<Expression>,
+        matrix: &QuantizedMatrix,
+        k_base: Handle<Expression>,
+        col: Handle<Expression>,
+        a: &Q8ActivationPacks,
+    ) -> Result<(Handle<Expression>, Vec<Range<Expression>>), LowerError> {
+        if matrix.format != GgmlQuantFormat::Q6K {
+            return Err(LowerError::UnsupportedOperation(
+                "q6k x q8 activation dot only supports Q6K",
+            ));
+        }
+
+        if a.len == 0 || !a.len.is_multiple_of(2) {
+            return Err(LowerError::UnsupportedOperation(
+                "q6k x q8 activation dot requires an even number of activation packs",
+            ));
+        }
+
+        let mut emits = Vec::new();
+        let mut total = self.f32(expressions, 0.0);
+        for pack_offset in (0..a.len).step_by(2) {
+            let k = self.add_lit(expressions, &mut emits, k_base, (pack_offset * 4) as u32);
+            let (chunk, chunk_emits) =
+                self.q6k_q8_activation_dot8(expressions, matrix, k, col, a, pack_offset)?;
+            emits.extend(chunk_emits);
+            total = self.bin(expressions, &mut emits, BinaryOperator::Add, total, chunk);
+        }
+        Ok((total, emits))
+    }
+
+    fn q6k_q8_activation_dot8(
+        &self,
+        expressions: &mut Arena<Expression>,
+        matrix: &QuantizedMatrix,
+        k_base: Handle<Expression>,
+        col: Handle<Expression>,
+        a: &Q8ActivationPacks,
+        pack_offset: usize,
+    ) -> Result<(Handle<Expression>, Vec<Range<Expression>>), LowerError> {
+        if a.len < pack_offset + 2 {
+            return Err(LowerError::UnsupportedOperation(
+                "q6k x q8 activation dot8 requires two activation packs",
+            ));
+        }
+
+        let mut emits = Vec::new();
+        let (b_scale, b_packs) =
+            self.q6k_quant_packs8(expressions, matrix, k_base, col, &mut emits)?;
+        let mut total = self.f32(expressions, 0.0);
+        for i in 0..2 {
+            let a_pack = pack_offset + i;
+            let a_pack_value = self.load_local(expressions, &mut emits, a.packs[a_pack]);
+            let dot = self.dot4_i8_packed(expressions, &mut emits, a_pack_value, b_packs[i]);
+            let scaled = self.mul(expressions, &mut emits, dot, b_scale);
+            let a_scale = self.load_local(expressions, &mut emits, a.scales[a_pack]);
+            let chunk = self.mul(expressions, &mut emits, scaled, a_scale);
+            total = self.bin(expressions, &mut emits, BinaryOperator::Add, total, chunk);
+        }
+        Ok((total, emits))
+    }
+
+    pub(super) fn cached_q8_activation_packs(
+        &self,
+        e: &mut Arena<Expression>,
+        scratch: ScratchLocals,
+        body: &mut Block,
+        a: &[Handle<Expression>],
+    ) -> Result<Q8ActivationPacks, LowerError> {
+        let key = a.to_vec();
+        if let Some(packs) = self.q8_activation_pack_cache.borrow().get(&key).cloned() {
+            return Ok(packs);
+        }
+
+        let mut emits = Vec::new();
+        let values = self.q8_activation_pack_values(e, a, &mut emits)?;
+        let packs = Self::q8_activation_pack_locals(scratch, values.packs.len())?;
+        self.q8_activation_pack_cache.borrow_mut().clear();
+        Self::push_emits(body, emits);
+        Self::store_q8_activation_pack_values(e, body, &packs, values);
+        self.q8_activation_pack_cache
+            .borrow_mut()
+            .insert(key, packs.clone());
+        Ok(packs)
+    }
+
+    pub(super) fn q8_activation_pack_values(
+        &self,
+        e: &mut Arena<Expression>,
+        a: &[Handle<Expression>],
+        emits: &mut Vec<Range<Expression>>,
+    ) -> Result<Q8ActivationPackValues, LowerError> {
+        if a.is_empty() || !a.len().is_multiple_of(4) {
+            return Err(LowerError::UnsupportedOperation(
+                "q8 activation packing requires a non-empty multiple of 4",
+            ));
+        }
+
+        let qmax = self.f32(e, 127.0);
+
+        let mut scales = Vec::with_capacity(a.len() / 4);
+        let mut sums_i32 = Vec::with_capacity(a.len() / 4);
+        let mut packs = Vec::with_capacity(a.len() / 4);
+        for chunk in a.chunks(4) {
+            let mut max_abs = self.f32(e, 0.0);
+            for value in chunk {
+                let abs = self.math1(e, emits, MathFunction::Abs, *value);
+                max_abs = self.math2(e, emits, MathFunction::Max, max_abs, abs);
+            }
+            let epsilon = self.f32(e, 1.0e-8);
+            max_abs = self.math2(e, emits, MathFunction::Max, max_abs, epsilon);
+            let inv_scale = self.div(e, emits, qmax, max_abs);
+            let scale = self.div(e, emits, max_abs, qmax);
+            let mut sum_i32 = self.i32(e, 0);
+            let mut packed_values = Vec::with_capacity(4);
+            for (lane, value) in chunk.iter().enumerate() {
+                let scaled = self.mul(e, emits, *value, inv_scale);
+                let rounded = self.math1(e, emits, MathFunction::Round, scaled);
+                let lo = self.f32(e, -127.0);
+                let hi = self.f32(e, 127.0);
+                let clamped = self.math2(e, emits, MathFunction::Min, rounded, hi);
+                let clamped = self.math2(e, emits, MathFunction::Max, clamped, lo);
+                let q_i32 = self.as_i32(e, emits, clamped);
+                sum_i32 = self.bin(e, emits, BinaryOperator::Add, sum_i32, q_i32);
+                debug_assert!(lane < 4);
+                packed_values.push(q_i32);
+            }
+            scales.push(scale);
+            sums_i32.push(sum_i32);
+            packs.push(self.pack_i8x4(e, emits, packed_values)?);
+        }
+
+        Ok(Q8ActivationPackValues {
+            scales,
+            packs,
+            sums_i32,
+        })
+    }
+
+    fn q8_activation_pack_locals(
+        scratch: ScratchLocals,
+        len: usize,
+    ) -> Result<Q8ActivationPacks, LowerError> {
+        if len > scratch.q8_activation_packs.len() {
+            return Err(LowerError::UnsupportedOperation(
+                "q8 activation packing supports at most four packs",
+            ));
+        }
+
+        Ok(Q8ActivationPacks {
+            len,
+            scales: scratch.q8_activation_scales,
+            packs: scratch.q8_activation_packs,
+            sums_i32: scratch.q8_activation_sums_i32,
+        })
+    }
+
+    fn store_q8_activation_pack_values(
+        e: &mut Arena<Expression>,
+        body: &mut Block,
+        locals: &Q8ActivationPacks,
+        values: Q8ActivationPackValues,
+    ) {
+        debug_assert_eq!(locals.len, values.scales.len());
+        debug_assert_eq!(locals.len, values.packs.len());
+        debug_assert_eq!(locals.len, values.sums_i32.len());
+
+        for i in 0..locals.len {
+            let scale_ptr = e.append(Expression::LocalVariable(locals.scales[i]), Span::default());
+            body.push(
+                Statement::Store {
+                    pointer: scale_ptr,
+                    value: values.scales[i],
+                },
+                Span::default(),
+            );
+
+            let pack_ptr = e.append(Expression::LocalVariable(locals.packs[i]), Span::default());
+            body.push(
+                Statement::Store {
+                    pointer: pack_ptr,
+                    value: values.packs[i],
+                },
+                Span::default(),
+            );
+
+            let sum_ptr = e.append(
+                Expression::LocalVariable(locals.sums_i32[i]),
+                Span::default(),
+            );
+            body.push(
+                Statement::Store {
+                    pointer: sum_ptr,
+                    value: values.sums_i32[i],
+                },
+                Span::default(),
+            );
+        }
+    }
+
+    fn q4k_quant_packs8(
+        &self,
+        expressions: &mut Arena<Expression>,
+        matrix: &QuantizedMatrix,
+        k_base: Handle<Expression>,
+        col: Handle<Expression>,
+        emits: &mut Vec<Range<Expression>>,
+    ) -> Result<
+        (
+            Handle<Expression>,
+            Handle<Expression>,
+            [Handle<Expression>; 2],
+        ),
+        LowerError,
+    > {
+        let block = self.div_literal_u32_emitted(expressions, k_base, 256, emits);
+        let q_base = self.and_lit(expressions, emits, k_base, 255);
+        let base = self.quantized_block_base(expressions, matrix, block, col, 37, emits);
+
+        let d_word = self.load_word(expressions, matrix, base, 0, emits)?;
+        let d = self.bitcast_f32(expressions, emits, d_word);
+        let dmin_word = self.load_word(expressions, matrix, base, 1, emits)?;
+        let dmin = self.bitcast_f32(expressions, emits, dmin_word);
+        let group = self.shr_lit(expressions, emits, q_base, 5);
+        let scale_byte = self.k_scale(expressions, matrix, base, group, false, emits)?;
+        let scale_f = self.as_f32(expressions, emits, scale_byte);
+        let scale = self.mul(expressions, emits, scale_f, d);
+        let min_byte = self.k_scale(expressions, matrix, base, group, true, emits)?;
+        let min_f = self.as_f32(expressions, emits, min_byte);
+        let min = self.mul(expressions, emits, min_f, dmin);
+
+        let in_group = self.and_lit(expressions, emits, q_base, 31);
+        let group_pair = self.shr_lit(expressions, emits, group, 1);
+        let group_pair_offset = self.shl_lit(expressions, emits, group_pair, 5);
+        let byte_index = self.bin(
+            expressions,
+            emits,
+            BinaryOperator::Add,
+            group_pair_offset,
+            in_group,
+        );
+        let data_word = self.shr_lit(expressions, emits, byte_index, 2);
+        let word0_off = self.add_lit(expressions, emits, data_word, 5);
+        let word1_off = self.add_lit(expressions, emits, data_word, 6);
+        let word0 = self.load_word_dynamic(expressions, matrix, base, word0_off, emits)?;
+        let word1 = self.load_word_dynamic(expressions, matrix, base, word1_off, emits)?;
+        let group_low = self.and_lit(expressions, emits, group, 1);
+        let high = self.cmp_lit(expressions, emits, BinaryOperator::NotEqual, group_low, 0);
+
+        let packs = std::array::from_fn(|chunk| {
+            let mut packed_values = Vec::with_capacity(4);
+            for lane in 0..4 {
+                let source_lane = chunk * 4 + lane;
+                let byte_lane = expressions.append(
+                    Expression::Literal(Literal::U32((source_lane % 4) as u32)),
+                    Span::default(),
+                );
+                let word = if source_lane < 4 { word0 } else { word1 };
+                let byte = self.byte_at(expressions, emits, word, byte_lane);
+                let byte_hi = self.shr_lit(expressions, emits, byte, 4);
+                let byte_lo = self.and_lit(expressions, emits, byte, 0x0f);
+                let quant = self.select(expressions, emits, high, byte_hi, byte_lo);
+                packed_values.push(self.as_i32(expressions, emits, quant));
+            }
+            self.pack_i8x4(expressions, emits, packed_values)
+                .expect("q4k packs exactly four i8 values")
+        });
+        Ok((scale, min, packs))
+    }
+
+    fn q6k_quant_packs8(
+        &self,
+        expressions: &mut Arena<Expression>,
+        matrix: &QuantizedMatrix,
+        k_base: Handle<Expression>,
+        col: Handle<Expression>,
+        emits: &mut Vec<Range<Expression>>,
+    ) -> Result<(Handle<Expression>, [Handle<Expression>; 2]), LowerError> {
+        let block = self.div_literal_u32_emitted(expressions, k_base, 256, emits);
+        let q_base = self.and_lit(expressions, emits, k_base, 255);
+        let base = self.quantized_block_base(expressions, matrix, block, col, 53, emits);
+
+        let d_word = self.load_word(expressions, matrix, base, 52, emits)?;
+        let d = self.bitcast_f32(expressions, emits, d_word);
+        let chunk = self.shr_lit(expressions, emits, q_base, 7);
+        let local = self.and_lit(expressions, emits, q_base, 127);
+        let high_byte_index = self.and_lit(expressions, emits, local, 31);
+        let low_group = self.shr_lit(expressions, emits, local, 5);
+
+        let chunk_low_base = self.shl_lit(expressions, emits, chunk, 6);
+        let low_group_parity = self.and_lit(expressions, emits, low_group, 1);
+        let low_group_offset = self.shl_lit(expressions, emits, low_group_parity, 5);
+        let local_low_index = self.bin(
+            expressions,
+            emits,
+            BinaryOperator::Add,
+            high_byte_index,
+            low_group_offset,
+        );
+        let lower_index = self.bin(
+            expressions,
+            emits,
+            BinaryOperator::Add,
+            chunk_low_base,
+            local_low_index,
+        );
+        let low_word_base = self.shr_lit(expressions, emits, lower_index, 2);
+        let low_word1_off = self.add_lit(expressions, emits, low_word_base, 1);
+        let low_word0 = self.load_word_dynamic(expressions, matrix, base, low_word_base, emits)?;
+        let low_word1 = self.load_word_dynamic(expressions, matrix, base, low_word1_off, emits)?;
+        let low_shift = self.shr_lit(expressions, emits, low_group, 1);
+        let low_shift = self.shl_lit(expressions, emits, low_shift, 2);
+
+        let high_chunk_base = self.shl_lit(expressions, emits, chunk, 5);
+        let high_index = self.bin(
+            expressions,
+            emits,
+            BinaryOperator::Add,
+            high_chunk_base,
+            high_byte_index,
+        );
+        let high_word_base = self.shr_lit(expressions, emits, high_index, 2);
+        let high_word0_off = self.add_lit(expressions, emits, high_word_base, 32);
+        let high_word1_off = self.add_lit(expressions, emits, high_word_base, 33);
+        let high_word0 =
+            self.load_word_dynamic(expressions, matrix, base, high_word0_off, emits)?;
+        let high_word1 =
+            self.load_word_dynamic(expressions, matrix, base, high_word1_off, emits)?;
+        let high_shift = self.shl_lit(expressions, emits, low_group, 1);
+
+        let scale_chunk_base = self.shl_lit(expressions, emits, chunk, 3);
+        let high_byte_half = self.shr_lit(expressions, emits, high_byte_index, 4);
+        let low_group_scale = self.shl_lit(expressions, emits, low_group, 1);
+        let local_scale_index = self.bin(
+            expressions,
+            emits,
+            BinaryOperator::Add,
+            high_byte_half,
+            low_group_scale,
+        );
+        let scale_index = self.bin(
+            expressions,
+            emits,
+            BinaryOperator::Add,
+            scale_chunk_base,
+            local_scale_index,
+        );
+        let scale_word_base = self.shr_lit(expressions, emits, scale_index, 2);
+        let scale_word_off = self.add_lit(expressions, emits, scale_word_base, 48);
+        let scale_word =
+            self.load_word_dynamic(expressions, matrix, base, scale_word_off, emits)?;
+        let scale_lane = self.and_lit(expressions, emits, scale_index, 3);
+        let scale_byte = self.byte_at(expressions, emits, scale_word, scale_lane);
+        let scale = self.signed_byte_f32(expressions, emits, scale_byte);
+        let scale = self.mul(expressions, emits, scale, d);
+
+        let packs = std::array::from_fn(|chunk| {
+            let mut packed_values = Vec::with_capacity(4);
+            for lane in 0..4 {
+                let source_lane = chunk * 4 + lane;
+                let byte_lane = expressions.append(
+                    Expression::Literal(Literal::U32((source_lane % 4) as u32)),
+                    Span::default(),
+                );
+                let low_word = if source_lane < 4 {
+                    low_word0
+                } else {
+                    low_word1
+                };
+                let low_byte = self.byte_at(expressions, emits, low_word, byte_lane);
+                let low_shifted = self.shr(expressions, emits, low_byte, low_shift);
+                let low4 = self.and_lit(expressions, emits, low_shifted, 0x0f);
+
+                let high_word = if source_lane < 4 {
+                    high_word0
+                } else {
+                    high_word1
+                };
+                let high_byte = self.byte_at(expressions, emits, high_word, byte_lane);
+                let high_shifted = self.shr(expressions, emits, high_byte, high_shift);
+                let high2 = self.and_lit(expressions, emits, high_shifted, 3);
+                let high2 = self.shl_lit(expressions, emits, high2, 4);
+                let quant = self.bin(expressions, emits, BinaryOperator::InclusiveOr, low4, high2);
+                let quant_i32 = self.as_i32(expressions, emits, quant);
+                let center = self.i32(expressions, 32);
+                let centered = self.bin(
+                    expressions,
+                    emits,
+                    BinaryOperator::Subtract,
+                    quant_i32,
+                    center,
+                );
+                packed_values.push(centered);
+            }
+            self.pack_i8x4(expressions, emits, packed_values)
+                .expect("q6k packs exactly four i8 values")
+        });
+        Ok((scale, packs))
     }
 
     fn dequant_q4_0(
@@ -1116,6 +1567,16 @@ impl<'a> Lowerer<'a> {
         value
     }
 
+    fn load_local(
+        &self,
+        e: &mut Arena<Expression>,
+        emits: &mut Vec<Range<Expression>>,
+        local: Handle<LocalVariable>,
+    ) -> Handle<Expression> {
+        let pointer = e.append(Expression::LocalVariable(local), Span::default());
+        self.emit(e, emits, Expression::Load { pointer })
+    }
+
     pub(super) fn bin(
         &self,
         e: &mut Arena<Expression>,
@@ -1231,7 +1692,126 @@ impl<'a> Lowerer<'a> {
         self.bin(e, emits, BinaryOperator::Multiply, left, right)
     }
 
-    fn as_f32(
+    fn div(
+        &self,
+        e: &mut Arena<Expression>,
+        emits: &mut Vec<Range<Expression>>,
+        left: Handle<Expression>,
+        right: Handle<Expression>,
+    ) -> Handle<Expression> {
+        self.bin(e, emits, BinaryOperator::Divide, left, right)
+    }
+
+    fn math1(
+        &self,
+        e: &mut Arena<Expression>,
+        emits: &mut Vec<Range<Expression>>,
+        fun: MathFunction,
+        arg: Handle<Expression>,
+    ) -> Handle<Expression> {
+        self.emit(
+            e,
+            emits,
+            Expression::Math {
+                fun,
+                arg,
+                arg1: None,
+                arg2: None,
+                arg3: None,
+            },
+        )
+    }
+
+    fn math2(
+        &self,
+        e: &mut Arena<Expression>,
+        emits: &mut Vec<Range<Expression>>,
+        fun: MathFunction,
+        arg: Handle<Expression>,
+        arg1: Handle<Expression>,
+    ) -> Handle<Expression> {
+        self.emit(
+            e,
+            emits,
+            Expression::Math {
+                fun,
+                arg,
+                arg1: Some(arg1),
+                arg2: None,
+                arg3: None,
+            },
+        )
+    }
+
+    fn dot4_i8_packed(
+        &self,
+        e: &mut Arena<Expression>,
+        emits: &mut Vec<Range<Expression>>,
+        left: Handle<Expression>,
+        right: Handle<Expression>,
+    ) -> Handle<Expression> {
+        let dot = self.emit(
+            e,
+            emits,
+            Expression::Math {
+                fun: MathFunction::Dot4I8Packed,
+                arg: left,
+                arg1: Some(right),
+                arg2: None,
+                arg3: None,
+            },
+        );
+        self.as_f32(e, emits, dot)
+    }
+
+    fn pack_i8x4(
+        &self,
+        e: &mut Arena<Expression>,
+        emits: &mut Vec<Range<Expression>>,
+        values: Vec<Handle<Expression>>,
+    ) -> Result<Handle<Expression>, LowerError> {
+        let components: [Handle<Expression>; 4] = values
+            .try_into()
+            .map_err(|_| LowerError::UnsupportedOperation("pack_i8x4 requires 4 values"))?;
+        let vec = e.append(
+            Expression::Compose {
+                ty: self.i32_vec4_ty,
+                components: components.to_vec(),
+            },
+            Span::default(),
+        );
+        emits.push(Self::single_expression_range(e, vec));
+        Ok(self.emit(
+            e,
+            emits,
+            Expression::Math {
+                fun: MathFunction::Pack4xI8Clamp,
+                arg: vec,
+                arg1: None,
+                arg2: None,
+                arg3: None,
+            },
+        ))
+    }
+
+    fn as_i32(
+        &self,
+        e: &mut Arena<Expression>,
+        emits: &mut Vec<Range<Expression>>,
+        value: Handle<Expression>,
+    ) -> Handle<Expression> {
+        self.emit(
+            e,
+            emits,
+            Expression::As {
+                expr: value,
+                kind: ScalarKind::Sint,
+                convert: Some(4),
+            },
+        )
+    }
+
+    pub(super) fn as_f32(
         &self,
         e: &mut Arena<Expression>,
         emits: &mut Vec<Range<Expression>>,
@@ -1267,6 +1847,10 @@ impl<'a> Lowerer<'a> {
 
     fn u32(&self, e: &mut Arena<Expression>, value: u32) -> Handle<Expression> {
         e.append(Expression::Literal(Literal::U32(value)), Span::default())
+    }
+
+    fn i32(&self, e: &mut Arena<Expression>, value: i32) -> Handle<Expression> {
+        e.append(Expression::Literal(Literal::I32(value)), Span::default())
     }
 
     fn f32(&self, e: &mut Arena<Expression>, value: f32) -> Handle<Expression> {

@@ -277,6 +277,12 @@ impl Program {
                 return self.qgemv_perf::<4, 4, 8, 128>(a, b, y, workgroups_x);
             }
             GgmlQuantFormat::Q4K => {
+                if b.format
+                    .qgemv_subgroups_per_workgroup_for_shape(b.rows, b.cols)
+                    == 8
+                {
+                    return self.qgemv_perf::<8, 8, 8, 256>(a, b, y, workgroups_x);
+                }
                 return self.qgemv_perf::<4, 8, 8, 128>(a, b, y, workgroups_x);
             }
             GgmlQuantFormat::Q5_0 => {
@@ -295,10 +301,13 @@ impl Program {
                 return self.qgemv_perf::<2, 1, 8, 64>(a, b, y, workgroups_x);
             }
             GgmlQuantFormat::Q6K => {
-                if matrix_shape(&a.view.layout)[1] <= 4096 {
+                if b.format
+                    .qgemv_subgroups_per_workgroup_for_shape(b.rows, b.cols)
+                    == 4
+                {
                     return self.qgemv_perf::<4, 4, 8, 128>(a, b, y, workgroups_x);
                 }
-                return self.qgemv_perf::<4, 4, 16, 128>(a, b, y, workgroups_x);
+                return self.qgemv_perf::<8, 4, 16, 256>(a, b, y, workgroups_x);
             }
         }
     }
@@ -373,6 +382,22 @@ impl Program {
                                 let a_vec: [Tile<BLOCK>; 8] =
                                     std::array::from_fn(|i| a_pins[i].get());
                                 return program.quantized_q8_0_dot8(
+                                    a_vec, &b_cloned, &k_base, &col, mask, 0.0,
+                                );
+                            }
+                            if b_cloned.format == GgmlQuantFormat::Q4K
+                                && (VALUES_PER_LANE == 8 || VALUES_PER_LANE == 16)
+                            {
+                                let a_vec: [Tile<BLOCK>; VALUES_PER_LANE] =
+                                    std::array::from_fn(|i| a_pins[i].get());
+                                return program.quantized_q8_activation_dot::<VALUES_PER_LANE>(
+                                    a_vec, &b_cloned, &k_base, &col, mask, 0.0,
+                                );
+                            }
+                            if b_cloned.format == GgmlQuantFormat::Q6K {
+                                let a_vec: [Tile<BLOCK>; VALUES_PER_LANE] =
+                                    std::array::from_fn(|i| a_pins[i].get());
+                                return program.quantized_q8_activation_dot::<VALUES_PER_LANE>(
                                     a_vec, &b_cloned, &k_base, &col, mask, 0.0,
                                 );
                             }
@@ -1315,6 +1340,32 @@ impl<const BLOCK: usize> TileBlock<'_, BLOCK> {
                 col: col.into_index(),
                 mask: mask.expr,
                 fill: F32Bits::new(fill),
+            },
+        }
+    }
+
+    pub fn quantized_q8_activation_dot<const N: usize>(
+        &self,
+        a: [Tile<BLOCK>; N],
+        matrix: &QuantizedMatrix,
+        k_base: impl IntoIndex<BLOCK>,
+        col: impl IntoIndex<BLOCK>,
+        mask: Mask<BLOCK>,
+        fill: f32,
+    ) -> Tile<BLOCK> {
+        assert!(
+            N == 8 || N == 16,
+            "q8 activation dot currently supports N == 8 or N == 16"
+        );
+        Tile {
+            expr: TileExpr::QuantizedQ8ActivationDot {
+                a: a.into_iter().map(|value| Box::new(value.expr)).collect(),
+                src: matrix.clone(),
+                k_base: k_base.into_index(),
+                col: col.into_index(),
+                mask: mask.expr,
+                fill: F32Bits::new(fill),
+                block_n: N as u32,
             },
         }
     }

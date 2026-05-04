@@ -26,11 +26,47 @@ use kalosm_model_types::ModelLoadingProgress;
 use llm_samplers::types::Logits;
 use std::collections::HashMap;
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::Duration;
 
 use tokenizers::Tokenizer;
 
 use crate::{InferenceSettings, LlamaSourceError};
+
+#[derive(Default)]
+struct DecodeTraceStats {
+    fast: Vec<Duration>,
+    fallback: Vec<Duration>,
+}
+
+static DECODE_TRACE_STATS: OnceLock<Mutex<DecodeTraceStats>> = OnceLock::new();
+
+fn record_decode_trace(path: &'static str, decode_eligible: bool, kernels: usize, total: Duration) {
+    let stats = DECODE_TRACE_STATS.get_or_init(|| Mutex::new(DecodeTraceStats::default()));
+    let mut stats = stats.lock().expect("decode trace mutex poisoned");
+    let samples = if decode_eligible {
+        &mut stats.fast
+    } else {
+        &mut stats.fallback
+    };
+    samples.push(total);
+    let mut total_samples = samples.clone();
+    total_samples.sort_unstable();
+    let p50 = percentile_duration(&total_samples, 50);
+    let p95 = percentile_duration(&total_samples, 95);
+    eprintln!(
+        "decode_trace_summary samples={} path={path} decode_eligible={decode_eligible} kernels={kernels} total={total:?} p50={p50:?} p95={p95:?}",
+        total_samples.len()
+    );
+}
+
+fn percentile_duration(samples: &[Duration], percentile: usize) -> Duration {
+    if samples.is_empty() {
+        return Duration::ZERO;
+    }
+    let index = ((samples.len() - 1) * percentile).div_ceil(100);
+    samples[index]
+}
 
 /// An error that can occur when running a [`LlamaModel`].
 #[derive(Debug, thiserror::Error)]
@@ -129,11 +165,28 @@ where
             );
         }
 
-        let trace = std::env::var_os("FUSOR_TRACE_RESOLVE").is_some();
+        let trace = std::env::var_os("FUSOR_TRACE_DECODE").is_some()
+            || std::env::var_os("FUSOR_TRACE_RESOLVE").is_some();
+        let fast_decode_enabled = std::env::var_os("KALOSM_LLAMA_FAST_DECODE")
+            .map(|value| value != "0")
+            .unwrap_or(true);
+        let decode_eligible = fast_decode_enabled
+            && tokens.len() == 1
+            && images.is_empty()
+            && cache.as_ref().is_some_and(|cache| !cache.tokens.is_empty());
+        let path = if decode_eligible {
+            "fast_decode_graph"
+        } else {
+            "graph_fallback"
+        };
+        let token_start = trace.then(std::time::Instant::now);
         let build_start = trace.then(std::time::Instant::now);
         let logits = model.forward(tokens, images, device, cache);
         if let Some(start) = build_start {
-            eprintln!("forward_graph_build elapsed={:?}", start.elapsed());
+            eprintln!(
+                "forward_graph_build path={path} decode_eligible={decode_eligible} elapsed={:?}",
+                start.elapsed()
+            );
         }
         let device = device.clone();
         Box::pin(async move {
@@ -142,17 +195,27 @@ where
             // Cast logits back to f32 for sampling
             let logits: fusor::Tensor<1, f32> = logits.cast();
             let len = logits.shape()[0];
+            let mut kernels = 0;
             if let Some(logits_key) = logits.gpu_key() {
                 let resolve_start = trace.then(std::time::Instant::now);
-                device.resolve_batch(&[logits_key]);
+                kernels = device.resolve_batch(&[logits_key]);
                 if let Some(start) = resolve_start {
-                    eprintln!("forward_resolve elapsed={:?}", start.elapsed());
+                    eprintln!(
+                        "forward_resolve path={path} decode_eligible={decode_eligible} kernels={kernels} elapsed={:?}",
+                        start.elapsed()
+                    );
                 }
             }
             let download_start = trace.then(std::time::Instant::now);
             let logits = logits.as_slice().await?;
             if let Some(start) = download_start {
-                eprintln!("forward_download elapsed={:?}", start.elapsed());
+                eprintln!(
+                    "forward_download path={path} decode_eligible={decode_eligible} elapsed={:?}",
+                    start.elapsed()
+                );
+            }
+            if let Some(start) = token_start {
+                record_decode_trace(path, decode_eligible, kernels, start.elapsed());
             }
             let mut logits_vec = Vec::with_capacity(len);
             for i in 0..len {

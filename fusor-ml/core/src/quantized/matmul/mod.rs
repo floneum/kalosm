@@ -205,12 +205,17 @@ impl Operation for QMatMulOperation {
         let mut qgemv_cols_per_workgroup = 1;
         if m == 1 {
             let qgemv_uses_accelerator = format == tile_ir::GgmlQuantFormat::Q4K
+                || format == tile_ir::GgmlQuantFormat::Q6K
                 || (format == tile_ir::GgmlQuantFormat::Q5_0
                     && k.checked_mul(n)
                         .is_some_and(|elements| elements >= 4 * 1024 * 1024))
                 || (format == tile_ir::GgmlQuantFormat::Q8_0 && k <= 1024 && n >= 8192);
             qgemv_cols_per_workgroup = if qgemv_uses_accelerator {
-                format.qgemv_cols_per_workgroup()
+                if format == tile_ir::GgmlQuantFormat::Q8_0 && k <= 1024 && n >= 8192 {
+                    4 * 8
+                } else {
+                    format.qgemv_cols_per_workgroup_for_shape(k, n)
+                }
             } else if format == tile_ir::GgmlQuantFormat::Q5_0 && k <= 1024 && n <= 4096 {
                 8
             } else {

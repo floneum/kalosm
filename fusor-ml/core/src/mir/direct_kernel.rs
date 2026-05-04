@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use wgpu::{CommandEncoder, ComputePass, PipelineCompilationOptions};
 
-use crate::Device;
+use crate::{Device, DirectDynamicBindGroupKey, DirectStorage3BindGroupKey};
 
 #[derive(Clone, Debug)]
 pub(crate) enum DirectKernelBinding {
@@ -104,27 +104,34 @@ impl DirectKernel {
         } = &self.bindings
         {
             let bind_group_layout = device.direct_storage3_bind_group_layout();
-            let bind_entries = [
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: input.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: weight.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 2,
-                    resource: output.as_entire_binding(),
-                },
-            ];
+            let bind_group_key = DirectStorage3BindGroupKey::new(input, weight, output);
             let bind_group = device
-                .wgpu_device()
-                .create_bind_group(&wgpu::BindGroupDescriptor {
-                    label: Some(&self.name),
-                    layout: &bind_group_layout,
-                    entries: &bind_entries,
-                });
+                .direct_storage3_bind_group_cache()
+                .write()
+                .get_or_insert(bind_group_key, || {
+                    let bind_entries = [
+                        wgpu::BindGroupEntry {
+                            binding: 0,
+                            resource: input.as_entire_binding(),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 1,
+                            resource: weight.as_entire_binding(),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 2,
+                            resource: output.as_entire_binding(),
+                        },
+                    ];
+                    device
+                        .wgpu_device()
+                        .create_bind_group(&wgpu::BindGroupDescriptor {
+                            label: Some(&self.name),
+                            layout: &bind_group_layout,
+                            entries: &bind_entries,
+                        })
+                })
+                .clone();
             let pipeline_layout = device.direct_storage3_pipeline_layout();
             let pipeline = self.pipeline_with_layout(device, pipeline_layout);
             return Some(PreparedDirectDispatch {
@@ -171,24 +178,38 @@ impl DirectKernel {
             })
             .clone();
 
-        let bind_entries = bindings
-            .iter()
-            .map(|binding| match binding {
-                DirectKernelBinding::Storage {
-                    binding, buffer, ..
-                } => wgpu::BindGroupEntry {
-                    binding: *binding,
-                    resource: buffer.as_entire_binding(),
-                },
-            })
-            .collect::<Vec<_>>();
+        let bind_group_key = DirectDynamicBindGroupKey::new(bindings.iter().map(|binding| {
+            let DirectKernelBinding::Storage {
+                binding,
+                buffer,
+                read_only,
+            } = binding;
+            (*binding, *read_only, buffer.clone())
+        }));
         let bind_group = device
-            .wgpu_device()
-            .create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some(&self.name),
-                layout: &bind_group_layout,
-                entries: &bind_entries,
-            });
+            .direct_dynamic_bind_group_cache()
+            .write()
+            .get_or_insert(bind_group_key, || {
+                let bind_entries = bindings
+                    .iter()
+                    .map(|binding| match binding {
+                        DirectKernelBinding::Storage {
+                            binding, buffer, ..
+                        } => wgpu::BindGroupEntry {
+                            binding: *binding,
+                            resource: buffer.as_entire_binding(),
+                        },
+                    })
+                    .collect::<Vec<_>>();
+                device
+                    .wgpu_device()
+                    .create_bind_group(&wgpu::BindGroupDescriptor {
+                        label: Some(&self.name),
+                        layout: &bind_group_layout,
+                        entries: &bind_entries,
+                    })
+            })
+            .clone();
 
         let pipeline_layout = device
             .pipeline_layout_cache()

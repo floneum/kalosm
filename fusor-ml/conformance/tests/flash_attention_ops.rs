@@ -260,6 +260,14 @@ async fn flash_attention_with_kv_cache_matches_cpu_reference_on_varied_shapes() 
             head_dim: 8,
         },
         FlashCase {
+            batch: 1,
+            num_heads: 32,
+            num_kv_heads: 8,
+            q_seq_len: 1,
+            kv_seq_len: 10,
+            head_dim: 128,
+        },
+        FlashCase {
             batch: 2,
             num_heads: 8,
             num_kv_heads: 8,
