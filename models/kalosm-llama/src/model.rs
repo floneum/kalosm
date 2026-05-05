@@ -23,7 +23,9 @@ use fusor_gguf::GgufValue;
 use kalosm_language_model::ImageFetchError;
 use kalosm_language_model::MediaHints;
 use kalosm_model_types::ModelLoadingProgress;
-use llm_samplers::types::Logits;
+use llm_samplers::types::{Logit, Logits};
+use std::cmp::Ordering;
+use std::collections::BinaryHeap;
 use std::collections::HashMap;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex, OnceLock};
@@ -66,6 +68,88 @@ fn percentile_duration(samples: &[Duration], percentile: usize) -> Duration {
     }
     let index = ((samples.len() - 1) * percentile).div_ceil(100);
     samples[index]
+}
+
+fn logits_from_sorted_top_k(logits: Vec<Logit>) -> Logits {
+    let mut result = Logits::default();
+    result.extend(logits);
+    result.set_sorted(true);
+    result
+}
+
+fn use_full_logits_for_sampling(_vocab_len: usize) -> bool {
+    let gpu_top_k_enabled = std::env::var_os("KALOSM_LLAMA_GPU_TOP_K")
+        .map(|value| value != "0")
+        .unwrap_or(true);
+    !gpu_top_k_enabled
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct WorstFirstLogit {
+    token_id: u32,
+    logit: f32,
+}
+
+impl Eq for WorstFirstLogit {}
+
+impl Ord for WorstFirstLogit {
+    fn cmp(&self, other: &Self) -> Ordering {
+        match self.logit.total_cmp(&other.logit) {
+            Ordering::Less => Ordering::Greater,
+            Ordering::Greater => Ordering::Less,
+            Ordering::Equal => other.token_id.cmp(&self.token_id),
+        }
+    }
+}
+
+impl PartialOrd for WorstFirstLogit {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+fn top_k_logits_from_full(logits: &[f32], k: usize) -> Vec<Logit> {
+    if k == 0 {
+        return Vec::new();
+    }
+
+    let mut heap = BinaryHeap::with_capacity(k);
+    for (token_id, logit) in logits.iter().copied().enumerate() {
+        if !logit.is_finite() {
+            continue;
+        }
+        let candidate = WorstFirstLogit {
+            token_id: token_id as u32,
+            logit,
+        };
+        if heap.len() < k {
+            heap.push(candidate);
+            continue;
+        }
+        let Some(worst) = heap.peek().copied() else {
+            continue;
+        };
+        if logit > worst.logit || (logit == worst.logit && candidate.token_id > worst.token_id) {
+            heap.pop();
+            heap.push(candidate);
+        }
+    }
+
+    let mut logits = heap
+        .into_iter()
+        .map(|candidate| Logit {
+            token_id: candidate.token_id,
+            logit: candidate.logit,
+            prob: 0.0,
+        })
+        .collect::<Vec<_>>();
+    logits.sort_unstable_by(|left, right| {
+        right
+            .logit
+            .total_cmp(&left.logit)
+            .then_with(|| right.token_id.cmp(&left.token_id))
+    });
+    logits
 }
 
 /// An error that can occur when running a [`LlamaModel`].
@@ -224,6 +308,110 @@ where
             }
 
             Ok(logits_vec)
+        })
+    }
+
+    pub(crate) fn forward_top_k(
+        model: &Model<F>,
+        device: &Device,
+        tokens: &[u32],
+        images: &[(image::DynamicImage, MediaHints)],
+        cache: Option<&mut LlamaCache>,
+        #[allow(unused)] tokenizer: &Tokenizer,
+        top_k: usize,
+    ) -> impl kalosm_model_types::FutureWasmNotSend<Output = Result<Vec<Logit>, LlamaModelError>>
+    {
+        if tokens.is_empty() {
+            return Box::pin(async { Err(LlamaModelError::EmptyInput) })
+                as Pin<
+                    Box<
+                        dyn kalosm_model_types::FutureWasmNotSend<
+                            Output = Result<Vec<Logit>, LlamaModelError>,
+                        >,
+                    >,
+                >;
+        }
+
+        #[cfg(debug_assertions)]
+        {
+            tracing::trace!(
+                "Running model with tokens: {:?}",
+                tokenizer.decode(tokens, false)
+            );
+        }
+
+        let trace = std::env::var_os("FUSOR_TRACE_DECODE").is_some()
+            || std::env::var_os("FUSOR_TRACE_RESOLVE").is_some();
+        let fast_decode_enabled = std::env::var_os("KALOSM_LLAMA_FAST_DECODE")
+            .map(|value| value != "0")
+            .unwrap_or(true);
+        let decode_eligible = fast_decode_enabled
+            && tokens.len() == 1
+            && images.is_empty()
+            && cache.as_ref().is_some_and(|cache| !cache.tokens.is_empty());
+        let path = if decode_eligible {
+            "fast_decode_graph_top_k"
+        } else {
+            "graph_fallback_top_k"
+        };
+        let token_start = trace.then(std::time::Instant::now);
+        let build_start = trace.then(std::time::Instant::now);
+        let logits = model.forward(tokens, images, device, cache);
+        if let Some(start) = build_start {
+            eprintln!(
+                "forward_graph_build path={path} decode_eligible={decode_eligible} elapsed={:?}",
+                start.elapsed()
+            );
+        }
+        let device = device.clone();
+        Box::pin(async move {
+            let logits = logits?;
+            let logits = logits.squeeze(0);
+            let logits: fusor::Tensor<1, f32> = logits.cast();
+            let len = logits.shape()[0];
+            let mut kernels = 0;
+            if let Some(logits_key) = logits.gpu_key() {
+                let resolve_start = trace.then(std::time::Instant::now);
+                kernels = device.resolve_batch(&[logits_key]);
+                if let Some(start) = resolve_start {
+                    eprintln!(
+                        "forward_resolve path={path} decode_eligible={decode_eligible} kernels={kernels} elapsed={:?}",
+                        start.elapsed()
+                    );
+                }
+            }
+
+            let download_start = trace.then(std::time::Instant::now);
+            let top_logits = if use_full_logits_for_sampling(len) {
+                let logits = logits.as_slice().await?;
+                let mut logits_vec = Vec::with_capacity(len);
+                for i in 0..len {
+                    logits_vec.push(logits[[i]]);
+                }
+                top_k_logits_from_full(&logits_vec, top_k)
+            } else {
+                logits
+                    .top_k_pairs(top_k)
+                    .await?
+                    .into_iter()
+                    .map(|(token_id, logit)| Logit {
+                        token_id,
+                        logit,
+                        prob: 0.0,
+                    })
+                    .collect()
+            };
+            if let Some(start) = download_start {
+                eprintln!(
+                    "forward_top_k_download path={path} decode_eligible={decode_eligible} k={top_k} elapsed={:?}",
+                    start.elapsed()
+                );
+            }
+            if let Some(start) = token_start {
+                record_decode_trace(path, decode_eligible, kernels, start.elapsed());
+            }
+
+            Ok(top_logits)
         })
     }
 
@@ -479,18 +667,25 @@ where
                 .cache
                 .write()
                 .map_err(|err| LlamaModelError::Session(err.to_string()))?;
-            Self::forward(
+            Self::forward_top_k(
                 &self.model,
                 &self.device,
                 tokens,
                 &images,
                 Some(&mut session_lock),
                 &self.tokenizer,
+                512,
             )
         }
         .await?;
-        let mut logits = Logits::try_from_iter_top_k(logit_probs, 512)
-            .expect("model output should be valid logits");
+        {
+            let mut session_lock = session
+                .cache
+                .write()
+                .map_err(|err| LlamaModelError::Session(err.to_string()))?;
+            session_lock.reserve_decode(&self.device, max_tokens as usize);
+        }
+        let mut logits = logits_from_sorted_top_k(logit_probs);
         // This stores a buffer of text that has been generated to check against the stop_on string. It should never be longer than the stop_on string.
         let mut queued_text_matching_stop_on = String::new();
         let stop_on_lowercase = stop_on.as_ref().map(|s| s.to_lowercase());
@@ -507,13 +702,14 @@ where
                     .cache
                     .write()
                     .map_err(|err| LlamaModelError::Session(err.to_string()))?;
-                Self::forward(
+                Self::forward_top_k(
                     &self.model,
                     &self.device,
                     &[new_token],
                     &[],
                     Some(&mut session_lock),
                     &self.tokenizer,
+                    512,
                 )
             }
             .await?;
@@ -574,8 +770,7 @@ where
                     on_token(new_text)?;
                 }
             }
-            logits = Logits::try_from_iter_top_k(logit_probs, 512)
-                .expect("model output should be valid logits");
+            logits = logits_from_sorted_top_k(logit_probs);
             // Yield control to allow the stream to deliver tokens
             {
                 use std::sync::atomic::{AtomicBool, Ordering};

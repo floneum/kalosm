@@ -1,6 +1,6 @@
 use std::{mem::size_of, num::NonZeroUsize, sync::Arc};
 
-use crate::Device;
+use crate::{Device, Layout};
 use fusor_gguf::{
     BlockQ4_0, BlockQ4K, BlockQ5_0, BlockQ5K, BlockQ6K, BlockQ8_0, GgmlType, GgufBlock,
     GgufMetadata, GgufReadError, GgufTensorMetadata,
@@ -14,6 +14,71 @@ pub(crate) mod embedding;
 pub(crate) mod matmul;
 
 const QMATRIX_DIRECT_PIPELINE_CACHE_SIZE: usize = 16;
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub(crate) struct QMatMulDirectPipelineKey {
+    format: u8,
+    m: u32,
+    k: u32,
+    n: u32,
+    dispatch_size: [u32; 3],
+    input_layout: QMatMulDirectLayoutKey,
+    output_layout: QMatMulDirectLayoutKey,
+}
+
+impl QMatMulDirectPipelineKey {
+    pub(crate) fn new(
+        format: GgmlType,
+        m: u32,
+        k: u32,
+        n: u32,
+        dispatch_size: [u32; 3],
+        input_layout: &Layout,
+        output_layout: &Layout,
+    ) -> Self {
+        Self {
+            format: format as u8,
+            m,
+            k,
+            n,
+            dispatch_size,
+            input_layout: QMatMulDirectLayoutKey::new(input_layout),
+            output_layout: QMatMulDirectLayoutKey::new(output_layout),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+enum QMatMulDirectLayoutKey {
+    Rank2 {
+        offset: usize,
+        shape: [usize; 2],
+        strides: [usize; 2],
+    },
+    General {
+        offset: usize,
+        shape: Box<[usize]>,
+        strides: Box<[usize]>,
+    },
+}
+
+impl QMatMulDirectLayoutKey {
+    fn new(layout: &Layout) -> Self {
+        if layout.shape().len() == 2 && layout.strides().len() == 2 {
+            Self::Rank2 {
+                offset: layout.offset(),
+                shape: [layout.shape()[0], layout.shape()[1]],
+                strides: [layout.strides()[0], layout.strides()[1]],
+            }
+        } else {
+            Self::General {
+                offset: layout.offset(),
+                shape: layout.shape().into(),
+                strides: layout.strides().into(),
+            }
+        }
+    }
+}
 
 fn padded_copy_size(size: u64) -> u64 {
     let align_mask = wgpu::COPY_BUFFER_ALIGNMENT - 1;
@@ -56,7 +121,8 @@ pub struct QMatrix {
     shape: Box<[usize]>,
     buffer: Arc<wgpu::Buffer>,
     datatype: GgmlType,
-    direct_pipeline_cache: Arc<RwLock<LruCache<String, wgpu::ComputePipeline, FxBuildHasher>>>,
+    direct_pipeline_cache:
+        Arc<RwLock<LruCache<QMatMulDirectPipelineKey, wgpu::ComputePipeline, FxBuildHasher>>>,
 }
 
 impl std::fmt::Debug for QMatrix {
@@ -255,7 +321,7 @@ impl QMatrix {
 
     pub(crate) fn direct_pipeline_cache(
         &self,
-    ) -> &RwLock<LruCache<String, wgpu::ComputePipeline, FxBuildHasher>> {
+    ) -> &RwLock<LruCache<QMatMulDirectPipelineKey, wgpu::ComputePipeline, FxBuildHasher>> {
         &self.direct_pipeline_cache
     }
 

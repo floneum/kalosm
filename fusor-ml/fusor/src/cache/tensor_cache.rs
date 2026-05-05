@@ -135,6 +135,38 @@ where
         }
     }
 
+    /// Reserve enough sequence storage to avoid growth during future appends.
+    pub fn reserve(&mut self, device: &Device, target_seq_len: usize) -> Option<crate::NodeIndex> {
+        let target_seq_len = target_seq_len.min(self.max_sequence_len);
+        if target_seq_len <= self.allocated_seq_len {
+            return None;
+        }
+
+        let Some(cached) = &mut self.all_data else {
+            return None;
+        };
+
+        let new_allocated_seq_len = target_seq_len
+            .next_power_of_two()
+            .min(self.max_sequence_len);
+        if new_allocated_seq_len <= self.allocated_seq_len {
+            return None;
+        }
+
+        let cached_shape = cached.shape();
+        let new_data_shape: [usize; R] = std::array::from_fn(|i| {
+            if i == self.concat_dim {
+                new_allocated_seq_len - self.allocated_seq_len
+            } else {
+                cached_shape[i]
+            }
+        });
+        let new_data = Tensor::zeros(device, new_data_shape);
+        *cached = cat([cached.clone(), new_data], self.concat_dim);
+        self.allocated_seq_len = new_allocated_seq_len;
+        cached.gpu_key()
+    }
+
     /// Get the current sequence length
     pub fn current_seq_len(&self) -> usize {
         self.current_seq_len

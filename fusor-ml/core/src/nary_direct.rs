@@ -1,4 +1,13 @@
+use std::{
+    hash::{Hash, Hasher},
+    num::NonZeroUsize,
+    sync::OnceLock,
+};
+
+use lru::LruCache;
+use parking_lot::RwLock;
 use phase_token_prototype as tile_ir;
+use rustc_hash::{FxBuildHasher, FxHasher};
 
 use crate::{
     mir::{
@@ -12,6 +21,85 @@ use crate::{
 };
 
 const BLOCK: usize = 256;
+const NARY_DIRECT_MODULE_CACHE_SIZE: usize = 1024;
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct NaryDirectModuleKey {
+    parts: [u64; 2],
+}
+
+impl NaryDirectModuleKey {
+    fn new(
+        operation: &NaryOperation,
+        workgroup_shape: &WorkgroupShape,
+        tensors: &[TensorData],
+        output_index: usize,
+        dispatch_size: [u32; 3],
+    ) -> Option<Self> {
+        let first = Self::hash_with_salt(
+            0x9e37_79b9_7f4a_7c15,
+            operation,
+            workgroup_shape,
+            tensors,
+            output_index,
+            dispatch_size,
+        )?;
+        let second = Self::hash_with_salt(
+            0xc2b2_ae3d_27d4_eb4f,
+            operation,
+            workgroup_shape,
+            tensors,
+            output_index,
+            dispatch_size,
+        )?;
+        Some(Self {
+            parts: [first, second],
+        })
+    }
+
+    fn short_cache_key(&self) -> String {
+        format!("nary:{:016x}{:016x}", self.parts[0], self.parts[1])
+    }
+
+    fn hash_with_salt(
+        salt: u64,
+        operation: &NaryOperation,
+        workgroup_shape: &WorkgroupShape,
+        tensors: &[TensorData],
+        output_index: usize,
+        dispatch_size: [u32; 3],
+    ) -> Option<u64> {
+        let mut hasher = FxHasher::default();
+        salt.hash(&mut hasher);
+        operation.expression.hash(&mut hasher);
+        operation.output_datatype.hash(&mut hasher);
+        operation.shape.hash(&mut hasher);
+        workgroup_shape.shape().hash(&mut hasher);
+        output_index.hash(&mut hasher);
+        dispatch_size.hash(&mut hasher);
+        for tensor in tensors {
+            tensor.datatype().hash(&mut hasher);
+            tensor.layout().offset().hash(&mut hasher);
+            tensor.layout().shape().hash(&mut hasher);
+            tensor.layout().strides().hash(&mut hasher);
+            layout_allocation_len(tensor.layout())?.hash(&mut hasher);
+        }
+        Some(hasher.finish())
+    }
+}
+
+fn nary_direct_module_cache()
+-> &'static RwLock<LruCache<NaryDirectModuleKey, wgpu::naga::Module, FxBuildHasher>> {
+    static CACHE: OnceLock<
+        RwLock<LruCache<NaryDirectModuleKey, wgpu::naga::Module, FxBuildHasher>>,
+    > = OnceLock::new();
+    CACHE.get_or_init(|| {
+        RwLock::new(LruCache::with_hasher(
+            NonZeroUsize::new(NARY_DIRECT_MODULE_CACHE_SIZE).unwrap(),
+            Default::default(),
+        ))
+    })
+}
 
 pub(crate) fn build_nary_direct_kernel(
     operation: &NaryOperation,
@@ -60,27 +148,48 @@ fn build_nary_direct_kernel_with_output_index(
     }
 
     let dispatch_size = operation.dispatch_size(workgroup_shape, inputs);
-    let cache_key = format!(
-        "{}:tile-program:{:?}:out={output_index}:dispatch={dispatch_size:?}:expr={:?}:{}",
-        operation.name(),
-        workgroup_shape.shape(),
-        operation.expression,
-        tensors
-            .iter()
-            .map(|tensor| format!("{:?}:{:?}", tensor.datatype(), tensor.layout()))
-            .collect::<Vec<_>>()
-            .join("|")
-    );
-    let module = if let Some(module) = graph.device().naga_module_cache().write().get(&cache_key) {
+    let module_key = NaryDirectModuleKey::new(
+        operation,
+        workgroup_shape,
+        &tensors,
+        output_index,
+        dispatch_size,
+    )?;
+    let cache_key = module_key.short_cache_key();
+    let module = if let Some(module) = nary_direct_module_cache().write().get(&module_key) {
         module.clone()
     } else {
-        let ir = build_nary_tile_ir(operation, &tensors, output_index, dispatch_size)?;
-        let module = ir.lower_to_naga().ok()?.module().clone();
-        graph
+        let verbose_cache_key = format!(
+            "{}:tile-program:{:?}:out={output_index}:dispatch={dispatch_size:?}:expr={:?}:{}",
+            operation.name(),
+            workgroup_shape.shape(),
+            operation.expression,
+            tensors
+                .iter()
+                .map(|tensor| format!("{:?}:{:?}", tensor.datatype(), tensor.layout()))
+                .collect::<Vec<_>>()
+                .join("|")
+        );
+        let module = if let Some(module) = graph
             .device()
             .naga_module_cache()
             .write()
-            .get_or_insert(cache_key.clone(), || module.clone())
+            .get(&verbose_cache_key)
+        {
+            module.clone()
+        } else {
+            let ir = build_nary_tile_ir(operation, &tensors, output_index, dispatch_size)?;
+            let module = ir.lower_to_naga().ok()?.module().clone();
+            graph
+                .device()
+                .naga_module_cache()
+                .write()
+                .get_or_insert(verbose_cache_key, || module.clone())
+                .clone()
+        };
+        nary_direct_module_cache()
+            .write()
+            .get_or_insert(module_key, || module.clone())
             .clone()
     };
 

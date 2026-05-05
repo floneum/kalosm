@@ -1,4 +1,5 @@
 use fusor::cache::KvCache;
+use fusor::Device;
 use fusor::SimdElement;
 
 use super::LlamaConfig;
@@ -49,6 +50,23 @@ impl LlamaCache {
     pub fn clear(&mut self) {
         for block in &mut self.blocks {
             block.reset()
+        }
+    }
+
+    pub(crate) fn reserve_decode(&mut self, device: &Device, additional_tokens: usize) {
+        if additional_tokens == 0 || self.tokens.is_empty() {
+            return;
+        }
+        let target_seq_len = self.tokens.len().saturating_add(additional_tokens);
+        let mut keys = Vec::with_capacity(self.blocks.len() * 2);
+        for block in &mut self.blocks {
+            block.reserve(device, target_seq_len, &mut keys);
+        }
+        if !keys.is_empty() {
+            device.resolve_batch(&keys);
+            if let Some(device) = device.as_gpu() {
+                device.poll_wait();
+            }
         }
     }
 }

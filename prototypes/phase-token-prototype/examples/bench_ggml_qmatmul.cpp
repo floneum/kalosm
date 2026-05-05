@@ -43,6 +43,15 @@ bool contains(const char * haystack, const char * needle) {
     return haystack != nullptr && std::strstr(haystack, needle) != nullptr;
 }
 
+int64_t parse_positive_i64(const char * raw, const char * name) {
+    char * end = nullptr;
+    const long long value = std::strtoll(raw, &end, 10);
+    if (end == raw || *end != '\0' || value <= 0) {
+        fail(std::string("expected positive integer for ") + name);
+    }
+    return static_cast<int64_t>(value);
+}
+
 ggml_backend_t init_metal_backend() {
     ggml_backend_load_all_from_path("/opt/homebrew/Cellar/ggml/0.9.11/libexec");
 
@@ -286,6 +295,11 @@ int main(int argc, char ** argv) {
         } else {
             format_arg = 1;
             shape = {"Gemm", GEMM_M, GEMM_N, GEMM_K};
+        }
+        if (argc >= format_arg + 4) {
+            shape.m = parse_positive_i64(argv[format_arg + 1], "m");
+            shape.n = parse_positive_i64(argv[format_arg + 2], "n");
+            shape.k = parse_positive_i64(argv[format_arg + 3], "k");
         }
 
         ggml_time_init();

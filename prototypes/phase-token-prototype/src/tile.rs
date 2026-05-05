@@ -277,6 +277,9 @@ impl Program {
                 return self.qgemv_perf::<4, 4, 8, 128>(a, b, y, workgroups_x);
             }
             GgmlQuantFormat::Q4K => {
+                if b.rows <= 4096 && b.cols >= 16_384 {
+                    return self.qgemv_perf::<8, 8, 8, 256>(a, b, y, workgroups_x);
+                }
                 if b.format
                     .qgemv_subgroups_per_workgroup_for_shape(b.rows, b.cols)
                     == 8
@@ -301,6 +304,12 @@ impl Program {
                 return self.qgemv_perf::<2, 1, 8, 64>(a, b, y, workgroups_x);
             }
             GgmlQuantFormat::Q6K => {
+                if b.rows <= 4096 && b.cols >= 65_536 {
+                    return self.qgemv_perf::<4, 4, 8, 128>(a, b, y, workgroups_x);
+                }
+                if b.rows > 4096 && b.cols <= 4096 {
+                    return self.qgemv_perf::<8, 4, 8, 256>(a, b, y, workgroups_x);
+                }
                 if b.format
                     .qgemv_subgroups_per_workgroup_for_shape(b.rows, b.cols)
                     == 4
@@ -336,12 +345,15 @@ impl Program {
         let [_, k] = matrix_shape(&a.view.layout);
         let cols_per_workgroup = SUBGROUPS * COLS_PER_SUBGROUP as u32;
         let total_workgroups = b.cols.div_ceil(cols_per_workgroup);
+        let workgroups_x = workgroups_x.min(total_workgroups.max(1));
         let dispatch_y = total_workgroups.div_ceil(workgroups_x);
         let k_per_iter = SUBGROUP_SIZE * VALUES_PER_LANE as u32;
         let k_iterations = k.div_ceil(k_per_iter);
         let n_cols = b.cols;
         let k_size = k;
         let b_cloned = b.clone();
+        let q6k_vocab_f32_dot =
+            b.format == GgmlQuantFormat::Q6K && b.rows <= 4096 && b.cols >= 65_536;
         self.program_grid::<BLOCK>([workgroups_x, dispatch_y, 1], |program| {
             let workgroup = program.program_id(WorkgroupAxis::X)
                 + program.program_id(WorkgroupAxis::Y) * workgroups_x;
@@ -394,7 +406,14 @@ impl Program {
                                     a_vec, &b_cloned, &k_base, &col, mask, 0.0,
                                 );
                             }
-                            if b_cloned.format == GgmlQuantFormat::Q6K {
+                            if b_cloned.format == GgmlQuantFormat::Q6K && VALUES_PER_LANE == 8 {
+                                let a_vec: [Tile<BLOCK>; 8] =
+                                    std::array::from_fn(|i| a_pins[i].get());
+                                return program.quantized_q8_0_dot8(
+                                    a_vec, &b_cloned, &k_base, &col, mask, 0.0,
+                                );
+                            }
+                            if b_cloned.format == GgmlQuantFormat::Q6K && !q6k_vocab_f32_dot {
                                 let a_vec: [Tile<BLOCK>; VALUES_PER_LANE] =
                                     std::array::from_fn(|i| a_pins[i].get());
                                 return program.quantized_q8_activation_dot::<VALUES_PER_LANE>(

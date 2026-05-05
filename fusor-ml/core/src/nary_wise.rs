@@ -1,3 +1,5 @@
+use std::hash::{Hash, Hasher};
+
 use crate::{
     TILE_SIZE,
     compute_graph::{ComputeGraphInner, NodeIndex},
@@ -6,11 +8,35 @@ use crate::{
     visit_tiled::{MaybeQData, titled_map_dispatch_size, titled_map_workgroup_size_constraints},
 };
 
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug)]
 pub(crate) enum NaryScalar {
     F32(f32),
     F16(half::f16),
     U32(u32),
+}
+
+impl PartialEq for NaryScalar {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::F32(a), Self::F32(b)) => a.to_bits() == b.to_bits(),
+            (Self::F16(a), Self::F16(b)) => a.to_bits() == b.to_bits(),
+            (Self::U32(a), Self::U32(b)) => a == b,
+            _ => false,
+        }
+    }
+}
+
+impl Eq for NaryScalar {}
+
+impl Hash for NaryScalar {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        std::mem::discriminant(self).hash(state);
+        match self {
+            Self::F32(value) => value.to_bits().hash(state),
+            Self::F16(value) => value.to_bits().hash(state),
+            Self::U32(value) => value.hash(state),
+        }
+    }
 }
 
 impl NaryScalar {
@@ -24,7 +50,7 @@ impl NaryScalar {
 }
 
 #[allow(dead_code)]
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) enum NaryOp {
     Add,
     Sub,
@@ -83,7 +109,7 @@ pub(crate) enum NaryOp {
 
 /// A function that can be applied in the expression tree.
 /// Supports any arity (unary, binary, etc.)
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub(crate) struct NaryFunction {
     pub(crate) name: Option<String>,
     pub(crate) op: NaryOp,
@@ -184,7 +210,7 @@ pub(crate) struct ExtractedUnaryChain {
 }
 
 /// Expression tree node supporting any arity operations
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub(crate) enum NaryExpr {
     /// Operation with N children (supports unary, binary, or more)
     Op {

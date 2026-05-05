@@ -1206,6 +1206,175 @@ impl<D: DataType, const R: usize> Tensor<R, D> {
     }
 }
 
+impl Tensor<1, f32> {
+    pub async fn top_k_pairs(
+        &self,
+        k: usize,
+    ) -> Result<(Vec<u32>, Vec<f32>), wgpu::BufferAsyncError> {
+        if k == 0 {
+            return Ok((Vec::new(), Vec::new()));
+        }
+
+        let (input, _) = self.data.materialize();
+        if input.datatype() != DataTypeEnum::F32 || input.layout().rank() != 1 {
+            return Ok(cpu_top_k_pairs_from_tensor_data(&input, k).await?);
+        }
+
+        let input_len = input.layout().shape()[0];
+        let k = k.min(input_len);
+        if k == 0 {
+            return Ok((Vec::new(), Vec::new()));
+        }
+
+        let chunks = input_len.div_ceil(crate::top_k::TOP_K_CHUNK);
+        let mut candidate_count = k
+            .div_ceil(chunks)
+            .max(crate::top_k::MIN_TOP_K_CANDIDATES_PER_CHUNK)
+            .min(k)
+            .min(crate::top_k::TOP_K_CHUNK);
+
+        loop {
+            let output_per_chunk = if candidate_count >= crate::top_k::TOP_K_CHUNK {
+                crate::top_k::TOP_K_CHUNK
+            } else {
+                candidate_count + 1
+            };
+            let Some((ids, values)) =
+                crate::top_k::chunk_top_k_pair_data(&input, candidate_count, output_per_chunk)
+            else {
+                return Ok(cpu_top_k_pairs_from_tensor_data(&input, k).await?);
+            };
+            if candidate_count >= crate::top_k::TOP_K_CHUNK {
+                let Some((ids, values)) = crate::top_k::merge_sorted_chunk_top_k_pair_data(
+                    &ids,
+                    &values,
+                    chunks,
+                    crate::top_k::TOP_K_CHUNK,
+                    input_len,
+                    k,
+                ) else {
+                    return Ok(cpu_top_k_pairs_from_tensor_data(&input, k).await?);
+                };
+                let ids = Tensor::<1, u32>::as_slice_from_tensor_data(&ids).await?;
+                let values = Tensor::<1, f32>::as_slice_from_tensor_data(&values).await?;
+                return Ok((ids.as_slice().to_vec(), values.as_slice().to_vec()));
+            }
+            let ids = Tensor::<1, u32>::as_slice_from_tensor_data(&ids).await?;
+            let values = Tensor::<1, f32>::as_slice_from_tensor_data(&values).await?;
+            if let Some(top) = top_k_from_chunk_candidates(
+                ids.as_slice(),
+                values.as_slice(),
+                k,
+                input_len,
+                chunks,
+                candidate_count,
+                output_per_chunk,
+            ) {
+                return Ok(top.into_iter().unzip());
+            }
+
+            if candidate_count >= crate::top_k::TOP_K_CHUNK {
+                return Ok(cpu_top_k_pairs_from_tensor_data(&input, k).await?);
+            }
+            candidate_count = (candidate_count * 2).min(crate::top_k::TOP_K_CHUNK);
+        }
+    }
+}
+
+fn top_k_from_chunk_candidates(
+    ids: &[u32],
+    values: &[f32],
+    k: usize,
+    input_len: usize,
+    chunks: usize,
+    candidate_count: usize,
+    output_per_chunk: usize,
+) -> Option<Vec<(u32, f32)>> {
+    let mut candidates = Vec::with_capacity(chunks * candidate_count);
+    let mut bounds = Vec::with_capacity(chunks);
+
+    for chunk in 0..chunks {
+        let base = chunk * output_per_chunk;
+        for rank in 0..candidate_count.min(output_per_chunk) {
+            let index = base + rank;
+            let logit = values[index];
+            if logit.is_finite() && (ids[index] as usize) < input_len {
+                candidates.push((ids[index], logit));
+            }
+        }
+        if candidate_count < crate::top_k::TOP_K_CHUNK {
+            let index = base + candidate_count;
+            let valid = (ids[index] as usize) < input_len;
+            bounds.push(valid.then_some(values[index]));
+        }
+    }
+
+    candidates.sort_unstable_by_key(|(token_id, _)| *token_id);
+    let top = fold_top_k_pairs(candidates, k);
+    let Some((_, threshold)) = top.get(k.saturating_sub(1)).copied() else {
+        if bounds.iter().flatten().any(|bound| bound.is_finite()) {
+            return None;
+        }
+        return Some(top);
+    };
+
+    if candidate_count < crate::top_k::TOP_K_CHUNK
+        && bounds
+            .iter()
+            .flatten()
+            .any(|bound| bound.is_finite() && *bound >= threshold)
+    {
+        return None;
+    }
+
+    Some(top)
+}
+
+fn fold_top_k_pairs(candidates: impl IntoIterator<Item = (u32, f32)>, k: usize) -> Vec<(u32, f32)> {
+    let mut top = Vec::<(u32, f32)>::with_capacity(k);
+    for (token_id, logit) in candidates {
+        if !logit.is_finite() {
+            continue;
+        }
+        if top.len() == k {
+            let Some((last_token_id, last_logit)) = top.last().copied() else {
+                continue;
+            };
+            if logit > last_logit || (logit == last_logit && token_id > last_token_id) {
+                top.truncate(k - 1);
+            } else {
+                continue;
+            }
+        }
+        let insert = top.partition_point(|(existing_id, value)| {
+            *value > logit || (*value == logit && *existing_id > token_id)
+        });
+        top.insert(insert, (token_id, logit));
+    }
+    top
+}
+
+async fn cpu_top_k_pairs_from_tensor_data(
+    input: &TensorData,
+    k: usize,
+) -> Result<(Vec<u32>, Vec<f32>), wgpu::BufferAsyncError> {
+    if k == 0 {
+        return Ok((Vec::new(), Vec::new()));
+    }
+
+    let values = Tensor::<1, f32>::as_slice_from_tensor_data(input).await?;
+    let top = fold_top_k_pairs(
+        values
+            .as_slice()
+            .iter()
+            .copied()
+            .enumerate()
+            .map(|(token_id, logit)| (token_id as u32, logit)),
+        k,
+    );
+    Ok(top.into_iter().unzip())
+}
+
 /// A buffer that has been mapped for reading. Wraps a wgpu BufferView and provides
 /// access to its mapped contents.
 pub struct MappedBuffer {

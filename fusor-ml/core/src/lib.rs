@@ -45,6 +45,7 @@ pub(crate) use rms_norm::RmsNormOperation;
 mod resize;
 mod slice_assign;
 mod tensor;
+mod top_k;
 mod varbuilder;
 mod visit_tiled;
 

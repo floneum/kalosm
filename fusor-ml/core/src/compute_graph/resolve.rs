@@ -81,6 +81,16 @@ struct ResolveHostProfile {
     profile_readback: Duration,
 }
 
+#[derive(Default)]
+struct ResolveHostCategoryProfile {
+    count: usize,
+    inputs: Duration,
+    output: Duration,
+    workgroup: Duration,
+    build_kernel: Duration,
+    prepare_dispatch: Duration,
+}
+
 impl ResolveHostProfile {
     fn print(&self, total: Duration, queued_ops: usize, kernels: usize) {
         eprintln!(
@@ -107,6 +117,42 @@ timestamp_setup={:?} encode={:?} submit={:?} profile_readback={:?}",
             self.submit,
             self.profile_readback,
         );
+    }
+}
+
+fn print_host_category_profile(profile: FxHashMap<&'static str, ResolveHostCategoryProfile>) {
+    let mut profile = profile
+        .into_iter()
+        .map(|(category, profile)| {
+            (
+                category,
+                profile.count,
+                profile.inputs,
+                profile.output,
+                profile.workgroup,
+                profile.build_kernel,
+                profile.prepare_dispatch,
+            )
+        })
+        .collect::<Vec<_>>();
+    profile.sort_by(|a, b| b.5.cmp(&a.5));
+    eprintln!("resolve_host_category_profile {profile:?}");
+}
+
+fn node_category(variant: &ComputeGraphNodeVariant) -> &'static str {
+    match variant {
+        ComputeGraphNodeVariant::Nary(_) => "nary",
+        ComputeGraphNodeVariant::SliceAssign(_) => "slice_assign",
+        ComputeGraphNodeVariant::Resize(_) => "resize",
+        ComputeGraphNodeVariant::MapLayout(_) => "map_layout",
+        ComputeGraphNodeVariant::Dequantize(_) => "dequantize",
+        ComputeGraphNodeVariant::QEmbedding(_) => "q_embedding",
+        ComputeGraphNodeVariant::MatMul(_) => "matmul",
+        ComputeGraphNodeVariant::QMatMul(_) => "q_matmul",
+        ComputeGraphNodeVariant::Tensor(_) => "tensor",
+        ComputeGraphNodeVariant::Reduce(_) => "reduce",
+        ComputeGraphNodeVariant::RmsNorm(_) => "rms_norm",
+        ComputeGraphNodeVariant::FlashAttention(_) => "flash_attention",
     }
 }
 
@@ -240,8 +286,11 @@ impl Resolver {
         _removed: &mut Vec<ComputeGraphNode>,
     ) -> ResolverResult {
         let host_trace = std::env::var_os("FUSOR_TRACE_RESOLVE_HOST").is_some();
+        let host_category_trace = std::env::var_os("FUSOR_TRACE_RESOLVE_HOST_CATEGORIES").is_some();
         let host_total_start = host_trace.then(Instant::now);
         let mut host_profile = ResolveHostProfile::default();
+        let mut host_category_profile =
+            FxHashMap::<&'static str, ResolveHostCategoryProfile>::default();
         let device = graph.device();
         let max_subgroup_size = device.max_subgroup_size();
 
@@ -345,6 +394,15 @@ impl Resolver {
         let mut dispatch_categories = FxHashMap::<String, usize>::default();
         let mut dispatch_names = FxHashMap::<String, usize>::default();
         for (node, operation) in queued_operations {
+            let operation_category = host_category_trace
+                .then(|| {
+                    graph
+                        .nodes
+                        .nodes
+                        .node_weight(node)
+                        .map(|node| node_category(&node.variant))
+                })
+                .flatten();
             // Map layout isn't really a kernel. Resolve it immediately
             let map_layout = if let Some(node_data) = graph.nodes.nodes.node_weight(node) {
                 match &node_data.variant {
@@ -404,7 +462,11 @@ impl Resolver {
                 let start = host_trace.then(Instant::now);
                 let new_inputs = operation.inputs(graph);
                 if let Some(start) = start {
-                    host_profile.inputs += start.elapsed();
+                    let elapsed = start.elapsed();
+                    host_profile.inputs += elapsed;
+                    if let Some(category) = operation_category {
+                        host_category_profile.entry(category).or_default().inputs += elapsed;
+                    }
                 }
                 let start = host_trace.then(Instant::now);
                 let result = operation.output(graph, &new_inputs);
@@ -413,7 +475,11 @@ impl Resolver {
                 };
                 graph.set_cached_result(node, resolved);
                 if let Some(start) = start {
-                    host_profile.output += start.elapsed();
+                    let elapsed = start.elapsed();
+                    host_profile.output += elapsed;
+                    if let Some(category) = operation_category {
+                        host_category_profile.entry(category).or_default().output += elapsed;
+                    }
                 }
 
                 let start = host_trace.then(Instant::now);
@@ -422,7 +488,11 @@ impl Resolver {
                     panic!("Failed to find a valid workgroup shape for constraints {constraints:?}")
                 });
                 if let Some(start) = start {
-                    host_profile.workgroup += start.elapsed();
+                    let elapsed = start.elapsed();
+                    host_profile.workgroup += elapsed;
+                    if let Some(category) = operation_category {
+                        host_category_profile.entry(category).or_default().workgroup += elapsed;
+                    }
                 }
                 let start = host_trace.then(Instant::now);
                 let Some(direct_kernel) =
@@ -434,12 +504,25 @@ impl Resolver {
                     );
                 };
                 if let Some(start) = start {
-                    host_profile.build_kernel += start.elapsed();
+                    let elapsed = start.elapsed();
+                    host_profile.build_kernel += elapsed;
+                    if let Some(category) = operation_category {
+                        let profile = host_category_profile.entry(category).or_default();
+                        profile.count += 1;
+                        profile.build_kernel += elapsed;
+                    }
                 }
                 let start = host_trace.then(Instant::now);
                 if let Some(dispatch) = direct_kernel.prepare_dispatch(&device) {
                     if let Some(start) = start {
-                        host_profile.prepare_dispatch += start.elapsed();
+                        let elapsed = start.elapsed();
+                        host_profile.prepare_dispatch += elapsed;
+                        if let Some(category) = operation_category {
+                            host_category_profile
+                                .entry(category)
+                                .or_default()
+                                .prepare_dispatch += elapsed;
+                        }
                     }
                     let (name, category) = if collect_dispatch_metadata {
                         let name = operation.name();
@@ -460,7 +543,14 @@ impl Resolver {
                         category,
                     }));
                 } else if let Some(start) = start {
-                    host_profile.prepare_dispatch += start.elapsed();
+                    let elapsed = start.elapsed();
+                    host_profile.prepare_dispatch += elapsed;
+                    if let Some(category) = operation_category {
+                        host_category_profile
+                            .entry(category)
+                            .or_default()
+                            .prepare_dispatch += elapsed;
+                    }
                 }
                 let start = host_trace.then(Instant::now);
                 Self::release_dead_intermediates(
@@ -696,6 +786,9 @@ impl Resolver {
             .expect("Target result not cached");
         if let Some(start) = host_total_start {
             host_profile.print(start.elapsed(), queued_operation_count, total_kernels);
+            if host_category_trace {
+                print_host_category_profile(host_category_profile);
+            }
         }
         ResolverResult {
             data,

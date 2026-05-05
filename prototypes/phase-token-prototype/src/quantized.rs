@@ -71,9 +71,8 @@ impl GgmlQuantFormat {
         }
     }
 
-    pub const fn qgemv_subgroups_per_workgroup_for_shape(self, rows: u32, cols: u32) -> u32 {
+    pub const fn qgemv_subgroups_per_workgroup_for_shape(self, rows: u32, _cols: u32) -> u32 {
         match self {
-            Self::Q4K if rows > 4096 || cols >= 8192 => 8,
             Self::Q6K if rows > 4096 => 8,
             _ => self.qgemv_subgroups_per_workgroup(),
         }

@@ -1,4 +1,8 @@
-use std::num::NonZeroU32;
+use std::{
+    hash::{Hash, Hasher},
+    num::{NonZeroU32, NonZeroUsize},
+    sync::OnceLock,
+};
 
 use crate::{
     DataTypeEnum,
@@ -11,6 +15,9 @@ use crate::{
     },
     tensor::TensorData,
 };
+use lru::LruCache;
+use parking_lot::RwLock;
+use rustc_hash::{FxBuildHasher, FxHasher};
 use wgpu::naga::{
     AddressSpace, Arena, ArraySize, Barrier, BinaryOperator, Binding, Block, BuiltIn, EntryPoint,
     Expression, Function, FunctionArgument, GlobalVariable, Handle, Literal, LocalVariable,
@@ -22,6 +29,54 @@ const BLOCK: usize = 256;
 const SIMD_WIDTH: usize = 32;
 const OUTPUTS_PER_WORKGROUP: usize = BLOCK / SIMD_WIDTH;
 const FLOAT_MIN: f32 = -1.0e30;
+const FLASH_ATTENTION_MODULE_CACHE_SIZE: usize = 128;
+
+fn flash_attention_module_cache() -> &'static RwLock<LruCache<[u64; 2], Module, FxBuildHasher>> {
+    static CACHE: OnceLock<RwLock<LruCache<[u64; 2], Module, FxBuildHasher>>> = OnceLock::new();
+    CACHE.get_or_init(|| {
+        RwLock::new(LruCache::with_hasher(
+            NonZeroUsize::new(FLASH_ATTENTION_MODULE_CACHE_SIZE).unwrap(),
+            Default::default(),
+        ))
+    })
+}
+
+fn hash_layout<H: Hasher>(state: &mut H, layout: &crate::Layout) {
+    layout.offset().hash(state);
+    layout.shape().hash(state);
+    layout.strides().hash(state);
+}
+
+fn flash_attention_module_key(
+    dims: FlashAttentionDims,
+    scale_bits: u32,
+    dispatch_size: [u32; 3],
+    q: &TensorData,
+    k: &TensorData,
+    v: &TensorData,
+    mask: Option<&TensorData>,
+    output: &TensorData,
+) -> [u64; 2] {
+    std::array::from_fn(|salt| {
+        let mut hasher = FxHasher::default();
+        (salt as u64).hash(&mut hasher);
+        dims.batch.hash(&mut hasher);
+        dims.num_heads.hash(&mut hasher);
+        dims.num_kv_heads.hash(&mut hasher);
+        dims.q_seq_len.hash(&mut hasher);
+        dims.kv_seq_len.hash(&mut hasher);
+        dims.head_dim.hash(&mut hasher);
+        scale_bits.hash(&mut hasher);
+        dispatch_size.hash(&mut hasher);
+        hash_layout(&mut hasher, q.layout());
+        hash_layout(&mut hasher, k.layout());
+        hash_layout(&mut hasher, v.layout());
+        mask.map(|mask| hash_layout(&mut hasher, mask.layout()))
+            .hash(&mut hasher);
+        hash_layout(&mut hasher, output.layout());
+        hasher.finish()
+    })
+}
 
 #[derive(Clone, Debug)]
 pub(crate) struct FlashAttentionOperation {
@@ -197,18 +252,39 @@ impl Operation for FlashAttentionOperation {
             return None;
         }
 
-        let cache_key = format!(
-            "{}:naga:block={BLOCK}:simd={SIMD_WIDTH}:outputs={OUTPUTS_PER_WORKGROUP}:dispatch={dispatch_size:?}:scale={:?}:q={:?}:k={:?}:v={:?}:mask={:?}:out={:?}",
-            self.name(),
+        let module_key = flash_attention_module_key(
+            dims,
             self.scale.to_bits(),
-            q.layout(),
-            k.layout(),
-            v.layout(),
-            mask.as_ref().map(|mask| mask.layout()),
-            output.layout()
+            dispatch_size,
+            &q,
+            &k,
+            &v,
+            mask.as_ref(),
+            &output,
         );
-        let module =
-            if let Some(module) = graph.device().naga_module_cache().write().get(&cache_key) {
+        let cache_key = format!(
+            "flash_attention:{:016x}{:016x}",
+            module_key[0], module_key[1]
+        );
+        let module = if let Some(module) = flash_attention_module_cache().write().get(&module_key) {
+            module.clone()
+        } else {
+            let verbose_cache_key = format!(
+                "{}:naga:block={BLOCK}:simd={SIMD_WIDTH}:outputs={OUTPUTS_PER_WORKGROUP}:dispatch={dispatch_size:?}:scale={:?}:q={:?}:k={:?}:v={:?}:mask={:?}:out={:?}",
+                self.name(),
+                self.scale.to_bits(),
+                q.layout(),
+                k.layout(),
+                v.layout(),
+                mask.as_ref().map(|mask| mask.layout()),
+                output.layout()
+            );
+            let module = if let Some(module) = graph
+                .device()
+                .naga_module_cache()
+                .write()
+                .get(&verbose_cache_key)
+            {
                 module.clone()
             } else {
                 let module = build_flash_attention_naga_module(
@@ -225,9 +301,14 @@ impl Operation for FlashAttentionOperation {
                     .device()
                     .naga_module_cache()
                     .write()
-                    .get_or_insert(cache_key.clone(), || module.clone())
+                    .get_or_insert(verbose_cache_key, || module.clone())
                     .clone()
             };
+            flash_attention_module_cache()
+                .write()
+                .get_or_insert(module_key, || module.clone())
+                .clone()
+        };
 
         let mut bindings = vec![
             DirectKernelBinding::Storage {
@@ -260,7 +341,7 @@ impl Operation for FlashAttentionOperation {
         });
 
         Some(DirectKernel::new_with_cache_key(
-            self.name(),
+            "flash_attention",
             cache_key,
             module,
             bindings,

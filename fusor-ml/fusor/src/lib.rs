@@ -429,6 +429,54 @@ where
     }
 }
 
+impl<B> Tensor<1, f32, B>
+where
+    B: TensorBacking<1, Elem = f32>,
+{
+    /// Return the top-k token ids and values sorted by descending logit.
+    pub async fn top_k_pairs(&self, k: usize) -> Result<Vec<(u32, f32)>, Error> {
+        match self {
+            Tensor::Cpu(t) => {
+                if k == 0 {
+                    return Ok(Vec::new());
+                }
+                let values = t.as_slice();
+                let mut top = Vec::<(u32, f32)>::with_capacity(k);
+                for (token_id, logit) in values.as_slice().iter().copied().enumerate() {
+                    if !logit.is_finite() {
+                        continue;
+                    }
+                    if top.len() == k {
+                        let Some((last_token_id, last_logit)) = top.last().copied() else {
+                            continue;
+                        };
+                        if logit > last_logit
+                            || (logit == last_logit && token_id as u32 > last_token_id)
+                        {
+                            top.truncate(k - 1);
+                        } else {
+                            continue;
+                        }
+                    }
+                    let token_id = token_id as u32;
+                    let insert = top.partition_point(|(existing_id, value)| {
+                        *value > logit || (*value == logit && *existing_id > token_id)
+                    });
+                    top.insert(insert, (token_id, logit));
+                }
+                Ok(top)
+            }
+            Tensor::Gpu(t) => {
+                let (ids, values) = t
+                    .top_k_pairs(k)
+                    .await
+                    .map_err(|err| Error::Gpu(err.into()))?;
+                Ok(ids.into_iter().zip(values).collect())
+            }
+        }
+    }
+}
+
 pub enum EitherMappedBuffer {
     Cpu(fusor_cpu::CpuMappedBuffer),
     Gpu(fusor_core::MappedBuffer),

@@ -506,6 +506,187 @@ impl<'a> Lowerer<'a> {
         Ok((values, emits))
     }
 
+    pub(super) fn dequantize_q6k_dot8(
+        &self,
+        expressions: &mut Arena<Expression>,
+        matrix: &QuantizedMatrix,
+        k_base: Handle<Expression>,
+        col: Handle<Expression>,
+        a: &[Handle<Expression>; 8],
+    ) -> Result<(Handle<Expression>, Vec<Range<Expression>>), LowerError> {
+        if matrix.format != GgmlQuantFormat::Q6K {
+            return Err(LowerError::UnsupportedOperation(
+                "q6k dot8 only supports Q6K",
+            ));
+        }
+
+        let mut emits = Vec::new();
+        let block = self.div_literal_u32_emitted(expressions, k_base, 256, &mut emits);
+        let q_base = self.and_lit(expressions, &mut emits, k_base, 255);
+        let base = self.quantized_block_base(expressions, matrix, block, col, 53, &mut emits);
+
+        let d_word = self.load_word(expressions, matrix, base, 52, &mut emits)?;
+        let d = self.bitcast_f32(expressions, &mut emits, d_word);
+        let chunk = self.shr_lit(expressions, &mut emits, q_base, 7);
+        let local = self.and_lit(expressions, &mut emits, q_base, 127);
+        let high_byte_index = self.and_lit(expressions, &mut emits, local, 31);
+        let low_group = self.shr_lit(expressions, &mut emits, local, 5);
+
+        let chunk_low_base = self.shl_lit(expressions, &mut emits, chunk, 6);
+        let low_group_parity = self.and_lit(expressions, &mut emits, low_group, 1);
+        let low_group_offset = self.shl_lit(expressions, &mut emits, low_group_parity, 5);
+        let local_low_index = self.bin(
+            expressions,
+            &mut emits,
+            BinaryOperator::Add,
+            high_byte_index,
+            low_group_offset,
+        );
+        let lower_index = self.bin(
+            expressions,
+            &mut emits,
+            BinaryOperator::Add,
+            chunk_low_base,
+            local_low_index,
+        );
+        let low_word_base = self.shr_lit(expressions, &mut emits, lower_index, 2);
+        let low_word1_off = self.add_lit(expressions, &mut emits, low_word_base, 1);
+        let low_word0 =
+            self.load_word_dynamic(expressions, matrix, base, low_word_base, &mut emits)?;
+        let low_word1 =
+            self.load_word_dynamic(expressions, matrix, base, low_word1_off, &mut emits)?;
+        let low_shift = self.shr_lit(expressions, &mut emits, low_group, 1);
+        let low_shift = self.shl_lit(expressions, &mut emits, low_shift, 2);
+
+        let high_chunk_base = self.shl_lit(expressions, &mut emits, chunk, 5);
+        let high_index = self.bin(
+            expressions,
+            &mut emits,
+            BinaryOperator::Add,
+            high_chunk_base,
+            high_byte_index,
+        );
+        let high_word_base = self.shr_lit(expressions, &mut emits, high_index, 2);
+        let high_word0_off = self.add_lit(expressions, &mut emits, high_word_base, 32);
+        let high_word1_off = self.add_lit(expressions, &mut emits, high_word_base, 33);
+        let high_word0 =
+            self.load_word_dynamic(expressions, matrix, base, high_word0_off, &mut emits)?;
+        let high_word1 =
+            self.load_word_dynamic(expressions, matrix, base, high_word1_off, &mut emits)?;
+        let high_shift = self.shl_lit(expressions, &mut emits, low_group, 1);
+
+        let scale_chunk_base = self.shl_lit(expressions, &mut emits, chunk, 3);
+        let high_byte_half = self.shr_lit(expressions, &mut emits, high_byte_index, 4);
+        let low_group_scale = self.shl_lit(expressions, &mut emits, low_group, 1);
+        let local_scale_index = self.bin(
+            expressions,
+            &mut emits,
+            BinaryOperator::Add,
+            high_byte_half,
+            low_group_scale,
+        );
+        let scale_index = self.bin(
+            expressions,
+            &mut emits,
+            BinaryOperator::Add,
+            scale_chunk_base,
+            local_scale_index,
+        );
+        let scale_word_base = self.shr_lit(expressions, &mut emits, scale_index, 2);
+        let scale_word_off = self.add_lit(expressions, &mut emits, scale_word_base, 48);
+        let scale_word =
+            self.load_word_dynamic(expressions, matrix, base, scale_word_off, &mut emits)?;
+        let scale_lane = self.and_lit(expressions, &mut emits, scale_index, 3);
+        let scale_byte = self.byte_at(expressions, &mut emits, scale_word, scale_lane);
+        let scale = self.signed_byte_f32(expressions, &mut emits, scale_byte);
+        let scale = self.mul(expressions, &mut emits, scale, d);
+
+        let mut q_components = Vec::with_capacity(8);
+        for lane in 0..8 {
+            let byte_lane = expressions.append(
+                Expression::Literal(Literal::U32((lane % 4) as u32)),
+                Span::default(),
+            );
+            let low_word = if lane < 4 { low_word0 } else { low_word1 };
+            let low_byte = self.byte_at(expressions, &mut emits, low_word, byte_lane);
+            let low_shifted = self.shr(expressions, &mut emits, low_byte, low_shift);
+            let low4 = self.and_lit(expressions, &mut emits, low_shifted, 0x0f);
+
+            let high_word = if lane < 4 { high_word0 } else { high_word1 };
+            let high_byte = self.byte_at(expressions, &mut emits, high_word, byte_lane);
+            let high_shifted = self.shr(expressions, &mut emits, high_byte, high_shift);
+            let high2 = self.and_lit(expressions, &mut emits, high_shifted, 3);
+            let high2 = self.shl_lit(expressions, &mut emits, high2, 4);
+            let quant = self.bin(
+                expressions,
+                &mut emits,
+                BinaryOperator::InclusiveOr,
+                low4,
+                high2,
+            );
+            let quant_f = self.as_f32(expressions, &mut emits, quant);
+            let center = self.f32(expressions, 32.0);
+            q_components.push(self.sub(expressions, &mut emits, quant_f, center));
+        }
+
+        let a0 = expressions.append(
+            Expression::Compose {
+                ty: self.f32_vec4_ty,
+                components: a[..4].to_vec(),
+            },
+            Span::default(),
+        );
+        emits.push(Self::single_expression_range(expressions, a0));
+        let q0 = expressions.append(
+            Expression::Compose {
+                ty: self.f32_vec4_ty,
+                components: q_components[..4].to_vec(),
+            },
+            Span::default(),
+        );
+        emits.push(Self::single_expression_range(expressions, q0));
+        let a1 = expressions.append(
+            Expression::Compose {
+                ty: self.f32_vec4_ty,
+                components: a[4..].to_vec(),
+            },
+            Span::default(),
+        );
+        emits.push(Self::single_expression_range(expressions, a1));
+        let q1 = expressions.append(
+            Expression::Compose {
+                ty: self.f32_vec4_ty,
+                components: q_components[4..].to_vec(),
+            },
+            Span::default(),
+        );
+        emits.push(Self::single_expression_range(expressions, q1));
+        let dot0 = expressions.append(
+            Expression::Math {
+                fun: MathFunction::Dot,
+                arg: a0,
+                arg1: Some(q0),
+                arg2: None,
+                arg3: None,
+            },
+            Span::default(),
+        );
+        emits.push(Self::single_expression_range(expressions, dot0));
+        let dot1 = expressions.append(
+            Expression::Math {
+                fun: MathFunction::Dot,
+                arg: a1,
+                arg1: Some(q1),
+                arg2: None,
+                arg3: None,
+            },
+            Span::default(),
+        );
+        emits.push(Self::single_expression_range(expressions, dot1));
+        let sum = self.bin(expressions, &mut emits, BinaryOperator::Add, dot0, dot1);
+        Ok((self.mul(expressions, &mut emits, sum, scale), emits))
+    }
+
     pub(super) fn q4k_q8_activation_dot(
         &self,
         expressions: &mut Arena<Expression>,

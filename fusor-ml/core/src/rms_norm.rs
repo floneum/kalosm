@@ -1,4 +1,13 @@
+use std::{
+    hash::{Hash, Hasher},
+    num::NonZeroUsize,
+    sync::OnceLock,
+};
+
+use lru::LruCache;
+use parking_lot::RwLock;
 use phase_token_prototype as tile_ir;
+use rustc_hash::{FxBuildHasher, FxHasher};
 
 use crate::{
     DataTypeEnum,
@@ -16,7 +25,60 @@ use crate::{
     tensor::TensorData,
 };
 
-const BLOCK: usize = 256;
+const BLOCK: usize = 1024;
+const RMS_NORM_MODULE_CACHE_SIZE: usize = 128;
+
+fn rms_norm_module_cache() -> &'static RwLock<LruCache<[u64; 2], wgpu::naga::Module, FxBuildHasher>>
+{
+    static CACHE: OnceLock<RwLock<LruCache<[u64; 2], wgpu::naga::Module, FxBuildHasher>>> =
+        OnceLock::new();
+    CACHE.get_or_init(|| {
+        RwLock::new(LruCache::with_hasher(
+            NonZeroUsize::new(RMS_NORM_MODULE_CACHE_SIZE).unwrap(),
+            Default::default(),
+        ))
+    })
+}
+
+fn hash_layout<H: Hasher>(state: &mut H, layout: &crate::Layout) {
+    layout.offset().hash(state);
+    layout.shape().hash(state);
+    layout.strides().hash(state);
+}
+
+fn rms_norm_module_key(
+    rows: u32,
+    cols: u32,
+    eps_bits: u32,
+    has_bias: bool,
+    has_residual: bool,
+    dispatch_size: [u32; 3],
+    input: &TensorData,
+    residual: Option<&TensorData>,
+    weight: &TensorData,
+    bias: Option<&TensorData>,
+    output: &TensorData,
+) -> [u64; 2] {
+    std::array::from_fn(|salt| {
+        let mut hasher = FxHasher::default();
+        (salt as u64).hash(&mut hasher);
+        rows.hash(&mut hasher);
+        cols.hash(&mut hasher);
+        eps_bits.hash(&mut hasher);
+        has_bias.hash(&mut hasher);
+        has_residual.hash(&mut hasher);
+        dispatch_size.hash(&mut hasher);
+        hash_layout(&mut hasher, input.layout());
+        residual
+            .map(|residual| hash_layout(&mut hasher, residual.layout()))
+            .hash(&mut hasher);
+        hash_layout(&mut hasher, weight.layout());
+        bias.map(|bias| hash_layout(&mut hasher, bias.layout()))
+            .hash(&mut hasher);
+        hash_layout(&mut hasher, output.layout());
+        hasher.finish()
+    })
+}
 
 #[derive(Clone, Debug)]
 pub(crate) struct RmsNormOperation {
@@ -181,18 +243,39 @@ impl Operation for RmsNormOperation {
         let dispatch_size = [rows, 1, 1];
         let has_bias = bias.is_some();
         let has_residual = residual.is_some();
-        let cache_key = format!(
-            "{}:tile-program:rows={rows}:cols={cols}:eps={:?}:bias={has_bias}:residual={has_residual}:dispatch={dispatch_size:?}:{:?}:{:?}:{:?}:{:?}:{:?}",
-            self.name(),
+        let module_key = rms_norm_module_key(
+            rows,
+            cols,
             self.eps.to_bits(),
-            input.layout(),
-            residual.map(|residual| residual.layout()),
-            weight.layout(),
-            bias.map(|bias| bias.layout()),
-            output.layout()
+            has_bias,
+            has_residual,
+            dispatch_size,
+            input,
+            residual,
+            weight,
+            bias,
+            output,
         );
-        let module =
-            if let Some(module) = graph.device().naga_module_cache().write().get(&cache_key) {
+        let cache_key = format!("rms_norm:{:016x}{:016x}", module_key[0], module_key[1]);
+        let module = if let Some(module) = rms_norm_module_cache().write().get(&module_key) {
+            module.clone()
+        } else {
+            let verbose_cache_key = format!(
+                "{}:tile-program:rows={rows}:cols={cols}:eps={:?}:bias={has_bias}:residual={has_residual}:dispatch={dispatch_size:?}:{:?}:{:?}:{:?}:{:?}:{:?}",
+                self.name(),
+                self.eps.to_bits(),
+                input.layout(),
+                residual.map(|residual| residual.layout()),
+                weight.layout(),
+                bias.map(|bias| bias.layout()),
+                output.layout()
+            );
+            let module = if let Some(module) = graph
+                .device()
+                .naga_module_cache()
+                .write()
+                .get(&verbose_cache_key)
+            {
                 module.clone()
             } else {
                 let ir = build_rms_norm_tile_ir(
@@ -208,9 +291,14 @@ impl Operation for RmsNormOperation {
                     .device()
                     .naga_module_cache()
                     .write()
-                    .get_or_insert(cache_key.clone(), || module.clone())
+                    .get_or_insert(verbose_cache_key, || module.clone())
                     .clone()
             };
+            rms_norm_module_cache()
+                .write()
+                .get_or_insert(module_key, || module.clone())
+                .clone()
+        };
 
         let mut bindings = vec![DirectKernelBinding::Storage {
             binding: 0,
@@ -247,7 +335,7 @@ impl Operation for RmsNormOperation {
         });
 
         Some(DirectKernel::new_with_cache_key(
-            self.name(),
+            "rms_norm",
             cache_key,
             module,
             bindings,

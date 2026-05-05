@@ -16,7 +16,7 @@ use crate::{
 use fusor_gguf::GgmlType;
 use phase_token_prototype as tile_ir;
 
-use super::QMatrix;
+use super::{QMatMulDirectPipelineKey, QMatrix};
 
 #[derive(Debug, Clone)]
 pub(crate) struct QMatMulOperation {
@@ -98,6 +98,27 @@ fn tile_cooperative_store_layout_supported(layout: &tile_ir::Layout) -> bool {
     layout.shape().rank() == 2
         && layout.strides().rank() == 2
         && (layout.strides().values()[0] == 1 || layout.strides().values()[1] == 1)
+}
+
+fn qgemv_cols_per_workgroup_for_direct(format: tile_ir::GgmlQuantFormat, k: u32, n: u32) -> u32 {
+    let qgemv_uses_accelerator = format == tile_ir::GgmlQuantFormat::Q4K
+        || format == tile_ir::GgmlQuantFormat::Q6K
+        || (format == tile_ir::GgmlQuantFormat::Q5_0
+            && k.checked_mul(n)
+                .is_some_and(|elements| elements >= 4 * 1024 * 1024))
+        || (format == tile_ir::GgmlQuantFormat::Q8_0 && k <= 1024 && n >= 8192);
+
+    if qgemv_uses_accelerator {
+        if format == tile_ir::GgmlQuantFormat::Q8_0 && k <= 1024 && n >= 8192 {
+            4 * 8
+        } else {
+            format.qgemv_cols_per_workgroup_for_shape(k, n)
+        }
+    } else if format == tile_ir::GgmlQuantFormat::Q5_0 && k <= 1024 && n <= 4096 {
+        8
+    } else {
+        4
+    }
 }
 
 impl<const R: usize> Tensor<R, f32> {
@@ -202,25 +223,8 @@ impl Operation for QMatMulOperation {
         let limits = graph.device().limits();
         let max_workgroups = limits.max_compute_workgroups_per_dimension;
         let mut qmatmul_workgroups_x = 1;
-        let mut qgemv_cols_per_workgroup = 1;
         if m == 1 {
-            let qgemv_uses_accelerator = format == tile_ir::GgmlQuantFormat::Q4K
-                || format == tile_ir::GgmlQuantFormat::Q6K
-                || (format == tile_ir::GgmlQuantFormat::Q5_0
-                    && k.checked_mul(n)
-                        .is_some_and(|elements| elements >= 4 * 1024 * 1024))
-                || (format == tile_ir::GgmlQuantFormat::Q8_0 && k <= 1024 && n >= 8192);
-            qgemv_cols_per_workgroup = if qgemv_uses_accelerator {
-                if format == tile_ir::GgmlQuantFormat::Q8_0 && k <= 1024 && n >= 8192 {
-                    4 * 8
-                } else {
-                    format.qgemv_cols_per_workgroup_for_shape(k, n)
-                }
-            } else if format == tile_ir::GgmlQuantFormat::Q5_0 && k <= 1024 && n <= 4096 {
-                8
-            } else {
-                4
-            };
+            let qgemv_cols_per_workgroup = qgemv_cols_per_workgroup_for_direct(format, k, n);
             let qgemv_workgroups = n.div_ceil(qgemv_cols_per_workgroup);
             let [dispatch_x, _] = split_workgroups_2d(qgemv_workgroups, max_workgroups)?;
             qmatmul_workgroups_x = dispatch_x;
@@ -250,6 +254,7 @@ impl Operation for QMatMulOperation {
             && !use_128x128_tile
             && !use_128x64_tile;
         let fast_dispatch_size = if m == 1 {
+            let qgemv_cols_per_workgroup = qgemv_cols_per_workgroup_for_direct(format, k, n);
             let qgemv_workgroups = n.div_ceil(qgemv_cols_per_workgroup);
             Some([
                 qmatmul_workgroups_x,
@@ -273,21 +278,24 @@ impl Operation for QMatMulOperation {
             if dispatch_size.iter().any(|dim| *dim > max_workgroups) {
                 return None;
             }
-            let kernel_name = self.name();
-            let cache_key = format!(
-                "{kernel_name}:direct:{format:?}:m={m}:k={k}:n={n}:dispatch={dispatch_size:?}:{:?}:{:?}",
+            let pipeline_key = QMatMulDirectPipelineKey::new(
+                matrix.datatype(),
+                m,
+                k,
+                n,
+                dispatch_size,
                 input.layout(),
-                output.layout()
+                output.layout(),
             );
             if let Some(pipeline) = matrix
                 .direct_pipeline_cache()
                 .write()
-                .get(&cache_key)
+                .get(&pipeline_key)
                 .cloned()
             {
                 return Some(DirectKernel::new_storage3_with_prepared_pipeline(
-                    kernel_name,
-                    cache_key,
+                    "q_mat_mul",
+                    "",
                     pipeline,
                     input.buffer().clone(),
                     matrix.buffer().clone(),
@@ -295,13 +303,19 @@ impl Operation for QMatMulOperation {
                     dispatch_size,
                 ));
             }
+            let kernel_name = self.name();
+            let cache_key = format!(
+                "{kernel_name}:direct:{format:?}:m={m}:k={k}:n={n}:dispatch={dispatch_size:?}:{:?}:{:?}",
+                input.layout(),
+                output.layout()
+            );
             if let Some(module) = graph.device().naga_module_cache().write().get(&cache_key) {
                 let pipeline =
                     Self::prepare_direct_pipeline(&graph.device(), &kernel_name, module.clone());
                 matrix
                     .direct_pipeline_cache()
                     .write()
-                    .get_or_insert(cache_key.clone(), || pipeline.clone());
+                    .get_or_insert(pipeline_key, || pipeline.clone());
                 return Some(DirectKernel::new_storage3_with_prepared_pipeline(
                     kernel_name,
                     cache_key,
@@ -337,21 +351,24 @@ impl Operation for QMatMulOperation {
         if dispatch_size.iter().any(|dim| *dim > max_workgroups) {
             return None;
         }
-        let kernel_name = self.name();
-        let cache_key = format!(
-            "{kernel_name}:direct:{format:?}:m={m}:k={k}:n={n}:dispatch={dispatch_size:?}:{:?}:{:?}",
+        let pipeline_key = QMatMulDirectPipelineKey::new(
+            matrix.datatype(),
+            m,
+            k,
+            n,
+            dispatch_size,
             input.layout(),
-            output.layout()
+            output.layout(),
         );
         if let Some(pipeline) = matrix
             .direct_pipeline_cache()
             .write()
-            .get(&cache_key)
+            .get(&pipeline_key)
             .cloned()
         {
             return Some(DirectKernel::new_storage3_with_prepared_pipeline(
-                kernel_name,
-                cache_key,
+                "q_mat_mul",
+                "",
                 pipeline,
                 input.buffer().clone(),
                 matrix.buffer().clone(),
@@ -359,6 +376,12 @@ impl Operation for QMatMulOperation {
                 dispatch_size,
             ));
         }
+        let kernel_name = self.name();
+        let cache_key = format!(
+            "{kernel_name}:direct:{format:?}:m={m}:k={k}:n={n}:dispatch={dispatch_size:?}:{:?}:{:?}",
+            input.layout(),
+            output.layout()
+        );
         let module =
             if let Some(module) = graph.device().naga_module_cache().write().get(&cache_key) {
                 module.clone()
@@ -374,7 +397,7 @@ impl Operation for QMatMulOperation {
         let pipeline = matrix
             .direct_pipeline_cache()
             .write()
-            .get_or_insert(cache_key.clone(), || {
+            .get_or_insert(pipeline_key, || {
                 Self::prepare_direct_pipeline(&graph.device(), &kernel_name, module)
             })
             .clone();

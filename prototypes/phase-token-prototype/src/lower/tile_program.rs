@@ -409,7 +409,7 @@ impl<'a> Lowerer<'a> {
                 col,
                 mask,
                 *fill,
-                GgmlQuantFormat::Q8_0,
+                src.format,
                 spill_depth,
             ),
             TileExpr::QuantizedQ8ActivationDot {
@@ -489,9 +489,12 @@ impl<'a> Lowerer<'a> {
             GgmlQuantFormat::Q8_0 => {
                 self.dequantize_q8_0_dot8(expressions, src, k_base_handle, col_handle, &a_handles)?
             }
+            GgmlQuantFormat::Q6K => {
+                self.dequantize_q6k_dot8(expressions, src, k_base_handle, col_handle, &a_handles)?
+            }
             _ => {
                 return Err(LowerError::UnsupportedOperation(
-                    "unsupported quantized dot8 format",
+                    "unsupported quantized f32 dot8 format",
                 ));
             }
         };
