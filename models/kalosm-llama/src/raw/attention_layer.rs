@@ -163,16 +163,21 @@ impl<F: FloatDataType + SimdElement> LlamaFeedForward<F> {
         // All computation happens in f32 for compatibility with SIMD ops
         let x_f32 = x.cast::<f32>();
 
-        let (w1, w3) =
+        let [_b_sz, seq_len, _hidden] = x.shape();
+        let up_result =
             if let (Some(gate_up), None, None) = (&self.gate_up, &self.gate_bias, &self.up_bias) {
-                let gate_up_states = x_f32.q_mat_mul(gate_up);
-                let w1 = gate_up_states
-                    .narrow(D::Minus1, 0, self.gate_len)
-                    .to_concrete();
-                let w3 = gate_up_states
-                    .narrow(D::Minus1, self.gate_len, self.up_len)
-                    .to_concrete();
-                (w1, w3)
+                if self.gate_len != self.up_len || seq_len != 1 {
+                    let gate_up_states = x_f32.q_mat_mul(gate_up);
+                    let w1 = gate_up_states
+                        .narrow(D::Minus1, 0, self.gate_len)
+                        .to_concrete();
+                    let w3 = gate_up_states
+                        .narrow(D::Minus1, self.gate_len, self.up_len)
+                        .to_concrete();
+                    (w1.silu() * w3).to_concrete()
+                } else {
+                    x_f32.q_mat_mul_swiglu(gate_up, self.gate_len)
+                }
             } else {
                 let gate = self
                     .gate
@@ -194,10 +199,8 @@ impl<F: FloatDataType + SimdElement> LlamaFeedForward<F> {
                     w3 = w3.add_(&bias_f32);
                 }
 
-                (w1, w3)
+                (w1.silu() * w3).to_concrete()
             };
-
-        let up_result = w1.silu() * w3;
         let mut up = up_result.q_mat_mul(&self.down);
         if let Some(ref bias) = self.down_bias {
             let bias_f32: Tensor<1, f32> = bias.cast();

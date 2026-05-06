@@ -149,6 +149,7 @@ fn node_category(variant: &ComputeGraphNodeVariant) -> &'static str {
         ComputeGraphNodeVariant::QEmbedding(_) => "q_embedding",
         ComputeGraphNodeVariant::MatMul(_) => "matmul",
         ComputeGraphNodeVariant::QMatMul(_) => "q_matmul",
+        ComputeGraphNodeVariant::QMatMulSwiGlu(_) => "q_mat_swiglu",
         ComputeGraphNodeVariant::Tensor(_) => "tensor",
         ComputeGraphNodeVariant::Reduce(_) => "reduce",
         ComputeGraphNodeVariant::RmsNorm(_) => "rms_norm",
@@ -982,6 +983,15 @@ impl Resolver {
                 op.input,
                 op.matrix.clone(),
             ))),
+            ComputeGraphNodeVariant::QMatMulSwiGlu(op) => Some(Arc::new(
+                crate::quantized::matmul::QMatMulSwiGluOperation::new(
+                    op.input_datatype,
+                    &op.in_shape,
+                    op.input,
+                    op.matrix.clone(),
+                    op.pair_len,
+                ),
+            )),
             ComputeGraphNodeVariant::Dequantize(op) => Some(Arc::new(op.clone())),
             ComputeGraphNodeVariant::Tensor(_) => None, // Handled in execution loop
         }

@@ -166,6 +166,53 @@ async fn assert_q_mat_mul_matches_host_reference(fixture: &QuantizedFixture, fuz
     .unwrap();
 }
 
+#[tokio::test]
+async fn q4k_q_mat_mul_swiglu_matches_cpu_reference() {
+    let ty = GgmlType::Q4K;
+    let weight_shape = [4, 512];
+    let raw_bytes = q4k_raw_bytes(weight_shape);
+    let weights = QuantizedTensor::<BlockQ4K>::from_raw_bytes(weight_shape, &raw_bytes);
+    let expected_weights = concrete_to_rows(&weights.dequantize::<2>(), weight_shape);
+
+    fusor_conformance::assert(move |input: Tensor<2, f32>| {
+        let raw_bytes = raw_bytes.clone();
+        async move {
+            let weights = qmatrix_from_raw_bytes(&input.device(), weight_shape, &raw_bytes, ty);
+            input.q_mat_mul_swiglu(&weights, 2)
+        }
+    })
+    .arg(q_mat_mul_input_fuzz(
+        1,
+        [2, weight_shape[1]],
+        0x5A17_5516_6C75,
+        Uniform::new(-0.25, 0.25).unwrap(),
+    ))
+    .equal_to(move |input: Tensor<2, f32>| {
+        let expected_weights = expected_weights.clone();
+        async move {
+            let device = input.device();
+            let input_values = input.as_slice().await.unwrap().to_vec2();
+            let projected = matmul2(&input_values, &transpose2(&expected_weights));
+            let expected = projected
+                .iter()
+                .map(|row| {
+                    let gate0 = row[0];
+                    let gate1 = row[1];
+                    vec![
+                        gate0 / (1.0 + (-gate0).exp()) * row[2],
+                        gate1 / (1.0 + (-gate1).exp()) * row[3],
+                    ]
+                })
+                .collect::<Vec<_>>();
+            Tensor::new(&device, &expected)
+        }
+    })
+    .compare_with(approx_compare::<2, f32>(2.0))
+    .runs(3)
+    .await
+    .unwrap();
+}
+
 fn q4_0_raw_bytes(shape: [usize; 2]) -> Vec<u8> {
     let mut bytes = raw_bytes_buffer::<BlockQ4_0>(shape);
     for block in 0..block_count(shape, BlockQ4_0::BLOCK_SIZE) {

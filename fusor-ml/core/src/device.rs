@@ -11,7 +11,7 @@ use std::{
 };
 
 use lru::LruCache;
-use parking_lot::RwLock;
+use parking_lot::{Mutex, RwLock};
 use rustc_hash::FxBuildHasher;
 use wgpu::{
     BackendOptions, BindGroupLayout, BufferUsages, COPY_BUFFER_ALIGNMENT, Dx12BackendOptions,
@@ -214,6 +214,7 @@ struct DeviceInner {
     buffer_allocation_cache:
         RwLock<LruCache<(u64, BufferUsages), Vec<CachedBuffer>, FxBuildHasher>>,
     initialized_buffers_dirty: AtomicBool,
+    initialized_buffer_keys: Mutex<Vec<(u64, BufferUsages)>>,
     // Single compute graph shared by all tensors on this device
     compute_graph: OnceLock<ComputeGraph>,
 }
@@ -366,6 +367,7 @@ impl Device {
             const { NonZeroUsize::new(128).unwrap() },
             Default::default(),
         ));
+        let initialized_buffer_keys = Mutex::new(Vec::new());
 
         let inner = Arc::new(DeviceInner {
             device,
@@ -384,6 +386,7 @@ impl Device {
             direct_storage3_pipeline_layout: OnceLock::new(),
             buffer_allocation_cache,
             initialized_buffers_dirty: AtomicBool::new(false),
+            initialized_buffer_keys,
             compute_graph: OnceLock::new(),
         });
 
@@ -606,12 +609,18 @@ impl Device {
         {
             return;
         }
+        let keys = {
+            let mut keys = self.inner.initialized_buffer_keys.lock();
+            std::mem::take(&mut *keys)
+        };
         let mut cache = self.inner.buffer_allocation_cache.write();
-        for (_, buffers) in cache.iter_mut() {
-            for buffer in buffers.iter_mut() {
-                buffer.writen = false;
+        for key in keys {
+            if let Some(buffers) = cache.get_mut(&key) {
+                for buffer in buffers.iter_mut() {
+                    buffer.writen = false;
+                }
+                prune_cached_buffers(buffers);
             }
-            prune_cached_buffers(buffers);
         }
     }
 
@@ -650,6 +659,10 @@ impl Device {
             self.inner
                 .initialized_buffers_dirty
                 .store(true, Ordering::Release);
+            self.inner
+                .initialized_buffer_keys
+                .lock()
+                .push((size, usage));
         }
         // Try to get a buffer from the cache first
         self.get_cached_buffer(size, usage, to_initilize)

@@ -1,8 +1,8 @@
 use crate::{
-    DataType, Tensor,
+    DataType, Layout, Tensor,
     compute_graph::NodeIndex,
     nary_wise::{NaryExpr, NaryOp, NaryScalar},
-    tensor::DataTypeEnum,
+    tensor::{DataTypeEnum, LazyTensorData, TensorInfo},
 };
 
 impl<D: DataType> Tensor<4, D> {
@@ -20,6 +20,32 @@ impl<D: DataType> Tensor<4, D> {
     /// `cos` and `sin` must already be narrowed to the sequence length.
     pub fn rope_normal_fused(&self, cos: &Tensor<2, D>, sin: &Tensor<2, D>) -> Tensor<4, D> {
         self.rope_fused_impl(cos, sin, RopeMode::Normal)
+    }
+
+    /// Apply fused interleaved RoPE to query and key tensors in one kernel.
+    ///
+    /// The returned tensors are layout views into one concatenated allocation. This keeps the
+    /// decode graph to one RoPE kernel per layer while preserving separate q/k tensor shapes.
+    pub fn rope_pair_fused(
+        &self,
+        k: &Tensor<4, D>,
+        cos: &Tensor<2, D>,
+        sin: &Tensor<2, D>,
+    ) -> (Tensor<4, D>, Tensor<4, D>) {
+        self.rope_pair_fused_impl(k, cos, sin, RopeMode::Interleaved)
+    }
+
+    /// Apply fused normal RoPE to query and key tensors in one kernel.
+    ///
+    /// The returned tensors are layout views into one concatenated allocation. This keeps the
+    /// decode graph to one RoPE kernel per layer while preserving separate q/k tensor shapes.
+    pub fn rope_normal_pair_fused(
+        &self,
+        k: &Tensor<4, D>,
+        cos: &Tensor<2, D>,
+        sin: &Tensor<2, D>,
+    ) -> (Tensor<4, D>, Tensor<4, D>) {
+        self.rope_pair_fused_impl(k, cos, sin, RopeMode::Normal)
     }
 
     fn rope_fused_impl(
@@ -43,6 +69,79 @@ impl<D: DataType> Tensor<4, D> {
 
         Tensor::from_parts(self.data().nary(operation))
     }
+
+    fn rope_pair_fused_impl(
+        &self,
+        k: &Tensor<4, D>,
+        cos: &Tensor<2, D>,
+        sin: &Tensor<2, D>,
+        mode: RopeMode,
+    ) -> (Tensor<4, D>, Tensor<4, D>) {
+        let q_shape = *self.shape();
+        let k_shape = *k.shape();
+        assert_eq!(
+            q_shape[0], k_shape[0],
+            "paired RoPE requires q and k batch dimensions to match"
+        );
+        assert_eq!(
+            q_shape[2], k_shape[2],
+            "paired RoPE requires q and k sequence dimensions to match"
+        );
+        assert_eq!(
+            q_shape[3], k_shape[3],
+            "paired RoPE requires q and k head dimensions to match"
+        );
+
+        let q_elements = q_shape.iter().product::<usize>();
+        let k_elements = k_shape.iter().product::<usize>();
+        let total_elements = q_elements
+            .checked_add(k_elements)
+            .expect("paired RoPE output element count overflow");
+        assert!(
+            total_elements <= u32::MAX as usize,
+            "paired RoPE output is too large for nary direct indexing"
+        );
+        assert!(
+            q_elements % k_elements == 0,
+            "paired RoPE expects q element count to be a whole multiple of k element count"
+        );
+
+        let operation = RopePairFusedOperation {
+            q: self.key(),
+            k: k.key(),
+            cos: cos.key(),
+            sin: sin.key(),
+            datatype: self.datatype(),
+            q_shape,
+            k_shape,
+            q_elements,
+            k_elements,
+            total_elements,
+            mode,
+        }
+        .to_nary();
+
+        let device = self.device().clone();
+        let key = device.compute_graph().create_nary(operation);
+        let combined: Tensor<1, D> = Tensor::from_parts(LazyTensorData::from_parts(
+            device,
+            TensorInfo::new(vec![total_elements].into_boxed_slice(), self.datatype()),
+            key,
+        ));
+
+        let q = combined.restride_layout(Layout::from_parts(
+            0,
+            q_shape.into(),
+            row_major_strides(&q_shape).into_boxed_slice(),
+        ));
+        let k = combined.restride_layout(Layout::from_parts(
+            q_elements,
+            k_shape.into(),
+            row_major_strides(&k_shape).into_boxed_slice(),
+        ));
+
+        (q, k)
+    }
 }
 
 /// Determines how element pairs are formed for RoPE
@@ -63,6 +162,21 @@ struct RopeFusedOperation {
     shape: Box<[usize]>,
     mode: RopeMode,
     head_dim: usize,
+}
+
+#[derive(Debug, Clone)]
+struct RopePairFusedOperation {
+    q: NodeIndex,
+    k: NodeIndex,
+    cos: NodeIndex,
+    sin: NodeIndex,
+    datatype: DataTypeEnum,
+    q_shape: [usize; 4],
+    k_shape: [usize; 4],
+    q_elements: usize,
+    k_elements: usize,
+    total_elements: usize,
+    mode: RopeMode,
 }
 
 impl RopeFusedOperation {
@@ -256,6 +370,221 @@ impl RopeFusedOperation {
         let mut components: Vec<NaryExpr> = (0..rank - 1).map(NaryExpr::DimIndex).collect();
         components.push(new_last);
         components
+    }
+}
+
+impl RopePairFusedOperation {
+    fn to_nary(&self) -> crate::nary_wise::NaryOperation {
+        crate::nary_wise::NaryOperation {
+            inputs: vec![self.q, self.k, self.cos, self.sin],
+            expression: self.build_expr(),
+            shape: vec![self.total_elements].into_boxed_slice(),
+            output_datatype: self.datatype,
+        }
+    }
+
+    fn build_expr(&self) -> NaryExpr {
+        let flat = NaryExpr::DimIndex(0);
+        let is_q = NaryExpr::unary_op(
+            flat.clone(),
+            "lt_q_elements",
+            NaryOp::LessConst(NaryScalar::U32(self.q_elements as u32)),
+            DataTypeEnum::U32,
+            DataTypeEnum::U32,
+        );
+
+        let q_flat = rem_const(flat.clone(), self.q_elements, "q_flat");
+        let k_flat = rem_const(flat, self.k_elements, "k_flat");
+        let q = self.build_rope_for_input(0, q_flat, self.q_shape);
+        let k = self.build_rope_for_input(1, k_flat, self.k_shape);
+
+        NaryExpr::select(is_q, q, k, DataTypeEnum::U32, self.datatype)
+    }
+
+    fn build_rope_for_input(
+        &self,
+        input_idx: usize,
+        flat: NaryExpr,
+        shape: [usize; 4],
+    ) -> NaryExpr {
+        let head_dim = shape[3];
+        let indices = row_major_indices_from_flat(flat.clone(), &shape);
+        let input_val = NaryExpr::indexed_input(input_idx, indices.clone());
+        let dim_seq = indices[2].clone();
+        let dim_last = indices[3].clone();
+
+        let cos_sin_indices = self.build_cos_sin_indices(dim_seq, dim_last.clone(), head_dim);
+        let cos_val = NaryExpr::indexed_input(2, cos_sin_indices.clone());
+        let sin_val = NaryExpr::indexed_input(3, cos_sin_indices);
+
+        let neighbor_last = self.build_neighbor_index_component(dim_last.clone(), head_dim);
+        let mut neighbor_indices = indices;
+        neighbor_indices[3] = neighbor_last;
+        let neighbor_val = NaryExpr::indexed_input(input_idx, neighbor_indices);
+
+        let sign_condition = self.build_sign_condition(dim_last, head_dim);
+        let neg_sin = NaryExpr::neg(sin_val.clone(), self.datatype);
+        let sin_with_sign = NaryExpr::select(
+            sign_condition,
+            sin_val,
+            neg_sin,
+            DataTypeEnum::U32,
+            self.datatype,
+        );
+
+        let input_times_cos = NaryExpr::mul(input_val, cos_val, self.datatype);
+        let neighbor_times_sin = NaryExpr::mul(neighbor_val, sin_with_sign, self.datatype);
+        NaryExpr::add(input_times_cos, neighbor_times_sin, self.datatype)
+    }
+
+    fn build_cos_sin_indices(
+        &self,
+        dim_seq: NaryExpr,
+        dim_last: NaryExpr,
+        head_dim: usize,
+    ) -> Vec<NaryExpr> {
+        let cos_sin_dim = match self.mode {
+            RopeMode::Interleaved => NaryExpr::unary_op(
+                dim_last,
+                "div2",
+                NaryOp::DivConst(NaryScalar::U32(2)),
+                DataTypeEnum::U32,
+                DataTypeEnum::U32,
+            ),
+            RopeMode::Normal => {
+                let half = head_dim / 2;
+                rem_const(dim_last, half, "mod_half")
+            }
+        };
+
+        vec![dim_seq, cos_sin_dim]
+    }
+
+    fn build_neighbor_index_component(&self, dim_last: NaryExpr, head_dim: usize) -> NaryExpr {
+        match self.mode {
+            RopeMode::Interleaved => {
+                let parity = rem_const(dim_last.clone(), 2, "mod2");
+                let is_even = NaryExpr::unary_op(
+                    parity,
+                    "eq0",
+                    NaryOp::EqualConst(NaryScalar::U32(0)),
+                    DataTypeEnum::U32,
+                    DataTypeEnum::U32,
+                );
+                let plus_one = NaryExpr::unary_op(
+                    dim_last.clone(),
+                    "add1",
+                    NaryOp::AddConst(NaryScalar::U32(1)),
+                    DataTypeEnum::U32,
+                    DataTypeEnum::U32,
+                );
+                let minus_one = NaryExpr::unary_op(
+                    dim_last,
+                    "sub1",
+                    NaryOp::SubConst(NaryScalar::U32(1)),
+                    DataTypeEnum::U32,
+                    DataTypeEnum::U32,
+                );
+                NaryExpr::select(
+                    is_even,
+                    plus_one,
+                    minus_one,
+                    DataTypeEnum::U32,
+                    DataTypeEnum::U32,
+                )
+            }
+            RopeMode::Normal => {
+                let half = head_dim / 2;
+                let first_half = NaryExpr::unary_op(
+                    dim_last.clone(),
+                    "lt_half",
+                    NaryOp::LessConst(NaryScalar::U32(half as u32)),
+                    DataTypeEnum::U32,
+                    DataTypeEnum::U32,
+                );
+                let plus_half = NaryExpr::unary_op(
+                    dim_last.clone(),
+                    "add_half",
+                    NaryOp::AddConst(NaryScalar::U32(half as u32)),
+                    DataTypeEnum::U32,
+                    DataTypeEnum::U32,
+                );
+                let minus_half = NaryExpr::unary_op(
+                    dim_last,
+                    "sub_half",
+                    NaryOp::SubConst(NaryScalar::U32(half as u32)),
+                    DataTypeEnum::U32,
+                    DataTypeEnum::U32,
+                );
+                NaryExpr::select(
+                    first_half,
+                    plus_half,
+                    minus_half,
+                    DataTypeEnum::U32,
+                    DataTypeEnum::U32,
+                )
+            }
+        }
+    }
+
+    fn build_sign_condition(&self, dim_last: NaryExpr, head_dim: usize) -> NaryExpr {
+        match self.mode {
+            RopeMode::Interleaved => rem_const(dim_last, 2, "mod2"),
+            RopeMode::Normal => {
+                let half = head_dim / 2;
+                NaryExpr::unary_op(
+                    dim_last,
+                    "div_half",
+                    NaryOp::DivConst(NaryScalar::U32(half as u32)),
+                    DataTypeEnum::U32,
+                    DataTypeEnum::U32,
+                )
+            }
+        }
+    }
+}
+
+fn row_major_strides(shape: &[usize; 4]) -> Vec<usize> {
+    let mut stride = 1;
+    let mut strides = vec![0; shape.len()];
+    for (i, dim) in shape.iter().enumerate().rev() {
+        strides[i] = stride;
+        stride *= dim;
+    }
+    strides
+}
+
+fn row_major_indices_from_flat(flat: NaryExpr, shape: &[usize; 4]) -> Vec<NaryExpr> {
+    let mut indices = Vec::with_capacity(shape.len());
+    for axis in 0..shape.len() {
+        let divisor = shape[axis + 1..].iter().product::<usize>();
+        let quotient = if divisor == 1 {
+            flat.clone()
+        } else {
+            NaryExpr::unary_op(
+                flat.clone(),
+                "div_stride",
+                NaryOp::DivConst(NaryScalar::U32(divisor as u32)),
+                DataTypeEnum::U32,
+                DataTypeEnum::U32,
+            )
+        };
+        indices.push(rem_const(quotient, shape[axis], "dim_index"));
+    }
+    indices
+}
+
+fn rem_const(value: NaryExpr, modulus: usize, name: &str) -> NaryExpr {
+    if modulus == 1 {
+        NaryExpr::scalar(NaryScalar::U32(0))
+    } else {
+        NaryExpr::unary_op(
+            value,
+            name,
+            NaryOp::RemConst(NaryScalar::U32(modulus as u32)),
+            DataTypeEnum::U32,
+            DataTypeEnum::U32,
+        )
     }
 }
 

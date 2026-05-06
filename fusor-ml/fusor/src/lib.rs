@@ -1208,6 +1208,41 @@ where
             _ => panic!("Cannot mix CPU and GPU tensors in q_mat_mul"),
         }
     }
+
+    pub fn q_mat_mul_swiglu(&self, weights: &crate::QMatrix, pair_len: usize) -> Tensor<R, f32> {
+        use crate::{D, QMatrix};
+
+        let fallback = || {
+            let projected = self.q_mat_mul(weights);
+            let gate = projected.narrow(D::Minus1, 0, pair_len).to_concrete();
+            let up = projected
+                .narrow(D::Minus1, pair_len, pair_len)
+                .to_concrete();
+            (gate.silu() * up).to_concrete()
+        };
+
+        assert_eq!(
+            weights.shape().len(),
+            2,
+            "q_mat_mul_swiglu requires 2D weight tensor, got {}D",
+            weights.shape().len()
+        );
+
+        if weights.shape()[0] != pair_len * 2 {
+            return fallback();
+        }
+
+        match (self, weights) {
+            (Tensor::Gpu(lhs), QMatrix::Gpu(rhs))
+                if weights.ggml_type() == fusor_gguf::GgmlType::Q4K =>
+            {
+                Tensor::Gpu(lhs.q_mat_mul_swiglu(rhs, pair_len))
+            }
+            (Tensor::Cpu(_), _) => fallback(),
+            (Tensor::Gpu(_), QMatrix::Gpu(_)) => fallback(),
+            _ => panic!("Cannot mix CPU and GPU tensors in q_mat_mul_swiglu"),
+        }
+    }
 }
 
 // Flatten operations

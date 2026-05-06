@@ -27,6 +27,53 @@ pub(crate) struct QMatMulOperation {
     pub(crate) out_shape: Box<[usize]>,
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct QMatMulSwiGluOperation {
+    pub(crate) input_datatype: DataTypeEnum,
+    pub(crate) input: NodeIndex,
+    pub(crate) matrix: QMatrix,
+    pub(crate) in_shape: Box<[usize]>,
+    pub(crate) out_shape: Box<[usize]>,
+    pub(crate) pair_len: usize,
+}
+
+impl QMatMulSwiGluOperation {
+    pub(crate) fn new(
+        input_datatype: DataTypeEnum,
+        input_shape: &[usize],
+        input: NodeIndex,
+        matrix: QMatrix,
+        pair_len: usize,
+    ) -> Self {
+        let last_dim = input_shape.len() - 1;
+        let mut out_shape = input_shape.to_vec();
+        out_shape[last_dim] = pair_len;
+        assert_eq!(input_shape[last_dim], matrix.shape[1]);
+        assert_eq!(matrix.shape[0], pair_len * 2);
+        let out_shape = out_shape.into_boxed_slice();
+        Self {
+            input_datatype,
+            input,
+            matrix,
+            in_shape: input_shape.into(),
+            out_shape,
+            pair_len,
+        }
+    }
+
+    fn m_size(&self) -> u32 {
+        let m_dim_idx = self.in_shape.len() - 2;
+        self.in_shape[m_dim_idx] as u32
+    }
+
+    fn direct_quant_format(&self) -> Option<tile_ir::GgmlQuantFormat> {
+        match self.matrix.datatype {
+            GgmlType::Q4K => Some(tile_ir::GgmlQuantFormat::Q4K),
+            _ => None,
+        }
+    }
+}
+
 impl QMatMulOperation {
     pub(crate) fn new(
         input_datatype: DataTypeEnum,
@@ -144,6 +191,10 @@ fn qgemv_cols_per_workgroup_for_direct(format: tile_ir::GgmlQuantFormat, k: u32,
 impl<const R: usize> Tensor<R, f32> {
     pub fn q_mat_mul(&self, other: &QMatrix) -> Self {
         self.add_q_mat_mul(other)
+    }
+
+    pub fn q_mat_mul_swiglu(&self, other: &QMatrix, pair_len: usize) -> Self {
+        self.add_q_mat_mul_swiglu(other, pair_len)
     }
 }
 
@@ -445,6 +496,192 @@ impl Operation for QMatMulOperation {
     fn name(&self) -> String {
         format!(
             "q_mat_mul_{}_{}_{}_{}",
+            self.input_datatype,
+            self.in_shape
+                .iter()
+                .map(|x| x.to_string())
+                .collect::<Vec<_>>()
+                .join("x"),
+            self.matrix.datatype,
+            self.matrix
+                .shape
+                .iter()
+                .map(|x| x.to_string())
+                .collect::<Vec<_>>()
+                .join("x")
+        )
+    }
+}
+
+impl Operation for QMatMulSwiGluOperation {
+    fn workgroup_shape_constraints(&self, _device: &Device) -> WorkgroupShapeConstraints {
+        let mut constraints = WorkgroupShapeConstraints::new();
+        constraints.add_constraint(0, Constraint::Equals(1));
+        constraints.add_constraint(1, Constraint::Equals(1));
+        constraints.add_constraint(2, Constraint::Equals(1));
+        constraints
+    }
+
+    fn dispatch_size(
+        &self,
+        _workgroup_shape: &crate::mir::workgroup_shape::WorkgroupShape,
+        _: &[MirValue],
+    ) -> [u32; 3] {
+        [self.pair_len as u32, self.m_size(), 1]
+    }
+
+    fn visit_dependencies(&self, f: &mut dyn FnMut(NodeIndex)) {
+        f(self.input);
+    }
+
+    fn inputs(&self, nodes: &crate::compute_graph::ComputeGraphInner) -> Vec<MirValue> {
+        let input = nodes.get_result(self.input).unwrap();
+        let q_matrix = self.matrix.clone();
+        let device = input.device();
+        let output_tensor = TensorData::new_for_shape(device, &self.out_shape, input.datatype());
+        vec![input.into(), q_matrix.into(), output_tensor.into()]
+    }
+
+    fn build_direct_kernel(
+        &self,
+        graph: &crate::compute_graph::ComputeGraphInner,
+        _: &crate::mir::workgroup_shape::WorkgroupShape,
+        inputs: &[MirValue],
+    ) -> Option<DirectKernel> {
+        let [input, matrix, output] = inputs else {
+            return None;
+        };
+        let input = input.as_tensor()?;
+        let MirValue::QMatrix(matrix) = matrix else {
+            return None;
+        };
+        let output = output.as_tensor()?;
+        if input.datatype() != DataTypeEnum::F32 || output.datatype() != DataTypeEnum::F32 {
+            return None;
+        }
+
+        let format = self.direct_quant_format()?;
+        let a_view = flatten_matrix_layout(input.layout())?;
+        let y_view = flatten_matrix_layout(output.layout())?;
+        let m = a_view.rows;
+        let k = a_view.cols;
+        let pair_len = self.pair_len as u32;
+        if m != 1
+            || y_view.rows != 1
+            || y_view.cols != pair_len
+            || k != self.matrix.shape[1] as u32
+            || self.matrix.shape[0] as u32 != pair_len.checked_mul(2)?
+        {
+            return None;
+        }
+
+        let limits = graph.device().limits();
+        let max_workgroups = limits.max_compute_workgroups_per_dimension;
+        let swiglu_tile = std::env::var("FUSOR_Q4K_SWIGLU_TILE").unwrap_or_default();
+        let swiglu_tile_name = match swiglu_tile.as_str() {
+            "4x1" => "4x1",
+            "2x2" => "2x2",
+            "2x4" => "2x4",
+            _ => "4x2",
+        };
+        let cols_per_workgroup = match swiglu_tile_name {
+            "4x1" | "2x2" => 4,
+            "2x4" | "4x2" => 8,
+            _ => unreachable!(),
+        };
+        let total_workgroups = pair_len.div_ceil(cols_per_workgroup);
+        let [workgroups_x, _] = split_workgroups_2d(total_workgroups, max_workgroups)?;
+        let dispatch_size = [workgroups_x, total_workgroups.div_ceil(workgroups_x), 1];
+        if dispatch_size.iter().any(|dim| *dim > max_workgroups) {
+            return None;
+        }
+
+        let pipeline_key = QMatMulDirectPipelineKey::new(
+            matrix.datatype(),
+            m,
+            k,
+            pair_len,
+            dispatch_size,
+            input.layout(),
+            output.layout(),
+        );
+        if let Some(pipeline) = matrix
+            .direct_pipeline_cache()
+            .write()
+            .get(&pipeline_key)
+            .cloned()
+        {
+            return Some(DirectKernel::new_storage3_with_prepared_pipeline(
+                "q_mat_swiglu",
+                "",
+                pipeline,
+                input.buffer().clone(),
+                matrix.buffer().clone(),
+                output.buffer().clone(),
+                dispatch_size,
+            ));
+        }
+        let kernel_name = self.name();
+        let cache_key = format!(
+            "{kernel_name}:direct:{format:?}:tile={swiglu_tile_name}:m={m}:k={k}:pair={pair_len}:dispatch={dispatch_size:?}:{:?}:{:?}",
+            input.layout(),
+            output.layout()
+        );
+        let module =
+            if let Some(module) = graph.device().naga_module_cache().write().get(&cache_key) {
+                module.clone()
+            } else {
+                let ir = tile_ir::tile::build(move |phase| {
+                    let a = tile_storage_read_with_direct_layout(phase, a_view);
+                    let b = phase.quantized_matrix(format, k, pair_len * 2);
+                    let y = tile_storage_write_with_direct_layout(phase, y_view);
+                    match swiglu_tile_name {
+                        "4x1" => phase.qgemv_q4k_swiglu_4x1(&a, &b, &y, pair_len, workgroups_x),
+                        "2x2" => phase.qgemv_q4k_swiglu_2x2(&a, &b, &y, pair_len, workgroups_x),
+                        "2x4" => phase.qgemv_q4k_swiglu_2x4(&a, &b, &y, pair_len, workgroups_x),
+                        "4x2" => phase.qgemv_q4k_swiglu_4x2(&a, &b, &y, pair_len, workgroups_x),
+                        _ => unreachable!(),
+                    }
+                });
+                let module = ir.lower_to_naga().ok()?.module().clone();
+                graph
+                    .device()
+                    .naga_module_cache()
+                    .write()
+                    .get_or_insert(cache_key.clone(), || module.clone())
+                    .clone()
+            };
+        let pipeline = matrix
+            .direct_pipeline_cache()
+            .write()
+            .get_or_insert(pipeline_key, || {
+                QMatMulOperation::prepare_direct_pipeline(&graph.device(), &kernel_name, module)
+            })
+            .clone();
+
+        Some(DirectKernel::new_storage3_with_prepared_pipeline(
+            kernel_name,
+            cache_key,
+            pipeline,
+            input.buffer().clone(),
+            matrix.buffer().clone(),
+            output.buffer().clone(),
+            dispatch_size,
+        ))
+    }
+
+    fn requires_single_kernel_batch(&self) -> bool {
+        true
+    }
+
+    fn output(&self, _: &crate::compute_graph::ComputeGraphInner, inputs: &[MirValue]) -> MirValue {
+        let output_tensor = inputs[2].as_tensor().unwrap();
+        output_tensor.clone().into()
+    }
+
+    fn name(&self) -> String {
+        format!(
+            "q_mat_swiglu_{}_{}_{}_{}",
             self.input_datatype,
             self.in_shape
                 .iter()

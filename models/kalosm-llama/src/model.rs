@@ -301,7 +301,8 @@ where
             );
         }
 
-        let trace = std::env::var_os("FUSOR_TRACE_DECODE").is_some()
+        let trace = std::env::var_os("KALOSM_TRACE_DECODE_TIMING").is_some()
+            || std::env::var_os("FUSOR_TRACE_DECODE").is_some()
             || std::env::var_os("FUSOR_TRACE_RESOLVE").is_some();
         let fast_decode_enabled = std::env::var_os("KALOSM_LLAMA_FAST_DECODE")
             .map(|value| value != "0")
@@ -392,7 +393,8 @@ where
             );
         }
 
-        let trace = std::env::var_os("FUSOR_TRACE_DECODE").is_some()
+        let trace = std::env::var_os("KALOSM_TRACE_DECODE_TIMING").is_some()
+            || std::env::var_os("FUSOR_TRACE_DECODE").is_some()
             || std::env::var_os("FUSOR_TRACE_RESOLVE").is_some();
         let fast_decode_enabled = std::env::var_os("KALOSM_LLAMA_FAST_DECODE")
             .map(|value| value != "0")
@@ -492,7 +494,8 @@ where
             );
         }
 
-        let trace = std::env::var_os("FUSOR_TRACE_DECODE").is_some()
+        let trace = std::env::var_os("KALOSM_TRACE_DECODE_TIMING").is_some()
+            || std::env::var_os("FUSOR_TRACE_DECODE").is_some()
             || std::env::var_os("FUSOR_TRACE_RESOLVE").is_some();
         let fast_decode_enabled = std::env::var_os("KALOSM_LLAMA_FAST_DECODE")
             .map(|value| value != "0")
@@ -843,11 +846,11 @@ where
                             tracing::trace!("Stopping on stop token");
                             break;
                         }
+                        tokens_generated += 1;
                         if let Some(new_text) = text_stream
                             .next_token(new_token)
                             .map_err(LlamaModelError::TokenOutputStreamError)?
                         {
-                            tokens_generated += 1;
                             on_token(new_text)?;
                         }
 
@@ -939,31 +942,15 @@ where
             let new_token = text_stream
                 .sample_token(&mut sampler, logits, stop_on.as_deref(), seed)
                 .map_err(LlamaModelError::TokenOutputStreamError)?;
-            let logit_probs = {
-                let mut session_lock = session
-                    .cache
-                    .write()
-                    .map_err(|err| LlamaModelError::Session(err.to_string()))?;
-                Self::forward_top_k(
-                    &self.model,
-                    &self.device,
-                    &[new_token],
-                    &[],
-                    Some(&mut session_lock),
-                    &self.tokenizer,
-                    512,
-                )
-            }
-            .await?;
             if new_token == stop_token {
                 tracing::trace!("Stopping on stop token");
                 break;
             }
+            tokens_generated += 1;
             if let Some(mut new_text) = text_stream
                 .next_token(new_token)
                 .map_err(LlamaModelError::TokenOutputStreamError)?
             {
-                tokens_generated += 1;
                 if let Some(stop_on) = stop_on_lowercase {
                     let lowercase = new_text.to_lowercase();
 
@@ -1012,6 +999,27 @@ where
                     on_token(new_text)?;
                 }
             }
+
+            if finished.is_canceled() || tokens_generated >= max_tokens {
+                break;
+            }
+
+            let logit_probs = {
+                let mut session_lock = session
+                    .cache
+                    .write()
+                    .map_err(|err| LlamaModelError::Session(err.to_string()))?;
+                Self::forward_top_k(
+                    &self.model,
+                    &self.device,
+                    &[new_token],
+                    &[],
+                    Some(&mut session_lock),
+                    &self.tokenizer,
+                    512,
+                )
+            }
+            .await?;
             logits = logits_from_sorted_top_k(logit_probs);
             // Yield control to allow the stream to deliver tokens
             {

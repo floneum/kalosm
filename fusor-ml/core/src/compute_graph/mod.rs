@@ -21,7 +21,7 @@ use crate::{
     mir::{inputs::MirValue, operation::Operation},
     nary_wise::NaryOperation,
     quantized::embedding::QEmbeddingOperation,
-    quantized::matmul::QMatMulOperation,
+    quantized::matmul::{QMatMulOperation, QMatMulSwiGluOperation},
     resize::ResizeOperation,
     slice_assign::SliceAssignOperation,
     tensor::TensorData,
@@ -63,6 +63,10 @@ impl ComputeGraph {
 
     pub(crate) fn create_q_mat_mul(&self, op: QMatMulOperation) -> NodeIndex {
         self.create_node(ComputeGraphNodeVariant::QMatMul(op))
+    }
+
+    pub(crate) fn create_q_mat_mul_swiglu(&self, op: QMatMulSwiGluOperation) -> NodeIndex {
+        self.create_node(ComputeGraphNodeVariant::QMatMulSwiGlu(op))
     }
 
     pub(crate) fn create_q_embedding(&self, op: QEmbeddingOperation) -> NodeIndex {
@@ -223,6 +227,7 @@ pub(crate) enum ComputeGraphNodeVariant {
     QEmbedding(QEmbeddingOperation),
     MatMul(MatMulOperation),
     QMatMul(QMatMulOperation),
+    QMatMulSwiGlu(QMatMulSwiGluOperation),
     Tensor(TensorData),
     Reduce(ReduceOperation),
     RmsNorm(RmsNormOperation),
@@ -242,6 +247,9 @@ impl ComputeGraphNodeVariant {
                 f(op.second);
             }
             ComputeGraphNodeVariant::QMatMul(op) => {
+                f(op.input);
+            }
+            ComputeGraphNodeVariant::QMatMulSwiGlu(op) => {
                 f(op.input);
             }
             ComputeGraphNodeVariant::QEmbedding(op) => {

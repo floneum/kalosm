@@ -311,6 +311,12 @@ impl Program {
                         }
                         _ => {}
                     }
+                    if b.cols == 5120 {
+                        return self.qgemv_q4k_ggml::<4, 3, 128>(a, b, y, workgroups_x);
+                    }
+                    if b.cols == 6144 {
+                        return self.qgemv_q4k_ggml::<8, 2, 256>(a, b, y, workgroups_x);
+                    }
                     return self.qgemv_q4k_ggml::<2, 2, 64>(a, b, y, workgroups_x);
                 }
                 if b.rows <= 4096 && b.cols <= 4096 {
@@ -359,7 +365,10 @@ impl Program {
                         }
                         _ => {}
                     }
-                    return self.qgemv_q4k_ggml::<4, 2, 128>(a, b, y, workgroups_x);
+                    if b.cols <= 16_384 {
+                        return self.qgemv_q4k_ggml::<4, 4, 128>(a, b, y, workgroups_x);
+                    }
+                    return self.qgemv_q4k_ggml::<2, 4, 64>(a, b, y, workgroups_x);
                 }
                 if b.rows > 4096 && b.cols <= 4096 {
                     match std::env::var("FUSOR_Q4K_TALL_TILE").as_deref() {
@@ -448,6 +457,9 @@ impl Program {
                             return self.qgemv_q6k_ggml::<8, 4, 256>(a, b, y, workgroups_x);
                         }
                         _ => {}
+                    }
+                    if b.cols <= 16_384 {
+                        return self.qgemv_q6k_ggml::<2, 2, 64>(a, b, y, workgroups_x);
                     }
                     return self.qgemv_q6k_ggml::<2, 4, 64>(a, b, y, workgroups_x);
                 }
@@ -607,6 +619,195 @@ impl Program {
                     lane.eq(0).and(col.lt(n_cols))
                 };
                 program.store(y.at(0, col), reduced, mask);
+            }
+        });
+    }
+
+    pub fn qgemv_q4k_swiglu_4x2(
+        &mut self,
+        a: &Storage<F32, 2>,
+        b: &QuantizedMatrix,
+        y: &Storage<F32, 2>,
+        pair_cols: u32,
+        workgroups_x: u32,
+    ) {
+        self.qgemv_q4k_swiglu_ggml::<4, 2, 4, 128>(a, b, y, pair_cols, workgroups_x);
+    }
+
+    pub fn qgemv_q4k_swiglu_4x1(
+        &mut self,
+        a: &Storage<F32, 2>,
+        b: &QuantizedMatrix,
+        y: &Storage<F32, 2>,
+        pair_cols: u32,
+        workgroups_x: u32,
+    ) {
+        self.qgemv_q4k_swiglu_ggml::<4, 1, 2, 128>(a, b, y, pair_cols, workgroups_x);
+    }
+
+    pub fn qgemv_q4k_swiglu_2x2(
+        &mut self,
+        a: &Storage<F32, 2>,
+        b: &QuantizedMatrix,
+        y: &Storage<F32, 2>,
+        pair_cols: u32,
+        workgroups_x: u32,
+    ) {
+        self.qgemv_q4k_swiglu_ggml::<2, 2, 4, 64>(a, b, y, pair_cols, workgroups_x);
+    }
+
+    pub fn qgemv_q4k_swiglu_2x4(
+        &mut self,
+        a: &Storage<F32, 2>,
+        b: &QuantizedMatrix,
+        y: &Storage<F32, 2>,
+        pair_cols: u32,
+        workgroups_x: u32,
+    ) {
+        self.qgemv_q4k_swiglu_ggml::<2, 4, 8, 64>(a, b, y, pair_cols, workgroups_x);
+    }
+
+    fn qgemv_q4k_swiglu_ggml<
+        const SUBGROUPS: u32,
+        const PAIRS_PER_SUBGROUP: usize,
+        const DOTS_PER_SUBGROUP: usize,
+        const BLOCK: usize,
+    >(
+        &mut self,
+        a: &Storage<F32, 2>,
+        b: &QuantizedMatrix,
+        y: &Storage<F32, 2>,
+        pair_cols: u32,
+        workgroups_x: u32,
+    ) {
+        const SUBGROUP_SIZE: u32 = 32;
+        debug_assert_eq!(SUBGROUPS * SUBGROUP_SIZE, BLOCK as u32);
+        debug_assert_eq!(DOTS_PER_SUBGROUP, PAIRS_PER_SUBGROUP * 2);
+        debug_assert_eq!(b.format, GgmlQuantFormat::Q4K);
+        debug_assert_eq!(b.cols, pair_cols * 2);
+
+        let [_, k] = matrix_shape(&a.view.layout);
+        let cols_per_workgroup = SUBGROUPS * PAIRS_PER_SUBGROUP as u32;
+        let total_workgroups = pair_cols.div_ceil(cols_per_workgroup);
+        let workgroups_x = workgroups_x.min(total_workgroups.max(1));
+        let dispatch_y = total_workgroups.div_ceil(workgroups_x);
+        let block_count = k.div_ceil(256);
+        let block_iterations = block_count.div_ceil(4);
+        let full_block_iterations = block_count.is_multiple_of(4);
+        let full_cols = pair_cols.is_multiple_of(cols_per_workgroup);
+        let b_cloned = b.clone();
+
+        self.program_grid::<BLOCK>([workgroups_x, dispatch_y, 1], |program| {
+            let workgroup = program.program_id(WorkgroupAxis::X)
+                + program.program_id(WorkgroupAxis::Y) * workgroups_x;
+            let col_group_base = workgroup * cols_per_workgroup;
+            let subgroup_col_base = program.subgroup_id() * PAIRS_PER_SUBGROUP as u32;
+            let col0 = col_group_base + subgroup_col_base;
+            let lane = program.subgroup_lane();
+            let ix = lane.clone() / 8;
+            let it = lane.clone() % 8;
+            let iq = it.clone() / 4;
+            let ir = it % 4;
+
+            let zero = TileLiteral::F32(F32Bits::new(0.0));
+            let sums: [Tile<BLOCK>; DOTS_PER_SUBGROUP] = program
+                .loop_fold_n::<DOTS_PER_SUBGROUP, _>(
+                    TileReduceOp::Sum,
+                    block_iterations,
+                    [zero; DOTS_PER_SUBGROUP],
+                    |program| {
+                        let block = program.loop_index() * 4 + ix.clone();
+                        let in_bounds = if full_block_iterations {
+                            Mask::all()
+                        } else {
+                            block.clone().lt(block_count)
+                        };
+                        let vector_base = block.clone() * 256 + iq.clone() * 64 + ir.clone() * 8;
+
+                        let a_low: [Pinned<BLOCK>; 16] = std::array::from_fn(|j| {
+                            let offset = if j < 8 { j as u32 } else { (j - 8) as u32 + 32 };
+                            let scalar = program.load(
+                                a.at(0, vector_base.clone() + offset),
+                                in_bounds.clone(),
+                                0.0,
+                            );
+                            program.pin(scalar)
+                        });
+                        let a_high: [Pinned<BLOCK>; 16] = std::array::from_fn(|j| {
+                            let offset = if j < 8 {
+                                j as u32 + 128
+                            } else {
+                                (j - 8) as u32 + 160
+                            };
+                            let scalar = program.load(
+                                a.at(0, vector_base.clone() + offset),
+                                in_bounds.clone(),
+                                0.0,
+                            );
+                            program.pin(scalar)
+                        });
+
+                        let mut sumy = [zero; 4].map(Tile::literal);
+                        for j in 0..8 {
+                            sumy[0] = sumy[0].clone() + a_low[j].get();
+                            sumy[1] = sumy[1].clone() + a_low[j + 8].get();
+                            sumy[2] = sumy[2].clone() + a_high[j].get();
+                            sumy[3] = sumy[3].clone() + a_high[j + 8].get();
+                        }
+
+                        let a_low_vec: [Tile<BLOCK>; 16] = std::array::from_fn(|i| a_low[i].get());
+                        let a_high_vec: [Tile<BLOCK>; 16] =
+                            std::array::from_fn(|i| a_high[i].get());
+                        let sum_vec: [Tile<BLOCK>; 4] = std::array::from_fn(|i| sumy[i].clone());
+
+                        let dot = |program: &mut TileBlock<'_, BLOCK>,
+                                   col: ScalarIndex,
+                                   mask: Mask<BLOCK>| {
+                            program.quantized_q4k_ggml_dot(
+                                a_low_vec.clone(),
+                                a_high_vec.clone(),
+                                sum_vec.clone(),
+                                &b_cloned,
+                                &block,
+                                &iq,
+                                &ir,
+                                &col,
+                                mask,
+                                0.0,
+                            )
+                        };
+
+                        std::array::from_fn(|idx| {
+                            let offset = idx % PAIRS_PER_SUBGROUP;
+                            let gate = col0.clone() + offset as u32;
+                            let col = if idx < PAIRS_PER_SUBGROUP {
+                                gate.clone()
+                            } else {
+                                gate.clone() + pair_cols
+                            };
+                            let mask = if full_cols {
+                                in_bounds.clone()
+                            } else {
+                                in_bounds.clone().and(gate.lt(pair_cols))
+                            };
+                            dot(program, col, mask)
+                        })
+                    },
+                );
+
+            for offset in 0..PAIRS_PER_SUBGROUP {
+                let col = col0.clone() + offset as u32;
+                let gate = program.subgroup_reduce_sum(sums[offset].clone());
+                let up = program.subgroup_reduce_sum(sums[offset + PAIRS_PER_SUBGROUP].clone());
+                let one = program.full(1.0);
+                let sigmoid = one.clone() / (one + (gate.clone() * program.full(-1.0)).exp());
+                let value = gate * sigmoid * up;
+                let mask = if full_cols {
+                    lane.eq(0)
+                } else {
+                    lane.eq(0).and(col.lt(pair_cols))
+                };
+                program.store(y.at(0, col), value, mask);
             }
         });
     }
