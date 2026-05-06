@@ -111,8 +111,9 @@ pub use fusor_core::Tensor as GpuTensor;
 
 // Re-export from fusor-core for GPU types
 pub use fusor_core::{
-    CastTensor, D, DataType, Dim, FloatDataType, GgufReadError, LastRank, LastRankInner, MaxRank,
-    NextRank, NextRankInner, NodeIndex, SmallerRank, WasmNotSend, WasmNotSync,
+    CastTensor, D, DataType, Dim, FloatDataType, GgufReadError, GpuMirostat2Sampler,
+    GpuMirostat2SamplerParams, LastRank, LastRankInner, MaxRank, NextRank, NextRankInner,
+    NodeIndex, SmallerRank, WasmNotSend, WasmNotSync,
 };
 
 /// Runtime dispatch wrapper - holds either CPU or GPU version of an operation/tensor type.
@@ -473,6 +474,27 @@ where
                     .map_err(|err| Error::Gpu(err.into()))?;
                 Ok(ids.into_iter().zip(values).collect())
             }
+        }
+    }
+
+    pub async fn sample_mirostat2_token(
+        &self,
+        sampler: &mut GpuMirostat2Sampler,
+        previous_tokens: &[u32],
+        params: GpuMirostat2SamplerParams,
+    ) -> Result<u32, Error> {
+        match self {
+            Tensor::Cpu(_) => {
+                let top = self.top_k_pairs(params.top_k).await?;
+                Ok(top
+                    .first()
+                    .map(|(token_id, _)| *token_id)
+                    .unwrap_or_default())
+            }
+            Tensor::Gpu(t) => t
+                .sample_mirostat2_token(sampler, previous_tokens, params)
+                .await
+                .map_err(|err| Error::Gpu(err.into())),
         }
     }
 }

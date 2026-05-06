@@ -1207,6 +1207,24 @@ impl<D: DataType, const R: usize> Tensor<R, D> {
 }
 
 impl Tensor<1, f32> {
+    pub async fn sample_mirostat2_token(
+        &self,
+        sampler: &mut crate::top_k::GpuMirostat2Sampler,
+        previous_tokens: &[u32],
+        params: crate::top_k::GpuMirostat2SamplerParams,
+    ) -> Result<u32, wgpu::BufferAsyncError> {
+        let (input, _) = self.data.materialize();
+        if let Some(output) =
+            crate::top_k::mirostat2_sample_token_data(&input, sampler, previous_tokens, params)
+        {
+            let token = Tensor::<1, u32>::as_slice_from_tensor_data(&output).await?;
+            return Ok(token.as_slice().first().copied().unwrap_or_default());
+        }
+
+        let (ids, _) = self.top_k_pairs(params.top_k).await?;
+        Ok(ids.first().copied().unwrap_or_default())
+    }
+
     pub async fn top_k_pairs(
         &self,
         k: usize,

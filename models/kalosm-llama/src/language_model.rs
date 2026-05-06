@@ -18,8 +18,8 @@ use crate::structured::generate_structured;
 pub use crate::Llama;
 use crate::LlamaBuilder;
 use crate::{
-    InferenceSettings, LlamaResultFuture, LlamaSession, LlamaSourceError, StructuredGenerationTask,
-    Task, UnstructuredGenerationTask,
+    GpuSamplerConfig, InferenceSettings, LlamaResultFuture, LlamaSession, LlamaSourceError,
+    StructuredGenerationTask, Task, UnstructuredGenerationTask,
 };
 
 impl<F: FloatDataType + SimdElement + Default + FloatOps + MatmulImpl> ModelBuilder
@@ -87,14 +87,22 @@ where
         on_token: impl FnMut(String) -> Result<(), Self::Error> + WasmNotSend + WasmNotSync + 'static,
     ) -> Result<(), Self::Error> {
         let (tx, rx) = futures::channel::oneshot::channel();
-        let (max_tokens, stop_on, seed) =
+        let (max_tokens, stop_on, seed, gpu_sampler) =
             match (&sampler as &dyn Any).downcast_ref::<GenerationParameters>() {
                 Some(sampler) => (
                     sampler.max_length(),
                     sampler.stop_on().map(|s| s.to_string()),
                     sampler.seed(),
+                    Some(GpuSamplerConfig::new(
+                        sampler.temperature(),
+                        sampler.tau(),
+                        sampler.eta(),
+                        sampler.mu(),
+                        sampler.repetition_penalty(),
+                        sampler.repetition_penalty_range() as usize,
+                    )),
                 ),
-                None => (u32::MAX, None, None),
+                None => (u32::MAX, None, None, None),
             };
         let sampler = std::sync::Arc::new(std::sync::Mutex::new(sampler));
         let on_token = Box::new(on_token);
@@ -122,6 +130,7 @@ where
                     max_tokens,
                     stop_on,
                     seed,
+                    gpu_sampler,
                 ),
                 on_token,
                 finished: tx,

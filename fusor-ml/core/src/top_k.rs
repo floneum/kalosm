@@ -1,6 +1,7 @@
 use std::num::NonZeroU32;
 
 use crate::{
+    Device,
     mir::direct_kernel::{DirectKernel, DirectKernelBinding},
     tensor::{DataTypeEnum, TensorData},
 };
@@ -16,6 +17,449 @@ pub(crate) const TOP_K_CHUNK: usize = TOP_K_BLOCK as usize;
 pub(crate) const MIN_TOP_K_CANDIDATES_PER_CHUNK: usize = 64;
 const MAX_F32: f32 = 3.4028234663852886e38;
 const NEG_MAX_F32: f32 = -3.4028234663852886e38;
+const GPU_SAMPLER_PREVIOUS_TOKENS: usize = 64;
+
+#[derive(Clone, Copy, Debug)]
+pub struct GpuMirostat2SamplerParams {
+    pub top_k: usize,
+    pub temperature: f32,
+    pub repetition_penalty: f32,
+    pub tau: f32,
+    pub eta: f32,
+    pub random: f32,
+}
+
+#[derive(Clone, Debug)]
+pub struct GpuMirostat2Sampler {
+    state: TensorData,
+}
+
+impl GpuMirostat2Sampler {
+    pub fn new(device: &Device, mu: f32) -> Self {
+        let state = TensorData::new_splat(device, &[1], mu);
+        Self { state }
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, bytemuck::Pod, bytemuck::Zeroable)]
+struct ProcessorParams {
+    temperature: f32,
+    repetition_penalty: f32,
+    previous_len: u32,
+    _padding: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, bytemuck::Pod, bytemuck::Zeroable)]
+struct Mirostat2Params {
+    tau: f32,
+    eta: f32,
+    random: f32,
+    _padding: f32,
+}
+
+pub(crate) fn mirostat2_sample_token_data(
+    input: &TensorData,
+    sampler: &mut GpuMirostat2Sampler,
+    previous_tokens: &[u32],
+    params: GpuMirostat2SamplerParams,
+) -> Option<TensorData> {
+    if input.datatype() != DataTypeEnum::F32 || input.layout().rank() != 1 {
+        return None;
+    }
+
+    let adjusted = adjusted_logits_for_sampler_data(
+        input,
+        previous_tokens,
+        params.temperature,
+        params.repetition_penalty,
+    )?;
+    let input_len = adjusted.layout().shape()[0];
+    let top_k = params.top_k.min(input_len);
+    if top_k == 0 {
+        return None;
+    }
+
+    let chunks = input_len.div_ceil(TOP_K_CHUNK);
+    let candidate_count = top_k
+        .div_ceil(chunks)
+        .max(MIN_TOP_K_CANDIDATES_PER_CHUNK)
+        .min(top_k)
+        .min(TOP_K_CHUNK);
+    let output_per_chunk = if candidate_count >= TOP_K_CHUNK {
+        TOP_K_CHUNK
+    } else {
+        candidate_count + 1
+    };
+    let (ids, values) = chunk_top_k_pair_data(&adjusted, candidate_count, output_per_chunk)?;
+    let (ids, values) = merge_sorted_chunk_top_k_pair_data(
+        &ids,
+        &values,
+        chunks,
+        candidate_count,
+        output_per_chunk,
+        input_len,
+        top_k,
+    )?;
+    sample_from_sorted_top_k_data(&ids, &values, sampler, params)
+}
+
+fn fixed_previous_tokens_data(device: &Device, previous_tokens: &[u32]) -> (TensorData, u32) {
+    let len = previous_tokens.len().min(GPU_SAMPLER_PREVIOUS_TOKENS);
+    let previous_tokens = &previous_tokens[previous_tokens.len().saturating_sub(len)..];
+    let mut fixed = [0u32; GPU_SAMPLER_PREVIOUS_TOKENS];
+    fixed[..len].copy_from_slice(previous_tokens);
+    let buffer = device.create_buffer_init(
+        bytemuck::cast_slice(&fixed),
+        wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::COPY_SRC,
+    );
+    (
+        TensorData::new_from_buffer(
+            device,
+            buffer,
+            &[GPU_SAMPLER_PREVIOUS_TOKENS],
+            DataTypeEnum::U32,
+        ),
+        len as u32,
+    )
+}
+
+fn processor_params_data(
+    device: &Device,
+    temperature: f32,
+    repetition_penalty: f32,
+    previous_len: u32,
+) -> TensorData {
+    let params = ProcessorParams {
+        temperature,
+        repetition_penalty,
+        previous_len,
+        _padding: 0,
+    };
+    let buffer = device.create_buffer_init(
+        bytemuck::bytes_of(&params),
+        wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::COPY_SRC,
+    );
+    TensorData::new_from_buffer(device, buffer, &[1], DataTypeEnum::U32)
+}
+
+fn mirostat2_params_data(device: &Device, params: GpuMirostat2SamplerParams) -> TensorData {
+    let params = Mirostat2Params {
+        tau: params.tau,
+        eta: params.eta,
+        random: params.random.clamp(0.0, 0.999_999_94),
+        _padding: 0.0,
+    };
+    let buffer = device.create_buffer_init(
+        bytemuck::bytes_of(&params),
+        wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::COPY_SRC,
+    );
+    TensorData::new_from_buffer(device, buffer, &[1], DataTypeEnum::U32)
+}
+
+fn adjusted_logits_for_sampler_data(
+    input: &TensorData,
+    previous_tokens: &[u32],
+    temperature: f32,
+    repetition_penalty: f32,
+) -> Option<TensorData> {
+    if input.datatype() != DataTypeEnum::F32 || input.layout().rank() != 1 {
+        return None;
+    }
+
+    let input_len = input.layout().shape()[0];
+    let input_offset = input.layout().offset();
+    let input_stride = input.layout().strides()[0];
+    let device = input.device();
+    let output = TensorData::new_for_shape(device, &[input_len], DataTypeEnum::F32);
+    if input_len == 0 {
+        return Some(output);
+    }
+
+    let (previous_tokens, previous_len) = fixed_previous_tokens_data(device, previous_tokens);
+    let params = processor_params_data(device, temperature, repetition_penalty, previous_len);
+    let cache_key = format!(
+        "apply_generation_processors_f32:block={TOP_K_BLOCK}:len={input_len}:offset={input_offset}:stride={input_stride}"
+    );
+    let source = format!(
+        r#"
+struct ProcessorParams {{
+    temperature: f32,
+    repetition_penalty: f32,
+    previous_len: u32,
+    _padding: u32,
+}};
+
+@group(0) @binding(0) var<storage, read> input: array<f32>;
+@group(0) @binding(1) var<storage, read> previous_tokens: array<u32>;
+@group(0) @binding(2) var<storage, read> params: ProcessorParams;
+@group(0) @binding(3) var<storage, read_write> output: array<f32>;
+
+@compute @workgroup_size({TOP_K_BLOCK})
+fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {{
+    let token_id = global_id.x;
+    if (token_id >= {input_len}u) {{
+        return;
+    }}
+
+    var value = input[{input_offset}u + token_id * {input_stride}u];
+    var repeated = false;
+    var previous_index = 0u;
+    loop {{
+        if (previous_index >= params.previous_len) {{
+            break;
+        }}
+        if (previous_tokens[previous_index] == token_id) {{
+            repeated = true;
+            break;
+        }}
+        previous_index = previous_index + 1u;
+    }}
+
+    if (repeated && params.repetition_penalty > 1.0) {{
+        if (value <= 0.0) {{
+            value = value * params.repetition_penalty;
+        }} else {{
+            value = value / params.repetition_penalty;
+        }}
+    }}
+    if (params.temperature != 0.0) {{
+        value = value / params.temperature;
+    }}
+    output[token_id] = value;
+}}
+"#
+    );
+
+    let kernel = DirectKernel::new_wgsl_with_cache_key(
+        "apply_generation_processors_f32",
+        cache_key,
+        source,
+        vec![
+            DirectKernelBinding::Storage {
+                binding: 0,
+                buffer: input.buffer().clone(),
+                read_only: true,
+            },
+            DirectKernelBinding::Storage {
+                binding: 1,
+                buffer: previous_tokens.buffer().clone(),
+                read_only: true,
+            },
+            DirectKernelBinding::Storage {
+                binding: 2,
+                buffer: params.buffer().clone(),
+                read_only: true,
+            },
+            DirectKernelBinding::Storage {
+                binding: 3,
+                buffer: output.buffer().clone(),
+                read_only: false,
+            },
+        ],
+        [input_len.div_ceil(TOP_K_BLOCK as usize) as u32, 1, 1],
+    );
+
+    let mut encoder =
+        device
+            .wgpu_device()
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("apply_generation_processors_f32 encoder"),
+            });
+    kernel.run(device, &mut encoder);
+    device.wgpu_queue().submit(Some(encoder.finish()));
+
+    Some(output)
+}
+
+fn sample_from_sorted_top_k_data(
+    ids: &TensorData,
+    values: &TensorData,
+    sampler: &mut GpuMirostat2Sampler,
+    params: GpuMirostat2SamplerParams,
+) -> Option<TensorData> {
+    if ids.datatype() != DataTypeEnum::U32 || values.datatype() != DataTypeEnum::F32 {
+        return None;
+    }
+    if ids.layout().rank() != 1 || values.layout().rank() != 1 {
+        return None;
+    }
+
+    let top_k = params
+        .top_k
+        .min(ids.layout().shape()[0])
+        .min(values.layout().shape()[0]);
+    if top_k == 0 {
+        return None;
+    }
+    let ids_offset = ids.layout().offset();
+    let ids_stride = ids.layout().strides()[0];
+    let values_offset = values.layout().offset();
+    let values_stride = values.layout().strides()[0];
+    let device = values.device();
+    let params = mirostat2_params_data(device, params);
+    let output = TensorData::new_for_shape(device, &[1], DataTypeEnum::U32);
+    let cache_key = format!(
+        "sample_mirostat2_sorted_top_k_f32:block={TOP_K_BLOCK}:top_k={top_k}:ids={:?}:values={:?}",
+        ids.layout(),
+        values.layout()
+    );
+    let reduce_start = TOP_K_BLOCK / 2;
+    let source = format!(
+        r#"
+struct Mirostat2Params {{
+    tau: f32,
+    eta: f32,
+    random: f32,
+    _padding: f32,
+}};
+
+@group(0) @binding(0) var<storage, read> ids: array<u32>;
+@group(0) @binding(1) var<storage, read> values: array<f32>;
+@group(0) @binding(2) var<storage, read_write> state: array<f32>;
+@group(0) @binding(3) var<storage, read> params: Mirostat2Params;
+@group(0) @binding(4) var<storage, read_write> output: array<u32>;
+
+var<workgroup> scratch: array<f32, {TOP_K_BLOCK}>;
+
+fn top_value(index: u32) -> f32 {{
+    return values[{values_offset}u + index * {values_stride}u];
+}}
+
+fn top_id(index: u32) -> u32 {{
+    return ids[{ids_offset}u + index * {ids_stride}u];
+}}
+
+@compute @workgroup_size({TOP_K_BLOCK})
+fn main(@builtin(local_invocation_index) lane: u32) {{
+    let max_value = top_value(0u);
+    var local_sum = 0.0;
+    var index = lane;
+    loop {{
+        if (index >= {top_k}u) {{
+            break;
+        }}
+        local_sum = local_sum + exp(top_value(index) - max_value);
+        index = index + {TOP_K_BLOCK}u;
+    }}
+    scratch[lane] = local_sum;
+    workgroupBarrier();
+
+    var reduce_step = {reduce_start}u;
+    loop {{
+        if (reduce_step == 0u) {{
+            break;
+        }}
+        if (lane < reduce_step) {{
+            scratch[lane] = scratch[lane] + scratch[lane + reduce_step];
+        }}
+        workgroupBarrier();
+        reduce_step = reduce_step / 2u;
+    }}
+
+    if (lane != 0u) {{
+        return;
+    }}
+
+    let total = max(scratch[0], 1.0e-20);
+    let mu = state[0];
+    var cutoff = 0u;
+    var scan = 0u;
+    loop {{
+        if (scan >= {top_k}u) {{
+            cutoff = 1u;
+            break;
+        }}
+        let probability = exp(top_value(scan) - max_value) / total;
+        if (-log2(max(probability, 1.0e-20)) > mu) {{
+            cutoff = max(scan, 1u);
+            break;
+        }}
+        scan = scan + 1u;
+    }}
+
+    var cutoff_sum = 0.0;
+    scan = 0u;
+    loop {{
+        if (scan >= cutoff) {{
+            break;
+        }}
+        cutoff_sum = cutoff_sum + exp(top_value(scan) - max_value);
+        scan = scan + 1u;
+    }}
+    cutoff_sum = max(cutoff_sum, 1.0e-20);
+
+    let threshold = params.random * cutoff_sum;
+    var cumulative = 0.0;
+    var selected = top_id(0u);
+    var selected_probability = exp(top_value(0u) - max_value) / cutoff_sum;
+    scan = 0u;
+    loop {{
+        if (scan >= cutoff) {{
+            break;
+        }}
+        let weight = exp(top_value(scan) - max_value);
+        cumulative = cumulative + weight;
+        if (cumulative >= threshold) {{
+            selected = top_id(scan);
+            selected_probability = weight / cutoff_sum;
+            break;
+        }}
+        scan = scan + 1u;
+    }}
+
+    state[0] = mu - params.eta * (-log2(max(selected_probability, 1.0e-20)) - params.tau);
+    output[0] = selected;
+}}
+"#
+    );
+
+    let kernel = DirectKernel::new_wgsl_with_cache_key(
+        "sample_mirostat2_sorted_top_k_f32",
+        cache_key,
+        source,
+        vec![
+            DirectKernelBinding::Storage {
+                binding: 0,
+                buffer: ids.buffer().clone(),
+                read_only: true,
+            },
+            DirectKernelBinding::Storage {
+                binding: 1,
+                buffer: values.buffer().clone(),
+                read_only: true,
+            },
+            DirectKernelBinding::Storage {
+                binding: 2,
+                buffer: sampler.state.buffer().clone(),
+                read_only: false,
+            },
+            DirectKernelBinding::Storage {
+                binding: 3,
+                buffer: params.buffer().clone(),
+                read_only: true,
+            },
+            DirectKernelBinding::Storage {
+                binding: 4,
+                buffer: output.buffer().clone(),
+                read_only: false,
+            },
+        ],
+        [1, 1, 1],
+    );
+
+    let mut encoder =
+        device
+            .wgpu_device()
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("sample_mirostat2_sorted_top_k_f32 encoder"),
+            });
+    kernel.run(device, &mut encoder);
+    device.wgpu_queue().submit(Some(encoder.finish()));
+
+    Some(output)
+}
 
 pub(crate) fn chunk_top_k_pair_data(
     input: &TensorData,

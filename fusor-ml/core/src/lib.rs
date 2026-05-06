@@ -46,6 +46,7 @@ mod resize;
 mod slice_assign;
 mod tensor;
 mod top_k;
+pub use top_k::{GpuMirostat2Sampler, GpuMirostat2SamplerParams};
 mod varbuilder;
 mod visit_tiled;
 

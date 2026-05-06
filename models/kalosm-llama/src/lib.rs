@@ -443,6 +443,39 @@ pub(crate) struct InferenceSettings<F: FloatDataType + SimdElement = f32> {
 
     /// The seed to use.
     seed: Option<u64>,
+
+    /// GPU-side sampler settings for the default generation sampler.
+    gpu_sampler: Option<GpuSamplerConfig>,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct GpuSamplerConfig {
+    pub(crate) temperature: f32,
+    pub(crate) tau: f32,
+    pub(crate) eta: f32,
+    pub(crate) mu: f32,
+    pub(crate) repetition_penalty: f32,
+    pub(crate) repetition_penalty_range: usize,
+}
+
+impl GpuSamplerConfig {
+    pub(crate) fn new(
+        temperature: f32,
+        tau: f32,
+        eta: f32,
+        mu: f32,
+        repetition_penalty: f32,
+        repetition_penalty_range: usize,
+    ) -> Self {
+        Self {
+            temperature,
+            tau,
+            eta,
+            mu,
+            repetition_penalty,
+            repetition_penalty_range,
+        }
+    }
 }
 
 impl<F: FloatDataType + SimdElement> InferenceSettings<F> {
@@ -454,6 +487,7 @@ impl<F: FloatDataType + SimdElement> InferenceSettings<F> {
         max_tokens: u32,
         stop_on: Option<String>,
         seed: Option<u64>,
+        gpu_sampler: Option<GpuSamplerConfig>,
     ) -> Self {
         let prompt = prompt.to_string();
         Self {
@@ -464,6 +498,7 @@ impl<F: FloatDataType + SimdElement> InferenceSettings<F> {
             session,
             max_tokens,
             seed,
+            gpu_sampler,
         }
     }
 }

@@ -24,10 +24,16 @@ enum DirectKernelBindings {
 }
 
 #[derive(Debug)]
+enum DirectKernelSource {
+    Naga(Arc<wgpu::naga::Module>),
+    Wgsl(Arc<str>),
+}
+
+#[derive(Debug)]
 pub(crate) struct DirectKernel {
     name: String,
     cache_key: String,
-    module: Option<Arc<wgpu::naga::Module>>,
+    source: Option<DirectKernelSource>,
     prepared_pipeline: Option<wgpu::ComputePipeline>,
     bindings: DirectKernelBindings,
     dispatch_size: [u32; 3],
@@ -50,7 +56,7 @@ impl DirectKernel {
         Self {
             name: name.into(),
             cache_key: cache_key.into(),
-            module: Some(Arc::new(module)),
+            source: Some(DirectKernelSource::Naga(Arc::new(module))),
             prepared_pipeline: None,
             bindings: DirectKernelBindings::Dynamic(bindings),
             dispatch_size,
@@ -67,7 +73,24 @@ impl DirectKernel {
         Self {
             name: name.into(),
             cache_key: cache_key.into(),
-            module: Some(module),
+            source: Some(DirectKernelSource::Naga(module)),
+            prepared_pipeline: None,
+            bindings: DirectKernelBindings::Dynamic(bindings),
+            dispatch_size,
+        }
+    }
+
+    pub(crate) fn new_wgsl_with_cache_key(
+        name: impl Into<String>,
+        cache_key: impl Into<String>,
+        source: impl Into<Arc<str>>,
+        bindings: Vec<DirectKernelBinding>,
+        dispatch_size: [u32; 3],
+    ) -> Self {
+        Self {
+            name: name.into(),
+            cache_key: cache_key.into(),
+            source: Some(DirectKernelSource::Wgsl(source.into())),
             prepared_pipeline: None,
             bindings: DirectKernelBindings::Dynamic(bindings),
             dispatch_size,
@@ -86,7 +109,7 @@ impl DirectKernel {
         Self {
             name: name.into(),
             cache_key: cache_key.into(),
-            module: None,
+            source: None,
             prepared_pipeline: Some(pipeline),
             bindings: DirectKernelBindings::Storage3 {
                 input,
@@ -258,17 +281,26 @@ impl DirectKernel {
         if let Some(pipeline) = &self.prepared_pipeline {
             pipeline.clone()
         } else {
-            let module_ir = self
-                .module
+            let source = self
+                .source
                 .as_ref()
-                .expect("direct kernel without a prepared pipeline needs a naga module");
-            let module = device
-                .shader_module_cache()
-                .write()
-                .get_or_insert_ref(&self.cache_key, || {
-                    device.create_naga_shader_module(module_ir.as_ref().clone())
-                })
-                .clone();
+                .expect("direct kernel without a prepared pipeline needs a shader source");
+            let module =
+                device
+                    .shader_module_cache()
+                    .write()
+                    .get_or_insert_ref(&self.cache_key, || match source {
+                        DirectKernelSource::Naga(module_ir) => {
+                            device.create_naga_shader_module(module_ir.as_ref().clone())
+                        }
+                        DirectKernelSource::Wgsl(source) => device
+                            .wgpu_device()
+                            .create_shader_module(wgpu::ShaderModuleDescriptor {
+                                label: Some("Fusor ML WGSL Shader Module"),
+                                source: wgpu::ShaderSource::Wgsl(source.to_string().into()),
+                            }),
+                    })
+                    .clone();
             device
                 .compute_pipeline_cache()
                 .write()

@@ -24,6 +24,7 @@ use kalosm_language_model::ImageFetchError;
 use kalosm_language_model::MediaHints;
 use kalosm_model_types::ModelLoadingProgress;
 use llm_samplers::types::{Logit, Logits};
+use rand::{Rng, SeedableRng};
 use std::cmp::Ordering;
 use std::collections::BinaryHeap;
 use std::collections::HashMap;
@@ -33,7 +34,7 @@ use std::time::Duration;
 
 use tokenizers::Tokenizer;
 
-use crate::{InferenceSettings, LlamaSourceError};
+use crate::{GpuSamplerConfig, InferenceSettings, LlamaSourceError};
 
 #[derive(Default)]
 struct DecodeTraceStats {
@@ -82,6 +83,57 @@ fn use_full_logits_for_sampling(_vocab_len: usize) -> bool {
         .map(|value| value != "0")
         .unwrap_or(true);
     !gpu_top_k_enabled
+}
+
+fn gpu_token_sampling_enabled() -> bool {
+    std::env::var_os("KALOSM_LLAMA_GPU_SAMPLE_TOKEN")
+        .map(|value| value != "0")
+        .unwrap_or(true)
+}
+
+fn gpu_sample_top_k() -> usize {
+    std::env::var("KALOSM_LLAMA_GPU_SAMPLE_TOP_K")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(512)
+        .max(1)
+}
+
+struct LlamaGpuSamplerState {
+    sampler: fusor::GpuMirostat2Sampler,
+    config: GpuSamplerConfig,
+    rng: rand::rngs::StdRng,
+}
+
+impl LlamaGpuSamplerState {
+    fn new(device: &Device, config: GpuSamplerConfig, seed: Option<u64>) -> Option<Self> {
+        let gpu_device = device.as_gpu()?;
+        let rng = seed
+            .map(rand::rngs::StdRng::seed_from_u64)
+            .unwrap_or_else(rand::rngs::StdRng::from_os_rng);
+        Some(Self {
+            sampler: fusor::GpuMirostat2Sampler::new(gpu_device, config.mu),
+            config,
+            rng,
+        })
+    }
+
+    fn params(&mut self, top_k: usize) -> fusor::GpuMirostat2SamplerParams {
+        fusor::GpuMirostat2SamplerParams {
+            top_k,
+            temperature: self.config.temperature,
+            repetition_penalty: self.config.repetition_penalty,
+            tau: self.config.tau,
+            eta: self.config.eta,
+            random: self.rng.random::<f32>(),
+        }
+    }
+
+    fn previous_tokens(&self, text_stream: &TokenOutputStream) -> Vec<u32> {
+        let tokens = text_stream.tokens();
+        let len = tokens.len().min(self.config.repetition_penalty_range);
+        tokens[tokens.len().saturating_sub(len)..].to_vec()
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -415,6 +467,90 @@ where
         })
     }
 
+    pub(crate) fn forward_sample_token<'a>(
+        model: &Model<F>,
+        device: &Device,
+        tokens: &[u32],
+        images: &[(image::DynamicImage, MediaHints)],
+        cache: Option<&mut LlamaCache>,
+        #[allow(unused)] tokenizer: &Tokenizer,
+        sampler: &'a mut fusor::GpuMirostat2Sampler,
+        previous_tokens: Vec<u32>,
+        params: fusor::GpuMirostat2SamplerParams,
+    ) -> Pin<
+        Box<dyn kalosm_model_types::FutureWasmNotSend<Output = Result<u32, LlamaModelError>> + 'a>,
+    > {
+        if tokens.is_empty() {
+            return Box::pin(async { Err(LlamaModelError::EmptyInput) });
+        }
+
+        #[cfg(debug_assertions)]
+        {
+            tracing::trace!(
+                "Running model with tokens: {:?}",
+                tokenizer.decode(tokens, false)
+            );
+        }
+
+        let trace = std::env::var_os("FUSOR_TRACE_DECODE").is_some()
+            || std::env::var_os("FUSOR_TRACE_RESOLVE").is_some();
+        let fast_decode_enabled = std::env::var_os("KALOSM_LLAMA_FAST_DECODE")
+            .map(|value| value != "0")
+            .unwrap_or(true);
+        let decode_eligible = fast_decode_enabled
+            && tokens.len() == 1
+            && images.is_empty()
+            && cache.as_ref().is_some_and(|cache| !cache.tokens.is_empty());
+        let path = if decode_eligible {
+            "fast_decode_graph_sample_token"
+        } else {
+            "graph_fallback_sample_token"
+        };
+        let token_start = trace.then(std::time::Instant::now);
+        let build_start = trace.then(std::time::Instant::now);
+        let logits = model.forward(tokens, images, device, cache);
+        if let Some(start) = build_start {
+            eprintln!(
+                "forward_graph_build path={path} decode_eligible={decode_eligible} elapsed={:?}",
+                start.elapsed()
+            );
+        }
+        let device = device.clone();
+        Box::pin(async move {
+            let logits = logits?;
+            let logits = logits.squeeze(0);
+            let logits: fusor::Tensor<1, f32> = logits.cast();
+            let mut kernels = 0;
+            if let Some(logits_key) = logits.gpu_key() {
+                let resolve_start = trace.then(std::time::Instant::now);
+                kernels = device.resolve_batch(&[logits_key]);
+                if let Some(start) = resolve_start {
+                    eprintln!(
+                        "forward_resolve path={path} decode_eligible={decode_eligible} kernels={kernels} elapsed={:?}",
+                        start.elapsed()
+                    );
+                }
+            }
+
+            let download_start = trace.then(std::time::Instant::now);
+            let token_id = logits
+                .sample_mirostat2_token(sampler, &previous_tokens, params)
+                .await?;
+            if let Some(start) = download_start {
+                eprintln!(
+                    "forward_sample_token_download path={path} decode_eligible={decode_eligible} k={} elapsed={:?}",
+                    params.top_k,
+                    start.elapsed()
+                );
+            }
+            if let Some(start) = token_start {
+                record_decode_trace(path, decode_eligible, kernels, start.elapsed());
+            }
+
+            Ok(token_id)
+        })
+    }
+
     /// Create a new sync Llama model from a builder.
     pub(crate) async fn from_builder(
         builder: crate::LlamaBuilder<F>,
@@ -648,6 +784,7 @@ where
             session,
             max_tokens,
             seed,
+            gpu_sampler,
         } = settings;
 
         let tokens = self
@@ -660,6 +797,105 @@ where
             text_stream
                 .next_token(token)
                 .map_err(LlamaModelError::TokenOutputStreamError)?;
+        }
+
+        if gpu_token_sampling_enabled() && stop_on.is_none() {
+            if let Some(gpu_sampler_config) = gpu_sampler {
+                if let Some(mut gpu_sampler) =
+                    LlamaGpuSamplerState::new(&self.device, gpu_sampler_config, seed)
+                {
+                    let mut next_token = {
+                        let top_k = gpu_sample_top_k();
+                        let previous_tokens = gpu_sampler.previous_tokens(&text_stream);
+                        let params = gpu_sampler.params(top_k);
+                        let mut session_lock = session
+                            .cache
+                            .write()
+                            .map_err(|err| LlamaModelError::Session(err.to_string()))?;
+                        Self::forward_sample_token(
+                            &self.model,
+                            &self.device,
+                            tokens,
+                            &images,
+                            Some(&mut session_lock),
+                            &self.tokenizer,
+                            &mut gpu_sampler.sampler,
+                            previous_tokens,
+                            params,
+                        )
+                    }
+                    .await?;
+                    {
+                        let mut session_lock = session
+                            .cache
+                            .write()
+                            .map_err(|err| LlamaModelError::Session(err.to_string()))?;
+                        if max_tokens != u32::MAX {
+                            session_lock.reserve_decode(&self.device, max_tokens as usize);
+                        }
+                    }
+
+                    let stop_token = self.model.config.stop_token;
+                    let mut tokens_generated = 0;
+                    while !finished.is_canceled() && tokens_generated < max_tokens {
+                        let new_token = next_token;
+                        if new_token == stop_token {
+                            tracing::trace!("Stopping on stop token");
+                            break;
+                        }
+                        if let Some(new_text) = text_stream
+                            .next_token(new_token)
+                            .map_err(LlamaModelError::TokenOutputStreamError)?
+                        {
+                            tokens_generated += 1;
+                            on_token(new_text)?;
+                        }
+
+                        if finished.is_canceled() || tokens_generated >= max_tokens {
+                            break;
+                        }
+
+                        next_token = {
+                            let top_k = gpu_sample_top_k();
+                            let previous_tokens = gpu_sampler.previous_tokens(&text_stream);
+                            let params = gpu_sampler.params(top_k);
+                            let mut session_lock = session
+                                .cache
+                                .write()
+                                .map_err(|err| LlamaModelError::Session(err.to_string()))?;
+                            Self::forward_sample_token(
+                                &self.model,
+                                &self.device,
+                                &[new_token],
+                                &[],
+                                Some(&mut session_lock),
+                                &self.tokenizer,
+                                &mut gpu_sampler.sampler,
+                                previous_tokens,
+                                params,
+                            )
+                        }
+                        .await?;
+
+                        {
+                            use std::sync::atomic::{AtomicBool, Ordering};
+                            let yielded = AtomicBool::new(false);
+                            std::future::poll_fn(|cx| {
+                                if yielded.load(Ordering::Relaxed) {
+                                    std::task::Poll::Ready(())
+                                } else {
+                                    yielded.store(true, Ordering::Relaxed);
+                                    cx.waker().wake_by_ref();
+                                    std::task::Poll::Pending
+                                }
+                            })
+                            .await;
+                        }
+                    }
+
+                    return Ok(());
+                }
+            }
         }
 
         let logit_probs = {
