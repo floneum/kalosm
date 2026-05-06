@@ -516,6 +516,10 @@ fn output_dims_from_flat<const N: usize>(
 ) -> Vec<tile_ir::tile::Tile<N>> {
     (0..shape.len())
         .map(|axis| {
+            let dim = shape[axis] as u32;
+            if dim == 1 {
+                return tile_u32(0);
+            }
             let divisor = shape[axis + 1..]
                 .iter()
                 .fold(1u32, |acc, dim| acc.saturating_mul(*dim as u32));
@@ -524,12 +528,7 @@ fn output_dims_from_flat<const N: usize>(
             } else {
                 flat.clone() / tile_u32(divisor)
             };
-            let dim = shape[axis] as u32;
-            if dim == 1 {
-                tile_u32(0)
-            } else {
-                quotient % tile_u32(dim)
-            }
+            quotient % tile_u32(dim)
         })
         .collect()
 }
@@ -539,8 +538,8 @@ fn layout_index<const N: usize>(
     coords: &[tile_ir::tile::Tile<N>],
 ) -> tile_ir::tile::Tile<N> {
     let mut index = tile_u32(meta.offset);
-    for (coord, stride) in coords.iter().zip(&meta.strides) {
-        if *stride == 0 {
+    for (axis, (coord, stride)) in coords.iter().zip(&meta.strides).enumerate() {
+        if *stride == 0 || meta.shape.get(axis).copied() == Some(1) {
             continue;
         }
         index = index + coord.clone() * tile_u32(*stride);
@@ -602,6 +601,7 @@ fn tile_element(value: DataTypeEnum) -> tile_ir::ElementType {
 struct TensorMeta {
     datatype: DataTypeEnum,
     element: tile_ir::ElementType,
+    shape: Vec<u32>,
     strides: Vec<u32>,
     offset: u32,
     allocation_len: u32,
@@ -612,6 +612,14 @@ impl TensorMeta {
         Some(Self {
             datatype: tensor.datatype(),
             element: tile_element(tensor.datatype()),
+            shape: tensor
+                .layout()
+                .shape()
+                .iter()
+                .copied()
+                .map(u32::try_from)
+                .collect::<Result<_, _>>()
+                .ok()?,
             strides: tensor
                 .layout()
                 .strides()

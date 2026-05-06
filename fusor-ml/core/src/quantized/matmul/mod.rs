@@ -101,8 +101,24 @@ fn tile_cooperative_store_layout_supported(layout: &tile_ir::Layout) -> bool {
 }
 
 fn qgemv_cols_per_workgroup_for_direct(format: tile_ir::GgmlQuantFormat, k: u32, n: u32) -> u32 {
+    if format == tile_ir::GgmlQuantFormat::Q4K && k <= 4096 && n >= 4096 && n < 8192 {
+        return 4;
+    }
+
+    if format == tile_ir::GgmlQuantFormat::Q4K && k <= 4096 && n >= 8192 {
+        return 8;
+    }
+
+    if format == tile_ir::GgmlQuantFormat::Q4K && k > 4096 && n <= 4096 {
+        return 8;
+    }
+
     if format == tile_ir::GgmlQuantFormat::Q6K && k <= 4096 && n >= 8192 {
-        return 32;
+        return 8;
+    }
+
+    if format == tile_ir::GgmlQuantFormat::Q6K && k > 4096 && n <= 4096 {
+        return 4;
     }
 
     let qgemv_uses_accelerator = format == tile_ir::GgmlQuantFormat::Q4K

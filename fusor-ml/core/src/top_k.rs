@@ -5,11 +5,14 @@ use crate::{
     mir::direct_kernel::{DirectKernel, DirectKernelBinding},
     tensor::{DataTypeEnum, TensorData},
 };
-use wgpu::naga::{
-    AddressSpace, Arena, ArraySize, Barrier, BinaryOperator, Binding, Block, BuiltIn, EntryPoint,
-    Expression, Function, FunctionArgument, GlobalVariable, Handle, Literal, LocalVariable,
-    MathFunction, Module, Range, ResourceBinding, Scalar, ShaderStage, Span, Statement,
-    StorageAccess, Type, TypeInner, VectorSize,
+use wgpu::{
+    CommandEncoder,
+    naga::{
+        AddressSpace, Arena, ArraySize, Barrier, BinaryOperator, Binding, Block, BuiltIn,
+        EntryPoint, Expression, Function, FunctionArgument, GlobalVariable, Handle, Literal,
+        LocalVariable, MathFunction, Module, Range, ResourceBinding, Scalar, ShaderStage, Span,
+        Statement, StorageAccess, Type, TypeInner, VectorSize,
+    },
 };
 
 const TOP_K_BLOCK: u32 = 256;
@@ -59,26 +62,37 @@ struct Mirostat2Params {
     _padding: f32,
 }
 
-pub(crate) fn mirostat2_sample_token_data(
+pub(crate) async fn mirostat2_sample_token_to_host(
     input: &TensorData,
     sampler: &mut GpuMirostat2Sampler,
     previous_tokens: &[u32],
     params: GpuMirostat2SamplerParams,
-) -> Option<TensorData> {
+) -> Result<Option<u32>, wgpu::BufferAsyncError> {
     if input.datatype() != DataTypeEnum::F32 || input.layout().rank() != 1 {
-        return None;
+        return Ok(None);
     }
 
-    let adjusted = adjusted_logits_for_sampler_data(
+    let device = input.device();
+    let mut encoder =
+        device
+            .wgpu_device()
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("mirostat2_sample_token_to_host encoder"),
+            });
+
+    let Some(adjusted) = adjusted_logits_for_sampler_data_with_encoder(
         input,
         previous_tokens,
         params.temperature,
         params.repetition_penalty,
-    )?;
+        Some(&mut encoder),
+    ) else {
+        return Ok(None);
+    };
     let input_len = adjusted.layout().shape()[0];
     let top_k = params.top_k.min(input_len);
     if top_k == 0 {
-        return None;
+        return Ok(None);
     }
 
     let chunks = input_len.div_ceil(TOP_K_CHUNK);
@@ -92,8 +106,15 @@ pub(crate) fn mirostat2_sample_token_data(
     } else {
         candidate_count + 1
     };
-    let (ids, values) = chunk_top_k_pair_data(&adjusted, candidate_count, output_per_chunk)?;
-    let (ids, values) = merge_sorted_chunk_top_k_pair_data(
+    let Some((ids, values)) = chunk_top_k_pair_data_with_encoder(
+        &adjusted,
+        candidate_count,
+        output_per_chunk,
+        Some(&mut encoder),
+    ) else {
+        return Ok(None);
+    };
+    let Some((ids, values)) = merge_sorted_chunk_top_k_pair_data_with_encoder(
         &ids,
         &values,
         chunks,
@@ -101,8 +122,52 @@ pub(crate) fn mirostat2_sample_token_data(
         output_per_chunk,
         input_len,
         top_k,
-    )?;
-    sample_from_sorted_top_k_data(&ids, &values, sampler, params)
+        Some(&mut encoder),
+    ) else {
+        return Ok(None);
+    };
+    let Some(output) = sample_from_sorted_top_k_data_with_encoder(
+        &ids,
+        &values,
+        sampler,
+        params,
+        Some(&mut encoder),
+    ) else {
+        return Ok(None);
+    };
+
+    let download = device.wgpu_device().create_buffer(&wgpu::BufferDescriptor {
+        size: std::mem::size_of::<u32>() as u64,
+        usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+        mapped_at_creation: false,
+        label: Some("mirostat2 sampled token download"),
+    });
+    encoder.copy_buffer_to_buffer(
+        output.buffer(),
+        0,
+        &download,
+        0,
+        std::mem::size_of::<u32>() as u64,
+    );
+    device.wgpu_queue().submit(Some(encoder.finish()));
+
+    let (sender, receiver) = futures_channel::oneshot::channel();
+    download
+        .slice(..)
+        .map_async(wgpu::MapMode::Read, move |result| {
+            _ = sender.send(result);
+        });
+    #[cfg(not(target_arch = "wasm32"))]
+    device.poll_wait();
+    receiver.await.map_err(|_| wgpu::BufferAsyncError)??;
+
+    let view = download.slice(..).get_mapped_range();
+    Ok(Some(
+        view.get(..std::mem::size_of::<u32>())
+            .map(bytemuck::from_bytes::<u32>)
+            .copied()
+            .unwrap_or_default(),
+    ))
 }
 
 fn fixed_previous_tokens_data(device: &Device, previous_tokens: &[u32]) -> (TensorData, u32) {
@@ -158,11 +223,12 @@ fn mirostat2_params_data(device: &Device, params: GpuMirostat2SamplerParams) -> 
     TensorData::new_from_buffer(device, buffer, &[1], DataTypeEnum::U32)
 }
 
-fn adjusted_logits_for_sampler_data(
+fn adjusted_logits_for_sampler_data_with_encoder(
     input: &TensorData,
     previous_tokens: &[u32],
     temperature: f32,
     repetition_penalty: f32,
+    encoder: Option<&mut CommandEncoder>,
 ) -> Option<TensorData> {
     if input.datatype() != DataTypeEnum::F32 || input.layout().rank() != 1 {
         return None;
@@ -261,23 +327,28 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {{
         [input_len.div_ceil(TOP_K_BLOCK as usize) as u32, 1, 1],
     );
 
-    let mut encoder =
-        device
-            .wgpu_device()
-            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("apply_generation_processors_f32 encoder"),
-            });
-    kernel.run(device, &mut encoder);
-    device.wgpu_queue().submit(Some(encoder.finish()));
+    if let Some(encoder) = encoder {
+        kernel.run(device, encoder);
+    } else {
+        let mut encoder =
+            device
+                .wgpu_device()
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("apply_generation_processors_f32 encoder"),
+                });
+        kernel.run(device, &mut encoder);
+        device.wgpu_queue().submit(Some(encoder.finish()));
+    }
 
     Some(output)
 }
 
-fn sample_from_sorted_top_k_data(
+fn sample_from_sorted_top_k_data_with_encoder(
     ids: &TensorData,
     values: &TensorData,
     sampler: &mut GpuMirostat2Sampler,
     params: GpuMirostat2SamplerParams,
+    encoder: Option<&mut CommandEncoder>,
 ) -> Option<TensorData> {
     if ids.datatype() != DataTypeEnum::U32 || values.datatype() != DataTypeEnum::F32 {
         return None;
@@ -449,14 +520,18 @@ fn main(@builtin(local_invocation_index) lane: u32) {{
         [1, 1, 1],
     );
 
-    let mut encoder =
-        device
-            .wgpu_device()
-            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("sample_mirostat2_sorted_top_k_f32 encoder"),
-            });
-    kernel.run(device, &mut encoder);
-    device.wgpu_queue().submit(Some(encoder.finish()));
+    if let Some(encoder) = encoder {
+        kernel.run(device, encoder);
+    } else {
+        let mut encoder =
+            device
+                .wgpu_device()
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("sample_mirostat2_sorted_top_k_f32 encoder"),
+                });
+        kernel.run(device, &mut encoder);
+        device.wgpu_queue().submit(Some(encoder.finish()));
+    }
 
     Some(output)
 }
@@ -465,6 +540,15 @@ pub(crate) fn chunk_top_k_pair_data(
     input: &TensorData,
     candidate_count: usize,
     output_per_chunk: usize,
+) -> Option<(TensorData, TensorData)> {
+    chunk_top_k_pair_data_with_encoder(input, candidate_count, output_per_chunk, None)
+}
+
+fn chunk_top_k_pair_data_with_encoder(
+    input: &TensorData,
+    candidate_count: usize,
+    output_per_chunk: usize,
+    encoder: Option<&mut CommandEncoder>,
 ) -> Option<(TensorData, TensorData)> {
     if input.datatype() != DataTypeEnum::F32 || input.layout().rank() != 1 {
         return None;
@@ -526,14 +610,18 @@ pub(crate) fn chunk_top_k_pair_data(
         [chunks.try_into().ok()?, 1, 1],
     );
 
-    let mut encoder =
-        device
-            .wgpu_device()
-            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("chunk_top_k_pairs_f32 encoder"),
-            });
-    kernel.run(device, &mut encoder);
-    device.wgpu_queue().submit(Some(encoder.finish()));
+    if let Some(encoder) = encoder {
+        kernel.run(device, encoder);
+    } else {
+        let mut encoder =
+            device
+                .wgpu_device()
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("chunk_top_k_pairs_f32 encoder"),
+                });
+        kernel.run(device, &mut encoder);
+        device.wgpu_queue().submit(Some(encoder.finish()));
+    }
 
     Some((ids, values))
 }
@@ -546,6 +634,28 @@ pub(crate) fn merge_sorted_chunk_top_k_pair_data(
     chunk_stride: usize,
     input_len: usize,
     k: usize,
+) -> Option<(TensorData, TensorData)> {
+    merge_sorted_chunk_top_k_pair_data_with_encoder(
+        input_ids,
+        input_values,
+        chunks,
+        chunk_len,
+        chunk_stride,
+        input_len,
+        k,
+        None,
+    )
+}
+
+fn merge_sorted_chunk_top_k_pair_data_with_encoder(
+    input_ids: &TensorData,
+    input_values: &TensorData,
+    chunks: usize,
+    chunk_len: usize,
+    chunk_stride: usize,
+    input_len: usize,
+    k: usize,
+    encoder: Option<&mut CommandEncoder>,
 ) -> Option<(TensorData, TensorData)> {
     if input_ids.datatype() != DataTypeEnum::U32 || input_values.datatype() != DataTypeEnum::F32 {
         return None;
@@ -626,14 +736,18 @@ pub(crate) fn merge_sorted_chunk_top_k_pair_data(
         [1, 1, 1],
     );
 
-    let mut encoder =
-        device
-            .wgpu_device()
-            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("merge_sorted_chunk_top_k_pairs_f32 encoder"),
-            });
-    kernel.run(device, &mut encoder);
-    device.wgpu_queue().submit(Some(encoder.finish()));
+    if let Some(encoder) = encoder {
+        kernel.run(device, encoder);
+    } else {
+        let mut encoder =
+            device
+                .wgpu_device()
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("merge_sorted_chunk_top_k_pairs_f32 encoder"),
+                });
+        kernel.run(device, &mut encoder);
+        device.wgpu_queue().submit(Some(encoder.finish()));
+    }
 
     Some((ids, values))
 }

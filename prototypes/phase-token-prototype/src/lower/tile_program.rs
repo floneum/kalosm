@@ -454,6 +454,56 @@ impl<'a> Lowerer<'a> {
                 *block_n,
                 spill_depth,
             ),
+            TileExpr::QuantizedQ4KGgmlDot {
+                a_low,
+                a_high,
+                sums,
+                src,
+                block,
+                iq,
+                ir,
+                col,
+                mask,
+                fill,
+            } => self.lower_tile_quantized_q4k_ggml_dot_expr(
+                expressions,
+                scratch,
+                body,
+                a_low,
+                a_high,
+                sums,
+                src,
+                block,
+                iq,
+                ir,
+                col,
+                mask,
+                *fill,
+                spill_depth,
+            ),
+            TileExpr::QuantizedQ6KGgmlDot {
+                a,
+                src,
+                block,
+                ip,
+                il,
+                col,
+                mask,
+                fill,
+            } => self.lower_tile_quantized_q6k_ggml_dot_expr(
+                expressions,
+                scratch,
+                body,
+                a,
+                src,
+                block,
+                ip,
+                il,
+                col,
+                mask,
+                *fill,
+                spill_depth,
+            ),
         }
     }
 
@@ -472,6 +522,50 @@ impl<'a> Lowerer<'a> {
         format: GgmlQuantFormat,
         spill_depth: usize,
     ) -> Result<Handle<Expression>, LowerError> {
+        let mut a_handles = Vec::with_capacity(8);
+        for expr in a {
+            a_handles.push(self.lower_tile_expr_lane(
+                expressions,
+                scratch,
+                body,
+                expr,
+                spill_depth + 1,
+            )?);
+        }
+        let a_handles: [Handle<Expression>; 8] = a_handles
+            .try_into()
+            .map_err(|_| LowerError::UnsupportedOperation("q8_0 dot8 expected 8 A values"))?;
+
+        if matches!(mask, TileMaskExpr::True) {
+            let k_base_handle =
+                self.lower_tile_index_expr(expressions, scratch, body, k_base, spill_depth)?;
+            let col_handle =
+                self.lower_tile_index_expr(expressions, scratch, body, col, spill_depth)?;
+            let (dot, value_emits) = match format {
+                GgmlQuantFormat::Q8_0 => self.dequantize_q8_0_dot8(
+                    expressions,
+                    src,
+                    k_base_handle,
+                    col_handle,
+                    &a_handles,
+                )?,
+                GgmlQuantFormat::Q6K => self.dequantize_q6k_dot8(
+                    expressions,
+                    src,
+                    k_base_handle,
+                    col_handle,
+                    &a_handles,
+                )?,
+                _ => {
+                    return Err(LowerError::UnsupportedOperation(
+                        "unsupported quantized f32 dot8 format",
+                    ));
+                }
+            };
+            Self::push_emits(body, value_emits);
+            return Ok(dot);
+        }
+
         let tmp = Self::tile_value_local(scratch, ElementType::F32)?;
         let tmp_ptr = expressions.append(Expression::LocalVariable(tmp), Span::default());
         let fill_value = expressions.append(
@@ -486,22 +580,9 @@ impl<'a> Lowerer<'a> {
             Span::default(),
         );
 
-        let mut a_handles = Vec::with_capacity(8);
-        for expr in a {
-            a_handles.push(self.lower_tile_expr_lane(
-                expressions,
-                scratch,
-                body,
-                expr,
-                spill_depth + 1,
-            )?);
-        }
         let mask_handle =
             self.lower_tile_mask_expr(expressions, scratch, body, mask, spill_depth)?;
         let mut accept = Block::new();
-        let a_handles: [Handle<Expression>; 8] = a_handles
-            .try_into()
-            .map_err(|_| LowerError::UnsupportedOperation("q8_0 dot8 expected 8 A values"))?;
         let k_base_handle =
             self.lower_tile_index_expr(expressions, scratch, &mut accept, k_base, spill_depth)?;
         let col_handle =
@@ -558,6 +639,48 @@ impl<'a> Lowerer<'a> {
         block_n: u32,
         spill_depth: usize,
     ) -> Result<Handle<Expression>, LowerError> {
+        let mut a_handles = Vec::with_capacity(a.len());
+        for expr in a {
+            a_handles.push(self.lower_tile_expr_lane(
+                expressions,
+                scratch,
+                body,
+                expr,
+                spill_depth + 1,
+            )?);
+        }
+        let a_packs = self.cached_q8_activation_packs(expressions, scratch, body, &a_handles)?;
+
+        if matches!(mask, TileMaskExpr::True) {
+            let k_base_handle =
+                self.lower_tile_index_expr(expressions, scratch, body, k_base, spill_depth)?;
+            let col_handle =
+                self.lower_tile_index_expr(expressions, scratch, body, col, spill_depth)?;
+            let (dot, value_emits) = match (src.format, block_n) {
+                (GgmlQuantFormat::Q4K, 8 | 16) => self.q4k_q8_activation_dot(
+                    expressions,
+                    src,
+                    k_base_handle,
+                    col_handle,
+                    &a_packs,
+                )?,
+                (GgmlQuantFormat::Q6K, 8 | 16) => self.q6k_q8_activation_dot(
+                    expressions,
+                    src,
+                    k_base_handle,
+                    col_handle,
+                    &a_packs,
+                )?,
+                _ => {
+                    return Err(LowerError::UnsupportedOperation(
+                        "q8 activation dot only supports Q4K/Q6K dot8/dot16",
+                    ));
+                }
+            };
+            Self::push_emits(body, value_emits);
+            return Ok(dot);
+        }
+
         let tmp = Self::tile_value_local(scratch, ElementType::F32)?;
         let tmp_ptr = expressions.append(Expression::LocalVariable(tmp), Span::default());
         let fill_value = expressions.append(
@@ -572,17 +695,6 @@ impl<'a> Lowerer<'a> {
             Span::default(),
         );
 
-        let mut a_handles = Vec::with_capacity(a.len());
-        for expr in a {
-            a_handles.push(self.lower_tile_expr_lane(
-                expressions,
-                scratch,
-                body,
-                expr,
-                spill_depth + 1,
-            )?);
-        }
-        let a_packs = self.cached_q8_activation_packs(expressions, scratch, body, &a_handles)?;
         let mask_handle =
             self.lower_tile_mask_expr(expressions, scratch, body, mask, spill_depth)?;
         let mut accept = Block::new();
@@ -642,6 +754,36 @@ impl<'a> Lowerer<'a> {
         block_n: u32,
         spill_depth: usize,
     ) -> Result<Handle<Expression>, LowerError> {
+        let mut a_handles = Vec::with_capacity(a.len());
+        for expr in a {
+            a_handles.push(self.lower_tile_expr_lane(
+                expressions,
+                scratch,
+                body,
+                expr,
+                spill_depth + 1,
+            )?);
+        }
+
+        if matches!(mask, TileMaskExpr::True) {
+            let k_base_handle =
+                self.lower_tile_index_expr(expressions, scratch, body, k_base, spill_depth)?;
+            let col_handle =
+                self.lower_tile_index_expr(expressions, scratch, body, col, spill_depth)?;
+            let (dot, value_emits) = match (src.format, block_n) {
+                (GgmlQuantFormat::Q4K, 8 | 16 | 32) => {
+                    self.q4k_f32_dot(expressions, src, k_base_handle, col_handle, &a_handles)?
+                }
+                _ => {
+                    return Err(LowerError::UnsupportedOperation(
+                        "q4k f32 dot only supports Q4K dot8/dot16/dot32",
+                    ));
+                }
+            };
+            Self::push_emits(body, value_emits);
+            return Ok(dot);
+        }
+
         let tmp = Self::tile_value_local(scratch, ElementType::F32)?;
         let tmp_ptr = expressions.append(Expression::LocalVariable(tmp), Span::default());
         let fill_value = expressions.append(
@@ -656,16 +798,6 @@ impl<'a> Lowerer<'a> {
             Span::default(),
         );
 
-        let mut a_handles = Vec::with_capacity(a.len());
-        for expr in a {
-            a_handles.push(self.lower_tile_expr_lane(
-                expressions,
-                scratch,
-                body,
-                expr,
-                spill_depth + 1,
-            )?);
-        }
         let mask_handle =
             self.lower_tile_mask_expr(expressions, scratch, body, mask, spill_depth)?;
         let mut accept = Block::new();
@@ -683,6 +815,258 @@ impl<'a> Lowerer<'a> {
                 ));
             }
         };
+        Self::push_emits(&mut accept, value_emits);
+        accept.push(
+            Statement::Store {
+                pointer: tmp_ptr,
+                value: dot,
+            },
+            Span::default(),
+        );
+        body.push(
+            Statement::If {
+                condition: mask_handle,
+                accept,
+                reject: Block::new(),
+            },
+            Span::default(),
+        );
+        let loaded = expressions.append(Expression::Load { pointer: tmp_ptr }, Span::default());
+        body.push(
+            Statement::Emit(Self::single_expression_range(expressions, loaded)),
+            Span::default(),
+        );
+        Ok(loaded)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn lower_tile_quantized_q4k_ggml_dot_expr(
+        &self,
+        expressions: &mut Arena<Expression>,
+        scratch: ScratchLocals,
+        body: &mut Block,
+        a_low: &[Box<TileExpr>],
+        a_high: &[Box<TileExpr>],
+        sums: &[Box<TileExpr>],
+        src: &QuantizedMatrix,
+        block: &TileIndexExpr,
+        iq: &TileIndexExpr,
+        ir: &TileIndexExpr,
+        col: &TileIndexExpr,
+        mask: &TileMaskExpr,
+        fill: F32Bits,
+        spill_depth: usize,
+    ) -> Result<Handle<Expression>, LowerError> {
+        if a_low.len() != 16 || a_high.len() != 16 || sums.len() != 4 {
+            return Err(LowerError::UnsupportedOperation(
+                "q4k ggml dot requires 16 low activations, 16 high activations, and 4 sums",
+            ));
+        }
+
+        let mut a_low_handles = Vec::with_capacity(16);
+        for expr in a_low {
+            a_low_handles.push(self.lower_tile_expr_lane(
+                expressions,
+                scratch,
+                body,
+                expr,
+                spill_depth + 1,
+            )?);
+        }
+        let mut a_high_handles = Vec::with_capacity(16);
+        for expr in a_high {
+            a_high_handles.push(self.lower_tile_expr_lane(
+                expressions,
+                scratch,
+                body,
+                expr,
+                spill_depth + 1,
+            )?);
+        }
+        let mut sum_handles = Vec::with_capacity(4);
+        for expr in sums {
+            sum_handles.push(self.lower_tile_expr_lane(
+                expressions,
+                scratch,
+                body,
+                expr,
+                spill_depth + 1,
+            )?);
+        }
+
+        if matches!(mask, TileMaskExpr::True) {
+            let block_handle =
+                self.lower_tile_index_expr(expressions, scratch, body, block, spill_depth)?;
+            let iq_handle =
+                self.lower_tile_index_expr(expressions, scratch, body, iq, spill_depth)?;
+            let ir_handle =
+                self.lower_tile_index_expr(expressions, scratch, body, ir, spill_depth)?;
+            let col_handle =
+                self.lower_tile_index_expr(expressions, scratch, body, col, spill_depth)?;
+            let (dot, value_emits) = self.q4k_ggml_dot(
+                expressions,
+                src,
+                block_handle,
+                iq_handle,
+                ir_handle,
+                col_handle,
+                &a_low_handles,
+                &a_high_handles,
+                &sum_handles,
+            )?;
+            Self::push_emits(body, value_emits);
+            return Ok(dot);
+        }
+
+        let tmp = Self::tile_value_local(scratch, ElementType::F32)?;
+        let tmp_ptr = expressions.append(Expression::LocalVariable(tmp), Span::default());
+        let fill_value = expressions.append(
+            Expression::Literal(Literal::F32(fill.get())),
+            Span::default(),
+        );
+        body.push(
+            Statement::Store {
+                pointer: tmp_ptr,
+                value: fill_value,
+            },
+            Span::default(),
+        );
+
+        let mask_handle =
+            self.lower_tile_mask_expr(expressions, scratch, body, mask, spill_depth)?;
+        let mut accept = Block::new();
+        let block_handle =
+            self.lower_tile_index_expr(expressions, scratch, &mut accept, block, spill_depth)?;
+        let iq_handle =
+            self.lower_tile_index_expr(expressions, scratch, &mut accept, iq, spill_depth)?;
+        let ir_handle =
+            self.lower_tile_index_expr(expressions, scratch, &mut accept, ir, spill_depth)?;
+        let col_handle =
+            self.lower_tile_index_expr(expressions, scratch, &mut accept, col, spill_depth)?;
+        let (dot, value_emits) = self.q4k_ggml_dot(
+            expressions,
+            src,
+            block_handle,
+            iq_handle,
+            ir_handle,
+            col_handle,
+            &a_low_handles,
+            &a_high_handles,
+            &sum_handles,
+        )?;
+        Self::push_emits(&mut accept, value_emits);
+        accept.push(
+            Statement::Store {
+                pointer: tmp_ptr,
+                value: dot,
+            },
+            Span::default(),
+        );
+        body.push(
+            Statement::If {
+                condition: mask_handle,
+                accept,
+                reject: Block::new(),
+            },
+            Span::default(),
+        );
+        let loaded = expressions.append(Expression::Load { pointer: tmp_ptr }, Span::default());
+        body.push(
+            Statement::Emit(Self::single_expression_range(expressions, loaded)),
+            Span::default(),
+        );
+        Ok(loaded)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn lower_tile_quantized_q6k_ggml_dot_expr(
+        &self,
+        expressions: &mut Arena<Expression>,
+        scratch: ScratchLocals,
+        body: &mut Block,
+        a: &[Box<TileExpr>],
+        src: &QuantizedMatrix,
+        block: &TileIndexExpr,
+        ip: &TileIndexExpr,
+        il: &TileIndexExpr,
+        col: &TileIndexExpr,
+        mask: &TileMaskExpr,
+        fill: F32Bits,
+        spill_depth: usize,
+    ) -> Result<Handle<Expression>, LowerError> {
+        if a.len() != 16 {
+            return Err(LowerError::UnsupportedOperation(
+                "q6k ggml dot requires 16 activations",
+            ));
+        }
+
+        let mut a_handles = Vec::with_capacity(16);
+        for expr in a {
+            a_handles.push(self.lower_tile_expr_lane(
+                expressions,
+                scratch,
+                body,
+                expr,
+                spill_depth + 1,
+            )?);
+        }
+
+        if matches!(mask, TileMaskExpr::True) {
+            let block_handle =
+                self.lower_tile_index_expr(expressions, scratch, body, block, spill_depth)?;
+            let ip_handle =
+                self.lower_tile_index_expr(expressions, scratch, body, ip, spill_depth)?;
+            let il_handle =
+                self.lower_tile_index_expr(expressions, scratch, body, il, spill_depth)?;
+            let col_handle =
+                self.lower_tile_index_expr(expressions, scratch, body, col, spill_depth)?;
+            let (dot, value_emits) = self.q6k_ggml_dot(
+                expressions,
+                src,
+                block_handle,
+                ip_handle,
+                il_handle,
+                col_handle,
+                &a_handles,
+            )?;
+            Self::push_emits(body, value_emits);
+            return Ok(dot);
+        }
+
+        let tmp = Self::tile_value_local(scratch, ElementType::F32)?;
+        let tmp_ptr = expressions.append(Expression::LocalVariable(tmp), Span::default());
+        let fill_value = expressions.append(
+            Expression::Literal(Literal::F32(fill.get())),
+            Span::default(),
+        );
+        body.push(
+            Statement::Store {
+                pointer: tmp_ptr,
+                value: fill_value,
+            },
+            Span::default(),
+        );
+
+        let mask_handle =
+            self.lower_tile_mask_expr(expressions, scratch, body, mask, spill_depth)?;
+        let mut accept = Block::new();
+        let block_handle =
+            self.lower_tile_index_expr(expressions, scratch, &mut accept, block, spill_depth)?;
+        let ip_handle =
+            self.lower_tile_index_expr(expressions, scratch, &mut accept, ip, spill_depth)?;
+        let il_handle =
+            self.lower_tile_index_expr(expressions, scratch, &mut accept, il, spill_depth)?;
+        let col_handle =
+            self.lower_tile_index_expr(expressions, scratch, &mut accept, col, spill_depth)?;
+        let (dot, value_emits) = self.q6k_ggml_dot(
+            expressions,
+            src,
+            block_handle,
+            ip_handle,
+            il_handle,
+            col_handle,
+            &a_handles,
+        )?;
         Self::push_emits(&mut accept, value_emits);
         accept.push(
             Statement::Store {
@@ -729,6 +1113,43 @@ impl<'a> Lowerer<'a> {
             ));
         }
         if let Some(values) = self.block_dequant_cache.borrow().get(&id).cloned() {
+            return Ok(values[lane as usize]);
+        }
+
+        if matches!(mask, TileMaskExpr::True) {
+            let k_base_handle =
+                self.lower_tile_index_expr(expressions, scratch, body, k_base, spill_depth)?;
+            let col_handle =
+                self.lower_tile_index_expr(expressions, scratch, body, col, spill_depth)?;
+            let (values, value_emits) = match (src.format, block_n) {
+                (GgmlQuantFormat::Q8_0, 8) => {
+                    self.dequantize_q8_0_values8(expressions, src, k_base_handle, col_handle)?
+                }
+                (GgmlQuantFormat::Q4K, 8) => {
+                    self.dequantize_q4k_values8(expressions, src, k_base_handle, col_handle)?
+                }
+                (GgmlQuantFormat::Q6K, 8) => {
+                    self.dequantize_q6k_values8(expressions, src, k_base_handle, col_handle)?
+                }
+                (GgmlQuantFormat::Q6K, 16) => {
+                    self.dequantize_q6k_values16(expressions, src, k_base_handle, col_handle)?
+                }
+                (GgmlQuantFormat::Q5_0, 16) => {
+                    self.dequantize_q5_0_values16(expressions, src, k_base_handle, col_handle)?
+                }
+                (_, 8 | 16) => {
+                    self.dequantize_qvalues(expressions, src, k_base_handle, col_handle, block_n)?
+                }
+                _ => {
+                    return Err(LowerError::UnsupportedOperation(
+                        "quantized block dequant only supports 8-wide or 16-wide blocks",
+                    ));
+                }
+            };
+            Self::push_emits(body, value_emits);
+            self.block_dequant_cache
+                .borrow_mut()
+                .insert(id, values.clone());
             return Ok(values[lane as usize]);
         }
 
@@ -872,6 +1293,25 @@ impl<'a> Lowerer<'a> {
         spill_depth: usize,
     ) -> Result<Handle<Expression>, LowerError> {
         let element = load.src.buffer.element;
+        if matches!(load.mask, TileMaskExpr::True) {
+            let row =
+                self.lower_tile_index_expr(expressions, scratch, body, &load.row, spill_depth)?;
+            let col =
+                self.lower_tile_index_expr(expressions, scratch, body, &load.col, spill_depth)?;
+            let (src_index, src_index_emits) =
+                self.storage_index_from_coords(expressions, &load.src, &[row, col])?;
+            let (src_ptr, src_ptr_emits) =
+                self.storage_dynamic_pointer(expressions, &load.src, src_index)?;
+            Self::push_emits(body, src_index_emits);
+            Self::push_emits(body, src_ptr_emits);
+            let value = expressions.append(Expression::Load { pointer: src_ptr }, Span::default());
+            body.push(
+                Statement::Emit(Self::single_expression_range(expressions, value)),
+                Span::default(),
+            );
+            return Ok(value);
+        }
+
         let tmp = Self::tile_value_local(scratch, element)?;
         let tmp_ptr = expressions.append(Expression::LocalVariable(tmp), Span::default());
         let fill_source = load.fill.element();
@@ -934,6 +1374,16 @@ impl<'a> Lowerer<'a> {
         load: &TileQuantizedLoadExpr,
         spill_depth: usize,
     ) -> Result<Handle<Expression>, LowerError> {
+        if matches!(load.mask, TileMaskExpr::True) {
+            let row =
+                self.lower_tile_index_expr(expressions, scratch, body, &load.row, spill_depth)?;
+            let col =
+                self.lower_tile_index_expr(expressions, scratch, body, &load.col, spill_depth)?;
+            let (value, value_emits) = self.dequantize_qvalue(expressions, &load.src, row, col)?;
+            Self::push_emits(body, value_emits);
+            return Ok(value);
+        }
+
         let tmp = Self::tile_value_local(scratch, ElementType::F32)?;
         let tmp_ptr = expressions.append(Expression::LocalVariable(tmp), Span::default());
         let fill = expressions.append(
@@ -1939,7 +2389,9 @@ impl<'a> Lowerer<'a> {
             TileExpr::Dot4 { .. }
             | TileExpr::QuantizedQ8_0Dot8 { .. }
             | TileExpr::QuantizedQ8ActivationDot { .. }
-            | TileExpr::QuantizedQ4KF32Dot { .. } => Ok(ElementType::F32),
+            | TileExpr::QuantizedQ4KF32Dot { .. }
+            | TileExpr::QuantizedQ4KGgmlDot { .. }
+            | TileExpr::QuantizedQ6KGgmlDot { .. } => Ok(ElementType::F32),
             TileExpr::PinnedRef { id } => self
                 .ir
                 .pinned_values

@@ -158,6 +158,14 @@ async fn flash_attention_matches_cpu_reference_on_varied_shapes() {
             kv_seq_len: 3,
             head_dim: 4,
         },
+        FlashCase {
+            batch: 1,
+            num_heads: 2,
+            num_kv_heads: 1,
+            q_seq_len: 1,
+            kv_seq_len: 9,
+            head_dim: 128,
+        },
     ] {
         assert_flash_attention_case(case, None, 1e-4).await;
     }

@@ -656,6 +656,44 @@ impl<'a> Lowerer<'a> {
                     || Self::tile_index_expr_uses_f16(col)
                     || Self::tile_mask_expr_uses_f16(mask)
             }
+            TileExpr::QuantizedQ4KGgmlDot {
+                a_low,
+                a_high,
+                sums,
+                block,
+                iq,
+                ir,
+                col,
+                mask,
+                ..
+            } => {
+                a_low
+                    .iter()
+                    .chain(a_high.iter())
+                    .chain(sums.iter())
+                    .any(|expr| Self::tile_expr_uses_f16(expr))
+                    || Self::tile_index_expr_uses_f16(block)
+                    || Self::tile_index_expr_uses_f16(iq)
+                    || Self::tile_index_expr_uses_f16(ir)
+                    || Self::tile_index_expr_uses_f16(col)
+                    || Self::tile_mask_expr_uses_f16(mask)
+            }
+            TileExpr::QuantizedQ6KGgmlDot {
+                a,
+                block,
+                ip,
+                il,
+                col,
+                mask,
+                ..
+            } => {
+                a.iter().any(|expr| Self::tile_expr_uses_f16(expr))
+                    || Self::tile_index_expr_uses_f16(block)
+                    || Self::tile_index_expr_uses_f16(ip)
+                    || Self::tile_index_expr_uses_f16(il)
+                    || Self::tile_index_expr_uses_f16(col)
+                    || Self::tile_mask_expr_uses_f16(mask)
+            }
             TileExpr::PinnedRef { .. } | TileExpr::LoopFoldGroupOutput { .. } => false,
         }
     }

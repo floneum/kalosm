@@ -947,6 +947,328 @@ impl<'a> Lowerer<'a> {
         Ok((total, emits))
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn q4k_ggml_dot(
+        &self,
+        expressions: &mut Arena<Expression>,
+        matrix: &QuantizedMatrix,
+        block: Handle<Expression>,
+        iq: Handle<Expression>,
+        ir: Handle<Expression>,
+        col: Handle<Expression>,
+        a_low: &[Handle<Expression>],
+        a_high: &[Handle<Expression>],
+        sums: &[Handle<Expression>],
+    ) -> Result<(Handle<Expression>, Vec<Range<Expression>>), LowerError> {
+        if matrix.format != GgmlQuantFormat::Q4K
+            || a_low.len() != 16
+            || a_high.len() != 16
+            || sums.len() != 4
+        {
+            return Err(LowerError::UnsupportedOperation(
+                "q4k ggml dot requires Q4K, 16 low/high activations, and 4 sums",
+            ));
+        }
+
+        let mut emits = Vec::new();
+        let base = self.quantized_block_base(expressions, matrix, block, col, 37, &mut emits);
+        let d_word = self.load_word(expressions, matrix, base, 0, &mut emits)?;
+        let d = self.bitcast_f32(expressions, &mut emits, d_word);
+        let dmin_word = self.load_word(expressions, matrix, base, 1, &mut emits)?;
+        let dmin = self.bitcast_f32(expressions, &mut emits, dmin_word);
+
+        let scale_shift = self.shl_lit(expressions, &mut emits, iq, 4);
+        let sc0 = self.load_word(expressions, matrix, base, 2, &mut emits)?;
+        let sc1 = self.load_word(expressions, matrix, base, 3, &mut emits)?;
+        let sc2 = self.load_word(expressions, matrix, base, 4, &mut emits)?;
+        let sc0 = self.shr(expressions, &mut emits, sc0, scale_shift);
+        let sc1 = self.shr(expressions, &mut emits, sc1, scale_shift);
+        let sc2 = self.shr(expressions, &mut emits, sc2, scale_shift);
+
+        let first_two = self.and_lit(expressions, &mut emits, sc0, 0x3f3f);
+        let second_two = self.and_lit(expressions, &mut emits, sc1, 0x3f3f);
+        let third_low = self.and_lit(expressions, &mut emits, sc2, 0x0f0f);
+        let third_high = self.and_lit(expressions, &mut emits, sc0, 0xc0c0);
+        let third_high = self.shr_lit(expressions, &mut emits, third_high, 2);
+        let third_two = self.bin(
+            expressions,
+            &mut emits,
+            BinaryOperator::InclusiveOr,
+            third_low,
+            third_high,
+        );
+        let fourth_low = self.shr_lit(expressions, &mut emits, sc2, 4);
+        let fourth_low = self.and_lit(expressions, &mut emits, fourth_low, 0x0f0f);
+        let fourth_high = self.and_lit(expressions, &mut emits, sc1, 0xc0c0);
+        let fourth_high = self.shr_lit(expressions, &mut emits, fourth_high, 2);
+        let fourth_two = self.bin(
+            expressions,
+            &mut emits,
+            BinaryOperator::InclusiveOr,
+            fourth_low,
+            fourth_high,
+        );
+
+        let odd_scales = [
+            self.u8_lane_f32(expressions, &mut emits, first_two, 0),
+            self.u8_lane_f32(expressions, &mut emits, first_two, 1),
+            self.u8_lane_f32(expressions, &mut emits, third_two, 0),
+            self.u8_lane_f32(expressions, &mut emits, third_two, 1),
+        ];
+        let even_scales = [
+            self.u8_lane_f32(expressions, &mut emits, second_two, 0),
+            self.u8_lane_f32(expressions, &mut emits, second_two, 1),
+            self.u8_lane_f32(expressions, &mut emits, fourth_two, 0),
+            self.u8_lane_f32(expressions, &mut emits, fourth_two, 1),
+        ];
+
+        let iq_words = self.shl_lit(expressions, &mut emits, iq, 3);
+        let ir_words = self.shl_lit(expressions, &mut emits, ir, 1);
+        let data_offset = self.bin(
+            expressions,
+            &mut emits,
+            BinaryOperator::Add,
+            iq_words,
+            ir_words,
+        );
+
+        let mut first_sums = [self.f32(expressions, 0.0); 4];
+        let mut second_sums = [self.f32(expressions, 0.0); 4];
+        let use_vector_accumulate = matrix.rows <= 4096 && matrix.cols >= 8192;
+        for j in 0..2 {
+            let word_off = self.add_lit(expressions, &mut emits, data_offset, 5 + j as u32);
+            let word = self.load_word_dynamic(expressions, matrix, base, word_off, &mut emits)?;
+            if use_vector_accumulate {
+                self.q4k_ggml_accumulate_word_vector(
+                    expressions,
+                    &mut emits,
+                    word,
+                    a_low,
+                    j,
+                    &mut first_sums,
+                );
+            } else {
+                self.q4k_ggml_accumulate_word_scalar(
+                    expressions,
+                    &mut emits,
+                    word,
+                    a_low,
+                    j,
+                    &mut first_sums,
+                );
+            }
+
+            let word_off = self.add_lit(expressions, &mut emits, data_offset, 21 + j as u32);
+            let word = self.load_word_dynamic(expressions, matrix, base, word_off, &mut emits)?;
+            if use_vector_accumulate {
+                self.q4k_ggml_accumulate_word_vector(
+                    expressions,
+                    &mut emits,
+                    word,
+                    a_high,
+                    j,
+                    &mut second_sums,
+                );
+            } else {
+                self.q4k_ggml_accumulate_word_scalar(
+                    expressions,
+                    &mut emits,
+                    word,
+                    a_high,
+                    j,
+                    &mut second_sums,
+                );
+            }
+        }
+
+        let inv_256 = self.f32(expressions, 1.0 / 256.0);
+        let inv_16 = self.f32(expressions, 1.0 / 16.0);
+        let one = self.f32(expressions, 1.0);
+        let small_shift_sums = self.compose_f32_vec4(
+            expressions,
+            &mut emits,
+            [first_sums[0], first_sums[2], second_sums[0], second_sums[2]],
+        );
+        let large_shift_sums = self.compose_f32_vec4(
+            expressions,
+            &mut emits,
+            [first_sums[1], first_sums[3], second_sums[1], second_sums[3]],
+        );
+        let inv_256_vec = self.compose_f32_vec4(
+            expressions,
+            &mut emits,
+            [inv_256, inv_256, inv_256, inv_256],
+        );
+        let large_shift_sums = self.mul(expressions, &mut emits, large_shift_sums, inv_256_vec);
+        let combined = self.bin(
+            expressions,
+            &mut emits,
+            BinaryOperator::Add,
+            small_shift_sums,
+            large_shift_sums,
+        );
+        let odd_scales = self.compose_f32_vec4(expressions, &mut emits, odd_scales);
+        let weighted = self.mul(expressions, &mut emits, combined, odd_scales);
+        let shift4 = self.compose_f32_vec4(expressions, &mut emits, [one, inv_16, one, inv_16]);
+        let scaled_dot = self.dot_f32_vec4(expressions, &mut emits, weighted, shift4);
+        let scaled_dot = self.mul(expressions, &mut emits, d, scaled_dot);
+
+        let sum_vec = self.compose_f32_vec4(
+            expressions,
+            &mut emits,
+            [sums[0], sums[1], sums[2], sums[3]],
+        );
+        let even_scales = self.compose_f32_vec4(expressions, &mut emits, even_scales);
+        let min_dot = self.dot_f32_vec4(expressions, &mut emits, sum_vec, even_scales);
+        let min_dot = self.mul(expressions, &mut emits, dmin, min_dot);
+        let total = self.sub(expressions, &mut emits, scaled_dot, min_dot);
+        Ok((total, emits))
+    }
+
+    pub(super) fn q6k_ggml_dot(
+        &self,
+        expressions: &mut Arena<Expression>,
+        matrix: &QuantizedMatrix,
+        block: Handle<Expression>,
+        ip: Handle<Expression>,
+        il: Handle<Expression>,
+        col: Handle<Expression>,
+        a: &[Handle<Expression>],
+    ) -> Result<(Handle<Expression>, Vec<Range<Expression>>), LowerError> {
+        if matrix.format != GgmlQuantFormat::Q6K || a.len() != 16 {
+            return Err(LowerError::UnsupportedOperation(
+                "q6k ggml dot requires Q6K and 16 activations",
+            ));
+        }
+
+        let mut emits = Vec::new();
+        let base = self.quantized_block_base(expressions, matrix, block, col, 53, &mut emits);
+        let d_word = self.load_word(expressions, matrix, base, 52, &mut emits)?;
+        let d = self.bitcast_f32(expressions, &mut emits, d_word);
+
+        let l0 = self.shl_lit(expressions, &mut emits, il, 2);
+        let low_base = self.shl_lit(expressions, &mut emits, ip, 6);
+        let low_byte_offset = self.bin(expressions, &mut emits, BinaryOperator::Add, low_base, l0);
+        let low_word_offset = self.shr_lit(expressions, &mut emits, low_byte_offset, 2);
+        let q1_word =
+            self.load_word_dynamic(expressions, matrix, base, low_word_offset, &mut emits)?;
+        let q2_word_offset = self.add_lit(expressions, &mut emits, low_word_offset, 8);
+        let q2_word =
+            self.load_word_dynamic(expressions, matrix, base, q2_word_offset, &mut emits)?;
+
+        let high_base = self.shl_lit(expressions, &mut emits, ip, 5);
+        let high_byte_offset =
+            self.bin(expressions, &mut emits, BinaryOperator::Add, high_base, l0);
+        let high_word_offset = self.shr_lit(expressions, &mut emits, high_byte_offset, 2);
+        let high_word_offset = self.add_lit(expressions, &mut emits, high_word_offset, 32);
+        let qh_word =
+            self.load_word_dynamic(expressions, matrix, base, high_word_offset, &mut emits)?;
+
+        let scale_base = self.shl_lit(expressions, &mut emits, ip, 3);
+        let scale_low = self.shr_lit(expressions, &mut emits, il, 2);
+        let scale_index = self.bin(
+            expressions,
+            &mut emits,
+            BinaryOperator::Add,
+            scale_base,
+            scale_low,
+        );
+        let scale_word0_offset = self.shr_lit(expressions, &mut emits, scale_index, 2);
+        let scale_word0_offset = self.add_lit(expressions, &mut emits, scale_word0_offset, 48);
+        let scale_word1_offset = self.add_lit(expressions, &mut emits, scale_word0_offset, 1);
+        let scale_word0 =
+            self.load_word_dynamic(expressions, matrix, base, scale_word0_offset, &mut emits)?;
+        let scale_word1 =
+            self.load_word_dynamic(expressions, matrix, base, scale_word1_offset, &mut emits)?;
+        let scale_lane0 = self.and_lit(expressions, &mut emits, scale_index, 3);
+        let scale_lane1 = self.add_lit(expressions, &mut emits, scale_lane0, 2);
+        let scales = [
+            self.byte_at(expressions, &mut emits, scale_word0, scale_lane0),
+            self.byte_at(expressions, &mut emits, scale_word0, scale_lane1),
+            self.byte_at(expressions, &mut emits, scale_word1, scale_lane0),
+            self.byte_at(expressions, &mut emits, scale_word1, scale_lane1),
+        ]
+        .map(|byte| self.signed_byte_f32(expressions, &mut emits, byte));
+
+        let mut sums = [self.f32(expressions, 0.0); 4];
+        for l in 0..4 {
+            let lane =
+                expressions.append(Expression::Literal(Literal::U32(l as u32)), Span::default());
+            let q1_byte = self.byte_at(expressions, &mut emits, q1_word, lane);
+            let q2_byte = self.byte_at(expressions, &mut emits, q2_word, lane);
+            let qh_byte = self.byte_at(expressions, &mut emits, qh_word, lane);
+
+            let q0_low = self.and_lit(expressions, &mut emits, q1_byte, 0x0f);
+            let q0_high = self.and_lit(expressions, &mut emits, qh_byte, 0x03);
+            let q0_high = self.shl_lit(expressions, &mut emits, q0_high, 4);
+            let q0 = self.bin(
+                expressions,
+                &mut emits,
+                BinaryOperator::InclusiveOr,
+                q0_low,
+                q0_high,
+            );
+            let q0 = self.center_q6k_quant(expressions, &mut emits, q0);
+
+            let q1_low = self.and_lit(expressions, &mut emits, q2_byte, 0x0f);
+            let q1_high = self.and_lit(expressions, &mut emits, qh_byte, 0x0c);
+            let q1_high = self.shl_lit(expressions, &mut emits, q1_high, 2);
+            let q1 = self.bin(
+                expressions,
+                &mut emits,
+                BinaryOperator::InclusiveOr,
+                q1_low,
+                q1_high,
+            );
+            let q1 = self.center_q6k_quant(expressions, &mut emits, q1);
+
+            let q2_low = self.shr_lit(expressions, &mut emits, q1_byte, 4);
+            let q2_high = self.and_lit(expressions, &mut emits, qh_byte, 0x30);
+            let q2 = self.bin(
+                expressions,
+                &mut emits,
+                BinaryOperator::InclusiveOr,
+                q2_low,
+                q2_high,
+            );
+            let q2 = self.center_q6k_quant(expressions, &mut emits, q2);
+
+            let q3_low = self.shr_lit(expressions, &mut emits, q2_byte, 4);
+            let q3_high = self.and_lit(expressions, &mut emits, qh_byte, 0xc0);
+            let q3_high = self.shr_lit(expressions, &mut emits, q3_high, 2);
+            let q3 = self.bin(
+                expressions,
+                &mut emits,
+                BinaryOperator::InclusiveOr,
+                q3_low,
+                q3_high,
+            );
+            let q3 = self.center_q6k_quant(expressions, &mut emits, q3);
+
+            for (sum, activation, quant) in [
+                (0, a[4 * l], q0),
+                (1, a[4 * l + 1], q1),
+                (2, a[4 * l + 2], q2),
+                (3, a[4 * l + 3], q3),
+            ] {
+                let weighted = self.mul(expressions, &mut emits, activation, quant);
+                sums[sum] = self.bin(
+                    expressions,
+                    &mut emits,
+                    BinaryOperator::Add,
+                    sums[sum],
+                    weighted,
+                );
+            }
+        }
+
+        let sum_vec = self.compose_f32_vec4(expressions, &mut emits, sums);
+        let scale_vec = self.compose_f32_vec4(expressions, &mut emits, scales);
+        let weighted = self.dot_f32_vec4(expressions, &mut emits, sum_vec, scale_vec);
+        let total = self.mul(expressions, &mut emits, d, weighted);
+        Ok((total, emits))
+    }
+
     pub(super) fn q6k_q8_activation_dot(
         &self,
         expressions: &mut Arena<Expression>,
@@ -2376,6 +2698,154 @@ impl<'a> Lowerer<'a> {
             },
         );
         self.as_f32(e, emits, dot)
+    }
+
+    fn compose_f32_vec4(
+        &self,
+        e: &mut Arena<Expression>,
+        emits: &mut Vec<Range<Expression>>,
+        components: [Handle<Expression>; 4],
+    ) -> Handle<Expression> {
+        let vec = e.append(
+            Expression::Compose {
+                ty: self.f32_vec4_ty,
+                components: components.to_vec(),
+            },
+            Span::default(),
+        );
+        emits.push(Self::single_expression_range(e, vec));
+        vec
+    }
+
+    fn dot_f32_vec4(
+        &self,
+        e: &mut Arena<Expression>,
+        emits: &mut Vec<Range<Expression>>,
+        left: Handle<Expression>,
+        right: Handle<Expression>,
+    ) -> Handle<Expression> {
+        self.emit(
+            e,
+            emits,
+            Expression::Math {
+                fun: MathFunction::Dot,
+                arg: left,
+                arg1: Some(right),
+                arg2: None,
+                arg3: None,
+            },
+        )
+    }
+
+    fn vec4_component(
+        &self,
+        e: &mut Arena<Expression>,
+        emits: &mut Vec<Range<Expression>>,
+        vector: Handle<Expression>,
+        index: u32,
+    ) -> Handle<Expression> {
+        self.emit(
+            e,
+            emits,
+            Expression::AccessIndex {
+                base: vector,
+                index,
+            },
+        )
+    }
+
+    fn u8_lane_f32(
+        &self,
+        e: &mut Arena<Expression>,
+        emits: &mut Vec<Range<Expression>>,
+        word: Handle<Expression>,
+        lane: u32,
+    ) -> Handle<Expression> {
+        let shifted = if lane == 0 {
+            word
+        } else {
+            self.shr_lit(e, emits, word, lane * 8)
+        };
+        let byte = self.and_lit(e, emits, shifted, 0xff);
+        self.as_f32(e, emits, byte)
+    }
+
+    fn center_q6k_quant(
+        &self,
+        e: &mut Arena<Expression>,
+        emits: &mut Vec<Range<Expression>>,
+        quant: Handle<Expression>,
+    ) -> Handle<Expression> {
+        let quant = self.as_f32(e, emits, quant);
+        let center = self.f32(e, 32.0);
+        self.sub(e, emits, quant, center)
+    }
+
+    fn q4k_ggml_accumulate_word_scalar(
+        &self,
+        e: &mut Arena<Expression>,
+        emits: &mut Vec<Range<Expression>>,
+        word: Handle<Expression>,
+        activations: &[Handle<Expression>],
+        pair: usize,
+        sums: &mut [Handle<Expression>; 4],
+    ) {
+        let high_word = self.shr_lit(e, emits, word, 16);
+        let entries = [
+            (word, 0usize, pair * 4, 0x000f_u32),
+            (word, 1usize, pair * 4 + 1, 0x0f00_u32),
+            (word, 2usize, pair * 4 + 8, 0x00f0_u32),
+            (word, 3usize, pair * 4 + 9, 0xf000_u32),
+            (high_word, 0usize, pair * 4 + 2, 0x000f_u32),
+            (high_word, 1usize, pair * 4 + 3, 0x0f00_u32),
+            (high_word, 2usize, pair * 4 + 10, 0x00f0_u32),
+            (high_word, 3usize, pair * 4 + 11, 0xf000_u32),
+        ];
+
+        for (source, sum_index, activation_index, mask) in entries {
+            let masked = self.and_lit(e, emits, source, mask);
+            let quant = self.as_f32(e, emits, masked);
+            let term = self.mul(e, emits, activations[activation_index], quant);
+            sums[sum_index] = self.bin(e, emits, BinaryOperator::Add, sums[sum_index], term);
+        }
+    }
+
+    fn q4k_ggml_accumulate_word_vector(
+        &self,
+        e: &mut Arena<Expression>,
+        emits: &mut Vec<Range<Expression>>,
+        word: Handle<Expression>,
+        activations: &[Handle<Expression>],
+        pair: usize,
+        sums: &mut [Handle<Expression>; 4],
+    ) {
+        let high_word = self.shr_lit(e, emits, word, 16);
+        for (source, activation_base) in [(word, pair * 4), (high_word, pair * 4 + 2)] {
+            let q0 = self.and_lit(e, emits, source, 0x000f);
+            let q0 = self.as_f32(e, emits, q0);
+            let q1 = self.and_lit(e, emits, source, 0x0f00);
+            let q1 = self.as_f32(e, emits, q1);
+            let q2 = self.and_lit(e, emits, source, 0x00f0);
+            let q2 = self.as_f32(e, emits, q2);
+            let q3 = self.and_lit(e, emits, source, 0xf000);
+            let q3 = self.as_f32(e, emits, q3);
+            let quant_vec = self.compose_f32_vec4(e, emits, [q0, q1, q2, q3]);
+            let activation_vec = self.compose_f32_vec4(
+                e,
+                emits,
+                [
+                    activations[activation_base],
+                    activations[activation_base + 1],
+                    activations[activation_base + 8],
+                    activations[activation_base + 9],
+                ],
+            );
+            let terms = self.mul(e, emits, activation_vec, quant_vec);
+            for (sum_index, sum) in sums.iter_mut().enumerate() {
+                let term = self.vec4_component(e, emits, terms, sum_index as u32);
+                *sum = self.bin(e, emits, BinaryOperator::Add, *sum, term);
+            }
+        }
     }
 
     fn pack_i8x4(

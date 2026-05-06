@@ -218,6 +218,45 @@ impl<'a> Lowerer<'a> {
                     || Self::tile_index_expr_uses_kind(col, kind)
                     || Self::tile_mask_expr_uses_kind(mask, kind)
             }
+            TileExpr::QuantizedQ4KGgmlDot {
+                a_low,
+                a_high,
+                sums,
+                block,
+                iq,
+                ir,
+                col,
+                mask,
+                ..
+            } => {
+                a_low
+                    .iter()
+                    .chain(a_high.iter())
+                    .chain(sums.iter())
+                    .any(|expr| Self::tile_expr_uses_index_kind(expr, kind))
+                    || Self::tile_index_expr_uses_kind(block, kind)
+                    || Self::tile_index_expr_uses_kind(iq, kind)
+                    || Self::tile_index_expr_uses_kind(ir, kind)
+                    || Self::tile_index_expr_uses_kind(col, kind)
+                    || Self::tile_mask_expr_uses_kind(mask, kind)
+            }
+            TileExpr::QuantizedQ6KGgmlDot {
+                a,
+                block,
+                ip,
+                il,
+                col,
+                mask,
+                ..
+            } => {
+                a.iter()
+                    .any(|expr| Self::tile_expr_uses_index_kind(expr, kind))
+                    || Self::tile_index_expr_uses_kind(block, kind)
+                    || Self::tile_index_expr_uses_kind(ip, kind)
+                    || Self::tile_index_expr_uses_kind(il, kind)
+                    || Self::tile_index_expr_uses_kind(col, kind)
+                    || Self::tile_mask_expr_uses_kind(mask, kind)
+            }
             TileExpr::PinnedRef { .. } | TileExpr::LoopFoldGroupOutput { .. } => false,
             TileExpr::Index(idx) => Self::tile_index_expr_uses_kind(idx, kind),
             TileExpr::Full(_) | TileExpr::Literal(_) => false,
@@ -307,6 +346,19 @@ impl<'a> Lowerer<'a> {
             TileExpr::QuantizedQ4KF32Dot { a, .. } => a
                 .iter()
                 .any(|expr| Self::tile_expr_uses_subgroup_reduce(expr)),
+            TileExpr::QuantizedQ4KGgmlDot {
+                a_low,
+                a_high,
+                sums,
+                ..
+            } => a_low
+                .iter()
+                .chain(a_high.iter())
+                .chain(sums.iter())
+                .any(|expr| Self::tile_expr_uses_subgroup_reduce(expr)),
+            TileExpr::QuantizedQ6KGgmlDot { a, .. } => a
+                .iter()
+                .any(|expr| Self::tile_expr_uses_subgroup_reduce(expr)),
             TileExpr::PinnedRef { .. } | TileExpr::LoopFoldGroupOutput { .. } => false,
             TileExpr::Scalar(expr) => match expr {
                 TileScalarExpr::Reduce { value, .. } | TileScalarExpr::LoopReduce { value, .. } => {
@@ -369,6 +421,21 @@ impl<'a> Lowerer<'a> {
                 }
             }
             TileExpr::QuantizedQ4KF32Dot { a, .. } => {
+                for expr in a {
+                    Self::mark_tile_expr_live(ir, expr, live);
+                }
+            }
+            TileExpr::QuantizedQ4KGgmlDot {
+                a_low,
+                a_high,
+                sums,
+                ..
+            } => {
+                for expr in a_low.iter().chain(a_high.iter()).chain(sums.iter()) {
+                    Self::mark_tile_expr_live(ir, expr, live);
+                }
+            }
+            TileExpr::QuantizedQ6KGgmlDot { a, .. } => {
                 for expr in a {
                     Self::mark_tile_expr_live(ir, expr, live);
                 }

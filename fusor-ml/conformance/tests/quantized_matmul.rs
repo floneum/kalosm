@@ -375,6 +375,36 @@ quantized_fixture_fn!(
     2.0
 );
 quantized_fixture_fn!(
+    q4k_large_qgemv_fixture,
+    BlockQ4K,
+    GgmlType::Q4K,
+    [8192, 512],
+    q4k_raw_bytes,
+    1,
+    1e-4,
+    2.0
+);
+quantized_fixture_fn!(
+    q4k_mid_qgemv_fixture,
+    BlockQ4K,
+    GgmlType::Q4K,
+    [4096, 512],
+    q4k_raw_bytes,
+    1,
+    1e-4,
+    2.0
+);
+quantized_fixture_fn!(
+    q4k_tall_qgemv_fixture,
+    BlockQ4K,
+    GgmlType::Q4K,
+    [128, 4608],
+    q4k_raw_bytes,
+    1,
+    1e-4,
+    2.0
+);
+quantized_fixture_fn!(
     q5k_wide_fixture,
     BlockQ5K,
     GgmlType::Q5K,
@@ -391,6 +421,26 @@ quantized_fixture_fn!(
     [2, 512],
     q6k_raw_bytes,
     3,
+    1e-4,
+    1.0
+);
+quantized_fixture_fn!(
+    q6k_large_qgemv_fixture,
+    BlockQ6K,
+    GgmlType::Q6K,
+    [8192, 512],
+    q6k_raw_bytes,
+    1,
+    1e-4,
+    1.0
+);
+quantized_fixture_fn!(
+    q6k_tall_qgemv_fixture,
+    BlockQ6K,
+    GgmlType::Q6K,
+    [128, 4608],
+    q6k_raw_bytes,
+    1,
     1e-4,
     1.0
 );
@@ -636,6 +686,21 @@ quantized_q_mat_mul_test!(
     812
 );
 quantized_q_mat_mul_test!(
+    q4k_q_mat_mul_large_qgemv_matches_cpu_reference,
+    q4k_large_qgemv_fixture,
+    827
+);
+quantized_q_mat_mul_test!(
+    q4k_q_mat_mul_mid_qgemv_matches_cpu_reference,
+    q4k_mid_qgemv_fixture,
+    830
+);
+quantized_q_mat_mul_test!(
+    q4k_q_mat_mul_tall_qgemv_matches_cpu_reference,
+    q4k_tall_qgemv_fixture,
+    828
+);
+quantized_q_mat_mul_test!(
     q5k_q_mat_mul_multi_row_matches_cpu_reference,
     q5k_wide_fixture,
     813
@@ -644,6 +709,16 @@ quantized_q_mat_mul_test!(
     q6k_q_mat_mul_multi_row_matches_cpu_reference,
     q6k_wide_fixture,
     814
+);
+quantized_q_mat_mul_test!(
+    q6k_q_mat_mul_large_qgemv_matches_cpu_reference,
+    q6k_large_qgemv_fixture,
+    831
+);
+quantized_q_mat_mul_test!(
+    q6k_q_mat_mul_tall_qgemv_matches_cpu_reference,
+    q6k_tall_qgemv_fixture,
+    829
 );
 quantized_q_mat_mul_test!(
     q4_0_q_mat_mul_tiled_matches_cpu_reference,

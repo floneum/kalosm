@@ -19,15 +19,17 @@ use lru::LruCache;
 use parking_lot::RwLock;
 use rustc_hash::{FxBuildHasher, FxHasher};
 use wgpu::naga::{
-    AddressSpace, Arena, ArraySize, Barrier, BinaryOperator, Binding, Block, BuiltIn, EntryPoint,
-    Expression, Function, FunctionArgument, GlobalVariable, Handle, Literal, LocalVariable,
-    MathFunction, Module, Range, ResourceBinding, Scalar, ShaderStage, Span, Statement,
-    StorageAccess, Type, TypeInner, VectorSize,
+    AddressSpace, Arena, ArraySize, Barrier, BinaryOperator, Binding, Block, BuiltIn,
+    CollectiveOperation, EntryPoint, Expression, Function, FunctionArgument, GlobalVariable,
+    Handle, Literal, LocalVariable, MathFunction, Module, Range, ResourceBinding, Scalar,
+    ShaderStage, Span, Statement, StorageAccess, SubgroupOperation, Type, TypeInner, VectorSize,
 };
 
 const BLOCK: usize = 256;
 const SIMD_WIDTH: usize = 32;
 const OUTPUTS_PER_WORKGROUP: usize = BLOCK / SIMD_WIDTH;
+const DECODE_BLOCK: u32 = 128;
+const DECODE_HEAD_DIM: u32 = 128;
 const FLOAT_MIN: f32 = -1.0e30;
 const FLASH_ATTENTION_MODULE_CACHE_SIZE: usize = 128;
 
@@ -50,6 +52,7 @@ fn hash_layout<H: Hasher>(state: &mut H, layout: &crate::Layout) {
 }
 
 fn flash_attention_module_key(
+    variant: FlashAttentionKernelVariant,
     dims: FlashAttentionDims,
     scale_bits: u32,
     dispatch_size: [u32; 3],
@@ -62,6 +65,7 @@ fn flash_attention_module_key(
     std::array::from_fn(|salt| {
         let mut hasher = FxHasher::default();
         (salt as u64).hash(&mut hasher);
+        variant.hash(&mut hasher);
         dims.batch.hash(&mut hasher);
         dims.num_heads.hash(&mut hasher);
         dims.num_kv_heads.hash(&mut hasher);
@@ -78,6 +82,12 @@ fn flash_attention_module_key(
         hash_layout(&mut hasher, output.layout());
         hasher.finish()
     })
+}
+
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
+enum FlashAttentionKernelVariant {
+    Streaming,
+    DecodeSmall,
 }
 
 #[derive(Clone, Debug)]
@@ -202,6 +212,14 @@ impl Operation for FlashAttentionOperation {
             (None, 3)
         };
         let output = inputs.get(output_index)?.as_tensor()?.clone();
+        let device = graph.device();
+
+        if !device.subgroups_supported()
+            || device.min_subgroup_size() > SIMD_WIDTH as u32
+            || device.max_subgroup_size() < SIMD_WIDTH as u32
+        {
+            return None;
+        }
 
         if q.datatype() != DataTypeEnum::F32
             || k.datatype() != DataTypeEnum::F32
@@ -221,14 +239,6 @@ impl Operation for FlashAttentionOperation {
             || dims.q_seq_len == 0
             || dims.kv_seq_len == 0
             || dims.head_dim == 0
-        {
-            return None;
-        }
-
-        let dispatch_size = self.dispatch_size(&WorkgroupShape::new(1, 1, 1), inputs);
-        if dispatch_size
-            .iter()
-            .any(|dim| *dim > graph.device().limits().max_compute_workgroups_per_dimension)
         {
             return None;
         }
@@ -254,7 +264,41 @@ impl Operation for FlashAttentionOperation {
             return None;
         }
 
+        let decode_meta = build_flash_decode_small_meta(
+            dims,
+            self.scale,
+            q_meta.clone(),
+            k_meta.clone(),
+            v_meta.clone(),
+            mask_meta.as_ref(),
+            output_meta.clone(),
+        );
+        let variant = if decode_meta.is_some() {
+            FlashAttentionKernelVariant::DecodeSmall
+        } else {
+            FlashAttentionKernelVariant::Streaming
+        };
+        let dispatch_size = match variant {
+            FlashAttentionKernelVariant::Streaming => {
+                self.dispatch_size(&WorkgroupShape::new(1, 1, 1), inputs)
+            }
+            FlashAttentionKernelVariant::DecodeSmall => [
+                dims.batch
+                    .checked_mul(dims.num_heads)
+                    .expect("flash decode dispatch overflow"),
+                1,
+                1,
+            ],
+        };
+        if dispatch_size
+            .iter()
+            .any(|dim| *dim > device.limits().max_compute_workgroups_per_dimension)
+        {
+            return None;
+        }
+
         let module_key = flash_attention_module_key(
+            variant,
             dims,
             self.scale.to_bits(),
             dispatch_size,
@@ -264,8 +308,12 @@ impl Operation for FlashAttentionOperation {
             mask.as_ref(),
             &output,
         );
+        let kernel_label = match variant {
+            FlashAttentionKernelVariant::Streaming => "flash_attention",
+            FlashAttentionKernelVariant::DecodeSmall => "flash_attention_decode",
+        };
         let cache_key = format!(
-            "flash_attention:{:016x}{:016x}",
+            "{kernel_label}:{:016x}{:016x}",
             module_key[0], module_key[1]
         );
         let module = if let Some(module) = flash_attention_module_cache().write().get(&module_key) {
@@ -281,31 +329,30 @@ impl Operation for FlashAttentionOperation {
                 mask.as_ref().map(|mask| mask.layout()),
                 output.layout()
             );
-            let module = if let Some(module) = graph
-                .device()
-                .naga_module_cache()
-                .write()
-                .get(&verbose_cache_key)
-            {
-                Arc::new(module.clone())
-            } else {
-                let module = build_flash_attention_naga_module(
-                    dims,
-                    self.scale,
-                    q_meta,
-                    k_meta,
-                    v_meta,
-                    mask_meta,
-                    output_meta,
-                    dispatch_size,
-                )?;
-                let _ = graph
-                    .device()
-                    .naga_module_cache()
-                    .write()
-                    .get_or_insert(verbose_cache_key, || module.clone());
-                Arc::new(module)
-            };
+            let module =
+                if let Some(module) = device.naga_module_cache().write().get(&verbose_cache_key) {
+                    Arc::new(module.clone())
+                } else {
+                    let module = if let Some(meta) = decode_meta {
+                        build_flash_decode_small_naga_module(meta)?
+                    } else {
+                        build_flash_attention_naga_module(
+                            dims,
+                            self.scale,
+                            q_meta,
+                            k_meta,
+                            v_meta,
+                            mask_meta,
+                            output_meta,
+                            dispatch_size,
+                        )?
+                    };
+                    let _ = device
+                        .naga_module_cache()
+                        .write()
+                        .get_or_insert(verbose_cache_key, || module.clone());
+                    Arc::new(module)
+                };
             flash_attention_module_cache()
                 .write()
                 .get_or_insert(module_key, || module.clone())
@@ -343,7 +390,7 @@ impl Operation for FlashAttentionOperation {
         });
 
         Some(DirectKernel::new_with_arc_module(
-            "flash_attention",
+            kernel_label,
             cache_key,
             module,
             bindings,
@@ -468,6 +515,862 @@ struct FlashAttentionNagaMeta {
     v_strides: [u32; 4],
     mask_strides: Option<[u32; 2]>,
     output_strides: [u32; 4],
+}
+
+#[derive(Clone, Copy)]
+struct FlashDecodeSmallMeta {
+    dims: FlashAttentionDims,
+    scale: f32,
+    groups: u32,
+    q_offset: u32,
+    k_offset: u32,
+    v_offset: u32,
+    output_offset: u32,
+    q_strides: [u32; 4],
+    k_strides: [u32; 4],
+    v_strides: [u32; 4],
+    output_strides: [u32; 4],
+}
+
+fn build_flash_decode_small_meta(
+    dims: FlashAttentionDims,
+    scale: f32,
+    q_meta: TensorMeta,
+    k_meta: TensorMeta,
+    v_meta: TensorMeta,
+    mask_meta: Option<&TensorMeta>,
+    output_meta: TensorMeta,
+) -> Option<FlashDecodeSmallMeta> {
+    if mask_meta.is_some()
+        || dims.q_seq_len != 1
+        || dims.head_dim != DECODE_HEAD_DIM
+        || dims.kv_seq_len == 0
+        || dims.kv_seq_len > DECODE_BLOCK
+    {
+        return None;
+    }
+
+    let groups = dims.num_heads.checked_div(dims.num_kv_heads)?;
+    if groups == 0 {
+        return None;
+    }
+
+    Some(FlashDecodeSmallMeta {
+        dims,
+        scale,
+        groups,
+        q_offset: q_meta.offset,
+        k_offset: k_meta.offset,
+        v_offset: v_meta.offset,
+        output_offset: output_meta.offset,
+        q_strides: q_meta.stride4()?,
+        k_strides: k_meta.stride4()?,
+        v_strides: v_meta.stride4()?,
+        output_strides: output_meta.stride4()?,
+    })
+}
+
+#[derive(Clone, Copy)]
+struct FlashDecodeSmallGlobals {
+    q: Handle<GlobalVariable>,
+    k: Handle<GlobalVariable>,
+    v: Handle<GlobalVariable>,
+    output: Handle<GlobalVariable>,
+    scores: Handle<GlobalVariable>,
+    probs: Handle<GlobalVariable>,
+    reduce: Handle<GlobalVariable>,
+}
+
+#[derive(Clone, Copy)]
+struct FlashDecodeSmallLocals {
+    acc: Handle<LocalVariable>,
+    kv: Handle<LocalVariable>,
+}
+
+struct FlashDecodeSmallNagaBuilder {
+    meta: FlashDecodeSmallMeta,
+}
+
+impl FlashDecodeSmallNagaBuilder {
+    fn new(meta: FlashDecodeSmallMeta) -> Self {
+        Self { meta }
+    }
+
+    fn build(self) -> Option<Module> {
+        let mut module = Module::default();
+        let f32_ty = module.types.insert(
+            Type {
+                name: Some("FlashDecodeF32".into()),
+                inner: TypeInner::Scalar(Scalar::F32),
+            },
+            Span::default(),
+        );
+        let u32_ty = module.types.insert(
+            Type {
+                name: Some("FlashDecodeU32".into()),
+                inner: TypeInner::Scalar(Scalar::U32),
+            },
+            Span::default(),
+        );
+        let u32_vec3_ty = module.types.insert(
+            Type {
+                name: Some("FlashDecodeWorkgroupId".into()),
+                inner: TypeInner::Vector {
+                    size: VectorSize::Tri,
+                    scalar: Scalar::U32,
+                },
+            },
+            Span::default(),
+        );
+        let storage_ty = module.types.insert(
+            Type {
+                name: Some("FlashDecodeBuffer".into()),
+                inner: TypeInner::Array {
+                    base: f32_ty,
+                    size: ArraySize::Dynamic,
+                    stride: 4,
+                },
+            },
+            Span::default(),
+        );
+        let scratch_ty = module.types.insert(
+            Type {
+                name: Some("FlashDecodeScratch".into()),
+                inner: TypeInner::Array {
+                    base: f32_ty,
+                    size: ArraySize::Constant(NonZeroU32::new(DECODE_BLOCK)?),
+                    stride: 4,
+                },
+            },
+            Span::default(),
+        );
+
+        let q = Self::storage_global(&mut module, "q", 0, storage_ty, true);
+        let k = Self::storage_global(&mut module, "k", 1, storage_ty, true);
+        let v = Self::storage_global(&mut module, "v", 2, storage_ty, true);
+        let output = Self::storage_global(&mut module, "output", 3, storage_ty, false);
+        let scores = Self::workgroup_global(&mut module, "scores", scratch_ty);
+        let probs = Self::workgroup_global(&mut module, "probs", scratch_ty);
+        let reduce = Self::workgroup_global(&mut module, "reduce", scratch_ty);
+        let globals = FlashDecodeSmallGlobals {
+            q,
+            k,
+            v,
+            output,
+            scores,
+            probs,
+            reduce,
+        };
+
+        let mut function = Function {
+            name: Some("main".into()),
+            arguments: vec![
+                FunctionArgument {
+                    name: Some("local_invocation_index".into()),
+                    ty: u32_ty,
+                    binding: Some(Binding::BuiltIn(BuiltIn::LocalInvocationIndex)),
+                },
+                FunctionArgument {
+                    name: Some("workgroup_id".into()),
+                    ty: u32_vec3_ty,
+                    binding: Some(Binding::BuiltIn(BuiltIn::WorkGroupId)),
+                },
+            ],
+            ..Function::default()
+        };
+        let locals = FlashDecodeSmallLocals {
+            acc: Self::local(&mut function, "acc", f32_ty),
+            kv: Self::local(&mut function, "kv", u32_ty),
+        };
+
+        function.body = self.entry_body(&mut function.expressions, globals, locals);
+        function
+            .body
+            .push(Statement::Return { value: None }, Span::default());
+        module.entry_points.push(EntryPoint {
+            name: "main".into(),
+            stage: ShaderStage::Compute,
+            early_depth_test: None,
+            workgroup_size: [DECODE_BLOCK, 1, 1],
+            workgroup_size_overrides: None,
+            function,
+            mesh_info: None,
+            task_payload: None,
+            incoming_ray_payload: None,
+        });
+
+        Some(module)
+    }
+
+    fn entry_body(
+        &self,
+        expressions: &mut Arena<Expression>,
+        globals: FlashDecodeSmallGlobals,
+        locals: FlashDecodeSmallLocals,
+    ) -> Block {
+        let mut body = Block::new();
+        let local = expressions.append(Expression::FunctionArgument(0), Span::default());
+        let workgroup_id = expressions.append(Expression::FunctionArgument(1), Span::default());
+        let row = self.emit(
+            expressions,
+            &mut body,
+            Expression::AccessIndex {
+                base: workgroup_id,
+                index: 0,
+            },
+        );
+        let head_idx = self.rem_lit(expressions, &mut body, row, self.meta.dims.num_heads);
+        let batch_idx = self.div_lit(expressions, &mut body, row, self.meta.dims.num_heads);
+        let kv_head_idx = self.div_lit(expressions, &mut body, head_idx, self.meta.groups);
+        let kv_valid = self.lt_lit(expressions, &mut body, local, self.meta.dims.kv_seq_len);
+
+        let min_score = self.f32_lit(expressions, FLOAT_MIN);
+        self.store_workgroup(expressions, &mut body, globals.scores, local, min_score);
+        self.store_workgroup(expressions, &mut body, globals.reduce, local, min_score);
+
+        let mut score_accept = Block::new();
+        let zero = self.f32_lit(expressions, 0.0);
+        let mut score = zero;
+        for dim in 0..DECODE_HEAD_DIM {
+            let q_index = self.index4_const_last(
+                expressions,
+                &mut score_accept,
+                self.meta.q_offset,
+                self.meta.q_strides,
+                batch_idx,
+                head_idx,
+                0,
+                dim,
+            );
+            let k_index = self.index4_const_last_dyn_i2(
+                expressions,
+                &mut score_accept,
+                self.meta.k_offset,
+                self.meta.k_strides,
+                batch_idx,
+                kv_head_idx,
+                local,
+                dim,
+            );
+            let q_value = self.load_storage(expressions, &mut score_accept, globals.q, q_index);
+            let k_value = self.load_storage(expressions, &mut score_accept, globals.k, k_index);
+            let product = self.bin(
+                expressions,
+                &mut score_accept,
+                BinaryOperator::Multiply,
+                q_value,
+                k_value,
+            );
+            score = self.bin(
+                expressions,
+                &mut score_accept,
+                BinaryOperator::Add,
+                score,
+                product,
+            );
+        }
+        let scale = self.f32_lit(expressions, self.meta.scale);
+        score = self.bin(
+            expressions,
+            &mut score_accept,
+            BinaryOperator::Multiply,
+            score,
+            scale,
+        );
+        self.store_workgroup(expressions, &mut score_accept, globals.scores, local, score);
+        self.store_workgroup(expressions, &mut score_accept, globals.reduce, local, score);
+        body.push(
+            Statement::If {
+                condition: kv_valid,
+                accept: score_accept,
+                reject: Block::new(),
+            },
+            Span::default(),
+        );
+        body.push(
+            Statement::ControlBarrier(Barrier::WORK_GROUP),
+            Span::default(),
+        );
+
+        self.reduce_workgroup(
+            expressions,
+            &mut body,
+            globals.reduce,
+            local,
+            FlashReduceOp::Max,
+        );
+        let zero_index = self.u32_lit(expressions, 0);
+        let max_score = self.load_workgroup(expressions, &mut body, globals.reduce, zero_index);
+        let score_value = self.load_workgroup(expressions, &mut body, globals.scores, local);
+        let shifted = self.bin(
+            expressions,
+            &mut body,
+            BinaryOperator::Subtract,
+            score_value,
+            max_score,
+        );
+        let raw_prob = self.exp_f32(expressions, &mut body, shifted);
+        let prob = self.select(expressions, &mut body, kv_valid, raw_prob, zero);
+        self.store_workgroup(expressions, &mut body, globals.probs, local, prob);
+        self.store_workgroup(expressions, &mut body, globals.reduce, local, prob);
+        body.push(
+            Statement::ControlBarrier(Barrier::WORK_GROUP),
+            Span::default(),
+        );
+
+        self.reduce_workgroup(
+            expressions,
+            &mut body,
+            globals.reduce,
+            local,
+            FlashReduceOp::Sum,
+        );
+        let denom = self.load_workgroup(expressions, &mut body, globals.reduce, zero_index);
+        let mut normalize_accept = Block::new();
+        let prob = self.load_workgroup(expressions, &mut normalize_accept, globals.probs, local);
+        let prob = self.bin(
+            expressions,
+            &mut normalize_accept,
+            BinaryOperator::Divide,
+            prob,
+            denom,
+        );
+        self.store_workgroup(
+            expressions,
+            &mut normalize_accept,
+            globals.probs,
+            local,
+            prob,
+        );
+        body.push(
+            Statement::If {
+                condition: kv_valid,
+                accept: normalize_accept,
+                reject: Block::new(),
+            },
+            Span::default(),
+        );
+        body.push(
+            Statement::ControlBarrier(Barrier::WORK_GROUP),
+            Span::default(),
+        );
+
+        let out_valid = self.lt_lit(expressions, &mut body, local, DECODE_HEAD_DIM);
+        let mut store_accept = Block::new();
+        self.store_local(expressions, &mut store_accept, locals.acc, zero);
+        let zero_u32 = self.u32_lit(expressions, 0);
+        self.store_local(expressions, &mut store_accept, locals.kv, zero_u32);
+        self.append_output_loop(
+            expressions,
+            &mut store_accept,
+            globals,
+            locals,
+            batch_idx,
+            head_idx,
+            kv_head_idx,
+            local,
+        );
+        body.push(
+            Statement::If {
+                condition: out_valid,
+                accept: store_accept,
+                reject: Block::new(),
+            },
+            Span::default(),
+        );
+
+        body
+    }
+
+    fn append_output_loop(
+        &self,
+        expressions: &mut Arena<Expression>,
+        body: &mut Block,
+        globals: FlashDecodeSmallGlobals,
+        locals: FlashDecodeSmallLocals,
+        batch_idx: Handle<Expression>,
+        head_idx: Handle<Expression>,
+        kv_head_idx: Handle<Expression>,
+        out_dim: Handle<Expression>,
+    ) {
+        let mut loop_body = Block::new();
+        let kv = self.load_local(expressions, &mut loop_body, locals.kv);
+        let done = self.ge_lit(expressions, &mut loop_body, kv, self.meta.dims.kv_seq_len);
+        loop_body.push(
+            Statement::If {
+                condition: done,
+                accept: Block::from_vec(vec![Statement::Break]),
+                reject: Block::new(),
+            },
+            Span::default(),
+        );
+        let prob = self.load_workgroup(expressions, &mut loop_body, globals.probs, kv);
+        let v_index = self.index4_dyn_last(
+            expressions,
+            &mut loop_body,
+            self.meta.v_offset,
+            self.meta.v_strides,
+            batch_idx,
+            kv_head_idx,
+            kv,
+            out_dim,
+        );
+        let v_value = self.load_storage(expressions, &mut loop_body, globals.v, v_index);
+        let weighted = self.bin(
+            expressions,
+            &mut loop_body,
+            BinaryOperator::Multiply,
+            prob,
+            v_value,
+        );
+        let acc = self.load_local(expressions, &mut loop_body, locals.acc);
+        let acc = self.bin(
+            expressions,
+            &mut loop_body,
+            BinaryOperator::Add,
+            acc,
+            weighted,
+        );
+        self.store_local(expressions, &mut loop_body, locals.acc, acc);
+        let next_kv = self.add_lit(expressions, &mut loop_body, kv, 1);
+        self.store_local(expressions, &mut loop_body, locals.kv, next_kv);
+        body.push(
+            Statement::Loop {
+                body: loop_body,
+                continuing: Block::new(),
+                break_if: None,
+            },
+            Span::default(),
+        );
+
+        let output_value = self.load_local(expressions, body, locals.acc);
+        let q_idx = self.u32_lit(expressions, 0);
+        let output_index = self.index4_dyn_last(
+            expressions,
+            body,
+            self.meta.output_offset,
+            self.meta.output_strides,
+            batch_idx,
+            head_idx,
+            q_idx,
+            out_dim,
+        );
+        self.store_storage(
+            expressions,
+            body,
+            globals.output,
+            output_index,
+            output_value,
+        );
+    }
+
+    fn reduce_workgroup(
+        &self,
+        expressions: &mut Arena<Expression>,
+        body: &mut Block,
+        scratch: Handle<GlobalVariable>,
+        local: Handle<Expression>,
+        op: FlashReduceOp,
+    ) {
+        let mut stride = DECODE_BLOCK / 2;
+        while stride > 0 {
+            let participates = self.lt_lit(expressions, body, local, stride);
+            let mut accept = Block::new();
+            let left = self.load_workgroup(expressions, &mut accept, scratch, local);
+            let rhs_index = self.add_lit(expressions, &mut accept, local, stride);
+            let right = self.load_workgroup(expressions, &mut accept, scratch, rhs_index);
+            let reduced = match op {
+                FlashReduceOp::Sum => {
+                    self.bin(expressions, &mut accept, BinaryOperator::Add, left, right)
+                }
+                FlashReduceOp::Max => self.max_f32(expressions, &mut accept, left, right),
+            };
+            self.store_workgroup(expressions, &mut accept, scratch, local, reduced);
+            body.push(
+                Statement::If {
+                    condition: participates,
+                    accept,
+                    reject: Block::new(),
+                },
+                Span::default(),
+            );
+            body.push(
+                Statement::ControlBarrier(Barrier::WORK_GROUP),
+                Span::default(),
+            );
+            stride /= 2;
+        }
+    }
+
+    fn index4_const_last(
+        &self,
+        expressions: &mut Arena<Expression>,
+        body: &mut Block,
+        offset: u32,
+        strides: [u32; 4],
+        i0: Handle<Expression>,
+        i1: Handle<Expression>,
+        i2: u32,
+        i3: u32,
+    ) -> Handle<Expression> {
+        let base = offset + i2 * strides[2] + i3 * strides[3];
+        self.index2_with_base(expressions, body, base, [strides[0], strides[1]], i0, i1)
+    }
+
+    fn index4_const_last_dyn_i2(
+        &self,
+        expressions: &mut Arena<Expression>,
+        body: &mut Block,
+        offset: u32,
+        strides: [u32; 4],
+        i0: Handle<Expression>,
+        i1: Handle<Expression>,
+        i2: Handle<Expression>,
+        i3: u32,
+    ) -> Handle<Expression> {
+        let base = offset + i3 * strides[3];
+        let index =
+            self.index2_with_base(expressions, body, base, [strides[0], strides[1]], i0, i1);
+        self.add_scaled_index(expressions, body, index, i2, strides[2])
+    }
+
+    fn index4_dyn_last(
+        &self,
+        expressions: &mut Arena<Expression>,
+        body: &mut Block,
+        offset: u32,
+        strides: [u32; 4],
+        i0: Handle<Expression>,
+        i1: Handle<Expression>,
+        i2: Handle<Expression>,
+        i3: Handle<Expression>,
+    ) -> Handle<Expression> {
+        let index =
+            self.index2_with_base(expressions, body, offset, [strides[0], strides[1]], i0, i1);
+        let index = self.add_scaled_index(expressions, body, index, i2, strides[2]);
+        self.add_scaled_index(expressions, body, index, i3, strides[3])
+    }
+
+    fn index2_with_base(
+        &self,
+        expressions: &mut Arena<Expression>,
+        body: &mut Block,
+        base: u32,
+        strides: [u32; 2],
+        i0: Handle<Expression>,
+        i1: Handle<Expression>,
+    ) -> Handle<Expression> {
+        let base = self.u32_lit(expressions, base);
+        let index = self.add_scaled_index(expressions, body, base, i0, strides[0]);
+        self.add_scaled_index(expressions, body, index, i1, strides[1])
+    }
+
+    fn add_scaled_index(
+        &self,
+        expressions: &mut Arena<Expression>,
+        body: &mut Block,
+        index: Handle<Expression>,
+        component: Handle<Expression>,
+        stride: u32,
+    ) -> Handle<Expression> {
+        if stride == 0 {
+            return index;
+        }
+        let term = self.mul_lit(expressions, body, component, stride);
+        self.bin(expressions, body, BinaryOperator::Add, index, term)
+    }
+
+    fn load_storage(
+        &self,
+        expressions: &mut Arena<Expression>,
+        body: &mut Block,
+        global: Handle<GlobalVariable>,
+        index: Handle<Expression>,
+    ) -> Handle<Expression> {
+        let ptr = self.ptr(expressions, body, global, index);
+        self.emit(expressions, body, Expression::Load { pointer: ptr })
+    }
+
+    fn store_storage(
+        &self,
+        expressions: &mut Arena<Expression>,
+        body: &mut Block,
+        global: Handle<GlobalVariable>,
+        index: Handle<Expression>,
+        value: Handle<Expression>,
+    ) {
+        let pointer = self.ptr(expressions, body, global, index);
+        body.push(Statement::Store { pointer, value }, Span::default());
+    }
+
+    fn load_workgroup(
+        &self,
+        expressions: &mut Arena<Expression>,
+        body: &mut Block,
+        global: Handle<GlobalVariable>,
+        index: Handle<Expression>,
+    ) -> Handle<Expression> {
+        let ptr = self.ptr(expressions, body, global, index);
+        self.emit(expressions, body, Expression::Load { pointer: ptr })
+    }
+
+    fn store_workgroup(
+        &self,
+        expressions: &mut Arena<Expression>,
+        body: &mut Block,
+        global: Handle<GlobalVariable>,
+        index: Handle<Expression>,
+        value: Handle<Expression>,
+    ) {
+        let pointer = self.ptr(expressions, body, global, index);
+        body.push(Statement::Store { pointer, value }, Span::default());
+    }
+
+    fn ptr(
+        &self,
+        expressions: &mut Arena<Expression>,
+        body: &mut Block,
+        global: Handle<GlobalVariable>,
+        index: Handle<Expression>,
+    ) -> Handle<Expression> {
+        let base = expressions.append(Expression::GlobalVariable(global), Span::default());
+        self.emit(expressions, body, Expression::Access { base, index })
+    }
+
+    fn load_local(
+        &self,
+        expressions: &mut Arena<Expression>,
+        body: &mut Block,
+        local: Handle<LocalVariable>,
+    ) -> Handle<Expression> {
+        let pointer = expressions.append(Expression::LocalVariable(local), Span::default());
+        self.emit(expressions, body, Expression::Load { pointer })
+    }
+
+    fn store_local(
+        &self,
+        expressions: &mut Arena<Expression>,
+        body: &mut Block,
+        local: Handle<LocalVariable>,
+        value: Handle<Expression>,
+    ) {
+        let pointer = expressions.append(Expression::LocalVariable(local), Span::default());
+        body.push(Statement::Store { pointer, value }, Span::default());
+    }
+
+    fn exp_f32(
+        &self,
+        expressions: &mut Arena<Expression>,
+        body: &mut Block,
+        value: Handle<Expression>,
+    ) -> Handle<Expression> {
+        self.emit(
+            expressions,
+            body,
+            Expression::Math {
+                fun: MathFunction::Exp,
+                arg: value,
+                arg1: None,
+                arg2: None,
+                arg3: None,
+            },
+        )
+    }
+
+    fn max_f32(
+        &self,
+        expressions: &mut Arena<Expression>,
+        body: &mut Block,
+        left: Handle<Expression>,
+        right: Handle<Expression>,
+    ) -> Handle<Expression> {
+        self.emit(
+            expressions,
+            body,
+            Expression::Math {
+                fun: MathFunction::Max,
+                arg: left,
+                arg1: Some(right),
+                arg2: None,
+                arg3: None,
+            },
+        )
+    }
+
+    fn select(
+        &self,
+        expressions: &mut Arena<Expression>,
+        body: &mut Block,
+        condition: Handle<Expression>,
+        accept: Handle<Expression>,
+        reject: Handle<Expression>,
+    ) -> Handle<Expression> {
+        self.emit(
+            expressions,
+            body,
+            Expression::Select {
+                condition,
+                accept,
+                reject,
+            },
+        )
+    }
+
+    fn bin(
+        &self,
+        expressions: &mut Arena<Expression>,
+        body: &mut Block,
+        op: BinaryOperator,
+        left: Handle<Expression>,
+        right: Handle<Expression>,
+    ) -> Handle<Expression> {
+        self.emit(expressions, body, Expression::Binary { op, left, right })
+    }
+
+    fn lt_lit(
+        &self,
+        expressions: &mut Arena<Expression>,
+        body: &mut Block,
+        value: Handle<Expression>,
+        literal: u32,
+    ) -> Handle<Expression> {
+        let rhs = self.u32_lit(expressions, literal);
+        self.bin(expressions, body, BinaryOperator::Less, value, rhs)
+    }
+
+    fn ge_lit(
+        &self,
+        expressions: &mut Arena<Expression>,
+        body: &mut Block,
+        value: Handle<Expression>,
+        literal: u32,
+    ) -> Handle<Expression> {
+        let rhs = self.u32_lit(expressions, literal);
+        self.bin(expressions, body, BinaryOperator::GreaterEqual, value, rhs)
+    }
+
+    fn div_lit(
+        &self,
+        expressions: &mut Arena<Expression>,
+        body: &mut Block,
+        value: Handle<Expression>,
+        literal: u32,
+    ) -> Handle<Expression> {
+        let rhs = self.u32_lit(expressions, literal);
+        self.bin(expressions, body, BinaryOperator::Divide, value, rhs)
+    }
+
+    fn rem_lit(
+        &self,
+        expressions: &mut Arena<Expression>,
+        body: &mut Block,
+        value: Handle<Expression>,
+        literal: u32,
+    ) -> Handle<Expression> {
+        let rhs = self.u32_lit(expressions, literal);
+        self.bin(expressions, body, BinaryOperator::Modulo, value, rhs)
+    }
+
+    fn add_lit(
+        &self,
+        expressions: &mut Arena<Expression>,
+        body: &mut Block,
+        value: Handle<Expression>,
+        literal: u32,
+    ) -> Handle<Expression> {
+        let rhs = self.u32_lit(expressions, literal);
+        self.bin(expressions, body, BinaryOperator::Add, value, rhs)
+    }
+
+    fn mul_lit(
+        &self,
+        expressions: &mut Arena<Expression>,
+        body: &mut Block,
+        value: Handle<Expression>,
+        literal: u32,
+    ) -> Handle<Expression> {
+        let rhs = self.u32_lit(expressions, literal);
+        self.bin(expressions, body, BinaryOperator::Multiply, value, rhs)
+    }
+
+    fn emit(
+        &self,
+        expressions: &mut Arena<Expression>,
+        body: &mut Block,
+        expression: Expression,
+    ) -> Handle<Expression> {
+        let handle = expressions.append(expression, Span::default());
+        body.push(
+            Statement::Emit(Range::new_from_bounds(handle, handle)),
+            Span::default(),
+        );
+        handle
+    }
+
+    fn f32_lit(&self, expressions: &mut Arena<Expression>, value: f32) -> Handle<Expression> {
+        expressions.append(Expression::Literal(Literal::F32(value)), Span::default())
+    }
+
+    fn u32_lit(&self, expressions: &mut Arena<Expression>, value: u32) -> Handle<Expression> {
+        expressions.append(Expression::Literal(Literal::U32(value)), Span::default())
+    }
+
+    fn storage_global(
+        module: &mut Module,
+        name: &str,
+        binding: u32,
+        ty: Handle<Type>,
+        read_only: bool,
+    ) -> Handle<GlobalVariable> {
+        module.global_variables.append(
+            GlobalVariable {
+                name: Some(name.into()),
+                space: AddressSpace::Storage {
+                    access: if read_only {
+                        StorageAccess::LOAD
+                    } else {
+                        StorageAccess::LOAD | StorageAccess::STORE
+                    },
+                },
+                binding: Some(ResourceBinding { group: 0, binding }),
+                ty,
+                init: None,
+            },
+            Span::default(),
+        )
+    }
+
+    fn workgroup_global(
+        module: &mut Module,
+        name: &str,
+        ty: Handle<Type>,
+    ) -> Handle<GlobalVariable> {
+        module.global_variables.append(
+            GlobalVariable {
+                name: Some(name.into()),
+                space: AddressSpace::WorkGroup,
+                binding: None,
+                ty,
+                init: None,
+            },
+            Span::default(),
+        )
+    }
+
+    fn local(function: &mut Function, name: &str, ty: Handle<Type>) -> Handle<LocalVariable> {
+        function.local_variables.append(
+            LocalVariable {
+                name: Some(name.into()),
+                ty,
+                init: None,
+            },
+            Span::default(),
+        )
+    }
+}
+
+fn build_flash_decode_small_naga_module(meta: FlashDecodeSmallMeta) -> Option<Module> {
+    FlashDecodeSmallNagaBuilder::new(meta).build()
 }
 
 struct FlashAttentionNagaBuilder {
@@ -607,7 +1510,7 @@ impl FlashAttentionNagaBuilder {
             o: Self::local(&mut function, "o", f32_ty),
         };
 
-        function.body = self.entry_body(&mut function.expressions, globals, locals);
+        function.body = self.entry_body(&mut function.expressions, globals, locals, f32_ty);
         function
             .body
             .push(Statement::Return { value: None }, Span::default());
@@ -667,6 +1570,7 @@ impl FlashAttentionNagaBuilder {
         expressions: &mut Arena<Expression>,
         globals: FlashAttentionGlobals,
         locals: FlashAttentionLocals,
+        f32_ty: Handle<Type>,
     ) -> Block {
         let mut body = Block::new();
         let lane = expressions.append(Expression::FunctionArgument(0), Span::default());
@@ -728,6 +1632,7 @@ impl FlashAttentionNagaBuilder {
             &mut body,
             globals,
             locals,
+            f32_ty,
             FlashAttentionIndices {
                 lane,
                 kv_lane,
@@ -793,6 +1698,7 @@ impl FlashAttentionNagaBuilder {
         body: &mut Block,
         globals: FlashAttentionGlobals,
         locals: FlashAttentionLocals,
+        f32_ty: Handle<Type>,
         indices: FlashAttentionIndices,
     ) {
         let kv_chunks = self.meta.dims.kv_seq_len.div_ceil(SIMD_WIDTH as u32);
@@ -911,6 +1817,7 @@ impl FlashAttentionNagaBuilder {
             indices.lane,
             score,
             FlashReduceOp::Max,
+            f32_ty,
         );
         let old_m = self.load_local(expressions, &mut loop_body, locals.m);
         let new_m = self.max_f32(expressions, &mut loop_body, old_m, block_max);
@@ -931,6 +1838,7 @@ impl FlashAttentionNagaBuilder {
             indices.lane,
             exp_score,
             FlashReduceOp::Sum,
+            f32_ty,
         );
 
         let zero_weighted = self.f32_lit(expressions, 0.0);
@@ -978,6 +1886,7 @@ impl FlashAttentionNagaBuilder {
             indices.lane,
             weighted,
             FlashReduceOp::Sum,
+            f32_ty,
         );
 
         let m_shift = self.bin(
@@ -1039,64 +1948,27 @@ impl FlashAttentionNagaBuilder {
         &self,
         expressions: &mut Arena<Expression>,
         body: &mut Block,
-        scratch: Handle<GlobalVariable>,
-        lane: Handle<Expression>,
+        _scratch: Handle<GlobalVariable>,
+        _lane: Handle<Expression>,
         value: Handle<Expression>,
         op: FlashReduceOp,
+        result_ty: Handle<Type>,
     ) -> Handle<Expression> {
-        self.store_storage(expressions, body, scratch, lane, value);
-        body.push(
-            Statement::ControlBarrier(Barrier::WORK_GROUP),
+        let subgroup_op = match op {
+            FlashReduceOp::Sum => SubgroupOperation::Add,
+            FlashReduceOp::Max => SubgroupOperation::Max,
+        };
+        let result = expressions.append(
+            Expression::SubgroupOperationResult { ty: result_ty },
             Span::default(),
         );
-        let group_offset = self.rem_lit(expressions, body, lane, SIMD_WIDTH as u32);
-        let group_base = self.bin(
-            expressions,
-            body,
-            BinaryOperator::Subtract,
-            lane,
-            group_offset,
-        );
-
-        let mut stride = SIMD_WIDTH as u32 / 2;
-        while stride > 0 {
-            let participates = self.lt_lit(expressions, body, group_offset, stride);
-            let mut accept = Block::new();
-            let lhs = self.load_storage(expressions, &mut accept, scratch, lane);
-            let stride_lit = self.u32_lit(expressions, stride);
-            let rhs_index = self.bin(
-                expressions,
-                &mut accept,
-                BinaryOperator::Add,
-                lane,
-                stride_lit,
-            );
-            let rhs = self.load_storage(expressions, &mut accept, scratch, rhs_index);
-            let reduced = match op {
-                FlashReduceOp::Sum => {
-                    self.bin(expressions, &mut accept, BinaryOperator::Add, lhs, rhs)
-                }
-                FlashReduceOp::Max => self.max_f32(expressions, &mut accept, lhs, rhs),
-            };
-            self.store_storage(expressions, &mut accept, scratch, lane, reduced);
-            body.push(
-                Statement::If {
-                    condition: participates,
-                    accept,
-                    reject: Block::new(),
-                },
-                Span::default(),
-            );
-            body.push(
-                Statement::ControlBarrier(Barrier::WORK_GROUP),
-                Span::default(),
-            );
-            stride /= 2;
-        }
-
-        let result = self.load_storage(expressions, body, scratch, group_base);
         body.push(
-            Statement::ControlBarrier(Barrier::WORK_GROUP),
+            Statement::SubgroupCollectiveOperation {
+                op: subgroup_op,
+                collective_op: CollectiveOperation::Reduce,
+                argument: value,
+                result,
+            },
             Span::default(),
         );
         result

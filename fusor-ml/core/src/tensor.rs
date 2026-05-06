@@ -1214,11 +1214,11 @@ impl Tensor<1, f32> {
         params: crate::top_k::GpuMirostat2SamplerParams,
     ) -> Result<u32, wgpu::BufferAsyncError> {
         let (input, _) = self.data.materialize();
-        if let Some(output) =
-            crate::top_k::mirostat2_sample_token_data(&input, sampler, previous_tokens, params)
+        if let Some(token) =
+            crate::top_k::mirostat2_sample_token_to_host(&input, sampler, previous_tokens, params)
+                .await?
         {
-            let token = Tensor::<1, u32>::as_slice_from_tensor_data(&output).await?;
-            return Ok(token.as_slice().first().copied().unwrap_or_default());
+            return Ok(token);
         }
 
         let (ids, _) = self.top_k_pairs(params.top_k).await?;
