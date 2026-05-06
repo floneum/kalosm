@@ -277,8 +277,14 @@ impl Program {
                 return self.qgemv_perf::<4, 4, 8, 128>(a, b, y, workgroups_x);
             }
             GgmlQuantFormat::Q4K => {
-                if b.rows <= 4096 && b.cols >= 16_384 {
-                    return self.qgemv_perf::<8, 8, 8, 256>(a, b, y, workgroups_x);
+                if b.rows <= 4096 && b.cols <= 4096 {
+                    return self.qgemv_perf::<8, 4, 16, 256>(a, b, y, workgroups_x);
+                }
+                if b.rows <= 4096 && b.cols >= 8192 {
+                    return self.qgemv_perf::<4, 8, 32, 128>(a, b, y, workgroups_x);
+                }
+                if b.rows > 4096 && b.cols <= 4096 {
+                    return self.qgemv_perf::<8, 4, 16, 256>(a, b, y, workgroups_x);
                 }
                 if b.format
                     .qgemv_subgroups_per_workgroup_for_shape(b.rows, b.cols)
@@ -304,8 +310,8 @@ impl Program {
                 return self.qgemv_perf::<2, 1, 8, 64>(a, b, y, workgroups_x);
             }
             GgmlQuantFormat::Q6K => {
-                if b.rows <= 4096 && b.cols >= 65_536 {
-                    return self.qgemv_perf::<4, 4, 8, 128>(a, b, y, workgroups_x);
+                if b.rows <= 4096 && b.cols >= 8192 {
+                    return self.qgemv_perf::<4, 8, 8, 128>(a, b, y, workgroups_x);
                 }
                 if b.rows > 4096 && b.cols <= 4096 {
                     return self.qgemv_perf::<8, 4, 8, 256>(a, b, y, workgroups_x);
@@ -335,7 +341,7 @@ impl Program {
     ) {
         const SUBGROUP_SIZE: u32 = 32;
         debug_assert_eq!(SUBGROUPS * SUBGROUP_SIZE, BLOCK as u32);
-        debug_assert!(VALUES_PER_LANE == 8 || VALUES_PER_LANE == 16);
+        debug_assert!(VALUES_PER_LANE == 8 || VALUES_PER_LANE == 16 || VALUES_PER_LANE == 32);
         debug_assert!(
             COLS_PER_SUBGROUP == 1
                 || COLS_PER_SUBGROUP == 2
@@ -398,11 +404,13 @@ impl Program {
                                 );
                             }
                             if b_cloned.format == GgmlQuantFormat::Q4K
-                                && (VALUES_PER_LANE == 8 || VALUES_PER_LANE == 16)
+                                && (VALUES_PER_LANE == 8
+                                    || VALUES_PER_LANE == 16
+                                    || VALUES_PER_LANE == 32)
                             {
                                 let a_vec: [Tile<BLOCK>; VALUES_PER_LANE] =
                                     std::array::from_fn(|i| a_pins[i].get());
-                                return program.quantized_q8_activation_dot::<VALUES_PER_LANE>(
+                                return program.quantized_q4k_f32_dot::<VALUES_PER_LANE>(
                                     a_vec, &b_cloned, &k_base, &col, mask, 0.0,
                                 );
                             }
@@ -1378,6 +1386,32 @@ impl<const BLOCK: usize> TileBlock<'_, BLOCK> {
         );
         Tile {
             expr: TileExpr::QuantizedQ8ActivationDot {
+                a: a.into_iter().map(|value| Box::new(value.expr)).collect(),
+                src: matrix.clone(),
+                k_base: k_base.into_index(),
+                col: col.into_index(),
+                mask: mask.expr,
+                fill: F32Bits::new(fill),
+                block_n: N as u32,
+            },
+        }
+    }
+
+    pub fn quantized_q4k_f32_dot<const N: usize>(
+        &self,
+        a: [Tile<BLOCK>; N],
+        matrix: &QuantizedMatrix,
+        k_base: impl IntoIndex<BLOCK>,
+        col: impl IntoIndex<BLOCK>,
+        mask: Mask<BLOCK>,
+        fill: f32,
+    ) -> Tile<BLOCK> {
+        assert!(
+            N == 8 || N == 16 || N == 32,
+            "q4k f32 dot currently supports N == 8, N == 16, or N == 32"
+        );
+        Tile {
+            expr: TileExpr::QuantizedQ4KF32Dot {
                 a: a.into_iter().map(|value| Box::new(value.expr)).collect(),
                 src: matrix.clone(),
                 k_base: k_base.into_index(),

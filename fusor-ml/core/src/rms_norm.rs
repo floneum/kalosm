@@ -1,7 +1,7 @@
 use std::{
     hash::{Hash, Hasher},
     num::NonZeroUsize,
-    sync::OnceLock,
+    sync::{Arc, OnceLock},
 };
 
 use lru::LruCache;
@@ -28,9 +28,9 @@ use crate::{
 const BLOCK: usize = 1024;
 const RMS_NORM_MODULE_CACHE_SIZE: usize = 128;
 
-fn rms_norm_module_cache() -> &'static RwLock<LruCache<[u64; 2], wgpu::naga::Module, FxBuildHasher>>
-{
-    static CACHE: OnceLock<RwLock<LruCache<[u64; 2], wgpu::naga::Module, FxBuildHasher>>> =
+fn rms_norm_module_cache()
+-> &'static RwLock<LruCache<[u64; 2], Arc<wgpu::naga::Module>, FxBuildHasher>> {
+    static CACHE: OnceLock<RwLock<LruCache<[u64; 2], Arc<wgpu::naga::Module>, FxBuildHasher>>> =
         OnceLock::new();
     CACHE.get_or_init(|| {
         RwLock::new(LruCache::with_hasher(
@@ -276,7 +276,7 @@ impl Operation for RmsNormOperation {
                 .write()
                 .get(&verbose_cache_key)
             {
-                module.clone()
+                Arc::new(module.clone())
             } else {
                 let ir = build_rms_norm_tile_ir(
                     input_view,
@@ -287,12 +287,12 @@ impl Operation for RmsNormOperation {
                     self.eps,
                 )?;
                 let module = ir.lower_to_naga().ok()?.module().clone();
-                graph
+                let _ = graph
                     .device()
                     .naga_module_cache()
                     .write()
-                    .get_or_insert(verbose_cache_key, || module.clone())
-                    .clone()
+                    .get_or_insert(verbose_cache_key, || module.clone());
+                Arc::new(module)
             };
             rms_norm_module_cache()
                 .write()
@@ -334,7 +334,7 @@ impl Operation for RmsNormOperation {
             read_only: false,
         });
 
-        Some(DirectKernel::new_with_cache_key(
+        Some(DirectKernel::new_with_arc_module(
             "rms_norm",
             cache_key,
             module,

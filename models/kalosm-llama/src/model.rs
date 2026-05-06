@@ -683,7 +683,13 @@ where
                 .cache
                 .write()
                 .map_err(|err| LlamaModelError::Session(err.to_string()))?;
-            session_lock.reserve_decode(&self.device, max_tokens as usize);
+            // `GenerationParameters::default()` uses `u32::MAX` as an "unbounded"
+            // generation sentinel. Reserving that would grow the KV cache to the
+            // model's full context length after every prompt, which is disastrous
+            // for large-context models when callers use `.take(n)` on the stream.
+            if max_tokens != u32::MAX {
+                session_lock.reserve_decode(&self.device, max_tokens as usize);
+            }
         }
         let mut logits = logits_from_sorted_top_k(logit_probs);
         // This stores a buffer of text that has been generated to check against the stop_on string. It should never be longer than the stop_on string.

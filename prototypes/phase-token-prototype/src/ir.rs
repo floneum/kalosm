@@ -557,6 +557,15 @@ pub enum TileExpr {
         fill: F32Bits,
         block_n: u32,
     },
+    QuantizedQ4KF32Dot {
+        a: Vec<Box<TileExpr>>,
+        src: QuantizedMatrix,
+        k_base: TileIndexExpr,
+        col: TileIndexExpr,
+        mask: TileMaskExpr,
+        fill: F32Bits,
+        block_n: u32,
+    },
     /// Reference to a pinned subexpression. The first reference in a scope
     /// lowers the bound value into a private local; subsequent references in
     /// the same scope reuse it.

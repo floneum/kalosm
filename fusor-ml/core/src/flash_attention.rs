@@ -1,7 +1,7 @@
 use std::{
     hash::{Hash, Hasher},
     num::{NonZeroU32, NonZeroUsize},
-    sync::OnceLock,
+    sync::{Arc, OnceLock},
 };
 
 use crate::{
@@ -31,8 +31,10 @@ const OUTPUTS_PER_WORKGROUP: usize = BLOCK / SIMD_WIDTH;
 const FLOAT_MIN: f32 = -1.0e30;
 const FLASH_ATTENTION_MODULE_CACHE_SIZE: usize = 128;
 
-fn flash_attention_module_cache() -> &'static RwLock<LruCache<[u64; 2], Module, FxBuildHasher>> {
-    static CACHE: OnceLock<RwLock<LruCache<[u64; 2], Module, FxBuildHasher>>> = OnceLock::new();
+fn flash_attention_module_cache() -> &'static RwLock<LruCache<[u64; 2], Arc<Module>, FxBuildHasher>>
+{
+    static CACHE: OnceLock<RwLock<LruCache<[u64; 2], Arc<Module>, FxBuildHasher>>> =
+        OnceLock::new();
     CACHE.get_or_init(|| {
         RwLock::new(LruCache::with_hasher(
             NonZeroUsize::new(FLASH_ATTENTION_MODULE_CACHE_SIZE).unwrap(),
@@ -285,7 +287,7 @@ impl Operation for FlashAttentionOperation {
                 .write()
                 .get(&verbose_cache_key)
             {
-                module.clone()
+                Arc::new(module.clone())
             } else {
                 let module = build_flash_attention_naga_module(
                     dims,
@@ -297,12 +299,12 @@ impl Operation for FlashAttentionOperation {
                     output_meta,
                     dispatch_size,
                 )?;
-                graph
+                let _ = graph
                     .device()
                     .naga_module_cache()
                     .write()
-                    .get_or_insert(verbose_cache_key, || module.clone())
-                    .clone()
+                    .get_or_insert(verbose_cache_key, || module.clone());
+                Arc::new(module)
             };
             flash_attention_module_cache()
                 .write()
@@ -340,7 +342,7 @@ impl Operation for FlashAttentionOperation {
             read_only: false,
         });
 
-        Some(DirectKernel::new_with_cache_key(
+        Some(DirectKernel::new_with_arc_module(
             "flash_attention",
             cache_key,
             module,

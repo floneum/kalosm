@@ -27,7 +27,7 @@ enum DirectKernelBindings {
 pub(crate) struct DirectKernel {
     name: String,
     cache_key: String,
-    module: Option<wgpu::naga::Module>,
+    module: Option<Arc<wgpu::naga::Module>>,
     prepared_pipeline: Option<wgpu::ComputePipeline>,
     bindings: DirectKernelBindings,
     dispatch_size: [u32; 3],
@@ -44,6 +44,23 @@ impl DirectKernel {
         name: impl Into<String>,
         cache_key: impl Into<String>,
         module: wgpu::naga::Module,
+        bindings: Vec<DirectKernelBinding>,
+        dispatch_size: [u32; 3],
+    ) -> Self {
+        Self {
+            name: name.into(),
+            cache_key: cache_key.into(),
+            module: Some(Arc::new(module)),
+            prepared_pipeline: None,
+            bindings: DirectKernelBindings::Dynamic(bindings),
+            dispatch_size,
+        }
+    }
+
+    pub(crate) fn new_with_arc_module(
+        name: impl Into<String>,
+        cache_key: impl Into<String>,
+        module: Arc<wgpu::naga::Module>,
         bindings: Vec<DirectKernelBinding>,
         dispatch_size: [u32; 3],
     ) -> Self {
@@ -249,7 +266,7 @@ impl DirectKernel {
                 .shader_module_cache()
                 .write()
                 .get_or_insert_ref(&self.cache_key, || {
-                    device.create_naga_shader_module(module_ir.clone())
+                    device.create_naga_shader_module(module_ir.as_ref().clone())
                 })
                 .clone();
             device

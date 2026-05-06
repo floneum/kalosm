@@ -9,6 +9,15 @@ fn env_usize(name: &str, default: usize) -> usize {
 }
 
 fn source() -> LlamaSource {
+    if let (Ok(model_id), Ok(file)) = (
+        std::env::var("KALOSM_PROFILE_LLAMA_HF_REPO"),
+        std::env::var("KALOSM_PROFILE_LLAMA_HF_FILE"),
+    ) {
+        let revision =
+            std::env::var("KALOSM_PROFILE_LLAMA_HF_REVISION").unwrap_or_else(|_| "main".into());
+        return LlamaSource::new(FileSource::huggingface(model_id, revision, file));
+    }
+
     match std::env::var("KALOSM_PROFILE_LLAMA_SOURCE").as_deref() {
         Ok("llama-8b") => LlamaSource::llama_8b(),
         Ok("llama-8b-chat") => LlamaSource::llama_8b_chat(),
@@ -35,7 +44,11 @@ async fn main() {
         .await
         .unwrap();
 
-    let mut stream = model.complete(&prompt).take(warmup + measured);
+    let sampler = GenerationParameters::default().with_max_length((warmup + measured) as u32);
+    let mut stream = model
+        .complete(&prompt)
+        .with_sampler(sampler)
+        .take(warmup + measured);
     for _ in 0..warmup {
         if stream.next().await.is_none() {
             eprintln!("stream ended during warmup");

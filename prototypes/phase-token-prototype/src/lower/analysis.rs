@@ -205,6 +205,19 @@ impl<'a> Lowerer<'a> {
                     || Self::tile_index_expr_uses_kind(col, kind)
                     || Self::tile_mask_expr_uses_kind(mask, kind)
             }
+            TileExpr::QuantizedQ4KF32Dot {
+                a,
+                k_base,
+                col,
+                mask,
+                ..
+            } => {
+                a.iter()
+                    .any(|expr| Self::tile_expr_uses_index_kind(expr, kind))
+                    || Self::tile_index_expr_uses_kind(k_base, kind)
+                    || Self::tile_index_expr_uses_kind(col, kind)
+                    || Self::tile_mask_expr_uses_kind(mask, kind)
+            }
             TileExpr::PinnedRef { .. } | TileExpr::LoopFoldGroupOutput { .. } => false,
             TileExpr::Index(idx) => Self::tile_index_expr_uses_kind(idx, kind),
             TileExpr::Full(_) | TileExpr::Literal(_) => false,
@@ -291,6 +304,9 @@ impl<'a> Lowerer<'a> {
             TileExpr::QuantizedQ8ActivationDot { a, .. } => a
                 .iter()
                 .any(|expr| Self::tile_expr_uses_subgroup_reduce(expr)),
+            TileExpr::QuantizedQ4KF32Dot { a, .. } => a
+                .iter()
+                .any(|expr| Self::tile_expr_uses_subgroup_reduce(expr)),
             TileExpr::PinnedRef { .. } | TileExpr::LoopFoldGroupOutput { .. } => false,
             TileExpr::Scalar(expr) => match expr {
                 TileScalarExpr::Reduce { value, .. } | TileScalarExpr::LoopReduce { value, .. } => {
@@ -348,6 +364,11 @@ impl<'a> Lowerer<'a> {
                 }
             }
             TileExpr::QuantizedQ8ActivationDot { a, .. } => {
+                for expr in a {
+                    Self::mark_tile_expr_live(ir, expr, live);
+                }
+            }
+            TileExpr::QuantizedQ4KF32Dot { a, .. } => {
                 for expr in a {
                     Self::mark_tile_expr_live(ir, expr, live);
                 }

@@ -433,6 +433,27 @@ impl<'a> Lowerer<'a> {
                 *block_n,
                 spill_depth,
             ),
+            TileExpr::QuantizedQ4KF32Dot {
+                a,
+                src,
+                k_base,
+                col,
+                mask,
+                fill,
+                block_n,
+            } => self.lower_tile_quantized_q4k_f32_dot_expr(
+                expressions,
+                scratch,
+                body,
+                a,
+                src,
+                k_base,
+                col,
+                mask,
+                *fill,
+                *block_n,
+                spill_depth,
+            ),
         }
     }
 
@@ -579,6 +600,86 @@ impl<'a> Lowerer<'a> {
             _ => {
                 return Err(LowerError::UnsupportedOperation(
                     "q8 activation dot only supports Q4K/Q6K dot8/dot16",
+                ));
+            }
+        };
+        Self::push_emits(&mut accept, value_emits);
+        accept.push(
+            Statement::Store {
+                pointer: tmp_ptr,
+                value: dot,
+            },
+            Span::default(),
+        );
+        body.push(
+            Statement::If {
+                condition: mask_handle,
+                accept,
+                reject: Block::new(),
+            },
+            Span::default(),
+        );
+        let loaded = expressions.append(Expression::Load { pointer: tmp_ptr }, Span::default());
+        body.push(
+            Statement::Emit(Self::single_expression_range(expressions, loaded)),
+            Span::default(),
+        );
+        Ok(loaded)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn lower_tile_quantized_q4k_f32_dot_expr(
+        &self,
+        expressions: &mut Arena<Expression>,
+        scratch: ScratchLocals,
+        body: &mut Block,
+        a: &[Box<TileExpr>],
+        src: &QuantizedMatrix,
+        k_base: &TileIndexExpr,
+        col: &TileIndexExpr,
+        mask: &TileMaskExpr,
+        fill: F32Bits,
+        block_n: u32,
+        spill_depth: usize,
+    ) -> Result<Handle<Expression>, LowerError> {
+        let tmp = Self::tile_value_local(scratch, ElementType::F32)?;
+        let tmp_ptr = expressions.append(Expression::LocalVariable(tmp), Span::default());
+        let fill_value = expressions.append(
+            Expression::Literal(Literal::F32(fill.get())),
+            Span::default(),
+        );
+        body.push(
+            Statement::Store {
+                pointer: tmp_ptr,
+                value: fill_value,
+            },
+            Span::default(),
+        );
+
+        let mut a_handles = Vec::with_capacity(a.len());
+        for expr in a {
+            a_handles.push(self.lower_tile_expr_lane(
+                expressions,
+                scratch,
+                body,
+                expr,
+                spill_depth + 1,
+            )?);
+        }
+        let mask_handle =
+            self.lower_tile_mask_expr(expressions, scratch, body, mask, spill_depth)?;
+        let mut accept = Block::new();
+        let k_base_handle =
+            self.lower_tile_index_expr(expressions, scratch, &mut accept, k_base, spill_depth)?;
+        let col_handle =
+            self.lower_tile_index_expr(expressions, scratch, &mut accept, col, spill_depth)?;
+        let (dot, value_emits) = match (src.format, block_n) {
+            (GgmlQuantFormat::Q4K, 8 | 16 | 32) => {
+                self.q4k_f32_dot(expressions, src, k_base_handle, col_handle, &a_handles)?
+            }
+            _ => {
+                return Err(LowerError::UnsupportedOperation(
+                    "q4k f32 dot only supports Q4K dot8/dot16/dot32",
                 ));
             }
         };
@@ -1837,7 +1938,8 @@ impl<'a> Lowerer<'a> {
             TileExpr::QuantizedBlockLane { .. } => Ok(ElementType::F32),
             TileExpr::Dot4 { .. }
             | TileExpr::QuantizedQ8_0Dot8 { .. }
-            | TileExpr::QuantizedQ8ActivationDot { .. } => Ok(ElementType::F32),
+            | TileExpr::QuantizedQ8ActivationDot { .. }
+            | TileExpr::QuantizedQ4KF32Dot { .. } => Ok(ElementType::F32),
             TileExpr::PinnedRef { id } => self
                 .ir
                 .pinned_values

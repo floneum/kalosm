@@ -1250,6 +1250,7 @@ impl Tensor<1, f32> {
                     &values,
                     chunks,
                     crate::top_k::TOP_K_CHUNK,
+                    crate::top_k::TOP_K_CHUNK,
                     input_len,
                     k,
                 ) else {
@@ -1259,11 +1260,41 @@ impl Tensor<1, f32> {
                 let values = Tensor::<1, f32>::as_slice_from_tensor_data(&values).await?;
                 return Ok((ids.as_slice().to_vec(), values.as_slice().to_vec()));
             }
+            let Some((merged_ids, merged_values)) =
+                crate::top_k::merge_sorted_chunk_top_k_pair_data(
+                    &ids,
+                    &values,
+                    chunks,
+                    candidate_count,
+                    output_per_chunk,
+                    input_len,
+                    k,
+                )
+            else {
+                return Ok(cpu_top_k_pairs_from_tensor_data(&input, k).await?);
+            };
+            let merged_ids = Tensor::<1, u32>::as_slice_from_tensor_data(&merged_ids).await?;
+            let merged_values = Tensor::<1, f32>::as_slice_from_tensor_data(&merged_values).await?;
+            let chunk_values = Tensor::<1, f32>::as_slice_from_tensor_data(&values).await?;
+            let exact = top_k_chunk_bounds_prove_exact(
+                merged_values.as_slice(),
+                chunk_values.as_slice(),
+                k,
+                chunks,
+                candidate_count,
+                output_per_chunk,
+            );
+            if exact {
+                return Ok((
+                    merged_ids.as_slice().to_vec(),
+                    merged_values.as_slice().to_vec(),
+                ));
+            }
+
             let ids = Tensor::<1, u32>::as_slice_from_tensor_data(&ids).await?;
-            let values = Tensor::<1, f32>::as_slice_from_tensor_data(&values).await?;
             if let Some(top) = top_k_from_chunk_candidates(
                 ids.as_slice(),
-                values.as_slice(),
+                chunk_values.as_slice(),
                 k,
                 input_len,
                 chunks,
@@ -1279,6 +1310,40 @@ impl Tensor<1, f32> {
             candidate_count = (candidate_count * 2).min(crate::top_k::TOP_K_CHUNK);
         }
     }
+}
+
+fn top_k_chunk_bounds_prove_exact(
+    top_values: &[f32],
+    chunk_values: &[f32],
+    k: usize,
+    chunks: usize,
+    candidate_count: usize,
+    output_per_chunk: usize,
+) -> bool {
+    let Some(&threshold) = top_values.get(k.saturating_sub(1)) else {
+        return !chunk_bounds(chunk_values, chunks, candidate_count, output_per_chunk)
+            .any(|bound| bound.is_finite());
+    };
+    if !threshold.is_finite() {
+        return !chunk_bounds(chunk_values, chunks, candidate_count, output_per_chunk)
+            .any(|bound| bound.is_finite());
+    }
+    !chunk_bounds(chunk_values, chunks, candidate_count, output_per_chunk)
+        .any(|bound| bound.is_finite() && bound >= threshold)
+}
+
+fn chunk_bounds(
+    values: &[f32],
+    chunks: usize,
+    candidate_count: usize,
+    output_per_chunk: usize,
+) -> impl Iterator<Item = f32> + '_ {
+    (0..chunks).filter_map(move |chunk| {
+        let index = chunk
+            .checked_mul(output_per_chunk)?
+            .checked_add(candidate_count)?;
+        values.get(index).copied()
+    })
 }
 
 fn top_k_from_chunk_candidates(

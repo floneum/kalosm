@@ -1,7 +1,7 @@
 use std::{
     hash::{Hash, Hasher},
     num::NonZeroUsize,
-    sync::OnceLock,
+    sync::{Arc, OnceLock},
 };
 
 use lru::LruCache;
@@ -89,9 +89,9 @@ impl NaryDirectModuleKey {
 }
 
 fn nary_direct_module_cache()
--> &'static RwLock<LruCache<NaryDirectModuleKey, wgpu::naga::Module, FxBuildHasher>> {
+-> &'static RwLock<LruCache<NaryDirectModuleKey, Arc<wgpu::naga::Module>, FxBuildHasher>> {
     static CACHE: OnceLock<
-        RwLock<LruCache<NaryDirectModuleKey, wgpu::naga::Module, FxBuildHasher>>,
+        RwLock<LruCache<NaryDirectModuleKey, Arc<wgpu::naga::Module>, FxBuildHasher>>,
     > = OnceLock::new();
     CACHE.get_or_init(|| {
         RwLock::new(LruCache::with_hasher(
@@ -176,16 +176,16 @@ fn build_nary_direct_kernel_with_output_index(
             .write()
             .get(&verbose_cache_key)
         {
-            module.clone()
+            Arc::new(module.clone())
         } else {
             let ir = build_nary_tile_ir(operation, &tensors, output_index, dispatch_size)?;
             let module = ir.lower_to_naga().ok()?.module().clone();
-            graph
+            let _ = graph
                 .device()
                 .naga_module_cache()
                 .write()
-                .get_or_insert(verbose_cache_key, || module.clone())
-                .clone()
+                .get_or_insert(verbose_cache_key, || module.clone());
+            Arc::new(module)
         };
         nary_direct_module_cache()
             .write()
@@ -203,7 +203,7 @@ fn build_nary_direct_kernel_with_output_index(
         })
         .collect();
 
-    Some(DirectKernel::new_with_cache_key(
+    Some(DirectKernel::new_with_arc_module(
         operation.name(),
         cache_key,
         module,

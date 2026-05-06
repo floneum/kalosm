@@ -120,6 +120,13 @@ impl Cache {
                 revision,
                 file,
             } => {
+                let path = self.location.join(model_id).join(revision);
+                let complete_download = path.join(file);
+                if std::env::var_os("KALOSM_CACHE_OFFLINE").is_some() && complete_download.exists()
+                {
+                    return Ok(complete_download);
+                }
+
                 let token = self.huggingface_token.clone().or_else(huggingface_token);
 
                 let repo = Repo::with_revision(
@@ -136,9 +143,6 @@ impl Cache {
                     .with_authorization_header(token.clone())
                     .send()
                     .await;
-
-                let path = self.location.join(model_id).join(revision);
-                let complete_download = path.join(file);
 
                 // Quick check without lock - if file exists and is up-to-date, return it
                 if is_file_current(&complete_download, &response).await {

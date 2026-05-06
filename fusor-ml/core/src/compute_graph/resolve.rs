@@ -990,9 +990,15 @@ impl Resolver {
     // --- Rewrite Engine ---
 
     fn optimize(&mut self, graph: &mut ComputeGraphInner) {
-        // Initialize worklist with all nodes
-        let mut worklist: VecDeque<ExecutionNodeIndex> =
-            self.execution_graph.node_indices().collect();
+        // The current rewrite rules can only start from Nary nodes (nary
+        // fusion, post-op reduce/matmul fusion) or MatMul nodes (pre-op
+        // unary fusion). Avoid scanning every QMatMul/RMS/attention node in
+        // decode graphs with hundreds of kernels.
+        let mut worklist: VecDeque<ExecutionNodeIndex> = self
+            .execution_graph
+            .node_indices()
+            .filter(|&node| self.is_optimization_candidate(node))
+            .collect();
         let mut in_worklist: FxHashSet<ExecutionNodeIndex> = worklist.iter().copied().collect();
 
         while let Some(node_idx) = worklist.pop_front() {
@@ -1016,7 +1022,9 @@ impl Resolver {
 
             if changed {
                 // Re-add the current node to worklist if it still exists
-                if self.execution_graph.contains_node(node_idx) && !in_worklist.contains(&node_idx)
+                if self.execution_graph.contains_node(node_idx)
+                    && self.is_optimization_candidate(node_idx)
+                    && !in_worklist.contains(&node_idx)
                 {
                     worklist.push_back(node_idx);
                     in_worklist.insert(node_idx);
@@ -1025,6 +1033,7 @@ impl Resolver {
                 // Re-add neighbors that might be affected by this change
                 for neighbor in neighbors {
                     if self.execution_graph.contains_node(neighbor)
+                        && self.is_optimization_candidate(neighbor)
                         && !in_worklist.contains(&neighbor)
                     {
                         worklist.push_back(neighbor);
@@ -1035,7 +1044,9 @@ impl Resolver {
                 // Also add new neighbors that may have been created
                 if self.execution_graph.contains_node(node_idx) {
                     for neighbor in self.execution_graph.neighbors_undirected(node_idx) {
-                        if !in_worklist.contains(&neighbor) {
+                        if self.is_optimization_candidate(neighbor)
+                            && !in_worklist.contains(&neighbor)
+                        {
                             worklist.push_back(neighbor);
                             in_worklist.insert(neighbor);
                         }
@@ -1043,6 +1054,13 @@ impl Resolver {
                 }
             }
         }
+    }
+
+    fn is_optimization_candidate(&self, node_idx: ExecutionNodeIndex) -> bool {
+        matches!(
+            self.execution_graph[node_idx].variant,
+            ComputeGraphNodeVariant::Nary(_) | ComputeGraphNodeVariant::MatMul(_)
+        )
     }
 
     // Helpers

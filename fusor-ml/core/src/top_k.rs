@@ -99,6 +99,7 @@ pub(crate) fn merge_sorted_chunk_top_k_pair_data(
     input_values: &TensorData,
     chunks: usize,
     chunk_len: usize,
+    chunk_stride: usize,
     input_len: usize,
     k: usize,
 ) -> Option<(TensorData, TensorData)> {
@@ -110,7 +111,13 @@ pub(crate) fn merge_sorted_chunk_top_k_pair_data(
     }
     let input_ids_len = input_ids.layout().shape()[0];
     let input_values_len = input_values.layout().shape()[0];
-    let expected_len = chunks.checked_mul(chunk_len)?;
+    let expected_len = if chunks == 0 {
+        0
+    } else {
+        (chunks - 1)
+            .checked_mul(chunk_stride)?
+            .checked_add(chunk_len)?
+    };
     if input_ids_len < expected_len || input_values_len < expected_len {
         return None;
     }
@@ -124,7 +131,7 @@ pub(crate) fn merge_sorted_chunk_top_k_pair_data(
     }
 
     let cache_key = format!(
-        "merge_sorted_chunk_top_k_pairs_f32:block={TOP_K_BLOCK}:chunks={chunks}:chunk_len={chunk_len}:input_len={input_len}:k={output_len}:ids={:?}:values={:?}",
+        "merge_sorted_chunk_top_k_pairs_f32:block={TOP_K_BLOCK}:chunks={chunks}:chunk_len={chunk_len}:chunk_stride={chunk_stride}:input_len={input_len}:k={output_len}:ids={:?}:values={:?}",
         input_ids.layout(),
         input_values.layout()
     );
@@ -134,6 +141,7 @@ pub(crate) fn merge_sorted_chunk_top_k_pair_data(
         let module = MergeTopKModuleBuilder::new(
             chunks.try_into().ok()?,
             chunk_len.try_into().ok()?,
+            chunk_stride.try_into().ok()?,
             input_len.try_into().ok()?,
             output_len.try_into().ok()?,
         )
@@ -209,6 +217,7 @@ struct TopKLocals {
 struct MergeTopKModuleBuilder {
     chunks: u32,
     chunk_len: u32,
+    chunk_stride: u32,
     input_len: u32,
     k: u32,
 }
@@ -234,10 +243,11 @@ struct MergeTopKLocals {
 }
 
 impl MergeTopKModuleBuilder {
-    fn new(chunks: u32, chunk_len: u32, input_len: u32, k: u32) -> Self {
+    fn new(chunks: u32, chunk_len: u32, chunk_stride: u32, input_len: u32, k: u32) -> Self {
         Self {
             chunks,
             chunk_len,
+            chunk_stride,
             input_len,
             k,
         }
@@ -505,7 +515,8 @@ impl MergeTopKModuleBuilder {
             chunk_len,
         );
         let mut candidate_accept = Block::new();
-        let chunk_offset = self.mul_lit(expressions, &mut candidate_accept, chunk, self.chunk_len);
+        let chunk_offset =
+            self.mul_lit(expressions, &mut candidate_accept, chunk, self.chunk_stride);
         let index = self.bin(
             expressions,
             &mut candidate_accept,
