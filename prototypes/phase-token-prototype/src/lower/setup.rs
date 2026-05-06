@@ -527,6 +527,14 @@ impl<'a> Lowerer<'a> {
                     || Self::tile_mask_expr_uses_f16(&store.mask)
                     || Self::tile_expr_uses_f16(&store.value)
             }
+            TileStmt::StoreSwiGlu(store) => {
+                store.dst.buffer.element == ElementType::F16
+                    || Self::tile_index_expr_uses_f16(&store.row)
+                    || Self::tile_index_expr_uses_f16(&store.col)
+                    || Self::tile_mask_expr_uses_f16(&store.mask)
+                    || Self::tile_expr_uses_f16(&store.gate)
+                    || Self::tile_expr_uses_f16(&store.up)
+            }
             TileStmt::CopyToWorkgroupTile {
                 dst,
                 src,

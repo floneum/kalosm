@@ -748,6 +748,10 @@ impl Device {
     pub fn resolve_batch(&self, keys: &[crate::compute_graph::NodeIndex]) -> usize {
         self.compute_graph().resolve_batch(keys)
     }
+
+    pub fn detach_cached(&self, keys: &[crate::compute_graph::NodeIndex]) {
+        self.compute_graph().detach_cached(keys)
+    }
 }
 
 fn prune_cached_buffers(buffers: &mut Vec<CachedBuffer>) {

@@ -34,6 +34,10 @@ impl<'a> Lowerer<'a> {
     fn mark_tile_stmt_live(ir: &KernelIr, stmt: &TileStmt, live: &mut [bool]) {
         match stmt {
             TileStmt::Store(store) => Self::mark_tile_expr_live(ir, &store.value, live),
+            TileStmt::StoreSwiGlu(store) => {
+                Self::mark_tile_expr_live(ir, &store.gate, live);
+                Self::mark_tile_expr_live(ir, &store.up, live);
+            }
             TileStmt::CopyToWorkgroupTile { dst, .. }
             | TileStmt::CopyQuantToWorkgroupTile { dst, .. } => {
                 if let Some(slot) = live.get_mut(dst.id.index()) {
@@ -92,7 +96,7 @@ impl<'a> Lowerer<'a> {
 
     fn tile_stmt_uses_cooperative_matrix(stmt: &TileStmt) -> bool {
         match stmt {
-            TileStmt::Store(_) | TileStmt::Barrier => false,
+            TileStmt::Store(_) | TileStmt::StoreSwiGlu(_) | TileStmt::Barrier => false,
             TileStmt::ZeroCoopAcc { .. }
             | TileStmt::CopyToWorkgroupTile { .. }
             | TileStmt::CopyQuantToWorkgroupTile { .. }
@@ -108,6 +112,10 @@ impl<'a> Lowerer<'a> {
     fn tile_stmt_uses_subgroup_reduce(stmt: &TileStmt) -> bool {
         match stmt {
             TileStmt::Store(store) => Self::tile_expr_uses_subgroup_reduce(&store.value),
+            TileStmt::StoreSwiGlu(store) => {
+                Self::tile_expr_uses_subgroup_reduce(&store.gate)
+                    || Self::tile_expr_uses_subgroup_reduce(&store.up)
+            }
             TileStmt::WhileTrue { body, .. } => {
                 body.iter().any(Self::tile_stmt_uses_subgroup_reduce)
             }
@@ -128,6 +136,13 @@ impl<'a> Lowerer<'a> {
                     || Self::tile_index_expr_uses_kind(&store.col, kind)
                     || Self::tile_mask_expr_uses_kind(&store.mask, kind)
                     || Self::tile_expr_uses_index_kind(&store.value, kind)
+            }
+            TileStmt::StoreSwiGlu(store) => {
+                Self::tile_index_expr_uses_kind(&store.row, kind)
+                    || Self::tile_index_expr_uses_kind(&store.col, kind)
+                    || Self::tile_mask_expr_uses_kind(&store.mask, kind)
+                    || Self::tile_expr_uses_index_kind(&store.gate, kind)
+                    || Self::tile_expr_uses_index_kind(&store.up, kind)
             }
             TileStmt::CopyToWorkgroupTile {
                 row_offset,

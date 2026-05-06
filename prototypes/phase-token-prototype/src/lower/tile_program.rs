@@ -19,6 +19,9 @@ impl<'a> Lowerer<'a> {
                 TileStmt::Store(store) => {
                     self.lower_tile_store_stmt(expressions, scratch, &mut body, store)?;
                 }
+                TileStmt::StoreSwiGlu(store) => {
+                    self.lower_tile_swiglu_store_stmt(expressions, scratch, &mut body, store)?;
+                }
                 _ => self.lower_tile_stmt(expressions, scratch, &mut body, stmt)?,
             }
         }
@@ -49,6 +52,150 @@ impl<'a> Lowerer<'a> {
             self.storage_dynamic_pointer(expressions, &store.dst, dst_index)?;
         Self::push_emits(&mut accept, dst_index_emits);
         Self::push_emits(&mut accept, dst_ptr_emits);
+        accept.push(
+            Statement::Store {
+                pointer: dst_ptr,
+                value,
+            },
+            Span::default(),
+        );
+        body.push(
+            Statement::If {
+                condition: mask,
+                accept,
+                reject: Block::new(),
+            },
+            Span::default(),
+        );
+        Ok(())
+    }
+
+    fn lower_tile_swiglu_store_stmt(
+        &self,
+        expressions: &mut Arena<Expression>,
+        scratch: ScratchLocals,
+        body: &mut Block,
+        store: &TileSwiGluStoreStmt,
+    ) -> Result<(), LowerError> {
+        self.block_dequant_cache.borrow_mut().clear();
+        self.pin_cache.borrow_mut().clear();
+        self.q8_activation_pack_cache.borrow_mut().clear();
+
+        let gate = self.lower_tile_expr_lane(expressions, scratch, body, &store.gate, 0)?;
+        let gate_spill = self.tile_expr_spill_local(scratch, ElementType::F32, 0)?;
+        let gate_spill_ptr =
+            expressions.append(Expression::LocalVariable(gate_spill), Span::default());
+        body.push(
+            Statement::Store {
+                pointer: gate_spill_ptr,
+                value: gate,
+            },
+            Span::default(),
+        );
+
+        let up = self.lower_tile_expr_lane(expressions, scratch, body, &store.up, 1)?;
+        let up_spill = self.tile_expr_spill_local(scratch, ElementType::F32, 1)?;
+        let up_spill_ptr = expressions.append(Expression::LocalVariable(up_spill), Span::default());
+        body.push(
+            Statement::Store {
+                pointer: up_spill_ptr,
+                value: up,
+            },
+            Span::default(),
+        );
+
+        let mask = self.lower_tile_mask_expr(expressions, scratch, body, &store.mask, 0)?;
+        let mut accept = Block::new();
+
+        let row = self.lower_tile_index_expr(expressions, scratch, &mut accept, &store.row, 0)?;
+        let col = self.lower_tile_index_expr(expressions, scratch, &mut accept, &store.col, 0)?;
+        let (dst_index, dst_index_emits) =
+            self.storage_index_from_coords(expressions, &store.dst, &[row, col])?;
+        let (dst_ptr, dst_ptr_emits) =
+            self.storage_dynamic_pointer(expressions, &store.dst, dst_index)?;
+        Self::push_emits(&mut accept, dst_index_emits);
+        Self::push_emits(&mut accept, dst_ptr_emits);
+
+        let gate_spill_ptr =
+            expressions.append(Expression::LocalVariable(gate_spill), Span::default());
+        let gate = expressions.append(
+            Expression::Load {
+                pointer: gate_spill_ptr,
+            },
+            Span::default(),
+        );
+        accept.push(
+            Statement::Emit(Self::single_expression_range(expressions, gate)),
+            Span::default(),
+        );
+        let up_spill_ptr = expressions.append(Expression::LocalVariable(up_spill), Span::default());
+        let up = expressions.append(
+            Expression::Load {
+                pointer: up_spill_ptr,
+            },
+            Span::default(),
+        );
+        accept.push(
+            Statement::Emit(Self::single_expression_range(expressions, up)),
+            Span::default(),
+        );
+
+        let neg_gate = self.emit_tile_expr(
+            expressions,
+            &mut accept,
+            Expression::Unary {
+                op: naga::UnaryOperator::Negate,
+                expr: gate,
+            },
+        );
+        let exp = self.emit_tile_expr(
+            expressions,
+            &mut accept,
+            Expression::Math {
+                fun: MathFunction::Exp,
+                arg: neg_gate,
+                arg1: None,
+                arg2: None,
+                arg3: None,
+            },
+        );
+        let one = expressions.append(Expression::Literal(Literal::F32(1.0)), Span::default());
+        let denom = self.emit_tile_expr(
+            expressions,
+            &mut accept,
+            Expression::Binary {
+                op: BinaryOperator::Add,
+                left: one,
+                right: exp,
+            },
+        );
+        let sigmoid = self.emit_tile_expr(
+            expressions,
+            &mut accept,
+            Expression::Binary {
+                op: BinaryOperator::Divide,
+                left: one,
+                right: denom,
+            },
+        );
+        let gated = self.emit_tile_expr(
+            expressions,
+            &mut accept,
+            Expression::Binary {
+                op: BinaryOperator::Multiply,
+                left: gate,
+                right: sigmoid,
+            },
+        );
+        let value = self.emit_tile_expr(
+            expressions,
+            &mut accept,
+            Expression::Binary {
+                op: BinaryOperator::Multiply,
+                left: gated,
+                right: up,
+            },
+        );
         accept.push(
             Statement::Store {
                 pointer: dst_ptr,

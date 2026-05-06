@@ -580,13 +580,17 @@ impl Operation for QMatMulSwiGluOperation {
         let swiglu_tile = std::env::var("FUSOR_Q4K_SWIGLU_TILE").unwrap_or_default();
         let swiglu_tile_name = match swiglu_tile.as_str() {
             "4x1" => "4x1",
+            "4x4" => "4x4",
+            "8x1" => "8x1",
+            "8x2" => "8x2",
             "2x2" => "2x2",
             "2x4" => "2x4",
-            _ => "4x2",
+            _ => "8x2",
         };
         let cols_per_workgroup = match swiglu_tile_name {
             "4x1" | "2x2" => 4,
-            "2x4" | "4x2" => 8,
+            "2x4" | "4x2" | "8x1" => 8,
+            "4x4" | "8x2" => 16,
             _ => unreachable!(),
         };
         let total_workgroups = pair_len.div_ceil(cols_per_workgroup);
@@ -637,6 +641,9 @@ impl Operation for QMatMulSwiGluOperation {
                     let y = tile_storage_write_with_direct_layout(phase, y_view);
                     match swiglu_tile_name {
                         "4x1" => phase.qgemv_q4k_swiglu_4x1(&a, &b, &y, pair_len, workgroups_x),
+                        "4x4" => phase.qgemv_q4k_swiglu_4x4(&a, &b, &y, pair_len, workgroups_x),
+                        "8x1" => phase.qgemv_q4k_swiglu_8x1(&a, &b, &y, pair_len, workgroups_x),
+                        "8x2" => phase.qgemv_q4k_swiglu_8x2(&a, &b, &y, pair_len, workgroups_x),
                         "2x2" => phase.qgemv_q4k_swiglu_2x2(&a, &b, &y, pair_len, workgroups_x),
                         "2x4" => phase.qgemv_q4k_swiglu_2x4(&a, &b, &y, pair_len, workgroups_x),
                         "4x2" => phase.qgemv_q4k_swiglu_4x2(&a, &b, &y, pair_len, workgroups_x),

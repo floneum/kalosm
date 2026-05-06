@@ -167,6 +167,16 @@ where
         cached.gpu_key()
     }
 
+    /// Add this cache tensor's GPU node to a batch of already-resolved nodes
+    /// that should be rebased to graph leaves.
+    pub fn detach_key(&self, keys: &mut Vec<crate::NodeIndex>) {
+        if let Some(cached) = &self.all_data
+            && let Some(key) = cached.gpu_key()
+        {
+            keys.push(key);
+        }
+    }
+
     /// Get the current sequence length
     pub fn current_seq_len(&self) -> usize {
         self.current_seq_len

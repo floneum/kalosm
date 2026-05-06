@@ -44,7 +44,11 @@ async fn main() {
         .await
         .unwrap();
 
-    let sampler = GenerationParameters::default().with_max_length((warmup + measured) as u32);
+    let sampler = if std::env::var_os("KALOSM_PROFILE_LLAMA_UNBOUNDED").is_some() {
+        GenerationParameters::default()
+    } else {
+        GenerationParameters::default().with_max_length((warmup + measured) as u32)
+    };
     let mut stream = model
         .complete(&prompt)
         .with_sampler(sampler)

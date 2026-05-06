@@ -76,6 +76,14 @@ impl Device {
             0
         }
     }
+
+    /// Rebase already-resolved GPU graph nodes into cached leaf nodes. On CPU
+    /// this is a no-op.
+    pub fn detach_cached(&self, keys: &[fusor_core::NodeIndex]) {
+        if let Device::Gpu(device) = self {
+            device.detach_cached(keys);
+        }
+    }
 }
 
 impl PartialEq for Device {

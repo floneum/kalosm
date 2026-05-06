@@ -76,6 +76,13 @@ where
         }
     }
 
+    /// Add live key/value GPU nodes to a batch of already-resolved nodes that
+    /// should be rebased to graph leaves.
+    pub fn detach_keys(&self, keys: &mut Vec<crate::NodeIndex>) {
+        self.key.detach_key(keys);
+        self.value.detach_key(keys);
+    }
+
     /// Get the current sequence length
     pub fn current_seq_len(&self) -> usize {
         self.key.current_seq_len()

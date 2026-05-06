@@ -203,8 +203,14 @@ fn build_nary_direct_kernel_with_output_index(
         })
         .collect();
 
+    let name = if std::env::var_os("FUSOR_TRACE_DECODE_NAMES").is_some() {
+        operation.name()
+    } else {
+        cache_key.clone()
+    };
+
     Some(DirectKernel::new_with_arc_module(
-        operation.name(),
+        name,
         cache_key,
         module,
         bindings,

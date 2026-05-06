@@ -3,6 +3,7 @@ use std::sync::Arc;
 use parking_lot::RwLock;
 pub use petgraph::graph::NodeIndex;
 use petgraph::prelude::StableGraph;
+use petgraph::visit::EdgeRef;
 use resolve::Resolver;
 use rustc_hash::FxHashSet;
 use tabbycat::Graph;
@@ -196,6 +197,20 @@ impl ComputeGraph {
             let mut inner = self.inner.write();
             let mut removed = Vec::new();
             inner.remove_reference(key, &mut removed);
+            #[cfg(feature = "extra_assertions")]
+            {
+                inner.verify_integrity()
+            }
+            removed
+        };
+        drop(removed);
+    }
+
+    pub(crate) fn detach_cached(&self, keys: &[NodeIndex]) {
+        let removed = {
+            let mut inner = self.inner.write();
+            let mut removed = Vec::new();
+            inner.detach_cached(keys, &mut removed);
             #[cfg(feature = "extra_assertions")]
             {
                 inner.verify_integrity()
@@ -460,6 +475,38 @@ impl ComputeGraphInner {
         // Remove the node from the graph (this also removes all edges)
         if let Some(node) = self.nodes.nodes.remove_node(key) {
             removed.push(node);
+        }
+    }
+
+    fn detach_cached(&mut self, keys: &[NodeIndex], removed: &mut Vec<ComputeGraphNode>) {
+        for &key in keys {
+            let Some(data) = self.get_cached_result(key).cloned() else {
+                continue;
+            };
+
+            let mut dependencies = Vec::new();
+            self.visit_dependencies(key, &mut |dependency| {
+                dependencies.push(dependency);
+            });
+
+            if let Some(node) = self.nodes.nodes.node_weight_mut(key) {
+                node.variant = ComputeGraphNodeVariant::Tensor(data.clone());
+                node.cached = Some(data);
+            }
+
+            let incoming_edges = self
+                .nodes
+                .nodes
+                .edges_directed(key, petgraph::Direction::Incoming)
+                .map(|edge| edge.id())
+                .collect::<Vec<_>>();
+            for edge in incoming_edges {
+                self.nodes.nodes.remove_edge(edge);
+            }
+
+            for dependency in dependencies {
+                self.check_life(dependency, removed);
+            }
         }
     }
 

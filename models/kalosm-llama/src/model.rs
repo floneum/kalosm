@@ -99,6 +99,13 @@ fn gpu_sample_top_k() -> usize {
         .max(1)
 }
 
+fn unbounded_decode_reserve_tokens() -> usize {
+    std::env::var("KALOSM_LLAMA_UNBOUNDED_DECODE_RESERVE")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(256)
+}
+
 struct LlamaGpuSamplerState {
     sampler: fusor::GpuMirostat2Sampler,
     config: GpuSamplerConfig,
@@ -278,19 +285,13 @@ where
         device: &Device,
         tokens: &[u32],
         images: &[(image::DynamicImage, MediaHints)],
-        cache: Option<&mut LlamaCache>,
+        mut cache: Option<&mut LlamaCache>,
         #[allow(unused)] tokenizer: &Tokenizer,
-    ) -> impl kalosm_model_types::FutureWasmNotSend<Output = Result<Vec<f32>, LlamaModelError>>
-    {
+    ) -> Pin<
+        Box<dyn kalosm_model_types::FutureWasmNotSend<Output = Result<Vec<f32>, LlamaModelError>>>,
+    > {
         if tokens.is_empty() {
-            return Box::pin(async { Err(LlamaModelError::EmptyInput) })
-                as Pin<
-                    Box<
-                        dyn kalosm_model_types::FutureWasmNotSend<
-                            Output = Result<Vec<f32>, LlamaModelError>,
-                        >,
-                    >,
-                >;
+            return Box::pin(async { Err(LlamaModelError::EmptyInput) });
         }
 
         #[cfg(debug_assertions)]
@@ -318,31 +319,36 @@ where
         };
         let token_start = trace.then(std::time::Instant::now);
         let build_start = trace.then(std::time::Instant::now);
-        let logits = model.forward(tokens, images, device, cache);
+        let logits = model.forward(tokens, images, device, cache.as_deref_mut());
         if let Some(start) = build_start {
             eprintln!(
                 "forward_graph_build path={path} decode_eligible={decode_eligible} elapsed={:?}",
                 start.elapsed()
             );
         }
-        let device = device.clone();
-        Box::pin(async move {
-            let logits = logits?;
-            let logits = logits.squeeze(0);
-            // Cast logits back to f32 for sampling
-            let logits: fusor::Tensor<1, f32> = logits.cast();
-            let len = logits.shape()[0];
-            let mut kernels = 0;
-            if let Some(logits_key) = logits.gpu_key() {
-                let resolve_start = trace.then(std::time::Instant::now);
-                kernels = device.resolve_batch(&[logits_key]);
-                if let Some(start) = resolve_start {
-                    eprintln!(
-                        "forward_resolve path={path} decode_eligible={decode_eligible} kernels={kernels} elapsed={:?}",
-                        start.elapsed()
-                    );
-                }
+        let logits = match logits {
+            Ok(logits) => logits,
+            Err(err) => return Box::pin(async move { Err(err.into()) }),
+        };
+        let logits = logits.squeeze(0);
+        // Cast logits back to f32 for sampling
+        let logits: fusor::Tensor<1, f32> = logits.cast();
+        let len = logits.shape()[0];
+        let mut kernels = 0;
+        if let Some(logits_key) = logits.gpu_key() {
+            let resolve_start = trace.then(std::time::Instant::now);
+            kernels = device.resolve_batch(&[logits_key]);
+            if let Some(start) = resolve_start {
+                eprintln!(
+                    "forward_resolve path={path} decode_eligible={decode_eligible} kernels={kernels} elapsed={:?}",
+                    start.elapsed()
+                );
             }
+            if let Some(cache) = cache.as_deref_mut() {
+                cache.detach(device);
+            }
+        }
+        Box::pin(async move {
             let download_start = trace.then(std::time::Instant::now);
             let logits = logits.as_slice().await?;
             if let Some(start) = download_start {
@@ -369,20 +375,16 @@ where
         device: &Device,
         tokens: &[u32],
         images: &[(image::DynamicImage, MediaHints)],
-        cache: Option<&mut LlamaCache>,
+        mut cache: Option<&mut LlamaCache>,
         #[allow(unused)] tokenizer: &Tokenizer,
         top_k: usize,
-    ) -> impl kalosm_model_types::FutureWasmNotSend<Output = Result<Vec<Logit>, LlamaModelError>>
-    {
+    ) -> Pin<
+        Box<
+            dyn kalosm_model_types::FutureWasmNotSend<Output = Result<Vec<Logit>, LlamaModelError>>,
+        >,
+    > {
         if tokens.is_empty() {
-            return Box::pin(async { Err(LlamaModelError::EmptyInput) })
-                as Pin<
-                    Box<
-                        dyn kalosm_model_types::FutureWasmNotSend<
-                            Output = Result<Vec<Logit>, LlamaModelError>,
-                        >,
-                    >,
-                >;
+            return Box::pin(async { Err(LlamaModelError::EmptyInput) });
         }
 
         #[cfg(debug_assertions)]
@@ -410,31 +412,35 @@ where
         };
         let token_start = trace.then(std::time::Instant::now);
         let build_start = trace.then(std::time::Instant::now);
-        let logits = model.forward(tokens, images, device, cache);
+        let logits = model.forward(tokens, images, device, cache.as_deref_mut());
         if let Some(start) = build_start {
             eprintln!(
                 "forward_graph_build path={path} decode_eligible={decode_eligible} elapsed={:?}",
                 start.elapsed()
             );
         }
-        let device = device.clone();
-        Box::pin(async move {
-            let logits = logits?;
-            let logits = logits.squeeze(0);
-            let logits: fusor::Tensor<1, f32> = logits.cast();
-            let len = logits.shape()[0];
-            let mut kernels = 0;
-            if let Some(logits_key) = logits.gpu_key() {
-                let resolve_start = trace.then(std::time::Instant::now);
-                kernels = device.resolve_batch(&[logits_key]);
-                if let Some(start) = resolve_start {
-                    eprintln!(
-                        "forward_resolve path={path} decode_eligible={decode_eligible} kernels={kernels} elapsed={:?}",
-                        start.elapsed()
-                    );
-                }
+        let logits = match logits {
+            Ok(logits) => logits,
+            Err(err) => return Box::pin(async move { Err(err.into()) }),
+        };
+        let logits = logits.squeeze(0);
+        let logits: fusor::Tensor<1, f32> = logits.cast();
+        let len = logits.shape()[0];
+        let mut kernels = 0;
+        if let Some(logits_key) = logits.gpu_key() {
+            let resolve_start = trace.then(std::time::Instant::now);
+            kernels = device.resolve_batch(&[logits_key]);
+            if let Some(start) = resolve_start {
+                eprintln!(
+                    "forward_resolve path={path} decode_eligible={decode_eligible} kernels={kernels} elapsed={:?}",
+                    start.elapsed()
+                );
             }
-
+            if let Some(cache) = cache.as_deref_mut() {
+                cache.detach(device);
+            }
+        }
+        Box::pin(async move {
             let download_start = trace.then(std::time::Instant::now);
             let top_logits = if use_full_logits_for_sampling(len) {
                 let logits = logits.as_slice().await?;
@@ -474,7 +480,7 @@ where
         device: &Device,
         tokens: &[u32],
         images: &[(image::DynamicImage, MediaHints)],
-        cache: Option<&mut LlamaCache>,
+        mut cache: Option<&mut LlamaCache>,
         #[allow(unused)] tokenizer: &Tokenizer,
         sampler: &'a mut fusor::GpuMirostat2Sampler,
         previous_tokens: Vec<u32>,
@@ -511,30 +517,34 @@ where
         };
         let token_start = trace.then(std::time::Instant::now);
         let build_start = trace.then(std::time::Instant::now);
-        let logits = model.forward(tokens, images, device, cache);
+        let logits = model.forward(tokens, images, device, cache.as_deref_mut());
         if let Some(start) = build_start {
             eprintln!(
                 "forward_graph_build path={path} decode_eligible={decode_eligible} elapsed={:?}",
                 start.elapsed()
             );
         }
-        let device = device.clone();
-        Box::pin(async move {
-            let logits = logits?;
-            let logits = logits.squeeze(0);
-            let logits: fusor::Tensor<1, f32> = logits.cast();
-            let mut kernels = 0;
-            if let Some(logits_key) = logits.gpu_key() {
-                let resolve_start = trace.then(std::time::Instant::now);
-                kernels = device.resolve_batch(&[logits_key]);
-                if let Some(start) = resolve_start {
-                    eprintln!(
-                        "forward_resolve path={path} decode_eligible={decode_eligible} kernels={kernels} elapsed={:?}",
-                        start.elapsed()
-                    );
-                }
+        let logits = match logits {
+            Ok(logits) => logits,
+            Err(err) => return Box::pin(async move { Err(err.into()) }),
+        };
+        let logits = logits.squeeze(0);
+        let logits: fusor::Tensor<1, f32> = logits.cast();
+        let mut kernels = 0;
+        if let Some(logits_key) = logits.gpu_key() {
+            let resolve_start = trace.then(std::time::Instant::now);
+            kernels = device.resolve_batch(&[logits_key]);
+            if let Some(start) = resolve_start {
+                eprintln!(
+                    "forward_resolve path={path} decode_eligible={decode_eligible} kernels={kernels} elapsed={:?}",
+                    start.elapsed()
+                );
             }
-
+            if let Some(cache) = cache.as_deref_mut() {
+                cache.detach(device);
+            }
+        }
+        Box::pin(async move {
             let download_start = trace.then(std::time::Instant::now);
             let token_id = logits
                 .sample_mirostat2_token(sampler, &previous_tokens, params)
@@ -833,9 +843,12 @@ where
                             .cache
                             .write()
                             .map_err(|err| LlamaModelError::Session(err.to_string()))?;
-                        if max_tokens != u32::MAX {
-                            session_lock.reserve_decode(&self.device, max_tokens as usize);
-                        }
+                        let reserve_tokens = if max_tokens == u32::MAX {
+                            unbounded_decode_reserve_tokens()
+                        } else {
+                            max_tokens as usize
+                        };
+                        session_lock.reserve_decode(&self.device, reserve_tokens);
                     }
 
                     let stop_token = self.model.config.stop_token;
@@ -866,6 +879,12 @@ where
                                 .cache
                                 .write()
                                 .map_err(|err| LlamaModelError::Session(err.to_string()))?;
+                            if max_tokens == u32::MAX {
+                                session_lock.reserve_decode(
+                                    &self.device,
+                                    unbounded_decode_reserve_tokens(),
+                                );
+                            }
                             Self::forward_sample_token(
                                 &self.model,
                                 &self.device,
@@ -922,13 +941,12 @@ where
                 .cache
                 .write()
                 .map_err(|err| LlamaModelError::Session(err.to_string()))?;
-            // `GenerationParameters::default()` uses `u32::MAX` as an "unbounded"
-            // generation sentinel. Reserving that would grow the KV cache to the
-            // model's full context length after every prompt, which is disastrous
-            // for large-context models when callers use `.take(n)` on the stream.
-            if max_tokens != u32::MAX {
-                session_lock.reserve_decode(&self.device, max_tokens as usize);
-            }
+            let reserve_tokens = if max_tokens == u32::MAX {
+                unbounded_decode_reserve_tokens()
+            } else {
+                max_tokens as usize
+            };
+            session_lock.reserve_decode(&self.device, reserve_tokens);
         }
         let mut logits = logits_from_sorted_top_k(logit_probs);
         // This stores a buffer of text that has been generated to check against the stop_on string. It should never be longer than the stop_on string.
@@ -1009,6 +1027,9 @@ where
                     .cache
                     .write()
                     .map_err(|err| LlamaModelError::Session(err.to_string()))?;
+                if max_tokens == u32::MAX {
+                    session_lock.reserve_decode(&self.device, unbounded_decode_reserve_tokens());
+                }
                 Self::forward_top_k(
                     &self.model,
                     &self.device,

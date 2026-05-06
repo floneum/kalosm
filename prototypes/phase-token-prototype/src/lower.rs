@@ -16,7 +16,7 @@ use crate::ir::{
     LoopFoldGroupId, MemoryLevel, Op, PinId, StorageIndexMap, StorageView, TileBinaryOp,
     TileCompareOp, TileExpr, TileId, TileIndexExpr, TileLiteral, TileLoadExpr, TileMaskExpr,
     TileOrigin, TileProgramOp, TileQuantizedLoadExpr, TileReduceOp, TileRef, TileScalarExpr,
-    TileStmt, TileStoreStmt, TileUnaryOp,
+    TileStmt, TileStoreStmt, TileSwiGluStoreStmt, TileUnaryOp,
 };
 use crate::quantized::{GgmlQuantFormat, QuantizedMatrix};
 

@@ -69,4 +69,14 @@ impl LlamaCache {
             }
         }
     }
+
+    pub(crate) fn detach(&mut self, device: &Device) {
+        let mut keys = Vec::with_capacity(self.blocks.len() * 2);
+        for block in &mut self.blocks {
+            block.detach_keys(&mut keys);
+        }
+        if !keys.is_empty() {
+            device.detach_cached(&keys);
+        }
+    }
 }

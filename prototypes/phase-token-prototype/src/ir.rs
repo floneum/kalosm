@@ -372,6 +372,11 @@ pub struct TileProgramOp {
 pub enum TileStmt {
     /// Per-lane masked storage write.
     Store(TileStoreStmt),
+    /// Per-lane masked SwiGLU storage write.
+    ///
+    /// This keeps the uniform `gate`/`up` expressions outside the store mask,
+    /// then computes `gate * sigmoid(gate) * up` only for lanes that store.
+    StoreSwiGlu(TileSwiGluStoreStmt),
     /// Zero-initialize a coop accumulator.
     ZeroCoopAcc { id: CoopAccId },
     /// Cooperatively copy a workgroup-tile-sized region of a storage view into
@@ -434,6 +439,17 @@ pub struct TileStoreStmt {
     pub row: TileIndexExpr,
     pub col: TileIndexExpr,
     pub value: TileExpr,
+    pub mask: TileMaskExpr,
+}
+
+/// A masked SwiGLU store emitted by a source tile program.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TileSwiGluStoreStmt {
+    pub dst: StorageView,
+    pub row: TileIndexExpr,
+    pub col: TileIndexExpr,
+    pub gate: TileExpr,
+    pub up: TileExpr,
     pub mask: TileMaskExpr,
 }
 

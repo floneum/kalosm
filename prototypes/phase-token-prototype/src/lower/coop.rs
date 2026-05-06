@@ -27,7 +27,7 @@ impl<'a> Lowerer<'a> {
         stmt: &TileStmt,
     ) -> Result<(), LowerError> {
         match stmt {
-            TileStmt::Store(_) => Err(LowerError::UnsupportedOperation(
+            TileStmt::Store(_) | TileStmt::StoreSwiGlu(_) => Err(LowerError::UnsupportedOperation(
                 "store statements must be lowered by lower_tile_program",
             )),
             TileStmt::Barrier => {

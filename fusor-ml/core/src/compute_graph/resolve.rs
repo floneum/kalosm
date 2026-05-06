@@ -310,7 +310,9 @@ impl Resolver {
         // Pass 2: Apply Rewrite Rules
         {
             let start = host_trace.then(Instant::now);
-            self.optimize(graph);
+            if std::env::var_os("FUSOR_RESOLVE_SKIP_OPTIMIZE").is_none() {
+                self.optimize(graph);
+            }
             if let Some(start) = start {
                 host_profile.optimize += start.elapsed();
             }
@@ -1004,6 +1006,18 @@ impl Resolver {
         // fusion, post-op reduce/matmul fusion) or MatMul nodes (pre-op
         // unary fusion). Avoid scanning every QMatMul/RMS/attention node in
         // decode graphs with hundreds of kernels.
+        let has_reduce = self.execution_graph.node_indices().any(|node| {
+            matches!(
+                self.execution_graph[node].variant,
+                ComputeGraphNodeVariant::Reduce(_)
+            )
+        });
+        let has_matmul = self.execution_graph.node_indices().any(|node| {
+            matches!(
+                self.execution_graph[node].variant,
+                ComputeGraphNodeVariant::MatMul(_)
+            )
+        });
         let mut worklist: VecDeque<ExecutionNodeIndex> = self
             .execution_graph
             .node_indices()
@@ -1027,8 +1041,8 @@ impl Resolver {
             // 1. Fuse naries together (combine expression trees)
             // 2. Try to fuse resulting nary into specialized ops (reduce, matmul, etc.)
             let changed = self.try_fuse_naries(graph, node_idx)
-                || self.try_fuse_into_reduce(graph, node_idx)
-                || self.try_fuse_into_matmul(graph, node_idx);
+                || (has_reduce && self.try_fuse_into_reduce(graph, node_idx))
+                || (has_matmul && self.try_fuse_into_matmul(graph, node_idx));
 
             if changed {
                 // Re-add the current node to worklist if it still exists

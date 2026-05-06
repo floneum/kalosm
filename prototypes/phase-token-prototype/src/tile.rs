@@ -7,8 +7,8 @@ use crate::ir::{
     LoopFoldGroupId, MemoryLevel, Numeric, Op, PinId, Shape, StorageIndexMap, StorageView,
     TileBinaryOp, TileCompareOp, TileDecl, TileExpr, TileIndexExpr, TileLevel, TileLiteral,
     TileLoadExpr, TileMaskExpr, TileOrigin, TileProgramOp, TileQuantizedLoadExpr, TileReduceOp,
-    TileRef, TileScalarExpr, TileStmt, TileStoreStmt, TileUnaryOp, WorkgroupAxis, WorkgroupOffset,
-    F32, U32,
+    TileRef, TileScalarExpr, TileStmt, TileStoreStmt, TileSwiGluStoreStmt, TileUnaryOp,
+    WorkgroupAxis, WorkgroupOffset, F32, U32,
 };
 use crate::quantized::{GgmlQuantFormat, QuantizedMatrix};
 
@@ -645,6 +645,39 @@ impl Program {
         self.qgemv_q4k_swiglu_ggml::<4, 1, 2, 128>(a, b, y, pair_cols, workgroups_x);
     }
 
+    pub fn qgemv_q4k_swiglu_4x4(
+        &mut self,
+        a: &Storage<F32, 2>,
+        b: &QuantizedMatrix,
+        y: &Storage<F32, 2>,
+        pair_cols: u32,
+        workgroups_x: u32,
+    ) {
+        self.qgemv_q4k_swiglu_ggml::<4, 4, 8, 128>(a, b, y, pair_cols, workgroups_x);
+    }
+
+    pub fn qgemv_q4k_swiglu_8x1(
+        &mut self,
+        a: &Storage<F32, 2>,
+        b: &QuantizedMatrix,
+        y: &Storage<F32, 2>,
+        pair_cols: u32,
+        workgroups_x: u32,
+    ) {
+        self.qgemv_q4k_swiglu_ggml::<8, 1, 2, 256>(a, b, y, pair_cols, workgroups_x);
+    }
+
+    pub fn qgemv_q4k_swiglu_8x2(
+        &mut self,
+        a: &Storage<F32, 2>,
+        b: &QuantizedMatrix,
+        y: &Storage<F32, 2>,
+        pair_cols: u32,
+        workgroups_x: u32,
+    ) {
+        self.qgemv_q4k_swiglu_ggml::<8, 2, 4, 256>(a, b, y, pair_cols, workgroups_x);
+    }
+
     pub fn qgemv_q4k_swiglu_2x2(
         &mut self,
         a: &Storage<F32, 2>,
@@ -799,15 +832,12 @@ impl Program {
                 let col = col0.clone() + offset as u32;
                 let gate = program.subgroup_reduce_sum(sums[offset].clone());
                 let up = program.subgroup_reduce_sum(sums[offset + PAIRS_PER_SUBGROUP].clone());
-                let one = program.full(1.0);
-                let sigmoid = one.clone() / (one + (gate.clone() * program.full(-1.0)).exp());
-                let value = gate * sigmoid * up;
                 let mask = if full_cols {
                     lane.eq(0)
                 } else {
                     lane.eq(0).and(col.lt(pair_cols))
                 };
-                program.store(y.at(0, col), value, mask);
+                program.store_swiglu(y.at(0, col), gate, up, mask);
             }
         });
     }
@@ -2438,6 +2468,23 @@ impl<const BLOCK: usize> TileBlock<'_, BLOCK> {
             row: address.row,
             col: address.col,
             value: value.expr,
+            mask: mask.expr,
+        }));
+    }
+
+    pub fn store_swiglu(
+        &mut self,
+        address: Address<F32, BLOCK>,
+        gate: Tile<BLOCK>,
+        up: Tile<BLOCK>,
+        mask: Mask<BLOCK>,
+    ) {
+        self.push_stmt(TileStmt::StoreSwiGlu(TileSwiGluStoreStmt {
+            dst: address.view,
+            row: address.row,
+            col: address.col,
+            gate: gate.expr,
+            up: up.expr,
             mask: mask.expr,
         }));
     }
