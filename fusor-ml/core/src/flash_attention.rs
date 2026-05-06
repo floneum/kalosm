@@ -28,7 +28,9 @@ use wgpu::naga::{
 const BLOCK: usize = 256;
 const SIMD_WIDTH: usize = 32;
 const OUTPUTS_PER_WORKGROUP: usize = BLOCK / SIMD_WIDTH;
-const DECODE_BLOCK: u32 = 128;
+const DECODE_SMALL_BLOCK: u32 = 128;
+const DECODE_MEDIUM_BLOCK: u32 = 512;
+const DECODE_LARGE_BLOCK: u32 = 1024;
 const DECODE_HEAD_DIM: u32 = 128;
 const FLOAT_MIN: f32 = -1.0e30;
 const FLASH_ATTENTION_MODULE_CACHE_SIZE: usize = 128;
@@ -51,9 +53,16 @@ fn hash_layout<H: Hasher>(state: &mut H, layout: &crate::Layout) {
     layout.strides().hash(state);
 }
 
+fn hash_strided_buffer<H: Hasher>(state: &mut H, layout: &crate::Layout) {
+    layout.offset().hash(state);
+    layout.strides().hash(state);
+}
+
 fn flash_attention_module_key(
     variant: FlashAttentionKernelVariant,
     dims: FlashAttentionDims,
+    decode_block: Option<u32>,
+    decode_tiled: bool,
     scale_bits: u32,
     dispatch_size: [u32; 3],
     q: &TensorData,
@@ -72,14 +81,23 @@ fn flash_attention_module_key(
         dims.q_seq_len.hash(&mut hasher);
         dims.kv_seq_len.hash(&mut hasher);
         dims.head_dim.hash(&mut hasher);
+        decode_block.hash(&mut hasher);
+        decode_tiled.hash(&mut hasher);
         scale_bits.hash(&mut hasher);
         dispatch_size.hash(&mut hasher);
-        hash_layout(&mut hasher, q.layout());
-        hash_layout(&mut hasher, k.layout());
-        hash_layout(&mut hasher, v.layout());
-        mask.map(|mask| hash_layout(&mut hasher, mask.layout()))
-            .hash(&mut hasher);
-        hash_layout(&mut hasher, output.layout());
+        if variant == FlashAttentionKernelVariant::DecodeSmall {
+            hash_strided_buffer(&mut hasher, q.layout());
+            hash_strided_buffer(&mut hasher, k.layout());
+            hash_strided_buffer(&mut hasher, v.layout());
+            hash_strided_buffer(&mut hasher, output.layout());
+        } else {
+            hash_layout(&mut hasher, q.layout());
+            hash_layout(&mut hasher, k.layout());
+            hash_layout(&mut hasher, v.layout());
+            mask.map(|mask| hash_layout(&mut hasher, mask.layout()))
+                .hash(&mut hasher);
+            hash_layout(&mut hasher, output.layout());
+        }
         hasher.finish()
     })
 }
@@ -264,14 +282,21 @@ impl Operation for FlashAttentionOperation {
             return None;
         }
 
+        let decode_candidate =
+            mask_meta.is_none() && dims.q_seq_len == 1 && dims.head_dim == DECODE_HEAD_DIM;
         let decode_meta = build_flash_decode_small_meta(
             dims,
             self.scale,
+            device.limits().max_compute_invocations_per_workgroup,
             q_meta.clone(),
             k_meta.clone(),
             v_meta.clone(),
             mask_meta.as_ref(),
             output_meta.clone(),
+        );
+        assert!(
+            !decode_candidate || decode_meta.is_some(),
+            "decode attention refused slow fallback: device must support at least {DECODE_SMALL_BLOCK} workgroup invocations"
         );
         let variant = if decode_meta.is_some() {
             FlashAttentionKernelVariant::DecodeSmall
@@ -297,9 +322,12 @@ impl Operation for FlashAttentionOperation {
             return None;
         }
 
+        let module_dims = decode_meta.as_ref().map(|meta| meta.dims).unwrap_or(dims);
         let module_key = flash_attention_module_key(
             variant,
-            dims,
+            module_dims,
+            decode_meta.as_ref().map(|meta| meta.decode_block),
+            decode_meta.as_ref().is_some_and(|meta| meta.tiled),
             self.scale.to_bits(),
             dispatch_size,
             &q,
@@ -388,6 +416,20 @@ impl Operation for FlashAttentionOperation {
             buffer: output.buffer().clone(),
             read_only: false,
         });
+        if let Some(meta) = decode_meta {
+            let params = [meta.active_kv_len, 0, 0, 0];
+            let params_buffer = device.create_buffer_init(
+                bytemuck::cast_slice(&params),
+                wgpu::BufferUsages::STORAGE
+                    | wgpu::BufferUsages::COPY_DST
+                    | wgpu::BufferUsages::COPY_SRC,
+            );
+            bindings.push(DirectKernelBinding::Storage {
+                binding: 4,
+                buffer: params_buffer,
+                read_only: true,
+            });
+        }
 
         Some(DirectKernel::new_with_arc_module(
             kernel_label,
@@ -521,6 +563,9 @@ struct FlashAttentionNagaMeta {
 struct FlashDecodeSmallMeta {
     dims: FlashAttentionDims,
     scale: f32,
+    active_kv_len: u32,
+    decode_block: u32,
+    tiled: bool,
     groups: u32,
     q_offset: u32,
     k_offset: u32,
@@ -535,6 +580,7 @@ struct FlashDecodeSmallMeta {
 fn build_flash_decode_small_meta(
     dims: FlashAttentionDims,
     scale: f32,
+    max_workgroup_invocations: u32,
     q_meta: TensorMeta,
     k_meta: TensorMeta,
     v_meta: TensorMeta,
@@ -545,19 +591,44 @@ fn build_flash_decode_small_meta(
         || dims.q_seq_len != 1
         || dims.head_dim != DECODE_HEAD_DIM
         || dims.kv_seq_len == 0
-        || dims.kv_seq_len > DECODE_BLOCK
     {
         return None;
     }
+    let decode_block = if dims.kv_seq_len > DECODE_LARGE_BLOCK {
+        if max_workgroup_invocations < DECODE_SMALL_BLOCK {
+            return None;
+        }
+        DECODE_SMALL_BLOCK
+    } else if dims.kv_seq_len <= DECODE_SMALL_BLOCK
+        || max_workgroup_invocations < DECODE_MEDIUM_BLOCK
+    {
+        if max_workgroup_invocations < DECODE_SMALL_BLOCK {
+            return None;
+        }
+        DECODE_SMALL_BLOCK
+    } else if dims.kv_seq_len <= DECODE_MEDIUM_BLOCK
+        || max_workgroup_invocations < DECODE_LARGE_BLOCK
+    {
+        DECODE_MEDIUM_BLOCK
+    } else {
+        DECODE_LARGE_BLOCK
+    };
+    let tiled = dims.kv_seq_len > decode_block;
 
     let groups = dims.num_heads.checked_div(dims.num_kv_heads)?;
     if groups == 0 {
         return None;
     }
 
+    let mut module_dims = dims;
+    module_dims.kv_seq_len = decode_block;
+
     Some(FlashDecodeSmallMeta {
-        dims,
+        dims: module_dims,
         scale,
+        active_kv_len: dims.kv_seq_len,
+        decode_block,
+        tiled,
         groups,
         q_offset: q_meta.offset,
         k_offset: k_meta.offset,
@@ -576,6 +647,7 @@ struct FlashDecodeSmallGlobals {
     k: Handle<GlobalVariable>,
     v: Handle<GlobalVariable>,
     output: Handle<GlobalVariable>,
+    params: Handle<GlobalVariable>,
     scores: Handle<GlobalVariable>,
     probs: Handle<GlobalVariable>,
     reduce: Handle<GlobalVariable>,
@@ -585,6 +657,14 @@ struct FlashDecodeSmallGlobals {
 struct FlashDecodeSmallLocals {
     acc: Handle<LocalVariable>,
     kv: Handle<LocalVariable>,
+    item: Handle<LocalVariable>,
+}
+
+#[derive(Clone, Copy)]
+struct FlashDecodeRowIndices {
+    batch_idx: Handle<Expression>,
+    head_idx: Handle<Expression>,
+    kv_head_idx: Handle<Expression>,
 }
 
 struct FlashDecodeSmallNagaBuilder {
@@ -633,12 +713,23 @@ impl FlashDecodeSmallNagaBuilder {
             },
             Span::default(),
         );
+        let u32_storage_ty = module.types.insert(
+            Type {
+                name: Some("FlashDecodeParams".into()),
+                inner: TypeInner::Array {
+                    base: u32_ty,
+                    size: ArraySize::Dynamic,
+                    stride: 4,
+                },
+            },
+            Span::default(),
+        );
         let scratch_ty = module.types.insert(
             Type {
                 name: Some("FlashDecodeScratch".into()),
                 inner: TypeInner::Array {
                     base: f32_ty,
-                    size: ArraySize::Constant(NonZeroU32::new(DECODE_BLOCK)?),
+                    size: ArraySize::Constant(NonZeroU32::new(self.meta.decode_block)?),
                     stride: 4,
                 },
             },
@@ -649,6 +740,7 @@ impl FlashDecodeSmallNagaBuilder {
         let k = Self::storage_global(&mut module, "k", 1, storage_ty, true);
         let v = Self::storage_global(&mut module, "v", 2, storage_ty, true);
         let output = Self::storage_global(&mut module, "output", 3, storage_ty, false);
+        let params = Self::storage_global(&mut module, "params", 4, u32_storage_ty, true);
         let scores = Self::workgroup_global(&mut module, "scores", scratch_ty);
         let probs = Self::workgroup_global(&mut module, "probs", scratch_ty);
         let reduce = Self::workgroup_global(&mut module, "reduce", scratch_ty);
@@ -657,6 +749,7 @@ impl FlashDecodeSmallNagaBuilder {
             k,
             v,
             output,
+            params,
             scores,
             probs,
             reduce,
@@ -681,6 +774,7 @@ impl FlashDecodeSmallNagaBuilder {
         let locals = FlashDecodeSmallLocals {
             acc: Self::local(&mut function, "acc", f32_ty),
             kv: Self::local(&mut function, "kv", u32_ty),
+            item: Self::local(&mut function, "item", u32_ty),
         };
 
         function.body = self.entry_body(&mut function.expressions, globals, locals);
@@ -691,7 +785,7 @@ impl FlashDecodeSmallNagaBuilder {
             name: "main".into(),
             stage: ShaderStage::Compute,
             early_depth_test: None,
-            workgroup_size: [DECODE_BLOCK, 1, 1],
+            workgroup_size: [self.meta.decode_block, 1, 1],
             workgroup_size_overrides: None,
             function,
             mesh_info: None,
@@ -708,9 +802,16 @@ impl FlashDecodeSmallNagaBuilder {
         globals: FlashDecodeSmallGlobals,
         locals: FlashDecodeSmallLocals,
     ) -> Block {
+        if self.meta.tiled {
+            return self.entry_body_tiled(expressions, globals, locals);
+        }
+
         let mut body = Block::new();
         let local = expressions.append(Expression::FunctionArgument(0), Span::default());
         let workgroup_id = expressions.append(Expression::FunctionArgument(1), Span::default());
+        let zero_param_index = self.u32_lit(expressions, 0);
+        let active_kv_len =
+            self.load_storage(expressions, &mut body, globals.params, zero_param_index);
         let row = self.emit(
             expressions,
             &mut body,
@@ -722,7 +823,13 @@ impl FlashDecodeSmallNagaBuilder {
         let head_idx = self.rem_lit(expressions, &mut body, row, self.meta.dims.num_heads);
         let batch_idx = self.div_lit(expressions, &mut body, row, self.meta.dims.num_heads);
         let kv_head_idx = self.div_lit(expressions, &mut body, head_idx, self.meta.groups);
-        let kv_valid = self.lt_lit(expressions, &mut body, local, self.meta.dims.kv_seq_len);
+        let kv_valid = self.bin(
+            expressions,
+            &mut body,
+            BinaryOperator::Less,
+            local,
+            active_kv_len,
+        );
 
         let min_score = self.f32_lit(expressions, FLOAT_MIN);
         self.store_workgroup(expressions, &mut body, globals.scores, local, min_score);
@@ -869,6 +976,7 @@ impl FlashDecodeSmallNagaBuilder {
             head_idx,
             kv_head_idx,
             local,
+            active_kv_len,
         );
         body.push(
             Statement::If {
@@ -882,6 +990,458 @@ impl FlashDecodeSmallNagaBuilder {
         body
     }
 
+    fn score_for_kv(
+        &self,
+        expressions: &mut Arena<Expression>,
+        body: &mut Block,
+        globals: FlashDecodeSmallGlobals,
+        indices: FlashDecodeRowIndices,
+        kv: Handle<Expression>,
+    ) -> Handle<Expression> {
+        let zero = self.f32_lit(expressions, 0.0);
+        let mut score = zero;
+        for dim in 0..DECODE_HEAD_DIM {
+            let q_index = self.index4_const_last(
+                expressions,
+                body,
+                self.meta.q_offset,
+                self.meta.q_strides,
+                indices.batch_idx,
+                indices.head_idx,
+                0,
+                dim,
+            );
+            let k_index = self.index4_const_last_dyn_i2(
+                expressions,
+                body,
+                self.meta.k_offset,
+                self.meta.k_strides,
+                indices.batch_idx,
+                indices.kv_head_idx,
+                kv,
+                dim,
+            );
+            let q_value = self.load_storage(expressions, body, globals.q, q_index);
+            let k_value = self.load_storage(expressions, body, globals.k, k_index);
+            let product = self.bin(
+                expressions,
+                body,
+                BinaryOperator::Multiply,
+                q_value,
+                k_value,
+            );
+            score = self.bin(expressions, body, BinaryOperator::Add, score, product);
+        }
+        let scale = self.f32_lit(expressions, self.meta.scale);
+        self.bin(expressions, body, BinaryOperator::Multiply, score, scale)
+    }
+
+    fn entry_body_tiled(
+        &self,
+        expressions: &mut Arena<Expression>,
+        globals: FlashDecodeSmallGlobals,
+        locals: FlashDecodeSmallLocals,
+    ) -> Block {
+        let mut body = Block::new();
+        let local = expressions.append(Expression::FunctionArgument(0), Span::default());
+        let workgroup_id = expressions.append(Expression::FunctionArgument(1), Span::default());
+        let zero_param_index = self.u32_lit(expressions, 0);
+        let active_kv_len =
+            self.load_storage(expressions, &mut body, globals.params, zero_param_index);
+        let row = self.emit(
+            expressions,
+            &mut body,
+            Expression::AccessIndex {
+                base: workgroup_id,
+                index: 0,
+            },
+        );
+        let head_idx = self.rem_lit(expressions, &mut body, row, self.meta.dims.num_heads);
+        let batch_idx = self.div_lit(expressions, &mut body, row, self.meta.dims.num_heads);
+        let kv_head_idx = self.div_lit(expressions, &mut body, head_idx, self.meta.groups);
+
+        let min_score = self.f32_lit(expressions, FLOAT_MIN);
+        self.store_workgroup(expressions, &mut body, globals.reduce, local, min_score);
+        self.store_local(expressions, &mut body, locals.kv, local);
+        self.append_tiled_max_loop(
+            expressions,
+            &mut body,
+            globals,
+            locals,
+            FlashDecodeRowIndices {
+                batch_idx,
+                head_idx,
+                kv_head_idx,
+            },
+            local,
+            active_kv_len,
+        );
+        body.push(
+            Statement::ControlBarrier(Barrier::WORK_GROUP),
+            Span::default(),
+        );
+
+        self.reduce_workgroup(
+            expressions,
+            &mut body,
+            globals.reduce,
+            local,
+            FlashReduceOp::Max,
+        );
+        let zero_index = self.u32_lit(expressions, 0);
+        let max_score = self.load_workgroup(expressions, &mut body, globals.reduce, zero_index);
+
+        let zero = self.f32_lit(expressions, 0.0);
+        self.store_workgroup(expressions, &mut body, globals.reduce, local, zero);
+        self.store_local(expressions, &mut body, locals.kv, local);
+        self.append_tiled_sum_loop(
+            expressions,
+            &mut body,
+            globals,
+            locals,
+            FlashDecodeRowIndices {
+                batch_idx,
+                head_idx,
+                kv_head_idx,
+            },
+            local,
+            active_kv_len,
+            max_score,
+        );
+        body.push(
+            Statement::ControlBarrier(Barrier::WORK_GROUP),
+            Span::default(),
+        );
+
+        self.reduce_workgroup(
+            expressions,
+            &mut body,
+            globals.reduce,
+            local,
+            FlashReduceOp::Sum,
+        );
+        let denom = self.load_workgroup(expressions, &mut body, globals.reduce, zero_index);
+
+        self.store_local(expressions, &mut body, locals.acc, zero);
+        let zero_u32 = self.u32_lit(expressions, 0);
+        self.store_local(expressions, &mut body, locals.kv, zero_u32);
+        self.append_tiled_output_loop(
+            expressions,
+            &mut body,
+            globals,
+            locals,
+            FlashDecodeRowIndices {
+                batch_idx,
+                head_idx,
+                kv_head_idx,
+            },
+            local,
+            active_kv_len,
+            max_score,
+            denom,
+        );
+
+        let output_value = self.load_local(expressions, &mut body, locals.acc);
+        let q_idx = self.u32_lit(expressions, 0);
+        let output_index = self.index4_dyn_last(
+            expressions,
+            &mut body,
+            self.meta.output_offset,
+            self.meta.output_strides,
+            batch_idx,
+            head_idx,
+            q_idx,
+            local,
+        );
+        self.store_storage(
+            expressions,
+            &mut body,
+            globals.output,
+            output_index,
+            output_value,
+        );
+
+        body
+    }
+
+    fn append_tiled_max_loop(
+        &self,
+        expressions: &mut Arena<Expression>,
+        body: &mut Block,
+        globals: FlashDecodeSmallGlobals,
+        locals: FlashDecodeSmallLocals,
+        indices: FlashDecodeRowIndices,
+        local: Handle<Expression>,
+        active_kv_len: Handle<Expression>,
+    ) {
+        let mut loop_body = Block::new();
+        let kv = self.load_local(expressions, &mut loop_body, locals.kv);
+        self.append_break_if_kv_done(expressions, &mut loop_body, kv, active_kv_len);
+        let score = self.score_for_kv(expressions, &mut loop_body, globals, indices, kv);
+        let current = self.load_workgroup(expressions, &mut loop_body, globals.reduce, local);
+        let next = self.max_f32(expressions, &mut loop_body, current, score);
+        self.store_workgroup(expressions, &mut loop_body, globals.reduce, local, next);
+        let next_kv = self.add_lit(expressions, &mut loop_body, kv, self.meta.decode_block);
+        self.store_local(expressions, &mut loop_body, locals.kv, next_kv);
+        body.push(
+            Statement::Loop {
+                body: loop_body,
+                continuing: Block::new(),
+                break_if: None,
+            },
+            Span::default(),
+        );
+    }
+
+    fn append_tiled_sum_loop(
+        &self,
+        expressions: &mut Arena<Expression>,
+        body: &mut Block,
+        globals: FlashDecodeSmallGlobals,
+        locals: FlashDecodeSmallLocals,
+        indices: FlashDecodeRowIndices,
+        local: Handle<Expression>,
+        active_kv_len: Handle<Expression>,
+        max_score: Handle<Expression>,
+    ) {
+        let mut loop_body = Block::new();
+        let kv = self.load_local(expressions, &mut loop_body, locals.kv);
+        self.append_break_if_kv_done(expressions, &mut loop_body, kv, active_kv_len);
+        let score = self.score_for_kv(expressions, &mut loop_body, globals, indices, kv);
+        let shifted = self.bin(
+            expressions,
+            &mut loop_body,
+            BinaryOperator::Subtract,
+            score,
+            max_score,
+        );
+        let prob = self.exp_f32(expressions, &mut loop_body, shifted);
+        let current = self.load_workgroup(expressions, &mut loop_body, globals.reduce, local);
+        let next = self.bin(
+            expressions,
+            &mut loop_body,
+            BinaryOperator::Add,
+            current,
+            prob,
+        );
+        self.store_workgroup(expressions, &mut loop_body, globals.reduce, local, next);
+        let next_kv = self.add_lit(expressions, &mut loop_body, kv, self.meta.decode_block);
+        self.store_local(expressions, &mut loop_body, locals.kv, next_kv);
+        body.push(
+            Statement::Loop {
+                body: loop_body,
+                continuing: Block::new(),
+                break_if: None,
+            },
+            Span::default(),
+        );
+    }
+
+    fn append_tiled_output_loop(
+        &self,
+        expressions: &mut Arena<Expression>,
+        body: &mut Block,
+        globals: FlashDecodeSmallGlobals,
+        locals: FlashDecodeSmallLocals,
+        indices: FlashDecodeRowIndices,
+        local: Handle<Expression>,
+        active_kv_len: Handle<Expression>,
+        max_score: Handle<Expression>,
+        denom: Handle<Expression>,
+    ) {
+        let mut loop_body = Block::new();
+        let tile_base = self.load_local(expressions, &mut loop_body, locals.kv);
+        self.append_break_if_kv_done(expressions, &mut loop_body, tile_base, active_kv_len);
+        let kv = self.bin(
+            expressions,
+            &mut loop_body,
+            BinaryOperator::Add,
+            tile_base,
+            local,
+        );
+        let kv_valid = self.bin(
+            expressions,
+            &mut loop_body,
+            BinaryOperator::Less,
+            kv,
+            active_kv_len,
+        );
+        let mut prob_accept = Block::new();
+        let score = self.score_for_kv(expressions, &mut prob_accept, globals, indices, kv);
+        let shifted = self.bin(
+            expressions,
+            &mut prob_accept,
+            BinaryOperator::Subtract,
+            score,
+            max_score,
+        );
+        let prob = self.exp_f32(expressions, &mut prob_accept, shifted);
+        let prob = self.bin(
+            expressions,
+            &mut prob_accept,
+            BinaryOperator::Divide,
+            prob,
+            denom,
+        );
+        self.store_workgroup(expressions, &mut prob_accept, globals.probs, local, prob);
+        let mut prob_reject = Block::new();
+        let zero = self.f32_lit(expressions, 0.0);
+        self.store_workgroup(expressions, &mut prob_reject, globals.probs, local, zero);
+        loop_body.push(
+            Statement::If {
+                condition: kv_valid,
+                accept: prob_accept,
+                reject: prob_reject,
+            },
+            Span::default(),
+        );
+        loop_body.push(
+            Statement::ControlBarrier(Barrier::WORK_GROUP),
+            Span::default(),
+        );
+
+        let zero_u32 = self.u32_lit(expressions, 0);
+        self.store_local(expressions, &mut loop_body, locals.item, zero_u32);
+        self.append_tiled_output_item_loop(
+            expressions,
+            &mut loop_body,
+            globals,
+            locals,
+            indices,
+            tile_base,
+            local,
+            active_kv_len,
+        );
+        loop_body.push(
+            Statement::ControlBarrier(Barrier::WORK_GROUP),
+            Span::default(),
+        );
+
+        let next_tile = self.add_lit(
+            expressions,
+            &mut loop_body,
+            tile_base,
+            self.meta.decode_block,
+        );
+        self.store_local(expressions, &mut loop_body, locals.kv, next_tile);
+        body.push(
+            Statement::Loop {
+                body: loop_body,
+                continuing: Block::new(),
+                break_if: None,
+            },
+            Span::default(),
+        );
+    }
+
+    fn append_tiled_output_item_loop(
+        &self,
+        expressions: &mut Arena<Expression>,
+        body: &mut Block,
+        globals: FlashDecodeSmallGlobals,
+        locals: FlashDecodeSmallLocals,
+        indices: FlashDecodeRowIndices,
+        tile_base: Handle<Expression>,
+        out_dim: Handle<Expression>,
+        active_kv_len: Handle<Expression>,
+    ) {
+        let mut loop_body = Block::new();
+        let item = self.load_local(expressions, &mut loop_body, locals.item);
+        let block_done = self.ge_lit(expressions, &mut loop_body, item, self.meta.decode_block);
+        let kv = self.bin(
+            expressions,
+            &mut loop_body,
+            BinaryOperator::Add,
+            tile_base,
+            item,
+        );
+        let kv_done = self.bin(
+            expressions,
+            &mut loop_body,
+            BinaryOperator::GreaterEqual,
+            kv,
+            active_kv_len,
+        );
+        let done = self.bin(
+            expressions,
+            &mut loop_body,
+            BinaryOperator::LogicalOr,
+            block_done,
+            kv_done,
+        );
+        loop_body.push(
+            Statement::If {
+                condition: done,
+                accept: Block::from_vec(vec![Statement::Break]),
+                reject: Block::new(),
+            },
+            Span::default(),
+        );
+
+        let prob = self.load_workgroup(expressions, &mut loop_body, globals.probs, item);
+        let v_index = self.index4_dyn_last(
+            expressions,
+            &mut loop_body,
+            self.meta.v_offset,
+            self.meta.v_strides,
+            indices.batch_idx,
+            indices.kv_head_idx,
+            kv,
+            out_dim,
+        );
+        let v_value = self.load_storage(expressions, &mut loop_body, globals.v, v_index);
+        let weighted = self.bin(
+            expressions,
+            &mut loop_body,
+            BinaryOperator::Multiply,
+            prob,
+            v_value,
+        );
+        let acc = self.load_local(expressions, &mut loop_body, locals.acc);
+        let acc = self.bin(
+            expressions,
+            &mut loop_body,
+            BinaryOperator::Add,
+            acc,
+            weighted,
+        );
+        self.store_local(expressions, &mut loop_body, locals.acc, acc);
+        let next_item = self.add_lit(expressions, &mut loop_body, item, 1);
+        self.store_local(expressions, &mut loop_body, locals.item, next_item);
+        body.push(
+            Statement::Loop {
+                body: loop_body,
+                continuing: Block::new(),
+                break_if: None,
+            },
+            Span::default(),
+        );
+    }
+
+    fn append_break_if_kv_done(
+        &self,
+        expressions: &mut Arena<Expression>,
+        body: &mut Block,
+        kv: Handle<Expression>,
+        active_kv_len: Handle<Expression>,
+    ) {
+        let done = self.bin(
+            expressions,
+            body,
+            BinaryOperator::GreaterEqual,
+            kv,
+            active_kv_len,
+        );
+        body.push(
+            Statement::If {
+                condition: done,
+                accept: Block::from_vec(vec![Statement::Break]),
+                reject: Block::new(),
+            },
+            Span::default(),
+        );
+    }
+
     fn append_output_loop(
         &self,
         expressions: &mut Arena<Expression>,
@@ -892,10 +1452,17 @@ impl FlashDecodeSmallNagaBuilder {
         head_idx: Handle<Expression>,
         kv_head_idx: Handle<Expression>,
         out_dim: Handle<Expression>,
+        active_kv_len: Handle<Expression>,
     ) {
         let mut loop_body = Block::new();
         let kv = self.load_local(expressions, &mut loop_body, locals.kv);
-        let done = self.ge_lit(expressions, &mut loop_body, kv, self.meta.dims.kv_seq_len);
+        let done = self.bin(
+            expressions,
+            &mut loop_body,
+            BinaryOperator::GreaterEqual,
+            kv,
+            active_kv_len,
+        );
         loop_body.push(
             Statement::If {
                 condition: done,
@@ -972,7 +1539,7 @@ impl FlashDecodeSmallNagaBuilder {
         local: Handle<Expression>,
         op: FlashReduceOp,
     ) {
-        let mut stride = DECODE_BLOCK / 2;
+        let mut stride = self.meta.decode_block / 2;
         while stride > 0 {
             let participates = self.lt_lit(expressions, body, local, stride);
             let mut accept = Block::new();
@@ -1371,6 +1938,317 @@ impl FlashDecodeSmallNagaBuilder {
 
 fn build_flash_decode_small_naga_module(meta: FlashDecodeSmallMeta) -> Option<Module> {
     FlashDecodeSmallNagaBuilder::new(meta).build()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{Device, Tensor};
+
+    const TEST_HEAD_DIM: usize = DECODE_HEAD_DIM as usize;
+
+    fn tensor_meta4() -> TensorMeta {
+        TensorMeta {
+            datatype: DataTypeEnum::F32,
+            strides: vec![65_536, 8_192, 128, 1],
+            offset: 0,
+        }
+    }
+
+    #[test]
+    fn decode_small_meta_buckets_dynamic_kv_len() {
+        let dims = FlashAttentionDims {
+            batch: 1,
+            num_heads: 32,
+            num_kv_heads: 8,
+            q_seq_len: 1,
+            kv_seq_len: DECODE_SMALL_BLOCK + 1,
+            head_dim: DECODE_HEAD_DIM,
+        };
+
+        let meta = build_flash_decode_small_meta(
+            dims,
+            1.0,
+            DECODE_MEDIUM_BLOCK,
+            tensor_meta4(),
+            tensor_meta4(),
+            tensor_meta4(),
+            None,
+            tensor_meta4(),
+        )
+        .unwrap();
+
+        assert_eq!(meta.active_kv_len, DECODE_SMALL_BLOCK + 1);
+        assert_eq!(meta.decode_block, DECODE_MEDIUM_BLOCK);
+        assert_eq!(meta.dims.kv_seq_len, DECODE_MEDIUM_BLOCK);
+        assert!(!meta.tiled);
+    }
+
+    #[test]
+    fn decode_small_meta_tiles_over_workgroup_limit() {
+        let dims = FlashAttentionDims {
+            batch: 1,
+            num_heads: 32,
+            num_kv_heads: 8,
+            q_seq_len: 1,
+            kv_seq_len: DECODE_SMALL_BLOCK + 1,
+            head_dim: DECODE_HEAD_DIM,
+        };
+
+        let meta = build_flash_decode_small_meta(
+            dims,
+            1.0,
+            DECODE_SMALL_BLOCK,
+            tensor_meta4(),
+            tensor_meta4(),
+            tensor_meta4(),
+            None,
+            tensor_meta4(),
+        );
+
+        let meta = meta.unwrap();
+        assert_eq!(meta.active_kv_len, DECODE_SMALL_BLOCK + 1);
+        assert_eq!(meta.decode_block, DECODE_SMALL_BLOCK);
+        assert_eq!(meta.dims.kv_seq_len, DECODE_SMALL_BLOCK);
+        assert!(meta.tiled);
+    }
+
+    #[test]
+    fn decode_small_meta_requires_minimum_workgroup_limit() {
+        let dims = FlashAttentionDims {
+            batch: 1,
+            num_heads: 32,
+            num_kv_heads: 8,
+            q_seq_len: 1,
+            kv_seq_len: DECODE_SMALL_BLOCK,
+            head_dim: DECODE_HEAD_DIM,
+        };
+
+        let meta = build_flash_decode_small_meta(
+            dims,
+            1.0,
+            DECODE_SMALL_BLOCK - 1,
+            tensor_meta4(),
+            tensor_meta4(),
+            tensor_meta4(),
+            None,
+            tensor_meta4(),
+        );
+
+        assert!(meta.is_none());
+    }
+
+    fn decode_q() -> Vec<Vec<Vec<Vec<f32>>>> {
+        vec![vec![vec![
+            (0..TEST_HEAD_DIM)
+                .map(|dim| ((dim % 17) as f32 - 8.0) * 0.0075)
+                .collect(),
+        ]]]
+    }
+
+    fn decode_k(kv_len: usize) -> Vec<Vec<Vec<Vec<f32>>>> {
+        vec![vec![
+            (0..kv_len)
+                .map(|token| {
+                    (0..TEST_HEAD_DIM)
+                        .map(|dim| {
+                            let value = ((token * 13 + dim * 7) % 31) as f32 - 15.0;
+                            value * 0.004
+                        })
+                        .collect()
+                })
+                .collect(),
+        ]]
+    }
+
+    fn decode_v(kv_len: usize) -> Vec<Vec<Vec<Vec<f32>>>> {
+        vec![vec![
+            (0..kv_len)
+                .map(|token| {
+                    (0..TEST_HEAD_DIM)
+                        .map(|dim| {
+                            let value = ((token * 5 + dim * 11) % 37) as f32 - 18.0;
+                            0.25 + value * 0.01
+                        })
+                        .collect()
+                })
+                .collect(),
+        ]]
+    }
+
+    fn decode_q_gqa(num_heads: usize) -> Vec<Vec<Vec<Vec<f32>>>> {
+        vec![
+            (0..num_heads)
+                .map(|head| {
+                    vec![
+                        (0..TEST_HEAD_DIM)
+                            .map(|dim| {
+                                let value = ((head * 19 + dim * 7) % 43) as f32 - 21.0;
+                                value * 0.003
+                            })
+                            .collect(),
+                    ]
+                })
+                .collect(),
+        ]
+    }
+
+    fn decode_k_gqa(num_kv_heads: usize, kv_len: usize) -> Vec<Vec<Vec<Vec<f32>>>> {
+        vec![
+            (0..num_kv_heads)
+                .map(|kv_head| {
+                    (0..kv_len)
+                        .map(|token| {
+                            (0..TEST_HEAD_DIM)
+                                .map(|dim| {
+                                    let value =
+                                        ((kv_head * 23 + token * 13 + dim * 5) % 47) as f32 - 23.0;
+                                    value * 0.0025
+                                })
+                                .collect()
+                        })
+                        .collect()
+                })
+                .collect(),
+        ]
+    }
+
+    fn decode_v_gqa(num_kv_heads: usize, kv_len: usize) -> Vec<Vec<Vec<Vec<f32>>>> {
+        vec![
+            (0..num_kv_heads)
+                .map(|kv_head| {
+                    (0..kv_len)
+                        .map(|token| {
+                            (0..TEST_HEAD_DIM)
+                                .map(|dim| {
+                                    let value =
+                                        ((kv_head * 29 + token * 3 + dim * 11) % 53) as f32 - 26.0;
+                                    0.05 + value * 0.004
+                                })
+                                .collect()
+                        })
+                        .collect()
+                })
+                .collect(),
+        ]
+    }
+
+    fn cpu_decode_reference(q: &[f32], k: &[Vec<f32>], v: &[Vec<f32>], scale: f32) -> Vec<f32> {
+        let scores = k
+            .iter()
+            .map(|key| {
+                q.iter()
+                    .zip(key)
+                    .map(|(q, k)| (*q as f64) * (*k as f64))
+                    .sum::<f64>()
+                    * scale as f64
+            })
+            .collect::<Vec<_>>();
+        let max_score = scores.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+        let denom = scores
+            .iter()
+            .map(|score| (score - max_score).exp())
+            .sum::<f64>();
+        let mut output = vec![0.0; TEST_HEAD_DIM];
+        for (token, score) in scores.iter().copied().enumerate() {
+            let prob = (score - max_score).exp() / denom;
+            for (dim, output) in output.iter_mut().enumerate() {
+                *output += prob * v[token][dim] as f64;
+            }
+        }
+        output.into_iter().map(|value| value as f32).collect()
+    }
+
+    #[tokio::test]
+    async fn tiled_decode_attention_matches_cpu_reference() {
+        let Ok(device) = Device::new().await else {
+            return;
+        };
+
+        let kv_len = DECODE_LARGE_BLOCK as usize + 1;
+        let q_data = decode_q();
+        let k_data = decode_k(kv_len);
+        let v_data = decode_v(kv_len);
+        let scale = 1.0 / f32::sqrt(TEST_HEAD_DIM as f32);
+
+        let q = Tensor::new(&device, &q_data);
+        let k = Tensor::new(&device, &k_data);
+        let v = Tensor::new(&device, &v_data);
+        let output = q.try_flash_attention_direct(&k, &v, scale, None).unwrap();
+        let output = output.as_slice().await.unwrap();
+        let expected = cpu_decode_reference(&q_data[0][0][0], &k_data[0][0], &v_data[0][0], scale);
+
+        let mut max_error = 0.0f32;
+        let mut max_dim = 0usize;
+        let mut max_actual = 0.0f32;
+        let mut max_expected = 0.0f32;
+        for (dim, expected) in expected.into_iter().enumerate() {
+            let actual = output[[0, 0, 0, dim]];
+            let error = (actual - expected).abs();
+            if error > max_error {
+                max_error = error;
+                max_dim = dim;
+                max_actual = actual;
+                max_expected = expected;
+            }
+        }
+        assert!(
+            max_error < 2.0e-4,
+            "dim {max_dim}: actual={max_actual} expected={max_expected} error={max_error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn tiled_decode_attention_gqa_matches_cpu_reference() {
+        let Ok(device) = Device::new().await else {
+            return;
+        };
+
+        let num_heads = 32;
+        let num_kv_heads = 8;
+        let groups = num_heads / num_kv_heads;
+        let kv_len = DECODE_LARGE_BLOCK as usize + 1;
+        let q_data = decode_q_gqa(num_heads);
+        let k_data = decode_k_gqa(num_kv_heads, kv_len);
+        let v_data = decode_v_gqa(num_kv_heads, kv_len);
+        let scale = 1.0 / f32::sqrt(TEST_HEAD_DIM as f32);
+
+        let q = Tensor::new(&device, &q_data);
+        let k = Tensor::new(&device, &k_data);
+        let v = Tensor::new(&device, &v_data);
+        let output = q.try_flash_attention_direct(&k, &v, scale, None).unwrap();
+        let output = output.as_slice().await.unwrap();
+
+        let mut max_error = 0.0f32;
+        let mut max_head = 0usize;
+        let mut max_dim = 0usize;
+        let mut max_actual = 0.0f32;
+        let mut max_expected = 0.0f32;
+        for head in 0..num_heads {
+            let kv_head = head / groups;
+            let expected = cpu_decode_reference(
+                &q_data[0][head][0],
+                &k_data[0][kv_head],
+                &v_data[0][kv_head],
+                scale,
+            );
+            for (dim, expected) in expected.into_iter().enumerate() {
+                let actual = output[[0, head, 0, dim]];
+                let error = (actual - expected).abs();
+                if error > max_error {
+                    max_error = error;
+                    max_head = head;
+                    max_dim = dim;
+                    max_actual = actual;
+                    max_expected = expected;
+                }
+            }
+        }
+        assert!(
+            max_error < 3.0e-4,
+            "head {max_head} dim {max_dim}: actual={max_actual} expected={max_expected} error={max_error}"
+        );
+    }
 }
 
 struct FlashAttentionNagaBuilder {

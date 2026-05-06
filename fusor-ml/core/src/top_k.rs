@@ -17,8 +17,8 @@ use wgpu::{
     naga::{
         AddressSpace, Arena, ArraySize, Barrier, BinaryOperator, Binding, Block, BuiltIn,
         EntryPoint, Expression, Function, FunctionArgument, GlobalVariable, Handle, Literal,
-        LocalVariable, MathFunction, Module, Range, ResourceBinding, Scalar, ShaderStage, Span,
-        Statement, StorageAccess, Type, TypeInner, VectorSize,
+        LocalVariable, MathFunction, Module, Range, ResourceBinding, Scalar, ScalarKind,
+        ShaderStage, Span, Statement, StorageAccess, Type, TypeInner, VectorSize,
     },
 };
 
@@ -75,106 +75,15 @@ pub(crate) async fn mirostat2_sample_token_to_host(
     previous_tokens: &[u32],
     params: GpuMirostat2SamplerParams,
 ) -> Result<Option<u32>, wgpu::BufferAsyncError> {
-    if input.datatype() != DataTypeEnum::F32 || input.layout().rank() != 1 {
-        return Ok(None);
-    }
-
-    let device = input.device();
-    let mut encoder =
-        device
-            .wgpu_device()
-            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("mirostat2_sample_token_to_host encoder"),
-            });
-
-    let Some(adjusted) = adjusted_logits_for_sampler_data_with_encoder(
+    sample_processed_logits_to_host(
         input,
-        previous_tokens,
-        params.temperature,
-        params.repetition_penalty,
-        Some(&mut encoder),
-    ) else {
-        return Ok(None);
-    };
-    let input_len = adjusted.layout().shape()[0];
-    let top_k = params.top_k.min(input_len);
-    if top_k == 0 {
-        return Ok(None);
-    }
-
-    let chunks = input_len.div_ceil(TOP_K_CHUNK);
-    let candidate_count = top_k
-        .div_ceil(chunks)
-        .max(MIN_TOP_K_CANDIDATES_PER_CHUNK)
-        .min(top_k)
-        .min(TOP_K_CHUNK);
-    let output_per_chunk = if candidate_count >= TOP_K_CHUNK {
-        TOP_K_CHUNK
-    } else {
-        candidate_count + 1
-    };
-    let Some((ids, values)) = chunk_top_k_pair_data_with_encoder(
-        &adjusted,
-        candidate_count,
-        output_per_chunk,
-        Some(&mut encoder),
-    ) else {
-        return Ok(None);
-    };
-    let Some((ids, values)) = merge_sorted_chunk_top_k_pair_data_with_encoder(
-        &ids,
-        &values,
-        chunks,
-        candidate_count,
-        output_per_chunk,
-        input_len,
-        top_k,
-        Some(&mut encoder),
-    ) else {
-        return Ok(None);
-    };
-    let Some(output) = sample_from_sorted_top_k_data_with_encoder(
-        &ids,
-        &values,
         sampler,
+        previous_tokens,
         params,
-        Some(&mut encoder),
-    ) else {
-        return Ok(None);
-    };
-
-    let download = device.wgpu_device().create_buffer(&wgpu::BufferDescriptor {
-        size: std::mem::size_of::<u32>() as u64,
-        usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
-        mapped_at_creation: false,
-        label: Some("mirostat2 sampled token download"),
-    });
-    encoder.copy_buffer_to_buffer(
-        output.buffer(),
-        0,
-        &download,
-        0,
-        std::mem::size_of::<u32>() as u64,
-    );
-    device.wgpu_queue().submit(Some(encoder.finish()));
-
-    let (sender, receiver) = futures_channel::oneshot::channel();
-    download
-        .slice(..)
-        .map_async(wgpu::MapMode::Read, move |result| {
-            _ = sender.send(result);
-        });
-    #[cfg(not(target_arch = "wasm32"))]
-    device.poll_wait();
-    receiver.await.map_err(|_| wgpu::BufferAsyncError)??;
-
-    let view = download.slice(..).get_mapped_range();
-    Ok(Some(
-        view.get(..std::mem::size_of::<u32>())
-            .map(bytemuck::from_bytes::<u32>)
-            .copied()
-            .unwrap_or_default(),
-    ))
+        None,
+        "mirostat2 sampled token download",
+    )
+    .await
 }
 
 pub(crate) async fn qmat_mirostat2_sample_token_to_host(
@@ -209,95 +118,142 @@ pub(crate) async fn qmat_mirostat2_sample_token_to_host(
     let Some(logits) = qmat_logits_data_with_encoder(hidden, matrix, &mut encoder) else {
         return Ok(None);
     };
-    let Some(adjusted) = adjusted_logits_for_sampler_data_with_encoder(
+    sample_processed_logits_to_host(
         &logits,
+        sampler,
         previous_tokens,
-        params.temperature,
-        params.repetition_penalty,
-        Some(&mut encoder),
-    ) else {
-        return Ok(None);
-    };
+        params,
+        Some(encoder),
+        "qmat mirostat2 sampled token download",
+    )
+    .await
+}
 
-    let input_len = adjusted.layout().shape()[0];
+async fn sample_processed_logits_to_host(
+    input: &TensorData,
+    sampler: &mut GpuMirostat2Sampler,
+    previous_tokens: &[u32],
+    params: GpuMirostat2SamplerParams,
+    mut initial_encoder: Option<CommandEncoder>,
+    download_label: &'static str,
+) -> Result<Option<u32>, wgpu::BufferAsyncError> {
+    if input.datatype() != DataTypeEnum::F32 || input.layout().rank() != 1 {
+        return Ok(None);
+    }
+
+    let input_len = input.layout().shape()[0];
     let top_k = params.top_k.min(input_len);
     if top_k == 0 {
         return Ok(None);
     }
 
     let chunks = input_len.div_ceil(TOP_K_CHUNK);
-    let candidate_count = top_k
-        .div_ceil(chunks)
-        .max(MIN_TOP_K_CANDIDATES_PER_CHUNK)
-        .min(top_k)
-        .min(TOP_K_CHUNK);
-    let output_per_chunk = if candidate_count >= TOP_K_CHUNK {
-        TOP_K_CHUNK
-    } else {
-        candidate_count + 1
-    };
-    let Some((ids, values)) = chunk_top_k_pair_data_with_encoder(
-        &adjusted,
-        candidate_count,
-        output_per_chunk,
-        Some(&mut encoder),
-    ) else {
-        return Ok(None);
-    };
-    let Some((ids, values)) = merge_sorted_chunk_top_k_pair_data_with_encoder(
-        &ids,
-        &values,
-        chunks,
-        candidate_count,
-        output_per_chunk,
-        input_len,
-        top_k,
-        Some(&mut encoder),
-    ) else {
-        return Ok(None);
-    };
-    let Some(output) = sample_from_sorted_top_k_data_with_encoder(
-        &ids,
-        &values,
-        sampler,
-        params,
-        Some(&mut encoder),
-    ) else {
-        return Ok(None);
-    };
-
-    let download = device.wgpu_device().create_buffer(&wgpu::BufferDescriptor {
-        size: std::mem::size_of::<u32>() as u64,
-        usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
-        mapped_at_creation: false,
-        label: Some("qmat mirostat2 sampled token download"),
-    });
-    encoder.copy_buffer_to_buffer(
-        output.buffer(),
-        0,
-        &download,
-        0,
-        std::mem::size_of::<u32>() as u64,
-    );
-    device.wgpu_queue().submit(Some(encoder.finish()));
-
-    let (sender, receiver) = futures_channel::oneshot::channel();
-    download
-        .slice(..)
-        .map_async(wgpu::MapMode::Read, move |result| {
-            _ = sender.send(result);
+    let mut candidate_count = initial_sampler_candidate_count(top_k, chunks);
+    loop {
+        let device = input.device();
+        let mut encoder = initial_encoder.take().unwrap_or_else(|| {
+            device
+                .wgpu_device()
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("mirostat2_sample_token_to_host encoder"),
+                })
         });
-    #[cfg(not(target_arch = "wasm32"))]
-    device.poll_wait();
-    receiver.await.map_err(|_| wgpu::BufferAsyncError)??;
 
-    let view = download.slice(..).get_mapped_range();
-    Ok(Some(
-        view.get(..std::mem::size_of::<u32>())
+        let output_per_chunk = sampler_output_per_chunk(candidate_count);
+        let Some((chunk_ids, chunk_values)) = chunk_top_k_pair_data_with_processors_with_encoder(
+            input,
+            previous_tokens,
+            params.temperature,
+            params.repetition_penalty,
+            candidate_count,
+            output_per_chunk,
+            Some(&mut encoder),
+        ) else {
+            return Ok(None);
+        };
+        let Some((ids, values)) = merge_sorted_chunk_top_k_pair_data_with_encoder(
+            &chunk_ids,
+            &chunk_values,
+            chunks,
+            candidate_count,
+            output_per_chunk,
+            input_len,
+            top_k,
+            Some(&mut encoder),
+        ) else {
+            return Ok(None);
+        };
+        let exactness_flag = if candidate_count < top_k && candidate_count < TOP_K_CHUNK {
+            let Some(flag) = top_k_exactness_flag_data_with_encoder(
+                &values,
+                &chunk_values,
+                chunks,
+                candidate_count,
+                output_per_chunk,
+                top_k,
+                Some(&mut encoder),
+            ) else {
+                return Ok(None);
+            };
+            Some(flag)
+        } else {
+            None
+        };
+        let Some(output) = sample_from_sorted_top_k_data_with_encoder(
+            &ids,
+            &values,
+            sampler,
+            params,
+            exactness_flag.as_ref(),
+            Some(&mut encoder),
+        ) else {
+            return Ok(None);
+        };
+
+        let download = device.wgpu_device().create_buffer(&wgpu::BufferDescriptor {
+            size: std::mem::size_of::<u32>() as u64,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+            label: Some(download_label),
+        });
+        encoder.copy_buffer_to_buffer(
+            output.buffer(),
+            0,
+            &download,
+            0,
+            std::mem::size_of::<u32>() as u64,
+        );
+        device.wgpu_queue().submit(Some(encoder.finish()));
+
+        let (sender, receiver) = futures_channel::oneshot::channel();
+        download
+            .slice(..)
+            .map_async(wgpu::MapMode::Read, move |result| {
+                _ = sender.send(result);
+            });
+        #[cfg(not(target_arch = "wasm32"))]
+        device.poll_wait();
+        receiver.await.map_err(|_| wgpu::BufferAsyncError)??;
+
+        let view = download.slice(..).get_mapped_range();
+        let token = view
+            .get(..std::mem::size_of::<u32>())
             .map(bytemuck::from_bytes::<u32>)
             .copied()
-            .unwrap_or_default(),
-    ))
+            .unwrap_or_default();
+        drop(view);
+        download.unmap();
+
+        if token != u32::MAX {
+            return Ok(Some(token));
+        }
+
+        let next = next_sampler_candidate_count(candidate_count, top_k);
+        if next == candidate_count {
+            return Ok(None);
+        }
+        candidate_count = next;
+    }
 }
 
 fn qmat_logits_data_with_encoder(
@@ -458,6 +414,29 @@ fn split_workgroups_2d(
     (y <= max_workgroups_per_dimension).then_some([x, y])
 }
 
+fn initial_sampler_candidate_count(top_k: usize, chunks: usize) -> usize {
+    top_k
+        .div_ceil(chunks)
+        .max(MIN_TOP_K_CANDIDATES_PER_CHUNK)
+        .min(top_k)
+        .min(TOP_K_CHUNK)
+}
+
+fn sampler_output_per_chunk(candidate_count: usize) -> usize {
+    if candidate_count >= TOP_K_CHUNK {
+        TOP_K_CHUNK
+    } else {
+        candidate_count + 1
+    }
+}
+
+fn next_sampler_candidate_count(candidate_count: usize, top_k: usize) -> usize {
+    candidate_count
+        .saturating_mul(2)
+        .min(top_k)
+        .min(TOP_K_CHUNK)
+}
+
 fn qgemv_cols_per_workgroup_for_direct(format: tile_ir::GgmlQuantFormat, k: u32, n: u32) -> u32 {
     if format == tile_ir::GgmlQuantFormat::Q4K && k <= 4096 && n >= 4096 && n < 8192 {
         return 4;
@@ -552,137 +531,26 @@ fn mirostat2_params_data(device: &Device, params: GpuMirostat2SamplerParams) -> 
     TensorData::new_from_buffer(device, buffer, &[1], DataTypeEnum::U32)
 }
 
-fn adjusted_logits_for_sampler_data_with_encoder(
-    input: &TensorData,
-    previous_tokens: &[u32],
-    temperature: f32,
-    repetition_penalty: f32,
-    encoder: Option<&mut CommandEncoder>,
-) -> Option<TensorData> {
-    if input.datatype() != DataTypeEnum::F32 || input.layout().rank() != 1 {
-        return None;
-    }
-
-    let input_len = input.layout().shape()[0];
-    let input_offset = input.layout().offset();
-    let input_stride = input.layout().strides()[0];
-    let device = input.device();
-    let output = TensorData::new_for_shape(device, &[input_len], DataTypeEnum::F32);
-    if input_len == 0 {
-        return Some(output);
-    }
-
-    let (previous_tokens, previous_len) = fixed_previous_tokens_data(device, previous_tokens);
-    let params = processor_params_data(device, temperature, repetition_penalty, previous_len);
-    let cache_key = format!(
-        "apply_generation_processors_f32:block={TOP_K_BLOCK}:len={input_len}:offset={input_offset}:stride={input_stride}"
-    );
-    let source = format!(
-        r#"
-struct ProcessorParams {{
-    temperature: f32,
-    repetition_penalty: f32,
-    previous_len: u32,
-    _padding: u32,
-}};
-
-@group(0) @binding(0) var<storage, read> input: array<f32>;
-@group(0) @binding(1) var<storage, read> previous_tokens: array<u32>;
-@group(0) @binding(2) var<storage, read> params: ProcessorParams;
-@group(0) @binding(3) var<storage, read_write> output: array<f32>;
-
-@compute @workgroup_size({TOP_K_BLOCK})
-fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {{
-    let token_id = global_id.x;
-    if (token_id >= {input_len}u) {{
-        return;
-    }}
-
-    var value = input[{input_offset}u + token_id * {input_stride}u];
-    var repeated = false;
-    var previous_index = 0u;
-    loop {{
-        if (previous_index >= params.previous_len) {{
-            break;
-        }}
-        if (previous_tokens[previous_index] == token_id) {{
-            repeated = true;
-            break;
-        }}
-        previous_index = previous_index + 1u;
-    }}
-
-    if (repeated && params.repetition_penalty > 1.0) {{
-        if (value <= 0.0) {{
-            value = value * params.repetition_penalty;
-        }} else {{
-            value = value / params.repetition_penalty;
-        }}
-    }}
-    if (params.temperature != 0.0) {{
-        value = value / params.temperature;
-    }}
-    output[token_id] = value;
-}}
-"#
-    );
-
-    let kernel = DirectKernel::new_wgsl_with_cache_key(
-        "apply_generation_processors_f32",
-        cache_key,
-        source,
-        vec![
-            DirectKernelBinding::Storage {
-                binding: 0,
-                buffer: input.buffer().clone(),
-                read_only: true,
-            },
-            DirectKernelBinding::Storage {
-                binding: 1,
-                buffer: previous_tokens.buffer().clone(),
-                read_only: true,
-            },
-            DirectKernelBinding::Storage {
-                binding: 2,
-                buffer: params.buffer().clone(),
-                read_only: true,
-            },
-            DirectKernelBinding::Storage {
-                binding: 3,
-                buffer: output.buffer().clone(),
-                read_only: false,
-            },
-        ],
-        [input_len.div_ceil(TOP_K_BLOCK as usize) as u32, 1, 1],
-    );
-
-    if let Some(encoder) = encoder {
-        kernel.run(device, encoder);
-    } else {
-        let mut encoder =
-            device
-                .wgpu_device()
-                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                    label: Some("apply_generation_processors_f32 encoder"),
-                });
-        kernel.run(device, &mut encoder);
-        device.wgpu_queue().submit(Some(encoder.finish()));
-    }
-
-    Some(output)
-}
-
 fn sample_from_sorted_top_k_data_with_encoder(
     ids: &TensorData,
     values: &TensorData,
     sampler: &mut GpuMirostat2Sampler,
     params: GpuMirostat2SamplerParams,
+    exactness_flag: Option<&TensorData>,
     encoder: Option<&mut CommandEncoder>,
 ) -> Option<TensorData> {
     if ids.datatype() != DataTypeEnum::U32 || values.datatype() != DataTypeEnum::F32 {
         return None;
     }
     if ids.layout().rank() != 1 || values.layout().rank() != 1 {
+        return None;
+    }
+    if let Some(flag) = exactness_flag
+        && (flag.datatype() != DataTypeEnum::U32
+            || flag.layout().rank() != 1
+            || flag.layout().shape()[0] == 0
+            || !values.device().is_same_device(flag.device()))
+    {
         return None;
     }
 
@@ -700,8 +568,24 @@ fn sample_from_sorted_top_k_data_with_encoder(
     let device = values.device();
     let params = mirostat2_params_data(device, params);
     let output = TensorData::new_for_shape(device, &[1], DataTypeEnum::U32);
+    let has_exactness_flag = exactness_flag.is_some();
+    let exactness_binding = if has_exactness_flag {
+        "@group(0) @binding(5) var<storage, read> exactness_flag: array<u32>;"
+    } else {
+        ""
+    };
+    let exactness_check = if has_exactness_flag {
+        r#"
+    if (exactness_flag[0] == 0u) {
+        output[0] = 4294967295u;
+        return;
+    }
+"#
+    } else {
+        ""
+    };
     let cache_key = format!(
-        "sample_mirostat2_sorted_top_k_f32:block={TOP_K_BLOCK}:top_k={top_k}:ids={:?}:values={:?}",
+        "sample_mirostat2_sorted_top_k_f32:block={TOP_K_BLOCK}:top_k={top_k}:ids={:?}:values={:?}:exact={has_exactness_flag}",
         ids.layout(),
         values.layout()
     );
@@ -720,6 +604,7 @@ struct Mirostat2Params {{
 @group(0) @binding(2) var<storage, read_write> state: array<f32>;
 @group(0) @binding(3) var<storage, read> params: Mirostat2Params;
 @group(0) @binding(4) var<storage, read_write> output: array<u32>;
+{exactness_binding}
 
 var<workgroup> scratch: array<f32, {TOP_K_BLOCK}>;
 
@@ -733,6 +618,7 @@ fn top_id(index: u32) -> u32 {{
 
 @compute @workgroup_size({TOP_K_BLOCK})
 fn main(@builtin(local_invocation_index) lane: u32) {{
+{exactness_check}
     let max_value = top_value(0u);
     var local_sum = 0.0;
     var index = lane;
@@ -815,37 +701,46 @@ fn main(@builtin(local_invocation_index) lane: u32) {{
 "#
     );
 
+    let mut bindings = vec![
+        DirectKernelBinding::Storage {
+            binding: 0,
+            buffer: ids.buffer().clone(),
+            read_only: true,
+        },
+        DirectKernelBinding::Storage {
+            binding: 1,
+            buffer: values.buffer().clone(),
+            read_only: true,
+        },
+        DirectKernelBinding::Storage {
+            binding: 2,
+            buffer: sampler.state.buffer().clone(),
+            read_only: false,
+        },
+        DirectKernelBinding::Storage {
+            binding: 3,
+            buffer: params.buffer().clone(),
+            read_only: true,
+        },
+        DirectKernelBinding::Storage {
+            binding: 4,
+            buffer: output.buffer().clone(),
+            read_only: false,
+        },
+    ];
+    if let Some(flag) = exactness_flag {
+        bindings.push(DirectKernelBinding::Storage {
+            binding: 5,
+            buffer: flag.buffer().clone(),
+            read_only: true,
+        });
+    }
+
     let kernel = DirectKernel::new_wgsl_with_cache_key(
         "sample_mirostat2_sorted_top_k_f32",
         cache_key,
         source,
-        vec![
-            DirectKernelBinding::Storage {
-                binding: 0,
-                buffer: ids.buffer().clone(),
-                read_only: true,
-            },
-            DirectKernelBinding::Storage {
-                binding: 1,
-                buffer: values.buffer().clone(),
-                read_only: true,
-            },
-            DirectKernelBinding::Storage {
-                binding: 2,
-                buffer: sampler.state.buffer().clone(),
-                read_only: false,
-            },
-            DirectKernelBinding::Storage {
-                binding: 3,
-                buffer: params.buffer().clone(),
-                read_only: true,
-            },
-            DirectKernelBinding::Storage {
-                binding: 4,
-                buffer: output.buffer().clone(),
-                read_only: false,
-            },
-        ],
+        bindings,
         [1, 1, 1],
     );
 
@@ -865,6 +760,106 @@ fn main(@builtin(local_invocation_index) lane: u32) {{
     Some(output)
 }
 
+#[derive(Clone, Copy)]
+struct TopKExactnessMeta {
+    chunks: u32,
+    candidate_count: u32,
+    output_per_chunk: u32,
+    top_k: u32,
+    top_values_offset: u32,
+    top_values_stride: u32,
+    chunk_values_offset: u32,
+    chunk_values_stride: u32,
+}
+
+fn top_k_exactness_flag_data_with_encoder(
+    top_values: &TensorData,
+    chunk_values: &TensorData,
+    chunks: usize,
+    candidate_count: usize,
+    output_per_chunk: usize,
+    top_k: usize,
+    encoder: Option<&mut CommandEncoder>,
+) -> Option<TensorData> {
+    if top_values.datatype() != DataTypeEnum::F32
+        || chunk_values.datatype() != DataTypeEnum::F32
+        || top_values.layout().rank() != 1
+        || chunk_values.layout().rank() != 1
+        || !top_values.device().is_same_device(chunk_values.device())
+        || top_k == 0
+        || top_values.layout().shape()[0] < top_k
+        || candidate_count >= output_per_chunk
+    {
+        return None;
+    }
+
+    let device = top_values.device();
+    let flag = TensorData::new_for_shape(device, &[1], DataTypeEnum::U32);
+    let meta = TopKExactnessMeta {
+        chunks: chunks.try_into().ok()?,
+        candidate_count: candidate_count.try_into().ok()?,
+        output_per_chunk: output_per_chunk.try_into().ok()?,
+        top_k: top_k.try_into().ok()?,
+        top_values_offset: top_values.layout().offset().try_into().ok()?,
+        top_values_stride: top_values.layout().strides()[0].try_into().ok()?,
+        chunk_values_offset: chunk_values.layout().offset().try_into().ok()?,
+        chunk_values_stride: chunk_values.layout().strides()[0].try_into().ok()?,
+    };
+    let cache_key = format!(
+        "prove_top_k_exact_f32:block={TOP_K_BLOCK}:chunks={chunks}:candidate_count={candidate_count}:output_per_chunk={output_per_chunk}:top_k={top_k}:top={:?}:chunk={:?}",
+        top_values.layout(),
+        chunk_values.layout()
+    );
+    let module = if let Some(module) = device.naga_module_cache().write().get(&cache_key) {
+        module.clone()
+    } else {
+        let module = TopKExactnessModuleBuilder::new(meta).build()?;
+        device
+            .naga_module_cache()
+            .write()
+            .get_or_insert(cache_key.clone(), || module.clone())
+            .clone()
+    };
+    let kernel = DirectKernel::new_with_cache_key(
+        "prove_top_k_exact_f32",
+        cache_key,
+        module,
+        vec![
+            DirectKernelBinding::Storage {
+                binding: 0,
+                buffer: top_values.buffer().clone(),
+                read_only: true,
+            },
+            DirectKernelBinding::Storage {
+                binding: 1,
+                buffer: chunk_values.buffer().clone(),
+                read_only: true,
+            },
+            DirectKernelBinding::Storage {
+                binding: 2,
+                buffer: flag.buffer().clone(),
+                read_only: false,
+            },
+        ],
+        [1, 1, 1],
+    );
+
+    if let Some(encoder) = encoder {
+        kernel.run(device, encoder);
+    } else {
+        let mut encoder =
+            device
+                .wgpu_device()
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("prove_top_k_exact_f32 encoder"),
+                });
+        kernel.run(device, &mut encoder);
+        device.wgpu_queue().submit(Some(encoder.finish()));
+    }
+
+    Some(flag)
+}
+
 pub(crate) fn chunk_top_k_pair_data(
     input: &TensorData,
     candidate_count: usize,
@@ -877,6 +872,43 @@ fn chunk_top_k_pair_data_with_encoder(
     input: &TensorData,
     candidate_count: usize,
     output_per_chunk: usize,
+    encoder: Option<&mut CommandEncoder>,
+) -> Option<(TensorData, TensorData)> {
+    chunk_top_k_pair_data_inner_with_encoder(
+        input,
+        candidate_count,
+        output_per_chunk,
+        None,
+        encoder,
+    )
+}
+
+fn chunk_top_k_pair_data_with_processors_with_encoder(
+    input: &TensorData,
+    previous_tokens: &[u32],
+    temperature: f32,
+    repetition_penalty: f32,
+    candidate_count: usize,
+    output_per_chunk: usize,
+    encoder: Option<&mut CommandEncoder>,
+) -> Option<(TensorData, TensorData)> {
+    let device = input.device();
+    let (previous_tokens, previous_len) = fixed_previous_tokens_data(device, previous_tokens);
+    let params = processor_params_data(device, temperature, repetition_penalty, previous_len);
+    chunk_top_k_pair_data_inner_with_encoder(
+        input,
+        candidate_count,
+        output_per_chunk,
+        Some((&previous_tokens, &params)),
+        encoder,
+    )
+}
+
+fn chunk_top_k_pair_data_inner_with_encoder(
+    input: &TensorData,
+    candidate_count: usize,
+    output_per_chunk: usize,
+    processors: Option<(&TensorData, &TensorData)>,
     encoder: Option<&mut CommandEncoder>,
 ) -> Option<(TensorData, TensorData)> {
     if input.datatype() != DataTypeEnum::F32 || input.layout().rank() != 1 {
@@ -895,8 +927,9 @@ fn chunk_top_k_pair_data_with_encoder(
 
     let input_offset = input.layout().offset();
     let input_stride = input.layout().strides()[0];
+    let has_processors = processors.is_some();
     let cache_key = format!(
-        "chunk_top_k_pairs_f32:block={TOP_K_BLOCK}:chunk={TOP_K_CHUNK}:len={input_len}:candidate_count={candidate_count}:output_per_chunk={output_per_chunk}:offset={input_offset}:stride={input_stride}"
+        "chunk_top_k_pairs_f32:block={TOP_K_BLOCK}:chunk={TOP_K_CHUNK}:len={input_len}:candidate_count={candidate_count}:output_per_chunk={output_per_chunk}:offset={input_offset}:stride={input_stride}:processors={has_processors}"
     );
     let module = if let Some(module) = device.naga_module_cache().write().get(&cache_key) {
         module.clone()
@@ -906,6 +939,7 @@ fn chunk_top_k_pair_data_with_encoder(
             output_per_chunk.try_into().ok()?,
             input_offset.try_into().ok()?,
             input_stride.try_into().ok()?,
+            has_processors,
         )
         .build()?;
         device
@@ -915,11 +949,8 @@ fn chunk_top_k_pair_data_with_encoder(
             .clone()
     };
 
-    let kernel = DirectKernel::new_with_cache_key(
-        "chunk_top_k_pairs_f32",
-        cache_key,
-        module,
-        vec![
+    let kernel = if let Some((previous_tokens, params)) = processors {
+        let bindings = vec![
             DirectKernelBinding::Storage {
                 binding: 0,
                 buffer: input.buffer().clone(),
@@ -935,9 +966,49 @@ fn chunk_top_k_pair_data_with_encoder(
                 buffer: values.buffer().clone(),
                 read_only: false,
             },
-        ],
-        [chunks.try_into().ok()?, 1, 1],
-    );
+            DirectKernelBinding::Storage {
+                binding: 3,
+                buffer: previous_tokens.buffer().clone(),
+                read_only: true,
+            },
+            DirectKernelBinding::Storage {
+                binding: 4,
+                buffer: params.buffer().clone(),
+                read_only: true,
+            },
+        ];
+        DirectKernel::new_with_cache_key(
+            "chunk_top_k_pairs_f32",
+            cache_key,
+            module,
+            bindings,
+            [chunks.try_into().ok()?, 1, 1],
+        )
+    } else {
+        DirectKernel::new_with_cache_key(
+            "chunk_top_k_pairs_f32",
+            cache_key,
+            module,
+            vec![
+                DirectKernelBinding::Storage {
+                    binding: 0,
+                    buffer: input.buffer().clone(),
+                    read_only: true,
+                },
+                DirectKernelBinding::Storage {
+                    binding: 1,
+                    buffer: ids.buffer().clone(),
+                    read_only: false,
+                },
+                DirectKernelBinding::Storage {
+                    binding: 2,
+                    buffer: values.buffer().clone(),
+                    read_only: false,
+                },
+            ],
+            [chunks.try_into().ok()?, 1, 1],
+        )
+    };
 
     if let Some(encoder) = encoder {
         kernel.run(device, encoder);
@@ -1086,12 +1157,15 @@ struct TopKModuleBuilder {
     output_per_chunk: u32,
     input_offset: u32,
     input_stride: u32,
+    processors: bool,
 }
 
 struct TopKGlobals {
     input: Handle<GlobalVariable>,
     output_ids: Handle<GlobalVariable>,
     output_values: Handle<GlobalVariable>,
+    previous_tokens: Option<Handle<GlobalVariable>>,
+    processor_params: Option<Handle<GlobalVariable>>,
     scratch_values: Handle<GlobalVariable>,
     scratch_ids: Handle<GlobalVariable>,
 }
@@ -1099,6 +1173,26 @@ struct TopKGlobals {
 struct TopKLocals {
     current_value: Handle<LocalVariable>,
     current_id: Handle<LocalVariable>,
+    previous_index: Handle<LocalVariable>,
+    repeated: Handle<LocalVariable>,
+}
+
+struct TopKExactnessModuleBuilder {
+    meta: TopKExactnessMeta,
+}
+
+#[derive(Clone, Copy)]
+struct TopKExactnessGlobals {
+    top_values: Handle<GlobalVariable>,
+    chunk_values: Handle<GlobalVariable>,
+    flag: Handle<GlobalVariable>,
+    scratch: Handle<GlobalVariable>,
+}
+
+#[derive(Clone, Copy)]
+struct TopKExactnessLocals {
+    chunk: Handle<LocalVariable>,
+    inexact: Handle<LocalVariable>,
 }
 
 struct MergeTopKModuleBuilder {
@@ -1127,6 +1221,592 @@ struct MergeTopKLocals {
     local_best_id: Handle<LocalVariable>,
     local_best_chunk: Handle<LocalVariable>,
     reduce_step: Handle<LocalVariable>,
+}
+
+impl TopKExactnessModuleBuilder {
+    fn new(meta: TopKExactnessMeta) -> Self {
+        Self { meta }
+    }
+
+    fn build(self) -> Option<Module> {
+        let mut module = Module::default();
+        let f32_ty = module.types.insert(
+            Type {
+                name: Some("TopKExactF32".into()),
+                inner: TypeInner::Scalar(Scalar::F32),
+            },
+            Span::default(),
+        );
+        let u32_ty = module.types.insert(
+            Type {
+                name: Some("TopKExactU32".into()),
+                inner: TypeInner::Scalar(Scalar::U32),
+            },
+            Span::default(),
+        );
+        let f32_storage_ty = module.types.insert(
+            Type {
+                name: Some("TopKExactF32Buffer".into()),
+                inner: TypeInner::Array {
+                    base: f32_ty,
+                    size: ArraySize::Dynamic,
+                    stride: 4,
+                },
+            },
+            Span::default(),
+        );
+        let u32_storage_ty = module.types.insert(
+            Type {
+                name: Some("TopKExactU32Buffer".into()),
+                inner: TypeInner::Array {
+                    base: u32_ty,
+                    size: ArraySize::Dynamic,
+                    stride: 4,
+                },
+            },
+            Span::default(),
+        );
+        let scratch_ty = module.types.insert(
+            Type {
+                name: Some("TopKExactScratch".into()),
+                inner: TypeInner::Array {
+                    base: u32_ty,
+                    size: ArraySize::Constant(NonZeroU32::new(TOP_K_BLOCK)?),
+                    stride: 4,
+                },
+            },
+            Span::default(),
+        );
+
+        let globals = TopKExactnessGlobals {
+            top_values: Self::storage_global(&mut module, "top_values", 0, f32_storage_ty, true),
+            chunk_values: Self::storage_global(
+                &mut module,
+                "chunk_values",
+                1,
+                f32_storage_ty,
+                true,
+            ),
+            flag: Self::storage_global(&mut module, "flag", 2, u32_storage_ty, false),
+            scratch: Self::workgroup_global(&mut module, "scratch", scratch_ty),
+        };
+
+        let mut function = Function {
+            name: Some("main".into()),
+            arguments: vec![FunctionArgument {
+                name: Some("local_invocation_index".into()),
+                ty: u32_ty,
+                binding: Some(Binding::BuiltIn(BuiltIn::LocalInvocationIndex)),
+            }],
+            ..Function::default()
+        };
+        let locals = TopKExactnessLocals {
+            chunk: Self::local(&mut function, "chunk", u32_ty),
+            inexact: Self::local(&mut function, "inexact", u32_ty),
+        };
+        function.body = self.entry_body(&mut function.expressions, globals, locals);
+        function
+            .body
+            .push(Statement::Return { value: None }, Span::default());
+
+        module.entry_points.push(EntryPoint {
+            name: "main".into(),
+            stage: ShaderStage::Compute,
+            early_depth_test: None,
+            workgroup_size: [TOP_K_BLOCK, 1, 1],
+            workgroup_size_overrides: None,
+            function,
+            mesh_info: None,
+            task_payload: None,
+            incoming_ray_payload: None,
+        });
+
+        Some(module)
+    }
+
+    fn entry_body(
+        &self,
+        expressions: &mut Arena<Expression>,
+        globals: TopKExactnessGlobals,
+        locals: TopKExactnessLocals,
+    ) -> Block {
+        let mut body = Block::new();
+        let lane = expressions.append(Expression::FunctionArgument(0), Span::default());
+        let threshold_rank = self.u32_lit(expressions, self.meta.top_k - 1);
+        let threshold_index = self.index1(
+            expressions,
+            &mut body,
+            self.meta.top_values_offset,
+            self.meta.top_values_stride,
+            threshold_rank,
+        );
+        let threshold =
+            self.load_storage(expressions, &mut body, globals.top_values, threshold_index);
+        let threshold_finite = self.is_finite(expressions, &mut body, threshold);
+
+        let zero = self.u32_lit(expressions, 0);
+        self.store_local(expressions, &mut body, locals.inexact, zero);
+        self.store_local(expressions, &mut body, locals.chunk, lane);
+        self.append_scan_loop(
+            expressions,
+            &mut body,
+            globals,
+            locals,
+            threshold,
+            threshold_finite,
+        );
+
+        let inexact = self.load_local(expressions, &mut body, locals.inexact);
+        self.store_workgroup(expressions, &mut body, globals.scratch, lane, inexact);
+        body.push(
+            Statement::ControlBarrier(Barrier::WORK_GROUP),
+            Span::default(),
+        );
+
+        let mut stride = TOP_K_BLOCK / 2;
+        while stride > 0 {
+            let participates = self.lt_lit(expressions, &mut body, lane, stride);
+            let mut accept = Block::new();
+            let rhs_index = self.add_lit(expressions, &mut accept, lane, stride);
+            let lhs = self.load_workgroup(expressions, &mut accept, globals.scratch, lane);
+            let rhs = self.load_workgroup(expressions, &mut accept, globals.scratch, rhs_index);
+            let merged = self.bin(
+                expressions,
+                &mut accept,
+                BinaryOperator::InclusiveOr,
+                lhs,
+                rhs,
+            );
+            self.store_workgroup(expressions, &mut accept, globals.scratch, lane, merged);
+            body.push(
+                Statement::If {
+                    condition: participates,
+                    accept,
+                    reject: Block::new(),
+                },
+                Span::default(),
+            );
+            body.push(
+                Statement::ControlBarrier(Barrier::WORK_GROUP),
+                Span::default(),
+            );
+            stride /= 2;
+        }
+
+        let lane_zero = self.bin(expressions, &mut body, BinaryOperator::Equal, lane, zero);
+        let mut store_accept = Block::new();
+        let root = self.load_workgroup(expressions, &mut store_accept, globals.scratch, zero);
+        let exact = self.bin(
+            expressions,
+            &mut store_accept,
+            BinaryOperator::Equal,
+            root,
+            zero,
+        );
+        let mut exact_accept = Block::new();
+        let one = self.u32_lit(expressions, 1);
+        self.store_storage(expressions, &mut exact_accept, globals.flag, zero, one);
+        let mut exact_reject = Block::new();
+        self.store_storage(expressions, &mut exact_reject, globals.flag, zero, zero);
+        store_accept.push(
+            Statement::If {
+                condition: exact,
+                accept: exact_accept,
+                reject: exact_reject,
+            },
+            Span::default(),
+        );
+        body.push(
+            Statement::If {
+                condition: lane_zero,
+                accept: store_accept,
+                reject: Block::new(),
+            },
+            Span::default(),
+        );
+
+        body
+    }
+
+    fn append_scan_loop(
+        &self,
+        expressions: &mut Arena<Expression>,
+        body: &mut Block,
+        globals: TopKExactnessGlobals,
+        locals: TopKExactnessLocals,
+        threshold: Handle<Expression>,
+        threshold_finite: Handle<Expression>,
+    ) {
+        let mut loop_body = Block::new();
+        let chunk = self.load_local(expressions, &mut loop_body, locals.chunk);
+        let chunks = self.u32_lit(expressions, self.meta.chunks);
+        let done = self.bin(
+            expressions,
+            &mut loop_body,
+            BinaryOperator::GreaterEqual,
+            chunk,
+            chunks,
+        );
+        loop_body.push(
+            Statement::If {
+                condition: done,
+                accept: Block::from_vec(vec![Statement::Break]),
+                reject: Block::new(),
+            },
+            Span::default(),
+        );
+
+        let bound_rank = self.mul_lit(
+            expressions,
+            &mut loop_body,
+            chunk,
+            self.meta.output_per_chunk,
+        );
+        let bound_rank = self.add_lit(
+            expressions,
+            &mut loop_body,
+            bound_rank,
+            self.meta.candidate_count,
+        );
+        let bound_index = self.index1(
+            expressions,
+            &mut loop_body,
+            self.meta.chunk_values_offset,
+            self.meta.chunk_values_stride,
+            bound_rank,
+        );
+        let bound = self.load_storage(
+            expressions,
+            &mut loop_body,
+            globals.chunk_values,
+            bound_index,
+        );
+        let bound_finite = self.is_finite(expressions, &mut loop_body, bound);
+        let bound_ge_threshold = self.bin(
+            expressions,
+            &mut loop_body,
+            BinaryOperator::GreaterEqual,
+            bound,
+            threshold,
+        );
+        let finite_bound_inexact = self.and(
+            expressions,
+            &mut loop_body,
+            bound_finite,
+            bound_ge_threshold,
+        );
+        let finite_inexact = self.and(
+            expressions,
+            &mut loop_body,
+            threshold_finite,
+            finite_bound_inexact,
+        );
+        let false_lit = self.bool_lit(expressions, false);
+        let threshold_not_finite = self.bin(
+            expressions,
+            &mut loop_body,
+            BinaryOperator::Equal,
+            threshold_finite,
+            false_lit,
+        );
+        let nonfinite_inexact = self.and(
+            expressions,
+            &mut loop_body,
+            threshold_not_finite,
+            bound_finite,
+        );
+        let inexact = self.or(
+            expressions,
+            &mut loop_body,
+            finite_inexact,
+            nonfinite_inexact,
+        );
+        let mut inexact_accept = Block::new();
+        let one = self.u32_lit(expressions, 1);
+        self.store_local(expressions, &mut inexact_accept, locals.inexact, one);
+        loop_body.push(
+            Statement::If {
+                condition: inexact,
+                accept: inexact_accept,
+                reject: Block::new(),
+            },
+            Span::default(),
+        );
+        let next_chunk = self.add_lit(expressions, &mut loop_body, chunk, TOP_K_BLOCK);
+        self.store_local(expressions, &mut loop_body, locals.chunk, next_chunk);
+        body.push(
+            Statement::Loop {
+                body: loop_body,
+                continuing: Block::new(),
+                break_if: None,
+            },
+            Span::default(),
+        );
+    }
+
+    fn storage_global(
+        module: &mut Module,
+        name: &str,
+        binding: u32,
+        ty: Handle<Type>,
+        read_only: bool,
+    ) -> Handle<GlobalVariable> {
+        module.global_variables.append(
+            GlobalVariable {
+                name: Some(name.into()),
+                space: AddressSpace::Storage {
+                    access: if read_only {
+                        StorageAccess::LOAD
+                    } else {
+                        StorageAccess::LOAD | StorageAccess::STORE
+                    },
+                },
+                binding: Some(ResourceBinding { group: 0, binding }),
+                ty,
+                init: None,
+            },
+            Span::default(),
+        )
+    }
+
+    fn workgroup_global(
+        module: &mut Module,
+        name: &str,
+        ty: Handle<Type>,
+    ) -> Handle<GlobalVariable> {
+        module.global_variables.append(
+            GlobalVariable {
+                name: Some(name.into()),
+                space: AddressSpace::WorkGroup,
+                binding: None,
+                ty,
+                init: None,
+            },
+            Span::default(),
+        )
+    }
+
+    fn local(function: &mut Function, name: &str, ty: Handle<Type>) -> Handle<LocalVariable> {
+        function.local_variables.append(
+            LocalVariable {
+                name: Some(name.into()),
+                ty,
+                init: None,
+            },
+            Span::default(),
+        )
+    }
+
+    fn index1(
+        &self,
+        expressions: &mut Arena<Expression>,
+        body: &mut Block,
+        offset: u32,
+        stride: u32,
+        index: Handle<Expression>,
+    ) -> Handle<Expression> {
+        let scaled = if stride == 1 {
+            index
+        } else {
+            self.mul_lit(expressions, body, index, stride)
+        };
+        self.add_lit(expressions, body, scaled, offset)
+    }
+
+    fn is_finite(
+        &self,
+        expressions: &mut Arena<Expression>,
+        body: &mut Block,
+        value: Handle<Expression>,
+    ) -> Handle<Expression> {
+        let self_equal = self.bin(expressions, body, BinaryOperator::Equal, value, value);
+        let abs = self.emit(
+            expressions,
+            body,
+            Expression::Math {
+                fun: MathFunction::Abs,
+                arg: value,
+                arg1: None,
+                arg2: None,
+                arg3: None,
+            },
+        );
+        let max = self.f32_lit(expressions, MAX_F32);
+        let finite_magnitude = self.bin(expressions, body, BinaryOperator::LessEqual, abs, max);
+        self.and(expressions, body, self_equal, finite_magnitude)
+    }
+
+    fn load_storage(
+        &self,
+        expressions: &mut Arena<Expression>,
+        body: &mut Block,
+        global: Handle<GlobalVariable>,
+        index: Handle<Expression>,
+    ) -> Handle<Expression> {
+        let ptr = self.ptr(expressions, body, Expression::GlobalVariable(global), index);
+        self.emit(expressions, body, Expression::Load { pointer: ptr })
+    }
+
+    fn store_storage(
+        &self,
+        expressions: &mut Arena<Expression>,
+        body: &mut Block,
+        global: Handle<GlobalVariable>,
+        index: Handle<Expression>,
+        value: Handle<Expression>,
+    ) {
+        let pointer = self.ptr(expressions, body, Expression::GlobalVariable(global), index);
+        body.push(Statement::Store { pointer, value }, Span::default());
+    }
+
+    fn load_workgroup(
+        &self,
+        expressions: &mut Arena<Expression>,
+        body: &mut Block,
+        global: Handle<GlobalVariable>,
+        index: Handle<Expression>,
+    ) -> Handle<Expression> {
+        let ptr = self.ptr(expressions, body, Expression::GlobalVariable(global), index);
+        self.emit(expressions, body, Expression::Load { pointer: ptr })
+    }
+
+    fn store_workgroup(
+        &self,
+        expressions: &mut Arena<Expression>,
+        body: &mut Block,
+        global: Handle<GlobalVariable>,
+        index: Handle<Expression>,
+        value: Handle<Expression>,
+    ) {
+        let pointer = self.ptr(expressions, body, Expression::GlobalVariable(global), index);
+        body.push(Statement::Store { pointer, value }, Span::default());
+    }
+
+    fn ptr(
+        &self,
+        expressions: &mut Arena<Expression>,
+        body: &mut Block,
+        base: Expression,
+        index: Handle<Expression>,
+    ) -> Handle<Expression> {
+        let base = expressions.append(base, Span::default());
+        self.emit(expressions, body, Expression::Access { base, index })
+    }
+
+    fn load_local(
+        &self,
+        expressions: &mut Arena<Expression>,
+        body: &mut Block,
+        local: Handle<LocalVariable>,
+    ) -> Handle<Expression> {
+        let pointer = expressions.append(Expression::LocalVariable(local), Span::default());
+        self.emit(expressions, body, Expression::Load { pointer })
+    }
+
+    fn store_local(
+        &self,
+        expressions: &mut Arena<Expression>,
+        body: &mut Block,
+        local: Handle<LocalVariable>,
+        value: Handle<Expression>,
+    ) {
+        let pointer = expressions.append(Expression::LocalVariable(local), Span::default());
+        body.push(Statement::Store { pointer, value }, Span::default());
+    }
+
+    fn lt_lit(
+        &self,
+        expressions: &mut Arena<Expression>,
+        body: &mut Block,
+        value: Handle<Expression>,
+        literal: u32,
+    ) -> Handle<Expression> {
+        let rhs = self.u32_lit(expressions, literal);
+        self.bin(expressions, body, BinaryOperator::Less, value, rhs)
+    }
+
+    fn add_lit(
+        &self,
+        expressions: &mut Arena<Expression>,
+        body: &mut Block,
+        value: Handle<Expression>,
+        literal: u32,
+    ) -> Handle<Expression> {
+        if literal == 0 {
+            value
+        } else {
+            let rhs = self.u32_lit(expressions, literal);
+            self.bin(expressions, body, BinaryOperator::Add, value, rhs)
+        }
+    }
+
+    fn mul_lit(
+        &self,
+        expressions: &mut Arena<Expression>,
+        body: &mut Block,
+        value: Handle<Expression>,
+        literal: u32,
+    ) -> Handle<Expression> {
+        let rhs = self.u32_lit(expressions, literal);
+        self.bin(expressions, body, BinaryOperator::Multiply, value, rhs)
+    }
+
+    fn and(
+        &self,
+        expressions: &mut Arena<Expression>,
+        body: &mut Block,
+        left: Handle<Expression>,
+        right: Handle<Expression>,
+    ) -> Handle<Expression> {
+        self.bin(expressions, body, BinaryOperator::LogicalAnd, left, right)
+    }
+
+    fn or(
+        &self,
+        expressions: &mut Arena<Expression>,
+        body: &mut Block,
+        left: Handle<Expression>,
+        right: Handle<Expression>,
+    ) -> Handle<Expression> {
+        self.bin(expressions, body, BinaryOperator::LogicalOr, left, right)
+    }
+
+    fn bin(
+        &self,
+        expressions: &mut Arena<Expression>,
+        body: &mut Block,
+        op: BinaryOperator,
+        left: Handle<Expression>,
+        right: Handle<Expression>,
+    ) -> Handle<Expression> {
+        self.emit(expressions, body, Expression::Binary { op, left, right })
+    }
+
+    fn emit(
+        &self,
+        expressions: &mut Arena<Expression>,
+        body: &mut Block,
+        expression: Expression,
+    ) -> Handle<Expression> {
+        let handle = expressions.append(expression, Span::default());
+        body.push(
+            Statement::Emit(Range::new_from_bounds(handle, handle)),
+            Span::default(),
+        );
+        handle
+    }
+
+    fn f32_lit(&self, expressions: &mut Arena<Expression>, value: f32) -> Handle<Expression> {
+        expressions.append(Expression::Literal(Literal::F32(value)), Span::default())
+    }
+
+    fn u32_lit(&self, expressions: &mut Arena<Expression>, value: u32) -> Handle<Expression> {
+        expressions.append(Expression::Literal(Literal::U32(value)), Span::default())
+    }
+
+    fn bool_lit(&self, expressions: &mut Arena<Expression>, value: bool) -> Handle<Expression> {
+        expressions.append(Expression::Literal(Literal::Bool(value)), Span::default())
+    }
 }
 
 impl MergeTopKModuleBuilder {
@@ -1948,17 +2628,31 @@ impl MergeTopKModuleBuilder {
 }
 
 impl TopKModuleBuilder {
-    fn new(input_len: u32, output_per_chunk: u32, input_offset: u32, input_stride: u32) -> Self {
+    fn new(
+        input_len: u32,
+        output_per_chunk: u32,
+        input_offset: u32,
+        input_stride: u32,
+        processors: bool,
+    ) -> Self {
         Self {
             input_len,
             output_per_chunk,
             input_offset,
             input_stride,
+            processors,
         }
     }
 
     fn build(self) -> Option<Module> {
         let mut module = Module::default();
+        let bool_ty = module.types.insert(
+            Type {
+                name: Some("TopKBool".into()),
+                inner: TypeInner::Scalar(Scalar::BOOL),
+            },
+            Span::default(),
+        );
         let f32_ty = module.types.insert(
             Type {
                 name: Some("TopKF32".into()),
@@ -2038,6 +2732,12 @@ impl TopKModuleBuilder {
                 f32_storage_ty,
                 false,
             ),
+            previous_tokens: self.processors.then(|| {
+                Self::storage_global(&mut module, "previous_tokens", 3, u32_storage_ty, true)
+            }),
+            processor_params: self.processors.then(|| {
+                Self::storage_global(&mut module, "processor_params", 4, u32_storage_ty, true)
+            }),
             scratch_values: Self::workgroup_global(&mut module, "scratch_values", scratch_f32_ty),
             scratch_ids: Self::workgroup_global(&mut module, "scratch_ids", scratch_u32_ty),
         };
@@ -2061,6 +2761,8 @@ impl TopKModuleBuilder {
         let locals = TopKLocals {
             current_value: Self::local(&mut function, "current_value", f32_ty),
             current_id: Self::local(&mut function, "current_id", u32_ty),
+            previous_index: Self::local(&mut function, "previous_index", u32_ty),
+            repeated: Self::local(&mut function, "repeated", bool_ty),
         };
 
         function.body = self.entry_body(&mut function.expressions, globals, locals);
@@ -2128,13 +2830,41 @@ impl TopKModuleBuilder {
             self.add_lit(expressions, &mut load_accept, scaled, self.input_offset)
         };
         let value = self.load_storage(expressions, &mut load_accept, globals.input, input_index);
-        let finite = self.is_finite(expressions, &mut load_accept, value);
+        let raw_finite = self.is_finite(expressions, &mut load_accept, value);
         let mut finite_accept = Block::new();
-        self.store_local(expressions, &mut finite_accept, locals.current_value, value);
-        self.store_local(expressions, &mut finite_accept, locals.current_id, token_id);
-        load_accept.push(
+        let value = self.apply_processors(
+            expressions,
+            &mut finite_accept,
+            &globals,
+            &locals,
+            value,
+            token_id,
+        );
+        let finite = self.is_finite(expressions, &mut finite_accept, value);
+        let mut processed_finite_accept = Block::new();
+        self.store_local(
+            expressions,
+            &mut processed_finite_accept,
+            locals.current_value,
+            value,
+        );
+        self.store_local(
+            expressions,
+            &mut processed_finite_accept,
+            locals.current_id,
+            token_id,
+        );
+        finite_accept.push(
             Statement::If {
                 condition: finite,
+                accept: processed_finite_accept,
+                reject: Block::new(),
+            },
+            Span::default(),
+        );
+        load_accept.push(
+            Statement::If {
+                condition: raw_finite,
                 accept: finite_accept,
                 reject: Block::new(),
             },
@@ -2338,6 +3068,191 @@ impl TopKModuleBuilder {
         );
     }
 
+    fn apply_processors(
+        &self,
+        expressions: &mut Arena<Expression>,
+        body: &mut Block,
+        globals: &TopKGlobals,
+        locals: &TopKLocals,
+        value: Handle<Expression>,
+        token_id: Handle<Expression>,
+    ) -> Handle<Expression> {
+        let (Some(previous_tokens), Some(processor_params)) =
+            (globals.previous_tokens, globals.processor_params)
+        else {
+            return value;
+        };
+
+        self.store_local(expressions, body, locals.current_value, value);
+        let zero_u32 = self.u32_lit(expressions, 0);
+        self.store_local(expressions, body, locals.previous_index, zero_u32);
+        let false_lit = self.bool_lit(expressions, false);
+        self.store_local(expressions, body, locals.repeated, false_lit);
+
+        let previous_len_index = self.u32_lit(expressions, 2);
+        let previous_len =
+            self.load_storage(expressions, body, processor_params, previous_len_index);
+        let mut scan_body = Block::new();
+        let previous_index = self.load_local(expressions, &mut scan_body, locals.previous_index);
+        let done = self.bin(
+            expressions,
+            &mut scan_body,
+            BinaryOperator::GreaterEqual,
+            previous_index,
+            previous_len,
+        );
+        scan_body.push(
+            Statement::If {
+                condition: done,
+                accept: Block::from_vec(vec![Statement::Break]),
+                reject: Block::new(),
+            },
+            Span::default(),
+        );
+        let previous_index = self.load_local(expressions, &mut scan_body, locals.previous_index);
+        let previous_token =
+            self.load_storage(expressions, &mut scan_body, previous_tokens, previous_index);
+        let repeated = self.bin(
+            expressions,
+            &mut scan_body,
+            BinaryOperator::Equal,
+            previous_token,
+            token_id,
+        );
+        let mut repeated_accept = Block::new();
+        let true_lit = self.bool_lit(expressions, true);
+        self.store_local(expressions, &mut repeated_accept, locals.repeated, true_lit);
+        repeated_accept.push(Statement::Break, Span::default());
+        scan_body.push(
+            Statement::If {
+                condition: repeated,
+                accept: repeated_accept,
+                reject: Block::new(),
+            },
+            Span::default(),
+        );
+        let previous_index = self.load_local(expressions, &mut scan_body, locals.previous_index);
+        let next_previous_index = self.add_lit(expressions, &mut scan_body, previous_index, 1);
+        self.store_local(
+            expressions,
+            &mut scan_body,
+            locals.previous_index,
+            next_previous_index,
+        );
+        body.push(
+            Statement::Loop {
+                body: scan_body,
+                continuing: Block::new(),
+                break_if: None,
+            },
+            Span::default(),
+        );
+
+        let repetition_penalty =
+            self.load_processor_param_f32(expressions, body, processor_params, 1);
+        let repeated = self.load_local(expressions, body, locals.repeated);
+        let one = self.f32_lit(expressions, 1.0);
+        let penalty_gt_one = self.bin(
+            expressions,
+            body,
+            BinaryOperator::Greater,
+            repetition_penalty,
+            one,
+        );
+        let should_apply_penalty = self.and(expressions, body, repeated, penalty_gt_one);
+        let mut penalty_accept = Block::new();
+        let current = self.load_local(expressions, &mut penalty_accept, locals.current_value);
+        let zero = self.f32_lit(expressions, 0.0);
+        let non_positive = self.bin(
+            expressions,
+            &mut penalty_accept,
+            BinaryOperator::LessEqual,
+            current,
+            zero,
+        );
+        let mut non_positive_accept = Block::new();
+        let current = self.load_local(expressions, &mut non_positive_accept, locals.current_value);
+        let penalized = self.bin(
+            expressions,
+            &mut non_positive_accept,
+            BinaryOperator::Multiply,
+            current,
+            repetition_penalty,
+        );
+        self.store_local(
+            expressions,
+            &mut non_positive_accept,
+            locals.current_value,
+            penalized,
+        );
+        let mut positive_accept = Block::new();
+        let current = self.load_local(expressions, &mut positive_accept, locals.current_value);
+        let penalized = self.bin(
+            expressions,
+            &mut positive_accept,
+            BinaryOperator::Divide,
+            current,
+            repetition_penalty,
+        );
+        self.store_local(
+            expressions,
+            &mut positive_accept,
+            locals.current_value,
+            penalized,
+        );
+        penalty_accept.push(
+            Statement::If {
+                condition: non_positive,
+                accept: non_positive_accept,
+                reject: positive_accept,
+            },
+            Span::default(),
+        );
+        body.push(
+            Statement::If {
+                condition: should_apply_penalty,
+                accept: penalty_accept,
+                reject: Block::new(),
+            },
+            Span::default(),
+        );
+
+        let temperature = self.load_processor_param_f32(expressions, body, processor_params, 0);
+        let zero = self.f32_lit(expressions, 0.0);
+        let temp_nonzero = self.bin(
+            expressions,
+            body,
+            BinaryOperator::NotEqual,
+            temperature,
+            zero,
+        );
+        let mut temperature_accept = Block::new();
+        let current = self.load_local(expressions, &mut temperature_accept, locals.current_value);
+        let adjusted = self.bin(
+            expressions,
+            &mut temperature_accept,
+            BinaryOperator::Divide,
+            current,
+            temperature,
+        );
+        self.store_local(
+            expressions,
+            &mut temperature_accept,
+            locals.current_value,
+            adjusted,
+        );
+        body.push(
+            Statement::If {
+                condition: temp_nonzero,
+                accept: temperature_accept,
+                reject: Block::new(),
+            },
+            Span::default(),
+        );
+
+        self.load_local(expressions, body, locals.current_value)
+    }
+
     fn storage_global(
         module: &mut Module,
         name: &str,
@@ -2445,6 +3360,26 @@ impl TopKModuleBuilder {
     ) -> Handle<Expression> {
         let ptr = self.storage_ptr(expressions, body, global, index);
         self.emit(expressions, body, Expression::Load { pointer: ptr })
+    }
+
+    fn load_processor_param_f32(
+        &self,
+        expressions: &mut Arena<Expression>,
+        body: &mut Block,
+        global: Handle<GlobalVariable>,
+        index: u32,
+    ) -> Handle<Expression> {
+        let index = self.u32_lit(expressions, index);
+        let bits = self.load_storage(expressions, body, global, index);
+        self.emit(
+            expressions,
+            body,
+            Expression::As {
+                expr: bits,
+                kind: ScalarKind::Float,
+                convert: None,
+            },
+        )
     }
 
     fn store_storage(
@@ -2579,10 +3514,13 @@ impl TopKModuleBuilder {
 mod tests {
     use std::mem::size_of;
 
-    use crate::{Device, Tensor, quantized::QMatrix};
+    use crate::{DataTypeEnum, Device, Tensor, TensorData, quantized::QMatrix};
     use fusor_gguf::{BlockQ4_0, GgmlType};
 
-    use super::{GpuMirostat2Sampler, GpuMirostat2SamplerParams};
+    use super::{
+        GpuMirostat2Sampler, GpuMirostat2SamplerParams,
+        chunk_top_k_pair_data_with_processors_with_encoder, mirostat2_sample_token_to_host,
+    };
 
     #[tokio::test]
     async fn top_k_pairs_match_cpu_sorted_order() {
@@ -2624,6 +3562,177 @@ mod tests {
             .map(|(id, value)| (id as usize, value))
             .collect::<Vec<_>>();
         assert_eq!(actual, expected);
+    }
+
+    #[tokio::test]
+    async fn processed_chunk_top_k_applies_temperature_and_repetition_penalty() {
+        let device = Device::new().await.unwrap();
+        let values = [
+            4.0,
+            -2.0,
+            3.5,
+            8.0,
+            f32::NAN,
+            1.0,
+            5.0,
+            -1.5,
+            6.5,
+            7.0,
+            f32::NEG_INFINITY,
+            0.5,
+        ];
+        let buffer = device.create_buffer_init(
+            bytemuck::cast_slice(&values),
+            wgpu::BufferUsages::STORAGE
+                | wgpu::BufferUsages::COPY_SRC
+                | wgpu::BufferUsages::COPY_DST,
+        );
+        let data = TensorData::new_from_buffer(&device, buffer, &[values.len()], DataTypeEnum::F32);
+        let previous_tokens = [0, 3, 9];
+        let (ids, logits) = chunk_top_k_pair_data_with_processors_with_encoder(
+            &data,
+            &previous_tokens,
+            0.5,
+            2.0,
+            5,
+            5,
+            None,
+        )
+        .unwrap();
+        let ids = Tensor::<1, u32>::from(ids).as_slice().await.unwrap();
+        let logits = Tensor::<1, f32>::from(logits).as_slice().await.unwrap();
+
+        let mut expected = values
+            .iter()
+            .copied()
+            .enumerate()
+            .filter_map(|(token_id, mut value)| {
+                if !value.is_finite() {
+                    return None;
+                }
+                if previous_tokens.contains(&(token_id as u32)) {
+                    if value <= 0.0 {
+                        value *= 2.0;
+                    } else {
+                        value /= 2.0;
+                    }
+                }
+                value /= 0.5;
+                Some((token_id as u32, value))
+            })
+            .collect::<Vec<_>>();
+        expected.sort_by(|left, right| {
+            right
+                .1
+                .total_cmp(&left.1)
+                .then_with(|| right.0.cmp(&left.0))
+        });
+        expected.truncate(5);
+
+        let actual = ids
+            .as_slice()
+            .iter()
+            .copied()
+            .zip(logits.as_slice().iter().copied())
+            .collect::<Vec<_>>();
+        assert_eq!(actual, expected);
+    }
+
+    fn cpu_mirostat2_selected_token(
+        values: &[f32],
+        mu: f32,
+        params: GpuMirostat2SamplerParams,
+    ) -> u32 {
+        let mut top = values
+            .iter()
+            .copied()
+            .enumerate()
+            .filter_map(|(token_id, value)| {
+                value
+                    .is_finite()
+                    .then_some((token_id as u32, value / params.temperature))
+            })
+            .collect::<Vec<_>>();
+        top.sort_by(|left, right| {
+            right
+                .1
+                .total_cmp(&left.1)
+                .then_with(|| right.0.cmp(&left.0))
+        });
+        top.truncate(params.top_k.min(top.len()));
+
+        let max_value = top[0].1;
+        let total = top
+            .iter()
+            .map(|(_, value)| (*value - max_value).exp())
+            .sum::<f32>()
+            .max(1.0e-20);
+        let mut cutoff = 0usize;
+        for (scan, (_, value)) in top.iter().enumerate() {
+            let probability = (*value - max_value).exp() / total;
+            if -probability.max(1.0e-20).log2() > mu {
+                cutoff = scan.max(1);
+                break;
+            }
+        }
+        if cutoff == 0 {
+            cutoff = 1;
+        }
+
+        let cutoff_sum = top
+            .iter()
+            .take(cutoff)
+            .map(|(_, value)| (*value - max_value).exp())
+            .sum::<f32>()
+            .max(1.0e-20);
+        let threshold = params.random.clamp(0.0, 0.999_999_94) * cutoff_sum;
+        let mut cumulative = 0.0;
+        let mut selected = top[0].0;
+        for (token_id, value) in top.iter().take(cutoff) {
+            cumulative += (*value - max_value).exp();
+            if cumulative >= threshold {
+                selected = *token_id;
+                break;
+            }
+        }
+        selected
+    }
+
+    #[tokio::test]
+    async fn mirostat2_sampler_uses_exact_top_k_when_candidates_cluster() {
+        let device = Device::new().await.unwrap();
+        let mut values = vec![0.0f32; 512];
+        for (token_id, value) in values.iter_mut().take(128).enumerate() {
+            *value = 10.0 - token_id as f32 * 0.005;
+        }
+        let buffer = device.create_buffer_init(
+            bytemuck::cast_slice(&values),
+            wgpu::BufferUsages::STORAGE
+                | wgpu::BufferUsages::COPY_SRC
+                | wgpu::BufferUsages::COPY_DST,
+        );
+        let data = TensorData::new_from_buffer(&device, buffer, &[values.len()], DataTypeEnum::F32);
+        let mu = 7.297_829;
+        let params = GpuMirostat2SamplerParams {
+            top_k: 128,
+            temperature: 1.0,
+            repetition_penalty: 1.0,
+            tau: 5.0,
+            eta: 0.1,
+            random: 0.99,
+        };
+        let expected = cpu_mirostat2_selected_token(&values, mu, params);
+        assert!(
+            expected >= 64,
+            "test setup should select a token missing from a 64-candidate chunk"
+        );
+
+        let mut sampler = GpuMirostat2Sampler::new(&device, mu);
+        let token = mirostat2_sample_token_to_host(&data, &mut sampler, &[], params)
+            .await
+            .unwrap();
+
+        assert_eq!(token, Some(expected));
     }
 
     #[tokio::test]

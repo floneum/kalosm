@@ -643,18 +643,16 @@ where
         }
         Box::pin(async move {
             let sample_start = trace.then(std::time::Instant::now);
-            let token_id = if let Some(token_id) = hidden
+            let token_id = match hidden
                 .try_sample_mirostat2_token_q_mat(&output_matrix, sampler, &previous_tokens, params)
                 .await?
             {
-                token_id
-            } else {
-                let hidden_2d = hidden.unsqueeze(0);
-                let projected = hidden_2d.q_mat_mul(&output_matrix);
-                let logits = projected.squeeze(0).to_concrete();
-                logits
-                    .sample_mirostat2_token(sampler, &previous_tokens, params)
-                    .await?
+                Some(token_id) => token_id,
+                None => {
+                    return Err(LlamaModelError::SamplerError(
+                        "fused logits sampler refused slow fallback".into(),
+                    ));
+                }
             };
             if let Some(start) = sample_start {
                 eprintln!(
