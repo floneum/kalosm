@@ -1229,6 +1229,24 @@ impl<D: DataType, const R: usize> Tensor<R, D> {
 }
 
 impl Tensor<1, f32> {
+    pub async fn try_sample_mirostat2_token_q_mat(
+        &self,
+        matrix: &QMatrix,
+        sampler: &mut crate::top_k::GpuMirostat2Sampler,
+        previous_tokens: &[u32],
+        params: crate::top_k::GpuMirostat2SamplerParams,
+    ) -> Result<Option<u32>, wgpu::BufferAsyncError> {
+        let (input, _) = self.data.materialize();
+        crate::top_k::qmat_mirostat2_sample_token_to_host(
+            &input,
+            matrix,
+            sampler,
+            previous_tokens,
+            params,
+        )
+        .await
+    }
+
     pub async fn sample_mirostat2_token(
         &self,
         sampler: &mut crate::top_k::GpuMirostat2Sampler,

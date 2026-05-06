@@ -497,6 +497,22 @@ where
                 .map_err(|err| Error::Gpu(err.into())),
         }
     }
+
+    pub async fn try_sample_mirostat2_token_q_mat(
+        &self,
+        weights: &crate::QMatrix,
+        sampler: &mut GpuMirostat2Sampler,
+        previous_tokens: &[u32],
+        params: GpuMirostat2SamplerParams,
+    ) -> Result<Option<u32>, Error> {
+        match (self, weights) {
+            (Tensor::Gpu(t), crate::QMatrix::Gpu(weights)) => t
+                .try_sample_mirostat2_token_q_mat(weights, sampler, previous_tokens, params)
+                .await
+                .map_err(|err| Error::Gpu(err.into())),
+            _ => Ok(None),
+        }
+    }
 }
 
 pub enum EitherMappedBuffer {

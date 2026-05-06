@@ -91,6 +91,12 @@ fn gpu_token_sampling_enabled() -> bool {
         .unwrap_or(true)
 }
 
+fn gpu_fused_logits_sampling_enabled() -> bool {
+    std::env::var_os("KALOSM_LLAMA_GPU_FUSED_LOGITS")
+        .map(|value| value != "0")
+        .unwrap_or(true)
+}
+
 fn gpu_sample_top_k() -> usize {
     std::env::var("KALOSM_LLAMA_GPU_SAMPLE_TOP_K")
         .ok()
@@ -500,6 +506,20 @@ where
             );
         }
 
+        if gpu_fused_logits_sampling_enabled() {
+            return Self::forward_sample_token_fused_logits(
+                model,
+                device,
+                tokens,
+                images,
+                cache,
+                tokenizer,
+                sampler,
+                previous_tokens,
+                params,
+            );
+        }
+
         let trace = std::env::var_os("KALOSM_TRACE_DECODE_TIMING").is_some()
             || std::env::var_os("FUSOR_TRACE_DECODE").is_some()
             || std::env::var_os("FUSOR_TRACE_RESOLVE").is_some();
@@ -552,6 +572,93 @@ where
             if let Some(start) = download_start {
                 eprintln!(
                     "forward_sample_token_download path={path} decode_eligible={decode_eligible} k={} elapsed={:?}",
+                    params.top_k,
+                    start.elapsed()
+                );
+            }
+            if let Some(start) = token_start {
+                record_decode_trace(path, decode_eligible, kernels, start.elapsed());
+            }
+
+            Ok(token_id)
+        })
+    }
+
+    fn forward_sample_token_fused_logits<'a>(
+        model: &Model<F>,
+        device: &Device,
+        tokens: &[u32],
+        images: &[(image::DynamicImage, MediaHints)],
+        mut cache: Option<&mut LlamaCache>,
+        #[allow(unused)] tokenizer: &Tokenizer,
+        sampler: &'a mut fusor::GpuMirostat2Sampler,
+        previous_tokens: Vec<u32>,
+        params: fusor::GpuMirostat2SamplerParams,
+    ) -> Pin<
+        Box<dyn kalosm_model_types::FutureWasmNotSend<Output = Result<u32, LlamaModelError>> + 'a>,
+    > {
+        let trace = std::env::var_os("KALOSM_TRACE_DECODE_TIMING").is_some()
+            || std::env::var_os("FUSOR_TRACE_DECODE").is_some()
+            || std::env::var_os("FUSOR_TRACE_RESOLVE").is_some();
+        let fast_decode_enabled = std::env::var_os("KALOSM_LLAMA_FAST_DECODE")
+            .map(|value| value != "0")
+            .unwrap_or(true);
+        let decode_eligible = fast_decode_enabled
+            && tokens.len() == 1
+            && images.is_empty()
+            && cache.as_ref().is_some_and(|cache| !cache.tokens.is_empty());
+        let path = if decode_eligible {
+            "fast_decode_graph_fused_sample_token"
+        } else {
+            "graph_fallback_fused_sample_token"
+        };
+        let token_start = trace.then(std::time::Instant::now);
+        let build_start = trace.then(std::time::Instant::now);
+        let hidden = model.forward_last_hidden_f32(tokens, images, device, cache.as_deref_mut());
+        if let Some(start) = build_start {
+            eprintln!(
+                "forward_graph_build path={path} decode_eligible={decode_eligible} elapsed={:?}",
+                start.elapsed()
+            );
+        }
+        let hidden = match hidden {
+            Ok(hidden) => hidden,
+            Err(err) => return Box::pin(async move { Err(err.into()) }),
+        };
+        let hidden = hidden.squeeze(0).to_concrete();
+        let output_matrix = model.output_matrix().clone();
+        let mut kernels = 0;
+        if let Some(hidden_key) = hidden.gpu_key() {
+            let resolve_start = trace.then(std::time::Instant::now);
+            kernels = device.resolve_batch(&[hidden_key]);
+            if let Some(start) = resolve_start {
+                eprintln!(
+                    "forward_resolve path={path} decode_eligible={decode_eligible} kernels={kernels} elapsed={:?}",
+                    start.elapsed()
+                );
+            }
+            if let Some(cache) = cache.as_deref_mut() {
+                cache.detach(device);
+            }
+        }
+        Box::pin(async move {
+            let sample_start = trace.then(std::time::Instant::now);
+            let token_id = if let Some(token_id) = hidden
+                .try_sample_mirostat2_token_q_mat(&output_matrix, sampler, &previous_tokens, params)
+                .await?
+            {
+                token_id
+            } else {
+                let hidden_2d = hidden.unsqueeze(0);
+                let projected = hidden_2d.q_mat_mul(&output_matrix);
+                let logits = projected.squeeze(0).to_concrete();
+                logits
+                    .sample_mirostat2_token(sampler, &previous_tokens, params)
+                    .await?
+            };
+            if let Some(start) = sample_start {
+                eprintln!(
+                    "forward_sample_token_download path={path} decode_eligible={decode_eligible} fused_logits=1 k={} elapsed={:?}",
                     params.top_k,
                     start.elapsed()
                 );

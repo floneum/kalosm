@@ -671,8 +671,24 @@ where
         tokens: &[u32],
         images: &[(image::DynamicImage, MediaHints)],
         device: &Device,
-        mut cache: Option<&mut LlamaCache>,
+        cache: Option<&mut LlamaCache>,
     ) -> Result<Tensor<2, F>>
+    where
+        F: CastTo<f32> + CastTensor<f32> + Default,
+        f32: CastTo<F> + CastTensor<F>,
+    {
+        let x_f32 = self.forward_last_hidden_f32(tokens, images, device, cache)?;
+        let result_f32 = x_f32.q_mat_mul(&self.output);
+        Ok(result_f32.cast())
+    }
+
+    pub(crate) fn forward_last_hidden_f32(
+        &self,
+        tokens: &[u32],
+        images: &[(image::DynamicImage, MediaHints)],
+        device: &Device,
+        mut cache: Option<&mut LlamaCache>,
+    ) -> Result<Tensor<2, f32>>
     where
         F: CastTo<f32> + CastTensor<f32> + Default,
         f32: CastTo<F> + CastTensor<F>,
@@ -712,9 +728,10 @@ where
         }
         let x = self.norm.forward_generic(&layer_in);
         let x = x.i((.., seq_len - 1, ..));
-        // Do final matmul in f32 and cast back
-        let x_f32 = x.cast::<f32>();
-        let result_f32 = x_f32.q_mat_mul(&self.output);
-        Ok(result_f32.cast())
+        Ok(x.cast::<f32>())
+    }
+
+    pub(crate) fn output_matrix(&self) -> &QMatrix {
+        &self.output
     }
 }

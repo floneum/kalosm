@@ -1,10 +1,17 @@
 use std::num::NonZeroU32;
 
 use crate::{
-    Device,
+    Device, Layout,
     mir::direct_kernel::{DirectKernel, DirectKernelBinding},
+    mir::tile_direct::{
+        flatten_matrix_layout, tile_storage_read_with_direct_layout,
+        tile_storage_write_with_direct_layout,
+    },
+    quantized::QMatrix,
     tensor::{DataTypeEnum, TensorData},
 };
+use fusor_gguf::GgmlType;
+use phase_token_prototype as tile_ir;
 use wgpu::{
     CommandEncoder,
     naga::{
@@ -168,6 +175,328 @@ pub(crate) async fn mirostat2_sample_token_to_host(
             .copied()
             .unwrap_or_default(),
     ))
+}
+
+pub(crate) async fn qmat_mirostat2_sample_token_to_host(
+    hidden: &TensorData,
+    matrix: &QMatrix,
+    sampler: &mut GpuMirostat2Sampler,
+    previous_tokens: &[u32],
+    params: GpuMirostat2SamplerParams,
+) -> Result<Option<u32>, wgpu::BufferAsyncError> {
+    if hidden.datatype() != DataTypeEnum::F32 || hidden.layout().rank() != 1 {
+        return Ok(None);
+    }
+    let hidden_len = hidden.layout().shape()[0];
+    let [vocab_len, hidden_matrix_len] = matrix.shape() else {
+        return Ok(None);
+    };
+    if hidden_len != *hidden_matrix_len || *vocab_len == 0 {
+        return Ok(None);
+    }
+    if !hidden.device().is_same_device(matrix.device()) {
+        return Ok(None);
+    }
+
+    let device = hidden.device();
+    let mut encoder =
+        device
+            .wgpu_device()
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("qmat_mirostat2_sample_token_to_host encoder"),
+            });
+
+    let Some(logits) = qmat_logits_data_with_encoder(hidden, matrix, &mut encoder) else {
+        return Ok(None);
+    };
+    let Some(adjusted) = adjusted_logits_for_sampler_data_with_encoder(
+        &logits,
+        previous_tokens,
+        params.temperature,
+        params.repetition_penalty,
+        Some(&mut encoder),
+    ) else {
+        return Ok(None);
+    };
+
+    let input_len = adjusted.layout().shape()[0];
+    let top_k = params.top_k.min(input_len);
+    if top_k == 0 {
+        return Ok(None);
+    }
+
+    let chunks = input_len.div_ceil(TOP_K_CHUNK);
+    let candidate_count = top_k
+        .div_ceil(chunks)
+        .max(MIN_TOP_K_CANDIDATES_PER_CHUNK)
+        .min(top_k)
+        .min(TOP_K_CHUNK);
+    let output_per_chunk = if candidate_count >= TOP_K_CHUNK {
+        TOP_K_CHUNK
+    } else {
+        candidate_count + 1
+    };
+    let Some((ids, values)) = chunk_top_k_pair_data_with_encoder(
+        &adjusted,
+        candidate_count,
+        output_per_chunk,
+        Some(&mut encoder),
+    ) else {
+        return Ok(None);
+    };
+    let Some((ids, values)) = merge_sorted_chunk_top_k_pair_data_with_encoder(
+        &ids,
+        &values,
+        chunks,
+        candidate_count,
+        output_per_chunk,
+        input_len,
+        top_k,
+        Some(&mut encoder),
+    ) else {
+        return Ok(None);
+    };
+    let Some(output) = sample_from_sorted_top_k_data_with_encoder(
+        &ids,
+        &values,
+        sampler,
+        params,
+        Some(&mut encoder),
+    ) else {
+        return Ok(None);
+    };
+
+    let download = device.wgpu_device().create_buffer(&wgpu::BufferDescriptor {
+        size: std::mem::size_of::<u32>() as u64,
+        usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+        mapped_at_creation: false,
+        label: Some("qmat mirostat2 sampled token download"),
+    });
+    encoder.copy_buffer_to_buffer(
+        output.buffer(),
+        0,
+        &download,
+        0,
+        std::mem::size_of::<u32>() as u64,
+    );
+    device.wgpu_queue().submit(Some(encoder.finish()));
+
+    let (sender, receiver) = futures_channel::oneshot::channel();
+    download
+        .slice(..)
+        .map_async(wgpu::MapMode::Read, move |result| {
+            _ = sender.send(result);
+        });
+    #[cfg(not(target_arch = "wasm32"))]
+    device.poll_wait();
+    receiver.await.map_err(|_| wgpu::BufferAsyncError)??;
+
+    let view = download.slice(..).get_mapped_range();
+    Ok(Some(
+        view.get(..std::mem::size_of::<u32>())
+            .map(bytemuck::from_bytes::<u32>)
+            .copied()
+            .unwrap_or_default(),
+    ))
+}
+
+fn qmat_logits_data_with_encoder(
+    hidden: &TensorData,
+    matrix: &QMatrix,
+    encoder: &mut CommandEncoder,
+) -> Option<TensorData> {
+    if hidden.datatype() != DataTypeEnum::F32 || hidden.layout().rank() != 1 {
+        return None;
+    }
+    let hidden_len = hidden.layout().shape()[0];
+    let hidden_stride = hidden.layout().strides()[0];
+    let [vocab_len, matrix_hidden_len] = matrix.shape() else {
+        return None;
+    };
+    if hidden_len != *matrix_hidden_len || *vocab_len == 0 {
+        return None;
+    }
+
+    let device = hidden.device();
+    let logits = TensorData::new_for_shape(device, &[*vocab_len], DataTypeEnum::F32);
+    let hidden_2d = TensorData::new_from_parts(
+        device,
+        hidden.buffer().clone(),
+        Layout::from_parts(
+            hidden.layout().offset(),
+            Box::new([1, hidden_len]),
+            Box::new([0, hidden_stride]),
+        ),
+        DataTypeEnum::F32,
+    );
+    let logits_2d = TensorData::new_from_parts(
+        device,
+        logits.buffer().clone(),
+        Layout::from_parts(0, Box::new([1, *vocab_len]), Box::new([*vocab_len, 1])),
+        DataTypeEnum::F32,
+    );
+    let kernel = qmat_logits_direct_kernel(&hidden_2d, matrix, &logits_2d)?;
+    kernel.run(device, encoder);
+
+    Some(logits)
+}
+
+fn qmat_logits_direct_kernel(
+    input: &TensorData,
+    matrix: &QMatrix,
+    output: &TensorData,
+) -> Option<DirectKernel> {
+    if input.datatype() != DataTypeEnum::F32 || output.datatype() != DataTypeEnum::F32 {
+        return None;
+    }
+    let format = qmat_direct_quant_format(matrix)?;
+    let a_view = flatten_matrix_layout(input.layout())?;
+    let y_view = flatten_matrix_layout(output.layout())?;
+    let m = a_view.rows;
+    let k = a_view.cols;
+    let y_m = y_view.rows;
+    let n = y_view.cols;
+    if m != 1 || y_m != 1 || k != matrix.shape()[1] as u32 || n != matrix.shape()[0] as u32 {
+        return None;
+    }
+
+    let device = input.device();
+    let limits = device.limits();
+    let max_workgroups = limits.max_compute_workgroups_per_dimension;
+    let qgemv_cols_per_workgroup = qgemv_cols_per_workgroup_for_direct(format, k, n);
+    let qgemv_workgroups = n.div_ceil(qgemv_cols_per_workgroup);
+    let [workgroups_x, _] = split_workgroups_2d(qgemv_workgroups, max_workgroups)?;
+    let dispatch_size = [workgroups_x, qgemv_workgroups.div_ceil(workgroups_x), 1];
+    if dispatch_size.iter().any(|dim| *dim > max_workgroups) {
+        return None;
+    }
+
+    let cache_key = format!(
+        "q_mat_logits_for_sampler:direct:{format:?}:m={m}:k={k}:n={n}:dispatch={dispatch_size:?}:{:?}:{:?}",
+        input.layout(),
+        output.layout()
+    );
+    let module = if let Some(module) = device.naga_module_cache().write().get(&cache_key) {
+        module.clone()
+    } else {
+        let ir = tile_ir::tile::build(move |phase| {
+            let a = tile_storage_read_with_direct_layout(phase, a_view);
+            let b = phase.quantized_matrix(format, k, n);
+            let y = tile_storage_write_with_direct_layout(phase, y_view);
+            if format == tile_ir::GgmlQuantFormat::Q5_0 && k <= 1024 && n <= 4096 {
+                phase.qgemv::<8, 32>(&a, &b, &y, 4, workgroups_x);
+            } else {
+                phase.qgemv::<4, 64>(&a, &b, &y, 4, workgroups_x);
+            }
+        });
+        let module = ir.lower_to_naga().ok()?.module().clone();
+        device
+            .naga_module_cache()
+            .write()
+            .get_or_insert(cache_key.clone(), || module.clone())
+            .clone()
+    };
+
+    Some(DirectKernel::new_with_cache_key(
+        "q_mat_logits_for_sampler",
+        cache_key,
+        module,
+        vec![
+            DirectKernelBinding::Storage {
+                binding: 0,
+                buffer: input.buffer().clone(),
+                read_only: true,
+            },
+            DirectKernelBinding::Storage {
+                binding: 1,
+                buffer: matrix.buffer().clone(),
+                read_only: true,
+            },
+            DirectKernelBinding::Storage {
+                binding: 2,
+                buffer: output.buffer().clone(),
+                read_only: false,
+            },
+        ],
+        dispatch_size,
+    ))
+}
+
+fn qmat_direct_quant_format(matrix: &QMatrix) -> Option<tile_ir::GgmlQuantFormat> {
+    Some(match matrix.datatype() {
+        GgmlType::Q4_0 => tile_ir::GgmlQuantFormat::Q4_0,
+        GgmlType::Q4_1 => tile_ir::GgmlQuantFormat::Q4_1,
+        GgmlType::Q5_0 => tile_ir::GgmlQuantFormat::Q5_0,
+        GgmlType::Q5_1 => tile_ir::GgmlQuantFormat::Q5_1,
+        GgmlType::Q8_0 => tile_ir::GgmlQuantFormat::Q8_0,
+        GgmlType::Q8_1 => tile_ir::GgmlQuantFormat::Q8_1,
+        GgmlType::Q2K => tile_ir::GgmlQuantFormat::Q2K,
+        GgmlType::Q3K => tile_ir::GgmlQuantFormat::Q3K,
+        GgmlType::Q4K => tile_ir::GgmlQuantFormat::Q4K,
+        GgmlType::Q5K => tile_ir::GgmlQuantFormat::Q5K,
+        GgmlType::Q6K => tile_ir::GgmlQuantFormat::Q6K,
+        GgmlType::Q8K => tile_ir::GgmlQuantFormat::Q8K,
+        GgmlType::F16 | GgmlType::F32 => return None,
+    })
+}
+
+fn ceil_div_u32(x: u32, divisor: u32) -> u32 {
+    x.div_ceil(divisor)
+}
+
+fn split_workgroups_2d(
+    total_workgroups: u32,
+    max_workgroups_per_dimension: u32,
+) -> Option<[u32; 2]> {
+    if total_workgroups == 0 {
+        return Some([1, 1]);
+    }
+
+    let max_workgroups_per_dimension = max_workgroups_per_dimension.max(1);
+    let x = total_workgroups.min(max_workgroups_per_dimension);
+    let y = ceil_div_u32(total_workgroups, x);
+    (y <= max_workgroups_per_dimension).then_some([x, y])
+}
+
+fn qgemv_cols_per_workgroup_for_direct(format: tile_ir::GgmlQuantFormat, k: u32, n: u32) -> u32 {
+    if format == tile_ir::GgmlQuantFormat::Q4K && k <= 4096 && n >= 4096 && n < 8192 {
+        return 4;
+    }
+
+    if format == tile_ir::GgmlQuantFormat::Q4K && k <= 4096 && n >= 8192 {
+        return 8;
+    }
+
+    if format == tile_ir::GgmlQuantFormat::Q4K && k > 4096 && n <= 4096 {
+        return 8;
+    }
+
+    if format == tile_ir::GgmlQuantFormat::Q6K && k <= 4096 && n >= 8192 {
+        return 8;
+    }
+
+    if format == tile_ir::GgmlQuantFormat::Q6K && k > 4096 && n <= 4096 {
+        return 4;
+    }
+
+    let qgemv_uses_accelerator = format == tile_ir::GgmlQuantFormat::Q4K
+        || format == tile_ir::GgmlQuantFormat::Q6K
+        || (format == tile_ir::GgmlQuantFormat::Q5_0
+            && k.checked_mul(n)
+                .is_some_and(|elements| elements >= 4 * 1024 * 1024))
+        || (format == tile_ir::GgmlQuantFormat::Q8_0 && k <= 1024 && n >= 8192);
+
+    if qgemv_uses_accelerator {
+        if format == tile_ir::GgmlQuantFormat::Q8_0 && k <= 1024 && n >= 8192 {
+            4 * 8
+        } else {
+            format.qgemv_cols_per_workgroup_for_shape(k, n)
+        }
+    } else if format == tile_ir::GgmlQuantFormat::Q5_0 && k <= 1024 && n <= 4096 {
+        8
+    } else {
+        4
+    }
 }
 
 fn fixed_previous_tokens_data(device: &Device, previous_tokens: &[u32]) -> (TensorData, u32) {
@@ -2248,7 +2577,12 @@ impl TopKModuleBuilder {
 
 #[cfg(test)]
 mod tests {
-    use crate::{Device, Tensor};
+    use std::mem::size_of;
+
+    use crate::{Device, Tensor, quantized::QMatrix};
+    use fusor_gguf::{BlockQ4_0, GgmlType};
+
+    use super::{GpuMirostat2Sampler, GpuMirostat2SamplerParams};
 
     #[tokio::test]
     async fn top_k_pairs_match_cpu_sorted_order() {
@@ -2376,5 +2710,32 @@ mod tests {
             .map(|(id, value)| (id as usize, value))
             .collect::<Vec<_>>();
         assert_eq!(actual, expected);
+    }
+
+    #[tokio::test]
+    async fn qmat_mirostat2_sample_token_uses_direct_sampler_path() {
+        let device = Device::new().await.unwrap();
+        let hidden = Tensor::new(&device, vec![1.0f32; 32].as_slice());
+        let element_count = 8 * 32;
+        let block_count = element_count / BlockQ4_0::BLOCK_SIZE;
+        let raw_bytes = vec![0u8; block_count * size_of::<BlockQ4_0>()];
+        let matrix =
+            QMatrix::from_parts(&device, &raw_bytes, Box::new([8, 32]), GgmlType::Q4_0).unwrap();
+        let mut sampler = GpuMirostat2Sampler::new(&device, 10.0);
+        let params = GpuMirostat2SamplerParams {
+            top_k: 4,
+            temperature: 1.0,
+            repetition_penalty: 1.0,
+            tau: 5.0,
+            eta: 0.1,
+            random: 0.0,
+        };
+
+        let token = hidden
+            .try_sample_mirostat2_token_q_mat(&matrix, &mut sampler, &[], params)
+            .await
+            .unwrap();
+
+        assert_eq!(token, Some(7));
     }
 }
