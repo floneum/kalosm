@@ -50,21 +50,21 @@ impl FlashDecodeSmallNagaBuilder {
         let mut module = Module::default();
         let f32_ty = module.types.insert(
             Type {
-                name: Some("FlashDecodeF32".into()),
+                name: None,
                 inner: TypeInner::Scalar(Scalar::F32),
             },
             Span::default(),
         );
         let u32_ty = module.types.insert(
             Type {
-                name: Some("FlashDecodeU32".into()),
+                name: None,
                 inner: TypeInner::Scalar(Scalar::U32),
             },
             Span::default(),
         );
         let u32_vec3_ty = module.types.insert(
             Type {
-                name: Some("FlashDecodeWorkgroupId".into()),
+                name: None,
                 inner: TypeInner::Vector {
                     size: VectorSize::Tri,
                     scalar: Scalar::U32,
@@ -74,7 +74,7 @@ impl FlashDecodeSmallNagaBuilder {
         );
         let storage_ty = module.types.insert(
             Type {
-                name: Some("FlashDecodeBuffer".into()),
+                name: None,
                 inner: TypeInner::Array {
                     base: f32_ty,
                     size: ArraySize::Dynamic,
@@ -85,7 +85,7 @@ impl FlashDecodeSmallNagaBuilder {
         );
         let u32_storage_ty = module.types.insert(
             Type {
-                name: Some("FlashDecodeParams".into()),
+                name: None,
                 inner: TypeInner::Array {
                     base: u32_ty,
                     size: ArraySize::Dynamic,
@@ -96,7 +96,7 @@ impl FlashDecodeSmallNagaBuilder {
         );
         let scratch_ty = module.types.insert(
             Type {
-                name: Some("FlashDecodeScratch".into()),
+                name: None,
                 inner: TypeInner::Array {
                     base: f32_ty,
                     size: ArraySize::Constant(NonZeroU32::new(self.meta.decode_block)?),
@@ -106,14 +106,14 @@ impl FlashDecodeSmallNagaBuilder {
             Span::default(),
         );
 
-        let q = Self::storage_global(&mut module, "q", 0, storage_ty, true);
-        let k = Self::storage_global(&mut module, "k", 1, storage_ty, true);
-        let v = Self::storage_global(&mut module, "v", 2, storage_ty, true);
-        let output = Self::storage_global(&mut module, "output", 3, storage_ty, false);
-        let params = Self::storage_global(&mut module, "params", 4, u32_storage_ty, true);
-        let scores = Self::workgroup_global(&mut module, "scores", scratch_ty);
-        let probs = Self::workgroup_global(&mut module, "probs", scratch_ty);
-        let reduce = Self::workgroup_global(&mut module, "reduce", scratch_ty);
+        let q = Self::storage_global(&mut module, 0, storage_ty, true);
+        let k = Self::storage_global(&mut module, 1, storage_ty, true);
+        let v = Self::storage_global(&mut module, 2, storage_ty, true);
+        let output = Self::storage_global(&mut module, 3, storage_ty, false);
+        let params = Self::storage_global(&mut module, 4, u32_storage_ty, true);
+        let scores = Self::workgroup_global(&mut module, scratch_ty);
+        let probs = Self::workgroup_global(&mut module, scratch_ty);
+        let reduce = Self::workgroup_global(&mut module, scratch_ty);
         let globals = FlashDecodeSmallGlobals {
             q,
             k,
@@ -126,15 +126,15 @@ impl FlashDecodeSmallNagaBuilder {
         };
 
         let mut function = Function {
-            name: Some("main".into()),
+            name: None,
             arguments: vec![
                 FunctionArgument {
-                    name: Some("local_invocation_index".into()),
+                    name: None,
                     ty: u32_ty,
                     binding: Some(Binding::BuiltIn(BuiltIn::LocalInvocationIndex)),
                 },
                 FunctionArgument {
-                    name: Some("workgroup_id".into()),
+                    name: None,
                     ty: u32_vec3_ty,
                     binding: Some(Binding::BuiltIn(BuiltIn::WorkGroupId)),
                 },
@@ -142,9 +142,9 @@ impl FlashDecodeSmallNagaBuilder {
             ..Function::default()
         };
         let locals = FlashDecodeSmallLocals {
-            acc: Self::local(&mut function, "acc", f32_ty),
-            kv: Self::local(&mut function, "kv", u32_ty),
-            item: Self::local(&mut function, "item", u32_ty),
+            acc: Self::local(&mut function, f32_ty),
+            kv: Self::local(&mut function, u32_ty),
+            item: Self::local(&mut function, u32_ty),
         };
 
         function.body = self.entry_body(&mut function.expressions, globals, locals);

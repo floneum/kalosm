@@ -31,28 +31,28 @@ impl super::TopKModuleBuilder {
         let mut module = Module::default();
         let bool_ty = module.types.insert(
             Type {
-                name: Some("TopKBool".into()),
+                name: None,
                 inner: TypeInner::Scalar(Scalar::BOOL),
             },
             Span::default(),
         );
         let f32_ty = module.types.insert(
             Type {
-                name: Some("TopKF32".into()),
+                name: None,
                 inner: TypeInner::Scalar(Scalar::F32),
             },
             Span::default(),
         );
         let u32_ty = module.types.insert(
             Type {
-                name: Some("TopKU32".into()),
+                name: None,
                 inner: TypeInner::Scalar(Scalar::U32),
             },
             Span::default(),
         );
         let u32_vec3_ty = module.types.insert(
             Type {
-                name: Some("TopKWorkgroupId".into()),
+                name: None,
                 inner: TypeInner::Vector {
                     size: VectorSize::Tri,
                     scalar: Scalar::U32,
@@ -62,7 +62,7 @@ impl super::TopKModuleBuilder {
         );
         let f32_storage_ty = module.types.insert(
             Type {
-                name: Some("TopKF32Buffer".into()),
+                name: None,
                 inner: TypeInner::Array {
                     base: f32_ty,
                     size: ArraySize::Dynamic,
@@ -73,7 +73,7 @@ impl super::TopKModuleBuilder {
         );
         let u32_storage_ty = module.types.insert(
             Type {
-                name: Some("TopKU32Buffer".into()),
+                name: None,
                 inner: TypeInner::Array {
                     base: u32_ty,
                     size: ArraySize::Dynamic,
@@ -84,7 +84,7 @@ impl super::TopKModuleBuilder {
         );
         let scratch_f32_ty = module.types.insert(
             Type {
-                name: Some("TopKScratchF32".into()),
+                name: None,
                 inner: TypeInner::Array {
                     base: f32_ty,
                     size: ArraySize::Constant(NonZeroU32::new(TOP_K_BLOCK)?),
@@ -95,7 +95,7 @@ impl super::TopKModuleBuilder {
         );
         let scratch_u32_ty = module.types.insert(
             Type {
-                name: Some("TopKScratchU32".into()),
+                name: None,
                 inner: TypeInner::Array {
                     base: u32_ty,
                     size: ArraySize::Constant(NonZeroU32::new(TOP_K_BLOCK)?),
@@ -106,35 +106,29 @@ impl super::TopKModuleBuilder {
         );
 
         let globals = TopKGlobals {
-            input: Self::storage_global(&mut module, "input", 0, f32_storage_ty, true),
-            output_ids: Self::storage_global(&mut module, "output_ids", 1, u32_storage_ty, false),
-            output_values: Self::storage_global(
-                &mut module,
-                "output_values",
-                2,
-                f32_storage_ty,
-                false,
-            ),
-            previous_tokens: self.processors.then(|| {
-                Self::storage_global(&mut module, "previous_tokens", 3, u32_storage_ty, true)
-            }),
-            processor_params: self.processors.then(|| {
-                Self::storage_global(&mut module, "processor_params", 4, u32_storage_ty, true)
-            }),
-            scratch_values: Self::workgroup_global(&mut module, "scratch_values", scratch_f32_ty),
-            scratch_ids: Self::workgroup_global(&mut module, "scratch_ids", scratch_u32_ty),
+            input: Self::storage_global(&mut module, 0, f32_storage_ty, true),
+            output_ids: Self::storage_global(&mut module, 1, u32_storage_ty, false),
+            output_values: Self::storage_global(&mut module, 2, f32_storage_ty, false),
+            previous_tokens: self
+                .processors
+                .then(|| Self::storage_global(&mut module, 3, u32_storage_ty, true)),
+            processor_params: self
+                .processors
+                .then(|| Self::storage_global(&mut module, 4, u32_storage_ty, true)),
+            scratch_values: Self::workgroup_global(&mut module, scratch_f32_ty),
+            scratch_ids: Self::workgroup_global(&mut module, scratch_u32_ty),
         };
 
         let mut function = Function {
-            name: Some("main".into()),
+            name: None,
             arguments: vec![
                 FunctionArgument {
-                    name: Some("local_invocation_index".into()),
+                    name: None,
                     ty: u32_ty,
                     binding: Some(Binding::BuiltIn(BuiltIn::LocalInvocationIndex)),
                 },
                 FunctionArgument {
-                    name: Some("workgroup_id".into()),
+                    name: None,
                     ty: u32_vec3_ty,
                     binding: Some(Binding::BuiltIn(BuiltIn::WorkGroupId)),
                 },
@@ -142,10 +136,10 @@ impl super::TopKModuleBuilder {
             ..Function::default()
         };
         let locals = TopKLocals {
-            current_value: Self::local(&mut function, "current_value", f32_ty),
-            current_id: Self::local(&mut function, "current_id", u32_ty),
-            previous_index: Self::local(&mut function, "previous_index", u32_ty),
-            repeated: Self::local(&mut function, "repeated", bool_ty),
+            current_value: Self::local(&mut function, f32_ty),
+            current_id: Self::local(&mut function, u32_ty),
+            previous_index: Self::local(&mut function, u32_ty),
+            repeated: Self::local(&mut function, bool_ty),
         };
 
         function.body = self.entry_body(&mut function.expressions, globals, locals);
@@ -638,14 +632,13 @@ impl super::TopKModuleBuilder {
 
     fn storage_global(
         module: &mut Module,
-        name: &str,
         binding: u32,
         ty: Handle<Type>,
         read_only: bool,
     ) -> Handle<GlobalVariable> {
         module.global_variables.append(
             GlobalVariable {
-                name: Some(name.into()),
+                name: None,
                 space: AddressSpace::Storage {
                     access: if read_only {
                         StorageAccess::LOAD
@@ -661,14 +654,10 @@ impl super::TopKModuleBuilder {
         )
     }
 
-    fn workgroup_global(
-        module: &mut Module,
-        name: &str,
-        ty: Handle<Type>,
-    ) -> Handle<GlobalVariable> {
+    fn workgroup_global(module: &mut Module, ty: Handle<Type>) -> Handle<GlobalVariable> {
         module.global_variables.append(
             GlobalVariable {
-                name: Some(name.into()),
+                name: None,
                 space: AddressSpace::WorkGroup,
                 binding: None,
                 ty,
@@ -678,10 +667,10 @@ impl super::TopKModuleBuilder {
         )
     }
 
-    fn local(function: &mut Function, name: &str, ty: Handle<Type>) -> Handle<LocalVariable> {
+    fn local(function: &mut Function, ty: Handle<Type>) -> Handle<LocalVariable> {
         function.local_variables.append(
             LocalVariable {
-                name: Some(name.into()),
+                name: None,
                 ty,
                 init: None,
             },

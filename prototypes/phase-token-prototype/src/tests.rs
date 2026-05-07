@@ -90,6 +90,44 @@ fn tile_source_softmax_lowers_to_naga() {
 }
 
 #[test]
+fn lowered_naga_uses_anonymous_ir_objects_except_entry_point() {
+    let ir = tile::build(|phase| {
+        let x = phase.storage_read::<F32, 2>(Shape::new([1, 8]));
+        let y = phase.storage_write::<F32, 2>(Shape::new([1, 8]));
+        phase.program_grid::<8>([1, 1, 1], |program| {
+            let lane = program.arange();
+            let mask = lane.lt(8);
+            let value = program.load(x.at(0, &lane), mask.clone(), 0.0);
+            program.store(y.at(0, lane), value, mask);
+        });
+    });
+    let lowered = ir
+        .lower_to_naga()
+        .unwrap_or_else(|error| panic!("tile lowering failed: {error}"));
+    let module = lowered.module();
+
+    assert!(module.types.iter().all(|(_, ty)| ty.name.is_none()));
+    assert!(module
+        .global_variables
+        .iter()
+        .all(|(_, global)| global.name.is_none()));
+    for entry in &module.entry_points {
+        assert_eq!(entry.name, "main");
+        assert!(entry.function.name.is_none());
+        assert!(entry
+            .function
+            .arguments
+            .iter()
+            .all(|arg| arg.name.is_none()));
+        assert!(entry
+            .function
+            .local_variables
+            .iter()
+            .all(|(_, local)| local.name.is_none()));
+    }
+}
+
+#[test]
 fn tile_source_dense_matmul_lowers_to_naga() {
     let ir = tile::build(|phase| {
         let a = phase.storage_read::<F32, 2>(Shape::new([8, 33]));

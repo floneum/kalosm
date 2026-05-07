@@ -197,21 +197,21 @@ impl SampleMirostat2ModuleBuilder {
         let mut module = Module::default();
         let f32_ty = module.types.insert(
             Type {
-                name: Some("SampleMirostat2F32".into()),
+                name: None,
                 inner: TypeInner::Scalar(Scalar::F32),
             },
             Span::default(),
         );
         let u32_ty = module.types.insert(
             Type {
-                name: Some("SampleMirostat2U32".into()),
+                name: None,
                 inner: TypeInner::Scalar(Scalar::U32),
             },
             Span::default(),
         );
         let f32_storage_ty = module.types.insert(
             Type {
-                name: Some("SampleMirostat2F32Buffer".into()),
+                name: None,
                 inner: TypeInner::Array {
                     base: f32_ty,
                     size: ArraySize::Dynamic,
@@ -222,7 +222,7 @@ impl SampleMirostat2ModuleBuilder {
         );
         let u32_storage_ty = module.types.insert(
             Type {
-                name: Some("SampleMirostat2U32Buffer".into()),
+                name: None,
                 inner: TypeInner::Array {
                     base: u32_ty,
                     size: ArraySize::Dynamic,
@@ -233,7 +233,7 @@ impl SampleMirostat2ModuleBuilder {
         );
         let scratch_ty = module.types.insert(
             Type {
-                name: Some("SampleMirostat2Scratch".into()),
+                name: None,
                 inner: TypeInner::Array {
                     base: f32_ty,
                     size: ArraySize::Constant(NonZeroU32::new(TOP_K_BLOCK)?),
@@ -244,36 +244,37 @@ impl SampleMirostat2ModuleBuilder {
         );
 
         let globals = SampleMirostat2Globals {
-            ids: Self::storage_global(&mut module, "ids", 0, u32_storage_ty, true),
-            values: Self::storage_global(&mut module, "values", 1, f32_storage_ty, true),
-            state: Self::storage_global(&mut module, "state", 2, f32_storage_ty, false),
-            params: Self::storage_global(&mut module, "params", 3, f32_storage_ty, true),
-            output: Self::storage_global(&mut module, "output", 4, u32_storage_ty, false),
-            exactness_flag: self.meta.has_exactness_flag.then(|| {
-                Self::storage_global(&mut module, "exactness_flag", 5, u32_storage_ty, true)
-            }),
-            scratch: Self::workgroup_global(&mut module, "scratch", scratch_ty),
+            ids: Self::storage_global(&mut module, 0, u32_storage_ty, true),
+            values: Self::storage_global(&mut module, 1, f32_storage_ty, true),
+            state: Self::storage_global(&mut module, 2, f32_storage_ty, false),
+            params: Self::storage_global(&mut module, 3, f32_storage_ty, true),
+            output: Self::storage_global(&mut module, 4, u32_storage_ty, false),
+            exactness_flag: self
+                .meta
+                .has_exactness_flag
+                .then(|| Self::storage_global(&mut module, 5, u32_storage_ty, true)),
+            scratch: Self::workgroup_global(&mut module, scratch_ty),
         };
 
         let mut function = Function {
-            name: Some("main".into()),
+            name: None,
             arguments: vec![FunctionArgument {
-                name: Some("local_invocation_index".into()),
+                name: None,
                 ty: u32_ty,
                 binding: Some(Binding::BuiltIn(BuiltIn::LocalInvocationIndex)),
             }],
             ..Function::default()
         };
         let locals = SampleMirostat2Locals {
-            index: Self::local(&mut function, "index", u32_ty),
-            local_sum: Self::local(&mut function, "local_sum", f32_ty),
-            reduce_step: Self::local(&mut function, "reduce_step", u32_ty),
-            cutoff: Self::local(&mut function, "cutoff", u32_ty),
-            scan: Self::local(&mut function, "scan", u32_ty),
-            cutoff_sum: Self::local(&mut function, "cutoff_sum", f32_ty),
-            cumulative: Self::local(&mut function, "cumulative", f32_ty),
-            selected: Self::local(&mut function, "selected", u32_ty),
-            selected_probability: Self::local(&mut function, "selected_probability", f32_ty),
+            index: Self::local(&mut function, u32_ty),
+            local_sum: Self::local(&mut function, f32_ty),
+            reduce_step: Self::local(&mut function, u32_ty),
+            cutoff: Self::local(&mut function, u32_ty),
+            scan: Self::local(&mut function, u32_ty),
+            cutoff_sum: Self::local(&mut function, f32_ty),
+            cumulative: Self::local(&mut function, f32_ty),
+            selected: Self::local(&mut function, u32_ty),
+            selected_probability: Self::local(&mut function, f32_ty),
         };
         function.body = self.entry_body(&mut function.expressions, globals, locals);
         function

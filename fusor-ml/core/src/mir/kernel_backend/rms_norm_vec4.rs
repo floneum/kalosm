@@ -44,21 +44,21 @@ impl RmsNormVec4NagaBuilder {
         let mut module = Module::default();
         let f32_ty = module.types.insert(
             Type {
-                name: Some("RmsNormF32".into()),
+                name: None,
                 inner: TypeInner::Scalar(Scalar::F32),
             },
             Span::default(),
         );
         let u32_ty = module.types.insert(
             Type {
-                name: Some("RmsNormU32".into()),
+                name: None,
                 inner: TypeInner::Scalar(Scalar::U32),
             },
             Span::default(),
         );
         let f32_vec4_ty = module.types.insert(
             Type {
-                name: Some("RmsNormF32Vec4".into()),
+                name: None,
                 inner: TypeInner::Vector {
                     size: VectorSize::Quad,
                     scalar: Scalar::F32,
@@ -68,7 +68,7 @@ impl RmsNormVec4NagaBuilder {
         );
         let u32_vec3_ty = module.types.insert(
             Type {
-                name: Some("RmsNormWorkgroupId".into()),
+                name: None,
                 inner: TypeInner::Vector {
                     size: VectorSize::Tri,
                     scalar: Scalar::U32,
@@ -78,7 +78,7 @@ impl RmsNormVec4NagaBuilder {
         );
         let storage_ty = module.types.insert(
             Type {
-                name: Some("RmsNormVec4Buffer".into()),
+                name: None,
                 inner: TypeInner::Array {
                     base: f32_vec4_ty,
                     size: ArraySize::Dynamic,
@@ -89,7 +89,7 @@ impl RmsNormVec4NagaBuilder {
         );
         let scratch_ty = module.types.insert(
             Type {
-                name: Some("RmsNormScratch".into()),
+                name: None,
                 inner: TypeInner::Array {
                     base: f32_ty,
                     size: ArraySize::Constant(NonZeroU32::new(VEC4_SUBGROUP_WIDTH)?),
@@ -99,28 +99,28 @@ impl RmsNormVec4NagaBuilder {
             Span::default(),
         );
 
-        let input = Self::storage_global(&mut module, "input", 0, storage_ty, true);
+        let input = Self::storage_global(&mut module, 0, storage_ty, true);
         let mut binding = 1;
         let residual = if self.has_residual {
-            let residual = Self::storage_global(&mut module, "residual", binding, storage_ty, true);
+            let residual = Self::storage_global(&mut module, binding, storage_ty, true);
             binding += 1;
             Some(residual)
         } else {
             None
         };
-        let weight = Self::storage_global(&mut module, "weight", binding, storage_ty, true);
+        let weight = Self::storage_global(&mut module, binding, storage_ty, true);
         binding += 1;
         let bias = if self.has_bias {
-            let bias = Self::storage_global(&mut module, "bias", binding, storage_ty, true);
+            let bias = Self::storage_global(&mut module, binding, storage_ty, true);
             binding += 1;
             Some(bias)
         } else {
             None
         };
-        let output = Self::storage_global(&mut module, "output", binding, storage_ty, false);
+        let output = Self::storage_global(&mut module, binding, storage_ty, false);
         let scratch = module.global_variables.append(
             GlobalVariable {
-                name: Some("rms_norm_scratch".into()),
+                name: None,
                 space: AddressSpace::WorkGroup,
                 binding: None,
                 ty: scratch_ty,
@@ -138,25 +138,25 @@ impl RmsNormVec4NagaBuilder {
         };
 
         let mut function = Function {
-            name: Some("main".into()),
+            name: None,
             arguments: vec![
                 FunctionArgument {
-                    name: Some("local_invocation_index".into()),
+                    name: None,
                     ty: u32_ty,
                     binding: Some(Binding::BuiltIn(BuiltIn::LocalInvocationIndex)),
                 },
                 FunctionArgument {
-                    name: Some("workgroup_id".into()),
+                    name: None,
                     ty: u32_vec3_ty,
                     binding: Some(Binding::BuiltIn(BuiltIn::WorkGroupId)),
                 },
                 FunctionArgument {
-                    name: Some("subgroup_id".into()),
+                    name: None,
                     ty: u32_ty,
                     binding: Some(Binding::BuiltIn(BuiltIn::SubgroupId)),
                 },
                 FunctionArgument {
-                    name: Some("subgroup_invocation_id".into()),
+                    name: None,
                     ty: u32_ty,
                     binding: Some(Binding::BuiltIn(BuiltIn::SubgroupInvocationId)),
                 },
@@ -164,8 +164,8 @@ impl RmsNormVec4NagaBuilder {
             ..Function::default()
         };
         let locals = RmsNormVec4Locals {
-            col: Self::local(&mut function, "col_vec", u32_ty),
-            sum: Self::local(&mut function, "sum", f32_ty),
+            col: Self::local(&mut function, u32_ty),
+            sum: Self::local(&mut function, f32_ty),
         };
 
         function.body = self.entry_body(
@@ -714,14 +714,13 @@ impl RmsNormVec4NagaBuilder {
 
     fn storage_global(
         module: &mut Module,
-        name: &str,
         binding: u32,
         ty: Handle<Type>,
         read_only: bool,
     ) -> Handle<GlobalVariable> {
         module.global_variables.append(
             GlobalVariable {
-                name: Some(name.into()),
+                name: None,
                 space: AddressSpace::Storage {
                     access: if read_only {
                         StorageAccess::LOAD
@@ -737,10 +736,10 @@ impl RmsNormVec4NagaBuilder {
         )
     }
 
-    fn local(function: &mut Function, name: &str, ty: Handle<Type>) -> Handle<LocalVariable> {
+    fn local(function: &mut Function, ty: Handle<Type>) -> Handle<LocalVariable> {
         function.local_variables.append(
             LocalVariable {
-                name: Some(name.into()),
+                name: None,
                 ty,
                 init: None,
             },

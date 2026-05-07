@@ -109,21 +109,21 @@ impl FlashAttentionNagaBuilder {
         let mut module = Module::default();
         let f32_ty = module.types.insert(
             Type {
-                name: Some("FlashAttentionF32".into()),
+                name: None,
                 inner: TypeInner::Scalar(Scalar::F32),
             },
             Span::default(),
         );
         let u32_ty = module.types.insert(
             Type {
-                name: Some("FlashAttentionU32".into()),
+                name: None,
                 inner: TypeInner::Scalar(Scalar::U32),
             },
             Span::default(),
         );
         let u32_vec3_ty = module.types.insert(
             Type {
-                name: Some("FlashAttentionWorkgroupId".into()),
+                name: None,
                 inner: TypeInner::Vector {
                     size: VectorSize::Tri,
                     scalar: Scalar::U32,
@@ -133,7 +133,7 @@ impl FlashAttentionNagaBuilder {
         );
         let storage_ty = module.types.insert(
             Type {
-                name: Some("FlashAttentionBuffer".into()),
+                name: None,
                 inner: TypeInner::Array {
                     base: f32_ty,
                     size: ArraySize::Dynamic,
@@ -144,7 +144,7 @@ impl FlashAttentionNagaBuilder {
         );
         let scratch_ty = module.types.insert(
             Type {
-                name: Some("FlashAttentionScratch".into()),
+                name: None,
                 inner: TypeInner::Array {
                     base: f32_ty,
                     size: ArraySize::Constant(NonZeroU32::new(BLOCK as u32)?),
@@ -154,17 +154,17 @@ impl FlashAttentionNagaBuilder {
             Span::default(),
         );
 
-        let q = Self::storage_global(&mut module, "q", 0, storage_ty, true);
-        let k = Self::storage_global(&mut module, "k", 1, storage_ty, true);
-        let v = Self::storage_global(&mut module, "v", 2, storage_ty, true);
+        let q = Self::storage_global(&mut module, 0, storage_ty, true);
+        let k = Self::storage_global(&mut module, 1, storage_ty, true);
+        let v = Self::storage_global(&mut module, 2, storage_ty, true);
         let mask = self
             .has_mask
-            .then(|| Self::storage_global(&mut module, "mask", 3, storage_ty, true));
+            .then(|| Self::storage_global(&mut module, 3, storage_ty, true));
         let output_binding = if self.has_mask { 4 } else { 3 };
-        let output = Self::storage_global(&mut module, "output", output_binding, storage_ty, false);
+        let output = Self::storage_global(&mut module, output_binding, storage_ty, false);
         let scratch = module.global_variables.append(
             GlobalVariable {
-                name: Some("flash_attention_scratch".into()),
+                name: None,
                 space: AddressSpace::WorkGroup,
                 binding: None,
                 ty: scratch_ty,
@@ -182,15 +182,15 @@ impl FlashAttentionNagaBuilder {
         };
 
         let mut function = Function {
-            name: Some("main".into()),
+            name: None,
             arguments: vec![
                 FunctionArgument {
-                    name: Some("local_invocation_index".into()),
+                    name: None,
                     ty: u32_ty,
                     binding: Some(Binding::BuiltIn(BuiltIn::LocalInvocationIndex)),
                 },
                 FunctionArgument {
-                    name: Some("workgroup_id".into()),
+                    name: None,
                     ty: u32_vec3_ty,
                     binding: Some(Binding::BuiltIn(BuiltIn::WorkGroupId)),
                 },
@@ -198,12 +198,12 @@ impl FlashAttentionNagaBuilder {
             ..Function::default()
         };
         let locals = FlashAttentionLocals {
-            loop_idx: Self::local(&mut function, "kv_chunk", u32_ty),
-            score: Self::local(&mut function, "score", f32_ty),
-            weighted: Self::local(&mut function, "weighted_value", f32_ty),
-            m: Self::local(&mut function, "m", f32_ty),
-            s: Self::local(&mut function, "s", f32_ty),
-            o: Self::local(&mut function, "o", f32_ty),
+            loop_idx: Self::local(&mut function, u32_ty),
+            score: Self::local(&mut function, f32_ty),
+            weighted: Self::local(&mut function, f32_ty),
+            m: Self::local(&mut function, f32_ty),
+            s: Self::local(&mut function, f32_ty),
+            o: Self::local(&mut function, f32_ty),
         };
 
         function.body = self.entry_body(&mut function.expressions, globals, locals, f32_ty);
@@ -227,14 +227,13 @@ impl FlashAttentionNagaBuilder {
 
     fn storage_global(
         module: &mut Module,
-        name: &str,
         binding: u32,
         ty: Handle<Type>,
         read_only: bool,
     ) -> Handle<GlobalVariable> {
         module.global_variables.append(
             GlobalVariable {
-                name: Some(name.into()),
+                name: None,
                 space: AddressSpace::Storage {
                     access: if read_only {
                         StorageAccess::LOAD
@@ -250,10 +249,10 @@ impl FlashAttentionNagaBuilder {
         )
     }
 
-    fn local(function: &mut Function, name: &str, ty: Handle<Type>) -> Handle<LocalVariable> {
+    fn local(function: &mut Function, ty: Handle<Type>) -> Handle<LocalVariable> {
         function.local_variables.append(
             LocalVariable {
-                name: Some(name.into()),
+                name: None,
                 ty,
                 init: None,
             },

@@ -735,14 +735,13 @@ impl super::FlashDecodeSmallNagaBuilder {
 
     pub(super) fn storage_global(
         module: &mut Module,
-        name: &str,
         binding: u32,
         ty: Handle<Type>,
         read_only: bool,
     ) -> Handle<GlobalVariable> {
         module.global_variables.append(
             GlobalVariable {
-                name: Some(name.into()),
+                name: None,
                 space: AddressSpace::Storage {
                     access: if read_only {
                         StorageAccess::LOAD
@@ -760,12 +759,11 @@ impl super::FlashDecodeSmallNagaBuilder {
 
     pub(super) fn workgroup_global(
         module: &mut Module,
-        name: &str,
         ty: Handle<Type>,
     ) -> Handle<GlobalVariable> {
         module.global_variables.append(
             GlobalVariable {
-                name: Some(name.into()),
+                name: None,
                 space: AddressSpace::WorkGroup,
                 binding: None,
                 ty,
@@ -775,14 +773,10 @@ impl super::FlashDecodeSmallNagaBuilder {
         )
     }
 
-    pub(super) fn local(
-        function: &mut Function,
-        name: &str,
-        ty: Handle<Type>,
-    ) -> Handle<LocalVariable> {
+    pub(super) fn local(function: &mut Function, ty: Handle<Type>) -> Handle<LocalVariable> {
         function.local_variables.append(
             LocalVariable {
-                name: Some(name.into()),
+                name: None,
                 ty,
                 init: None,
             },

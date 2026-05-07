@@ -31,21 +31,21 @@ impl super::MergeTopKModuleBuilder {
         let mut module = Module::default();
         let f32_ty = module.types.insert(
             Type {
-                name: Some("MergeTopKF32".into()),
+                name: None,
                 inner: TypeInner::Scalar(Scalar::F32),
             },
             Span::default(),
         );
         let u32_ty = module.types.insert(
             Type {
-                name: Some("MergeTopKU32".into()),
+                name: None,
                 inner: TypeInner::Scalar(Scalar::U32),
             },
             Span::default(),
         );
         let f32_storage_ty = module.types.insert(
             Type {
-                name: Some("MergeTopKF32Buffer".into()),
+                name: None,
                 inner: TypeInner::Array {
                     base: f32_ty,
                     size: ArraySize::Dynamic,
@@ -56,7 +56,7 @@ impl super::MergeTopKModuleBuilder {
         );
         let u32_storage_ty = module.types.insert(
             Type {
-                name: Some("MergeTopKU32Buffer".into()),
+                name: None,
                 inner: TypeInner::Array {
                     base: u32_ty,
                     size: ArraySize::Dynamic,
@@ -67,7 +67,7 @@ impl super::MergeTopKModuleBuilder {
         );
         let chunk_positions_ty = module.types.insert(
             Type {
-                name: Some("MergeTopKChunkPositions".into()),
+                name: None,
                 inner: TypeInner::Array {
                     base: u32_ty,
                     size: ArraySize::Constant(NonZeroU32::new(self.chunks)?),
@@ -78,7 +78,7 @@ impl super::MergeTopKModuleBuilder {
         );
         let scratch_f32_ty = module.types.insert(
             Type {
-                name: Some("MergeTopKScratchF32".into()),
+                name: None,
                 inner: TypeInner::Array {
                     base: f32_ty,
                     size: ArraySize::Constant(NonZeroU32::new(TOP_K_BLOCK)?),
@@ -89,7 +89,7 @@ impl super::MergeTopKModuleBuilder {
         );
         let scratch_u32_ty = module.types.insert(
             Type {
-                name: Some("MergeTopKScratchU32".into()),
+                name: None,
                 inner: TypeInner::Array {
                     base: u32_ty,
                     size: ArraySize::Constant(NonZeroU32::new(TOP_K_BLOCK)?),
@@ -100,48 +100,32 @@ impl super::MergeTopKModuleBuilder {
         );
 
         let globals = MergeTopKGlobals {
-            input_ids: Self::storage_global(&mut module, "input_ids", 0, u32_storage_ty, true),
-            input_values: Self::storage_global(
-                &mut module,
-                "input_values",
-                1,
-                f32_storage_ty,
-                true,
-            ),
-            output_ids: Self::storage_global(&mut module, "output_ids", 2, u32_storage_ty, false),
-            output_values: Self::storage_global(
-                &mut module,
-                "output_values",
-                3,
-                f32_storage_ty,
-                false,
-            ),
-            chunk_positions: Self::workgroup_global(
-                &mut module,
-                "chunk_positions",
-                chunk_positions_ty,
-            ),
-            scratch_values: Self::workgroup_global(&mut module, "scratch_values", scratch_f32_ty),
-            scratch_ids: Self::workgroup_global(&mut module, "scratch_ids", scratch_u32_ty),
-            scratch_chunks: Self::workgroup_global(&mut module, "scratch_chunks", scratch_u32_ty),
+            input_ids: Self::storage_global(&mut module, 0, u32_storage_ty, true),
+            input_values: Self::storage_global(&mut module, 1, f32_storage_ty, true),
+            output_ids: Self::storage_global(&mut module, 2, u32_storage_ty, false),
+            output_values: Self::storage_global(&mut module, 3, f32_storage_ty, false),
+            chunk_positions: Self::workgroup_global(&mut module, chunk_positions_ty),
+            scratch_values: Self::workgroup_global(&mut module, scratch_f32_ty),
+            scratch_ids: Self::workgroup_global(&mut module, scratch_u32_ty),
+            scratch_chunks: Self::workgroup_global(&mut module, scratch_u32_ty),
         };
 
         let mut function = Function {
-            name: Some("main".into()),
+            name: None,
             arguments: vec![FunctionArgument {
-                name: Some("local_invocation_index".into()),
+                name: None,
                 ty: u32_ty,
                 binding: Some(Binding::BuiltIn(BuiltIn::LocalInvocationIndex)),
             }],
             ..Function::default()
         };
         let locals = MergeTopKLocals {
-            rank: Self::local(&mut function, "rank", u32_ty),
-            scan_chunk: Self::local(&mut function, "scan_chunk", u32_ty),
-            local_best_value: Self::local(&mut function, "local_best_value", f32_ty),
-            local_best_id: Self::local(&mut function, "local_best_id", u32_ty),
-            local_best_chunk: Self::local(&mut function, "local_best_chunk", u32_ty),
-            reduce_step: Self::local(&mut function, "reduce_step", u32_ty),
+            rank: Self::local(&mut function, u32_ty),
+            scan_chunk: Self::local(&mut function, u32_ty),
+            local_best_value: Self::local(&mut function, f32_ty),
+            local_best_id: Self::local(&mut function, u32_ty),
+            local_best_chunk: Self::local(&mut function, u32_ty),
+            reduce_step: Self::local(&mut function, u32_ty),
         };
 
         function.body = self.entry_body(&mut function.expressions, globals, locals);
@@ -581,14 +565,13 @@ impl super::MergeTopKModuleBuilder {
 
     fn storage_global(
         module: &mut Module,
-        name: &str,
         binding: u32,
         ty: Handle<Type>,
         read_only: bool,
     ) -> Handle<GlobalVariable> {
         module.global_variables.append(
             GlobalVariable {
-                name: Some(name.into()),
+                name: None,
                 space: AddressSpace::Storage {
                     access: if read_only {
                         StorageAccess::LOAD
@@ -604,14 +587,10 @@ impl super::MergeTopKModuleBuilder {
         )
     }
 
-    fn workgroup_global(
-        module: &mut Module,
-        name: &str,
-        ty: Handle<Type>,
-    ) -> Handle<GlobalVariable> {
+    fn workgroup_global(module: &mut Module, ty: Handle<Type>) -> Handle<GlobalVariable> {
         module.global_variables.append(
             GlobalVariable {
-                name: Some(name.into()),
+                name: None,
                 space: AddressSpace::WorkGroup,
                 binding: None,
                 ty,
@@ -621,10 +600,10 @@ impl super::MergeTopKModuleBuilder {
         )
     }
 
-    fn local(function: &mut Function, name: &str, ty: Handle<Type>) -> Handle<LocalVariable> {
+    fn local(function: &mut Function, ty: Handle<Type>) -> Handle<LocalVariable> {
         function.local_variables.append(
             LocalVariable {
-                name: Some(name.into()),
+                name: None,
                 ty,
                 init: None,
             },

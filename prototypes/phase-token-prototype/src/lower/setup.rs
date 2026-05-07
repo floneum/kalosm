@@ -5,14 +5,14 @@ impl<'a> Lowerer<'a> {
         let mut module = Module::default();
         let f32_ty = module.types.insert(
             Type {
-                name: Some("TileElement".into()),
+                name: None,
                 inner: TypeInner::Scalar(Scalar::F32),
             },
             Span::default(),
         );
         let f32_vec4_ty = module.types.insert(
             Type {
-                name: Some("Dot4".into()),
+                name: None,
                 inner: TypeInner::Vector {
                     size: VectorSize::Quad,
                     scalar: Scalar::F32,
@@ -22,7 +22,7 @@ impl<'a> Lowerer<'a> {
         );
         let i32_ty = module.types.insert(
             Type {
-                name: Some("Signed".into()),
+                name: None,
                 inner: TypeInner::Scalar(Scalar {
                     kind: ScalarKind::Sint,
                     width: 4,
@@ -32,7 +32,7 @@ impl<'a> Lowerer<'a> {
         );
         let i32_vec4_ty = module.types.insert(
             Type {
-                name: Some("PackedI8".into()),
+                name: None,
                 inner: TypeInner::Vector {
                     size: VectorSize::Quad,
                     scalar: Scalar {
@@ -55,7 +55,7 @@ impl<'a> Lowerer<'a> {
         let f16_ty = uses_f16.then(|| {
             module.types.insert(
                 Type {
-                    name: Some("TileElementF16".into()),
+                    name: None,
                     inner: TypeInner::Scalar(Scalar {
                         kind: ScalarKind::Float,
                         width: 2,
@@ -66,14 +66,14 @@ impl<'a> Lowerer<'a> {
         });
         let u32_ty = module.types.insert(
             Type {
-                name: Some("Index".into()),
+                name: None,
                 inner: TypeInner::Scalar(Scalar::U32),
             },
             Span::default(),
         );
         let u32_vec3_ty = module.types.insert(
             Type {
-                name: Some("WorkgroupId".into()),
+                name: None,
                 inner: TypeInner::Vector {
                     size: VectorSize::Tri,
                     scalar: Scalar::U32,
@@ -100,7 +100,7 @@ impl<'a> Lowerer<'a> {
         let coop_c_ty = uses_cooperative_matrix.then(|| {
             module.types.insert(
                 Type {
-                    name: Some("CoopC8x8F32".into()),
+                    name: None,
                     inner: TypeInner::CooperativeMatrix {
                         columns: naga::CooperativeSize::Eight,
                         rows: naga::CooperativeSize::Eight,
@@ -161,47 +161,47 @@ impl<'a> Lowerer<'a> {
 
         let mut arguments = vec![
             FunctionArgument {
-                name: Some("local_invocation_index".into()),
+                name: None,
                 ty: self.u32_ty,
                 binding: Some(Binding::BuiltIn(BuiltIn::LocalInvocationIndex)),
             },
             FunctionArgument {
-                name: Some("workgroup_id".into()),
+                name: None,
                 ty: self.u32_vec3_ty,
                 binding: Some(Binding::BuiltIn(BuiltIn::WorkGroupId)),
             },
         ];
         if self.uses_subgroup_id {
             arguments.push(FunctionArgument {
-                name: Some("subgroup_id".into()),
+                name: None,
                 ty: self.u32_ty,
                 binding: Some(Binding::BuiltIn(BuiltIn::SubgroupId)),
             });
         }
         if self.uses_subgroup_invocation_id {
             arguments.push(FunctionArgument {
-                name: Some("subgroup_invocation_id".into()),
+                name: None,
                 ty: self.u32_ty,
                 binding: Some(Binding::BuiltIn(BuiltIn::SubgroupInvocationId)),
             });
         }
         if self.uses_subgroup_size {
             arguments.push(FunctionArgument {
-                name: Some("subgroup_size".into()),
+                name: None,
                 ty: self.u32_ty,
                 binding: Some(Binding::BuiltIn(BuiltIn::SubgroupSize)),
             });
         }
         if self.uses_num_subgroups {
             arguments.push(FunctionArgument {
-                name: Some("num_subgroups".into()),
+                name: None,
                 ty: self.u32_ty,
                 binding: Some(Binding::BuiltIn(BuiltIn::NumSubgroups)),
             });
         }
 
         let mut function = Function {
-            name: Some("main".into()),
+            name: None,
             arguments,
             ..Function::default()
         };
@@ -258,7 +258,7 @@ impl<'a> Lowerer<'a> {
             };
             let global = self.module.global_variables.append(
                 GlobalVariable {
-                    name: Some(format!("buffer_{}", buffer.id.index())),
+                    name: None,
                     space: AddressSpace::Storage { access },
                     binding: Some(ResourceBinding {
                         group: 0,
@@ -292,7 +292,7 @@ impl<'a> Lowerer<'a> {
             let ty = self.tile_type(tile.id.index(), tile.element, &tile.layout);
             let global = self.module.global_variables.append(
                 GlobalVariable {
-                    name: Some(format!("tile_{}", tile.id.index())),
+                    name: None,
                     space: AddressSpace::WorkGroup,
                     binding: None,
                     ty,
@@ -327,7 +327,7 @@ impl<'a> Lowerer<'a> {
             let ty = self.tile_type(tile.id.index(), tile.element, &tile.layout);
             let local = function.local_variables.append(
                 LocalVariable {
-                    name: Some(format!("tile_{}", tile.id.index())),
+                    name: None,
                     ty,
                     init: None,
                 },
@@ -340,35 +340,21 @@ impl<'a> Lowerer<'a> {
 
     pub(super) fn create_scratch_locals(&self, function: &mut Function) -> ScratchLocals {
         ScratchLocals {
-            loop_index: self.create_u32_local(function, "loop_index"),
+            loop_index: self.create_u32_local(function),
             values: [
-                self.create_f32_local(function, "tile_value_f32"),
-                self.create_f16_local(function, "tile_value_f16"),
-                self.create_u32_local(function, "tile_value_u32"),
+                self.create_f32_local(function),
+                self.create_f16_local(function),
+                self.create_u32_local(function),
             ],
             spills: [
-                std::array::from_fn(|index| {
-                    self.create_f32_local(function, &format!("tile_spill_f32_{index}"))
-                }),
-                std::array::from_fn(|index| {
-                    self.create_f16_local(function, &format!("tile_spill_f16_{index}"))
-                }),
-                std::array::from_fn(|index| {
-                    self.create_u32_local(function, &format!("tile_spill_u32_{index}"))
-                }),
+                std::array::from_fn(|_| self.create_f32_local(function)),
+                std::array::from_fn(|_| self.create_f16_local(function)),
+                std::array::from_fn(|_| self.create_u32_local(function)),
             ],
-            block_dequant: std::array::from_fn(|index| {
-                self.create_f32_local(function, &format!("tile_block_dequant_{index}"))
-            }),
-            q8_activation_scales: std::array::from_fn(|index| {
-                self.create_f32_local(function, &format!("tile_q8_activation_scale_{index}"))
-            }),
-            q8_activation_packs: std::array::from_fn(|index| {
-                self.create_u32_local(function, &format!("tile_q8_activation_pack_{index}"))
-            }),
-            q8_activation_sums_i32: std::array::from_fn(|index| {
-                self.create_i32_local(function, &format!("tile_q8_activation_sum_{index}"))
-            }),
+            block_dequant: std::array::from_fn(|_| self.create_f32_local(function)),
+            q8_activation_scales: std::array::from_fn(|_| self.create_f32_local(function)),
+            q8_activation_packs: std::array::from_fn(|_| self.create_u32_local(function)),
+            q8_activation_sums_i32: std::array::from_fn(|_| self.create_i32_local(function)),
         }
     }
 
@@ -378,9 +364,7 @@ impl<'a> Lowerer<'a> {
                 .ir
                 .coop_accs
                 .iter()
-                .map(|decl| {
-                    self.create_local(function, &format!("coop_acc_{}", decl.id.index()), ty)
-                })
+                .map(|_| self.create_local(function, ty))
                 .collect();
         }
     }
@@ -394,18 +378,14 @@ impl<'a> Lowerer<'a> {
         }
         self.fold_group_offsets = offsets;
         self.fold_accumulator_locals = (0..total)
-            .map(|i| self.create_f32_local(function, &format!("fold_acc_{i}")))
+            .map(|_| self.create_f32_local(function))
             .collect();
     }
 
-    pub(super) fn create_u32_local(
-        &self,
-        function: &mut Function,
-        name: &str,
-    ) -> Handle<LocalVariable> {
+    pub(super) fn create_u32_local(&self, function: &mut Function) -> Handle<LocalVariable> {
         function.local_variables.append(
             LocalVariable {
-                name: Some(name.into()),
+                name: None,
                 ty: self.u32_ty,
                 init: None,
             },
@@ -413,39 +393,26 @@ impl<'a> Lowerer<'a> {
         )
     }
 
-    pub(super) fn create_f32_local(
-        &self,
-        function: &mut Function,
-        name: &str,
-    ) -> Handle<LocalVariable> {
-        self.create_local(function, name, self.f32_ty)
+    pub(super) fn create_f32_local(&self, function: &mut Function) -> Handle<LocalVariable> {
+        self.create_local(function, self.f32_ty)
     }
 
-    pub(super) fn create_i32_local(
-        &self,
-        function: &mut Function,
-        name: &str,
-    ) -> Handle<LocalVariable> {
-        self.create_local(function, name, self.i32_ty)
+    pub(super) fn create_i32_local(&self, function: &mut Function) -> Handle<LocalVariable> {
+        self.create_local(function, self.i32_ty)
     }
 
-    pub(super) fn create_f16_local(
-        &self,
-        function: &mut Function,
-        name: &str,
-    ) -> Handle<LocalVariable> {
-        self.create_local(function, name, self.f16_ty.unwrap_or(self.f32_ty))
+    pub(super) fn create_f16_local(&self, function: &mut Function) -> Handle<LocalVariable> {
+        self.create_local(function, self.f16_ty.unwrap_or(self.f32_ty))
     }
 
     pub(super) fn create_local(
         &self,
         function: &mut Function,
-        name: &str,
         ty: Handle<Type>,
     ) -> Handle<LocalVariable> {
         function.local_variables.append(
             LocalVariable {
-                name: Some(name.into()),
+                name: None,
                 ty,
                 init: None,
             },
@@ -455,30 +422,24 @@ impl<'a> Lowerer<'a> {
 
     pub(super) fn tile_type(
         &mut self,
-        tile: usize,
+        _tile: usize,
         element: ElementType,
         layout: &Layout,
     ) -> Handle<Type> {
-        self.array_type(format!("Tile{tile}"), element, layout)
+        self.array_type(element, layout)
     }
 
     pub(super) fn storage_type(
         &mut self,
-        buffer: usize,
+        _buffer: usize,
         element: ElementType,
         _layout: &Layout,
     ) -> Handle<Type> {
-        self.array_type_with_size(format!("Buffer{buffer}"), element, ArraySize::Dynamic)
+        self.array_type_with_size(element, ArraySize::Dynamic)
     }
 
-    pub(super) fn array_type(
-        &mut self,
-        name: String,
-        element: ElementType,
-        layout: &Layout,
-    ) -> Handle<Type> {
+    pub(super) fn array_type(&mut self, element: ElementType, layout: &Layout) -> Handle<Type> {
         self.array_type_with_size(
-            name,
             element,
             ArraySize::Constant(layout.allocation_element_count()),
         )
@@ -486,7 +447,6 @@ impl<'a> Lowerer<'a> {
 
     pub(super) fn array_type_with_size(
         &mut self,
-        name: String,
         element: ElementType,
         size: ArraySize,
     ) -> Handle<Type> {
@@ -504,7 +464,7 @@ impl<'a> Lowerer<'a> {
 
         self.module.types.insert(
             Type {
-                name: Some(name),
+                name: None,
                 inner: TypeInner::Array { base, size, stride },
             },
             Span::default(),

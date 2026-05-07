@@ -19,21 +19,21 @@ impl super::TopKExactnessModuleBuilder {
         let mut module = Module::default();
         let f32_ty = module.types.insert(
             Type {
-                name: Some("TopKExactF32".into()),
+                name: None,
                 inner: TypeInner::Scalar(Scalar::F32),
             },
             Span::default(),
         );
         let u32_ty = module.types.insert(
             Type {
-                name: Some("TopKExactU32".into()),
+                name: None,
                 inner: TypeInner::Scalar(Scalar::U32),
             },
             Span::default(),
         );
         let f32_storage_ty = module.types.insert(
             Type {
-                name: Some("TopKExactF32Buffer".into()),
+                name: None,
                 inner: TypeInner::Array {
                     base: f32_ty,
                     size: ArraySize::Dynamic,
@@ -44,7 +44,7 @@ impl super::TopKExactnessModuleBuilder {
         );
         let u32_storage_ty = module.types.insert(
             Type {
-                name: Some("TopKExactU32Buffer".into()),
+                name: None,
                 inner: TypeInner::Array {
                     base: u32_ty,
                     size: ArraySize::Dynamic,
@@ -55,7 +55,7 @@ impl super::TopKExactnessModuleBuilder {
         );
         let scratch_ty = module.types.insert(
             Type {
-                name: Some("TopKExactScratch".into()),
+                name: None,
                 inner: TypeInner::Array {
                     base: u32_ty,
                     size: ArraySize::Constant(NonZeroU32::new(TOP_K_BLOCK)?),
@@ -66,30 +66,24 @@ impl super::TopKExactnessModuleBuilder {
         );
 
         let globals = TopKExactnessGlobals {
-            top_values: Self::storage_global(&mut module, "top_values", 0, f32_storage_ty, true),
-            chunk_values: Self::storage_global(
-                &mut module,
-                "chunk_values",
-                1,
-                f32_storage_ty,
-                true,
-            ),
-            flag: Self::storage_global(&mut module, "flag", 2, u32_storage_ty, false),
-            scratch: Self::workgroup_global(&mut module, "scratch", scratch_ty),
+            top_values: Self::storage_global(&mut module, 0, f32_storage_ty, true),
+            chunk_values: Self::storage_global(&mut module, 1, f32_storage_ty, true),
+            flag: Self::storage_global(&mut module, 2, u32_storage_ty, false),
+            scratch: Self::workgroup_global(&mut module, scratch_ty),
         };
 
         let mut function = Function {
-            name: Some("main".into()),
+            name: None,
             arguments: vec![FunctionArgument {
-                name: Some("local_invocation_index".into()),
+                name: None,
                 ty: u32_ty,
                 binding: Some(Binding::BuiltIn(BuiltIn::LocalInvocationIndex)),
             }],
             ..Function::default()
         };
         let locals = TopKExactnessLocals {
-            chunk: Self::local(&mut function, "chunk", u32_ty),
-            inexact: Self::local(&mut function, "inexact", u32_ty),
+            chunk: Self::local(&mut function, u32_ty),
+            inexact: Self::local(&mut function, u32_ty),
         };
         function.body = self.entry_body(&mut function.expressions, globals, locals);
         function
@@ -333,14 +327,13 @@ impl super::TopKExactnessModuleBuilder {
 
     fn storage_global(
         module: &mut Module,
-        name: &str,
         binding: u32,
         ty: Handle<Type>,
         read_only: bool,
     ) -> Handle<GlobalVariable> {
         module.global_variables.append(
             GlobalVariable {
-                name: Some(name.into()),
+                name: None,
                 space: AddressSpace::Storage {
                     access: if read_only {
                         StorageAccess::LOAD
@@ -356,14 +349,10 @@ impl super::TopKExactnessModuleBuilder {
         )
     }
 
-    fn workgroup_global(
-        module: &mut Module,
-        name: &str,
-        ty: Handle<Type>,
-    ) -> Handle<GlobalVariable> {
+    fn workgroup_global(module: &mut Module, ty: Handle<Type>) -> Handle<GlobalVariable> {
         module.global_variables.append(
             GlobalVariable {
-                name: Some(name.into()),
+                name: None,
                 space: AddressSpace::WorkGroup,
                 binding: None,
                 ty,
@@ -373,10 +362,10 @@ impl super::TopKExactnessModuleBuilder {
         )
     }
 
-    fn local(function: &mut Function, name: &str, ty: Handle<Type>) -> Handle<LocalVariable> {
+    fn local(function: &mut Function, ty: Handle<Type>) -> Handle<LocalVariable> {
         function.local_variables.append(
             LocalVariable {
-                name: Some(name.into()),
+                name: None,
                 ty,
                 init: None,
             },
