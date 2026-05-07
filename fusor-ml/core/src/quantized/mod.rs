@@ -245,8 +245,8 @@ impl QMatrix {
 
     /// Create a QMatrix from raw quantized bytes.
     ///
-    /// The primary buffer stores the block layout consumed by the typed qmatmul
-    /// prototype. Explicit dequantize is lowered separately and does not keep a
+    /// The primary buffer stores the block layout consumed by the tiled qmatmul
+    /// path. Explicit dequantize is lowered separately and does not keep a
     /// dense f32 backing here.
     pub fn from_parts(
         device: &Device,

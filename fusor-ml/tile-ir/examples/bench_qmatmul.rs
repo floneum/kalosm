@@ -1,8 +1,6 @@
 use std::{borrow::Cow, env, sync::mpsc, time::Instant};
 
-use phase_token_prototype::{
-    tile, GgmlQuantFormat, KernelIr, Layout, MemoryLevel, Shape, Strides, F32,
-};
+use fusor_tile_ir::{tile, GgmlQuantFormat, KernelIr, Layout, MemoryLevel, Shape, Strides, F32};
 use wgpu::util::DeviceExt;
 
 const GEMM_M: usize = 1024;
@@ -242,7 +240,7 @@ impl Harness {
         }
         let (device, queue) = adapter
             .request_device(&wgpu::DeviceDescriptor {
-                label: Some("phase-token-prototype qmatmul bench device"),
+                label: Some("fusor-tile-ir qmatmul bench device"),
                 required_features,
                 required_limits: adapter.limits(),
                 experimental_features: unsafe { wgpu::ExperimentalFeatures::enabled() },

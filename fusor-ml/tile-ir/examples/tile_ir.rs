@@ -1,4 +1,4 @@
-use phase_token_prototype::{tile, GgmlQuantFormat, KernelIr, Shape, WorkgroupAxis, F32};
+use fusor_tile_ir::{tile, GgmlQuantFormat, KernelIr, Shape, WorkgroupAxis, F32};
 
 fn softmax_ir(rows: u32, cols: u32) -> KernelIr {
     const BLOCK: usize = 128;

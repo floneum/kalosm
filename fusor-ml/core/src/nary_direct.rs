@@ -4,9 +4,9 @@ use std::{
     sync::OnceLock,
 };
 
+use fusor_tile_ir as tile_ir;
 use lru::LruCache;
 use parking_lot::RwLock;
-use phase_token_prototype as tile_ir;
 use rustc_hash::{FxBuildHasher, FxHasher};
 
 use crate::{

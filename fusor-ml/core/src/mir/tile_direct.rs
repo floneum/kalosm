@@ -1,5 +1,5 @@
 use crate::Layout;
-use phase_token_prototype as tile_ir;
+use fusor_tile_ir as tile_ir;
 
 #[derive(Clone)]
 pub(crate) struct DirectMatrixLayout {

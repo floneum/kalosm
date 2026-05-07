@@ -1,4 +1,4 @@
-use phase_token_prototype as tile_ir;
+use fusor_tile_ir as tile_ir;
 
 use crate::{
     matmul::MatMulOperation,

@@ -18,7 +18,7 @@ use crate::{
     },
 };
 use fusor_gguf::GgmlType;
-use phase_token_prototype as tile_ir;
+use fusor_tile_ir as tile_ir;
 
 use super::{QMatMulDirectPipelineKey, QMatrix};
 

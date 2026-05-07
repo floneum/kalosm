@@ -23,9 +23,9 @@ use crate::{
     },
     tensor::TensorData,
 };
+use fusor_tile_ir as tile_ir;
 use lru::LruCache;
 use parking_lot::RwLock;
-use phase_token_prototype as tile_ir;
 use rustc_hash::{FxBuildHasher, FxHasher};
 
 const BLOCK: usize = 1024;

@@ -16,7 +16,7 @@ use crate::{
     nary_wise::UnaryFunctionChain,
     tensor::{DataType, DataTypeEnum, TensorData},
 };
-use phase_token_prototype as tile_ir;
+use fusor_tile_ir as tile_ir;
 
 pub mod coop_gemm;
 mod direct;

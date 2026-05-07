@@ -1,6 +1,6 @@
 use std::{borrow::Cow, sync::mpsc, time::Instant};
 
-use phase_token_prototype::{tile, KernelIr, Shape, WorkgroupAxis, F32};
+use fusor_tile_ir::{tile, KernelIr, Shape, WorkgroupAxis, F32};
 use wgpu::util::DeviceExt;
 
 const WARMUP_BATCHES: usize = 2;
@@ -83,7 +83,7 @@ impl Harness {
         let adapter_info = adapter.get_info();
         let (device, queue) = adapter
             .request_device(&wgpu::DeviceDescriptor {
-                label: Some("phase-token-prototype tile softmax bench device"),
+                label: Some("fusor-tile-ir tile softmax bench device"),
                 required_features: wgpu::Features::empty(),
                 required_limits: wgpu::Limits::default(),
                 experimental_features: unsafe { wgpu::ExperimentalFeatures::enabled() },

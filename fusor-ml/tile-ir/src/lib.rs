@@ -1,4 +1,4 @@
-//! A prototype typed tile IR.
+//! Typed tile IR and lowering for Fusor kernels.
 //!
 //! Source kernels are built with [`tile::build`]. The only executable IR
 //! operation is [`Op::TileProgram`]; conveniences such as dense matmul,

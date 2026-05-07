@@ -12,7 +12,7 @@ are no longer the obvious gap; the remaining large wins are:
    prepare the same 300+ dispatch graph.
 
 Do not add WGSL. New kernels should be raw Naga through
-`prototypes/phase-token-prototype`.
+`fusor-ml/tile-ir`.
 
 ## Current Measurements
 
@@ -122,7 +122,7 @@ fusor-ml/core/src/top_k.rs
 ```
 
 Important: those existing sampler kernels are WGSL. New fused work should be
-raw Naga through `phase-token-prototype`, not more WGSL.
+raw Naga through `fusor-tile-ir`, not more WGSL.
 
 Graph resolver / dispatch path:
 
@@ -135,9 +135,9 @@ fusor-ml/core/src/mir/direct_kernel.rs
 Raw Naga tile source:
 
 ```text
-prototypes/phase-token-prototype/src/tile.rs
-prototypes/phase-token-prototype/src/lower/tile_program.rs
-prototypes/phase-token-prototype/src/lower/quantized.rs
+fusor-ml/tile-ir/src/tile.rs
+fusor-ml/tile-ir/src/lower/tile_program.rs
+fusor-ml/tile-ir/src/lower/quantized.rs
 ```
 
 ## Workstream A: Fused Final Logits + Top-K/Sample

@@ -1,5 +1,5 @@
 use fusor_gguf::GgmlType;
-use phase_token_prototype as tile_ir;
+use fusor_tile_ir as tile_ir;
 
 use crate::{
     DataTypeEnum, Device, Tensor, TensorData, TensorInfo,

@@ -3083,6 +3083,7 @@ dependencies = [
  "enumset",
  "env_logger",
  "fusor-gguf",
+ "fusor-tile-ir",
  "fusor-types",
  "futures",
  "futures-channel",
@@ -3095,7 +3096,6 @@ dependencies = [
  "num-traits",
  "parking_lot",
  "petgraph 0.8.3",
- "phase-token-prototype",
  "pollster",
  "pretty_assertions",
  "rand 0.9.2",
@@ -3141,6 +3141,17 @@ dependencies = [
  "rustversion",
  "thiserror 2.0.18",
  "tokio",
+]
+
+[[package]]
+name = "fusor-tile-ir"
+version = "0.1.0"
+dependencies = [
+ "bytemuck",
+ "half 2.7.1",
+ "naga",
+ "pollster",
+ "wgpu",
 ]
 
 [[package]]
@@ -6587,17 +6598,6 @@ checksum = "e9567389417feee6ce15dd6527a8a1ecac205ef62c2932bcf3d9f6fc5b78b414"
 dependencies = [
  "futures",
  "rustc_version",
-]
-
-[[package]]
-name = "phase-token-prototype"
-version = "0.1.0"
-dependencies = [
- "bytemuck",
- "half 2.7.1",
- "naga",
- "pollster",
- "wgpu",
 ]
 
 [[package]]

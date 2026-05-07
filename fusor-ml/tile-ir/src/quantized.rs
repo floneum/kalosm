@@ -1,6 +1,6 @@
 use crate::ir::StorageView;
 
-/// GGML quantization formats represented by the prototype qmatmul path.
+/// GGML quantization formats represented by the tiled qmatmul path.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum GgmlQuantFormat {
     Q4_0,

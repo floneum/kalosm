@@ -25,7 +25,7 @@ tracing = "0.1.41"
 lru = "0.14.0"
 pollster = "0.4.0"
 petgraph = "0.8.3"
-phase-token-prototype = { path = "../../prototypes/phase-token-prototype" }
+fusor-tile-ir = { workspace = true }
 
 [features]
 extra_assertions = []

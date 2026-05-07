@@ -1,5 +1,5 @@
 [package]
-name = "phase-token-prototype"
+name = "fusor-tile-ir"
 version = "0.1.0"
 edition = "2021"
 publish = false

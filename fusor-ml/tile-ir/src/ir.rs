@@ -2,7 +2,7 @@ use std::num::NonZeroU32;
 
 use crate::{LowerError, NagaKernel, QuantizedMatrix};
 
-/// A typed kernel IR emitted by the prototype builder.
+/// A typed kernel IR emitted by the tile builder.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct KernelIr {
     pub(crate) buffers: Vec<BufferDecl>,

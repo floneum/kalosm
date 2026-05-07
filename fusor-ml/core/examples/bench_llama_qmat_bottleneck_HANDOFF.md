@@ -80,17 +80,17 @@ Fusor qmat operation:
 fusor-ml/core/src/quantized/matmul/mod.rs
 ```
 
-Tile prototype used to generate qgemv kernels:
+Tile IR used to generate qgemv kernels:
 
 ```text
-prototypes/phase-token-prototype/src/tile.rs
+fusor-ml/tile-ir/src/tile.rs
 ```
 
 Q4K/Q6K lowering details:
 
 ```text
-prototypes/phase-token-prototype/src/lower/quantized.rs
-prototypes/phase-token-prototype/src/lower/tile_program.rs
+fusor-ml/tile-ir/src/lower/quantized.rs
+fusor-ml/tile-ir/src/lower/tile_program.rs
 ```
 
 QMatrix storage conversion:
@@ -133,7 +133,7 @@ to:
 qgemv_perf::<8, 4, 16, 256>
 ```
 
-This regressed badly in the existing prototype microbench:
+This regressed badly in the existing tile IR microbench:
 
 ```text
 target/release/examples/bench_qmatmul gemv q4k contiguous 1 28672 4096
@@ -183,7 +183,7 @@ target/release/examples/bench_llama_qmat_bottleneck
 Optional broader qmat comparison:
 
 ```bash
-cargo build -p phase-token-prototype --example bench_qmatmul --profile release
+cargo build -p fusor-tile-ir --example bench_qmatmul --profile release
 target/release/examples/bench_qmatmul gemv q4k contiguous 1 28672 4096
 ```
 
