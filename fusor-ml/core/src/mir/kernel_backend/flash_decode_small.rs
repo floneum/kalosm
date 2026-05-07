@@ -28,6 +28,11 @@ struct FlashDecodeSmallLocals {
     acc: Handle<LocalVariable>,
     kv: Handle<LocalVariable>,
     item: Handle<LocalVariable>,
+    dim: Handle<LocalVariable>,
+    /// Scratch accumulator used by `score_for_kv` so each q*k addition becomes
+    /// a load/store on a function-scope `var` instead of folding into a single
+    /// nested expression.
+    score_acc: Handle<LocalVariable>,
 }
 
 #[derive(Clone, Copy)]
@@ -145,6 +150,8 @@ impl FlashDecodeSmallNagaBuilder {
             acc: Self::local(&mut function, f32_ty),
             kv: Self::local(&mut function, u32_ty),
             item: Self::local(&mut function, u32_ty),
+            dim: Self::local(&mut function, u32_ty),
+            score_acc: Self::local(&mut function, f32_ty),
         };
 
         function.body = self.entry_body(&mut function.expressions, globals, locals);
@@ -207,52 +214,17 @@ impl FlashDecodeSmallNagaBuilder {
 
         let mut score_accept = Block::new();
         let zero = self.f32_lit(expressions, 0.0);
-        let mut score = zero;
-        for dim in 0..DECODE_HEAD_DIM {
-            let q_index = self.index4_const_last(
-                expressions,
-                &mut score_accept,
-                self.meta.q_offset,
-                self.meta.q_strides,
-                batch_idx,
-                head_idx,
-                0,
-                dim,
-            );
-            let k_index = self.index4_const_last_dyn_i2(
-                expressions,
-                &mut score_accept,
-                self.meta.k_offset,
-                self.meta.k_strides,
-                batch_idx,
-                kv_head_idx,
-                local,
-                dim,
-            );
-            let q_value = self.load_storage(expressions, &mut score_accept, globals.q, q_index);
-            let k_value = self.load_storage(expressions, &mut score_accept, globals.k, k_index);
-            let product = self.bin(
-                expressions,
-                &mut score_accept,
-                BinaryOperator::Multiply,
-                q_value,
-                k_value,
-            );
-            score = self.bin(
-                expressions,
-                &mut score_accept,
-                BinaryOperator::Add,
-                score,
-                product,
-            );
-        }
-        let scale = self.f32_lit(expressions, self.meta.scale);
-        score = self.bin(
+        let score = self.score_for_kv(
             expressions,
             &mut score_accept,
-            BinaryOperator::Multiply,
-            score,
-            scale,
+            globals,
+            locals,
+            FlashDecodeRowIndices {
+                batch_idx,
+                head_idx,
+                kv_head_idx,
+            },
+            local,
         );
         self.store_workgroup(expressions, &mut score_accept, globals.scores, local, score);
         self.store_workgroup(expressions, &mut score_accept, globals.reduce, local, score);
@@ -365,45 +337,78 @@ impl FlashDecodeSmallNagaBuilder {
         expressions: &mut Arena<Expression>,
         body: &mut Block,
         globals: FlashDecodeSmallGlobals,
+        locals: FlashDecodeSmallLocals,
         indices: FlashDecodeRowIndices,
         kv: Handle<Expression>,
     ) -> Handle<Expression> {
         let zero = self.f32_lit(expressions, 0.0);
-        let mut score = zero;
-        for dim in 0..DECODE_HEAD_DIM {
-            let q_index = self.index4_const_last(
-                expressions,
-                body,
-                self.meta.q_offset,
-                self.meta.q_strides,
-                indices.batch_idx,
-                indices.head_idx,
-                0,
-                dim,
-            );
-            let k_index = self.index4_const_last_dyn_i2(
-                expressions,
-                body,
-                self.meta.k_offset,
-                self.meta.k_strides,
-                indices.batch_idx,
-                indices.kv_head_idx,
-                kv,
-                dim,
-            );
-            let q_value = self.load_storage(expressions, body, globals.q, q_index);
-            let k_value = self.load_storage(expressions, body, globals.k, k_index);
-            let product = self.bin(
-                expressions,
-                body,
-                BinaryOperator::Multiply,
-                q_value,
-                k_value,
-            );
-            score = self.bin(expressions, body, BinaryOperator::Add, score, product);
-        }
+        let zero_u32 = self.u32_lit(expressions, 0);
+        self.store_local(expressions, body, locals.score_acc, zero);
+        self.store_local(expressions, body, locals.dim, zero_u32);
+
+        let mut loop_body = Block::new();
+        let dim = self.load_local(expressions, &mut loop_body, locals.dim);
+        let done = self.ge_lit(expressions, &mut loop_body, dim, DECODE_HEAD_DIM);
+        loop_body.push(
+            Statement::If {
+                condition: done,
+                accept: Block::from_vec(vec![Statement::Break]),
+                reject: Block::new(),
+            },
+            Span::default(),
+        );
+        let q_index = self.index4_dyn_last(
+            expressions,
+            &mut loop_body,
+            self.meta.q_offset,
+            self.meta.q_strides,
+            indices.batch_idx,
+            indices.head_idx,
+            zero_u32,
+            dim,
+        );
+        let k_index = self.index4_dyn_last(
+            expressions,
+            &mut loop_body,
+            self.meta.k_offset,
+            self.meta.k_strides,
+            indices.batch_idx,
+            indices.kv_head_idx,
+            kv,
+            dim,
+        );
+        let q_value = self.load_storage(expressions, &mut loop_body, globals.q, q_index);
+        let k_value = self.load_storage(expressions, &mut loop_body, globals.k, k_index);
+        let product = self.bin(
+            expressions,
+            &mut loop_body,
+            BinaryOperator::Multiply,
+            q_value,
+            k_value,
+        );
+        let acc = self.load_local(expressions, &mut loop_body, locals.score_acc);
+        let new_acc = self.bin(
+            expressions,
+            &mut loop_body,
+            BinaryOperator::Add,
+            acc,
+            product,
+        );
+        self.store_local(expressions, &mut loop_body, locals.score_acc, new_acc);
+        let next_dim = self.add_lit(expressions, &mut loop_body, dim, 1);
+        self.store_local(expressions, &mut loop_body, locals.dim, next_dim);
+        body.push(
+            Statement::Loop {
+                body: loop_body,
+                continuing: Block::new(),
+                break_if: None,
+            },
+            Span::default(),
+        );
+
         let scale = self.f32_lit(expressions, self.meta.scale);
-        self.bin(expressions, body, BinaryOperator::Multiply, score, scale)
+        let total = self.load_local(expressions, body, locals.score_acc);
+        self.bin(expressions, body, BinaryOperator::Multiply, total, scale)
     }
 
     fn entry_body_tiled(
@@ -492,6 +497,7 @@ impl FlashDecodeSmallNagaBuilder {
         );
         let denom = self.load_workgroup(expressions, &mut body, globals.reduce, zero_index);
 
+        let out_valid = self.lt_lit(expressions, &mut body, local, DECODE_HEAD_DIM);
         self.store_local(expressions, &mut body, locals.acc, zero);
         let zero_u32 = self.u32_lit(expressions, 0);
         self.store_local(expressions, &mut body, locals.kv, zero_u32);
@@ -509,13 +515,15 @@ impl FlashDecodeSmallNagaBuilder {
             active_kv_len,
             max_score,
             denom,
+            out_valid,
         );
 
-        let output_value = self.load_local(expressions, &mut body, locals.acc);
+        let mut store_accept = Block::new();
+        let output_value = self.load_local(expressions, &mut store_accept, locals.acc);
         let q_idx = self.u32_lit(expressions, 0);
         let output_index = self.index4_dyn_last(
             expressions,
-            &mut body,
+            &mut store_accept,
             self.meta.output_offset,
             self.meta.output_strides,
             batch_idx,
@@ -525,10 +533,18 @@ impl FlashDecodeSmallNagaBuilder {
         );
         self.store_storage(
             expressions,
-            &mut body,
+            &mut store_accept,
             globals.output,
             output_index,
             output_value,
+        );
+        body.push(
+            Statement::If {
+                condition: out_valid,
+                accept: store_accept,
+                reject: Block::new(),
+            },
+            Span::default(),
         );
 
         body

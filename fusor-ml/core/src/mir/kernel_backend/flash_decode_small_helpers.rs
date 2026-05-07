@@ -20,7 +20,7 @@ impl super::FlashDecodeSmallNagaBuilder {
         let mut loop_body = Block::new();
         let kv = self.load_local(expressions, &mut loop_body, locals.kv);
         self.append_break_if_kv_done(expressions, &mut loop_body, kv, active_kv_len);
-        let score = self.score_for_kv(expressions, &mut loop_body, globals, indices, kv);
+        let score = self.score_for_kv(expressions, &mut loop_body, globals, locals, indices, kv);
         let current = self.load_workgroup(expressions, &mut loop_body, globals.reduce, local);
         let next = self.max_f32(expressions, &mut loop_body, current, score);
         self.store_workgroup(expressions, &mut loop_body, globals.reduce, local, next);
@@ -50,7 +50,7 @@ impl super::FlashDecodeSmallNagaBuilder {
         let mut loop_body = Block::new();
         let kv = self.load_local(expressions, &mut loop_body, locals.kv);
         self.append_break_if_kv_done(expressions, &mut loop_body, kv, active_kv_len);
-        let score = self.score_for_kv(expressions, &mut loop_body, globals, indices, kv);
+        let score = self.score_for_kv(expressions, &mut loop_body, globals, locals, indices, kv);
         let shifted = self.bin(
             expressions,
             &mut loop_body,
@@ -91,6 +91,7 @@ impl super::FlashDecodeSmallNagaBuilder {
         active_kv_len: Handle<Expression>,
         max_score: Handle<Expression>,
         denom: Handle<Expression>,
+        out_valid: Handle<Expression>,
     ) {
         let mut loop_body = Block::new();
         let tile_base = self.load_local(expressions, &mut loop_body, locals.kv);
@@ -110,7 +111,7 @@ impl super::FlashDecodeSmallNagaBuilder {
             active_kv_len,
         );
         let mut prob_accept = Block::new();
-        let score = self.score_for_kv(expressions, &mut prob_accept, globals, indices, kv);
+        let score = self.score_for_kv(expressions, &mut prob_accept, globals, locals, indices, kv);
         let shifted = self.bin(
             expressions,
             &mut prob_accept,
@@ -145,15 +146,24 @@ impl super::FlashDecodeSmallNagaBuilder {
 
         let zero_u32 = self.u32_lit(expressions, 0);
         self.store_local(expressions, &mut loop_body, locals.item, zero_u32);
+        let mut output_accept = Block::new();
         self.append_tiled_output_item_loop(
             expressions,
-            &mut loop_body,
+            &mut output_accept,
             globals,
             locals,
             indices,
             tile_base,
             local,
             active_kv_len,
+        );
+        loop_body.push(
+            Statement::If {
+                condition: out_valid,
+                accept: output_accept,
+                reject: Block::new(),
+            },
+            Span::default(),
         );
         loop_body.push(
             Statement::ControlBarrier(Barrier::WORK_GROUP),
@@ -410,38 +420,6 @@ impl super::FlashDecodeSmallNagaBuilder {
             );
             stride /= 2;
         }
-    }
-
-    pub(super) fn index4_const_last(
-        &self,
-        expressions: &mut Arena<Expression>,
-        body: &mut Block,
-        offset: u32,
-        strides: [u32; 4],
-        i0: Handle<Expression>,
-        i1: Handle<Expression>,
-        i2: u32,
-        i3: u32,
-    ) -> Handle<Expression> {
-        let base = offset + i2 * strides[2] + i3 * strides[3];
-        self.index2_with_base(expressions, body, base, [strides[0], strides[1]], i0, i1)
-    }
-
-    pub(super) fn index4_const_last_dyn_i2(
-        &self,
-        expressions: &mut Arena<Expression>,
-        body: &mut Block,
-        offset: u32,
-        strides: [u32; 4],
-        i0: Handle<Expression>,
-        i1: Handle<Expression>,
-        i2: Handle<Expression>,
-        i3: u32,
-    ) -> Handle<Expression> {
-        let base = offset + i3 * strides[3];
-        let index =
-            self.index2_with_base(expressions, body, base, [strides[0], strides[1]], i0, i1);
-        self.add_scaled_index(expressions, body, index, i2, strides[2])
     }
 
     pub(super) fn index4_dyn_last(

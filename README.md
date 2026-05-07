@@ -54,15 +54,6 @@ Kalosm also supports a variety of utilities around pre-trained models. These inc
 - [Transcribing audio from your microphone or file](./interfaces/kalosm/examples/transcribe.rs)
 - [Crawling and scraping content from web pages](./interfaces/kalosm/examples/crawl.rs)
 
-### Performance
-
-Kalosm uses the [candle](https://github.com/huggingface/candle) machine learning library to run models in pure rust. It supports quantized and accelerated models with performance on par with `llama.cpp`:
-
-**Mistral 7b**
-| Accelerator | Kalosm | llama.cpp |
-| ------ | --------- | --------- |
-| Metal (M2) | 39 t/s | 27 t/s |
-
 ### Structured Generation
 
 Kalosm supports structured generation with arbitrary parsers. It uses a custom parser engine and sampler and structure-aware acceleration to make structure generation even faster than uncontrolled text generation. You can take any rust type and add `#[derive(Parse, Schema)]` to make it usable with structured generation:

@@ -7,7 +7,9 @@ use std::{
 use crate::{
     DataTypeEnum,
     compute_graph::{ComputeGraphInner, NodeIndex},
-    kernel_selection::{Axis, KernelDeviceCaps, KernelShape, ShapeRule, ShapeSelector, eq, range},
+    kernel_selection::{
+        Axis, DimConstraint, KernelDeviceCaps, KernelShape, ShapeRule, ShapeSelector, eq, range,
+    },
     mir::{
         direct_kernel::{DirectKernel, DirectKernelBinding},
         inputs::MirValue,
@@ -109,29 +111,42 @@ const FLASH_KV_SEQ: Axis<4> = Axis;
 const FLASH_HEAD_DIM: Axis<5> = Axis;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DecodeBlock {
+    Small,
+    Medium,
+    Large,
+}
+
+impl DecodeBlock {
+    const ALL: [Self; 3] = [Self::Small, Self::Medium, Self::Large];
+
+    fn size(self) -> u32 {
+        match self {
+            Self::Small => DECODE_SMALL_BLOCK,
+            Self::Medium => DECODE_MEDIUM_BLOCK,
+            Self::Large => DECODE_LARGE_BLOCK,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum FlashAttentionSelectedVariant {
     Streaming,
-    DecodeSmall128,
-    DecodeSmall512,
-    DecodeSmall1024,
+    DecodeSmall(DecodeBlock),
 }
 
 impl FlashAttentionSelectedVariant {
     fn kernel_variant(self) -> FlashAttentionKernelVariant {
         match self {
             Self::Streaming => FlashAttentionKernelVariant::Streaming,
-            Self::DecodeSmall128 | Self::DecodeSmall512 | Self::DecodeSmall1024 => {
-                FlashAttentionKernelVariant::DecodeSmall
-            }
+            Self::DecodeSmall(_) => FlashAttentionKernelVariant::DecodeSmall,
         }
     }
 
     fn decode_block(self) -> Option<u32> {
         match self {
             Self::Streaming => None,
-            Self::DecodeSmall128 => Some(DECODE_SMALL_BLOCK),
-            Self::DecodeSmall512 => Some(DECODE_MEDIUM_BLOCK),
-            Self::DecodeSmall1024 => Some(DECODE_LARGE_BLOCK),
+            Self::DecodeSmall(block) => Some(block.size()),
         }
     }
 }
@@ -141,56 +156,94 @@ struct FlashAttentionSelectionCtx {
     has_mask: bool,
 }
 
+fn decode_block_supported(block: DecodeBlock, caps: KernelDeviceCaps) -> bool {
+    let size = block.size();
+    size <= caps.max_compute_invocations_per_workgroup && size <= caps.max_compute_workgroup_size_x
+}
+
+fn choose_decode_block(kv_seq_len: u32, caps: KernelDeviceCaps) -> Option<DecodeBlock> {
+    if kv_seq_len == 0 {
+        return None;
+    }
+
+    let mut largest_supported = None;
+    for block in DecodeBlock::ALL {
+        if !decode_block_supported(block, caps) {
+            continue;
+        }
+        largest_supported = Some(block);
+        if kv_seq_len <= block.size() {
+            return Some(block);
+        }
+    }
+    largest_supported
+}
+
+fn selected_decode_block_for_shape(
+    shape: KernelShape<6>,
+    ctx: &FlashAttentionSelectionCtx,
+    caps: KernelDeviceCaps,
+) -> Option<DecodeBlock> {
+    if ctx.has_mask || shape[FLASH_KV_SEQ] == 0 {
+        return None;
+    }
+    choose_decode_block(shape[FLASH_KV_SEQ].try_into().ok()?, caps)
+}
+
+fn decode_shape_rule(
+    block: DecodeBlock,
+    kv_constraint: Option<DimConstraint>,
+) -> ShapeRule<6, FlashAttentionSelectionCtx> {
+    let mut rule = ShapeRule::new()
+        .axis(FLASH_Q_SEQ, eq(1))
+        .axis(FLASH_HEAD_DIM, eq(DECODE_HEAD_DIM as usize));
+    if let Some(kv_constraint) = kv_constraint {
+        rule = rule.axis(FLASH_KV_SEQ, kv_constraint);
+    }
+    rule.when(move |shape, ctx, caps| {
+        selected_decode_block_for_shape(shape, ctx, caps) == Some(block)
+    })
+}
+
 fn flash_attention_selector()
 -> ShapeSelector<6, FlashAttentionSelectionCtx, FlashAttentionSelectedVariant> {
     ShapeSelector::new()
         .rule(
-            FlashAttentionSelectedVariant::DecodeSmall128,
-            ShapeRule::new()
-                .axis(FLASH_Q_SEQ, eq(1))
-                .axis(FLASH_HEAD_DIM, eq(DECODE_HEAD_DIM as usize))
-                .when(
-                    |shape: KernelShape<6>, ctx: &FlashAttentionSelectionCtx, caps| {
-                        !ctx.has_mask
-                            && shape[FLASH_KV_SEQ] > 0
-                            && caps.max_compute_invocations_per_workgroup >= DECODE_SMALL_BLOCK
-                            && (shape[FLASH_KV_SEQ] > DECODE_LARGE_BLOCK as usize
-                                || shape[FLASH_KV_SEQ] <= DECODE_SMALL_BLOCK as usize
-                                || caps.max_compute_invocations_per_workgroup < DECODE_MEDIUM_BLOCK)
-                    },
-                ),
+            FlashAttentionSelectedVariant::DecodeSmall(DecodeBlock::Small),
+            decode_shape_rule(
+                DecodeBlock::Small,
+                Some(range(1..=DECODE_SMALL_BLOCK as usize)),
+            ),
         )
         .rule(
-            FlashAttentionSelectedVariant::DecodeSmall512,
-            ShapeRule::new()
-                .axis(FLASH_Q_SEQ, eq(1))
-                .axis(FLASH_HEAD_DIM, eq(DECODE_HEAD_DIM as usize))
-                .when(
-                    |shape: KernelShape<6>, ctx: &FlashAttentionSelectionCtx, caps| {
-                        !ctx.has_mask
-                            && shape[FLASH_KV_SEQ] > DECODE_SMALL_BLOCK as usize
-                            && shape[FLASH_KV_SEQ] <= DECODE_LARGE_BLOCK as usize
-                            && caps.max_compute_invocations_per_workgroup >= DECODE_MEDIUM_BLOCK
-                            && (shape[FLASH_KV_SEQ] <= DECODE_MEDIUM_BLOCK as usize
-                                || caps.max_compute_invocations_per_workgroup < DECODE_LARGE_BLOCK)
-                    },
-                ),
+            FlashAttentionSelectedVariant::DecodeSmall(DecodeBlock::Medium),
+            decode_shape_rule(
+                DecodeBlock::Medium,
+                Some(range(
+                    (DECODE_SMALL_BLOCK as usize + 1)..=DECODE_MEDIUM_BLOCK as usize,
+                )),
+            ),
         )
         .rule(
-            FlashAttentionSelectedVariant::DecodeSmall1024,
-            ShapeRule::new()
-                .axis(FLASH_Q_SEQ, eq(1))
-                .axis(
-                    FLASH_KV_SEQ,
-                    range((DECODE_MEDIUM_BLOCK as usize + 1)..=DECODE_LARGE_BLOCK as usize),
-                )
-                .axis(FLASH_HEAD_DIM, eq(DECODE_HEAD_DIM as usize))
-                .when(
-                    |_shape: KernelShape<6>, ctx: &FlashAttentionSelectionCtx, caps| {
-                        !ctx.has_mask
-                            && caps.max_compute_invocations_per_workgroup >= DECODE_LARGE_BLOCK
-                    },
-                ),
+            FlashAttentionSelectedVariant::DecodeSmall(DecodeBlock::Large),
+            decode_shape_rule(
+                DecodeBlock::Large,
+                Some(range(
+                    (DECODE_MEDIUM_BLOCK as usize + 1)..=DECODE_LARGE_BLOCK as usize,
+                )),
+            ),
+        )
+        .rule(
+            FlashAttentionSelectedVariant::DecodeSmall(DecodeBlock::Small),
+            decode_shape_rule(DecodeBlock::Small, None),
+        )
+        .rule(
+            FlashAttentionSelectedVariant::DecodeSmall(DecodeBlock::Medium),
+            decode_shape_rule(DecodeBlock::Medium, None),
+        )
+        .rule(
+            FlashAttentionSelectedVariant::DecodeSmall(DecodeBlock::Large),
+            decode_shape_rule(DecodeBlock::Large, None),
         )
         .rule(FlashAttentionSelectedVariant::Streaming, ShapeRule::new())
 }
@@ -388,22 +441,19 @@ impl Operation for FlashAttentionOperation {
             return None;
         }
 
-        let selected_variant = select_flash_attention_variant(
-            dims,
-            mask_meta.is_some(),
-            KernelDeviceCaps::from_device(&device),
-        );
+        let caps = KernelDeviceCaps::from_device(&device);
+        let selected_variant = select_flash_attention_variant(dims, mask_meta.is_some(), caps);
         let decode_candidate =
             mask_meta.is_none() && dims.q_seq_len == 1 && dims.head_dim == DECODE_HEAD_DIM;
         assert!(
             !decode_candidate || selected_variant.decode_block().is_some(),
-            "decode attention refused slow fallback: device must support at least {DECODE_SMALL_BLOCK} workgroup invocations"
+            "decode attention refused slow fallback: device must support at least {DECODE_SMALL_BLOCK} workgroup invocations on x"
         );
         let decode_meta = if selected_variant.decode_block().is_some() {
             let meta = build_flash_decode_small_meta(
                 dims,
                 self.scale,
-                device.limits().max_compute_invocations_per_workgroup,
+                caps,
                 q_meta.clone(),
                 k_meta.clone(),
                 v_meta.clone(),
@@ -630,7 +680,7 @@ pub(crate) struct FlashDecodeSmallMeta {
 fn build_flash_decode_small_meta(
     dims: FlashAttentionDims,
     scale: f32,
-    max_workgroup_invocations: u32,
+    caps: KernelDeviceCaps,
     q_meta: TensorMeta,
     k_meta: TensorMeta,
     v_meta: TensorMeta,
@@ -644,25 +694,7 @@ fn build_flash_decode_small_meta(
     {
         return None;
     }
-    let decode_block = if dims.kv_seq_len > DECODE_LARGE_BLOCK {
-        if max_workgroup_invocations < DECODE_SMALL_BLOCK {
-            return None;
-        }
-        DECODE_SMALL_BLOCK
-    } else if dims.kv_seq_len <= DECODE_SMALL_BLOCK
-        || max_workgroup_invocations < DECODE_MEDIUM_BLOCK
-    {
-        if max_workgroup_invocations < DECODE_SMALL_BLOCK {
-            return None;
-        }
-        DECODE_SMALL_BLOCK
-    } else if dims.kv_seq_len <= DECODE_MEDIUM_BLOCK
-        || max_workgroup_invocations < DECODE_LARGE_BLOCK
-    {
-        DECODE_MEDIUM_BLOCK
-    } else {
-        DECODE_LARGE_BLOCK
-    };
+    let decode_block = choose_decode_block(dims.kv_seq_len, caps)?.size();
     let tiled = dims.kv_seq_len > decode_block;
 
     let groups = dims.num_heads.checked_div(dims.num_kv_heads)?;
@@ -727,21 +759,55 @@ mod tests {
         }
     }
 
-    #[test]
-    fn decode_small_meta_buckets_dynamic_kv_len() {
-        let dims = FlashAttentionDims {
+    fn decode_dims(kv_seq_len: u32) -> FlashAttentionDims {
+        FlashAttentionDims {
             batch: 1,
             num_heads: 32,
             num_kv_heads: 8,
             q_seq_len: 1,
-            kv_seq_len: DECODE_SMALL_BLOCK + 1,
+            kv_seq_len,
             head_dim: DECODE_HEAD_DIM,
-        };
+        }
+    }
 
+    fn decode_shape(kv_seq_len: usize) -> KernelShape<6> {
+        KernelShape::new([1, 32, 8, 1, kv_seq_len, DECODE_HEAD_DIM as usize])
+    }
+
+    #[test]
+    fn decode_block_choice_uses_smallest_covering_supported_block() {
+        assert_eq!(
+            choose_decode_block(64, caps(DECODE_LARGE_BLOCK)),
+            Some(DecodeBlock::Small)
+        );
+        assert_eq!(
+            choose_decode_block(200, caps(DECODE_LARGE_BLOCK)),
+            Some(DecodeBlock::Medium)
+        );
+        assert_eq!(
+            choose_decode_block(600, caps(DECODE_LARGE_BLOCK)),
+            Some(DecodeBlock::Large)
+        );
+        assert_eq!(
+            choose_decode_block(600, caps(DECODE_MEDIUM_BLOCK)),
+            Some(DecodeBlock::Medium)
+        );
+        assert_eq!(
+            choose_decode_block(DECODE_LARGE_BLOCK + 1, caps(DECODE_LARGE_BLOCK)),
+            Some(DecodeBlock::Large)
+        );
+        assert_eq!(
+            choose_decode_block(DECODE_SMALL_BLOCK, caps(DECODE_SMALL_BLOCK - 1)),
+            None
+        );
+    }
+
+    #[test]
+    fn decode_small_meta_buckets_dynamic_kv_len() {
         let meta = build_flash_decode_small_meta(
-            dims,
+            decode_dims(DECODE_SMALL_BLOCK + 1),
             1.0,
-            DECODE_MEDIUM_BLOCK,
+            caps(DECODE_LARGE_BLOCK),
             tensor_meta4(),
             tensor_meta4(),
             tensor_meta4(),
@@ -757,20 +823,11 @@ mod tests {
     }
 
     #[test]
-    fn decode_small_meta_tiles_over_workgroup_limit() {
-        let dims = FlashAttentionDims {
-            batch: 1,
-            num_heads: 32,
-            num_kv_heads: 8,
-            q_seq_len: 1,
-            kv_seq_len: DECODE_SMALL_BLOCK + 1,
-            head_dim: DECODE_HEAD_DIM,
-        };
-
+    fn decode_small_meta_tiles_with_largest_supported_block() {
         let meta = build_flash_decode_small_meta(
-            dims,
+            decode_dims(DECODE_MEDIUM_BLOCK + 1),
             1.0,
-            DECODE_SMALL_BLOCK,
+            caps(DECODE_MEDIUM_BLOCK),
             tensor_meta4(),
             tensor_meta4(),
             tensor_meta4(),
@@ -779,27 +836,18 @@ mod tests {
         );
 
         let meta = meta.unwrap();
-        assert_eq!(meta.active_kv_len, DECODE_SMALL_BLOCK + 1);
-        assert_eq!(meta.decode_block, DECODE_SMALL_BLOCK);
-        assert_eq!(meta.dims.kv_seq_len, DECODE_SMALL_BLOCK);
+        assert_eq!(meta.active_kv_len, DECODE_MEDIUM_BLOCK + 1);
+        assert_eq!(meta.decode_block, DECODE_MEDIUM_BLOCK);
+        assert_eq!(meta.dims.kv_seq_len, DECODE_MEDIUM_BLOCK);
         assert!(meta.tiled);
     }
 
     #[test]
     fn decode_small_meta_requires_minimum_workgroup_limit() {
-        let dims = FlashAttentionDims {
-            batch: 1,
-            num_heads: 32,
-            num_kv_heads: 8,
-            q_seq_len: 1,
-            kv_seq_len: DECODE_SMALL_BLOCK,
-            head_dim: DECODE_HEAD_DIM,
-        };
-
         let meta = build_flash_decode_small_meta(
-            dims,
+            decode_dims(DECODE_SMALL_BLOCK),
             1.0,
-            DECODE_SMALL_BLOCK - 1,
+            caps(DECODE_SMALL_BLOCK - 1),
             tensor_meta4(),
             tensor_meta4(),
             tensor_meta4(),
@@ -811,23 +859,73 @@ mod tests {
     }
 
     #[test]
+    fn flash_attention_selector_selects_decode_block_buckets() {
+        let selector = flash_attention_selector();
+        let decode_ctx = FlashAttentionSelectionCtx { has_mask: false };
+        let masked_ctx = FlashAttentionSelectionCtx { has_mask: true };
+
+        assert_eq!(
+            selector.select(decode_shape(64), &decode_ctx, caps(DECODE_LARGE_BLOCK)),
+            Some(FlashAttentionSelectedVariant::DecodeSmall(
+                DecodeBlock::Small
+            ))
+        );
+        assert_eq!(
+            selector.select(decode_shape(200), &decode_ctx, caps(DECODE_LARGE_BLOCK)),
+            Some(FlashAttentionSelectedVariant::DecodeSmall(
+                DecodeBlock::Medium
+            ))
+        );
+        assert_eq!(
+            selector.select(decode_shape(600), &decode_ctx, caps(DECODE_LARGE_BLOCK)),
+            Some(FlashAttentionSelectedVariant::DecodeSmall(
+                DecodeBlock::Large
+            ))
+        );
+        assert_eq!(
+            selector.select(decode_shape(600), &decode_ctx, caps(DECODE_MEDIUM_BLOCK)),
+            Some(FlashAttentionSelectedVariant::DecodeSmall(
+                DecodeBlock::Medium
+            ))
+        );
+        assert_eq!(
+            selector.select(
+                decode_shape(DECODE_LARGE_BLOCK as usize + 1),
+                &decode_ctx,
+                caps(DECODE_LARGE_BLOCK)
+            ),
+            Some(FlashAttentionSelectedVariant::DecodeSmall(
+                DecodeBlock::Large
+            ))
+        );
+        assert_eq!(
+            selector.select(decode_shape(200), &decode_ctx, caps(DECODE_SMALL_BLOCK - 1)),
+            Some(FlashAttentionSelectedVariant::Streaming)
+        );
+        assert_eq!(
+            selector.select(decode_shape(200), &masked_ctx, caps(DECODE_LARGE_BLOCK)),
+            Some(FlashAttentionSelectedVariant::Streaming)
+        );
+    }
+
+    #[test]
     fn flash_attention_selector_generates_each_variant() {
         let selector = flash_attention_selector();
         let decode_ctx = FlashAttentionSelectionCtx { has_mask: false };
         let streaming_ctx = FlashAttentionSelectionCtx { has_mask: true };
         let cases = [
             (
-                FlashAttentionSelectedVariant::DecodeSmall128,
+                FlashAttentionSelectedVariant::DecodeSmall(DecodeBlock::Small),
                 decode_ctx,
                 caps(DECODE_SMALL_BLOCK),
             ),
             (
-                FlashAttentionSelectedVariant::DecodeSmall512,
+                FlashAttentionSelectedVariant::DecodeSmall(DecodeBlock::Medium),
                 decode_ctx,
                 caps(DECODE_MEDIUM_BLOCK),
             ),
             (
-                FlashAttentionSelectedVariant::DecodeSmall1024,
+                FlashAttentionSelectedVariant::DecodeSmall(DecodeBlock::Large),
                 decode_ctx,
                 caps(DECODE_LARGE_BLOCK),
             ),
@@ -1057,5 +1155,72 @@ mod tests {
             max_error < 3.0e-4,
             "head {max_head} dim {max_dim}: actual={max_actual} expected={max_expected} error={max_error}"
         );
+    }
+
+    /// Regression test for the non-tiled 512/1024-thread decode blocks.
+    /// Before the fix, the per-thread score loop folded its 128 q*k
+    /// accumulations into a single deeply-nested Naga expression, which
+    /// miscompiled on Metal once the kernel's `workgroup_size` exceeded 128;
+    /// the kernel produced all-zero output. The fix emits the dot product as a
+    /// shader loop with a function-scope accumulator.
+    #[tokio::test]
+    async fn decode_gqa_non_tiled_large_blocks_match_cpu_reference() {
+        let Ok(device) = Device::new().await else {
+            return;
+        };
+
+        let num_heads = 32;
+        let num_kv_heads = 8;
+        let groups = num_heads / num_kv_heads;
+        let caps = KernelDeviceCaps::from_device(&device);
+
+        // On devices that support the larger workgroups, 200 uses the 512
+        // block and 600 uses the 1024 block.
+        for (kv_len, expected_block) in [(200usize, DecodeBlock::Medium), (600, DecodeBlock::Large)]
+        {
+            if choose_decode_block(kv_len as u32, caps) != Some(expected_block) {
+                continue;
+            }
+            let q_data = decode_q_gqa(num_heads);
+            let k_data = decode_k_gqa(num_kv_heads, kv_len);
+            let v_data = decode_v_gqa(num_kv_heads, kv_len);
+            let scale = 1.0 / f32::sqrt(TEST_HEAD_DIM as f32);
+
+            let q = Tensor::new(&device, &q_data);
+            let k = Tensor::new(&device, &k_data);
+            let v = Tensor::new(&device, &v_data);
+            let output = q.try_flash_attention_direct(&k, &v, scale, None).unwrap();
+            let output = output.as_slice().await.unwrap();
+
+            let mut max_error = 0.0f32;
+            let mut max_head = 0usize;
+            let mut max_dim = 0usize;
+            let mut max_actual = 0.0f32;
+            let mut max_expected = 0.0f32;
+            for head in 0..num_heads {
+                let kv_head = head / groups;
+                let expected = cpu_decode_reference(
+                    &q_data[0][head][0],
+                    &k_data[0][kv_head],
+                    &v_data[0][kv_head],
+                    scale,
+                );
+                for (dim, expected) in expected.into_iter().enumerate() {
+                    let actual = output[[0, head, 0, dim]];
+                    let error = (actual - expected).abs();
+                    if error > max_error {
+                        max_error = error;
+                        max_head = head;
+                        max_dim = dim;
+                        max_actual = actual;
+                        max_expected = expected;
+                    }
+                }
+            }
+            assert!(
+                max_error < 5.0e-4,
+                "kv_len={kv_len} head={max_head} dim={max_dim}: actual={max_actual} expected={max_expected} error={max_error}"
+            );
+        }
     }
 }
