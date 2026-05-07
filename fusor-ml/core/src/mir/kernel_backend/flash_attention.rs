@@ -7,6 +7,7 @@ use std::{
 use crate::{
     DataTypeEnum,
     compute_graph::{ComputeGraphInner, NodeIndex},
+    kernel_selection::{Axis, KernelDeviceCaps, KernelShape, ShapeRule, ShapeSelector, eq, range},
     mir::{
         direct_kernel::{DirectKernel, DirectKernelBinding},
         inputs::MirValue,
@@ -101,6 +102,116 @@ fn flash_attention_module_key(
 enum FlashAttentionKernelVariant {
     Streaming,
     DecodeSmall,
+}
+
+const FLASH_Q_SEQ: Axis<3> = Axis;
+const FLASH_KV_SEQ: Axis<4> = Axis;
+const FLASH_HEAD_DIM: Axis<5> = Axis;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FlashAttentionSelectedVariant {
+    Streaming,
+    DecodeSmall128,
+    DecodeSmall512,
+    DecodeSmall1024,
+}
+
+impl FlashAttentionSelectedVariant {
+    fn kernel_variant(self) -> FlashAttentionKernelVariant {
+        match self {
+            Self::Streaming => FlashAttentionKernelVariant::Streaming,
+            Self::DecodeSmall128 | Self::DecodeSmall512 | Self::DecodeSmall1024 => {
+                FlashAttentionKernelVariant::DecodeSmall
+            }
+        }
+    }
+
+    fn decode_block(self) -> Option<u32> {
+        match self {
+            Self::Streaming => None,
+            Self::DecodeSmall128 => Some(DECODE_SMALL_BLOCK),
+            Self::DecodeSmall512 => Some(DECODE_MEDIUM_BLOCK),
+            Self::DecodeSmall1024 => Some(DECODE_LARGE_BLOCK),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct FlashAttentionSelectionCtx {
+    has_mask: bool,
+}
+
+fn flash_attention_selector()
+-> ShapeSelector<6, FlashAttentionSelectionCtx, FlashAttentionSelectedVariant> {
+    ShapeSelector::new()
+        .rule(
+            FlashAttentionSelectedVariant::DecodeSmall128,
+            ShapeRule::new()
+                .axis(FLASH_Q_SEQ, eq(1))
+                .axis(FLASH_HEAD_DIM, eq(DECODE_HEAD_DIM as usize))
+                .when(
+                    |shape: KernelShape<6>, ctx: &FlashAttentionSelectionCtx, caps| {
+                        !ctx.has_mask
+                            && shape[FLASH_KV_SEQ] > 0
+                            && caps.max_compute_invocations_per_workgroup >= DECODE_SMALL_BLOCK
+                            && (shape[FLASH_KV_SEQ] > DECODE_LARGE_BLOCK as usize
+                                || shape[FLASH_KV_SEQ] <= DECODE_SMALL_BLOCK as usize
+                                || caps.max_compute_invocations_per_workgroup < DECODE_MEDIUM_BLOCK)
+                    },
+                ),
+        )
+        .rule(
+            FlashAttentionSelectedVariant::DecodeSmall512,
+            ShapeRule::new()
+                .axis(FLASH_Q_SEQ, eq(1))
+                .axis(FLASH_HEAD_DIM, eq(DECODE_HEAD_DIM as usize))
+                .when(
+                    |shape: KernelShape<6>, ctx: &FlashAttentionSelectionCtx, caps| {
+                        !ctx.has_mask
+                            && shape[FLASH_KV_SEQ] > DECODE_SMALL_BLOCK as usize
+                            && shape[FLASH_KV_SEQ] <= DECODE_LARGE_BLOCK as usize
+                            && caps.max_compute_invocations_per_workgroup >= DECODE_MEDIUM_BLOCK
+                            && (shape[FLASH_KV_SEQ] <= DECODE_MEDIUM_BLOCK as usize
+                                || caps.max_compute_invocations_per_workgroup < DECODE_LARGE_BLOCK)
+                    },
+                ),
+        )
+        .rule(
+            FlashAttentionSelectedVariant::DecodeSmall1024,
+            ShapeRule::new()
+                .axis(FLASH_Q_SEQ, eq(1))
+                .axis(
+                    FLASH_KV_SEQ,
+                    range((DECODE_MEDIUM_BLOCK as usize + 1)..=DECODE_LARGE_BLOCK as usize),
+                )
+                .axis(FLASH_HEAD_DIM, eq(DECODE_HEAD_DIM as usize))
+                .when(
+                    |_shape: KernelShape<6>, ctx: &FlashAttentionSelectionCtx, caps| {
+                        !ctx.has_mask
+                            && caps.max_compute_invocations_per_workgroup >= DECODE_LARGE_BLOCK
+                    },
+                ),
+        )
+        .rule(FlashAttentionSelectedVariant::Streaming, ShapeRule::new())
+}
+
+fn select_flash_attention_variant(
+    dims: FlashAttentionDims,
+    has_mask: bool,
+    caps: KernelDeviceCaps,
+) -> FlashAttentionSelectedVariant {
+    let shape = KernelShape::new([
+        dims.batch as usize,
+        dims.num_heads as usize,
+        dims.num_kv_heads as usize,
+        dims.q_seq_len as usize,
+        dims.kv_seq_len as usize,
+        dims.head_dim as usize,
+    ]);
+    let ctx = FlashAttentionSelectionCtx { has_mask };
+    flash_attention_selector()
+        .select(shape, &ctx, caps)
+        .expect("flash attention selector has a catch-all rule")
 }
 
 #[derive(Clone, Debug)]
@@ -277,27 +388,38 @@ impl Operation for FlashAttentionOperation {
             return None;
         }
 
+        let selected_variant = select_flash_attention_variant(
+            dims,
+            mask_meta.is_some(),
+            KernelDeviceCaps::from_device(&device),
+        );
         let decode_candidate =
             mask_meta.is_none() && dims.q_seq_len == 1 && dims.head_dim == DECODE_HEAD_DIM;
-        let decode_meta = build_flash_decode_small_meta(
-            dims,
-            self.scale,
-            device.limits().max_compute_invocations_per_workgroup,
-            q_meta.clone(),
-            k_meta.clone(),
-            v_meta.clone(),
-            mask_meta.as_ref(),
-            output_meta.clone(),
-        );
         assert!(
-            !decode_candidate || decode_meta.is_some(),
+            !decode_candidate || selected_variant.decode_block().is_some(),
             "decode attention refused slow fallback: device must support at least {DECODE_SMALL_BLOCK} workgroup invocations"
         );
-        let variant = if decode_meta.is_some() {
-            FlashAttentionKernelVariant::DecodeSmall
+        let decode_meta = if selected_variant.decode_block().is_some() {
+            let meta = build_flash_decode_small_meta(
+                dims,
+                self.scale,
+                device.limits().max_compute_invocations_per_workgroup,
+                q_meta.clone(),
+                k_meta.clone(),
+                v_meta.clone(),
+                mask_meta.as_ref(),
+                output_meta.clone(),
+            )?;
+            assert_eq!(
+                Some(meta.decode_block),
+                selected_variant.decode_block(),
+                "flash attention selector and decode meta disagree"
+            );
+            Some(meta)
         } else {
-            FlashAttentionKernelVariant::Streaming
+            None
         };
+        let variant = selected_variant.kernel_variant();
         let dispatch_size = match variant {
             FlashAttentionKernelVariant::Streaming => {
                 self.dispatch_size(&WorkgroupShape::new(1, 1, 1), inputs)
@@ -580,9 +702,22 @@ use flash_streaming::build_flash_attention_naga_module;
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{Device, Tensor};
+    use crate::{Device, Tensor, kernel_selection::DeterministicShapeRng};
 
     const TEST_HEAD_DIM: usize = DECODE_HEAD_DIM as usize;
+
+    fn caps(max_compute_invocations_per_workgroup: u32) -> KernelDeviceCaps {
+        KernelDeviceCaps {
+            subgroups_supported: true,
+            cooperative_matrix_supported: false,
+            min_subgroup_size: 32,
+            max_subgroup_size: 32,
+            max_compute_invocations_per_workgroup,
+            max_compute_workgroup_storage_size: 64 * 1024,
+            max_compute_workgroup_size_x: 1024,
+            max_compute_workgroups_per_dimension: 65_535,
+        }
+    }
 
     fn tensor_meta4() -> TensorMeta {
         TensorMeta {
@@ -673,6 +808,43 @@ mod tests {
         );
 
         assert!(meta.is_none());
+    }
+
+    #[test]
+    fn flash_attention_selector_generates_each_variant() {
+        let selector = flash_attention_selector();
+        let decode_ctx = FlashAttentionSelectionCtx { has_mask: false };
+        let streaming_ctx = FlashAttentionSelectionCtx { has_mask: true };
+        let cases = [
+            (
+                FlashAttentionSelectedVariant::DecodeSmall128,
+                decode_ctx,
+                caps(DECODE_SMALL_BLOCK),
+            ),
+            (
+                FlashAttentionSelectedVariant::DecodeSmall512,
+                decode_ctx,
+                caps(DECODE_MEDIUM_BLOCK),
+            ),
+            (
+                FlashAttentionSelectedVariant::DecodeSmall1024,
+                decode_ctx,
+                caps(DECODE_LARGE_BLOCK),
+            ),
+            (
+                FlashAttentionSelectedVariant::Streaming,
+                streaming_ctx,
+                caps(DECODE_LARGE_BLOCK),
+            ),
+        ];
+        let mut rng = DeterministicShapeRng::default();
+
+        for (variant, ctx, caps) in cases {
+            let shape = selector
+                .generate_for(variant, &ctx, caps, &mut rng)
+                .expect("variant should generate");
+            assert_eq!(selector.select(shape, &ctx, caps), Some(variant));
+        }
     }
 
     fn decode_q() -> Vec<Vec<Vec<Vec<f32>>>> {

@@ -7,6 +7,9 @@ use std::{
 use crate::{
     DataTypeEnum,
     compute_graph::{ComputeGraphInner, NodeIndex},
+    kernel_selection::{
+        Axis, KernelDeviceCaps, KernelShape, ShapeRule, ShapeSelector, multiple_of,
+    },
     mir::{
         direct_kernel::{DirectKernel, DirectKernelBinding},
         inputs::MirValue,
@@ -88,6 +91,35 @@ fn rms_norm_module_key(
 enum RmsNormKernelVariant {
     Tile,
     Vec4,
+}
+
+const RMS_COLS: Axis<1> = Axis;
+
+#[derive(Clone, Copy, Debug)]
+struct RmsNormSelectionCtx {
+    vec4_supported: bool,
+}
+
+fn rms_norm_selector() -> ShapeSelector<2, RmsNormSelectionCtx, RmsNormKernelVariant> {
+    ShapeSelector::new()
+        .rule(
+            RmsNormKernelVariant::Vec4,
+            ShapeRule::new()
+                .axis(RMS_COLS, multiple_of(4))
+                .when_ctx(|ctx: &RmsNormSelectionCtx| ctx.vec4_supported),
+        )
+        .rule(RmsNormKernelVariant::Tile, ShapeRule::new())
+}
+
+fn select_rms_norm_variant(
+    rows: u32,
+    cols: u32,
+    ctx: &RmsNormSelectionCtx,
+    caps: KernelDeviceCaps,
+) -> RmsNormKernelVariant {
+    rms_norm_selector()
+        .select(KernelShape::new([rows as usize, cols as usize]), ctx, caps)
+        .expect("rms norm selector has a catch-all rule")
 }
 
 #[derive(Clone, Debug)]
@@ -266,11 +298,15 @@ impl Operation for RmsNormOperation {
                 )
             })
             .flatten();
-        let variant = if vec4_meta.is_some() {
-            RmsNormKernelVariant::Vec4
-        } else {
-            RmsNormKernelVariant::Tile
+        let selection_ctx = RmsNormSelectionCtx {
+            vec4_supported: vec4_meta.is_some(),
         };
+        let variant = select_rms_norm_variant(
+            rows,
+            cols,
+            &selection_ctx,
+            KernelDeviceCaps::from_device(&graph.device()),
+        );
         let dispatch_size = [rows, 1, 1];
         let module_key = rms_norm_module_key(
             variant,
@@ -620,7 +656,48 @@ fn vector_as_row_layout(layout: &crate::Layout) -> Option<tile_ir::Layout> {
 
 #[cfg(test)]
 mod tests {
-    use crate::{Device, Tensor};
+    use super::*;
+    use crate::{Device, Tensor, kernel_selection::DeterministicShapeRng};
+
+    fn caps() -> KernelDeviceCaps {
+        KernelDeviceCaps {
+            subgroups_supported: true,
+            cooperative_matrix_supported: false,
+            min_subgroup_size: 32,
+            max_subgroup_size: 32,
+            max_compute_invocations_per_workgroup: 1024,
+            max_compute_workgroup_storage_size: 64 * 1024,
+            max_compute_workgroup_size_x: 1024,
+            max_compute_workgroups_per_dimension: 65_535,
+        }
+    }
+
+    #[test]
+    fn rms_norm_selector_generates_each_variant() {
+        let selector = rms_norm_selector();
+        let cases = [
+            (
+                RmsNormKernelVariant::Vec4,
+                RmsNormSelectionCtx {
+                    vec4_supported: true,
+                },
+            ),
+            (
+                RmsNormKernelVariant::Tile,
+                RmsNormSelectionCtx {
+                    vec4_supported: false,
+                },
+            ),
+        ];
+        let mut rng = DeterministicShapeRng::default();
+
+        for (variant, ctx) in cases {
+            let shape = selector
+                .generate_for(variant, &ctx, caps(), &mut rng)
+                .expect("variant should generate");
+            assert_eq!(selector.select(shape, &ctx, caps()), Some(variant));
+        }
+    }
 
     #[tokio::test]
     async fn rms_norm_direct_matches_reference() {
