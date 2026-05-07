@@ -26,7 +26,6 @@ enum DirectKernelBindings {
 #[derive(Debug)]
 enum DirectKernelSource {
     Naga(Arc<wgpu::naga::Module>),
-    Wgsl(Arc<str>),
 }
 
 #[derive(Debug)]
@@ -46,24 +45,7 @@ pub(crate) struct PreparedDirectDispatch {
 }
 
 impl DirectKernel {
-    pub(crate) fn new_with_cache_key(
-        name: impl Into<String>,
-        cache_key: impl Into<String>,
-        module: wgpu::naga::Module,
-        bindings: Vec<DirectKernelBinding>,
-        dispatch_size: [u32; 3],
-    ) -> Self {
-        Self {
-            name: name.into(),
-            cache_key: cache_key.into(),
-            source: Some(DirectKernelSource::Naga(Arc::new(module))),
-            prepared_pipeline: None,
-            bindings: DirectKernelBindings::Dynamic(bindings),
-            dispatch_size,
-        }
-    }
-
-    pub(crate) fn new_with_arc_module(
+    pub(super) fn new_with_arc_module(
         name: impl Into<String>,
         cache_key: impl Into<String>,
         module: Arc<wgpu::naga::Module>,
@@ -80,24 +62,7 @@ impl DirectKernel {
         }
     }
 
-    pub(crate) fn new_wgsl_with_cache_key(
-        name: impl Into<String>,
-        cache_key: impl Into<String>,
-        source: impl Into<Arc<str>>,
-        bindings: Vec<DirectKernelBinding>,
-        dispatch_size: [u32; 3],
-    ) -> Self {
-        Self {
-            name: name.into(),
-            cache_key: cache_key.into(),
-            source: Some(DirectKernelSource::Wgsl(source.into())),
-            prepared_pipeline: None,
-            bindings: DirectKernelBindings::Dynamic(bindings),
-            dispatch_size,
-        }
-    }
-
-    pub(crate) fn new_storage3_with_prepared_pipeline(
+    pub(super) fn new_storage3_with_prepared_pipeline(
         name: impl Into<String>,
         cache_key: impl Into<String>,
         pipeline: wgpu::ComputePipeline,
@@ -285,22 +250,15 @@ impl DirectKernel {
                 .source
                 .as_ref()
                 .expect("direct kernel without a prepared pipeline needs a shader source");
-            let module =
-                device
-                    .shader_module_cache()
-                    .write()
-                    .get_or_insert_ref(&self.cache_key, || match source {
-                        DirectKernelSource::Naga(module_ir) => {
-                            device.create_naga_shader_module(module_ir.as_ref().clone())
-                        }
-                        DirectKernelSource::Wgsl(source) => device
-                            .wgpu_device()
-                            .create_shader_module(wgpu::ShaderModuleDescriptor {
-                                label: Some("Fusor ML WGSL Shader Module"),
-                                source: wgpu::ShaderSource::Wgsl(source.to_string().into()),
-                            }),
-                    })
-                    .clone();
+            let module = device
+                .shader_module_cache()
+                .write()
+                .get_or_insert_ref(&self.cache_key, || match source {
+                    DirectKernelSource::Naga(module_ir) => {
+                        device.create_naga_shader_module(module_ir.as_ref().clone())
+                    }
+                })
+                .clone();
             device
                 .compute_pipeline_cache()
                 .write()

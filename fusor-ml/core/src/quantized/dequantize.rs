@@ -8,6 +8,7 @@ use crate::{
     TensorInfo,
     mir::{
         direct_kernel::{DirectKernel, DirectKernelBinding},
+        kernel_backend,
         workgroup_shape::{Constraint, WorkgroupShapeConstraints},
     },
     nary_wise::UnaryFunctionChain,
@@ -140,28 +141,17 @@ impl Operation for DequantizeOperation {
             self.name(),
             self.matrix.shape
         );
-        let module =
-            if let Some(module) = graph.device().naga_module_cache().write().get(&cache_key) {
-                module.clone()
-            } else {
-                let ir = tile_ir::tile::build(move |phase| {
+        kernel_backend::dynamic_kernel_from_ir(
+            &graph.device(),
+            self.name(),
+            cache_key,
+            || {
+                Some(tile_ir::tile::build(move |phase| {
                     let q = phase.quantized_matrix(format, k, n);
                     let y = phase.storage_write::<tile_ir::F32, 1>(tile_ir::Shape::new([total]));
                     phase.qdequantize(&q, &y, dispatch_x);
-                });
-                let module = ir.lower_to_naga().ok()?.module().clone();
-                graph
-                    .device()
-                    .naga_module_cache()
-                    .write()
-                    .get_or_insert(cache_key.clone(), || module.clone())
-                    .clone()
-            };
-
-        Some(DirectKernel::new_with_cache_key(
-            self.name(),
-            cache_key,
-            module,
+                }))
+            },
             vec![
                 DirectKernelBinding::Storage {
                     binding: 0,
@@ -175,7 +165,7 @@ impl Operation for DequantizeOperation {
                 },
             ],
             [dispatch_x, dispatch_y, 1],
-        ))
+        )
     }
 
     fn requires_single_kernel_batch(&self) -> bool {

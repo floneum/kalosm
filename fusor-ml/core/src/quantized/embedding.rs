@@ -7,6 +7,7 @@ use crate::{
     mir::{
         direct_kernel::{DirectKernel, DirectKernelBinding},
         inputs::MirValue,
+        kernel_backend,
         operation::Operation,
         workgroup_shape::{Constraint, WorkgroupShape, WorkgroupShapeConstraints},
     },
@@ -171,11 +172,12 @@ impl Operation for QEmbeddingOperation {
             indexes.layout(),
             output.layout()
         );
-        let module =
-            if let Some(module) = graph.device().naga_module_cache().write().get(&cache_key) {
-                module.clone()
-            } else {
-                let ir = tile_ir::tile::build(move |phase| {
+        kernel_backend::dynamic_kernel_from_ir(
+            &graph.device(),
+            self.name(),
+            cache_key,
+            || {
+                Some(tile_ir::tile::build(move |phase| {
                     let q = phase.quantized_matrix(format, embedding_dim, num_embeddings);
                     let indexes = phase.storage_read_element_with_layout_offset::<2>(
                         tile_ir::ElementType::U32,
@@ -203,20 +205,8 @@ impl Operation for QEmbeddingOperation {
                             program.load_quantized(&q, dim.clone(), token, in_bounds.clone(), 0.0);
                         program.store(y.at(index_pos, dim), value, in_bounds);
                     });
-                });
-                let module = ir.lower_to_naga().ok()?.module().clone();
-                graph
-                    .device()
-                    .naga_module_cache()
-                    .write()
-                    .get_or_insert(cache_key.clone(), || module.clone())
-                    .clone()
-            };
-
-        Some(DirectKernel::new_with_cache_key(
-            self.name(),
-            cache_key,
-            module,
+                }))
+            },
             vec![
                 DirectKernelBinding::Storage {
                     binding: 0,
@@ -235,7 +225,7 @@ impl Operation for QEmbeddingOperation {
                 },
             ],
             dispatch_size,
-        ))
+        )
     }
 
     fn requires_single_kernel_batch(&self) -> bool {

@@ -6,6 +6,7 @@ use crate::{
     compute_graph::NodeIndex,
     mir::{
         direct_kernel::{DirectKernel, DirectKernelBinding},
+        kernel_backend,
         tile_direct::{
             flatten_matrix_layout, tile_storage_read_with_direct_layout,
             tile_storage_write_with_direct_layout,
@@ -180,20 +181,11 @@ impl MatMulOperation {
             output.layout()
         );
 
-        let module = if let Some(module) = device.naga_module_cache().write().get(&cache_key) {
-            module.clone()
-        } else {
-            let module = ir.lower_to_naga().ok()?.module().clone();
-            device
-                .naga_module_cache()
-                .write()
-                .get_or_insert(cache_key.clone(), || module.clone())
-                .clone()
-        };
-        Some(DirectKernel::new_with_cache_key(
+        kernel_backend::dynamic_kernel_from_ir(
+            device,
             self.name(),
             cache_key,
-            module,
+            || Some(ir),
             vec![
                 DirectKernelBinding::Storage {
                     binding: 0,
@@ -212,7 +204,7 @@ impl MatMulOperation {
                 },
             ],
             dispatch_size,
-        ))
+        )
     }
 }
 

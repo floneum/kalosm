@@ -5,6 +5,7 @@ use crate::{
     mir::{
         direct_kernel::DirectKernel,
         inputs::MirValue,
+        kernel_backend,
         operation::Operation,
         tile_direct::{
             flatten_matrix_layout, tile_storage_read_with_direct_layout,
@@ -104,23 +105,238 @@ impl QMatMulOperation {
         self.matrix.shape[0] as u32
     }
 
-    fn direct_quant_format(&self) -> Option<tile_ir::GgmlQuantFormat> {
-        Some(match self.matrix.datatype {
-            GgmlType::Q4_0 => tile_ir::GgmlQuantFormat::Q4_0,
-            GgmlType::Q4_1 => tile_ir::GgmlQuantFormat::Q4_1,
-            GgmlType::Q5_0 => tile_ir::GgmlQuantFormat::Q5_0,
-            GgmlType::Q5_1 => tile_ir::GgmlQuantFormat::Q5_1,
-            GgmlType::Q8_0 => tile_ir::GgmlQuantFormat::Q8_0,
-            GgmlType::Q8_1 => tile_ir::GgmlQuantFormat::Q8_1,
-            GgmlType::Q2K => tile_ir::GgmlQuantFormat::Q2K,
-            GgmlType::Q3K => tile_ir::GgmlQuantFormat::Q3K,
-            GgmlType::Q4K => tile_ir::GgmlQuantFormat::Q4K,
-            GgmlType::Q5K => tile_ir::GgmlQuantFormat::Q5K,
-            GgmlType::Q6K => tile_ir::GgmlQuantFormat::Q6K,
-            GgmlType::Q8K => tile_ir::GgmlQuantFormat::Q8K,
-            GgmlType::F16 | GgmlType::F32 => return None,
-        })
+    pub(crate) fn direct_kernel_for_tensors(
+        device: &Device,
+        input: &TensorData,
+        matrix: &QMatrix,
+        output: &TensorData,
+        kernel_name: impl Into<String>,
+    ) -> Option<DirectKernel> {
+        if input.datatype() != DataTypeEnum::F32 || output.datatype() != DataTypeEnum::F32 {
+            return None;
+        }
+        if matrix.datatype() == GgmlType::F32 {
+            return None;
+        }
+        let input_rank = input.layout().shape().len();
+        if input_rank != output.layout().shape().len() {
+            return None;
+        }
+
+        let format = qmatrix_direct_quant_format(matrix)?;
+        let a_view = flatten_matrix_layout(input.layout())?;
+        let y_view = flatten_matrix_layout(output.layout())?;
+        let m = a_view.rows;
+        let k = a_view.cols;
+        let y_m = y_view.rows;
+        let n = y_view.cols;
+        if m != y_m || k != matrix.shape[1] as u32 || n != matrix.shape[0] as u32 {
+            return None;
+        }
+
+        let limits = device.limits();
+        let max_workgroups = limits.max_compute_workgroups_per_dimension;
+        let mut qmatmul_workgroups_x = 1;
+        if m == 1 {
+            let qgemv_cols_per_workgroup = qgemv_cols_per_workgroup_for_direct(format, k, n);
+            let qgemv_workgroups = n.div_ceil(qgemv_cols_per_workgroup);
+            let [dispatch_x, _] = split_workgroups_2d(qgemv_workgroups, max_workgroups)?;
+            qmatmul_workgroups_x = dispatch_x;
+        }
+        let y_supports_coop = tile_cooperative_store_layout_supported(&y_view.layout);
+        let use_wide_q8_tile = format == tile_ir::GgmlQuantFormat::Q8_0
+            && m.is_multiple_of(64)
+            && n.is_multiple_of(128)
+            && n >= 8192
+            && k <= 1024
+            && limits.max_compute_invocations_per_workgroup >= 512
+            && limits.max_compute_workgroup_storage_size >= 32 * 1024;
+        // Larger qmatmul tile shapes for high-arithmetic-intensity GEMM. Each
+        // workgroup amortizes more arithmetic per dispatch + threadgroup-tile
+        // load, so bigger tiles win when the output dimensions allow.
+        let coop_eligible = y_supports_coop && k.is_multiple_of(32) && m > 1;
+        let use_128x128_tile = coop_eligible
+            && m.is_multiple_of(128)
+            && n.is_multiple_of(128)
+            && limits.max_compute_invocations_per_workgroup >= 512
+            && limits.max_compute_workgroup_storage_size >= 32 * 1024;
+        let use_128x64_tile =
+            coop_eligible && m.is_multiple_of(128) && n.is_multiple_of(64) && !use_128x128_tile;
+        let use_64x128_tile = coop_eligible
+            && m.is_multiple_of(64)
+            && n.is_multiple_of(128)
+            && !use_128x128_tile
+            && !use_128x64_tile;
+        let fast_dispatch_size = if m == 1 {
+            let qgemv_cols_per_workgroup = qgemv_cols_per_workgroup_for_direct(format, k, n);
+            let qgemv_workgroups = n.div_ceil(qgemv_cols_per_workgroup);
+            Some([
+                qmatmul_workgroups_x,
+                qgemv_workgroups.div_ceil(qmatmul_workgroups_x),
+                1,
+            ])
+        } else if use_wide_q8_tile {
+            Some([n / 128, m / 64, 1])
+        } else if use_128x128_tile {
+            Some([n / 128, m / 128, 1])
+        } else if use_128x64_tile {
+            Some([n / 64, m / 128, 1])
+        } else if use_64x128_tile {
+            Some([n / 128, m / 64, 1])
+        } else if coop_eligible && m.is_multiple_of(64) && n.is_multiple_of(64) {
+            Some([n / 64, m / 64, 1])
+        } else {
+            None
+        };
+        let kernel_name = kernel_name.into();
+        if let Some(dispatch_size) = fast_dispatch_size {
+            if dispatch_size.iter().any(|dim| *dim > max_workgroups) {
+                return None;
+            }
+            let pipeline_key = QMatMulDirectPipelineKey::new(
+                matrix.datatype(),
+                m,
+                k,
+                n,
+                dispatch_size,
+                input.layout(),
+                output.layout(),
+            );
+            if let Some(pipeline) = matrix
+                .direct_pipeline_cache()
+                .write()
+                .get(&pipeline_key)
+                .cloned()
+            {
+                return Some(kernel_backend::storage3_kernel_with_prepared_pipeline(
+                    kernel_name.clone(),
+                    "",
+                    pipeline,
+                    input.buffer().clone(),
+                    matrix.buffer().clone(),
+                    output.buffer().clone(),
+                    dispatch_size,
+                ));
+            }
+            let cache_key = format!(
+                "{kernel_name}:direct:{format:?}:m={m}:k={k}:n={n}:dispatch={dispatch_size:?}:{:?}:{:?}",
+                input.layout(),
+                output.layout()
+            );
+            if let Some(pipeline) = kernel_backend::storage3_pipeline_from_cached_module(
+                device,
+                &kernel_name,
+                &cache_key,
+            ) {
+                matrix
+                    .direct_pipeline_cache()
+                    .write()
+                    .get_or_insert(pipeline_key, || pipeline.clone());
+                return Some(kernel_backend::storage3_kernel_with_prepared_pipeline(
+                    kernel_name.clone(),
+                    cache_key,
+                    pipeline,
+                    input.buffer().clone(),
+                    matrix.buffer().clone(),
+                    output.buffer().clone(),
+                    dispatch_size,
+                ));
+            }
+        }
+        let ir = tile_ir::tile::build(move |phase| {
+            let a = tile_storage_read_with_direct_layout(phase, a_view);
+            let b = phase.quantized_matrix(format, k, n);
+            let y = tile_storage_write_with_direct_layout(phase, y_view);
+            if m == 1 && format == tile_ir::GgmlQuantFormat::Q5_0 && k <= 1024 && n <= 4096 {
+                phase.qgemv::<8, 32>(&a, &b, &y, 4, qmatmul_workgroups_x);
+            } else if m == 1 {
+                phase.qgemv::<4, 64>(&a, &b, &y, 4, qmatmul_workgroups_x);
+            } else if use_wide_q8_tile {
+                phase.qmatmul::<64, 128, 32>(&a, &b, &y, 4);
+            } else if use_128x128_tile {
+                phase.qmatmul::<128, 128, 32>(&a, &b, &y, 4);
+            } else if use_128x64_tile {
+                phase.qmatmul::<128, 64, 32>(&a, &b, &y, 4);
+            } else if use_64x128_tile {
+                phase.qmatmul::<64, 128, 32>(&a, &b, &y, 4);
+            } else {
+                phase.qmatmul::<64, 64, 32>(&a, &b, &y, 4);
+            }
+        });
+        let dispatch_size = ir.single_tile_program_grid()?;
+        if dispatch_size.iter().any(|dim| *dim > max_workgroups) {
+            return None;
+        }
+        let pipeline_key = QMatMulDirectPipelineKey::new(
+            matrix.datatype(),
+            m,
+            k,
+            n,
+            dispatch_size,
+            input.layout(),
+            output.layout(),
+        );
+        if let Some(pipeline) = matrix
+            .direct_pipeline_cache()
+            .write()
+            .get(&pipeline_key)
+            .cloned()
+        {
+            return Some(kernel_backend::storage3_kernel_with_prepared_pipeline(
+                kernel_name.clone(),
+                "",
+                pipeline,
+                input.buffer().clone(),
+                matrix.buffer().clone(),
+                output.buffer().clone(),
+                dispatch_size,
+            ));
+        }
+        let cache_key = format!(
+            "{kernel_name}:direct:{format:?}:m={m}:k={k}:n={n}:dispatch={dispatch_size:?}:{:?}:{:?}",
+            input.layout(),
+            output.layout()
+        );
+        let pipeline = kernel_backend::storage3_pipeline_from_ir(
+            device,
+            &kernel_name,
+            cache_key.clone(),
+            || Some(ir),
+        )?;
+        let pipeline = matrix
+            .direct_pipeline_cache()
+            .write()
+            .get_or_insert(pipeline_key, || pipeline.clone())
+            .clone();
+
+        Some(kernel_backend::storage3_kernel_with_prepared_pipeline(
+            kernel_name,
+            cache_key,
+            pipeline,
+            input.buffer().clone(),
+            matrix.buffer().clone(),
+            output.buffer().clone(),
+            dispatch_size,
+        ))
     }
+}
+
+fn qmatrix_direct_quant_format(matrix: &QMatrix) -> Option<tile_ir::GgmlQuantFormat> {
+    Some(match matrix.datatype() {
+        GgmlType::Q4_0 => tile_ir::GgmlQuantFormat::Q4_0,
+        GgmlType::Q4_1 => tile_ir::GgmlQuantFormat::Q4_1,
+        GgmlType::Q5_0 => tile_ir::GgmlQuantFormat::Q5_0,
+        GgmlType::Q5_1 => tile_ir::GgmlQuantFormat::Q5_1,
+        GgmlType::Q8_0 => tile_ir::GgmlQuantFormat::Q8_0,
+        GgmlType::Q8_1 => tile_ir::GgmlQuantFormat::Q8_1,
+        GgmlType::Q2K => tile_ir::GgmlQuantFormat::Q2K,
+        GgmlType::Q3K => tile_ir::GgmlQuantFormat::Q3K,
+        GgmlType::Q4K => tile_ir::GgmlQuantFormat::Q4K,
+        GgmlType::Q5K => tile_ir::GgmlQuantFormat::Q5K,
+        GgmlType::Q6K => tile_ir::GgmlQuantFormat::Q6K,
+        GgmlType::Q8K => tile_ir::GgmlQuantFormat::Q8K,
+        GgmlType::F16 | GgmlType::F32 => return None,
+    })
 }
 
 fn ceil_div_u32(x: u32, divisor: u32) -> u32 {
@@ -275,213 +491,7 @@ impl Operation for QMatMulOperation {
         if matrix.datatype() == GgmlType::F32 {
             return self.build_dense_direct_kernel(graph, input, matrix, output);
         }
-        let input_rank = input.layout().shape().len();
-        if input_rank != output.layout().shape().len() {
-            return None;
-        }
-
-        let format = self.direct_quant_format()?;
-        let a_view = flatten_matrix_layout(input.layout())?;
-        let y_view = flatten_matrix_layout(output.layout())?;
-        let m = a_view.rows;
-        let k = a_view.cols;
-        let y_m = y_view.rows;
-        let n = y_view.cols;
-        if m != y_m || k != self.matrix.shape[1] as u32 || n != self.matrix.shape[0] as u32 {
-            return None;
-        }
-
-        let limits = graph.device().limits();
-        let max_workgroups = limits.max_compute_workgroups_per_dimension;
-        let mut qmatmul_workgroups_x = 1;
-        if m == 1 {
-            let qgemv_cols_per_workgroup = qgemv_cols_per_workgroup_for_direct(format, k, n);
-            let qgemv_workgroups = n.div_ceil(qgemv_cols_per_workgroup);
-            let [dispatch_x, _] = split_workgroups_2d(qgemv_workgroups, max_workgroups)?;
-            qmatmul_workgroups_x = dispatch_x;
-        }
-        let y_supports_coop = tile_cooperative_store_layout_supported(&y_view.layout);
-        let use_wide_q8_tile = format == tile_ir::GgmlQuantFormat::Q8_0
-            && m.is_multiple_of(64)
-            && n.is_multiple_of(128)
-            && n >= 8192
-            && k <= 1024
-            && limits.max_compute_invocations_per_workgroup >= 512
-            && limits.max_compute_workgroup_storage_size >= 32 * 1024;
-        // Larger qmatmul tile shapes for high-arithmetic-intensity GEMM. Each
-        // workgroup amortizes more arithmetic per dispatch + threadgroup-tile
-        // load, so bigger tiles win when the output dimensions allow.
-        let coop_eligible = y_supports_coop && k.is_multiple_of(32) && m > 1;
-        let use_128x128_tile = coop_eligible
-            && m.is_multiple_of(128)
-            && n.is_multiple_of(128)
-            && limits.max_compute_invocations_per_workgroup >= 512
-            && limits.max_compute_workgroup_storage_size >= 32 * 1024;
-        let use_128x64_tile =
-            coop_eligible && m.is_multiple_of(128) && n.is_multiple_of(64) && !use_128x128_tile;
-        let use_64x128_tile = coop_eligible
-            && m.is_multiple_of(64)
-            && n.is_multiple_of(128)
-            && !use_128x128_tile
-            && !use_128x64_tile;
-        let fast_dispatch_size = if m == 1 {
-            let qgemv_cols_per_workgroup = qgemv_cols_per_workgroup_for_direct(format, k, n);
-            let qgemv_workgroups = n.div_ceil(qgemv_cols_per_workgroup);
-            Some([
-                qmatmul_workgroups_x,
-                qgemv_workgroups.div_ceil(qmatmul_workgroups_x),
-                1,
-            ])
-        } else if use_wide_q8_tile {
-            Some([n / 128, m / 64, 1])
-        } else if use_128x128_tile {
-            Some([n / 128, m / 128, 1])
-        } else if use_128x64_tile {
-            Some([n / 64, m / 128, 1])
-        } else if use_64x128_tile {
-            Some([n / 128, m / 64, 1])
-        } else if coop_eligible && m.is_multiple_of(64) && n.is_multiple_of(64) {
-            Some([n / 64, m / 64, 1])
-        } else {
-            None
-        };
-        if let Some(dispatch_size) = fast_dispatch_size {
-            if dispatch_size.iter().any(|dim| *dim > max_workgroups) {
-                return None;
-            }
-            let pipeline_key = QMatMulDirectPipelineKey::new(
-                matrix.datatype(),
-                m,
-                k,
-                n,
-                dispatch_size,
-                input.layout(),
-                output.layout(),
-            );
-            if let Some(pipeline) = matrix
-                .direct_pipeline_cache()
-                .write()
-                .get(&pipeline_key)
-                .cloned()
-            {
-                return Some(DirectKernel::new_storage3_with_prepared_pipeline(
-                    "q_mat_mul",
-                    "",
-                    pipeline,
-                    input.buffer().clone(),
-                    matrix.buffer().clone(),
-                    output.buffer().clone(),
-                    dispatch_size,
-                ));
-            }
-            let kernel_name = self.name();
-            let cache_key = format!(
-                "{kernel_name}:direct:{format:?}:m={m}:k={k}:n={n}:dispatch={dispatch_size:?}:{:?}:{:?}",
-                input.layout(),
-                output.layout()
-            );
-            if let Some(module) = graph.device().naga_module_cache().write().get(&cache_key) {
-                let pipeline =
-                    Self::prepare_direct_pipeline(&graph.device(), &kernel_name, module.clone());
-                matrix
-                    .direct_pipeline_cache()
-                    .write()
-                    .get_or_insert(pipeline_key, || pipeline.clone());
-                return Some(DirectKernel::new_storage3_with_prepared_pipeline(
-                    kernel_name,
-                    cache_key,
-                    pipeline,
-                    input.buffer().clone(),
-                    matrix.buffer().clone(),
-                    output.buffer().clone(),
-                    dispatch_size,
-                ));
-            }
-        }
-        let ir = tile_ir::tile::build(move |phase| {
-            let a = tile_storage_read_with_direct_layout(phase, a_view);
-            let b = phase.quantized_matrix(format, k, n);
-            let y = tile_storage_write_with_direct_layout(phase, y_view);
-            if m == 1 && format == tile_ir::GgmlQuantFormat::Q5_0 && k <= 1024 && n <= 4096 {
-                phase.qgemv::<8, 32>(&a, &b, &y, 4, qmatmul_workgroups_x);
-            } else if m == 1 {
-                phase.qgemv::<4, 64>(&a, &b, &y, 4, qmatmul_workgroups_x);
-            } else if use_wide_q8_tile {
-                phase.qmatmul::<64, 128, 32>(&a, &b, &y, 4);
-            } else if use_128x128_tile {
-                phase.qmatmul::<128, 128, 32>(&a, &b, &y, 4);
-            } else if use_128x64_tile {
-                phase.qmatmul::<128, 64, 32>(&a, &b, &y, 4);
-            } else if use_64x128_tile {
-                phase.qmatmul::<64, 128, 32>(&a, &b, &y, 4);
-            } else {
-                phase.qmatmul::<64, 64, 32>(&a, &b, &y, 4);
-            }
-        });
-        let dispatch_size = ir.single_tile_program_grid()?;
-        if dispatch_size.iter().any(|dim| *dim > max_workgroups) {
-            return None;
-        }
-        let pipeline_key = QMatMulDirectPipelineKey::new(
-            matrix.datatype(),
-            m,
-            k,
-            n,
-            dispatch_size,
-            input.layout(),
-            output.layout(),
-        );
-        if let Some(pipeline) = matrix
-            .direct_pipeline_cache()
-            .write()
-            .get(&pipeline_key)
-            .cloned()
-        {
-            return Some(DirectKernel::new_storage3_with_prepared_pipeline(
-                "q_mat_mul",
-                "",
-                pipeline,
-                input.buffer().clone(),
-                matrix.buffer().clone(),
-                output.buffer().clone(),
-                dispatch_size,
-            ));
-        }
-        let kernel_name = self.name();
-        let cache_key = format!(
-            "{kernel_name}:direct:{format:?}:m={m}:k={k}:n={n}:dispatch={dispatch_size:?}:{:?}:{:?}",
-            input.layout(),
-            output.layout()
-        );
-        let module =
-            if let Some(module) = graph.device().naga_module_cache().write().get(&cache_key) {
-                module.clone()
-            } else {
-                let module = ir.lower_to_naga().ok()?.module().clone();
-                graph
-                    .device()
-                    .naga_module_cache()
-                    .write()
-                    .get_or_insert(cache_key.clone(), || module.clone())
-                    .clone()
-            };
-        let pipeline = matrix
-            .direct_pipeline_cache()
-            .write()
-            .get_or_insert(pipeline_key, || {
-                Self::prepare_direct_pipeline(&graph.device(), &kernel_name, module)
-            })
-            .clone();
-
-        Some(DirectKernel::new_storage3_with_prepared_pipeline(
-            kernel_name,
-            cache_key,
-            pipeline,
-            input.buffer().clone(),
-            matrix.buffer().clone(),
-            output.buffer().clone(),
-            dispatch_size,
-        ))
+        Self::direct_kernel_for_tensors(&graph.device(), input, matrix, output, self.name())
     }
 
     fn requires_single_kernel_batch(&self) -> bool {
@@ -615,7 +625,7 @@ impl Operation for QMatMulSwiGluOperation {
             .get(&pipeline_key)
             .cloned()
         {
-            return Some(DirectKernel::new_storage3_with_prepared_pipeline(
+            return Some(kernel_backend::storage3_kernel_with_prepared_pipeline(
                 "q_mat_swiglu",
                 "",
                 pipeline,
@@ -631,11 +641,12 @@ impl Operation for QMatMulSwiGluOperation {
             input.layout(),
             output.layout()
         );
-        let module =
-            if let Some(module) = graph.device().naga_module_cache().write().get(&cache_key) {
-                module.clone()
-            } else {
-                let ir = tile_ir::tile::build(move |phase| {
+        let pipeline = kernel_backend::storage3_pipeline_from_ir(
+            &graph.device(),
+            &kernel_name,
+            cache_key.clone(),
+            || {
+                Some(tile_ir::tile::build(move |phase| {
                     let a = tile_storage_read_with_direct_layout(phase, a_view);
                     let b = phase.quantized_matrix(format, k, pair_len * 2);
                     let y = tile_storage_write_with_direct_layout(phase, y_view);
@@ -649,24 +660,16 @@ impl Operation for QMatMulSwiGluOperation {
                         "4x2" => phase.qgemv_q4k_swiglu_4x2(&a, &b, &y, pair_len, workgroups_x),
                         _ => unreachable!(),
                     }
-                });
-                let module = ir.lower_to_naga().ok()?.module().clone();
-                graph
-                    .device()
-                    .naga_module_cache()
-                    .write()
-                    .get_or_insert(cache_key.clone(), || module.clone())
-                    .clone()
-            };
+                }))
+            },
+        )?;
         let pipeline = matrix
             .direct_pipeline_cache()
             .write()
-            .get_or_insert(pipeline_key, || {
-                QMatMulOperation::prepare_direct_pipeline(&graph.device(), &kernel_name, module)
-            })
+            .get_or_insert(pipeline_key, || pipeline.clone())
             .clone();
 
-        Some(DirectKernel::new_storage3_with_prepared_pipeline(
+        Some(kernel_backend::storage3_kernel_with_prepared_pipeline(
             kernel_name,
             cache_key,
             pipeline,
@@ -707,28 +710,6 @@ impl Operation for QMatMulSwiGluOperation {
 }
 
 impl QMatMulOperation {
-    fn prepare_direct_pipeline(
-        device: &Device,
-        name: &str,
-        module: wgpu::naga::Module,
-    ) -> wgpu::ComputePipeline {
-        let shader = device.create_naga_shader_module(module);
-        let pipeline_layout = device.direct_storage3_pipeline_layout();
-        device
-            .wgpu_device()
-            .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-                label: Some(name),
-                layout: Some(&pipeline_layout),
-                module: &shader,
-                entry_point: Some("main"),
-                cache: device.wgpu_cache(),
-                compilation_options: wgpu::PipelineCompilationOptions {
-                    zero_initialize_workgroup_memory: false,
-                    ..Default::default()
-                },
-            })
-    }
-
     fn build_dense_direct_kernel(
         &self,
         graph: &crate::compute_graph::ComputeGraphInner,

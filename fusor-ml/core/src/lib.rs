@@ -43,6 +43,7 @@ mod reduce_direct;
 mod rms_norm;
 pub(crate) use rms_norm::RmsNormOperation;
 mod resize;
+mod sampling;
 mod slice_assign;
 mod tensor;
 mod top_k;

@@ -5,6 +5,7 @@ use crate::{
     mir::{
         direct_kernel::{DirectKernel, DirectKernelBinding},
         inputs::MirValue,
+        kernel_backend,
         operation::Operation,
         workgroup_shape::WorkgroupShape,
     },
@@ -60,23 +61,11 @@ pub(crate) fn build_serial_matmul_direct_kernel(
         output.datatype(),
         output.layout()
     );
-    let module = if let Some(module) = graph.device().naga_module_cache().write().get(&cache_key) {
-        module.clone()
-    } else {
-        let ir = build_matmul_tile_ir(operation, &input_a, &input_b, &output, dispatch_size)?;
-        let module = ir.lower_to_naga().ok()?.module().clone();
-        graph
-            .device()
-            .naga_module_cache()
-            .write()
-            .get_or_insert(cache_key.clone(), || module.clone())
-            .clone()
-    };
-
-    Some(DirectKernel::new_with_cache_key(
+    kernel_backend::dynamic_kernel_from_ir(
+        &graph.device(),
         operation.name(),
         cache_key,
-        module,
+        || build_matmul_tile_ir(operation, &input_a, &input_b, &output, dispatch_size),
         vec![
             DirectKernelBinding::Storage {
                 binding: 0,
@@ -95,7 +84,7 @@ pub(crate) fn build_serial_matmul_direct_kernel(
             },
         ],
         dispatch_size,
-    ))
+    )
 }
 
 fn build_matmul_tile_ir(

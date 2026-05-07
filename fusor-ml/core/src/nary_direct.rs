@@ -1,7 +1,7 @@
 use std::{
     hash::{Hash, Hasher},
     num::NonZeroUsize,
-    sync::{Arc, OnceLock},
+    sync::OnceLock,
 };
 
 use lru::LruCache;
@@ -13,6 +13,7 @@ use crate::{
     mir::{
         direct_kernel::{DirectKernel, DirectKernelBinding},
         inputs::MirValue,
+        kernel_backend::{self, CompiledKernelModule},
         operation::Operation,
         workgroup_shape::WorkgroupShape,
     },
@@ -89,9 +90,9 @@ impl NaryDirectModuleKey {
 }
 
 fn nary_direct_module_cache()
--> &'static RwLock<LruCache<NaryDirectModuleKey, Arc<wgpu::naga::Module>, FxBuildHasher>> {
+-> &'static RwLock<LruCache<NaryDirectModuleKey, CompiledKernelModule, FxBuildHasher>> {
     static CACHE: OnceLock<
-        RwLock<LruCache<NaryDirectModuleKey, Arc<wgpu::naga::Module>, FxBuildHasher>>,
+        RwLock<LruCache<NaryDirectModuleKey, CompiledKernelModule, FxBuildHasher>>,
     > = OnceLock::new();
     CACHE.get_or_init(|| {
         RwLock::new(LruCache::with_hasher(
@@ -170,23 +171,9 @@ fn build_nary_direct_kernel_with_output_index(
                 .collect::<Vec<_>>()
                 .join("|")
         );
-        let module = if let Some(module) = graph
-            .device()
-            .naga_module_cache()
-            .write()
-            .get(&verbose_cache_key)
-        {
-            Arc::new(module.clone())
-        } else {
-            let ir = build_nary_tile_ir(operation, &tensors, output_index, dispatch_size)?;
-            let module = ir.lower_to_naga().ok()?.module().clone();
-            let _ = graph
-                .device()
-                .naga_module_cache()
-                .write()
-                .get_or_insert(verbose_cache_key, || module.clone());
-            Arc::new(module)
-        };
+        let module = kernel_backend::cached_kernel_ir(&graph.device(), verbose_cache_key, || {
+            build_nary_tile_ir(operation, &tensors, output_index, dispatch_size)
+        })?;
         nary_direct_module_cache()
             .write()
             .get_or_insert(module_key, || module.clone())
@@ -209,7 +196,7 @@ fn build_nary_direct_kernel_with_output_index(
         cache_key.clone()
     };
 
-    Some(DirectKernel::new_with_arc_module(
+    Some(kernel_backend::dynamic_kernel_from_module(
         name,
         cache_key,
         module,
