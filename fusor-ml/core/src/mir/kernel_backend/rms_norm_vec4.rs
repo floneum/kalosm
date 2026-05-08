@@ -3,11 +3,12 @@ use std::num::NonZeroU32;
 use wgpu::naga::{
     AddressSpace, Arena, ArraySize, Barrier, BinaryOperator, Binding, Block, BuiltIn,
     CollectiveOperation, EntryPoint, Expression, Function, FunctionArgument, GlobalVariable,
-    Handle, Literal, LocalVariable, MathFunction, Module, Range, ResourceBinding, Scalar,
-    ShaderStage, Span, Statement, StorageAccess, SubgroupOperation, Type, TypeInner, VectorSize,
+    Handle, LocalVariable, MathFunction, Module, Scalar, ShaderStage, Span, Statement,
+    SubgroupOperation, Type, TypeInner, VectorSize,
 };
 
 use super::{RmsNormVec4Meta, VEC4_BLOCK, VEC4_SUBGROUP_WIDTH};
+use crate::mir::kernel_backend::naga_helpers::{NagaBuilderExt, local, storage_global};
 
 #[derive(Clone, Copy)]
 struct RmsNormVec4Globals {
@@ -99,25 +100,25 @@ impl RmsNormVec4NagaBuilder {
             Span::default(),
         );
 
-        let input = Self::storage_global(&mut module, 0, storage_ty, true);
+        let input = storage_global(&mut module, 0, storage_ty, true);
         let mut binding = 1;
         let residual = if self.has_residual {
-            let residual = Self::storage_global(&mut module, binding, storage_ty, true);
+            let residual = storage_global(&mut module, binding, storage_ty, true);
             binding += 1;
             Some(residual)
         } else {
             None
         };
-        let weight = Self::storage_global(&mut module, binding, storage_ty, true);
+        let weight = storage_global(&mut module, binding, storage_ty, true);
         binding += 1;
         let bias = if self.has_bias {
-            let bias = Self::storage_global(&mut module, binding, storage_ty, true);
+            let bias = storage_global(&mut module, binding, storage_ty, true);
             binding += 1;
             Some(bias)
         } else {
             None
         };
-        let output = Self::storage_global(&mut module, binding, storage_ty, false);
+        let output = storage_global(&mut module, binding, storage_ty, false);
         let scratch = module.global_variables.append(
             GlobalVariable {
                 name: None,
@@ -164,8 +165,8 @@ impl RmsNormVec4NagaBuilder {
             ..Function::default()
         };
         let locals = RmsNormVec4Locals {
-            col: Self::local(&mut function, u32_ty),
-            sum: Self::local(&mut function, f32_ty),
+            col: local(&mut function, u32_ty),
+            sum: local(&mut function, f32_ty),
         };
 
         function.body = self.entry_body(
@@ -543,207 +544,6 @@ impl RmsNormVec4NagaBuilder {
                 ty,
                 components: vec![value, value, value, value],
             },
-        )
-    }
-
-    fn load_storage(
-        &self,
-        expressions: &mut Arena<Expression>,
-        body: &mut Block,
-        global: Handle<GlobalVariable>,
-        index: Handle<Expression>,
-    ) -> Handle<Expression> {
-        let ptr = self.storage_ptr(expressions, body, global, index);
-        self.emit(expressions, body, Expression::Load { pointer: ptr })
-    }
-
-    fn store_storage(
-        &self,
-        expressions: &mut Arena<Expression>,
-        body: &mut Block,
-        global: Handle<GlobalVariable>,
-        index: Handle<Expression>,
-        value: Handle<Expression>,
-    ) {
-        let pointer = self.storage_ptr(expressions, body, global, index);
-        body.push(Statement::Store { pointer, value }, Span::default());
-    }
-
-    fn load_workgroup(
-        &self,
-        expressions: &mut Arena<Expression>,
-        body: &mut Block,
-        global: Handle<GlobalVariable>,
-        index: Handle<Expression>,
-    ) -> Handle<Expression> {
-        let ptr = self.workgroup_ptr(expressions, body, global, index);
-        self.emit(expressions, body, Expression::Load { pointer: ptr })
-    }
-
-    fn store_workgroup(
-        &self,
-        expressions: &mut Arena<Expression>,
-        body: &mut Block,
-        global: Handle<GlobalVariable>,
-        index: Handle<Expression>,
-        value: Handle<Expression>,
-    ) {
-        let pointer = self.workgroup_ptr(expressions, body, global, index);
-        body.push(Statement::Store { pointer, value }, Span::default());
-    }
-
-    fn storage_ptr(
-        &self,
-        expressions: &mut Arena<Expression>,
-        body: &mut Block,
-        global: Handle<GlobalVariable>,
-        index: Handle<Expression>,
-    ) -> Handle<Expression> {
-        let base = expressions.append(Expression::GlobalVariable(global), Span::default());
-        self.emit(expressions, body, Expression::Access { base, index })
-    }
-
-    fn workgroup_ptr(
-        &self,
-        expressions: &mut Arena<Expression>,
-        body: &mut Block,
-        global: Handle<GlobalVariable>,
-        index: Handle<Expression>,
-    ) -> Handle<Expression> {
-        let base = expressions.append(Expression::GlobalVariable(global), Span::default());
-        self.emit(expressions, body, Expression::Access { base, index })
-    }
-
-    fn load_local(
-        &self,
-        expressions: &mut Arena<Expression>,
-        body: &mut Block,
-        local: Handle<LocalVariable>,
-    ) -> Handle<Expression> {
-        let pointer = expressions.append(Expression::LocalVariable(local), Span::default());
-        self.emit(expressions, body, Expression::Load { pointer })
-    }
-
-    fn store_local(
-        &self,
-        expressions: &mut Arena<Expression>,
-        body: &mut Block,
-        local: Handle<LocalVariable>,
-        value: Handle<Expression>,
-    ) {
-        let pointer = expressions.append(Expression::LocalVariable(local), Span::default());
-        body.push(Statement::Store { pointer, value }, Span::default());
-    }
-
-    fn eq_lit(
-        &self,
-        expressions: &mut Arena<Expression>,
-        body: &mut Block,
-        value: Handle<Expression>,
-        literal: u32,
-    ) -> Handle<Expression> {
-        let rhs = self.u32_lit(expressions, literal);
-        self.bin(expressions, body, BinaryOperator::Equal, value, rhs)
-    }
-
-    fn ge_lit(
-        &self,
-        expressions: &mut Arena<Expression>,
-        body: &mut Block,
-        value: Handle<Expression>,
-        literal: u32,
-    ) -> Handle<Expression> {
-        let rhs = self.u32_lit(expressions, literal);
-        self.bin(expressions, body, BinaryOperator::GreaterEqual, value, rhs)
-    }
-
-    fn add_lit(
-        &self,
-        expressions: &mut Arena<Expression>,
-        body: &mut Block,
-        value: Handle<Expression>,
-        literal: u32,
-    ) -> Handle<Expression> {
-        let rhs = self.u32_lit(expressions, literal);
-        self.bin(expressions, body, BinaryOperator::Add, value, rhs)
-    }
-
-    fn mul_lit(
-        &self,
-        expressions: &mut Arena<Expression>,
-        body: &mut Block,
-        value: Handle<Expression>,
-        literal: u32,
-    ) -> Handle<Expression> {
-        let rhs = self.u32_lit(expressions, literal);
-        self.bin(expressions, body, BinaryOperator::Multiply, value, rhs)
-    }
-
-    fn bin(
-        &self,
-        expressions: &mut Arena<Expression>,
-        body: &mut Block,
-        op: BinaryOperator,
-        left: Handle<Expression>,
-        right: Handle<Expression>,
-    ) -> Handle<Expression> {
-        self.emit(expressions, body, Expression::Binary { op, left, right })
-    }
-
-    fn emit(
-        &self,
-        expressions: &mut Arena<Expression>,
-        body: &mut Block,
-        expression: Expression,
-    ) -> Handle<Expression> {
-        let handle = expressions.append(expression, Span::default());
-        body.push(
-            Statement::Emit(Range::new_from_bounds(handle, handle)),
-            Span::default(),
-        );
-        handle
-    }
-
-    fn f32_lit(&self, expressions: &mut Arena<Expression>, value: f32) -> Handle<Expression> {
-        expressions.append(Expression::Literal(Literal::F32(value)), Span::default())
-    }
-
-    fn u32_lit(&self, expressions: &mut Arena<Expression>, value: u32) -> Handle<Expression> {
-        expressions.append(Expression::Literal(Literal::U32(value)), Span::default())
-    }
-
-    fn storage_global(
-        module: &mut Module,
-        binding: u32,
-        ty: Handle<Type>,
-        read_only: bool,
-    ) -> Handle<GlobalVariable> {
-        module.global_variables.append(
-            GlobalVariable {
-                name: None,
-                space: AddressSpace::Storage {
-                    access: if read_only {
-                        StorageAccess::LOAD
-                    } else {
-                        StorageAccess::LOAD | StorageAccess::STORE
-                    },
-                },
-                binding: Some(ResourceBinding { group: 0, binding }),
-                ty,
-                init: None,
-            },
-            Span::default(),
-        )
-    }
-
-    fn local(function: &mut Function, ty: Handle<Type>) -> Handle<LocalVariable> {
-        function.local_variables.append(
-            LocalVariable {
-                name: None,
-                ty,
-                init: None,
-            },
-            Span::default(),
         )
     }
 }

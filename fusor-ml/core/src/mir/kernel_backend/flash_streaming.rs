@@ -2,12 +2,12 @@ use std::num::NonZeroU32;
 
 use wgpu::naga::{
     AddressSpace, Arena, ArraySize, BinaryOperator, Binding, Block, BuiltIn, CollectiveOperation,
-    EntryPoint, Expression, Function, FunctionArgument, GlobalVariable, Handle, Literal,
-    LocalVariable, MathFunction, Module, Range, ResourceBinding, Scalar, ShaderStage, Span,
-    Statement, StorageAccess, SubgroupOperation, Type, TypeInner, VectorSize,
+    EntryPoint, Expression, Function, FunctionArgument, GlobalVariable, Handle, LocalVariable,
+    Module, Scalar, ShaderStage, Span, Statement, SubgroupOperation, Type, TypeInner, VectorSize,
 };
 
 use super::{BLOCK, FLOAT_MIN, FlashAttentionDims, OUTPUTS_PER_WORKGROUP, SIMD_WIDTH, TensorMeta};
+use crate::mir::kernel_backend::naga_helpers::{NagaBuilderExt, local, storage_global};
 
 pub(super) fn build_flash_attention_naga_module(
     dims: FlashAttentionDims,
@@ -154,14 +154,14 @@ impl FlashAttentionNagaBuilder {
             Span::default(),
         );
 
-        let q = Self::storage_global(&mut module, 0, storage_ty, true);
-        let k = Self::storage_global(&mut module, 1, storage_ty, true);
-        let v = Self::storage_global(&mut module, 2, storage_ty, true);
+        let q = storage_global(&mut module, 0, storage_ty, true);
+        let k = storage_global(&mut module, 1, storage_ty, true);
+        let v = storage_global(&mut module, 2, storage_ty, true);
         let mask = self
             .has_mask
-            .then(|| Self::storage_global(&mut module, 3, storage_ty, true));
+            .then(|| storage_global(&mut module, 3, storage_ty, true));
         let output_binding = if self.has_mask { 4 } else { 3 };
-        let output = Self::storage_global(&mut module, output_binding, storage_ty, false);
+        let output = storage_global(&mut module, output_binding, storage_ty, false);
         let scratch = module.global_variables.append(
             GlobalVariable {
                 name: None,
@@ -198,12 +198,12 @@ impl FlashAttentionNagaBuilder {
             ..Function::default()
         };
         let locals = FlashAttentionLocals {
-            loop_idx: Self::local(&mut function, u32_ty),
-            score: Self::local(&mut function, f32_ty),
-            weighted: Self::local(&mut function, f32_ty),
-            m: Self::local(&mut function, f32_ty),
-            s: Self::local(&mut function, f32_ty),
-            o: Self::local(&mut function, f32_ty),
+            loop_idx: local(&mut function, u32_ty),
+            score: local(&mut function, f32_ty),
+            weighted: local(&mut function, f32_ty),
+            m: local(&mut function, f32_ty),
+            s: local(&mut function, f32_ty),
+            o: local(&mut function, f32_ty),
         };
 
         function.body = self.entry_body(&mut function.expressions, globals, locals, f32_ty);
@@ -223,41 +223,6 @@ impl FlashAttentionNagaBuilder {
         });
 
         Some(module)
-    }
-
-    fn storage_global(
-        module: &mut Module,
-        binding: u32,
-        ty: Handle<Type>,
-        read_only: bool,
-    ) -> Handle<GlobalVariable> {
-        module.global_variables.append(
-            GlobalVariable {
-                name: None,
-                space: AddressSpace::Storage {
-                    access: if read_only {
-                        StorageAccess::LOAD
-                    } else {
-                        StorageAccess::LOAD | StorageAccess::STORE
-                    },
-                },
-                binding: Some(ResourceBinding { group: 0, binding }),
-                ty,
-                init: None,
-            },
-            Span::default(),
-        )
-    }
-
-    fn local(function: &mut Function, ty: Handle<Type>) -> Handle<LocalVariable> {
-        function.local_variables.append(
-            LocalVariable {
-                name: None,
-                ty,
-                init: None,
-            },
-            Span::default(),
-        )
     }
 
     fn entry_body(
@@ -758,218 +723,6 @@ impl FlashAttentionNagaBuilder {
         }
         let term = self.mul_lit(expressions, body, component, stride);
         self.bin(expressions, body, BinaryOperator::Add, index, term)
-    }
-
-    fn load_storage(
-        &self,
-        expressions: &mut Arena<Expression>,
-        body: &mut Block,
-        global: Handle<GlobalVariable>,
-        index: Handle<Expression>,
-    ) -> Handle<Expression> {
-        let ptr = self.storage_ptr(expressions, body, global, index);
-        self.emit(expressions, body, Expression::Load { pointer: ptr })
-    }
-
-    fn store_storage(
-        &self,
-        expressions: &mut Arena<Expression>,
-        body: &mut Block,
-        global: Handle<GlobalVariable>,
-        index: Handle<Expression>,
-        value: Handle<Expression>,
-    ) {
-        let pointer = self.storage_ptr(expressions, body, global, index);
-        body.push(Statement::Store { pointer, value }, Span::default());
-    }
-
-    fn storage_ptr(
-        &self,
-        expressions: &mut Arena<Expression>,
-        body: &mut Block,
-        global: Handle<GlobalVariable>,
-        index: Handle<Expression>,
-    ) -> Handle<Expression> {
-        let base = expressions.append(Expression::GlobalVariable(global), Span::default());
-        self.emit(expressions, body, Expression::Access { base, index })
-    }
-
-    fn load_local(
-        &self,
-        expressions: &mut Arena<Expression>,
-        body: &mut Block,
-        local: Handle<LocalVariable>,
-    ) -> Handle<Expression> {
-        let pointer = expressions.append(Expression::LocalVariable(local), Span::default());
-        self.emit(expressions, body, Expression::Load { pointer })
-    }
-
-    fn store_local(
-        &self,
-        expressions: &mut Arena<Expression>,
-        body: &mut Block,
-        local: Handle<LocalVariable>,
-        value: Handle<Expression>,
-    ) {
-        let pointer = expressions.append(Expression::LocalVariable(local), Span::default());
-        body.push(Statement::Store { pointer, value }, Span::default());
-    }
-
-    fn exp_f32(
-        &self,
-        expressions: &mut Arena<Expression>,
-        body: &mut Block,
-        value: Handle<Expression>,
-    ) -> Handle<Expression> {
-        self.emit(
-            expressions,
-            body,
-            Expression::Math {
-                fun: MathFunction::Exp,
-                arg: value,
-                arg1: None,
-                arg2: None,
-                arg3: None,
-            },
-        )
-    }
-
-    fn max_f32(
-        &self,
-        expressions: &mut Arena<Expression>,
-        body: &mut Block,
-        left: Handle<Expression>,
-        right: Handle<Expression>,
-    ) -> Handle<Expression> {
-        self.emit(
-            expressions,
-            body,
-            Expression::Math {
-                fun: MathFunction::Max,
-                arg: left,
-                arg1: Some(right),
-                arg2: None,
-                arg3: None,
-            },
-        )
-    }
-
-    fn select(
-        &self,
-        expressions: &mut Arena<Expression>,
-        body: &mut Block,
-        condition: Handle<Expression>,
-        accept: Handle<Expression>,
-        reject: Handle<Expression>,
-    ) -> Handle<Expression> {
-        self.emit(
-            expressions,
-            body,
-            Expression::Select {
-                condition,
-                accept,
-                reject,
-            },
-        )
-    }
-
-    fn bin(
-        &self,
-        expressions: &mut Arena<Expression>,
-        body: &mut Block,
-        op: BinaryOperator,
-        left: Handle<Expression>,
-        right: Handle<Expression>,
-    ) -> Handle<Expression> {
-        self.emit(expressions, body, Expression::Binary { op, left, right })
-    }
-
-    fn lt_lit(
-        &self,
-        expressions: &mut Arena<Expression>,
-        body: &mut Block,
-        value: Handle<Expression>,
-        literal: u32,
-    ) -> Handle<Expression> {
-        let rhs = self.u32_lit(expressions, literal);
-        self.bin(expressions, body, BinaryOperator::Less, value, rhs)
-    }
-
-    fn ge_lit(
-        &self,
-        expressions: &mut Arena<Expression>,
-        body: &mut Block,
-        value: Handle<Expression>,
-        literal: u32,
-    ) -> Handle<Expression> {
-        let rhs = self.u32_lit(expressions, literal);
-        self.bin(expressions, body, BinaryOperator::GreaterEqual, value, rhs)
-    }
-
-    fn eq_lit(
-        &self,
-        expressions: &mut Arena<Expression>,
-        body: &mut Block,
-        value: Handle<Expression>,
-        literal: u32,
-    ) -> Handle<Expression> {
-        let rhs = self.u32_lit(expressions, literal);
-        self.bin(expressions, body, BinaryOperator::Equal, value, rhs)
-    }
-
-    fn div_lit(
-        &self,
-        expressions: &mut Arena<Expression>,
-        body: &mut Block,
-        value: Handle<Expression>,
-        literal: u32,
-    ) -> Handle<Expression> {
-        let rhs = self.u32_lit(expressions, literal);
-        self.bin(expressions, body, BinaryOperator::Divide, value, rhs)
-    }
-
-    fn rem_lit(
-        &self,
-        expressions: &mut Arena<Expression>,
-        body: &mut Block,
-        value: Handle<Expression>,
-        literal: u32,
-    ) -> Handle<Expression> {
-        let rhs = self.u32_lit(expressions, literal);
-        self.bin(expressions, body, BinaryOperator::Modulo, value, rhs)
-    }
-
-    fn mul_lit(
-        &self,
-        expressions: &mut Arena<Expression>,
-        body: &mut Block,
-        value: Handle<Expression>,
-        literal: u32,
-    ) -> Handle<Expression> {
-        let rhs = self.u32_lit(expressions, literal);
-        self.bin(expressions, body, BinaryOperator::Multiply, value, rhs)
-    }
-
-    fn emit(
-        &self,
-        expressions: &mut Arena<Expression>,
-        body: &mut Block,
-        expression: Expression,
-    ) -> Handle<Expression> {
-        let handle = expressions.append(expression, Span::default());
-        body.push(
-            Statement::Emit(Range::new_from_bounds(handle, handle)),
-            Span::default(),
-        );
-        handle
-    }
-
-    fn f32_lit(&self, expressions: &mut Arena<Expression>, value: f32) -> Handle<Expression> {
-        expressions.append(Expression::Literal(Literal::F32(value)), Span::default())
-    }
-
-    fn u32_lit(&self, expressions: &mut Arena<Expression>, value: u32) -> Handle<Expression> {
-        expressions.append(Expression::Literal(Literal::U32(value)), Span::default())
     }
 }
 

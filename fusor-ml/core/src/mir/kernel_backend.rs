@@ -9,6 +9,7 @@ use crate::{
 
 pub(crate) mod flash_attention;
 pub(crate) mod mirostat;
+mod naga_helpers;
 pub(crate) mod rms_norm;
 pub(crate) mod sampling_topk;
 

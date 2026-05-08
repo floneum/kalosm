@@ -1,7 +1,10 @@
 use super::{AnthropicCompatibleClient, NoAnthropicAPIKeyError};
 use crate::{
-    ChatMessage, ChatModel, ChatSession, ContentChunk, CreateChatSession,
-    CreateDefaultChatConstraintsForType, GenerationParameters, SchemaParser, StructuredChatModel,
+    provider_chat::{
+        extract_system_prompt, format_provider_messages, ProviderChatSession, ProviderMessageFormat,
+    },
+    ChatMessage, ChatModel, ChatSession, CreateChatSession, CreateDefaultChatConstraintsForType,
+    GenerationParameters, SchemaParser, StructuredChatModel,
 };
 use futures_util::StreamExt;
 use kalosm_model_types::{ModelBuilder, ModelLoadingProgress};
@@ -174,14 +177,15 @@ impl From<reqwest_eventsource::Error> for AnthropicCompatibleChatModelError {
 
 /// A chat session for the Anthropic compatible chat model.
 #[derive(Serialize, Deserialize, Clone)]
+#[serde(transparent)]
 pub struct AnthropicCompatibleChatSession {
-    messages: Vec<crate::ChatMessage>,
+    inner: ProviderChatSession,
 }
 
 impl AnthropicCompatibleChatSession {
     fn new() -> Self {
         Self {
-            messages: Vec::new(),
+            inner: ProviderChatSession::new(),
         }
     }
 }
@@ -190,7 +194,7 @@ impl ChatSession for AnthropicCompatibleChatSession {
     type Error = serde_json::Error;
 
     fn history(&self) -> Vec<crate::ChatMessage> {
-        self.messages.clone()
+        self.inner.history()
     }
 
     fn try_clone(&self) -> Result<Self, Self::Error>
@@ -344,10 +348,7 @@ impl ChatModel<GenerationParameters> for AnthropicCompatibleChatModel {
             let new_message_text =
                 consume_anthropic_stream(&mut event_source, &mut on_token).await?;
 
-            let new_message =
-                crate::ChatMessage::new(crate::MessageType::ModelAnswer, new_message_text);
-
-            session.messages.push(new_message);
+            session.inner.push_model_answer(new_message_text);
 
             Ok(())
         }
@@ -428,9 +429,7 @@ where
                 AnthropicCompatibleChatModelError::DeserializeError(err)
             })?;
 
-            let new_message =
-                crate::ChatMessage::new(crate::MessageType::ModelAnswer, new_message_text);
-            session.messages.push(new_message);
+            session.inner.push_model_answer(new_message_text);
 
             Ok(result)
         }
@@ -521,61 +520,8 @@ async fn consume_anthropic_stream(
     Ok(new_message_text)
 }
 
-fn extract_system_prompt(messages: &[ChatMessage]) -> (Option<String>, Vec<&ChatMessage>) {
-    let mut system_prompt = None;
-    let filtered: Vec<_> = messages
-        .iter()
-        .filter(|message| {
-            if let crate::MessageType::SystemPrompt = message.role() {
-                system_prompt = message.content().as_str().map(ToString::to_string);
-                false
-            } else {
-                true
-            }
-        })
-        .collect();
-    (system_prompt, filtered)
-}
-
 fn format_messages(messages: &[&crate::ChatMessage]) -> serde_json::Value {
-    messages
-        .iter()
-        .map(|m| {
-            let content = m.content();
-            let content: serde_json::Value = if let Some(string) = content.as_str() {
-                string.into()
-            } else {
-                content
-                    .chunks()
-                    .iter()
-                    .map(|chunk| match chunk {
-                        ContentChunk::Text(text) => {
-                            serde_json::json!({
-                                "type": "text",
-                                "text": text
-                            })
-                        }
-                        ContentChunk::Media(image) => {
-                            serde_json::json!({
-                                "type": "image",
-                                "source": {
-                                    "type": "url",
-                                    "url": image.as_url(),
-                                }
-                            })
-                        }
-                    })
-                    .collect::<Vec<_>>()
-                    .into()
-            };
-
-            serde_json::json!({
-                "role": m.role(),
-                "content": content,
-            })
-        })
-        .collect::<Vec<_>>()
-        .into()
+    format_provider_messages(messages.iter().copied(), ProviderMessageFormat::Anthropic)
 }
 
 #[cfg(test)]

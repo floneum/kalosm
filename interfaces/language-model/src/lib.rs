@@ -40,3 +40,5 @@ mod model;
 pub use model::*;
 mod chat;
 pub use chat::*;
+#[cfg(any(feature = "openai", feature = "anthropic"))]
+mod provider_chat;

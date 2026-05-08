@@ -11,6 +11,10 @@ use super::{DECODE_HEAD_DIM, FLOAT_MIN, FlashDecodeSmallMeta};
 #[path = "flash_decode_small_helpers.rs"]
 mod helpers;
 
+use crate::mir::kernel_backend::naga_helpers::{
+    NagaBuilderExt, local, storage_global, workgroup_global,
+};
+
 #[derive(Clone, Copy)]
 struct FlashDecodeSmallGlobals {
     q: Handle<GlobalVariable>,
@@ -111,14 +115,14 @@ impl FlashDecodeSmallNagaBuilder {
             Span::default(),
         );
 
-        let q = Self::storage_global(&mut module, 0, storage_ty, true);
-        let k = Self::storage_global(&mut module, 1, storage_ty, true);
-        let v = Self::storage_global(&mut module, 2, storage_ty, true);
-        let output = Self::storage_global(&mut module, 3, storage_ty, false);
-        let params = Self::storage_global(&mut module, 4, u32_storage_ty, true);
-        let scores = Self::workgroup_global(&mut module, scratch_ty);
-        let probs = Self::workgroup_global(&mut module, scratch_ty);
-        let reduce = Self::workgroup_global(&mut module, scratch_ty);
+        let q = storage_global(&mut module, 0, storage_ty, true);
+        let k = storage_global(&mut module, 1, storage_ty, true);
+        let v = storage_global(&mut module, 2, storage_ty, true);
+        let output = storage_global(&mut module, 3, storage_ty, false);
+        let params = storage_global(&mut module, 4, u32_storage_ty, true);
+        let scores = workgroup_global(&mut module, scratch_ty);
+        let probs = workgroup_global(&mut module, scratch_ty);
+        let reduce = workgroup_global(&mut module, scratch_ty);
         let globals = FlashDecodeSmallGlobals {
             q,
             k,
@@ -147,11 +151,11 @@ impl FlashDecodeSmallNagaBuilder {
             ..Function::default()
         };
         let locals = FlashDecodeSmallLocals {
-            acc: Self::local(&mut function, f32_ty),
-            kv: Self::local(&mut function, u32_ty),
-            item: Self::local(&mut function, u32_ty),
-            dim: Self::local(&mut function, u32_ty),
-            score_acc: Self::local(&mut function, f32_ty),
+            acc: local(&mut function, f32_ty),
+            kv: local(&mut function, u32_ty),
+            item: local(&mut function, u32_ty),
+            dim: local(&mut function, u32_ty),
+            score_acc: local(&mut function, f32_ty),
         };
 
         function.body = self.entry_body(&mut function.expressions, globals, locals);

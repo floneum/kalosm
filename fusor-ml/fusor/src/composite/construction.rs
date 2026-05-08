@@ -4,82 +4,12 @@ use crate::{Device, SimdElement, Tensor};
 use fusor_core::DataType;
 use fusor_types::FromArray;
 
-impl<D: DataType + SimdElement + Default> FromArray<0, D, (), Device> for Tensor<0, D> {
-    fn from_array(data: (), device: &Device) -> Self {
-        match device {
-            Device::Cpu => Tensor::Cpu(FromArray::from_array(data, &())),
-            Device::Gpu(gpu_device) => Tensor::Gpu(FromArray::from_array(data, gpu_device)),
-        }
-    }
-}
-
-impl<'a, I, D: DataType + SimdElement + Default + Copy> FromArray<1, D, I, Device> for Tensor<1, D>
+impl<const R: usize, D, T> FromArray<R, D, T, Device> for Tensor<R, D>
 where
-    I: IntoIterator<Item = &'a D, IntoIter: ExactSizeIterator>,
+    D: DataType + SimdElement + Default,
+    T: fusor_types::IntoFlatArray<D, R>,
 {
-    fn from_array(data: I, device: &Device) -> Self {
-        match device {
-            Device::Cpu => Tensor::Cpu(FromArray::from_array(data, &())),
-            Device::Gpu(gpu_device) => Tensor::Gpu(FromArray::from_array(data, gpu_device)),
-        }
-    }
-}
-
-impl<'a, I, I2, D: DataType + SimdElement + Default + Copy> FromArray<2, D, I, Device>
-    for Tensor<2, D>
-where
-    I: IntoIterator<Item = I2, IntoIter: ExactSizeIterator>,
-    I2: IntoIterator<Item = &'a D, IntoIter: ExactSizeIterator>,
-{
-    fn from_array(data: I, device: &Device) -> Self {
-        match device {
-            Device::Cpu => Tensor::Cpu(FromArray::from_array(data, &())),
-            Device::Gpu(gpu_device) => Tensor::Gpu(FromArray::from_array(data, gpu_device)),
-        }
-    }
-}
-
-impl<'a, I, I2, I3, D: DataType + SimdElement + Default + Copy> FromArray<3, D, I, Device>
-    for Tensor<3, D>
-where
-    I: IntoIterator<Item = I2, IntoIter: ExactSizeIterator>,
-    I2: IntoIterator<Item = I3, IntoIter: ExactSizeIterator>,
-    I3: IntoIterator<Item = &'a D, IntoIter: ExactSizeIterator>,
-{
-    fn from_array(data: I, device: &Device) -> Self {
-        match device {
-            Device::Cpu => Tensor::Cpu(FromArray::from_array(data, &())),
-            Device::Gpu(gpu_device) => Tensor::Gpu(FromArray::from_array(data, gpu_device)),
-        }
-    }
-}
-
-impl<'a, I, I2, I3, I4, D: DataType + SimdElement + Default + Copy> FromArray<4, D, I, Device>
-    for Tensor<4, D>
-where
-    I: IntoIterator<Item = I2, IntoIter: ExactSizeIterator>,
-    I2: IntoIterator<Item = I3, IntoIter: ExactSizeIterator>,
-    I3: IntoIterator<Item = I4, IntoIter: ExactSizeIterator>,
-    I4: IntoIterator<Item = &'a D, IntoIter: ExactSizeIterator>,
-{
-    fn from_array(data: I, device: &Device) -> Self {
-        match device {
-            Device::Cpu => Tensor::Cpu(FromArray::from_array(data, &())),
-            Device::Gpu(gpu_device) => Tensor::Gpu(FromArray::from_array(data, gpu_device)),
-        }
-    }
-}
-
-impl<'a, I, I2, I3, I4, I5, D: DataType + SimdElement + Default + Copy> FromArray<5, D, I, Device>
-    for Tensor<5, D>
-where
-    I: IntoIterator<Item = I2, IntoIter: ExactSizeIterator>,
-    I2: IntoIterator<Item = I3, IntoIter: ExactSizeIterator>,
-    I3: IntoIterator<Item = I4, IntoIter: ExactSizeIterator>,
-    I4: IntoIterator<Item = I5, IntoIter: ExactSizeIterator>,
-    I5: IntoIterator<Item = &'a D, IntoIter: ExactSizeIterator>,
-{
-    fn from_array(data: I, device: &Device) -> Self {
+    fn from_array(data: T, device: &Device) -> Self {
         match device {
             Device::Cpu => Tensor::Cpu(FromArray::from_array(data, &())),
             Device::Gpu(gpu_device) => Tensor::Gpu(FromArray::from_array(data, gpu_device)),

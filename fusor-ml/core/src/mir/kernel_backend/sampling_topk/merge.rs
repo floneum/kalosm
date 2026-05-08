@@ -1,13 +1,15 @@
 use std::num::NonZeroU32;
 
 use wgpu::naga::{
-    AddressSpace, Arena, ArraySize, Barrier, BinaryOperator, Binding, Block, BuiltIn, EntryPoint,
-    Expression, Function, FunctionArgument, GlobalVariable, Handle, Literal, LocalVariable,
-    MathFunction, Module, Range, ResourceBinding, Scalar, ShaderStage, Span, Statement,
-    StorageAccess, Type, TypeInner,
+    Arena, ArraySize, Barrier, BinaryOperator, Binding, Block, BuiltIn, EntryPoint, Expression,
+    Function, FunctionArgument, Handle, MathFunction, Module, Scalar, ShaderStage, Span, Statement,
+    Type, TypeInner,
 };
 
 use super::{MergeTopKGlobals, MergeTopKLocals};
+use crate::mir::kernel_backend::naga_helpers::{
+    NagaBuilderExt, local, storage_global, workgroup_global,
+};
 use crate::sampling::{MAX_F32, NEG_MAX_F32, TOP_K_BLOCK};
 
 impl super::MergeTopKModuleBuilder {
@@ -100,14 +102,14 @@ impl super::MergeTopKModuleBuilder {
         );
 
         let globals = MergeTopKGlobals {
-            input_ids: Self::storage_global(&mut module, 0, u32_storage_ty, true),
-            input_values: Self::storage_global(&mut module, 1, f32_storage_ty, true),
-            output_ids: Self::storage_global(&mut module, 2, u32_storage_ty, false),
-            output_values: Self::storage_global(&mut module, 3, f32_storage_ty, false),
-            chunk_positions: Self::workgroup_global(&mut module, chunk_positions_ty),
-            scratch_values: Self::workgroup_global(&mut module, scratch_f32_ty),
-            scratch_ids: Self::workgroup_global(&mut module, scratch_u32_ty),
-            scratch_chunks: Self::workgroup_global(&mut module, scratch_u32_ty),
+            input_ids: storage_global(&mut module, 0, u32_storage_ty, true),
+            input_values: storage_global(&mut module, 1, f32_storage_ty, true),
+            output_ids: storage_global(&mut module, 2, u32_storage_ty, false),
+            output_values: storage_global(&mut module, 3, f32_storage_ty, false),
+            chunk_positions: workgroup_global(&mut module, chunk_positions_ty),
+            scratch_values: workgroup_global(&mut module, scratch_f32_ty),
+            scratch_ids: workgroup_global(&mut module, scratch_u32_ty),
+            scratch_chunks: workgroup_global(&mut module, scratch_u32_ty),
         };
 
         let mut function = Function {
@@ -120,12 +122,12 @@ impl super::MergeTopKModuleBuilder {
             ..Function::default()
         };
         let locals = MergeTopKLocals {
-            rank: Self::local(&mut function, u32_ty),
-            scan_chunk: Self::local(&mut function, u32_ty),
-            local_best_value: Self::local(&mut function, f32_ty),
-            local_best_id: Self::local(&mut function, u32_ty),
-            local_best_chunk: Self::local(&mut function, u32_ty),
-            reduce_step: Self::local(&mut function, u32_ty),
+            rank: local(&mut function, u32_ty),
+            scan_chunk: local(&mut function, u32_ty),
+            local_best_value: local(&mut function, f32_ty),
+            local_best_id: local(&mut function, u32_ty),
+            local_best_chunk: local(&mut function, u32_ty),
+            reduce_step: local(&mut function, u32_ty),
         };
 
         function.body = self.entry_body(&mut function.expressions, globals, locals);
@@ -563,54 +565,6 @@ impl super::MergeTopKModuleBuilder {
         );
     }
 
-    fn storage_global(
-        module: &mut Module,
-        binding: u32,
-        ty: Handle<Type>,
-        read_only: bool,
-    ) -> Handle<GlobalVariable> {
-        module.global_variables.append(
-            GlobalVariable {
-                name: None,
-                space: AddressSpace::Storage {
-                    access: if read_only {
-                        StorageAccess::LOAD
-                    } else {
-                        StorageAccess::LOAD | StorageAccess::STORE
-                    },
-                },
-                binding: Some(ResourceBinding { group: 0, binding }),
-                ty,
-                init: None,
-            },
-            Span::default(),
-        )
-    }
-
-    fn workgroup_global(module: &mut Module, ty: Handle<Type>) -> Handle<GlobalVariable> {
-        module.global_variables.append(
-            GlobalVariable {
-                name: None,
-                space: AddressSpace::WorkGroup,
-                binding: None,
-                ty,
-                init: None,
-            },
-            Span::default(),
-        )
-    }
-
-    fn local(function: &mut Function, ty: Handle<Type>) -> Handle<LocalVariable> {
-        function.local_variables.append(
-            LocalVariable {
-                name: None,
-                ty,
-                init: None,
-            },
-            Span::default(),
-        )
-    }
-
     fn is_finite(
         &self,
         expressions: &mut Arena<Expression>,
@@ -654,161 +608,5 @@ impl super::MergeTopKModuleBuilder {
         let id_greater = self.bin(expressions, body, BinaryOperator::Greater, id, best_id);
         let equal_and_id = self.and(expressions, body, value_equal, id_greater);
         self.or(expressions, body, value_greater, equal_and_id)
-    }
-
-    fn load_storage(
-        &self,
-        expressions: &mut Arena<Expression>,
-        body: &mut Block,
-        global: Handle<GlobalVariable>,
-        index: Handle<Expression>,
-    ) -> Handle<Expression> {
-        let ptr = self.storage_ptr(expressions, body, global, index);
-        self.emit(expressions, body, Expression::Load { pointer: ptr })
-    }
-
-    fn store_storage(
-        &self,
-        expressions: &mut Arena<Expression>,
-        body: &mut Block,
-        global: Handle<GlobalVariable>,
-        index: Handle<Expression>,
-        value: Handle<Expression>,
-    ) {
-        let pointer = self.storage_ptr(expressions, body, global, index);
-        body.push(Statement::Store { pointer, value }, Span::default());
-    }
-
-    fn storage_ptr(
-        &self,
-        expressions: &mut Arena<Expression>,
-        body: &mut Block,
-        global: Handle<GlobalVariable>,
-        index: Handle<Expression>,
-    ) -> Handle<Expression> {
-        let base = expressions.append(Expression::GlobalVariable(global), Span::default());
-        self.emit(expressions, body, Expression::Access { base, index })
-    }
-
-    fn load_local(
-        &self,
-        expressions: &mut Arena<Expression>,
-        body: &mut Block,
-        local: Handle<LocalVariable>,
-    ) -> Handle<Expression> {
-        let pointer = expressions.append(Expression::LocalVariable(local), Span::default());
-        self.emit(expressions, body, Expression::Load { pointer })
-    }
-
-    fn store_local(
-        &self,
-        expressions: &mut Arena<Expression>,
-        body: &mut Block,
-        local: Handle<LocalVariable>,
-        value: Handle<Expression>,
-    ) {
-        let pointer = expressions.append(Expression::LocalVariable(local), Span::default());
-        body.push(Statement::Store { pointer, value }, Span::default());
-    }
-
-    fn add_lit(
-        &self,
-        expressions: &mut Arena<Expression>,
-        body: &mut Block,
-        value: Handle<Expression>,
-        literal: u32,
-    ) -> Handle<Expression> {
-        if literal == 0 {
-            value
-        } else {
-            let rhs = self.u32_lit(expressions, literal);
-            self.bin(expressions, body, BinaryOperator::Add, value, rhs)
-        }
-    }
-
-    fn mul_lit(
-        &self,
-        expressions: &mut Arena<Expression>,
-        body: &mut Block,
-        value: Handle<Expression>,
-        literal: u32,
-    ) -> Handle<Expression> {
-        let rhs = self.u32_lit(expressions, literal);
-        self.bin(expressions, body, BinaryOperator::Multiply, value, rhs)
-    }
-
-    fn ge_lit(
-        &self,
-        expressions: &mut Arena<Expression>,
-        body: &mut Block,
-        value: Handle<Expression>,
-        literal: u32,
-    ) -> Handle<Expression> {
-        let rhs = self.u32_lit(expressions, literal);
-        self.bin(expressions, body, BinaryOperator::GreaterEqual, value, rhs)
-    }
-
-    fn eq_lit(
-        &self,
-        expressions: &mut Arena<Expression>,
-        body: &mut Block,
-        value: Handle<Expression>,
-        literal: u32,
-    ) -> Handle<Expression> {
-        let rhs = self.u32_lit(expressions, literal);
-        self.bin(expressions, body, BinaryOperator::Equal, value, rhs)
-    }
-
-    fn and(
-        &self,
-        expressions: &mut Arena<Expression>,
-        body: &mut Block,
-        left: Handle<Expression>,
-        right: Handle<Expression>,
-    ) -> Handle<Expression> {
-        self.bin(expressions, body, BinaryOperator::LogicalAnd, left, right)
-    }
-
-    fn or(
-        &self,
-        expressions: &mut Arena<Expression>,
-        body: &mut Block,
-        left: Handle<Expression>,
-        right: Handle<Expression>,
-    ) -> Handle<Expression> {
-        self.bin(expressions, body, BinaryOperator::LogicalOr, left, right)
-    }
-
-    fn bin(
-        &self,
-        expressions: &mut Arena<Expression>,
-        body: &mut Block,
-        op: BinaryOperator,
-        left: Handle<Expression>,
-        right: Handle<Expression>,
-    ) -> Handle<Expression> {
-        self.emit(expressions, body, Expression::Binary { op, left, right })
-    }
-
-    fn emit(
-        &self,
-        expressions: &mut Arena<Expression>,
-        body: &mut Block,
-        expression: Expression,
-    ) -> Handle<Expression> {
-        let handle = expressions.append(expression, Span::default());
-        body.push(
-            Statement::Emit(Range::new_from_bounds(handle, handle)),
-            Span::default(),
-        );
-        handle
-    }
-
-    fn f32_lit(&self, expressions: &mut Arena<Expression>, value: f32) -> Handle<Expression> {
-        expressions.append(Expression::Literal(Literal::F32(value)), Span::default())
-    }
-
-    fn u32_lit(&self, expressions: &mut Arena<Expression>, value: u32) -> Handle<Expression> {
-        expressions.append(Expression::Literal(Literal::U32(value)), Span::default())
     }
 }

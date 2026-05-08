@@ -21,6 +21,10 @@ use wgpu::{
 #[path = "mirostat_helpers.rs"]
 mod helpers;
 
+use crate::mir::kernel_backend::naga_helpers::{
+    NagaBuilderExt, local, storage_global, workgroup_global,
+};
+
 #[repr(C)]
 #[derive(Clone, Copy, Debug, bytemuck::Pod, bytemuck::Zeroable)]
 struct Mirostat2Params {
@@ -244,16 +248,16 @@ impl SampleMirostat2ModuleBuilder {
         );
 
         let globals = SampleMirostat2Globals {
-            ids: Self::storage_global(&mut module, 0, u32_storage_ty, true),
-            values: Self::storage_global(&mut module, 1, f32_storage_ty, true),
-            state: Self::storage_global(&mut module, 2, f32_storage_ty, false),
-            params: Self::storage_global(&mut module, 3, f32_storage_ty, true),
-            output: Self::storage_global(&mut module, 4, u32_storage_ty, false),
+            ids: storage_global(&mut module, 0, u32_storage_ty, true),
+            values: storage_global(&mut module, 1, f32_storage_ty, true),
+            state: storage_global(&mut module, 2, f32_storage_ty, false),
+            params: storage_global(&mut module, 3, f32_storage_ty, true),
+            output: storage_global(&mut module, 4, u32_storage_ty, false),
             exactness_flag: self
                 .meta
                 .has_exactness_flag
-                .then(|| Self::storage_global(&mut module, 5, u32_storage_ty, true)),
-            scratch: Self::workgroup_global(&mut module, scratch_ty),
+                .then(|| storage_global(&mut module, 5, u32_storage_ty, true)),
+            scratch: workgroup_global(&mut module, scratch_ty),
         };
 
         let mut function = Function {
@@ -266,15 +270,15 @@ impl SampleMirostat2ModuleBuilder {
             ..Function::default()
         };
         let locals = SampleMirostat2Locals {
-            index: Self::local(&mut function, u32_ty),
-            local_sum: Self::local(&mut function, f32_ty),
-            reduce_step: Self::local(&mut function, u32_ty),
-            cutoff: Self::local(&mut function, u32_ty),
-            scan: Self::local(&mut function, u32_ty),
-            cutoff_sum: Self::local(&mut function, f32_ty),
-            cumulative: Self::local(&mut function, f32_ty),
-            selected: Self::local(&mut function, u32_ty),
-            selected_probability: Self::local(&mut function, f32_ty),
+            index: local(&mut function, u32_ty),
+            local_sum: local(&mut function, f32_ty),
+            reduce_step: local(&mut function, u32_ty),
+            cutoff: local(&mut function, u32_ty),
+            scan: local(&mut function, u32_ty),
+            cutoff_sum: local(&mut function, f32_ty),
+            cumulative: local(&mut function, f32_ty),
+            selected: local(&mut function, u32_ty),
+            selected_probability: local(&mut function, f32_ty),
         };
         function.body = self.entry_body(&mut function.expressions, globals, locals);
         function
