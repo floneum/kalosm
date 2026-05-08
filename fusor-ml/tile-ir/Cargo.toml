@@ -9,14 +9,6 @@ autoexamples = false
 name = "tile_ir"
 path = "examples/tile_ir.rs"
 
-[[example]]
-name = "bench_tile_softmax"
-path = "examples/bench_tile_softmax.rs"
-
-[[example]]
-name = "bench_qmatmul"
-path = "examples/bench_qmatmul.rs"
-
 [dependencies]
 bytemuck = "1.25.0"
 half = "2.4.1"
