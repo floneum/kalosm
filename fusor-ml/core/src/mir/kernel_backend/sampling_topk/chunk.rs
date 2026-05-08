@@ -1,14 +1,13 @@
-use std::num::NonZeroU32;
-
 use wgpu::naga::{
-    Arena, ArraySize, Barrier, BinaryOperator, Binding, Block, BuiltIn, EntryPoint, Expression,
-    Function, FunctionArgument, GlobalVariable, Handle, MathFunction, Module, Scalar, ScalarKind,
-    ShaderStage, Span, Statement, Type, TypeInner, VectorSize,
+    Arena, Barrier, BinaryOperator, Binding, Block, BuiltIn, EntryPoint, Expression, Function,
+    FunctionArgument, GlobalVariable, Handle, MathFunction, Module, Scalar, ScalarKind,
+    ShaderStage, Span, Statement, VectorSize,
 };
 
 use super::{TopKGlobals, TopKLocals};
 use crate::mir::kernel_backend::naga_helpers::{
-    NagaBuilderExt, local, storage_global, workgroup_global,
+    NagaBuilderExt, constant_array_type, dynamic_array_type, local, scalar_type, storage_global,
+    vector_type, workgroup_global,
 };
 use crate::sampling::{MAX_F32, NEG_MAX_F32, TOP_K_BLOCK, TOP_K_CHUNK};
 
@@ -31,81 +30,14 @@ impl super::TopKModuleBuilder {
 
     pub(super) fn build(self) -> Option<Module> {
         let mut module = Module::default();
-        let bool_ty = module.types.insert(
-            Type {
-                name: None,
-                inner: TypeInner::Scalar(Scalar::BOOL),
-            },
-            Span::default(),
-        );
-        let f32_ty = module.types.insert(
-            Type {
-                name: None,
-                inner: TypeInner::Scalar(Scalar::F32),
-            },
-            Span::default(),
-        );
-        let u32_ty = module.types.insert(
-            Type {
-                name: None,
-                inner: TypeInner::Scalar(Scalar::U32),
-            },
-            Span::default(),
-        );
-        let u32_vec3_ty = module.types.insert(
-            Type {
-                name: None,
-                inner: TypeInner::Vector {
-                    size: VectorSize::Tri,
-                    scalar: Scalar::U32,
-                },
-            },
-            Span::default(),
-        );
-        let f32_storage_ty = module.types.insert(
-            Type {
-                name: None,
-                inner: TypeInner::Array {
-                    base: f32_ty,
-                    size: ArraySize::Dynamic,
-                    stride: 4,
-                },
-            },
-            Span::default(),
-        );
-        let u32_storage_ty = module.types.insert(
-            Type {
-                name: None,
-                inner: TypeInner::Array {
-                    base: u32_ty,
-                    size: ArraySize::Dynamic,
-                    stride: 4,
-                },
-            },
-            Span::default(),
-        );
-        let scratch_f32_ty = module.types.insert(
-            Type {
-                name: None,
-                inner: TypeInner::Array {
-                    base: f32_ty,
-                    size: ArraySize::Constant(NonZeroU32::new(TOP_K_BLOCK)?),
-                    stride: 4,
-                },
-            },
-            Span::default(),
-        );
-        let scratch_u32_ty = module.types.insert(
-            Type {
-                name: None,
-                inner: TypeInner::Array {
-                    base: u32_ty,
-                    size: ArraySize::Constant(NonZeroU32::new(TOP_K_BLOCK)?),
-                    stride: 4,
-                },
-            },
-            Span::default(),
-        );
+        let bool_ty = scalar_type(&mut module, Scalar::BOOL);
+        let f32_ty = scalar_type(&mut module, Scalar::F32);
+        let u32_ty = scalar_type(&mut module, Scalar::U32);
+        let u32_vec3_ty = vector_type(&mut module, VectorSize::Tri, Scalar::U32);
+        let f32_storage_ty = dynamic_array_type(&mut module, f32_ty, 4);
+        let u32_storage_ty = dynamic_array_type(&mut module, u32_ty, 4);
+        let scratch_f32_ty = constant_array_type(&mut module, f32_ty, TOP_K_BLOCK, 4)?;
+        let scratch_u32_ty = constant_array_type(&mut module, u32_ty, TOP_K_BLOCK, 4)?;
 
         let globals = TopKGlobals {
             input: storage_global(&mut module, 0, f32_storage_ty, true),

@@ -1,9 +1,7 @@
-use std::num::NonZeroU32;
-
 use wgpu::naga::{
-    Arena, ArraySize, Barrier, BinaryOperator, Binding, Block, BuiltIn, EntryPoint, Expression,
-    Function, FunctionArgument, GlobalVariable, Handle, LocalVariable, Module, Scalar, ShaderStage,
-    Span, Statement, Type, TypeInner, VectorSize,
+    Arena, Barrier, BinaryOperator, Binding, Block, BuiltIn, EntryPoint, Expression, Function,
+    FunctionArgument, GlobalVariable, Handle, LocalVariable, Module, Scalar, ShaderStage, Span,
+    Statement, VectorSize,
 };
 
 use super::{DECODE_HEAD_DIM, FLOAT_MIN, FlashDecodeSmallMeta};
@@ -12,7 +10,8 @@ use super::{DECODE_HEAD_DIM, FLOAT_MIN, FlashDecodeSmallMeta};
 mod helpers;
 
 use crate::mir::kernel_backend::naga_helpers::{
-    NagaBuilderExt, local, storage_global, workgroup_global,
+    NagaBuilderExt, constant_array_type, dynamic_array_type, local, scalar_type, storage_global,
+    vector_type, workgroup_global,
 };
 
 #[derive(Clone, Copy)]
@@ -57,63 +56,12 @@ impl FlashDecodeSmallNagaBuilder {
 
     fn build(self) -> Option<Module> {
         let mut module = Module::default();
-        let f32_ty = module.types.insert(
-            Type {
-                name: None,
-                inner: TypeInner::Scalar(Scalar::F32),
-            },
-            Span::default(),
-        );
-        let u32_ty = module.types.insert(
-            Type {
-                name: None,
-                inner: TypeInner::Scalar(Scalar::U32),
-            },
-            Span::default(),
-        );
-        let u32_vec3_ty = module.types.insert(
-            Type {
-                name: None,
-                inner: TypeInner::Vector {
-                    size: VectorSize::Tri,
-                    scalar: Scalar::U32,
-                },
-            },
-            Span::default(),
-        );
-        let storage_ty = module.types.insert(
-            Type {
-                name: None,
-                inner: TypeInner::Array {
-                    base: f32_ty,
-                    size: ArraySize::Dynamic,
-                    stride: 4,
-                },
-            },
-            Span::default(),
-        );
-        let u32_storage_ty = module.types.insert(
-            Type {
-                name: None,
-                inner: TypeInner::Array {
-                    base: u32_ty,
-                    size: ArraySize::Dynamic,
-                    stride: 4,
-                },
-            },
-            Span::default(),
-        );
-        let scratch_ty = module.types.insert(
-            Type {
-                name: None,
-                inner: TypeInner::Array {
-                    base: f32_ty,
-                    size: ArraySize::Constant(NonZeroU32::new(self.meta.decode_block)?),
-                    stride: 4,
-                },
-            },
-            Span::default(),
-        );
+        let f32_ty = scalar_type(&mut module, Scalar::F32);
+        let u32_ty = scalar_type(&mut module, Scalar::U32);
+        let u32_vec3_ty = vector_type(&mut module, VectorSize::Tri, Scalar::U32);
+        let storage_ty = dynamic_array_type(&mut module, f32_ty, 4);
+        let u32_storage_ty = dynamic_array_type(&mut module, u32_ty, 4);
+        let scratch_ty = constant_array_type(&mut module, f32_ty, self.meta.decode_block, 4)?;
 
         let q = storage_global(&mut module, 0, storage_ty, true);
         let k = storage_global(&mut module, 1, storage_ty, true);

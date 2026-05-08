@@ -1,5 +1,3 @@
-use std::num::NonZeroU32;
-
 use crate::{
     Device,
     mir::{direct_kernel::DirectKernelBinding, kernel_backend},
@@ -12,9 +10,9 @@ use crate::{
 use wgpu::{
     CommandEncoder,
     naga::{
-        Arena, ArraySize, Barrier, BinaryOperator, Binding, Block, BuiltIn, EntryPoint, Expression,
-        Function, FunctionArgument, GlobalVariable, Handle, LocalVariable, Module, Scalar,
-        ShaderStage, Span, Statement, Type, TypeInner,
+        Arena, Barrier, BinaryOperator, Binding, Block, BuiltIn, EntryPoint, Expression, Function,
+        FunctionArgument, GlobalVariable, Handle, LocalVariable, Module, Scalar, ShaderStage, Span,
+        Statement,
     },
 };
 
@@ -22,7 +20,8 @@ use wgpu::{
 mod helpers;
 
 use crate::mir::kernel_backend::naga_helpers::{
-    NagaBuilderExt, local, storage_global, workgroup_global,
+    NagaBuilderExt, constant_array_type, dynamic_array_type, local, scalar_type, storage_global,
+    workgroup_global,
 };
 
 #[repr(C)]
@@ -199,53 +198,11 @@ impl SampleMirostat2ModuleBuilder {
 
     fn build(self) -> Option<Module> {
         let mut module = Module::default();
-        let f32_ty = module.types.insert(
-            Type {
-                name: None,
-                inner: TypeInner::Scalar(Scalar::F32),
-            },
-            Span::default(),
-        );
-        let u32_ty = module.types.insert(
-            Type {
-                name: None,
-                inner: TypeInner::Scalar(Scalar::U32),
-            },
-            Span::default(),
-        );
-        let f32_storage_ty = module.types.insert(
-            Type {
-                name: None,
-                inner: TypeInner::Array {
-                    base: f32_ty,
-                    size: ArraySize::Dynamic,
-                    stride: 4,
-                },
-            },
-            Span::default(),
-        );
-        let u32_storage_ty = module.types.insert(
-            Type {
-                name: None,
-                inner: TypeInner::Array {
-                    base: u32_ty,
-                    size: ArraySize::Dynamic,
-                    stride: 4,
-                },
-            },
-            Span::default(),
-        );
-        let scratch_ty = module.types.insert(
-            Type {
-                name: None,
-                inner: TypeInner::Array {
-                    base: f32_ty,
-                    size: ArraySize::Constant(NonZeroU32::new(TOP_K_BLOCK)?),
-                    stride: 4,
-                },
-            },
-            Span::default(),
-        );
+        let f32_ty = scalar_type(&mut module, Scalar::F32);
+        let u32_ty = scalar_type(&mut module, Scalar::U32);
+        let f32_storage_ty = dynamic_array_type(&mut module, f32_ty, 4);
+        let u32_storage_ty = dynamic_array_type(&mut module, u32_ty, 4);
+        let scratch_ty = constant_array_type(&mut module, f32_ty, TOP_K_BLOCK, 4)?;
 
         let globals = SampleMirostat2Globals {
             ids: storage_global(&mut module, 0, u32_storage_ty, true),

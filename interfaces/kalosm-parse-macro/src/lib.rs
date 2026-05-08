@@ -1294,19 +1294,19 @@ impl Parse for ParserType {
 #[test]
 fn type_parses() {
     assert!(matches!(
-        dbg!(syn::parse2::<ParserType>(quote! { String })).unwrap(),
+        syn::parse2::<ParserType>(quote! { String }).unwrap(),
         ParserType::String(_)
     ));
     assert!(matches!(
-        dbg!(syn::parse2::<ParserType>(quote! { std::string::String })).unwrap(),
+        syn::parse2::<ParserType>(quote! { std::string::String }).unwrap(),
         ParserType::String(_)
     ));
     assert!(matches!(
-        dbg!(syn::parse2::<ParserType>(quote! { i32 })).unwrap(),
+        syn::parse2::<ParserType>(quote! { i32 }).unwrap(),
         ParserType::Integer(_)
     ));
     assert!(matches!(
-        dbg!(syn::parse2::<ParserType>(quote! { f32 })).unwrap(),
+        syn::parse2::<ParserType>(quote! { f32 }).unwrap(),
         ParserType::Number(_)
     ));
 }

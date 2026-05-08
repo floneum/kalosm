@@ -1,8 +1,65 @@
 use wgpu::naga::{
     AddressSpace, Arena, BinaryOperator, Block, Expression, Function, GlobalVariable, Handle,
-    Literal, LocalVariable, MathFunction, Module, Range, ResourceBinding, Span, Statement,
-    StorageAccess, Type,
+    Literal, LocalVariable, MathFunction, Module, Range, ResourceBinding, Scalar, Span, Statement,
+    StorageAccess, Type, TypeInner, VectorSize,
 };
+
+pub(crate) fn scalar_type(module: &mut Module, scalar: Scalar) -> Handle<Type> {
+    module.types.insert(
+        Type {
+            name: None,
+            inner: TypeInner::Scalar(scalar),
+        },
+        Span::default(),
+    )
+}
+
+pub(crate) fn vector_type(module: &mut Module, size: VectorSize, scalar: Scalar) -> Handle<Type> {
+    module.types.insert(
+        Type {
+            name: None,
+            inner: TypeInner::Vector { size, scalar },
+        },
+        Span::default(),
+    )
+}
+
+pub(crate) fn dynamic_array_type(
+    module: &mut Module,
+    base: Handle<Type>,
+    stride: u32,
+) -> Handle<Type> {
+    array_type(module, base, wgpu::naga::ArraySize::Dynamic, stride)
+}
+
+pub(crate) fn constant_array_type(
+    module: &mut Module,
+    base: Handle<Type>,
+    size: u32,
+    stride: u32,
+) -> Option<Handle<Type>> {
+    Some(array_type(
+        module,
+        base,
+        wgpu::naga::ArraySize::Constant(std::num::NonZeroU32::new(size)?),
+        stride,
+    ))
+}
+
+fn array_type(
+    module: &mut Module,
+    base: Handle<Type>,
+    size: wgpu::naga::ArraySize,
+    stride: u32,
+) -> Handle<Type> {
+    module.types.insert(
+        Type {
+            name: None,
+            inner: TypeInner::Array { base, size, stride },
+        },
+        Span::default(),
+    )
+}
 
 pub(crate) fn storage_global(
     module: &mut Module,

@@ -1,14 +1,15 @@
-use std::num::NonZeroU32;
-
 use wgpu::naga::{
-    AddressSpace, Arena, ArraySize, Barrier, BinaryOperator, Binding, Block, BuiltIn,
-    CollectiveOperation, EntryPoint, Expression, Function, FunctionArgument, GlobalVariable,
-    Handle, LocalVariable, MathFunction, Module, Scalar, ShaderStage, Span, Statement,
-    SubgroupOperation, Type, TypeInner, VectorSize,
+    AddressSpace, Arena, Barrier, BinaryOperator, Binding, Block, BuiltIn, CollectiveOperation,
+    EntryPoint, Expression, Function, FunctionArgument, GlobalVariable, Handle, LocalVariable,
+    MathFunction, Module, Scalar, ShaderStage, Span, Statement, SubgroupOperation, Type,
+    VectorSize,
 };
 
 use super::{RmsNormVec4Meta, VEC4_BLOCK, VEC4_SUBGROUP_WIDTH};
-use crate::mir::kernel_backend::naga_helpers::{NagaBuilderExt, local, storage_global};
+use crate::mir::kernel_backend::naga_helpers::{
+    NagaBuilderExt, constant_array_type, dynamic_array_type, local, scalar_type, storage_global,
+    vector_type,
+};
 
 #[derive(Clone, Copy)]
 struct RmsNormVec4Globals {
@@ -43,62 +44,12 @@ impl RmsNormVec4NagaBuilder {
 
     fn build(self) -> Option<Module> {
         let mut module = Module::default();
-        let f32_ty = module.types.insert(
-            Type {
-                name: None,
-                inner: TypeInner::Scalar(Scalar::F32),
-            },
-            Span::default(),
-        );
-        let u32_ty = module.types.insert(
-            Type {
-                name: None,
-                inner: TypeInner::Scalar(Scalar::U32),
-            },
-            Span::default(),
-        );
-        let f32_vec4_ty = module.types.insert(
-            Type {
-                name: None,
-                inner: TypeInner::Vector {
-                    size: VectorSize::Quad,
-                    scalar: Scalar::F32,
-                },
-            },
-            Span::default(),
-        );
-        let u32_vec3_ty = module.types.insert(
-            Type {
-                name: None,
-                inner: TypeInner::Vector {
-                    size: VectorSize::Tri,
-                    scalar: Scalar::U32,
-                },
-            },
-            Span::default(),
-        );
-        let storage_ty = module.types.insert(
-            Type {
-                name: None,
-                inner: TypeInner::Array {
-                    base: f32_vec4_ty,
-                    size: ArraySize::Dynamic,
-                    stride: 16,
-                },
-            },
-            Span::default(),
-        );
-        let scratch_ty = module.types.insert(
-            Type {
-                name: None,
-                inner: TypeInner::Array {
-                    base: f32_ty,
-                    size: ArraySize::Constant(NonZeroU32::new(VEC4_SUBGROUP_WIDTH)?),
-                    stride: 4,
-                },
-            },
-            Span::default(),
-        );
+        let f32_ty = scalar_type(&mut module, Scalar::F32);
+        let u32_ty = scalar_type(&mut module, Scalar::U32);
+        let f32_vec4_ty = vector_type(&mut module, VectorSize::Quad, Scalar::F32);
+        let u32_vec3_ty = vector_type(&mut module, VectorSize::Tri, Scalar::U32);
+        let storage_ty = dynamic_array_type(&mut module, f32_vec4_ty, 16);
+        let scratch_ty = constant_array_type(&mut module, f32_ty, VEC4_SUBGROUP_WIDTH, 4)?;
 
         let input = storage_global(&mut module, 0, storage_ty, true);
         let mut binding = 1;

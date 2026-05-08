@@ -159,61 +159,7 @@ impl<'a> Lowerer<'a> {
             let byte = self.byte_at(expressions, &mut emits, word, byte_lane);
             q_components.push(self.signed_byte_f32(expressions, &mut emits, byte));
         }
-        let a0 = expressions.append(
-            Expression::Compose {
-                ty: self.f32_vec4_ty,
-                components: a[..4].to_vec(),
-            },
-            Span::default(),
-        );
-        emits.push(Self::single_expression_range(expressions, a0));
-        let q0 = expressions.append(
-            Expression::Compose {
-                ty: self.f32_vec4_ty,
-                components: q_components[..4].to_vec(),
-            },
-            Span::default(),
-        );
-        emits.push(Self::single_expression_range(expressions, q0));
-        let a1 = expressions.append(
-            Expression::Compose {
-                ty: self.f32_vec4_ty,
-                components: a[4..].to_vec(),
-            },
-            Span::default(),
-        );
-        emits.push(Self::single_expression_range(expressions, a1));
-        let q1 = expressions.append(
-            Expression::Compose {
-                ty: self.f32_vec4_ty,
-                components: q_components[4..].to_vec(),
-            },
-            Span::default(),
-        );
-        emits.push(Self::single_expression_range(expressions, q1));
-        let dot0 = expressions.append(
-            Expression::Math {
-                fun: MathFunction::Dot,
-                arg: a0,
-                arg1: Some(q0),
-                arg2: None,
-                arg3: None,
-            },
-            Span::default(),
-        );
-        emits.push(Self::single_expression_range(expressions, dot0));
-        let dot1 = expressions.append(
-            Expression::Math {
-                fun: MathFunction::Dot,
-                arg: a1,
-                arg1: Some(q1),
-                arg2: None,
-                arg3: None,
-            },
-            Span::default(),
-        );
-        emits.push(Self::single_expression_range(expressions, dot1));
-        let sum = self.bin(expressions, &mut emits, BinaryOperator::Add, dot0, dot1);
+        let sum = self.dot_vec4_chunks(expressions, &mut emits, a, &q_components);
         Ok((self.mul(expressions, &mut emits, sum, scale), emits))
     }
 
@@ -629,61 +575,7 @@ impl<'a> Lowerer<'a> {
             q_components.push(self.sub(expressions, &mut emits, quant_f, center));
         }
 
-        let a0 = expressions.append(
-            Expression::Compose {
-                ty: self.f32_vec4_ty,
-                components: a[..4].to_vec(),
-            },
-            Span::default(),
-        );
-        emits.push(Self::single_expression_range(expressions, a0));
-        let q0 = expressions.append(
-            Expression::Compose {
-                ty: self.f32_vec4_ty,
-                components: q_components[..4].to_vec(),
-            },
-            Span::default(),
-        );
-        emits.push(Self::single_expression_range(expressions, q0));
-        let a1 = expressions.append(
-            Expression::Compose {
-                ty: self.f32_vec4_ty,
-                components: a[4..].to_vec(),
-            },
-            Span::default(),
-        );
-        emits.push(Self::single_expression_range(expressions, a1));
-        let q1 = expressions.append(
-            Expression::Compose {
-                ty: self.f32_vec4_ty,
-                components: q_components[4..].to_vec(),
-            },
-            Span::default(),
-        );
-        emits.push(Self::single_expression_range(expressions, q1));
-        let dot0 = expressions.append(
-            Expression::Math {
-                fun: MathFunction::Dot,
-                arg: a0,
-                arg1: Some(q0),
-                arg2: None,
-                arg3: None,
-            },
-            Span::default(),
-        );
-        emits.push(Self::single_expression_range(expressions, dot0));
-        let dot1 = expressions.append(
-            Expression::Math {
-                fun: MathFunction::Dot,
-                arg: a1,
-                arg1: Some(q1),
-                arg2: None,
-                arg3: None,
-            },
-            Span::default(),
-        );
-        emits.push(Self::single_expression_range(expressions, dot1));
-        let sum = self.bin(expressions, &mut emits, BinaryOperator::Add, dot0, dot1);
+        let sum = self.dot_vec4_chunks(expressions, &mut emits, a, &q_components);
         Ok((self.mul(expressions, &mut emits, sum, scale), emits))
     }
 
@@ -817,61 +709,7 @@ impl<'a> Lowerer<'a> {
         let (scale, min, quants) =
             self.q4k_quant_values32(expressions, matrix, k_base, col, &mut emits)?;
 
-        let mut weighted_sum = self.f32(expressions, 0.0);
-        for chunk in 0..8 {
-            let a_vec = expressions.append(
-                Expression::Compose {
-                    ty: self.f32_vec4_ty,
-                    components: a[chunk * 4..chunk * 4 + 4].to_vec(),
-                },
-                Span::default(),
-            );
-            emits.push(Self::single_expression_range(expressions, a_vec));
-            let q_components = quants[chunk * 4..chunk * 4 + 4]
-                .iter()
-                .map(|quant| self.as_f32(expressions, &mut emits, *quant))
-                .collect::<Vec<_>>();
-            let q_vec = expressions.append(
-                Expression::Compose {
-                    ty: self.f32_vec4_ty,
-                    components: q_components,
-                },
-                Span::default(),
-            );
-            emits.push(Self::single_expression_range(expressions, q_vec));
-            let dot = expressions.append(
-                Expression::Math {
-                    fun: MathFunction::Dot,
-                    arg: a_vec,
-                    arg1: Some(q_vec),
-                    arg2: None,
-                    arg3: None,
-                },
-                Span::default(),
-            );
-            emits.push(Self::single_expression_range(expressions, dot));
-            weighted_sum = self.bin(
-                expressions,
-                &mut emits,
-                BinaryOperator::Add,
-                weighted_sum,
-                dot,
-            );
-        }
-
-        let mut activation_sum = self.f32(expressions, 0.0);
-        for activation in a {
-            activation_sum = self.bin(
-                expressions,
-                &mut emits,
-                BinaryOperator::Add,
-                activation_sum,
-                *activation,
-            );
-        }
-        let scaled = self.mul(expressions, &mut emits, weighted_sum, scale);
-        let min_term = self.mul(expressions, &mut emits, activation_sum, min);
-        let total = self.sub(expressions, &mut emits, scaled, min_term);
+        let total = self.q4k_f32_weighted_sum(expressions, &mut emits, scale, min, &quants, a);
         Ok((total, emits))
     }
 
@@ -889,62 +727,123 @@ impl<'a> Lowerer<'a> {
         let (scale, min, quants) =
             self.q4k_quant_values16(expressions, matrix, k_base, col, &mut emits)?;
 
-        let mut weighted_sum = self.f32(expressions, 0.0);
-        for chunk in 0..4 {
-            let a_vec = expressions.append(
-                Expression::Compose {
-                    ty: self.f32_vec4_ty,
-                    components: a[chunk * 4..chunk * 4 + 4].to_vec(),
-                },
-                Span::default(),
-            );
-            emits.push(Self::single_expression_range(expressions, a_vec));
-            let q_components = quants[chunk * 4..chunk * 4 + 4]
-                .iter()
-                .map(|quant| self.as_f32(expressions, &mut emits, *quant))
-                .collect::<Vec<_>>();
-            let q_vec = expressions.append(
-                Expression::Compose {
-                    ty: self.f32_vec4_ty,
-                    components: q_components,
-                },
-                Span::default(),
-            );
-            emits.push(Self::single_expression_range(expressions, q_vec));
-            let dot = expressions.append(
-                Expression::Math {
-                    fun: MathFunction::Dot,
-                    arg: a_vec,
-                    arg1: Some(q_vec),
-                    arg2: None,
-                    arg3: None,
-                },
-                Span::default(),
-            );
-            emits.push(Self::single_expression_range(expressions, dot));
-            weighted_sum = self.bin(
-                expressions,
-                &mut emits,
-                BinaryOperator::Add,
-                weighted_sum,
-                dot,
-            );
-        }
-
-        let mut activation_sum = self.f32(expressions, 0.0);
-        for activation in a {
-            activation_sum = self.bin(
-                expressions,
-                &mut emits,
-                BinaryOperator::Add,
-                activation_sum,
-                *activation,
-            );
-        }
-        let scaled = self.mul(expressions, &mut emits, weighted_sum, scale);
-        let min_term = self.mul(expressions, &mut emits, activation_sum, min);
-        let total = self.sub(expressions, &mut emits, scaled, min_term);
+        let total = self.q4k_f32_weighted_sum(expressions, &mut emits, scale, min, &quants, a);
         Ok((total, emits))
+    }
+
+    fn q4k_f32_weighted_sum(
+        &self,
+        expressions: &mut Arena<Expression>,
+        emits: &mut Vec<Range<Expression>>,
+        scale: Handle<Expression>,
+        min: Handle<Expression>,
+        quants: &[Handle<Expression>],
+        a: &[Handle<Expression>],
+    ) -> Handle<Expression> {
+        let weighted_sum = self.dot_quant_vec4_chunks(expressions, emits, a, quants);
+        let activation_sum = self.sum_values(expressions, emits, a);
+        let scaled = self.mul(expressions, emits, weighted_sum, scale);
+        let min_term = self.mul(expressions, emits, activation_sum, min);
+        self.sub(expressions, emits, scaled, min_term)
+    }
+
+    fn sum_values(
+        &self,
+        expressions: &mut Arena<Expression>,
+        emits: &mut Vec<Range<Expression>>,
+        values: &[Handle<Expression>],
+    ) -> Handle<Expression> {
+        let mut total = self.f32(expressions, 0.0);
+        for value in values {
+            total = self.bin(expressions, emits, BinaryOperator::Add, total, *value);
+        }
+        total
+    }
+
+    fn dot_quant_vec4_chunks(
+        &self,
+        expressions: &mut Arena<Expression>,
+        emits: &mut Vec<Range<Expression>>,
+        left: &[Handle<Expression>],
+        right_quants: &[Handle<Expression>],
+    ) -> Handle<Expression> {
+        debug_assert_eq!(left.len(), right_quants.len());
+        debug_assert!(!left.is_empty());
+        debug_assert_eq!(left.len() % 4, 0);
+
+        let mut total = self.f32(expressions, 0.0);
+        for (left_chunk, right_chunk) in left.chunks_exact(4).zip(right_quants.chunks_exact(4)) {
+            let right_chunk = right_chunk
+                .iter()
+                .map(|quant| self.as_f32(expressions, emits, *quant))
+                .collect::<Vec<_>>();
+            let dot = self.dot_vec4(expressions, emits, left_chunk, &right_chunk);
+            total = self.bin(expressions, emits, BinaryOperator::Add, total, dot);
+        }
+        total
+    }
+
+    fn dot_vec4_chunks(
+        &self,
+        expressions: &mut Arena<Expression>,
+        emits: &mut Vec<Range<Expression>>,
+        left: &[Handle<Expression>],
+        right: &[Handle<Expression>],
+    ) -> Handle<Expression> {
+        debug_assert_eq!(left.len(), right.len());
+        debug_assert!(!left.is_empty());
+        debug_assert_eq!(left.len() % 4, 0);
+
+        let mut chunks = left.chunks_exact(4).zip(right.chunks_exact(4));
+        let (left_chunk, right_chunk) = chunks
+            .next()
+            .expect("dot_vec4_chunks requires at least one vec4");
+        let mut total = self.dot_vec4(expressions, emits, left_chunk, right_chunk);
+        for (left_chunk, right_chunk) in chunks {
+            let dot = self.dot_vec4(expressions, emits, left_chunk, right_chunk);
+            total = self.bin(expressions, emits, BinaryOperator::Add, total, dot);
+        }
+        total
+    }
+
+    fn dot_vec4(
+        &self,
+        expressions: &mut Arena<Expression>,
+        emits: &mut Vec<Range<Expression>>,
+        left: &[Handle<Expression>],
+        right: &[Handle<Expression>],
+    ) -> Handle<Expression> {
+        debug_assert_eq!(left.len(), 4);
+        debug_assert_eq!(right.len(), 4);
+
+        let left = expressions.append(
+            Expression::Compose {
+                ty: self.f32_vec4_ty,
+                components: left.to_vec(),
+            },
+            Span::default(),
+        );
+        emits.push(Self::single_expression_range(expressions, left));
+        let right = expressions.append(
+            Expression::Compose {
+                ty: self.f32_vec4_ty,
+                components: right.to_vec(),
+            },
+            Span::default(),
+        );
+        emits.push(Self::single_expression_range(expressions, right));
+        let dot = expressions.append(
+            Expression::Math {
+                fun: MathFunction::Dot,
+                arg: left,
+                arg1: Some(right),
+                arg2: None,
+                arg3: None,
+            },
+            Span::default(),
+        );
+        emits.push(Self::single_expression_range(expressions, dot));
+        dot
     }
 
     #[allow(clippy::too_many_arguments)]
