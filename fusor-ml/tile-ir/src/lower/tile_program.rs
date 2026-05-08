@@ -22,13 +22,19 @@ impl<'a> Lowerer<'a> {
                 TileStmt::StoreSwiGlu(store) => {
                     self.lower_tile_swiglu_store_stmt(expressions, scratch, &mut body, store)?;
                 }
+                TileStmt::StoreVec4(store) => {
+                    self.lower_tile_vec4_store_stmt(expressions, scratch, &mut body, store)?;
+                }
+                TileStmt::StoreLinear(store) => {
+                    self.lower_tile_linear_store_stmt(expressions, scratch, &mut body, store)?;
+                }
                 _ => self.lower_tile_stmt(expressions, scratch, &mut body, stmt)?,
             }
         }
         Ok(Statement::Block(body))
     }
 
-    fn lower_tile_store_stmt(
+    pub(super) fn lower_tile_store_stmt(
         &self,
         expressions: &mut Arena<Expression>,
         scratch: ScratchLocals,
@@ -70,7 +76,7 @@ impl<'a> Lowerer<'a> {
         Ok(())
     }
 
-    fn lower_tile_swiglu_store_stmt(
+    pub(super) fn lower_tile_swiglu_store_stmt(
         &self,
         expressions: &mut Arena<Expression>,
         scratch: ScratchLocals,
@@ -78,7 +84,6 @@ impl<'a> Lowerer<'a> {
         store: &TileSwiGluStoreStmt,
     ) -> Result<(), LowerError> {
         self.block_dequant_cache.borrow_mut().clear();
-        self.pin_cache.borrow_mut().clear();
         self.q8_activation_pack_cache.borrow_mut().clear();
 
         let gate = self.lower_tile_expr_lane(expressions, scratch, body, &store.gate, 0)?;
@@ -214,7 +219,79 @@ impl<'a> Lowerer<'a> {
         Ok(())
     }
 
-    fn lower_tile_expr_lane(
+    pub(super) fn lower_tile_vec4_store_stmt(
+        &self,
+        expressions: &mut Arena<Expression>,
+        scratch: ScratchLocals,
+        body: &mut Block,
+        store: &TileVec4StoreStmt,
+    ) -> Result<(), LowerError> {
+        self.block_dequant_cache.borrow_mut().clear();
+        self.q8_activation_pack_cache.borrow_mut().clear();
+
+        let value = self.lower_tile_expr_lane(expressions, scratch, body, &store.value, 0)?;
+        let mask = self.lower_tile_mask_expr(expressions, scratch, body, &store.mask, 0)?;
+        let mut accept = Block::new();
+        let index =
+            self.lower_tile_index_expr(expressions, scratch, &mut accept, &store.index, 0)?;
+        let (dst_ptr, dst_ptr_emits) =
+            self.storage_dynamic_pointer(expressions, &store.dst, index)?;
+        Self::push_emits(&mut accept, dst_ptr_emits);
+        accept.push(
+            Statement::Store {
+                pointer: dst_ptr,
+                value,
+            },
+            Span::default(),
+        );
+        body.push(
+            Statement::If {
+                condition: mask,
+                accept,
+                reject: Block::new(),
+            },
+            Span::default(),
+        );
+        Ok(())
+    }
+
+    pub(super) fn lower_tile_linear_store_stmt(
+        &self,
+        expressions: &mut Arena<Expression>,
+        scratch: ScratchLocals,
+        body: &mut Block,
+        store: &TileLinearStoreStmt,
+    ) -> Result<(), LowerError> {
+        self.block_dequant_cache.borrow_mut().clear();
+        self.q8_activation_pack_cache.borrow_mut().clear();
+
+        let value = self.lower_tile_expr_lane(expressions, scratch, body, &store.value, 0)?;
+        let mask = self.lower_tile_mask_expr(expressions, scratch, body, &store.mask, 0)?;
+        let mut accept = Block::new();
+        let index =
+            self.lower_tile_index_expr(expressions, scratch, &mut accept, &store.index, 0)?;
+        let (dst_ptr, dst_ptr_emits) =
+            self.storage_dynamic_pointer(expressions, &store.dst, index)?;
+        Self::push_emits(&mut accept, dst_ptr_emits);
+        accept.push(
+            Statement::Store {
+                pointer: dst_ptr,
+                value,
+            },
+            Span::default(),
+        );
+        body.push(
+            Statement::If {
+                condition: mask,
+                accept,
+                reject: Block::new(),
+            },
+            Span::default(),
+        );
+        Ok(())
+    }
+
+    pub(super) fn lower_tile_expr_lane(
         &self,
         expressions: &mut Arena<Expression>,
         scratch: ScratchLocals,
@@ -225,6 +302,34 @@ impl<'a> Lowerer<'a> {
         match expr {
             TileExpr::Load(load) => {
                 self.lower_tile_load_expr(expressions, scratch, body, load, spill_depth)
+            }
+            TileExpr::LoadLinear(load) => {
+                self.lower_tile_linear_load_expr(expressions, scratch, body, load, spill_depth)
+            }
+            TileExpr::LoadVec4(load) => {
+                self.lower_tile_vec4_load_expr(expressions, scratch, body, load, spill_depth)
+            }
+            TileExpr::LoadWorkgroup { src, index } => {
+                let index =
+                    self.lower_tile_index_expr(expressions, scratch, body, index, spill_depth)?;
+                let (ptr, emits) = self.tile_dynamic_pointer(expressions, *src, index)?;
+                Self::push_emits(body, emits);
+                let value = expressions.append(Expression::Load { pointer: ptr }, Span::default());
+                body.push(
+                    Statement::Emit(Self::single_expression_range(expressions, value)),
+                    Span::default(),
+                );
+                Ok(value)
+            }
+            TileExpr::LoadLocal(local) => {
+                let local = self.private_local(*local)?;
+                let pointer = expressions.append(Expression::LocalVariable(local), Span::default());
+                let value = expressions.append(Expression::Load { pointer }, Span::default());
+                body.push(
+                    Statement::Emit(Self::single_expression_range(expressions, value)),
+                    Span::default(),
+                );
+                Ok(value)
             }
             TileExpr::QuantizedLoad(load) => {
                 self.lower_tile_quantized_load_expr(expressions, scratch, body, load, spill_depth)
@@ -264,35 +369,61 @@ impl<'a> Lowerer<'a> {
                 Ok(self.emit_tile_expr(expressions, body, expr))
             }
             TileExpr::Binary { op, left, right } => {
-                let left_ty = self.tile_expr_element(left)?;
                 let left =
                     self.lower_tile_expr_lane(expressions, scratch, body, left, spill_depth + 1)?;
-                let spill = self.tile_expr_spill_local(scratch, left_ty, spill_depth)?;
-                let spill_ptr =
-                    expressions.append(Expression::LocalVariable(spill), Span::default());
-                body.push(
-                    Statement::Store {
-                        pointer: spill_ptr,
-                        value: left,
-                    },
-                    Span::default(),
-                );
                 let right =
                     self.lower_tile_expr_lane(expressions, scratch, body, right, spill_depth + 1)?;
-                let left =
-                    expressions.append(Expression::Load { pointer: spill_ptr }, Span::default());
-                body.push(
-                    Statement::Emit(Self::single_expression_range(expressions, left)),
-                    Span::default(),
-                );
                 let expr = Self::tile_binary_expression(*op, left, right);
                 Ok(self.emit_tile_expr(expressions, body, expr))
+            }
+            TileExpr::Sum { values } => {
+                let mut iter = values.iter();
+                let Some(first) = iter.next() else {
+                    return Ok(
+                        expressions.append(Expression::Literal(Literal::F32(0.0)), Span::default())
+                    );
+                };
+                let mut sum =
+                    self.lower_tile_expr_lane(expressions, scratch, body, first, spill_depth + 1)?;
+                for value in iter {
+                    let rhs = self.lower_tile_expr_lane(
+                        expressions,
+                        scratch,
+                        body,
+                        value,
+                        spill_depth + 1,
+                    )?;
+                    sum = self.emit_tile_expr(
+                        expressions,
+                        body,
+                        Expression::Binary {
+                            op: BinaryOperator::Add,
+                            left: sum,
+                            right: rhs,
+                        },
+                    );
+                }
+                Ok(sum)
             }
             TileExpr::Cast { value, to } => {
                 let source = self.tile_expr_element(value)?;
                 let value =
                     self.lower_tile_expr_lane(expressions, scratch, body, value, spill_depth)?;
                 Ok(self.cast_tile_value(expressions, body, value, source, *to))
+            }
+            TileExpr::Bitcast { value, to } => {
+                let value =
+                    self.lower_tile_expr_lane(expressions, scratch, body, value, spill_depth)?;
+                let scalar = Self::element_scalar(*to);
+                Ok(self.emit_tile_expr(
+                    expressions,
+                    body,
+                    Expression::As {
+                        expr: value,
+                        kind: scalar.kind,
+                        convert: None,
+                    },
+                ))
             }
             TileExpr::Select {
                 condition,
@@ -307,28 +438,11 @@ impl<'a> Lowerer<'a> {
                     condition,
                     spill_depth + 1,
                 )?;
-                let condition = self.numeric_not_zero(expressions, body, condition, condition_ty);
-                let accept_ty = self.tile_expr_element(accept)?;
+                let condition = self.condition_value(expressions, body, condition, condition_ty);
                 let accept =
                     self.lower_tile_expr_lane(expressions, scratch, body, accept, spill_depth + 1)?;
-                let spill = self.tile_expr_spill_local(scratch, accept_ty, spill_depth)?;
-                let spill_ptr =
-                    expressions.append(Expression::LocalVariable(spill), Span::default());
-                body.push(
-                    Statement::Store {
-                        pointer: spill_ptr,
-                        value: accept,
-                    },
-                    Span::default(),
-                );
                 let reject =
                     self.lower_tile_expr_lane(expressions, scratch, body, reject, spill_depth + 1)?;
-                let accept =
-                    expressions.append(Expression::Load { pointer: spill_ptr }, Span::default());
-                body.push(
-                    Statement::Emit(Self::single_expression_range(expressions, accept)),
-                    Span::default(),
-                );
                 Ok(self.emit_tile_expr(
                     expressions,
                     body,
@@ -345,27 +459,10 @@ impl<'a> Lowerer<'a> {
                 right,
                 output,
             } => {
-                let left_ty = self.tile_expr_element(left)?;
                 let left =
                     self.lower_tile_expr_lane(expressions, scratch, body, left, spill_depth + 1)?;
-                let spill = self.tile_expr_spill_local(scratch, left_ty, spill_depth)?;
-                let spill_ptr =
-                    expressions.append(Expression::LocalVariable(spill), Span::default());
-                body.push(
-                    Statement::Store {
-                        pointer: spill_ptr,
-                        value: left,
-                    },
-                    Span::default(),
-                );
                 let right =
                     self.lower_tile_expr_lane(expressions, scratch, body, right, spill_depth + 1)?;
-                let left =
-                    expressions.append(Expression::Load { pointer: spill_ptr }, Span::default());
-                body.push(
-                    Statement::Emit(Self::single_expression_range(expressions, left)),
-                    Span::default(),
-                );
                 let condition = self.emit_tile_expr(
                     expressions,
                     body,
@@ -375,6 +472,9 @@ impl<'a> Lowerer<'a> {
                         right,
                     },
                 );
+                if *output == ElementType::Bool {
+                    return Ok(condition);
+                }
                 let one = expressions.append(Self::one_literal(*output), Span::default());
                 let zero = expressions.append(Self::zero_literal(*output), Span::default());
                 Ok(self.emit_tile_expr(
@@ -538,6 +638,39 @@ impl<'a> Lowerer<'a> {
                     Span::default(),
                 );
                 Ok(dot)
+            }
+            TileExpr::Vec4Dot { left, right } => {
+                let left =
+                    self.lower_tile_expr_lane(expressions, scratch, body, left, spill_depth + 1)?;
+                let right =
+                    self.lower_tile_expr_lane(expressions, scratch, body, right, spill_depth + 1)?;
+                let dot = expressions.append(
+                    Expression::Math {
+                        fun: MathFunction::Dot,
+                        arg: left,
+                        arg1: Some(right),
+                        arg2: None,
+                        arg3: None,
+                    },
+                    Span::default(),
+                );
+                body.push(
+                    Statement::Emit(Self::single_expression_range(expressions, dot)),
+                    Span::default(),
+                );
+                Ok(dot)
+            }
+            TileExpr::Vec4Splat { value } => {
+                let value =
+                    self.lower_tile_expr_lane(expressions, scratch, body, value, spill_depth)?;
+                Ok(self.emit_tile_expr(
+                    expressions,
+                    body,
+                    Expression::Compose {
+                        ty: self.f32_vec4_ty,
+                        components: vec![value, value, value, value],
+                    },
+                ))
             }
             TileExpr::QuantizedQ8_0Dot8 {
                 a,
@@ -1513,6 +1646,163 @@ impl<'a> Lowerer<'a> {
         Ok(loaded)
     }
 
+    fn lower_tile_vec4_load_expr(
+        &self,
+        expressions: &mut Arena<Expression>,
+        scratch: ScratchLocals,
+        body: &mut Block,
+        load: &TileVec4LoadExpr,
+        spill_depth: usize,
+    ) -> Result<Handle<Expression>, LowerError> {
+        if load.src.buffer.element != ElementType::F32Vec4 {
+            return Err(LowerError::UnsupportedOperation(
+                "vec4 load requires f32x4 storage",
+            ));
+        }
+
+        if matches!(load.mask, TileMaskExpr::True) {
+            let index =
+                self.lower_tile_index_expr(expressions, scratch, body, &load.index, spill_depth)?;
+            let (src_ptr, src_ptr_emits) =
+                self.storage_dynamic_pointer(expressions, &load.src, index)?;
+            Self::push_emits(body, src_ptr_emits);
+            let value = expressions.append(Expression::Load { pointer: src_ptr }, Span::default());
+            body.push(
+                Statement::Emit(Self::single_expression_range(expressions, value)),
+                Span::default(),
+            );
+            return Ok(value);
+        }
+
+        let tmp = Self::tile_value_local(scratch, ElementType::F32Vec4)?;
+        let tmp_ptr = expressions.append(Expression::LocalVariable(tmp), Span::default());
+        let fill = self.vec4_splat_literal(expressions, body, load.fill.get());
+        body.push(
+            Statement::Store {
+                pointer: tmp_ptr,
+                value: fill,
+            },
+            Span::default(),
+        );
+
+        let mask =
+            self.lower_tile_mask_expr(expressions, scratch, body, &load.mask, spill_depth)?;
+        let mut accept = Block::new();
+        let index = self.lower_tile_index_expr(
+            expressions,
+            scratch,
+            &mut accept,
+            &load.index,
+            spill_depth,
+        )?;
+        let (src_ptr, src_ptr_emits) =
+            self.storage_dynamic_pointer(expressions, &load.src, index)?;
+        Self::push_emits(&mut accept, src_ptr_emits);
+        let value = expressions.append(Expression::Load { pointer: src_ptr }, Span::default());
+        accept.push(
+            Statement::Emit(Self::single_expression_range(expressions, value)),
+            Span::default(),
+        );
+        accept.push(
+            Statement::Store {
+                pointer: tmp_ptr,
+                value,
+            },
+            Span::default(),
+        );
+        body.push(
+            Statement::If {
+                condition: mask,
+                accept,
+                reject: Block::new(),
+            },
+            Span::default(),
+        );
+        let loaded = expressions.append(Expression::Load { pointer: tmp_ptr }, Span::default());
+        body.push(
+            Statement::Emit(Self::single_expression_range(expressions, loaded)),
+            Span::default(),
+        );
+        Ok(loaded)
+    }
+
+    fn lower_tile_linear_load_expr(
+        &self,
+        expressions: &mut Arena<Expression>,
+        scratch: ScratchLocals,
+        body: &mut Block,
+        load: &TileLinearLoadExpr,
+        spill_depth: usize,
+    ) -> Result<Handle<Expression>, LowerError> {
+        let element = load.src.buffer.element;
+        if matches!(load.mask, TileMaskExpr::True) {
+            let index =
+                self.lower_tile_index_expr(expressions, scratch, body, &load.index, spill_depth)?;
+            let (src_ptr, src_ptr_emits) =
+                self.storage_dynamic_pointer(expressions, &load.src, index)?;
+            Self::push_emits(body, src_ptr_emits);
+            let value = expressions.append(Expression::Load { pointer: src_ptr }, Span::default());
+            body.push(
+                Statement::Emit(Self::single_expression_range(expressions, value)),
+                Span::default(),
+            );
+            return Ok(value);
+        }
+
+        let tmp = Self::tile_value_local(scratch, element)?;
+        let tmp_ptr = expressions.append(Expression::LocalVariable(tmp), Span::default());
+        let fill_source = load.fill.element();
+        let fill = expressions.append(Self::tile_literal(load.fill), Span::default());
+        let fill = self.cast_tile_value(expressions, body, fill, fill_source, element);
+        body.push(
+            Statement::Store {
+                pointer: tmp_ptr,
+                value: fill,
+            },
+            Span::default(),
+        );
+
+        let mask =
+            self.lower_tile_mask_expr(expressions, scratch, body, &load.mask, spill_depth)?;
+        let mut accept = Block::new();
+        let index = self.lower_tile_index_expr(
+            expressions,
+            scratch,
+            &mut accept,
+            &load.index,
+            spill_depth,
+        )?;
+        let (src_ptr, src_ptr_emits) =
+            self.storage_dynamic_pointer(expressions, &load.src, index)?;
+        Self::push_emits(&mut accept, src_ptr_emits);
+        let value = expressions.append(Expression::Load { pointer: src_ptr }, Span::default());
+        accept.push(
+            Statement::Emit(Self::single_expression_range(expressions, value)),
+            Span::default(),
+        );
+        accept.push(
+            Statement::Store {
+                pointer: tmp_ptr,
+                value,
+            },
+            Span::default(),
+        );
+        body.push(
+            Statement::If {
+                condition: mask,
+                accept,
+                reject: Block::new(),
+            },
+            Span::default(),
+        );
+        let loaded = expressions.append(Expression::Load { pointer: tmp_ptr }, Span::default());
+        body.push(
+            Statement::Emit(Self::single_expression_range(expressions, loaded)),
+            Span::default(),
+        );
+        Ok(loaded)
+    }
+
     fn lower_tile_quantized_load_expr(
         &self,
         expressions: &mut Arena<Expression>,
@@ -2279,6 +2569,16 @@ impl<'a> Lowerer<'a> {
                 "subgroup reduce on f16 requires f16 capability",
             ))?,
             ElementType::U32 => self.u32_ty,
+            ElementType::F32Vec4 => {
+                return Err(LowerError::UnsupportedOperation(
+                    "subgroup reduce on vec4 values is not supported",
+                ));
+            }
+            ElementType::Bool => {
+                return Err(LowerError::UnsupportedOperation(
+                    "subgroup reduce on bool values is not supported",
+                ));
+            }
         };
         let result = expressions.append(
             Expression::SubgroupOperationResult { ty: result_ty },
@@ -2306,11 +2606,15 @@ impl<'a> Lowerer<'a> {
                     Expression::Literal(Literal::F16(half::f16::from_f32(-65504.0)))
                 }
                 ElementType::U32 => Expression::Literal(Literal::U32(0)),
+                ElementType::F32Vec4 => panic!("vec4 reductions are not supported"),
+                ElementType::Bool => panic!("bool reductions are not supported"),
             },
             TileReduceOp::Min => match element {
                 ElementType::F32 => Expression::Literal(Literal::F32(f32::MAX)),
                 ElementType::F16 => Expression::Literal(Literal::F16(half::f16::from_f32(65504.0))),
                 ElementType::U32 => Expression::Literal(Literal::U32(u32::MAX)),
+                ElementType::F32Vec4 => panic!("vec4 reductions are not supported"),
+                ElementType::Bool => panic!("bool reductions are not supported"),
             },
         }
     }
@@ -2495,6 +2799,7 @@ impl<'a> Lowerer<'a> {
                     TileCompareOp::Gt => BinaryOperator::Greater,
                     TileCompareOp::Ge => BinaryOperator::GreaterEqual,
                     TileCompareOp::Eq => BinaryOperator::Equal,
+                    TileCompareOp::Ne => BinaryOperator::NotEqual,
                 };
                 self.emit_tile_expr(expressions, body, Expression::Binary { op, left, right })
             }
@@ -2516,9 +2821,13 @@ impl<'a> Lowerer<'a> {
         })
     }
 
-    fn tile_expr_element(&self, expr: &TileExpr) -> Result<ElementType, LowerError> {
+    pub(super) fn tile_expr_element(&self, expr: &TileExpr) -> Result<ElementType, LowerError> {
         match expr {
             TileExpr::Load(load) => Ok(load.src.buffer.element),
+            TileExpr::LoadLinear(load) => Ok(load.src.buffer.element),
+            TileExpr::LoadVec4(_) => Ok(ElementType::F32Vec4),
+            TileExpr::LoadWorkgroup { src, .. } => Ok(src.element),
+            TileExpr::LoadLocal(local) => Ok(local.element),
             TileExpr::QuantizedLoad(_) | TileExpr::Full(_) => Ok(ElementType::F32),
             TileExpr::Literal(value) => Ok(value.element()),
             TileExpr::Index(_) => Ok(ElementType::U32),
@@ -2526,7 +2835,12 @@ impl<'a> Lowerer<'a> {
             TileExpr::Unary { value, .. } | TileExpr::Binary { left: value, .. } => {
                 self.tile_expr_element(value)
             }
+            TileExpr::Sum { values } => values
+                .first()
+                .map(|value| self.tile_expr_element(value))
+                .unwrap_or(Ok(ElementType::F32)),
             TileExpr::Cast { to, .. } => Ok(*to),
+            TileExpr::Bitcast { to, .. } => Ok(*to),
             TileExpr::Select { accept, .. } => self.tile_expr_element(accept),
             TileExpr::Compare { output, .. } => Ok(*output),
             TileExpr::LoopFold { initial, .. } => Ok(initial.element()),
@@ -2534,11 +2848,13 @@ impl<'a> Lowerer<'a> {
             TileExpr::SubgroupReduce { value, .. } => self.tile_expr_element(value),
             TileExpr::QuantizedBlockLane { .. } => Ok(ElementType::F32),
             TileExpr::Dot4 { .. }
+            | TileExpr::Vec4Dot { .. }
             | TileExpr::QuantizedQ8_0Dot8 { .. }
             | TileExpr::QuantizedQ8ActivationDot { .. }
             | TileExpr::QuantizedQ4KF32Dot { .. }
             | TileExpr::QuantizedQ4KGgmlDot { .. }
             | TileExpr::QuantizedQ6KGgmlDot { .. } => Ok(ElementType::F32),
+            TileExpr::Vec4Splat { .. } => Ok(ElementType::F32Vec4),
             TileExpr::PinnedRef { id } => self
                 .ir
                 .pinned_values
@@ -2573,6 +2889,8 @@ impl<'a> Lowerer<'a> {
             ElementType::F32 => 0,
             ElementType::F16 => 1,
             ElementType::U32 => 2,
+            ElementType::F32Vec4 => 3,
+            ElementType::Bool => 4,
         }
     }
 
@@ -2583,6 +2901,7 @@ impl<'a> Lowerer<'a> {
                 Expression::Literal(Literal::F16(half::f16::from_bits(value)))
             }
             TileLiteral::U32(value) => Expression::Literal(Literal::U32(value)),
+            TileLiteral::Bool(value) => Expression::Literal(Literal::Bool(value)),
         }
     }
 
@@ -2591,6 +2910,8 @@ impl<'a> Lowerer<'a> {
             ElementType::F32 => Expression::Literal(Literal::F32(0.0)),
             ElementType::F16 => Expression::Literal(Literal::F16(half::f16::from_f32(0.0))),
             ElementType::U32 => Expression::Literal(Literal::U32(0)),
+            ElementType::F32Vec4 => panic!("vec4 literal requires composition"),
+            ElementType::Bool => Expression::Literal(Literal::Bool(false)),
         }
     }
 
@@ -2599,6 +2920,8 @@ impl<'a> Lowerer<'a> {
             ElementType::F32 => Expression::Literal(Literal::F32(1.0)),
             ElementType::F16 => Expression::Literal(Literal::F16(half::f16::from_f32(1.0))),
             ElementType::U32 => Expression::Literal(Literal::U32(1)),
+            ElementType::F32Vec4 => panic!("vec4 literal requires composition"),
+            ElementType::Bool => Expression::Literal(Literal::Bool(true)),
         }
     }
 
@@ -2610,7 +2933,26 @@ impl<'a> Lowerer<'a> {
                 width: 2,
             },
             ElementType::U32 => Scalar::U32,
+            ElementType::F32Vec4 => Scalar::F32,
+            ElementType::Bool => Scalar::BOOL,
         }
+    }
+
+    fn vec4_splat_literal(
+        &self,
+        expressions: &mut Arena<Expression>,
+        body: &mut Block,
+        value: f32,
+    ) -> Handle<Expression> {
+        let value = expressions.append(Expression::Literal(Literal::F32(value)), Span::default());
+        self.emit_tile_expr(
+            expressions,
+            body,
+            Expression::Compose {
+                ty: self.f32_vec4_ty,
+                components: vec![value, value, value, value],
+            },
+        )
     }
 
     fn cast_tile_value(
@@ -2636,13 +2978,16 @@ impl<'a> Lowerer<'a> {
         )
     }
 
-    fn numeric_not_zero(
+    pub(super) fn condition_value(
         &self,
         expressions: &mut Arena<Expression>,
         body: &mut Block,
         value: Handle<Expression>,
         element: ElementType,
     ) -> Handle<Expression> {
+        if element == ElementType::Bool {
+            return value;
+        }
         let zero = expressions.append(Self::zero_literal(element), Span::default());
         self.emit_tile_expr(
             expressions,
@@ -2662,6 +3007,7 @@ impl<'a> Lowerer<'a> {
             TileUnaryOp::Log => MathFunction::Log,
             TileUnaryOp::Log2 => MathFunction::Log2,
             TileUnaryOp::Sqrt => MathFunction::Sqrt,
+            TileUnaryOp::InverseSqrt => MathFunction::InverseSqrt,
             TileUnaryOp::Sin => MathFunction::Sin,
             TileUnaryOp::Cos => MathFunction::Cos,
             TileUnaryOp::Tan => MathFunction::Tan,
@@ -2731,6 +3077,31 @@ impl<'a> Lowerer<'a> {
                 arg2: None,
                 arg3: None,
             },
+            TileBinaryOp::BitAnd => Expression::Binary {
+                op: BinaryOperator::And,
+                left,
+                right,
+            },
+            TileBinaryOp::BitOr => Expression::Binary {
+                op: BinaryOperator::InclusiveOr,
+                left,
+                right,
+            },
+            TileBinaryOp::BitXor => Expression::Binary {
+                op: BinaryOperator::ExclusiveOr,
+                left,
+                right,
+            },
+            TileBinaryOp::LogicalAnd => Expression::Binary {
+                op: BinaryOperator::LogicalAnd,
+                left,
+                right,
+            },
+            TileBinaryOp::LogicalOr => Expression::Binary {
+                op: BinaryOperator::LogicalOr,
+                left,
+                right,
+            },
         }
     }
 
@@ -2741,6 +3112,7 @@ impl<'a> Lowerer<'a> {
             TileCompareOp::Gt => BinaryOperator::Greater,
             TileCompareOp::Ge => BinaryOperator::GreaterEqual,
             TileCompareOp::Eq => BinaryOperator::Equal,
+            TileCompareOp::Ne => BinaryOperator::NotEqual,
         }
     }
 

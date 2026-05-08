@@ -38,6 +38,14 @@ impl<'a> Lowerer<'a> {
                 Self::mark_tile_expr_live(ir, &store.gate, live);
                 Self::mark_tile_expr_live(ir, &store.up, live);
             }
+            TileStmt::StoreVec4(store) => Self::mark_tile_expr_live(ir, &store.value, live),
+            TileStmt::StoreLinear(store) => Self::mark_tile_expr_live(ir, &store.value, live),
+            TileStmt::StoreLocal { value, .. } => Self::mark_tile_expr_live(ir, value, live),
+            TileStmt::Emit { value } => Self::mark_tile_expr_live(ir, value, live),
+            TileStmt::StoreWorkgroup { dst, value, .. } => {
+                Self::mark_tile_live(ir, *dst, live);
+                Self::mark_tile_expr_live(ir, value, live);
+            }
             TileStmt::CopyToWorkgroupTile { dst, .. }
             | TileStmt::CopyQuantToWorkgroupTile { dst, .. } => {
                 if let Some(slot) = live.get_mut(dst.id.index()) {
@@ -58,6 +66,22 @@ impl<'a> Lowerer<'a> {
                     Self::mark_tile_stmt_live(ir, s, live);
                 }
             }
+            TileStmt::If {
+                condition,
+                accept,
+                reject,
+            } => {
+                Self::mark_tile_expr_live(ir, condition, live);
+                for s in accept.iter().chain(reject.iter()) {
+                    Self::mark_tile_stmt_live(ir, s, live);
+                }
+            }
+            TileStmt::Loop { body } => {
+                for s in body {
+                    Self::mark_tile_stmt_live(ir, s, live);
+                }
+            }
+            TileStmt::Break | TileStmt::Return => {}
         }
     }
 
@@ -72,7 +96,15 @@ impl<'a> Lowerer<'a> {
         ir.body().ops().iter().any(|op| {
             let Op::TileProgram(op) = op;
             op.body.iter().any(Self::tile_stmt_uses_subgroup_reduce)
-        })
+        }) || ir
+            .pinned_values
+            .iter()
+            .any(Self::tile_expr_uses_subgroup_reduce)
+            || ir.loop_fold_groups.iter().any(|g| {
+                g.bodies
+                    .iter()
+                    .any(|b| Self::tile_expr_uses_subgroup_reduce(b))
+            })
     }
 
     pub(super) fn uses_index_kind(ir: &KernelIr, kind: SubgroupIndexKind) -> bool {
@@ -96,7 +128,16 @@ impl<'a> Lowerer<'a> {
 
     fn tile_stmt_uses_cooperative_matrix(stmt: &TileStmt) -> bool {
         match stmt {
-            TileStmt::Store(_) | TileStmt::StoreSwiGlu(_) | TileStmt::Barrier => false,
+            TileStmt::Store(_)
+            | TileStmt::StoreSwiGlu(_)
+            | TileStmt::StoreVec4(_)
+            | TileStmt::StoreLinear(_)
+            | TileStmt::StoreLocal { .. }
+            | TileStmt::Emit { .. }
+            | TileStmt::StoreWorkgroup { .. }
+            | TileStmt::Barrier
+            | TileStmt::Break
+            | TileStmt::Return => false,
             TileStmt::ZeroCoopAcc { .. }
             | TileStmt::CopyToWorkgroupTile { .. }
             | TileStmt::CopyQuantToWorkgroupTile { .. }
@@ -106,6 +147,11 @@ impl<'a> Lowerer<'a> {
             TileStmt::WhileTrue { body, .. } => {
                 body.iter().any(Self::tile_stmt_uses_cooperative_matrix)
             }
+            TileStmt::If { accept, reject, .. } => accept
+                .iter()
+                .chain(reject.iter())
+                .any(Self::tile_stmt_uses_cooperative_matrix),
+            TileStmt::Loop { body } => body.iter().any(Self::tile_stmt_uses_cooperative_matrix),
         }
     }
 
@@ -116,16 +162,35 @@ impl<'a> Lowerer<'a> {
                 Self::tile_expr_uses_subgroup_reduce(&store.gate)
                     || Self::tile_expr_uses_subgroup_reduce(&store.up)
             }
+            TileStmt::StoreVec4(store) => Self::tile_expr_uses_subgroup_reduce(&store.value),
+            TileStmt::StoreLinear(store) => Self::tile_expr_uses_subgroup_reduce(&store.value),
+            TileStmt::StoreLocal { value, .. }
+            | TileStmt::Emit { value }
+            | TileStmt::StoreWorkgroup { value, .. } => Self::tile_expr_uses_subgroup_reduce(value),
             TileStmt::WhileTrue { body, .. } => {
                 body.iter().any(Self::tile_stmt_uses_subgroup_reduce)
             }
+            TileStmt::If {
+                condition,
+                accept,
+                reject,
+            } => {
+                Self::tile_expr_uses_subgroup_reduce(condition)
+                    || accept
+                        .iter()
+                        .chain(reject.iter())
+                        .any(Self::tile_stmt_uses_subgroup_reduce)
+            }
+            TileStmt::Loop { body } => body.iter().any(Self::tile_stmt_uses_subgroup_reduce),
             TileStmt::ZeroCoopAcc { .. }
             | TileStmt::CopyToWorkgroupTile { .. }
             | TileStmt::CopyQuantToWorkgroupTile { .. }
             | TileStmt::Barrier
             | TileStmt::LoadCoop { .. }
             | TileStmt::Mma { .. }
-            | TileStmt::StoreCoopAcc { .. } => false,
+            | TileStmt::StoreCoopAcc { .. }
+            | TileStmt::Break
+            | TileStmt::Return => false,
         }
     }
 
@@ -143,6 +208,22 @@ impl<'a> Lowerer<'a> {
                     || Self::tile_mask_expr_uses_kind(&store.mask, kind)
                     || Self::tile_expr_uses_index_kind(&store.gate, kind)
                     || Self::tile_expr_uses_index_kind(&store.up, kind)
+            }
+            TileStmt::StoreVec4(store) => {
+                Self::tile_index_expr_uses_kind(&store.index, kind)
+                    || Self::tile_mask_expr_uses_kind(&store.mask, kind)
+                    || Self::tile_expr_uses_index_kind(&store.value, kind)
+            }
+            TileStmt::StoreLinear(store) => {
+                Self::tile_index_expr_uses_kind(&store.index, kind)
+                    || Self::tile_mask_expr_uses_kind(&store.mask, kind)
+                    || Self::tile_expr_uses_index_kind(&store.value, kind)
+            }
+            TileStmt::StoreLocal { value, .. } => Self::tile_expr_uses_index_kind(value, kind),
+            TileStmt::Emit { value } => Self::tile_expr_uses_index_kind(value, kind),
+            TileStmt::StoreWorkgroup { index, value, .. } => {
+                Self::tile_index_expr_uses_kind(index, kind)
+                    || Self::tile_expr_uses_index_kind(value, kind)
             }
             TileStmt::CopyToWorkgroupTile {
                 row_offset,
@@ -164,10 +245,26 @@ impl<'a> Lowerer<'a> {
             TileStmt::WhileTrue { body, .. } => body
                 .iter()
                 .any(|stmt| Self::tile_stmt_uses_index_kind(stmt, kind)),
+            TileStmt::If {
+                condition,
+                accept,
+                reject,
+            } => {
+                Self::tile_expr_uses_index_kind(condition, kind)
+                    || accept
+                        .iter()
+                        .chain(reject.iter())
+                        .any(|stmt| Self::tile_stmt_uses_index_kind(stmt, kind))
+            }
+            TileStmt::Loop { body } => body
+                .iter()
+                .any(|stmt| Self::tile_stmt_uses_index_kind(stmt, kind)),
             TileStmt::ZeroCoopAcc { .. }
             | TileStmt::Barrier
             | TileStmt::LoadCoop { .. }
-            | TileStmt::Mma { .. } => false,
+            | TileStmt::Mma { .. }
+            | TileStmt::Break
+            | TileStmt::Return => false,
         }
     }
 
@@ -178,6 +275,16 @@ impl<'a> Lowerer<'a> {
                     || Self::tile_index_expr_uses_kind(&load.col, kind)
                     || Self::tile_mask_expr_uses_kind(&load.mask, kind)
             }
+            TileExpr::LoadLinear(load) => {
+                Self::tile_index_expr_uses_kind(&load.index, kind)
+                    || Self::tile_mask_expr_uses_kind(&load.mask, kind)
+            }
+            TileExpr::LoadVec4(load) => {
+                Self::tile_index_expr_uses_kind(&load.index, kind)
+                    || Self::tile_mask_expr_uses_kind(&load.mask, kind)
+            }
+            TileExpr::LoadWorkgroup { index, .. } => Self::tile_index_expr_uses_kind(index, kind),
+            TileExpr::LoadLocal(_) => false,
             TileExpr::QuantizedLoad(load) => {
                 Self::tile_index_expr_uses_kind(&load.row, kind)
                     || Self::tile_index_expr_uses_kind(&load.col, kind)
@@ -194,6 +301,11 @@ impl<'a> Lowerer<'a> {
                 .iter()
                 .chain(b.iter())
                 .any(|expr| Self::tile_expr_uses_index_kind(expr, kind)),
+            TileExpr::Vec4Dot { left, right } => {
+                Self::tile_expr_uses_index_kind(left, kind)
+                    || Self::tile_expr_uses_index_kind(right, kind)
+            }
+            TileExpr::Vec4Splat { value } => Self::tile_expr_uses_index_kind(value, kind),
             TileExpr::QuantizedQ8_0Dot8 {
                 a,
                 k_base,
@@ -283,6 +395,7 @@ impl<'a> Lowerer<'a> {
             },
             TileExpr::Unary { value, .. }
             | TileExpr::Cast { value, .. }
+            | TileExpr::Bitcast { value, .. }
             | TileExpr::LoopFold { value, .. }
             | TileExpr::GroupReduce { value, .. }
             | TileExpr::SubgroupReduce { value, .. } => {
@@ -292,6 +405,9 @@ impl<'a> Lowerer<'a> {
                 Self::tile_expr_uses_index_kind(left, kind)
                     || Self::tile_expr_uses_index_kind(right, kind)
             }
+            TileExpr::Sum { values } => values
+                .iter()
+                .any(|expr| Self::tile_expr_uses_index_kind(expr, kind)),
             TileExpr::Select {
                 condition,
                 accept,
@@ -343,15 +459,24 @@ impl<'a> Lowerer<'a> {
         match expr {
             TileExpr::SubgroupReduce { .. } => true,
             TileExpr::Load(_)
+            | TileExpr::LoadLinear(_)
+            | TileExpr::LoadVec4(_)
+            | TileExpr::LoadLocal(_)
             | TileExpr::QuantizedLoad(_)
             | TileExpr::QuantizedBlockLane { .. }
             | TileExpr::Full(_)
             | TileExpr::Literal(_)
             | TileExpr::Index(_) => false,
+            TileExpr::LoadWorkgroup { .. } => false,
             TileExpr::Dot4 { a, b } => a
                 .iter()
                 .chain(b.iter())
                 .any(|expr| Self::tile_expr_uses_subgroup_reduce(expr)),
+            TileExpr::Vec4Dot { left, right } => {
+                Self::tile_expr_uses_subgroup_reduce(left)
+                    || Self::tile_expr_uses_subgroup_reduce(right)
+            }
+            TileExpr::Vec4Splat { value } => Self::tile_expr_uses_subgroup_reduce(value),
             TileExpr::QuantizedQ8_0Dot8 { a, .. } => a
                 .iter()
                 .any(|expr| Self::tile_expr_uses_subgroup_reduce(expr)),
@@ -382,6 +507,7 @@ impl<'a> Lowerer<'a> {
                 TileScalarExpr::Literal(_) => false,
             },
             TileExpr::Unary { value, .. }
+            | TileExpr::Bitcast { value, .. }
             | TileExpr::Cast { value, .. }
             | TileExpr::LoopFold { value, .. }
             | TileExpr::GroupReduce { value, .. } => Self::tile_expr_uses_subgroup_reduce(value),
@@ -389,6 +515,9 @@ impl<'a> Lowerer<'a> {
                 Self::tile_expr_uses_subgroup_reduce(left)
                     || Self::tile_expr_uses_subgroup_reduce(right)
             }
+            TileExpr::Sum { values } => values
+                .iter()
+                .any(|expr| Self::tile_expr_uses_subgroup_reduce(expr)),
             TileExpr::Select {
                 condition,
                 accept,
@@ -404,12 +533,17 @@ impl<'a> Lowerer<'a> {
     fn mark_tile_expr_live(ir: &KernelIr, expr: &TileExpr, live: &mut [bool]) {
         match expr {
             TileExpr::Load(_)
+            | TileExpr::LoadLinear(_)
+            | TileExpr::LoadVec4(_)
+            | TileExpr::LoadLocal(_)
             | TileExpr::QuantizedLoad(_)
             | TileExpr::Full(_)
             | TileExpr::Literal(_)
             | TileExpr::Index(_) => {}
+            TileExpr::LoadWorkgroup { src, .. } => Self::mark_tile_live(ir, *src, live),
             TileExpr::Scalar(expr) => Self::mark_tile_scalar_expr_live(ir, expr, live),
             TileExpr::Unary { value, .. }
+            | TileExpr::Bitcast { value, .. }
             | TileExpr::Cast { value, .. }
             | TileExpr::LoopFold { value, .. } => Self::mark_tile_expr_live(ir, value, live),
             TileExpr::GroupReduce { value, scratch, .. } => {
@@ -425,6 +559,11 @@ impl<'a> Lowerer<'a> {
                     Self::mark_tile_expr_live(ir, expr, live);
                 }
             }
+            TileExpr::Vec4Dot { left, right } => {
+                Self::mark_tile_expr_live(ir, left, live);
+                Self::mark_tile_expr_live(ir, right, live);
+            }
+            TileExpr::Vec4Splat { value } => Self::mark_tile_expr_live(ir, value, live),
             TileExpr::QuantizedQ8_0Dot8 { a, .. } => {
                 for expr in a {
                     Self::mark_tile_expr_live(ir, expr, live);
@@ -470,6 +609,11 @@ impl<'a> Lowerer<'a> {
             TileExpr::Binary { left, right, .. } => {
                 Self::mark_tile_expr_live(ir, left, live);
                 Self::mark_tile_expr_live(ir, right, live);
+            }
+            TileExpr::Sum { values } => {
+                for expr in values {
+                    Self::mark_tile_expr_live(ir, expr, live);
+                }
             }
             TileExpr::Select {
                 condition,

@@ -27,9 +27,97 @@ impl<'a> Lowerer<'a> {
         stmt: &TileStmt,
     ) -> Result<(), LowerError> {
         match stmt {
-            TileStmt::Store(_) | TileStmt::StoreSwiGlu(_) => Err(LowerError::UnsupportedOperation(
-                "store statements must be lowered by lower_tile_program",
-            )),
+            TileStmt::Store(store) => self.lower_tile_store_stmt(expressions, scratch, body, store),
+            TileStmt::StoreSwiGlu(store) => {
+                self.lower_tile_swiglu_store_stmt(expressions, scratch, body, store)
+            }
+            TileStmt::StoreVec4(store) => {
+                self.lower_tile_vec4_store_stmt(expressions, scratch, body, store)
+            }
+            TileStmt::StoreLinear(store) => {
+                self.lower_tile_linear_store_stmt(expressions, scratch, body, store)
+            }
+            TileStmt::StoreLocal { dst, value } => {
+                let value_ty = self.tile_expr_element(value)?;
+                if value_ty != dst.element {
+                    return Err(LowerError::LocalElementMismatch {
+                        local: dst.id,
+                        declared: dst.element,
+                        used: value_ty,
+                    });
+                }
+                let value = self.lower_tile_expr_lane(expressions, scratch, body, value, 0)?;
+                let local = self.private_local(*dst)?;
+                let pointer = expressions.append(Expression::LocalVariable(local), Span::default());
+                body.push(Statement::Store { pointer, value }, Span::default());
+                Ok(())
+            }
+            TileStmt::Emit { value } => {
+                self.lower_tile_expr_lane(expressions, scratch, body, value, 0)?;
+                Ok(())
+            }
+            TileStmt::StoreWorkgroup { dst, index, value } => {
+                let value_ty = self.tile_expr_element(value)?;
+                if value_ty != dst.element {
+                    return Err(LowerError::TileElementMismatch {
+                        tile: dst.id,
+                        declared: dst.element,
+                        used: value_ty,
+                    });
+                }
+                let value = self.lower_tile_expr_lane(expressions, scratch, body, value, 0)?;
+                let index = self.lower_tile_index_expr(expressions, scratch, body, index, 0)?;
+                let (pointer, emits) = self.tile_dynamic_pointer(expressions, *dst, index)?;
+                Self::push_emits(body, emits);
+                body.push(Statement::Store { pointer, value }, Span::default());
+                Ok(())
+            }
+            TileStmt::If {
+                condition,
+                accept,
+                reject,
+            } => {
+                let condition_ty = self.tile_expr_element(condition)?;
+                let condition =
+                    self.lower_tile_expr_lane(expressions, scratch, body, condition, 0)?;
+                let condition = self.condition_value(expressions, body, condition, condition_ty);
+                let mut accept_block = Block::new();
+                self.lower_tile_stmt_body(expressions, scratch, &mut accept_block, accept)?;
+                let mut reject_block = Block::new();
+                self.lower_tile_stmt_body(expressions, scratch, &mut reject_block, reject)?;
+                body.push(
+                    Statement::If {
+                        condition,
+                        accept: accept_block,
+                        reject: reject_block,
+                    },
+                    Span::default(),
+                );
+                Ok(())
+            }
+            TileStmt::Loop { body: inner } => {
+                self.flush_coop_acc_cache(expressions, body);
+                let mut loop_body = Block::new();
+                self.lower_tile_stmt_body(expressions, scratch, &mut loop_body, inner)?;
+                self.flush_coop_acc_cache(expressions, &mut loop_body);
+                body.push(
+                    Statement::Loop {
+                        body: loop_body,
+                        continuing: Block::new(),
+                        break_if: None,
+                    },
+                    Span::default(),
+                );
+                Ok(())
+            }
+            TileStmt::Break => {
+                body.push(Statement::Break, Span::default());
+                Ok(())
+            }
+            TileStmt::Return => {
+                body.push(Statement::Return { value: None }, Span::default());
+                Ok(())
+            }
             TileStmt::Barrier => {
                 body.push(
                     Statement::ControlBarrier(Barrier::WORK_GROUP),

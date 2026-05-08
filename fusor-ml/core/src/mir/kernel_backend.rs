@@ -9,7 +9,6 @@ use crate::{
 
 pub(crate) mod flash_attention;
 pub(crate) mod mirostat;
-mod naga_helpers;
 pub(crate) mod rms_norm;
 pub(crate) mod sampling_topk;
 
@@ -54,33 +53,6 @@ pub(crate) fn cached_kernel_ir(
     build_ir: impl FnOnce() -> Option<tile_ir::KernelIr>,
 ) -> Option<CompiledKernelModule> {
     cached_kernel_module(device, cache_key, || compile_ir(build_ir()?))
-}
-
-pub(super) fn cached_backend_naga_module(
-    device: &Device,
-    cache_key: impl Into<String>,
-    build_module: impl FnOnce() -> Option<wgpu::naga::Module>,
-) -> Option<CompiledKernelModule> {
-    cached_kernel_module(device, cache_key, || Some(compiled_module(build_module()?)))
-}
-
-pub(super) fn dynamic_kernel_from_backend_naga_module(
-    device: &Device,
-    name: impl Into<String>,
-    cache_key: impl Into<String>,
-    build_module: impl FnOnce() -> Option<wgpu::naga::Module>,
-    bindings: Vec<DirectKernelBinding>,
-    dispatch_size: [u32; 3],
-) -> Option<DirectKernel> {
-    let cache_key = cache_key.into();
-    let module = cached_backend_naga_module(device, cache_key.clone(), build_module)?;
-    Some(dynamic_kernel_from_module(
-        name,
-        cache_key,
-        module,
-        bindings,
-        dispatch_size,
-    ))
 }
 
 pub(crate) fn dynamic_kernel_from_ir(

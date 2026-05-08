@@ -1,6 +1,4 @@
-mod chunk;
-mod exactness;
-mod merge;
+use fusor_tile_ir as tile_ir;
 
 use crate::{
     kernel_selection::{Axis, KernelDeviceCaps, KernelShape, ShapeRule, ShapeSelector, eq, range},
@@ -11,10 +9,7 @@ use crate::{
     },
     tensor::{DataTypeEnum, TensorData},
 };
-use wgpu::{
-    CommandEncoder,
-    naga::{GlobalVariable, Handle, LocalVariable},
-};
+use wgpu::CommandEncoder;
 
 const TOPK_A: Axis<0> = Axis;
 const TOPK_B: Axis<1> = Axis;
@@ -212,11 +207,22 @@ pub(crate) fn top_k_exactness_flag_data_with_encoder(
         top_values.layout(),
         chunk_values.layout()
     );
-    let kernel = kernel_backend::dynamic_kernel_from_backend_naga_module(
+    let kernel = kernel_backend::dynamic_kernel_from_ir(
         device,
         "prove_top_k_exact_f32",
         cache_key,
-        || TopKExactnessModuleBuilder::new(meta).build(),
+        || {
+            tile_ir::kernels::top_k_exactness(tile_ir::TopKExactnessMeta {
+                chunks: meta.chunks,
+                candidate_count: meta.candidate_count,
+                output_per_chunk: meta.output_per_chunk,
+                top_k: meta.top_k,
+                top_values_offset: meta.top_values_offset,
+                top_values_stride: meta.top_values_stride,
+                chunk_values_offset: meta.chunk_values_offset,
+                chunk_values_stride: meta.chunk_values_stride,
+            })
+        },
         vec![
             DirectKernelBinding::Storage {
                 binding: 0,
@@ -253,15 +259,7 @@ pub(crate) fn top_k_exactness_flag_data_with_encoder(
     Some(flag)
 }
 
-pub(crate) fn chunk_top_k_pair_data(
-    input: &TensorData,
-    candidate_count: usize,
-    output_per_chunk: usize,
-) -> Option<(TensorData, TensorData)> {
-    chunk_top_k_pair_data_with_encoder(input, candidate_count, output_per_chunk, None)
-}
-
-fn chunk_top_k_pair_data_with_encoder(
+pub(crate) fn chunk_top_k_pair_data_with_encoder(
     input: &TensorData,
     candidate_count: usize,
     output_per_chunk: usize,
@@ -326,15 +324,14 @@ fn chunk_top_k_pair_data_inner_with_encoder(
     let cache_key = format!(
         "chunk_top_k_pairs_f32:block={TOP_K_BLOCK}:chunk={TOP_K_CHUNK}:len={input_len}:candidate_count={candidate_count}:output_per_chunk={output_per_chunk}:offset={input_offset}:stride={input_stride}:processors={has_processors}"
     );
-    let build_module = || {
-        TopKModuleBuilder::new(
-            input_len.try_into().ok()?,
-            output_per_chunk.try_into().ok()?,
-            input_offset.try_into().ok()?,
-            input_stride.try_into().ok()?,
-            has_processors,
-        )
-        .build()
+    let build_ir = || {
+        tile_ir::kernels::top_k_chunk(tile_ir::TopKChunkMeta {
+            input_len: input_len.try_into().ok()?,
+            output_per_chunk: output_per_chunk.try_into().ok()?,
+            input_offset: input_offset.try_into().ok()?,
+            input_stride: input_stride.try_into().ok()?,
+            processors: has_processors,
+        })
     };
 
     let kernel = if let Some((previous_tokens, params)) = processors {
@@ -365,20 +362,20 @@ fn chunk_top_k_pair_data_inner_with_encoder(
                 read_only: true,
             },
         ];
-        kernel_backend::dynamic_kernel_from_backend_naga_module(
+        kernel_backend::dynamic_kernel_from_ir(
             device,
             "chunk_top_k_pairs_f32",
             cache_key,
-            build_module,
+            build_ir,
             bindings,
             [chunks.try_into().ok()?, 1, 1],
         )?
     } else {
-        kernel_backend::dynamic_kernel_from_backend_naga_module(
+        kernel_backend::dynamic_kernel_from_ir(
             device,
             "chunk_top_k_pairs_f32",
             cache_key,
-            build_module,
+            build_ir,
             vec![
                 DirectKernelBinding::Storage {
                     binding: 0,
@@ -414,27 +411,6 @@ fn chunk_top_k_pair_data_inner_with_encoder(
     }
 
     Some((ids, values))
-}
-
-pub(crate) fn merge_sorted_chunk_top_k_pair_data(
-    input_ids: &TensorData,
-    input_values: &TensorData,
-    chunks: usize,
-    chunk_len: usize,
-    chunk_stride: usize,
-    input_len: usize,
-    k: usize,
-) -> Option<(TensorData, TensorData)> {
-    merge_sorted_chunk_top_k_pair_data_with_encoder(
-        input_ids,
-        input_values,
-        chunks,
-        chunk_len,
-        chunk_stride,
-        input_len,
-        k,
-        None,
-    )
 }
 
 pub(crate) fn merge_sorted_chunk_top_k_pair_data_with_encoder(
@@ -479,19 +455,18 @@ pub(crate) fn merge_sorted_chunk_top_k_pair_data_with_encoder(
         input_ids.layout(),
         input_values.layout()
     );
-    let kernel = kernel_backend::dynamic_kernel_from_backend_naga_module(
+    let kernel = kernel_backend::dynamic_kernel_from_ir(
         device,
         "merge_sorted_chunk_top_k_pairs_f32",
         cache_key,
         || {
-            MergeTopKModuleBuilder::new(
-                chunks.try_into().ok()?,
-                chunk_len.try_into().ok()?,
-                chunk_stride.try_into().ok()?,
-                input_len.try_into().ok()?,
-                output_len.try_into().ok()?,
-            )
-            .build()
+            tile_ir::kernels::top_k_merge(tile_ir::MergeTopKMeta {
+                chunks: chunks.try_into().ok()?,
+                chunk_len: chunk_len.try_into().ok()?,
+                chunk_stride: chunk_stride.try_into().ok()?,
+                input_len: input_len.try_into().ok()?,
+                k: output_len.try_into().ok()?,
+            })
         },
         vec![
             DirectKernelBinding::Storage {
@@ -532,77 +507,6 @@ pub(crate) fn merge_sorted_chunk_top_k_pair_data_with_encoder(
     }
 
     Some((ids, values))
-}
-
-struct TopKModuleBuilder {
-    input_len: u32,
-    output_per_chunk: u32,
-    input_offset: u32,
-    input_stride: u32,
-    processors: bool,
-}
-
-struct TopKGlobals {
-    input: Handle<GlobalVariable>,
-    output_ids: Handle<GlobalVariable>,
-    output_values: Handle<GlobalVariable>,
-    previous_tokens: Option<Handle<GlobalVariable>>,
-    processor_params: Option<Handle<GlobalVariable>>,
-    scratch_values: Handle<GlobalVariable>,
-    scratch_ids: Handle<GlobalVariable>,
-}
-
-struct TopKLocals {
-    current_value: Handle<LocalVariable>,
-    current_id: Handle<LocalVariable>,
-    previous_index: Handle<LocalVariable>,
-    repeated: Handle<LocalVariable>,
-}
-
-struct TopKExactnessModuleBuilder {
-    meta: TopKExactnessMeta,
-}
-
-#[derive(Clone, Copy)]
-struct TopKExactnessGlobals {
-    top_values: Handle<GlobalVariable>,
-    chunk_values: Handle<GlobalVariable>,
-    flag: Handle<GlobalVariable>,
-    scratch: Handle<GlobalVariable>,
-}
-
-#[derive(Clone, Copy)]
-struct TopKExactnessLocals {
-    chunk: Handle<LocalVariable>,
-    inexact: Handle<LocalVariable>,
-}
-
-struct MergeTopKModuleBuilder {
-    chunks: u32,
-    chunk_len: u32,
-    chunk_stride: u32,
-    input_len: u32,
-    k: u32,
-}
-
-struct MergeTopKGlobals {
-    input_ids: Handle<GlobalVariable>,
-    input_values: Handle<GlobalVariable>,
-    output_ids: Handle<GlobalVariable>,
-    output_values: Handle<GlobalVariable>,
-    chunk_positions: Handle<GlobalVariable>,
-    scratch_values: Handle<GlobalVariable>,
-    scratch_ids: Handle<GlobalVariable>,
-    scratch_chunks: Handle<GlobalVariable>,
-}
-
-struct MergeTopKLocals {
-    rank: Handle<LocalVariable>,
-    scan_chunk: Handle<LocalVariable>,
-    local_best_value: Handle<LocalVariable>,
-    local_best_id: Handle<LocalVariable>,
-    local_best_chunk: Handle<LocalVariable>,
-    reduce_step: Handle<LocalVariable>,
 }
 
 #[cfg(test)]

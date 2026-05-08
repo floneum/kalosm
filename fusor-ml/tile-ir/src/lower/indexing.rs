@@ -110,6 +110,29 @@ impl<'a> Lowerer<'a> {
         Ok(&view.layout)
     }
 
+    pub(super) fn private_local(
+        &self,
+        local: LocalRef,
+    ) -> Result<Handle<LocalVariable>, LowerError> {
+        let decl = self
+            .ir
+            .locals()
+            .get(local.id.index())
+            .ok_or(LowerError::UnknownLocal(local.id))?;
+        if decl.element != local.element {
+            return Err(LowerError::LocalElementMismatch {
+                local: local.id,
+                declared: decl.element,
+                used: local.element,
+            });
+        }
+        self.private_locals
+            .get(local.id.index())
+            .copied()
+            .flatten()
+            .ok_or(LowerError::UnknownLocal(local.id))
+    }
+
     pub(super) fn is_u32_literal(
         expressions: &Arena<Expression>,
         value: Handle<Expression>,

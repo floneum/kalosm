@@ -7,9 +7,11 @@ use crate::{LowerError, NagaKernel, QuantizedMatrix};
 pub struct KernelIr {
     pub(crate) buffers: Vec<BufferDecl>,
     pub(crate) tiles: Vec<TileDecl>,
+    pub(crate) locals: Vec<LocalDecl>,
     pub(crate) body: Block,
     pub(crate) next_buffer: u32,
     pub(crate) next_tile: u32,
+    pub(crate) next_local: u32,
     pub(crate) next_block_dequant: u32,
     /// Side table of pinned subexpressions, indexed by `PinId`. The lowerer
     /// emits each entry into a private local on first reference and reuses the
@@ -110,6 +112,11 @@ impl KernelIr {
     /// Workgroup tile declarations allocated by the kernel.
     pub fn tiles(&self) -> &[TileDecl] {
         &self.tiles
+    }
+
+    /// Private scalar/vector locals allocated by tiled programs.
+    pub fn locals(&self) -> &[LocalDecl] {
+        &self.locals
     }
 
     /// The structured root body of the kernel.
@@ -226,6 +233,36 @@ pub struct TileDecl {
 pub struct TileRef {
     pub id: TileId,
     pub element: ElementType,
+}
+
+/// A private per-invocation local declaration.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LocalDecl {
+    pub id: LocalId,
+    pub element: ElementType,
+}
+
+/// A typed private local reference.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct LocalRef {
+    pub id: LocalId,
+    pub element: ElementType,
+}
+
+impl LocalRef {
+    pub const fn new(id: LocalId, element: ElementType) -> Self {
+        Self { id, element }
+    }
+}
+
+/// A private local identifier.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+pub struct LocalId(pub(crate) u32);
+
+impl LocalId {
+    pub const fn index(self) -> usize {
+        self.0 as usize
+    }
 }
 
 impl TileRef {
@@ -377,6 +414,33 @@ pub enum TileStmt {
     /// This keeps the uniform `gate`/`up` expressions outside the store mask,
     /// then computes `gate * sigmoid(gate) * up` only for lanes that store.
     StoreSwiGlu(TileSwiGluStoreStmt),
+    /// Per-lane masked vector storage write to a rank-1 storage view.
+    StoreVec4(TileVec4StoreStmt),
+    /// Per-lane masked rank-1 storage write.
+    StoreLinear(TileLinearStoreStmt),
+    /// Store to a private per-invocation local.
+    StoreLocal { dst: LocalRef, value: TileExpr },
+    /// Materialize a pure tile expression at this point so later pinned
+    /// references can reuse the resulting SSA handle in dominated blocks.
+    Emit { value: TileExpr },
+    /// Store to a workgroup scratch tile at a dynamic flat index.
+    StoreWorkgroup {
+        dst: TileRef,
+        index: TileIndexExpr,
+        value: TileExpr,
+    },
+    /// Per-invocation control flow.
+    If {
+        condition: TileExpr,
+        accept: Vec<TileStmt>,
+        reject: Vec<TileStmt>,
+    },
+    /// Unstructured loop. Body may contain `Break` and `Return`.
+    Loop { body: Vec<TileStmt> },
+    /// Break out of the innermost `Loop`.
+    Break,
+    /// Return from the kernel entry point.
+    Return,
     /// Zero-initialize a coop accumulator.
     ZeroCoopAcc { id: CoopAccId },
     /// Cooperatively copy a workgroup-tile-sized region of a storage view into
@@ -453,6 +517,24 @@ pub struct TileSwiGluStoreStmt {
     pub mask: TileMaskExpr,
 }
 
+/// A masked vec4 store emitted by a source tile program.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TileVec4StoreStmt {
+    pub dst: StorageView,
+    pub index: TileIndexExpr,
+    pub value: TileExpr,
+    pub mask: TileMaskExpr,
+}
+
+/// A masked rank-1 store emitted by a source tile program.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TileLinearStoreStmt {
+    pub dst: StorageView,
+    pub index: TileIndexExpr,
+    pub value: TileExpr,
+    pub mask: TileMaskExpr,
+}
+
 /// Floating point literal stored by bits so IR equality remains exact.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct F32Bits(pub u32);
@@ -473,6 +555,7 @@ pub enum TileLiteral {
     F32(F32Bits),
     F16(u16),
     U32(u32),
+    Bool(bool),
 }
 
 impl TileLiteral {
@@ -481,6 +564,7 @@ impl TileLiteral {
             Self::F32(_) => ElementType::F32,
             Self::F16(_) => ElementType::F16,
             Self::U32(_) => ElementType::U32,
+            Self::Bool(_) => ElementType::Bool,
         }
     }
 }
@@ -489,6 +573,13 @@ impl TileLiteral {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum TileExpr {
     Load(TileLoadExpr),
+    LoadLinear(TileLinearLoadExpr),
+    LoadVec4(TileVec4LoadExpr),
+    LoadWorkgroup {
+        src: TileRef,
+        index: TileIndexExpr,
+    },
+    LoadLocal(LocalRef),
     QuantizedLoad(TileQuantizedLoadExpr),
     Full(F32Bits),
     Literal(TileLiteral),
@@ -503,7 +594,17 @@ pub enum TileExpr {
         left: Box<TileExpr>,
         right: Box<TileExpr>,
     },
+    /// Left-associated sum of a flat value list. This represents long
+    /// unrolled accumulations without forcing the lowerer to recurse through
+    /// a deep binary tree.
+    Sum {
+        values: Vec<Box<TileExpr>>,
+    },
     Cast {
+        value: Box<TileExpr>,
+        to: ElementType,
+    },
+    Bitcast {
         value: Box<TileExpr>,
         to: ElementType,
     },
@@ -555,6 +656,15 @@ pub enum TileExpr {
     Dot4 {
         a: [Box<TileExpr>; 4],
         b: [Box<TileExpr>; 4],
+    },
+    /// Dot product between two `vec4<f32>` expressions.
+    Vec4Dot {
+        left: Box<TileExpr>,
+        right: Box<TileExpr>,
+    },
+    /// `vec4<f32>(value, value, value, value)`.
+    Vec4Splat {
+        value: Box<TileExpr>,
     },
     QuantizedQ8_0Dot8 {
         a: [Box<TileExpr>; 8],
@@ -629,6 +739,24 @@ pub struct TileLoadExpr {
     pub fill: TileLiteral,
 }
 
+/// A masked rank-1 vec4 load.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TileVec4LoadExpr {
+    pub src: StorageView,
+    pub index: TileIndexExpr,
+    pub mask: TileMaskExpr,
+    pub fill: F32Bits,
+}
+
+/// A masked rank-1 storage load.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TileLinearLoadExpr {
+    pub src: StorageView,
+    pub index: TileIndexExpr,
+    pub mask: TileMaskExpr,
+    pub fill: TileLiteral,
+}
+
 /// A masked dequantizing rank-1 tile load from a packed quantized matrix.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TileQuantizedLoadExpr {
@@ -697,6 +825,7 @@ pub enum TileUnaryOp {
     Log,
     Log2,
     Sqrt,
+    InverseSqrt,
     Sin,
     Cos,
     Tan,
@@ -723,6 +852,11 @@ pub enum TileBinaryOp {
     Pow,
     Min,
     Max,
+    BitAnd,
+    BitOr,
+    BitXor,
+    LogicalAnd,
+    LogicalOr,
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -740,6 +874,7 @@ pub enum TileCompareOp {
     Gt,
     Ge,
     Eq,
+    Ne,
 }
 
 /// A tiny tile identifier for the typed IR.
@@ -759,6 +894,8 @@ pub enum ElementType {
     F32,
     F16,
     U32,
+    F32Vec4,
+    Bool,
 }
 
 /// A sample numeric marker.
@@ -772,6 +909,14 @@ pub struct F16;
 /// Packed u32 storage marker.
 #[derive(Copy, Clone, Debug)]
 pub struct U32;
+
+/// Four packed f32 values stored as one storage element.
+#[derive(Copy, Clone, Debug)]
+pub struct F32Vec4;
+
+/// Boolean private/control value marker.
+#[derive(Copy, Clone, Debug)]
+pub struct Bool;
 
 /// Numeric element markers that can appear in the typed IR.
 pub trait Numeric {
@@ -788,6 +933,14 @@ impl Numeric for F16 {
 
 impl Numeric for U32 {
     const ELEMENT: ElementType = ElementType::U32;
+}
+
+impl Numeric for F32Vec4 {
+    const ELEMENT: ElementType = ElementType::F32Vec4;
+}
+
+impl Numeric for Bool {
+    const ELEMENT: ElementType = ElementType::Bool;
 }
 
 /// A concrete layout for a tile-like value.

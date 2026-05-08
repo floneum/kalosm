@@ -29,8 +29,6 @@ use parking_lot::RwLock;
 use rustc_hash::{FxBuildHasher, FxHasher};
 
 const BLOCK: usize = 1024;
-const VEC4_BLOCK: u32 = 128;
-const VEC4_SUBGROUP_WIDTH: u32 = 32;
 const RMS_NORM_MODULE_CACHE_SIZE: usize = 128;
 
 fn rms_norm_module_cache()
@@ -344,11 +342,9 @@ impl Operation for RmsNormOperation {
                 output.layout()
             );
             let module = if let Some(meta) = vec4_meta {
-                kernel_backend::cached_backend_naga_module(
-                    &graph.device(),
-                    verbose_cache_key,
-                    || build_rms_norm_vec4_naga_module(meta),
-                )?
+                kernel_backend::cached_kernel_ir(&graph.device(), verbose_cache_key, || {
+                    tile_ir::kernels::rms_norm_vec4(meta.into_tile_ir(), rows)
+                })?
             } else {
                 kernel_backend::cached_kernel_ir(&graph.device(), verbose_cache_key, || {
                     build_rms_norm_tile_ir(
@@ -446,6 +442,24 @@ pub(crate) struct RmsNormVec4Meta {
     output_row_stride_vec: u32,
 }
 
+impl RmsNormVec4Meta {
+    fn into_tile_ir(self) -> tile_ir::RmsNormVec4Meta {
+        tile_ir::RmsNormVec4Meta {
+            cols: self.cols,
+            cols_vec: self.cols_vec,
+            eps: tile_ir::F32Bits::new(self.eps),
+            input_offset_vec: self.input_offset_vec,
+            input_row_stride_vec: self.input_row_stride_vec,
+            residual_offset_vec: self.residual_offset_vec,
+            residual_row_stride_vec: self.residual_row_stride_vec,
+            weight_offset_vec: self.weight_offset_vec,
+            bias_offset_vec: self.bias_offset_vec,
+            output_offset_vec: self.output_offset_vec,
+            output_row_stride_vec: self.output_row_stride_vec,
+        }
+    }
+}
+
 fn build_vec4_rms_norm_meta(
     input_view: crate::mir::tile_direct::DirectMatrixLayout,
     residual_view: Option<crate::mir::tile_direct::DirectMatrixLayout>,
@@ -529,11 +543,6 @@ fn build_vec4_rms_norm_meta(
 fn matrix_strides(strides: &tile_ir::Strides) -> Option<[u32; 2]> {
     strides.values().try_into().ok()
 }
-
-#[path = "rms_norm_vec4.rs"]
-mod rms_norm_vec4;
-
-use rms_norm_vec4::build_rms_norm_vec4_naga_module;
 
 fn build_rms_norm_tile_ir(
     input_view: crate::mir::tile_direct::DirectMatrixLayout,

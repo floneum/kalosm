@@ -1,13 +1,14 @@
 use std::marker::PhantomData;
-use std::ops::{Add, Div, Mul, Rem, Sub};
+use std::ops::{Add, BitAnd, BitXor, Div, Mul, Rem, Sub};
 
 use crate::ir::{
     BlockDequantId, BufferAccess, BufferDecl, BufferRef, CoopAccDecl, CoopAccId, CoopFragmentId,
-    CoopOperandRole, DynamicOffset, F32Bits, Im2ColNhwcMap, KernelIr, Layout, LoopFoldGroup,
-    LoopFoldGroupId, MemoryLevel, Numeric, Op, PinId, Shape, StorageIndexMap, StorageView,
-    TileBinaryOp, TileCompareOp, TileDecl, TileExpr, TileIndexExpr, TileLevel, TileLiteral,
-    TileLoadExpr, TileMaskExpr, TileOrigin, TileProgramOp, TileQuantizedLoadExpr, TileReduceOp,
-    TileRef, TileScalarExpr, TileStmt, TileStoreStmt, TileSwiGluStoreStmt, TileUnaryOp,
+    CoopOperandRole, DynamicOffset, F32Bits, F32Vec4, Im2ColNhwcMap, KernelIr, Layout, LocalDecl,
+    LocalRef, LoopFoldGroup, LoopFoldGroupId, MemoryLevel, Numeric, Op, PinId, Shape,
+    StorageIndexMap, StorageView, TileBinaryOp, TileCompareOp, TileDecl, TileExpr, TileIndexExpr,
+    TileLevel, TileLinearLoadExpr, TileLinearStoreStmt, TileLiteral, TileLoadExpr, TileMaskExpr,
+    TileOrigin, TileProgramOp, TileQuantizedLoadExpr, TileReduceOp, TileRef, TileScalarExpr,
+    TileStmt, TileStoreStmt, TileSwiGluStoreStmt, TileUnaryOp, TileVec4LoadExpr, TileVec4StoreStmt,
     WorkgroupAxis, WorkgroupOffset, F32, U32,
 };
 use crate::quantized::{GgmlQuantFormat, QuantizedMatrix};
@@ -1513,10 +1514,29 @@ impl Program {
         id
     }
 
+    fn alloc_local<T: Numeric>(&mut self) -> LocalRef {
+        let id = crate::LocalId(self.ir.next_local);
+        self.ir.next_local += 1;
+        let local = LocalRef::new(id, T::ELEMENT);
+        self.ir.locals.push(LocalDecl {
+            id,
+            element: T::ELEMENT,
+        });
+        local
+    }
+
     /// Allocate a workgroup-scope f32 tile of shape `[rows, cols]`.
     pub fn alloc_workgroup_tile_f32(&mut self, rows: u32, cols: u32) -> TileRef {
         self.alloc_tile::<F32>(
             Layout::contiguous(MemoryLevel::Workgroup, Shape::new([rows, cols])),
+            TileLevel::Workgroup,
+        )
+    }
+
+    /// Allocate a rank-1 workgroup-scope scratch array.
+    pub fn alloc_workgroup_array<T: Numeric>(&mut self, len: u32) -> TileRef {
+        self.alloc_tile::<T>(
+            Layout::contiguous(MemoryLevel::Workgroup, Shape::new([len])),
             TileLevel::Workgroup,
         )
     }
@@ -1552,6 +1572,16 @@ pub struct ErasedStorage<const R: usize> {
 impl<const R: usize> ErasedStorage<R> {
     pub fn view(&self) -> &StorageView {
         &self.view
+    }
+}
+
+impl<T> Storage<T, 1> {
+    pub fn at<const N: usize>(&self, index: impl IntoIndex<N>) -> LinearAddress<T, N> {
+        LinearAddress {
+            view: self.view.clone(),
+            index: index.into_index(),
+            _ty: PhantomData,
+        }
     }
 }
 
@@ -1829,6 +1859,38 @@ impl<const BLOCK: usize> TileBlock<'_, BLOCK> {
         }
     }
 
+    pub fn load_linear<T: Numeric>(
+        &self,
+        address: LinearAddress<T, BLOCK>,
+        mask: Mask<BLOCK>,
+        fill: TileLiteral,
+    ) -> Tile<BLOCK> {
+        Tile {
+            expr: TileExpr::LoadLinear(TileLinearLoadExpr {
+                src: address.view,
+                index: address.index,
+                mask: mask.expr,
+                fill,
+            }),
+        }
+    }
+
+    pub fn load_vec4(
+        &self,
+        address: LinearAddress<F32Vec4, BLOCK>,
+        mask: Mask<BLOCK>,
+        fill: f32,
+    ) -> Tile<BLOCK> {
+        Tile {
+            expr: TileExpr::LoadVec4(TileVec4LoadExpr {
+                src: address.view,
+                index: address.index,
+                mask: mask.expr,
+                fill: F32Bits::new(fill),
+            }),
+        }
+    }
+
     pub fn load_erased(
         &self,
         address: ErasedAddress<BLOCK>,
@@ -1913,6 +1975,19 @@ impl<const BLOCK: usize> TileBlock<'_, BLOCK> {
         }
     }
 
+    /// Build a left-associated sum from a flat value list without creating a
+    /// deep nested binary expression.
+    pub fn sum(&self, values: impl IntoIterator<Item = Tile<BLOCK>>) -> Tile<BLOCK> {
+        Tile {
+            expr: TileExpr::Sum {
+                values: values
+                    .into_iter()
+                    .map(|value| Box::new(value.expr))
+                    .collect(),
+            },
+        }
+    }
+
     /// Run one K-loop with N parallel reductions. The body closure runs once
     /// at IR-build time and produces N tile expressions that all share the
     /// same loop scope; the lowerer materializes a single Naga loop with N
@@ -1965,6 +2040,23 @@ impl<const BLOCK: usize> TileBlock<'_, BLOCK> {
                     Box::new(b2.expr),
                     Box::new(b3.expr),
                 ],
+            },
+        }
+    }
+
+    pub fn vec4_dot(&self, left: Tile<BLOCK>, right: Tile<BLOCK>) -> Tile<BLOCK> {
+        Tile {
+            expr: TileExpr::Vec4Dot {
+                left: Box::new(left.expr),
+                right: Box::new(right.expr),
+            },
+        }
+    }
+
+    pub fn vec4_splat(&self, value: Tile<BLOCK>) -> Tile<BLOCK> {
+        Tile {
+            expr: TileExpr::Vec4Splat {
+                value: Box::new(value.expr),
             },
         }
     }
@@ -2115,6 +2207,18 @@ impl<const BLOCK: usize> TileBlock<'_, BLOCK> {
         Tile {
             expr: TileExpr::Literal(value),
         }
+    }
+
+    pub fn f32(&self, value: f32) -> Tile<BLOCK> {
+        self.literal(TileLiteral::F32(F32Bits::new(value)))
+    }
+
+    pub fn u32(&self, value: u32) -> Tile<BLOCK> {
+        self.literal(TileLiteral::U32(value))
+    }
+
+    pub fn bool(&self, value: bool) -> Tile<BLOCK> {
+        self.literal(TileLiteral::Bool(value))
     }
 
     pub fn index(&self, value: impl IntoIndex<BLOCK>) -> Tile<BLOCK> {
@@ -2338,6 +2442,90 @@ impl<const BLOCK: usize> TileBlock<'_, BLOCK> {
         self.push_stmt(TileStmt::Barrier);
     }
 
+    pub fn private<T: Numeric>(&mut self) -> Local<T, BLOCK> {
+        Local {
+            local: self.program.alloc_local::<T>(),
+            _ty: PhantomData,
+        }
+    }
+
+    pub fn load_local<T>(&self, local: &Local<T, BLOCK>) -> Tile<BLOCK> {
+        Tile {
+            expr: TileExpr::LoadLocal(local.local),
+        }
+    }
+
+    pub fn store_local<T>(&mut self, local: &Local<T, BLOCK>, value: Tile<BLOCK>) {
+        self.push_stmt(TileStmt::StoreLocal {
+            dst: local.local,
+            value: value.expr,
+        });
+    }
+
+    pub fn emit(&mut self, value: Tile<BLOCK>) {
+        self.push_stmt(TileStmt::Emit { value: value.expr });
+    }
+
+    pub fn load_workgroup(&self, tile: TileRef, index: impl IntoIndex<BLOCK>) -> Tile<BLOCK> {
+        Tile {
+            expr: TileExpr::LoadWorkgroup {
+                src: tile,
+                index: index.into_index(),
+            },
+        }
+    }
+
+    pub fn store_workgroup(
+        &mut self,
+        tile: TileRef,
+        index: impl IntoIndex<BLOCK>,
+        value: Tile<BLOCK>,
+    ) {
+        self.push_stmt(TileStmt::StoreWorkgroup {
+            dst: tile,
+            index: index.into_index(),
+            value: value.expr,
+        });
+    }
+
+    pub fn if_then(&mut self, condition: Tile<BLOCK>, accept: impl FnOnce(&mut Self)) {
+        self.if_else(condition, accept, |_| {});
+    }
+
+    pub fn if_else(
+        &mut self,
+        condition: Tile<BLOCK>,
+        accept: impl FnOnce(&mut Self),
+        reject: impl FnOnce(&mut Self),
+    ) {
+        self.stmt_stack.push(Vec::new());
+        accept(self);
+        let accept = self.stmt_stack.pop().expect("if accept frame missing");
+        self.stmt_stack.push(Vec::new());
+        reject(self);
+        let reject = self.stmt_stack.pop().expect("if reject frame missing");
+        self.push_stmt(TileStmt::If {
+            condition: condition.expr,
+            accept,
+            reject,
+        });
+    }
+
+    pub fn loop_forever(&mut self, body: impl FnOnce(&mut Self)) {
+        self.stmt_stack.push(Vec::new());
+        body(self);
+        let body = self.stmt_stack.pop().expect("loop frame missing");
+        self.push_stmt(TileStmt::Loop { body });
+    }
+
+    pub fn break_loop(&mut self) {
+        self.push_stmt(TileStmt::Break);
+    }
+
+    pub fn return_(&mut self) {
+        self.push_stmt(TileStmt::Return);
+    }
+
     /// `acc += coop_load_a(a_tile, ar, ak) * coop_load_b(b_tile, bk, bc)`.
     /// Convenience wrapper that emits `coop_load_a`, `coop_load_b`, then
     /// `coop_mma`. For MMAs that share an A or B operand across the inner row ×
@@ -2472,6 +2660,34 @@ impl<const BLOCK: usize> TileBlock<'_, BLOCK> {
         }));
     }
 
+    pub fn store_linear<T: Numeric>(
+        &mut self,
+        address: LinearAddress<T, BLOCK>,
+        value: Tile<BLOCK>,
+        mask: Mask<BLOCK>,
+    ) {
+        self.push_stmt(TileStmt::StoreLinear(TileLinearStoreStmt {
+            dst: address.view,
+            index: address.index,
+            value: value.expr,
+            mask: mask.expr,
+        }));
+    }
+
+    pub fn store_vec4(
+        &mut self,
+        address: LinearAddress<F32Vec4, BLOCK>,
+        value: Tile<BLOCK>,
+        mask: Mask<BLOCK>,
+    ) {
+        self.push_stmt(TileStmt::StoreVec4(TileVec4StoreStmt {
+            dst: address.view,
+            index: address.index,
+            value: value.expr,
+            mask: mask.expr,
+        }));
+    }
+
     pub fn store_swiglu(
         &mut self,
         address: Address<F32, BLOCK>,
@@ -2540,6 +2756,17 @@ pub struct Address<T, const N: usize> {
     row: TileIndexExpr,
     col: TileIndexExpr,
     _ty: PhantomData<T>,
+}
+
+pub struct LinearAddress<T, const N: usize> {
+    view: StorageView,
+    index: TileIndexExpr,
+    _ty: PhantomData<T>,
+}
+
+pub struct Local<T, const N: usize> {
+    local: LocalRef,
+    _ty: PhantomData<(T, [(); N])>,
 }
 
 pub struct ErasedAddress<const N: usize> {
@@ -2725,6 +2952,34 @@ impl Div<u32> for ScalarIndex {
     }
 }
 
+impl BitAnd<u32> for ScalarIndex {
+    type Output = ScalarIndex;
+
+    fn bitand(self, rhs: u32) -> Self::Output {
+        ScalarIndex {
+            expr: TileIndexExpr::Value(Box::new(TileExpr::Binary {
+                op: TileBinaryOp::BitAnd,
+                left: Box::new(TileExpr::Index(self.expr)),
+                right: Box::new(TileExpr::Literal(TileLiteral::U32(rhs))),
+            })),
+        }
+    }
+}
+
+impl BitXor<u32> for ScalarIndex {
+    type Output = ScalarIndex;
+
+    fn bitxor(self, rhs: u32) -> Self::Output {
+        ScalarIndex {
+            expr: TileIndexExpr::Value(Box::new(TileExpr::Binary {
+                op: TileBinaryOp::BitXor,
+                left: Box::new(TileExpr::Index(self.expr)),
+                right: Box::new(TileExpr::Literal(TileLiteral::U32(rhs))),
+            })),
+        }
+    }
+}
+
 impl Rem<u32> for ScalarIndex {
     type Output = ScalarIndex;
 
@@ -2763,6 +3018,34 @@ impl<const N: usize> Div<u32> for Range<N> {
         assert!(rhs > 0, "tile index divisor must be non-zero");
         Range {
             expr: TileIndexExpr::Div(Box::new(self.expr), rhs),
+        }
+    }
+}
+
+impl<const N: usize> BitAnd<u32> for Range<N> {
+    type Output = Range<N>;
+
+    fn bitand(self, rhs: u32) -> Self::Output {
+        Range {
+            expr: TileIndexExpr::Value(Box::new(TileExpr::Binary {
+                op: TileBinaryOp::BitAnd,
+                left: Box::new(TileExpr::Index(self.expr)),
+                right: Box::new(TileExpr::Literal(TileLiteral::U32(rhs))),
+            })),
+        }
+    }
+}
+
+impl<const N: usize> BitXor<u32> for Range<N> {
+    type Output = Range<N>;
+
+    fn bitxor(self, rhs: u32) -> Self::Output {
+        Range {
+            expr: TileIndexExpr::Value(Box::new(TileExpr::Binary {
+                op: TileBinaryOp::BitXor,
+                left: Box::new(TileExpr::Index(self.expr)),
+                right: Box::new(TileExpr::Literal(TileLiteral::U32(rhs))),
+            })),
         }
     }
 }
@@ -2852,6 +3135,10 @@ impl<const N: usize> Tile<N> {
         self.unary(TileUnaryOp::Exp)
     }
 
+    pub fn inverse_sqrt(self) -> Self {
+        self.unary(TileUnaryOp::InverseSqrt)
+    }
+
     pub fn unary(self, op: TileUnaryOp) -> Self {
         Self {
             expr: TileExpr::Unary {
@@ -2868,6 +3155,15 @@ impl<const N: usize> Tile<N> {
     pub fn cast(self, to: crate::ElementType) -> Self {
         Self {
             expr: TileExpr::Cast {
+                value: Box::new(self.expr),
+                to,
+            },
+        }
+    }
+
+    pub fn bitcast(self, to: crate::ElementType) -> Self {
+        Self {
+            expr: TileExpr::Bitcast {
                 value: Box::new(self.expr),
                 to,
             },
@@ -2895,6 +3191,34 @@ impl<const N: usize> Tile<N> {
         }
     }
 
+    pub fn compare_bool(op: TileCompareOp, left: Self, right: Self) -> Self {
+        Self::compare(op, left, right, crate::ElementType::Bool)
+    }
+
+    pub fn lt(self, rhs: Self) -> Self {
+        Self::compare_bool(TileCompareOp::Lt, self, rhs)
+    }
+
+    pub fn le(self, rhs: Self) -> Self {
+        Self::compare_bool(TileCompareOp::Le, self, rhs)
+    }
+
+    pub fn gt(self, rhs: Self) -> Self {
+        Self::compare_bool(TileCompareOp::Gt, self, rhs)
+    }
+
+    pub fn ge(self, rhs: Self) -> Self {
+        Self::compare_bool(TileCompareOp::Ge, self, rhs)
+    }
+
+    pub fn eq(self, rhs: Self) -> Self {
+        Self::compare_bool(TileCompareOp::Eq, self, rhs)
+    }
+
+    pub fn ne(self, rhs: Self) -> Self {
+        Self::compare_bool(TileCompareOp::Ne, self, rhs)
+    }
+
     pub fn binary(self, op: TileBinaryOp, rhs: Self) -> Self {
         Tile {
             expr: TileExpr::Binary {
@@ -2911,6 +3235,26 @@ impl<const N: usize> Tile<N> {
 
     pub fn min(self, rhs: Self) -> Self {
         self.binary(TileBinaryOp::Min, rhs)
+    }
+
+    pub fn bit_and(self, rhs: Self) -> Self {
+        self.binary(TileBinaryOp::BitAnd, rhs)
+    }
+
+    pub fn bit_or(self, rhs: Self) -> Self {
+        self.binary(TileBinaryOp::BitOr, rhs)
+    }
+
+    pub fn bit_xor(self, rhs: Self) -> Self {
+        self.binary(TileBinaryOp::BitXor, rhs)
+    }
+
+    pub fn and(self, rhs: Self) -> Self {
+        self.binary(TileBinaryOp::LogicalAnd, rhs)
+    }
+
+    pub fn or(self, rhs: Self) -> Self {
+        self.binary(TileBinaryOp::LogicalOr, rhs)
     }
 }
 

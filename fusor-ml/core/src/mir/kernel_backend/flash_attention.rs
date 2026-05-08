@@ -4,6 +4,8 @@ use std::{
     sync::OnceLock,
 };
 
+use fusor_tile_ir as tile_ir;
+
 use crate::{
     DataTypeEnum,
     compute_graph::{ComputeGraphInner, NodeIndex},
@@ -30,7 +32,6 @@ const DECODE_SMALL_BLOCK: u32 = 128;
 const DECODE_MEDIUM_BLOCK: u32 = 512;
 const DECODE_LARGE_BLOCK: u32 = 1024;
 const DECODE_HEAD_DIM: u32 = 128;
-const FLOAT_MIN: f32 = -1.0e30;
 const FLASH_ATTENTION_MODULE_CACHE_SIZE: usize = 128;
 
 fn flash_attention_module_cache()
@@ -524,23 +525,22 @@ impl Operation for FlashAttentionOperation {
                 mask.as_ref().map(|mask| mask.layout()),
                 output.layout()
             );
-            let module =
-                kernel_backend::cached_backend_naga_module(&device, verbose_cache_key, || {
-                    if let Some(meta) = decode_meta {
-                        build_flash_decode_small_naga_module(meta)
-                    } else {
-                        build_flash_attention_naga_module(
-                            dims,
-                            self.scale,
-                            q_meta,
-                            k_meta,
-                            v_meta,
-                            mask_meta,
-                            output_meta,
-                            dispatch_size,
-                        )
-                    }
-                })?;
+            let module = kernel_backend::cached_kernel_ir(&device, verbose_cache_key, || {
+                if let Some(meta) = decode_meta {
+                    tile_ir::kernels::flash_decode_small(meta.into_tile_ir())
+                } else {
+                    tile_ir::kernels::flash_attention(tile_ir::FlashAttentionMeta {
+                        dims: dims.into_tile_ir(),
+                        scale: tile_ir::F32Bits::new(self.scale),
+                        q_meta: q_meta.clone().into_tile_ir(),
+                        k_meta: k_meta.clone().into_tile_ir(),
+                        v_meta: v_meta.clone().into_tile_ir(),
+                        mask_meta: mask_meta.clone().map(TensorMeta::into_tile_ir),
+                        output_meta: output_meta.clone().into_tile_ir(),
+                        dispatch_size,
+                    })
+                }
+            })?;
             flash_attention_module_cache()
                 .write()
                 .get_or_insert(module_key, || module.clone())
@@ -627,6 +627,19 @@ pub(crate) struct FlashAttentionDims {
     head_dim: u32,
 }
 
+impl FlashAttentionDims {
+    fn into_tile_ir(self) -> tile_ir::FlashAttentionDims {
+        tile_ir::FlashAttentionDims {
+            batch: self.batch,
+            num_heads: self.num_heads,
+            num_kv_heads: self.num_kv_heads,
+            q_seq_len: self.q_seq_len,
+            kv_seq_len: self.kv_seq_len,
+            head_dim: self.head_dim,
+        }
+    }
+}
+
 #[derive(Clone)]
 pub(crate) struct TensorMeta {
     datatype: DataTypeEnum,
@@ -654,8 +667,8 @@ impl TensorMeta {
         self.strides.as_slice().try_into().ok()
     }
 
-    fn stride2(&self) -> Option<[u32; 2]> {
-        self.strides.as_slice().try_into().ok()
+    fn into_tile_ir(self) -> tile_ir::TensorMeta {
+        tile_ir::TensorMeta::new(self.strides, self.offset)
     }
 }
 
@@ -675,6 +688,27 @@ pub(crate) struct FlashDecodeSmallMeta {
     k_strides: [u32; 4],
     v_strides: [u32; 4],
     output_strides: [u32; 4],
+}
+
+impl FlashDecodeSmallMeta {
+    fn into_tile_ir(self) -> tile_ir::FlashDecodeSmallMeta {
+        tile_ir::FlashDecodeSmallMeta {
+            dims: self.dims.into_tile_ir(),
+            scale: tile_ir::F32Bits::new(self.scale),
+            active_kv_len: self.active_kv_len,
+            decode_block: self.decode_block,
+            tiled: self.tiled,
+            groups: self.groups,
+            q_offset: self.q_offset,
+            k_offset: self.k_offset,
+            v_offset: self.v_offset,
+            output_offset: self.output_offset,
+            q_strides: self.q_strides,
+            k_strides: self.k_strides,
+            v_strides: self.v_strides,
+            output_strides: self.output_strides,
+        }
+    }
 }
 
 fn build_flash_decode_small_meta(
@@ -722,14 +756,6 @@ fn build_flash_decode_small_meta(
         output_strides: output_meta.stride4()?,
     })
 }
-
-#[path = "flash_decode_small.rs"]
-mod flash_decode_small;
-#[path = "flash_streaming.rs"]
-mod flash_streaming;
-
-use flash_decode_small::build_flash_decode_small_naga_module;
-use flash_streaming::build_flash_attention_naga_module;
 
 #[cfg(test)]
 mod tests {
@@ -1222,5 +1248,41 @@ mod tests {
                 "kv_len={kv_len} head={max_head} dim={max_dim}: actual={max_actual} expected={max_expected} error={max_error}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn streaming_gqa_regression_shape_builds_direct_kernel() {
+        let Ok(device) = Device::new().await else {
+            return;
+        };
+
+        let q_data = vec![
+            (0..32)
+                .map(|head| {
+                    (0..48)
+                        .map(|token| {
+                            (0..TEST_HEAD_DIM)
+                                .map(|dim| {
+                                    let value =
+                                        ((head * 17 + token * 11 + dim * 5) % 41) as f32 - 20.0;
+                                    value * 0.002
+                                })
+                                .collect::<Vec<_>>()
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .collect::<Vec<_>>(),
+        ];
+        let k_data = decode_k_gqa(8, 48);
+        let v_data = decode_v_gqa(8, 48);
+        let scale = 1.0 / f32::sqrt(TEST_HEAD_DIM as f32);
+
+        let q = Tensor::new(&device, &q_data);
+        let k = Tensor::new(&device, &k_data);
+        let v = Tensor::new(&device, &v_data);
+        let output = q
+            .try_flash_attention_direct(&k, &v, scale, None)
+            .expect("streaming flash attention direct kernel should build");
+        output.materialize().await;
     }
 }

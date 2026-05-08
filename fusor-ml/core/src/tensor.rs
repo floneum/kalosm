@@ -1099,29 +1099,41 @@ impl Tensor<1, f32> {
             } else {
                 candidate_count + 1
             };
-            let Some((ids, values)) =
-                crate::top_k::chunk_top_k_pair_data(&input, candidate_count, output_per_chunk)
-            else {
+            let mut encoder = input.device().wgpu_device().create_command_encoder(
+                &wgpu::CommandEncoderDescriptor {
+                    label: Some("top_k_pairs encoder"),
+                },
+            );
+            let Some((ids, values)) = crate::top_k::chunk_top_k_pair_data_with_encoder(
+                &input,
+                candidate_count,
+                output_per_chunk,
+                Some(&mut encoder),
+            ) else {
                 return Ok(cpu_top_k_pairs_from_tensor_data(&input, k).await?);
             };
             if candidate_count >= crate::top_k::TOP_K_CHUNK {
-                let Some((ids, values)) = crate::top_k::merge_sorted_chunk_top_k_pair_data(
-                    &ids,
-                    &values,
-                    chunks,
-                    crate::top_k::TOP_K_CHUNK,
-                    crate::top_k::TOP_K_CHUNK,
-                    input_len,
-                    k,
-                ) else {
+                let Some((ids, values)) =
+                    crate::top_k::merge_sorted_chunk_top_k_pair_data_with_encoder(
+                        &ids,
+                        &values,
+                        chunks,
+                        crate::top_k::TOP_K_CHUNK,
+                        crate::top_k::TOP_K_CHUNK,
+                        input_len,
+                        k,
+                        Some(&mut encoder),
+                    )
+                else {
                     return Ok(cpu_top_k_pairs_from_tensor_data(&input, k).await?);
                 };
+                input.device().wgpu_queue().submit(Some(encoder.finish()));
                 let ids = Tensor::<1, u32>::as_slice_from_tensor_data(&ids).await?;
                 let values = Tensor::<1, f32>::as_slice_from_tensor_data(&values).await?;
                 return Ok((ids.as_slice().to_vec(), values.as_slice().to_vec()));
             }
             let Some((merged_ids, merged_values)) =
-                crate::top_k::merge_sorted_chunk_top_k_pair_data(
+                crate::top_k::merge_sorted_chunk_top_k_pair_data_with_encoder(
                     &ids,
                     &values,
                     chunks,
@@ -1129,10 +1141,12 @@ impl Tensor<1, f32> {
                     output_per_chunk,
                     input_len,
                     k,
+                    Some(&mut encoder),
                 )
             else {
                 return Ok(cpu_top_k_pairs_from_tensor_data(&input, k).await?);
             };
+            input.device().wgpu_queue().submit(Some(encoder.finish()));
             let merged_ids = Tensor::<1, u32>::as_slice_from_tensor_data(&merged_ids).await?;
             let merged_values = Tensor::<1, f32>::as_slice_from_tensor_data(&merged_values).await?;
             let chunk_values = Tensor::<1, f32>::as_slice_from_tensor_data(&values).await?;

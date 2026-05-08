@@ -13,10 +13,11 @@ use naga::{
 use crate::ir::{
     BlockDequantId, BufferAccess, BufferId, CoopAccId, CoopFragmentId, CoopOperandRole,
     DynamicOffset, ElementType, F32Bits, FlattenedMatrixMap, Im2ColNhwcMap, KernelIr, Layout,
-    LoopFoldGroupId, MemoryLevel, Op, PinId, StorageIndexMap, StorageView, TileBinaryOp,
-    TileCompareOp, TileExpr, TileId, TileIndexExpr, TileLiteral, TileLoadExpr, TileMaskExpr,
-    TileOrigin, TileProgramOp, TileQuantizedLoadExpr, TileReduceOp, TileRef, TileScalarExpr,
-    TileStmt, TileStoreStmt, TileSwiGluStoreStmt, TileUnaryOp,
+    LocalId, LocalRef, LoopFoldGroupId, MemoryLevel, Op, PinId, StorageIndexMap, StorageView,
+    TileBinaryOp, TileCompareOp, TileExpr, TileId, TileIndexExpr, TileLinearLoadExpr,
+    TileLinearStoreStmt, TileLiteral, TileLoadExpr, TileMaskExpr, TileOrigin, TileProgramOp,
+    TileQuantizedLoadExpr, TileReduceOp, TileRef, TileScalarExpr, TileStmt, TileStoreStmt,
+    TileSwiGluStoreStmt, TileUnaryOp, TileVec4LoadExpr, TileVec4StoreStmt,
 };
 use crate::quantized::{GgmlQuantFormat, QuantizedMatrix};
 
@@ -56,6 +57,8 @@ impl NagaKernel {
 pub enum LowerError {
     /// An event referenced a tile that was never allocated.
     UnknownTile(TileId),
+    /// An operation referenced a private local that was never allocated.
+    UnknownLocal(LocalId),
     /// An operation referenced a storage buffer that was never declared.
     UnknownBuffer(BufferId),
     /// The Naga lowerer cannot emit this memory level.
@@ -68,6 +71,12 @@ pub enum LowerError {
         declared: ElementType,
         used: ElementType,
     },
+    /// An operation used a local as a different element type than its declaration.
+    LocalElementMismatch {
+        local: LocalId,
+        declared: ElementType,
+        used: ElementType,
+    },
     /// Naga rejected the generated module.
     Validation(String),
 }
@@ -76,6 +85,7 @@ impl fmt::Display for LowerError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::UnknownTile(tile) => write!(f, "unknown tile {:?}", tile),
+            Self::UnknownLocal(local) => write!(f, "unknown local {:?}", local),
             Self::UnknownBuffer(buffer) => write!(f, "unknown buffer {:?}", buffer),
             Self::UnsupportedMemoryLevel(memory) => {
                 write!(f, "unsupported memory level {:?}", memory)
@@ -89,6 +99,15 @@ impl fmt::Display for LowerError {
                 f,
                 "tile {:?} declared as {:?} but used as {:?}",
                 tile, declared, used
+            ),
+            Self::LocalElementMismatch {
+                local,
+                declared,
+                used,
+            } => write!(
+                f,
+                "local {:?} declared as {:?} but used as {:?}",
+                local, declared, used
             ),
             Self::Validation(error) => write!(f, "naga validation failed: {error}"),
         }
@@ -106,10 +125,12 @@ struct Lowerer<'a> {
     i32_vec4_ty: Handle<Type>,
     f16_ty: Option<Handle<Type>>,
     u32_ty: Handle<Type>,
+    bool_ty: Handle<Type>,
     u32_vec3_ty: Handle<Type>,
     buffer_globals: Vec<Option<Handle<GlobalVariable>>>,
     tile_globals: Vec<Option<Handle<GlobalVariable>>>,
     tile_locals: Vec<Option<Handle<LocalVariable>>>,
+    private_locals: Vec<Option<Handle<LocalVariable>>>,
     live_tiles: Vec<bool>,
     loop_index_local: Option<Handle<LocalVariable>>,
     workgroup_invocations: u32,
@@ -151,8 +172,8 @@ struct Q8ActivationPackValues {
 #[derive(Copy, Clone)]
 struct ScratchLocals {
     loop_index: Handle<LocalVariable>,
-    values: [Handle<LocalVariable>; 3],
-    spills: [[Handle<LocalVariable>; 32]; 3],
+    values: [Handle<LocalVariable>; 5],
+    spills: [[Handle<LocalVariable>; 32]; 5],
     block_dequant: [Handle<LocalVariable>; 16],
     q8_activation_scales: [Handle<LocalVariable>; 4],
     q8_activation_packs: [Handle<LocalVariable>; 4],
