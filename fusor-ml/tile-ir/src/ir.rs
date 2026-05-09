@@ -2,6 +2,34 @@ use std::num::NonZeroU32;
 
 use crate::{LowerError, NagaKernel, QuantizedMatrix};
 
+macro_rules! id_newtype {
+    ($(#[$meta:meta])* $vis:vis $name:ident $(, $derive:ident)*) => {
+        $(#[$meta])*
+        #[derive(Copy, Clone, Debug, PartialEq, Eq $(, $derive)*)]
+        $vis struct $name(pub(crate) u32);
+
+        impl $name {
+            pub const fn index(self) -> usize {
+                self.0 as usize
+            }
+        }
+    };
+}
+
+macro_rules! numeric_markers {
+    ($(($(#[$meta:meta])* $name:ident, $element:expr)),+ $(,)?) => {
+        $(
+            $(#[$meta])*
+            #[derive(Copy, Clone, Debug)]
+            pub struct $name;
+
+            impl Numeric for $name {
+                const ELEMENT: ElementType = $element;
+            }
+        )+
+    };
+}
+
 /// A typed kernel IR emitted by the tile builder.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct KernelIr {
@@ -28,15 +56,10 @@ pub struct KernelIr {
     pub(crate) next_coop_fragment: u32,
 }
 
-/// Identifier of a cooperative-matrix accumulator local.
-#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
-pub struct CoopAccId(pub(crate) u32);
-
-impl CoopAccId {
-    pub const fn index(self) -> usize {
-        self.0 as usize
-    }
-}
+id_newtype!(
+    /// Identifier of a cooperative-matrix accumulator local.
+    pub CoopAccId, Hash
+);
 
 /// Declaration of a cooperative-matrix accumulator. Currently only 8x8 f32
 /// `C`-role fragments are supported.
@@ -47,15 +70,10 @@ pub struct CoopAccDecl {
     pub cols: u32,
 }
 
-/// Identifier of a cooperatively-loaded fragment (SSA-cached).
-#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
-pub struct CoopFragmentId(pub(crate) u32);
-
-impl CoopFragmentId {
-    pub const fn index(self) -> usize {
-        self.0 as usize
-    }
-}
+id_newtype!(
+    /// Identifier of a cooperatively-loaded fragment (SSA-cached).
+    pub CoopFragmentId, Hash
+);
 
 /// Multiplicand role for a cooperatively-loaded matrix fragment.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
@@ -64,25 +82,15 @@ pub enum CoopOperandRole {
     B,
 }
 
-/// Identifier of a pinned subexpression.
-#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
-pub struct PinId(pub(crate) u32);
+id_newtype!(
+    /// Identifier of a pinned subexpression.
+    pub PinId, Hash
+);
 
-impl PinId {
-    pub const fn index(self) -> usize {
-        self.0 as usize
-    }
-}
-
-/// Identifier of a multi-output loop-fold group.
-#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
-pub struct LoopFoldGroupId(pub(crate) u32);
-
-impl LoopFoldGroupId {
-    pub const fn index(self) -> usize {
-        self.0 as usize
-    }
-}
+id_newtype!(
+    /// Identifier of a multi-output loop-fold group.
+    pub LoopFoldGroupId, Hash
+);
 
 /// A K-loop that accumulates N parallel reductions sharing one body.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -93,15 +101,10 @@ pub struct LoopFoldGroup {
     pub bodies: Vec<TileExpr>,
 }
 
-/// Identifier shared by lanes of one fused quantized-block dequant.
-#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
-pub struct BlockDequantId(pub(crate) u32);
-
-impl BlockDequantId {
-    pub const fn index(self) -> usize {
-        self.0 as usize
-    }
-}
+id_newtype!(
+    /// Identifier shared by lanes of one fused quantized-block dequant.
+    pub BlockDequantId, Hash
+);
 
 impl KernelIr {
     /// Storage buffer declarations bound by the kernel.
@@ -200,16 +203,10 @@ impl BufferRef {
     }
 }
 
-/// A storage buffer identifier.
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub struct BufferId(pub(crate) u32);
-
-impl BufferId {
-    /// The dense index for this buffer declaration.
-    pub const fn index(self) -> usize {
-        self.0 as usize
-    }
-}
+id_newtype!(
+    /// A storage buffer identifier.
+    pub BufferId
+);
 
 /// Access required for a storage buffer.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -255,15 +252,10 @@ impl LocalRef {
     }
 }
 
-/// A private local identifier.
-#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
-pub struct LocalId(pub(crate) u32);
-
-impl LocalId {
-    pub const fn index(self) -> usize {
-        self.0 as usize
-    }
-}
+id_newtype!(
+    /// A private local identifier.
+    pub LocalId, Hash
+);
 
 impl TileRef {
     /// Create a typed reference to an existing tile declaration.
@@ -409,11 +401,6 @@ pub struct TileProgramOp {
 pub enum TileStmt {
     /// Per-lane masked storage write.
     Store(TileStoreStmt),
-    /// Per-lane masked SwiGLU storage write.
-    ///
-    /// This keeps the uniform `gate`/`up` expressions outside the store mask,
-    /// then computes `gate * sigmoid(gate) * up` only for lanes that store.
-    StoreSwiGlu(TileSwiGluStoreStmt),
     /// Per-lane masked vector storage write to a rank-1 storage view.
     StoreVec4(TileVec4StoreStmt),
     /// Per-lane masked rank-1 storage write.
@@ -503,17 +490,6 @@ pub struct TileStoreStmt {
     pub row: TileIndexExpr,
     pub col: TileIndexExpr,
     pub value: TileExpr,
-    pub mask: TileMaskExpr,
-}
-
-/// A masked SwiGLU store emitted by a source tile program.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct TileSwiGluStoreStmt {
-    pub dst: StorageView,
-    pub row: TileIndexExpr,
-    pub col: TileIndexExpr,
-    pub gate: TileExpr,
-    pub up: TileExpr,
     pub mask: TileMaskExpr,
 }
 
@@ -877,16 +853,10 @@ pub enum TileCompareOp {
     Ne,
 }
 
-/// A tiny tile identifier for the typed IR.
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub struct TileId(pub(crate) u32);
-
-impl TileId {
-    /// The dense index for this tile declaration.
-    pub const fn index(self) -> usize {
-        self.0 as usize
-    }
-}
+id_newtype!(
+    /// A tiny tile identifier for the typed IR.
+    pub TileId
+);
 
 /// Element types represented by the typed IR.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -898,50 +868,38 @@ pub enum ElementType {
     Bool,
 }
 
-/// A sample numeric marker.
-#[derive(Copy, Clone, Debug)]
-pub struct F32;
-
-/// Half-precision floating point storage marker.
-#[derive(Copy, Clone, Debug)]
-pub struct F16;
-
-/// Packed u32 storage marker.
-#[derive(Copy, Clone, Debug)]
-pub struct U32;
-
-/// Four packed f32 values stored as one storage element.
-#[derive(Copy, Clone, Debug)]
-pub struct F32Vec4;
-
-/// Boolean private/control value marker.
-#[derive(Copy, Clone, Debug)]
-pub struct Bool;
-
 /// Numeric element markers that can appear in the typed IR.
 pub trait Numeric {
     const ELEMENT: ElementType;
 }
 
-impl Numeric for F32 {
-    const ELEMENT: ElementType = ElementType::F32;
-}
-
-impl Numeric for F16 {
-    const ELEMENT: ElementType = ElementType::F16;
-}
-
-impl Numeric for U32 {
-    const ELEMENT: ElementType = ElementType::U32;
-}
-
-impl Numeric for F32Vec4 {
-    const ELEMENT: ElementType = ElementType::F32Vec4;
-}
-
-impl Numeric for Bool {
-    const ELEMENT: ElementType = ElementType::Bool;
-}
+numeric_markers!(
+    (
+        /// A sample numeric marker.
+        F32,
+        ElementType::F32
+    ),
+    (
+        /// Half-precision floating point storage marker.
+        F16,
+        ElementType::F16
+    ),
+    (
+        /// Packed u32 storage marker.
+        U32,
+        ElementType::U32
+    ),
+    (
+        /// Four packed f32 values stored as one storage element.
+        F32Vec4,
+        ElementType::F32Vec4
+    ),
+    (
+        /// Boolean private/control value marker.
+        Bool,
+        ElementType::Bool
+    ),
+);
 
 /// A concrete layout for a tile-like value.
 #[derive(Clone, Debug, PartialEq, Eq)]

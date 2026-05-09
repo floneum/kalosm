@@ -3,10 +3,7 @@ use fusor_tile_ir as tile_ir;
 use crate::{
     matmul::MatMulOperation,
     mir::{
-        direct_kernel::{DirectKernel, DirectKernelBinding},
-        inputs::MirValue,
-        kernel_backend,
-        operation::Operation,
+        direct_kernel::DirectKernel, inputs::MirValue, kernel_backend, operation::Operation,
         workgroup_shape::WorkgroupShape,
     },
     nary_direct::apply_unary_function_chain,
@@ -67,21 +64,9 @@ pub(crate) fn build_serial_matmul_direct_kernel(
         cache_key,
         || build_matmul_tile_ir(operation, &input_a, &input_b, &output, dispatch_size),
         vec![
-            DirectKernelBinding::Storage {
-                binding: 0,
-                buffer: input_a.buffer().clone(),
-                read_only: true,
-            },
-            DirectKernelBinding::Storage {
-                binding: 1,
-                buffer: input_b.buffer().clone(),
-                read_only: true,
-            },
-            DirectKernelBinding::Storage {
-                binding: 2,
-                buffer: output.buffer().clone(),
-                read_only: false,
-            },
+            kernel_backend::storage_binding(0, &input_a, true),
+            kernel_backend::storage_binding(1, &input_b, true),
+            kernel_backend::storage_binding(2, &output, false),
         ],
         dispatch_size,
     )

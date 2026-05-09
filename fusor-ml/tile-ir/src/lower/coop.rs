@@ -28,9 +28,6 @@ impl<'a> Lowerer<'a> {
     ) -> Result<(), LowerError> {
         match stmt {
             TileStmt::Store(store) => self.lower_tile_store_stmt(expressions, scratch, body, store),
-            TileStmt::StoreSwiGlu(store) => {
-                self.lower_tile_swiglu_store_stmt(expressions, scratch, body, store)
-            }
             TileStmt::StoreVec4(store) => {
                 self.lower_tile_vec4_store_stmt(expressions, scratch, body, store)
             }
@@ -334,79 +331,24 @@ impl<'a> Lowerer<'a> {
         max_iterations: u32,
         inner: &[TileStmt],
     ) -> Result<(), LowerError> {
-        let loop_ptr = expressions.append(
-            Expression::LocalVariable(scratch.loop_index),
-            Span::default(),
-        );
-        let zero = expressions.append(Expression::Literal(Literal::U32(0)), Span::default());
-        body.push(
-            Statement::Store {
-                pointer: loop_ptr,
-                value: zero,
-            },
-            Span::default(),
-        );
-
-        let mut loop_body = Block::new();
-        let loop_index =
-            expressions.append(Expression::Load { pointer: loop_ptr }, Span::default());
-        loop_body.push(
-            Statement::Emit(Self::single_expression_range(expressions, loop_index)),
-            Span::default(),
-        );
-        let done = self.bin_lit_u32(
+        self.emit_counted_loop(
             expressions,
-            &mut loop_body,
-            BinaryOperator::GreaterEqual,
-            loop_index,
+            scratch,
+            body,
             max_iterations,
-        );
-        loop_body.push(
-            Statement::If {
-                condition: done,
-                accept: Block::from_vec(vec![Statement::Break]),
-                reject: Block::new(),
+            |expressions, loop_body, _| {
+                // Cache entries reference SSA handles emitted into the outer block;
+                // they are out of scope inside this loop body. Snapshot, clear for the
+                // body, restore on exit. The accumulator-value cache must be flushed
+                // at iteration boundaries too; its SSA chain only carries within one
+                // iteration, while loop-carry goes through the accumulator local.
+                let saved = self.snapshot_coop_loop_caches();
+                self.lower_tile_stmt_body(expressions, scratch, loop_body, inner)?;
+                self.flush_coop_acc_cache(expressions, loop_body);
+                self.restore_coop_loop_caches(saved);
+                Ok(())
             },
-            Span::default(),
-        );
-
-        // Cache entries reference SSA handles emitted into the outer block;
-        // they are out of scope inside this loop body. Snapshot, clear for the
-        // body, restore on exit. The accumulator-value cache must be flushed
-        // at iteration boundaries too — its SSA chain only carries within one
-        // iteration (loop-carry goes through the accumulator local).
-        let saved_frag: Vec<_> = self.coop_fragment_cache.borrow_mut().drain().collect();
-        let saved_acc: Vec<_> = self.coop_acc_value_cache.borrow_mut().drain().collect();
-        self.lower_tile_stmt_body(expressions, scratch, &mut loop_body, inner)?;
-        self.flush_coop_acc_cache(expressions, &mut loop_body);
-        {
-            let mut cache = self.coop_fragment_cache.borrow_mut();
-            cache.clear();
-            for (k, v) in saved_frag {
-                cache.insert(k, v);
-            }
-        }
-        {
-            let mut cache = self.coop_acc_value_cache.borrow_mut();
-            cache.clear();
-            for (k, v) in saved_acc {
-                cache.insert(k, v);
-            }
-        }
-
-        loop_body.push(
-            self.increment_u32_local(expressions, scratch.loop_index, 1),
-            Span::default(),
-        );
-        body.push(
-            Statement::Loop {
-                body: loop_body,
-                continuing: Block::new(),
-                break_if: None,
-            },
-            Span::default(),
-        );
-        Ok(())
+        )
     }
 
     fn lower_copy_to_tile(

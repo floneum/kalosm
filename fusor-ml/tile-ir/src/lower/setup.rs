@@ -426,54 +426,11 @@ impl<'a> Lowerer<'a> {
     }
 
     fn tile_programs_need_full_scratch(ir: &KernelIr) -> bool {
-        ir.body().ops().iter().any(|op| {
-            let Op::TileProgram(op) = op;
-            op.body.iter().any(Self::tile_stmt_needs_full_scratch)
-        })
+        Self::tile_programs_expr_any(ir, Self::tile_expr_needs_full_scratch)
     }
 
     fn tile_programs_need_value_scratch(ir: &KernelIr) -> bool {
-        ir.body().ops().iter().any(|op| {
-            let Op::TileProgram(op) = op;
-            op.body.iter().any(Self::tile_stmt_needs_value_scratch)
-        })
-    }
-
-    fn tile_stmt_needs_value_scratch(stmt: &TileStmt) -> bool {
-        match stmt {
-            TileStmt::Store(store) => Self::tile_expr_needs_value_scratch(&store.value),
-            TileStmt::StoreSwiGlu(store) => {
-                Self::tile_expr_needs_value_scratch(&store.gate)
-                    || Self::tile_expr_needs_value_scratch(&store.up)
-            }
-            TileStmt::StoreVec4(store) => Self::tile_expr_needs_value_scratch(&store.value),
-            TileStmt::StoreLinear(store) => Self::tile_expr_needs_value_scratch(&store.value),
-            TileStmt::StoreLocal { value, .. } | TileStmt::Emit { value } => {
-                Self::tile_expr_needs_value_scratch(value)
-            }
-            TileStmt::StoreWorkgroup { value, .. } => Self::tile_expr_needs_value_scratch(value),
-            TileStmt::If {
-                condition,
-                accept,
-                reject,
-            } => {
-                Self::tile_expr_needs_value_scratch(condition)
-                    || accept.iter().any(Self::tile_stmt_needs_value_scratch)
-                    || reject.iter().any(Self::tile_stmt_needs_value_scratch)
-            }
-            TileStmt::Loop { body } | TileStmt::WhileTrue { body, .. } => {
-                body.iter().any(Self::tile_stmt_needs_value_scratch)
-            }
-            TileStmt::StoreCoopAcc { .. }
-            | TileStmt::CopyToWorkgroupTile { .. }
-            | TileStmt::CopyQuantToWorkgroupTile { .. }
-            | TileStmt::ZeroCoopAcc { .. }
-            | TileStmt::Barrier
-            | TileStmt::LoadCoop { .. }
-            | TileStmt::Mma { .. }
-            | TileStmt::Break
-            | TileStmt::Return => false,
-        }
+        Self::tile_programs_expr_any(ir, Self::tile_expr_needs_value_scratch)
     }
 
     fn tile_expr_needs_value_scratch(expr: &TileExpr) -> bool {
@@ -482,100 +439,7 @@ impl<'a> Lowerer<'a> {
             TileExpr::LoadLinear(load) => !matches!(load.mask, TileMaskExpr::True),
             TileExpr::LoadVec4(load) => !matches!(load.mask, TileMaskExpr::True),
             TileExpr::QuantizedLoad(load) => !matches!(load.mask, TileMaskExpr::True),
-            TileExpr::Scalar(TileScalarExpr::Reduce { value, .. })
-            | TileExpr::Scalar(TileScalarExpr::LoopReduce { value, .. }) => {
-                Self::tile_expr_needs_value_scratch(value)
-            }
-            TileExpr::Scalar(TileScalarExpr::Literal(_))
-            | TileExpr::LoadWorkgroup { .. }
-            | TileExpr::LoadLocal(_)
-            | TileExpr::Full(_)
-            | TileExpr::Literal(_)
-            | TileExpr::Index(_)
-            | TileExpr::PinnedRef { .. }
-            | TileExpr::LoopFoldGroupOutput { .. }
-            | TileExpr::QuantizedBlockLane { .. } => false,
-            TileExpr::Unary { value, .. }
-            | TileExpr::Cast { value, .. }
-            | TileExpr::Bitcast { value, .. }
-            | TileExpr::LoopFold { value, .. }
-            | TileExpr::GroupReduce { value, .. }
-            | TileExpr::SubgroupReduce { value, .. }
-            | TileExpr::Vec4Splat { value } => Self::tile_expr_needs_value_scratch(value),
-            TileExpr::Binary { left, right, .. }
-            | TileExpr::Compare { left, right, .. }
-            | TileExpr::Vec4Dot { left, right } => {
-                Self::tile_expr_needs_value_scratch(left)
-                    || Self::tile_expr_needs_value_scratch(right)
-            }
-            TileExpr::Select {
-                condition,
-                accept,
-                reject,
-            } => {
-                Self::tile_expr_needs_value_scratch(condition)
-                    || Self::tile_expr_needs_value_scratch(accept)
-                    || Self::tile_expr_needs_value_scratch(reject)
-            }
-            TileExpr::Sum { values } => values
-                .iter()
-                .any(|expr| Self::tile_expr_needs_value_scratch(expr)),
-            TileExpr::Dot4 { a, b } => a
-                .iter()
-                .chain(b.iter())
-                .any(|expr| Self::tile_expr_needs_value_scratch(expr)),
-            TileExpr::QuantizedQ8_0Dot8 { a, .. } => a
-                .iter()
-                .any(|expr| Self::tile_expr_needs_value_scratch(expr)),
-            TileExpr::QuantizedQ8ActivationDot { a, .. }
-            | TileExpr::QuantizedQ4KF32Dot { a, .. }
-            | TileExpr::QuantizedQ6KGgmlDot { a, .. } => a
-                .iter()
-                .any(|expr| Self::tile_expr_needs_value_scratch(expr)),
-            TileExpr::QuantizedQ4KGgmlDot {
-                a_low,
-                a_high,
-                sums,
-                ..
-            } => a_low
-                .iter()
-                .chain(a_high.iter())
-                .chain(sums.iter())
-                .any(|expr| Self::tile_expr_needs_value_scratch(expr)),
-        }
-    }
-
-    fn tile_stmt_needs_full_scratch(stmt: &TileStmt) -> bool {
-        match stmt {
-            TileStmt::StoreSwiGlu(_) => true,
-            TileStmt::Store(store) => Self::tile_expr_needs_full_scratch(&store.value),
-            TileStmt::StoreVec4(store) => Self::tile_expr_needs_full_scratch(&store.value),
-            TileStmt::StoreLinear(store) => Self::tile_expr_needs_full_scratch(&store.value),
-            TileStmt::StoreLocal { value, .. } | TileStmt::Emit { value } => {
-                Self::tile_expr_needs_full_scratch(value)
-            }
-            TileStmt::StoreWorkgroup { value, .. } => Self::tile_expr_needs_full_scratch(value),
-            TileStmt::If {
-                condition,
-                accept,
-                reject,
-            } => {
-                Self::tile_expr_needs_full_scratch(condition)
-                    || accept.iter().any(Self::tile_stmt_needs_full_scratch)
-                    || reject.iter().any(Self::tile_stmt_needs_full_scratch)
-            }
-            TileStmt::Loop { body } | TileStmt::WhileTrue { body, .. } => {
-                body.iter().any(Self::tile_stmt_needs_full_scratch)
-            }
-            TileStmt::StoreCoopAcc { .. }
-            | TileStmt::CopyToWorkgroupTile { .. }
-            | TileStmt::CopyQuantToWorkgroupTile { .. }
-            | TileStmt::ZeroCoopAcc { .. }
-            | TileStmt::Barrier
-            | TileStmt::LoadCoop { .. }
-            | TileStmt::Mma { .. }
-            | TileStmt::Break
-            | TileStmt::Return => false,
+            _ => Self::tile_expr_children_any(expr, Self::tile_expr_needs_value_scratch),
         }
     }
 
@@ -589,49 +453,7 @@ impl<'a> Lowerer<'a> {
             | TileExpr::QuantizedQ6KGgmlDot { .. }
             | TileExpr::LoopFold { .. } => true,
             TileExpr::Scalar(TileScalarExpr::LoopReduce { .. }) => true,
-            TileExpr::Scalar(TileScalarExpr::Reduce { value, .. }) => {
-                Self::tile_expr_needs_full_scratch(value)
-            }
-            TileExpr::Scalar(TileScalarExpr::Literal(_))
-            | TileExpr::Load(_)
-            | TileExpr::LoadLinear(_)
-            | TileExpr::LoadVec4(_)
-            | TileExpr::LoadWorkgroup { .. }
-            | TileExpr::LoadLocal(_)
-            | TileExpr::QuantizedLoad(_)
-            | TileExpr::Full(_)
-            | TileExpr::Literal(_)
-            | TileExpr::Index(_)
-            | TileExpr::PinnedRef { .. }
-            | TileExpr::LoopFoldGroupOutput { .. } => false,
-            TileExpr::Unary { value, .. }
-            | TileExpr::Cast { value, .. }
-            | TileExpr::Bitcast { value, .. }
-            | TileExpr::GroupReduce { value, .. }
-            | TileExpr::SubgroupReduce { value, .. }
-            | TileExpr::Vec4Splat { value } => Self::tile_expr_needs_full_scratch(value),
-            TileExpr::Binary { left, right, .. }
-            | TileExpr::Compare { left, right, .. }
-            | TileExpr::Vec4Dot { left, right } => {
-                Self::tile_expr_needs_full_scratch(left)
-                    || Self::tile_expr_needs_full_scratch(right)
-            }
-            TileExpr::Select {
-                condition,
-                accept,
-                reject,
-            } => {
-                Self::tile_expr_needs_full_scratch(condition)
-                    || Self::tile_expr_needs_full_scratch(accept)
-                    || Self::tile_expr_needs_full_scratch(reject)
-            }
-            TileExpr::Sum { values } => values
-                .iter()
-                .any(|expr| Self::tile_expr_needs_full_scratch(expr)),
-            TileExpr::Dot4 { a, b } => a
-                .iter()
-                .chain(b.iter())
-                .any(|expr| Self::tile_expr_needs_full_scratch(expr)),
+            _ => Self::tile_expr_children_any(expr, Self::tile_expr_needs_full_scratch),
         }
     }
 
@@ -767,81 +589,37 @@ impl<'a> Lowerer<'a> {
     }
 
     fn tile_stmt_uses_f16(stmt: &TileStmt) -> bool {
+        if Self::tile_stmt_f16_payload(stmt) {
+            return true;
+        }
+        let mut index_uses_f16 = |expr: &TileIndexExpr| Self::tile_index_expr_uses_f16(expr);
+        if Self::tile_stmt_index_any(stmt, &mut index_uses_f16) {
+            return true;
+        }
+        let mut expr_uses_f16 = |expr: &TileExpr| Self::tile_expr_uses_f16(expr);
+        Self::tile_stmt_expr_any(stmt, &mut expr_uses_f16)
+    }
+
+    fn tile_stmt_f16_payload(stmt: &TileStmt) -> bool {
         match stmt {
-            TileStmt::Store(store) => {
-                store.dst.buffer.element == ElementType::F16
-                    || Self::tile_index_expr_uses_f16(&store.row)
-                    || Self::tile_index_expr_uses_f16(&store.col)
-                    || Self::tile_mask_expr_uses_f16(&store.mask)
-                    || Self::tile_expr_uses_f16(&store.value)
-            }
-            TileStmt::StoreSwiGlu(store) => {
-                store.dst.buffer.element == ElementType::F16
-                    || Self::tile_index_expr_uses_f16(&store.row)
-                    || Self::tile_index_expr_uses_f16(&store.col)
-                    || Self::tile_mask_expr_uses_f16(&store.mask)
-                    || Self::tile_expr_uses_f16(&store.gate)
-                    || Self::tile_expr_uses_f16(&store.up)
-            }
-            TileStmt::StoreVec4(store) => {
-                Self::tile_index_expr_uses_f16(&store.index)
-                    || Self::tile_mask_expr_uses_f16(&store.mask)
-                    || Self::tile_expr_uses_f16(&store.value)
-            }
-            TileStmt::StoreLinear(store) => {
-                store.dst.buffer.element == ElementType::F16
-                    || Self::tile_index_expr_uses_f16(&store.index)
-                    || Self::tile_mask_expr_uses_f16(&store.mask)
-                    || Self::tile_expr_uses_f16(&store.value)
-            }
+            TileStmt::Store(store) => store.dst.buffer.element == ElementType::F16,
+            TileStmt::StoreVec4(_) => false,
+            TileStmt::StoreLinear(store) => store.dst.buffer.element == ElementType::F16,
             TileStmt::StoreLocal { dst, value } => {
                 dst.element == ElementType::F16 || Self::tile_expr_uses_f16(value)
             }
-            TileStmt::Emit { value } => Self::tile_expr_uses_f16(value),
-            TileStmt::StoreWorkgroup { dst, index, value } => {
-                dst.element == ElementType::F16
-                    || Self::tile_index_expr_uses_f16(index)
-                    || Self::tile_expr_uses_f16(value)
+            TileStmt::Emit { .. } => false,
+            TileStmt::StoreWorkgroup { dst, .. } => dst.element == ElementType::F16,
+            TileStmt::CopyToWorkgroupTile { dst, src, .. } => {
+                dst.element == ElementType::F16 || src.buffer.element == ElementType::F16
             }
-            TileStmt::If {
-                condition,
-                accept,
-                reject,
-            } => {
-                Self::tile_expr_uses_f16(condition)
-                    || accept.iter().any(Self::tile_stmt_uses_f16)
-                    || reject.iter().any(Self::tile_stmt_uses_f16)
-            }
-            TileStmt::Loop { body } => body.iter().any(Self::tile_stmt_uses_f16),
-            TileStmt::CopyToWorkgroupTile {
-                dst,
-                src,
-                row_offset,
-                col_offset,
-            } => {
-                dst.element == ElementType::F16
-                    || src.buffer.element == ElementType::F16
-                    || Self::tile_index_expr_uses_f16(row_offset)
-                    || Self::tile_index_expr_uses_f16(col_offset)
-            }
-            TileStmt::CopyQuantToWorkgroupTile {
-                row_offset,
-                col_offset,
-                ..
-            } => {
-                Self::tile_index_expr_uses_f16(row_offset)
-                    || Self::tile_index_expr_uses_f16(col_offset)
-            }
-            TileStmt::LoadCoop { row, col, .. } => {
-                Self::tile_index_expr_uses_f16(row) || Self::tile_index_expr_uses_f16(col)
-            }
-            TileStmt::StoreCoopAcc { dst, row, col, .. } => {
-                dst.buffer.element == ElementType::F16
-                    || Self::tile_index_expr_uses_f16(row)
-                    || Self::tile_index_expr_uses_f16(col)
-            }
-            TileStmt::WhileTrue { body, .. } => body.iter().any(Self::tile_stmt_uses_f16),
-            TileStmt::ZeroCoopAcc { .. }
+            TileStmt::StoreCoopAcc { dst, .. } => dst.buffer.element == ElementType::F16,
+            TileStmt::If { .. }
+            | TileStmt::Loop { .. }
+            | TileStmt::CopyQuantToWorkgroupTile { .. }
+            | TileStmt::LoadCoop { .. }
+            | TileStmt::WhileTrue { .. }
+            | TileStmt::ZeroCoopAcc { .. }
             | TileStmt::Barrier
             | TileStmt::Mma { .. }
             | TileStmt::Break
@@ -850,205 +628,68 @@ impl<'a> Lowerer<'a> {
     }
 
     fn tile_expr_uses_f16(expr: &TileExpr) -> bool {
+        if Self::tile_expr_f16_payload(expr) {
+            return true;
+        }
+        let mut index_uses_f16 = |expr: &TileIndexExpr| Self::tile_index_expr_uses_f16(expr);
+        Self::tile_expr_index_any(expr, &mut index_uses_f16)
+            || Self::tile_expr_children_any(expr, Self::tile_expr_uses_f16)
+    }
+
+    fn tile_expr_f16_payload(expr: &TileExpr) -> bool {
         match expr {
             TileExpr::Load(load) => {
                 load.src.buffer.element == ElementType::F16
                     || load.fill.element() == ElementType::F16
-                    || Self::tile_index_expr_uses_f16(&load.row)
-                    || Self::tile_index_expr_uses_f16(&load.col)
-                    || Self::tile_mask_expr_uses_f16(&load.mask)
             }
             TileExpr::LoadLinear(load) => {
                 load.src.buffer.element == ElementType::F16
                     || load.fill.element() == ElementType::F16
-                    || Self::tile_index_expr_uses_f16(&load.index)
-                    || Self::tile_mask_expr_uses_f16(&load.mask)
             }
-            TileExpr::LoadVec4(load) => {
-                Self::tile_index_expr_uses_f16(&load.index)
-                    || Self::tile_mask_expr_uses_f16(&load.mask)
-            }
+            TileExpr::LoadVec4(_) => false,
             TileExpr::LoadWorkgroup { src, index } => {
                 src.element == ElementType::F16 || Self::tile_index_expr_uses_f16(index)
             }
             TileExpr::LoadLocal(local) => local.element == ElementType::F16,
-            TileExpr::QuantizedLoad(load) => {
-                Self::tile_index_expr_uses_f16(&load.row)
-                    || Self::tile_index_expr_uses_f16(&load.col)
-                    || Self::tile_mask_expr_uses_f16(&load.mask)
-            }
-            TileExpr::Full(_) | TileExpr::Index(_) => false,
+            TileExpr::QuantizedLoad(_) | TileExpr::Full(_) | TileExpr::Index(_) => false,
             TileExpr::Literal(value) => value.element() == ElementType::F16,
-            TileExpr::Scalar(expr) => Self::tile_scalar_expr_uses_f16(expr),
-            TileExpr::Unary { value, .. } => Self::tile_expr_uses_f16(value),
+            TileExpr::Scalar(TileScalarExpr::Literal(value)) => value.element() == ElementType::F16,
+            TileExpr::Scalar(
+                TileScalarExpr::Reduce { scratch, .. } | TileScalarExpr::LoopReduce { scratch, .. },
+            ) => scratch.element == ElementType::F16,
+            TileExpr::Unary { .. } => false,
             TileExpr::Cast { value, to } => {
                 *to == ElementType::F16 || Self::tile_expr_uses_f16(value)
             }
             TileExpr::Bitcast { value, to } => {
                 *to == ElementType::F16 || Self::tile_expr_uses_f16(value)
             }
-            TileExpr::Binary { left, right, .. } => {
-                Self::tile_expr_uses_f16(left) || Self::tile_expr_uses_f16(right)
-            }
-            TileExpr::Sum { values } => values.iter().any(|expr| Self::tile_expr_uses_f16(expr)),
-            TileExpr::Compare {
-                left,
-                right,
-                output,
-                ..
-            } => {
-                *output == ElementType::F16
-                    || Self::tile_expr_uses_f16(left)
-                    || Self::tile_expr_uses_f16(right)
-            }
-            TileExpr::Select {
-                condition,
-                accept,
-                reject,
-            } => {
-                Self::tile_expr_uses_f16(condition)
-                    || Self::tile_expr_uses_f16(accept)
-                    || Self::tile_expr_uses_f16(reject)
-            }
-            TileExpr::LoopFold { value, initial, .. } => {
-                initial.element() == ElementType::F16 || Self::tile_expr_uses_f16(value)
-            }
+            TileExpr::Binary { .. } | TileExpr::Sum { .. } => false,
+            TileExpr::Compare { output, .. } => *output == ElementType::F16,
+            TileExpr::Select { .. } => false,
+            TileExpr::LoopFold { initial, .. } => initial.element() == ElementType::F16,
             TileExpr::GroupReduce { value, scratch, .. } => {
                 scratch.element == ElementType::F16 || Self::tile_expr_uses_f16(value)
             }
-            TileExpr::SubgroupReduce { value, .. } => Self::tile_expr_uses_f16(value),
-            TileExpr::QuantizedBlockLane {
-                k_base, col, mask, ..
-            } => {
-                Self::tile_index_expr_uses_f16(k_base)
-                    || Self::tile_index_expr_uses_f16(col)
-                    || Self::tile_mask_expr_uses_f16(mask)
-            }
-            TileExpr::Dot4 { a, b } => a
-                .iter()
-                .chain(b.iter())
-                .any(|expr| Self::tile_expr_uses_f16(expr)),
-            TileExpr::Vec4Dot { left, right } => {
-                Self::tile_expr_uses_f16(left) || Self::tile_expr_uses_f16(right)
-            }
-            TileExpr::Vec4Splat { value } => Self::tile_expr_uses_f16(value),
-            TileExpr::QuantizedQ8_0Dot8 {
-                a,
-                k_base,
-                col,
-                mask,
-                ..
-            } => {
-                a.iter().any(|expr| Self::tile_expr_uses_f16(expr))
-                    || Self::tile_index_expr_uses_f16(k_base)
-                    || Self::tile_index_expr_uses_f16(col)
-                    || Self::tile_mask_expr_uses_f16(mask)
-            }
-            TileExpr::QuantizedQ8ActivationDot {
-                a,
-                k_base,
-                col,
-                mask,
-                ..
-            } => {
-                a.iter().any(|expr| Self::tile_expr_uses_f16(expr))
-                    || Self::tile_index_expr_uses_f16(k_base)
-                    || Self::tile_index_expr_uses_f16(col)
-                    || Self::tile_mask_expr_uses_f16(mask)
-            }
-            TileExpr::QuantizedQ4KF32Dot {
-                a,
-                k_base,
-                col,
-                mask,
-                ..
-            } => {
-                a.iter().any(|expr| Self::tile_expr_uses_f16(expr))
-                    || Self::tile_index_expr_uses_f16(k_base)
-                    || Self::tile_index_expr_uses_f16(col)
-                    || Self::tile_mask_expr_uses_f16(mask)
-            }
-            TileExpr::QuantizedQ4KGgmlDot {
-                a_low,
-                a_high,
-                sums,
-                block,
-                iq,
-                ir,
-                col,
-                mask,
-                ..
-            } => {
-                a_low
-                    .iter()
-                    .chain(a_high.iter())
-                    .chain(sums.iter())
-                    .any(|expr| Self::tile_expr_uses_f16(expr))
-                    || Self::tile_index_expr_uses_f16(block)
-                    || Self::tile_index_expr_uses_f16(iq)
-                    || Self::tile_index_expr_uses_f16(ir)
-                    || Self::tile_index_expr_uses_f16(col)
-                    || Self::tile_mask_expr_uses_f16(mask)
-            }
-            TileExpr::QuantizedQ6KGgmlDot {
-                a,
-                block,
-                ip,
-                il,
-                col,
-                mask,
-                ..
-            } => {
-                a.iter().any(|expr| Self::tile_expr_uses_f16(expr))
-                    || Self::tile_index_expr_uses_f16(block)
-                    || Self::tile_index_expr_uses_f16(ip)
-                    || Self::tile_index_expr_uses_f16(il)
-                    || Self::tile_index_expr_uses_f16(col)
-                    || Self::tile_mask_expr_uses_f16(mask)
-            }
-            TileExpr::PinnedRef { .. } | TileExpr::LoopFoldGroupOutput { .. } => false,
-        }
-    }
-
-    fn tile_scalar_expr_uses_f16(expr: &TileScalarExpr) -> bool {
-        match expr {
-            TileScalarExpr::Reduce { value, scratch, .. }
-            | TileScalarExpr::LoopReduce { value, scratch, .. } => {
-                scratch.element == ElementType::F16 || Self::tile_expr_uses_f16(value)
-            }
-            TileScalarExpr::Literal(value) => value.element() == ElementType::F16,
+            TileExpr::SubgroupReduce { .. }
+            | TileExpr::QuantizedBlockLane { .. }
+            | TileExpr::Dot4 { .. }
+            | TileExpr::Vec4Dot { .. }
+            | TileExpr::Vec4Splat { .. }
+            | TileExpr::QuantizedQ8_0Dot8 { .. }
+            | TileExpr::QuantizedQ8ActivationDot { .. }
+            | TileExpr::QuantizedQ4KF32Dot { .. }
+            | TileExpr::QuantizedQ4KGgmlDot { .. }
+            | TileExpr::QuantizedQ6KGgmlDot { .. }
+            | TileExpr::PinnedRef { .. }
+            | TileExpr::LoopFoldGroupOutput { .. } => false,
         }
     }
 
     fn tile_index_expr_uses_f16(expr: &TileIndexExpr) -> bool {
-        match expr {
-            TileIndexExpr::Lane
-            | TileIndexExpr::LoopIndex
-            | TileIndexExpr::ProgramId(_)
-            | TileIndexExpr::SubgroupId
-            | TileIndexExpr::SubgroupLane
-            | TileIndexExpr::SubgroupSize
-            | TileIndexExpr::NumSubgroups
-            | TileIndexExpr::Literal(_) => false,
-            TileIndexExpr::Add(left, right) => {
-                Self::tile_index_expr_uses_f16(left) || Self::tile_index_expr_uses_f16(right)
-            }
-            TileIndexExpr::Mul(value, _)
-            | TileIndexExpr::Div(value, _)
-            | TileIndexExpr::Mod(value, _) => Self::tile_index_expr_uses_f16(value),
+        Self::tile_index_expr_any(expr, &mut |expr| match expr {
             TileIndexExpr::Value(value) => Self::tile_expr_uses_f16(value),
-        }
-    }
-
-    fn tile_mask_expr_uses_f16(expr: &TileMaskExpr) -> bool {
-        match expr {
-            TileMaskExpr::True => false,
-            TileMaskExpr::Compare { left, right, .. } => {
-                Self::tile_index_expr_uses_f16(left) || Self::tile_index_expr_uses_f16(right)
-            }
-            TileMaskExpr::And(left, right) => {
-                Self::tile_mask_expr_uses_f16(left) || Self::tile_mask_expr_uses_f16(right)
-            }
-        }
+            _ => false,
+        })
     }
 }

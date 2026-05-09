@@ -17,7 +17,7 @@ use crate::{
     map_layout::MapLayoutOperation,
     nary_wise::{NaryExpr, NaryFunction, NaryOperation},
     quantized::QMatrix,
-    quantized::matmul::{QMatMulOperation, QMatMulSwiGluOperation},
+    quantized::matmul::{QMatMulOperation, QMatMulPairedOperation},
     resize::ResizeOperation,
     rms_norm::RmsNormOperation,
     slice_assign::SliceAssignOperation,
@@ -312,11 +312,11 @@ impl LazyTensorData {
         Self::from_parts(device, info, key)
     }
 
-    pub(crate) fn q_mat_mul_swiglu(&self, function: QMatMulSwiGluOperation) -> Self {
+    pub(crate) fn q_mat_mul_paired(&self, function: QMatMulPairedOperation) -> Self {
         let device = self.device.clone();
         let mut info = self.info.clone();
         info.shape = function.out_shape.clone();
-        let key = device.compute_graph().create_q_mat_mul_swiglu(function);
+        let key = device.compute_graph().create_q_mat_mul_paired(function);
 
         Self::from_parts(device, info, key)
     }
@@ -834,16 +834,22 @@ impl<D: DataType, const R: usize> Tensor<R, D> {
         Self::from_parts(self.data.q_mat_mul(operation))
     }
 
-    pub(crate) fn add_q_mat_mul_swiglu(&self, other: &QMatrix, pair_len: usize) -> Self {
-        let operation = QMatMulSwiGluOperation::new(
+    pub(crate) fn add_q_mat_mul_paired(
+        &self,
+        other: &QMatrix,
+        pair_len: usize,
+        activation: fusor_tile_ir::PairedActivation,
+    ) -> Self {
+        let operation = QMatMulPairedOperation::new(
             self.datatype(),
             self.shape(),
             self.data.key,
             other.clone(),
             pair_len,
+            activation,
         );
 
-        Self::from_parts(self.data.q_mat_mul_swiglu(operation))
+        Self::from_parts(self.data.q_mat_mul_paired(operation))
     }
 
     pub(crate) fn add_resize<const R2: usize>(&self, op: ResizeOperation) -> Tensor<R2, D> {
@@ -962,9 +968,7 @@ impl<D: DataType, const R: usize> Tensor<R, D> {
         scale: f32,
         mask: Option<&Tensor<2, D>>,
     ) -> Option<Self> {
-        if R != 4
-            || !matches!(D::DATA_TYPE, DataTypeEnum::F32 | DataTypeEnum::F16)
-        {
+        if R != 4 || !matches!(D::DATA_TYPE, DataTypeEnum::F32 | DataTypeEnum::F16) {
             return None;
         }
         let q_shape = self.shape();

@@ -17,7 +17,7 @@ use crate::ir::{
     TileBinaryOp, TileCompareOp, TileExpr, TileId, TileIndexExpr, TileLinearLoadExpr,
     TileLinearStoreStmt, TileLiteral, TileLoadExpr, TileMaskExpr, TileOrigin, TileProgramOp,
     TileQuantizedLoadExpr, TileReduceOp, TileRef, TileScalarExpr, TileStmt, TileStoreStmt,
-    TileSwiGluStoreStmt, TileUnaryOp, TileVec4LoadExpr, TileVec4StoreStmt,
+    TileUnaryOp, TileVec4LoadExpr, TileVec4StoreStmt,
 };
 use crate::quantized::{GgmlQuantFormat, QuantizedMatrix};
 
@@ -167,6 +167,16 @@ struct Q8ActivationPackValues {
     scales: Vec<Handle<Expression>>,
     packs: Vec<Handle<Expression>>,
     sums_i32: Vec<Handle<Expression>>,
+}
+
+struct TileLoopCacheSnapshot {
+    block_dequant: Vec<(BlockDequantId, Vec<Handle<Expression>>)>,
+    pin: Vec<(PinId, Handle<Expression>)>,
+}
+
+struct CoopLoopCacheSnapshot {
+    fragments: Vec<(CoopFragmentId, Handle<Expression>)>,
+    acc_values: Vec<(CoopAccId, Handle<Expression>)>,
 }
 
 #[derive(Copy, Clone)]

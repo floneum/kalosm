@@ -168,15 +168,61 @@ async fn assert_q_mat_mul_matches_host_reference(fixture: &QuantizedFixture, fuz
 
 #[tokio::test]
 async fn q4k_q_mat_mul_swiglu_matches_cpu_reference() {
-    swiglu_matches_cpu_for_rows(1).await;
+    paired_matches_cpu_for_rows(1, PairedKind::SwiGLU).await;
 }
 
 #[tokio::test]
 async fn q4k_q_mat_mul_swiglu_multi_row_matches_cpu_reference() {
-    swiglu_matches_cpu_for_rows(4).await;
+    paired_matches_cpu_for_rows(4, PairedKind::SwiGLU).await;
 }
 
-async fn swiglu_matches_cpu_for_rows(input_row_count: usize) {
+#[tokio::test]
+async fn q4k_q_mat_mul_geglu_matches_cpu_reference() {
+    paired_matches_cpu_for_rows(1, PairedKind::GeGLU).await;
+}
+
+#[tokio::test]
+async fn q4k_q_mat_mul_geglu_multi_row_matches_cpu_reference() {
+    paired_matches_cpu_for_rows(4, PairedKind::GeGLU).await;
+}
+
+#[tokio::test]
+async fn q4k_q_mat_mul_reglu_matches_cpu_reference() {
+    paired_matches_cpu_for_rows(1, PairedKind::ReGLU).await;
+}
+
+#[tokio::test]
+async fn q4k_q_mat_mul_reglu_multi_row_matches_cpu_reference() {
+    paired_matches_cpu_for_rows(4, PairedKind::ReGLU).await;
+}
+
+#[derive(Clone, Copy)]
+enum PairedKind {
+    SwiGLU,
+    GeGLU,
+    ReGLU,
+}
+
+impl PairedKind {
+    fn cpu_activation(self, x: f32) -> f32 {
+        match self {
+            PairedKind::SwiGLU => x / (1.0 + (-x).exp()),
+            PairedKind::GeGLU => {
+                // tanh approximation matching the kernel-side helper
+                0.5 * x * (1.0 + (0.797_884_56 * (x + 0.044_715 * x * x * x)).tanh())
+            }
+            PairedKind::ReGLU => {
+                if x > 0.0 {
+                    x
+                } else {
+                    0.0
+                }
+            }
+        }
+    }
+}
+
+async fn paired_matches_cpu_for_rows(input_row_count: usize, kind: PairedKind) {
     let ty = GgmlType::Q4K;
     let weight_shape = [4, 512];
     let raw_bytes = q4k_raw_bytes(weight_shape);
@@ -187,7 +233,11 @@ async fn swiglu_matches_cpu_for_rows(input_row_count: usize) {
         let raw_bytes = raw_bytes.clone();
         async move {
             let weights = qmatrix_from_raw_bytes(&input.device(), weight_shape, &raw_bytes, ty);
-            input.q_mat_mul_swiglu(&weights, 2)
+            match kind {
+                PairedKind::SwiGLU => input.q_mat_mul_swiglu(&weights, 2),
+                PairedKind::GeGLU => input.q_mat_mul_geglu(&weights, 2),
+                PairedKind::ReGLU => input.q_mat_mul_reglu(&weights, 2),
+            }
         }
     })
     .arg(q_mat_mul_input_fuzz(
@@ -208,8 +258,8 @@ async fn swiglu_matches_cpu_for_rows(input_row_count: usize) {
                     let gate0 = row[0];
                     let gate1 = row[1];
                     vec![
-                        gate0 / (1.0 + (-gate0).exp()) * row[2],
-                        gate1 / (1.0 + (-gate1).exp()) * row[3],
+                        kind.cpu_activation(gate0) * row[2],
+                        kind.cpu_activation(gate1) * row[3],
                     ]
                 })
                 .collect::<Vec<_>>();

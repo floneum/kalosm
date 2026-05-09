@@ -19,9 +19,6 @@ impl<'a> Lowerer<'a> {
                 TileStmt::Store(store) => {
                     self.lower_tile_store_stmt(expressions, scratch, &mut body, store)?;
                 }
-                TileStmt::StoreSwiGlu(store) => {
-                    self.lower_tile_swiglu_store_stmt(expressions, scratch, &mut body, store)?;
-                }
                 TileStmt::StoreVec4(store) => {
                     self.lower_tile_vec4_store_stmt(expressions, scratch, &mut body, store)?;
                 }
@@ -58,149 +55,6 @@ impl<'a> Lowerer<'a> {
             self.storage_dynamic_pointer(expressions, &store.dst, dst_index)?;
         Self::push_emits(&mut accept, dst_index_emits);
         Self::push_emits(&mut accept, dst_ptr_emits);
-        accept.push(
-            Statement::Store {
-                pointer: dst_ptr,
-                value,
-            },
-            Span::default(),
-        );
-        body.push(
-            Statement::If {
-                condition: mask,
-                accept,
-                reject: Block::new(),
-            },
-            Span::default(),
-        );
-        Ok(())
-    }
-
-    pub(super) fn lower_tile_swiglu_store_stmt(
-        &self,
-        expressions: &mut Arena<Expression>,
-        scratch: ScratchLocals,
-        body: &mut Block,
-        store: &TileSwiGluStoreStmt,
-    ) -> Result<(), LowerError> {
-        self.block_dequant_cache.borrow_mut().clear();
-        self.q8_activation_pack_cache.borrow_mut().clear();
-
-        let gate = self.lower_tile_expr_lane(expressions, scratch, body, &store.gate, 0)?;
-        let gate_spill = self.tile_expr_spill_local(scratch, ElementType::F32, 0)?;
-        let gate_spill_ptr =
-            expressions.append(Expression::LocalVariable(gate_spill), Span::default());
-        body.push(
-            Statement::Store {
-                pointer: gate_spill_ptr,
-                value: gate,
-            },
-            Span::default(),
-        );
-
-        let up = self.lower_tile_expr_lane(expressions, scratch, body, &store.up, 1)?;
-        let up_spill = self.tile_expr_spill_local(scratch, ElementType::F32, 1)?;
-        let up_spill_ptr = expressions.append(Expression::LocalVariable(up_spill), Span::default());
-        body.push(
-            Statement::Store {
-                pointer: up_spill_ptr,
-                value: up,
-            },
-            Span::default(),
-        );
-
-        let mask = self.lower_tile_mask_expr(expressions, scratch, body, &store.mask, 0)?;
-        let mut accept = Block::new();
-
-        let row = self.lower_tile_index_expr(expressions, scratch, &mut accept, &store.row, 0)?;
-        let col = self.lower_tile_index_expr(expressions, scratch, &mut accept, &store.col, 0)?;
-        let (dst_index, dst_index_emits) =
-            self.storage_index_from_coords(expressions, &store.dst, &[row, col])?;
-        let (dst_ptr, dst_ptr_emits) =
-            self.storage_dynamic_pointer(expressions, &store.dst, dst_index)?;
-        Self::push_emits(&mut accept, dst_index_emits);
-        Self::push_emits(&mut accept, dst_ptr_emits);
-
-        let gate_spill_ptr =
-            expressions.append(Expression::LocalVariable(gate_spill), Span::default());
-        let gate = expressions.append(
-            Expression::Load {
-                pointer: gate_spill_ptr,
-            },
-            Span::default(),
-        );
-        accept.push(
-            Statement::Emit(Self::single_expression_range(expressions, gate)),
-            Span::default(),
-        );
-        let up_spill_ptr = expressions.append(Expression::LocalVariable(up_spill), Span::default());
-        let up = expressions.append(
-            Expression::Load {
-                pointer: up_spill_ptr,
-            },
-            Span::default(),
-        );
-        accept.push(
-            Statement::Emit(Self::single_expression_range(expressions, up)),
-            Span::default(),
-        );
-
-        let neg_gate = self.emit_tile_expr(
-            expressions,
-            &mut accept,
-            Expression::Unary {
-                op: naga::UnaryOperator::Negate,
-                expr: gate,
-            },
-        );
-        let exp = self.emit_tile_expr(
-            expressions,
-            &mut accept,
-            Expression::Math {
-                fun: MathFunction::Exp,
-                arg: neg_gate,
-                arg1: None,
-                arg2: None,
-                arg3: None,
-            },
-        );
-        let one = expressions.append(Expression::Literal(Literal::F32(1.0)), Span::default());
-        let denom = self.emit_tile_expr(
-            expressions,
-            &mut accept,
-            Expression::Binary {
-                op: BinaryOperator::Add,
-                left: one,
-                right: exp,
-            },
-        );
-        let sigmoid = self.emit_tile_expr(
-            expressions,
-            &mut accept,
-            Expression::Binary {
-                op: BinaryOperator::Divide,
-                left: one,
-                right: denom,
-            },
-        );
-        let gated = self.emit_tile_expr(
-            expressions,
-            &mut accept,
-            Expression::Binary {
-                op: BinaryOperator::Multiply,
-                left: gate,
-                right: sigmoid,
-            },
-        );
-        let value = self.emit_tile_expr(
-            expressions,
-            &mut accept,
-            Expression::Binary {
-                op: BinaryOperator::Multiply,
-                left: gated,
-                right: up,
-            },
-        );
         accept.push(
             Statement::Store {
                 pointer: dst_ptr,
@@ -816,92 +670,41 @@ impl<'a> Lowerer<'a> {
             .try_into()
             .map_err(|_| LowerError::UnsupportedOperation("q8_0 dot8 expected 8 A values"))?;
 
-        if matches!(mask, TileMaskExpr::True) {
-            let k_base_handle =
-                self.lower_tile_index_expr(expressions, scratch, body, k_base, spill_depth)?;
-            let col_handle =
-                self.lower_tile_index_expr(expressions, scratch, body, col, spill_depth)?;
-            let (dot, value_emits) = match format {
-                GgmlQuantFormat::Q8_0 => self.dequantize_q8_0_dot8(
-                    expressions,
-                    src,
-                    k_base_handle,
-                    col_handle,
-                    &a_handles,
-                )?,
-                GgmlQuantFormat::Q6K => self.dequantize_q6k_dot8(
-                    expressions,
-                    src,
-                    k_base_handle,
-                    col_handle,
-                    &a_handles,
-                )?,
-                _ => {
-                    return Err(LowerError::UnsupportedOperation(
-                        "unsupported quantized f32 dot8 format",
-                    ));
+        self.lower_masked_f32_value(
+            expressions,
+            scratch,
+            body,
+            mask,
+            spill_depth,
+            fill,
+            |expressions, block| {
+                let k_base_handle =
+                    self.lower_tile_index_expr(expressions, scratch, block, k_base, spill_depth)?;
+                let col_handle =
+                    self.lower_tile_index_expr(expressions, scratch, block, col, spill_depth)?;
+                match format {
+                    GgmlQuantFormat::Q8_0 => self.dequantize_q8_0_dot8(
+                        expressions,
+                        src,
+                        k_base_handle,
+                        col_handle,
+                        &a_handles,
+                    ),
+                    GgmlQuantFormat::Q6K => self.dequantize_q6k_dot8(
+                        expressions,
+                        src,
+                        k_base_handle,
+                        col_handle,
+                        &a_handles,
+                    ),
+                    _ => {
+                        return Err(LowerError::UnsupportedOperation(
+                            "unsupported quantized f32 dot8 format",
+                        ));
+                    }
                 }
-            };
-            Self::push_emits(body, value_emits);
-            return Ok(dot);
-        }
-
-        let tmp = Self::tile_value_local(scratch, ElementType::F32)?;
-        let tmp_ptr = expressions.append(Expression::LocalVariable(tmp), Span::default());
-        let fill_value = expressions.append(
-            Expression::Literal(Literal::F32(fill.get())),
-            Span::default(),
-        );
-        body.push(
-            Statement::Store {
-                pointer: tmp_ptr,
-                value: fill_value,
             },
-            Span::default(),
-        );
-
-        let mask_handle =
-            self.lower_tile_mask_expr(expressions, scratch, body, mask, spill_depth)?;
-        let mut accept = Block::new();
-        let k_base_handle =
-            self.lower_tile_index_expr(expressions, scratch, &mut accept, k_base, spill_depth)?;
-        let col_handle =
-            self.lower_tile_index_expr(expressions, scratch, &mut accept, col, spill_depth)?;
-        let (dot, value_emits) = match format {
-            GgmlQuantFormat::Q8_0 => {
-                self.dequantize_q8_0_dot8(expressions, src, k_base_handle, col_handle, &a_handles)?
-            }
-            GgmlQuantFormat::Q6K => {
-                self.dequantize_q6k_dot8(expressions, src, k_base_handle, col_handle, &a_handles)?
-            }
-            _ => {
-                return Err(LowerError::UnsupportedOperation(
-                    "unsupported quantized f32 dot8 format",
-                ));
-            }
-        };
-        Self::push_emits(&mut accept, value_emits);
-        accept.push(
-            Statement::Store {
-                pointer: tmp_ptr,
-                value: dot,
-            },
-            Span::default(),
-        );
-        body.push(
-            Statement::If {
-                condition: mask_handle,
-                accept,
-                reject: Block::new(),
-            },
-            Span::default(),
-        );
-        let loaded = expressions.append(Expression::Load { pointer: tmp_ptr }, Span::default());
-        body.push(
-            Statement::Emit(Self::single_expression_range(expressions, loaded)),
-            Span::default(),
-        );
-        Ok(loaded)
+        )
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -931,92 +734,41 @@ impl<'a> Lowerer<'a> {
         }
         let a_packs = self.cached_q8_activation_packs(expressions, scratch, body, &a_handles)?;
 
-        if matches!(mask, TileMaskExpr::True) {
-            let k_base_handle =
-                self.lower_tile_index_expr(expressions, scratch, body, k_base, spill_depth)?;
-            let col_handle =
-                self.lower_tile_index_expr(expressions, scratch, body, col, spill_depth)?;
-            let (dot, value_emits) = match (src.format, block_n) {
-                (GgmlQuantFormat::Q4K, 8 | 16) => self.q4k_q8_activation_dot(
-                    expressions,
-                    src,
-                    k_base_handle,
-                    col_handle,
-                    &a_packs,
-                )?,
-                (GgmlQuantFormat::Q6K, 8 | 16) => self.q6k_q8_activation_dot(
-                    expressions,
-                    src,
-                    k_base_handle,
-                    col_handle,
-                    &a_packs,
-                )?,
-                _ => {
-                    return Err(LowerError::UnsupportedOperation(
-                        "q8 activation dot only supports Q4K/Q6K dot8/dot16",
-                    ));
+        self.lower_masked_f32_value(
+            expressions,
+            scratch,
+            body,
+            mask,
+            spill_depth,
+            fill,
+            |expressions, block| {
+                let k_base_handle =
+                    self.lower_tile_index_expr(expressions, scratch, block, k_base, spill_depth)?;
+                let col_handle =
+                    self.lower_tile_index_expr(expressions, scratch, block, col, spill_depth)?;
+                match (src.format, block_n) {
+                    (GgmlQuantFormat::Q4K, 8 | 16) => self.q4k_q8_activation_dot(
+                        expressions,
+                        src,
+                        k_base_handle,
+                        col_handle,
+                        &a_packs,
+                    ),
+                    (GgmlQuantFormat::Q6K, 8 | 16) => self.q6k_q8_activation_dot(
+                        expressions,
+                        src,
+                        k_base_handle,
+                        col_handle,
+                        &a_packs,
+                    ),
+                    _ => {
+                        return Err(LowerError::UnsupportedOperation(
+                            "q8 activation dot only supports Q4K/Q6K dot8/dot16",
+                        ));
+                    }
                 }
-            };
-            Self::push_emits(body, value_emits);
-            return Ok(dot);
-        }
-
-        let tmp = Self::tile_value_local(scratch, ElementType::F32)?;
-        let tmp_ptr = expressions.append(Expression::LocalVariable(tmp), Span::default());
-        let fill_value = expressions.append(
-            Expression::Literal(Literal::F32(fill.get())),
-            Span::default(),
-        );
-        body.push(
-            Statement::Store {
-                pointer: tmp_ptr,
-                value: fill_value,
             },
-            Span::default(),
-        );
-
-        let mask_handle =
-            self.lower_tile_mask_expr(expressions, scratch, body, mask, spill_depth)?;
-        let mut accept = Block::new();
-        let k_base_handle =
-            self.lower_tile_index_expr(expressions, scratch, &mut accept, k_base, spill_depth)?;
-        let col_handle =
-            self.lower_tile_index_expr(expressions, scratch, &mut accept, col, spill_depth)?;
-        let (dot, value_emits) = match (src.format, block_n) {
-            (GgmlQuantFormat::Q4K, 8 | 16) => {
-                self.q4k_q8_activation_dot(expressions, src, k_base_handle, col_handle, &a_packs)?
-            }
-            (GgmlQuantFormat::Q6K, 8 | 16) => {
-                self.q6k_q8_activation_dot(expressions, src, k_base_handle, col_handle, &a_packs)?
-            }
-            _ => {
-                return Err(LowerError::UnsupportedOperation(
-                    "q8 activation dot only supports Q4K/Q6K dot8/dot16",
-                ));
-            }
-        };
-        Self::push_emits(&mut accept, value_emits);
-        accept.push(
-            Statement::Store {
-                pointer: tmp_ptr,
-                value: dot,
-            },
-            Span::default(),
-        );
-        body.push(
-            Statement::If {
-                condition: mask_handle,
-                accept,
-                reject: Block::new(),
-            },
-            Span::default(),
-        );
-        let loaded = expressions.append(Expression::Load { pointer: tmp_ptr }, Span::default());
-        body.push(
-            Statement::Emit(Self::single_expression_range(expressions, loaded)),
-            Span::default(),
-        );
-        Ok(loaded)
+        )
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1045,78 +797,30 @@ impl<'a> Lowerer<'a> {
             )?);
         }
 
-        if matches!(mask, TileMaskExpr::True) {
-            let k_base_handle =
-                self.lower_tile_index_expr(expressions, scratch, body, k_base, spill_depth)?;
-            let col_handle =
-                self.lower_tile_index_expr(expressions, scratch, body, col, spill_depth)?;
-            let (dot, value_emits) = match (src.format, block_n) {
-                (GgmlQuantFormat::Q4K, 8 | 16 | 32) => {
-                    self.q4k_f32_dot(expressions, src, k_base_handle, col_handle, &a_handles)?
+        self.lower_masked_f32_value(
+            expressions,
+            scratch,
+            body,
+            mask,
+            spill_depth,
+            fill,
+            |expressions, block| {
+                let k_base_handle =
+                    self.lower_tile_index_expr(expressions, scratch, block, k_base, spill_depth)?;
+                let col_handle =
+                    self.lower_tile_index_expr(expressions, scratch, block, col, spill_depth)?;
+                match (src.format, block_n) {
+                    (GgmlQuantFormat::Q4K, 8 | 16 | 32) => {
+                        self.q4k_f32_dot(expressions, src, k_base_handle, col_handle, &a_handles)
+                    }
+                    _ => {
+                        return Err(LowerError::UnsupportedOperation(
+                            "q4k f32 dot only supports Q4K dot8/dot16/dot32",
+                        ));
+                    }
                 }
-                _ => {
-                    return Err(LowerError::UnsupportedOperation(
-                        "q4k f32 dot only supports Q4K dot8/dot16/dot32",
-                    ));
-                }
-            };
-            Self::push_emits(body, value_emits);
-            return Ok(dot);
-        }
-
-        let tmp = Self::tile_value_local(scratch, ElementType::F32)?;
-        let tmp_ptr = expressions.append(Expression::LocalVariable(tmp), Span::default());
-        let fill_value = expressions.append(
-            Expression::Literal(Literal::F32(fill.get())),
-            Span::default(),
-        );
-        body.push(
-            Statement::Store {
-                pointer: tmp_ptr,
-                value: fill_value,
             },
-            Span::default(),
-        );
-
-        let mask_handle =
-            self.lower_tile_mask_expr(expressions, scratch, body, mask, spill_depth)?;
-        let mut accept = Block::new();
-        let k_base_handle =
-            self.lower_tile_index_expr(expressions, scratch, &mut accept, k_base, spill_depth)?;
-        let col_handle =
-            self.lower_tile_index_expr(expressions, scratch, &mut accept, col, spill_depth)?;
-        let (dot, value_emits) = match (src.format, block_n) {
-            (GgmlQuantFormat::Q4K, 8 | 16 | 32) => {
-                self.q4k_f32_dot(expressions, src, k_base_handle, col_handle, &a_handles)?
-            }
-            _ => {
-                return Err(LowerError::UnsupportedOperation(
-                    "q4k f32 dot only supports Q4K dot8/dot16/dot32",
-                ));
-            }
-        };
-        Self::push_emits(&mut accept, value_emits);
-        accept.push(
-            Statement::Store {
-                pointer: tmp_ptr,
-                value: dot,
-            },
-            Span::default(),
-        );
-        body.push(
-            Statement::If {
-                condition: mask_handle,
-                accept,
-                reject: Block::new(),
-            },
-            Span::default(),
-        );
-        let loaded = expressions.append(Expression::Load { pointer: tmp_ptr }, Span::default());
-        body.push(
-            Statement::Emit(Self::single_expression_range(expressions, loaded)),
-            Span::default(),
-        );
-        Ok(loaded)
+        )
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1174,88 +878,40 @@ impl<'a> Lowerer<'a> {
             )?);
         }
 
-        if matches!(mask, TileMaskExpr::True) {
-            let block_handle =
-                self.lower_tile_index_expr(expressions, scratch, body, block, spill_depth)?;
-            let iq_handle =
-                self.lower_tile_index_expr(expressions, scratch, body, iq, spill_depth)?;
-            let ir_handle =
-                self.lower_tile_index_expr(expressions, scratch, body, ir, spill_depth)?;
-            let col_handle =
-                self.lower_tile_index_expr(expressions, scratch, body, col, spill_depth)?;
-            let (dot, value_emits) = self.q4k_ggml_dot(
-                expressions,
-                src,
-                block_handle,
-                iq_handle,
-                ir_handle,
-                col_handle,
-                &a_low_handles,
-                &a_high_handles,
-                &sum_handles,
-            )?;
-            Self::push_emits(body, value_emits);
-            return Ok(dot);
-        }
-
-        let tmp = Self::tile_value_local(scratch, ElementType::F32)?;
-        let tmp_ptr = expressions.append(Expression::LocalVariable(tmp), Span::default());
-        let fill_value = expressions.append(
-            Expression::Literal(Literal::F32(fill.get())),
-            Span::default(),
-        );
-        body.push(
-            Statement::Store {
-                pointer: tmp_ptr,
-                value: fill_value,
-            },
-            Span::default(),
-        );
-
-        let mask_handle =
-            self.lower_tile_mask_expr(expressions, scratch, body, mask, spill_depth)?;
-        let mut accept = Block::new();
-        let block_handle =
-            self.lower_tile_index_expr(expressions, scratch, &mut accept, block, spill_depth)?;
-        let iq_handle =
-            self.lower_tile_index_expr(expressions, scratch, &mut accept, iq, spill_depth)?;
-        let ir_handle =
-            self.lower_tile_index_expr(expressions, scratch, &mut accept, ir, spill_depth)?;
-        let col_handle =
-            self.lower_tile_index_expr(expressions, scratch, &mut accept, col, spill_depth)?;
-        let (dot, value_emits) = self.q4k_ggml_dot(
+        self.lower_masked_f32_value(
             expressions,
-            src,
-            block_handle,
-            iq_handle,
-            ir_handle,
-            col_handle,
-            &a_low_handles,
-            &a_high_handles,
-            &sum_handles,
-        )?;
-        Self::push_emits(&mut accept, value_emits);
-        accept.push(
-            Statement::Store {
-                pointer: tmp_ptr,
-                value: dot,
+            scratch,
+            body,
+            mask,
+            spill_depth,
+            fill,
+            |expressions, block_body| {
+                let block_handle = self.lower_tile_index_expr(
+                    expressions,
+                    scratch,
+                    block_body,
+                    block,
+                    spill_depth,
+                )?;
+                let iq_handle =
+                    self.lower_tile_index_expr(expressions, scratch, block_body, iq, spill_depth)?;
+                let ir_handle =
+                    self.lower_tile_index_expr(expressions, scratch, block_body, ir, spill_depth)?;
+                let col_handle =
+                    self.lower_tile_index_expr(expressions, scratch, block_body, col, spill_depth)?;
+                self.q4k_ggml_dot(
+                    expressions,
+                    src,
+                    block_handle,
+                    iq_handle,
+                    ir_handle,
+                    col_handle,
+                    &a_low_handles,
+                    &a_high_handles,
+                    &sum_handles,
+                )
             },
-            Span::default(),
-        );
-        body.push(
-            Statement::If {
-                condition: mask_handle,
-                accept,
-                reject: Block::new(),
-            },
-            Span::default(),
-        );
-        let loaded = expressions.append(Expression::Load { pointer: tmp_ptr }, Span::default());
-        body.push(
-            Statement::Emit(Self::single_expression_range(expressions, loaded)),
-            Span::default(),
-        );
-        Ok(loaded)
+        )
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1291,84 +947,38 @@ impl<'a> Lowerer<'a> {
             )?);
         }
 
-        if matches!(mask, TileMaskExpr::True) {
-            let block_handle =
-                self.lower_tile_index_expr(expressions, scratch, body, block, spill_depth)?;
-            let ip_handle =
-                self.lower_tile_index_expr(expressions, scratch, body, ip, spill_depth)?;
-            let il_handle =
-                self.lower_tile_index_expr(expressions, scratch, body, il, spill_depth)?;
-            let col_handle =
-                self.lower_tile_index_expr(expressions, scratch, body, col, spill_depth)?;
-            let (dot, value_emits) = self.q6k_ggml_dot(
-                expressions,
-                src,
-                block_handle,
-                ip_handle,
-                il_handle,
-                col_handle,
-                &a_handles,
-            )?;
-            Self::push_emits(body, value_emits);
-            return Ok(dot);
-        }
-
-        let tmp = Self::tile_value_local(scratch, ElementType::F32)?;
-        let tmp_ptr = expressions.append(Expression::LocalVariable(tmp), Span::default());
-        let fill_value = expressions.append(
-            Expression::Literal(Literal::F32(fill.get())),
-            Span::default(),
-        );
-        body.push(
-            Statement::Store {
-                pointer: tmp_ptr,
-                value: fill_value,
-            },
-            Span::default(),
-        );
-
-        let mask_handle =
-            self.lower_tile_mask_expr(expressions, scratch, body, mask, spill_depth)?;
-        let mut accept = Block::new();
-        let block_handle =
-            self.lower_tile_index_expr(expressions, scratch, &mut accept, block, spill_depth)?;
-        let ip_handle =
-            self.lower_tile_index_expr(expressions, scratch, &mut accept, ip, spill_depth)?;
-        let il_handle =
-            self.lower_tile_index_expr(expressions, scratch, &mut accept, il, spill_depth)?;
-        let col_handle =
-            self.lower_tile_index_expr(expressions, scratch, &mut accept, col, spill_depth)?;
-        let (dot, value_emits) = self.q6k_ggml_dot(
+        self.lower_masked_f32_value(
             expressions,
-            src,
-            block_handle,
-            ip_handle,
-            il_handle,
-            col_handle,
-            &a_handles,
-        )?;
-        Self::push_emits(&mut accept, value_emits);
-        accept.push(
-            Statement::Store {
-                pointer: tmp_ptr,
-                value: dot,
+            scratch,
+            body,
+            mask,
+            spill_depth,
+            fill,
+            |expressions, block_body| {
+                let block_handle = self.lower_tile_index_expr(
+                    expressions,
+                    scratch,
+                    block_body,
+                    block,
+                    spill_depth,
+                )?;
+                let ip_handle =
+                    self.lower_tile_index_expr(expressions, scratch, block_body, ip, spill_depth)?;
+                let il_handle =
+                    self.lower_tile_index_expr(expressions, scratch, block_body, il, spill_depth)?;
+                let col_handle =
+                    self.lower_tile_index_expr(expressions, scratch, block_body, col, spill_depth)?;
+                self.q6k_ggml_dot(
+                    expressions,
+                    src,
+                    block_handle,
+                    ip_handle,
+                    il_handle,
+                    col_handle,
+                    &a_handles,
+                )
             },
-            Span::default(),
-        );
-        body.push(
-            Statement::If {
-                condition: mask_handle,
-                accept,
-                reject: Block::new(),
-            },
-            Span::default(),
-        );
-        let loaded = expressions.append(Expression::Load { pointer: tmp_ptr }, Span::default());
-        body.push(
-            Statement::Emit(Self::single_expression_range(expressions, loaded)),
-            Span::default(),
-        );
-        Ok(loaded)
+        )
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1564,6 +1174,96 @@ impl<'a> Lowerer<'a> {
             ))
     }
 
+    fn lower_masked_f32_value(
+        &self,
+        expressions: &mut Arena<Expression>,
+        scratch: ScratchLocals,
+        body: &mut Block,
+        mask: &TileMaskExpr,
+        spill_depth: usize,
+        fill: F32Bits,
+        lower_value: impl FnOnce(
+            &mut Arena<Expression>,
+            &mut Block,
+        )
+            -> Result<(Handle<Expression>, Vec<Range<Expression>>), LowerError>,
+    ) -> Result<Handle<Expression>, LowerError> {
+        if matches!(mask, TileMaskExpr::True) {
+            let (value, emits) = lower_value(expressions, body)?;
+            Self::push_emits(body, emits);
+            return Ok(value);
+        }
+
+        let fill = expressions.append(
+            Expression::Literal(Literal::F32(fill.get())),
+            Span::default(),
+        );
+        self.lower_masked_value_to_local(
+            expressions,
+            scratch,
+            body,
+            mask,
+            spill_depth,
+            ElementType::F32,
+            fill,
+            |expressions, accept| {
+                let (value, emits) = lower_value(expressions, accept)?;
+                Self::push_emits(accept, emits);
+                Ok(value)
+            },
+        )
+    }
+
+    fn lower_masked_value_to_local(
+        &self,
+        expressions: &mut Arena<Expression>,
+        scratch: ScratchLocals,
+        body: &mut Block,
+        mask: &TileMaskExpr,
+        spill_depth: usize,
+        element: ElementType,
+        fill: Handle<Expression>,
+        lower_accept_value: impl FnOnce(
+            &mut Arena<Expression>,
+            &mut Block,
+        ) -> Result<Handle<Expression>, LowerError>,
+    ) -> Result<Handle<Expression>, LowerError> {
+        let tmp = Self::tile_value_local(scratch, element)?;
+        let tmp_ptr = expressions.append(Expression::LocalVariable(tmp), Span::default());
+        body.push(
+            Statement::Store {
+                pointer: tmp_ptr,
+                value: fill,
+            },
+            Span::default(),
+        );
+
+        let mask = self.lower_tile_mask_expr(expressions, scratch, body, mask, spill_depth)?;
+        let mut accept = Block::new();
+        let value = lower_accept_value(expressions, &mut accept)?;
+        accept.push(
+            Statement::Store {
+                pointer: tmp_ptr,
+                value,
+            },
+            Span::default(),
+        );
+        body.push(
+            Statement::If {
+                condition: mask,
+                accept,
+                reject: Block::new(),
+            },
+            Span::default(),
+        );
+        let loaded = expressions.append(Expression::Load { pointer: tmp_ptr }, Span::default());
+        body.push(
+            Statement::Emit(Self::single_expression_range(expressions, loaded)),
+            Span::default(),
+        );
+        Ok(loaded)
+    }
+
     fn lower_tile_load_expr(
         &self,
         expressions: &mut Arena<Expression>,
@@ -1592,58 +1292,47 @@ impl<'a> Lowerer<'a> {
             return Ok(value);
         }
 
-        let tmp = Self::tile_value_local(scratch, element)?;
-        let tmp_ptr = expressions.append(Expression::LocalVariable(tmp), Span::default());
         let fill_source = load.fill.element();
         let fill = expressions.append(Self::tile_literal(load.fill), Span::default());
         let fill = self.cast_tile_value(expressions, body, fill, fill_source, element);
-        body.push(
-            Statement::Store {
-                pointer: tmp_ptr,
-                value: fill,
+        self.lower_masked_value_to_local(
+            expressions,
+            scratch,
+            body,
+            &load.mask,
+            spill_depth,
+            element,
+            fill,
+            |expressions, accept| {
+                let row = self.lower_tile_index_expr(
+                    expressions,
+                    scratch,
+                    accept,
+                    &load.row,
+                    spill_depth,
+                )?;
+                let col = self.lower_tile_index_expr(
+                    expressions,
+                    scratch,
+                    accept,
+                    &load.col,
+                    spill_depth,
+                )?;
+                let (src_index, src_index_emits) =
+                    self.storage_index_from_coords(expressions, &load.src, &[row, col])?;
+                let (src_ptr, src_ptr_emits) =
+                    self.storage_dynamic_pointer(expressions, &load.src, src_index)?;
+                Self::push_emits(accept, src_index_emits);
+                Self::push_emits(accept, src_ptr_emits);
+                let value =
+                    expressions.append(Expression::Load { pointer: src_ptr }, Span::default());
+                accept.push(
+                    Statement::Emit(Self::single_expression_range(expressions, value)),
+                    Span::default(),
+                );
+                Ok(value)
             },
-            Span::default(),
-        );
-
-        let mask =
-            self.lower_tile_mask_expr(expressions, scratch, body, &load.mask, spill_depth)?;
-        let mut accept = Block::new();
-        let row =
-            self.lower_tile_index_expr(expressions, scratch, &mut accept, &load.row, spill_depth)?;
-        let col =
-            self.lower_tile_index_expr(expressions, scratch, &mut accept, &load.col, spill_depth)?;
-        let (src_index, src_index_emits) =
-            self.storage_index_from_coords(expressions, &load.src, &[row, col])?;
-        let (src_ptr, src_ptr_emits) =
-            self.storage_dynamic_pointer(expressions, &load.src, src_index)?;
-        Self::push_emits(&mut accept, src_index_emits);
-        Self::push_emits(&mut accept, src_ptr_emits);
-        let value = expressions.append(Expression::Load { pointer: src_ptr }, Span::default());
-        accept.push(
-            Statement::Emit(Self::single_expression_range(expressions, value)),
-            Span::default(),
-        );
-        accept.push(
-            Statement::Store {
-                pointer: tmp_ptr,
-                value,
-            },
-            Span::default(),
-        );
-        body.push(
-            Statement::If {
-                condition: mask,
-                accept,
-                reject: Block::new(),
-            },
-            Span::default(),
-        );
-        let loaded = expressions.append(Expression::Load { pointer: tmp_ptr }, Span::default());
-        body.push(
-            Statement::Emit(Self::single_expression_range(expressions, loaded)),
-            Span::default(),
-        );
-        Ok(loaded)
+        )
     }
 
     fn lower_tile_vec4_load_expr(
@@ -1674,56 +1363,35 @@ impl<'a> Lowerer<'a> {
             return Ok(value);
         }
 
-        let tmp = Self::tile_value_local(scratch, ElementType::F32Vec4)?;
-        let tmp_ptr = expressions.append(Expression::LocalVariable(tmp), Span::default());
         let fill = self.vec4_splat_literal(expressions, body, load.fill.get());
-        body.push(
-            Statement::Store {
-                pointer: tmp_ptr,
-                value: fill,
-            },
-            Span::default(),
-        );
-
-        let mask =
-            self.lower_tile_mask_expr(expressions, scratch, body, &load.mask, spill_depth)?;
-        let mut accept = Block::new();
-        let index = self.lower_tile_index_expr(
+        self.lower_masked_value_to_local(
             expressions,
             scratch,
-            &mut accept,
-            &load.index,
+            body,
+            &load.mask,
             spill_depth,
-        )?;
-        let (src_ptr, src_ptr_emits) =
-            self.storage_dynamic_pointer(expressions, &load.src, index)?;
-        Self::push_emits(&mut accept, src_ptr_emits);
-        let value = expressions.append(Expression::Load { pointer: src_ptr }, Span::default());
-        accept.push(
-            Statement::Emit(Self::single_expression_range(expressions, value)),
-            Span::default(),
-        );
-        accept.push(
-            Statement::Store {
-                pointer: tmp_ptr,
-                value,
+            ElementType::F32Vec4,
+            fill,
+            |expressions, accept| {
+                let index = self.lower_tile_index_expr(
+                    expressions,
+                    scratch,
+                    accept,
+                    &load.index,
+                    spill_depth,
+                )?;
+                let (src_ptr, src_ptr_emits) =
+                    self.storage_dynamic_pointer(expressions, &load.src, index)?;
+                Self::push_emits(accept, src_ptr_emits);
+                let value =
+                    expressions.append(Expression::Load { pointer: src_ptr }, Span::default());
+                accept.push(
+                    Statement::Emit(Self::single_expression_range(expressions, value)),
+                    Span::default(),
+                );
+                Ok(value)
             },
-            Span::default(),
-        );
-        body.push(
-            Statement::If {
-                condition: mask,
-                accept,
-                reject: Block::new(),
-            },
-            Span::default(),
-        );
-        let loaded = expressions.append(Expression::Load { pointer: tmp_ptr }, Span::default());
-        body.push(
-            Statement::Emit(Self::single_expression_range(expressions, loaded)),
-            Span::default(),
-        );
-        Ok(loaded)
+        )
     }
 
     fn lower_tile_linear_load_expr(
@@ -1749,58 +1417,37 @@ impl<'a> Lowerer<'a> {
             return Ok(value);
         }
 
-        let tmp = Self::tile_value_local(scratch, element)?;
-        let tmp_ptr = expressions.append(Expression::LocalVariable(tmp), Span::default());
         let fill_source = load.fill.element();
         let fill = expressions.append(Self::tile_literal(load.fill), Span::default());
         let fill = self.cast_tile_value(expressions, body, fill, fill_source, element);
-        body.push(
-            Statement::Store {
-                pointer: tmp_ptr,
-                value: fill,
-            },
-            Span::default(),
-        );
-
-        let mask =
-            self.lower_tile_mask_expr(expressions, scratch, body, &load.mask, spill_depth)?;
-        let mut accept = Block::new();
-        let index = self.lower_tile_index_expr(
+        self.lower_masked_value_to_local(
             expressions,
             scratch,
-            &mut accept,
-            &load.index,
+            body,
+            &load.mask,
             spill_depth,
-        )?;
-        let (src_ptr, src_ptr_emits) =
-            self.storage_dynamic_pointer(expressions, &load.src, index)?;
-        Self::push_emits(&mut accept, src_ptr_emits);
-        let value = expressions.append(Expression::Load { pointer: src_ptr }, Span::default());
-        accept.push(
-            Statement::Emit(Self::single_expression_range(expressions, value)),
-            Span::default(),
-        );
-        accept.push(
-            Statement::Store {
-                pointer: tmp_ptr,
-                value,
+            element,
+            fill,
+            |expressions, accept| {
+                let index = self.lower_tile_index_expr(
+                    expressions,
+                    scratch,
+                    accept,
+                    &load.index,
+                    spill_depth,
+                )?;
+                let (src_ptr, src_ptr_emits) =
+                    self.storage_dynamic_pointer(expressions, &load.src, index)?;
+                Self::push_emits(accept, src_ptr_emits);
+                let value =
+                    expressions.append(Expression::Load { pointer: src_ptr }, Span::default());
+                accept.push(
+                    Statement::Emit(Self::single_expression_range(expressions, value)),
+                    Span::default(),
+                );
+                Ok(value)
             },
-            Span::default(),
-        );
-        body.push(
-            Statement::If {
-                condition: mask,
-                accept,
-                reject: Block::new(),
-            },
-            Span::default(),
-        );
-        let loaded = expressions.append(Expression::Load { pointer: tmp_ptr }, Span::default());
-        body.push(
-            Statement::Emit(Self::single_expression_range(expressions, loaded)),
-            Span::default(),
-        );
-        Ok(loaded)
+        )
     }
 
     fn lower_tile_quantized_load_expr(
@@ -1811,60 +1458,31 @@ impl<'a> Lowerer<'a> {
         load: &TileQuantizedLoadExpr,
         spill_depth: usize,
     ) -> Result<Handle<Expression>, LowerError> {
-        if matches!(load.mask, TileMaskExpr::True) {
-            let row =
-                self.lower_tile_index_expr(expressions, scratch, body, &load.row, spill_depth)?;
-            let col =
-                self.lower_tile_index_expr(expressions, scratch, body, &load.col, spill_depth)?;
-            let (value, value_emits) = self.dequantize_qvalue(expressions, &load.src, row, col)?;
-            Self::push_emits(body, value_emits);
-            return Ok(value);
-        }
-
-        let tmp = Self::tile_value_local(scratch, ElementType::F32)?;
-        let tmp_ptr = expressions.append(Expression::LocalVariable(tmp), Span::default());
-        let fill = expressions.append(
-            Expression::Literal(Literal::F32(load.fill.get())),
-            Span::default(),
-        );
-        body.push(
-            Statement::Store {
-                pointer: tmp_ptr,
-                value: fill,
+        self.lower_masked_f32_value(
+            expressions,
+            scratch,
+            body,
+            &load.mask,
+            spill_depth,
+            load.fill,
+            |expressions, block| {
+                let row = self.lower_tile_index_expr(
+                    expressions,
+                    scratch,
+                    block,
+                    &load.row,
+                    spill_depth,
+                )?;
+                let col = self.lower_tile_index_expr(
+                    expressions,
+                    scratch,
+                    block,
+                    &load.col,
+                    spill_depth,
+                )?;
+                self.dequantize_qvalue(expressions, &load.src, row, col)
             },
-            Span::default(),
-        );
-
-        let mask =
-            self.lower_tile_mask_expr(expressions, scratch, body, &load.mask, spill_depth)?;
-        let mut accept = Block::new();
-        let row =
-            self.lower_tile_index_expr(expressions, scratch, &mut accept, &load.row, spill_depth)?;
-        let col =
-            self.lower_tile_index_expr(expressions, scratch, &mut accept, &load.col, spill_depth)?;
-        let (value, value_emits) = self.dequantize_qvalue(expressions, &load.src, row, col)?;
-        Self::push_emits(&mut accept, value_emits);
-        accept.push(
-            Statement::Store {
-                pointer: tmp_ptr,
-                value,
-            },
-            Span::default(),
-        );
-        body.push(
-            Statement::If {
-                condition: mask,
-                accept,
-                reject: Block::new(),
-            },
-            Span::default(),
-        );
-        let loaded = expressions.append(Expression::Load { pointer: tmp_ptr }, Span::default());
-        body.push(
-            Statement::Emit(Self::single_expression_range(expressions, loaded)),
-            Span::default(),
-        );
-        Ok(loaded)
+        )
     }
 
     fn lower_tile_scalar_expr(
@@ -1919,117 +1537,18 @@ impl<'a> Lowerer<'a> {
         spill_depth: usize,
     ) -> Result<Handle<Expression>, LowerError> {
         let element = self.tile_expr_element(value)?;
-        let acc = self.tile_expr_spill_local(scratch, element, 0)?;
-        let acc_ptr = expressions.append(Expression::LocalVariable(acc), Span::default());
-        let identity = expressions.append(Self::tile_reduce_identity(op, element), Span::default());
-        body.push(
-            Statement::Store {
-                pointer: acc_ptr,
-                value: identity,
-            },
-            Span::default(),
-        );
-
-        let loop_ptr = expressions.append(
-            Expression::LocalVariable(scratch.loop_index),
-            Span::default(),
-        );
-        let zero = expressions.append(Expression::Literal(Literal::U32(0)), Span::default());
-        body.push(
-            Statement::Store {
-                pointer: loop_ptr,
-                value: zero,
-            },
-            Span::default(),
-        );
-
-        let mut loop_body = Block::new();
-        let loop_index =
-            expressions.append(Expression::Load { pointer: loop_ptr }, Span::default());
-        loop_body.push(
-            Statement::Emit(Self::single_expression_range(expressions, loop_index)),
-            Span::default(),
-        );
-        let done = self.bin_lit_u32(
-            expressions,
-            &mut loop_body,
-            BinaryOperator::GreaterEqual,
-            loop_index,
-            iterations,
-        );
-        loop_body.push(
-            Statement::If {
-                condition: done,
-                accept: Block::from_vec(vec![Statement::Break]),
-                reject: Block::new(),
-            },
-            Span::default(),
-        );
-
-        // Cache entries reference values scoped to the outer block. Snapshot
-        // expression-handle caches, but drop q8 activation locals because the
-        // loop body may overwrite the shared scratch slots.
-        let saved_dequant: Vec<_> = self.block_dequant_cache.borrow_mut().drain().collect();
-        let saved_pin: Vec<_> = self.pin_cache.borrow_mut().drain().collect();
-        self.q8_activation_pack_cache.borrow_mut().clear();
-        let value = self.lower_tile_expr_lane(
+        self.lower_tile_loop_accumulate_value(
             expressions,
             scratch,
-            &mut loop_body,
+            body,
             value,
-            spill_depth + 1,
-        )?;
-        {
-            let mut cache = self.block_dequant_cache.borrow_mut();
-            cache.clear();
-            for (k, v) in saved_dequant {
-                cache.insert(k, v);
-            }
-        }
-        {
-            let mut cache = self.pin_cache.borrow_mut();
-            cache.clear();
-            for (k, v) in saved_pin {
-                cache.insert(k, v);
-            }
-        }
-        self.q8_activation_pack_cache.borrow_mut().clear();
-        let acc = expressions.append(Expression::Load { pointer: acc_ptr }, Span::default());
-        loop_body.push(
-            Statement::Emit(Self::single_expression_range(expressions, acc)),
-            Span::default(),
-        );
-        let reduced = self.emit_tile_expr(
-            expressions,
-            &mut loop_body,
-            Self::tile_reduce_expression(op, acc, value),
-        );
-        loop_body.push(
-            Statement::Store {
-                pointer: acc_ptr,
-                value: reduced,
-            },
-            Span::default(),
-        );
-        loop_body.push(
-            self.increment_u32_local(expressions, scratch.loop_index, 1),
-            Span::default(),
-        );
-        body.push(
-            Statement::Loop {
-                body: loop_body,
-                continuing: Block::new(),
-                break_if: None,
-            },
-            Span::default(),
-        );
-
-        let value = expressions.append(Expression::Load { pointer: acc_ptr }, Span::default());
-        body.push(
-            Statement::Emit(Self::single_expression_range(expressions, value)),
-            Span::default(),
-        );
-        Ok(value)
+            iterations,
+            op,
+            element,
+            Self::tile_reduce_identity(op, element),
+            0,
+            spill_depth,
+        )
     }
 
     fn lower_tile_loop_fold_value(
@@ -2044,9 +1563,36 @@ impl<'a> Lowerer<'a> {
         spill_depth: usize,
     ) -> Result<Handle<Expression>, LowerError> {
         let element = initial.element();
-        let acc = self.tile_expr_spill_local(scratch, element, spill_depth)?;
+        self.lower_tile_loop_accumulate_value(
+            expressions,
+            scratch,
+            body,
+            value,
+            iterations,
+            op,
+            element,
+            Self::tile_literal(initial),
+            spill_depth,
+            spill_depth,
+        )
+    }
+
+    fn lower_tile_loop_accumulate_value(
+        &self,
+        expressions: &mut Arena<Expression>,
+        scratch: ScratchLocals,
+        body: &mut Block,
+        value: &TileExpr,
+        iterations: u32,
+        op: TileReduceOp,
+        element: ElementType,
+        initial: Expression,
+        acc_spill_depth: usize,
+        spill_depth: usize,
+    ) -> Result<Handle<Expression>, LowerError> {
+        let acc = self.tile_expr_spill_local(scratch, element, acc_spill_depth)?;
         let acc_ptr = expressions.append(Expression::LocalVariable(acc), Span::default());
-        let initial = expressions.append(Self::tile_literal(initial), Span::default());
+        let initial = expressions.append(initial, Span::default());
         body.push(
             Statement::Store {
                 pointer: acc_ptr,
@@ -2055,99 +1601,45 @@ impl<'a> Lowerer<'a> {
             Span::default(),
         );
 
-        let loop_ptr = expressions.append(
-            Expression::LocalVariable(scratch.loop_index),
-            Span::default(),
-        );
-        let zero = expressions.append(Expression::Literal(Literal::U32(0)), Span::default());
-        body.push(
-            Statement::Store {
-                pointer: loop_ptr,
-                value: zero,
-            },
-            Span::default(),
-        );
-
-        let mut loop_body = Block::new();
-        let loop_index =
-            expressions.append(Expression::Load { pointer: loop_ptr }, Span::default());
-        loop_body.push(
-            Statement::Emit(Self::single_expression_range(expressions, loop_index)),
-            Span::default(),
-        );
-        let done = self.bin_lit_u32(
-            expressions,
-            &mut loop_body,
-            BinaryOperator::GreaterEqual,
-            loop_index,
-            iterations,
-        );
-        loop_body.push(
-            Statement::If {
-                condition: done,
-                accept: Block::from_vec(vec![Statement::Break]),
-                reject: Block::new(),
-            },
-            Span::default(),
-        );
-
-        // Cache entries reference values scoped to the outer block. Snapshot
-        // expression-handle caches, but drop q8 activation locals because the
-        // loop body may overwrite the shared scratch slots.
-        let saved_dequant: Vec<_> = self.block_dequant_cache.borrow_mut().drain().collect();
-        let saved_pin: Vec<_> = self.pin_cache.borrow_mut().drain().collect();
-        self.q8_activation_pack_cache.borrow_mut().clear();
-        let value = self.lower_tile_expr_lane(
+        self.emit_counted_loop(
             expressions,
             scratch,
-            &mut loop_body,
-            value,
-            spill_depth + 1,
+            body,
+            iterations,
+            |expressions, loop_body, _| {
+                // Cache entries reference values scoped to the outer block. Snapshot
+                // expression-handle caches, but drop q8 activation locals because the
+                // loop body may overwrite the shared scratch slots.
+                let saved = self.snapshot_tile_loop_caches();
+                let value = self.lower_tile_expr_lane(
+                    expressions,
+                    scratch,
+                    loop_body,
+                    value,
+                    spill_depth + 1,
+                )?;
+                self.restore_tile_loop_caches(saved);
+                let acc =
+                    expressions.append(Expression::Load { pointer: acc_ptr }, Span::default());
+                loop_body.push(
+                    Statement::Emit(Self::single_expression_range(expressions, acc)),
+                    Span::default(),
+                );
+                let reduced = self.emit_tile_expr(
+                    expressions,
+                    loop_body,
+                    Self::tile_reduce_expression(op, acc, value),
+                );
+                loop_body.push(
+                    Statement::Store {
+                        pointer: acc_ptr,
+                        value: reduced,
+                    },
+                    Span::default(),
+                );
+                Ok(())
+            },
         )?;
-        {
-            let mut cache = self.block_dequant_cache.borrow_mut();
-            cache.clear();
-            for (k, v) in saved_dequant {
-                cache.insert(k, v);
-            }
-        }
-        {
-            let mut cache = self.pin_cache.borrow_mut();
-            cache.clear();
-            for (k, v) in saved_pin {
-                cache.insert(k, v);
-            }
-        }
-        self.q8_activation_pack_cache.borrow_mut().clear();
-        let acc = expressions.append(Expression::Load { pointer: acc_ptr }, Span::default());
-        loop_body.push(
-            Statement::Emit(Self::single_expression_range(expressions, acc)),
-            Span::default(),
-        );
-        let reduced = self.emit_tile_expr(
-            expressions,
-            &mut loop_body,
-            Self::tile_reduce_expression(op, acc, value),
-        );
-        loop_body.push(
-            Statement::Store {
-                pointer: acc_ptr,
-                value: reduced,
-            },
-            Span::default(),
-        );
-        loop_body.push(
-            self.increment_u32_local(expressions, scratch.loop_index, 1),
-            Span::default(),
-        );
-        body.push(
-            Statement::Loop {
-                body: loop_body,
-                continuing: Block::new(),
-                break_if: None,
-            },
-            Span::default(),
-        );
 
         let value = expressions.append(Expression::Load { pointer: acc_ptr }, Span::default());
         body.push(
@@ -2426,111 +1918,52 @@ impl<'a> Lowerer<'a> {
             );
         }
 
-        // Initialize loop index.
-        let loop_ptr = expressions.append(
-            Expression::LocalVariable(scratch.loop_index),
-            Span::default(),
-        );
-        let zero = expressions.append(Expression::Literal(Literal::U32(0)), Span::default());
-        body.push(
-            Statement::Store {
-                pointer: loop_ptr,
-                value: zero,
-            },
-            Span::default(),
-        );
-
-        // Build loop body.
-        let mut loop_body = Block::new();
-        let loop_index =
-            expressions.append(Expression::Load { pointer: loop_ptr }, Span::default());
-        loop_body.push(
-            Statement::Emit(Self::single_expression_range(expressions, loop_index)),
-            Span::default(),
-        );
-        let done = self.bin_lit_u32(
+        self.emit_counted_loop(
             expressions,
-            &mut loop_body,
-            BinaryOperator::GreaterEqual,
-            loop_index,
+            scratch,
+            body,
             g.iterations,
-        );
-        loop_body.push(
-            Statement::If {
-                condition: done,
-                accept: Block::from_vec(vec![Statement::Break]),
-                reject: Block::new(),
+            |expressions, loop_body, _| {
+                // Snapshot caches that reference handles in the outer block; the loop
+                // body emits a fresh scope. Q8 activation packs use shared scratch
+                // locals, so discard that cache around loops instead of restoring it.
+                let saved = self.snapshot_tile_loop_caches();
+
+                // Lower each body[i] within the same loop body, accumulate into acc_locals[i].
+                for (i, body_expr) in g.bodies.iter().enumerate() {
+                    let value = self.lower_tile_expr_lane(
+                        expressions,
+                        scratch,
+                        loop_body,
+                        body_expr,
+                        spill_depth + 1,
+                    )?;
+                    let acc_ptr = expressions
+                        .append(Expression::LocalVariable(acc_locals[i]), Span::default());
+                    let acc_load =
+                        expressions.append(Expression::Load { pointer: acc_ptr }, Span::default());
+                    loop_body.push(
+                        Statement::Emit(Self::single_expression_range(expressions, acc_load)),
+                        Span::default(),
+                    );
+                    let reduced = self.emit_tile_expr(
+                        expressions,
+                        loop_body,
+                        Self::tile_reduce_expression(g.op, acc_load, value),
+                    );
+                    loop_body.push(
+                        Statement::Store {
+                            pointer: acc_ptr,
+                            value: reduced,
+                        },
+                        Span::default(),
+                    );
+                }
+
+                self.restore_tile_loop_caches(saved);
+                Ok(())
             },
-            Span::default(),
-        );
-
-        // Snapshot caches that reference handles in the outer block; the loop
-        // body emits a fresh scope. Q8 activation packs use shared scratch
-        // locals, so discard that cache around loops instead of restoring it.
-        let saved_dequant: Vec<_> = self.block_dequant_cache.borrow_mut().drain().collect();
-        let saved_pin: Vec<_> = self.pin_cache.borrow_mut().drain().collect();
-        self.q8_activation_pack_cache.borrow_mut().clear();
-
-        // Lower each body[i] within the same loop body, accumulate into acc_locals[i].
-        for (i, body_expr) in g.bodies.iter().enumerate() {
-            let value = self.lower_tile_expr_lane(
-                expressions,
-                scratch,
-                &mut loop_body,
-                body_expr,
-                spill_depth + 1,
-            )?;
-            let acc_ptr =
-                expressions.append(Expression::LocalVariable(acc_locals[i]), Span::default());
-            let acc_load =
-                expressions.append(Expression::Load { pointer: acc_ptr }, Span::default());
-            loop_body.push(
-                Statement::Emit(Self::single_expression_range(expressions, acc_load)),
-                Span::default(),
-            );
-            let reduced = self.emit_tile_expr(
-                expressions,
-                &mut loop_body,
-                Self::tile_reduce_expression(g.op, acc_load, value),
-            );
-            loop_body.push(
-                Statement::Store {
-                    pointer: acc_ptr,
-                    value: reduced,
-                },
-                Span::default(),
-            );
-        }
-
-        // Restore caches now that we're leaving the loop body scope.
-        {
-            let mut cache = self.block_dequant_cache.borrow_mut();
-            cache.clear();
-            for (k, v) in saved_dequant {
-                cache.insert(k, v);
-            }
-        }
-        {
-            let mut cache = self.pin_cache.borrow_mut();
-            cache.clear();
-            for (k, v) in saved_pin {
-                cache.insert(k, v);
-            }
-        }
-        self.q8_activation_pack_cache.borrow_mut().clear();
-
-        loop_body.push(
-            self.increment_u32_local(expressions, scratch.loop_index, 1),
-            Span::default(),
-        );
-        body.push(
-            Statement::Loop {
-                body: loop_body,
-                continuing: Block::new(),
-                break_if: None,
-            },
-            Span::default(),
-        );
+        )?;
 
         // Materialize per-accumulator final loads in the outer block; cache them.
         let mut handles = Vec::with_capacity(n);

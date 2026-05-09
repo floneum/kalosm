@@ -27,6 +27,7 @@ pub use kernels::{
 };
 pub use lower::{LowerError, NagaKernel};
 pub use quantized::{GgmlQuantFormat, QuantizedMatrix};
+pub use tile::PairedActivation;
 
 #[cfg(test)]
 mod tests;

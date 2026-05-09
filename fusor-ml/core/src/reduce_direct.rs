@@ -2,10 +2,7 @@ use fusor_tile_ir as tile_ir;
 
 use crate::{
     mir::{
-        direct_kernel::{DirectKernel, DirectKernelBinding},
-        inputs::MirValue,
-        kernel_backend,
-        operation::Operation,
+        direct_kernel::DirectKernel, inputs::MirValue, kernel_backend, operation::Operation,
         workgroup_shape::WorkgroupShape,
     },
     nary_direct::apply_unary_function_chain,
@@ -66,16 +63,8 @@ pub(crate) fn build_reduce_direct_kernel(
             )
         },
         vec![
-            DirectKernelBinding::Storage {
-                binding: 0,
-                buffer: input.buffer().clone(),
-                read_only: true,
-            },
-            DirectKernelBinding::Storage {
-                binding: 1,
-                buffer: output.buffer().clone(),
-                read_only: false,
-            },
+            kernel_backend::storage_binding(0, &input, true),
+            kernel_backend::storage_binding(1, &output, false),
         ],
         dispatch_size,
     )

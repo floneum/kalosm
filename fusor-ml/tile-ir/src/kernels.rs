@@ -566,8 +566,8 @@ pub fn flash_attention<E: Numeric>(meta: FlashAttentionMeta) -> Option<KernelIr>
 
             let store_valid = kv_lane.eq(u32_tile(0)).and(out_valid.get());
             program.if_then(store_valid, |program| {
-                let output_value = (program.load_local(&o_local) / program.load_local(&s_local))
-                    .cast(E::ELEMENT);
+                let output_value =
+                    (program.load_local(&o_local) / program.load_local(&s_local)).cast(E::ELEMENT);
                 let output_index = index4(
                     meta.output_meta.offset,
                     output_strides,

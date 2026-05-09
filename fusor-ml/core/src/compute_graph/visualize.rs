@@ -69,14 +69,19 @@ impl GraphVisPass {
         self.identities.insert(key, id.clone());
     }
 
-    fn visit_q_mat_mul_swiglu(
+    fn visit_q_mat_mul_paired(
         &mut self,
         key: NodeIndex,
-        operation: &crate::quantized::matmul::QMatMulSwiGluOperation,
+        operation: &crate::quantized::matmul::QMatMulPairedOperation,
     ) {
         let input = self.identities.get(&operation.input).unwrap();
         let output_layout = self.layout_pass.output_layout.get(&key).unwrap();
-        let id = Identity::quoted(format!("qmatmul_swiglu ({}) #{:?}", output_layout, key));
+        let act = match operation.activation {
+            fusor_tile_ir::PairedActivation::SwiGLU => "swiglu",
+            fusor_tile_ir::PairedActivation::GeGLU => "geglu",
+            fusor_tile_ir::PairedActivation::ReGLU => "reglu",
+        };
+        let id = Identity::quoted(format!("qmatmul_{act} ({}) #{:?}", output_layout, key));
         self.statements.push(Stmt::Node {
             id: id.clone(),
             port: None,
@@ -314,8 +319,8 @@ impl ComputeGraphInner {
                 ComputeGraphNodeVariant::Nary(op) => graph_vis_pass.visit_nary(node, op),
                 ComputeGraphNodeVariant::MatMul(op) => graph_vis_pass.visit_mat_mul(node, op),
                 ComputeGraphNodeVariant::QMatMul(op) => graph_vis_pass.visit_q_mat_mul(node, op),
-                ComputeGraphNodeVariant::QMatMulSwiGlu(op) => {
-                    graph_vis_pass.visit_q_mat_mul_swiglu(node, op)
+                ComputeGraphNodeVariant::QMatMulPaired(op) => {
+                    graph_vis_pass.visit_q_mat_mul_paired(node, op)
                 }
                 ComputeGraphNodeVariant::QEmbedding(op) => {
                     graph_vis_pass.visit_q_embedding(node, op)

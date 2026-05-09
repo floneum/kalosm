@@ -282,23 +282,28 @@ pub(crate) struct QMatMulOperation {
     pub(crate) out_shape: Box<[usize]>,
 }
 
+/// Paired-activation quantized matmul: produces `[gate; up]` columns and applies
+/// `activation.apply(gate, up)` to emit one output column per pair. Replaces
+/// the SwiGLU-specific operation with a pluggable activation parameter.
 #[derive(Debug, Clone)]
-pub(crate) struct QMatMulSwiGluOperation {
+pub(crate) struct QMatMulPairedOperation {
     pub(crate) input_datatype: DataTypeEnum,
     pub(crate) input: NodeIndex,
     pub(crate) matrix: QMatrix,
     pub(crate) in_shape: Box<[usize]>,
     pub(crate) out_shape: Box<[usize]>,
     pub(crate) pair_len: usize,
+    pub(crate) activation: tile_ir::PairedActivation,
 }
 
-impl QMatMulSwiGluOperation {
+impl QMatMulPairedOperation {
     pub(crate) fn new(
         input_datatype: DataTypeEnum,
         input_shape: &[usize],
         input: NodeIndex,
         matrix: QMatrix,
         pair_len: usize,
+        activation: tile_ir::PairedActivation,
     ) -> Self {
         let last_dim = input_shape.len() - 1;
         let mut out_shape = input_shape.to_vec();
@@ -313,6 +318,7 @@ impl QMatMulSwiGluOperation {
             in_shape: input_shape.into(),
             out_shape,
             pair_len,
+            activation,
         }
     }
 
@@ -613,7 +619,15 @@ impl<const R: usize> Tensor<R, f32> {
     }
 
     pub fn q_mat_mul_swiglu(&self, other: &QMatrix, pair_len: usize) -> Self {
-        self.add_q_mat_mul_swiglu(other, pair_len)
+        self.add_q_mat_mul_paired(other, pair_len, tile_ir::PairedActivation::SwiGLU)
+    }
+
+    pub fn q_mat_mul_geglu(&self, other: &QMatrix, pair_len: usize) -> Self {
+        self.add_q_mat_mul_paired(other, pair_len, tile_ir::PairedActivation::GeGLU)
+    }
+
+    pub fn q_mat_mul_reglu(&self, other: &QMatrix, pair_len: usize) -> Self {
+        self.add_q_mat_mul_paired(other, pair_len, tile_ir::PairedActivation::ReGLU)
     }
 }
 
@@ -861,7 +875,18 @@ impl Operation for QMatMulOperation {
     }
 }
 
-impl Operation for QMatMulSwiGluOperation {
+/// Distinct hash perturbation per paired activation so the pipeline cache key
+/// (which already mixes `pair_len`) doesn't alias kernels for different
+/// activations on the same shape.
+fn activation_cache_salt(activation: tile_ir::PairedActivation) -> u32 {
+    match activation {
+        tile_ir::PairedActivation::SwiGLU => 0,
+        tile_ir::PairedActivation::GeGLU => 0x4000_0000,
+        tile_ir::PairedActivation::ReGLU => 0x8000_0000,
+    }
+}
+
+impl Operation for QMatMulPairedOperation {
     fn workgroup_shape_constraints(&self, _device: &Device) -> WorkgroupShapeConstraints {
         let mut constraints = WorkgroupShapeConstraints::new();
         constraints.add_constraint(0, Constraint::Equals(1));
@@ -925,8 +950,10 @@ impl Operation for QMatMulSwiGluOperation {
 
         let limits = graph.device().limits();
         let max_workgroups = limits.max_compute_workgroups_per_dimension;
-        let swiglu_tile = std::env::var("FUSOR_Q4K_SWIGLU_TILE").unwrap_or_default();
-        let swiglu_tile_name = match swiglu_tile.as_str() {
+        let tile_choice = std::env::var("FUSOR_Q4K_PAIRED_TILE")
+            .or_else(|_| std::env::var("FUSOR_Q4K_SWIGLU_TILE"))
+            .unwrap_or_default();
+        let tile_name = match tile_choice.as_str() {
             "4x1" => "4x1",
             "4x4" => "4x4",
             "8x1" => "8x1",
@@ -935,7 +962,7 @@ impl Operation for QMatMulSwiGluOperation {
             "2x4" => "2x4",
             _ => "8x2",
         };
-        let cols_per_workgroup = match swiglu_tile_name {
+        let cols_per_workgroup = match tile_name {
             "4x1" | "2x2" => 4,
             "2x4" | "4x2" | "8x1" => 8,
             "4x4" | "8x2" => 16,
@@ -949,11 +976,12 @@ impl Operation for QMatMulSwiGluOperation {
             return None;
         }
 
+        let activation = self.activation;
         let pipeline_key = QMatMulDirectPipelineKey::new(
             matrix.datatype(),
             m,
             k,
-            pair_len,
+            pair_len.wrapping_add(activation_cache_salt(activation)),
             dispatch_size,
             input.layout(),
             output.layout(),
@@ -965,7 +993,7 @@ impl Operation for QMatMulSwiGluOperation {
             .cloned()
         {
             return Some(kernel_backend::storage3_kernel_with_prepared_pipeline(
-                "q_mat_swiglu",
+                "q_mat_paired",
                 "",
                 pipeline,
                 input.buffer().clone(),
@@ -976,7 +1004,7 @@ impl Operation for QMatMulSwiGluOperation {
         }
         let kernel_name = self.name();
         let cache_key = format!(
-            "{kernel_name}:direct:{format:?}:tile={swiglu_tile_name}:m={m}:k={k}:pair={pair_len}:dispatch={dispatch_size:?}:{:?}:{:?}",
+            "{kernel_name}:direct:{format:?}:tile={tile_name}:m={m}:k={k}:pair={pair_len}:act={activation:?}:dispatch={dispatch_size:?}:{:?}:{:?}",
             input.layout(),
             output.layout()
         );
@@ -989,28 +1017,70 @@ impl Operation for QMatMulSwiGluOperation {
                     let a = tile_storage_read_with_direct_layout(phase, a_view);
                     let b = phase.quantized_matrix(format, k, pair_len * 2);
                     let y = tile_storage_write_with_direct_layout(phase, y_view);
-                    match swiglu_tile_name {
-                        "4x1" => {
-                            phase.qgemv_q4k_swiglu_4x1(&a, &b, &y, pair_len, m, workgroups_x)
-                        }
-                        "4x4" => {
-                            phase.qgemv_q4k_swiglu_4x4(&a, &b, &y, pair_len, m, workgroups_x)
-                        }
-                        "8x1" => {
-                            phase.qgemv_q4k_swiglu_8x1(&a, &b, &y, pair_len, m, workgroups_x)
-                        }
-                        "8x2" => {
-                            phase.qgemv_q4k_swiglu_8x2(&a, &b, &y, pair_len, m, workgroups_x)
-                        }
-                        "2x2" => {
-                            phase.qgemv_q4k_swiglu_2x2(&a, &b, &y, pair_len, m, workgroups_x)
-                        }
-                        "2x4" => {
-                            phase.qgemv_q4k_swiglu_2x4(&a, &b, &y, pair_len, m, workgroups_x)
-                        }
-                        "4x2" => {
-                            phase.qgemv_q4k_swiglu_4x2(&a, &b, &y, pair_len, m, workgroups_x)
-                        }
+                    match tile_name {
+                        "4x1" => phase.qgemv_q4k_paired_4x1(
+                            &a,
+                            &b,
+                            &y,
+                            pair_len,
+                            m,
+                            workgroups_x,
+                            activation,
+                        ),
+                        "4x4" => phase.qgemv_q4k_paired_4x4(
+                            &a,
+                            &b,
+                            &y,
+                            pair_len,
+                            m,
+                            workgroups_x,
+                            activation,
+                        ),
+                        "8x1" => phase.qgemv_q4k_paired_8x1(
+                            &a,
+                            &b,
+                            &y,
+                            pair_len,
+                            m,
+                            workgroups_x,
+                            activation,
+                        ),
+                        "8x2" => phase.qgemv_q4k_paired_8x2(
+                            &a,
+                            &b,
+                            &y,
+                            pair_len,
+                            m,
+                            workgroups_x,
+                            activation,
+                        ),
+                        "2x2" => phase.qgemv_q4k_paired_2x2(
+                            &a,
+                            &b,
+                            &y,
+                            pair_len,
+                            m,
+                            workgroups_x,
+                            activation,
+                        ),
+                        "2x4" => phase.qgemv_q4k_paired_2x4(
+                            &a,
+                            &b,
+                            &y,
+                            pair_len,
+                            m,
+                            workgroups_x,
+                            activation,
+                        ),
+                        "4x2" => phase.qgemv_q4k_paired_4x2(
+                            &a,
+                            &b,
+                            &y,
+                            pair_len,
+                            m,
+                            workgroups_x,
+                            activation,
+                        ),
                         _ => unreachable!(),
                     }
                 }))
@@ -1043,8 +1113,14 @@ impl Operation for QMatMulSwiGluOperation {
     }
 
     fn name(&self) -> String {
+        let act = match self.activation {
+            tile_ir::PairedActivation::SwiGLU => "swiglu",
+            tile_ir::PairedActivation::GeGLU => "geglu",
+            tile_ir::PairedActivation::ReGLU => "reglu",
+        };
         format!(
-            "q_mat_swiglu_{}_{}_{}_{}",
+            "q_mat_{}_{}_{}_{}_{}",
+            act,
             self.input_datatype,
             self.in_shape
                 .iter()

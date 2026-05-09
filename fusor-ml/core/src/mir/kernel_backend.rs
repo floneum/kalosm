@@ -5,6 +5,7 @@ use fusor_tile_ir as tile_ir;
 use crate::{
     Device,
     mir::direct_kernel::{DirectKernel, DirectKernelBinding},
+    tensor::TensorData,
 };
 
 pub(crate) mod flash_attention;
@@ -82,6 +83,35 @@ pub(crate) fn dynamic_kernel_from_module(
     dispatch_size: [u32; 3],
 ) -> DirectKernel {
     DirectKernel::new_with_arc_module(name, cache_key, module.module, bindings, dispatch_size)
+}
+
+pub(crate) fn storage_binding(
+    binding: u32,
+    tensor: &TensorData,
+    read_only: bool,
+) -> DirectKernelBinding {
+    DirectKernelBinding::Storage {
+        binding,
+        buffer: tensor.buffer().clone(),
+        read_only,
+    }
+}
+
+pub(crate) fn run_direct_kernel(
+    device: &Device,
+    label: &str,
+    kernel: &DirectKernel,
+    encoder: Option<&mut wgpu::CommandEncoder>,
+) {
+    if let Some(encoder) = encoder {
+        kernel.run(device, encoder);
+    } else {
+        let mut encoder = device
+            .wgpu_device()
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some(label) });
+        kernel.run(device, &mut encoder);
+        device.wgpu_queue().submit(Some(encoder.finish()));
+    }
 }
 
 pub(crate) fn storage3_kernel_with_prepared_pipeline(

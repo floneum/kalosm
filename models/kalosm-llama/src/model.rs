@@ -97,6 +97,12 @@ fn gpu_fused_logits_sampling_enabled() -> bool {
         .unwrap_or(true)
 }
 
+fn decode_trace_enabled() -> bool {
+    std::env::var_os("KALOSM_TRACE_DECODE_TIMING").is_some()
+        || std::env::var_os("FUSOR_TRACE_DECODE").is_some()
+        || std::env::var_os("FUSOR_TRACE_RESOLVE").is_some()
+}
+
 fn gpu_sample_top_k() -> usize {
     std::env::var("KALOSM_LLAMA_GPU_SAMPLE_TOP_K")
         .ok()
@@ -147,6 +153,37 @@ impl LlamaGpuSamplerState {
         let len = tokens.len().min(self.config.repetition_penalty_range);
         tokens[tokens.len().saturating_sub(len)..].to_vec()
     }
+}
+
+struct ForwardTrace {
+    enabled: bool,
+    decode_eligible: bool,
+    path: &'static str,
+    token_start: Option<std::time::Instant>,
+    kernels: usize,
+}
+
+impl ForwardTrace {
+    fn step_start(&self) -> Option<std::time::Instant> {
+        self.enabled.then(std::time::Instant::now)
+    }
+
+    fn record(&self) {
+        if let Some(start) = self.token_start {
+            record_decode_trace(
+                self.path,
+                self.decode_eligible,
+                self.kernels,
+                start.elapsed(),
+            );
+        }
+    }
+}
+
+struct PreparedForwardLogits {
+    logits: fusor::Tensor<1, f32>,
+    len: usize,
+    trace: ForwardTrace,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -286,18 +323,18 @@ where
     AddOp: SimdBinaryOp<F>,
     SumOp: SimdReduceOp<F>,
 {
-    pub(crate) fn forward(
+    fn prepare_forward_logits(
         model: &Model<F>,
         device: &Device,
         tokens: &[u32],
         images: &[(image::DynamicImage, MediaHints)],
         mut cache: Option<&mut LlamaCache>,
-        #[allow(unused)] tokenizer: &Tokenizer,
-    ) -> Pin<
-        Box<dyn kalosm_model_types::FutureWasmNotSend<Output = Result<Vec<f32>, LlamaModelError>>>,
-    > {
+        #[allow(unused_variables)] tokenizer: &Tokenizer,
+        fast_path: &'static str,
+        fallback_path: &'static str,
+    ) -> Result<PreparedForwardLogits, LlamaModelError> {
         if tokens.is_empty() {
-            return Box::pin(async { Err(LlamaModelError::EmptyInput) });
+            return Err(LlamaModelError::EmptyInput);
         }
 
         #[cfg(debug_assertions)]
@@ -308,19 +345,17 @@ where
             );
         }
 
-        let trace = std::env::var_os("KALOSM_TRACE_DECODE_TIMING").is_some()
-            || std::env::var_os("FUSOR_TRACE_DECODE").is_some()
-            || std::env::var_os("FUSOR_TRACE_RESOLVE").is_some();
+        let trace_enabled = decode_trace_enabled();
         let decode_eligible = tokens.len() == 1
             && images.is_empty()
             && cache.as_ref().is_some_and(|cache| !cache.tokens.is_empty());
         let path = if decode_eligible {
-            "fast_decode_graph"
+            fast_path
         } else {
-            "graph_fallback"
+            fallback_path
         };
-        let token_start = trace.then(std::time::Instant::now);
-        let build_start = trace.then(std::time::Instant::now);
+        let token_start = trace_enabled.then(std::time::Instant::now);
+        let build_start = trace_enabled.then(std::time::Instant::now);
         let logits = model.forward(tokens, images, device, cache.as_deref_mut());
         if let Some(start) = build_start {
             eprintln!(
@@ -328,17 +363,13 @@ where
                 start.elapsed()
             );
         }
-        let logits = match logits {
-            Ok(logits) => logits,
-            Err(err) => return Box::pin(async move { Err(err.into()) }),
-        };
+        let logits = logits.map_err(LlamaModelError::from)?;
         let logits = logits.squeeze(0);
-        // Cast logits back to f32 for sampling
         let logits: fusor::Tensor<1, f32> = logits.cast();
         let len = logits.shape()[0];
         let mut kernels = 0;
         if let Some(logits_key) = logits.gpu_key() {
-            let resolve_start = trace.then(std::time::Instant::now);
+            let resolve_start = trace_enabled.then(std::time::Instant::now);
             kernels = device.resolve_batch(&[logits_key]);
             if let Some(start) = resolve_start {
                 eprintln!(
@@ -350,18 +381,56 @@ where
                 cache.detach(device);
             }
         }
+
+        Ok(PreparedForwardLogits {
+            logits,
+            len,
+            trace: ForwardTrace {
+                enabled: trace_enabled,
+                decode_eligible,
+                path,
+                token_start,
+                kernels,
+            },
+        })
+    }
+
+    pub(crate) fn forward(
+        model: &Model<F>,
+        device: &Device,
+        tokens: &[u32],
+        images: &[(image::DynamicImage, MediaHints)],
+        cache: Option<&mut LlamaCache>,
+        #[allow(unused)] tokenizer: &Tokenizer,
+    ) -> Pin<
+        Box<dyn kalosm_model_types::FutureWasmNotSend<Output = Result<Vec<f32>, LlamaModelError>>>,
+    > {
+        let prepared = match Self::prepare_forward_logits(
+            model,
+            device,
+            tokens,
+            images,
+            cache,
+            tokenizer,
+            "fast_decode_graph",
+            "graph_fallback",
+        ) {
+            Ok(prepared) => prepared,
+            Err(err) => return Box::pin(async move { Err(err) }),
+        };
+        let PreparedForwardLogits { logits, len, trace } = prepared;
         Box::pin(async move {
-            let download_start = trace.then(std::time::Instant::now);
+            let download_start = trace.step_start();
             let logits = logits.as_slice().await?;
             if let Some(start) = download_start {
                 eprintln!(
-                    "forward_download path={path} decode_eligible={decode_eligible} elapsed={:?}",
-                    start.elapsed()
+                    "forward_download path={} decode_eligible={} elapsed={:?}",
+                    trace.path,
+                    trace.decode_eligible,
+                    start.elapsed(),
                 );
             }
-            if let Some(start) = token_start {
-                record_decode_trace(path, decode_eligible, kernels, start.elapsed());
-            }
+            trace.record();
             let mut logits_vec = Vec::with_capacity(len);
             for i in 0..len {
                 let logit = logits[[i]];
@@ -377,7 +446,7 @@ where
         device: &Device,
         tokens: &[u32],
         images: &[(image::DynamicImage, MediaHints)],
-        mut cache: Option<&mut LlamaCache>,
+        cache: Option<&mut LlamaCache>,
         #[allow(unused)] tokenizer: &Tokenizer,
         top_k: usize,
     ) -> Pin<
@@ -385,61 +454,22 @@ where
             dyn kalosm_model_types::FutureWasmNotSend<Output = Result<Vec<Logit>, LlamaModelError>>,
         >,
     > {
-        if tokens.is_empty() {
-            return Box::pin(async { Err(LlamaModelError::EmptyInput) });
-        }
-
-        #[cfg(debug_assertions)]
-        {
-            tracing::trace!(
-                "Running model with tokens: {:?}",
-                tokenizer.decode(tokens, false)
-            );
-        }
-
-        let trace = std::env::var_os("KALOSM_TRACE_DECODE_TIMING").is_some()
-            || std::env::var_os("FUSOR_TRACE_DECODE").is_some()
-            || std::env::var_os("FUSOR_TRACE_RESOLVE").is_some();
-        let decode_eligible = tokens.len() == 1
-            && images.is_empty()
-            && cache.as_ref().is_some_and(|cache| !cache.tokens.is_empty());
-        let path = if decode_eligible {
-            "fast_decode_graph_top_k"
-        } else {
-            "graph_fallback_top_k"
+        let prepared = match Self::prepare_forward_logits(
+            model,
+            device,
+            tokens,
+            images,
+            cache,
+            tokenizer,
+            "fast_decode_graph_top_k",
+            "graph_fallback_top_k",
+        ) {
+            Ok(prepared) => prepared,
+            Err(err) => return Box::pin(async move { Err(err) }),
         };
-        let token_start = trace.then(std::time::Instant::now);
-        let build_start = trace.then(std::time::Instant::now);
-        let logits = model.forward(tokens, images, device, cache.as_deref_mut());
-        if let Some(start) = build_start {
-            eprintln!(
-                "forward_graph_build path={path} decode_eligible={decode_eligible} elapsed={:?}",
-                start.elapsed()
-            );
-        }
-        let logits = match logits {
-            Ok(logits) => logits,
-            Err(err) => return Box::pin(async move { Err(err.into()) }),
-        };
-        let logits = logits.squeeze(0);
-        let logits: fusor::Tensor<1, f32> = logits.cast();
-        let len = logits.shape()[0];
-        let mut kernels = 0;
-        if let Some(logits_key) = logits.gpu_key() {
-            let resolve_start = trace.then(std::time::Instant::now);
-            kernels = device.resolve_batch(&[logits_key]);
-            if let Some(start) = resolve_start {
-                eprintln!(
-                    "forward_resolve path={path} decode_eligible={decode_eligible} kernels={kernels} elapsed={:?}",
-                    start.elapsed()
-                );
-            }
-            if let Some(cache) = cache.as_deref_mut() {
-                cache.detach(device);
-            }
-        }
+        let PreparedForwardLogits { logits, len, trace } = prepared;
         Box::pin(async move {
-            let download_start = trace.then(std::time::Instant::now);
+            let download_start = trace.step_start();
             let top_logits = if use_full_logits_for_sampling(len) {
                 let logits = logits.as_slice().await?;
                 let mut logits_vec = Vec::with_capacity(len);
@@ -461,13 +491,13 @@ where
             };
             if let Some(start) = download_start {
                 eprintln!(
-                    "forward_top_k_download path={path} decode_eligible={decode_eligible} k={top_k} elapsed={:?}",
-                    start.elapsed()
+                    "forward_top_k_download path={} decode_eligible={} k={top_k} elapsed={:?}",
+                    trace.path,
+                    trace.decode_eligible,
+                    start.elapsed(),
                 );
             }
-            if let Some(start) = token_start {
-                record_decode_trace(path, decode_eligible, kernels, start.elapsed());
-            }
+            trace.record();
 
             Ok(top_logits)
         })
@@ -478,7 +508,7 @@ where
         device: &Device,
         tokens: &[u32],
         images: &[(image::DynamicImage, MediaHints)],
-        mut cache: Option<&mut LlamaCache>,
+        cache: Option<&mut LlamaCache>,
         #[allow(unused)] tokenizer: &Tokenizer,
         sampler: &'a mut fusor::GpuMirostat2Sampler,
         previous_tokens: Vec<u32>,
@@ -512,61 +542,35 @@ where
             );
         }
 
-        let trace = std::env::var_os("KALOSM_TRACE_DECODE_TIMING").is_some()
-            || std::env::var_os("FUSOR_TRACE_DECODE").is_some()
-            || std::env::var_os("FUSOR_TRACE_RESOLVE").is_some();
-        let decode_eligible = tokens.len() == 1
-            && images.is_empty()
-            && cache.as_ref().is_some_and(|cache| !cache.tokens.is_empty());
-        let path = if decode_eligible {
-            "fast_decode_graph_sample_token"
-        } else {
-            "graph_fallback_sample_token"
+        let prepared = match Self::prepare_forward_logits(
+            model,
+            device,
+            tokens,
+            images,
+            cache,
+            tokenizer,
+            "fast_decode_graph_sample_token",
+            "graph_fallback_sample_token",
+        ) {
+            Ok(prepared) => prepared,
+            Err(err) => return Box::pin(async move { Err(err) }),
         };
-        let token_start = trace.then(std::time::Instant::now);
-        let build_start = trace.then(std::time::Instant::now);
-        let logits = model.forward(tokens, images, device, cache.as_deref_mut());
-        if let Some(start) = build_start {
-            eprintln!(
-                "forward_graph_build path={path} decode_eligible={decode_eligible} elapsed={:?}",
-                start.elapsed()
-            );
-        }
-        let logits = match logits {
-            Ok(logits) => logits,
-            Err(err) => return Box::pin(async move { Err(err.into()) }),
-        };
-        let logits = logits.squeeze(0);
-        let logits: fusor::Tensor<1, f32> = logits.cast();
-        let mut kernels = 0;
-        if let Some(logits_key) = logits.gpu_key() {
-            let resolve_start = trace.then(std::time::Instant::now);
-            kernels = device.resolve_batch(&[logits_key]);
-            if let Some(start) = resolve_start {
-                eprintln!(
-                    "forward_resolve path={path} decode_eligible={decode_eligible} kernels={kernels} elapsed={:?}",
-                    start.elapsed()
-                );
-            }
-            if let Some(cache) = cache.as_deref_mut() {
-                cache.detach(device);
-            }
-        }
+        let PreparedForwardLogits { logits, trace, .. } = prepared;
         Box::pin(async move {
-            let download_start = trace.then(std::time::Instant::now);
+            let download_start = trace.step_start();
             let token_id = logits
                 .sample_mirostat2_token(sampler, &previous_tokens, params)
                 .await?;
             if let Some(start) = download_start {
                 eprintln!(
-                    "forward_sample_token_download path={path} decode_eligible={decode_eligible} k={} elapsed={:?}",
+                    "forward_sample_token_download path={} decode_eligible={} k={} elapsed={:?}",
+                    trace.path,
+                    trace.decode_eligible,
                     params.top_k,
-                    start.elapsed()
+                    start.elapsed(),
                 );
             }
-            if let Some(start) = token_start {
-                record_decode_trace(path, decode_eligible, kernels, start.elapsed());
-            }
+            trace.record();
 
             Ok(token_id)
         })
@@ -585,9 +589,7 @@ where
     ) -> Pin<
         Box<dyn kalosm_model_types::FutureWasmNotSend<Output = Result<u32, LlamaModelError>> + 'a>,
     > {
-        let trace = std::env::var_os("KALOSM_TRACE_DECODE_TIMING").is_some()
-            || std::env::var_os("FUSOR_TRACE_DECODE").is_some()
-            || std::env::var_os("FUSOR_TRACE_RESOLVE").is_some();
+        let trace = decode_trace_enabled();
         let decode_eligible = tokens.len() == 1
             && images.is_empty()
             && cache.as_ref().is_some_and(|cache| !cache.tokens.is_empty());

@@ -74,6 +74,122 @@ impl<'a> Lowerer<'a> {
         ]))
     }
 
+    pub(super) fn emit_counted_loop<T>(
+        &self,
+        expressions: &mut Arena<Expression>,
+        scratch: ScratchLocals,
+        body: &mut Block,
+        iterations: u32,
+        build_body: impl FnOnce(
+            &mut Arena<Expression>,
+            &mut Block,
+            Handle<Expression>,
+        ) -> Result<T, LowerError>,
+    ) -> Result<T, LowerError> {
+        let loop_ptr = expressions.append(
+            Expression::LocalVariable(scratch.loop_index),
+            Span::default(),
+        );
+        let zero = expressions.append(Expression::Literal(Literal::U32(0)), Span::default());
+        body.push(
+            Statement::Store {
+                pointer: loop_ptr,
+                value: zero,
+            },
+            Span::default(),
+        );
+
+        let mut loop_body = Block::new();
+        let loop_index =
+            expressions.append(Expression::Load { pointer: loop_ptr }, Span::default());
+        loop_body.push(
+            Statement::Emit(Self::single_expression_range(expressions, loop_index)),
+            Span::default(),
+        );
+        let done = self.bin_lit_u32(
+            expressions,
+            &mut loop_body,
+            BinaryOperator::GreaterEqual,
+            loop_index,
+            iterations,
+        );
+        loop_body.push(
+            Statement::If {
+                condition: done,
+                accept: Block::from_vec(vec![Statement::Break]),
+                reject: Block::new(),
+            },
+            Span::default(),
+        );
+
+        let result = build_body(expressions, &mut loop_body, loop_index)?;
+
+        loop_body.push(
+            self.increment_u32_local(expressions, scratch.loop_index, 1),
+            Span::default(),
+        );
+        body.push(
+            Statement::Loop {
+                body: loop_body,
+                continuing: Block::new(),
+                break_if: None,
+            },
+            Span::default(),
+        );
+        Ok(result)
+    }
+
+    pub(super) fn snapshot_tile_loop_caches(&self) -> TileLoopCacheSnapshot {
+        let snapshot = TileLoopCacheSnapshot {
+            block_dequant: self.block_dequant_cache.borrow_mut().drain().collect(),
+            pin: self.pin_cache.borrow_mut().drain().collect(),
+        };
+        self.q8_activation_pack_cache.borrow_mut().clear();
+        snapshot
+    }
+
+    pub(super) fn restore_tile_loop_caches(&self, snapshot: TileLoopCacheSnapshot) {
+        {
+            let mut cache = self.block_dequant_cache.borrow_mut();
+            cache.clear();
+            for (key, value) in snapshot.block_dequant {
+                cache.insert(key, value);
+            }
+        }
+        {
+            let mut cache = self.pin_cache.borrow_mut();
+            cache.clear();
+            for (key, value) in snapshot.pin {
+                cache.insert(key, value);
+            }
+        }
+        self.q8_activation_pack_cache.borrow_mut().clear();
+    }
+
+    pub(super) fn snapshot_coop_loop_caches(&self) -> CoopLoopCacheSnapshot {
+        CoopLoopCacheSnapshot {
+            fragments: self.coop_fragment_cache.borrow_mut().drain().collect(),
+            acc_values: self.coop_acc_value_cache.borrow_mut().drain().collect(),
+        }
+    }
+
+    pub(super) fn restore_coop_loop_caches(&self, snapshot: CoopLoopCacheSnapshot) {
+        {
+            let mut cache = self.coop_fragment_cache.borrow_mut();
+            cache.clear();
+            for (key, value) in snapshot.fragments {
+                cache.insert(key, value);
+            }
+        }
+        {
+            let mut cache = self.coop_acc_value_cache.borrow_mut();
+            cache.clear();
+            for (key, value) in snapshot.acc_values {
+                cache.insert(key, value);
+            }
+        }
+    }
+
     pub(super) fn load_u32_local(
         &self,
         expressions: &mut Arena<Expression>,

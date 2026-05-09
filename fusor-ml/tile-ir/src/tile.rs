@@ -8,10 +8,183 @@ use crate::ir::{
     StorageIndexMap, StorageView, TileBinaryOp, TileCompareOp, TileDecl, TileExpr, TileIndexExpr,
     TileLevel, TileLinearLoadExpr, TileLinearStoreStmt, TileLiteral, TileLoadExpr, TileMaskExpr,
     TileOrigin, TileProgramOp, TileQuantizedLoadExpr, TileReduceOp, TileRef, TileScalarExpr,
-    TileStmt, TileStoreStmt, TileSwiGluStoreStmt, TileUnaryOp, TileVec4LoadExpr, TileVec4StoreStmt,
-    WorkgroupAxis, WorkgroupOffset, F32, U32,
+    TileStmt, TileStoreStmt, TileUnaryOp, TileVec4LoadExpr, TileVec4StoreStmt, WorkgroupAxis,
+    WorkgroupOffset, F32, U32,
 };
 use crate::quantized::{GgmlQuantFormat, QuantizedMatrix};
+
+/// Activation pattern fused on top of a paired matmul reduction (gate, up).
+///
+/// The matmul produces concatenated `[gate; up]` columns; the kernel reduces
+/// each pair separately and applies the chosen activation as `act(gate) * up`
+/// before storing a single output column per pair.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum PairedActivation {
+    /// `silu(gate) * up` — used by Llama, Mistral, Qwen, Gemma SwiGLU FFNs.
+    SwiGLU,
+    /// `gelu(gate) * up` — used by GeGLU-style FFNs (some PaLM variants).
+    GeGLU,
+    /// `relu(gate) * up` — used by ReGLU-style FFNs.
+    ReGLU,
+}
+
+impl PairedActivation {
+    /// Build the per-output tile expression for this activation.
+    pub fn apply<const BLOCK: usize>(self, gate: Tile<BLOCK>, up: Tile<BLOCK>) -> Tile<BLOCK> {
+        match self {
+            Self::SwiGLU => gate.silu() * up,
+            Self::GeGLU => gate.gelu() * up,
+            Self::ReGLU => gate.relu() * up,
+        }
+    }
+}
+
+macro_rules! q4k_paired_entrypoints {
+    ($(($name:ident, $subgroups:literal, $pairs:literal, $dots:literal, $block:literal)),+ $(,)?) => {
+        $(
+            pub fn $name(
+                &mut self,
+                a: &Storage<F32, 2>,
+                b: &QuantizedMatrix,
+                y: &Storage<F32, 2>,
+                pair_cols: u32,
+                m_rows: u32,
+                workgroups_x: u32,
+                activation: PairedActivation,
+            ) {
+                self.qgemv_q4k_paired_ggml::<$subgroups, $pairs, $dots, $block>(
+                    a,
+                    b,
+                    y,
+                    pair_cols,
+                    m_rows,
+                    workgroups_x,
+                    activation,
+                );
+            }
+        )+
+    };
+}
+
+macro_rules! qgemv_ggml_env {
+    ($program:expr, $method:ident, $var:literal, $a:expr, $b:expr, $y:expr, $workgroups_x:expr, [
+        $(($name:literal, $subgroups:literal, $cols:literal, $block:literal)),+ $(,)?
+    ]) => {
+        match std::env::var($var).as_deref() {
+            $(
+                Ok($name) => {
+                    return $program.$method::<$subgroups, $cols, $block>(
+                        $a,
+                        $b,
+                        $y,
+                        $workgroups_x,
+                    );
+                }
+            )+
+            _ => {}
+        }
+    };
+}
+
+macro_rules! qgemv_ggml_env_with_old {
+    (
+        $program:expr,
+        $method:ident,
+        $var:literal,
+        $a:expr,
+        $b:expr,
+        $y:expr,
+        $workgroups_x:expr,
+        old = ($old_subgroups:literal, $old_cols:literal, $old_values:literal, $old_block:literal),
+        [
+            $(($name:literal, $subgroups:literal, $cols:literal, $block:literal)),+ $(,)?
+        ]
+    ) => {
+        match std::env::var($var).as_deref() {
+            Ok("old") => {
+                return $program.qgemv_perf::<$old_subgroups, $old_cols, $old_values, $old_block>(
+                    $a,
+                    $b,
+                    $y,
+                    $workgroups_x,
+                );
+            }
+            $(
+                Ok($name) => {
+                    return $program.$method::<$subgroups, $cols, $block>(
+                        $a,
+                        $b,
+                        $y,
+                        $workgroups_x,
+                    );
+                }
+            )+
+            _ => {}
+        }
+    };
+}
+
+#[derive(Clone, Copy)]
+struct QgemvGrid {
+    cols_per_workgroup: u32,
+    workgroups_x: u32,
+    dispatch_y: u32,
+    n_cols: u32,
+    full_cols: bool,
+}
+
+fn qgemv_grid<const SUBGROUPS: u32, const COLS_PER_SUBGROUP: usize>(
+    n_cols: u32,
+    requested_workgroups_x: u32,
+) -> QgemvGrid {
+    let cols_per_workgroup = SUBGROUPS * COLS_PER_SUBGROUP as u32;
+    let total_workgroups = n_cols.div_ceil(cols_per_workgroup);
+    let workgroups_x = requested_workgroups_x.min(total_workgroups.max(1));
+    QgemvGrid {
+        cols_per_workgroup,
+        workgroups_x,
+        dispatch_y: total_workgroups.div_ceil(workgroups_x),
+        n_cols,
+        full_cols: n_cols.is_multiple_of(cols_per_workgroup),
+    }
+}
+
+impl QgemvGrid {
+    fn mask<const BLOCK: usize>(
+        self,
+        full_iterations: bool,
+        in_bounds: Mask<BLOCK>,
+        col: &ScalarIndex,
+    ) -> Mask<BLOCK> {
+        match (full_iterations, self.full_cols) {
+            (true, true) => Mask::all(),
+            (true, false) => col.lt(self.n_cols),
+            (false, true) => in_bounds,
+            (false, false) => in_bounds.and(col.lt(self.n_cols)),
+        }
+    }
+}
+
+fn store_qgemv_sums<const BLOCK: usize, const COLS_PER_SUBGROUP: usize>(
+    program: &mut TileBlock<'_, BLOCK>,
+    y: &Storage<F32, 2>,
+    col0: ScalarIndex,
+    lane: ScalarIndex,
+    sums: [Tile<BLOCK>; COLS_PER_SUBGROUP],
+    full_cols: bool,
+    n_cols: u32,
+) {
+    for (offset, sum) in sums.into_iter().enumerate() {
+        let col = col0.clone() + offset as u32;
+        let reduced = program.subgroup_reduce_sum(sum);
+        let mask = if full_cols {
+            lane.eq(0)
+        } else {
+            lane.eq(0).and(col.lt(n_cols))
+        };
+        program.store(y.at(0, col), reduced, mask);
+    }
+}
 
 /// Build a Triton-like source tile IR.
 pub fn build(f: impl FnOnce(&mut Program)) -> KernelIr {
@@ -279,39 +452,27 @@ impl Program {
             }
             GgmlQuantFormat::Q4K => {
                 if b.rows <= 4096 && b.cols >= 4096 && b.cols < 8192 {
-                    match std::env::var("FUSOR_Q4K_MID_TILE").as_deref() {
-                        Ok("ggml_2x2") => {
-                            return self.qgemv_q4k_ggml::<2, 2, 64>(a, b, y, workgroups_x);
-                        }
-                        Ok("ggml_2x3") => {
-                            return self.qgemv_q4k_ggml::<2, 3, 64>(a, b, y, workgroups_x);
-                        }
-                        Ok("ggml_2x4") => {
-                            return self.qgemv_q4k_ggml::<2, 4, 64>(a, b, y, workgroups_x);
-                        }
-                        Ok("ggml_2x8") => {
-                            return self.qgemv_q4k_ggml::<2, 8, 64>(a, b, y, workgroups_x);
-                        }
-                        Ok("ggml_4x2") => {
-                            return self.qgemv_q4k_ggml::<4, 2, 128>(a, b, y, workgroups_x);
-                        }
-                        Ok("ggml_4x3") => {
-                            return self.qgemv_q4k_ggml::<4, 3, 128>(a, b, y, workgroups_x);
-                        }
-                        Ok("ggml_4x4") => {
-                            return self.qgemv_q4k_ggml::<4, 4, 128>(a, b, y, workgroups_x);
-                        }
-                        Ok("ggml_4x8") => {
-                            return self.qgemv_q4k_ggml::<4, 8, 128>(a, b, y, workgroups_x);
-                        }
-                        Ok("ggml_8x2") => {
-                            return self.qgemv_q4k_ggml::<8, 2, 256>(a, b, y, workgroups_x);
-                        }
-                        Ok("ggml_8x4") => {
-                            return self.qgemv_q4k_ggml::<8, 4, 256>(a, b, y, workgroups_x);
-                        }
-                        _ => {}
-                    }
+                    qgemv_ggml_env!(
+                        self,
+                        qgemv_q4k_ggml,
+                        "FUSOR_Q4K_MID_TILE",
+                        a,
+                        b,
+                        y,
+                        workgroups_x,
+                        [
+                            ("ggml_2x2", 2, 2, 64),
+                            ("ggml_2x3", 2, 3, 64),
+                            ("ggml_2x4", 2, 4, 64),
+                            ("ggml_2x8", 2, 8, 64),
+                            ("ggml_4x2", 4, 2, 128),
+                            ("ggml_4x3", 4, 3, 128),
+                            ("ggml_4x4", 4, 4, 128),
+                            ("ggml_4x8", 4, 8, 128),
+                            ("ggml_8x2", 8, 2, 256),
+                            ("ggml_8x4", 8, 4, 256),
+                        ]
+                    );
                     if b.cols == 5120 {
                         return self.qgemv_q4k_ggml::<4, 3, 128>(a, b, y, workgroups_x);
                     }
@@ -324,84 +485,56 @@ impl Program {
                     return self.qgemv_perf::<8, 4, 16, 256>(a, b, y, workgroups_x);
                 }
                 if b.rows <= 4096 && b.cols >= 8192 {
-                    match std::env::var("FUSOR_Q4K_LARGE_TILE").as_deref() {
-                        Ok("old") => {
-                            return self.qgemv_perf::<4, 8, 32, 128>(a, b, y, workgroups_x);
-                        }
-                        Ok("ggml_1x4") => {
-                            return self.qgemv_q4k_ggml::<1, 4, 32>(a, b, y, workgroups_x);
-                        }
-                        Ok("ggml_1x8") => {
-                            return self.qgemv_q4k_ggml::<1, 8, 32>(a, b, y, workgroups_x);
-                        }
-                        Ok("ggml_2x2") => {
-                            return self.qgemv_q4k_ggml::<2, 2, 64>(a, b, y, workgroups_x);
-                        }
-                        Ok("ggml_2x4") => {
-                            return self.qgemv_q4k_ggml::<2, 4, 64>(a, b, y, workgroups_x);
-                        }
-                        Ok("ggml_2x8") => {
-                            return self.qgemv_q4k_ggml::<2, 8, 64>(a, b, y, workgroups_x);
-                        }
-                        Ok("ggml_4x1") => {
-                            return self.qgemv_q4k_ggml::<4, 1, 128>(a, b, y, workgroups_x);
-                        }
-                        Ok("ggml_4x2") => {
-                            return self.qgemv_q4k_ggml::<4, 2, 128>(a, b, y, workgroups_x);
-                        }
-                        Ok("ggml_4x4") => {
-                            return self.qgemv_q4k_ggml::<4, 4, 128>(a, b, y, workgroups_x);
-                        }
-                        Ok("ggml_4x8") => {
-                            return self.qgemv_q4k_ggml::<4, 8, 128>(a, b, y, workgroups_x);
-                        }
-                        Ok("ggml_8x1") => {
-                            return self.qgemv_q4k_ggml::<8, 1, 256>(a, b, y, workgroups_x);
-                        }
-                        Ok("ggml_8x2") => {
-                            return self.qgemv_q4k_ggml::<8, 2, 256>(a, b, y, workgroups_x);
-                        }
-                        Ok("ggml_8x4") => {
-                            return self.qgemv_q4k_ggml::<8, 4, 256>(a, b, y, workgroups_x);
-                        }
-                        _ => {}
-                    }
+                    qgemv_ggml_env_with_old!(
+                        self,
+                        qgemv_q4k_ggml,
+                        "FUSOR_Q4K_LARGE_TILE",
+                        a,
+                        b,
+                        y,
+                        workgroups_x,
+                        old = (4, 8, 32, 128),
+                        [
+                            ("ggml_1x4", 1, 4, 32),
+                            ("ggml_1x8", 1, 8, 32),
+                            ("ggml_2x2", 2, 2, 64),
+                            ("ggml_2x4", 2, 4, 64),
+                            ("ggml_2x8", 2, 8, 64),
+                            ("ggml_4x1", 4, 1, 128),
+                            ("ggml_4x2", 4, 2, 128),
+                            ("ggml_4x4", 4, 4, 128),
+                            ("ggml_4x8", 4, 8, 128),
+                            ("ggml_8x1", 8, 1, 256),
+                            ("ggml_8x2", 8, 2, 256),
+                            ("ggml_8x4", 8, 4, 256),
+                        ]
+                    );
                     if b.cols <= 16_384 {
                         return self.qgemv_q4k_ggml::<4, 4, 128>(a, b, y, workgroups_x);
                     }
                     return self.qgemv_q4k_ggml::<2, 4, 64>(a, b, y, workgroups_x);
                 }
                 if b.rows > 4096 && b.cols <= 4096 {
-                    match std::env::var("FUSOR_Q4K_TALL_TILE").as_deref() {
-                        Ok("old") => {
-                            return self.qgemv_perf::<8, 4, 16, 256>(a, b, y, workgroups_x);
-                        }
-                        Ok("ggml_2x2") => {
-                            return self.qgemv_q4k_ggml::<2, 2, 64>(a, b, y, workgroups_x);
-                        }
-                        Ok("ggml_2x4") => {
-                            return self.qgemv_q4k_ggml::<2, 4, 64>(a, b, y, workgroups_x);
-                        }
-                        Ok("ggml_2x8") => {
-                            return self.qgemv_q4k_ggml::<2, 8, 64>(a, b, y, workgroups_x);
-                        }
-                        Ok("ggml_4x2") => {
-                            return self.qgemv_q4k_ggml::<4, 2, 128>(a, b, y, workgroups_x);
-                        }
-                        Ok("ggml_4x4") => {
-                            return self.qgemv_q4k_ggml::<4, 4, 128>(a, b, y, workgroups_x);
-                        }
-                        Ok("ggml_4x8") => {
-                            return self.qgemv_q4k_ggml::<4, 8, 128>(a, b, y, workgroups_x);
-                        }
-                        Ok("ggml_8x2") => {
-                            return self.qgemv_q4k_ggml::<8, 2, 256>(a, b, y, workgroups_x);
-                        }
-                        Ok("ggml_8x4") => {
-                            return self.qgemv_q4k_ggml::<8, 4, 256>(a, b, y, workgroups_x);
-                        }
-                        _ => {}
-                    }
+                    qgemv_ggml_env_with_old!(
+                        self,
+                        qgemv_q4k_ggml,
+                        "FUSOR_Q4K_TALL_TILE",
+                        a,
+                        b,
+                        y,
+                        workgroups_x,
+                        old = (8, 4, 16, 256),
+                        [
+                            ("ggml_2x2", 2, 2, 64),
+                            ("ggml_2x4", 2, 4, 64),
+                            ("ggml_2x8", 2, 8, 64),
+                            ("ggml_4x2", 4, 2, 128),
+                            ("ggml_4x4", 4, 4, 128),
+                            ("ggml_4x8", 4, 8, 128),
+                            ("ggml_8x2", 8, 2, 256),
+                            ("ggml_8x4", 8, 4, 256),
+                        ]
+                    );
                     return self.qgemv_q4k_ggml::<4, 2, 128>(a, b, y, workgroups_x);
                 }
                 if b.format
@@ -429,72 +562,52 @@ impl Program {
             }
             GgmlQuantFormat::Q6K => {
                 if b.rows <= 4096 && b.cols >= 8192 {
-                    match std::env::var("FUSOR_Q6K_LARGE_TILE").as_deref() {
-                        Ok("old") => {
-                            return self.qgemv_perf::<4, 8, 8, 128>(a, b, y, workgroups_x);
-                        }
-                        Ok("ggml_2x2") => {
-                            return self.qgemv_q6k_ggml::<2, 2, 64>(a, b, y, workgroups_x);
-                        }
-                        Ok("ggml_2x4") => {
-                            return self.qgemv_q6k_ggml::<2, 4, 64>(a, b, y, workgroups_x);
-                        }
-                        Ok("ggml_2x8") => {
-                            return self.qgemv_q6k_ggml::<2, 8, 64>(a, b, y, workgroups_x);
-                        }
-                        Ok("ggml_4x2") => {
-                            return self.qgemv_q6k_ggml::<4, 2, 128>(a, b, y, workgroups_x);
-                        }
-                        Ok("ggml_4x4") => {
-                            return self.qgemv_q6k_ggml::<4, 4, 128>(a, b, y, workgroups_x);
-                        }
-                        Ok("ggml_4x8") => {
-                            return self.qgemv_q6k_ggml::<4, 8, 128>(a, b, y, workgroups_x);
-                        }
-                        Ok("ggml_8x2") => {
-                            return self.qgemv_q6k_ggml::<8, 2, 256>(a, b, y, workgroups_x);
-                        }
-                        Ok("ggml_8x4") => {
-                            return self.qgemv_q6k_ggml::<8, 4, 256>(a, b, y, workgroups_x);
-                        }
-                        _ => {}
-                    }
+                    qgemv_ggml_env_with_old!(
+                        self,
+                        qgemv_q6k_ggml,
+                        "FUSOR_Q6K_LARGE_TILE",
+                        a,
+                        b,
+                        y,
+                        workgroups_x,
+                        old = (4, 8, 8, 128),
+                        [
+                            ("ggml_2x2", 2, 2, 64),
+                            ("ggml_2x4", 2, 4, 64),
+                            ("ggml_2x8", 2, 8, 64),
+                            ("ggml_4x2", 4, 2, 128),
+                            ("ggml_4x4", 4, 4, 128),
+                            ("ggml_4x8", 4, 8, 128),
+                            ("ggml_8x2", 8, 2, 256),
+                            ("ggml_8x4", 8, 4, 256),
+                        ]
+                    );
                     if b.cols <= 16_384 {
                         return self.qgemv_q6k_ggml::<2, 2, 64>(a, b, y, workgroups_x);
                     }
                     return self.qgemv_q6k_ggml::<2, 4, 64>(a, b, y, workgroups_x);
                 }
                 if b.rows > 4096 && b.cols <= 4096 {
-                    match std::env::var("FUSOR_Q6K_TALL_TILE").as_deref() {
-                        Ok("old") => {
-                            return self.qgemv_perf::<8, 4, 8, 256>(a, b, y, workgroups_x);
-                        }
-                        Ok("ggml_2x2") => {
-                            return self.qgemv_q6k_ggml::<2, 2, 64>(a, b, y, workgroups_x);
-                        }
-                        Ok("ggml_2x4") => {
-                            return self.qgemv_q6k_ggml::<2, 4, 64>(a, b, y, workgroups_x);
-                        }
-                        Ok("ggml_2x8") => {
-                            return self.qgemv_q6k_ggml::<2, 8, 64>(a, b, y, workgroups_x);
-                        }
-                        Ok("ggml_4x2") => {
-                            return self.qgemv_q6k_ggml::<4, 2, 128>(a, b, y, workgroups_x);
-                        }
-                        Ok("ggml_4x4") => {
-                            return self.qgemv_q6k_ggml::<4, 4, 128>(a, b, y, workgroups_x);
-                        }
-                        Ok("ggml_4x8") => {
-                            return self.qgemv_q6k_ggml::<4, 8, 128>(a, b, y, workgroups_x);
-                        }
-                        Ok("ggml_8x2") => {
-                            return self.qgemv_q6k_ggml::<8, 2, 256>(a, b, y, workgroups_x);
-                        }
-                        Ok("ggml_8x4") => {
-                            return self.qgemv_q6k_ggml::<8, 4, 256>(a, b, y, workgroups_x);
-                        }
-                        _ => {}
-                    }
+                    qgemv_ggml_env_with_old!(
+                        self,
+                        qgemv_q6k_ggml,
+                        "FUSOR_Q6K_TALL_TILE",
+                        a,
+                        b,
+                        y,
+                        workgroups_x,
+                        old = (8, 4, 8, 256),
+                        [
+                            ("ggml_2x2", 2, 2, 64),
+                            ("ggml_2x4", 2, 4, 64),
+                            ("ggml_2x8", 2, 8, 64),
+                            ("ggml_4x2", 4, 2, 128),
+                            ("ggml_4x4", 4, 4, 128),
+                            ("ggml_4x8", 4, 8, 128),
+                            ("ggml_8x2", 8, 2, 256),
+                            ("ggml_8x4", 8, 4, 256),
+                        ]
+                    );
                     return self.qgemv_q6k_ggml::<2, 2, 64>(a, b, y, workgroups_x);
                 }
                 if b.format
@@ -520,21 +633,16 @@ impl Program {
         debug_assert_eq!(b.format, GgmlQuantFormat::Q4K);
 
         let [_, k] = matrix_shape(&a.view.layout);
-        let cols_per_workgroup = SUBGROUPS * COLS_PER_SUBGROUP as u32;
-        let total_workgroups = b.cols.div_ceil(cols_per_workgroup);
-        let workgroups_x = workgroups_x.min(total_workgroups.max(1));
-        let dispatch_y = total_workgroups.div_ceil(workgroups_x);
+        let grid = qgemv_grid::<SUBGROUPS, COLS_PER_SUBGROUP>(b.cols, workgroups_x);
         let block_count = k.div_ceil(256);
         let block_iterations = block_count.div_ceil(4);
-        let n_cols = b.cols;
         let full_block_iterations = block_count.is_multiple_of(4);
-        let full_cols = b.cols.is_multiple_of(cols_per_workgroup);
         let b_cloned = b.clone();
 
-        self.program_grid::<BLOCK>([workgroups_x, dispatch_y, 1], |program| {
+        self.program_grid::<BLOCK>([grid.workgroups_x, grid.dispatch_y, 1], |program| {
             let workgroup = program.program_id(WorkgroupAxis::X)
-                + program.program_id(WorkgroupAxis::Y) * workgroups_x;
-            let col_group_base = workgroup * cols_per_workgroup;
+                + program.program_id(WorkgroupAxis::Y) * grid.workgroups_x;
+            let col_group_base = workgroup * grid.cols_per_workgroup;
             let subgroup_col_base = program.subgroup_id() * COLS_PER_SUBGROUP as u32;
             let col0 = col_group_base + subgroup_col_base;
             let lane = program.subgroup_lane();
@@ -591,12 +699,7 @@ impl Program {
 
                         std::array::from_fn(|c| {
                             let col = col0.clone() + c as u32;
-                            let mask = match (full_block_iterations, full_cols) {
-                                (true, true) => Mask::all(),
-                                (true, false) => col.lt(n_cols),
-                                (false, true) => in_bounds.clone(),
-                                (false, false) => in_bounds.clone().and(col.lt(n_cols)),
-                            };
+                            let mask = grid.mask(full_block_iterations, in_bounds.clone(), &col);
                             let a_low_vec: [Tile<BLOCK>; 16] =
                                 std::array::from_fn(|i| a_low[i].get());
                             let a_high_vec: [Tile<BLOCK>; 16] =
@@ -611,104 +714,21 @@ impl Program {
                     },
                 );
 
-            for (offset, sum) in sums.into_iter().enumerate() {
-                let col = col0.clone() + offset as u32;
-                let reduced = program.subgroup_reduce_sum(sum);
-                let mask = if full_cols {
-                    lane.eq(0)
-                } else {
-                    lane.eq(0).and(col.lt(n_cols))
-                };
-                program.store(y.at(0, col), reduced, mask);
-            }
+            store_qgemv_sums(program, y, col0, lane, sums, grid.full_cols, grid.n_cols);
         });
     }
 
-    pub fn qgemv_q4k_swiglu_4x2(
-        &mut self,
-        a: &Storage<F32, 2>,
-        b: &QuantizedMatrix,
-        y: &Storage<F32, 2>,
-        pair_cols: u32,
-        m_rows: u32,
-        workgroups_x: u32,
-    ) {
-        self.qgemv_q4k_swiglu_ggml::<4, 2, 4, 128>(a, b, y, pair_cols, m_rows, workgroups_x);
-    }
+    q4k_paired_entrypoints!(
+        (qgemv_q4k_paired_4x2, 4, 2, 4, 128),
+        (qgemv_q4k_paired_4x1, 4, 1, 2, 128),
+        (qgemv_q4k_paired_4x4, 4, 4, 8, 128),
+        (qgemv_q4k_paired_8x1, 8, 1, 2, 256),
+        (qgemv_q4k_paired_8x2, 8, 2, 4, 256),
+        (qgemv_q4k_paired_2x2, 2, 2, 4, 64),
+        (qgemv_q4k_paired_2x4, 2, 4, 8, 64),
+    );
 
-    pub fn qgemv_q4k_swiglu_4x1(
-        &mut self,
-        a: &Storage<F32, 2>,
-        b: &QuantizedMatrix,
-        y: &Storage<F32, 2>,
-        pair_cols: u32,
-        m_rows: u32,
-        workgroups_x: u32,
-    ) {
-        self.qgemv_q4k_swiglu_ggml::<4, 1, 2, 128>(a, b, y, pair_cols, m_rows, workgroups_x);
-    }
-
-    pub fn qgemv_q4k_swiglu_4x4(
-        &mut self,
-        a: &Storage<F32, 2>,
-        b: &QuantizedMatrix,
-        y: &Storage<F32, 2>,
-        pair_cols: u32,
-        m_rows: u32,
-        workgroups_x: u32,
-    ) {
-        self.qgemv_q4k_swiglu_ggml::<4, 4, 8, 128>(a, b, y, pair_cols, m_rows, workgroups_x);
-    }
-
-    pub fn qgemv_q4k_swiglu_8x1(
-        &mut self,
-        a: &Storage<F32, 2>,
-        b: &QuantizedMatrix,
-        y: &Storage<F32, 2>,
-        pair_cols: u32,
-        m_rows: u32,
-        workgroups_x: u32,
-    ) {
-        self.qgemv_q4k_swiglu_ggml::<8, 1, 2, 256>(a, b, y, pair_cols, m_rows, workgroups_x);
-    }
-
-    pub fn qgemv_q4k_swiglu_8x2(
-        &mut self,
-        a: &Storage<F32, 2>,
-        b: &QuantizedMatrix,
-        y: &Storage<F32, 2>,
-        pair_cols: u32,
-        m_rows: u32,
-        workgroups_x: u32,
-    ) {
-        self.qgemv_q4k_swiglu_ggml::<8, 2, 4, 256>(a, b, y, pair_cols, m_rows, workgroups_x);
-    }
-
-    pub fn qgemv_q4k_swiglu_2x2(
-        &mut self,
-        a: &Storage<F32, 2>,
-        b: &QuantizedMatrix,
-        y: &Storage<F32, 2>,
-        pair_cols: u32,
-        m_rows: u32,
-        workgroups_x: u32,
-    ) {
-        self.qgemv_q4k_swiglu_ggml::<2, 2, 4, 64>(a, b, y, pair_cols, m_rows, workgroups_x);
-    }
-
-    pub fn qgemv_q4k_swiglu_2x4(
-        &mut self,
-        a: &Storage<F32, 2>,
-        b: &QuantizedMatrix,
-        y: &Storage<F32, 2>,
-        pair_cols: u32,
-        m_rows: u32,
-        workgroups_x: u32,
-    ) {
-        self.qgemv_q4k_swiglu_ggml::<2, 4, 8, 64>(a, b, y, pair_cols, m_rows, workgroups_x);
-    }
-
-    fn qgemv_q4k_swiglu_ggml<
+    fn qgemv_q4k_paired_ggml<
         const SUBGROUPS: u32,
         const PAIRS_PER_SUBGROUP: usize,
         const DOTS_PER_SUBGROUP: usize,
@@ -721,6 +741,7 @@ impl Program {
         pair_cols: u32,
         m_rows: u32,
         workgroups_x: u32,
+        activation: PairedActivation,
     ) {
         const SUBGROUP_SIZE: u32 = 32;
         debug_assert_eq!(SUBGROUPS * SUBGROUP_SIZE, BLOCK as u32);
@@ -852,7 +873,8 @@ impl Program {
                     lane.eq(0).and(col.lt(pair_cols))
                 };
                 let mask = store_lane.and(row_in_bounds.clone());
-                program.store_swiglu(y.at(row.clone(), col), gate, up, mask);
+                let value = activation.apply(gate, up);
+                program.store(y.at(row.clone(), col), value, mask);
             }
         });
     }
@@ -869,21 +891,16 @@ impl Program {
         debug_assert_eq!(b.format, GgmlQuantFormat::Q6K);
 
         let [_, k] = matrix_shape(&a.view.layout);
-        let cols_per_workgroup = SUBGROUPS * COLS_PER_SUBGROUP as u32;
-        let total_workgroups = b.cols.div_ceil(cols_per_workgroup);
-        let workgroups_x = workgroups_x.min(total_workgroups.max(1));
-        let dispatch_y = total_workgroups.div_ceil(workgroups_x);
+        let grid = qgemv_grid::<SUBGROUPS, COLS_PER_SUBGROUP>(b.cols, workgroups_x);
         let block_count = k.div_ceil(256);
         let block_iterations = block_count.div_ceil(2);
-        let n_cols = b.cols;
         let full_block_iterations = block_count.is_multiple_of(2);
-        let full_cols = b.cols.is_multiple_of(cols_per_workgroup);
         let b_cloned = b.clone();
 
-        self.program_grid::<BLOCK>([workgroups_x, dispatch_y, 1], |program| {
+        self.program_grid::<BLOCK>([grid.workgroups_x, grid.dispatch_y, 1], |program| {
             let workgroup = program.program_id(WorkgroupAxis::X)
-                + program.program_id(WorkgroupAxis::Y) * workgroups_x;
-            let col_group_base = workgroup * cols_per_workgroup;
+                + program.program_id(WorkgroupAxis::Y) * grid.workgroups_x;
+            let col_group_base = workgroup * grid.cols_per_workgroup;
             let subgroup_col_base = program.subgroup_id() * COLS_PER_SUBGROUP as u32;
             let col0 = col_group_base + subgroup_col_base;
             let lane = program.subgroup_lane();
@@ -920,12 +937,7 @@ impl Program {
 
                         std::array::from_fn(|c| {
                             let col = col0.clone() + c as u32;
-                            let mask = match (full_block_iterations, full_cols) {
-                                (true, true) => Mask::all(),
-                                (true, false) => col.lt(n_cols),
-                                (false, true) => in_bounds.clone(),
-                                (false, false) => in_bounds.clone().and(col.lt(n_cols)),
-                            };
+                            let mask = grid.mask(full_block_iterations, in_bounds.clone(), &col);
                             let a_vec: [Tile<BLOCK>; 16] = std::array::from_fn(|i| a_pins[i].get());
                             program.quantized_q6k_ggml_dot(
                                 a_vec, &b_cloned, &block, &ip, &il, &col, mask, 0.0,
@@ -934,16 +946,7 @@ impl Program {
                     },
                 );
 
-            for (offset, sum) in sums.into_iter().enumerate() {
-                let col = col0.clone() + offset as u32;
-                let reduced = program.subgroup_reduce_sum(sum);
-                let mask = if full_cols {
-                    lane.eq(0)
-                } else {
-                    lane.eq(0).and(col.lt(n_cols))
-                };
-                program.store(y.at(0, col), reduced, mask);
-            }
+            store_qgemv_sums(program, y, col0, lane, sums, grid.full_cols, grid.n_cols);
         });
     }
 
@@ -969,23 +972,18 @@ impl Program {
                 || COLS_PER_SUBGROUP == 8
         );
         let [_, k] = matrix_shape(&a.view.layout);
-        let cols_per_workgroup = SUBGROUPS * COLS_PER_SUBGROUP as u32;
-        let total_workgroups = b.cols.div_ceil(cols_per_workgroup);
-        let workgroups_x = workgroups_x.min(total_workgroups.max(1));
-        let dispatch_y = total_workgroups.div_ceil(workgroups_x);
+        let grid = qgemv_grid::<SUBGROUPS, COLS_PER_SUBGROUP>(b.cols, workgroups_x);
         let k_per_iter = SUBGROUP_SIZE * VALUES_PER_LANE as u32;
         let k_iterations = k.div_ceil(k_per_iter);
-        let n_cols = b.cols;
         let k_size = k;
         let full_k_iterations = k.is_multiple_of(k_per_iter);
-        let full_cols = b.cols.is_multiple_of(cols_per_workgroup);
         let b_cloned = b.clone();
         let q6k_vocab_f32_dot =
             b.format == GgmlQuantFormat::Q6K && b.rows <= 4096 && b.cols >= 65_536;
-        self.program_grid::<BLOCK>([workgroups_x, dispatch_y, 1], |program| {
+        self.program_grid::<BLOCK>([grid.workgroups_x, grid.dispatch_y, 1], |program| {
             let workgroup = program.program_id(WorkgroupAxis::X)
-                + program.program_id(WorkgroupAxis::Y) * workgroups_x;
-            let col_group_base = workgroup * cols_per_workgroup;
+                + program.program_id(WorkgroupAxis::Y) * grid.workgroups_x;
+            let col_group_base = workgroup * grid.cols_per_workgroup;
             let subgroup_col_base = program.subgroup_id() * COLS_PER_SUBGROUP as u32;
             let col0 = col_group_base + subgroup_col_base;
             let lane = program.subgroup_lane();
@@ -1018,15 +1016,10 @@ impl Program {
 
                         std::array::from_fn(|c| {
                             let col = col0.clone() + c as u32;
-                            let mask = match (full_k_iterations, full_cols) {
-                                (true, true) => Mask::all(),
-                                (true, false) => col.lt(n_cols),
-                                (false, true) => in_bounds_k.clone(),
-                                (false, false) => in_bounds_k.clone().and(col.lt(n_cols)),
-                            };
+                            let mask = grid.mask(full_k_iterations, in_bounds_k.clone(), &col);
                             if b_cloned.format == GgmlQuantFormat::Q8_0
                                 && VALUES_PER_LANE == 8
-                                && n_cols >= 8192
+                                && grid.n_cols >= 8192
                             {
                                 let a_vec: [Tile<BLOCK>; 8] =
                                     std::array::from_fn(|i| a_pins[i].get());
@@ -1082,16 +1075,7 @@ impl Program {
                     },
                 );
 
-            for (offset, sum) in sums.into_iter().enumerate() {
-                let col = col0.clone() + offset as u32;
-                let reduced = program.subgroup_reduce_sum(sum);
-                let mask = if full_cols {
-                    lane.eq(0)
-                } else {
-                    lane.eq(0).and(col.lt(n_cols))
-                };
-                program.store(y.at(0, col), reduced, mask);
-            }
+            store_qgemv_sums(program, y, col0, lane, sums, grid.full_cols, grid.n_cols);
         });
     }
 
@@ -2702,23 +2686,6 @@ impl<const BLOCK: usize> TileBlock<'_, BLOCK> {
         }));
     }
 
-    pub fn store_swiglu(
-        &mut self,
-        address: Address<F32, BLOCK>,
-        gate: Tile<BLOCK>,
-        up: Tile<BLOCK>,
-        mask: Mask<BLOCK>,
-    ) {
-        self.push_stmt(TileStmt::StoreSwiGlu(TileSwiGluStoreStmt {
-            dst: address.view,
-            row: address.row,
-            col: address.col,
-            gate: gate.expr,
-            up: up.expr,
-            mask: mask.expr,
-        }));
-    }
-
     pub fn store_erased(
         &mut self,
         address: ErasedAddress<BLOCK>,
@@ -3164,6 +3131,45 @@ impl<const N: usize> Tile<N> {
 
     pub fn exp2(self) -> Self {
         self.unary(TileUnaryOp::Exp2)
+    }
+
+    pub fn tanh(self) -> Self {
+        self.unary(TileUnaryOp::Tanh)
+    }
+
+    pub fn neg_unary(self) -> Self {
+        self.unary(TileUnaryOp::Neg)
+    }
+
+    /// Sigmoid activation: `1 / (1 + exp(-x))`.
+    pub fn sigmoid(self) -> Self {
+        let one = Tile::literal(TileLiteral::F32(F32Bits::new(1.0)));
+        one.clone() / (one + self.neg_unary().exp())
+    }
+
+    /// SiLU (a.k.a. swish) activation: `x * sigmoid(x)`.
+    pub fn silu(self) -> Self {
+        self.clone() * self.sigmoid()
+    }
+
+    /// GELU activation, tanh approximation:
+    /// `0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))`.
+    pub fn gelu(self) -> Self {
+        let half = Tile::literal(TileLiteral::F32(F32Bits::new(0.5)));
+        let one = Tile::literal(TileLiteral::F32(F32Bits::new(1.0)));
+        let coeff = Tile::literal(TileLiteral::F32(F32Bits::new(0.044_715)));
+        let sqrt_2_over_pi = Tile::literal(TileLiteral::F32(F32Bits::new(0.797_884_56)));
+        let x = self;
+        let x_cubed = x.clone() * x.clone() * x.clone();
+        let inner = sqrt_2_over_pi * (x.clone() + coeff * x_cubed);
+        half * x * (one + inner.tanh())
+    }
+
+    /// ReLU activation: `max(x, 0)`.
+    pub fn relu(self) -> Self {
+        let zero = Tile::literal(TileLiteral::F32(F32Bits::new(0.0)));
+        let condition = Tile::compare_bool(TileCompareOp::Gt, self.clone(), zero.clone());
+        Tile::select(condition, self, zero)
     }
 
     pub fn cast(self, to: crate::ElementType) -> Self {

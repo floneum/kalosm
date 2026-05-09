@@ -2,7 +2,7 @@ use fusor_tile_ir as tile_ir;
 
 use crate::{
     kernel_selection::{Axis, KernelDeviceCaps, KernelShape, ShapeRule, ShapeSelector, eq, range},
-    mir::{direct_kernel::DirectKernelBinding, kernel_backend},
+    mir::kernel_backend,
     sampling::{
         TOP_K_BLOCK, TOP_K_CHUNK,
         processors::{fixed_previous_tokens_data, processor_params_data},
@@ -224,37 +224,14 @@ pub(crate) fn top_k_exactness_flag_data_with_encoder(
             })
         },
         vec![
-            DirectKernelBinding::Storage {
-                binding: 0,
-                buffer: top_values.buffer().clone(),
-                read_only: true,
-            },
-            DirectKernelBinding::Storage {
-                binding: 1,
-                buffer: chunk_values.buffer().clone(),
-                read_only: true,
-            },
-            DirectKernelBinding::Storage {
-                binding: 2,
-                buffer: flag.buffer().clone(),
-                read_only: false,
-            },
+            kernel_backend::storage_binding(0, top_values, true),
+            kernel_backend::storage_binding(1, chunk_values, true),
+            kernel_backend::storage_binding(2, &flag, false),
         ],
         [1, 1, 1],
     )?;
 
-    if let Some(encoder) = encoder {
-        kernel.run(device, encoder);
-    } else {
-        let mut encoder =
-            device
-                .wgpu_device()
-                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                    label: Some("prove_top_k_exact_f32 encoder"),
-                });
-        kernel.run(device, &mut encoder);
-        device.wgpu_queue().submit(Some(encoder.finish()));
-    }
+    kernel_backend::run_direct_kernel(device, "prove_top_k_exact_f32 encoder", &kernel, encoder);
 
     Some(flag)
 }
@@ -336,31 +313,11 @@ fn chunk_top_k_pair_data_inner_with_encoder(
 
     let kernel = if let Some((previous_tokens, params)) = processors {
         let bindings = vec![
-            DirectKernelBinding::Storage {
-                binding: 0,
-                buffer: input.buffer().clone(),
-                read_only: true,
-            },
-            DirectKernelBinding::Storage {
-                binding: 1,
-                buffer: ids.buffer().clone(),
-                read_only: false,
-            },
-            DirectKernelBinding::Storage {
-                binding: 2,
-                buffer: values.buffer().clone(),
-                read_only: false,
-            },
-            DirectKernelBinding::Storage {
-                binding: 3,
-                buffer: previous_tokens.buffer().clone(),
-                read_only: true,
-            },
-            DirectKernelBinding::Storage {
-                binding: 4,
-                buffer: params.buffer().clone(),
-                read_only: true,
-            },
+            kernel_backend::storage_binding(0, input, true),
+            kernel_backend::storage_binding(1, &ids, false),
+            kernel_backend::storage_binding(2, &values, false),
+            kernel_backend::storage_binding(3, previous_tokens, true),
+            kernel_backend::storage_binding(4, params, true),
         ];
         kernel_backend::dynamic_kernel_from_ir(
             device,
@@ -377,38 +334,15 @@ fn chunk_top_k_pair_data_inner_with_encoder(
             cache_key,
             build_ir,
             vec![
-                DirectKernelBinding::Storage {
-                    binding: 0,
-                    buffer: input.buffer().clone(),
-                    read_only: true,
-                },
-                DirectKernelBinding::Storage {
-                    binding: 1,
-                    buffer: ids.buffer().clone(),
-                    read_only: false,
-                },
-                DirectKernelBinding::Storage {
-                    binding: 2,
-                    buffer: values.buffer().clone(),
-                    read_only: false,
-                },
+                kernel_backend::storage_binding(0, input, true),
+                kernel_backend::storage_binding(1, &ids, false),
+                kernel_backend::storage_binding(2, &values, false),
             ],
             [chunks.try_into().ok()?, 1, 1],
         )?
     };
 
-    if let Some(encoder) = encoder {
-        kernel.run(device, encoder);
-    } else {
-        let mut encoder =
-            device
-                .wgpu_device()
-                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                    label: Some("chunk_top_k_pairs_f32 encoder"),
-                });
-        kernel.run(device, &mut encoder);
-        device.wgpu_queue().submit(Some(encoder.finish()));
-    }
+    kernel_backend::run_direct_kernel(device, "chunk_top_k_pairs_f32 encoder", &kernel, encoder);
 
     Some((ids, values))
 }
@@ -469,42 +403,20 @@ pub(crate) fn merge_sorted_chunk_top_k_pair_data_with_encoder(
             })
         },
         vec![
-            DirectKernelBinding::Storage {
-                binding: 0,
-                buffer: input_ids.buffer().clone(),
-                read_only: true,
-            },
-            DirectKernelBinding::Storage {
-                binding: 1,
-                buffer: input_values.buffer().clone(),
-                read_only: true,
-            },
-            DirectKernelBinding::Storage {
-                binding: 2,
-                buffer: ids.buffer().clone(),
-                read_only: false,
-            },
-            DirectKernelBinding::Storage {
-                binding: 3,
-                buffer: values.buffer().clone(),
-                read_only: false,
-            },
+            kernel_backend::storage_binding(0, input_ids, true),
+            kernel_backend::storage_binding(1, input_values, true),
+            kernel_backend::storage_binding(2, &ids, false),
+            kernel_backend::storage_binding(3, &values, false),
         ],
         [1, 1, 1],
     )?;
 
-    if let Some(encoder) = encoder {
-        kernel.run(device, encoder);
-    } else {
-        let mut encoder =
-            device
-                .wgpu_device()
-                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                    label: Some("merge_sorted_chunk_top_k_pairs_f32 encoder"),
-                });
-        kernel.run(device, &mut encoder);
-        device.wgpu_queue().submit(Some(encoder.finish()));
-    }
+    kernel_backend::run_direct_kernel(
+        device,
+        "merge_sorted_chunk_top_k_pairs_f32 encoder",
+        &kernel,
+        encoder,
+    );
 
     Some((ids, values))
 }
