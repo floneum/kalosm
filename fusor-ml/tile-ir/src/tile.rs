@@ -630,9 +630,10 @@ impl Program {
         b: &QuantizedMatrix,
         y: &Storage<F32, 2>,
         pair_cols: u32,
+        m_rows: u32,
         workgroups_x: u32,
     ) {
-        self.qgemv_q4k_swiglu_ggml::<4, 2, 4, 128>(a, b, y, pair_cols, workgroups_x);
+        self.qgemv_q4k_swiglu_ggml::<4, 2, 4, 128>(a, b, y, pair_cols, m_rows, workgroups_x);
     }
 
     pub fn qgemv_q4k_swiglu_4x1(
@@ -641,9 +642,10 @@ impl Program {
         b: &QuantizedMatrix,
         y: &Storage<F32, 2>,
         pair_cols: u32,
+        m_rows: u32,
         workgroups_x: u32,
     ) {
-        self.qgemv_q4k_swiglu_ggml::<4, 1, 2, 128>(a, b, y, pair_cols, workgroups_x);
+        self.qgemv_q4k_swiglu_ggml::<4, 1, 2, 128>(a, b, y, pair_cols, m_rows, workgroups_x);
     }
 
     pub fn qgemv_q4k_swiglu_4x4(
@@ -652,9 +654,10 @@ impl Program {
         b: &QuantizedMatrix,
         y: &Storage<F32, 2>,
         pair_cols: u32,
+        m_rows: u32,
         workgroups_x: u32,
     ) {
-        self.qgemv_q4k_swiglu_ggml::<4, 4, 8, 128>(a, b, y, pair_cols, workgroups_x);
+        self.qgemv_q4k_swiglu_ggml::<4, 4, 8, 128>(a, b, y, pair_cols, m_rows, workgroups_x);
     }
 
     pub fn qgemv_q4k_swiglu_8x1(
@@ -663,9 +666,10 @@ impl Program {
         b: &QuantizedMatrix,
         y: &Storage<F32, 2>,
         pair_cols: u32,
+        m_rows: u32,
         workgroups_x: u32,
     ) {
-        self.qgemv_q4k_swiglu_ggml::<8, 1, 2, 256>(a, b, y, pair_cols, workgroups_x);
+        self.qgemv_q4k_swiglu_ggml::<8, 1, 2, 256>(a, b, y, pair_cols, m_rows, workgroups_x);
     }
 
     pub fn qgemv_q4k_swiglu_8x2(
@@ -674,9 +678,10 @@ impl Program {
         b: &QuantizedMatrix,
         y: &Storage<F32, 2>,
         pair_cols: u32,
+        m_rows: u32,
         workgroups_x: u32,
     ) {
-        self.qgemv_q4k_swiglu_ggml::<8, 2, 4, 256>(a, b, y, pair_cols, workgroups_x);
+        self.qgemv_q4k_swiglu_ggml::<8, 2, 4, 256>(a, b, y, pair_cols, m_rows, workgroups_x);
     }
 
     pub fn qgemv_q4k_swiglu_2x2(
@@ -685,9 +690,10 @@ impl Program {
         b: &QuantizedMatrix,
         y: &Storage<F32, 2>,
         pair_cols: u32,
+        m_rows: u32,
         workgroups_x: u32,
     ) {
-        self.qgemv_q4k_swiglu_ggml::<2, 2, 4, 64>(a, b, y, pair_cols, workgroups_x);
+        self.qgemv_q4k_swiglu_ggml::<2, 2, 4, 64>(a, b, y, pair_cols, m_rows, workgroups_x);
     }
 
     pub fn qgemv_q4k_swiglu_2x4(
@@ -696,9 +702,10 @@ impl Program {
         b: &QuantizedMatrix,
         y: &Storage<F32, 2>,
         pair_cols: u32,
+        m_rows: u32,
         workgroups_x: u32,
     ) {
-        self.qgemv_q4k_swiglu_ggml::<2, 4, 8, 64>(a, b, y, pair_cols, workgroups_x);
+        self.qgemv_q4k_swiglu_ggml::<2, 4, 8, 64>(a, b, y, pair_cols, m_rows, workgroups_x);
     }
 
     fn qgemv_q4k_swiglu_ggml<
@@ -712,6 +719,7 @@ impl Program {
         b: &QuantizedMatrix,
         y: &Storage<F32, 2>,
         pair_cols: u32,
+        m_rows: u32,
         workgroups_x: u32,
     ) {
         const SUBGROUP_SIZE: u32 = 32;
@@ -722,7 +730,9 @@ impl Program {
 
         let [_, k] = matrix_shape(&a.view.layout);
         let cols_per_workgroup = SUBGROUPS * PAIRS_PER_SUBGROUP as u32;
-        let total_workgroups = pair_cols.div_ceil(cols_per_workgroup);
+        let cols_workgroups = pair_cols.div_ceil(cols_per_workgroup);
+        let m_rows = m_rows.max(1);
+        let total_workgroups = cols_workgroups * m_rows;
         let workgroups_x = workgroups_x.min(total_workgroups.max(1));
         let dispatch_y = total_workgroups.div_ceil(workgroups_x);
         let block_count = k.div_ceil(256);
@@ -732,9 +742,12 @@ impl Program {
         let b_cloned = b.clone();
 
         self.program_grid::<BLOCK>([workgroups_x, dispatch_y, 1], |program| {
-            let workgroup = program.program_id(WorkgroupAxis::X)
+            let workgroup_idx = program.program_id(WorkgroupAxis::X)
                 + program.program_id(WorkgroupAxis::Y) * workgroups_x;
-            let col_group_base = workgroup * cols_per_workgroup;
+            let row = workgroup_idx.clone() / cols_workgroups;
+            let col_workgroup = workgroup_idx % cols_workgroups;
+            let row_in_bounds = row.clone().lt(m_rows);
+            let col_group_base = col_workgroup * cols_per_workgroup;
             let subgroup_col_base = program.subgroup_id() * PAIRS_PER_SUBGROUP as u32;
             let col0 = col_group_base + subgroup_col_base;
             let lane = program.subgroup_lane();
@@ -752,16 +765,16 @@ impl Program {
                     |program| {
                         let block = program.loop_index() * 4 + ix.clone();
                         let in_bounds = if full_block_iterations {
-                            Mask::all()
+                            row_in_bounds.clone()
                         } else {
-                            block.clone().lt(block_count)
+                            row_in_bounds.clone().and(block.clone().lt(block_count))
                         };
                         let vector_base = block.clone() * 256 + iq.clone() * 64 + ir.clone() * 8;
 
                         let a_low: [Pinned<BLOCK>; 16] = std::array::from_fn(|j| {
                             let offset = if j < 8 { j as u32 } else { (j - 8) as u32 + 32 };
                             let scalar = program.load(
-                                a.at(0, vector_base.clone() + offset),
+                                a.at(row.clone(), vector_base.clone() + offset),
                                 in_bounds.clone(),
                                 0.0,
                             );
@@ -774,7 +787,7 @@ impl Program {
                                 (j - 8) as u32 + 160
                             };
                             let scalar = program.load(
-                                a.at(0, vector_base.clone() + offset),
+                                a.at(row.clone(), vector_base.clone() + offset),
                                 in_bounds.clone(),
                                 0.0,
                             );
@@ -833,12 +846,13 @@ impl Program {
                 let col = col0.clone() + offset as u32;
                 let gate = program.subgroup_reduce_sum(sums[offset].clone());
                 let up = program.subgroup_reduce_sum(sums[offset + PAIRS_PER_SUBGROUP].clone());
-                let mask = if full_cols {
+                let store_lane = if full_cols {
                     lane.eq(0)
                 } else {
                     lane.eq(0).and(col.lt(pair_cols))
                 };
-                program.store_swiglu(y.at(0, col), gate, up, mask);
+                let mask = store_lane.and(row_in_bounds.clone());
+                program.store_swiglu(y.at(row.clone(), col), gate, up, mask);
             }
         });
     }

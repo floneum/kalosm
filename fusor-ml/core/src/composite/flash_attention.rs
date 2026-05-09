@@ -11,12 +11,7 @@ where
         scale: f32,
         mask: Option<&Tensor<2, T>>,
     ) -> Self {
-        let fast_decode_enabled = std::env::var_os("KALOSM_LLAMA_FAST_DECODE")
-            .map(|value| value != "0")
-            .unwrap_or(true);
-        if fast_decode_enabled
-            && let Some(output) = self.try_flash_attention_direct(k, v, scale, mask)
-        {
+        if let Some(output) = self.try_flash_attention_direct(k, v, scale, mask) {
             return output;
         }
 

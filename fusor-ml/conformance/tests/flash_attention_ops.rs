@@ -1,5 +1,6 @@
 use fusor::{Device, MaskKind, Tensor};
-use fusor_conformance::{approx_eq, available_devices};
+use fusor_conformance::{approx_eq, available_devices, f16_capable_devices};
+use half::f16;
 
 #[derive(Clone, Copy)]
 struct FlashCase {
@@ -37,6 +38,175 @@ fn batch_key_mask_data(batch: usize, kv_seq_len: usize) -> Vec<f32> {
         }
     }
     data
+}
+
+async fn assert_flash_attention_case_f16(
+    case: FlashCase,
+    mask: Option<(Vec<f32>, MaskKind, [usize; 2])>,
+    tol: f16,
+) {
+    let q_data: Vec<f16> = attention_data(
+        case.batch * case.num_heads * case.q_seq_len * case.head_dim,
+        0.1,
+    )
+    .into_iter()
+    .map(f16::from_f32)
+    .collect();
+    let k_data: Vec<f16> = attention_data(
+        case.batch * case.num_kv_heads * case.kv_seq_len * case.head_dim,
+        -0.1,
+    )
+    .into_iter()
+    .map(f16::from_f32)
+    .collect();
+    let v_data: Vec<f16> = attention_data(
+        case.batch * case.num_kv_heads * case.kv_seq_len * case.head_dim,
+        0.05,
+    )
+    .into_iter()
+    .map(f16::from_f32)
+    .collect();
+    let scale = 1.0 / (case.head_dim as f32).sqrt();
+
+    let q_cpu: Tensor<4, f16> = Tensor::from_slice(
+        &Device::Cpu,
+        [case.batch, case.num_heads, case.q_seq_len, case.head_dim],
+        &q_data,
+    );
+    let k_cpu: Tensor<4, f16> = Tensor::from_slice(
+        &Device::Cpu,
+        [
+            case.batch,
+            case.num_kv_heads,
+            case.kv_seq_len,
+            case.head_dim,
+        ],
+        &k_data,
+    );
+    let v_cpu: Tensor<4, f16> = Tensor::from_slice(
+        &Device::Cpu,
+        [
+            case.batch,
+            case.num_kv_heads,
+            case.kv_seq_len,
+            case.head_dim,
+        ],
+        &v_data,
+    );
+    let expected = if let Some((mask_data, kind, shape)) = mask.as_ref() {
+        let mask_f16: Vec<f16> = mask_data.iter().copied().map(f16::from_f32).collect();
+        let mask_cpu: Tensor<2, f16> = Tensor::from_slice(&Device::Cpu, *shape, &mask_f16);
+        q_cpu
+            .flash_attention(&k_cpu, &v_cpu, scale, Some((&mask_cpu, *kind)))
+            .to_concrete()
+    } else {
+        q_cpu
+            .flash_attention(&k_cpu, &v_cpu, scale, None)
+            .to_concrete()
+    };
+
+    for device in f16_capable_devices().await {
+        let q: Tensor<4, f16> = Tensor::from_slice(
+            &device,
+            [case.batch, case.num_heads, case.q_seq_len, case.head_dim],
+            &q_data,
+        );
+        let k: Tensor<4, f16> = Tensor::from_slice(
+            &device,
+            [
+                case.batch,
+                case.num_kv_heads,
+                case.kv_seq_len,
+                case.head_dim,
+            ],
+            &k_data,
+        );
+        let v: Tensor<4, f16> = Tensor::from_slice(
+            &device,
+            [
+                case.batch,
+                case.num_kv_heads,
+                case.kv_seq_len,
+                case.head_dim,
+            ],
+            &v_data,
+        );
+        let actual = if let Some((mask_data, kind, shape)) = mask.as_ref() {
+            let mask_f16: Vec<f16> = mask_data.iter().copied().map(f16::from_f32).collect();
+            let device_mask: Tensor<2, f16> = Tensor::from_slice(&device, *shape, &mask_f16);
+            q.flash_attention(&k, &v, scale, Some((&device_mask, *kind)))
+                .to_concrete()
+        } else {
+            q.flash_attention(&k, &v, scale, None).to_concrete()
+        };
+        approx_eq(&actual, &expected, tol).await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn flash_attention_f16_matches_cpu_reference_on_varied_shapes() {
+    for case in [
+        FlashCase {
+            batch: 1,
+            num_heads: 1,
+            num_kv_heads: 1,
+            q_seq_len: 2,
+            kv_seq_len: 2,
+            head_dim: 2,
+        },
+        FlashCase {
+            batch: 2,
+            num_heads: 2,
+            num_kv_heads: 2,
+            q_seq_len: 4,
+            kv_seq_len: 5,
+            head_dim: 3,
+        },
+        FlashCase {
+            batch: 1,
+            num_heads: 2,
+            num_kv_heads: 1,
+            q_seq_len: 1,
+            kv_seq_len: 9,
+            head_dim: 128,
+        },
+    ] {
+        assert_flash_attention_case_f16(case, None, f16::from_f32(5e-3)).await;
+    }
+}
+
+#[tokio::test]
+async fn flash_attention_f16_with_qk_mask_matches_cpu_reference() {
+    for case in [
+        FlashCase {
+            batch: 1,
+            num_heads: 1,
+            num_kv_heads: 1,
+            q_seq_len: 2,
+            kv_seq_len: 2,
+            head_dim: 2,
+        },
+        FlashCase {
+            batch: 1,
+            num_heads: 2,
+            num_kv_heads: 2,
+            q_seq_len: 5,
+            kv_seq_len: 5,
+            head_dim: 4,
+        },
+    ] {
+        let shape = [case.q_seq_len, case.kv_seq_len];
+        assert_flash_attention_case_f16(
+            case,
+            Some((
+                qk_mask_data(case.q_seq_len, case.kv_seq_len),
+                MaskKind::QKMask,
+                shape,
+            )),
+            f16::from_f32(5e-3),
+        )
+        .await;
+    }
 }
 
 async fn assert_flash_attention_case(

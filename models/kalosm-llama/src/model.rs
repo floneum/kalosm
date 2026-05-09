@@ -311,11 +311,7 @@ where
         let trace = std::env::var_os("KALOSM_TRACE_DECODE_TIMING").is_some()
             || std::env::var_os("FUSOR_TRACE_DECODE").is_some()
             || std::env::var_os("FUSOR_TRACE_RESOLVE").is_some();
-        let fast_decode_enabled = std::env::var_os("KALOSM_LLAMA_FAST_DECODE")
-            .map(|value| value != "0")
-            .unwrap_or(true);
-        let decode_eligible = fast_decode_enabled
-            && tokens.len() == 1
+        let decode_eligible = tokens.len() == 1
             && images.is_empty()
             && cache.as_ref().is_some_and(|cache| !cache.tokens.is_empty());
         let path = if decode_eligible {
@@ -404,11 +400,7 @@ where
         let trace = std::env::var_os("KALOSM_TRACE_DECODE_TIMING").is_some()
             || std::env::var_os("FUSOR_TRACE_DECODE").is_some()
             || std::env::var_os("FUSOR_TRACE_RESOLVE").is_some();
-        let fast_decode_enabled = std::env::var_os("KALOSM_LLAMA_FAST_DECODE")
-            .map(|value| value != "0")
-            .unwrap_or(true);
-        let decode_eligible = fast_decode_enabled
-            && tokens.len() == 1
+        let decode_eligible = tokens.len() == 1
             && images.is_empty()
             && cache.as_ref().is_some_and(|cache| !cache.tokens.is_empty());
         let path = if decode_eligible {
@@ -523,11 +515,7 @@ where
         let trace = std::env::var_os("KALOSM_TRACE_DECODE_TIMING").is_some()
             || std::env::var_os("FUSOR_TRACE_DECODE").is_some()
             || std::env::var_os("FUSOR_TRACE_RESOLVE").is_some();
-        let fast_decode_enabled = std::env::var_os("KALOSM_LLAMA_FAST_DECODE")
-            .map(|value| value != "0")
-            .unwrap_or(true);
-        let decode_eligible = fast_decode_enabled
-            && tokens.len() == 1
+        let decode_eligible = tokens.len() == 1
             && images.is_empty()
             && cache.as_ref().is_some_and(|cache| !cache.tokens.is_empty());
         let path = if decode_eligible {
@@ -600,11 +588,7 @@ where
         let trace = std::env::var_os("KALOSM_TRACE_DECODE_TIMING").is_some()
             || std::env::var_os("FUSOR_TRACE_DECODE").is_some()
             || std::env::var_os("FUSOR_TRACE_RESOLVE").is_some();
-        let fast_decode_enabled = std::env::var_os("KALOSM_LLAMA_FAST_DECODE")
-            .map(|value| value != "0")
-            .unwrap_or(true);
-        let decode_eligible = fast_decode_enabled
-            && tokens.len() == 1
+        let decode_eligible = tokens.len() == 1
             && images.is_empty()
             && cache.as_ref().is_some_and(|cache| !cache.tokens.is_empty());
         let path = if decode_eligible {

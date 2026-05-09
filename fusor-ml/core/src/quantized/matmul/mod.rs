@@ -914,8 +914,8 @@ impl Operation for QMatMulSwiGluOperation {
         let m = a_view.rows;
         let k = a_view.cols;
         let pair_len = self.pair_len as u32;
-        if m != 1
-            || y_view.rows != 1
+        if m == 0
+            || y_view.rows != m
             || y_view.cols != pair_len
             || k != self.matrix.shape[1] as u32
             || self.matrix.shape[0] as u32 != pair_len.checked_mul(2)?
@@ -941,7 +941,8 @@ impl Operation for QMatMulSwiGluOperation {
             "4x4" | "8x2" => 16,
             _ => unreachable!(),
         };
-        let total_workgroups = pair_len.div_ceil(cols_per_workgroup);
+        let cols_workgroups = pair_len.div_ceil(cols_per_workgroup);
+        let total_workgroups = cols_workgroups.checked_mul(m)?;
         let [workgroups_x, _] = split_workgroups_2d(total_workgroups, max_workgroups)?;
         let dispatch_size = [workgroups_x, total_workgroups.div_ceil(workgroups_x), 1];
         if dispatch_size.iter().any(|dim| *dim > max_workgroups) {
@@ -989,13 +990,27 @@ impl Operation for QMatMulSwiGluOperation {
                     let b = phase.quantized_matrix(format, k, pair_len * 2);
                     let y = tile_storage_write_with_direct_layout(phase, y_view);
                     match swiglu_tile_name {
-                        "4x1" => phase.qgemv_q4k_swiglu_4x1(&a, &b, &y, pair_len, workgroups_x),
-                        "4x4" => phase.qgemv_q4k_swiglu_4x4(&a, &b, &y, pair_len, workgroups_x),
-                        "8x1" => phase.qgemv_q4k_swiglu_8x1(&a, &b, &y, pair_len, workgroups_x),
-                        "8x2" => phase.qgemv_q4k_swiglu_8x2(&a, &b, &y, pair_len, workgroups_x),
-                        "2x2" => phase.qgemv_q4k_swiglu_2x2(&a, &b, &y, pair_len, workgroups_x),
-                        "2x4" => phase.qgemv_q4k_swiglu_2x4(&a, &b, &y, pair_len, workgroups_x),
-                        "4x2" => phase.qgemv_q4k_swiglu_4x2(&a, &b, &y, pair_len, workgroups_x),
+                        "4x1" => {
+                            phase.qgemv_q4k_swiglu_4x1(&a, &b, &y, pair_len, m, workgroups_x)
+                        }
+                        "4x4" => {
+                            phase.qgemv_q4k_swiglu_4x4(&a, &b, &y, pair_len, m, workgroups_x)
+                        }
+                        "8x1" => {
+                            phase.qgemv_q4k_swiglu_8x1(&a, &b, &y, pair_len, m, workgroups_x)
+                        }
+                        "8x2" => {
+                            phase.qgemv_q4k_swiglu_8x2(&a, &b, &y, pair_len, m, workgroups_x)
+                        }
+                        "2x2" => {
+                            phase.qgemv_q4k_swiglu_2x2(&a, &b, &y, pair_len, m, workgroups_x)
+                        }
+                        "2x4" => {
+                            phase.qgemv_q4k_swiglu_2x4(&a, &b, &y, pair_len, m, workgroups_x)
+                        }
+                        "4x2" => {
+                            phase.qgemv_q4k_swiglu_4x2(&a, &b, &y, pair_len, m, workgroups_x)
+                        }
                         _ => unreachable!(),
                     }
                 }))

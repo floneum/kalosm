@@ -962,7 +962,9 @@ impl<D: DataType, const R: usize> Tensor<R, D> {
         scale: f32,
         mask: Option<&Tensor<2, D>>,
     ) -> Option<Self> {
-        if R != 4 || D::DATA_TYPE != DataTypeEnum::F32 {
+        if R != 4
+            || !matches!(D::DATA_TYPE, DataTypeEnum::F32 | DataTypeEnum::F16)
+        {
             return None;
         }
         let q_shape = self.shape();
@@ -1013,6 +1015,7 @@ impl<D: DataType, const R: usize> Tensor<R, D> {
             k_shape,
             v_shape,
             scale,
+            D::DATA_TYPE,
         );
         Some(Self::from_parts(self.data.flash_attention(operation)))
     }

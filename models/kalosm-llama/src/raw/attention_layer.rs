@@ -102,9 +102,7 @@ impl<F: FloatDataType + SimdElement> LlamaFeedForward<F> {
     pub(crate) fn new(gate: QMatrix, down: QMatrix, up: QMatrix) -> Self {
         let gate_len = gate.shape()[0];
         let up_len = up.shape()[0];
-        let gate_up = fast_decode_enabled()
-            .then(|| QMatrix::concat_rows(&[&gate, &up]))
-            .flatten();
+        let gate_up = QMatrix::concat_rows(&[&gate, &up]);
         let (gate, up) = if gate_up.is_some() {
             (None, None)
         } else {
@@ -133,9 +131,7 @@ impl<F: FloatDataType + SimdElement> LlamaFeedForward<F> {
     ) -> Self {
         let gate_len = gate.shape()[0];
         let up_len = up.shape()[0];
-        let gate_up = (fast_decode_enabled() && gate_bias.is_none() && up_bias.is_none())
-            .then(|| QMatrix::concat_rows(&[&gate, &up]))
-            .flatten();
+        let gate_up = QMatrix::concat_rows(&[&gate, &up]);
         let (gate, up) = if gate_up.is_some() {
             (None, None)
         } else {
@@ -163,44 +159,52 @@ impl<F: FloatDataType + SimdElement> LlamaFeedForward<F> {
         // All computation happens in f32 for compatibility with SIMD ops
         let x_f32 = x.cast::<f32>();
 
-        let [_b_sz, seq_len, _hidden] = x.shape();
-        let up_result =
-            if let (Some(gate_up), None, None) = (&self.gate_up, &self.gate_bias, &self.up_bias) {
-                if self.gate_len != self.up_len || seq_len != 1 {
-                    let gate_up_states = x_f32.q_mat_mul(gate_up);
-                    let w1 = gate_up_states
-                        .narrow(D::Minus1, 0, self.gate_len)
-                        .to_concrete();
-                    let w3 = gate_up_states
-                        .narrow(D::Minus1, self.gate_len, self.up_len)
-                        .to_concrete();
-                    (w1.silu() * w3).to_concrete()
-                } else {
-                    x_f32.q_mat_mul_swiglu(gate_up, self.gate_len)
-                }
+        let [_b_sz, _seq_len, _hidden] = x.shape();
+        let up_result = if let Some(gate_up) = &self.gate_up {
+            let no_bias = self.gate_bias.is_none() && self.up_bias.is_none();
+            if no_bias && self.gate_len == self.up_len {
+                x_f32.q_mat_mul_swiglu(gate_up, self.gate_len)
             } else {
-                let gate = self
-                    .gate
-                    .as_ref()
-                    .expect("separate gate matrix should exist without fused gate_up");
-                let mut w1 = x_f32.q_mat_mul(gate);
+                let gate_up_states = x_f32.q_mat_mul(gate_up);
+                let mut w1 = gate_up_states
+                    .narrow(D::Minus1, 0, self.gate_len)
+                    .to_concrete();
+                let mut w3 = gate_up_states
+                    .narrow(D::Minus1, self.gate_len, self.up_len)
+                    .to_concrete();
                 if let Some(ref bias) = self.gate_bias {
                     let bias_f32: Tensor<1, f32> = bias.cast();
                     w1 = w1.add_(&bias_f32);
                 }
-
-                let up = self
-                    .up
-                    .as_ref()
-                    .expect("separate up matrix should exist without fused gate_up");
-                let mut w3 = x_f32.q_mat_mul(up);
                 if let Some(ref bias) = self.up_bias {
                     let bias_f32: Tensor<1, f32> = bias.cast();
                     w3 = w3.add_(&bias_f32);
                 }
-
                 (w1.silu() * w3).to_concrete()
-            };
+            }
+        } else {
+            let gate = self
+                .gate
+                .as_ref()
+                .expect("separate gate matrix should exist without fused gate_up");
+            let mut w1 = x_f32.q_mat_mul(gate);
+            if let Some(ref bias) = self.gate_bias {
+                let bias_f32: Tensor<1, f32> = bias.cast();
+                w1 = w1.add_(&bias_f32);
+            }
+
+            let up = self
+                .up
+                .as_ref()
+                .expect("separate up matrix should exist without fused gate_up");
+            let mut w3 = x_f32.q_mat_mul(up);
+            if let Some(ref bias) = self.up_bias {
+                let bias_f32: Tensor<1, f32> = bias.cast();
+                w3 = w3.add_(&bias_f32);
+            }
+
+            (w1.silu() * w3).to_concrete()
+        };
         let mut up = up_result.q_mat_mul(&self.down);
         if let Some(ref bias) = self.down_bias {
             let bias_f32: Tensor<1, f32> = bias.cast();
@@ -212,16 +216,10 @@ impl<F: FloatDataType + SimdElement> LlamaFeedForward<F> {
     }
 }
 
-fn fast_decode_enabled() -> bool {
-    std::env::var_os("KALOSM_LLAMA_FAST_DECODE")
-        .map(|value| value != "0")
-        .unwrap_or(true)
-}
-
 pub enum AttentionVariant<F: FloatDataType + SimdElement = f32> {
     Separate(Box<SeparateAttention<F>>),
-    Grouped(GroupedAttention),
-    Paired(PairedAttention),
+    Grouped(GroupedAttention<F>),
+    Paired(PairedAttention<F>),
 }
 
 pub struct AttentionBias<F: FloatDataType + SimdElement = f32> {
@@ -340,14 +338,21 @@ where
     }
 }
 
-pub struct GroupedAttention {
+pub struct GroupedAttention<F: FloatDataType + SimdElement = f32> {
     pub attention_qkv: QMatrix,
+    pub attention_q_norm: Option<RmsNorm<1, F>>,
+    pub attention_k_norm: Option<RmsNorm<1, F>>,
+    pub bias: Option<AttentionBias<F>>,
     pub interleaved_rope: bool,
 }
 
-impl GroupedAttention {
+impl<F: FloatDataType + SimdElement + Default> GroupedAttention<F>
+where
+    F: CastTo<f32> + CastTensor<f32>,
+    f32: CastTo<F> + CastTensor<F>,
+{
     #[allow(clippy::too_many_arguments)]
-    fn forward<F, B>(
+    fn forward<B>(
         &self,
         num_heads: usize,
         head_dim: usize,
@@ -358,8 +363,6 @@ impl GroupedAttention {
         pos_ids: Option<&Tensor<2, F>>,
     ) -> (Tensor<4, F>, Tensor<4, F>, Tensor<4, F>)
     where
-        F: FloatDataType + SimdElement + Default + CastTo<f32> + CastTensor<f32>,
-        f32: CastTo<F> + CastTensor<F>,
         B: TensorBacking<3, Elem = F>,
     {
         let [b_sz, seq_len, _] = x.shape();
@@ -368,20 +371,28 @@ impl GroupedAttention {
         let qkv = x_f32.q_mat_mul(&self.attention_qkv);
 
         let query_pos = num_heads * head_dim;
-        let query_states = qkv.narrow(D::Minus1, 0, query_pos);
-        let key_states = qkv.narrow(D::Minus1, query_pos, num_key_value_heads * head_dim);
-        let value_states = qkv.narrow(
-            D::Minus1,
-            query_pos + num_key_value_heads * head_dim,
-            num_key_value_heads * head_dim,
-        );
+        let kv_pos = num_key_value_heads * head_dim;
+        let mut query_states = qkv.narrow(D::Minus1, 0, query_pos).to_concrete();
+        let mut key_states = qkv.narrow(D::Minus1, query_pos, kv_pos).to_concrete();
+        let mut value_states = qkv
+            .narrow(D::Minus1, query_pos + kv_pos, kv_pos)
+            .to_concrete();
 
-        let query_states: Tensor<4, F> = query_states
+        if let Some(bias) = &self.bias {
+            let bq: Tensor<1, f32> = bias.bias_q.cast();
+            let bk: Tensor<1, f32> = bias.bias_k.cast();
+            let bv: Tensor<1, f32> = bias.bias_v.cast();
+            query_states = query_states.add_(&bq);
+            key_states = key_states.add_(&bk);
+            value_states = value_states.add_(&bv);
+        }
+
+        let mut query_states: Tensor<4, F> = query_states
             .reshape([b_sz, seq_len, num_heads, head_dim])
             .transpose(1, 2)
             .to_concrete()
             .cast();
-        let key_states: Tensor<4, F> = key_states
+        let mut key_states: Tensor<4, F> = key_states
             .reshape([b_sz, seq_len, num_key_value_heads, head_dim])
             .transpose(1, 2)
             .to_concrete()
@@ -391,6 +402,13 @@ impl GroupedAttention {
             .transpose(1, 2)
             .to_concrete()
             .cast();
+
+        if let Some(norm) = &self.attention_q_norm {
+            query_states = norm.forward_generic_4d(&query_states);
+        }
+        if let Some(norm) = &self.attention_k_norm {
+            key_states = norm.forward_generic_4d(&key_states);
+        }
 
         let (query_states, key_states) = rope_cache.forward(
             &query_states,
@@ -411,16 +429,23 @@ pub enum PairedAttentionKind {
     KeyValue,
 }
 
-pub struct PairedAttention {
+pub struct PairedAttention<F: FloatDataType + SimdElement = f32> {
     pub attention_pair: QMatrix,
     pub attention_single: QMatrix,
+    pub attention_q_norm: Option<RmsNorm<1, F>>,
+    pub attention_k_norm: Option<RmsNorm<1, F>>,
+    pub bias: Option<AttentionBias<F>>,
     pub kind: PairedAttentionKind,
     pub interleaved_rope: bool,
 }
 
-impl PairedAttention {
+impl<F: FloatDataType + SimdElement + Default> PairedAttention<F>
+where
+    F: CastTo<f32> + CastTensor<f32>,
+    f32: CastTo<F> + CastTensor<F>,
+{
     #[allow(clippy::too_many_arguments)]
-    fn forward<F, B>(
+    fn forward<B>(
         &self,
         num_heads: usize,
         head_dim: usize,
@@ -431,8 +456,6 @@ impl PairedAttention {
         pos_ids: Option<&Tensor<2, F>>,
     ) -> (Tensor<4, F>, Tensor<4, F>, Tensor<4, F>)
     where
-        F: FloatDataType + SimdElement + Default + CastTo<f32> + CastTensor<f32>,
-        f32: CastTo<F> + CastTensor<F>,
         B: TensorBacking<3, Elem = F>,
     {
         let [b_sz, seq_len, _] = x.shape();
@@ -442,7 +465,7 @@ impl PairedAttention {
         let pair = x_f32.q_mat_mul(&self.attention_pair);
         let single = x_f32.q_mat_mul(&self.attention_single);
 
-        let (query_states, key_states, value_states) = match self.kind {
+        let (mut query_states, mut key_states, mut value_states) = match self.kind {
             PairedAttentionKind::QueryKey => {
                 let query = pair.narrow(D::Minus1, 0, query_pos);
                 let key = pair.narrow(D::Minus1, query_pos, kv_pos);
@@ -464,12 +487,21 @@ impl PairedAttention {
             }
         };
 
-        let query_states: Tensor<4, F> = query_states
+        if let Some(bias) = &self.bias {
+            let bq: Tensor<1, f32> = bias.bias_q.cast();
+            let bk: Tensor<1, f32> = bias.bias_k.cast();
+            let bv: Tensor<1, f32> = bias.bias_v.cast();
+            query_states = query_states.add_(&bq);
+            key_states = key_states.add_(&bk);
+            value_states = value_states.add_(&bv);
+        }
+
+        let mut query_states: Tensor<4, F> = query_states
             .reshape([b_sz, seq_len, num_heads, head_dim])
             .transpose(1, 2)
             .to_concrete()
             .cast();
-        let key_states: Tensor<4, F> = key_states
+        let mut key_states: Tensor<4, F> = key_states
             .reshape([b_sz, seq_len, num_key_value_heads, head_dim])
             .transpose(1, 2)
             .to_concrete()
@@ -479,6 +511,13 @@ impl PairedAttention {
             .transpose(1, 2)
             .to_concrete()
             .cast();
+
+        if let Some(norm) = &self.attention_q_norm {
+            query_states = norm.forward_generic_4d(&query_states);
+        }
+        if let Some(norm) = &self.attention_k_norm {
+            key_states = norm.forward_generic_4d(&key_states);
+        }
 
         let (query_states, key_states) = rope_cache.forward(
             &query_states,

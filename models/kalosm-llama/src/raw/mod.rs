@@ -324,6 +324,9 @@ where
             {
                 AttentionVariant::Grouped(GroupedAttention {
                     attention_qkv,
+                    attention_q_norm: None,
+                    attention_k_norm: None,
+                    bias: None,
                     interleaved_rope: false,
                 })
             } else {
@@ -359,47 +362,34 @@ where
                     && architecture.as_ref() != "qwen3"
                     && architecture.as_ref() != "gemma3";
 
-                let fast_decode_enabled = std::env::var_os("KALOSM_LLAMA_FAST_DECODE")
-                    .map(|value| value != "0")
-                    .unwrap_or(true);
-                let can_fuse_qkv = fast_decode_enabled
-                    && bias.is_none()
-                    && attention_q_norm.is_none()
-                    && attention_k_norm.is_none();
-                let fused_qkv = can_fuse_qkv
-                    .then(|| QMatrix::concat_rows(&[&q, &k, &v]))
-                    .flatten();
+                let fused_qkv = QMatrix::concat_rows(&[&q, &k, &v]);
                 if let Some(attention_qkv) = fused_qkv {
                     AttentionVariant::Grouped(GroupedAttention {
                         attention_qkv,
+                        attention_q_norm,
+                        attention_k_norm,
+                        bias,
                         interleaved_rope,
                     })
-                } else if can_fuse_qkv {
-                    let paired_attention =
-                        if let Some(attention_pair) = QMatrix::concat_rows(&[&q, &k]) {
-                            Some(PairedAttention {
-                                attention_pair,
-                                attention_single: v.clone(),
-                                kind: PairedAttentionKind::QueryKey,
-                                interleaved_rope,
-                            })
-                        } else if let Some(attention_pair) = QMatrix::concat_rows(&[&q, &v]) {
-                            Some(PairedAttention {
-                                attention_pair,
-                                attention_single: k.clone(),
-                                kind: PairedAttentionKind::QueryValue,
-                                interleaved_rope,
-                            })
-                        } else {
-                            QMatrix::concat_rows(&[&k, &v]).map(|attention_pair| PairedAttention {
-                                attention_pair,
-                                attention_single: q.clone(),
-                                kind: PairedAttentionKind::KeyValue,
-                                interleaved_rope,
-                            })
-                        };
-                    if let Some(attention) = paired_attention {
-                        AttentionVariant::Paired(attention)
+                } else {
+                    let paired = if let Some(pair) = QMatrix::concat_rows(&[&q, &k]) {
+                        Some((pair, v.clone(), PairedAttentionKind::QueryKey))
+                    } else if let Some(pair) = QMatrix::concat_rows(&[&q, &v]) {
+                        Some((pair, k.clone(), PairedAttentionKind::QueryValue))
+                    } else {
+                        QMatrix::concat_rows(&[&k, &v])
+                            .map(|pair| (pair, q.clone(), PairedAttentionKind::KeyValue))
+                    };
+                    if let Some((attention_pair, attention_single, kind)) = paired {
+                        AttentionVariant::Paired(PairedAttention {
+                            attention_pair,
+                            attention_single,
+                            attention_q_norm,
+                            attention_k_norm,
+                            bias,
+                            kind,
+                            interleaved_rope,
+                        })
                     } else {
                         let separate = SeparateAttention {
                             attention_wq: q,
@@ -412,17 +402,6 @@ where
                         };
                         AttentionVariant::Separate(Box::new(separate))
                     }
-                } else {
-                    let separate = SeparateAttention {
-                        attention_wq: q,
-                        attention_q_norm,
-                        attention_wk: k,
-                        attention_k_norm,
-                        attention_wv: v,
-                        interleaved_rope,
-                        bias,
-                    };
-                    AttentionVariant::Separate(Box::new(separate))
                 }
             };
             let attention_wo = source.tensor(&format!("{prefix}.attn_output.weight"), device)?;

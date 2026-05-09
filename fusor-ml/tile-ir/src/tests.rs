@@ -91,7 +91,7 @@ fn tile_source_softmax_lowers_to_naga() {
 
 #[test]
 fn streaming_flash_attention_regression_shape_lowers_to_naga() {
-    let ir = kernels::flash_attention(FlashAttentionMeta {
+    let ir = kernels::flash_attention::<crate::F32>(FlashAttentionMeta {
         dims: FlashAttentionDims {
             batch: 1,
             num_heads: 32,

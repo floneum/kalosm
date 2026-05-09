@@ -64,6 +64,7 @@ fn flash_attention_module_key(
     decode_tiled: bool,
     scale_bits: u32,
     dispatch_size: [u32; 3],
+    input_dtype: DataTypeEnum,
     q: &TensorData,
     k: &TensorData,
     v: &TensorData,
@@ -84,6 +85,7 @@ fn flash_attention_module_key(
         decode_tiled.hash(&mut hasher);
         scale_bits.hash(&mut hasher);
         dispatch_size.hash(&mut hasher);
+        (input_dtype as u32).hash(&mut hasher);
         if variant == FlashAttentionKernelVariant::DecodeSmall {
             hash_strided_buffer(&mut hasher, q.layout());
             hash_strided_buffer(&mut hasher, k.layout());
@@ -278,6 +280,7 @@ pub(crate) struct FlashAttentionOperation {
     q_shape: Box<[usize]>,
     k_shape: Box<[usize]>,
     scale: f32,
+    input_dtype: DataTypeEnum,
 }
 
 impl FlashAttentionOperation {
@@ -290,6 +293,7 @@ impl FlashAttentionOperation {
         k_shape: &[usize],
         v_shape: &[usize],
         scale: f32,
+        input_dtype: DataTypeEnum,
     ) -> Self {
         assert_eq!(q_shape.len(), 4, "Q must be rank-4");
         assert_eq!(k_shape.len(), 4, "K must be rank-4");
@@ -316,6 +320,7 @@ impl FlashAttentionOperation {
             q_shape: q_shape.into(),
             k_shape: k_shape.into(),
             scale,
+            input_dtype,
         }
     }
 
@@ -365,7 +370,7 @@ impl Operation for FlashAttentionOperation {
         let q = nodes.get_result(self.q).unwrap();
         let k = nodes.get_result(self.k).unwrap();
         let v = nodes.get_result(self.v).unwrap();
-        let output = TensorData::new_for_shape(q.device(), &self.out_shape, DataTypeEnum::F32);
+        let output = TensorData::new_for_shape(q.device(), &self.out_shape, self.input_dtype);
 
         let mut inputs = vec![q.into(), k.into(), v.into()];
         if let Some(mask) = self.mask {
@@ -399,13 +404,17 @@ impl Operation for FlashAttentionOperation {
             return None;
         }
 
-        if q.datatype() != DataTypeEnum::F32
-            || k.datatype() != DataTypeEnum::F32
-            || v.datatype() != DataTypeEnum::F32
-            || output.datatype() != DataTypeEnum::F32
+        let input_dtype = self.input_dtype;
+        if !matches!(input_dtype, DataTypeEnum::F32 | DataTypeEnum::F16) {
+            return None;
+        }
+        if q.datatype() != input_dtype
+            || k.datatype() != input_dtype
+            || v.datatype() != input_dtype
+            || output.datatype() != input_dtype
             || mask
                 .as_ref()
-                .is_some_and(|mask| mask.datatype() != DataTypeEnum::F32)
+                .is_some_and(|mask| mask.datatype() != input_dtype)
         {
             return None;
         }
@@ -431,26 +440,31 @@ impl Operation for FlashAttentionOperation {
         };
         let output_meta = TensorMeta::new(&output)?;
 
-        if q_meta.datatype != DataTypeEnum::F32
-            || k_meta.datatype != DataTypeEnum::F32
-            || v_meta.datatype != DataTypeEnum::F32
-            || output_meta.datatype != DataTypeEnum::F32
+        if q_meta.datatype != input_dtype
+            || k_meta.datatype != input_dtype
+            || v_meta.datatype != input_dtype
+            || output_meta.datatype != input_dtype
             || mask_meta
                 .as_ref()
-                .is_some_and(|mask| mask.datatype != DataTypeEnum::F32)
+                .is_some_and(|mask| mask.datatype != input_dtype)
         {
             return None;
         }
 
         let caps = KernelDeviceCaps::from_device(&device);
         let selected_variant = select_flash_attention_variant(dims, mask_meta.is_some(), caps);
-        let decode_candidate =
-            mask_meta.is_none() && dims.q_seq_len == 1 && dims.head_dim == DECODE_HEAD_DIM;
+        // Decode-small kernel only supports f32; force streaming for other dtypes.
+        let decode_eligible =
+            input_dtype == DataTypeEnum::F32 && selected_variant.decode_block().is_some();
+        let decode_candidate = mask_meta.is_none()
+            && dims.q_seq_len == 1
+            && dims.head_dim == DECODE_HEAD_DIM
+            && input_dtype == DataTypeEnum::F32;
         assert!(
             !decode_candidate || selected_variant.decode_block().is_some(),
             "decode attention refused slow fallback: device must support at least {DECODE_SMALL_BLOCK} workgroup invocations on x"
         );
-        let decode_meta = if selected_variant.decode_block().is_some() {
+        let decode_meta = if decode_eligible {
             let meta = build_flash_decode_small_meta(
                 dims,
                 self.scale,
@@ -470,7 +484,11 @@ impl Operation for FlashAttentionOperation {
         } else {
             None
         };
-        let variant = selected_variant.kernel_variant();
+        let variant = if decode_eligible {
+            selected_variant.kernel_variant()
+        } else {
+            FlashAttentionKernelVariant::Streaming
+        };
         let dispatch_size = match variant {
             FlashAttentionKernelVariant::Streaming => {
                 self.dispatch_size(&WorkgroupShape::new(1, 1, 1), inputs)
@@ -498,6 +516,7 @@ impl Operation for FlashAttentionOperation {
             decode_meta.as_ref().is_some_and(|meta| meta.tiled),
             self.scale.to_bits(),
             dispatch_size,
+            input_dtype,
             &q,
             &k,
             &v,
@@ -529,7 +548,7 @@ impl Operation for FlashAttentionOperation {
                 if let Some(meta) = decode_meta {
                     tile_ir::kernels::flash_decode_small(meta.into_tile_ir())
                 } else {
-                    tile_ir::kernels::flash_attention(tile_ir::FlashAttentionMeta {
+                    let stream_meta = tile_ir::FlashAttentionMeta {
                         dims: dims.into_tile_ir(),
                         scale: tile_ir::F32Bits::new(self.scale),
                         q_meta: q_meta.clone().into_tile_ir(),
@@ -538,7 +557,16 @@ impl Operation for FlashAttentionOperation {
                         mask_meta: mask_meta.clone().map(TensorMeta::into_tile_ir),
                         output_meta: output_meta.clone().into_tile_ir(),
                         dispatch_size,
-                    })
+                    };
+                    match input_dtype {
+                        DataTypeEnum::F32 => {
+                            tile_ir::kernels::flash_attention::<tile_ir::F32>(stream_meta)
+                        }
+                        DataTypeEnum::F16 => {
+                            tile_ir::kernels::flash_attention::<tile_ir::F16>(stream_meta)
+                        }
+                        _ => None,
+                    }
                 }
             })?;
             flash_attention_module_cache()

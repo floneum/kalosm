@@ -168,6 +168,15 @@ async fn assert_q_mat_mul_matches_host_reference(fixture: &QuantizedFixture, fuz
 
 #[tokio::test]
 async fn q4k_q_mat_mul_swiglu_matches_cpu_reference() {
+    swiglu_matches_cpu_for_rows(1).await;
+}
+
+#[tokio::test]
+async fn q4k_q_mat_mul_swiglu_multi_row_matches_cpu_reference() {
+    swiglu_matches_cpu_for_rows(4).await;
+}
+
+async fn swiglu_matches_cpu_for_rows(input_row_count: usize) {
     let ty = GgmlType::Q4K;
     let weight_shape = [4, 512];
     let raw_bytes = q4k_raw_bytes(weight_shape);
@@ -182,7 +191,7 @@ async fn q4k_q_mat_mul_swiglu_matches_cpu_reference() {
         }
     })
     .arg(q_mat_mul_input_fuzz(
-        1,
+        input_row_count,
         [2, weight_shape[1]],
         0x5A17_5516_6C75,
         Uniform::new(-0.25, 0.25).unwrap(),

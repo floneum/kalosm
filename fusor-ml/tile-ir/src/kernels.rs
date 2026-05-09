@@ -1,8 +1,16 @@
 use crate::{
     tile::{self, Mask, Tile, TileBlock},
-    Bool, ElementType, F32Bits, KernelIr, Layout, MemoryLevel, Shape, Strides, TileLiteral,
-    TileReduceOp, TileUnaryOp, WorkgroupAxis, F32, U32,
+    Bool, ElementType, F32Bits, KernelIr, Layout, MemoryLevel, Numeric, Shape, Strides,
+    TileLiteral, TileReduceOp, TileUnaryOp, WorkgroupAxis, F32, U32,
 };
+
+fn zero_fill<E: Numeric>() -> TileLiteral {
+    match E::ELEMENT {
+        ElementType::F32 => TileLiteral::F32(F32Bits::new(0.0)),
+        ElementType::F16 => TileLiteral::F16(0),
+        _ => panic!("flash_attention only supports F32 and F16 element types"),
+    }
+}
 
 const RMS_NORM_VEC4_BLOCK: usize = 128;
 const TOP_K_BLOCK: usize = 256;
@@ -390,7 +398,7 @@ fn reduce_workgroup_f32<const BLOCK: usize>(
     }
 }
 
-pub fn flash_attention(meta: FlashAttentionMeta) -> Option<KernelIr> {
+pub fn flash_attention<E: Numeric>(meta: FlashAttentionMeta) -> Option<KernelIr> {
     let q_strides: [u32; 4] = meta.q_meta.strides.as_slice().try_into().ok()?;
     let k_strides: [u32; 4] = meta.k_meta.strides.as_slice().try_into().ok()?;
     let v_strides: [u32; 4] = meta.v_meta.strides.as_slice().try_into().ok()?;
@@ -413,16 +421,17 @@ pub fn flash_attention(meta: FlashAttentionMeta) -> Option<KernelIr> {
     if groups == 0 {
         return None;
     }
+    let elem_fill = zero_fill::<E>();
     Some(tile::build(move |phase| {
         let layout = linear_storage_layout();
-        let q = phase.storage_read_with_layout::<F32, 1>(layout.clone());
-        let k = phase.storage_read_with_layout::<F32, 1>(layout.clone());
-        let v = phase.storage_read_with_layout::<F32, 1>(layout.clone());
+        let q = phase.storage_read_with_layout::<E, 1>(layout.clone());
+        let k = phase.storage_read_with_layout::<E, 1>(layout.clone());
+        let v = phase.storage_read_with_layout::<E, 1>(layout.clone());
         let mask = meta
             .mask_meta
             .as_ref()
-            .map(|_| phase.storage_read_with_layout::<F32, 1>(layout.clone()));
-        let output = phase.storage_write_with_layout::<F32, 1>(layout);
+            .map(|_| phase.storage_read_with_layout::<E, 1>(layout.clone()));
+        let output = phase.storage_write_with_layout::<E, 1>(layout);
 
         phase.program_grid::<FLASH_BLOCK>(meta.dispatch_size, |program| {
             let lane = program.arange();
@@ -489,16 +498,12 @@ pub fn flash_attention(meta: FlashAttentionMeta) -> Option<KernelIr> {
                             kv_idx.get(),
                             dim,
                         );
-                        let q_value = program.load_linear(
-                            q.at(q_index),
-                            all(),
-                            TileLiteral::F32(F32Bits::new(0.0)),
-                        );
-                        let k_value = program.load_linear(
-                            k.at(k_index),
-                            all(),
-                            TileLiteral::F32(F32Bits::new(0.0)),
-                        );
+                        let q_value = program
+                            .load_linear(q.at(q_index), all(), elem_fill.clone())
+                            .cast(ElementType::F32);
+                        let k_value = program
+                            .load_linear(k.at(k_index), all(), elem_fill.clone())
+                            .cast(ElementType::F32);
                         products.push(q_value * k_value);
                     }
                     let mut score = program.sum(products) * f32_tile(meta.scale.get());
@@ -507,11 +512,9 @@ pub fn flash_attention(meta: FlashAttentionMeta) -> Option<KernelIr> {
                     {
                         let mask_index =
                             index2(mask_meta.offset, mask_strides, q_idx.get(), kv_idx.get());
-                        let mask_value = program.load_linear(
-                            mask.at(mask_index),
-                            all(),
-                            TileLiteral::F32(F32Bits::new(0.0)),
-                        );
+                        let mask_value = program
+                            .load_linear(mask.at(mask_index), all(), elem_fill.clone())
+                            .cast(ElementType::F32);
                         score = score + mask_value;
                     }
                     program.store_local(&score_local, score);
@@ -542,11 +545,9 @@ pub fn flash_attention(meta: FlashAttentionMeta) -> Option<KernelIr> {
                         kv_idx.get(),
                         out_dim.get(),
                     );
-                    let v_value = program.load_linear(
-                        v.at(v_index),
-                        all(),
-                        TileLiteral::F32(F32Bits::new(0.0)),
-                    );
+                    let v_value = program
+                        .load_linear(v.at(v_index), all(), elem_fill.clone())
+                        .cast(ElementType::F32);
                     program.store_local(&weighted_local, exp_score.get() * v_value);
                 });
                 let weighted = program.load_local(&weighted_local);
@@ -565,7 +566,8 @@ pub fn flash_attention(meta: FlashAttentionMeta) -> Option<KernelIr> {
 
             let store_valid = kv_lane.eq(u32_tile(0)).and(out_valid.get());
             program.if_then(store_valid, |program| {
-                let output_value = program.load_local(&o_local) / program.load_local(&s_local);
+                let output_value = (program.load_local(&o_local) / program.load_local(&s_local))
+                    .cast(E::ELEMENT);
                 let output_index = index4(
                     meta.output_meta.offset,
                     output_strides,
