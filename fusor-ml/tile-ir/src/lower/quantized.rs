@@ -21,6 +21,69 @@ struct Q8_0BlockParts {
     words: [Handle<Expression>; 2],
 }
 
+/// Quant-byte extraction layout for the affine GGML formats.
+///
+/// `Q4` packs two 4-bit nibbles per byte; `Q5` adds an extra high-bit
+/// register (`high_offset`) so the upper bit of each 5-bit value can be
+/// reconstructed alongside the low nibble at `data_offset`.
+#[derive(Clone, Copy)]
+enum AffineNibble {
+    Q4 { data_offset: u32 },
+    Q5 { high_offset: u32, data_offset: u32 },
+}
+
+/// The simple affine GGML quant family: `Q4_0`, `Q4_1`, `Q5_0`, `Q5_1`,
+/// `Q8_0`, `Q8_1`. Each block stores a single scale (and optionally a min)
+/// and dequantizes via one of three affine forms:
+///
+/// - `Centered`: `(quant − center) · scale` — used by Q4_0/Q5_0.
+/// - `ScaleMin`: `quant · scale + min` — used by Q4_1/Q5_1.
+/// - `Q8`: `signed_byte · scale` — used by Q8_0/Q8_1.
+///
+/// The richer K-quants (Q2K…Q8K) carry per-block group scales and live in
+/// their own dedicated lowering paths.
+#[derive(Clone, Copy)]
+enum AffineDequantSpec {
+    Centered { nibble: AffineNibble, center: f32 },
+    ScaleMin { nibble: AffineNibble },
+    Q8 { data_offset: u32 },
+}
+
+impl AffineDequantSpec {
+    fn for_format(format: GgmlQuantFormat) -> Option<Self> {
+        Some(match format {
+            GgmlQuantFormat::Q4_0 => Self::Centered {
+                nibble: AffineNibble::Q4 { data_offset: 1 },
+                center: 8.0,
+            },
+            GgmlQuantFormat::Q5_0 => Self::Centered {
+                nibble: AffineNibble::Q5 {
+                    high_offset: 1,
+                    data_offset: 2,
+                },
+                center: 16.0,
+            },
+            GgmlQuantFormat::Q8_0 => Self::Q8 { data_offset: 1 },
+            GgmlQuantFormat::Q4_1 => Self::ScaleMin {
+                nibble: AffineNibble::Q4 { data_offset: 2 },
+            },
+            GgmlQuantFormat::Q5_1 => Self::ScaleMin {
+                nibble: AffineNibble::Q5 {
+                    high_offset: 2,
+                    data_offset: 3,
+                },
+            },
+            GgmlQuantFormat::Q8_1 => Self::Q8 { data_offset: 2 },
+            GgmlQuantFormat::Q2K
+            | GgmlQuantFormat::Q3K
+            | GgmlQuantFormat::Q4K
+            | GgmlQuantFormat::Q5K
+            | GgmlQuantFormat::Q6K
+            | GgmlQuantFormat::Q8K => return None,
+        })
+    }
+}
+
 macro_rules! expr_binary_helper {
     ($name:ident, $op:ident) => {
         fn $name(
@@ -80,19 +143,23 @@ impl<'a> Lowerer<'a> {
         let q = self.and_lit(expressions, &mut emits, k, block_elems - 1);
         let base =
             self.quantized_block_base(expressions, matrix, block, col, block_words, &mut emits);
-        let value = match matrix.format {
-            GgmlQuantFormat::Q4_0 => self.dequant_q4_0(expressions, matrix, base, q, &mut emits)?,
-            GgmlQuantFormat::Q4_1 => self.dequant_q4_1(expressions, matrix, base, q, &mut emits)?,
-            GgmlQuantFormat::Q5_0 => self.dequant_q5_0(expressions, matrix, base, q, &mut emits)?,
-            GgmlQuantFormat::Q5_1 => self.dequant_q5_1(expressions, matrix, base, q, &mut emits)?,
-            GgmlQuantFormat::Q8_0 => self.dequant_q8_0(expressions, matrix, base, q, &mut emits)?,
-            GgmlQuantFormat::Q8_1 => self.dequant_q8_1(expressions, matrix, base, q, &mut emits)?,
-            GgmlQuantFormat::Q2K => self.dequant_q2k(expressions, matrix, base, q, &mut emits)?,
-            GgmlQuantFormat::Q3K => self.dequant_q3k(expressions, matrix, base, q, &mut emits)?,
-            GgmlQuantFormat::Q4K => self.dequant_q4k(expressions, matrix, base, q, &mut emits)?,
-            GgmlQuantFormat::Q5K => self.dequant_q5k(expressions, matrix, base, q, &mut emits)?,
-            GgmlQuantFormat::Q6K => self.dequant_q6k(expressions, matrix, base, q, &mut emits)?,
-            GgmlQuantFormat::Q8K => self.dequant_q8k(expressions, matrix, base, q, &mut emits)?,
+        let value = if let Some(spec) = AffineDequantSpec::for_format(matrix.format) {
+            self.dequant_affine(expressions, matrix, base, q, spec, &mut emits)?
+        } else {
+            match matrix.format {
+                GgmlQuantFormat::Q2K => self.dequant_q2k(expressions, matrix, base, q, &mut emits)?,
+                GgmlQuantFormat::Q3K => self.dequant_q3k(expressions, matrix, base, q, &mut emits)?,
+                GgmlQuantFormat::Q4K => self.dequant_q4k(expressions, matrix, base, q, &mut emits)?,
+                GgmlQuantFormat::Q5K => self.dequant_q5k(expressions, matrix, base, q, &mut emits)?,
+                GgmlQuantFormat::Q6K => self.dequant_q6k(expressions, matrix, base, q, &mut emits)?,
+                GgmlQuantFormat::Q8K => self.dequant_q8k(expressions, matrix, base, q, &mut emits)?,
+                GgmlQuantFormat::Q4_0
+                | GgmlQuantFormat::Q4_1
+                | GgmlQuantFormat::Q5_0
+                | GgmlQuantFormat::Q5_1
+                | GgmlQuantFormat::Q8_0
+                | GgmlQuantFormat::Q8_1 => unreachable!("legacy formats handled above"),
+            }
         };
         Ok((value, emits))
     }
@@ -1552,85 +1619,59 @@ impl<'a> Lowerer<'a> {
         Ok((parts.scale, packs))
     }
 
-    fn dequant_q4_0(
+    fn dequant_affine(
         &self,
         e: &mut Arena<Expression>,
         matrix: &QuantizedMatrix,
         base: Handle<Expression>,
         q: Handle<Expression>,
+        spec: AffineDequantSpec,
         emits: &mut Vec<Range<Expression>>,
     ) -> Result<Handle<Expression>, LowerError> {
-        let scale_word = self.load_word(e, matrix, base, 0, emits)?;
-        let scale = self.bitcast_f32(e, emits, scale_word);
-        let quant = self.q4_block_nibble(e, matrix, base, q, 1, emits)?;
-        let quant_f = self.as_f32(e, emits, quant);
-        let center = self.f32(e, 8.0);
-        let centered = self.sub(e, emits, quant_f, center);
-        Ok(self.mul(e, emits, centered, scale))
+        match spec {
+            AffineDequantSpec::Q8 { data_offset } => {
+                self.dequant_q8_scaled(e, matrix, base, q, data_offset, emits)
+            }
+            AffineDequantSpec::Centered { nibble, center } => {
+                let scale_word = self.load_word(e, matrix, base, 0, emits)?;
+                let scale = self.bitcast_f32(e, emits, scale_word);
+                let quant = self.affine_nibble(e, matrix, base, q, nibble, emits)?;
+                let quant_f = self.as_f32(e, emits, quant);
+                let center = self.f32(e, center);
+                let centered = self.sub(e, emits, quant_f, center);
+                Ok(self.mul(e, emits, centered, scale))
+            }
+            AffineDequantSpec::ScaleMin { nibble } => {
+                let scale_word = self.load_word(e, matrix, base, 0, emits)?;
+                let scale = self.bitcast_f32(e, emits, scale_word);
+                let min_word = self.load_word(e, matrix, base, 1, emits)?;
+                let min = self.bitcast_f32(e, emits, min_word);
+                let quant = self.affine_nibble(e, matrix, base, q, nibble, emits)?;
+                let quant_f = self.as_f32(e, emits, quant);
+                let scaled = self.mul(e, emits, quant_f, scale);
+                Ok(self.bin(e, emits, BinaryOperator::Add, scaled, min))
+            }
+        }
     }
 
-    fn dequant_q5_0(
+    fn affine_nibble(
         &self,
         e: &mut Arena<Expression>,
         matrix: &QuantizedMatrix,
         base: Handle<Expression>,
         q: Handle<Expression>,
+        nibble: AffineNibble,
         emits: &mut Vec<Range<Expression>>,
     ) -> Result<Handle<Expression>, LowerError> {
-        let scale_word = self.load_word(e, matrix, base, 0, emits)?;
-        let scale = self.bitcast_f32(e, emits, scale_word);
-        let quant = self.q5_block_nibble(e, matrix, base, q, 1, 2, emits)?;
-        let quant_f = self.as_f32(e, emits, quant);
-        let center = self.f32(e, 16.0);
-        let centered = self.sub(e, emits, quant_f, center);
-        Ok(self.mul(e, emits, centered, scale))
-    }
-
-    fn dequant_q8_0(
-        &self,
-        e: &mut Arena<Expression>,
-        matrix: &QuantizedMatrix,
-        base: Handle<Expression>,
-        q: Handle<Expression>,
-        emits: &mut Vec<Range<Expression>>,
-    ) -> Result<Handle<Expression>, LowerError> {
-        self.dequant_q8_scaled(e, matrix, base, q, 1, emits)
-    }
-
-    fn dequant_q4_1(
-        &self,
-        e: &mut Arena<Expression>,
-        matrix: &QuantizedMatrix,
-        base: Handle<Expression>,
-        q: Handle<Expression>,
-        emits: &mut Vec<Range<Expression>>,
-    ) -> Result<Handle<Expression>, LowerError> {
-        let scale_word = self.load_word(e, matrix, base, 0, emits)?;
-        let scale = self.bitcast_f32(e, emits, scale_word);
-        let min_word = self.load_word(e, matrix, base, 1, emits)?;
-        let min = self.bitcast_f32(e, emits, min_word);
-        let quant = self.q4_block_nibble(e, matrix, base, q, 2, emits)?;
-        let quant_f = self.as_f32(e, emits, quant);
-        let scaled = self.mul(e, emits, quant_f, scale);
-        Ok(self.bin(e, emits, BinaryOperator::Add, scaled, min))
-    }
-
-    fn dequant_q5_1(
-        &self,
-        e: &mut Arena<Expression>,
-        matrix: &QuantizedMatrix,
-        base: Handle<Expression>,
-        q: Handle<Expression>,
-        emits: &mut Vec<Range<Expression>>,
-    ) -> Result<Handle<Expression>, LowerError> {
-        let scale_word = self.load_word(e, matrix, base, 0, emits)?;
-        let scale = self.bitcast_f32(e, emits, scale_word);
-        let min_word = self.load_word(e, matrix, base, 1, emits)?;
-        let min = self.bitcast_f32(e, emits, min_word);
-        let quant = self.q5_block_nibble(e, matrix, base, q, 2, 3, emits)?;
-        let quant_f = self.as_f32(e, emits, quant);
-        let scaled = self.mul(e, emits, quant_f, scale);
-        Ok(self.bin(e, emits, BinaryOperator::Add, scaled, min))
+        match nibble {
+            AffineNibble::Q4 { data_offset } => {
+                self.q4_block_nibble(e, matrix, base, q, data_offset, emits)
+            }
+            AffineNibble::Q5 {
+                high_offset,
+                data_offset,
+            } => self.q5_block_nibble(e, matrix, base, q, high_offset, data_offset, emits),
+        }
     }
 
     fn q4_block_nibble(
@@ -1681,17 +1722,6 @@ impl<'a> Lowerer<'a> {
         let hi_bit_low = self.and_lit(e, emits, shifted_qh, 1);
         let hi_bit = self.shl_lit(e, emits, hi_bit_low, 4);
         Ok(self.bin(e, emits, BinaryOperator::InclusiveOr, low4, hi_bit))
-    }
-
-    fn dequant_q8_1(
-        &self,
-        e: &mut Arena<Expression>,
-        matrix: &QuantizedMatrix,
-        base: Handle<Expression>,
-        q: Handle<Expression>,
-        emits: &mut Vec<Range<Expression>>,
-    ) -> Result<Handle<Expression>, LowerError> {
-        self.dequant_q8_scaled(e, matrix, base, q, 2, emits)
     }
 
     fn dequant_q2k(

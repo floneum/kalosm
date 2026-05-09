@@ -6,6 +6,7 @@
 //! are expressed by composing tile program expressions.
 
 mod ir;
+pub mod kernel_builder;
 pub mod kernels;
 mod lower;
 pub mod quantized;
@@ -20,6 +21,7 @@ pub use ir::{
     TileOrigin, TileProgramOp, TileQuantizedLoadExpr, TileReduceOp, TileRef, TileScalarExpr,
     TileStmt, TileUnaryOp, TileVec4LoadExpr, WorkgroupAxis, WorkgroupOffset, F16, F32, U32,
 };
+pub use kernel_builder::{KernelBuilder, KernelTensorRef};
 pub use kernels::{
     FlashAttentionDims, FlashAttentionMeta, FlashDecodeSmallMeta, MergeTopKMeta, Mirostat2Meta,
     RmsNormVec4Meta, TensorMeta, TopKChunkMeta, TopKExactnessMeta,

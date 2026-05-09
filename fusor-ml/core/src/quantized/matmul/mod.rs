@@ -657,10 +657,6 @@ fn qmatmul_direct_kernel_from_ir(
     ))
 }
 
-fn ceil_div_u32(x: u32, divisor: u32) -> u32 {
-    x.div_ceil(divisor)
-}
-
 fn split_workgroups_2d(
     total_workgroups: u32,
     max_workgroups_per_dimension: u32,
@@ -671,7 +667,7 @@ fn split_workgroups_2d(
 
     let max_workgroups_per_dimension = max_workgroups_per_dimension.max(1);
     let x = total_workgroups.min(max_workgroups_per_dimension);
-    let y = ceil_div_u32(total_workgroups, x);
+    let y = total_workgroups.div_ceil(x);
     (y <= max_workgroups_per_dimension).then_some([x, y])
 }
 
@@ -944,39 +940,43 @@ enum Q4KPairedTile {
     X2x4,
 }
 
+/// Tuning table: `(variant, env-var name, cols_per_workgroup)`. Drives both
+/// `from_env` lookup and the `name`/`cols_per_workgroup` accessors so adding
+/// a tile only requires one row.
+const Q4K_PAIRED_TILES: &[(Q4KPairedTile, &str, u32)] = &[
+    (Q4KPairedTile::X4x1, "4x1", 4),
+    (Q4KPairedTile::X2x2, "2x2", 4),
+    (Q4KPairedTile::X2x4, "2x4", 8),
+    (Q4KPairedTile::X8x1, "8x1", 8),
+    (Q4KPairedTile::X4x4, "4x4", 16),
+    (Q4KPairedTile::X8x2, "8x2", 16),
+];
+
 impl Q4KPairedTile {
     fn from_env() -> Self {
         let tile_choice = std::env::var("FUSOR_Q4K_PAIRED_TILE")
             .or_else(|_| std::env::var("FUSOR_Q4K_SWIGLU_TILE"))
             .unwrap_or_default();
-        match tile_choice.as_str() {
-            "4x1" => Self::X4x1,
-            "4x4" => Self::X4x4,
-            "8x1" => Self::X8x1,
-            "8x2" => Self::X8x2,
-            "2x2" => Self::X2x2,
-            "2x4" => Self::X2x4,
-            _ => Self::X8x2,
-        }
+        Q4K_PAIRED_TILES
+            .iter()
+            .find(|(_, name, _)| *name == tile_choice)
+            .map(|(tile, _, _)| *tile)
+            .unwrap_or(Self::X8x2)
     }
 
-    const fn name(self) -> &'static str {
-        match self {
-            Self::X4x1 => "4x1",
-            Self::X4x4 => "4x4",
-            Self::X8x1 => "8x1",
-            Self::X8x2 => "8x2",
-            Self::X2x2 => "2x2",
-            Self::X2x4 => "2x4",
-        }
+    fn spec(self) -> &'static (Self, &'static str, u32) {
+        Q4K_PAIRED_TILES
+            .iter()
+            .find(|(tile, _, _)| *tile == self)
+            .expect("Q4KPairedTile variant must appear in Q4K_PAIRED_TILES")
     }
 
-    const fn cols_per_workgroup(self) -> u32 {
-        match self {
-            Self::X4x1 | Self::X2x2 => 4,
-            Self::X2x4 | Self::X8x1 => 8,
-            Self::X4x4 | Self::X8x2 => 16,
-        }
+    fn name(self) -> &'static str {
+        self.spec().1
+    }
+
+    fn cols_per_workgroup(self) -> u32 {
+        self.spec().2
     }
 
     fn emit(
@@ -1124,12 +1124,12 @@ impl Operation for QMatMulPairedOperation {
     }
 
     fn name(&self) -> String {
-        let act = match self.activation {
-            tile_ir::PairedActivation::SwiGLU => "swiglu",
-            tile_ir::PairedActivation::GeGLU => "geglu",
-            tile_ir::PairedActivation::ReGLU => "reglu",
-        };
-        qmatmul_operation_name(act, self.input_datatype, &self.in_shape, &self.matrix)
+        qmatmul_operation_name(
+            self.activation.label(),
+            self.input_datatype,
+            &self.in_shape,
+            &self.matrix,
+        )
     }
 }
 

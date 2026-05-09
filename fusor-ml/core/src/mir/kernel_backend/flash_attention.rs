@@ -1,7 +1,4 @@
-use std::{
-    hash::{Hash, Hasher},
-    sync::OnceLock,
-};
+use std::{hash::Hash, sync::OnceLock};
 
 use fusor_tile_ir as tile_ir;
 
@@ -12,7 +9,7 @@ use crate::{
         Axis, DimConstraint, KernelDeviceCaps, KernelShape, ShapeRule, ShapeSelector, eq, range,
     },
     mir::{
-        direct_kernel::{DirectKernel, DirectKernelBinding},
+        direct_kernel::DirectKernel,
         inputs::MirValue,
         kernel_backend,
         operation::Operation,
@@ -20,7 +17,6 @@ use crate::{
     },
     tensor::TensorData,
 };
-use rustc_hash::FxHasher;
 
 const BLOCK: usize = 256;
 const SIMD_WIDTH: usize = 32;
@@ -50,35 +46,32 @@ fn flash_attention_module_key(
     mask: Option<&TensorData>,
     output: &TensorData,
 ) -> [u64; 2] {
-    std::array::from_fn(|salt| {
-        let mut hasher = FxHasher::default();
-        (salt as u64).hash(&mut hasher);
-        variant.hash(&mut hasher);
-        dims.batch.hash(&mut hasher);
-        dims.num_heads.hash(&mut hasher);
-        dims.num_kv_heads.hash(&mut hasher);
-        dims.q_seq_len.hash(&mut hasher);
-        dims.kv_seq_len.hash(&mut hasher);
-        dims.head_dim.hash(&mut hasher);
-        decode_block.hash(&mut hasher);
-        decode_tiled.hash(&mut hasher);
-        scale_bits.hash(&mut hasher);
-        dispatch_size.hash(&mut hasher);
-        (input_dtype as u32).hash(&mut hasher);
+    kernel_backend::module_key_from(|hasher| {
+        variant.hash(hasher);
+        dims.batch.hash(hasher);
+        dims.num_heads.hash(hasher);
+        dims.num_kv_heads.hash(hasher);
+        dims.q_seq_len.hash(hasher);
+        dims.kv_seq_len.hash(hasher);
+        dims.head_dim.hash(hasher);
+        decode_block.hash(hasher);
+        decode_tiled.hash(hasher);
+        scale_bits.hash(hasher);
+        dispatch_size.hash(hasher);
+        (input_dtype as u32).hash(hasher);
         if variant == FlashAttentionKernelVariant::DecodeSmall {
-            kernel_backend::hash_strided_layout(&mut hasher, q.layout());
-            kernel_backend::hash_strided_layout(&mut hasher, k.layout());
-            kernel_backend::hash_strided_layout(&mut hasher, v.layout());
-            kernel_backend::hash_strided_layout(&mut hasher, output.layout());
+            kernel_backend::hash_strided_layout(hasher, q.layout());
+            kernel_backend::hash_strided_layout(hasher, k.layout());
+            kernel_backend::hash_strided_layout(hasher, v.layout());
+            kernel_backend::hash_strided_layout(hasher, output.layout());
         } else {
-            kernel_backend::hash_layout(&mut hasher, q.layout());
-            kernel_backend::hash_layout(&mut hasher, k.layout());
-            kernel_backend::hash_layout(&mut hasher, v.layout());
-            mask.map(|mask| kernel_backend::hash_layout(&mut hasher, mask.layout()))
-                .hash(&mut hasher);
-            kernel_backend::hash_layout(&mut hasher, output.layout());
+            kernel_backend::hash_layout(hasher, q.layout());
+            kernel_backend::hash_layout(hasher, k.layout());
+            kernel_backend::hash_layout(hasher, v.layout());
+            mask.map(|mask| kernel_backend::hash_layout(hasher, mask.layout()))
+                .hash(hasher);
+            kernel_backend::hash_layout(hasher, output.layout());
         }
-        hasher.finish()
     })
 }
 
@@ -509,103 +502,71 @@ impl Operation for FlashAttentionOperation {
             FlashAttentionKernelVariant::Streaming => "flash_attention",
             FlashAttentionKernelVariant::DecodeSmall => "flash_attention_decode",
         };
-        let cache_key = format!(
-            "{kernel_label}:{:016x}{:016x}",
-            module_key[0], module_key[1]
-        );
-        let module = kernel_backend::cached_hashed_kernel_module(
+
+        let _ = output_index; // Bindings are derived from the kernel IR.
+        let layout = tile_ir::kernels::linear_storage_layout();
+        let q_buffer = q.buffer().clone();
+        let k_buffer = k.buffer().clone();
+        let v_buffer = v.buffer().clone();
+        let mask_buffer = mask.as_ref().map(|m| m.buffer().clone());
+        let output_buffer = output.buffer().clone();
+        let scale = self.scale;
+        let q_tile_meta = q_meta.tile.clone();
+        let k_tile_meta = k_meta.tile.clone();
+        let v_tile_meta = v_meta.tile.clone();
+        let mask_tile_meta = mask_meta.clone().map(|meta| meta.tile);
+        let output_tile_meta = output_meta.tile.clone();
+
+        let device_for_closure = device.clone();
+        kernel_backend::run_kernel_with_hashed_cache(
+            &device,
             flash_attention_module_cache(),
-            module_key,
-            || {
-                let verbose_cache_key = format!(
-                    "{}:backend-lowered:block={BLOCK}:simd={SIMD_WIDTH}:outputs={OUTPUTS_PER_WORKGROUP}:dispatch={dispatch_size:?}:scale={:?}:q={:?}:k={:?}:v={:?}:mask={:?}:out={:?}",
-                    self.name(),
-                    self.scale.to_bits(),
-                    q.layout(),
-                    k.layout(),
-                    v.layout(),
-                    mask.as_ref().map(|mask| mask.layout()),
-                    output.layout()
-                );
-                kernel_backend::cached_kernel_ir(&device, verbose_cache_key, || {
-                    if let Some(meta) = decode_meta {
-                        tile_ir::kernels::flash_decode_small(meta)
-                    } else {
-                        let stream_meta = tile_ir::FlashAttentionMeta {
-                            dims,
-                            scale: tile_ir::F32Bits::new(self.scale),
-                            q_meta: q_meta.tile.clone(),
-                            k_meta: k_meta.tile.clone(),
-                            v_meta: v_meta.tile.clone(),
-                            mask_meta: mask_meta.clone().map(|meta| meta.tile),
-                            output_meta: output_meta.tile.clone(),
-                            dispatch_size,
-                        };
-                        match input_dtype {
-                            DataTypeEnum::F32 => {
-                                tile_ir::kernels::flash_attention::<tile_ir::F32>(stream_meta)
-                            }
-                            DataTypeEnum::F16 => {
-                                tile_ir::kernels::flash_attention::<tile_ir::F16>(stream_meta)
-                            }
-                            _ => None,
-                        }
-                    }
-                })
-            },
-        )?;
-
-        let mut bindings = vec![
-            DirectKernelBinding::Storage {
-                binding: 0,
-                buffer: q.buffer().clone(),
-                read_only: true,
-            },
-            DirectKernelBinding::Storage {
-                binding: 1,
-                buffer: k.buffer().clone(),
-                read_only: true,
-            },
-            DirectKernelBinding::Storage {
-                binding: 2,
-                buffer: v.buffer().clone(),
-                read_only: true,
-            },
-        ];
-        if let Some(mask) = mask {
-            bindings.push(DirectKernelBinding::Storage {
-                binding: 3,
-                buffer: mask.buffer().clone(),
-                read_only: true,
-            });
-        }
-        bindings.push(DirectKernelBinding::Storage {
-            binding: output_index as u32,
-            buffer: output.buffer().clone(),
-            read_only: false,
-        });
-        if let Some(meta) = decode_meta {
-            let params = [meta.active_kv_len, 0, 0, 0];
-            let params_buffer = device.create_buffer_init(
-                bytemuck::cast_slice(&params),
-                wgpu::BufferUsages::STORAGE
-                    | wgpu::BufferUsages::COPY_DST
-                    | wgpu::BufferUsages::COPY_SRC,
-            );
-            bindings.push(DirectKernelBinding::Storage {
-                binding: 4,
-                buffer: params_buffer,
-                read_only: true,
-            });
-        }
-
-        Some(kernel_backend::dynamic_kernel_from_module(
             kernel_label,
-            cache_key,
-            module,
-            bindings,
+            module_key,
             dispatch_size,
-        ))
+            move |kb| {
+                let q_ref = tile_ir::KernelTensorRef::new(q_buffer, layout.clone());
+                let k_ref = tile_ir::KernelTensorRef::new(k_buffer, layout.clone());
+                let v_ref = tile_ir::KernelTensorRef::new(v_buffer, layout.clone());
+                let mask_ref = mask_buffer
+                    .map(|buf| tile_ir::KernelTensorRef::new(buf, layout.clone()));
+                let output_ref =
+                    tile_ir::KernelTensorRef::new(output_buffer, layout.clone());
+                if let Some(meta) = decode_meta {
+                    let params = [meta.active_kv_len, 0, 0, 0];
+                    let params_buffer = device_for_closure.create_buffer_init(
+                        bytemuck::cast_slice(&params),
+                        wgpu::BufferUsages::STORAGE
+                            | wgpu::BufferUsages::COPY_DST
+                            | wgpu::BufferUsages::COPY_SRC,
+                    );
+                    let params_ref = tile_ir::KernelTensorRef::new(params_buffer, layout);
+                    tile_ir::kernels::flash_decode_small(
+                        kb, q_ref, k_ref, v_ref, output_ref, params_ref, meta,
+                    )
+                } else {
+                    let stream_meta = tile_ir::FlashAttentionMeta {
+                        dims,
+                        scale: tile_ir::F32Bits::new(scale),
+                        q_meta: q_tile_meta,
+                        k_meta: k_tile_meta,
+                        v_meta: v_tile_meta,
+                        mask_meta: mask_tile_meta,
+                        output_meta: output_tile_meta,
+                        dispatch_size,
+                    };
+                    match input_dtype {
+                        DataTypeEnum::F32 => tile_ir::kernels::flash_attention::<tile_ir::F32, _>(
+                            kb, q_ref, k_ref, v_ref, mask_ref, output_ref, stream_meta,
+                        ),
+                        DataTypeEnum::F16 => tile_ir::kernels::flash_attention::<tile_ir::F16, _>(
+                            kb, q_ref, k_ref, v_ref, mask_ref, output_ref, stream_meta,
+                        ),
+                        _ => None,
+                    }
+                }
+            },
+        )
     }
 
     fn output(&self, _nodes: &ComputeGraphInner, inputs: &[MirValue]) -> MirValue {

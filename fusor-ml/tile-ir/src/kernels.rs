@@ -1,6 +1,6 @@
 use crate::{
     tile::{self, Mask, Tile, TileBlock},
-    Bool, ElementType, F32Bits, KernelIr, Layout, MemoryLevel, Numeric, Shape, Strides,
+    Bool, ElementType, F32Bits, Layout, MemoryLevel, Numeric, Shape, Strides,
     TileLiteral, TileReduceOp, TileUnaryOp, WorkgroupAxis, F32, U32,
 };
 
@@ -132,36 +132,36 @@ pub struct Mirostat2Meta {
     pub has_exactness_flag: bool,
 }
 
-pub fn rms_norm_vec4(meta: RmsNormVec4Meta, rows: u32) -> Option<KernelIr> {
+pub fn rms_norm_vec4<B>(
+    kb: &mut crate::kernel_builder::KernelBuilder<B>,
+    input: crate::kernel_builder::KernelTensorRef<B>,
+    residual: Option<crate::kernel_builder::KernelTensorRef<B>>,
+    weight: crate::kernel_builder::KernelTensorRef<B>,
+    bias: Option<crate::kernel_builder::KernelTensorRef<B>>,
+    output: crate::kernel_builder::KernelTensorRef<B>,
+    meta: RmsNormVec4Meta,
+    rows: u32,
+) -> Option<()> {
     if rows == 0 || meta.cols == 0 || meta.cols_vec == 0 {
         return None;
     }
+    if meta.residual_offset_vec.is_some() != residual.is_some()
+        || meta.bias_offset_vec.is_some() != bias.is_some()
+    {
+        return None;
+    }
 
-    let vec_layout = Layout::strided(MemoryLevel::Storage, Shape::new([1]), Strides::new([1]));
     let chunks = meta.cols_vec.div_ceil(RMS_NORM_VEC4_BLOCK as u32);
     let eps = meta.eps.get();
 
-    Some(tile::build(move |phase| {
-        let input = phase.storage_read_with_layout_offset::<crate::F32Vec4, 1>(
-            vec_layout.clone(),
-            meta.input_offset_vec,
-        );
-        let residual = meta.residual_offset_vec.map(|offset| {
-            phase.storage_read_with_layout_offset::<crate::F32Vec4, 1>(vec_layout.clone(), offset)
-        });
-        let weight = phase.storage_read_with_layout_offset::<crate::F32Vec4, 1>(
-            vec_layout.clone(),
-            meta.weight_offset_vec,
-        );
-        let bias = meta.bias_offset_vec.map(|offset| {
-            phase.storage_read_with_layout_offset::<crate::F32Vec4, 1>(vec_layout.clone(), offset)
-        });
-        let output = phase.storage_write_with_layout_offset::<crate::F32Vec4, 1>(
-            vec_layout,
-            meta.output_offset_vec,
-        );
+    let input = kb.read::<crate::F32Vec4, 1>(input);
+    let residual = residual.map(|r| kb.read::<crate::F32Vec4, 1>(r));
+    let weight = kb.read::<crate::F32Vec4, 1>(weight);
+    let bias = bias.map(|b| kb.read::<crate::F32Vec4, 1>(b));
+    let output = kb.write::<crate::F32Vec4, 1>(output);
+    let phase = kb.program();
 
-        phase.program_grid::<RMS_NORM_VEC4_BLOCK>([rows, 1, 1], |program| {
+    phase.program_grid::<RMS_NORM_VEC4_BLOCK>([rows, 1, 1], |program| {
             let row = program.program_id(WorkgroupAxis::X);
             let lane = program.arange();
             let reduce_col = program.loop_index() * RMS_NORM_VEC4_BLOCK as u32 + lane.clone();
@@ -211,10 +211,14 @@ pub fn rms_norm_vec4(meta: RmsNormVec4Meta, rows: u32) -> Option<KernelIr> {
                 program.store_vec4(output.at(output_index), normalized, mask);
             }
         });
-    }))
+    Some(())
 }
 
-fn linear_storage_layout() -> Layout {
+/// The default rank-1 unit-stride layout used by tile-ir's pre-built kernels
+/// for tensors whose offset/stride is encoded in the `Meta` struct itself.
+/// Callers feed this into [`crate::KernelTensorRef`] to attach a runtime
+/// binding.
+pub fn linear_storage_layout() -> Layout {
     Layout::strided(MemoryLevel::Storage, Shape::new([1]), Strides::new([1]))
 }
 
@@ -377,31 +381,15 @@ fn index4_const_last<const BLOCK: usize>(
     index3_with_base(base, [strides[0], strides[1], strides[2]], i0, i1, i2)
 }
 
-fn reduce_workgroup_f32<const BLOCK: usize>(
+/// Tree-reduce a workgroup-scratch array by halving stride, applying
+/// `combine(lhs, rhs)` at each level. The combine closure is the only
+/// difference between sum/max/bitwise-or reductions, which previously each
+/// had their own near-identical loop.
+fn reduce_workgroup<const BLOCK: usize>(
     program: &mut TileBlock<'_, BLOCK>,
     scratch: crate::TileRef,
     lane: tile::Range<BLOCK>,
-    sum: bool,
-) {
-    let mut stride = BLOCK as u32 / 2;
-    while stride > 0 {
-        let participates = program.index(lane.clone()).lt(u32_tile(stride));
-        program.if_then(participates, |program| {
-            let left = program.load_workgroup(scratch, lane.clone());
-            let rhs_index = lane.clone() + stride;
-            let right = program.load_workgroup(scratch, rhs_index);
-            let reduced = if sum { left + right } else { left.max(right) };
-            program.store_workgroup(scratch, lane.clone(), reduced);
-        });
-        program.workgroup_barrier();
-        stride /= 2;
-    }
-}
-
-fn reduce_workgroup_u32_or<const BLOCK: usize>(
-    program: &mut TileBlock<'_, BLOCK>,
-    scratch: crate::TileRef,
-    lane: tile::Range<BLOCK>,
+    combine: impl Fn(Tile<BLOCK>, Tile<BLOCK>) -> Tile<BLOCK>,
 ) {
     let mut stride = BLOCK as u32 / 2;
     while stride > 0 {
@@ -410,14 +398,22 @@ fn reduce_workgroup_u32_or<const BLOCK: usize>(
             let lhs = program.load_workgroup(scratch, lane.clone());
             let rhs_index = lane.clone() + stride;
             let rhs = program.load_workgroup(scratch, rhs_index);
-            program.store_workgroup(scratch, lane.clone(), lhs.bit_or(rhs));
+            program.store_workgroup(scratch, lane.clone(), combine(lhs, rhs));
         });
         program.workgroup_barrier();
         stride /= 2;
     }
 }
 
-pub fn flash_attention<E: Numeric>(meta: FlashAttentionMeta) -> Option<KernelIr> {
+pub fn flash_attention<E: Numeric, B>(
+    kb: &mut crate::kernel_builder::KernelBuilder<B>,
+    q: crate::kernel_builder::KernelTensorRef<B>,
+    k: crate::kernel_builder::KernelTensorRef<B>,
+    v: crate::kernel_builder::KernelTensorRef<B>,
+    mask: Option<crate::kernel_builder::KernelTensorRef<B>>,
+    output: crate::kernel_builder::KernelTensorRef<B>,
+    meta: FlashAttentionMeta,
+) -> Option<()> {
     let q_strides: [u32; 4] = meta.q_meta.strides.as_slice().try_into().ok()?;
     let k_strides: [u32; 4] = meta.k_meta.strides.as_slice().try_into().ok()?;
     let v_strides: [u32; 4] = meta.v_meta.strides.as_slice().try_into().ok()?;
@@ -436,22 +432,21 @@ pub fn flash_attention<E: Numeric>(meta: FlashAttentionMeta) -> Option<KernelIr>
     {
         return None;
     }
+    if meta.mask_meta.is_some() != mask.is_some() {
+        return None;
+    }
     let groups = meta.dims.num_heads.checked_div(meta.dims.num_kv_heads)?;
     if groups == 0 {
         return None;
     }
     let elem_fill = zero_fill::<E>();
-    Some(tile::build(move |phase| {
-        let layout = linear_storage_layout();
-        let q = phase.storage_read_with_layout::<E, 1>(layout.clone());
-        let k = phase.storage_read_with_layout::<E, 1>(layout.clone());
-        let v = phase.storage_read_with_layout::<E, 1>(layout.clone());
-        let mask = meta
-            .mask_meta
-            .as_ref()
-            .map(|_| phase.storage_read_with_layout::<E, 1>(layout.clone()));
-        let output = phase.storage_write_with_layout::<E, 1>(layout);
-
+    let q = kb.read::<E, 1>(q);
+    let k = kb.read::<E, 1>(k);
+    let v = kb.read::<E, 1>(v);
+    let mask = mask.map(|m| kb.read::<E, 1>(m));
+    let output = kb.write::<E, 1>(output);
+    let phase = kb.program();
+    {
         phase.program_grid::<FLASH_BLOCK>(meta.dispatch_size, |program| {
             let lane = program.arange();
             let workgroup_x = program.program_id(WorkgroupAxis::X);
@@ -598,7 +593,8 @@ pub fn flash_attention<E: Numeric>(meta: FlashAttentionMeta) -> Option<KernelIr>
                 program.store_linear(output.at(output_index), output_value, all());
             });
         });
-    }))
+    }
+    Some(())
 }
 
 fn decode_score_for_kv<const BLOCK: usize>(
@@ -695,19 +691,26 @@ fn append_decode_output_loop<const BLOCK: usize>(
     program.store_linear(output.at(output_index), output_value, all());
 }
 
-fn flash_decode_small_block<const BLOCK: usize>(meta: FlashDecodeSmallMeta) -> KernelIr {
-    tile::build(move |phase| {
-        let layout = linear_storage_layout();
-        let q = phase.storage_read_with_layout::<F32, 1>(layout.clone());
-        let k = phase.storage_read_with_layout::<F32, 1>(layout.clone());
-        let v = phase.storage_read_with_layout::<F32, 1>(layout.clone());
-        let output = phase.storage_write_with_layout::<F32, 1>(layout.clone());
-        let params = phase.storage_read_with_layout::<U32, 1>(layout);
-        let scores = phase.alloc_workgroup_array::<F32>(BLOCK as u32);
-        let probs = phase.alloc_workgroup_array::<F32>(BLOCK as u32);
-        let reduce = phase.alloc_workgroup_array::<F32>(BLOCK as u32);
+fn flash_decode_small_block<const BLOCK: usize, B>(
+    kb: &mut crate::kernel_builder::KernelBuilder<B>,
+    q: crate::kernel_builder::KernelTensorRef<B>,
+    k: crate::kernel_builder::KernelTensorRef<B>,
+    v: crate::kernel_builder::KernelTensorRef<B>,
+    output: crate::kernel_builder::KernelTensorRef<B>,
+    params: crate::kernel_builder::KernelTensorRef<B>,
+    meta: FlashDecodeSmallMeta,
+) {
+    let q = kb.read::<F32, 1>(q);
+    let k = kb.read::<F32, 1>(k);
+    let v = kb.read::<F32, 1>(v);
+    let output = kb.write::<F32, 1>(output);
+    let params = kb.read::<U32, 1>(params);
+    let phase = kb.program();
+    let scores = phase.alloc_workgroup_array::<F32>(BLOCK as u32);
+    let probs = phase.alloc_workgroup_array::<F32>(BLOCK as u32);
+    let reduce = phase.alloc_workgroup_array::<F32>(BLOCK as u32);
 
-        phase.program_grid::<BLOCK>([meta.dims.batch * meta.dims.num_heads, 1, 1], |program| {
+    phase.program_grid::<BLOCK>([meta.dims.batch * meta.dims.num_heads, 1, 1], |program| {
             let lane = program.arange();
             let row = program.program_id(WorkgroupAxis::X);
             let active_kv_len =
@@ -748,7 +751,7 @@ fn flash_decode_small_block<const BLOCK: usize>(meta: FlashDecodeSmallMeta) -> K
                     program.store_local(&kv_local, kv + u32_tile(BLOCK as u32));
                 });
                 program.workgroup_barrier();
-                reduce_workgroup_f32(program, reduce, lane.clone(), false);
+                reduce_workgroup(program, reduce, lane.clone(), |lhs, rhs| lhs.max(rhs));
                 let max_score = program.load_workgroup(reduce, 0);
                 program.store_local(&max_score_local, max_score);
                 let max_score = program.load_local(&max_score_local);
@@ -778,7 +781,7 @@ fn flash_decode_small_block<const BLOCK: usize>(meta: FlashDecodeSmallMeta) -> K
                     program.store_local(&kv_local, kv + u32_tile(BLOCK as u32));
                 });
                 program.workgroup_barrier();
-                reduce_workgroup_f32(program, reduce, lane.clone(), true);
+                reduce_workgroup(program, reduce, lane.clone(), |lhs, rhs| lhs + rhs);
                 let denom = program.load_workgroup(reduce, 0);
 
                 program.store_local(&acc, f32_tile(0.0));
@@ -882,7 +885,7 @@ fn flash_decode_small_block<const BLOCK: usize>(meta: FlashDecodeSmallMeta) -> K
                 program.store_workgroup(reduce, lane.clone(), score);
             });
             program.workgroup_barrier();
-            reduce_workgroup_f32(program, reduce, lane.clone(), false);
+            reduce_workgroup(program, reduce, lane.clone(), |lhs, rhs| lhs.max(rhs));
             let max_score = program.load_workgroup(reduce, 0);
             let score_value = program.load_workgroup(scores, lane.clone());
             let raw_prob = (score_value - max_score).exp();
@@ -890,7 +893,7 @@ fn flash_decode_small_block<const BLOCK: usize>(meta: FlashDecodeSmallMeta) -> K
             program.store_workgroup(probs, lane.clone(), prob.clone());
             program.store_workgroup(reduce, lane.clone(), prob);
             program.workgroup_barrier();
-            reduce_workgroup_f32(program, reduce, lane.clone(), true);
+            reduce_workgroup(program, reduce, lane.clone(), |lhs, rhs| lhs + rhs);
             let denom = program.load_workgroup(reduce, 0);
             program.if_then(kv_valid, |program| {
                 let prob = program.load_workgroup(probs, lane.clone()) / denom.clone();
@@ -918,42 +921,62 @@ fn flash_decode_small_block<const BLOCK: usize>(meta: FlashDecodeSmallMeta) -> K
                 );
             });
         });
-    })
 }
 
-pub fn flash_decode_small(meta: FlashDecodeSmallMeta) -> Option<KernelIr> {
+pub fn flash_decode_small<B>(
+    kb: &mut crate::kernel_builder::KernelBuilder<B>,
+    q: crate::kernel_builder::KernelTensorRef<B>,
+    k: crate::kernel_builder::KernelTensorRef<B>,
+    v: crate::kernel_builder::KernelTensorRef<B>,
+    output: crate::kernel_builder::KernelTensorRef<B>,
+    params: crate::kernel_builder::KernelTensorRef<B>,
+    meta: FlashDecodeSmallMeta,
+) -> Option<()> {
     if meta.dims.head_dim != DECODE_HEAD_DIM || meta.decode_block == 0 || meta.groups == 0 {
         return None;
     }
     match meta.decode_block {
-        128 => Some(flash_decode_small_block::<128>(meta)),
-        512 => Some(flash_decode_small_block::<512>(meta)),
-        1024 => Some(flash_decode_small_block::<1024>(meta)),
-        _ => None,
+        128 => flash_decode_small_block::<128, B>(kb, q, k, v, output, params, meta),
+        512 => flash_decode_small_block::<512, B>(kb, q, k, v, output, params, meta),
+        1024 => flash_decode_small_block::<1024, B>(kb, q, k, v, output, params, meta),
+        _ => return None,
     }
+    Some(())
 }
 
-pub fn top_k_chunk(meta: TopKChunkMeta) -> Option<KernelIr> {
+pub fn top_k_chunk<B>(
+    kb: &mut crate::kernel_builder::KernelBuilder<B>,
+    input: crate::kernel_builder::KernelTensorRef<B>,
+    output_ids: crate::kernel_builder::KernelTensorRef<B>,
+    output_values: crate::kernel_builder::KernelTensorRef<B>,
+    processors: Option<(
+        crate::kernel_builder::KernelTensorRef<B>,
+        crate::kernel_builder::KernelTensorRef<B>,
+    )>,
+    meta: TopKChunkMeta,
+) -> Option<()> {
     if meta.input_len == 0 || meta.output_per_chunk == 0 {
         return None;
     }
+    if meta.processors != processors.is_some() {
+        return None;
+    }
 
-    Some(tile::build(move |phase| {
-        let layout = linear_storage_layout();
-        let input = phase.storage_read_with_layout::<F32, 1>(layout.clone());
-        let output_ids = phase.storage_write_with_layout::<U32, 1>(layout.clone());
-        let output_values = phase.storage_write_with_layout::<F32, 1>(layout.clone());
-        let processors = meta.processors.then(|| {
-            (
-                phase.storage_read_with_layout::<U32, 1>(layout.clone()),
-                phase.storage_read_with_layout::<U32, 1>(layout),
-            )
-        });
-        let scratch_values = phase.alloc_workgroup_array::<F32>(TOP_K_BLOCK as u32);
-        let scratch_ids = phase.alloc_workgroup_array::<U32>(TOP_K_BLOCK as u32);
-        let chunks = meta.input_len.div_ceil(TOP_K_CHUNK);
+    let input = kb.read::<F32, 1>(input);
+    let output_ids = kb.write::<U32, 1>(output_ids);
+    let output_values = kb.write::<F32, 1>(output_values);
+    let processors = processors.map(|(prev, params)| {
+        (
+            kb.read::<U32, 1>(prev),
+            kb.read::<U32, 1>(params),
+        )
+    });
+    let phase = kb.program();
+    let scratch_values = phase.alloc_workgroup_array::<F32>(TOP_K_BLOCK as u32);
+    let scratch_ids = phase.alloc_workgroup_array::<U32>(TOP_K_BLOCK as u32);
+    let chunks = meta.input_len.div_ceil(TOP_K_CHUNK);
 
-        phase.program_grid::<TOP_K_BLOCK>([chunks, 1, 1], |program| {
+    phase.program_grid::<TOP_K_BLOCK>([chunks, 1, 1], |program| {
             let lane = program.arange();
             let chunk = program.program_id(WorkgroupAxis::X);
             let current_value = program.private::<F32>();
@@ -1139,22 +1162,27 @@ pub fn top_k_chunk(meta: TopKChunkMeta) -> Option<KernelIr> {
             );
             program.store_linear(output_ids.at(output_index), selected_id, writes_output);
         });
-    }))
+    Some(())
 }
 
-pub fn top_k_exactness(meta: TopKExactnessMeta) -> Option<KernelIr> {
+pub fn top_k_exactness<B>(
+    kb: &mut crate::kernel_builder::KernelBuilder<B>,
+    top_values: crate::kernel_builder::KernelTensorRef<B>,
+    chunk_values: crate::kernel_builder::KernelTensorRef<B>,
+    flag: crate::kernel_builder::KernelTensorRef<B>,
+    meta: TopKExactnessMeta,
+) -> Option<()> {
     if meta.top_k == 0 || meta.candidate_count >= meta.output_per_chunk {
         return None;
     }
 
-    Some(tile::build(move |phase| {
-        let layout = linear_storage_layout();
-        let top_values = phase.storage_read_with_layout::<F32, 1>(layout.clone());
-        let chunk_values = phase.storage_read_with_layout::<F32, 1>(layout.clone());
-        let flag = phase.storage_write_with_layout::<U32, 1>(layout);
-        let scratch = phase.alloc_workgroup_array::<U32>(TOP_K_BLOCK as u32);
+    let top_values = kb.read::<F32, 1>(top_values);
+    let chunk_values = kb.read::<F32, 1>(chunk_values);
+    let flag = kb.write::<U32, 1>(flag);
+    let phase = kb.program();
+    let scratch = phase.alloc_workgroup_array::<U32>(TOP_K_BLOCK as u32);
 
-        phase.program_grid::<TOP_K_BLOCK>([1, 1, 1], |program| {
+    phase.program_grid::<TOP_K_BLOCK>([1, 1, 1], |program| {
             let lane = program.arange();
             let chunk = program.private::<U32>();
             let inexact = program.private::<U32>();
@@ -1214,7 +1242,7 @@ pub fn top_k_exactness(meta: TopKExactnessMeta) -> Option<KernelIr> {
             program.store_workgroup(scratch, lane.clone(), inexact_value);
             program.workgroup_barrier();
 
-            reduce_workgroup_u32_or(program, scratch, lane.clone());
+            reduce_workgroup(program, scratch, lane.clone(), |lhs, rhs| lhs.bit_or(rhs));
 
             let lane_zero = program.index(lane.clone()).eq(u32_tile(0));
             program.if_then(lane_zero, |program| {
@@ -1227,26 +1255,32 @@ pub fn top_k_exactness(meta: TopKExactnessMeta) -> Option<KernelIr> {
                 );
             });
         });
-    }))
+    Some(())
 }
 
-pub fn top_k_merge(meta: MergeTopKMeta) -> Option<KernelIr> {
+pub fn top_k_merge<B>(
+    kb: &mut crate::kernel_builder::KernelBuilder<B>,
+    input_ids: crate::kernel_builder::KernelTensorRef<B>,
+    input_values: crate::kernel_builder::KernelTensorRef<B>,
+    output_ids: crate::kernel_builder::KernelTensorRef<B>,
+    output_values: crate::kernel_builder::KernelTensorRef<B>,
+    meta: MergeTopKMeta,
+) -> Option<()> {
     if meta.chunks == 0 || meta.chunk_len == 0 || meta.k == 0 {
         return None;
     }
 
-    Some(tile::build(move |phase| {
-        let layout = linear_storage_layout();
-        let input_ids = phase.storage_read_with_layout::<U32, 1>(layout.clone());
-        let input_values = phase.storage_read_with_layout::<F32, 1>(layout.clone());
-        let output_ids = phase.storage_write_with_layout::<U32, 1>(layout.clone());
-        let output_values = phase.storage_write_with_layout::<F32, 1>(layout);
-        let chunk_positions = phase.alloc_workgroup_array::<U32>(meta.chunks);
-        let scratch_values = phase.alloc_workgroup_array::<F32>(TOP_K_BLOCK as u32);
-        let scratch_ids = phase.alloc_workgroup_array::<U32>(TOP_K_BLOCK as u32);
-        let scratch_chunks = phase.alloc_workgroup_array::<U32>(TOP_K_BLOCK as u32);
+    let input_ids = kb.read::<U32, 1>(input_ids);
+    let input_values = kb.read::<F32, 1>(input_values);
+    let output_ids = kb.write::<U32, 1>(output_ids);
+    let output_values = kb.write::<F32, 1>(output_values);
+    let phase = kb.program();
+    let chunk_positions = phase.alloc_workgroup_array::<U32>(meta.chunks);
+    let scratch_values = phase.alloc_workgroup_array::<F32>(TOP_K_BLOCK as u32);
+    let scratch_ids = phase.alloc_workgroup_array::<U32>(TOP_K_BLOCK as u32);
+    let scratch_chunks = phase.alloc_workgroup_array::<U32>(TOP_K_BLOCK as u32);
 
-        phase.program_grid::<TOP_K_BLOCK>([1, 1, 1], |program| {
+    phase.program_grid::<TOP_K_BLOCK>([1, 1, 1], |program| {
             let lane = program.arange();
             let rank = program.private::<U32>();
             let scan_chunk = program.private::<U32>();
@@ -1401,27 +1435,36 @@ pub fn top_k_merge(meta: MergeTopKMeta) -> Option<KernelIr> {
                 program.store_local(&rank, rank_value + u32_tile(1));
             });
         });
-    }))
+    Some(())
 }
 
-pub fn mirostat2(meta: Mirostat2Meta) -> Option<KernelIr> {
+pub fn mirostat2<B>(
+    kb: &mut crate::kernel_builder::KernelBuilder<B>,
+    ids: crate::kernel_builder::KernelTensorRef<B>,
+    values: crate::kernel_builder::KernelTensorRef<B>,
+    state: crate::kernel_builder::KernelTensorRef<B>,
+    params: crate::kernel_builder::KernelTensorRef<B>,
+    output: crate::kernel_builder::KernelTensorRef<B>,
+    exactness_flag: Option<crate::kernel_builder::KernelTensorRef<B>>,
+    meta: Mirostat2Meta,
+) -> Option<()> {
     if meta.top_k == 0 {
         return None;
     }
+    if meta.has_exactness_flag != exactness_flag.is_some() {
+        return None;
+    }
 
-    Some(tile::build(move |phase| {
-        let layout = linear_storage_layout();
-        let ids = phase.storage_read_with_layout::<U32, 1>(layout.clone());
-        let values = phase.storage_read_with_layout::<F32, 1>(layout.clone());
-        let state = phase.storage_write_with_layout::<F32, 1>(layout.clone());
-        let params = phase.storage_read_with_layout::<F32, 1>(layout.clone());
-        let output = phase.storage_write_with_layout::<U32, 1>(layout.clone());
-        let exactness_flag = meta
-            .has_exactness_flag
-            .then(|| phase.storage_read_with_layout::<U32, 1>(layout));
-        let scratch = phase.alloc_workgroup_array::<F32>(TOP_K_BLOCK as u32);
+    let ids = kb.read::<U32, 1>(ids);
+    let values = kb.read::<F32, 1>(values);
+    let state = kb.write::<F32, 1>(state);
+    let params = kb.read::<F32, 1>(params);
+    let output = kb.write::<U32, 1>(output);
+    let exactness_flag = exactness_flag.map(|tensor| kb.read::<U32, 1>(tensor));
+    let phase = kb.program();
+    let scratch = phase.alloc_workgroup_array::<F32>(TOP_K_BLOCK as u32);
 
-        phase.program_grid::<TOP_K_BLOCK>([1, 1, 1], |program| {
+    phase.program_grid::<TOP_K_BLOCK>([1, 1, 1], |program| {
             let lane = program.arange();
             let index = program.private::<U32>();
             let local_sum = program.private::<F32>();
@@ -1636,5 +1679,5 @@ pub fn mirostat2(meta: Mirostat2Meta) -> Option<KernelIr> {
                 },
             );
         });
-    }))
+    Some(())
 }

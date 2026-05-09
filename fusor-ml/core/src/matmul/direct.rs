@@ -58,30 +58,9 @@ pub(crate) fn build_serial_matmul_direct_kernel(
         output.datatype(),
         output.layout()
     );
-    kernel_backend::dynamic_kernel_from_ir(
-        &graph.device(),
-        operation.name(),
-        cache_key,
-        || build_matmul_tile_ir(operation, &input_a, &input_b, &output, dispatch_size),
-        vec![
-            kernel_backend::storage_binding(0, &input_a, true),
-            kernel_backend::storage_binding(1, &input_b, true),
-            kernel_backend::storage_binding(2, &output, false),
-        ],
-        dispatch_size,
-    )
-}
-
-fn build_matmul_tile_ir(
-    operation: &MatMulOperation,
-    input_a: &TensorData,
-    input_b: &TensorData,
-    output: &TensorData,
-    dispatch_size: [u32; 3],
-) -> Option<tile_ir::KernelIr> {
-    let a_meta = TensorMeta::new(input_a)?;
-    let b_meta = TensorMeta::new(input_b)?;
-    let y_meta = TensorMeta::new(output)?;
+    let a_meta = TensorMeta::new(&input_a)?;
+    let b_meta = TensorMeta::new(&input_b)?;
+    let y_meta = TensorMeta::new(&output)?;
     if operation.pre_element_wise[0].input_datatype() != a_meta.datatype
         || operation.pre_element_wise[1].input_datatype() != b_meta.datatype
     {
@@ -106,7 +85,7 @@ fn build_matmul_tile_ir(
     let total_outputs = out_shape
         .iter()
         .try_fold(1u32, |acc, dim| acc.checked_mul(*dim))?;
-    let k = input_a
+    let k: u32 = input_a
         .layout()
         .shape()
         .last()
@@ -118,75 +97,91 @@ fn build_matmul_tile_ir(
     };
     let result_dtype = a_product_dtype;
 
-    Some(tile_ir::tile::build(move |phase| {
-        let a_storage = phase.storage_read_element_with_layout_offset::<2>(
-            a_meta.element,
-            flat_layout(a_meta.allocation_len),
-            0,
-        );
-        let b_storage = phase.storage_read_element_with_layout_offset::<2>(
-            b_meta.element,
-            flat_layout(b_meta.allocation_len),
-            0,
-        );
-        let y_storage = phase.storage_write_element_with_layout_offset::<2>(
-            y_meta.element,
-            flat_layout(y_meta.allocation_len),
-            0,
-        );
+    let a_buffer = input_a.buffer().clone();
+    let b_buffer = input_b.buffer().clone();
+    let y_buffer = output.buffer().clone();
+    let a_layout = flat_layout(a_meta.allocation_len);
+    let b_layout = flat_layout(b_meta.allocation_len);
+    let y_layout = flat_layout(y_meta.allocation_len);
+    let a_meta_body = a_meta.clone();
+    let b_meta_body = b_meta.clone();
+    let y_meta_body = y_meta.clone();
 
-        phase.program_grid::<BLOCK>(dispatch_size, |program| {
-            let lane = program.arange();
-            let group = linear_group(program, dispatch_size);
-            let flat = group * BLOCK as u32 + lane.clone();
-            let in_bounds = flat.lt(total_outputs);
-            let dims =
-                output_dims_from_flat(tile_ir::tile::Tile::from_index(flat.clone()), &out_shape);
-            let k_index = tile_ir::tile::Tile::from_index(program.loop_index());
+    kernel_backend::run_kernel(
+        &graph.device(),
+        operation.name(),
+        cache_key,
+        dispatch_size,
+        move |kb| {
+            let a_storage = kb.read_erased::<2>(
+                a_meta_body.element,
+                tile_ir::KernelTensorRef::new(a_buffer, a_layout),
+            );
+            let b_storage = kb.read_erased::<2>(
+                b_meta_body.element,
+                tile_ir::KernelTensorRef::new(b_buffer, b_layout),
+            );
+            let y_storage = kb.write_erased::<2>(
+                y_meta_body.element,
+                tile_ir::KernelTensorRef::new(y_buffer, y_layout),
+            );
 
-            let mut a_coords = dims[..rank - 1].to_vec();
-            a_coords.push(k_index.clone());
-            let mut b_coords = dims[..rank - 2].to_vec();
-            b_coords.push(k_index);
-            b_coords.push(dims[rank - 1].clone());
+            kb.program().program_grid::<BLOCK>(dispatch_size, |program| {
+                let lane = program.arange();
+                let group = linear_group(program, dispatch_size);
+                let flat = group * BLOCK as u32 + lane.clone();
+                let in_bounds = flat.lt(total_outputs);
+                let dims = output_dims_from_flat(
+                    tile_ir::tile::Tile::from_index(flat.clone()),
+                    &out_shape,
+                );
+                let k_index = tile_ir::tile::Tile::from_index(program.loop_index());
 
-            let a = program.load_erased(
-                a_storage.at(0, layout_index(&a_meta, &a_coords)),
-                in_bounds.clone(),
-                zero_literal(a_meta.datatype),
-            );
-            let b = program.load_erased(
-                b_storage.at(0, layout_index(&b_meta, &b_coords)),
-                in_bounds.clone(),
-                zero_literal(b_meta.datatype),
-            );
-            let (a, a_ty) =
-                apply_unary_function_chain(a, a_meta.datatype, &operation.pre_element_wise[0])
-                    .expect("validated matmul pre_element_wise[0] chain");
-            let (b, b_ty) =
-                apply_unary_function_chain(b, b_meta.datatype, &operation.pre_element_wise[1])
-                    .expect("validated matmul pre_element_wise[1] chain");
-            let a = cast_tile(a, a_ty, acc_dtype);
-            let b = cast_tile(b, b_ty, acc_dtype);
-            let product = a * b;
-            let sum = program.loop_fold(
-                tile_ir::TileReduceOp::Sum,
-                k,
-                product,
-                zero_literal(acc_dtype),
-            );
-            let sum = cast_tile(sum, acc_dtype, result_dtype);
-            let (sum, sum_ty) =
-                apply_unary_function_chain(sum, result_dtype, &operation.post_element_wise)
-                    .expect("validated matmul post_element_wise chain");
-            let sum = cast_tile(sum, sum_ty, y_meta.datatype);
-            program.store_erased(
-                y_storage.at(0, layout_index(&y_meta, &dims)),
-                sum,
-                in_bounds,
-            );
-        });
-    }))
+                let mut a_coords = dims[..rank - 1].to_vec();
+                a_coords.push(k_index.clone());
+                let mut b_coords = dims[..rank - 2].to_vec();
+                b_coords.push(k_index);
+                b_coords.push(dims[rank - 1].clone());
+
+                let a = program.load_erased(
+                    a_storage.at(0, layout_index(&a_meta_body, &a_coords)),
+                    in_bounds.clone(),
+                    zero_literal(a_meta_body.datatype),
+                );
+                let b = program.load_erased(
+                    b_storage.at(0, layout_index(&b_meta_body, &b_coords)),
+                    in_bounds.clone(),
+                    zero_literal(b_meta_body.datatype),
+                );
+                let (a, a_ty) =
+                    apply_unary_function_chain(a, a_meta_body.datatype, &operation.pre_element_wise[0])
+                        .expect("validated matmul pre_element_wise[0] chain");
+                let (b, b_ty) =
+                    apply_unary_function_chain(b, b_meta_body.datatype, &operation.pre_element_wise[1])
+                        .expect("validated matmul pre_element_wise[1] chain");
+                let a = cast_tile(a, a_ty, acc_dtype);
+                let b = cast_tile(b, b_ty, acc_dtype);
+                let product = a * b;
+                let sum = program.loop_fold(
+                    tile_ir::TileReduceOp::Sum,
+                    k,
+                    product,
+                    zero_literal(acc_dtype),
+                );
+                let sum = cast_tile(sum, acc_dtype, result_dtype);
+                let (sum, sum_ty) =
+                    apply_unary_function_chain(sum, result_dtype, &operation.post_element_wise)
+                        .expect("validated matmul post_element_wise chain");
+                let sum = cast_tile(sum, sum_ty, y_meta_body.datatype);
+                program.store_erased(
+                    y_storage.at(0, layout_index(&y_meta_body, &dims)),
+                    sum,
+                    in_bounds,
+                );
+            });
+            Some(())
+        },
+    )
 }
 
 fn output_dims_from_flat<const N: usize>(

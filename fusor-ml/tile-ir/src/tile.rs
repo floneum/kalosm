@@ -37,6 +37,15 @@ impl PairedActivation {
             Self::ReGLU => gate.relu() * up,
         }
     }
+
+    /// Lowercase identifier used in kernel names and cache keys.
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::SwiGLU => "swiglu",
+            Self::GeGLU => "geglu",
+            Self::ReGLU => "reglu",
+        }
+    }
 }
 
 macro_rules! q4k_paired_entrypoints {
@@ -358,7 +367,29 @@ pub fn build(f: impl FnOnce(&mut Program)) -> KernelIr {
 
 /// Source tile program builder.
 pub struct Program {
-    ir: KernelIr,
+    pub(crate) ir: KernelIr,
+}
+
+impl Program {
+    /// Create an empty builder. Most callers should use [`build`] instead;
+    /// this is for [`crate::kernel_builder::KernelBuilder`] which owns the
+    /// program plus a parallel binding list.
+    pub fn new() -> Self {
+        Self {
+            ir: KernelIr::default(),
+        }
+    }
+
+    /// Consume the builder and return the constructed [`KernelIr`].
+    pub fn into_ir(self) -> KernelIr {
+        self.ir
+    }
+}
+
+impl Default for Program {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl Program {

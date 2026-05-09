@@ -1,7 +1,4 @@
-use std::{
-    hash::{Hash, Hasher},
-    sync::OnceLock,
-};
+use std::sync::OnceLock;
 
 use crate::{
     DataTypeEnum,
@@ -10,7 +7,7 @@ use crate::{
         Axis, KernelDeviceCaps, KernelShape, ShapeRule, ShapeSelector, multiple_of,
     },
     mir::{
-        direct_kernel::{DirectKernel, DirectKernelBinding},
+        direct_kernel::DirectKernel,
         inputs::MirValue,
         kernel_backend,
         operation::Operation,
@@ -23,7 +20,7 @@ use crate::{
     tensor::TensorData,
 };
 use fusor_tile_ir as tile_ir;
-use rustc_hash::FxHasher;
+use std::hash::Hash;
 
 const BLOCK: usize = 1024;
 const RMS_NORM_MODULE_CACHE_SIZE: usize = 128;
@@ -47,25 +44,22 @@ fn rms_norm_module_key(
     bias: Option<&TensorData>,
     output: &TensorData,
 ) -> [u64; 2] {
-    std::array::from_fn(|salt| {
-        let mut hasher = FxHasher::default();
-        (salt as u64).hash(&mut hasher);
-        variant.hash(&mut hasher);
-        rows.hash(&mut hasher);
-        cols.hash(&mut hasher);
-        eps_bits.hash(&mut hasher);
-        has_bias.hash(&mut hasher);
-        has_residual.hash(&mut hasher);
-        dispatch_size.hash(&mut hasher);
-        kernel_backend::hash_layout(&mut hasher, input.layout());
+    kernel_backend::module_key_from(|hasher| {
+        variant.hash(hasher);
+        rows.hash(hasher);
+        cols.hash(hasher);
+        eps_bits.hash(hasher);
+        has_bias.hash(hasher);
+        has_residual.hash(hasher);
+        dispatch_size.hash(hasher);
+        kernel_backend::hash_layout(hasher, input.layout());
         residual
-            .map(|residual| kernel_backend::hash_layout(&mut hasher, residual.layout()))
-            .hash(&mut hasher);
-        kernel_backend::hash_layout(&mut hasher, weight.layout());
-        bias.map(|bias| kernel_backend::hash_layout(&mut hasher, bias.layout()))
-            .hash(&mut hasher);
-        kernel_backend::hash_layout(&mut hasher, output.layout());
-        hasher.finish()
+            .map(|residual| kernel_backend::hash_layout(hasher, residual.layout()))
+            .hash(hasher);
+        kernel_backend::hash_layout(hasher, weight.layout());
+        bias.map(|bias| kernel_backend::hash_layout(hasher, bias.layout()))
+            .hash(hasher);
+        kernel_backend::hash_layout(hasher, output.layout());
     })
 }
 
@@ -308,28 +302,83 @@ impl Operation for RmsNormOperation {
             RmsNormKernelVariant::Tile => "rms_norm",
             RmsNormKernelVariant::Vec4 => "rms_norm_vec4",
         };
-        let cache_key = format!(
-            "{kernel_label}:{:016x}{:016x}",
-            module_key[0], module_key[1]
-        );
-        let module =
-            kernel_backend::cached_hashed_kernel_module(rms_norm_module_cache(), module_key, || {
-            let verbose_cache_key = format!(
-                "{}:tile-program:rows={rows}:cols={cols}:eps={:?}:bias={has_bias}:residual={has_residual}:dispatch={dispatch_size:?}:{:?}:{:?}:{:?}:{:?}:{:?}",
-                self.name(),
-                self.eps.to_bits(),
-                input.layout(),
-                residual.map(|residual| residual.layout()),
-                weight.layout(),
-                bias.map(|bias| bias.layout()),
-                output.layout()
+
+        if let Some(meta) = vec4_meta {
+            let vec_layout = tile_ir::Layout::strided(
+                tile_ir::MemoryLevel::Storage,
+                tile_ir::Shape::new([1]),
+                tile_ir::Strides::new([1]),
             );
-            let module = if let Some(meta) = vec4_meta {
-                kernel_backend::cached_kernel_ir(&graph.device(), verbose_cache_key, || {
-                    tile_ir::kernels::rms_norm_vec4(meta, rows)
-                })?
-            } else {
-                kernel_backend::cached_kernel_ir(&graph.device(), verbose_cache_key, || {
+            let input_buffer = input.buffer().clone();
+            let residual_buffer = residual.map(|r| r.buffer().clone());
+            let weight_buffer = weight.buffer().clone();
+            let bias_buffer = bias.map(|b| b.buffer().clone());
+            let output_buffer = output.buffer().clone();
+            kernel_backend::run_kernel_with_hashed_cache(
+                &graph.device(),
+                rms_norm_module_cache(),
+                kernel_label,
+                module_key,
+                dispatch_size,
+                move |kb| {
+                    tile_ir::kernels::rms_norm_vec4(
+                        kb,
+                        tile_ir::KernelTensorRef::with_offset(
+                            input_buffer,
+                            vec_layout.clone(),
+                            meta.input_offset_vec,
+                        ),
+                        residual_buffer.zip(meta.residual_offset_vec).map(
+                            |(buffer, offset)| {
+                                tile_ir::KernelTensorRef::with_offset(
+                                    buffer,
+                                    vec_layout.clone(),
+                                    offset,
+                                )
+                            },
+                        ),
+                        tile_ir::KernelTensorRef::with_offset(
+                            weight_buffer,
+                            vec_layout.clone(),
+                            meta.weight_offset_vec,
+                        ),
+                        bias_buffer.zip(meta.bias_offset_vec).map(|(buffer, offset)| {
+                            tile_ir::KernelTensorRef::with_offset(
+                                buffer,
+                                vec_layout.clone(),
+                                offset,
+                            )
+                        }),
+                        tile_ir::KernelTensorRef::with_offset(
+                            output_buffer,
+                            vec_layout,
+                            meta.output_offset_vec,
+                        ),
+                        meta,
+                        rows,
+                    )
+                },
+            )
+        } else {
+            let mut buffers = Vec::with_capacity(5);
+            buffers.push(input.buffer().clone());
+            if let Some(residual) = residual {
+                buffers.push(residual.buffer().clone());
+            }
+            buffers.push(weight.buffer().clone());
+            if let Some(bias) = bias {
+                buffers.push(bias.buffer().clone());
+            }
+            buffers.push(output.buffer().clone());
+
+            kernel_backend::dynamic_kernel_from_hashed_ir(
+                &graph.device(),
+                rms_norm_module_cache(),
+                kernel_label,
+                module_key,
+                buffers,
+                dispatch_size,
+                || {
                     build_rms_norm_tile_ir(
                         input_view,
                         residual_view,
@@ -338,52 +387,9 @@ impl Operation for RmsNormOperation {
                         output_view,
                         self.eps,
                     )
-                })?
-            };
-            Some(module)
-        })?;
-
-        let mut bindings = vec![DirectKernelBinding::Storage {
-            binding: 0,
-            buffer: input.buffer().clone(),
-            read_only: true,
-        }];
-        let mut binding = 1;
-        if let Some(residual) = residual {
-            bindings.push(DirectKernelBinding::Storage {
-                binding,
-                buffer: residual.buffer().clone(),
-                read_only: true,
-            });
-            binding += 1;
+                },
+            )
         }
-        bindings.push(DirectKernelBinding::Storage {
-            binding,
-            buffer: weight.buffer().clone(),
-            read_only: true,
-        });
-        binding += 1;
-        if let Some(bias) = bias {
-            bindings.push(DirectKernelBinding::Storage {
-                binding,
-                buffer: bias.buffer().clone(),
-                read_only: true,
-            });
-            binding += 1;
-        }
-        bindings.push(DirectKernelBinding::Storage {
-            binding,
-            buffer: output.buffer().clone(),
-            read_only: false,
-        });
-
-        Some(kernel_backend::dynamic_kernel_from_module(
-            kernel_label,
-            cache_key,
-            module,
-            bindings,
-            dispatch_size,
-        ))
     }
 
     fn output(&self, _nodes: &ComputeGraphInner, inputs: &[MirValue]) -> MirValue {

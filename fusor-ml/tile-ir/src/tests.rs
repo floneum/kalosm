@@ -91,24 +91,35 @@ fn tile_source_softmax_lowers_to_naga() {
 
 #[test]
 fn streaming_flash_attention_regression_shape_lowers_to_naga() {
-    let ir = kernels::flash_attention::<crate::F32>(FlashAttentionMeta {
-        dims: FlashAttentionDims {
-            batch: 1,
-            num_heads: 32,
-            num_kv_heads: 8,
-            q_seq_len: 48,
-            kv_seq_len: 48,
-            head_dim: 128,
+    let layout = kernels::linear_storage_layout();
+    let mut kb = crate::KernelBuilder::<()>::new();
+    kernels::flash_attention::<crate::F32, ()>(
+        &mut kb,
+        crate::KernelTensorRef::new((), layout.clone()),
+        crate::KernelTensorRef::new((), layout.clone()),
+        crate::KernelTensorRef::new((), layout.clone()),
+        None,
+        crate::KernelTensorRef::new((), layout),
+        FlashAttentionMeta {
+            dims: FlashAttentionDims {
+                batch: 1,
+                num_heads: 32,
+                num_kv_heads: 8,
+                q_seq_len: 48,
+                kv_seq_len: 48,
+                head_dim: 128,
+            },
+            scale: F32Bits::new(1.0 / 128.0f32.sqrt()),
+            q_meta: TensorMeta::new(vec![196_608, 6_144, 128, 1], 0),
+            k_meta: TensorMeta::new(vec![49_152, 6_144, 128, 1], 0),
+            v_meta: TensorMeta::new(vec![49_152, 6_144, 128, 1], 0),
+            mask_meta: None,
+            output_meta: TensorMeta::new(vec![196_608, 6_144, 128, 1], 0),
+            dispatch_size: [16, 1536, 1],
         },
-        scale: F32Bits::new(1.0 / 128.0f32.sqrt()),
-        q_meta: TensorMeta::new(vec![196_608, 6_144, 128, 1], 0),
-        k_meta: TensorMeta::new(vec![49_152, 6_144, 128, 1], 0),
-        v_meta: TensorMeta::new(vec![49_152, 6_144, 128, 1], 0),
-        mask_meta: None,
-        output_meta: TensorMeta::new(vec![196_608, 6_144, 128, 1], 0),
-        dispatch_size: [16, 1536, 1],
-    })
+    )
     .expect("streaming flash attention should build");
+    let (ir, _) = kb.finish();
 
     ir.lower_to_naga()
         .unwrap_or_else(|error| panic!("streaming flash attention lowering failed: {error}"));

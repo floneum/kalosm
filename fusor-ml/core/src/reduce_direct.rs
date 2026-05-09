@@ -48,38 +48,8 @@ pub(crate) fn build_reduce_direct_kernel(
         output.datatype(),
         output.layout()
     );
-    kernel_backend::dynamic_kernel_from_ir(
-        &graph.device(),
-        operation.name(),
-        cache_key,
-        || {
-            build_reduce_tile_ir(
-                operation,
-                &input,
-                &output,
-                dispatch_size,
-                reduce_size,
-                reduce_stride,
-            )
-        },
-        vec![
-            kernel_backend::storage_binding(0, &input, true),
-            kernel_backend::storage_binding(1, &output, false),
-        ],
-        dispatch_size,
-    )
-}
-
-fn build_reduce_tile_ir(
-    operation: &ReduceOperation,
-    input: &TensorData,
-    output: &TensorData,
-    dispatch_size: [u32; 3],
-    reduce_size: u32,
-    reduce_stride: u32,
-) -> Option<tile_ir::KernelIr> {
-    let input_meta = TensorMeta::new(input)?;
-    let output_meta = TensorMeta::new(output)?;
+    let input_meta = TensorMeta::new(&input)?;
+    let output_meta = TensorMeta::new(&output)?;
     if operation.pre_element_wise.input_datatype() != input_meta.datatype {
         return None;
     }
@@ -103,45 +73,66 @@ fn build_reduce_tile_ir(
     let reduce_op = tile_reduce_op(operation.function.op);
     let initial = tile_literal(operation.function.initial_value);
 
-    Some(tile_ir::tile::build(move |phase| {
-        let input_layout = flat_layout(input_meta.allocation_len);
-        let output_layout = flat_layout(output_meta.allocation_len);
-        let input_storage =
-            phase.storage_read_element_with_layout_offset::<2>(input_meta.element, input_layout, 0);
-        let output_storage = phase.storage_write_element_with_layout_offset::<2>(
-            output_meta.element,
-            output_layout,
-            0,
-        );
+    let input_buffer = input.buffer().clone();
+    let output_buffer = output.buffer().clone();
+    let input_layout = flat_layout(input_meta.allocation_len);
+    let output_layout = flat_layout(output_meta.allocation_len);
+    let input_meta_body = input_meta.clone();
+    let output_meta_body = output_meta.clone();
 
-        phase.program_grid::<BLOCK>(dispatch_size, |program| {
-            let lane = program.arange();
-            let group = linear_group(program, dispatch_size);
-            let flat = group * BLOCK as u32 + lane.clone();
-            let in_bounds = flat.lt(total_outputs);
-            let dims =
-                output_dims_from_flat(tile_ir::tile::Tile::from_index(flat.clone()), &output_shape);
-            let base = layout_index(&input_meta, &dims);
-            let k = tile_ir::tile::Tile::from_index(program.loop_index() * reduce_stride);
-            let value_index = base + k;
-            let value = program.load_erased(
-                input_storage.at(0, value_index),
-                in_bounds.clone(),
-                zero_literal(input_meta.datatype),
+    kernel_backend::run_kernel(
+        &graph.device(),
+        operation.name(),
+        cache_key,
+        dispatch_size,
+        move |kb| {
+            let input_storage = kb.read_erased::<2>(
+                input_meta_body.element,
+                tile_ir::KernelTensorRef::new(input_buffer, input_layout),
             );
-            let (value, value_ty) =
-                apply_unary_function_chain(value, input_meta.datatype, &operation.pre_element_wise)
-                    .expect("validated reduce pre_element_wise chain");
-            let value = cast_tile(value, value_ty, reduce_dtype);
-            let reduced = program.loop_fold(reduce_op, reduce_size, value, initial);
-            let (reduced, reduced_ty) =
-                apply_unary_function_chain(reduced, reduce_dtype, &operation.post_element_wise)
-                    .expect("validated reduce post_element_wise chain");
-            let reduced = cast_tile(reduced, reduced_ty, output_meta.datatype);
-            let output_index = layout_index(&output_meta, &dims);
-            program.store_erased(output_storage.at(0, output_index), reduced, in_bounds);
-        });
-    }))
+            let output_storage = kb.write_erased::<2>(
+                output_meta_body.element,
+                tile_ir::KernelTensorRef::new(output_buffer, output_layout),
+            );
+
+            kb.program().program_grid::<BLOCK>(dispatch_size, |program| {
+                let lane = program.arange();
+                let group = linear_group(program, dispatch_size);
+                let flat = group * BLOCK as u32 + lane.clone();
+                let in_bounds = flat.lt(total_outputs);
+                let dims = output_dims_from_flat(
+                    tile_ir::tile::Tile::from_index(flat.clone()),
+                    &output_shape,
+                );
+                let base = layout_index(&input_meta_body, &dims);
+                let k = tile_ir::tile::Tile::from_index(program.loop_index() * reduce_stride);
+                let value_index = base + k;
+                let value = program.load_erased(
+                    input_storage.at(0, value_index),
+                    in_bounds.clone(),
+                    zero_literal(input_meta_body.datatype),
+                );
+                let (value, value_ty) = apply_unary_function_chain(
+                    value,
+                    input_meta_body.datatype,
+                    &operation.pre_element_wise,
+                )
+                .expect("validated reduce pre_element_wise chain");
+                let value = cast_tile(value, value_ty, reduce_dtype);
+                let reduced = program.loop_fold(reduce_op, reduce_size, value, initial);
+                let (reduced, reduced_ty) = apply_unary_function_chain(
+                    reduced,
+                    reduce_dtype,
+                    &operation.post_element_wise,
+                )
+                .expect("validated reduce post_element_wise chain");
+                let reduced = cast_tile(reduced, reduced_ty, output_meta_body.datatype);
+                let output_index = layout_index(&output_meta_body, &dims);
+                program.store_erased(output_storage.at(0, output_index), reduced, in_bounds);
+            });
+            Some(())
+        },
+    )
 }
 
 fn output_dims_from_flat<const N: usize>(

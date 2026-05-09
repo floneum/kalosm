@@ -2,7 +2,7 @@ use fusor_tile_ir as tile_ir;
 
 use crate::{
     Device,
-    mir::{direct_kernel::DirectKernelBinding, kernel_backend},
+    mir::kernel_backend,
     sampling::{
         GPU_SAMPLE_RESULT_WORDS, GpuMirostat2Sampler, GpuMirostat2SamplerParams, TOP_K_BLOCK,
     },
@@ -80,48 +80,23 @@ pub(crate) fn sample_from_sorted_top_k_data_with_encoder(
         ids.layout(),
         values.layout()
     );
-    let mut bindings = vec![
-        DirectKernelBinding::Storage {
-            binding: 0,
-            buffer: ids.buffer().clone(),
-            read_only: true,
-        },
-        DirectKernelBinding::Storage {
-            binding: 1,
-            buffer: values.buffer().clone(),
-            read_only: true,
-        },
-        DirectKernelBinding::Storage {
-            binding: 2,
-            buffer: sampler.state.buffer().clone(),
-            read_only: false,
-        },
-        DirectKernelBinding::Storage {
-            binding: 3,
-            buffer: params.buffer().clone(),
-            read_only: true,
-        },
-        DirectKernelBinding::Storage {
-            binding: 4,
-            buffer: output.buffer().clone(),
-            read_only: false,
-        },
-    ];
-    if let Some(flag) = exactness_flag {
-        bindings.push(DirectKernelBinding::Storage {
-            binding: 5,
-            buffer: flag.buffer().clone(),
-            read_only: true,
-        });
-    }
-
-    let kernel = kernel_backend::dynamic_kernel_from_ir(
+    let kernel = kernel_backend::run_kernel(
         device,
         "sample_mirostat2_sorted_top_k_f32",
         cache_key,
-        || tile_ir::kernels::mirostat2(meta),
-        bindings,
         [1, 1, 1],
+        |kb| {
+            tile_ir::kernels::mirostat2(
+                kb,
+                kernel_backend::linear_tensor_ref(ids),
+                kernel_backend::linear_tensor_ref(values),
+                kernel_backend::linear_tensor_ref(&sampler.state),
+                kernel_backend::linear_tensor_ref(&params),
+                kernel_backend::linear_tensor_ref(&output),
+                exactness_flag.map(kernel_backend::linear_tensor_ref),
+                meta,
+            )
+        },
     )?;
 
     if let Some(encoder) = encoder {

@@ -7,7 +7,7 @@ use crate::{
     CastTensor, DataType, DataTypeEnum, Device, Layout, LazyTensorData, Tensor, TensorData,
     TensorInfo,
     mir::{
-        direct_kernel::{DirectKernel, DirectKernelBinding},
+        direct_kernel::DirectKernel,
         kernel_backend,
         workgroup_shape::{Constraint, WorkgroupShapeConstraints},
     },
@@ -51,10 +51,6 @@ impl DequantizeOperation {
     }
 }
 
-fn ceil_div_u32(x: u32, divisor: u32) -> u32 {
-    x.div_ceil(divisor)
-}
-
 impl Operation for DequantizeOperation {
     fn workgroup_shape_constraints(
         &self,
@@ -79,7 +75,7 @@ impl Operation for DequantizeOperation {
             .try_fold(1u32, |acc, dim| acc.checked_mul((*dim).try_into().ok()?))
             .unwrap_or(u32::MAX);
         let lanes = workgroup_shape.x() * workgroup_shape.y() * workgroup_shape.z();
-        [ceil_div_u32(total, lanes), 1, 1]
+        [total.div_ceil(lanes), 1, 1]
     }
 
     fn visit_dependencies(&self, _: &mut dyn FnMut(crate::compute_graph::NodeIndex)) {}
@@ -125,14 +121,14 @@ impl Operation for DequantizeOperation {
             .skip(1)
             .try_fold(1u32, |acc, dim| acc.checked_mul((*dim).try_into().ok()?))?;
         let total = k.checked_mul(n)?;
-        let workgroups = ceil_div_u32(total, 256);
+        let workgroups = total.div_ceil(256);
         let max_workgroups = graph
             .device()
             .limits()
             .max_compute_workgroups_per_dimension
             .max(1);
         let dispatch_x = workgroups.min(max_workgroups);
-        let dispatch_y = ceil_div_u32(workgroups, dispatch_x);
+        let dispatch_y = workgroups.div_ceil(dispatch_x);
         if dispatch_y > max_workgroups {
             return None;
         }
@@ -141,30 +137,24 @@ impl Operation for DequantizeOperation {
             self.name(),
             self.matrix.shape
         );
-        kernel_backend::dynamic_kernel_from_ir(
+        let matrix_buffer = matrix.buffer().clone();
+        let output_buffer = output.buffer().clone();
+        let output_layout =
+            tile_ir::Layout::contiguous(tile_ir::MemoryLevel::Storage, tile_ir::Shape::new([total]));
+        kernel_backend::run_kernel(
             &graph.device(),
             self.name(),
             cache_key,
-            || {
-                Some(tile_ir::tile::build(move |phase| {
-                    let q = phase.quantized_matrix(format, k, n);
-                    let y = phase.storage_write::<tile_ir::F32, 1>(tile_ir::Shape::new([total]));
-                    phase.qdequantize(&q, &y, dispatch_x);
-                }))
-            },
-            vec![
-                DirectKernelBinding::Storage {
-                    binding: 0,
-                    buffer: matrix.buffer().clone(),
-                    read_only: true,
-                },
-                DirectKernelBinding::Storage {
-                    binding: 1,
-                    buffer: output.buffer().clone(),
-                    read_only: false,
-                },
-            ],
             [dispatch_x, dispatch_y, 1],
+            move |kb| {
+                let q = kb.quantized_matrix(matrix_buffer, format, k, n);
+                let y = kb.write::<tile_ir::F32, 1>(tile_ir::KernelTensorRef::new(
+                    output_buffer,
+                    output_layout,
+                ));
+                kb.program().qdequantize(&q, &y, dispatch_x);
+                Some(())
+            },
         )
     }
 

@@ -180,17 +180,20 @@ pub(crate) fn top_k_exactness_flag_data_with_encoder(
         top_values.layout(),
         chunk_values.layout()
     );
-    let kernel = kernel_backend::dynamic_kernel_from_ir(
+    let kernel = kernel_backend::run_kernel(
         device,
         "prove_top_k_exact_f32",
         cache_key,
-        || tile_ir::kernels::top_k_exactness(meta),
-        vec![
-            kernel_backend::storage_binding(0, top_values, true),
-            kernel_backend::storage_binding(1, chunk_values, true),
-            kernel_backend::storage_binding(2, &flag, false),
-        ],
         [1, 1, 1],
+        |kb| {
+            tile_ir::kernels::top_k_exactness(
+                kb,
+                kernel_backend::linear_tensor_ref(top_values),
+                kernel_backend::linear_tensor_ref(chunk_values),
+                kernel_backend::linear_tensor_ref(&flag),
+                meta,
+            )
+        },
     )?;
 
     kernel_backend::run_direct_kernel(device, "prove_top_k_exact_f32 encoder", &kernel, encoder);
@@ -263,46 +266,34 @@ fn chunk_top_k_pair_data_inner_with_encoder(
     let cache_key = format!(
         "chunk_top_k_pairs_f32:block={TOP_K_BLOCK}:chunk={TOP_K_CHUNK}:len={input_len}:candidate_count={candidate_count}:output_per_chunk={output_per_chunk}:offset={input_offset}:stride={input_stride}:processors={has_processors}"
     );
-    let build_ir = || {
-        tile_ir::kernels::top_k_chunk(tile_ir::TopKChunkMeta {
-            input_len: input_len.try_into().ok()?,
-            output_per_chunk: output_per_chunk.try_into().ok()?,
-            input_offset: input_offset.try_into().ok()?,
-            input_stride: input_stride.try_into().ok()?,
-            processors: has_processors,
-        })
-    };
 
-    let kernel = if let Some((previous_tokens, params)) = processors {
-        let bindings = vec![
-            kernel_backend::storage_binding(0, input, true),
-            kernel_backend::storage_binding(1, &ids, false),
-            kernel_backend::storage_binding(2, &values, false),
-            kernel_backend::storage_binding(3, previous_tokens, true),
-            kernel_backend::storage_binding(4, params, true),
-        ];
-        kernel_backend::dynamic_kernel_from_ir(
-            device,
-            "chunk_top_k_pairs_f32",
-            cache_key,
-            build_ir,
-            bindings,
-            [chunks.try_into().ok()?, 1, 1],
-        )?
-    } else {
-        kernel_backend::dynamic_kernel_from_ir(
-            device,
-            "chunk_top_k_pairs_f32",
-            cache_key,
-            build_ir,
-            vec![
-                kernel_backend::storage_binding(0, input, true),
-                kernel_backend::storage_binding(1, &ids, false),
-                kernel_backend::storage_binding(2, &values, false),
-            ],
-            [chunks.try_into().ok()?, 1, 1],
-        )?
-    };
+    let kernel = kernel_backend::run_kernel(
+        device,
+        "chunk_top_k_pairs_f32",
+        cache_key,
+        [chunks.try_into().ok()?, 1, 1],
+        |kb| {
+            tile_ir::kernels::top_k_chunk(
+                kb,
+                kernel_backend::linear_tensor_ref(input),
+                kernel_backend::linear_tensor_ref(&ids),
+                kernel_backend::linear_tensor_ref(&values),
+                processors.map(|(previous_tokens, params)| {
+                    (
+                        kernel_backend::linear_tensor_ref(previous_tokens),
+                        kernel_backend::linear_tensor_ref(params),
+                    )
+                }),
+                tile_ir::TopKChunkMeta {
+                    input_len: input_len.try_into().ok()?,
+                    output_per_chunk: output_per_chunk.try_into().ok()?,
+                    input_offset: input_offset.try_into().ok()?,
+                    input_stride: input_stride.try_into().ok()?,
+                    processors: has_processors,
+                },
+            )
+        },
+    )?;
 
     kernel_backend::run_direct_kernel(device, "chunk_top_k_pairs_f32 encoder", &kernel, encoder);
 
@@ -351,26 +342,27 @@ pub(crate) fn merge_sorted_chunk_top_k_pair_data_with_encoder(
         input_ids.layout(),
         input_values.layout()
     );
-    let kernel = kernel_backend::dynamic_kernel_from_ir(
+    let kernel = kernel_backend::run_kernel(
         device,
         "merge_sorted_chunk_top_k_pairs_f32",
         cache_key,
-        || {
-            tile_ir::kernels::top_k_merge(tile_ir::MergeTopKMeta {
-                chunks: chunks.try_into().ok()?,
-                chunk_len: chunk_len.try_into().ok()?,
-                chunk_stride: chunk_stride.try_into().ok()?,
-                input_len: input_len.try_into().ok()?,
-                k: output_len.try_into().ok()?,
-            })
-        },
-        vec![
-            kernel_backend::storage_binding(0, input_ids, true),
-            kernel_backend::storage_binding(1, input_values, true),
-            kernel_backend::storage_binding(2, &ids, false),
-            kernel_backend::storage_binding(3, &values, false),
-        ],
         [1, 1, 1],
+        |kb| {
+            tile_ir::kernels::top_k_merge(
+                kb,
+                kernel_backend::linear_tensor_ref(input_ids),
+                kernel_backend::linear_tensor_ref(input_values),
+                kernel_backend::linear_tensor_ref(&ids),
+                kernel_backend::linear_tensor_ref(&values),
+                tile_ir::MergeTopKMeta {
+                    chunks: chunks.try_into().ok()?,
+                    chunk_len: chunk_len.try_into().ok()?,
+                    chunk_stride: chunk_stride.try_into().ok()?,
+                    input_len: input_len.try_into().ok()?,
+                    k: output_len.try_into().ok()?,
+                },
+            )
+        },
     )?;
 
     kernel_backend::run_direct_kernel(

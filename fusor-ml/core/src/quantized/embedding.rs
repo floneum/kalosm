@@ -5,7 +5,7 @@ use crate::{
     DataTypeEnum, Device, Tensor, TensorData, TensorInfo,
     compute_graph::NodeIndex,
     mir::{
-        direct_kernel::{DirectKernel, DirectKernelBinding},
+        direct_kernel::DirectKernel,
         inputs::MirValue,
         kernel_backend,
         operation::Operation,
@@ -172,59 +172,48 @@ impl Operation for QEmbeddingOperation {
             indexes.layout(),
             output.layout()
         );
-        kernel_backend::dynamic_kernel_from_ir(
+        let matrix_buffer = matrix.buffer().clone();
+        let indexes_buffer = indexes.buffer().clone();
+        let output_buffer = output.buffer().clone();
+        kernel_backend::run_kernel(
             &graph.device(),
             self.name(),
             cache_key,
-            || {
-                Some(tile_ir::tile::build(move |phase| {
-                    let q = phase.quantized_matrix(format, embedding_dim, num_embeddings);
-                    let indexes = phase.storage_read_element_with_layout_offset::<2>(
-                        tile_ir::ElementType::U32,
+            dispatch_size,
+            move |kb| {
+                let q = kb.quantized_matrix(matrix_buffer, format, embedding_dim, num_embeddings);
+                let indexes = kb.read_erased::<2>(
+                    tile_ir::ElementType::U32,
+                    tile_ir::KernelTensorRef::with_offset(
+                        indexes_buffer,
                         indexes_layout,
                         indexes_offset,
+                    ),
+                );
+                let y = kb.write::<tile_ir::F32, 2>(tile_ir::KernelTensorRef::with_offset(
+                    output_buffer,
+                    output_layout,
+                    output_offset,
+                ));
+                kb.program().program_grid::<BLOCK>(dispatch_size, |program| {
+                    let lane = program.arange();
+                    let group = program.program_id(tile_ir::WorkgroupAxis::X)
+                        + program.program_id(tile_ir::WorkgroupAxis::Y) * dispatch_size[0];
+                    let flat = group * BLOCK as u32 + lane;
+                    let in_bounds = flat.clone().lt(total);
+                    let dim = flat.clone() % embedding_dim;
+                    let index_pos = flat / embedding_dim;
+                    let token = program.load_erased(
+                        indexes.at(0, index_pos.clone()),
+                        in_bounds.clone(),
+                        tile_ir::TileLiteral::U32(0),
                     );
-                    let y = phase.storage_write_with_layout_offset::<tile_ir::F32, 2>(
-                        output_layout,
-                        output_offset,
-                    );
-                    phase.program_grid::<BLOCK>(dispatch_size, |program| {
-                        let lane = program.arange();
-                        let group = program.program_id(tile_ir::WorkgroupAxis::X)
-                            + program.program_id(tile_ir::WorkgroupAxis::Y) * dispatch_size[0];
-                        let flat = group * BLOCK as u32 + lane;
-                        let in_bounds = flat.clone().lt(total);
-                        let dim = flat.clone() % embedding_dim;
-                        let index_pos = flat / embedding_dim;
-                        let token = program.load_erased(
-                            indexes.at(0, index_pos.clone()),
-                            in_bounds.clone(),
-                            tile_ir::TileLiteral::U32(0),
-                        );
-                        let value =
-                            program.load_quantized(&q, dim.clone(), token, in_bounds.clone(), 0.0);
-                        program.store(y.at(index_pos, dim), value, in_bounds);
-                    });
-                }))
+                    let value =
+                        program.load_quantized(&q, dim.clone(), token, in_bounds.clone(), 0.0);
+                    program.store(y.at(index_pos, dim), value, in_bounds);
+                });
+                Some(())
             },
-            vec![
-                DirectKernelBinding::Storage {
-                    binding: 0,
-                    buffer: matrix.buffer().clone(),
-                    read_only: true,
-                },
-                DirectKernelBinding::Storage {
-                    binding: 1,
-                    buffer: indexes.buffer().clone(),
-                    read_only: true,
-                },
-                DirectKernelBinding::Storage {
-                    binding: 2,
-                    buffer: output.buffer().clone(),
-                    read_only: false,
-                },
-            ],
-            dispatch_size,
         )
     }
 

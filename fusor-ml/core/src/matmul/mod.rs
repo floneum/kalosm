@@ -6,7 +6,7 @@ use crate::{
     compute_graph::NodeIndex,
     kernel_selection::{Axis, KernelDeviceCaps, KernelShape, ShapeRule, ShapeSelector, eq, range},
     mir::{
-        direct_kernel::{DirectKernel, DirectKernelBinding},
+        direct_kernel::DirectKernel,
         kernel_backend,
         tile_direct::{
             flatten_matrix_layout, tile_storage_read_with_direct_layout,
@@ -307,23 +307,7 @@ impl MatMulOperation {
             self.name(),
             cache_key,
             || Some(ir),
-            vec![
-                DirectKernelBinding::Storage {
-                    binding: 0,
-                    buffer: input_a.buffer().clone(),
-                    read_only: true,
-                },
-                DirectKernelBinding::Storage {
-                    binding: 1,
-                    buffer: input_b.buffer().clone(),
-                    read_only: true,
-                },
-                DirectKernelBinding::Storage {
-                    binding: 2,
-                    buffer: output.buffer().clone(),
-                    read_only: false,
-                },
-            ],
+            kernel_backend::buffers_from_tensors([&input_a, &input_b, &output]),
             dispatch_size,
         )
     }

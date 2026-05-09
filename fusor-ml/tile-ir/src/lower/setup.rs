@@ -33,18 +33,16 @@ impl<'a> Lowerer<'a> {
         let bool_ty = Self::scalar_type(&mut module, Scalar::BOOL);
         let u32_vec3_ty = Self::vector_type(&mut module, VectorSize::Tri, Scalar::U32);
         let uses_cooperative_matrix = Self::uses_cooperative_matrix(ir);
-        let uses_subgroup_id_idx =
-            Self::uses_index_kind(ir, super::analysis::SubgroupIndexKind::SubgroupId);
-        let uses_subgroup_lane_idx =
+        let uses_subgroup_id = Self::uses_index_kind(
+            ir,
+            super::analysis::SubgroupIndexKind::SubgroupId,
+        ) || uses_cooperative_matrix;
+        let uses_subgroup_invocation_id =
             Self::uses_index_kind(ir, super::analysis::SubgroupIndexKind::SubgroupLane);
-        let uses_subgroup_size_idx =
+        let uses_subgroup_size =
             Self::uses_index_kind(ir, super::analysis::SubgroupIndexKind::SubgroupSize);
-        let uses_num_subgroups_idx =
+        let uses_num_subgroups =
             Self::uses_index_kind(ir, super::analysis::SubgroupIndexKind::NumSubgroups);
-        let uses_subgroup_id = uses_subgroup_id_idx || uses_cooperative_matrix;
-        let uses_subgroup_invocation_id = uses_subgroup_lane_idx;
-        let uses_subgroup_size = uses_subgroup_size_idx;
-        let uses_num_subgroups = uses_num_subgroups_idx;
 
         let coop_c_ty = uses_cooperative_matrix.then(|| {
             Self::type_with_inner(
@@ -89,16 +87,16 @@ impl<'a> Lowerer<'a> {
             uses_subgroup_invocation_id,
             uses_subgroup_size,
             uses_num_subgroups,
-            block_dequant_cache: std::cell::RefCell::new(std::collections::HashMap::new()),
-            pin_cache: std::cell::RefCell::new(std::collections::HashMap::new()),
-            q8_activation_pack_cache: std::cell::RefCell::new(std::collections::HashMap::new()),
-            loop_fold_group_cache: std::cell::RefCell::new(std::collections::HashMap::new()),
+            block_dequant_cache: Default::default(),
+            pin_cache: Default::default(),
+            q8_activation_pack_cache: Default::default(),
+            loop_fold_group_cache: Default::default(),
             fold_accumulator_locals: Vec::new(),
             fold_group_offsets: Vec::new(),
             coop_c_ty,
             coop_acc_locals: Vec::new(),
-            coop_fragment_cache: std::cell::RefCell::new(std::collections::HashMap::new()),
-            coop_acc_value_cache: std::cell::RefCell::new(std::collections::HashMap::new()),
+            coop_fragment_cache: Default::default(),
+            coop_acc_value_cache: Default::default(),
             uses_cooperative_matrix,
         }
     }
@@ -214,7 +212,7 @@ impl<'a> Lowerer<'a> {
     pub(super) fn create_storage_globals(&mut self) {
         self.buffer_globals = vec![None; self.ir.buffers().len()];
         for buffer in self.ir.buffers() {
-            let ty = self.storage_type(buffer.id.index(), buffer.element, &buffer.layout);
+            let ty = self.storage_type(buffer.element);
             let access = match buffer.access {
                 BufferAccess::Read => StorageAccess::LOAD,
                 BufferAccess::ReadWrite => StorageAccess::LOAD | StorageAccess::STORE,
@@ -252,7 +250,7 @@ impl<'a> Lowerer<'a> {
             {
                 continue;
             }
-            let ty = self.tile_type(tile.id.index(), tile.element, &tile.layout);
+            let ty = self.tile_type(tile.element, &tile.layout);
             let global = self.module.global_variables.append(
                 GlobalVariable {
                     name: None,
@@ -287,7 +285,7 @@ impl<'a> Lowerer<'a> {
             {
                 continue;
             }
-            let ty = self.tile_type(tile.id.index(), tile.element, &tile.layout);
+            let ty = self.tile_type(tile.element, &tile.layout);
             let local = function.local_variables.append(
                 LocalVariable {
                     name: None,
@@ -436,14 +434,7 @@ impl<'a> Lowerer<'a> {
     }
 
     pub(super) fn create_u32_local(&self, function: &mut Function) -> Handle<LocalVariable> {
-        function.local_variables.append(
-            LocalVariable {
-                name: None,
-                ty: self.u32_ty,
-                init: None,
-            },
-            Span::default(),
-        )
+        self.create_local(function, self.u32_ty)
     }
 
     pub(super) fn create_f32_local(&self, function: &mut Function) -> Handle<LocalVariable> {
@@ -485,21 +476,11 @@ impl<'a> Lowerer<'a> {
         )
     }
 
-    pub(super) fn tile_type(
-        &mut self,
-        _tile: usize,
-        element: ElementType,
-        layout: &Layout,
-    ) -> Handle<Type> {
+    pub(super) fn tile_type(&mut self, element: ElementType, layout: &Layout) -> Handle<Type> {
         self.array_type(element, layout)
     }
 
-    pub(super) fn storage_type(
-        &mut self,
-        _buffer: usize,
-        element: ElementType,
-        _layout: &Layout,
-    ) -> Handle<Type> {
+    pub(super) fn storage_type(&mut self, element: ElementType) -> Handle<Type> {
         self.array_type_with_size(element, ArraySize::Dynamic)
     }
 
