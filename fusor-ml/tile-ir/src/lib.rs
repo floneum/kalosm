@@ -16,10 +16,9 @@ pub use ir::{
     ElementType, F32Bits, F32Vec4, FlattenedMatrixMap, Im2ColNhwcMap, KernelIr, Layout, LocalDecl,
     LocalId, LocalRef, LoopOffset, MemoryLevel, Numeric, Op, Shape, StorageIndexMap, StorageView,
     Strides, TileBinaryOp, TileCompareOp, TileDecl, TileExpr, TileId, TileIndexExpr, TileLevel,
-    TileLinearLoadExpr, TileLinearStoreStmt, TileLiteral, TileLoadExpr, TileMaskExpr, TileOrigin,
-    TileProgramOp, TileQuantizedLoadExpr, TileReduceOp, TileRef, TileScalarExpr, TileStmt,
-    TileUnaryOp, TileVec4LoadExpr, TileVec4StoreStmt, WorkgroupAxis, WorkgroupOffset, F16, F32,
-    U32,
+    TileIndexedStoreStmt, TileLinearLoadExpr, TileLiteral, TileLoadExpr, TileMaskExpr,
+    TileOrigin, TileProgramOp, TileQuantizedLoadExpr, TileReduceOp, TileRef, TileScalarExpr,
+    TileStmt, TileUnaryOp, TileVec4LoadExpr, WorkgroupAxis, WorkgroupOffset, F16, F32, U32,
 };
 pub use kernels::{
     FlashAttentionDims, FlashAttentionMeta, FlashDecodeSmallMeta, MergeTopKMeta, Mirostat2Meta,

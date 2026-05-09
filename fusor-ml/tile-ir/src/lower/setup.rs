@@ -3,46 +3,14 @@ use super::*;
 impl<'a> Lowerer<'a> {
     pub(super) fn new(ir: &'a KernelIr) -> Self {
         let mut module = Module::default();
-        let f32_ty = module.types.insert(
-            Type {
-                name: None,
-                inner: TypeInner::Scalar(Scalar::F32),
-            },
-            Span::default(),
-        );
-        let f32_vec4_ty = module.types.insert(
-            Type {
-                name: None,
-                inner: TypeInner::Vector {
-                    size: VectorSize::Quad,
-                    scalar: Scalar::F32,
-                },
-            },
-            Span::default(),
-        );
-        let i32_ty = module.types.insert(
-            Type {
-                name: None,
-                inner: TypeInner::Scalar(Scalar {
-                    kind: ScalarKind::Sint,
-                    width: 4,
-                }),
-            },
-            Span::default(),
-        );
-        let i32_vec4_ty = module.types.insert(
-            Type {
-                name: None,
-                inner: TypeInner::Vector {
-                    size: VectorSize::Quad,
-                    scalar: Scalar {
-                        kind: ScalarKind::Sint,
-                        width: 4,
-                    },
-                },
-            },
-            Span::default(),
-        );
+        let i32_scalar = Scalar {
+            kind: ScalarKind::Sint,
+            width: 4,
+        };
+        let f32_ty = Self::scalar_type(&mut module, Scalar::F32);
+        let f32_vec4_ty = Self::vector_type(&mut module, VectorSize::Quad, Scalar::F32);
+        let i32_ty = Self::scalar_type(&mut module, i32_scalar);
+        let i32_vec4_ty = Self::vector_type(&mut module, VectorSize::Quad, i32_scalar);
         let uses_f16 = ir
             .buffers()
             .iter()
@@ -53,41 +21,17 @@ impl<'a> Lowerer<'a> {
                 .any(|tile| tile.element == ElementType::F16)
             || Self::tile_programs_use_f16(ir);
         let f16_ty = uses_f16.then(|| {
-            module.types.insert(
-                Type {
-                    name: None,
-                    inner: TypeInner::Scalar(Scalar {
-                        kind: ScalarKind::Float,
-                        width: 2,
-                    }),
+            Self::scalar_type(
+                &mut module,
+                Scalar {
+                    kind: ScalarKind::Float,
+                    width: 2,
                 },
-                Span::default(),
             )
         });
-        let u32_ty = module.types.insert(
-            Type {
-                name: None,
-                inner: TypeInner::Scalar(Scalar::U32),
-            },
-            Span::default(),
-        );
-        let bool_ty = module.types.insert(
-            Type {
-                name: None,
-                inner: TypeInner::Scalar(Scalar::BOOL),
-            },
-            Span::default(),
-        );
-        let u32_vec3_ty = module.types.insert(
-            Type {
-                name: None,
-                inner: TypeInner::Vector {
-                    size: VectorSize::Tri,
-                    scalar: Scalar::U32,
-                },
-            },
-            Span::default(),
-        );
+        let u32_ty = Self::scalar_type(&mut module, Scalar::U32);
+        let bool_ty = Self::scalar_type(&mut module, Scalar::BOOL);
+        let u32_vec3_ty = Self::vector_type(&mut module, VectorSize::Tri, Scalar::U32);
         let uses_cooperative_matrix = Self::uses_cooperative_matrix(ir);
         let uses_subgroup_id_idx =
             Self::uses_index_kind(ir, super::analysis::SubgroupIndexKind::SubgroupId);
@@ -103,17 +47,14 @@ impl<'a> Lowerer<'a> {
         let uses_num_subgroups = uses_num_subgroups_idx;
 
         let coop_c_ty = uses_cooperative_matrix.then(|| {
-            module.types.insert(
-                Type {
-                    name: None,
-                    inner: TypeInner::CooperativeMatrix {
-                        columns: naga::CooperativeSize::Eight,
-                        rows: naga::CooperativeSize::Eight,
-                        scalar: Scalar::F32,
-                        role: naga::CooperativeRole::C,
-                    },
+            Self::type_with_inner(
+                &mut module,
+                TypeInner::CooperativeMatrix {
+                    columns: naga::CooperativeSize::Eight,
+                    rows: naga::CooperativeSize::Eight,
+                    scalar: Scalar::F32,
+                    role: naga::CooperativeRole::C,
                 },
-                Span::default(),
             )
         });
 
@@ -160,6 +101,20 @@ impl<'a> Lowerer<'a> {
             coop_acc_value_cache: std::cell::RefCell::new(std::collections::HashMap::new()),
             uses_cooperative_matrix,
         }
+    }
+
+    fn scalar_type(module: &mut Module, scalar: Scalar) -> Handle<Type> {
+        Self::type_with_inner(module, TypeInner::Scalar(scalar))
+    }
+
+    fn vector_type(module: &mut Module, size: VectorSize, scalar: Scalar) -> Handle<Type> {
+        Self::type_with_inner(module, TypeInner::Vector { size, scalar })
+    }
+
+    fn type_with_inner(module: &mut Module, inner: TypeInner) -> Handle<Type> {
+        module
+            .types
+            .insert(Type { name: None, inner }, Span::default())
     }
 
     pub(super) fn lower(mut self) -> Result<NagaKernel, LowerError> {
@@ -446,9 +401,8 @@ impl<'a> Lowerer<'a> {
     fn tile_expr_needs_full_scratch(expr: &TileExpr) -> bool {
         match expr {
             TileExpr::QuantizedBlockLane { .. }
-            | TileExpr::QuantizedQ8ActivationDot { .. }
             | TileExpr::QuantizedQ8_0Dot8 { .. }
-            | TileExpr::QuantizedQ4KF32Dot { .. }
+            | TileExpr::QuantizedVecDot { .. }
             | TileExpr::QuantizedQ4KGgmlDot { .. }
             | TileExpr::QuantizedQ6KGgmlDot { .. }
             | TileExpr::LoopFold { .. } => true,
@@ -603,8 +557,7 @@ impl<'a> Lowerer<'a> {
     fn tile_stmt_f16_payload(stmt: &TileStmt) -> bool {
         match stmt {
             TileStmt::Store(store) => store.dst.buffer.element == ElementType::F16,
-            TileStmt::StoreVec4(_) => false,
-            TileStmt::StoreLinear(store) => store.dst.buffer.element == ElementType::F16,
+            TileStmt::StoreIndexed(store) => store.dst.buffer.element == ElementType::F16,
             TileStmt::StoreLocal { dst, value } => {
                 dst.element == ElementType::F16 || Self::tile_expr_uses_f16(value)
             }
@@ -677,8 +630,7 @@ impl<'a> Lowerer<'a> {
             | TileExpr::Vec4Dot { .. }
             | TileExpr::Vec4Splat { .. }
             | TileExpr::QuantizedQ8_0Dot8 { .. }
-            | TileExpr::QuantizedQ8ActivationDot { .. }
-            | TileExpr::QuantizedQ4KF32Dot { .. }
+            | TileExpr::QuantizedVecDot { .. }
             | TileExpr::QuantizedQ4KGgmlDot { .. }
             | TileExpr::QuantizedQ6KGgmlDot { .. }
             | TileExpr::PinnedRef { .. }

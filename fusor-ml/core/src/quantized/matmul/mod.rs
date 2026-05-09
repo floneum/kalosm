@@ -273,6 +273,51 @@ fn select_qgemv_cols_variant(format: tile_ir::GgmlQuantFormat, k: u32, n: u32) -
         .expect("qgemv column selector has a catch-all rule")
 }
 
+fn matmul_m_size(shape: &[usize]) -> u32 {
+    shape[shape.len() - 2] as u32
+}
+
+fn qmatmul_operation_inputs(
+    input: NodeIndex,
+    matrix: &QMatrix,
+    out_shape: &[usize],
+    nodes: &crate::compute_graph::ComputeGraphInner,
+) -> Vec<MirValue> {
+    let input = nodes.get_result(input).unwrap();
+    let q_matrix = matrix.clone();
+    let device = input.device();
+    let output_tensor = TensorData::new_for_shape(device, out_shape, input.datatype());
+    vec![input.into(), q_matrix.into(), output_tensor.into()]
+}
+
+fn qmatmul_operation_output(inputs: &[MirValue]) -> MirValue {
+    let output_tensor = inputs[2].as_tensor().unwrap();
+    output_tensor.clone().into()
+}
+
+fn qmatmul_shape_key(shape: &[usize]) -> String {
+    shape
+        .iter()
+        .map(|x| x.to_string())
+        .collect::<Vec<_>>()
+        .join("x")
+}
+
+fn qmatmul_operation_name(
+    kind: &str,
+    input_datatype: DataTypeEnum,
+    in_shape: &[usize],
+    matrix: &QMatrix,
+) -> String {
+    format!(
+        "q_mat_{kind}_{}_{}_{}_{}",
+        input_datatype,
+        qmatmul_shape_key(in_shape),
+        matrix.datatype,
+        qmatmul_shape_key(&matrix.shape)
+    )
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct QMatMulOperation {
     pub(crate) input_datatype: DataTypeEnum,
@@ -323,8 +368,7 @@ impl QMatMulPairedOperation {
     }
 
     fn m_size(&self) -> u32 {
-        let m_dim_idx = self.in_shape.len() - 2;
-        self.in_shape[m_dim_idx] as u32
+        matmul_m_size(&self.in_shape)
     }
 
     fn direct_quant_format(&self) -> Option<tile_ir::GgmlQuantFormat> {
@@ -357,8 +401,7 @@ impl QMatMulOperation {
     }
 
     fn m_size(&self) -> u32 {
-        let m_dim_idx = self.in_shape.len() - 2;
-        self.in_shape[m_dim_idx] as u32
+        matmul_m_size(&self.in_shape)
     }
 
     fn n_size(&self) -> u32 {
@@ -433,21 +476,15 @@ impl QMatMulOperation {
                 input.layout(),
                 output.layout(),
             );
-            if let Some(pipeline) = matrix
-                .direct_pipeline_cache()
-                .write()
-                .get(&pipeline_key)
-                .cloned()
-            {
-                return Some(kernel_backend::storage3_kernel_with_prepared_pipeline(
-                    kernel_name.clone(),
-                    "",
-                    pipeline,
-                    input.buffer().clone(),
-                    matrix.buffer().clone(),
-                    output.buffer().clone(),
-                    dispatch_size,
-                ));
+            if let Some(kernel) = cached_qmatmul_direct_kernel(
+                &kernel_name,
+                matrix,
+                &pipeline_key,
+                input,
+                output,
+                dispatch_size,
+            ) {
+                return Some(kernel);
             }
             let cache_key = format!(
                 "{kernel_name}:direct:{format:?}:m={m}:k={k}:n={n}:dispatch={dispatch_size:?}:{:?}:{:?}",
@@ -512,48 +549,23 @@ impl QMatMulOperation {
             input.layout(),
             output.layout(),
         );
-        if let Some(pipeline) = matrix
-            .direct_pipeline_cache()
-            .write()
-            .get(&pipeline_key)
-            .cloned()
-        {
-            return Some(kernel_backend::storage3_kernel_with_prepared_pipeline(
-                kernel_name.clone(),
-                "",
-                pipeline,
-                input.buffer().clone(),
-                matrix.buffer().clone(),
-                output.buffer().clone(),
-                dispatch_size,
-            ));
-        }
         let cache_key = format!(
             "{kernel_name}:direct:{format:?}:m={m}:k={k}:n={n}:dispatch={dispatch_size:?}:{:?}:{:?}",
             input.layout(),
             output.layout()
         );
-        let pipeline = kernel_backend::storage3_pipeline_from_ir(
+        qmatmul_direct_kernel_from_ir(
             device,
-            &kernel_name,
-            cache_key.clone(),
-            || Some(ir),
-        )?;
-        let pipeline = matrix
-            .direct_pipeline_cache()
-            .write()
-            .get_or_insert(pipeline_key, || pipeline.clone())
-            .clone();
-
-        Some(kernel_backend::storage3_kernel_with_prepared_pipeline(
+            kernel_name.clone(),
             kernel_name,
             cache_key,
-            pipeline,
-            input.buffer().clone(),
-            matrix.buffer().clone(),
-            output.buffer().clone(),
+            matrix,
+            pipeline_key,
+            input,
+            output,
             dispatch_size,
-        ))
+            || Some(ir),
+        )
     }
 }
 
@@ -573,6 +585,76 @@ fn qmatrix_direct_quant_format(matrix: &QMatrix) -> Option<tile_ir::GgmlQuantFor
         GgmlType::Q8K => tile_ir::GgmlQuantFormat::Q8K,
         GgmlType::F16 | GgmlType::F32 => return None,
     })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn cached_qmatmul_direct_kernel(
+    kernel_name: &str,
+    matrix: &QMatrix,
+    pipeline_key: &QMatMulDirectPipelineKey,
+    input: &TensorData,
+    output: &TensorData,
+    dispatch_size: [u32; 3],
+) -> Option<DirectKernel> {
+    let pipeline = matrix
+        .direct_pipeline_cache()
+        .write()
+        .get(pipeline_key)
+        .cloned()?;
+    Some(kernel_backend::storage3_kernel_with_prepared_pipeline(
+        kernel_name.to_owned(),
+        "",
+        pipeline,
+        input.buffer().clone(),
+        matrix.buffer().clone(),
+        output.buffer().clone(),
+        dispatch_size,
+    ))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn qmatmul_direct_kernel_from_ir(
+    device: &Device,
+    cached_kernel_name: String,
+    kernel_name: String,
+    cache_key: String,
+    matrix: &QMatrix,
+    pipeline_key: QMatMulDirectPipelineKey,
+    input: &TensorData,
+    output: &TensorData,
+    dispatch_size: [u32; 3],
+    build_ir: impl FnOnce() -> Option<tile_ir::KernelIr>,
+) -> Option<DirectKernel> {
+    if let Some(kernel) = cached_qmatmul_direct_kernel(
+        &cached_kernel_name,
+        matrix,
+        &pipeline_key,
+        input,
+        output,
+        dispatch_size,
+    ) {
+        return Some(kernel);
+    }
+    let pipeline = kernel_backend::storage3_pipeline_from_ir(
+        device,
+        &kernel_name,
+        cache_key.clone(),
+        build_ir,
+    )?;
+    let pipeline = matrix
+        .direct_pipeline_cache()
+        .write()
+        .get_or_insert(pipeline_key, || pipeline.clone())
+        .clone();
+    Some(kernel_backend::storage3_kernel_with_prepared_pipeline(
+        kernel_name,
+        cache_key,
+        pipeline,
+        input.buffer().clone(),
+        matrix.buffer().clone(),
+        output.buffer().clone(),
+        dispatch_size,
+    ))
 }
 
 fn ceil_div_u32(x: u32, divisor: u32) -> u32 {
@@ -640,7 +722,7 @@ impl<const R: usize> Tensor<R, half::f16> {
 #[cfg(test)]
 mod selection_tests {
     use super::*;
-    use crate::kernel_selection::DeterministicShapeRng;
+    use crate::kernel_selection::assert_selector_generates;
 
     fn caps(high_tile_limits: bool) -> KernelDeviceCaps {
         KernelDeviceCaps {
@@ -692,14 +774,7 @@ mod selection_tests {
             ),
             (QMatmulDirectVariant::Tile64x64, ctx(q4, false), caps(false)),
         ];
-        let mut rng = DeterministicShapeRng::default();
-
-        for (variant, ctx, caps) in cases {
-            let shape = selector
-                .generate_for(variant, &ctx, caps, &mut rng)
-                .expect("variant should generate");
-            assert_eq!(selector.select(shape, &ctx, caps), Some(variant));
-        }
+        assert_selector_generates(&selector, cases);
     }
 
     #[test]
@@ -761,14 +836,7 @@ mod selection_tests {
                 },
             ),
         ];
-        let mut rng = DeterministicShapeRng::default();
-
-        for (variant, ctx) in cases {
-            let shape = selector
-                .generate_for(variant, &ctx, caps(false), &mut rng)
-                .expect("variant should generate");
-            assert_eq!(selector.select(shape, &ctx, caps(false)), Some(variant));
-        }
+        assert_selector_generates(&selector, cases.map(|(variant, ctx)| (variant, ctx, caps(false))));
     }
 }
 
@@ -816,11 +884,7 @@ impl Operation for QMatMulOperation {
     }
 
     fn inputs(&self, nodes: &crate::compute_graph::ComputeGraphInner) -> Vec<MirValue> {
-        let input = nodes.get_result(self.input).unwrap();
-        let q_matrix = self.matrix.clone();
-        let device = input.device();
-        let output_tensor = TensorData::new_for_shape(device, &self.out_shape, input.datatype());
-        vec![input.into(), q_matrix.into(), output_tensor.into()]
+        qmatmul_operation_inputs(self.input, &self.matrix, &self.out_shape, nodes)
     }
 
     fn build_direct_kernel(
@@ -851,27 +915,11 @@ impl Operation for QMatMulOperation {
     }
 
     fn output(&self, _: &crate::compute_graph::ComputeGraphInner, inputs: &[MirValue]) -> MirValue {
-        let output_tensor = inputs[2].as_tensor().unwrap();
-        output_tensor.clone().into()
+        qmatmul_operation_output(inputs)
     }
 
     fn name(&self) -> String {
-        format!(
-            "q_mat_mul_{}_{}_{}_{}",
-            self.input_datatype,
-            self.in_shape
-                .iter()
-                .map(|x| x.to_string())
-                .collect::<Vec<_>>()
-                .join("x"),
-            self.matrix.datatype,
-            self.matrix
-                .shape
-                .iter()
-                .map(|x| x.to_string())
-                .collect::<Vec<_>>()
-                .join("x")
-        )
+        qmatmul_operation_name("mul", self.input_datatype, &self.in_shape, &self.matrix)
     }
 }
 
@@ -883,6 +931,79 @@ fn activation_cache_salt(activation: tile_ir::PairedActivation) -> u32 {
         tile_ir::PairedActivation::SwiGLU => 0,
         tile_ir::PairedActivation::GeGLU => 0x4000_0000,
         tile_ir::PairedActivation::ReGLU => 0x8000_0000,
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Q4KPairedTile {
+    X4x1,
+    X4x4,
+    X8x1,
+    X8x2,
+    X2x2,
+    X2x4,
+}
+
+impl Q4KPairedTile {
+    fn from_env() -> Self {
+        let tile_choice = std::env::var("FUSOR_Q4K_PAIRED_TILE")
+            .or_else(|_| std::env::var("FUSOR_Q4K_SWIGLU_TILE"))
+            .unwrap_or_default();
+        match tile_choice.as_str() {
+            "4x1" => Self::X4x1,
+            "4x4" => Self::X4x4,
+            "8x1" => Self::X8x1,
+            "8x2" => Self::X8x2,
+            "2x2" => Self::X2x2,
+            "2x4" => Self::X2x4,
+            _ => Self::X8x2,
+        }
+    }
+
+    const fn name(self) -> &'static str {
+        match self {
+            Self::X4x1 => "4x1",
+            Self::X4x4 => "4x4",
+            Self::X8x1 => "8x1",
+            Self::X8x2 => "8x2",
+            Self::X2x2 => "2x2",
+            Self::X2x4 => "2x4",
+        }
+    }
+
+    const fn cols_per_workgroup(self) -> u32 {
+        match self {
+            Self::X4x1 | Self::X2x2 => 4,
+            Self::X2x4 | Self::X8x1 => 8,
+            Self::X4x4 | Self::X8x2 => 16,
+        }
+    }
+
+    fn emit(
+        self,
+        phase: &mut tile_ir::tile::Program,
+        a: &tile_ir::tile::Storage<tile_ir::F32, 2>,
+        b: &tile_ir::QuantizedMatrix,
+        y: &tile_ir::tile::Storage<tile_ir::F32, 2>,
+        pair_len: u32,
+        m: u32,
+        workgroups_x: u32,
+        activation: tile_ir::PairedActivation,
+    ) {
+        macro_rules! emit_tile {
+            ($method:ident) => {
+                phase.$method(a, b, y, pair_len, m, workgroups_x, activation)
+            };
+        }
+
+        match self {
+            Self::X4x1 => emit_tile!(qgemv_q4k_paired_4x1),
+            Self::X4x4 => emit_tile!(qgemv_q4k_paired_4x4),
+            Self::X8x1 => emit_tile!(qgemv_q4k_paired_8x1),
+            Self::X8x2 => emit_tile!(qgemv_q4k_paired_8x2),
+            Self::X2x2 => emit_tile!(qgemv_q4k_paired_2x2),
+            Self::X2x4 => emit_tile!(qgemv_q4k_paired_2x4),
+        }
     }
 }
 
@@ -908,11 +1029,7 @@ impl Operation for QMatMulPairedOperation {
     }
 
     fn inputs(&self, nodes: &crate::compute_graph::ComputeGraphInner) -> Vec<MirValue> {
-        let input = nodes.get_result(self.input).unwrap();
-        let q_matrix = self.matrix.clone();
-        let device = input.device();
-        let output_tensor = TensorData::new_for_shape(device, &self.out_shape, input.datatype());
-        vec![input.into(), q_matrix.into(), output_tensor.into()]
+        qmatmul_operation_inputs(self.input, &self.matrix, &self.out_shape, nodes)
     }
 
     fn build_direct_kernel(
@@ -950,24 +1067,9 @@ impl Operation for QMatMulPairedOperation {
 
         let limits = graph.device().limits();
         let max_workgroups = limits.max_compute_workgroups_per_dimension;
-        let tile_choice = std::env::var("FUSOR_Q4K_PAIRED_TILE")
-            .or_else(|_| std::env::var("FUSOR_Q4K_SWIGLU_TILE"))
-            .unwrap_or_default();
-        let tile_name = match tile_choice.as_str() {
-            "4x1" => "4x1",
-            "4x4" => "4x4",
-            "8x1" => "8x1",
-            "8x2" => "8x2",
-            "2x2" => "2x2",
-            "2x4" => "2x4",
-            _ => "8x2",
-        };
-        let cols_per_workgroup = match tile_name {
-            "4x1" | "2x2" => 4,
-            "2x4" | "4x2" | "8x1" => 8,
-            "4x4" | "8x2" => 16,
-            _ => unreachable!(),
-        };
+        let tile = Q4KPairedTile::from_env();
+        let tile_name = tile.name();
+        let cols_per_workgroup = tile.cols_per_workgroup();
         let cols_workgroups = pair_len.div_ceil(cols_per_workgroup);
         let total_workgroups = cols_workgroups.checked_mul(m)?;
         let [workgroups_x, _] = split_workgroups_2d(total_workgroups, max_workgroups)?;
@@ -986,121 +1088,31 @@ impl Operation for QMatMulPairedOperation {
             input.layout(),
             output.layout(),
         );
-        if let Some(pipeline) = matrix
-            .direct_pipeline_cache()
-            .write()
-            .get(&pipeline_key)
-            .cloned()
-        {
-            return Some(kernel_backend::storage3_kernel_with_prepared_pipeline(
-                "q_mat_paired",
-                "",
-                pipeline,
-                input.buffer().clone(),
-                matrix.buffer().clone(),
-                output.buffer().clone(),
-                dispatch_size,
-            ));
-        }
         let kernel_name = self.name();
         let cache_key = format!(
             "{kernel_name}:direct:{format:?}:tile={tile_name}:m={m}:k={k}:pair={pair_len}:act={activation:?}:dispatch={dispatch_size:?}:{:?}:{:?}",
             input.layout(),
             output.layout()
         );
-        let pipeline = kernel_backend::storage3_pipeline_from_ir(
+        qmatmul_direct_kernel_from_ir(
             &graph.device(),
-            &kernel_name,
-            cache_key.clone(),
+            "q_mat_paired".to_owned(),
+            kernel_name,
+            cache_key,
+            matrix,
+            pipeline_key,
+            input,
+            output,
+            dispatch_size,
             || {
                 Some(tile_ir::tile::build(move |phase| {
                     let a = tile_storage_read_with_direct_layout(phase, a_view);
                     let b = phase.quantized_matrix(format, k, pair_len * 2);
                     let y = tile_storage_write_with_direct_layout(phase, y_view);
-                    match tile_name {
-                        "4x1" => phase.qgemv_q4k_paired_4x1(
-                            &a,
-                            &b,
-                            &y,
-                            pair_len,
-                            m,
-                            workgroups_x,
-                            activation,
-                        ),
-                        "4x4" => phase.qgemv_q4k_paired_4x4(
-                            &a,
-                            &b,
-                            &y,
-                            pair_len,
-                            m,
-                            workgroups_x,
-                            activation,
-                        ),
-                        "8x1" => phase.qgemv_q4k_paired_8x1(
-                            &a,
-                            &b,
-                            &y,
-                            pair_len,
-                            m,
-                            workgroups_x,
-                            activation,
-                        ),
-                        "8x2" => phase.qgemv_q4k_paired_8x2(
-                            &a,
-                            &b,
-                            &y,
-                            pair_len,
-                            m,
-                            workgroups_x,
-                            activation,
-                        ),
-                        "2x2" => phase.qgemv_q4k_paired_2x2(
-                            &a,
-                            &b,
-                            &y,
-                            pair_len,
-                            m,
-                            workgroups_x,
-                            activation,
-                        ),
-                        "2x4" => phase.qgemv_q4k_paired_2x4(
-                            &a,
-                            &b,
-                            &y,
-                            pair_len,
-                            m,
-                            workgroups_x,
-                            activation,
-                        ),
-                        "4x2" => phase.qgemv_q4k_paired_4x2(
-                            &a,
-                            &b,
-                            &y,
-                            pair_len,
-                            m,
-                            workgroups_x,
-                            activation,
-                        ),
-                        _ => unreachable!(),
-                    }
+                    tile.emit(phase, &a, &b, &y, pair_len, m, workgroups_x, activation);
                 }))
             },
-        )?;
-        let pipeline = matrix
-            .direct_pipeline_cache()
-            .write()
-            .get_or_insert(pipeline_key, || pipeline.clone())
-            .clone();
-
-        Some(kernel_backend::storage3_kernel_with_prepared_pipeline(
-            kernel_name,
-            cache_key,
-            pipeline,
-            input.buffer().clone(),
-            matrix.buffer().clone(),
-            output.buffer().clone(),
-            dispatch_size,
-        ))
+        )
     }
 
     fn requires_single_kernel_batch(&self) -> bool {
@@ -1108,8 +1120,7 @@ impl Operation for QMatMulPairedOperation {
     }
 
     fn output(&self, _: &crate::compute_graph::ComputeGraphInner, inputs: &[MirValue]) -> MirValue {
-        let output_tensor = inputs[2].as_tensor().unwrap();
-        output_tensor.clone().into()
+        qmatmul_operation_output(inputs)
     }
 
     fn name(&self) -> String {
@@ -1118,23 +1129,7 @@ impl Operation for QMatMulPairedOperation {
             tile_ir::PairedActivation::GeGLU => "geglu",
             tile_ir::PairedActivation::ReGLU => "reglu",
         };
-        format!(
-            "q_mat_{}_{}_{}_{}_{}",
-            act,
-            self.input_datatype,
-            self.in_shape
-                .iter()
-                .map(|x| x.to_string())
-                .collect::<Vec<_>>()
-                .join("x"),
-            self.matrix.datatype,
-            self.matrix
-                .shape
-                .iter()
-                .map(|x| x.to_string())
-                .collect::<Vec<_>>()
-                .join("x")
-        )
+        qmatmul_operation_name(act, self.input_datatype, &self.in_shape, &self.matrix)
     }
 }
 

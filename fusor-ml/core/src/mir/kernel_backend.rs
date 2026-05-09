@@ -1,6 +1,13 @@
-use std::sync::Arc;
+use std::{
+    hash::{Hash, Hasher},
+    num::NonZeroUsize,
+    sync::Arc,
+};
 
 use fusor_tile_ir as tile_ir;
+use lru::LruCache;
+use parking_lot::RwLock;
+use rustc_hash::FxBuildHasher;
 
 use crate::{
     Device,
@@ -16,6 +23,38 @@ pub(crate) mod sampling_topk;
 #[derive(Clone, Debug)]
 pub(crate) struct CompiledKernelModule {
     module: Arc<wgpu::naga::Module>,
+}
+
+pub(crate) type ModuleCache = RwLock<LruCache<[u64; 2], CompiledKernelModule, FxBuildHasher>>;
+
+pub(crate) fn module_cache(capacity: usize) -> ModuleCache {
+    RwLock::new(LruCache::with_hasher(
+        NonZeroUsize::new(capacity).expect("module cache capacity must be non-zero"),
+        Default::default(),
+    ))
+}
+
+pub(crate) fn cached_hashed_kernel_module(
+    cache: &'static ModuleCache,
+    key: [u64; 2],
+    build_module: impl FnOnce() -> Option<CompiledKernelModule>,
+) -> Option<CompiledKernelModule> {
+    if let Some(module) = cache.write().get(&key) {
+        return Some(module.clone());
+    }
+    let module = build_module()?;
+    Some(cache.write().get_or_insert(key, || module.clone()).clone())
+}
+
+pub(crate) fn hash_layout<H: Hasher>(state: &mut H, layout: &crate::Layout) {
+    layout.offset().hash(state);
+    layout.shape().hash(state);
+    layout.strides().hash(state);
+}
+
+pub(crate) fn hash_strided_layout<H: Hasher>(state: &mut H, layout: &crate::Layout) {
+    layout.offset().hash(state);
+    layout.strides().hash(state);
 }
 
 fn compiled_module(module: wgpu::naga::Module) -> CompiledKernelModule {

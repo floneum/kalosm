@@ -167,33 +167,12 @@ async fn assert_q_mat_mul_matches_host_reference(fixture: &QuantizedFixture, fuz
 }
 
 #[tokio::test]
-async fn q4k_q_mat_mul_swiglu_matches_cpu_reference() {
-    paired_matches_cpu_for_rows(1, PairedKind::SwiGLU).await;
-}
-
-#[tokio::test]
-async fn q4k_q_mat_mul_swiglu_multi_row_matches_cpu_reference() {
-    paired_matches_cpu_for_rows(4, PairedKind::SwiGLU).await;
-}
-
-#[tokio::test]
-async fn q4k_q_mat_mul_geglu_matches_cpu_reference() {
-    paired_matches_cpu_for_rows(1, PairedKind::GeGLU).await;
-}
-
-#[tokio::test]
-async fn q4k_q_mat_mul_geglu_multi_row_matches_cpu_reference() {
-    paired_matches_cpu_for_rows(4, PairedKind::GeGLU).await;
-}
-
-#[tokio::test]
-async fn q4k_q_mat_mul_reglu_matches_cpu_reference() {
-    paired_matches_cpu_for_rows(1, PairedKind::ReGLU).await;
-}
-
-#[tokio::test]
-async fn q4k_q_mat_mul_reglu_multi_row_matches_cpu_reference() {
-    paired_matches_cpu_for_rows(4, PairedKind::ReGLU).await;
+async fn q4k_q_mat_mul_paired_matches_cpu_reference() {
+    for kind in [PairedKind::SwiGLU, PairedKind::GeGLU, PairedKind::ReGLU] {
+        for rows in [1, 4] {
+            paired_matches_cpu_for_rows(rows, kind).await;
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -371,312 +350,86 @@ fn q6k_raw_bytes(shape: [usize; 2]) -> Vec<u8> {
     bytes
 }
 
-macro_rules! quantized_fixture_fn {
-    ($fn_name:ident, $block:ty, $ty:expr, $shape:expr, $raw_bytes_fn:ident, $rows:expr, $deq_tol:expr, $q_tol:expr) => {
-        fn $fn_name() -> QuantizedFixture {
-            let shape = $shape;
-            build_fixture::<$block>($ty, shape, $raw_bytes_fn(shape), $rows, $deq_tol, $q_tol)
-        }
+macro_rules! quantized_fixture_cases {
+    ($($fn_name:ident: $block:ty, $ty:expr, $shape:expr, $raw_bytes_fn:ident, $rows:expr, $deq_tol:expr, $q_tol:expr, $seed:expr, $dequantize:expr;)*) => {
+        $(
+            fn $fn_name() -> QuantizedFixture {
+                let shape = $shape;
+                build_fixture::<$block>($ty, shape, $raw_bytes_fn(shape), $rows, $deq_tol, $q_tol)
+            }
+        )*
+
+        const QUANTIZED_FIXTURE_CASES: &[(fn() -> QuantizedFixture, u64, bool)] = &[
+            $(($fn_name, $seed, $dequantize),)*
+        ];
     };
 }
 
-quantized_fixture_fn!(
-    q4_0_fixture,
-    BlockQ4_0,
-    GgmlType::Q4_0,
-    [2, 64],
-    q4_0_raw_bytes,
-    3,
-    1e-5,
-    1.0
-);
-quantized_fixture_fn!(
-    q5_0_fixture,
-    BlockQ5_0,
-    GgmlType::Q5_0,
-    [2, 64],
-    q5_0_raw_bytes,
-    1,
-    1e-5,
-    1.0
-);
-quantized_fixture_fn!(
-    q8_0_fixture,
-    BlockQ8_0,
-    GgmlType::Q8_0,
-    [2, 64],
-    q8_0_raw_bytes,
-    1,
-    1e-5,
-    0.5
-);
-quantized_fixture_fn!(
-    q4k_fixture,
-    BlockQ4K,
-    GgmlType::Q4K,
-    [2, 512],
-    q4k_raw_bytes,
-    1,
-    1e-4,
-    2.0
-);
-quantized_fixture_fn!(
-    q5k_fixture,
-    BlockQ5K,
-    GgmlType::Q5K,
-    [2, 512],
-    q5k_raw_bytes,
-    1,
-    1e-4,
-    1.0
-);
-quantized_fixture_fn!(
-    q6k_fixture,
-    BlockQ6K,
-    GgmlType::Q6K,
-    [2, 512],
-    q6k_raw_bytes,
-    1,
-    1e-4,
-    1.0
-);
-quantized_fixture_fn!(
-    q5_0_wide_fixture,
-    BlockQ5_0,
-    GgmlType::Q5_0,
-    [2, 64],
-    q5_0_raw_bytes,
-    3,
-    1e-5,
-    1.0
-);
-quantized_fixture_fn!(
-    q8_0_wide_fixture,
-    BlockQ8_0,
-    GgmlType::Q8_0,
-    [2, 64],
-    q8_0_raw_bytes,
-    3,
-    1e-5,
-    0.5
-);
-quantized_fixture_fn!(
-    q8_0_single_row_wide_output_fixture,
-    BlockQ8_0,
-    GgmlType::Q8_0,
-    [96, 64],
-    q8_0_raw_bytes,
-    1,
-    1e-5,
-    0.5
-);
-quantized_fixture_fn!(
-    q4k_wide_fixture,
-    BlockQ4K,
-    GgmlType::Q4K,
-    [2, 512],
-    q4k_raw_bytes,
-    3,
-    1e-4,
-    2.0
-);
-quantized_fixture_fn!(
-    q4k_large_qgemv_fixture,
-    BlockQ4K,
-    GgmlType::Q4K,
-    [8192, 512],
-    q4k_raw_bytes,
-    1,
-    1e-4,
-    2.0
-);
-quantized_fixture_fn!(
-    q4k_mid_qgemv_fixture,
-    BlockQ4K,
-    GgmlType::Q4K,
-    [4096, 512],
-    q4k_raw_bytes,
-    1,
-    1e-4,
-    2.0
-);
-quantized_fixture_fn!(
-    q4k_tall_qgemv_fixture,
-    BlockQ4K,
-    GgmlType::Q4K,
-    [128, 4608],
-    q4k_raw_bytes,
-    1,
-    1e-4,
-    2.0
-);
-quantized_fixture_fn!(
-    q5k_wide_fixture,
-    BlockQ5K,
-    GgmlType::Q5K,
-    [2, 512],
-    q5k_raw_bytes,
-    3,
-    1e-4,
-    1.0
-);
-quantized_fixture_fn!(
-    q6k_wide_fixture,
-    BlockQ6K,
-    GgmlType::Q6K,
-    [2, 512],
-    q6k_raw_bytes,
-    3,
-    1e-4,
-    1.0
-);
-quantized_fixture_fn!(
-    q6k_large_qgemv_fixture,
-    BlockQ6K,
-    GgmlType::Q6K,
-    [8192, 512],
-    q6k_raw_bytes,
-    1,
-    1e-4,
-    1.0
-);
-quantized_fixture_fn!(
-    q6k_tall_qgemv_fixture,
-    BlockQ6K,
-    GgmlType::Q6K,
-    [128, 4608],
-    q6k_raw_bytes,
-    1,
-    1e-4,
-    1.0
-);
-quantized_fixture_fn!(
-    q4_0_tiled_fixture,
-    BlockQ4_0,
-    GgmlType::Q4_0,
-    [64, 64],
-    q4_0_raw_bytes,
-    64,
-    1e-5,
-    1.0
-);
-quantized_fixture_fn!(
-    q5_0_tiled_fixture,
-    BlockQ5_0,
-    GgmlType::Q5_0,
-    [64, 64],
-    q5_0_raw_bytes,
-    64,
-    1e-5,
-    1.0
-);
-quantized_fixture_fn!(
-    q8_0_tiled_fixture,
-    BlockQ8_0,
-    GgmlType::Q8_0,
-    [64, 64],
-    q8_0_raw_bytes,
-    64,
-    1e-5,
-    0.5
-);
-quantized_fixture_fn!(
-    q4k_tiled_fixture,
-    BlockQ4K,
-    GgmlType::Q4K,
-    [64, 512],
-    q4k_raw_bytes,
-    64,
-    1e-4,
-    2.0
-);
-quantized_fixture_fn!(
-    q5k_tiled_fixture,
-    BlockQ5K,
-    GgmlType::Q5K,
-    [64, 512],
-    q5k_raw_bytes,
-    64,
-    1e-4,
-    1.0
-);
-quantized_fixture_fn!(
-    q6k_tiled_fixture,
-    BlockQ6K,
-    GgmlType::Q6K,
-    [64, 512],
-    q6k_raw_bytes,
-    64,
-    1e-4,
-    1.0
-);
-
-macro_rules! quantized_dequantize_test {
-    ($test_name:ident, $fixture_fn:ident) => {
-        #[tokio::test]
-        async fn $test_name() {
-            let QuantizedFixture {
-                ty,
-                weight_shape,
-                raw_bytes,
-                dequantized,
-                dequantize_tol,
-                ..
-            } = $fixture_fn();
-            assert_dequantize_matches_host_reference(
-                ty,
-                weight_shape,
-                raw_bytes,
-                dequantized,
-                dequantize_tol,
-            )
-            .await;
-        }
-    };
+quantized_fixture_cases! {
+    q4_0_fixture: BlockQ4_0, GgmlType::Q4_0, [2, 64], q4_0_raw_bytes, 3, 1e-5, 1.0, 800, true;
+    q5_0_fixture: BlockQ5_0, GgmlType::Q5_0, [2, 64], q5_0_raw_bytes, 1, 1e-5, 1.0, 801, true;
+    q8_0_fixture: BlockQ8_0, GgmlType::Q8_0, [2, 64], q8_0_raw_bytes, 1, 1e-5, 0.5, 802, true;
+    q4k_fixture: BlockQ4K, GgmlType::Q4K, [2, 512], q4k_raw_bytes, 1, 1e-4, 2.0, 803, true;
+    q5k_fixture: BlockQ5K, GgmlType::Q5K, [2, 512], q5k_raw_bytes, 1, 1e-4, 1.0, 804, true;
+    q6k_fixture: BlockQ6K, GgmlType::Q6K, [2, 512], q6k_raw_bytes, 1, 1e-4, 1.0, 805, true;
+    q5_0_wide_fixture: BlockQ5_0, GgmlType::Q5_0, [2, 64], q5_0_raw_bytes, 3, 1e-5, 1.0, 810, false;
+    q8_0_wide_fixture: BlockQ8_0, GgmlType::Q8_0, [2, 64], q8_0_raw_bytes, 3, 1e-5, 0.5, 811, false;
+    q8_0_single_row_wide_output_fixture: BlockQ8_0, GgmlType::Q8_0, [96, 64], q8_0_raw_bytes, 1, 1e-5, 0.5, 826, false;
+    q4k_wide_fixture: BlockQ4K, GgmlType::Q4K, [2, 512], q4k_raw_bytes, 3, 1e-4, 2.0, 812, false;
+    q4k_large_qgemv_fixture: BlockQ4K, GgmlType::Q4K, [8192, 512], q4k_raw_bytes, 1, 1e-4, 2.0, 827, false;
+    q4k_mid_qgemv_fixture: BlockQ4K, GgmlType::Q4K, [4096, 512], q4k_raw_bytes, 1, 1e-4, 2.0, 830, false;
+    q4k_tall_qgemv_fixture: BlockQ4K, GgmlType::Q4K, [128, 4608], q4k_raw_bytes, 1, 1e-4, 2.0, 828, false;
+    q5k_wide_fixture: BlockQ5K, GgmlType::Q5K, [2, 512], q5k_raw_bytes, 3, 1e-4, 1.0, 813, false;
+    q6k_wide_fixture: BlockQ6K, GgmlType::Q6K, [2, 512], q6k_raw_bytes, 3, 1e-4, 1.0, 814, false;
+    q6k_large_qgemv_fixture: BlockQ6K, GgmlType::Q6K, [8192, 512], q6k_raw_bytes, 1, 1e-4, 1.0, 831, false;
+    q6k_tall_qgemv_fixture: BlockQ6K, GgmlType::Q6K, [128, 4608], q6k_raw_bytes, 1, 1e-4, 1.0, 829, false;
+    q4_0_tiled_fixture: BlockQ4_0, GgmlType::Q4_0, [64, 64], q4_0_raw_bytes, 64, 1e-5, 1.0, 820, false;
+    q5_0_tiled_fixture: BlockQ5_0, GgmlType::Q5_0, [64, 64], q5_0_raw_bytes, 64, 1e-5, 1.0, 821, false;
+    q8_0_tiled_fixture: BlockQ8_0, GgmlType::Q8_0, [64, 64], q8_0_raw_bytes, 64, 1e-5, 0.5, 822, false;
+    q4k_tiled_fixture: BlockQ4K, GgmlType::Q4K, [64, 512], q4k_raw_bytes, 64, 1e-4, 2.0, 823, false;
+    q5k_tiled_fixture: BlockQ5K, GgmlType::Q5K, [64, 512], q5k_raw_bytes, 64, 1e-4, 1.0, 824, false;
+    q6k_tiled_fixture: BlockQ6K, GgmlType::Q6K, [64, 512], q6k_raw_bytes, 64, 1e-4, 1.0, 825, false;
 }
 
-macro_rules! quantized_q_mat_mul_test {
-    ($test_name:ident, $fixture_fn:ident, $seed:expr) => {
-        #[tokio::test]
-        async fn $test_name() {
-            let fixture = $fixture_fn();
-            assert_q_mat_mul_matches_host_reference(
-                &fixture,
-                QMatMulFuzz {
-                    seed: $seed,
-                    distribution: Uniform::new(-0.25, 0.25).unwrap(),
-                },
-            )
-            .await;
-        }
-    };
+#[tokio::test]
+async fn quantized_dequantize_matches_cpu_reference() {
+    for &(fixture, _, _) in QUANTIZED_FIXTURE_CASES
+        .iter()
+        .filter(|&&(_, _, dequantize)| dequantize)
+    {
+        let QuantizedFixture {
+            ty,
+            weight_shape,
+            raw_bytes,
+            dequantized,
+            dequantize_tol,
+            ..
+        } = fixture();
+        assert_dequantize_matches_host_reference(
+            ty,
+            weight_shape,
+            raw_bytes,
+            dequantized,
+            dequantize_tol,
+        )
+        .await;
+    }
 }
 
-macro_rules! quantized_fixture_tests {
-    ($fixture_fn:ident, $dequantize_test:ident, $q_mat_mul_test:ident, $seed:expr) => {
-        quantized_dequantize_test!($dequantize_test, $fixture_fn);
-        quantized_q_mat_mul_test!($q_mat_mul_test, $fixture_fn, $seed);
-    };
+#[tokio::test]
+async fn quantized_q_mat_mul_matches_cpu_reference() {
+    for &(fixture, seed, _) in QUANTIZED_FIXTURE_CASES {
+        let fixture = fixture();
+        assert_q_mat_mul_matches_host_reference(
+            &fixture,
+            QMatMulFuzz {
+                seed,
+                distribution: Uniform::new(-0.25, 0.25).unwrap(),
+            },
+        )
+        .await;
+    }
 }
-
-quantized_fixture_tests!(
-    q4_0_fixture,
-    q4_0_dequantize_matches_cpu_reference,
-    q4_0_q_mat_mul_matches_cpu_reference,
-    800
-);
-quantized_fixture_tests!(
-    q5_0_fixture,
-    q5_0_dequantize_matches_cpu_reference,
-    q5_0_q_mat_mul_matches_cpu_reference,
-    801
-);
-quantized_fixture_tests!(
-    q8_0_fixture,
-    q8_0_dequantize_matches_cpu_reference,
-    q8_0_q_mat_mul_matches_cpu_reference,
-    802
-);
 
 #[tokio::test]
 async fn q8_0_dequantize_then_add_matches_cpu_reference() {
@@ -708,41 +461,6 @@ async fn q8_0_dequantize_then_add_matches_cpu_reference() {
     .await
     .unwrap();
 }
-
-quantized_fixture_tests!(
-    q4k_fixture,
-    q4k_dequantize_matches_cpu_reference,
-    q4k_q_mat_mul_matches_cpu_reference,
-    803
-);
-quantized_fixture_tests!(
-    q5k_fixture,
-    q5k_dequantize_matches_cpu_reference,
-    q5k_q_mat_mul_matches_cpu_reference,
-    804
-);
-quantized_fixture_tests!(
-    q6k_fixture,
-    q6k_dequantize_matches_cpu_reference,
-    q6k_q_mat_mul_matches_cpu_reference,
-    805
-);
-
-quantized_q_mat_mul_test!(
-    q5_0_q_mat_mul_multi_row_matches_cpu_reference,
-    q5_0_wide_fixture,
-    810
-);
-quantized_q_mat_mul_test!(
-    q8_0_q_mat_mul_multi_row_matches_cpu_reference,
-    q8_0_wide_fixture,
-    811
-);
-quantized_q_mat_mul_test!(
-    q8_0_q_mat_mul_single_row_wide_output_matches_cpu_reference,
-    q8_0_single_row_wide_output_fixture,
-    826
-);
 
 #[tokio::test]
 async fn q5_0_q_mat_mul_single_row_splits_large_qgemv_dispatch() {
@@ -785,77 +503,6 @@ async fn q5_0_q_mat_mul_single_row_splits_large_qgemv_dispatch() {
         "large qgemv dispatch regression requires a subgroup-capable GPU"
     );
 }
-
-quantized_q_mat_mul_test!(
-    q4k_q_mat_mul_multi_row_matches_cpu_reference,
-    q4k_wide_fixture,
-    812
-);
-quantized_q_mat_mul_test!(
-    q4k_q_mat_mul_large_qgemv_matches_cpu_reference,
-    q4k_large_qgemv_fixture,
-    827
-);
-quantized_q_mat_mul_test!(
-    q4k_q_mat_mul_mid_qgemv_matches_cpu_reference,
-    q4k_mid_qgemv_fixture,
-    830
-);
-quantized_q_mat_mul_test!(
-    q4k_q_mat_mul_tall_qgemv_matches_cpu_reference,
-    q4k_tall_qgemv_fixture,
-    828
-);
-quantized_q_mat_mul_test!(
-    q5k_q_mat_mul_multi_row_matches_cpu_reference,
-    q5k_wide_fixture,
-    813
-);
-quantized_q_mat_mul_test!(
-    q6k_q_mat_mul_multi_row_matches_cpu_reference,
-    q6k_wide_fixture,
-    814
-);
-quantized_q_mat_mul_test!(
-    q6k_q_mat_mul_large_qgemv_matches_cpu_reference,
-    q6k_large_qgemv_fixture,
-    831
-);
-quantized_q_mat_mul_test!(
-    q6k_q_mat_mul_tall_qgemv_matches_cpu_reference,
-    q6k_tall_qgemv_fixture,
-    829
-);
-quantized_q_mat_mul_test!(
-    q4_0_q_mat_mul_tiled_matches_cpu_reference,
-    q4_0_tiled_fixture,
-    820
-);
-quantized_q_mat_mul_test!(
-    q5_0_q_mat_mul_tiled_matches_cpu_reference,
-    q5_0_tiled_fixture,
-    821
-);
-quantized_q_mat_mul_test!(
-    q8_0_q_mat_mul_tiled_matches_cpu_reference,
-    q8_0_tiled_fixture,
-    822
-);
-quantized_q_mat_mul_test!(
-    q4k_q_mat_mul_tiled_matches_cpu_reference,
-    q4k_tiled_fixture,
-    823
-);
-quantized_q_mat_mul_test!(
-    q5k_q_mat_mul_tiled_matches_cpu_reference,
-    q5k_tiled_fixture,
-    824
-);
-quantized_q_mat_mul_test!(
-    q6k_q_mat_mul_tiled_matches_cpu_reference,
-    q6k_tiled_fixture,
-    825
-);
 
 fn f32_weight_rows() -> Vec<Vec<f32>> {
     vec![vec![1.0, 2.0, 3.0, 4.0], vec![5.0, 6.0, 7.0, 8.0]]

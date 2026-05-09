@@ -4,12 +4,12 @@ use std::ops::{Add, BitAnd, BitXor, Div, Mul, Rem, Sub};
 use crate::ir::{
     BlockDequantId, BufferAccess, BufferDecl, BufferRef, CoopAccDecl, CoopAccId, CoopFragmentId,
     CoopOperandRole, DynamicOffset, F32Bits, F32Vec4, Im2ColNhwcMap, KernelIr, Layout, LocalDecl,
-    LocalRef, LoopFoldGroup, LoopFoldGroupId, MemoryLevel, Numeric, Op, PinId, Shape,
-    StorageIndexMap, StorageView, TileBinaryOp, TileCompareOp, TileDecl, TileExpr, TileIndexExpr,
-    TileLevel, TileLinearLoadExpr, TileLinearStoreStmt, TileLiteral, TileLoadExpr, TileMaskExpr,
-    TileOrigin, TileProgramOp, TileQuantizedLoadExpr, TileReduceOp, TileRef, TileScalarExpr,
-    TileStmt, TileStoreStmt, TileUnaryOp, TileVec4LoadExpr, TileVec4StoreStmt, WorkgroupAxis,
-    WorkgroupOffset, F32, U32,
+    LocalRef, LoopFoldGroup, LoopFoldGroupId, MemoryLevel, Numeric, Op, PinId,
+    QuantizedVecDotKind, Shape, StorageIndexMap, StorageView, TileBinaryOp, TileCompareOp,
+    TileDecl, TileExpr, TileIndexExpr, TileIndexedStoreStmt, TileLevel, TileLinearLoadExpr,
+    TileLiteral, TileLoadExpr, TileMaskExpr, TileOrigin, TileProgramOp, TileQuantizedLoadExpr,
+    TileReduceOp, TileRef, TileScalarExpr, TileStmt, TileStoreStmt, TileUnaryOp, TileVec4LoadExpr,
+    WorkgroupAxis, WorkgroupOffset, F32, U32,
 };
 use crate::quantized::{GgmlQuantFormat, QuantizedMatrix};
 
@@ -86,40 +86,129 @@ macro_rules! qgemv_ggml_env {
     };
 }
 
-macro_rules! qgemv_ggml_env_with_old {
-    (
-        $program:expr,
-        $method:ident,
-        $var:literal,
-        $a:expr,
-        $b:expr,
-        $y:expr,
-        $workgroups_x:expr,
-        old = ($old_subgroups:literal, $old_cols:literal, $old_values:literal, $old_block:literal),
-        [
-            $(($name:literal, $subgroups:literal, $cols:literal, $block:literal)),+ $(,)?
-        ]
-    ) => {
-        match std::env::var($var).as_deref() {
-            Ok("old") => {
-                return $program.qgemv_perf::<$old_subgroups, $old_cols, $old_values, $old_block>(
-                    $a,
-                    $b,
-                    $y,
-                    $workgroups_x,
-                );
+macro_rules! qgemv_ggml_env_standard_tiles {
+    ($program:expr, $method:ident, $var:literal, $a:expr, $b:expr, $y:expr, $workgroups_x:expr) => {
+        qgemv_ggml_env!(
+            $program,
+            $method,
+            $var,
+            $a,
+            $b,
+            $y,
+            $workgroups_x,
+            [
+                ("ggml_2x2", 2, 2, 64),
+                ("ggml_2x4", 2, 4, 64),
+                ("ggml_2x8", 2, 8, 64),
+                ("ggml_4x2", 4, 2, 128),
+                ("ggml_4x4", 4, 4, 128),
+                ("ggml_4x8", 4, 8, 128),
+                ("ggml_8x2", 8, 2, 256),
+                ("ggml_8x4", 8, 4, 256),
+            ]
+        );
+    };
+}
+
+macro_rules! tile_reduce_entrypoints {
+    ($(($reduce:ident, $loop_reduce:ident, $group_reduce:ident, $subgroup_reduce:ident, $op:ident)),+ $(,)?) => {
+        $(
+            pub fn $reduce(&mut self, value: Tile<BLOCK>) -> Scalar {
+                self.reduce(TileReduceOp::$op, value)
             }
-            $(
-                Ok($name) => {
-                    return $program.$method::<$subgroups, $cols, $block>(
-                        $a,
-                        $b,
-                        $y,
-                        $workgroups_x,
-                    );
-                }
-            )+
-            _ => {}
+
+            pub fn $loop_reduce(&mut self, iterations: u32, value: Tile<BLOCK>) -> Scalar {
+                self.loop_reduce(TileReduceOp::$op, iterations, value)
+            }
+
+            pub fn $group_reduce<const GROUP: usize>(&mut self, value: Tile<BLOCK>) -> Tile<BLOCK> {
+                self.group_reduce::<GROUP>(TileReduceOp::$op, value)
+            }
+
+            pub fn $subgroup_reduce(&self, value: Tile<BLOCK>) -> Tile<BLOCK> {
+                self.subgroup_reduce(TileReduceOp::$op, value)
+            }
+        )+
+    };
+}
+
+macro_rules! storage_accessors {
+    ($read:ident, $write:ident($($arg:ident: $ty:ty),*) => ($layout:expr, $offset:expr, $index_map:expr)) => {
+        pub fn $read<T: Numeric, const R: usize>(&mut self, $($arg: $ty),*) -> Storage<T, R> {
+            self.storage_with_layout_and_access($layout, $offset, $index_map, BufferAccess::Read)
+        }
+
+        pub fn $write<T: Numeric, const R: usize>(&mut self, $($arg: $ty),*) -> Storage<T, R> {
+            self.storage_with_layout_and_access(
+                $layout,
+                $offset,
+                $index_map,
+                BufferAccess::ReadWrite,
+            )
+        }
+    };
+}
+
+macro_rules! erased_storage_accessors {
+    ($read:ident, $write:ident($($arg:ident: $ty:ty),*) => ($layout:expr, $offset:expr)) => {
+        pub fn $read<const R: usize>(
+            &mut self,
+            element: crate::ElementType,
+            $($arg: $ty),*
+        ) -> ErasedStorage<R> {
+            ErasedStorage {
+                view: self.storage_view_with_layout_and_access::<R>(
+                    element,
+                    $layout,
+                    $offset,
+                    None,
+                    BufferAccess::Read,
+                ),
+            }
+        }
+
+        pub fn $write<const R: usize>(
+            &mut self,
+            element: crate::ElementType,
+            $($arg: $ty),*
+        ) -> ErasedStorage<R> {
+            ErasedStorage {
+                view: self.storage_view_with_layout_and_access::<R>(
+                    element,
+                    $layout,
+                    $offset,
+                    None,
+                    BufferAccess::ReadWrite,
+                ),
+            }
+        }
+    };
+}
+
+macro_rules! quantized_vec_dot_entrypoint {
+    ($name:ident, $kind:ident, [$($n:literal),+ $(,)?], $msg:literal) => {
+        pub fn $name<const N: usize>(
+            &self,
+            a: [Tile<BLOCK>; N],
+            matrix: &QuantizedMatrix,
+            k_base: impl IntoIndex<BLOCK>,
+            col: impl IntoIndex<BLOCK>,
+            mask: Mask<BLOCK>,
+            fill: f32,
+        ) -> Tile<BLOCK> {
+            assert!($(N == $n)||+, $msg);
+            Tile {
+                expr: TileExpr::QuantizedVecDot {
+                    kind: QuantizedVecDotKind::$kind,
+                    a: a.into_iter().map(|value| Box::new(value.expr)).collect(),
+                    src: matrix.clone(),
+                    k_base: k_base.into_index(),
+                    col: col.into_index(),
+                    mask: mask.expr,
+                    fill: F32Bits::new(fill),
+                    block_n: N as u32,
+                },
+            }
         }
     };
 }
@@ -186,6 +275,78 @@ fn store_qgemv_sums<const BLOCK: usize, const COLS_PER_SUBGROUP: usize>(
     }
 }
 
+#[derive(Clone)]
+struct Q4KGgmlActivations<const BLOCK: usize> {
+    low: [Tile<BLOCK>; 16],
+    high: [Tile<BLOCK>; 16],
+    sums: [Tile<BLOCK>; 4],
+}
+
+fn q4k_ggml_activations<const BLOCK: usize>(
+    program: &mut TileBlock<'_, BLOCK>,
+    a: &Storage<F32, 2>,
+    row: impl Clone + IntoIndex<BLOCK>,
+    vector_base: &ScalarIndex,
+    in_bounds: Mask<BLOCK>,
+) -> Q4KGgmlActivations<BLOCK> {
+    let low: [Pinned<BLOCK>; 16] = std::array::from_fn(|j| {
+        let offset = if j < 8 { j as u32 } else { (j - 8) as u32 + 32 };
+        let scalar = program.load(
+            a.at(row.clone(), vector_base.clone() + offset),
+            in_bounds.clone(),
+            0.0,
+        );
+        program.pin(scalar)
+    });
+    let high: [Pinned<BLOCK>; 16] = std::array::from_fn(|j| {
+        let offset = if j < 8 {
+            j as u32 + 128
+        } else {
+            (j - 8) as u32 + 160
+        };
+        let scalar = program.load(
+            a.at(row.clone(), vector_base.clone() + offset),
+            in_bounds.clone(),
+            0.0,
+        );
+        program.pin(scalar)
+    });
+
+    let zero = TileLiteral::F32(F32Bits::new(0.0));
+    let mut sums = [zero; 4].map(Tile::literal);
+    for j in 0..8 {
+        sums[0] = sums[0].clone() + low[j].get();
+        sums[1] = sums[1].clone() + low[j + 8].get();
+        sums[2] = sums[2].clone() + high[j].get();
+        sums[3] = sums[3].clone() + high[j + 8].get();
+    }
+
+    Q4KGgmlActivations {
+        low: std::array::from_fn(|i| low[i].get()),
+        high: std::array::from_fn(|i| high[i].get()),
+        sums,
+    }
+}
+
+fn dot4_sum<const BLOCK: usize, const VALUES: usize>(
+    program: &TileBlock<'_, BLOCK>,
+    a: &[Tile<BLOCK>; VALUES],
+    b: &[Tile<BLOCK>; VALUES],
+) -> Tile<BLOCK> {
+    debug_assert!(VALUES >= 4 && VALUES.is_multiple_of(4));
+    let mut sum: Option<Tile<BLOCK>> = None;
+    for chunk in 0..VALUES / 4 {
+        let a_vec = std::array::from_fn(|i| a[chunk * 4 + i].clone());
+        let b_vec = std::array::from_fn(|i| b[chunk * 4 + i].clone());
+        let term = program.dot4(a_vec, b_vec);
+        sum = Some(match sum {
+            Some(prev) => prev + term,
+            None => term,
+        });
+    }
+    sum.expect("VALUES >= 4")
+}
+
 /// Build a Triton-like source tile IR.
 pub fn build(f: impl FnOnce(&mut Program)) -> KernelIr {
     let mut program = Program {
@@ -201,76 +362,30 @@ pub struct Program {
 }
 
 impl Program {
-    pub fn storage_read<T: Numeric, const R: usize>(&mut self, shape: Shape) -> Storage<T, R> {
-        self.storage_with_layout_and_access(
+    storage_accessors!(
+        storage_read,
+        storage_write(shape: Shape) => (
             Layout::contiguous(MemoryLevel::Storage, shape),
             0,
-            None,
-            BufferAccess::Read,
+            None
         )
-    }
-
-    pub fn storage_write<T: Numeric, const R: usize>(&mut self, shape: Shape) -> Storage<T, R> {
-        self.storage_with_layout_and_access(
-            Layout::contiguous(MemoryLevel::Storage, shape),
-            0,
-            None,
-            BufferAccess::ReadWrite,
-        )
-    }
-
-    pub fn storage_read_with_layout<T: Numeric, const R: usize>(
-        &mut self,
-        layout: Layout,
-    ) -> Storage<T, R> {
-        self.storage_with_layout_and_access(layout, 0, None, BufferAccess::Read)
-    }
-
-    pub fn storage_write_with_layout<T: Numeric, const R: usize>(
-        &mut self,
-        layout: Layout,
-    ) -> Storage<T, R> {
-        self.storage_with_layout_and_access(layout, 0, None, BufferAccess::ReadWrite)
-    }
-
-    pub fn storage_read_with_layout_offset<T: Numeric, const R: usize>(
-        &mut self,
-        layout: Layout,
-        offset: u32,
-    ) -> Storage<T, R> {
-        self.storage_with_layout_and_access(layout, offset, None, BufferAccess::Read)
-    }
-
-    pub fn storage_write_with_layout_offset<T: Numeric, const R: usize>(
-        &mut self,
-        layout: Layout,
-        offset: u32,
-    ) -> Storage<T, R> {
-        self.storage_with_layout_and_access(layout, offset, None, BufferAccess::ReadWrite)
-    }
-
-    pub fn storage_read_with_layout_offset_and_index_map<T: Numeric, const R: usize>(
-        &mut self,
-        layout: Layout,
-        offset: u32,
-        index_map: StorageIndexMap,
-    ) -> Storage<T, R> {
-        self.storage_with_layout_and_access(layout, offset, Some(index_map), BufferAccess::Read)
-    }
-
-    pub fn storage_write_with_layout_offset_and_index_map<T: Numeric, const R: usize>(
-        &mut self,
-        layout: Layout,
-        offset: u32,
-        index_map: StorageIndexMap,
-    ) -> Storage<T, R> {
-        self.storage_with_layout_and_access(
-            layout,
-            offset,
-            Some(index_map),
-            BufferAccess::ReadWrite,
-        )
-    }
+    );
+    storage_accessors!(
+        storage_read_with_layout,
+        storage_write_with_layout(layout: Layout) => (layout, 0, None)
+    );
+    storage_accessors!(
+        storage_read_with_layout_offset,
+        storage_write_with_layout_offset(layout: Layout, offset: u32) => (layout, offset, None)
+    );
+    storage_accessors!(
+        storage_read_with_layout_offset_and_index_map,
+        storage_write_with_layout_offset_and_index_map(
+            layout: Layout,
+            offset: u32,
+            index_map: StorageIndexMap
+        ) => (layout, offset, Some(index_map))
+    );
 
     fn storage_with_layout_and_access<T: Numeric, const R: usize>(
         &mut self,
@@ -292,39 +407,10 @@ impl Program {
         }
     }
 
-    pub fn storage_read_element_with_layout_offset<const R: usize>(
-        &mut self,
-        element: crate::ElementType,
-        layout: Layout,
-        offset: u32,
-    ) -> ErasedStorage<R> {
-        ErasedStorage {
-            view: self.storage_view_with_layout_and_access::<R>(
-                element,
-                layout,
-                offset,
-                None,
-                BufferAccess::Read,
-            ),
-        }
-    }
-
-    pub fn storage_write_element_with_layout_offset<const R: usize>(
-        &mut self,
-        element: crate::ElementType,
-        layout: Layout,
-        offset: u32,
-    ) -> ErasedStorage<R> {
-        ErasedStorage {
-            view: self.storage_view_with_layout_and_access::<R>(
-                element,
-                layout,
-                offset,
-                None,
-                BufferAccess::ReadWrite,
-            ),
-        }
-    }
+    erased_storage_accessors!(
+        storage_read_element_with_layout_offset,
+        storage_write_element_with_layout_offset(layout: Layout, offset: u32) => (layout, offset)
+    );
 
     fn storage_view_with_layout_and_access<const R: usize>(
         &mut self,
@@ -485,7 +571,7 @@ impl Program {
                     return self.qgemv_perf::<8, 4, 16, 256>(a, b, y, workgroups_x);
                 }
                 if b.rows <= 4096 && b.cols >= 8192 {
-                    qgemv_ggml_env_with_old!(
+                    qgemv_ggml_env!(
                         self,
                         qgemv_q4k_ggml,
                         "FUSOR_Q4K_LARGE_TILE",
@@ -493,7 +579,6 @@ impl Program {
                         b,
                         y,
                         workgroups_x,
-                        old = (4, 8, 32, 128),
                         [
                             ("ggml_1x4", 1, 4, 32),
                             ("ggml_1x8", 1, 8, 32),
@@ -515,25 +600,14 @@ impl Program {
                     return self.qgemv_q4k_ggml::<2, 4, 64>(a, b, y, workgroups_x);
                 }
                 if b.rows > 4096 && b.cols <= 4096 {
-                    qgemv_ggml_env_with_old!(
+                    qgemv_ggml_env_standard_tiles!(
                         self,
                         qgemv_q4k_ggml,
                         "FUSOR_Q4K_TALL_TILE",
                         a,
                         b,
                         y,
-                        workgroups_x,
-                        old = (8, 4, 16, 256),
-                        [
-                            ("ggml_2x2", 2, 2, 64),
-                            ("ggml_2x4", 2, 4, 64),
-                            ("ggml_2x8", 2, 8, 64),
-                            ("ggml_4x2", 4, 2, 128),
-                            ("ggml_4x4", 4, 4, 128),
-                            ("ggml_4x8", 4, 8, 128),
-                            ("ggml_8x2", 8, 2, 256),
-                            ("ggml_8x4", 8, 4, 256),
-                        ]
+                        workgroups_x
                     );
                     return self.qgemv_q4k_ggml::<4, 2, 128>(a, b, y, workgroups_x);
                 }
@@ -562,25 +636,14 @@ impl Program {
             }
             GgmlQuantFormat::Q6K => {
                 if b.rows <= 4096 && b.cols >= 8192 {
-                    qgemv_ggml_env_with_old!(
+                    qgemv_ggml_env_standard_tiles!(
                         self,
                         qgemv_q6k_ggml,
                         "FUSOR_Q6K_LARGE_TILE",
                         a,
                         b,
                         y,
-                        workgroups_x,
-                        old = (4, 8, 8, 128),
-                        [
-                            ("ggml_2x2", 2, 2, 64),
-                            ("ggml_2x4", 2, 4, 64),
-                            ("ggml_2x8", 2, 8, 64),
-                            ("ggml_4x2", 4, 2, 128),
-                            ("ggml_4x4", 4, 4, 128),
-                            ("ggml_4x8", 4, 8, 128),
-                            ("ggml_8x2", 8, 2, 256),
-                            ("ggml_8x4", 8, 4, 256),
-                        ]
+                        workgroups_x
                     );
                     if b.cols <= 16_384 {
                         return self.qgemv_q6k_ggml::<2, 2, 64>(a, b, y, workgroups_x);
@@ -588,25 +651,14 @@ impl Program {
                     return self.qgemv_q6k_ggml::<2, 4, 64>(a, b, y, workgroups_x);
                 }
                 if b.rows > 4096 && b.cols <= 4096 {
-                    qgemv_ggml_env_with_old!(
+                    qgemv_ggml_env_standard_tiles!(
                         self,
                         qgemv_q6k_ggml,
                         "FUSOR_Q6K_TALL_TILE",
                         a,
                         b,
                         y,
-                        workgroups_x,
-                        old = (8, 4, 8, 256),
-                        [
-                            ("ggml_2x2", 2, 2, 64),
-                            ("ggml_2x4", 2, 4, 64),
-                            ("ggml_2x8", 2, 8, 64),
-                            ("ggml_4x2", 4, 2, 128),
-                            ("ggml_4x4", 4, 4, 128),
-                            ("ggml_4x8", 4, 8, 128),
-                            ("ggml_8x2", 8, 2, 256),
-                            ("ggml_8x4", 8, 4, 256),
-                        ]
+                        workgroups_x
                     );
                     return self.qgemv_q6k_ggml::<2, 2, 64>(a, b, y, workgroups_x);
                 }
@@ -666,49 +718,24 @@ impl Program {
                         };
                         let vector_base = block.clone() * 256 + iq.clone() * 64 + ir.clone() * 8;
 
-                        let a_low: [Pinned<BLOCK>; 16] = std::array::from_fn(|j| {
-                            let offset = if j < 8 { j as u32 } else { (j - 8) as u32 + 32 };
-                            let scalar = program.load(
-                                a.at(0, vector_base.clone() + offset),
-                                in_bounds.clone(),
-                                0.0,
-                            );
-                            program.pin(scalar)
-                        });
-                        let a_high: [Pinned<BLOCK>; 16] = std::array::from_fn(|j| {
-                            let offset = if j < 8 {
-                                j as u32 + 128
-                            } else {
-                                (j - 8) as u32 + 160
-                            };
-                            let scalar = program.load(
-                                a.at(0, vector_base.clone() + offset),
-                                in_bounds.clone(),
-                                0.0,
-                            );
-                            program.pin(scalar)
-                        });
-
-                        let mut sumy = [zero; 4].map(Tile::literal);
-                        for j in 0..8 {
-                            sumy[0] = sumy[0].clone() + a_low[j].get();
-                            sumy[1] = sumy[1].clone() + a_low[j + 8].get();
-                            sumy[2] = sumy[2].clone() + a_high[j].get();
-                            sumy[3] = sumy[3].clone() + a_high[j + 8].get();
-                        }
+                        let activations =
+                            q4k_ggml_activations(program, a, 0, &vector_base, in_bounds.clone());
 
                         std::array::from_fn(|c| {
                             let col = col0.clone() + c as u32;
                             let mask = grid.mask(full_block_iterations, in_bounds.clone(), &col);
-                            let a_low_vec: [Tile<BLOCK>; 16] =
-                                std::array::from_fn(|i| a_low[i].get());
-                            let a_high_vec: [Tile<BLOCK>; 16] =
-                                std::array::from_fn(|i| a_high[i].get());
-                            let sum_vec: [Tile<BLOCK>; 4] =
-                                std::array::from_fn(|i| sumy[i].clone());
+                            let dot_inputs = activations.clone();
                             program.quantized_q4k_ggml_dot(
-                                a_low_vec, a_high_vec, sum_vec, &b_cloned, &block, &iq, &ir, &col,
-                                mask, 0.0,
+                                dot_inputs.low,
+                                dot_inputs.high,
+                                dot_inputs.sums,
+                                &b_cloned,
+                                &block,
+                                &iq,
+                                &ir,
+                                &col,
+                                mask,
+                                0.0,
                             )
                         })
                     },
@@ -792,41 +819,16 @@ impl Program {
                         };
                         let vector_base = block.clone() * 256 + iq.clone() * 64 + ir.clone() * 8;
 
-                        let a_low: [Pinned<BLOCK>; 16] = std::array::from_fn(|j| {
-                            let offset = if j < 8 { j as u32 } else { (j - 8) as u32 + 32 };
-                            let scalar = program.load(
-                                a.at(row.clone(), vector_base.clone() + offset),
-                                in_bounds.clone(),
-                                0.0,
-                            );
-                            program.pin(scalar)
-                        });
-                        let a_high: [Pinned<BLOCK>; 16] = std::array::from_fn(|j| {
-                            let offset = if j < 8 {
-                                j as u32 + 128
-                            } else {
-                                (j - 8) as u32 + 160
-                            };
-                            let scalar = program.load(
-                                a.at(row.clone(), vector_base.clone() + offset),
-                                in_bounds.clone(),
-                                0.0,
-                            );
-                            program.pin(scalar)
-                        });
-
-                        let mut sumy = [zero; 4].map(Tile::literal);
-                        for j in 0..8 {
-                            sumy[0] = sumy[0].clone() + a_low[j].get();
-                            sumy[1] = sumy[1].clone() + a_low[j + 8].get();
-                            sumy[2] = sumy[2].clone() + a_high[j].get();
-                            sumy[3] = sumy[3].clone() + a_high[j + 8].get();
-                        }
-
-                        let a_low_vec: [Tile<BLOCK>; 16] = std::array::from_fn(|i| a_low[i].get());
-                        let a_high_vec: [Tile<BLOCK>; 16] =
-                            std::array::from_fn(|i| a_high[i].get());
-                        let sum_vec: [Tile<BLOCK>; 4] = std::array::from_fn(|i| sumy[i].clone());
+                        let activations = q4k_ggml_activations(
+                            program,
+                            a,
+                            row.clone(),
+                            &vector_base,
+                            in_bounds.clone(),
+                        );
+                        let a_low_vec = activations.low;
+                        let a_high_vec = activations.high;
+                        let sum_vec = activations.sums;
 
                         let dot = |program: &mut TileBlock<'_, BLOCK>,
                                    col: ScalarIndex,
@@ -1056,21 +1058,9 @@ impl Program {
                                 .load_quantized_block::<VALUES_PER_LANE>(
                                     &b_cloned, &k_base, &col, mask, 0.0,
                                 );
-                            // VALUES_PER_LANE / 4 dot4s, summed.
-                            let mut sum: Option<Tile<BLOCK>> = None;
-                            let chunks = VALUES_PER_LANE / 4;
-                            for chunk in 0..chunks {
-                                let a_vec: [Tile<BLOCK>; 4] =
-                                    std::array::from_fn(|i| a_pins[chunk * 4 + i].get());
-                                let b_vec: [Tile<BLOCK>; 4] =
-                                    std::array::from_fn(|i| bs[chunk * 4 + i].clone());
-                                let term = program.dot4(a_vec, b_vec);
-                                sum = Some(match sum {
-                                    Some(prev) => prev + term,
-                                    None => term,
-                                });
-                            }
-                            sum.expect("VALUES_PER_LANE >= 4")
+                            let a_values: [Tile<BLOCK>; VALUES_PER_LANE] =
+                                std::array::from_fn(|i| a_pins[i].get());
+                            dot4_sum(program, &a_values, &bs)
                         })
                     },
                 );
@@ -1234,7 +1224,7 @@ impl Program {
                 // B fragment once, then MMA the full row × col grid against
                 // the cached SSA handles. This keeps the kk-step at
                 // ROW × A-loads + COL × B-loads + ROW*COL × MMAs (matching
-                // the old accelerator), instead of (ROW*COL) of each.
+                // the accelerator path), instead of (ROW*COL) of each.
                 let kk_steps = (BK as u32) / COOP_DIM;
                 for kk in 0..kk_steps {
                     let a_frags: Vec<_> = (0..TILE_ROWS_PER_SG)
@@ -1374,20 +1364,7 @@ impl Program {
                         let k_index = k_base.clone() + i as u32;
                         program.load(x.at(k_index.clone(), 0), k_index.lt(k), 0.0)
                     });
-                    let mut sum: Option<Tile<BLOCK>> = None;
-                    let chunks = VALUES_PER_LANE / 4;
-                    for chunk in 0..chunks {
-                        let a_vec: [Tile<BLOCK>; 4] =
-                            std::array::from_fn(|i| a_values[chunk * 4 + i].clone());
-                        let x_vec: [Tile<BLOCK>; 4] =
-                            std::array::from_fn(|i| x_values[chunk * 4 + i].clone());
-                        let term = program.dot4(a_vec, x_vec);
-                        sum = Some(match sum {
-                            Some(prev) => prev + term,
-                            None => term,
-                        });
-                    }
-                    [sum.expect("VALUES_PER_LANE >= 4")]
+                    [dot4_sum(program, &a_values, &x_values)]
                 });
             let reduced = program.subgroup_reduce_sum(sum);
             let mask = lane.eq(0).and(row_in_bounds);
@@ -2081,57 +2058,19 @@ impl<const BLOCK: usize> TileBlock<'_, BLOCK> {
         }
     }
 
-    pub fn quantized_q8_activation_dot<const N: usize>(
-        &self,
-        a: [Tile<BLOCK>; N],
-        matrix: &QuantizedMatrix,
-        k_base: impl IntoIndex<BLOCK>,
-        col: impl IntoIndex<BLOCK>,
-        mask: Mask<BLOCK>,
-        fill: f32,
-    ) -> Tile<BLOCK> {
-        assert!(
-            N == 8 || N == 16,
-            "q8 activation dot currently supports N == 8 or N == 16"
-        );
-        Tile {
-            expr: TileExpr::QuantizedQ8ActivationDot {
-                a: a.into_iter().map(|value| Box::new(value.expr)).collect(),
-                src: matrix.clone(),
-                k_base: k_base.into_index(),
-                col: col.into_index(),
-                mask: mask.expr,
-                fill: F32Bits::new(fill),
-                block_n: N as u32,
-            },
-        }
-    }
+    quantized_vec_dot_entrypoint!(
+        quantized_q8_activation_dot,
+        Q8Activation,
+        [8, 16],
+        "q8 activation dot currently supports N == 8 or N == 16"
+    );
 
-    pub fn quantized_q4k_f32_dot<const N: usize>(
-        &self,
-        a: [Tile<BLOCK>; N],
-        matrix: &QuantizedMatrix,
-        k_base: impl IntoIndex<BLOCK>,
-        col: impl IntoIndex<BLOCK>,
-        mask: Mask<BLOCK>,
-        fill: f32,
-    ) -> Tile<BLOCK> {
-        assert!(
-            N == 8 || N == 16 || N == 32,
-            "q4k f32 dot currently supports N == 8, N == 16, or N == 32"
-        );
-        Tile {
-            expr: TileExpr::QuantizedQ4KF32Dot {
-                a: a.into_iter().map(|value| Box::new(value.expr)).collect(),
-                src: matrix.clone(),
-                k_base: k_base.into_index(),
-                col: col.into_index(),
-                mask: mask.expr,
-                fill: F32Bits::new(fill),
-                block_n: N as u32,
-            },
-        }
-    }
+    quantized_vec_dot_entrypoint!(
+        quantized_q4k_f32_dot,
+        Q4KF32,
+        [8, 16, 32],
+        "q4k f32 dot currently supports N == 8, N == 16, or N == 32"
+    );
 
     #[allow(clippy::too_many_arguments)]
     pub fn quantized_q4k_ggml_dot(
@@ -2234,29 +2173,29 @@ impl<const BLOCK: usize> TileBlock<'_, BLOCK> {
         }
     }
 
-    pub fn reduce_sum(&mut self, value: Tile<BLOCK>) -> Scalar {
-        self.reduce(TileReduceOp::Sum, value)
-    }
-
-    pub fn reduce_max(&mut self, value: Tile<BLOCK>) -> Scalar {
-        self.reduce(TileReduceOp::Max, value)
-    }
-
-    pub fn reduce_min(&mut self, value: Tile<BLOCK>) -> Scalar {
-        self.reduce(TileReduceOp::Min, value)
-    }
-
-    pub fn loop_reduce_sum(&mut self, iterations: u32, value: Tile<BLOCK>) -> Scalar {
-        self.loop_reduce(TileReduceOp::Sum, iterations, value)
-    }
-
-    pub fn loop_reduce_max(&mut self, iterations: u32, value: Tile<BLOCK>) -> Scalar {
-        self.loop_reduce(TileReduceOp::Max, iterations, value)
-    }
-
-    pub fn loop_reduce_min(&mut self, iterations: u32, value: Tile<BLOCK>) -> Scalar {
-        self.loop_reduce(TileReduceOp::Min, iterations, value)
-    }
+    tile_reduce_entrypoints!(
+        (
+            reduce_sum,
+            loop_reduce_sum,
+            group_reduce_sum,
+            subgroup_reduce_sum,
+            Sum
+        ),
+        (
+            reduce_max,
+            loop_reduce_max,
+            group_reduce_max,
+            subgroup_reduce_max,
+            Max
+        ),
+        (
+            reduce_min,
+            loop_reduce_min,
+            group_reduce_min,
+            subgroup_reduce_min,
+            Min
+        ),
+    );
 
     pub fn loop_fold(
         &mut self,
@@ -2276,22 +2215,6 @@ impl<const BLOCK: usize> TileBlock<'_, BLOCK> {
         }
     }
 
-    pub fn group_reduce_sum<const GROUP: usize>(&mut self, value: Tile<BLOCK>) -> Tile<BLOCK> {
-        self.group_reduce::<GROUP>(TileReduceOp::Sum, value)
-    }
-
-    pub fn subgroup_reduce_sum(&self, value: Tile<BLOCK>) -> Tile<BLOCK> {
-        self.subgroup_reduce(TileReduceOp::Sum, value)
-    }
-
-    pub fn subgroup_reduce_max(&self, value: Tile<BLOCK>) -> Tile<BLOCK> {
-        self.subgroup_reduce(TileReduceOp::Max, value)
-    }
-
-    pub fn subgroup_reduce_min(&self, value: Tile<BLOCK>) -> Tile<BLOCK> {
-        self.subgroup_reduce(TileReduceOp::Min, value)
-    }
-
     fn subgroup_reduce(&self, op: TileReduceOp, value: Tile<BLOCK>) -> Tile<BLOCK> {
         Tile {
             expr: TileExpr::SubgroupReduce {
@@ -2299,14 +2222,6 @@ impl<const BLOCK: usize> TileBlock<'_, BLOCK> {
                 value: Box::new(value.expr),
             },
         }
-    }
-
-    pub fn group_reduce_max<const GROUP: usize>(&mut self, value: Tile<BLOCK>) -> Tile<BLOCK> {
-        self.group_reduce::<GROUP>(TileReduceOp::Max, value)
-    }
-
-    pub fn group_reduce_min<const GROUP: usize>(&mut self, value: Tile<BLOCK>) -> Tile<BLOCK> {
-        self.group_reduce::<GROUP>(TileReduceOp::Min, value)
     }
 
     fn group_reduce<const GROUP: usize>(
@@ -2377,27 +2292,6 @@ impl<const BLOCK: usize> TileBlock<'_, BLOCK> {
 
     pub fn zero_coop_acc(&mut self, acc: &CoopAcc) {
         self.push_stmt(TileStmt::ZeroCoopAcc { id: acc.id });
-    }
-
-    /// Cooperatively stage a workgroup-tile-sized region of `src` into `dst`.
-    /// One element per invocation per pass.
-    pub fn copy_to_workgroup_tile(
-        &mut self,
-        dst: &Storage<F32, 2>,
-        src: &Storage<F32, 2>,
-        row_offset: impl IntoIndex<BLOCK>,
-        col_offset: impl IntoIndex<BLOCK>,
-    ) {
-        // The `dst` argument is here only for type discipline; the underlying
-        // workgroup-tile is identified by its TileRef. To keep the API
-        // ergonomic, callers pass the workgroup-tile-allocated `Storage<F32,
-        // 2>` they got from `program.alloc_workgroup_tile_2d`. We extract its
-        // tile id from the StorageView's buffer mapping.
-        let _ = dst;
-        let _ = src;
-        let _ = row_offset;
-        let _ = col_offset;
-        unimplemented!("workgroup-tile copies use TileRef directly; see copy_storage_to_tile");
     }
 
     /// Stage a workgroup-tile region of dense `src` into the workgroup-tile
@@ -2552,18 +2446,7 @@ impl<const BLOCK: usize> TileBlock<'_, BLOCK> {
         row: impl IntoIndex<BLOCK>,
         col: impl IntoIndex<BLOCK>,
     ) -> CoopFragment {
-        let id = self.program.next_coop_fragment_id();
-        self.push_stmt(TileStmt::LoadCoop {
-            id,
-            role: CoopOperandRole::A,
-            tile,
-            row: row.into_index(),
-            col: col.into_index(),
-        });
-        CoopFragment {
-            id,
-            role: CoopOperandRole::A,
-        }
+        self.coop_load(CoopOperandRole::A, tile, row, col)
     }
 
     /// Cooperatively load an 8x8 B fragment.
@@ -2573,18 +2456,25 @@ impl<const BLOCK: usize> TileBlock<'_, BLOCK> {
         row: impl IntoIndex<BLOCK>,
         col: impl IntoIndex<BLOCK>,
     ) -> CoopFragment {
+        self.coop_load(CoopOperandRole::B, tile, row, col)
+    }
+
+    fn coop_load(
+        &mut self,
+        role: CoopOperandRole,
+        tile: TileRef,
+        row: impl IntoIndex<BLOCK>,
+        col: impl IntoIndex<BLOCK>,
+    ) -> CoopFragment {
         let id = self.program.next_coop_fragment_id();
         self.push_stmt(TileStmt::LoadCoop {
             id,
-            role: CoopOperandRole::B,
+            role,
             tile,
             row: row.into_index(),
             col: col.into_index(),
         });
-        CoopFragment {
-            id,
-            role: CoopOperandRole::B,
-        }
+        CoopFragment { id, role }
     }
 
     /// `acc += a * b` where `a`/`b` are fragments previously loaded via
@@ -2664,7 +2554,7 @@ impl<const BLOCK: usize> TileBlock<'_, BLOCK> {
         value: Tile<BLOCK>,
         mask: Mask<BLOCK>,
     ) {
-        self.push_stmt(TileStmt::StoreLinear(TileLinearStoreStmt {
+        self.push_stmt(TileStmt::StoreIndexed(TileIndexedStoreStmt {
             dst: address.view,
             index: address.index,
             value: value.expr,
@@ -2678,7 +2568,7 @@ impl<const BLOCK: usize> TileBlock<'_, BLOCK> {
         value: Tile<BLOCK>,
         mask: Mask<BLOCK>,
     ) {
-        self.push_stmt(TileStmt::StoreVec4(TileVec4StoreStmt {
+        self.push_stmt(TileStmt::StoreIndexed(TileIndexedStoreStmt {
             dst: address.view,
             index: address.index,
             value: value.expr,
@@ -2828,79 +2718,142 @@ impl<const N: usize> IntoIndex<N> for &Tile<N> {
     }
 }
 
+fn index_compare<const N: usize>(left: TileIndexExpr, op: TileCompareOp, value: u32) -> Mask<N> {
+    Mask {
+        expr: TileMaskExpr::Compare {
+            op,
+            left,
+            right: TileIndexExpr::Literal(value),
+        },
+    }
+}
+
+macro_rules! range_compare_methods {
+    ($($name:ident => $op:ident),+ $(,)?) => {
+        $(
+            pub fn $name(&self, value: u32) -> Mask<N> {
+                index_compare(self.expr.clone(), TileCompareOp::$op, value)
+            }
+        )+
+    };
+}
+
+macro_rules! scalar_index_compare_methods {
+    ($($name:ident => $op:ident),+ $(,)?) => {
+        $(
+            pub fn $name<const N: usize>(&self, value: u32) -> Mask<N> {
+                index_compare(self.expr.clone(), TileCompareOp::$op, value)
+            }
+        )+
+    };
+}
+
 impl<const N: usize> Range<N> {
-    pub fn lt(&self, value: u32) -> Mask<N> {
-        self.compare(TileCompareOp::Lt, value)
-    }
-
-    pub fn le(&self, value: u32) -> Mask<N> {
-        self.compare(TileCompareOp::Le, value)
-    }
-
-    pub fn gt(&self, value: u32) -> Mask<N> {
-        self.compare(TileCompareOp::Gt, value)
-    }
-
-    pub fn ge(&self, value: u32) -> Mask<N> {
-        self.compare(TileCompareOp::Ge, value)
-    }
-
-    pub fn eq(&self, value: u32) -> Mask<N> {
-        self.compare(TileCompareOp::Eq, value)
-    }
-
-    fn compare(&self, op: TileCompareOp, value: u32) -> Mask<N> {
-        Mask {
-            expr: TileMaskExpr::Compare {
-                op,
-                left: self.expr.clone(),
-                right: TileIndexExpr::Literal(value),
-            },
-        }
-    }
+    range_compare_methods!(lt => Lt, le => Le, gt => Gt, ge => Ge, eq => Eq);
 }
 
 impl ScalarIndex {
-    pub fn lt<const N: usize>(&self, value: u32) -> Mask<N> {
-        self.compare(TileCompareOp::Lt, value)
-    }
-
-    pub fn le<const N: usize>(&self, value: u32) -> Mask<N> {
-        self.compare(TileCompareOp::Le, value)
-    }
-
-    pub fn gt<const N: usize>(&self, value: u32) -> Mask<N> {
-        self.compare(TileCompareOp::Gt, value)
-    }
-
-    pub fn ge<const N: usize>(&self, value: u32) -> Mask<N> {
-        self.compare(TileCompareOp::Ge, value)
-    }
-
-    pub fn eq<const N: usize>(&self, value: u32) -> Mask<N> {
-        self.compare(TileCompareOp::Eq, value)
-    }
-
-    fn compare<const N: usize>(&self, op: TileCompareOp, value: u32) -> Mask<N> {
-        Mask {
-            expr: TileMaskExpr::Compare {
-                op,
-                left: self.expr.clone(),
-                right: TileIndexExpr::Literal(value),
-            },
-        }
-    }
+    scalar_index_compare_methods!(lt => Lt, le => Le, gt => Gt, ge => Ge, eq => Eq);
 }
 
-impl Add<u32> for ScalarIndex {
-    type Output = ScalarIndex;
+macro_rules! impl_index_u32_ops {
+    (generic($($generics:tt)+), $ty:ty, $out:ty, $ctor:ident, $div_msg:literal, $mod_msg:literal) => {
+        impl_index_u32_ops!(@impl [impl<$($generics)+>] $ty, $out, $ctor, $div_msg, $mod_msg);
+    };
+    ($ty:ty, $out:ty, $ctor:ident, $div_msg:literal, $mod_msg:literal) => {
+        impl_index_u32_ops!(@impl [impl] $ty, $out, $ctor, $div_msg, $mod_msg);
+    };
+    (@impl [$($impl_head:tt)*] $ty:ty, $out:ty, $ctor:ident, $div_msg:literal, $mod_msg:literal) => {
+        $($impl_head)* Add<u32> for $ty {
+            type Output = $out;
 
-    fn add(self, rhs: u32) -> Self::Output {
-        ScalarIndex {
-            expr: TileIndexExpr::Add(Box::new(self.expr), Box::new(TileIndexExpr::Literal(rhs))),
+            fn add(self, rhs: u32) -> Self::Output {
+                $ctor {
+                    expr: TileIndexExpr::Add(
+                        Box::new(self.expr),
+                        Box::new(TileIndexExpr::Literal(rhs)),
+                    ),
+                }
+            }
         }
-    }
+
+        $($impl_head)* Mul<u32> for $ty {
+            type Output = $out;
+
+            fn mul(self, rhs: u32) -> Self::Output {
+                $ctor {
+                    expr: TileIndexExpr::Mul(Box::new(self.expr), rhs),
+                }
+            }
+        }
+
+        $($impl_head)* Div<u32> for $ty {
+            type Output = $out;
+
+            fn div(self, rhs: u32) -> Self::Output {
+                assert!(rhs > 0, $div_msg);
+                $ctor {
+                    expr: TileIndexExpr::Div(Box::new(self.expr), rhs),
+                }
+            }
+        }
+
+        $($impl_head)* BitAnd<u32> for $ty {
+            type Output = $out;
+
+            fn bitand(self, rhs: u32) -> Self::Output {
+                $ctor {
+                    expr: TileIndexExpr::Value(Box::new(TileExpr::Binary {
+                        op: TileBinaryOp::BitAnd,
+                        left: Box::new(TileExpr::Index(self.expr)),
+                        right: Box::new(TileExpr::Literal(TileLiteral::U32(rhs))),
+                    })),
+                }
+            }
+        }
+
+        $($impl_head)* BitXor<u32> for $ty {
+            type Output = $out;
+
+            fn bitxor(self, rhs: u32) -> Self::Output {
+                $ctor {
+                    expr: TileIndexExpr::Value(Box::new(TileExpr::Binary {
+                        op: TileBinaryOp::BitXor,
+                        left: Box::new(TileExpr::Index(self.expr)),
+                        right: Box::new(TileExpr::Literal(TileLiteral::U32(rhs))),
+                    })),
+                }
+            }
+        }
+
+        $($impl_head)* Rem<u32> for $ty {
+            type Output = $out;
+
+            fn rem(self, rhs: u32) -> Self::Output {
+                assert!(rhs > 0, $mod_msg);
+                $ctor {
+                    expr: TileIndexExpr::Mod(Box::new(self.expr), rhs),
+                }
+            }
+        }
+    };
 }
+
+impl_index_u32_ops!(
+    ScalarIndex,
+    ScalarIndex,
+    ScalarIndex,
+    "scalar index divisor must be non-zero",
+    "scalar index modulus must be non-zero"
+);
+impl_index_u32_ops!(
+    generic(const N: usize),
+    Range<N>,
+    Range<N>,
+    Range,
+    "tile index divisor must be non-zero",
+    "tile index modulus must be non-zero"
+);
 
 impl Add<ScalarIndex> for ScalarIndex {
     type Output = ScalarIndex;
@@ -2908,136 +2861,6 @@ impl Add<ScalarIndex> for ScalarIndex {
     fn add(self, rhs: ScalarIndex) -> Self::Output {
         ScalarIndex {
             expr: TileIndexExpr::Add(Box::new(self.expr), Box::new(rhs.expr)),
-        }
-    }
-}
-
-impl Mul<u32> for ScalarIndex {
-    type Output = ScalarIndex;
-
-    fn mul(self, rhs: u32) -> Self::Output {
-        ScalarIndex {
-            expr: TileIndexExpr::Mul(Box::new(self.expr), rhs),
-        }
-    }
-}
-
-impl Div<u32> for ScalarIndex {
-    type Output = ScalarIndex;
-
-    fn div(self, rhs: u32) -> Self::Output {
-        assert!(rhs > 0, "scalar index divisor must be non-zero");
-        ScalarIndex {
-            expr: TileIndexExpr::Div(Box::new(self.expr), rhs),
-        }
-    }
-}
-
-impl BitAnd<u32> for ScalarIndex {
-    type Output = ScalarIndex;
-
-    fn bitand(self, rhs: u32) -> Self::Output {
-        ScalarIndex {
-            expr: TileIndexExpr::Value(Box::new(TileExpr::Binary {
-                op: TileBinaryOp::BitAnd,
-                left: Box::new(TileExpr::Index(self.expr)),
-                right: Box::new(TileExpr::Literal(TileLiteral::U32(rhs))),
-            })),
-        }
-    }
-}
-
-impl BitXor<u32> for ScalarIndex {
-    type Output = ScalarIndex;
-
-    fn bitxor(self, rhs: u32) -> Self::Output {
-        ScalarIndex {
-            expr: TileIndexExpr::Value(Box::new(TileExpr::Binary {
-                op: TileBinaryOp::BitXor,
-                left: Box::new(TileExpr::Index(self.expr)),
-                right: Box::new(TileExpr::Literal(TileLiteral::U32(rhs))),
-            })),
-        }
-    }
-}
-
-impl Rem<u32> for ScalarIndex {
-    type Output = ScalarIndex;
-
-    fn rem(self, rhs: u32) -> Self::Output {
-        assert!(rhs > 0, "scalar index modulus must be non-zero");
-        ScalarIndex {
-            expr: TileIndexExpr::Mod(Box::new(self.expr), rhs),
-        }
-    }
-}
-
-impl<const N: usize> Add<u32> for Range<N> {
-    type Output = Range<N>;
-
-    fn add(self, rhs: u32) -> Self::Output {
-        Range {
-            expr: TileIndexExpr::Add(Box::new(self.expr), Box::new(TileIndexExpr::Literal(rhs))),
-        }
-    }
-}
-
-impl<const N: usize> Mul<u32> for Range<N> {
-    type Output = Range<N>;
-
-    fn mul(self, rhs: u32) -> Self::Output {
-        Range {
-            expr: TileIndexExpr::Mul(Box::new(self.expr), rhs),
-        }
-    }
-}
-
-impl<const N: usize> Div<u32> for Range<N> {
-    type Output = Range<N>;
-
-    fn div(self, rhs: u32) -> Self::Output {
-        assert!(rhs > 0, "tile index divisor must be non-zero");
-        Range {
-            expr: TileIndexExpr::Div(Box::new(self.expr), rhs),
-        }
-    }
-}
-
-impl<const N: usize> BitAnd<u32> for Range<N> {
-    type Output = Range<N>;
-
-    fn bitand(self, rhs: u32) -> Self::Output {
-        Range {
-            expr: TileIndexExpr::Value(Box::new(TileExpr::Binary {
-                op: TileBinaryOp::BitAnd,
-                left: Box::new(TileExpr::Index(self.expr)),
-                right: Box::new(TileExpr::Literal(TileLiteral::U32(rhs))),
-            })),
-        }
-    }
-}
-
-impl<const N: usize> BitXor<u32> for Range<N> {
-    type Output = Range<N>;
-
-    fn bitxor(self, rhs: u32) -> Self::Output {
-        Range {
-            expr: TileIndexExpr::Value(Box::new(TileExpr::Binary {
-                op: TileBinaryOp::BitXor,
-                left: Box::new(TileExpr::Index(self.expr)),
-                right: Box::new(TileExpr::Literal(TileLiteral::U32(rhs))),
-            })),
-        }
-    }
-}
-
-impl<const N: usize> Rem<u32> for Range<N> {
-    type Output = Range<N>;
-
-    fn rem(self, rhs: u32) -> Self::Output {
-        assert!(rhs > 0, "tile index modulus must be non-zero");
-        Range {
-            expr: TileIndexExpr::Mod(Box::new(self.expr), rhs),
         }
     }
 }
@@ -3099,6 +2922,36 @@ pub struct Tile<const N: usize> {
     expr: TileExpr,
 }
 
+macro_rules! tile_unary_methods {
+    ($($name:ident => $op:ident),+ $(,)?) => {
+        $(
+            pub fn $name(self) -> Self {
+                self.unary(TileUnaryOp::$op)
+            }
+        )+
+    };
+}
+
+macro_rules! tile_compare_methods {
+    ($($name:ident => $op:ident),+ $(,)?) => {
+        $(
+            pub fn $name(self, rhs: Self) -> Self {
+                Self::compare_bool(TileCompareOp::$op, self, rhs)
+            }
+        )+
+    };
+}
+
+macro_rules! tile_binary_methods {
+    ($($name:ident => $op:ident),+ $(,)?) => {
+        $(
+            pub fn $name(self, rhs: Self) -> Self {
+                self.binary(TileBinaryOp::$op, rhs)
+            }
+        )+
+    };
+}
+
 impl<const N: usize> Tile<N> {
     pub fn literal(value: TileLiteral) -> Self {
         Self {
@@ -3112,14 +2965,6 @@ impl<const N: usize> Tile<N> {
         }
     }
 
-    pub fn exp(self) -> Self {
-        self.unary(TileUnaryOp::Exp)
-    }
-
-    pub fn inverse_sqrt(self) -> Self {
-        self.unary(TileUnaryOp::InverseSqrt)
-    }
-
     pub fn unary(self, op: TileUnaryOp) -> Self {
         Self {
             expr: TileExpr::Unary {
@@ -3129,17 +2974,7 @@ impl<const N: usize> Tile<N> {
         }
     }
 
-    pub fn exp2(self) -> Self {
-        self.unary(TileUnaryOp::Exp2)
-    }
-
-    pub fn tanh(self) -> Self {
-        self.unary(TileUnaryOp::Tanh)
-    }
-
-    pub fn neg_unary(self) -> Self {
-        self.unary(TileUnaryOp::Neg)
-    }
+    tile_unary_methods!(exp => Exp, inverse_sqrt => InverseSqrt, exp2 => Exp2, tanh => Tanh, neg_unary => Neg);
 
     /// Sigmoid activation: `1 / (1 + exp(-x))`.
     pub fn sigmoid(self) -> Self {
@@ -3215,29 +3050,7 @@ impl<const N: usize> Tile<N> {
         Self::compare(op, left, right, crate::ElementType::Bool)
     }
 
-    pub fn lt(self, rhs: Self) -> Self {
-        Self::compare_bool(TileCompareOp::Lt, self, rhs)
-    }
-
-    pub fn le(self, rhs: Self) -> Self {
-        Self::compare_bool(TileCompareOp::Le, self, rhs)
-    }
-
-    pub fn gt(self, rhs: Self) -> Self {
-        Self::compare_bool(TileCompareOp::Gt, self, rhs)
-    }
-
-    pub fn ge(self, rhs: Self) -> Self {
-        Self::compare_bool(TileCompareOp::Ge, self, rhs)
-    }
-
-    pub fn eq(self, rhs: Self) -> Self {
-        Self::compare_bool(TileCompareOp::Eq, self, rhs)
-    }
-
-    pub fn ne(self, rhs: Self) -> Self {
-        Self::compare_bool(TileCompareOp::Ne, self, rhs)
-    }
+    tile_compare_methods!(lt => Lt, le => Le, gt => Gt, ge => Ge, eq => Eq, ne => Ne);
 
     pub fn binary(self, op: TileBinaryOp, rhs: Self) -> Self {
         Tile {
@@ -3249,33 +3062,15 @@ impl<const N: usize> Tile<N> {
         }
     }
 
-    pub fn max(self, rhs: Self) -> Self {
-        self.binary(TileBinaryOp::Max, rhs)
-    }
-
-    pub fn min(self, rhs: Self) -> Self {
-        self.binary(TileBinaryOp::Min, rhs)
-    }
-
-    pub fn bit_and(self, rhs: Self) -> Self {
-        self.binary(TileBinaryOp::BitAnd, rhs)
-    }
-
-    pub fn bit_or(self, rhs: Self) -> Self {
-        self.binary(TileBinaryOp::BitOr, rhs)
-    }
-
-    pub fn bit_xor(self, rhs: Self) -> Self {
-        self.binary(TileBinaryOp::BitXor, rhs)
-    }
-
-    pub fn and(self, rhs: Self) -> Self {
-        self.binary(TileBinaryOp::LogicalAnd, rhs)
-    }
-
-    pub fn or(self, rhs: Self) -> Self {
-        self.binary(TileBinaryOp::LogicalOr, rhs)
-    }
+    tile_binary_methods!(
+        max => Max,
+        min => Min,
+        bit_and => BitAnd,
+        bit_or => BitOr,
+        bit_xor => BitXor,
+        and => LogicalAnd,
+        or => LogicalOr,
+    );
 }
 
 impl<const N: usize> From<Scalar> for Tile<N> {

@@ -205,27 +205,23 @@ fn fuzz_qgemm_case(
     let (packed_b, dequantized_b) = pack_random_quantized_matrix(rng, format, k, n);
     let expected = cpu_matmul(&a, &dequantized_b, m, k, n);
     let ir = qmatmul_ir(m, n, k, format, true, &a_layout, &y_layout);
-    let actual_physical = run_three_buffer_kernel(
+    assert_kernel_matmul(
         device,
         queue,
-        &ir,
-        bytemuck::cast_slice(&a_physical),
-        bytemuck::cast_slice(&packed_b),
-        allocation_len(&y_layout),
-        (n as u32, m as u32, 1),
-    )?;
-    let actual = gather_f32_matrix(&actual_physical, m, n, &y_layout);
-
-    assert_close(
         &format!(
             "qgemm {format:?} {} case {case} m={m} n={n} k={k}",
             variant.name()
         ),
-        &actual,
+        &ir,
+        bytemuck::cast_slice(&a_physical),
+        bytemuck::cast_slice(&packed_b),
+        &y_layout,
+        m,
+        n,
+        (n as u32, m as u32, 1),
         &expected,
         3.0e-2,
-    );
-    Ok(())
+    )
 }
 
 fn fuzz_qgemm_skewed_activation_case(
@@ -244,24 +240,20 @@ fn fuzz_qgemm_skewed_activation_case(
     let (packed_b, dequantized_b) = pack_random_quantized_matrix(rng, format, k, n);
     let expected = cpu_matmul(&a, &dequantized_b, m, k, n);
     let ir = qmatmul_ir(m, n, k, format, true, &a_layout, &y_layout);
-    let actual_physical = run_three_buffer_kernel(
+    assert_kernel_matmul(
         device,
         queue,
+        &format!("qgemm {format:?} skewed activation m={m} n={n} k={k}"),
         &ir,
         bytemuck::cast_slice(&a_physical),
         bytemuck::cast_slice(&packed_b),
-        allocation_len(&y_layout),
+        &y_layout,
+        m,
+        n,
         (n as u32, m as u32, 1),
-    )?;
-    let actual = gather_f32_matrix(&actual_physical, m, n, &y_layout);
-
-    assert_close(
-        &format!("qgemm {format:?} skewed activation m={m} n={n} k={k}"),
-        &actual,
         &expected,
         3.0e-2,
-    );
-    Ok(())
+    )
 }
 
 fn fuzz_qgemm_im2col_nhwc_case(
@@ -302,24 +294,20 @@ fn fuzz_qgemm_im2col_nhwc_case(
         [kernel_h, kernel_w],
         &y_layout,
     );
-    let actual_physical = run_three_buffer_kernel(
+    assert_kernel_matmul(
         device,
         queue,
+        &format!("qgemm {format:?} im2col_nhwc m={m} n={n} k={k}"),
         &ir,
         bytemuck::cast_slice(&input),
         bytemuck::cast_slice(&packed_b),
-        allocation_len(&y_layout),
+        &y_layout,
+        m,
+        n,
         (n as u32, m as u32, 1),
-    )?;
-    let actual = gather_f32_matrix(&actual_physical, m, n, &y_layout);
-
-    assert_close(
-        &format!("qgemm {format:?} im2col_nhwc m={m} n={n} k={k}"),
-        &actual,
         &expected,
         3.0e-2,
-    );
-    Ok(())
+    )
 }
 
 fn fuzz_qgemv_case(
@@ -340,27 +328,23 @@ fn fuzz_qgemv_case(
     let (packed_b, dequantized_b) = pack_random_quantized_matrix(rng, format, k, n);
     let expected = cpu_matmul(&a, &dequantized_b, m, k, n);
     let ir = qmatmul_ir(m, n, k, format, false, &a_layout, &y_layout);
-    let actual_physical = run_three_buffer_kernel(
+    assert_kernel_matmul(
         device,
         queue,
-        &ir,
-        bytemuck::cast_slice(&a_physical),
-        bytemuck::cast_slice(&packed_b),
-        allocation_len(&y_layout),
-        (1, n as u32, 1),
-    )?;
-    let actual = gather_f32_matrix(&actual_physical, m, n, &y_layout);
-
-    assert_close(
         &format!(
             "qgemv {format:?} {} case {case} n={n} k={k}",
             variant.name()
         ),
-        &actual,
+        &ir,
+        bytemuck::cast_slice(&a_physical),
+        bytemuck::cast_slice(&packed_b),
+        &y_layout,
+        m,
+        n,
+        (1, n as u32, 1),
         &expected,
         qgemv_tolerance(format),
-    );
-    Ok(())
+    )
 }
 
 fn fuzz_qgemv_split_workgroups_case(
@@ -379,24 +363,20 @@ fn fuzz_qgemv_split_workgroups_case(
     let (packed_b, dequantized_b) = pack_random_quantized_matrix(rng, format, k, n);
     let expected = cpu_matmul(&a, &dequantized_b, m, k, n);
     let ir = qmatmul_split_workgroups_ir(m, n, k, format, 2, &a_layout, &y_layout);
-    let actual_physical = run_three_buffer_kernel(
+    assert_kernel_matmul(
         device,
         queue,
+        &format!("split-grid qgemv {format:?} n={n} k={k}"),
         &ir,
         bytemuck::cast_slice(&a_physical),
         bytemuck::cast_slice(&packed_b),
-        allocation_len(&y_layout),
+        &y_layout,
+        m,
+        n,
         (2, n.div_ceil(2) as u32, 1),
-    )?;
-    let actual = gather_f32_matrix(&actual_physical, m, n, &y_layout);
-
-    assert_close(
-        &format!("split-grid qgemv {format:?} n={n} k={k}"),
-        &actual,
         &expected,
         qgemv_tolerance(format),
-    );
-    Ok(())
+    )
 }
 
 fn gemm_ir(a_layout: &Layout, b_layout: &Layout, y_layout: &Layout) -> KernelIr {
@@ -609,6 +589,35 @@ fn run_three_buffer_kernel(
     Ok(values)
 }
 
+#[allow(clippy::too_many_arguments)]
+fn assert_kernel_matmul(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    label: &str,
+    ir: &KernelIr,
+    first_input: &[u8],
+    second_input: &[u8],
+    y_layout: &Layout,
+    rows: usize,
+    cols: usize,
+    dispatch: (u32, u32, u32),
+    expected: &[f32],
+    tolerance: f32,
+) -> TestResult {
+    let actual_physical = run_three_buffer_kernel(
+        device,
+        queue,
+        ir,
+        first_input,
+        second_input,
+        allocation_len(y_layout),
+        dispatch,
+    )?;
+    let actual = gather_f32_matrix(&actual_physical, rows, cols, y_layout);
+    assert_close(label, &actual, expected, tolerance);
+    Ok(())
+}
+
 fn storage_layout_entry(binding: u32, read_only: bool) -> wgpu::BindGroupLayoutEntry {
     wgpu::BindGroupLayoutEntry {
         binding,
@@ -719,117 +728,85 @@ fn pack_random_quantized_matrix(
 
 fn pack_random_quantized_block(rng: &mut FuzzRng, format: GgmlQuantFormat) -> (Vec<u32>, Vec<f32>) {
     match format {
-        GgmlQuantFormat::Q4_0 => pack_q4_0_block(rng),
-        GgmlQuantFormat::Q4_1 => pack_q4_1_block(rng),
-        GgmlQuantFormat::Q5_0 => pack_q5_0_block(rng),
-        GgmlQuantFormat::Q5_1 => pack_q5_1_block(rng),
-        GgmlQuantFormat::Q8_0 => pack_q8_0_block(rng),
-        GgmlQuantFormat::Q8_1 => pack_q8_1_block(rng),
+        GgmlQuantFormat::Q4_0 => {
+            pack_q4_q5_nibble_block(rng, format, 4, None, 0xf, QValue::Signed(8))
+        }
+        GgmlQuantFormat::Q4_1 => {
+            pack_q4_q5_nibble_block(rng, format, 8, None, 0xf, QValue::Affine(-1.0))
+        }
+        GgmlQuantFormat::Q5_0 => {
+            pack_q4_q5_nibble_block(rng, format, 8, Some(1), 0x1f, QValue::Signed(16))
+        }
+        GgmlQuantFormat::Q5_1 => {
+            pack_q4_q5_nibble_block(rng, format, 12, Some(2), 0x1f, QValue::Affine(-2.0))
+        }
+        GgmlQuantFormat::Q8_0 => pack_signed_byte_block(rng, format, 4, 32, 63, 31),
+        GgmlQuantFormat::Q8_1 => pack_signed_byte_block(rng, format, 8, 32, 63, 31),
         GgmlQuantFormat::Q2K => pack_q2k_block(rng),
         GgmlQuantFormat::Q3K => pack_q3k_block(rng),
-        GgmlQuantFormat::Q4K => pack_q4k_block(rng),
-        GgmlQuantFormat::Q5K => pack_q5k_block(rng),
+        GgmlQuantFormat::Q4K => pack_k_nibble_block(rng, format, 5, None, 0xf),
+        GgmlQuantFormat::Q5K => pack_k_nibble_block(rng, format, 13, Some(5 * 4), 0x1f),
         GgmlQuantFormat::Q6K => pack_q6k_block(rng),
-        GgmlQuantFormat::Q8K => pack_q8k_block(rng),
+        GgmlQuantFormat::Q8K => pack_signed_byte_block(rng, format, 4, 256, 127, 63),
     }
 }
 
-fn pack_q4_0_block(rng: &mut FuzzRng) -> (Vec<u32>, Vec<f32>) {
-    let scale: f32 = 0.125;
-    let mut words = vec![0; GgmlQuantFormat::Q4_0.block_words() as usize];
-    words[0] = scale.to_bits();
-    let mut values = vec![0.0; 32];
-
-    for (i, value) in values.iter_mut().enumerate() {
-        let q = (rng.next_u32() & 0xf) as u8;
-        set_nibble(&mut words, 4 + (i & 15), i >= 16, q);
-        *value = (q as i32 - 8) as f32 * scale;
-    }
-
-    (words, values)
+#[derive(Copy, Clone)]
+enum QValue {
+    Signed(i32),
+    Affine(f32),
 }
 
-fn pack_q4_1_block(rng: &mut FuzzRng) -> (Vec<u32>, Vec<f32>) {
+fn pack_q4_q5_nibble_block(
+    rng: &mut FuzzRng,
+    format: GgmlQuantFormat,
+    nibble_byte_offset: usize,
+    high_word: Option<usize>,
+    q_mask: u32,
+    value_kind: QValue,
+) -> (Vec<u32>, Vec<f32>) {
     let scale: f32 = 0.125;
-    let min: f32 = -1.0;
-    let mut words = vec![0; GgmlQuantFormat::Q4_1.block_words() as usize];
+    let mut words = vec![0; format.block_words() as usize];
     words[0] = scale.to_bits();
-    words[1] = min.to_bits();
-    let mut values = vec![0.0; 32];
-
-    for (i, value) in values.iter_mut().enumerate() {
-        let q = (rng.next_u32() & 0xf) as u8;
-        set_nibble(&mut words, 8 + (i & 15), i >= 16, q);
-        *value = q as f32 * scale + min;
+    if let QValue::Affine(min) = value_kind {
+        words[1] = min.to_bits();
     }
-
-    (words, values)
-}
-
-fn pack_q5_0_block(rng: &mut FuzzRng) -> (Vec<u32>, Vec<f32>) {
-    let scale: f32 = 0.125;
-    let mut words = vec![0; GgmlQuantFormat::Q5_0.block_words() as usize];
-    words[0] = scale.to_bits();
     let mut values = vec![0.0; 32];
 
     for (i, value) in values.iter_mut().enumerate() {
-        let q = (rng.next_u32() & 0x1f) as u8;
+        let q = (rng.next_u32() & q_mask) as u8;
         if q & 0x10 != 0 {
-            let high_bit = if i < 16 { i } else { (i & 15) + 16 };
-            words[1] |= 1u32 << high_bit;
+            if let Some(high_word) = high_word {
+                let high_bit = if i < 16 { i } else { (i & 15) + 16 };
+                words[high_word] |= 1u32 << high_bit;
+            }
         }
-        set_nibble(&mut words, 8 + (i & 15), i >= 16, q & 0xf);
-        *value = (q as i32 - 16) as f32 * scale;
+        set_nibble(&mut words, nibble_byte_offset + (i & 15), i >= 16, q & 0xf);
+        *value = match value_kind {
+            QValue::Signed(bias) => (q as i32 - bias) as f32 * scale,
+            QValue::Affine(min) => q as f32 * scale + min,
+        };
     }
 
     (words, values)
 }
 
-fn pack_q5_1_block(rng: &mut FuzzRng) -> (Vec<u32>, Vec<f32>) {
-    let scale: f32 = 0.125;
-    let min: f32 = -2.0;
-    let mut words = vec![0; GgmlQuantFormat::Q5_1.block_words() as usize];
-    words[0] = scale.to_bits();
-    words[1] = min.to_bits();
-    let mut values = vec![0.0; 32];
-
-    for (i, value) in values.iter_mut().enumerate() {
-        let q = (rng.next_u32() & 0x1f) as u8;
-        if q & 0x10 != 0 {
-            let high_bit = if i < 16 { i } else { (i & 15) + 16 };
-            words[2] |= 1u32 << high_bit;
-        }
-        set_nibble(&mut words, 12 + (i & 15), i >= 16, q & 0xf);
-        *value = q as f32 * scale + min;
-    }
-
-    (words, values)
-}
-
-fn pack_q8_0_block(rng: &mut FuzzRng) -> (Vec<u32>, Vec<f32>) {
+fn pack_signed_byte_block(
+    rng: &mut FuzzRng,
+    format: GgmlQuantFormat,
+    byte_offset: usize,
+    elements: usize,
+    span: u32,
+    bias: i32,
+) -> (Vec<u32>, Vec<f32>) {
     let scale: f32 = 0.03125;
-    let mut words = vec![0; GgmlQuantFormat::Q8_0.block_words() as usize];
+    let mut words = vec![0; format.block_words() as usize];
     words[0] = scale.to_bits();
-    let mut values = vec![0.0; 32];
+    let mut values = vec![0.0; elements];
 
     for (i, value) in values.iter_mut().enumerate() {
-        let q = (rng.next_u32() % 63) as i32 - 31;
-        set_byte(&mut words, 4 + i, q as i8 as u8);
-        *value = q as f32 * scale;
-    }
-
-    (words, values)
-}
-
-fn pack_q8_1_block(rng: &mut FuzzRng) -> (Vec<u32>, Vec<f32>) {
-    let scale: f32 = 0.03125;
-    let mut words = vec![0; GgmlQuantFormat::Q8_1.block_words() as usize];
-    words[0] = scale.to_bits();
-    let mut values = vec![0.0; 32];
-
-    for (i, value) in values.iter_mut().enumerate() {
-        let q = (rng.next_u32() % 63) as i32 - 31;
-        set_byte(&mut words, 8 + i, q as i8 as u8);
+        let q = (rng.next_u32() % span) as i32 - bias;
+        set_byte(&mut words, byte_offset + i, q as i8 as u8);
         *value = q as f32 * scale;
     }
 
@@ -897,9 +874,15 @@ fn pack_q3k_block(rng: &mut FuzzRng) -> (Vec<u32>, Vec<f32>) {
     (words, values)
 }
 
-fn pack_q4k_block(rng: &mut FuzzRng) -> (Vec<u32>, Vec<f32>) {
+fn pack_k_nibble_block(
+    rng: &mut FuzzRng,
+    format: GgmlQuantFormat,
+    nibble_word_offset: usize,
+    high_byte_offset: Option<usize>,
+    q_mask: u32,
+) -> (Vec<u32>, Vec<f32>) {
     let scale: f32 = 0.0625;
-    let mut words = vec![0; GgmlQuantFormat::Q4K.block_words() as usize];
+    let mut words = vec![0; format.block_words() as usize];
     words[0] = scale.to_bits();
     words[1] = 0.0_f32.to_bits();
     words[2] = 0x0101_0101;
@@ -908,32 +891,15 @@ fn pack_q4k_block(rng: &mut FuzzRng) -> (Vec<u32>, Vec<f32>) {
     let mut values = vec![0.0; 256];
 
     for (i, value) in values.iter_mut().enumerate() {
-        let q = (rng.next_u32() & 0xf) as u8;
-        set_k_nibble(&mut words, 5, i, q);
-        *value = q as f32 * scale;
-    }
-
-    (words, values)
-}
-
-fn pack_q5k_block(rng: &mut FuzzRng) -> (Vec<u32>, Vec<f32>) {
-    let scale: f32 = 0.0625;
-    let mut words = vec![0; GgmlQuantFormat::Q5K.block_words() as usize];
-    words[0] = scale.to_bits();
-    words[1] = 0.0_f32.to_bits();
-    words[2] = 0x0101_0101;
-    words[3] = 0;
-    words[4] = 0x0101_0101;
-    let mut values = vec![0.0; 256];
-
-    for (i, value) in values.iter_mut().enumerate() {
-        let q = (rng.next_u32() & 0x1f) as u8;
+        let q = (rng.next_u32() & q_mask) as u8;
         if q & 0x10 != 0 {
-            let qh_byte = 5 * 4 + (i & 31);
-            let qh_bit = i >> 5;
-            set_bit_in_byte(&mut words, qh_byte, qh_bit);
+            if let Some(high_byte_offset) = high_byte_offset {
+                let qh_byte = high_byte_offset + (i & 31);
+                let qh_bit = i >> 5;
+                set_bit_in_byte(&mut words, qh_byte, qh_bit);
+            }
         }
-        set_k_nibble(&mut words, 13, i, q & 0xf);
+        set_k_nibble(&mut words, nibble_word_offset, i, q & 0xf);
         *value = q as f32 * scale;
     }
 
@@ -963,21 +929,6 @@ fn pack_q6k_block(rng: &mut FuzzRng) -> (Vec<u32>, Vec<f32>) {
         set_two_bits(&mut words, higher_byte, low_group * 2, (q >> 4) & 0x3);
 
         *value = (q as i32 - 32) as f32 * scale;
-    }
-
-    (words, values)
-}
-
-fn pack_q8k_block(rng: &mut FuzzRng) -> (Vec<u32>, Vec<f32>) {
-    let scale: f32 = 0.03125;
-    let mut words = vec![0; GgmlQuantFormat::Q8K.block_words() as usize];
-    words[0] = scale.to_bits();
-    let mut values = vec![0.0; 256];
-
-    for (i, value) in values.iter_mut().enumerate() {
-        let q = (rng.next_u32() % 127) as i32 - 63;
-        set_byte(&mut words, 4 + i, q as i8 as u8);
-        *value = q as f32 * scale;
     }
 
     (words, values)

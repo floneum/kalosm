@@ -401,10 +401,8 @@ pub struct TileProgramOp {
 pub enum TileStmt {
     /// Per-lane masked storage write.
     Store(TileStoreStmt),
-    /// Per-lane masked vector storage write to a rank-1 storage view.
-    StoreVec4(TileVec4StoreStmt),
     /// Per-lane masked rank-1 storage write.
-    StoreLinear(TileLinearStoreStmt),
+    StoreIndexed(TileIndexedStoreStmt),
     /// Store to a private per-invocation local.
     StoreLocal { dst: LocalRef, value: TileExpr },
     /// Materialize a pure tile expression at this point so later pinned
@@ -493,18 +491,9 @@ pub struct TileStoreStmt {
     pub mask: TileMaskExpr,
 }
 
-/// A masked vec4 store emitted by a source tile program.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct TileVec4StoreStmt {
-    pub dst: StorageView,
-    pub index: TileIndexExpr,
-    pub value: TileExpr,
-    pub mask: TileMaskExpr,
-}
-
 /// A masked rank-1 store emitted by a source tile program.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct TileLinearStoreStmt {
+pub struct TileIndexedStoreStmt {
     pub dst: StorageView,
     pub index: TileIndexExpr,
     pub value: TileExpr,
@@ -650,16 +639,8 @@ pub enum TileExpr {
         mask: TileMaskExpr,
         fill: F32Bits,
     },
-    QuantizedQ8ActivationDot {
-        a: Vec<Box<TileExpr>>,
-        src: QuantizedMatrix,
-        k_base: TileIndexExpr,
-        col: TileIndexExpr,
-        mask: TileMaskExpr,
-        fill: F32Bits,
-        block_n: u32,
-    },
-    QuantizedQ4KF32Dot {
+    QuantizedVecDot {
+        kind: QuantizedVecDotKind,
         a: Vec<Box<TileExpr>>,
         src: QuantizedMatrix,
         k_base: TileIndexExpr,
@@ -703,6 +684,12 @@ pub enum TileExpr {
         group: LoopFoldGroupId,
         lane: u32,
     },
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum QuantizedVecDotKind {
+    Q8Activation,
+    Q4KF32,
 }
 
 /// A masked rank-1 tile load.

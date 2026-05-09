@@ -1,6 +1,5 @@
 use std::{
     hash::{Hash, Hasher},
-    num::NonZeroUsize,
     sync::OnceLock,
 };
 
@@ -15,15 +14,13 @@ use crate::{
     mir::{
         direct_kernel::{DirectKernel, DirectKernelBinding},
         inputs::MirValue,
-        kernel_backend::{self, CompiledKernelModule},
+        kernel_backend,
         operation::Operation,
         workgroup_shape::{Constraint, WorkgroupShape, WorkgroupShapeConstraints},
     },
     tensor::TensorData,
 };
-use lru::LruCache;
-use parking_lot::RwLock;
-use rustc_hash::{FxBuildHasher, FxHasher};
+use rustc_hash::FxHasher;
 
 const BLOCK: usize = 256;
 const SIMD_WIDTH: usize = 32;
@@ -34,27 +31,9 @@ const DECODE_LARGE_BLOCK: u32 = 1024;
 const DECODE_HEAD_DIM: u32 = 128;
 const FLASH_ATTENTION_MODULE_CACHE_SIZE: usize = 128;
 
-fn flash_attention_module_cache()
--> &'static RwLock<LruCache<[u64; 2], CompiledKernelModule, FxBuildHasher>> {
-    static CACHE: OnceLock<RwLock<LruCache<[u64; 2], CompiledKernelModule, FxBuildHasher>>> =
-        OnceLock::new();
-    CACHE.get_or_init(|| {
-        RwLock::new(LruCache::with_hasher(
-            NonZeroUsize::new(FLASH_ATTENTION_MODULE_CACHE_SIZE).unwrap(),
-            Default::default(),
-        ))
-    })
-}
-
-fn hash_layout<H: Hasher>(state: &mut H, layout: &crate::Layout) {
-    layout.offset().hash(state);
-    layout.shape().hash(state);
-    layout.strides().hash(state);
-}
-
-fn hash_strided_buffer<H: Hasher>(state: &mut H, layout: &crate::Layout) {
-    layout.offset().hash(state);
-    layout.strides().hash(state);
+fn flash_attention_module_cache() -> &'static kernel_backend::ModuleCache {
+    static CACHE: OnceLock<kernel_backend::ModuleCache> = OnceLock::new();
+    CACHE.get_or_init(|| kernel_backend::module_cache(FLASH_ATTENTION_MODULE_CACHE_SIZE))
 }
 
 fn flash_attention_module_key(
@@ -87,17 +66,17 @@ fn flash_attention_module_key(
         dispatch_size.hash(&mut hasher);
         (input_dtype as u32).hash(&mut hasher);
         if variant == FlashAttentionKernelVariant::DecodeSmall {
-            hash_strided_buffer(&mut hasher, q.layout());
-            hash_strided_buffer(&mut hasher, k.layout());
-            hash_strided_buffer(&mut hasher, v.layout());
-            hash_strided_buffer(&mut hasher, output.layout());
+            kernel_backend::hash_strided_layout(&mut hasher, q.layout());
+            kernel_backend::hash_strided_layout(&mut hasher, k.layout());
+            kernel_backend::hash_strided_layout(&mut hasher, v.layout());
+            kernel_backend::hash_strided_layout(&mut hasher, output.layout());
         } else {
-            hash_layout(&mut hasher, q.layout());
-            hash_layout(&mut hasher, k.layout());
-            hash_layout(&mut hasher, v.layout());
-            mask.map(|mask| hash_layout(&mut hasher, mask.layout()))
+            kernel_backend::hash_layout(&mut hasher, q.layout());
+            kernel_backend::hash_layout(&mut hasher, k.layout());
+            kernel_backend::hash_layout(&mut hasher, v.layout());
+            mask.map(|mask| kernel_backend::hash_layout(&mut hasher, mask.layout()))
                 .hash(&mut hasher);
-            hash_layout(&mut hasher, output.layout());
+            kernel_backend::hash_layout(&mut hasher, output.layout());
         }
         hasher.finish()
     })
@@ -112,6 +91,9 @@ enum FlashAttentionKernelVariant {
 const FLASH_Q_SEQ: Axis<3> = Axis;
 const FLASH_KV_SEQ: Axis<4> = Axis;
 const FLASH_HEAD_DIM: Axis<5> = Axis;
+
+type FlashAttentionDims = tile_ir::FlashAttentionDims;
+type FlashDecodeSmallMeta = tile_ir::FlashDecodeSmallMeta;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum DecodeBlock {
@@ -531,49 +513,47 @@ impl Operation for FlashAttentionOperation {
             "{kernel_label}:{:016x}{:016x}",
             module_key[0], module_key[1]
         );
-        let module = if let Some(module) = flash_attention_module_cache().write().get(&module_key) {
-            module.clone()
-        } else {
-            let verbose_cache_key = format!(
-                "{}:backend-lowered:block={BLOCK}:simd={SIMD_WIDTH}:outputs={OUTPUTS_PER_WORKGROUP}:dispatch={dispatch_size:?}:scale={:?}:q={:?}:k={:?}:v={:?}:mask={:?}:out={:?}",
-                self.name(),
-                self.scale.to_bits(),
-                q.layout(),
-                k.layout(),
-                v.layout(),
-                mask.as_ref().map(|mask| mask.layout()),
-                output.layout()
-            );
-            let module = kernel_backend::cached_kernel_ir(&device, verbose_cache_key, || {
-                if let Some(meta) = decode_meta {
-                    tile_ir::kernels::flash_decode_small(meta.into_tile_ir())
-                } else {
-                    let stream_meta = tile_ir::FlashAttentionMeta {
-                        dims: dims.into_tile_ir(),
-                        scale: tile_ir::F32Bits::new(self.scale),
-                        q_meta: q_meta.clone().into_tile_ir(),
-                        k_meta: k_meta.clone().into_tile_ir(),
-                        v_meta: v_meta.clone().into_tile_ir(),
-                        mask_meta: mask_meta.clone().map(TensorMeta::into_tile_ir),
-                        output_meta: output_meta.clone().into_tile_ir(),
-                        dispatch_size,
-                    };
-                    match input_dtype {
-                        DataTypeEnum::F32 => {
-                            tile_ir::kernels::flash_attention::<tile_ir::F32>(stream_meta)
+        let module = kernel_backend::cached_hashed_kernel_module(
+            flash_attention_module_cache(),
+            module_key,
+            || {
+                let verbose_cache_key = format!(
+                    "{}:backend-lowered:block={BLOCK}:simd={SIMD_WIDTH}:outputs={OUTPUTS_PER_WORKGROUP}:dispatch={dispatch_size:?}:scale={:?}:q={:?}:k={:?}:v={:?}:mask={:?}:out={:?}",
+                    self.name(),
+                    self.scale.to_bits(),
+                    q.layout(),
+                    k.layout(),
+                    v.layout(),
+                    mask.as_ref().map(|mask| mask.layout()),
+                    output.layout()
+                );
+                kernel_backend::cached_kernel_ir(&device, verbose_cache_key, || {
+                    if let Some(meta) = decode_meta {
+                        tile_ir::kernels::flash_decode_small(meta)
+                    } else {
+                        let stream_meta = tile_ir::FlashAttentionMeta {
+                            dims,
+                            scale: tile_ir::F32Bits::new(self.scale),
+                            q_meta: q_meta.tile.clone(),
+                            k_meta: k_meta.tile.clone(),
+                            v_meta: v_meta.tile.clone(),
+                            mask_meta: mask_meta.clone().map(|meta| meta.tile),
+                            output_meta: output_meta.tile.clone(),
+                            dispatch_size,
+                        };
+                        match input_dtype {
+                            DataTypeEnum::F32 => {
+                                tile_ir::kernels::flash_attention::<tile_ir::F32>(stream_meta)
+                            }
+                            DataTypeEnum::F16 => {
+                                tile_ir::kernels::flash_attention::<tile_ir::F16>(stream_meta)
+                            }
+                            _ => None,
                         }
-                        DataTypeEnum::F16 => {
-                            tile_ir::kernels::flash_attention::<tile_ir::F16>(stream_meta)
-                        }
-                        _ => None,
                     }
-                }
-            })?;
-            flash_attention_module_cache()
-                .write()
-                .get_or_insert(module_key, || module.clone())
-                .clone()
-        };
+                })
+            },
+        )?;
 
         let mut bindings = vec![
             DirectKernelBinding::Storage {
@@ -645,97 +625,31 @@ impl Operation for FlashAttentionOperation {
     }
 }
 
-#[derive(Clone, Copy, Debug)]
-pub(crate) struct FlashAttentionDims {
-    batch: u32,
-    num_heads: u32,
-    num_kv_heads: u32,
-    q_seq_len: u32,
-    kv_seq_len: u32,
-    head_dim: u32,
-}
-
-impl FlashAttentionDims {
-    fn into_tile_ir(self) -> tile_ir::FlashAttentionDims {
-        tile_ir::FlashAttentionDims {
-            batch: self.batch,
-            num_heads: self.num_heads,
-            num_kv_heads: self.num_kv_heads,
-            q_seq_len: self.q_seq_len,
-            kv_seq_len: self.kv_seq_len,
-            head_dim: self.head_dim,
-        }
-    }
-}
-
 #[derive(Clone)]
 pub(crate) struct TensorMeta {
     datatype: DataTypeEnum,
-    strides: Vec<u32>,
-    offset: u32,
+    tile: tile_ir::TensorMeta,
 }
 
 impl TensorMeta {
     fn new(tensor: &TensorData) -> Option<Self> {
+        let strides = tensor
+            .layout()
+            .strides()
+            .iter()
+            .copied()
+            .map(u32::try_from)
+            .collect::<Result<Vec<_>, _>>()
+            .ok()?;
+        let offset = tensor.layout().offset().try_into().ok()?;
         Some(Self {
             datatype: tensor.datatype(),
-            strides: tensor
-                .layout()
-                .strides()
-                .iter()
-                .copied()
-                .map(u32::try_from)
-                .collect::<Result<Vec<_>, _>>()
-                .ok()?,
-            offset: tensor.layout().offset().try_into().ok()?,
+            tile: tile_ir::TensorMeta::new(strides, offset),
         })
     }
 
     fn stride4(&self) -> Option<[u32; 4]> {
-        self.strides.as_slice().try_into().ok()
-    }
-
-    fn into_tile_ir(self) -> tile_ir::TensorMeta {
-        tile_ir::TensorMeta::new(self.strides, self.offset)
-    }
-}
-
-#[derive(Clone, Copy)]
-pub(crate) struct FlashDecodeSmallMeta {
-    dims: FlashAttentionDims,
-    scale: f32,
-    active_kv_len: u32,
-    decode_block: u32,
-    tiled: bool,
-    groups: u32,
-    q_offset: u32,
-    k_offset: u32,
-    v_offset: u32,
-    output_offset: u32,
-    q_strides: [u32; 4],
-    k_strides: [u32; 4],
-    v_strides: [u32; 4],
-    output_strides: [u32; 4],
-}
-
-impl FlashDecodeSmallMeta {
-    fn into_tile_ir(self) -> tile_ir::FlashDecodeSmallMeta {
-        tile_ir::FlashDecodeSmallMeta {
-            dims: self.dims.into_tile_ir(),
-            scale: tile_ir::F32Bits::new(self.scale),
-            active_kv_len: self.active_kv_len,
-            decode_block: self.decode_block,
-            tiled: self.tiled,
-            groups: self.groups,
-            q_offset: self.q_offset,
-            k_offset: self.k_offset,
-            v_offset: self.v_offset,
-            output_offset: self.output_offset,
-            q_strides: self.q_strides,
-            k_strides: self.k_strides,
-            v_strides: self.v_strides,
-            output_strides: self.output_strides,
-        }
+        self.tile.strides.as_slice().try_into().ok()
     }
 }
 
@@ -769,15 +683,15 @@ fn build_flash_decode_small_meta(
 
     Some(FlashDecodeSmallMeta {
         dims: module_dims,
-        scale,
+        scale: tile_ir::F32Bits::new(scale),
         active_kv_len: dims.kv_seq_len,
         decode_block,
         tiled,
         groups,
-        q_offset: q_meta.offset,
-        k_offset: k_meta.offset,
-        v_offset: v_meta.offset,
-        output_offset: output_meta.offset,
+        q_offset: q_meta.tile.offset,
+        k_offset: k_meta.tile.offset,
+        v_offset: v_meta.tile.offset,
+        output_offset: output_meta.tile.offset,
         q_strides: q_meta.stride4()?,
         k_strides: k_meta.stride4()?,
         v_strides: v_meta.stride4()?,
@@ -788,7 +702,7 @@ fn build_flash_decode_small_meta(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{Device, Tensor, kernel_selection::DeterministicShapeRng};
+    use crate::{Device, Tensor, kernel_selection::assert_selector_generates};
 
     const TEST_HEAD_DIM: usize = DECODE_HEAD_DIM as usize;
 
@@ -808,8 +722,7 @@ mod tests {
     fn tensor_meta4() -> TensorMeta {
         TensorMeta {
             datatype: DataTypeEnum::F32,
-            strides: vec![65_536, 8_192, 128, 1],
-            offset: 0,
+            tile: tile_ir::TensorMeta::new(vec![65_536, 8_192, 128, 1], 0),
         }
     }
 
@@ -989,109 +902,64 @@ mod tests {
                 caps(DECODE_LARGE_BLOCK),
             ),
         ];
-        let mut rng = DeterministicShapeRng::default();
-
-        for (variant, ctx, caps) in cases {
-            let shape = selector
-                .generate_for(variant, &ctx, caps, &mut rng)
-                .expect("variant should generate");
-            assert_eq!(selector.select(shape, &ctx, caps), Some(variant));
-        }
+        assert_selector_generates(&selector, cases);
     }
 
-    fn decode_q() -> Vec<Vec<Vec<Vec<f32>>>> {
-        vec![vec![vec![
-            (0..TEST_HEAD_DIM)
-                .map(|dim| ((dim % 17) as f32 - 8.0) * 0.0075)
-                .collect(),
-        ]]]
-    }
+    type AttentionFixture = Vec<Vec<Vec<Vec<f32>>>>;
 
-    fn decode_k(kv_len: usize) -> Vec<Vec<Vec<Vec<f32>>>> {
-        vec![vec![
-            (0..kv_len)
-                .map(|token| {
-                    (0..TEST_HEAD_DIM)
-                        .map(|dim| {
-                            let value = ((token * 13 + dim * 7) % 31) as f32 - 15.0;
-                            value * 0.004
-                        })
-                        .collect()
-                })
-                .collect(),
-        ]]
-    }
-
-    fn decode_v(kv_len: usize) -> Vec<Vec<Vec<Vec<f32>>>> {
-        vec![vec![
-            (0..kv_len)
-                .map(|token| {
-                    (0..TEST_HEAD_DIM)
-                        .map(|dim| {
-                            let value = ((token * 5 + dim * 11) % 37) as f32 - 18.0;
-                            0.25 + value * 0.01
-                        })
-                        .collect()
-                })
-                .collect(),
-        ]]
-    }
-
-    fn decode_q_gqa(num_heads: usize) -> Vec<Vec<Vec<Vec<f32>>>> {
+    fn attention_fixture(
+        heads: usize,
+        tokens: usize,
+        f: impl Fn(usize, usize, usize) -> f32,
+    ) -> AttentionFixture {
         vec![
-            (0..num_heads)
+            (0..heads)
                 .map(|head| {
-                    vec![
-                        (0..TEST_HEAD_DIM)
-                            .map(|dim| {
-                                let value = ((head * 19 + dim * 7) % 43) as f32 - 21.0;
-                                value * 0.003
-                            })
-                            .collect(),
-                    ]
-                })
-                .collect(),
-        ]
-    }
-
-    fn decode_k_gqa(num_kv_heads: usize, kv_len: usize) -> Vec<Vec<Vec<Vec<f32>>>> {
-        vec![
-            (0..num_kv_heads)
-                .map(|kv_head| {
-                    (0..kv_len)
-                        .map(|token| {
-                            (0..TEST_HEAD_DIM)
-                                .map(|dim| {
-                                    let value =
-                                        ((kv_head * 23 + token * 13 + dim * 5) % 47) as f32 - 23.0;
-                                    value * 0.0025
-                                })
-                                .collect()
-                        })
+                    (0..tokens)
+                        .map(|token| (0..TEST_HEAD_DIM).map(|dim| f(head, token, dim)).collect())
                         .collect()
                 })
                 .collect(),
         ]
     }
 
-    fn decode_v_gqa(num_kv_heads: usize, kv_len: usize) -> Vec<Vec<Vec<Vec<f32>>>> {
-        vec![
-            (0..num_kv_heads)
-                .map(|kv_head| {
-                    (0..kv_len)
-                        .map(|token| {
-                            (0..TEST_HEAD_DIM)
-                                .map(|dim| {
-                                    let value =
-                                        ((kv_head * 29 + token * 3 + dim * 11) % 53) as f32 - 26.0;
-                                    0.05 + value * 0.004
-                                })
-                                .collect()
-                        })
-                        .collect()
-                })
-                .collect(),
-        ]
+    fn decode_q() -> AttentionFixture {
+        attention_fixture(1, 1, |_, _, dim| ((dim % 17) as f32 - 8.0) * 0.0075)
+    }
+
+    fn decode_k(kv_len: usize) -> AttentionFixture {
+        attention_fixture(1, kv_len, |_, token, dim| {
+            let value = ((token * 13 + dim * 7) % 31) as f32 - 15.0;
+            value * 0.004
+        })
+    }
+
+    fn decode_v(kv_len: usize) -> AttentionFixture {
+        attention_fixture(1, kv_len, |_, token, dim| {
+            let value = ((token * 5 + dim * 11) % 37) as f32 - 18.0;
+            0.25 + value * 0.01
+        })
+    }
+
+    fn decode_q_gqa(num_heads: usize) -> AttentionFixture {
+        attention_fixture(num_heads, 1, |head, _, dim| {
+            let value = ((head * 19 + dim * 7) % 43) as f32 - 21.0;
+            value * 0.003
+        })
+    }
+
+    fn decode_k_gqa(num_kv_heads: usize, kv_len: usize) -> AttentionFixture {
+        attention_fixture(num_kv_heads, kv_len, |kv_head, token, dim| {
+            let value = ((kv_head * 23 + token * 13 + dim * 5) % 47) as f32 - 23.0;
+            value * 0.0025
+        })
+    }
+
+    fn decode_v_gqa(num_kv_heads: usize, kv_len: usize) -> AttentionFixture {
+        attention_fixture(num_kv_heads, kv_len, |kv_head, token, dim| {
+            let value = ((kv_head * 29 + token * 3 + dim * 11) % 53) as f32 - 26.0;
+            0.05 + value * 0.004
+        })
     }
 
     fn cpu_decode_reference(q: &[f32], k: &[Vec<f32>], v: &[Vec<f32>], scale: f32) -> Vec<f32> {
@@ -1120,6 +988,43 @@ mod tests {
         output.into_iter().map(|value| value as f32).collect()
     }
 
+    fn decode_max_error(
+        num_heads: usize,
+        groups: usize,
+        q_data: &AttentionFixture,
+        k_data: &AttentionFixture,
+        v_data: &AttentionFixture,
+        scale: f32,
+        actual: impl Fn(usize, usize) -> f32,
+    ) -> (f32, usize, usize, f32, f32) {
+        let mut max_error = 0.0f32;
+        let mut max_head = 0usize;
+        let mut max_dim = 0usize;
+        let mut max_actual = 0.0f32;
+        let mut max_expected = 0.0f32;
+        for head in 0..num_heads {
+            let kv_head = head / groups;
+            let expected = cpu_decode_reference(
+                &q_data[0][head][0],
+                &k_data[0][kv_head],
+                &v_data[0][kv_head],
+                scale,
+            );
+            for (dim, expected) in expected.into_iter().enumerate() {
+                let actual = actual(head, dim);
+                let error = (actual - expected).abs();
+                if error > max_error {
+                    max_error = error;
+                    max_head = head;
+                    max_dim = dim;
+                    max_actual = actual;
+                    max_expected = expected;
+                }
+            }
+        }
+        (max_error, max_head, max_dim, max_actual, max_expected)
+    }
+
     #[tokio::test]
     async fn tiled_decode_attention_matches_cpu_reference() {
         let Ok(device) = Device::new().await else {
@@ -1137,22 +1042,10 @@ mod tests {
         let v = Tensor::new(&device, &v_data);
         let output = q.try_flash_attention_direct(&k, &v, scale, None).unwrap();
         let output = output.as_slice().await.unwrap();
-        let expected = cpu_decode_reference(&q_data[0][0][0], &k_data[0][0], &v_data[0][0], scale);
-
-        let mut max_error = 0.0f32;
-        let mut max_dim = 0usize;
-        let mut max_actual = 0.0f32;
-        let mut max_expected = 0.0f32;
-        for (dim, expected) in expected.into_iter().enumerate() {
-            let actual = output[[0, 0, 0, dim]];
-            let error = (actual - expected).abs();
-            if error > max_error {
-                max_error = error;
-                max_dim = dim;
-                max_actual = actual;
-                max_expected = expected;
-            }
-        }
+        let (max_error, _, max_dim, max_actual, max_expected) =
+            decode_max_error(1, 1, &q_data, &k_data, &v_data, scale, |_, dim| {
+                output[[0, 0, 0, dim]]
+            });
         assert!(
             max_error < 2.0e-4,
             "dim {max_dim}: actual={max_actual} expected={max_expected} error={max_error}"
@@ -1180,31 +1073,15 @@ mod tests {
         let output = q.try_flash_attention_direct(&k, &v, scale, None).unwrap();
         let output = output.as_slice().await.unwrap();
 
-        let mut max_error = 0.0f32;
-        let mut max_head = 0usize;
-        let mut max_dim = 0usize;
-        let mut max_actual = 0.0f32;
-        let mut max_expected = 0.0f32;
-        for head in 0..num_heads {
-            let kv_head = head / groups;
-            let expected = cpu_decode_reference(
-                &q_data[0][head][0],
-                &k_data[0][kv_head],
-                &v_data[0][kv_head],
-                scale,
-            );
-            for (dim, expected) in expected.into_iter().enumerate() {
-                let actual = output[[0, head, 0, dim]];
-                let error = (actual - expected).abs();
-                if error > max_error {
-                    max_error = error;
-                    max_head = head;
-                    max_dim = dim;
-                    max_actual = actual;
-                    max_expected = expected;
-                }
-            }
-        }
+        let (max_error, max_head, max_dim, max_actual, max_expected) = decode_max_error(
+            num_heads,
+            groups,
+            &q_data,
+            &k_data,
+            &v_data,
+            scale,
+            |head, dim| output[[0, head, 0, dim]],
+        );
         assert!(
             max_error < 3.0e-4,
             "head {max_head} dim {max_dim}: actual={max_actual} expected={max_expected} error={max_error}"
@@ -1246,31 +1123,15 @@ mod tests {
             let output = q.try_flash_attention_direct(&k, &v, scale, None).unwrap();
             let output = output.as_slice().await.unwrap();
 
-            let mut max_error = 0.0f32;
-            let mut max_head = 0usize;
-            let mut max_dim = 0usize;
-            let mut max_actual = 0.0f32;
-            let mut max_expected = 0.0f32;
-            for head in 0..num_heads {
-                let kv_head = head / groups;
-                let expected = cpu_decode_reference(
-                    &q_data[0][head][0],
-                    &k_data[0][kv_head],
-                    &v_data[0][kv_head],
-                    scale,
-                );
-                for (dim, expected) in expected.into_iter().enumerate() {
-                    let actual = output[[0, head, 0, dim]];
-                    let error = (actual - expected).abs();
-                    if error > max_error {
-                        max_error = error;
-                        max_head = head;
-                        max_dim = dim;
-                        max_actual = actual;
-                        max_expected = expected;
-                    }
-                }
-            }
+            let (max_error, max_head, max_dim, max_actual, max_expected) = decode_max_error(
+                num_heads,
+                groups,
+                &q_data,
+                &k_data,
+                &v_data,
+                scale,
+                |head, dim| output[[0, head, 0, dim]],
+            );
             assert!(
                 max_error < 5.0e-4,
                 "kv_len={kv_len} head={max_head} dim={max_dim}: actual={max_actual} expected={max_expected} error={max_error}"

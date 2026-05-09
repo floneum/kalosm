@@ -13,11 +13,11 @@ use naga::{
 use crate::ir::{
     BlockDequantId, BufferAccess, BufferId, CoopAccId, CoopFragmentId, CoopOperandRole,
     DynamicOffset, ElementType, F32Bits, FlattenedMatrixMap, Im2ColNhwcMap, KernelIr, Layout,
-    LocalId, LocalRef, LoopFoldGroupId, MemoryLevel, Op, PinId, StorageIndexMap, StorageView,
-    TileBinaryOp, TileCompareOp, TileExpr, TileId, TileIndexExpr, TileLinearLoadExpr,
-    TileLinearStoreStmt, TileLiteral, TileLoadExpr, TileMaskExpr, TileOrigin, TileProgramOp,
+    LocalId, LocalRef, LoopFoldGroupId, MemoryLevel, Op, PinId, QuantizedVecDotKind,
+    StorageIndexMap, StorageView, TileBinaryOp, TileCompareOp, TileExpr, TileId, TileIndexExpr,
+    TileLinearLoadExpr, TileLiteral, TileLoadExpr, TileMaskExpr, TileOrigin, TileProgramOp,
     TileQuantizedLoadExpr, TileReduceOp, TileRef, TileScalarExpr, TileStmt, TileStoreStmt,
-    TileUnaryOp, TileVec4LoadExpr, TileVec4StoreStmt,
+    TileUnaryOp, TileVec4LoadExpr,
 };
 use crate::quantized::{GgmlQuantFormat, QuantizedMatrix};
 

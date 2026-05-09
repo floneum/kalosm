@@ -1,6 +1,5 @@
 use std::{
     hash::{Hash, Hasher},
-    num::NonZeroUsize,
     sync::OnceLock,
 };
 
@@ -13,7 +12,7 @@ use crate::{
     mir::{
         direct_kernel::{DirectKernel, DirectKernelBinding},
         inputs::MirValue,
-        kernel_backend::{self, CompiledKernelModule},
+        kernel_backend,
         operation::Operation,
         tile_direct::{
             flatten_matrix_layout, tile_storage_read_with_direct_layout,
@@ -24,29 +23,14 @@ use crate::{
     tensor::TensorData,
 };
 use fusor_tile_ir as tile_ir;
-use lru::LruCache;
-use parking_lot::RwLock;
-use rustc_hash::{FxBuildHasher, FxHasher};
+use rustc_hash::FxHasher;
 
 const BLOCK: usize = 1024;
 const RMS_NORM_MODULE_CACHE_SIZE: usize = 128;
 
-fn rms_norm_module_cache()
--> &'static RwLock<LruCache<[u64; 2], CompiledKernelModule, FxBuildHasher>> {
-    static CACHE: OnceLock<RwLock<LruCache<[u64; 2], CompiledKernelModule, FxBuildHasher>>> =
-        OnceLock::new();
-    CACHE.get_or_init(|| {
-        RwLock::new(LruCache::with_hasher(
-            NonZeroUsize::new(RMS_NORM_MODULE_CACHE_SIZE).unwrap(),
-            Default::default(),
-        ))
-    })
-}
-
-fn hash_layout<H: Hasher>(state: &mut H, layout: &crate::Layout) {
-    layout.offset().hash(state);
-    layout.shape().hash(state);
-    layout.strides().hash(state);
+fn rms_norm_module_cache() -> &'static kernel_backend::ModuleCache {
+    static CACHE: OnceLock<kernel_backend::ModuleCache> = OnceLock::new();
+    CACHE.get_or_init(|| kernel_backend::module_cache(RMS_NORM_MODULE_CACHE_SIZE))
 }
 
 fn rms_norm_module_key(
@@ -73,14 +57,14 @@ fn rms_norm_module_key(
         has_bias.hash(&mut hasher);
         has_residual.hash(&mut hasher);
         dispatch_size.hash(&mut hasher);
-        hash_layout(&mut hasher, input.layout());
+        kernel_backend::hash_layout(&mut hasher, input.layout());
         residual
-            .map(|residual| hash_layout(&mut hasher, residual.layout()))
+            .map(|residual| kernel_backend::hash_layout(&mut hasher, residual.layout()))
             .hash(&mut hasher);
-        hash_layout(&mut hasher, weight.layout());
-        bias.map(|bias| hash_layout(&mut hasher, bias.layout()))
+        kernel_backend::hash_layout(&mut hasher, weight.layout());
+        bias.map(|bias| kernel_backend::hash_layout(&mut hasher, bias.layout()))
             .hash(&mut hasher);
-        hash_layout(&mut hasher, output.layout());
+        kernel_backend::hash_layout(&mut hasher, output.layout());
         hasher.finish()
     })
 }
@@ -328,9 +312,8 @@ impl Operation for RmsNormOperation {
             "{kernel_label}:{:016x}{:016x}",
             module_key[0], module_key[1]
         );
-        let module = if let Some(module) = rms_norm_module_cache().write().get(&module_key) {
-            module.clone()
-        } else {
+        let module =
+            kernel_backend::cached_hashed_kernel_module(rms_norm_module_cache(), module_key, || {
             let verbose_cache_key = format!(
                 "{}:tile-program:rows={rows}:cols={cols}:eps={:?}:bias={has_bias}:residual={has_residual}:dispatch={dispatch_size:?}:{:?}:{:?}:{:?}:{:?}:{:?}",
                 self.name(),
@@ -343,7 +326,7 @@ impl Operation for RmsNormOperation {
             );
             let module = if let Some(meta) = vec4_meta {
                 kernel_backend::cached_kernel_ir(&graph.device(), verbose_cache_key, || {
-                    tile_ir::kernels::rms_norm_vec4(meta.into_tile_ir(), rows)
+                    tile_ir::kernels::rms_norm_vec4(meta, rows)
                 })?
             } else {
                 kernel_backend::cached_kernel_ir(&graph.device(), verbose_cache_key, || {
@@ -357,11 +340,8 @@ impl Operation for RmsNormOperation {
                     )
                 })?
             };
-            rms_norm_module_cache()
-                .write()
-                .get_or_insert(module_key, || module.clone())
-                .clone()
-        };
+            Some(module)
+        })?;
 
         let mut bindings = vec![DirectKernelBinding::Storage {
             binding: 0,
@@ -427,39 +407,6 @@ impl Operation for RmsNormOperation {
     }
 }
 
-#[derive(Clone, Copy)]
-pub(crate) struct RmsNormVec4Meta {
-    cols: u32,
-    cols_vec: u32,
-    eps: f32,
-    input_offset_vec: u32,
-    input_row_stride_vec: u32,
-    residual_offset_vec: Option<u32>,
-    residual_row_stride_vec: u32,
-    weight_offset_vec: u32,
-    bias_offset_vec: Option<u32>,
-    output_offset_vec: u32,
-    output_row_stride_vec: u32,
-}
-
-impl RmsNormVec4Meta {
-    fn into_tile_ir(self) -> tile_ir::RmsNormVec4Meta {
-        tile_ir::RmsNormVec4Meta {
-            cols: self.cols,
-            cols_vec: self.cols_vec,
-            eps: tile_ir::F32Bits::new(self.eps),
-            input_offset_vec: self.input_offset_vec,
-            input_row_stride_vec: self.input_row_stride_vec,
-            residual_offset_vec: self.residual_offset_vec,
-            residual_row_stride_vec: self.residual_row_stride_vec,
-            weight_offset_vec: self.weight_offset_vec,
-            bias_offset_vec: self.bias_offset_vec,
-            output_offset_vec: self.output_offset_vec,
-            output_row_stride_vec: self.output_row_stride_vec,
-        }
-    }
-}
-
 fn build_vec4_rms_norm_meta(
     input_view: crate::mir::tile_direct::DirectMatrixLayout,
     residual_view: Option<crate::mir::tile_direct::DirectMatrixLayout>,
@@ -467,7 +414,7 @@ fn build_vec4_rms_norm_meta(
     bias: Option<&TensorData>,
     output_view: crate::mir::tile_direct::DirectMatrixLayout,
     eps: f32,
-) -> Option<RmsNormVec4Meta> {
+) -> Option<tile_ir::RmsNormVec4Meta> {
     if input_view.index_map.is_some()
         || output_view.index_map.is_some()
         || residual_view
@@ -525,10 +472,10 @@ fn build_vec4_rms_norm_meta(
         None
     };
 
-    Some(RmsNormVec4Meta {
+    Some(tile_ir::RmsNormVec4Meta {
         cols: input_view.cols,
         cols_vec: input_view.cols / 4,
-        eps,
+        eps: tile_ir::F32Bits::new(eps),
         input_offset_vec: input_view.offset / 4,
         input_row_stride_vec: input_row_stride / 4,
         residual_offset_vec,
@@ -666,7 +613,7 @@ fn vector_as_row_layout(layout: &crate::Layout) -> Option<tile_ir::Layout> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{Device, Tensor, kernel_selection::DeterministicShapeRng};
+    use crate::{Device, Tensor, kernel_selection::assert_selector_generates};
 
     fn caps() -> KernelDeviceCaps {
         KernelDeviceCaps {
@@ -698,14 +645,7 @@ mod tests {
                 },
             ),
         ];
-        let mut rng = DeterministicShapeRng::default();
-
-        for (variant, ctx) in cases {
-            let shape = selector
-                .generate_for(variant, &ctx, caps(), &mut rng)
-                .expect("variant should generate");
-            assert_eq!(selector.select(shape, &ctx, caps()), Some(variant));
-        }
+        assert_selector_generates(&selector, cases.map(|(variant, ctx)| (variant, ctx, caps())));
     }
 
     #[tokio::test]

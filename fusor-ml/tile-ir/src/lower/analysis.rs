@@ -34,8 +34,7 @@ impl<'a> Lowerer<'a> {
     fn mark_tile_stmt_live(ir: &KernelIr, stmt: &TileStmt, live: &mut [bool]) {
         match stmt {
             TileStmt::Store(store) => Self::mark_tile_expr_live(ir, &store.value, live),
-            TileStmt::StoreVec4(store) => Self::mark_tile_expr_live(ir, &store.value, live),
-            TileStmt::StoreLinear(store) => Self::mark_tile_expr_live(ir, &store.value, live),
+            TileStmt::StoreIndexed(store) => Self::mark_tile_expr_live(ir, &store.value, live),
             TileStmt::StoreLocal { value, .. } => Self::mark_tile_expr_live(ir, value, live),
             TileStmt::Emit { value } => Self::mark_tile_expr_live(ir, value, live),
             TileStmt::StoreWorkgroup { dst, value, .. } => {
@@ -144,8 +143,7 @@ impl<'a> Lowerer<'a> {
     {
         match stmt {
             TileStmt::Store(store) => Self::tile_expr_any(&store.value, pred),
-            TileStmt::StoreVec4(store) => Self::tile_expr_any(&store.value, pred),
-            TileStmt::StoreLinear(store) => Self::tile_expr_any(&store.value, pred),
+            TileStmt::StoreIndexed(store) => Self::tile_expr_any(&store.value, pred),
             TileStmt::StoreLocal { value, .. }
             | TileStmt::Emit { value }
             | TileStmt::StoreWorkgroup { value, .. } => Self::tile_expr_any(value, pred),
@@ -186,12 +184,7 @@ impl<'a> Lowerer<'a> {
                     || Self::tile_mask_expr_index_any(&store.mask, pred)
                     || Self::tile_expr_index_any(&store.value, pred)
             }
-            TileStmt::StoreVec4(store) => {
-                Self::tile_index_expr_any(&store.index, pred)
-                    || Self::tile_mask_expr_index_any(&store.mask, pred)
-                    || Self::tile_expr_index_any(&store.value, pred)
-            }
-            TileStmt::StoreLinear(store) => {
+            TileStmt::StoreIndexed(store) => {
                 Self::tile_index_expr_any(&store.index, pred)
                     || Self::tile_mask_expr_index_any(&store.mask, pred)
                     || Self::tile_expr_index_any(&store.value, pred)
@@ -292,8 +285,7 @@ impl<'a> Lowerer<'a> {
             TileExpr::Sum { values } => values.iter().any(|expr| pred(expr)),
             TileExpr::Dot4 { a, b } => a.iter().chain(b.iter()).any(|expr| pred(expr)),
             TileExpr::QuantizedQ8_0Dot8 { a, .. } => a.iter().any(|expr| pred(expr)),
-            TileExpr::QuantizedQ8ActivationDot { a, .. }
-            | TileExpr::QuantizedQ4KF32Dot { a, .. }
+            TileExpr::QuantizedVecDot { a, .. }
             | TileExpr::QuantizedQ6KGgmlDot { a, .. } => a.iter().any(|expr| pred(expr)),
             TileExpr::QuantizedQ4KGgmlDot {
                 a_low,
@@ -342,10 +334,7 @@ impl<'a> Lowerer<'a> {
             TileExpr::QuantizedQ8_0Dot8 {
                 k_base, col, mask, ..
             }
-            | TileExpr::QuantizedQ8ActivationDot {
-                k_base, col, mask, ..
-            }
-            | TileExpr::QuantizedQ4KF32Dot {
+            | TileExpr::QuantizedVecDot {
                 k_base, col, mask, ..
             } => {
                 Self::tile_index_expr_any(k_base, pred)
@@ -442,8 +431,7 @@ impl<'a> Lowerer<'a> {
     fn tile_stmt_uses_cooperative_matrix(stmt: &TileStmt) -> bool {
         match stmt {
             TileStmt::Store(_)
-            | TileStmt::StoreVec4(_)
-            | TileStmt::StoreLinear(_)
+            | TileStmt::StoreIndexed(_)
             | TileStmt::StoreLocal { .. }
             | TileStmt::Emit { .. }
             | TileStmt::StoreWorkgroup { .. }

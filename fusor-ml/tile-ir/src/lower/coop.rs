@@ -28,12 +28,15 @@ impl<'a> Lowerer<'a> {
     ) -> Result<(), LowerError> {
         match stmt {
             TileStmt::Store(store) => self.lower_tile_store_stmt(expressions, scratch, body, store),
-            TileStmt::StoreVec4(store) => {
-                self.lower_tile_vec4_store_stmt(expressions, scratch, body, store)
-            }
-            TileStmt::StoreLinear(store) => {
-                self.lower_tile_linear_store_stmt(expressions, scratch, body, store)
-            }
+            TileStmt::StoreIndexed(store) => self.lower_tile_indexed_store_stmt(
+                expressions,
+                scratch,
+                body,
+                &store.dst,
+                &store.index,
+                &store.value,
+                &store.mask,
+            ),
             TileStmt::StoreLocal { dst, value } => {
                 let value_ty = self.tile_expr_element(value)?;
                 if value_ty != dst.element {
@@ -351,6 +354,39 @@ impl<'a> Lowerer<'a> {
         )
     }
 
+    fn lower_copy_passes(
+        &self,
+        expressions: &mut Arena<Expression>,
+        body: &mut Block,
+        local: Handle<Expression>,
+        total: u32,
+        mut build_accept: impl FnMut(&mut Arena<Expression>, Handle<Expression>) -> Result<Block, LowerError>,
+    ) -> Result<(), LowerError> {
+        let passes = total.div_ceil(self.workgroup_invocations);
+        for pass in 0..passes {
+            let full_pass = (pass + 1) * self.workgroup_invocations <= total;
+            let mut guard_emits = Vec::new();
+            let flat = self.add_literal_u32_emitted(
+                expressions,
+                local,
+                pass * self.workgroup_invocations,
+                &mut guard_emits,
+            );
+            let condition = (!full_pass).then(|| {
+                self.cmp_lit(
+                    expressions,
+                    &mut guard_emits,
+                    BinaryOperator::Less,
+                    flat,
+                    total,
+                )
+            });
+            let accept = build_accept(expressions, flat)?;
+            Self::push_guarded_or_full_block(body, guard_emits, condition, accept);
+        }
+        Ok(())
+    }
+
     fn lower_copy_to_tile(
         &self,
         expressions: &mut Arena<Expression>,
@@ -376,25 +412,7 @@ impl<'a> Lowerer<'a> {
         let row_base = self.lower_tile_index_expr(expressions, scratch, body, row_offset, 0)?;
         let col_base = self.lower_tile_index_expr(expressions, scratch, body, col_offset, 0)?;
 
-        let passes = total.div_ceil(self.workgroup_invocations);
-        for pass in 0..passes {
-            let full_pass = (pass + 1) * self.workgroup_invocations <= total;
-            let mut guard_emits = Vec::new();
-            let flat = self.add_literal_u32_emitted(
-                expressions,
-                local,
-                pass * self.workgroup_invocations,
-                &mut guard_emits,
-            );
-            let condition = (!full_pass).then(|| {
-                self.cmp_lit(
-                    expressions,
-                    &mut guard_emits,
-                    BinaryOperator::Less,
-                    flat,
-                    total,
-                )
-            });
+        self.lower_copy_passes(expressions, body, local, total, |expressions, flat| {
             let mut emits = Vec::new();
             let local_row = self.div_literal_u32_emitted(expressions, flat, cols, &mut emits);
             let local_col = self.mod_literal_u32_emitted(expressions, flat, cols, &mut emits);
@@ -446,9 +464,8 @@ impl<'a> Lowerer<'a> {
                 Span::default(),
             );
 
-            Self::push_guarded_or_full_block(body, guard_emits, condition, accept);
-        }
-        Ok(())
+            Ok(accept)
+        })
     }
 
     fn lower_copy_quant_to_tile(
@@ -482,25 +499,7 @@ impl<'a> Lowerer<'a> {
         if n > 0 && rows.is_multiple_of(n) {
             let groups_per_col = rows / n;
             let total = groups_per_col * cols;
-            let passes = total.div_ceil(self.workgroup_invocations);
-            for pass in 0..passes {
-                let full_pass = (pass + 1) * self.workgroup_invocations <= total;
-                let mut guard_emits = Vec::new();
-                let flat = self.add_literal_u32_emitted(
-                    expressions,
-                    local,
-                    pass * self.workgroup_invocations,
-                    &mut guard_emits,
-                );
-                let condition = (!full_pass).then(|| {
-                    self.cmp_lit(
-                        expressions,
-                        &mut guard_emits,
-                        BinaryOperator::Less,
-                        flat,
-                        total,
-                    )
-                });
+            self.lower_copy_passes(expressions, body, local, total, |expressions, flat| {
                 let mut emits = Vec::new();
                 let local_k_group =
                     self.div_literal_u32_emitted(expressions, flat, cols, &mut emits);
@@ -564,32 +563,14 @@ impl<'a> Lowerer<'a> {
                         Span::default(),
                     );
                 }
-                Self::push_guarded_or_full_block(body, guard_emits, condition, accept);
-            }
+                Ok(accept)
+            })?;
             return Ok(());
         }
 
         // Scalar fallback: one element per invocation per pass.
         let total = rows * cols;
-        let passes = total.div_ceil(self.workgroup_invocations);
-        for pass in 0..passes {
-            let full_pass = (pass + 1) * self.workgroup_invocations <= total;
-            let mut guard_emits = Vec::new();
-            let flat = self.add_literal_u32_emitted(
-                expressions,
-                local,
-                pass * self.workgroup_invocations,
-                &mut guard_emits,
-            );
-            let condition = (!full_pass).then(|| {
-                self.cmp_lit(
-                    expressions,
-                    &mut guard_emits,
-                    BinaryOperator::Less,
-                    flat,
-                    total,
-                )
-            });
+        self.lower_copy_passes(expressions, body, local, total, |expressions, flat| {
             let mut emits = Vec::new();
             let local_row = self.div_literal_u32_emitted(expressions, flat, cols, &mut emits);
             let local_col = self.mod_literal_u32_emitted(expressions, flat, cols, &mut emits);
@@ -629,9 +610,8 @@ impl<'a> Lowerer<'a> {
                 },
                 Span::default(),
             );
-            Self::push_guarded_or_full_block(body, guard_emits, condition, accept);
-        }
-        Ok(())
+            Ok(accept)
+        })
     }
 
     fn lower_store_coop_acc(

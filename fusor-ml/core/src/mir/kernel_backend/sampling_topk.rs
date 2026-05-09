@@ -47,21 +47,19 @@ fn topk_empty_caps() -> KernelDeviceCaps {
     }
 }
 
-fn topk_chunk_selector() -> ShapeSelector<3, (), TopKChunkVariant> {
+fn topk_nonempty_selector<Variant: Copy>(
+    empty: Variant,
+    kernel: Variant,
+) -> ShapeSelector<3, (), Variant> {
     ShapeSelector::new()
-        .rule(
-            TopKChunkVariant::Empty,
-            ShapeRule::new().axis(TOPK_A, eq(0)),
-        )
-        .rule(
-            TopKChunkVariant::Empty,
-            ShapeRule::new().axis(TOPK_B, eq(0)),
-        )
-        .rule(
-            TopKChunkVariant::Empty,
-            ShapeRule::new().axis(TOPK_C, eq(0)),
-        )
-        .rule(TopKChunkVariant::Kernel, ShapeRule::new())
+        .rule(empty, ShapeRule::new().axis(TOPK_A, eq(0)))
+        .rule(empty, ShapeRule::new().axis(TOPK_B, eq(0)))
+        .rule(empty, ShapeRule::new().axis(TOPK_C, eq(0)))
+        .rule(kernel, ShapeRule::new())
+}
+
+fn topk_chunk_selector() -> ShapeSelector<3, (), TopKChunkVariant> {
+    topk_nonempty_selector(TopKChunkVariant::Empty, TopKChunkVariant::Kernel)
 }
 
 fn select_topk_chunk_variant(
@@ -79,20 +77,7 @@ fn select_topk_chunk_variant(
 }
 
 fn topk_merge_selector() -> ShapeSelector<3, (), TopKMergeVariant> {
-    ShapeSelector::new()
-        .rule(
-            TopKMergeVariant::Empty,
-            ShapeRule::new().axis(TOPK_A, eq(0)),
-        )
-        .rule(
-            TopKMergeVariant::Empty,
-            ShapeRule::new().axis(TOPK_B, eq(0)),
-        )
-        .rule(
-            TopKMergeVariant::Empty,
-            ShapeRule::new().axis(TOPK_C, eq(0)),
-        )
-        .rule(TopKMergeVariant::Kernel, ShapeRule::new())
+    topk_nonempty_selector(TopKMergeVariant::Empty, TopKMergeVariant::Kernel)
 }
 
 fn select_topk_merge_variant(
@@ -151,18 +136,6 @@ fn select_topk_exactness_variant(
         .expect("top-k exactness selector has a catch-all rule")
 }
 
-#[derive(Clone, Copy)]
-pub(crate) struct TopKExactnessMeta {
-    chunks: u32,
-    candidate_count: u32,
-    output_per_chunk: u32,
-    top_k: u32,
-    top_values_offset: u32,
-    top_values_stride: u32,
-    chunk_values_offset: u32,
-    chunk_values_stride: u32,
-}
-
 pub(crate) fn top_k_exactness_flag_data_with_encoder(
     top_values: &TensorData,
     chunk_values: &TensorData,
@@ -192,7 +165,7 @@ pub(crate) fn top_k_exactness_flag_data_with_encoder(
 
     let device = top_values.device();
     let flag = TensorData::new_for_shape(device, &[1], DataTypeEnum::U32);
-    let meta = TopKExactnessMeta {
+    let meta = tile_ir::TopKExactnessMeta {
         chunks: chunks.try_into().ok()?,
         candidate_count: candidate_count.try_into().ok()?,
         output_per_chunk: output_per_chunk.try_into().ok()?,
@@ -211,18 +184,7 @@ pub(crate) fn top_k_exactness_flag_data_with_encoder(
         device,
         "prove_top_k_exact_f32",
         cache_key,
-        || {
-            tile_ir::kernels::top_k_exactness(tile_ir::TopKExactnessMeta {
-                chunks: meta.chunks,
-                candidate_count: meta.candidate_count,
-                output_per_chunk: meta.output_per_chunk,
-                top_k: meta.top_k,
-                top_values_offset: meta.top_values_offset,
-                top_values_stride: meta.top_values_stride,
-                chunk_values_offset: meta.chunk_values_offset,
-                chunk_values_stride: meta.chunk_values_stride,
-            })
-        },
+        || tile_ir::kernels::top_k_exactness(meta),
         vec![
             kernel_backend::storage_binding(0, top_values, true),
             kernel_backend::storage_binding(1, chunk_values, true),
@@ -424,56 +386,38 @@ pub(crate) fn merge_sorted_chunk_top_k_pair_data_with_encoder(
 #[cfg(test)]
 mod selection_tests {
     use super::*;
-    use crate::kernel_selection::DeterministicShapeRng;
+    use crate::kernel_selection::assert_selector_generates;
 
     #[test]
     fn topk_chunk_selector_generates_each_variant() {
         let selector = topk_chunk_selector();
-        let mut rng = DeterministicShapeRng::default();
-
-        for variant in [TopKChunkVariant::Empty, TopKChunkVariant::Kernel] {
-            let shape = selector
-                .generate_for(variant, &(), topk_empty_caps(), &mut rng)
-                .expect("variant should generate");
-            assert_eq!(
-                selector.select(shape, &(), topk_empty_caps()),
-                Some(variant)
-            );
-        }
+        assert_selector_generates(
+            &selector,
+            [TopKChunkVariant::Empty, TopKChunkVariant::Kernel]
+                .map(|variant| (variant, (), topk_empty_caps())),
+        );
     }
 
     #[test]
     fn topk_merge_selector_generates_each_variant() {
         let selector = topk_merge_selector();
-        let mut rng = DeterministicShapeRng::default();
-
-        for variant in [TopKMergeVariant::Empty, TopKMergeVariant::Kernel] {
-            let shape = selector
-                .generate_for(variant, &(), topk_empty_caps(), &mut rng)
-                .expect("variant should generate");
-            assert_eq!(
-                selector.select(shape, &(), topk_empty_caps()),
-                Some(variant)
-            );
-        }
+        assert_selector_generates(
+            &selector,
+            [TopKMergeVariant::Empty, TopKMergeVariant::Kernel]
+                .map(|variant| (variant, (), topk_empty_caps())),
+        );
     }
 
     #[test]
     fn topk_exactness_selector_generates_each_variant() {
         let selector = topk_exactness_selector();
-        let mut rng = DeterministicShapeRng::default();
-
-        for variant in [
-            TopKExactnessVariant::Ineligible,
-            TopKExactnessVariant::Kernel,
-        ] {
-            let shape = selector
-                .generate_for(variant, &(), topk_empty_caps(), &mut rng)
-                .expect("variant should generate");
-            assert_eq!(
-                selector.select(shape, &(), topk_empty_caps()),
-                Some(variant)
-            );
-        }
+        assert_selector_generates(
+            &selector,
+            [
+                TopKExactnessVariant::Ineligible,
+                TopKExactnessVariant::Kernel,
+            ]
+            .map(|variant| (variant, (), topk_empty_caps())),
+        );
     }
 }

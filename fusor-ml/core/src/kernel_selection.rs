@@ -111,6 +111,23 @@ impl ShapeRng for DeterministicShapeRng {
     }
 }
 
+#[cfg(test)]
+pub(crate) fn assert_selector_generates<const DIMS: usize, Ctx, Variant>(
+    selector: &ShapeSelector<DIMS, Ctx, Variant>,
+    cases: impl IntoIterator<Item = (Variant, Ctx, KernelDeviceCaps)>,
+) where
+    Ctx: Copy,
+    Variant: Copy + PartialEq + fmt::Debug,
+{
+    let mut rng = DeterministicShapeRng::default();
+    for (variant, ctx, caps) in cases {
+        let shape = selector
+            .generate_for(variant, &ctx, caps, &mut rng)
+            .expect("variant should generate");
+        assert_eq!(selector.select(shape, &ctx, caps), Some(variant));
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum DimConstraint {
     Any,

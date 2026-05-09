@@ -398,6 +398,25 @@ fn reduce_workgroup_f32<const BLOCK: usize>(
     }
 }
 
+fn reduce_workgroup_u32_or<const BLOCK: usize>(
+    program: &mut TileBlock<'_, BLOCK>,
+    scratch: crate::TileRef,
+    lane: tile::Range<BLOCK>,
+) {
+    let mut stride = BLOCK as u32 / 2;
+    while stride > 0 {
+        let participates = program.index(lane.clone()).lt(u32_tile(stride));
+        program.if_then(participates, |program| {
+            let lhs = program.load_workgroup(scratch, lane.clone());
+            let rhs_index = lane.clone() + stride;
+            let rhs = program.load_workgroup(scratch, rhs_index);
+            program.store_workgroup(scratch, lane.clone(), lhs.bit_or(rhs));
+        });
+        program.workgroup_barrier();
+        stride /= 2;
+    }
+}
+
 pub fn flash_attention<E: Numeric>(meta: FlashAttentionMeta) -> Option<KernelIr> {
     let q_strides: [u32; 4] = meta.q_meta.strides.as_slice().try_into().ok()?;
     let k_strides: [u32; 4] = meta.k_meta.strides.as_slice().try_into().ok()?;
@@ -1195,18 +1214,7 @@ pub fn top_k_exactness(meta: TopKExactnessMeta) -> Option<KernelIr> {
             program.store_workgroup(scratch, lane.clone(), inexact_value);
             program.workgroup_barrier();
 
-            let mut stride = TOP_K_BLOCK as u32 / 2;
-            while stride > 0 {
-                let condition = program.index(lane.clone()).lt(u32_tile(stride));
-                program.if_then(condition, |program| {
-                    let rhs_index = lane.clone() + stride;
-                    let lhs = program.load_workgroup(scratch, lane.clone());
-                    let rhs = program.load_workgroup(scratch, rhs_index);
-                    program.store_workgroup(scratch, lane.clone(), lhs.bit_or(rhs));
-                });
-                program.workgroup_barrier();
-                stride /= 2;
-            }
+            reduce_workgroup_u32_or(program, scratch, lane.clone());
 
             let lane_zero = program.index(lane.clone()).eq(u32_tile(0));
             program.if_then(lane_zero, |program| {
