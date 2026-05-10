@@ -107,28 +107,19 @@ impl<'a> Lowerer<'a> {
     }
 
     pub(super) fn uses_subgroup_reduce(ir: &KernelIr) -> bool {
-        Self::tile_programs_expr_any(ir, |expr| matches!(expr, TileExpr::SubgroupReduce { .. }))
+        Self::tile_programs_expr_any(ir, |expr| matches!(expr, Expr::SubgroupReduce { .. }))
     }
 
     pub(super) fn uses_index_kind(ir: &KernelIr, kind: SubgroupIndexKind) -> bool {
-        Self::tile_programs_index_any(ir, |expr| Self::index_expr_is_kind(expr, kind))
-    }
-
-    pub(super) fn tile_programs_index_any<F>(ir: &KernelIr, mut pred: F) -> bool
-    where
-        F: FnMut(&TileIndexExpr) -> bool,
-    {
-        ir.body().ops().iter().any(|op| {
-            let Op::TileProgram(op) = op;
-            op.body
-                .iter()
-                .any(|stmt| Self::tile_stmt_index_any(stmt, &mut pred))
+        Self::tile_programs_expr_any(ir, |expr| match expr {
+            Expr::Builtin(builtin) => Self::builtin_is_kind(*builtin, kind),
+            _ => false,
         })
     }
 
     pub(super) fn tile_programs_expr_any<F>(ir: &KernelIr, mut pred: F) -> bool
     where
-        F: FnMut(&TileExpr) -> bool,
+        F: FnMut(&Expr) -> bool,
     {
         ir.body().ops().iter().any(|op| {
             let Op::TileProgram(op) = op;
@@ -140,7 +131,7 @@ impl<'a> Lowerer<'a> {
 
     pub(super) fn tile_stmt_expr_any<F>(stmt: &TileStmt, pred: &mut F) -> bool
     where
-        F: FnMut(&TileExpr) -> bool,
+        F: FnMut(&Expr) -> bool,
     {
         match stmt {
             TileStmt::Store(store) => Self::tile_expr_any(&store.value, pred),
@@ -192,211 +183,76 @@ impl<'a> Lowerer<'a> {
         }
     }
 
-    pub(super) fn tile_stmt_index_any<F>(stmt: &TileStmt, pred: &mut F) -> bool
+    pub(super) fn tile_expr_any<F>(expr: &Expr, pred: &mut F) -> bool
     where
-        F: FnMut(&TileIndexExpr) -> bool,
-    {
-        match stmt {
-            TileStmt::Store(store) => {
-                Self::tile_index_expr_any(&store.row, pred)
-                    || Self::tile_index_expr_any(&store.col, pred)
-                    || Self::tile_mask_expr_index_any(&store.mask, pred)
-                    || Self::tile_expr_index_any(&store.value, pred)
-            }
-            TileStmt::StoreIndexed(store) => {
-                Self::tile_index_expr_any(&store.index, pred)
-                    || Self::tile_mask_expr_index_any(&store.mask, pred)
-                    || Self::tile_expr_index_any(&store.value, pred)
-            }
-            TileStmt::StoreLocal { value, .. }
-            | TileStmt::Let { value, .. } => Self::tile_expr_index_any(value, pred),
-            TileStmt::StoreWorkgroup { index, value, .. } => {
-                Self::tile_index_expr_any(index, pred) || Self::tile_expr_index_any(value, pred)
-            }
-            TileStmt::CopyToWorkgroupTile {
-                row_offset,
-                col_offset,
-                ..
-            }
-            | TileStmt::CopyQuantToWorkgroupTile {
-                row_offset,
-                col_offset,
-                ..
-            }
-            | TileStmt::StoreCoopAcc {
-                row: row_offset,
-                col: col_offset,
-                ..
-            }
-            | TileStmt::LoadCoop {
-                row: row_offset,
-                col: col_offset,
-                ..
-            } => {
-                Self::tile_index_expr_any(row_offset, pred)
-                    || Self::tile_index_expr_any(col_offset, pred)
-            }
-            TileStmt::If {
-                condition,
-                accept,
-                reject,
-            } => {
-                Self::tile_expr_index_any(condition, pred)
-                    || accept
-                        .iter()
-                        .chain(reject.iter())
-                        .any(|stmt| Self::tile_stmt_index_any(stmt, pred))
-            }
-            TileStmt::Loop { body } | TileStmt::WhileTrue { body, .. } => body
-                .iter()
-                .any(|stmt| Self::tile_stmt_index_any(stmt, pred)),
-            TileStmt::Fold {
-                iter,
-                body: fold_body,
-                accumulators,
-                ..
-            } => {
-                let iter_match = match iter {
-                    TileIter::Range { count } => Self::tile_expr_index_any(count, pred),
-                };
-                iter_match
-                    || fold_body
-                        .iter()
-                        .any(|s| Self::tile_stmt_index_any(s, pred))
-                    || accumulators.iter().any(|acc| {
-                        Self::tile_expr_index_any(&acc.init, pred)
-                            || Self::tile_expr_index_any(&acc.update, pred)
-                    })
-            }
-            TileStmt::ZeroCoopAcc { .. }
-            | TileStmt::Barrier
-            | TileStmt::Mma { .. }
-            | TileStmt::Break
-            | TileStmt::Return => false,
-        }
-    }
-
-    pub(super) fn tile_expr_any<F>(expr: &TileExpr, pred: &mut F) -> bool
-    where
-        F: FnMut(&TileExpr) -> bool,
+        F: FnMut(&Expr) -> bool,
     {
         pred(expr) || Self::tile_expr_children_any(expr, |child| Self::tile_expr_any(child, pred))
     }
 
-    pub(super) fn tile_expr_children_any<F>(expr: &TileExpr, mut pred: F) -> bool
+    pub(super) fn tile_expr_children_any<F>(expr: &Expr, mut pred: F) -> bool
     where
-        F: FnMut(&TileExpr) -> bool,
+        F: FnMut(&Expr) -> bool,
     {
         match expr {
-            TileExpr::Scalar(TileScalarExpr::Reduce { value, .. })
-            | TileExpr::Scalar(TileScalarExpr::LoopReduce { value, .. }) => pred(value),
-            TileExpr::Scalar(TileScalarExpr::Literal(_))
-            | TileExpr::Load(_)
-            | TileExpr::LoadLinear(_)
-            | TileExpr::LoadVec4(_)
-            | TileExpr::LoadWorkgroup { .. }
-            | TileExpr::LoadLocal(_)
-            | TileExpr::QuantizedLoad(_)
-            | TileExpr::Full(_)
-            | TileExpr::Literal(_)
-            | TileExpr::Index(_)
-            | TileExpr::Builtin(_)
-            | TileExpr::QuantizedBlockLane { .. } => false,
-            TileExpr::Unary { value, .. }
-            | TileExpr::Cast { value, .. }
-            | TileExpr::Bitcast { value, .. }
-            | TileExpr::LoopFold { value, .. }
-            | TileExpr::GroupReduce { value, .. }
-            | TileExpr::SubgroupReduce { value, .. }
-            | TileExpr::Vec4Splat { value } => pred(value),
-            TileExpr::Binary { left, right, .. }
-            | TileExpr::Compare { left, right, .. }
-            | TileExpr::Vec4Dot { left, right } => pred(left) || pred(right),
-            TileExpr::Select {
+            Expr::Reduce { value, .. } | Expr::LoopReduce { value, .. } => pred(value),
+            Expr::LoadLocal(_)
+            | Expr::Full(_)
+            | Expr::Literal(_)
+            | Expr::Builtin(_) => false,
+            Expr::Load(load) => pred(&load.row) || pred(&load.col) || pred(&load.mask),
+            Expr::LoadLinear(load) => pred(&load.index) || pred(&load.mask),
+            Expr::LoadVec4(load) => pred(&load.index) || pred(&load.mask),
+            Expr::LoadWorkgroup { index, .. } => pred(index),
+            Expr::QuantizedLoad(load) => {
+                pred(&load.row) || pred(&load.col) || pred(&load.mask)
+            }
+            Expr::QuantizedBlockLane {
+                k_base, col, mask, ..
+            } => pred(k_base) || pred(col) || pred(mask),
+            Expr::Unary { value, .. }
+            | Expr::Cast { value, .. }
+            | Expr::Bitcast { value, .. }
+            | Expr::LoopFold { value, .. }
+            | Expr::GroupReduce { value, .. }
+            | Expr::SubgroupReduce { value, .. }
+            | Expr::Vec4Splat { value } => pred(value),
+            Expr::Binary { left, right, .. }
+            | Expr::Compare { left, right, .. }
+            | Expr::Vec4Dot { left, right } => pred(left) || pred(right),
+            Expr::Select {
                 condition,
                 accept,
                 reject,
             } => pred(condition) || pred(accept) || pred(reject),
-            TileExpr::Sum { values } => values.iter().any(|expr| pred(expr)),
-            TileExpr::Compose4 { values } => values.iter().any(|expr| pred(expr)),
-            TileExpr::QuantizedQ8_0Dot8 { a, .. } => a.iter().any(|expr| pred(expr)),
-            TileExpr::QuantizedVecDot { a, .. }
-            | TileExpr::QuantizedQ6KGgmlDot { a, .. } => a.iter().any(|expr| pred(expr)),
-            TileExpr::QuantizedQ4KGgmlDot {
-                a_low,
-                a_high,
-                sums,
-                ..
-            } => a_low
-                .iter()
-                .chain(a_high.iter())
-                .chain(sums.iter())
-                .any(|expr| pred(expr)),
-        }
-    }
-
-    pub(super) fn tile_expr_index_any<F>(expr: &TileExpr, pred: &mut F) -> bool
-    where
-        F: FnMut(&TileIndexExpr) -> bool,
-    {
-        match expr {
-            TileExpr::Load(load) => {
-                Self::tile_index_expr_any(&load.row, pred)
-                    || Self::tile_index_expr_any(&load.col, pred)
-                    || Self::tile_mask_expr_index_any(&load.mask, pred)
-            }
-            TileExpr::LoadLinear(load) => {
-                Self::tile_index_expr_any(&load.index, pred)
-                    || Self::tile_mask_expr_index_any(&load.mask, pred)
-            }
-            TileExpr::LoadVec4(load) => {
-                Self::tile_index_expr_any(&load.index, pred)
-                    || Self::tile_mask_expr_index_any(&load.mask, pred)
-            }
-            TileExpr::LoadWorkgroup { index, .. } => Self::tile_index_expr_any(index, pred),
-            TileExpr::QuantizedLoad(load) => {
-                Self::tile_index_expr_any(&load.row, pred)
-                    || Self::tile_index_expr_any(&load.col, pred)
-                    || Self::tile_mask_expr_index_any(&load.mask, pred)
-            }
-            TileExpr::QuantizedBlockLane {
-                k_base, col, mask, ..
-            } => {
-                Self::tile_index_expr_any(k_base, pred)
-                    || Self::tile_index_expr_any(col, pred)
-                    || Self::tile_mask_expr_index_any(mask, pred)
-            }
-            TileExpr::QuantizedQ8_0Dot8 {
-                k_base, col, mask, ..
-            }
-            | TileExpr::QuantizedVecDot {
-                k_base, col, mask, ..
-            } => {
-                Self::tile_index_expr_any(k_base, pred)
-                    || Self::tile_index_expr_any(col, pred)
-                    || Self::tile_mask_expr_index_any(mask, pred)
-                    || Self::tile_expr_children_any(expr, |child| {
-                        Self::tile_expr_index_any(child, pred)
-                    })
-            }
-            TileExpr::QuantizedQ4KGgmlDot {
-                block,
-                iq,
-                ir,
+            Expr::Sum { values } => values.iter().any(|expr| pred(expr)),
+            Expr::Compose4 { values } => values.iter().any(|expr| pred(expr)),
+            Expr::QuantizedQ8_0Dot8 {
+                a,
+                k_base,
                 col,
                 mask,
                 ..
             } => {
-                Self::tile_index_expr_any(block, pred)
-                    || Self::tile_index_expr_any(iq, pred)
-                    || Self::tile_index_expr_any(ir, pred)
-                    || Self::tile_index_expr_any(col, pred)
-                    || Self::tile_mask_expr_index_any(mask, pred)
-                    || Self::tile_expr_children_any(expr, |child| {
-                        Self::tile_expr_index_any(child, pred)
-                    })
+                a.iter().any(|expr| pred(expr))
+                    || pred(k_base)
+                    || pred(col)
+                    || pred(mask)
             }
-            TileExpr::QuantizedQ6KGgmlDot {
+            Expr::QuantizedVecDot {
+                a,
+                k_base,
+                col,
+                mask,
+                ..
+            } => {
+                a.iter().any(|expr| pred(expr))
+                    || pred(k_base)
+                    || pred(col)
+                    || pred(mask)
+            }
+            Expr::QuantizedQ6KGgmlDot {
+                a,
                 block,
                 ip,
                 il,
@@ -404,59 +260,34 @@ impl<'a> Lowerer<'a> {
                 mask,
                 ..
             } => {
-                Self::tile_index_expr_any(block, pred)
-                    || Self::tile_index_expr_any(ip, pred)
-                    || Self::tile_index_expr_any(il, pred)
-                    || Self::tile_index_expr_any(col, pred)
-                    || Self::tile_mask_expr_index_any(mask, pred)
-                    || Self::tile_expr_children_any(expr, |child| {
-                        Self::tile_expr_index_any(child, pred)
-                    })
+                a.iter().any(|expr| pred(expr))
+                    || pred(block)
+                    || pred(ip)
+                    || pred(il)
+                    || pred(col)
+                    || pred(mask)
             }
-            TileExpr::Index(index) => Self::tile_index_expr_any(index, pred),
-            TileExpr::LoadLocal(_)
-            | TileExpr::Full(_)
-            | TileExpr::Literal(_) => false,
-            _ => Self::tile_expr_children_any(expr, |child| Self::tile_expr_index_any(child, pred)),
-        }
-    }
-
-    pub(super) fn tile_index_expr_any<F>(expr: &TileIndexExpr, pred: &mut F) -> bool
-    where
-        F: FnMut(&TileIndexExpr) -> bool,
-    {
-        pred(expr)
-            || match expr {
-                TileIndexExpr::Add(left, right) => {
-                    Self::tile_index_expr_any(left, pred) || Self::tile_index_expr_any(right, pred)
-                }
-                TileIndexExpr::Mul(value, _)
-                | TileIndexExpr::Div(value, _)
-                | TileIndexExpr::Mod(value, _) => Self::tile_index_expr_any(value, pred),
-                TileIndexExpr::Value(value) => Self::tile_expr_index_any(value, pred),
-                TileIndexExpr::Lane
-                | TileIndexExpr::LoopIndex
-                | TileIndexExpr::ProgramId(_)
-                | TileIndexExpr::SubgroupId
-                | TileIndexExpr::SubgroupLane
-                | TileIndexExpr::SubgroupSize
-                | TileIndexExpr::NumSubgroups
-                | TileIndexExpr::Literal(_) => false,
-            }
-    }
-
-    pub(super) fn tile_mask_expr_index_any<F>(expr: &TileMaskExpr, pred: &mut F) -> bool
-    where
-        F: FnMut(&TileIndexExpr) -> bool,
-    {
-        match expr {
-            TileMaskExpr::True => false,
-            TileMaskExpr::Compare { left, right, .. } => {
-                Self::tile_index_expr_any(left, pred) || Self::tile_index_expr_any(right, pred)
-            }
-            TileMaskExpr::And(left, right) => {
-                Self::tile_mask_expr_index_any(left, pred)
-                    || Self::tile_mask_expr_index_any(right, pred)
+            Expr::QuantizedQ4KGgmlDot {
+                a_low,
+                a_high,
+                sums,
+                block,
+                iq,
+                ir,
+                col,
+                mask,
+                ..
+            } => {
+                a_low
+                    .iter()
+                    .chain(a_high.iter())
+                    .chain(sums.iter())
+                    .any(|expr| pred(expr))
+                    || pred(block)
+                    || pred(iq)
+                    || pred(ir)
+                    || pred(col)
+                    || pred(mask)
             }
         }
     }
@@ -491,23 +322,23 @@ impl<'a> Lowerer<'a> {
         }
     }
 
-    fn index_expr_is_kind(expr: &TileIndexExpr, kind: SubgroupIndexKind) -> bool {
-        match expr {
-            TileIndexExpr::SubgroupId => kind == SubgroupIndexKind::SubgroupId,
-            TileIndexExpr::SubgroupLane => kind == SubgroupIndexKind::SubgroupLane,
-            TileIndexExpr::SubgroupSize => kind == SubgroupIndexKind::SubgroupSize,
-            TileIndexExpr::NumSubgroups => kind == SubgroupIndexKind::NumSubgroups,
+    fn builtin_is_kind(builtin: crate::ir::Builtin, kind: SubgroupIndexKind) -> bool {
+        use crate::ir::Builtin;
+        match builtin {
+            Builtin::SubgroupId => kind == SubgroupIndexKind::SubgroupId,
+            Builtin::SubgroupLane => kind == SubgroupIndexKind::SubgroupLane,
+            Builtin::SubgroupSize => kind == SubgroupIndexKind::SubgroupSize,
+            Builtin::NumSubgroups => kind == SubgroupIndexKind::NumSubgroups,
             _ => false,
         }
     }
 
-    fn mark_tile_expr_live(ir: &KernelIr, expr: &TileExpr, live: &mut [bool]) {
+    fn mark_tile_expr_live(ir: &KernelIr, expr: &Expr, live: &mut [bool]) {
         match expr {
-            TileExpr::LoadWorkgroup { src, .. } => Self::mark_tile_live(ir, *src, live),
-            TileExpr::Scalar(
-                TileScalarExpr::Reduce { scratch, .. } | TileScalarExpr::LoopReduce { scratch, .. },
-            )
-            | TileExpr::GroupReduce { scratch, .. } => {
+            Expr::LoadWorkgroup { src, .. } => Self::mark_tile_live(ir, *src, live),
+            Expr::Reduce { scratch, .. }
+            | Expr::LoopReduce { scratch, .. }
+            | Expr::GroupReduce { scratch, .. } => {
                 Self::mark_tile_live(ir, *scratch, live);
             }
             _ => {}

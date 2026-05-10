@@ -17,9 +17,9 @@ pub use ir::{
     Block, Bool, BufferAccess, BufferDecl, BufferId, BufferRef, CoopOperandRole, DynamicOffset,
     ElementType, F32Bits, F32Vec4, FlattenedMatrixMap, Im2ColNhwcMap, KernelIr, Layout, LocalDecl,
     LocalId, LocalRef, LoopOffset, MemoryLevel, Numeric, Op, Shape, StorageIndexMap, StorageView,
-    Strides, TileBinaryOp, TileCompareOp, TileDecl, TileExpr, TileId, TileIndexExpr, TileLevel,
-    TileIndexedStoreStmt, TileLinearLoadExpr, TileLiteral, TileLoadExpr, TileMaskExpr,
-    TileOrigin, TileProgramOp, TileQuantizedLoadExpr, TileReduceOp, TileRef, TileScalarExpr,
+    Strides, TileBinaryOp, TileCompareOp, TileDecl, Expr, TileId, TileLevel,
+    TileIndexedStoreStmt, TileLinearLoadExpr, TileLiteral, TileLoadExpr,
+    TileOrigin, TileProgramOp, TileQuantizedLoadExpr, TileReduceOp, TileRef,
     TileStmt, TileUnaryOp, TileVec4LoadExpr, WorkgroupAxis, WorkgroupOffset, F16, F32, U32,
 };
 pub use kernel_builder::{KernelBuilder, KernelTensorRef};

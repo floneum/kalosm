@@ -14,9 +14,9 @@ use crate::ir::{
     BlockDequantId, BufferAccess, BufferId, CoopFragmentId, CoopOperandRole,
     DynamicOffset, ElementType, F32Bits, FlattenedMatrixMap, Im2ColNhwcMap, KernelIr,
     Layout, LocalId, LocalRef, MemoryLevel, Op, QuantizedVecDotKind,
-    StorageIndexMap, StorageView, TileBinaryOp, TileCompareOp, TileExpr, TileId,
-    TileIndexExpr, TileIter, TileLinearLoadExpr, TileLiteral, TileLoadExpr, TileMaskExpr,
-    TileOrigin, TileProgramOp, TileQuantizedLoadExpr, TileReduceOp, TileRef, TileScalarExpr,
+    StorageIndexMap, StorageView, TileBinaryOp, TileCompareOp, Expr, TileId,
+    TileIter, TileLinearLoadExpr, TileLiteral, TileLoadExpr,
+    TileOrigin, TileProgramOp, TileQuantizedLoadExpr, TileReduceOp, TileRef,
     TileStmt, TileStoreStmt, TileUnaryOp, TileVec4LoadExpr,
 };
 use crate::quantized::{GgmlQuantFormat, QuantizedMatrix};
@@ -189,6 +189,7 @@ struct ScratchLocals {
     q8_activation_sums_i32: [Handle<LocalVariable>; 4],
 }
 
+mod affine;
 mod analysis;
 mod block;
 mod control;

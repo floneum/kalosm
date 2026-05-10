@@ -5,70 +5,89 @@ use crate::lower::quantized::dot_lowering::{
     VecDotLowering,
 };
 
-pub(in crate::lower) fn builtin_to_index_expr(builtin: Builtin) -> TileIndexExpr {
-    match builtin {
-        Builtin::Lane => TileIndexExpr::Lane,
-        Builtin::LoopIndex => TileIndexExpr::LoopIndex,
-        Builtin::ProgramId(axis) => TileIndexExpr::ProgramId(axis),
-        Builtin::SubgroupId => TileIndexExpr::SubgroupId,
-        Builtin::SubgroupLane => TileIndexExpr::SubgroupLane,
-        Builtin::SubgroupSize => TileIndexExpr::SubgroupSize,
-        Builtin::NumSubgroups => TileIndexExpr::NumSubgroups,
-    }
-}
-
 impl<'a> Lowerer<'a> {
     pub(in crate::lower) fn lower_tile_expr_lane(
         &self,
         expressions: &mut Arena<Expression>,
         scratch: ScratchLocals,
         body: &mut Block,
-        expr: &TileExpr,
+        expr: &Expr,
         spill_depth: usize,
     ) -> Result<Handle<Expression>, LowerError> {
         match expr {
-            TileExpr::Load(load) => {
+            Expr::Load(load) => {
                 self.lower_tile_load_expr(expressions, scratch, body, load, spill_depth)
             }
-            TileExpr::LoadLinear(load) => {
+            Expr::LoadLinear(load) => {
                 self.lower_tile_linear_load_expr(expressions, scratch, body, load, spill_depth)
             }
-            TileExpr::LoadVec4(load) => {
+            Expr::LoadVec4(load) => {
                 self.lower_tile_vec4_load_expr(expressions, scratch, body, load, spill_depth)
             }
-            TileExpr::LoadWorkgroup { src, index } => {
+            Expr::LoadWorkgroup { src, index } => {
                 let index =
-                    self.lower_tile_index_expr(expressions, scratch, body, index, spill_depth)?;
+                    self.lower_tile_expr_lane(expressions, scratch, body, index, spill_depth)?;
                 let (ptr, emits) = self.tile_dynamic_pointer(expressions, *src, index)?;
                 Self::push_emits(body, emits);
                 Ok(Self::emit_load(expressions, body, ptr))
             }
-            TileExpr::LoadLocal(local) => {
+            Expr::LoadLocal(local) => {
                 let local = self.private_local(*local)?;
                 let pointer = expressions.append(Expression::LocalVariable(local), Span::default());
                 Ok(Self::emit_load(expressions, body, pointer))
             }
-            TileExpr::QuantizedLoad(load) => {
+            Expr::QuantizedLoad(load) => {
                 self.lower_tile_quantized_load_expr(expressions, scratch, body, load, spill_depth)
             }
-            TileExpr::Full(value) => Ok(expressions.append(
+            Expr::Full(value) => Ok(expressions.append(
                 Expression::Literal(Literal::F32(value.get())),
                 Span::default(),
             )),
-            TileExpr::Literal(value) => {
+            Expr::Literal(value) => {
                 Ok(expressions.append(Self::tile_literal(*value), Span::default()))
             }
-            TileExpr::Index(index) => {
-                self.lower_tile_index_expr(expressions, scratch, body, index, spill_depth)
+            Expr::Builtin(builtin) => Ok(self.lower_builtin(expressions, body, *builtin)),
+            Expr::Reduce {
+                op,
+                value,
+                scratch: scratch_tile,
+            } => {
+                let value =
+                    self.lower_tile_expr_lane(expressions, scratch, body, value, spill_depth)?;
+                self.lower_tile_reduce_value(
+                    expressions,
+                    body,
+                    value,
+                    *scratch_tile,
+                    *op,
+                    self.workgroup_invocations,
+                )
             }
-            TileExpr::Builtin(builtin) => {
-                let index = builtin_to_index_expr(*builtin);
-                self.lower_tile_index_expr(expressions, scratch, body, &index, spill_depth)
+            Expr::LoopReduce {
+                op,
+                iterations,
+                value,
+                scratch: scratch_tile,
+            } => {
+                let value = self.lower_tile_loop_reduce_value(
+                    expressions,
+                    scratch,
+                    body,
+                    value,
+                    *iterations,
+                    *op,
+                    spill_depth,
+                )?;
+                self.lower_tile_reduce_value(
+                    expressions,
+                    body,
+                    value,
+                    *scratch_tile,
+                    *op,
+                    self.workgroup_invocations,
+                )
             }
-            TileExpr::Scalar(expr) => {
-                self.lower_tile_scalar_expr(expressions, scratch, body, expr, spill_depth)
-            }
-            TileExpr::Unary { op, value } => {
+            Expr::Unary { op, value } => {
                 let value =
                     self.lower_tile_expr_lane(expressions, scratch, body, value, spill_depth)?;
                 let expr = match Self::tile_unary_math(*op) {
@@ -89,7 +108,7 @@ impl<'a> Lowerer<'a> {
                 };
                 Ok(self.emit_tile_expr(expressions, body, expr))
             }
-            TileExpr::Binary { op, left, right } => {
+            Expr::Binary { op, left, right } => {
                 let left =
                     self.lower_tile_expr_lane(expressions, scratch, body, left, spill_depth + 1)?;
                 let right =
@@ -97,7 +116,7 @@ impl<'a> Lowerer<'a> {
                 let expr = Self::tile_binary_expression(*op, left, right);
                 Ok(self.emit_tile_expr(expressions, body, expr))
             }
-            TileExpr::Sum { values } => {
+            Expr::Sum { values } => {
                 let mut iter = values.iter();
                 let Some(first) = iter.next() else {
                     return Ok(
@@ -126,13 +145,13 @@ impl<'a> Lowerer<'a> {
                 }
                 Ok(sum)
             }
-            TileExpr::Cast { value, to } => {
+            Expr::Cast { value, to } => {
                 let source = self.tile_expr_element(value)?;
                 let value =
                     self.lower_tile_expr_lane(expressions, scratch, body, value, spill_depth)?;
                 Ok(self.cast_tile_value(expressions, body, value, source, *to))
             }
-            TileExpr::Bitcast { value, to } => {
+            Expr::Bitcast { value, to } => {
                 let value =
                     self.lower_tile_expr_lane(expressions, scratch, body, value, spill_depth)?;
                 let scalar = Self::element_scalar(*to);
@@ -146,7 +165,7 @@ impl<'a> Lowerer<'a> {
                     },
                 ))
             }
-            TileExpr::Select {
+            Expr::Select {
                 condition,
                 accept,
                 reject,
@@ -174,7 +193,7 @@ impl<'a> Lowerer<'a> {
                     },
                 ))
             }
-            TileExpr::Compare {
+            Expr::Compare {
                 op,
                 left,
                 right,
@@ -208,7 +227,7 @@ impl<'a> Lowerer<'a> {
                     },
                 ))
             }
-            TileExpr::LoopFold {
+            Expr::LoopFold {
                 op,
                 iterations,
                 value,
@@ -223,7 +242,7 @@ impl<'a> Lowerer<'a> {
                 *initial,
                 spill_depth,
             ),
-            TileExpr::GroupReduce {
+            Expr::GroupReduce {
                 op,
                 value,
                 scratch: scratch_tile,
@@ -240,13 +259,13 @@ impl<'a> Lowerer<'a> {
                     *group_size,
                 )
             }
-            TileExpr::SubgroupReduce { op, value } => {
+            Expr::SubgroupReduce { op, value } => {
                 let element = self.tile_expr_element(value)?;
                 let value =
                     self.lower_tile_expr_lane(expressions, scratch, body, value, spill_depth)?;
                 self.lower_tile_subgroup_reduce_value(expressions, body, value, *op, element)
             }
-            TileExpr::QuantizedBlockLane {
+            Expr::QuantizedBlockLane {
                 id,
                 src,
                 k_base,
@@ -269,7 +288,7 @@ impl<'a> Lowerer<'a> {
                 *lane,
                 spill_depth,
             ),
-            TileExpr::Compose4 { values } => {
+            Expr::Compose4 { values } => {
                 let mut handles = Vec::with_capacity(4);
                 for value in values.iter() {
                     handles.push(self.lower_tile_expr_lane(
@@ -289,7 +308,7 @@ impl<'a> Lowerer<'a> {
                     },
                 ))
             }
-            TileExpr::Vec4Dot { left, right } => {
+            Expr::Vec4Dot { left, right } => {
                 let left =
                     self.lower_tile_expr_lane(expressions, scratch, body, left, spill_depth + 1)?;
                 let right =
@@ -310,7 +329,7 @@ impl<'a> Lowerer<'a> {
                 );
                 Ok(dot)
             }
-            TileExpr::Vec4Splat { value } => {
+            Expr::Vec4Splat { value } => {
                 let value =
                     self.lower_tile_expr_lane(expressions, scratch, body, value, spill_depth)?;
                 Ok(self.emit_tile_expr(
@@ -322,7 +341,7 @@ impl<'a> Lowerer<'a> {
                     },
                 ))
             }
-            TileExpr::QuantizedQ8_0Dot8 {
+            Expr::QuantizedQ8_0Dot8 {
                 a,
                 src,
                 k_base,
@@ -342,7 +361,7 @@ impl<'a> Lowerer<'a> {
                     fill: *fill,
                 },
             ),
-            TileExpr::QuantizedVecDot {
+            Expr::QuantizedVecDot {
                 kind,
                 a,
                 src,
@@ -370,7 +389,7 @@ impl<'a> Lowerer<'a> {
                     fill: *fill,
                 },
             ),
-            TileExpr::QuantizedQ4KGgmlDot {
+            Expr::QuantizedQ4KGgmlDot {
                 a_low,
                 a_high,
                 sums,
@@ -402,7 +421,7 @@ impl<'a> Lowerer<'a> {
                     fill: *fill,
                 },
             ),
-            TileExpr::QuantizedQ6KGgmlDot {
+            Expr::QuantizedQ6KGgmlDot {
                 a,
                 src,
                 block,
@@ -427,4 +446,59 @@ impl<'a> Lowerer<'a> {
         }
     }
 
+    pub(in crate::lower) fn lower_builtin(
+        &self,
+        expressions: &mut Arena<Expression>,
+        body: &mut Block,
+        builtin: Builtin,
+    ) -> Handle<Expression> {
+        match builtin {
+            Builtin::Lane => expressions.append(
+                Expression::FunctionArgument(LOCAL_INVOCATION_INDEX_ARG),
+                Span::default(),
+            ),
+            Builtin::LoopIndex => {
+                let pointer = expressions.append(
+                    Expression::LocalVariable(self.current_loop_index()),
+                    Span::default(),
+                );
+                let value = expressions.append(Expression::Load { pointer }, Span::default());
+                body.push(
+                    Statement::Emit(Self::single_expression_range(expressions, value)),
+                    Span::default(),
+                );
+                value
+            }
+            Builtin::ProgramId(axis) => {
+                let wg = expressions.append(
+                    Expression::FunctionArgument(WORKGROUP_ID_ARG),
+                    Span::default(),
+                );
+                self.emit_tile_expr(
+                    expressions,
+                    body,
+                    Expression::AccessIndex {
+                        base: wg,
+                        index: axis.index(),
+                    },
+                )
+            }
+            Builtin::SubgroupId => expressions.append(
+                Expression::FunctionArgument(SUBGROUP_ID_ARG),
+                Span::default(),
+            ),
+            Builtin::SubgroupLane => expressions.append(
+                Expression::FunctionArgument(SUBGROUP_INVOCATION_ID_ARG),
+                Span::default(),
+            ),
+            Builtin::SubgroupSize => expressions.append(
+                Expression::FunctionArgument(SUBGROUP_SIZE_ARG),
+                Span::default(),
+            ),
+            Builtin::NumSubgroups => expressions.append(
+                Expression::FunctionArgument(NUM_SUBGROUPS_ARG),
+                Span::default(),
+            ),
+        }
+    }
 }

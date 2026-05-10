@@ -60,28 +60,7 @@ id_newtype!(
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum TileIter {
     /// Counted range `0..count` where `count` is a dynamic expression.
-    Range { count: Box<TileExpr> },
-}
-
-/// Built-in u32 quantities that show up as leaves in index/address arithmetic.
-/// Promoted to `TileExpr::Builtin` so a single expression type can host both
-/// per-lane data and indexing math.
-#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
-pub enum Builtin {
-    /// `@builtin(local_invocation_index)` — flat lane within the workgroup.
-    Lane,
-    /// Current iteration counter of the innermost structured `Fold` / `Loop`.
-    LoopIndex,
-    /// `@builtin(workgroup_id).{x|y|z}`.
-    ProgramId(WorkgroupAxis),
-    /// `@builtin(subgroup_id)`.
-    SubgroupId,
-    /// `@builtin(subgroup_invocation_id)` — lane within the subgroup.
-    SubgroupLane,
-    /// `@builtin(subgroup_size)` — runtime subgroup size.
-    SubgroupSize,
-    /// `@builtin(num_subgroups)` — number of subgroups per workgroup.
-    NumSubgroups,
+    Range { count: Box<Expr> },
 }
 
 impl KernelIr {
@@ -118,47 +97,43 @@ impl KernelIr {
         Some(program.grid)
     }
 
-    /// Best-effort element-type inference for a `TileExpr`, used by builder
+    /// Best-effort element-type inference for a `Expr`, used by builder
     /// helpers like `pin` that need to allocate a typed local before the
     /// lowerer runs. Falls back to `F32` for variants that need additional
     /// context.
-    pub(crate) fn tile_expr_element(&self, expr: &TileExpr) -> ElementType {
+    pub(crate) fn tile_expr_element(&self, expr: &Expr) -> ElementType {
         match expr {
-            TileExpr::Load(load) => load.src.buffer.element,
-            TileExpr::LoadLinear(load) => load.src.buffer.element,
-            TileExpr::LoadVec4(_) => ElementType::F32Vec4,
-            TileExpr::LoadWorkgroup { src, .. } => src.element,
-            TileExpr::LoadLocal(local) => local.element,
-            TileExpr::QuantizedLoad(_) | TileExpr::Full(_) => ElementType::F32,
-            TileExpr::Literal(value) => value.element(),
-            TileExpr::Index(_) => ElementType::U32,
-            TileExpr::Builtin(_) => ElementType::U32,
-            TileExpr::Scalar(scalar) => match scalar {
-                TileScalarExpr::Reduce { scratch, .. }
-                | TileScalarExpr::LoopReduce { scratch, .. } => scratch.element,
-                TileScalarExpr::Literal(value) => value.element(),
-            },
-            TileExpr::Unary { value, .. } | TileExpr::Binary { left: value, .. } => {
+            Expr::Load(load) => load.src.buffer.element,
+            Expr::LoadLinear(load) => load.src.buffer.element,
+            Expr::LoadVec4(_) => ElementType::F32Vec4,
+            Expr::LoadWorkgroup { src, .. } => src.element,
+            Expr::LoadLocal(local) => local.element,
+            Expr::QuantizedLoad(_) | Expr::Full(_) => ElementType::F32,
+            Expr::Literal(value) => value.element(),
+            Expr::Builtin(_) => ElementType::U32,
+            Expr::Reduce { scratch, .. } => scratch.element,
+            Expr::LoopReduce { scratch, .. } => scratch.element,
+            Expr::Unary { value, .. } | Expr::Binary { left: value, .. } => {
                 self.tile_expr_element(value)
             }
-            TileExpr::Sum { values } => values
+            Expr::Sum { values } => values
                 .first()
                 .map(|value| self.tile_expr_element(value))
                 .unwrap_or(ElementType::F32),
-            TileExpr::Cast { to, .. } => *to,
-            TileExpr::Bitcast { to, .. } => *to,
-            TileExpr::Select { accept, .. } => self.tile_expr_element(accept),
-            TileExpr::Compare { output, .. } => *output,
-            TileExpr::LoopFold { initial, .. } => initial.element(),
-            TileExpr::GroupReduce { scratch, .. } => scratch.element,
-            TileExpr::SubgroupReduce { value, .. } => self.tile_expr_element(value),
-            TileExpr::QuantizedBlockLane { .. } => ElementType::F32,
-            TileExpr::Vec4Dot { .. }
-            | TileExpr::QuantizedQ8_0Dot8 { .. }
-            | TileExpr::QuantizedVecDot { .. }
-            | TileExpr::QuantizedQ4KGgmlDot { .. }
-            | TileExpr::QuantizedQ6KGgmlDot { .. } => ElementType::F32,
-            TileExpr::Vec4Splat { .. } | TileExpr::Compose4 { .. } => ElementType::F32Vec4,
+            Expr::Cast { to, .. } => *to,
+            Expr::Bitcast { to, .. } => *to,
+            Expr::Select { accept, .. } => self.tile_expr_element(accept),
+            Expr::Compare { output, .. } => *output,
+            Expr::LoopFold { initial, .. } => initial.element(),
+            Expr::GroupReduce { scratch, .. } => scratch.element,
+            Expr::SubgroupReduce { value, .. } => self.tile_expr_element(value),
+            Expr::QuantizedBlockLane { .. } => ElementType::F32,
+            Expr::Vec4Dot { .. }
+            | Expr::QuantizedQ8_0Dot8 { .. }
+            | Expr::QuantizedVecDot { .. }
+            | Expr::QuantizedQ4KGgmlDot { .. }
+            | Expr::QuantizedQ6KGgmlDot { .. } => ElementType::F32,
+            Expr::Vec4Splat { .. } | Expr::Compose4 { .. } => ElementType::F32Vec4,
         }
     }
 }
@@ -421,21 +396,21 @@ pub enum TileStmt {
     /// Per-lane masked rank-1 storage write.
     StoreIndexed(TileIndexedStoreStmt),
     /// Store to a private per-invocation local.
-    StoreLocal { dst: LocalRef, value: TileExpr },
+    StoreLocal { dst: LocalRef, value: Expr },
     /// Bind `value` to a fresh local. Subsequent reads in the rest of this
-    /// statement vec use `TileExpr::LoadLocal(LocalRef { id: name.id, .. })`.
+    /// statement vec use `Expr::LoadLocal(LocalRef { id: name.id, .. })`.
     /// Lowers to a Store of `value` into the local; the local must be
     /// declared in `KernelIr.locals`.
-    Let { name: LocalRef, value: TileExpr },
+    Let { name: LocalRef, value: Expr },
     /// Store to a workgroup scratch tile at a dynamic flat index.
     StoreWorkgroup {
         dst: TileRef,
-        index: TileIndexExpr,
-        value: TileExpr,
+        index: Box<Expr>,
+        value: Expr,
     },
     /// Per-invocation control flow.
     If {
-        condition: TileExpr,
+        condition: Expr,
         accept: Vec<TileStmt>,
         reject: Vec<TileStmt>,
     },
@@ -455,16 +430,16 @@ pub enum TileStmt {
     CopyToWorkgroupTile {
         dst: TileRef,
         src: StorageView,
-        row_offset: TileIndexExpr,
-        col_offset: TileIndexExpr,
+        row_offset: Box<Expr>,
+        col_offset: Box<Expr>,
     },
     /// Same as `CopyToWorkgroupTile` but dequantizing on the fly from a packed
     /// quantized matrix. `dst` must be an f32 workgroup tile.
     CopyQuantToWorkgroupTile {
         dst: TileRef,
         src: QuantizedMatrix,
-        row_offset: TileIndexExpr,
-        col_offset: TileIndexExpr,
+        row_offset: Box<Expr>,
+        col_offset: Box<Expr>,
     },
     /// Workgroup-scope memory barrier.
     Barrier,
@@ -474,8 +449,8 @@ pub enum TileStmt {
         id: CoopFragmentId,
         role: CoopOperandRole,
         tile: TileRef,
-        row: TileIndexExpr,
-        col: TileIndexExpr,
+        row: Box<Expr>,
+        col: Box<Expr>,
     },
     /// `acc += a * b` where `a`/`b` are previously loaded fragments. Letting
     /// the user load fragments separately lets one A/B load be reused across
@@ -491,11 +466,11 @@ pub enum TileStmt {
     StoreCoopAcc {
         acc: LocalRef,
         dst: StorageView,
-        row: TileIndexExpr,
-        col: TileIndexExpr,
+        row: Box<Expr>,
+        col: Box<Expr>,
     },
     /// Temporary generic loop form. Lowering emits `loop { ... }` with an
-    /// explicit top-of-loop break when `TileIndexExpr::LoopIndex` reaches
+    /// explicit top-of-loop break when `Builtin::LoopIndex` reaches
     /// `max_iterations`.
     WhileTrue {
         max_iterations: u32,
@@ -527,27 +502,27 @@ pub enum TileStmt {
 pub struct FoldAccumulator {
     pub name: LocalId,
     pub element: ElementType,
-    pub init: TileExpr,
-    pub update: TileExpr,
+    pub init: Expr,
+    pub update: Expr,
 }
 
 /// A masked tile store emitted by a source tile program.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TileStoreStmt {
     pub dst: StorageView,
-    pub row: TileIndexExpr,
-    pub col: TileIndexExpr,
-    pub value: TileExpr,
-    pub mask: TileMaskExpr,
+    pub row: Box<Expr>,
+    pub col: Box<Expr>,
+    pub value: Expr,
+    pub mask: Box<Expr>,
 }
 
 /// A masked rank-1 store emitted by a source tile program.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TileIndexedStoreStmt {
     pub dst: StorageView,
-    pub index: TileIndexExpr,
-    pub value: TileExpr,
-    pub mask: TileMaskExpr,
+    pub index: Box<Expr>,
+    pub value: Expr,
+    pub mask: Box<Expr>,
 }
 
 /// Floating point literal stored by bits so IR equality remains exact.
@@ -582,244 +557,6 @@ impl TileLiteral {
             Self::Bool(_) => ElementType::Bool,
         }
     }
-}
-
-/// A rank-1 tile expression evaluated lane-wise.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum TileExpr {
-    Load(TileLoadExpr),
-    LoadLinear(TileLinearLoadExpr),
-    LoadVec4(TileVec4LoadExpr),
-    LoadWorkgroup {
-        src: TileRef,
-        index: TileIndexExpr,
-    },
-    LoadLocal(LocalRef),
-    QuantizedLoad(TileQuantizedLoadExpr),
-    Full(F32Bits),
-    Literal(TileLiteral),
-    Index(TileIndexExpr),
-    Scalar(TileScalarExpr),
-    /// A built-in u32 quantity (lane id, loop index, program id, subgroup
-    /// builtins). Promoted from `TileIndexExpr` leaves so the same expression
-    /// type spans index arithmetic and per-lane data.
-    Builtin(Builtin),
-    Unary {
-        op: TileUnaryOp,
-        value: Box<TileExpr>,
-    },
-    Binary {
-        op: TileBinaryOp,
-        left: Box<TileExpr>,
-        right: Box<TileExpr>,
-    },
-    /// Left-associated sum of a flat value list. This represents long
-    /// unrolled accumulations without forcing the lowerer to recurse through
-    /// a deep binary tree.
-    Sum {
-        values: Vec<Box<TileExpr>>,
-    },
-    Cast {
-        value: Box<TileExpr>,
-        to: ElementType,
-    },
-    Bitcast {
-        value: Box<TileExpr>,
-        to: ElementType,
-    },
-    Select {
-        condition: Box<TileExpr>,
-        accept: Box<TileExpr>,
-        reject: Box<TileExpr>,
-    },
-    Compare {
-        op: TileCompareOp,
-        left: Box<TileExpr>,
-        right: Box<TileExpr>,
-        output: ElementType,
-    },
-    LoopFold {
-        op: TileReduceOp,
-        iterations: u32,
-        value: Box<TileExpr>,
-        initial: TileLiteral,
-    },
-    GroupReduce {
-        op: TileReduceOp,
-        value: Box<TileExpr>,
-        scratch: TileRef,
-        group_size: u32,
-    },
-    /// Reduction across the lanes of one subgroup. Lowers to
-    /// `subgroupAdd`/`subgroupMax`/`subgroupMin` — no shared-memory tree, no
-    /// workgroup-shape divisibility constraint.
-    SubgroupReduce {
-        op: TileReduceOp,
-        value: Box<TileExpr>,
-    },
-    /// One lane of a fused N-wide quantized dequant. All lanes of the same
-    /// `id` share the block scale lookup; the lowerer emits the helper once
-    /// and reuses the result across lanes.
-    QuantizedBlockLane {
-        id: BlockDequantId,
-        src: QuantizedMatrix,
-        k_base: TileIndexExpr,
-        col: TileIndexExpr,
-        mask: TileMaskExpr,
-        fill: F32Bits,
-        block_n: u32,
-        lane: u32,
-    },
-    /// Dot product between two `vec4<f32>` expressions.
-    Vec4Dot {
-        left: Box<TileExpr>,
-        right: Box<TileExpr>,
-    },
-    /// `vec4<f32>(value, value, value, value)`.
-    Vec4Splat {
-        value: Box<TileExpr>,
-    },
-    /// `vec4<f32>(values[0], values[1], values[2], values[3])`. Combined with
-    /// `Vec4Dot` this expresses the fused 4-way dot product the qgemv
-    /// accelerator emits.
-    Compose4 {
-        values: [Box<TileExpr>; 4],
-    },
-    QuantizedQ8_0Dot8 {
-        a: [Box<TileExpr>; 8],
-        src: QuantizedMatrix,
-        k_base: TileIndexExpr,
-        col: TileIndexExpr,
-        mask: TileMaskExpr,
-        fill: F32Bits,
-    },
-    QuantizedVecDot {
-        kind: QuantizedVecDotKind,
-        a: Vec<Box<TileExpr>>,
-        src: QuantizedMatrix,
-        k_base: TileIndexExpr,
-        col: TileIndexExpr,
-        mask: TileMaskExpr,
-        fill: F32Bits,
-        block_n: u32,
-    },
-    QuantizedQ4KGgmlDot {
-        a_low: Vec<Box<TileExpr>>,
-        a_high: Vec<Box<TileExpr>>,
-        sums: Vec<Box<TileExpr>>,
-        src: QuantizedMatrix,
-        block: TileIndexExpr,
-        iq: TileIndexExpr,
-        ir: TileIndexExpr,
-        col: TileIndexExpr,
-        mask: TileMaskExpr,
-        fill: F32Bits,
-    },
-    QuantizedQ6KGgmlDot {
-        a: Vec<Box<TileExpr>>,
-        src: QuantizedMatrix,
-        block: TileIndexExpr,
-        ip: TileIndexExpr,
-        il: TileIndexExpr,
-        col: TileIndexExpr,
-        mask: TileMaskExpr,
-        fill: F32Bits,
-    },
-}
-
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub enum QuantizedVecDotKind {
-    Q8Activation,
-    Q4KF32,
-}
-
-/// A masked rank-1 tile load.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct TileLoadExpr {
-    pub src: StorageView,
-    pub row: TileIndexExpr,
-    pub col: TileIndexExpr,
-    pub mask: TileMaskExpr,
-    pub fill: TileLiteral,
-}
-
-/// A masked rank-1 vec4 load.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct TileVec4LoadExpr {
-    pub src: StorageView,
-    pub index: TileIndexExpr,
-    pub mask: TileMaskExpr,
-    pub fill: F32Bits,
-}
-
-/// A masked rank-1 storage load.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct TileLinearLoadExpr {
-    pub src: StorageView,
-    pub index: TileIndexExpr,
-    pub mask: TileMaskExpr,
-    pub fill: TileLiteral,
-}
-
-/// A masked dequantizing rank-1 tile load from a packed quantized matrix.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct TileQuantizedLoadExpr {
-    pub src: QuantizedMatrix,
-    pub row: TileIndexExpr,
-    pub col: TileIndexExpr,
-    pub mask: TileMaskExpr,
-    pub fill: F32Bits,
-}
-
-/// A scalar value derived from a tile expression.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum TileScalarExpr {
-    Reduce {
-        op: TileReduceOp,
-        value: Box<TileExpr>,
-        scratch: TileRef,
-    },
-    LoopReduce {
-        op: TileReduceOp,
-        iterations: u32,
-        value: Box<TileExpr>,
-        scratch: TileRef,
-    },
-    Literal(TileLiteral),
-}
-
-/// Integer index expression over program ids and the current lane.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum TileIndexExpr {
-    Lane,
-    LoopIndex,
-    ProgramId(WorkgroupAxis),
-    /// `@builtin(subgroup_id)` — index of the subgroup within the workgroup.
-    SubgroupId,
-    /// `@builtin(subgroup_invocation_id)` — lane within the current subgroup.
-    SubgroupLane,
-    /// `@builtin(subgroup_size)` — runtime subgroup size.
-    SubgroupSize,
-    /// `@builtin(num_subgroups)` — number of subgroups per workgroup.
-    NumSubgroups,
-    Literal(u32),
-    Add(Box<TileIndexExpr>, Box<TileIndexExpr>),
-    Mul(Box<TileIndexExpr>, u32),
-    Div(Box<TileIndexExpr>, u32),
-    Mod(Box<TileIndexExpr>, u32),
-    Value(Box<TileExpr>),
-}
-
-/// Boolean mask expression.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum TileMaskExpr {
-    True,
-    Compare {
-        op: TileCompareOp,
-        left: TileIndexExpr,
-        right: TileIndexExpr,
-    },
-    And(Box<TileMaskExpr>, Box<TileMaskExpr>),
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -936,6 +673,12 @@ numeric_markers!(
         ElementType::Bool
     ),
 );
+
+mod expr;
+pub use expr::{
+    Builtin, Expr, QuantizedVecDotKind, TileLinearLoadExpr, TileLoadExpr, TileQuantizedLoadExpr,
+    TileVec4LoadExpr,
+};
 
 mod layout;
 pub use layout::{Layout, MemoryLevel, Shape, Strides, TileLevel, TileOrigin};

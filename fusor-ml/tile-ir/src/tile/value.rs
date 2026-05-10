@@ -7,11 +7,12 @@ use crate::ir::{
     CoopOperandRole, DynamicOffset, F32Bits, F32Vec4, Im2ColNhwcMap, KernelIr, Layout, LocalDecl,
     LocalRef, MemoryLevel, Numeric, Op,
     QuantizedVecDotKind, Shape, StorageIndexMap, StorageView, TileBinaryOp, TileCompareOp,
-    TileDecl, TileExpr, TileIndexExpr, TileIndexedStoreStmt, TileLevel, TileLinearLoadExpr,
-    TileLiteral, TileLoadExpr, TileMaskExpr, TileOrigin, TileProgramOp, TileQuantizedLoadExpr,
-    TileReduceOp, TileRef, TileScalarExpr, TileStmt, TileStoreStmt, TileUnaryOp, TileVec4LoadExpr,
+    TileDecl, Expr, TileIndexedStoreStmt, TileLevel, TileLinearLoadExpr,
+    TileLiteral, TileLoadExpr, TileOrigin, TileProgramOp, TileQuantizedLoadExpr,
+    TileReduceOp, TileRef, TileStmt, TileStoreStmt, TileUnaryOp, TileVec4LoadExpr,
     WorkgroupAxis, WorkgroupOffset, F32, U32,
 };
+use crate::ir::ElementType;
 use crate::quantized::{GgmlQuantFormat, QuantizedMatrix};
 use super::*;
 
@@ -59,21 +60,21 @@ pub fn range<const BLOCK: usize>(count: Tile<BLOCK>) -> FoldIter {
 impl<const BLOCK: usize> Bound<BLOCK> {
     pub fn get(&self) -> Tile<BLOCK> {
         Tile {
-            expr: TileExpr::LoadLocal(self.local),
+            expr: Expr::LoadLocal(self.local),
         }
     }
 }
 
 pub struct Address<T, const N: usize> {
     pub(super) view: StorageView,
-    pub(super) row: TileIndexExpr,
-    pub(super) col: TileIndexExpr,
+    pub(super) row: Box<Expr>,
+    pub(super) col: Box<Expr>,
     pub(super) _ty: PhantomData<T>,
 }
 
 pub struct LinearAddress<T, const N: usize> {
     pub(super) view: StorageView,
-    pub(super) index: TileIndexExpr,
+    pub(super) index: Box<Expr>,
     pub(super) _ty: PhantomData<T>,
 }
 
@@ -84,8 +85,8 @@ pub struct Local<T, const N: usize> {
 
 pub struct ErasedAddress<const N: usize> {
     pub(super) view: StorageView,
-    pub(super) row: TileIndexExpr,
-    pub(super) col: TileIndexExpr,
+    pub(super) row: Box<Expr>,
+    pub(super) col: Box<Expr>,
 }
 
 #[derive(Clone)]
@@ -105,68 +106,69 @@ impl<const ROWS: usize, const COLS: usize, const N: usize> LaneTile2d<ROWS, COLS
 }
 
 pub trait IntoIndex<const N: usize> {
-    fn into_index(self) -> TileIndexExpr;
+    fn into_index(self) -> Box<Expr>;
 }
 
 #[derive(Clone)]
 pub struct ScalarIndex {
-    pub(super) expr: TileIndexExpr,
+    pub(super) expr: Box<Expr>,
 }
 
 #[derive(Clone)]
 pub struct Range<const N: usize> {
-    pub(super) expr: TileIndexExpr,
+    pub(super) expr: Box<Expr>,
 }
 
 impl<const N: usize> IntoIndex<N> for ScalarIndex {
-    fn into_index(self) -> TileIndexExpr {
+    fn into_index(self) -> Box<Expr> {
         self.expr
     }
 }
 
 impl<const N: usize> IntoIndex<N> for &ScalarIndex {
-    fn into_index(self) -> TileIndexExpr {
+    fn into_index(self) -> Box<Expr> {
         self.expr.clone()
     }
 }
 
 impl<const N: usize> IntoIndex<N> for Range<N> {
-    fn into_index(self) -> TileIndexExpr {
+    fn into_index(self) -> Box<Expr> {
         self.expr
     }
 }
 
 impl<const N: usize> IntoIndex<N> for &Range<N> {
-    fn into_index(self) -> TileIndexExpr {
+    fn into_index(self) -> Box<Expr> {
         self.expr.clone()
     }
 }
 
 impl<const N: usize> IntoIndex<N> for u32 {
-    fn into_index(self) -> TileIndexExpr {
-        TileIndexExpr::Literal(self)
+    fn into_index(self) -> Box<Expr> {
+        Box::new(Expr::Literal(TileLiteral::U32(self)))
     }
 }
 
 impl<const N: usize> IntoIndex<N> for Tile<N> {
-    fn into_index(self) -> TileIndexExpr {
-        TileIndexExpr::Value(Box::new(self.expr))
+    fn into_index(self) -> Box<Expr> {
+        Box::new(self.expr)
     }
 }
 
 impl<const N: usize> IntoIndex<N> for &Tile<N> {
-    fn into_index(self) -> TileIndexExpr {
-        TileIndexExpr::Value(Box::new(self.expr.clone()))
+    fn into_index(self) -> Box<Expr> {
+        Box::new(self.expr.clone())
     }
 }
 
-pub(super) fn index_compare<const N: usize>(left: TileIndexExpr, op: TileCompareOp, value: u32) -> Mask<N> {
+pub(super) fn index_compare<const N: usize>(left: Box<Expr>, op: TileCompareOp, value: u32) -> Mask<N> {
     Mask {
-        expr: TileMaskExpr::Compare {
+        expr: Box::new(Expr::Compare {
             op,
             left,
-            right: TileIndexExpr::Literal(value),
-        },
+            right: Box::new(Expr::Literal(TileLiteral::U32(value))),
+            output: ElementType::Bool,
+        }),
     }
 }
 
@@ -211,10 +213,11 @@ macro_rules! impl_index_u32_ops {
 
             fn add(self, rhs: u32) -> Self::Output {
                 $ctor {
-                    expr: TileIndexExpr::Add(
-                        Box::new(self.expr),
-                        Box::new(TileIndexExpr::Literal(rhs)),
-                    ),
+                    expr: Box::new(Expr::Binary {
+                        op: TileBinaryOp::Add,
+                        left: self.expr,
+                        right: Box::new(Expr::Literal(TileLiteral::U32(rhs))),
+                    }),
                 }
             }
         }
@@ -224,7 +227,11 @@ macro_rules! impl_index_u32_ops {
 
             fn mul(self, rhs: u32) -> Self::Output {
                 $ctor {
-                    expr: TileIndexExpr::Mul(Box::new(self.expr), rhs),
+                    expr: Box::new(Expr::Binary {
+                        op: TileBinaryOp::Mul,
+                        left: self.expr,
+                        right: Box::new(Expr::Literal(TileLiteral::U32(rhs))),
+                    }),
                 }
             }
         }
@@ -235,7 +242,11 @@ macro_rules! impl_index_u32_ops {
             fn div(self, rhs: u32) -> Self::Output {
                 assert!(rhs > 0, $div_msg);
                 $ctor {
-                    expr: TileIndexExpr::Div(Box::new(self.expr), rhs),
+                    expr: Box::new(Expr::Binary {
+                        op: TileBinaryOp::Div,
+                        left: self.expr,
+                        right: Box::new(Expr::Literal(TileLiteral::U32(rhs))),
+                    }),
                 }
             }
         }
@@ -245,11 +256,11 @@ macro_rules! impl_index_u32_ops {
 
             fn bitand(self, rhs: u32) -> Self::Output {
                 $ctor {
-                    expr: TileIndexExpr::Value(Box::new(TileExpr::Binary {
+                    expr: Box::new(Expr::Binary {
                         op: TileBinaryOp::BitAnd,
-                        left: Box::new(TileExpr::Index(self.expr)),
-                        right: Box::new(TileExpr::Literal(TileLiteral::U32(rhs))),
-                    })),
+                        left: self.expr,
+                        right: Box::new(Expr::Literal(TileLiteral::U32(rhs))),
+                    }),
                 }
             }
         }
@@ -259,11 +270,11 @@ macro_rules! impl_index_u32_ops {
 
             fn bitxor(self, rhs: u32) -> Self::Output {
                 $ctor {
-                    expr: TileIndexExpr::Value(Box::new(TileExpr::Binary {
+                    expr: Box::new(Expr::Binary {
                         op: TileBinaryOp::BitXor,
-                        left: Box::new(TileExpr::Index(self.expr)),
-                        right: Box::new(TileExpr::Literal(TileLiteral::U32(rhs))),
-                    })),
+                        left: self.expr,
+                        right: Box::new(Expr::Literal(TileLiteral::U32(rhs))),
+                    }),
                 }
             }
         }
@@ -274,7 +285,11 @@ macro_rules! impl_index_u32_ops {
             fn rem(self, rhs: u32) -> Self::Output {
                 assert!(rhs > 0, $mod_msg);
                 $ctor {
-                    expr: TileIndexExpr::Mod(Box::new(self.expr), rhs),
+                    expr: Box::new(Expr::Binary {
+                        op: TileBinaryOp::Rem,
+                        left: self.expr,
+                        right: Box::new(Expr::Literal(TileLiteral::U32(rhs))),
+                    }),
                 }
             }
         }
@@ -302,7 +317,11 @@ impl Add<ScalarIndex> for ScalarIndex {
 
     fn add(self, rhs: ScalarIndex) -> Self::Output {
         ScalarIndex {
-            expr: TileIndexExpr::Add(Box::new(self.expr), Box::new(rhs.expr)),
+            expr: Box::new(Expr::Binary {
+                op: TileBinaryOp::Add,
+                left: self.expr,
+                right: rhs.expr,
+            }),
         }
     }
 }
@@ -312,7 +331,11 @@ impl<const N: usize> Add<Range<N>> for ScalarIndex {
 
     fn add(self, rhs: Range<N>) -> Self::Output {
         Range {
-            expr: TileIndexExpr::Add(Box::new(self.expr), Box::new(rhs.expr)),
+            expr: Box::new(Expr::Binary {
+                op: TileBinaryOp::Add,
+                left: self.expr,
+                right: rhs.expr,
+            }),
         }
     }
 }
@@ -322,46 +345,54 @@ impl<const N: usize> Add<ScalarIndex> for Range<N> {
 
     fn add(self, rhs: ScalarIndex) -> Self::Output {
         Range {
-            expr: TileIndexExpr::Add(Box::new(self.expr), Box::new(rhs.expr)),
+            expr: Box::new(Expr::Binary {
+                op: TileBinaryOp::Add,
+                left: self.expr,
+                right: rhs.expr,
+            }),
         }
     }
 }
 
 #[derive(Clone)]
 pub struct Mask<const N: usize> {
-    pub(super) expr: TileMaskExpr,
+    pub(super) expr: Box<Expr>,
 }
 
 impl<const N: usize> Mask<N> {
     pub fn all() -> Self {
         Self {
-            expr: TileMaskExpr::True,
+            expr: Box::new(Expr::Literal(TileLiteral::Bool(true))),
         }
     }
 
     pub fn and(self, rhs: Self) -> Self {
         Self {
-            expr: TileMaskExpr::And(Box::new(self.expr), Box::new(rhs.expr)),
+            expr: Box::new(Expr::Binary {
+                op: TileBinaryOp::LogicalAnd,
+                left: self.expr,
+                right: rhs.expr,
+            }),
         }
     }
 }
 
 #[derive(Clone)]
 pub struct Scalar {
-    pub(super) expr: TileScalarExpr,
+    pub(super) expr: Expr,
 }
 
 impl Scalar {
     pub fn literal(value: f32) -> Self {
         Self {
-            expr: TileScalarExpr::Literal(TileLiteral::F32(F32Bits::new(value))),
+            expr: Expr::Literal(TileLiteral::F32(F32Bits::new(value))),
         }
     }
 }
 
 #[derive(Clone)]
 pub struct Tile<const N: usize> {
-    pub(super) expr: TileExpr,
+    pub(super) expr: Expr,
 }
 
 macro_rules! tile_unary_methods {
@@ -397,19 +428,19 @@ macro_rules! tile_binary_methods {
 impl<const N: usize> Tile<N> {
     pub fn literal(value: TileLiteral) -> Self {
         Self {
-            expr: TileExpr::Literal(value),
+            expr: Expr::Literal(value),
         }
     }
 
     pub fn from_index(index: impl IntoIndex<N>) -> Self {
         Self {
-            expr: TileExpr::Index(index.into_index()),
+            expr: *index.into_index(),
         }
     }
 
     pub fn unary(self, op: TileUnaryOp) -> Self {
         Self {
-            expr: TileExpr::Unary {
+            expr: Expr::Unary {
                 op,
                 value: Box::new(self.expr),
             },
@@ -451,7 +482,7 @@ impl<const N: usize> Tile<N> {
 
     pub fn cast(self, to: crate::ElementType) -> Self {
         Self {
-            expr: TileExpr::Cast {
+            expr: Expr::Cast {
                 value: Box::new(self.expr),
                 to,
             },
@@ -460,7 +491,7 @@ impl<const N: usize> Tile<N> {
 
     pub fn bitcast(self, to: crate::ElementType) -> Self {
         Self {
-            expr: TileExpr::Bitcast {
+            expr: Expr::Bitcast {
                 value: Box::new(self.expr),
                 to,
             },
@@ -469,7 +500,7 @@ impl<const N: usize> Tile<N> {
 
     pub fn select(condition: Self, accept: Self, reject: Self) -> Self {
         Self {
-            expr: TileExpr::Select {
+            expr: Expr::Select {
                 condition: Box::new(condition.expr),
                 accept: Box::new(accept.expr),
                 reject: Box::new(reject.expr),
@@ -479,7 +510,7 @@ impl<const N: usize> Tile<N> {
 
     pub fn compare(op: TileCompareOp, left: Self, right: Self, output: crate::ElementType) -> Self {
         Self {
-            expr: TileExpr::Compare {
+            expr: Expr::Compare {
                 op,
                 left: Box::new(left.expr),
                 right: Box::new(right.expr),
@@ -496,7 +527,7 @@ impl<const N: usize> Tile<N> {
 
     pub fn binary(self, op: TileBinaryOp, rhs: Self) -> Self {
         Tile {
-            expr: TileExpr::Binary {
+            expr: Expr::Binary {
                 op,
                 left: Box::new(self.expr),
                 right: Box::new(rhs.expr),
@@ -518,7 +549,7 @@ impl<const N: usize> Tile<N> {
 impl<const N: usize> From<Scalar> for Tile<N> {
     fn from(value: Scalar) -> Self {
         Self {
-            expr: TileExpr::Scalar(value.expr),
+            expr: value.expr,
         }
     }
 }
@@ -538,10 +569,10 @@ macro_rules! impl_tile_binary {
 
             fn $method(self, rhs: Scalar) -> Self::Output {
                 Tile {
-                    expr: TileExpr::Binary {
+                    expr: Expr::Binary {
                         op: $op,
                         left: Box::new(self.expr),
-                        right: Box::new(TileExpr::Scalar(rhs.expr)),
+                        right: Box::new(rhs.expr),
                     },
                 }
             }

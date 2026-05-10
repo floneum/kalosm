@@ -1,67 +1,12 @@
 use super::*;
 
 impl<'a> Lowerer<'a> {
-    pub(in crate::lower) fn lower_tile_scalar_expr(
-        &self,
-        expressions: &mut Arena<Expression>,
-        scratch: ScratchLocals,
-        body: &mut Block,
-        expr: &TileScalarExpr,
-        spill_depth: usize,
-    ) -> Result<Handle<Expression>, LowerError> {
-        match expr {
-            TileScalarExpr::Literal(value) => {
-                Ok(expressions.append(Self::tile_literal(*value), Span::default()))
-            }
-            TileScalarExpr::Reduce {
-                op,
-                value,
-                scratch: scratch_tile,
-            } => {
-                let value =
-                    self.lower_tile_expr_lane(expressions, scratch, body, value, spill_depth)?;
-                self.lower_tile_reduce_value(
-                    expressions,
-                    body,
-                    value,
-                    *scratch_tile,
-                    *op,
-                    self.workgroup_invocations,
-                )
-            }
-            TileScalarExpr::LoopReduce {
-                op,
-                iterations,
-                value,
-                scratch: scratch_tile,
-            } => {
-                let value = self.lower_tile_loop_reduce_value(
-                    expressions,
-                    scratch,
-                    body,
-                    value,
-                    *iterations,
-                    *op,
-                    spill_depth,
-                )?;
-                self.lower_tile_reduce_value(
-                    expressions,
-                    body,
-                    value,
-                    *scratch_tile,
-                    *op,
-                    self.workgroup_invocations,
-                )
-            }
-        }
-    }
-
     pub(in crate::lower) fn lower_tile_loop_reduce_value(
         &self,
         expressions: &mut Arena<Expression>,
         scratch: ScratchLocals,
         body: &mut Block,
-        value: &TileExpr,
+        value: &Expr,
         iterations: u32,
         op: TileReduceOp,
         spill_depth: usize,
@@ -86,7 +31,7 @@ impl<'a> Lowerer<'a> {
         expressions: &mut Arena<Expression>,
         scratch: ScratchLocals,
         body: &mut Block,
-        value: &TileExpr,
+        value: &Expr,
         iterations: u32,
         op: TileReduceOp,
         initial: TileLiteral,
@@ -112,7 +57,7 @@ impl<'a> Lowerer<'a> {
         expressions: &mut Arena<Expression>,
         scratch: ScratchLocals,
         body: &mut Block,
-        value: &TileExpr,
+        value: &Expr,
         iterations: u32,
         op: TileReduceOp,
         element: ElementType,

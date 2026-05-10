@@ -1,6 +1,6 @@
-//! Trait dispatch for the quantized dot-product `TileExpr` variants.
+//! Trait dispatch for the quantized dot-product `Expr` variants.
 //!
-//! Each variant in `TileExpr` that lowers to a fused quantized dot product
+//! Each variant in `Expr` that lowers to a fused quantized dot product
 //! (`QuantizedQ8_0Dot8`, `QuantizedVecDot`, `QuantizedQ4KGgmlDot`,
 //! `QuantizedQ6KGgmlDot`) implements [`QuantizedDotLowering`]. The match arm
 //! in `lower_tile_expr_lane` only has to package the lowering context and
@@ -15,7 +15,7 @@
 use naga::{Arena, Block, Expression, Handle};
 
 use super::super::{Lowerer, LowerError, ScratchLocals};
-use crate::ir::{F32Bits, QuantizedVecDotKind, TileExpr, TileIndexExpr, TileMaskExpr};
+use crate::ir::{F32Bits, QuantizedVecDotKind, Expr};
 use crate::quantized::QuantizedMatrix;
 
 /// Context the lowerer threads through when materialising a dot expression.
@@ -25,8 +25,8 @@ pub(in crate::lower) struct DotLoweringCtx<'b, 'e, 's> {
     pub(in crate::lower) body: &'b mut Block,
     pub(in crate::lower) spill_depth: usize,
     pub(in crate::lower) src: &'s QuantizedMatrix,
-    pub(in crate::lower) col: &'s TileIndexExpr,
-    pub(in crate::lower) mask: &'s TileMaskExpr,
+    pub(in crate::lower) col: &'s Expr,
+    pub(in crate::lower) mask: &'s Expr,
     pub(in crate::lower) fill: F32Bits,
 }
 
@@ -46,8 +46,8 @@ pub(in crate::lower) trait QuantizedDotLowering {
 /// Eight-wide Q8_0 (and Q6K-as-Q8) dot product. The format on the matrix
 /// determines which inner helper runs.
 pub(in crate::lower) struct Q8_0Dot8Lowering<'s> {
-    pub(in crate::lower) a: &'s [Box<TileExpr>; 8],
-    pub(in crate::lower) k_base: &'s TileIndexExpr,
+    pub(in crate::lower) a: &'s [Box<Expr>; 8],
+    pub(in crate::lower) k_base: &'s Expr,
 }
 
 impl<'s> QuantizedDotLowering for Q8_0Dot8Lowering<'s> {
@@ -76,8 +76,8 @@ impl<'s> QuantizedDotLowering for Q8_0Dot8Lowering<'s> {
 /// strategy; `block_n` selects the inner kernel.
 pub(in crate::lower) struct VecDotLowering<'s> {
     pub(in crate::lower) kind: QuantizedVecDotKind,
-    pub(in crate::lower) a: &'s [Box<TileExpr>],
-    pub(in crate::lower) k_base: &'s TileIndexExpr,
+    pub(in crate::lower) a: &'s [Box<Expr>],
+    pub(in crate::lower) k_base: &'s Expr,
     pub(in crate::lower) block_n: u32,
 }
 
@@ -107,12 +107,12 @@ impl<'s> QuantizedDotLowering for VecDotLowering<'s> {
 /// Q4K-specific dot. Carries the split low/high activation halves and the
 /// per-quad sums alongside the Q4K (`block`, `iq`, `ir`) coordinate triple.
 pub(in crate::lower) struct Q4KGgmlDotLowering<'s> {
-    pub(in crate::lower) a_low: &'s [Box<TileExpr>],
-    pub(in crate::lower) a_high: &'s [Box<TileExpr>],
-    pub(in crate::lower) sums: &'s [Box<TileExpr>],
-    pub(in crate::lower) block: &'s TileIndexExpr,
-    pub(in crate::lower) iq: &'s TileIndexExpr,
-    pub(in crate::lower) ir: &'s TileIndexExpr,
+    pub(in crate::lower) a_low: &'s [Box<Expr>],
+    pub(in crate::lower) a_high: &'s [Box<Expr>],
+    pub(in crate::lower) sums: &'s [Box<Expr>],
+    pub(in crate::lower) block: &'s Expr,
+    pub(in crate::lower) iq: &'s Expr,
+    pub(in crate::lower) ir: &'s Expr,
 }
 
 impl<'s> QuantizedDotLowering for Q4KGgmlDotLowering<'s> {
@@ -143,10 +143,10 @@ impl<'s> QuantizedDotLowering for Q4KGgmlDotLowering<'s> {
 /// Q6K-specific dot. Carries the activation tile and the Q6K (`block`, `ip`,
 /// `il`) coordinate triple.
 pub(in crate::lower) struct Q6KGgmlDotLowering<'s> {
-    pub(in crate::lower) a: &'s [Box<TileExpr>],
-    pub(in crate::lower) block: &'s TileIndexExpr,
-    pub(in crate::lower) ip: &'s TileIndexExpr,
-    pub(in crate::lower) il: &'s TileIndexExpr,
+    pub(in crate::lower) a: &'s [Box<Expr>],
+    pub(in crate::lower) block: &'s Expr,
+    pub(in crate::lower) ip: &'s Expr,
+    pub(in crate::lower) il: &'s Expr,
 }
 
 impl<'s> QuantizedDotLowering for Q6KGgmlDotLowering<'s> {

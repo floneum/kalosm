@@ -6,11 +6,11 @@ impl<'a> Lowerer<'a> {
         expressions: &mut Arena<Expression>,
         scratch: ScratchLocals,
         body: &mut Block,
-        a: &[Box<TileExpr>; 8],
+        a: &[Box<Expr>; 8],
         src: &QuantizedMatrix,
-        k_base: &TileIndexExpr,
-        col: &TileIndexExpr,
-        mask: &TileMaskExpr,
+        k_base: &Expr,
+        col: &Expr,
+        mask: &Expr,
         fill: F32Bits,
         format: GgmlQuantFormat,
         spill_depth: usize,
@@ -51,11 +51,11 @@ impl<'a> Lowerer<'a> {
         scratch: ScratchLocals,
         body: &mut Block,
         kind: QuantizedVecDotKind,
-        a: &[Box<TileExpr>],
+        a: &[Box<Expr>],
         src: &QuantizedMatrix,
-        k_base: &TileIndexExpr,
-        col: &TileIndexExpr,
-        mask: &TileMaskExpr,
+        k_base: &Expr,
+        col: &Expr,
+        mask: &Expr,
         fill: F32Bits,
         block_n: u32,
         spill_depth: usize,
@@ -115,15 +115,15 @@ impl<'a> Lowerer<'a> {
         expressions: &mut Arena<Expression>,
         scratch: ScratchLocals,
         body: &mut Block,
-        a_low: &[Box<TileExpr>],
-        a_high: &[Box<TileExpr>],
-        sums: &[Box<TileExpr>],
+        a_low: &[Box<Expr>],
+        a_high: &[Box<Expr>],
+        sums: &[Box<Expr>],
         src: &QuantizedMatrix,
-        block: &TileIndexExpr,
-        iq: &TileIndexExpr,
-        ir: &TileIndexExpr,
-        col: &TileIndexExpr,
-        mask: &TileMaskExpr,
+        block: &Expr,
+        iq: &Expr,
+        ir: &Expr,
+        col: &Expr,
+        mask: &Expr,
         fill: F32Bits,
         spill_depth: usize,
     ) -> Result<Handle<Expression>, LowerError> {
@@ -148,13 +148,14 @@ impl<'a> Lowerer<'a> {
             spill_depth,
             fill,
             |expressions, block_body| {
-                let [block_h, iq_h, ir_h, col_h] = self.lower_tile_index_exprs(
-                    expressions,
-                    scratch,
-                    block_body,
-                    [block, iq, ir, col],
-                    spill_depth,
-                )?;
+                let block_h = self
+                    .lower_tile_expr_lane(expressions, scratch, block_body, block, spill_depth)?;
+                let iq_h = self
+                    .lower_tile_expr_lane(expressions, scratch, block_body, iq, spill_depth)?;
+                let ir_h = self
+                    .lower_tile_expr_lane(expressions, scratch, block_body, ir, spill_depth)?;
+                let col_h = self
+                    .lower_tile_expr_lane(expressions, scratch, block_body, col, spill_depth)?;
                 self.q4k_ggml_dot(
                     expressions,
                     src,
@@ -176,13 +177,13 @@ impl<'a> Lowerer<'a> {
         expressions: &mut Arena<Expression>,
         scratch: ScratchLocals,
         body: &mut Block,
-        a: &[Box<TileExpr>],
+        a: &[Box<Expr>],
         src: &QuantizedMatrix,
-        block: &TileIndexExpr,
-        ip: &TileIndexExpr,
-        il: &TileIndexExpr,
-        col: &TileIndexExpr,
-        mask: &TileMaskExpr,
+        block: &Expr,
+        ip: &Expr,
+        il: &Expr,
+        col: &Expr,
+        mask: &Expr,
         fill: F32Bits,
         spill_depth: usize,
     ) -> Result<Handle<Expression>, LowerError> {
@@ -203,13 +204,14 @@ impl<'a> Lowerer<'a> {
             spill_depth,
             fill,
             |expressions, block_body| {
-                let [block_h, ip_h, il_h, col_h] = self.lower_tile_index_exprs(
-                    expressions,
-                    scratch,
-                    block_body,
-                    [block, ip, il, col],
-                    spill_depth,
-                )?;
+                let block_h = self
+                    .lower_tile_expr_lane(expressions, scratch, block_body, block, spill_depth)?;
+                let ip_h = self
+                    .lower_tile_expr_lane(expressions, scratch, block_body, ip, spill_depth)?;
+                let il_h = self
+                    .lower_tile_expr_lane(expressions, scratch, block_body, il, spill_depth)?;
+                let col_h = self
+                    .lower_tile_expr_lane(expressions, scratch, block_body, col, spill_depth)?;
                 self.q6k_ggml_dot(expressions, src, block_h, ip_h, il_h, col_h, &a_handles)
             },
         )
@@ -220,7 +222,7 @@ impl<'a> Lowerer<'a> {
         expressions: &mut Arena<Expression>,
         scratch: ScratchLocals,
         body: &mut Block,
-        exprs: &[Box<TileExpr>],
+        exprs: &[Box<Expr>],
         spill_depth: usize,
     ) -> Result<Vec<Handle<Expression>>, LowerError> {
         exprs
@@ -235,9 +237,9 @@ impl<'a> Lowerer<'a> {
         expressions: &mut Arena<Expression>,
         scratch: ScratchLocals,
         body: &mut Block,
-        k_base: &TileIndexExpr,
-        col: &TileIndexExpr,
-        mask: &TileMaskExpr,
+        k_base: &Expr,
+        col: &Expr,
+        mask: &Expr,
         fill: F32Bits,
         spill_depth: usize,
         lower_value: impl FnOnce(
@@ -256,9 +258,9 @@ impl<'a> Lowerer<'a> {
             fill,
             |expressions, block| {
                 let k_base =
-                    self.lower_tile_index_expr(expressions, scratch, block, k_base, spill_depth)?;
+                    self.lower_tile_expr_lane(expressions, scratch, block, k_base, spill_depth)?;
                 let col =
-                    self.lower_tile_index_expr(expressions, scratch, block, col, spill_depth)?;
+                    self.lower_tile_expr_lane(expressions, scratch, block, col, spill_depth)?;
                 lower_value(expressions, k_base, col)
             },
         )
@@ -299,9 +301,9 @@ impl<'a> Lowerer<'a> {
         body: &mut Block,
         id: BlockDequantId,
         src: &QuantizedMatrix,
-        k_base: &TileIndexExpr,
-        col: &TileIndexExpr,
-        mask: &TileMaskExpr,
+        k_base: &Expr,
+        col: &Expr,
+        mask: &Expr,
         fill: F32Bits,
         block_n: u32,
         lane: u32,
@@ -316,11 +318,11 @@ impl<'a> Lowerer<'a> {
             return Ok(values[lane as usize]);
         }
 
-        if matches!(mask, TileMaskExpr::True) {
+        if mask.is_constant_true() {
             let k_base_handle =
-                self.lower_tile_index_expr(expressions, scratch, body, k_base, spill_depth)?;
+                self.lower_tile_expr_lane(expressions, scratch, body, k_base, spill_depth)?;
             let col_handle =
-                self.lower_tile_index_expr(expressions, scratch, body, col, spill_depth)?;
+                self.lower_tile_expr_lane(expressions, scratch, body, col, spill_depth)?;
             let (values, value_emits) = self.dequantize_quantized_block_values(
                 expressions,
                 src,
@@ -361,12 +363,12 @@ impl<'a> Lowerer<'a> {
         }
 
         let mask_handle =
-            self.lower_tile_mask_expr(expressions, scratch, body, mask, spill_depth)?;
+            self.lower_tile_expr_lane(expressions, scratch, body, mask, spill_depth)?;
         let mut accept = Block::new();
         let k_base_handle =
-            self.lower_tile_index_expr(expressions, scratch, &mut accept, k_base, spill_depth)?;
+            self.lower_tile_expr_lane(expressions, scratch, &mut accept, k_base, spill_depth)?;
         let col_handle =
-            self.lower_tile_index_expr(expressions, scratch, &mut accept, col, spill_depth)?;
+            self.lower_tile_expr_lane(expressions, scratch, &mut accept, col, spill_depth)?;
         let (values, value_emits) = self.dequantize_quantized_block_values(
             expressions,
             src,
@@ -453,7 +455,7 @@ impl<'a> Lowerer<'a> {
         expressions: &mut Arena<Expression>,
         scratch: ScratchLocals,
         body: &mut Block,
-        mask: &TileMaskExpr,
+        mask: &Expr,
         spill_depth: usize,
         fill: F32Bits,
         lower_value: impl FnOnce(
@@ -462,7 +464,7 @@ impl<'a> Lowerer<'a> {
         )
             -> Result<(Handle<Expression>, Vec<Range<Expression>>), LowerError>,
     ) -> Result<Handle<Expression>, LowerError> {
-        if matches!(mask, TileMaskExpr::True) {
+        if mask.is_constant_true() {
             let (value, emits) = lower_value(expressions, body)?;
             Self::push_emits(body, emits);
             return Ok(value);
@@ -493,7 +495,7 @@ impl<'a> Lowerer<'a> {
         expressions: &mut Arena<Expression>,
         scratch: ScratchLocals,
         body: &mut Block,
-        mask: &TileMaskExpr,
+        mask: &Expr,
         spill_depth: usize,
         element: ElementType,
         fill: Handle<Expression>,
@@ -512,7 +514,7 @@ impl<'a> Lowerer<'a> {
             Span::default(),
         );
 
-        let mask = self.lower_tile_mask_expr(expressions, scratch, body, mask, spill_depth)?;
+        let mask = self.lower_tile_expr_lane(expressions, scratch, body, mask, spill_depth)?;
         let mut accept = Block::new();
         let value = lower_accept_value(expressions, &mut accept)?;
         accept.push(

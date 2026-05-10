@@ -3,13 +3,13 @@ use std::marker::PhantomData;
 use std::ops::{Add, BitAnd, BitXor, Div, Mul, Rem, Sub};
 
 use crate::ir::{
-    BlockDequantId, BufferAccess, BufferDecl, BufferRef, CoopFragmentId,
+    BlockDequantId, Builtin, BufferAccess, BufferDecl, BufferRef, CoopFragmentId,
     CoopOperandRole, DynamicOffset, ElementType, F32Bits, F32Vec4, Im2ColNhwcMap,
     KernelIr, Layout, LocalDecl, LocalRef, MemoryLevel, Numeric,
     Op, QuantizedVecDotKind, Shape, StorageIndexMap, StorageView,
-    TileBinaryOp, TileCompareOp, TileDecl, TileExpr, TileIndexExpr, TileIndexedStoreStmt,
-    TileLevel, TileLinearLoadExpr, TileLiteral, TileLoadExpr, TileMaskExpr, TileOrigin,
-    TileProgramOp, TileQuantizedLoadExpr, TileReduceOp, TileRef, TileScalarExpr, TileStmt,
+    TileBinaryOp, TileCompareOp, TileDecl, Expr, TileIndexedStoreStmt,
+    TileLevel, TileLinearLoadExpr, TileLiteral, TileLoadExpr, TileOrigin,
+    TileProgramOp, TileQuantizedLoadExpr, TileReduceOp, TileRef, TileStmt,
     TileStoreStmt, TileUnaryOp, TileVec4LoadExpr, WorkgroupAxis, WorkgroupOffset, F32, U32,
 };
 use crate::quantized::{GgmlQuantFormat, QuantizedMatrix};
@@ -52,7 +52,7 @@ macro_rules! quantized_vec_dot_entrypoint {
         ) -> Tile<BLOCK> {
             assert!($(N == $n)||+, $msg);
             Tile {
-                expr: TileExpr::QuantizedVecDot {
+                expr: Expr::QuantizedVecDot {
                     kind: QuantizedVecDotKind::$kind,
                     a: a.into_iter().map(|value| Box::new(value.expr)).collect(),
                     src: matrix.clone(),
@@ -81,31 +81,31 @@ pub struct TileBlock<'a, const BLOCK: usize> {
 impl<const BLOCK: usize> TileBlock<'_, BLOCK> {
     pub fn program_id(&self, axis: WorkgroupAxis) -> ScalarIndex {
         ScalarIndex {
-            expr: TileIndexExpr::ProgramId(axis),
+            expr: Box::new(Expr::Builtin(Builtin::ProgramId(axis))),
         }
     }
 
     pub fn subgroup_id(&self) -> ScalarIndex {
         ScalarIndex {
-            expr: TileIndexExpr::SubgroupId,
+            expr: Box::new(Expr::Builtin(Builtin::SubgroupId)),
         }
     }
 
     pub fn subgroup_lane(&self) -> ScalarIndex {
         ScalarIndex {
-            expr: TileIndexExpr::SubgroupLane,
+            expr: Box::new(Expr::Builtin(Builtin::SubgroupLane)),
         }
     }
 
     pub fn subgroup_size(&self) -> ScalarIndex {
         ScalarIndex {
-            expr: TileIndexExpr::SubgroupSize,
+            expr: Box::new(Expr::Builtin(Builtin::SubgroupSize)),
         }
     }
 
     pub fn num_subgroups(&self) -> ScalarIndex {
         ScalarIndex {
-            expr: TileIndexExpr::NumSubgroups,
+            expr: Box::new(Expr::Builtin(Builtin::NumSubgroups)),
         }
     }
 
@@ -115,7 +115,7 @@ impl<const BLOCK: usize> TileBlock<'_, BLOCK> {
 
     pub fn arange(&self) -> Range<BLOCK> {
         Range {
-            expr: TileIndexExpr::Lane,
+            expr: Box::new(Expr::Builtin(Builtin::Lane)),
         }
     }
 
@@ -135,13 +135,13 @@ impl<const BLOCK: usize> TileBlock<'_, BLOCK> {
 
     pub fn loop_index(&self) -> ScalarIndex {
         ScalarIndex {
-            expr: TileIndexExpr::LoopIndex,
+            expr: Box::new(Expr::Builtin(Builtin::LoopIndex)),
         }
     }
 
     pub fn load<T>(&self, address: Address<T, BLOCK>, mask: Mask<BLOCK>, fill: f32) -> Tile<BLOCK> {
         Tile {
-            expr: TileExpr::Load(TileLoadExpr {
+            expr: Expr::Load(TileLoadExpr {
                 src: address.view,
                 row: address.row,
                 col: address.col,
@@ -158,7 +158,7 @@ impl<const BLOCK: usize> TileBlock<'_, BLOCK> {
         fill: TileLiteral,
     ) -> Tile<BLOCK> {
         Tile {
-            expr: TileExpr::LoadLinear(TileLinearLoadExpr {
+            expr: Expr::LoadLinear(TileLinearLoadExpr {
                 src: address.view,
                 index: address.index,
                 mask: mask.expr,
@@ -174,7 +174,7 @@ impl<const BLOCK: usize> TileBlock<'_, BLOCK> {
         fill: f32,
     ) -> Tile<BLOCK> {
         Tile {
-            expr: TileExpr::LoadVec4(TileVec4LoadExpr {
+            expr: Expr::LoadVec4(TileVec4LoadExpr {
                 src: address.view,
                 index: address.index,
                 mask: mask.expr,
@@ -190,7 +190,7 @@ impl<const BLOCK: usize> TileBlock<'_, BLOCK> {
         fill: TileLiteral,
     ) -> Tile<BLOCK> {
         Tile {
-            expr: TileExpr::Load(TileLoadExpr {
+            expr: Expr::Load(TileLoadExpr {
                 src: address.view,
                 row: address.row,
                 col: address.col,
@@ -209,7 +209,7 @@ impl<const BLOCK: usize> TileBlock<'_, BLOCK> {
         fill: f32,
     ) -> Tile<BLOCK> {
         Tile {
-            expr: TileExpr::QuantizedLoad(TileQuantizedLoadExpr {
+            expr: Expr::QuantizedLoad(TileQuantizedLoadExpr {
                 src: matrix.clone(),
                 row: row.into_index(),
                 col: col.into_index(),
@@ -243,7 +243,7 @@ impl<const BLOCK: usize> TileBlock<'_, BLOCK> {
         let mask_expr = mask.expr;
         let fill_bits = F32Bits::new(fill);
         std::array::from_fn(|lane| Tile {
-            expr: TileExpr::QuantizedBlockLane {
+            expr: Expr::QuantizedBlockLane {
                 id,
                 src: matrix.clone(),
                 k_base: k_base.clone(),
@@ -277,7 +277,7 @@ impl<const BLOCK: usize> TileBlock<'_, BLOCK> {
     /// deep nested binary expression.
     pub fn sum(&self, values: impl IntoIterator<Item = Tile<BLOCK>>) -> Tile<BLOCK> {
         Tile {
-            expr: TileExpr::Sum {
+            expr: Expr::Sum {
                 values: values
                     .into_iter()
                     .map(|value| Box::new(value.expr))
@@ -308,7 +308,7 @@ impl<const BLOCK: usize> TileBlock<'_, BLOCK> {
         F: FnOnce(&mut Self, ScalarIndex, [Tile<BLOCK>; N]) -> [Tile<BLOCK>; N],
     {
         assert!(N > 0, "fold must have at least one accumulator");
-        let initial_exprs: Vec<TileExpr> = initial.into_iter().map(|t| t.expr).collect();
+        let initial_exprs: Vec<Expr> = initial.into_iter().map(|t| t.expr).collect();
 
         // Allocate the iterator-value local and one local per accumulator.
         let iter_var_local = self.program.alloc_local::<U32>();
@@ -319,10 +319,10 @@ impl<const BLOCK: usize> TileBlock<'_, BLOCK> {
         // statements emitted by the closure.
         self.stmt_stack.push(Vec::new());
         let iter_element = ScalarIndex {
-            expr: TileIndexExpr::Value(Box::new(TileExpr::LoadLocal(iter_var_local))),
+            expr: Box::new(Expr::LoadLocal(iter_var_local)),
         };
         let acc_tiles: [Tile<BLOCK>; N] = std::array::from_fn(|i| Tile {
-            expr: TileExpr::LoadLocal(acc_locals[i]),
+            expr: Expr::LoadLocal(acc_locals[i]),
         });
         let new_state = body(self, iter_element, acc_tiles);
         let body_stmts = self.stmt_stack.pop().expect("fold body frame missing");
@@ -346,7 +346,7 @@ impl<const BLOCK: usize> TileBlock<'_, BLOCK> {
         });
 
         std::array::from_fn(|i| Tile {
-            expr: TileExpr::LoadLocal(acc_locals[i]),
+            expr: Expr::LoadLocal(acc_locals[i]),
         })
     }
 
@@ -379,7 +379,7 @@ impl<const BLOCK: usize> TileBlock<'_, BLOCK> {
             self.program.alloc_local_element(initials[i].element())
         });
         // Allocate the iter_var local (unused by the body — bodies use
-        // `TileIndexExpr::LoopIndex` to address the iteration index — but
+        // `Builtin::LoopIndex` to address the iteration index — but
         // `TileStmt::Fold` requires a name).
         let iter_var_local = self.program.alloc_local::<U32>();
 
@@ -398,10 +398,10 @@ impl<const BLOCK: usize> TileBlock<'_, BLOCK> {
             .map(|(i, lane_value)| crate::ir::FoldAccumulator {
                 name: acc_locals[i].id,
                 element: acc_locals[i].element,
-                init: TileExpr::Literal(initials[i]),
-                update: TileExpr::Binary {
+                init: Expr::Literal(initials[i]),
+                update: Expr::Binary {
                     op: binary_op,
-                    left: Box::new(TileExpr::LoadLocal(acc_locals[i])),
+                    left: Box::new(Expr::LoadLocal(acc_locals[i])),
                     right: Box::new(lane_value.expr),
                 },
             })
@@ -409,7 +409,7 @@ impl<const BLOCK: usize> TileBlock<'_, BLOCK> {
 
         self.push_stmt(TileStmt::Fold {
             iter: crate::ir::TileIter::Range {
-                count: Box::new(TileExpr::Literal(TileLiteral::U32(iterations))),
+                count: Box::new(Expr::Literal(TileLiteral::U32(iterations))),
             },
             iter_var: iter_var_local.id,
             body: body_stmts,
@@ -417,7 +417,7 @@ impl<const BLOCK: usize> TileBlock<'_, BLOCK> {
         });
 
         std::array::from_fn(|i| Tile {
-            expr: TileExpr::LoadLocal(acc_locals[i]),
+            expr: Expr::LoadLocal(acc_locals[i]),
         })
     }
 
@@ -432,7 +432,7 @@ impl<const BLOCK: usize> TileBlock<'_, BLOCK> {
 
     pub fn vec4_dot(&self, left: Tile<BLOCK>, right: Tile<BLOCK>) -> Tile<BLOCK> {
         Tile {
-            expr: TileExpr::Vec4Dot {
+            expr: Expr::Vec4Dot {
                 left: Box::new(left.expr),
                 right: Box::new(right.expr),
             },
@@ -441,7 +441,7 @@ impl<const BLOCK: usize> TileBlock<'_, BLOCK> {
 
     pub fn vec4_splat(&self, value: Tile<BLOCK>) -> Tile<BLOCK> {
         Tile {
-            expr: TileExpr::Vec4Splat {
+            expr: Expr::Vec4Splat {
                 value: Box::new(value.expr),
             },
         }
@@ -451,7 +451,7 @@ impl<const BLOCK: usize> TileBlock<'_, BLOCK> {
     pub fn compose4(&self, values: [Tile<BLOCK>; 4]) -> Tile<BLOCK> {
         let [v0, v1, v2, v3] = values;
         Tile {
-            expr: TileExpr::Compose4 {
+            expr: Expr::Compose4 {
                 values: [
                     Box::new(v0.expr),
                     Box::new(v1.expr),
@@ -473,7 +473,7 @@ impl<const BLOCK: usize> TileBlock<'_, BLOCK> {
     ) -> Tile<BLOCK> {
         let a = a.map(|value| Box::new(value.expr));
         Tile {
-            expr: TileExpr::QuantizedQ8_0Dot8 {
+            expr: Expr::QuantizedQ8_0Dot8 {
                 a,
                 src: matrix.clone(),
                 k_base: k_base.into_index(),
@@ -513,7 +513,7 @@ impl<const BLOCK: usize> TileBlock<'_, BLOCK> {
         fill: f32,
     ) -> Tile<BLOCK> {
         Tile {
-            expr: TileExpr::QuantizedQ4KGgmlDot {
+            expr: Expr::QuantizedQ4KGgmlDot {
                 a_low: a_low
                     .into_iter()
                     .map(|value| Box::new(value.expr))
@@ -547,7 +547,7 @@ impl<const BLOCK: usize> TileBlock<'_, BLOCK> {
         fill: f32,
     ) -> Tile<BLOCK> {
         Tile {
-            expr: TileExpr::QuantizedQ6KGgmlDot {
+            expr: Expr::QuantizedQ6KGgmlDot {
                 a: a.into_iter().map(|value| Box::new(value.expr)).collect(),
                 src: matrix.clone(),
                 block: block.into_index(),
@@ -562,13 +562,13 @@ impl<const BLOCK: usize> TileBlock<'_, BLOCK> {
 
     pub fn full(&self, value: f32) -> Tile<BLOCK> {
         Tile {
-            expr: TileExpr::Full(F32Bits::new(value)),
+            expr: Expr::Full(F32Bits::new(value)),
         }
     }
 
     pub fn literal(&self, value: TileLiteral) -> Tile<BLOCK> {
         Tile {
-            expr: TileExpr::Literal(value),
+            expr: Expr::Literal(value),
         }
     }
 
@@ -586,13 +586,13 @@ impl<const BLOCK: usize> TileBlock<'_, BLOCK> {
 
     pub fn index(&self, value: impl IntoIndex<BLOCK>) -> Tile<BLOCK> {
         Tile {
-            expr: TileExpr::Index(value.into_index()),
+            expr: *value.into_index(),
         }
     }
 
     pub fn exp(&self, value: Tile<BLOCK>) -> Tile<BLOCK> {
         Tile {
-            expr: TileExpr::Unary {
+            expr: Expr::Unary {
                 op: TileUnaryOp::Exp,
                 value: Box::new(value.expr),
             },
@@ -632,7 +632,7 @@ impl<const BLOCK: usize> TileBlock<'_, BLOCK> {
     ) -> Tile<BLOCK> {
         assert!(iterations > 0, "loop fold iterations must be non-zero");
         Tile {
-            expr: TileExpr::LoopFold {
+            expr: Expr::LoopFold {
                 op,
                 iterations,
                 value: Box::new(value.expr),
@@ -643,7 +643,7 @@ impl<const BLOCK: usize> TileBlock<'_, BLOCK> {
 
     fn subgroup_reduce(&self, op: TileReduceOp, value: Tile<BLOCK>) -> Tile<BLOCK> {
         Tile {
-            expr: TileExpr::SubgroupReduce {
+            expr: Expr::SubgroupReduce {
                 op,
                 value: Box::new(value.expr),
             },
@@ -664,7 +664,7 @@ impl<const BLOCK: usize> TileBlock<'_, BLOCK> {
             TileLevel::Workgroup,
         );
         Tile {
-            expr: TileExpr::GroupReduce {
+            expr: Expr::GroupReduce {
                 op,
                 value: Box::new(value.expr),
                 scratch,
@@ -679,7 +679,7 @@ impl<const BLOCK: usize> TileBlock<'_, BLOCK> {
             TileLevel::Workgroup,
         );
         Scalar {
-            expr: TileScalarExpr::Reduce {
+            expr: Expr::Reduce {
                 op,
                 value: Box::new(value.expr),
                 scratch,
@@ -694,7 +694,7 @@ impl<const BLOCK: usize> TileBlock<'_, BLOCK> {
             TileLevel::Workgroup,
         );
         Scalar {
-            expr: TileScalarExpr::LoopReduce {
+            expr: Expr::LoopReduce {
                 op,
                 iterations,
                 value: Box::new(value.expr),
@@ -766,7 +766,7 @@ impl<const BLOCK: usize> TileBlock<'_, BLOCK> {
 
     pub fn load_local<T>(&self, local: &Local<T, BLOCK>) -> Tile<BLOCK> {
         Tile {
-            expr: TileExpr::LoadLocal(local.local),
+            expr: Expr::LoadLocal(local.local),
         }
     }
 
@@ -785,7 +785,7 @@ impl<const BLOCK: usize> TileBlock<'_, BLOCK> {
 
     pub fn load_workgroup(&self, tile: TileRef, index: impl IntoIndex<BLOCK>) -> Tile<BLOCK> {
         Tile {
-            expr: TileExpr::LoadWorkgroup {
+            expr: Expr::LoadWorkgroup {
                 src: tile,
                 index: index.into_index(),
             },

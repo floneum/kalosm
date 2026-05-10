@@ -63,233 +63,39 @@ impl<'a> Lowerer<'a> {
         }
     }
 
-    pub(in crate::lower) fn lower_tile_index_exprs<const N: usize>(
-        &self,
-        expressions: &mut Arena<Expression>,
-        scratch: ScratchLocals,
-        body: &mut Block,
-        exprs: [&TileIndexExpr; N],
-        spill_depth: usize,
-    ) -> Result<[Handle<Expression>; N], LowerError> {
-        let mut out = [None; N];
-        for (slot, expr) in out.iter_mut().zip(exprs.iter()) {
-            *slot =
-                Some(self.lower_tile_index_expr(expressions, scratch, body, expr, spill_depth)?);
-        }
-        Ok(out.map(Option::unwrap))
-    }
-
-    pub(in crate::lower) fn lower_tile_index_expr(
-        &self,
-        expressions: &mut Arena<Expression>,
-        scratch: ScratchLocals,
-        body: &mut Block,
-        expr: &TileIndexExpr,
-        spill_depth: usize,
-    ) -> Result<Handle<Expression>, LowerError> {
-        Ok(match expr {
-            TileIndexExpr::Lane => expressions.append(
-                Expression::FunctionArgument(LOCAL_INVOCATION_INDEX_ARG),
-                Span::default(),
-            ),
-            TileIndexExpr::LoopIndex => {
-                let pointer = expressions.append(
-                    Expression::LocalVariable(self.current_loop_index()),
-                    Span::default(),
-                );
-                let value = expressions.append(Expression::Load { pointer }, Span::default());
-                body.push(
-                    Statement::Emit(Self::single_expression_range(expressions, value)),
-                    Span::default(),
-                );
-                value
-            }
-            TileIndexExpr::ProgramId(axis) => {
-                let wg = expressions.append(
-                    Expression::FunctionArgument(WORKGROUP_ID_ARG),
-                    Span::default(),
-                );
-                self.emit_tile_expr(
-                    expressions,
-                    body,
-                    Expression::AccessIndex {
-                        base: wg,
-                        index: axis.index(),
-                    },
-                )
-            }
-            TileIndexExpr::SubgroupId => expressions.append(
-                Expression::FunctionArgument(SUBGROUP_ID_ARG),
-                Span::default(),
-            ),
-            TileIndexExpr::SubgroupLane => expressions.append(
-                Expression::FunctionArgument(SUBGROUP_INVOCATION_ID_ARG),
-                Span::default(),
-            ),
-            TileIndexExpr::SubgroupSize => expressions.append(
-                Expression::FunctionArgument(SUBGROUP_SIZE_ARG),
-                Span::default(),
-            ),
-            TileIndexExpr::NumSubgroups => expressions.append(
-                Expression::FunctionArgument(NUM_SUBGROUPS_ARG),
-                Span::default(),
-            ),
-            TileIndexExpr::Literal(value) => {
-                expressions.append(Expression::Literal(Literal::U32(*value)), Span::default())
-            }
-            TileIndexExpr::Add(left, right) => {
-                let left =
-                    self.lower_tile_index_expr(expressions, scratch, body, left, spill_depth)?;
-                let right =
-                    self.lower_tile_index_expr(expressions, scratch, body, right, spill_depth)?;
-                self.emit_tile_expr(
-                    expressions,
-                    body,
-                    Expression::Binary {
-                        op: BinaryOperator::Add,
-                        left,
-                        right,
-                    },
-                )
-            }
-            TileIndexExpr::Mul(value, literal) => {
-                let value =
-                    self.lower_tile_index_expr(expressions, scratch, body, value, spill_depth)?;
-                let rhs = expressions
-                    .append(Expression::Literal(Literal::U32(*literal)), Span::default());
-                self.emit_tile_expr(
-                    expressions,
-                    body,
-                    Expression::Binary {
-                        op: BinaryOperator::Multiply,
-                        left: value,
-                        right: rhs,
-                    },
-                )
-            }
-            TileIndexExpr::Div(value, literal) => {
-                let value =
-                    self.lower_tile_index_expr(expressions, scratch, body, value, spill_depth)?;
-                let rhs = expressions
-                    .append(Expression::Literal(Literal::U32(*literal)), Span::default());
-                self.emit_tile_expr(
-                    expressions,
-                    body,
-                    Expression::Binary {
-                        op: BinaryOperator::Divide,
-                        left: value,
-                        right: rhs,
-                    },
-                )
-            }
-            TileIndexExpr::Mod(value, literal) => {
-                let value =
-                    self.lower_tile_index_expr(expressions, scratch, body, value, spill_depth)?;
-                let rhs = expressions
-                    .append(Expression::Literal(Literal::U32(*literal)), Span::default());
-                self.emit_tile_expr(
-                    expressions,
-                    body,
-                    Expression::Binary {
-                        op: BinaryOperator::Modulo,
-                        left: value,
-                        right: rhs,
-                    },
-                )
-            }
-            TileIndexExpr::Value(value) => {
-                self.lower_tile_expr_lane(expressions, scratch, body, value, spill_depth)?
-            }
-        })
-    }
-
-    pub(in crate::lower) fn lower_tile_mask_expr(
-        &self,
-        expressions: &mut Arena<Expression>,
-        scratch: ScratchLocals,
-        body: &mut Block,
-        expr: &TileMaskExpr,
-        spill_depth: usize,
-    ) -> Result<Handle<Expression>, LowerError> {
-        Ok(match expr {
-            TileMaskExpr::True => {
-                expressions.append(Expression::Literal(Literal::Bool(true)), Span::default())
-            }
-            TileMaskExpr::Compare { op, left, right } => {
-                let left =
-                    self.lower_tile_index_expr(expressions, scratch, body, left, spill_depth)?;
-                let right =
-                    self.lower_tile_index_expr(expressions, scratch, body, right, spill_depth)?;
-                let op = match op {
-                    TileCompareOp::Lt => BinaryOperator::Less,
-                    TileCompareOp::Le => BinaryOperator::LessEqual,
-                    TileCompareOp::Gt => BinaryOperator::Greater,
-                    TileCompareOp::Ge => BinaryOperator::GreaterEqual,
-                    TileCompareOp::Eq => BinaryOperator::Equal,
-                    TileCompareOp::Ne => BinaryOperator::NotEqual,
-                };
-                self.emit_tile_expr(expressions, body, Expression::Binary { op, left, right })
-            }
-            TileMaskExpr::And(left, right) => {
-                let left =
-                    self.lower_tile_mask_expr(expressions, scratch, body, left, spill_depth)?;
-                let right =
-                    self.lower_tile_mask_expr(expressions, scratch, body, right, spill_depth)?;
-                self.emit_tile_expr(
-                    expressions,
-                    body,
-                    Expression::Binary {
-                        op: BinaryOperator::LogicalAnd,
-                        left,
-                        right,
-                    },
-                )
-            }
-        })
-    }
-
-    pub(in crate::lower) fn tile_expr_element(&self, expr: &TileExpr) -> Result<ElementType, LowerError> {
+    pub(in crate::lower) fn tile_expr_element(&self, expr: &Expr) -> Result<ElementType, LowerError> {
         match expr {
-            TileExpr::Load(load) => Ok(load.src.buffer.element),
-            TileExpr::LoadLinear(load) => Ok(load.src.buffer.element),
-            TileExpr::LoadVec4(_) => Ok(ElementType::F32Vec4),
-            TileExpr::LoadWorkgroup { src, .. } => Ok(src.element),
-            TileExpr::LoadLocal(local) => Ok(local.element),
-            TileExpr::QuantizedLoad(_) | TileExpr::Full(_) => Ok(ElementType::F32),
-            TileExpr::Literal(value) => Ok(value.element()),
-            TileExpr::Index(_) => Ok(ElementType::U32),
-            TileExpr::Builtin(_) => Ok(ElementType::U32),
-            TileExpr::Scalar(expr) => self.tile_scalar_expr_element(expr),
-            TileExpr::Unary { value, .. } | TileExpr::Binary { left: value, .. } => {
+            Expr::Load(load) => Ok(load.src.buffer.element),
+            Expr::LoadLinear(load) => Ok(load.src.buffer.element),
+            Expr::LoadVec4(_) => Ok(ElementType::F32Vec4),
+            Expr::LoadWorkgroup { src, .. } => Ok(src.element),
+            Expr::LoadLocal(local) => Ok(local.element),
+            Expr::QuantizedLoad(_) | Expr::Full(_) => Ok(ElementType::F32),
+            Expr::Literal(value) => Ok(value.element()),
+            Expr::Builtin(_) => Ok(ElementType::U32),
+            Expr::Reduce { scratch, .. } => Ok(scratch.element),
+            Expr::LoopReduce { scratch, .. } => Ok(scratch.element),
+            Expr::Unary { value, .. } | Expr::Binary { left: value, .. } => {
                 self.tile_expr_element(value)
             }
-            TileExpr::Sum { values } => values
+            Expr::Sum { values } => values
                 .first()
                 .map(|value| self.tile_expr_element(value))
                 .unwrap_or(Ok(ElementType::F32)),
-            TileExpr::Cast { to, .. } => Ok(*to),
-            TileExpr::Bitcast { to, .. } => Ok(*to),
-            TileExpr::Select { accept, .. } => self.tile_expr_element(accept),
-            TileExpr::Compare { output, .. } => Ok(*output),
-            TileExpr::LoopFold { initial, .. } => Ok(initial.element()),
-            TileExpr::GroupReduce { scratch, .. } => Ok(scratch.element),
-            TileExpr::SubgroupReduce { value, .. } => self.tile_expr_element(value),
-            TileExpr::QuantizedBlockLane { .. } => Ok(ElementType::F32),
-            TileExpr::Vec4Dot { .. }
-            | TileExpr::QuantizedQ8_0Dot8 { .. }
-            | TileExpr::QuantizedVecDot { .. }
-            | TileExpr::QuantizedQ4KGgmlDot { .. }
-            | TileExpr::QuantizedQ6KGgmlDot { .. } => Ok(ElementType::F32),
-            TileExpr::Vec4Splat { .. } | TileExpr::Compose4 { .. } => Ok(ElementType::F32Vec4),
-        }
-    }
-
-    pub(in crate::lower) fn tile_scalar_expr_element(&self, expr: &TileScalarExpr) -> Result<ElementType, LowerError> {
-        match expr {
-            TileScalarExpr::Reduce { scratch, .. } | TileScalarExpr::LoopReduce { scratch, .. } => {
-                Ok(scratch.element)
-            }
-            TileScalarExpr::Literal(value) => Ok(value.element()),
+            Expr::Cast { to, .. } => Ok(*to),
+            Expr::Bitcast { to, .. } => Ok(*to),
+            Expr::Select { accept, .. } => self.tile_expr_element(accept),
+            Expr::Compare { output, .. } => Ok(*output),
+            Expr::LoopFold { initial, .. } => Ok(initial.element()),
+            Expr::GroupReduce { scratch, .. } => Ok(scratch.element),
+            Expr::SubgroupReduce { value, .. } => self.tile_expr_element(value),
+            Expr::QuantizedBlockLane { .. } => Ok(ElementType::F32),
+            Expr::Vec4Dot { .. }
+            | Expr::QuantizedQ8_0Dot8 { .. }
+            | Expr::QuantizedVecDot { .. }
+            | Expr::QuantizedQ4KGgmlDot { .. }
+            | Expr::QuantizedQ6KGgmlDot { .. } => Ok(ElementType::F32),
+            Expr::Vec4Splat { .. } | Expr::Compose4 { .. } => Ok(ElementType::F32Vec4),
         }
     }
 

@@ -77,7 +77,7 @@ impl<'a> Lowerer<'a> {
                     });
                 }
                 let value = self.lower_tile_expr_lane(expressions, scratch, body, value, 0)?;
-                let index = self.lower_tile_index_expr(expressions, scratch, body, index, 0)?;
+                let index = self.lower_tile_expr_lane(expressions, scratch, body, index, 0)?;
                 let (pointer, emits) = self.tile_dynamic_pointer(expressions, *dst, index)?;
                 Self::push_emits(body, emits);
                 body.push(Statement::Store { pointer, value }, Span::default());
@@ -232,14 +232,14 @@ impl<'a> Lowerer<'a> {
         body: &mut Block,
         id: CoopFragmentId,
         tile: TileRef,
-        row: &TileIndexExpr,
-        col: &TileIndexExpr,
+        row: &Expr,
+        col: &Expr,
         role: CooperativeRole,
     ) -> Result<(), LowerError> {
         let layout = self.tile_layout(tile)?;
         let stride_u = Self::row_major_tile_stride(layout)?;
-        let row_h = self.lower_tile_index_expr(expressions, scratch, body, row, 0)?;
-        let col_h = self.lower_tile_index_expr(expressions, scratch, body, col, 0)?;
+        let row_h = self.lower_tile_expr_lane(expressions, scratch, body, row, 0)?;
+        let col_h = self.lower_tile_expr_lane(expressions, scratch, body, col, 0)?;
         let mut emits = Vec::new();
         let index = self.tile_matrix_index_inline(expressions, &mut emits, row_h, col_h, stride_u);
         let (ptr, ptr_emits) = self.tile_dynamic_pointer(expressions, tile, index)?;
@@ -416,8 +416,8 @@ impl<'a> Lowerer<'a> {
         body: &mut Block,
         dst: TileRef,
         src: &StorageView,
-        row_offset: &TileIndexExpr,
-        col_offset: &TileIndexExpr,
+        row_offset: &Expr,
+        col_offset: &Expr,
     ) -> Result<(), LowerError> {
         let layout = self.tile_layout(dst)?;
         let [rows, cols] = Self::tile_shape(layout)?;
@@ -431,8 +431,8 @@ impl<'a> Lowerer<'a> {
             Expression::FunctionArgument(LOCAL_INVOCATION_INDEX_ARG),
             Span::default(),
         );
-        let row_base = self.lower_tile_index_expr(expressions, scratch, body, row_offset, 0)?;
-        let col_base = self.lower_tile_index_expr(expressions, scratch, body, col_offset, 0)?;
+        let row_base = self.lower_tile_expr_lane(expressions, scratch, body, row_offset, 0)?;
+        let col_base = self.lower_tile_expr_lane(expressions, scratch, body, col_offset, 0)?;
 
         self.lower_copy_passes(expressions, body, local, total, |expressions, flat| {
             let mut emits = Vec::new();
@@ -497,8 +497,8 @@ impl<'a> Lowerer<'a> {
         body: &mut Block,
         dst: TileRef,
         src: &QuantizedMatrix,
-        row_offset: &TileIndexExpr,
-        col_offset: &TileIndexExpr,
+        row_offset: &Expr,
+        col_offset: &Expr,
     ) -> Result<(), LowerError> {
         let layout = self.tile_layout(dst)?;
         let [rows, cols] = Self::tile_shape(layout)?;
@@ -515,8 +515,8 @@ impl<'a> Lowerer<'a> {
             Expression::FunctionArgument(LOCAL_INVOCATION_INDEX_ARG),
             Span::default(),
         );
-        let row_base = self.lower_tile_index_expr(expressions, scratch, body, row_offset, 0)?;
-        let col_base = self.lower_tile_index_expr(expressions, scratch, body, col_offset, 0)?;
+        let row_base = self.lower_tile_expr_lane(expressions, scratch, body, row_offset, 0)?;
+        let col_base = self.lower_tile_expr_lane(expressions, scratch, body, col_offset, 0)?;
 
         if n > 0 && rows.is_multiple_of(n) {
             let groups_per_col = rows / n;
@@ -643,15 +643,15 @@ impl<'a> Lowerer<'a> {
         body: &mut Block,
         acc: LocalRef,
         dst: &StorageView,
-        row: &TileIndexExpr,
-        col: &TileIndexExpr,
+        row: &Expr,
+        col: &Expr,
     ) -> Result<(), LowerError> {
         // Flush any pending acc SSA so the Load below sees the current value.
         self.flush_coop_acc_cache(expressions, body);
         let acc_local = self.private_local(acc)?;
         let (stride_u, row_major) = Self::cooperative_store_layout(&dst.layout)?;
-        let row_h = self.lower_tile_index_expr(expressions, scratch, body, row, 0)?;
-        let col_h = self.lower_tile_index_expr(expressions, scratch, body, col, 0)?;
+        let row_h = self.lower_tile_expr_lane(expressions, scratch, body, row, 0)?;
+        let col_h = self.lower_tile_expr_lane(expressions, scratch, body, col, 0)?;
         let (storage_index, storage_emits) =
             self.storage_index_from_coords(expressions, dst, &[row_h, col_h])?;
         Self::push_emits(body, storage_emits);

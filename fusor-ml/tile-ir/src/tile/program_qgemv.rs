@@ -7,9 +7,9 @@ use crate::ir::{
     CoopOperandRole, DynamicOffset, F32Bits, F32Vec4, Im2ColNhwcMap, KernelIr, Layout, LocalDecl,
     LocalRef, MemoryLevel, Numeric, Op,
     QuantizedVecDotKind, Shape, StorageIndexMap, StorageView, TileBinaryOp, TileCompareOp,
-    TileDecl, TileExpr, TileIndexExpr, TileIndexedStoreStmt, TileLevel, TileLinearLoadExpr,
-    TileLiteral, TileLoadExpr, TileMaskExpr, TileOrigin, TileProgramOp, TileQuantizedLoadExpr,
-    TileReduceOp, TileRef, TileScalarExpr, TileStmt, TileStoreStmt, TileUnaryOp, TileVec4LoadExpr,
+    TileDecl, Expr, TileIndexedStoreStmt, TileLevel, TileLinearLoadExpr,
+    TileLiteral, TileLoadExpr, TileOrigin, TileProgramOp, TileQuantizedLoadExpr,
+    TileReduceOp, TileRef, TileStmt, TileStoreStmt, TileUnaryOp, TileVec4LoadExpr,
     WorkgroupAxis, WorkgroupOffset, F32, U32,
 };
 use crate::dispatch::{

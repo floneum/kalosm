@@ -45,10 +45,10 @@ impl<'a> Lowerer<'a> {
     ) -> Result<(), LowerError> {
         self.clear_store_caches(true);
         let value = self.lower_tile_expr_lane(expressions, scratch, body, &store.value, 0)?;
-        let mask = self.lower_tile_mask_expr(expressions, scratch, body, &store.mask, 0)?;
+        let mask = self.lower_tile_expr_lane(expressions, scratch, body, &store.mask, 0)?;
         let mut accept = Block::new();
-        let row = self.lower_tile_index_expr(expressions, scratch, &mut accept, &store.row, 0)?;
-        let col = self.lower_tile_index_expr(expressions, scratch, &mut accept, &store.col, 0)?;
+        let row = self.lower_tile_expr_lane(expressions, scratch, &mut accept, &store.row, 0)?;
+        let col = self.lower_tile_expr_lane(expressions, scratch, &mut accept, &store.col, 0)?;
         let (dst_index, dst_index_emits) =
             self.storage_index_from_coords(expressions, &store.dst, &[row, col])?;
         let (dst_ptr, dst_ptr_emits) =
@@ -65,15 +65,15 @@ impl<'a> Lowerer<'a> {
         scratch: ScratchLocals,
         body: &mut Block,
         dst: &StorageView,
-        index: &TileIndexExpr,
-        value: &TileExpr,
-        mask: &TileMaskExpr,
+        index: &Expr,
+        value: &Expr,
+        mask: &Expr,
     ) -> Result<(), LowerError> {
         self.clear_store_caches(false);
         let value = self.lower_tile_expr_lane(expressions, scratch, body, value, 0)?;
-        let mask = self.lower_tile_mask_expr(expressions, scratch, body, mask, 0)?;
+        let mask = self.lower_tile_expr_lane(expressions, scratch, body, mask, 0)?;
         let mut accept = Block::new();
-        let index = self.lower_tile_index_expr(expressions, scratch, &mut accept, index, 0)?;
+        let index = self.lower_tile_expr_lane(expressions, scratch, &mut accept, index, 0)?;
         let (dst_ptr, dst_ptr_emits) = self.storage_dynamic_pointer(expressions, dst, index)?;
         Self::push_emits(&mut accept, dst_ptr_emits);
         Self::push_masked_store(body, mask, accept, dst_ptr, value);

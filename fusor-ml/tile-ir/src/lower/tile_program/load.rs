@@ -10,11 +10,11 @@ impl<'a> Lowerer<'a> {
         spill_depth: usize,
     ) -> Result<Handle<Expression>, LowerError> {
         let element = load.src.buffer.element;
-        if matches!(load.mask, TileMaskExpr::True) {
+        if load.mask.is_constant_true() {
             let row =
-                self.lower_tile_index_expr(expressions, scratch, body, &load.row, spill_depth)?;
+                self.lower_tile_expr_lane(expressions, scratch, body, &load.row, spill_depth)?;
             let col =
-                self.lower_tile_index_expr(expressions, scratch, body, &load.col, spill_depth)?;
+                self.lower_tile_expr_lane(expressions, scratch, body, &load.col, spill_depth)?;
             let (src_index, src_index_emits) =
                 self.storage_index_from_coords(expressions, &load.src, &[row, col])?;
             let (src_ptr, src_ptr_emits) =
@@ -36,14 +36,14 @@ impl<'a> Lowerer<'a> {
             element,
             fill,
             |expressions, accept| {
-                let row = self.lower_tile_index_expr(
+                let row = self.lower_tile_expr_lane(
                     expressions,
                     scratch,
                     accept,
                     &load.row,
                     spill_depth,
                 )?;
-                let col = self.lower_tile_index_expr(
+                let col = self.lower_tile_expr_lane(
                     expressions,
                     scratch,
                     accept,
@@ -122,15 +122,15 @@ impl<'a> Lowerer<'a> {
         scratch: ScratchLocals,
         body: &mut Block,
         src: &StorageView,
-        index: &TileIndexExpr,
-        mask: &TileMaskExpr,
+        index: &Expr,
+        mask: &Expr,
         spill_depth: usize,
         element: ElementType,
         fill: impl FnOnce(&Self, &mut Arena<Expression>, &mut Block) -> Handle<Expression>,
     ) -> Result<Handle<Expression>, LowerError> {
-        if matches!(mask, TileMaskExpr::True) {
+        if mask.is_constant_true() {
             let index =
-                self.lower_tile_index_expr(expressions, scratch, body, index, spill_depth)?;
+                self.lower_tile_expr_lane(expressions, scratch, body, index, spill_depth)?;
             let (src_ptr, src_ptr_emits) = self.storage_dynamic_pointer(expressions, src, index)?;
             Self::push_emits(body, src_ptr_emits);
             return Ok(Self::emit_load(expressions, body, src_ptr));
@@ -147,7 +147,7 @@ impl<'a> Lowerer<'a> {
             fill,
             |expressions, accept| {
                 let index =
-                    self.lower_tile_index_expr(expressions, scratch, accept, index, spill_depth)?;
+                    self.lower_tile_expr_lane(expressions, scratch, accept, index, spill_depth)?;
                 let (src_ptr, src_ptr_emits) =
                     self.storage_dynamic_pointer(expressions, src, index)?;
                 Self::push_emits(accept, src_ptr_emits);
@@ -172,14 +172,14 @@ impl<'a> Lowerer<'a> {
             spill_depth,
             load.fill,
             |expressions, block| {
-                let row = self.lower_tile_index_expr(
+                let row = self.lower_tile_expr_lane(
                     expressions,
                     scratch,
                     block,
                     &load.row,
                     spill_depth,
                 )?;
-                let col = self.lower_tile_index_expr(
+                let col = self.lower_tile_expr_lane(
                     expressions,
                     scratch,
                     block,
