@@ -246,8 +246,10 @@ fn coop_qmatmul_q8_0_lowers_through_subgroup_dsl() {
         "coop qmatmul should express A and B fragment roles on LoadCoop statements"
     );
     assert!(
-        !ir.coop_accs().is_empty(),
-        "coop qmatmul must declare cooperative-matrix accumulators"
+        ir.locals()
+            .iter()
+            .any(|local| matches!(local.element, ElementType::CoopMatrixF32 { .. })),
+        "coop qmatmul must declare cooperative-matrix accumulator locals"
     );
     ir.lower_to_naga()
         .unwrap_or_else(|error| panic!("coop qmatmul lowering failed: {error}"));

@@ -3,14 +3,14 @@ use std::marker::PhantomData;
 use std::ops::{Add, BitAnd, BitXor, Div, Mul, Rem, Sub};
 
 use crate::ir::{
-    BlockDequantId, BufferAccess, BufferDecl, BufferRef, CoopAccDecl, CoopAccId, CoopFragmentId,
-    CoopOperandRole, DynamicOffset, F32Bits, F32Vec4, Im2ColNhwcMap, KernelIr, Layout, LocalDecl,
-    LocalRef, LoopFoldGroup, LoopFoldGroupId, MemoryLevel, Numeric, Op, PinId,
-    QuantizedVecDotKind, Shape, StorageIndexMap, StorageView, TileBinaryOp, TileCompareOp,
-    TileDecl, TileExpr, TileIndexExpr, TileIndexedStoreStmt, TileLevel, TileLinearLoadExpr,
-    TileLiteral, TileLoadExpr, TileMaskExpr, TileOrigin, TileProgramOp, TileQuantizedLoadExpr,
-    TileReduceOp, TileRef, TileScalarExpr, TileStmt, TileStoreStmt, TileUnaryOp, TileVec4LoadExpr,
-    WorkgroupAxis, WorkgroupOffset, F32, U32,
+    BlockDequantId, BufferAccess, BufferDecl, BufferRef, CoopFragmentId,
+    CoopOperandRole, DynamicOffset, ElementType, F32Bits, F32Vec4, Im2ColNhwcMap,
+    KernelIr, Layout, LocalDecl, LocalRef, MemoryLevel, Numeric,
+    Op, QuantizedVecDotKind, Shape, StorageIndexMap, StorageView,
+    TileBinaryOp, TileCompareOp, TileDecl, TileExpr, TileIndexExpr, TileIndexedStoreStmt,
+    TileLevel, TileLinearLoadExpr, TileLiteral, TileLoadExpr, TileMaskExpr, TileOrigin,
+    TileProgramOp, TileQuantizedLoadExpr, TileReduceOp, TileRef, TileScalarExpr, TileStmt,
+    TileStoreStmt, TileUnaryOp, TileVec4LoadExpr, WorkgroupAxis, WorkgroupOffset, F32, U32,
 };
 use crate::quantized::{GgmlQuantFormat, QuantizedMatrix};
 use super::*;
@@ -257,12 +257,18 @@ impl<const BLOCK: usize> TileBlock<'_, BLOCK> {
     }
 
     /// Bind a subexpression to a private local so subsequent references reuse
-    /// the value without re-emitting its computation. Returns N references that
-    /// all evaluate to the same value within the same scope.
-    pub fn pin(&mut self, value: Tile<BLOCK>) -> Pinned<BLOCK> {
-        let id = self.program.next_pin_id(value.expr);
-        Pinned {
-            id,
+    /// the value without re-emitting its computation. Pushes a `TileStmt::Let`
+    /// at the call site; subsequent `Bound::get()` calls return tiles that
+    /// lower to a load of the bound local.
+    pub fn bind(&mut self, value: Tile<BLOCK>) -> Bound<BLOCK> {
+        let element = self.program.ir.tile_expr_element(&value.expr);
+        let local = self.program.alloc_local_element(element);
+        self.push_stmt(TileStmt::Let {
+            name: local,
+            value: value.expr,
+        });
+        Bound {
+            local,
             _block: PhantomData,
         }
     }
@@ -280,11 +286,81 @@ impl<const BLOCK: usize> TileBlock<'_, BLOCK> {
         }
     }
 
+    /// Iterator-based, state-carrying fold. Iterates over `iter`, threading
+    /// `N` `F32` accumulators through the body. Each iteration the body sees
+    /// the current iter element and the current accumulator values; it
+    /// returns the new accumulator values, which become the values for the
+    /// next iteration. After the loop, returns the N final accumulator
+    /// values.
+    ///
+    /// Implementation: allocates a U32 local for the iterator value plus one
+    /// F32 local per accumulator, pushes a `TileStmt::Fold` carrying body
+    /// statements emitted by the closure plus per-accumulator `init`/`update`
+    /// expressions, and returns Tiles that read the accumulator locals
+    /// post-loop. Currently the accumulator element type is fixed to `F32`.
+    pub fn fold<const N: usize, F>(
+        &mut self,
+        iter: super::FoldIter,
+        initial: [Tile<BLOCK>; N],
+        body: F,
+    ) -> [Tile<BLOCK>; N]
+    where
+        F: FnOnce(&mut Self, ScalarIndex, [Tile<BLOCK>; N]) -> [Tile<BLOCK>; N],
+    {
+        assert!(N > 0, "fold must have at least one accumulator");
+        let initial_exprs: Vec<TileExpr> = initial.into_iter().map(|t| t.expr).collect();
+
+        // Allocate the iterator-value local and one local per accumulator.
+        let iter_var_local = self.program.alloc_local::<U32>();
+        let acc_locals: [LocalRef; N] =
+            std::array::from_fn(|_| self.program.alloc_local::<F32>());
+
+        // Build the body in a fresh stmt frame so we can capture exactly the
+        // statements emitted by the closure.
+        self.stmt_stack.push(Vec::new());
+        let iter_element = ScalarIndex {
+            expr: TileIndexExpr::Value(Box::new(TileExpr::LoadLocal(iter_var_local))),
+        };
+        let acc_tiles: [Tile<BLOCK>; N] = std::array::from_fn(|i| Tile {
+            expr: TileExpr::LoadLocal(acc_locals[i]),
+        });
+        let new_state = body(self, iter_element, acc_tiles);
+        let body_stmts = self.stmt_stack.pop().expect("fold body frame missing");
+
+        let accumulators: Vec<crate::ir::FoldAccumulator> = new_state
+            .into_iter()
+            .enumerate()
+            .map(|(i, new)| crate::ir::FoldAccumulator {
+                name: acc_locals[i].id,
+                element: acc_locals[i].element,
+                init: initial_exprs[i].clone(),
+                update: new.expr,
+            })
+            .collect();
+
+        self.push_stmt(TileStmt::Fold {
+            iter: iter.iter,
+            iter_var: iter_var_local.id,
+            body: body_stmts,
+            accumulators,
+        });
+
+        std::array::from_fn(|i| Tile {
+            expr: TileExpr::LoadLocal(acc_locals[i]),
+        })
+    }
+
     /// Run one K-loop with N parallel reductions. The body closure runs once
     /// at IR-build time and produces N tile expressions that all share the
     /// same loop scope; the lowerer materializes a single Naga loop with N
     /// accumulator locals so common subexpressions across the N outputs are
     /// emitted only once per iteration (when bound via `pin`).
+    ///
+    /// Implementation: desugars into a `TileStmt::Fold` over a counted range
+    /// with one `FoldAccumulator` per lane. Each accumulator's `update` is
+    /// `binary(reduce_op_to_binary(op), LoadLocal(acc), body[lane])`. After
+    /// the statement the per-accumulator locals hold the final reduced
+    /// values.
     pub fn loop_fold_n<const N: usize, F>(
         &mut self,
         op: TileReduceOp,
@@ -297,18 +373,51 @@ impl<const BLOCK: usize> TileBlock<'_, BLOCK> {
     {
         assert!(iterations > 0, "loop_fold_n iterations must be non-zero");
         assert!(N > 0, "loop_fold_n must have at least one accumulator");
-        let bodies = body(self);
-        let group = self.program.next_loop_fold_group_id(LoopFoldGroup {
-            iterations,
-            op,
-            initials: initials.to_vec(),
-            bodies: bodies.into_iter().map(|t| t.expr).collect(),
+
+        // Allocate one local per accumulator, typed by the initial literal.
+        let acc_locals: [LocalRef; N] = std::array::from_fn(|i| {
+            self.program.alloc_local_element(initials[i].element())
         });
-        std::array::from_fn(|lane| Tile {
-            expr: TileExpr::LoopFoldGroupOutput {
-                group,
-                lane: lane as u32,
+        // Allocate the iter_var local (unused by the body — bodies use
+        // `TileIndexExpr::LoopIndex` to address the iteration index — but
+        // `TileStmt::Fold` requires a name).
+        let iter_var_local = self.program.alloc_local::<U32>();
+
+        // Build the body in a fresh stmt frame so we can capture exactly the
+        // statements emitted by the closure (e.g. `let` bindings of shared
+        // subexpressions). The body closure references the lane accumulators
+        // and yields the per-iteration values to combine into them.
+        self.stmt_stack.push(Vec::new());
+        let bodies = body(self);
+        let body_stmts = self.stmt_stack.pop().expect("loop_fold_n body frame missing");
+
+        let binary_op = reduce_op_to_binary(op);
+        let accumulators: Vec<crate::ir::FoldAccumulator> = bodies
+            .into_iter()
+            .enumerate()
+            .map(|(i, lane_value)| crate::ir::FoldAccumulator {
+                name: acc_locals[i].id,
+                element: acc_locals[i].element,
+                init: TileExpr::Literal(initials[i]),
+                update: TileExpr::Binary {
+                    op: binary_op,
+                    left: Box::new(TileExpr::LoadLocal(acc_locals[i])),
+                    right: Box::new(lane_value.expr),
+                },
+            })
+            .collect();
+
+        self.push_stmt(TileStmt::Fold {
+            iter: crate::ir::TileIter::Range {
+                count: Box::new(TileExpr::Literal(TileLiteral::U32(iterations))),
             },
+            iter_var: iter_var_local.id,
+            body: body_stmts,
+            accumulators,
+        });
+
+        std::array::from_fn(|i| Tile {
+            expr: TileExpr::LoadLocal(acc_locals[i]),
         })
     }
 
@@ -316,24 +425,9 @@ impl<const BLOCK: usize> TileBlock<'_, BLOCK> {
     /// `Math::Dot` over `vec4<f32>` operands. Lowers to the same instruction
     /// sequence the qgemv accelerator emits.
     pub fn dot4(&self, a: [Tile<BLOCK>; 4], b: [Tile<BLOCK>; 4]) -> Tile<BLOCK> {
-        let [a0, a1, a2, a3] = a;
-        let [b0, b1, b2, b3] = b;
-        Tile {
-            expr: TileExpr::Dot4 {
-                a: [
-                    Box::new(a0.expr),
-                    Box::new(a1.expr),
-                    Box::new(a2.expr),
-                    Box::new(a3.expr),
-                ],
-                b: [
-                    Box::new(b0.expr),
-                    Box::new(b1.expr),
-                    Box::new(b2.expr),
-                    Box::new(b3.expr),
-                ],
-            },
-        }
+        let left = self.compose4(a);
+        let right = self.compose4(b);
+        self.vec4_dot(left, right)
     }
 
     pub fn vec4_dot(&self, left: Tile<BLOCK>, right: Tile<BLOCK>) -> Tile<BLOCK> {
@@ -349,6 +443,21 @@ impl<const BLOCK: usize> TileBlock<'_, BLOCK> {
         Tile {
             expr: TileExpr::Vec4Splat {
                 value: Box::new(value.expr),
+            },
+        }
+    }
+
+    /// Pack four scalars into a `vec4<f32>`.
+    pub fn compose4(&self, values: [Tile<BLOCK>; 4]) -> Tile<BLOCK> {
+        let [v0, v1, v2, v3] = values;
+        Tile {
+            expr: TileExpr::Compose4 {
+                values: [
+                    Box::new(v0.expr),
+                    Box::new(v1.expr),
+                    Box::new(v2.expr),
+                    Box::new(v3.expr),
+                ],
             },
         }
     }
@@ -598,17 +707,14 @@ impl<const BLOCK: usize> TileBlock<'_, BLOCK> {
     /// handle is consumed by `zero_coop_acc`, `mma_from_tiles`, and
     /// `coop_store`.
     pub fn alloc_coop_acc(&mut self) -> CoopAcc {
-        let id = CoopAccId(self.program.ir.coop_accs.len() as u32);
-        self.program.ir.coop_accs.push(CoopAccDecl {
-            id,
-            rows: 8,
-            cols: 8,
-        });
-        CoopAcc { id }
+        let local = self
+            .program
+            .alloc_local_element(ElementType::CoopMatrixF32 { rows: 8, cols: 8 });
+        CoopAcc { local }
     }
 
     pub fn zero_coop_acc(&mut self, acc: &CoopAcc) {
-        self.push_stmt(TileStmt::ZeroCoopAcc { id: acc.id });
+        self.push_stmt(TileStmt::ZeroCoopAcc { acc: acc.local });
     }
 
     /// Stage a workgroup-tile region of dense `src` into the workgroup-tile
@@ -671,9 +777,11 @@ impl<const BLOCK: usize> TileBlock<'_, BLOCK> {
         });
     }
 
-    pub fn emit(&mut self, value: Tile<BLOCK>) {
-        self.push_stmt(TileStmt::Emit { value: value.expr });
-    }
+    /// No-op kept for source compatibility. With `pin` now eagerly pushing a
+    /// `TileStmt::Let` at the bind site, callers no longer need to force the
+    /// pin into a particular scope by re-emitting it. Remove all callers in a
+    /// follow-up cleanup.
+    pub fn emit(&mut self, _value: Tile<BLOCK>) {}
 
     pub fn load_workgroup(&self, tile: TileRef, index: impl IntoIndex<BLOCK>) -> Tile<BLOCK> {
         Tile {
@@ -808,7 +916,7 @@ impl<const BLOCK: usize> TileBlock<'_, BLOCK> {
             "coop_mma B operand must be a B-role fragment"
         );
         self.push_stmt(TileStmt::Mma {
-            acc: acc.id,
+            acc: acc.local,
             a: a.id,
             b: b.id,
         });
@@ -823,7 +931,7 @@ impl<const BLOCK: usize> TileBlock<'_, BLOCK> {
         col: impl IntoIndex<BLOCK>,
     ) {
         self.push_stmt(TileStmt::StoreCoopAcc {
-            acc: acc.id,
+            acc: acc.local,
             dst: dst.view.clone(),
             row: row.into_index(),
             col: col.into_index(),
@@ -906,5 +1014,17 @@ impl<const BLOCK: usize> TileBlock<'_, BLOCK> {
             value: value.expr,
             mask: mask.expr,
         }));
+    }
+}
+
+/// Map a `TileReduceOp` to the binary operator that combines the in-flight
+/// accumulator with the per-iteration value when desugaring loop folds into
+/// `TileStmt::Fold` accumulators.
+fn reduce_op_to_binary(op: TileReduceOp) -> TileBinaryOp {
+    match op {
+        TileReduceOp::Sum => TileBinaryOp::Add,
+        TileReduceOp::Product => TileBinaryOp::Mul,
+        TileReduceOp::Max => TileBinaryOp::Max,
+        TileReduceOp::Min => TileBinaryOp::Min,
     }
 }

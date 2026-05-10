@@ -3,9 +3,9 @@ use std::marker::PhantomData;
 use std::ops::{Add, BitAnd, BitXor, Div, Mul, Rem, Sub};
 
 use crate::ir::{
-    BlockDequantId, BufferAccess, BufferDecl, BufferRef, CoopAccDecl, CoopAccId, CoopFragmentId,
+    BlockDequantId, BufferAccess, BufferDecl, BufferRef, CoopFragmentId,
     CoopOperandRole, DynamicOffset, F32Bits, F32Vec4, Im2ColNhwcMap, KernelIr, Layout, LocalDecl,
-    LocalRef, LoopFoldGroup, LoopFoldGroupId, MemoryLevel, Numeric, Op, PinId,
+    LocalRef, MemoryLevel, Numeric, Op,
     QuantizedVecDotKind, Shape, StorageIndexMap, StorageView, TileBinaryOp, TileCompareOp,
     TileDecl, TileExpr, TileIndexExpr, TileIndexedStoreStmt, TileLevel, TileLinearLoadExpr,
     TileLiteral, TileLoadExpr, TileMaskExpr, TileOrigin, TileProgramOp, TileQuantizedLoadExpr,
@@ -18,7 +18,7 @@ use super::*;
 /// Handle to an 8x8 cooperative-matrix accumulator local.
 #[derive(Copy, Clone)]
 pub struct CoopAcc {
-    pub(super) id: CoopAccId,
+    pub(super) local: LocalRef,
 }
 
 /// Handle to a cooperatively-loaded 8x8 fragment SSA value. Reusable across
@@ -29,18 +29,37 @@ pub struct CoopFragment {
     pub(super) role: CoopOperandRole,
 }
 
-/// Handle to a pinned subexpression. Each call to `get()` returns a fresh
-/// `Tile` reference; lowering deduplicates them onto a single private local.
+/// Handle to a bound subexpression. Each call to `get()` returns a fresh
+/// `Tile` that lowers to a load from the private local that backs the binding.
+/// Allocating the local and emitting the binding store happens at the call
+/// site of `bind`.
 #[derive(Clone, Copy)]
-pub struct Pinned<const BLOCK: usize> {
-    pub(super) id: PinId,
+pub struct Bound<const BLOCK: usize> {
+    pub(super) local: LocalRef,
     pub(super) _block: PhantomData<[(); BLOCK]>,
 }
 
-impl<const BLOCK: usize> Pinned<BLOCK> {
+/// Iterator description passed to `TileBlock::fold`. Currently only counted
+/// ranges are supported; future variants (chunks, strided, zip) compose into
+/// the same `Fold` shape.
+#[derive(Clone)]
+pub struct FoldIter {
+    pub(crate) iter: crate::ir::TileIter,
+}
+
+/// Construct a counted `0..count` iterator for `TileBlock::fold`.
+pub fn range<const BLOCK: usize>(count: Tile<BLOCK>) -> FoldIter {
+    FoldIter {
+        iter: crate::ir::TileIter::Range {
+            count: Box::new(count.expr),
+        },
+    }
+}
+
+impl<const BLOCK: usize> Bound<BLOCK> {
     pub fn get(&self) -> Tile<BLOCK> {
         Tile {
-            expr: TileExpr::PinnedRef { id: self.id },
+            expr: TileExpr::LoadLocal(self.local),
         }
     }
 }

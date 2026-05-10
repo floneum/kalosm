@@ -74,6 +74,79 @@ impl<'a> Lowerer<'a> {
         ]))
     }
 
+    /// Same shape as `emit_counted_loop` but takes a dynamic `iterations`
+    /// expression. Compares `loop_index >= iterations_expr` at the top of
+    /// each iteration and breaks when true.
+    pub(super) fn emit_dynamic_counted_loop<T>(
+        &self,
+        expressions: &mut Arena<Expression>,
+        scratch: ScratchLocals,
+        body: &mut Block,
+        iterations: Handle<Expression>,
+        build_body: impl FnOnce(
+            &mut Arena<Expression>,
+            &mut Block,
+            Handle<Expression>,
+        ) -> Result<T, LowerError>,
+    ) -> Result<T, LowerError> {
+        let loop_ptr = expressions.append(
+            Expression::LocalVariable(scratch.loop_index),
+            Span::default(),
+        );
+        let zero = expressions.append(Expression::Literal(Literal::U32(0)), Span::default());
+        body.push(
+            Statement::Store {
+                pointer: loop_ptr,
+                value: zero,
+            },
+            Span::default(),
+        );
+
+        let mut loop_body = Block::new();
+        let loop_index =
+            expressions.append(Expression::Load { pointer: loop_ptr }, Span::default());
+        loop_body.push(
+            Statement::Emit(Self::single_expression_range(expressions, loop_index)),
+            Span::default(),
+        );
+        let done = expressions.append(
+            Expression::Binary {
+                op: BinaryOperator::GreaterEqual,
+                left: loop_index,
+                right: iterations,
+            },
+            Span::default(),
+        );
+        loop_body.push(
+            Statement::Emit(Self::single_expression_range(expressions, done)),
+            Span::default(),
+        );
+        loop_body.push(
+            Statement::If {
+                condition: done,
+                accept: Block::from_vec(vec![Statement::Break]),
+                reject: Block::new(),
+            },
+            Span::default(),
+        );
+
+        let result = build_body(expressions, &mut loop_body, loop_index)?;
+
+        loop_body.push(
+            self.increment_u32_local(expressions, scratch.loop_index, 1),
+            Span::default(),
+        );
+        body.push(
+            Statement::Loop {
+                body: loop_body,
+                continuing: Block::new(),
+                break_if: None,
+            },
+            Span::default(),
+        );
+        Ok(result)
+    }
+
     pub(super) fn emit_counted_loop<T>(
         &self,
         expressions: &mut Arena<Expression>,
@@ -142,7 +215,6 @@ impl<'a> Lowerer<'a> {
     pub(super) fn snapshot_tile_loop_caches(&self) -> TileLoopCacheSnapshot {
         let snapshot = TileLoopCacheSnapshot {
             block_dequant: self.block_dequant_cache.borrow_mut().drain().collect(),
-            pin: self.pin_cache.borrow_mut().drain().collect(),
         };
         self.q8_activation_pack_cache.borrow_mut().clear();
         snapshot
@@ -153,13 +225,6 @@ impl<'a> Lowerer<'a> {
             let mut cache = self.block_dequant_cache.borrow_mut();
             cache.clear();
             for (key, value) in snapshot.block_dequant {
-                cache.insert(key, value);
-            }
-        }
-        {
-            let mut cache = self.pin_cache.borrow_mut();
-            cache.clear();
-            for (key, value) in snapshot.pin {
                 cache.insert(key, value);
             }
         }
@@ -203,6 +268,102 @@ impl<'a> Lowerer<'a> {
     pub(super) fn current_loop_index(&self) -> Handle<LocalVariable> {
         self.loop_index_local
             .expect("scratch locals must be created before lowering storage offsets")
+    }
+
+    /// Lower a `TileStmt::Fold`. Initializes each accumulator local from its
+    /// `init` expression in the surrounding scope, then emits a counted loop
+    /// over `iter`. Inside the loop body, the iterator value is stored into
+    /// `iter_var`'s local, the body statements run, and each accumulator's
+    /// `update` expression is evaluated and stored back into its local. After
+    /// the loop, the locals hold the final values and are read by subsequent
+    /// `LoadLocal`s in the surrounding scope.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn lower_tile_fold_stmt(
+        &self,
+        expressions: &mut Arena<Expression>,
+        scratch: ScratchLocals,
+        body: &mut Block,
+        iter: &TileIter,
+        iter_var: LocalId,
+        fold_body: &[TileStmt],
+        accumulators: &[crate::ir::FoldAccumulator],
+    ) -> Result<(), LowerError> {
+        // 1. Initialize each accumulator local from its init expression.
+        for acc in accumulators {
+            let init_value =
+                self.lower_tile_expr_lane(expressions, scratch, body, &acc.init, 0)?;
+            let local = self.private_local(LocalRef::new(acc.name, acc.element))?;
+            let pointer = expressions.append(Expression::LocalVariable(local), Span::default());
+            body.push(
+                Statement::Store {
+                    pointer,
+                    value: init_value,
+                },
+                Span::default(),
+            );
+        }
+
+        // 2. Lower the iterator's count expression in the surrounding scope.
+        let count_handle = match iter {
+            TileIter::Range { count } => {
+                self.lower_tile_expr_lane(expressions, scratch, body, count, 0)?
+            }
+        };
+
+        // 3. Emit the counted loop. Inside the body, store the loop index into
+        //    iter_var's local so subsequent LoadLocal(iter_var) reads see it.
+        let iter_var_local =
+            self.private_local(LocalRef::new(iter_var, ElementType::U32))?;
+        self.emit_dynamic_counted_loop(
+            expressions,
+            scratch,
+            body,
+            count_handle,
+            |expressions, loop_body, loop_index| {
+                // Store the loop index into iter_var's local.
+                let iter_ptr = expressions
+                    .append(Expression::LocalVariable(iter_var_local), Span::default());
+                loop_body.push(
+                    Statement::Store {
+                        pointer: iter_ptr,
+                        value: loop_index,
+                    },
+                    Span::default(),
+                );
+
+                // Lower body statements.
+                let saved = self.snapshot_tile_loop_caches();
+                for stmt in fold_body {
+                    self.lower_tile_stmt(expressions, scratch, loop_body, stmt)?;
+                }
+
+                // Lower each accumulator's update expression and store it back
+                // into the accumulator's local.
+                for acc in accumulators {
+                    let value = self.lower_tile_expr_lane(
+                        expressions,
+                        scratch,
+                        loop_body,
+                        &acc.update,
+                        0,
+                    )?;
+                    let acc_local =
+                        self.private_local(LocalRef::new(acc.name, acc.element))?;
+                    let pointer = expressions
+                        .append(Expression::LocalVariable(acc_local), Span::default());
+                    loop_body.push(
+                        Statement::Store {
+                            pointer,
+                            value,
+                        },
+                        Span::default(),
+                    );
+                }
+
+                self.restore_tile_loop_caches(saved);
+                Ok(())
+            },
+        )
     }
 
     pub(super) fn bin_lit_u32(

@@ -3,19 +3,43 @@ use std::marker::PhantomData;
 use std::ops::{Add, BitAnd, BitXor, Div, Mul, Rem, Sub};
 
 use crate::ir::{
-    BlockDequantId, BufferAccess, BufferDecl, BufferRef, CoopAccDecl, CoopAccId, CoopFragmentId,
+    BlockDequantId, BufferAccess, BufferDecl, BufferRef, CoopFragmentId,
     CoopOperandRole, DynamicOffset, F32Bits, F32Vec4, Im2ColNhwcMap, KernelIr, Layout, LocalDecl,
-    LocalRef, LoopFoldGroup, LoopFoldGroupId, MemoryLevel, Numeric, Op, PinId,
+    LocalRef, MemoryLevel, Numeric, Op,
     QuantizedVecDotKind, Shape, StorageIndexMap, StorageView, TileBinaryOp, TileCompareOp,
     TileDecl, TileExpr, TileIndexExpr, TileIndexedStoreStmt, TileLevel, TileLinearLoadExpr,
     TileLiteral, TileLoadExpr, TileMaskExpr, TileOrigin, TileProgramOp, TileQuantizedLoadExpr,
     TileReduceOp, TileRef, TileScalarExpr, TileStmt, TileStoreStmt, TileUnaryOp, TileVec4LoadExpr,
     WorkgroupAxis, WorkgroupOffset, F32, U32,
 };
+use crate::dispatch::{qmatmul_path, QmatmulPath};
 use crate::quantized::{GgmlQuantFormat, QuantizedMatrix};
 use super::*;
 use super::types::{matrix_shape, cooperative_store_layout_supported};
 use super::grid::{qgemv_grid, store_qgemv_sums, q4k_ggml_activations, dot4_sum};
+
+/// Monomorphization dispatcher for `qmatmul_perf`. Stays as a macro so the
+/// const literals are visible at the call site for the compiler to
+/// instantiate. Policy lives in `crate::dispatch::qmatmul_path`.
+macro_rules! dispatch_qmatmul {
+    ($program:expr, $path:expr, $a:expr, $b:expr, $y:expr, $fallthrough:block) => {
+        match $path {
+            QmatmulPath::Coop64x64 => {
+                return $program.qmatmul_perf::<64, 64, 32, 2, 2, 128>($a, $b, $y);
+            }
+            QmatmulPath::Coop64x128 => {
+                return $program.qmatmul_perf::<64, 128, 32, 2, 4, 256>($a, $b, $y);
+            }
+            QmatmulPath::Coop128x64 => {
+                return $program.qmatmul_perf::<128, 64, 32, 4, 2, 256>($a, $b, $y);
+            }
+            QmatmulPath::Coop128x128 => {
+                return $program.qmatmul_perf::<128, 128, 32, 4, 4, 512>($a, $b, $y);
+            }
+            QmatmulPath::Scalar => $fallthrough,
+        }
+    };
+}
 
 macro_rules! storage_accessors {
     ($read:ident, $write:ident($($arg:ident: $ty:ty),*) => ($layout:expr, $offset:expr, $index_map:expr)) => {
@@ -72,6 +96,23 @@ macro_rules! erased_storage_accessors {
 
 pub struct Program {
     pub(crate) ir: KernelIr,
+    /// Builder-only counter for fresh `BufferId`s. Lives here (not on
+    /// `KernelIr`) because the finished IR is immutable data — the counter
+    /// is only needed during construction.
+    pub(crate) next_buffer: u32,
+    /// Builder-only counter for fresh `TileId`s. Same reasoning as
+    /// `next_buffer`.
+    pub(crate) next_tile: u32,
+    /// Builder-only counter for fresh `LocalId`s. Same reasoning as
+    /// `next_buffer`.
+    pub(crate) next_local: u32,
+    /// Builder-only counter for fresh `BlockDequantId`s. Lives here (not on
+    /// `KernelIr`) because these ids are SSA-scoped names allocated by the
+    /// builder and never observed off the finished IR.
+    pub(crate) next_block_dequant: u32,
+    /// Builder-only counter for fresh `CoopFragmentId`s. Same reasoning as
+    /// `next_block_dequant`.
+    pub(crate) next_coop_fragment: u32,
 }
 
 impl Program {
@@ -81,6 +122,11 @@ impl Program {
     pub fn new() -> Self {
         Self {
             ir: KernelIr::default(),
+            next_buffer: 0,
+            next_tile: 0,
+            next_local: 0,
+            next_block_dequant: 0,
+            next_coop_fragment: 0,
         }
     }
 
@@ -262,40 +308,19 @@ impl Program {
         );
         let [m, k] = matrix_shape(&a.view.layout);
 
-        // Cooperative-matrix perf-parity path. Mirrors the layout the deleted
-        // `lower_tile_qmatmul_coop` used for tile shapes that fit a 2D
-        // subgroup grid of 32x32 regions, each holding 4x4 = 16 fragments.
-        let coop_eligible = BK == 32
-            && BM % 32 == 0
-            && BN % 32 == 0
-            && m as usize % BM == 0
-            && b.cols as usize % BN == 0
-            && k as usize % BK == 0
-            && cooperative_store_layout_supported(&y.view.layout);
-        if coop_eligible {
-            // Choose an interleaved subgroup grid so each subgroup owns a
-            // 32x32 sub-tile. row_groups * col_groups == subgroups.
-            let row_groups = (BM as u32) / 32;
-            let col_groups = (BN as u32) / 32;
-            let subgroups = row_groups * col_groups;
-            if subgroups <= 16 {
-                match (BM, BN, subgroups) {
-                    (64, 64, 4) => {
-                        return self.qmatmul_perf::<64, 64, 32, 2, 2, 128>(a, b, y);
-                    }
-                    (64, 128, 8) => {
-                        return self.qmatmul_perf::<64, 128, 32, 2, 4, 256>(a, b, y);
-                    }
-                    (128, 64, 8) => {
-                        return self.qmatmul_perf::<128, 64, 32, 4, 2, 256>(a, b, y);
-                    }
-                    (128, 128, 16) => {
-                        return self.qmatmul_perf::<128, 128, 32, 4, 4, 512>(a, b, y);
-                    }
-                    _ => {}
-                }
-            }
-        }
+        // Cooperative-matrix perf-parity path. Policy in `crate::dispatch`
+        // selects which `qmatmul_perf::<...>` monomorphization to call (or
+        // `Scalar` to fall through to the lane-mapped tile body below).
+        let path = qmatmul_path(
+            BM,
+            BN,
+            BK,
+            m as usize % BM == 0,
+            b.cols as usize % BN == 0,
+            k as usize % BK == 0,
+            cooperative_store_layout_supported(&y.view.layout),
+        );
+        dispatch_qmatmul!(self, path, a, b, y, {});
 
         if BM * BN * BK != LANES || !BK.is_power_of_two() {
             self.qmatmul_tile::<8, 4, 8>(a, b, y);
@@ -633,8 +658,8 @@ impl Program {
         layout: Layout,
         access: BufferAccess,
     ) -> BufferRef {
-        let id = crate::BufferId(self.ir.next_buffer);
-        self.ir.next_buffer += 1;
+        let id = crate::BufferId(self.next_buffer);
+        self.next_buffer += 1;
         let buffer = BufferRef::new(id, element);
         self.ir.buffers.push(BufferDecl {
             id,
@@ -646,37 +671,26 @@ impl Program {
     }
 
     pub(super) fn next_block_dequant_id(&mut self) -> BlockDequantId {
-        let id = BlockDequantId(self.ir.next_block_dequant);
-        self.ir.next_block_dequant += 1;
-        id
-    }
-
-    pub(super) fn next_pin_id(&mut self, value: TileExpr) -> PinId {
-        let id = PinId(self.ir.pinned_values.len() as u32);
-        self.ir.pinned_values.push(value);
-        id
-    }
-
-    pub(super) fn next_loop_fold_group_id(&mut self, group: LoopFoldGroup) -> LoopFoldGroupId {
-        let id = LoopFoldGroupId(self.ir.loop_fold_groups.len() as u32);
-        self.ir.loop_fold_groups.push(group);
+        let id = BlockDequantId(self.next_block_dequant);
+        self.next_block_dequant += 1;
         id
     }
 
     pub(super) fn next_coop_fragment_id(&mut self) -> CoopFragmentId {
-        let id = CoopFragmentId(self.ir.next_coop_fragment);
-        self.ir.next_coop_fragment += 1;
+        let id = CoopFragmentId(self.next_coop_fragment);
+        self.next_coop_fragment += 1;
         id
     }
 
     pub(super) fn alloc_local<T: Numeric>(&mut self) -> LocalRef {
-        let id = crate::LocalId(self.ir.next_local);
-        self.ir.next_local += 1;
-        let local = LocalRef::new(id, T::ELEMENT);
-        self.ir.locals.push(LocalDecl {
-            id,
-            element: T::ELEMENT,
-        });
+        self.alloc_local_element(T::ELEMENT)
+    }
+
+    pub(super) fn alloc_local_element(&mut self, element: crate::ElementType) -> LocalRef {
+        let id = crate::LocalId(self.next_local);
+        self.next_local += 1;
+        let local = LocalRef::new(id, element);
+        self.ir.locals.push(LocalDecl { id, element });
         local
     }
 
@@ -697,8 +711,8 @@ impl Program {
     }
 
     pub(super) fn alloc_tile<T: Numeric>(&mut self, layout: Layout, level: TileLevel) -> TileRef {
-        let id = crate::TileId(self.ir.next_tile);
-        self.ir.next_tile += 1;
+        let id = crate::TileId(self.next_tile);
+        self.next_tile += 1;
         let tile = TileRef::new(id, T::ELEMENT);
         self.ir.tiles.push(TileDecl {
             id,

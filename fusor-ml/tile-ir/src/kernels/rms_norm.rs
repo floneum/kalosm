@@ -61,7 +61,7 @@ pub fn rms_norm_vec4<B>(
             let scale = (mean
                 + Tile::<RMS_NORM_VEC4_BLOCK>::literal(TileLiteral::F32(F32Bits::new(eps))))
             .inverse_sqrt();
-            let scale = program.pin(scale);
+            let scale = program.bind(scale);
 
             for chunk in 0..chunks {
                 let col = lane.clone() + chunk * RMS_NORM_VEC4_BLOCK as u32;

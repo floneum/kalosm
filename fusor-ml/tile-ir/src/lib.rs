@@ -5,6 +5,7 @@
 //! quantized matmul, quantized GEMV, dequantization, reductions, and softmax
 //! are expressed by composing tile program expressions.
 
+mod dispatch;
 mod ir;
 pub mod kernel_builder;
 pub mod kernels;

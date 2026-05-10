@@ -13,6 +13,9 @@ impl<'a> Lowerer<'a> {
                 ElementType::U32 => Expression::Literal(Literal::U32(0)),
                 ElementType::F32Vec4 => panic!("vec4 reductions are not supported"),
                 ElementType::Bool => panic!("bool reductions are not supported"),
+                ElementType::CoopMatrixF32 { .. } => {
+                    panic!("cooperative-matrix reductions are not supported")
+                }
             },
             TileReduceOp::Min => match element {
                 ElementType::F32 => Expression::Literal(Literal::F32(f32::MAX)),
@@ -20,6 +23,9 @@ impl<'a> Lowerer<'a> {
                 ElementType::U32 => Expression::Literal(Literal::U32(u32::MAX)),
                 ElementType::F32Vec4 => panic!("vec4 reductions are not supported"),
                 ElementType::Bool => panic!("bool reductions are not supported"),
+                ElementType::CoopMatrixF32 { .. } => {
+                    panic!("cooperative-matrix reductions are not supported")
+                }
             },
         }
     }
@@ -252,6 +258,7 @@ impl<'a> Lowerer<'a> {
             TileExpr::QuantizedLoad(_) | TileExpr::Full(_) => Ok(ElementType::F32),
             TileExpr::Literal(value) => Ok(value.element()),
             TileExpr::Index(_) => Ok(ElementType::U32),
+            TileExpr::Builtin(_) => Ok(ElementType::U32),
             TileExpr::Scalar(expr) => self.tile_scalar_expr_element(expr),
             TileExpr::Unary { value, .. } | TileExpr::Binary { left: value, .. } => {
                 self.tile_expr_element(value)
@@ -268,30 +275,12 @@ impl<'a> Lowerer<'a> {
             TileExpr::GroupReduce { scratch, .. } => Ok(scratch.element),
             TileExpr::SubgroupReduce { value, .. } => self.tile_expr_element(value),
             TileExpr::QuantizedBlockLane { .. } => Ok(ElementType::F32),
-            TileExpr::Dot4 { .. }
-            | TileExpr::Vec4Dot { .. }
+            TileExpr::Vec4Dot { .. }
             | TileExpr::QuantizedQ8_0Dot8 { .. }
             | TileExpr::QuantizedVecDot { .. }
             | TileExpr::QuantizedQ4KGgmlDot { .. }
             | TileExpr::QuantizedQ6KGgmlDot { .. } => Ok(ElementType::F32),
-            TileExpr::Vec4Splat { .. } => Ok(ElementType::F32Vec4),
-            TileExpr::PinnedRef { id } => self
-                .ir
-                .pinned_values
-                .get(id.index())
-                .map(|value| self.tile_expr_element(value).unwrap_or(ElementType::F32))
-                .ok_or(LowerError::UnsupportedOperation("unknown pin id")),
-            TileExpr::LoopFoldGroupOutput { group, lane } => {
-                let g = self
-                    .ir
-                    .loop_fold_groups
-                    .get(group.index())
-                    .ok_or(LowerError::UnsupportedOperation("unknown fold group"))?;
-                Ok(g.initials
-                    .get(*lane as usize)
-                    .map(|init| init.element())
-                    .unwrap_or(ElementType::F32))
-            }
+            TileExpr::Vec4Splat { .. } | TileExpr::Compose4 { .. } => Ok(ElementType::F32Vec4),
         }
     }
 
@@ -311,6 +300,9 @@ impl<'a> Lowerer<'a> {
             ElementType::U32 => 2,
             ElementType::F32Vec4 => 3,
             ElementType::Bool => 4,
+            ElementType::CoopMatrixF32 { .. } => {
+                panic!("cooperative-matrix scratch is not supported")
+            }
         }
     }
 
@@ -332,6 +324,7 @@ impl<'a> Lowerer<'a> {
             ElementType::U32 => Expression::Literal(Literal::U32(0)),
             ElementType::F32Vec4 => panic!("vec4 literal requires composition"),
             ElementType::Bool => Expression::Literal(Literal::Bool(false)),
+            ElementType::CoopMatrixF32 { .. } => panic!("cooperative-matrix has no scalar literal"),
         }
     }
 
@@ -342,6 +335,7 @@ impl<'a> Lowerer<'a> {
             ElementType::U32 => Expression::Literal(Literal::U32(1)),
             ElementType::F32Vec4 => panic!("vec4 literal requires composition"),
             ElementType::Bool => Expression::Literal(Literal::Bool(true)),
+            ElementType::CoopMatrixF32 { .. } => panic!("cooperative-matrix has no scalar literal"),
         }
     }
 
@@ -355,6 +349,7 @@ impl<'a> Lowerer<'a> {
             ElementType::U32 => Scalar::U32,
             ElementType::F32Vec4 => Scalar::F32,
             ElementType::Bool => Scalar::BOOL,
+            ElementType::CoopMatrixF32 { .. } => Scalar::F32,
         }
     }
 

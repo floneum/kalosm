@@ -3,14 +3,19 @@ use std::marker::PhantomData;
 use std::ops::{Add, BitAnd, BitXor, Div, Mul, Rem, Sub};
 
 use crate::ir::{
-    BlockDequantId, BufferAccess, BufferDecl, BufferRef, CoopAccDecl, CoopAccId, CoopFragmentId,
+    BlockDequantId, BufferAccess, BufferDecl, BufferRef, CoopFragmentId,
     CoopOperandRole, DynamicOffset, F32Bits, F32Vec4, Im2ColNhwcMap, KernelIr, Layout, LocalDecl,
-    LocalRef, LoopFoldGroup, LoopFoldGroupId, MemoryLevel, Numeric, Op, PinId,
+    LocalRef, MemoryLevel, Numeric, Op,
     QuantizedVecDotKind, Shape, StorageIndexMap, StorageView, TileBinaryOp, TileCompareOp,
     TileDecl, TileExpr, TileIndexExpr, TileIndexedStoreStmt, TileLevel, TileLinearLoadExpr,
     TileLiteral, TileLoadExpr, TileMaskExpr, TileOrigin, TileProgramOp, TileQuantizedLoadExpr,
     TileReduceOp, TileRef, TileScalarExpr, TileStmt, TileStoreStmt, TileUnaryOp, TileVec4LoadExpr,
     WorkgroupAxis, WorkgroupOffset, F32, U32,
+};
+use crate::dispatch::{
+    q4k_default_large, q4k_default_mid, q4k_default_tall, q4k_large_override, q4k_mid_override,
+    q4k_tall_override, q6k_default_large, q6k_default_tall, q6k_large_override, q6k_tall_override,
+    QgemvShapeQ4K, QgemvShapeQ6K,
 };
 use crate::quantized::{GgmlQuantFormat, QuantizedMatrix};
 use super::*;
@@ -44,47 +49,89 @@ macro_rules! q4k_paired_entrypoints {
     };
 }
 
-macro_rules! qgemv_ggml_env {
-    ($program:expr, $method:ident, $var:literal, $a:expr, $b:expr, $y:expr, $workgroups_x:expr, [
-        $(($name:literal, $subgroups:literal, $cols:literal, $block:literal)),+ $(,)?
-    ]) => {
-        match std::env::var($var).as_deref() {
-            $(
-                Ok($name) => {
-                    return $program.$method::<$subgroups, $cols, $block>(
-                        $a,
-                        $b,
-                        $y,
-                        $workgroups_x,
-                    );
-                }
-            )+
-            _ => {}
+/// Monomorphization dispatcher for `qgemv_q4k_ggml`. Stays as a macro so the
+/// `<S, C, B>` const literals are visible at the call site for the compiler
+/// to instantiate. Policy (which `QgemvShapeQ4K` for which shape/env) lives
+/// in `crate::dispatch`.
+macro_rules! dispatch_qgemv_q4k {
+    ($program:expr, $shape:expr, $a:expr, $b:expr, $y:expr, $workgroups_x:expr) => {
+        match $shape {
+            QgemvShapeQ4K::Ggml1x4_32 => {
+                return $program.qgemv_q4k_ggml::<1, 4, 32>($a, $b, $y, $workgroups_x);
+            }
+            QgemvShapeQ4K::Ggml1x8_32 => {
+                return $program.qgemv_q4k_ggml::<1, 8, 32>($a, $b, $y, $workgroups_x);
+            }
+            QgemvShapeQ4K::Ggml2x2_64 => {
+                return $program.qgemv_q4k_ggml::<2, 2, 64>($a, $b, $y, $workgroups_x);
+            }
+            QgemvShapeQ4K::Ggml2x3_64 => {
+                return $program.qgemv_q4k_ggml::<2, 3, 64>($a, $b, $y, $workgroups_x);
+            }
+            QgemvShapeQ4K::Ggml2x4_64 => {
+                return $program.qgemv_q4k_ggml::<2, 4, 64>($a, $b, $y, $workgroups_x);
+            }
+            QgemvShapeQ4K::Ggml2x8_64 => {
+                return $program.qgemv_q4k_ggml::<2, 8, 64>($a, $b, $y, $workgroups_x);
+            }
+            QgemvShapeQ4K::Ggml4x1_128 => {
+                return $program.qgemv_q4k_ggml::<4, 1, 128>($a, $b, $y, $workgroups_x);
+            }
+            QgemvShapeQ4K::Ggml4x2_128 => {
+                return $program.qgemv_q4k_ggml::<4, 2, 128>($a, $b, $y, $workgroups_x);
+            }
+            QgemvShapeQ4K::Ggml4x3_128 => {
+                return $program.qgemv_q4k_ggml::<4, 3, 128>($a, $b, $y, $workgroups_x);
+            }
+            QgemvShapeQ4K::Ggml4x4_128 => {
+                return $program.qgemv_q4k_ggml::<4, 4, 128>($a, $b, $y, $workgroups_x);
+            }
+            QgemvShapeQ4K::Ggml4x8_128 => {
+                return $program.qgemv_q4k_ggml::<4, 8, 128>($a, $b, $y, $workgroups_x);
+            }
+            QgemvShapeQ4K::Ggml8x1_256 => {
+                return $program.qgemv_q4k_ggml::<8, 1, 256>($a, $b, $y, $workgroups_x);
+            }
+            QgemvShapeQ4K::Ggml8x2_256 => {
+                return $program.qgemv_q4k_ggml::<8, 2, 256>($a, $b, $y, $workgroups_x);
+            }
+            QgemvShapeQ4K::Ggml8x4_256 => {
+                return $program.qgemv_q4k_ggml::<8, 4, 256>($a, $b, $y, $workgroups_x);
+            }
         }
     };
 }
 
-macro_rules! qgemv_ggml_env_standard_tiles {
-    ($program:expr, $method:ident, $var:literal, $a:expr, $b:expr, $y:expr, $workgroups_x:expr) => {
-        qgemv_ggml_env!(
-            $program,
-            $method,
-            $var,
-            $a,
-            $b,
-            $y,
-            $workgroups_x,
-            [
-                ("ggml_2x2", 2, 2, 64),
-                ("ggml_2x4", 2, 4, 64),
-                ("ggml_2x8", 2, 8, 64),
-                ("ggml_4x2", 4, 2, 128),
-                ("ggml_4x4", 4, 4, 128),
-                ("ggml_4x8", 4, 8, 128),
-                ("ggml_8x2", 8, 2, 256),
-                ("ggml_8x4", 8, 4, 256),
-            ]
-        );
+/// Monomorphization dispatcher for `qgemv_q6k_ggml`. Same const-literal
+/// rationale as `dispatch_qgemv_q4k!`.
+macro_rules! dispatch_qgemv_q6k {
+    ($program:expr, $shape:expr, $a:expr, $b:expr, $y:expr, $workgroups_x:expr) => {
+        match $shape {
+            QgemvShapeQ6K::Ggml2x2_64 => {
+                return $program.qgemv_q6k_ggml::<2, 2, 64>($a, $b, $y, $workgroups_x);
+            }
+            QgemvShapeQ6K::Ggml2x4_64 => {
+                return $program.qgemv_q6k_ggml::<2, 4, 64>($a, $b, $y, $workgroups_x);
+            }
+            QgemvShapeQ6K::Ggml2x8_64 => {
+                return $program.qgemv_q6k_ggml::<2, 8, 64>($a, $b, $y, $workgroups_x);
+            }
+            QgemvShapeQ6K::Ggml4x2_128 => {
+                return $program.qgemv_q6k_ggml::<4, 2, 128>($a, $b, $y, $workgroups_x);
+            }
+            QgemvShapeQ6K::Ggml4x4_128 => {
+                return $program.qgemv_q6k_ggml::<4, 4, 128>($a, $b, $y, $workgroups_x);
+            }
+            QgemvShapeQ6K::Ggml4x8_128 => {
+                return $program.qgemv_q6k_ggml::<4, 8, 128>($a, $b, $y, $workgroups_x);
+            }
+            QgemvShapeQ6K::Ggml8x2_256 => {
+                return $program.qgemv_q6k_ggml::<8, 2, 256>($a, $b, $y, $workgroups_x);
+            }
+            QgemvShapeQ6K::Ggml8x4_256 => {
+                return $program.qgemv_q6k_ggml::<8, 4, 256>($a, $b, $y, $workgroups_x);
+            }
+        }
     };
 }
 
@@ -113,78 +160,19 @@ impl Program {
             }
             GgmlQuantFormat::Q4K => {
                 if b.rows <= 4096 && b.cols >= 4096 && b.cols < 8192 {
-                    qgemv_ggml_env!(
-                        self,
-                        qgemv_q4k_ggml,
-                        "FUSOR_Q4K_MID_TILE",
-                        a,
-                        b,
-                        y,
-                        workgroups_x,
-                        [
-                            ("ggml_2x2", 2, 2, 64),
-                            ("ggml_2x3", 2, 3, 64),
-                            ("ggml_2x4", 2, 4, 64),
-                            ("ggml_2x8", 2, 8, 64),
-                            ("ggml_4x2", 4, 2, 128),
-                            ("ggml_4x3", 4, 3, 128),
-                            ("ggml_4x4", 4, 4, 128),
-                            ("ggml_4x8", 4, 8, 128),
-                            ("ggml_8x2", 8, 2, 256),
-                            ("ggml_8x4", 8, 4, 256),
-                        ]
-                    );
-                    if b.cols == 5120 {
-                        return self.qgemv_q4k_ggml::<4, 3, 128>(a, b, y, workgroups_x);
-                    }
-                    if b.cols == 6144 {
-                        return self.qgemv_q4k_ggml::<8, 2, 256>(a, b, y, workgroups_x);
-                    }
-                    return self.qgemv_q4k_ggml::<2, 2, 64>(a, b, y, workgroups_x);
+                    let shape = q4k_mid_override(q4k_default_mid(b.rows, b.cols));
+                    dispatch_qgemv_q4k!(self, shape, a, b, y, workgroups_x);
                 }
                 if b.rows <= 4096 && b.cols <= 4096 {
                     return self.qgemv_perf::<8, 4, 16, 256>(a, b, y, workgroups_x);
                 }
                 if b.rows <= 4096 && b.cols >= 8192 {
-                    qgemv_ggml_env!(
-                        self,
-                        qgemv_q4k_ggml,
-                        "FUSOR_Q4K_LARGE_TILE",
-                        a,
-                        b,
-                        y,
-                        workgroups_x,
-                        [
-                            ("ggml_1x4", 1, 4, 32),
-                            ("ggml_1x8", 1, 8, 32),
-                            ("ggml_2x2", 2, 2, 64),
-                            ("ggml_2x4", 2, 4, 64),
-                            ("ggml_2x8", 2, 8, 64),
-                            ("ggml_4x1", 4, 1, 128),
-                            ("ggml_4x2", 4, 2, 128),
-                            ("ggml_4x4", 4, 4, 128),
-                            ("ggml_4x8", 4, 8, 128),
-                            ("ggml_8x1", 8, 1, 256),
-                            ("ggml_8x2", 8, 2, 256),
-                            ("ggml_8x4", 8, 4, 256),
-                        ]
-                    );
-                    if b.cols <= 16_384 {
-                        return self.qgemv_q4k_ggml::<4, 4, 128>(a, b, y, workgroups_x);
-                    }
-                    return self.qgemv_q4k_ggml::<2, 4, 64>(a, b, y, workgroups_x);
+                    let shape = q4k_large_override(q4k_default_large(b.rows, b.cols));
+                    dispatch_qgemv_q4k!(self, shape, a, b, y, workgroups_x);
                 }
                 if b.rows > 4096 && b.cols <= 4096 {
-                    qgemv_ggml_env_standard_tiles!(
-                        self,
-                        qgemv_q4k_ggml,
-                        "FUSOR_Q4K_TALL_TILE",
-                        a,
-                        b,
-                        y,
-                        workgroups_x
-                    );
-                    return self.qgemv_q4k_ggml::<4, 2, 128>(a, b, y, workgroups_x);
+                    let shape = q4k_tall_override(q4k_default_tall(b.rows, b.cols));
+                    dispatch_qgemv_q4k!(self, shape, a, b, y, workgroups_x);
                 }
                 if b.format
                     .qgemv_subgroups_per_workgroup_for_shape(b.rows, b.cols)
@@ -211,31 +199,12 @@ impl Program {
             }
             GgmlQuantFormat::Q6K => {
                 if b.rows <= 4096 && b.cols >= 8192 {
-                    qgemv_ggml_env_standard_tiles!(
-                        self,
-                        qgemv_q6k_ggml,
-                        "FUSOR_Q6K_LARGE_TILE",
-                        a,
-                        b,
-                        y,
-                        workgroups_x
-                    );
-                    if b.cols <= 16_384 {
-                        return self.qgemv_q6k_ggml::<2, 2, 64>(a, b, y, workgroups_x);
-                    }
-                    return self.qgemv_q6k_ggml::<2, 4, 64>(a, b, y, workgroups_x);
+                    let shape = q6k_large_override(q6k_default_large(b.rows, b.cols));
+                    dispatch_qgemv_q6k!(self, shape, a, b, y, workgroups_x);
                 }
                 if b.rows > 4096 && b.cols <= 4096 {
-                    qgemv_ggml_env_standard_tiles!(
-                        self,
-                        qgemv_q6k_ggml,
-                        "FUSOR_Q6K_TALL_TILE",
-                        a,
-                        b,
-                        y,
-                        workgroups_x
-                    );
-                    return self.qgemv_q6k_ggml::<2, 2, 64>(a, b, y, workgroups_x);
+                    let shape = q6k_tall_override(q6k_default_tall(b.rows, b.cols));
+                    dispatch_qgemv_q6k!(self, shape, a, b, y, workgroups_x);
                 }
                 if b.format
                     .qgemv_subgroups_per_workgroup_for_shape(b.rows, b.cols)
@@ -502,20 +471,20 @@ impl Program {
                         };
                         let vector_base = block.clone() * 256 + ip.clone() * 128 + l0.clone();
 
-                        let a_pins: [Pinned<BLOCK>; 16] = std::array::from_fn(|j| {
+                        let a_bound: [Bound<BLOCK>; 16] = std::array::from_fn(|j| {
                             let offset = (j / 4) as u32 + (j % 4) as u32 * 32;
                             let scalar = program.load(
                                 a.at(0, vector_base.clone() + offset),
                                 in_bounds.clone(),
                                 0.0,
                             );
-                            program.pin(scalar)
+                            program.bind(scalar)
                         });
 
                         std::array::from_fn(|c| {
                             let col = col0.clone() + c as u32;
                             let mask = grid.mask(full_block_iterations, in_bounds.clone(), &col);
-                            let a_vec: [Tile<BLOCK>; 16] = std::array::from_fn(|i| a_pins[i].get());
+                            let a_vec: [Tile<BLOCK>; 16] = std::array::from_fn(|i| a_bound[i].get());
                             program.quantized_q6k_ggml_dot(
                                 a_vec, &b_cloned, &block, &ip, &il, &col, mask, 0.0,
                             )
@@ -580,15 +549,15 @@ impl Program {
                             k_base.lt(k_size)
                         };
 
-                        // Pin all A scalars so each is computed once per iteration
+                        // Bind all A scalars so each is computed once per iteration
                         // and reused across all COLS_PER_SUBGROUP dot products.
-                        let a_pins: [Pinned<BLOCK>; VALUES_PER_LANE] = std::array::from_fn(|i| {
+                        let a_bound: [Bound<BLOCK>; VALUES_PER_LANE] = std::array::from_fn(|i| {
                             let scalar = program.load(
                                 a.at(0, k_base.clone() + i as u32),
                                 in_bounds_k.clone(),
                                 0.0,
                             );
-                            program.pin(scalar)
+                            program.bind(scalar)
                         });
 
                         std::array::from_fn(|c| {
@@ -599,7 +568,7 @@ impl Program {
                                 && grid.n_cols >= 8192
                             {
                                 let a_vec: [Tile<BLOCK>; 8] =
-                                    std::array::from_fn(|i| a_pins[i].get());
+                                    std::array::from_fn(|i| a_bound[i].get());
                                 return program.quantized_q8_0_dot8(
                                     a_vec, &b_cloned, &k_base, &col, mask, 0.0,
                                 );
@@ -610,21 +579,21 @@ impl Program {
                                     || VALUES_PER_LANE == 32)
                             {
                                 let a_vec: [Tile<BLOCK>; VALUES_PER_LANE] =
-                                    std::array::from_fn(|i| a_pins[i].get());
+                                    std::array::from_fn(|i| a_bound[i].get());
                                 return program.quantized_q4k_f32_dot::<VALUES_PER_LANE>(
                                     a_vec, &b_cloned, &k_base, &col, mask, 0.0,
                                 );
                             }
                             if b_cloned.format == GgmlQuantFormat::Q6K && VALUES_PER_LANE == 8 {
                                 let a_vec: [Tile<BLOCK>; 8] =
-                                    std::array::from_fn(|i| a_pins[i].get());
+                                    std::array::from_fn(|i| a_bound[i].get());
                                 return program.quantized_q8_0_dot8(
                                     a_vec, &b_cloned, &k_base, &col, mask, 0.0,
                                 );
                             }
                             if b_cloned.format == GgmlQuantFormat::Q6K && !q6k_vocab_f32_dot {
                                 let a_vec: [Tile<BLOCK>; VALUES_PER_LANE] =
-                                    std::array::from_fn(|i| a_pins[i].get());
+                                    std::array::from_fn(|i| a_bound[i].get());
                                 return program.quantized_q8_activation_dot::<VALUES_PER_LANE>(
                                     a_vec, &b_cloned, &k_base, &col, mask, 0.0,
                                 );
@@ -634,7 +603,7 @@ impl Program {
                                     &b_cloned, &k_base, &col, mask, 0.0,
                                 );
                             let a_values: [Tile<BLOCK>; VALUES_PER_LANE] =
-                                std::array::from_fn(|i| a_pins[i].get());
+                                std::array::from_fn(|i| a_bound[i].get());
                             dot4_sum(program, &a_values, &bs)
                         })
                     },

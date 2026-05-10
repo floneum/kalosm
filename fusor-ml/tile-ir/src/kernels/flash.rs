@@ -1,5 +1,5 @@
 use crate::{
-    tile::{self, Tile, TileBlock},
+    tile::{self, range, Tile, TileBlock},
     ElementType, F32Bits, Numeric, TileLiteral, WorkgroupAxis, F32, U32,
 };
 
@@ -67,23 +67,21 @@ pub fn flash_attention<E: Numeric, B>(
             let lane = program.arange();
             let workgroup_x = program.program_id(WorkgroupAxis::X);
             let row = program.program_id(WorkgroupAxis::Y);
-            let q_idx = program.pin(program.index(row.clone() % meta.dims.q_seq_len));
+            let q_idx = program.bind(program.index(row.clone() % meta.dims.q_seq_len));
             let row_over_q = row.clone() / meta.dims.q_seq_len;
-            let head_idx = program.pin(program.index(row_over_q.clone() % meta.dims.num_heads));
+            let head_idx = program.bind(program.index(row_over_q.clone() % meta.dims.num_heads));
             let batch_idx =
-                program.pin(program.index(row / (meta.dims.q_seq_len * meta.dims.num_heads)));
-            let kv_head_idx = program.pin(head_idx.get() / u32_tile(groups));
+                program.bind(program.index(row / (meta.dims.q_seq_len * meta.dims.num_heads)));
+            let kv_head_idx = program.bind(head_idx.get() / u32_tile(groups));
             let kv_lane = program.index(lane.clone() % FLASH_SIMD_WIDTH);
-            let out_dim = program.pin(program.index(
+            let out_dim = program.bind(program.index(
                 workgroup_x * FLASH_OUTPUTS_PER_WORKGROUP + (lane.clone() / FLASH_SIMD_WIDTH),
             ));
-            let out_valid = program.pin(out_dim.get().lt(u32_tile(meta.dims.head_dim)));
-            let loop_idx = program.private::<U32>();
+            let out_valid = program.bind(out_dim.get().lt(u32_tile(meta.dims.head_dim)));
+            // Per-iteration scratch locals — used to bridge values across
+            // `if_then` branches inside the body. Not loop-carried.
             let score_local = program.private::<F32>();
             let weighted_local = program.private::<F32>();
-            let m_local = program.private::<F32>();
-            let s_local = program.private::<F32>();
-            let o_local = program.private::<F32>();
 
             program.emit(q_idx.get());
             program.emit(head_idx.get());
@@ -92,112 +90,113 @@ pub fn flash_attention<E: Numeric, B>(
             program.emit(out_dim.get());
             program.emit(out_valid.get());
 
-            program.store_local(&m_local, f32_tile(NEG_MAX_F32));
-            program.store_local(&s_local, f32_tile(0.0));
-            program.store_local(&o_local, f32_tile(0.0));
-            program.store_local(&loop_idx, u32_tile(0));
-
             let kv_chunks = meta.dims.kv_seq_len.div_ceil(FLASH_SIMD_WIDTH);
-            program.loop_forever(|program| {
-                let chunk = program.load_local(&loop_idx);
-                program.if_then(chunk.clone().ge(u32_tile(kv_chunks)), |program| {
-                    program.break_loop();
-                });
-                let kv_idx =
-                    program.pin(chunk.clone() * u32_tile(FLASH_SIMD_WIDTH) + kv_lane.clone());
-                let kv_valid = program.pin(kv_idx.get().lt(u32_tile(meta.dims.kv_seq_len)));
-                program.emit(kv_idx.get());
-                program.emit(kv_valid.get());
-                program.store_local(&score_local, f32_tile(NEG_MAX_F32));
-                program.if_then(kv_valid.get(), |program| {
-                    let mut products = Vec::with_capacity(meta.dims.head_dim as usize);
-                    for dim in 0..meta.dims.head_dim {
-                        let q_index = index4_const_last(
-                            meta.q_meta.offset,
-                            q_strides,
-                            batch_idx.get(),
-                            head_idx.get(),
-                            q_idx.get(),
-                            dim,
-                        );
-                        let k_index = index4_const_last(
-                            meta.k_meta.offset,
-                            k_strides,
+            let [final_m, final_s, final_o] = program.fold(
+                range::<FLASH_BLOCK>(u32_tile::<FLASH_BLOCK>(kv_chunks)),
+                [f32_tile(NEG_MAX_F32), f32_tile(0.0), f32_tile(0.0)],
+                |program, chunk_idx, [m_state, s_state, o_state]| {
+                    let chunk = Tile::from_index(chunk_idx);
+                    let kv_idx =
+                        program.bind(chunk * u32_tile(FLASH_SIMD_WIDTH) + kv_lane.clone());
+                    let kv_valid = program.bind(kv_idx.get().lt(u32_tile(meta.dims.kv_seq_len)));
+                    program.emit(kv_idx.get());
+                    program.emit(kv_valid.get());
+                    program.store_local(&score_local, f32_tile(NEG_MAX_F32));
+                    program.if_then(kv_valid.get(), |program| {
+                        let mut products = Vec::with_capacity(meta.dims.head_dim as usize);
+                        for dim in 0..meta.dims.head_dim {
+                            let q_index = index4_const_last(
+                                meta.q_meta.offset,
+                                q_strides,
+                                batch_idx.get(),
+                                head_idx.get(),
+                                q_idx.get(),
+                                dim,
+                            );
+                            let k_index = index4_const_last(
+                                meta.k_meta.offset,
+                                k_strides,
+                                batch_idx.get(),
+                                kv_head_idx.get(),
+                                kv_idx.get(),
+                                dim,
+                            );
+                            let q_value = program
+                                .load_linear(q.at(q_index), all(), elem_fill.clone())
+                                .cast(ElementType::F32);
+                            let k_value = program
+                                .load_linear(k.at(k_index), all(), elem_fill.clone())
+                                .cast(ElementType::F32);
+                            products.push(q_value * k_value);
+                        }
+                        let mut score = program.sum(products) * f32_tile(meta.scale.get());
+                        if let (Some(mask), Some(mask_meta), Some(mask_strides)) =
+                            (&mask, meta.mask_meta.as_ref(), mask_strides)
+                        {
+                            let mask_index =
+                                index2(mask_meta.offset, mask_strides, q_idx.get(), kv_idx.get());
+                            let mask_value = program
+                                .load_linear(mask.at(mask_index), all(), elem_fill.clone())
+                                .cast(ElementType::F32);
+                            score = score + mask_value;
+                        }
+                        program.store_local(&score_local, score);
+                    });
+
+                    let score = program.bind(program.load_local(&score_local));
+                    program.emit(score.get());
+                    let block_max = program.bind(program.subgroup_reduce_max(score.get()));
+                    program.emit(block_max.get());
+                    let old_m = program.bind(m_state);
+                    program.emit(old_m.get());
+                    let new_m = program.bind(old_m.get().max(block_max.get()));
+                    program.emit(new_m.get());
+                    let raw_exp = (score.get() - new_m.get()).exp();
+                    let exp_score =
+                        program.bind(Tile::select(kv_valid.get(), raw_exp, f32_tile(0.0)));
+                    program.emit(exp_score.get());
+                    let block_sum = program.bind(program.subgroup_reduce_sum(exp_score.get()));
+                    program.emit(block_sum.get());
+
+                    program.store_local(&weighted_local, f32_tile(0.0));
+                    let valid_value = kv_valid.get().and(out_valid.get());
+                    program.if_then(valid_value, |program| {
+                        let v_index = index4(
+                            meta.v_meta.offset,
+                            v_strides,
                             batch_idx.get(),
                             kv_head_idx.get(),
                             kv_idx.get(),
-                            dim,
+                            out_dim.get(),
                         );
-                        let q_value = program
-                            .load_linear(q.at(q_index), all(), elem_fill.clone())
+                        let v_value = program
+                            .load_linear(v.at(v_index), all(), elem_fill.clone())
                             .cast(ElementType::F32);
-                        let k_value = program
-                            .load_linear(k.at(k_index), all(), elem_fill.clone())
-                            .cast(ElementType::F32);
-                        products.push(q_value * k_value);
-                    }
-                    let mut score = program.sum(products) * f32_tile(meta.scale.get());
-                    if let (Some(mask), Some(mask_meta), Some(mask_strides)) =
-                        (&mask, meta.mask_meta.as_ref(), mask_strides)
-                    {
-                        let mask_index =
-                            index2(mask_meta.offset, mask_strides, q_idx.get(), kv_idx.get());
-                        let mask_value = program
-                            .load_linear(mask.at(mask_index), all(), elem_fill.clone())
-                            .cast(ElementType::F32);
-                        score = score + mask_value;
-                    }
-                    program.store_local(&score_local, score);
-                });
+                        program.store_local(&weighted_local, exp_score.get() * v_value);
+                    });
+                    let weighted = program.load_local(&weighted_local);
+                    let block_out = program.bind(program.subgroup_reduce_sum(weighted));
+                    program.emit(block_out.get());
 
-                let score = program.pin(program.load_local(&score_local));
-                program.emit(score.get());
-                let block_max = program.pin(program.subgroup_reduce_max(score.get()));
-                program.emit(block_max.get());
-                let old_m = program.pin(program.load_local(&m_local));
-                program.emit(old_m.get());
-                let new_m = program.pin(old_m.get().max(block_max.get()));
-                program.emit(new_m.get());
-                let raw_exp = (score.get() - new_m.get()).exp();
-                let exp_score = program.pin(Tile::select(kv_valid.get(), raw_exp, f32_tile(0.0)));
-                program.emit(exp_score.get());
-                let block_sum = program.pin(program.subgroup_reduce_sum(exp_score.get()));
-                program.emit(block_sum.get());
-
-                program.store_local(&weighted_local, f32_tile(0.0));
-                let valid_value = kv_valid.get().and(out_valid.get());
-                program.if_then(valid_value, |program| {
-                    let v_index = index4(
-                        meta.v_meta.offset,
-                        v_strides,
-                        batch_idx.get(),
-                        kv_head_idx.get(),
-                        kv_idx.get(),
-                        out_dim.get(),
-                    );
-                    let v_value = program
-                        .load_linear(v.at(v_index), all(), elem_fill.clone())
-                        .cast(ElementType::F32);
-                    program.store_local(&weighted_local, exp_score.get() * v_value);
-                });
-                let weighted = program.load_local(&weighted_local);
-                let block_out = program.pin(program.subgroup_reduce_sum(weighted));
-                program.emit(block_out.get());
-
-                let old_m_scale = program.pin((old_m.get() - new_m.get()).exp());
-                program.emit(old_m_scale.get());
-                let new_s = program.load_local(&s_local) * old_m_scale.get() + block_sum.get();
-                let new_o = program.load_local(&o_local) * old_m_scale.get() + block_out.get();
-                program.store_local(&s_local, new_s);
-                program.store_local(&o_local, new_o);
-                program.store_local(&m_local, new_m.get());
-                program.store_local(&loop_idx, chunk + u32_tile(1));
-            });
+                    let old_m_scale = program.bind((old_m.get() - new_m.get()).exp());
+                    program.emit(old_m_scale.get());
+                    let new_s = s_state * old_m_scale.get() + block_sum.get();
+                    let new_o = o_state * old_m_scale.get() + block_out.get();
+                    [new_m.get(), new_s, new_o]
+                },
+            );
 
             let store_valid = kv_lane.eq(u32_tile(0)).and(out_valid.get());
+            // Bind the fold results so the divide and the `if_then` body share
+            // the same SSA values rather than re-emitting the loop materialize.
+            let final_o_bound = program.bind(final_o);
+            let final_s_bound = program.bind(final_s);
+            // Evaluate `final_m` once so the loop fires even though we don't
+            // need its value in the post-loop stage.
+            program.emit(final_m);
             program.if_then(store_valid, |program| {
                 let output_value =
-                    (program.load_local(&o_local) / program.load_local(&s_local)).cast(E::ELEMENT);
+                    (final_o_bound.get() / final_s_bound.get()).cast(E::ELEMENT);
                 let output_index = index4(
                     meta.output_meta.offset,
                     output_strides,

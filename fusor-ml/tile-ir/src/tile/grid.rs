@@ -3,9 +3,9 @@ use std::marker::PhantomData;
 use std::ops::{Add, BitAnd, BitXor, Div, Mul, Rem, Sub};
 
 use crate::ir::{
-    BlockDequantId, BufferAccess, BufferDecl, BufferRef, CoopAccDecl, CoopAccId, CoopFragmentId,
+    BlockDequantId, BufferAccess, BufferDecl, BufferRef, CoopFragmentId,
     CoopOperandRole, DynamicOffset, F32Bits, F32Vec4, Im2ColNhwcMap, KernelIr, Layout, LocalDecl,
-    LocalRef, LoopFoldGroup, LoopFoldGroupId, MemoryLevel, Numeric, Op, PinId,
+    LocalRef, MemoryLevel, Numeric, Op,
     QuantizedVecDotKind, Shape, StorageIndexMap, StorageView, TileBinaryOp, TileCompareOp,
     TileDecl, TileExpr, TileIndexExpr, TileIndexedStoreStmt, TileLevel, TileLinearLoadExpr,
     TileLiteral, TileLoadExpr, TileMaskExpr, TileOrigin, TileProgramOp, TileQuantizedLoadExpr,
@@ -91,16 +91,16 @@ pub(super) fn q4k_ggml_activations<const BLOCK: usize>(
     vector_base: &ScalarIndex,
     in_bounds: Mask<BLOCK>,
 ) -> Q4KGgmlActivations<BLOCK> {
-    let low: [Pinned<BLOCK>; 16] = std::array::from_fn(|j| {
+    let low: [Bound<BLOCK>; 16] = std::array::from_fn(|j| {
         let offset = if j < 8 { j as u32 } else { (j - 8) as u32 + 32 };
         let scalar = program.load(
             a.at(row.clone(), vector_base.clone() + offset),
             in_bounds.clone(),
             0.0,
         );
-        program.pin(scalar)
+        program.bind(scalar)
     });
-    let high: [Pinned<BLOCK>; 16] = std::array::from_fn(|j| {
+    let high: [Bound<BLOCK>; 16] = std::array::from_fn(|j| {
         let offset = if j < 8 {
             j as u32 + 128
         } else {
@@ -111,7 +111,7 @@ pub(super) fn q4k_ggml_activations<const BLOCK: usize>(
             in_bounds.clone(),
             0.0,
         );
-        program.pin(scalar)
+        program.bind(scalar)
     });
 
     let zero = TileLiteral::F32(F32Bits::new(0.0));
@@ -151,9 +151,7 @@ pub(super) fn dot4_sum<const BLOCK: usize, const VALUES: usize>(
 
 
 pub fn build(f: impl FnOnce(&mut Program)) -> KernelIr {
-    let mut program = Program {
-        ir: KernelIr::default(),
-    };
+    let mut program = Program::new();
     f(&mut program);
     program.ir
 }

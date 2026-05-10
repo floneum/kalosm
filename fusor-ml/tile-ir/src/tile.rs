@@ -12,6 +12,6 @@ pub use program::Program;
 pub use storage::{ErasedStorage, Storage};
 pub use types::PairedActivation;
 pub use value::{
-    Address, CoopAcc, CoopFragment, ErasedAddress, IntoIndex, LaneTile2d, LinearAddress, Local,
-    Mask, Pinned, Range, Scalar, ScalarIndex, Tile,
+    range, Address, CoopAcc, CoopFragment, ErasedAddress, FoldIter, IntoIndex, LaneTile2d,
+    LinearAddress, Local, Mask, Bound, Range, Scalar, ScalarIndex, Tile,
 };

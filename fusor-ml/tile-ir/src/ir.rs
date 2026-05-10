@@ -35,37 +35,6 @@ pub struct KernelIr {
     pub(crate) tiles: Vec<TileDecl>,
     pub(crate) locals: Vec<LocalDecl>,
     pub(crate) body: Block,
-    pub(crate) next_buffer: u32,
-    pub(crate) next_tile: u32,
-    pub(crate) next_local: u32,
-    pub(crate) next_block_dequant: u32,
-    /// Side table of pinned subexpressions, indexed by `PinId`. The lowerer
-    /// emits each entry into a private local on first reference and reuses the
-    /// load on subsequent references in the same scope.
-    pub(crate) pinned_values: Vec<TileExpr>,
-    /// Side table of multi-output loop-fold groups, indexed by
-    /// `LoopFoldGroupId`. Lowering materializes one Naga loop per group with N
-    /// parallel accumulators.
-    pub(crate) loop_fold_groups: Vec<LoopFoldGroup>,
-    /// Declared cooperative-matrix accumulators. Each entry maps to an 8x8 f32
-    /// CooperativeMatrix-typed function local.
-    pub(crate) coop_accs: Vec<CoopAccDecl>,
-    /// Counter for cooperative-matrix fragment SSA names.
-    pub(crate) next_coop_fragment: u32,
-}
-
-id_newtype!(
-    /// Identifier of a cooperative-matrix accumulator local.
-    pub CoopAccId, Hash
-);
-
-/// Declaration of a cooperative-matrix accumulator. Currently only 8x8 f32
-/// `C`-role fragments are supported.
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub struct CoopAccDecl {
-    pub id: CoopAccId,
-    pub rows: u32,
-    pub cols: u32,
 }
 
 id_newtype!(
@@ -81,28 +50,39 @@ pub enum CoopOperandRole {
 }
 
 id_newtype!(
-    /// Identifier of a pinned subexpression.
-    pub PinId, Hash
-);
-
-id_newtype!(
-    /// Identifier of a multi-output loop-fold group.
-    pub LoopFoldGroupId, Hash
-);
-
-/// A K-loop that accumulates N parallel reductions sharing one body.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct LoopFoldGroup {
-    pub iterations: u32,
-    pub op: TileReduceOp,
-    pub initials: Vec<TileLiteral>,
-    pub bodies: Vec<TileExpr>,
-}
-
-id_newtype!(
     /// Identifier shared by lanes of one fused quantized-block dequant.
     pub BlockDequantId, Hash
 );
+
+/// What to iterate over inside a `Fold`. Initially just `Range`; future
+/// variants (Chunks, Strided, Zip) compose without changing existing loop
+/// shapes.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum TileIter {
+    /// Counted range `0..count` where `count` is a dynamic expression.
+    Range { count: Box<TileExpr> },
+}
+
+/// Built-in u32 quantities that show up as leaves in index/address arithmetic.
+/// Promoted to `TileExpr::Builtin` so a single expression type can host both
+/// per-lane data and indexing math.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+pub enum Builtin {
+    /// `@builtin(local_invocation_index)` — flat lane within the workgroup.
+    Lane,
+    /// Current iteration counter of the innermost structured `Fold` / `Loop`.
+    LoopIndex,
+    /// `@builtin(workgroup_id).{x|y|z}`.
+    ProgramId(WorkgroupAxis),
+    /// `@builtin(subgroup_id)`.
+    SubgroupId,
+    /// `@builtin(subgroup_invocation_id)` — lane within the subgroup.
+    SubgroupLane,
+    /// `@builtin(subgroup_size)` — runtime subgroup size.
+    SubgroupSize,
+    /// `@builtin(num_subgroups)` — number of subgroups per workgroup.
+    NumSubgroups,
+}
 
 impl KernelIr {
     /// Storage buffer declarations bound by the kernel.
@@ -125,11 +105,6 @@ impl KernelIr {
         &self.body
     }
 
-    /// Cooperative-matrix accumulators declared by the kernel body.
-    pub fn coop_accs(&self) -> &[CoopAccDecl] {
-        &self.coop_accs
-    }
-
     /// Lower this IR into a validated Naga module.
     pub fn lower_to_naga(&self) -> Result<NagaKernel, LowerError> {
         crate::lower::lower_to_naga(self)
@@ -141,6 +116,50 @@ impl KernelIr {
             return None;
         };
         Some(program.grid)
+    }
+
+    /// Best-effort element-type inference for a `TileExpr`, used by builder
+    /// helpers like `pin` that need to allocate a typed local before the
+    /// lowerer runs. Falls back to `F32` for variants that need additional
+    /// context.
+    pub(crate) fn tile_expr_element(&self, expr: &TileExpr) -> ElementType {
+        match expr {
+            TileExpr::Load(load) => load.src.buffer.element,
+            TileExpr::LoadLinear(load) => load.src.buffer.element,
+            TileExpr::LoadVec4(_) => ElementType::F32Vec4,
+            TileExpr::LoadWorkgroup { src, .. } => src.element,
+            TileExpr::LoadLocal(local) => local.element,
+            TileExpr::QuantizedLoad(_) | TileExpr::Full(_) => ElementType::F32,
+            TileExpr::Literal(value) => value.element(),
+            TileExpr::Index(_) => ElementType::U32,
+            TileExpr::Builtin(_) => ElementType::U32,
+            TileExpr::Scalar(scalar) => match scalar {
+                TileScalarExpr::Reduce { scratch, .. }
+                | TileScalarExpr::LoopReduce { scratch, .. } => scratch.element,
+                TileScalarExpr::Literal(value) => value.element(),
+            },
+            TileExpr::Unary { value, .. } | TileExpr::Binary { left: value, .. } => {
+                self.tile_expr_element(value)
+            }
+            TileExpr::Sum { values } => values
+                .first()
+                .map(|value| self.tile_expr_element(value))
+                .unwrap_or(ElementType::F32),
+            TileExpr::Cast { to, .. } => *to,
+            TileExpr::Bitcast { to, .. } => *to,
+            TileExpr::Select { accept, .. } => self.tile_expr_element(accept),
+            TileExpr::Compare { output, .. } => *output,
+            TileExpr::LoopFold { initial, .. } => initial.element(),
+            TileExpr::GroupReduce { scratch, .. } => scratch.element,
+            TileExpr::SubgroupReduce { value, .. } => self.tile_expr_element(value),
+            TileExpr::QuantizedBlockLane { .. } => ElementType::F32,
+            TileExpr::Vec4Dot { .. }
+            | TileExpr::QuantizedQ8_0Dot8 { .. }
+            | TileExpr::QuantizedVecDot { .. }
+            | TileExpr::QuantizedQ4KGgmlDot { .. }
+            | TileExpr::QuantizedQ6KGgmlDot { .. } => ElementType::F32,
+            TileExpr::Vec4Splat { .. } | TileExpr::Compose4 { .. } => ElementType::F32Vec4,
+        }
     }
 }
 
@@ -369,7 +388,7 @@ impl LoopOffset {
 }
 
 /// Axis of `@builtin(workgroup_id)`.
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub enum WorkgroupAxis {
     X,
     Y,
@@ -403,9 +422,11 @@ pub enum TileStmt {
     StoreIndexed(TileIndexedStoreStmt),
     /// Store to a private per-invocation local.
     StoreLocal { dst: LocalRef, value: TileExpr },
-    /// Materialize a pure tile expression at this point so later pinned
-    /// references can reuse the resulting SSA handle in dominated blocks.
-    Emit { value: TileExpr },
+    /// Bind `value` to a fresh local. Subsequent reads in the rest of this
+    /// statement vec use `TileExpr::LoadLocal(LocalRef { id: name.id, .. })`.
+    /// Lowers to a Store of `value` into the local; the local must be
+    /// declared in `KernelIr.locals`.
+    Let { name: LocalRef, value: TileExpr },
     /// Store to a workgroup scratch tile at a dynamic flat index.
     StoreWorkgroup {
         dst: TileRef,
@@ -424,8 +445,9 @@ pub enum TileStmt {
     Break,
     /// Return from the kernel entry point.
     Return,
-    /// Zero-initialize a coop accumulator.
-    ZeroCoopAcc { id: CoopAccId },
+    /// Zero-initialize a coop accumulator. `acc` is a local declared with
+    /// element `ElementType::CoopMatrixF32 { .. }`.
+    ZeroCoopAcc { acc: LocalRef },
     /// Cooperatively copy a workgroup-tile-sized region of a storage view into
     /// a workgroup tile (one element per invocation per pass). `row_offset`
     /// and `col_offset` are evaluated in the surrounding scope (e.g. inside a
@@ -457,15 +479,17 @@ pub enum TileStmt {
     },
     /// `acc += a * b` where `a`/`b` are previously loaded fragments. Letting
     /// the user load fragments separately lets one A/B load be reused across
-    /// many MMAs (e.g. across the inner row × col grid in qmatmul).
+    /// many MMAs (e.g. across the inner row × col grid in qmatmul). `acc` is
+    /// a local declared with element `ElementType::CoopMatrixF32 { .. }`.
     Mma {
-        acc: CoopAccId,
+        acc: LocalRef,
         a: CoopFragmentId,
         b: CoopFragmentId,
     },
-    /// Cooperatively store an accumulator to a global storage view.
+    /// Cooperatively store an accumulator to a global storage view. `acc` is
+    /// a local declared with element `ElementType::CoopMatrixF32 { .. }`.
     StoreCoopAcc {
-        acc: CoopAccId,
+        acc: LocalRef,
         dst: StorageView,
         row: TileIndexExpr,
         col: TileIndexExpr,
@@ -477,6 +501,34 @@ pub enum TileStmt {
         max_iterations: u32,
         body: Vec<TileStmt>,
     },
+    /// Iterator-driven loop that carries named, mutable accumulators. Each
+    /// `accumulator.init` is evaluated in the surrounding scope and stored
+    /// into the accumulator local. Inside `body` and inside each
+    /// `accumulator.update`, references to the iterator value are
+    /// `LoadLocal(LocalRef { id: iter_var, element: U32 })`, and references
+    /// to the in-flight accumulator value are `LoadLocal` of the
+    /// accumulator's name. After the statement finishes, the accumulator
+    /// locals hold the final values and may be read as ordinary `LoadLocal`.
+    Fold {
+        iter: TileIter,
+        iter_var: LocalId,
+        body: Vec<TileStmt>,
+        accumulators: Vec<FoldAccumulator>,
+    },
+}
+
+/// One accumulator carried by a `TileStmt::Fold`. `init` is evaluated once
+/// in the surrounding scope. `update` is evaluated each iteration with
+/// `iter_var` and the current accumulator values in scope (via
+/// `LoadLocal`). The result of `update` becomes the accumulator's value for
+/// the next iteration; after the loop, it is the final value visible
+/// outside the fold.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FoldAccumulator {
+    pub name: LocalId,
+    pub element: ElementType,
+    pub init: TileExpr,
+    pub update: TileExpr,
 }
 
 /// A masked tile store emitted by a source tile program.
@@ -548,6 +600,10 @@ pub enum TileExpr {
     Literal(TileLiteral),
     Index(TileIndexExpr),
     Scalar(TileScalarExpr),
+    /// A built-in u32 quantity (lane id, loop index, program id, subgroup
+    /// builtins). Promoted from `TileIndexExpr` leaves so the same expression
+    /// type spans index arithmetic and per-lane data.
+    Builtin(Builtin),
     Unary {
         op: TileUnaryOp,
         value: Box<TileExpr>,
@@ -614,12 +670,6 @@ pub enum TileExpr {
         block_n: u32,
         lane: u32,
     },
-    /// Fused 4-way dot product. Lowers to a single `Math::Dot` over composed
-    /// `vec4<f32>` operands — the same pattern the qgemv accelerator emits.
-    Dot4 {
-        a: [Box<TileExpr>; 4],
-        b: [Box<TileExpr>; 4],
-    },
     /// Dot product between two `vec4<f32>` expressions.
     Vec4Dot {
         left: Box<TileExpr>,
@@ -628,6 +678,12 @@ pub enum TileExpr {
     /// `vec4<f32>(value, value, value, value)`.
     Vec4Splat {
         value: Box<TileExpr>,
+    },
+    /// `vec4<f32>(values[0], values[1], values[2], values[3])`. Combined with
+    /// `Vec4Dot` this expresses the fused 4-way dot product the qgemv
+    /// accelerator emits.
+    Compose4 {
+        values: [Box<TileExpr>; 4],
     },
     QuantizedQ8_0Dot8 {
         a: [Box<TileExpr>; 8],
@@ -668,19 +724,6 @@ pub enum TileExpr {
         col: TileIndexExpr,
         mask: TileMaskExpr,
         fill: F32Bits,
-    },
-    /// Reference to a pinned subexpression. The first reference in a scope
-    /// lowers the bound value into a private local; subsequent references in
-    /// the same scope reuse it.
-    PinnedRef {
-        id: PinId,
-    },
-    /// Reference to one accumulator output of a multi-output loop-fold group.
-    /// The first reference materializes the shared K-loop; subsequent
-    /// references reuse the per-accumulator local.
-    LoopFoldGroupOutput {
-        group: LoopFoldGroupId,
-        lane: u32,
     },
 }
 
@@ -844,13 +887,21 @@ id_newtype!(
 );
 
 /// Element types represented by the typed IR.
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub enum ElementType {
     F32,
     F16,
     U32,
     F32Vec4,
     Bool,
+    /// Cooperative-matrix accumulator type (the `C`-role fragment) of the
+    /// given shape. Only `8x8` f32 is currently supported by the lowerer; the
+    /// shape is carried explicitly so a single `LocalDecl` describes the full
+    /// fragment type.
+    CoopMatrixF32 {
+        rows: u32,
+        cols: u32,
+    },
 }
 
 /// Numeric element markers that can appear in the typed IR.

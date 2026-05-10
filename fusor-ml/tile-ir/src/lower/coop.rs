@@ -52,8 +52,19 @@ impl<'a> Lowerer<'a> {
                 body.push(Statement::Store { pointer, value }, Span::default());
                 Ok(())
             }
-            TileStmt::Emit { value } => {
-                self.lower_tile_expr_lane(expressions, scratch, body, value, 0)?;
+            TileStmt::Let { name, value } => {
+                let value_ty = self.tile_expr_element(value)?;
+                if value_ty != name.element {
+                    return Err(LowerError::LocalElementMismatch {
+                        local: name.id,
+                        declared: name.element,
+                        used: value_ty,
+                    });
+                }
+                let value = self.lower_tile_expr_lane(expressions, scratch, body, value, 0)?;
+                let local = self.private_local(*name)?;
+                let pointer = expressions.append(Expression::LocalVariable(local), Span::default());
+                body.push(Statement::Store { pointer, value }, Span::default());
                 Ok(())
             }
             TileStmt::StoreWorkgroup { dst, index, value } => {
@@ -125,12 +136,8 @@ impl<'a> Lowerer<'a> {
                 );
                 Ok(())
             }
-            TileStmt::ZeroCoopAcc { id } => {
-                let local = self
-                    .coop_acc_locals
-                    .get(id.index())
-                    .copied()
-                    .ok_or(LowerError::UnsupportedOperation("unknown coop acc id"))?;
+            TileStmt::ZeroCoopAcc { acc } => {
+                let local = self.private_local(*acc)?;
                 let ty = self.coop_c_ty.ok_or(LowerError::UnsupportedOperation(
                     "coop C type missing — tile program uses coop statements without cooperative-matrix support",
                 ))?;
@@ -200,6 +207,20 @@ impl<'a> Lowerer<'a> {
                 },
             ),
             TileStmt::Mma { acc, a, b } => self.lower_coop_mma(expressions, body, *acc, *a, *b),
+            TileStmt::Fold {
+                iter,
+                iter_var,
+                body: fold_body,
+                accumulators,
+            } => self.lower_tile_fold_stmt(
+                expressions,
+                scratch,
+                body,
+                iter,
+                *iter_var,
+                fold_body,
+                accumulators,
+            ),
         }
     }
 
@@ -251,15 +272,11 @@ impl<'a> Lowerer<'a> {
         &self,
         expressions: &mut Arena<Expression>,
         body: &mut Block,
-        acc_id: CoopAccId,
+        acc: LocalRef,
         a_id: CoopFragmentId,
         b_id: CoopFragmentId,
     ) -> Result<(), LowerError> {
-        let acc_local = self
-            .coop_acc_locals
-            .get(acc_id.index())
-            .copied()
-            .ok_or(LowerError::UnsupportedOperation("unknown coop acc"))?;
+        let acc_local = self.private_local(acc)?;
         let a = self
             .coop_fragment_cache
             .borrow()
@@ -279,7 +296,7 @@ impl<'a> Lowerer<'a> {
         // Get the current SSA value of this accumulator: cache hit → reuse;
         // cache miss → emit one Load from the accumulator local. Subsequent
         // MMAs in this scope chain through SSA without touching the local.
-        let c = match self.coop_acc_value_cache.borrow().get(&acc_id).copied() {
+        let c = match self.coop_acc_value_cache.borrow().get(&acc.id).copied() {
             Some(value) => value,
             None => {
                 let acc_ptr =
@@ -301,7 +318,7 @@ impl<'a> Lowerer<'a> {
             Statement::Emit(Self::single_expression_range(expressions, next)),
             Span::default(),
         );
-        self.coop_acc_value_cache.borrow_mut().insert(acc_id, next);
+        self.coop_acc_value_cache.borrow_mut().insert(acc.id, next);
         Ok(())
     }
 
@@ -310,8 +327,13 @@ impl<'a> Lowerer<'a> {
     /// boundary, before reads of the local, end of program body, etc.).
     fn flush_coop_acc_cache(&self, expressions: &mut Arena<Expression>, body: &mut Block) {
         let drained: Vec<_> = self.coop_acc_value_cache.borrow_mut().drain().collect();
-        for (acc_id, value) in drained {
-            let acc_local = match self.coop_acc_locals.get(acc_id.index()).copied() {
+        for (local_id, value) in drained {
+            let acc_local = match self
+                .private_locals
+                .get(local_id.index())
+                .copied()
+                .flatten()
+            {
                 Some(l) => l,
                 None => continue,
             };
@@ -619,18 +641,14 @@ impl<'a> Lowerer<'a> {
         expressions: &mut Arena<Expression>,
         scratch: ScratchLocals,
         body: &mut Block,
-        acc_id: CoopAccId,
+        acc: LocalRef,
         dst: &StorageView,
         row: &TileIndexExpr,
         col: &TileIndexExpr,
     ) -> Result<(), LowerError> {
         // Flush any pending acc SSA so the Load below sees the current value.
         self.flush_coop_acc_cache(expressions, body);
-        let acc_local = self
-            .coop_acc_locals
-            .get(acc_id.index())
-            .copied()
-            .ok_or(LowerError::UnsupportedOperation("unknown coop acc"))?;
+        let acc_local = self.private_local(acc)?;
         let (stride_u, row_major) = Self::cooperative_store_layout(&dst.layout)?;
         let row_h = self.lower_tile_index_expr(expressions, scratch, body, row, 0)?;
         let col_h = self.lower_tile_index_expr(expressions, scratch, body, col, 0)?;

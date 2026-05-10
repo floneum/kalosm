@@ -88,13 +88,8 @@ impl<'a> Lowerer<'a> {
             uses_subgroup_size,
             uses_num_subgroups,
             block_dequant_cache: Default::default(),
-            pin_cache: Default::default(),
             q8_activation_pack_cache: Default::default(),
-            loop_fold_group_cache: Default::default(),
-            fold_accumulator_locals: Vec::new(),
-            fold_group_offsets: Vec::new(),
             coop_c_ty,
-            coop_acc_locals: Vec::new(),
             coop_fragment_cache: Default::default(),
             coop_acc_value_cache: Default::default(),
             uses_cooperative_matrix,
@@ -169,8 +164,6 @@ impl<'a> Lowerer<'a> {
         self.loop_index_local = Some(scratch.loop_index);
         self.create_private_locals(&mut function)?;
         self.create_program_private_locals(&mut function);
-        self.create_fold_group_locals(&mut function);
-        self.create_coop_acc_locals(&mut function);
 
         function.body = self.lower_block(self.ir.body(), &mut function.expressions, scratch)?;
         function
@@ -409,30 +402,6 @@ impl<'a> Lowerer<'a> {
         }
     }
 
-    pub(super) fn create_coop_acc_locals(&mut self, function: &mut Function) {
-        if let Some(ty) = self.coop_c_ty {
-            self.coop_acc_locals = self
-                .ir
-                .coop_accs
-                .iter()
-                .map(|_| self.create_local(function, ty))
-                .collect();
-        }
-    }
-
-    pub(super) fn create_fold_group_locals(&mut self, function: &mut Function) {
-        let mut offsets = Vec::with_capacity(self.ir.loop_fold_groups.len());
-        let mut total = 0usize;
-        for group in &self.ir.loop_fold_groups {
-            offsets.push(total);
-            total += group.initials.len();
-        }
-        self.fold_group_offsets = offsets;
-        self.fold_accumulator_locals = (0..total)
-            .map(|_| self.create_f32_local(function))
-            .collect();
-    }
-
     pub(super) fn create_u32_local(&self, function: &mut Function) -> Handle<LocalVariable> {
         self.create_local(function, self.u32_ty)
     }
@@ -458,6 +427,12 @@ impl<'a> Lowerer<'a> {
             ElementType::U32 => self.u32_ty,
             ElementType::F32Vec4 => self.f32_vec4_ty,
             ElementType::Bool => self.bool_ty,
+            ElementType::CoopMatrixF32 { rows: 8, cols: 8 } => self
+                .coop_c_ty
+                .expect("8x8 cooperative-matrix local requested without coop type"),
+            ElementType::CoopMatrixF32 { rows, cols } => {
+                panic!("unsupported cooperative-matrix shape {rows}x{cols}")
+            }
         }
     }
 
@@ -498,6 +473,9 @@ impl<'a> Lowerer<'a> {
     ) -> Handle<Type> {
         let base = match element {
             ElementType::Bool => panic!("bool arrays are not supported"),
+            ElementType::CoopMatrixF32 { .. } => {
+                panic!("cooperative-matrix arrays are not supported")
+            }
             _ => self.element_type(element),
         };
         let stride = match element {
@@ -505,6 +483,9 @@ impl<'a> Lowerer<'a> {
             ElementType::F32 | ElementType::U32 => 4,
             ElementType::F32Vec4 => 16,
             ElementType::Bool => panic!("bool arrays are not supported"),
+            ElementType::CoopMatrixF32 { .. } => {
+                panic!("cooperative-matrix arrays are not supported")
+            }
         };
 
         self.module.types.insert(
@@ -542,12 +523,19 @@ impl<'a> Lowerer<'a> {
             TileStmt::StoreLocal { dst, value } => {
                 dst.element == ElementType::F16 || Self::tile_expr_uses_f16(value)
             }
-            TileStmt::Emit { .. } => false,
+            TileStmt::Let { name, value } => {
+                name.element == ElementType::F16 || Self::tile_expr_uses_f16(value)
+            }
             TileStmt::StoreWorkgroup { dst, .. } => dst.element == ElementType::F16,
             TileStmt::CopyToWorkgroupTile { dst, src, .. } => {
                 dst.element == ElementType::F16 || src.buffer.element == ElementType::F16
             }
             TileStmt::StoreCoopAcc { dst, .. } => dst.buffer.element == ElementType::F16,
+            TileStmt::Fold { accumulators, .. } => accumulators.iter().any(|acc| {
+                acc.element == ElementType::F16
+                    || Self::tile_expr_uses_f16(&acc.init)
+                    || Self::tile_expr_uses_f16(&acc.update)
+            }),
             TileStmt::If { .. }
             | TileStmt::Loop { .. }
             | TileStmt::CopyQuantToWorkgroupTile { .. }
@@ -607,15 +595,13 @@ impl<'a> Lowerer<'a> {
             }
             TileExpr::SubgroupReduce { .. }
             | TileExpr::QuantizedBlockLane { .. }
-            | TileExpr::Dot4 { .. }
             | TileExpr::Vec4Dot { .. }
             | TileExpr::Vec4Splat { .. }
+            | TileExpr::Compose4 { .. }
             | TileExpr::QuantizedQ8_0Dot8 { .. }
             | TileExpr::QuantizedVecDot { .. }
             | TileExpr::QuantizedQ4KGgmlDot { .. }
-            | TileExpr::QuantizedQ6KGgmlDot { .. }
-            | TileExpr::PinnedRef { .. }
-            | TileExpr::LoopFoldGroupOutput { .. } => false,
+            | TileExpr::QuantizedQ6KGgmlDot { .. } => false,
         }
     }
 

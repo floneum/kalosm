@@ -325,122 +325,6 @@ impl<'a> Lowerer<'a> {
         Ok(body)
     }
 
-    pub(in crate::lower) fn lower_tile_loop_fold_group_output(
-        &self,
-        expressions: &mut Arena<Expression>,
-        scratch: ScratchLocals,
-        body: &mut Block,
-        group: LoopFoldGroupId,
-        lane: u32,
-        spill_depth: usize,
-    ) -> Result<Handle<Expression>, LowerError> {
-        if let Some(values) = self.loop_fold_group_cache.borrow().get(&group).cloned() {
-            return Ok(values.get(lane as usize).copied().ok_or(
-                LowerError::UnsupportedOperation("fold group lane out of range"),
-            )?);
-        }
-
-        let g = self
-            .ir
-            .loop_fold_groups
-            .get(group.index())
-            .ok_or(LowerError::UnsupportedOperation("unknown fold group"))?
-            .clone();
-        let n = g.bodies.len();
-        if g.initials.len() != n {
-            return Err(LowerError::UnsupportedOperation(
-                "fold group initial count mismatch",
-            ));
-        }
-        let offset = self.fold_group_offsets.get(group.index()).copied().ok_or(
-            LowerError::UnsupportedOperation("fold group offset missing"),
-        )?;
-        if offset + n > self.fold_accumulator_locals.len() {
-            return Err(LowerError::UnsupportedOperation(
-                "fold group accumulator pool exhausted",
-            ));
-        }
-        let acc_locals: Vec<_> = (0..n)
-            .map(|i| self.fold_accumulator_locals[offset + i])
-            .collect();
-
-        // Initialize accumulators.
-        for (i, local) in acc_locals.iter().enumerate() {
-            let init = expressions.append(Self::tile_literal(g.initials[i]), Span::default());
-            let ptr = expressions.append(Expression::LocalVariable(*local), Span::default());
-            body.push(
-                Statement::Store {
-                    pointer: ptr,
-                    value: init,
-                },
-                Span::default(),
-            );
-        }
-
-        self.emit_counted_loop(
-            expressions,
-            scratch,
-            body,
-            g.iterations,
-            |expressions, loop_body, _| {
-                // Snapshot caches that reference handles in the outer block; the loop
-                // body emits a fresh scope. Q8 activation packs use shared scratch
-                // locals, so discard that cache around loops instead of restoring it.
-                let saved = self.snapshot_tile_loop_caches();
-
-                // Lower each body[i] within the same loop body, accumulate into acc_locals[i].
-                for (i, body_expr) in g.bodies.iter().enumerate() {
-                    let value = self.lower_tile_expr_lane(
-                        expressions,
-                        scratch,
-                        loop_body,
-                        body_expr,
-                        spill_depth + 1,
-                    )?;
-                    let acc_ptr = expressions
-                        .append(Expression::LocalVariable(acc_locals[i]), Span::default());
-                    let acc_load =
-                        expressions.append(Expression::Load { pointer: acc_ptr }, Span::default());
-                    loop_body.push(
-                        Statement::Emit(Self::single_expression_range(expressions, acc_load)),
-                        Span::default(),
-                    );
-                    let reduced = self.emit_tile_expr(
-                        expressions,
-                        loop_body,
-                        Self::tile_reduce_expression(g.op, acc_load, value),
-                    );
-                    loop_body.push(
-                        Statement::Store {
-                            pointer: acc_ptr,
-                            value: reduced,
-                        },
-                        Span::default(),
-                    );
-                }
-
-                self.restore_tile_loop_caches(saved);
-                Ok(())
-            },
-        )?;
-
-        // Materialize per-accumulator final loads in the outer block; cache them.
-        let mut handles = Vec::with_capacity(n);
-        for local in &acc_locals {
-            let ptr = expressions.append(Expression::LocalVariable(*local), Span::default());
-            let value = expressions.append(Expression::Load { pointer: ptr }, Span::default());
-            body.push(
-                Statement::Emit(Self::single_expression_range(expressions, value)),
-                Span::default(),
-            );
-            handles.push(value);
-        }
-        self.loop_fold_group_cache
-            .borrow_mut()
-            .insert(group, handles.clone());
-        Ok(handles[lane as usize])
-    }
-
     pub(in crate::lower) fn lower_tile_subgroup_reduce_value(
         &self,
         expressions: &mut Arena<Expression>,
@@ -469,6 +353,11 @@ impl<'a> Lowerer<'a> {
             ElementType::Bool => {
                 return Err(LowerError::UnsupportedOperation(
                     "subgroup reduce on bool values is not supported",
+                ));
+            }
+            ElementType::CoopMatrixF32 { .. } => {
+                return Err(LowerError::UnsupportedOperation(
+                    "subgroup reduce on cooperative-matrix values is not supported",
                 ));
             }
         };

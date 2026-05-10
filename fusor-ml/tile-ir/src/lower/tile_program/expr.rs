@@ -1,4 +1,21 @@
 use super::*;
+use crate::ir::Builtin;
+use crate::lower::quantized::dot_lowering::{
+    DotLoweringCtx, Q4KGgmlDotLowering, Q6KGgmlDotLowering, Q8_0Dot8Lowering, QuantizedDotLowering,
+    VecDotLowering,
+};
+
+pub(in crate::lower) fn builtin_to_index_expr(builtin: Builtin) -> TileIndexExpr {
+    match builtin {
+        Builtin::Lane => TileIndexExpr::Lane,
+        Builtin::LoopIndex => TileIndexExpr::LoopIndex,
+        Builtin::ProgramId(axis) => TileIndexExpr::ProgramId(axis),
+        Builtin::SubgroupId => TileIndexExpr::SubgroupId,
+        Builtin::SubgroupLane => TileIndexExpr::SubgroupLane,
+        Builtin::SubgroupSize => TileIndexExpr::SubgroupSize,
+        Builtin::NumSubgroups => TileIndexExpr::NumSubgroups,
+    }
+}
 
 impl<'a> Lowerer<'a> {
     pub(in crate::lower) fn lower_tile_expr_lane(
@@ -43,6 +60,10 @@ impl<'a> Lowerer<'a> {
             }
             TileExpr::Index(index) => {
                 self.lower_tile_index_expr(expressions, scratch, body, index, spill_depth)
+            }
+            TileExpr::Builtin(builtin) => {
+                let index = builtin_to_index_expr(*builtin);
+                self.lower_tile_index_expr(expressions, scratch, body, &index, spill_depth)
             }
             TileExpr::Scalar(expr) => {
                 self.lower_tile_scalar_expr(expressions, scratch, body, expr, spill_depth)
@@ -248,96 +269,25 @@ impl<'a> Lowerer<'a> {
                 *lane,
                 spill_depth,
             ),
-            TileExpr::PinnedRef { id } => {
-                if let Some(handle) = self.pin_cache.borrow().get(id).copied() {
-                    return Ok(handle);
-                }
-                let value_expr = self
-                    .ir
-                    .pinned_values
-                    .get(id.index())
-                    .ok_or(LowerError::UnsupportedOperation("unknown pin id"))?
-                    .clone();
-                // Lower the bound value once into the current block; cache the
-                // SSA handle. naga's dominator-based SSA validates re-use from
-                // any nested block so a single handle suffices.
-                let value = self.lower_tile_expr_lane(
-                    expressions,
-                    scratch,
-                    body,
-                    &value_expr,
-                    spill_depth,
-                )?;
-                self.pin_cache.borrow_mut().insert(*id, value);
-                Ok(value)
-            }
-            TileExpr::LoopFoldGroupOutput { group, lane } => self
-                .lower_tile_loop_fold_group_output(
-                    expressions,
-                    scratch,
-                    body,
-                    *group,
-                    *lane,
-                    spill_depth,
-                ),
-            TileExpr::Dot4 { a, b } => {
-                let mut a_handles = Vec::with_capacity(4);
-                let mut b_handles = Vec::with_capacity(4);
-                for i in 0..4 {
-                    a_handles.push(self.lower_tile_expr_lane(
+            TileExpr::Compose4 { values } => {
+                let mut handles = Vec::with_capacity(4);
+                for value in values.iter() {
+                    handles.push(self.lower_tile_expr_lane(
                         expressions,
                         scratch,
                         body,
-                        &a[i],
+                        value,
                         spill_depth + 1,
                     )?);
                 }
-                for i in 0..4 {
-                    b_handles.push(self.lower_tile_expr_lane(
-                        expressions,
-                        scratch,
-                        body,
-                        &b[i],
-                        spill_depth + 1,
-                    )?);
-                }
-                let a_vec = expressions.append(
+                Ok(self.emit_tile_expr(
+                    expressions,
+                    body,
                     Expression::Compose {
                         ty: self.f32_vec4_ty,
-                        components: a_handles,
+                        components: handles,
                     },
-                    Span::default(),
-                );
-                let b_vec = expressions.append(
-                    Expression::Compose {
-                        ty: self.f32_vec4_ty,
-                        components: b_handles,
-                    },
-                    Span::default(),
-                );
-                body.push(
-                    Statement::Emit(Self::single_expression_range(expressions, a_vec)),
-                    Span::default(),
-                );
-                body.push(
-                    Statement::Emit(Self::single_expression_range(expressions, b_vec)),
-                    Span::default(),
-                );
-                let dot = expressions.append(
-                    Expression::Math {
-                        fun: MathFunction::Dot,
-                        arg: a_vec,
-                        arg1: Some(b_vec),
-                        arg2: None,
-                        arg3: None,
-                    },
-                    Span::default(),
-                );
-                body.push(
-                    Statement::Emit(Self::single_expression_range(expressions, dot)),
-                    Span::default(),
-                );
-                Ok(dot)
+                ))
             }
             TileExpr::Vec4Dot { left, right } => {
                 let left =
@@ -379,18 +329,18 @@ impl<'a> Lowerer<'a> {
                 col,
                 mask,
                 fill,
-            } => self.lower_tile_quantized_q8_0_dot8_expr(
-                expressions,
-                scratch,
-                body,
-                a,
-                src,
-                k_base,
-                col,
-                mask,
-                *fill,
-                src.format,
-                spill_depth,
+            } => Q8_0Dot8Lowering { a, k_base }.lower(
+                self,
+                DotLoweringCtx {
+                    expressions,
+                    scratch,
+                    body,
+                    spill_depth,
+                    src,
+                    col,
+                    mask,
+                    fill: *fill,
+                },
             ),
             TileExpr::QuantizedVecDot {
                 kind,
@@ -401,19 +351,24 @@ impl<'a> Lowerer<'a> {
                 mask,
                 fill,
                 block_n,
-            } => self.lower_tile_quantized_vec_dot_expr(
-                expressions,
-                scratch,
-                body,
-                *kind,
+            } => VecDotLowering {
+                kind: *kind,
                 a,
-                src,
                 k_base,
-                col,
-                mask,
-                *fill,
-                *block_n,
-                spill_depth,
+                block_n: *block_n,
+            }
+            .lower(
+                self,
+                DotLoweringCtx {
+                    expressions,
+                    scratch,
+                    body,
+                    spill_depth,
+                    src,
+                    col,
+                    mask,
+                    fill: *fill,
+                },
             ),
             TileExpr::QuantizedQ4KGgmlDot {
                 a_low,
@@ -426,21 +381,26 @@ impl<'a> Lowerer<'a> {
                 col,
                 mask,
                 fill,
-            } => self.lower_tile_quantized_q4k_ggml_dot_expr(
-                expressions,
-                scratch,
-                body,
+            } => Q4KGgmlDotLowering {
                 a_low,
                 a_high,
                 sums,
-                src,
                 block,
                 iq,
                 ir,
-                col,
-                mask,
-                *fill,
-                spill_depth,
+            }
+            .lower(
+                self,
+                DotLoweringCtx {
+                    expressions,
+                    scratch,
+                    body,
+                    spill_depth,
+                    src,
+                    col,
+                    mask,
+                    fill: *fill,
+                },
             ),
             TileExpr::QuantizedQ6KGgmlDot {
                 a,
@@ -451,19 +411,18 @@ impl<'a> Lowerer<'a> {
                 col,
                 mask,
                 fill,
-            } => self.lower_tile_quantized_q6k_ggml_dot_expr(
-                expressions,
-                scratch,
-                body,
-                a,
-                src,
-                block,
-                ip,
-                il,
-                col,
-                mask,
-                *fill,
-                spill_depth,
+            } => Q6KGgmlDotLowering { a, block, ip, il }.lower(
+                self,
+                DotLoweringCtx {
+                    expressions,
+                    scratch,
+                    body,
+                    spill_depth,
+                    src,
+                    col,
+                    mask,
+                    fill: *fill,
+                },
             ),
         }
     }

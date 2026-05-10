@@ -11,13 +11,13 @@ use naga::{
 };
 
 use crate::ir::{
-    BlockDequantId, BufferAccess, BufferId, CoopAccId, CoopFragmentId, CoopOperandRole,
-    DynamicOffset, ElementType, F32Bits, FlattenedMatrixMap, Im2ColNhwcMap, KernelIr, Layout,
-    LocalId, LocalRef, LoopFoldGroupId, MemoryLevel, Op, PinId, QuantizedVecDotKind,
-    StorageIndexMap, StorageView, TileBinaryOp, TileCompareOp, TileExpr, TileId, TileIndexExpr,
-    TileLinearLoadExpr, TileLiteral, TileLoadExpr, TileMaskExpr, TileOrigin, TileProgramOp,
-    TileQuantizedLoadExpr, TileReduceOp, TileRef, TileScalarExpr, TileStmt, TileStoreStmt,
-    TileUnaryOp, TileVec4LoadExpr,
+    BlockDequantId, BufferAccess, BufferId, CoopFragmentId, CoopOperandRole,
+    DynamicOffset, ElementType, F32Bits, FlattenedMatrixMap, Im2ColNhwcMap, KernelIr,
+    Layout, LocalId, LocalRef, MemoryLevel, Op, QuantizedVecDotKind,
+    StorageIndexMap, StorageView, TileBinaryOp, TileCompareOp, TileExpr, TileId,
+    TileIndexExpr, TileIter, TileLinearLoadExpr, TileLiteral, TileLoadExpr, TileMaskExpr,
+    TileOrigin, TileProgramOp, TileQuantizedLoadExpr, TileReduceOp, TileRef, TileScalarExpr,
+    TileStmt, TileStoreStmt, TileUnaryOp, TileVec4LoadExpr,
 };
 use crate::quantized::{GgmlQuantFormat, QuantizedMatrix};
 
@@ -140,18 +140,18 @@ struct Lowerer<'a> {
     uses_subgroup_size: bool,
     uses_num_subgroups: bool,
     block_dequant_cache: RefCell<HashMap<BlockDequantId, Vec<Handle<Expression>>>>,
-    pin_cache: RefCell<HashMap<PinId, Handle<Expression>>>,
     q8_activation_pack_cache: RefCell<HashMap<Vec<Handle<Expression>>, Q8ActivationPacks>>,
-    loop_fold_group_cache: RefCell<HashMap<LoopFoldGroupId, Vec<Handle<Expression>>>>,
-    fold_accumulator_locals: Vec<Handle<LocalVariable>>,
-    fold_group_offsets: Vec<usize>,
     coop_c_ty: Option<Handle<Type>>,
-    coop_acc_locals: Vec<Handle<LocalVariable>>,
+    /// SSA-cached cooperatively-loaded fragments. The producer
+    /// (`TileStmt::LoadCoop`) inserts its fresh `CoopFragmentId`; consumers
+    /// (`TileStmt::Mma`) read by id within the same scope. Cleared at
+    /// boundaries via `snapshot_coop_loop_caches`.
     coop_fragment_cache: RefCell<HashMap<CoopFragmentId, Handle<Expression>>>,
-    /// Latest SSA value of each cooperative accumulator. Lets MMAs chain
-    /// through SSA — `mma(c=load)` once, then `mma(c=last_ssa)` for the rest
-    /// of the scope, with a single Store at scope end.
-    coop_acc_value_cache: RefCell<HashMap<CoopAccId, Handle<Expression>>>,
+    /// Latest SSA value of each cooperative accumulator, keyed by the
+    /// accumulator's `LocalId`. Lets MMAs chain through SSA — `mma(c=load)`
+    /// once, then `mma(c=last_ssa)` for the rest of the scope, with a single
+    /// Store at scope end.
+    coop_acc_value_cache: RefCell<HashMap<LocalId, Handle<Expression>>>,
     uses_cooperative_matrix: bool,
 }
 
@@ -171,12 +171,11 @@ struct Q8ActivationPackValues {
 
 struct TileLoopCacheSnapshot {
     block_dequant: Vec<(BlockDequantId, Vec<Handle<Expression>>)>,
-    pin: Vec<(PinId, Handle<Expression>)>,
 }
 
 struct CoopLoopCacheSnapshot {
     fragments: Vec<(CoopFragmentId, Handle<Expression>)>,
-    acc_values: Vec<(CoopAccId, Handle<Expression>)>,
+    acc_values: Vec<(LocalId, Handle<Expression>)>,
 }
 
 #[derive(Copy, Clone)]

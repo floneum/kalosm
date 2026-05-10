@@ -80,15 +80,9 @@ impl<'a> Lowerer<'a> {
         Ok(())
     }
 
-    pub(in crate::lower) fn clear_store_caches(&self, clear_pins: bool) {
+    pub(in crate::lower) fn clear_store_caches(&self, _clear_pins: bool) {
         self.block_dequant_cache.borrow_mut().clear();
-        if clear_pins {
-            self.pin_cache.borrow_mut().clear();
-        }
         self.q8_activation_pack_cache.borrow_mut().clear();
-        // loop_fold_group_cache is intentionally NOT cleared here: group
-        // outputs survive across stores because the K loop is emitted into
-        // the outer body block, dominated by every store that follows.
     }
 
     pub(in crate::lower) fn push_masked_store(
