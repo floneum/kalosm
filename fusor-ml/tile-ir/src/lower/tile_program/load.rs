@@ -1,0 +1,193 @@
+use super::*;
+
+impl<'a> Lowerer<'a> {
+    pub(in crate::lower) fn lower_tile_load_expr(
+        &self,
+        expressions: &mut Arena<Expression>,
+        scratch: ScratchLocals,
+        body: &mut Block,
+        load: &TileLoadExpr,
+        spill_depth: usize,
+    ) -> Result<Handle<Expression>, LowerError> {
+        let element = load.src.buffer.element;
+        if matches!(load.mask, TileMaskExpr::True) {
+            let row =
+                self.lower_tile_index_expr(expressions, scratch, body, &load.row, spill_depth)?;
+            let col =
+                self.lower_tile_index_expr(expressions, scratch, body, &load.col, spill_depth)?;
+            let (src_index, src_index_emits) =
+                self.storage_index_from_coords(expressions, &load.src, &[row, col])?;
+            let (src_ptr, src_ptr_emits) =
+                self.storage_dynamic_pointer(expressions, &load.src, src_index)?;
+            Self::push_emits(body, src_index_emits);
+            Self::push_emits(body, src_ptr_emits);
+            return Ok(Self::emit_load(expressions, body, src_ptr));
+        }
+
+        let fill_source = load.fill.element();
+        let fill = expressions.append(Self::tile_literal(load.fill), Span::default());
+        let fill = self.cast_tile_value(expressions, body, fill, fill_source, element);
+        self.lower_masked_value_to_local(
+            expressions,
+            scratch,
+            body,
+            &load.mask,
+            spill_depth,
+            element,
+            fill,
+            |expressions, accept| {
+                let row = self.lower_tile_index_expr(
+                    expressions,
+                    scratch,
+                    accept,
+                    &load.row,
+                    spill_depth,
+                )?;
+                let col = self.lower_tile_index_expr(
+                    expressions,
+                    scratch,
+                    accept,
+                    &load.col,
+                    spill_depth,
+                )?;
+                let (src_index, src_index_emits) =
+                    self.storage_index_from_coords(expressions, &load.src, &[row, col])?;
+                let (src_ptr, src_ptr_emits) =
+                    self.storage_dynamic_pointer(expressions, &load.src, src_index)?;
+                Self::push_emits(accept, src_index_emits);
+                Self::push_emits(accept, src_ptr_emits);
+                Ok(Self::emit_load(expressions, accept, src_ptr))
+            },
+        )
+    }
+
+    pub(in crate::lower) fn lower_tile_vec4_load_expr(
+        &self,
+        expressions: &mut Arena<Expression>,
+        scratch: ScratchLocals,
+        body: &mut Block,
+        load: &TileVec4LoadExpr,
+        spill_depth: usize,
+    ) -> Result<Handle<Expression>, LowerError> {
+        if load.src.buffer.element != ElementType::F32Vec4 {
+            return Err(LowerError::UnsupportedOperation(
+                "vec4 load requires f32x4 storage",
+            ));
+        }
+
+        self.lower_indexed_storage_load(
+            expressions,
+            scratch,
+            body,
+            &load.src,
+            &load.index,
+            &load.mask,
+            spill_depth,
+            ElementType::F32Vec4,
+            |lowerer, expressions, body| {
+                lowerer.vec4_splat_literal(expressions, body, load.fill.get())
+            },
+        )
+    }
+
+    pub(in crate::lower) fn lower_tile_linear_load_expr(
+        &self,
+        expressions: &mut Arena<Expression>,
+        scratch: ScratchLocals,
+        body: &mut Block,
+        load: &TileLinearLoadExpr,
+        spill_depth: usize,
+    ) -> Result<Handle<Expression>, LowerError> {
+        let element = load.src.buffer.element;
+        self.lower_indexed_storage_load(
+            expressions,
+            scratch,
+            body,
+            &load.src,
+            &load.index,
+            &load.mask,
+            spill_depth,
+            element,
+            |lowerer, expressions, body| {
+                let fill_source = load.fill.element();
+                let fill = expressions.append(Self::tile_literal(load.fill), Span::default());
+                lowerer.cast_tile_value(expressions, body, fill, fill_source, element)
+            },
+        )
+    }
+
+    pub(in crate::lower) fn lower_indexed_storage_load(
+        &self,
+        expressions: &mut Arena<Expression>,
+        scratch: ScratchLocals,
+        body: &mut Block,
+        src: &StorageView,
+        index: &TileIndexExpr,
+        mask: &TileMaskExpr,
+        spill_depth: usize,
+        element: ElementType,
+        fill: impl FnOnce(&Self, &mut Arena<Expression>, &mut Block) -> Handle<Expression>,
+    ) -> Result<Handle<Expression>, LowerError> {
+        if matches!(mask, TileMaskExpr::True) {
+            let index =
+                self.lower_tile_index_expr(expressions, scratch, body, index, spill_depth)?;
+            let (src_ptr, src_ptr_emits) = self.storage_dynamic_pointer(expressions, src, index)?;
+            Self::push_emits(body, src_ptr_emits);
+            return Ok(Self::emit_load(expressions, body, src_ptr));
+        }
+
+        let fill = fill(self, expressions, body);
+        self.lower_masked_value_to_local(
+            expressions,
+            scratch,
+            body,
+            mask,
+            spill_depth,
+            element,
+            fill,
+            |expressions, accept| {
+                let index =
+                    self.lower_tile_index_expr(expressions, scratch, accept, index, spill_depth)?;
+                let (src_ptr, src_ptr_emits) =
+                    self.storage_dynamic_pointer(expressions, src, index)?;
+                Self::push_emits(accept, src_ptr_emits);
+                Ok(Self::emit_load(expressions, accept, src_ptr))
+            },
+        )
+    }
+
+    pub(in crate::lower) fn lower_tile_quantized_load_expr(
+        &self,
+        expressions: &mut Arena<Expression>,
+        scratch: ScratchLocals,
+        body: &mut Block,
+        load: &TileQuantizedLoadExpr,
+        spill_depth: usize,
+    ) -> Result<Handle<Expression>, LowerError> {
+        self.lower_masked_f32_value(
+            expressions,
+            scratch,
+            body,
+            &load.mask,
+            spill_depth,
+            load.fill,
+            |expressions, block| {
+                let row = self.lower_tile_index_expr(
+                    expressions,
+                    scratch,
+                    block,
+                    &load.row,
+                    spill_depth,
+                )?;
+                let col = self.lower_tile_index_expr(
+                    expressions,
+                    scratch,
+                    block,
+                    &load.col,
+                    spill_depth,
+                )?;
+                self.dequantize_qvalue(expressions, &load.src, row, col)
+            },
+        )
+    }
+}
