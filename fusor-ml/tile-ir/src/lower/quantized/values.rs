@@ -350,12 +350,8 @@ impl<'a> Lowerer<'a> {
             scale_chunk_base,
             local_scale_index,
         );
-        let scale_word_base = self.shr_lit(expressions, body, scale_index, 2);
-        let scale_word_off = self.add_lit(expressions, body, scale_word_base, 48);
-        let scale_word =
-            self.load_word_dynamic(expressions, matrix, base, scale_word_off, body)?;
-        let scale_lane = self.and_lit(expressions, body, scale_index, 3);
-        let scale_byte = self.byte_at(expressions, body, scale_word, scale_lane);
+        let scale_byte =
+            self.load_byte_dynamic(expressions, matrix, base, scale_index, 48, body)?;
         let scale = self.signed_byte_f32(expressions, body, scale_byte);
         let scale = self.mul(expressions, body, scale, d);
 
