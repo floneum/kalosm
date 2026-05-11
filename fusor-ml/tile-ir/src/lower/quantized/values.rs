@@ -488,17 +488,37 @@ impl<'a> Lowerer<'a> {
         a: &Q8ActivationPacks,
         body: &mut Block,
     ) -> Result<Handle<Expression>, LowerError> {
+        self.q8_activation_pack_pair_dot(expressions, body, k_base, a, |s, e, b, k, off| {
+            s.q4k_q8_activation_dot8(e, matrix, k, col, a, off, b)
+        })
+    }
+
+    /// Sum a per-pair dot product over every 2-pack chunk of the activation
+    /// stream. Shared by Q4K and Q6K x Q8 activation dot helpers.
+    pub(in crate::lower) fn q8_activation_pack_pair_dot(
+        &self,
+        expressions: &mut Arena<Expression>,
+        body: &mut Block,
+        k_base: Handle<Expression>,
+        a: &Q8ActivationPacks,
+        mut chunk: impl FnMut(
+            &Self,
+            &mut Arena<Expression>,
+            &mut Block,
+            Handle<Expression>,
+            usize,
+        ) -> Result<Handle<Expression>, LowerError>,
+    ) -> Result<Handle<Expression>, LowerError> {
         if a.len == 0 || !a.len.is_multiple_of(2) {
             return Err(LowerError::UnsupportedOperation(
-                "q4k x q8 activation dot requires an even number of activation packs",
+                "q8 activation dot requires an even number of activation packs",
             ));
         }
 
         let mut total = self.f32(expressions, 0.0);
         for pack_offset in (0..a.len).step_by(2) {
             let k = self.add_lit(expressions, body, k_base, (pack_offset * 4) as u32);
-            let chunk =
-                self.q4k_q8_activation_dot8(expressions, matrix, k, col, a, pack_offset, body)?;
+            let chunk = chunk(self, expressions, body, k, pack_offset)?;
             total = self.bin(expressions, body, BinaryOperator::Add, total, chunk);
         }
         Ok(total)

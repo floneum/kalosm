@@ -333,20 +333,9 @@ impl<'a> Lowerer<'a> {
             ));
         }
 
-        if a.len == 0 || !a.len.is_multiple_of(2) {
-            return Err(LowerError::UnsupportedOperation(
-                "q6k x q8 activation dot requires an even number of activation packs",
-            ));
-        }
-
-        let mut total = self.f32(expressions, 0.0);
-        for pack_offset in (0..a.len).step_by(2) {
-            let k = self.add_lit(expressions, body, k_base, (pack_offset * 4) as u32);
-            let chunk =
-                self.q6k_q8_activation_dot8(expressions, matrix, k, col, a, pack_offset, body)?;
-            total = self.bin(expressions, body, BinaryOperator::Add, total, chunk);
-        }
-        Ok(total)
+        self.q8_activation_pack_pair_dot(expressions, body, k_base, a, |s, e, b, k, off| {
+            s.q6k_q8_activation_dot8(e, matrix, k, col, a, off, b)
+        })
     }
 
     pub(in crate::lower) fn q6k_q8_activation_dot8(
