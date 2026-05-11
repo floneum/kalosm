@@ -33,16 +33,8 @@ impl<'a> Lowerer<'a> {
                 Self::mark_tile_live(ir, *dst, live);
                 Self::mark_tile_expr_live(ir, value, live);
             }
-            TileStmt::CopyToWorkgroupTile { dst, .. } => {
-                if let Some(slot) = live.get_mut(dst.id.index()) {
-                    *slot = true;
-                }
-            }
-            TileStmt::LoadCoop { tile, .. } => {
-                if let Some(slot) = live.get_mut(tile.id.index()) {
-                    *slot = true;
-                }
-            }
+            TileStmt::CopyToWorkgroupTile { dst, .. } => Self::mark_tile_live(ir, *dst, live),
+            TileStmt::LoadCoop { tile, .. } => Self::mark_tile_live(ir, *tile, live),
             TileStmt::ZeroCoopAcc { .. }
             | TileStmt::Barrier
             | TileStmt::Mma { .. }
@@ -279,10 +271,9 @@ impl<'a> Lowerer<'a> {
         });
     }
 
-    pub(super) fn mark_tile_live(ir: &KernelIr, tile: TileRef, live: &mut [bool]) {
-        if ir.tiles().get(tile.id.index()).is_none() {
-            return;
+    pub(super) fn mark_tile_live(_ir: &KernelIr, tile: TileRef, live: &mut [bool]) {
+        if let Some(slot) = live.get_mut(tile.id.index()) {
+            *slot = true;
         }
-        live[tile.id.index()] = true;
     }
 }
