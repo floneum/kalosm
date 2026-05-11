@@ -551,13 +551,7 @@ macro_rules! impl_tile_binary {
             type Output = Tile<N>;
 
             fn $method(self, rhs: Scalar) -> Self::Output {
-                Tile {
-                    expr: Expr::Binary {
-                        op: $op,
-                        left: Box::new(self.expr),
-                        right: Box::new(rhs.expr),
-                    },
-                }
+                self.binary($op, rhs.into())
             }
         }
     };
