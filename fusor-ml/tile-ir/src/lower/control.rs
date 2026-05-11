@@ -231,13 +231,8 @@ impl<'a> Lowerer<'a> {
                 // Lower each accumulator's update expression and store it back
                 // into the accumulator's local.
                 for acc in accumulators {
-                    let value = self.lower_tile_expr_lane(
-                        expressions,
-                        scratch,
-                        loop_body,
-                        &acc.update,
-                        0,
-                    )?;
+                    let value =
+                        self.lower_tile_expr(expressions, scratch, loop_body, &acc.update)?;
                     let acc_local =
                         self.private_local(LocalRef::new(acc.name, acc.element))?;
                     self.store_local(expressions, loop_body, acc_local, value);
