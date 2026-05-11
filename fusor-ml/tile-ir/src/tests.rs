@@ -1,5 +1,12 @@
 use super::*;
 
+/// Lower `ir` and panic with a labelled message on failure. Returns the
+/// lowered Naga kernel for tests that want to inspect the module.
+fn lower_or_fail(ir: &KernelIr, label: &str) -> NagaKernel {
+    ir.lower_to_naga()
+        .unwrap_or_else(|error| panic!("{label} lowering failed: {error}"))
+}
+
 fn ggml_quant_formats() -> [GgmlQuantFormat; 12] {
     [
         GgmlQuantFormat::Q4_0,
@@ -73,8 +80,7 @@ fn tile_source_softmax_lowers_to_naga() {
         });
     });
 
-    ir.lower_to_naga()
-        .unwrap_or_else(|error| panic!("tile softmax lowering failed: {error}"));
+    lower_or_fail(&ir, "tile softmax");
 }
 
 #[test]
@@ -109,8 +115,7 @@ fn streaming_flash_attention_regression_shape_lowers_to_naga() {
     .expect("streaming flash attention should build");
     let (ir, _) = kb.finish();
 
-    ir.lower_to_naga()
-        .unwrap_or_else(|error| panic!("streaming flash attention lowering failed: {error}"));
+    lower_or_fail(&ir, "streaming flash attention");
 }
 
 #[test]
@@ -125,9 +130,7 @@ fn lowered_naga_uses_anonymous_ir_objects_except_entry_point() {
             program.store(y.at(0, lane), value, mask);
         });
     });
-    let lowered = ir
-        .lower_to_naga()
-        .unwrap_or_else(|error| panic!("tile lowering failed: {error}"));
+    let lowered = lower_or_fail(&ir, "tile");
     let module = lowered.module();
 
     assert!(module.types.iter().all(|(_, ty)| ty.name.is_none()));
@@ -160,8 +163,7 @@ fn tile_source_dense_matmul_lowers_to_naga() {
         phase.matmul::<64>(&a, &b, &y);
     });
 
-    ir.lower_to_naga()
-        .unwrap_or_else(|error| panic!("dense matmul lowering failed: {error}"));
+    lower_or_fail(&ir, "dense matmul");
 }
 
 #[test]
@@ -174,8 +176,7 @@ fn tile_source_qmatmul_and_qgemv_lower_all_supported_ggml_formats() {
             let y = phase.storage_write::<F32, 2>(Shape::new([3, 7]));
             phase.qmatmul::<8, 4, 8>(&a, &b, &y, 4);
         });
-        ir.lower_to_naga()
-            .unwrap_or_else(|error| panic!("{format:?} tile qmatmul lowering failed: {error}"));
+        lower_or_fail(&ir, &format!("{format:?} tile qmatmul"));
 
         let ir = tile::build(|phase| {
             let a = phase.storage_read::<F32, 2>(Shape::new([1, k]));
@@ -187,8 +188,7 @@ fn tile_source_qmatmul_and_qgemv_lower_all_supported_ggml_formats() {
             ir.tiles().is_empty(),
             "{format:?} qgemv should use the subgroup perf path without workgroup scratch"
         );
-        ir.lower_to_naga()
-            .unwrap_or_else(|error| panic!("{format:?} tile qgemv lowering failed: {error}"));
+        lower_or_fail(&ir, &format!("{format:?} tile qgemv"));
     }
 }
 
@@ -234,8 +234,7 @@ fn coop_qmatmul_q8_0_lowers_through_subgroup_dsl() {
             .any(|local| matches!(local.element, ElementType::CoopMatrixF32 { .. })),
         "coop qmatmul must declare cooperative-matrix accumulator locals"
     );
-    ir.lower_to_naga()
-        .unwrap_or_else(|error| panic!("coop qmatmul lowering failed: {error}"));
+    lower_or_fail(&ir, "coop qmatmul");
 }
 
 #[test]
@@ -250,8 +249,7 @@ fn coop_qmatmul_q5_0_large_benchmark_shape_lowers() {
         phase.qmatmul::<128, 128, 32>(&a, &b, &y, 4);
     });
 
-    ir.lower_to_naga()
-        .unwrap_or_else(|error| panic!("large Q5_0 coop qmatmul lowering failed: {error}"));
+    lower_or_fail(&ir, "large Q5_0 coop qmatmul");
 }
 
 #[test]
@@ -326,8 +324,7 @@ fn primitive_qgemm_q8_0_in_dsl() {
         ir.tiles().is_empty(),
         "scalar primitive qgemm should not need workgroup scratch"
     );
-    ir.lower_to_naga()
-        .unwrap_or_else(|error| panic!("primitive qgemm lowering failed: {error}"));
+    lower_or_fail(&ir, "primitive qgemm");
 }
 
 #[test]
@@ -350,8 +347,7 @@ fn qdequantize_lowers_large_embedding_table_as_tile_program() {
         &store.value,
         Expr::Load(load) if matches!(load.src, LoadSource::Quantized(_))
     ));
-    ir.lower_to_naga()
-        .unwrap_or_else(|error| panic!("large Q4K qdequantize lowering failed: {error}"));
+    lower_or_fail(&ir, "large Q4K qdequantize");
 }
 
 #[test]
@@ -383,6 +379,5 @@ fn rms_norm_vec4_minimal_lowers() {
     };
     rms_norm_vec4(&mut kb, input, None, weight, None, output, meta, 1).unwrap();
     let (ir, _) = kb.finish();
-    ir.lower_to_naga()
-        .unwrap_or_else(|error| panic!("rms_norm_vec4 lowering failed: {error}"));
+    lower_or_fail(&ir, "rms_norm_vec4");
 }
