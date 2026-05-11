@@ -865,6 +865,13 @@ impl<const BLOCK: usize> TileBlock<'_, BLOCK> {
         self.push_stmt(TileStmt::Break);
     }
 
+    /// `if condition { break }` — the dominant kernel-side pattern for
+    /// counted/conditional `loop_forever` exits. Bare `break_loop` remains for
+    /// the unconditional case and for compound break bodies.
+    pub fn break_if(&mut self, condition: Tile<BLOCK>) {
+        self.if_then(condition, |program| program.break_loop());
+    }
+
     pub fn return_(&mut self) {
         self.push_stmt(TileStmt::Return);
     }

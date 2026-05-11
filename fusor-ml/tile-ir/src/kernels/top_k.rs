@@ -310,9 +310,7 @@ pub fn top_k_exactness<B>(
 
             program.loop_forever(|program| {
                 let chunk_value = program.load_local(&chunk);
-                program.if_then(chunk_value.clone().ge(u32_tile(meta.chunks)), |program| {
-                    program.break_loop();
-                });
+                program.break_if(chunk_value.clone().ge(u32_tile(meta.chunks)));
                 let bound_rank = chunk_value.clone() * u32_tile(meta.output_per_chunk)
                     + u32_tile(meta.candidate_count);
                 let bound_index = index1(
@@ -397,9 +395,7 @@ pub fn top_k_merge<B>(
             program.store_local(&scan_chunk, program.index(lane.clone()));
             program.loop_forever(|program| {
                 let chunk = program.load_local(&scan_chunk);
-                program.if_then(chunk.clone().ge(u32_tile(meta.chunks)), |program| {
-                    program.break_loop();
-                });
+                program.break_if(chunk.clone().ge(u32_tile(meta.chunks)));
                 program.store_workgroup(chunk_positions, chunk.clone(), u32_tile(0));
                 program.store_local(&scan_chunk, chunk + u32_tile(TOP_K_BLOCK as u32));
             });
@@ -408,9 +404,7 @@ pub fn top_k_merge<B>(
             program.store_local(&rank, u32_tile(0));
             program.loop_forever(|program| {
                 let rank_value = program.load_local(&rank);
-                program.if_then(rank_value.clone().ge(u32_tile(meta.k)), |program| {
-                    program.break_loop();
-                });
+                program.break_if(rank_value.clone().ge(u32_tile(meta.k)));
                 program.store_local(&local_best_value, f32_tile(NEG_MAX_F32));
                 program.store_local(&local_best_id, u32_tile(u32::MAX));
                 program.store_local(&local_best_chunk, u32_tile(u32::MAX));
@@ -418,9 +412,7 @@ pub fn top_k_merge<B>(
 
                 program.loop_forever(|program| {
                     let chunk = program.load_local(&scan_chunk);
-                    program.if_then(chunk.clone().ge(u32_tile(meta.chunks)), |program| {
-                        program.break_loop();
-                    });
+                    program.break_if(chunk.clone().ge(u32_tile(meta.chunks)));
                     let position = program.load_workgroup(chunk_positions, chunk.clone());
                     let in_chunk = position.clone().lt(u32_tile(meta.chunk_len));
                     program.if_then(in_chunk, |program| {
@@ -464,9 +456,7 @@ pub fn top_k_merge<B>(
                 program.store_local(&reduce_step, u32_tile(TOP_K_BLOCK as u32 / 2));
                 program.loop_forever(|program| {
                     let step = program.load_local(&reduce_step);
-                    program.if_then(step.clone().eq(u32_tile(0)), |program| {
-                        program.break_loop();
-                    });
+                    program.break_if(step.clone().eq(u32_tile(0)));
                     let participates = program.index(lane.clone()).lt(step.clone());
                     program.if_then(participates, |program| {
                         let other_index = program.index(lane.clone()) + step.clone();

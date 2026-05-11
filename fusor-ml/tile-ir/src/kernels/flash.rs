@@ -211,9 +211,7 @@ fn decode_score_for_kv<const BLOCK: usize>(
     program.store_local(dim_local, u32_tile(0));
     program.loop_forever(|program| {
         let dim = program.load_local(dim_local);
-        program.if_then(dim.clone().ge(u32_tile(DECODE_HEAD_DIM)), |program| {
-            program.break_loop();
-        });
+        program.break_if(dim.clone().ge(u32_tile(DECODE_HEAD_DIM)));
         let q_index = index4(
             meta.q_offset,
             meta.q_strides,
@@ -258,9 +256,7 @@ fn append_decode_output_loop<const BLOCK: usize>(
 ) {
     program.loop_forever(|program| {
         let kv = program.load_local(kv_local);
-        program.if_then(kv.clone().ge(active_kv_len.clone()), |program| {
-            program.break_loop();
-        });
+        program.break_if(kv.clone().ge(active_kv_len.clone()));
         let prob = program.load_workgroup(probs, kv.clone());
         let v_index = index4(
             meta.v_offset,
@@ -329,9 +325,7 @@ fn flash_decode_small_block<const BLOCK: usize, B>(
                 program.store_local(&kv_local, lane_value.clone());
                 program.loop_forever(|program| {
                     let kv = program.load_local(&kv_local);
-                    program.if_then(kv.clone().ge(active_kv_len.clone()), |program| {
-                        program.break_loop();
-                    });
+                    program.break_if(kv.clone().ge(active_kv_len.clone()));
                     let score = decode_score_for_kv(
                         program,
                         &q,
@@ -358,9 +352,7 @@ fn flash_decode_small_block<const BLOCK: usize, B>(
                 program.store_local(&kv_local, lane_value.clone());
                 program.loop_forever(|program| {
                     let kv = program.load_local(&kv_local);
-                    program.if_then(kv.clone().ge(active_kv_len.clone()), |program| {
-                        program.break_loop();
-                    });
+                    program.break_if(kv.clone().ge(active_kv_len.clone()));
                     let score = decode_score_for_kv(
                         program,
                         &q,
@@ -386,9 +378,7 @@ fn flash_decode_small_block<const BLOCK: usize, B>(
                 program.store_local(&kv_local, u32_tile(0));
                 program.loop_forever(|program| {
                     let tile_base = program.load_local(&kv_local);
-                    program.if_then(tile_base.clone().ge(active_kv_len.clone()), |program| {
-                        program.break_loop();
-                    });
+                    program.break_if(tile_base.clone().ge(active_kv_len.clone()));
                     let kv = tile_base.clone() + lane_value.clone();
                     let kv_valid = kv.clone().lt(active_kv_len.clone());
                     program.if_else(
@@ -422,9 +412,7 @@ fn flash_decode_small_block<const BLOCK: usize, B>(
                             let block_done = item_value.clone().ge(u32_tile(BLOCK as u32));
                             let kv = tile_base.clone() + item_value.clone();
                             let kv_done = kv.clone().ge(active_kv_len.clone());
-                            program.if_then(block_done.or(kv_done), |program| {
-                                program.break_loop();
-                            });
+                            program.break_if(block_done.or(kv_done));
                             let prob = program.load_workgroup(probs, item_value.clone());
                             let v_index = index4(
                                 meta.v_offset,

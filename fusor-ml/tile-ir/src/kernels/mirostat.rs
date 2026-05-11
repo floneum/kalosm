@@ -133,9 +133,7 @@ pub fn mirostat2<B>(
             program.store_local(&index, program.index(lane.clone()));
             program.loop_forever(|program| {
                 let index_value = program.load_local(&index);
-                program.if_then(index_value.clone().ge(u32_tile(meta.top_k)), |program| {
-                    program.break_loop();
-                });
+                program.break_if(index_value.clone().ge(u32_tile(meta.top_k)));
                 let weight =
                     mirostat_top_weight(program, &values, meta, max_value.clone(), index_value);
                 let current = program.load_local(&local_sum);
@@ -151,9 +149,7 @@ pub fn mirostat2<B>(
             program.store_local(&reduce_step, u32_tile(TOP_K_BLOCK as u32 / 2));
             program.loop_forever(|program| {
                 let step = program.load_local(&reduce_step);
-                program.if_then(step.clone().eq(u32_tile(0)), |program| {
-                    program.break_loop();
-                });
+                program.break_if(step.clone().eq(u32_tile(0)));
                 let participates = program.index(lane.clone()).lt(step.clone());
                 program.if_then(participates, |program| {
                     let rhs_index = program.index(lane.clone()) + step.clone();
@@ -221,9 +217,7 @@ pub fn mirostat2<B>(
                     program.loop_forever(|program| {
                         let scan_value = program.load_local(&scan);
                         let cutoff_value = program.load_local(&cutoff);
-                        program.if_then(scan_value.clone().ge(cutoff_value), |program| {
-                            program.break_loop();
-                        });
+                        program.break_if(scan_value.clone().ge(cutoff_value));
                         let scan_value = program.load_local(&scan);
                         let weight = mirostat_top_weight(
                             program,
@@ -253,9 +247,7 @@ pub fn mirostat2<B>(
                     program.loop_forever(|program| {
                         let scan_value = program.load_local(&scan);
                         let cutoff_value = program.load_local(&cutoff);
-                        program.if_then(scan_value.clone().ge(cutoff_value), |program| {
-                            program.break_loop();
-                        });
+                        program.break_if(scan_value.clone().ge(cutoff_value));
                         let scan_value = program.load_local(&scan);
                         let weight = mirostat_top_weight(
                             program,
