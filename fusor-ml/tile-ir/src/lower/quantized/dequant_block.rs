@@ -84,11 +84,7 @@ impl<'a> Lowerer<'a> {
         body: &mut Block,
     ) -> Result<(Handle<Expression>, Handle<Expression>, Handle<Expression>), LowerError> {
         let q_local = self.and_lit(e, body, q, 15);
-        let q_word = self.shr_lit(e, body, q_local, 2);
-        let word_off = self.add_lit(e, body, q_word, data_offset);
-        let word = self.load_word_dynamic(e, matrix, base, word_off, body)?;
-        let byte_lane = self.and_lit(e, body, q_local, 3);
-        let byte = self.byte_at(e, body, word, byte_lane);
+        let byte = self.load_byte_dynamic(e, matrix, base, q_local, data_offset, body)?;
         let low = self.and_lit(e, body, byte, 0x0f);
         let high4 = self.shr_lit(e, body, byte, 4);
         Ok((q_local, low, high4))
@@ -150,11 +146,7 @@ impl<'a> Lowerer<'a> {
         let pair_offset = self.shl_lit(e, body, pair, 4);
         let byte_base = self.bin(e, body, BinaryOperator::Add, byte_base, pair_offset);
         let byte_index = self.bin(e, body, BinaryOperator::Add, byte_base, q_local);
-        let word_off = self.shr_lit(e, body, byte_index, 2);
-        let word_off = self.add_lit(e, body, word_off, data_base);
-        let word = self.load_word_dynamic(e, matrix, base, word_off, body)?;
-        let byte_lane = self.and_lit(e, body, byte_index, 3);
-        let byte = self.byte_at(e, body, word, byte_lane);
+        let byte = self.load_byte_dynamic(e, matrix, base, byte_index, data_base, body)?;
         let shift = self.shr_lit(e, body, group_in_chunk, 1);
         let shift = self.shl_lit(e, body, shift, 1);
         let shifted = self.shr(e, body, byte, shift);
@@ -176,10 +168,7 @@ impl<'a> Lowerer<'a> {
         let dmin_word = self.load_word(e, matrix, base, 21, body)?;
         let dmin = self.bitcast_f32(e, body, dmin_word);
         let group = self.shr_lit(e, body, q, 4);
-        let scale_word_off = self.shr_lit(e, body, group, 2);
-        let scale_word = self.load_word_dynamic(e, matrix, base, scale_word_off, body)?;
-        let scale_lane = self.and_lit(e, body, group, 3);
-        let scale_byte = self.byte_at(e, body, scale_word, scale_lane);
+        let scale_byte = self.load_byte_dynamic(e, matrix, base, group, 0, body)?;
         let scale_quant = self.and_lit(e, body, scale_byte, 0x0f);
         let scale_quant_f = self.as_f32(e, body, scale_quant);
         let scale = self.mul(e, body, scale_quant_f, d);
@@ -209,10 +198,7 @@ impl<'a> Lowerer<'a> {
         let scale = self.mul(e, body, scale_quant_f, d);
         let parts = self.dequant_q23k_quant_f(e, matrix, base, q, group, 8, body)?;
         let hmask_index = self.bin(e, body, BinaryOperator::Add, parts.pair_offset, parts.q_local);
-        let hmask_word_off = self.shr_lit(e, body, hmask_index, 2);
-        let hword = self.load_word_dynamic(e, matrix, base, hmask_word_off, body)?;
-        let hmask_lane = self.and_lit(e, body, hmask_index, 3);
-        let hbyte = self.byte_at(e, body, hword, hmask_lane);
+        let hbyte = self.load_byte_dynamic(e, matrix, base, hmask_index, 0, body)?;
         let hmask_bit_pair = self.shr_lit(e, body, parts.group_in_chunk, 1);
         let chunk_mask_base = self.shl_lit(e, body, parts.chunk, 2);
         let hmask_bit = self.bin(
@@ -255,11 +241,7 @@ impl<'a> Lowerer<'a> {
     ) -> Result<Handle<Expression>, LowerError> {
         let scale_word = self.load_word(e, matrix, base, 0, body)?;
         let scale = self.bitcast_f32(e, body, scale_word);
-        let q_word = self.shr_lit(e, body, q, 2);
-        let word_off = self.add_lit(e, body, q_word, data_offset);
-        let word = self.load_word_dynamic(e, matrix, base, word_off, body)?;
-        let byte_lane = self.and_lit(e, body, q, 3);
-        let byte = self.byte_at(e, body, word, byte_lane);
+        let byte = self.load_byte_dynamic(e, matrix, base, q, data_offset, body)?;
         let signed = self.signed_byte_f32(e, body, byte);
         Ok(self.mul(e, body, signed, scale))
     }
@@ -311,11 +293,7 @@ impl<'a> Lowerer<'a> {
         let group_pair_offset = self.shl_lit(e, body, group_pair, 5);
         let byte_index = self.bin(e, body, BinaryOperator::Add, group_pair_offset, in_group);
         let data_base = if q5 { 13 } else { 5 };
-        let data_word = self.shr_lit(e, body, byte_index, 2);
-        let data_off = self.add_lit(e, body, data_word, data_base);
-        let word = self.load_word_dynamic(e, matrix, base, data_off, body)?;
-        let byte_lane = self.and_lit(e, body, byte_index, 3);
-        let byte = self.byte_at(e, body, word, byte_lane);
+        let byte = self.load_byte_dynamic(e, matrix, base, byte_index, data_base, body)?;
         let group_low = self.and_lit(e, body, group, 1);
         let high = self.cmp_lit(e, body, BinaryOperator::NotEqual, group_low, 0);
         let byte_hi = self.shr_lit(e, body, byte, 4);
@@ -323,11 +301,7 @@ impl<'a> Lowerer<'a> {
         let mut quant = self.select(e, body, high, byte_hi, byte_lo);
         if q5 {
             let qh_byte_index = self.and_lit(e, body, q, 31);
-            let qh_word = self.shr_lit(e, body, qh_byte_index, 2);
-            let qh_off = self.add_lit(e, body, qh_word, 5);
-            let qh = self.load_word_dynamic(e, matrix, base, qh_off, body)?;
-            let qh_lane = self.and_lit(e, body, qh_byte_index, 3);
-            let qh_byte = self.byte_at(e, body, qh, qh_lane);
+            let qh_byte = self.load_byte_dynamic(e, matrix, base, qh_byte_index, 5, body)?;
             let qh_bit_index = self.shr_lit(e, body, q, 5);
             let shifted_qh = self.shr(e, body, qh_byte, qh_bit_index);
             let bit = self.and_lit(e, body, shifted_qh, 1);
@@ -370,10 +344,7 @@ impl<'a> Lowerer<'a> {
             chunk_low_base,
             local_low_index,
         );
-        let low_word_off = self.shr_lit(e, body, lower_index, 2);
-        let low_word = self.load_word_dynamic(e, matrix, base, low_word_off, body)?;
-        let low_lane = self.and_lit(e, body, lower_index, 3);
-        let low_byte = self.byte_at(e, body, low_word, low_lane);
+        let low_byte = self.load_byte_dynamic(e, matrix, base, lower_index, 0, body)?;
         let low_nibble_shift = self.shr_lit(e, body, low_group, 1);
         let low_nibble_shift = self.shl_lit(e, body, low_nibble_shift, 2);
         let low_shifted = self.shr(e, body, low_byte, low_nibble_shift);
@@ -386,11 +357,7 @@ impl<'a> Lowerer<'a> {
             high_chunk_base,
             high_byte_index,
         );
-        let high_word_base = self.shr_lit(e, body, high_index, 2);
-        let high_word_off = self.add_lit(e, body, high_word_base, 32);
-        let high_word = self.load_word_dynamic(e, matrix, base, high_word_off, body)?;
-        let high_lane = self.and_lit(e, body, high_index, 3);
-        let high_byte = self.byte_at(e, body, high_word, high_lane);
+        let high_byte = self.load_byte_dynamic(e, matrix, base, high_index, 32, body)?;
         let high_shift = self.shl_lit(e, body, low_group, 1);
         let high_shifted = self.shr(e, body, high_byte, high_shift);
         let high2 = self.and_lit(e, body, high_shifted, 3);
@@ -413,11 +380,7 @@ impl<'a> Lowerer<'a> {
             scale_chunk_base,
             local_scale_index,
         );
-        let scale_word_base = self.shr_lit(e, body, scale_index, 2);
-        let scale_word_off = self.add_lit(e, body, scale_word_base, 48);
-        let scale_word = self.load_word_dynamic(e, matrix, base, scale_word_off, body)?;
-        let scale_lane = self.and_lit(e, body, scale_index, 3);
-        let scale_byte = self.byte_at(e, body, scale_word, scale_lane);
+        let scale_byte = self.load_byte_dynamic(e, matrix, base, scale_index, 48, body)?;
         let scale = self.signed_byte_f32(e, body, scale_byte);
         let scale = self.mul(e, body, scale, d);
         let quant_f = self.as_f32(e, body, quant);

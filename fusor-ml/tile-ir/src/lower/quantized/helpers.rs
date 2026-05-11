@@ -176,6 +176,28 @@ impl<'a> Lowerer<'a> {
         self.and_lit(e, body, shifted, 0xff)
     }
 
+    /// Load `matrix.data[word_offset + byte_index >> 2]` and extract the
+    /// `byte_index & 3`-th byte. The dequantizers all index packed-byte arrays
+    /// this way: `byte_index >> 2` picks the word and `byte_index & 3` picks
+    /// the byte within the word. `word_offset` is the constant word offset to
+    /// the start of the byte array (e.g. 5 for q4k data, 32/48 for q6k high
+    /// nibbles / scales).
+    pub(in crate::lower) fn load_byte_dynamic(
+        &self,
+        e: &mut Arena<Expression>,
+        matrix: &QuantizedMatrix,
+        base: Handle<Expression>,
+        byte_index: Handle<Expression>,
+        word_offset: u32,
+        body: &mut Block,
+    ) -> Result<Handle<Expression>, LowerError> {
+        let word_base = self.shr_lit(e, body, byte_index, 2);
+        let word_off = self.add_lit(e, body, word_base, word_offset);
+        let word = self.load_word_dynamic(e, matrix, base, word_off, body)?;
+        let lane = self.and_lit(e, body, byte_index, 3);
+        Ok(self.byte_at(e, body, word, lane))
+    }
+
     pub(in crate::lower) fn signed_byte_f32(
         &self,
         e: &mut Arena<Expression>,
