@@ -159,57 +159,9 @@ impl<'a> Lowerer<'a> {
             Handle<Expression>,
         ) -> Result<T, LowerError>,
     ) -> Result<T, LowerError> {
-        let loop_ptr = expressions.append(
-            Expression::LocalVariable(scratch.loop_index),
-            Span::default(),
-        );
-        let zero = expressions.append(Expression::Literal(Literal::U32(0)), Span::default());
-        body.push(
-            Statement::Store {
-                pointer: loop_ptr,
-                value: zero,
-            },
-            Span::default(),
-        );
-
-        let mut loop_body = Block::new();
-        let loop_index =
-            expressions.append(Expression::Load { pointer: loop_ptr }, Span::default());
-        loop_body.push(
-            Statement::Emit(Self::single_expression_range(expressions, loop_index)),
-            Span::default(),
-        );
-        let done = self.bin_lit_u32(
-            expressions,
-            &mut loop_body,
-            BinaryOperator::GreaterEqual,
-            loop_index,
-            iterations,
-        );
-        loop_body.push(
-            Statement::If {
-                condition: done,
-                accept: Block::from_vec(vec![Statement::Break]),
-                reject: Block::new(),
-            },
-            Span::default(),
-        );
-
-        let result = build_body(expressions, &mut loop_body, loop_index)?;
-
-        loop_body.push(
-            self.increment_u32_local(expressions, scratch.loop_index, 1),
-            Span::default(),
-        );
-        body.push(
-            Statement::Loop {
-                body: loop_body,
-                continuing: Block::new(),
-                break_if: None,
-            },
-            Span::default(),
-        );
-        Ok(result)
+        let count =
+            expressions.append(Expression::Literal(Literal::U32(iterations)), Span::default());
+        self.emit_dynamic_counted_loop(expressions, scratch, body, count, build_body)
     }
 
     pub(super) fn snapshot_tile_loop_caches(&self) -> TileLoopCacheSnapshot {
@@ -371,20 +323,4 @@ impl<'a> Lowerer<'a> {
         )
     }
 
-    pub(super) fn bin_lit_u32(
-        &self,
-        expressions: &mut Arena<Expression>,
-        body: &mut Block,
-        op: BinaryOperator,
-        left: Handle<Expression>,
-        right: u32,
-    ) -> Handle<Expression> {
-        let right = expressions.append(Expression::Literal(Literal::U32(right)), Span::default());
-        let value = expressions.append(Expression::Binary { op, left, right }, Span::default());
-        body.push(
-            Statement::Emit(Self::single_expression_range(expressions, value)),
-            Span::default(),
-        );
-        value
-    }
 }
