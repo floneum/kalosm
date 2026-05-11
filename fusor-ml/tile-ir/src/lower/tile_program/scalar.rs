@@ -12,36 +12,12 @@ impl<'a> Lowerer<'a> {
         spill_depth: usize,
     ) -> Result<Handle<Expression>, LowerError> {
         let element = self.tile_expr_element(value)?;
-        self.lower_tile_loop_accumulate_value(
-            expressions,
-            scratch,
-            body,
-            value,
-            iterations,
-            op,
-            element,
-            Self::tile_reduce_identity(op, element),
-            0,
-            spill_depth,
-        )
-    }
-
-pub(in crate::lower) fn lower_tile_loop_accumulate_value(
-        &self,
-        expressions: &mut Arena<Expression>,
-        scratch: ScratchLocals,
-        body: &mut Block,
-        value: &Expr,
-        iterations: u32,
-        op: TileReduceOp,
-        element: ElementType,
-        initial: Expression,
-        acc_spill_depth: usize,
-        spill_depth: usize,
-    ) -> Result<Handle<Expression>, LowerError> {
-        let acc = self.tile_expr_spill_local(scratch, element, acc_spill_depth)?;
+        let acc = self.tile_expr_spill_local(scratch, element, 0)?;
         let acc_ptr = expressions.append(Expression::LocalVariable(acc), Span::default());
-        let initial = expressions.append(initial, Span::default());
+        let initial = expressions.append(
+            Self::tile_reduce_identity(op, element),
+            Span::default(),
+        );
         body.push(
             Statement::Store {
                 pointer: acc_ptr,
