@@ -33,12 +33,7 @@ pub(super) fn index1<const BLOCK: usize>(
     offset: u32,
     stride: u32,
 ) -> Tile<BLOCK> {
-    let scaled = if stride == 1 {
-        index
-    } else {
-        index * u32_tile(stride)
-    };
-    scaled + u32_tile(offset)
+    super::helpers::add_scaled_index(u32_tile(offset), index, stride)
 }
 
 fn load_processor_param_f32(

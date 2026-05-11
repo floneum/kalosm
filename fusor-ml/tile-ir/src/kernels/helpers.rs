@@ -24,10 +24,10 @@ pub(super) fn add_scaled_index<const BLOCK: usize>(
     component: Tile<BLOCK>,
     stride: u32,
 ) -> Tile<BLOCK> {
-    if stride == 0 {
-        index
-    } else {
-        index + component * u32_tile(stride)
+    match stride {
+        0 => index,
+        1 => index + component,
+        _ => index + component * u32_tile(stride),
     }
 }
 
