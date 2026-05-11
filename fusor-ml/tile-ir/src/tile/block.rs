@@ -53,7 +53,7 @@ macro_rules! quantized_vec_dot_entrypoint {
                     k: DotK::Base(k_base.into_index()),
                     col: col.into_index(),
                     mask: mask.expr,
-                    fill: F32Bits::new(fill),
+                    fill: Box::new(Expr::Literal(TileLiteral::F32(F32Bits::new(fill)))),
                     block_n: N as u32,
                 },
             }
@@ -214,7 +214,7 @@ impl<const BLOCK: usize> TileBlock<'_, BLOCK> {
                 row: row.into_index(),
                 col: col.into_index(),
                 mask: mask.expr,
-                fill: F32Bits::new(fill),
+                fill: Box::new(Expr::Literal(TileLiteral::F32(F32Bits::new(fill)))),
             }),
         }
     }
@@ -241,7 +241,7 @@ impl<const BLOCK: usize> TileBlock<'_, BLOCK> {
         let k_base = k_base.into_index();
         let col = col.into_index();
         let mask_expr = mask.expr;
-        let fill_bits = F32Bits::new(fill);
+        let fill_expr: Box<Expr> = Box::new(Expr::Literal(TileLiteral::F32(F32Bits::new(fill))));
         std::array::from_fn(|lane| Tile {
             expr: Expr::QuantizedBlockLane {
                 id,
@@ -249,7 +249,7 @@ impl<const BLOCK: usize> TileBlock<'_, BLOCK> {
                 k_base: k_base.clone(),
                 col: col.clone(),
                 mask: mask_expr.clone(),
-                fill: fill_bits,
+                fill: fill_expr.clone(),
                 block_n: N as u32,
                 lane: lane as u32,
             },
@@ -509,7 +509,7 @@ impl<const BLOCK: usize> TileBlock<'_, BLOCK> {
                 k: DotK::Base(k_base.into_index()),
                 col: col.into_index(),
                 mask: mask.expr,
-                fill: F32Bits::new(fill),
+                fill: Box::new(Expr::Literal(TileLiteral::F32(F32Bits::new(fill)))),
                 block_n: 8,
             },
         }
@@ -564,7 +564,7 @@ impl<const BLOCK: usize> TileBlock<'_, BLOCK> {
                 },
                 col: col.into_index(),
                 mask: mask.expr,
-                fill: F32Bits::new(fill),
+                fill: Box::new(Expr::Literal(TileLiteral::F32(F32Bits::new(fill)))),
                 block_n: 32,
             },
         }
@@ -595,7 +595,7 @@ impl<const BLOCK: usize> TileBlock<'_, BLOCK> {
                 },
                 col: col.into_index(),
                 mask: mask.expr,
-                fill: F32Bits::new(fill),
+                fill: Box::new(Expr::Literal(TileLiteral::F32(F32Bits::new(fill)))),
                 block_n: 16,
             },
         }

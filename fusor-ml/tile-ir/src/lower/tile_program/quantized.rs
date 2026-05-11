@@ -17,7 +17,7 @@ impl<'a> Lowerer<'a> {
         k: &DotK,
         col: &Expr,
         mask: &Expr,
-        fill: F32Bits,
+        fill: &Expr,
         block_n: u32,
         spill_depth: usize,
     ) -> Result<Handle<Expression>, LowerError> {
@@ -223,7 +223,7 @@ impl<'a> Lowerer<'a> {
         k_base: &Expr,
         col: &Expr,
         mask: &Expr,
-        fill: F32Bits,
+        fill: &Expr,
         spill_depth: usize,
         lower_value: impl FnOnce(
             &mut Arena<Expression>,
@@ -287,7 +287,7 @@ impl<'a> Lowerer<'a> {
         k_base: &Expr,
         col: &Expr,
         mask: &Expr,
-        fill: F32Bits,
+        fill: &Expr,
         block_n: u32,
         lane: u32,
         spill_depth: usize,
@@ -330,10 +330,11 @@ impl<'a> Lowerer<'a> {
                     ))
             })
             .collect::<Result<_, _>>()?;
-        let fill_value = expressions.append(
-            Expression::Literal(Literal::F32(fill.get())),
-            Span::default(),
-        );
+        let fill_source = self.tile_expr_element(fill)?;
+        let fill_value =
+            self.lower_tile_expr_lane(expressions, scratch, body, fill, spill_depth)?;
+        let fill_value =
+            self.cast_tile_value(expressions, body, fill_value, fill_source, ElementType::F32);
         for local in &tmp_locals {
             let ptr = expressions.append(Expression::LocalVariable(*local), Span::default());
             body.push(
@@ -440,7 +441,7 @@ impl<'a> Lowerer<'a> {
         body: &mut Block,
         mask: &Expr,
         spill_depth: usize,
-        fill: F32Bits,
+        fill: &Expr,
         lower_value: impl FnOnce(
             &mut Arena<Expression>,
             &mut Block,
@@ -453,10 +454,11 @@ impl<'a> Lowerer<'a> {
             return Ok(value);
         }
 
-        let fill = expressions.append(
-            Expression::Literal(Literal::F32(fill.get())),
-            Span::default(),
-        );
+        let fill_source = self.tile_expr_element(fill)?;
+        let fill_handle =
+            self.lower_tile_expr_lane(expressions, scratch, body, fill, spill_depth)?;
+        let fill_handle =
+            self.cast_tile_value(expressions, body, fill_handle, fill_source, ElementType::F32);
         self.lower_masked_value_to_local(
             expressions,
             scratch,
@@ -464,7 +466,7 @@ impl<'a> Lowerer<'a> {
             mask,
             spill_depth,
             ElementType::F32,
-            fill,
+            fill_handle,
             |expressions, accept| {
                 let (value, emits) = lower_value(expressions, accept)?;
                 Self::push_emits(accept, emits);

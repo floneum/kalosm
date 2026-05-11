@@ -198,11 +198,15 @@ impl<'a> Lowerer<'a> {
             }
             Expr::LoadWorkgroup { index, .. } => pred(index),
             Expr::QuantizedLoad(load) => {
-                pred(&load.row) || pred(&load.col) || pred(&load.mask)
+                pred(&load.row) || pred(&load.col) || pred(&load.mask) || pred(&load.fill)
             }
             Expr::QuantizedBlockLane {
-                k_base, col, mask, ..
-            } => pred(k_base) || pred(col) || pred(mask),
+                k_base,
+                col,
+                mask,
+                fill,
+                ..
+            } => pred(k_base) || pred(col) || pred(mask) || pred(fill),
             Expr::Unary { value, .. }
             | Expr::Cast { value, .. }
             | Expr::Bitcast { value, .. }
@@ -222,6 +226,7 @@ impl<'a> Lowerer<'a> {
                 k,
                 col,
                 mask,
+                fill,
                 ..
             } => {
                 let activations_match = match activations {
@@ -238,7 +243,7 @@ impl<'a> Lowerer<'a> {
                     DotK::Base(k_base) => pred(k_base),
                     DotK::Block { block, c0, c1 } => pred(block) || pred(c0) || pred(c1),
                 };
-                activations_match || k_match || pred(col) || pred(mask)
+                activations_match || k_match || pred(col) || pred(mask) || pred(fill)
             }
         }
     }

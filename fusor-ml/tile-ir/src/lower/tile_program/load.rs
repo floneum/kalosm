@@ -151,7 +151,7 @@ impl<'a> Lowerer<'a> {
             body,
             &load.mask,
             spill_depth,
-            load.fill,
+            &load.fill,
             |expressions, block| {
                 let row = self.lower_tile_expr_lane(
                     expressions,

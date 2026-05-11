@@ -1,8 +1,8 @@
 use crate::quantized::QuantizedMatrix;
 
 use super::{
-    BlockDequantId, ElementType, F32Bits, LocalRef, StorageView, TileBinaryOp, TileCompareOp,
-    TileLiteral, TileReduceOp, TileRef, TileUnaryOp, WorkgroupAxis,
+    BlockDequantId, ElementType, LocalRef, StorageView, TileBinaryOp, TileCompareOp, TileLiteral,
+    TileReduceOp, TileRef, TileUnaryOp, WorkgroupAxis,
 };
 
 /// Built-in u32 quantities that show up as leaves in index/address arithmetic.
@@ -96,14 +96,15 @@ pub enum Expr {
     },
     /// One lane of a fused N-wide quantized dequant. All lanes of the same
     /// `id` share the block scale lookup; the lowerer emits the helper once
-    /// and reuses the result across lanes.
+    /// and reuses the result across lanes. `fill` is always-`f32`; see
+    /// `TileLoadExpr` for the wider `fill` semantics.
     QuantizedBlockLane {
         id: BlockDequantId,
         src: QuantizedMatrix,
         k_base: Box<Expr>,
         col: Box<Expr>,
         mask: Box<Expr>,
-        fill: F32Bits,
+        fill: Box<Expr>,
         block_n: u32,
         lane: u32,
     },
@@ -120,14 +121,15 @@ pub enum Expr {
     },
     /// Per-column dot of activations against a dequantized quantized-matrix
     /// block. The activation packing (`activations`) and the K coordinate
-    /// shape (`k`) together select the lowering helper.
+    /// shape (`k`) together select the lowering helper. `fill` is the
+    /// masked-out value; quantized dots always produce `f32`.
     QuantizedDot {
         src: QuantizedMatrix,
         activations: PackedActivations,
         k: DotK,
         col: Box<Expr>,
         mask: Box<Expr>,
-        fill: F32Bits,
+        fill: Box<Expr>,
         /// Dot width hint. Meaningful for `F32`/`Q8` activation paths over a
         /// flat `Base` K coordinate; for `Block` K the lowerer dispatches on
         /// shape and ignores this value.
@@ -204,11 +206,12 @@ pub struct TileLinearLoadExpr {
 }
 
 /// A masked dequantizing rank-1 tile load from a packed quantized matrix.
+/// `fill` is always-`f32`; see `TileLoadExpr` for the wider `fill` semantics.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TileQuantizedLoadExpr {
     pub src: QuantizedMatrix,
     pub row: Box<Expr>,
     pub col: Box<Expr>,
     pub mask: Box<Expr>,
-    pub fill: F32Bits,
+    pub fill: Box<Expr>,
 }
