@@ -251,22 +251,8 @@ impl<'a> Lowerer<'a> {
         b_id: CoopFragmentId,
     ) -> Result<(), LowerError> {
         let acc_local = self.private_local(acc)?;
-        let a = self
-            .coop_fragment_cache
-            .borrow()
-            .get(&a_id)
-            .copied()
-            .ok_or(LowerError::UnsupportedOperation(
-                "coop_mma A fragment not loaded in current scope",
-            ))?;
-        let b = self
-            .coop_fragment_cache
-            .borrow()
-            .get(&b_id)
-            .copied()
-            .ok_or(LowerError::UnsupportedOperation(
-                "coop_mma B fragment not loaded in current scope",
-            ))?;
+        let a = self.coop_fragment_handle(a_id, "A")?;
+        let b = self.coop_fragment_handle(b_id, "B")?;
         // Get the current SSA value of this accumulator: cache hit → reuse;
         // cache miss → emit one Load from the accumulator local. Subsequent
         // MMAs in this scope chain through SSA without touching the local.
@@ -294,6 +280,25 @@ impl<'a> Lowerer<'a> {
         );
         self.coop_acc_value_cache.borrow_mut().insert(acc.id, next);
         Ok(())
+    }
+
+    /// Look up a previously-loaded coop fragment by id. Both operands of an
+    /// MMA need this lookup; `role` is interpolated into the error message
+    /// when the fragment isn't in the cache.
+    fn coop_fragment_handle(
+        &self,
+        id: CoopFragmentId,
+        role: &'static str,
+    ) -> Result<Handle<Expression>, LowerError> {
+        self.coop_fragment_cache
+            .borrow()
+            .get(&id)
+            .copied()
+            .ok_or(LowerError::UnsupportedOperation(match role {
+                "A" => "coop_mma A fragment not loaded in current scope",
+                "B" => "coop_mma B fragment not loaded in current scope",
+                _ => "coop_mma fragment not loaded in current scope",
+            }))
     }
 
     /// Flush every cached accumulator SSA back to its local. Called at the
