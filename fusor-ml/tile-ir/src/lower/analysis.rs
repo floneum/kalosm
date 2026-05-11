@@ -30,11 +30,11 @@ impl<'a> Lowerer<'a> {
             TileStmt::StoreIndexed(store) => Self::mark_tile_expr_live(ir, &store.value, live),
             TileStmt::StoreLocal { value, .. } => Self::mark_tile_expr_live(ir, value, live),
             TileStmt::StoreWorkgroup { dst, value, .. } => {
-                Self::mark_tile_live(ir, *dst, live);
+                Self::mark_tile_live(*dst, live);
                 Self::mark_tile_expr_live(ir, value, live);
             }
-            TileStmt::CopyToWorkgroupTile { dst, .. } => Self::mark_tile_live(ir, *dst, live),
-            TileStmt::LoadCoop { tile, .. } => Self::mark_tile_live(ir, *tile, live),
+            TileStmt::CopyToWorkgroupTile { dst, .. } => Self::mark_tile_live(*dst, live),
+            TileStmt::LoadCoop { tile, .. } => Self::mark_tile_live(*tile, live),
             TileStmt::ZeroCoopAcc { .. }
             | TileStmt::Barrier
             | TileStmt::Mma { .. }
@@ -259,9 +259,9 @@ impl<'a> Lowerer<'a> {
 
     fn mark_tile_expr_live(ir: &KernelIr, expr: &Expr, live: &mut [bool]) {
         match expr {
-            Expr::LoadWorkgroup { src, .. } => Self::mark_tile_live(ir, *src, live),
+            Expr::LoadWorkgroup { src, .. } => Self::mark_tile_live(*src, live),
             Expr::Reduce { scratch, .. } => {
-                Self::mark_tile_live(ir, *scratch, live);
+                Self::mark_tile_live(*scratch, live);
             }
             _ => {}
         }
@@ -271,7 +271,7 @@ impl<'a> Lowerer<'a> {
         });
     }
 
-    pub(super) fn mark_tile_live(_ir: &KernelIr, tile: TileRef, live: &mut [bool]) {
+    pub(super) fn mark_tile_live(tile: TileRef, live: &mut [bool]) {
         if let Some(slot) = live.get_mut(tile.id.index()) {
             *slot = true;
         }
