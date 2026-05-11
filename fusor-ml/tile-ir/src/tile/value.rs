@@ -133,9 +133,15 @@ impl<const N: usize> IntoIndex<N> for &Range<N> {
     }
 }
 
+/// `Box<Expr::Literal(TileLiteral::U32(value)))` — the const-RHS shape every
+/// `Index op u32` overload and `index_compare` builds.
+fn boxed_u32_literal(value: u32) -> Box<Expr> {
+    Box::new(Expr::Literal(TileLiteral::U32(value)))
+}
+
 impl<const N: usize> IntoIndex<N> for u32 {
     fn into_index(self) -> Box<Expr> {
-        Box::new(Expr::Literal(TileLiteral::U32(self)))
+        boxed_u32_literal(self)
     }
 }
 
@@ -156,7 +162,7 @@ pub(super) fn index_compare<const N: usize>(left: Box<Expr>, op: TileCompareOp, 
         expr: Box::new(Expr::Compare {
             op,
             left,
-            right: Box::new(Expr::Literal(TileLiteral::U32(value))),
+            right: boxed_u32_literal(value),
         }),
     }
 }
@@ -183,97 +189,64 @@ macro_rules! index_compare_methods {
 
 index_compare_methods!(lt => Lt, le => Le, gt => Gt, ge => Ge, eq => Eq);
 
+/// Build `$ctor { expr: Expr::Binary(op, self.expr, U32(rhs)) }` — the body
+/// every arm of `impl_index_u32_ops!` produces. The two assert arms (`Div`,
+/// `Rem`) wrap this with a non-zero check on `rhs`.
+impl ScalarIndex {
+    fn binary_u32_lit(self, op: TileBinaryOp, rhs: u32) -> Self {
+        Self {
+            expr: Box::new(Expr::Binary {
+                op,
+                left: self.expr,
+                right: boxed_u32_literal(rhs),
+            }),
+        }
+    }
+}
+
+impl<const N: usize> Range<N> {
+    fn binary_u32_lit(self, op: TileBinaryOp, rhs: u32) -> Self {
+        Self {
+            expr: Box::new(Expr::Binary {
+                op,
+                left: self.expr,
+                right: boxed_u32_literal(rhs),
+            }),
+        }
+    }
+}
+
 macro_rules! impl_index_u32_ops {
-    (generic($($generics:tt)+), $ty:ty, $out:ty, $ctor:ident, $div_msg:literal, $mod_msg:literal) => {
-        impl_index_u32_ops!(@impl [impl<$($generics)+>] $ty, $out, $ctor, $div_msg, $mod_msg);
+    (generic($($generics:tt)+), $ty:ty, $div_msg:literal, $mod_msg:literal) => {
+        impl_index_u32_ops!(@impl [impl<$($generics)+>] $ty, $div_msg, $mod_msg);
     };
-    ($ty:ty, $out:ty, $ctor:ident, $div_msg:literal, $mod_msg:literal) => {
-        impl_index_u32_ops!(@impl [impl] $ty, $out, $ctor, $div_msg, $mod_msg);
+    ($ty:ty, $div_msg:literal, $mod_msg:literal) => {
+        impl_index_u32_ops!(@impl [impl] $ty, $div_msg, $mod_msg);
     };
-    (@impl [$($impl_head:tt)*] $ty:ty, $out:ty, $ctor:ident, $div_msg:literal, $mod_msg:literal) => {
-        $($impl_head)* Add<u32> for $ty {
-            type Output = $out;
+    (@impl [$($impl_head:tt)*] $ty:ty, $div_msg:literal, $mod_msg:literal) => {
+        impl_index_u32_ops!(@arm [$($impl_head)*] $ty, Add, add, TileBinaryOp::Add);
+        impl_index_u32_ops!(@arm [$($impl_head)*] $ty, Mul, mul, TileBinaryOp::Mul);
+        impl_index_u32_ops!(@arm [$($impl_head)*] $ty, BitAnd, bitand, TileBinaryOp::BitAnd);
+        impl_index_u32_ops!(@arm [$($impl_head)*] $ty, BitXor, bitxor, TileBinaryOp::BitXor);
+        impl_index_u32_ops!(@assert_arm [$($impl_head)*] $ty, Div, div, TileBinaryOp::Div, $div_msg);
+        impl_index_u32_ops!(@assert_arm [$($impl_head)*] $ty, Rem, rem, TileBinaryOp::Rem, $mod_msg);
+    };
+    (@arm [$($impl_head:tt)*] $ty:ty, $trait:ident, $method:ident, $op:expr) => {
+        $($impl_head)* $trait<u32> for $ty {
+            type Output = $ty;
 
-            fn add(self, rhs: u32) -> Self::Output {
-                $ctor {
-                    expr: Box::new(Expr::Binary {
-                        op: TileBinaryOp::Add,
-                        left: self.expr,
-                        right: Box::new(Expr::Literal(TileLiteral::U32(rhs))),
-                    }),
-                }
+            fn $method(self, rhs: u32) -> Self::Output {
+                self.binary_u32_lit($op, rhs)
             }
         }
+    };
+    (@assert_arm [$($impl_head:tt)*] $ty:ty, $trait:ident, $method:ident, $op:expr, $msg:literal) => {
+        $($impl_head)* $trait<u32> for $ty {
+            type Output = $ty;
 
-        $($impl_head)* Mul<u32> for $ty {
-            type Output = $out;
-
-            fn mul(self, rhs: u32) -> Self::Output {
-                $ctor {
-                    expr: Box::new(Expr::Binary {
-                        op: TileBinaryOp::Mul,
-                        left: self.expr,
-                        right: Box::new(Expr::Literal(TileLiteral::U32(rhs))),
-                    }),
-                }
-            }
-        }
-
-        $($impl_head)* Div<u32> for $ty {
-            type Output = $out;
-
-            fn div(self, rhs: u32) -> Self::Output {
-                assert!(rhs > 0, $div_msg);
-                $ctor {
-                    expr: Box::new(Expr::Binary {
-                        op: TileBinaryOp::Div,
-                        left: self.expr,
-                        right: Box::new(Expr::Literal(TileLiteral::U32(rhs))),
-                    }),
-                }
-            }
-        }
-
-        $($impl_head)* BitAnd<u32> for $ty {
-            type Output = $out;
-
-            fn bitand(self, rhs: u32) -> Self::Output {
-                $ctor {
-                    expr: Box::new(Expr::Binary {
-                        op: TileBinaryOp::BitAnd,
-                        left: self.expr,
-                        right: Box::new(Expr::Literal(TileLiteral::U32(rhs))),
-                    }),
-                }
-            }
-        }
-
-        $($impl_head)* BitXor<u32> for $ty {
-            type Output = $out;
-
-            fn bitxor(self, rhs: u32) -> Self::Output {
-                $ctor {
-                    expr: Box::new(Expr::Binary {
-                        op: TileBinaryOp::BitXor,
-                        left: self.expr,
-                        right: Box::new(Expr::Literal(TileLiteral::U32(rhs))),
-                    }),
-                }
-            }
-        }
-
-        $($impl_head)* Rem<u32> for $ty {
-            type Output = $out;
-
-            fn rem(self, rhs: u32) -> Self::Output {
-                assert!(rhs > 0, $mod_msg);
-                $ctor {
-                    expr: Box::new(Expr::Binary {
-                        op: TileBinaryOp::Rem,
-                        left: self.expr,
-                        right: Box::new(Expr::Literal(TileLiteral::U32(rhs))),
-                    }),
-                }
+            fn $method(self, rhs: u32) -> Self::Output {
+                assert!(rhs > 0, $msg);
+                self.binary_u32_lit($op, rhs)
             }
         }
     };
@@ -281,16 +254,12 @@ macro_rules! impl_index_u32_ops {
 
 impl_index_u32_ops!(
     ScalarIndex,
-    ScalarIndex,
-    ScalarIndex,
     "scalar index divisor must be non-zero",
     "scalar index modulus must be non-zero"
 );
 impl_index_u32_ops!(
     generic(const N: usize),
     Range<N>,
-    Range<N>,
-    Range,
     "tile index divisor must be non-zero",
     "tile index modulus must be non-zero"
 );
