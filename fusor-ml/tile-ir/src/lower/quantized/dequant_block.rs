@@ -1,5 +1,17 @@
 use super::*;
 
+/// Intermediate values produced by `dequant_q23k_quant_f`. The 2-bit dequant
+/// shares enough address arithmetic between Q2K and Q3K to be worth lifting,
+/// but Q3K reuses the offsets to compute its high-bit mask while Q2K only
+/// keeps the dequantized value.
+pub(in crate::lower) struct Q23KQuantParts {
+    pub group_in_chunk: Handle<Expression>,
+    pub chunk: Handle<Expression>,
+    pub pair_offset: Handle<Expression>,
+    pub q_local: Handle<Expression>,
+    pub quant_f: Handle<Expression>,
+}
+
 impl<'a> Lowerer<'a> {
     pub(in crate::lower) fn dequant_affine(
         &self,
@@ -115,16 +127,7 @@ impl<'a> Lowerer<'a> {
         group: Handle<Expression>,
         data_base: u32,
         body: &mut Block,
-    ) -> Result<
-        (
-            Handle<Expression>,
-            Handle<Expression>,
-            Handle<Expression>,
-            Handle<Expression>,
-            Handle<Expression>,
-        ),
-        LowerError,
-    > {
+    ) -> Result<Q23KQuantParts, LowerError> {
         let q_local = self.and_lit(e, body, q, 15);
         let chunk = self.shr_lit(e, body, group, 3);
         let group_in_chunk = self.and_lit(e, body, group, 7);
@@ -143,7 +146,7 @@ impl<'a> Lowerer<'a> {
         let shifted = self.shr(e, body, byte, shift);
         let quant = self.and_lit(e, body, shifted, 3);
         let quant_f = self.as_f32(e, body, quant);
-        Ok((group_in_chunk, chunk, pair_offset, q_local, quant_f))
+        Ok(Q23KQuantParts { group_in_chunk, chunk, pair_offset, q_local, quant_f })
     }
 
     pub(in crate::lower) fn dequant_q2k(
@@ -169,9 +172,8 @@ impl<'a> Lowerer<'a> {
         let min_quant = self.shr_lit(e, body, scale_byte, 4);
         let min_quant_f = self.as_f32(e, body, min_quant);
         let min = self.mul(e, body, min_quant_f, dmin);
-        let (_, _, _, _, quant_f) =
-            self.dequant_q23k_quant_f(e, matrix, base, q, group, 4, body)?;
-        let scaled = self.mul(e, body, quant_f, scale);
+        let parts = self.dequant_q23k_quant_f(e, matrix, base, q, group, 4, body)?;
+        let scaled = self.mul(e, body, parts.quant_f, scale);
         Ok(self.sub(e, body, scaled, min))
     }
 
@@ -191,15 +193,14 @@ impl<'a> Lowerer<'a> {
         let center = self.f32(e, 32.0);
         let scale_quant_f = self.sub(e, body, scale_quant_f, center);
         let scale = self.mul(e, body, scale_quant_f, d);
-        let (group_in_chunk, chunk, pair_offset, q_local, quant_f) =
-            self.dequant_q23k_quant_f(e, matrix, base, q, group, 8, body)?;
-        let hmask_index = self.bin(e, body, BinaryOperator::Add, pair_offset, q_local);
+        let parts = self.dequant_q23k_quant_f(e, matrix, base, q, group, 8, body)?;
+        let hmask_index = self.bin(e, body, BinaryOperator::Add, parts.pair_offset, parts.q_local);
         let hmask_word_off = self.shr_lit(e, body, hmask_index, 2);
         let hword = self.load_word_dynamic(e, matrix, base, hmask_word_off, body)?;
         let hmask_lane = self.and_lit(e, body, hmask_index, 3);
         let hbyte = self.byte_at(e, body, hword, hmask_lane);
-        let hmask_bit_pair = self.shr_lit(e, body, group_in_chunk, 1);
-        let chunk_mask_base = self.shl_lit(e, body, chunk, 2);
+        let hmask_bit_pair = self.shr_lit(e, body, parts.group_in_chunk, 1);
+        let chunk_mask_base = self.shl_lit(e, body, parts.chunk, 2);
         let hmask_bit = self.bin(
             e,
             body,
@@ -214,7 +215,7 @@ impl<'a> Lowerer<'a> {
         let zero = self.f32(e, 0.0);
         let four = self.f32(e, 4.0);
         let penalty = self.select(e, body, high_set, zero, four);
-        let centered = self.sub(e, body, quant_f, penalty);
+        let centered = self.sub(e, body, parts.quant_f, penalty);
         Ok(self.mul(e, body, centered, scale))
     }
 
