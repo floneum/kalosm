@@ -534,7 +534,7 @@ impl<'a> Lowerer<'a> {
                     )?,
                     _ => unreachable!(),
                 };
-                for (ptr, value) in tile_ptrs.into_iter().zip(values.into_iter()) {
+                for (ptr, value) in tile_ptrs.into_iter().zip(values) {
                     accept.push(
                         Statement::Store {
                             pointer: ptr,

@@ -86,7 +86,7 @@ impl<'a> Lowerer<'a> {
         if group_size == 0
             || !group_size.is_power_of_two()
             || group_size > self.workgroup_invocations
-            || self.workgroup_invocations % group_size != 0
+            || !self.workgroup_invocations.is_multiple_of(group_size)
         {
             return Err(LowerError::UnsupportedOperation(
                 "tile reduce requires a power-of-two group size that divides the block",

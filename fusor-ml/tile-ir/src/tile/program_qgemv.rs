@@ -147,10 +147,10 @@ impl Program {
                 if b.cols >= 8192 {
                     return self.qgemv_perf::<4, 8, 8, 128>(a, b, y, workgroups_x);
                 }
-                return self.qgemv_perf::<4, 4, 8, 128>(a, b, y, workgroups_x);
+                self.qgemv_perf::<4, 4, 8, 128>(a, b, y, workgroups_x)
             }
             GgmlQuantFormat::Q8_1 => {
-                return self.qgemv_perf::<4, 4, 8, 128>(a, b, y, workgroups_x);
+                self.qgemv_perf::<4, 4, 8, 128>(a, b, y, workgroups_x)
             }
             GgmlQuantFormat::Q4K => {
                 if b.rows <= 4096 && b.cols >= 4096 && b.cols < 8192 {
@@ -174,22 +174,22 @@ impl Program {
                 {
                     return self.qgemv_perf::<8, 8, 8, 256>(a, b, y, workgroups_x);
                 }
-                return self.qgemv_perf::<4, 8, 8, 128>(a, b, y, workgroups_x);
+                self.qgemv_perf::<4, 8, 8, 128>(a, b, y, workgroups_x)
             }
             GgmlQuantFormat::Q5_0 => {
-                return self.qgemv_perf::<2, 4, 16, 64>(a, b, y, workgroups_x);
+                self.qgemv_perf::<2, 4, 16, 64>(a, b, y, workgroups_x)
             }
             GgmlQuantFormat::Q4_0
             | GgmlQuantFormat::Q4_1
             | GgmlQuantFormat::Q5_1
             | GgmlQuantFormat::Q2K => {
-                return self.qgemv_perf::<2, 4, 8, 64>(a, b, y, workgroups_x);
+                self.qgemv_perf::<2, 4, 8, 64>(a, b, y, workgroups_x)
             }
             GgmlQuantFormat::Q3K | GgmlQuantFormat::Q8K => {
-                return self.qgemv_perf::<2, 2, 8, 64>(a, b, y, workgroups_x);
+                self.qgemv_perf::<2, 2, 8, 64>(a, b, y, workgroups_x)
             }
             GgmlQuantFormat::Q5K => {
-                return self.qgemv_perf::<2, 1, 8, 64>(a, b, y, workgroups_x);
+                self.qgemv_perf::<2, 1, 8, 64>(a, b, y, workgroups_x)
             }
             GgmlQuantFormat::Q6K => {
                 if b.rows <= 4096 && b.cols >= 8192 {
@@ -206,7 +206,7 @@ impl Program {
                 {
                     return self.qgemv_perf::<4, 4, 8, 128>(a, b, y, workgroups_x);
                 }
-                return self.qgemv_perf::<8, 4, 16, 256>(a, b, y, workgroups_x);
+                self.qgemv_perf::<8, 4, 16, 256>(a, b, y, workgroups_x)
             }
         }
     }

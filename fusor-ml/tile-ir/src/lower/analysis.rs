@@ -208,13 +208,13 @@ impl<'a> Lowerer<'a> {
             } => {
                 let activations_match = match activations {
                     PackedActivations::F32(a) | PackedActivations::Q8(a) => {
-                        a.iter().any(|expr| pred(expr))
+                        a.iter().any(&mut pred)
                     }
                     PackedActivations::Q4KGgml { low, high, sums } => low
                         .iter()
                         .chain(high.iter())
                         .chain(sums.iter())
-                        .any(|expr| pred(expr)),
+                        .any(&mut pred),
                 };
                 let k_match = match k {
                     DotK::Base(k_base) => pred(k_base),

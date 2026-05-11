@@ -699,7 +699,7 @@ impl<const BLOCK: usize> TileBlock<'_, BLOCK> {
         value: Tile<BLOCK>,
     ) -> Tile<BLOCK> {
         assert!(
-            GROUP > 0 && GROUP <= BLOCK && GROUP.is_power_of_two() && BLOCK % GROUP == 0,
+            GROUP > 0 && GROUP <= BLOCK && GROUP.is_power_of_two() && BLOCK.is_multiple_of(GROUP),
             "tile group reduction size must be a power-of-two divisor of the block"
         );
         let scratch = self.program.alloc_tile::<F32>(Layout::contiguous(

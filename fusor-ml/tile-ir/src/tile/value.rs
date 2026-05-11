@@ -449,7 +449,7 @@ impl<const N: usize> Tile<N> {
         let half = Tile::literal(TileLiteral::F32(F32Bits::new(0.5)));
         let one = Tile::literal(TileLiteral::F32(F32Bits::new(1.0)));
         let coeff = Tile::literal(TileLiteral::F32(F32Bits::new(0.044_715)));
-        let sqrt_2_over_pi = Tile::literal(TileLiteral::F32(F32Bits::new(0.797_884_56)));
+        let sqrt_2_over_pi = Tile::literal(TileLiteral::F32(F32Bits::new(0.797_884_6)));
         let x = self;
         let x_cubed = x.clone() * x.clone() * x.clone();
         let inner = sqrt_2_over_pi * (x.clone() + coeff * x_cubed);

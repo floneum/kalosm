@@ -310,9 +310,9 @@ impl Program {
             BM,
             BN,
             BK,
-            m as usize % BM == 0,
-            b.cols as usize % BN == 0,
-            k as usize % BK == 0,
+            (m as usize).is_multiple_of(BM),
+            (b.cols as usize).is_multiple_of(BN),
+            (k as usize).is_multiple_of(BK),
             cooperative_store_layout_supported(&y.view.layout),
         );
         dispatch_qmatmul!(self, path, a, b, y, {});
@@ -416,7 +416,7 @@ impl Program {
 
             program.while_true(k_iterations, |program| {
                 let k_base = program.loop_index() * BK as u32;
-                program.copy_storage_to_tile(a_tile, &a_clone, &row_base, &k_base);
+                program.copy_storage_to_tile(a_tile, a_clone, &row_base, &k_base);
                 program.copy_quant_to_tile(b_tile, &b_clone, &k_base, &col_base);
                 program.workgroup_barrier();
 
@@ -463,7 +463,7 @@ impl Program {
                 for c in 0..TILE_COLS_PER_SG {
                     let row = row_base.clone() + sg_row_base.clone() + r * COOP_DIM;
                     let col = col_base.clone() + sg_col_base.clone() + c * COOP_DIM;
-                    program.coop_store(&accs[r as usize][c as usize], &y_clone, row, col);
+                    program.coop_store(&accs[r as usize][c as usize], y_clone, row, col);
                 }
             }
         });
@@ -532,7 +532,7 @@ impl Program {
             "gemv maps one output row to each subgroup"
         );
         assert!(
-            VALUES_PER_LANE % 4 == 0,
+            VALUES_PER_LANE.is_multiple_of(4),
             "gemv values per lane must be divisible by dot4 width"
         );
         let [m, k] = matrix_shape(&a.view.layout);

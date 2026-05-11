@@ -50,8 +50,8 @@ pub const fn qmatmul_path(
     cooperative_store_supported: bool,
 ) -> QmatmulPath {
     if bk != 32
-        || bm % 32 != 0
-        || bn % 32 != 0
+        || !bm.is_multiple_of(32)
+        || !bn.is_multiple_of(32)
         || !m_div_bm
         || !n_div_bn
         || !k_div_bk

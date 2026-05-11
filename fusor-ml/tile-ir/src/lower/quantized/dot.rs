@@ -703,7 +703,7 @@ impl<'a> Lowerer<'a> {
         for offset in offsets {
             words.push(self.load_word_dynamic(expressions, matrix, parts.base, offset, body)?);
         }
-        let words = words.try_into().ok().expect("q4k word count mismatch");
+        let words = words.try_into().expect("q4k word count mismatch");
         let group_low = self.and_lit(expressions, body, parts.group, 1);
         let nibble_shift = self.shl_lit(expressions, body, group_low, 2);
         Ok((words, nibble_shift))
