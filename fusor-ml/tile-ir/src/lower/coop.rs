@@ -221,7 +221,9 @@ impl<'a> Lowerer<'a> {
         let ptr = self.tile_dynamic_pointer(expressions, tile, index, body)?;
         let stride =
             expressions.append(Expression::Literal(Literal::U32(stride_u)), Span::default());
-        let frag = expressions.append(
+        let frag = self.emit(
+            expressions,
+            body,
             Expression::CooperativeLoad {
                 columns: COOP_SIZE,
                 rows: COOP_SIZE,
@@ -232,11 +234,6 @@ impl<'a> Lowerer<'a> {
                     row_major: false,
                 },
             },
-            Span::default(),
-        );
-        body.push(
-            Statement::Emit(Self::single_expression_range(expressions, frag)),
-            Span::default(),
         );
         self.coop_fragment_cache.borrow_mut().insert(id, frag);
         Ok(())
@@ -393,16 +390,7 @@ impl<'a> Lowerer<'a> {
             )?;
             let storage_ptr =
                 self.storage_dynamic_pointer(expressions, src, storage_index, &mut accept)?;
-            let value = expressions.append(
-                Expression::Load {
-                    pointer: storage_ptr,
-                },
-                Span::default(),
-            );
-            accept.push(
-                Statement::Emit(Self::single_expression_range(expressions, value)),
-                Span::default(),
-            );
+            let value = Self::emit_load(expressions, &mut accept, storage_ptr);
             accept.push(
                 Statement::Store {
                     pointer: tile_ptr,
@@ -578,11 +566,7 @@ impl<'a> Lowerer<'a> {
         let stride =
             expressions.append(Expression::Literal(Literal::U32(stride_u)), Span::default());
         let acc_ptr = expressions.append(Expression::LocalVariable(acc_local), Span::default());
-        let acc_value = expressions.append(Expression::Load { pointer: acc_ptr }, Span::default());
-        body.push(
-            Statement::Emit(Self::single_expression_range(expressions, acc_value)),
-            Span::default(),
-        );
+        let acc_value = Self::emit_load(expressions, body, acc_ptr);
         body.push(
             Statement::CooperativeStore {
                 target: acc_value,

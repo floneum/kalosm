@@ -207,21 +207,7 @@ impl<'a> Lowerer<'a> {
                     self.lower_tile_expr_lane(expressions, scratch, body, left, spill_depth + 1)?;
                 let right =
                     self.lower_tile_expr_lane(expressions, scratch, body, right, spill_depth + 1)?;
-                let dot = expressions.append(
-                    Expression::Math {
-                        fun: MathFunction::Dot,
-                        arg: left,
-                        arg1: Some(right),
-                        arg2: None,
-                        arg3: None,
-                    },
-                    Span::default(),
-                );
-                body.push(
-                    Statement::Emit(Self::single_expression_range(expressions, dot)),
-                    Span::default(),
-                );
-                Ok(dot)
+                Ok(self.dot_f32_vec4(expressions, body, left, right))
             }
             Expr::QuantizedDot {
                 src,
@@ -263,12 +249,7 @@ impl<'a> Lowerer<'a> {
                     Expression::LocalVariable(self.current_loop_index()),
                     Span::default(),
                 );
-                let value = expressions.append(Expression::Load { pointer }, Span::default());
-                body.push(
-                    Statement::Emit(Self::single_expression_range(expressions, value)),
-                    Span::default(),
-                );
-                value
+                Self::emit_load(expressions, body, pointer)
             }
             Builtin::ProgramId(axis) => {
                 let wg = expressions.append(
