@@ -723,45 +723,8 @@ impl<'a> Lowerer<'a> {
         left: &[Handle<Expression>],
         right: &[Handle<Expression>],
     ) -> Handle<Expression> {
-        debug_assert_eq!(left.len(), 4);
-        debug_assert_eq!(right.len(), 4);
-
-        let left = expressions.append(
-            Expression::Compose {
-                ty: self.f32_vec4_ty,
-                components: left.to_vec(),
-            },
-            Span::default(),
-        );
-        body.push(
-            Statement::Emit(Self::single_expression_range(expressions, left)),
-            Span::default(),
-        );
-        let right = expressions.append(
-            Expression::Compose {
-                ty: self.f32_vec4_ty,
-                components: right.to_vec(),
-            },
-            Span::default(),
-        );
-        body.push(
-            Statement::Emit(Self::single_expression_range(expressions, right)),
-            Span::default(),
-        );
-        let dot = expressions.append(
-            Expression::Math {
-                fun: MathFunction::Dot,
-                arg: left,
-                arg1: Some(right),
-                arg2: None,
-                arg3: None,
-            },
-            Span::default(),
-        );
-        body.push(
-            Statement::Emit(Self::single_expression_range(expressions, dot)),
-            Span::default(),
-        );
-        dot
+        let left = self.compose_f32_vec4(expressions, body, left.try_into().unwrap());
+        let right = self.compose_f32_vec4(expressions, body, right.try_into().unwrap());
+        self.dot_f32_vec4(expressions, body, left, right)
     }
 }
