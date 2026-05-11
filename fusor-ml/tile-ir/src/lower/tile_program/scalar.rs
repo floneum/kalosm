@@ -166,12 +166,8 @@ impl<'a> Lowerer<'a> {
         let lhs_ptr = self.tile_dynamic_pointer(expressions, scratch_tile, lane, &mut body)?;
         let rhs_ptr =
             self.tile_dynamic_pointer(expressions, scratch_tile, rhs_index, &mut body)?;
-        let lhs = expressions.append(Expression::Load { pointer: lhs_ptr }, Span::default());
-        let rhs = expressions.append(Expression::Load { pointer: rhs_ptr }, Span::default());
-        body.push(
-            Statement::Emit(Self::range_from(expressions, lhs, rhs)),
-            Span::default(),
-        );
+        let lhs = Self::emit_load(expressions, &mut body, lhs_ptr);
+        let rhs = Self::emit_load(expressions, &mut body, rhs_ptr);
         let reduced = self.emit(
             expressions,
             &mut body,

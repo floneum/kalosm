@@ -32,14 +32,6 @@ impl<'a> Lowerer<'a> {
         Range::new_from_bounds(value, value)
     }
 
-    pub(super) fn range_from(
-        _expressions: &Arena<Expression>,
-        first: Handle<Expression>,
-        second: Handle<Expression>,
-    ) -> Range<Expression> {
-        Range::new_from_bounds(first, second)
-    }
-
     pub(super) fn increment_u32_local(
         &self,
         expressions: &mut Arena<Expression>,
@@ -48,22 +40,18 @@ impl<'a> Lowerer<'a> {
     ) -> Statement {
         let amount = self.u32(expressions, amount);
         let pointer = self.local_var(expressions, local);
-        let current = expressions.append(Expression::Load { pointer }, Span::default());
-        let next = expressions.append(
-            Expression::Binary {
-                op: BinaryOperator::Add,
-                left: current,
-                right: amount,
-            },
+        let mut block = Block::new();
+        let current = Self::emit_load(expressions, &mut block, pointer);
+        let next = self.emit(expressions, &mut block, Expression::Binary {
+            op: BinaryOperator::Add,
+            left: current,
+            right: amount,
+        });
+        block.push(
+            Statement::Store { pointer, value: next },
             Span::default(),
         );
-        Statement::Block(Block::from_vec(vec![
-            Statement::Emit(Self::range_from(expressions, current, next)),
-            Statement::Store {
-                pointer,
-                value: next,
-            },
-        ]))
+        Statement::Block(block)
     }
 
     /// Same shape as `emit_counted_loop` but takes a dynamic `iterations`
