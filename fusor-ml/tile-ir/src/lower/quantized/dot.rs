@@ -516,10 +516,7 @@ impl<'a> Lowerer<'a> {
             let mut packed_values = Vec::with_capacity(4);
             for lane in 0..4 {
                 let source_lane = chunk * 4 + lane;
-                let byte_lane = expressions.append(
-                    Expression::Literal(Literal::U32((source_lane % 4) as u32)),
-                    Span::default(),
-                );
+                let byte_lane = self.u32(expressions, (source_lane % 4) as u32);
                 let byte = self.byte_at(expressions, body, words[source_lane / 4], byte_lane);
                 let shifted = self.shr(expressions, body, byte, nibble_shift);
                 let quant = self.and_lit(expressions, body, shifted, 0x0f);
@@ -549,10 +546,7 @@ impl<'a> Lowerer<'a> {
             self.q4k_quant_words::<WORDS>(expressions, matrix, &parts, whole_group_pair, body)?;
 
         let data = std::array::from_fn(|source_lane| {
-            let byte_lane = expressions.append(
-                Expression::Literal(Literal::U32((source_lane % 4) as u32)),
-                Span::default(),
-            );
+            let byte_lane = self.u32(expressions, (source_lane % 4) as u32);
             let byte = self.byte_at(expressions, body, words[source_lane / 4], byte_lane);
             let shifted = self.shr(expressions, body, byte, nibble_shift);
             self.and_lit(expressions, body, shifted, 0x0f)

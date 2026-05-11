@@ -69,10 +69,7 @@ impl<'a> Lowerer<'a> {
             Handle<Expression>,
         ) -> Result<T, LowerError>,
     ) -> Result<T, LowerError> {
-        let loop_ptr = expressions.append(
-            Expression::LocalVariable(scratch.loop_index),
-            Span::default(),
-        );
+        let loop_ptr = self.local_var(expressions, scratch.loop_index);
         let zero = self.u32(expressions, 0);
         body.push(
             Statement::Store {
