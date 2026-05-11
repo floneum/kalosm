@@ -225,7 +225,9 @@ impl<'a> Lowerer<'a> {
         self.emit(e, body, Expression::Binary { op, left, right })
     }
 
-    pub(in crate::lower) fn cmp_lit(
+    /// Apply a binary operator with a u32 literal RHS. Shared by `cmp_lit`,
+    /// `shr_lit`, `shl_lit`, `and_lit`.
+    pub(in crate::lower) fn bin_lit(
         &self,
         e: &mut Arena<Expression>,
         body: &mut Block,
@@ -235,6 +237,18 @@ impl<'a> Lowerer<'a> {
     ) -> Handle<Expression> {
         let right = self.u32(e, right);
         self.bin(e, body, op, left, right)
+    }
+
+    /// Compare with a u32 literal RHS. Returns the resulting Bool handle.
+    pub(in crate::lower) fn cmp_lit(
+        &self,
+        e: &mut Arena<Expression>,
+        body: &mut Block,
+        op: BinaryOperator,
+        left: Handle<Expression>,
+        right: u32,
+    ) -> Handle<Expression> {
+        self.bin_lit(e, body, op, left, right)
     }
 
     pub(in crate::lower) fn select(
@@ -273,8 +287,7 @@ impl<'a> Lowerer<'a> {
         left: Handle<Expression>,
         right: u32,
     ) -> Handle<Expression> {
-        let right = self.u32(e, right);
-        self.bin(e, body, BinaryOperator::ShiftRight, left, right)
+        self.bin_lit(e, body, BinaryOperator::ShiftRight, left, right)
     }
 
     pub(in crate::lower) fn shl_lit(
@@ -284,8 +297,7 @@ impl<'a> Lowerer<'a> {
         left: Handle<Expression>,
         right: u32,
     ) -> Handle<Expression> {
-        let right = self.u32(e, right);
-        self.bin(e, body, BinaryOperator::ShiftLeft, left, right)
+        self.bin_lit(e, body, BinaryOperator::ShiftLeft, left, right)
     }
 
     pub(in crate::lower) fn and_lit(
@@ -295,8 +307,7 @@ impl<'a> Lowerer<'a> {
         left: Handle<Expression>,
         right: u32,
     ) -> Handle<Expression> {
-        let right = self.u32(e, right);
-        self.bin(e, body, BinaryOperator::And, left, right)
+        self.bin_lit(e, body, BinaryOperator::And, left, right)
     }
 
     pub(in crate::lower) fn add_lit(
