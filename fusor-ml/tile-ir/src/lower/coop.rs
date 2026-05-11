@@ -63,8 +63,7 @@ impl<'a> Lowerer<'a> {
                 }
                 let value = self.lower_tile_expr_lane(expressions, scratch, body, value, 0)?;
                 let index = self.lower_tile_expr_lane(expressions, scratch, body, index, 0)?;
-                let (pointer, emits) = self.tile_dynamic_pointer(expressions, *dst, index)?;
-                Self::push_emits(body, emits);
+                let pointer = self.tile_dynamic_pointer(expressions, *dst, index, body)?;
                 body.push(Statement::Store { pointer, value }, Span::default());
                 Ok(())
             }
@@ -218,11 +217,8 @@ impl<'a> Lowerer<'a> {
         let stride_u = Self::row_major_tile_stride(layout)?;
         let row_h = self.lower_tile_expr_lane(expressions, scratch, body, row, 0)?;
         let col_h = self.lower_tile_expr_lane(expressions, scratch, body, col, 0)?;
-        let mut emits = Vec::new();
-        let index = self.tile_matrix_index_inline(expressions, &mut emits, row_h, col_h, stride_u);
-        let (ptr, ptr_emits) = self.tile_dynamic_pointer(expressions, tile, index)?;
-        emits.extend(ptr_emits);
-        Self::push_emits(body, emits);
+        let index = self.tile_matrix_index_inline(expressions, body, row_h, col_h, stride_u);
+        let ptr = self.tile_dynamic_pointer(expressions, tile, index, body)?;
         let stride =
             expressions.append(Expression::Literal(Literal::U32(stride_u)), Span::default());
         let frag = expressions.append(
@@ -337,24 +333,24 @@ impl<'a> Lowerer<'a> {
         let passes = total.div_ceil(self.workgroup_invocations);
         for pass in 0..passes {
             let full_pass = (pass + 1) * self.workgroup_invocations <= total;
-            let mut guard_emits = Vec::new();
+            let mut guard_block = Block::new();
             let flat = self.add_literal_u32_emitted(
                 expressions,
                 local,
                 pass * self.workgroup_invocations,
-                &mut guard_emits,
+                &mut guard_block,
             );
             let condition = (!full_pass).then(|| {
                 self.cmp_lit(
                     expressions,
-                    &mut guard_emits,
+                    &mut guard_block,
                     BinaryOperator::Less,
                     flat,
                     total,
                 )
             });
             let accept = build_accept(expressions, flat)?;
-            Self::push_guarded_or_full_block(body, guard_emits, condition, accept);
+            Self::push_guarded_or_full_block(body, guard_block, condition, accept);
         }
         Ok(())
     }
@@ -385,49 +381,49 @@ impl<'a> Lowerer<'a> {
         let col_base = self.lower_tile_expr_lane(expressions, scratch, body, col_offset, 0)?;
 
         self.lower_copy_passes(expressions, body, local, total, |expressions, flat| {
-            let mut emits = Vec::new();
-            let local_row = self.div_literal_u32_emitted(expressions, flat, cols, &mut emits);
-            let local_col = self.mod_literal_u32_emitted(expressions, flat, cols, &mut emits);
+            let mut accept = Block::new();
+            let local_row = self.div_literal_u32_emitted(expressions, flat, cols, &mut accept);
+            let local_col = self.mod_literal_u32_emitted(expressions, flat, cols, &mut accept);
             let global_row = self.bin(
                 expressions,
-                &mut emits,
+                &mut accept,
                 BinaryOperator::Add,
                 row_base,
                 local_row,
             );
             let global_col = self.bin(
                 expressions,
-                &mut emits,
+                &mut accept,
                 BinaryOperator::Add,
                 col_base,
                 local_col,
             );
             let tile_index = self.tile_matrix_index_inline(
                 expressions,
-                &mut emits,
+                &mut accept,
                 local_row,
                 local_col,
                 stride,
             );
-            let (tile_ptr, tile_ptr_emits) =
-                self.tile_dynamic_pointer(expressions, dst, tile_index)?;
-            emits.extend(tile_ptr_emits);
-            let (storage_index, storage_emits) =
-                self.storage_index_from_coords(expressions, src, &[global_row, global_col])?;
-            emits.extend(storage_emits);
-            let (storage_ptr, storage_ptr_emits) =
-                self.storage_dynamic_pointer(expressions, src, storage_index)?;
-            emits.extend(storage_ptr_emits);
+            let tile_ptr = self.tile_dynamic_pointer(expressions, dst, tile_index, &mut accept)?;
+            let storage_index = self.storage_index_from_coords(
+                expressions,
+                src,
+                &[global_row, global_col],
+                &mut accept,
+            )?;
+            let storage_ptr =
+                self.storage_dynamic_pointer(expressions, src, storage_index, &mut accept)?;
             let value = expressions.append(
                 Expression::Load {
                     pointer: storage_ptr,
                 },
                 Span::default(),
             );
-            emits.push(Self::single_expression_range(expressions, value));
-
-            let mut accept = Block::new();
-            Self::push_emits(&mut accept, emits);
+            accept.push(
+                Statement::Emit(Self::single_expression_range(expressions, value)),
+                Span::default(),
+            );
             accept.push(
                 Statement::Store {
                     pointer: tile_ptr,
@@ -472,22 +468,22 @@ impl<'a> Lowerer<'a> {
             let groups_per_col = rows / n;
             let total = groups_per_col * cols;
             self.lower_copy_passes(expressions, body, local, total, |expressions, flat| {
-                let mut emits = Vec::new();
+                let mut accept = Block::new();
                 let local_k_group =
-                    self.div_literal_u32_emitted(expressions, flat, cols, &mut emits);
-                let local_col = self.mod_literal_u32_emitted(expressions, flat, cols, &mut emits);
+                    self.div_literal_u32_emitted(expressions, flat, cols, &mut accept);
+                let local_col = self.mod_literal_u32_emitted(expressions, flat, cols, &mut accept);
                 let local_k_base =
-                    self.mul_literal_u32_emitted(expressions, local_k_group, n, &mut emits);
+                    self.mul_literal_u32_emitted(expressions, local_k_group, n, &mut accept);
                 let global_k_base = self.bin(
                     expressions,
-                    &mut emits,
+                    &mut accept,
                     BinaryOperator::Add,
                     row_base,
                     local_k_base,
                 );
                 let global_col = self.bin(
                     expressions,
-                    &mut emits,
+                    &mut accept,
                     BinaryOperator::Add,
                     col_base,
                     local_col,
@@ -495,37 +491,49 @@ impl<'a> Lowerer<'a> {
                 let mut tile_ptrs = Vec::with_capacity(n as usize);
                 for lane in 0..n {
                     let local_k =
-                        self.add_literal_u32_emitted(expressions, local_k_base, lane, &mut emits);
+                        self.add_literal_u32_emitted(expressions, local_k_base, lane, &mut accept);
                     let tile_index = self.tile_matrix_index_inline(
                         expressions,
-                        &mut emits,
+                        &mut accept,
                         local_k,
                         local_col,
                         stride,
                     );
-                    let (ptr, ptr_emits) =
-                        self.tile_dynamic_pointer(expressions, dst, tile_index)?;
-                    emits.extend(ptr_emits);
+                    let ptr =
+                        self.tile_dynamic_pointer(expressions, dst, tile_index, &mut accept)?;
                     tile_ptrs.push(ptr);
                 }
-                let mut accept = Block::new();
-                Self::push_emits(&mut accept, emits);
-                let (values, value_emits) = match (src.format, n) {
-                    (GgmlQuantFormat::Q8_0, 8) => {
-                        self.dequantize_q8_0_values8(expressions, src, global_k_base, global_col)?
-                    }
-                    (GgmlQuantFormat::Q4K, 8) => {
-                        self.dequantize_q4k_values8(expressions, src, global_k_base, global_col)?
-                    }
-                    (GgmlQuantFormat::Q6K, 8) => {
-                        self.dequantize_q6k_values8(expressions, src, global_k_base, global_col)?
-                    }
-                    (GgmlQuantFormat::Q5_0, 16) => {
-                        self.dequantize_q5_0_values16(expressions, src, global_k_base, global_col)?
-                    }
+                let values = match (src.format, n) {
+                    (GgmlQuantFormat::Q8_0, 8) => self.dequantize_q8_0_values8(
+                        expressions,
+                        src,
+                        global_k_base,
+                        global_col,
+                        &mut accept,
+                    )?,
+                    (GgmlQuantFormat::Q4K, 8) => self.dequantize_q4k_values8(
+                        expressions,
+                        src,
+                        global_k_base,
+                        global_col,
+                        &mut accept,
+                    )?,
+                    (GgmlQuantFormat::Q6K, 8) => self.dequantize_q6k_values8(
+                        expressions,
+                        src,
+                        global_k_base,
+                        global_col,
+                        &mut accept,
+                    )?,
+                    (GgmlQuantFormat::Q5_0, 16) => self.dequantize_q5_0_values16(
+                        expressions,
+                        src,
+                        global_k_base,
+                        global_col,
+                        &mut accept,
+                    )?,
                     _ => unreachable!(),
                 };
-                Self::push_emits(&mut accept, value_emits);
                 for (ptr, value) in tile_ptrs.into_iter().zip(values.into_iter()) {
                     accept.push(
                         Statement::Store {
@@ -543,38 +551,33 @@ impl<'a> Lowerer<'a> {
         // Scalar fallback: one element per invocation per pass.
         let total = rows * cols;
         self.lower_copy_passes(expressions, body, local, total, |expressions, flat| {
-            let mut emits = Vec::new();
-            let local_row = self.div_literal_u32_emitted(expressions, flat, cols, &mut emits);
-            let local_col = self.mod_literal_u32_emitted(expressions, flat, cols, &mut emits);
+            let mut accept = Block::new();
+            let local_row = self.div_literal_u32_emitted(expressions, flat, cols, &mut accept);
+            let local_col = self.mod_literal_u32_emitted(expressions, flat, cols, &mut accept);
             let global_row = self.bin(
                 expressions,
-                &mut emits,
+                &mut accept,
                 BinaryOperator::Add,
                 row_base,
                 local_row,
             );
             let global_col = self.bin(
                 expressions,
-                &mut emits,
+                &mut accept,
                 BinaryOperator::Add,
                 col_base,
                 local_col,
             );
             let tile_index = self.tile_matrix_index_inline(
                 expressions,
-                &mut emits,
+                &mut accept,
                 local_row,
                 local_col,
                 stride,
             );
-            let (tile_ptr, tile_ptr_emits) =
-                self.tile_dynamic_pointer(expressions, dst, tile_index)?;
-            emits.extend(tile_ptr_emits);
-            let (value, value_emits) =
-                self.dequantize_qvalue(expressions, src, global_row, global_col)?;
-            emits.extend(value_emits);
-            let mut accept = Block::new();
-            Self::push_emits(&mut accept, emits);
+            let tile_ptr = self.tile_dynamic_pointer(expressions, dst, tile_index, &mut accept)?;
+            let value =
+                self.dequantize_qvalue(expressions, src, global_row, global_col, &mut accept)?;
             accept.push(
                 Statement::Store {
                     pointer: tile_ptr,
@@ -602,12 +605,9 @@ impl<'a> Lowerer<'a> {
         let (stride_u, row_major) = Self::cooperative_store_layout(&dst.layout)?;
         let row_h = self.lower_tile_expr_lane(expressions, scratch, body, row, 0)?;
         let col_h = self.lower_tile_expr_lane(expressions, scratch, body, col, 0)?;
-        let (storage_index, storage_emits) =
-            self.storage_index_from_coords(expressions, dst, &[row_h, col_h])?;
-        Self::push_emits(body, storage_emits);
-        let (storage_ptr, ptr_emits) =
-            self.storage_dynamic_pointer(expressions, dst, storage_index)?;
-        Self::push_emits(body, ptr_emits);
+        let storage_index =
+            self.storage_index_from_coords(expressions, dst, &[row_h, col_h], body)?;
+        let storage_ptr = self.storage_dynamic_pointer(expressions, dst, storage_index, body)?;
 
         let stride =
             expressions.append(Expression::Literal(Literal::U32(stride_u)), Span::default());
@@ -673,12 +673,12 @@ impl<'a> Lowerer<'a> {
     fn tile_matrix_index_inline(
         &self,
         expressions: &mut Arena<Expression>,
-        emits: &mut Vec<Range<Expression>>,
+        body: &mut Block,
         row: Handle<Expression>,
         col: Handle<Expression>,
         stride: u32,
     ) -> Handle<Expression> {
-        let row_offset = self.mul_literal_u32_emitted(expressions, row, stride, emits);
-        self.bin(expressions, emits, BinaryOperator::Add, row_offset, col)
+        let row_offset = self.mul_literal_u32_emitted(expressions, row, stride, body);
+        self.bin(expressions, body, BinaryOperator::Add, row_offset, col)
     }
 }

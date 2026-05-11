@@ -97,9 +97,7 @@ impl<'a> Lowerer<'a> {
             Expression::FunctionArgument(LOCAL_INVOCATION_INDEX_ARG),
             Span::default(),
         );
-        let (lane_ptr, lane_ptr_emits) =
-            self.tile_dynamic_pointer(expressions, scratch_tile, lane)?;
-        Self::push_emits(body, lane_ptr_emits);
+        let lane_ptr = self.tile_dynamic_pointer(expressions, scratch_tile, lane, body)?;
         body.push(
             Statement::Store {
                 pointer: lane_ptr,
@@ -117,9 +115,8 @@ impl<'a> Lowerer<'a> {
                 expressions.append(Expression::Literal(Literal::U32(0)), Span::default());
             (lane, zero)
         } else {
-            let mut index_emits = Vec::new();
             let group_offset =
-                self.mod_literal_u32_emitted(expressions, lane, group_size, &mut index_emits);
+                self.mod_literal_u32_emitted(expressions, lane, group_size, body);
             let group_base = expressions.append(
                 Expression::Binary {
                     op: BinaryOperator::Subtract,
@@ -128,8 +125,10 @@ impl<'a> Lowerer<'a> {
                 },
                 Span::default(),
             );
-            index_emits.push(Self::single_expression_range(expressions, group_base));
-            Self::push_emits(body, index_emits);
+            body.push(
+                Statement::Emit(Self::single_expression_range(expressions, group_base)),
+                Span::default(),
+            );
             (group_offset, group_base)
         };
 
@@ -163,9 +162,8 @@ impl<'a> Lowerer<'a> {
             stride /= 2;
         }
 
-        let (result_ptr, result_ptr_emits) =
-            self.tile_dynamic_pointer(expressions, scratch_tile, result_index)?;
-        Self::push_emits(body, result_ptr_emits);
+        let result_ptr =
+            self.tile_dynamic_pointer(expressions, scratch_tile, result_index, body)?;
         let result = expressions.append(
             Expression::Load {
                 pointer: result_ptr,
@@ -193,12 +191,9 @@ impl<'a> Lowerer<'a> {
             Statement::Emit(Self::single_expression_range(expressions, rhs_index)),
             Span::default(),
         );
-        let (lhs_ptr, lhs_ptr_emits) =
-            self.tile_dynamic_pointer(expressions, scratch_tile, lane)?;
-        let (rhs_ptr, rhs_ptr_emits) =
-            self.tile_dynamic_pointer(expressions, scratch_tile, rhs_index)?;
-        Self::push_emits(&mut body, lhs_ptr_emits);
-        Self::push_emits(&mut body, rhs_ptr_emits);
+        let lhs_ptr = self.tile_dynamic_pointer(expressions, scratch_tile, lane, &mut body)?;
+        let rhs_ptr =
+            self.tile_dynamic_pointer(expressions, scratch_tile, rhs_index, &mut body)?;
         let lhs = expressions.append(Expression::Load { pointer: lhs_ptr }, Span::default());
         let rhs = expressions.append(Expression::Load { pointer: rhs_ptr }, Span::default());
         body.push(

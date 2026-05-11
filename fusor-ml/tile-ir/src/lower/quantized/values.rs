@@ -7,24 +7,24 @@ impl<'a> Lowerer<'a> {
         matrix: &QuantizedMatrix,
         k: Handle<Expression>,
         col: Handle<Expression>,
-    ) -> Result<(Handle<Expression>, Vec<Range<Expression>>), LowerError> {
-        let mut emits = Vec::new();
+        body: &mut Block,
+    ) -> Result<Handle<Expression>, LowerError> {
         let block_elems = matrix.format.block_elements();
         let block_words = matrix.format.block_words();
-        let block = self.div_literal_u32_emitted(expressions, k, block_elems, &mut emits);
-        let q = self.and_lit(expressions, &mut emits, k, block_elems - 1);
+        let block = self.div_literal_u32_emitted(expressions, k, block_elems, body);
+        let q = self.and_lit(expressions, body, k, block_elems - 1);
         let base =
-            self.quantized_block_base(expressions, matrix, block, col, block_words, &mut emits);
+            self.quantized_block_base(expressions, matrix, block, col, block_words, body);
         let value = if let Some(spec) = AffineDequantSpec::for_format(matrix.format) {
-            self.dequant_affine(expressions, matrix, base, q, spec, &mut emits)?
+            self.dequant_affine(expressions, matrix, base, q, spec, body)?
         } else {
             match matrix.format {
-                GgmlQuantFormat::Q2K => self.dequant_q2k(expressions, matrix, base, q, &mut emits)?,
-                GgmlQuantFormat::Q3K => self.dequant_q3k(expressions, matrix, base, q, &mut emits)?,
-                GgmlQuantFormat::Q4K => self.dequant_q4k(expressions, matrix, base, q, &mut emits)?,
-                GgmlQuantFormat::Q5K => self.dequant_q5k(expressions, matrix, base, q, &mut emits)?,
-                GgmlQuantFormat::Q6K => self.dequant_q6k(expressions, matrix, base, q, &mut emits)?,
-                GgmlQuantFormat::Q8K => self.dequant_q8k(expressions, matrix, base, q, &mut emits)?,
+                GgmlQuantFormat::Q2K => self.dequant_q2k(expressions, matrix, base, q, body)?,
+                GgmlQuantFormat::Q3K => self.dequant_q3k(expressions, matrix, base, q, body)?,
+                GgmlQuantFormat::Q4K => self.dequant_q4k(expressions, matrix, base, q, body)?,
+                GgmlQuantFormat::Q5K => self.dequant_q5k(expressions, matrix, base, q, body)?,
+                GgmlQuantFormat::Q6K => self.dequant_q6k(expressions, matrix, base, q, body)?,
+                GgmlQuantFormat::Q8K => self.dequant_q8k(expressions, matrix, base, q, body)?,
                 GgmlQuantFormat::Q4_0
                 | GgmlQuantFormat::Q4_1
                 | GgmlQuantFormat::Q5_0
@@ -33,7 +33,7 @@ impl<'a> Lowerer<'a> {
                 | GgmlQuantFormat::Q8_1 => unreachable!("legacy formats handled above"),
             }
         };
-        Ok((value, emits))
+        Ok(value)
     }
 
     pub(in crate::lower) fn dequantize_qvalues(
@@ -43,16 +43,15 @@ impl<'a> Lowerer<'a> {
         k_base: Handle<Expression>,
         col: Handle<Expression>,
         n: u32,
-    ) -> Result<(Vec<Handle<Expression>>, Vec<Range<Expression>>), LowerError> {
-        let mut emits = Vec::new();
+        body: &mut Block,
+    ) -> Result<Vec<Handle<Expression>>, LowerError> {
         let mut values = Vec::with_capacity(n as usize);
         for lane in 0..n {
-            let k = self.add_literal_u32_emitted(expressions, k_base, lane, &mut emits);
-            let (value, mut value_emits) = self.dequantize_qvalue(expressions, matrix, k, col)?;
-            emits.append(&mut value_emits);
+            let k = self.add_literal_u32_emitted(expressions, k_base, lane, body);
+            let value = self.dequantize_qvalue(expressions, matrix, k, col, body)?;
             values.push(value);
         }
-        Ok((values, emits))
+        Ok(values)
     }
 
     pub(in crate::lower) fn dequantize_q8_0_values8(
@@ -61,20 +60,20 @@ impl<'a> Lowerer<'a> {
         matrix: &QuantizedMatrix,
         k_base: Handle<Expression>,
         col: Handle<Expression>,
-    ) -> Result<(Vec<Handle<Expression>>, Vec<Range<Expression>>), LowerError> {
+        body: &mut Block,
+    ) -> Result<Vec<Handle<Expression>>, LowerError> {
         if matrix.format != GgmlQuantFormat::Q8_0 {
             return Err(LowerError::UnsupportedOperation(
                 "q8_0 vector dequantizer only supports Q8_0",
             ));
         }
 
-        let mut emits = Vec::new();
-        let parts = self.q8_0_block_parts8(expressions, matrix, k_base, col, &mut emits)?;
+        let parts = self.q8_0_block_parts8(expressions, matrix, k_base, col, body)?;
         let mut values = Vec::with_capacity(8);
-        for signed in self.q8_0_components8(expressions, &mut emits, &parts) {
-            values.push(self.mul(expressions, &mut emits, signed, parts.scale));
+        for signed in self.q8_0_components8(expressions, body, &parts) {
+            values.push(self.mul(expressions, body, signed, parts.scale));
         }
-        Ok((values, emits))
+        Ok(values)
     }
 
     pub(in crate::lower) fn dequantize_q8_0_dot8(
@@ -84,18 +83,18 @@ impl<'a> Lowerer<'a> {
         k_base: Handle<Expression>,
         col: Handle<Expression>,
         a: &[Handle<Expression>; 8],
-    ) -> Result<(Handle<Expression>, Vec<Range<Expression>>), LowerError> {
+        body: &mut Block,
+    ) -> Result<Handle<Expression>, LowerError> {
         if matrix.format != GgmlQuantFormat::Q8_0 {
             return Err(LowerError::UnsupportedOperation(
                 "q8_0 dot8 only supports Q8_0",
             ));
         }
 
-        let mut emits = Vec::new();
-        let parts = self.q8_0_block_parts8(expressions, matrix, k_base, col, &mut emits)?;
-        let q_components = self.q8_0_components8(expressions, &mut emits, &parts);
-        let sum = self.dot_vec4_chunks(expressions, &mut emits, a, &q_components);
-        Ok((self.mul(expressions, &mut emits, sum, parts.scale), emits))
+        let parts = self.q8_0_block_parts8(expressions, matrix, k_base, col, body)?;
+        let q_components = self.q8_0_components8(expressions, body, &parts);
+        let sum = self.dot_vec4_chunks(expressions, body, a, &q_components);
+        Ok(self.mul(expressions, body, sum, parts.scale))
     }
 
     pub(in crate::lower) fn q8_0_block_parts8(
@@ -104,20 +103,20 @@ impl<'a> Lowerer<'a> {
         matrix: &QuantizedMatrix,
         k_base: Handle<Expression>,
         col: Handle<Expression>,
-        emits: &mut Vec<Range<Expression>>,
+        body: &mut Block,
     ) -> Result<Q8_0BlockParts, LowerError> {
-        let block = self.div_literal_u32_emitted(expressions, k_base, 32, emits);
-        let q = self.and_lit(expressions, emits, k_base, 31);
-        let col_block = self.mul_literal_u32_emitted(expressions, col, matrix.rows / 32, emits);
-        let block_index = self.bin(expressions, emits, BinaryOperator::Add, col_block, block);
-        let base = self.mul_literal_u32_emitted(expressions, block_index, 9, emits);
-        let scale_word = self.load_word(expressions, matrix, base, 0, emits)?;
-        let scale = self.bitcast_f32(expressions, emits, scale_word);
-        let q_word = self.shr_lit(expressions, emits, q, 2);
-        let word0_off = self.add_lit(expressions, emits, q_word, 1);
-        let word1_off = self.add_lit(expressions, emits, q_word, 2);
-        let word0 = self.load_word_dynamic(expressions, matrix, base, word0_off, emits)?;
-        let word1 = self.load_word_dynamic(expressions, matrix, base, word1_off, emits)?;
+        let block = self.div_literal_u32_emitted(expressions, k_base, 32, body);
+        let q = self.and_lit(expressions, body, k_base, 31);
+        let col_block = self.mul_literal_u32_emitted(expressions, col, matrix.rows / 32, body);
+        let block_index = self.bin(expressions, body, BinaryOperator::Add, col_block, block);
+        let base = self.mul_literal_u32_emitted(expressions, block_index, 9, body);
+        let scale_word = self.load_word(expressions, matrix, base, 0, body)?;
+        let scale = self.bitcast_f32(expressions, body, scale_word);
+        let q_word = self.shr_lit(expressions, body, q, 2);
+        let word0_off = self.add_lit(expressions, body, q_word, 1);
+        let word1_off = self.add_lit(expressions, body, q_word, 2);
+        let word0 = self.load_word_dynamic(expressions, matrix, base, word0_off, body)?;
+        let word1 = self.load_word_dynamic(expressions, matrix, base, word1_off, body)?;
         Ok(Q8_0BlockParts {
             scale,
             words: [word0, word1],
@@ -127,7 +126,7 @@ impl<'a> Lowerer<'a> {
     pub(in crate::lower) fn q8_0_components8(
         &self,
         expressions: &mut Arena<Expression>,
-        emits: &mut Vec<Range<Expression>>,
+        body: &mut Block,
         parts: &Q8_0BlockParts,
     ) -> [Handle<Expression>; 8] {
         std::array::from_fn(|lane| {
@@ -136,8 +135,8 @@ impl<'a> Lowerer<'a> {
                 Span::default(),
             );
             let word = parts.words[usize::from(lane >= 4)];
-            let byte = self.byte_at(expressions, emits, word, byte_lane);
-            self.signed_byte_f32(expressions, emits, byte)
+            let byte = self.byte_at(expressions, body, word, byte_lane);
+            self.signed_byte_f32(expressions, body, byte)
         })
     }
 
@@ -147,49 +146,49 @@ impl<'a> Lowerer<'a> {
         matrix: &QuantizedMatrix,
         k_base: Handle<Expression>,
         col: Handle<Expression>,
-    ) -> Result<(Vec<Handle<Expression>>, Vec<Range<Expression>>), LowerError> {
+        body: &mut Block,
+    ) -> Result<Vec<Handle<Expression>>, LowerError> {
         if matrix.format != GgmlQuantFormat::Q4K {
             return Err(LowerError::UnsupportedOperation(
                 "q4k vector dequantizer only supports Q4K",
             ));
         }
 
-        let mut emits = Vec::new();
-        let block = self.div_literal_u32_emitted(expressions, k_base, 256, &mut emits);
-        let q_base = self.and_lit(expressions, &mut emits, k_base, 255);
-        let base = self.quantized_block_base(expressions, matrix, block, col, 37, &mut emits);
+        let block = self.div_literal_u32_emitted(expressions, k_base, 256, body);
+        let q_base = self.and_lit(expressions, body, k_base, 255);
+        let base = self.quantized_block_base(expressions, matrix, block, col, 37, body);
 
-        let d_word = self.load_word(expressions, matrix, base, 0, &mut emits)?;
-        let d = self.bitcast_f32(expressions, &mut emits, d_word);
-        let dmin_word = self.load_word(expressions, matrix, base, 1, &mut emits)?;
-        let dmin = self.bitcast_f32(expressions, &mut emits, dmin_word);
-        let group = self.shr_lit(expressions, &mut emits, q_base, 5);
-        let scale_byte = self.k_scale(expressions, matrix, base, group, false, &mut emits)?;
-        let scale_f = self.as_f32(expressions, &mut emits, scale_byte);
-        let scale = self.mul(expressions, &mut emits, scale_f, d);
-        let min_byte = self.k_scale(expressions, matrix, base, group, true, &mut emits)?;
-        let min_f = self.as_f32(expressions, &mut emits, min_byte);
-        let min = self.mul(expressions, &mut emits, min_f, dmin);
+        let d_word = self.load_word(expressions, matrix, base, 0, body)?;
+        let d = self.bitcast_f32(expressions, body, d_word);
+        let dmin_word = self.load_word(expressions, matrix, base, 1, body)?;
+        let dmin = self.bitcast_f32(expressions, body, dmin_word);
+        let group = self.shr_lit(expressions, body, q_base, 5);
+        let scale_byte = self.k_scale(expressions, matrix, base, group, false, body)?;
+        let scale_f = self.as_f32(expressions, body, scale_byte);
+        let scale = self.mul(expressions, body, scale_f, d);
+        let min_byte = self.k_scale(expressions, matrix, base, group, true, body)?;
+        let min_f = self.as_f32(expressions, body, min_byte);
+        let min = self.mul(expressions, body, min_f, dmin);
 
-        let in_group = self.and_lit(expressions, &mut emits, q_base, 31);
-        let group_pair = self.shr_lit(expressions, &mut emits, group, 1);
-        let group_pair_offset = self.shl_lit(expressions, &mut emits, group_pair, 5);
+        let in_group = self.and_lit(expressions, body, q_base, 31);
+        let group_pair = self.shr_lit(expressions, body, group, 1);
+        let group_pair_offset = self.shl_lit(expressions, body, group_pair, 5);
         let byte_index = self.bin(
             expressions,
-            &mut emits,
+            body,
             BinaryOperator::Add,
             group_pair_offset,
             in_group,
         );
-        let data_word = self.shr_lit(expressions, &mut emits, byte_index, 2);
-        let word0_off = self.add_lit(expressions, &mut emits, data_word, 5);
-        let word1_off = self.add_lit(expressions, &mut emits, data_word, 6);
-        let word0 = self.load_word_dynamic(expressions, matrix, base, word0_off, &mut emits)?;
-        let word1 = self.load_word_dynamic(expressions, matrix, base, word1_off, &mut emits)?;
-        let group_low = self.and_lit(expressions, &mut emits, group, 1);
+        let data_word = self.shr_lit(expressions, body, byte_index, 2);
+        let word0_off = self.add_lit(expressions, body, data_word, 5);
+        let word1_off = self.add_lit(expressions, body, data_word, 6);
+        let word0 = self.load_word_dynamic(expressions, matrix, base, word0_off, body)?;
+        let word1 = self.load_word_dynamic(expressions, matrix, base, word1_off, body)?;
+        let group_low = self.and_lit(expressions, body, group, 1);
         let high = self.cmp_lit(
             expressions,
-            &mut emits,
+            body,
             BinaryOperator::NotEqual,
             group_low,
             0,
@@ -202,15 +201,15 @@ impl<'a> Lowerer<'a> {
                 Span::default(),
             );
             let word = if lane < 4 { word0 } else { word1 };
-            let byte = self.byte_at(expressions, &mut emits, word, byte_lane);
-            let byte_hi = self.shr_lit(expressions, &mut emits, byte, 4);
-            let byte_lo = self.and_lit(expressions, &mut emits, byte, 0x0f);
-            let quant = self.select(expressions, &mut emits, high, byte_hi, byte_lo);
-            let quant_f = self.as_f32(expressions, &mut emits, quant);
-            let scaled = self.mul(expressions, &mut emits, quant_f, scale);
-            values.push(self.sub(expressions, &mut emits, scaled, min));
+            let byte = self.byte_at(expressions, body, word, byte_lane);
+            let byte_hi = self.shr_lit(expressions, body, byte, 4);
+            let byte_lo = self.and_lit(expressions, body, byte, 0x0f);
+            let quant = self.select(expressions, body, high, byte_hi, byte_lo);
+            let quant_f = self.as_f32(expressions, body, quant);
+            let scaled = self.mul(expressions, body, quant_f, scale);
+            values.push(self.sub(expressions, body, scaled, min));
         }
-        Ok((values, emits))
+        Ok(values)
     }
 
     pub(in crate::lower) fn dequantize_q5_0_values16(
@@ -219,44 +218,44 @@ impl<'a> Lowerer<'a> {
         matrix: &QuantizedMatrix,
         k_base: Handle<Expression>,
         col: Handle<Expression>,
-    ) -> Result<(Vec<Handle<Expression>>, Vec<Range<Expression>>), LowerError> {
+        body: &mut Block,
+    ) -> Result<Vec<Handle<Expression>>, LowerError> {
         if matrix.format != GgmlQuantFormat::Q5_0 {
             return Err(LowerError::UnsupportedOperation(
                 "q5_0 vector dequantizer only supports Q5_0",
             ));
         }
 
-        let mut emits = Vec::new();
-        let block = self.div_literal_u32_emitted(expressions, k_base, 32, &mut emits);
-        let q_base = self.and_lit(expressions, &mut emits, k_base, 31);
+        let block = self.div_literal_u32_emitted(expressions, k_base, 32, body);
+        let q_base = self.and_lit(expressions, body, k_base, 31);
         let col_block =
-            self.mul_literal_u32_emitted(expressions, col, matrix.rows / 32, &mut emits);
+            self.mul_literal_u32_emitted(expressions, col, matrix.rows / 32, body);
         let block_index = self.bin(
             expressions,
-            &mut emits,
+            body,
             BinaryOperator::Add,
             col_block,
             block,
         );
-        let base = self.mul_literal_u32_emitted(expressions, block_index, 6, &mut emits);
-        let scale_word = self.load_word(expressions, matrix, base, 0, &mut emits)?;
-        let scale = self.bitcast_f32(expressions, &mut emits, scale_word);
-        let qh = self.load_word(expressions, matrix, base, 1, &mut emits)?;
+        let base = self.mul_literal_u32_emitted(expressions, block_index, 6, body);
+        let scale_word = self.load_word(expressions, matrix, base, 0, body)?;
+        let scale = self.bitcast_f32(expressions, body, scale_word);
+        let qh = self.load_word(expressions, matrix, base, 1, body)?;
         let high = self.cmp_lit(
             expressions,
-            &mut emits,
+            body,
             BinaryOperator::GreaterEqual,
             q_base,
             16,
         );
         let sixteen = expressions.append(Expression::Literal(Literal::U32(16)), Span::default());
         let zero = expressions.append(Expression::Literal(Literal::U32(0)), Span::default());
-        let high_base = self.select(expressions, &mut emits, high, sixteen, zero);
+        let high_base = self.select(expressions, body, high, sixteen, zero);
         let words = [
-            self.load_word(expressions, matrix, base, 2, &mut emits)?,
-            self.load_word(expressions, matrix, base, 3, &mut emits)?,
-            self.load_word(expressions, matrix, base, 4, &mut emits)?,
-            self.load_word(expressions, matrix, base, 5, &mut emits)?,
+            self.load_word(expressions, matrix, base, 2, body)?,
+            self.load_word(expressions, matrix, base, 3, body)?,
+            self.load_word(expressions, matrix, base, 4, body)?,
+            self.load_word(expressions, matrix, base, 5, body)?,
         ];
 
         let mut values = Vec::with_capacity(16);
@@ -265,27 +264,27 @@ impl<'a> Lowerer<'a> {
                 Expression::Literal(Literal::U32((lane % 4) as u32)),
                 Span::default(),
             );
-            let byte = self.byte_at(expressions, &mut emits, words[lane / 4], byte_lane);
-            let low = self.and_lit(expressions, &mut emits, byte, 0x0f);
-            let high4 = self.shr_lit(expressions, &mut emits, byte, 4);
-            let low4 = self.select(expressions, &mut emits, high, high4, low);
+            let byte = self.byte_at(expressions, body, words[lane / 4], byte_lane);
+            let low = self.and_lit(expressions, body, byte, 0x0f);
+            let high4 = self.shr_lit(expressions, body, byte, 4);
+            let low4 = self.select(expressions, body, high, high4, low);
             let lane_index = self.add_literal_u32(expressions, high_base, lane as u32);
-            let shifted_qh = self.shr(expressions, &mut emits, qh, lane_index);
-            let hi_bit_low = self.and_lit(expressions, &mut emits, shifted_qh, 1);
-            let hi_bit = self.shl_lit(expressions, &mut emits, hi_bit_low, 4);
+            let shifted_qh = self.shr(expressions, body, qh, lane_index);
+            let hi_bit_low = self.and_lit(expressions, body, shifted_qh, 1);
+            let hi_bit = self.shl_lit(expressions, body, hi_bit_low, 4);
             let quant = self.bin(
                 expressions,
-                &mut emits,
+                body,
                 BinaryOperator::InclusiveOr,
                 low4,
                 hi_bit,
             );
-            let quant_f = self.as_f32(expressions, &mut emits, quant);
+            let quant_f = self.as_f32(expressions, body, quant);
             let center = self.f32(expressions, 16.0);
-            let centered = self.sub(expressions, &mut emits, quant_f, center);
-            values.push(self.mul(expressions, &mut emits, centered, scale));
+            let centered = self.sub(expressions, body, quant_f, center);
+            values.push(self.mul(expressions, body, centered, scale));
         }
-        Ok((values, emits))
+        Ok(values)
     }
 
     pub(in crate::lower) fn q6k_block_parts(
@@ -294,80 +293,80 @@ impl<'a> Lowerer<'a> {
         matrix: &QuantizedMatrix,
         k_base: Handle<Expression>,
         col: Handle<Expression>,
-        emits: &mut Vec<Range<Expression>>,
+        body: &mut Block,
     ) -> Result<Q6KBlockParts, LowerError> {
-        let block = self.div_literal_u32_emitted(expressions, k_base, 256, emits);
-        let q_base = self.and_lit(expressions, emits, k_base, 255);
-        let base = self.quantized_block_base(expressions, matrix, block, col, 53, emits);
+        let block = self.div_literal_u32_emitted(expressions, k_base, 256, body);
+        let q_base = self.and_lit(expressions, body, k_base, 255);
+        let base = self.quantized_block_base(expressions, matrix, block, col, 53, body);
 
-        let d_word = self.load_word(expressions, matrix, base, 52, emits)?;
-        let d = self.bitcast_f32(expressions, emits, d_word);
-        let chunk = self.shr_lit(expressions, emits, q_base, 7);
-        let local = self.and_lit(expressions, emits, q_base, 127);
-        let high_byte_index = self.and_lit(expressions, emits, local, 31);
-        let low_group = self.shr_lit(expressions, emits, local, 5);
+        let d_word = self.load_word(expressions, matrix, base, 52, body)?;
+        let d = self.bitcast_f32(expressions, body, d_word);
+        let chunk = self.shr_lit(expressions, body, q_base, 7);
+        let local = self.and_lit(expressions, body, q_base, 127);
+        let high_byte_index = self.and_lit(expressions, body, local, 31);
+        let low_group = self.shr_lit(expressions, body, local, 5);
 
-        let chunk_low_base = self.shl_lit(expressions, emits, chunk, 6);
-        let low_group_parity = self.and_lit(expressions, emits, low_group, 1);
-        let low_group_offset = self.shl_lit(expressions, emits, low_group_parity, 5);
+        let chunk_low_base = self.shl_lit(expressions, body, chunk, 6);
+        let low_group_parity = self.and_lit(expressions, body, low_group, 1);
+        let low_group_offset = self.shl_lit(expressions, body, low_group_parity, 5);
         let local_low_index = self.bin(
             expressions,
-            emits,
+            body,
             BinaryOperator::Add,
             high_byte_index,
             low_group_offset,
         );
         let lower_index = self.bin(
             expressions,
-            emits,
+            body,
             BinaryOperator::Add,
             chunk_low_base,
             local_low_index,
         );
-        let low_word_base = self.shr_lit(expressions, emits, lower_index, 2);
+        let low_word_base = self.shr_lit(expressions, body, lower_index, 2);
         let low_words =
-            self.load_word_pair_dynamic(expressions, matrix, base, low_word_base, 0, emits)?;
-        let low_shift = self.shr_lit(expressions, emits, low_group, 1);
-        let low_shift = self.shl_lit(expressions, emits, low_shift, 2);
+            self.load_word_pair_dynamic(expressions, matrix, base, low_word_base, 0, body)?;
+        let low_shift = self.shr_lit(expressions, body, low_group, 1);
+        let low_shift = self.shl_lit(expressions, body, low_shift, 2);
 
-        let high_chunk_base = self.shl_lit(expressions, emits, chunk, 5);
+        let high_chunk_base = self.shl_lit(expressions, body, chunk, 5);
         let high_index = self.bin(
             expressions,
-            emits,
+            body,
             BinaryOperator::Add,
             high_chunk_base,
             high_byte_index,
         );
-        let high_word_base = self.shr_lit(expressions, emits, high_index, 2);
+        let high_word_base = self.shr_lit(expressions, body, high_index, 2);
         let high_words =
-            self.load_word_pair_dynamic(expressions, matrix, base, high_word_base, 32, emits)?;
-        let high_shift = self.shl_lit(expressions, emits, low_group, 1);
+            self.load_word_pair_dynamic(expressions, matrix, base, high_word_base, 32, body)?;
+        let high_shift = self.shl_lit(expressions, body, low_group, 1);
 
-        let scale_chunk_base = self.shl_lit(expressions, emits, chunk, 3);
-        let high_byte_half = self.shr_lit(expressions, emits, high_byte_index, 4);
-        let low_group_scale = self.shl_lit(expressions, emits, low_group, 1);
+        let scale_chunk_base = self.shl_lit(expressions, body, chunk, 3);
+        let high_byte_half = self.shr_lit(expressions, body, high_byte_index, 4);
+        let low_group_scale = self.shl_lit(expressions, body, low_group, 1);
         let local_scale_index = self.bin(
             expressions,
-            emits,
+            body,
             BinaryOperator::Add,
             high_byte_half,
             low_group_scale,
         );
         let scale_index = self.bin(
             expressions,
-            emits,
+            body,
             BinaryOperator::Add,
             scale_chunk_base,
             local_scale_index,
         );
-        let scale_word_base = self.shr_lit(expressions, emits, scale_index, 2);
-        let scale_word_off = self.add_lit(expressions, emits, scale_word_base, 48);
+        let scale_word_base = self.shr_lit(expressions, body, scale_index, 2);
+        let scale_word_off = self.add_lit(expressions, body, scale_word_base, 48);
         let scale_word =
-            self.load_word_dynamic(expressions, matrix, base, scale_word_off, emits)?;
-        let scale_lane = self.and_lit(expressions, emits, scale_index, 3);
-        let scale_byte = self.byte_at(expressions, emits, scale_word, scale_lane);
-        let scale = self.signed_byte_f32(expressions, emits, scale_byte);
-        let scale = self.mul(expressions, emits, scale, d);
+            self.load_word_dynamic(expressions, matrix, base, scale_word_off, body)?;
+        let scale_lane = self.and_lit(expressions, body, scale_index, 3);
+        let scale_byte = self.byte_at(expressions, body, scale_word, scale_lane);
+        let scale = self.signed_byte_f32(expressions, body, scale_byte);
+        let scale = self.mul(expressions, body, scale, d);
 
         Ok(Q6KBlockParts {
             low_words,
@@ -381,18 +380,18 @@ impl<'a> Lowerer<'a> {
     pub(in crate::lower) fn q6k_centered_component(
         &self,
         expressions: &mut Arena<Expression>,
-        emits: &mut Vec<Range<Expression>>,
+        body: &mut Block,
         parts: &Q6KBlockParts,
         lane: usize,
     ) -> Handle<Expression> {
-        let quant = self.q6k_quant_component(expressions, emits, parts, lane);
-        self.center_q6k_quant(expressions, emits, quant)
+        let quant = self.q6k_quant_component(expressions, body, parts, lane);
+        self.center_q6k_quant(expressions, body, quant)
     }
 
     pub(in crate::lower) fn q6k_quant_component(
         &self,
         expressions: &mut Arena<Expression>,
-        emits: &mut Vec<Range<Expression>>,
+        body: &mut Block,
         parts: &Q6KBlockParts,
         lane: usize,
     ) -> Handle<Expression> {
@@ -401,16 +400,16 @@ impl<'a> Lowerer<'a> {
             Span::default(),
         );
         let low_word = parts.low_words[usize::from(lane >= 4)];
-        let low_byte = self.byte_at(expressions, emits, low_word, byte_lane);
-        let low_shifted = self.shr(expressions, emits, low_byte, parts.low_shift);
-        let low4 = self.and_lit(expressions, emits, low_shifted, 0x0f);
+        let low_byte = self.byte_at(expressions, body, low_word, byte_lane);
+        let low_shifted = self.shr(expressions, body, low_byte, parts.low_shift);
+        let low4 = self.and_lit(expressions, body, low_shifted, 0x0f);
 
         let high_word = parts.high_words[usize::from(lane >= 4)];
-        let high_byte = self.byte_at(expressions, emits, high_word, byte_lane);
-        let high_shifted = self.shr(expressions, emits, high_byte, parts.high_shift);
-        let high2 = self.and_lit(expressions, emits, high_shifted, 3);
-        let high2 = self.shl_lit(expressions, emits, high2, 4);
-        self.bin(expressions, emits, BinaryOperator::InclusiveOr, low4, high2)
+        let high_byte = self.byte_at(expressions, body, high_word, byte_lane);
+        let high_shifted = self.shr(expressions, body, high_byte, parts.high_shift);
+        let high2 = self.and_lit(expressions, body, high_shifted, 3);
+        let high2 = self.shl_lit(expressions, body, high2, 4);
+        self.bin(expressions, body, BinaryOperator::InclusiveOr, low4, high2)
     }
 
     pub(in crate::lower) fn dequantize_q6k_values8(
@@ -419,22 +418,22 @@ impl<'a> Lowerer<'a> {
         matrix: &QuantizedMatrix,
         k_base: Handle<Expression>,
         col: Handle<Expression>,
-    ) -> Result<(Vec<Handle<Expression>>, Vec<Range<Expression>>), LowerError> {
+        body: &mut Block,
+    ) -> Result<Vec<Handle<Expression>>, LowerError> {
         if matrix.format != GgmlQuantFormat::Q6K {
             return Err(LowerError::UnsupportedOperation(
                 "q6k vector dequantizer only supports Q6K",
             ));
         }
 
-        let mut emits = Vec::new();
-        let parts = self.q6k_block_parts(expressions, matrix, k_base, col, &mut emits)?;
+        let parts = self.q6k_block_parts(expressions, matrix, k_base, col, body)?;
 
         let mut values = Vec::with_capacity(8);
         for lane in 0..8 {
-            let centered = self.q6k_centered_component(expressions, &mut emits, &parts, lane);
-            values.push(self.mul(expressions, &mut emits, centered, parts.scale));
+            let centered = self.q6k_centered_component(expressions, body, &parts, lane);
+            values.push(self.mul(expressions, body, centered, parts.scale));
         }
-        Ok((values, emits))
+        Ok(values)
     }
 
     pub(in crate::lower) fn dequantize_q6k_values16(
@@ -443,15 +442,15 @@ impl<'a> Lowerer<'a> {
         matrix: &QuantizedMatrix,
         k_base: Handle<Expression>,
         col: Handle<Expression>,
-    ) -> Result<(Vec<Handle<Expression>>, Vec<Range<Expression>>), LowerError> {
-        let (mut values, mut emits) =
-            self.dequantize_q6k_values8(expressions, matrix, k_base, col)?;
-        let k_base_hi = self.add_lit(expressions, &mut emits, k_base, 8);
-        let (hi_values, hi_emits) =
-            self.dequantize_q6k_values8(expressions, matrix, k_base_hi, col)?;
-        emits.extend(hi_emits);
+        body: &mut Block,
+    ) -> Result<Vec<Handle<Expression>>, LowerError> {
+        let mut values =
+            self.dequantize_q6k_values8(expressions, matrix, k_base, col, body)?;
+        let k_base_hi = self.add_lit(expressions, body, k_base, 8);
+        let hi_values =
+            self.dequantize_q6k_values8(expressions, matrix, k_base_hi, col, body)?;
         values.extend(hi_values);
-        Ok((values, emits))
+        Ok(values)
     }
 
     pub(in crate::lower) fn dequantize_q6k_dot8(
@@ -461,23 +460,23 @@ impl<'a> Lowerer<'a> {
         k_base: Handle<Expression>,
         col: Handle<Expression>,
         a: &[Handle<Expression>; 8],
-    ) -> Result<(Handle<Expression>, Vec<Range<Expression>>), LowerError> {
+        body: &mut Block,
+    ) -> Result<Handle<Expression>, LowerError> {
         if matrix.format != GgmlQuantFormat::Q6K {
             return Err(LowerError::UnsupportedOperation(
                 "q6k dot8 only supports Q6K",
             ));
         }
 
-        let mut emits = Vec::new();
-        let parts = self.q6k_block_parts(expressions, matrix, k_base, col, &mut emits)?;
+        let parts = self.q6k_block_parts(expressions, matrix, k_base, col, body)?;
 
         let mut q_components = Vec::with_capacity(8);
         for lane in 0..8 {
-            q_components.push(self.q6k_centered_component(expressions, &mut emits, &parts, lane));
+            q_components.push(self.q6k_centered_component(expressions, body, &parts, lane));
         }
 
-        let sum = self.dot_vec4_chunks(expressions, &mut emits, a, &q_components);
-        Ok((self.mul(expressions, &mut emits, sum, parts.scale), emits))
+        let sum = self.dot_vec4_chunks(expressions, body, a, &q_components);
+        Ok(self.mul(expressions, body, sum, parts.scale))
     }
 
     pub(in crate::lower) fn q4k_q8_activation_dot(
@@ -487,23 +486,22 @@ impl<'a> Lowerer<'a> {
         k_base: Handle<Expression>,
         col: Handle<Expression>,
         a: &Q8ActivationPacks,
-    ) -> Result<(Handle<Expression>, Vec<Range<Expression>>), LowerError> {
+        body: &mut Block,
+    ) -> Result<Handle<Expression>, LowerError> {
         if a.len == 0 || !a.len.is_multiple_of(2) {
             return Err(LowerError::UnsupportedOperation(
                 "q4k x q8 activation dot requires an even number of activation packs",
             ));
         }
 
-        let mut emits = Vec::new();
         let mut total = self.f32(expressions, 0.0);
         for pack_offset in (0..a.len).step_by(2) {
-            let k = self.add_lit(expressions, &mut emits, k_base, (pack_offset * 4) as u32);
-            let (chunk, chunk_emits) =
-                self.q4k_q8_activation_dot8(expressions, matrix, k, col, a, pack_offset)?;
-            emits.extend(chunk_emits);
-            total = self.bin(expressions, &mut emits, BinaryOperator::Add, total, chunk);
+            let k = self.add_lit(expressions, body, k_base, (pack_offset * 4) as u32);
+            let chunk =
+                self.q4k_q8_activation_dot8(expressions, matrix, k, col, a, pack_offset, body)?;
+            total = self.bin(expressions, body, BinaryOperator::Add, total, chunk);
         }
-        Ok((total, emits))
+        Ok(total)
     }
 
     pub(in crate::lower) fn q4k_q8_activation_dot8(
@@ -514,26 +512,26 @@ impl<'a> Lowerer<'a> {
         col: Handle<Expression>,
         a: &Q8ActivationPacks,
         pack_offset: usize,
-    ) -> Result<(Handle<Expression>, Vec<Range<Expression>>), LowerError> {
+        body: &mut Block,
+    ) -> Result<Handle<Expression>, LowerError> {
         if matrix.format != GgmlQuantFormat::Q4K || a.len < pack_offset + 2 {
             return Err(LowerError::UnsupportedOperation(
                 "q4k x q8 activation dot requires Q4K and two activation packs",
             ));
         }
 
-        let mut emits = Vec::new();
         let (b_scale, b_min, b_packs) =
-            self.q4k_quant_packs8(expressions, matrix, k_base, col, &mut emits)?;
+            self.q4k_quant_packs8(expressions, matrix, k_base, col, body)?;
         let total = self.q8_activation_packs_dot(
             expressions,
-            &mut emits,
+            body,
             a,
             pack_offset,
             b_scale,
             b_packs,
             Some(b_min),
         );
-        Ok((total, emits))
+        Ok(total)
     }
 
     pub(in crate::lower) fn q4k_f32_dot(
@@ -543,7 +541,8 @@ impl<'a> Lowerer<'a> {
         k_base: Handle<Expression>,
         col: Handle<Expression>,
         a: &[Handle<Expression>],
-    ) -> Result<(Handle<Expression>, Vec<Range<Expression>>), LowerError> {
+        body: &mut Block,
+    ) -> Result<Handle<Expression>, LowerError> {
         if matrix.format != GgmlQuantFormat::Q4K || a.is_empty() || !a.len().is_multiple_of(8) {
             return Err(LowerError::UnsupportedOperation(
                 "q4k f32 dot requires Q4K and a multiple of 8 activation values",
@@ -557,6 +556,7 @@ impl<'a> Lowerer<'a> {
                 col,
                 a,
                 true,
+                body,
             );
         }
         if a.len() == 16 {
@@ -567,42 +567,42 @@ impl<'a> Lowerer<'a> {
                 col,
                 a,
                 false,
+                body,
             );
         }
 
-        let mut emits = Vec::new();
         let mut total = self.f32(expressions, 0.0);
         for pack_offset in (0..a.len()).step_by(8) {
-            let k = self.add_lit(expressions, &mut emits, k_base, pack_offset as u32);
+            let k = self.add_lit(expressions, body, k_base, pack_offset as u32);
             let (scale, min, quants) =
-                self.q4k_quant_values::<8, 2>(expressions, matrix, k, col, false, &mut emits)?;
+                self.q4k_quant_values::<8, 2>(expressions, matrix, k, col, false, body)?;
             let mut weighted_sum = self.f32(expressions, 0.0);
             let mut activation_sum = self.f32(expressions, 0.0);
             for lane in 0..8 {
-                let q = self.as_f32(expressions, &mut emits, quants[lane]);
+                let q = self.as_f32(expressions, body, quants[lane]);
                 let activation = a[pack_offset + lane];
-                let weighted = self.mul(expressions, &mut emits, activation, q);
+                let weighted = self.mul(expressions, body, activation, q);
                 weighted_sum = self.bin(
                     expressions,
-                    &mut emits,
+                    body,
                     BinaryOperator::Add,
                     weighted_sum,
                     weighted,
                 );
                 activation_sum = self.bin(
                     expressions,
-                    &mut emits,
+                    body,
                     BinaryOperator::Add,
                     activation_sum,
                     activation,
                 );
             }
-            let scaled = self.mul(expressions, &mut emits, weighted_sum, scale);
-            let min_term = self.mul(expressions, &mut emits, activation_sum, min);
-            let chunk = self.sub(expressions, &mut emits, scaled, min_term);
-            total = self.bin(expressions, &mut emits, BinaryOperator::Add, total, chunk);
+            let scaled = self.mul(expressions, body, weighted_sum, scale);
+            let min_term = self.mul(expressions, body, activation_sum, min);
+            let chunk = self.sub(expressions, body, scaled, min_term);
+            total = self.bin(expressions, body, BinaryOperator::Add, total, chunk);
         }
-        Ok((total, emits))
+        Ok(total)
     }
 
     pub(in crate::lower) fn q4k_f32_dot_exact<const N: usize, const WORDS: usize>(
@@ -613,11 +613,11 @@ impl<'a> Lowerer<'a> {
         col: Handle<Expression>,
         a: &[Handle<Expression>],
         whole_group_pair: bool,
-    ) -> Result<(Handle<Expression>, Vec<Range<Expression>>), LowerError> {
+        body: &mut Block,
+    ) -> Result<Handle<Expression>, LowerError> {
         debug_assert_eq!(WORDS * 4, N);
         debug_assert_eq!(a.len(), N);
 
-        let mut emits = Vec::new();
         let (scale, min, quants) =
             self.q4k_quant_values::<N, WORDS>(
                 expressions,
@@ -625,38 +625,38 @@ impl<'a> Lowerer<'a> {
                 k_base,
                 col,
                 whole_group_pair,
-                &mut emits,
+                body,
             )?;
 
-        let total = self.q4k_f32_weighted_sum(expressions, &mut emits, scale, min, &quants, a);
-        Ok((total, emits))
+        let total = self.q4k_f32_weighted_sum(expressions, body, scale, min, &quants, a);
+        Ok(total)
     }
 
     pub(in crate::lower) fn q4k_f32_weighted_sum(
         &self,
         expressions: &mut Arena<Expression>,
-        emits: &mut Vec<Range<Expression>>,
+        body: &mut Block,
         scale: Handle<Expression>,
         min: Handle<Expression>,
         quants: &[Handle<Expression>],
         a: &[Handle<Expression>],
     ) -> Handle<Expression> {
-        let weighted_sum = self.dot_quant_vec4_chunks(expressions, emits, a, quants);
-        let activation_sum = self.sum_values(expressions, emits, a);
-        let scaled = self.mul(expressions, emits, weighted_sum, scale);
-        let min_term = self.mul(expressions, emits, activation_sum, min);
-        self.sub(expressions, emits, scaled, min_term)
+        let weighted_sum = self.dot_quant_vec4_chunks(expressions, body, a, quants);
+        let activation_sum = self.sum_values(expressions, body, a);
+        let scaled = self.mul(expressions, body, weighted_sum, scale);
+        let min_term = self.mul(expressions, body, activation_sum, min);
+        self.sub(expressions, body, scaled, min_term)
     }
 
     pub(in crate::lower) fn sum_values(
         &self,
         expressions: &mut Arena<Expression>,
-        emits: &mut Vec<Range<Expression>>,
+        body: &mut Block,
         values: &[Handle<Expression>],
     ) -> Handle<Expression> {
         let mut total = self.f32(expressions, 0.0);
         for value in values {
-            total = self.bin(expressions, emits, BinaryOperator::Add, total, *value);
+            total = self.bin(expressions, body, BinaryOperator::Add, total, *value);
         }
         total
     }
@@ -664,7 +664,7 @@ impl<'a> Lowerer<'a> {
     pub(in crate::lower) fn dot_quant_vec4_chunks(
         &self,
         expressions: &mut Arena<Expression>,
-        emits: &mut Vec<Range<Expression>>,
+        body: &mut Block,
         left: &[Handle<Expression>],
         right_quants: &[Handle<Expression>],
     ) -> Handle<Expression> {
@@ -676,10 +676,10 @@ impl<'a> Lowerer<'a> {
         for (left_chunk, right_chunk) in left.chunks_exact(4).zip(right_quants.chunks_exact(4)) {
             let right_chunk = right_chunk
                 .iter()
-                .map(|quant| self.as_f32(expressions, emits, *quant))
+                .map(|quant| self.as_f32(expressions, body, *quant))
                 .collect::<Vec<_>>();
-            let dot = self.dot_vec4(expressions, emits, left_chunk, &right_chunk);
-            total = self.bin(expressions, emits, BinaryOperator::Add, total, dot);
+            let dot = self.dot_vec4(expressions, body, left_chunk, &right_chunk);
+            total = self.bin(expressions, body, BinaryOperator::Add, total, dot);
         }
         total
     }
@@ -687,7 +687,7 @@ impl<'a> Lowerer<'a> {
     pub(in crate::lower) fn dot_vec4_chunks(
         &self,
         expressions: &mut Arena<Expression>,
-        emits: &mut Vec<Range<Expression>>,
+        body: &mut Block,
         left: &[Handle<Expression>],
         right: &[Handle<Expression>],
     ) -> Handle<Expression> {
@@ -699,10 +699,10 @@ impl<'a> Lowerer<'a> {
         let (left_chunk, right_chunk) = chunks
             .next()
             .expect("dot_vec4_chunks requires at least one vec4");
-        let mut total = self.dot_vec4(expressions, emits, left_chunk, right_chunk);
+        let mut total = self.dot_vec4(expressions, body, left_chunk, right_chunk);
         for (left_chunk, right_chunk) in chunks {
-            let dot = self.dot_vec4(expressions, emits, left_chunk, right_chunk);
-            total = self.bin(expressions, emits, BinaryOperator::Add, total, dot);
+            let dot = self.dot_vec4(expressions, body, left_chunk, right_chunk);
+            total = self.bin(expressions, body, BinaryOperator::Add, total, dot);
         }
         total
     }
@@ -710,7 +710,7 @@ impl<'a> Lowerer<'a> {
     pub(in crate::lower) fn dot_vec4(
         &self,
         expressions: &mut Arena<Expression>,
-        emits: &mut Vec<Range<Expression>>,
+        body: &mut Block,
         left: &[Handle<Expression>],
         right: &[Handle<Expression>],
     ) -> Handle<Expression> {
@@ -724,7 +724,10 @@ impl<'a> Lowerer<'a> {
             },
             Span::default(),
         );
-        emits.push(Self::single_expression_range(expressions, left));
+        body.push(
+            Statement::Emit(Self::single_expression_range(expressions, left)),
+            Span::default(),
+        );
         let right = expressions.append(
             Expression::Compose {
                 ty: self.f32_vec4_ty,
@@ -732,7 +735,10 @@ impl<'a> Lowerer<'a> {
             },
             Span::default(),
         );
-        emits.push(Self::single_expression_range(expressions, right));
+        body.push(
+            Statement::Emit(Self::single_expression_range(expressions, right)),
+            Span::default(),
+        );
         let dot = expressions.append(
             Expression::Math {
                 fun: MathFunction::Dot,
@@ -743,7 +749,10 @@ impl<'a> Lowerer<'a> {
             },
             Span::default(),
         );
-        emits.push(Self::single_expression_range(expressions, dot));
+        body.push(
+            Statement::Emit(Self::single_expression_range(expressions, dot)),
+            Span::default(),
+        );
         dot
     }
 }

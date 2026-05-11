@@ -23,16 +23,19 @@ impl<'a> Lowerer<'a> {
         expressions: &mut Arena<Expression>,
         tile: TileRef,
         index: Handle<Expression>,
-    ) -> Result<(Handle<Expression>, Vec<Range<Expression>>), LowerError> {
+        body: &mut Block,
+    ) -> Result<Handle<Expression>, LowerError> {
         self.tile_layout(tile)?;
 
         let base = self.tile_base_expression(expressions, tile)?;
         let (_, offset) = self.storage_tile_and_offset(tile)?;
-        let mut emits = Vec::new();
-        let index = self.add_literal_u32_emitted(expressions, index, offset, &mut emits);
+        let index = self.add_literal_u32_emitted(expressions, index, offset, body);
         let pointer = expressions.append(Expression::Access { base, index }, Span::default());
-        emits.push(Self::single_expression_range(expressions, pointer));
-        Ok((pointer, emits))
+        body.push(
+            Statement::Emit(Self::single_expression_range(expressions, pointer)),
+            Span::default(),
+        );
+        Ok(pointer)
     }
 
     pub(super) fn tile_base_expression(
@@ -71,13 +74,16 @@ impl<'a> Lowerer<'a> {
         expressions: &mut Arena<Expression>,
         view: &StorageView,
         index: Handle<Expression>,
-    ) -> Result<(Handle<Expression>, Vec<Range<Expression>>), LowerError> {
+        body: &mut Block,
+    ) -> Result<Handle<Expression>, LowerError> {
         let base = self.storage_base_expression(expressions, view)?;
-        let mut emits = Vec::new();
-        let index = self.add_literal_u32_emitted(expressions, index, view.offset, &mut emits);
+        let index = self.add_literal_u32_emitted(expressions, index, view.offset, body);
         let pointer = expressions.append(Expression::Access { base, index }, Span::default());
-        emits.push(Self::single_expression_range(expressions, pointer));
-        Ok((pointer, emits))
+        body.push(
+            Statement::Emit(Self::single_expression_range(expressions, pointer)),
+            Span::default(),
+        );
+        Ok(pointer)
     }
 
     pub(super) fn storage_base_expression(
@@ -156,9 +162,10 @@ impl<'a> Lowerer<'a> {
         expressions: &mut Arena<Expression>,
         view: &StorageView,
         coords: &[Handle<Expression>],
-    ) -> Result<(Handle<Expression>, Vec<Range<Expression>>), LowerError> {
+        body: &mut Block,
+    ) -> Result<Handle<Expression>, LowerError> {
         if let Some(index_map) = &view.index_map {
-            return self.storage_index_from_index_map(expressions, index_map, coords);
+            return self.storage_index_from_index_map(expressions, index_map, coords, body);
         }
 
         let layout = self.storage_layout(view)?;
@@ -166,10 +173,9 @@ impl<'a> Lowerer<'a> {
             return Err(LowerError::UnsupportedOperation("layout rank mismatch"));
         }
 
-        let mut emits = Vec::new();
         let mut terms = Vec::with_capacity(coords.len());
         for (coord, stride) in coords.iter().zip(layout.strides().values()) {
-            terms.push(self.mul_literal_u32_emitted(expressions, *coord, *stride, &mut emits));
+            terms.push(self.mul_literal_u32_emitted(expressions, *coord, *stride, body));
         }
         let mut terms = terms.into_iter();
         let Some(mut index) = terms.next() else {
@@ -184,10 +190,13 @@ impl<'a> Lowerer<'a> {
                 },
                 Span::default(),
             );
-            emits.push(Self::single_expression_range(expressions, index));
+            body.push(
+                Statement::Emit(Self::single_expression_range(expressions, index)),
+                Span::default(),
+            );
         }
 
-        Ok((index, emits))
+        Ok(index)
     }
 
     fn storage_index_from_index_map(
@@ -195,13 +204,14 @@ impl<'a> Lowerer<'a> {
         expressions: &mut Arena<Expression>,
         index_map: &StorageIndexMap,
         coords: &[Handle<Expression>],
-    ) -> Result<(Handle<Expression>, Vec<Range<Expression>>), LowerError> {
+        body: &mut Block,
+    ) -> Result<Handle<Expression>, LowerError> {
         match index_map {
             StorageIndexMap::Im2ColNhwc(map) => {
-                self.storage_index_from_im2col_nhwc(expressions, *map, coords)
+                self.storage_index_from_im2col_nhwc(expressions, *map, coords, body)
             }
             StorageIndexMap::FlattenedMatrix(map) => {
-                self.storage_index_from_flattened_matrix(expressions, map, coords)
+                self.storage_index_from_flattened_matrix(expressions, map, coords, body)
             }
         }
     }
@@ -211,7 +221,8 @@ impl<'a> Lowerer<'a> {
         expressions: &mut Arena<Expression>,
         map: &FlattenedMatrixMap,
         coords: &[Handle<Expression>],
-    ) -> Result<(Handle<Expression>, Vec<Range<Expression>>), LowerError> {
+        body: &mut Block,
+    ) -> Result<Handle<Expression>, LowerError> {
         if coords.len() != 2 {
             return Err(LowerError::UnsupportedOperation(
                 "flattened matrix storage views require matrix coordinates",
@@ -223,7 +234,6 @@ impl<'a> Lowerer<'a> {
             ));
         }
 
-        let mut emits = Vec::new();
         let row = coords[0];
         let col = coords[1];
         let mut remaining = row;
@@ -234,13 +244,13 @@ impl<'a> Lowerer<'a> {
             let coord = if axis == 0 {
                 remaining
             } else {
-                let coord = self.mod_literal_u32_emitted(expressions, remaining, dim, &mut emits);
-                remaining = self.div_literal_u32_emitted(expressions, remaining, dim, &mut emits);
+                let coord = self.mod_literal_u32_emitted(expressions, remaining, dim, body);
+                remaining = self.div_literal_u32_emitted(expressions, remaining, dim, body);
                 coord
             };
             let stride = map.prefix_strides[axis];
             if stride != 0 {
-                terms.push(self.mul_literal_u32_emitted(expressions, coord, stride, &mut emits));
+                terms.push(self.mul_literal_u32_emitted(expressions, coord, stride, body));
             }
         }
 
@@ -249,19 +259,19 @@ impl<'a> Lowerer<'a> {
                 expressions,
                 col,
                 map.column_stride,
-                &mut emits,
+                body,
             ));
         }
 
         let mut terms = terms.into_iter();
         let Some(mut index) = terms.next() else {
             let zero = expressions.append(Expression::Literal(Literal::U32(0)), Span::default());
-            return Ok((zero, emits));
+            return Ok(zero);
         };
         for term in terms {
-            index = Self::add_u32_expr(expressions, index, term, &mut emits);
+            index = Self::add_u32_expr(expressions, index, term, body);
         }
-        Ok((index, emits))
+        Ok(index)
     }
 
     fn storage_index_from_im2col_nhwc(
@@ -269,14 +279,14 @@ impl<'a> Lowerer<'a> {
         expressions: &mut Arena<Expression>,
         map: Im2ColNhwcMap,
         coords: &[Handle<Expression>],
-    ) -> Result<(Handle<Expression>, Vec<Range<Expression>>), LowerError> {
+        body: &mut Block,
+    ) -> Result<Handle<Expression>, LowerError> {
         if coords.len() != 2 {
             return Err(LowerError::UnsupportedOperation(
                 "im2col storage views require matrix coordinates",
             ));
         }
 
-        let mut emits = Vec::new();
         let row = coords[0];
         let k = coords[1];
         let output_pixels =
@@ -292,27 +302,27 @@ impl<'a> Lowerer<'a> {
                     "im2col kernel shape overflow",
                 ))?;
 
-        let batch = self.div_literal_u32_emitted(expressions, row, output_pixels, &mut emits);
+        let batch = self.div_literal_u32_emitted(expressions, row, output_pixels, body);
         let output_index =
-            self.mod_literal_u32_emitted(expressions, row, output_pixels, &mut emits);
-        let out_y = self.div_literal_u32_emitted(expressions, output_index, map.out_w, &mut emits);
-        let out_x = self.mod_literal_u32_emitted(expressions, output_index, map.out_w, &mut emits);
+            self.mod_literal_u32_emitted(expressions, row, output_pixels, body);
+        let out_y = self.div_literal_u32_emitted(expressions, output_index, map.out_w, body);
+        let out_x = self.mod_literal_u32_emitted(expressions, output_index, map.out_w, body);
 
-        let kernel_y = self.div_literal_u32_emitted(expressions, k, kernel_w_channels, &mut emits);
-        let kernel_xc = self.mod_literal_u32_emitted(expressions, k, kernel_w_channels, &mut emits);
+        let kernel_y = self.div_literal_u32_emitted(expressions, k, kernel_w_channels, body);
+        let kernel_xc = self.mod_literal_u32_emitted(expressions, k, kernel_w_channels, body);
         let kernel_x =
-            self.div_literal_u32_emitted(expressions, kernel_xc, map.channels, &mut emits);
+            self.div_literal_u32_emitted(expressions, kernel_xc, map.channels, body);
         let channel =
-            self.mod_literal_u32_emitted(expressions, kernel_xc, map.channels, &mut emits);
+            self.mod_literal_u32_emitted(expressions, kernel_xc, map.channels, body);
 
-        let out_y = self.mul_literal_u32_emitted(expressions, out_y, map.stride_h, &mut emits);
+        let out_y = self.mul_literal_u32_emitted(expressions, out_y, map.stride_h, body);
         let kernel_y =
-            self.mul_literal_u32_emitted(expressions, kernel_y, map.dilation_h, &mut emits);
-        let in_y = Self::add_u32_expr(expressions, out_y, kernel_y, &mut emits);
-        let out_x = self.mul_literal_u32_emitted(expressions, out_x, map.stride_w, &mut emits);
+            self.mul_literal_u32_emitted(expressions, kernel_y, map.dilation_h, body);
+        let in_y = Self::add_u32_expr(expressions, out_y, kernel_y, body);
+        let out_x = self.mul_literal_u32_emitted(expressions, out_x, map.stride_w, body);
         let kernel_x =
-            self.mul_literal_u32_emitted(expressions, kernel_x, map.dilation_w, &mut emits);
-        let in_x = Self::add_u32_expr(expressions, out_x, kernel_x, &mut emits);
+            self.mul_literal_u32_emitted(expressions, kernel_x, map.dilation_w, body);
+        let in_x = Self::add_u32_expr(expressions, out_x, kernel_x, body);
 
         let terms = [
             (batch, map.batch_stride),
@@ -325,23 +335,23 @@ impl<'a> Lowerer<'a> {
             if Self::is_u32_literal(expressions, coord, 0) || stride == 0 {
                 continue;
             }
-            let term = self.mul_literal_u32_emitted(expressions, coord, stride, &mut emits);
+            let term = self.mul_literal_u32_emitted(expressions, coord, stride, body);
             index = Some(match index {
-                Some(index) => Self::add_u32_expr(expressions, index, term, &mut emits),
+                Some(index) => Self::add_u32_expr(expressions, index, term, body),
                 None => term,
             });
         }
         let index = index.unwrap_or_else(|| {
             expressions.append(Expression::Literal(Literal::U32(0)), Span::default())
         });
-        Ok((index, emits))
+        Ok(index)
     }
 
     fn add_u32_expr(
         expressions: &mut Arena<Expression>,
         left: Handle<Expression>,
         right: Handle<Expression>,
-        emits: &mut Vec<Range<Expression>>,
+        body: &mut Block,
     ) -> Handle<Expression> {
         if Self::is_u32_literal(expressions, left, 0) {
             return right;
@@ -357,7 +367,10 @@ impl<'a> Lowerer<'a> {
             },
             Span::default(),
         );
-        emits.push(Self::single_expression_range(expressions, value));
+        body.push(
+            Statement::Emit(Self::single_expression_range(expressions, value)),
+            Span::default(),
+        );
         value
     }
 

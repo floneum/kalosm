@@ -49,12 +49,10 @@ impl<'a> Lowerer<'a> {
         let mut accept = Block::new();
         let row = self.lower_tile_expr_lane(expressions, scratch, &mut accept, &store.row, 0)?;
         let col = self.lower_tile_expr_lane(expressions, scratch, &mut accept, &store.col, 0)?;
-        let (dst_index, dst_index_emits) =
-            self.storage_index_from_coords(expressions, &store.dst, &[row, col])?;
-        let (dst_ptr, dst_ptr_emits) =
-            self.storage_dynamic_pointer(expressions, &store.dst, dst_index)?;
-        Self::push_emits(&mut accept, dst_index_emits);
-        Self::push_emits(&mut accept, dst_ptr_emits);
+        let dst_index =
+            self.storage_index_from_coords(expressions, &store.dst, &[row, col], &mut accept)?;
+        let dst_ptr =
+            self.storage_dynamic_pointer(expressions, &store.dst, dst_index, &mut accept)?;
         Self::push_masked_store(body, mask, accept, dst_ptr, value);
         Ok(())
     }
@@ -74,8 +72,7 @@ impl<'a> Lowerer<'a> {
         let mask = self.lower_tile_expr_lane(expressions, scratch, body, mask, 0)?;
         let mut accept = Block::new();
         let index = self.lower_tile_expr_lane(expressions, scratch, &mut accept, index, 0)?;
-        let (dst_ptr, dst_ptr_emits) = self.storage_dynamic_pointer(expressions, dst, index)?;
-        Self::push_emits(&mut accept, dst_ptr_emits);
+        let dst_ptr = self.storage_dynamic_pointer(expressions, dst, index, &mut accept)?;
         Self::push_masked_store(body, mask, accept, dst_ptr, value);
         Ok(())
     }

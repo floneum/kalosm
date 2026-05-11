@@ -52,7 +52,7 @@ impl<'a> Lowerer<'a> {
         expressions: &mut Arena<Expression>,
         value: Handle<Expression>,
         literal: u32,
-        emits: &mut Vec<Range<Expression>>,
+        body: &mut Block,
     ) -> Handle<Expression> {
         if literal == 0 {
             return value;
@@ -73,7 +73,10 @@ impl<'a> Lowerer<'a> {
             },
             Span::default(),
         );
-        emits.push(Self::single_expression_range(expressions, value));
+        body.push(
+            Statement::Emit(Self::single_expression_range(expressions, value)),
+            Span::default(),
+        );
         value
     }
 
@@ -82,7 +85,7 @@ impl<'a> Lowerer<'a> {
         expressions: &mut Arena<Expression>,
         value: Handle<Expression>,
         literal: u32,
-        emits: &mut Vec<Range<Expression>>,
+        body: &mut Block,
     ) -> Handle<Expression> {
         if literal == 1 {
             return value;
@@ -103,7 +106,10 @@ impl<'a> Lowerer<'a> {
             },
             Span::default(),
         );
-        emits.push(Self::single_expression_range(expressions, value));
+        body.push(
+            Statement::Emit(Self::single_expression_range(expressions, value)),
+            Span::default(),
+        );
         value
     }
 
@@ -112,7 +118,7 @@ impl<'a> Lowerer<'a> {
         expressions: &mut Arena<Expression>,
         value: Handle<Expression>,
         literal: u32,
-        emits: &mut Vec<Range<Expression>>,
+        body: &mut Block,
     ) -> Handle<Expression> {
         if literal == 1 {
             return value;
@@ -148,7 +154,10 @@ impl<'a> Lowerer<'a> {
                 Span::default(),
             )
         };
-        emits.push(Self::single_expression_range(expressions, value));
+        body.push(
+            Statement::Emit(Self::single_expression_range(expressions, value)),
+            Span::default(),
+        );
         value
     }
 
@@ -157,7 +166,7 @@ impl<'a> Lowerer<'a> {
         expressions: &mut Arena<Expression>,
         value: Handle<Expression>,
         literal: u32,
-        emits: &mut Vec<Range<Expression>>,
+        body: &mut Block,
     ) -> Handle<Expression> {
         if literal == 1 {
             return expressions.append(Expression::Literal(Literal::U32(0)), Span::default());
@@ -193,7 +202,10 @@ impl<'a> Lowerer<'a> {
                 Span::default(),
             )
         };
-        emits.push(Self::single_expression_range(expressions, value));
+        body.push(
+            Statement::Emit(Self::single_expression_range(expressions, value)),
+            Span::default(),
+        );
         value
     }
 }

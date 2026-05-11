@@ -1,20 +1,14 @@
 use super::*;
 
 impl<'a> Lowerer<'a> {
-    pub(super) fn push_emits(body: &mut Block, emits: Vec<Range<Expression>>) {
-        for emit in emits {
-            body.push(Statement::Emit(emit), Span::default());
-        }
-    }
-
     pub(super) fn push_guarded_or_full_block(
         body: &mut Block,
-        guard_emits: Vec<Range<Expression>>,
+        mut guard_block: Block,
         condition: Option<Handle<Expression>>,
         accept: Block,
     ) {
         if let Some(condition) = condition {
-            Self::push_emits(body, guard_emits);
+            body.append(&mut guard_block);
             body.push(
                 Statement::If {
                     condition,
@@ -23,13 +17,11 @@ impl<'a> Lowerer<'a> {
                 },
                 Span::default(),
             );
-        } else if guard_emits.is_empty() {
+        } else if guard_block.is_empty() {
             body.push(Statement::Block(accept), Span::default());
         } else {
-            let mut block = Block::new();
-            Self::push_emits(&mut block, guard_emits);
-            block.push(Statement::Block(accept), Span::default());
-            body.push(Statement::Block(block), Span::default());
+            guard_block.push(Statement::Block(accept), Span::default());
+            body.push(Statement::Block(guard_block), Span::default());
         }
     }
 

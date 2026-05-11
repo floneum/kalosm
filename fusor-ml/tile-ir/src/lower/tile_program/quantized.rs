@@ -34,7 +34,7 @@ impl<'a> Lowerer<'a> {
                     mask,
                     fill,
                     spill_depth,
-                    |expressions, k_base, col| match (src.format, block_n) {
+                    |expressions, k_base, col, body| match (src.format, block_n) {
                         (GgmlQuantFormat::Q8_0, 8) => {
                             let a8: [Handle<Expression>; 8] =
                                 a_handles.as_slice().try_into().map_err(|_| {
@@ -42,7 +42,7 @@ impl<'a> Lowerer<'a> {
                                         "f32 activation dot only supports dot8",
                                     )
                                 })?;
-                            self.dequantize_q8_0_dot8(expressions, src, k_base, col, &a8)
+                            self.dequantize_q8_0_dot8(expressions, src, k_base, col, &a8, body)
                         }
                         (GgmlQuantFormat::Q6K, 8) => {
                             let a8: [Handle<Expression>; 8] =
@@ -51,10 +51,10 @@ impl<'a> Lowerer<'a> {
                                         "f32 activation dot only supports dot8",
                                     )
                                 })?;
-                            self.dequantize_q6k_dot8(expressions, src, k_base, col, &a8)
+                            self.dequantize_q6k_dot8(expressions, src, k_base, col, &a8, body)
                         }
                         (GgmlQuantFormat::Q4K, 8 | 16 | 32) => {
-                            self.q4k_f32_dot(expressions, src, k_base, col, &a_handles)
+                            self.q4k_f32_dot(expressions, src, k_base, col, &a_handles, body)
                         }
                         _ => Err(LowerError::UnsupportedOperation(
                             "f32 activation dot only supports Q8_0/Q6K dot8 or Q4K dot8/dot16/dot32",
@@ -76,13 +76,23 @@ impl<'a> Lowerer<'a> {
                     mask,
                     fill,
                     spill_depth,
-                    |expressions, k_base, col| match (src.format, block_n) {
-                        (GgmlQuantFormat::Q4K, 8 | 16) => {
-                            self.q4k_q8_activation_dot(expressions, src, k_base, col, &a_packs)
-                        }
-                        (GgmlQuantFormat::Q6K, 8 | 16) => {
-                            self.q6k_q8_activation_dot(expressions, src, k_base, col, &a_packs)
-                        }
+                    |expressions, k_base, col, body| match (src.format, block_n) {
+                        (GgmlQuantFormat::Q4K, 8 | 16) => self.q4k_q8_activation_dot(
+                            expressions,
+                            src,
+                            k_base,
+                            col,
+                            &a_packs,
+                            body,
+                        ),
+                        (GgmlQuantFormat::Q6K, 8 | 16) => self.q6k_q8_activation_dot(
+                            expressions,
+                            src,
+                            k_base,
+                            col,
+                            &a_packs,
+                            body,
+                        ),
                         _ => Err(LowerError::UnsupportedOperation(
                             "q8 activation dot only supports Q4K/Q6K dot8/dot16",
                         )),
@@ -142,6 +152,7 @@ impl<'a> Lowerer<'a> {
                             &low_handles,
                             &high_handles,
                             &sum_handles,
+                            block_body,
                         )
                     },
                 )
@@ -185,7 +196,16 @@ impl<'a> Lowerer<'a> {
                             .lower_tile_expr_lane(expressions, scratch, block_body, il, spill_depth)?;
                         let col_h = self
                             .lower_tile_expr_lane(expressions, scratch, block_body, col, spill_depth)?;
-                        self.q6k_ggml_dot(expressions, src, block_h, ip_h, il_h, col_h, &a_handles)
+                        self.q6k_ggml_dot(
+                            expressions,
+                            src,
+                            block_h,
+                            ip_h,
+                            il_h,
+                            col_h,
+                            &a_handles,
+                            block_body,
+                        )
                     },
                 )
             }
@@ -229,8 +249,8 @@ impl<'a> Lowerer<'a> {
             &mut Arena<Expression>,
             Handle<Expression>,
             Handle<Expression>,
-        )
-            -> Result<(Handle<Expression>, Vec<Range<Expression>>), LowerError>,
+            &mut Block,
+        ) -> Result<Handle<Expression>, LowerError>,
     ) -> Result<Handle<Expression>, LowerError> {
         self.lower_masked_f32_value(
             expressions,
@@ -244,7 +264,7 @@ impl<'a> Lowerer<'a> {
                     self.lower_tile_expr_lane(expressions, scratch, block, k_base, spill_depth)?;
                 let col =
                     self.lower_tile_expr_lane(expressions, scratch, block, col, spill_depth)?;
-                lower_value(expressions, k_base, col)
+                lower_value(expressions, k_base, col, block)
             },
         )
     }
@@ -256,20 +276,25 @@ impl<'a> Lowerer<'a> {
         k_base: Handle<Expression>,
         col: Handle<Expression>,
         block_n: u32,
-    ) -> Result<(Vec<Handle<Expression>>, Vec<Range<Expression>>), LowerError> {
+        body: &mut Block,
+    ) -> Result<Vec<Handle<Expression>>, LowerError> {
         match (src.format, block_n) {
             (GgmlQuantFormat::Q8_0, 8) => {
-                self.dequantize_q8_0_values8(expressions, src, k_base, col)
+                self.dequantize_q8_0_values8(expressions, src, k_base, col, body)
             }
-            (GgmlQuantFormat::Q4K, 8) => self.dequantize_q4k_values8(expressions, src, k_base, col),
-            (GgmlQuantFormat::Q6K, 8) => self.dequantize_q6k_values8(expressions, src, k_base, col),
+            (GgmlQuantFormat::Q4K, 8) => {
+                self.dequantize_q4k_values8(expressions, src, k_base, col, body)
+            }
+            (GgmlQuantFormat::Q6K, 8) => {
+                self.dequantize_q6k_values8(expressions, src, k_base, col, body)
+            }
             (GgmlQuantFormat::Q6K, 16) => {
-                self.dequantize_q6k_values16(expressions, src, k_base, col)
+                self.dequantize_q6k_values16(expressions, src, k_base, col, body)
             }
             (GgmlQuantFormat::Q5_0, 16) => {
-                self.dequantize_q5_0_values16(expressions, src, k_base, col)
+                self.dequantize_q5_0_values16(expressions, src, k_base, col, body)
             }
-            (_, 8 | 16) => self.dequantize_qvalues(expressions, src, k_base, col, block_n),
+            (_, 8 | 16) => self.dequantize_qvalues(expressions, src, k_base, col, block_n, body),
             _ => Err(LowerError::UnsupportedOperation(
                 "quantized block dequant only supports 8-wide or 16-wide blocks",
             )),
@@ -306,14 +331,14 @@ impl<'a> Lowerer<'a> {
                 self.lower_tile_expr_lane(expressions, scratch, body, k_base, spill_depth)?;
             let col_handle =
                 self.lower_tile_expr_lane(expressions, scratch, body, col, spill_depth)?;
-            let (values, value_emits) = self.dequantize_quantized_block_values(
+            let values = self.dequantize_quantized_block_values(
                 expressions,
                 src,
                 k_base_handle,
                 col_handle,
                 block_n,
+                body,
             )?;
-            Self::push_emits(body, value_emits);
             self.block_dequant_cache
                 .borrow_mut()
                 .insert(id, values.clone());
@@ -353,14 +378,14 @@ impl<'a> Lowerer<'a> {
             self.lower_tile_expr_lane(expressions, scratch, &mut accept, k_base, spill_depth)?;
         let col_handle =
             self.lower_tile_expr_lane(expressions, scratch, &mut accept, col, spill_depth)?;
-        let (values, value_emits) = self.dequantize_quantized_block_values(
+        let values = self.dequantize_quantized_block_values(
             expressions,
             src,
             k_base_handle,
             col_handle,
             block_n,
+            &mut accept,
         )?;
-        Self::push_emits(&mut accept, value_emits);
         for (local, value) in tmp_locals.iter().zip(values.iter()) {
             let ptr = expressions.append(Expression::LocalVariable(*local), Span::default());
             accept.push(
@@ -445,13 +470,10 @@ impl<'a> Lowerer<'a> {
         lower_value: impl FnOnce(
             &mut Arena<Expression>,
             &mut Block,
-        )
-            -> Result<(Handle<Expression>, Vec<Range<Expression>>), LowerError>,
+        ) -> Result<Handle<Expression>, LowerError>,
     ) -> Result<Handle<Expression>, LowerError> {
         if mask.is_constant_true() {
-            let (value, emits) = lower_value(expressions, body)?;
-            Self::push_emits(body, emits);
-            return Ok(value);
+            return lower_value(expressions, body);
         }
 
         let fill_source = self.tile_expr_element(fill)?;
@@ -467,11 +489,7 @@ impl<'a> Lowerer<'a> {
             spill_depth,
             ElementType::F32,
             fill_handle,
-            |expressions, accept| {
-                let (value, emits) = lower_value(expressions, accept)?;
-                Self::push_emits(accept, emits);
-                Ok(value)
-            },
+            lower_value,
         )
     }
 

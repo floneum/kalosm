@@ -35,7 +35,7 @@ impl<'a> Lowerer<'a> {
                         &load.col,
                         spill_depth,
                     )?;
-                    self.dequantize_qvalue(expressions, matrix, row, col)
+                    self.dequantize_qvalue(expressions, matrix, row, col, block)
                 },
             ),
         }
@@ -56,12 +56,9 @@ impl<'a> Lowerer<'a> {
                 self.lower_tile_expr_lane(expressions, scratch, body, &load.row, spill_depth)?;
             let col =
                 self.lower_tile_expr_lane(expressions, scratch, body, &load.col, spill_depth)?;
-            let (src_index, src_index_emits) =
-                self.storage_index_from_coords(expressions, view, &[row, col])?;
-            let (src_ptr, src_ptr_emits) =
-                self.storage_dynamic_pointer(expressions, view, src_index)?;
-            Self::push_emits(body, src_index_emits);
-            Self::push_emits(body, src_ptr_emits);
+            let src_index =
+                self.storage_index_from_coords(expressions, view, &[row, col], body)?;
+            let src_ptr = self.storage_dynamic_pointer(expressions, view, src_index, body)?;
             return Ok(Self::emit_load(expressions, body, src_ptr));
         }
 
@@ -91,12 +88,9 @@ impl<'a> Lowerer<'a> {
                     &load.col,
                     spill_depth,
                 )?;
-                let (src_index, src_index_emits) =
-                    self.storage_index_from_coords(expressions, view, &[row, col])?;
-                let (src_ptr, src_ptr_emits) =
-                    self.storage_dynamic_pointer(expressions, view, src_index)?;
-                Self::push_emits(accept, src_index_emits);
-                Self::push_emits(accept, src_ptr_emits);
+                let src_index =
+                    self.storage_index_from_coords(expressions, view, &[row, col], accept)?;
+                let src_ptr = self.storage_dynamic_pointer(expressions, view, src_index, accept)?;
                 Ok(Self::emit_load(expressions, accept, src_ptr))
             },
         )
@@ -153,8 +147,7 @@ impl<'a> Lowerer<'a> {
         if mask.is_constant_true() {
             let index =
                 self.lower_tile_expr_lane(expressions, scratch, body, index, spill_depth)?;
-            let (src_ptr, src_ptr_emits) = self.storage_dynamic_pointer(expressions, src, index)?;
-            Self::push_emits(body, src_ptr_emits);
+            let src_ptr = self.storage_dynamic_pointer(expressions, src, index, body)?;
             return Ok(Self::emit_load(expressions, body, src_ptr));
         }
 
@@ -170,9 +163,7 @@ impl<'a> Lowerer<'a> {
             |expressions, accept| {
                 let index =
                     self.lower_tile_expr_lane(expressions, scratch, accept, index, spill_depth)?;
-                let (src_ptr, src_ptr_emits) =
-                    self.storage_dynamic_pointer(expressions, src, index)?;
-                Self::push_emits(accept, src_ptr_emits);
+                let src_ptr = self.storage_dynamic_pointer(expressions, src, index, accept)?;
                 Ok(Self::emit_load(expressions, accept, src_ptr))
             },
         )

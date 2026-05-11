@@ -20,8 +20,7 @@ impl<'a> Lowerer<'a> {
             Expr::LoadWorkgroup { src, index } => {
                 let index =
                     self.lower_tile_expr_lane(expressions, scratch, body, index, spill_depth)?;
-                let (ptr, emits) = self.tile_dynamic_pointer(expressions, *src, index)?;
-                Self::push_emits(body, emits);
+                let ptr = self.tile_dynamic_pointer(expressions, *src, index, body)?;
                 Ok(Self::emit_load(expressions, body, ptr))
             }
             Expr::LoadLocal(local) => {
