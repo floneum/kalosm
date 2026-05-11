@@ -261,7 +261,7 @@ impl<const BLOCK: usize> TileBlock<'_, BLOCK> {
     /// `TileStmt::StoreLocal` at the call site; subsequent `Bound::get()` calls
     /// return tiles that lower to a load of the bound local.
     pub fn bind(&mut self, value: Tile<BLOCK>) -> Bound<BLOCK> {
-        let element = self.program.ir.tile_expr_element(&value.expr);
+        let element = value.expr.element();
         let local = self.program.alloc_local_element(element);
         self.push_stmt(TileStmt::StoreLocal {
             dst: local,

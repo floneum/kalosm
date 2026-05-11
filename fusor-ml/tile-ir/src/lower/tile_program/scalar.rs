@@ -11,7 +11,7 @@ impl<'a> Lowerer<'a> {
         op: TileReduceOp,
         spill_depth: usize,
     ) -> Result<Handle<Expression>, LowerError> {
-        let element = self.tile_expr_element(value)?;
+        let element = value.element();
         let acc = self.tile_expr_spill_local(scratch, element, 0)?;
         let acc_ptr = expressions.append(Expression::LocalVariable(acc), Span::default());
         let initial = expressions.append(

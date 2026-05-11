@@ -62,7 +62,7 @@ impl<'a> Lowerer<'a> {
             return Ok(Self::emit_load(expressions, body, src_ptr));
         }
 
-        let fill_source = self.tile_expr_element(&load.fill)?;
+        let fill_source = load.fill.element();
         let fill = self.lower_tile_expr_lane(expressions, scratch, body, &load.fill, spill_depth)?;
         let fill = self.cast_tile_value(expressions, body, fill, fill_source, element);
         self.lower_masked_value_to_local(
@@ -115,7 +115,7 @@ impl<'a> Lowerer<'a> {
             spill_depth,
             element,
             |lowerer, expressions, body| {
-                let fill_source = lowerer.tile_expr_element(&load.fill)?;
+                let fill_source = load.fill.element();
                 let fill = lowerer.lower_tile_expr_lane(
                     expressions,
                     scratch,

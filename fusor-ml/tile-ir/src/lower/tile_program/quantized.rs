@@ -355,7 +355,7 @@ impl<'a> Lowerer<'a> {
                     ))
             })
             .collect::<Result<_, _>>()?;
-        let fill_source = self.tile_expr_element(fill)?;
+        let fill_source = fill.element();
         let fill_value =
             self.lower_tile_expr_lane(expressions, scratch, body, fill, spill_depth)?;
         let fill_value =
@@ -476,7 +476,7 @@ impl<'a> Lowerer<'a> {
             return lower_value(expressions, body);
         }
 
-        let fill_source = self.tile_expr_element(fill)?;
+        let fill_source = fill.element();
         let fill_handle =
             self.lower_tile_expr_lane(expressions, scratch, body, fill, spill_depth)?;
         let fill_handle =

@@ -91,7 +91,7 @@ impl<'a> Lowerer<'a> {
                 Ok(self.emit_tile_expr(expressions, body, expr))
             }
             Expr::Cast { value, to } => {
-                let source = self.tile_expr_element(value)?;
+                let source = value.element();
                 let value =
                     self.lower_tile_expr_lane(expressions, scratch, body, value, spill_depth)?;
                 Ok(self.cast_tile_value(expressions, body, value, source, *to))
@@ -115,7 +115,7 @@ impl<'a> Lowerer<'a> {
                 accept,
                 reject,
             } => {
-                let condition_ty = self.tile_expr_element(condition)?;
+                let condition_ty = condition.element();
                 let condition = self.lower_tile_expr_lane(
                     expressions,
                     scratch,
@@ -154,7 +154,7 @@ impl<'a> Lowerer<'a> {
                 ))
             }
             Expr::SubgroupReduce { op, value } => {
-                let element = self.tile_expr_element(value)?;
+                let element = value.element();
                 let value =
                     self.lower_tile_expr_lane(expressions, scratch, body, value, spill_depth)?;
                 self.lower_tile_subgroup_reduce_value(expressions, body, value, *op, element)

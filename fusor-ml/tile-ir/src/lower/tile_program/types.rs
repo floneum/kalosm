@@ -63,32 +63,6 @@ impl<'a> Lowerer<'a> {
         }
     }
 
-    pub(in crate::lower) fn tile_expr_element(&self, expr: &Expr) -> Result<ElementType, LowerError> {
-        match expr {
-            Expr::Load(load) => Ok(match &load.src {
-                LoadSource::Storage(view) => view.buffer.element,
-                LoadSource::Quantized(_) => ElementType::F32,
-            }),
-            Expr::LoadLinear(load) => Ok(load.src.buffer.element),
-            Expr::LoadWorkgroup { src, .. } => Ok(src.element),
-            Expr::LoadLocal(local) => Ok(local.element),
-            Expr::Literal(value) => Ok(value.element()),
-            Expr::Builtin(_) => Ok(ElementType::U32),
-            Expr::Reduce { scratch, .. } => Ok(scratch.element),
-            Expr::Unary { value, .. } | Expr::Binary { left: value, .. } => {
-                self.tile_expr_element(value)
-            }
-            Expr::Cast { to, .. } => Ok(*to),
-            Expr::Bitcast { to, .. } => Ok(*to),
-            Expr::Select { accept, .. } => self.tile_expr_element(accept),
-            Expr::Compare { .. } => Ok(ElementType::Bool),
-            Expr::SubgroupReduce { value, .. } => self.tile_expr_element(value),
-            Expr::QuantizedBlockLane { .. } => Ok(ElementType::F32),
-            Expr::Vec4Dot { .. } | Expr::QuantizedDot { .. } => Ok(ElementType::F32),
-            Expr::Compose4 { .. } => Ok(ElementType::F32Vec4),
-        }
-    }
-
     pub(in crate::lower) fn element_scratch_index(element: ElementType) -> usize {
         match element {
             ElementType::F32 => 0,

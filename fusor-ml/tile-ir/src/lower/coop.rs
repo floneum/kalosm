@@ -38,7 +38,7 @@ impl<'a> Lowerer<'a> {
                 &store.mask,
             ),
             TileStmt::StoreLocal { dst, value } => {
-                let value_ty = self.tile_expr_element(value)?;
+                let value_ty = value.element();
                 if value_ty != dst.element {
                     return Err(LowerError::LocalElementMismatch {
                         local: dst.id,
@@ -53,7 +53,7 @@ impl<'a> Lowerer<'a> {
                 Ok(())
             }
             TileStmt::StoreWorkgroup { dst, index, value } => {
-                let value_ty = self.tile_expr_element(value)?;
+                let value_ty = value.element();
                 if value_ty != dst.element {
                     return Err(LowerError::TileElementMismatch {
                         tile: dst.id,
@@ -72,7 +72,7 @@ impl<'a> Lowerer<'a> {
                 accept,
                 reject,
             } => {
-                let condition_ty = self.tile_expr_element(condition)?;
+                let condition_ty = condition.element();
                 let condition =
                     self.lower_tile_expr_lane(expressions, scratch, body, condition, 0)?;
                 let condition = self.condition_value(expressions, body, condition, condition_ty);

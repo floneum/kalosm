@@ -161,6 +161,33 @@ pub enum DotK {
 }
 
 impl Expr {
+    /// Element type of this expression. Walks the tree using the type carried
+    /// in each leaf (`StorageView`, `LocalRef`, etc.) and the operator's known
+    /// output type; no external context required.
+    pub fn element(&self) -> ElementType {
+        match self {
+            Expr::Load(load) => match &load.src {
+                LoadSource::Storage(view) => view.buffer.element,
+                LoadSource::Quantized(_) => ElementType::F32,
+            },
+            Expr::LoadLinear(load) => load.src.buffer.element,
+            Expr::LoadWorkgroup { src, .. } => src.element,
+            Expr::LoadLocal(local) => local.element,
+            Expr::Literal(value) => value.element(),
+            Expr::Builtin(_) => ElementType::U32,
+            Expr::Reduce { scratch, .. } => scratch.element,
+            Expr::Unary { value, .. } | Expr::Binary { left: value, .. } => value.element(),
+            Expr::Cast { to, .. } => *to,
+            Expr::Bitcast { to, .. } => *to,
+            Expr::Select { accept, .. } => accept.element(),
+            Expr::Compare { .. } => ElementType::Bool,
+            Expr::SubgroupReduce { value, .. } => value.element(),
+            Expr::QuantizedBlockLane { .. } => ElementType::F32,
+            Expr::Vec4Dot { .. } | Expr::QuantizedDot { .. } => ElementType::F32,
+            Expr::Compose4 { .. } => ElementType::F32Vec4,
+        }
+    }
+
     /// Recognize a Bool-typed expression that is statically `true`. Used by the
     /// lowerer to skip mask codegen entirely for unconditional masks.
     pub fn is_constant_true(&self) -> bool {

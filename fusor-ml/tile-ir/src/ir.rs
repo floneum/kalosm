@@ -85,35 +85,6 @@ impl KernelIr {
         Some(self.body.grid)
     }
 
-    /// Best-effort element-type inference for a `Expr`, used by builder
-    /// helpers like `pin` that need to allocate a typed local before the
-    /// lowerer runs. Falls back to `F32` for variants that need additional
-    /// context.
-    pub(crate) fn tile_expr_element(&self, expr: &Expr) -> ElementType {
-        match expr {
-            Expr::Load(load) => match &load.src {
-                LoadSource::Storage(view) => view.buffer.element,
-                LoadSource::Quantized(_) => ElementType::F32,
-            },
-            Expr::LoadLinear(load) => load.src.buffer.element,
-            Expr::LoadWorkgroup { src, .. } => src.element,
-            Expr::LoadLocal(local) => local.element,
-            Expr::Literal(value) => value.element(),
-            Expr::Builtin(_) => ElementType::U32,
-            Expr::Reduce { scratch, .. } => scratch.element,
-            Expr::Unary { value, .. } | Expr::Binary { left: value, .. } => {
-                self.tile_expr_element(value)
-            }
-            Expr::Cast { to, .. } => *to,
-            Expr::Bitcast { to, .. } => *to,
-            Expr::Select { accept, .. } => self.tile_expr_element(accept),
-            Expr::Compare { .. } => ElementType::Bool,
-            Expr::SubgroupReduce { value, .. } => self.tile_expr_element(value),
-            Expr::QuantizedBlockLane { .. } => ElementType::F32,
-            Expr::Vec4Dot { .. } | Expr::QuantizedDot { .. } => ElementType::F32,
-            Expr::Compose4 { .. } => ElementType::F32Vec4,
-        }
-    }
 }
 
 /// A storage buffer declaration.
