@@ -170,15 +170,14 @@ impl<const BLOCK: usize> TileBlock<'_, BLOCK> {
         mask: Mask<BLOCK>,
         fill: f32,
     ) -> Tile<BLOCK> {
-        let scalar = Box::new(Expr::Literal(TileLiteral::F32(F32Bits::new(fill))));
+        let scalar = Tile::literal(TileLiteral::F32(F32Bits::new(fill)));
+        let fill_vec4 = self.vec4_splat(scalar).expr;
         Tile {
             expr: Expr::LoadLinear(TileLinearLoadExpr {
                 src: address.view,
                 index: address.index,
                 mask: mask.expr,
-                fill: Box::new(Expr::Compose4 {
-                    values: [scalar.clone(), scalar.clone(), scalar.clone(), scalar],
-                }),
+                fill: Box::new(fill_vec4),
             }),
         }
     }
