@@ -551,6 +551,10 @@ impl Program {
                             program.bind(scalar)
                         });
 
+                        let a8 = || -> [Tile<BLOCK>; 8] { std::array::from_fn(|i| a_bound[i].get()) };
+                        let an = || -> [Tile<BLOCK>; VALUES_PER_LANE] {
+                            std::array::from_fn(|i| a_bound[i].get())
+                        };
                         std::array::from_fn(|c| {
                             let col = col0.clone() + c as u32;
                             let mask = grid.mask(full_k_iterations, in_bounds_k.clone(), &col);
@@ -558,10 +562,8 @@ impl Program {
                                 && VALUES_PER_LANE == 8
                                 && grid.n_cols >= 8192
                             {
-                                let a_vec: [Tile<BLOCK>; 8] =
-                                    std::array::from_fn(|i| a_bound[i].get());
                                 return program.quantized_q8_0_dot8(
-                                    a_vec, &b_cloned, &k_base, &col, mask, 0.0,
+                                    a8(), &b_cloned, &k_base, &col, mask, 0.0,
                                 );
                             }
                             if b_cloned.format == GgmlQuantFormat::Q4K
@@ -569,33 +571,25 @@ impl Program {
                                     || VALUES_PER_LANE == 16
                                     || VALUES_PER_LANE == 32)
                             {
-                                let a_vec: [Tile<BLOCK>; VALUES_PER_LANE] =
-                                    std::array::from_fn(|i| a_bound[i].get());
                                 return program.quantized_q4k_f32_dot::<VALUES_PER_LANE>(
-                                    a_vec, &b_cloned, &k_base, &col, mask, 0.0,
+                                    an(), &b_cloned, &k_base, &col, mask, 0.0,
                                 );
                             }
                             if b_cloned.format == GgmlQuantFormat::Q6K && VALUES_PER_LANE == 8 {
-                                let a_vec: [Tile<BLOCK>; 8] =
-                                    std::array::from_fn(|i| a_bound[i].get());
                                 return program.quantized_q8_0_dot8(
-                                    a_vec, &b_cloned, &k_base, &col, mask, 0.0,
+                                    a8(), &b_cloned, &k_base, &col, mask, 0.0,
                                 );
                             }
                             if b_cloned.format == GgmlQuantFormat::Q6K && !q6k_vocab_f32_dot {
-                                let a_vec: [Tile<BLOCK>; VALUES_PER_LANE] =
-                                    std::array::from_fn(|i| a_bound[i].get());
                                 return program.quantized_q8_activation_dot::<VALUES_PER_LANE>(
-                                    a_vec, &b_cloned, &k_base, &col, mask, 0.0,
+                                    an(), &b_cloned, &k_base, &col, mask, 0.0,
                                 );
                             }
                             let bs: [Tile<BLOCK>; VALUES_PER_LANE] = program
                                 .load_quantized_block::<VALUES_PER_LANE>(
                                     &b_cloned, &k_base, &col, mask, 0.0,
                                 );
-                            let a_values: [Tile<BLOCK>; VALUES_PER_LANE] =
-                                std::array::from_fn(|i| a_bound[i].get());
-                            dot4_sum(program, &a_values, &bs)
+                            dot4_sum(program, &an(), &bs)
                         })
                     },
                 );
