@@ -460,13 +460,6 @@ impl<'a> Lowerer<'a> {
         element: ElementType,
         size: ArraySize,
     ) -> Handle<Type> {
-        let base = match element {
-            ElementType::Bool => panic!("bool arrays are not supported"),
-            ElementType::CoopMatrixF32 { .. } => {
-                panic!("cooperative-matrix arrays are not supported")
-            }
-            _ => self.element_type(element),
-        };
         let stride = match element {
             ElementType::F16 => 2,
             ElementType::F32 | ElementType::U32 => 4,
@@ -476,6 +469,7 @@ impl<'a> Lowerer<'a> {
                 panic!("cooperative-matrix arrays are not supported")
             }
         };
+        let base = self.element_type(element);
 
         self.module.types.insert(
             Type {

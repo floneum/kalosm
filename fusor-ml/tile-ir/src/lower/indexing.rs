@@ -29,13 +29,7 @@ impl<'a> Lowerer<'a> {
 
         let base = self.tile_base_expression(expressions, tile)?;
         let (_, offset) = self.storage_tile_and_offset(tile)?;
-        let index = self.add_literal_u32_emitted(expressions, index, offset, body);
-        let pointer = expressions.append(Expression::Access { base, index }, Span::default());
-        body.push(
-            Statement::Emit(Self::single_expression_range(expressions, pointer)),
-            Span::default(),
-        );
-        Ok(pointer)
+        Ok(self.access_offset_pointer(expressions, body, base, index, offset))
     }
 
     pub(super) fn tile_base_expression(
@@ -77,13 +71,27 @@ impl<'a> Lowerer<'a> {
         body: &mut Block,
     ) -> Result<Handle<Expression>, LowerError> {
         let base = self.storage_base_expression(expressions, view)?;
-        let index = self.add_literal_u32_emitted(expressions, index, view.offset, body);
+        Ok(self.access_offset_pointer(expressions, body, base, index, view.offset))
+    }
+
+    /// `&base[index + offset]`. Threads through the same emit dance both
+    /// `tile_dynamic_pointer` and `storage_dynamic_pointer` need: bias the
+    /// index by a constant, then `Expression::Access`.
+    pub(super) fn access_offset_pointer(
+        &self,
+        expressions: &mut Arena<Expression>,
+        body: &mut Block,
+        base: Handle<Expression>,
+        index: Handle<Expression>,
+        offset: u32,
+    ) -> Handle<Expression> {
+        let index = self.add_literal_u32_emitted(expressions, index, offset, body);
         let pointer = expressions.append(Expression::Access { base, index }, Span::default());
         body.push(
             Statement::Emit(Self::single_expression_range(expressions, pointer)),
             Span::default(),
         );
-        Ok(pointer)
+        pointer
     }
 
     pub(super) fn storage_base_expression(
