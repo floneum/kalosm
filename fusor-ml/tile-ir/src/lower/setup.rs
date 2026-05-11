@@ -33,16 +33,11 @@ impl<'a> Lowerer<'a> {
         let bool_ty = Self::scalar_type(&mut module, Scalar::BOOL);
         let u32_vec3_ty = Self::vector_type(&mut module, VectorSize::Tri, Scalar::U32);
         let uses_cooperative_matrix = Self::uses_cooperative_matrix(ir);
-        let uses_subgroup_id = Self::uses_index_kind(
-            ir,
-            super::analysis::SubgroupIndexKind::SubgroupId,
-        ) || uses_cooperative_matrix;
-        let uses_subgroup_invocation_id =
-            Self::uses_index_kind(ir, super::analysis::SubgroupIndexKind::SubgroupLane);
-        let uses_subgroup_size =
-            Self::uses_index_kind(ir, super::analysis::SubgroupIndexKind::SubgroupSize);
-        let uses_num_subgroups =
-            Self::uses_index_kind(ir, super::analysis::SubgroupIndexKind::NumSubgroups);
+        let subgroup_usage = Self::subgroup_index_usage(ir);
+        let uses_subgroup_id = subgroup_usage.subgroup_id || uses_cooperative_matrix;
+        let uses_subgroup_invocation_id = subgroup_usage.subgroup_lane;
+        let uses_subgroup_size = subgroup_usage.subgroup_size;
+        let uses_num_subgroups = subgroup_usage.num_subgroups;
 
         let coop_c_ty = uses_cooperative_matrix.then(|| {
             Self::type_with_inner(

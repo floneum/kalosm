@@ -1,11 +1,14 @@
 use super::*;
 
-#[derive(Copy, Clone, PartialEq, Eq)]
-pub(super) enum SubgroupIndexKind {
-    SubgroupId,
-    SubgroupLane,
-    SubgroupSize,
-    NumSubgroups,
+/// Which subgroup builtins are referenced anywhere in the IR. Aggregated by
+/// `Lowerer::subgroup_index_usage` so that one tree walk fills all four flags
+/// instead of four separate single-flag walks.
+#[derive(Copy, Clone, Default, PartialEq, Eq)]
+pub(super) struct SubgroupIndexUsage {
+    pub subgroup_id: bool,
+    pub subgroup_lane: bool,
+    pub subgroup_size: bool,
+    pub num_subgroups: bool,
 }
 
 impl<'a> Lowerer<'a> {
@@ -89,11 +92,23 @@ impl<'a> Lowerer<'a> {
         Self::tile_programs_expr_any(ir, |expr| matches!(expr, Expr::SubgroupReduce { .. }))
     }
 
-    pub(super) fn uses_index_kind(ir: &KernelIr, kind: SubgroupIndexKind) -> bool {
-        Self::tile_programs_expr_any(ir, |expr| match expr {
-            Expr::Builtin(builtin) => Self::builtin_is_kind(*builtin, kind),
-            _ => false,
-        })
+    pub(super) fn subgroup_index_usage(ir: &KernelIr) -> SubgroupIndexUsage {
+        let mut usage = SubgroupIndexUsage::default();
+        Self::tile_programs_expr_any(ir, |expr| {
+            if let Expr::Builtin(builtin) = expr {
+                use crate::ir::Builtin;
+                match builtin {
+                    Builtin::SubgroupId => usage.subgroup_id = true,
+                    Builtin::SubgroupLane => usage.subgroup_lane = true,
+                    Builtin::SubgroupSize => usage.subgroup_size = true,
+                    Builtin::NumSubgroups => usage.num_subgroups = true,
+                    _ => {}
+                }
+            }
+            // Always continue: we want to collect every flag.
+            false
+        });
+        usage
     }
 
     pub(super) fn tile_programs_expr_any<F>(ir: &KernelIr, mut pred: F) -> bool
@@ -247,17 +262,6 @@ impl<'a> Lowerer<'a> {
             TileStmt::Fold { body, .. } => {
                 body.iter().any(Self::tile_stmt_uses_cooperative_matrix)
             }
-        }
-    }
-
-    fn builtin_is_kind(builtin: crate::ir::Builtin, kind: SubgroupIndexKind) -> bool {
-        use crate::ir::Builtin;
-        match builtin {
-            Builtin::SubgroupId => kind == SubgroupIndexKind::SubgroupId,
-            Builtin::SubgroupLane => kind == SubgroupIndexKind::SubgroupLane,
-            Builtin::SubgroupSize => kind == SubgroupIndexKind::SubgroupSize,
-            Builtin::NumSubgroups => kind == SubgroupIndexKind::NumSubgroups,
-            _ => false,
         }
     }
 
