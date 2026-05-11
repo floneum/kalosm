@@ -486,20 +486,6 @@ impl<'a> Lowerer<'a> {
         }
     }
 
-    /// `*local = value;` — appends the LocalVariable pointer expression and
-    /// pushes a `Statement::Store`. Used by helpers that materialise SSA
-    /// values back into named locals.
-    pub(in crate::lower) fn store_local(
-        &self,
-        e: &mut Arena<Expression>,
-        body: &mut Block,
-        local: Handle<LocalVariable>,
-        value: Handle<Expression>,
-    ) {
-        let pointer = self.local_var(e, local);
-        body.push(Statement::Store { pointer, value }, Span::default());
-    }
-
     pub(in crate::lower) fn q4k_quant_packs8(
         &self,
         expressions: &mut Arena<Expression>,

@@ -620,6 +620,20 @@ impl<'a> Lowerer<'a> {
         e.append(Expression::GlobalVariable(global), Span::default())
     }
 
+    /// `*local = value;` — appends the LocalVariable pointer expression and
+    /// pushes a `Statement::Store`. Used by helpers that materialise SSA
+    /// values back into named locals.
+    pub(in crate::lower) fn store_local(
+        &self,
+        e: &mut Arena<Expression>,
+        body: &mut Block,
+        local: Handle<LocalVariable>,
+        value: Handle<Expression>,
+    ) {
+        let pointer = self.local_var(e, local);
+        body.push(Statement::Store { pointer, value }, Span::default());
+    }
+
     pub(in crate::lower) fn u32(&self, e: &mut Arena<Expression>, value: u32) -> Handle<Expression> {
         e.append(Expression::Literal(Literal::U32(value)), Span::default())
     }
