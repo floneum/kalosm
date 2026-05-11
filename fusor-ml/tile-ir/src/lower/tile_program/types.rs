@@ -2,31 +2,21 @@ use super::*;
 
 impl<'a> Lowerer<'a> {
     pub(in crate::lower) fn tile_reduce_identity(op: TileReduceOp, element: ElementType) -> Expression {
-        match op {
-            TileReduceOp::Sum => Self::zero_literal(element),
-            TileReduceOp::Product => Self::one_literal(element),
-            TileReduceOp::Max => match element {
-                ElementType::F32 => Expression::Literal(Literal::F32(f32::MIN)),
-                ElementType::F16 => {
-                    Expression::Literal(Literal::F16(half::f16::from_f32(-65504.0)))
-                }
-                ElementType::U32 => Expression::Literal(Literal::U32(0)),
-                ElementType::F32Vec4 => panic!("vec4 reductions are not supported"),
-                ElementType::Bool => panic!("bool reductions are not supported"),
-                ElementType::CoopMatrixF32 { .. } => {
-                    panic!("cooperative-matrix reductions are not supported")
-                }
-            },
-            TileReduceOp::Min => match element {
-                ElementType::F32 => Expression::Literal(Literal::F32(f32::MAX)),
-                ElementType::F16 => Expression::Literal(Literal::F16(half::f16::from_f32(65504.0))),
-                ElementType::U32 => Expression::Literal(Literal::U32(u32::MAX)),
-                ElementType::F32Vec4 => panic!("vec4 reductions are not supported"),
-                ElementType::Bool => panic!("bool reductions are not supported"),
-                ElementType::CoopMatrixF32 { .. } => {
-                    panic!("cooperative-matrix reductions are not supported")
-                }
-            },
+        let (f32_value, f16_value, u32_value, bool_value) = match op {
+            TileReduceOp::Sum => (0.0_f32, 0.0_f32, 0_u32, false),
+            TileReduceOp::Product => (1.0_f32, 1.0_f32, 1_u32, true),
+            TileReduceOp::Max => (f32::MIN, -65504.0, 0_u32, false),
+            TileReduceOp::Min => (f32::MAX, 65504.0, u32::MAX, true),
+        };
+        match element {
+            ElementType::F32 => Expression::Literal(Literal::F32(f32_value)),
+            ElementType::F16 => Expression::Literal(Literal::F16(half::f16::from_f32(f16_value))),
+            ElementType::U32 => Expression::Literal(Literal::U32(u32_value)),
+            ElementType::Bool => Expression::Literal(Literal::Bool(bool_value)),
+            ElementType::F32Vec4 => panic!("vec4 reductions are not supported"),
+            ElementType::CoopMatrixF32 { .. } => {
+                panic!("cooperative-matrix reductions are not supported")
+            }
         }
     }
 
@@ -88,25 +78,7 @@ impl<'a> Lowerer<'a> {
     }
 
     pub(in crate::lower) fn zero_literal(element: ElementType) -> Expression {
-        match element {
-            ElementType::F32 => Expression::Literal(Literal::F32(0.0)),
-            ElementType::F16 => Expression::Literal(Literal::F16(half::f16::from_f32(0.0))),
-            ElementType::U32 => Expression::Literal(Literal::U32(0)),
-            ElementType::F32Vec4 => panic!("vec4 literal requires composition"),
-            ElementType::Bool => Expression::Literal(Literal::Bool(false)),
-            ElementType::CoopMatrixF32 { .. } => panic!("cooperative-matrix has no scalar literal"),
-        }
-    }
-
-    pub(in crate::lower) fn one_literal(element: ElementType) -> Expression {
-        match element {
-            ElementType::F32 => Expression::Literal(Literal::F32(1.0)),
-            ElementType::F16 => Expression::Literal(Literal::F16(half::f16::from_f32(1.0))),
-            ElementType::U32 => Expression::Literal(Literal::U32(1)),
-            ElementType::F32Vec4 => panic!("vec4 literal requires composition"),
-            ElementType::Bool => Expression::Literal(Literal::Bool(true)),
-            ElementType::CoopMatrixF32 { .. } => panic!("cooperative-matrix has no scalar literal"),
-        }
+        Self::tile_reduce_identity(TileReduceOp::Sum, element)
     }
 
     pub(in crate::lower) fn element_scalar(element: ElementType) -> Scalar {
