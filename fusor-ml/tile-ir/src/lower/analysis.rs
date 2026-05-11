@@ -10,23 +10,13 @@ pub(super) enum SubgroupIndexKind {
 
 impl<'a> Lowerer<'a> {
     pub(super) fn max_tile_program_block(ir: &KernelIr) -> u32 {
-        ir.body()
-            .ops()
-            .iter()
-            .map(|op| match op {
-                Op::TileProgram(op) => op.block,
-            })
-            .max()
-            .unwrap_or(0)
+        ir.body().block
     }
 
     pub(super) fn live_tiles(ir: &KernelIr) -> Vec<bool> {
         let mut live = vec![false; ir.tiles().len()];
-        for op in ir.body().ops() {
-            let Op::TileProgram(op) = op;
-            for stmt in &op.body {
-                Self::mark_tile_stmt_live(ir, stmt, &mut live);
-            }
+        for stmt in &ir.body().body {
+            Self::mark_tile_stmt_live(ir, stmt, &mut live);
         }
         live
     }
@@ -70,16 +60,12 @@ impl<'a> Lowerer<'a> {
                 }
             }
             TileStmt::Fold {
-                iter,
+                count,
                 body: fold_body,
                 accumulators,
                 ..
             } => {
-                match iter {
-                    TileIter::Range { count } => {
-                        Self::mark_tile_expr_live(ir, count, live);
-                    }
-                }
+                Self::mark_tile_expr_live(ir, count, live);
                 for stmt in fold_body {
                     Self::mark_tile_stmt_live(ir, stmt, live);
                 }
@@ -93,10 +79,10 @@ impl<'a> Lowerer<'a> {
     }
 
     pub(super) fn uses_cooperative_matrix(ir: &KernelIr) -> bool {
-        ir.body().ops().iter().any(|op| {
-            let Op::TileProgram(op) = op;
-            op.body.iter().any(Self::tile_stmt_uses_cooperative_matrix)
-        })
+        ir.body()
+            .body
+            .iter()
+            .any(Self::tile_stmt_uses_cooperative_matrix)
     }
 
     pub(super) fn uses_subgroup_reduce(ir: &KernelIr) -> bool {
@@ -114,12 +100,10 @@ impl<'a> Lowerer<'a> {
     where
         F: FnMut(&Expr) -> bool,
     {
-        ir.body().ops().iter().any(|op| {
-            let Op::TileProgram(op) = op;
-            op.body
-                .iter()
-                .any(|stmt| Self::tile_stmt_expr_any(stmt, &mut pred))
-        })
+        ir.body()
+            .body
+            .iter()
+            .any(|stmt| Self::tile_stmt_expr_any(stmt, &mut pred))
     }
 
     pub(super) fn tile_stmt_expr_any<F>(stmt: &TileStmt, pred: &mut F) -> bool
@@ -146,15 +130,12 @@ impl<'a> Lowerer<'a> {
                 body.iter().any(|stmt| Self::tile_stmt_expr_any(stmt, pred))
             }
             TileStmt::Fold {
-                iter,
+                count,
                 body: fold_body,
                 accumulators,
                 ..
             } => {
-                let iter_match = match iter {
-                    TileIter::Range { count } => Self::tile_expr_any(count, pred),
-                };
-                iter_match
+                Self::tile_expr_any(count, pred)
                     || fold_body
                         .iter()
                         .any(|s| Self::tile_stmt_expr_any(s, pred))

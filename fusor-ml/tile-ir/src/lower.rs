@@ -13,8 +13,8 @@ use naga::{
 use crate::ir::{
     BlockDequantId, BufferAccess, BufferId, CoopFragmentId, CoopOperandRole, CopySource,
     DotK, DynamicOffset, ElementType, Expr, FlattenedMatrixMap, Im2ColNhwcMap, KernelIr,
-    Layout, LocalId, LocalRef, MemoryLevel, Op, PackedActivations, StorageIndexMap, StorageView,
-    TileBinaryOp, TileCompareOp, TileId, TileIter, TileLinearLoadExpr, TileLiteral, TileLoadExpr,
+    Layout, LocalId, LocalRef, MemoryLevel, PackedActivations, StorageIndexMap, StorageView,
+    TileBinaryOp, TileCompareOp, TileId, TileLinearLoadExpr, TileLiteral, TileLoadExpr,
     TileOrigin, TileProgramOp, TileQuantizedLoadExpr, TileReduceOp, TileRef, TileStmt,
     TileStoreStmt, TileUnaryOp,
 };

@@ -34,7 +34,7 @@ pub struct KernelIr {
     pub(crate) buffers: Vec<BufferDecl>,
     pub(crate) tiles: Vec<TileDecl>,
     pub(crate) locals: Vec<LocalDecl>,
-    pub(crate) body: Block,
+    pub(crate) body: TileProgramOp,
 }
 
 id_newtype!(
@@ -54,15 +54,6 @@ id_newtype!(
     pub BlockDequantId, Hash
 );
 
-/// What to iterate over inside a `Fold`. Initially just `Range`; future
-/// variants (Chunks, Strided, Zip) compose without changing existing loop
-/// shapes.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum TileIter {
-    /// Counted range `0..count` where `count` is a dynamic expression.
-    Range { count: Box<Expr> },
-}
-
 impl KernelIr {
     /// Storage buffer declarations bound by the kernel.
     pub fn buffers(&self) -> &[BufferDecl] {
@@ -79,8 +70,8 @@ impl KernelIr {
         &self.locals
     }
 
-    /// The structured root body of the kernel.
-    pub fn body(&self) -> &Block {
+    /// The single tile program that forms the kernel body.
+    pub fn body(&self) -> &TileProgramOp {
         &self.body
     }
 
@@ -91,10 +82,7 @@ impl KernelIr {
 
     /// Return the dispatch grid for kernels that lower to a single tile program.
     pub fn single_tile_program_grid(&self) -> Option<[u32; 3]> {
-        let [Op::TileProgram(program)] = self.body.ops.as_slice() else {
-            return None;
-        };
-        Some(program.grid)
+        Some(self.body.grid)
     }
 
     /// Best-effort element-type inference for a `Expr`, used by builder
@@ -125,40 +113,6 @@ impl KernelIr {
             Expr::Compose4 { .. } => ElementType::F32Vec4,
         }
     }
-}
-
-/// A structured sequence of typed IR operations.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct Block {
-    ops: Vec<Op>,
-}
-
-impl Block {
-    /// Construct an empty block.
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// Construct a block from an operation list.
-    pub fn from_ops(ops: Vec<Op>) -> Self {
-        Self { ops }
-    }
-
-    /// Operations in this block.
-    pub fn ops(&self) -> &[Op] {
-        &self.ops
-    }
-
-    pub(crate) fn push(&mut self, op: Op) {
-        self.ops.push(op);
-    }
-}
-
-/// A typed IR operation.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum Op {
-    /// Triton-like source tile program over one workgroup tile.
-    TileProgram(TileProgramOp),
 }
 
 /// A storage buffer declaration.
@@ -377,6 +331,16 @@ pub struct TileProgramOp {
     pub body: Vec<TileStmt>,
 }
 
+impl Default for TileProgramOp {
+    fn default() -> Self {
+        Self {
+            grid: [1, 1, 1],
+            block: 0,
+            body: Vec::new(),
+        }
+    }
+}
+
 /// Source of a `TileStmt::CopyToWorkgroupTile`. The lowerer dispatches the
 /// per-element copy on this variant — `Quantized` dequantizes on the fly.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -456,16 +420,16 @@ pub enum TileStmt {
         row: Box<Expr>,
         col: Box<Expr>,
     },
-    /// Iterator-driven loop that carries named, mutable accumulators. Each
-    /// `accumulator.init` is evaluated in the surrounding scope and stored
-    /// into the accumulator local. Inside `body` and inside each
-    /// `accumulator.update`, references to the iterator value are
+    /// Iterator-driven loop over `0..count` that carries named, mutable
+    /// accumulators. Each `accumulator.init` is evaluated in the surrounding
+    /// scope and stored into the accumulator local. Inside `body` and inside
+    /// each `accumulator.update`, references to the iterator value are
     /// `LoadLocal(LocalRef { id: iter_var, element: U32 })`, and references
     /// to the in-flight accumulator value are `LoadLocal` of the
     /// accumulator's name. After the statement finishes, the accumulator
     /// locals hold the final values and may be read as ordinary `LoadLocal`.
     Fold {
-        iter: TileIter,
+        count: Box<Expr>,
         iter_var: LocalId,
         body: Vec<TileStmt>,
         accumulators: Vec<FoldAccumulator>,

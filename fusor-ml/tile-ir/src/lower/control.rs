@@ -272,18 +272,18 @@ impl<'a> Lowerer<'a> {
 
     /// Lower a `TileStmt::Fold`. Initializes each accumulator local from its
     /// `init` expression in the surrounding scope, then emits a counted loop
-    /// over `iter`. Inside the loop body, the iterator value is stored into
-    /// `iter_var`'s local, the body statements run, and each accumulator's
-    /// `update` expression is evaluated and stored back into its local. After
-    /// the loop, the locals hold the final values and are read by subsequent
-    /// `LoadLocal`s in the surrounding scope.
+    /// over `0..count`. Inside the loop body, the iterator value is stored
+    /// into `iter_var`'s local, the body statements run, and each
+    /// accumulator's `update` expression is evaluated and stored back into its
+    /// local. After the loop, the locals hold the final values and are read by
+    /// subsequent `LoadLocal`s in the surrounding scope.
     #[allow(clippy::too_many_arguments)]
     pub(super) fn lower_tile_fold_stmt(
         &self,
         expressions: &mut Arena<Expression>,
         scratch: ScratchLocals,
         body: &mut Block,
-        iter: &TileIter,
+        count: &Expr,
         iter_var: LocalId,
         fold_body: &[TileStmt],
         accumulators: &[crate::ir::FoldAccumulator],
@@ -304,11 +304,8 @@ impl<'a> Lowerer<'a> {
         }
 
         // 2. Lower the iterator's count expression in the surrounding scope.
-        let count_handle = match iter {
-            TileIter::Range { count } => {
-                self.lower_tile_expr_lane(expressions, scratch, body, count, 0)?
-            }
-        };
+        let count_handle =
+            self.lower_tile_expr_lane(expressions, scratch, body, count, 0)?;
 
         // 3. Emit the counted loop. Inside the body, store the loop index into
         //    iter_var's local so subsequent LoadLocal(iter_var) reads see it.

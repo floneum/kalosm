@@ -186,7 +186,7 @@ impl<'a> Lowerer<'a> {
             ),
             TileStmt::Mma { acc, a, b } => self.lower_coop_mma(expressions, body, *acc, *a, *b),
             TileStmt::Fold {
-                iter,
+                count,
                 iter_var,
                 body: fold_body,
                 accumulators,
@@ -194,7 +194,7 @@ impl<'a> Lowerer<'a> {
                 expressions,
                 scratch,
                 body,
-                iter,
+                count,
                 *iter_var,
                 fold_body,
                 accumulators,

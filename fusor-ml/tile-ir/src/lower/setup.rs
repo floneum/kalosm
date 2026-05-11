@@ -165,7 +165,7 @@ impl<'a> Lowerer<'a> {
         self.create_private_locals(&mut function)?;
         self.create_program_private_locals(&mut function);
 
-        function.body = self.lower_block(self.ir.body(), &mut function.expressions, scratch)?;
+        function.body = self.lower_body(self.ir.body(), &mut function.expressions, scratch)?;
         function
             .body
             .push(Statement::Return { value: None }, Span::default());
@@ -492,10 +492,7 @@ impl<'a> Lowerer<'a> {
     }
 
     fn tile_programs_use_f16(ir: &KernelIr) -> bool {
-        ir.body().ops().iter().any(|op| {
-            let Op::TileProgram(op) = op;
-            op.body.iter().any(Self::tile_stmt_uses_f16)
-        })
+        ir.body().body.iter().any(Self::tile_stmt_uses_f16)
     }
 
     fn tile_stmt_uses_f16(stmt: &TileStmt) -> bool {

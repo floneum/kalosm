@@ -2,7 +2,7 @@ use std::marker::PhantomData;
 
 use crate::ir::{
     BlockDequantId, BufferAccess, BufferDecl, BufferRef, CoopFragmentId, F32Bits, KernelIr, Layout, LocalDecl,
-    LocalRef, MemoryLevel, Numeric, Op, Shape, StorageIndexMap, StorageView,
+    LocalRef, MemoryLevel, Numeric, Shape, StorageIndexMap, StorageView,
     TileDecl, TileLevel,
     TileLiteral, TileOrigin, TileProgramOp,
     TileReduceOp, TileRef,
@@ -641,11 +641,11 @@ impl Program {
             stmt_stack: Vec::new(),
         };
         body(&mut block);
-        block.program.ir.body.push(Op::TileProgram(TileProgramOp {
+        block.program.ir.body = TileProgramOp {
             grid,
             block: BLOCK as u32,
             body: block.body,
-        }));
+        };
     }
 
     fn alloc_buffer_element(

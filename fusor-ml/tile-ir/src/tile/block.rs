@@ -356,7 +356,7 @@ impl<const BLOCK: usize> TileBlock<'_, BLOCK> {
             .collect();
 
         self.push_stmt(TileStmt::Fold {
-            iter: iter.iter,
+            count: iter.count,
             iter_var: iter_var_local.id,
             body: body_stmts,
             accumulators,
@@ -425,9 +425,7 @@ impl<const BLOCK: usize> TileBlock<'_, BLOCK> {
             .collect();
 
         self.push_stmt(TileStmt::Fold {
-            iter: crate::ir::TileIter::Range {
-                count: Box::new(Expr::Literal(TileLiteral::U32(iterations))),
-            },
+            count: Box::new(Expr::Literal(TileLiteral::U32(iterations))),
             iter_var: iter_var_local.id,
             body: body_stmts,
             accumulators,
@@ -673,9 +671,7 @@ impl<const BLOCK: usize> TileBlock<'_, BLOCK> {
         let acc_local = self.program.alloc_local_element(element);
         let iter_var_local = self.program.alloc_local::<U32>();
         self.push_stmt(TileStmt::Fold {
-            iter: crate::ir::TileIter::Range {
-                count: Box::new(Expr::Literal(TileLiteral::U32(iterations))),
-            },
+            count: Box::new(Expr::Literal(TileLiteral::U32(iterations))),
             iter_var: iter_var_local.id,
             body: Vec::new(),
             accumulators: vec![crate::ir::FoldAccumulator {
@@ -995,9 +991,7 @@ impl<const BLOCK: usize> TileBlock<'_, BLOCK> {
         body(self);
         let stmts = self.stmt_stack.pop().expect("while_true frame missing");
         self.push_stmt(TileStmt::Fold {
-            iter: crate::ir::TileIter::Range {
-                count: Box::new(Expr::Literal(TileLiteral::U32(max_iterations))),
-            },
+            count: Box::new(Expr::Literal(TileLiteral::U32(max_iterations))),
             iter_var: iter_var_local.id,
             body: stmts,
             accumulators: Vec::new(),

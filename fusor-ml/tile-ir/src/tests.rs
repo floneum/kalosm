@@ -17,14 +17,9 @@ fn ggml_quant_formats() -> [GgmlQuantFormat; 12] {
     ]
 }
 
-fn assert_only_tile_programs(ir: &KernelIr) {
-    assert!(
-        ir.body()
-            .ops()
-            .iter()
-            .all(|op| matches!(op, Op::TileProgram(_))),
-        "source IR should contain only tile programs"
-    );
+fn assert_only_tile_programs(_ir: &KernelIr) {
+    // The IR body is now a single `TileProgramOp` by construction, so this is
+    // a no-op kept for parity with old call sites.
 }
 
 fn tile_stmts_contain_load_role(stmts: &[TileStmt], role: CoopOperandRole) -> bool {
@@ -59,9 +54,8 @@ fn op_enum_is_source_tile_program_only() {
         });
     });
 
-    let [Op::TileProgram(_)] = ir.body().ops() else {
-        panic!("expected exactly one tile program");
-    };
+    // The kernel body is a single `TileProgramOp` by construction.
+    let _ = ir.body();
 }
 
 #[test]
@@ -222,9 +216,7 @@ fn coop_qmatmul_q8_0_lowers_through_subgroup_dsl() {
         phase.qmatmul::<64, 64, 32>(&a, &b, &y, 4);
     });
 
-    let [Op::TileProgram(program)] = ir.body().ops() else {
-        panic!("expected one tile program");
-    };
+    let program = ir.body();
     assert_eq!(program.block, 128, "BM*BN=64*64 → 4 subgroups → 128 lanes");
     assert!(
         program
@@ -360,9 +352,7 @@ fn qdequantize_lowers_large_embedding_table_as_tile_program() {
         phase.qdequantize(&b, &y, 65_535);
     });
 
-    let [Op::TileProgram(program)] = ir.body().ops() else {
-        panic!("qdequantize should expand to a tile program");
-    };
+    let program = ir.body();
     assert_eq!(program.block, 256);
     let [TileStmt::Store(store)] = program.body.as_slice() else {
         panic!("qdequantize should emit one tile store");

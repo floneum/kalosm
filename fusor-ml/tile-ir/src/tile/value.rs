@@ -34,20 +34,18 @@ pub struct Bound<const BLOCK: usize> {
     pub(super) _block: PhantomData<[(); BLOCK]>,
 }
 
-/// Iterator description passed to `TileBlock::fold`. Currently only counted
-/// ranges are supported; future variants (chunks, strided, zip) compose into
-/// the same `Fold` shape.
+/// Iterator description passed to `TileBlock::fold`. Carries a counted
+/// `0..count` range; future variants (chunks, strided, zip) would extend this
+/// constructor.
 #[derive(Clone)]
 pub struct FoldIter {
-    pub(crate) iter: crate::ir::TileIter,
+    pub(crate) count: Box<Expr>,
 }
 
 /// Construct a counted `0..count` iterator for `TileBlock::fold`.
 pub fn range<const BLOCK: usize>(count: Tile<BLOCK>) -> FoldIter {
     FoldIter {
-        iter: crate::ir::TileIter::Range {
-            count: Box::new(count.expr),
-        },
+        count: Box::new(count.expr),
     }
 }
 
