@@ -105,35 +105,24 @@ impl KernelIr {
         match expr {
             Expr::Load(load) => load.src.buffer.element,
             Expr::LoadLinear(load) => load.src.buffer.element,
-            Expr::LoadVec4(_) => ElementType::F32Vec4,
             Expr::LoadWorkgroup { src, .. } => src.element,
             Expr::LoadLocal(local) => local.element,
-            Expr::QuantizedLoad(_) | Expr::Full(_) => ElementType::F32,
+            Expr::QuantizedLoad(_) => ElementType::F32,
             Expr::Literal(value) => value.element(),
             Expr::Builtin(_) => ElementType::U32,
             Expr::Reduce { scratch, .. } => scratch.element,
-            Expr::LoopReduce { scratch, .. } => scratch.element,
             Expr::Unary { value, .. } | Expr::Binary { left: value, .. } => {
                 self.tile_expr_element(value)
             }
-            Expr::Sum { values } => values
-                .first()
-                .map(|value| self.tile_expr_element(value))
-                .unwrap_or(ElementType::F32),
             Expr::Cast { to, .. } => *to,
             Expr::Bitcast { to, .. } => *to,
             Expr::Select { accept, .. } => self.tile_expr_element(accept),
             Expr::Compare { output, .. } => *output,
-            Expr::LoopFold { initial, .. } => initial.element(),
             Expr::GroupReduce { scratch, .. } => scratch.element,
             Expr::SubgroupReduce { value, .. } => self.tile_expr_element(value),
             Expr::QuantizedBlockLane { .. } => ElementType::F32,
-            Expr::Vec4Dot { .. }
-            | Expr::QuantizedQ8_0Dot8 { .. }
-            | Expr::QuantizedVecDot { .. }
-            | Expr::QuantizedQ4KGgmlDot { .. }
-            | Expr::QuantizedQ6KGgmlDot { .. } => ElementType::F32,
-            Expr::Vec4Splat { .. } | Expr::Compose4 { .. } => ElementType::F32Vec4,
+            Expr::Vec4Dot { .. } | Expr::QuantizedDot { .. } => ElementType::F32,
+            Expr::Compose4 { .. } => ElementType::F32Vec4,
         }
     }
 }
@@ -388,6 +377,14 @@ pub struct TileProgramOp {
     pub body: Vec<TileStmt>,
 }
 
+/// Source of a `TileStmt::CopyToWorkgroupTile`. The lowerer dispatches the
+/// per-element copy on this variant — `Quantized` dequantizes on the fly.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CopySource {
+    Storage(StorageView),
+    Quantized(QuantizedMatrix),
+}
+
 /// One ordered statement in a tile program.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum TileStmt {
@@ -395,13 +392,9 @@ pub enum TileStmt {
     Store(TileStoreStmt),
     /// Per-lane masked rank-1 storage write.
     StoreIndexed(TileIndexedStoreStmt),
-    /// Store to a private per-invocation local.
+    /// Store to a private per-invocation local. The kernel-builder uses this
+    /// for both first-write SSA bindings (via `program.bind`) and rebinds.
     StoreLocal { dst: LocalRef, value: Expr },
-    /// Bind `value` to a fresh local. Subsequent reads in the rest of this
-    /// statement vec use `Expr::LoadLocal(LocalRef { id: name.id, .. })`.
-    /// Lowers to a Store of `value` into the local; the local must be
-    /// declared in `KernelIr.locals`.
-    Let { name: LocalRef, value: Expr },
     /// Store to a workgroup scratch tile at a dynamic flat index.
     StoreWorkgroup {
         dst: TileRef,
@@ -426,18 +419,12 @@ pub enum TileStmt {
     /// Cooperatively copy a workgroup-tile-sized region of a storage view into
     /// a workgroup tile (one element per invocation per pass). `row_offset`
     /// and `col_offset` are evaluated in the surrounding scope (e.g. inside a
-    /// K loop body they may reference `loop_index`).
+    /// K loop body they may reference `loop_index`). The lowerer dispatches on
+    /// `src` — `CopySource::Quantized` dequantizes on the fly and requires an
+    /// `f32` `dst` tile.
     CopyToWorkgroupTile {
         dst: TileRef,
-        src: StorageView,
-        row_offset: Box<Expr>,
-        col_offset: Box<Expr>,
-    },
-    /// Same as `CopyToWorkgroupTile` but dequantizing on the fly from a packed
-    /// quantized matrix. `dst` must be an f32 workgroup tile.
-    CopyQuantToWorkgroupTile {
-        dst: TileRef,
-        src: QuantizedMatrix,
+        src: CopySource,
         row_offset: Box<Expr>,
         col_offset: Box<Expr>,
     },
@@ -468,13 +455,6 @@ pub enum TileStmt {
         dst: StorageView,
         row: Box<Expr>,
         col: Box<Expr>,
-    },
-    /// Temporary generic loop form. Lowering emits `loop { ... }` with an
-    /// explicit top-of-loop break when `Builtin::LoopIndex` reaches
-    /// `max_iterations`.
-    WhileTrue {
-        max_iterations: u32,
-        body: Vec<TileStmt>,
     },
     /// Iterator-driven loop that carries named, mutable accumulators. Each
     /// `accumulator.init` is evaluated in the surrounding scope and stored
@@ -539,13 +519,15 @@ impl F32Bits {
     }
 }
 
-/// A typed scalar literal stored by bits so IR equality remains exact.
+/// A typed literal stored by bits so IR equality remains exact. `F32Vec4` is a
+/// splat — all four lanes carry the same scalar.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum TileLiteral {
     F32(F32Bits),
     F16(u16),
     U32(u32),
     Bool(bool),
+    F32Vec4(F32Bits),
 }
 
 impl TileLiteral {
@@ -555,6 +537,7 @@ impl TileLiteral {
             Self::F16(_) => ElementType::F16,
             Self::U32(_) => ElementType::U32,
             Self::Bool(_) => ElementType::Bool,
+            Self::F32Vec4(_) => ElementType::F32Vec4,
         }
     }
 }
@@ -676,8 +659,8 @@ numeric_markers!(
 
 mod expr;
 pub use expr::{
-    Builtin, Expr, QuantizedVecDotKind, TileLinearLoadExpr, TileLoadExpr, TileQuantizedLoadExpr,
-    TileVec4LoadExpr,
+    Builtin, DotK, Expr, PackedActivations, TileLinearLoadExpr, TileLoadExpr,
+    TileQuantizedLoadExpr,
 };
 
 mod layout;

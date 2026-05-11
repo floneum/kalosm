@@ -122,10 +122,10 @@ pub fn flash_attention<E: Numeric, B>(
                                 dim,
                             );
                             let q_value = program
-                                .load_linear(q.at(q_index), all(), elem_fill.clone())
+                                .load_linear(q.at(q_index), all(), elem_fill)
                                 .cast(ElementType::F32);
                             let k_value = program
-                                .load_linear(k.at(k_index), all(), elem_fill.clone())
+                                .load_linear(k.at(k_index), all(), elem_fill)
                                 .cast(ElementType::F32);
                             products.push(q_value * k_value);
                         }
@@ -136,7 +136,7 @@ pub fn flash_attention<E: Numeric, B>(
                             let mask_index =
                                 index2(mask_meta.offset, mask_strides, q_idx.get(), kv_idx.get());
                             let mask_value = program
-                                .load_linear(mask.at(mask_index), all(), elem_fill.clone())
+                                .load_linear(mask.at(mask_index), all(), elem_fill)
                                 .cast(ElementType::F32);
                             score = score + mask_value;
                         }
@@ -170,7 +170,7 @@ pub fn flash_attention<E: Numeric, B>(
                             out_dim.get(),
                         );
                         let v_value = program
-                            .load_linear(v.at(v_index), all(), elem_fill.clone())
+                            .load_linear(v.at(v_index), all(), elem_fill)
                             .cast(ElementType::F32);
                         program.store_local(&weighted_local, exp_score.get() * v_value);
                     });

@@ -67,35 +67,24 @@ impl<'a> Lowerer<'a> {
         match expr {
             Expr::Load(load) => Ok(load.src.buffer.element),
             Expr::LoadLinear(load) => Ok(load.src.buffer.element),
-            Expr::LoadVec4(_) => Ok(ElementType::F32Vec4),
             Expr::LoadWorkgroup { src, .. } => Ok(src.element),
             Expr::LoadLocal(local) => Ok(local.element),
-            Expr::QuantizedLoad(_) | Expr::Full(_) => Ok(ElementType::F32),
+            Expr::QuantizedLoad(_) => Ok(ElementType::F32),
             Expr::Literal(value) => Ok(value.element()),
             Expr::Builtin(_) => Ok(ElementType::U32),
             Expr::Reduce { scratch, .. } => Ok(scratch.element),
-            Expr::LoopReduce { scratch, .. } => Ok(scratch.element),
             Expr::Unary { value, .. } | Expr::Binary { left: value, .. } => {
                 self.tile_expr_element(value)
             }
-            Expr::Sum { values } => values
-                .first()
-                .map(|value| self.tile_expr_element(value))
-                .unwrap_or(Ok(ElementType::F32)),
             Expr::Cast { to, .. } => Ok(*to),
             Expr::Bitcast { to, .. } => Ok(*to),
             Expr::Select { accept, .. } => self.tile_expr_element(accept),
             Expr::Compare { output, .. } => Ok(*output),
-            Expr::LoopFold { initial, .. } => Ok(initial.element()),
             Expr::GroupReduce { scratch, .. } => Ok(scratch.element),
             Expr::SubgroupReduce { value, .. } => self.tile_expr_element(value),
             Expr::QuantizedBlockLane { .. } => Ok(ElementType::F32),
-            Expr::Vec4Dot { .. }
-            | Expr::QuantizedQ8_0Dot8 { .. }
-            | Expr::QuantizedVecDot { .. }
-            | Expr::QuantizedQ4KGgmlDot { .. }
-            | Expr::QuantizedQ6KGgmlDot { .. } => Ok(ElementType::F32),
-            Expr::Vec4Splat { .. } | Expr::Compose4 { .. } => Ok(ElementType::F32Vec4),
+            Expr::Vec4Dot { .. } | Expr::QuantizedDot { .. } => Ok(ElementType::F32),
+            Expr::Compose4 { .. } => Ok(ElementType::F32Vec4),
         }
     }
 
@@ -112,15 +101,33 @@ impl<'a> Lowerer<'a> {
         }
     }
 
-    pub(in crate::lower) fn tile_literal(value: TileLiteral) -> Expression {
-        match value {
+    pub(in crate::lower) fn tile_literal(
+        &self,
+        expressions: &mut Arena<Expression>,
+        value: TileLiteral,
+    ) -> Handle<Expression> {
+        let scalar = match value {
             TileLiteral::F32(value) => Expression::Literal(Literal::F32(value.get())),
             TileLiteral::F16(value) => {
                 Expression::Literal(Literal::F16(half::f16::from_bits(value)))
             }
             TileLiteral::U32(value) => Expression::Literal(Literal::U32(value)),
             TileLiteral::Bool(value) => Expression::Literal(Literal::Bool(value)),
-        }
+            TileLiteral::F32Vec4(value) => {
+                let scalar = expressions.append(
+                    Expression::Literal(Literal::F32(value.get())),
+                    Span::default(),
+                );
+                return expressions.append(
+                    Expression::Compose {
+                        ty: self.f32_vec4_ty,
+                        components: vec![scalar, scalar, scalar, scalar],
+                    },
+                    Span::default(),
+                );
+            }
+        };
+        expressions.append(scalar, Span::default())
     }
 
     pub(in crate::lower) fn zero_literal(element: ElementType) -> Expression {
@@ -157,23 +164,6 @@ impl<'a> Lowerer<'a> {
             ElementType::Bool => Scalar::BOOL,
             ElementType::CoopMatrixF32 { .. } => Scalar::F32,
         }
-    }
-
-    pub(in crate::lower) fn vec4_splat_literal(
-        &self,
-        expressions: &mut Arena<Expression>,
-        body: &mut Block,
-        value: f32,
-    ) -> Handle<Expression> {
-        let value = expressions.append(Expression::Literal(Literal::F32(value)), Span::default());
-        self.emit_tile_expr(
-            expressions,
-            body,
-            Expression::Compose {
-                ty: self.f32_vec4_ty,
-                components: vec![value, value, value, value],
-            },
-        )
     }
 
     pub(in crate::lower) fn cast_tile_value(

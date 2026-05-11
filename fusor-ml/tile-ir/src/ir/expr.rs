@@ -31,31 +31,23 @@ pub enum Builtin {
 pub enum Expr {
     Load(TileLoadExpr),
     LoadLinear(TileLinearLoadExpr),
-    LoadVec4(TileVec4LoadExpr),
     LoadWorkgroup {
         src: TileRef,
         index: Box<Expr>,
     },
     LoadLocal(LocalRef),
     QuantizedLoad(TileQuantizedLoadExpr),
-    Full(F32Bits),
     Literal(TileLiteral),
     /// A built-in u32 quantity (lane id, loop index, program id, subgroup
     /// builtins). Indexing arithmetic uses `Expr::Binary` over `Builtin`
     /// leaves and `Literal(U32(_))` constants.
     Builtin(Builtin),
-    /// Reduce a tile expression to a single scalar via a workgroup-wide
-    /// shared-memory reduction tree. `scratch` is the workgroup tile used as
-    /// the reduction buffer.
+    /// Reduce a tile expression to a single scalar. When `iterations > 1`,
+    /// `value` is first accumulated across that many loop iterations; the
+    /// result is then collapsed across the workgroup via a shared-memory tree
+    /// over `scratch`. `iterations == 1` skips the loop and lowers as a
+    /// single-pass workgroup reduction.
     Reduce {
-        op: TileReduceOp,
-        value: Box<Expr>,
-        scratch: TileRef,
-    },
-    /// Reduce a tile expression to a single scalar over `iterations` loop
-    /// iterations, then across the workgroup. `scratch` is the workgroup
-    /// tile used as the cross-lane reduction buffer.
-    LoopReduce {
         op: TileReduceOp,
         iterations: u32,
         value: Box<Expr>,
@@ -69,12 +61,6 @@ pub enum Expr {
         op: TileBinaryOp,
         left: Box<Expr>,
         right: Box<Expr>,
-    },
-    /// Left-associated sum of a flat value list. This represents long
-    /// unrolled accumulations without forcing the lowerer to recurse through
-    /// a deep binary tree.
-    Sum {
-        values: Vec<Box<Expr>>,
     },
     Cast {
         value: Box<Expr>,
@@ -94,12 +80,6 @@ pub enum Expr {
         left: Box<Expr>,
         right: Box<Expr>,
         output: ElementType,
-    },
-    LoopFold {
-        op: TileReduceOp,
-        iterations: u32,
-        value: Box<Expr>,
-        initial: TileLiteral,
     },
     GroupReduce {
         op: TileReduceOp,
@@ -132,62 +112,56 @@ pub enum Expr {
         left: Box<Expr>,
         right: Box<Expr>,
     },
-    /// `vec4<f32>(value, value, value, value)`.
-    Vec4Splat {
-        value: Box<Expr>,
-    },
     /// `vec4<f32>(values[0], values[1], values[2], values[3])`. Combined with
     /// `Vec4Dot` this expresses the fused 4-way dot product the qgemv
     /// accelerator emits.
     Compose4 {
         values: [Box<Expr>; 4],
     },
-    QuantizedQ8_0Dot8 {
-        a: [Box<Expr>; 8],
+    /// Per-column dot of activations against a dequantized quantized-matrix
+    /// block. The activation packing (`activations`) and the K coordinate
+    /// shape (`k`) together select the lowering helper.
+    QuantizedDot {
         src: QuantizedMatrix,
-        k_base: Box<Expr>,
+        activations: PackedActivations,
+        k: DotK,
         col: Box<Expr>,
         mask: Box<Expr>,
         fill: F32Bits,
-    },
-    QuantizedVecDot {
-        kind: QuantizedVecDotKind,
-        a: Vec<Box<Expr>>,
-        src: QuantizedMatrix,
-        k_base: Box<Expr>,
-        col: Box<Expr>,
-        mask: Box<Expr>,
-        fill: F32Bits,
+        /// Dot width hint. Meaningful for `F32`/`Q8` activation paths over a
+        /// flat `Base` K coordinate; for `Block` K the lowerer dispatches on
+        /// shape and ignores this value.
         block_n: u32,
-    },
-    QuantizedQ4KGgmlDot {
-        a_low: Vec<Box<Expr>>,
-        a_high: Vec<Box<Expr>>,
-        sums: Vec<Box<Expr>>,
-        src: QuantizedMatrix,
-        block: Box<Expr>,
-        iq: Box<Expr>,
-        ir: Box<Expr>,
-        col: Box<Expr>,
-        mask: Box<Expr>,
-        fill: F32Bits,
-    },
-    QuantizedQ6KGgmlDot {
-        a: Vec<Box<Expr>>,
-        src: QuantizedMatrix,
-        block: Box<Expr>,
-        ip: Box<Expr>,
-        il: Box<Expr>,
-        col: Box<Expr>,
-        mask: Box<Expr>,
-        fill: F32Bits,
     },
 }
 
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub enum QuantizedVecDotKind {
-    Q8Activation,
-    Q4KF32,
+/// Activation packing for `Expr::QuantizedDot`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PackedActivations {
+    /// Raw `f32` activations, fed directly to the format's dequant+dot helper.
+    F32(Vec<Box<Expr>>),
+    /// `f32` activations that get pre-packed to Q8 before the dot
+    /// (Q4K-Q8, Q6K-Q8 paths).
+    Q8(Vec<Box<Expr>>),
+    /// Q4K-paired GGML activations: low/high halves and per-quad sums.
+    Q4KGgml {
+        low: Vec<Box<Expr>>,
+        high: Vec<Box<Expr>>,
+        sums: Vec<Box<Expr>>,
+    },
+}
+
+/// Quantized-matrix K coordinate. The `Base` variant is a flat K offset; the
+/// `Block` variant carries the per-format block + 2 inner sub-coords (Q4K
+/// uses iq/ir, Q6K uses ip/il — same shape).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum DotK {
+    Base(Box<Expr>),
+    Block {
+        block: Box<Expr>,
+        c0: Box<Expr>,
+        c1: Box<Expr>,
+    },
 }
 
 impl Expr {
@@ -205,19 +179,6 @@ impl Expr {
         }
     }
 
-    /// Recognize a Bool-typed expression that is statically `false`. Mirror of
-    /// `is_constant_true`.
-    pub fn is_constant_false(&self) -> bool {
-        match self {
-            Expr::Literal(TileLiteral::Bool(false)) => true,
-            Expr::Binary {
-                op: TileBinaryOp::LogicalOr,
-                left,
-                right,
-            } => left.is_constant_false() && right.is_constant_false(),
-            _ => false,
-        }
-    }
 }
 
 /// A masked rank-1 tile load.
@@ -230,14 +191,6 @@ pub struct TileLoadExpr {
     pub fill: TileLiteral,
 }
 
-/// A masked rank-1 vec4 load.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct TileVec4LoadExpr {
-    pub src: StorageView,
-    pub index: Box<Expr>,
-    pub mask: Box<Expr>,
-    pub fill: F32Bits,
-}
 
 /// A masked rank-1 storage load.
 #[derive(Clone, Debug, PartialEq, Eq)]

@@ -1,21 +1,14 @@
-#![allow(unused_imports)]
+
 use std::marker::PhantomData;
-use std::ops::{Add, BitAnd, BitXor, Div, Mul, Rem, Sub};
 
 use crate::ir::{
-    BlockDequantId, Builtin, BufferAccess, BufferDecl, BufferRef, CoopFragmentId,
-    CoopOperandRole, DynamicOffset, ElementType, F32Bits, F32Vec4, Im2ColNhwcMap,
-    KernelIr, Layout, LocalDecl, LocalRef, MemoryLevel, Numeric,
-    Op, QuantizedVecDotKind, Shape, StorageIndexMap, StorageView,
-    TileBinaryOp, TileCompareOp, TileDecl, Expr, TileIndexedStoreStmt,
-    TileLevel, TileLinearLoadExpr, TileLiteral, TileLoadExpr, TileOrigin,
-    TileProgramOp, TileQuantizedLoadExpr, TileReduceOp, TileRef, TileStmt,
-    TileStoreStmt, TileUnaryOp, TileVec4LoadExpr, WorkgroupAxis, WorkgroupOffset, F32, U32,
+    Builtin, CoopOperandRole, DotK, ElementType, Expr, F32Bits, F32Vec4, Layout, LocalRef,
+    MemoryLevel, Numeric, PackedActivations, Shape, TileBinaryOp, TileIndexedStoreStmt, TileLevel,
+    TileLinearLoadExpr, TileLiteral, TileLoadExpr, TileQuantizedLoadExpr, TileReduceOp, TileRef,
+    TileStmt, TileStoreStmt, TileUnaryOp, WorkgroupAxis, F32, U32,
 };
-use crate::quantized::{GgmlQuantFormat, QuantizedMatrix};
+use crate::quantized::QuantizedMatrix;
 use super::*;
-use super::types::{matrix_shape, cooperative_store_layout_supported};
-use super::grid::{qgemv_grid, store_qgemv_sums, q4k_ggml_activations, dot4_sum};
 
 macro_rules! tile_reduce_entrypoints {
     ($(($reduce:ident, $loop_reduce:ident, $group_reduce:ident, $subgroup_reduce:ident, $op:ident)),+ $(,)?) => {
@@ -40,7 +33,7 @@ macro_rules! tile_reduce_entrypoints {
 }
 
 macro_rules! quantized_vec_dot_entrypoint {
-    ($name:ident, $kind:ident, [$($n:literal),+ $(,)?], $msg:literal) => {
+    ($name:ident, $packing:ident, [$($n:literal),+ $(,)?], $msg:literal) => {
         pub fn $name<const N: usize>(
             &self,
             a: [Tile<BLOCK>; N],
@@ -52,11 +45,12 @@ macro_rules! quantized_vec_dot_entrypoint {
         ) -> Tile<BLOCK> {
             assert!($(N == $n)||+, $msg);
             Tile {
-                expr: Expr::QuantizedVecDot {
-                    kind: QuantizedVecDotKind::$kind,
-                    a: a.into_iter().map(|value| Box::new(value.expr)).collect(),
+                expr: Expr::QuantizedDot {
                     src: matrix.clone(),
-                    k_base: k_base.into_index(),
+                    activations: PackedActivations::$packing(
+                        a.into_iter().map(|value| Box::new(value.expr)).collect(),
+                    ),
+                    k: DotK::Base(k_base.into_index()),
                     col: col.into_index(),
                     mask: mask.expr,
                     fill: F32Bits::new(fill),
@@ -72,8 +66,8 @@ pub struct TileBlock<'a, const BLOCK: usize> {
     pub(super) grid: [u32; 3],
     pub(super) body: Vec<TileStmt>,
     /// Stack of nested statement builders. The innermost frame collects
-    /// statements emitted inside `while_true` closures; popped into
-    /// `WhileTrue` on closure exit.
+    /// statements emitted inside `while_true`/`fold` closures; popped into
+    /// the enclosing loop's body on closure exit.
     pub(super) stmt_stack: Vec<Vec<TileStmt>>,
 }
 
@@ -167,6 +161,9 @@ impl<const BLOCK: usize> TileBlock<'_, BLOCK> {
         }
     }
 
+    /// Load a `vec4<f32>` from an `F32Vec4`-typed storage view. Routes through
+    /// the generic `LoadLinear` with a vec4-splat fill literal — the AST has
+    /// no dedicated `LoadVec4` variant.
     pub fn load_vec4(
         &self,
         address: LinearAddress<F32Vec4, BLOCK>,
@@ -174,11 +171,11 @@ impl<const BLOCK: usize> TileBlock<'_, BLOCK> {
         fill: f32,
     ) -> Tile<BLOCK> {
         Tile {
-            expr: Expr::LoadVec4(TileVec4LoadExpr {
+            expr: Expr::LoadLinear(TileLinearLoadExpr {
                 src: address.view,
                 index: address.index,
                 mask: mask.expr,
-                fill: F32Bits::new(fill),
+                fill: TileLiteral::F32Vec4(F32Bits::new(fill)),
             }),
         }
     }
@@ -257,14 +254,14 @@ impl<const BLOCK: usize> TileBlock<'_, BLOCK> {
     }
 
     /// Bind a subexpression to a private local so subsequent references reuse
-    /// the value without re-emitting its computation. Pushes a `TileStmt::Let`
-    /// at the call site; subsequent `Bound::get()` calls return tiles that
-    /// lower to a load of the bound local.
+    /// the value without re-emitting its computation. Pushes a
+    /// `TileStmt::StoreLocal` at the call site; subsequent `Bound::get()` calls
+    /// return tiles that lower to a load of the bound local.
     pub fn bind(&mut self, value: Tile<BLOCK>) -> Bound<BLOCK> {
         let element = self.program.ir.tile_expr_element(&value.expr);
         let local = self.program.alloc_local_element(element);
-        self.push_stmt(TileStmt::Let {
-            name: local,
+        self.push_stmt(TileStmt::StoreLocal {
+            dst: local,
             value: value.expr,
         });
         Bound {
@@ -273,16 +270,33 @@ impl<const BLOCK: usize> TileBlock<'_, BLOCK> {
         }
     }
 
-    /// Build a left-associated sum from a flat value list without creating a
-    /// deep nested binary expression.
+    /// Sum a flat value list. Constructs a balanced binary tree of
+    /// `Expr::Binary(Add, ...)` so the lowerer's recursion depth is
+    /// `O(log N)` instead of `O(N)` — the AST has no flat-sum variant.
     pub fn sum(&self, values: impl IntoIterator<Item = Tile<BLOCK>>) -> Tile<BLOCK> {
+        let mut exprs: Vec<Expr> = values.into_iter().map(|t| t.expr).collect();
+        if exprs.is_empty() {
+            return Tile {
+                expr: Expr::Literal(TileLiteral::F32(F32Bits::new(0.0))),
+            };
+        }
+        while exprs.len() > 1 {
+            let mut next = Vec::with_capacity(exprs.len().div_ceil(2));
+            let mut iter = exprs.into_iter();
+            while let Some(left) = iter.next() {
+                match iter.next() {
+                    Some(right) => next.push(Expr::Binary {
+                        op: TileBinaryOp::Add,
+                        left: Box::new(left),
+                        right: Box::new(right),
+                    }),
+                    None => next.push(left),
+                }
+            }
+            exprs = next;
+        }
         Tile {
-            expr: Expr::Sum {
-                values: values
-                    .into_iter()
-                    .map(|value| Box::new(value.expr))
-                    .collect(),
-            },
+            expr: exprs.pop().expect("at least one element"),
         }
     }
 
@@ -439,10 +453,19 @@ impl<const BLOCK: usize> TileBlock<'_, BLOCK> {
         }
     }
 
+    /// `vec4<f32>(value, value, value, value)`. Lowers to a `Compose4` over
+    /// four references to the same value — Naga's downstream optimizer
+    /// collapses identical SSA reads.
     pub fn vec4_splat(&self, value: Tile<BLOCK>) -> Tile<BLOCK> {
+        let v = value.expr;
         Tile {
-            expr: Expr::Vec4Splat {
-                value: Box::new(value.expr),
+            expr: Expr::Compose4 {
+                values: [
+                    Box::new(v.clone()),
+                    Box::new(v.clone()),
+                    Box::new(v.clone()),
+                    Box::new(v),
+                ],
             },
         }
     }
@@ -462,6 +485,9 @@ impl<const BLOCK: usize> TileBlock<'_, BLOCK> {
         }
     }
 
+    /// 8-wide quantized dot with raw `f32` activations (Q8_0 / Q6K). Routes
+    /// through the generic `QuantizedDot` with `F32` activations, a flat
+    /// `Base` K coordinate, and `block_n = 8`.
     pub fn quantized_q8_0_dot8(
         &self,
         a: [Tile<BLOCK>; 8],
@@ -471,29 +497,31 @@ impl<const BLOCK: usize> TileBlock<'_, BLOCK> {
         mask: Mask<BLOCK>,
         fill: f32,
     ) -> Tile<BLOCK> {
-        let a = a.map(|value| Box::new(value.expr));
         Tile {
-            expr: Expr::QuantizedQ8_0Dot8 {
-                a,
+            expr: Expr::QuantizedDot {
                 src: matrix.clone(),
-                k_base: k_base.into_index(),
+                activations: PackedActivations::F32(
+                    a.into_iter().map(|value| Box::new(value.expr)).collect(),
+                ),
+                k: DotK::Base(k_base.into_index()),
                 col: col.into_index(),
                 mask: mask.expr,
                 fill: F32Bits::new(fill),
+                block_n: 8,
             },
         }
     }
 
     quantized_vec_dot_entrypoint!(
         quantized_q8_activation_dot,
-        Q8Activation,
+        Q8,
         [8, 16],
         "q8 activation dot currently supports N == 8 or N == 16"
     );
 
     quantized_vec_dot_entrypoint!(
         quantized_q4k_f32_dot,
-        Q4KF32,
+        F32,
         [8, 16, 32],
         "q4k f32 dot currently supports N == 8, N == 16, or N == 32"
     );
@@ -513,23 +541,28 @@ impl<const BLOCK: usize> TileBlock<'_, BLOCK> {
         fill: f32,
     ) -> Tile<BLOCK> {
         Tile {
-            expr: Expr::QuantizedQ4KGgmlDot {
-                a_low: a_low
-                    .into_iter()
-                    .map(|value| Box::new(value.expr))
-                    .collect(),
-                a_high: a_high
-                    .into_iter()
-                    .map(|value| Box::new(value.expr))
-                    .collect(),
-                sums: sums.into_iter().map(|value| Box::new(value.expr)).collect(),
+            expr: Expr::QuantizedDot {
                 src: matrix.clone(),
-                block: block.into_index(),
-                iq: iq.into_index(),
-                ir: ir.into_index(),
+                activations: PackedActivations::Q4KGgml {
+                    low: a_low
+                        .into_iter()
+                        .map(|value| Box::new(value.expr))
+                        .collect(),
+                    high: a_high
+                        .into_iter()
+                        .map(|value| Box::new(value.expr))
+                        .collect(),
+                    sums: sums.into_iter().map(|value| Box::new(value.expr)).collect(),
+                },
+                k: DotK::Block {
+                    block: block.into_index(),
+                    c0: iq.into_index(),
+                    c1: ir.into_index(),
+                },
                 col: col.into_index(),
                 mask: mask.expr,
                 fill: F32Bits::new(fill),
+                block_n: 32,
             },
         }
     }
@@ -547,22 +580,21 @@ impl<const BLOCK: usize> TileBlock<'_, BLOCK> {
         fill: f32,
     ) -> Tile<BLOCK> {
         Tile {
-            expr: Expr::QuantizedQ6KGgmlDot {
-                a: a.into_iter().map(|value| Box::new(value.expr)).collect(),
+            expr: Expr::QuantizedDot {
                 src: matrix.clone(),
-                block: block.into_index(),
-                ip: ip.into_index(),
-                il: il.into_index(),
+                activations: PackedActivations::F32(
+                    a.into_iter().map(|value| Box::new(value.expr)).collect(),
+                ),
+                k: DotK::Block {
+                    block: block.into_index(),
+                    c0: ip.into_index(),
+                    c1: il.into_index(),
+                },
                 col: col.into_index(),
                 mask: mask.expr,
                 fill: F32Bits::new(fill),
+                block_n: 16,
             },
-        }
-    }
-
-    pub fn full(&self, value: f32) -> Tile<BLOCK> {
-        Tile {
-            expr: Expr::Full(F32Bits::new(value)),
         }
     }
 
@@ -623,6 +655,9 @@ impl<const BLOCK: usize> TileBlock<'_, BLOCK> {
         ),
     );
 
+    /// Per-lane scalar fold over `iterations` iterations. Desugars into a
+    /// single-accumulator `TileStmt::Fold`; the AST has no dedicated
+    /// loop-fold expression.
     pub fn loop_fold(
         &mut self,
         op: TileReduceOp,
@@ -631,13 +666,28 @@ impl<const BLOCK: usize> TileBlock<'_, BLOCK> {
         initial: TileLiteral,
     ) -> Tile<BLOCK> {
         assert!(iterations > 0, "loop fold iterations must be non-zero");
-        Tile {
-            expr: Expr::LoopFold {
-                op,
-                iterations,
-                value: Box::new(value.expr),
-                initial,
+        let element = initial.element();
+        let acc_local = self.program.alloc_local_element(element);
+        let iter_var_local = self.program.alloc_local::<U32>();
+        self.push_stmt(TileStmt::Fold {
+            iter: crate::ir::TileIter::Range {
+                count: Box::new(Expr::Literal(TileLiteral::U32(iterations))),
             },
+            iter_var: iter_var_local.id,
+            body: Vec::new(),
+            accumulators: vec![crate::ir::FoldAccumulator {
+                name: acc_local.id,
+                element,
+                init: Expr::Literal(initial),
+                update: Expr::Binary {
+                    op: reduce_op_to_binary(op),
+                    left: Box::new(Expr::LoadLocal(acc_local)),
+                    right: Box::new(value.expr),
+                },
+            }],
+        });
+        Tile {
+            expr: Expr::LoadLocal(acc_local),
         }
     }
 
@@ -674,17 +724,7 @@ impl<const BLOCK: usize> TileBlock<'_, BLOCK> {
     }
 
     fn reduce(&mut self, op: TileReduceOp, value: Tile<BLOCK>) -> Scalar {
-        let scratch = self.program.alloc_tile::<F32>(
-            Layout::contiguous(MemoryLevel::Workgroup, Shape::new([BLOCK as u32])),
-            TileLevel::Workgroup,
-        );
-        Scalar {
-            expr: Expr::Reduce {
-                op,
-                value: Box::new(value.expr),
-                scratch,
-            },
-        }
+        self.loop_reduce(op, 1, value)
     }
 
     fn loop_reduce(&mut self, op: TileReduceOp, iterations: u32, value: Tile<BLOCK>) -> Scalar {
@@ -694,7 +734,7 @@ impl<const BLOCK: usize> TileBlock<'_, BLOCK> {
             TileLevel::Workgroup,
         );
         Scalar {
-            expr: Expr::LoopReduce {
+            expr: Expr::Reduce {
                 op,
                 iterations,
                 value: Box::new(value.expr),
@@ -729,7 +769,7 @@ impl<const BLOCK: usize> TileBlock<'_, BLOCK> {
     ) {
         self.push_stmt(TileStmt::CopyToWorkgroupTile {
             dst: dst_tile,
-            src: src.view.clone(),
+            src: crate::ir::CopySource::Storage(src.view.clone()),
             row_offset: row_offset.into_index(),
             col_offset: col_offset.into_index(),
         });
@@ -745,9 +785,9 @@ impl<const BLOCK: usize> TileBlock<'_, BLOCK> {
         row_offset: impl IntoIndex<BLOCK>,
         col_offset: impl IntoIndex<BLOCK>,
     ) {
-        self.push_stmt(TileStmt::CopyQuantToWorkgroupTile {
+        self.push_stmt(TileStmt::CopyToWorkgroupTile {
             dst: dst_tile,
-            src: src.clone(),
+            src: crate::ir::CopySource::Quantized(src.clone()),
             row_offset: row_offset.into_index(),
             col_offset: col_offset.into_index(),
         });
@@ -939,19 +979,25 @@ impl<const BLOCK: usize> TileBlock<'_, BLOCK> {
     }
 
     /// Emit a counted `while true` loop where `program.loop_index()` resolves
-    /// to the current iteration. This is intentionally generic while the IR's
-    /// loop-carried value model settles.
+    /// to the current iteration. Desugars into a `TileStmt::Fold` over a
+    /// counted range with no accumulators — the AST has no dedicated counted
+    /// loop variant.
     pub fn while_true<F: FnOnce(&mut Self)>(&mut self, max_iterations: u32, body: F) {
         assert!(
             max_iterations > 0,
             "while_true max_iterations must be non-zero"
         );
+        let iter_var_local = self.program.alloc_local::<U32>();
         self.stmt_stack.push(Vec::new());
         body(self);
         let stmts = self.stmt_stack.pop().expect("while_true frame missing");
-        self.push_stmt(TileStmt::WhileTrue {
-            max_iterations,
+        self.push_stmt(TileStmt::Fold {
+            iter: crate::ir::TileIter::Range {
+                count: Box::new(Expr::Literal(TileLiteral::U32(max_iterations))),
+            },
+            iter_var: iter_var_local.id,
             body: stmts,
+            accumulators: Vec::new(),
         });
     }
 

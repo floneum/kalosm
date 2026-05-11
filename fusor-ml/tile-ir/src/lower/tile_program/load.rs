@@ -25,7 +25,7 @@ impl<'a> Lowerer<'a> {
         }
 
         let fill_source = load.fill.element();
-        let fill = expressions.append(Self::tile_literal(load.fill), Span::default());
+        let fill = self.tile_literal(expressions, load.fill);
         let fill = self.cast_tile_value(expressions, body, fill, fill_source, element);
         self.lower_masked_value_to_local(
             expressions,
@@ -61,35 +61,6 @@ impl<'a> Lowerer<'a> {
         )
     }
 
-    pub(in crate::lower) fn lower_tile_vec4_load_expr(
-        &self,
-        expressions: &mut Arena<Expression>,
-        scratch: ScratchLocals,
-        body: &mut Block,
-        load: &TileVec4LoadExpr,
-        spill_depth: usize,
-    ) -> Result<Handle<Expression>, LowerError> {
-        if load.src.buffer.element != ElementType::F32Vec4 {
-            return Err(LowerError::UnsupportedOperation(
-                "vec4 load requires f32x4 storage",
-            ));
-        }
-
-        self.lower_indexed_storage_load(
-            expressions,
-            scratch,
-            body,
-            &load.src,
-            &load.index,
-            &load.mask,
-            spill_depth,
-            ElementType::F32Vec4,
-            |lowerer, expressions, body| {
-                lowerer.vec4_splat_literal(expressions, body, load.fill.get())
-            },
-        )
-    }
-
     pub(in crate::lower) fn lower_tile_linear_load_expr(
         &self,
         expressions: &mut Arena<Expression>,
@@ -110,7 +81,7 @@ impl<'a> Lowerer<'a> {
             element,
             |lowerer, expressions, body| {
                 let fill_source = load.fill.element();
-                let fill = expressions.append(Self::tile_literal(load.fill), Span::default());
+                let fill = lowerer.tile_literal(expressions, load.fill);
                 lowerer.cast_tile_value(expressions, body, fill, fill_source, element)
             },
         )

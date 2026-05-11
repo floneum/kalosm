@@ -26,33 +26,7 @@ impl<'a> Lowerer<'a> {
         )
     }
 
-    pub(in crate::lower) fn lower_tile_loop_fold_value(
-        &self,
-        expressions: &mut Arena<Expression>,
-        scratch: ScratchLocals,
-        body: &mut Block,
-        value: &Expr,
-        iterations: u32,
-        op: TileReduceOp,
-        initial: TileLiteral,
-        spill_depth: usize,
-    ) -> Result<Handle<Expression>, LowerError> {
-        let element = initial.element();
-        self.lower_tile_loop_accumulate_value(
-            expressions,
-            scratch,
-            body,
-            value,
-            iterations,
-            op,
-            element,
-            Self::tile_literal(initial),
-            spill_depth,
-            spill_depth,
-        )
-    }
-
-    pub(in crate::lower) fn lower_tile_loop_accumulate_value(
+pub(in crate::lower) fn lower_tile_loop_accumulate_value(
         &self,
         expressions: &mut Arena<Expression>,
         scratch: ScratchLocals,

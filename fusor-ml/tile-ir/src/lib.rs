@@ -20,7 +20,7 @@ pub use ir::{
     Strides, TileBinaryOp, TileCompareOp, TileDecl, Expr, TileId, TileLevel,
     TileIndexedStoreStmt, TileLinearLoadExpr, TileLiteral, TileLoadExpr,
     TileOrigin, TileProgramOp, TileQuantizedLoadExpr, TileReduceOp, TileRef,
-    TileStmt, TileUnaryOp, TileVec4LoadExpr, WorkgroupAxis, WorkgroupOffset, F16, F32, U32,
+    TileStmt, TileUnaryOp, WorkgroupAxis, WorkgroupOffset, F16, F32, U32,
 };
 pub use kernel_builder::{KernelBuilder, KernelTensorRef};
 pub use kernels::{

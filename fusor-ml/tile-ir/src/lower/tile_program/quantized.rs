@@ -1,69 +1,70 @@
 use super::*;
 
 impl<'a> Lowerer<'a> {
-    pub(in crate::lower) fn lower_tile_quantized_q8_0_dot8_expr(
-        &self,
-        expressions: &mut Arena<Expression>,
-        scratch: ScratchLocals,
-        body: &mut Block,
-        a: &[Box<Expr>; 8],
-        src: &QuantizedMatrix,
-        k_base: &Expr,
-        col: &Expr,
-        mask: &Expr,
-        fill: F32Bits,
-        format: GgmlQuantFormat,
-        spill_depth: usize,
-    ) -> Result<Handle<Expression>, LowerError> {
-        let a_handles =
-            self.lower_tile_exprs_lane(expressions, scratch, body, a, spill_depth + 1)?;
-        let a_handles: [Handle<Expression>; 8] = a_handles
-            .try_into()
-            .map_err(|_| LowerError::UnsupportedOperation("q8_0 dot8 expected 8 A values"))?;
-
-        self.lower_masked_quantized_col_value(
-            expressions,
-            scratch,
-            body,
-            k_base,
-            col,
-            mask,
-            fill,
-            spill_depth,
-            |expressions, k_base, col| match format {
-                GgmlQuantFormat::Q8_0 => {
-                    self.dequantize_q8_0_dot8(expressions, src, k_base, col, &a_handles)
-                }
-                GgmlQuantFormat::Q6K => {
-                    self.dequantize_q6k_dot8(expressions, src, k_base, col, &a_handles)
-                }
-                _ => Err(LowerError::UnsupportedOperation(
-                    "unsupported quantized f32 dot8 format",
-                )),
-            },
-        )
-    }
-
+    /// Lower a unified `Expr::QuantizedDot`. Activations and K coordinate are
+    /// materialised once, then the format-specific helper is selected by the
+    /// `(format, activations, k, block_n)` tuple. Unsupported combinations
+    /// return `LowerError::UnsupportedOperation` with the same messages the
+    /// pre-merge helpers used.
     #[allow(clippy::too_many_arguments)]
-    pub(in crate::lower) fn lower_tile_quantized_vec_dot_expr(
+    pub(in crate::lower) fn lower_tile_quantized_dot_expr(
         &self,
         expressions: &mut Arena<Expression>,
         scratch: ScratchLocals,
         body: &mut Block,
-        kind: QuantizedVecDotKind,
-        a: &[Box<Expr>],
         src: &QuantizedMatrix,
-        k_base: &Expr,
+        activations: &PackedActivations,
+        k: &DotK,
         col: &Expr,
         mask: &Expr,
         fill: F32Bits,
         block_n: u32,
         spill_depth: usize,
     ) -> Result<Handle<Expression>, LowerError> {
-        let a_handles =
-            self.lower_tile_exprs_lane(expressions, scratch, body, a, spill_depth + 1)?;
-        match kind {
-            QuantizedVecDotKind::Q8Activation => {
+        match (activations, k) {
+            (PackedActivations::F32(a), DotK::Base(k_base)) => {
+                let a_handles =
+                    self.lower_tile_exprs_lane(expressions, scratch, body, a, spill_depth + 1)?;
+                self.lower_masked_quantized_col_value(
+                    expressions,
+                    scratch,
+                    body,
+                    k_base,
+                    col,
+                    mask,
+                    fill,
+                    spill_depth,
+                    |expressions, k_base, col| match (src.format, block_n) {
+                        (GgmlQuantFormat::Q8_0, 8) => {
+                            let a8: [Handle<Expression>; 8] =
+                                a_handles.as_slice().try_into().map_err(|_| {
+                                    LowerError::UnsupportedOperation(
+                                        "f32 activation dot only supports dot8",
+                                    )
+                                })?;
+                            self.dequantize_q8_0_dot8(expressions, src, k_base, col, &a8)
+                        }
+                        (GgmlQuantFormat::Q6K, 8) => {
+                            let a8: [Handle<Expression>; 8] =
+                                a_handles.as_slice().try_into().map_err(|_| {
+                                    LowerError::UnsupportedOperation(
+                                        "f32 activation dot only supports dot8",
+                                    )
+                                })?;
+                            self.dequantize_q6k_dot8(expressions, src, k_base, col, &a8)
+                        }
+                        (GgmlQuantFormat::Q4K, 8 | 16 | 32) => {
+                            self.q4k_f32_dot(expressions, src, k_base, col, &a_handles)
+                        }
+                        _ => Err(LowerError::UnsupportedOperation(
+                            "f32 activation dot only supports Q8_0/Q6K dot8 or Q4K dot8/dot16/dot32",
+                        )),
+                    },
+                )
+            }
+            (PackedActivations::Q8(a), DotK::Base(k_base)) => {
+                let a_handles =
+                    self.lower_tile_exprs_lane(expressions, scratch, body, a, spill_depth + 1)?;
                 let a_packs =
                     self.cached_q8_activation_packs(expressions, scratch, body, &a_handles)?;
                 self.lower_masked_quantized_col_value(
@@ -88,133 +89,115 @@ impl<'a> Lowerer<'a> {
                     },
                 )
             }
-            QuantizedVecDotKind::Q4KF32 => self.lower_masked_quantized_col_value(
-                expressions,
-                scratch,
-                body,
-                k_base,
-                col,
-                mask,
-                fill,
-                spill_depth,
-                |expressions, k_base, col| match (src.format, block_n) {
-                    (GgmlQuantFormat::Q4K, 8 | 16 | 32) => {
-                        self.q4k_f32_dot(expressions, src, k_base, col, &a_handles)
-                    }
-                    _ => Err(LowerError::UnsupportedOperation(
-                        "q4k f32 dot only supports Q4K dot8/dot16/dot32",
-                    )),
-                },
-            ),
-        }
-    }
+            (
+                PackedActivations::Q4KGgml { low, high, sums },
+                DotK::Block { block, c0: iq, c1: ir },
+            ) => {
+                if low.len() != 16 || high.len() != 16 || sums.len() != 4 {
+                    return Err(LowerError::UnsupportedOperation(
+                        "q4k ggml dot requires 16 low activations, 16 high activations, and 4 sums",
+                    ));
+                }
+                if !matches!(src.format, GgmlQuantFormat::Q4K) {
+                    return Err(LowerError::UnsupportedOperation(
+                        "q4k ggml dot only supports the Q4K format",
+                    ));
+                }
 
-    #[allow(clippy::too_many_arguments)]
-    pub(in crate::lower) fn lower_tile_quantized_q4k_ggml_dot_expr(
-        &self,
-        expressions: &mut Arena<Expression>,
-        scratch: ScratchLocals,
-        body: &mut Block,
-        a_low: &[Box<Expr>],
-        a_high: &[Box<Expr>],
-        sums: &[Box<Expr>],
-        src: &QuantizedMatrix,
-        block: &Expr,
-        iq: &Expr,
-        ir: &Expr,
-        col: &Expr,
-        mask: &Expr,
-        fill: F32Bits,
-        spill_depth: usize,
-    ) -> Result<Handle<Expression>, LowerError> {
-        if a_low.len() != 16 || a_high.len() != 16 || sums.len() != 4 {
-            return Err(LowerError::UnsupportedOperation(
-                "q4k ggml dot requires 16 low activations, 16 high activations, and 4 sums",
-            ));
-        }
+                let low_handles =
+                    self.lower_tile_exprs_lane(expressions, scratch, body, low, spill_depth + 1)?;
+                let high_handles =
+                    self.lower_tile_exprs_lane(expressions, scratch, body, high, spill_depth + 1)?;
+                let sum_handles =
+                    self.lower_tile_exprs_lane(expressions, scratch, body, sums, spill_depth + 1)?;
 
-        let a_low_handles =
-            self.lower_tile_exprs_lane(expressions, scratch, body, a_low, spill_depth + 1)?;
-        let a_high_handles =
-            self.lower_tile_exprs_lane(expressions, scratch, body, a_high, spill_depth + 1)?;
-        let sum_handles =
-            self.lower_tile_exprs_lane(expressions, scratch, body, sums, spill_depth + 1)?;
-
-        self.lower_masked_f32_value(
-            expressions,
-            scratch,
-            body,
-            mask,
-            spill_depth,
-            fill,
-            |expressions, block_body| {
-                let block_h = self
-                    .lower_tile_expr_lane(expressions, scratch, block_body, block, spill_depth)?;
-                let iq_h = self
-                    .lower_tile_expr_lane(expressions, scratch, block_body, iq, spill_depth)?;
-                let ir_h = self
-                    .lower_tile_expr_lane(expressions, scratch, block_body, ir, spill_depth)?;
-                let col_h = self
-                    .lower_tile_expr_lane(expressions, scratch, block_body, col, spill_depth)?;
-                self.q4k_ggml_dot(
+                self.lower_masked_f32_value(
                     expressions,
-                    src,
-                    block_h,
-                    iq_h,
-                    ir_h,
-                    col_h,
-                    &a_low_handles,
-                    &a_high_handles,
-                    &sum_handles,
+                    scratch,
+                    body,
+                    mask,
+                    spill_depth,
+                    fill,
+                    |expressions, block_body| {
+                        let block_h = self.lower_tile_expr_lane(
+                            expressions,
+                            scratch,
+                            block_body,
+                            block,
+                            spill_depth,
+                        )?;
+                        let iq_h = self
+                            .lower_tile_expr_lane(expressions, scratch, block_body, iq, spill_depth)?;
+                        let ir_h = self
+                            .lower_tile_expr_lane(expressions, scratch, block_body, ir, spill_depth)?;
+                        let col_h = self
+                            .lower_tile_expr_lane(expressions, scratch, block_body, col, spill_depth)?;
+                        self.q4k_ggml_dot(
+                            expressions,
+                            src,
+                            block_h,
+                            iq_h,
+                            ir_h,
+                            col_h,
+                            &low_handles,
+                            &high_handles,
+                            &sum_handles,
+                        )
+                    },
                 )
-            },
-        )
-    }
+            }
+            (
+                PackedActivations::F32(a),
+                DotK::Block { block, c0: ip, c1: il },
+            ) => {
+                if a.len() != 16 {
+                    return Err(LowerError::UnsupportedOperation(
+                        "q6k ggml dot requires 16 activations",
+                    ));
+                }
+                if !matches!(src.format, GgmlQuantFormat::Q6K) {
+                    return Err(LowerError::UnsupportedOperation(
+                        "q6k ggml dot only supports the Q6K format",
+                    ));
+                }
 
-    #[allow(clippy::too_many_arguments)]
-    pub(in crate::lower) fn lower_tile_quantized_q6k_ggml_dot_expr(
-        &self,
-        expressions: &mut Arena<Expression>,
-        scratch: ScratchLocals,
-        body: &mut Block,
-        a: &[Box<Expr>],
-        src: &QuantizedMatrix,
-        block: &Expr,
-        ip: &Expr,
-        il: &Expr,
-        col: &Expr,
-        mask: &Expr,
-        fill: F32Bits,
-        spill_depth: usize,
-    ) -> Result<Handle<Expression>, LowerError> {
-        if a.len() != 16 {
-            return Err(LowerError::UnsupportedOperation(
-                "q6k ggml dot requires 16 activations",
-            ));
+                let a_handles =
+                    self.lower_tile_exprs_lane(expressions, scratch, body, a, spill_depth + 1)?;
+
+                self.lower_masked_f32_value(
+                    expressions,
+                    scratch,
+                    body,
+                    mask,
+                    spill_depth,
+                    fill,
+                    |expressions, block_body| {
+                        let block_h = self.lower_tile_expr_lane(
+                            expressions,
+                            scratch,
+                            block_body,
+                            block,
+                            spill_depth,
+                        )?;
+                        let ip_h = self
+                            .lower_tile_expr_lane(expressions, scratch, block_body, ip, spill_depth)?;
+                        let il_h = self
+                            .lower_tile_expr_lane(expressions, scratch, block_body, il, spill_depth)?;
+                        let col_h = self
+                            .lower_tile_expr_lane(expressions, scratch, block_body, col, spill_depth)?;
+                        self.q6k_ggml_dot(expressions, src, block_h, ip_h, il_h, col_h, &a_handles)
+                    },
+                )
+            }
+            (PackedActivations::Q8(_), DotK::Block { .. }) => Err(LowerError::UnsupportedOperation(
+                "q8 activation dot does not support block-shaped K coordinates",
+            )),
+            (PackedActivations::Q4KGgml { .. }, DotK::Base(_)) => {
+                Err(LowerError::UnsupportedOperation(
+                    "q4k ggml dot requires a block-shaped K coordinate",
+                ))
+            }
         }
-
-        let a_handles =
-            self.lower_tile_exprs_lane(expressions, scratch, body, a, spill_depth + 1)?;
-
-        self.lower_masked_f32_value(
-            expressions,
-            scratch,
-            body,
-            mask,
-            spill_depth,
-            fill,
-            |expressions, block_body| {
-                let block_h = self
-                    .lower_tile_expr_lane(expressions, scratch, block_body, block, spill_depth)?;
-                let ip_h = self
-                    .lower_tile_expr_lane(expressions, scratch, block_body, ip, spill_depth)?;
-                let il_h = self
-                    .lower_tile_expr_lane(expressions, scratch, block_body, il, spill_depth)?;
-                let col_h = self
-                    .lower_tile_expr_lane(expressions, scratch, block_body, col, spill_depth)?;
-                self.q6k_ggml_dot(expressions, src, block_h, ip_h, il_h, col_h, &a_handles)
-            },
-        )
     }
 
     pub(in crate::lower) fn lower_tile_exprs_lane(

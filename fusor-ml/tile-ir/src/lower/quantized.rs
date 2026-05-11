@@ -2,7 +2,6 @@ use super::*;
 
 mod dequant_block;
 mod dot;
-pub(super) mod dot_lowering;
 mod helpers;
 mod values;
 

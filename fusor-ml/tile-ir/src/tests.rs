@@ -30,7 +30,7 @@ fn assert_only_tile_programs(ir: &KernelIr) {
 fn tile_stmts_contain_load_role(stmts: &[TileStmt], role: CoopOperandRole) -> bool {
     stmts.iter().any(|stmt| match stmt {
         TileStmt::LoadCoop { role: r, .. } => *r == role,
-        TileStmt::WhileTrue { body, .. } => tile_stmts_contain_load_role(body, role),
+        TileStmt::Fold { body, .. } => tile_stmts_contain_load_role(body, role),
         _ => false,
     })
 }

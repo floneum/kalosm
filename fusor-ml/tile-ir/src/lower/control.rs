@@ -331,8 +331,14 @@ impl<'a> Lowerer<'a> {
                     Span::default(),
                 );
 
-                // Lower body statements.
-                let saved = self.snapshot_tile_loop_caches();
+                // Snapshot caches whose SSA handles are scoped to the outer
+                // block so the body's lowering can repopulate them inside the
+                // loop, then restore on exit. Coop fragments and acc-value SSA
+                // chains live within one iteration only; flush at the
+                // iteration boundary.
+                let tile_saved = self.snapshot_tile_loop_caches();
+                let coop_saved = self.snapshot_coop_loop_caches();
+
                 for stmt in fold_body {
                     self.lower_tile_stmt(expressions, scratch, loop_body, stmt)?;
                 }
@@ -360,7 +366,9 @@ impl<'a> Lowerer<'a> {
                     );
                 }
 
-                self.restore_tile_loop_caches(saved);
+                self.flush_coop_acc_cache(expressions, loop_body);
+                self.restore_coop_loop_caches(coop_saved);
+                self.restore_tile_loop_caches(tile_saved);
                 Ok(())
             },
         )

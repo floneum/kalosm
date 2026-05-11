@@ -4,8 +4,8 @@ use naga::{Barrier, CooperativeData, CooperativeRole, CooperativeSize};
 const COOP_SIZE: CooperativeSize = CooperativeSize::Eight;
 
 impl<'a> Lowerer<'a> {
-    /// Lower non-store tile statements. WhileTrue emits a Naga `loop` with an
-    /// explicit break guard; coop ops emit cooperative-matrix Loads/MMA/Store.
+    /// Lower non-store tile statements. Coop ops emit cooperative-matrix
+    /// Loads/MMA/Store.
     pub(super) fn lower_tile_stmt_body(
         &self,
         expressions: &mut Arena<Expression>,
@@ -48,21 +48,6 @@ impl<'a> Lowerer<'a> {
                 }
                 let value = self.lower_tile_expr_lane(expressions, scratch, body, value, 0)?;
                 let local = self.private_local(*dst)?;
-                let pointer = expressions.append(Expression::LocalVariable(local), Span::default());
-                body.push(Statement::Store { pointer, value }, Span::default());
-                Ok(())
-            }
-            TileStmt::Let { name, value } => {
-                let value_ty = self.tile_expr_element(value)?;
-                if value_ty != name.element {
-                    return Err(LowerError::LocalElementMismatch {
-                        local: name.id,
-                        declared: name.element,
-                        used: value_ty,
-                    });
-                }
-                let value = self.lower_tile_expr_lane(expressions, scratch, body, value, 0)?;
-                let local = self.private_local(*name)?;
                 let pointer = expressions.append(Expression::LocalVariable(local), Span::default());
                 body.push(Statement::Store { pointer, value }, Span::default());
                 Ok(())
@@ -152,38 +137,31 @@ impl<'a> Lowerer<'a> {
                 );
                 Ok(())
             }
-            TileStmt::WhileTrue {
-                max_iterations,
-                body: inner,
-            } => self.lower_tile_while_true(expressions, scratch, body, *max_iterations, inner),
             TileStmt::CopyToWorkgroupTile {
                 dst,
                 src,
                 row_offset,
                 col_offset,
-            } => self.lower_copy_to_tile(
-                expressions,
-                scratch,
-                body,
-                *dst,
-                src,
-                row_offset,
-                col_offset,
-            ),
-            TileStmt::CopyQuantToWorkgroupTile {
-                dst,
-                src,
-                row_offset,
-                col_offset,
-            } => self.lower_copy_quant_to_tile(
-                expressions,
-                scratch,
-                body,
-                *dst,
-                src,
-                row_offset,
-                col_offset,
-            ),
+            } => match src {
+                CopySource::Storage(view) => self.lower_copy_to_tile(
+                    expressions,
+                    scratch,
+                    body,
+                    *dst,
+                    view,
+                    row_offset,
+                    col_offset,
+                ),
+                CopySource::Quantized(matrix) => self.lower_copy_quant_to_tile(
+                    expressions,
+                    scratch,
+                    body,
+                    *dst,
+                    matrix,
+                    row_offset,
+                    col_offset,
+                ),
+            },
             TileStmt::StoreCoopAcc { acc, dst, row, col } => {
                 self.lower_store_coop_acc(expressions, scratch, body, *acc, dst, row, col)
             }
@@ -325,7 +303,7 @@ impl<'a> Lowerer<'a> {
     /// Flush every cached accumulator SSA back to its local. Called at the
     /// end of any scope where the cache must not leak (loop body iteration
     /// boundary, before reads of the local, end of program body, etc.).
-    fn flush_coop_acc_cache(&self, expressions: &mut Arena<Expression>, body: &mut Block) {
+    pub(super) fn flush_coop_acc_cache(&self, expressions: &mut Arena<Expression>, body: &mut Block) {
         let drained: Vec<_> = self.coop_acc_value_cache.borrow_mut().drain().collect();
         for (local_id, value) in drained {
             let acc_local = match self
@@ -346,34 +324,6 @@ impl<'a> Lowerer<'a> {
                 Span::default(),
             );
         }
-    }
-
-    fn lower_tile_while_true(
-        &self,
-        expressions: &mut Arena<Expression>,
-        scratch: ScratchLocals,
-        body: &mut Block,
-        max_iterations: u32,
-        inner: &[TileStmt],
-    ) -> Result<(), LowerError> {
-        self.emit_counted_loop(
-            expressions,
-            scratch,
-            body,
-            max_iterations,
-            |expressions, loop_body, _| {
-                // Cache entries reference SSA handles emitted into the outer block;
-                // they are out of scope inside this loop body. Snapshot, clear for the
-                // body, restore on exit. The accumulator-value cache must be flushed
-                // at iteration boundaries too; its SSA chain only carries within one
-                // iteration, while loop-carry goes through the accumulator local.
-                let saved = self.snapshot_coop_loop_caches();
-                self.lower_tile_stmt_body(expressions, scratch, loop_body, inner)?;
-                self.flush_coop_acc_cache(expressions, loop_body);
-                self.restore_coop_loop_caches(saved);
-                Ok(())
-            },
-        )
     }
 
     fn lower_copy_passes(

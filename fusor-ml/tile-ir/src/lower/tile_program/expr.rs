@@ -1,9 +1,5 @@
 use super::*;
 use crate::ir::Builtin;
-use crate::lower::quantized::dot_lowering::{
-    DotLoweringCtx, Q4KGgmlDotLowering, Q6KGgmlDotLowering, Q8_0Dot8Lowering, QuantizedDotLowering,
-    VecDotLowering,
-};
 
 impl<'a> Lowerer<'a> {
     pub(in crate::lower) fn lower_tile_expr_lane(
@@ -21,9 +17,6 @@ impl<'a> Lowerer<'a> {
             Expr::LoadLinear(load) => {
                 self.lower_tile_linear_load_expr(expressions, scratch, body, load, spill_depth)
             }
-            Expr::LoadVec4(load) => {
-                self.lower_tile_vec4_load_expr(expressions, scratch, body, load, spill_depth)
-            }
             Expr::LoadWorkgroup { src, index } => {
                 let index =
                     self.lower_tile_expr_lane(expressions, scratch, body, index, spill_depth)?;
@@ -39,45 +32,27 @@ impl<'a> Lowerer<'a> {
             Expr::QuantizedLoad(load) => {
                 self.lower_tile_quantized_load_expr(expressions, scratch, body, load, spill_depth)
             }
-            Expr::Full(value) => Ok(expressions.append(
-                Expression::Literal(Literal::F32(value.get())),
-                Span::default(),
-            )),
-            Expr::Literal(value) => {
-                Ok(expressions.append(Self::tile_literal(*value), Span::default()))
-            }
+            Expr::Literal(value) => Ok(self.tile_literal(expressions, *value)),
             Expr::Builtin(builtin) => Ok(self.lower_builtin(expressions, body, *builtin)),
             Expr::Reduce {
-                op,
-                value,
-                scratch: scratch_tile,
-            } => {
-                let value =
-                    self.lower_tile_expr_lane(expressions, scratch, body, value, spill_depth)?;
-                self.lower_tile_reduce_value(
-                    expressions,
-                    body,
-                    value,
-                    *scratch_tile,
-                    *op,
-                    self.workgroup_invocations,
-                )
-            }
-            Expr::LoopReduce {
                 op,
                 iterations,
                 value,
                 scratch: scratch_tile,
             } => {
-                let value = self.lower_tile_loop_reduce_value(
-                    expressions,
-                    scratch,
-                    body,
-                    value,
-                    *iterations,
-                    *op,
-                    spill_depth,
-                )?;
+                let value = if *iterations == 1 {
+                    self.lower_tile_expr_lane(expressions, scratch, body, value, spill_depth)?
+                } else {
+                    self.lower_tile_loop_reduce_value(
+                        expressions,
+                        scratch,
+                        body,
+                        value,
+                        *iterations,
+                        *op,
+                        spill_depth,
+                    )?
+                };
                 self.lower_tile_reduce_value(
                     expressions,
                     body,
@@ -115,35 +90,6 @@ impl<'a> Lowerer<'a> {
                     self.lower_tile_expr_lane(expressions, scratch, body, right, spill_depth + 1)?;
                 let expr = Self::tile_binary_expression(*op, left, right);
                 Ok(self.emit_tile_expr(expressions, body, expr))
-            }
-            Expr::Sum { values } => {
-                let mut iter = values.iter();
-                let Some(first) = iter.next() else {
-                    return Ok(
-                        expressions.append(Expression::Literal(Literal::F32(0.0)), Span::default())
-                    );
-                };
-                let mut sum =
-                    self.lower_tile_expr_lane(expressions, scratch, body, first, spill_depth + 1)?;
-                for value in iter {
-                    let rhs = self.lower_tile_expr_lane(
-                        expressions,
-                        scratch,
-                        body,
-                        value,
-                        spill_depth + 1,
-                    )?;
-                    sum = self.emit_tile_expr(
-                        expressions,
-                        body,
-                        Expression::Binary {
-                            op: BinaryOperator::Add,
-                            left: sum,
-                            right: rhs,
-                        },
-                    );
-                }
-                Ok(sum)
             }
             Expr::Cast { value, to } => {
                 let source = self.tile_expr_element(value)?;
@@ -227,21 +173,6 @@ impl<'a> Lowerer<'a> {
                     },
                 ))
             }
-            Expr::LoopFold {
-                op,
-                iterations,
-                value,
-                initial,
-            } => self.lower_tile_loop_fold_value(
-                expressions,
-                scratch,
-                body,
-                value,
-                *iterations,
-                *op,
-                *initial,
-                spill_depth,
-            ),
             Expr::GroupReduce {
                 op,
                 value,
@@ -329,119 +260,26 @@ impl<'a> Lowerer<'a> {
                 );
                 Ok(dot)
             }
-            Expr::Vec4Splat { value } => {
-                let value =
-                    self.lower_tile_expr_lane(expressions, scratch, body, value, spill_depth)?;
-                Ok(self.emit_tile_expr(
-                    expressions,
-                    body,
-                    Expression::Compose {
-                        ty: self.f32_vec4_ty,
-                        components: vec![value, value, value, value],
-                    },
-                ))
-            }
-            Expr::QuantizedQ8_0Dot8 {
-                a,
+            Expr::QuantizedDot {
                 src,
-                k_base,
-                col,
-                mask,
-                fill,
-            } => Q8_0Dot8Lowering { a, k_base }.lower(
-                self,
-                DotLoweringCtx {
-                    expressions,
-                    scratch,
-                    body,
-                    spill_depth,
-                    src,
-                    col,
-                    mask,
-                    fill: *fill,
-                },
-            ),
-            Expr::QuantizedVecDot {
-                kind,
-                a,
-                src,
-                k_base,
+                activations,
+                k,
                 col,
                 mask,
                 fill,
                 block_n,
-            } => VecDotLowering {
-                kind: *kind,
-                a,
-                k_base,
-                block_n: *block_n,
-            }
-            .lower(
-                self,
-                DotLoweringCtx {
-                    expressions,
-                    scratch,
-                    body,
-                    spill_depth,
-                    src,
-                    col,
-                    mask,
-                    fill: *fill,
-                },
-            ),
-            Expr::QuantizedQ4KGgmlDot {
-                a_low,
-                a_high,
-                sums,
+            } => self.lower_tile_quantized_dot_expr(
+                expressions,
+                scratch,
+                body,
                 src,
-                block,
-                iq,
-                ir,
+                activations,
+                k,
                 col,
                 mask,
-                fill,
-            } => Q4KGgmlDotLowering {
-                a_low,
-                a_high,
-                sums,
-                block,
-                iq,
-                ir,
-            }
-            .lower(
-                self,
-                DotLoweringCtx {
-                    expressions,
-                    scratch,
-                    body,
-                    spill_depth,
-                    src,
-                    col,
-                    mask,
-                    fill: *fill,
-                },
-            ),
-            Expr::QuantizedQ6KGgmlDot {
-                a,
-                src,
-                block,
-                ip,
-                il,
-                col,
-                mask,
-                fill,
-            } => Q6KGgmlDotLowering { a, block, ip, il }.lower(
-                self,
-                DotLoweringCtx {
-                    expressions,
-                    scratch,
-                    body,
-                    spill_depth,
-                    src,
-                    col,
-                    mask,
-                    fill: *fill,
-                },
+                *fill,
+                *block_n,
+                spill_depth,
             ),
         }
     }

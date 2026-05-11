@@ -1,16 +1,10 @@
-#![allow(unused_imports)]
-use std::marker::PhantomData;
-use std::ops::{Add, BitAnd, BitXor, Div, Mul, Rem, Sub};
+
 
 use crate::ir::{
-    BlockDequantId, BufferAccess, BufferDecl, BufferRef, CoopFragmentId,
-    CoopOperandRole, DynamicOffset, F32Bits, F32Vec4, Im2ColNhwcMap, KernelIr, Layout, LocalDecl,
-    LocalRef, MemoryLevel, Numeric, Op,
-    QuantizedVecDotKind, Shape, StorageIndexMap, StorageView, TileBinaryOp, TileCompareOp,
-    TileDecl, Expr, TileIndexedStoreStmt, TileLevel, TileLinearLoadExpr,
-    TileLiteral, TileLoadExpr, TileOrigin, TileProgramOp, TileQuantizedLoadExpr,
-    TileReduceOp, TileRef, TileStmt, TileStoreStmt, TileUnaryOp, TileVec4LoadExpr,
-    WorkgroupAxis, WorkgroupOffset, F32, U32,
+    F32Bits,
+    TileLiteral,
+    TileReduceOp,
+    WorkgroupAxis, F32,
 };
 use crate::dispatch::{
     q4k_default_large, q4k_default_mid, q4k_default_tall, q4k_large_override, q4k_mid_override,
@@ -19,7 +13,7 @@ use crate::dispatch::{
 };
 use crate::quantized::{GgmlQuantFormat, QuantizedMatrix};
 use super::*;
-use super::types::{matrix_shape, cooperative_store_layout_supported};
+use super::types::matrix_shape;
 use super::grid::{qgemv_grid, store_qgemv_sums, q4k_ggml_activations, dot4_sum};
 
 macro_rules! q4k_paired_entrypoints {

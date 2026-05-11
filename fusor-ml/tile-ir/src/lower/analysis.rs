@@ -36,13 +36,11 @@ impl<'a> Lowerer<'a> {
             TileStmt::Store(store) => Self::mark_tile_expr_live(ir, &store.value, live),
             TileStmt::StoreIndexed(store) => Self::mark_tile_expr_live(ir, &store.value, live),
             TileStmt::StoreLocal { value, .. } => Self::mark_tile_expr_live(ir, value, live),
-            TileStmt::Let { value, .. } => Self::mark_tile_expr_live(ir, value, live),
             TileStmt::StoreWorkgroup { dst, value, .. } => {
                 Self::mark_tile_live(ir, *dst, live);
                 Self::mark_tile_expr_live(ir, value, live);
             }
-            TileStmt::CopyToWorkgroupTile { dst, .. }
-            | TileStmt::CopyQuantToWorkgroupTile { dst, .. } => {
+            TileStmt::CopyToWorkgroupTile { dst, .. } => {
                 if let Some(slot) = live.get_mut(dst.id.index()) {
                     *slot = true;
                 }
@@ -56,11 +54,6 @@ impl<'a> Lowerer<'a> {
             | TileStmt::Barrier
             | TileStmt::Mma { .. }
             | TileStmt::StoreCoopAcc { .. } => {}
-            TileStmt::WhileTrue { body, .. } => {
-                for s in body {
-                    Self::mark_tile_stmt_live(ir, s, live);
-                }
-            }
             TileStmt::If {
                 condition,
                 accept,
@@ -137,7 +130,6 @@ impl<'a> Lowerer<'a> {
             TileStmt::Store(store) => Self::tile_expr_any(&store.value, pred),
             TileStmt::StoreIndexed(store) => Self::tile_expr_any(&store.value, pred),
             TileStmt::StoreLocal { value, .. }
-            | TileStmt::Let { value, .. }
             | TileStmt::StoreWorkgroup { value, .. } => Self::tile_expr_any(value, pred),
             TileStmt::If {
                 condition,
@@ -150,7 +142,7 @@ impl<'a> Lowerer<'a> {
                         .chain(reject.iter())
                         .any(|stmt| Self::tile_stmt_expr_any(stmt, pred))
             }
-            TileStmt::Loop { body } | TileStmt::WhileTrue { body, .. } => {
+            TileStmt::Loop { body } => {
                 body.iter().any(|stmt| Self::tile_stmt_expr_any(stmt, pred))
             }
             TileStmt::Fold {
@@ -173,7 +165,6 @@ impl<'a> Lowerer<'a> {
             }
             TileStmt::StoreCoopAcc { .. }
             | TileStmt::CopyToWorkgroupTile { .. }
-            | TileStmt::CopyQuantToWorkgroupTile { .. }
             | TileStmt::ZeroCoopAcc { .. }
             | TileStmt::Barrier
             | TileStmt::LoadCoop { .. }
@@ -195,14 +186,12 @@ impl<'a> Lowerer<'a> {
         F: FnMut(&Expr) -> bool,
     {
         match expr {
-            Expr::Reduce { value, .. } | Expr::LoopReduce { value, .. } => pred(value),
+            Expr::Reduce { value, .. } => pred(value),
             Expr::LoadLocal(_)
-            | Expr::Full(_)
             | Expr::Literal(_)
             | Expr::Builtin(_) => false,
             Expr::Load(load) => pred(&load.row) || pred(&load.col) || pred(&load.mask),
             Expr::LoadLinear(load) => pred(&load.index) || pred(&load.mask),
-            Expr::LoadVec4(load) => pred(&load.index) || pred(&load.mask),
             Expr::LoadWorkgroup { index, .. } => pred(index),
             Expr::QuantizedLoad(load) => {
                 pred(&load.row) || pred(&load.col) || pred(&load.mask)
@@ -213,10 +202,8 @@ impl<'a> Lowerer<'a> {
             Expr::Unary { value, .. }
             | Expr::Cast { value, .. }
             | Expr::Bitcast { value, .. }
-            | Expr::LoopFold { value, .. }
             | Expr::GroupReduce { value, .. }
-            | Expr::SubgroupReduce { value, .. }
-            | Expr::Vec4Splat { value } => pred(value),
+            | Expr::SubgroupReduce { value, .. } => pred(value),
             Expr::Binary { left, right, .. }
             | Expr::Compare { left, right, .. }
             | Expr::Vec4Dot { left, right } => pred(left) || pred(right),
@@ -225,69 +212,29 @@ impl<'a> Lowerer<'a> {
                 accept,
                 reject,
             } => pred(condition) || pred(accept) || pred(reject),
-            Expr::Sum { values } => values.iter().any(|expr| pred(expr)),
             Expr::Compose4 { values } => values.iter().any(|expr| pred(expr)),
-            Expr::QuantizedQ8_0Dot8 {
-                a,
-                k_base,
+            Expr::QuantizedDot {
+                activations,
+                k,
                 col,
                 mask,
                 ..
             } => {
-                a.iter().any(|expr| pred(expr))
-                    || pred(k_base)
-                    || pred(col)
-                    || pred(mask)
-            }
-            Expr::QuantizedVecDot {
-                a,
-                k_base,
-                col,
-                mask,
-                ..
-            } => {
-                a.iter().any(|expr| pred(expr))
-                    || pred(k_base)
-                    || pred(col)
-                    || pred(mask)
-            }
-            Expr::QuantizedQ6KGgmlDot {
-                a,
-                block,
-                ip,
-                il,
-                col,
-                mask,
-                ..
-            } => {
-                a.iter().any(|expr| pred(expr))
-                    || pred(block)
-                    || pred(ip)
-                    || pred(il)
-                    || pred(col)
-                    || pred(mask)
-            }
-            Expr::QuantizedQ4KGgmlDot {
-                a_low,
-                a_high,
-                sums,
-                block,
-                iq,
-                ir,
-                col,
-                mask,
-                ..
-            } => {
-                a_low
-                    .iter()
-                    .chain(a_high.iter())
-                    .chain(sums.iter())
-                    .any(|expr| pred(expr))
-                    || pred(block)
-                    || pred(iq)
-                    || pred(ir)
-                    || pred(col)
-                    || pred(mask)
+                let activations_match = match activations {
+                    PackedActivations::F32(a) | PackedActivations::Q8(a) => {
+                        a.iter().any(|expr| pred(expr))
+                    }
+                    PackedActivations::Q4KGgml { low, high, sums } => low
+                        .iter()
+                        .chain(high.iter())
+                        .chain(sums.iter())
+                        .any(|expr| pred(expr)),
+                };
+                let k_match = match k {
+                    DotK::Base(k_base) => pred(k_base),
+                    DotK::Block { block, c0, c1 } => pred(block) || pred(c0) || pred(c1),
+                };
+                activations_match || k_match || pred(col) || pred(mask)
             }
         }
     }
@@ -297,20 +244,15 @@ impl<'a> Lowerer<'a> {
             TileStmt::Store(_)
             | TileStmt::StoreIndexed(_)
             | TileStmt::StoreLocal { .. }
-            | TileStmt::Let { .. }
             | TileStmt::StoreWorkgroup { .. }
             | TileStmt::Barrier
             | TileStmt::Break
             | TileStmt::Return => false,
             TileStmt::ZeroCoopAcc { .. }
             | TileStmt::CopyToWorkgroupTile { .. }
-            | TileStmt::CopyQuantToWorkgroupTile { .. }
             | TileStmt::LoadCoop { .. }
             | TileStmt::Mma { .. }
             | TileStmt::StoreCoopAcc { .. } => true,
-            TileStmt::WhileTrue { body, .. } => {
-                body.iter().any(Self::tile_stmt_uses_cooperative_matrix)
-            }
             TileStmt::If { accept, reject, .. } => accept
                 .iter()
                 .chain(reject.iter())
@@ -336,9 +278,7 @@ impl<'a> Lowerer<'a> {
     fn mark_tile_expr_live(ir: &KernelIr, expr: &Expr, live: &mut [bool]) {
         match expr {
             Expr::LoadWorkgroup { src, .. } => Self::mark_tile_live(ir, *src, live),
-            Expr::Reduce { scratch, .. }
-            | Expr::LoopReduce { scratch, .. }
-            | Expr::GroupReduce { scratch, .. } => {
+            Expr::Reduce { scratch, .. } | Expr::GroupReduce { scratch, .. } => {
                 Self::mark_tile_live(ir, *scratch, live);
             }
             _ => {}

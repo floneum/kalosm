@@ -383,7 +383,6 @@ impl<'a> Lowerer<'a> {
         match expr {
             Expr::Load(load) => !load.mask.is_constant_true(),
             Expr::LoadLinear(load) => !load.mask.is_constant_true(),
-            Expr::LoadVec4(load) => !load.mask.is_constant_true(),
             Expr::QuantizedLoad(load) => !load.mask.is_constant_true(),
             _ => Self::tile_expr_children_any(expr, Self::tile_expr_needs_value_scratch),
         }
@@ -391,13 +390,8 @@ impl<'a> Lowerer<'a> {
 
     fn tile_expr_needs_full_scratch(expr: &Expr) -> bool {
         match expr {
-            Expr::QuantizedBlockLane { .. }
-            | Expr::QuantizedQ8_0Dot8 { .. }
-            | Expr::QuantizedVecDot { .. }
-            | Expr::QuantizedQ4KGgmlDot { .. }
-            | Expr::QuantizedQ6KGgmlDot { .. }
-            | Expr::LoopFold { .. }
-            | Expr::LoopReduce { .. } => true,
+            Expr::QuantizedBlockLane { .. } | Expr::QuantizedDot { .. } => true,
+            Expr::Reduce { iterations, .. } if *iterations > 1 => true,
             _ => Self::tile_expr_children_any(expr, Self::tile_expr_needs_full_scratch),
         }
     }
@@ -519,12 +513,15 @@ impl<'a> Lowerer<'a> {
             TileStmt::StoreLocal { dst, value } => {
                 dst.element == ElementType::F16 || Self::tile_expr_uses_f16(value)
             }
-            TileStmt::Let { name, value } => {
-                name.element == ElementType::F16 || Self::tile_expr_uses_f16(value)
-            }
             TileStmt::StoreWorkgroup { dst, .. } => dst.element == ElementType::F16,
             TileStmt::CopyToWorkgroupTile { dst, src, .. } => {
-                dst.element == ElementType::F16 || src.buffer.element == ElementType::F16
+                let src_uses_f16 = match src {
+                    crate::ir::CopySource::Storage(view) => {
+                        view.buffer.element == ElementType::F16
+                    }
+                    crate::ir::CopySource::Quantized(_) => false,
+                };
+                dst.element == ElementType::F16 || src_uses_f16
             }
             TileStmt::StoreCoopAcc { dst, .. } => dst.buffer.element == ElementType::F16,
             TileStmt::Fold { accumulators, .. } => accumulators.iter().any(|acc| {
@@ -534,9 +531,7 @@ impl<'a> Lowerer<'a> {
             }),
             TileStmt::If { .. }
             | TileStmt::Loop { .. }
-            | TileStmt::CopyQuantToWorkgroupTile { .. }
             | TileStmt::LoadCoop { .. }
-            | TileStmt::WhileTrue { .. }
             | TileStmt::ZeroCoopAcc { .. }
             | TileStmt::Barrier
             | TileStmt::Mma { .. }
@@ -562,16 +557,13 @@ impl<'a> Lowerer<'a> {
                 load.src.buffer.element == ElementType::F16
                     || load.fill.element() == ElementType::F16
             }
-            Expr::LoadVec4(_) => false,
             Expr::LoadWorkgroup { src, index } => {
                 src.element == ElementType::F16 || Self::tile_expr_uses_f16(index)
             }
             Expr::LoadLocal(local) => local.element == ElementType::F16,
-            Expr::QuantizedLoad(_) | Expr::Full(_) => false,
+            Expr::QuantizedLoad(_) => false,
             Expr::Literal(value) => value.element() == ElementType::F16,
-            Expr::Reduce { scratch, .. } | Expr::LoopReduce { scratch, .. } => {
-                scratch.element == ElementType::F16
-            }
+            Expr::Reduce { scratch, .. } => scratch.element == ElementType::F16,
             Expr::Unary { .. } => false,
             Expr::Cast { value, to } => {
                 *to == ElementType::F16 || Self::tile_expr_uses_f16(value)
@@ -579,22 +571,17 @@ impl<'a> Lowerer<'a> {
             Expr::Bitcast { value, to } => {
                 *to == ElementType::F16 || Self::tile_expr_uses_f16(value)
             }
-            Expr::Binary { .. } | Expr::Sum { .. } => false,
+            Expr::Binary { .. } => false,
             Expr::Compare { output, .. } => *output == ElementType::F16,
             Expr::Select { .. } => false,
-            Expr::LoopFold { initial, .. } => initial.element() == ElementType::F16,
             Expr::GroupReduce { value, scratch, .. } => {
                 scratch.element == ElementType::F16 || Self::tile_expr_uses_f16(value)
             }
             Expr::SubgroupReduce { .. }
             | Expr::QuantizedBlockLane { .. }
             | Expr::Vec4Dot { .. }
-            | Expr::Vec4Splat { .. }
             | Expr::Compose4 { .. }
-            | Expr::QuantizedQ8_0Dot8 { .. }
-            | Expr::QuantizedVecDot { .. }
-            | Expr::QuantizedQ4KGgmlDot { .. }
-            | Expr::QuantizedQ6KGgmlDot { .. }
+            | Expr::QuantizedDot { .. }
             | Expr::Builtin(_) => false,
         }
     }

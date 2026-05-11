@@ -1,22 +1,18 @@
-#![allow(unused_imports)]
 use std::marker::PhantomData;
-use std::ops::{Add, BitAnd, BitXor, Div, Mul, Rem, Sub};
 
 use crate::ir::{
-    BlockDequantId, BufferAccess, BufferDecl, BufferRef, CoopFragmentId,
-    CoopOperandRole, DynamicOffset, F32Bits, F32Vec4, Im2ColNhwcMap, KernelIr, Layout, LocalDecl,
-    LocalRef, MemoryLevel, Numeric, Op,
-    QuantizedVecDotKind, Shape, StorageIndexMap, StorageView, TileBinaryOp, TileCompareOp,
-    TileDecl, Expr, TileIndexedStoreStmt, TileLevel, TileLinearLoadExpr,
-    TileLiteral, TileLoadExpr, TileOrigin, TileProgramOp, TileQuantizedLoadExpr,
-    TileReduceOp, TileRef, TileStmt, TileStoreStmt, TileUnaryOp, TileVec4LoadExpr,
-    WorkgroupAxis, WorkgroupOffset, F32, U32,
+    BlockDequantId, BufferAccess, BufferDecl, BufferRef, CoopFragmentId, F32Bits, KernelIr, Layout, LocalDecl,
+    LocalRef, MemoryLevel, Numeric, Op, Shape, StorageIndexMap, StorageView,
+    TileDecl, TileLevel,
+    TileLiteral, TileOrigin, TileProgramOp,
+    TileReduceOp, TileRef,
+    WorkgroupAxis, F32, U32,
 };
 use crate::dispatch::{qmatmul_path, QmatmulPath};
 use crate::quantized::{GgmlQuantFormat, QuantizedMatrix};
 use super::*;
 use super::types::{matrix_shape, cooperative_store_layout_supported};
-use super::grid::{qgemv_grid, store_qgemv_sums, q4k_ggml_activations, dot4_sum};
+use super::grid::dot4_sum;
 
 /// Monomorphization dispatcher for `qmatmul_perf`. Stays as a macro so the
 /// const literals are visible at the call site for the compiler to
@@ -389,8 +385,8 @@ impl Program {
         let a_tile = self.alloc_workgroup_tile_f32(BM as u32, BK as u32);
         let b_tile = self.alloc_workgroup_tile_f32(BK as u32, BN as u32);
         let b_clone = b.clone();
-        let a_clone = a.clone();
-        let y_clone = y.clone();
+        let a_clone = a;
+        let y_clone = y;
 
         const TILE_ROWS_PER_SG: u32 = SUBGROUP_ROWS / 8;
         const TILE_COLS_PER_SG: u32 = SUBGROUP_COLS / 8;

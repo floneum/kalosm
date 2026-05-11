@@ -1,20 +1,14 @@
-#![allow(unused_imports)]
+
 use std::marker::PhantomData;
 use std::ops::{Add, BitAnd, BitXor, Div, Mul, Rem, Sub};
 
 use crate::ir::{
-    BlockDequantId, BufferAccess, BufferDecl, BufferRef, CoopFragmentId,
-    CoopOperandRole, DynamicOffset, F32Bits, F32Vec4, Im2ColNhwcMap, KernelIr, Layout, LocalDecl,
-    LocalRef, MemoryLevel, Numeric, Op,
-    QuantizedVecDotKind, Shape, StorageIndexMap, StorageView, TileBinaryOp, TileCompareOp,
-    TileDecl, Expr, TileIndexedStoreStmt, TileLevel, TileLinearLoadExpr,
-    TileLiteral, TileLoadExpr, TileOrigin, TileProgramOp, TileQuantizedLoadExpr,
-    TileReduceOp, TileRef, TileStmt, TileStoreStmt, TileUnaryOp, TileVec4LoadExpr,
-    WorkgroupAxis, WorkgroupOffset, F32, U32,
+    CoopFragmentId,
+    CoopOperandRole, F32Bits,
+    LocalRef, StorageView, TileBinaryOp, TileCompareOp, Expr,
+    TileLiteral, TileUnaryOp,
 };
 use crate::ir::ElementType;
-use crate::quantized::{GgmlQuantFormat, QuantizedMatrix};
-use super::*;
 
 /// Handle to an 8x8 cooperative-matrix accumulator local.
 #[derive(Copy, Clone)]
@@ -172,33 +166,27 @@ pub(super) fn index_compare<const N: usize>(left: Box<Expr>, op: TileCompareOp, 
     }
 }
 
-macro_rules! range_compare_methods {
+macro_rules! index_compare_methods {
     ($($name:ident => $op:ident),+ $(,)?) => {
-        $(
-            pub fn $name(&self, value: u32) -> Mask<N> {
-                index_compare(self.expr.clone(), TileCompareOp::$op, value)
-            }
-        )+
+        impl<const N: usize> Range<N> {
+            $(
+                pub fn $name(&self, value: u32) -> Mask<N> {
+                    index_compare(self.expr.clone(), TileCompareOp::$op, value)
+                }
+            )+
+        }
+
+        impl ScalarIndex {
+            $(
+                pub fn $name<const N: usize>(&self, value: u32) -> Mask<N> {
+                    index_compare(self.expr.clone(), TileCompareOp::$op, value)
+                }
+            )+
+        }
     };
 }
 
-macro_rules! scalar_index_compare_methods {
-    ($($name:ident => $op:ident),+ $(,)?) => {
-        $(
-            pub fn $name<const N: usize>(&self, value: u32) -> Mask<N> {
-                index_compare(self.expr.clone(), TileCompareOp::$op, value)
-            }
-        )+
-    };
-}
-
-impl<const N: usize> Range<N> {
-    range_compare_methods!(lt => Lt, le => Le, gt => Gt, ge => Ge, eq => Eq);
-}
-
-impl ScalarIndex {
-    scalar_index_compare_methods!(lt => Lt, le => Le, gt => Gt, ge => Ge, eq => Eq);
-}
+index_compare_methods!(lt => Lt, le => Le, gt => Gt, ge => Ge, eq => Eq);
 
 macro_rules! impl_index_u32_ops {
     (generic($($generics:tt)+), $ty:ty, $out:ty, $ctor:ident, $div_msg:literal, $mod_msg:literal) => {
