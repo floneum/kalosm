@@ -33,11 +33,10 @@ impl<'a> Lowerer<'a> {
         let bool_ty = Self::scalar_type(&mut module, Scalar::BOOL);
         let u32_vec3_ty = Self::vector_type(&mut module, VectorSize::Tri, Scalar::U32);
         let uses_cooperative_matrix = Self::uses_cooperative_matrix(ir);
-        let subgroup_usage = Self::subgroup_index_usage(ir);
-        let uses_subgroup_id = subgroup_usage.subgroup_id || uses_cooperative_matrix;
-        let uses_subgroup_invocation_id = subgroup_usage.subgroup_lane;
-        let uses_subgroup_size = subgroup_usage.subgroup_size;
-        let uses_num_subgroups = subgroup_usage.num_subgroups;
+        let mut subgroup_usage = Self::subgroup_index_usage(ir);
+        // Cooperative-matrix lowering needs a subgroup id even if the kernel
+        // never asks for one explicitly.
+        subgroup_usage.subgroup_id |= uses_cooperative_matrix;
 
         let coop_c_ty = uses_cooperative_matrix.then(|| {
             Self::type_with_inner(
@@ -78,10 +77,7 @@ impl<'a> Lowerer<'a> {
             loop_index_local: None,
             workgroup_invocations,
             workgroup_size,
-            uses_subgroup_id,
-            uses_subgroup_invocation_id,
-            uses_subgroup_size,
-            uses_num_subgroups,
+            subgroup_usage,
             block_dequant_cache: Default::default(),
             q8_activation_pack_cache: Default::default(),
             coop_c_ty,
@@ -114,10 +110,10 @@ impl<'a> Lowerer<'a> {
             builtin_arg(self.u32_vec3_ty, BuiltIn::WorkGroupId),
         ];
         let optional_subgroup_args = [
-            (self.uses_subgroup_id, BuiltIn::SubgroupId),
-            (self.uses_subgroup_invocation_id, BuiltIn::SubgroupInvocationId),
-            (self.uses_subgroup_size, BuiltIn::SubgroupSize),
-            (self.uses_num_subgroups, BuiltIn::NumSubgroups),
+            (self.subgroup_usage.subgroup_id, BuiltIn::SubgroupId),
+            (self.subgroup_usage.subgroup_lane, BuiltIn::SubgroupInvocationId),
+            (self.subgroup_usage.subgroup_size, BuiltIn::SubgroupSize),
+            (self.subgroup_usage.num_subgroups, BuiltIn::NumSubgroups),
         ];
         for (used, builtin) in optional_subgroup_args {
             if used {
@@ -156,7 +152,7 @@ impl<'a> Lowerer<'a> {
         if self.f16_ty.is_some() {
             capabilities |= naga::valid::Capabilities::SHADER_FLOAT16;
         }
-        if Self::uses_subgroup_reduce(self.ir) || self.uses_subgroup_id {
+        if Self::uses_subgroup_reduce(self.ir) || self.subgroup_usage.subgroup_id {
             capabilities |= naga::valid::Capabilities::SUBGROUP;
         }
         if self.uses_cooperative_matrix {
