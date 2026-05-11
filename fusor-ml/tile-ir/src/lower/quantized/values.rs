@@ -130,10 +130,7 @@ impl<'a> Lowerer<'a> {
         parts: &Q8_0BlockParts,
     ) -> [Handle<Expression>; 8] {
         std::array::from_fn(|lane| {
-            let byte_lane = expressions.append(
-                Expression::Literal(Literal::U32((lane % 4) as u32)),
-                Span::default(),
-            );
+            let byte_lane = self.u32(expressions, (lane % 4) as u32);
             let word = parts.words[usize::from(lane >= 4)];
             let byte = self.byte_at(expressions, body, word, byte_lane);
             self.signed_byte_f32(expressions, body, byte)
@@ -196,10 +193,7 @@ impl<'a> Lowerer<'a> {
 
         let mut values = Vec::with_capacity(8);
         for lane in 0..8 {
-            let byte_lane = expressions.append(
-                Expression::Literal(Literal::U32((lane % 4) as u32)),
-                Span::default(),
-            );
+            let byte_lane = self.u32(expressions, (lane % 4) as u32);
             let word = if lane < 4 { word0 } else { word1 };
             let byte = self.byte_at(expressions, body, word, byte_lane);
             let byte_hi = self.shr_lit(expressions, body, byte, 4);
@@ -260,10 +254,7 @@ impl<'a> Lowerer<'a> {
 
         let mut values = Vec::with_capacity(16);
         for lane in 0..16 {
-            let byte_lane = expressions.append(
-                Expression::Literal(Literal::U32((lane % 4) as u32)),
-                Span::default(),
-            );
+            let byte_lane = self.u32(expressions, (lane % 4) as u32);
             let byte = self.byte_at(expressions, body, words[lane / 4], byte_lane);
             let low = self.and_lit(expressions, body, byte, 0x0f);
             let high4 = self.shr_lit(expressions, body, byte, 4);
@@ -395,10 +386,7 @@ impl<'a> Lowerer<'a> {
         parts: &Q6KBlockParts,
         lane: usize,
     ) -> Handle<Expression> {
-        let byte_lane = expressions.append(
-            Expression::Literal(Literal::U32((lane % 4) as u32)),
-            Span::default(),
-        );
+        let byte_lane = self.u32(expressions, (lane % 4) as u32);
         let low_word = parts.low_words[usize::from(lane >= 4)];
         let low_byte = self.byte_at(expressions, body, low_word, byte_lane);
         let low_shifted = self.shr(expressions, body, low_byte, parts.low_shift);
