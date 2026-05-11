@@ -24,21 +24,11 @@ pub struct KernelTensorRef<B> {
 
 impl<B> KernelTensorRef<B> {
     pub fn new(binding: B, layout: Layout) -> Self {
-        Self {
-            binding,
-            layout,
-            offset: 0,
-            index_map: None,
-        }
+        Self::with_offset_and_index_map(binding, layout, 0, None)
     }
 
     pub fn with_offset(binding: B, layout: Layout, offset: u32) -> Self {
-        Self {
-            binding,
-            layout,
-            offset,
-            index_map: None,
-        }
+        Self::with_offset_and_index_map(binding, layout, offset, None)
     }
 
     pub fn with_offset_and_index_map(
@@ -47,12 +37,7 @@ impl<B> KernelTensorRef<B> {
         offset: u32,
         index_map: Option<StorageIndexMap>,
     ) -> Self {
-        Self {
-            binding,
-            layout,
-            offset,
-            index_map,
-        }
+        Self { binding, layout, offset, index_map }
     }
 }
 
