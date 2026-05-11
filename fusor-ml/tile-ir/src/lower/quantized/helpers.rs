@@ -411,17 +411,7 @@ impl<'a> Lowerer<'a> {
         left: Handle<Expression>,
         right: Handle<Expression>,
     ) -> Handle<Expression> {
-        let dot = self.emit(
-            e,
-            body,
-            Expression::Math {
-                fun: MathFunction::Dot4I8Packed,
-                arg: left,
-                arg1: Some(right),
-                arg2: None,
-                arg3: None,
-            },
-        );
+        let dot = self.math2(e, body, MathFunction::Dot4I8Packed, left, right);
         self.as_f32(e, body, dot)
     }
 
