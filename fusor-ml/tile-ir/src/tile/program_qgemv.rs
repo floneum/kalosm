@@ -14,7 +14,10 @@ use crate::dispatch::{
 use crate::quantized::{GgmlQuantFormat, QuantizedMatrix};
 use super::*;
 use super::types::matrix_shape;
-use super::grid::{qgemv_grid, store_qgemv_sums, q4k_ggml_activations, dot4_sum};
+use super::grid::{
+    dot4_sum, q4k_ggml_activations, q4k_lane_decomposition, qgemv_grid, store_qgemv_sums,
+    Q4KLane,
+};
 
 macro_rules! q4k_paired_entrypoints {
     ($(($name:ident, $subgroups:literal, $pairs:literal, $dots:literal, $block:literal)),+ $(,)?) => {
@@ -236,10 +239,7 @@ impl Program {
             let subgroup_col_base = program.subgroup_id() * COLS_PER_SUBGROUP as u32;
             let col0 = col_group_base + subgroup_col_base;
             let lane = program.subgroup_lane();
-            let ix = lane.clone() / 8;
-            let it = lane.clone() % 8;
-            let iq = it.clone() / 4;
-            let ir = it % 4;
+            let Q4KLane { ix, iq, ir } = q4k_lane_decomposition(&lane);
 
             let zero = TileLiteral::F32(F32Bits::new(0.0));
             let sums: [Tile<BLOCK>; COLS_PER_SUBGROUP] = program
@@ -337,10 +337,7 @@ impl Program {
             let subgroup_col_base = program.subgroup_id() * PAIRS_PER_SUBGROUP as u32;
             let col0 = col_group_base + subgroup_col_base;
             let lane = program.subgroup_lane();
-            let ix = lane.clone() / 8;
-            let it = lane.clone() % 8;
-            let iq = it.clone() / 4;
-            let ir = it % 4;
+            let Q4KLane { ix, iq, ir } = q4k_lane_decomposition(&lane);
 
             let zero = TileLiteral::F32(F32Bits::new(0.0));
             let sums: [Tile<BLOCK>; DOTS_PER_SUBGROUP] = program

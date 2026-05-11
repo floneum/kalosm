@@ -112,6 +112,24 @@ pub(super) fn q4k_ggml_activations<const BLOCK: usize>(
     }
 }
 
+/// Q4K subgroup-lane decomposition shared by `qgemv_q4k_ggml` and
+/// `qgemv_q4k_paired_ggml`. Splits a 32-wide subgroup into a 4x8 grid where
+/// `ix = lane / 8` selects one of 4 K-blocks per workgroup pass and
+/// `(iq, ir) = (it / 4, it % 4)` indexes into the 8-byte sub-block.
+pub(super) struct Q4KLane {
+    pub ix: ScalarIndex,
+    pub iq: ScalarIndex,
+    pub ir: ScalarIndex,
+}
+
+pub(super) fn q4k_lane_decomposition(lane: &ScalarIndex) -> Q4KLane {
+    let ix = lane.clone() / 8;
+    let it = lane.clone() % 8;
+    let iq = it.clone() / 4;
+    let ir = it % 4;
+    Q4KLane { ix, iq, ir }
+}
+
 pub(super) fn dot4_sum<const BLOCK: usize, const VALUES: usize>(
     program: &TileBlock<'_, BLOCK>,
     a: &[Tile<BLOCK>; VALUES],
