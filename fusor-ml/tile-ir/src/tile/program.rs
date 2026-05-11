@@ -652,8 +652,7 @@ impl Program {
         layout: Layout,
         access: BufferAccess,
     ) -> BufferRef {
-        let id = crate::BufferId(self.next_buffer);
-        self.next_buffer += 1;
+        let id = crate::BufferId(post_inc(&mut self.next_buffer));
         let buffer = BufferRef::new(id, element);
         self.ir.buffers.push(BufferDecl {
             id,
@@ -665,15 +664,11 @@ impl Program {
     }
 
     pub(super) fn next_block_dequant_id(&mut self) -> BlockDequantId {
-        let id = BlockDequantId(self.next_block_dequant);
-        self.next_block_dequant += 1;
-        id
+        BlockDequantId(post_inc(&mut self.next_block_dequant))
     }
 
     pub(super) fn next_coop_fragment_id(&mut self) -> CoopFragmentId {
-        let id = CoopFragmentId(self.next_coop_fragment);
-        self.next_coop_fragment += 1;
-        id
+        CoopFragmentId(post_inc(&mut self.next_coop_fragment))
     }
 
     pub(super) fn alloc_local<T: Numeric>(&mut self) -> LocalRef {
@@ -681,8 +676,7 @@ impl Program {
     }
 
     pub(super) fn alloc_local_element(&mut self, element: crate::ElementType) -> LocalRef {
-        let id = crate::LocalId(self.next_local);
-        self.next_local += 1;
+        let id = crate::LocalId(post_inc(&mut self.next_local));
         let local = LocalRef::new(id, element);
         self.ir.locals.push(local);
         local
@@ -705,8 +699,7 @@ impl Program {
     }
 
     pub(super) fn alloc_tile<T: Numeric>(&mut self, layout: Layout) -> TileRef {
-        let id = crate::TileId(self.next_tile);
-        self.next_tile += 1;
+        let id = crate::TileId(post_inc(&mut self.next_tile));
         let tile = TileRef::new(id, T::ELEMENT);
         self.ir.tiles.push(TileDecl {
             id,
@@ -715,4 +708,12 @@ impl Program {
         });
         tile
     }
+}
+
+/// Returns the current value and post-increments. The builder uses this for
+/// every fresh `BufferId` / `TileId` / `LocalId` / SSA id.
+fn post_inc(counter: &mut u32) -> u32 {
+    let value = *counter;
+    *counter += 1;
+    value
 }
