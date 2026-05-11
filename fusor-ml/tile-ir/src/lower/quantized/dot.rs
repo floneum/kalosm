@@ -6,11 +6,10 @@ impl<'a> Lowerer<'a> {
         expressions: &mut Arena<Expression>,
         matrix: &QuantizedMatrix,
         coords: GgmlBlockCoords,
-        a_low: &[Handle<Expression>],
-        a_high: &[Handle<Expression>],
-        sums: &[Handle<Expression>],
+        activations: Q4KGgmlActivationHandles<'_>,
         body: &mut Block,
     ) -> Result<Handle<Expression>, LowerError> {
+        let Q4KGgmlActivationHandles { low: a_low, high: a_high, sums } = activations;
         if matrix.format != GgmlQuantFormat::Q4K
             || a_low.len() != 16
             || a_high.len() != 16

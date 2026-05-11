@@ -35,6 +35,15 @@ pub(in crate::lower) struct Q4KQuantBlock<const N: usize> {
     pub data: [Handle<Expression>; N],
 }
 
+/// Activation handles consumed by the Q4K ggml dot lowering: 16 low-nibble
+/// loads, 16 high-nibble loads, and 4 per-pair sums. Bundled to keep
+/// `q4k_ggml_dot` from carrying three parallel slice arguments.
+pub(in crate::lower) struct Q4KGgmlActivationHandles<'a> {
+    pub low: &'a [Handle<Expression>],
+    pub high: &'a [Handle<Expression>],
+    pub sums: &'a [Handle<Expression>],
+}
+
 /// Resolved `(block, c0, c1, col)` coordinates for a Q4K/Q6K ggml dot helper.
 /// Q4K uses `(iq, ir)` for `(c0, c1)`; Q6K uses `(ip, il)`.
 pub(in crate::lower) struct GgmlBlockCoords {

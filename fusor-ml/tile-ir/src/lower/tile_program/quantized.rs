@@ -144,9 +144,11 @@ impl<'a> Lowerer<'a> {
                             expressions,
                             src,
                             coords,
-                            &low_handles,
-                            &high_handles,
-                            &sum_handles,
+                            crate::lower::quantized::Q4KGgmlActivationHandles {
+                                low: &low_handles,
+                                high: &high_handles,
+                                sums: &sum_handles,
+                            },
                             block_body,
                         )
                     },
