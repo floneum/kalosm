@@ -30,27 +30,15 @@ impl<'a> Lowerer<'a> {
         if literal == 0 {
             return value;
         }
-        if let Some(value) = Self::u32_literal(expressions, value) {
-            return expressions.append(
-                Expression::Literal(Literal::U32(value + literal)),
-                Span::default(),
-            );
+        if let Some(folded) = Self::u32_literal(expressions, value) {
+            return Self::append_u32_literal(expressions, folded + literal);
         }
-        let literal =
-            expressions.append(Expression::Literal(Literal::U32(literal)), Span::default());
-        let value = expressions.append(
-            Expression::Binary {
-                op: BinaryOperator::Add,
-                left: value,
-                right: literal,
-            },
-            Span::default(),
-        );
-        body.push(
-            Statement::Emit(Self::single_expression_range(expressions, value)),
-            Span::default(),
-        );
-        value
+        let rhs = Self::append_u32_literal(expressions, literal);
+        self.emit_tile_expr(expressions, body, Expression::Binary {
+            op: BinaryOperator::Add,
+            left: value,
+            right: rhs,
+        })
     }
 
     pub(super) fn mul_literal_u32_emitted(
@@ -63,27 +51,15 @@ impl<'a> Lowerer<'a> {
         if literal == 1 {
             return value;
         }
-        if let Some(value) = Self::u32_literal(expressions, value) {
-            return expressions.append(
-                Expression::Literal(Literal::U32(value * literal)),
-                Span::default(),
-            );
+        if let Some(folded) = Self::u32_literal(expressions, value) {
+            return Self::append_u32_literal(expressions, folded * literal);
         }
-        let literal =
-            expressions.append(Expression::Literal(Literal::U32(literal)), Span::default());
-        let value = expressions.append(
-            Expression::Binary {
-                op: BinaryOperator::Multiply,
-                left: value,
-                right: literal,
-            },
-            Span::default(),
-        );
-        body.push(
-            Statement::Emit(Self::single_expression_range(expressions, value)),
-            Span::default(),
-        );
-        value
+        let rhs = Self::append_u32_literal(expressions, literal);
+        self.emit_tile_expr(expressions, body, Expression::Binary {
+            op: BinaryOperator::Multiply,
+            left: value,
+            right: rhs,
+        })
     }
 
     pub(super) fn div_literal_u32_emitted(
@@ -96,42 +72,18 @@ impl<'a> Lowerer<'a> {
         if literal == 1 {
             return value;
         }
-        if let Some(value) = Self::u32_literal(expressions, value) {
-            return expressions.append(
-                Expression::Literal(Literal::U32(value / literal)),
-                Span::default(),
-            );
+        if let Some(folded) = Self::u32_literal(expressions, value) {
+            return Self::append_u32_literal(expressions, folded / literal);
         }
-        let value = if literal.is_power_of_two() {
-            let shift = expressions.append(
-                Expression::Literal(Literal::U32(literal.trailing_zeros())),
-                Span::default(),
-            );
-            expressions.append(
-                Expression::Binary {
-                    op: BinaryOperator::ShiftRight,
-                    left: value,
-                    right: shift,
-                },
-                Span::default(),
+        let (op, rhs) = if literal.is_power_of_two() {
+            (
+                BinaryOperator::ShiftRight,
+                Self::append_u32_literal(expressions, literal.trailing_zeros()),
             )
         } else {
-            let literal =
-                expressions.append(Expression::Literal(Literal::U32(literal)), Span::default());
-            expressions.append(
-                Expression::Binary {
-                    op: BinaryOperator::Divide,
-                    left: value,
-                    right: literal,
-                },
-                Span::default(),
-            )
+            (BinaryOperator::Divide, Self::append_u32_literal(expressions, literal))
         };
-        body.push(
-            Statement::Emit(Self::single_expression_range(expressions, value)),
-            Span::default(),
-        );
-        value
+        self.emit_tile_expr(expressions, body, Expression::Binary { op, left: value, right: rhs })
     }
 
     pub(super) fn mod_literal_u32_emitted(
@@ -142,43 +94,20 @@ impl<'a> Lowerer<'a> {
         body: &mut Block,
     ) -> Handle<Expression> {
         if literal == 1 {
-            return expressions.append(Expression::Literal(Literal::U32(0)), Span::default());
+            return Self::append_u32_literal(expressions, 0);
         }
-        if let Some(value) = Self::u32_literal(expressions, value) {
-            return expressions.append(
-                Expression::Literal(Literal::U32(value % literal)),
-                Span::default(),
-            );
+        if let Some(folded) = Self::u32_literal(expressions, value) {
+            return Self::append_u32_literal(expressions, folded % literal);
         }
-        let value = if literal.is_power_of_two() {
-            let mask = expressions.append(
-                Expression::Literal(Literal::U32(literal - 1)),
-                Span::default(),
-            );
-            expressions.append(
-                Expression::Binary {
-                    op: BinaryOperator::And,
-                    left: value,
-                    right: mask,
-                },
-                Span::default(),
-            )
+        let (op, rhs) = if literal.is_power_of_two() {
+            (BinaryOperator::And, Self::append_u32_literal(expressions, literal - 1))
         } else {
-            let literal =
-                expressions.append(Expression::Literal(Literal::U32(literal)), Span::default());
-            expressions.append(
-                Expression::Binary {
-                    op: BinaryOperator::Modulo,
-                    left: value,
-                    right: literal,
-                },
-                Span::default(),
-            )
+            (BinaryOperator::Modulo, Self::append_u32_literal(expressions, literal))
         };
-        body.push(
-            Statement::Emit(Self::single_expression_range(expressions, value)),
-            Span::default(),
-        );
-        value
+        self.emit_tile_expr(expressions, body, Expression::Binary { op, left: value, right: rhs })
+    }
+
+    fn append_u32_literal(expressions: &mut Arena<Expression>, value: u32) -> Handle<Expression> {
+        expressions.append(Expression::Literal(Literal::U32(value)), Span::default())
     }
 }
