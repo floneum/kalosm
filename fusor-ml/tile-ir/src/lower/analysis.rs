@@ -191,7 +191,6 @@ impl<'a> Lowerer<'a> {
             Expr::Unary { value, .. }
             | Expr::Cast { value, .. }
             | Expr::Bitcast { value, .. }
-            | Expr::GroupReduce { value, .. }
             | Expr::SubgroupReduce { value, .. } => pred(value),
             Expr::Binary { left, right, .. }
             | Expr::Compare { left, right, .. }
@@ -268,7 +267,7 @@ impl<'a> Lowerer<'a> {
     fn mark_tile_expr_live(ir: &KernelIr, expr: &Expr, live: &mut [bool]) {
         match expr {
             Expr::LoadWorkgroup { src, .. } => Self::mark_tile_live(ir, *src, live),
-            Expr::Reduce { scratch, .. } | Expr::GroupReduce { scratch, .. } => {
+            Expr::Reduce { scratch, .. } => {
                 Self::mark_tile_live(ir, *scratch, live);
             }
             _ => {}

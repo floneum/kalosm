@@ -567,9 +567,6 @@ impl<'a> Lowerer<'a> {
             Expr::Binary { .. } => false,
             Expr::Compare { output, .. } => *output == ElementType::F16,
             Expr::Select { .. } => false,
-            Expr::GroupReduce { value, scratch, .. } => {
-                scratch.element == ElementType::F16 || Self::tile_expr_uses_f16(value)
-            }
             Expr::SubgroupReduce { .. }
             | Expr::QuantizedBlockLane { .. }
             | Expr::Vec4Dot { .. }

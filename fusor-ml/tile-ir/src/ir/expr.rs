@@ -42,16 +42,17 @@ pub enum Expr {
     /// builtins). Indexing arithmetic uses `Expr::Binary` over `Builtin`
     /// leaves and `Literal(U32(_))` constants.
     Builtin(Builtin),
-    /// Reduce a tile expression to a single scalar. When `iterations > 1`,
-    /// `value` is first accumulated across that many loop iterations; the
-    /// result is then collapsed across the workgroup via a shared-memory tree
-    /// over `scratch`. `iterations == 1` skips the loop and lowers as a
-    /// single-pass workgroup reduction.
+    /// Reduce a tile expression via a shared-memory tree over `scratch`.
+    /// `group_size` is the contiguous-lane group reduced together — typically
+    /// the full workgroup, but smaller power-of-two groups are supported. When
+    /// `iterations > 1`, `value` is first accumulated across that many loop
+    /// iterations per lane before the cross-lane tree.
     Reduce {
         op: TileReduceOp,
         iterations: u32,
         value: Box<Expr>,
         scratch: TileRef,
+        group_size: u32,
     },
     Unary {
         op: TileUnaryOp,
@@ -80,12 +81,6 @@ pub enum Expr {
         left: Box<Expr>,
         right: Box<Expr>,
         output: ElementType,
-    },
-    GroupReduce {
-        op: TileReduceOp,
-        value: Box<Expr>,
-        scratch: TileRef,
-        group_size: u32,
     },
     /// Reduction across the lanes of one subgroup. Lowers to
     /// `subgroupAdd`/`subgroupMax`/`subgroupMin` — no shared-memory tree, no

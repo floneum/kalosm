@@ -41,6 +41,7 @@ impl<'a> Lowerer<'a> {
                 iterations,
                 value,
                 scratch: scratch_tile,
+                group_size,
             } => {
                 let value = if *iterations == 1 {
                     self.lower_tile_expr_lane(expressions, scratch, body, value, spill_depth)?
@@ -61,7 +62,7 @@ impl<'a> Lowerer<'a> {
                     value,
                     *scratch_tile,
                     *op,
-                    self.workgroup_invocations,
+                    *group_size,
                 )
             }
             Expr::Unary { op, value } => {
@@ -174,23 +175,6 @@ impl<'a> Lowerer<'a> {
                         reject: zero,
                     },
                 ))
-            }
-            Expr::GroupReduce {
-                op,
-                value,
-                scratch: scratch_tile,
-                group_size,
-            } => {
-                let value =
-                    self.lower_tile_expr_lane(expressions, scratch, body, value, spill_depth)?;
-                self.lower_tile_reduce_value(
-                    expressions,
-                    body,
-                    value,
-                    *scratch_tile,
-                    *op,
-                    *group_size,
-                )
             }
             Expr::SubgroupReduce { op, value } => {
                 let element = self.tile_expr_element(value)?;

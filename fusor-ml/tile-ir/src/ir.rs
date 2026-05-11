@@ -106,7 +106,6 @@ impl KernelIr {
             Expr::Bitcast { to, .. } => *to,
             Expr::Select { accept, .. } => self.tile_expr_element(accept),
             Expr::Compare { output, .. } => *output,
-            Expr::GroupReduce { scratch, .. } => scratch.element,
             Expr::SubgroupReduce { value, .. } => self.tile_expr_element(value),
             Expr::QuantizedBlockLane { .. } => ElementType::F32,
             Expr::Vec4Dot { .. } | Expr::QuantizedDot { .. } => ElementType::F32,

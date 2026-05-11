@@ -713,8 +713,9 @@ impl<const BLOCK: usize> TileBlock<'_, BLOCK> {
             Shape::new([BLOCK as u32]),
         ));
         Tile {
-            expr: Expr::GroupReduce {
+            expr: Expr::Reduce {
                 op,
+                iterations: 1,
                 value: Box::new(value.expr),
                 scratch,
                 group_size: GROUP as u32,
@@ -738,6 +739,7 @@ impl<const BLOCK: usize> TileBlock<'_, BLOCK> {
                 iterations,
                 value: Box::new(value.expr),
                 scratch,
+                group_size: BLOCK as u32,
             },
         }
     }
