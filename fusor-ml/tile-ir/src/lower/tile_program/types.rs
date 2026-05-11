@@ -25,31 +25,15 @@ impl<'a> Lowerer<'a> {
         left: Handle<Expression>,
         right: Handle<Expression>,
     ) -> Expression {
+        Self::tile_binary_expression(Self::tile_reduce_binary(op), left, right)
+    }
+
+    pub(in crate::lower) fn tile_reduce_binary(op: TileReduceOp) -> TileBinaryOp {
         match op {
-            TileReduceOp::Sum => Expression::Binary {
-                op: BinaryOperator::Add,
-                left,
-                right,
-            },
-            TileReduceOp::Product => Expression::Binary {
-                op: BinaryOperator::Multiply,
-                left,
-                right,
-            },
-            TileReduceOp::Max => Expression::Math {
-                fun: MathFunction::Max,
-                arg: left,
-                arg1: Some(right),
-                arg2: None,
-                arg3: None,
-            },
-            TileReduceOp::Min => Expression::Math {
-                fun: MathFunction::Min,
-                arg: left,
-                arg1: Some(right),
-                arg2: None,
-                arg3: None,
-            },
+            TileReduceOp::Sum => TileBinaryOp::Add,
+            TileReduceOp::Product => TileBinaryOp::Mul,
+            TileReduceOp::Max => TileBinaryOp::Max,
+            TileReduceOp::Min => TileBinaryOp::Min,
         }
     }
 
@@ -170,79 +154,34 @@ impl<'a> Lowerer<'a> {
         left: Handle<Expression>,
         right: Handle<Expression>,
     ) -> Expression {
-        match op {
-            TileBinaryOp::Add => Expression::Binary {
-                op: BinaryOperator::Add,
-                left,
-                right,
-            },
-            TileBinaryOp::Sub => Expression::Binary {
-                op: BinaryOperator::Subtract,
-                left,
-                right,
-            },
-            TileBinaryOp::Mul => Expression::Binary {
-                op: BinaryOperator::Multiply,
-                left,
-                right,
-            },
-            TileBinaryOp::Div => Expression::Binary {
-                op: BinaryOperator::Divide,
-                left,
-                right,
-            },
-            TileBinaryOp::Rem => Expression::Binary {
-                op: BinaryOperator::Modulo,
-                left,
-                right,
-            },
-            TileBinaryOp::Pow => Expression::Math {
-                fun: MathFunction::Pow,
-                arg: left,
-                arg1: Some(right),
-                arg2: None,
-                arg3: None,
-            },
-            TileBinaryOp::Min => Expression::Math {
-                fun: MathFunction::Min,
-                arg: left,
-                arg1: Some(right),
-                arg2: None,
-                arg3: None,
-            },
-            TileBinaryOp::Max => Expression::Math {
-                fun: MathFunction::Max,
-                arg: left,
-                arg1: Some(right),
-                arg2: None,
-                arg3: None,
-            },
-            TileBinaryOp::BitAnd => Expression::Binary {
-                op: BinaryOperator::And,
-                left,
-                right,
-            },
-            TileBinaryOp::BitOr => Expression::Binary {
-                op: BinaryOperator::InclusiveOr,
-                left,
-                right,
-            },
-            TileBinaryOp::BitXor => Expression::Binary {
-                op: BinaryOperator::ExclusiveOr,
-                left,
-                right,
-            },
-            TileBinaryOp::LogicalAnd => Expression::Binary {
-                op: BinaryOperator::LogicalAnd,
-                left,
-                right,
-            },
-            TileBinaryOp::LogicalOr => Expression::Binary {
-                op: BinaryOperator::LogicalOr,
-                left,
-                right,
-            },
-        }
+        let naga_op = match op {
+            TileBinaryOp::Add => BinaryOperator::Add,
+            TileBinaryOp::Sub => BinaryOperator::Subtract,
+            TileBinaryOp::Mul => BinaryOperator::Multiply,
+            TileBinaryOp::Div => BinaryOperator::Divide,
+            TileBinaryOp::Rem => BinaryOperator::Modulo,
+            TileBinaryOp::BitAnd => BinaryOperator::And,
+            TileBinaryOp::BitOr => BinaryOperator::InclusiveOr,
+            TileBinaryOp::BitXor => BinaryOperator::ExclusiveOr,
+            TileBinaryOp::LogicalAnd => BinaryOperator::LogicalAnd,
+            TileBinaryOp::LogicalOr => BinaryOperator::LogicalOr,
+            TileBinaryOp::Pow | TileBinaryOp::Min | TileBinaryOp::Max => {
+                let fun = match op {
+                    TileBinaryOp::Pow => MathFunction::Pow,
+                    TileBinaryOp::Min => MathFunction::Min,
+                    TileBinaryOp::Max => MathFunction::Max,
+                    _ => unreachable!(),
+                };
+                return Expression::Math {
+                    fun,
+                    arg: left,
+                    arg1: Some(right),
+                    arg2: None,
+                    arg3: None,
+                };
+            }
+        };
+        Expression::Binary { op: naga_op, left, right }
     }
 
     pub(in crate::lower) fn tile_compare_binary(op: TileCompareOp) -> BinaryOperator {
