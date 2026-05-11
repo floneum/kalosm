@@ -150,14 +150,13 @@ pub enum BufferAccess {
     ReadWrite,
 }
 
-/// A typed workgroup tile declaration.
+/// A typed workgroup tile declaration. Tiles are always workgroup-level and
+/// always own their storage — the IR has no other shape today.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TileDecl {
     pub id: TileId,
     pub element: ElementType,
     pub layout: Layout,
-    pub level: TileLevel,
-    pub origin: TileOrigin,
 }
 
 /// A typed reference to a tile declaration.
@@ -627,4 +626,4 @@ pub use expr::{
 };
 
 mod layout;
-pub use layout::{Layout, MemoryLevel, Shape, Strides, TileLevel, TileOrigin};
+pub use layout::{Layout, MemoryLevel, Shape, Strides};

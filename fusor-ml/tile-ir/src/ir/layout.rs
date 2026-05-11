@@ -190,14 +190,3 @@ pub enum MemoryLevel {
     Private,
 }
 
-/// The execution hierarchy level that owns a tile.
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub enum TileLevel {
-    Workgroup,
-}
-
-/// Whether a tile declaration owns storage.
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub enum TileOrigin {
-    Allocation,
-}

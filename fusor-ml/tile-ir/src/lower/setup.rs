@@ -238,9 +238,7 @@ impl<'a> Lowerer<'a> {
             {
                 continue;
             }
-            if tile.layout.memory_level() != MemoryLevel::Workgroup
-                || tile.origin != TileOrigin::Allocation
-            {
+            if tile.layout.memory_level() != MemoryLevel::Workgroup {
                 continue;
             }
             let ty = self.tile_type(tile.element, &tile.layout);
@@ -273,9 +271,7 @@ impl<'a> Lowerer<'a> {
             {
                 continue;
             }
-            if tile.layout.memory_level() != MemoryLevel::Private
-                || tile.origin != TileOrigin::Allocation
-            {
+            if tile.layout.memory_level() != MemoryLevel::Private {
                 continue;
             }
             let ty = self.tile_type(tile.element, &tile.layout);

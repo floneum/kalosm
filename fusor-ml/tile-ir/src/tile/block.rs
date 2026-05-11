@@ -3,7 +3,7 @@ use std::marker::PhantomData;
 
 use crate::ir::{
     Builtin, CoopOperandRole, DotK, ElementType, Expr, F32Bits, F32Vec4, Layout, LocalRef,
-    MemoryLevel, Numeric, PackedActivations, Shape, TileBinaryOp, TileIndexedStoreStmt, TileLevel,
+    MemoryLevel, Numeric, PackedActivations, Shape, TileBinaryOp, TileIndexedStoreStmt,
     TileLinearLoadExpr, TileLiteral, TileLoadExpr, TileQuantizedLoadExpr, TileReduceOp, TileRef,
     TileStmt, TileStoreStmt, TileUnaryOp, WorkgroupAxis, F32, U32,
 };
@@ -708,10 +708,10 @@ impl<const BLOCK: usize> TileBlock<'_, BLOCK> {
             GROUP > 0 && GROUP <= BLOCK && GROUP.is_power_of_two() && BLOCK % GROUP == 0,
             "tile group reduction size must be a power-of-two divisor of the block"
         );
-        let scratch = self.program.alloc_tile::<F32>(
-            Layout::contiguous(MemoryLevel::Workgroup, Shape::new([BLOCK as u32])),
-            TileLevel::Workgroup,
-        );
+        let scratch = self.program.alloc_tile::<F32>(Layout::contiguous(
+            MemoryLevel::Workgroup,
+            Shape::new([BLOCK as u32]),
+        ));
         Tile {
             expr: Expr::GroupReduce {
                 op,
@@ -728,10 +728,10 @@ impl<const BLOCK: usize> TileBlock<'_, BLOCK> {
 
     fn loop_reduce(&mut self, op: TileReduceOp, iterations: u32, value: Tile<BLOCK>) -> Scalar {
         assert!(iterations > 0, "loop reduce iterations must be non-zero");
-        let scratch = self.program.alloc_tile::<F32>(
-            Layout::contiguous(MemoryLevel::Workgroup, Shape::new([BLOCK as u32])),
-            TileLevel::Workgroup,
-        );
+        let scratch = self.program.alloc_tile::<F32>(Layout::contiguous(
+            MemoryLevel::Workgroup,
+            Shape::new([BLOCK as u32]),
+        ));
         Scalar {
             expr: Expr::Reduce {
                 op,

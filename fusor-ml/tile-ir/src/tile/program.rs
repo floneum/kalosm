@@ -3,8 +3,8 @@ use std::marker::PhantomData;
 use crate::ir::{
     BlockDequantId, BufferAccess, BufferDecl, BufferRef, CoopFragmentId, F32Bits, KernelIr, Layout, LocalDecl,
     LocalRef, MemoryLevel, Numeric, Shape, StorageIndexMap, StorageView,
-    TileDecl, TileLevel,
-    TileLiteral, TileOrigin, TileProgramOp,
+    TileDecl,
+    TileLiteral, TileProgramOp,
     TileReduceOp, TileRef,
     WorkgroupAxis, F32, U32,
 };
@@ -692,21 +692,21 @@ impl Program {
 
     /// Allocate a workgroup-scope f32 tile of shape `[rows, cols]`.
     pub fn alloc_workgroup_tile_f32(&mut self, rows: u32, cols: u32) -> TileRef {
-        self.alloc_tile::<F32>(
-            Layout::contiguous(MemoryLevel::Workgroup, Shape::new([rows, cols])),
-            TileLevel::Workgroup,
-        )
+        self.alloc_tile::<F32>(Layout::contiguous(
+            MemoryLevel::Workgroup,
+            Shape::new([rows, cols]),
+        ))
     }
 
     /// Allocate a rank-1 workgroup-scope scratch array.
     pub fn alloc_workgroup_array<T: Numeric>(&mut self, len: u32) -> TileRef {
-        self.alloc_tile::<T>(
-            Layout::contiguous(MemoryLevel::Workgroup, Shape::new([len])),
-            TileLevel::Workgroup,
-        )
+        self.alloc_tile::<T>(Layout::contiguous(
+            MemoryLevel::Workgroup,
+            Shape::new([len]),
+        ))
     }
 
-    pub(super) fn alloc_tile<T: Numeric>(&mut self, layout: Layout, level: TileLevel) -> TileRef {
+    pub(super) fn alloc_tile<T: Numeric>(&mut self, layout: Layout) -> TileRef {
         let id = crate::TileId(self.next_tile);
         self.next_tile += 1;
         let tile = TileRef::new(id, T::ELEMENT);
@@ -714,8 +714,6 @@ impl Program {
             id,
             element: T::ELEMENT,
             layout,
-            level,
-            origin: TileOrigin::Allocation,
         });
         tile
     }
