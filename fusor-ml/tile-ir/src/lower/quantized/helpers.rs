@@ -565,15 +565,7 @@ impl<'a> Lowerer<'a> {
         body: &mut Block,
         value: Handle<Expression>,
     ) -> Handle<Expression> {
-        self.emit(
-            e,
-            body,
-            Expression::As {
-                expr: value,
-                kind: ScalarKind::Sint,
-                convert: Some(4),
-            },
-        )
+        self.cast_as(e, body, value, ScalarKind::Sint, Some(4))
     }
 
     pub(in crate::lower) fn as_f32(
@@ -582,15 +574,7 @@ impl<'a> Lowerer<'a> {
         body: &mut Block,
         value: Handle<Expression>,
     ) -> Handle<Expression> {
-        self.emit(
-            e,
-            body,
-            Expression::As {
-                expr: value,
-                kind: ScalarKind::Float,
-                convert: Some(4),
-            },
-        )
+        self.cast_as(e, body, value, ScalarKind::Float, Some(4))
     }
 
     pub(in crate::lower) fn bitcast_f32(
@@ -599,15 +583,20 @@ impl<'a> Lowerer<'a> {
         body: &mut Block,
         value: Handle<Expression>,
     ) -> Handle<Expression> {
-        self.emit(
-            e,
-            body,
-            Expression::As {
-                expr: value,
-                kind: ScalarKind::Float,
-                convert: None,
-            },
-        )
+        self.cast_as(e, body, value, ScalarKind::Float, None)
+    }
+
+    /// Emit `Expression::As`. Wraps the convert/no-convert variants used by
+    /// `as_i32`, `as_f32`, and `bitcast_f32`.
+    fn cast_as(
+        &self,
+        e: &mut Arena<Expression>,
+        body: &mut Block,
+        value: Handle<Expression>,
+        kind: ScalarKind,
+        convert: Option<naga::Bytes>,
+    ) -> Handle<Expression> {
+        self.emit(e, body, Expression::As { expr: value, kind, convert })
     }
 
     pub(in crate::lower) fn u32(&self, e: &mut Arena<Expression>, value: u32) -> Handle<Expression> {
