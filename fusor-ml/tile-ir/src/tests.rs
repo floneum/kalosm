@@ -17,11 +17,6 @@ fn ggml_quant_formats() -> [GgmlQuantFormat; 12] {
     ]
 }
 
-fn assert_only_tile_programs(_ir: &KernelIr) {
-    // The IR body is now a single `TileProgramOp` by construction, so this is
-    // a no-op kept for parity with old call sites.
-}
-
 fn tile_stmts_contain_load_role(stmts: &[TileStmt], role: CoopOperandRole) -> bool {
     stmts.iter().any(|stmt| match stmt {
         TileStmt::LoadCoop { role: r, .. } => *r == role,
@@ -78,7 +73,6 @@ fn tile_source_softmax_lowers_to_naga() {
         });
     });
 
-    assert_only_tile_programs(&ir);
     ir.lower_to_naga()
         .unwrap_or_else(|error| panic!("tile softmax lowering failed: {error}"));
 }
@@ -166,7 +160,6 @@ fn tile_source_dense_matmul_lowers_to_naga() {
         phase.matmul::<64>(&a, &b, &y);
     });
 
-    assert_only_tile_programs(&ir);
     ir.lower_to_naga()
         .unwrap_or_else(|error| panic!("dense matmul lowering failed: {error}"));
 }
@@ -181,7 +174,6 @@ fn tile_source_qmatmul_and_qgemv_lower_all_supported_ggml_formats() {
             let y = phase.storage_write::<F32, 2>(Shape::new([3, 7]));
             phase.qmatmul::<8, 4, 8>(&a, &b, &y, 4);
         });
-        assert_only_tile_programs(&ir);
         ir.lower_to_naga()
             .unwrap_or_else(|error| panic!("{format:?} tile qmatmul lowering failed: {error}"));
 
@@ -191,7 +183,6 @@ fn tile_source_qmatmul_and_qgemv_lower_all_supported_ggml_formats() {
             let y = phase.storage_write::<F32, 2>(Shape::new([1, 7]));
             phase.qgemv::<4, 64>(&a, &b, &y, 4, 3);
         });
-        assert_only_tile_programs(&ir);
         assert!(
             ir.tiles().is_empty(),
             "{format:?} qgemv should use the subgroup perf path without workgroup scratch"
@@ -259,7 +250,6 @@ fn coop_qmatmul_q5_0_large_benchmark_shape_lowers() {
         phase.qmatmul::<128, 128, 32>(&a, &b, &y, 4);
     });
 
-    assert_only_tile_programs(&ir);
     ir.lower_to_naga()
         .unwrap_or_else(|error| panic!("large Q5_0 coop qmatmul lowering failed: {error}"));
 }
@@ -332,7 +322,6 @@ fn primitive_qgemm_q8_0_in_dsl() {
         );
     });
 
-    assert_only_tile_programs(&ir);
     assert!(
         ir.tiles().is_empty(),
         "scalar primitive qgemm should not need workgroup scratch"
