@@ -599,6 +599,17 @@ impl<'a> Lowerer<'a> {
         self.emit(e, body, Expression::As { expr: value, kind, convert })
     }
 
+    /// Append an `Expression::LocalVariable` reference. LocalVariable
+    /// expressions are pure pointers; Naga doesn't require an `Emit`
+    /// statement for them, so this is a plain append.
+    pub(in crate::lower) fn local_var(
+        &self,
+        e: &mut Arena<Expression>,
+        local: Handle<LocalVariable>,
+    ) -> Handle<Expression> {
+        e.append(Expression::LocalVariable(local), Span::default())
+    }
+
     pub(in crate::lower) fn u32(&self, e: &mut Arena<Expression>, value: u32) -> Handle<Expression> {
         e.append(Expression::Literal(Literal::U32(value)), Span::default())
     }

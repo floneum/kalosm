@@ -13,7 +13,7 @@ impl<'a> Lowerer<'a> {
     ) -> Result<Handle<Expression>, LowerError> {
         let element = value.element();
         let acc = self.tile_expr_spill_local(scratch, element, 0)?;
-        let acc_ptr = expressions.append(Expression::LocalVariable(acc), Span::default());
+        let acc_ptr = self.local_var(expressions, acc);
         let initial = expressions.append(
             Self::tile_reduce_identity(op, element),
             Span::default(),

@@ -48,7 +48,7 @@ impl<'a> Lowerer<'a> {
                 }
                 let value = self.lower_tile_expr_lane(expressions, scratch, body, value, 0)?;
                 let local = self.private_local(*dst)?;
-                let pointer = expressions.append(Expression::LocalVariable(local), Span::default());
+                let pointer = self.local_var(expressions, local);
                 body.push(Statement::Store { pointer, value }, Span::default());
                 Ok(())
             }
@@ -126,7 +126,7 @@ impl<'a> Lowerer<'a> {
                     "coop C type missing — tile program uses coop statements without cooperative-matrix support",
                 ))?;
                 let zero = expressions.append(Expression::ZeroValue(ty), Span::default());
-                let ptr = expressions.append(Expression::LocalVariable(local), Span::default());
+                let ptr = self.local_var(expressions, local);
                 body.push(
                     Statement::Store {
                         pointer: ptr,
@@ -256,7 +256,7 @@ impl<'a> Lowerer<'a> {
             Some(value) => value,
             None => {
                 let acc_ptr =
-                    expressions.append(Expression::LocalVariable(acc_local), Span::default());
+                    self.local_var(expressions, acc_local);
                 Self::emit_load(expressions, body, acc_ptr)
             }
         };
@@ -299,7 +299,7 @@ impl<'a> Lowerer<'a> {
                 Some(l) => l,
                 None => continue,
             };
-            let acc_ptr = expressions.append(Expression::LocalVariable(acc_local), Span::default());
+            let acc_ptr = self.local_var(expressions, acc_local);
             body.push(
                 Statement::Store {
                     pointer: acc_ptr,
@@ -563,7 +563,7 @@ impl<'a> Lowerer<'a> {
         let storage_ptr = self.storage_dynamic_pointer(expressions, dst, storage_index, body)?;
 
         let stride = self.u32(expressions, stride_u);
-        let acc_ptr = expressions.append(Expression::LocalVariable(acc_local), Span::default());
+        let acc_ptr = self.local_var(expressions, acc_local);
         let acc_value = Self::emit_load(expressions, body, acc_ptr);
         body.push(
             Statement::CooperativeStore {

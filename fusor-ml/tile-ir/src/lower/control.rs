@@ -47,7 +47,7 @@ impl<'a> Lowerer<'a> {
         amount: u32,
     ) -> Statement {
         let amount = self.u32(expressions, amount);
-        let pointer = expressions.append(Expression::LocalVariable(local), Span::default());
+        let pointer = self.local_var(expressions, local);
         let current = expressions.append(Expression::Load { pointer }, Span::default());
         let next = expressions.append(
             Expression::Binary {
@@ -211,7 +211,7 @@ impl<'a> Lowerer<'a> {
             let init_value =
                 self.lower_tile_expr_lane(expressions, scratch, body, &acc.init, 0)?;
             let local = self.private_local(LocalRef::new(acc.name, acc.element))?;
-            let pointer = expressions.append(Expression::LocalVariable(local), Span::default());
+            let pointer = self.local_var(expressions, local);
             body.push(
                 Statement::Store {
                     pointer,

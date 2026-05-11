@@ -49,7 +49,7 @@ impl<'a> Lowerer<'a> {
             }
             MemoryLevel::Private => {
                 let local = lookup_handle(&self.tile_locals, id.index(), unknown)?;
-                Ok(expressions.append(Expression::LocalVariable(local), Span::default()))
+                Ok(self.local_var(expressions, local))
             }
             memory => Err(LowerError::UnsupportedMemoryLevel(memory)),
         }

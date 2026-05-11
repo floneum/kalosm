@@ -25,7 +25,7 @@ impl<'a> Lowerer<'a> {
             }
             Expr::LoadLocal(local) => {
                 let local = self.private_local(*local)?;
-                let pointer = expressions.append(Expression::LocalVariable(local), Span::default());
+                let pointer = self.local_var(expressions, local);
                 Ok(Self::emit_load(expressions, body, pointer))
             }
             Expr::Literal(value) => {

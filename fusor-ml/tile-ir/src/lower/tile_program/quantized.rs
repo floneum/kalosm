@@ -366,7 +366,7 @@ impl<'a> Lowerer<'a> {
         let fill_value =
             self.cast_tile_value(expressions, body, fill_value, fill_source, ElementType::F32);
         for local in &tmp_locals {
-            let ptr = expressions.append(Expression::LocalVariable(*local), Span::default());
+            let ptr = self.local_var(expressions, *local);
             body.push(
                 Statement::Store {
                     pointer: ptr,
@@ -392,7 +392,7 @@ impl<'a> Lowerer<'a> {
             &mut accept,
         )?;
         for (local, value) in tmp_locals.iter().zip(values.iter()) {
-            let ptr = expressions.append(Expression::LocalVariable(*local), Span::default());
+            let ptr = self.local_var(expressions, *local);
             accept.push(
                 Statement::Store {
                     pointer: ptr,
@@ -413,7 +413,7 @@ impl<'a> Lowerer<'a> {
         // Materialize the locals into SSA loads we hand back per lane.
         let mut handles = Vec::with_capacity(block_n as usize);
         for local in &tmp_locals {
-            let ptr = expressions.append(Expression::LocalVariable(*local), Span::default());
+            let ptr = self.local_var(expressions, *local);
             handles.push(Self::emit_load(expressions, body, ptr));
         }
         self.block_dequant_cache
@@ -508,7 +508,7 @@ impl<'a> Lowerer<'a> {
         ) -> Result<Handle<Expression>, LowerError>,
     ) -> Result<Handle<Expression>, LowerError> {
         let tmp = Self::tile_value_local(scratch, element)?;
-        let tmp_ptr = expressions.append(Expression::LocalVariable(tmp), Span::default());
+        let tmp_ptr = self.local_var(expressions, tmp);
         body.push(
             Statement::Store {
                 pointer: tmp_ptr,
