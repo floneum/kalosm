@@ -72,35 +72,31 @@ pub struct TileBlock<'a, const BLOCK: usize> {
 }
 
 
+/// Wrap a `Builtin` as a `ScalarIndex` (u32-typed scalar). All `program.*_id`
+/// / `subgroup_*` getters are one-line wrappers over this.
+fn builtin_index(builtin: Builtin) -> ScalarIndex {
+    ScalarIndex { expr: Box::new(Expr::Builtin(builtin)) }
+}
+
 impl<const BLOCK: usize> TileBlock<'_, BLOCK> {
     pub fn program_id(&self, axis: WorkgroupAxis) -> ScalarIndex {
-        ScalarIndex {
-            expr: Box::new(Expr::Builtin(Builtin::ProgramId(axis))),
-        }
+        builtin_index(Builtin::ProgramId(axis))
     }
 
     pub fn subgroup_id(&self) -> ScalarIndex {
-        ScalarIndex {
-            expr: Box::new(Expr::Builtin(Builtin::SubgroupId)),
-        }
+        builtin_index(Builtin::SubgroupId)
     }
 
     pub fn subgroup_lane(&self) -> ScalarIndex {
-        ScalarIndex {
-            expr: Box::new(Expr::Builtin(Builtin::SubgroupLane)),
-        }
+        builtin_index(Builtin::SubgroupLane)
     }
 
     pub fn subgroup_size(&self) -> ScalarIndex {
-        ScalarIndex {
-            expr: Box::new(Expr::Builtin(Builtin::SubgroupSize)),
-        }
+        builtin_index(Builtin::SubgroupSize)
     }
 
     pub fn num_subgroups(&self) -> ScalarIndex {
-        ScalarIndex {
-            expr: Box::new(Expr::Builtin(Builtin::NumSubgroups)),
-        }
+        builtin_index(Builtin::NumSubgroups)
     }
 
     pub fn grid(&self) -> [u32; 3] {
@@ -108,9 +104,7 @@ impl<const BLOCK: usize> TileBlock<'_, BLOCK> {
     }
 
     pub fn arange(&self) -> Range<BLOCK> {
-        Range {
-            expr: Box::new(Expr::Builtin(Builtin::Lane)),
-        }
+        Range { expr: Box::new(Expr::Builtin(Builtin::Lane)) }
     }
 
     pub fn lane_tile_2d<const ROWS: usize, const COLS: usize>(
@@ -128,9 +122,7 @@ impl<const BLOCK: usize> TileBlock<'_, BLOCK> {
     }
 
     pub fn loop_index(&self) -> ScalarIndex {
-        ScalarIndex {
-            expr: Box::new(Expr::Builtin(Builtin::LoopIndex)),
-        }
+        builtin_index(Builtin::LoopIndex)
     }
 
     pub fn load<T>(&self, address: Address<T, BLOCK>, mask: Mask<BLOCK>, fill: f32) -> Tile<BLOCK> {
