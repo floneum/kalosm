@@ -397,18 +397,14 @@ impl<'a> Lowerer<'a> {
         body: &mut Block,
         components: [Handle<Expression>; 4],
     ) -> Handle<Expression> {
-        let vec = e.append(
+        self.emit(
+            e,
+            body,
             Expression::Compose {
                 ty: self.f32_vec4_ty,
                 components: components.to_vec(),
             },
-            Span::default(),
-        );
-        body.push(
-            Statement::Emit(Self::single_expression_range(e, vec)),
-            Span::default(),
-        );
-        vec
+        )
     }
 
     pub(in crate::lower) fn dot_f32_vec4(
@@ -541,16 +537,13 @@ impl<'a> Lowerer<'a> {
         let components: [Handle<Expression>; 4] = values
             .try_into()
             .map_err(|_| LowerError::UnsupportedOperation("pack_i8x4 requires 4 values"))?;
-        let vec = e.append(
+        let vec = self.emit(
+            e,
+            body,
             Expression::Compose {
                 ty: self.i32_vec4_ty,
                 components: components.to_vec(),
             },
-            Span::default(),
-        );
-        body.push(
-            Statement::Emit(Self::single_expression_range(e, vec)),
-            Span::default(),
         );
         Ok(self.math1(e, body, MathFunction::Pack4xI8Clamp, vec))
     }
