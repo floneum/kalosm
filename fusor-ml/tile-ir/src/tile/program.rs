@@ -684,7 +684,7 @@ impl Program {
         let id = crate::LocalId(self.next_local);
         self.next_local += 1;
         let local = LocalRef::new(id, element);
-        self.ir.locals.push(LocalRef { id, element });
+        self.ir.locals.push(local);
         local
     }
 
