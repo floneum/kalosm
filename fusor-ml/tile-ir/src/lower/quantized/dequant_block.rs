@@ -125,7 +125,7 @@ impl<'a> Lowerer<'a> {
         let shifted_qh = self.shr(e, body, qh, hi_bit_index);
         let hi_bit_low = self.and_lit(e, body, shifted_qh, 1);
         let hi_bit = self.shl_lit(e, body, hi_bit_low, 4);
-        Ok(self.bin(e, body, BinaryOperator::InclusiveOr, low4, hi_bit))
+        Ok(self.or(e, body, low4, hi_bit))
     }
 
     pub(in crate::lower) fn dequant_q23k_quant_f(
@@ -304,7 +304,7 @@ impl<'a> Lowerer<'a> {
             let shifted_qh = self.shr(e, body, qh_byte, qh_bit_index);
             let bit = self.and_lit(e, body, shifted_qh, 1);
             let bit = self.shl_lit(e, body, bit, 4);
-            quant = self.bin(e, body, BinaryOperator::InclusiveOr, quant, bit);
+            quant = self.or(e, body, quant, bit);
         }
         let quant_f = self.as_f32(e, body, quant);
         let scaled = self.mul(e, body, quant_f, scale);
@@ -360,7 +360,7 @@ impl<'a> Lowerer<'a> {
         let high_shifted = self.shr(e, body, high_byte, high_shift);
         let high2 = self.and_lit(e, body, high_shifted, 3);
         let high2 = self.shl_lit(e, body, high2, 4);
-        let quant = self.bin(e, body, BinaryOperator::InclusiveOr, low4, high2);
+        let quant = self.or(e, body, low4, high2);
         let scale_chunk_base = self.shl_lit(e, body, chunk, 3);
         let high_byte_half = self.shr_lit(e, body, high_byte_index, 4);
         let low_group_scale = self.shl_lit(e, body, low_group, 1);

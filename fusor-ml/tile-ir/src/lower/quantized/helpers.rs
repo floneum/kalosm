@@ -93,7 +93,7 @@ impl<'a> Lowerer<'a> {
         };
         let msb_bits = self.and_lit(e, body, low_byte, 0xc0);
         let msb = self.shr_lit(e, body, msb_bits, 2);
-        let high_scale = self.bin(e, body, BinaryOperator::InclusiveOr, lsb, msb);
+        let high_scale = self.or(e, body, lsb, msb);
         Ok(self.select(e, body, high, high_scale, low_scale))
     }
 
@@ -120,7 +120,7 @@ impl<'a> Lowerer<'a> {
         let scale_lsb = self.and_lit(e, body, extra_byte, 0x0f);
         let scale_msb_bits = self.and_lit(e, body, scale_low_byte, 0xc0);
         let scale_msb = self.shr_lit(e, body, scale_msb_bits, 2);
-        let scale_high = self.bin(e, body, BinaryOperator::InclusiveOr, scale_lsb, scale_msb);
+        let scale_high = self.or(e, body, scale_lsb, scale_msb);
         let scale = self.select(e, body, high, scale_high, scale_low);
 
         let min_low = self.and_lit(e, body, min_low_byte, 0x3f);
@@ -128,7 +128,7 @@ impl<'a> Lowerer<'a> {
         let min_lsb = self.and_lit(e, body, min_lsb_shifted, 0x0f);
         let min_msb_bits = self.and_lit(e, body, min_low_byte, 0xc0);
         let min_msb = self.shr_lit(e, body, min_msb_bits, 2);
-        let min_high = self.bin(e, body, BinaryOperator::InclusiveOr, min_lsb, min_msb);
+        let min_high = self.or(e, body, min_lsb, min_msb);
         let min = self.select(e, body, high, min_high, min_low);
 
         Ok((scale, min))
@@ -161,7 +161,7 @@ impl<'a> Lowerer<'a> {
         let high = self.shr(e, body, extra_byte, high_shift);
         let high = self.and_lit(e, body, high, 3);
         let high = self.shl_lit(e, body, high, 4);
-        Ok(self.bin(e, body, BinaryOperator::InclusiveOr, low, high))
+        Ok(self.or(e, body, low, high))
     }
 
     pub(in crate::lower) fn byte_at(
@@ -350,6 +350,16 @@ impl<'a> Lowerer<'a> {
         right: Handle<Expression>,
     ) -> Handle<Expression> {
         self.bin(e, body, BinaryOperator::Add, left, right)
+    }
+
+    pub(in crate::lower) fn or(
+        &self,
+        e: &mut Arena<Expression>,
+        body: &mut Block,
+        left: Handle<Expression>,
+        right: Handle<Expression>,
+    ) -> Handle<Expression> {
+        self.bin(e, body, BinaryOperator::InclusiveOr, left, right)
     }
 
     pub(in crate::lower) fn sub(

@@ -393,7 +393,7 @@ impl<'a> Lowerer<'a> {
         let high_shifted = self.shr(expressions, body, high_byte, parts.high_shift);
         let high2 = self.and_lit(expressions, body, high_shifted, 3);
         let high2 = self.shl_lit(expressions, body, high2, 4);
-        self.bin(expressions, body, BinaryOperator::InclusiveOr, low4, high2)
+        self.or(expressions, body, low4, high2)
     }
 
     pub(in crate::lower) fn dequantize_q6k_values8(
