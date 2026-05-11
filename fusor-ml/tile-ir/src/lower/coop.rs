@@ -48,8 +48,7 @@ impl<'a> Lowerer<'a> {
                 }
                 let value = self.lower_tile_expr_lane(expressions, scratch, body, value, 0)?;
                 let local = self.private_local(*dst)?;
-                let pointer = self.local_var(expressions, local);
-                body.push(Statement::Store { pointer, value }, Span::default());
+                self.store_local(expressions, body, local, value);
                 Ok(())
             }
             TileStmt::StoreWorkgroup { dst, index, value } => {
@@ -126,14 +125,7 @@ impl<'a> Lowerer<'a> {
                     "coop C type missing — tile program uses coop statements without cooperative-matrix support",
                 ))?;
                 let zero = expressions.append(Expression::ZeroValue(ty), Span::default());
-                let ptr = self.local_var(expressions, local);
-                body.push(
-                    Statement::Store {
-                        pointer: ptr,
-                        value: zero,
-                    },
-                    Span::default(),
-                );
+                self.store_local(expressions, body, local, zero);
                 Ok(())
             }
             TileStmt::CopyToWorkgroupTile {
@@ -299,14 +291,7 @@ impl<'a> Lowerer<'a> {
                 Some(l) => l,
                 None => continue,
             };
-            let acc_ptr = self.local_var(expressions, acc_local);
-            body.push(
-                Statement::Store {
-                    pointer: acc_ptr,
-                    value,
-                },
-                Span::default(),
-            );
+            self.store_local(expressions, body, acc_local, value);
         }
     }
 

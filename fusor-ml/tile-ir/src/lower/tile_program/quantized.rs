@@ -366,14 +366,7 @@ impl<'a> Lowerer<'a> {
         let fill_value =
             self.cast_tile_value(expressions, body, fill_value, fill_source, ElementType::F32);
         for local in &tmp_locals {
-            let ptr = self.local_var(expressions, *local);
-            body.push(
-                Statement::Store {
-                    pointer: ptr,
-                    value: fill_value,
-                },
-                Span::default(),
-            );
+            self.store_local(expressions, body, *local, fill_value);
         }
 
         let mask_handle =
@@ -392,14 +385,7 @@ impl<'a> Lowerer<'a> {
             &mut accept,
         )?;
         for (local, value) in tmp_locals.iter().zip(values.iter()) {
-            let ptr = self.local_var(expressions, *local);
-            accept.push(
-                Statement::Store {
-                    pointer: ptr,
-                    value: *value,
-                },
-                Span::default(),
-            );
+            self.store_local(expressions, &mut accept, *local, *value);
         }
         body.push(
             Statement::If {
