@@ -248,8 +248,8 @@ impl<'a> Lowerer<'a> {
             q_base,
             16,
         );
-        let sixteen = expressions.append(Expression::Literal(Literal::U32(16)), Span::default());
-        let zero = expressions.append(Expression::Literal(Literal::U32(0)), Span::default());
+        let sixteen = self.u32(expressions, 16);
+        let zero = self.u32(expressions, 0);
         let high_base = self.select(expressions, body, high, sixteen, zero);
         let words = [
             self.load_word(expressions, matrix, base, 2, body)?,

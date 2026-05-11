@@ -218,8 +218,7 @@ impl<'a> Lowerer<'a> {
 
         let mut sums = [self.f32(expressions, 0.0); 4];
         for l in 0..4 {
-            let lane =
-                expressions.append(Expression::Literal(Literal::U32(l as u32)), Span::default());
+            let lane = self.u32(expressions, l as u32);
             let q1_byte = self.byte_at(expressions, body, q1_word, lane);
             let q2_byte = self.byte_at(expressions, body, q2_word, lane);
             let qh_byte = self.byte_at(expressions, body, qh_word, lane);

@@ -102,7 +102,7 @@ impl<'a> Lowerer<'a> {
 
         let (compare_index, result_index) = if group_size == self.workgroup_invocations {
             let zero =
-                expressions.append(Expression::Literal(Literal::U32(0)), Span::default());
+                self.u32(expressions, 0);
             (lane, zero)
         } else {
             let group_offset =
@@ -121,8 +121,7 @@ impl<'a> Lowerer<'a> {
 
         let mut stride = group_size / 2;
         while stride > 0 {
-            let limit =
-                expressions.append(Expression::Literal(Literal::U32(stride)), Span::default());
+            let limit = self.u32(expressions, stride);
             let participates = self.emit(
                 expressions,
                 body,

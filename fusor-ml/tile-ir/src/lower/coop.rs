@@ -219,8 +219,7 @@ impl<'a> Lowerer<'a> {
         let col_h = self.lower_tile_expr_lane(expressions, scratch, body, col, 0)?;
         let index = self.tile_matrix_index_inline(expressions, body, row_h, col_h, stride_u);
         let ptr = self.tile_dynamic_pointer(expressions, tile, index, body)?;
-        let stride =
-            expressions.append(Expression::Literal(Literal::U32(stride_u)), Span::default());
+        let stride = self.u32(expressions, stride_u);
         let frag = self.emit(
             expressions,
             body,
@@ -563,8 +562,7 @@ impl<'a> Lowerer<'a> {
             self.storage_index_from_coords(expressions, dst, &[row_h, col_h], body)?;
         let storage_ptr = self.storage_dynamic_pointer(expressions, dst, storage_index, body)?;
 
-        let stride =
-            expressions.append(Expression::Literal(Literal::U32(stride_u)), Span::default());
+        let stride = self.u32(expressions, stride_u);
         let acc_ptr = expressions.append(Expression::LocalVariable(acc_local), Span::default());
         let acc_value = Self::emit_load(expressions, body, acc_ptr);
         body.push(

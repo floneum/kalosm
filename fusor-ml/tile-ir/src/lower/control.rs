@@ -46,7 +46,7 @@ impl<'a> Lowerer<'a> {
         local: Handle<LocalVariable>,
         amount: u32,
     ) -> Statement {
-        let amount = expressions.append(Expression::Literal(Literal::U32(amount)), Span::default());
+        let amount = self.u32(expressions, amount);
         let pointer = expressions.append(Expression::LocalVariable(local), Span::default());
         let current = expressions.append(Expression::Load { pointer }, Span::default());
         let next = expressions.append(
@@ -85,7 +85,7 @@ impl<'a> Lowerer<'a> {
             Expression::LocalVariable(scratch.loop_index),
             Span::default(),
         );
-        let zero = expressions.append(Expression::Literal(Literal::U32(0)), Span::default());
+        let zero = self.u32(expressions, 0);
         body.push(
             Statement::Store {
                 pointer: loop_ptr,
@@ -143,8 +143,7 @@ impl<'a> Lowerer<'a> {
             Handle<Expression>,
         ) -> Result<T, LowerError>,
     ) -> Result<T, LowerError> {
-        let count =
-            expressions.append(Expression::Literal(Literal::U32(iterations)), Span::default());
+        let count = self.u32(expressions, iterations);
         self.emit_dynamic_counted_loop(expressions, scratch, body, count, build_body)
     }
 
