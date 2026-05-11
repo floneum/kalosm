@@ -210,8 +210,8 @@ impl<'a> Lowerer<'a> {
         body: &mut Block,
         local: Handle<LocalVariable>,
     ) -> Handle<Expression> {
-        let pointer = e.append(Expression::LocalVariable(local), Span::default());
-        self.emit(e, body, Expression::Load { pointer })
+        let pointer = self.local_var(e, local);
+        Self::emit_load(e, body, pointer)
     }
 
     pub(in crate::lower) fn bin(

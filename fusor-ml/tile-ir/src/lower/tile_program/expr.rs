@@ -25,8 +25,7 @@ impl<'a> Lowerer<'a> {
             }
             Expr::LoadLocal(local) => {
                 let local = self.private_local(*local)?;
-                let pointer = self.local_var(expressions, local);
-                Ok(Self::emit_load(expressions, body, pointer))
+                Ok(self.load_local(expressions, body, local))
             }
             Expr::Literal(value) => {
                 Ok(expressions.append(Self::tile_literal(*value), Span::default()))
@@ -227,10 +226,7 @@ impl<'a> Lowerer<'a> {
             Builtin::SubgroupLane => Self::function_arg(expressions, SUBGROUP_INVOCATION_ID_ARG),
             Builtin::SubgroupSize => Self::function_arg(expressions, SUBGROUP_SIZE_ARG),
             Builtin::NumSubgroups => Self::function_arg(expressions, NUM_SUBGROUPS_ARG),
-            Builtin::LoopIndex => {
-                let pointer = self.local_var(expressions, self.current_loop_index());
-                Self::emit_load(expressions, body, pointer)
-            }
+            Builtin::LoopIndex => self.load_local(expressions, body, self.current_loop_index()),
             Builtin::ProgramId(axis) => {
                 let wg = Self::function_arg(expressions, WORKGROUP_ID_ARG);
                 self.emit(
