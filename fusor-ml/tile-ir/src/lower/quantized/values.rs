@@ -520,16 +520,15 @@ impl<'a> Lowerer<'a> {
             ));
         }
 
-        let (b_scale, b_min, b_packs) =
-            self.q4k_quant_packs8(expressions, matrix, k_base, col, body)?;
+        let block = self.q4k_quant_packs8(expressions, matrix, k_base, col, body)?;
         let total = self.q8_activation_packs_dot(
             expressions,
             body,
             a,
             pack_offset,
-            b_scale,
-            b_packs,
-            Some(b_min),
+            block.scale,
+            block.data,
+            Some(block.min),
         );
         Ok(total)
     }
@@ -574,12 +573,11 @@ impl<'a> Lowerer<'a> {
         let mut total = self.f32(expressions, 0.0);
         for pack_offset in (0..a.len()).step_by(8) {
             let k = self.add_lit(expressions, body, k_base, pack_offset as u32);
-            let (scale, min, quants) =
-                self.q4k_quant_values::<8, 2>(expressions, matrix, k, col, false, body)?;
+            let block = self.q4k_quant_values::<8, 2>(expressions, matrix, k, col, false, body)?;
             let mut weighted_sum = self.f32(expressions, 0.0);
             let mut activation_sum = self.f32(expressions, 0.0);
             for lane in 0..8 {
-                let q = self.as_f32(expressions, body, quants[lane]);
+                let q = self.as_f32(expressions, body, block.data[lane]);
                 let activation = a[pack_offset + lane];
                 let weighted = self.mul(expressions, body, activation, q);
                 weighted_sum = self.bin(
@@ -597,8 +595,8 @@ impl<'a> Lowerer<'a> {
                     activation,
                 );
             }
-            let scaled = self.mul(expressions, body, weighted_sum, scale);
-            let min_term = self.mul(expressions, body, activation_sum, min);
+            let scaled = self.mul(expressions, body, weighted_sum, block.scale);
+            let min_term = self.mul(expressions, body, activation_sum, block.min);
             let chunk = self.sub(expressions, body, scaled, min_term);
             total = self.bin(expressions, body, BinaryOperator::Add, total, chunk);
         }
@@ -618,7 +616,7 @@ impl<'a> Lowerer<'a> {
         debug_assert_eq!(WORDS * 4, N);
         debug_assert_eq!(a.len(), N);
 
-        let (scale, min, quants) =
+        let block =
             self.q4k_quant_values::<N, WORDS>(
                 expressions,
                 matrix,
@@ -628,7 +626,14 @@ impl<'a> Lowerer<'a> {
                 body,
             )?;
 
-        let total = self.q4k_f32_weighted_sum(expressions, body, scale, min, &quants, a);
+        let total = self.q4k_f32_weighted_sum(
+            expressions,
+            body,
+            block.scale,
+            block.min,
+            &block.data,
+            a,
+        );
         Ok(total)
     }
 

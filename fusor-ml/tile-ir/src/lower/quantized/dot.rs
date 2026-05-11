@@ -1,5 +1,14 @@
 use super::*;
 
+/// `(scale, min)` factor pair plus per-quantization-block decoded data.
+/// `data` is `[Handle<Expression>; N]` where `N` is either the per-quad pack
+/// count (`2`) or the dequantized lane count (`8`/`16`/`32`).
+pub(in crate::lower) struct Q4KQuantBlock<const N: usize> {
+    pub scale: Handle<Expression>,
+    pub min: Handle<Expression>,
+    pub data: [Handle<Expression>; N],
+}
+
 impl<'a> Lowerer<'a> {
     pub(in crate::lower) fn q4k_ggml_dot(
         &self,
@@ -557,19 +566,12 @@ impl<'a> Lowerer<'a> {
         k_base: Handle<Expression>,
         col: Handle<Expression>,
         body: &mut Block,
-    ) -> Result<
-        (
-            Handle<Expression>,
-            Handle<Expression>,
-            [Handle<Expression>; 2],
-        ),
-        LowerError,
-    > {
+    ) -> Result<Q4KQuantBlock<2>, LowerError> {
         let parts = self.q4k_block_parts(expressions, matrix, k_base, col, body)?;
         let (words, nibble_shift) =
             self.q4k_quant_words::<2>(expressions, matrix, &parts, false, body)?;
 
-        let packs = std::array::from_fn(|chunk| {
+        let data = std::array::from_fn(|chunk| {
             let mut packed_values = Vec::with_capacity(4);
             for lane in 0..4 {
                 let source_lane = chunk * 4 + lane;
@@ -585,7 +587,7 @@ impl<'a> Lowerer<'a> {
             self.pack_i8x4(expressions, body, packed_values)
                 .expect("q4k packs exactly four i8 values")
         });
-        Ok((parts.scale, parts.min, packs))
+        Ok(Q4KQuantBlock { scale: parts.scale, min: parts.min, data })
     }
 
     pub(in crate::lower) fn q4k_quant_values<const N: usize, const WORDS: usize>(
@@ -596,14 +598,7 @@ impl<'a> Lowerer<'a> {
         col: Handle<Expression>,
         whole_group_pair: bool,
         body: &mut Block,
-    ) -> Result<
-        (
-            Handle<Expression>,
-            Handle<Expression>,
-            [Handle<Expression>; N],
-        ),
-        LowerError,
-    > {
+    ) -> Result<Q4KQuantBlock<N>, LowerError> {
         debug_assert_eq!(WORDS * 4, N);
         let block = self.div_literal_u32_emitted(expressions, k_base, 256, body);
         let q_base = self.and_lit(expressions, body, k_base, 255);
@@ -612,7 +607,7 @@ impl<'a> Lowerer<'a> {
         let (words, nibble_shift) =
             self.q4k_quant_words::<WORDS>(expressions, matrix, &parts, whole_group_pair, body)?;
 
-        let quants = std::array::from_fn(|source_lane| {
+        let data = std::array::from_fn(|source_lane| {
             let byte_lane = expressions.append(
                 Expression::Literal(Literal::U32((source_lane % 4) as u32)),
                 Span::default(),
@@ -622,7 +617,7 @@ impl<'a> Lowerer<'a> {
             self.and_lit(expressions, body, shifted, 0x0f)
         });
 
-        Ok((parts.scale, parts.min, quants))
+        Ok(Q4KQuantBlock { scale: parts.scale, min: parts.min, data })
     }
 
     pub(in crate::lower) fn q4k_block_parts(
