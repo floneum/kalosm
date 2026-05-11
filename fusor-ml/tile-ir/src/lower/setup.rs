@@ -110,44 +110,19 @@ impl<'a> Lowerer<'a> {
         self.create_workgroup_globals()?;
 
         let mut arguments = vec![
-            FunctionArgument {
-                name: None,
-                ty: self.u32_ty,
-                binding: Some(Binding::BuiltIn(BuiltIn::LocalInvocationIndex)),
-            },
-            FunctionArgument {
-                name: None,
-                ty: self.u32_vec3_ty,
-                binding: Some(Binding::BuiltIn(BuiltIn::WorkGroupId)),
-            },
+            builtin_arg(self.u32_ty, BuiltIn::LocalInvocationIndex),
+            builtin_arg(self.u32_vec3_ty, BuiltIn::WorkGroupId),
         ];
-        if self.uses_subgroup_id {
-            arguments.push(FunctionArgument {
-                name: None,
-                ty: self.u32_ty,
-                binding: Some(Binding::BuiltIn(BuiltIn::SubgroupId)),
-            });
-        }
-        if self.uses_subgroup_invocation_id {
-            arguments.push(FunctionArgument {
-                name: None,
-                ty: self.u32_ty,
-                binding: Some(Binding::BuiltIn(BuiltIn::SubgroupInvocationId)),
-            });
-        }
-        if self.uses_subgroup_size {
-            arguments.push(FunctionArgument {
-                name: None,
-                ty: self.u32_ty,
-                binding: Some(Binding::BuiltIn(BuiltIn::SubgroupSize)),
-            });
-        }
-        if self.uses_num_subgroups {
-            arguments.push(FunctionArgument {
-                name: None,
-                ty: self.u32_ty,
-                binding: Some(Binding::BuiltIn(BuiltIn::NumSubgroups)),
-            });
+        let optional_subgroup_args = [
+            (self.uses_subgroup_id, BuiltIn::SubgroupId),
+            (self.uses_subgroup_invocation_id, BuiltIn::SubgroupInvocationId),
+            (self.uses_subgroup_size, BuiltIn::SubgroupSize),
+            (self.uses_num_subgroups, BuiltIn::NumSubgroups),
+        ];
+        for (used, builtin) in optional_subgroup_args {
+            if used {
+                arguments.push(builtin_arg(self.u32_ty, builtin));
+            }
         }
 
         let mut function = Function {
@@ -557,4 +532,12 @@ impl<'a> Lowerer<'a> {
         }
     }
 
+}
+
+fn builtin_arg(ty: Handle<Type>, builtin: BuiltIn) -> FunctionArgument {
+    FunctionArgument {
+        name: None,
+        ty,
+        binding: Some(Binding::BuiltIn(builtin)),
+    }
 }
