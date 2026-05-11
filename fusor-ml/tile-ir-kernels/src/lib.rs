@@ -6,12 +6,12 @@
 //! matmul, gemv, qdequantize, flash attention, top-k, rms-norm, mirostat —
 //! lives in this crate as free functions over `&mut Program`.
 
-pub mod dispatch;
-pub mod grid;
-pub mod kernels;
-pub mod program_kernels;
-pub mod program_qgemv;
-pub mod types;
+mod dispatch;
+mod grid;
+mod kernels;
+mod program_kernels;
+mod program_qgemv;
+mod types;
 
 pub use dispatch::{
     q4k_default_large, q4k_default_mid, q4k_default_tall, q4k_large_override, q4k_mid_override,
@@ -37,4 +37,4 @@ pub use program_qgemv::{
     qgemv_q4k_paired_4x1, qgemv_q4k_paired_4x2, qgemv_q4k_paired_4x4, qgemv_q4k_paired_8x1,
     qgemv_q4k_paired_8x2, qgemv_q4k_paired_ggml, qgemv_q6k_dispatch, qgemv_q6k_ggml, qgemv_tile,
 };
-pub use types::{cooperative_store_layout_supported, matrix_shape, PairedActivation};
+pub use types::PairedActivation;

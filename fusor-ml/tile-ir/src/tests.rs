@@ -1,4 +1,5 @@
 use super::*;
+use crate::ir::{CoopOperandRole, TileStmt};
 
 /// Lower `ir` and panic with a labelled message on failure. Returns the
 /// lowered Naga kernel for tests that want to inspect the module.

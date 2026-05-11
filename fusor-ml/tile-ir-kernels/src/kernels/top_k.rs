@@ -47,13 +47,13 @@ fn load_processor_param_f32(
 }
 
 pub fn top_k_chunk<B>(
-    kb: &mut fusor_tile_ir::kernel_builder::KernelBuilder<B>,
-    input: fusor_tile_ir::kernel_builder::KernelTensorRef<B>,
-    output_ids: fusor_tile_ir::kernel_builder::KernelTensorRef<B>,
-    output_values: fusor_tile_ir::kernel_builder::KernelTensorRef<B>,
+    kb: &mut fusor_tile_ir::KernelBuilder<B>,
+    input: fusor_tile_ir::KernelTensorRef<B>,
+    output_ids: fusor_tile_ir::KernelTensorRef<B>,
+    output_values: fusor_tile_ir::KernelTensorRef<B>,
     processors: Option<(
-        fusor_tile_ir::kernel_builder::KernelTensorRef<B>,
-        fusor_tile_ir::kernel_builder::KernelTensorRef<B>,
+        fusor_tile_ir::KernelTensorRef<B>,
+        fusor_tile_ir::KernelTensorRef<B>,
     )>,
     meta: TopKChunkMeta,
 ) -> Option<()> {
@@ -268,10 +268,10 @@ pub fn top_k_chunk<B>(
 }
 
 pub fn top_k_exactness<B>(
-    kb: &mut fusor_tile_ir::kernel_builder::KernelBuilder<B>,
-    top_values: fusor_tile_ir::kernel_builder::KernelTensorRef<B>,
-    chunk_values: fusor_tile_ir::kernel_builder::KernelTensorRef<B>,
-    flag: fusor_tile_ir::kernel_builder::KernelTensorRef<B>,
+    kb: &mut fusor_tile_ir::KernelBuilder<B>,
+    top_values: fusor_tile_ir::KernelTensorRef<B>,
+    chunk_values: fusor_tile_ir::KernelTensorRef<B>,
+    flag: fusor_tile_ir::KernelTensorRef<B>,
     meta: TopKExactnessMeta,
 ) -> Option<()> {
     if meta.top_k == 0 || meta.candidate_count >= meta.output_per_chunk {
@@ -359,11 +359,11 @@ pub fn top_k_exactness<B>(
 }
 
 pub fn top_k_merge<B>(
-    kb: &mut fusor_tile_ir::kernel_builder::KernelBuilder<B>,
-    input_ids: fusor_tile_ir::kernel_builder::KernelTensorRef<B>,
-    input_values: fusor_tile_ir::kernel_builder::KernelTensorRef<B>,
-    output_ids: fusor_tile_ir::kernel_builder::KernelTensorRef<B>,
-    output_values: fusor_tile_ir::kernel_builder::KernelTensorRef<B>,
+    kb: &mut fusor_tile_ir::KernelBuilder<B>,
+    input_ids: fusor_tile_ir::KernelTensorRef<B>,
+    input_values: fusor_tile_ir::KernelTensorRef<B>,
+    output_ids: fusor_tile_ir::KernelTensorRef<B>,
+    output_values: fusor_tile_ir::KernelTensorRef<B>,
     meta: MergeTopKMeta,
 ) -> Option<()> {
     if meta.chunks == 0 || meta.chunk_len == 0 || meta.k == 0 {

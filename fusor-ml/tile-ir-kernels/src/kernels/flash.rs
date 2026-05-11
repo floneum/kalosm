@@ -22,12 +22,12 @@ fn zero_fill<E: Numeric>() -> TileLiteral {
 }
 
 pub fn flash_attention<E: Numeric, B>(
-    kb: &mut fusor_tile_ir::kernel_builder::KernelBuilder<B>,
-    q: fusor_tile_ir::kernel_builder::KernelTensorRef<B>,
-    k: fusor_tile_ir::kernel_builder::KernelTensorRef<B>,
-    v: fusor_tile_ir::kernel_builder::KernelTensorRef<B>,
-    mask: Option<fusor_tile_ir::kernel_builder::KernelTensorRef<B>>,
-    output: fusor_tile_ir::kernel_builder::KernelTensorRef<B>,
+    kb: &mut fusor_tile_ir::KernelBuilder<B>,
+    q: fusor_tile_ir::KernelTensorRef<B>,
+    k: fusor_tile_ir::KernelTensorRef<B>,
+    v: fusor_tile_ir::KernelTensorRef<B>,
+    mask: Option<fusor_tile_ir::KernelTensorRef<B>>,
+    output: fusor_tile_ir::KernelTensorRef<B>,
     meta: FlashAttentionMeta,
 ) -> Option<()> {
     let q_strides: [u32; 4] = meta.q_meta.strides.as_slice().try_into().ok()?;
@@ -286,12 +286,12 @@ fn append_decode_output_loop<const BLOCK: usize>(
 }
 
 fn flash_decode_small_block<const BLOCK: usize, B>(
-    kb: &mut fusor_tile_ir::kernel_builder::KernelBuilder<B>,
-    q: fusor_tile_ir::kernel_builder::KernelTensorRef<B>,
-    k: fusor_tile_ir::kernel_builder::KernelTensorRef<B>,
-    v: fusor_tile_ir::kernel_builder::KernelTensorRef<B>,
-    output: fusor_tile_ir::kernel_builder::KernelTensorRef<B>,
-    params: fusor_tile_ir::kernel_builder::KernelTensorRef<B>,
+    kb: &mut fusor_tile_ir::KernelBuilder<B>,
+    q: fusor_tile_ir::KernelTensorRef<B>,
+    k: fusor_tile_ir::KernelTensorRef<B>,
+    v: fusor_tile_ir::KernelTensorRef<B>,
+    output: fusor_tile_ir::KernelTensorRef<B>,
+    params: fusor_tile_ir::KernelTensorRef<B>,
     meta: FlashDecodeSmallMeta,
 ) {
     let q = kb.read::<F32, 1>(q);
@@ -510,12 +510,12 @@ fn flash_decode_small_block<const BLOCK: usize, B>(
 }
 
 pub fn flash_decode_small<B>(
-    kb: &mut fusor_tile_ir::kernel_builder::KernelBuilder<B>,
-    q: fusor_tile_ir::kernel_builder::KernelTensorRef<B>,
-    k: fusor_tile_ir::kernel_builder::KernelTensorRef<B>,
-    v: fusor_tile_ir::kernel_builder::KernelTensorRef<B>,
-    output: fusor_tile_ir::kernel_builder::KernelTensorRef<B>,
-    params: fusor_tile_ir::kernel_builder::KernelTensorRef<B>,
+    kb: &mut fusor_tile_ir::KernelBuilder<B>,
+    q: fusor_tile_ir::KernelTensorRef<B>,
+    k: fusor_tile_ir::KernelTensorRef<B>,
+    v: fusor_tile_ir::KernelTensorRef<B>,
+    output: fusor_tile_ir::KernelTensorRef<B>,
+    params: fusor_tile_ir::KernelTensorRef<B>,
     meta: FlashDecodeSmallMeta,
 ) -> Option<()> {
     if meta.dims.head_dim != DECODE_HEAD_DIM || meta.decode_block == 0 || meta.groups == 0 {

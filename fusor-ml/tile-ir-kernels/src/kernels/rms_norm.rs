@@ -6,12 +6,12 @@ use fusor_tile_ir::tile::Tile;
 const RMS_NORM_VEC4_BLOCK: usize = 128;
 
 pub fn rms_norm_vec4<B>(
-    kb: &mut fusor_tile_ir::kernel_builder::KernelBuilder<B>,
-    input: fusor_tile_ir::kernel_builder::KernelTensorRef<B>,
-    residual: Option<fusor_tile_ir::kernel_builder::KernelTensorRef<B>>,
-    weight: fusor_tile_ir::kernel_builder::KernelTensorRef<B>,
-    bias: Option<fusor_tile_ir::kernel_builder::KernelTensorRef<B>>,
-    output: fusor_tile_ir::kernel_builder::KernelTensorRef<B>,
+    kb: &mut fusor_tile_ir::KernelBuilder<B>,
+    input: fusor_tile_ir::KernelTensorRef<B>,
+    residual: Option<fusor_tile_ir::KernelTensorRef<B>>,
+    weight: fusor_tile_ir::KernelTensorRef<B>,
+    bias: Option<fusor_tile_ir::KernelTensorRef<B>>,
+    output: fusor_tile_ir::KernelTensorRef<B>,
     meta: RmsNormVec4Meta,
     rows: u32,
 ) -> Option<()> {

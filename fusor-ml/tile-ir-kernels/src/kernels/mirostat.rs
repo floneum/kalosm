@@ -64,13 +64,13 @@ fn store_sample_result(
 }
 
 pub fn mirostat2<B>(
-    kb: &mut fusor_tile_ir::kernel_builder::KernelBuilder<B>,
-    ids: fusor_tile_ir::kernel_builder::KernelTensorRef<B>,
-    values: fusor_tile_ir::kernel_builder::KernelTensorRef<B>,
-    state: fusor_tile_ir::kernel_builder::KernelTensorRef<B>,
-    params: fusor_tile_ir::kernel_builder::KernelTensorRef<B>,
-    output: fusor_tile_ir::kernel_builder::KernelTensorRef<B>,
-    exactness_flag: Option<fusor_tile_ir::kernel_builder::KernelTensorRef<B>>,
+    kb: &mut fusor_tile_ir::KernelBuilder<B>,
+    ids: fusor_tile_ir::KernelTensorRef<B>,
+    values: fusor_tile_ir::KernelTensorRef<B>,
+    state: fusor_tile_ir::KernelTensorRef<B>,
+    params: fusor_tile_ir::KernelTensorRef<B>,
+    output: fusor_tile_ir::KernelTensorRef<B>,
+    exactness_flag: Option<fusor_tile_ir::KernelTensorRef<B>>,
     meta: Mirostat2Meta,
 ) -> Option<()> {
     if meta.top_k == 0 {

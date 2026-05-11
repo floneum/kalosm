@@ -196,7 +196,7 @@ impl Program {
         layout: Layout,
         access: BufferAccess,
     ) -> BufferRef {
-        let id = crate::BufferId(post_inc(&mut self.next_buffer));
+        let id = crate::ir::BufferId(post_inc(&mut self.next_buffer));
         let buffer = BufferRef::new(id, element);
         self.ir.buffers.push(BufferDecl {
             id,
@@ -220,7 +220,7 @@ impl Program {
     }
 
     pub(super) fn alloc_local_element(&mut self, element: crate::ElementType) -> LocalRef {
-        let id = crate::LocalId(post_inc(&mut self.next_local));
+        let id = crate::ir::LocalId(post_inc(&mut self.next_local));
         let local = LocalRef::new(id, element);
         self.ir.locals.push(local);
         local
@@ -243,7 +243,7 @@ impl Program {
     }
 
     pub(super) fn alloc_tile<T: Numeric>(&mut self, layout: Layout) -> TileRef {
-        let id = crate::TileId(post_inc(&mut self.next_tile));
+        let id = crate::ir::TileId(post_inc(&mut self.next_tile));
         let tile = TileRef::new(id, T::ELEMENT);
         self.ir.tiles.push(TileDecl {
             id,

@@ -1,8 +1,8 @@
 //! Program-level qmatmul / matmul / gemv / qdequantize kernel constructors.
 //! Free functions over `&mut fusor_tile_ir::Program`.
 
-use fusor_tile_ir::kernel_builder::KernelBuilder;
 use fusor_tile_ir::tile::{CoopAcc, Program, Storage, Tile};
+use fusor_tile_ir::KernelBuilder;
 use fusor_tile_ir::{
     GgmlQuantFormat, Layout, MemoryLevel, Shape, StorageView, TileLiteral, TileReduceOp,
     WorkgroupAxis, F32, U32,
