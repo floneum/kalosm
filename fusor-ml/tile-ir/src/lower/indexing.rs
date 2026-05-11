@@ -40,23 +40,15 @@ impl<'a> Lowerer<'a> {
         let (storage_tile, _) = self.storage_tile_and_offset(tile)?;
         let layout = self.tile_layout(storage_tile)?;
 
+        let id = storage_tile.id;
+        let unknown = || LowerError::UnknownTile(id);
         match layout.memory_level() {
             MemoryLevel::Workgroup => {
-                let global = self
-                    .tile_globals
-                    .get(storage_tile.id.index())
-                    .copied()
-                    .flatten()
-                    .ok_or(LowerError::UnknownTile(storage_tile.id))?;
+                let global = lookup_handle(&self.tile_globals, id.index(), unknown)?;
                 Ok(expressions.append(Expression::GlobalVariable(global), Span::default()))
             }
             MemoryLevel::Private => {
-                let local = self
-                    .tile_locals
-                    .get(storage_tile.id.index())
-                    .copied()
-                    .flatten()
-                    .ok_or(LowerError::UnknownTile(storage_tile.id))?;
+                let local = lookup_handle(&self.tile_locals, id.index(), unknown)?;
                 Ok(expressions.append(Expression::LocalVariable(local), Span::default()))
             }
             memory => Err(LowerError::UnsupportedMemoryLevel(memory)),
@@ -100,12 +92,9 @@ impl<'a> Lowerer<'a> {
         view: &StorageView,
     ) -> Result<Handle<Expression>, LowerError> {
         self.storage_layout(view)?;
-        let global = self
-            .buffer_globals
-            .get(view.buffer.id.index())
-            .copied()
-            .flatten()
-            .ok_or(LowerError::UnknownBuffer(view.buffer.id))?;
+        let global = lookup_handle(&self.buffer_globals, view.buffer.id.index(), || {
+            LowerError::UnknownBuffer(view.buffer.id)
+        })?;
         Ok(expressions.append(Expression::GlobalVariable(global), Span::default()))
     }
 
@@ -140,11 +129,9 @@ impl<'a> Lowerer<'a> {
                 used: local.element,
             });
         }
-        self.private_locals
-            .get(local.id.index())
-            .copied()
-            .flatten()
-            .ok_or(LowerError::UnknownLocal(local.id))
+        lookup_handle(&self.private_locals, local.id.index(), || {
+            LowerError::UnknownLocal(local.id)
+        })
     }
 
     pub(super) fn is_u32_literal(
@@ -381,5 +368,15 @@ impl<'a> Lowerer<'a> {
         );
         value
     }
+}
 
+/// Resolve a side-table slot of `Option<Handle<H>>` indexed by an IR id.
+/// Returns the handle if both the slot exists and was filled in, otherwise
+/// produces the caller's "unknown id" error.
+fn lookup_handle<H, E>(
+    table: &[Option<Handle<H>>],
+    index: usize,
+    err: impl FnOnce() -> E,
+) -> Result<Handle<H>, E> {
+    table.get(index).copied().flatten().ok_or_else(err)
 }
