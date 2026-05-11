@@ -610,6 +610,16 @@ impl<'a> Lowerer<'a> {
         e.append(Expression::LocalVariable(local), Span::default())
     }
 
+    /// Append an `Expression::GlobalVariable` reference. Same rationale as
+    /// `local_var`: globals are pure pointers and don't need an `Emit`.
+    pub(in crate::lower) fn global_var(
+        &self,
+        e: &mut Arena<Expression>,
+        global: Handle<GlobalVariable>,
+    ) -> Handle<Expression> {
+        e.append(Expression::GlobalVariable(global), Span::default())
+    }
+
     pub(in crate::lower) fn u32(&self, e: &mut Arena<Expression>, value: u32) -> Handle<Expression> {
         e.append(Expression::Literal(Literal::U32(value)), Span::default())
     }

@@ -45,7 +45,7 @@ impl<'a> Lowerer<'a> {
         match layout.memory_level() {
             MemoryLevel::Workgroup => {
                 let global = lookup_handle(&self.tile_globals, id.index(), unknown)?;
-                Ok(expressions.append(Expression::GlobalVariable(global), Span::default()))
+                Ok(self.global_var(expressions, global))
             }
             MemoryLevel::Private => {
                 let local = lookup_handle(&self.tile_locals, id.index(), unknown)?;
@@ -90,7 +90,7 @@ impl<'a> Lowerer<'a> {
         let global = lookup_handle(&self.buffer_globals, view.buffer.id.index(), || {
             LowerError::UnknownBuffer(view.buffer.id)
         })?;
-        Ok(expressions.append(Expression::GlobalVariable(global), Span::default()))
+        Ok(self.global_var(expressions, global))
     }
 
     pub(super) fn storage_layout<'view>(
