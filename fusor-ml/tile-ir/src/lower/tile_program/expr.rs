@@ -139,37 +139,18 @@ impl<'a> Lowerer<'a> {
                     },
                 ))
             }
-            Expr::Compare {
-                op,
-                left,
-                right,
-                output,
-            } => {
+            Expr::Compare { op, left, right } => {
                 let left =
                     self.lower_tile_expr_lane(expressions, scratch, body, left, spill_depth + 1)?;
                 let right =
                     self.lower_tile_expr_lane(expressions, scratch, body, right, spill_depth + 1)?;
-                let condition = self.emit_tile_expr(
+                Ok(self.emit_tile_expr(
                     expressions,
                     body,
                     Expression::Binary {
                         op: Self::tile_compare_binary(*op),
                         left,
                         right,
-                    },
-                );
-                if *output == ElementType::Bool {
-                    return Ok(condition);
-                }
-                let one = expressions.append(Self::one_literal(*output), Span::default());
-                let zero = expressions.append(Self::zero_literal(*output), Span::default());
-                Ok(self.emit_tile_expr(
-                    expressions,
-                    body,
-                    Expression::Select {
-                        condition,
-                        accept: one,
-                        reject: zero,
                     },
                 ))
             }

@@ -81,7 +81,7 @@ impl<'a> Lowerer<'a> {
             Expr::Cast { to, .. } => Ok(*to),
             Expr::Bitcast { to, .. } => Ok(*to),
             Expr::Select { accept, .. } => self.tile_expr_element(accept),
-            Expr::Compare { output, .. } => Ok(*output),
+            Expr::Compare { .. } => Ok(ElementType::Bool),
             Expr::SubgroupReduce { value, .. } => self.tile_expr_element(value),
             Expr::QuantizedBlockLane { .. } => Ok(ElementType::F32),
             Expr::Vec4Dot { .. } | Expr::QuantizedDot { .. } => Ok(ElementType::F32),

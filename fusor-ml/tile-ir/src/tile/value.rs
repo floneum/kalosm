@@ -8,8 +8,6 @@ use crate::ir::{
     LocalRef, StorageView, TileBinaryOp, TileCompareOp, Expr,
     TileLiteral, TileUnaryOp,
 };
-use crate::ir::ElementType;
-
 /// Handle to an 8x8 cooperative-matrix accumulator local.
 #[derive(Copy, Clone)]
 pub struct CoopAcc {
@@ -159,7 +157,6 @@ pub(super) fn index_compare<const N: usize>(left: Box<Expr>, op: TileCompareOp, 
             op,
             left,
             right: Box::new(Expr::Literal(TileLiteral::U32(value))),
-            output: ElementType::Bool,
         }),
     }
 }
@@ -494,19 +491,30 @@ impl<const N: usize> Tile<N> {
         }
     }
 
+    /// Compare two tiles producing a `Bool`-typed tile, then optionally
+    /// broadcast `1`/`0` of `output`'s element type via `Select`. Pure builder
+    /// convenience — `Expr::Compare` itself always produces `Bool`.
     pub fn compare(op: TileCompareOp, left: Self, right: Self, output: crate::ElementType) -> Self {
+        let condition = Self::compare_bool(op, left, right);
+        if output == crate::ElementType::Bool {
+            condition
+        } else {
+            let one = TileLiteral::F32(F32Bits::new(1.0));
+            let zero = TileLiteral::F32(F32Bits::new(0.0));
+            let one = Tile::literal(one).cast(output);
+            let zero = Tile::literal(zero).cast(output);
+            Self::select(condition, one, zero)
+        }
+    }
+
+    pub fn compare_bool(op: TileCompareOp, left: Self, right: Self) -> Self {
         Self {
             expr: Expr::Compare {
                 op,
                 left: Box::new(left.expr),
                 right: Box::new(right.expr),
-                output,
             },
         }
-    }
-
-    pub fn compare_bool(op: TileCompareOp, left: Self, right: Self) -> Self {
-        Self::compare(op, left, right, crate::ElementType::Bool)
     }
 
     tile_compare_methods!(lt => Lt, le => Le, gt => Gt, ge => Ge, eq => Eq, ne => Ne);

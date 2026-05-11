@@ -75,11 +75,11 @@ pub enum Expr {
         accept: Box<Expr>,
         reject: Box<Expr>,
     },
+    /// Returns Bool. To get a 0/1 numeric, follow with `Select(cond, 1, 0)`.
     Compare {
         op: TileCompareOp,
         left: Box<Expr>,
         right: Box<Expr>,
-        output: ElementType,
     },
     /// Reduction across the lanes of one subgroup. Lowers to
     /// `subgroupAdd`/`subgroupMax`/`subgroupMin` — no shared-memory tree, no

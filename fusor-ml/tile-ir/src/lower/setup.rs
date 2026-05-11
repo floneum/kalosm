@@ -566,7 +566,7 @@ impl<'a> Lowerer<'a> {
                 *to == ElementType::F16 || Self::tile_expr_uses_f16(value)
             }
             Expr::Binary { .. } => false,
-            Expr::Compare { output, .. } => *output == ElementType::F16,
+            Expr::Compare { .. } => false,
             Expr::Select { .. } => false,
             Expr::SubgroupReduce { .. }
             | Expr::QuantizedBlockLane { .. }
