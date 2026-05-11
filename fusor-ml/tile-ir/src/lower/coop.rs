@@ -382,16 +382,17 @@ impl<'a> Lowerer<'a> {
 
         self.lower_copy_passes(expressions, body, local, total, |expressions, flat| {
             let mut accept = Block::new();
-            let (global_row, global_col, tile_ptr) = self.copy_lane_pointer_and_globals(
-                expressions,
-                &mut accept,
-                flat,
-                dst,
-                cols,
-                stride,
-                row_base,
-                col_base,
-            )?;
+            let CopyLaneCoords { global_row, global_col, tile_ptr } = self
+                .copy_lane_pointer_and_globals(
+                    expressions,
+                    &mut accept,
+                    flat,
+                    dst,
+                    cols,
+                    stride,
+                    row_base,
+                    col_base,
+                )?;
             let storage_index = self.storage_index_from_coords(
                 expressions,
                 src,
@@ -538,16 +539,17 @@ impl<'a> Lowerer<'a> {
         let total = rows * cols;
         self.lower_copy_passes(expressions, body, local, total, |expressions, flat| {
             let mut accept = Block::new();
-            let (global_row, global_col, tile_ptr) = self.copy_lane_pointer_and_globals(
-                expressions,
-                &mut accept,
-                flat,
-                dst,
-                cols,
-                stride,
-                row_base,
-                col_base,
-            )?;
+            let CopyLaneCoords { global_row, global_col, tile_ptr } = self
+                .copy_lane_pointer_and_globals(
+                    expressions,
+                    &mut accept,
+                    flat,
+                    dst,
+                    cols,
+                    stride,
+                    row_base,
+                    col_base,
+                )?;
             let value =
                 self.dequantize_qvalue(expressions, src, global_row, global_col, &mut accept)?;
             accept.push(
@@ -668,7 +670,7 @@ impl<'a> Lowerer<'a> {
         stride: u32,
         row_base: Handle<Expression>,
         col_base: Handle<Expression>,
-    ) -> Result<(Handle<Expression>, Handle<Expression>, Handle<Expression>), LowerError> {
+    ) -> Result<CopyLaneCoords, LowerError> {
         let local_row = self.div_literal_u32_emitted(expressions, flat, cols, body);
         let local_col = self.mod_literal_u32_emitted(expressions, flat, cols, body);
         let global_row = self.bin(expressions, body, BinaryOperator::Add, row_base, local_row);
@@ -676,6 +678,14 @@ impl<'a> Lowerer<'a> {
         let tile_index =
             self.tile_matrix_index_inline(expressions, body, local_row, local_col, stride);
         let tile_ptr = self.tile_dynamic_pointer(expressions, dst, tile_index, body)?;
-        Ok((global_row, global_col, tile_ptr))
+        Ok(CopyLaneCoords { global_row, global_col, tile_ptr })
     }
+}
+
+/// One copy lane's resolved global source (row, col) and destination tile
+/// pointer. Returned by `Lowerer::copy_lane_pointer_and_globals`.
+pub(super) struct CopyLaneCoords {
+    pub global_row: Handle<Expression>,
+    pub global_col: Handle<Expression>,
+    pub tile_ptr: Handle<Expression>,
 }
