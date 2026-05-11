@@ -34,7 +34,7 @@ impl<'a> Lowerer<'a> {
             return self.u32(expressions,folded + literal);
         }
         let rhs = self.u32(expressions,literal);
-        self.emit_tile_expr(expressions, body, Expression::Binary {
+        self.emit(expressions, body, Expression::Binary {
             op: BinaryOperator::Add,
             left: value,
             right: rhs,
@@ -55,7 +55,7 @@ impl<'a> Lowerer<'a> {
             return self.u32(expressions,folded * literal);
         }
         let rhs = self.u32(expressions,literal);
-        self.emit_tile_expr(expressions, body, Expression::Binary {
+        self.emit(expressions, body, Expression::Binary {
             op: BinaryOperator::Multiply,
             left: value,
             right: rhs,
@@ -83,7 +83,7 @@ impl<'a> Lowerer<'a> {
         } else {
             (BinaryOperator::Divide, self.u32(expressions,literal))
         };
-        self.emit_tile_expr(expressions, body, Expression::Binary { op, left: value, right: rhs })
+        self.emit(expressions, body, Expression::Binary { op, left: value, right: rhs })
     }
 
     pub(super) fn mod_literal_u32_emitted(
@@ -104,7 +104,7 @@ impl<'a> Lowerer<'a> {
         } else {
             (BinaryOperator::Modulo, self.u32(expressions,literal))
         };
-        self.emit_tile_expr(expressions, body, Expression::Binary { op, left: value, right: rhs })
+        self.emit(expressions, body, Expression::Binary { op, left: value, right: rhs })
     }
 
 }

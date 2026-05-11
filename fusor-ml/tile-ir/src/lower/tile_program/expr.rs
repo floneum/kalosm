@@ -80,7 +80,7 @@ impl<'a> Lowerer<'a> {
                         _ => unreachable!(),
                     },
                 };
-                Ok(self.emit_tile_expr(expressions, body, expr))
+                Ok(self.emit(expressions, body, expr))
             }
             Expr::Binary { op, left, right } => {
                 let left =
@@ -88,7 +88,7 @@ impl<'a> Lowerer<'a> {
                 let right =
                     self.lower_tile_expr_lane(expressions, scratch, body, right, spill_depth + 1)?;
                 let expr = Self::tile_binary_expression(*op, left, right);
-                Ok(self.emit_tile_expr(expressions, body, expr))
+                Ok(self.emit(expressions, body, expr))
             }
             Expr::Cast { value, to } => {
                 let source = value.element();
@@ -100,7 +100,7 @@ impl<'a> Lowerer<'a> {
                 let value =
                     self.lower_tile_expr_lane(expressions, scratch, body, value, spill_depth)?;
                 let scalar = Self::element_scalar(*to);
-                Ok(self.emit_tile_expr(
+                Ok(self.emit(
                     expressions,
                     body,
                     Expression::As {
@@ -128,7 +128,7 @@ impl<'a> Lowerer<'a> {
                     self.lower_tile_expr_lane(expressions, scratch, body, accept, spill_depth + 1)?;
                 let reject =
                     self.lower_tile_expr_lane(expressions, scratch, body, reject, spill_depth + 1)?;
-                Ok(self.emit_tile_expr(
+                Ok(self.emit(
                     expressions,
                     body,
                     Expression::Select {
@@ -143,7 +143,7 @@ impl<'a> Lowerer<'a> {
                     self.lower_tile_expr_lane(expressions, scratch, body, left, spill_depth + 1)?;
                 let right =
                     self.lower_tile_expr_lane(expressions, scratch, body, right, spill_depth + 1)?;
-                Ok(self.emit_tile_expr(
+                Ok(self.emit(
                     expressions,
                     body,
                     Expression::Binary {
@@ -193,7 +193,7 @@ impl<'a> Lowerer<'a> {
                         spill_depth + 1,
                     )?);
                 }
-                Ok(self.emit_tile_expr(
+                Ok(self.emit(
                     expressions,
                     body,
                     Expression::Compose {
@@ -275,7 +275,7 @@ impl<'a> Lowerer<'a> {
                     Expression::FunctionArgument(WORKGROUP_ID_ARG),
                     Span::default(),
                 );
-                self.emit_tile_expr(
+                self.emit(
                     expressions,
                     body,
                     Expression::AccessIndex {

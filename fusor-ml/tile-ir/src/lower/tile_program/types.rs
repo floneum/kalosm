@@ -82,7 +82,7 @@ impl<'a> Lowerer<'a> {
             return value;
         }
         let scalar = Self::element_scalar(target);
-        self.emit_tile_expr(
+        self.emit(
             expressions,
             body,
             Expression::As {
@@ -104,7 +104,7 @@ impl<'a> Lowerer<'a> {
             return value;
         }
         let zero = expressions.append(Self::zero_literal(element), Span::default());
-        self.emit_tile_expr(
+        self.emit(
             expressions,
             body,
             Expression::Binary {
@@ -186,17 +186,4 @@ impl<'a> Lowerer<'a> {
         }
     }
 
-    pub(in crate::lower) fn emit_tile_expr(
-        &self,
-        expressions: &mut Arena<Expression>,
-        body: &mut Block,
-        expr: Expression,
-    ) -> Handle<Expression> {
-        let handle = expressions.append(expr, Span::default());
-        body.push(
-            Statement::Emit(Self::single_expression_range(expressions, handle)),
-            Span::default(),
-        );
-        handle
-    }
 }

@@ -50,7 +50,7 @@ impl<'a> Lowerer<'a> {
                     Statement::Emit(Self::single_expression_range(expressions, acc)),
                     Span::default(),
                 );
-                let reduced = self.emit_tile_expr(
+                let reduced = self.emit(
                     expressions,
                     loop_body,
                     Self::tile_reduce_expression(op, acc, value),
@@ -136,7 +136,7 @@ impl<'a> Lowerer<'a> {
         while stride > 0 {
             let limit =
                 expressions.append(Expression::Literal(Literal::U32(stride)), Span::default());
-            let participates = self.emit_tile_expr(
+            let participates = self.emit(
                 expressions,
                 body,
                 Expression::Binary {
@@ -196,7 +196,7 @@ impl<'a> Lowerer<'a> {
             Statement::Emit(Self::range_from(expressions, lhs, rhs)),
             Span::default(),
         );
-        let reduced = self.emit_tile_expr(
+        let reduced = self.emit(
             expressions,
             &mut body,
             Self::tile_reduce_expression(op, lhs, rhs),
