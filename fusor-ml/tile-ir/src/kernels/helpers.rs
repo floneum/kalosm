@@ -31,26 +31,28 @@ pub(super) fn add_scaled_index<const BLOCK: usize>(
     }
 }
 
+/// `offset + sum(strides[i] * components[i])`. Strided index into a
+/// rank-`N` row-major tensor, with a constant scalar offset folded in. The
+/// `add_scaled_index` shortcut elides the multiply when the corresponding
+/// stride is zero.
+pub(super) fn index_n<const N: usize, const BLOCK: usize>(
+    offset: u32,
+    strides: [u32; N],
+    components: [Tile<BLOCK>; N],
+) -> Tile<BLOCK> {
+    components
+        .into_iter()
+        .zip(strides)
+        .fold(u32_tile(offset), |idx, (c, s)| add_scaled_index(idx, c, s))
+}
+
 pub(super) fn index2<const BLOCK: usize>(
     offset: u32,
     strides: [u32; 2],
     i0: Tile<BLOCK>,
     i1: Tile<BLOCK>,
 ) -> Tile<BLOCK> {
-    let index = add_scaled_index(u32_tile(offset), i0, strides[0]);
-    add_scaled_index(index, i1, strides[1])
-}
-
-pub(super) fn index3_with_base<const BLOCK: usize>(
-    base: u32,
-    strides: [u32; 3],
-    i0: Tile<BLOCK>,
-    i1: Tile<BLOCK>,
-    i2: Tile<BLOCK>,
-) -> Tile<BLOCK> {
-    let index = add_scaled_index(u32_tile(base), i0, strides[0]);
-    let index = add_scaled_index(index, i1, strides[1]);
-    add_scaled_index(index, i2, strides[2])
+    index_n(offset, strides, [i0, i1])
 }
 
 pub(super) fn index4<const BLOCK: usize>(
@@ -61,8 +63,7 @@ pub(super) fn index4<const BLOCK: usize>(
     i2: Tile<BLOCK>,
     i3: Tile<BLOCK>,
 ) -> Tile<BLOCK> {
-    let index = index3_with_base(offset, [strides[0], strides[1], strides[2]], i0, i1, i2);
-    add_scaled_index(index, i3, strides[3])
+    index_n(offset, strides, [i0, i1, i2, i3])
 }
 
 pub(super) fn index4_const_last<const BLOCK: usize>(
@@ -74,7 +75,7 @@ pub(super) fn index4_const_last<const BLOCK: usize>(
     i3: u32,
 ) -> Tile<BLOCK> {
     let base = offset + i3 * strides[3];
-    index3_with_base(base, [strides[0], strides[1], strides[2]], i0, i1, i2)
+    index_n(base, [strides[0], strides[1], strides[2]], [i0, i1, i2])
 }
 
 /// Tree-reduce a workgroup-scratch array by halving stride, applying
