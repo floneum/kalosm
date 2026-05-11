@@ -382,30 +382,16 @@ impl<'a> Lowerer<'a> {
 
         self.lower_copy_passes(expressions, body, local, total, |expressions, flat| {
             let mut accept = Block::new();
-            let local_row = self.div_literal_u32_emitted(expressions, flat, cols, &mut accept);
-            let local_col = self.mod_literal_u32_emitted(expressions, flat, cols, &mut accept);
-            let global_row = self.bin(
+            let (global_row, global_col, tile_ptr) = self.copy_lane_pointer_and_globals(
                 expressions,
                 &mut accept,
-                BinaryOperator::Add,
-                row_base,
-                local_row,
-            );
-            let global_col = self.bin(
-                expressions,
-                &mut accept,
-                BinaryOperator::Add,
-                col_base,
-                local_col,
-            );
-            let tile_index = self.tile_matrix_index_inline(
-                expressions,
-                &mut accept,
-                local_row,
-                local_col,
+                flat,
+                dst,
+                cols,
                 stride,
-            );
-            let tile_ptr = self.tile_dynamic_pointer(expressions, dst, tile_index, &mut accept)?;
+                row_base,
+                col_base,
+            )?;
             let storage_index = self.storage_index_from_coords(
                 expressions,
                 src,
@@ -552,30 +538,16 @@ impl<'a> Lowerer<'a> {
         let total = rows * cols;
         self.lower_copy_passes(expressions, body, local, total, |expressions, flat| {
             let mut accept = Block::new();
-            let local_row = self.div_literal_u32_emitted(expressions, flat, cols, &mut accept);
-            let local_col = self.mod_literal_u32_emitted(expressions, flat, cols, &mut accept);
-            let global_row = self.bin(
+            let (global_row, global_col, tile_ptr) = self.copy_lane_pointer_and_globals(
                 expressions,
                 &mut accept,
-                BinaryOperator::Add,
-                row_base,
-                local_row,
-            );
-            let global_col = self.bin(
-                expressions,
-                &mut accept,
-                BinaryOperator::Add,
-                col_base,
-                local_col,
-            );
-            let tile_index = self.tile_matrix_index_inline(
-                expressions,
-                &mut accept,
-                local_row,
-                local_col,
+                flat,
+                dst,
+                cols,
                 stride,
-            );
-            let tile_ptr = self.tile_dynamic_pointer(expressions, dst, tile_index, &mut accept)?;
+                row_base,
+                col_base,
+            )?;
             let value =
                 self.dequantize_qvalue(expressions, src, global_row, global_col, &mut accept)?;
             accept.push(
@@ -680,5 +652,30 @@ impl<'a> Lowerer<'a> {
     ) -> Handle<Expression> {
         let row_offset = self.mul_literal_u32_emitted(expressions, row, stride, body);
         self.bin(expressions, body, BinaryOperator::Add, row_offset, col)
+    }
+
+    /// Resolve a flat invocation index into the destination tile pointer plus
+    /// the source's global (row, col). Shared by `lower_copy_to_tile` and the
+    /// scalar fallback in `lower_copy_quant_to_tile`.
+    #[allow(clippy::too_many_arguments)]
+    fn copy_lane_pointer_and_globals(
+        &self,
+        expressions: &mut Arena<Expression>,
+        body: &mut Block,
+        flat: Handle<Expression>,
+        dst: TileRef,
+        cols: u32,
+        stride: u32,
+        row_base: Handle<Expression>,
+        col_base: Handle<Expression>,
+    ) -> Result<(Handle<Expression>, Handle<Expression>, Handle<Expression>), LowerError> {
+        let local_row = self.div_literal_u32_emitted(expressions, flat, cols, body);
+        let local_col = self.mod_literal_u32_emitted(expressions, flat, cols, body);
+        let global_row = self.bin(expressions, body, BinaryOperator::Add, row_base, local_row);
+        let global_col = self.bin(expressions, body, BinaryOperator::Add, col_base, local_col);
+        let tile_index =
+            self.tile_matrix_index_inline(expressions, body, local_row, local_col, stride);
+        let tile_ptr = self.tile_dynamic_pointer(expressions, dst, tile_index, body)?;
+        Ok((global_row, global_col, tile_ptr))
     }
 }
