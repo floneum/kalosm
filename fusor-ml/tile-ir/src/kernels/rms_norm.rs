@@ -1,4 +1,4 @@
-use crate::{F32Bits, TileLiteral, TileReduceOp, WorkgroupAxis};
+use crate::{TileLiteral, TileReduceOp, WorkgroupAxis};
 
 use super::types::RmsNormVec4Meta;
 use crate::tile::Tile;
@@ -55,9 +55,7 @@ pub fn rms_norm_vec4<B>(
             );
             let total_sum = program.group_reduce_sum::<RMS_NORM_VEC4_BLOCK>(partial_sum);
             let mean = total_sum
-                / Tile::<RMS_NORM_VEC4_BLOCK>::literal(TileLiteral::F32(F32Bits::new(
-                    meta.cols as f32,
-                )));
+                / Tile::<RMS_NORM_VEC4_BLOCK>::literal(TileLiteral::f32(meta.cols as f32));
             let scale = (mean
                 + Tile::<RMS_NORM_VEC4_BLOCK>::literal(TileLiteral::f32(eps)))
             .inverse_sqrt();
