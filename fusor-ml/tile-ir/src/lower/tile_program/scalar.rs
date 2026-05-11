@@ -186,11 +186,7 @@ impl<'a> Lowerer<'a> {
         op: TileReduceOp,
     ) -> Result<Block, LowerError> {
         let mut body = Block::new();
-        let rhs_index = self.add_literal_u32(expressions, lane, stride);
-        body.push(
-            Statement::Emit(Self::single_expression_range(expressions, rhs_index)),
-            Span::default(),
-        );
+        let rhs_index = self.add_literal_u32_emitted(expressions, lane, stride, &mut body);
         let lhs_ptr = self.tile_dynamic_pointer(expressions, scratch_tile, lane, &mut body)?;
         let rhs_ptr =
             self.tile_dynamic_pointer(expressions, scratch_tile, rhs_index, &mut body)?;

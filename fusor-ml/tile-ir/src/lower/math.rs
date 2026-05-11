@@ -20,33 +20,6 @@ impl<'a> Lowerer<'a> {
         Ok((tile, 0))
     }
 
-    pub(super) fn add_literal_u32(
-        &self,
-        expressions: &mut Arena<Expression>,
-        value: Handle<Expression>,
-        literal: u32,
-    ) -> Handle<Expression> {
-        if literal == 0 {
-            return value;
-        }
-        if let Some(value) = Self::u32_literal(expressions, value) {
-            return expressions.append(
-                Expression::Literal(Literal::U32(value + literal)),
-                Span::default(),
-            );
-        }
-        let literal =
-            expressions.append(Expression::Literal(Literal::U32(literal)), Span::default());
-        expressions.append(
-            Expression::Binary {
-                op: BinaryOperator::Add,
-                left: value,
-                right: literal,
-            },
-            Span::default(),
-        )
-    }
-
     pub(super) fn add_literal_u32_emitted(
         &self,
         expressions: &mut Arena<Expression>,

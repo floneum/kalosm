@@ -268,7 +268,7 @@ impl<'a> Lowerer<'a> {
             let low = self.and_lit(expressions, body, byte, 0x0f);
             let high4 = self.shr_lit(expressions, body, byte, 4);
             let low4 = self.select(expressions, body, high, high4, low);
-            let lane_index = self.add_literal_u32(expressions, high_base, lane as u32);
+            let lane_index = self.add_literal_u32_emitted(expressions, high_base, lane as u32, body);
             let shifted_qh = self.shr(expressions, body, qh, lane_index);
             let hi_bit_low = self.and_lit(expressions, body, shifted_qh, 1);
             let hi_bit = self.shl_lit(expressions, body, hi_bit_low, 4);
