@@ -12,7 +12,7 @@ use naga::{
 
 use crate::ir::{
     BlockDequantId, BufferAccess, BufferId, CoopFragmentId, CoopOperandRole, CopySource,
-    DotK, DynamicOffset, ElementType, Expr, FlattenedMatrixMap, Im2ColNhwcMap, KernelIr,
+    DotK, ElementType, Expr, FlattenedMatrixMap, Im2ColNhwcMap, KernelIr,
     Layout, LocalId, LocalRef, MemoryLevel, PackedActivations, StorageIndexMap, StorageView,
     TileBinaryOp, TileCompareOp, TileId, TileLinearLoadExpr, TileLiteral, TileLoadExpr,
     LoadSource, TileProgramOp, TileReduceOp, TileRef, TileStmt,

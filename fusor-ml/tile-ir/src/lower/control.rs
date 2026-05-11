@@ -207,16 +207,6 @@ impl<'a> Lowerer<'a> {
         }
     }
 
-    pub(super) fn load_u32_local(
-        &self,
-        expressions: &mut Arena<Expression>,
-        local: Handle<LocalVariable>,
-    ) -> (Handle<Expression>, Range<Expression>) {
-        let pointer = expressions.append(Expression::LocalVariable(local), Span::default());
-        let value = expressions.append(Expression::Load { pointer }, Span::default());
-        (value, Self::single_expression_range(expressions, value))
-    }
-
     pub(super) fn current_loop_index(&self) -> Handle<LocalVariable> {
         self.loop_index_local
             .expect("scratch locals must be created before lowering storage offsets")

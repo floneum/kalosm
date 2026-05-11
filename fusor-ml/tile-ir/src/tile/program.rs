@@ -207,7 +207,6 @@ impl Program {
         StorageView {
             buffer,
             offset,
-            dynamic_offsets: vec![None; layout.shape().rank()],
             layout,
             index_map,
         }
@@ -601,7 +600,6 @@ impl Program {
             view: StorageView {
                 buffer: y.view.buffer,
                 offset: y.view.offset,
-                dynamic_offsets: vec![None, None],
                 layout: Layout::contiguous(MemoryLevel::Storage, Shape::new([1, total])),
                 index_map: None,
             },

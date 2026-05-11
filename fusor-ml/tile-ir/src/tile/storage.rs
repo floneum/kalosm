@@ -1,9 +1,7 @@
 
 use std::marker::PhantomData;
 
-use crate::ir::{
-    DynamicOffset, Im2ColNhwcMap, Layout, MemoryLevel, Shape, StorageIndexMap, StorageView, WorkgroupOffset,
-};
+use crate::ir::{Im2ColNhwcMap, Layout, MemoryLevel, Shape, StorageIndexMap, StorageView};
 use super::*;
 
 pub struct Storage<T, const R: usize> {
@@ -47,51 +45,6 @@ impl<T> Storage<T, 2> {
         }
     }
 
-    pub fn dynamic_tile_2d(
-        &self,
-        shape: Shape,
-        row_offset: Option<DynamicOffset>,
-        col_offset: Option<DynamicOffset>,
-    ) -> Self {
-        assert_eq!(self.view.layout.shape().rank(), 2, "parent view must be 2D");
-        assert_eq!(shape.rank(), 2, "tile view must be 2D");
-        assert!(
-            self.view.dynamic_offsets.iter().all(Option::is_none),
-            "nested dynamic storage views are not supported"
-        );
-        assert!(
-            self.view.index_map.is_none(),
-            "nested mapped storage views are not supported"
-        );
-        let layout = Layout::strided(
-            MemoryLevel::Storage,
-            shape,
-            self.view.layout.strides().clone(),
-        );
-        Self {
-            view: StorageView {
-                buffer: self.view.buffer,
-                offset: self.view.offset,
-                layout,
-                dynamic_offsets: vec![row_offset, col_offset],
-                index_map: None,
-            },
-            _ty: PhantomData,
-        }
-    }
-
-    pub fn workgroup_tile_2d(
-        &self,
-        shape: Shape,
-        row_offset: Option<WorkgroupOffset>,
-        col_offset: Option<WorkgroupOffset>,
-    ) -> Self {
-        self.dynamic_tile_2d(
-            shape,
-            row_offset.map(DynamicOffset::Workgroup),
-            col_offset.map(DynamicOffset::Workgroup),
-        )
-    }
 }
 
 impl ErasedStorage<2> {
@@ -121,10 +74,6 @@ impl<T> Storage<T, 4> {
             self.view.layout.shape().rank(),
             4,
             "NHWC input must be rank-4"
-        );
-        assert!(
-            self.view.dynamic_offsets.iter().all(Option::is_none),
-            "im2col views do not support dynamic offsets"
         );
         assert!(
             self.view.index_map.is_none(),
@@ -210,7 +159,6 @@ impl<T> Storage<T, 4> {
                 buffer: self.view.buffer,
                 offset: self.view.offset,
                 layout: Layout::contiguous(MemoryLevel::Storage, shape),
-                dynamic_offsets: vec![None, None],
                 index_map: Some(StorageIndexMap::Im2ColNhwc(map)),
             },
             _ty: PhantomData,

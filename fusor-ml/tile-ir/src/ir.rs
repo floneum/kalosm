@@ -205,19 +205,16 @@ pub struct StorageView {
     pub buffer: BufferRef,
     pub offset: u32,
     pub layout: Layout,
-    pub dynamic_offsets: Vec<Option<DynamicOffset>>,
     pub index_map: Option<StorageIndexMap>,
 }
 
 impl StorageView {
-    /// Construct a storage view with no dynamic workgroup offset.
+    /// Construct a storage view directly over `buffer`.
     pub fn root(buffer: BufferRef, layout: Layout) -> Self {
-        let dynamic_offsets = vec![None; layout.shape().rank()];
         Self {
             buffer,
             offset: 0,
             layout,
-            dynamic_offsets,
             index_map: None,
         }
     }
@@ -255,54 +252,6 @@ pub struct Im2ColNhwcMap {
     pub row_stride: u32,
     pub col_stride: u32,
     pub channel_stride: u32,
-}
-
-/// Dynamic coordinate offset used by storage views.
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub enum DynamicOffset {
-    /// Offset derived from `@builtin(workgroup_id)`.
-    Workgroup(WorkgroupOffset),
-    /// Offset derived from the innermost IR loop induction variable.
-    Loop(LoopOffset),
-}
-
-impl From<WorkgroupOffset> for DynamicOffset {
-    fn from(offset: WorkgroupOffset) -> Self {
-        Self::Workgroup(offset)
-    }
-}
-
-impl From<LoopOffset> for DynamicOffset {
-    fn from(offset: LoopOffset) -> Self {
-        Self::Loop(offset)
-    }
-}
-
-/// Dynamic coordinate offset derived from `@builtin(workgroup_id)`.
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub struct WorkgroupOffset {
-    pub axis: WorkgroupAxis,
-    pub scale: u32,
-}
-
-impl WorkgroupOffset {
-    /// Offset an axis by `workgroup_id.axis * scale`.
-    pub const fn new(axis: WorkgroupAxis, scale: u32) -> Self {
-        Self { axis, scale }
-    }
-}
-
-/// Dynamic coordinate offset derived from the current loop induction.
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub struct LoopOffset {
-    pub scale: u32,
-}
-
-impl LoopOffset {
-    /// Offset an axis by `loop_index * scale`.
-    pub const fn new(scale: u32) -> Self {
-        Self { scale }
-    }
 }
 
 /// Axis of `@builtin(workgroup_id)`.

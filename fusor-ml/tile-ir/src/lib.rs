@@ -14,13 +14,12 @@ pub mod quantized;
 pub mod tile;
 
 pub use ir::{
-    Bool, BufferAccess, BufferDecl, BufferId, BufferRef, CoopOperandRole, DynamicOffset,
-    ElementType, F32Bits, F32Vec4, FlattenedMatrixMap, Im2ColNhwcMap, KernelIr, Layout, LocalDecl,
-    LocalId, LocalRef, LoopOffset, MemoryLevel, Numeric, Shape, StorageIndexMap, StorageView,
-    Strides, TileBinaryOp, TileCompareOp, TileDecl, Expr, TileId,
-    TileIndexedStoreStmt, TileLinearLoadExpr, TileLiteral, TileLoadExpr,
-    LoadSource, TileProgramOp, TileReduceOp, TileRef,
-    TileStmt, TileUnaryOp, WorkgroupAxis, WorkgroupOffset, F16, F32, U32,
+    Bool, BufferAccess, BufferDecl, BufferId, BufferRef, CoopOperandRole, ElementType, F32Bits,
+    F32Vec4, FlattenedMatrixMap, Im2ColNhwcMap, KernelIr, Layout, LoadSource, LocalDecl, LocalId,
+    LocalRef, MemoryLevel, Numeric, Shape, StorageIndexMap, StorageView, Strides, TileBinaryOp,
+    TileCompareOp, TileDecl, Expr, TileId, TileIndexedStoreStmt, TileLinearLoadExpr, TileLiteral,
+    TileLoadExpr, TileProgramOp, TileReduceOp, TileRef, TileStmt, TileUnaryOp, WorkgroupAxis, F16,
+    F32, U32,
 };
 pub use kernel_builder::{KernelBuilder, KernelTensorRef};
 pub use kernels::{

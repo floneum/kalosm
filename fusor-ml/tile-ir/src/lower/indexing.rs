@@ -157,27 +157,7 @@ impl<'a> Lowerer<'a> {
         view: &StorageView,
         coords: &[Handle<Expression>],
     ) -> Result<(Handle<Expression>, Vec<Range<Expression>>), LowerError> {
-        self.storage_index_from_coords_filtered(expressions, view, coords, false)
-    }
-
-    pub(super) fn storage_index_from_coords_filtered(
-        &self,
-        expressions: &mut Arena<Expression>,
-        view: &StorageView,
-        coords: &[Handle<Expression>],
-        skip_loop_offsets: bool,
-    ) -> Result<(Handle<Expression>, Vec<Range<Expression>>), LowerError> {
         if let Some(index_map) = &view.index_map {
-            if view.dynamic_offsets.iter().any(Option::is_some) {
-                return Err(LowerError::UnsupportedOperation(
-                    "mapped storage views do not support dynamic offsets",
-                ));
-            }
-            if skip_loop_offsets {
-                return Err(LowerError::UnsupportedOperation(
-                    "mapped storage views do not support partial dynamic-offset indexing",
-                ));
-            }
             return self.storage_index_from_index_map(expressions, index_map, coords);
         }
 
@@ -188,16 +168,8 @@ impl<'a> Lowerer<'a> {
 
         let mut emits = Vec::new();
         let mut terms = Vec::with_capacity(coords.len());
-        for (axis, (coord, stride)) in coords.iter().zip(layout.strides().values()).enumerate() {
-            let coord = self.apply_dynamic_offset_filtered(
-                expressions,
-                *coord,
-                &view.dynamic_offsets,
-                axis,
-                skip_loop_offsets,
-                &mut emits,
-            );
-            terms.push(self.mul_literal_u32_emitted(expressions, coord, *stride, &mut emits));
+        for (coord, stride) in coords.iter().zip(layout.strides().values()) {
+            terms.push(self.mul_literal_u32_emitted(expressions, *coord, *stride, &mut emits));
         }
         let mut terms = terms.into_iter();
         let Some(mut index) = terms.next() else {
@@ -389,62 +361,4 @@ impl<'a> Lowerer<'a> {
         value
     }
 
-    pub(super) fn apply_dynamic_offset_filtered(
-        &self,
-        expressions: &mut Arena<Expression>,
-        coord: Handle<Expression>,
-        dynamic_offsets: &[Option<DynamicOffset>],
-        axis_index: usize,
-        skip_loop_offsets: bool,
-        emits: &mut Vec<Range<Expression>>,
-    ) -> Handle<Expression> {
-        let Some(Some(offset)) = dynamic_offsets.get(axis_index) else {
-            return coord;
-        };
-        if skip_loop_offsets && matches!(offset, DynamicOffset::Loop(_)) {
-            return coord;
-        }
-        let scaled = self.dynamic_offset_scaled(expressions, *offset, emits);
-        let coord = expressions.append(
-            Expression::Binary {
-                op: BinaryOperator::Add,
-                left: coord,
-                right: scaled,
-            },
-            Span::default(),
-        );
-        emits.push(Self::single_expression_range(expressions, coord));
-        coord
-    }
-
-    pub(super) fn dynamic_offset_scaled(
-        &self,
-        expressions: &mut Arena<Expression>,
-        offset: DynamicOffset,
-        emits: &mut Vec<Range<Expression>>,
-    ) -> Handle<Expression> {
-        match offset {
-            DynamicOffset::Workgroup(offset) => {
-                let workgroup_id = expressions.append(
-                    Expression::FunctionArgument(WORKGROUP_ID_ARG),
-                    Span::default(),
-                );
-                let axis = expressions.append(
-                    Expression::AccessIndex {
-                        base: workgroup_id,
-                        index: offset.axis.index(),
-                    },
-                    Span::default(),
-                );
-                emits.push(Self::single_expression_range(expressions, axis));
-                self.mul_literal_u32_emitted(expressions, axis, offset.scale, emits)
-            }
-            DynamicOffset::Loop(offset) => {
-                let (loop_index, loop_emit) =
-                    self.load_u32_local(expressions, self.current_loop_index());
-                emits.push(loop_emit);
-                self.mul_literal_u32_emitted(expressions, loop_index, offset.scale, emits)
-            }
-        }
-    }
 }
