@@ -175,24 +175,14 @@ impl<'a> Lowerer<'a> {
                 spill_depth,
             ),
             Expr::Compose4 { values } => {
-                let mut handles = Vec::with_capacity(4);
-                for value in values.iter() {
-                    handles.push(self.lower_tile_expr_lane(
-                        expressions,
-                        scratch,
-                        body,
-                        value,
-                        spill_depth + 1,
-                    )?);
-                }
-                Ok(self.emit(
-                    expressions,
-                    body,
-                    Expression::Compose {
-                        ty: self.f32_vec4_ty,
-                        components: handles,
-                    },
-                ))
+                let handles = values
+                    .iter()
+                    .map(|value| {
+                        self.lower_tile_expr_lane(expressions, scratch, body, value, spill_depth + 1)
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                let handles: [_; 4] = handles.try_into().expect("Compose4 carries exactly 4");
+                Ok(self.compose_f32_vec4(expressions, body, handles))
             }
             Expr::Vec4Dot { left, right } => {
                 let left =
