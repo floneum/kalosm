@@ -184,34 +184,10 @@ impl<'a> Lowerer<'a> {
     ) -> Handle<Expression> {
         let bias = self.u32(e, 128);
         let biased = self.bin(e, body, BinaryOperator::ExclusiveOr, byte, bias);
-        let as_i32 = self.emit(
-            e,
-            body,
-            Expression::As {
-                expr: biased,
-                kind: ScalarKind::Sint,
-                convert: Some(4),
-            },
-        );
-        let offset = e.append(Expression::Literal(Literal::I32(128)), Span::default());
-        let signed = self.emit(
-            e,
-            body,
-            Expression::Binary {
-                op: BinaryOperator::Subtract,
-                left: as_i32,
-                right: offset,
-            },
-        );
-        self.emit(
-            e,
-            body,
-            Expression::As {
-                expr: signed,
-                kind: ScalarKind::Float,
-                convert: Some(4),
-            },
-        )
+        let as_i32 = self.as_i32(e, body, biased);
+        let offset = self.i32(e, 128);
+        let signed = self.sub(e, body, as_i32, offset);
+        self.as_f32(e, body, signed)
     }
 
     pub(in crate::lower) fn emit(
