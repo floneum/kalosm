@@ -82,28 +82,19 @@ pub(super) fn q4k_ggml_activations<const BLOCK: usize>(
     vector_base: &ScalarIndex,
     in_bounds: Mask<BLOCK>,
 ) -> Q4KGgmlActivations<BLOCK> {
-    let low: [Bound<BLOCK>; 16] = std::array::from_fn(|j| {
-        let offset = if j < 8 { j as u32 } else { (j - 8) as u32 + 32 };
-        let scalar = program.load(
-            a.at(row.clone(), vector_base.clone() + offset),
-            in_bounds.clone(),
-            0.0,
-        );
-        program.bind(scalar)
-    });
-    let high: [Bound<BLOCK>; 16] = std::array::from_fn(|j| {
-        let offset = if j < 8 {
-            j as u32 + 128
-        } else {
-            (j - 8) as u32 + 160
-        };
-        let scalar = program.load(
-            a.at(row.clone(), vector_base.clone() + offset),
-            in_bounds.clone(),
-            0.0,
-        );
-        program.bind(scalar)
-    });
+    let load_quad = |program: &mut TileBlock<'_, BLOCK>, base: u32| -> [Bound<BLOCK>; 16] {
+        std::array::from_fn(|j| {
+            let offset = if j < 8 { j as u32 } else { (j - 8) as u32 + 32 } + base;
+            let scalar = program.load(
+                a.at(row.clone(), vector_base.clone() + offset),
+                in_bounds.clone(),
+                0.0,
+            );
+            program.bind(scalar)
+        })
+    };
+    let low = load_quad(program, 0);
+    let high = load_quad(program, 128);
 
     let zero = TileLiteral::F32(F32Bits::new(0.0));
     let mut sums = [zero; 4].map(Tile::literal);
