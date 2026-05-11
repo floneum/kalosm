@@ -210,17 +210,7 @@ pub const fn q6k_default_large(_rows: u32, cols: u32) -> QgemvShapeQ6K {
 
 /// Apply `FUSOR_Q6K_LARGE_TILE` if set. Standard 8-tile set.
 pub fn q6k_large_override(default: QgemvShapeQ6K) -> QgemvShapeQ6K {
-    match std::env::var("FUSOR_Q6K_LARGE_TILE").as_deref() {
-        Ok("ggml_2x2") => QgemvShapeQ6K::Ggml2x2_64,
-        Ok("ggml_2x4") => QgemvShapeQ6K::Ggml2x4_64,
-        Ok("ggml_2x8") => QgemvShapeQ6K::Ggml2x8_64,
-        Ok("ggml_4x2") => QgemvShapeQ6K::Ggml4x2_128,
-        Ok("ggml_4x4") => QgemvShapeQ6K::Ggml4x4_128,
-        Ok("ggml_4x8") => QgemvShapeQ6K::Ggml4x8_128,
-        Ok("ggml_8x2") => QgemvShapeQ6K::Ggml8x2_256,
-        Ok("ggml_8x4") => QgemvShapeQ6K::Ggml8x4_256,
-        _ => default,
-    }
+    q6k_standard_override("FUSOR_Q6K_LARGE_TILE", default)
 }
 
 // ----- Q6K tall (rows>4096, cols<=4096) -----
@@ -232,7 +222,14 @@ pub const fn q6k_default_tall(_rows: u32, _cols: u32) -> QgemvShapeQ6K {
 
 /// Apply `FUSOR_Q6K_TALL_TILE` if set. Standard 8-tile set.
 pub fn q6k_tall_override(default: QgemvShapeQ6K) -> QgemvShapeQ6K {
-    match std::env::var("FUSOR_Q6K_TALL_TILE").as_deref() {
+    q6k_standard_override("FUSOR_Q6K_TALL_TILE", default)
+}
+
+/// Q6K's "standard 8-tile set" override table. Both `q6k_large_override` and
+/// `q6k_tall_override` accept the same set of env values; the only difference
+/// is which env var name they read.
+fn q6k_standard_override(var: &str, default: QgemvShapeQ6K) -> QgemvShapeQ6K {
+    match std::env::var(var).as_deref() {
         Ok("ggml_2x2") => QgemvShapeQ6K::Ggml2x2_64,
         Ok("ggml_2x4") => QgemvShapeQ6K::Ggml2x4_64,
         Ok("ggml_2x8") => QgemvShapeQ6K::Ggml2x8_64,
