@@ -19,19 +19,19 @@ impl<'a> Lowerer<'a> {
     pub(super) fn live_tiles(ir: &KernelIr) -> Vec<bool> {
         let mut live = vec![false; ir.tiles().len()];
         for stmt in &ir.body().body {
-            Self::mark_tile_stmt_live(ir, stmt, &mut live);
+            Self::mark_tile_stmt_live(stmt, &mut live);
         }
         live
     }
 
-    fn mark_tile_stmt_live(ir: &KernelIr, stmt: &TileStmt, live: &mut [bool]) {
+    fn mark_tile_stmt_live(stmt: &TileStmt, live: &mut [bool]) {
         match stmt {
-            TileStmt::Store(store) => Self::mark_tile_expr_live(ir, &store.value, live),
-            TileStmt::StoreIndexed(store) => Self::mark_tile_expr_live(ir, &store.value, live),
-            TileStmt::StoreLocal { value, .. } => Self::mark_tile_expr_live(ir, value, live),
+            TileStmt::Store(store) => Self::mark_tile_expr_live(&store.value, live),
+            TileStmt::StoreIndexed(store) => Self::mark_tile_expr_live(&store.value, live),
+            TileStmt::StoreLocal { value, .. } => Self::mark_tile_expr_live(value, live),
             TileStmt::StoreWorkgroup { dst, value, .. } => {
                 Self::mark_tile_live(*dst, live);
-                Self::mark_tile_expr_live(ir, value, live);
+                Self::mark_tile_expr_live(value, live);
             }
             TileStmt::CopyToWorkgroupTile { dst, .. } => Self::mark_tile_live(*dst, live),
             TileStmt::LoadCoop { tile, .. } => Self::mark_tile_live(*tile, live),
@@ -44,14 +44,14 @@ impl<'a> Lowerer<'a> {
                 accept,
                 reject,
             } => {
-                Self::mark_tile_expr_live(ir, condition, live);
+                Self::mark_tile_expr_live(condition, live);
                 for s in accept.iter().chain(reject.iter()) {
-                    Self::mark_tile_stmt_live(ir, s, live);
+                    Self::mark_tile_stmt_live(s, live);
                 }
             }
             TileStmt::Loop { body } => {
                 for s in body {
-                    Self::mark_tile_stmt_live(ir, s, live);
+                    Self::mark_tile_stmt_live(s, live);
                 }
             }
             TileStmt::Fold {
@@ -60,13 +60,13 @@ impl<'a> Lowerer<'a> {
                 accumulators,
                 ..
             } => {
-                Self::mark_tile_expr_live(ir, count, live);
+                Self::mark_tile_expr_live(count, live);
                 for stmt in fold_body {
-                    Self::mark_tile_stmt_live(ir, stmt, live);
+                    Self::mark_tile_stmt_live(stmt, live);
                 }
                 for acc in accumulators {
-                    Self::mark_tile_expr_live(ir, &acc.init, live);
-                    Self::mark_tile_expr_live(ir, &acc.update, live);
+                    Self::mark_tile_expr_live(&acc.init, live);
+                    Self::mark_tile_expr_live(&acc.update, live);
                 }
             }
             TileStmt::Break | TileStmt::Return => {}
@@ -267,7 +267,7 @@ impl<'a> Lowerer<'a> {
         }
     }
 
-    fn mark_tile_expr_live(ir: &KernelIr, expr: &Expr, live: &mut [bool]) {
+    fn mark_tile_expr_live(expr: &Expr, live: &mut [bool]) {
         match expr {
             Expr::LoadWorkgroup { src, .. } => Self::mark_tile_live(*src, live),
             Expr::Reduce { scratch, .. } => {
@@ -276,7 +276,7 @@ impl<'a> Lowerer<'a> {
             _ => {}
         }
         Self::tile_expr_children_any(expr, |child| {
-            Self::mark_tile_expr_live(ir, child, live);
+            Self::mark_tile_expr_live(child, live);
             false
         });
     }
