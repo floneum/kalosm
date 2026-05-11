@@ -483,7 +483,9 @@ impl<'a> Lowerer<'a> {
         self.as_f32(e, body, byte)
     }
 
-    pub(in crate::lower) fn center_q6k_quant(
+    /// `as_f32(quant) - 32.0`. Both Q3K scales and Q6K quants are stored
+    /// unsigned with a +32 bias; subtracting 32 recenters them around zero.
+    pub(in crate::lower) fn center_quant_by_32(
         &self,
         e: &mut Arena<Expression>,
         body: &mut Block,

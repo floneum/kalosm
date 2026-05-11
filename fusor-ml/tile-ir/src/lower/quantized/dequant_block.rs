@@ -192,9 +192,7 @@ impl<'a> Lowerer<'a> {
         let d = self.bitcast_f32(e, body, d_word);
         let group = self.shr_lit(e, body, q, 4);
         let scale_quant = self.q3k_scale(e, matrix, base, group, body)?;
-        let scale_quant_f = self.as_f32(e, body, scale_quant);
-        let center = self.f32(e, 32.0);
-        let scale_quant_f = self.sub(e, body, scale_quant_f, center);
+        let scale_quant_f = self.center_quant_by_32(e, body, scale_quant);
         let scale = self.mul(e, body, scale_quant_f, d);
         let parts = self.dequant_q23k_quant_f(e, matrix, base, q, group, 8, body)?;
         let hmask_index = self.bin(e, body, BinaryOperator::Add, parts.pair_offset, parts.q_local);

@@ -376,7 +376,7 @@ impl<'a> Lowerer<'a> {
         lane: usize,
     ) -> Handle<Expression> {
         let quant = self.q6k_quant_component(expressions, body, parts, lane);
-        self.center_q6k_quant(expressions, body, quant)
+        self.center_quant_by_32(expressions, body, quant)
     }
 
     pub(in crate::lower) fn q6k_quant_component(

@@ -232,7 +232,7 @@ impl<'a> Lowerer<'a> {
                 q0_low,
                 q0_high,
             );
-            let q0 = self.center_q6k_quant(expressions, body, q0);
+            let q0 = self.center_quant_by_32(expressions, body, q0);
 
             let q1_low = self.and_lit(expressions, body, q2_byte, 0x0f);
             let q1_high = self.and_lit(expressions, body, qh_byte, 0x0c);
@@ -244,7 +244,7 @@ impl<'a> Lowerer<'a> {
                 q1_low,
                 q1_high,
             );
-            let q1 = self.center_q6k_quant(expressions, body, q1);
+            let q1 = self.center_quant_by_32(expressions, body, q1);
 
             let q2_low = self.shr_lit(expressions, body, q1_byte, 4);
             let q2_high = self.and_lit(expressions, body, qh_byte, 0x30);
@@ -255,7 +255,7 @@ impl<'a> Lowerer<'a> {
                 q2_low,
                 q2_high,
             );
-            let q2 = self.center_q6k_quant(expressions, body, q2);
+            let q2 = self.center_quant_by_32(expressions, body, q2);
 
             let q3_low = self.shr_lit(expressions, body, q2_byte, 4);
             let q3_high = self.and_lit(expressions, body, qh_byte, 0xc0);
@@ -267,7 +267,7 @@ impl<'a> Lowerer<'a> {
                 q3_low,
                 q3_high,
             );
-            let q3 = self.center_q6k_quant(expressions, body, q3);
+            let q3 = self.center_quant_by_32(expressions, body, q3);
 
             for (sum, activation, quant) in [
                 (0, a[4 * l], q0),
