@@ -43,7 +43,7 @@ impl<'a> Lowerer<'a> {
                 let quant = self.affine_nibble(e, matrix, base, q, nibble, body)?;
                 let quant_f = self.as_f32(e, body, quant);
                 let scaled = self.mul(e, body, quant_f, scale);
-                Ok(self.bin(e, body, BinaryOperator::Add, scaled, min))
+                Ok(self.add(e, body, scaled, min))
             }
         }
     }
@@ -144,8 +144,8 @@ impl<'a> Lowerer<'a> {
         let pair = self.and_lit(e, body, group_in_chunk, 1);
         let byte_base = self.shl_lit(e, body, chunk, 5);
         let pair_offset = self.shl_lit(e, body, pair, 4);
-        let byte_base = self.bin(e, body, BinaryOperator::Add, byte_base, pair_offset);
-        let byte_index = self.bin(e, body, BinaryOperator::Add, byte_base, q_local);
+        let byte_base = self.add(e, body, byte_base, pair_offset);
+        let byte_index = self.add(e, body, byte_base, q_local);
         let byte = self.load_byte_dynamic(e, matrix, base, byte_index, data_base, body)?;
         let shift = self.shr_lit(e, body, group_in_chunk, 1);
         let shift = self.shl_lit(e, body, shift, 1);
@@ -195,7 +195,7 @@ impl<'a> Lowerer<'a> {
         let scale_quant_f = self.center_quant_by_32(e, body, scale_quant);
         let scale = self.mul(e, body, scale_quant_f, d);
         let parts = self.dequant_q23k_quant_f(e, matrix, base, q, group, 8, body)?;
-        let hmask_index = self.bin(e, body, BinaryOperator::Add, parts.pair_offset, parts.q_local);
+        let hmask_index = self.add(e, body, parts.pair_offset, parts.q_local);
         let hbyte = self.load_byte_dynamic(e, matrix, base, hmask_index, 0, body)?;
         let hmask_bit_pair = self.shr_lit(e, body, parts.group_in_chunk, 1);
         let chunk_mask_base = self.shl_lit(e, body, parts.chunk, 2);
@@ -289,7 +289,7 @@ impl<'a> Lowerer<'a> {
         let in_group = self.and_lit(e, body, q, 31);
         let group_pair = self.shr_lit(e, body, group, 1);
         let group_pair_offset = self.shl_lit(e, body, group_pair, 5);
-        let byte_index = self.bin(e, body, BinaryOperator::Add, group_pair_offset, in_group);
+        let byte_index = self.add(e, body, group_pair_offset, in_group);
         let data_base = if q5 { 13 } else { 5 };
         let byte = self.load_byte_dynamic(e, matrix, base, byte_index, data_base, body)?;
         let group_low = self.and_lit(e, body, group, 1);

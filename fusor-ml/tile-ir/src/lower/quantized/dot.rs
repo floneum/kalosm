@@ -173,7 +173,7 @@ impl<'a> Lowerer<'a> {
 
         let l0 = self.shl_lit(expressions, body, il, 2);
         let low_base = self.shl_lit(expressions, body, ip, 6);
-        let low_byte_offset = self.bin(expressions, body, BinaryOperator::Add, low_base, l0);
+        let low_byte_offset = self.add(expressions, body, low_base, l0);
         let low_word_offset = self.shr_lit(expressions, body, low_byte_offset, 2);
         let q1_word =
             self.load_word_dynamic(expressions, matrix, base, low_word_offset, body)?;
@@ -183,7 +183,7 @@ impl<'a> Lowerer<'a> {
 
         let high_base = self.shl_lit(expressions, body, ip, 5);
         let high_byte_offset =
-            self.bin(expressions, body, BinaryOperator::Add, high_base, l0);
+            self.add(expressions, body, high_base, l0);
         let high_word_offset = self.shr_lit(expressions, body, high_byte_offset, 2);
         let high_word_offset = self.add_lit(expressions, body, high_word_offset, 32);
         let qh_word =
@@ -369,7 +369,7 @@ impl<'a> Lowerer<'a> {
             };
             let a_scale = self.load_local(expressions, body, a.scales[a_pack_index]);
             let chunk = self.mul(expressions, body, unscaled, a_scale);
-            total = self.bin(expressions, body, BinaryOperator::Add, total, chunk);
+            total = self.add(expressions, body, total, chunk);
         }
         total
     }
@@ -433,7 +433,7 @@ impl<'a> Lowerer<'a> {
                 let clamped = self.math2(e, body, MathFunction::Min, rounded, hi);
                 let clamped = self.math2(e, body, MathFunction::Max, clamped, lo);
                 let q_i32 = self.as_i32(e, body, clamped);
-                sum_i32 = self.bin(e, body, BinaryOperator::Add, sum_i32, q_i32);
+                sum_i32 = self.add(e, body, sum_i32, q_i32);
                 debug_assert!(lane < 4);
                 packed_values.push(q_i32);
             }

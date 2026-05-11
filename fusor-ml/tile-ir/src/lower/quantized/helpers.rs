@@ -12,7 +12,7 @@ impl<'a> Lowerer<'a> {
     ) -> Handle<Expression> {
         let blocks_per_col = matrix.rows / matrix.format.block_elements();
         let col_block = self.mul_literal_u32_emitted(e, col, blocks_per_col, body);
-        let block_index = self.bin(e, body, BinaryOperator::Add, col_block, block);
+        let block_index = self.add(e, body, col_block, block);
         self.mul_literal_u32_emitted(e, block_index, block_words, body)
     }
 
@@ -36,7 +36,7 @@ impl<'a> Lowerer<'a> {
         offset: Handle<Expression>,
         body: &mut Block,
     ) -> Result<Handle<Expression>, LowerError> {
-        let index = self.bin(e, body, BinaryOperator::Add, base, offset);
+        let index = self.add(e, body, base, offset);
         self.load_word_at(e, matrix, index, body)
     }
 
@@ -342,6 +342,16 @@ impl<'a> Lowerer<'a> {
         self.add_literal_u32_emitted(e, left, right, body)
     }
 
+    pub(in crate::lower) fn add(
+        &self,
+        e: &mut Arena<Expression>,
+        body: &mut Block,
+        left: Handle<Expression>,
+        right: Handle<Expression>,
+    ) -> Handle<Expression> {
+        self.bin(e, body, BinaryOperator::Add, left, right)
+    }
+
     pub(in crate::lower) fn sub(
         &self,
         e: &mut Arena<Expression>,
@@ -521,7 +531,7 @@ impl<'a> Lowerer<'a> {
             let masked = self.and_lit(e, body, source, mask);
             let quant = self.as_f32(e, body, masked);
             let term = self.mul(e, body, activations[activation_index], quant);
-            sums[sum_index] = self.bin(e, body, BinaryOperator::Add, sums[sum_index], term);
+            sums[sum_index] = self.add(e, body, sums[sum_index], term);
         }
     }
 
@@ -558,7 +568,7 @@ impl<'a> Lowerer<'a> {
             let terms = self.mul(e, body, activation_vec, quant_vec);
             for (sum_index, sum) in sums.iter_mut().enumerate() {
                 let term = self.vec4_component(e, body, terms, sum_index as u32);
-                *sum = self.bin(e, body, BinaryOperator::Add, *sum, term);
+                *sum = self.add(e, body, *sum, term);
             }
         }
     }

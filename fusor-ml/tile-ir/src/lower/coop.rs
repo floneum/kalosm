@@ -606,7 +606,7 @@ impl<'a> Lowerer<'a> {
         stride: u32,
     ) -> Handle<Expression> {
         let row_offset = self.mul_literal_u32_emitted(expressions, row, stride, body);
-        self.bin(expressions, body, BinaryOperator::Add, row_offset, col)
+        self.add(expressions, body, row_offset, col)
     }
 
     /// Resolve a flat invocation index into the destination tile pointer plus
@@ -626,8 +626,8 @@ impl<'a> Lowerer<'a> {
     ) -> Result<CopyLaneCoords, LowerError> {
         let local_row = self.div_literal_u32_emitted(expressions, flat, cols, body);
         let local_col = self.mod_literal_u32_emitted(expressions, flat, cols, body);
-        let global_row = self.bin(expressions, body, BinaryOperator::Add, row_base, local_row);
-        let global_col = self.bin(expressions, body, BinaryOperator::Add, col_base, local_col);
+        let global_row = self.add(expressions, body, row_base, local_row);
+        let global_col = self.add(expressions, body, col_base, local_col);
         let tile_index =
             self.tile_matrix_index_inline(expressions, body, local_row, local_col, stride);
         let tile_ptr = self.tile_dynamic_pointer(expressions, dst, tile_index, body)?;

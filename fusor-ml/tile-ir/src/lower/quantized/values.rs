@@ -108,7 +108,7 @@ impl<'a> Lowerer<'a> {
         let block = self.div_literal_u32_emitted(expressions, k_base, 32, body);
         let q = self.and_lit(expressions, body, k_base, 31);
         let col_block = self.mul_literal_u32_emitted(expressions, col, matrix.rows / 32, body);
-        let block_index = self.bin(expressions, body, BinaryOperator::Add, col_block, block);
+        let block_index = self.add(expressions, body, col_block, block);
         let base = self.mul_literal_u32_emitted(expressions, block_index, 9, body);
         let scale_word = self.load_word(expressions, matrix, base, 0, body)?;
         let scale = self.bitcast_f32(expressions, body, scale_word);
@@ -503,7 +503,7 @@ impl<'a> Lowerer<'a> {
         for pack_offset in (0..a.len).step_by(2) {
             let k = self.add_lit(expressions, body, k_base, (pack_offset * 4) as u32);
             let chunk = chunk(self, expressions, body, k, pack_offset)?;
-            total = self.bin(expressions, body, BinaryOperator::Add, total, chunk);
+            total = self.add(expressions, body, total, chunk);
         }
         Ok(total)
     }
@@ -586,7 +586,7 @@ impl<'a> Lowerer<'a> {
                 &block.data,
                 &a[pack_offset..pack_offset + 8],
             );
-            total = self.bin(expressions, body, BinaryOperator::Add, total, chunk);
+            total = self.add(expressions, body, total, chunk);
         }
         Ok(total)
     }
@@ -649,7 +649,7 @@ impl<'a> Lowerer<'a> {
     ) -> Handle<Expression> {
         let mut total = self.f32(expressions, 0.0);
         for value in values {
-            total = self.bin(expressions, body, BinaryOperator::Add, total, *value);
+            total = self.add(expressions, body, total, *value);
         }
         total
     }
@@ -672,7 +672,7 @@ impl<'a> Lowerer<'a> {
                 .map(|quant| self.as_f32(expressions, body, *quant))
                 .collect::<Vec<_>>();
             let dot = self.dot_vec4(expressions, body, left_chunk, &right_chunk);
-            total = self.bin(expressions, body, BinaryOperator::Add, total, dot);
+            total = self.add(expressions, body, total, dot);
         }
         total
     }
@@ -695,7 +695,7 @@ impl<'a> Lowerer<'a> {
         let mut total = self.dot_vec4(expressions, body, left_chunk, right_chunk);
         for (left_chunk, right_chunk) in chunks {
             let dot = self.dot_vec4(expressions, body, left_chunk, right_chunk);
-            total = self.bin(expressions, body, BinaryOperator::Add, total, dot);
+            total = self.add(expressions, body, total, dot);
         }
         total
     }
