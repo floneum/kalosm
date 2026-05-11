@@ -44,11 +44,11 @@ impl<'a> Lowerer<'a> {
         store: &TileStoreStmt,
     ) -> Result<(), LowerError> {
         self.clear_store_caches(true);
-        let value = self.lower_tile_expr_lane(expressions, scratch, body, &store.value, 0)?;
-        let mask = self.lower_tile_expr_lane(expressions, scratch, body, &store.mask, 0)?;
+        let value = self.lower_tile_expr(expressions, scratch, body, &store.value)?;
+        let mask = self.lower_tile_expr(expressions, scratch, body, &store.mask)?;
         let mut accept = Block::new();
-        let row = self.lower_tile_expr_lane(expressions, scratch, &mut accept, &store.row, 0)?;
-        let col = self.lower_tile_expr_lane(expressions, scratch, &mut accept, &store.col, 0)?;
+        let row = self.lower_tile_expr(expressions, scratch, &mut accept, &store.row)?;
+        let col = self.lower_tile_expr(expressions, scratch, &mut accept, &store.col)?;
         let dst_index =
             self.storage_index_from_coords(expressions, &store.dst, &[row, col], &mut accept)?;
         let dst_ptr =
@@ -68,10 +68,10 @@ impl<'a> Lowerer<'a> {
         mask: &Expr,
     ) -> Result<(), LowerError> {
         self.clear_store_caches(false);
-        let value = self.lower_tile_expr_lane(expressions, scratch, body, value, 0)?;
-        let mask = self.lower_tile_expr_lane(expressions, scratch, body, mask, 0)?;
+        let value = self.lower_tile_expr(expressions, scratch, body, value)?;
+        let mask = self.lower_tile_expr(expressions, scratch, body, mask)?;
         let mut accept = Block::new();
-        let index = self.lower_tile_expr_lane(expressions, scratch, &mut accept, index, 0)?;
+        let index = self.lower_tile_expr(expressions, scratch, &mut accept, index)?;
         let dst_ptr = self.storage_dynamic_pointer(expressions, dst, index, &mut accept)?;
         Self::push_masked_store(body, mask, accept, dst_ptr, value);
         Ok(())

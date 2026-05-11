@@ -2,6 +2,21 @@ use super::*;
 use crate::ir::Builtin;
 
 impl<'a> Lowerer<'a> {
+    /// Top-level entry point for lowering an `Expr` tree. External callers
+    /// (statement lowering, fragment loads, fold init, etc.) all enter at
+    /// `spill_depth = 0`; the recursive arms inside `lower_tile_expr_lane`
+    /// pass through their own `spill_depth` (sometimes incremented to limit
+    /// register pressure on nested binary ops).
+    pub(in crate::lower) fn lower_tile_expr(
+        &self,
+        expressions: &mut Arena<Expression>,
+        scratch: ScratchLocals,
+        body: &mut Block,
+        expr: &Expr,
+    ) -> Result<Handle<Expression>, LowerError> {
+        self.lower_tile_expr_lane(expressions, scratch, body, expr, 0)
+    }
+
     pub(in crate::lower) fn lower_tile_expr_lane(
         &self,
         expressions: &mut Arena<Expression>,

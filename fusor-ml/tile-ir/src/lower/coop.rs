@@ -46,7 +46,7 @@ impl<'a> Lowerer<'a> {
                         used: value_ty,
                     });
                 }
-                let value = self.lower_tile_expr_lane(expressions, scratch, body, value, 0)?;
+                let value = self.lower_tile_expr(expressions, scratch, body, value)?;
                 let local = self.private_local(*dst)?;
                 self.store_local(expressions, body, local, value);
                 Ok(())
@@ -60,8 +60,8 @@ impl<'a> Lowerer<'a> {
                         used: value_ty,
                     });
                 }
-                let value = self.lower_tile_expr_lane(expressions, scratch, body, value, 0)?;
-                let index = self.lower_tile_expr_lane(expressions, scratch, body, index, 0)?;
+                let value = self.lower_tile_expr(expressions, scratch, body, value)?;
+                let index = self.lower_tile_expr(expressions, scratch, body, index)?;
                 let pointer = self.tile_dynamic_pointer(expressions, *dst, index, body)?;
                 body.push(Statement::Store { pointer, value }, Span::default());
                 Ok(())
@@ -73,7 +73,7 @@ impl<'a> Lowerer<'a> {
             } => {
                 let condition_ty = condition.element();
                 let condition =
-                    self.lower_tile_expr_lane(expressions, scratch, body, condition, 0)?;
+                    self.lower_tile_expr(expressions, scratch, body, condition)?;
                 let condition = self.condition_value(expressions, body, condition, condition_ty);
                 let mut accept_block = Block::new();
                 self.lower_tile_stmt_body(expressions, scratch, &mut accept_block, accept)?;
@@ -207,8 +207,8 @@ impl<'a> Lowerer<'a> {
     ) -> Result<(), LowerError> {
         let layout = self.tile_layout(tile)?;
         let stride_u = Self::row_major_tile_stride(layout)?;
-        let row_h = self.lower_tile_expr_lane(expressions, scratch, body, row, 0)?;
-        let col_h = self.lower_tile_expr_lane(expressions, scratch, body, col, 0)?;
+        let row_h = self.lower_tile_expr(expressions, scratch, body, row)?;
+        let col_h = self.lower_tile_expr(expressions, scratch, body, col)?;
         let index = self.tile_matrix_index_inline(expressions, body, row_h, col_h, stride_u);
         let ptr = self.tile_dynamic_pointer(expressions, tile, index, body)?;
         let stride = self.u32(expressions, stride_u);
@@ -347,8 +347,8 @@ impl<'a> Lowerer<'a> {
             ))?;
         let stride = Self::row_major_tile_stride(layout)?;
         let local = Self::function_arg(expressions, LOCAL_INVOCATION_INDEX_ARG);
-        let row_base = self.lower_tile_expr_lane(expressions, scratch, body, row_offset, 0)?;
-        let col_base = self.lower_tile_expr_lane(expressions, scratch, body, col_offset, 0)?;
+        let row_base = self.lower_tile_expr(expressions, scratch, body, row_offset)?;
+        let col_base = self.lower_tile_expr(expressions, scratch, body, col_offset)?;
 
         self.lower_copy_passes(expressions, body, local, total, |expressions, flat| {
             let mut accept = Block::new();
@@ -406,8 +406,8 @@ impl<'a> Lowerer<'a> {
             _ => 0,
         };
         let local = Self::function_arg(expressions, LOCAL_INVOCATION_INDEX_ARG);
-        let row_base = self.lower_tile_expr_lane(expressions, scratch, body, row_offset, 0)?;
-        let col_base = self.lower_tile_expr_lane(expressions, scratch, body, col_offset, 0)?;
+        let row_base = self.lower_tile_expr(expressions, scratch, body, row_offset)?;
+        let col_base = self.lower_tile_expr(expressions, scratch, body, col_offset)?;
 
         if n > 0 && rows.is_multiple_of(n) {
             let groups_per_col = rows / n;
@@ -535,8 +535,8 @@ impl<'a> Lowerer<'a> {
         self.flush_coop_acc_cache(expressions, body);
         let acc_local = self.private_local(acc)?;
         let (stride_u, row_major) = Self::cooperative_store_layout(&dst.layout)?;
-        let row_h = self.lower_tile_expr_lane(expressions, scratch, body, row, 0)?;
-        let col_h = self.lower_tile_expr_lane(expressions, scratch, body, col, 0)?;
+        let row_h = self.lower_tile_expr(expressions, scratch, body, row)?;
+        let col_h = self.lower_tile_expr(expressions, scratch, body, col)?;
         let storage_index =
             self.storage_index_from_coords(expressions, dst, &[row_h, col_h], body)?;
         let storage_ptr = self.storage_dynamic_pointer(expressions, dst, storage_index, body)?;

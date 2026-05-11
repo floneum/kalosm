@@ -194,14 +194,14 @@ impl<'a> Lowerer<'a> {
         // 1. Initialize each accumulator local from its init expression.
         for acc in accumulators {
             let init_value =
-                self.lower_tile_expr_lane(expressions, scratch, body, &acc.init, 0)?;
+                self.lower_tile_expr(expressions, scratch, body, &acc.init)?;
             let local = self.private_local(LocalRef::new(acc.name, acc.element))?;
             self.store_local(expressions, body, local, init_value);
         }
 
         // 2. Lower the iterator's count expression in the surrounding scope.
         let count_handle =
-            self.lower_tile_expr_lane(expressions, scratch, body, count, 0)?;
+            self.lower_tile_expr(expressions, scratch, body, count)?;
 
         // 3. Emit the counted loop. Inside the body, store the loop index into
         //    iter_var's local so subsequent LoadLocal(iter_var) reads see it.
