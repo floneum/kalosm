@@ -492,13 +492,15 @@ impl<'a> Lowerer<'a> {
         Self::tile_stmt_expr_any(stmt, &mut expr_uses_f16)
     }
 
+    /// Per-statement F16 check. Expr trees and nested statement bodies are
+    /// recursed into by the caller via `tile_stmt_expr_any`, so this method
+    /// only inspects the element types attached directly to the current
+    /// statement (storage views, locals, accumulators, workgroup tiles).
     fn tile_stmt_f16_payload(stmt: &TileStmt) -> bool {
         match stmt {
             TileStmt::Store(store) => store.dst.buffer.element == ElementType::F16,
             TileStmt::StoreIndexed(store) => store.dst.buffer.element == ElementType::F16,
-            TileStmt::StoreLocal { dst, value } => {
-                dst.element == ElementType::F16 || Self::tile_expr_uses_f16(value)
-            }
+            TileStmt::StoreLocal { dst, .. } => dst.element == ElementType::F16,
             TileStmt::StoreWorkgroup { dst, .. } => dst.element == ElementType::F16,
             TileStmt::CopyToWorkgroupTile { dst, src, .. } => {
                 let src_uses_f16 = match src {
@@ -510,11 +512,9 @@ impl<'a> Lowerer<'a> {
                 dst.element == ElementType::F16 || src_uses_f16
             }
             TileStmt::StoreCoopAcc { dst, .. } => dst.buffer.element == ElementType::F16,
-            TileStmt::Fold { accumulators, .. } => accumulators.iter().any(|acc| {
-                acc.element == ElementType::F16
-                    || Self::tile_expr_uses_f16(&acc.init)
-                    || Self::tile_expr_uses_f16(&acc.update)
-            }),
+            TileStmt::Fold { accumulators, .. } => {
+                accumulators.iter().any(|acc| acc.element == ElementType::F16)
+            }
             TileStmt::If { .. }
             | TileStmt::Loop { .. }
             | TileStmt::LoadCoop { .. }
