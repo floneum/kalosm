@@ -3,7 +3,7 @@ use crate::{
     F32Bits, TileLiteral, TileUnaryOp, F32, U32,
 };
 
-use super::helpers::{all, f32_tile, u32_tile, NEG_MAX_F32, TOP_K_BLOCK};
+use super::helpers::{all, f32_tile, lane_zero, u32_tile, NEG_MAX_F32, TOP_K_BLOCK};
 use super::top_k::index1;
 use super::types::Mirostat2Meta;
 
@@ -105,7 +105,7 @@ pub fn mirostat2<B>(
                 let flag = program.load_linear(exactness_flag.at(0), all(), TileLiteral::U32(0));
                 let retry = flag.eq(u32_tile(0));
                 program.if_then(retry, |program| {
-                    let lane_zero = program.index(lane.clone()).eq(u32_tile(0));
+                    let lane_zero = lane_zero(program, &lane);
                     program.if_then(lane_zero, |program| {
                         store_sample_result(
                             program,
@@ -121,7 +121,7 @@ pub fn mirostat2<B>(
             let top_id = mirostat_top_id(program, &ids, meta, u32_tile(0));
             let invalid = top_id.eq(u32_tile(u32::MAX));
             program.if_then(invalid, |program| {
-                let lane_zero = program.index(lane.clone()).eq(u32_tile(0));
+                let lane_zero = lane_zero(program, &lane);
                 program.if_then(lane_zero, |program| {
                     store_sample_result(program, &output, GPU_SAMPLE_STATUS_INVALID, u32_tile(0));
                 });
@@ -166,7 +166,7 @@ pub fn mirostat2<B>(
                 program.store_local(&reduce_step, step / u32_tile(2));
             });
 
-            let lane_zero = program.index(lane.clone()).eq(u32_tile(0));
+            let lane_zero = lane_zero(program, &lane);
             program.if_else(
                 lane_zero,
                 |program| {

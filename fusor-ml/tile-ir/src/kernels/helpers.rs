@@ -78,6 +78,15 @@ pub(super) fn index4_const_last<const BLOCK: usize>(
     index_n(base, [strides[0], strides[1], strides[2]], [i0, i1, i2])
 }
 
+/// `lane == 0` mask for the common "only one lane writes" pattern in
+/// kernels that broadcast a result via lane-zero stores.
+pub(super) fn lane_zero<const BLOCK: usize>(
+    program: &TileBlock<'_, BLOCK>,
+    lane: &crate::tile::Range<BLOCK>,
+) -> Tile<BLOCK> {
+    program.index(lane.clone()).eq(u32_tile(0))
+}
+
 /// Tree-reduce a workgroup-scratch array by halving stride, applying
 /// `combine(lhs, rhs)` at each level. The combine closure is the only
 /// difference between sum/max/bitwise-or reductions, which previously each

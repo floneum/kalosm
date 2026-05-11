@@ -4,7 +4,7 @@ use crate::{
 };
 
 use super::helpers::{
-    all, f32_tile, reduce_workgroup, u32_tile, MAX_F32, NEG_MAX_F32, TOP_K_BLOCK,
+    all, f32_tile, lane_zero, reduce_workgroup, u32_tile, MAX_F32, NEG_MAX_F32, TOP_K_BLOCK,
 };
 use super::types::{MergeTopKMeta, TopKChunkMeta, TopKExactnessMeta};
 
@@ -346,7 +346,7 @@ pub fn top_k_exactness<B>(
 
             reduce_workgroup(program, scratch, lane.clone(), |lhs, rhs| lhs.bit_or(rhs));
 
-            let lane_zero = program.index(lane.clone()).eq(u32_tile(0));
+            let lane_zero = lane_zero(program, &lane);
             program.if_then(lane_zero, |program| {
                 let root = program.load_workgroup(scratch, 0);
                 let exact = root.eq(u32_tile(0));
@@ -501,7 +501,7 @@ pub fn top_k_merge<B>(
                     program.store_local(&reduce_step, step / u32_tile(2));
                 });
 
-                let lane_zero = program.index(lane.clone()).eq(u32_tile(0));
+                let lane_zero = lane_zero(program, &lane);
                 program.if_then(lane_zero, |program| {
                     let selected_value = program.load_workgroup(scratch_values, 0);
                     let selected_id = program.load_workgroup(scratch_ids, 0);
