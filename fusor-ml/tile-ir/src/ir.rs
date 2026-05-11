@@ -33,7 +33,7 @@ macro_rules! numeric_markers {
 pub struct KernelIr {
     pub(crate) buffers: Vec<BufferDecl>,
     pub(crate) tiles: Vec<TileDecl>,
-    pub(crate) locals: Vec<LocalDecl>,
+    pub(crate) locals: Vec<LocalRef>,
     pub(crate) body: TileProgramOp,
 }
 
@@ -66,7 +66,7 @@ impl KernelIr {
     }
 
     /// Private scalar/vector locals allocated by tiled programs.
-    pub fn locals(&self) -> &[LocalDecl] {
+    pub fn locals(&self) -> &[LocalRef] {
         &self.locals
     }
 
@@ -167,14 +167,9 @@ pub struct TileRef {
     pub element: ElementType,
 }
 
-/// A private per-invocation local declaration.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct LocalDecl {
-    pub id: LocalId,
-    pub element: ElementType,
-}
-
-/// A typed private local reference.
+/// A typed private per-invocation local. Used both as the declaration in
+/// `KernelIr::locals` and as the reference embedded in `Expr::LoadLocal` /
+/// `TileStmt::StoreLocal` — they carry the same fields.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct LocalRef {
     pub id: LocalId,
@@ -528,7 +523,7 @@ pub enum ElementType {
     Bool,
     /// Cooperative-matrix accumulator type (the `C`-role fragment) of the
     /// given shape. Only `8x8` f32 is currently supported by the lowerer; the
-    /// shape is carried explicitly so a single `LocalDecl` describes the full
+    /// shape is carried explicitly so a single `LocalRef` describes the full
     /// fragment type.
     CoopMatrixF32 {
         rows: u32,

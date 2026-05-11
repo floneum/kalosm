@@ -1,7 +1,7 @@
 use std::marker::PhantomData;
 
 use crate::ir::{
-    BlockDequantId, BufferAccess, BufferDecl, BufferRef, CoopFragmentId, F32Bits, KernelIr, Layout, LocalDecl,
+    BlockDequantId, BufferAccess, BufferDecl, BufferRef, CoopFragmentId, F32Bits, KernelIr, Layout,
     LocalRef, MemoryLevel, Numeric, Shape, StorageIndexMap, StorageView,
     TileDecl,
     TileLiteral, TileProgramOp,
@@ -684,7 +684,7 @@ impl Program {
         let id = crate::LocalId(self.next_local);
         self.next_local += 1;
         let local = LocalRef::new(id, element);
-        self.ir.locals.push(LocalDecl { id, element });
+        self.ir.locals.push(LocalRef { id, element });
         local
     }
 

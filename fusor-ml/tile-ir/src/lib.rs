@@ -15,7 +15,7 @@ pub mod tile;
 
 pub use ir::{
     Bool, BufferAccess, BufferDecl, BufferId, BufferRef, CoopOperandRole, ElementType, F32Bits,
-    F32Vec4, FlattenedMatrixMap, Im2ColNhwcMap, KernelIr, Layout, LoadSource, LocalDecl, LocalId,
+    F32Vec4, FlattenedMatrixMap, Im2ColNhwcMap, KernelIr, Layout, LoadSource, LocalId,
     LocalRef, MemoryLevel, Numeric, Shape, StorageIndexMap, StorageView, Strides, TileBinaryOp,
     TileCompareOp, TileDecl, Expr, TileId, TileIndexedStoreStmt, TileLinearLoadExpr, TileLiteral,
     TileLoadExpr, TileProgramOp, TileReduceOp, TileRef, TileStmt, TileUnaryOp, WorkgroupAxis, F16,
