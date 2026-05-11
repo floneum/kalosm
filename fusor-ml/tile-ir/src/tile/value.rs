@@ -4,7 +4,7 @@ use std::ops::{Add, BitAnd, BitXor, Div, Mul, Rem, Sub};
 
 use crate::ir::{
     CoopFragmentId,
-    CoopOperandRole, F32Bits,
+    CoopOperandRole,
     LocalRef, StorageView, TileBinaryOp, TileCompareOp, Expr,
     TileLiteral, TileUnaryOp,
 };
@@ -327,7 +327,7 @@ pub struct Scalar {
 impl Scalar {
     pub fn literal(value: f32) -> Self {
         Self {
-            expr: Expr::Literal(TileLiteral::F32(F32Bits::new(value))),
+            expr: Expr::Literal(TileLiteral::f32(value)),
         }
     }
 }
@@ -393,7 +393,7 @@ impl<const N: usize> Tile<N> {
 
     /// Sigmoid activation: `1 / (1 + exp(-x))`.
     pub fn sigmoid(self) -> Self {
-        let one = Tile::literal(TileLiteral::F32(F32Bits::new(1.0)));
+        let one = Tile::literal(TileLiteral::f32(1.0));
         one.clone() / (one + self.neg_unary().exp())
     }
 
@@ -405,10 +405,10 @@ impl<const N: usize> Tile<N> {
     /// GELU activation, tanh approximation:
     /// `0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))`.
     pub fn gelu(self) -> Self {
-        let half = Tile::literal(TileLiteral::F32(F32Bits::new(0.5)));
-        let one = Tile::literal(TileLiteral::F32(F32Bits::new(1.0)));
-        let coeff = Tile::literal(TileLiteral::F32(F32Bits::new(0.044_715)));
-        let sqrt_2_over_pi = Tile::literal(TileLiteral::F32(F32Bits::new(0.797_884_6)));
+        let half = Tile::literal(TileLiteral::f32(0.5));
+        let one = Tile::literal(TileLiteral::f32(1.0));
+        let coeff = Tile::literal(TileLiteral::f32(0.044_715));
+        let sqrt_2_over_pi = Tile::literal(TileLiteral::f32(0.797_884_6));
         let x = self;
         let x_cubed = x.clone() * x.clone() * x.clone();
         let inner = sqrt_2_over_pi * (x.clone() + coeff * x_cubed);
@@ -417,7 +417,7 @@ impl<const N: usize> Tile<N> {
 
     /// ReLU activation: `max(x, 0)`.
     pub fn relu(self) -> Self {
-        let zero = Tile::literal(TileLiteral::F32(F32Bits::new(0.0)));
+        let zero = Tile::literal(TileLiteral::f32(0.0));
         let condition = Tile::compare_bool(TileCompareOp::Gt, self.clone(), zero.clone());
         Tile::select(condition, self, zero)
     }
@@ -458,8 +458,8 @@ impl<const N: usize> Tile<N> {
         if output == crate::ElementType::Bool {
             condition
         } else {
-            let one = TileLiteral::F32(F32Bits::new(1.0));
-            let zero = TileLiteral::F32(F32Bits::new(0.0));
+            let one = TileLiteral::f32(1.0);
+            let zero = TileLiteral::f32(0.0);
             let one = Tile::literal(one).cast(output);
             let zero = Tile::literal(zero).cast(output);
             Self::select(condition, one, zero)

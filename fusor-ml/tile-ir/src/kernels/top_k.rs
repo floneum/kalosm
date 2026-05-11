@@ -1,6 +1,6 @@
 use crate::{
     tile::{self, Tile, TileBlock},
-    Bool, ElementType, F32Bits, TileLiteral, TileUnaryOp, WorkgroupAxis, F32, U32,
+    Bool, ElementType, TileLiteral, TileUnaryOp, WorkgroupAxis, F32, U32,
 };
 
 use super::helpers::{
@@ -101,7 +101,7 @@ pub fn top_k_chunk<B>(
                 let raw = program.load_linear(
                     input.at(input_index),
                     all(),
-                    TileLiteral::F32(F32Bits::new(NEG_MAX_F32)),
+                    TileLiteral::f32(NEG_MAX_F32),
                 );
                 let raw_finite = is_finite(raw.clone());
                 program.if_then(raw_finite, |program| {
@@ -300,7 +300,7 @@ pub fn top_k_exactness<B>(
             let threshold = program.load_linear(
                 top_values.at(threshold_index),
                 all(),
-                TileLiteral::F32(F32Bits::new(NEG_MAX_F32)),
+                TileLiteral::f32(NEG_MAX_F32),
             );
             let threshold_finite = is_finite(threshold.clone());
             program.store_local(&threshold_local, threshold);
@@ -321,7 +321,7 @@ pub fn top_k_exactness<B>(
                 let bound = program.load_linear(
                     chunk_values.at(bound_index),
                     all(),
-                    TileLiteral::F32(F32Bits::new(NEG_MAX_F32)),
+                    TileLiteral::f32(NEG_MAX_F32),
                 );
                 let bound_finite = is_finite(bound.clone());
                 let threshold = program.load_local(&threshold_local);
@@ -425,7 +425,7 @@ pub fn top_k_merge<B>(
                         let value = program.load_linear(
                             input_values.at(index),
                             all(),
-                            TileLiteral::F32(F32Bits::new(NEG_MAX_F32)),
+                            TileLiteral::f32(NEG_MAX_F32),
                         );
                         let valid = id
                             .clone()

@@ -2,7 +2,7 @@
 use std::marker::PhantomData;
 
 use crate::ir::{
-    Builtin, CoopOperandRole, DotK, ElementType, Expr, F32Bits, F32Vec4, Layout, LocalRef,
+    Builtin, CoopOperandRole, DotK, ElementType, Expr, F32Vec4, Layout, LocalRef,
     MemoryLevel, Numeric, PackedActivations, Shape, TileBinaryOp, TileIndexedStoreStmt,
     LoadSource, TileLinearLoadExpr, TileLiteral, TileLoadExpr, TileReduceOp, TileRef,
     TileStmt, TileStoreStmt, TileUnaryOp, WorkgroupAxis, F32, U32,
@@ -81,7 +81,7 @@ fn builtin_index(builtin: Builtin) -> ScalarIndex {
 
 /// Boxed `f32` fill literal used by every `load*` entry point's `fill` field.
 fn f32_fill(value: f32) -> Box<Expr> {
-    Box::new(Expr::Literal(TileLiteral::F32(F32Bits::new(value))))
+    Box::new(Expr::Literal(TileLiteral::f32(value)))
 }
 
 /// Unwrap an iterable of `Tile`s into the parallel `Expr` vector. Used by
@@ -178,7 +178,7 @@ impl<const BLOCK: usize> TileBlock<'_, BLOCK> {
         mask: Mask<BLOCK>,
         fill: f32,
     ) -> Tile<BLOCK> {
-        let scalar = Tile::literal(TileLiteral::F32(F32Bits::new(fill)));
+        let scalar = Tile::literal(TileLiteral::f32(fill));
         let fill_vec4 = self.vec4_splat(scalar).expr;
         Tile {
             expr: Expr::LoadLinear(TileLinearLoadExpr {
@@ -287,7 +287,7 @@ impl<const BLOCK: usize> TileBlock<'_, BLOCK> {
         let mut exprs = tiles_to_exprs(values);
         if exprs.is_empty() {
             return Tile {
-                expr: Expr::Literal(TileLiteral::F32(F32Bits::new(0.0))),
+                expr: Expr::Literal(TileLiteral::f32(0.0)),
             };
         }
         while exprs.len() > 1 {
@@ -597,7 +597,7 @@ impl<const BLOCK: usize> TileBlock<'_, BLOCK> {
     }
 
     pub fn f32(&self, value: f32) -> Tile<BLOCK> {
-        self.literal(TileLiteral::F32(F32Bits::new(value)))
+        self.literal(TileLiteral::f32(value))
     }
 
     pub fn u32(&self, value: u32) -> Tile<BLOCK> {

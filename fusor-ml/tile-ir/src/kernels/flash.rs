@@ -1,6 +1,6 @@
 use crate::{
     tile::{self, range, Tile, TileBlock},
-    ElementType, F32Bits, Numeric, TileLiteral, WorkgroupAxis, F32, U32,
+    ElementType, Numeric, TileLiteral, WorkgroupAxis, F32, U32,
 };
 
 use super::helpers::{
@@ -15,7 +15,7 @@ const DECODE_HEAD_DIM: u32 = 128;
 
 fn zero_fill<E: Numeric>() -> TileLiteral {
     match E::ELEMENT {
-        ElementType::F32 => TileLiteral::F32(F32Bits::new(0.0)),
+        ElementType::F32 => TileLiteral::f32(0.0),
         ElementType::F16 => TileLiteral::F16(0),
         _ => panic!("flash_attention only supports F32 and F16 element types"),
     }
@@ -229,9 +229,9 @@ fn decode_score_for_kv<const BLOCK: usize>(
             dim.clone(),
         );
         let q_value =
-            program.load_linear(q.at(q_index), all(), TileLiteral::F32(F32Bits::new(0.0)));
+            program.load_linear(q.at(q_index), all(), TileLiteral::f32(0.0));
         let k_value =
-            program.load_linear(k.at(k_index), all(), TileLiteral::F32(F32Bits::new(0.0)));
+            program.load_linear(k.at(k_index), all(), TileLiteral::f32(0.0));
         let acc = program.load_local(score_acc);
         program.store_local(score_acc, acc + q_value * k_value);
         program.store_local(dim_local, dim + u32_tile(1));
@@ -267,7 +267,7 @@ fn append_decode_output_loop<const BLOCK: usize>(
             out_dim.clone(),
         );
         let v_value =
-            program.load_linear(v.at(v_index), all(), TileLiteral::F32(F32Bits::new(0.0)));
+            program.load_linear(v.at(v_index), all(), TileLiteral::f32(0.0));
         let current = program.load_local(acc);
         program.store_local(acc, current + prob * v_value);
         program.store_local(kv_local, kv + u32_tile(1));
@@ -425,7 +425,7 @@ fn flash_decode_small_block<const BLOCK: usize, B>(
                             let v_value = program.load_linear(
                                 v.at(v_index),
                                 all(),
-                                TileLiteral::F32(F32Bits::new(0.0)),
+                                TileLiteral::f32(0.0),
                             );
                             let current = program.load_local(&acc);
                             program.store_local(&acc, current + prob * v_value);

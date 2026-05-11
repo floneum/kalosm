@@ -418,6 +418,13 @@ impl TileLiteral {
             Self::Bool(_) => ElementType::Bool,
         }
     }
+
+    /// `TileLiteral::F32(F32Bits::new(value))` — the float-literal shape
+    /// every kernel and test builds. Inlined so callers don't repeat the
+    /// `F32Bits::new` wrapping each time.
+    pub fn f32(value: f32) -> Self {
+        Self::F32(F32Bits::new(value))
+    }
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]

@@ -1,6 +1,6 @@
 use crate::{
     tile::{Mask, Tile, TileBlock},
-    F32Bits, TileLiteral,
+    TileLiteral,
 };
 
 pub(super) const TOP_K_BLOCK: usize = 256;
@@ -12,7 +12,7 @@ pub(super) fn all<const BLOCK: usize>() -> Mask<BLOCK> {
 }
 
 pub(super) fn f32_tile<const BLOCK: usize>(value: f32) -> Tile<BLOCK> {
-    Tile::literal(TileLiteral::F32(F32Bits::new(value)))
+    Tile::literal(TileLiteral::f32(value))
 }
 
 pub(super) fn u32_tile<const BLOCK: usize>(value: u32) -> Tile<BLOCK> {

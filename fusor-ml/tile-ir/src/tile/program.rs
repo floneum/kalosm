@@ -1,7 +1,7 @@
 use std::marker::PhantomData;
 
 use crate::ir::{
-    BlockDequantId, BufferAccess, BufferDecl, BufferRef, CoopFragmentId, F32Bits, KernelIr, Layout,
+    BlockDequantId, BufferAccess, BufferDecl, BufferRef, CoopFragmentId, KernelIr, Layout,
     LocalRef, MemoryLevel, Numeric, Shape, StorageIndexMap, StorageView,
     TileDecl,
     TileLiteral, TileProgramOp,
@@ -341,7 +341,7 @@ impl Program {
                     TileReduceOp::Sum,
                     k_iterations,
                     a_value * b_value,
-                    TileLiteral::F32(F32Bits::new(0.0)),
+                    TileLiteral::f32(0.0),
                 );
                 let sum = program.group_reduce_sum::<BK>(partial);
                 let store_mask = k_lane.eq(0).and(row.lt(m)).and(col.lt(b.cols));
@@ -504,7 +504,7 @@ impl Program {
                     TileReduceOp::Sum,
                     k,
                     a_value * b_value,
-                    TileLiteral::F32(F32Bits::new(0.0)),
+                    TileLiteral::f32(0.0),
                 );
                 program.store(y.at(row, col), sum, mask);
             },
@@ -550,7 +550,7 @@ impl Program {
                 + program.subgroup_id();
             let lane = program.subgroup_lane();
             let row_in_bounds = row.lt(m);
-            let zero = TileLiteral::F32(F32Bits::new(0.0));
+            let zero = TileLiteral::f32(0.0);
             let [sum] =
                 program.loop_fold_n::<1, _>(TileReduceOp::Sum, k_iterations, [zero], |program| {
                     let k_base =

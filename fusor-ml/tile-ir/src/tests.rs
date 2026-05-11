@@ -311,7 +311,7 @@ fn primitive_qgemm_q8_0_in_dsl() {
                     TileReduceOp::Sum,
                     K_ITERATIONS,
                     body,
-                    TileLiteral::F32(F32Bits::new(0.0)),
+                    TileLiteral::f32(0.0),
                 );
                 let sum = program.subgroup_reduce_sum(partial);
                 let store_mask = lane.eq(0).and(row.lt(M)).and(col.lt(N));

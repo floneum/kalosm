@@ -1,6 +1,6 @@
 use crate::{
     tile::{self, Tile, TileBlock},
-    F32Bits, TileLiteral, TileUnaryOp, F32, U32,
+    TileLiteral, TileUnaryOp, F32, U32,
 };
 
 use super::helpers::{all, f32_tile, lane_zero, u32_tile, NEG_MAX_F32, TOP_K_BLOCK};
@@ -21,7 +21,7 @@ fn mirostat_top_value(
     program.load_linear(
         values.at(index),
         all(),
-        TileLiteral::F32(F32Bits::new(NEG_MAX_F32)),
+        TileLiteral::f32(NEG_MAX_F32),
     )
 }
 
@@ -50,7 +50,7 @@ fn load_param_f32(
     params: &tile::Storage<F32, 1>,
     index: u32,
 ) -> Tile<TOP_K_BLOCK> {
-    program.load_linear(params.at(index), all(), TileLiteral::F32(F32Bits::new(0.0)))
+    program.load_linear(params.at(index), all(), TileLiteral::f32(0.0))
 }
 
 fn store_sample_result(
@@ -171,7 +171,7 @@ pub fn mirostat2<B>(
                     let mu = program.load_linear(
                         state.at(0),
                         all(),
-                        TileLiteral::F32(F32Bits::new(0.0)),
+                        TileLiteral::f32(0.0),
                     );
                     program.store_local(&cutoff, u32_tile(0));
                     program.store_local(&scan, u32_tile(0));

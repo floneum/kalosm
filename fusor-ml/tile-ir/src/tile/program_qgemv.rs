@@ -1,7 +1,6 @@
 
 
 use crate::ir::{
-    F32Bits,
     TileLiteral,
     TileReduceOp,
     WorkgroupAxis, F32,
@@ -241,7 +240,7 @@ impl Program {
             let lane = program.subgroup_lane();
             let Q4KLane { ix, iq, ir } = q4k_lane_decomposition(&lane);
 
-            let zero = TileLiteral::F32(F32Bits::new(0.0));
+            let zero = TileLiteral::f32(0.0);
             let sums: [Tile<BLOCK>; COLS_PER_SUBGROUP] = program
                 .loop_fold_n::<COLS_PER_SUBGROUP, _>(
                     TileReduceOp::Sum,
@@ -339,7 +338,7 @@ impl Program {
             let lane = program.subgroup_lane();
             let Q4KLane { ix, iq, ir } = q4k_lane_decomposition(&lane);
 
-            let zero = TileLiteral::F32(F32Bits::new(0.0));
+            let zero = TileLiteral::f32(0.0);
             let sums: [Tile<BLOCK>; DOTS_PER_SUBGROUP] = program
                 .loop_fold_n::<DOTS_PER_SUBGROUP, _>(
                     TileReduceOp::Sum,
@@ -447,7 +446,7 @@ impl Program {
             let il = tid % 8;
             let l0 = il.clone() * 4;
 
-            let zero = TileLiteral::F32(F32Bits::new(0.0));
+            let zero = TileLiteral::f32(0.0);
             let sums: [Tile<BLOCK>; COLS_PER_SUBGROUP] = program
                 .loop_fold_n::<COLS_PER_SUBGROUP, _>(
                     TileReduceOp::Sum,
@@ -525,7 +524,7 @@ impl Program {
             let col0 = col_group_base + subgroup_col_base;
             let lane = program.subgroup_lane();
 
-            let zero = TileLiteral::F32(F32Bits::new(0.0));
+            let zero = TileLiteral::f32(0.0);
             let sums: [Tile<BLOCK>; COLS_PER_SUBGROUP] = program
                 .loop_fold_n::<COLS_PER_SUBGROUP, _>(
                     TileReduceOp::Sum,

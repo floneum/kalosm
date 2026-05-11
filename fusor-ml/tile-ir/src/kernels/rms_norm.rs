@@ -51,7 +51,7 @@ pub fn rms_norm_vec4<B>(
                 TileReduceOp::Sum,
                 chunks,
                 dot,
-                TileLiteral::F32(F32Bits::new(0.0)),
+                TileLiteral::f32(0.0),
             );
             let total_sum = program.group_reduce_sum::<RMS_NORM_VEC4_BLOCK>(partial_sum);
             let mean = total_sum
@@ -59,7 +59,7 @@ pub fn rms_norm_vec4<B>(
                     meta.cols as f32,
                 )));
             let scale = (mean
-                + Tile::<RMS_NORM_VEC4_BLOCK>::literal(TileLiteral::F32(F32Bits::new(eps))))
+                + Tile::<RMS_NORM_VEC4_BLOCK>::literal(TileLiteral::f32(eps)))
             .inverse_sqrt();
             let scale = program.bind(scale);
 

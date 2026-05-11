@@ -1,7 +1,7 @@
 
 
 use crate::ir::{
-    F32Bits, KernelIr,
+    KernelIr,
     TileLiteral, F32,
 };
 use super::*;
@@ -96,7 +96,7 @@ pub(super) fn q4k_ggml_activations<const BLOCK: usize>(
     let low = load_quad(program, 0);
     let high = load_quad(program, 128);
 
-    let zero = TileLiteral::F32(F32Bits::new(0.0));
+    let zero = TileLiteral::f32(0.0);
     let mut sums = [zero; 4].map(Tile::literal);
     for j in 0..8 {
         sums[0] = sums[0].clone() + low[j].get();
