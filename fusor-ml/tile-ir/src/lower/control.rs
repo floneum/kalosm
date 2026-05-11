@@ -165,13 +165,7 @@ impl<'a> Lowerer<'a> {
     }
 
     pub(super) fn restore_tile_loop_caches(&self, snapshot: TileLoopCacheSnapshot) {
-        {
-            let mut cache = self.block_dequant_cache.borrow_mut();
-            cache.clear();
-            for (key, value) in snapshot.block_dequant {
-                cache.insert(key, value);
-            }
-        }
+        Self::replace_cache(&self.block_dequant_cache, snapshot.block_dequant);
         self.q8_activation_pack_cache.borrow_mut().clear();
     }
 
@@ -183,20 +177,19 @@ impl<'a> Lowerer<'a> {
     }
 
     pub(super) fn restore_coop_loop_caches(&self, snapshot: CoopLoopCacheSnapshot) {
-        {
-            let mut cache = self.coop_fragment_cache.borrow_mut();
-            cache.clear();
-            for (key, value) in snapshot.fragments {
-                cache.insert(key, value);
-            }
-        }
-        {
-            let mut cache = self.coop_acc_value_cache.borrow_mut();
-            cache.clear();
-            for (key, value) in snapshot.acc_values {
-                cache.insert(key, value);
-            }
-        }
+        Self::replace_cache(&self.coop_fragment_cache, snapshot.fragments);
+        Self::replace_cache(&self.coop_acc_value_cache, snapshot.acc_values);
+    }
+
+    /// Drain `cache` and refill it with `entries`. Snapshot/restore helpers
+    /// use this to atomically reset a cache to a previously-recorded set.
+    fn replace_cache<K: std::hash::Hash + Eq, V>(
+        cache: &RefCell<HashMap<K, V>>,
+        entries: Vec<(K, V)>,
+    ) {
+        let mut cache = cache.borrow_mut();
+        cache.clear();
+        cache.extend(entries);
     }
 
     pub(super) fn current_loop_index(&self) -> Handle<LocalVariable> {
