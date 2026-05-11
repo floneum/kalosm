@@ -458,17 +458,7 @@ impl<const BLOCK: usize> TileBlock<'_, BLOCK> {
     /// four references to the same value — Naga's downstream optimizer
     /// collapses identical SSA reads.
     pub fn vec4_splat(&self, value: Tile<BLOCK>) -> Tile<BLOCK> {
-        let v = value.expr;
-        Tile {
-            expr: Expr::Compose4 {
-                values: [
-                    Box::new(v.clone()),
-                    Box::new(v.clone()),
-                    Box::new(v.clone()),
-                    Box::new(v),
-                ],
-            },
-        }
+        self.compose4([value.clone(), value.clone(), value.clone(), value])
     }
 
     /// Pack four scalars into a `vec4<f32>`.
