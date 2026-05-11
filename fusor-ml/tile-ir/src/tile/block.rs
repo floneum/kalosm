@@ -1026,20 +1026,6 @@ impl<const BLOCK: usize> TileBlock<'_, BLOCK> {
         }));
     }
 
-    pub fn store_vec4(
-        &mut self,
-        address: LinearAddress<F32Vec4, BLOCK>,
-        value: Tile<BLOCK>,
-        mask: Mask<BLOCK>,
-    ) {
-        self.push_stmt(TileStmt::StoreIndexed(TileIndexedStoreStmt {
-            dst: address.view,
-            index: address.index,
-            value: value.expr,
-            mask: mask.expr,
-        }));
-    }
-
     pub fn store_erased(
         &mut self,
         address: ErasedAddress<BLOCK>,

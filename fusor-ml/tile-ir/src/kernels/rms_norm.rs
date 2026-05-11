@@ -81,7 +81,7 @@ pub fn rms_norm_vec4<B>(
                         normalized + program.load_vec4(bias.at(col.clone()), mask.clone(), 0.0);
                 }
                 let output_index = row.clone() * meta.output_row_stride_vec + col;
-                program.store_vec4(output.at(output_index), normalized, mask);
+                program.store_linear(output.at(output_index), normalized, mask);
             }
         });
     Some(())
