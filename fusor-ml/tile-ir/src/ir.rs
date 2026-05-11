@@ -469,6 +469,20 @@ pub enum TileReduceOp {
     Min,
 }
 
+impl TileReduceOp {
+    /// The binary operator that combines two values under this reduction.
+    /// Used both by the kernel-builder when desugaring loop folds and by the
+    /// lowerer when emitting cross-lane reduce trees.
+    pub const fn binary(self) -> TileBinaryOp {
+        match self {
+            Self::Sum => TileBinaryOp::Add,
+            Self::Product => TileBinaryOp::Mul,
+            Self::Max => TileBinaryOp::Max,
+            Self::Min => TileBinaryOp::Min,
+        }
+    }
+}
+
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum TileCompareOp {
     Lt,

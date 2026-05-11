@@ -408,7 +408,7 @@ impl<const BLOCK: usize> TileBlock<'_, BLOCK> {
         let bodies = body(self);
         let body_stmts = self.stmt_stack.pop().expect("loop_fold_n body frame missing");
 
-        let binary_op = reduce_op_to_binary(op);
+        let binary_op = op.binary();
         let accumulators: Vec<crate::ir::FoldAccumulator> = bodies
             .into_iter()
             .enumerate()
@@ -673,7 +673,7 @@ impl<const BLOCK: usize> TileBlock<'_, BLOCK> {
                 element,
                 init: Expr::Literal(initial),
                 update: Expr::Binary {
-                    op: reduce_op_to_binary(op),
+                    op: op.binary(),
                     left: Box::new(Expr::LoadLocal(acc_local)),
                     right: Box::new(value.expr),
                 },
@@ -1042,14 +1042,3 @@ impl<const BLOCK: usize> TileBlock<'_, BLOCK> {
     }
 }
 
-/// Map a `TileReduceOp` to the binary operator that combines the in-flight
-/// accumulator with the per-iteration value when desugaring loop folds into
-/// `TileStmt::Fold` accumulators.
-fn reduce_op_to_binary(op: TileReduceOp) -> TileBinaryOp {
-    match op {
-        TileReduceOp::Sum => TileBinaryOp::Add,
-        TileReduceOp::Product => TileBinaryOp::Mul,
-        TileReduceOp::Max => TileBinaryOp::Max,
-        TileReduceOp::Min => TileBinaryOp::Min,
-    }
-}

@@ -25,16 +25,7 @@ impl<'a> Lowerer<'a> {
         left: Handle<Expression>,
         right: Handle<Expression>,
     ) -> Expression {
-        Self::tile_binary_expression(Self::tile_reduce_binary(op), left, right)
-    }
-
-    pub(in crate::lower) fn tile_reduce_binary(op: TileReduceOp) -> TileBinaryOp {
-        match op {
-            TileReduceOp::Sum => TileBinaryOp::Add,
-            TileReduceOp::Product => TileBinaryOp::Mul,
-            TileReduceOp::Max => TileBinaryOp::Max,
-            TileReduceOp::Min => TileBinaryOp::Min,
-        }
+        Self::tile_binary_expression(op.binary(), left, right)
     }
 
     pub(in crate::lower) fn element_scratch_index(element: ElementType) -> usize {
