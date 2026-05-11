@@ -1,4 +1,4 @@
-use crate::{
+use fusor_tile_ir::{
     tile::{Mask, Tile, TileBlock},
     TileLiteral,
 };
@@ -82,7 +82,7 @@ pub(super) fn index4_const_last<const BLOCK: usize>(
 /// kernels that broadcast a result via lane-zero stores.
 pub(super) fn lane_zero<const BLOCK: usize>(
     program: &TileBlock<'_, BLOCK>,
-    lane: &crate::tile::Range<BLOCK>,
+    lane: &fusor_tile_ir::tile::Range<BLOCK>,
 ) -> Tile<BLOCK> {
     program.index(lane.clone()).eq(u32_tile(0))
 }
@@ -93,8 +93,8 @@ pub(super) fn lane_zero<const BLOCK: usize>(
 /// had their own near-identical loop.
 pub(super) fn reduce_workgroup<const BLOCK: usize>(
     program: &mut TileBlock<'_, BLOCK>,
-    scratch: crate::TileRef,
-    lane: crate::tile::Range<BLOCK>,
+    scratch: fusor_tile_ir::TileRef,
+    lane: fusor_tile_ir::tile::Range<BLOCK>,
     combine: impl Fn(Tile<BLOCK>, Tile<BLOCK>) -> Tile<BLOCK>,
 ) {
     let mut stride = BLOCK as u32 / 2;

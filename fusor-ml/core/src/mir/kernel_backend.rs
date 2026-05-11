@@ -5,6 +5,7 @@ use std::{
 };
 
 use fusor_tile_ir as tile_ir;
+use fusor_tile_ir_kernels as tile_ir_kernels;
 use lru::LruCache;
 use parking_lot::RwLock;
 use rustc_hash::{FxBuildHasher, FxHasher};
@@ -244,7 +245,7 @@ pub(crate) fn linear_tensor_ref(
 ) -> tile_ir::KernelTensorRef<Arc<wgpu::Buffer>> {
     tile_ir::KernelTensorRef::new(
         tensor.buffer().clone(),
-        tile_ir::kernels::linear_storage_layout(),
+        tile_ir_kernels::linear_storage_layout(),
     )
 }
 

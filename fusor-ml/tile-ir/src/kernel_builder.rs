@@ -7,8 +7,7 @@
 //! `core` uses `Arc<wgpu::Buffer>`; tests can use `()`.
 
 use crate::{
-    ElementType, KernelIr, Layout, Numeric, StorageIndexMap,
-    quantized::{GgmlQuantFormat, QuantizedMatrix},
+    ElementType, KernelIr, Layout, Numeric,
     tile::{ErasedStorage, Program, Storage},
 };
 
@@ -19,25 +18,19 @@ pub struct KernelTensorRef<B> {
     pub binding: B,
     pub layout: Layout,
     pub offset: u32,
-    pub index_map: Option<StorageIndexMap>,
 }
 
 impl<B> KernelTensorRef<B> {
     pub fn new(binding: B, layout: Layout) -> Self {
-        Self::with_offset_and_index_map(binding, layout, 0, None)
+        Self::with_offset(binding, layout, 0)
     }
 
     pub fn with_offset(binding: B, layout: Layout, offset: u32) -> Self {
-        Self::with_offset_and_index_map(binding, layout, offset, None)
-    }
-
-    pub fn with_offset_and_index_map(
-        binding: B,
-        layout: Layout,
-        offset: u32,
-        index_map: Option<StorageIndexMap>,
-    ) -> Self {
-        Self { binding, layout, offset, index_map }
+        Self {
+            binding,
+            layout,
+            offset,
+        }
     }
 }
 
@@ -77,10 +70,8 @@ impl<B> KernelBuilder<B> {
         &mut self,
         tensor: KernelTensorRef<B>,
     ) -> Storage<T, R> {
-        self.declare_storage(tensor, |program, layout, offset, index_map| match index_map {
-            Some(index_map) => program
-                .storage_read_with_layout_offset_and_index_map::<T, R>(layout, offset, index_map),
-            None => program.storage_read_with_layout_offset::<T, R>(layout, offset),
+        self.declare_storage(tensor, |program, layout, offset| {
+            program.storage_read_with_layout_offset::<T, R>(layout, offset)
         })
     }
 
@@ -88,10 +79,8 @@ impl<B> KernelBuilder<B> {
         &mut self,
         tensor: KernelTensorRef<B>,
     ) -> Storage<T, R> {
-        self.declare_storage(tensor, |program, layout, offset, index_map| match index_map {
-            Some(index_map) => program
-                .storage_write_with_layout_offset_and_index_map::<T, R>(layout, offset, index_map),
-            None => program.storage_write_with_layout_offset::<T, R>(layout, offset),
+        self.declare_storage(tensor, |program, layout, offset| {
+            program.storage_write_with_layout_offset::<T, R>(layout, offset)
         })
     }
 
@@ -100,7 +89,7 @@ impl<B> KernelBuilder<B> {
         element: ElementType,
         tensor: KernelTensorRef<B>,
     ) -> ErasedStorage<R> {
-        self.declare_storage(tensor, |program, layout, offset, _| {
+        self.declare_storage(tensor, |program, layout, offset| {
             program.storage_read_element_with_layout_offset::<R>(element, layout, offset)
         })
     }
@@ -110,33 +99,29 @@ impl<B> KernelBuilder<B> {
         element: ElementType,
         tensor: KernelTensorRef<B>,
     ) -> ErasedStorage<R> {
-        self.declare_storage(tensor, |program, layout, offset, _| {
+        self.declare_storage(tensor, |program, layout, offset| {
             program.storage_write_element_with_layout_offset::<R>(element, layout, offset)
         })
     }
 
     /// Push the binding and call `declare` with the program plus the
-    /// tensor's layout, offset, and optional index map. Shared by every
+    /// tensor's layout and offset. Shared by every
     /// `read`/`write`/`read_erased`/`write_erased` entry point.
     fn declare_storage<S>(
         &mut self,
         tensor: KernelTensorRef<B>,
-        declare: impl FnOnce(&mut Program, Layout, u32, Option<StorageIndexMap>) -> S,
+        declare: impl FnOnce(&mut Program, Layout, u32) -> S,
     ) -> S {
         self.bindings.push(tensor.binding);
-        declare(&mut self.program, tensor.layout, tensor.offset, tensor.index_map)
+        declare(&mut self.program, tensor.layout, tensor.offset)
     }
 
-    /// Declare a quantized matrix backed by `binding`.
-    pub fn quantized_matrix(
-        &mut self,
-        binding: B,
-        format: GgmlQuantFormat,
-        rows: u32,
-        cols: u32,
-    ) -> QuantizedMatrix {
+    /// Append a binding without declaring an IR storage. Used by downstream
+    /// helpers (e.g. `fusor-tile-ir-kernels::quantized_matrix_for`) that need
+    /// to declare a quantized matrix backed by a runtime binding without
+    /// going through the typed `read`/`write` paths.
+    pub fn push_binding(&mut self, binding: B) {
         self.bindings.push(binding);
-        self.program.quantized_matrix(format, rows, cols)
     }
 
     pub fn finish(self) -> (KernelIr, Vec<B>) {

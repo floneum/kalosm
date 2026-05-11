@@ -1,6 +1,7 @@
 use std::{borrow::Cow, error::Error, sync::mpsc};
 
-use fusor_tile_ir::{tile, GgmlQuantFormat, KernelIr, Layout, MemoryLevel, Shape, Strides, F32};
+use fusor_tile_ir::{tile, tile::Storage, GgmlQuantFormat, KernelIr, Layout, MemoryLevel, Shape, F32};
+use fusor_tile_ir_kernels as tile_ir_kernels;
 use wgpu::util::DeviceExt;
 
 type TestResult<T = ()> = Result<T, Box<dyn Error>>;
@@ -387,7 +388,7 @@ fn gemm_ir(a_layout: &Layout, b_layout: &Layout, y_layout: &Layout) -> KernelIr 
         let a = phase.storage_read_with_layout::<F32, 2>(a_layout);
         let b = phase.storage_read_with_layout::<F32, 2>(b_layout);
         let y = phase.storage_write_with_layout::<F32, 2>(y_layout);
-        phase.matmul::<256>(&a, &b, &y);
+        tile_ir_kernels::matmul::<256>(phase, &a, &b, &y);
     })
 }
 
@@ -407,7 +408,7 @@ fn gemv_ir(
         let a = phase.storage_read_with_layout::<F32, 2>(a_layout);
         let x = phase.storage_read_with_layout::<F32, 2>(x_layout);
         let y = phase.storage_write_with_layout::<F32, 2>(y_layout);
-        phase.matmul::<256>(&a, &x, &y);
+        tile_ir_kernels::matmul::<256>(phase, &a, &x, &y);
     })
 }
 
@@ -424,14 +425,14 @@ fn qmatmul_ir(
     let y_layout = y_layout.clone();
     tile::build(move |phase| {
         let a = phase.storage_read_with_layout::<F32, 2>(a_layout);
-        let b = phase.quantized_matrix(format, k as u32, n as u32);
+        let b = tile_ir_kernels::quantized_matrix(phase, format, k as u32, n as u32);
         let y = phase.storage_write_with_layout::<F32, 2>(y_layout);
         if force_gemm {
-            phase.qmatmul::<8, 4, 8>(&a, &b, &y, 4);
+            tile_ir_kernels::qmatmul::<8, 4, 8>(phase, &a, &b, &y, 4);
         } else if m == 1 {
-            phase.qgemv::<4, 64>(&a, &b, &y, 4, 1);
+            tile_ir_kernels::qgemv::<4, 64>(phase, &a, &b, &y, 4, 1);
         } else {
-            phase.qmatmul::<8, 4, 8>(&a, &b, &y, 4);
+            tile_ir_kernels::qmatmul::<8, 4, 8>(phase, &a, &b, &y, 4);
         }
     })
 }
@@ -449,9 +450,9 @@ fn qmatmul_split_workgroups_ir(
     let y_layout = y_layout.clone();
     tile::build(move |phase| {
         let a = phase.storage_read_with_layout::<F32, 2>(a_layout);
-        let b = phase.quantized_matrix(format, k as u32, n as u32);
+        let b = tile_ir_kernels::quantized_matrix(phase, format, k as u32, n as u32);
         let y = phase.storage_write_with_layout::<F32, 2>(y_layout);
-        phase.qgemv::<4, 64>(&a, &b, &y, 4, workgroups_x);
+        tile_ir_kernels::qgemv::<4, 64>(phase, &a, &b, &y, 4, workgroups_x);
     })
 }
 
@@ -469,16 +470,87 @@ fn qmatmul_im2col_nhwc_ir(
     let y_layout = y_layout.clone();
     tile::build(move |phase| {
         let input = phase.storage_read_with_layout::<F32, 4>(input_layout);
-        let a = input.im2col_nhwc(
+        let a = im2col_nhwc(
+            &input,
             [output_hw[0] as u32, output_hw[1] as u32],
             [kernel_hw[0] as u32, kernel_hw[1] as u32],
             [1, 1],
             [1, 1],
         );
-        let b = phase.quantized_matrix(format, k as u32, n as u32);
+        let b = tile_ir_kernels::quantized_matrix(phase, format, k as u32, n as u32);
         let y = phase.storage_write_with_layout::<F32, 2>(y_layout);
-        phase.qmatmul::<8, 4, 8>(&a, &b, &y, 4);
+        tile_ir_kernels::qmatmul::<8, 4, 8>(phase, &a, &b, &y, 4);
     })
+}
+
+/// Userland NHWC im2col: composes `restride` (rank-4 → rank-6 affine view
+/// with overlapping strides for the conv window) with `flatten_axes`
+/// (fuse `(N, out_h, out_w) → M` and `(kh, kw, C) → K`). Pure composition
+/// over generic primitives — `tile-ir` has no im2col-specific node.
+fn im2col_nhwc<T>(
+    input: &Storage<T, 4>,
+    output_hw: [u32; 2],
+    kernel_hw: [u32; 2],
+    stride_hw: [u32; 2],
+    dilation_hw: [u32; 2],
+) -> Storage<T, 2> {
+    assert_eq!(
+        input.view().layout.shape().rank(),
+        4,
+        "NHWC input must be rank-4",
+    );
+    let dims = input.view().layout.shape().dims();
+    let batch = dims[0].get();
+    let input_h = dims[1].get();
+    let input_w = dims[2].get();
+    let channels = dims[3].get();
+    let [out_h, out_w] = output_hw;
+    let [kernel_h, kernel_w] = kernel_hw;
+    let [stride_h, stride_w] = stride_hw;
+    let [dilation_h, dilation_w] = dilation_hw;
+    assert!(out_h > 0 && out_w > 0, "im2col output shape must be non-zero");
+    assert!(kernel_h > 0 && kernel_w > 0, "im2col kernel shape must be non-zero");
+    assert!(stride_h > 0 && stride_w > 0, "im2col stride must be non-zero");
+    assert!(dilation_h > 0 && dilation_w > 0, "im2col dilation must be non-zero");
+    let used_h = out_h
+        .checked_sub(1)
+        .and_then(|v| v.checked_mul(stride_h))
+        .and_then(|v| {
+            kernel_h
+                .checked_sub(1)
+                .and_then(|k| k.checked_mul(dilation_h))
+                .and_then(|k| v.checked_add(k))
+        })
+        .and_then(|v| v.checked_add(1))
+        .expect("im2col height extent overflow");
+    let used_w = out_w
+        .checked_sub(1)
+        .and_then(|v| v.checked_mul(stride_w))
+        .and_then(|v| {
+            kernel_w
+                .checked_sub(1)
+                .and_then(|k| k.checked_mul(dilation_w))
+                .and_then(|k| v.checked_add(k))
+        })
+        .and_then(|v| v.checked_add(1))
+        .expect("im2col width extent overflow");
+    assert!(used_h <= input_h, "im2col view exceeds input height");
+    assert!(used_w <= input_w, "im2col view exceeds input width");
+
+    let strides = input.view().layout.affine_strides();
+    let (b_str, h_str, w_str, c_str) = (strides[0], strides[1], strides[2], strides[3]);
+    let view6 = input.restride::<6>(
+        [batch, out_h, out_w, kernel_h, kernel_w, channels],
+        [
+            b_str,
+            stride_h.checked_mul(h_str).expect("im2col h sub-stride overflow"),
+            stride_w.checked_mul(w_str).expect("im2col w sub-stride overflow"),
+            dilation_h.checked_mul(h_str).expect("im2col kh sub-stride overflow"),
+            dilation_w.checked_mul(w_str).expect("im2col kw sub-stride overflow"),
+            c_str,
+        ],
+    );
+    view6.flatten_axes::<2>([&[0, 1, 2], &[3, 4, 5]])
 }
 
 fn run_three_buffer_kernel(
@@ -645,16 +717,16 @@ fn matrix_layout(rows: usize, cols: usize, variant: StorageVariant) -> Layout {
         StorageVariant::Padded if rows == 1 && cols > 1 => Layout::strided(
             MemoryLevel::Storage,
             shape,
-            Strides::new([(cols * 2 + 3) as u32, 2]),
+            &[(cols * 2 + 3) as u32, 2],
         ),
         StorageVariant::Padded => Layout::strided(
             MemoryLevel::Storage,
             shape,
-            Strides::new([(cols + 5) as u32, 1]),
+            &[(cols + 5) as u32, 1],
         ),
         StorageVariant::Transposed => {
-            let strides = Strides::col_major_for(&shape);
-            Layout::strided(MemoryLevel::Storage, shape, strides)
+            let strides = fusor_tile_ir::MultiFlattenMap::col_major_for(&shape).affine_strides();
+            Layout::strided(MemoryLevel::Storage, shape, &strides)
         }
     }
 }
@@ -664,7 +736,7 @@ fn skewed_activation_layout(rows: usize, cols: usize) -> Layout {
     Layout::strided(
         MemoryLevel::Storage,
         shape,
-        Strides::new([2, (rows * 2 + 7) as u32]),
+        &[2, (rows * 2 + 7) as u32],
     )
 }
 
@@ -673,7 +745,7 @@ fn allocation_len(layout: &Layout) -> usize {
 }
 
 fn matrix_storage_index(layout: &Layout, row: usize, col: usize) -> usize {
-    let strides = layout.strides().values();
+    let strides = layout.affine_strides();
     row * strides[0] as usize + col * strides[1] as usize
 }
 

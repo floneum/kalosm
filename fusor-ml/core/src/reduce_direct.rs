@@ -186,7 +186,7 @@ fn flat_layout(allocation_len: u32) -> tile_ir::Layout {
     tile_ir::Layout::strided(
         tile_ir::MemoryLevel::Storage,
         tile_ir::Shape::new([1, allocation_len]),
-        tile_ir::Strides::new([0, 1]),
+        &[0, 1],
     )
 }
 

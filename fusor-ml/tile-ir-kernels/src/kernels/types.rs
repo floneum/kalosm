@@ -1,4 +1,4 @@
-use crate::F32Bits;
+use fusor_tile_ir::F32Bits;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct FlashAttentionDims {

@@ -1,6 +1,7 @@
 use std::{hash::Hash, sync::OnceLock};
 
 use fusor_tile_ir as tile_ir;
+use fusor_tile_ir_kernels as tile_ir_kernels;
 
 use crate::{
     DataTypeEnum,
@@ -85,8 +86,8 @@ const FLASH_Q_SEQ: Axis<3> = Axis;
 const FLASH_KV_SEQ: Axis<4> = Axis;
 const FLASH_HEAD_DIM: Axis<5> = Axis;
 
-type FlashAttentionDims = tile_ir::FlashAttentionDims;
-type FlashDecodeSmallMeta = tile_ir::FlashDecodeSmallMeta;
+type FlashAttentionDims = tile_ir_kernels::FlashAttentionDims;
+type FlashDecodeSmallMeta = tile_ir_kernels::FlashDecodeSmallMeta;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum DecodeBlock {
@@ -504,7 +505,7 @@ impl Operation for FlashAttentionOperation {
         };
 
         let _ = output_index; // Bindings are derived from the kernel IR.
-        let layout = tile_ir::kernels::linear_storage_layout();
+        let layout = tile_ir_kernels::linear_storage_layout();
         let q_buffer = q.buffer().clone();
         let k_buffer = k.buffer().clone();
         let v_buffer = v.buffer().clone();
@@ -541,11 +542,11 @@ impl Operation for FlashAttentionOperation {
                             | wgpu::BufferUsages::COPY_SRC,
                     );
                     let params_ref = tile_ir::KernelTensorRef::new(params_buffer, layout);
-                    tile_ir::kernels::flash_decode_small(
+                    tile_ir_kernels::flash_decode_small(
                         kb, q_ref, k_ref, v_ref, output_ref, params_ref, meta,
                     )
                 } else {
-                    let stream_meta = tile_ir::FlashAttentionMeta {
+                    let stream_meta = tile_ir_kernels::FlashAttentionMeta {
                         dims,
                         scale: tile_ir::F32Bits::new(scale),
                         q_meta: q_tile_meta,
@@ -556,10 +557,10 @@ impl Operation for FlashAttentionOperation {
                         dispatch_size,
                     };
                     match input_dtype {
-                        DataTypeEnum::F32 => tile_ir::kernels::flash_attention::<tile_ir::F32, _>(
+                        DataTypeEnum::F32 => tile_ir_kernels::flash_attention::<tile_ir::F32, _>(
                             kb, q_ref, k_ref, v_ref, mask_ref, output_ref, stream_meta,
                         ),
-                        DataTypeEnum::F16 => tile_ir::kernels::flash_attention::<tile_ir::F16, _>(
+                        DataTypeEnum::F16 => tile_ir_kernels::flash_attention::<tile_ir::F16, _>(
                             kb, q_ref, k_ref, v_ref, mask_ref, output_ref, stream_meta,
                         ),
                         _ => None,
@@ -589,7 +590,7 @@ impl Operation for FlashAttentionOperation {
 #[derive(Clone)]
 pub(crate) struct TensorMeta {
     datatype: DataTypeEnum,
-    tile: tile_ir::TensorMeta,
+    tile: tile_ir_kernels::TensorMeta,
 }
 
 impl TensorMeta {
@@ -605,7 +606,7 @@ impl TensorMeta {
         let offset = tensor.layout().offset().try_into().ok()?;
         Some(Self {
             datatype: tensor.datatype(),
-            tile: tile_ir::TensorMeta::new(strides, offset),
+            tile: tile_ir_kernels::TensorMeta::new(strides, offset),
         })
     }
 
@@ -683,7 +684,7 @@ mod tests {
     fn tensor_meta4() -> TensorMeta {
         TensorMeta {
             datatype: DataTypeEnum::F32,
-            tile: tile_ir::TensorMeta::new(vec![65_536, 8_192, 128, 1], 0),
+            tile: tile_ir_kernels::TensorMeta::new(vec![65_536, 8_192, 128, 1], 0),
         }
     }
 

@@ -1,13 +1,20 @@
 [package]
-name = "fusor-tile-ir"
+name = "fusor-tile-ir-kernels"
 version = "0.1.0"
 edition = "2021"
 publish = false
 autoexamples = false
 
+[[example]]
+name = "tile_ir"
+path = "examples/tile_ir.rs"
+
 [dependencies]
+fusor-tile-ir = { workspace = true }
 bytemuck = "1.25.0"
 half = "2.4.1"
+
+[dev-dependencies]
 naga = { git = "https://github.com/ealmloff/wgpu", branch = "yield-now", package = "naga" }
 pollster = "0.4.0"
 wgpu = { git = "https://github.com/ealmloff/wgpu", branch = "yield-now", features = ["naga-ir", "static-dxc"] }

@@ -1,4 +1,4 @@
-use fusor_tile_ir as tile_ir;
+use fusor_tile_ir_kernels as tile_ir_kernels;
 
 use crate::{
     Device,
@@ -67,7 +67,7 @@ pub(crate) fn sample_from_sorted_top_k_data_with_encoder(
     let params = mirostat2_params_data(device, params);
     let has_exactness_flag = exactness_flag.is_some();
     let output = TensorData::new_for_shape(device, &[GPU_SAMPLE_RESULT_WORDS], DataTypeEnum::U32);
-    let meta = tile_ir::Mirostat2Meta {
+    let meta = tile_ir_kernels::Mirostat2Meta {
         top_k: top_k.try_into().ok()?,
         ids_offset: ids.layout().offset().try_into().ok()?,
         ids_stride: ids.layout().strides()[0].try_into().ok()?,
@@ -86,7 +86,7 @@ pub(crate) fn sample_from_sorted_top_k_data_with_encoder(
         cache_key,
         [1, 1, 1],
         |kb| {
-            tile_ir::kernels::mirostat2(
+            tile_ir_kernels::mirostat2(
                 kb,
                 kernel_backend::linear_tensor_ref(ids),
                 kernel_backend::linear_tensor_ref(values),

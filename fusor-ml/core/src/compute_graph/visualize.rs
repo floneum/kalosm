@@ -77,9 +77,9 @@ impl GraphVisPass {
         let input = self.identities.get(&operation.input).unwrap();
         let output_layout = self.layout_pass.output_layout.get(&key).unwrap();
         let act = match operation.activation {
-            fusor_tile_ir::PairedActivation::SwiGLU => "swiglu",
-            fusor_tile_ir::PairedActivation::GeGLU => "geglu",
-            fusor_tile_ir::PairedActivation::ReGLU => "reglu",
+            fusor_tile_ir_kernels::PairedActivation::SwiGLU => "swiglu",
+            fusor_tile_ir_kernels::PairedActivation::GeGLU => "geglu",
+            fusor_tile_ir_kernels::PairedActivation::ReGLU => "reglu",
         };
         let id = Identity::quoted(format!("qmatmul_{act} ({}) #{:?}", output_layout, key));
         self.statements.push(Stmt::Node {

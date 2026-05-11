@@ -1,5 +1,6 @@
 use fusor_gguf::GgmlType;
 use fusor_tile_ir as tile_ir;
+use fusor_tile_ir_kernels as tile_ir_kernels;
 
 use crate::mir::inputs::MirValue;
 use crate::mir::operation::Operation;
@@ -147,12 +148,12 @@ impl Operation for DequantizeOperation {
             cache_key,
             [dispatch_x, dispatch_y, 1],
             move |kb| {
-                let q = kb.quantized_matrix(matrix_buffer, format, k, n);
+                let q = tile_ir_kernels::quantized_matrix_for(kb, matrix_buffer, format, k, n);
                 let y = kb.write::<tile_ir::F32, 1>(tile_ir::KernelTensorRef::new(
                     output_buffer,
                     output_layout,
                 ));
-                kb.program().qdequantize(&q, &y, dispatch_x);
+                tile_ir_kernels::qdequantize(kb.program(), &q, &y, dispatch_x);
                 Some(())
             },
         )

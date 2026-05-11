@@ -1,4 +1,5 @@
 use fusor_tile_ir::{tile, GgmlQuantFormat, KernelIr, Shape, WorkgroupAxis, F32};
+use fusor_tile_ir_kernels as tile_ir_kernels;
 
 fn softmax_ir(rows: u32, cols: u32) -> KernelIr {
     const BLOCK: usize = 128;
@@ -26,20 +27,20 @@ fn softmax_ir(rows: u32, cols: u32) -> KernelIr {
 fn qmatmul_ir(format: GgmlQuantFormat, m: u32, n: u32, k: u32) -> KernelIr {
     tile::build(|phase| {
         let a = phase.storage_read::<F32, 2>(Shape::new([m, k]));
-        let b = phase.quantized_matrix(format, k, n);
+        let b = tile_ir_kernels::quantized_matrix(phase, format, k, n);
         let y = phase.storage_write::<F32, 2>(Shape::new([m, n]));
 
-        phase.qmatmul::<8, 4, 8>(&a, &b, &y, 4);
+        tile_ir_kernels::qmatmul::<8, 4, 8>(phase, &a, &b, &y, 4);
     })
 }
 
 fn qgemv_ir(format: GgmlQuantFormat, n: u32, k: u32) -> KernelIr {
     tile::build(|phase| {
         let a = phase.storage_read::<F32, 2>(Shape::new([1, k]));
-        let b = phase.quantized_matrix(format, k, n);
+        let b = tile_ir_kernels::quantized_matrix(phase, format, k, n);
         let y = phase.storage_write::<F32, 2>(Shape::new([1, n]));
 
-        phase.qgemv::<4, 64>(&a, &b, &y, 4, 1);
+        tile_ir_kernels::qgemv::<4, 64>(phase, &a, &b, &y, 4, 1);
     })
 }
 

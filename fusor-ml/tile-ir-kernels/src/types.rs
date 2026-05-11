@@ -1,7 +1,5 @@
-
-
-use crate::ir::Layout;
-use super::*;
+use fusor_tile_ir::tile::Tile;
+use fusor_tile_ir::Layout;
 
 /// Activation pattern fused on top of a paired matmul reduction (gate, up).
 ///
@@ -38,7 +36,7 @@ impl PairedActivation {
     }
 }
 
-pub(super) fn matrix_shape(layout: &Layout) -> [u32; 2] {
+pub fn matrix_shape(layout: &Layout) -> [u32; 2] {
     assert_eq!(layout.shape().rank(), 2, "matrix operands must be rank-2");
     [
         layout.shape().dims()[0].get(),
@@ -46,8 +44,10 @@ pub(super) fn matrix_shape(layout: &Layout) -> [u32; 2] {
     ]
 }
 
-pub(super) fn cooperative_store_layout_supported(layout: &Layout) -> bool {
-    layout.shape().rank() == 2
-        && layout.strides().rank() == 2
-        && (layout.strides().values()[0] == 1 || layout.strides().values()[1] == 1)
+pub fn cooperative_store_layout_supported(layout: &Layout) -> bool {
+    if !layout.is_affine() || layout.shape().rank() != 2 {
+        return false;
+    }
+    let strides = layout.affine_strides();
+    strides[0] == 1 || strides[1] == 1
 }

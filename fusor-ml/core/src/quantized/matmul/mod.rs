@@ -19,6 +19,7 @@ use crate::{
 };
 use fusor_gguf::GgmlType;
 use fusor_tile_ir as tile_ir;
+use fusor_tile_ir_kernels as tile_ir_kernels;
 
 use super::{QMatMulDirectPipelineKey, QMatrix};
 
@@ -338,7 +339,7 @@ pub(crate) struct QMatMulPairedOperation {
     pub(crate) in_shape: Box<[usize]>,
     pub(crate) out_shape: Box<[usize]>,
     pub(crate) pair_len: usize,
-    pub(crate) activation: tile_ir::PairedActivation,
+    pub(crate) activation: tile_ir_kernels::PairedActivation,
 }
 
 impl QMatMulPairedOperation {
@@ -348,7 +349,7 @@ impl QMatMulPairedOperation {
         input: NodeIndex,
         matrix: QMatrix,
         pair_len: usize,
-        activation: tile_ir::PairedActivation,
+        activation: tile_ir_kernels::PairedActivation,
     ) -> Self {
         let last_dim = input_shape.len() - 1;
         let mut out_shape = input_shape.to_vec();
@@ -513,26 +514,26 @@ impl QMatMulOperation {
         }
         let ir = tile_ir::tile::build(move |phase| {
             let a = tile_storage_read_with_direct_layout(phase, a_view);
-            let b = phase.quantized_matrix(format, k, n);
+            let b = tile_ir_kernels::quantized_matrix(phase, format, k, n);
             let y = tile_storage_write_with_direct_layout(phase, y_view);
             match variant {
                 QMatmulDirectVariant::Q5SmallSingleRow => {
-                    phase.qgemv::<8, 32>(&a, &b, &y, 4, qmatmul_workgroups_x);
+                    tile_ir_kernels::qgemv::<8, 32>(phase, &a, &b, &y, 4, qmatmul_workgroups_x);
                 }
                 QMatmulDirectVariant::SingleRow => {
-                    phase.qgemv::<4, 64>(&a, &b, &y, 4, qmatmul_workgroups_x);
+                    tile_ir_kernels::qgemv::<4, 64>(phase, &a, &b, &y, 4, qmatmul_workgroups_x);
                 }
                 QMatmulDirectVariant::Q8Wide64x128 | QMatmulDirectVariant::Tile64x128 => {
-                    phase.qmatmul::<64, 128, 32>(&a, &b, &y, 4);
+                    tile_ir_kernels::qmatmul::<64, 128, 32>(phase, &a, &b, &y, 4);
                 }
                 QMatmulDirectVariant::Tile128x128 => {
-                    phase.qmatmul::<128, 128, 32>(&a, &b, &y, 4);
+                    tile_ir_kernels::qmatmul::<128, 128, 32>(phase, &a, &b, &y, 4);
                 }
                 QMatmulDirectVariant::Tile128x64 => {
-                    phase.qmatmul::<128, 64, 32>(&a, &b, &y, 4);
+                    tile_ir_kernels::qmatmul::<128, 64, 32>(phase, &a, &b, &y, 4);
                 }
                 QMatmulDirectVariant::Tile64x64Fast | QMatmulDirectVariant::Tile64x64 => {
-                    phase.qmatmul::<64, 64, 32>(&a, &b, &y, 4);
+                    tile_ir_kernels::qmatmul::<64, 64, 32>(phase, &a, &b, &y, 4);
                 }
             }
         });
@@ -672,9 +673,11 @@ fn split_workgroups_2d(
 }
 
 fn tile_cooperative_store_layout_supported(layout: &tile_ir::Layout) -> bool {
-    layout.shape().rank() == 2
-        && layout.strides().rank() == 2
-        && (layout.strides().values()[0] == 1 || layout.strides().values()[1] == 1)
+    if !layout.is_affine() || layout.shape().rank() != 2 {
+        return false;
+    }
+    let strides = layout.affine_strides();
+    strides[0] == 1 || strides[1] == 1
 }
 
 fn qgemv_cols_per_workgroup_for_direct(format: tile_ir::GgmlQuantFormat, k: u32, n: u32) -> u32 {
@@ -697,15 +700,15 @@ impl<const R: usize> Tensor<R, f32> {
     }
 
     pub fn q_mat_mul_swiglu(&self, other: &QMatrix, pair_len: usize) -> Self {
-        self.add_q_mat_mul_paired(other, pair_len, tile_ir::PairedActivation::SwiGLU)
+        self.add_q_mat_mul_paired(other, pair_len, tile_ir_kernels::PairedActivation::SwiGLU)
     }
 
     pub fn q_mat_mul_geglu(&self, other: &QMatrix, pair_len: usize) -> Self {
-        self.add_q_mat_mul_paired(other, pair_len, tile_ir::PairedActivation::GeGLU)
+        self.add_q_mat_mul_paired(other, pair_len, tile_ir_kernels::PairedActivation::GeGLU)
     }
 
     pub fn q_mat_mul_reglu(&self, other: &QMatrix, pair_len: usize) -> Self {
-        self.add_q_mat_mul_paired(other, pair_len, tile_ir::PairedActivation::ReGLU)
+        self.add_q_mat_mul_paired(other, pair_len, tile_ir_kernels::PairedActivation::ReGLU)
     }
 }
 
@@ -922,11 +925,11 @@ impl Operation for QMatMulOperation {
 /// Distinct hash perturbation per paired activation so the pipeline cache key
 /// (which already mixes `pair_len`) doesn't alias kernels for different
 /// activations on the same shape.
-fn activation_cache_salt(activation: tile_ir::PairedActivation) -> u32 {
+fn activation_cache_salt(activation: tile_ir_kernels::PairedActivation) -> u32 {
     match activation {
-        tile_ir::PairedActivation::SwiGLU => 0,
-        tile_ir::PairedActivation::GeGLU => 0x4000_0000,
-        tile_ir::PairedActivation::ReGLU => 0x8000_0000,
+        tile_ir_kernels::PairedActivation::SwiGLU => 0,
+        tile_ir_kernels::PairedActivation::GeGLU => 0x4000_0000,
+        tile_ir_kernels::PairedActivation::ReGLU => 0x8000_0000,
     }
 }
 
@@ -988,21 +991,21 @@ impl Q4KPairedTile {
         pair_len: u32,
         m: u32,
         workgroups_x: u32,
-        activation: tile_ir::PairedActivation,
+        activation: tile_ir_kernels::PairedActivation,
     ) {
         macro_rules! emit_tile {
-            ($method:ident) => {
-                phase.$method(a, b, y, pair_len, m, workgroups_x, activation)
+            ($func:path) => {
+                $func(phase, a, b, y, pair_len, m, workgroups_x, activation)
             };
         }
 
         match self {
-            Self::X4x1 => emit_tile!(qgemv_q4k_paired_4x1),
-            Self::X4x4 => emit_tile!(qgemv_q4k_paired_4x4),
-            Self::X8x1 => emit_tile!(qgemv_q4k_paired_8x1),
-            Self::X8x2 => emit_tile!(qgemv_q4k_paired_8x2),
-            Self::X2x2 => emit_tile!(qgemv_q4k_paired_2x2),
-            Self::X2x4 => emit_tile!(qgemv_q4k_paired_2x4),
+            Self::X4x1 => emit_tile!(tile_ir_kernels::qgemv_q4k_paired_4x1),
+            Self::X4x4 => emit_tile!(tile_ir_kernels::qgemv_q4k_paired_4x4),
+            Self::X8x1 => emit_tile!(tile_ir_kernels::qgemv_q4k_paired_8x1),
+            Self::X8x2 => emit_tile!(tile_ir_kernels::qgemv_q4k_paired_8x2),
+            Self::X2x2 => emit_tile!(tile_ir_kernels::qgemv_q4k_paired_2x2),
+            Self::X2x4 => emit_tile!(tile_ir_kernels::qgemv_q4k_paired_2x4),
         }
     }
 }
@@ -1107,7 +1110,7 @@ impl Operation for QMatMulPairedOperation {
             || {
                 Some(tile_ir::tile::build(move |phase| {
                     let a = tile_storage_read_with_direct_layout(phase, a_view);
-                    let b = phase.quantized_matrix(format, k, pair_len * 2);
+                    let b = tile_ir_kernels::quantized_matrix(phase, format, k, pair_len * 2);
                     let y = tile_storage_write_with_direct_layout(phase, y_view);
                     tile.emit(phase, &a, &b, &y, pair_len, m, workgroups_x, activation);
                 }))

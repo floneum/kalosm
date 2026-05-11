@@ -171,7 +171,6 @@ pub struct StorageView {
     pub buffer: BufferRef,
     pub offset: u32,
     pub layout: Layout,
-    pub index_map: Option<StorageIndexMap>,
 }
 
 impl StorageView {
@@ -181,43 +180,8 @@ impl StorageView {
             buffer,
             offset: 0,
             layout,
-            index_map: None,
         }
     }
-}
-
-/// Non-affine logical-to-storage mappings for matrix views.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum StorageIndexMap {
-    Im2ColNhwc(Im2ColNhwcMap),
-    FlattenedMatrix(FlattenedMatrixMap),
-}
-
-/// Rank-N tensor viewed as a rank-2 matrix by flattening every axis except the
-/// final column axis.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct FlattenedMatrixMap {
-    pub prefix_shape: Vec<u32>,
-    pub prefix_strides: Vec<u32>,
-    pub column_stride: u32,
-}
-
-/// NHWC convolution activation view lowered as an im2col matrix.
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub struct Im2ColNhwcMap {
-    pub out_h: u32,
-    pub out_w: u32,
-    pub kernel_h: u32,
-    pub kernel_w: u32,
-    pub channels: u32,
-    pub stride_h: u32,
-    pub stride_w: u32,
-    pub dilation_h: u32,
-    pub dilation_w: u32,
-    pub batch_stride: u32,
-    pub row_stride: u32,
-    pub col_stride: u32,
-    pub channel_stride: u32,
 }
 
 /// Axis of `@builtin(workgroup_id)`.
@@ -562,4 +526,4 @@ pub use expr::{
 };
 
 mod layout;
-pub use layout::{Layout, MemoryLevel, Shape, Strides};
+pub use layout::{AxisGroup, Layout, MemoryLevel, MultiFlattenMap, Shape, SubAxis};

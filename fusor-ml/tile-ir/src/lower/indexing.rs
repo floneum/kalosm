@@ -154,180 +154,74 @@ impl<'a> Lowerer<'a> {
         coords: &[Handle<Expression>],
         body: &mut Block,
     ) -> Result<Handle<Expression>, LowerError> {
-        if let Some(index_map) = &view.index_map {
-            return self.storage_index_from_index_map(expressions, index_map, coords, body);
-        }
-
         let layout = self.storage_layout(view)?;
-        if layout.strides().rank() != coords.len() {
-            return Err(LowerError::UnsupportedOperation("layout rank mismatch"));
-        }
-
-        let mut terms = Vec::with_capacity(coords.len());
-        for (coord, stride) in coords.iter().zip(layout.strides().values()) {
-            terms.push(self.mul_literal_u32_emitted(expressions, *coord, *stride, body));
-        }
-        let mut terms = terms.into_iter();
-        let Some(mut index) = terms.next() else {
-            return Err(LowerError::UnsupportedOperation("zero-rank layout"));
-        };
-        for term in terms {
-            index = self.emit(
-                expressions,
-                body,
-                Expression::Binary {
-                    op: BinaryOperator::Add,
-                    left: index,
-                    right: term,
-                },
-            );
-        }
-
-        Ok(index)
+        self.storage_index_from_multi_flatten(expressions, layout.indexing(), coords, body)
     }
 
-    fn storage_index_from_index_map(
+    fn storage_index_from_multi_flatten(
         &self,
         expressions: &mut Arena<Expression>,
-        index_map: &StorageIndexMap,
+        map: &MultiFlattenMap,
         coords: &[Handle<Expression>],
         body: &mut Block,
     ) -> Result<Handle<Expression>, LowerError> {
-        match index_map {
-            StorageIndexMap::Im2ColNhwc(map) => {
-                self.storage_index_from_im2col_nhwc(expressions, *map, coords, body)
-            }
-            StorageIndexMap::FlattenedMatrix(map) => {
-                self.storage_index_from_flattened_matrix(expressions, map, coords, body)
-            }
-        }
-    }
-
-    fn storage_index_from_flattened_matrix(
-        &self,
-        expressions: &mut Arena<Expression>,
-        map: &FlattenedMatrixMap,
-        coords: &[Handle<Expression>],
-        body: &mut Block,
-    ) -> Result<Handle<Expression>, LowerError> {
-        if coords.len() != 2 {
+        if map.groups.len() != coords.len() {
             return Err(LowerError::UnsupportedOperation(
-                "flattened matrix storage views require matrix coordinates",
+                "multi-flatten map rank does not match coord count",
             ));
         }
-        if map.prefix_shape.is_empty() || map.prefix_shape.len() != map.prefix_strides.len() {
-            return Err(LowerError::UnsupportedOperation(
-                "flattened matrix prefix metadata mismatch",
-            ));
-        }
-
-        let row = coords[0];
-        let col = coords[1];
-        let mut remaining = row;
-        let mut terms = Vec::with_capacity(map.prefix_shape.len() + 1);
-
-        for axis in (0..map.prefix_shape.len()).rev() {
-            let dim = map.prefix_shape[axis];
-            let coord = if axis == 0 {
-                remaining
-            } else {
-                let coord = self.mod_literal_u32_emitted(expressions, remaining, dim, body);
-                remaining = self.div_literal_u32_emitted(expressions, remaining, dim, body);
-                coord
-            };
-            let stride = map.prefix_strides[axis];
-            if stride != 0 {
-                terms.push(self.mul_literal_u32_emitted(expressions, coord, stride, body));
-            }
-        }
-
-        if map.column_stride != 0 {
-            terms.push(self.mul_literal_u32_emitted(
-                expressions,
-                col,
-                map.column_stride,
-                body,
-            ));
-        }
-
-        let mut terms = terms.into_iter();
-        let Some(mut index) = terms.next() else {
-            return Ok(self.u32(expressions, 0));
-        };
-        for term in terms {
-            index = self.add_u32_expr(expressions, index, term, body);
-        }
-        Ok(index)
-    }
-
-    fn storage_index_from_im2col_nhwc(
-        &self,
-        expressions: &mut Arena<Expression>,
-        map: Im2ColNhwcMap,
-        coords: &[Handle<Expression>],
-        body: &mut Block,
-    ) -> Result<Handle<Expression>, LowerError> {
-        if coords.len() != 2 {
-            return Err(LowerError::UnsupportedOperation(
-                "im2col storage views require matrix coordinates",
-            ));
-        }
-
-        let row = coords[0];
-        let k = coords[1];
-        let output_pixels =
-            map.out_h
-                .checked_mul(map.out_w)
-                .ok_or(LowerError::UnsupportedOperation(
-                    "im2col output shape overflow",
-                ))?;
-        let kernel_w_channels =
-            map.kernel_w
-                .checked_mul(map.channels)
-                .ok_or(LowerError::UnsupportedOperation(
-                    "im2col kernel shape overflow",
-                ))?;
-
-        let batch = self.div_literal_u32_emitted(expressions, row, output_pixels, body);
-        let output_index =
-            self.mod_literal_u32_emitted(expressions, row, output_pixels, body);
-        let out_y = self.div_literal_u32_emitted(expressions, output_index, map.out_w, body);
-        let out_x = self.mod_literal_u32_emitted(expressions, output_index, map.out_w, body);
-
-        let kernel_y = self.div_literal_u32_emitted(expressions, k, kernel_w_channels, body);
-        let kernel_xc = self.mod_literal_u32_emitted(expressions, k, kernel_w_channels, body);
-        let kernel_x =
-            self.div_literal_u32_emitted(expressions, kernel_xc, map.channels, body);
-        let channel =
-            self.mod_literal_u32_emitted(expressions, kernel_xc, map.channels, body);
-
-        let out_y = self.mul_literal_u32_emitted(expressions, out_y, map.stride_h, body);
-        let kernel_y =
-            self.mul_literal_u32_emitted(expressions, kernel_y, map.dilation_h, body);
-        let in_y = self.add_u32_expr(expressions, out_y, kernel_y, body);
-        let out_x = self.mul_literal_u32_emitted(expressions, out_x, map.stride_w, body);
-        let kernel_x =
-            self.mul_literal_u32_emitted(expressions, kernel_x, map.dilation_w, body);
-        let in_x = self.add_u32_expr(expressions, out_x, kernel_x, body);
-
-        let terms = [
-            (batch, map.batch_stride),
-            (in_y, map.row_stride),
-            (in_x, map.col_stride),
-            (channel, map.channel_stride),
-        ];
-        let mut index = None;
-        for (coord, stride) in terms {
-            if Self::is_u32_literal(expressions, coord, 0) || stride == 0 {
+        let mut acc: Option<Handle<Expression>> = None;
+        for (group, &coord) in map.groups.iter().zip(coords.iter()) {
+            let Some(term) = self.lower_axis_group(expressions, group, coord, body)? else {
                 continue;
-            }
-            let term = self.mul_literal_u32_emitted(expressions, coord, stride, body);
-            index = Some(match index {
-                Some(index) => self.add_u32_expr(expressions, index, term, body),
+            };
+            acc = Some(match acc {
+                Some(a) => self.add_u32_expr(expressions, a, term, body),
                 None => term,
             });
         }
-        Ok(index.unwrap_or_else(|| self.u32(expressions, 0)))
+        Ok(acc.unwrap_or_else(|| self.u32(expressions, 0)))
+    }
+
+    fn lower_axis_group(
+        &self,
+        expressions: &mut Arena<Expression>,
+        group: &AxisGroup,
+        coord: Handle<Expression>,
+        body: &mut Block,
+    ) -> Result<Option<Handle<Expression>>, LowerError> {
+        let sub = &group.sub_axes;
+        if sub.is_empty() {
+            return Err(LowerError::UnsupportedOperation("empty axis group"));
+        }
+        let mut remaining = coord;
+        let mut terms = Vec::with_capacity(sub.len());
+        for axis in (0..sub.len()).rev() {
+            let sub_coord = if axis == 0 {
+                remaining
+            } else {
+                let extent = sub[axis].extent;
+                let c = self.mod_literal_u32_emitted(expressions, remaining, extent, body);
+                remaining = self.div_literal_u32_emitted(expressions, remaining, extent, body);
+                c
+            };
+            let stride = sub[axis].stride;
+            if stride == 0 {
+                continue;
+            }
+            if Self::is_u32_literal(expressions, sub_coord, 0) {
+                continue;
+            }
+            terms.push(self.mul_literal_u32_emitted(expressions, sub_coord, stride, body));
+        }
+        let mut iter = terms.into_iter();
+        let Some(mut sum) = iter.next() else {
+            return Ok(None);
+        };
+        for t in iter {
+            sum = self.add_u32_expr(expressions, sum, t, body);
+        }
+        Ok(Some(sum))
     }
 
     fn add_u32_expr(

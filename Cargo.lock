@@ -3084,6 +3084,7 @@ dependencies = [
  "env_logger",
  "fusor-gguf",
  "fusor-tile-ir",
+ "fusor-tile-ir-kernels",
  "fusor-types",
  "futures",
  "futures-channel",
@@ -3148,6 +3149,18 @@ name = "fusor-tile-ir"
 version = "0.1.0"
 dependencies = [
  "bytemuck",
+ "half 2.7.1",
+ "naga",
+ "pollster",
+ "wgpu",
+]
+
+[[package]]
+name = "fusor-tile-ir-kernels"
+version = "0.1.0"
+dependencies = [
+ "bytemuck",
+ "fusor-tile-ir",
  "half 2.7.1",
  "naga",
  "pollster",

@@ -247,7 +247,7 @@ fn build_nary_tile_ir(
                 let layout = tile_ir::Layout::strided(
                     tile_ir::MemoryLevel::Storage,
                     tile_ir::Shape::new([1, meta.allocation_len]),
-                    tile_ir::Strides::new([0, 1]),
+                    &[0, 1],
                 );
                 if binding == output_index {
                     phase.storage_write_element_with_layout_offset::<2>(meta.element, layout, 0)

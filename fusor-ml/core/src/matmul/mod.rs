@@ -17,6 +17,7 @@ use crate::{
     tensor::{DataType, DataTypeEnum, TensorData},
 };
 use fusor_tile_ir as tile_ir;
+use fusor_tile_ir_kernels as tile_ir_kernels;
 
 pub mod coop_gemm;
 mod direct;
@@ -285,8 +286,12 @@ impl MatMulOperation {
             let b = tile_storage_read_with_direct_layout(phase, b_view);
             let y = tile_storage_write_with_direct_layout(phase, y_view);
             match variant {
-                DirectTileMatmulVariant::Gemv => phase.gemv::<4, 4, 128>(&a, &b, &y),
-                DirectTileMatmulVariant::MatMul => phase.matmul::<256>(&a, &b, &y),
+                DirectTileMatmulVariant::Gemv => {
+                    tile_ir_kernels::gemv::<4, 4, 128>(phase, &a, &b, &y)
+                }
+                DirectTileMatmulVariant::MatMul => {
+                    tile_ir_kernels::matmul::<256>(phase, &a, &b, &y)
+                }
             }
         });
         let dispatch_size = ir.single_tile_program_grid()?;

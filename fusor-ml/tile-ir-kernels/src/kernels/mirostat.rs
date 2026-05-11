@@ -1,4 +1,4 @@
-use crate::{
+use fusor_tile_ir::{
     tile::{self, Tile, TileBlock},
     TileLiteral, TileUnaryOp, F32, U32,
 };
@@ -64,13 +64,13 @@ fn store_sample_result(
 }
 
 pub fn mirostat2<B>(
-    kb: &mut crate::kernel_builder::KernelBuilder<B>,
-    ids: crate::kernel_builder::KernelTensorRef<B>,
-    values: crate::kernel_builder::KernelTensorRef<B>,
-    state: crate::kernel_builder::KernelTensorRef<B>,
-    params: crate::kernel_builder::KernelTensorRef<B>,
-    output: crate::kernel_builder::KernelTensorRef<B>,
-    exactness_flag: Option<crate::kernel_builder::KernelTensorRef<B>>,
+    kb: &mut fusor_tile_ir::kernel_builder::KernelBuilder<B>,
+    ids: fusor_tile_ir::kernel_builder::KernelTensorRef<B>,
+    values: fusor_tile_ir::kernel_builder::KernelTensorRef<B>,
+    state: fusor_tile_ir::kernel_builder::KernelTensorRef<B>,
+    params: fusor_tile_ir::kernel_builder::KernelTensorRef<B>,
+    output: fusor_tile_ir::kernel_builder::KernelTensorRef<B>,
+    exactness_flag: Option<fusor_tile_ir::kernel_builder::KernelTensorRef<B>>,
     meta: Mirostat2Meta,
 ) -> Option<()> {
     if meta.top_k == 0 {

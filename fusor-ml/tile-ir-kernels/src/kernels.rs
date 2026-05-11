@@ -1,4 +1,4 @@
-use crate::{Layout, MemoryLevel, Shape, Strides};
+use fusor_tile_ir::{Layout, MemoryLevel, Shape};
 
 mod flash;
 mod helpers;
@@ -18,8 +18,8 @@ pub use types::{
 
 /// The default rank-1 unit-stride layout used by tile-ir's pre-built kernels
 /// for tensors whose offset/stride is encoded in the `Meta` struct itself.
-/// Callers feed this into [`crate::KernelTensorRef`] to attach a runtime
+/// Callers feed this into [`fusor_tile_ir::KernelTensorRef`] to attach a runtime
 /// binding.
 pub fn linear_storage_layout() -> Layout {
-    Layout::strided(MemoryLevel::Storage, Shape::new([1]), Strides::new([1]))
+    Layout::strided(MemoryLevel::Storage, Shape::new([1]), &[1])
 }

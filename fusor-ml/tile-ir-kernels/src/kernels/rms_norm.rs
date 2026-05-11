@@ -1,17 +1,17 @@
-use crate::{TileLiteral, TileReduceOp, WorkgroupAxis};
+use fusor_tile_ir::{TileLiteral, TileReduceOp, WorkgroupAxis};
 
 use super::types::RmsNormVec4Meta;
-use crate::tile::Tile;
+use fusor_tile_ir::tile::Tile;
 
 const RMS_NORM_VEC4_BLOCK: usize = 128;
 
 pub fn rms_norm_vec4<B>(
-    kb: &mut crate::kernel_builder::KernelBuilder<B>,
-    input: crate::kernel_builder::KernelTensorRef<B>,
-    residual: Option<crate::kernel_builder::KernelTensorRef<B>>,
-    weight: crate::kernel_builder::KernelTensorRef<B>,
-    bias: Option<crate::kernel_builder::KernelTensorRef<B>>,
-    output: crate::kernel_builder::KernelTensorRef<B>,
+    kb: &mut fusor_tile_ir::kernel_builder::KernelBuilder<B>,
+    input: fusor_tile_ir::kernel_builder::KernelTensorRef<B>,
+    residual: Option<fusor_tile_ir::kernel_builder::KernelTensorRef<B>>,
+    weight: fusor_tile_ir::kernel_builder::KernelTensorRef<B>,
+    bias: Option<fusor_tile_ir::kernel_builder::KernelTensorRef<B>>,
+    output: fusor_tile_ir::kernel_builder::KernelTensorRef<B>,
     meta: RmsNormVec4Meta,
     rows: u32,
 ) -> Option<()> {
@@ -27,11 +27,11 @@ pub fn rms_norm_vec4<B>(
     let chunks = meta.cols_vec.div_ceil(RMS_NORM_VEC4_BLOCK as u32);
     let eps = meta.eps.get();
 
-    let input = kb.read::<crate::F32Vec4, 1>(input);
-    let residual = residual.map(|r| kb.read::<crate::F32Vec4, 1>(r));
-    let weight = kb.read::<crate::F32Vec4, 1>(weight);
-    let bias = bias.map(|b| kb.read::<crate::F32Vec4, 1>(b));
-    let output = kb.write::<crate::F32Vec4, 1>(output);
+    let input = kb.read::<fusor_tile_ir::F32Vec4, 1>(input);
+    let residual = residual.map(|r| kb.read::<fusor_tile_ir::F32Vec4, 1>(r));
+    let weight = kb.read::<fusor_tile_ir::F32Vec4, 1>(weight);
+    let bias = bias.map(|b| kb.read::<fusor_tile_ir::F32Vec4, 1>(b));
+    let output = kb.write::<fusor_tile_ir::F32Vec4, 1>(output);
     let phase = kb.program();
 
     phase.program_grid::<RMS_NORM_VEC4_BLOCK>([rows, 1, 1], |program| {

@@ -99,7 +99,8 @@ impl GgmlQuantFormat {
     }
 }
 
-/// A packed quantized storage matrix.
+/// A packed quantized storage matrix — kernel-input handle pairing a tile-IR
+/// storage view with the quantization format and matrix dimensions.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct QuantizedMatrix {
     pub data: StorageView,
@@ -107,3 +108,4 @@ pub struct QuantizedMatrix {
     pub rows: u32,
     pub cols: u32,
 }
+

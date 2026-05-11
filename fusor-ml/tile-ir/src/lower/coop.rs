@@ -571,21 +571,27 @@ impl<'a> Lowerer<'a> {
     }
 
     fn row_major_tile_stride(layout: &Layout) -> Result<u32, LowerError> {
-        if layout.strides().rank() != 2 || layout.strides().values()[1] != 1 {
+        if !layout.is_affine() {
             return Err(LowerError::UnsupportedOperation(
                 "workgroup tile must be row-major",
             ));
         }
-        Ok(layout.strides().values()[0])
+        let strides = layout.affine_strides();
+        if strides.len() != 2 || strides[1] != 1 {
+            return Err(LowerError::UnsupportedOperation(
+                "workgroup tile must be row-major",
+            ));
+        }
+        Ok(strides[0])
     }
 
     fn cooperative_store_layout(layout: &Layout) -> Result<(u32, bool), LowerError> {
-        if layout.shape().rank() != 2 || layout.strides().rank() != 2 {
+        if !layout.is_affine() || layout.shape().rank() != 2 {
             return Err(LowerError::UnsupportedOperation(
                 "cooperative store requires a rank-2 output view",
             ));
         }
-        let strides = layout.strides().values();
+        let strides = layout.affine_strides();
         if strides[1] == 1 {
             Ok((strides[0], false))
         } else if strides[0] == 1 {

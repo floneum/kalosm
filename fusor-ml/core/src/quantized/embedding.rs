@@ -1,5 +1,6 @@
 use fusor_gguf::GgmlType;
 use fusor_tile_ir as tile_ir;
+use fusor_tile_ir_kernels as tile_ir_kernels;
 
 use crate::{
     DataTypeEnum, Device, Tensor, TensorData, TensorInfo,
@@ -73,7 +74,7 @@ fn u32_layout_2d(layout: &crate::Layout) -> Option<(u32, tile_ir::Layout)> {
         tile_ir::Layout::strided(
             tile_ir::MemoryLevel::Storage,
             tile_ir::Shape::new([shape[0].try_into().ok()?, shape[1].try_into().ok()?]),
-            tile_ir::Strides::new([strides[0].try_into().ok()?, strides[1].try_into().ok()?]),
+            &[strides[0].try_into().ok()?, strides[1].try_into().ok()?],
         ),
     ))
 }
@@ -90,7 +91,7 @@ fn u32_index_layout(layout: &crate::Layout) -> Option<(u32, tile_ir::Layout)> {
         tile_ir::Layout::strided(
             tile_ir::MemoryLevel::Storage,
             tile_ir::Shape::new([1, shape[0].try_into().ok()?]),
-            tile_ir::Strides::new([0, strides[0].try_into().ok()?]),
+            &[0, strides[0].try_into().ok()?],
         ),
     ))
 }
@@ -181,7 +182,13 @@ impl Operation for QEmbeddingOperation {
             cache_key,
             dispatch_size,
             move |kb| {
-                let q = kb.quantized_matrix(matrix_buffer, format, embedding_dim, num_embeddings);
+                let q = tile_ir_kernels::quantized_matrix_for(
+                    kb,
+                    matrix_buffer,
+                    format,
+                    embedding_dim,
+                    num_embeddings,
+                );
                 let indexes = kb.read_erased::<2>(
                     tile_ir::ElementType::U32,
                     tile_ir::KernelTensorRef::with_offset(

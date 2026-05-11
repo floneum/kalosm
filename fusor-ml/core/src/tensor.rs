@@ -838,7 +838,7 @@ impl<D: DataType, const R: usize> Tensor<R, D> {
         &self,
         other: &QMatrix,
         pair_len: usize,
-        activation: fusor_tile_ir::PairedActivation,
+        activation: fusor_tile_ir_kernels::PairedActivation,
     ) -> Self {
         let operation = QMatMulPairedOperation::new(
             self.datatype(),

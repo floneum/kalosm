@@ -20,6 +20,7 @@ use crate::{
     tensor::TensorData,
 };
 use fusor_tile_ir as tile_ir;
+use fusor_tile_ir_kernels as tile_ir_kernels;
 use std::hash::Hash;
 
 const BLOCK: usize = 1024;
@@ -307,7 +308,7 @@ impl Operation for RmsNormOperation {
             let vec_layout = tile_ir::Layout::strided(
                 tile_ir::MemoryLevel::Storage,
                 tile_ir::Shape::new([1]),
-                tile_ir::Strides::new([1]),
+                &[1],
             );
             let input_buffer = input.buffer().clone();
             let residual_buffer = residual.map(|r| r.buffer().clone());
@@ -321,7 +322,7 @@ impl Operation for RmsNormOperation {
                 module_key,
                 dispatch_size,
                 move |kb| {
-                    tile_ir::kernels::rms_norm_vec4(
+                    tile_ir_kernels::rms_norm_vec4(
                         kb,
                         tile_ir::KernelTensorRef::with_offset(
                             input_buffer,
@@ -420,19 +421,19 @@ fn build_vec4_rms_norm_meta(
     bias: Option<&TensorData>,
     output_view: crate::mir::tile_direct::DirectMatrixLayout,
     eps: f32,
-) -> Option<tile_ir::RmsNormVec4Meta> {
-    if input_view.index_map.is_some()
-        || output_view.index_map.is_some()
+) -> Option<tile_ir_kernels::RmsNormVec4Meta> {
+    if !input_view.layout.is_affine()
+        || !output_view.layout.is_affine()
         || residual_view
             .as_ref()
-            .is_some_and(|residual| residual.index_map.is_some())
+            .is_some_and(|residual| !residual.layout.is_affine())
         || !input_view.cols.is_multiple_of(4)
     {
         return None;
     }
 
-    let [input_row_stride, input_col_stride] = matrix_strides(input_view.layout.strides())?;
-    let [output_row_stride, output_col_stride] = matrix_strides(output_view.layout.strides())?;
+    let [input_row_stride, input_col_stride] = matrix_strides(input_view.layout.affine_strides())?;
+    let [output_row_stride, output_col_stride] = matrix_strides(output_view.layout.affine_strides())?;
     if input_col_stride != 1
         || output_col_stride != 1
         || !input_view.offset.is_multiple_of(4)
@@ -446,7 +447,7 @@ fn build_vec4_rms_norm_meta(
     let (residual_offset_vec, residual_row_stride_vec) = if let Some(residual_view) = residual_view
     {
         let [residual_row_stride, residual_col_stride] =
-            matrix_strides(residual_view.layout.strides())?;
+            matrix_strides(residual_view.layout.affine_strides())?;
         if residual_col_stride != 1
             || !residual_view.offset.is_multiple_of(4)
             || !residual_row_stride.is_multiple_of(4)
@@ -478,7 +479,7 @@ fn build_vec4_rms_norm_meta(
         None
     };
 
-    Some(tile_ir::RmsNormVec4Meta {
+    Some(tile_ir_kernels::RmsNormVec4Meta {
         cols: input_view.cols,
         cols_vec: input_view.cols / 4,
         eps: tile_ir::F32Bits::new(eps),
@@ -493,8 +494,8 @@ fn build_vec4_rms_norm_meta(
     })
 }
 
-fn matrix_strides(strides: &tile_ir::Strides) -> Option<[u32; 2]> {
-    strides.values().try_into().ok()
+fn matrix_strides(strides: Vec<u32>) -> Option<[u32; 2]> {
+    strides.try_into().ok()
 }
 
 fn build_rms_norm_tile_ir(
@@ -512,9 +513,6 @@ fn build_rms_norm_tile_ir(
         .as_ref()
         .map(|residual_view| residual_view.layout.clone());
     let residual_offset = residual_view.as_ref().map(|residual| residual.offset);
-    let residual_index_map = residual_view
-        .as_ref()
-        .and_then(|residual_view| residual_view.index_map.clone());
     let output_storage_layout = output_view.layout.clone();
     let weight_layout = vector_as_row_layout(weight.layout())?;
     let bias_layout = match bias {
@@ -535,7 +533,6 @@ fn build_rms_norm_tile_ir(
                 cols,
                 offset: input_view.offset,
                 layout: input_storage_layout,
-                index_map: input_view.index_map,
             },
         );
         let residual = residual_storage_layout.map(|layout| {
@@ -546,7 +543,6 @@ fn build_rms_norm_tile_ir(
                     cols,
                     offset: residual_offset.expect("residual offset exists with layout"),
                     layout,
-                    index_map: residual_index_map,
                 },
             )
         });
@@ -565,7 +561,6 @@ fn build_rms_norm_tile_ir(
                 cols,
                 offset: output_view.offset,
                 layout: output_storage_layout,
-                index_map: output_view.index_map,
             },
         );
 
@@ -612,7 +607,7 @@ fn vector_as_row_layout(layout: &crate::Layout) -> Option<tile_ir::Layout> {
     Some(tile_ir::Layout::strided(
         tile_ir::MemoryLevel::Storage,
         tile_ir::Shape::new([1, (*shape.first()?).try_into().ok()?]),
-        tile_ir::Strides::new([0, (*strides.first()?).try_into().ok()?]),
+        &[0, (*strides.first()?).try_into().ok()?],
     ))
 }
 

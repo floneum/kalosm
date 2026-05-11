@@ -38,6 +38,7 @@ members = [
     "fusor-ml/fusor",
     "fusor-ml/types",
     "fusor-ml/tile-ir",
+    "fusor-ml/tile-ir-kernels",
 ]
 
 [workspace.dependencies]
@@ -66,6 +67,7 @@ fusor = { path = "./fusor-ml/fusor", version = "0.1.0" }
 fusor-core = { path = "./fusor-ml/core", version = "0.1.0" }
 fusor-gguf = { path = "./fusor-ml/gguf", version = "0.1.0" }
 fusor-tile-ir = { path = "./fusor-ml/tile-ir", version = "0.1.0" }
+fusor-tile-ir-kernels = { path = "./fusor-ml/tile-ir-kernels", version = "0.1.0" }
 fusor-types = { path = "./fusor-ml/types", version = "0.1.0" }
 llm-samplers = { git = "https://github.com/ealmloff/llm-samplers" }
 tokenizers = { version = "0.21.0", default-features = false }
