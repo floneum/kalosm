@@ -222,22 +222,17 @@ impl<'a> Lowerer<'a> {
         builtin: Builtin,
     ) -> Handle<Expression> {
         match builtin {
-            Builtin::Lane => expressions.append(
-                Expression::FunctionArgument(LOCAL_INVOCATION_INDEX_ARG),
-                Span::default(),
-            ),
+            Builtin::Lane => Self::function_arg(expressions, LOCAL_INVOCATION_INDEX_ARG),
+            Builtin::SubgroupId => Self::function_arg(expressions, SUBGROUP_ID_ARG),
+            Builtin::SubgroupLane => Self::function_arg(expressions, SUBGROUP_INVOCATION_ID_ARG),
+            Builtin::SubgroupSize => Self::function_arg(expressions, SUBGROUP_SIZE_ARG),
+            Builtin::NumSubgroups => Self::function_arg(expressions, NUM_SUBGROUPS_ARG),
             Builtin::LoopIndex => {
-                let pointer = expressions.append(
-                    Expression::LocalVariable(self.current_loop_index()),
-                    Span::default(),
-                );
+                let pointer = self.local_var(expressions, self.current_loop_index());
                 Self::emit_load(expressions, body, pointer)
             }
             Builtin::ProgramId(axis) => {
-                let wg = expressions.append(
-                    Expression::FunctionArgument(WORKGROUP_ID_ARG),
-                    Span::default(),
-                );
+                let wg = Self::function_arg(expressions, WORKGROUP_ID_ARG);
                 self.emit(
                     expressions,
                     body,
@@ -247,22 +242,10 @@ impl<'a> Lowerer<'a> {
                     },
                 )
             }
-            Builtin::SubgroupId => expressions.append(
-                Expression::FunctionArgument(SUBGROUP_ID_ARG),
-                Span::default(),
-            ),
-            Builtin::SubgroupLane => expressions.append(
-                Expression::FunctionArgument(SUBGROUP_INVOCATION_ID_ARG),
-                Span::default(),
-            ),
-            Builtin::SubgroupSize => expressions.append(
-                Expression::FunctionArgument(SUBGROUP_SIZE_ARG),
-                Span::default(),
-            ),
-            Builtin::NumSubgroups => expressions.append(
-                Expression::FunctionArgument(NUM_SUBGROUPS_ARG),
-                Span::default(),
-            ),
         }
+    }
+
+    fn function_arg(expressions: &mut Arena<Expression>, arg: u32) -> Handle<Expression> {
+        expressions.append(Expression::FunctionArgument(arg), Span::default())
     }
 }
