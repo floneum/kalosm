@@ -390,7 +390,7 @@ impl<'a> Lowerer<'a> {
         let values = self.q8_activation_pack_values(e, a, body)?;
         let packs = Self::q8_activation_pack_locals(scratch, values.packs.len())?;
         self.q8_activation_pack_cache.borrow_mut().clear();
-        Self::store_q8_activation_pack_values(e, body, &packs, values);
+        self.store_q8_activation_pack_values(e, body, &packs, values);
         self.q8_activation_pack_cache
             .borrow_mut()
             .insert(key, packs.clone());
@@ -469,6 +469,7 @@ impl<'a> Lowerer<'a> {
     }
 
     pub(in crate::lower) fn store_q8_activation_pack_values(
+        &self,
         e: &mut Arena<Expression>,
         body: &mut Block,
         locals: &Q8ActivationPacks,
@@ -479,36 +480,24 @@ impl<'a> Lowerer<'a> {
         debug_assert_eq!(locals.len, values.sums_i32.len());
 
         for i in 0..locals.len {
-            let scale_ptr = e.append(Expression::LocalVariable(locals.scales[i]), Span::default());
-            body.push(
-                Statement::Store {
-                    pointer: scale_ptr,
-                    value: values.scales[i],
-                },
-                Span::default(),
-            );
-
-            let pack_ptr = e.append(Expression::LocalVariable(locals.packs[i]), Span::default());
-            body.push(
-                Statement::Store {
-                    pointer: pack_ptr,
-                    value: values.packs[i],
-                },
-                Span::default(),
-            );
-
-            let sum_ptr = e.append(
-                Expression::LocalVariable(locals.sums_i32[i]),
-                Span::default(),
-            );
-            body.push(
-                Statement::Store {
-                    pointer: sum_ptr,
-                    value: values.sums_i32[i],
-                },
-                Span::default(),
-            );
+            self.store_local(e, body, locals.scales[i], values.scales[i]);
+            self.store_local(e, body, locals.packs[i], values.packs[i]);
+            self.store_local(e, body, locals.sums_i32[i], values.sums_i32[i]);
         }
+    }
+
+    /// `*local = value;` — appends the LocalVariable pointer expression and
+    /// pushes a `Statement::Store`. Used by helpers that materialise SSA
+    /// values back into named locals.
+    pub(in crate::lower) fn store_local(
+        &self,
+        e: &mut Arena<Expression>,
+        body: &mut Block,
+        local: Handle<LocalVariable>,
+        value: Handle<Expression>,
+    ) {
+        let pointer = self.local_var(e, local);
+        body.push(Statement::Store { pointer, value }, Span::default());
     }
 
     pub(in crate::lower) fn q4k_quant_packs8(
