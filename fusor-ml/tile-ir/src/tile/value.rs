@@ -295,17 +295,18 @@ impl_index_u32_ops!(
     "tile index modulus must be non-zero"
 );
 
+/// `lhs + rhs` as `Expr::Binary { Add, .. }`. Shared by the three `Add`
+/// impls below — `ScalarIndex + ScalarIndex`, `ScalarIndex + Range`, and
+/// `Range + ScalarIndex` all reduce to the same expression.
+fn add_index_exprs(left: Box<Expr>, right: Box<Expr>) -> Box<Expr> {
+    Box::new(Expr::Binary { op: TileBinaryOp::Add, left, right })
+}
+
 impl Add<ScalarIndex> for ScalarIndex {
     type Output = ScalarIndex;
 
     fn add(self, rhs: ScalarIndex) -> Self::Output {
-        ScalarIndex {
-            expr: Box::new(Expr::Binary {
-                op: TileBinaryOp::Add,
-                left: self.expr,
-                right: rhs.expr,
-            }),
-        }
+        ScalarIndex { expr: add_index_exprs(self.expr, rhs.expr) }
     }
 }
 
@@ -313,13 +314,7 @@ impl<const N: usize> Add<Range<N>> for ScalarIndex {
     type Output = Range<N>;
 
     fn add(self, rhs: Range<N>) -> Self::Output {
-        Range {
-            expr: Box::new(Expr::Binary {
-                op: TileBinaryOp::Add,
-                left: self.expr,
-                right: rhs.expr,
-            }),
-        }
+        Range { expr: add_index_exprs(self.expr, rhs.expr) }
     }
 }
 
@@ -327,13 +322,7 @@ impl<const N: usize> Add<ScalarIndex> for Range<N> {
     type Output = Range<N>;
 
     fn add(self, rhs: ScalarIndex) -> Self::Output {
-        Range {
-            expr: Box::new(Expr::Binary {
-                op: TileBinaryOp::Add,
-                left: self.expr,
-                right: rhs.expr,
-            }),
-        }
+        Range { expr: add_index_exprs(self.expr, rhs.expr) }
     }
 }
 
