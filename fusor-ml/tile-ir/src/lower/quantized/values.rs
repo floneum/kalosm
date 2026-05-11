@@ -574,30 +574,14 @@ impl<'a> Lowerer<'a> {
         for pack_offset in (0..a.len()).step_by(8) {
             let k = self.add_lit(expressions, body, k_base, pack_offset as u32);
             let block = self.q4k_quant_values::<8, 2>(expressions, matrix, k, col, false, body)?;
-            let mut weighted_sum = self.f32(expressions, 0.0);
-            let mut activation_sum = self.f32(expressions, 0.0);
-            for lane in 0..8 {
-                let q = self.as_f32(expressions, body, block.data[lane]);
-                let activation = a[pack_offset + lane];
-                let weighted = self.mul(expressions, body, activation, q);
-                weighted_sum = self.bin(
-                    expressions,
-                    body,
-                    BinaryOperator::Add,
-                    weighted_sum,
-                    weighted,
-                );
-                activation_sum = self.bin(
-                    expressions,
-                    body,
-                    BinaryOperator::Add,
-                    activation_sum,
-                    activation,
-                );
-            }
-            let scaled = self.mul(expressions, body, weighted_sum, block.scale);
-            let min_term = self.mul(expressions, body, activation_sum, block.min);
-            let chunk = self.sub(expressions, body, scaled, min_term);
+            let chunk = self.q4k_f32_weighted_sum(
+                expressions,
+                body,
+                block.scale,
+                block.min,
+                &block.data,
+                &a[pack_offset..pack_offset + 8],
+            );
             total = self.bin(expressions, body, BinaryOperator::Add, total, chunk);
         }
         Ok(total)
