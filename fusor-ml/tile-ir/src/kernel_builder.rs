@@ -92,38 +92,22 @@ impl<B> KernelBuilder<B> {
         &mut self,
         tensor: KernelTensorRef<B>,
     ) -> Storage<T, R> {
-        self.bindings.push(tensor.binding);
-        match tensor.index_map {
-            Some(index_map) => self
-                .program
-                .storage_read_with_layout_offset_and_index_map::<T, R>(
-                    tensor.layout,
-                    tensor.offset,
-                    index_map,
-                ),
-            None => self
-                .program
-                .storage_read_with_layout_offset::<T, R>(tensor.layout, tensor.offset),
-        }
+        self.declare_storage(tensor, |program, layout, offset, index_map| match index_map {
+            Some(index_map) => program
+                .storage_read_with_layout_offset_and_index_map::<T, R>(layout, offset, index_map),
+            None => program.storage_read_with_layout_offset::<T, R>(layout, offset),
+        })
     }
 
     pub fn write<T: Numeric, const R: usize>(
         &mut self,
         tensor: KernelTensorRef<B>,
     ) -> Storage<T, R> {
-        self.bindings.push(tensor.binding);
-        match tensor.index_map {
-            Some(index_map) => self
-                .program
-                .storage_write_with_layout_offset_and_index_map::<T, R>(
-                    tensor.layout,
-                    tensor.offset,
-                    index_map,
-                ),
-            None => self
-                .program
-                .storage_write_with_layout_offset::<T, R>(tensor.layout, tensor.offset),
-        }
+        self.declare_storage(tensor, |program, layout, offset, index_map| match index_map {
+            Some(index_map) => program
+                .storage_write_with_layout_offset_and_index_map::<T, R>(layout, offset, index_map),
+            None => program.storage_write_with_layout_offset::<T, R>(layout, offset),
+        })
     }
 
     pub fn read_erased<const R: usize>(
@@ -131,12 +115,9 @@ impl<B> KernelBuilder<B> {
         element: ElementType,
         tensor: KernelTensorRef<B>,
     ) -> ErasedStorage<R> {
-        self.bindings.push(tensor.binding);
-        self.program.storage_read_element_with_layout_offset::<R>(
-            element,
-            tensor.layout,
-            tensor.offset,
-        )
+        self.declare_storage(tensor, |program, layout, offset, _| {
+            program.storage_read_element_with_layout_offset::<R>(element, layout, offset)
+        })
     }
 
     pub fn write_erased<const R: usize>(
@@ -144,12 +125,21 @@ impl<B> KernelBuilder<B> {
         element: ElementType,
         tensor: KernelTensorRef<B>,
     ) -> ErasedStorage<R> {
+        self.declare_storage(tensor, |program, layout, offset, _| {
+            program.storage_write_element_with_layout_offset::<R>(element, layout, offset)
+        })
+    }
+
+    /// Push the binding and call `declare` with the program plus the
+    /// tensor's layout, offset, and optional index map. Shared by every
+    /// `read`/`write`/`read_erased`/`write_erased` entry point.
+    fn declare_storage<S>(
+        &mut self,
+        tensor: KernelTensorRef<B>,
+        declare: impl FnOnce(&mut Program, Layout, u32, Option<StorageIndexMap>) -> S,
+    ) -> S {
         self.bindings.push(tensor.binding);
-        self.program.storage_write_element_with_layout_offset::<R>(
-            element,
-            tensor.layout,
-            tensor.offset,
-        )
+        declare(&mut self.program, tensor.layout, tensor.offset, tensor.index_map)
     }
 
     /// Declare a quantized matrix backed by `binding`.
