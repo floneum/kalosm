@@ -107,17 +107,14 @@ impl<'a> Lowerer<'a> {
         } else {
             let group_offset =
                 self.mod_literal_u32_emitted(expressions, lane, group_size, body);
-            let group_base = expressions.append(
+            let group_base = self.emit(
+                expressions,
+                body,
                 Expression::Binary {
                     op: BinaryOperator::Subtract,
                     left: lane,
                     right: group_offset,
                 },
-                Span::default(),
-            );
-            body.push(
-                Statement::Emit(Self::single_expression_range(expressions, group_base)),
-                Span::default(),
             );
             (group_offset, group_base)
         };

@@ -78,12 +78,7 @@ impl<'a> Lowerer<'a> {
         offset: u32,
     ) -> Handle<Expression> {
         let index = self.add_literal_u32_emitted(expressions, index, offset, body);
-        let pointer = expressions.append(Expression::Access { base, index }, Span::default());
-        body.push(
-            Statement::Emit(Self::single_expression_range(expressions, pointer)),
-            Span::default(),
-        );
-        pointer
+        self.emit(expressions, body, Expression::Access { base, index })
     }
 
     pub(super) fn storage_base_expression(
@@ -177,17 +172,14 @@ impl<'a> Lowerer<'a> {
             return Err(LowerError::UnsupportedOperation("zero-rank layout"));
         };
         for term in terms {
-            index = expressions.append(
+            index = self.emit(
+                expressions,
+                body,
                 Expression::Binary {
                     op: BinaryOperator::Add,
                     left: index,
                     right: term,
                 },
-                Span::default(),
-            );
-            body.push(
-                Statement::Emit(Self::single_expression_range(expressions, index)),
-                Span::default(),
             );
         }
 
@@ -264,7 +256,7 @@ impl<'a> Lowerer<'a> {
             return Ok(zero);
         };
         for term in terms {
-            index = Self::add_u32_expr(expressions, index, term, body);
+            index = self.add_u32_expr(expressions, index, term, body);
         }
         Ok(index)
     }
@@ -313,11 +305,11 @@ impl<'a> Lowerer<'a> {
         let out_y = self.mul_literal_u32_emitted(expressions, out_y, map.stride_h, body);
         let kernel_y =
             self.mul_literal_u32_emitted(expressions, kernel_y, map.dilation_h, body);
-        let in_y = Self::add_u32_expr(expressions, out_y, kernel_y, body);
+        let in_y = self.add_u32_expr(expressions, out_y, kernel_y, body);
         let out_x = self.mul_literal_u32_emitted(expressions, out_x, map.stride_w, body);
         let kernel_x =
             self.mul_literal_u32_emitted(expressions, kernel_x, map.dilation_w, body);
-        let in_x = Self::add_u32_expr(expressions, out_x, kernel_x, body);
+        let in_x = self.add_u32_expr(expressions, out_x, kernel_x, body);
 
         let terms = [
             (batch, map.batch_stride),
@@ -332,7 +324,7 @@ impl<'a> Lowerer<'a> {
             }
             let term = self.mul_literal_u32_emitted(expressions, coord, stride, body);
             index = Some(match index {
-                Some(index) => Self::add_u32_expr(expressions, index, term, body),
+                Some(index) => self.add_u32_expr(expressions, index, term, body),
                 None => term,
             });
         }
@@ -343,6 +335,7 @@ impl<'a> Lowerer<'a> {
     }
 
     fn add_u32_expr(
+        &self,
         expressions: &mut Arena<Expression>,
         left: Handle<Expression>,
         right: Handle<Expression>,
@@ -354,19 +347,15 @@ impl<'a> Lowerer<'a> {
         if Self::is_u32_literal(expressions, right, 0) {
             return left;
         }
-        let value = expressions.append(
+        self.emit(
+            expressions,
+            body,
             Expression::Binary {
                 op: BinaryOperator::Add,
                 left,
                 right,
             },
-            Span::default(),
-        );
-        body.push(
-            Statement::Emit(Self::single_expression_range(expressions, value)),
-            Span::default(),
-        );
-        value
+        )
     }
 }
 
