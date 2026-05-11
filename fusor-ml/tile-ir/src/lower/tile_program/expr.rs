@@ -245,7 +245,10 @@ impl<'a> Lowerer<'a> {
         }
     }
 
-    fn function_arg(expressions: &mut Arena<Expression>, arg: u32) -> Handle<Expression> {
+    pub(in crate::lower) fn function_arg(
+        expressions: &mut Arena<Expression>,
+        arg: u32,
+    ) -> Handle<Expression> {
         expressions.append(Expression::FunctionArgument(arg), Span::default())
     }
 }

@@ -361,10 +361,7 @@ impl<'a> Lowerer<'a> {
                 "workgroup tile size overflow",
             ))?;
         let stride = Self::row_major_tile_stride(layout)?;
-        let local = expressions.append(
-            Expression::FunctionArgument(LOCAL_INVOCATION_INDEX_ARG),
-            Span::default(),
-        );
+        let local = Self::function_arg(expressions, LOCAL_INVOCATION_INDEX_ARG);
         let row_base = self.lower_tile_expr_lane(expressions, scratch, body, row_offset, 0)?;
         let col_base = self.lower_tile_expr_lane(expressions, scratch, body, col_offset, 0)?;
 
@@ -423,10 +420,7 @@ impl<'a> Lowerer<'a> {
             GgmlQuantFormat::Q5_0 => 16,
             _ => 0,
         };
-        let local = expressions.append(
-            Expression::FunctionArgument(LOCAL_INVOCATION_INDEX_ARG),
-            Span::default(),
-        );
+        let local = Self::function_arg(expressions, LOCAL_INVOCATION_INDEX_ARG);
         let row_base = self.lower_tile_expr_lane(expressions, scratch, body, row_offset, 0)?;
         let col_base = self.lower_tile_expr_lane(expressions, scratch, body, col_offset, 0)?;
 

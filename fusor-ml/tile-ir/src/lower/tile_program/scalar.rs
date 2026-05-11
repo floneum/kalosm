@@ -83,10 +83,7 @@ impl<'a> Lowerer<'a> {
             ));
         }
 
-        let lane = expressions.append(
-            Expression::FunctionArgument(LOCAL_INVOCATION_INDEX_ARG),
-            Span::default(),
-        );
+        let lane = Self::function_arg(expressions, LOCAL_INVOCATION_INDEX_ARG);
         let lane_ptr = self.tile_dynamic_pointer(expressions, scratch_tile, lane, body)?;
         body.push(
             Statement::Store {
