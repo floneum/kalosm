@@ -233,27 +233,37 @@ impl<'a> Lowerer<'a> {
     }
 
     fn tile_stmt_uses_cooperative_matrix(stmt: &TileStmt) -> bool {
+        Self::tile_stmt_tree_any(stmt, &mut |s| {
+            matches!(
+                s,
+                TileStmt::ZeroCoopAcc { .. }
+                    | TileStmt::CopyToWorkgroupTile { .. }
+                    | TileStmt::LoadCoop { .. }
+                    | TileStmt::Mma { .. }
+                    | TileStmt::StoreCoopAcc { .. }
+            )
+        })
+    }
+
+    /// Pre-order tree-any over a `TileStmt`: returns true if `pred` matches
+    /// the statement itself or any nested child. Visitors that test a
+    /// statement-shape predicate (no expr walking) compose on top of this.
+    fn tile_stmt_tree_any(
+        stmt: &TileStmt,
+        pred: &mut impl FnMut(&TileStmt) -> bool,
+    ) -> bool {
+        if pred(stmt) {
+            return true;
+        }
         match stmt {
-            TileStmt::Store(_)
-            | TileStmt::StoreIndexed(_)
-            | TileStmt::StoreLocal { .. }
-            | TileStmt::StoreWorkgroup { .. }
-            | TileStmt::Barrier
-            | TileStmt::Break
-            | TileStmt::Return => false,
-            TileStmt::ZeroCoopAcc { .. }
-            | TileStmt::CopyToWorkgroupTile { .. }
-            | TileStmt::LoadCoop { .. }
-            | TileStmt::Mma { .. }
-            | TileStmt::StoreCoopAcc { .. } => true,
             TileStmt::If { accept, reject, .. } => accept
                 .iter()
                 .chain(reject.iter())
-                .any(Self::tile_stmt_uses_cooperative_matrix),
-            TileStmt::Loop { body } => body.iter().any(Self::tile_stmt_uses_cooperative_matrix),
-            TileStmt::Fold { body, .. } => {
-                body.iter().any(Self::tile_stmt_uses_cooperative_matrix)
+                .any(|s| Self::tile_stmt_tree_any(s, pred)),
+            TileStmt::Loop { body } | TileStmt::Fold { body, .. } => {
+                body.iter().any(|s| Self::tile_stmt_tree_any(s, pred))
             }
+            _ => false,
         }
     }
 
