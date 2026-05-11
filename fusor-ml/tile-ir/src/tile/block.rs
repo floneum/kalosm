@@ -140,7 +140,7 @@ impl<const BLOCK: usize> TileBlock<'_, BLOCK> {
                 row: address.row,
                 col: address.col,
                 mask: mask.expr,
-                fill: TileLiteral::F32(F32Bits::new(fill)),
+                fill: Box::new(Expr::Literal(TileLiteral::F32(F32Bits::new(fill)))),
             }),
         }
     }
@@ -156,26 +156,29 @@ impl<const BLOCK: usize> TileBlock<'_, BLOCK> {
                 src: address.view,
                 index: address.index,
                 mask: mask.expr,
-                fill,
+                fill: Box::new(Expr::Literal(fill)),
             }),
         }
     }
 
     /// Load a `vec4<f32>` from an `F32Vec4`-typed storage view. Routes through
-    /// the generic `LoadLinear` with a vec4-splat fill literal — the AST has
-    /// no dedicated `LoadVec4` variant.
+    /// the generic `LoadLinear` with a vec4-splat fill expression — the AST
+    /// has no dedicated `LoadVec4` variant and no vec4 literal kind.
     pub fn load_vec4(
         &self,
         address: LinearAddress<F32Vec4, BLOCK>,
         mask: Mask<BLOCK>,
         fill: f32,
     ) -> Tile<BLOCK> {
+        let scalar = Box::new(Expr::Literal(TileLiteral::F32(F32Bits::new(fill))));
         Tile {
             expr: Expr::LoadLinear(TileLinearLoadExpr {
                 src: address.view,
                 index: address.index,
                 mask: mask.expr,
-                fill: TileLiteral::F32Vec4(F32Bits::new(fill)),
+                fill: Box::new(Expr::Compose4 {
+                    values: [scalar.clone(), scalar.clone(), scalar.clone(), scalar],
+                }),
             }),
         }
     }
@@ -192,7 +195,7 @@ impl<const BLOCK: usize> TileBlock<'_, BLOCK> {
                 row: address.row,
                 col: address.col,
                 mask: mask.expr,
-                fill,
+                fill: Box::new(Expr::Literal(fill)),
             }),
         }
     }

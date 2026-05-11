@@ -190,8 +190,12 @@ impl<'a> Lowerer<'a> {
             Expr::LoadLocal(_)
             | Expr::Literal(_)
             | Expr::Builtin(_) => false,
-            Expr::Load(load) => pred(&load.row) || pred(&load.col) || pred(&load.mask),
-            Expr::LoadLinear(load) => pred(&load.index) || pred(&load.mask),
+            Expr::Load(load) => {
+                pred(&load.row) || pred(&load.col) || pred(&load.mask) || pred(&load.fill)
+            }
+            Expr::LoadLinear(load) => {
+                pred(&load.index) || pred(&load.mask) || pred(&load.fill)
+            }
             Expr::LoadWorkgroup { index, .. } => pred(index),
             Expr::QuantizedLoad(load) => {
                 pred(&load.row) || pred(&load.col) || pred(&load.mask)

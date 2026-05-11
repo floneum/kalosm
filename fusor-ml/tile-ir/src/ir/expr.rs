@@ -181,24 +181,26 @@ impl Expr {
 
 }
 
-/// A masked rank-1 tile load.
+/// A masked rank-1 tile load. `fill` is the masked-out value — typically a
+/// `Literal`, but any expression evaluable in the surrounding scope is
+/// allowed (e.g. `Compose4` for a vec4 splat constant).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TileLoadExpr {
     pub src: StorageView,
     pub row: Box<Expr>,
     pub col: Box<Expr>,
     pub mask: Box<Expr>,
-    pub fill: TileLiteral,
+    pub fill: Box<Expr>,
 }
 
 
-/// A masked rank-1 storage load.
+/// A masked rank-1 storage load. See `TileLoadExpr` for `fill` semantics.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TileLinearLoadExpr {
     pub src: StorageView,
     pub index: Box<Expr>,
     pub mask: Box<Expr>,
-    pub fill: TileLiteral,
+    pub fill: Box<Expr>,
 }
 
 /// A masked dequantizing rank-1 tile load from a packed quantized matrix.

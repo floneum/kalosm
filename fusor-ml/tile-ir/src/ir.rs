@@ -519,15 +519,15 @@ impl F32Bits {
     }
 }
 
-/// A typed literal stored by bits so IR equality remains exact. `F32Vec4` is a
-/// splat — all four lanes carry the same scalar.
+/// A typed scalar literal stored by bits so IR equality remains exact. Vector
+/// constants are not literals — they are built by composing scalar literals
+/// (e.g. `Expr::Compose4`).
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum TileLiteral {
     F32(F32Bits),
     F16(u16),
     U32(u32),
     Bool(bool),
-    F32Vec4(F32Bits),
 }
 
 impl TileLiteral {
@@ -537,7 +537,6 @@ impl TileLiteral {
             Self::F16(_) => ElementType::F16,
             Self::U32(_) => ElementType::U32,
             Self::Bool(_) => ElementType::Bool,
-            Self::F32Vec4(_) => ElementType::F32Vec4,
         }
     }
 }

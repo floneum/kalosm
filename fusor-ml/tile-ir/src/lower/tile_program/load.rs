@@ -24,8 +24,8 @@ impl<'a> Lowerer<'a> {
             return Ok(Self::emit_load(expressions, body, src_ptr));
         }
 
-        let fill_source = load.fill.element();
-        let fill = self.tile_literal(expressions, load.fill);
+        let fill_source = self.tile_expr_element(&load.fill)?;
+        let fill = self.lower_tile_expr_lane(expressions, scratch, body, &load.fill, spill_depth)?;
         let fill = self.cast_tile_value(expressions, body, fill, fill_source, element);
         self.lower_masked_value_to_local(
             expressions,
@@ -80,9 +80,15 @@ impl<'a> Lowerer<'a> {
             spill_depth,
             element,
             |lowerer, expressions, body| {
-                let fill_source = load.fill.element();
-                let fill = lowerer.tile_literal(expressions, load.fill);
-                lowerer.cast_tile_value(expressions, body, fill, fill_source, element)
+                let fill_source = lowerer.tile_expr_element(&load.fill)?;
+                let fill = lowerer.lower_tile_expr_lane(
+                    expressions,
+                    scratch,
+                    body,
+                    &load.fill,
+                    spill_depth,
+                )?;
+                Ok(lowerer.cast_tile_value(expressions, body, fill, fill_source, element))
             },
         )
     }
@@ -97,7 +103,11 @@ impl<'a> Lowerer<'a> {
         mask: &Expr,
         spill_depth: usize,
         element: ElementType,
-        fill: impl FnOnce(&Self, &mut Arena<Expression>, &mut Block) -> Handle<Expression>,
+        fill: impl FnOnce(
+            &Self,
+            &mut Arena<Expression>,
+            &mut Block,
+        ) -> Result<Handle<Expression>, LowerError>,
     ) -> Result<Handle<Expression>, LowerError> {
         if mask.is_constant_true() {
             let index =
@@ -107,7 +117,7 @@ impl<'a> Lowerer<'a> {
             return Ok(Self::emit_load(expressions, body, src_ptr));
         }
 
-        let fill = fill(self, expressions, body);
+        let fill = fill(self, expressions, body)?;
         self.lower_masked_value_to_local(
             expressions,
             scratch,

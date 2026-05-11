@@ -101,33 +101,15 @@ impl<'a> Lowerer<'a> {
         }
     }
 
-    pub(in crate::lower) fn tile_literal(
-        &self,
-        expressions: &mut Arena<Expression>,
-        value: TileLiteral,
-    ) -> Handle<Expression> {
-        let scalar = match value {
+    pub(in crate::lower) fn tile_literal(value: TileLiteral) -> Expression {
+        match value {
             TileLiteral::F32(value) => Expression::Literal(Literal::F32(value.get())),
             TileLiteral::F16(value) => {
                 Expression::Literal(Literal::F16(half::f16::from_bits(value)))
             }
             TileLiteral::U32(value) => Expression::Literal(Literal::U32(value)),
             TileLiteral::Bool(value) => Expression::Literal(Literal::Bool(value)),
-            TileLiteral::F32Vec4(value) => {
-                let scalar = expressions.append(
-                    Expression::Literal(Literal::F32(value.get())),
-                    Span::default(),
-                );
-                return expressions.append(
-                    Expression::Compose {
-                        ty: self.f32_vec4_ty,
-                        components: vec![scalar, scalar, scalar, scalar],
-                    },
-                    Span::default(),
-                );
-            }
-        };
-        expressions.append(scalar, Span::default())
+        }
     }
 
     pub(in crate::lower) fn zero_literal(element: ElementType) -> Expression {

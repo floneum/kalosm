@@ -32,7 +32,9 @@ impl<'a> Lowerer<'a> {
             Expr::QuantizedLoad(load) => {
                 self.lower_tile_quantized_load_expr(expressions, scratch, body, load, spill_depth)
             }
-            Expr::Literal(value) => Ok(self.tile_literal(expressions, *value)),
+            Expr::Literal(value) => {
+                Ok(expressions.append(Self::tile_literal(*value), Span::default()))
+            }
             Expr::Builtin(builtin) => Ok(self.lower_builtin(expressions, body, *builtin)),
             Expr::Reduce {
                 op,

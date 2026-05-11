@@ -551,11 +551,11 @@ impl<'a> Lowerer<'a> {
         match expr {
             Expr::Load(load) => {
                 load.src.buffer.element == ElementType::F16
-                    || load.fill.element() == ElementType::F16
+                    || Self::tile_expr_uses_f16(&load.fill)
             }
             Expr::LoadLinear(load) => {
                 load.src.buffer.element == ElementType::F16
-                    || load.fill.element() == ElementType::F16
+                    || Self::tile_expr_uses_f16(&load.fill)
             }
             Expr::LoadWorkgroup { src, index } => {
                 src.element == ElementType::F16 || Self::tile_expr_uses_f16(index)

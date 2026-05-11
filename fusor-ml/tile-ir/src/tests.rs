@@ -371,3 +371,36 @@ fn qdequantize_lowers_large_embedding_table_as_tile_program() {
     ir.lower_to_naga()
         .unwrap_or_else(|error| panic!("large Q4K qdequantize lowering failed: {error}"));
 }
+
+#[test]
+fn rms_norm_vec4_minimal_lowers() {
+    use crate::kernel_builder::{KernelBuilder, KernelTensorRef};
+    use crate::kernels::{rms_norm_vec4, RmsNormVec4Meta};
+
+    let layout = Layout::strided(
+        MemoryLevel::Storage,
+        Shape::new([1]),
+        Strides::new([1]),
+    );
+    let mut kb = KernelBuilder::<()>::new();
+    let input = KernelTensorRef::with_offset((), layout.clone(), 0);
+    let weight = KernelTensorRef::with_offset((), layout.clone(), 0);
+    let output = KernelTensorRef::with_offset((), layout.clone(), 0);
+    let meta = RmsNormVec4Meta {
+        cols: 4,
+        cols_vec: 1,
+        eps: F32Bits::new(1e-5),
+        input_offset_vec: 0,
+        input_row_stride_vec: 1,
+        residual_offset_vec: None,
+        residual_row_stride_vec: 0,
+        weight_offset_vec: 0,
+        bias_offset_vec: None,
+        output_offset_vec: 0,
+        output_row_stride_vec: 1,
+    };
+    rms_norm_vec4(&mut kb, input, None, weight, None, output, meta, 1).unwrap();
+    let (ir, _) = kb.finish();
+    ir.lower_to_naga()
+        .unwrap_or_else(|error| panic!("rms_norm_vec4 lowering failed: {error}"));
+}
