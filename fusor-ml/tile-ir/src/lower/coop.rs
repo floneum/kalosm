@@ -261,23 +261,10 @@ impl<'a> Lowerer<'a> {
             None => {
                 let acc_ptr =
                     expressions.append(Expression::LocalVariable(acc_local), Span::default());
-                let load =
-                    expressions.append(Expression::Load { pointer: acc_ptr }, Span::default());
-                body.push(
-                    Statement::Emit(Self::single_expression_range(expressions, load)),
-                    Span::default(),
-                );
-                load
+                Self::emit_load(expressions, body, acc_ptr)
             }
         };
-        let next = expressions.append(
-            Expression::CooperativeMultiplyAdd { a, b, c },
-            Span::default(),
-        );
-        body.push(
-            Statement::Emit(Self::single_expression_range(expressions, next)),
-            Span::default(),
-        );
+        let next = self.emit(expressions, body, Expression::CooperativeMultiplyAdd { a, b, c });
         self.coop_acc_value_cache.borrow_mut().insert(acc.id, next);
         Ok(())
     }

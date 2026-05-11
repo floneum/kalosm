@@ -44,12 +44,7 @@ impl<'a> Lowerer<'a> {
                     spill_depth + 1,
                 )?;
                 self.restore_tile_loop_caches(saved);
-                let acc =
-                    expressions.append(Expression::Load { pointer: acc_ptr }, Span::default());
-                loop_body.push(
-                    Statement::Emit(Self::single_expression_range(expressions, acc)),
-                    Span::default(),
-                );
+                let acc = Self::emit_load(expressions, loop_body, acc_ptr);
                 let reduced = self.emit(
                     expressions,
                     loop_body,
@@ -66,12 +61,7 @@ impl<'a> Lowerer<'a> {
             },
         )?;
 
-        let value = expressions.append(Expression::Load { pointer: acc_ptr }, Span::default());
-        body.push(
-            Statement::Emit(Self::single_expression_range(expressions, value)),
-            Span::default(),
-        );
-        Ok(value)
+        Ok(Self::emit_load(expressions, body, acc_ptr))
     }
 
     pub(in crate::lower) fn lower_tile_reduce_value(
@@ -164,17 +154,7 @@ impl<'a> Lowerer<'a> {
 
         let result_ptr =
             self.tile_dynamic_pointer(expressions, scratch_tile, result_index, body)?;
-        let result = expressions.append(
-            Expression::Load {
-                pointer: result_ptr,
-            },
-            Span::default(),
-        );
-        body.push(
-            Statement::Emit(Self::single_expression_range(expressions, result)),
-            Span::default(),
-        );
-        Ok(result)
+        Ok(Self::emit_load(expressions, body, result_ptr))
     }
 
     pub(in crate::lower) fn lower_tile_reduce_step(

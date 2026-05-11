@@ -414,12 +414,7 @@ impl<'a> Lowerer<'a> {
         let mut handles = Vec::with_capacity(block_n as usize);
         for local in &tmp_locals {
             let ptr = expressions.append(Expression::LocalVariable(*local), Span::default());
-            let value = expressions.append(Expression::Load { pointer: ptr }, Span::default());
-            body.push(
-                Statement::Emit(Self::single_expression_range(expressions, value)),
-                Span::default(),
-            );
-            handles.push(value);
+            handles.push(Self::emit_load(expressions, body, ptr));
         }
         self.block_dequant_cache
             .borrow_mut()
@@ -540,11 +535,7 @@ impl<'a> Lowerer<'a> {
             },
             Span::default(),
         );
-        let loaded = expressions.append(Expression::Load { pointer: tmp_ptr }, Span::default());
-        body.push(
-            Statement::Emit(Self::single_expression_range(expressions, loaded)),
-            Span::default(),
-        );
+        let loaded = Self::emit_load(expressions, body, tmp_ptr);
         Ok(loaded)
     }
 }

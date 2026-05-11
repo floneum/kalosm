@@ -95,12 +95,7 @@ impl<'a> Lowerer<'a> {
         );
 
         let mut loop_body = Block::new();
-        let loop_index =
-            expressions.append(Expression::Load { pointer: loop_ptr }, Span::default());
-        loop_body.push(
-            Statement::Emit(Self::single_expression_range(expressions, loop_index)),
-            Span::default(),
-        );
+        let loop_index = Self::emit_load(expressions, &mut loop_body, loop_ptr);
         let done = expressions.append(
             Expression::Binary {
                 op: BinaryOperator::GreaterEqual,
