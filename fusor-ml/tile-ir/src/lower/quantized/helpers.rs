@@ -442,17 +442,7 @@ impl<'a> Lowerer<'a> {
         left: Handle<Expression>,
         right: Handle<Expression>,
     ) -> Handle<Expression> {
-        self.emit(
-            e,
-            body,
-            Expression::Math {
-                fun: MathFunction::Dot,
-                arg: left,
-                arg1: Some(right),
-                arg2: None,
-                arg3: None,
-            },
-        )
+        self.math2(e, body, MathFunction::Dot, left, right)
     }
 
     pub(in crate::lower) fn vec4_component(
@@ -586,17 +576,7 @@ impl<'a> Lowerer<'a> {
             Statement::Emit(Self::single_expression_range(e, vec)),
             Span::default(),
         );
-        Ok(self.emit(
-            e,
-            body,
-            Expression::Math {
-                fun: MathFunction::Pack4xI8Clamp,
-                arg: vec,
-                arg1: None,
-                arg2: None,
-                arg3: None,
-            },
-        ))
+        Ok(self.math1(e, body, MathFunction::Pack4xI8Clamp, vec))
     }
 
     pub(in crate::lower) fn as_i32(
