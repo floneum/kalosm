@@ -397,11 +397,10 @@ impl<'a> Lowerer<'a> {
         );
 
         // Materialize the locals into SSA loads we hand back per lane.
-        let mut handles = Vec::with_capacity(block_n as usize);
-        for local in &tmp_locals {
-            let ptr = self.local_var(expressions, *local);
-            handles.push(Self::emit_load(expressions, body, ptr));
-        }
+        let handles: Vec<_> = tmp_locals
+            .iter()
+            .map(|local| self.load_local(expressions, body, *local))
+            .collect();
         self.block_dequant_cache
             .borrow_mut()
             .insert(id, handles.clone());
