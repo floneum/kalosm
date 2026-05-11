@@ -68,6 +68,32 @@ impl<'a> Lowerer<'a> {
         }
     }
 
+    /// Extract the (q_local, low-nibble, high-nibble) triple shared by Q4 /
+    /// Q5 block nibble extraction. The packed-data layout is identical: the
+    /// 4-bit q value is stored as one nibble of one byte, with `q in 0..16`
+    /// addressing the low nibble and `q in 16..32` addressing the high nibble
+    /// of the same byte. Callers `select(high_pred, high4, low)` to pick the
+    /// correct nibble for the current `q`.
+    fn q_block_byte_nibbles(
+        &self,
+        e: &mut Arena<Expression>,
+        matrix: &QuantizedMatrix,
+        base: Handle<Expression>,
+        q: Handle<Expression>,
+        data_offset: u32,
+        body: &mut Block,
+    ) -> Result<(Handle<Expression>, Handle<Expression>, Handle<Expression>), LowerError> {
+        let q_local = self.and_lit(e, body, q, 15);
+        let q_word = self.shr_lit(e, body, q_local, 2);
+        let word_off = self.add_lit(e, body, q_word, data_offset);
+        let word = self.load_word_dynamic(e, matrix, base, word_off, body)?;
+        let byte_lane = self.and_lit(e, body, q_local, 3);
+        let byte = self.byte_at(e, body, word, byte_lane);
+        let low = self.and_lit(e, body, byte, 0x0f);
+        let high4 = self.shr_lit(e, body, byte, 4);
+        Ok((q_local, low, high4))
+    }
+
     pub(in crate::lower) fn q4_block_nibble(
         &self,
         e: &mut Arena<Expression>,
@@ -78,14 +104,8 @@ impl<'a> Lowerer<'a> {
         body: &mut Block,
     ) -> Result<Handle<Expression>, LowerError> {
         let high = self.cmp_lit(e, body, BinaryOperator::GreaterEqual, q, 16);
-        let q_local = self.and_lit(e, body, q, 15);
-        let q_word = self.shr_lit(e, body, q_local, 2);
-        let word_off = self.add_lit(e, body, q_word, data_offset);
-        let word = self.load_word_dynamic(e, matrix, base, word_off, body)?;
-        let byte_lane = self.and_lit(e, body, q_local, 3);
-        let byte = self.byte_at(e, body, word, byte_lane);
-        let low = self.and_lit(e, body, byte, 0x0f);
-        let high_q = self.shr_lit(e, body, byte, 4);
+        let (_q_local, low, high_q) =
+            self.q_block_byte_nibbles(e, matrix, base, q, data_offset, body)?;
         Ok(self.select(e, body, high, high_q, low))
     }
 
@@ -101,14 +121,8 @@ impl<'a> Lowerer<'a> {
     ) -> Result<Handle<Expression>, LowerError> {
         let qh = self.load_word(e, matrix, base, high_offset, body)?;
         let high = self.cmp_lit(e, body, BinaryOperator::GreaterEqual, q, 16);
-        let q_local = self.and_lit(e, body, q, 15);
-        let q_word = self.shr_lit(e, body, q_local, 2);
-        let word_off = self.add_lit(e, body, q_word, data_offset);
-        let word = self.load_word_dynamic(e, matrix, base, word_off, body)?;
-        let byte_lane = self.and_lit(e, body, q_local, 3);
-        let byte = self.byte_at(e, body, word, byte_lane);
-        let low = self.and_lit(e, body, byte, 0x0f);
-        let high4 = self.shr_lit(e, body, byte, 4);
+        let (q_local, low, high4) =
+            self.q_block_byte_nibbles(e, matrix, base, q, data_offset, body)?;
         let low4 = self.select(e, body, high, high4, low);
         let high_index = self.add_lit(e, body, q_local, 16);
         let hi_bit_index = self.select(e, body, high, high_index, q_local);
