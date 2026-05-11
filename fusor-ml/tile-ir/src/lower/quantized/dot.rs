@@ -85,6 +85,7 @@ impl<'a> Lowerer<'a> {
 
         let mut first_sums = [self.f32(expressions, 0.0); 4];
         let mut second_sums = [self.f32(expressions, 0.0); 4];
+        #[allow(clippy::type_complexity)]
         let accumulate: fn(
             &Self,
             &mut Arena<Expression>,
