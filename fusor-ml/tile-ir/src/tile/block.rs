@@ -53,7 +53,7 @@ macro_rules! quantized_vec_dot_entrypoint {
                     k: DotK::Base(k_base.into_index()),
                     col: col.into_index(),
                     mask: mask.expr,
-                    fill: Box::new(Expr::Literal(TileLiteral::F32(F32Bits::new(fill)))),
+                    fill: f32_fill(fill),
                     block_n: N as u32,
                 },
             }
@@ -76,6 +76,11 @@ pub struct TileBlock<'a, const BLOCK: usize> {
 /// / `subgroup_*` getters are one-line wrappers over this.
 fn builtin_index(builtin: Builtin) -> ScalarIndex {
     ScalarIndex { expr: Box::new(Expr::Builtin(builtin)) }
+}
+
+/// Boxed `f32` fill literal used by every `load*` entry point's `fill` field.
+fn f32_fill(value: f32) -> Box<Expr> {
+    Box::new(Expr::Literal(TileLiteral::F32(F32Bits::new(value))))
 }
 
 impl<const BLOCK: usize> TileBlock<'_, BLOCK> {
@@ -132,7 +137,7 @@ impl<const BLOCK: usize> TileBlock<'_, BLOCK> {
                 row: address.row,
                 col: address.col,
                 mask: mask.expr,
-                fill: Box::new(Expr::Literal(TileLiteral::F32(F32Bits::new(fill)))),
+                fill: f32_fill(fill),
             }),
         }
     }
@@ -205,7 +210,7 @@ impl<const BLOCK: usize> TileBlock<'_, BLOCK> {
                 row: row.into_index(),
                 col: col.into_index(),
                 mask: mask.expr,
-                fill: Box::new(Expr::Literal(TileLiteral::F32(F32Bits::new(fill)))),
+                fill: f32_fill(fill),
             }),
         }
     }
@@ -232,7 +237,7 @@ impl<const BLOCK: usize> TileBlock<'_, BLOCK> {
         let k_base = k_base.into_index();
         let col = col.into_index();
         let mask_expr = mask.expr;
-        let fill_expr: Box<Expr> = Box::new(Expr::Literal(TileLiteral::F32(F32Bits::new(fill))));
+        let fill_expr: Box<Expr> = f32_fill(fill);
         std::array::from_fn(|lane| Tile {
             expr: Expr::QuantizedBlockLane {
                 id,
@@ -488,7 +493,7 @@ impl<const BLOCK: usize> TileBlock<'_, BLOCK> {
                 k: DotK::Base(k_base.into_index()),
                 col: col.into_index(),
                 mask: mask.expr,
-                fill: Box::new(Expr::Literal(TileLiteral::F32(F32Bits::new(fill)))),
+                fill: f32_fill(fill),
                 block_n: 8,
             },
         }
@@ -537,7 +542,7 @@ impl<const BLOCK: usize> TileBlock<'_, BLOCK> {
                 },
                 col: col.into_index(),
                 mask: mask.expr,
-                fill: Box::new(Expr::Literal(TileLiteral::F32(F32Bits::new(fill)))),
+                fill: f32_fill(fill),
                 block_n: 32,
             },
         }
@@ -568,7 +573,7 @@ impl<const BLOCK: usize> TileBlock<'_, BLOCK> {
                 },
                 col: col.into_index(),
                 mask: mask.expr,
-                fill: Box::new(Expr::Literal(TileLiteral::F32(F32Bits::new(fill)))),
+                fill: f32_fill(fill),
                 block_n: 16,
             },
         }
