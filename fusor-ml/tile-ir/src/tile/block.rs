@@ -812,12 +812,6 @@ impl<const BLOCK: usize> TileBlock<'_, BLOCK> {
         });
     }
 
-    /// No-op kept for source compatibility. With `pin` now eagerly pushing a
-    /// `TileStmt::Let` at the bind site, callers no longer need to force the
-    /// pin into a particular scope by re-emitting it. Remove all callers in a
-    /// follow-up cleanup.
-    pub fn emit(&mut self, _value: Tile<BLOCK>) {}
-
     pub fn load_workgroup(&self, tile: TileRef, index: impl IntoIndex<BLOCK>) -> Tile<BLOCK> {
         Tile {
             expr: Expr::LoadWorkgroup {

@@ -83,15 +83,9 @@ pub fn flash_attention<E: Numeric, B>(
             let score_local = program.private::<F32>();
             let weighted_local = program.private::<F32>();
 
-            program.emit(q_idx.get());
-            program.emit(head_idx.get());
-            program.emit(batch_idx.get());
-            program.emit(kv_head_idx.get());
-            program.emit(out_dim.get());
-            program.emit(out_valid.get());
 
             let kv_chunks = meta.dims.kv_seq_len.div_ceil(FLASH_SIMD_WIDTH);
-            let [final_m, final_s, final_o] = program.fold(
+            let [_final_m, final_s, final_o] = program.fold(
                 range::<FLASH_BLOCK>(u32_tile::<FLASH_BLOCK>(kv_chunks)),
                 [f32_tile(NEG_MAX_F32), f32_tile(0.0), f32_tile(0.0)],
                 |program, chunk_idx, [m_state, s_state, o_state]| {
@@ -99,8 +93,6 @@ pub fn flash_attention<E: Numeric, B>(
                     let kv_idx =
                         program.bind(chunk * u32_tile(FLASH_SIMD_WIDTH) + kv_lane.clone());
                     let kv_valid = program.bind(kv_idx.get().lt(u32_tile(meta.dims.kv_seq_len)));
-                    program.emit(kv_idx.get());
-                    program.emit(kv_valid.get());
                     program.store_local(&score_local, f32_tile(NEG_MAX_F32));
                     program.if_then(kv_valid.get(), |program| {
                         let mut products = Vec::with_capacity(meta.dims.head_dim as usize);
@@ -144,19 +136,13 @@ pub fn flash_attention<E: Numeric, B>(
                     });
 
                     let score = program.bind(program.load_local(&score_local));
-                    program.emit(score.get());
                     let block_max = program.bind(program.subgroup_reduce_max(score.get()));
-                    program.emit(block_max.get());
                     let old_m = program.bind(m_state);
-                    program.emit(old_m.get());
                     let new_m = program.bind(old_m.get().max(block_max.get()));
-                    program.emit(new_m.get());
                     let raw_exp = (score.get() - new_m.get()).exp();
                     let exp_score =
                         program.bind(Tile::select(kv_valid.get(), raw_exp, f32_tile(0.0)));
-                    program.emit(exp_score.get());
                     let block_sum = program.bind(program.subgroup_reduce_sum(exp_score.get()));
-                    program.emit(block_sum.get());
 
                     program.store_local(&weighted_local, f32_tile(0.0));
                     let valid_value = kv_valid.get().and(out_valid.get());
@@ -176,10 +162,8 @@ pub fn flash_attention<E: Numeric, B>(
                     });
                     let weighted = program.load_local(&weighted_local);
                     let block_out = program.bind(program.subgroup_reduce_sum(weighted));
-                    program.emit(block_out.get());
 
                     let old_m_scale = program.bind((old_m.get() - new_m.get()).exp());
-                    program.emit(old_m_scale.get());
                     let new_s = s_state * old_m_scale.get() + block_sum.get();
                     let new_o = o_state * old_m_scale.get() + block_out.get();
                     [new_m.get(), new_s, new_o]
@@ -193,7 +177,6 @@ pub fn flash_attention<E: Numeric, B>(
             let final_s_bound = program.bind(final_s);
             // Evaluate `final_m` once so the loop fires even though we don't
             // need its value in the post-loop stage.
-            program.emit(final_m);
             program.if_then(store_valid, |program| {
                 let output_value =
                     (final_o_bound.get() / final_s_bound.get()).cast(E::ELEMENT);
