@@ -135,15 +135,15 @@ pub enum Expr {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum PackedActivations {
     /// Raw `f32` activations, fed directly to the format's dequant+dot helper.
-    F32(Vec<Box<Expr>>),
+    F32(Vec<Expr>),
     /// `f32` activations that get pre-packed to Q8 before the dot
     /// (Q4K-Q8, Q6K-Q8 paths).
-    Q8(Vec<Box<Expr>>),
+    Q8(Vec<Expr>),
     /// Q4K-paired GGML activations: low/high halves and per-quad sums.
     Q4KGgml {
-        low: Vec<Box<Expr>>,
-        high: Vec<Box<Expr>>,
-        sums: Vec<Box<Expr>>,
+        low: Vec<Expr>,
+        high: Vec<Expr>,
+        sums: Vec<Expr>,
     },
 }
 

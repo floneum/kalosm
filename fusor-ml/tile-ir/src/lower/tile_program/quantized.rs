@@ -205,7 +205,7 @@ impl<'a> Lowerer<'a> {
         expressions: &mut Arena<Expression>,
         scratch: ScratchLocals,
         body: &mut Block,
-        exprs: &[Box<Expr>],
+        exprs: &[Expr],
         spill_depth: usize,
     ) -> Result<Vec<Handle<Expression>>, LowerError> {
         exprs

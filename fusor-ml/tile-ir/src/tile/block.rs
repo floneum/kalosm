@@ -48,7 +48,7 @@ macro_rules! quantized_vec_dot_entrypoint {
                 expr: Expr::QuantizedDot {
                     src: matrix.clone(),
                     activations: PackedActivations::$packing(
-                        a.into_iter().map(|value| Box::new(value.expr)).collect(),
+                        a.into_iter().map(|value| value.expr).collect(),
                     ),
                     k: DotK::Base(k_base.into_index()),
                     col: col.into_index(),
@@ -502,7 +502,7 @@ impl<const BLOCK: usize> TileBlock<'_, BLOCK> {
             expr: Expr::QuantizedDot {
                 src: matrix.clone(),
                 activations: PackedActivations::F32(
-                    a.into_iter().map(|value| Box::new(value.expr)).collect(),
+                    a.into_iter().map(|value| value.expr).collect(),
                 ),
                 k: DotK::Base(k_base.into_index()),
                 col: col.into_index(),
@@ -545,15 +545,9 @@ impl<const BLOCK: usize> TileBlock<'_, BLOCK> {
             expr: Expr::QuantizedDot {
                 src: matrix.clone(),
                 activations: PackedActivations::Q4KGgml {
-                    low: a_low
-                        .into_iter()
-                        .map(|value| Box::new(value.expr))
-                        .collect(),
-                    high: a_high
-                        .into_iter()
-                        .map(|value| Box::new(value.expr))
-                        .collect(),
-                    sums: sums.into_iter().map(|value| Box::new(value.expr)).collect(),
+                    low: a_low.into_iter().map(|value| value.expr).collect(),
+                    high: a_high.into_iter().map(|value| value.expr).collect(),
+                    sums: sums.into_iter().map(|value| value.expr).collect(),
                 },
                 k: DotK::Block {
                     block: block.into_index(),
@@ -584,7 +578,7 @@ impl<const BLOCK: usize> TileBlock<'_, BLOCK> {
             expr: Expr::QuantizedDot {
                 src: matrix.clone(),
                 activations: PackedActivations::F32(
-                    a.into_iter().map(|value| Box::new(value.expr)).collect(),
+                    a.into_iter().map(|value| value.expr).collect(),
                 ),
                 k: DotK::Block {
                     block: block.into_index(),
