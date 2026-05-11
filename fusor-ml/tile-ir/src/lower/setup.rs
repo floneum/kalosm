@@ -199,19 +199,7 @@ impl<'a> Lowerer<'a> {
 
     pub(super) fn create_workgroup_globals(&mut self) -> Result<(), LowerError> {
         self.tile_globals = vec![None; self.ir.tiles().len()];
-        for tile in self.ir.tiles() {
-            if !self
-                .live_tiles
-                .get(tile.id.index())
-                .copied()
-                .unwrap_or(false)
-            {
-                continue;
-            }
-            if tile.layout.memory_level() != MemoryLevel::Workgroup {
-                continue;
-            }
-            let ty = self.tile_type(tile.element, &tile.layout);
+        for (index, ty) in self.live_tile_types(MemoryLevel::Workgroup) {
             let global = self.module.global_variables.append(
                 GlobalVariable {
                     name: None,
@@ -222,7 +210,7 @@ impl<'a> Lowerer<'a> {
                 },
                 Span::default(),
             );
-            self.tile_globals[tile.id.index()] = Some(global);
+            self.tile_globals[index] = Some(global);
         }
         Ok(())
     }
@@ -232,19 +220,7 @@ impl<'a> Lowerer<'a> {
         function: &mut Function,
     ) -> Result<(), LowerError> {
         self.tile_locals = vec![None; self.ir.tiles().len()];
-        for tile in self.ir.tiles() {
-            if !self
-                .live_tiles
-                .get(tile.id.index())
-                .copied()
-                .unwrap_or(false)
-            {
-                continue;
-            }
-            if tile.layout.memory_level() != MemoryLevel::Private {
-                continue;
-            }
-            let ty = self.tile_type(tile.element, &tile.layout);
+        for (index, ty) in self.live_tile_types(MemoryLevel::Private) {
             let local = function.local_variables.append(
                 LocalVariable {
                     name: None,
@@ -253,9 +229,29 @@ impl<'a> Lowerer<'a> {
                 },
                 Span::default(),
             );
-            self.tile_locals[tile.id.index()] = Some(local);
+            self.tile_locals[index] = Some(local);
         }
         Ok(())
+    }
+
+    /// `(tile_index, naga_type)` for every live tile whose layout is at
+    /// `level`. Materialised eagerly so the caller can mutate `self.module`
+    /// and `function.local_variables` while iterating.
+    fn live_tile_types(&mut self, level: MemoryLevel) -> Vec<(usize, Handle<Type>)> {
+        let pending: Vec<_> = self
+            .ir
+            .tiles()
+            .iter()
+            .filter(|tile| {
+                self.live_tiles.get(tile.id.index()).copied().unwrap_or(false)
+                    && tile.layout.memory_level() == level
+            })
+            .map(|tile| (tile.id.index(), tile.element, tile.layout.clone()))
+            .collect();
+        pending
+            .into_iter()
+            .map(|(index, element, layout)| (index, self.tile_type(element, &layout)))
+            .collect()
     }
 
     pub(super) fn create_program_private_locals(&mut self, function: &mut Function) {
