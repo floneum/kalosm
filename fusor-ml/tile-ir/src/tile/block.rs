@@ -48,7 +48,7 @@ macro_rules! quantized_vec_dot_entrypoint {
                 expr: Expr::QuantizedDot {
                     src: matrix.clone(),
                     activations: PackedActivations::$packing(
-                        a.into_iter().map(|value| value.expr).collect(),
+                        tiles_to_exprs(a),
                     ),
                     k: DotK::Base(k_base.into_index()),
                     col: col.into_index(),
@@ -81,6 +81,16 @@ fn builtin_index(builtin: Builtin) -> ScalarIndex {
 /// Boxed `f32` fill literal used by every `load*` entry point's `fill` field.
 fn f32_fill(value: f32) -> Box<Expr> {
     Box::new(Expr::Literal(TileLiteral::F32(F32Bits::new(value))))
+}
+
+/// Unwrap an iterable of `Tile`s into the parallel `Expr` vector. Used by
+/// the quantized-dot entry points that pack tile arrays into
+/// `PackedActivations` variants and by `sum`/`fold` that move the underlying
+/// expressions out of their typed wrappers.
+fn tiles_to_exprs<const BLOCK: usize>(
+    values: impl IntoIterator<Item = Tile<BLOCK>>,
+) -> Vec<Expr> {
+    values.into_iter().map(|t| t.expr).collect()
 }
 
 impl<const BLOCK: usize> TileBlock<'_, BLOCK> {
@@ -273,7 +283,7 @@ impl<const BLOCK: usize> TileBlock<'_, BLOCK> {
     /// `Expr::Binary(Add, ...)` so the lowerer's recursion depth is
     /// `O(log N)` instead of `O(N)` — the AST has no flat-sum variant.
     pub fn sum(&self, values: impl IntoIterator<Item = Tile<BLOCK>>) -> Tile<BLOCK> {
-        let mut exprs: Vec<Expr> = values.into_iter().map(|t| t.expr).collect();
+        let mut exprs = tiles_to_exprs(values);
         if exprs.is_empty() {
             return Tile {
                 expr: Expr::Literal(TileLiteral::F32(F32Bits::new(0.0))),
@@ -321,7 +331,7 @@ impl<const BLOCK: usize> TileBlock<'_, BLOCK> {
         F: FnOnce(&mut Self, ScalarIndex, [Tile<BLOCK>; N]) -> [Tile<BLOCK>; N],
     {
         assert!(N > 0, "fold must have at least one accumulator");
-        let initial_exprs: Vec<Expr> = initial.into_iter().map(|t| t.expr).collect();
+        let initial_exprs = tiles_to_exprs(initial);
 
         // Allocate the iterator-value local and one local per accumulator.
         let iter_var_local = self.program.alloc_local::<U32>();
@@ -488,7 +498,7 @@ impl<const BLOCK: usize> TileBlock<'_, BLOCK> {
             expr: Expr::QuantizedDot {
                 src: matrix.clone(),
                 activations: PackedActivations::F32(
-                    a.into_iter().map(|value| value.expr).collect(),
+                    tiles_to_exprs(a),
                 ),
                 k: DotK::Base(k_base.into_index()),
                 col: col.into_index(),
@@ -531,9 +541,9 @@ impl<const BLOCK: usize> TileBlock<'_, BLOCK> {
             expr: Expr::QuantizedDot {
                 src: matrix.clone(),
                 activations: PackedActivations::Q4KGgml {
-                    low: a_low.into_iter().map(|value| value.expr).collect(),
-                    high: a_high.into_iter().map(|value| value.expr).collect(),
-                    sums: sums.into_iter().map(|value| value.expr).collect(),
+                    low: tiles_to_exprs(a_low),
+                    high: tiles_to_exprs(a_high),
+                    sums: tiles_to_exprs(sums),
                 },
                 k: DotK::Block {
                     block: block.into_index(),
@@ -564,7 +574,7 @@ impl<const BLOCK: usize> TileBlock<'_, BLOCK> {
             expr: Expr::QuantizedDot {
                 src: matrix.clone(),
                 activations: PackedActivations::F32(
-                    a.into_iter().map(|value| value.expr).collect(),
+                    tiles_to_exprs(a),
                 ),
                 k: DotK::Block {
                     block: block.into_index(),
