@@ -252,8 +252,7 @@ impl<'a> Lowerer<'a> {
 
         let mut terms = terms.into_iter();
         let Some(mut index) = terms.next() else {
-            let zero = expressions.append(Expression::Literal(Literal::U32(0)), Span::default());
-            return Ok(zero);
+            return Ok(self.u32(expressions, 0));
         };
         for term in terms {
             index = self.add_u32_expr(expressions, index, term, body);
@@ -328,10 +327,7 @@ impl<'a> Lowerer<'a> {
                 None => term,
             });
         }
-        let index = index.unwrap_or_else(|| {
-            expressions.append(Expression::Literal(Literal::U32(0)), Span::default())
-        });
-        Ok(index)
+        Ok(index.unwrap_or_else(|| self.u32(expressions, 0)))
     }
 
     fn add_u32_expr(
