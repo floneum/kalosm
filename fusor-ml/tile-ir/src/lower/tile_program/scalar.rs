@@ -13,18 +13,11 @@ impl<'a> Lowerer<'a> {
     ) -> Result<Handle<Expression>, LowerError> {
         let element = value.element();
         let acc = self.tile_expr_spill_local(scratch, element, 0)?;
-        let acc_ptr = self.local_var(expressions, acc);
         let initial = expressions.append(
             Self::tile_reduce_identity(op, element),
             Span::default(),
         );
-        body.push(
-            Statement::Store {
-                pointer: acc_ptr,
-                value: initial,
-            },
-            Span::default(),
-        );
+        self.store_local(expressions, body, acc, initial);
 
         self.emit_counted_loop(
             expressions,
@@ -44,23 +37,19 @@ impl<'a> Lowerer<'a> {
                     spill_depth + 1,
                 )?;
                 self.restore_tile_loop_caches(saved);
-                let acc = Self::emit_load(expressions, loop_body, acc_ptr);
+                let acc_ptr = self.local_var(expressions, acc);
+                let acc_value = Self::emit_load(expressions, loop_body, acc_ptr);
                 let reduced = self.emit(
                     expressions,
                     loop_body,
-                    Self::tile_reduce_expression(op, acc, value),
+                    Self::tile_reduce_expression(op, acc_value, value),
                 );
-                loop_body.push(
-                    Statement::Store {
-                        pointer: acc_ptr,
-                        value: reduced,
-                    },
-                    Span::default(),
-                );
+                self.store_local(expressions, loop_body, acc, reduced);
                 Ok(())
             },
         )?;
 
+        let acc_ptr = self.local_var(expressions, acc);
         Ok(Self::emit_load(expressions, body, acc_ptr))
     }
 
