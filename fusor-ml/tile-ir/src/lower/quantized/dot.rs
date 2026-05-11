@@ -1,23 +1,11 @@
 use super::*;
 
-/// `(scale, min)` factor pair plus per-quantization-block decoded data.
-/// `data` is `[Handle<Expression>; N]` where `N` is either the per-quad pack
-/// count (`2`) or the dequantized lane count (`8`/`16`/`32`).
-pub(in crate::lower) struct Q4KQuantBlock<const N: usize> {
-    pub scale: Handle<Expression>,
-    pub min: Handle<Expression>,
-    pub data: [Handle<Expression>; N],
-}
-
 impl<'a> Lowerer<'a> {
     pub(in crate::lower) fn q4k_ggml_dot(
         &self,
         expressions: &mut Arena<Expression>,
         matrix: &QuantizedMatrix,
-        block: Handle<Expression>,
-        iq: Handle<Expression>,
-        ir: Handle<Expression>,
-        col: Handle<Expression>,
+        coords: GgmlBlockCoords,
         a_low: &[Handle<Expression>],
         a_high: &[Handle<Expression>],
         sums: &[Handle<Expression>],
@@ -32,6 +20,7 @@ impl<'a> Lowerer<'a> {
                 "q4k ggml dot requires Q4K, 16 low/high activations, and 4 sums",
             ));
         }
+        let GgmlBlockCoords { block, c0: iq, c1: ir, col } = coords;
 
         let base = self.quantized_block_base(expressions, matrix, block, col, 37, body);
         let d_word = self.load_word(expressions, matrix, base, 0, body)?;
@@ -191,10 +180,7 @@ impl<'a> Lowerer<'a> {
         &self,
         expressions: &mut Arena<Expression>,
         matrix: &QuantizedMatrix,
-        block: Handle<Expression>,
-        ip: Handle<Expression>,
-        il: Handle<Expression>,
-        col: Handle<Expression>,
+        coords: GgmlBlockCoords,
         a: &[Handle<Expression>],
         body: &mut Block,
     ) -> Result<Handle<Expression>, LowerError> {
@@ -203,6 +189,7 @@ impl<'a> Lowerer<'a> {
                 "q6k ggml dot requires Q6K and 16 activations",
             ));
         }
+        let GgmlBlockCoords { block, c0: ip, c1: il, col } = coords;
 
         let base = self.quantized_block_base(expressions, matrix, block, col, 53, body);
         let d_word = self.load_word(expressions, matrix, base, 52, body)?;

@@ -1,4 +1,5 @@
 use super::*;
+use crate::lower::quantized::GgmlBlockCoords;
 
 impl<'a> Lowerer<'a> {
     /// Lower a unified `Expr::QuantizedDot`. Activations and K coordinate are
@@ -129,26 +130,20 @@ impl<'a> Lowerer<'a> {
                     spill_depth,
                     fill,
                     |expressions, block_body| {
-                        let block_h = self.lower_tile_expr_lane(
+                        let coords = self.lower_ggml_block_coords(
                             expressions,
                             scratch,
                             block_body,
                             block,
+                            iq,
+                            ir,
+                            col,
                             spill_depth,
                         )?;
-                        let iq_h = self
-                            .lower_tile_expr_lane(expressions, scratch, block_body, iq, spill_depth)?;
-                        let ir_h = self
-                            .lower_tile_expr_lane(expressions, scratch, block_body, ir, spill_depth)?;
-                        let col_h = self
-                            .lower_tile_expr_lane(expressions, scratch, block_body, col, spill_depth)?;
                         self.q4k_ggml_dot(
                             expressions,
                             src,
-                            block_h,
-                            iq_h,
-                            ir_h,
-                            col_h,
+                            coords,
                             &low_handles,
                             &high_handles,
                             &sum_handles,
@@ -183,29 +178,17 @@ impl<'a> Lowerer<'a> {
                     spill_depth,
                     fill,
                     |expressions, block_body| {
-                        let block_h = self.lower_tile_expr_lane(
+                        let coords = self.lower_ggml_block_coords(
                             expressions,
                             scratch,
                             block_body,
                             block,
+                            ip,
+                            il,
+                            col,
                             spill_depth,
                         )?;
-                        let ip_h = self
-                            .lower_tile_expr_lane(expressions, scratch, block_body, ip, spill_depth)?;
-                        let il_h = self
-                            .lower_tile_expr_lane(expressions, scratch, block_body, il, spill_depth)?;
-                        let col_h = self
-                            .lower_tile_expr_lane(expressions, scratch, block_body, col, spill_depth)?;
-                        self.q6k_ggml_dot(
-                            expressions,
-                            src,
-                            block_h,
-                            ip_h,
-                            il_h,
-                            col_h,
-                            &a_handles,
-                            block_body,
-                        )
+                        self.q6k_ggml_dot(expressions, src, coords, &a_handles, block_body)
                     },
                 )
             }
@@ -232,6 +215,28 @@ impl<'a> Lowerer<'a> {
             .iter()
             .map(|expr| self.lower_tile_expr_lane(expressions, scratch, body, expr, spill_depth))
             .collect()
+    }
+
+    /// Lower the four `(block, c0, c1, col)` index expressions used by Q4K and
+    /// Q6K ggml dot helpers.
+    #[allow(clippy::too_many_arguments)]
+    pub(in crate::lower) fn lower_ggml_block_coords(
+        &self,
+        expressions: &mut Arena<Expression>,
+        scratch: ScratchLocals,
+        body: &mut Block,
+        block: &Expr,
+        c0: &Expr,
+        c1: &Expr,
+        col: &Expr,
+        spill_depth: usize,
+    ) -> Result<GgmlBlockCoords, LowerError> {
+        Ok(GgmlBlockCoords {
+            block: self.lower_tile_expr_lane(expressions, scratch, body, block, spill_depth)?,
+            c0: self.lower_tile_expr_lane(expressions, scratch, body, c0, spill_depth)?,
+            c1: self.lower_tile_expr_lane(expressions, scratch, body, c1, spill_depth)?,
+            col: self.lower_tile_expr_lane(expressions, scratch, body, col, spill_depth)?,
+        })
     }
 
     #[allow(clippy::too_many_arguments)]

@@ -26,6 +26,24 @@ pub(super) struct Q8_0BlockParts {
     words: [Handle<Expression>; 2],
 }
 
+/// `(scale, min)` factor pair plus per-quantization-block decoded data.
+/// `data` is `[Handle<Expression>; N]` where `N` is either the per-quad pack
+/// count (`2`) or the dequantized lane count (`8`/`16`/`32`).
+pub(in crate::lower) struct Q4KQuantBlock<const N: usize> {
+    pub scale: Handle<Expression>,
+    pub min: Handle<Expression>,
+    pub data: [Handle<Expression>; N],
+}
+
+/// Resolved `(block, c0, c1, col)` coordinates for a Q4K/Q6K ggml dot helper.
+/// Q4K uses `(iq, ir)` for `(c0, c1)`; Q6K uses `(ip, il)`.
+pub(in crate::lower) struct GgmlBlockCoords {
+    pub block: Handle<Expression>,
+    pub c0: Handle<Expression>,
+    pub c1: Handle<Expression>,
+    pub col: Handle<Expression>,
+}
+
 /// Quant-byte extraction layout for the affine GGML formats.
 ///
 /// `Q4` packs two 4-bit nibbles per byte; `Q5` adds an extra high-bit
