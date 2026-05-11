@@ -85,51 +85,27 @@ impl<'a> Lowerer<'a> {
 
         let mut first_sums = [self.f32(expressions, 0.0); 4];
         let mut second_sums = [self.f32(expressions, 0.0); 4];
-        let use_vector_accumulate = matrix.rows <= 4096 && matrix.cols >= 8192;
+        let accumulate: fn(
+            &Self,
+            &mut Arena<Expression>,
+            &mut Block,
+            Handle<Expression>,
+            &[Handle<Expression>],
+            usize,
+            &mut [Handle<Expression>; 4],
+        ) = if matrix.rows <= 4096 && matrix.cols >= 8192 {
+            Self::q4k_ggml_accumulate_word_vector
+        } else {
+            Self::q4k_ggml_accumulate_word_scalar
+        };
         for j in 0..2 {
             let word_off = self.add_lit(expressions, body, data_offset, 5 + j as u32);
             let word = self.load_word_dynamic(expressions, matrix, base, word_off, body)?;
-            if use_vector_accumulate {
-                self.q4k_ggml_accumulate_word_vector(
-                    expressions,
-                    body,
-                    word,
-                    a_low,
-                    j,
-                    &mut first_sums,
-                );
-            } else {
-                self.q4k_ggml_accumulate_word_scalar(
-                    expressions,
-                    body,
-                    word,
-                    a_low,
-                    j,
-                    &mut first_sums,
-                );
-            }
+            accumulate(self, expressions, body, word, a_low, j, &mut first_sums);
 
             let word_off = self.add_lit(expressions, body, data_offset, 21 + j as u32);
             let word = self.load_word_dynamic(expressions, matrix, base, word_off, body)?;
-            if use_vector_accumulate {
-                self.q4k_ggml_accumulate_word_vector(
-                    expressions,
-                    body,
-                    word,
-                    a_high,
-                    j,
-                    &mut second_sums,
-                );
-            } else {
-                self.q4k_ggml_accumulate_word_scalar(
-                    expressions,
-                    body,
-                    word,
-                    a_high,
-                    j,
-                    &mut second_sums,
-                );
-            }
+            accumulate(self, expressions, body, word, a_high, j, &mut second_sums);
         }
 
         let inv_256 = self.f32(expressions, 1.0 / 256.0);
