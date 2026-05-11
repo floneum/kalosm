@@ -196,14 +196,7 @@ impl<'a> Lowerer<'a> {
             let init_value =
                 self.lower_tile_expr_lane(expressions, scratch, body, &acc.init, 0)?;
             let local = self.private_local(LocalRef::new(acc.name, acc.element))?;
-            let pointer = self.local_var(expressions, local);
-            body.push(
-                Statement::Store {
-                    pointer,
-                    value: init_value,
-                },
-                Span::default(),
-            );
+            self.store_local(expressions, body, local, init_value);
         }
 
         // 2. Lower the iterator's count expression in the surrounding scope.
@@ -221,15 +214,7 @@ impl<'a> Lowerer<'a> {
             count_handle,
             |expressions, loop_body, loop_index| {
                 // Store the loop index into iter_var's local.
-                let iter_ptr = expressions
-                    .append(Expression::LocalVariable(iter_var_local), Span::default());
-                loop_body.push(
-                    Statement::Store {
-                        pointer: iter_ptr,
-                        value: loop_index,
-                    },
-                    Span::default(),
-                );
+                self.store_local(expressions, loop_body, iter_var_local, loop_index);
 
                 // Snapshot caches whose SSA handles are scoped to the outer
                 // block so the body's lowering can repopulate them inside the
@@ -255,15 +240,7 @@ impl<'a> Lowerer<'a> {
                     )?;
                     let acc_local =
                         self.private_local(LocalRef::new(acc.name, acc.element))?;
-                    let pointer = expressions
-                        .append(Expression::LocalVariable(acc_local), Span::default());
-                    loop_body.push(
-                        Statement::Store {
-                            pointer,
-                            value,
-                        },
-                        Span::default(),
-                    );
+                    self.store_local(expressions, loop_body, acc_local, value);
                 }
 
                 self.flush_coop_acc_cache(expressions, loop_body);
