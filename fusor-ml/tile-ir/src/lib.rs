@@ -19,7 +19,7 @@ pub use ir::{
     LocalId, LocalRef, LoopOffset, MemoryLevel, Numeric, Shape, StorageIndexMap, StorageView,
     Strides, TileBinaryOp, TileCompareOp, TileDecl, Expr, TileId,
     TileIndexedStoreStmt, TileLinearLoadExpr, TileLiteral, TileLoadExpr,
-    TileProgramOp, TileQuantizedLoadExpr, TileReduceOp, TileRef,
+    LoadSource, TileProgramOp, TileReduceOp, TileRef,
     TileStmt, TileUnaryOp, WorkgroupAxis, WorkgroupOffset, F16, F32, U32,
 };
 pub use kernel_builder::{KernelBuilder, KernelTensorRef};

@@ -9,16 +9,57 @@ impl<'a> Lowerer<'a> {
         load: &TileLoadExpr,
         spill_depth: usize,
     ) -> Result<Handle<Expression>, LowerError> {
-        let element = load.src.buffer.element;
+        match &load.src {
+            LoadSource::Storage(view) => {
+                self.lower_storage_load(expressions, scratch, body, load, view, spill_depth)
+            }
+            LoadSource::Quantized(matrix) => self.lower_masked_f32_value(
+                expressions,
+                scratch,
+                body,
+                &load.mask,
+                spill_depth,
+                &load.fill,
+                |expressions, block| {
+                    let row = self.lower_tile_expr_lane(
+                        expressions,
+                        scratch,
+                        block,
+                        &load.row,
+                        spill_depth,
+                    )?;
+                    let col = self.lower_tile_expr_lane(
+                        expressions,
+                        scratch,
+                        block,
+                        &load.col,
+                        spill_depth,
+                    )?;
+                    self.dequantize_qvalue(expressions, matrix, row, col)
+                },
+            ),
+        }
+    }
+
+    fn lower_storage_load(
+        &self,
+        expressions: &mut Arena<Expression>,
+        scratch: ScratchLocals,
+        body: &mut Block,
+        load: &TileLoadExpr,
+        view: &StorageView,
+        spill_depth: usize,
+    ) -> Result<Handle<Expression>, LowerError> {
+        let element = view.buffer.element;
         if load.mask.is_constant_true() {
             let row =
                 self.lower_tile_expr_lane(expressions, scratch, body, &load.row, spill_depth)?;
             let col =
                 self.lower_tile_expr_lane(expressions, scratch, body, &load.col, spill_depth)?;
             let (src_index, src_index_emits) =
-                self.storage_index_from_coords(expressions, &load.src, &[row, col])?;
+                self.storage_index_from_coords(expressions, view, &[row, col])?;
             let (src_ptr, src_ptr_emits) =
-                self.storage_dynamic_pointer(expressions, &load.src, src_index)?;
+                self.storage_dynamic_pointer(expressions, view, src_index)?;
             Self::push_emits(body, src_index_emits);
             Self::push_emits(body, src_ptr_emits);
             return Ok(Self::emit_load(expressions, body, src_ptr));
@@ -51,9 +92,9 @@ impl<'a> Lowerer<'a> {
                     spill_depth,
                 )?;
                 let (src_index, src_index_emits) =
-                    self.storage_index_from_coords(expressions, &load.src, &[row, col])?;
+                    self.storage_index_from_coords(expressions, view, &[row, col])?;
                 let (src_ptr, src_ptr_emits) =
-                    self.storage_dynamic_pointer(expressions, &load.src, src_index)?;
+                    self.storage_dynamic_pointer(expressions, view, src_index)?;
                 Self::push_emits(accept, src_index_emits);
                 Self::push_emits(accept, src_ptr_emits);
                 Ok(Self::emit_load(expressions, accept, src_ptr))
@@ -137,38 +178,4 @@ impl<'a> Lowerer<'a> {
         )
     }
 
-    pub(in crate::lower) fn lower_tile_quantized_load_expr(
-        &self,
-        expressions: &mut Arena<Expression>,
-        scratch: ScratchLocals,
-        body: &mut Block,
-        load: &TileQuantizedLoadExpr,
-        spill_depth: usize,
-    ) -> Result<Handle<Expression>, LowerError> {
-        self.lower_masked_f32_value(
-            expressions,
-            scratch,
-            body,
-            &load.mask,
-            spill_depth,
-            &load.fill,
-            |expressions, block| {
-                let row = self.lower_tile_expr_lane(
-                    expressions,
-                    scratch,
-                    block,
-                    &load.row,
-                    spill_depth,
-                )?;
-                let col = self.lower_tile_expr_lane(
-                    expressions,
-                    scratch,
-                    block,
-                    &load.col,
-                    spill_depth,
-                )?;
-                self.dequantize_qvalue(expressions, &load.src, row, col)
-            },
-        )
-    }
 }

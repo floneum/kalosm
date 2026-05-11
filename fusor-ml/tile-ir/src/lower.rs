@@ -15,7 +15,7 @@ use crate::ir::{
     DotK, DynamicOffset, ElementType, Expr, FlattenedMatrixMap, Im2ColNhwcMap, KernelIr,
     Layout, LocalId, LocalRef, MemoryLevel, PackedActivations, StorageIndexMap, StorageView,
     TileBinaryOp, TileCompareOp, TileId, TileLinearLoadExpr, TileLiteral, TileLoadExpr,
-    TileProgramOp, TileQuantizedLoadExpr, TileReduceOp, TileRef, TileStmt,
+    LoadSource, TileProgramOp, TileReduceOp, TileRef, TileStmt,
     TileStoreStmt, TileUnaryOp,
 };
 use crate::quantized::{GgmlQuantFormat, QuantizedMatrix};

@@ -178,9 +178,6 @@ impl<'a> Lowerer<'a> {
                 pred(&load.index) || pred(&load.mask) || pred(&load.fill)
             }
             Expr::LoadWorkgroup { index, .. } => pred(index),
-            Expr::QuantizedLoad(load) => {
-                pred(&load.row) || pred(&load.col) || pred(&load.mask) || pred(&load.fill)
-            }
             Expr::QuantizedBlockLane {
                 k_base,
                 col,

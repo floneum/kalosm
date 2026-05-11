@@ -36,7 +36,6 @@ pub enum Expr {
         index: Box<Expr>,
     },
     LoadLocal(LocalRef),
-    QuantizedLoad(TileQuantizedLoadExpr),
     Literal(TileLiteral),
     /// A built-in u32 quantity (lane id, loop index, program id, subgroup
     /// builtins). Indexing arithmetic uses `Expr::Binary` over `Builtin`
@@ -178,12 +177,21 @@ impl Expr {
 
 }
 
-/// A masked rank-1 tile load. `fill` is the masked-out value — typically a
+/// Source of an `Expr::Load`. The lowerer dispatches on the variant to choose
+/// between a raw storage read and a dequantized read.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum LoadSource {
+    Storage(StorageView),
+    Quantized(QuantizedMatrix),
+}
+
+/// A masked rank-2 tile load. `fill` is the masked-out value — typically a
 /// `Literal`, but any expression evaluable in the surrounding scope is
-/// allowed (e.g. `Compose4` for a vec4 splat constant).
+/// allowed (e.g. `Compose4` for a vec4 splat constant). When `src` is
+/// `Quantized`, the load dequantizes on the fly and the result is `f32`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TileLoadExpr {
-    pub src: StorageView,
+    pub src: LoadSource,
     pub row: Box<Expr>,
     pub col: Box<Expr>,
     pub mask: Box<Expr>,
@@ -196,17 +204,6 @@ pub struct TileLoadExpr {
 pub struct TileLinearLoadExpr {
     pub src: StorageView,
     pub index: Box<Expr>,
-    pub mask: Box<Expr>,
-    pub fill: Box<Expr>,
-}
-
-/// A masked dequantizing rank-1 tile load from a packed quantized matrix.
-/// `fill` is always-`f32`; see `TileLoadExpr` for the wider `fill` semantics.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct TileQuantizedLoadExpr {
-    pub src: QuantizedMatrix,
-    pub row: Box<Expr>,
-    pub col: Box<Expr>,
     pub mask: Box<Expr>,
     pub fill: Box<Expr>,
 }

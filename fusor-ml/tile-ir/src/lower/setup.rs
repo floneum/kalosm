@@ -379,7 +379,6 @@ impl<'a> Lowerer<'a> {
         match expr {
             Expr::Load(load) => !load.mask.is_constant_true(),
             Expr::LoadLinear(load) => !load.mask.is_constant_true(),
-            Expr::QuantizedLoad(load) => !load.mask.is_constant_true(),
             _ => Self::tile_expr_children_any(expr, Self::tile_expr_needs_value_scratch),
         }
     }
@@ -543,8 +542,11 @@ impl<'a> Lowerer<'a> {
     fn tile_expr_f16_payload(expr: &Expr) -> bool {
         match expr {
             Expr::Load(load) => {
-                load.src.buffer.element == ElementType::F16
-                    || Self::tile_expr_uses_f16(&load.fill)
+                let src_uses_f16 = match &load.src {
+                    LoadSource::Storage(view) => view.buffer.element == ElementType::F16,
+                    LoadSource::Quantized(_) => false,
+                };
+                src_uses_f16 || Self::tile_expr_uses_f16(&load.fill)
             }
             Expr::LoadLinear(load) => {
                 load.src.buffer.element == ElementType::F16
@@ -554,7 +556,6 @@ impl<'a> Lowerer<'a> {
                 src.element == ElementType::F16 || Self::tile_expr_uses_f16(index)
             }
             Expr::LoadLocal(local) => local.element == ElementType::F16,
-            Expr::QuantizedLoad(_) => false,
             Expr::Literal(value) => value.element() == ElementType::F16,
             Expr::Reduce { scratch, .. } => scratch.element == ElementType::F16,
             Expr::Unary { .. } => false,

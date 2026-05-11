@@ -357,7 +357,10 @@ fn qdequantize_lowers_large_embedding_table_as_tile_program() {
     let [TileStmt::Store(store)] = program.body.as_slice() else {
         panic!("qdequantize should emit one tile store");
     };
-    assert!(matches!(store.value, Expr::QuantizedLoad(_)));
+    assert!(matches!(
+        &store.value,
+        Expr::Load(load) if matches!(load.src, LoadSource::Quantized(_))
+    ));
     ir.lower_to_naga()
         .unwrap_or_else(|error| panic!("large Q4K qdequantize lowering failed: {error}"));
 }

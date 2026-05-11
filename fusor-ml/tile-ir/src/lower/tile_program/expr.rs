@@ -29,9 +29,6 @@ impl<'a> Lowerer<'a> {
                 let pointer = expressions.append(Expression::LocalVariable(local), Span::default());
                 Ok(Self::emit_load(expressions, body, pointer))
             }
-            Expr::QuantizedLoad(load) => {
-                self.lower_tile_quantized_load_expr(expressions, scratch, body, load, spill_depth)
-            }
             Expr::Literal(value) => {
                 Ok(expressions.append(Self::tile_literal(*value), Span::default()))
             }

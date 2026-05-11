@@ -91,11 +91,13 @@ impl KernelIr {
     /// context.
     pub(crate) fn tile_expr_element(&self, expr: &Expr) -> ElementType {
         match expr {
-            Expr::Load(load) => load.src.buffer.element,
+            Expr::Load(load) => match &load.src {
+                LoadSource::Storage(view) => view.buffer.element,
+                LoadSource::Quantized(_) => ElementType::F32,
+            },
             Expr::LoadLinear(load) => load.src.buffer.element,
             Expr::LoadWorkgroup { src, .. } => src.element,
             Expr::LoadLocal(local) => local.element,
-            Expr::QuantizedLoad(_) => ElementType::F32,
             Expr::Literal(value) => value.element(),
             Expr::Builtin(_) => ElementType::U32,
             Expr::Reduce { scratch, .. } => scratch.element,
@@ -620,8 +622,7 @@ numeric_markers!(
 
 mod expr;
 pub use expr::{
-    Builtin, DotK, Expr, PackedActivations, TileLinearLoadExpr, TileLoadExpr,
-    TileQuantizedLoadExpr,
+    Builtin, DotK, Expr, LoadSource, PackedActivations, TileLinearLoadExpr, TileLoadExpr,
 };
 
 mod layout;

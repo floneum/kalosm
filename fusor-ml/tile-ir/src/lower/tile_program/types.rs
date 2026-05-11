@@ -65,11 +65,13 @@ impl<'a> Lowerer<'a> {
 
     pub(in crate::lower) fn tile_expr_element(&self, expr: &Expr) -> Result<ElementType, LowerError> {
         match expr {
-            Expr::Load(load) => Ok(load.src.buffer.element),
+            Expr::Load(load) => Ok(match &load.src {
+                LoadSource::Storage(view) => view.buffer.element,
+                LoadSource::Quantized(_) => ElementType::F32,
+            }),
             Expr::LoadLinear(load) => Ok(load.src.buffer.element),
             Expr::LoadWorkgroup { src, .. } => Ok(src.element),
             Expr::LoadLocal(local) => Ok(local.element),
-            Expr::QuantizedLoad(_) => Ok(ElementType::F32),
             Expr::Literal(value) => Ok(value.element()),
             Expr::Builtin(_) => Ok(ElementType::U32),
             Expr::Reduce { scratch, .. } => Ok(scratch.element),

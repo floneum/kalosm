@@ -4,7 +4,7 @@ use std::marker::PhantomData;
 use crate::ir::{
     Builtin, CoopOperandRole, DotK, ElementType, Expr, F32Bits, F32Vec4, Layout, LocalRef,
     MemoryLevel, Numeric, PackedActivations, Shape, TileBinaryOp, TileIndexedStoreStmt,
-    TileLinearLoadExpr, TileLiteral, TileLoadExpr, TileQuantizedLoadExpr, TileReduceOp, TileRef,
+    LoadSource, TileLinearLoadExpr, TileLiteral, TileLoadExpr, TileReduceOp, TileRef,
     TileStmt, TileStoreStmt, TileUnaryOp, WorkgroupAxis, F32, U32,
 };
 use crate::quantized::QuantizedMatrix;
@@ -136,7 +136,7 @@ impl<const BLOCK: usize> TileBlock<'_, BLOCK> {
     pub fn load<T>(&self, address: Address<T, BLOCK>, mask: Mask<BLOCK>, fill: f32) -> Tile<BLOCK> {
         Tile {
             expr: Expr::Load(TileLoadExpr {
-                src: address.view,
+                src: LoadSource::Storage(address.view),
                 row: address.row,
                 col: address.col,
                 mask: mask.expr,
@@ -191,7 +191,7 @@ impl<const BLOCK: usize> TileBlock<'_, BLOCK> {
     ) -> Tile<BLOCK> {
         Tile {
             expr: Expr::Load(TileLoadExpr {
-                src: address.view,
+                src: LoadSource::Storage(address.view),
                 row: address.row,
                 col: address.col,
                 mask: mask.expr,
@@ -209,8 +209,8 @@ impl<const BLOCK: usize> TileBlock<'_, BLOCK> {
         fill: f32,
     ) -> Tile<BLOCK> {
         Tile {
-            expr: Expr::QuantizedLoad(TileQuantizedLoadExpr {
-                src: matrix.clone(),
+            expr: Expr::Load(TileLoadExpr {
+                src: crate::ir::LoadSource::Quantized(matrix.clone()),
                 row: row.into_index(),
                 col: col.into_index(),
                 mask: mask.expr,
