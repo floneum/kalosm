@@ -28,6 +28,21 @@ impl<'a> Lowerer<'a> {
         self.load_word_at(e, matrix, index, body)
     }
 
+    /// `load_word(...) → bitcast_f32(...)`. The dominant scale-read pattern
+    /// in every K-quant block: a single u32 word at a known offset reinterpreted
+    /// as `f32` (the per-block `d` / `dmin` scales).
+    pub(in crate::lower) fn load_word_f32(
+        &self,
+        e: &mut Arena<Expression>,
+        matrix: &QuantizedMatrix,
+        base: Handle<Expression>,
+        offset: u32,
+        body: &mut Block,
+    ) -> Result<Handle<Expression>, LowerError> {
+        let word = self.load_word(e, matrix, base, offset, body)?;
+        Ok(self.bitcast_f32(e, body, word))
+    }
+
     pub(in crate::lower) fn load_word_dynamic(
         &self,
         e: &mut Arena<Expression>,

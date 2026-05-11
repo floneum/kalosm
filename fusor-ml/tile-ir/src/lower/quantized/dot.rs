@@ -22,10 +22,8 @@ impl<'a> Lowerer<'a> {
         let GgmlBlockCoords { block, c0: iq, c1: ir, col } = coords;
 
         let base = self.quantized_block_base(expressions, matrix, block, col, 37, body);
-        let d_word = self.load_word(expressions, matrix, base, 0, body)?;
-        let d = self.bitcast_f32(expressions, body, d_word);
-        let dmin_word = self.load_word(expressions, matrix, base, 1, body)?;
-        let dmin = self.bitcast_f32(expressions, body, dmin_word);
+        let d = self.load_word_f32(expressions, matrix, base, 0, body)?;
+        let dmin = self.load_word_f32(expressions, matrix, base, 1, body)?;
 
         let scale_shift = self.shl_lit(expressions, body, iq, 4);
         let sc0 = self.load_word(expressions, matrix, base, 2, body)?;
@@ -168,8 +166,7 @@ impl<'a> Lowerer<'a> {
         let GgmlBlockCoords { block, c0: ip, c1: il, col } = coords;
 
         let base = self.quantized_block_base(expressions, matrix, block, col, 53, body);
-        let d_word = self.load_word(expressions, matrix, base, 52, body)?;
-        let d = self.bitcast_f32(expressions, body, d_word);
+        let d = self.load_word_f32(expressions, matrix, base, 52, body)?;
 
         let l0 = self.shl_lit(expressions, body, il, 2);
         let low_base = self.shl_lit(expressions, body, ip, 6);
@@ -563,10 +560,8 @@ impl<'a> Lowerer<'a> {
         body: &mut Block,
     ) -> Result<Q4KBlockParts, LowerError> {
         let base = self.quantized_block_base(expressions, matrix, block, col, 37, body);
-        let d_word = self.load_word(expressions, matrix, base, 0, body)?;
-        let d = self.bitcast_f32(expressions, body, d_word);
-        let dmin_word = self.load_word(expressions, matrix, base, 1, body)?;
-        let dmin = self.bitcast_f32(expressions, body, dmin_word);
+        let d = self.load_word_f32(expressions, matrix, base, 0, body)?;
+        let dmin = self.load_word_f32(expressions, matrix, base, 1, body)?;
         let group = self.shr_lit(expressions, body, q_base, 5);
         let (scale_byte, min_byte) =
             self.q4k_scale_min_bytes(expressions, matrix, base, group, body)?;

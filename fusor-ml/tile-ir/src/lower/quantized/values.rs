@@ -110,8 +110,7 @@ impl<'a> Lowerer<'a> {
         let col_block = self.mul_literal_u32_emitted(expressions, col, matrix.rows / 32, body);
         let block_index = self.add(expressions, body, col_block, block);
         let base = self.mul_literal_u32_emitted(expressions, block_index, 9, body);
-        let scale_word = self.load_word(expressions, matrix, base, 0, body)?;
-        let scale = self.bitcast_f32(expressions, body, scale_word);
+        let scale = self.load_word_f32(expressions, matrix, base, 0, body)?;
         let q_word = self.shr_lit(expressions, body, q, 2);
         let word0_off = self.add_lit(expressions, body, q_word, 1);
         let word1_off = self.add_lit(expressions, body, q_word, 2);
@@ -155,10 +154,8 @@ impl<'a> Lowerer<'a> {
         let q_base = self.and_lit(expressions, body, k_base, 255);
         let base = self.quantized_block_base(expressions, matrix, block, col, 37, body);
 
-        let d_word = self.load_word(expressions, matrix, base, 0, body)?;
-        let d = self.bitcast_f32(expressions, body, d_word);
-        let dmin_word = self.load_word(expressions, matrix, base, 1, body)?;
-        let dmin = self.bitcast_f32(expressions, body, dmin_word);
+        let d = self.load_word_f32(expressions, matrix, base, 0, body)?;
+        let dmin = self.load_word_f32(expressions, matrix, base, 1, body)?;
         let group = self.shr_lit(expressions, body, q_base, 5);
         let scale_byte = self.k_scale(expressions, matrix, base, group, false, body)?;
         let scale_f = self.as_f32(expressions, body, scale_byte);
@@ -232,8 +229,7 @@ impl<'a> Lowerer<'a> {
             block,
         );
         let base = self.mul_literal_u32_emitted(expressions, block_index, 6, body);
-        let scale_word = self.load_word(expressions, matrix, base, 0, body)?;
-        let scale = self.bitcast_f32(expressions, body, scale_word);
+        let scale = self.load_word_f32(expressions, matrix, base, 0, body)?;
         let qh = self.load_word(expressions, matrix, base, 1, body)?;
         let high = self.cmp_lit(
             expressions,
@@ -290,8 +286,7 @@ impl<'a> Lowerer<'a> {
         let q_base = self.and_lit(expressions, body, k_base, 255);
         let base = self.quantized_block_base(expressions, matrix, block, col, 53, body);
 
-        let d_word = self.load_word(expressions, matrix, base, 52, body)?;
-        let d = self.bitcast_f32(expressions, body, d_word);
+        let d = self.load_word_f32(expressions, matrix, base, 52, body)?;
         let chunk = self.shr_lit(expressions, body, q_base, 7);
         let local = self.and_lit(expressions, body, q_base, 127);
         let high_byte_index = self.and_lit(expressions, body, local, 31);

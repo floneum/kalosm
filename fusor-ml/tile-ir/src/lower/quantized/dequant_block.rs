@@ -27,8 +27,7 @@ impl<'a> Lowerer<'a> {
                 self.dequant_q8_scaled(e, matrix, base, q, data_offset, body)
             }
             AffineDequantSpec::Centered { nibble, center } => {
-                let scale_word = self.load_word(e, matrix, base, 0, body)?;
-                let scale = self.bitcast_f32(e, body, scale_word);
+                let scale = self.load_word_f32(e, matrix, base, 0, body)?;
                 let quant = self.affine_nibble(e, matrix, base, q, nibble, body)?;
                 let quant_f = self.as_f32(e, body, quant);
                 let center = self.f32(e, center);
@@ -36,10 +35,8 @@ impl<'a> Lowerer<'a> {
                 Ok(self.mul(e, body, centered, scale))
             }
             AffineDequantSpec::ScaleMin { nibble } => {
-                let scale_word = self.load_word(e, matrix, base, 0, body)?;
-                let scale = self.bitcast_f32(e, body, scale_word);
-                let min_word = self.load_word(e, matrix, base, 1, body)?;
-                let min = self.bitcast_f32(e, body, min_word);
+                let scale = self.load_word_f32(e, matrix, base, 0, body)?;
+                let min = self.load_word_f32(e, matrix, base, 1, body)?;
                 let quant = self.affine_nibble(e, matrix, base, q, nibble, body)?;
                 let quant_f = self.as_f32(e, body, quant);
                 let scaled = self.mul(e, body, quant_f, scale);
@@ -163,10 +160,8 @@ impl<'a> Lowerer<'a> {
         q: Handle<Expression>,
         body: &mut Block,
     ) -> Result<Handle<Expression>, LowerError> {
-        let d_word = self.load_word(e, matrix, base, 20, body)?;
-        let d = self.bitcast_f32(e, body, d_word);
-        let dmin_word = self.load_word(e, matrix, base, 21, body)?;
-        let dmin = self.bitcast_f32(e, body, dmin_word);
+        let d = self.load_word_f32(e, matrix, base, 20, body)?;
+        let dmin = self.load_word_f32(e, matrix, base, 21, body)?;
         let group = self.shr_lit(e, body, q, 4);
         let scale_byte = self.load_byte_dynamic(e, matrix, base, group, 0, body)?;
         let scale_quant = self.and_lit(e, body, scale_byte, 0x0f);
@@ -188,8 +183,7 @@ impl<'a> Lowerer<'a> {
         q: Handle<Expression>,
         body: &mut Block,
     ) -> Result<Handle<Expression>, LowerError> {
-        let d_word = self.load_word(e, matrix, base, 27, body)?;
-        let d = self.bitcast_f32(e, body, d_word);
+        let d = self.load_word_f32(e, matrix, base, 27, body)?;
         let group = self.shr_lit(e, body, q, 4);
         let scale_quant = self.q3k_scale(e, matrix, base, group, body)?;
         let scale_quant_f = self.center_quant_by_32(e, body, scale_quant);
@@ -237,8 +231,7 @@ impl<'a> Lowerer<'a> {
         data_offset: u32,
         body: &mut Block,
     ) -> Result<Handle<Expression>, LowerError> {
-        let scale_word = self.load_word(e, matrix, base, 0, body)?;
-        let scale = self.bitcast_f32(e, body, scale_word);
+        let scale = self.load_word_f32(e, matrix, base, 0, body)?;
         let byte = self.load_byte_dynamic(e, matrix, base, q, data_offset, body)?;
         let signed = self.signed_byte_f32(e, body, byte);
         Ok(self.mul(e, body, signed, scale))
@@ -275,10 +268,8 @@ impl<'a> Lowerer<'a> {
         body: &mut Block,
         q5: bool,
     ) -> Result<Handle<Expression>, LowerError> {
-        let d_word = self.load_word(e, matrix, base, 0, body)?;
-        let d = self.bitcast_f32(e, body, d_word);
-        let dmin_word = self.load_word(e, matrix, base, 1, body)?;
-        let dmin = self.bitcast_f32(e, body, dmin_word);
+        let d = self.load_word_f32(e, matrix, base, 0, body)?;
+        let dmin = self.load_word_f32(e, matrix, base, 1, body)?;
         let group = self.shr_lit(e, body, q, 5);
         let scale_byte = self.k_scale(e, matrix, base, group, false, body)?;
         let scale_f = self.as_f32(e, body, scale_byte);
@@ -319,8 +310,7 @@ impl<'a> Lowerer<'a> {
         q: Handle<Expression>,
         body: &mut Block,
     ) -> Result<Handle<Expression>, LowerError> {
-        let d_word = self.load_word(e, matrix, base, 52, body)?;
-        let d = self.bitcast_f32(e, body, d_word);
+        let d = self.load_word_f32(e, matrix, base, 52, body)?;
         let chunk = self.shr_lit(e, body, q, 7);
         let local = self.and_lit(e, body, q, 127);
         let high_byte_index = self.and_lit(e, body, local, 31);
