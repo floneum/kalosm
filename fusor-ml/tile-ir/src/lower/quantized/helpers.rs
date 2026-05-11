@@ -587,8 +587,8 @@ impl<'a> Lowerer<'a> {
     }
 
     /// Emit `Expression::As`. Wraps the convert/no-convert variants used by
-    /// `as_i32`, `as_f32`, and `bitcast_f32`.
-    fn cast_as(
+    /// `as_i32`, `as_f32`, `bitcast_f32`, and `cast_tile_value`.
+    pub(in crate::lower) fn cast_as(
         &self,
         e: &mut Arena<Expression>,
         body: &mut Block,

@@ -100,15 +100,7 @@ impl<'a> Lowerer<'a> {
                 let value =
                     self.lower_tile_expr_lane(expressions, scratch, body, value, spill_depth)?;
                 let scalar = Self::element_scalar(*to);
-                Ok(self.emit(
-                    expressions,
-                    body,
-                    Expression::As {
-                        expr: value,
-                        kind: scalar.kind,
-                        convert: None,
-                    },
-                ))
+                Ok(self.cast_as(expressions, body, value, scalar.kind, None))
             }
             Expr::Select {
                 condition,

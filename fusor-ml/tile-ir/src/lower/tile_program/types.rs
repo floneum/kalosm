@@ -82,15 +82,7 @@ impl<'a> Lowerer<'a> {
             return value;
         }
         let scalar = Self::element_scalar(target);
-        self.emit(
-            expressions,
-            body,
-            Expression::As {
-                expr: value,
-                kind: scalar.kind,
-                convert: Some(scalar.width),
-            },
-        )
+        self.cast_as(expressions, body, value, scalar.kind, Some(scalar.width))
     }
 
     pub(in crate::lower) fn condition_value(
