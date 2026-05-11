@@ -533,36 +533,27 @@ impl<'a> Lowerer<'a> {
         Self::tile_expr_children_any(expr, Self::tile_expr_uses_f16)
     }
 
+    /// Per-node F16 check. Tree recursion happens in the caller via
+    /// `tile_expr_children_any`, so this method only inspects the element
+    /// types attached to the current node (storage views, locals, scratch,
+    /// cast destinations).
     fn tile_expr_f16_payload(expr: &Expr) -> bool {
         match expr {
-            Expr::Load(load) => {
-                let src_uses_f16 = match &load.src {
-                    LoadSource::Storage(view) => view.buffer.element == ElementType::F16,
-                    LoadSource::Quantized(_) => false,
-                };
-                src_uses_f16 || Self::tile_expr_uses_f16(&load.fill)
-            }
-            Expr::LoadLinear(load) => {
-                load.src.buffer.element == ElementType::F16
-                    || Self::tile_expr_uses_f16(&load.fill)
-            }
-            Expr::LoadWorkgroup { src, index } => {
-                src.element == ElementType::F16 || Self::tile_expr_uses_f16(index)
-            }
+            Expr::Load(load) => match &load.src {
+                LoadSource::Storage(view) => view.buffer.element == ElementType::F16,
+                LoadSource::Quantized(_) => false,
+            },
+            Expr::LoadLinear(load) => load.src.buffer.element == ElementType::F16,
+            Expr::LoadWorkgroup { src, .. } => src.element == ElementType::F16,
             Expr::LoadLocal(local) => local.element == ElementType::F16,
             Expr::Literal(value) => value.element() == ElementType::F16,
             Expr::Reduce { scratch, .. } => scratch.element == ElementType::F16,
-            Expr::Unary { .. } => false,
-            Expr::Cast { value, to } => {
-                *to == ElementType::F16 || Self::tile_expr_uses_f16(value)
-            }
-            Expr::Bitcast { value, to } => {
-                *to == ElementType::F16 || Self::tile_expr_uses_f16(value)
-            }
-            Expr::Binary { .. } => false,
-            Expr::Compare { .. } => false,
-            Expr::Select { .. } => false,
-            Expr::SubgroupReduce { .. }
+            Expr::Cast { to, .. } | Expr::Bitcast { to, .. } => *to == ElementType::F16,
+            Expr::Unary { .. }
+            | Expr::Binary { .. }
+            | Expr::Compare { .. }
+            | Expr::Select { .. }
+            | Expr::SubgroupReduce { .. }
             | Expr::QuantizedBlockLane { .. }
             | Expr::Vec4Dot { .. }
             | Expr::Compose4 { .. }
