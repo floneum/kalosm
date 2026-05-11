@@ -8,6 +8,7 @@ use crate::ir::{
     TileStmt, TileStoreStmt, TileUnaryOp, WorkgroupAxis, F32, U32,
 };
 use crate::quantized::QuantizedMatrix;
+use super::value::boxed_u32_literal;
 use super::*;
 
 macro_rules! tile_reduce_entrypoints {
@@ -81,12 +82,6 @@ fn builtin_index(builtin: Builtin) -> ScalarIndex {
 /// Boxed `f32` fill literal used by every `load*` entry point's `fill` field.
 fn f32_fill(value: f32) -> Box<Expr> {
     Box::new(Expr::Literal(TileLiteral::F32(F32Bits::new(value))))
-}
-
-/// Boxed u32 literal — the iteration counts on `Fold`/`Loop` `count` fields
-/// are always wrapped this way.
-fn boxed_u32_literal(value: u32) -> Box<Expr> {
-    Box::new(Expr::Literal(TileLiteral::U32(value)))
 }
 
 /// Unwrap an iterable of `Tile`s into the parallel `Expr` vector. Used by

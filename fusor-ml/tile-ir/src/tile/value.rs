@@ -134,8 +134,9 @@ impl<const N: usize> IntoIndex<N> for &Range<N> {
 }
 
 /// `Box<Expr::Literal(TileLiteral::U32(value)))` — the const-RHS shape every
-/// `Index op u32` overload and `index_compare` builds.
-fn boxed_u32_literal(value: u32) -> Box<Expr> {
+/// `Index op u32` overload, `index_compare`, and `Fold`/`Loop` count field
+/// builds.
+pub(super) fn boxed_u32_literal(value: u32) -> Box<Expr> {
     Box::new(Expr::Literal(TileLiteral::U32(value)))
 }
 
