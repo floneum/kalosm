@@ -305,59 +305,84 @@ impl Operation for RmsNormOperation {
         };
 
         if let Some(meta) = vec4_meta {
-            let vec_layout = tile_ir::Layout::strided(
-                tile_ir::MemoryLevel::Storage,
-                tile_ir::Shape::new([1]),
-                &[1],
-            );
-            let input_buffer = input.buffer().clone();
-            let residual_buffer = residual.map(|r| r.buffer().clone());
-            let weight_buffer = weight.buffer().clone();
-            let bias_buffer = bias.map(|b| b.buffer().clone());
-            let output_buffer = output.buffer().clone();
-            kernel_backend::run_kernel_with_hashed_cache(
+            // Collect buffers in the SAME order as the IR builder declares
+            // them (input, residual?, weight, bias?, output), so the closure
+            // can be deferred to cache-miss only.
+            let mut buffers = Vec::with_capacity(5);
+            buffers.push(input.buffer().clone());
+            if let Some(residual) = residual {
+                buffers.push(residual.buffer().clone());
+            }
+            buffers.push(weight.buffer().clone());
+            if let Some(bias) = bias {
+                buffers.push(bias.buffer().clone());
+            }
+            buffers.push(output.buffer().clone());
+
+            let has_residual = residual.is_some();
+            let has_bias = bias.is_some();
+            kernel_backend::dynamic_kernel_from_hashed_ir(
                 &graph.device(),
                 rms_norm_module_cache(),
                 kernel_label,
                 module_key,
+                buffers,
                 dispatch_size,
-                move |kb| {
-                    tile_ir_kernels::rms_norm_vec4(
-                        kb,
-                        tile_ir::KernelTensorRef::with_offset(
-                            input_buffer,
-                            vec_layout.clone(),
-                            meta.input_offset_vec,
-                        ),
-                        residual_buffer.zip(meta.residual_offset_vec).map(
-                            |(buffer, offset)| {
-                                tile_ir::KernelTensorRef::with_offset(
-                                    buffer,
-                                    vec_layout.clone(),
-                                    offset,
-                                )
-                            },
-                        ),
-                        tile_ir::KernelTensorRef::with_offset(
-                            weight_buffer,
-                            vec_layout.clone(),
-                            meta.weight_offset_vec,
-                        ),
-                        bias_buffer.zip(meta.bias_offset_vec).map(|(buffer, offset)| {
+                move || {
+                    let vec_layout = tile_ir::Layout::strided(
+                        tile_ir::MemoryLevel::Storage,
+                        tile_ir::Shape::new([1]),
+                        &[1],
+                    );
+                    let mut kb = tile_ir::KernelBuilder::<()>::new();
+                    let input_ref = tile_ir::KernelTensorRef::with_offset(
+                        (),
+                        vec_layout.clone(),
+                        meta.input_offset_vec,
+                    );
+                    let residual_ref = if has_residual {
+                        meta.residual_offset_vec.map(|offset| {
                             tile_ir::KernelTensorRef::with_offset(
-                                buffer,
+                                (),
                                 vec_layout.clone(),
                                 offset,
                             )
-                        }),
-                        tile_ir::KernelTensorRef::with_offset(
-                            output_buffer,
-                            vec_layout,
-                            meta.output_offset_vec,
-                        ),
+                        })
+                    } else {
+                        None
+                    };
+                    let weight_ref = tile_ir::KernelTensorRef::with_offset(
+                        (),
+                        vec_layout.clone(),
+                        meta.weight_offset_vec,
+                    );
+                    let bias_ref = if has_bias {
+                        meta.bias_offset_vec.map(|offset| {
+                            tile_ir::KernelTensorRef::with_offset(
+                                (),
+                                vec_layout.clone(),
+                                offset,
+                            )
+                        })
+                    } else {
+                        None
+                    };
+                    let output_ref = tile_ir::KernelTensorRef::with_offset(
+                        (),
+                        vec_layout,
+                        meta.output_offset_vec,
+                    );
+                    tile_ir_kernels::rms_norm_vec4(
+                        &mut kb,
+                        input_ref,
+                        residual_ref,
+                        weight_ref,
+                        bias_ref,
+                        output_ref,
                         meta,
                         rows,
-                    )
+                    )?;
+                    Some(kb.finish().0)
                 },
             )
         } else {

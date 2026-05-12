@@ -1,4 +1,4 @@
-use std::{hash::Hash, sync::OnceLock};
+use std::{hash::Hash, sync::{Arc, OnceLock}};
 
 use fusor_tile_ir as tile_ir;
 use fusor_tile_ir_kernels as tile_ir_kernels;
@@ -518,32 +518,49 @@ impl Operation for FlashAttentionOperation {
         let mask_tile_meta = mask_meta.clone().map(|meta| meta.tile);
         let output_tile_meta = output_meta.tile.clone();
 
-        let device_for_closure = device.clone();
-        kernel_backend::run_kernel_with_hashed_cache(
+        // Hoist params-buffer upload (decode path only) and the buffer-list
+        // collection OUTSIDE the IR-build closure so cache hits skip the
+        // entire IR construction. The closure runs only on cache miss.
+        let mut buffers: Vec<Arc<wgpu::Buffer>> = Vec::with_capacity(6);
+        buffers.push(q_buffer.clone());
+        buffers.push(k_buffer.clone());
+        buffers.push(v_buffer.clone());
+        if let Some(mask_buf) = mask_buffer.as_ref() {
+            buffers.push(mask_buf.clone());
+        }
+        buffers.push(output_buffer.clone());
+        if let Some(meta) = decode_meta {
+            let params = [meta.active_kv_len, 0, 0, 0];
+            let params_buffer = device.create_buffer_init(
+                bytemuck::cast_slice(&params),
+                wgpu::BufferUsages::STORAGE
+                    | wgpu::BufferUsages::COPY_DST
+                    | wgpu::BufferUsages::COPY_SRC,
+            );
+            buffers.push(params_buffer);
+        }
+
+        kernel_backend::dynamic_kernel_from_hashed_ir(
             &device,
             flash_attention_module_cache(),
             kernel_label,
             module_key,
+            buffers,
             dispatch_size,
-            move |kb| {
-                let q_ref = tile_ir::KernelTensorRef::new(q_buffer, layout.clone());
-                let k_ref = tile_ir::KernelTensorRef::new(k_buffer, layout.clone());
-                let v_ref = tile_ir::KernelTensorRef::new(v_buffer, layout.clone());
+            move || {
+                let mut kb = tile_ir::KernelBuilder::<()>::new();
+                let q_ref = tile_ir::KernelTensorRef::new((), layout.clone());
+                let k_ref = tile_ir::KernelTensorRef::new((), layout.clone());
+                let v_ref = tile_ir::KernelTensorRef::new((), layout.clone());
                 let mask_ref = mask_buffer
-                    .map(|buf| tile_ir::KernelTensorRef::new(buf, layout.clone()));
-                let output_ref =
-                    tile_ir::KernelTensorRef::new(output_buffer, layout.clone());
-                if let Some(meta) = decode_meta {
-                    let params = [meta.active_kv_len, 0, 0, 0];
-                    let params_buffer = device_for_closure.create_buffer_init(
-                        bytemuck::cast_slice(&params),
-                        wgpu::BufferUsages::STORAGE
-                            | wgpu::BufferUsages::COPY_DST
-                            | wgpu::BufferUsages::COPY_SRC,
-                    );
-                    let params_ref = tile_ir::KernelTensorRef::new(params_buffer, layout);
+                    .as_ref()
+                    .map(|_| tile_ir::KernelTensorRef::new((), layout.clone()));
+                let output_ref = tile_ir::KernelTensorRef::new((), layout.clone());
+                let result = if let Some(meta) = decode_meta {
+                    let params_ref =
+                        tile_ir::KernelTensorRef::new((), layout.clone());
                     tile_ir_kernels::flash_decode_small(
-                        kb, q_ref, k_ref, v_ref, output_ref, params_ref, meta,
+                        &mut kb, q_ref, k_ref, v_ref, output_ref, params_ref, meta,
                     )
                 } else {
                     let stream_meta = tile_ir_kernels::FlashAttentionMeta {
@@ -558,14 +575,16 @@ impl Operation for FlashAttentionOperation {
                     };
                     match input_dtype {
                         DataTypeEnum::F32 => tile_ir_kernels::flash_attention::<tile_ir::F32, _>(
-                            kb, q_ref, k_ref, v_ref, mask_ref, output_ref, stream_meta,
+                            &mut kb, q_ref, k_ref, v_ref, mask_ref, output_ref, stream_meta,
                         ),
                         DataTypeEnum::F16 => tile_ir_kernels::flash_attention::<tile_ir::F16, _>(
-                            kb, q_ref, k_ref, v_ref, mask_ref, output_ref, stream_meta,
+                            &mut kb, q_ref, k_ref, v_ref, mask_ref, output_ref, stream_meta,
                         ),
                         _ => None,
                     }
-                }
+                }?;
+                let _ = result;
+                Some(kb.finish().0)
             },
         )
     }
