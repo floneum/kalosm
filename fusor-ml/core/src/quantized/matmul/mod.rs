@@ -328,9 +328,10 @@ pub(crate) struct QMatMulOperation {
     pub(crate) out_shape: Box<[usize]>,
 }
 
-/// Paired-activation quantized matmul: produces `[gate; up]` columns and applies
-/// `activation.apply(gate, up)` to emit one output column per pair. Replaces
-/// the SwiGLU-specific operation with a pluggable activation parameter.
+/// Paired-epilogue quantized matmul: produces `[gate; up]` columns and applies
+/// `epilogue.apply(gate, up)` to emit one output column per pair. The epilogue
+/// is an arbitrary tile-IR closure; cache identity is derived from the
+/// structural hash of its produced Expr tree.
 #[derive(Debug, Clone)]
 pub(crate) struct QMatMulPairedOperation {
     pub(crate) input_datatype: DataTypeEnum,
@@ -339,7 +340,7 @@ pub(crate) struct QMatMulPairedOperation {
     pub(crate) in_shape: Box<[usize]>,
     pub(crate) out_shape: Box<[usize]>,
     pub(crate) pair_len: usize,
-    pub(crate) activation: tile_ir_kernels::PairedActivation,
+    pub(crate) epilogue: tile_ir_kernels::PairedEpilogue,
 }
 
 impl QMatMulPairedOperation {
@@ -349,7 +350,7 @@ impl QMatMulPairedOperation {
         input: NodeIndex,
         matrix: QMatrix,
         pair_len: usize,
-        activation: tile_ir_kernels::PairedActivation,
+        epilogue: tile_ir_kernels::PairedEpilogue,
     ) -> Self {
         let last_dim = input_shape.len() - 1;
         let mut out_shape = input_shape.to_vec();
@@ -364,7 +365,7 @@ impl QMatMulPairedOperation {
             in_shape: input_shape.into(),
             out_shape,
             pair_len,
-            activation,
+            epilogue,
         }
     }
 
@@ -699,16 +700,13 @@ impl<const R: usize> Tensor<R, f32> {
         self.add_q_mat_mul(other)
     }
 
-    pub fn q_mat_mul_swiglu(&self, other: &QMatrix, pair_len: usize) -> Self {
-        self.add_q_mat_mul_paired(other, pair_len, tile_ir_kernels::PairedActivation::SwiGLU)
-    }
-
-    pub fn q_mat_mul_geglu(&self, other: &QMatrix, pair_len: usize) -> Self {
-        self.add_q_mat_mul_paired(other, pair_len, tile_ir_kernels::PairedActivation::GeGLU)
-    }
-
-    pub fn q_mat_mul_reglu(&self, other: &QMatrix, pair_len: usize) -> Self {
-        self.add_q_mat_mul_paired(other, pair_len, tile_ir_kernels::PairedActivation::ReGLU)
+    pub fn q_mat_mul_paired(
+        &self,
+        other: &QMatrix,
+        pair_len: usize,
+        epilogue: tile_ir_kernels::PairedEpilogue,
+    ) -> Self {
+        self.add_q_mat_mul_paired(other, pair_len, epilogue)
     }
 }
 
@@ -922,17 +920,6 @@ impl Operation for QMatMulOperation {
     }
 }
 
-/// Distinct hash perturbation per paired activation so the pipeline cache key
-/// (which already mixes `pair_len`) doesn't alias kernels for different
-/// activations on the same shape.
-fn activation_cache_salt(activation: tile_ir_kernels::PairedActivation) -> u32 {
-    match activation {
-        tile_ir_kernels::PairedActivation::SwiGLU => 0,
-        tile_ir_kernels::PairedActivation::GeGLU => 0x4000_0000,
-        tile_ir_kernels::PairedActivation::ReGLU => 0x8000_0000,
-    }
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Q4KPairedTile {
     X4x1,
@@ -991,11 +978,11 @@ impl Q4KPairedTile {
         pair_len: u32,
         m: u32,
         workgroups_x: u32,
-        activation: tile_ir_kernels::PairedActivation,
+        epilogue: &tile_ir_kernels::PairedEpilogue,
     ) {
         macro_rules! emit_tile {
             ($func:path) => {
-                $func(phase, a, b, y, pair_len, m, workgroups_x, activation)
+                $func(phase, a, b, y, pair_len, m, workgroups_x, epilogue)
             };
         }
 
@@ -1081,19 +1068,22 @@ impl Operation for QMatMulPairedOperation {
             return None;
         }
 
-        let activation = self.activation;
-        let pipeline_key = QMatMulDirectPipelineKey::new(
+        let epilogue = self.epilogue.clone();
+        let epilogue_identity = epilogue.identity();
+        let epilogue_label = epilogue.label();
+        let pipeline_key = QMatMulDirectPipelineKey::new_with_epilogue(
             matrix.datatype(),
             m,
             k,
-            pair_len.wrapping_add(activation_cache_salt(activation)),
+            pair_len,
+            epilogue_identity,
             dispatch_size,
             input.layout(),
             output.layout(),
         );
         let kernel_name = self.name();
         let cache_key = format!(
-            "{kernel_name}:direct:{format:?}:tile={tile_name}:m={m}:k={k}:pair={pair_len}:act={activation:?}:dispatch={dispatch_size:?}:{:?}:{:?}",
+            "{kernel_name}:direct:{format:?}:tile={tile_name}:m={m}:k={k}:pair={pair_len}:epilogue={epilogue_label}#{epilogue_identity:#018x}:dispatch={dispatch_size:?}:{:?}:{:?}",
             input.layout(),
             output.layout()
         );
@@ -1112,7 +1102,7 @@ impl Operation for QMatMulPairedOperation {
                     let a = tile_storage_read_with_direct_layout(phase, a_view);
                     let b = tile_ir_kernels::quantized_matrix(phase, format, k, pair_len * 2);
                     let y = tile_storage_write_with_direct_layout(phase, y_view);
-                    tile.emit(phase, &a, &b, &y, pair_len, m, workgroups_x, activation);
+                    tile.emit(phase, &a, &b, &y, pair_len, m, workgroups_x, &epilogue);
                 }))
             },
         )
@@ -1128,7 +1118,7 @@ impl Operation for QMatMulPairedOperation {
 
     fn name(&self) -> String {
         qmatmul_operation_name(
-            self.activation.label(),
+            self.epilogue.label(),
             self.input_datatype,
             &self.in_shape,
             &self.matrix,

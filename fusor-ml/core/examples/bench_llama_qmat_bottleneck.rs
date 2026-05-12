@@ -110,7 +110,7 @@ fn run_batch(
     let mut keys = Vec::with_capacity(dispatches);
     for _ in 0..dispatches {
         let output = if swiglu {
-            input.q_mat_mul_swiglu(weight, N / 2)
+            input.q_mat_mul_paired(weight, N / 2, fusor_core::PairedEpilogue::swiglu())
         } else {
             input.q_mat_mul(weight)
         };

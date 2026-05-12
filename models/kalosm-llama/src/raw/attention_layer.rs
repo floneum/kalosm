@@ -161,27 +161,26 @@ impl<F: FloatDataType + SimdElement> LlamaFeedForward<F> {
 
         let [_b_sz, _seq_len, _hidden] = x.shape();
         let up_result = if let Some(gate_up) = &self.gate_up {
-            let no_bias = self.gate_bias.is_none() && self.up_bias.is_none();
-            if no_bias && self.gate_len == self.up_len {
-                x_f32.q_mat_mul_swiglu(gate_up, self.gate_len)
-            } else {
-                let gate_up_states = x_f32.q_mat_mul(gate_up);
-                let mut w1 = gate_up_states
-                    .narrow(D::Minus1, 0, self.gate_len)
-                    .to_concrete();
-                let mut w3 = gate_up_states
-                    .narrow(D::Minus1, self.gate_len, self.up_len)
-                    .to_concrete();
-                if let Some(ref bias) = self.gate_bias {
-                    let bias_f32: Tensor<1, f32> = bias.cast();
-                    w1 = w1.add_(&bias_f32);
-                }
-                if let Some(ref bias) = self.up_bias {
-                    let bias_f32: Tensor<1, f32> = bias.cast();
-                    w3 = w3.add_(&bias_f32);
-                }
-                (w1.silu() * w3).to_concrete()
+            // Natural unfused source. When gate/up lengths match and no biases
+            // are present, the compute-graph fuser auto-detects the paired
+            // `silu(gate) * up` pattern and rewrites this to a single
+            // QMatMulPaired kernel that applies the epilogue in-register.
+            let gate_up_states = x_f32.q_mat_mul(gate_up);
+            let mut w1 = gate_up_states
+                .narrow(D::Minus1, 0, self.gate_len)
+                .to_concrete();
+            let mut w3 = gate_up_states
+                .narrow(D::Minus1, self.gate_len, self.up_len)
+                .to_concrete();
+            if let Some(ref bias) = self.gate_bias {
+                let bias_f32: Tensor<1, f32> = bias.cast();
+                w1 = w1.add_(&bias_f32);
             }
+            if let Some(ref bias) = self.up_bias {
+                let bias_f32: Tensor<1, f32> = bias.cast();
+                w3 = w3.add_(&bias_f32);
+            }
+            (w1.silu() * w3).to_concrete()
         } else {
             let gate = self
                 .gate

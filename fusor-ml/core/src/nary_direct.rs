@@ -446,6 +446,39 @@ fn emit_function<const N: usize>(
     }
 }
 
+/// Evaluate a tile-evaluatable `NaryExpr` (no DimIndex, only element-wise
+/// IndexedInput leaves) over a vector of pre-loaded tile values. Used by the
+/// resolver to re-emit captured tensor-level expressions at the tile-IR level
+/// when fusing into kernels that materialize inputs in-register (e.g. the
+/// qgemv paired epilogue).
+pub(crate) fn eval_nary_expr_on_tiles<const N: usize>(
+    expr: &NaryExpr,
+    inputs: &[(tile_ir::tile::Tile<N>, DataTypeEnum)],
+    output_dtype: DataTypeEnum,
+) -> (tile_ir::tile::Tile<N>, DataTypeEnum) {
+    match expr {
+        NaryExpr::Op { children, function } => {
+            let mut values = children
+                .iter()
+                .zip(&function.input_types)
+                .map(|(child, expected)| {
+                    let (value, ty) = eval_nary_expr_on_tiles(child, inputs, output_dtype);
+                    (cast_tile(value, ty, *expected), *expected)
+                })
+                .collect::<Vec<_>>();
+            (emit_function(function, &mut values), function.output_type)
+        }
+        NaryExpr::IndexedInput { input_idx, .. } => {
+            let (tile, ty) = inputs[*input_idx].clone();
+            (tile, ty)
+        }
+        NaryExpr::Scalar(value) => (tile_literal(*value), value.datatype()),
+        NaryExpr::DimIndex(_) => {
+            panic!("eval_nary_expr_on_tiles called with a DimIndex leaf — not supported");
+        }
+    }
+}
+
 pub(crate) fn apply_unary_function_chain<const N: usize>(
     mut value: tile_ir::tile::Tile<N>,
     mut value_ty: DataTypeEnum,

@@ -465,6 +465,76 @@ impl NaryOperation {
             NaryExpr::DimIndex(_) | NaryExpr::Scalar(_) => None,
         }
     }
+
+    /// Recognize a binary tile-IR-evaluatable expression over exactly two inputs
+    /// `act(input_a, input_b)` where both inputs are accessed element-wise. The
+    /// resolver uses this to auto-detect any `q_mat_mul → split → epilogue`
+    /// FFN pattern, without enumerating specific activations like SiLU/GELU.
+    pub(crate) fn try_extract_paired_split(&self) -> Option<ExtractedPairedSplit> {
+        if self.inputs.len() != 2 {
+            return None;
+        }
+        if !Self::expr_is_tile_evaluatable(&self.expression) {
+            return None;
+        }
+        // Both inputs must be referenced at least once with element-wise access
+        // so the qgemv kernel can substitute the gate/up tiles directly.
+        let mut input_seen = [false; 2];
+        Self::collect_input_usage(&self.expression, &mut input_seen)?;
+        if !input_seen[0] || !input_seen[1] {
+            return None;
+        }
+        Some(ExtractedPairedSplit {
+            input_a: self.inputs[0],
+            input_b: self.inputs[1],
+            expression: self.expression.clone(),
+            output_datatype: self.output_datatype,
+        })
+    }
+
+    /// An expression is tile-evaluatable when every input access is
+    /// element-wise (no custom indexing), and the structure uses only
+    /// `Op` / `IndexedInput` / `Scalar` nodes — no DimIndex (which would
+    /// require knowing the current output coordinate inside the qgemv kernel).
+    fn expr_is_tile_evaluatable(expr: &NaryExpr) -> bool {
+        match expr {
+            NaryExpr::Op { children, .. } => children.iter().all(Self::expr_is_tile_evaluatable),
+            NaryExpr::IndexedInput { indices, .. } => NaryExpr::is_elementwise_indices(indices),
+            NaryExpr::Scalar(_) => true,
+            NaryExpr::DimIndex(_) => false,
+        }
+    }
+
+    fn collect_input_usage(expr: &NaryExpr, seen: &mut [bool; 2]) -> Option<()> {
+        match expr {
+            NaryExpr::Op { children, .. } => {
+                for child in children {
+                    Self::collect_input_usage(child, seen)?;
+                }
+                Some(())
+            }
+            NaryExpr::IndexedInput { input_idx, .. } => {
+                if *input_idx >= 2 {
+                    return None;
+                }
+                seen[*input_idx] = true;
+                Some(())
+            }
+            NaryExpr::Scalar(_) => Some(()),
+            NaryExpr::DimIndex(_) => None,
+        }
+    }
+}
+
+/// Result of extracting a paired-split FFN pattern from an NaryOperation. The
+/// expression is preserved verbatim — the resolver re-emits it at the tile-IR
+/// level inside the qgemv kernel, substituting the actual `gate` / `up` tile
+/// values for each `IndexedInput` leaf.
+pub(crate) struct ExtractedPairedSplit {
+    pub(crate) input_a: NodeIndex,
+    pub(crate) input_b: NodeIndex,
+    pub(crate) expression: NaryExpr,
+    pub(crate) output_datatype: DataTypeEnum,
 }
 
 impl Operation for NaryOperation {

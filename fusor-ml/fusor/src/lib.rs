@@ -113,7 +113,7 @@ pub use fusor_core::Tensor as GpuTensor;
 pub use fusor_core::{
     CastTensor, D, DataType, Dim, FloatDataType, GgufReadError, GpuMirostat2Sampler,
     GpuMirostat2SamplerParams, LastRank, LastRankInner, MaxRank, NextRank, NextRankInner,
-    NodeIndex, SmallerRank, WasmNotSend, WasmNotSync,
+    NodeIndex, PairedEpilogue, PairedEpiloguePreset, SmallerRank, WasmNotSend, WasmNotSync,
 };
 
 /// Runtime dispatch wrapper - holds either CPU or GPU version of an operation/tensor type.
@@ -1225,36 +1225,32 @@ where
         }
     }
 
-    pub fn q_mat_mul_swiglu(&self, weights: &crate::QMatrix, pair_len: usize) -> Tensor<R, f32> {
-        self.q_mat_mul_paired(weights, pair_len, fusor_core::PairedActivation::SwiGLU)
-    }
-
-    pub fn q_mat_mul_geglu(&self, weights: &crate::QMatrix, pair_len: usize) -> Tensor<R, f32> {
-        self.q_mat_mul_paired(weights, pair_len, fusor_core::PairedActivation::GeGLU)
-    }
-
-    pub fn q_mat_mul_reglu(&self, weights: &crate::QMatrix, pair_len: usize) -> Tensor<R, f32> {
-        self.q_mat_mul_paired(weights, pair_len, fusor_core::PairedActivation::ReGLU)
-    }
-
-    fn q_mat_mul_paired(
+    pub fn q_mat_mul_paired(
         &self,
         weights: &crate::QMatrix,
         pair_len: usize,
-        activation: fusor_core::PairedActivation,
+        epilogue: fusor_core::PairedEpilogue,
     ) -> Tensor<R, f32> {
         use crate::{D, QMatrix};
 
         let fallback = || {
+            let preset = epilogue.cpu_preset().unwrap_or_else(|| {
+                panic!(
+                    "PairedEpilogue '{}' has no CPU evaluator; arbitrary tile-IR \
+                     epilogues currently run only on the Q4K GPU paired kernel. \
+                     Use a preset (swiglu/geglu/reglu) or ensure GPU + Q4K weights.",
+                    epilogue.label()
+                )
+            });
             let projected = self.q_mat_mul(weights);
             let gate = projected.narrow(D::Minus1, 0, pair_len).to_concrete();
             let up = projected
                 .narrow(D::Minus1, pair_len, pair_len)
                 .to_concrete();
-            let activated = match activation {
-                fusor_core::PairedActivation::SwiGLU => gate.silu(),
-                fusor_core::PairedActivation::GeGLU => gate.gelu(),
-                fusor_core::PairedActivation::ReGLU => gate.relu(),
+            let activated = match preset {
+                fusor_core::PairedEpiloguePreset::SwiGLU => gate.silu(),
+                fusor_core::PairedEpiloguePreset::GeGLU => gate.gelu(),
+                fusor_core::PairedEpiloguePreset::ReGLU => gate.relu(),
             };
             (activated * up).to_concrete()
         };
@@ -1274,11 +1270,7 @@ where
             (Tensor::Gpu(lhs), QMatrix::Gpu(rhs))
                 if weights.ggml_type() == fusor_gguf::GgmlType::Q4K =>
             {
-                Tensor::Gpu(match activation {
-                    fusor_core::PairedActivation::SwiGLU => lhs.q_mat_mul_swiglu(rhs, pair_len),
-                    fusor_core::PairedActivation::GeGLU => lhs.q_mat_mul_geglu(rhs, pair_len),
-                    fusor_core::PairedActivation::ReGLU => lhs.q_mat_mul_reglu(rhs, pair_len),
-                })
+                Tensor::Gpu(lhs.q_mat_mul_paired(rhs, pair_len, epilogue))
             }
             (Tensor::Cpu(_), _) => fallback(),
             (Tensor::Gpu(_), QMatrix::Gpu(_)) => fallback(),

@@ -380,6 +380,27 @@ impl<const N: usize> Tile<N> {
         }
     }
 
+    /// Stable structural hash of this tile's expression tree. Used by host-time
+    /// builders (e.g. matmul-epilogue cache keys) to key kernel pipelines on the
+    /// resulting AST without depending on closure identity. Two tiles with
+    /// identical Debug forms hash equal; two tiles with structurally distinct
+    /// expressions hash distinct.
+    pub fn signature_hash(&self) -> u64 {
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+        let mut hasher = DefaultHasher::new();
+        format!("{:?}", self.expr).hash(&mut hasher);
+        hasher.finish()
+    }
+
+    /// Re-tag the BLOCK marker. `Tile<N>` is a `Expr` wrapper with no runtime
+    /// state beyond the expression itself, so this is a host-time shape cast
+    /// only — useful when threading a tile through a generic closure that
+    /// erases the const.
+    pub fn retag_block<const M: usize>(self) -> Tile<M> {
+        Tile { expr: self.expr }
+    }
+
     pub fn unary(self, op: TileUnaryOp) -> Self {
         Self {
             expr: Expr::Unary {

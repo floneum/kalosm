@@ -21,6 +21,10 @@ pub(crate) struct QMatMulDirectPipelineKey {
     m: u32,
     k: u32,
     n: u32,
+    // Structural hash of an attached epilogue (e.g. paired-matmul activation).
+    // Zero for plain qmatmul; non-zero values disambiguate kernels whose only
+    // difference is the in-register epilogue.
+    epilogue_identity: u64,
     dispatch_size: [u32; 3],
     input_layout: QMatMulDirectLayoutKey,
     output_layout: QMatMulDirectLayoutKey,
@@ -36,11 +40,25 @@ impl QMatMulDirectPipelineKey {
         input_layout: &Layout,
         output_layout: &Layout,
     ) -> Self {
+        Self::new_with_epilogue(format, m, k, n, 0, dispatch_size, input_layout, output_layout)
+    }
+
+    pub(crate) fn new_with_epilogue(
+        format: GgmlType,
+        m: u32,
+        k: u32,
+        n: u32,
+        epilogue_identity: u64,
+        dispatch_size: [u32; 3],
+        input_layout: &Layout,
+        output_layout: &Layout,
+    ) -> Self {
         Self {
             format: format as u8,
             m,
             k,
             n,
+            epilogue_identity,
             dispatch_size,
             input_layout: QMatMulDirectLayoutKey::new(input_layout),
             output_layout: QMatMulDirectLayoutKey::new(output_layout),

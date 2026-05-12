@@ -838,7 +838,7 @@ impl<D: DataType, const R: usize> Tensor<R, D> {
         &self,
         other: &QMatrix,
         pair_len: usize,
-        activation: fusor_tile_ir_kernels::PairedActivation,
+        epilogue: fusor_tile_ir_kernels::PairedEpilogue,
     ) -> Self {
         let operation = QMatMulPairedOperation::new(
             self.datatype(),
@@ -846,7 +846,7 @@ impl<D: DataType, const R: usize> Tensor<R, D> {
             self.data.key,
             other.clone(),
             pair_len,
-            activation,
+            epilogue,
         );
 
         Self::from_parts(self.data.q_mat_mul_paired(operation))
