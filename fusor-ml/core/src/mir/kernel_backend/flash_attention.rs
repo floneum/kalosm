@@ -1,4 +1,7 @@
-use std::{hash::Hash, sync::{Arc, OnceLock}};
+use std::{
+    hash::Hash,
+    sync::{Arc, OnceLock},
+};
 
 use fusor_tile_ir as tile_ir;
 use fusor_tile_ir_kernels as tile_ir_kernels;
@@ -557,8 +560,7 @@ impl Operation for FlashAttentionOperation {
                     .map(|_| tile_ir::KernelTensorRef::new((), layout.clone()));
                 let output_ref = tile_ir::KernelTensorRef::new((), layout.clone());
                 let result = if let Some(meta) = decode_meta {
-                    let params_ref =
-                        tile_ir::KernelTensorRef::new((), layout.clone());
+                    let params_ref = tile_ir::KernelTensorRef::new((), layout.clone());
                     tile_ir_kernels::flash_decode_small(
                         &mut kb, q_ref, k_ref, v_ref, output_ref, params_ref, meta,
                     )
@@ -575,10 +577,22 @@ impl Operation for FlashAttentionOperation {
                     };
                     match input_dtype {
                         DataTypeEnum::F32 => tile_ir_kernels::flash_attention::<tile_ir::F32, _>(
-                            &mut kb, q_ref, k_ref, v_ref, mask_ref, output_ref, stream_meta,
+                            &mut kb,
+                            q_ref,
+                            k_ref,
+                            v_ref,
+                            mask_ref,
+                            output_ref,
+                            stream_meta,
                         ),
                         DataTypeEnum::F16 => tile_ir_kernels::flash_attention::<tile_ir::F16, _>(
-                            &mut kb, q_ref, k_ref, v_ref, mask_ref, output_ref, stream_meta,
+                            &mut kb,
+                            q_ref,
+                            k_ref,
+                            v_ref,
+                            mask_ref,
+                            output_ref,
+                            stream_meta,
                         ),
                         _ => None,
                     }

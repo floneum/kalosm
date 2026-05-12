@@ -1,8 +1,7 @@
-
 use std::marker::PhantomData;
 
-use crate::ir::{AxisGroup, Layout, MultiFlattenMap, Shape, StorageView, SubAxis};
 use super::*;
+use crate::ir::{AxisGroup, Layout, MultiFlattenMap, Shape, StorageView, SubAxis};
 
 pub struct Storage<T, const R: usize> {
     pub(crate) view: StorageView,
@@ -105,10 +104,7 @@ impl<T, const R: usize> Storage<T, R> {
     /// Fuse adjacent axes into groups, lowering rank from `R` to `R2` via
     /// divmod indexing. `groups[i]` lists the source axes (most-significant
     /// first) of output axis `i`.
-    pub fn flatten_axes<const R2: usize>(
-        &self,
-        groups: [&[usize]; R2],
-    ) -> Storage<T, R2> {
+    pub fn flatten_axes<const R2: usize>(&self, groups: [&[usize]; R2]) -> Storage<T, R2> {
         assert!(
             self.view.layout.is_affine(),
             "flatten_axes source must be an affine view",

@@ -108,4 +108,3 @@ pub struct QuantizedMatrix {
     pub rows: u32,
     pub cols: u32,
 }
-

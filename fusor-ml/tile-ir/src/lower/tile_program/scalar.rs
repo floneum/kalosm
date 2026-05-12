@@ -13,10 +13,7 @@ impl<'a> Lowerer<'a> {
     ) -> Result<Handle<Expression>, LowerError> {
         let element = value.element();
         let acc = self.tile_expr_spill_local(scratch, element, 0)?;
-        let initial = expressions.append(
-            Self::tile_reduce_identity(op, element),
-            Span::default(),
-        );
+        let initial = expressions.append(Self::tile_reduce_identity(op, element), Span::default());
         self.store_local(expressions, body, acc, initial);
 
         self.emit_counted_loop(
@@ -87,12 +84,10 @@ impl<'a> Lowerer<'a> {
         );
 
         let (compare_index, result_index) = if group_size == self.workgroup_invocations {
-            let zero =
-                self.u32(expressions, 0);
+            let zero = self.u32(expressions, 0);
             (lane, zero)
         } else {
-            let group_offset =
-                self.mod_literal_u32_emitted(expressions, lane, group_size, body);
+            let group_offset = self.mod_literal_u32_emitted(expressions, lane, group_size, body);
             let group_base = self.emit(
                 expressions,
                 body,
@@ -150,8 +145,7 @@ impl<'a> Lowerer<'a> {
         let mut body = Block::new();
         let rhs_index = self.add_literal_u32_emitted(expressions, lane, stride, &mut body);
         let lhs_ptr = self.tile_dynamic_pointer(expressions, scratch_tile, lane, &mut body)?;
-        let rhs_ptr =
-            self.tile_dynamic_pointer(expressions, scratch_tile, rhs_index, &mut body)?;
+        let rhs_ptr = self.tile_dynamic_pointer(expressions, scratch_tile, rhs_index, &mut body)?;
         let lhs = Self::emit_load(expressions, &mut body, lhs_ptr);
         let rhs = Self::emit_load(expressions, &mut body, rhs_ptr);
         let reduced = self.emit(
@@ -220,5 +214,4 @@ impl<'a> Lowerer<'a> {
         );
         Ok(result)
     }
-
 }

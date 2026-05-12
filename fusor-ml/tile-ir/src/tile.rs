@@ -9,6 +9,6 @@ pub use grid::build;
 pub use program::Program;
 pub use storage::{ErasedStorage, Storage};
 pub use value::{
-    range, Address, CoopAcc, CoopFragment, ErasedAddress, FoldIter, IntoIndex, LaneTile2d,
-    LinearAddress, Local, Mask, Bound, Range, Scalar, ScalarIndex, Tile,
+    range, Address, Bound, CoopAcc, CoopFragment, ErasedAddress, FoldIter, IntoIndex, LaneTile2d,
+    LinearAddress, Local, Mask, Range, Scalar, ScalarIndex, Tile,
 };

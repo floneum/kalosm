@@ -1,5 +1,5 @@
-use crate::ir::KernelIr;
 use super::*;
+use crate::ir::KernelIr;
 
 pub fn build(f: impl FnOnce(&mut Program)) -> KernelIr {
     let mut program = Program::new();

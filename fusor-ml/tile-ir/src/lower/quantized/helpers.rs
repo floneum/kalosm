@@ -655,7 +655,15 @@ impl<'a> Lowerer<'a> {
         kind: ScalarKind,
         convert: Option<naga::Bytes>,
     ) -> Handle<Expression> {
-        self.emit(e, body, Expression::As { expr: value, kind, convert })
+        self.emit(
+            e,
+            body,
+            Expression::As {
+                expr: value,
+                kind,
+                convert,
+            },
+        )
     }
 
     /// Append an `Expression::LocalVariable` reference. LocalVariable
@@ -693,15 +701,27 @@ impl<'a> Lowerer<'a> {
         body.push(Statement::Store { pointer, value }, Span::default());
     }
 
-    pub(in crate::lower) fn u32(&self, e: &mut Arena<Expression>, value: u32) -> Handle<Expression> {
+    pub(in crate::lower) fn u32(
+        &self,
+        e: &mut Arena<Expression>,
+        value: u32,
+    ) -> Handle<Expression> {
         e.append(Expression::Literal(Literal::U32(value)), Span::default())
     }
 
-    pub(in crate::lower) fn i32(&self, e: &mut Arena<Expression>, value: i32) -> Handle<Expression> {
+    pub(in crate::lower) fn i32(
+        &self,
+        e: &mut Arena<Expression>,
+        value: i32,
+    ) -> Handle<Expression> {
         e.append(Expression::Literal(Literal::I32(value)), Span::default())
     }
 
-    pub(in crate::lower) fn f32(&self, e: &mut Arena<Expression>, value: f32) -> Handle<Expression> {
+    pub(in crate::lower) fn f32(
+        &self,
+        e: &mut Arena<Expression>,
+        value: f32,
+    ) -> Handle<Expression> {
         e.append(Expression::Literal(Literal::F32(value)), Span::default())
     }
 }

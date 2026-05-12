@@ -13,8 +13,7 @@ impl<'a> Lowerer<'a> {
         let block_words = matrix.format.block_words();
         let block = self.div_literal_u32_emitted(expressions, k, block_elems, body);
         let q = self.and_lit(expressions, body, k, block_elems - 1);
-        let base =
-            self.quantized_block_base(expressions, matrix, block, col, block_words, body);
+        let base = self.quantized_block_base(expressions, matrix, block, col, block_words, body);
         let value = if let Some(spec) = AffineDequantSpec::for_format(matrix.format) {
             self.dequant_affine(expressions, matrix, base, q, spec, body)?
         } else {
@@ -180,13 +179,7 @@ impl<'a> Lowerer<'a> {
         let word0 = self.load_word_dynamic(expressions, matrix, base, word0_off, body)?;
         let word1 = self.load_word_dynamic(expressions, matrix, base, word1_off, body)?;
         let group_low = self.and_lit(expressions, body, group, 1);
-        let high = self.cmp_lit(
-            expressions,
-            body,
-            BinaryOperator::NotEqual,
-            group_low,
-            0,
-        );
+        let high = self.cmp_lit(expressions, body, BinaryOperator::NotEqual, group_low, 0);
 
         let mut values = Vec::with_capacity(8);
         for lane in 0..8 {
@@ -219,25 +212,12 @@ impl<'a> Lowerer<'a> {
 
         let block = self.div_literal_u32_emitted(expressions, k_base, 32, body);
         let q_base = self.and_lit(expressions, body, k_base, 31);
-        let col_block =
-            self.mul_literal_u32_emitted(expressions, col, matrix.rows / 32, body);
-        let block_index = self.bin(
-            expressions,
-            body,
-            BinaryOperator::Add,
-            col_block,
-            block,
-        );
+        let col_block = self.mul_literal_u32_emitted(expressions, col, matrix.rows / 32, body);
+        let block_index = self.bin(expressions, body, BinaryOperator::Add, col_block, block);
         let base = self.mul_literal_u32_emitted(expressions, block_index, 6, body);
         let scale = self.load_word_f32(expressions, matrix, base, 0, body)?;
         let qh = self.load_word(expressions, matrix, base, 1, body)?;
-        let high = self.cmp_lit(
-            expressions,
-            body,
-            BinaryOperator::GreaterEqual,
-            q_base,
-            16,
-        );
+        let high = self.cmp_lit(expressions, body, BinaryOperator::GreaterEqual, q_base, 16);
         let sixteen = self.u32(expressions, 16);
         let zero = self.u32(expressions, 0);
         let high_base = self.select(expressions, body, high, sixteen, zero);
@@ -255,17 +235,12 @@ impl<'a> Lowerer<'a> {
             let low = self.and_lit(expressions, body, byte, 0x0f);
             let high4 = self.shr_lit(expressions, body, byte, 4);
             let low4 = self.select(expressions, body, high, high4, low);
-            let lane_index = self.add_literal_u32_emitted(expressions, high_base, lane as u32, body);
+            let lane_index =
+                self.add_literal_u32_emitted(expressions, high_base, lane as u32, body);
             let shifted_qh = self.shr(expressions, body, qh, lane_index);
             let hi_bit_low = self.and_lit(expressions, body, shifted_qh, 1);
             let hi_bit = self.shl_lit(expressions, body, hi_bit_low, 4);
-            let quant = self.bin(
-                expressions,
-                body,
-                BinaryOperator::InclusiveOr,
-                low4,
-                hi_bit,
-            );
+            let quant = self.bin(expressions, body, BinaryOperator::InclusiveOr, low4, hi_bit);
             let quant_f = self.as_f32(expressions, body, quant);
             let center = self.f32(expressions, 16.0);
             let centered = self.sub(expressions, body, quant_f, center);
@@ -423,11 +398,9 @@ impl<'a> Lowerer<'a> {
         col: Handle<Expression>,
         body: &mut Block,
     ) -> Result<Vec<Handle<Expression>>, LowerError> {
-        let mut values =
-            self.dequantize_q6k_values8(expressions, matrix, k_base, col, body)?;
+        let mut values = self.dequantize_q6k_values8(expressions, matrix, k_base, col, body)?;
         let k_base_hi = self.add_lit(expressions, body, k_base, 8);
-        let hi_values =
-            self.dequantize_q6k_values8(expressions, matrix, k_base_hi, col, body)?;
+        let hi_values = self.dequantize_q6k_values8(expressions, matrix, k_base_hi, col, body)?;
         values.extend(hi_values);
         Ok(values)
     }
@@ -599,24 +572,17 @@ impl<'a> Lowerer<'a> {
         debug_assert_eq!(WORDS * 4, N);
         debug_assert_eq!(a.len(), N);
 
-        let block =
-            self.q4k_quant_values::<N, WORDS>(
-                expressions,
-                matrix,
-                k_base,
-                col,
-                whole_group_pair,
-                body,
-            )?;
-
-        let total = self.q4k_f32_weighted_sum(
+        let block = self.q4k_quant_values::<N, WORDS>(
             expressions,
+            matrix,
+            k_base,
+            col,
+            whole_group_pair,
             body,
-            block.scale,
-            block.min,
-            &block.data,
-            a,
-        );
+        )?;
+
+        let total =
+            self.q4k_f32_weighted_sum(expressions, body, block.scale, block.min, &block.data, a);
         Ok(total)
     }
 

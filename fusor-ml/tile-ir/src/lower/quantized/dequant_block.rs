@@ -149,7 +149,13 @@ impl<'a> Lowerer<'a> {
         let shifted = self.shr(e, body, byte, shift);
         let quant = self.and_lit(e, body, shifted, 3);
         let quant_f = self.as_f32(e, body, quant);
-        Ok(Q23KQuantParts { group_in_chunk, chunk, pair_offset, q_local, quant_f })
+        Ok(Q23KQuantParts {
+            group_in_chunk,
+            chunk,
+            pair_offset,
+            q_local,
+            quant_f,
+        })
     }
 
     pub(in crate::lower) fn dequant_q2k(

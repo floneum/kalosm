@@ -55,15 +55,42 @@ pub fn store_qgemv_sums<const BLOCK: usize, const COLS_PER_SUBGROUP: usize>(
     full_cols: bool,
     n_cols: u32,
 ) {
+    store_qgemv_sums_with_epilogue(
+        program,
+        y,
+        col0,
+        lane,
+        sums,
+        full_cols,
+        n_cols,
+        &crate::types::QmatmulEpilogues::empty(),
+    );
+}
+
+/// Variant of [`store_qgemv_sums`] that applies an optional post-reduce
+/// epilogue between the subgroup reduce and the store. Used by the resolver
+/// when it has fused a unary post-op chain into the qmatmul. The `pre` slot
+/// is ignored here (pre is applied at load sites by the kernel body).
+pub fn store_qgemv_sums_with_epilogue<const BLOCK: usize, const COLS_PER_SUBGROUP: usize>(
+    program: &mut TileBlock<'_, BLOCK>,
+    y: &Storage<F32, 2>,
+    col0: ScalarIndex,
+    lane: ScalarIndex,
+    sums: [Tile<BLOCK>; COLS_PER_SUBGROUP],
+    full_cols: bool,
+    n_cols: u32,
+    epilogues: &crate::types::QmatmulEpilogues<'_>,
+) {
     for (offset, sum) in sums.into_iter().enumerate() {
         let col = col0.clone() + offset as u32;
         let reduced = program.subgroup_reduce_sum(sum);
+        let value = crate::types::apply_optional_epilogue(epilogues.post, reduced);
         let mask = if full_cols {
             lane.eq(0)
         } else {
             lane.eq(0).and(col.lt(n_cols))
         };
-        program.store(y.at(0, col), reduced, mask);
+        program.store(y.at(0, col), value, mask);
     }
 }
 

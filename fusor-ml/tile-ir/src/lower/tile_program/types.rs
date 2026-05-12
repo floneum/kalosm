@@ -1,7 +1,10 @@
 use super::*;
 
 impl<'a> Lowerer<'a> {
-    pub(in crate::lower) fn tile_reduce_identity(op: TileReduceOp, element: ElementType) -> Expression {
+    pub(in crate::lower) fn tile_reduce_identity(
+        op: TileReduceOp,
+        element: ElementType,
+    ) -> Expression {
         let (f32_value, f16_value, u32_value, bool_value) = match op {
             TileReduceOp::Sum => (0.0_f32, 0.0_f32, 0_u32, false),
             TileReduceOp::Product => (1.0_f32, 1.0_f32, 1_u32, true),
@@ -164,7 +167,11 @@ impl<'a> Lowerer<'a> {
                 };
             }
         };
-        Expression::Binary { op: naga_op, left, right }
+        Expression::Binary {
+            op: naga_op,
+            left,
+            right,
+        }
     }
 
     pub(in crate::lower) fn tile_compare_binary(op: TileCompareOp) -> BinaryOperator {
@@ -177,5 +184,4 @@ impl<'a> Lowerer<'a> {
             TileCompareOp::Ne => BinaryOperator::NotEqual,
         }
     }
-
 }

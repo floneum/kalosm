@@ -31,14 +31,18 @@ impl<'a> Lowerer<'a> {
             return value;
         }
         if let Some(folded) = Self::u32_literal(expressions, value) {
-            return self.u32(expressions,folded + literal);
+            return self.u32(expressions, folded + literal);
         }
-        let rhs = self.u32(expressions,literal);
-        self.emit(expressions, body, Expression::Binary {
-            op: BinaryOperator::Add,
-            left: value,
-            right: rhs,
-        })
+        let rhs = self.u32(expressions, literal);
+        self.emit(
+            expressions,
+            body,
+            Expression::Binary {
+                op: BinaryOperator::Add,
+                left: value,
+                right: rhs,
+            },
+        )
     }
 
     pub(super) fn mul_literal_u32_emitted(
@@ -52,14 +56,18 @@ impl<'a> Lowerer<'a> {
             return value;
         }
         if let Some(folded) = Self::u32_literal(expressions, value) {
-            return self.u32(expressions,folded * literal);
+            return self.u32(expressions, folded * literal);
         }
-        let rhs = self.u32(expressions,literal);
-        self.emit(expressions, body, Expression::Binary {
-            op: BinaryOperator::Multiply,
-            left: value,
-            right: rhs,
-        })
+        let rhs = self.u32(expressions, literal);
+        self.emit(
+            expressions,
+            body,
+            Expression::Binary {
+                op: BinaryOperator::Multiply,
+                left: value,
+                right: rhs,
+            },
+        )
     }
 
     pub(super) fn div_literal_u32_emitted(
@@ -73,17 +81,25 @@ impl<'a> Lowerer<'a> {
             return value;
         }
         if let Some(folded) = Self::u32_literal(expressions, value) {
-            return self.u32(expressions,folded / literal);
+            return self.u32(expressions, folded / literal);
         }
         let (op, rhs) = if literal.is_power_of_two() {
             (
                 BinaryOperator::ShiftRight,
-                self.u32(expressions,literal.trailing_zeros()),
+                self.u32(expressions, literal.trailing_zeros()),
             )
         } else {
-            (BinaryOperator::Divide, self.u32(expressions,literal))
+            (BinaryOperator::Divide, self.u32(expressions, literal))
         };
-        self.emit(expressions, body, Expression::Binary { op, left: value, right: rhs })
+        self.emit(
+            expressions,
+            body,
+            Expression::Binary {
+                op,
+                left: value,
+                right: rhs,
+            },
+        )
     }
 
     pub(super) fn mod_literal_u32_emitted(
@@ -94,17 +110,24 @@ impl<'a> Lowerer<'a> {
         body: &mut Block,
     ) -> Handle<Expression> {
         if literal == 1 {
-            return self.u32(expressions,0);
+            return self.u32(expressions, 0);
         }
         if let Some(folded) = Self::u32_literal(expressions, value) {
-            return self.u32(expressions,folded % literal);
+            return self.u32(expressions, folded % literal);
         }
         let (op, rhs) = if literal.is_power_of_two() {
-            (BinaryOperator::And, self.u32(expressions,literal - 1))
+            (BinaryOperator::And, self.u32(expressions, literal - 1))
         } else {
-            (BinaryOperator::Modulo, self.u32(expressions,literal))
+            (BinaryOperator::Modulo, self.u32(expressions, literal))
         };
-        self.emit(expressions, body, Expression::Binary { op, left: value, right: rhs })
+        self.emit(
+            expressions,
+            body,
+            Expression::Binary {
+                op,
+                left: value,
+                right: rhs,
+            },
+        )
     }
-
 }

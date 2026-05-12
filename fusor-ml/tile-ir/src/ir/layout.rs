@@ -147,7 +147,11 @@ impl Layout {
     }
 
     /// Construct a layout with an explicit (possibly non-affine) indexing.
-    pub fn with_indexing(memory_level: MemoryLevel, shape: Shape, indexing: MultiFlattenMap) -> Self {
+    pub fn with_indexing(
+        memory_level: MemoryLevel,
+        shape: Shape,
+        indexing: MultiFlattenMap,
+    ) -> Self {
         assert_eq!(
             shape.rank(),
             indexing.rank(),

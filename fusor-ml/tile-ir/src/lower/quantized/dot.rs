@@ -9,7 +9,11 @@ impl<'a> Lowerer<'a> {
         activations: Q4KGgmlActivationHandles<'_>,
         body: &mut Block,
     ) -> Result<Handle<Expression>, LowerError> {
-        let Q4KGgmlActivationHandles { low: a_low, high: a_high, sums } = activations;
+        let Q4KGgmlActivationHandles {
+            low: a_low,
+            high: a_high,
+            sums,
+        } = activations;
         if matrix.format != GgmlQuantFormat::Q4K
             || a_low.len() != 16
             || a_high.len() != 16
@@ -19,7 +23,12 @@ impl<'a> Lowerer<'a> {
                 "q4k ggml dot requires Q4K, 16 low/high activations, and 4 sums",
             ));
         }
-        let GgmlBlockCoords { block, c0: iq, c1: ir, col } = coords;
+        let GgmlBlockCoords {
+            block,
+            c0: iq,
+            c1: ir,
+            col,
+        } = coords;
 
         let base = self.quantized_block_base(expressions, matrix, block, col, 37, body);
         let d = self.load_word_f32(expressions, matrix, base, 0, body)?;
@@ -72,13 +81,7 @@ impl<'a> Lowerer<'a> {
 
         let iq_words = self.shl_lit(expressions, body, iq, 3);
         let ir_words = self.shl_lit(expressions, body, ir, 1);
-        let data_offset = self.bin(
-            expressions,
-            body,
-            BinaryOperator::Add,
-            iq_words,
-            ir_words,
-        );
+        let data_offset = self.bin(expressions, body, BinaryOperator::Add, iq_words, ir_words);
 
         let mut first_sums = [self.f32(expressions, 0.0); 4];
         let mut second_sums = [self.f32(expressions, 0.0); 4];
@@ -119,11 +122,8 @@ impl<'a> Lowerer<'a> {
             body,
             [first_sums[1], first_sums[3], second_sums[1], second_sums[3]],
         );
-        let inv_256_vec = self.compose_f32_vec4(
-            expressions,
-            body,
-            [inv_256, inv_256, inv_256, inv_256],
-        );
+        let inv_256_vec =
+            self.compose_f32_vec4(expressions, body, [inv_256, inv_256, inv_256, inv_256]);
         let large_shift_sums = self.mul(expressions, body, large_shift_sums, inv_256_vec);
         let combined = self.bin(
             expressions,
@@ -138,11 +138,8 @@ impl<'a> Lowerer<'a> {
         let scaled_dot = self.dot_f32_vec4(expressions, body, weighted, shift4);
         let scaled_dot = self.mul(expressions, body, d, scaled_dot);
 
-        let sum_vec = self.compose_f32_vec4(
-            expressions,
-            body,
-            [sums[0], sums[1], sums[2], sums[3]],
-        );
+        let sum_vec =
+            self.compose_f32_vec4(expressions, body, [sums[0], sums[1], sums[2], sums[3]]);
         let even_scales = self.compose_f32_vec4(expressions, body, even_scales);
         let min_dot = self.dot_f32_vec4(expressions, body, sum_vec, even_scales);
         let min_dot = self.mul(expressions, body, dmin, min_dot);
@@ -163,7 +160,12 @@ impl<'a> Lowerer<'a> {
                 "q6k ggml dot requires Q6K and 16 activations",
             ));
         }
-        let GgmlBlockCoords { block, c0: ip, c1: il, col } = coords;
+        let GgmlBlockCoords {
+            block,
+            c0: ip,
+            c1: il,
+            col,
+        } = coords;
 
         let base = self.quantized_block_base(expressions, matrix, block, col, 53, body);
         let d = self.load_word_f32(expressions, matrix, base, 52, body)?;
@@ -172,19 +174,15 @@ impl<'a> Lowerer<'a> {
         let low_base = self.shl_lit(expressions, body, ip, 6);
         let low_byte_offset = self.add(expressions, body, low_base, l0);
         let low_word_offset = self.shr_lit(expressions, body, low_byte_offset, 2);
-        let q1_word =
-            self.load_word_dynamic(expressions, matrix, base, low_word_offset, body)?;
+        let q1_word = self.load_word_dynamic(expressions, matrix, base, low_word_offset, body)?;
         let q2_word_offset = self.add_lit(expressions, body, low_word_offset, 8);
-        let q2_word =
-            self.load_word_dynamic(expressions, matrix, base, q2_word_offset, body)?;
+        let q2_word = self.load_word_dynamic(expressions, matrix, base, q2_word_offset, body)?;
 
         let high_base = self.shl_lit(expressions, body, ip, 5);
-        let high_byte_offset =
-            self.add(expressions, body, high_base, l0);
+        let high_byte_offset = self.add(expressions, body, high_base, l0);
         let high_word_offset = self.shr_lit(expressions, body, high_byte_offset, 2);
         let high_word_offset = self.add_lit(expressions, body, high_word_offset, 32);
-        let qh_word =
-            self.load_word_dynamic(expressions, matrix, base, high_word_offset, body)?;
+        let qh_word = self.load_word_dynamic(expressions, matrix, base, high_word_offset, body)?;
 
         let scale_base = self.shl_lit(expressions, body, ip, 3);
         let scale_low = self.shr_lit(expressions, body, il, 2);
@@ -273,13 +271,7 @@ impl<'a> Lowerer<'a> {
                 (3, a[4 * l + 3], q3),
             ] {
                 let weighted = self.mul(expressions, body, activation, quant);
-                sums[sum] = self.bin(
-                    expressions,
-                    body,
-                    BinaryOperator::Add,
-                    sums[sum],
-                    weighted,
-                );
+                sums[sum] = self.bin(expressions, body, BinaryOperator::Add, sums[sum], weighted);
             }
         }
 
@@ -326,17 +318,9 @@ impl<'a> Lowerer<'a> {
             ));
         }
 
-        let (b_scale, b_packs) =
-            self.q6k_quant_packs8(expressions, matrix, k_base, col, body)?;
-        let total = self.q8_activation_packs_dot(
-            expressions,
-            body,
-            a,
-            pack_offset,
-            b_scale,
-            b_packs,
-            None,
-        );
+        let (b_scale, b_packs) = self.q6k_quant_packs8(expressions, matrix, k_base, col, body)?;
+        let total =
+            self.q8_activation_packs_dot(expressions, body, a, pack_offset, b_scale, b_packs, None);
         Ok(total)
     }
 
@@ -507,7 +491,11 @@ impl<'a> Lowerer<'a> {
             self.pack_i8x4(expressions, body, packed_values)
                 .expect("q4k packs exactly four i8 values")
         });
-        Ok(Q4KQuantBlock { scale: parts.scale, min: parts.min, data })
+        Ok(Q4KQuantBlock {
+            scale: parts.scale,
+            min: parts.min,
+            data,
+        })
     }
 
     pub(in crate::lower) fn q4k_quant_values<const N: usize, const WORDS: usize>(
@@ -534,7 +522,11 @@ impl<'a> Lowerer<'a> {
             self.and_lit(expressions, body, shifted, 0x0f)
         });
 
-        Ok(Q4KQuantBlock { scale: parts.scale, min: parts.min, data })
+        Ok(Q4KQuantBlock {
+            scale: parts.scale,
+            min: parts.min,
+            data,
+        })
     }
 
     pub(in crate::lower) fn q4k_block_parts(

@@ -119,4 +119,3 @@ fn lowered_naga_uses_anonymous_ir_objects_except_entry_point() {
             .all(|(_, local)| local.name.is_none()));
     }
 }
-

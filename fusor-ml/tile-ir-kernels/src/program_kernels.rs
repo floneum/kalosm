@@ -15,6 +15,25 @@ use crate::grid::dot4_sum;
 use crate::program_qgemv;
 use crate::types::{cooperative_store_layout_supported, matrix_shape};
 
+pub trait IntoQgemvEpilogues<'a> {
+    fn into_qgemv_epilogues(self) -> crate::types::QmatmulEpilogues<'a>;
+}
+
+impl<'a> IntoQgemvEpilogues<'a> for Option<&'a crate::UnaryEpilogue> {
+    fn into_qgemv_epilogues(self) -> crate::types::QmatmulEpilogues<'a> {
+        crate::types::QmatmulEpilogues {
+            pre: None,
+            post: self,
+        }
+    }
+}
+
+impl<'a> IntoQgemvEpilogues<'a> for &'a crate::types::QmatmulEpilogues<'a> {
+    fn into_qgemv_epilogues(self) -> crate::types::QmatmulEpilogues<'a> {
+        self.clone()
+    }
+}
+
 /// Convenience: declare a quantized matrix on a [`KernelBuilder`] and remember
 /// its runtime binding. Equivalent to pushing `binding` and then calling
 /// [`quantized_matrix`] on the underlying [`Program`].
@@ -81,6 +100,20 @@ pub fn qgemv<const BN: usize, const BK: usize>(
     workgroups_x: u32,
 ) {
     qmatmul_options::<1, BN, BK>(program, a, b, y, vector_width, true, workgroups_x);
+}
+
+/// Variant of [`qgemv`] that threads optional pre/post unary epilogues through
+/// the underlying qgemv variant chosen by `qgemv_tile`.
+pub fn qgemv_with_epilogue<'a, const BN: usize, const BK: usize>(
+    program: &mut Program,
+    a: &Storage<F32, 2>,
+    b: &QuantizedMatrix,
+    y: &Storage<F32, 2>,
+    workgroups_x: u32,
+    epilogues: impl IntoQgemvEpilogues<'a>,
+) {
+    let epilogues = epilogues.into_qgemv_epilogues();
+    program_qgemv::qgemv_tile_with_epilogue::<BN, BK>(program, a, b, y, workgroups_x, &epilogues);
 }
 
 pub fn qmatmul_options<const BM: usize, const BN: usize, const BK: usize>(
@@ -360,11 +393,7 @@ pub fn matmul<const BK: usize>(
 
 /// Dense F32 GEMV (matrix × vector) — single-output-column matmul specialized
 /// for the K-reduction along the input vector.
-pub fn gemv<
-    const ROWS_PER_WORKGROUP: usize,
-    const VALUES_PER_LANE: usize,
-    const BLOCK: usize,
->(
+pub fn gemv<const ROWS_PER_WORKGROUP: usize, const VALUES_PER_LANE: usize, const BLOCK: usize>(
     program: &mut Program,
     a: &Storage<F32, 2>,
     x: &Storage<F32, 2>,
@@ -473,4 +502,3 @@ pub fn qdequantize(
         program.store(y.at(0, flat), value, mask);
     });
 }
-

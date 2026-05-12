@@ -255,6 +255,136 @@ async fn paired_matches_cpu_for_rows(input_row_count: usize, kind: PairedKind) {
     .unwrap();
 }
 
+/// The fuser must collapse `rms_norm(...).relu()` (or any unary chain after
+/// an RmsNorm) into a single RmsNorm kernel dispatch — the kernel applies
+/// the chain in-register before the store. Without the rule, the unfused
+/// source resolves to 2 dispatches.
+#[tokio::test]
+async fn rmsnorm_post_relu_resolves_to_single_kernel() {
+    let Ok(device) = fusor::Device::new().await else {
+        return;
+    };
+    let Some(gpu_device) = device.as_gpu() else {
+        panic!("expected GPU device");
+    };
+    let cols = 64usize;
+    let input_data = vec![vec![0.1f32; cols]; 4];
+    let weight_data = vec![1.2f32; cols];
+    let input: Tensor<2, f32> = Tensor::new(&device, &input_data);
+    let weight: Tensor<1, f32> = Tensor::new(&device, &weight_data);
+
+    let output = input
+        .rms_norm_fused::<1, 1>(&weight, None, 1e-5)
+        .relu()
+        .to_concrete();
+    let Tensor::Gpu(gpu_out) = output else {
+        panic!("expected GPU tensor");
+    };
+    let kernels = gpu_device.resolve_batch(&[gpu_out.key()]);
+    assert_eq!(
+        kernels, 1,
+        "expected fuser to collapse rms_norm -> relu to 1 dispatch, got {kernels}"
+    );
+}
+
+/// The fuser must collapse `relu(input).q_mat_mul(weights)` into a single
+/// QMatMul kernel — qgemv applies the activation to each loaded activation
+/// tile before the dot product. Without the pre-fusion rule, the unfused
+/// source resolves to 2 dispatches (nary + matmul).
+#[tokio::test]
+async fn q4k_qmatmul_pre_relu_resolves_to_single_kernel() {
+    let Ok(device) = fusor::Device::new().await else {
+        return;
+    };
+    let weight_shape = [4, 512];
+    let raw_bytes = q4k_raw_bytes(weight_shape);
+    let input_data = vec![vec![0.1f32; weight_shape[1]]; 1];
+    let Some(gpu_device) = device.as_gpu() else {
+        panic!("expected GPU device");
+    };
+
+    let weights = qmatrix_from_raw_bytes(&device, weight_shape, &raw_bytes, GgmlType::Q4K);
+    let input: Tensor<2, f32> = Tensor::new(&device, &input_data);
+    let output = input.relu().to_concrete().q_mat_mul(&weights).to_concrete();
+    let Tensor::Gpu(gpu_out) = output else {
+        panic!("expected GPU tensor");
+    };
+    let kernels = gpu_device.resolve_batch(&[gpu_out.key()]);
+    assert_eq!(
+        kernels, 1,
+        "expected fuser to collapse relu -> q_mat_mul to 1 dispatch, got {kernels}"
+    );
+}
+
+/// The fuser must collapse `q_mat_mul → unary chain` (e.g. relu, silu)
+/// into a single QMatMul kernel dispatch — qgemv kernels apply the chain
+/// in-register before storing. Without the fuser rule, the unfused source
+/// resolves to 2 dispatches (matmul + nary).
+#[tokio::test]
+async fn q4k_qmatmul_post_relu_resolves_to_single_kernel() {
+    let Ok(device) = fusor::Device::new().await else {
+        return; // No GPU available.
+    };
+    let weight_shape = [4, 512];
+    let raw_bytes = q4k_raw_bytes(weight_shape);
+    let input_data = vec![vec![0.1f32; weight_shape[1]]; 1];
+    let Some(gpu_device) = device.as_gpu() else {
+        panic!("expected GPU device");
+    };
+
+    let weights = qmatrix_from_raw_bytes(&device, weight_shape, &raw_bytes, GgmlType::Q4K);
+    let input: Tensor<2, f32> = Tensor::new(&device, &input_data);
+
+    // Natural unfused source: matmul + relu. Fuser should collapse to 1 kernel.
+    let output = input.q_mat_mul(&weights).relu().to_concrete();
+    let Tensor::Gpu(natural_gpu) = output else {
+        panic!("expected GPU tensor");
+    };
+    let natural_kernels = gpu_device.resolve_batch(&[natural_gpu.key()]);
+    assert_eq!(
+        natural_kernels, 1,
+        "expected fuser to collapse q_mat_mul -> relu to 1 dispatch, got {natural_kernels}"
+    );
+}
+
+/// Biased FFN pattern: `silu(gate + gate_bias) * (up + up_bias)`.
+/// The fuser detects this as a paired-with-extras pattern (2 matmul views +
+/// 2 broadcast bias vectors) and rewrites it to a single `QMatMulPaired`
+/// kernel that loads the biases per output column at epilogue time.
+#[tokio::test]
+async fn q4k_paired_with_bias_resolves_to_single_kernel() {
+    use fusor::D;
+    let Ok(device) = fusor::Device::new().await else {
+        return;
+    };
+    let Some(gpu_device) = device.as_gpu() else {
+        panic!("expected GPU device");
+    };
+    let weight_shape = [4, 512];
+    let raw_bytes = q4k_raw_bytes(weight_shape);
+    let input_data = vec![vec![0.1f32; weight_shape[1]]; 1];
+    let weights = qmatrix_from_raw_bytes(&device, weight_shape, &raw_bytes, GgmlType::Q4K);
+    let input: Tensor<2, f32> = Tensor::new(&device, &input_data);
+    let gate_bias: Tensor<1, f32> = Tensor::new(&device, &vec![0.05f32, -0.05]);
+    let up_bias: Tensor<1, f32> = Tensor::new(&device, &vec![0.02f32, 0.03]);
+
+    let projected = input.q_mat_mul(&weights);
+    let gate = projected.narrow(D::Minus1, 0, 2).to_concrete();
+    let up = projected.narrow(D::Minus1, 2, 2).to_concrete();
+    let gate_biased = gate.add_(&gate_bias);
+    let up_biased = up.add_(&up_bias);
+    let output = (gate_biased.silu() * up_biased).to_concrete();
+
+    let Tensor::Gpu(gpu_out) = output else {
+        panic!("expected GPU tensor");
+    };
+    let kernels = gpu_device.resolve_batch(&[gpu_out.key()]);
+    assert_eq!(
+        kernels, 1,
+        "expected fuser to collapse biased silu(gate+gb)*up_biased to 1 dispatch, got {kernels}"
+    );
+}
+
 /// The fuser must collapse the natural `q_mat_mul → narrow → silu → mul(narrow)`
 /// pattern into the same kernel dispatch count as the explicit paired API.
 /// Without the fuser rule the natural pattern would emit more dispatches

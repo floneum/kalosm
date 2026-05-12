@@ -201,7 +201,6 @@ impl Expr {
             _ => false,
         }
     }
-
 }
 
 /// Source of an `Expr::Load`. The lowerer dispatches on the variant to choose
@@ -224,7 +223,6 @@ pub struct TileLoadExpr {
     pub mask: Box<Expr>,
     pub fill: Box<Expr>,
 }
-
 
 /// A masked rank-1 storage load. See `TileLoadExpr` for `fill` semantics.
 #[derive(Clone, Debug, PartialEq, Eq)]

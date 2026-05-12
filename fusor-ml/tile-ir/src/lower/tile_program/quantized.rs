@@ -102,7 +102,11 @@ impl<'a> Lowerer<'a> {
             }
             (
                 PackedActivations::Q4KGgml { low, high, sums },
-                DotK::Block { block, c0: iq, c1: ir },
+                DotK::Block {
+                    block,
+                    c0: iq,
+                    c1: ir,
+                },
             ) => {
                 if low.len() != 16 || high.len() != 16 || sums.len() != 4 {
                     return Err(LowerError::UnsupportedOperation(
@@ -156,7 +160,11 @@ impl<'a> Lowerer<'a> {
             }
             (
                 PackedActivations::F32(a),
-                DotK::Block { block, c0: ip, c1: il },
+                DotK::Block {
+                    block,
+                    c0: ip,
+                    c1: il,
+                },
             ) => {
                 if a.len() != 16 {
                     return Err(LowerError::UnsupportedOperation(
@@ -194,9 +202,11 @@ impl<'a> Lowerer<'a> {
                     },
                 )
             }
-            (PackedActivations::Q8(_), DotK::Block { .. }) => Err(LowerError::UnsupportedOperation(
-                "q8 activation dot does not support block-shaped K coordinates",
-            )),
+            (PackedActivations::Q8(_), DotK::Block { .. }) => {
+                Err(LowerError::UnsupportedOperation(
+                    "q8 activation dot does not support block-shaped K coordinates",
+                ))
+            }
             (PackedActivations::Q4KGgml { .. }, DotK::Base(_)) => {
                 Err(LowerError::UnsupportedOperation(
                     "q4k ggml dot requires a block-shaped K coordinate",
@@ -466,8 +476,13 @@ impl<'a> Lowerer<'a> {
         let fill_source = fill.element();
         let fill_handle =
             self.lower_tile_expr_lane(expressions, scratch, body, fill, spill_depth)?;
-        let fill_handle =
-            self.cast_tile_value(expressions, body, fill_handle, fill_source, ElementType::F32);
+        let fill_handle = self.cast_tile_value(
+            expressions,
+            body,
+            fill_handle,
+            fill_source,
+            ElementType::F32,
+        );
         self.lower_masked_value_to_local(
             expressions,
             scratch,

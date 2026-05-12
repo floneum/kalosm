@@ -466,55 +466,75 @@ impl NaryOperation {
         }
     }
 
-    /// Recognize a binary tile-IR-evaluatable expression over exactly two inputs
-    /// `act(input_a, input_b)` where both inputs are accessed element-wise. The
-    /// resolver uses this to auto-detect any `q_mat_mul → split → epilogue`
-    /// FFN pattern, without enumerating specific activations like SiLU/GELU.
+    /// Recognize a tile-IR-evaluatable expression over a paired-split pattern:
+    /// two of the inputs are the gate/up halves of a `q_mat_mul` output, and
+    /// any remaining inputs are per-column broadcast tensors (e.g. bias
+    /// vectors) accessed as `IndexedInput(k, [DimIndex(last_axis)])`. The
+    /// resolver uses this to auto-detect both the no-bias and biased FFN
+    /// patterns and synthesize a `PairedEpilogue` that captures the whole
+    /// expression.
     pub(crate) fn try_extract_paired_split(&self) -> Option<ExtractedPairedSplit> {
-        if self.inputs.len() != 2 {
+        if self.inputs.len() < 2 {
             return None;
         }
-        if !Self::expr_is_tile_evaluatable(&self.expression) {
+        let output_rank = self.shape.len();
+        if !Self::expr_is_paired_evaluatable(&self.expression, output_rank) {
             return None;
         }
-        // Both inputs must be referenced at least once with element-wise access
-        // so the qgemv kernel can substitute the gate/up tiles directly.
-        let mut input_seen = [false; 2];
-        Self::collect_input_usage(&self.expression, &mut input_seen)?;
-        if !input_seen[0] || !input_seen[1] {
-            return None;
-        }
+        let mut input_seen = vec![false; self.inputs.len()];
+        Self::collect_input_usage_n(&self.expression, &mut input_seen, output_rank)?;
         Some(ExtractedPairedSplit {
-            input_a: self.inputs[0],
-            input_b: self.inputs[1],
+            inputs: self.inputs.clone(),
+            inputs_seen: input_seen,
             expression: self.expression.clone(),
             output_datatype: self.output_datatype,
         })
     }
 
-    /// An expression is tile-evaluatable when every input access is
-    /// element-wise (no custom indexing), and the structure uses only
-    /// `Op` / `IndexedInput` / `Scalar` nodes — no DimIndex (which would
-    /// require knowing the current output coordinate inside the qgemv kernel).
-    fn expr_is_tile_evaluatable(expr: &NaryExpr) -> bool {
+    /// An expression is paired-evaluatable when every input access is either
+    /// fully element-wise (matmul-view inputs: gate/up) or a single
+    /// `DimIndex(output_rank - 1)` access into a 1D broadcast tensor
+    /// (per-column extras: bias vectors). Other structures (DimIndex outside
+    /// IndexedInput leaves, non-trivial index arithmetic) block fusion.
+    fn expr_is_paired_evaluatable(expr: &NaryExpr, output_rank: usize) -> bool {
         match expr {
-            NaryExpr::Op { children, .. } => children.iter().all(Self::expr_is_tile_evaluatable),
-            NaryExpr::IndexedInput { indices, .. } => NaryExpr::is_elementwise_indices(indices),
+            NaryExpr::Op { children, .. } => children
+                .iter()
+                .all(|c| Self::expr_is_paired_evaluatable(c, output_rank)),
+            NaryExpr::IndexedInput { indices, .. } => {
+                NaryExpr::is_elementwise_indices(indices)
+                    || Self::is_last_dim_broadcast(indices, output_rank)
+            }
             NaryExpr::Scalar(_) => true,
             NaryExpr::DimIndex(_) => false,
         }
     }
 
-    fn collect_input_usage(expr: &NaryExpr, seen: &mut [bool; 2]) -> Option<()> {
+    /// `indices` describes a 1D-broadcast access whose only index is the
+    /// output's last-dim coordinate (e.g. `bias[col]` where `col` is the
+    /// kernel's output column). Bias vectors hit this branch.
+    fn is_last_dim_broadcast(indices: &[NaryExpr], output_rank: usize) -> bool {
+        if output_rank == 0 || indices.len() != 1 {
+            return false;
+        }
+        matches!(&indices[0], NaryExpr::DimIndex(d) if *d == output_rank - 1)
+    }
+
+    fn collect_input_usage_n(expr: &NaryExpr, seen: &mut [bool], output_rank: usize) -> Option<()> {
         match expr {
             NaryExpr::Op { children, .. } => {
                 for child in children {
-                    Self::collect_input_usage(child, seen)?;
+                    Self::collect_input_usage_n(child, seen, output_rank)?;
                 }
                 Some(())
             }
-            NaryExpr::IndexedInput { input_idx, .. } => {
-                if *input_idx >= 2 {
+            NaryExpr::IndexedInput { input_idx, indices } => {
+                if *input_idx >= seen.len() {
+                    return None;
+                }
+                if !NaryExpr::is_elementwise_indices(indices)
+                    && !Self::is_last_dim_broadcast(indices, output_rank)
+                {
                     return None;
                 }
                 seen[*input_idx] = true;
@@ -528,11 +548,14 @@ impl NaryOperation {
 
 /// Result of extracting a paired-split FFN pattern from an NaryOperation. The
 /// expression is preserved verbatim — the resolver re-emits it at the tile-IR
-/// level inside the qgemv kernel, substituting the actual `gate` / `up` tile
-/// values for each `IndexedInput` leaf.
+/// level inside the qgemv kernel, substituting the actual `gate` / `up` /
+/// `extras...` tile values for each `IndexedInput` leaf.
 pub(crate) struct ExtractedPairedSplit {
-    pub(crate) input_a: NodeIndex,
-    pub(crate) input_b: NodeIndex,
+    pub(crate) inputs: Vec<NodeIndex>,
+    /// `inputs_seen[i]` is `true` if the captured expression references
+    /// `IndexedInput(i, ...)` anywhere. The resolver requires all inputs to
+    /// be used (unused inputs would point at dead graph nodes).
+    pub(crate) inputs_seen: Vec<bool>,
     pub(crate) expression: NaryExpr,
     pub(crate) output_datatype: DataTypeEnum,
 }

@@ -166,11 +166,13 @@ pub(crate) fn bindings_from_module(
         storages
             .into_iter()
             .zip(buffers)
-            .map(|((binding, read_only), buffer)| DirectKernelBinding::Storage {
-                binding,
-                buffer,
-                read_only,
-            })
+            .map(
+                |((binding, read_only), buffer)| DirectKernelBinding::Storage {
+                    binding,
+                    buffer,
+                    read_only,
+                },
+            )
             .collect(),
     )
 }
@@ -206,34 +208,6 @@ where
         move || Some(ir),
         buffers,
         dispatch_size,
-    )
-}
-
-/// Same as [`run_kernel`] but uses the hashed two-tier module cache so
-/// repeated dispatches with the same shape skip both the tile-ir build and
-/// the Naga lowering.
-pub(crate) fn run_kernel_with_hashed_cache<F>(
-    device: &Device,
-    cache: &'static ModuleCache,
-    label: &str,
-    module_key: [u64; 2],
-    dispatch_size: [u32; 3],
-    body: F,
-) -> Option<DirectKernel>
-where
-    F: FnOnce(&mut tile_ir::KernelBuilder<Arc<wgpu::Buffer>>) -> Option<()>,
-{
-    let mut kb = tile_ir::KernelBuilder::<Arc<wgpu::Buffer>>::new();
-    body(&mut kb)?;
-    let (ir, buffers) = kb.finish();
-    dynamic_kernel_from_hashed_ir(
-        device,
-        cache,
-        label,
-        module_key,
-        buffers,
-        dispatch_size,
-        move || Some(ir),
     )
 }
 

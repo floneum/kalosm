@@ -140,8 +140,10 @@ impl Operation for DequantizeOperation {
         );
         let matrix_buffer = matrix.buffer().clone();
         let output_buffer = output.buffer().clone();
-        let output_layout =
-            tile_ir::Layout::contiguous(tile_ir::MemoryLevel::Storage, tile_ir::Shape::new([total]));
+        let output_layout = tile_ir::Layout::contiguous(
+            tile_ir::MemoryLevel::Storage,
+            tile_ir::Shape::new([total]),
+        );
         kernel_backend::run_kernel(
             &graph.device(),
             self.name(),

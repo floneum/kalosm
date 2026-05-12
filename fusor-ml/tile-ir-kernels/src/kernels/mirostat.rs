@@ -18,11 +18,7 @@ fn mirostat_top_value(
     index: Tile<TOP_K_BLOCK>,
 ) -> Tile<TOP_K_BLOCK> {
     let index = index1(index, meta.values_offset, meta.values_stride);
-    program.load_linear(
-        values.at(index),
-        all(),
-        TileLiteral::f32(NEG_MAX_F32),
-    )
+    program.load_linear(values.at(index), all(), TileLiteral::f32(NEG_MAX_F32))
 }
 
 fn mirostat_top_id(
@@ -90,211 +86,194 @@ pub fn mirostat2<B>(
     let scratch = phase.alloc_workgroup_array::<F32>(TOP_K_BLOCK as u32);
 
     phase.program_grid::<TOP_K_BLOCK>([1, 1, 1], |program| {
-            let lane = program.arange();
-            let index = program.private::<U32>();
-            let local_sum = program.private::<F32>();
-            let reduce_step = program.private::<U32>();
-            let cutoff = program.private::<U32>();
-            let scan = program.private::<U32>();
-            let cutoff_sum = program.private::<F32>();
-            let cumulative = program.private::<F32>();
-            let selected = program.private::<U32>();
-            let selected_probability = program.private::<F32>();
+        let lane = program.arange();
+        let index = program.private::<U32>();
+        let local_sum = program.private::<F32>();
+        let reduce_step = program.private::<U32>();
+        let cutoff = program.private::<U32>();
+        let scan = program.private::<U32>();
+        let cutoff_sum = program.private::<F32>();
+        let cumulative = program.private::<F32>();
+        let selected = program.private::<U32>();
+        let selected_probability = program.private::<F32>();
 
-            if let Some(exactness_flag) = &exactness_flag {
-                let flag = program.load_linear(exactness_flag.at(0), all(), TileLiteral::U32(0));
-                let retry = flag.eq(u32_tile(0));
-                program.if_then(retry, |program| {
-                    let lane_zero = lane_zero(program, &lane);
-                    program.if_then(lane_zero, |program| {
-                        store_sample_result(
-                            program,
-                            &output,
-                            GPU_SAMPLE_STATUS_RETRY_NEEDED,
-                            u32_tile(0),
-                        );
-                    });
-                    program.return_();
-                });
-            }
-
-            let top_id = mirostat_top_id(program, &ids, meta, u32_tile(0));
-            let invalid = top_id.eq(u32_tile(u32::MAX));
-            program.if_then(invalid, |program| {
+        if let Some(exactness_flag) = &exactness_flag {
+            let flag = program.load_linear(exactness_flag.at(0), all(), TileLiteral::U32(0));
+            let retry = flag.eq(u32_tile(0));
+            program.if_then(retry, |program| {
                 let lane_zero = lane_zero(program, &lane);
                 program.if_then(lane_zero, |program| {
-                    store_sample_result(program, &output, GPU_SAMPLE_STATUS_INVALID, u32_tile(0));
-                });
-                program.return_();
-            });
-
-            let max_value = mirostat_top_value(program, &values, meta, u32_tile(0));
-            program.store_local(&local_sum, f32_tile(0.0));
-            program.store_local(&index, program.index(lane.clone()));
-            program.loop_forever(|program| {
-                let index_value = program.load_local(&index);
-                program.break_if(index_value.clone().ge(u32_tile(meta.top_k)));
-                let weight =
-                    mirostat_top_weight(program, &values, meta, max_value.clone(), index_value);
-                let current = program.load_local(&local_sum);
-                program.store_local(&local_sum, current + weight);
-                let index_value = program.load_local(&index);
-                program.store_local(&index, index_value + u32_tile(TOP_K_BLOCK as u32));
-            });
-
-            let local_sum_value = program.load_local(&local_sum);
-            program.store_workgroup(scratch, lane.clone(), local_sum_value);
-            program.workgroup_barrier();
-
-            program.store_local(&reduce_step, u32_tile(TOP_K_BLOCK as u32 / 2));
-            program.loop_forever(|program| {
-                let step = program.load_local(&reduce_step);
-                program.break_if(step.clone().eq(u32_tile(0)));
-                let participates = program.index(lane.clone()).lt(step.clone());
-                program.if_then(participates, |program| {
-                    let rhs_index = program.index(lane.clone()) + step.clone();
-                    let lhs = program.load_workgroup(scratch, lane.clone());
-                    let rhs = program.load_workgroup(scratch, rhs_index);
-                    program.store_workgroup(scratch, lane.clone(), lhs + rhs);
-                });
-                program.workgroup_barrier();
-                let step = program.load_local(&reduce_step);
-                program.store_local(&reduce_step, step / u32_tile(2));
-            });
-
-            let lane_zero = lane_zero(program, &lane);
-            program.if_else(
-                lane_zero,
-                |program| {
-                    let epsilon = f32_tile(1.0e-20);
-                    let total = program.load_workgroup(scratch, 0).max(epsilon.clone());
-                    let mu = program.load_linear(
-                        state.at(0),
-                        all(),
-                        TileLiteral::f32(0.0),
-                    );
-                    program.store_local(&cutoff, u32_tile(0));
-                    program.store_local(&scan, u32_tile(0));
-                    program.loop_forever(|program| {
-                        let scan_value = program.load_local(&scan);
-                        let done = scan_value.clone().ge(u32_tile(meta.top_k));
-                        program.if_then(done, |program| {
-                            program.store_local(&cutoff, u32_tile(1));
-                            program.break_loop();
-                        });
-                        let scan_value = program.load_local(&scan);
-                        let weight = mirostat_top_weight(
-                            program,
-                            &values,
-                            meta,
-                            max_value.clone(),
-                            scan_value.clone(),
-                        );
-                        let probability = (weight / total.clone()).max(epsilon.clone());
-                        let surprise = probability.unary(TileUnaryOp::Log2) * f32_tile(-1.0);
-                        let too_surprising = surprise.gt(mu.clone());
-                        program.if_then(too_surprising, |program| {
-                            let scan_value = program.load_local(&scan);
-                            let scan_gt_one = scan_value.clone().gt(u32_tile(1));
-                            program.if_else(
-                                scan_gt_one,
-                                |program| {
-                                    let scan_value = program.load_local(&scan);
-                                    program.store_local(&cutoff, scan_value);
-                                },
-                                |program| {
-                                    program.store_local(&cutoff, u32_tile(1));
-                                },
-                            );
-                            program.break_loop();
-                        });
-                        let scan_value = program.load_local(&scan);
-                        program.store_local(&scan, scan_value + u32_tile(1));
-                    });
-
-                    program.store_local(&cutoff_sum, f32_tile(0.0));
-                    program.store_local(&scan, u32_tile(0));
-                    program.loop_forever(|program| {
-                        let scan_value = program.load_local(&scan);
-                        let cutoff_value = program.load_local(&cutoff);
-                        program.break_if(scan_value.clone().ge(cutoff_value));
-                        let scan_value = program.load_local(&scan);
-                        let weight = mirostat_top_weight(
-                            program,
-                            &values,
-                            meta,
-                            max_value.clone(),
-                            scan_value,
-                        );
-                        let current = program.load_local(&cutoff_sum);
-                        program.store_local(&cutoff_sum, current + weight);
-                        let scan_value = program.load_local(&scan);
-                        program.store_local(&scan, scan_value + u32_tile(1));
-                    });
-                    let cutoff_sum_value = program.load_local(&cutoff_sum).max(epsilon.clone());
-                    program.store_local(&cutoff_sum, cutoff_sum_value.clone());
-
-                    let random = load_param_f32(program, &params, 2);
-                    let threshold = random * cutoff_sum_value.clone();
-                    program.store_local(&cumulative, f32_tile(0.0));
-                    let selected_token = mirostat_top_id(program, &ids, meta, u32_tile(0));
-                    program.store_local(&selected, selected_token);
-                    let selected_weight =
-                        mirostat_top_weight(program, &values, meta, max_value.clone(), u32_tile(0));
-                    let selected_prob = selected_weight / cutoff_sum_value.clone();
-                    program.store_local(&selected_probability, selected_prob);
-                    program.store_local(&scan, u32_tile(0));
-                    program.loop_forever(|program| {
-                        let scan_value = program.load_local(&scan);
-                        let cutoff_value = program.load_local(&cutoff);
-                        program.break_if(scan_value.clone().ge(cutoff_value));
-                        let scan_value = program.load_local(&scan);
-                        let weight = mirostat_top_weight(
-                            program,
-                            &values,
-                            meta,
-                            max_value.clone(),
-                            scan_value.clone(),
-                        );
-                        let cumulative_value = program.load_local(&cumulative) + weight.clone();
-                        let picked = cumulative_value.clone().ge(threshold.clone());
-                        program.if_then(picked, |program| {
-                            let scan_value = program.load_local(&scan);
-                            let token = mirostat_top_id(program, &ids, meta, scan_value);
-                            program.store_local(&selected, token);
-                            program.store_local(
-                                &selected_probability,
-                                weight / cutoff_sum_value.clone(),
-                            );
-                            program.break_loop();
-                        });
-                        program.store_local(&cumulative, cumulative_value);
-                        let scan_value = program.load_local(&scan);
-                        program.store_local(&scan, scan_value + u32_tile(1));
-                    });
-
-                    let selected_probability_value =
-                        program.load_local(&selected_probability).max(epsilon);
-                    let surprise =
-                        selected_probability_value.unary(TileUnaryOp::Log2) * f32_tile(-1.0);
-                    let tau = load_param_f32(program, &params, 0);
-                    let eta = load_param_f32(program, &params, 1);
-                    let error = surprise - tau;
-                    let correction = eta * error;
-                    let next_mu = mu - correction;
-                    program.store_linear(state.at(0), next_mu, all());
-                    let selected_token = program.load_local(&selected);
                     store_sample_result(
                         program,
                         &output,
-                        GPU_SAMPLE_STATUS_SAMPLED,
-                        selected_token,
+                        GPU_SAMPLE_STATUS_RETRY_NEEDED,
+                        u32_tile(0),
                     );
-                },
-                |program| {
-                    program.return_();
-                },
-            );
+                });
+                program.return_();
+            });
+        }
+
+        let top_id = mirostat_top_id(program, &ids, meta, u32_tile(0));
+        let invalid = top_id.eq(u32_tile(u32::MAX));
+        program.if_then(invalid, |program| {
+            let lane_zero = lane_zero(program, &lane);
+            program.if_then(lane_zero, |program| {
+                store_sample_result(program, &output, GPU_SAMPLE_STATUS_INVALID, u32_tile(0));
+            });
+            program.return_();
         });
+
+        let max_value = mirostat_top_value(program, &values, meta, u32_tile(0));
+        program.store_local(&local_sum, f32_tile(0.0));
+        program.store_local(&index, program.index(lane.clone()));
+        program.loop_forever(|program| {
+            let index_value = program.load_local(&index);
+            program.break_if(index_value.clone().ge(u32_tile(meta.top_k)));
+            let weight =
+                mirostat_top_weight(program, &values, meta, max_value.clone(), index_value);
+            let current = program.load_local(&local_sum);
+            program.store_local(&local_sum, current + weight);
+            let index_value = program.load_local(&index);
+            program.store_local(&index, index_value + u32_tile(TOP_K_BLOCK as u32));
+        });
+
+        let local_sum_value = program.load_local(&local_sum);
+        program.store_workgroup(scratch, lane.clone(), local_sum_value);
+        program.workgroup_barrier();
+
+        program.store_local(&reduce_step, u32_tile(TOP_K_BLOCK as u32 / 2));
+        program.loop_forever(|program| {
+            let step = program.load_local(&reduce_step);
+            program.break_if(step.clone().eq(u32_tile(0)));
+            let participates = program.index(lane.clone()).lt(step.clone());
+            program.if_then(participates, |program| {
+                let rhs_index = program.index(lane.clone()) + step.clone();
+                let lhs = program.load_workgroup(scratch, lane.clone());
+                let rhs = program.load_workgroup(scratch, rhs_index);
+                program.store_workgroup(scratch, lane.clone(), lhs + rhs);
+            });
+            program.workgroup_barrier();
+            let step = program.load_local(&reduce_step);
+            program.store_local(&reduce_step, step / u32_tile(2));
+        });
+
+        let lane_zero = lane_zero(program, &lane);
+        program.if_else(
+            lane_zero,
+            |program| {
+                let epsilon = f32_tile(1.0e-20);
+                let total = program.load_workgroup(scratch, 0).max(epsilon.clone());
+                let mu = program.load_linear(state.at(0), all(), TileLiteral::f32(0.0));
+                program.store_local(&cutoff, u32_tile(0));
+                program.store_local(&scan, u32_tile(0));
+                program.loop_forever(|program| {
+                    let scan_value = program.load_local(&scan);
+                    let done = scan_value.clone().ge(u32_tile(meta.top_k));
+                    program.if_then(done, |program| {
+                        program.store_local(&cutoff, u32_tile(1));
+                        program.break_loop();
+                    });
+                    let scan_value = program.load_local(&scan);
+                    let weight = mirostat_top_weight(
+                        program,
+                        &values,
+                        meta,
+                        max_value.clone(),
+                        scan_value.clone(),
+                    );
+                    let probability = (weight / total.clone()).max(epsilon.clone());
+                    let surprise = probability.unary(TileUnaryOp::Log2) * f32_tile(-1.0);
+                    let too_surprising = surprise.gt(mu.clone());
+                    program.if_then(too_surprising, |program| {
+                        let scan_value = program.load_local(&scan);
+                        let scan_gt_one = scan_value.clone().gt(u32_tile(1));
+                        program.if_else(
+                            scan_gt_one,
+                            |program| {
+                                let scan_value = program.load_local(&scan);
+                                program.store_local(&cutoff, scan_value);
+                            },
+                            |program| {
+                                program.store_local(&cutoff, u32_tile(1));
+                            },
+                        );
+                        program.break_loop();
+                    });
+                    let scan_value = program.load_local(&scan);
+                    program.store_local(&scan, scan_value + u32_tile(1));
+                });
+
+                program.store_local(&cutoff_sum, f32_tile(0.0));
+                program.store_local(&scan, u32_tile(0));
+                program.loop_forever(|program| {
+                    let scan_value = program.load_local(&scan);
+                    let cutoff_value = program.load_local(&cutoff);
+                    program.break_if(scan_value.clone().ge(cutoff_value));
+                    let scan_value = program.load_local(&scan);
+                    let weight =
+                        mirostat_top_weight(program, &values, meta, max_value.clone(), scan_value);
+                    let current = program.load_local(&cutoff_sum);
+                    program.store_local(&cutoff_sum, current + weight);
+                    let scan_value = program.load_local(&scan);
+                    program.store_local(&scan, scan_value + u32_tile(1));
+                });
+                let cutoff_sum_value = program.load_local(&cutoff_sum).max(epsilon.clone());
+                program.store_local(&cutoff_sum, cutoff_sum_value.clone());
+
+                let random = load_param_f32(program, &params, 2);
+                let threshold = random * cutoff_sum_value.clone();
+                program.store_local(&cumulative, f32_tile(0.0));
+                let selected_token = mirostat_top_id(program, &ids, meta, u32_tile(0));
+                program.store_local(&selected, selected_token);
+                let selected_weight =
+                    mirostat_top_weight(program, &values, meta, max_value.clone(), u32_tile(0));
+                let selected_prob = selected_weight / cutoff_sum_value.clone();
+                program.store_local(&selected_probability, selected_prob);
+                program.store_local(&scan, u32_tile(0));
+                program.loop_forever(|program| {
+                    let scan_value = program.load_local(&scan);
+                    let cutoff_value = program.load_local(&cutoff);
+                    program.break_if(scan_value.clone().ge(cutoff_value));
+                    let scan_value = program.load_local(&scan);
+                    let weight = mirostat_top_weight(
+                        program,
+                        &values,
+                        meta,
+                        max_value.clone(),
+                        scan_value.clone(),
+                    );
+                    let cumulative_value = program.load_local(&cumulative) + weight.clone();
+                    let picked = cumulative_value.clone().ge(threshold.clone());
+                    program.if_then(picked, |program| {
+                        let scan_value = program.load_local(&scan);
+                        let token = mirostat_top_id(program, &ids, meta, scan_value);
+                        program.store_local(&selected, token);
+                        program
+                            .store_local(&selected_probability, weight / cutoff_sum_value.clone());
+                        program.break_loop();
+                    });
+                    program.store_local(&cumulative, cumulative_value);
+                    let scan_value = program.load_local(&scan);
+                    program.store_local(&scan, scan_value + u32_tile(1));
+                });
+
+                let selected_probability_value =
+                    program.load_local(&selected_probability).max(epsilon);
+                let surprise = selected_probability_value.unary(TileUnaryOp::Log2) * f32_tile(-1.0);
+                let tau = load_param_f32(program, &params, 0);
+                let eta = load_param_f32(program, &params, 1);
+                let error = surprise - tau;
+                let correction = eta * error;
+                let next_mu = mu - correction;
+                program.store_linear(state.at(0), next_mu, all());
+                let selected_token = program.load_local(&selected);
+                store_sample_result(program, &output, GPU_SAMPLE_STATUS_SAMPLED, selected_token);
+            },
+            |program| {
+                program.return_();
+            },
+        );
+    });
     Some(())
 }

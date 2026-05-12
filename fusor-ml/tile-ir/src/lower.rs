@@ -12,9 +12,9 @@ use naga::{
 
 use crate::ir::{
     AxisGroup, BlockDequantId, BufferAccess, BufferId, CoopFragmentId, CoopOperandRole, CopySource,
-    DotK, ElementType, Expr, KernelIr, Layout, LocalId, LocalRef, MemoryLevel, MultiFlattenMap,
-    PackedActivations, StorageView, TileBinaryOp, TileCompareOp, TileId, TileLinearLoadExpr,
-    TileLiteral, TileLoadExpr, LoadSource, TileProgramOp, TileReduceOp, TileRef, TileStmt,
+    DotK, ElementType, Expr, KernelIr, Layout, LoadSource, LocalId, LocalRef, MemoryLevel,
+    MultiFlattenMap, PackedActivations, StorageView, TileBinaryOp, TileCompareOp, TileId,
+    TileLinearLoadExpr, TileLiteral, TileLoadExpr, TileProgramOp, TileReduceOp, TileRef, TileStmt,
     TileStoreStmt, TileUnaryOp,
 };
 use crate::quantized::{GgmlQuantFormat, QuantizedMatrix};

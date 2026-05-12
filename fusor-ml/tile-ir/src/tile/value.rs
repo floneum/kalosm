@@ -1,11 +1,8 @@
-
 use std::marker::PhantomData;
 use std::ops::{Add, BitAnd, BitXor, Div, Mul, Rem, Sub};
 
 use crate::ir::{
-    CoopFragmentId,
-    CoopOperandRole,
-    LocalRef, StorageView, TileBinaryOp, TileCompareOp, Expr,
+    CoopFragmentId, CoopOperandRole, Expr, LocalRef, StorageView, TileBinaryOp, TileCompareOp,
     TileLiteral, TileUnaryOp,
 };
 /// Handle to an 8x8 cooperative-matrix accumulator local.
@@ -158,7 +155,11 @@ impl<const N: usize> IntoIndex<N> for &Tile<N> {
     }
 }
 
-pub(super) fn index_compare<const N: usize>(left: Box<Expr>, op: TileCompareOp, value: u32) -> Mask<N> {
+pub(super) fn index_compare<const N: usize>(
+    left: Box<Expr>,
+    op: TileCompareOp,
+    value: u32,
+) -> Mask<N> {
     Mask {
         expr: Box::new(Expr::Compare {
             op,
@@ -269,14 +270,20 @@ impl_index_u32_ops!(
 /// impls below — `ScalarIndex + ScalarIndex`, `ScalarIndex + Range`, and
 /// `Range + ScalarIndex` all reduce to the same expression.
 fn add_index_exprs(left: Box<Expr>, right: Box<Expr>) -> Box<Expr> {
-    Box::new(Expr::Binary { op: TileBinaryOp::Add, left, right })
+    Box::new(Expr::Binary {
+        op: TileBinaryOp::Add,
+        left,
+        right,
+    })
 }
 
 impl Add<ScalarIndex> for ScalarIndex {
     type Output = ScalarIndex;
 
     fn add(self, rhs: ScalarIndex) -> Self::Output {
-        ScalarIndex { expr: add_index_exprs(self.expr, rhs.expr) }
+        ScalarIndex {
+            expr: add_index_exprs(self.expr, rhs.expr),
+        }
     }
 }
 
@@ -284,7 +291,9 @@ impl<const N: usize> Add<Range<N>> for ScalarIndex {
     type Output = Range<N>;
 
     fn add(self, rhs: Range<N>) -> Self::Output {
-        Range { expr: add_index_exprs(self.expr, rhs.expr) }
+        Range {
+            expr: add_index_exprs(self.expr, rhs.expr),
+        }
     }
 }
 
@@ -292,7 +301,9 @@ impl<const N: usize> Add<ScalarIndex> for Range<N> {
     type Output = Range<N>;
 
     fn add(self, rhs: ScalarIndex) -> Self::Output {
-        Range { expr: add_index_exprs(self.expr, rhs.expr) }
+        Range {
+            expr: add_index_exprs(self.expr, rhs.expr),
+        }
     }
 }
 
@@ -522,9 +533,7 @@ impl<const N: usize> Tile<N> {
 
 impl<const N: usize> From<Scalar> for Tile<N> {
     fn from(value: Scalar) -> Self {
-        Self {
-            expr: value.expr,
-        }
+        Self { expr: value.expr }
     }
 }
 

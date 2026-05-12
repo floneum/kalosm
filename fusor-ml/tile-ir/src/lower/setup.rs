@@ -111,7 +111,10 @@ impl<'a> Lowerer<'a> {
         ];
         let optional_subgroup_args = [
             (self.subgroup_usage.subgroup_id, BuiltIn::SubgroupId),
-            (self.subgroup_usage.subgroup_lane, BuiltIn::SubgroupInvocationId),
+            (
+                self.subgroup_usage.subgroup_lane,
+                BuiltIn::SubgroupInvocationId,
+            ),
             (self.subgroup_usage.subgroup_size, BuiltIn::SubgroupSize),
             (self.subgroup_usage.num_subgroups, BuiltIn::NumSubgroups),
         ];
@@ -239,7 +242,10 @@ impl<'a> Lowerer<'a> {
             .tiles()
             .iter()
             .filter(|tile| {
-                self.live_tiles.get(tile.id.index()).copied().unwrap_or(false)
+                self.live_tiles
+                    .get(tile.id.index())
+                    .copied()
+                    .unwrap_or(false)
                     && tile.layout.memory_level() == level
             })
             .map(|tile| (tile.id.index(), tile.element, tile.layout.clone()))
@@ -466,17 +472,15 @@ impl<'a> Lowerer<'a> {
             TileStmt::StoreWorkgroup { dst, .. } => dst.element == ElementType::F16,
             TileStmt::CopyToWorkgroupTile { dst, src, .. } => {
                 let src_uses_f16 = match src {
-                    crate::ir::CopySource::Storage(view) => {
-                        view.buffer.element == ElementType::F16
-                    }
+                    crate::ir::CopySource::Storage(view) => view.buffer.element == ElementType::F16,
                     crate::ir::CopySource::Quantized(_) => false,
                 };
                 dst.element == ElementType::F16 || src_uses_f16
             }
             TileStmt::StoreCoopAcc { dst, .. } => dst.buffer.element == ElementType::F16,
-            TileStmt::Fold { accumulators, .. } => {
-                accumulators.iter().any(|acc| acc.element == ElementType::F16)
-            }
+            TileStmt::Fold { accumulators, .. } => accumulators
+                .iter()
+                .any(|acc| acc.element == ElementType::F16),
             TileStmt::If { .. }
             | TileStmt::Loop { .. }
             | TileStmt::LoadCoop { .. }
@@ -523,7 +527,6 @@ impl<'a> Lowerer<'a> {
             | Expr::Builtin(_) => false,
         }
     }
-
 }
 
 fn builtin_arg(ty: Handle<Type>, builtin: BuiltIn) -> FunctionArgument {

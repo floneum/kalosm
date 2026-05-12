@@ -40,7 +40,16 @@ impl QMatMulDirectPipelineKey {
         input_layout: &Layout,
         output_layout: &Layout,
     ) -> Self {
-        Self::new_with_epilogue(format, m, k, n, 0, dispatch_size, input_layout, output_layout)
+        Self::new_with_epilogue(
+            format,
+            m,
+            k,
+            n,
+            0,
+            dispatch_size,
+            input_layout,
+            output_layout,
+        )
     }
 
     pub(crate) fn new_with_epilogue(

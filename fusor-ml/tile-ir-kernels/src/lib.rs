@@ -25,16 +25,19 @@ pub use grid::{
 pub use kernels::{
     flash_attention, flash_decode_small, linear_storage_layout, mirostat2, rms_norm_vec4,
     top_k_chunk, top_k_exactness, top_k_merge, FlashAttentionDims, FlashAttentionMeta,
-    FlashDecodeSmallMeta, MergeTopKMeta, Mirostat2Meta, RmsNormVec4Meta, TensorMeta,
-    TopKChunkMeta, TopKExactnessMeta,
+    FlashDecodeSmallMeta, MergeTopKMeta, Mirostat2Meta, RmsNormVec4Meta, TensorMeta, TopKChunkMeta,
+    TopKExactnessMeta,
 };
 pub use program_kernels::{
-    gemv, matmul, qdequantize, qgemv, qmatmul, qmatmul_dispatch, qmatmul_options, qmatmul_perf,
-    qmatmul_tile, quantized_matrix, quantized_matrix_for,
+    gemv, matmul, qdequantize, qgemv, qgemv_with_epilogue, qmatmul, qmatmul_dispatch,
+    qmatmul_options, qmatmul_perf, qmatmul_tile, quantized_matrix, quantized_matrix_for,
+    IntoQgemvEpilogues,
 };
 pub use program_qgemv::{
     qgemv_perf, qgemv_q4k_dispatch, qgemv_q4k_ggml, qgemv_q4k_paired_2x2, qgemv_q4k_paired_2x4,
     qgemv_q4k_paired_4x1, qgemv_q4k_paired_4x2, qgemv_q4k_paired_4x4, qgemv_q4k_paired_8x1,
     qgemv_q4k_paired_8x2, qgemv_q4k_paired_ggml, qgemv_q6k_dispatch, qgemv_q6k_ggml, qgemv_tile,
 };
-pub use types::{PairedEpilogue, PairedEpiloguePreset};
+pub use types::{
+    apply_optional_epilogue, PairedEpilogue, PairedEpiloguePreset, QmatmulEpilogues, UnaryEpilogue,
+};

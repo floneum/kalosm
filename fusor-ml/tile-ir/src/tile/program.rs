@@ -1,10 +1,10 @@
 use std::marker::PhantomData;
 
+use super::*;
 use crate::ir::{
     BlockDequantId, BufferAccess, BufferDecl, BufferRef, CoopFragmentId, KernelIr, Layout,
     LocalRef, MemoryLevel, Numeric, Shape, StorageView, TileDecl, TileProgramOp, TileRef, F32,
 };
-use super::*;
 
 macro_rules! storage_accessors {
     ($read:ident, $write:ident($($arg:ident: $ty:ty),*) => ($layout:expr, $offset:expr)) => {
@@ -127,12 +127,8 @@ impl Program {
         offset: u32,
         access: BufferAccess,
     ) -> Storage<T, R> {
-        let view = self.storage_view_with_layout_and_access::<R>(
-            T::ELEMENT,
-            layout,
-            offset,
-            access,
-        );
+        let view =
+            self.storage_view_with_layout_and_access::<R>(T::ELEMENT, layout, offset, access);
         Storage {
             view,
             _ty: PhantomData,
@@ -164,7 +160,6 @@ impl Program {
             layout,
         }
     }
-
 
     pub fn program_grid<const BLOCK: usize>(
         &mut self,

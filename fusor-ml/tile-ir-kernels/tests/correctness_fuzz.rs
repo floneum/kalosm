@@ -1,6 +1,8 @@
 use std::{borrow::Cow, error::Error, sync::mpsc};
 
-use fusor_tile_ir::{tile, tile::Storage, GgmlQuantFormat, KernelIr, Layout, MemoryLevel, Shape, F32};
+use fusor_tile_ir::{
+    tile, tile::Storage, GgmlQuantFormat, KernelIr, Layout, MemoryLevel, Shape, F32,
+};
 use fusor_tile_ir_kernels as tile_ir_kernels;
 use wgpu::util::DeviceExt;
 
@@ -508,10 +510,22 @@ fn im2col_nhwc<T>(
     let [kernel_h, kernel_w] = kernel_hw;
     let [stride_h, stride_w] = stride_hw;
     let [dilation_h, dilation_w] = dilation_hw;
-    assert!(out_h > 0 && out_w > 0, "im2col output shape must be non-zero");
-    assert!(kernel_h > 0 && kernel_w > 0, "im2col kernel shape must be non-zero");
-    assert!(stride_h > 0 && stride_w > 0, "im2col stride must be non-zero");
-    assert!(dilation_h > 0 && dilation_w > 0, "im2col dilation must be non-zero");
+    assert!(
+        out_h > 0 && out_w > 0,
+        "im2col output shape must be non-zero"
+    );
+    assert!(
+        kernel_h > 0 && kernel_w > 0,
+        "im2col kernel shape must be non-zero"
+    );
+    assert!(
+        stride_h > 0 && stride_w > 0,
+        "im2col stride must be non-zero"
+    );
+    assert!(
+        dilation_h > 0 && dilation_w > 0,
+        "im2col dilation must be non-zero"
+    );
     let used_h = out_h
         .checked_sub(1)
         .and_then(|v| v.checked_mul(stride_h))
@@ -543,10 +557,18 @@ fn im2col_nhwc<T>(
         [batch, out_h, out_w, kernel_h, kernel_w, channels],
         [
             b_str,
-            stride_h.checked_mul(h_str).expect("im2col h sub-stride overflow"),
-            stride_w.checked_mul(w_str).expect("im2col w sub-stride overflow"),
-            dilation_h.checked_mul(h_str).expect("im2col kh sub-stride overflow"),
-            dilation_w.checked_mul(w_str).expect("im2col kw sub-stride overflow"),
+            stride_h
+                .checked_mul(h_str)
+                .expect("im2col h sub-stride overflow"),
+            stride_w
+                .checked_mul(w_str)
+                .expect("im2col w sub-stride overflow"),
+            dilation_h
+                .checked_mul(h_str)
+                .expect("im2col kh sub-stride overflow"),
+            dilation_w
+                .checked_mul(w_str)
+                .expect("im2col kw sub-stride overflow"),
             c_str,
         ],
     );
@@ -714,16 +736,12 @@ fn matrix_layout(rows: usize, cols: usize, variant: StorageVariant) -> Layout {
     let shape = shape([rows, cols]);
     match variant {
         StorageVariant::Contiguous => Layout::contiguous(MemoryLevel::Storage, shape),
-        StorageVariant::Padded if rows == 1 && cols > 1 => Layout::strided(
-            MemoryLevel::Storage,
-            shape,
-            &[(cols * 2 + 3) as u32, 2],
-        ),
-        StorageVariant::Padded => Layout::strided(
-            MemoryLevel::Storage,
-            shape,
-            &[(cols + 5) as u32, 1],
-        ),
+        StorageVariant::Padded if rows == 1 && cols > 1 => {
+            Layout::strided(MemoryLevel::Storage, shape, &[(cols * 2 + 3) as u32, 2])
+        }
+        StorageVariant::Padded => {
+            Layout::strided(MemoryLevel::Storage, shape, &[(cols + 5) as u32, 1])
+        }
         StorageVariant::Transposed => {
             let strides = fusor_tile_ir::MultiFlattenMap::col_major_for(&shape).affine_strides();
             Layout::strided(MemoryLevel::Storage, shape, &strides)
@@ -733,11 +751,7 @@ fn matrix_layout(rows: usize, cols: usize, variant: StorageVariant) -> Layout {
 
 fn skewed_activation_layout(rows: usize, cols: usize) -> Layout {
     let shape = shape([rows, cols]);
-    Layout::strided(
-        MemoryLevel::Storage,
-        shape,
-        &[2, (rows * 2 + 7) as u32],
-    )
+    Layout::strided(MemoryLevel::Storage, shape, &[2, (rows * 2 + 7) as u32])
 }
 
 fn allocation_len(layout: &Layout) -> usize {

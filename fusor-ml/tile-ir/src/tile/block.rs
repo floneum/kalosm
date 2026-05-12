@@ -1,15 +1,14 @@
-
 use std::marker::PhantomData;
 
-use crate::ir::{
-    Builtin, CoopOperandRole, DotK, ElementType, Expr, F32Vec4, Layout, LocalRef,
-    MemoryLevel, Numeric, PackedActivations, Shape, TileBinaryOp, TileIndexedStoreStmt,
-    LoadSource, TileLinearLoadExpr, TileLiteral, TileLoadExpr, TileReduceOp, TileRef,
-    TileStmt, TileStoreStmt, TileUnaryOp, WorkgroupAxis, F32, U32,
-};
-use crate::quantized::QuantizedMatrix;
 use super::value::boxed_u32_literal;
 use super::*;
+use crate::ir::{
+    Builtin, CoopOperandRole, DotK, ElementType, Expr, F32Vec4, Layout, LoadSource, LocalRef,
+    MemoryLevel, Numeric, PackedActivations, Shape, TileBinaryOp, TileIndexedStoreStmt,
+    TileLinearLoadExpr, TileLiteral, TileLoadExpr, TileReduceOp, TileRef, TileStmt, TileStoreStmt,
+    TileUnaryOp, WorkgroupAxis, F32, U32,
+};
+use crate::quantized::QuantizedMatrix;
 
 macro_rules! tile_reduce_entrypoints {
     ($(($reduce:ident, $loop_reduce:ident, $group_reduce:ident, $subgroup_reduce:ident, $op:ident)),+ $(,)?) => {
@@ -72,11 +71,12 @@ pub struct TileBlock<'a, const BLOCK: usize> {
     pub(super) stmt_stack: Vec<Vec<TileStmt>>,
 }
 
-
 /// Wrap a `Builtin` as a `ScalarIndex` (u32-typed scalar). All `program.*_id`
 /// / `subgroup_*` getters are one-line wrappers over this.
 fn builtin_index(builtin: Builtin) -> ScalarIndex {
-    ScalarIndex { expr: Box::new(Expr::Builtin(builtin)) }
+    ScalarIndex {
+        expr: Box::new(Expr::Builtin(builtin)),
+    }
 }
 
 /// Boxed `f32` fill literal used by every `load*` entry point's `fill` field.
@@ -88,9 +88,7 @@ fn f32_fill(value: f32) -> Box<Expr> {
 /// the quantized-dot entry points that pack tile arrays into
 /// `PackedActivations` variants and by `sum`/`fold` that move the underlying
 /// expressions out of their typed wrappers.
-fn tiles_to_exprs<const BLOCK: usize>(
-    values: impl IntoIterator<Item = Tile<BLOCK>>,
-) -> Vec<Expr> {
+fn tiles_to_exprs<const BLOCK: usize>(values: impl IntoIterator<Item = Tile<BLOCK>>) -> Vec<Expr> {
     values.into_iter().map(|t| t.expr).collect()
 }
 
@@ -120,7 +118,9 @@ impl<const BLOCK: usize> TileBlock<'_, BLOCK> {
     }
 
     pub fn arange(&self) -> Range<BLOCK> {
-        Range { expr: Box::new(Expr::Builtin(Builtin::Lane)) }
+        Range {
+            expr: Box::new(Expr::Builtin(Builtin::Lane)),
+        }
     }
 
     pub fn lane_tile_2d<const ROWS: usize, const COLS: usize>(
@@ -336,8 +336,7 @@ impl<const BLOCK: usize> TileBlock<'_, BLOCK> {
 
         // Allocate the iterator-value local and one local per accumulator.
         let iter_var_local = self.program.alloc_local::<U32>();
-        let acc_locals: [LocalRef; N] =
-            std::array::from_fn(|_| self.program.alloc_local::<F32>());
+        let acc_locals: [LocalRef; N] = std::array::from_fn(|_| self.program.alloc_local::<F32>());
 
         // Build the body in a fresh stmt frame so we can capture exactly the
         // statements emitted by the closure.
@@ -399,9 +398,8 @@ impl<const BLOCK: usize> TileBlock<'_, BLOCK> {
         assert!(N > 0, "loop_fold_n must have at least one accumulator");
 
         // Allocate one local per accumulator, typed by the initial literal.
-        let acc_locals: [LocalRef; N] = std::array::from_fn(|i| {
-            self.program.alloc_local_element(initials[i].element())
-        });
+        let acc_locals: [LocalRef; N] =
+            std::array::from_fn(|i| self.program.alloc_local_element(initials[i].element()));
         // Allocate the iter_var local (unused by the body — bodies use
         // `Builtin::LoopIndex` to address the iteration index — but
         // `TileStmt::Fold` requires a name).
@@ -413,7 +411,10 @@ impl<const BLOCK: usize> TileBlock<'_, BLOCK> {
         // and yields the per-iteration values to combine into them.
         self.stmt_stack.push(Vec::new());
         let bodies = body(self);
-        let body_stmts = self.stmt_stack.pop().expect("loop_fold_n body frame missing");
+        let body_stmts = self
+            .stmt_stack
+            .pop()
+            .expect("loop_fold_n body frame missing");
 
         let binary_op = op.binary();
         let accumulators: Vec<crate::ir::FoldAccumulator> = bodies
@@ -498,9 +499,7 @@ impl<const BLOCK: usize> TileBlock<'_, BLOCK> {
         Tile {
             expr: Expr::QuantizedDot {
                 src: matrix.clone(),
-                activations: PackedActivations::F32(
-                    tiles_to_exprs(a),
-                ),
+                activations: PackedActivations::F32(tiles_to_exprs(a)),
                 k: DotK::Base(k_base.into_index()),
                 col: col.into_index(),
                 mask: mask.expr,
@@ -574,9 +573,7 @@ impl<const BLOCK: usize> TileBlock<'_, BLOCK> {
         Tile {
             expr: Expr::QuantizedDot {
                 src: matrix.clone(),
-                activations: PackedActivations::F32(
-                    tiles_to_exprs(a),
-                ),
+                activations: PackedActivations::F32(tiles_to_exprs(a)),
                 k: DotK::Block {
                     block: block.into_index(),
                     c0: ip.into_index(),
@@ -1039,4 +1036,3 @@ impl<const BLOCK: usize> TileBlock<'_, BLOCK> {
         }));
     }
 }
-

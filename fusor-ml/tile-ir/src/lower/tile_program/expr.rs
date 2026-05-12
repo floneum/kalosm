@@ -192,7 +192,13 @@ impl<'a> Lowerer<'a> {
                 let handles = values
                     .iter()
                     .map(|value| {
-                        self.lower_tile_expr_lane(expressions, scratch, body, value, spill_depth + 1)
+                        self.lower_tile_expr_lane(
+                            expressions,
+                            scratch,
+                            body,
+                            value,
+                            spill_depth + 1,
+                        )
                     })
                     .collect::<Result<Vec<_>, _>>()?;
                 let handles: [_; 4] = handles.try_into().expect("Compose4 carries exactly 4");

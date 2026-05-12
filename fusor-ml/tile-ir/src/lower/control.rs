@@ -42,13 +42,20 @@ impl<'a> Lowerer<'a> {
         let pointer = self.local_var(expressions, local);
         let mut block = Block::new();
         let current = Self::emit_load(expressions, &mut block, pointer);
-        let next = self.emit(expressions, &mut block, Expression::Binary {
-            op: BinaryOperator::Add,
-            left: current,
-            right: amount,
-        });
+        let next = self.emit(
+            expressions,
+            &mut block,
+            Expression::Binary {
+                op: BinaryOperator::Add,
+                left: current,
+                right: amount,
+            },
+        );
         block.push(
-            Statement::Store { pointer, value: next },
+            Statement::Store {
+                pointer,
+                value: next,
+            },
             Span::default(),
         );
         Statement::Block(block)
@@ -193,20 +200,17 @@ impl<'a> Lowerer<'a> {
     ) -> Result<(), LowerError> {
         // 1. Initialize each accumulator local from its init expression.
         for acc in accumulators {
-            let init_value =
-                self.lower_tile_expr(expressions, scratch, body, &acc.init)?;
+            let init_value = self.lower_tile_expr(expressions, scratch, body, &acc.init)?;
             let local = self.private_local(LocalRef::new(acc.name, acc.element))?;
             self.store_local(expressions, body, local, init_value);
         }
 
         // 2. Lower the iterator's count expression in the surrounding scope.
-        let count_handle =
-            self.lower_tile_expr(expressions, scratch, body, count)?;
+        let count_handle = self.lower_tile_expr(expressions, scratch, body, count)?;
 
         // 3. Emit the counted loop. Inside the body, store the loop index into
         //    iter_var's local so subsequent LoadLocal(iter_var) reads see it.
-        let iter_var_local =
-            self.private_local(LocalRef::new(iter_var, ElementType::U32))?;
+        let iter_var_local = self.private_local(LocalRef::new(iter_var, ElementType::U32))?;
         self.emit_dynamic_counted_loop(
             expressions,
             scratch,
@@ -233,8 +237,7 @@ impl<'a> Lowerer<'a> {
                 for acc in accumulators {
                     let value =
                         self.lower_tile_expr(expressions, scratch, loop_body, &acc.update)?;
-                    let acc_local =
-                        self.private_local(LocalRef::new(acc.name, acc.element))?;
+                    let acc_local = self.private_local(LocalRef::new(acc.name, acc.element))?;
                     self.store_local(expressions, loop_body, acc_local, value);
                 }
 
@@ -245,5 +248,4 @@ impl<'a> Lowerer<'a> {
             },
         )
     }
-
 }

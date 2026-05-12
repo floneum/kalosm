@@ -17,6 +17,8 @@ use crate::{
         },
         workgroup_shape::{Constraint, WorkgroupShape, WorkgroupShapeConstraints},
     },
+    nary_direct::apply_unary_function_chain,
+    nary_wise::UnaryFunctionChain,
     tensor::TensorData,
 };
 use fusor_tile_ir as tile_ir;
@@ -44,6 +46,7 @@ fn rms_norm_module_key(
     weight: &TensorData,
     bias: Option<&TensorData>,
     output: &TensorData,
+    post_chain_signature: u64,
 ) -> [u64; 2] {
     kernel_backend::module_key_from(|hasher| {
         variant.hash(hasher);
@@ -61,7 +64,21 @@ fn rms_norm_module_key(
         bias.map(|bias| kernel_backend::hash_layout(hasher, bias.layout()))
             .hash(hasher);
         kernel_backend::hash_layout(hasher, output.layout());
+        post_chain_signature.hash(hasher);
     })
+}
+
+/// Stable structural hash of a `UnaryFunctionChain` for cache-key use.
+/// Empty chain returns 0 so non-fused kernels share the existing cache slot.
+fn unary_chain_signature(chain: &UnaryFunctionChain) -> u64 {
+    if chain.functions.is_empty() {
+        return 0;
+    }
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::Hasher;
+    let mut hasher = DefaultHasher::new();
+    format!("{:?}", chain).hash(&mut hasher);
+    hasher.finish()
 }
 
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
@@ -107,6 +124,10 @@ pub(crate) struct RmsNormOperation {
     pub(crate) bias: Option<NodeIndex>,
     shape: Box<[usize]>,
     eps: f32,
+    /// Unary chain applied to each normalized output element in-register
+    /// before the store. Populated by `try_fuse_into_rmsnorm` when a
+    /// downstream `Nary` matches the element-wise fusion pattern.
+    pub(crate) post_element_wise: UnaryFunctionChain,
 }
 
 impl RmsNormOperation {
@@ -124,6 +145,7 @@ impl RmsNormOperation {
             bias,
             shape: shape.into(),
             eps,
+            post_element_wise: UnaryFunctionChain::empty(DataTypeEnum::F32),
         }
     }
 
@@ -142,6 +164,7 @@ impl RmsNormOperation {
             bias,
             shape: shape.into(),
             eps,
+            post_element_wise: UnaryFunctionChain::empty(DataTypeEnum::F32),
         }
     }
 
@@ -261,10 +284,17 @@ impl Operation for RmsNormOperation {
 
         let has_bias = bias.is_some();
         let has_residual = residual.is_some();
+        // The vec4 path is a pre-built kernel that doesn't accept an arbitrary
+        // post-element-wise chain; force the tile path when fusion has
+        // attached one. (The tile path applies the chain inline below.)
+        let post_chain_nonempty = !self.post_element_wise.functions.is_empty();
         let vec4_meta = graph
             .device()
             .subgroups_supported()
             .then(|| {
+                if post_chain_nonempty {
+                    return None;
+                }
                 build_vec4_rms_norm_meta(
                     input_view.clone(),
                     residual_view.clone(),
@@ -285,6 +315,7 @@ impl Operation for RmsNormOperation {
             KernelDeviceCaps::from_device(&graph.device()),
         );
         let dispatch_size = [rows, 1, 1];
+        let post_chain_signature = unary_chain_signature(&self.post_element_wise);
         let module_key = rms_norm_module_key(
             variant,
             rows,
@@ -298,6 +329,7 @@ impl Operation for RmsNormOperation {
             weight,
             bias,
             output,
+            post_chain_signature,
         );
         let kernel_label = match variant {
             RmsNormKernelVariant::Tile => "rms_norm",
@@ -342,11 +374,7 @@ impl Operation for RmsNormOperation {
                     );
                     let residual_ref = if has_residual {
                         meta.residual_offset_vec.map(|offset| {
-                            tile_ir::KernelTensorRef::with_offset(
-                                (),
-                                vec_layout.clone(),
-                                offset,
-                            )
+                            tile_ir::KernelTensorRef::with_offset((), vec_layout.clone(), offset)
                         })
                     } else {
                         None
@@ -358,11 +386,7 @@ impl Operation for RmsNormOperation {
                     );
                     let bias_ref = if has_bias {
                         meta.bias_offset_vec.map(|offset| {
-                            tile_ir::KernelTensorRef::with_offset(
-                                (),
-                                vec_layout.clone(),
-                                offset,
-                            )
+                            tile_ir::KernelTensorRef::with_offset((), vec_layout.clone(), offset)
                         })
                     } else {
                         None
@@ -397,6 +421,7 @@ impl Operation for RmsNormOperation {
             }
             buffers.push(output.buffer().clone());
 
+            let post_chain = self.post_element_wise.clone();
             kernel_backend::dynamic_kernel_from_hashed_ir(
                 &graph.device(),
                 rms_norm_module_cache(),
@@ -412,6 +437,7 @@ impl Operation for RmsNormOperation {
                         bias,
                         output_view,
                         self.eps,
+                        post_chain,
                     )
                 },
             )
@@ -458,7 +484,8 @@ fn build_vec4_rms_norm_meta(
     }
 
     let [input_row_stride, input_col_stride] = matrix_strides(input_view.layout.affine_strides())?;
-    let [output_row_stride, output_col_stride] = matrix_strides(output_view.layout.affine_strides())?;
+    let [output_row_stride, output_col_stride] =
+        matrix_strides(output_view.layout.affine_strides())?;
     if input_col_stride != 1
         || output_col_stride != 1
         || !input_view.offset.is_multiple_of(4)
@@ -530,6 +557,7 @@ fn build_rms_norm_tile_ir(
     bias: Option<&TensorData>,
     output_view: crate::mir::tile_direct::DirectMatrixLayout,
     eps: f32,
+    post_chain: UnaryFunctionChain,
 ) -> Option<tile_ir::KernelIr> {
     let rows = input_view.rows;
     let cols = input_view.cols;
@@ -617,6 +645,15 @@ fn build_rms_norm_tile_ir(
                     let bias_value = program.load(bias.at(0, &col), mask.clone(), 0.0);
                     normalized = normalized + bias_value;
                 }
+                // Apply any fused post-element-wise chain in-register before
+                // the store. Empty chain is a no-op (the loop below short-
+                // circuits and returns the value unchanged).
+                if !post_chain.functions.is_empty() {
+                    let (val, _) =
+                        apply_unary_function_chain(normalized, DataTypeEnum::F32, &post_chain)
+                            .expect("rms_norm post-chain validated at fuse time");
+                    normalized = val;
+                }
                 program.store(output.at(&row, col), normalized, mask);
             }
         });
@@ -671,7 +708,10 @@ mod tests {
                 },
             ),
         ];
-        assert_selector_generates(&selector, cases.map(|(variant, ctx)| (variant, ctx, caps())));
+        assert_selector_generates(
+            &selector,
+            cases.map(|(variant, ctx)| (variant, ctx, caps())),
+        );
     }
 
     #[tokio::test]

@@ -7,8 +7,8 @@
 //! `core` uses `Arc<wgpu::Buffer>`; tests can use `()`.
 
 use crate::{
-    ElementType, KernelIr, Layout, Numeric,
     tile::{ErasedStorage, Program, Storage},
+    ElementType, KernelIr, Layout, Numeric,
 };
 
 /// A runtime binding paired with the IR layout that describes how the kernel

@@ -126,59 +126,66 @@ pub(crate) fn build_serial_matmul_direct_kernel(
                 tile_ir::KernelTensorRef::new(y_buffer, y_layout),
             );
 
-            kb.program().program_grid::<BLOCK>(dispatch_size, |program| {
-                let lane = program.arange();
-                let group = linear_group(program, dispatch_size);
-                let flat = group * BLOCK as u32 + lane.clone();
-                let in_bounds = flat.lt(total_outputs);
-                let dims = output_dims_from_flat(
-                    tile_ir::tile::Tile::from_index(flat.clone()),
-                    &out_shape,
-                );
-                let k_index = tile_ir::tile::Tile::from_index(program.loop_index());
+            kb.program()
+                .program_grid::<BLOCK>(dispatch_size, |program| {
+                    let lane = program.arange();
+                    let group = linear_group(program, dispatch_size);
+                    let flat = group * BLOCK as u32 + lane.clone();
+                    let in_bounds = flat.lt(total_outputs);
+                    let dims = output_dims_from_flat(
+                        tile_ir::tile::Tile::from_index(flat.clone()),
+                        &out_shape,
+                    );
+                    let k_index = tile_ir::tile::Tile::from_index(program.loop_index());
 
-                let mut a_coords = dims[..rank - 1].to_vec();
-                a_coords.push(k_index.clone());
-                let mut b_coords = dims[..rank - 2].to_vec();
-                b_coords.push(k_index);
-                b_coords.push(dims[rank - 1].clone());
+                    let mut a_coords = dims[..rank - 1].to_vec();
+                    a_coords.push(k_index.clone());
+                    let mut b_coords = dims[..rank - 2].to_vec();
+                    b_coords.push(k_index);
+                    b_coords.push(dims[rank - 1].clone());
 
-                let a = program.load_erased(
-                    a_storage.at(0, layout_index(&a_meta_body, &a_coords)),
-                    in_bounds.clone(),
-                    zero_literal(a_meta_body.datatype),
-                );
-                let b = program.load_erased(
-                    b_storage.at(0, layout_index(&b_meta_body, &b_coords)),
-                    in_bounds.clone(),
-                    zero_literal(b_meta_body.datatype),
-                );
-                let (a, a_ty) =
-                    apply_unary_function_chain(a, a_meta_body.datatype, &operation.pre_element_wise[0])
-                        .expect("validated matmul pre_element_wise[0] chain");
-                let (b, b_ty) =
-                    apply_unary_function_chain(b, b_meta_body.datatype, &operation.pre_element_wise[1])
-                        .expect("validated matmul pre_element_wise[1] chain");
-                let a = cast_tile(a, a_ty, acc_dtype);
-                let b = cast_tile(b, b_ty, acc_dtype);
-                let product = a * b;
-                let sum = program.loop_fold(
-                    tile_ir::TileReduceOp::Sum,
-                    k,
-                    product,
-                    zero_literal(acc_dtype),
-                );
-                let sum = cast_tile(sum, acc_dtype, result_dtype);
-                let (sum, sum_ty) =
-                    apply_unary_function_chain(sum, result_dtype, &operation.post_element_wise)
-                        .expect("validated matmul post_element_wise chain");
-                let sum = cast_tile(sum, sum_ty, y_meta_body.datatype);
-                program.store_erased(
-                    y_storage.at(0, layout_index(&y_meta_body, &dims)),
-                    sum,
-                    in_bounds,
-                );
-            });
+                    let a = program.load_erased(
+                        a_storage.at(0, layout_index(&a_meta_body, &a_coords)),
+                        in_bounds.clone(),
+                        zero_literal(a_meta_body.datatype),
+                    );
+                    let b = program.load_erased(
+                        b_storage.at(0, layout_index(&b_meta_body, &b_coords)),
+                        in_bounds.clone(),
+                        zero_literal(b_meta_body.datatype),
+                    );
+                    let (a, a_ty) = apply_unary_function_chain(
+                        a,
+                        a_meta_body.datatype,
+                        &operation.pre_element_wise[0],
+                    )
+                    .expect("validated matmul pre_element_wise[0] chain");
+                    let (b, b_ty) = apply_unary_function_chain(
+                        b,
+                        b_meta_body.datatype,
+                        &operation.pre_element_wise[1],
+                    )
+                    .expect("validated matmul pre_element_wise[1] chain");
+                    let a = cast_tile(a, a_ty, acc_dtype);
+                    let b = cast_tile(b, b_ty, acc_dtype);
+                    let product = a * b;
+                    let sum = program.loop_fold(
+                        tile_ir::TileReduceOp::Sum,
+                        k,
+                        product,
+                        zero_literal(acc_dtype),
+                    );
+                    let sum = cast_tile(sum, acc_dtype, result_dtype);
+                    let (sum, sum_ty) =
+                        apply_unary_function_chain(sum, result_dtype, &operation.post_element_wise)
+                            .expect("validated matmul post_element_wise chain");
+                    let sum = cast_tile(sum, sum_ty, y_meta_body.datatype);
+                    program.store_erased(
+                        y_storage.at(0, layout_index(&y_meta_body, &dims)),
+                        sum,
+                        in_bounds,
+                    );
+                });
             Some(())
         },
     )

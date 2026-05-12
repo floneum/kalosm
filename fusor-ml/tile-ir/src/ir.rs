@@ -84,7 +84,6 @@ impl KernelIr {
     pub fn single_tile_program_grid(&self) -> Option<[u32; 3]> {
         Some(self.body.grid)
     }
-
 }
 
 /// A storage buffer declaration.

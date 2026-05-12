@@ -120,8 +120,9 @@ impl<'a> Lowerer<'a> {
         match stmt {
             TileStmt::Store(store) => Self::tile_expr_any(&store.value, pred),
             TileStmt::StoreIndexed(store) => Self::tile_expr_any(&store.value, pred),
-            TileStmt::StoreLocal { value, .. }
-            | TileStmt::StoreWorkgroup { value, .. } => Self::tile_expr_any(value, pred),
+            TileStmt::StoreLocal { value, .. } | TileStmt::StoreWorkgroup { value, .. } => {
+                Self::tile_expr_any(value, pred)
+            }
             TileStmt::If {
                 condition,
                 accept,
@@ -133,9 +134,7 @@ impl<'a> Lowerer<'a> {
                         .chain(reject.iter())
                         .any(|stmt| Self::tile_stmt_expr_any(stmt, pred))
             }
-            TileStmt::Loop { body } => {
-                body.iter().any(|stmt| Self::tile_stmt_expr_any(stmt, pred))
-            }
+            TileStmt::Loop { body } => body.iter().any(|stmt| Self::tile_stmt_expr_any(stmt, pred)),
             TileStmt::Fold {
                 count,
                 body: fold_body,
@@ -143,9 +142,7 @@ impl<'a> Lowerer<'a> {
                 ..
             } => {
                 Self::tile_expr_any(count, pred)
-                    || fold_body
-                        .iter()
-                        .any(|s| Self::tile_stmt_expr_any(s, pred))
+                    || fold_body.iter().any(|s| Self::tile_stmt_expr_any(s, pred))
                     || accumulators.iter().any(|acc| {
                         Self::tile_expr_any(&acc.init, pred)
                             || Self::tile_expr_any(&acc.update, pred)
@@ -175,15 +172,11 @@ impl<'a> Lowerer<'a> {
     {
         match expr {
             Expr::Reduce { value, .. } => pred(value),
-            Expr::LoadLocal(_)
-            | Expr::Literal(_)
-            | Expr::Builtin(_) => false,
+            Expr::LoadLocal(_) | Expr::Literal(_) | Expr::Builtin(_) => false,
             Expr::Load(load) => {
                 pred(&load.row) || pred(&load.col) || pred(&load.mask) || pred(&load.fill)
             }
-            Expr::LoadLinear(load) => {
-                pred(&load.index) || pred(&load.mask) || pred(&load.fill)
-            }
+            Expr::LoadLinear(load) => pred(&load.index) || pred(&load.mask) || pred(&load.fill),
             Expr::LoadWorkgroup { index, .. } => pred(index),
             Expr::QuantizedBlockLane {
                 k_base,
@@ -214,9 +207,7 @@ impl<'a> Lowerer<'a> {
                 ..
             } => {
                 let activations_match = match activations {
-                    PackedActivations::F32(a) | PackedActivations::Q8(a) => {
-                        a.iter().any(&mut pred)
-                    }
+                    PackedActivations::F32(a) | PackedActivations::Q8(a) => a.iter().any(&mut pred),
                     PackedActivations::Q4KGgml { low, high, sums } => low
                         .iter()
                         .chain(high.iter())
@@ -248,10 +239,7 @@ impl<'a> Lowerer<'a> {
     /// Pre-order tree-any over a `TileStmt`: returns true if `pred` matches
     /// the statement itself or any nested child. Visitors that test a
     /// statement-shape predicate (no expr walking) compose on top of this.
-    fn tile_stmt_tree_any(
-        stmt: &TileStmt,
-        pred: &mut impl FnMut(&TileStmt) -> bool,
-    ) -> bool {
+    fn tile_stmt_tree_any(stmt: &TileStmt, pred: &mut impl FnMut(&TileStmt) -> bool) -> bool {
         if pred(stmt) {
             return true;
         }

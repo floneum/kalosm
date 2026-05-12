@@ -5,7 +5,7 @@ use std::{
 };
 
 use crate::{
-    Layout,
+    DataTypeEnum, Layout,
     mir::{direct_kernel::PreparedDirectDispatch, inputs::MirValue, operation::Operation},
     nary_direct::eval_nary_expr_on_tiles,
     nary_wise::{ExtractedUnaryChain, NaryExpr, NaryOperation, UnaryFunctionChain},
@@ -988,13 +988,14 @@ impl Resolver {
                 op.matrix.clone(),
             ))),
             ComputeGraphNodeVariant::QMatMulPaired(op) => Some(Arc::new(
-                crate::quantized::matmul::QMatMulPairedOperation::new(
+                crate::quantized::matmul::QMatMulPairedOperation::new_with_extras(
                     op.input_datatype,
                     &op.in_shape,
                     op.input,
                     op.matrix.clone(),
                     op.pair_len,
                     op.epilogue.clone(),
+                    op.extras.clone(),
                 ),
             )),
             ComputeGraphNodeVariant::Dequantize(op) => Some(Arc::new(op.clone())),
@@ -1027,6 +1028,12 @@ impl Resolver {
                 ComputeGraphNodeVariant::QMatMul(_)
             )
         });
+        let has_rmsnorm = self.execution_graph.node_indices().any(|node| {
+            matches!(
+                self.execution_graph[node].variant,
+                ComputeGraphNodeVariant::RmsNorm(_)
+            )
+        });
         let mut worklist: VecDeque<ExecutionNodeIndex> = self
             .execution_graph
             .node_indices()
@@ -1051,8 +1058,9 @@ impl Resolver {
             // 2. Try to fuse resulting nary into specialized ops (reduce, matmul, etc.)
             let changed = self.try_fuse_naries(graph, node_idx)
                 || (has_reduce && self.try_fuse_into_reduce(graph, node_idx))
-                || (has_matmul && self.try_fuse_into_matmul(graph, node_idx))
-                || (has_qmatmul && self.try_fuse_paired_qmatmul(graph, node_idx));
+                || ((has_matmul || has_qmatmul) && self.try_fuse_into_matmul(graph, node_idx))
+                || (has_qmatmul && self.try_fuse_paired_qmatmul(graph, node_idx))
+                || (has_rmsnorm && self.try_fuse_into_rmsnorm(graph, node_idx));
 
             if changed {
                 // Re-add the current node to worklist if it still exists
@@ -1093,7 +1101,10 @@ impl Resolver {
     fn is_optimization_candidate(&self, node_idx: ExecutionNodeIndex) -> bool {
         matches!(
             self.execution_graph[node_idx].variant,
-            ComputeGraphNodeVariant::Nary(_) | ComputeGraphNodeVariant::MatMul(_)
+            ComputeGraphNodeVariant::Nary(_)
+                | ComputeGraphNodeVariant::MatMul(_)
+                | ComputeGraphNodeVariant::QMatMul(_)
+                | ComputeGraphNodeVariant::RmsNorm(_)
         )
     }
 
@@ -1112,6 +1123,33 @@ impl Resolver {
 
     fn get_input_node_in_exec_graph(&self, inner_input: NodeIndex) -> Option<ExecutionNodeIndex> {
         self.node_mapping.get(&inner_input).copied()
+    }
+
+    fn walk_map_layout_chain(
+        &self,
+        mut inner: NodeIndex,
+    ) -> Option<(NodeIndex, Vec<crate::map_layout::MapLayoutOperation>)> {
+        let mut chain = Vec::new();
+        loop {
+            let exec = self.get_input_node_in_exec_graph(inner)?;
+            let ComputeGraphNodeVariant::MapLayout(map) =
+                self.execution_graph[exec].variant.clone()
+            else {
+                chain.reverse();
+                return Some((inner, chain));
+            };
+            inner = map.input;
+            chain.push(map);
+        }
+    }
+
+    fn apply_map_layout_chain(
+        base: &Layout,
+        chain: &[crate::map_layout::MapLayoutOperation],
+    ) -> Layout {
+        chain
+            .iter()
+            .fold(base.clone(), |layout, map| map.map_layout(&layout))
     }
 
     fn check_cached(&self, graph: &ComputeGraphInner, inner_idx: NodeIndex) -> bool {
@@ -1523,7 +1561,7 @@ impl Resolver {
     ) -> bool {
         let node_variant = self.execution_graph[node_idx].variant.clone();
 
-        // Post-op: fuse elementwise after matmul
+        // Post-op: fuse elementwise after matmul (dense or quantized).
         if let Some(el_op) = Self::try_get_unary_chain(&node_variant) {
             let input_inner = el_op.value;
             if !self.check_cached(graph, input_inner)
@@ -1556,7 +1594,77 @@ impl Resolver {
                     self.remove_node_if_dead(input_exec_idx);
                     return true;
                 }
+                // Parallel QMatMul arm: fold the unary chain into the qmatmul
+                // op's `post_element_wise`. The qgemv kernels consume it via
+                // `qgemv_with_epilogue` and apply it in-register before store.
+                // Only fires for single-row qgemv variants today (multi-row
+                // qmatmul tile paths don't yet support the epilogue parameter).
+                if let ComputeGraphNodeVariant::QMatMul(qmatmul_op) = input_variant {
+                    if el_op.functions.input_datatype() != crate::DataTypeEnum::F32
+                        || el_op.functions.out_datatype() != crate::DataTypeEnum::F32
+                    {
+                        return false;
+                    }
+                    let mut new_q = qmatmul_op.clone();
+                    let mut existing = new_q.post_element_wise.functions.clone();
+                    existing.extend(el_op.functions.functions.iter().cloned());
+                    new_q.post_element_wise = UnaryFunctionChain::new(
+                        existing,
+                        qmatmul_op.post_element_wise.input_datatype(),
+                    );
+
+                    self.execution_graph[node_idx].variant =
+                        ComputeGraphNodeVariant::QMatMul(new_q);
+
+                    let input_inner_of_qmatmul = qmatmul_op.input;
+                    if let Some(idx) = self.get_input_node_in_exec_graph(input_inner_of_qmatmul) {
+                        self.execution_graph.add_edge(idx, node_idx, ());
+                    }
+                    if let Some(edge) = self.execution_graph.find_edge(input_exec_idx, node_idx) {
+                        self.execution_graph.remove_edge(edge);
+                    }
+                    self.add_physical_dependencies(graph, node_idx, &[input_inner_of_qmatmul]);
+                    self.remove_node_if_dead(input_exec_idx);
+                    return true;
+                }
             }
+        }
+
+        // Pre-op (QMatMul): fuse element-wise unary upstream of the qmatmul
+        // input into `pre_element_wise`. The qgemv kernels apply this chain to
+        // each loaded activation tile before the dot.
+        if let ComputeGraphNodeVariant::QMatMul(qmatmul_op) = &node_variant
+            && !self.check_cached(graph, qmatmul_op.input)
+            && let Some(input_exec) = self.get_input_node_in_exec_graph(qmatmul_op.input)
+            && let Some(el_op) =
+                Self::try_get_unary_chain(&self.execution_graph[input_exec].variant)
+        {
+            if el_op.functions.input_datatype() != crate::DataTypeEnum::F32
+                || el_op.functions.out_datatype() != crate::DataTypeEnum::F32
+            {
+                return false;
+            }
+            let mut new_q = qmatmul_op.clone();
+            new_q.input = el_op.value;
+            let mut functions = el_op.functions.functions.clone();
+            functions.extend(new_q.pre_element_wise.functions.iter().cloned());
+            new_q.pre_element_wise =
+                UnaryFunctionChain::new(functions, el_op.functions.input_datatype());
+
+            self.execution_graph[node_idx].variant =
+                ComputeGraphNodeVariant::QMatMul(new_q.clone());
+
+            if new_q.input != qmatmul_op.input {
+                if let Some(edge) = self.execution_graph.find_edge(input_exec, node_idx) {
+                    self.execution_graph.remove_edge(edge);
+                }
+                if let Some(new) = self.get_input_node_in_exec_graph(new_q.input) {
+                    self.execution_graph.add_edge(new, node_idx, ());
+                }
+                self.remove_node_if_dead(input_exec);
+            }
+            self.add_physical_dependencies(graph, node_idx, &[new_q.input]);
+            return true;
         }
 
         // Pre-op: fuse elementwise before matmul inputs
@@ -1648,7 +1756,10 @@ impl Resolver {
         };
         let Some(split) = nary.try_extract_paired_split() else {
             if trace {
-                eprintln!("paired-fuse: extract_paired_split failed on nary {:?}", node_idx);
+                eprintln!(
+                    "paired-fuse: extract_paired_split failed on nary {:?}",
+                    node_idx
+                );
             }
             return false;
         };
@@ -1660,48 +1771,111 @@ impl Resolver {
             );
         }
 
-        // Both inputs must be MapLayout views in the live execution graph.
-        let Some(a_exec) = self.get_input_node_in_exec_graph(split.input_a) else {
-            return false;
-        };
-        let Some(b_exec) = self.get_input_node_in_exec_graph(split.input_b) else {
-            return false;
-        };
-        let a_variant = self.execution_graph[a_exec].variant.clone();
-        let b_variant = self.execution_graph[b_exec].variant.clone();
-        let ComputeGraphNodeVariant::MapLayout(a_map) = a_variant else {
+        // Classify each Nary input as either a matmul-view (MapLayout
+        // whose source is the same QMatMul) or an extra (broadcast bias
+        // vector). Broadcasts in fusor are emitted as `MapLayout(rank-1
+        // leaf)` with stride-0 dims, so a MapLayout can appear for either
+        // role; disambiguate by the source-node kind. The original (un-
+        // broadcasted) NodeIndex is stored for extras so the kernel can
+        // load the rank-1 tensor directly with `bias[col]` semantics.
+        // Each matmul-view slot carries the chain of MapLayouts that wrap the
+        // common qmatmul (innermost-first), so we can compose them onto the
+        // qmatmul's base layout to recover the view's effective layout.
+        let mut matmul_view_slots: Vec<(
+            usize,
+            ExecutionNodeIndex,
+            Vec<crate::map_layout::MapLayoutOperation>,
+        )> = Vec::new();
+        let mut extra_slots: Vec<(usize, NodeIndex)> = Vec::new();
+        let mut common_qmatmul_inner: Option<NodeIndex> = None;
+        for (slot_idx, input_inner) in split.inputs.iter().enumerate() {
+            if !split.inputs_seen[slot_idx] {
+                return false;
+            }
+            let Some(exec_idx) = self.get_input_node_in_exec_graph(*input_inner) else {
+                return false;
+            };
             if trace {
                 eprintln!(
-                    "paired-fuse: input_a not MapLayout, variant={}",
-                    node_category(&self.execution_graph[a_exec].variant)
+                    "paired-fuse: input slot {} ({:?}) variant={}",
+                    slot_idx,
+                    input_inner,
+                    node_category(&self.execution_graph[exec_idx].variant)
                 );
             }
-            return false;
-        };
-        let ComputeGraphNodeVariant::MapLayout(b_map) = b_variant else {
-            if trace {
-                eprintln!(
-                    "paired-fuse: input_b not MapLayout, variant={}",
-                    node_category(&self.execution_graph[b_exec].variant)
-                );
+            match self.execution_graph[exec_idx].variant.clone() {
+                ComputeGraphNodeVariant::MapLayout(_map) => {
+                    // Walk the MapLayout chain to the ultimate source. fusor
+                    // can stack MapLayouts (e.g. narrow + broadcast_as), and
+                    // any QMatMul-rooted chain is treated as a matmul-view
+                    // (its composed layout closure is invoked later).
+                    let (source_inner, composed) = match self.walk_map_layout_chain(*input_inner) {
+                        Some(walked) => walked,
+                        None => return false,
+                    };
+                    let source_exec = self.get_input_node_in_exec_graph(source_inner);
+                    let source_is_qmatmul = source_exec
+                        .map(|e| {
+                            matches!(
+                                self.execution_graph[e].variant,
+                                ComputeGraphNodeVariant::QMatMul(_)
+                            )
+                        })
+                        .unwrap_or(false);
+                    if trace {
+                        eprintln!(
+                            "paired-fuse:   slot {} chain bottom={:?} source_variant={}",
+                            slot_idx,
+                            source_inner,
+                            source_exec
+                                .map(|e| node_category(&self.execution_graph[e].variant))
+                                .unwrap_or("<none>"),
+                        );
+                    }
+                    if source_is_qmatmul {
+                        match common_qmatmul_inner {
+                            None => common_qmatmul_inner = Some(source_inner),
+                            Some(existing) if existing == source_inner => {}
+                            Some(_) => {
+                                if trace {
+                                    eprintln!(
+                                        "paired-fuse: matmul-view slots reference different qmatmuls"
+                                    );
+                                }
+                                return false;
+                            }
+                        }
+                        matmul_view_slots.push((slot_idx, exec_idx, composed));
+                    } else {
+                        // Broadcast-extra path: chain bottoms at a leaf
+                        // tensor (e.g. bias). Use the source NodeIndex so
+                        // the kernel loads the un-broadcasted rank-1
+                        // tensor as `Storage<F32, 1>`.
+                        extra_slots.push((slot_idx, source_inner));
+                    }
+                }
+                _ => {
+                    extra_slots.push((slot_idx, *input_inner));
+                }
             }
-            return false;
-        };
-        if a_map.input != b_map.input {
+        }
+        if matmul_view_slots.len() != 2 {
             if trace {
                 eprintln!(
-                    "paired-fuse: a.input={:?} != b.input={:?}",
-                    a_map.input, b_map.input
+                    "paired-fuse: expected 2 matmul-view slots, found {}",
+                    matmul_view_slots.len()
                 );
             }
             return false;
         }
+        let Some(qmatmul_inner) = common_qmatmul_inner else {
+            return false;
+        };
 
         // Common source must be an uncached QMatMul.
-        if self.check_cached(graph, a_map.input) {
+        if self.check_cached(graph, qmatmul_inner) {
             return false;
         }
-        let qmatmul_inner = a_map.input;
         let Some(qmatmul_exec) = self.get_input_node_in_exec_graph(qmatmul_inner) else {
             return false;
         };
@@ -1718,10 +1892,13 @@ impl Resolver {
         };
 
         // The qmatmul produces a contiguous output of its declared out_shape;
-        // apply each MapLayout closure to that base layout to recover the views.
+        // apply each MapLayout closure to that base layout to recover the
+        // gate/up views.
         let qmatmul_layout = Layout::contiguous(&qmatmul_op.out_shape);
-        let a_layout = a_map.map_layout(&qmatmul_layout);
-        let b_layout = b_map.map_layout(&qmatmul_layout);
+        let (a_slot, a_exec, a_map) = matmul_view_slots[0].clone();
+        let (b_slot, b_exec, b_map) = matmul_view_slots[1].clone();
+        let a_layout = Self::apply_map_layout_chain(&qmatmul_layout, &a_map);
+        let b_layout = Self::apply_map_layout_chain(&qmatmul_layout, &b_map);
 
         let q_shape = qmatmul_layout.shape();
         let a_shape = a_layout.shape();
@@ -1751,16 +1928,18 @@ impl Resolver {
         let Some(b_expected_offset) = q_offset.checked_add(shift) else {
             return false;
         };
-        // Determine which input is the gate (offset 0) and which is up (offset N).
-        // The kernel always passes (gate, up) to the epilogue, but the captured
-        // NaryExpr's `IndexedInput(0)` / `IndexedInput(1)` map to whichever of
-        // a/b each side of the layout split corresponds to.
+        // Determine which slot is the gate (offset 0) and which is up
+        // (offset pair_len). The kernel always passes (gate, up, extras...)
+        // to the epilogue closure, but the captured NaryExpr's
+        // `IndexedInput(i, _)` slots refer to the original Nary input
+        // ordering. Build a permutation: gate_input_idx -> slot 0,
+        // up_input_idx -> slot 1, extra_k's input_idx -> slot 2+k.
         let (gate_input_idx, up_input_idx) = if a_layout.offset() == q_offset
             && b_layout.offset() == b_expected_offset
         {
-            (0usize, 1usize)
+            (a_slot, b_slot)
         } else if b_layout.offset() == q_offset && a_layout.offset() == b_expected_offset {
-            (1usize, 0usize)
+            (b_slot, a_slot)
         } else {
             if trace {
                 eprintln!(
@@ -1774,60 +1953,151 @@ impl Resolver {
             return false;
         };
 
-        // Synthesize the epilogue closure. Captures the recorded NaryExpr and
-        // re-emits it at the tile-IR level inside the qgemv kernel, with
-        // `IndexedInput(gate_input_idx)` substituted by `gate_tile` and
-        // `IndexedInput(up_input_idx)` substituted by `up_tile`.
+        // Permutation: for each captured-NaryExpr input slot, the closure
+        // tile-slice index it maps to.
+        let total_inputs = split.inputs.len();
+        let mut input_slot_to_tile_idx = vec![usize::MAX; total_inputs];
+        input_slot_to_tile_idx[gate_input_idx] = 0;
+        input_slot_to_tile_idx[up_input_idx] = 1;
+        let extras_order: Vec<NodeIndex> = extra_slots
+            .iter()
+            .enumerate()
+            .map(|(k, (slot_idx, inner))| {
+                input_slot_to_tile_idx[*slot_idx] = 2 + k;
+                *inner
+            })
+            .collect();
+        let extras_count = extras_order.len();
+
+        // Synthesize the epilogue closure. Captures the recorded NaryExpr
+        // and re-emits it at tile-IR level inside the qgemv kernel,
+        // substituting each input slot with the corresponding tile from the
+        // closure's slice via `input_slot_to_tile_idx`.
         let expression = split.expression.clone();
         let datatype = qmatmul_op.input_datatype;
         let output_datatype = split.output_datatype;
-        let epilogue = fusor_tile_ir_kernels::PairedEpilogue::new("autofused", move |gate, up| {
-            let mut inputs = vec![(gate.clone(), datatype); 2];
-            inputs[gate_input_idx] = (gate, datatype);
-            inputs[up_input_idx] = (up, datatype);
-            let (tile, _) = eval_nary_expr_on_tiles(&expression, &inputs, output_datatype);
-            tile
-        });
+        let permutation = input_slot_to_tile_idx.clone();
+        let epilogue = fusor_tile_ir_kernels::PairedEpilogue::with_extras(
+            "autofused_with_extras",
+            extras_count,
+            move |tiles| {
+                // Re-order the closure's tile slice to match the captured
+                // NaryExpr's input numbering.
+                let inputs: Vec<(fusor_tile_ir::tile::Tile<1>, DataTypeEnum)> = permutation
+                    .iter()
+                    .map(|&tile_idx| (tiles[tile_idx].clone(), datatype))
+                    .collect();
+                let (tile, _) = eval_nary_expr_on_tiles(&expression, &inputs, output_datatype);
+                tile
+            },
+        );
 
-        let paired_op = QMatMulPairedOperation::new(
+        let paired_op = QMatMulPairedOperation::new_with_extras(
             qmatmul_op.input_datatype,
             &qmatmul_op.in_shape,
             qmatmul_op.input,
             qmatmul_op.matrix.clone(),
             pair_len,
             epilogue,
+            extras_order,
         );
 
         if trace {
             eprintln!(
-                "paired-fuse: rewriting nary {:?} -> QMatMulPaired (pair_len={})",
-                node_idx, pair_len
+                "paired-fuse: rewriting nary {:?} -> QMatMulPaired (pair_len={}, extras={})",
+                node_idx, pair_len, extras_count
             );
         }
 
         // Rewrite this Nary's variant in place; the produced shape and edges
-        // already match the new operation (paired output shape ==
-        // a-view shape == b-view shape == this nary's output shape).
-        self.execution_graph[node_idx].variant =
-            ComputeGraphNodeVariant::QMatMulPaired(paired_op);
+        // already match the new operation.
+        self.execution_graph[node_idx].variant = ComputeGraphNodeVariant::QMatMulPaired(paired_op);
 
-        // Re-wire incoming dependency edges. The new op consumes only the
-        // qmatmul input; the gate/up views and the qmatmul itself are now dead.
+        // Re-wire incoming dependency edges. The new op consumes the qmatmul
+        // input *and* every extra; the matmul views and the qmatmul itself
+        // are now dead.
         let qmatmul_input_inner = qmatmul_op.input;
-        if let Some(input_exec) = self.get_input_node_in_exec_graph(qmatmul_input_inner)
-            && self.execution_graph.find_edge(input_exec, node_idx).is_none()
-        {
-            self.execution_graph.add_edge(input_exec, node_idx, ());
+        let mut new_deps = vec![qmatmul_input_inner];
+        for (_, extra_inner) in &extra_slots {
+            new_deps.push(*extra_inner);
+        }
+        for dep in &new_deps {
+            if let Some(input_exec) = self.get_input_node_in_exec_graph(*dep)
+                && self
+                    .execution_graph
+                    .find_edge(input_exec, node_idx)
+                    .is_none()
+            {
+                self.execution_graph.add_edge(input_exec, node_idx, ());
+            }
         }
         for stale in [a_exec, b_exec] {
             if let Some(edge) = self.execution_graph.find_edge(stale, node_idx) {
                 self.execution_graph.remove_edge(edge);
             }
         }
-        self.add_physical_dependencies(graph, node_idx, &[qmatmul_input_inner]);
+        self.add_physical_dependencies(graph, node_idx, &new_deps);
         for stale in [a_exec, b_exec, qmatmul_exec] {
             self.remove_node_if_dead(stale);
         }
+        true
+    }
+
+    /// Fuse a downstream unary element-wise Nary into an `RmsNorm`'s
+    /// `post_element_wise` chain. Mirrors `try_fuse_into_matmul`'s post-op arm.
+    fn try_fuse_into_rmsnorm(
+        &mut self,
+        graph: &mut ComputeGraphInner,
+        node_idx: ExecutionNodeIndex,
+    ) -> bool {
+        let ComputeGraphNodeVariant::Nary(_) = &self.execution_graph[node_idx].variant else {
+            return false;
+        };
+        let node_variant = self.execution_graph[node_idx].variant.clone();
+        let Some(el_op) = Self::try_get_unary_chain(&node_variant) else {
+            return false;
+        };
+        let input_inner = el_op.value;
+        if self.check_cached(graph, input_inner) {
+            return false;
+        }
+        let Some(input_exec_idx) = self.get_input_node_in_exec_graph(input_inner) else {
+            return false;
+        };
+        let input_variant = self.execution_graph[input_exec_idx].variant.clone();
+        let ComputeGraphNodeVariant::RmsNorm(rms_op) = input_variant else {
+            return false;
+        };
+        let mut new_rms = rms_op.clone();
+        let mut existing = new_rms.post_element_wise.functions.clone();
+        existing.extend(el_op.functions.functions.iter().cloned());
+        new_rms.post_element_wise =
+            UnaryFunctionChain::new(existing, rms_op.post_element_wise.input_datatype());
+
+        self.execution_graph[node_idx].variant = ComputeGraphNodeVariant::RmsNorm(new_rms.clone());
+
+        // Re-wire dependency edges: the new RmsNorm node consumes whatever the
+        // old one consumed (input, residual?, weight, bias?).
+        let mut deps = vec![new_rms.input];
+        if let Some(residual) = new_rms.residual {
+            deps.push(residual);
+        }
+        deps.push(new_rms.weight);
+        if let Some(bias) = new_rms.bias {
+            deps.push(bias);
+        }
+        for &dep in &deps {
+            if let Some(idx) = self.get_input_node_in_exec_graph(dep)
+                && self.execution_graph.find_edge(idx, node_idx).is_none()
+            {
+                self.execution_graph.add_edge(idx, node_idx, ());
+            }
+        }
+        if let Some(edge) = self.execution_graph.find_edge(input_exec_idx, node_idx) {
+            self.execution_graph.remove_edge(edge);
+        }
+        self.add_physical_dependencies(graph, node_idx, &deps);
+        self.remove_node_if_dead(input_exec_idx);
         true
     }
 }
