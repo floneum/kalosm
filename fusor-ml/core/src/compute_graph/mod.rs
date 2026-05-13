@@ -22,7 +22,7 @@ use crate::{
     mir::{inputs::MirValue, operation::Operation},
     nary_wise::NaryOperation,
     quantized::embedding::QEmbeddingOperation,
-    quantized::matmul::{QMatMulOperation, QMatMulPairedOperation},
+    quantized::matmul::QMatMulOperation,
     resize::ResizeOperation,
     slice_assign::SliceAssignOperation,
     tensor::TensorData,
@@ -64,10 +64,6 @@ impl ComputeGraph {
 
     pub(crate) fn create_q_mat_mul(&self, op: QMatMulOperation) -> NodeIndex {
         self.create_node(ComputeGraphNodeVariant::QMatMul(op))
-    }
-
-    pub(crate) fn create_q_mat_mul_paired(&self, op: QMatMulPairedOperation) -> NodeIndex {
-        self.create_node(ComputeGraphNodeVariant::QMatMulPaired(op))
     }
 
     pub(crate) fn create_q_embedding(&self, op: QEmbeddingOperation) -> NodeIndex {
@@ -242,7 +238,6 @@ pub(crate) enum ComputeGraphNodeVariant {
     QEmbedding(QEmbeddingOperation),
     MatMul(MatMulOperation),
     QMatMul(QMatMulOperation),
-    QMatMulPaired(QMatMulPairedOperation),
     Tensor(TensorData),
     Reduce(ReduceOperation),
     RmsNorm(RmsNormOperation),
@@ -263,9 +258,11 @@ impl ComputeGraphNodeVariant {
             }
             ComputeGraphNodeVariant::QMatMul(op) => {
                 f(op.input);
-            }
-            ComputeGraphNodeVariant::QMatMulPaired(op) => {
-                f(op.input);
+                if let Some(paired) = &op.paired {
+                    for extra in &paired.extras {
+                        f(*extra);
+                    }
+                }
             }
             ComputeGraphNodeVariant::QEmbedding(op) => {
                 f(op.indexes);

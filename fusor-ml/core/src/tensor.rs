@@ -17,7 +17,7 @@ use crate::{
     map_layout::MapLayoutOperation,
     nary_wise::{NaryExpr, NaryFunction, NaryOperation},
     quantized::QMatrix,
-    quantized::matmul::{QMatMulOperation, QMatMulPairedOperation},
+    quantized::matmul::QMatMulOperation,
     resize::ResizeOperation,
     rms_norm::RmsNormOperation,
     slice_assign::SliceAssignOperation,
@@ -308,15 +308,6 @@ impl LazyTensorData {
         let mut info = self.info.clone();
         info.shape = function.out_shape.clone();
         let key = device.compute_graph().create_q_mat_mul(function);
-
-        Self::from_parts(device, info, key)
-    }
-
-    pub(crate) fn q_mat_mul_paired(&self, function: QMatMulPairedOperation) -> Self {
-        let device = self.device.clone();
-        let mut info = self.info.clone();
-        info.shape = function.out_shape.clone();
-        let key = device.compute_graph().create_q_mat_mul_paired(function);
 
         Self::from_parts(device, info, key)
     }
@@ -832,24 +823,6 @@ impl<D: DataType, const R: usize> Tensor<R, D> {
             QMatMulOperation::new(self.datatype(), self.shape(), self.data.key, other.clone());
 
         Self::from_parts(self.data.q_mat_mul(operation))
-    }
-
-    pub(crate) fn add_q_mat_mul_paired(
-        &self,
-        other: &QMatrix,
-        pair_len: usize,
-        epilogue: fusor_tile_ir_kernels::PairedEpilogue,
-    ) -> Self {
-        let operation = QMatMulPairedOperation::new(
-            self.datatype(),
-            self.shape(),
-            self.data.key,
-            other.clone(),
-            pair_len,
-            epilogue,
-        );
-
-        Self::from_parts(self.data.q_mat_mul_paired(operation))
     }
 
     pub(crate) fn add_resize<const R2: usize>(&self, op: ResizeOperation) -> Tensor<R2, D> {

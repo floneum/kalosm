@@ -167,7 +167,7 @@ async fn assert_q_mat_mul_matches_host_reference(fixture: &QuantizedFixture, fuz
 }
 
 #[tokio::test]
-async fn q4k_q_mat_mul_paired_matches_cpu_reference() {
+async fn q4k_paired_natural_form_matches_cpu_reference() {
     for kind in [PairedKind::SwiGLU, PairedKind::GeGLU, PairedKind::ReGLU] {
         for rows in [1, 4] {
             paired_matches_cpu_for_rows(rows, kind).await;
@@ -199,28 +199,32 @@ impl PairedKind {
             }
         }
     }
-
-    fn epilogue(self) -> fusor::PairedEpilogue {
-        match self {
-            PairedKind::SwiGLU => fusor::PairedEpilogue::swiglu(),
-            PairedKind::GeGLU => fusor::PairedEpilogue::geglu(),
-            PairedKind::ReGLU => fusor::PairedEpilogue::reglu(),
-        }
-    }
 }
 
 async fn paired_matches_cpu_for_rows(input_row_count: usize, kind: PairedKind) {
+    use fusor::D;
     let ty = GgmlType::Q4K;
     let weight_shape = [4, 512];
     let raw_bytes = q4k_raw_bytes(weight_shape);
     let weights = QuantizedTensor::<BlockQ4K>::from_raw_bytes(weight_shape, &raw_bytes);
     let expected_weights = concrete_to_rows(&weights.dequantize::<2>(), weight_shape);
 
+    // Author the natural unfused source — the resolver's paired-fusion rule
+    // rewrites this into a single paired-mode QMatMul kernel. Correctness verifies
+    // both the rewrite and the kernel's per-output epilogue evaluation.
     fusor_conformance::assert(move |input: Tensor<2, f32>| {
         let raw_bytes = raw_bytes.clone();
         async move {
             let weights = qmatrix_from_raw_bytes(&input.device(), weight_shape, &raw_bytes, ty);
-            input.q_mat_mul_paired(&weights, 2, kind.epilogue())
+            let projected = input.q_mat_mul(&weights);
+            let gate = projected.narrow(D::Minus1, 0, 2).to_concrete();
+            let up = projected.narrow(D::Minus1, 2, 2).to_concrete();
+            let activated = match kind {
+                PairedKind::SwiGLU => gate.silu(),
+                PairedKind::GeGLU => gate.gelu(),
+                PairedKind::ReGLU => gate.relu(),
+            };
+            (activated * up).to_concrete()
         }
     })
     .arg(q_mat_mul_input_fuzz(
@@ -349,7 +353,7 @@ async fn q4k_qmatmul_post_relu_resolves_to_single_kernel() {
 
 /// Biased FFN pattern: `silu(gate + gate_bias) * (up + up_bias)`.
 /// The fuser detects this as a paired-with-extras pattern (2 matmul views +
-/// 2 broadcast bias vectors) and rewrites it to a single `QMatMulPaired`
+/// 2 broadcast bias vectors) and rewrites it to a single `paired-mode QMatMul`
 /// kernel that loads the biases per output column at epilogue time.
 #[tokio::test]
 async fn q4k_paired_with_bias_resolves_to_single_kernel() {
@@ -386,9 +390,8 @@ async fn q4k_paired_with_bias_resolves_to_single_kernel() {
 }
 
 /// The fuser must collapse the natural `q_mat_mul → narrow → silu → mul(narrow)`
-/// pattern into the same kernel dispatch count as the explicit paired API.
-/// Without the fuser rule the natural pattern would emit more dispatches
-/// (matmul + elementwise) than the explicit paired call.
+/// pattern into a single dispatch. Without the rule the source would emit
+/// multiple kernels (matmul + nary).
 #[tokio::test]
 async fn q4k_paired_pattern_resolves_to_single_kernel() {
     use fusor::D;
@@ -402,16 +405,6 @@ async fn q4k_paired_pattern_resolves_to_single_kernel() {
         panic!("expected GPU device");
     };
 
-    // Baseline: the explicit paired API.
-    let weights = qmatrix_from_raw_bytes(&device, weight_shape, &raw_bytes, GgmlType::Q4K);
-    let input: Tensor<2, f32> = Tensor::new(&device, &input_data);
-    let explicit = input.q_mat_mul_paired(&weights, 2, fusor::PairedEpilogue::swiglu());
-    let Tensor::Gpu(explicit_gpu) = explicit else {
-        panic!("expected GPU tensor");
-    };
-    let explicit_kernels = gpu_device.resolve_batch(&[explicit_gpu.key()]);
-
-    // Natural pattern: matmul + narrow + silu + mul.
     let weights = qmatrix_from_raw_bytes(&device, weight_shape, &raw_bytes, GgmlType::Q4K);
     let input: Tensor<2, f32> = Tensor::new(&device, &input_data);
     let projected = input.q_mat_mul(&weights);
@@ -424,17 +417,14 @@ async fn q4k_paired_pattern_resolves_to_single_kernel() {
     let natural_kernels = gpu_device.resolve_batch(&[natural_gpu.key()]);
 
     assert_eq!(
-        natural_kernels, explicit_kernels,
-        "natural paired pattern dispatched {natural_kernels} kernels; \
-         explicit paired API dispatched {explicit_kernels}. \
-         The auto-fusion rule should collapse the natural pattern to the same \
-         kernel count as the explicit API."
+        natural_kernels, 1,
+        "expected fuser to collapse paired pattern to 1 dispatch, got {natural_kernels}"
     );
 }
 
-/// Authoring the natural unfused source (`q_mat_mul → narrow → silu → mul(narrow)`)
-/// should produce results identical to the explicit paired API, because the
-/// compute-graph fuser rewrites the pattern to a `QMatMulPaired` kernel.
+/// Authoring the natural source (`q_mat_mul → narrow → silu → mul(narrow)`)
+/// should produce results identical to the CPU reference, because the
+/// compute-graph fuser rewrites the pattern to a `paired-mode QMatMul` kernel.
 #[tokio::test]
 async fn q4k_paired_pattern_auto_fuses_to_paired_kernel() {
     use fusor::D;

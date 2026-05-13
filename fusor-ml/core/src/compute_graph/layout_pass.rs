@@ -27,7 +27,6 @@ impl LayoutPass {
                 ComputeGraphNodeVariant::Nary(op) => self.visit_nary(node, op),
                 ComputeGraphNodeVariant::MatMul(op) => self.visit_mat_mul(node, op),
                 ComputeGraphNodeVariant::QMatMul(op) => self.visit_q_mat_mul(node, op),
-                ComputeGraphNodeVariant::QMatMulPaired(op) => self.visit_q_mat_mul_paired(node, op),
                 ComputeGraphNodeVariant::QEmbedding(op) => self.visit_q_embedding(node, op),
                 ComputeGraphNodeVariant::Reduce(op) => self.visit_reduce(node, op),
                 ComputeGraphNodeVariant::RmsNorm(op) => self.visit_rms_norm(node, op),
@@ -80,23 +79,6 @@ impl LayoutPass {
         &mut self,
         key: NodeIndex,
         operation: &crate::quantized::matmul::QMatMulOperation,
-    ) {
-        let Some(first_layout) = self.output_layout.get(&operation.input) else {
-            self.queue.push_back(operation.input);
-            self.queue.push_back(key);
-            return;
-        };
-        let output_layout = Layout::contiguous(&operation.out_shape);
-        self.output_layout.insert(
-            key,
-            TensorLayoutInfo::new(output_layout, first_layout.datatype()),
-        );
-    }
-
-    fn visit_q_mat_mul_paired(
-        &mut self,
-        key: NodeIndex,
-        operation: &crate::quantized::matmul::QMatMulPairedOperation,
     ) {
         let Some(first_layout) = self.output_layout.get(&operation.input) else {
             self.queue.push_back(operation.input);

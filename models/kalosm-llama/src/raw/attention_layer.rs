@@ -163,7 +163,7 @@ impl<F: FloatDataType + SimdElement> LlamaFeedForward<F> {
         let up_result = if let Some(gate_up) = &self.gate_up {
             // Natural unfused source. The compute-graph fuser auto-detects
             // the paired `silu(gate) * up` pattern (with optional bias
-            // broadcasts) and rewrites this to a single QMatMulPaired kernel
+            // broadcasts) and rewrites this to a single paired-mode QMatMul kernel
             // that applies the epilogue in-register at epilogue time.
             let gate_up_states = x_f32.q_mat_mul(gate_up);
             let mut w1 = gate_up_states

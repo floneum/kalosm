@@ -38,6 +38,4 @@ pub use program_qgemv::{
     qgemv_q4k_paired_4x1, qgemv_q4k_paired_4x2, qgemv_q4k_paired_4x4, qgemv_q4k_paired_8x1,
     qgemv_q4k_paired_8x2, qgemv_q4k_paired_ggml, qgemv_q6k_dispatch, qgemv_q6k_ggml, qgemv_tile,
 };
-pub use types::{
-    apply_optional_epilogue, PairedEpilogue, PairedEpiloguePreset, QmatmulEpilogues, UnaryEpilogue,
-};
+pub use types::{apply_optional_epilogue, PairedEpilogue, QmatmulEpilogues, UnaryEpilogue};

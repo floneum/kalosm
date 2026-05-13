@@ -57,27 +57,17 @@ impl GraphVisPass {
     ) {
         let input = self.identities.get(&operation.input).unwrap();
         let output_layout = self.layout_pass.output_layout.get(&key).unwrap();
-        let id = Identity::quoted(format!("qmatmul ({}) #{:?}", output_layout, key));
-        self.statements.push(Stmt::Node {
-            id: id.clone(),
-            port: None,
-            attr: None,
-        });
-        self.statements.push(Stmt::Edge(
-            Edge::head_node(input.clone(), None).arrow_to_node(id.clone(), None),
-        ));
-        self.identities.insert(key, id.clone());
-    }
-
-    fn visit_q_mat_mul_paired(
-        &mut self,
-        key: NodeIndex,
-        operation: &crate::quantized::matmul::QMatMulPairedOperation,
-    ) {
-        let input = self.identities.get(&operation.input).unwrap();
-        let output_layout = self.layout_pass.output_layout.get(&key).unwrap();
-        let label = operation.epilogue.label();
-        let id = Identity::quoted(format!("qmatmul_{label} ({}) #{:?}", output_layout, key));
+        let label = operation
+            .paired
+            .as_ref()
+            .map(|p| p.epilogue.label())
+            .unwrap_or("");
+        let header = if label.is_empty() {
+            format!("qmatmul ({}) #{:?}", output_layout, key)
+        } else {
+            format!("qmatmul_{label} ({}) #{:?}", output_layout, key)
+        };
+        let id = Identity::quoted(header);
         self.statements.push(Stmt::Node {
             id: id.clone(),
             port: None,
@@ -315,9 +305,6 @@ impl ComputeGraphInner {
                 ComputeGraphNodeVariant::Nary(op) => graph_vis_pass.visit_nary(node, op),
                 ComputeGraphNodeVariant::MatMul(op) => graph_vis_pass.visit_mat_mul(node, op),
                 ComputeGraphNodeVariant::QMatMul(op) => graph_vis_pass.visit_q_mat_mul(node, op),
-                ComputeGraphNodeVariant::QMatMulPaired(op) => {
-                    graph_vis_pass.visit_q_mat_mul_paired(node, op)
-                }
                 ComputeGraphNodeVariant::QEmbedding(op) => {
                     graph_vis_pass.visit_q_embedding(node, op)
                 }

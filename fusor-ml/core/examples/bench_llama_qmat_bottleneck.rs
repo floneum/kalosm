@@ -17,12 +17,6 @@ fn env_usize(name: &str, default: usize) -> usize {
         .unwrap_or(default)
 }
 
-fn env_flag(name: &str) -> bool {
-    std::env::var_os(name)
-        .map(|value| value != "0")
-        .unwrap_or(false)
-}
-
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let warmup_batches = env_usize("FUSOR_QMAT_BENCH_WARMUP_BATCHES", DEFAULT_WARMUP_BATCHES);
@@ -35,7 +29,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         DEFAULT_DISPATCHES_PER_BATCH,
     )
     .max(1);
-    let swiglu = env_flag("FUSOR_QMAT_BENCH_SWIGLU");
 
     let device = Device::new().await?;
     let input_data = vec![vec![0.25f32; K]; M];
@@ -46,14 +39,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let weight = QMatrix::from_parts(&device, &raw_weight, Box::new([N, K]), GgmlType::Q4K)?;
 
     for _ in 0..warmup_batches {
-        run_batch(&device, &input, &weight, dispatches_per_batch, swiglu);
+        run_batch(&device, &input, &weight, dispatches_per_batch);
     }
 
     let mut samples = Vec::with_capacity(measured_batches);
     let mut kernels = 0usize;
     for _ in 0..measured_batches {
         let start = std::time::Instant::now();
-        kernels = run_batch(&device, &input, &weight, dispatches_per_batch, swiglu);
+        kernels = run_batch(&device, &input, &weight, dispatches_per_batch);
         samples.push(start.elapsed() / dispatches_per_batch as u32);
     }
 
@@ -68,11 +61,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     println!("bench_llama_qmat_bottleneck");
     println!("shape: A={M}x{K} B={K}x{N} -> Y={M}x{N}");
-    if swiglu {
-        println!("kernel: q_mat_swiglu_f32_1x1x4096_Q4k_28672x4096");
-    } else {
-        println!("kernel: q_mat_mul_f32_1x1x4096_Q4k_28672x4096");
-    }
+    println!("kernel: q_mat_mul_f32_1x1x4096_Q4k_28672x4096");
     println!("format: {:?}", GgmlType::Q4K);
     println!("warmup_batches: {warmup_batches}");
     println!("measured_batches: {measured_batches}");
@@ -104,16 +93,11 @@ fn run_batch(
     input: &Tensor<2, f32>,
     weight: &QMatrix,
     dispatches: usize,
-    swiglu: bool,
 ) -> usize {
     let mut outputs = Vec::with_capacity(dispatches);
     let mut keys = Vec::with_capacity(dispatches);
     for _ in 0..dispatches {
-        let output = if swiglu {
-            input.q_mat_mul_paired(weight, N / 2, fusor_core::PairedEpilogue::swiglu())
-        } else {
-            input.q_mat_mul(weight)
-        };
+        let output = input.q_mat_mul(weight);
         keys.push(output.key());
         outputs.push(output);
     }

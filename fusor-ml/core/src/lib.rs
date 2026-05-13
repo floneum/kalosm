@@ -5,7 +5,7 @@
 pub use device::*;
 pub use element_wise::CastTensor;
 pub use fusor_gguf::GgufReadError;
-pub use fusor_tile_ir_kernels::{PairedEpilogue, PairedEpiloguePreset};
+pub use fusor_tile_ir_kernels::PairedEpilogue;
 pub use fusor_types::{
     Layout, SlidingWindow, StrideSpec, TILE_SIZE, TensorSlice, slice_shape, slice_strides,
 };

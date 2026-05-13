@@ -9,7 +9,7 @@ use crate::{
     mir::{direct_kernel::PreparedDirectDispatch, inputs::MirValue, operation::Operation},
     nary_direct::eval_nary_expr_on_tiles,
     nary_wise::{ExtractedUnaryChain, NaryExpr, NaryOperation, UnaryFunctionChain},
-    quantized::matmul::{QMatMulOperation, QMatMulPairedOperation},
+    quantized::matmul::QMatMulOperation,
     tensor::TensorData,
 };
 use petgraph::algo::toposort;
@@ -150,8 +150,13 @@ fn node_category(variant: &ComputeGraphNodeVariant) -> &'static str {
         ComputeGraphNodeVariant::Dequantize(_) => "dequantize",
         ComputeGraphNodeVariant::QEmbedding(_) => "q_embedding",
         ComputeGraphNodeVariant::MatMul(_) => "matmul",
-        ComputeGraphNodeVariant::QMatMul(_) => "q_matmul",
-        ComputeGraphNodeVariant::QMatMulPaired(_) => "q_mat_paired",
+        ComputeGraphNodeVariant::QMatMul(op) => {
+            if op.paired.is_some() {
+                "q_mat_paired"
+            } else {
+                "q_matmul"
+            }
+        }
         ComputeGraphNodeVariant::Tensor(_) => "tensor",
         ComputeGraphNodeVariant::Reduce(_) => "reduce",
         ComputeGraphNodeVariant::RmsNorm(_) => "rms_norm",
@@ -981,23 +986,7 @@ impl Resolver {
             ComputeGraphNodeVariant::Resize(op) => Some(Arc::new(op.clone())),
             ComputeGraphNodeVariant::SliceAssign(op) => Some(Arc::new(op.clone())),
             ComputeGraphNodeVariant::QEmbedding(op) => Some(Arc::new(op.clone())),
-            ComputeGraphNodeVariant::QMatMul(op) => Some(Arc::new(QMatMulOperation::new(
-                op.input_datatype,
-                &op.in_shape,
-                op.input,
-                op.matrix.clone(),
-            ))),
-            ComputeGraphNodeVariant::QMatMulPaired(op) => Some(Arc::new(
-                crate::quantized::matmul::QMatMulPairedOperation::new_with_extras(
-                    op.input_datatype,
-                    &op.in_shape,
-                    op.input,
-                    op.matrix.clone(),
-                    op.pair_len,
-                    op.epilogue.clone(),
-                    op.extras.clone(),
-                ),
-            )),
+            ComputeGraphNodeVariant::QMatMul(op) => Some(Arc::new(op.clone())),
             ComputeGraphNodeVariant::Dequantize(op) => Some(Arc::new(op.clone())),
             ComputeGraphNodeVariant::Tensor(_) => None, // Handled in execution loop
         }
@@ -1737,7 +1726,7 @@ impl Resolver {
     }
 
     /// Detect `q_mat_mul(input, weights) → narrow(0, n) → <unary chain> * narrow(n, n)`
-    /// and rewrite the subgraph to a single `QMatMulPaired` that applies the
+    /// and rewrite the subgraph to a paired `QMatMul` that applies the
     /// equivalent epilogue in-register on the qgemv kernel.
     ///
     /// The check walks one Nary node back through a pair of MapLayout views to a
@@ -1992,7 +1981,7 @@ impl Resolver {
             },
         );
 
-        let paired_op = QMatMulPairedOperation::new_with_extras(
+        let paired_op = QMatMulOperation::new_paired(
             qmatmul_op.input_datatype,
             &qmatmul_op.in_shape,
             qmatmul_op.input,
@@ -2004,14 +1993,14 @@ impl Resolver {
 
         if trace {
             eprintln!(
-                "paired-fuse: rewriting nary {:?} -> QMatMulPaired (pair_len={}, extras={})",
+                "paired-fuse: rewriting nary {:?} -> paired QMatMul (pair_len={}, extras={})",
                 node_idx, pair_len, extras_count
             );
         }
 
         // Rewrite this Nary's variant in place; the produced shape and edges
         // already match the new operation.
-        self.execution_graph[node_idx].variant = ComputeGraphNodeVariant::QMatMulPaired(paired_op);
+        self.execution_graph[node_idx].variant = ComputeGraphNodeVariant::QMatMul(paired_op);
 
         // Re-wire incoming dependency edges. The new op consumes the qmatmul
         // input *and* every extra; the matmul views and the qmatmul itself

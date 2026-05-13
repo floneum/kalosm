@@ -321,6 +321,18 @@ fn qmatmul_operation_name(
     )
 }
 
+/// Paired-mode configuration on a `QMatMulOperation`. When present, the
+/// matmul produces `[gate; up]` columns and applies `epilogue.apply(gate, up,
+/// extras…)` to emit one output column per pair — `extras` are per-column
+/// broadcast tensors (e.g. bias vectors) the kernel loads at epilogue time.
+/// Populated by the resolver's `try_fuse_paired_qmatmul` rule.
+#[derive(Debug, Clone)]
+pub(crate) struct PairedConfig {
+    pub(crate) epilogue: tile_ir_kernels::PairedEpilogue,
+    pub(crate) pair_len: usize,
+    pub(crate) extras: Vec<NodeIndex>,
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct QMatMulOperation {
     pub(crate) input_datatype: DataTypeEnum,
@@ -331,105 +343,19 @@ pub(crate) struct QMatMulOperation {
     /// Unary chain applied to each loaded activation tile in-register before
     /// the dot product. Populated by the resolver's pre-op arm of
     /// `try_fuse_into_matmul` when the upstream of the qmatmul is an
-    /// element-wise Nary that can be evaluated tile-locally. Empty by default.
+    /// element-wise Nary that can be evaluated tile-locally. Empty by default,
+    /// and must stay empty when `paired.is_some()` (the paired closure
+    /// already encodes any per-tile transformation).
     pub(crate) pre_element_wise: UnaryFunctionChain,
     /// Unary chain applied to each output column in-register after the
-    /// reduction and before the store. Populated by the resolver's post-op
-    /// arm when a downstream `Nary` matches the element-wise fusion pattern.
-    /// Empty by default — kernels skip the chain via `None` to avoid overhead
-    /// on the non-fused path.
+    /// reduction and before the store. Empty by default; ignored when
+    /// `paired.is_some()`.
     pub(crate) post_element_wise: UnaryFunctionChain,
-}
-
-/// Paired-epilogue quantized matmul: produces `[gate; up]` columns and applies
-/// `epilogue.apply(gate, up)` to emit one output column per pair. The epilogue
-/// is an arbitrary tile-IR closure; cache identity is derived from the
-/// structural hash of its produced Expr tree.
-#[derive(Debug, Clone)]
-pub(crate) struct QMatMulPairedOperation {
-    pub(crate) input_datatype: DataTypeEnum,
-    pub(crate) input: NodeIndex,
-    pub(crate) matrix: QMatrix,
-    pub(crate) in_shape: Box<[usize]>,
-    pub(crate) out_shape: Box<[usize]>,
-    pub(crate) pair_len: usize,
-    pub(crate) epilogue: tile_ir_kernels::PairedEpilogue,
-    /// Per-column broadcast tensors (e.g. bias vectors) the qgemv kernel
-    /// loads at epilogue time and passes to the closure. Empty for vanilla
-    /// SwiGLU/etc.; populated by the resolver when the paired-fusion pattern
-    /// includes auxiliary broadcast inputs. Length must equal
-    /// `epilogue.extras_count()`.
-    pub(crate) extras: Vec<NodeIndex>,
-}
-
-impl QMatMulPairedOperation {
-    pub(crate) fn new(
-        input_datatype: DataTypeEnum,
-        input_shape: &[usize],
-        input: NodeIndex,
-        matrix: QMatrix,
-        pair_len: usize,
-        epilogue: tile_ir_kernels::PairedEpilogue,
-    ) -> Self {
-        assert_eq!(
-            epilogue.extras_count(),
-            0,
-            "QMatMulPairedOperation::new requires an epilogue with no extras; \
-             use new_with_extras() when the epilogue references auxiliary inputs"
-        );
-        Self::new_with_extras(
-            input_datatype,
-            input_shape,
-            input,
-            matrix,
-            pair_len,
-            epilogue,
-            Vec::new(),
-        )
-    }
-
-    pub(crate) fn new_with_extras(
-        input_datatype: DataTypeEnum,
-        input_shape: &[usize],
-        input: NodeIndex,
-        matrix: QMatrix,
-        pair_len: usize,
-        epilogue: tile_ir_kernels::PairedEpilogue,
-        extras: Vec<NodeIndex>,
-    ) -> Self {
-        assert_eq!(
-            extras.len(),
-            epilogue.extras_count(),
-            "QMatMulPairedOperation::new_with_extras: extras.len() must equal epilogue.extras_count()"
-        );
-        let last_dim = input_shape.len() - 1;
-        let mut out_shape = input_shape.to_vec();
-        out_shape[last_dim] = pair_len;
-        assert_eq!(input_shape[last_dim], matrix.shape[1]);
-        assert_eq!(matrix.shape[0], pair_len * 2);
-        let out_shape = out_shape.into_boxed_slice();
-        Self {
-            input_datatype,
-            input,
-            matrix,
-            in_shape: input_shape.into(),
-            out_shape,
-            pair_len,
-            epilogue,
-            extras,
-        }
-    }
-
-    fn m_size(&self) -> u32 {
-        matmul_m_size(&self.in_shape)
-    }
-
-    fn direct_quant_format(&self) -> Option<tile_ir::GgmlQuantFormat> {
-        match self.matrix.datatype {
-            GgmlType::Q4K => Some(tile_ir::GgmlQuantFormat::Q4K),
-            _ => None,
-        }
-    }
+    /// When `Some`, this operation produces a paired output (`out_shape[-1]`
+    /// = `paired.pair_len`, half of `matrix.shape[0]`) and dispatches to the
+    /// `qgemv_q4k_paired_*` kernel family. When `None`, it's a plain
+    /// quantized matmul with optional pre/post unary chains.
+    pub(crate) paired: Option<PairedConfig>,
 }
 
 impl QMatMulOperation {
@@ -452,6 +378,48 @@ impl QMatMulOperation {
             out_shape,
             pre_element_wise: UnaryFunctionChain::empty(input_datatype),
             post_element_wise: UnaryFunctionChain::empty(input_datatype),
+            paired: None,
+        }
+    }
+
+    /// Build a paired-mode QMatMul that emits one output column per
+    /// gate/up pair via the supplied epilogue. `pair_len` must equal
+    /// `matrix.shape[0] / 2`; `extras.len()` must equal
+    /// `epilogue.extras_count()`. Used by the resolver's paired-fusion
+    /// rewrite.
+    pub(crate) fn new_paired(
+        input_datatype: DataTypeEnum,
+        input_shape: &[usize],
+        input: NodeIndex,
+        matrix: QMatrix,
+        pair_len: usize,
+        epilogue: tile_ir_kernels::PairedEpilogue,
+        extras: Vec<NodeIndex>,
+    ) -> Self {
+        assert_eq!(
+            extras.len(),
+            epilogue.extras_count(),
+            "QMatMulOperation::new_paired: extras.len() must equal epilogue.extras_count()"
+        );
+        let last_dim = input_shape.len() - 1;
+        let mut out_shape = input_shape.to_vec();
+        out_shape[last_dim] = pair_len;
+        assert_eq!(input_shape[last_dim], matrix.shape[1]);
+        assert_eq!(matrix.shape[0], pair_len * 2);
+        let out_shape = out_shape.into_boxed_slice();
+        QMatMulOperation {
+            input_datatype,
+            input,
+            matrix,
+            in_shape: input_shape.into(),
+            out_shape,
+            pre_element_wise: UnaryFunctionChain::empty(input_datatype),
+            post_element_wise: UnaryFunctionChain::empty(input_datatype),
+            paired: Some(PairedConfig {
+                epilogue,
+                pair_len,
+                extras,
+            }),
         }
     }
 
@@ -832,15 +800,6 @@ impl<const R: usize> Tensor<R, f32> {
     pub fn q_mat_mul(&self, other: &QMatrix) -> Self {
         self.add_q_mat_mul(other)
     }
-
-    pub fn q_mat_mul_paired(
-        &self,
-        other: &QMatrix,
-        pair_len: usize,
-        epilogue: tile_ir_kernels::PairedEpilogue,
-    ) -> Self {
-        self.add_q_mat_mul_paired(other, pair_len, epilogue)
-    }
 }
 
 impl<const R: usize> Tensor<R, half::f16> {
@@ -979,7 +938,11 @@ impl Operation for QMatMulOperation {
         _device: &Device,
     ) -> crate::mir::workgroup_shape::WorkgroupShapeConstraints {
         let mut constraints = WorkgroupShapeConstraints::new();
-        if self.m_size() == 1 {
+        if self.paired.is_some() {
+            // Paired qgemv kernels are single-thread dispatched along x; the
+            // tile shape is set inside the kernel.
+            constraints.add_constraint(0, Constraint::Equals(1));
+        } else if self.m_size() == 1 {
             constraints.add_constraint(0, Constraint::Equals(1));
         } else {
             constraints.add_constraint(0, Constraint::Equals(32));
@@ -994,6 +957,9 @@ impl Operation for QMatMulOperation {
         _workgroup_shape: &crate::mir::workgroup_shape::WorkgroupShape,
         _: &[MirValue],
     ) -> [u32; 3] {
+        if let Some(paired) = &self.paired {
+            return [paired.pair_len as u32, self.m_size(), 1];
+        }
         let n = self.n_size();
         let m = self.m_size();
         // Calculate batch size for dimensions beyond the last two (M, K)
@@ -1014,10 +980,32 @@ impl Operation for QMatMulOperation {
 
     fn visit_dependencies(&self, f: &mut dyn FnMut(NodeIndex)) {
         f(self.input);
+        if let Some(paired) = &self.paired {
+            for extra in &paired.extras {
+                f(*extra);
+            }
+        }
     }
 
     fn inputs(&self, nodes: &crate::compute_graph::ComputeGraphInner) -> Vec<MirValue> {
-        qmatmul_operation_inputs(self.input, &self.matrix, &self.out_shape, nodes)
+        let base = qmatmul_operation_inputs(self.input, &self.matrix, &self.out_shape, nodes);
+        let Some(paired) = &self.paired else {
+            return base;
+        };
+        if paired.extras.is_empty() {
+            return base;
+        }
+        // [input, qmatrix, extras..., output] — splice extras between qmatrix
+        // and output so the layout stays a strict superset of the no-extras
+        // case and `qmatmul_operation_output` still pattern-matches the tail.
+        let mut result = Vec::with_capacity(base.len() + paired.extras.len());
+        let (head, tail) = base.split_at(2);
+        result.extend_from_slice(head);
+        for extra in &paired.extras {
+            result.push(nodes.get_cached_result(*extra).unwrap().clone().into());
+        }
+        result.extend_from_slice(tail);
+        result
     }
 
     fn build_direct_kernel(
@@ -1026,6 +1014,9 @@ impl Operation for QMatMulOperation {
         _: &crate::mir::workgroup_shape::WorkgroupShape,
         inputs: &[MirValue],
     ) -> Option<DirectKernel> {
+        if let Some(paired) = &self.paired {
+            return self.build_paired_direct_kernel(graph, paired, inputs);
+        }
         let [input, matrix, output] = inputs else {
             return None;
         };
@@ -1060,7 +1051,12 @@ impl Operation for QMatMulOperation {
     }
 
     fn name(&self) -> String {
-        qmatmul_operation_name("mul", self.input_datatype, &self.in_shape, &self.matrix)
+        let op_label = self
+            .paired
+            .as_ref()
+            .map(|p| p.epilogue.label())
+            .unwrap_or("mul");
+        qmatmul_operation_name(op_label, self.input_datatype, &self.in_shape, &self.matrix)
     }
 }
 
@@ -1142,55 +1138,14 @@ impl Q4KPairedTile {
     }
 }
 
-impl Operation for QMatMulPairedOperation {
-    fn workgroup_shape_constraints(&self, _device: &Device) -> WorkgroupShapeConstraints {
-        let mut constraints = WorkgroupShapeConstraints::new();
-        constraints.add_constraint(0, Constraint::Equals(1));
-        constraints.add_constraint(1, Constraint::Equals(1));
-        constraints.add_constraint(2, Constraint::Equals(1));
-        constraints
-    }
-
-    fn dispatch_size(
-        &self,
-        _workgroup_shape: &crate::mir::workgroup_shape::WorkgroupShape,
-        _: &[MirValue],
-    ) -> [u32; 3] {
-        [self.pair_len as u32, self.m_size(), 1]
-    }
-
-    fn visit_dependencies(&self, f: &mut dyn FnMut(NodeIndex)) {
-        f(self.input);
-        for extra in &self.extras {
-            f(*extra);
-        }
-    }
-
-    fn inputs(&self, nodes: &crate::compute_graph::ComputeGraphInner) -> Vec<MirValue> {
-        // [input, qmatrix, extras..., output]. Extras (e.g. bias vectors)
-        // are spliced between the qmatrix and the output so the layout stays
-        // a strict superset of the no-extras case.
-        let base = qmatmul_operation_inputs(self.input, &self.matrix, &self.out_shape, nodes);
-        if self.extras.is_empty() {
-            return base;
-        }
-        let mut result = Vec::with_capacity(base.len() + self.extras.len());
-        let (head, tail) = base.split_at(2);
-        result.extend_from_slice(head);
-        for extra in &self.extras {
-            result.push(nodes.get_cached_result(*extra).unwrap().clone().into());
-        }
-        result.extend_from_slice(tail);
-        result
-    }
-
-    fn build_direct_kernel(
+impl QMatMulOperation {
+    fn build_paired_direct_kernel(
         &self,
         graph: &crate::compute_graph::ComputeGraphInner,
-        _: &crate::mir::workgroup_shape::WorkgroupShape,
+        paired: &PairedConfig,
         inputs: &[MirValue],
     ) -> Option<DirectKernel> {
-        let extras_count = self.extras.len();
+        let extras_count = paired.extras.len();
         if inputs.len() != 2 + extras_count + 1 {
             return None;
         }
@@ -1207,17 +1162,21 @@ impl Operation for QMatMulPairedOperation {
             return None;
         }
         for extra in &extras_tensors {
-            if extra.datatype() != DataTypeEnum::F32 || extra.layout().shape() != [self.pair_len] {
+            if extra.datatype() != DataTypeEnum::F32 || extra.layout().shape() != [paired.pair_len]
+            {
                 return None;
             }
         }
-
-        let format = self.direct_quant_format()?;
+        // Paired only supports Q4K today.
+        if matrix.datatype() != GgmlType::Q4K {
+            return None;
+        }
+        let format = tile_ir::GgmlQuantFormat::Q4K;
         let a_view = flatten_matrix_layout(input.layout())?;
         let y_view = flatten_matrix_layout(output.layout())?;
         let m = a_view.rows;
         let k = a_view.cols;
-        let pair_len = self.pair_len as u32;
+        let pair_len = paired.pair_len as u32;
         if m == 0
             || y_view.rows != m
             || y_view.cols != pair_len
@@ -1240,7 +1199,7 @@ impl Operation for QMatMulPairedOperation {
             return None;
         }
 
-        let epilogue = self.epilogue.clone();
+        let epilogue = paired.epilogue.clone();
         let epilogue_identity = epilogue.identity();
         let epilogue_label = epilogue.label();
         let kernel_name = self.name();
@@ -1368,23 +1327,6 @@ impl Operation for QMatMulPairedOperation {
             dispatch_size,
         )
     }
-
-    fn requires_single_kernel_batch(&self) -> bool {
-        true
-    }
-
-    fn output(&self, _: &crate::compute_graph::ComputeGraphInner, inputs: &[MirValue]) -> MirValue {
-        qmatmul_operation_output(inputs)
-    }
-
-    fn name(&self) -> String {
-        qmatmul_operation_name(
-            self.epilogue.label(),
-            self.input_datatype,
-            &self.in_shape,
-            &self.matrix,
-        )
-    }
 }
 
 impl QMatMulOperation {
@@ -1494,6 +1436,7 @@ mod tests {
             out_shape: Box::new([1, weight_shape[0]]),
             pre_element_wise: UnaryFunctionChain::empty(DataTypeEnum::F32),
             post_element_wise: UnaryFunctionChain::empty(DataTypeEnum::F32),
+            paired: None,
         };
         let kernel = operation
             .build_direct_kernel(
