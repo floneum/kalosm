@@ -41,11 +41,12 @@ pub(crate) trait Operation: Debug {
 
     /// Hash the structural operation state that affects generated kernel IR.
     ///
-    /// The default intentionally uses `Debug` so newly-added operation fields
-    /// participate in cache keys by default. Implementations can override this
-    /// to avoid over-discriminating on graph node ids or other non-IR state.
+    /// The default stays on the object-safe `Operation` surface: operation
+    /// name plus `kernel_module_key_with_dispatch`'s MIR inputs, dispatch, and
+    /// workgroup shape. Implementations only override this when generated IR
+    /// depends on fields not represented by that trait-level data.
     fn hash_kernel_signature(&self, state: &mut FxHasher) {
-        format!("{self:?}").hash(state);
+        self.name().hash(state);
     }
 
     fn kernel_module_key_with_dispatch(

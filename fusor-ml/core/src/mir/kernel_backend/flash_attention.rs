@@ -1,11 +1,7 @@
-use std::{
-    hash::Hash,
-    sync::{Arc, OnceLock},
-};
+use std::sync::{Arc, OnceLock};
 
 use fusor_tile_ir as tile_ir;
 use fusor_tile_ir_kernels as tile_ir_kernels;
-use rustc_hash::FxHasher;
 
 use crate::{
     DataTypeEnum,
@@ -274,15 +270,6 @@ impl FlashAttentionOperation {
 }
 
 impl Operation for FlashAttentionOperation {
-    fn hash_kernel_signature(&self, state: &mut FxHasher) {
-        self.out_shape.hash(state);
-        self.q_shape.hash(state);
-        self.k_shape.hash(state);
-        self.scale.to_bits().hash(state);
-        self.input_dtype.hash(state);
-        self.mask.is_some().hash(state);
-    }
-
     fn workgroup_shape_constraints(&self, _device: &crate::Device) -> WorkgroupShapeConstraints {
         let mut constraints = WorkgroupShapeConstraints::new();
         constraints.add_constraint(0, Constraint::Equals(1));
@@ -460,11 +447,13 @@ impl Operation for FlashAttentionOperation {
         };
         let key_label = if let Some(meta) = decode_meta.as_ref() {
             format!(
-                "{kernel_label}:block={}:tiled={}",
-                meta.decode_block, meta.tiled
+                "{kernel_label}:block={}:tiled={}:scale={:08x}",
+                meta.decode_block,
+                meta.tiled,
+                self.scale.to_bits()
             )
         } else {
-            kernel_label.to_string()
+            format!("{kernel_label}:scale={:08x}", self.scale.to_bits())
         };
         let module_key = self.kernel_module_key_with_dispatch(
             &key_label,
@@ -575,7 +564,8 @@ impl Operation for FlashAttentionOperation {
 
     fn name(&self) -> String {
         format!(
-            "flash_attention_f32_{}x{}x{}x{}_by_{}x{}",
+            "flash_attention_{}_{}x{}x{}x{}_by_{}x{}",
+            self.input_dtype,
             self.q_shape[0],
             self.q_shape[1],
             self.q_shape[2],

@@ -1,5 +1,3 @@
-use std::hash::Hash;
-
 use crate::{
     DataTypeEnum, Device, Layout, Tensor, TensorData,
     compute_graph::NodeIndex,
@@ -24,7 +22,6 @@ use crate::{
 use fusor_gguf::GgmlType;
 use fusor_tile_ir as tile_ir;
 use fusor_tile_ir_kernels as tile_ir_kernels;
-use rustc_hash::FxHasher;
 
 use super::{QMatMulDirectPipelineKey, QMatrix};
 
@@ -973,25 +970,6 @@ mod selection_tests {
 }
 
 impl Operation for QMatMulOperation {
-    fn hash_kernel_signature(&self, state: &mut FxHasher) {
-        self.input_datatype.hash(state);
-        self.matrix.datatype().hash(state);
-        self.matrix.shape().hash(state);
-        self.in_shape.hash(state);
-        self.out_shape.hash(state);
-        self.pre_element_wise.hash(state);
-        self.post_element_wise.hash(state);
-        match &self.paired {
-            Some(paired) => {
-                true.hash(state);
-                paired.epilogue.hash(state);
-                paired.pair_len.hash(state);
-                paired.extras.len().hash(state);
-            }
-            None => false.hash(state),
-        }
-    }
-
     fn workgroup_shape_constraints(
         &self,
         _device: &Device,
