@@ -1,3 +1,5 @@
+use std::hash::Hash;
+
 use crate::{
     DataTypeEnum, Device, Layout, Tensor, TensorData,
     compute_graph::NodeIndex,
@@ -22,6 +24,7 @@ use crate::{
 use fusor_gguf::GgmlType;
 use fusor_tile_ir as tile_ir;
 use fusor_tile_ir_kernels as tile_ir_kernels;
+use rustc_hash::FxHasher;
 
 use super::{QMatMulDirectPipelineKey, QMatrix};
 
@@ -458,6 +461,28 @@ impl QMatMulOperation {
         pre_chain: Option<&UnaryFunctionChain>,
         post_chain: Option<&UnaryFunctionChain>,
     ) -> Option<DirectKernel> {
+        Self::direct_kernel_for_tensors_with_epilogue_inner(
+            device,
+            input,
+            matrix,
+            output,
+            kernel_name,
+            pre_chain,
+            post_chain,
+            None,
+        )
+    }
+
+    fn direct_kernel_for_tensors_with_epilogue_inner(
+        device: &Device,
+        input: &TensorData,
+        matrix: &QMatrix,
+        output: &TensorData,
+        kernel_name: impl Into<String>,
+        pre_chain: Option<&UnaryFunctionChain>,
+        post_chain: Option<&UnaryFunctionChain>,
+        operation_key: Option<(&dyn Operation, &[MirValue])>,
+    ) -> Option<DirectKernel> {
         if input.datatype() != DataTypeEnum::F32 || output.datatype() != DataTypeEnum::F32 {
             return None;
         }
@@ -560,11 +585,21 @@ impl QMatMulOperation {
             ) {
                 return Some(kernel);
             }
-            let cache_key = format!(
-                "{kernel_name}:direct:{format:?}:m={m}:k={k}:n={n}:dispatch={dispatch_size:?}:{:?}:{:?}",
-                input.layout(),
-                output.layout()
-            );
+            let cache_key = if let Some((operation, operation_inputs)) = operation_key {
+                let label = format!("qmatmul_direct:{variant:?}:fast");
+                operation.kernel_cache_key_with_dispatch(
+                    &label,
+                    None,
+                    dispatch_size,
+                    operation_inputs,
+                )
+            } else {
+                format!(
+                    "{kernel_name}:direct:{format:?}:m={m}:k={k}:n={n}:dispatch={dispatch_size:?}:{:?}:{:?}",
+                    input.layout(),
+                    output.layout()
+                )
+            };
             if let Some(pipeline) = kernel_backend::storage3_pipeline_from_cached_module(
                 device,
                 &kernel_name,
@@ -652,11 +687,16 @@ impl QMatMulOperation {
             input.layout(),
             output.layout(),
         );
-        let cache_key = format!(
-            "{kernel_name}:direct:{format:?}:m={m}:k={k}:n={n}:epilogue={epilogue_identity:#018x}:dispatch={dispatch_size:?}:{:?}:{:?}",
-            input.layout(),
-            output.layout()
-        );
+        let cache_key = if let Some((operation, operation_inputs)) = operation_key {
+            let label = format!("qmatmul_direct:{variant:?}:epilogue={epilogue_identity:#018x}");
+            operation.kernel_cache_key_with_dispatch(&label, None, dispatch_size, operation_inputs)
+        } else {
+            format!(
+                "{kernel_name}:direct:{format:?}:m={m}:k={k}:n={n}:epilogue={epilogue_identity:#018x}:dispatch={dispatch_size:?}:{:?}:{:?}",
+                input.layout(),
+                output.layout()
+            )
+        };
         qmatmul_direct_kernel_from_ir(
             device,
             kernel_name.clone(),
@@ -933,6 +973,25 @@ mod selection_tests {
 }
 
 impl Operation for QMatMulOperation {
+    fn hash_kernel_signature(&self, state: &mut FxHasher) {
+        self.input_datatype.hash(state);
+        self.matrix.datatype().hash(state);
+        self.matrix.shape().hash(state);
+        self.in_shape.hash(state);
+        self.out_shape.hash(state);
+        self.pre_element_wise.hash(state);
+        self.post_element_wise.hash(state);
+        match &self.paired {
+            Some(paired) => {
+                true.hash(state);
+                paired.epilogue.hash(state);
+                paired.pair_len.hash(state);
+                paired.extras.len().hash(state);
+            }
+            None => false.hash(state),
+        }
+    }
+
     fn workgroup_shape_constraints(
         &self,
         _device: &Device,
@@ -1031,7 +1090,7 @@ impl Operation for QMatMulOperation {
         if matrix.datatype() == GgmlType::F32 {
             return self.build_dense_direct_kernel(graph, input, matrix, output);
         }
-        Self::direct_kernel_for_tensors_with_epilogue(
+        Self::direct_kernel_for_tensors_with_epilogue_inner(
             &graph.device(),
             input,
             matrix,
@@ -1039,6 +1098,7 @@ impl Operation for QMatMulOperation {
             self.name(),
             Some(&self.pre_element_wise),
             Some(&self.post_element_wise),
+            Some((self, inputs)),
         )
     }
 
@@ -1216,11 +1276,10 @@ impl QMatMulOperation {
                 input.layout(),
                 output.layout(),
             );
-            let cache_key = format!(
-                "{kernel_name}:direct:{format:?}:tile={tile_name}:m={m}:k={k}:pair={pair_len}:epilogue={epilogue_label}#{epilogue_identity:#018x}:dispatch={dispatch_size:?}:{:?}:{:?}",
-                input.layout(),
-                output.layout()
-            );
+            let key_label =
+                format!("qmatmul_paired:{tile_name}:{epilogue_label}:{epilogue_identity:#018x}");
+            let cache_key =
+                self.kernel_cache_key_with_dispatch(&key_label, None, dispatch_size, inputs);
             return qmatmul_direct_kernel_from_ir(
                 &graph.device(),
                 "q_mat_paired".to_owned(),
@@ -1273,15 +1332,10 @@ impl QMatMulOperation {
             })
             .collect();
         let extra_views = extra_views?;
-        let extras_signature: Vec<String> = extras_tensors
-            .iter()
-            .map(|t| format!("{:?}", t.layout()))
-            .collect();
-        let cache_key = format!(
-            "{kernel_name}:direct:{format:?}:tile={tile_name}:m={m}:k={k}:pair={pair_len}:epilogue={epilogue_label}#{epilogue_identity:#018x}:extras={extras_signature:?}:dispatch={dispatch_size:?}:{:?}:{:?}",
-            input.layout(),
-            output.layout()
-        );
+        let key_label =
+            format!("qmatmul_paired:{tile_name}:{epilogue_label}:{epilogue_identity:#018x}:extras");
+        let cache_key =
+            self.kernel_cache_key_with_dispatch(&key_label, None, dispatch_size, inputs);
         // Buffer ordering must match the IR builder's storage declaration
         // order: a (input), b (qmatrix), extras..., y (output).
         let mut buffers: Vec<std::sync::Arc<wgpu::Buffer>> = Vec::with_capacity(3 + extras_count);

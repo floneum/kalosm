@@ -48,17 +48,6 @@ pub(crate) fn cached_hashed_kernel_module(
     Some(cache.write().get_or_insert(key, || module.clone()).clone())
 }
 
-pub(crate) fn hash_layout<H: Hasher>(state: &mut H, layout: &crate::Layout) {
-    layout.offset().hash(state);
-    layout.shape().hash(state);
-    layout.strides().hash(state);
-}
-
-pub(crate) fn hash_strided_layout<H: Hasher>(state: &mut H, layout: &crate::Layout) {
-    layout.offset().hash(state);
-    layout.strides().hash(state);
-}
-
 fn compiled_module(module: wgpu::naga::Module) -> CompiledKernelModule {
     CompiledKernelModule {
         module: Arc::new(module),

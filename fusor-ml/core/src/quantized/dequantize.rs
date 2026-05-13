@@ -1,6 +1,9 @@
+use std::hash::Hash;
+
 use fusor_gguf::GgmlType;
 use fusor_tile_ir as tile_ir;
 use fusor_tile_ir_kernels as tile_ir_kernels;
+use rustc_hash::FxHasher;
 
 use crate::mir::inputs::MirValue;
 use crate::mir::operation::Operation;
@@ -53,6 +56,13 @@ impl DequantizeOperation {
 }
 
 impl Operation for DequantizeOperation {
+    fn hash_kernel_signature(&self, state: &mut FxHasher) {
+        self.matrix.datatype().hash(state);
+        self.matrix.shape().hash(state);
+        self.datatype.hash(state);
+        self.post_dequantize.hash(state);
+    }
+
     fn workgroup_shape_constraints(
         &self,
         _device: &Device,
@@ -133,10 +143,11 @@ impl Operation for DequantizeOperation {
         if dispatch_y > max_workgroups {
             return None;
         }
-        let cache_key = format!(
-            "{}:direct:{format:?}:k={k}:n={n}:shape={:?}:dispatch={dispatch_x}x{dispatch_y}",
-            self.name(),
-            self.matrix.shape
+        let cache_key = self.kernel_cache_key_with_dispatch(
+            "dequantize_direct",
+            Some(_workgroup_shape),
+            [dispatch_x, dispatch_y, 1],
+            inputs,
         );
         let matrix_buffer = matrix.buffer().clone();
         let output_buffer = output.buffer().clone();

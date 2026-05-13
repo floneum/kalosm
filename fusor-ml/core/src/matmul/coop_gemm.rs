@@ -1,7 +1,7 @@
 use crate::{Device, MatMulOperation};
 
 /// Parameters for cooperative matrix matmul.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Hash)]
 pub struct CoopGemmParams {
     pub block_m: u32,
     pub block_n: u32,

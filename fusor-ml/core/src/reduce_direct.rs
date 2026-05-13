@@ -37,16 +37,11 @@ pub(crate) fn build_reduce_direct_kernel(
     }
 
     let dispatch_size = operation.dispatch_size(workgroup_shape, inputs);
-    let cache_key = format!(
-        "{}:tile-program:{:?}:dispatch={dispatch_size:?}:reduce={reduce_size}:stride={reduce_stride}:pre={:?}:post={:?}:{:?}:{:?}:{:?}:{:?}",
-        operation.name(),
-        workgroup_shape.shape(),
-        operation.pre_element_wise,
-        operation.post_element_wise,
-        input.datatype(),
-        input.layout(),
-        output.datatype(),
-        output.layout()
+    let cache_key = operation.kernel_cache_key_with_dispatch(
+        "reduce_direct",
+        Some(workgroup_shape),
+        dispatch_size,
+        inputs,
     );
     let input_meta = TensorMeta::new(&input)?;
     let output_meta = TensorMeta::new(&output)?;

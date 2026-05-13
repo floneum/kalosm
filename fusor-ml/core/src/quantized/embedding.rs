@@ -1,6 +1,9 @@
+use std::hash::Hash;
+
 use fusor_gguf::GgmlType;
 use fusor_tile_ir as tile_ir;
 use fusor_tile_ir_kernels as tile_ir_kernels;
+use rustc_hash::FxHasher;
 
 use crate::{
     DataTypeEnum, Device, Tensor, TensorData, TensorInfo,
@@ -97,6 +100,12 @@ fn u32_index_layout(layout: &crate::Layout) -> Option<(u32, tile_ir::Layout)> {
 }
 
 impl Operation for QEmbeddingOperation {
+    fn hash_kernel_signature(&self, state: &mut FxHasher) {
+        self.matrix.datatype().hash(state);
+        self.matrix.shape().hash(state);
+        self.out_shape.hash(state);
+    }
+
     fn workgroup_shape_constraints(&self, _device: &Device) -> WorkgroupShapeConstraints {
         let mut constraints = WorkgroupShapeConstraints::new();
         constraints.add_constraint(0, Constraint::equals(BLOCK as u32));
@@ -167,11 +176,11 @@ impl Operation for QEmbeddingOperation {
         let dispatch_size = self.dispatch_size(workgroup_shape, inputs);
         let (indexes_offset, indexes_layout) = u32_index_layout(indexes.layout())?;
         let (output_offset, output_layout) = u32_layout_2d(output.layout())?;
-        let cache_key = format!(
-            "{}:direct:{format:?}:indexes={index_count}:embedding={embedding_dim}:vocab={num_embeddings}:dispatch={dispatch_size:?}:{:?}:{:?}",
-            self.name(),
-            indexes.layout(),
-            output.layout()
+        let cache_key = self.kernel_cache_key_with_dispatch(
+            "q_embedding_direct",
+            Some(workgroup_shape),
+            dispatch_size,
+            inputs,
         );
         let matrix_buffer = matrix.buffer().clone();
         let indexes_buffer = indexes.buffer().clone();

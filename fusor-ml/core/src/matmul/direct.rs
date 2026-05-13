@@ -46,17 +46,11 @@ pub(crate) fn build_serial_matmul_direct_kernel(
         .iter()
         .try_fold(1u32, |acc, dim| acc.checked_mul((*dim).try_into().ok()?))?;
     let dispatch_size = distribute_workgroups(total_outputs.div_ceil(BLOCK as u32));
-    let cache_key = format!(
-        "{}:serial-tile-program:dispatch={dispatch_size:?}:pre={:?}:post={:?}:{:?}:{:?}:{:?}:{:?}:{:?}:{:?}",
-        operation.name(),
-        operation.pre_element_wise,
-        operation.post_element_wise,
-        input_a.datatype(),
-        input_a.layout(),
-        input_b.datatype(),
-        input_b.layout(),
-        output.datatype(),
-        output.layout()
+    let cache_key = operation.kernel_cache_key_with_dispatch(
+        "matmul_serial_direct",
+        Some(_workgroup_shape),
+        dispatch_size,
+        inputs,
     );
     let a_meta = TensorMeta::new(&input_a)?;
     let b_meta = TensorMeta::new(&input_b)?;

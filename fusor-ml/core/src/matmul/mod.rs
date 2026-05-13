@@ -1,3 +1,5 @@
+use std::hash::Hash;
+
 use crate::matmul::sgemm_params::gemm_parameters;
 use crate::matmul::sgemv_params::gemv_parameters;
 use crate::mir::operation::Operation;
@@ -18,6 +20,7 @@ use crate::{
 };
 use fusor_tile_ir as tile_ir;
 use fusor_tile_ir_kernels as tile_ir_kernels;
+use rustc_hash::FxHasher;
 
 pub mod coop_gemm;
 mod direct;
@@ -164,7 +167,7 @@ fn select_direct_tile_matmul_variant(m: u32, k: u32, n: u32) -> DirectTileMatmul
         .expect("direct tile matmul selector has a catch-all rule")
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Hash)]
 pub enum MatMulParams {
     Vector(sgemv::SgemvParams),
     MatMul(sgemm::SgemmParams),
@@ -299,13 +302,13 @@ impl MatMulOperation {
         if dispatch_size.iter().any(|dim| *dim > max_workgroups) {
             return None;
         }
-        let cache_key = format!(
-            "{}:matmul-tile-program:{:?}:{:?}:{:?}:dispatch={dispatch_size:?}",
-            self.name(),
-            input_a.layout(),
-            input_b.layout(),
-            output.layout()
-        );
+        let inputs = [
+            input_a.clone().into(),
+            input_b.clone().into(),
+            output.clone().into(),
+        ];
+        let cache_key =
+            self.kernel_cache_key_with_dispatch("matmul_tile_direct", None, dispatch_size, &inputs);
 
         kernel_backend::dynamic_kernel_from_ir(
             device,
@@ -319,6 +322,16 @@ impl MatMulOperation {
 }
 
 impl Operation for MatMulOperation {
+    fn hash_kernel_signature(&self, state: &mut FxHasher) {
+        self.datatype.hash(state);
+        self.first_shape.hash(state);
+        self.second_shape.hash(state);
+        self.out_shape.hash(state);
+        self.pre_element_wise.hash(state);
+        self.post_element_wise.hash(state);
+        self.parameters.hash(state);
+    }
+
     fn workgroup_shape_constraints(
         &self,
         device: &Device,

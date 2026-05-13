@@ -1,5 +1,7 @@
 use std::hash::{Hash, Hasher};
 
+use rustc_hash::FxHasher;
+
 use crate::{
     TILE_SIZE,
     compute_graph::{ComputeGraphInner, NodeIndex},
@@ -168,7 +170,7 @@ impl NaryFunction {
 
 /// A chain of unary functions used for pre/post processing in reduce/matmul/dequantize.
 /// Each function takes a single input and produces a single output; the chain is applied sequentially.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Hash)]
 pub(crate) struct UnaryFunctionChain {
     input_datatype: DataTypeEnum,
     pub(crate) functions: Vec<NaryFunction>,
@@ -561,6 +563,12 @@ pub(crate) struct ExtractedPairedSplit {
 }
 
 impl Operation for NaryOperation {
+    fn hash_kernel_signature(&self, state: &mut FxHasher) {
+        self.expression.hash(state);
+        self.shape.hash(state);
+        self.output_datatype.hash(state);
+    }
+
     fn workgroup_shape_constraints(
         &self,
         device: &crate::Device,

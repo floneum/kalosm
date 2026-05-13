@@ -32,7 +32,7 @@ pub(super) fn dispatch_size(
     ]
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Hash)]
 pub struct SgemmParams {
     double_buffer: bool,
     block_m_size: u32,

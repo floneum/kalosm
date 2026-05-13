@@ -1,3 +1,7 @@
+use std::hash::Hash;
+
+use rustc_hash::FxHasher;
+
 use crate::{
     Dim, LastRank, LastRankInner, NextRankInner,
     mir::{
@@ -62,6 +66,13 @@ impl ReduceOperation {
 }
 
 impl Operation for ReduceOperation {
+    fn hash_kernel_signature(&self, state: &mut FxHasher) {
+        self.pre_element_wise.hash(state);
+        self.function.hash(state);
+        self.post_element_wise.hash(state);
+        self.axis.hash(state);
+    }
+
     fn workgroup_shape_constraints(
         &self,
         device: &crate::Device,
@@ -159,7 +170,7 @@ impl Operation for ReduceOperation {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Hash)]
 pub struct ReduceFunction {
     pub(crate) name: Option<String>,
     pub(crate) op: ReduceOp,
@@ -191,7 +202,7 @@ impl ReduceFunction {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) enum ReduceOp {
     Sum,
     Max,

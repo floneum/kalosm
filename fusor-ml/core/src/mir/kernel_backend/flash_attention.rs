@@ -5,6 +5,7 @@ use std::{
 
 use fusor_tile_ir as tile_ir;
 use fusor_tile_ir_kernels as tile_ir_kernels;
+use rustc_hash::FxHasher;
 
 use crate::{
     DataTypeEnum,
@@ -34,49 +35,6 @@ const FLASH_ATTENTION_MODULE_CACHE_SIZE: usize = 128;
 fn flash_attention_module_cache() -> &'static kernel_backend::ModuleCache {
     static CACHE: OnceLock<kernel_backend::ModuleCache> = OnceLock::new();
     CACHE.get_or_init(|| kernel_backend::module_cache(FLASH_ATTENTION_MODULE_CACHE_SIZE))
-}
-
-fn flash_attention_module_key(
-    variant: FlashAttentionKernelVariant,
-    dims: FlashAttentionDims,
-    decode_block: Option<u32>,
-    decode_tiled: bool,
-    scale_bits: u32,
-    dispatch_size: [u32; 3],
-    input_dtype: DataTypeEnum,
-    q: &TensorData,
-    k: &TensorData,
-    v: &TensorData,
-    mask: Option<&TensorData>,
-    output: &TensorData,
-) -> [u64; 2] {
-    kernel_backend::module_key_from(|hasher| {
-        variant.hash(hasher);
-        dims.batch.hash(hasher);
-        dims.num_heads.hash(hasher);
-        dims.num_kv_heads.hash(hasher);
-        dims.q_seq_len.hash(hasher);
-        dims.kv_seq_len.hash(hasher);
-        dims.head_dim.hash(hasher);
-        decode_block.hash(hasher);
-        decode_tiled.hash(hasher);
-        scale_bits.hash(hasher);
-        dispatch_size.hash(hasher);
-        (input_dtype as u32).hash(hasher);
-        if variant == FlashAttentionKernelVariant::DecodeSmall {
-            kernel_backend::hash_strided_layout(hasher, q.layout());
-            kernel_backend::hash_strided_layout(hasher, k.layout());
-            kernel_backend::hash_strided_layout(hasher, v.layout());
-            kernel_backend::hash_strided_layout(hasher, output.layout());
-        } else {
-            kernel_backend::hash_layout(hasher, q.layout());
-            kernel_backend::hash_layout(hasher, k.layout());
-            kernel_backend::hash_layout(hasher, v.layout());
-            mask.map(|mask| kernel_backend::hash_layout(hasher, mask.layout()))
-                .hash(hasher);
-            kernel_backend::hash_layout(hasher, output.layout());
-        }
-    })
 }
 
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
@@ -316,6 +274,15 @@ impl FlashAttentionOperation {
 }
 
 impl Operation for FlashAttentionOperation {
+    fn hash_kernel_signature(&self, state: &mut FxHasher) {
+        self.out_shape.hash(state);
+        self.q_shape.hash(state);
+        self.k_shape.hash(state);
+        self.scale.to_bits().hash(state);
+        self.input_dtype.hash(state);
+        self.mask.is_some().hash(state);
+    }
+
     fn workgroup_shape_constraints(&self, _device: &crate::Device) -> WorkgroupShapeConstraints {
         let mut constraints = WorkgroupShapeConstraints::new();
         constraints.add_constraint(0, Constraint::Equals(1));
@@ -362,7 +329,7 @@ impl Operation for FlashAttentionOperation {
     fn build_direct_kernel(
         &self,
         graph: &ComputeGraphInner,
-        _workgroup_shape: &WorkgroupShape,
+        workgroup_shape: &WorkgroupShape,
         inputs: &[MirValue],
     ) -> Option<DirectKernel> {
         let q = inputs.first()?.as_tensor()?.clone();
@@ -487,25 +454,24 @@ impl Operation for FlashAttentionOperation {
             return None;
         }
 
-        let module_dims = decode_meta.as_ref().map(|meta| meta.dims).unwrap_or(dims);
-        let module_key = flash_attention_module_key(
-            variant,
-            module_dims,
-            decode_meta.as_ref().map(|meta| meta.decode_block),
-            decode_meta.as_ref().is_some_and(|meta| meta.tiled),
-            self.scale.to_bits(),
-            dispatch_size,
-            input_dtype,
-            &q,
-            &k,
-            &v,
-            mask.as_ref(),
-            &output,
-        );
         let kernel_label = match variant {
             FlashAttentionKernelVariant::Streaming => "flash_attention",
             FlashAttentionKernelVariant::DecodeSmall => "flash_attention_decode",
         };
+        let key_label = if let Some(meta) = decode_meta.as_ref() {
+            format!(
+                "{kernel_label}:block={}:tiled={}",
+                meta.decode_block, meta.tiled
+            )
+        } else {
+            kernel_label.to_string()
+        };
+        let module_key = self.kernel_module_key_with_dispatch(
+            &key_label,
+            Some(workgroup_shape),
+            dispatch_size,
+            inputs,
+        );
 
         let _ = output_index; // Bindings are derived from the kernel IR.
         let layout = tile_ir_kernels::linear_storage_layout();

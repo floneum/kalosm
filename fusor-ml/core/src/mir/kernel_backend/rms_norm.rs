@@ -24,6 +24,7 @@ use crate::{
 use fusor_tile_ir as tile_ir;
 use fusor_tile_ir_kernels as tile_ir_kernels;
 use rustc_hash::FxHashMap;
+use rustc_hash::FxHasher;
 
 const BLOCK: usize = 1024;
 const RMS_NORM_MODULE_CACHE_SIZE: usize = 128;
@@ -31,54 +32,6 @@ const RMS_NORM_MODULE_CACHE_SIZE: usize = 128;
 fn rms_norm_module_cache() -> &'static kernel_backend::ModuleCache {
     static CACHE: OnceLock<kernel_backend::ModuleCache> = OnceLock::new();
     CACHE.get_or_init(|| kernel_backend::module_cache(RMS_NORM_MODULE_CACHE_SIZE))
-}
-
-fn rms_norm_module_key(
-    variant: RmsNormKernelVariant,
-    rows: u32,
-    cols: u32,
-    eps_bits: u32,
-    has_bias: bool,
-    has_residual: bool,
-    dispatch_size: [u32; 3],
-    input: &TensorData,
-    residual: Option<&TensorData>,
-    weight: &TensorData,
-    bias: Option<&TensorData>,
-    output: &TensorData,
-    post_chain_signature: u64,
-) -> [u64; 2] {
-    kernel_backend::module_key_from(|hasher| {
-        variant.hash(hasher);
-        rows.hash(hasher);
-        cols.hash(hasher);
-        eps_bits.hash(hasher);
-        has_bias.hash(hasher);
-        has_residual.hash(hasher);
-        dispatch_size.hash(hasher);
-        kernel_backend::hash_layout(hasher, input.layout());
-        residual
-            .map(|residual| kernel_backend::hash_layout(hasher, residual.layout()))
-            .hash(hasher);
-        kernel_backend::hash_layout(hasher, weight.layout());
-        bias.map(|bias| kernel_backend::hash_layout(hasher, bias.layout()))
-            .hash(hasher);
-        kernel_backend::hash_layout(hasher, output.layout());
-        post_chain_signature.hash(hasher);
-    })
-}
-
-/// Stable structural hash of a `UnaryFunctionChain` for cache-key use.
-/// Empty chain returns 0 so non-fused kernels share the existing cache slot.
-fn unary_chain_signature(chain: &UnaryFunctionChain) -> u64 {
-    if chain.functions.is_empty() {
-        return 0;
-    }
-    use std::collections::hash_map::DefaultHasher;
-    use std::hash::Hasher;
-    let mut hasher = DefaultHasher::new();
-    format!("{:?}", chain).hash(&mut hasher);
-    hasher.finish()
 }
 
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
@@ -178,6 +131,14 @@ impl RmsNormOperation {
 }
 
 impl Operation for RmsNormOperation {
+    fn hash_kernel_signature(&self, state: &mut FxHasher) {
+        self.residual.is_some().hash(state);
+        self.bias.is_some().hash(state);
+        self.shape.hash(state);
+        self.eps.to_bits().hash(state);
+        self.post_element_wise.hash(state);
+    }
+
     fn workgroup_shape_constraints(&self, _device: &crate::Device) -> WorkgroupShapeConstraints {
         let mut constraints = WorkgroupShapeConstraints::new();
         constraints.add_constraint(0, Constraint::Equals(1));
@@ -228,7 +189,7 @@ impl Operation for RmsNormOperation {
     fn build_direct_kernel(
         &self,
         graph: &ComputeGraphInner,
-        _workgroup_shape: &WorkgroupShape,
+        workgroup_shape: &WorkgroupShape,
         inputs: &[MirValue],
     ) -> Option<DirectKernel> {
         let input = inputs.first()?.as_tensor()?;
@@ -282,8 +243,6 @@ impl Operation for RmsNormOperation {
             return None;
         }
 
-        let has_bias = bias.is_some();
-        let has_residual = residual.is_some();
         // The vec4 path is a pre-built kernel that doesn't accept an arbitrary
         // post-element-wise chain; force the tile path when fusion has
         // attached one. (The tile path applies the chain inline below.)
@@ -315,26 +274,16 @@ impl Operation for RmsNormOperation {
             KernelDeviceCaps::from_device(&graph.device()),
         );
         let dispatch_size = [rows, 1, 1];
-        let post_chain_signature = unary_chain_signature(&self.post_element_wise);
-        let module_key = rms_norm_module_key(
-            variant,
-            rows,
-            cols,
-            self.eps.to_bits(),
-            has_bias,
-            has_residual,
-            dispatch_size,
-            input,
-            residual,
-            weight,
-            bias,
-            output,
-            post_chain_signature,
-        );
         let kernel_label = match variant {
             RmsNormKernelVariant::Tile => "rms_norm",
             RmsNormKernelVariant::Vec4 => "rms_norm_vec4",
         };
+        let module_key = self.kernel_module_key_with_dispatch(
+            kernel_label,
+            Some(workgroup_shape),
+            dispatch_size,
+            inputs,
+        );
 
         if let Some(meta) = vec4_meta {
             // Collect buffers in the SAME order as the IR builder declares
