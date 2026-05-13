@@ -2,7 +2,7 @@ use rustc_hash::FxHashMap;
 
 use crate::{Layout, TensorLayoutInfo, nary_wise::NaryOperation};
 
-use super::{ComputeGraphNodeVariant, NodeIndex, queue::ComputeQueue};
+use super::{ComputeGraphNodeVariant, GraphOperation, NodeIndex, queue::ComputeQueue};
 
 #[derive(Default)]
 pub(crate) struct LayoutPass {
@@ -29,8 +29,8 @@ impl LayoutPass {
                 ComputeGraphNodeVariant::QMatMul(op) => self.visit_q_mat_mul(node, op),
                 ComputeGraphNodeVariant::QEmbedding(op) => self.visit_q_embedding(node, op),
                 ComputeGraphNodeVariant::Reduce(op) => self.visit_reduce(node, op),
-                ComputeGraphNodeVariant::RmsNorm(op) => self.visit_rms_norm(node, op),
                 ComputeGraphNodeVariant::FlashAttention(op) => self.visit_flash_attention(node, op),
+                ComputeGraphNodeVariant::GraphOp(op) => self.visit_graph_op(node, op.as_ref()),
                 ComputeGraphNodeVariant::MapLayout(op) => self.visit_map_layout(node, op),
                 ComputeGraphNodeVariant::Resize(op) => self.visit_resize(node, op),
                 ComputeGraphNodeVariant::SliceAssign(op) => self.visit_slice_assign(node, op),
@@ -130,31 +130,33 @@ impl LayoutPass {
         );
     }
 
-    fn visit_rms_norm(&mut self, key: NodeIndex, operation: &crate::RmsNormOperation) {
-        let Some(input_layout) = self.output_layout.get(&operation.input) else {
-            self.queue.push_back(operation.input);
-            self.queue.push_back(key);
-            return;
-        };
-        if !self.output_layout.contains_key(&operation.weight) {
-            self.queue.push_back(operation.weight);
+    fn visit_graph_op(&mut self, key: NodeIndex, operation: &dyn GraphOperation) {
+        let mut dependencies = Vec::new();
+        operation.visit_dependencies(&mut |dependency| {
+            dependencies.push(dependency);
+        });
+
+        let mut missing_dependency = false;
+        for dependency in dependencies {
+            if !self.output_layout.contains_key(&dependency) {
+                self.queue.push_back(dependency);
+                missing_dependency = true;
+            }
+        }
+        if missing_dependency {
             self.queue.push_back(key);
             return;
         }
-        if let Some(bias) = operation.bias
-            && !self.output_layout.contains_key(&bias)
-        {
-            self.queue.push_back(bias);
-            self.queue.push_back(key);
-            return;
-        }
-        self.output_layout.insert(
-            key,
-            TensorLayoutInfo::new(
-                Layout::contiguous(input_layout.shape()),
-                input_layout.datatype(),
-            ),
-        );
+
+        let output_layout = operation
+            .output_layout(&self.output_layout)
+            .unwrap_or_else(|| {
+                panic!(
+                    "graph operation {} could not infer output layout",
+                    operation.category()
+                )
+            });
+        self.output_layout.insert(key, output_layout);
     }
 
     fn visit_flash_attention(

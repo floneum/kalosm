@@ -159,9 +159,16 @@ fn node_category(variant: &ComputeGraphNodeVariant) -> &'static str {
         }
         ComputeGraphNodeVariant::Tensor(_) => "tensor",
         ComputeGraphNodeVariant::Reduce(_) => "reduce",
-        ComputeGraphNodeVariant::RmsNorm(_) => "rms_norm",
         ComputeGraphNodeVariant::FlashAttention(_) => "flash_attention",
+        ComputeGraphNodeVariant::GraphOp(op) => op.category(),
     }
+}
+
+fn as_rms_norm(variant: &ComputeGraphNodeVariant) -> Option<&crate::RmsNormOperation> {
+    let ComputeGraphNodeVariant::GraphOp(op) = variant else {
+        return None;
+    };
+    op.as_any().downcast_ref::<crate::RmsNormOperation>()
 }
 
 #[derive(Debug, Clone)]
@@ -980,8 +987,8 @@ impl Resolver {
             ComputeGraphNodeVariant::Nary(op) => Some(Arc::new(op.clone())),
             ComputeGraphNodeVariant::MatMul(op) => Some(Arc::new(op.clone())),
             ComputeGraphNodeVariant::Reduce(op) => Some(Arc::new(op.clone())),
-            ComputeGraphNodeVariant::RmsNorm(op) => Some(Arc::new(op.clone())),
             ComputeGraphNodeVariant::FlashAttention(op) => Some(Arc::new(op.clone())),
+            ComputeGraphNodeVariant::GraphOp(op) => Some(op.clone()),
             ComputeGraphNodeVariant::MapLayout(op) => Some(Arc::new(op.clone())),
             ComputeGraphNodeVariant::Resize(op) => Some(Arc::new(op.clone())),
             ComputeGraphNodeVariant::SliceAssign(op) => Some(Arc::new(op.clone())),
@@ -1017,12 +1024,10 @@ impl Resolver {
                 ComputeGraphNodeVariant::QMatMul(_)
             )
         });
-        let has_rmsnorm = self.execution_graph.node_indices().any(|node| {
-            matches!(
-                self.execution_graph[node].variant,
-                ComputeGraphNodeVariant::RmsNorm(_)
-            )
-        });
+        let has_rmsnorm = self
+            .execution_graph
+            .node_indices()
+            .any(|node| as_rms_norm(&self.execution_graph[node].variant).is_some());
         let mut worklist: VecDeque<ExecutionNodeIndex> = self
             .execution_graph
             .node_indices()
@@ -1093,8 +1098,7 @@ impl Resolver {
             ComputeGraphNodeVariant::Nary(_)
                 | ComputeGraphNodeVariant::MatMul(_)
                 | ComputeGraphNodeVariant::QMatMul(_)
-                | ComputeGraphNodeVariant::RmsNorm(_)
-        )
+        ) || as_rms_norm(&self.execution_graph[node_idx].variant).is_some()
     }
 
     // Helpers
@@ -2054,7 +2058,7 @@ impl Resolver {
             return false;
         };
         let input_variant = self.execution_graph[input_exec_idx].variant.clone();
-        let ComputeGraphNodeVariant::RmsNorm(rms_op) = input_variant else {
+        let Some(rms_op) = as_rms_norm(&input_variant) else {
             return false;
         };
         let mut new_rms = rms_op.clone();
@@ -2063,7 +2067,8 @@ impl Resolver {
         new_rms.post_element_wise =
             UnaryFunctionChain::new(existing, rms_op.post_element_wise.input_datatype());
 
-        self.execution_graph[node_idx].variant = ComputeGraphNodeVariant::RmsNorm(new_rms.clone());
+        self.execution_graph[node_idx].variant =
+            ComputeGraphNodeVariant::GraphOp(Arc::new(new_rms.clone()));
 
         // Re-wire dependency edges: the new RmsNorm node consumes whatever the
         // old one consumed (input, residual?, weight, bias?).

@@ -1,11 +1,11 @@
-use std::sync::Arc;
+use std::{any::Any, sync::Arc};
 
 use parking_lot::RwLock;
 pub use petgraph::graph::NodeIndex;
 use petgraph::prelude::StableGraph;
 use petgraph::visit::EdgeRef;
 use resolve::Resolver;
-use rustc_hash::FxHashSet;
+use rustc_hash::{FxHashMap, FxHashSet};
 use tabbycat::Graph;
 
 mod layout_pass;
@@ -25,7 +25,7 @@ use crate::{
     quantized::matmul::QMatMulOperation,
     resize::ResizeOperation,
     slice_assign::SliceAssignOperation,
-    tensor::TensorData,
+    tensor::{TensorData, TensorLayoutInfo},
     visit_tiled::MaybeQData,
 };
 
@@ -74,8 +74,12 @@ impl ComputeGraph {
         self.create_node(ComputeGraphNodeVariant::Reduce(op))
     }
 
+    pub(crate) fn create_graph_op(&self, op: Arc<dyn GraphOperation>) -> NodeIndex {
+        self.create_node(ComputeGraphNodeVariant::GraphOp(op))
+    }
+
     pub(crate) fn create_rms_norm(&self, op: RmsNormOperation) -> NodeIndex {
-        self.create_node(ComputeGraphNodeVariant::RmsNorm(op))
+        self.create_graph_op(Arc::new(op))
     }
 
     pub(crate) fn create_flash_attention(&self, op: FlashAttentionOperation) -> NodeIndex {
@@ -228,6 +232,17 @@ pub(crate) struct ComputeGraphNode {
     cached: Option<TensorData>,
 }
 
+pub(crate) trait GraphOperation: Operation + Send + Sync {
+    fn as_any(&self) -> &dyn Any;
+
+    fn category(&self) -> &'static str;
+
+    fn output_layout(
+        &self,
+        input_layouts: &FxHashMap<NodeIndex, TensorLayoutInfo>,
+    ) -> Option<TensorLayoutInfo>;
+}
+
 #[derive(Clone, Debug)]
 pub(crate) enum ComputeGraphNodeVariant {
     Nary(NaryOperation),
@@ -240,8 +255,8 @@ pub(crate) enum ComputeGraphNodeVariant {
     QMatMul(QMatMulOperation),
     Tensor(TensorData),
     Reduce(ReduceOperation),
-    RmsNorm(RmsNormOperation),
     FlashAttention(FlashAttentionOperation),
+    GraphOp(Arc<dyn GraphOperation>),
 }
 
 impl ComputeGraphNodeVariant {
@@ -268,17 +283,8 @@ impl ComputeGraphNodeVariant {
                 f(op.indexes);
             }
             ComputeGraphNodeVariant::Reduce(op) => f(op.value),
-            ComputeGraphNodeVariant::RmsNorm(op) => {
-                f(op.input);
-                if let Some(residual) = op.residual {
-                    f(residual);
-                }
-                f(op.weight);
-                if let Some(bias) = op.bias {
-                    f(bias);
-                }
-            }
             ComputeGraphNodeVariant::FlashAttention(op) => op.visit_dependencies(f),
+            ComputeGraphNodeVariant::GraphOp(op) => op.visit_dependencies(f),
             ComputeGraphNodeVariant::MapLayout(op) => f(op.input),
             ComputeGraphNodeVariant::Resize(op) => f(op.input),
             ComputeGraphNodeVariant::SliceAssign(op) => {

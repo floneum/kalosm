@@ -1,7 +1,7 @@
 use rustc_hash::FxHashMap;
 
 use super::queue::ComputeQueue;
-use super::{ComputeGraphInner, ComputeGraphNodeVariant, NodeIndex, layout_pass};
+use super::{ComputeGraphInner, ComputeGraphNodeVariant, GraphOperation, NodeIndex, layout_pass};
 use tabbycat::Graph;
 use tabbycat::{Edge, GraphBuilder, GraphType, Identity, Stmt, StmtList};
 
@@ -99,26 +99,28 @@ impl GraphVisPass {
         self.identities.insert(key, id.clone());
     }
 
-    fn visit_rms_norm(&mut self, key: NodeIndex, operation: &crate::RmsNormOperation) {
-        let input = self.identities.get(&operation.input).unwrap();
-        let weight = self.identities.get(&operation.weight).unwrap();
+    fn visit_graph_op(&mut self, key: NodeIndex, operation: &dyn GraphOperation) {
         let output_layout = self.layout_pass.output_layout.get(&key).unwrap();
-        let id = Identity::quoted(format!("rms_norm ({}) #{:?}", output_layout, key));
+        let id = Identity::quoted(format!(
+            "{} ({}) #{:?}",
+            operation.category(),
+            output_layout,
+            key
+        ));
         self.statements.push(Stmt::Node {
             id: id.clone(),
             port: None,
             attr: None,
         });
-        self.statements.push(Stmt::Edge(
-            Edge::head_node(input.clone(), None).arrow_to_node(id.clone(), None),
-        ));
-        self.statements.push(Stmt::Edge(
-            Edge::head_node(weight.clone(), None).arrow_to_node(id.clone(), None),
-        ));
-        if let Some(bias) = operation.bias {
-            let bias = self.identities.get(&bias).unwrap();
+
+        let mut dependencies = Vec::new();
+        operation.visit_dependencies(&mut |dependency| {
+            dependencies.push(dependency);
+        });
+        for dependency in dependencies {
+            let dependency = self.identities.get(&dependency).unwrap();
             self.statements.push(Stmt::Edge(
-                Edge::head_node(bias.clone(), None).arrow_to_node(id.clone(), None),
+                Edge::head_node(dependency.clone(), None).arrow_to_node(id.clone(), None),
             ));
         }
         self.identities.insert(key, id.clone());
@@ -309,9 +311,11 @@ impl ComputeGraphInner {
                     graph_vis_pass.visit_q_embedding(node, op)
                 }
                 ComputeGraphNodeVariant::Reduce(op) => graph_vis_pass.visit_reduce(node, op),
-                ComputeGraphNodeVariant::RmsNorm(op) => graph_vis_pass.visit_rms_norm(node, op),
                 ComputeGraphNodeVariant::FlashAttention(op) => {
                     graph_vis_pass.visit_flash_attention(node, op)
+                }
+                ComputeGraphNodeVariant::GraphOp(op) => {
+                    graph_vis_pass.visit_graph_op(node, op.as_ref())
                 }
                 ComputeGraphNodeVariant::MapLayout(op) => graph_vis_pass.visit_map_layout(node, op),
                 ComputeGraphNodeVariant::Resize(op) => graph_vis_pass.visit_resize(node, op),

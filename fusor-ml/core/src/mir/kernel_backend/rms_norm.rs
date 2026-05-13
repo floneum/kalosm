@@ -1,8 +1,8 @@
-use std::sync::OnceLock;
+use std::{any::Any, hash::Hash, sync::OnceLock};
 
 use crate::{
-    DataTypeEnum,
-    compute_graph::{ComputeGraphInner, NodeIndex},
+    DataTypeEnum, Layout,
+    compute_graph::{ComputeGraphInner, GraphOperation, NodeIndex},
     kernel_selection::{
         Axis, KernelDeviceCaps, KernelShape, ShapeRule, ShapeSelector, multiple_of,
     },
@@ -19,11 +19,11 @@ use crate::{
     },
     nary_direct::apply_unary_function_chain,
     nary_wise::UnaryFunctionChain,
-    tensor::TensorData,
+    tensor::{TensorData, TensorLayoutInfo},
 };
 use fusor_tile_ir as tile_ir;
 use fusor_tile_ir_kernels as tile_ir_kernels;
-use std::hash::Hash;
+use rustc_hash::FxHashMap;
 
 const BLOCK: usize = 1024;
 const RMS_NORM_MODULE_CACHE_SIZE: usize = 128;
@@ -462,6 +462,27 @@ impl Operation for RmsNormOperation {
                 .collect::<Vec<_>>()
                 .join("x")
         )
+    }
+}
+
+impl GraphOperation for RmsNormOperation {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn category(&self) -> &'static str {
+        "rms_norm"
+    }
+
+    fn output_layout(
+        &self,
+        input_layouts: &FxHashMap<NodeIndex, TensorLayoutInfo>,
+    ) -> Option<TensorLayoutInfo> {
+        let input_layout = input_layouts.get(&self.input)?;
+        Some(TensorLayoutInfo::new(
+            Layout::contiguous(input_layout.shape()),
+            input_layout.datatype(),
+        ))
     }
 }
 
