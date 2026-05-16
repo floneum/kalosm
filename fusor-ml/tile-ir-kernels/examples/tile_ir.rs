@@ -17,7 +17,7 @@ fn fused_bias_gelu_residual_ir(rows: u32, cols: u32) -> KernelIr {
             let mask = col.lt(cols);
 
             let x = program.load(x.at((&row, &col)), mask.clone(), 0.0);
-            let bias = program.load_linear(bias.at(&col), mask.clone(), TileLiteral::f32(0.0));
+            let bias = program.load(bias.at(&col), mask.clone(), TileLiteral::f32(0.0));
             let residual = program.load(residual.at((&row, &col)), mask.clone(), 0.0);
 
             // One tile expression becomes one fused kernel: bias add, GELU,
@@ -44,12 +44,11 @@ fn fused_rms_norm_silu_ir(rows: u32, cols: u32, eps: f32) -> KernelIr {
             let mask = col.lt(cols);
 
             let x = program.load(x.at((&row, &col)), mask.clone(), 0.0);
-            let weight = program.load_linear(weight.at(&col), mask.clone(), TileLiteral::f32(0.0));
+            let weight = program.load(weight.at(&col), mask.clone(), TileLiteral::f32(0.0));
 
             let square = x.clone() * x.clone();
             let sum_square = program.reduce_sum(square);
-            let mean_square =
-                tile::Tile::<BLOCK>::from(sum_square) / tile::Scalar::literal(cols as f32);
+            let mean_square = tile::Tile::from(sum_square) / tile::Scalar::literal(cols as f32);
             let inv_rms = (mean_square + tile::Scalar::literal(eps)).inverse_sqrt();
 
             // The normalization reduction feeds directly into the per-element

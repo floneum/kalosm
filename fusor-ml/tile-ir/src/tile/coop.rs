@@ -6,26 +6,42 @@ use crate::ir::{
 };
 
 /// Workgroup tile coordinates for `TileBlock::mma_from_tiles`.
-pub struct CoopTileLoad<const BLOCK: usize> {
+pub struct CoopTileLoad {
     tile: TileRef,
     row: Box<Expr>,
     col: Box<Expr>,
-    _block: PhantomData<[(); BLOCK]>,
 }
 
-impl<const BLOCK: usize> CoopTileLoad<BLOCK> {
-    /// Create a cooperative tile-load descriptor.
-    pub fn new(tile: TileRef, row: impl IntoIndex<BLOCK>, col: impl IntoIndex<BLOCK>) -> Self {
-        Self {
-            tile,
-            row: row.into_index(),
-            col: col.into_index(),
-            _block: PhantomData,
+/// Cooperative-matrix operand role for generic fragment loads.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum CoopRole {
+    /// Load an A operand fragment.
+    A,
+    /// Load a B operand fragment.
+    B,
+}
+
+impl From<CoopRole> for CoopOperandRole {
+    fn from(value: CoopRole) -> Self {
+        match value {
+            CoopRole::A => Self::A,
+            CoopRole::B => Self::B,
         }
     }
 }
 
-impl<const BLOCK: usize> TileBlock<'_, BLOCK> {
+impl CoopTileLoad {
+    /// Create a cooperative tile-load descriptor.
+    pub fn new(tile: TileRef, row: impl IntoIndex, col: impl IntoIndex) -> Self {
+        Self {
+            tile,
+            row: row.into_index(),
+            col: col.into_index(),
+        }
+    }
+}
+
+impl TileBlock<'_> {
     /// Allocate a cooperative-matrix accumulator.
     ///
     /// ```
@@ -33,13 +49,13 @@ impl<const BLOCK: usize> TileBlock<'_, BLOCK> {
     ///
     /// let ir = tile::build(|program| {
     ///     program.program_grid::<32>([1, 1, 1], |block| {
-    ///         let acc = block.alloc_coop_acc_typed::<F32, 8, 8>();
+    ///         let acc = block.alloc_coop_acc::<F32, 8, 8>();
     ///         block.zero_coop_acc(&acc);
     ///     });
     /// });
     /// # let _ = ir;
     /// ```
-    pub fn alloc_coop_acc_typed<T: CoopElement, const ROWS: usize, const COLS: usize>(
+    pub fn alloc_coop_acc<T: CoopElement, const ROWS: usize, const COLS: usize>(
         &mut self,
     ) -> CoopAcc<T, ROWS, COLS> {
         assert!(
@@ -75,8 +91,8 @@ impl<const BLOCK: usize> TileBlock<'_, BLOCK> {
         &mut self,
         dst: TileRef,
         src: &Storage<T, 2>,
-        row_offset: impl IntoIndex<BLOCK>,
-        col_offset: impl IntoIndex<BLOCK>,
+        row_offset: impl IntoIndex,
+        col_offset: impl IntoIndex,
     ) {
         self.push_stmt(TileStmt::CopyToWorkgroupTile {
             dst,
@@ -91,8 +107,8 @@ impl<const BLOCK: usize> TileBlock<'_, BLOCK> {
         &mut self,
         dst: TileRef,
         src: &crate::quantized::QuantizedMatrix,
-        row_offset: impl IntoIndex<BLOCK>,
-        col_offset: impl IntoIndex<BLOCK>,
+        row_offset: impl IntoIndex,
+        col_offset: impl IntoIndex,
     ) {
         self.push_stmt(TileStmt::CopyToWorkgroupTile {
             dst,
@@ -111,11 +127,11 @@ impl<const BLOCK: usize> TileBlock<'_, BLOCK> {
     pub fn mma_from_tiles<T: CoopElement, const ROWS: usize, const COLS: usize>(
         &mut self,
         acc: &CoopAcc<T, ROWS, COLS>,
-        a: CoopTileLoad<BLOCK>,
-        b: CoopTileLoad<BLOCK>,
+        a: CoopTileLoad,
+        b: CoopTileLoad,
     ) {
-        let a = self.coop_load_indexed::<T, ROWS, COLS>(CoopOperandRole::A, a);
-        let b = self.coop_load_indexed::<T, ROWS, COLS>(CoopOperandRole::B, b);
+        let a = self.coop_load::<T, ROWS, COLS>(CoopRole::A, a);
+        let b = self.coop_load::<T, ROWS, COLS>(CoopRole::B, b);
         self.coop_mma(acc, &a, &b);
     }
 
@@ -123,48 +139,17 @@ impl<const BLOCK: usize> TileBlock<'_, BLOCK> {
     pub fn coop_tile_load(
         &self,
         tile: TileRef,
-        row: impl IntoIndex<BLOCK>,
-        col: impl IntoIndex<BLOCK>,
-    ) -> CoopTileLoad<BLOCK> {
+        row: impl IntoIndex,
+        col: impl IntoIndex,
+    ) -> CoopTileLoad {
         CoopTileLoad::new(tile, row, col)
     }
 
-    /// Cooperatively load an A fragment from a workgroup tile. The returned
-    /// handle's SSA value is bound at the load site and reused wherever the
-    /// handle is consumed by `coop_mma` in the same scope.
-    pub fn coop_load_a_typed<T: CoopElement, const ROWS: usize, const COLS: usize>(
+    /// Cooperatively load a fragment from a workgroup tile.
+    pub fn coop_load<T: CoopElement, const ROWS: usize, const COLS: usize>(
         &mut self,
-        tile: TileRef,
-        row: impl IntoIndex<BLOCK>,
-        col: impl IntoIndex<BLOCK>,
-    ) -> CoopFragment<T, ROWS, COLS> {
-        self.coop_load(CoopOperandRole::A, tile, row, col)
-    }
-
-    /// Cooperatively load a B fragment.
-    pub fn coop_load_b_typed<T: CoopElement, const ROWS: usize, const COLS: usize>(
-        &mut self,
-        tile: TileRef,
-        row: impl IntoIndex<BLOCK>,
-        col: impl IntoIndex<BLOCK>,
-    ) -> CoopFragment<T, ROWS, COLS> {
-        self.coop_load(CoopOperandRole::B, tile, row, col)
-    }
-
-    fn coop_load<T: CoopElement, const ROWS: usize, const COLS: usize>(
-        &mut self,
-        role: CoopOperandRole,
-        tile: TileRef,
-        row: impl IntoIndex<BLOCK>,
-        col: impl IntoIndex<BLOCK>,
-    ) -> CoopFragment<T, ROWS, COLS> {
-        self.coop_load_indexed(role, CoopTileLoad::new(tile, row, col))
-    }
-
-    fn coop_load_indexed<T: CoopElement, const ROWS: usize, const COLS: usize>(
-        &mut self,
-        role: CoopOperandRole,
-        load: CoopTileLoad<BLOCK>,
+        role: CoopRole,
+        load: CoopTileLoad,
     ) -> CoopFragment<T, ROWS, COLS> {
         assert!(
             ROWS == 8 || ROWS == 16,
@@ -175,6 +160,7 @@ impl<const BLOCK: usize> TileBlock<'_, BLOCK> {
             "cooperative-matrix columns must be 8 or 16"
         );
         let id = self.program.next_coop_fragment_id();
+        let role = CoopOperandRole::from(role);
         self.push_stmt(TileStmt::LoadCoop {
             id,
             role,
@@ -222,8 +208,8 @@ impl<const BLOCK: usize> TileBlock<'_, BLOCK> {
         &mut self,
         acc: &CoopAcc<T, ROWS, COLS>,
         dst: &Storage<T, 2>,
-        row: impl IntoIndex<BLOCK>,
-        col: impl IntoIndex<BLOCK>,
+        row: impl IntoIndex,
+        col: impl IntoIndex,
     ) {
         self.push_stmt(TileStmt::StoreCoopAcc {
             acc: acc.local,

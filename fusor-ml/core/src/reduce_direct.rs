@@ -108,7 +108,7 @@ pub(crate) fn build_reduce_direct_kernel(
                         |program, loop_index| {
                             let k = tile_ir::tile::Tile::from_index(loop_index * reduce_stride);
                             let value_index = base.clone() + k;
-                            let value = program.load_literal(
+                            let value = program.load(
                                 input_storage.at((0, value_index)),
                                 in_bounds.clone(),
                                 zero_literal(input_meta_body.datatype),
@@ -137,10 +137,7 @@ pub(crate) fn build_reduce_direct_kernel(
     )
 }
 
-fn output_dims_from_flat<const N: usize>(
-    flat: tile_ir::tile::Tile<N>,
-    shape: &[u32],
-) -> Vec<tile_ir::tile::Tile<N>> {
+fn output_dims_from_flat(flat: tile_ir::tile::Tile, shape: &[u32]) -> Vec<tile_ir::tile::Tile> {
     (0..shape.len())
         .map(|axis| {
             let divisor = shape[axis + 1..]
@@ -161,10 +158,7 @@ fn output_dims_from_flat<const N: usize>(
         .collect()
 }
 
-fn layout_index<const N: usize>(
-    meta: &TensorMeta,
-    coords: &[tile_ir::tile::Tile<N>],
-) -> tile_ir::tile::Tile<N> {
+fn layout_index(meta: &TensorMeta, coords: &[tile_ir::tile::Tile]) -> tile_ir::tile::Tile {
     let mut index = tile_u32(meta.offset);
     for (coord, stride) in coords.iter().zip(&meta.strides) {
         if *stride != 0 {
@@ -174,8 +168,8 @@ fn layout_index<const N: usize>(
     index
 }
 
-fn linear_group<const N: usize>(
-    program: &tile_ir::tile::TileBlock<'_, N>,
+fn linear_group(
+    program: &tile_ir::tile::TileBlock<'_>,
     dispatch_size: [u32; 3],
 ) -> tile_ir::tile::ScalarIndex {
     program.program_id(tile_ir::WorkgroupAxis::X)
@@ -192,11 +186,11 @@ fn flat_layout(allocation_len: u32) -> tile_ir::Layout {
     )
 }
 
-fn cast_tile<const N: usize>(
-    value: tile_ir::tile::Tile<N>,
+fn cast_tile(
+    value: tile_ir::tile::Tile,
     source: DataTypeEnum,
     target: DataTypeEnum,
-) -> tile_ir::tile::Tile<N> {
+) -> tile_ir::tile::Tile {
     if source == target {
         value
     } else {
@@ -221,7 +215,7 @@ fn tile_literal(value: NaryScalar) -> tile_ir::TileLiteral {
     }
 }
 
-fn tile_u32<const N: usize>(value: u32) -> tile_ir::tile::Tile<N> {
+fn tile_u32(value: u32) -> tile_ir::tile::Tile {
     tile_ir::tile::Tile::literal(tile_ir::TileLiteral::U32(value))
 }
 

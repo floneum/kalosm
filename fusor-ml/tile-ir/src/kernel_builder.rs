@@ -7,8 +7,8 @@
 //! `core` uses `Arc<wgpu::Buffer>`; tests can use `()`.
 
 use crate::{
-    ElementType, KernelIr, Layout, Numeric,
     tile::{Program, RuntimeElement, Storage},
+    ElementType, KernelIr, Layout, Numeric,
 };
 
 /// A runtime binding paired with the IR layout that describes how the kernel
@@ -73,8 +73,8 @@ impl<B> KernelBuilder<B> {
     /// kb.program().program_grid::<16>([1, 1, 1], |block| {
     ///     let lane = block.lane();
     ///     let mask = lane.clone().lt(16u32);
-    ///     let value = block.load_linear(input.at(lane.clone()), mask.clone(), TileLiteral::f32(0.0));
-    ///     block.store_linear(output.at(lane), value, mask);
+    ///     let value = block.load(input.at(lane.clone()), mask.clone(), TileLiteral::f32(0.0));
+    ///     block.store(output.at(lane), value, mask);
     /// });
     ///
     /// let (_ir, bindings) = kb.finish();

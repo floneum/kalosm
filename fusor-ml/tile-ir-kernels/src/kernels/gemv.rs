@@ -50,12 +50,12 @@ pub fn gemv<const ROWS_PER_WORKGROUP: usize, const VALUES_PER_LANE: usize, const
             [zero],
             |program, loop_index| {
                 let k_base = loop_index * k_per_iter + lane.clone() * VALUES_PER_LANE as u32;
-                let a_values: [Tile<BLOCK>; VALUES_PER_LANE] = std::array::from_fn(|i| {
+                let a_values: [Tile; VALUES_PER_LANE] = std::array::from_fn(|i| {
                     let k_index = k_base.clone() + i as u32;
                     let mask = row_in_bounds.clone().and(k_index.lt(k));
                     program.load(a.at((&row, k_index)), mask, 0.0)
                 });
-                let x_values: [Tile<BLOCK>; VALUES_PER_LANE] = std::array::from_fn(|i| {
+                let x_values: [Tile; VALUES_PER_LANE] = std::array::from_fn(|i| {
                     let k_index = k_base.clone() + i as u32;
                     program.load(x.at((k_index.clone(), 0)), k_index.lt(k), 0.0)
                 });

@@ -21,8 +21,7 @@ pub use mirostat::{mirostat2, Mirostat2};
 pub use qdequantize::qdequantize;
 pub use qgemv::{qgemv, qgemv_with_epilogue, IntoQgemvEpilogues};
 pub use qgemv_paired_q4k::{
-    qgemv_q4k_paired_2x2, qgemv_q4k_paired_2x4, qgemv_q4k_paired_4x1, qgemv_q4k_paired_4x2,
-    qgemv_q4k_paired_4x4, qgemv_q4k_paired_8x1, qgemv_q4k_paired_8x2, qgemv_q4k_paired_ggml,
+    qgemv_q4k_paired, qgemv_q4k_paired_cols_per_workgroup, qgemv_q4k_paired_tile_name,
     Q4KPairedGgml,
 };
 pub use qmatmul::{qmatmul, qmatmul_with_epilogue};

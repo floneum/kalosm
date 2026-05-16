@@ -83,13 +83,9 @@ fn generic_vector_load_and_dot_lower_to_naga() {
         phase.program_grid::<16>([1, 1, 1], |program| {
             let lane = program.lane();
             let mask = lane.clone().lt(16);
-            let value = program.load_vector::<F32, 2>(
-                x.at(lane.clone()),
-                mask.clone(),
-                TileLiteral::f32(0.0),
-            );
+            let value = program.load(x.at(lane.clone()), mask.clone(), TileLiteral::f32(0.0));
             let dot = program.vector_dot::<F32, 2>(value.clone(), value);
-            program.store_linear(y.at(lane), dot, mask);
+            program.store(y.at(lane), dot, mask);
         });
     });
 
@@ -100,7 +96,7 @@ fn generic_vector_load_and_dot_lower_to_naga() {
 fn typed_coop_accumulator_records_scalar_role_and_shape() {
     let ir = tile::build(|phase| {
         phase.program_grid::<32>([1, 1, 1], |program| {
-            let acc = program.alloc_coop_acc_typed::<F32, 8, 8>();
+            let acc = program.alloc_coop_acc::<F32, 8, 8>();
             program.zero_coop_acc(&acc);
         });
     });

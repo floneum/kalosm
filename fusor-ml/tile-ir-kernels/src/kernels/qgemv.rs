@@ -1,6 +1,8 @@
 //! Quantized GEMV program kernels.
 
-use fusor_tile_ir::tile::{Bound, GgmlBlockCoords, Mask, Program, QuantizedDot, Storage, Tile};
+use fusor_tile_ir::tile::{
+    quantized::ggml::BlockCoords, Bound, Mask, Program, QuantizedDot, Storage, Tile,
+};
 use fusor_tile_ir::{GgmlQuantFormat, QuantizedMatrix, TileLiteral, TileReduceOp, F32};
 
 use crate::dispatch::{
@@ -278,13 +280,13 @@ pub(crate) fn qgemv_q4k_ggml_with_epilogue<
     let b_cloned = b.clone();
 
     program.program_grid::<BLOCK>([grid.workgroups_x, grid.dispatch_y, 1], |program| {
-        let scope = qgemv_program_scope::<BLOCK, COLS_PER_SUBGROUP>(program, grid);
+        let scope = qgemv_program_scope::<COLS_PER_SUBGROUP>(program, grid);
         let col0 = scope.col0;
         let lane = scope.lane;
         let q4k_lane = q4k_lane_decomposition(&lane);
 
         let zero = TileLiteral::f32(0.0);
-        let sums: [Tile<BLOCK>; COLS_PER_SUBGROUP] = program.loop_fold_n::<COLS_PER_SUBGROUP, _>(
+        let sums: [Tile; COLS_PER_SUBGROUP] = program.loop_fold_n::<COLS_PER_SUBGROUP, _>(
             TileReduceOp::Sum,
             block_iterations,
             [zero; COLS_PER_SUBGROUP],
@@ -305,13 +307,8 @@ pub(crate) fn qgemv_q4k_ggml_with_epilogue<
                 std::array::from_fn(|c| {
                     let col = col0.clone() + c as u32;
                     let mask = grid.mask(full_block_iterations, pass.in_bounds.clone(), &col);
-                    let coords = GgmlBlockCoords::new::<BLOCK>(
-                        &pass.block,
-                        &q4k_lane.iq,
-                        &q4k_lane.ir,
-                        &col,
-                    );
-                    program.quantized_dot(QuantizedDot::q4k_ggml(
+                    let coords = BlockCoords::new(&pass.block, &q4k_lane.iq, &q4k_lane.ir, &col);
+                    program.quantized_dot(QuantizedDot::ggml_q4k(
                         pass.activations.clone(),
                         &b_cloned,
                         coords,
@@ -362,13 +359,13 @@ pub(crate) fn qgemv_q6k_ggml_with_epilogue<
     let b_cloned = b.clone();
 
     program.program_grid::<BLOCK>([grid.workgroups_x, grid.dispatch_y, 1], |program| {
-        let scope = qgemv_program_scope::<BLOCK, COLS_PER_SUBGROUP>(program, grid);
+        let scope = qgemv_program_scope::<COLS_PER_SUBGROUP>(program, grid);
         let col0 = scope.col0;
         let lane = scope.lane;
         let q6k_lane = q6k_lane_decomposition(&lane);
 
         let zero = TileLiteral::f32(0.0);
-        let sums: [Tile<BLOCK>; COLS_PER_SUBGROUP] = program.loop_fold_n::<COLS_PER_SUBGROUP, _>(
+        let sums: [Tile; COLS_PER_SUBGROUP] = program.loop_fold_n::<COLS_PER_SUBGROUP, _>(
             TileReduceOp::Sum,
             block_iterations,
             [zero; COLS_PER_SUBGROUP],
@@ -389,13 +386,8 @@ pub(crate) fn qgemv_q6k_ggml_with_epilogue<
                 std::array::from_fn(|c| {
                     let col = col0.clone() + c as u32;
                     let mask = grid.mask(full_block_iterations, pass.in_bounds.clone(), &col);
-                    let coords = GgmlBlockCoords::new::<BLOCK>(
-                        &pass.block,
-                        &q6k_lane.ip,
-                        &q6k_lane.il,
-                        &col,
-                    );
-                    program.quantized_dot(QuantizedDot::q6k_ggml(
+                    let coords = BlockCoords::new(&pass.block, &q6k_lane.ip, &q6k_lane.il, &col);
+                    program.quantized_dot(QuantizedDot::ggml_q6k(
                         pass.activations.clone(),
                         &b_cloned,
                         coords,
@@ -456,12 +448,12 @@ pub(crate) fn qgemv_perf_with_epilogue<
     let b_cloned = b.clone();
     let q6k_vocab_f32_dot = b.format == GgmlQuantFormat::Q6K && b.rows <= 4096 && b.cols >= 65_536;
     program.program_grid::<BLOCK>([grid.workgroups_x, grid.dispatch_y, 1], |program| {
-        let scope = qgemv_program_scope::<BLOCK, COLS_PER_SUBGROUP>(program, grid);
+        let scope = qgemv_program_scope::<COLS_PER_SUBGROUP>(program, grid);
         let col0 = scope.col0;
         let lane = scope.lane;
 
         let zero = TileLiteral::f32(0.0);
-        let sums: [Tile<BLOCK>; COLS_PER_SUBGROUP] = program.loop_fold_n::<COLS_PER_SUBGROUP, _>(
+        let sums: [Tile; COLS_PER_SUBGROUP] = program.loop_fold_n::<COLS_PER_SUBGROUP, _>(
             TileReduceOp::Sum,
             k_iterations,
             [zero; COLS_PER_SUBGROUP],
@@ -473,7 +465,7 @@ pub(crate) fn qgemv_perf_with_epilogue<
                     k_base.lt(k_size)
                 };
 
-                let a_bound: [Bound<BLOCK>; VALUES_PER_LANE] = std::array::from_fn(|i| {
+                let a_bound: [Bound; VALUES_PER_LANE] = std::array::from_fn(|i| {
                     let scalar = program.load(
                         a.at((0, k_base.clone() + i as u32)),
                         in_bounds_k.clone(),
@@ -483,10 +475,9 @@ pub(crate) fn qgemv_perf_with_epilogue<
                     program.bind(scalar)
                 });
 
-                let a8 = || -> [Tile<BLOCK>; 8] { std::array::from_fn(|i| a_bound[i].get()) };
-                let an = || -> [Tile<BLOCK>; VALUES_PER_LANE] {
-                    std::array::from_fn(|i| a_bound[i].get())
-                };
+                let a8 = || -> [Tile; 8] { std::array::from_fn(|i| a_bound[i].get()) };
+                let an =
+                    || -> [Tile; VALUES_PER_LANE] { std::array::from_fn(|i| a_bound[i].get()) };
                 std::array::from_fn(|c| {
                     let col = col0.clone() + c as u32;
                     let mask = grid.mask(full_k_iterations, in_bounds_k.clone(), &col);
@@ -494,7 +485,7 @@ pub(crate) fn qgemv_perf_with_epilogue<
                         && VALUES_PER_LANE == 8
                         && grid.n_cols >= 8192
                     {
-                        return program.quantized_dot(QuantizedDot::q8_0_dot8(
+                        return program.quantized_dot(QuantizedDot::f32_activations(
                             a8(),
                             &b_cloned,
                             &k_base,
@@ -506,17 +497,14 @@ pub(crate) fn qgemv_perf_with_epilogue<
                     if b_cloned.format == GgmlQuantFormat::Q4K
                         && (VALUES_PER_LANE == 8 || VALUES_PER_LANE == 16 || VALUES_PER_LANE == 32)
                     {
-                        return program.quantized_dot(QuantizedDot::q4k_f32::<VALUES_PER_LANE>(
-                            an(),
-                            &b_cloned,
-                            &k_base,
-                            &col,
-                            mask,
-                            0.0,
+                        return program.quantized_dot(QuantizedDot::f32_activations::<
+                            VALUES_PER_LANE,
+                        >(
+                            an(), &b_cloned, &k_base, &col, mask, 0.0
                         ));
                     }
                     if b_cloned.format == GgmlQuantFormat::Q6K && VALUES_PER_LANE == 8 {
-                        return program.quantized_dot(QuantizedDot::q8_0_dot8(
+                        return program.quantized_dot(QuantizedDot::f32_activations(
                             a8(),
                             &b_cloned,
                             &k_base,
@@ -526,18 +514,13 @@ pub(crate) fn qgemv_perf_with_epilogue<
                         ));
                     }
                     if b_cloned.format == GgmlQuantFormat::Q6K && !q6k_vocab_f32_dot {
-                        return program.quantized_dot(
-                            QuantizedDot::q8_activation::<VALUES_PER_LANE>(
-                                an(),
-                                &b_cloned,
-                                &k_base,
-                                &col,
-                                mask,
-                                0.0,
-                            ),
-                        );
+                        return program.quantized_dot(QuantizedDot::q8_activations::<
+                            VALUES_PER_LANE,
+                        >(
+                            an(), &b_cloned, &k_base, &col, mask, 0.0
+                        ));
                     }
-                    let bs: [Tile<BLOCK>; VALUES_PER_LANE] = program
+                    let bs: [Tile; VALUES_PER_LANE] = program
                         .load_quantized_block::<VALUES_PER_LANE>(
                             &b_cloned, &k_base, &col, mask, 0.0,
                         );

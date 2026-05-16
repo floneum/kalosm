@@ -8,7 +8,7 @@ use super::types::{MergeTopKMeta, TopKChunkMeta, TopKExactnessMeta};
 
 const TOP_K_CHUNK: u32 = TOP_K_BLOCK as u32;
 
-fn is_finite<const BLOCK: usize>(value: Tile<BLOCK>) -> Tile<BLOCK> {
+fn is_finite(value: Tile) -> Tile {
     let self_equal = value.clone().eq(value.clone());
     let finite_magnitude = value
         .unary(TileUnaryOp::Abs)
@@ -16,12 +16,7 @@ fn is_finite<const BLOCK: usize>(value: Tile<BLOCK>) -> Tile<BLOCK> {
     self_equal.and(finite_magnitude)
 }
 
-fn better_candidate<const BLOCK: usize>(
-    value: Tile<BLOCK>,
-    id: Tile<BLOCK>,
-    best_value: Tile<BLOCK>,
-    best_id: Tile<BLOCK>,
-) -> Tile<BLOCK> {
+fn better_candidate(value: Tile, id: Tile, best_value: Tile, best_id: Tile) -> Tile {
     let value_greater = value.clone().gt(best_value.clone());
     let value_equal = value.eq(best_value);
     let id_greater = id.gt(best_id);
@@ -29,12 +24,12 @@ fn better_candidate<const BLOCK: usize>(
 }
 
 fn load_processor_param_f32(
-    program: &TileBlock<'_, TOP_K_BLOCK>,
+    program: &TileBlock<'_>,
     params: &tile::Storage<U32, 1>,
     index: u32,
-) -> Tile<TOP_K_BLOCK> {
+) -> Tile {
     program
-        .load_linear(params.at(index), Mask::all(), TileLiteral::U32(0))
+        .load(params.at(index), Mask::all(), TileLiteral::U32(0))
         .bitcast(ElementType::F32)
 }
 
@@ -91,7 +86,7 @@ pub fn top_k_chunk<B>(
             .lt(Tile::literal(TileLiteral::U32(meta.input_len)));
         program.if_then(token_valid, |program| {
             let input_index = index_n(meta.input_offset, [meta.input_stride], token_id.clone());
-            let raw = program.load_linear(
+            let raw = program.load(
                 input.at(input_index),
                 Mask::all(),
                 TileLiteral::f32(NEG_MAX_F32),
@@ -103,11 +98,8 @@ pub fn top_k_chunk<B>(
                     program.store_local(&current_value, value);
                     program.store_local(&previous_index, Tile::literal(TileLiteral::U32(0)));
                     program.store_local(&repeated, program.bool(false));
-                    let previous_len = program.load_linear(
-                        processor_params.at(2),
-                        Mask::all(),
-                        TileLiteral::U32(0),
-                    );
+                    let previous_len =
+                        program.load(processor_params.at(2), Mask::all(), TileLiteral::U32(0));
                     program.store_local(&previous_len_local, previous_len);
                     program.loop_forever(|program| {
                         let previous_index_value = program.load_local(&previous_index);
@@ -116,7 +108,7 @@ pub fn top_k_chunk<B>(
                             program.break_loop();
                         });
                         let previous_index_value = program.load_local(&previous_index);
-                        let previous_token = program.load_linear(
+                        let previous_token = program.load(
                             previous_tokens.at(previous_index_value),
                             Mask::all(),
                             TileLiteral::U32(0),
@@ -252,12 +244,12 @@ pub fn top_k_chunk<B>(
         let output_index = program.index(chunk * meta.output_per_chunk + lane.clone());
         let selected_value = program.load_workgroup(scratch_values, lane.clone());
         let selected_id = program.load_workgroup(scratch_ids, lane.clone());
-        program.store_linear(
+        program.store(
             output_values.at(output_index.clone()),
             selected_value,
             writes_output.clone(),
         );
-        program.store_linear(output_ids.at(output_index), selected_id, writes_output);
+        program.store(output_ids.at(output_index), selected_id, writes_output);
     });
     Some(())
 }
@@ -295,7 +287,7 @@ pub fn top_k_exactness<B>(
             [meta.top_values_stride],
             threshold_rank,
         );
-        let threshold = program.load_linear(
+        let threshold = program.load(
             top_values.at(threshold_index),
             Mask::all(),
             TileLiteral::f32(NEG_MAX_F32),
@@ -321,7 +313,7 @@ pub fn top_k_exactness<B>(
                 [meta.chunk_values_stride],
                 bound_rank,
             );
-            let bound = program.load_linear(
+            let bound = program.load(
                 chunk_values.at(bound_index),
                 Mask::all(),
                 TileLiteral::f32(NEG_MAX_F32),
@@ -359,18 +351,10 @@ pub fn top_k_exactness<B>(
             program.if_else(
                 exact,
                 |program| {
-                    program.store_linear(
-                        flag.at(0),
-                        Tile::literal(TileLiteral::U32(1)),
-                        Mask::all(),
-                    )
+                    program.store(flag.at(0), Tile::literal(TileLiteral::U32(1)), Mask::all())
                 },
                 |program| {
-                    program.store_linear(
-                        flag.at(0),
-                        Tile::literal(TileLiteral::U32(0)),
-                        Mask::all(),
-                    )
+                    program.store(flag.at(0), Tile::literal(TileLiteral::U32(0)), Mask::all())
                 },
             );
         });
@@ -463,12 +447,12 @@ pub fn top_k_merge<B>(
                 program.if_then(in_chunk, |program| {
                     let index = chunk.clone() * Tile::literal(TileLiteral::U32(meta.chunk_stride))
                         + position.clone();
-                    let id = program.load_linear(
+                    let id = program.load(
                         input_ids.at(index.clone()),
                         Mask::all(),
                         TileLiteral::U32(u32::MAX),
                     );
-                    let value = program.load_linear(
+                    let value = program.load(
                         input_values.at(index),
                         Mask::all(),
                         TileLiteral::f32(NEG_MAX_F32),
@@ -548,12 +532,12 @@ pub fn top_k_merge<B>(
                 let selected_id = program.load_local(&selected_id_local);
                 let selected_chunk = program.load_local(&selected_chunk_local);
                 let rank_value = program.load_local(&rank);
-                program.store_linear(
+                program.store(
                     output_values.at(rank_value.clone()),
                     selected_value,
                     Mask::all(),
                 );
-                program.store_linear(output_ids.at(rank_value), selected_id, Mask::all());
+                program.store(output_ids.at(rank_value), selected_id, Mask::all());
                 let valid_chunk = selected_chunk
                     .clone()
                     .lt(Tile::literal(TileLiteral::U32(meta.chunks)));

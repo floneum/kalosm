@@ -208,7 +208,7 @@ impl Operation for QEmbeddingOperation {
                         let in_bounds = flat.clone().lt(total);
                         let dim = flat.clone() % embedding_dim;
                         let index_pos = flat / embedding_dim;
-                        let token = program.load_literal(
+                        let token = program.load(
                             indexes.at((0, index_pos.clone())),
                             in_bounds.clone(),
                             tile_ir::TileLiteral::U32(0),

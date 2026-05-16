@@ -2,8 +2,8 @@ use std::marker::PhantomData;
 
 use super::*;
 use crate::ir::{
-    BlockDequantId, BufferAccess, BufferDecl, BufferRef, CoopFragmentId, F32, KernelIr, Layout,
-    LocalRef, MemoryLevel, Numeric, Shape, StorageView, TileDecl, TileProgramOp, TileRef,
+    BlockDequantId, BufferAccess, BufferDecl, BufferRef, CoopFragmentId, KernelIr, Layout,
+    LocalRef, MemoryLevel, Numeric, Shape, StorageView, TileDecl, TileProgramOp, TileRef, F32,
 };
 
 macro_rules! storage_accessors {
@@ -178,7 +178,7 @@ impl Program {
     pub fn program_grid<const BLOCK: usize>(
         &mut self,
         grid: [u32; 3],
-        body: impl FnOnce(&mut TileBlock<'_, BLOCK>),
+        body: impl FnOnce(&mut TileBlock<'_>),
     ) {
         assert!(BLOCK > 0, "tile block size must be non-zero");
         assert!(
@@ -188,6 +188,7 @@ impl Program {
         let mut block = TileBlock {
             program: self,
             grid,
+            block: BLOCK,
             body: Vec::new(),
             stmt_stack: Vec::new(),
         };

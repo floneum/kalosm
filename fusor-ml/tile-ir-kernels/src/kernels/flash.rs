@@ -93,7 +93,7 @@ pub fn flash_attention<E: Numeric, B>(
 
             let kv_chunks = meta.dims.kv_seq_len.div_ceil(FLASH_SIMD_WIDTH);
             let [_final_m, final_s, final_o] = program.fold(
-                range::<FLASH_BLOCK>(Tile::<FLASH_BLOCK>::literal(TileLiteral::U32(kv_chunks))),
+                range(Tile::literal(TileLiteral::U32(kv_chunks))),
                 [
                     Tile::literal(TileLiteral::f32(NEG_MAX_F32)),
                     Tile::literal(TileLiteral::f32(0.0)),
@@ -124,10 +124,10 @@ pub fn flash_attention<E: Numeric, B>(
                                 (batch_idx.get(), kv_head_idx.get(), kv_idx.get(), dim),
                             );
                             let q_value = program
-                                .load_linear(q.at(q_index), Mask::all(), elem_fill)
+                                .load(q.at(q_index), Mask::all(), elem_fill)
                                 .cast(ElementType::F32);
                             let k_value = program
-                                .load_linear(k.at(k_index), Mask::all(), elem_fill)
+                                .load(k.at(k_index), Mask::all(), elem_fill)
                                 .cast(ElementType::F32);
                             products.push(q_value * k_value);
                         }
@@ -142,7 +142,7 @@ pub fn flash_attention<E: Numeric, B>(
                                 (q_idx.get(), kv_idx.get()),
                             );
                             let mask_value = program
-                                .load_linear(mask.at(mask_index), Mask::all(), elem_fill)
+                                .load(mask.at(mask_index), Mask::all(), elem_fill)
                                 .cast(ElementType::F32);
                             score = score + mask_value;
                         }
@@ -175,7 +175,7 @@ pub fn flash_attention<E: Numeric, B>(
                             ),
                         );
                         let v_value = program
-                            .load_linear(v.at(v_index), Mask::all(), elem_fill)
+                            .load(v.at(v_index), Mask::all(), elem_fill)
                             .cast(ElementType::F32);
                         program.store_local(&weighted_local, exp_score.get() * v_value);
                     });
@@ -205,29 +205,26 @@ pub fn flash_attention<E: Numeric, B>(
                     output_strides,
                     (batch_idx.get(), head_idx.get(), q_idx.get(), out_dim.get()),
                 );
-                program.store_linear(output.at(output_index), output_value, Mask::all());
+                program.store(output.at(output_index), output_value, Mask::all());
             });
         });
     }
     Some(())
 }
 
-struct DecodeScoreForKv<'a, const BLOCK: usize> {
+struct DecodeScoreForKv<'a> {
     q: &'a tile::Storage<F32, 1>,
     k: &'a tile::Storage<F32, 1>,
     meta: FlashDecodeSmallMeta,
-    batch_idx: Tile<BLOCK>,
-    head_idx: Tile<BLOCK>,
-    kv_head_idx: Tile<BLOCK>,
-    kv: Tile<BLOCK>,
-    score_acc: &'a tile::Local<F32, BLOCK>,
-    dim_local: &'a tile::Local<U32, BLOCK>,
+    batch_idx: Tile,
+    head_idx: Tile,
+    kv_head_idx: Tile,
+    kv: Tile,
+    score_acc: &'a tile::Local<F32>,
+    dim_local: &'a tile::Local<U32>,
 }
 
-fn decode_score_for_kv<const BLOCK: usize>(
-    program: &mut TileBlock<'_, BLOCK>,
-    request: DecodeScoreForKv<'_, BLOCK>,
-) -> Tile<BLOCK> {
+fn decode_score_for_kv(program: &mut TileBlock<'_>, request: DecodeScoreForKv<'_>) -> Tile {
     let DecodeScoreForKv {
         q,
         k,
@@ -262,8 +259,8 @@ fn decode_score_for_kv<const BLOCK: usize>(
                 dim.clone(),
             ),
         );
-        let q_value = program.load_linear(q.at(q_index), Mask::all(), TileLiteral::f32(0.0));
-        let k_value = program.load_linear(k.at(k_index), Mask::all(), TileLiteral::f32(0.0));
+        let q_value = program.load(q.at(q_index), Mask::all(), TileLiteral::f32(0.0));
+        let k_value = program.load(k.at(k_index), Mask::all(), TileLiteral::f32(0.0));
         let acc = program.load_local(score_acc);
         program.store_local(score_acc, acc + q_value * k_value);
         program.store_local(dim_local, dim + Tile::literal(TileLiteral::U32(1)));
@@ -271,24 +268,21 @@ fn decode_score_for_kv<const BLOCK: usize>(
     program.load_local(score_acc) * Tile::literal(TileLiteral::f32(meta.scale.get()))
 }
 
-struct DecodeOutputLoop<'a, const BLOCK: usize> {
+struct DecodeOutputLoop<'a> {
     v: &'a tile::Storage<F32, 1>,
     output: &'a tile::Storage<F32, 1>,
     probs: fusor_tile_ir::TileRef,
     meta: FlashDecodeSmallMeta,
-    batch_idx: Tile<BLOCK>,
-    head_idx: Tile<BLOCK>,
-    kv_head_idx: Tile<BLOCK>,
-    out_dim: Tile<BLOCK>,
-    active_kv_len: Tile<BLOCK>,
-    acc: &'a tile::Local<F32, BLOCK>,
-    kv_local: &'a tile::Local<U32, BLOCK>,
+    batch_idx: Tile,
+    head_idx: Tile,
+    kv_head_idx: Tile,
+    out_dim: Tile,
+    active_kv_len: Tile,
+    acc: &'a tile::Local<F32>,
+    kv_local: &'a tile::Local<U32>,
 }
 
-fn append_decode_output_loop<const BLOCK: usize>(
-    program: &mut TileBlock<'_, BLOCK>,
-    request: DecodeOutputLoop<'_, BLOCK>,
-) {
+fn append_decode_output_loop(program: &mut TileBlock<'_>, request: DecodeOutputLoop<'_>) {
     let DecodeOutputLoop {
         v,
         output,
@@ -316,7 +310,7 @@ fn append_decode_output_loop<const BLOCK: usize>(
                 out_dim.clone(),
             ),
         );
-        let v_value = program.load_linear(v.at(v_index), Mask::all(), TileLiteral::f32(0.0));
+        let v_value = program.load(v.at(v_index), Mask::all(), TileLiteral::f32(0.0));
         let current = program.load_local(acc);
         program.store_local(acc, current + prob * v_value);
         program.store_local(kv_local, kv + Tile::literal(TileLiteral::U32(1)));
@@ -328,7 +322,7 @@ fn append_decode_output_loop<const BLOCK: usize>(
         meta.output_strides,
         (batch_idx, head_idx, 0, out_dim),
     );
-    program.store_linear(output.at(output_index), output_value, Mask::all());
+    program.store(output.at(output_index), output_value, Mask::all());
 }
 
 fn flash_decode_small_block<const BLOCK: usize, B>(
@@ -353,7 +347,7 @@ fn flash_decode_small_block<const BLOCK: usize, B>(
     phase.program_grid::<BLOCK>([meta.dims.batch * meta.dims.num_heads, 1, 1], |program| {
         let lane = program.lane();
         let row = program.program_id(WorkgroupAxis::X);
-        let active_kv_len = program.load_linear(
+        let active_kv_len = program.load(
             params.at(0),
             Mask::all(),
             TileLiteral::U32(meta.active_kv_len),
@@ -498,7 +492,7 @@ fn flash_decode_small_block<const BLOCK: usize, B>(
                             ),
                         );
                         let v_value =
-                            program.load_linear(v.at(v_index), Mask::all(), TileLiteral::f32(0.0));
+                            program.load(v.at(v_index), Mask::all(), TileLiteral::f32(0.0));
                         let current = program.load_local(&acc);
                         program.store_local(&acc, current + prob * v_value);
                         program.store_local(&item, item_value + Tile::literal(TileLiteral::U32(1)));
@@ -520,7 +514,7 @@ fn flash_decode_small_block<const BLOCK: usize, B>(
                     meta.output_strides,
                     (batch_idx.clone(), head_idx.clone(), 0, lane_value.clone()),
                 );
-                program.store_linear(output.at(output_index), output_value, Mask::all());
+                program.store(output.at(output_index), output_value, Mask::all());
             });
             return;
         }

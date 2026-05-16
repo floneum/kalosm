@@ -11,55 +11,51 @@ const GPU_SAMPLE_STATUS_SAMPLED: u32 = 1;
 const GPU_SAMPLE_STATUS_INVALID: u32 = 2;
 
 fn mirostat_top_value(
-    program: &TileBlock<'_, TOP_K_BLOCK>,
+    program: &TileBlock<'_>,
     values: &tile::Storage<F32, 1>,
     meta: Mirostat2Meta,
-    index: Tile<TOP_K_BLOCK>,
-) -> Tile<TOP_K_BLOCK> {
+    index: Tile,
+) -> Tile {
     let index = index_n(meta.values_offset, [meta.values_stride], index);
-    program.load_linear(values.at(index), Mask::all(), TileLiteral::f32(NEG_MAX_F32))
+    program.load(values.at(index), Mask::all(), TileLiteral::f32(NEG_MAX_F32))
 }
 
 fn mirostat_top_id(
-    program: &TileBlock<'_, TOP_K_BLOCK>,
+    program: &TileBlock<'_>,
     ids: &tile::Storage<U32, 1>,
     meta: Mirostat2Meta,
-    index: Tile<TOP_K_BLOCK>,
-) -> Tile<TOP_K_BLOCK> {
+    index: Tile,
+) -> Tile {
     let index = index_n(meta.ids_offset, [meta.ids_stride], index);
-    program.load_linear(ids.at(index), Mask::all(), TileLiteral::U32(u32::MAX))
+    program.load(ids.at(index), Mask::all(), TileLiteral::U32(u32::MAX))
 }
 
 fn mirostat_top_weight(
-    program: &TileBlock<'_, TOP_K_BLOCK>,
+    program: &TileBlock<'_>,
     values: &tile::Storage<F32, 1>,
     meta: Mirostat2Meta,
-    max_value: Tile<TOP_K_BLOCK>,
-    index: Tile<TOP_K_BLOCK>,
-) -> Tile<TOP_K_BLOCK> {
+    max_value: Tile,
+    index: Tile,
+) -> Tile {
     (mirostat_top_value(program, values, meta, index) - max_value).exp()
 }
 
-fn load_param_f32(
-    program: &TileBlock<'_, TOP_K_BLOCK>,
-    params: &tile::Storage<F32, 1>,
-    index: u32,
-) -> Tile<TOP_K_BLOCK> {
-    program.load_linear(params.at(index), Mask::all(), TileLiteral::f32(0.0))
+fn load_param_f32(program: &TileBlock<'_>, params: &tile::Storage<F32, 1>, index: u32) -> Tile {
+    program.load(params.at(index), Mask::all(), TileLiteral::f32(0.0))
 }
 
 fn store_sample_result(
-    program: &mut TileBlock<'_, TOP_K_BLOCK>,
+    program: &mut TileBlock<'_>,
     output: &tile::Storage<U32, 1>,
     status: u32,
-    token: Tile<TOP_K_BLOCK>,
+    token: Tile,
 ) {
-    program.store_linear(
+    program.store(
         output.at(0),
         Tile::literal(TileLiteral::U32(status)),
         Mask::all(),
     );
-    program.store_linear(output.at(1), token, Mask::all());
+    program.store(output.at(1), token, Mask::all());
 }
 
 /// Tensor bindings and metadata for [`mirostat2`].
@@ -153,7 +149,7 @@ pub fn mirostat2<B>(kb: &mut fusor_tile_ir::KernelBuilder<B>, spec: Mirostat2<B>
         let selected_probability = program.private::<F32>();
 
         if let Some(exactness_flag) = &exactness_flag {
-            let flag = program.load_linear(exactness_flag.at(0), Mask::all(), TileLiteral::U32(0));
+            let flag = program.load(exactness_flag.at(0), Mask::all(), TileLiteral::U32(0));
             let retry = flag.eq(Tile::literal(TileLiteral::U32(0)));
             program.if_then(retry, |program| {
                 let first_lane = program
@@ -241,7 +237,7 @@ pub fn mirostat2<B>(kb: &mut fusor_tile_ir::KernelBuilder<B>, spec: Mirostat2<B>
             |program| {
                 let epsilon = Tile::literal(TileLiteral::f32(1.0e-20));
                 let total = program.load_workgroup(scratch, 0).max(epsilon.clone());
-                let mu = program.load_linear(state.at(0), Mask::all(), TileLiteral::f32(0.0));
+                let mu = program.load(state.at(0), Mask::all(), TileLiteral::f32(0.0));
                 program.store_local(&cutoff, Tile::literal(TileLiteral::U32(0)));
                 program.store_local(&scan, Tile::literal(TileLiteral::U32(0)));
                 program.loop_forever(|program| {
@@ -353,7 +349,7 @@ pub fn mirostat2<B>(kb: &mut fusor_tile_ir::KernelBuilder<B>, spec: Mirostat2<B>
                 let error = surprise - tau;
                 let correction = eta * error;
                 let next_mu = mu - correction;
-                program.store_linear(state.at(0), next_mu, Mask::all());
+                program.store(state.at(0), next_mu, Mask::all());
                 let selected_token = program.load_local(&selected);
                 store_sample_result(program, &output, GPU_SAMPLE_STATUS_SAMPLED, selected_token);
             },

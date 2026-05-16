@@ -24,18 +24,19 @@ mod block;
 mod coop;
 mod grid;
 mod program;
-mod quantized;
+pub mod quantized;
 mod reduce;
 mod storage;
 mod value;
 
 pub use block::TileBlock;
-pub use coop::CoopTileLoad;
+pub use coop::{CoopRole, CoopTileLoad};
 pub use grid::build;
 pub use program::Program;
-pub use quantized::{GgmlBlockCoords, Q4KGgmlActivations, QuantizedDot};
+pub use quantized::QuantizedDot;
 pub use storage::{RuntimeElement, Storage};
 pub use value::{
-    range, Address, Bound, CoopAcc, CoopFragment, FoldIter, IntoIndex, LinearAddress, Local, Mask,
-    Range, Scalar, ScalarIndex, Tile,
+    range, Address, Bound, CoopAcc, CoopFragment, FoldIter, IntoIndex, IntoTileLiteral,
+    LinearAddress, Local, Mask, Range, Rank1TileAddress, Rank2TileAddress, Scalar, ScalarIndex,
+    Tile, TileLoadAddress, TileStoreAddress,
 };

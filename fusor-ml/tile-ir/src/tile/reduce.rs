@@ -2,15 +2,15 @@ use super::block::tiles_to_exprs;
 use super::value::boxed_u32_literal;
 use super::*;
 use crate::ir::{
-    Expr, F32, Layout, LocalRef, MemoryLevel, Shape, TileBinaryOp, TileLiteral, TileReduceOp,
-    TileStmt, U32,
+    Expr, Layout, LocalRef, MemoryLevel, Shape, TileBinaryOp, TileLiteral, TileReduceOp, TileStmt,
+    F32, U32,
 };
 
 macro_rules! tile_reduce_entrypoints {
     ($(($reduce:ident, $loop_reduce:ident, $group_reduce:ident, $subgroup_reduce:ident, $op:ident)),+ $(,)?) => {
         $(
             #[doc = concat!("Reduce `value` across the whole workgroup with `", stringify!($op), "`.")]
-            pub fn $reduce(&mut self, value: Tile<BLOCK>) -> Scalar {
+            pub fn $reduce(&mut self, value: Tile) -> Scalar {
                 self.reduce(TileReduceOp::$op, value)
             }
 
@@ -21,29 +21,29 @@ macro_rules! tile_reduce_entrypoints {
             #[doc = "cross-lane reduced."]
             pub fn $loop_reduce<F>(&mut self, iterations: u32, body: F) -> Scalar
             where
-                F: FnOnce(&mut Self, ScalarIndex) -> Tile<BLOCK>,
+                F: FnOnce(&mut Self, ScalarIndex) -> Tile,
             {
                 self.loop_reduce(TileReduceOp::$op, iterations, body)
             }
 
             #[doc = concat!("Reduce `value` across a fixed group using `", stringify!($op), "`.")]
-            pub fn $group_reduce<const GROUP: usize>(&mut self, value: Tile<BLOCK>) -> Tile<BLOCK> {
+            pub fn $group_reduce<const GROUP: usize>(&mut self, value: Tile) -> Tile {
                 self.group_reduce::<GROUP>(TileReduceOp::$op, value)
             }
 
             #[doc = concat!("Reduce `value` across the current subgroup using `", stringify!($op), "`.")]
-            pub fn $subgroup_reduce(&self, value: Tile<BLOCK>) -> Tile<BLOCK> {
+            pub fn $subgroup_reduce(&self, value: Tile) -> Tile {
                 self.subgroup_reduce(TileReduceOp::$op, value)
             }
         )+
     };
 }
 
-impl<const BLOCK: usize> TileBlock<'_, BLOCK> {
+impl TileBlock<'_> {
     /// Sum a flat value list. Constructs a balanced binary tree of
     /// `Expr::Binary(Add, ...)` so the lowerer's recursion depth is
     /// `O(log N)` instead of `O(N)` — the AST has no flat-sum variant.
-    pub fn sum(&self, values: impl IntoIterator<Item = Tile<BLOCK>>) -> Tile<BLOCK> {
+    pub fn sum(&self, values: impl IntoIterator<Item = Tile>) -> Tile {
         let mut exprs = tiles_to_exprs(values);
         if exprs.is_empty() {
             return Tile {
@@ -79,11 +79,11 @@ impl<const BLOCK: usize> TileBlock<'_, BLOCK> {
     pub fn fold<const N: usize, F>(
         &mut self,
         iter: super::FoldIter,
-        initial: [Tile<BLOCK>; N],
+        initial: [Tile; N],
         body: F,
-    ) -> [Tile<BLOCK>; N]
+    ) -> [Tile; N]
     where
-        F: FnOnce(&mut Self, ScalarIndex, [Tile<BLOCK>; N]) -> [Tile<BLOCK>; N],
+        F: FnOnce(&mut Self, ScalarIndex, [Tile; N]) -> [Tile; N],
     {
         assert!(N > 0, "fold must have at least one accumulator");
         let initial_exprs = tiles_to_exprs(initial);
@@ -95,7 +95,7 @@ impl<const BLOCK: usize> TileBlock<'_, BLOCK> {
         let iter_element = ScalarIndex {
             expr: Box::new(Expr::LoadLocal(iter_var_local)),
         };
-        let acc_tiles: [Tile<BLOCK>; N] = std::array::from_fn(|i| Tile {
+        let acc_tiles: [Tile; N] = std::array::from_fn(|i| Tile {
             expr: Expr::LoadLocal(acc_locals[i]),
         });
         let new_state = body(self, iter_element, acc_tiles);
@@ -136,9 +136,9 @@ impl<const BLOCK: usize> TileBlock<'_, BLOCK> {
         iterations: u32,
         initials: [TileLiteral; N],
         body: F,
-    ) -> [Tile<BLOCK>; N]
+    ) -> [Tile; N]
     where
-        F: FnOnce(&mut Self, ScalarIndex) -> [Tile<BLOCK>; N],
+        F: FnOnce(&mut Self, ScalarIndex) -> [Tile; N],
     {
         assert!(iterations > 0, "loop_fold_n iterations must be non-zero");
         assert!(N > 0, "loop_fold_n must have at least one accumulator");
@@ -220,9 +220,9 @@ impl<const BLOCK: usize> TileBlock<'_, BLOCK> {
         iterations: u32,
         initial: TileLiteral,
         body: F,
-    ) -> Tile<BLOCK>
+    ) -> Tile
     where
-        F: FnOnce(&mut Self, ScalarIndex) -> Tile<BLOCK>,
+        F: FnOnce(&mut Self, ScalarIndex) -> Tile,
     {
         assert!(iterations > 0, "loop fold iterations must be non-zero");
         let element = initial.element();
@@ -254,7 +254,7 @@ impl<const BLOCK: usize> TileBlock<'_, BLOCK> {
         }
     }
 
-    fn subgroup_reduce(&self, op: TileReduceOp, value: Tile<BLOCK>) -> Tile<BLOCK> {
+    fn subgroup_reduce(&self, op: TileReduceOp, value: Tile) -> Tile {
         Tile {
             expr: Expr::SubgroupReduce {
                 op,
@@ -263,18 +263,15 @@ impl<const BLOCK: usize> TileBlock<'_, BLOCK> {
         }
     }
 
-    fn group_reduce<const GROUP: usize>(
-        &mut self,
-        op: TileReduceOp,
-        value: Tile<BLOCK>,
-    ) -> Tile<BLOCK> {
+    fn group_reduce<const GROUP: usize>(&mut self, op: TileReduceOp, value: Tile) -> Tile {
+        let block = self.block_size();
         assert!(
-            GROUP > 0 && GROUP <= BLOCK && GROUP.is_power_of_two() && BLOCK.is_multiple_of(GROUP),
+            GROUP > 0 && GROUP <= block && GROUP.is_power_of_two() && block.is_multiple_of(GROUP),
             "tile group reduction size must be a power-of-two divisor of the block"
         );
         let scratch = self.program.alloc_tile::<F32>(Layout::contiguous(
             MemoryLevel::Workgroup,
-            Shape::new([BLOCK as u32]),
+            Shape::new([block as u32]),
         ));
         Tile {
             expr: Expr::Reduce {
@@ -288,10 +285,11 @@ impl<const BLOCK: usize> TileBlock<'_, BLOCK> {
         }
     }
 
-    fn reduce(&mut self, op: TileReduceOp, value: Tile<BLOCK>) -> Scalar {
+    fn reduce(&mut self, op: TileReduceOp, value: Tile) -> Scalar {
+        let block = self.block_size();
         let scratch = self.program.alloc_tile::<F32>(Layout::contiguous(
             MemoryLevel::Workgroup,
-            Shape::new([BLOCK as u32]),
+            Shape::new([block as u32]),
         ));
         Scalar {
             expr: Expr::Reduce {
@@ -300,19 +298,20 @@ impl<const BLOCK: usize> TileBlock<'_, BLOCK> {
                 iter_var: None,
                 value: Box::new(value.expr),
                 scratch,
-                group_size: BLOCK as u32,
+                group_size: block as u32,
             },
         }
     }
 
     fn loop_reduce<F>(&mut self, op: TileReduceOp, iterations: u32, body: F) -> Scalar
     where
-        F: FnOnce(&mut Self, ScalarIndex) -> Tile<BLOCK>,
+        F: FnOnce(&mut Self, ScalarIndex) -> Tile,
     {
         assert!(iterations > 0, "loop reduce iterations must be non-zero");
+        let block = self.block_size();
         let scratch = self.program.alloc_tile::<F32>(Layout::contiguous(
             MemoryLevel::Workgroup,
-            Shape::new([BLOCK as u32]),
+            Shape::new([block as u32]),
         ));
         let iter_var_local = self.program.alloc_local::<U32>();
         let iter_index = ScalarIndex {
@@ -340,7 +339,7 @@ impl<const BLOCK: usize> TileBlock<'_, BLOCK> {
                 iter_var: Some(iter_var_local.id),
                 value: Box::new(value.expr),
                 scratch,
-                group_size: BLOCK as u32,
+                group_size: block as u32,
             },
         }
     }

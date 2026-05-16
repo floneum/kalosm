@@ -604,7 +604,7 @@ fn build_rms_norm_tile_ir(
                 }
                 value.clone() * value
             });
-            let rms = (tile_ir::tile::Tile::<BLOCK>::from(sum_square)
+            let rms = (tile_ir::tile::Tile::from(sum_square)
                 / tile_ir::tile::Scalar::literal(cols as f32)
                 + tile_ir::tile::Scalar::literal(eps))
             .unary(tile_ir::TileUnaryOp::Sqrt);

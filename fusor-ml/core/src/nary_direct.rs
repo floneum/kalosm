@@ -192,14 +192,14 @@ fn build_nary_tile_ir(
     }))
 }
 
-fn eval_nary_expr<const N: usize>(
-    program: &mut tile_ir::tile::TileBlock<'_, N>,
+fn eval_nary_expr(
+    program: &mut tile_ir::tile::TileBlock<'_>,
     expr: &NaryExpr,
-    dims: &[tile_ir::tile::Tile<N>],
+    dims: &[tile_ir::tile::Tile],
     storages: &[tile_ir::tile::Storage<tile_ir::tile::RuntimeElement, 2>],
     metas: &[TensorMeta],
-    mask: tile_ir::tile::Mask<N>,
-) -> (tile_ir::tile::Tile<N>, DataTypeEnum) {
+    mask: tile_ir::tile::Mask,
+) -> (tile_ir::tile::Tile, DataTypeEnum) {
     match expr {
         NaryExpr::Op { children, function } => {
             let mut values = children
@@ -225,8 +225,7 @@ fn eval_nary_expr<const N: usize>(
                 })
                 .collect::<Vec<_>>();
             let index = layout_index(meta, &coords);
-            let value =
-                program.load_literal(storage.at((0, index)), mask, zero_literal(meta.datatype));
+            let value = program.load(storage.at((0, index)), mask, zero_literal(meta.datatype));
             (value, meta.datatype)
         }
         NaryExpr::DimIndex(dim) => (dims[*dim].clone(), DataTypeEnum::U32),
@@ -234,10 +233,10 @@ fn eval_nary_expr<const N: usize>(
     }
 }
 
-fn emit_function<const N: usize>(
+fn emit_function(
     function: &NaryFunction,
-    values: &mut [(tile_ir::tile::Tile<N>, DataTypeEnum)],
-) -> tile_ir::tile::Tile<N> {
+    values: &mut [(tile_ir::tile::Tile, DataTypeEnum)],
+) -> tile_ir::tile::Tile {
     match function.op {
         NaryOp::Add => values[0].0.clone() + values[1].0.clone(),
         NaryOp::Sub => values[0].0.clone() - values[1].0.clone(),
@@ -360,11 +359,11 @@ fn emit_function<const N: usize>(
 /// resolver to re-emit captured tensor-level expressions at the tile-IR level
 /// when fusing into kernels that materialize inputs in-register (e.g. the
 /// qgemv paired epilogue).
-pub(crate) fn eval_nary_expr_on_tiles<const N: usize>(
+pub(crate) fn eval_nary_expr_on_tiles(
     expr: &NaryExpr,
-    inputs: &[(tile_ir::tile::Tile<N>, DataTypeEnum)],
+    inputs: &[(tile_ir::tile::Tile, DataTypeEnum)],
     output_dtype: DataTypeEnum,
-) -> (tile_ir::tile::Tile<N>, DataTypeEnum) {
+) -> (tile_ir::tile::Tile, DataTypeEnum) {
     match expr {
         NaryExpr::Op { children, function } => {
             let mut values = children
@@ -388,11 +387,11 @@ pub(crate) fn eval_nary_expr_on_tiles<const N: usize>(
     }
 }
 
-pub(crate) fn apply_unary_function_chain<const N: usize>(
-    mut value: tile_ir::tile::Tile<N>,
+pub(crate) fn apply_unary_function_chain(
+    mut value: tile_ir::tile::Tile,
     mut value_ty: DataTypeEnum,
     chain: &UnaryFunctionChain,
-) -> Option<(tile_ir::tile::Tile<N>, DataTypeEnum)> {
+) -> Option<(tile_ir::tile::Tile, DataTypeEnum)> {
     if chain.input_datatype() != value_ty {
         return None;
     }
@@ -409,7 +408,7 @@ pub(crate) fn apply_unary_function_chain<const N: usize>(
     Some((value, value_ty))
 }
 
-fn tanh_exact<const N: usize>(value: tile_ir::tile::Tile<N>) -> tile_ir::tile::Tile<N> {
+fn tanh_exact(value: tile_ir::tile::Tile) -> tile_ir::tile::Tile {
     let exp_pos = value.clone().unary(tile_ir::TileUnaryOp::Exp);
     let exp_neg = value
         .unary(tile_ir::TileUnaryOp::Neg)
@@ -417,12 +416,12 @@ fn tanh_exact<const N: usize>(value: tile_ir::tile::Tile<N>) -> tile_ir::tile::T
     (exp_pos.clone() - exp_neg.clone()) / (exp_pos + exp_neg)
 }
 
-fn compare_tile<const N: usize>(
+fn compare_tile(
     op: tile_ir::TileCompareOp,
-    left: &(tile_ir::tile::Tile<N>, DataTypeEnum),
-    right: &(tile_ir::tile::Tile<N>, DataTypeEnum),
+    left: &(tile_ir::tile::Tile, DataTypeEnum),
+    right: &(tile_ir::tile::Tile, DataTypeEnum),
     output: DataTypeEnum,
-) -> tile_ir::tile::Tile<N> {
+) -> tile_ir::tile::Tile {
     tile_ir::tile::Tile::compare(
         op,
         left.0.clone(),
@@ -431,12 +430,12 @@ fn compare_tile<const N: usize>(
     )
 }
 
-fn compare_const<const N: usize>(
+fn compare_const(
     op: tile_ir::TileCompareOp,
-    left: &(tile_ir::tile::Tile<N>, DataTypeEnum),
+    left: &(tile_ir::tile::Tile, DataTypeEnum),
     scalar: NaryScalar,
     output: DataTypeEnum,
-) -> tile_ir::tile::Tile<N> {
+) -> tile_ir::tile::Tile {
     tile_ir::tile::Tile::compare(
         op,
         left.0.clone(),
@@ -445,10 +444,7 @@ fn compare_const<const N: usize>(
     )
 }
 
-fn output_dims_from_flat<const N: usize>(
-    flat: tile_ir::tile::Tile<N>,
-    shape: &[usize],
-) -> Vec<tile_ir::tile::Tile<N>> {
+fn output_dims_from_flat(flat: tile_ir::tile::Tile, shape: &[usize]) -> Vec<tile_ir::tile::Tile> {
     (0..shape.len())
         .map(|axis| {
             let dim = shape[axis] as u32;
@@ -468,10 +464,7 @@ fn output_dims_from_flat<const N: usize>(
         .collect()
 }
 
-fn layout_index<const N: usize>(
-    meta: &TensorMeta,
-    coords: &[tile_ir::tile::Tile<N>],
-) -> tile_ir::tile::Tile<N> {
+fn layout_index(meta: &TensorMeta, coords: &[tile_ir::tile::Tile]) -> tile_ir::tile::Tile {
     let mut index = tile_u32(meta.offset);
     for (axis, (coord, stride)) in coords.iter().zip(&meta.strides).enumerate() {
         if *stride == 0 || meta.shape.get(axis).copied() == Some(1) {
@@ -482,8 +475,8 @@ fn layout_index<const N: usize>(
     index
 }
 
-fn linear_group<const N: usize>(
-    program: &tile_ir::tile::TileBlock<'_, N>,
+fn linear_group(
+    program: &tile_ir::tile::TileBlock<'_>,
     dispatch_size: [u32; 3],
 ) -> tile_ir::tile::ScalarIndex {
     program.program_id(tile_ir::WorkgroupAxis::X)
@@ -492,11 +485,11 @@ fn linear_group<const N: usize>(
             * dispatch_size[0].saturating_mul(dispatch_size[1])
 }
 
-fn cast_tile<const N: usize>(
-    value: tile_ir::tile::Tile<N>,
+fn cast_tile(
+    value: tile_ir::tile::Tile,
     source: DataTypeEnum,
     target: DataTypeEnum,
-) -> tile_ir::tile::Tile<N> {
+) -> tile_ir::tile::Tile {
     if source == target {
         value
     } else {
@@ -504,7 +497,7 @@ fn cast_tile<const N: usize>(
     }
 }
 
-fn tile_literal<const N: usize>(value: NaryScalar) -> tile_ir::tile::Tile<N> {
+fn tile_literal(value: NaryScalar) -> tile_ir::tile::Tile {
     tile_ir::tile::Tile::literal(match value {
         NaryScalar::F32(value) => tile_ir::TileLiteral::F32(tile_ir::F32Bits::new(value)),
         NaryScalar::F16(value) => tile_ir::TileLiteral::F16(value.to_bits()),
@@ -512,7 +505,7 @@ fn tile_literal<const N: usize>(value: NaryScalar) -> tile_ir::tile::Tile<N> {
     })
 }
 
-fn tile_u32<const N: usize>(value: u32) -> tile_ir::tile::Tile<N> {
+fn tile_u32(value: u32) -> tile_ir::tile::Tile {
     tile_ir::tile::Tile::literal(tile_ir::TileLiteral::U32(value))
 }
 

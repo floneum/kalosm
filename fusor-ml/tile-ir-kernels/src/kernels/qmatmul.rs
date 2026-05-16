@@ -1,6 +1,8 @@
 //! Quantized matrix multiply program kernels.
 
-use fusor_tile_ir::tile::{CoopAcc, CoopFragment, Program, ScalarIndex, Storage, TileBlock};
+use fusor_tile_ir::tile::{
+    CoopAcc, CoopFragment, CoopRole, Program, ScalarIndex, Storage, TileBlock,
+};
 use fusor_tile_ir::{QuantizedMatrix, TileLiteral, TileReduceOp, TileRef, WorkgroupAxis, F32};
 
 use crate::types::{apply_optional_epilogue, cooperative_store_layout_supported, matrix_shape};
@@ -201,8 +203,8 @@ pub(crate) fn qmatmul_try_coop<const BM: usize, const BN: usize, const BK: usize
     true
 }
 
-fn zero_coop_acc_grid<const BLOCK: usize>(
-    program: &mut TileBlock<'_, BLOCK>,
+fn zero_coop_acc_grid(
+    program: &mut TileBlock<'_>,
     rows: u32,
     cols: u32,
 ) -> Vec<Vec<CoopAcc<F32, 8, 8>>> {
@@ -210,7 +212,7 @@ fn zero_coop_acc_grid<const BLOCK: usize>(
         .map(|_| {
             (0..cols)
                 .map(|_| {
-                    let acc = program.alloc_coop_acc_typed::<F32, 8, 8>();
+                    let acc = program.alloc_coop_acc::<F32, 8, 8>();
                     program.zero_coop_acc(&acc);
                     acc
                 })
@@ -219,8 +221,8 @@ fn zero_coop_acc_grid<const BLOCK: usize>(
         .collect()
 }
 
-fn coop_load_a_fragments<const BLOCK: usize>(
-    program: &mut TileBlock<'_, BLOCK>,
+fn coop_load_a_fragments(
+    program: &mut TileBlock<'_>,
     tile: TileRef,
     sg_row_base: &ScalarIndex,
     kk: u32,
@@ -229,17 +231,16 @@ fn coop_load_a_fragments<const BLOCK: usize>(
     const COOP_DIM: u32 = 8;
     (0..rows)
         .map(|r| {
-            program.coop_load_a_typed::<F32, 8, 8>(
-                tile,
-                sg_row_base.clone() + r * COOP_DIM,
-                kk * COOP_DIM,
+            program.coop_load::<F32, 8, 8>(
+                CoopRole::A,
+                program.coop_tile_load(tile, sg_row_base.clone() + r * COOP_DIM, kk * COOP_DIM),
             )
         })
         .collect()
 }
 
-fn coop_load_b_fragments<const BLOCK: usize>(
-    program: &mut TileBlock<'_, BLOCK>,
+fn coop_load_b_fragments(
+    program: &mut TileBlock<'_>,
     tile: TileRef,
     sg_col_base: &ScalarIndex,
     kk: u32,
@@ -248,17 +249,16 @@ fn coop_load_b_fragments<const BLOCK: usize>(
     const COOP_DIM: u32 = 8;
     (0..cols)
         .map(|c| {
-            program.coop_load_b_typed::<F32, 8, 8>(
-                tile,
-                kk * COOP_DIM,
-                sg_col_base.clone() + c * COOP_DIM,
+            program.coop_load::<F32, 8, 8>(
+                CoopRole::B,
+                program.coop_tile_load(tile, kk * COOP_DIM, sg_col_base.clone() + c * COOP_DIM),
             )
         })
         .collect()
 }
 
-fn coop_mma_grid<const BLOCK: usize>(
-    program: &mut TileBlock<'_, BLOCK>,
+fn coop_mma_grid(
+    program: &mut TileBlock<'_>,
     accs: &[Vec<CoopAcc<F32, 8, 8>>],
     a_frags: &[CoopFragment<F32, 8, 8>],
     b_frags: &[CoopFragment<F32, 8, 8>],
@@ -270,8 +270,8 @@ fn coop_mma_grid<const BLOCK: usize>(
     }
 }
 
-fn coop_store_acc_grid<const BLOCK: usize>(
-    program: &mut TileBlock<'_, BLOCK>,
+fn coop_store_acc_grid(
+    program: &mut TileBlock<'_>,
     accs: &[Vec<CoopAcc<F32, 8, 8>>],
     y: &Storage<F32, 2>,
     row_base: &ScalarIndex,

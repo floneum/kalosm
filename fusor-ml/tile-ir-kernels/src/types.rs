@@ -3,8 +3,8 @@ use std::sync::Arc;
 use fusor_tile_ir::tile::Tile;
 use fusor_tile_ir::{Layout, TileLiteral};
 
-type PairedEpilogueBuilder = dyn Fn(&[Tile<1>]) -> Tile<1> + Send + Sync;
-type UnaryEpilogueBuilder = dyn Fn(Tile<1>) -> Tile<1> + Send + Sync;
+type PairedEpilogueBuilder = dyn Fn(&[Tile]) -> Tile + Send + Sync;
+type UnaryEpilogueBuilder = dyn Fn(Tile) -> Tile + Send + Sync;
 
 /// Paired matmul epilogue. The matmul produces concatenated `[gate; up]`
 /// columns; the kernel reduces each pair separately and applies this epilogue
@@ -31,10 +31,7 @@ pub struct PairedEpilogue {
     /// loaded by the kernel from the corresponding entries in
     /// `extra_inputs`.
     arity: usize,
-    // Closure is BLOCK-agnostic — it sees `Tile<1>` and the caller re-tags the
-    // const generic on both sides of the call. `Tile<N>` carries no runtime
-    // state beyond its `Expr`, so this is a host-time shape cast only.
-    // The closure receives a slice of `arity` tiles.
+    // The closure receives a slice of `arity` block-agnostic tile expressions.
     build: Arc<PairedEpilogueBuilder>,
 }
 
@@ -46,16 +43,16 @@ impl PairedEpilogue {
     /// resolver collected them.
     pub fn with_extras<F>(label: &'static str, extras_arity: usize, build: F) -> Self
     where
-        F: Fn(&[Tile<1>]) -> Tile<1> + Send + Sync + 'static,
+        F: Fn(&[Tile]) -> Tile + Send + Sync + 'static,
     {
         let arity = 2 + extras_arity;
         // Probe the closure with `arity` distinguishable placeholder tiles so
         // commutative differences (`gate * up` vs `up * gate`) and distinct
         // extras yield distinct structural hashes.
-        let probes: Vec<Tile<1>> = (0..arity)
+        let probes: Vec<Tile> = (0..arity)
             .map(|i| {
                 let bits = 0xDEAD_0000u32 ^ (i as u32).wrapping_mul(0x9E37_79B9);
-                Tile::<1>::literal(TileLiteral::f32(f32::from_bits(bits)))
+                Tile::literal(TileLiteral::f32(f32::from_bits(bits)))
             })
             .collect();
         let identity = build(&probes).signature_hash();
@@ -81,24 +78,19 @@ impl PairedEpilogue {
     /// Build the per-output tile expression for this epilogue. The kernel
     /// must pass exactly `extras_count()` extra tiles; passing the wrong
     /// number is a programming error caught by `debug_assert`.
-    pub fn apply<const BLOCK: usize>(
-        &self,
-        gate: Tile<BLOCK>,
-        up: Tile<BLOCK>,
-        extras: &[Tile<BLOCK>],
-    ) -> Tile<BLOCK> {
+    pub fn apply(&self, gate: Tile, up: Tile, extras: &[Tile]) -> Tile {
         debug_assert_eq!(
             extras.len(),
             self.extras_count(),
             "paired epilogue extras count mismatch"
         );
-        let mut tiles: Vec<Tile<1>> = Vec::with_capacity(self.arity);
-        tiles.push(gate.retag_block::<1>());
-        tiles.push(up.retag_block::<1>());
+        let mut tiles: Vec<Tile> = Vec::with_capacity(self.arity);
+        tiles.push(gate);
+        tiles.push(up);
         for extra in extras {
-            tiles.push(extra.clone().retag_block::<1>());
+            tiles.push(extra.clone());
         }
-        (self.build)(&tiles).retag_block::<BLOCK>()
+        (self.build)(&tiles)
     }
 
     /// Stable structural hash of the produced Tile-IR Expr tree. Mix into
@@ -164,9 +156,9 @@ impl UnaryEpilogue {
     /// Build a unary epilogue from an arbitrary tile-IR closure.
     pub fn new<F>(label: &'static str, build: F) -> Self
     where
-        F: Fn(Tile<1>) -> Tile<1> + Send + Sync + 'static,
+        F: Fn(Tile) -> Tile + Send + Sync + 'static,
     {
-        let probe = Tile::<1>::literal(TileLiteral::f32(f32::from_bits(0x5EED_CA7E)));
+        let probe = Tile::literal(TileLiteral::f32(f32::from_bits(0x5EED_CA7E)));
         let identity = build(probe).signature_hash();
         Self {
             label,
@@ -176,8 +168,8 @@ impl UnaryEpilogue {
     }
 
     /// Apply this epilogue to one tile expression.
-    pub fn apply<const BLOCK: usize>(&self, tile: Tile<BLOCK>) -> Tile<BLOCK> {
-        (self.build)(tile.retag_block::<1>()).retag_block::<BLOCK>()
+    pub fn apply(&self, tile: Tile) -> Tile {
+        (self.build)(tile)
     }
 
     /// Stable structural hash of the produced Tile-IR Expr tree.
@@ -217,10 +209,7 @@ impl std::hash::Hash for UnaryEpilogue {
 /// Apply the optional epilogue to a tile. Identity (no allocation, no
 /// dispatch) when `epilogue` is `None`. Kernels call this between their
 /// per-output reduce and the store.
-pub(crate) fn apply_optional_epilogue<const BLOCK: usize>(
-    epilogue: Option<&UnaryEpilogue>,
-    tile: Tile<BLOCK>,
-) -> Tile<BLOCK> {
+pub(crate) fn apply_optional_epilogue(epilogue: Option<&UnaryEpilogue>, tile: Tile) -> Tile {
     match epilogue {
         Some(ep) => ep.apply(tile),
         None => tile,

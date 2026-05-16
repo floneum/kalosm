@@ -3,53 +3,58 @@ use super::*;
 use crate::ir::{DotK, Expr, PackedActivations};
 use crate::quantized::QuantizedMatrix;
 
-/// Block-shaped coordinates used by GGML Q4K/Q6K dot kernels.
-///
-/// These coordinates address a 256-element quantized block, the GGML inner
-/// sub-block indices, and the output column. Most callers get them from a
-/// kernel-specific lane decomposition rather than constructing them by hand.
-pub struct GgmlBlockCoords {
-    block: Box<Expr>,
-    c0: Box<Expr>,
-    c1: Box<Expr>,
-    col: Box<Expr>,
-}
+/// GGML-specific quantized dot helpers.
+pub mod ggml {
+    use super::*;
 
-impl GgmlBlockCoords {
-    /// Create block coordinates from tile indices.
-    pub fn new<const BLOCK: usize>(
-        block: impl IntoIndex<BLOCK>,
-        c0: impl IntoIndex<BLOCK>,
-        c1: impl IntoIndex<BLOCK>,
-        col: impl IntoIndex<BLOCK>,
-    ) -> Self {
-        Self {
-            block: block.into_index(),
-            c0: c0.into_index(),
-            c1: c1.into_index(),
-            col: col.into_index(),
+    /// Block-shaped coordinates used by GGML Q4K/Q6K dot kernels.
+    ///
+    /// These coordinates address a 256-element quantized block, the GGML inner
+    /// sub-block indices, and the output column. Most callers get them from a
+    /// kernel-specific lane decomposition rather than constructing them by hand.
+    pub struct BlockCoords {
+        pub(super) block: Box<Expr>,
+        pub(super) c0: Box<Expr>,
+        pub(super) c1: Box<Expr>,
+        pub(super) col: Box<Expr>,
+    }
+
+    impl BlockCoords {
+        /// Create block coordinates from tile indices.
+        pub fn new(
+            block: impl IntoIndex,
+            c0: impl IntoIndex,
+            c1: impl IntoIndex,
+            col: impl IntoIndex,
+        ) -> Self {
+            Self {
+                block: block.into_index(),
+                c0: c0.into_index(),
+                c1: c1.into_index(),
+                col: col.into_index(),
+            }
         }
     }
-}
 
-/// Activations prepacked in the layout expected by the optimized GGML Q4K dot.
-///
-/// `low` and `high` hold the two nibble halves for 16 lanes each. `sums` holds
-/// the activation sums used by the Q4K min-scale correction term.
-#[derive(Clone)]
-pub struct Q4KGgmlActivations<const BLOCK: usize> {
-    /// Low-half activation terms.
-    pub low: [Tile<BLOCK>; 16],
-    /// High-half activation terms.
-    pub high: [Tile<BLOCK>; 16],
-    /// Four activation sums for min-scale correction.
-    pub sums: [Tile<BLOCK>; 4],
-}
+    /// Activations prepacked in the layout expected by the optimized GGML Q4K dot.
+    ///
+    /// `low` and `high` hold the two nibble halves for 16 lanes each. `sums` holds
+    /// the activation sums used by the Q4K min-scale correction term.
+    #[derive(Clone)]
+    pub struct Q4KActivations {
+        /// Low-half activation terms.
+        pub low: [Tile; 16],
+        /// High-half activation terms.
+        pub high: [Tile; 16],
+        /// Four activation sums for min-scale correction.
+        pub sums: [Tile; 4],
+    }
 
-impl<const BLOCK: usize> Q4KGgmlActivations<BLOCK> {
-    /// Create a Q4K GGML activation pack.
-    pub fn new(low: [Tile<BLOCK>; 16], high: [Tile<BLOCK>; 16], sums: [Tile<BLOCK>; 4]) -> Self {
-        Self { low, high, sums }
+    impl Q4KActivations {
+        /// Create a Q4K GGML activation pack.
+        pub fn new(low: [Tile; 16], high: [Tile; 16], sums: [Tile; 4]) -> Self {
+            Self { low, high, sums }
+        }
     }
 }
 
@@ -83,7 +88,7 @@ impl<const BLOCK: usize> Q4KGgmlActivations<BLOCK> {
 ///         let activations = std::array::from_fn(|i| {
 ///             block.load(a.at((0u32, k_base.clone() + i as u32)), Mask::all(), 0.0)
 ///         });
-///         let dot = block.quantized_dot(QuantizedDot::q8_0_dot8(
+///         let dot = block.quantized_dot(QuantizedDot::f32_activations(
 ///             activations,
 ///             &b,
 ///             &k_base,
@@ -97,7 +102,7 @@ impl<const BLOCK: usize> Q4KGgmlActivations<BLOCK> {
 /// });
 /// # let _ = ir;
 /// ```
-pub struct QuantizedDot<const BLOCK: usize> {
+pub struct QuantizedDot {
     src: QuantizedMatrix,
     activations: PackedActivations,
     k: DotK,
@@ -107,14 +112,14 @@ pub struct QuantizedDot<const BLOCK: usize> {
     block_n: u32,
 }
 
-impl<const BLOCK: usize> QuantizedDot<BLOCK> {
+impl QuantizedDot {
     fn base_dot<const N: usize>(
-        a: [Tile<BLOCK>; N],
+        a: [Tile; N],
         activations: impl FnOnce(Vec<Expr>) -> PackedActivations,
         matrix: &QuantizedMatrix,
-        k_base: impl IntoIndex<BLOCK>,
-        col: impl IntoIndex<BLOCK>,
-        mask: Mask<BLOCK>,
+        k_base: impl IntoIndex,
+        col: impl IntoIndex,
+        mask: Mask,
         fill: f32,
     ) -> Self {
         Self {
@@ -128,27 +133,33 @@ impl<const BLOCK: usize> QuantizedDot<BLOCK> {
         }
     }
 
-    /// Build a Q8_0 dot over eight f32 activation values.
-    pub fn q8_0_dot8(
-        a: [Tile<BLOCK>; 8],
+    /// Build a dot over f32 activation values.
+    ///
+    /// `N` must be 8, 16, or 32.
+    pub fn f32_activations<const N: usize>(
+        a: [Tile; N],
         matrix: &QuantizedMatrix,
-        k_base: impl IntoIndex<BLOCK>,
-        col: impl IntoIndex<BLOCK>,
-        mask: Mask<BLOCK>,
+        k_base: impl IntoIndex,
+        col: impl IntoIndex,
+        mask: Mask,
         fill: f32,
     ) -> Self {
+        assert!(
+            N == 8 || N == 16 || N == 32,
+            "f32 activation dot currently supports N == 8, N == 16, or N == 32"
+        );
         Self::base_dot(a, PackedActivations::F32, matrix, k_base, col, mask, fill)
     }
 
     /// Build a Q4K/Q6K dot over Q8-packed activation values.
     ///
     /// `N` must be 8 or 16.
-    pub fn q8_activation<const N: usize>(
-        a: [Tile<BLOCK>; N],
+    pub fn q8_activations<const N: usize>(
+        a: [Tile; N],
         matrix: &QuantizedMatrix,
-        k_base: impl IntoIndex<BLOCK>,
-        col: impl IntoIndex<BLOCK>,
-        mask: Mask<BLOCK>,
+        k_base: impl IntoIndex,
+        col: impl IntoIndex,
+        mask: Mask,
         fill: f32,
     ) -> Self {
         assert!(
@@ -158,34 +169,16 @@ impl<const BLOCK: usize> QuantizedDot<BLOCK> {
         Self::base_dot(a, PackedActivations::Q8, matrix, k_base, col, mask, fill)
     }
 
-    /// Build a Q4K dot over f32 activation values.
-    ///
-    /// `N` must be 8, 16, or 32.
-    pub fn q4k_f32<const N: usize>(
-        a: [Tile<BLOCK>; N],
-        matrix: &QuantizedMatrix,
-        k_base: impl IntoIndex<BLOCK>,
-        col: impl IntoIndex<BLOCK>,
-        mask: Mask<BLOCK>,
-        fill: f32,
-    ) -> Self {
-        assert!(
-            N == 8 || N == 16 || N == 32,
-            "q4k f32 dot currently supports N == 8, N == 16, or N == 32"
-        );
-        Self::base_dot(a, PackedActivations::F32, matrix, k_base, col, mask, fill)
-    }
-
     /// Build an optimized GGML-layout Q4K dot.
-    pub fn q4k_ggml(
-        activations: Q4KGgmlActivations<BLOCK>,
+    pub fn ggml_q4k(
+        activations: ggml::Q4KActivations,
         matrix: &QuantizedMatrix,
-        coords: GgmlBlockCoords,
-        mask: Mask<BLOCK>,
+        coords: ggml::BlockCoords,
+        mask: Mask,
         fill: f32,
     ) -> Self {
-        let Q4KGgmlActivations { low, high, sums } = activations;
-        let GgmlBlockCoords { block, c0, c1, col } = coords;
+        let ggml::Q4KActivations { low, high, sums } = activations;
+        let ggml::BlockCoords { block, c0, c1, col } = coords;
         Self {
             src: matrix.clone(),
             activations: PackedActivations::Q4KGgml {
@@ -202,14 +195,14 @@ impl<const BLOCK: usize> QuantizedDot<BLOCK> {
     }
 
     /// Build an optimized GGML-layout Q6K dot.
-    pub fn q6k_ggml(
-        a: [Tile<BLOCK>; 16],
+    pub fn ggml_q6k(
+        a: [Tile; 16],
         matrix: &QuantizedMatrix,
-        coords: GgmlBlockCoords,
-        mask: Mask<BLOCK>,
+        coords: ggml::BlockCoords,
+        mask: Mask,
         fill: f32,
     ) -> Self {
-        let GgmlBlockCoords { block, c0, c1, col } = coords;
+        let ggml::BlockCoords { block, c0, c1, col } = coords;
         Self {
             src: matrix.clone(),
             activations: PackedActivations::F32(tiles_to_exprs(a)),
@@ -222,9 +215,9 @@ impl<const BLOCK: usize> QuantizedDot<BLOCK> {
     }
 }
 
-impl<const BLOCK: usize> TileBlock<'_, BLOCK> {
+impl TileBlock<'_> {
     /// Emit a quantized dot tile expression.
-    pub fn quantized_dot(&self, dot: QuantizedDot<BLOCK>) -> Tile<BLOCK> {
+    pub fn quantized_dot(&self, dot: QuantizedDot) -> Tile {
         Tile {
             expr: Expr::QuantizedDot {
                 src: dot.src,

@@ -16,8 +16,8 @@ use crate::ir::KernelIr;
 ///     program.program_grid::<32>([1, 1, 1], |block| {
 ///         let lane = block.lane();
 ///         let mask = lane.clone().lt(32u32);
-///         let value = block.load_linear(x.at(lane.clone()), mask.clone(), TileLiteral::f32(0.0));
-///         block.store_linear(y.at(lane), value, mask);
+///         let value = block.load(x.at(lane.clone()), mask.clone(), TileLiteral::f32(0.0));
+///         block.store(y.at(lane), value, mask);
 ///     });
 /// });
 /// # let _ = ir;

@@ -1976,7 +1976,7 @@ impl Resolver {
             move |tiles| {
                 // Re-order the closure's tile slice to match the captured
                 // NaryExpr's input numbering.
-                let inputs: Vec<(fusor_tile_ir::tile::Tile<1>, DataTypeEnum)> = permutation
+                let inputs: Vec<(fusor_tile_ir::tile::Tile, DataTypeEnum)> = permutation
                     .iter()
                     .map(|&tile_idx| (tiles[tile_idx].clone(), datatype))
                     .collect();

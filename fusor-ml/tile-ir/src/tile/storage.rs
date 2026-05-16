@@ -18,7 +18,7 @@ pub struct Storage<T, const R: usize> {
 pub struct RuntimeElement;
 
 /// Converts rank-specific index arguments into a typed storage address.
-pub trait StorageIndex<T, const R: usize, const N: usize> {
+pub trait StorageIndex<T, const R: usize> {
     /// Address type produced by this index.
     type Address;
 
@@ -26,11 +26,11 @@ pub trait StorageIndex<T, const R: usize, const N: usize> {
     fn address(self, view: StorageView) -> Self::Address;
 }
 
-impl<T, const N: usize, I> StorageIndex<T, 1, N> for I
+impl<T, I> StorageIndex<T, 1> for I
 where
-    I: IntoIndex<N>,
+    I: IntoIndex,
 {
-    type Address = LinearAddress<T, N>;
+    type Address = LinearAddress<T>;
 
     fn address(self, view: StorageView) -> Self::Address {
         LinearAddress {
@@ -41,12 +41,12 @@ where
     }
 }
 
-impl<T, const N: usize, Row, Col> StorageIndex<T, 2, N> for (Row, Col)
+impl<T, Row, Col> StorageIndex<T, 2> for (Row, Col)
 where
-    Row: IntoIndex<N>,
-    Col: IntoIndex<N>,
+    Row: IntoIndex,
+    Col: IntoIndex,
 {
-    type Address = Address<T, N>;
+    type Address = Address<T>;
 
     fn address(self, view: StorageView) -> Self::Address {
         let (row, col) = self;
@@ -66,9 +66,9 @@ impl<T, const R: usize> Storage<T, R> {
     }
 
     /// Address one element in this storage view.
-    pub fn at<const N: usize, I>(&self, index: I) -> I::Address
+    pub fn at<I>(&self, index: I) -> I::Address
     where
-        I: StorageIndex<T, R, N>,
+        I: StorageIndex<T, R>,
     {
         index.address(self.view.clone())
     }

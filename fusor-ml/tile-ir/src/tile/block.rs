@@ -3,9 +3,8 @@ use std::marker::PhantomData;
 use super::value::boxed_u32_literal;
 use super::*;
 use crate::ir::{
-    Builtin, Expr, FloatElement, LoadSource, Numeric, ScalarMarker, TileIndexedStoreStmt,
-    TileLinearLoadExpr, TileLiteral, TileLoadExpr, TileRef, TileStmt, TileStoreStmt, TileUnaryOp,
-    Vector, WorkgroupAxis, U32,
+    Builtin, Expr, FloatElement, Numeric, ScalarMarker, TileLiteral, TileLoadExpr, TileRef,
+    TileStmt, TileUnaryOp, WorkgroupAxis, U32,
 };
 use crate::quantized::QuantizedMatrix;
 
@@ -13,9 +12,10 @@ use crate::quantized::QuantizedMatrix;
 ///
 /// `BLOCK` is the number of invocations in the workgroup. Values returned by
 /// methods on `TileBlock` are symbolic tile expressions, not host values.
-pub struct TileBlock<'a, const BLOCK: usize> {
+pub struct TileBlock<'a> {
     pub(super) program: &'a mut Program,
     pub(super) grid: [u32; 3],
+    pub(super) block: usize,
     pub(super) body: Vec<TileStmt>,
     /// Stack of nested statement builders. The innermost frame collects
     /// statements emitted inside `while_true`/`fold` closures; popped into
@@ -40,13 +40,11 @@ pub(super) fn f32_fill(value: f32) -> Box<Expr> {
 /// the quantized-dot entry points that pack tile arrays into
 /// `PackedActivations` variants and by `sum`/`fold` that move the underlying
 /// expressions out of their typed wrappers.
-pub(super) fn tiles_to_exprs<const BLOCK: usize>(
-    values: impl IntoIterator<Item = Tile<BLOCK>>,
-) -> Vec<Expr> {
+pub(super) fn tiles_to_exprs(values: impl IntoIterator<Item = Tile>) -> Vec<Expr> {
     values.into_iter().map(|t| t.expr).collect()
 }
 
-impl<const BLOCK: usize> TileBlock<'_, BLOCK> {
+impl TileBlock<'_> {
     /// Workgroup id component for `axis`.
     pub fn program_id(&self, axis: WorkgroupAxis) -> ScalarIndex {
         builtin_index(Builtin::ProgramId(axis))
@@ -77,16 +75,21 @@ impl<const BLOCK: usize> TileBlock<'_, BLOCK> {
         self.grid
     }
 
+    /// Number of invocations in this workgroup.
+    pub fn block_size(&self) -> usize {
+        self.block
+    }
+
     /// This invocation's lane index within the workgroup (`0..BLOCK`).
     /// Lowers to `@builtin(local_invocation_index)`.
-    pub fn lane(&self) -> Range<BLOCK> {
+    pub fn lane(&self) -> Range {
         Range {
             expr: Box::new(Expr::Builtin(Builtin::Lane)),
         }
     }
 
     /// Interpret lanes as row-major coordinates for a tile with `dims`.
-    pub fn lane_tiles<const DIMS: usize>(&self, dims: &[u32; DIMS]) -> [Range<BLOCK>; DIMS] {
+    pub fn lane_tiles<const DIMS: usize>(&self, dims: &[u32; DIMS]) -> [Range; DIMS] {
         assert!(
             DIMS > 0,
             "lane tile coordinates require at least one dimension"
@@ -97,7 +100,7 @@ impl<const BLOCK: usize> TileBlock<'_, BLOCK> {
         });
         assert_eq!(
             lane_count,
-            Some(BLOCK),
+            Some(self.block),
             "lane tile shape must match the tile program block size"
         );
 
@@ -113,84 +116,27 @@ impl<const BLOCK: usize> TileBlock<'_, BLOCK> {
         })
     }
 
-    /// Load a rank-2 storage element with a masked fill value.
-    pub fn load<T>(&self, address: Address<T, BLOCK>, mask: Mask<BLOCK>, fill: f32) -> Tile<BLOCK> {
-        Tile {
-            expr: Expr::Load(TileLoadExpr {
-                src: LoadSource::Storage(address.view),
-                row: address.row,
-                col: address.col,
-                mask: mask.expr,
-                fill: f32_fill(fill),
-            }),
-        }
-    }
-
-    /// Load a rank-2 storage element with a masked fill literal.
-    pub fn load_literal<T>(
-        &self,
-        address: Address<T, BLOCK>,
-        mask: Mask<BLOCK>,
-        fill: TileLiteral,
-    ) -> Tile<BLOCK> {
-        Tile {
-            expr: Expr::Load(TileLoadExpr {
-                src: LoadSource::Storage(address.view),
-                row: address.row,
-                col: address.col,
-                mask: mask.expr,
-                fill: Box::new(Expr::Literal(fill)),
-            }),
-        }
-    }
-
-    /// Load a rank-1 storage element with a masked fill literal.
-    pub fn load_linear<T: Numeric>(
-        &self,
-        address: LinearAddress<T, BLOCK>,
-        mask: Mask<BLOCK>,
-        fill: TileLiteral,
-    ) -> Tile<BLOCK> {
-        Tile {
-            expr: Expr::LoadLinear(TileLinearLoadExpr {
-                src: address.view,
-                index: address.index,
-                mask: mask.expr,
-                fill: Box::new(Expr::Literal(fill)),
-            }),
-        }
-    }
-
-    /// Load a vector from a vector-typed rank-1 storage view.
+    /// Load from rank-1, rank-2, or vector rank-1 storage with a masked fill.
     ///
     /// ```
-    /// use fusor_tile_ir::{tile, Shape, TileLiteral, Vector, F32};
+    /// use fusor_tile_ir::{tile, Shape, Vector, F32};
     ///
     /// let ir = tile::build(|program| {
     ///     let x = program.storage_read::<Vector<F32, 2>, 1>(Shape::new([16]));
     ///     program.program_grid::<16>([1, 1, 1], |block| {
     ///         let lane = block.lane();
     ///         let mask = lane.clone().lt(16);
-    ///         let _value = block.load_vector::<F32, 2>(x.at(lane), mask, TileLiteral::f32(0.0));
+    ///         let _value = block.load(x.at(lane), mask, 0.0);
     ///     });
     /// });
     /// # let _ = ir;
     /// ```
-    pub fn load_vector<T: ScalarMarker, const LANES: usize>(
-        &self,
-        address: LinearAddress<Vector<T, LANES>, BLOCK>,
-        mask: Mask<BLOCK>,
-        fill: TileLiteral,
-    ) -> Tile<BLOCK> {
-        let scalar = Tile::literal(fill);
-        let fill_vector = self.vector_splat::<T, LANES>(scalar).expr;
+    pub fn load<A>(&self, address: A, mask: Mask, fill: impl IntoTileLiteral) -> Tile
+    where
+        A: TileLoadAddress,
+    {
         Tile {
-            expr: Expr::LoadLinear(TileLinearLoadExpr {
-                src: address.view,
-                index: address.index,
-                mask: mask.expr,
-                fill: Box::new(fill_vector),
-            }),
+            expr: address.load_expr(mask.expr, fill.into_tile_literal()),
         }
     }
 
@@ -198,11 +144,11 @@ impl<const BLOCK: usize> TileBlock<'_, BLOCK> {
     pub fn load_quantized(
         &self,
         matrix: &QuantizedMatrix,
-        row: impl IntoIndex<BLOCK>,
-        col: impl IntoIndex<BLOCK>,
-        mask: Mask<BLOCK>,
+        row: impl IntoIndex,
+        col: impl IntoIndex,
+        mask: Mask,
         fill: f32,
-    ) -> Tile<BLOCK> {
+    ) -> Tile {
         Tile {
             expr: Expr::Load(TileLoadExpr {
                 src: crate::ir::LoadSource::Quantized(matrix.clone()),
@@ -223,11 +169,11 @@ impl<const BLOCK: usize> TileBlock<'_, BLOCK> {
     pub fn load_quantized_block<const N: usize>(
         &mut self,
         matrix: &QuantizedMatrix,
-        k_base: impl IntoIndex<BLOCK>,
-        col: impl IntoIndex<BLOCK>,
-        mask: Mask<BLOCK>,
+        k_base: impl IntoIndex,
+        col: impl IntoIndex,
+        mask: Mask,
         fill: f32,
-    ) -> [Tile<BLOCK>; N] {
+    ) -> [Tile; N] {
         assert!(
             N == 8 || N == 16,
             "load_quantized_block currently supports N == 8 or N == 16"
@@ -255,29 +201,19 @@ impl<const BLOCK: usize> TileBlock<'_, BLOCK> {
     /// the value without re-emitting its computation. Pushes a
     /// `TileStmt::StoreLocal` at the call site; subsequent `Bound::get()` calls
     /// return tiles that lower to a load of the bound local.
-    pub fn bind(&mut self, value: Tile<BLOCK>) -> Bound<BLOCK> {
+    pub fn bind(&mut self, value: Tile) -> Bound {
         let element = value.expr.element();
         let local = self.program.alloc_local_element(element);
         self.push_stmt(TileStmt::StoreLocal {
             dst: local,
             value: value.expr,
         });
-        Bound {
-            local,
-            _block: PhantomData,
-        }
+        Bound { local }
     }
 
     /// Dot product between two float vector tile expressions.
-    pub fn vector_dot<T: FloatElement, const LANES: usize>(
-        &self,
-        left: Tile<BLOCK>,
-        right: Tile<BLOCK>,
-    ) -> Tile<BLOCK> {
-        assert!(
-            (2..=4).contains(&LANES),
-            "vector_dot supports 2, 3, or 4 lanes"
-        );
+    pub fn vector_dot<T: FloatElement, const LANES: usize>(&self, left: Tile, right: Tile) -> Tile {
+        validate_vector_lanes(LANES, "vector_dot");
         Tile {
             expr: Expr::VectorDot {
                 scalar: T::SCALAR,
@@ -289,14 +225,8 @@ impl<const BLOCK: usize> TileBlock<'_, BLOCK> {
     }
 
     /// Build a vector by repeating one scalar tile expression.
-    pub fn vector_splat<T: ScalarMarker, const LANES: usize>(
-        &self,
-        value: Tile<BLOCK>,
-    ) -> Tile<BLOCK> {
-        assert!(
-            (2..=4).contains(&LANES),
-            "vector_splat supports 2, 3, or 4 lanes"
-        );
+    pub fn vector_splat<T: ScalarMarker, const LANES: usize>(&self, value: Tile) -> Tile {
+        validate_vector_lanes(LANES, "vector_splat");
         assert_eq!(
             value.expr.element(),
             T::SCALAR.element(),
@@ -314,12 +244,9 @@ impl<const BLOCK: usize> TileBlock<'_, BLOCK> {
     /// Pack scalars into a vector.
     pub fn compose_vector<T: ScalarMarker, const LANES: usize>(
         &self,
-        values: [Tile<BLOCK>; LANES],
-    ) -> Tile<BLOCK> {
-        assert!(
-            (2..=4).contains(&LANES),
-            "compose_vector supports 2, 3, or 4 lanes"
-        );
+        values: [Tile; LANES],
+    ) -> Tile {
+        validate_vector_lanes(LANES, "compose_vector");
         let values = values
             .into_iter()
             .map(|value| {
@@ -341,36 +268,36 @@ impl<const BLOCK: usize> TileBlock<'_, BLOCK> {
     }
 
     /// Create a tile literal.
-    pub fn literal(&self, value: TileLiteral) -> Tile<BLOCK> {
+    pub fn literal(&self, value: TileLiteral) -> Tile {
         Tile {
             expr: Expr::Literal(value),
         }
     }
 
     /// Create an f32 tile literal.
-    pub fn f32(&self, value: f32) -> Tile<BLOCK> {
+    pub fn f32(&self, value: f32) -> Tile {
         self.literal(TileLiteral::f32(value))
     }
 
     /// Create a u32 tile literal.
-    pub fn u32(&self, value: u32) -> Tile<BLOCK> {
+    pub fn u32(&self, value: u32) -> Tile {
         self.literal(TileLiteral::U32(value))
     }
 
     /// Create a bool tile literal.
-    pub fn bool(&self, value: bool) -> Tile<BLOCK> {
+    pub fn bool(&self, value: bool) -> Tile {
         self.literal(TileLiteral::Bool(value))
     }
 
     /// Convert an index expression into a u32 tile expression.
-    pub fn index(&self, value: impl IntoIndex<BLOCK>) -> Tile<BLOCK> {
+    pub fn index(&self, value: impl IntoIndex) -> Tile {
         Tile {
             expr: *value.into_index(),
         }
     }
 
     /// Exponential of a tile expression.
-    pub fn exp(&self, value: Tile<BLOCK>) -> Tile<BLOCK> {
+    pub fn exp(&self, value: Tile) -> Tile {
         Tile {
             expr: Expr::Unary {
                 op: TileUnaryOp::Exp,
@@ -385,7 +312,7 @@ impl<const BLOCK: usize> TileBlock<'_, BLOCK> {
     }
 
     /// Allocate a private per-invocation local.
-    pub fn private<T: Numeric>(&mut self) -> Local<T, BLOCK> {
+    pub fn private<T: Numeric>(&mut self) -> Local<T> {
         Local {
             local: self.program.alloc_local::<T>(),
             _ty: PhantomData,
@@ -393,14 +320,14 @@ impl<const BLOCK: usize> TileBlock<'_, BLOCK> {
     }
 
     /// Load a private local.
-    pub fn load_local<T>(&self, local: &Local<T, BLOCK>) -> Tile<BLOCK> {
+    pub fn load_local<T>(&self, local: &Local<T>) -> Tile {
         Tile {
             expr: Expr::LoadLocal(local.local),
         }
     }
 
     /// Store a private local.
-    pub fn store_local<T>(&mut self, local: &Local<T, BLOCK>, value: Tile<BLOCK>) {
+    pub fn store_local<T>(&mut self, local: &Local<T>, value: Tile) {
         self.push_stmt(TileStmt::StoreLocal {
             dst: local.local,
             value: value.expr,
@@ -408,7 +335,7 @@ impl<const BLOCK: usize> TileBlock<'_, BLOCK> {
     }
 
     /// Load a value from workgroup tile storage.
-    pub fn load_workgroup(&self, tile: TileRef, index: impl IntoIndex<BLOCK>) -> Tile<BLOCK> {
+    pub fn load_workgroup(&self, tile: TileRef, index: impl IntoIndex) -> Tile {
         Tile {
             expr: Expr::LoadWorkgroup {
                 src: tile,
@@ -418,12 +345,7 @@ impl<const BLOCK: usize> TileBlock<'_, BLOCK> {
     }
 
     /// Store a value into workgroup tile storage.
-    pub fn store_workgroup(
-        &mut self,
-        tile: TileRef,
-        index: impl IntoIndex<BLOCK>,
-        value: Tile<BLOCK>,
-    ) {
+    pub fn store_workgroup(&mut self, tile: TileRef, index: impl IntoIndex, value: Tile) {
         self.push_stmt(TileStmt::StoreWorkgroup {
             dst: tile,
             index: index.into_index(),
@@ -432,14 +354,14 @@ impl<const BLOCK: usize> TileBlock<'_, BLOCK> {
     }
 
     /// Emit `if condition { ... }`.
-    pub fn if_then(&mut self, condition: Tile<BLOCK>, accept: impl FnOnce(&mut Self)) {
+    pub fn if_then(&mut self, condition: Tile, accept: impl FnOnce(&mut Self)) {
         self.if_else(condition, accept, |_| {});
     }
 
     /// Emit `if condition { ... } else { ... }`.
     pub fn if_else(
         &mut self,
-        condition: Tile<BLOCK>,
+        condition: Tile,
         accept: impl FnOnce(&mut Self),
         reject: impl FnOnce(&mut Self),
     ) {
@@ -472,7 +394,7 @@ impl<const BLOCK: usize> TileBlock<'_, BLOCK> {
     /// `if condition { break }` — the dominant kernel-side pattern for
     /// counted/conditional `loop_forever` exits. Bare `break_loop` remains for
     /// the unconditional case and for compound break bodies.
-    pub fn break_if(&mut self, condition: Tile<BLOCK>) {
+    pub fn break_if(&mut self, condition: Tile) {
         self.if_then(condition, |program| program.break_loop());
     }
 
@@ -517,29 +439,15 @@ impl<const BLOCK: usize> TileBlock<'_, BLOCK> {
         }
     }
 
-    /// Store to a rank-2 storage address.
-    pub fn store<T>(&mut self, address: Address<T, BLOCK>, value: Tile<BLOCK>, mask: Mask<BLOCK>) {
-        self.push_stmt(TileStmt::Store(TileStoreStmt {
-            dst: address.view,
-            row: address.row,
-            col: address.col,
-            value: value.expr,
-            mask: mask.expr,
-        }));
+    /// Store to a rank-1 or rank-2 storage address.
+    pub fn store<A>(&mut self, address: A, value: Tile, mask: Mask)
+    where
+        A: TileStoreAddress,
+    {
+        self.push_stmt(address.store_stmt(value.expr, mask.expr));
     }
+}
 
-    /// Store to a rank-1 storage address.
-    pub fn store_linear<T: Numeric>(
-        &mut self,
-        address: LinearAddress<T, BLOCK>,
-        value: Tile<BLOCK>,
-        mask: Mask<BLOCK>,
-    ) {
-        self.push_stmt(TileStmt::StoreIndexed(TileIndexedStoreStmt {
-            dst: address.view,
-            index: address.index,
-            value: value.expr,
-            mask: mask.expr,
-        }));
-    }
+fn validate_vector_lanes(lanes: usize, op: &str) {
+    assert!((2..=4).contains(&lanes), "{op} supports 2, 3, or 4 lanes");
 }

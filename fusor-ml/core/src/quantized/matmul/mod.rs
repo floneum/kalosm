@@ -1105,96 +1105,6 @@ impl Operation for QMatMulOperation {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Q4KPairedTile {
-    X4x1,
-    X4x4,
-    X8x1,
-    X8x2,
-    X2x2,
-    X2x4,
-}
-
-/// Tuning table: `(variant, env-var name, cols_per_workgroup)`. Drives both
-/// `from_env` lookup and the `name`/`cols_per_workgroup` accessors so adding
-/// a tile only requires one row.
-const Q4K_PAIRED_TILES: &[(Q4KPairedTile, &str, u32)] = &[
-    (Q4KPairedTile::X4x1, "4x1", 4),
-    (Q4KPairedTile::X2x2, "2x2", 4),
-    (Q4KPairedTile::X2x4, "2x4", 8),
-    (Q4KPairedTile::X8x1, "8x1", 8),
-    (Q4KPairedTile::X4x4, "4x4", 16),
-    (Q4KPairedTile::X8x2, "8x2", 16),
-];
-
-impl Q4KPairedTile {
-    fn from_env() -> Self {
-        let tile_choice = std::env::var("FUSOR_Q4K_PAIRED_TILE")
-            .or_else(|_| std::env::var("FUSOR_Q4K_SWIGLU_TILE"))
-            .unwrap_or_default();
-        Q4K_PAIRED_TILES
-            .iter()
-            .find(|(_, name, _)| *name == tile_choice)
-            .map(|(tile, _, _)| *tile)
-            .unwrap_or(Self::X8x2)
-    }
-
-    fn spec(self) -> &'static (Self, &'static str, u32) {
-        Q4K_PAIRED_TILES
-            .iter()
-            .find(|(tile, _, _)| *tile == self)
-            .expect("Q4KPairedTile variant must appear in Q4K_PAIRED_TILES")
-    }
-
-    fn name(self) -> &'static str {
-        self.spec().1
-    }
-
-    fn cols_per_workgroup(self) -> u32 {
-        self.spec().2
-    }
-
-    fn emit(
-        self,
-        phase: &mut tile_ir::tile::Program,
-        a: &tile_ir::tile::Storage<tile_ir::F32, 2>,
-        b: &tile_ir::QuantizedMatrix,
-        y: &tile_ir::tile::Storage<tile_ir::F32, 2>,
-        pair_len: u32,
-        m: u32,
-        workgroups_x: u32,
-        epilogue: &tile_ir_kernels::PairedEpilogue,
-        extras: &[tile_ir::tile::Storage<tile_ir::F32, 1>],
-    ) {
-        macro_rules! emit_tile {
-            ($func:path) => {
-                $func(
-                    phase,
-                    tile_ir_kernels::Q4KPairedGgml {
-                        a,
-                        b,
-                        y,
-                        pair_cols: pair_len,
-                        m_rows: m,
-                        workgroups_x,
-                        epilogue,
-                        extras,
-                    },
-                )
-            };
-        }
-
-        match self {
-            Self::X4x1 => emit_tile!(tile_ir_kernels::qgemv_q4k_paired_4x1),
-            Self::X4x4 => emit_tile!(tile_ir_kernels::qgemv_q4k_paired_4x4),
-            Self::X8x1 => emit_tile!(tile_ir_kernels::qgemv_q4k_paired_8x1),
-            Self::X8x2 => emit_tile!(tile_ir_kernels::qgemv_q4k_paired_8x2),
-            Self::X2x2 => emit_tile!(tile_ir_kernels::qgemv_q4k_paired_2x2),
-            Self::X2x4 => emit_tile!(tile_ir_kernels::qgemv_q4k_paired_2x4),
-        }
-    }
-}
-
 impl QMatMulOperation {
     fn build_paired_direct_kernel(
         &self,
@@ -1245,9 +1155,8 @@ impl QMatMulOperation {
 
         let limits = graph.device().limits();
         let max_workgroups = limits.max_compute_workgroups_per_dimension;
-        let tile = Q4KPairedTile::from_env();
-        let tile_name = tile.name();
-        let cols_per_workgroup = tile.cols_per_workgroup();
+        let tile_name = tile_ir_kernels::qgemv_q4k_paired_tile_name();
+        let cols_per_workgroup = tile_ir_kernels::qgemv_q4k_paired_cols_per_workgroup();
         let cols_workgroups = pair_len.div_ceil(cols_per_workgroup);
         let total_workgroups = cols_workgroups.checked_mul(m)?;
         let [workgroups_x, _] = split_workgroups_2d(total_workgroups, max_workgroups)?;
@@ -1292,7 +1201,19 @@ impl QMatMulOperation {
                         let a = tile_storage_read_with_direct_layout(phase, a_view);
                         let b = tile_ir_kernels::quantized_matrix(phase, format, k, pair_len * 2);
                         let y = tile_storage_write_with_direct_layout(phase, y_view);
-                        tile.emit(phase, &a, &b, &y, pair_len, m, workgroups_x, &epilogue, &[]);
+                        tile_ir_kernels::qgemv_q4k_paired(
+                            phase,
+                            tile_ir_kernels::Q4KPairedGgml {
+                                a: &a,
+                                b: &b,
+                                y: &y,
+                                pair_cols: pair_len,
+                                m_rows: m,
+                                workgroups_x,
+                                epilogue: &epilogue,
+                                extras: &[],
+                            },
+                        );
                     }))
                 },
             );
@@ -1361,16 +1282,18 @@ impl QMatMulOperation {
                         })
                         .collect();
                     let y = tile_storage_write_with_direct_layout(phase, y_view);
-                    tile.emit(
+                    tile_ir_kernels::qgemv_q4k_paired(
                         phase,
-                        &a,
-                        &b,
-                        &y,
-                        pair_len,
-                        m,
-                        workgroups_x,
-                        &epilogue,
-                        &extras,
+                        tile_ir_kernels::Q4KPairedGgml {
+                            a: &a,
+                            b: &b,
+                            y: &y,
+                            pair_cols: pair_len,
+                            m_rows: m,
+                            workgroups_x,
+                            epilogue: &epilogue,
+                            extras: &extras,
+                        },
                     );
                 }))
             },
