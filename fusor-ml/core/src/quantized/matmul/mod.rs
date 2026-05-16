@@ -1155,8 +1155,8 @@ impl QMatMulOperation {
 
         let limits = graph.device().limits();
         let max_workgroups = limits.max_compute_workgroups_per_dimension;
-        let tile_name = tile_ir_kernels::qgemv_q4k_paired_tile_name();
-        let cols_per_workgroup = tile_ir_kernels::qgemv_q4k_paired_cols_per_workgroup();
+        let tile_name = tile_ir_kernels::QGEMV_Q4K_PAIRED_TILE_NAME;
+        let cols_per_workgroup = tile_ir_kernels::QGEMV_Q4K_PAIRED_COLS_PER_WORKGROUP;
         let cols_workgroups = pair_len.div_ceil(cols_per_workgroup);
         let total_workgroups = cols_workgroups.checked_mul(m)?;
         let [workgroups_x, _] = split_workgroups_2d(total_workgroups, max_workgroups)?;

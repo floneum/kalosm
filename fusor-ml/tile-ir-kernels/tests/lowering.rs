@@ -3,7 +3,7 @@ use fusor_tile_ir::{
     NagaKernel, Shape, F32,
 };
 use fusor_tile_ir_kernels::{
-    flash_attention, linear_storage_layout, qdequantize, qgemv, qgemv_q4k_paired_4x2, qmatmul,
+    flash_attention, linear_storage_layout, qdequantize, qgemv, qgemv_q4k_paired, qmatmul,
     quantized_matrix, rms_norm_vec4, FlashAttentionDims, FlashAttentionMeta, PairedEpilogue,
     Q4KPairedGgml, RmsNormVec4, RmsNormVec4Meta, TensorMeta,
 };
@@ -122,7 +122,7 @@ fn q4k_paired_epilogue_lowers() {
         let y = program.storage_write::<F32, 2>(Shape::new([1, pair_cols]));
         let epilogue =
             PairedEpilogue::with_extras("mul", 0, |tiles| tiles[0].clone() * tiles[1].clone());
-        qgemv_q4k_paired_4x2(
+        qgemv_q4k_paired(
             program,
             Q4KPairedGgml {
                 a: &a,

@@ -11,35 +11,11 @@ use fusor_tile_ir::{
 use crate::grid::{q4k_ggml_iteration, q4k_lane_decomposition, Q4KGgmlIterationRequest};
 use crate::types::{matrix_shape, PairedEpilogue};
 
-fn qgemv_q4k_paired_tile_name_from_env() -> &'static str {
-    match std::env::var("FUSOR_Q4K_PAIRED_TILE")
-        .or_else(|_| std::env::var("FUSOR_Q4K_SWIGLU_TILE"))
-        .as_deref()
-    {
-        Ok("4x1") => "4x1",
-        Ok("2x2") => "2x2",
-        Ok("2x4") => "2x4",
-        Ok("8x1") => "8x1",
-        Ok("4x4") => "4x4",
-        Ok("8x2") | _ => "8x2",
-    }
-}
+/// Stable short name for the Q4K paired GEMV tile.
+pub const QGEMV_Q4K_PAIRED_TILE_NAME: &str = "8x2";
 
-/// Stable short name for the env-selected Q4K paired GEMV tile.
-pub fn qgemv_q4k_paired_tile_name() -> &'static str {
-    qgemv_q4k_paired_tile_name_from_env()
-}
-
-/// Number of output pair columns covered by one workgroup for the env-selected
-/// Q4K paired GEMV tile.
-pub fn qgemv_q4k_paired_cols_per_workgroup() -> u32 {
-    match qgemv_q4k_paired_tile_name_from_env() {
-        "4x1" | "2x2" => 4,
-        "2x4" | "8x1" => 8,
-        "4x4" | "8x2" => 16,
-        _ => unreachable!("qgemv_q4k_paired_tile_name_from_env returns a known tile name"),
-    }
-}
+/// Number of output pair columns covered by one paired Q4K GEMV workgroup.
+pub const QGEMV_Q4K_PAIRED_COLS_PER_WORKGROUP: u32 = 16;
 
 /// Inputs and launch geometry for the Q4K paired-epilogue GEMV kernels.
 ///
@@ -94,15 +70,7 @@ pub struct Q4KPairedGgml<'a> {
 
 /// Build a Q4K paired-epilogue GEMV body.
 pub fn qgemv_q4k_paired(program: &mut Program, spec: Q4KPairedGgml<'_>) {
-    match qgemv_q4k_paired_tile_name_from_env() {
-        "4x1" => qgemv_q4k_paired_ggml::<4, 1, 2, 128>(program, spec),
-        "4x4" => qgemv_q4k_paired_ggml::<4, 4, 8, 128>(program, spec),
-        "8x1" => qgemv_q4k_paired_ggml::<8, 1, 2, 256>(program, spec),
-        "8x2" => qgemv_q4k_paired_ggml::<8, 2, 4, 256>(program, spec),
-        "2x2" => qgemv_q4k_paired_ggml::<2, 2, 4, 64>(program, spec),
-        "2x4" => qgemv_q4k_paired_ggml::<2, 4, 8, 64>(program, spec),
-        _ => unreachable!("qgemv_q4k_paired_tile_name_from_env returns a known tile name"),
-    }
+    qgemv_q4k_paired_ggml::<8, 2, 4, 256>(program, spec);
 }
 
 /// Q4K paired-epilogue qgemv body. The kernel reduces the gate and up halves
