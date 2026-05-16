@@ -7,34 +7,39 @@ impl<'a> Lowerer<'a> {
     /// `(format, activations, k, block_n)` tuple. Unsupported combinations
     /// return `LowerError::UnsupportedOperation` with the same messages the
     /// pre-merge helpers used.
-    #[allow(clippy::too_many_arguments)]
     pub(in crate::lower) fn lower_tile_quantized_dot_expr(
         &self,
         expressions: &mut Arena<Expression>,
         scratch: ScratchLocals,
         body: &mut Block,
-        src: &QuantizedMatrix,
-        activations: &PackedActivations,
-        k: &DotK,
-        col: &Expr,
-        mask: &Expr,
-        fill: &Expr,
-        block_n: u32,
-        spill_depth: usize,
+        request: QuantizedDotLowering<'_>,
     ) -> Result<Handle<Expression>, LowerError> {
+        let QuantizedDotLowering {
+            src,
+            activations,
+            k,
+            col,
+            masked,
+            block_n,
+        } = request;
         match (activations, k) {
             (PackedActivations::F32(a), DotK::Base(k_base)) => {
-                let a_handles =
-                    self.lower_tile_exprs_lane(expressions, scratch, body, a, spill_depth + 1)?;
+                let a_handles = self.lower_tile_exprs_lane(
+                    expressions,
+                    scratch,
+                    body,
+                    a,
+                    masked.spill_depth + 1,
+                )?;
                 self.lower_masked_quantized_col_value(
                     expressions,
                     scratch,
                     body,
-                    k_base,
-                    col,
-                    mask,
-                    fill,
-                    spill_depth,
+                    MaskedQuantizedCol {
+                        k_base,
+                        col,
+                        masked,
+                    },
                     |expressions, k_base, col, body| match (src.format, block_n) {
                         (GgmlQuantFormat::Q8_0, 8) => {
                             let a8: [Handle<Expression>; 8] =
@@ -64,19 +69,24 @@ impl<'a> Lowerer<'a> {
                 )
             }
             (PackedActivations::Q8(a), DotK::Base(k_base)) => {
-                let a_handles =
-                    self.lower_tile_exprs_lane(expressions, scratch, body, a, spill_depth + 1)?;
+                let a_handles = self.lower_tile_exprs_lane(
+                    expressions,
+                    scratch,
+                    body,
+                    a,
+                    masked.spill_depth + 1,
+                )?;
                 let a_packs =
                     self.cached_q8_activation_packs(expressions, scratch, body, &a_handles)?;
                 self.lower_masked_quantized_col_value(
                     expressions,
                     scratch,
                     body,
-                    k_base,
-                    col,
-                    mask,
-                    fill,
-                    spill_depth,
+                    MaskedQuantizedCol {
+                        k_base,
+                        col,
+                        masked,
+                    },
                     |expressions, k_base, col, body| match (src.format, block_n) {
                         (GgmlQuantFormat::Q4K, 8 | 16) => self.q4k_q8_activation_dot(
                             expressions,
@@ -119,30 +129,45 @@ impl<'a> Lowerer<'a> {
                     ));
                 }
 
-                let low_handles =
-                    self.lower_tile_exprs_lane(expressions, scratch, body, low, spill_depth + 1)?;
-                let high_handles =
-                    self.lower_tile_exprs_lane(expressions, scratch, body, high, spill_depth + 1)?;
-                let sum_handles =
-                    self.lower_tile_exprs_lane(expressions, scratch, body, sums, spill_depth + 1)?;
+                let low_handles = self.lower_tile_exprs_lane(
+                    expressions,
+                    scratch,
+                    body,
+                    low,
+                    masked.spill_depth + 1,
+                )?;
+                let high_handles = self.lower_tile_exprs_lane(
+                    expressions,
+                    scratch,
+                    body,
+                    high,
+                    masked.spill_depth + 1,
+                )?;
+                let sum_handles = self.lower_tile_exprs_lane(
+                    expressions,
+                    scratch,
+                    body,
+                    sums,
+                    masked.spill_depth + 1,
+                )?;
 
                 self.lower_masked_f32_value(
                     expressions,
                     scratch,
                     body,
-                    mask,
-                    spill_depth,
-                    fill,
+                    masked,
                     |expressions, block_body| {
                         let coords = self.lower_ggml_block_coords(
                             expressions,
                             scratch,
                             block_body,
-                            block,
-                            iq,
-                            ir,
-                            col,
-                            spill_depth,
+                            GgmlBlockCoordExprs {
+                                block,
+                                c0: iq,
+                                c1: ir,
+                                col,
+                                spill_depth: masked.spill_depth,
+                            },
                         )?;
                         self.q4k_ggml_dot(
                             expressions,
@@ -177,26 +202,31 @@ impl<'a> Lowerer<'a> {
                     ));
                 }
 
-                let a_handles =
-                    self.lower_tile_exprs_lane(expressions, scratch, body, a, spill_depth + 1)?;
+                let a_handles = self.lower_tile_exprs_lane(
+                    expressions,
+                    scratch,
+                    body,
+                    a,
+                    masked.spill_depth + 1,
+                )?;
 
                 self.lower_masked_f32_value(
                     expressions,
                     scratch,
                     body,
-                    mask,
-                    spill_depth,
-                    fill,
+                    masked,
                     |expressions, block_body| {
                         let coords = self.lower_ggml_block_coords(
                             expressions,
                             scratch,
                             block_body,
-                            block,
-                            ip,
-                            il,
-                            col,
-                            spill_depth,
+                            GgmlBlockCoordExprs {
+                                block,
+                                c0: ip,
+                                c1: il,
+                                col,
+                                spill_depth: masked.spill_depth,
+                            },
                         )?;
                         self.q6k_ggml_dot(expressions, src, coords, &a_handles, block_body)
                     },
@@ -231,37 +261,51 @@ impl<'a> Lowerer<'a> {
 
     /// Lower the four `(block, c0, c1, col)` index expressions used by Q4K and
     /// Q6K ggml dot helpers.
-    #[allow(clippy::too_many_arguments)]
     pub(in crate::lower) fn lower_ggml_block_coords(
         &self,
         expressions: &mut Arena<Expression>,
         scratch: ScratchLocals,
         body: &mut Block,
-        block: &Expr,
-        c0: &Expr,
-        c1: &Expr,
-        col: &Expr,
-        spill_depth: usize,
+        coords: GgmlBlockCoordExprs<'_>,
     ) -> Result<GgmlBlockCoords, LowerError> {
         Ok(GgmlBlockCoords {
-            block: self.lower_tile_expr_lane(expressions, scratch, body, block, spill_depth)?,
-            c0: self.lower_tile_expr_lane(expressions, scratch, body, c0, spill_depth)?,
-            c1: self.lower_tile_expr_lane(expressions, scratch, body, c1, spill_depth)?,
-            col: self.lower_tile_expr_lane(expressions, scratch, body, col, spill_depth)?,
+            block: self.lower_tile_expr_lane(
+                expressions,
+                scratch,
+                body,
+                coords.block,
+                coords.spill_depth,
+            )?,
+            c0: self.lower_tile_expr_lane(
+                expressions,
+                scratch,
+                body,
+                coords.c0,
+                coords.spill_depth,
+            )?,
+            c1: self.lower_tile_expr_lane(
+                expressions,
+                scratch,
+                body,
+                coords.c1,
+                coords.spill_depth,
+            )?,
+            col: self.lower_tile_expr_lane(
+                expressions,
+                scratch,
+                body,
+                coords.col,
+                coords.spill_depth,
+            )?,
         })
     }
 
-    #[allow(clippy::too_many_arguments)]
     pub(in crate::lower) fn lower_masked_quantized_col_value(
         &self,
         expressions: &mut Arena<Expression>,
         scratch: ScratchLocals,
         body: &mut Block,
-        k_base: &Expr,
-        col: &Expr,
-        mask: &Expr,
-        fill: &Expr,
-        spill_depth: usize,
+        request: MaskedQuantizedCol<'_>,
         lower_value: impl FnOnce(
             &mut Arena<Expression>,
             Handle<Expression>,
@@ -273,14 +317,22 @@ impl<'a> Lowerer<'a> {
             expressions,
             scratch,
             body,
-            mask,
-            spill_depth,
-            fill,
+            request.masked,
             |expressions, block| {
-                let k_base =
-                    self.lower_tile_expr_lane(expressions, scratch, block, k_base, spill_depth)?;
-                let col =
-                    self.lower_tile_expr_lane(expressions, scratch, block, col, spill_depth)?;
+                let k_base = self.lower_tile_expr_lane(
+                    expressions,
+                    scratch,
+                    block,
+                    request.k_base,
+                    request.masked.spill_depth,
+                )?;
+                let col = self.lower_tile_expr_lane(
+                    expressions,
+                    scratch,
+                    block,
+                    request.col,
+                    request.masked.spill_depth,
+                )?;
                 lower_value(expressions, k_base, col, block)
             },
         )
@@ -318,22 +370,27 @@ impl<'a> Lowerer<'a> {
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
     pub(in crate::lower) fn lower_tile_quantized_block_lane(
         &self,
         expressions: &mut Arena<Expression>,
         scratch: ScratchLocals,
         body: &mut Block,
-        id: BlockDequantId,
-        src: &QuantizedMatrix,
-        k_base: &Expr,
-        col: &Expr,
-        mask: &Expr,
-        fill: &Expr,
-        block_n: u32,
-        lane: u32,
-        spill_depth: usize,
+        request: QuantizedBlockLaneLowering<'_>,
     ) -> Result<Handle<Expression>, LowerError> {
+        let QuantizedBlockLaneLowering {
+            id,
+            src,
+            k_base,
+            col,
+            masked,
+            block_n,
+            lane,
+        } = request;
+        let MaskedF32Value {
+            mask,
+            fill,
+            spill_depth,
+        } = masked;
         if lane >= block_n {
             return Err(LowerError::UnsupportedOperation(
                 "quantized block lane out of range",
@@ -435,7 +492,7 @@ impl<'a> Lowerer<'a> {
     ) -> Result<Handle<LocalVariable>, LowerError> {
         scratch
             .spills
-            .get(Self::element_scratch_index(element))
+            .get(Self::element_scratch_index(element)?)
             .and_then(|spills| spills.get(depth))
             .copied()
             .ok_or(LowerError::UnsupportedOperation(
@@ -449,7 +506,7 @@ impl<'a> Lowerer<'a> {
     ) -> Result<Handle<LocalVariable>, LowerError> {
         scratch
             .values
-            .get(Self::element_scratch_index(element))
+            .get(Self::element_scratch_index(element)?)
             .copied()
             .ok_or(LowerError::UnsupportedOperation(
                 "unsupported tile value type",
@@ -461,21 +518,19 @@ impl<'a> Lowerer<'a> {
         expressions: &mut Arena<Expression>,
         scratch: ScratchLocals,
         body: &mut Block,
-        mask: &Expr,
-        spill_depth: usize,
-        fill: &Expr,
+        masked: MaskedF32Value<'_>,
         lower_value: impl FnOnce(
             &mut Arena<Expression>,
             &mut Block,
         ) -> Result<Handle<Expression>, LowerError>,
     ) -> Result<Handle<Expression>, LowerError> {
-        if mask.is_constant_true() {
+        if masked.mask.is_constant_true() {
             return lower_value(expressions, body);
         }
 
-        let fill_source = fill.element();
+        let fill_source = masked.fill.element();
         let fill_handle =
-            self.lower_tile_expr_lane(expressions, scratch, body, fill, spill_depth)?;
+            self.lower_tile_expr_lane(expressions, scratch, body, masked.fill, masked.spill_depth)?;
         let fill_handle = self.cast_tile_value(
             expressions,
             body,
@@ -487,10 +542,12 @@ impl<'a> Lowerer<'a> {
             expressions,
             scratch,
             body,
-            mask,
-            spill_depth,
-            ElementType::F32,
-            fill_handle,
+            MaskedLocalValue {
+                mask: masked.mask,
+                element: ElementType::F32,
+                fill: fill_handle,
+                spill_depth: masked.spill_depth,
+            },
             lower_value,
         )
     }
@@ -500,26 +557,24 @@ impl<'a> Lowerer<'a> {
         expressions: &mut Arena<Expression>,
         scratch: ScratchLocals,
         body: &mut Block,
-        mask: &Expr,
-        spill_depth: usize,
-        element: ElementType,
-        fill: Handle<Expression>,
+        masked: MaskedLocalValue<'_>,
         lower_accept_value: impl FnOnce(
             &mut Arena<Expression>,
             &mut Block,
         ) -> Result<Handle<Expression>, LowerError>,
     ) -> Result<Handle<Expression>, LowerError> {
-        let tmp = Self::tile_value_local(scratch, element)?;
+        let tmp = Self::tile_value_local(scratch, masked.element)?;
         let tmp_ptr = self.local_var(expressions, tmp);
         body.push(
             Statement::Store {
                 pointer: tmp_ptr,
-                value: fill,
+                value: masked.fill,
             },
             Span::default(),
         );
 
-        let mask = self.lower_tile_expr_lane(expressions, scratch, body, mask, spill_depth)?;
+        let mask =
+            self.lower_tile_expr_lane(expressions, scratch, body, masked.mask, masked.spill_depth)?;
         let mut accept = Block::new();
         let value = lower_accept_value(expressions, &mut accept)?;
         accept.push(

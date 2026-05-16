@@ -1,9 +1,11 @@
 use fusor_tile_ir::{
-    F32Bits, KernelBuilder, KernelTensorRef, Layout, MemoryLevel, NagaKernel, Shape, F32,
+    tile, F32Bits, GgmlQuantFormat, KernelBuilder, KernelTensorRef, Layout, MemoryLevel,
+    NagaKernel, Shape, F32,
 };
 use fusor_tile_ir_kernels::{
-    flash_attention, linear_storage_layout, rms_norm_vec4, FlashAttentionDims, FlashAttentionMeta,
-    RmsNormVec4Meta, TensorMeta,
+    flash_attention, linear_storage_layout, qdequantize, qgemv, qgemv_q4k_paired_4x2, qmatmul,
+    quantized_matrix, rms_norm_vec4, FlashAttentionDims, FlashAttentionMeta, PairedEpilogue,
+    Q4KPairedGgml, RmsNormVec4, RmsNormVec4Meta, TensorMeta,
 };
 
 fn lower_or_fail(ir: &fusor_tile_ir::KernelIr, label: &str) -> NagaKernel {
@@ -66,7 +68,105 @@ fn rms_norm_vec4_minimal_lowers() {
         output_offset_vec: 0,
         output_row_stride_vec: 1,
     };
-    rms_norm_vec4(&mut kb, input, None, weight, None, output, meta, 1).unwrap();
+    rms_norm_vec4(
+        &mut kb,
+        RmsNormVec4 {
+            input,
+            residual: None,
+            weight,
+            bias: None,
+            output,
+            meta,
+            rows: 1,
+        },
+    )
+    .unwrap();
     let (ir, _) = kb.finish();
     lower_or_fail(&ir, "rms_norm_vec4");
+}
+
+fn qgemv_ir(format: GgmlQuantFormat, rows: u32, cols: u32) -> fusor_tile_ir::KernelIr {
+    tile::build(|program| {
+        let a = program.storage_read::<F32, 2>(Shape::new([1, rows]));
+        let b = quantized_matrix(program, format, rows, cols);
+        let y = program.storage_write::<F32, 2>(Shape::new([1, cols]));
+        qgemv::<4, 64>(program, &a, &b, &y, 4, 1);
+    })
+}
+
+#[test]
+fn generic_q8_qgemv_lowers() {
+    let ir = qgemv_ir(GgmlQuantFormat::Q8_0, 256, 1024);
+    lower_or_fail(&ir, "q8_0 qgemv");
+}
+
+#[test]
+fn q4k_ggml_qgemv_lowers() {
+    let ir = qgemv_ir(GgmlQuantFormat::Q4K, 4096, 8192);
+    lower_or_fail(&ir, "q4k ggml qgemv");
+}
+
+#[test]
+fn q6k_ggml_qgemv_lowers() {
+    let ir = qgemv_ir(GgmlQuantFormat::Q6K, 4096, 8192);
+    lower_or_fail(&ir, "q6k ggml qgemv");
+}
+
+#[test]
+fn q4k_paired_epilogue_lowers() {
+    let ir = tile::build(|program| {
+        let rows = 4096;
+        let pair_cols = 4096;
+        let a = program.storage_read::<F32, 2>(Shape::new([1, rows]));
+        let b = quantized_matrix(program, GgmlQuantFormat::Q4K, rows, pair_cols * 2);
+        let y = program.storage_write::<F32, 2>(Shape::new([1, pair_cols]));
+        let epilogue =
+            PairedEpilogue::with_extras("mul", 0, |tiles| tiles[0].clone() * tiles[1].clone());
+        qgemv_q4k_paired_4x2(
+            program,
+            Q4KPairedGgml {
+                a: &a,
+                b: &b,
+                y: &y,
+                pair_cols,
+                m_rows: 1,
+                workgroups_x: 1,
+                epilogue: &epilogue,
+                extras: &[],
+            },
+        );
+    });
+    lower_or_fail(&ir, "q4k paired qgemv");
+}
+
+#[test]
+fn scalar_qmatmul_lowers() {
+    let ir = tile::build(|program| {
+        let a = program.storage_read::<F32, 2>(Shape::new([8, 256]));
+        let b = quantized_matrix(program, GgmlQuantFormat::Q8_0, 256, 16);
+        let y = program.storage_write::<F32, 2>(Shape::new([8, 16]));
+        qmatmul::<8, 4, 8>(program, &a, &b, &y, 4);
+    });
+    lower_or_fail(&ir, "scalar qmatmul");
+}
+
+#[test]
+fn cooperative_qmatmul_lowers() {
+    let ir = tile::build(|program| {
+        let a = program.storage_read::<F32, 2>(Shape::new([64, 256]));
+        let b = quantized_matrix(program, GgmlQuantFormat::Q8_0, 256, 64);
+        let y = program.storage_write::<F32, 2>(Shape::new([64, 64]));
+        qmatmul::<64, 64, 32>(program, &a, &b, &y, 4);
+    });
+    lower_or_fail(&ir, "cooperative qmatmul");
+}
+
+#[test]
+fn qdequantize_lowers() {
+    let ir = tile::build(|program| {
+        let b = quantized_matrix(program, GgmlQuantFormat::Q4K, 256, 4);
+        let y = program.storage_write::<F32, 1>(Shape::new([1024]));
+        qdequantize(program, &b, &y, 1);
+    });
+    lower_or_fail(&ir, "qdequantize");
 }

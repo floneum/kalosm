@@ -189,14 +189,11 @@ impl Operation for QEmbeddingOperation {
                     embedding_dim,
                     num_embeddings,
                 );
-                let indexes = kb.read_erased::<2>(
-                    tile_ir::ElementType::U32,
-                    tile_ir::KernelTensorRef::with_offset(
-                        indexes_buffer,
-                        indexes_layout,
-                        indexes_offset,
-                    ),
-                );
+                let indexes = kb.read::<tile_ir::U32, 2>(tile_ir::KernelTensorRef::with_offset(
+                    indexes_buffer,
+                    indexes_layout,
+                    indexes_offset,
+                ));
                 let y = kb.write::<tile_ir::F32, 2>(tile_ir::KernelTensorRef::with_offset(
                     output_buffer,
                     output_layout,
@@ -204,21 +201,21 @@ impl Operation for QEmbeddingOperation {
                 ));
                 kb.program()
                     .program_grid::<BLOCK>(dispatch_size, |program| {
-                        let lane = program.arange();
+                        let lane = program.lane();
                         let group = program.program_id(tile_ir::WorkgroupAxis::X)
                             + program.program_id(tile_ir::WorkgroupAxis::Y) * dispatch_size[0];
                         let flat = group * BLOCK as u32 + lane;
                         let in_bounds = flat.clone().lt(total);
                         let dim = flat.clone() % embedding_dim;
                         let index_pos = flat / embedding_dim;
-                        let token = program.load_erased(
-                            indexes.at(0, index_pos.clone()),
+                        let token = program.load_literal(
+                            indexes.at((0, index_pos.clone())),
                             in_bounds.clone(),
                             tile_ir::TileLiteral::U32(0),
                         );
                         let value =
                             program.load_quantized(&q, dim.clone(), token, in_bounds.clone(), 0.0);
-                        program.store(y.at(index_pos, dim), value, in_bounds);
+                        program.store(y.at((index_pos, dim)), value, in_bounds);
                     });
                 Some(())
             },

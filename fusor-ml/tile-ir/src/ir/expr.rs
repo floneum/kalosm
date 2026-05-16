@@ -1,8 +1,8 @@
 use crate::quantized::QuantizedMatrix;
 
 use super::{
-    BlockDequantId, ElementType, LocalRef, StorageView, TileBinaryOp, TileCompareOp, TileLiteral,
-    TileReduceOp, TileRef, TileUnaryOp, WorkgroupAxis,
+    BlockDequantId, ElementType, LocalId, LocalRef, ScalarElement, StorageView, TileBinaryOp,
+    TileCompareOp, TileLiteral, TileReduceOp, TileRef, TileUnaryOp, WorkgroupAxis,
 };
 
 /// Built-in u32 quantities that show up as leaves in index/address arithmetic.
@@ -12,8 +12,6 @@ use super::{
 pub enum Builtin {
     /// `@builtin(local_invocation_index)` — flat lane within the workgroup.
     Lane,
-    /// Current iteration counter of the innermost structured `Fold` / `Loop`.
-    LoopIndex,
     /// `@builtin(workgroup_id).{x|y|z}`.
     ProgramId(WorkgroupAxis),
     /// `@builtin(subgroup_id)`.
@@ -45,10 +43,14 @@ pub enum Expr {
     /// `group_size` is the contiguous-lane group reduced together — typically
     /// the full workgroup, but smaller power-of-two groups are supported. When
     /// `iterations > 1`, `value` is first accumulated across that many loop
-    /// iterations per lane before the cross-lane tree.
+    /// iterations per lane before the cross-lane tree, and `iter_var` is the
+    /// U32 local that the lowerer stores the current iteration into so the
+    /// `value` expression can reference it via `LoadLocal(iter_var)`. For
+    /// `iterations == 1`, `iter_var` is `None`.
     Reduce {
         op: TileReduceOp,
         iterations: u32,
+        iter_var: Option<LocalId>,
         value: Box<Expr>,
         scratch: TileRef,
         group_size: u32,
@@ -102,16 +104,18 @@ pub enum Expr {
         block_n: u32,
         lane: u32,
     },
-    /// Dot product between two `vec4<f32>` expressions.
-    Vec4Dot {
+    /// Dot product between two vector expressions.
+    VectorDot {
+        scalar: ScalarElement,
+        lanes: u32,
         left: Box<Expr>,
         right: Box<Expr>,
     },
-    /// `vec4<f32>(values[0], values[1], values[2], values[3])`. Combined with
-    /// `Vec4Dot` this expresses the fused 4-way dot product the qgemv
-    /// accelerator emits.
-    Compose4 {
-        values: [Box<Expr>; 4],
+    /// Compose scalar values into a vector expression.
+    ComposeVector {
+        scalar: ScalarElement,
+        lanes: u32,
+        values: Vec<Expr>,
     },
     /// Per-column dot of activations against a dequantized quantized-matrix
     /// block. The activation packing (`activations`) and the K coordinate
@@ -183,8 +187,12 @@ impl Expr {
             Expr::Compare { .. } => ElementType::Bool,
             Expr::SubgroupReduce { value, .. } => value.element(),
             Expr::QuantizedBlockLane { .. } => ElementType::F32,
-            Expr::Vec4Dot { .. } | Expr::QuantizedDot { .. } => ElementType::F32,
-            Expr::Compose4 { .. } => ElementType::F32Vec4,
+            Expr::VectorDot { scalar, .. } => scalar.element(),
+            Expr::QuantizedDot { .. } => ElementType::F32,
+            Expr::ComposeVector { scalar, lanes, .. } => ElementType::Vector {
+                scalar: *scalar,
+                lanes: *lanes,
+            },
         }
     }
 
@@ -213,7 +221,7 @@ pub enum LoadSource {
 
 /// A masked rank-2 tile load. `fill` is the masked-out value — typically a
 /// `Literal`, but any expression evaluable in the surrounding scope is
-/// allowed (e.g. `Compose4` for a vec4 splat constant). When `src` is
+/// allowed (e.g. `ComposeVector` for a vector splat constant). When `src` is
 /// `Quantized`, the load dequantizes on the fly and the result is `f32`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TileLoadExpr {

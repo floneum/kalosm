@@ -15,6 +15,7 @@ use crate::{
             tile_storage_write_with_direct_layout,
         },
     },
+    nary_direct::apply_unary_function_chain,
     nary_wise::UnaryFunctionChain,
     tensor::{DataType, DataTypeEnum, TensorData},
 };
@@ -258,11 +259,6 @@ impl MatMulOperation {
 
     fn can_use_direct_tile_matmul(&self) -> bool {
         self.datatype == DataTypeEnum::F32
-            && self
-                .pre_element_wise
-                .iter()
-                .all(|chain| chain.functions.is_empty())
-            && self.post_element_wise.functions.is_empty()
     }
 
     fn build_direct_tile_matmul(
@@ -284,16 +280,74 @@ impl MatMulOperation {
         }
 
         let variant = select_direct_tile_matmul_variant(m, k, n);
+        let pre_a = self.pre_element_wise[0]
+            .functions
+            .is_empty()
+            .then_some(())
+            .is_none()
+            .then(|| {
+                let chain = self.pre_element_wise[0].clone();
+                let datatype = chain.input_datatype();
+                tile_ir_kernels::UnaryEpilogue::new("matmul_pre_a_chain", move |tile| {
+                    apply_unary_function_chain(tile, datatype, &chain)
+                        .expect("pre-chain validated at fuse time")
+                        .0
+                })
+            });
+        let pre_b = self.pre_element_wise[1]
+            .functions
+            .is_empty()
+            .then_some(())
+            .is_none()
+            .then(|| {
+                let chain = self.pre_element_wise[1].clone();
+                let datatype = chain.input_datatype();
+                tile_ir_kernels::UnaryEpilogue::new("matmul_pre_b_chain", move |tile| {
+                    apply_unary_function_chain(tile, datatype, &chain)
+                        .expect("pre-chain validated at fuse time")
+                        .0
+                })
+            });
+        let post = self
+            .post_element_wise
+            .functions
+            .is_empty()
+            .then_some(())
+            .is_none()
+            .then(|| {
+                let chain = self.post_element_wise.clone();
+                let datatype = chain.input_datatype();
+                tile_ir_kernels::UnaryEpilogue::new("matmul_post_chain", move |tile| {
+                    apply_unary_function_chain(tile, datatype, &chain)
+                        .expect("post-chain validated at fuse time")
+                        .0
+                })
+            });
+        let epilogue_identity = pre_a.as_ref().map(|e| e.identity()).unwrap_or(0)
+            ^ pre_b.as_ref().map(|e| e.identity()).unwrap_or(0)
+            ^ post.as_ref().map(|e| e.identity()).unwrap_or(0);
         let ir = tile_ir::tile::build(move |phase| {
             let a = tile_storage_read_with_direct_layout(phase, a_view);
             let b = tile_storage_read_with_direct_layout(phase, b_view);
             let y = tile_storage_write_with_direct_layout(phase, y_view);
+            let epilogues = tile_ir_kernels::DenseMatmulEpilogues {
+                pre_a: pre_a.as_ref(),
+                pre_b: pre_b.as_ref(),
+                post: post.as_ref(),
+            };
             match variant {
                 DirectTileMatmulVariant::Gemv => {
-                    tile_ir_kernels::gemv::<4, 4, 128>(phase, &a, &b, &y)
+                    if epilogues.pre_a.is_none()
+                        && epilogues.pre_b.is_none()
+                        && epilogues.post.is_none()
+                    {
+                        tile_ir_kernels::gemv::<4, 4, 128>(phase, &a, &b, &y)
+                    } else {
+                        tile_ir_kernels::matmul_with_epilogues::<256>(phase, &a, &b, &y, &epilogues)
+                    }
                 }
                 DirectTileMatmulVariant::MatMul => {
-                    tile_ir_kernels::matmul::<256>(phase, &a, &b, &y)
+                    tile_ir_kernels::matmul_with_epilogues::<256>(phase, &a, &b, &y, &epilogues)
                 }
             }
         });
@@ -307,8 +361,12 @@ impl MatMulOperation {
             input_b.clone().into(),
             output.clone().into(),
         ];
-        let cache_key =
-            self.kernel_cache_key_with_dispatch("matmul_tile_direct", None, dispatch_size, &inputs);
+        let cache_key = self.kernel_cache_key_with_dispatch(
+            &format!("matmul_tile_direct:epilogue={epilogue_identity:#018x}"),
+            None,
+            dispatch_size,
+            &inputs,
+        );
 
         kernel_backend::dynamic_kernel_from_ir(
             device,

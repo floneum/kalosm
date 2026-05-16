@@ -1,90 +1,188 @@
 use fusor_tile_ir::{
-    tile::{Mask, Tile, TileBlock},
     TileLiteral,
+    tile::{Range, ScalarIndex, Tile, TileBlock},
 };
 
 pub(super) const TOP_K_BLOCK: usize = 256;
 pub(super) const MAX_F32: f32 = f32::MAX;
 pub(super) const NEG_MAX_F32: f32 = -f32::MAX;
 
-pub(super) fn all<const BLOCK: usize>() -> Mask<BLOCK> {
-    Mask::all()
+/// One component of a strided tensor index.
+pub(super) enum IndexComponent<const BLOCK: usize> {
+    /// Compile-time scalar component that can be folded into the base offset.
+    Static(u32),
+    /// Per-lane component that must remain in the tile expression.
+    Dynamic(Box<Tile<BLOCK>>),
 }
 
-pub(super) fn f32_tile<const BLOCK: usize>(value: f32) -> Tile<BLOCK> {
-    Tile::literal(TileLiteral::f32(value))
+/// Convert one scalar or per-lane value into an index component.
+pub(super) trait Index<const BLOCK: usize> {
+    /// Consume or clone into a component usable by [`index_n`].
+    fn into_component(self) -> IndexComponent<BLOCK>;
 }
 
-pub(super) fn u32_tile<const BLOCK: usize>(value: u32) -> Tile<BLOCK> {
-    Tile::literal(TileLiteral::U32(value))
+impl<const BLOCK: usize> Index<BLOCK> for u32 {
+    fn into_component(self) -> IndexComponent<BLOCK> {
+        IndexComponent::Static(self)
+    }
 }
 
-pub(super) fn add_scaled_index<const BLOCK: usize>(
-    index: Tile<BLOCK>,
-    component: Tile<BLOCK>,
-    stride: u32,
-) -> Tile<BLOCK> {
-    match stride {
-        0 => index,
-        1 => index + component,
-        _ => index + component * u32_tile(stride),
+impl<const BLOCK: usize> Index<BLOCK> for Tile<BLOCK> {
+    fn into_component(self) -> IndexComponent<BLOCK> {
+        IndexComponent::Dynamic(Box::new(self))
+    }
+}
+
+impl<const BLOCK: usize> Index<BLOCK> for &Tile<BLOCK> {
+    fn into_component(self) -> IndexComponent<BLOCK> {
+        IndexComponent::Dynamic(Box::new(self.clone()))
+    }
+}
+
+impl<const BLOCK: usize> Index<BLOCK> for Range<BLOCK> {
+    fn into_component(self) -> IndexComponent<BLOCK> {
+        IndexComponent::Dynamic(Box::new(Tile::from_index(self)))
+    }
+}
+
+impl<const BLOCK: usize> Index<BLOCK> for &Range<BLOCK> {
+    fn into_component(self) -> IndexComponent<BLOCK> {
+        IndexComponent::Dynamic(Box::new(Tile::from_index(self)))
+    }
+}
+
+impl<const BLOCK: usize> Index<BLOCK> for ScalarIndex {
+    fn into_component(self) -> IndexComponent<BLOCK> {
+        IndexComponent::Dynamic(Box::new(Tile::from_index(self)))
+    }
+}
+
+impl<const BLOCK: usize> Index<BLOCK> for &ScalarIndex {
+    fn into_component(self) -> IndexComponent<BLOCK> {
+        IndexComponent::Dynamic(Box::new(Tile::from_index(self)))
+    }
+}
+
+/// Convert a rank-`R` list of components into index components.
+pub(super) trait IntoIndex<const R: usize, const BLOCK: usize> {
+    /// Consume the list while preserving component order.
+    fn into_indices(self) -> [IndexComponent<BLOCK>; R];
+}
+
+impl<I, const R: usize, const BLOCK: usize> IntoIndex<R, BLOCK> for [I; R]
+where
+    I: Index<BLOCK>,
+{
+    fn into_indices(self) -> [IndexComponent<BLOCK>; R] {
+        self.map(Index::into_component)
+    }
+}
+
+impl<I, const BLOCK: usize> IntoIndex<1, BLOCK> for I
+where
+    I: Index<BLOCK>,
+{
+    fn into_indices(self) -> [IndexComponent<BLOCK>; 1] {
+        [self.into_component()]
+    }
+}
+
+impl<Prefix, Last, const BLOCK: usize> IntoIndex<2, BLOCK> for (Prefix, Last)
+where
+    Prefix: IntoIndex<1, BLOCK>,
+    Last: Index<BLOCK>,
+{
+    fn into_indices(self) -> [IndexComponent<BLOCK>; 2] {
+        let [i0] = self.0.into_indices();
+        [i0, self.1.into_component()]
+    }
+}
+
+impl<Prefix, Last, const BLOCK: usize> IntoIndex<3, BLOCK> for (Prefix, Last)
+where
+    Prefix: IntoIndex<2, BLOCK>,
+    Last: Index<BLOCK>,
+{
+    fn into_indices(self) -> [IndexComponent<BLOCK>; 3] {
+        let [i0, i1] = self.0.into_indices();
+        [i0, i1, self.1.into_component()]
+    }
+}
+
+impl<A, B, C, const BLOCK: usize> IntoIndex<3, BLOCK> for (A, B, C)
+where
+    A: Index<BLOCK>,
+    B: Index<BLOCK>,
+    C: Index<BLOCK>,
+{
+    fn into_indices(self) -> [IndexComponent<BLOCK>; 3] {
+        [
+            self.0.into_component(),
+            self.1.into_component(),
+            self.2.into_component(),
+        ]
+    }
+}
+
+impl<Prefix, Last, const BLOCK: usize> IntoIndex<4, BLOCK> for (Prefix, Last)
+where
+    Prefix: IntoIndex<3, BLOCK>,
+    Last: Index<BLOCK>,
+{
+    fn into_indices(self) -> [IndexComponent<BLOCK>; 4] {
+        let [i0, i1, i2] = self.0.into_indices();
+        [i0, i1, i2, self.1.into_component()]
+    }
+}
+
+impl<A, B, C, D, const BLOCK: usize> IntoIndex<4, BLOCK> for (A, B, C, D)
+where
+    A: Index<BLOCK>,
+    B: Index<BLOCK>,
+    C: Index<BLOCK>,
+    D: Index<BLOCK>,
+{
+    fn into_indices(self) -> [IndexComponent<BLOCK>; 4] {
+        [
+            self.0.into_component(),
+            self.1.into_component(),
+            self.2.into_component(),
+            self.3.into_component(),
+        ]
     }
 }
 
 /// `offset + sum(strides[i] * components[i])`. Strided index into a
 /// rank-`N` row-major tensor, with a constant scalar offset folded in. The
-/// `add_scaled_index` shortcut elides the multiply when the corresponding
-/// stride is zero.
-pub(super) fn index_n<const N: usize, const BLOCK: usize>(
+/// fold elides the multiply when the corresponding stride is zero.
+pub(super) fn index_n<const R: usize, const BLOCK: usize>(
     offset: u32,
-    strides: [u32; N],
-    components: [Tile<BLOCK>; N],
+    strides: [u32; R],
+    components: impl IntoIndex<R, BLOCK>,
 ) -> Tile<BLOCK> {
-    components
-        .into_iter()
-        .zip(strides)
-        .fold(u32_tile(offset), |idx, (c, s)| add_scaled_index(idx, c, s))
-}
+    let mut folded_offset = offset;
+    let mut dynamic_components = Vec::with_capacity(R);
+    for (component, stride) in components.into_indices().into_iter().zip(strides) {
+        match component {
+            IndexComponent::Static(value) => {
+                folded_offset = folded_offset.wrapping_add(value.wrapping_mul(stride));
+            }
+            IndexComponent::Dynamic(component) => {
+                if stride != 0 {
+                    dynamic_components.push((*component, stride));
+                }
+            }
+        }
+    }
 
-pub(super) fn index2<const BLOCK: usize>(
-    offset: u32,
-    strides: [u32; 2],
-    i0: Tile<BLOCK>,
-    i1: Tile<BLOCK>,
-) -> Tile<BLOCK> {
-    index_n(offset, strides, [i0, i1])
-}
-
-pub(super) fn index4<const BLOCK: usize>(
-    offset: u32,
-    strides: [u32; 4],
-    i0: Tile<BLOCK>,
-    i1: Tile<BLOCK>,
-    i2: Tile<BLOCK>,
-    i3: Tile<BLOCK>,
-) -> Tile<BLOCK> {
-    index_n(offset, strides, [i0, i1, i2, i3])
-}
-
-pub(super) fn index4_const_last<const BLOCK: usize>(
-    offset: u32,
-    strides: [u32; 4],
-    i0: Tile<BLOCK>,
-    i1: Tile<BLOCK>,
-    i2: Tile<BLOCK>,
-    i3: u32,
-) -> Tile<BLOCK> {
-    let base = offset + i3 * strides[3];
-    index_n(base, [strides[0], strides[1], strides[2]], [i0, i1, i2])
-}
-
-/// `lane == 0` mask for the common "only one lane writes" pattern in
-/// kernels that broadcast a result via lane-zero stores.
-pub(super) fn lane_zero<const BLOCK: usize>(
-    program: &TileBlock<'_, BLOCK>,
-    lane: &fusor_tile_ir::tile::Range<BLOCK>,
-) -> Tile<BLOCK> {
-    program.index(lane.clone()).eq(u32_tile(0))
+    dynamic_components.into_iter().fold(
+        Tile::literal(TileLiteral::U32(folded_offset)),
+        |index, (component, stride)| match stride {
+            0 => index,
+            1 => index + component,
+            _ => index + component * Tile::literal(TileLiteral::U32(stride)),
+        },
+    )
 }
 
 /// Tree-reduce a workgroup-scratch array by halving stride, applying
@@ -99,7 +197,9 @@ pub(super) fn reduce_workgroup<const BLOCK: usize>(
 ) {
     let mut stride = BLOCK as u32 / 2;
     while stride > 0 {
-        let participates = program.index(lane.clone()).lt(u32_tile(stride));
+        let participates = program
+            .index(lane.clone())
+            .lt(Tile::literal(TileLiteral::U32(stride)));
         program.if_then(participates, |program| {
             let lhs = program.load_workgroup(scratch, lane.clone());
             let rhs_index = lane.clone() + stride;

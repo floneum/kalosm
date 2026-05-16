@@ -88,13 +88,15 @@ pub(crate) fn sample_from_sorted_top_k_data_with_encoder(
         |kb| {
             tile_ir_kernels::mirostat2(
                 kb,
-                kernel_backend::linear_tensor_ref(ids),
-                kernel_backend::linear_tensor_ref(values),
-                kernel_backend::linear_tensor_ref(&sampler.state),
-                kernel_backend::linear_tensor_ref(&params),
-                kernel_backend::linear_tensor_ref(&output),
-                exactness_flag.map(kernel_backend::linear_tensor_ref),
-                meta,
+                tile_ir_kernels::Mirostat2 {
+                    ids: kernel_backend::linear_tensor_ref(ids),
+                    values: kernel_backend::linear_tensor_ref(values),
+                    state: kernel_backend::linear_tensor_ref(&sampler.state),
+                    params: kernel_backend::linear_tensor_ref(&params),
+                    output: kernel_backend::linear_tensor_ref(&output),
+                    exactness_flag: exactness_flag.map(kernel_backend::linear_tensor_ref),
+                    meta,
+                },
             )
         },
     )?;

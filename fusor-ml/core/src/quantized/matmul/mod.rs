@@ -649,24 +649,29 @@ impl QMatMulOperation {
                     );
                 }
                 QMatmulDirectVariant::Q8Wide64x128 | QMatmulDirectVariant::Tile64x128 => {
-                    if epilogues.post.is_none() && epilogues.pre.is_none() {
-                        tile_ir_kernels::qmatmul::<64, 128, 32>(phase, &a, &b, &y, 4);
-                    } else {
-                        // Multi-row qmatmul tile paths don't yet support
-                        // epilogue fusion. The resolver only attaches an
-                        // epilogue when it can prove this branch isn't taken
-                        // (i.e. single-row qgemv variants).
-                        unreachable!("multi-row qmatmul tile path with epilogue");
-                    }
+                    tile_ir_kernels::qmatmul_with_epilogue::<64, 128, 32>(
+                        phase, &a, &b, &y, 4, &epilogues,
+                    );
                 }
                 QMatmulDirectVariant::Tile128x128 => {
-                    tile_ir_kernels::qmatmul::<128, 128, 32>(phase, &a, &b, &y, 4);
+                    tile_ir_kernels::qmatmul_with_epilogue::<128, 128, 32>(
+                        phase, &a, &b, &y, 4, &epilogues,
+                    );
                 }
                 QMatmulDirectVariant::Tile128x64 => {
-                    tile_ir_kernels::qmatmul::<128, 64, 32>(phase, &a, &b, &y, 4);
+                    tile_ir_kernels::qmatmul_with_epilogue::<128, 64, 32>(
+                        phase, &a, &b, &y, 4, &epilogues,
+                    );
                 }
-                QMatmulDirectVariant::Tile64x64Fast | QMatmulDirectVariant::Tile64x64 => {
-                    tile_ir_kernels::qmatmul::<64, 64, 32>(phase, &a, &b, &y, 4);
+                QMatmulDirectVariant::Tile64x64Fast => {
+                    tile_ir_kernels::qmatmul_with_epilogue::<64, 64, 32>(
+                        phase, &a, &b, &y, 4, &epilogues,
+                    );
+                }
+                QMatmulDirectVariant::Tile64x64 => {
+                    tile_ir_kernels::qmatmul_with_epilogue::<64, 64, 32>(
+                        phase, &a, &b, &y, 4, &epilogues,
+                    );
                 }
             }
         });
@@ -827,7 +832,9 @@ fn qgemv_cols_per_workgroup_for_direct(format: tile_ir::GgmlQuantFormat, k: u32,
         QgemvColsVariant::Q6KSmallWide8 => 8,
         QgemvColsVariant::Q6KLargeNarrow4 => 4,
         QgemvColsVariant::Q8WideAccelerated32 => 4 * 8,
-        QgemvColsVariant::FormatAccelerated => format.qgemv_cols_per_workgroup_for_shape(k, n),
+        QgemvColsVariant::FormatAccelerated => {
+            tile_ir_kernels::qgemv_cols_per_workgroup_for_shape(format, k, n)
+        }
         QgemvColsVariant::Q5Small8 => 8,
         QgemvColsVariant::Default4 => 4,
     }
@@ -1161,7 +1168,19 @@ impl Q4KPairedTile {
     ) {
         macro_rules! emit_tile {
             ($func:path) => {
-                $func(phase, a, b, y, pair_len, m, workgroups_x, epilogue, extras)
+                $func(
+                    phase,
+                    tile_ir_kernels::Q4KPairedGgml {
+                        a,
+                        b,
+                        y,
+                        pair_cols: pair_len,
+                        m_rows: m,
+                        workgroups_x,
+                        epilogue,
+                        extras,
+                    },
+                )
             };
         }
 

@@ -29,7 +29,7 @@ impl<'a> Lowerer<'a> {
                 | GgmlQuantFormat::Q5_0
                 | GgmlQuantFormat::Q5_1
                 | GgmlQuantFormat::Q8_0
-                | GgmlQuantFormat::Q8_1 => unreachable!("legacy formats handled above"),
+                | GgmlQuantFormat::Q8_1 => unreachable!("affine formats handled above"),
             }
         };
         Ok(value)
@@ -441,7 +441,7 @@ impl<'a> Lowerer<'a> {
         body: &mut Block,
     ) -> Result<Handle<Expression>, LowerError> {
         self.q8_activation_pack_pair_dot(expressions, body, k_base, a, |s, e, b, k, off| {
-            s.q4k_q8_activation_dot8(e, matrix, k, col, a, off, b)
+            s.q4k_q8_activation_dot8(e, matrix, QuantDotCoords { k_base: k, col }, a, off, b)
         })
     }
 
@@ -480,8 +480,7 @@ impl<'a> Lowerer<'a> {
         &self,
         expressions: &mut Arena<Expression>,
         matrix: &QuantizedMatrix,
-        k_base: Handle<Expression>,
-        col: Handle<Expression>,
+        coords: QuantDotCoords,
         a: &Q8ActivationPacks,
         pack_offset: usize,
         body: &mut Block,
@@ -492,15 +491,17 @@ impl<'a> Lowerer<'a> {
             ));
         }
 
-        let block = self.q4k_quant_packs8(expressions, matrix, k_base, col, body)?;
+        let block = self.q4k_quant_packs8(expressions, matrix, coords.k_base, coords.col, body)?;
         let total = self.q8_activation_packs_dot(
             expressions,
             body,
             a,
             pack_offset,
-            block.scale,
-            block.data,
-            Some(block.min),
+            Q8ActivationDotRhs {
+                scale: block.scale,
+                packs: block.data,
+                min: Some(block.min),
+            },
         );
         Ok(total)
     }
@@ -523,8 +524,7 @@ impl<'a> Lowerer<'a> {
             return self.q4k_f32_dot_exact::<32, 8>(
                 expressions,
                 matrix,
-                k_base,
-                col,
+                QuantDotCoords { k_base, col },
                 a,
                 true,
                 body,
@@ -534,8 +534,7 @@ impl<'a> Lowerer<'a> {
             return self.q4k_f32_dot_exact::<16, 4>(
                 expressions,
                 matrix,
-                k_base,
-                col,
+                QuantDotCoords { k_base, col },
                 a,
                 false,
                 body,
@@ -563,8 +562,7 @@ impl<'a> Lowerer<'a> {
         &self,
         expressions: &mut Arena<Expression>,
         matrix: &QuantizedMatrix,
-        k_base: Handle<Expression>,
-        col: Handle<Expression>,
+        coords: QuantDotCoords,
         a: &[Handle<Expression>],
         whole_group_pair: bool,
         body: &mut Block,
@@ -575,8 +573,8 @@ impl<'a> Lowerer<'a> {
         let block = self.q4k_quant_values::<N, WORDS>(
             expressions,
             matrix,
-            k_base,
-            col,
+            coords.k_base,
+            coords.col,
             whole_group_pair,
             body,
         )?;

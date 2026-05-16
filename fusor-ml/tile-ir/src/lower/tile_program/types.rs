@@ -16,8 +16,8 @@ impl<'a> Lowerer<'a> {
             ElementType::F16 => Expression::Literal(Literal::F16(half::f16::from_f32(f16_value))),
             ElementType::U32 => Expression::Literal(Literal::U32(u32_value)),
             ElementType::Bool => Expression::Literal(Literal::Bool(bool_value)),
-            ElementType::F32Vec4 => panic!("vec4 reductions are not supported"),
-            ElementType::CoopMatrixF32 { .. } => {
+            ElementType::Vector { .. } => panic!("vector reductions are not supported"),
+            ElementType::CoopMatrix { .. } => {
                 panic!("cooperative-matrix reductions are not supported")
             }
         }
@@ -31,17 +31,15 @@ impl<'a> Lowerer<'a> {
         Self::tile_binary_expression(op.binary(), left, right)
     }
 
-    pub(in crate::lower) fn element_scratch_index(element: ElementType) -> usize {
-        match element {
-            ElementType::F32 => 0,
-            ElementType::F16 => 1,
-            ElementType::U32 => 2,
-            ElementType::F32Vec4 => 3,
-            ElementType::Bool => 4,
-            ElementType::CoopMatrixF32 { .. } => {
-                panic!("cooperative-matrix scratch is not supported")
-            }
-        }
+    pub(in crate::lower) fn element_scratch_index(
+        element: ElementType,
+    ) -> Result<usize, LowerError> {
+        SCRATCH_ELEMENTS
+            .iter()
+            .position(|candidate| *candidate == element)
+            .ok_or(LowerError::UnsupportedOperation(
+                "unsupported tile value type",
+            ))
     }
 
     pub(in crate::lower) fn tile_literal(value: TileLiteral) -> Expression {
@@ -67,9 +65,10 @@ impl<'a> Lowerer<'a> {
                 width: 2,
             },
             ElementType::U32 => Scalar::U32,
-            ElementType::F32Vec4 => Scalar::F32,
             ElementType::Bool => Scalar::BOOL,
-            ElementType::CoopMatrixF32 { .. } => Scalar::F32,
+            ElementType::Vector { scalar, .. } | ElementType::CoopMatrix { scalar, .. } => {
+                Self::scalar_type_inner(scalar).expect("scalar element is supported")
+            }
         }
     }
 

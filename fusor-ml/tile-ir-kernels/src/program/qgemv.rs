@@ -1,0 +1,562 @@
+//! Quantized GEMV program kernels.
+
+use fusor_tile_ir::tile::{Bound, GgmlBlockCoords, Mask, Program, QuantizedDot, Storage, Tile};
+use fusor_tile_ir::{F32, GgmlQuantFormat, QuantizedMatrix, TileLiteral, TileReduceOp};
+
+use crate::dispatch::{
+    QgemvShapeQ4K, QgemvShapeQ6K, q4k_default_large, q4k_default_mid, q4k_default_tall,
+    q4k_large_override, q4k_mid_override, q4k_tall_override, q6k_default_large, q6k_default_tall,
+    q6k_large_override, q6k_tall_override, qgemv_subgroups_per_workgroup_for_shape,
+};
+use crate::grid::{
+    Q4KGgmlIterationRequest, Q6KGgmlIterationRequest, QgemvStoreTarget, dot4_sum,
+    q4k_ggml_iteration, q4k_lane_decomposition, q6k_ggml_iteration, q6k_lane_decomposition,
+    qgemv_grid, qgemv_program_scope,
+};
+use crate::types::matrix_shape;
+
+/// Converts qgemv epilogue inputs into the internal pre/post epilogue bundle.
+///
+/// Public callers normally pass either `Option<&UnaryEpilogue>` for a post-only
+/// epilogue or `&QmatmulEpilogues` for explicit pre/post control.
+pub trait IntoQgemvEpilogues<'a> {
+    /// Convert into a qgemv epilogue bundle.
+    fn into_qgemv_epilogues(self) -> crate::types::QmatmulEpilogues<'a>;
+}
+
+impl<'a> IntoQgemvEpilogues<'a> for Option<&'a crate::UnaryEpilogue> {
+    fn into_qgemv_epilogues(self) -> crate::types::QmatmulEpilogues<'a> {
+        crate::types::QmatmulEpilogues {
+            pre: None,
+            post: self,
+        }
+    }
+}
+
+impl<'a> IntoQgemvEpilogues<'a> for &'a crate::types::QmatmulEpilogues<'a> {
+    fn into_qgemv_epilogues(self) -> crate::types::QmatmulEpilogues<'a> {
+        self.clone()
+    }
+}
+
+/// Top-level quantized GEMV entry.
+///
+/// Equivalent to [`crate::qmatmul`] with `BM = 1`.
+///
+/// ```
+/// use fusor_tile_ir::{tile, GgmlQuantFormat, Shape, F32};
+/// use fusor_tile_ir_kernels::{qgemv, quantized_matrix};
+///
+/// let ir = tile::build(|program| {
+///     let a = program.storage_read::<F32, 2>(Shape::new([1, 256]));
+///     let b = quantized_matrix(program, GgmlQuantFormat::Q4K, 256, 128);
+///     let y = program.storage_write::<F32, 2>(Shape::new([1, 128]));
+///     qgemv::<4, 64>(program, &a, &b, &y, 4, 1);
+/// });
+/// # let _ = ir;
+/// ```
+pub fn qgemv<const BN: usize, const BK: usize>(
+    program: &mut Program,
+    a: &Storage<F32, 2>,
+    b: &QuantizedMatrix,
+    y: &Storage<F32, 2>,
+    vector_width: u32,
+    workgroups_x: u32,
+) {
+    super::qmatmul::qmatmul_options::<1, BN, BK>(
+        program,
+        a,
+        b,
+        y,
+        vector_width,
+        true,
+        workgroups_x,
+    );
+}
+
+/// Variant of [`qgemv`] that threads optional pre/post unary epilogues through
+/// the underlying qgemv variant chosen by `qgemv_tile`.
+pub fn qgemv_with_epilogue<'a, const BN: usize, const BK: usize>(
+    program: &mut Program,
+    a: &Storage<F32, 2>,
+    b: &QuantizedMatrix,
+    y: &Storage<F32, 2>,
+    workgroups_x: u32,
+    epilogues: impl IntoQgemvEpilogues<'a>,
+) {
+    let epilogues = epilogues.into_qgemv_epilogues();
+    qgemv_tile_with_epilogue::<BN, BK>(program, a, b, y, workgroups_x, &epilogues);
+}
+
+/// Variant-dispatched Q4K ggml qgemv. Picks the right monomorphization for
+/// the supplied shape and threads optional unary epilogues through it.
+pub(crate) fn qgemv_q4k_dispatch_with_epilogue(
+    program: &mut Program,
+    shape: QgemvShapeQ4K,
+    a: &Storage<F32, 2>,
+    b: &QuantizedMatrix,
+    y: &Storage<F32, 2>,
+    workgroups_x: u32,
+    epilogues: &crate::types::QmatmulEpilogues<'_>,
+) {
+    macro_rules! emit {
+        ($s:literal, $c:literal, $b:literal) => {
+            qgemv_q4k_ggml_with_epilogue::<$s, $c, $b>(program, a, b, y, workgroups_x, epilogues)
+        };
+    }
+    match shape {
+        QgemvShapeQ4K::Ggml1x4_32 => emit!(1, 4, 32),
+        QgemvShapeQ4K::Ggml1x8_32 => emit!(1, 8, 32),
+        QgemvShapeQ4K::Ggml2x2_64 => emit!(2, 2, 64),
+        QgemvShapeQ4K::Ggml2x3_64 => emit!(2, 3, 64),
+        QgemvShapeQ4K::Ggml2x4_64 => emit!(2, 4, 64),
+        QgemvShapeQ4K::Ggml2x8_64 => emit!(2, 8, 64),
+        QgemvShapeQ4K::Ggml4x1_128 => emit!(4, 1, 128),
+        QgemvShapeQ4K::Ggml4x2_128 => emit!(4, 2, 128),
+        QgemvShapeQ4K::Ggml4x3_128 => emit!(4, 3, 128),
+        QgemvShapeQ4K::Ggml4x4_128 => emit!(4, 4, 128),
+        QgemvShapeQ4K::Ggml4x8_128 => emit!(4, 8, 128),
+        QgemvShapeQ4K::Ggml8x1_256 => emit!(8, 1, 256),
+        QgemvShapeQ4K::Ggml8x2_256 => emit!(8, 2, 256),
+        QgemvShapeQ4K::Ggml8x4_256 => emit!(8, 4, 256),
+    }
+}
+
+/// Variant-dispatched Q6K ggml qgemv. Same role as the Q4K dispatch helper,
+/// but for Q6K shapes.
+pub(crate) fn qgemv_q6k_dispatch_with_epilogue(
+    program: &mut Program,
+    shape: QgemvShapeQ6K,
+    a: &Storage<F32, 2>,
+    b: &QuantizedMatrix,
+    y: &Storage<F32, 2>,
+    workgroups_x: u32,
+    epilogues: &crate::types::QmatmulEpilogues<'_>,
+) {
+    macro_rules! emit {
+        ($s:literal, $c:literal, $b:literal) => {
+            qgemv_q6k_ggml_with_epilogue::<$s, $c, $b>(program, a, b, y, workgroups_x, epilogues)
+        };
+    }
+    match shape {
+        QgemvShapeQ6K::Ggml2x2_64 => emit!(2, 2, 64),
+        QgemvShapeQ6K::Ggml2x4_64 => emit!(2, 4, 64),
+        QgemvShapeQ6K::Ggml2x8_64 => emit!(2, 8, 64),
+        QgemvShapeQ6K::Ggml4x2_128 => emit!(4, 2, 128),
+        QgemvShapeQ6K::Ggml4x4_128 => emit!(4, 4, 128),
+        QgemvShapeQ6K::Ggml4x8_128 => emit!(4, 8, 128),
+        QgemvShapeQ6K::Ggml8x2_256 => emit!(8, 2, 256),
+        QgemvShapeQ6K::Ggml8x4_256 => emit!(8, 4, 256),
+    }
+}
+
+/// Format-dispatched qgemv body with optional pre/post unary epilogues.
+pub(crate) fn qgemv_tile_with_epilogue<const BN: usize, const BK: usize>(
+    program: &mut Program,
+    a: &Storage<F32, 2>,
+    b: &QuantizedMatrix,
+    y: &Storage<F32, 2>,
+    workgroups_x: u32,
+    ep: &crate::types::QmatmulEpilogues<'_>,
+) {
+    let [m, _] = matrix_shape(&a.view().layout);
+    assert_eq!(m, 1, "qgemv requires a single input row");
+
+    match b.format {
+        GgmlQuantFormat::Q8_0 => {
+            if b.cols >= 8192 {
+                return qgemv_perf_with_epilogue::<4, 8, 8, 128>(
+                    program,
+                    a,
+                    b,
+                    y,
+                    workgroups_x,
+                    ep,
+                );
+            }
+            qgemv_perf_with_epilogue::<4, 4, 8, 128>(program, a, b, y, workgroups_x, ep)
+        }
+        GgmlQuantFormat::Q8_1 => {
+            qgemv_perf_with_epilogue::<4, 4, 8, 128>(program, a, b, y, workgroups_x, ep)
+        }
+        GgmlQuantFormat::Q4K => {
+            if b.rows <= 4096 && b.cols >= 4096 && b.cols < 8192 {
+                let shape = q4k_mid_override(q4k_default_mid(b.rows, b.cols));
+                return qgemv_q4k_dispatch_with_epilogue(program, shape, a, b, y, workgroups_x, ep);
+            }
+            if b.rows <= 4096 && b.cols <= 4096 {
+                return qgemv_perf_with_epilogue::<8, 4, 16, 256>(
+                    program,
+                    a,
+                    b,
+                    y,
+                    workgroups_x,
+                    ep,
+                );
+            }
+            if b.rows <= 4096 && b.cols >= 8192 {
+                let shape = q4k_large_override(q4k_default_large(b.rows, b.cols));
+                return qgemv_q4k_dispatch_with_epilogue(program, shape, a, b, y, workgroups_x, ep);
+            }
+            if b.rows > 4096 && b.cols <= 4096 {
+                let shape = q4k_tall_override(q4k_default_tall(b.rows, b.cols));
+                return qgemv_q4k_dispatch_with_epilogue(program, shape, a, b, y, workgroups_x, ep);
+            }
+            if qgemv_subgroups_per_workgroup_for_shape(b.format, b.rows, b.cols) == 8 {
+                return qgemv_perf_with_epilogue::<8, 8, 8, 256>(
+                    program,
+                    a,
+                    b,
+                    y,
+                    workgroups_x,
+                    ep,
+                );
+            }
+            qgemv_perf_with_epilogue::<4, 8, 8, 128>(program, a, b, y, workgroups_x, ep)
+        }
+        GgmlQuantFormat::Q5_0 => {
+            qgemv_perf_with_epilogue::<2, 4, 16, 64>(program, a, b, y, workgroups_x, ep)
+        }
+        GgmlQuantFormat::Q4_0
+        | GgmlQuantFormat::Q4_1
+        | GgmlQuantFormat::Q5_1
+        | GgmlQuantFormat::Q2K => {
+            qgemv_perf_with_epilogue::<2, 4, 8, 64>(program, a, b, y, workgroups_x, ep)
+        }
+        GgmlQuantFormat::Q3K | GgmlQuantFormat::Q8K => {
+            qgemv_perf_with_epilogue::<2, 2, 8, 64>(program, a, b, y, workgroups_x, ep)
+        }
+        GgmlQuantFormat::Q5K => {
+            qgemv_perf_with_epilogue::<2, 1, 8, 64>(program, a, b, y, workgroups_x, ep)
+        }
+        GgmlQuantFormat::Q6K => {
+            if b.rows <= 4096 && b.cols >= 8192 {
+                let shape = q6k_large_override(q6k_default_large(b.rows, b.cols));
+                return qgemv_q6k_dispatch_with_epilogue(program, shape, a, b, y, workgroups_x, ep);
+            }
+            if b.rows > 4096 && b.cols <= 4096 {
+                let shape = q6k_tall_override(q6k_default_tall(b.rows, b.cols));
+                return qgemv_q6k_dispatch_with_epilogue(program, shape, a, b, y, workgroups_x, ep);
+            }
+            if qgemv_subgroups_per_workgroup_for_shape(b.format, b.rows, b.cols) == 4 {
+                return qgemv_perf_with_epilogue::<4, 4, 8, 128>(
+                    program,
+                    a,
+                    b,
+                    y,
+                    workgroups_x,
+                    ep,
+                );
+            }
+            qgemv_perf_with_epilogue::<8, 4, 16, 256>(program, a, b, y, workgroups_x, ep)
+        }
+    }
+}
+
+/// Q4K ggml-format qgemv body with optional pre/post unary epilogues.
+pub(crate) fn qgemv_q4k_ggml_with_epilogue<
+    const SUBGROUPS: u32,
+    const COLS_PER_SUBGROUP: usize,
+    const BLOCK: usize,
+>(
+    program: &mut Program,
+    a: &Storage<F32, 2>,
+    b: &QuantizedMatrix,
+    y: &Storage<F32, 2>,
+    workgroups_x: u32,
+    epilogues: &crate::types::QmatmulEpilogues<'_>,
+) {
+    const SUBGROUP_SIZE: u32 = 32;
+    debug_assert_eq!(SUBGROUPS * SUBGROUP_SIZE, BLOCK as u32);
+    debug_assert_eq!(b.format, GgmlQuantFormat::Q4K);
+
+    let [_, k] = matrix_shape(&a.view().layout);
+    let grid = qgemv_grid::<SUBGROUPS, COLS_PER_SUBGROUP>(b.cols, workgroups_x);
+    let block_count = k.div_ceil(256);
+    let block_iterations = block_count.div_ceil(4);
+    let full_block_iterations = block_count.is_multiple_of(4);
+    let b_cloned = b.clone();
+
+    program.program_grid::<BLOCK>([grid.workgroups_x, grid.dispatch_y, 1], |program| {
+        let scope = qgemv_program_scope::<BLOCK, COLS_PER_SUBGROUP>(program, grid);
+        let col0 = scope.col0;
+        let lane = scope.lane;
+        let q4k_lane = q4k_lane_decomposition(&lane);
+
+        let zero = TileLiteral::f32(0.0);
+        let sums: [Tile<BLOCK>; COLS_PER_SUBGROUP] = program.loop_fold_n::<COLS_PER_SUBGROUP, _>(
+            TileReduceOp::Sum,
+            block_iterations,
+            [zero; COLS_PER_SUBGROUP],
+            |program, loop_index| {
+                let pass = q4k_ggml_iteration(
+                    program,
+                    Q4KGgmlIterationRequest {
+                        loop_index,
+                        a,
+                        row: 0,
+                        block_count,
+                        full_block_iterations,
+                        lane: &q4k_lane,
+                        base_mask: Mask::all(),
+                    },
+                );
+
+                std::array::from_fn(|c| {
+                    let col = col0.clone() + c as u32;
+                    let mask = grid.mask(full_block_iterations, pass.in_bounds.clone(), &col);
+                    let coords = GgmlBlockCoords::new::<BLOCK>(
+                        &pass.block,
+                        &q4k_lane.iq,
+                        &q4k_lane.ir,
+                        &col,
+                    );
+                    program.quantized_dot(QuantizedDot::q4k_ggml(
+                        pass.activations.clone(),
+                        &b_cloned,
+                        coords,
+                        mask,
+                        0.0,
+                    ))
+                })
+            },
+        );
+
+        crate::grid::store_qgemv_sums_with_epilogue(
+            program,
+            sums,
+            QgemvStoreTarget {
+                y,
+                col0,
+                lane,
+                full_cols: grid.full_cols,
+                n_cols: grid.n_cols,
+                epilogues,
+            },
+        );
+    });
+}
+
+/// Q6K ggml-format qgemv body with optional pre/post unary epilogues.
+pub(crate) fn qgemv_q6k_ggml_with_epilogue<
+    const SUBGROUPS: u32,
+    const COLS_PER_SUBGROUP: usize,
+    const BLOCK: usize,
+>(
+    program: &mut Program,
+    a: &Storage<F32, 2>,
+    b: &QuantizedMatrix,
+    y: &Storage<F32, 2>,
+    workgroups_x: u32,
+    epilogues: &crate::types::QmatmulEpilogues<'_>,
+) {
+    const SUBGROUP_SIZE: u32 = 32;
+    debug_assert_eq!(SUBGROUPS * SUBGROUP_SIZE, BLOCK as u32);
+    debug_assert_eq!(b.format, GgmlQuantFormat::Q6K);
+
+    let [_, k] = matrix_shape(&a.view().layout);
+    let grid = qgemv_grid::<SUBGROUPS, COLS_PER_SUBGROUP>(b.cols, workgroups_x);
+    let block_count = k.div_ceil(256);
+    let block_iterations = block_count.div_ceil(2);
+    let full_block_iterations = block_count.is_multiple_of(2);
+    let b_cloned = b.clone();
+
+    program.program_grid::<BLOCK>([grid.workgroups_x, grid.dispatch_y, 1], |program| {
+        let scope = qgemv_program_scope::<BLOCK, COLS_PER_SUBGROUP>(program, grid);
+        let col0 = scope.col0;
+        let lane = scope.lane;
+        let q6k_lane = q6k_lane_decomposition(&lane);
+
+        let zero = TileLiteral::f32(0.0);
+        let sums: [Tile<BLOCK>; COLS_PER_SUBGROUP] = program.loop_fold_n::<COLS_PER_SUBGROUP, _>(
+            TileReduceOp::Sum,
+            block_iterations,
+            [zero; COLS_PER_SUBGROUP],
+            |program, loop_index| {
+                let pass = q6k_ggml_iteration(
+                    program,
+                    Q6KGgmlIterationRequest {
+                        loop_index,
+                        a,
+                        row: 0,
+                        block_count,
+                        full_block_iterations,
+                        lane: &q6k_lane,
+                        base_mask: Mask::all(),
+                    },
+                );
+
+                std::array::from_fn(|c| {
+                    let col = col0.clone() + c as u32;
+                    let mask = grid.mask(full_block_iterations, pass.in_bounds.clone(), &col);
+                    let coords = GgmlBlockCoords::new::<BLOCK>(
+                        &pass.block,
+                        &q6k_lane.ip,
+                        &q6k_lane.il,
+                        &col,
+                    );
+                    program.quantized_dot(QuantizedDot::q6k_ggml(
+                        pass.activations.clone(),
+                        &b_cloned,
+                        coords,
+                        mask,
+                        0.0,
+                    ))
+                })
+            },
+        );
+
+        crate::grid::store_qgemv_sums_with_epilogue(
+            program,
+            sums,
+            QgemvStoreTarget {
+                y,
+                col0,
+                lane,
+                full_cols: grid.full_cols,
+                n_cols: grid.n_cols,
+                epilogues,
+            },
+        );
+    });
+}
+
+/// Generic subgroup-partitioned qgemv body with optional pre- and post-reduce
+/// epilogues, covering the formats that don't have a dedicated `qgemv_q*_ggml`
+/// path. `pre` is applied to each loaded activation tile before the dot;
+/// `post` is applied to each per-output tile before the store.
+pub(crate) fn qgemv_perf_with_epilogue<
+    const SUBGROUPS: u32,
+    const COLS_PER_SUBGROUP: usize,
+    const VALUES_PER_LANE: usize,
+    const BLOCK: usize,
+>(
+    program: &mut Program,
+    a: &Storage<F32, 2>,
+    b: &QuantizedMatrix,
+    y: &Storage<F32, 2>,
+    workgroups_x: u32,
+    epilogues: &crate::types::QmatmulEpilogues<'_>,
+) {
+    const SUBGROUP_SIZE: u32 = 32;
+    debug_assert_eq!(SUBGROUPS * SUBGROUP_SIZE, BLOCK as u32);
+    debug_assert!(VALUES_PER_LANE == 8 || VALUES_PER_LANE == 16 || VALUES_PER_LANE == 32);
+    debug_assert!(
+        COLS_PER_SUBGROUP == 1
+            || COLS_PER_SUBGROUP == 2
+            || COLS_PER_SUBGROUP == 4
+            || COLS_PER_SUBGROUP == 8
+    );
+    let [_, k] = matrix_shape(&a.view().layout);
+    let grid = qgemv_grid::<SUBGROUPS, COLS_PER_SUBGROUP>(b.cols, workgroups_x);
+    let k_per_iter = SUBGROUP_SIZE * VALUES_PER_LANE as u32;
+    let k_iterations = k.div_ceil(k_per_iter);
+    let k_size = k;
+    let full_k_iterations = k.is_multiple_of(k_per_iter);
+    let b_cloned = b.clone();
+    let q6k_vocab_f32_dot = b.format == GgmlQuantFormat::Q6K && b.rows <= 4096 && b.cols >= 65_536;
+    program.program_grid::<BLOCK>([grid.workgroups_x, grid.dispatch_y, 1], |program| {
+        let scope = qgemv_program_scope::<BLOCK, COLS_PER_SUBGROUP>(program, grid);
+        let col0 = scope.col0;
+        let lane = scope.lane;
+
+        let zero = TileLiteral::f32(0.0);
+        let sums: [Tile<BLOCK>; COLS_PER_SUBGROUP] = program.loop_fold_n::<COLS_PER_SUBGROUP, _>(
+            TileReduceOp::Sum,
+            k_iterations,
+            [zero; COLS_PER_SUBGROUP],
+            |program, loop_index| {
+                let k_base = loop_index * k_per_iter + lane.clone() * VALUES_PER_LANE as u32;
+                let in_bounds_k = if full_k_iterations {
+                    Mask::all()
+                } else {
+                    k_base.lt(k_size)
+                };
+
+                let a_bound: [Bound<BLOCK>; VALUES_PER_LANE] = std::array::from_fn(|i| {
+                    let scalar = program.load(
+                        a.at((0, k_base.clone() + i as u32)),
+                        in_bounds_k.clone(),
+                        0.0,
+                    );
+                    let scalar = crate::types::apply_optional_epilogue(epilogues.pre, scalar);
+                    program.bind(scalar)
+                });
+
+                let a8 = || -> [Tile<BLOCK>; 8] { std::array::from_fn(|i| a_bound[i].get()) };
+                let an = || -> [Tile<BLOCK>; VALUES_PER_LANE] {
+                    std::array::from_fn(|i| a_bound[i].get())
+                };
+                std::array::from_fn(|c| {
+                    let col = col0.clone() + c as u32;
+                    let mask = grid.mask(full_k_iterations, in_bounds_k.clone(), &col);
+                    if b_cloned.format == GgmlQuantFormat::Q8_0
+                        && VALUES_PER_LANE == 8
+                        && grid.n_cols >= 8192
+                    {
+                        return program.quantized_dot(QuantizedDot::q8_0_dot8(
+                            a8(),
+                            &b_cloned,
+                            &k_base,
+                            &col,
+                            mask,
+                            0.0,
+                        ));
+                    }
+                    if b_cloned.format == GgmlQuantFormat::Q4K
+                        && (VALUES_PER_LANE == 8 || VALUES_PER_LANE == 16 || VALUES_PER_LANE == 32)
+                    {
+                        return program.quantized_dot(QuantizedDot::q4k_f32::<VALUES_PER_LANE>(
+                            an(),
+                            &b_cloned,
+                            &k_base,
+                            &col,
+                            mask,
+                            0.0,
+                        ));
+                    }
+                    if b_cloned.format == GgmlQuantFormat::Q6K && VALUES_PER_LANE == 8 {
+                        return program.quantized_dot(QuantizedDot::q8_0_dot8(
+                            a8(),
+                            &b_cloned,
+                            &k_base,
+                            &col,
+                            mask,
+                            0.0,
+                        ));
+                    }
+                    if b_cloned.format == GgmlQuantFormat::Q6K && !q6k_vocab_f32_dot {
+                        return program.quantized_dot(
+                            QuantizedDot::q8_activation::<VALUES_PER_LANE>(
+                                an(),
+                                &b_cloned,
+                                &k_base,
+                                &col,
+                                mask,
+                                0.0,
+                            ),
+                        );
+                    }
+                    let bs: [Tile<BLOCK>; VALUES_PER_LANE] = program
+                        .load_quantized_block::<VALUES_PER_LANE>(
+                            &b_cloned, &k_base, &col, mask, 0.0,
+                        );
+                    dot4_sum(program, &an(), &bs)
+                })
+            },
+        );
+
+        crate::grid::store_qgemv_sums_with_epilogue(
+            program,
+            sums,
+            QgemvStoreTarget {
+                y,
+                col0,
+                lane,
+                full_cols: grid.full_cols,
+                n_cols: grid.n_cols,
+                epilogues,
+            },
+        );
+    });
+}

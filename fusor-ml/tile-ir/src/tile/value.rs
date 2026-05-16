@@ -5,18 +5,20 @@ use crate::ir::{
     CoopFragmentId, CoopOperandRole, Expr, LocalRef, StorageView, TileBinaryOp, TileCompareOp,
     TileLiteral, TileUnaryOp,
 };
-/// Handle to an 8x8 cooperative-matrix accumulator local.
+/// Handle to a cooperative-matrix accumulator local.
 #[derive(Copy, Clone)]
-pub struct CoopAcc {
+pub struct CoopAcc<T, const ROWS: usize, const COLS: usize> {
     pub(super) local: LocalRef,
+    pub(super) _ty: PhantomData<T>,
 }
 
-/// Handle to a cooperatively-loaded 8x8 fragment SSA value. Reusable across
-/// any number of `coop_mma` calls in the same scope without re-loading.
+/// Handle to a cooperatively-loaded fragment SSA value. Reusable across any
+/// number of compatible `coop_mma` calls in the same scope without re-loading.
 #[derive(Copy, Clone)]
-pub struct CoopFragment {
+pub struct CoopFragment<T, const ROWS: usize, const COLS: usize> {
     pub(super) id: CoopFragmentId,
     pub(super) role: CoopOperandRole,
+    pub(super) _ty: PhantomData<T>,
 }
 
 /// Handle to a bound subexpression. Each call to `get()` returns a fresh
@@ -45,6 +47,7 @@ pub fn range<const BLOCK: usize>(count: Tile<BLOCK>) -> FoldIter {
 }
 
 impl<const BLOCK: usize> Bound<BLOCK> {
+    /// Load the bound value.
     pub fn get(&self) -> Tile<BLOCK> {
         Tile {
             expr: Expr::LoadLocal(self.local),
@@ -52,6 +55,7 @@ impl<const BLOCK: usize> Bound<BLOCK> {
     }
 }
 
+/// Rank-2 storage address.
 pub struct Address<T, const N: usize> {
     pub(super) view: StorageView,
     pub(super) row: Box<Expr>,
@@ -59,48 +63,32 @@ pub struct Address<T, const N: usize> {
     pub(super) _ty: PhantomData<T>,
 }
 
+/// Rank-1 storage address.
 pub struct LinearAddress<T, const N: usize> {
     pub(super) view: StorageView,
     pub(super) index: Box<Expr>,
     pub(super) _ty: PhantomData<T>,
 }
 
+/// Private local handle.
 pub struct Local<T, const N: usize> {
     pub(super) local: LocalRef,
     pub(super) _ty: PhantomData<(T, [(); N])>,
 }
 
-pub struct ErasedAddress<const N: usize> {
-    pub(super) view: StorageView,
-    pub(super) row: Box<Expr>,
-    pub(super) col: Box<Expr>,
-}
-
-#[derive(Clone)]
-pub struct LaneTile2d<const ROWS: usize, const COLS: usize, const N: usize> {
-    pub(super) row: Range<N>,
-    pub(super) col: Range<N>,
-}
-
-impl<const ROWS: usize, const COLS: usize, const N: usize> LaneTile2d<ROWS, COLS, N> {
-    pub fn row(&self) -> Range<N> {
-        self.row.clone()
-    }
-
-    pub fn col(&self) -> Range<N> {
-        self.col.clone()
-    }
-}
-
+/// Convert builder values into a tile index expression.
 pub trait IntoIndex<const N: usize> {
+    /// Consume or clone into an index expression.
     fn into_index(self) -> Box<Expr>;
 }
 
+/// Scalar u32 index expression.
 #[derive(Clone)]
 pub struct ScalarIndex {
     pub(super) expr: Box<Expr>,
 }
 
+/// Per-lane u32 index expression.
 #[derive(Clone)]
 pub struct Range<const N: usize> {
     pub(super) expr: Box<Expr>,
@@ -173,6 +161,7 @@ macro_rules! index_compare_methods {
     ($($name:ident => $op:ident),+ $(,)?) => {
         impl<const N: usize> Range<N> {
             $(
+                #[doc = concat!("Compare this range with a u32 using `", stringify!($name), "`.")]
                 pub fn $name(&self, value: u32) -> Mask<N> {
                     index_compare(self.expr.clone(), TileCompareOp::$op, value)
                 }
@@ -181,6 +170,7 @@ macro_rules! index_compare_methods {
 
         impl ScalarIndex {
             $(
+                #[doc = concat!("Compare this scalar index with a u32 using `", stringify!($name), "`.")]
                 pub fn $name<const N: usize>(&self, value: u32) -> Mask<N> {
                     index_compare(self.expr.clone(), TileCompareOp::$op, value)
                 }
@@ -307,18 +297,21 @@ impl<const N: usize> Add<ScalarIndex> for Range<N> {
     }
 }
 
+/// Per-lane boolean mask.
 #[derive(Clone)]
 pub struct Mask<const N: usize> {
     pub(super) expr: Box<Expr>,
 }
 
 impl<const N: usize> Mask<N> {
+    /// Mask that accepts every lane.
     pub fn all() -> Self {
         Self {
             expr: Box::new(Expr::Literal(TileLiteral::Bool(true))),
         }
     }
 
+    /// Logical conjunction of two masks.
     pub fn and(self, rhs: Self) -> Self {
         Self {
             expr: Box::new(Expr::Binary {
@@ -330,12 +323,14 @@ impl<const N: usize> Mask<N> {
     }
 }
 
+/// Scalar expression reduced to one workgroup value.
 #[derive(Clone)]
 pub struct Scalar {
     pub(super) expr: Expr,
 }
 
 impl Scalar {
+    /// Build an f32 scalar literal.
     pub fn literal(value: f32) -> Self {
         Self {
             expr: Expr::Literal(TileLiteral::f32(value)),
@@ -343,6 +338,7 @@ impl Scalar {
     }
 }
 
+/// Per-lane tile expression.
 #[derive(Clone)]
 pub struct Tile<const N: usize> {
     pub(super) expr: Expr,
@@ -351,6 +347,7 @@ pub struct Tile<const N: usize> {
 macro_rules! tile_unary_methods {
     ($($name:ident => $op:ident),+ $(,)?) => {
         $(
+            #[doc = concat!("Apply unary `", stringify!($op), "`.")]
             pub fn $name(self) -> Self {
                 self.unary(TileUnaryOp::$op)
             }
@@ -361,6 +358,7 @@ macro_rules! tile_unary_methods {
 macro_rules! tile_compare_methods {
     ($($name:ident => $op:ident),+ $(,)?) => {
         $(
+            #[doc = concat!("Compare two tiles with `", stringify!($op), "`.")]
             pub fn $name(self, rhs: Self) -> Self {
                 Self::compare_bool(TileCompareOp::$op, self, rhs)
             }
@@ -371,6 +369,7 @@ macro_rules! tile_compare_methods {
 macro_rules! tile_binary_methods {
     ($($name:ident => $op:ident),+ $(,)?) => {
         $(
+            #[doc = concat!("Apply binary `", stringify!($op), "`.")]
             pub fn $name(self, rhs: Self) -> Self {
                 self.binary(TileBinaryOp::$op, rhs)
             }
@@ -379,12 +378,14 @@ macro_rules! tile_binary_methods {
 }
 
 impl<const N: usize> Tile<N> {
+    /// Build a tile literal.
     pub fn literal(value: TileLiteral) -> Self {
         Self {
             expr: Expr::Literal(value),
         }
     }
 
+    /// Build a tile from an index expression.
     pub fn from_index(index: impl IntoIndex<N>) -> Self {
         Self {
             expr: *index.into_index(),
@@ -412,6 +413,7 @@ impl<const N: usize> Tile<N> {
         Tile { expr: self.expr }
     }
 
+    /// Apply an arbitrary unary operation.
     pub fn unary(self, op: TileUnaryOp) -> Self {
         Self {
             expr: Expr::Unary {
@@ -454,6 +456,7 @@ impl<const N: usize> Tile<N> {
         Tile::select(condition, self, zero)
     }
 
+    /// Cast to another element type.
     pub fn cast(self, to: crate::ElementType) -> Self {
         Self {
             expr: Expr::Cast {
@@ -463,6 +466,7 @@ impl<const N: usize> Tile<N> {
         }
     }
 
+    /// Bitcast to another element type.
     pub fn bitcast(self, to: crate::ElementType) -> Self {
         Self {
             expr: Expr::Bitcast {
@@ -472,6 +476,7 @@ impl<const N: usize> Tile<N> {
         }
     }
 
+    /// Select between two tile values.
     pub fn select(condition: Self, accept: Self, reject: Self) -> Self {
         Self {
             expr: Expr::Select {
@@ -498,6 +503,7 @@ impl<const N: usize> Tile<N> {
         }
     }
 
+    /// Compare two tiles and produce a bool tile.
     pub fn compare_bool(op: TileCompareOp, left: Self, right: Self) -> Self {
         Self {
             expr: Expr::Compare {
@@ -510,6 +516,7 @@ impl<const N: usize> Tile<N> {
 
     tile_compare_methods!(lt => Lt, le => Le, gt => Gt, ge => Ge, eq => Eq, ne => Ne);
 
+    /// Apply an arbitrary binary operation.
     pub fn binary(self, op: TileBinaryOp, rhs: Self) -> Self {
         Tile {
             expr: Expr::Binary {

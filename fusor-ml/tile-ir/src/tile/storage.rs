@@ -3,65 +3,74 @@ use std::marker::PhantomData;
 use super::*;
 use crate::ir::{AxisGroup, Layout, MultiFlattenMap, Shape, StorageView, SubAxis};
 
+/// Typed handle to a storage buffer view declared on a [`Program`].
+///
+/// `T` is the element type exposed to the tile API and `R` is the logical
+/// rank of the view. Use [`Storage::view`] to inspect the underlying
+/// [`StorageView`](crate::StorageView).
 pub struct Storage<T, const R: usize> {
     pub(crate) view: StorageView,
     pub(super) _ty: PhantomData<T>,
 }
 
-/// A storage tensor whose element type is known at runtime.
-#[derive(Clone)]
-pub struct ErasedStorage<const R: usize> {
-    pub(crate) view: StorageView,
+/// Marker for storage whose element type is carried by the [`StorageView`]
+/// instead of a compile-time [`Numeric`] marker.
+pub struct RuntimeElement;
+
+/// Converts rank-specific index arguments into a typed storage address.
+pub trait StorageIndex<T, const R: usize, const N: usize> {
+    /// Address type produced by this index.
+    type Address;
+
+    /// Build an address against `view`.
+    fn address(self, view: StorageView) -> Self::Address;
 }
 
-impl<const R: usize> ErasedStorage<R> {
-    pub fn view(&self) -> &StorageView {
-        &self.view
-    }
-}
+impl<T, const N: usize, I> StorageIndex<T, 1, N> for I
+where
+    I: IntoIndex<N>,
+{
+    type Address = LinearAddress<T, N>;
 
-impl<T> Storage<T, 1> {
-    pub fn at<const N: usize>(&self, index: impl IntoIndex<N>) -> LinearAddress<T, N> {
+    fn address(self, view: StorageView) -> Self::Address {
         LinearAddress {
-            view: self.view.clone(),
-            index: index.into_index(),
+            view,
+            index: self.into_index(),
             _ty: PhantomData,
         }
     }
 }
 
-impl<T> Storage<T, 2> {
-    pub fn at<const N: usize>(
-        &self,
-        row: impl IntoIndex<N>,
-        col: impl IntoIndex<N>,
-    ) -> Address<T, N> {
+impl<T, const N: usize, Row, Col> StorageIndex<T, 2, N> for (Row, Col)
+where
+    Row: IntoIndex<N>,
+    Col: IntoIndex<N>,
+{
+    type Address = Address<T, N>;
+
+    fn address(self, view: StorageView) -> Self::Address {
+        let (row, col) = self;
         Address {
-            view: self.view.clone(),
+            view,
             row: row.into_index(),
             col: col.into_index(),
             _ty: PhantomData,
-        }
-    }
-}
-
-impl ErasedStorage<2> {
-    pub fn at<const N: usize>(
-        &self,
-        row: impl IntoIndex<N>,
-        col: impl IntoIndex<N>,
-    ) -> ErasedAddress<N> {
-        ErasedAddress {
-            view: self.view.clone(),
-            row: row.into_index(),
-            col: col.into_index(),
         }
     }
 }
 
 impl<T, const R: usize> Storage<T, R> {
+    /// Underlying storage view.
     pub fn view(&self) -> &StorageView {
         &self.view
+    }
+
+    /// Address one element in this storage view.
+    pub fn at<const N: usize, I>(&self, index: I) -> I::Address
+    where
+        I: StorageIndex<T, R, N>,
+    {
+        index.address(self.view.clone())
     }
 
     /// Construct a typed storage handle from an existing view. Caller is

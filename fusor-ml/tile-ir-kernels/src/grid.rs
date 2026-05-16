@@ -2,19 +2,21 @@
 //! when the kernels split landed. `tile-ir`'s grid.rs still owns the generic
 //! `tile::build` entry point.
 
-use fusor_tile_ir::tile::{Bound, IntoIndex, Mask, ScalarIndex, Storage, Tile, TileBlock};
-use fusor_tile_ir::{TileLiteral, F32};
+use fusor_tile_ir::tile::{
+    Bound, IntoIndex, Mask, Q4KGgmlActivations, ScalarIndex, Storage, Tile, TileBlock,
+};
+use fusor_tile_ir::{F32, TileLiteral, WorkgroupAxis};
 
 #[derive(Clone, Copy)]
-pub struct QgemvGrid {
-    pub cols_per_workgroup: u32,
-    pub workgroups_x: u32,
-    pub dispatch_y: u32,
-    pub n_cols: u32,
-    pub full_cols: bool,
+pub(crate) struct QgemvGrid {
+    pub(crate) cols_per_workgroup: u32,
+    pub(crate) workgroups_x: u32,
+    pub(crate) dispatch_y: u32,
+    pub(crate) n_cols: u32,
+    pub(crate) full_cols: bool,
 }
 
-pub fn qgemv_grid<const SUBGROUPS: u32, const COLS_PER_SUBGROUP: usize>(
+pub(crate) fn qgemv_grid<const SUBGROUPS: u32, const COLS_PER_SUBGROUP: usize>(
     n_cols: u32,
     requested_workgroups_x: u32,
 ) -> QgemvGrid {
@@ -31,7 +33,7 @@ pub fn qgemv_grid<const SUBGROUPS: u32, const COLS_PER_SUBGROUP: usize>(
 }
 
 impl QgemvGrid {
-    pub fn mask<const BLOCK: usize>(
+    pub(crate) fn mask<const BLOCK: usize>(
         self,
         full_iterations: bool,
         in_bounds: Mask<BLOCK>,
@@ -46,62 +48,57 @@ impl QgemvGrid {
     }
 }
 
-pub fn store_qgemv_sums<const BLOCK: usize, const COLS_PER_SUBGROUP: usize>(
-    program: &mut TileBlock<'_, BLOCK>,
-    y: &Storage<F32, 2>,
-    col0: ScalarIndex,
-    lane: ScalarIndex,
-    sums: [Tile<BLOCK>; COLS_PER_SUBGROUP],
-    full_cols: bool,
-    n_cols: u32,
-) {
-    store_qgemv_sums_with_epilogue(
-        program,
-        y,
-        col0,
-        lane,
-        sums,
-        full_cols,
-        n_cols,
-        &crate::types::QmatmulEpilogues::empty(),
-    );
+#[derive(Clone)]
+pub(crate) struct QgemvProgramScope {
+    pub(crate) col0: ScalarIndex,
+    pub(crate) lane: ScalarIndex,
 }
 
-/// Variant of [`store_qgemv_sums`] that applies an optional post-reduce
-/// epilogue between the subgroup reduce and the store. Used by the resolver
-/// when it has fused a unary post-op chain into the qmatmul. The `pre` slot
-/// is ignored here (pre is applied at load sites by the kernel body).
-pub fn store_qgemv_sums_with_epilogue<const BLOCK: usize, const COLS_PER_SUBGROUP: usize>(
-    program: &mut TileBlock<'_, BLOCK>,
-    y: &Storage<F32, 2>,
-    col0: ScalarIndex,
-    lane: ScalarIndex,
-    sums: [Tile<BLOCK>; COLS_PER_SUBGROUP],
-    full_cols: bool,
-    n_cols: u32,
-    epilogues: &crate::types::QmatmulEpilogues<'_>,
-) {
-    for (offset, sum) in sums.into_iter().enumerate() {
-        let col = col0.clone() + offset as u32;
-        let reduced = program.subgroup_reduce_sum(sum);
-        let value = crate::types::apply_optional_epilogue(epilogues.post, reduced);
-        let mask = if full_cols {
-            lane.eq(0)
-        } else {
-            lane.eq(0).and(col.lt(n_cols))
-        };
-        program.store(y.at(0, col), value, mask);
+pub(crate) struct QgemvStoreTarget<'a> {
+    pub(crate) y: &'a Storage<F32, 2>,
+    pub(crate) col0: ScalarIndex,
+    pub(crate) lane: ScalarIndex,
+    pub(crate) full_cols: bool,
+    pub(crate) n_cols: u32,
+    pub(crate) epilogues: &'a crate::types::QmatmulEpilogues<'a>,
+}
+
+pub(crate) fn qgemv_program_scope<const BLOCK: usize, const COLS_PER_SUBGROUP: usize>(
+    program: &TileBlock<'_, BLOCK>,
+    grid: QgemvGrid,
+) -> QgemvProgramScope {
+    let workgroup = program.program_id(WorkgroupAxis::X)
+        + program.program_id(WorkgroupAxis::Y) * grid.workgroups_x;
+    let col_group_base = workgroup * grid.cols_per_workgroup;
+    let subgroup_col_base = program.subgroup_id() * COLS_PER_SUBGROUP as u32;
+    QgemvProgramScope {
+        col0: col_group_base + subgroup_col_base,
+        lane: program.subgroup_lane(),
     }
 }
 
-#[derive(Clone)]
-pub struct Q4KGgmlActivations<const BLOCK: usize> {
-    pub low: [Tile<BLOCK>; 16],
-    pub high: [Tile<BLOCK>; 16],
-    pub sums: [Tile<BLOCK>; 4],
+/// Store subgroup-reduced qgemv sums, applying an optional post-reduce
+/// epilogue between the subgroup reduce and the store. The `pre` slot is
+/// ignored here because pre-epilogues are applied at load sites by the kernel
+/// body.
+pub(crate) fn store_qgemv_sums_with_epilogue<const BLOCK: usize, const COLS_PER_SUBGROUP: usize>(
+    program: &mut TileBlock<'_, BLOCK>,
+    sums: [Tile<BLOCK>; COLS_PER_SUBGROUP],
+    target: QgemvStoreTarget<'_>,
+) {
+    for (offset, sum) in sums.into_iter().enumerate() {
+        let col = target.col0.clone() + offset as u32;
+        let reduced = program.subgroup_reduce_sum(sum);
+        let value = crate::types::apply_optional_epilogue(target.epilogues.post, reduced);
+        let mut mask = target.lane.eq(0);
+        if !target.full_cols {
+            mask = mask.and(col.lt(target.n_cols));
+        }
+        program.store(target.y.at((0, col)), value, mask);
+    }
 }
 
-pub fn q4k_ggml_activations<const BLOCK: usize>(
+pub(crate) fn q4k_ggml_activations<const BLOCK: usize>(
     program: &mut TileBlock<'_, BLOCK>,
     a: &Storage<F32, 2>,
     row: impl Clone + IntoIndex<BLOCK>,
@@ -112,7 +109,7 @@ pub fn q4k_ggml_activations<const BLOCK: usize>(
         std::array::from_fn(|j| {
             let offset = if j < 8 { j as u32 } else { (j - 8) as u32 + 32 } + base;
             let scalar = program.load(
-                a.at(row.clone(), vector_base.clone() + offset),
+                a.at((row.clone(), vector_base.clone() + offset)),
                 in_bounds.clone(),
                 0.0,
             );
@@ -131,24 +128,24 @@ pub fn q4k_ggml_activations<const BLOCK: usize>(
         sums[3] = sums[3].clone() + high[j + 8].get();
     }
 
-    Q4KGgmlActivations {
-        low: std::array::from_fn(|i| low[i].get()),
-        high: std::array::from_fn(|i| high[i].get()),
+    Q4KGgmlActivations::new(
+        std::array::from_fn(|i| low[i].get()),
+        std::array::from_fn(|i| high[i].get()),
         sums,
-    }
+    )
 }
 
 /// Q4K subgroup-lane decomposition shared by `qgemv_q4k_ggml` and
 /// `qgemv_q4k_paired_ggml`. Splits a 32-wide subgroup into a 4x8 grid where
 /// `ix = lane / 8` selects one of 4 K-blocks per workgroup pass and
 /// `(iq, ir) = (it / 4, it % 4)` indexes into the 8-byte sub-block.
-pub struct Q4KLane {
-    pub ix: ScalarIndex,
-    pub iq: ScalarIndex,
-    pub ir: ScalarIndex,
+pub(crate) struct Q4KLane {
+    pub(crate) ix: ScalarIndex,
+    pub(crate) iq: ScalarIndex,
+    pub(crate) ir: ScalarIndex,
 }
 
-pub fn q4k_lane_decomposition(lane: &ScalarIndex) -> Q4KLane {
+pub(crate) fn q4k_lane_decomposition(lane: &ScalarIndex) -> Q4KLane {
     let ix = lane.clone() / 8;
     let it = lane.clone() % 8;
     let iq = it.clone() / 4;
@@ -156,7 +153,136 @@ pub fn q4k_lane_decomposition(lane: &ScalarIndex) -> Q4KLane {
     Q4KLane { ix, iq, ir }
 }
 
-pub fn dot4_sum<const BLOCK: usize, const VALUES: usize>(
+pub(crate) struct Q4KGgmlIteration<const BLOCK: usize> {
+    pub(crate) block: ScalarIndex,
+    pub(crate) in_bounds: Mask<BLOCK>,
+    pub(crate) activations: Q4KGgmlActivations<BLOCK>,
+}
+
+pub(crate) struct Q4KGgmlIterationRequest<'a, Row, const BLOCK: usize> {
+    pub(crate) loop_index: ScalarIndex,
+    pub(crate) a: &'a Storage<F32, 2>,
+    pub(crate) row: Row,
+    pub(crate) block_count: u32,
+    pub(crate) full_block_iterations: bool,
+    pub(crate) lane: &'a Q4KLane,
+    pub(crate) base_mask: Mask<BLOCK>,
+}
+
+pub(crate) fn q4k_ggml_iteration<Row, const BLOCK: usize>(
+    program: &mut TileBlock<'_, BLOCK>,
+    request: Q4KGgmlIterationRequest<'_, Row, BLOCK>,
+) -> Q4KGgmlIteration<BLOCK>
+where
+    Row: Clone + IntoIndex<BLOCK>,
+{
+    let Q4KGgmlIterationRequest {
+        loop_index,
+        a,
+        row,
+        block_count,
+        full_block_iterations,
+        lane,
+        base_mask,
+    } = request;
+    let block = loop_index * 4 + lane.ix.clone();
+    let in_bounds = if full_block_iterations {
+        base_mask
+    } else {
+        base_mask.and(block.clone().lt(block_count))
+    };
+    let vector_base = block.clone() * 256 + lane.iq.clone() * 64 + lane.ir.clone() * 8;
+    let activations = q4k_ggml_activations(program, a, row, &vector_base, in_bounds.clone());
+    Q4KGgmlIteration {
+        block,
+        in_bounds,
+        activations,
+    }
+}
+
+pub(crate) struct Q6KLane {
+    pub(crate) ix: ScalarIndex,
+    pub(crate) ip: ScalarIndex,
+    pub(crate) il: ScalarIndex,
+    pub(crate) l0: ScalarIndex,
+}
+
+pub(crate) fn q6k_lane_decomposition(lane: &ScalarIndex) -> Q6KLane {
+    let tid = lane.clone() / 2;
+    let ix = lane.clone() % 2;
+    let ip = tid.clone() / 8;
+    let il = tid % 8;
+    let l0 = il.clone() * 4;
+    Q6KLane { ix, ip, il, l0 }
+}
+
+pub(crate) fn q6k_ggml_activations<const BLOCK: usize>(
+    program: &mut TileBlock<'_, BLOCK>,
+    a: &Storage<F32, 2>,
+    row: impl Clone + IntoIndex<BLOCK>,
+    vector_base: &ScalarIndex,
+    in_bounds: Mask<BLOCK>,
+) -> [Tile<BLOCK>; 16] {
+    let a_bound: [Bound<BLOCK>; 16] = std::array::from_fn(|j| {
+        let offset = (j / 4) as u32 + (j % 4) as u32 * 32;
+        let scalar = program.load(
+            a.at((row.clone(), vector_base.clone() + offset)),
+            in_bounds.clone(),
+            0.0,
+        );
+        program.bind(scalar)
+    });
+    std::array::from_fn(|i| a_bound[i].get())
+}
+
+pub(crate) struct Q6KGgmlIteration<const BLOCK: usize> {
+    pub(crate) block: ScalarIndex,
+    pub(crate) in_bounds: Mask<BLOCK>,
+    pub(crate) activations: [Tile<BLOCK>; 16],
+}
+
+pub(crate) struct Q6KGgmlIterationRequest<'a, Row, const BLOCK: usize> {
+    pub(crate) loop_index: ScalarIndex,
+    pub(crate) a: &'a Storage<F32, 2>,
+    pub(crate) row: Row,
+    pub(crate) block_count: u32,
+    pub(crate) full_block_iterations: bool,
+    pub(crate) lane: &'a Q6KLane,
+    pub(crate) base_mask: Mask<BLOCK>,
+}
+
+pub(crate) fn q6k_ggml_iteration<Row, const BLOCK: usize>(
+    program: &mut TileBlock<'_, BLOCK>,
+    request: Q6KGgmlIterationRequest<'_, Row, BLOCK>,
+) -> Q6KGgmlIteration<BLOCK>
+where
+    Row: Clone + IntoIndex<BLOCK>,
+{
+    let Q6KGgmlIterationRequest {
+        loop_index,
+        a,
+        row,
+        block_count,
+        full_block_iterations,
+        lane,
+        base_mask,
+    } = request;
+    let block = loop_index * 2 + lane.ix.clone();
+    let in_bounds = if full_block_iterations {
+        base_mask
+    } else {
+        base_mask.and(block.clone().lt(block_count))
+    };
+    let vector_base = block.clone() * 256 + lane.ip.clone() * 128 + lane.l0.clone();
+    let activations = q6k_ggml_activations(program, a, row, &vector_base, in_bounds.clone());
+    Q6KGgmlIteration {
+        block,
+        in_bounds,
+        activations,
+    }
+}
+
+pub(crate) fn dot4_sum<const BLOCK: usize, const VALUES: usize>(
     program: &TileBlock<'_, BLOCK>,
     a: &[Tile<BLOCK>; VALUES],
     b: &[Tile<BLOCK>; VALUES],
@@ -166,7 +292,9 @@ pub fn dot4_sum<const BLOCK: usize, const VALUES: usize>(
     for chunk in 0..VALUES / 4 {
         let a_vec = std::array::from_fn(|i| a[chunk * 4 + i].clone());
         let b_vec = std::array::from_fn(|i| b[chunk * 4 + i].clone());
-        let term = program.dot4(a_vec, b_vec);
+        let a_vec = program.compose_vector::<F32, 4>(a_vec);
+        let b_vec = program.compose_vector::<F32, 4>(b_vec);
+        let term = program.vector_dot::<F32, 4>(a_vec, b_vec);
         sum = Some(match sum {
             Some(prev) => prev + term,
             None => term,

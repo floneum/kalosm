@@ -49,6 +49,7 @@ impl<'a> Lowerer<'a> {
             Expr::Reduce {
                 op,
                 iterations,
+                iter_var,
                 value,
                 scratch: scratch_tile,
                 group_size,
@@ -56,14 +57,18 @@ impl<'a> Lowerer<'a> {
                 let value = if *iterations == 1 {
                     self.lower_tile_expr_lane(expressions, scratch, body, value, spill_depth)?
                 } else {
+                    let iter_var = iter_var.expect("loop reduce must carry an iter var");
                     self.lower_tile_loop_reduce_value(
                         expressions,
                         scratch,
                         body,
                         value,
-                        *iterations,
-                        *op,
-                        spill_depth,
+                        TileLoopReduceSpec {
+                            iterations: *iterations,
+                            iter_var,
+                            op: *op,
+                            spill_depth,
+                        },
                     )?
                 };
                 self.lower_tile_reduce_value(
@@ -178,17 +183,25 @@ impl<'a> Lowerer<'a> {
                 expressions,
                 scratch,
                 body,
-                *id,
-                src,
-                k_base,
-                col,
-                mask,
-                fill,
-                *block_n,
-                *lane,
-                spill_depth,
+                QuantizedBlockLaneLowering {
+                    id: *id,
+                    src,
+                    k_base,
+                    col,
+                    masked: MaskedF32Value {
+                        mask,
+                        fill,
+                        spill_depth,
+                    },
+                    block_n: *block_n,
+                    lane: *lane,
+                },
             ),
-            Expr::Compose4 { values } => {
+            Expr::ComposeVector {
+                scalar,
+                lanes,
+                values,
+            } => {
                 let handles = values
                     .iter()
                     .map(|value| {
@@ -201,15 +214,33 @@ impl<'a> Lowerer<'a> {
                         )
                     })
                     .collect::<Result<Vec<_>, _>>()?;
-                let handles: [_; 4] = handles.try_into().expect("Compose4 carries exactly 4");
-                Ok(self.compose_f32_vec4(expressions, body, handles))
+                let ty = self.vector_type_handle(*scalar, *lanes)?;
+                Ok(self.emit(
+                    expressions,
+                    body,
+                    Expression::Compose {
+                        ty,
+                        components: handles,
+                    },
+                ))
             }
-            Expr::Vec4Dot { left, right } => {
+            Expr::VectorDot {
+                scalar,
+                lanes,
+                left,
+                right,
+            } => {
+                if !matches!(scalar, ScalarElement::F32 | ScalarElement::F16) {
+                    return Err(LowerError::UnsupportedOperation(
+                        "vector dot requires a floating-point vector",
+                    ));
+                }
+                self.vector_type_handle(*scalar, *lanes)?;
                 let left =
                     self.lower_tile_expr_lane(expressions, scratch, body, left, spill_depth + 1)?;
                 let right =
                     self.lower_tile_expr_lane(expressions, scratch, body, right, spill_depth + 1)?;
-                Ok(self.dot_f32_vec4(expressions, body, left, right))
+                Ok(self.math2(expressions, body, MathFunction::Dot, left, right))
             }
             Expr::QuantizedDot {
                 src,
@@ -223,14 +254,18 @@ impl<'a> Lowerer<'a> {
                 expressions,
                 scratch,
                 body,
-                src,
-                activations,
-                k,
-                col,
-                mask,
-                fill,
-                *block_n,
-                spill_depth,
+                QuantizedDotLowering {
+                    src,
+                    activations,
+                    k,
+                    col,
+                    masked: MaskedF32Value {
+                        mask,
+                        fill,
+                        spill_depth,
+                    },
+                    block_n: *block_n,
+                },
             ),
         }
     }
@@ -247,7 +282,6 @@ impl<'a> Lowerer<'a> {
             Builtin::SubgroupLane => Self::function_arg(expressions, SUBGROUP_INVOCATION_ID_ARG),
             Builtin::SubgroupSize => Self::function_arg(expressions, SUBGROUP_SIZE_ARG),
             Builtin::NumSubgroups => Self::function_arg(expressions, NUM_SUBGROUPS_ARG),
-            Builtin::LoopIndex => self.load_local(expressions, body, self.current_loop_index()),
             Builtin::ProgramId(axis) => {
                 let wg = Self::function_arg(expressions, WORKGROUP_ID_ARG);
                 self.emit(

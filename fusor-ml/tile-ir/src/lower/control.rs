@@ -1,4 +1,5 @@
 use super::*;
+use crate::lower::tile_program::TileFoldLowering;
 
 impl<'a> Lowerer<'a> {
     pub(super) fn push_guarded_or_full_block(
@@ -175,11 +176,6 @@ impl<'a> Lowerer<'a> {
         cache.extend(entries);
     }
 
-    pub(super) fn current_loop_index(&self) -> Handle<LocalVariable> {
-        self.loop_index_local
-            .expect("scratch locals must be created before lowering storage offsets")
-    }
-
     /// Lower a `TileStmt::Fold`. Initializes each accumulator local from its
     /// `init` expression in the surrounding scope, then emits a counted loop
     /// over `0..count`. Inside the loop body, the iterator value is stored
@@ -187,17 +183,19 @@ impl<'a> Lowerer<'a> {
     /// accumulator's `update` expression is evaluated and stored back into its
     /// local. After the loop, the locals hold the final values and are read by
     /// subsequent `LoadLocal`s in the surrounding scope.
-    #[allow(clippy::too_many_arguments)]
     pub(super) fn lower_tile_fold_stmt(
         &self,
         expressions: &mut Arena<Expression>,
         scratch: ScratchLocals,
         body: &mut Block,
-        count: &Expr,
-        iter_var: LocalId,
-        fold_body: &[TileStmt],
-        accumulators: &[crate::ir::FoldAccumulator],
+        request: TileFoldLowering<'_>,
     ) -> Result<(), LowerError> {
+        let TileFoldLowering {
+            count,
+            iter_var,
+            body: fold_body,
+            accumulators,
+        } = request;
         // 1. Initialize each accumulator local from its init expression.
         for acc in accumulators {
             let init_value = self.lower_tile_expr(expressions, scratch, body, &acc.init)?;

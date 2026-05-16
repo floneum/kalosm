@@ -1,41 +1,60 @@
 //! Pre-built kernels for `fusor-tile-ir`.
 //!
-//! `fusor-tile-ir` itself contains only the IR types, the lowerer, and the
-//! generic kernel-builder primitives (`Program::program_grid`,
-//! `TileBlock::load`, etc.). Every concrete kernel — qmatmul, qgemv, dense
-//! matmul, gemv, qdequantize, flash attention, top-k, rms-norm, mirostat —
-//! lives in this crate as free functions over `&mut Program`.
+//! `fusor-tile-ir` contains the IR, lowerer, and generic tile builder. This
+//! crate contains concrete kernels: dense matmul/GEMV, quantized matmul/GEMV,
+//! dequantization, flash attention, top-k, RMS norm, and Mirostat sampling.
+//!
+//! ```
+//! use fusor_tile_ir::{tile, GgmlQuantFormat, Shape, F32};
+//! use fusor_tile_ir_kernels::{qgemv, quantized_matrix};
+//!
+//! let ir = tile::build(|program| {
+//!     let a = program.storage_read::<F32, 2>(Shape::new([1, 256]));
+//!     let b = quantized_matrix(program, GgmlQuantFormat::Q8_0, 256, 128);
+//!     let y = program.storage_write::<F32, 2>(Shape::new([1, 128]));
+//!     qgemv::<4, 64>(program, &a, &b, &y, 4, 1);
+//! });
+//! # let _ = ir;
+//! ```
+//!
+//! For runtime-owned bindings, pair kernel constructors with
+//! [`fusor_tile_ir::KernelBuilder`]:
+//!
+//! ```
+//! use fusor_tile_ir::{
+//!     GgmlQuantFormat, KernelBuilder, KernelTensorRef, Layout, MemoryLevel, Shape, F32,
+//! };
+//! use fusor_tile_ir_kernels::{qdequantize, quantized_matrix_for};
+//!
+//! let mut kb = KernelBuilder::<&'static str>::new();
+//! let q = quantized_matrix_for(&mut kb, "matrix", GgmlQuantFormat::Q4K, 256, 4);
+//! let layout = Layout::contiguous(MemoryLevel::Storage, Shape::new([1024]));
+//! let y = kb.write::<F32, 1>(KernelTensorRef::new("output", layout));
+//! qdequantize(kb.program(), &q, &y, 1);
+//! let (_ir, bindings) = kb.finish();
+//! assert_eq!(bindings, ["matrix", "output"]);
+//! ```
 
 mod dispatch;
 mod grid;
 mod kernels;
-mod program_kernels;
-mod program_qgemv;
+mod program;
 mod types;
 
 pub use dispatch::{
-    q4k_default_large, q4k_default_mid, q4k_default_tall, q4k_large_override, q4k_mid_override,
-    q4k_tall_override, q6k_default_large, q6k_default_tall, q6k_large_override, q6k_tall_override,
-    qmatmul_path, QgemvShapeQ4K, QgemvShapeQ6K, QmatmulPath,
-};
-pub use grid::{
-    dot4_sum, q4k_ggml_activations, q4k_lane_decomposition, qgemv_grid, store_qgemv_sums,
-    Q4KGgmlActivations, Q4KLane, QgemvGrid,
+    qgemv_cols_per_workgroup, qgemv_cols_per_workgroup_for_shape,
+    qgemv_subgroups_per_workgroup_for_shape,
 };
 pub use kernels::{
+    FlashAttentionDims, FlashAttentionMeta, FlashDecodeSmallMeta, MergeTopKMeta, Mirostat2,
+    Mirostat2Meta, RmsNormVec4, RmsNormVec4Meta, TensorMeta, TopKChunkMeta, TopKExactnessMeta,
     flash_attention, flash_decode_small, linear_storage_layout, mirostat2, rms_norm_vec4,
-    top_k_chunk, top_k_exactness, top_k_merge, FlashAttentionDims, FlashAttentionMeta,
-    FlashDecodeSmallMeta, MergeTopKMeta, Mirostat2Meta, RmsNormVec4Meta, TensorMeta, TopKChunkMeta,
-    TopKExactnessMeta,
+    top_k_chunk, top_k_exactness, top_k_merge,
 };
-pub use program_kernels::{
-    gemv, matmul, qdequantize, qgemv, qgemv_with_epilogue, qmatmul, qmatmul_dispatch,
-    qmatmul_options, qmatmul_perf, qmatmul_tile, quantized_matrix, quantized_matrix_for,
-    IntoQgemvEpilogues,
+pub use program::{
+    IntoQgemvEpilogues, Q4KPairedGgml, gemv, matmul, matmul_with_epilogues, qdequantize, qgemv,
+    qgemv_q4k_paired_2x2, qgemv_q4k_paired_2x4, qgemv_q4k_paired_4x1, qgemv_q4k_paired_4x2,
+    qgemv_q4k_paired_4x4, qgemv_q4k_paired_8x1, qgemv_q4k_paired_8x2, qgemv_q4k_paired_ggml,
+    qgemv_with_epilogue, qmatmul, qmatmul_with_epilogue, quantized_matrix, quantized_matrix_for,
 };
-pub use program_qgemv::{
-    qgemv_perf, qgemv_q4k_dispatch, qgemv_q4k_ggml, qgemv_q4k_paired_2x2, qgemv_q4k_paired_2x4,
-    qgemv_q4k_paired_4x1, qgemv_q4k_paired_4x2, qgemv_q4k_paired_4x4, qgemv_q4k_paired_8x1,
-    qgemv_q4k_paired_8x2, qgemv_q4k_paired_ggml, qgemv_q6k_dispatch, qgemv_q6k_ggml, qgemv_tile,
-};
-pub use types::{apply_optional_epilogue, PairedEpilogue, QmatmulEpilogues, UnaryEpilogue};
+pub use types::{DenseMatmulEpilogues, PairedEpilogue, QmatmulEpilogues, UnaryEpilogue};

@@ -7,21 +7,26 @@ impl<'a> Lowerer<'a> {
         scratch: ScratchLocals,
         body: &mut Block,
         value: &Expr,
-        iterations: u32,
-        op: TileReduceOp,
-        spill_depth: usize,
+        spec: TileLoopReduceSpec,
     ) -> Result<Handle<Expression>, LowerError> {
         let element = value.element();
         let acc = self.tile_expr_spill_local(scratch, element, 0)?;
-        let initial = expressions.append(Self::tile_reduce_identity(op, element), Span::default());
+        let initial = expressions.append(
+            Self::tile_reduce_identity(spec.op, element),
+            Span::default(),
+        );
         self.store_local(expressions, body, acc, initial);
 
+        let iter_var_local = self.private_local(LocalRef::new(spec.iter_var, ElementType::U32))?;
         self.emit_counted_loop(
             expressions,
             scratch,
             body,
-            iterations,
-            |expressions, loop_body, _| {
+            spec.iterations,
+            |expressions, loop_body, loop_index| {
+                // Bind the loop's iter_var local so the value expression's
+                // LoadLocal(iter_var) references resolve to the current index.
+                self.store_local(expressions, loop_body, iter_var_local, loop_index);
                 // Cache entries reference values scoped to the outer block. Snapshot
                 // expression-handle caches, but drop q8 activation locals because the
                 // loop body may overwrite the shared scratch slots.
@@ -31,7 +36,7 @@ impl<'a> Lowerer<'a> {
                     scratch,
                     loop_body,
                     value,
-                    spill_depth + 1,
+                    spec.spill_depth + 1,
                 )?;
                 self.restore_tile_loop_caches(saved);
                 let acc_ptr = self.local_var(expressions, acc);
@@ -39,7 +44,7 @@ impl<'a> Lowerer<'a> {
                 let reduced = self.emit(
                     expressions,
                     loop_body,
-                    Self::tile_reduce_expression(op, acc_value, value),
+                    Self::tile_reduce_expression(spec.op, acc_value, value),
                 );
                 self.store_local(expressions, loop_body, acc, reduced);
                 Ok(())
@@ -183,9 +188,9 @@ impl<'a> Lowerer<'a> {
                 "subgroup reduce on f16 requires f16 capability",
             ))?,
             ElementType::U32 => self.u32_ty,
-            ElementType::F32Vec4 => {
+            ElementType::Vector { .. } => {
                 return Err(LowerError::UnsupportedOperation(
-                    "subgroup reduce on vec4 values is not supported",
+                    "subgroup reduce on vector values is not supported",
                 ));
             }
             ElementType::Bool => {
@@ -193,7 +198,7 @@ impl<'a> Lowerer<'a> {
                     "subgroup reduce on bool values is not supported",
                 ));
             }
-            ElementType::CoopMatrixF32 { .. } => {
+            ElementType::CoopMatrix { .. } => {
                 return Err(LowerError::UnsupportedOperation(
                     "subgroup reduce on cooperative-matrix values is not supported",
                 ));

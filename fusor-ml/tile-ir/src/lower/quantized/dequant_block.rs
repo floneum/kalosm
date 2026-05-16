@@ -12,6 +12,18 @@ pub(in crate::lower) struct Q23KQuantParts {
     pub quant_f: Handle<Expression>,
 }
 
+type QBlockByteNibbles = (Handle<Expression>, Handle<Expression>, Handle<Expression>);
+
+struct Q5BlockOffsets {
+    high: u32,
+    data: u32,
+}
+
+struct Q23KQuantIndices {
+    q: Handle<Expression>,
+    group: Handle<Expression>,
+}
+
 impl<'a> Lowerer<'a> {
     pub(in crate::lower) fn dequant_affine(
         &self,
@@ -61,7 +73,17 @@ impl<'a> Lowerer<'a> {
             AffineNibble::Q5 {
                 high_offset,
                 data_offset,
-            } => self.q5_block_nibble(e, matrix, base, q, high_offset, data_offset, body),
+            } => self.q5_block_nibble(
+                e,
+                matrix,
+                base,
+                q,
+                Q5BlockOffsets {
+                    high: high_offset,
+                    data: data_offset,
+                },
+                body,
+            ),
         }
     }
 
@@ -79,7 +101,7 @@ impl<'a> Lowerer<'a> {
         q: Handle<Expression>,
         data_offset: u32,
         body: &mut Block,
-    ) -> Result<(Handle<Expression>, Handle<Expression>, Handle<Expression>), LowerError> {
+    ) -> Result<QBlockByteNibbles, LowerError> {
         let q_local = self.and_lit(e, body, q, 15);
         let byte = self.load_byte_dynamic(e, matrix, base, q_local, data_offset, body)?;
         let low = self.and_lit(e, body, byte, 0x0f);
@@ -102,20 +124,19 @@ impl<'a> Lowerer<'a> {
         Ok(self.select(e, body, high, high_q, low))
     }
 
-    pub(in crate::lower) fn q5_block_nibble(
+    fn q5_block_nibble(
         &self,
         e: &mut Arena<Expression>,
         matrix: &QuantizedMatrix,
         base: Handle<Expression>,
         q: Handle<Expression>,
-        high_offset: u32,
-        data_offset: u32,
+        offsets: Q5BlockOffsets,
         body: &mut Block,
     ) -> Result<Handle<Expression>, LowerError> {
-        let qh = self.load_word(e, matrix, base, high_offset, body)?;
+        let qh = self.load_word(e, matrix, base, offsets.high, body)?;
         let high = self.cmp_lit(e, body, BinaryOperator::GreaterEqual, q, 16);
         let (q_local, low, high4) =
-            self.q_block_byte_nibbles(e, matrix, base, q, data_offset, body)?;
+            self.q_block_byte_nibbles(e, matrix, base, q, offsets.data, body)?;
         let low4 = self.select(e, body, high, high4, low);
         let high_index = self.add_lit(e, body, q_local, 16);
         let hi_bit_index = self.select(e, body, high, high_index, q_local);
@@ -125,16 +146,16 @@ impl<'a> Lowerer<'a> {
         Ok(self.or(e, body, low4, hi_bit))
     }
 
-    pub(in crate::lower) fn dequant_q23k_quant_f(
+    fn dequant_q23k_quant_f(
         &self,
         e: &mut Arena<Expression>,
         matrix: &QuantizedMatrix,
         base: Handle<Expression>,
-        q: Handle<Expression>,
-        group: Handle<Expression>,
+        indices: Q23KQuantIndices,
         data_base: u32,
         body: &mut Block,
     ) -> Result<Q23KQuantParts, LowerError> {
+        let Q23KQuantIndices { q, group } = indices;
         let q_local = self.and_lit(e, body, q, 15);
         let chunk = self.shr_lit(e, body, group, 3);
         let group_in_chunk = self.and_lit(e, body, group, 7);
@@ -176,7 +197,8 @@ impl<'a> Lowerer<'a> {
         let min_quant = self.shr_lit(e, body, scale_byte, 4);
         let min_quant_f = self.as_f32(e, body, min_quant);
         let min = self.mul(e, body, min_quant_f, dmin);
-        let parts = self.dequant_q23k_quant_f(e, matrix, base, q, group, 4, body)?;
+        let parts =
+            self.dequant_q23k_quant_f(e, matrix, base, Q23KQuantIndices { q, group }, 4, body)?;
         let scaled = self.mul(e, body, parts.quant_f, scale);
         Ok(self.sub(e, body, scaled, min))
     }
@@ -194,7 +216,8 @@ impl<'a> Lowerer<'a> {
         let scale_quant = self.q3k_scale(e, matrix, base, group, body)?;
         let scale_quant_f = self.center_quant_by_32(e, body, scale_quant);
         let scale = self.mul(e, body, scale_quant_f, d);
-        let parts = self.dequant_q23k_quant_f(e, matrix, base, q, group, 8, body)?;
+        let parts =
+            self.dequant_q23k_quant_f(e, matrix, base, Q23KQuantIndices { q, group }, 8, body)?;
         let hmask_index = self.add(e, body, parts.pair_offset, parts.q_local);
         let hbyte = self.load_byte_dynamic(e, matrix, base, hmask_index, 0, body)?;
         let hmask_bit_pair = self.shr_lit(e, body, parts.group_in_chunk, 1);

@@ -1,4 +1,5 @@
 use super::*;
+use crate::ir::TileIndexedStoreStmt;
 
 impl<'a> Lowerer<'a> {
     pub(in crate::lower) fn lower_tile_program(
@@ -20,15 +21,7 @@ impl<'a> Lowerer<'a> {
                     self.lower_tile_store_stmt(expressions, scratch, &mut body, store)?;
                 }
                 TileStmt::StoreIndexed(store) => {
-                    self.lower_tile_indexed_store_stmt(
-                        expressions,
-                        scratch,
-                        &mut body,
-                        &store.dst,
-                        &store.index,
-                        &store.value,
-                        &store.mask,
-                    )?;
+                    self.lower_tile_indexed_store_stmt(expressions, scratch, &mut body, store)?;
                 }
                 _ => self.lower_tile_stmt(expressions, scratch, &mut body, stmt)?,
             }
@@ -62,17 +55,14 @@ impl<'a> Lowerer<'a> {
         expressions: &mut Arena<Expression>,
         scratch: ScratchLocals,
         body: &mut Block,
-        dst: &StorageView,
-        index: &Expr,
-        value: &Expr,
-        mask: &Expr,
+        store: &TileIndexedStoreStmt,
     ) -> Result<(), LowerError> {
         self.clear_store_caches(false);
-        let value = self.lower_tile_expr(expressions, scratch, body, value)?;
-        let mask = self.lower_tile_expr(expressions, scratch, body, mask)?;
+        let value = self.lower_tile_expr(expressions, scratch, body, &store.value)?;
+        let mask = self.lower_tile_expr(expressions, scratch, body, &store.mask)?;
         let mut accept = Block::new();
-        let index = self.lower_tile_expr(expressions, scratch, &mut accept, index)?;
-        let dst_ptr = self.storage_dynamic_pointer(expressions, dst, index, &mut accept)?;
+        let index = self.lower_tile_expr(expressions, scratch, &mut accept, &store.index)?;
+        let dst_ptr = self.storage_dynamic_pointer(expressions, &store.dst, index, &mut accept)?;
         Self::push_masked_store(body, mask, accept, dst_ptr, value);
         Ok(())
     }

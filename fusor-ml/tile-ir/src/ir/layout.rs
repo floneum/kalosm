@@ -5,7 +5,9 @@ use std::num::NonZeroU32;
 /// sub-axes (non-injective views, e.g. im2col).
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct SubAxis {
+    /// Logical extent of this sub-axis.
     pub extent: u32,
+    /// Physical stride for this sub-axis.
     pub stride: u32,
 }
 
@@ -16,10 +18,12 @@ pub struct SubAxis {
 /// rest. A group with a single sub-axis is the affine case.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AxisGroup {
+    /// Sub-axes that make up one logical axis.
     pub sub_axes: Vec<SubAxis>,
 }
 
 impl AxisGroup {
+    /// Build a single-sub-axis affine group.
     pub fn affine(extent: u32, stride: u32) -> Self {
         Self {
             sub_axes: vec![SubAxis { extent, stride }],
@@ -31,6 +35,7 @@ impl AxisGroup {
 /// views are the all-single-sub-axis case.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MultiFlattenMap {
+    /// Logical axis groups.
     pub groups: Vec<AxisGroup>,
 }
 
@@ -61,6 +66,7 @@ impl MultiFlattenMap {
         Self::affine(shape, &col_major_strides(shape))
     }
 
+    /// Number of logical axes.
     pub fn rank(&self) -> usize {
         self.groups.len()
     }
@@ -85,14 +91,17 @@ impl MultiFlattenMap {
             .collect()
     }
 
+    /// True if this affine map is row-major contiguous for `shape`.
     pub fn is_row_major(&self, shape: &Shape) -> bool {
         self.is_affine() && self.affine_strides() == row_major_strides(shape)
     }
 
+    /// True if this affine map is column-major contiguous for `shape`.
     pub fn is_col_major(&self, shape: &Shape) -> bool {
         self.is_affine() && self.affine_strides() == col_major_strides(shape)
     }
 
+    /// True if this map is row-major or column-major contiguous for `shape`.
     pub fn is_contiguous(&self, shape: &Shape) -> bool {
         self.is_row_major(shape) || self.is_col_major(shape)
     }
@@ -164,14 +173,17 @@ impl Layout {
         }
     }
 
+    /// Logical shape.
     pub fn shape(&self) -> &Shape {
         &self.shape
     }
 
+    /// Logical-to-storage indexing map.
     pub fn indexing(&self) -> &MultiFlattenMap {
         &self.indexing
     }
 
+    /// Memory level for this layout.
     pub const fn memory_level(&self) -> MemoryLevel {
         self.memory_level
     }
@@ -208,14 +220,17 @@ impl Layout {
         self.indexing.affine_strides()
     }
 
+    /// True if this layout is row-major contiguous.
     pub fn is_row_major(&self) -> bool {
         self.indexing.is_row_major(&self.shape)
     }
 
+    /// True if this layout is column-major contiguous.
     pub fn is_col_major(&self) -> bool {
         self.indexing.is_col_major(&self.shape)
     }
 
+    /// True if this layout is row-major or column-major contiguous.
     pub fn is_contiguous(&self) -> bool {
         self.indexing.is_contiguous(&self.shape)
     }
@@ -273,8 +288,12 @@ impl Shape {
 /// Where a layout lives in the GPU memory hierarchy.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum MemoryLevel {
+    /// Storage buffer memory.
     Storage,
+    /// Uniform buffer memory.
     Uniform,
+    /// Workgroup/shared memory.
     Workgroup,
+    /// Private per-invocation memory.
     Private,
 }

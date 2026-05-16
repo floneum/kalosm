@@ -3,6 +3,9 @@ use std::sync::Arc;
 use fusor_tile_ir::tile::Tile;
 use fusor_tile_ir::{Layout, TileLiteral};
 
+type PairedEpilogueBuilder = dyn Fn(&[Tile<1>]) -> Tile<1> + Send + Sync;
+type UnaryEpilogueBuilder = dyn Fn(Tile<1>) -> Tile<1> + Send + Sync;
+
 /// Paired matmul epilogue. The matmul produces concatenated `[gate; up]`
 /// columns; the kernel reduces each pair separately and applies this epilogue
 /// before storing a single output column per pair.
@@ -11,6 +14,14 @@ use fusor_tile_ir::{Layout, TileLiteral};
 /// detects a `q_mat_mul → narrow → … → mul(narrow)` subgraph; the closure
 /// re-emits the captured `NaryExpr` at the tile-IR level. Pipelines are
 /// cached by the structural hash of the produced Expr tree.
+///
+/// ```
+/// use fusor_tile_ir_kernels::PairedEpilogue;
+///
+/// let epilogue =
+///     PairedEpilogue::with_extras("mul", 0, |tiles| tiles[0].clone() * tiles[1].clone());
+/// assert_eq!(epilogue.arity(), 2);
+/// ```
 #[derive(Clone)]
 pub struct PairedEpilogue {
     label: &'static str,
@@ -24,7 +35,7 @@ pub struct PairedEpilogue {
     // const generic on both sides of the call. `Tile<N>` carries no runtime
     // state beyond its `Expr`, so this is a host-time shape cast only.
     // The closure receives a slice of `arity` tiles.
-    build: Arc<dyn Fn(&[Tile<1>]) -> Tile<1> + Send + Sync>,
+    build: Arc<PairedEpilogueBuilder>,
 }
 
 impl PairedEpilogue {
@@ -135,11 +146,18 @@ impl std::hash::Hash for PairedEpilogue {
 /// [`UnaryEpilogue::new`] when the resolver detects a post-op chain to fuse;
 /// the closure runs at kernel-build time and produces a Tile-IR `Expr` tree
 /// that is hashed into the pipeline cache key.
+///
+/// ```
+/// use fusor_tile_ir_kernels::UnaryEpilogue;
+///
+/// let epilogue = UnaryEpilogue::new("relu", |tile| tile.relu());
+/// assert_eq!(epilogue.label(), "relu");
+/// ```
 #[derive(Clone)]
 pub struct UnaryEpilogue {
     label: &'static str,
     identity: u64,
-    build: Arc<dyn Fn(Tile<1>) -> Tile<1> + Send + Sync>,
+    build: Arc<UnaryEpilogueBuilder>,
 }
 
 impl UnaryEpilogue {
@@ -157,14 +175,17 @@ impl UnaryEpilogue {
         }
     }
 
+    /// Apply this epilogue to one tile expression.
     pub fn apply<const BLOCK: usize>(&self, tile: Tile<BLOCK>) -> Tile<BLOCK> {
         (self.build)(tile.retag_block::<1>()).retag_block::<BLOCK>()
     }
 
+    /// Stable structural hash of the produced Tile-IR Expr tree.
     pub fn identity(&self) -> u64 {
         self.identity
     }
 
+    /// Human-readable label for graph visualization and kernel names.
     pub fn label(&self) -> &'static str {
         self.label
     }
@@ -196,7 +217,7 @@ impl std::hash::Hash for UnaryEpilogue {
 /// Apply the optional epilogue to a tile. Identity (no allocation, no
 /// dispatch) when `epilogue` is `None`. Kernels call this between their
 /// per-output reduce and the store.
-pub fn apply_optional_epilogue<const BLOCK: usize>(
+pub(crate) fn apply_optional_epilogue<const BLOCK: usize>(
     epilogue: Option<&UnaryEpilogue>,
     tile: Tile<BLOCK>,
 ) -> Tile<BLOCK> {
@@ -206,21 +227,43 @@ pub fn apply_optional_epilogue<const BLOCK: usize>(
     }
 }
 
+/// Bundle of pre- and post-reduce epilogues for dense F32 matmul kernels.
+#[derive(Clone, Default)]
+pub struct DenseMatmulEpilogues<'a> {
+    /// Optional transform applied to each loaded lhs value before the product.
+    pub pre_a: Option<&'a UnaryEpilogue>,
+    /// Optional transform applied to each loaded rhs value before the product.
+    pub pre_b: Option<&'a UnaryEpilogue>,
+    /// Optional transform applied after the reduction and before the store.
+    pub post: Option<&'a UnaryEpilogue>,
+}
+
+impl<'a> DenseMatmulEpilogues<'a> {
+    /// No dense matmul epilogues.
+    pub fn empty() -> Self {
+        Self::default()
+    }
+}
+
 /// Bundle of pre- and post-reduce epilogues for `qgemv` / `qmatmul` kernels.
 /// `pre` is applied to each loaded activation tile before the dot product;
 /// `post` is applied to each per-output reduced tile before the store. Either
 /// may be `None`, in which case the kernel skips that injection point.
 #[derive(Clone, Default)]
 pub struct QmatmulEpilogues<'a> {
+    /// Optional activation transform applied before each dot product.
     pub pre: Option<&'a UnaryEpilogue>,
+    /// Optional output transform applied after the reduction.
     pub post: Option<&'a UnaryEpilogue>,
 }
 
 impl<'a> QmatmulEpilogues<'a> {
+    /// No qmatmul epilogues.
     pub fn empty() -> Self {
         Self::default()
     }
 
+    /// Only a post-reduce epilogue.
     pub fn post(post: &'a UnaryEpilogue) -> Self {
         Self {
             pre: None,
@@ -228,6 +271,7 @@ impl<'a> QmatmulEpilogues<'a> {
         }
     }
 
+    /// Only a pre-dot epilogue.
     pub fn pre(pre: &'a UnaryEpilogue) -> Self {
         Self {
             pre: Some(pre),
@@ -236,7 +280,7 @@ impl<'a> QmatmulEpilogues<'a> {
     }
 }
 
-pub fn matrix_shape(layout: &Layout) -> [u32; 2] {
+pub(crate) fn matrix_shape(layout: &Layout) -> [u32; 2] {
     assert_eq!(layout.shape().rank(), 2, "matrix operands must be rank-2");
     [
         layout.shape().dims()[0].get(),
@@ -244,7 +288,7 @@ pub fn matrix_shape(layout: &Layout) -> [u32; 2] {
     ]
 }
 
-pub fn cooperative_store_layout_supported(layout: &Layout) -> bool {
+pub(crate) fn cooperative_store_layout_supported(layout: &Layout) -> bool {
     if !layout.is_affine() || layout.shape().rank() != 2 {
         return false;
     }

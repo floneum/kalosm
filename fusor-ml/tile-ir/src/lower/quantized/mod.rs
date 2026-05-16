@@ -53,6 +53,18 @@ pub(in crate::lower) struct GgmlBlockCoords {
     pub col: Handle<Expression>,
 }
 
+#[derive(Clone, Copy)]
+pub(in crate::lower) struct QuantDotCoords {
+    pub k_base: Handle<Expression>,
+    pub col: Handle<Expression>,
+}
+
+pub(in crate::lower) struct Q8ActivationDotRhs {
+    pub scale: Handle<Expression>,
+    pub packs: [Handle<Expression>; 2],
+    pub min: Option<Handle<Expression>>,
+}
+
 /// Quant-byte extraction layout for the affine GGML formats.
 ///
 /// `Q4` packs two 4-bit nibbles per byte; `Q5` adds an extra high-bit

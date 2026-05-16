@@ -8,8 +8,8 @@ mod top_k;
 mod types;
 
 pub use flash::{flash_attention, flash_decode_small};
-pub use mirostat::mirostat2;
-pub use rms_norm::rms_norm_vec4;
+pub use mirostat::{Mirostat2, mirostat2};
+pub use rms_norm::{RmsNormVec4, rms_norm_vec4};
 pub use top_k::{top_k_chunk, top_k_exactness, top_k_merge};
 pub use types::{
     FlashAttentionDims, FlashAttentionMeta, FlashDecodeSmallMeta, MergeTopKMeta, Mirostat2Meta,

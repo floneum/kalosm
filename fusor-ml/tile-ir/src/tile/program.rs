@@ -2,16 +2,18 @@ use std::marker::PhantomData;
 
 use super::*;
 use crate::ir::{
-    BlockDequantId, BufferAccess, BufferDecl, BufferRef, CoopFragmentId, KernelIr, Layout,
-    LocalRef, MemoryLevel, Numeric, Shape, StorageView, TileDecl, TileProgramOp, TileRef, F32,
+    BlockDequantId, BufferAccess, BufferDecl, BufferRef, CoopFragmentId, F32, KernelIr, Layout,
+    LocalRef, MemoryLevel, Numeric, Shape, StorageView, TileDecl, TileProgramOp, TileRef,
 };
 
 macro_rules! storage_accessors {
     ($read:ident, $write:ident($($arg:ident: $ty:ty),*) => ($layout:expr, $offset:expr)) => {
+        /// Declare a read-only typed storage view.
         pub fn $read<T: Numeric, const R: usize>(&mut self, $($arg: $ty),*) -> Storage<T, R> {
             self.storage_with_layout_and_access($layout, $offset, BufferAccess::Read)
         }
 
+        /// Declare a read-write typed storage view.
         pub fn $write<T: Numeric, const R: usize>(&mut self, $($arg: $ty),*) -> Storage<T, R> {
             self.storage_with_layout_and_access(
                 $layout,
@@ -22,40 +24,37 @@ macro_rules! storage_accessors {
     };
 }
 
-macro_rules! erased_storage_accessors {
+macro_rules! element_storage_accessors {
     ($read:ident, $write:ident($($arg:ident: $ty:ty),*) => ($layout:expr, $offset:expr)) => {
+        /// Declare a read-only storage view with an element type known at runtime.
         pub fn $read<const R: usize>(
             &mut self,
             element: crate::ElementType,
             $($arg: $ty),*
-        ) -> ErasedStorage<R> {
-            ErasedStorage {
-                view: self.storage_view_with_layout_and_access::<R>(
-                    element,
-                    $layout,
-                    $offset,
-                    BufferAccess::Read,
-                ),
-            }
+        ) -> Storage<RuntimeElement, R> {
+            self.storage_element_with_layout_and_access(element, $layout, $offset, BufferAccess::Read)
         }
 
+        /// Declare a read-write storage view with an element type known at runtime.
         pub fn $write<const R: usize>(
             &mut self,
             element: crate::ElementType,
             $($arg: $ty),*
-        ) -> ErasedStorage<R> {
-            ErasedStorage {
-                view: self.storage_view_with_layout_and_access::<R>(
-                    element,
-                    $layout,
-                    $offset,
-                    BufferAccess::ReadWrite,
-                ),
-            }
+        ) -> Storage<RuntimeElement, R> {
+            self.storage_element_with_layout_and_access(
+                element,
+                $layout,
+                $offset,
+                BufferAccess::ReadWrite,
+            )
         }
     };
 }
 
+/// Builder for one tile IR kernel.
+///
+/// A `Program` owns storage declarations, scratch allocations, and the single
+/// tile program body. Most callers construct one through [`build`](crate::tile::build).
 pub struct Program {
     pub(crate) ir: KernelIr,
     /// Builder-only counter for fresh `BufferId`s. Lives here (not on
@@ -135,7 +134,21 @@ impl Program {
         }
     }
 
-    erased_storage_accessors!(
+    fn storage_element_with_layout_and_access<const R: usize>(
+        &mut self,
+        element: crate::ElementType,
+        layout: Layout,
+        offset: u32,
+        access: BufferAccess,
+    ) -> Storage<RuntimeElement, R> {
+        let view = self.storage_view_with_layout_and_access::<R>(element, layout, offset, access);
+        Storage {
+            view,
+            _ty: PhantomData,
+        }
+    }
+
+    element_storage_accessors!(
         storage_read_element_with_layout_offset,
         storage_write_element_with_layout_offset(layout: Layout, offset: u32) => (layout, offset)
     );
@@ -161,6 +174,7 @@ impl Program {
         }
     }
 
+    /// Emit a tile-program body over a dispatch grid.
     pub fn program_grid<const BLOCK: usize>(
         &mut self,
         grid: [u32; 3],
@@ -221,12 +235,17 @@ impl Program {
         local
     }
 
-    /// Allocate a workgroup-scope f32 tile of shape `[rows, cols]`.
-    pub fn alloc_workgroup_tile_f32(&mut self, rows: u32, cols: u32) -> TileRef {
-        self.alloc_tile::<F32>(Layout::contiguous(
+    /// Allocate a rank-2 workgroup-scope tile of shape `[rows, cols]`.
+    pub fn alloc_workgroup_tile<T: Numeric>(&mut self, rows: u32, cols: u32) -> TileRef {
+        self.alloc_tile::<T>(Layout::contiguous(
             MemoryLevel::Workgroup,
             Shape::new([rows, cols]),
         ))
+    }
+
+    /// Allocate a workgroup-scope f32 tile of shape `[rows, cols]`.
+    pub fn alloc_workgroup_tile_f32(&mut self, rows: u32, cols: u32) -> TileRef {
+        self.alloc_workgroup_tile::<F32>(rows, cols)
     }
 
     /// Allocate a rank-1 workgroup-scope scratch array.

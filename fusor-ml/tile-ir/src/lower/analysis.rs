@@ -148,11 +148,19 @@ impl<'a> Lowerer<'a> {
                             || Self::tile_expr_any(&acc.update, pred)
                     })
             }
-            TileStmt::StoreCoopAcc { .. }
-            | TileStmt::CopyToWorkgroupTile { .. }
-            | TileStmt::ZeroCoopAcc { .. }
+            TileStmt::StoreCoopAcc { row, col, .. } => {
+                Self::tile_expr_any(row, pred) || Self::tile_expr_any(col, pred)
+            }
+            TileStmt::CopyToWorkgroupTile {
+                row_offset,
+                col_offset,
+                ..
+            } => Self::tile_expr_any(row_offset, pred) || Self::tile_expr_any(col_offset, pred),
+            TileStmt::LoadCoop { row, col, .. } => {
+                Self::tile_expr_any(row, pred) || Self::tile_expr_any(col, pred)
+            }
+            TileStmt::ZeroCoopAcc { .. }
             | TileStmt::Barrier
-            | TileStmt::LoadCoop { .. }
             | TileStmt::Mma { .. }
             | TileStmt::Break
             | TileStmt::Return => false,
@@ -191,13 +199,13 @@ impl<'a> Lowerer<'a> {
             | Expr::SubgroupReduce { value, .. } => pred(value),
             Expr::Binary { left, right, .. }
             | Expr::Compare { left, right, .. }
-            | Expr::Vec4Dot { left, right } => pred(left) || pred(right),
+            | Expr::VectorDot { left, right, .. } => pred(left) || pred(right),
             Expr::Select {
                 condition,
                 accept,
                 reject,
             } => pred(condition) || pred(accept) || pred(reject),
-            Expr::Compose4 { values } => values.iter().any(|expr| pred(expr)),
+            Expr::ComposeVector { values, .. } => values.iter().any(pred),
             Expr::QuantizedDot {
                 activations,
                 k,

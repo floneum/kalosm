@@ -81,18 +81,18 @@ pub(crate) fn build_reduce_direct_kernel(
         cache_key,
         dispatch_size,
         move |kb| {
-            let input_storage = kb.read_erased::<2>(
+            let input_storage = kb.read_element::<2>(
                 input_meta_body.element,
                 tile_ir::KernelTensorRef::new(input_buffer, input_layout),
             );
-            let output_storage = kb.write_erased::<2>(
+            let output_storage = kb.write_element::<2>(
                 output_meta_body.element,
                 tile_ir::KernelTensorRef::new(output_buffer, output_layout),
             );
 
             kb.program()
                 .program_grid::<BLOCK>(dispatch_size, |program| {
-                    let lane = program.arange();
+                    let lane = program.lane();
                     let group = linear_group(program, dispatch_size);
                     let flat = group * BLOCK as u32 + lane.clone();
                     let in_bounds = flat.lt(total_outputs);
@@ -101,21 +101,27 @@ pub(crate) fn build_reduce_direct_kernel(
                         &output_shape,
                     );
                     let base = layout_index(&input_meta_body, &dims);
-                    let k = tile_ir::tile::Tile::from_index(program.loop_index() * reduce_stride);
-                    let value_index = base + k;
-                    let value = program.load_erased(
-                        input_storage.at(0, value_index),
-                        in_bounds.clone(),
-                        zero_literal(input_meta_body.datatype),
+                    let reduced = program.loop_fold(
+                        reduce_op,
+                        reduce_size,
+                        initial,
+                        |program, loop_index| {
+                            let k = tile_ir::tile::Tile::from_index(loop_index * reduce_stride);
+                            let value_index = base.clone() + k;
+                            let value = program.load_literal(
+                                input_storage.at((0, value_index)),
+                                in_bounds.clone(),
+                                zero_literal(input_meta_body.datatype),
+                            );
+                            let (value, value_ty) = apply_unary_function_chain(
+                                value,
+                                input_meta_body.datatype,
+                                &operation.pre_element_wise,
+                            )
+                            .expect("validated reduce pre_element_wise chain");
+                            cast_tile(value, value_ty, reduce_dtype)
+                        },
                     );
-                    let (value, value_ty) = apply_unary_function_chain(
-                        value,
-                        input_meta_body.datatype,
-                        &operation.pre_element_wise,
-                    )
-                    .expect("validated reduce pre_element_wise chain");
-                    let value = cast_tile(value, value_ty, reduce_dtype);
-                    let reduced = program.loop_fold(reduce_op, reduce_size, value, initial);
                     let (reduced, reduced_ty) = apply_unary_function_chain(
                         reduced,
                         reduce_dtype,
@@ -124,7 +130,7 @@ pub(crate) fn build_reduce_direct_kernel(
                     .expect("validated reduce post_element_wise chain");
                     let reduced = cast_tile(reduced, reduced_ty, output_meta_body.datatype);
                     let output_index = layout_index(&output_meta_body, &dims);
-                    program.store_erased(output_storage.at(0, output_index), reduced, in_bounds);
+                    program.store(output_storage.at((0, output_index)), reduced, in_bounds);
                 });
             Some(())
         },

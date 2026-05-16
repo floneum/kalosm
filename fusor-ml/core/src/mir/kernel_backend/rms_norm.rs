@@ -347,13 +347,15 @@ impl Operation for RmsNormOperation {
                     );
                     tile_ir_kernels::rms_norm_vec4(
                         &mut kb,
-                        input_ref,
-                        residual_ref,
-                        weight_ref,
-                        bias_ref,
-                        output_ref,
-                        meta,
-                        rows,
+                        tile_ir_kernels::RmsNormVec4 {
+                            input: input_ref,
+                            residual: residual_ref,
+                            weight: weight_ref,
+                            bias: bias_ref,
+                            output: output_ref,
+                            meta,
+                            rows,
+                        },
                     )?;
                     Some(kb.finish().0)
                 },
@@ -590,14 +592,18 @@ fn build_rms_norm_tile_ir(
         let chunks = cols.div_ceil(BLOCK as u32);
         phase.program_grid::<BLOCK>([rows, 1, 1], |program| {
             let row = program.program_id(tile_ir::WorkgroupAxis::X);
-            let lane = program.arange();
-            let reduce_col = program.loop_index() * BLOCK as u32 + lane.clone();
-            let reduce_mask = reduce_col.lt(cols);
-            let mut value = program.load(input.at(&row, &reduce_col), reduce_mask.clone(), 0.0);
-            if let Some(residual) = &residual {
-                value = value + program.load(residual.at(&row, &reduce_col), reduce_mask, 0.0);
-            }
-            let sum_square = program.loop_reduce_sum(chunks, value.clone() * value);
+            let lane = program.lane();
+            let sum_square = program.loop_reduce_sum(chunks, |program, loop_index| {
+                let reduce_col = loop_index * BLOCK as u32 + lane.clone();
+                let reduce_mask = reduce_col.clone().lt(cols);
+                let mut value =
+                    program.load(input.at((&row, &reduce_col)), reduce_mask.clone(), 0.0);
+                if let Some(residual) = &residual {
+                    value =
+                        value + program.load(residual.at((&row, &reduce_col)), reduce_mask, 0.0);
+                }
+                value.clone() * value
+            });
             let rms = (tile_ir::tile::Tile::<BLOCK>::from(sum_square)
                 / tile_ir::tile::Scalar::literal(cols as f32)
                 + tile_ir::tile::Scalar::literal(eps))
@@ -605,14 +611,14 @@ fn build_rms_norm_tile_ir(
             for chunk in 0..chunks {
                 let col = lane.clone() + chunk * BLOCK as u32;
                 let mask = col.lt(cols);
-                let mut value = program.load(input.at(&row, &col), mask.clone(), 0.0);
+                let mut value = program.load(input.at((&row, &col)), mask.clone(), 0.0);
                 if let Some(residual) = &residual {
-                    value = value + program.load(residual.at(&row, &col), mask.clone(), 0.0);
+                    value = value + program.load(residual.at((&row, &col)), mask.clone(), 0.0);
                 }
-                let weight = program.load(weight.at(0, &col), mask.clone(), 0.0);
+                let weight = program.load(weight.at((0, &col)), mask.clone(), 0.0);
                 let mut normalized = value / rms.clone() * weight;
                 if let Some(bias) = &bias {
-                    let bias_value = program.load(bias.at(0, &col), mask.clone(), 0.0);
+                    let bias_value = program.load(bias.at((0, &col)), mask.clone(), 0.0);
                     normalized = normalized + bias_value;
                 }
                 // Apply any fused post-element-wise chain in-register before
@@ -624,7 +630,7 @@ fn build_rms_norm_tile_ir(
                             .expect("rms_norm post-chain validated at fuse time");
                     normalized = val;
                 }
-                program.store(output.at(&row, col), normalized, mask);
+                program.store(output.at((&row, col)), normalized, mask);
             }
         });
     }))

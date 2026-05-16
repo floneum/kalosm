@@ -167,7 +167,7 @@ fn build_nary_tile_ir(
             .collect::<Vec<_>>();
 
         phase.program_grid::<BLOCK>(dispatch_size, |program| {
-            let lane = program.arange();
+            let lane = program.lane();
             let group = linear_group(program, dispatch_size);
             let flat_index = group * BLOCK as u32 + lane.clone();
             let in_bounds = flat_index.lt(total_elements);
@@ -183,8 +183,8 @@ fn build_nary_tile_ir(
             );
             let value = cast_tile(value, value_ty, operation.output_datatype);
             let output_index_value = layout_index(&tensor_metas[output_index], &dims);
-            program.store_erased(
-                storages[output_index].at(0, output_index_value),
+            program.store(
+                storages[output_index].at((0, output_index_value)),
                 value,
                 in_bounds,
             );
@@ -196,7 +196,7 @@ fn eval_nary_expr<const N: usize>(
     program: &mut tile_ir::tile::TileBlock<'_, N>,
     expr: &NaryExpr,
     dims: &[tile_ir::tile::Tile<N>],
-    storages: &[tile_ir::tile::ErasedStorage<2>],
+    storages: &[tile_ir::tile::Storage<tile_ir::tile::RuntimeElement, 2>],
     metas: &[TensorMeta],
     mask: tile_ir::tile::Mask<N>,
 ) -> (tile_ir::tile::Tile<N>, DataTypeEnum) {
@@ -226,7 +226,7 @@ fn eval_nary_expr<const N: usize>(
                 .collect::<Vec<_>>();
             let index = layout_index(meta, &coords);
             let value =
-                program.load_erased(storage.at(0, index), mask, zero_literal(meta.datatype));
+                program.load_literal(storage.at((0, index)), mask, zero_literal(meta.datatype));
             (value, meta.datatype)
         }
         NaryExpr::DimIndex(dim) => (dims[*dim].clone(), DataTypeEnum::U32),

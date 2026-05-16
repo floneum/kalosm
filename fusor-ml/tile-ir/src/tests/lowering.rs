@@ -1,48 +1,4 @@
 use super::*;
-use crate::ir::{CoopOperandRole, TileStmt};
-
-/// Lower `ir` and panic with a labelled message on failure. Returns the
-/// lowered Naga kernel for tests that want to inspect the module.
-fn lower_or_fail(ir: &KernelIr, label: &str) -> NagaKernel {
-    ir.lower_to_naga()
-        .unwrap_or_else(|error| panic!("{label} lowering failed: {error}"))
-}
-
-fn ggml_quant_formats() -> [GgmlQuantFormat; 12] {
-    [
-        GgmlQuantFormat::Q4_0,
-        GgmlQuantFormat::Q4_1,
-        GgmlQuantFormat::Q5_0,
-        GgmlQuantFormat::Q5_1,
-        GgmlQuantFormat::Q8_0,
-        GgmlQuantFormat::Q8_1,
-        GgmlQuantFormat::Q2K,
-        GgmlQuantFormat::Q3K,
-        GgmlQuantFormat::Q4K,
-        GgmlQuantFormat::Q5K,
-        GgmlQuantFormat::Q6K,
-        GgmlQuantFormat::Q8K,
-    ]
-}
-
-fn tile_stmts_contain_load_role(stmts: &[TileStmt], role: CoopOperandRole) -> bool {
-    stmts.iter().any(|stmt| match stmt {
-        TileStmt::LoadCoop { role: r, .. } => *r == role,
-        TileStmt::Fold { body, .. } => tile_stmts_contain_load_role(body, role),
-        _ => false,
-    })
-}
-
-#[test]
-fn layout_is_structured_shape_strides_and_memory_level() {
-    let shape = Shape::new([4, 8]);
-    let layout = Layout::contiguous(MemoryLevel::Storage, shape.clone());
-
-    assert_eq!(layout.shape(), &shape);
-    assert_eq!(layout.affine_strides(), vec![8, 1]);
-    assert_eq!(layout.memory_level(), MemoryLevel::Storage);
-    assert_eq!(layout.element_count().get(), 32);
-}
 
 #[test]
 fn op_enum_is_source_tile_program_only() {
@@ -50,14 +6,13 @@ fn op_enum_is_source_tile_program_only() {
         let x = phase.storage_read::<F32, 2>(Shape::new([1, 8]));
         let y = phase.storage_write::<F32, 2>(Shape::new([1, 8]));
         phase.program_grid::<8>([1, 1, 1], |program| {
-            let lane = program.arange();
+            let lane = program.lane();
             let mask = lane.lt(8);
-            let value = program.load(x.at(0, &lane), mask.clone(), 0.0);
-            program.store(y.at(0, lane), value, mask);
+            let value = program.load(x.at((0, &lane)), mask.clone(), 0.0);
+            program.store(y.at((0, lane)), value, mask);
         });
     });
 
-    // The kernel body is a single `TileProgramOp` by construction.
     let _ = ir.body();
 }
 
@@ -71,13 +26,13 @@ fn tile_source_softmax_lowers_to_naga() {
         let y = phase.storage_write::<F32, 2>(Shape::new([ROWS, COLS]));
         phase.program_grid::<BLOCK>([1, ROWS, 1], |program| {
             let row = program.program_id(WorkgroupAxis::Y);
-            let col = program.arange();
+            let col = program.lane();
             let mask = col.lt(COLS);
-            let values = program.load(x.at(&row, &col), mask.clone(), f32::MIN);
+            let values = program.load(x.at((&row, &col)), mask.clone(), f32::MIN);
             let max = program.reduce_max(values.clone());
             let exp = (values - max).exp();
             let sum = program.reduce_sum(exp.clone());
-            program.store(y.at(row, col), exp / sum, mask);
+            program.store(y.at((row, col)), exp / sum, mask);
         });
     });
 
@@ -90,10 +45,10 @@ fn lowered_naga_uses_anonymous_ir_objects_except_entry_point() {
         let x = phase.storage_read::<F32, 2>(Shape::new([1, 8]));
         let y = phase.storage_write::<F32, 2>(Shape::new([1, 8]));
         phase.program_grid::<8>([1, 1, 1], |program| {
-            let lane = program.arange();
+            let lane = program.lane();
             let mask = lane.lt(8);
-            let value = program.load(x.at(0, &lane), mask.clone(), 0.0);
-            program.store(y.at(0, lane), value, mask);
+            let value = program.load(x.at((0, &lane)), mask.clone(), 0.0);
+            program.store(y.at((0, lane)), value, mask);
         });
     });
     let lowered = lower_or_fail(&ir, "tile");
@@ -118,4 +73,40 @@ fn lowered_naga_uses_anonymous_ir_objects_except_entry_point() {
             .iter()
             .all(|(_, local)| local.name.is_none()));
     }
+}
+
+#[test]
+fn generic_vector_load_and_dot_lower_to_naga() {
+    let ir = tile::build(|phase| {
+        let x = phase.storage_read::<Vector<F32, 2>, 1>(Shape::new([16]));
+        let y = phase.storage_write::<F32, 1>(Shape::new([16]));
+        phase.program_grid::<16>([1, 1, 1], |program| {
+            let lane = program.lane();
+            let mask = lane.clone().lt(16);
+            let value = program.load_vector::<F32, 2>(
+                x.at(lane.clone()),
+                mask.clone(),
+                TileLiteral::f32(0.0),
+            );
+            let dot = program.vector_dot::<F32, 2>(value.clone(), value);
+            program.store_linear(y.at(lane), dot, mask);
+        });
+    });
+
+    lower_or_fail(&ir, "generic vec2 dot");
+}
+
+#[test]
+fn typed_coop_accumulator_records_scalar_role_and_shape() {
+    let ir = tile::build(|phase| {
+        phase.program_grid::<32>([1, 1, 1], |program| {
+            let acc = program.alloc_coop_acc_typed::<F32, 8, 8>();
+            program.zero_coop_acc(&acc);
+        });
+    });
+
+    assert_eq!(
+        ir.locals()[0].element,
+        ElementType::coop_matrix(ScalarElement::F32, CoopMatrixRole::C, 8, 8)
+    );
 }

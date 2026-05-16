@@ -1,5 +1,15 @@
 use super::*;
 
+type Q4KGgmlAccumulateWord<'a> = fn(
+    &Lowerer<'a>,
+    &mut Arena<Expression>,
+    &mut Block,
+    Handle<Expression>,
+    &[Handle<Expression>],
+    usize,
+    &mut [Handle<Expression>; 4],
+);
+
 impl<'a> Lowerer<'a> {
     pub(in crate::lower) fn q4k_ggml_dot(
         &self,
@@ -85,16 +95,7 @@ impl<'a> Lowerer<'a> {
 
         let mut first_sums = [self.f32(expressions, 0.0); 4];
         let mut second_sums = [self.f32(expressions, 0.0); 4];
-        #[allow(clippy::type_complexity)]
-        let accumulate: fn(
-            &Self,
-            &mut Arena<Expression>,
-            &mut Block,
-            Handle<Expression>,
-            &[Handle<Expression>],
-            usize,
-            &mut [Handle<Expression>; 4],
-        ) = if matrix.rows <= 4096 && matrix.cols >= 8192 {
+        let accumulate: Q4KGgmlAccumulateWord<'a> = if matrix.rows <= 4096 && matrix.cols >= 8192 {
             Self::q4k_ggml_accumulate_word_vector
         } else {
             Self::q4k_ggml_accumulate_word_scalar
@@ -298,7 +299,7 @@ impl<'a> Lowerer<'a> {
         }
 
         self.q8_activation_pack_pair_dot(expressions, body, k_base, a, |s, e, b, k, off| {
-            s.q6k_q8_activation_dot8(e, matrix, k, col, a, off, b)
+            s.q6k_q8_activation_dot8(e, matrix, QuantDotCoords { k_base: k, col }, a, off, b)
         })
     }
 
@@ -306,8 +307,7 @@ impl<'a> Lowerer<'a> {
         &self,
         expressions: &mut Arena<Expression>,
         matrix: &QuantizedMatrix,
-        k_base: Handle<Expression>,
-        col: Handle<Expression>,
+        coords: QuantDotCoords,
         a: &Q8ActivationPacks,
         pack_offset: usize,
         body: &mut Block,
@@ -318,9 +318,19 @@ impl<'a> Lowerer<'a> {
             ));
         }
 
-        let (b_scale, b_packs) = self.q6k_quant_packs8(expressions, matrix, k_base, col, body)?;
-        let total =
-            self.q8_activation_packs_dot(expressions, body, a, pack_offset, b_scale, b_packs, None);
+        let (b_scale, b_packs) =
+            self.q6k_quant_packs8(expressions, matrix, coords.k_base, coords.col, body)?;
+        let total = self.q8_activation_packs_dot(
+            expressions,
+            body,
+            a,
+            pack_offset,
+            Q8ActivationDotRhs {
+                scale: b_scale,
+                packs: b_packs,
+                min: None,
+            },
+        );
         Ok(total)
     }
 
@@ -330,17 +340,15 @@ impl<'a> Lowerer<'a> {
         body: &mut Block,
         a: &Q8ActivationPacks,
         pack_offset: usize,
-        b_scale: Handle<Expression>,
-        b_packs: [Handle<Expression>; 2],
-        b_min: Option<Handle<Expression>>,
+        rhs: Q8ActivationDotRhs,
     ) -> Handle<Expression> {
         let mut total = self.f32(expressions, 0.0);
-        for (i, b_pack) in b_packs.into_iter().enumerate() {
+        for (i, b_pack) in rhs.packs.into_iter().enumerate() {
             let a_pack_index = pack_offset + i;
             let a_pack = self.load_local(expressions, body, a.packs[a_pack_index]);
             let dot = self.dot4_i8_packed(expressions, body, a_pack, b_pack);
-            let scaled = self.mul(expressions, body, dot, b_scale);
-            let unscaled = if let Some(b_min) = b_min {
+            let scaled = self.mul(expressions, body, dot, rhs.scale);
+            let unscaled = if let Some(b_min) = rhs.min {
                 let a_sum_i32 = self.load_local(expressions, body, a.sums_i32[a_pack_index]);
                 let a_sum = self.as_f32(expressions, body, a_sum_i32);
                 let min_term = self.mul(expressions, body, a_sum, b_min);

@@ -1,7 +1,6 @@
 use super::*;
-use naga::{Barrier, CooperativeData, CooperativeRole, CooperativeSize};
-
-const COOP_SIZE: CooperativeSize = CooperativeSize::Eight;
+use crate::lower::tile_program::{CoopFragmentLoad, TileFoldLowering};
+use naga::{Barrier, CooperativeData, CooperativeRole};
 
 impl<'a> Lowerer<'a> {
     /// Lower non-store tile statements. Coop ops emit cooperative-matrix
@@ -28,15 +27,9 @@ impl<'a> Lowerer<'a> {
     ) -> Result<(), LowerError> {
         match stmt {
             TileStmt::Store(store) => self.lower_tile_store_stmt(expressions, scratch, body, store),
-            TileStmt::StoreIndexed(store) => self.lower_tile_indexed_store_stmt(
-                expressions,
-                scratch,
-                body,
-                &store.dst,
-                &store.index,
-                &store.value,
-                &store.mask,
-            ),
+            TileStmt::StoreIndexed(store) => {
+                self.lower_tile_indexed_store_stmt(expressions, scratch, body, store)
+            }
             TileStmt::StoreLocal { dst, value } => {
                 let value_ty = value.element();
                 if value_ty != dst.element {
@@ -120,9 +113,7 @@ impl<'a> Lowerer<'a> {
             }
             TileStmt::ZeroCoopAcc { acc } => {
                 let local = self.private_local(*acc)?;
-                let ty = self.coop_c_ty.ok_or(LowerError::UnsupportedOperation(
-                    "coop C type missing — tile program uses coop statements without cooperative-matrix support",
-                ))?;
+                let ty = self.element_type(acc.element)?;
                 let zero = expressions.append(Expression::ZeroValue(ty), Span::default());
                 self.store_local(expressions, body, local, zero);
                 Ok(())
@@ -132,46 +123,58 @@ impl<'a> Lowerer<'a> {
                 src,
                 row_offset,
                 col_offset,
-            } => match src {
-                CopySource::Storage(view) => self.lower_copy_to_tile(
-                    expressions,
-                    scratch,
-                    body,
-                    *dst,
-                    view,
-                    row_offset,
-                    col_offset,
-                ),
-                CopySource::Quantized(matrix) => self.lower_copy_quant_to_tile(
-                    expressions,
-                    scratch,
-                    body,
-                    *dst,
-                    matrix,
-                    row_offset,
-                    col_offset,
-                ),
-            },
-            TileStmt::StoreCoopAcc { acc, dst, row, col } => {
-                self.lower_store_coop_acc(expressions, scratch, body, *acc, dst, row, col)
+            } => {
+                let offsets = TileCoordExprs {
+                    row: row_offset,
+                    col: col_offset,
+                };
+                match src {
+                    CopySource::Storage(view) => {
+                        self.lower_copy_to_tile(expressions, scratch, body, *dst, view, offsets)
+                    }
+                    CopySource::Quantized(matrix) => self.lower_copy_quant_to_tile(
+                        expressions,
+                        scratch,
+                        body,
+                        *dst,
+                        matrix,
+                        offsets,
+                    ),
+                }
             }
+            TileStmt::StoreCoopAcc { acc, dst, row, col } => self.lower_store_coop_acc(
+                expressions,
+                scratch,
+                body,
+                *acc,
+                dst,
+                TileCoordExprs { row, col },
+            ),
             TileStmt::LoadCoop {
                 id,
                 role,
                 tile,
                 row,
                 col,
+                scalar,
+                rows,
+                cols,
             } => self.lower_load_coop_fragment(
                 expressions,
                 scratch,
                 body,
-                *id,
-                *tile,
-                row,
-                col,
-                match role {
-                    CoopOperandRole::A => CooperativeRole::A,
-                    CoopOperandRole::B => CooperativeRole::B,
+                CoopFragmentLoad {
+                    id: *id,
+                    tile: *tile,
+                    row,
+                    col,
+                    role: match role {
+                        CoopOperandRole::A => CooperativeRole::A,
+                        CoopOperandRole::B => CooperativeRole::B,
+                    },
+                    scalar: *scalar,
+                    rows: *rows,
+                    cols: *cols,
                 },
             ),
             TileStmt::Mma { acc, a, b } => self.lower_coop_mma(expressions, body, *acc, *a, *b),
@@ -184,27 +187,42 @@ impl<'a> Lowerer<'a> {
                 expressions,
                 scratch,
                 body,
-                count,
-                *iter_var,
-                fold_body,
-                accumulators,
+                TileFoldLowering {
+                    count,
+                    iter_var: *iter_var,
+                    body: fold_body,
+                    accumulators,
+                },
             ),
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn lower_load_coop_fragment(
         &self,
         expressions: &mut Arena<Expression>,
         scratch: ScratchLocals,
         body: &mut Block,
-        id: CoopFragmentId,
-        tile: TileRef,
-        row: &Expr,
-        col: &Expr,
-        role: CooperativeRole,
+        request: CoopFragmentLoad<'_>,
     ) -> Result<(), LowerError> {
+        let CoopFragmentLoad {
+            id,
+            tile,
+            row,
+            col,
+            role,
+            scalar,
+            rows,
+            cols,
+        } = request;
         let layout = self.tile_layout(tile)?;
+        let expected_tile_element = scalar.element();
+        if tile.element != expected_tile_element {
+            return Err(LowerError::TileElementMismatch {
+                tile: tile.id,
+                declared: tile.element,
+                used: expected_tile_element,
+            });
+        }
         let stride_u = Self::row_major_tile_stride(layout)?;
         let row_h = self.lower_tile_expr(expressions, scratch, body, row)?;
         let col_h = self.lower_tile_expr(expressions, scratch, body, col)?;
@@ -215,8 +233,8 @@ impl<'a> Lowerer<'a> {
             expressions,
             body,
             Expression::CooperativeLoad {
-                columns: COOP_SIZE,
-                rows: COOP_SIZE,
+                columns: Self::cooperative_size(cols)?,
+                rows: Self::cooperative_size(rows)?,
                 role,
                 data: CooperativeData {
                     pointer: ptr,
@@ -339,9 +357,15 @@ impl<'a> Lowerer<'a> {
         body: &mut Block,
         dst: TileRef,
         src: &StorageView,
-        row_offset: &Expr,
-        col_offset: &Expr,
+        offsets: TileCoordExprs<'_>,
     ) -> Result<(), LowerError> {
+        if dst.element != src.buffer.element {
+            return Err(LowerError::TileElementMismatch {
+                tile: dst.id,
+                declared: dst.element,
+                used: src.buffer.element,
+            });
+        }
         let layout = self.tile_layout(dst)?;
         let [rows, cols] = Self::tile_shape(layout)?;
         let total = rows
@@ -351,8 +375,15 @@ impl<'a> Lowerer<'a> {
             ))?;
         let stride = Self::row_major_tile_stride(layout)?;
         let local = Self::function_arg(expressions, LOCAL_INVOCATION_INDEX_ARG);
-        let row_base = self.lower_tile_expr(expressions, scratch, body, row_offset)?;
-        let col_base = self.lower_tile_expr(expressions, scratch, body, col_offset)?;
+        let row_base = self.lower_tile_expr(expressions, scratch, body, offsets.row)?;
+        let col_base = self.lower_tile_expr(expressions, scratch, body, offsets.col)?;
+        let lane_layout = CopyLaneLayout {
+            dst,
+            cols,
+            stride,
+            row_base,
+            col_base,
+        };
 
         self.lower_copy_passes(expressions, body, local, total, |expressions, flat| {
             let mut accept = Block::new();
@@ -360,16 +391,7 @@ impl<'a> Lowerer<'a> {
                 global_row,
                 global_col,
                 tile_ptr,
-            } = self.copy_lane_pointer_and_globals(
-                expressions,
-                &mut accept,
-                flat,
-                dst,
-                cols,
-                stride,
-                row_base,
-                col_base,
-            )?;
+            } = self.copy_lane_pointer_and_globals(expressions, &mut accept, flat, lane_layout)?;
             let storage_index = self.storage_index_from_coords(
                 expressions,
                 src,
@@ -398,9 +420,15 @@ impl<'a> Lowerer<'a> {
         body: &mut Block,
         dst: TileRef,
         src: &QuantizedMatrix,
-        row_offset: &Expr,
-        col_offset: &Expr,
+        offsets: TileCoordExprs<'_>,
     ) -> Result<(), LowerError> {
+        if dst.element != ElementType::F32 {
+            return Err(LowerError::TileElementMismatch {
+                tile: dst.id,
+                declared: dst.element,
+                used: ElementType::F32,
+            });
+        }
         let layout = self.tile_layout(dst)?;
         let [rows, cols] = Self::tile_shape(layout)?;
         let stride = Self::row_major_tile_stride(layout)?;
@@ -413,8 +441,8 @@ impl<'a> Lowerer<'a> {
             _ => 0,
         };
         let local = Self::function_arg(expressions, LOCAL_INVOCATION_INDEX_ARG);
-        let row_base = self.lower_tile_expr(expressions, scratch, body, row_offset)?;
-        let col_base = self.lower_tile_expr(expressions, scratch, body, col_offset)?;
+        let row_base = self.lower_tile_expr(expressions, scratch, body, offsets.row)?;
+        let col_base = self.lower_tile_expr(expressions, scratch, body, offsets.col)?;
 
         if n > 0 && rows.is_multiple_of(n) {
             let groups_per_col = rows / n;
@@ -502,22 +530,20 @@ impl<'a> Lowerer<'a> {
 
         // Scalar fallback: one element per invocation per pass.
         let total = rows * cols;
+        let lane_layout = CopyLaneLayout {
+            dst,
+            cols,
+            stride,
+            row_base,
+            col_base,
+        };
         self.lower_copy_passes(expressions, body, local, total, |expressions, flat| {
             let mut accept = Block::new();
             let CopyLaneCoords {
                 global_row,
                 global_col,
                 tile_ptr,
-            } = self.copy_lane_pointer_and_globals(
-                expressions,
-                &mut accept,
-                flat,
-                dst,
-                cols,
-                stride,
-                row_base,
-                col_base,
-            )?;
+            } = self.copy_lane_pointer_and_globals(expressions, &mut accept, flat, lane_layout)?;
             let value =
                 self.dequantize_qvalue(expressions, src, global_row, global_col, &mut accept)?;
             accept.push(
@@ -538,15 +564,14 @@ impl<'a> Lowerer<'a> {
         body: &mut Block,
         acc: LocalRef,
         dst: &StorageView,
-        row: &Expr,
-        col: &Expr,
+        coords: TileCoordExprs<'_>,
     ) -> Result<(), LowerError> {
         // Flush any pending acc SSA so the Load below sees the current value.
         self.flush_coop_acc_cache(expressions, body);
         let acc_local = self.private_local(acc)?;
         let (stride_u, row_major) = Self::cooperative_store_layout(&dst.layout)?;
-        let row_h = self.lower_tile_expr(expressions, scratch, body, row)?;
-        let col_h = self.lower_tile_expr(expressions, scratch, body, col)?;
+        let row_h = self.lower_tile_expr(expressions, scratch, body, coords.row)?;
+        let col_h = self.lower_tile_expr(expressions, scratch, body, coords.col)?;
         let storage_index =
             self.storage_index_from_coords(expressions, dst, &[row_h, col_h], body)?;
         let storage_ptr = self.storage_dynamic_pointer(expressions, dst, storage_index, body)?;
@@ -628,18 +653,20 @@ impl<'a> Lowerer<'a> {
     /// Resolve a flat invocation index into the destination tile pointer plus
     /// the source's global (row, col). Shared by `lower_copy_to_tile` and the
     /// scalar fallback in `lower_copy_quant_to_tile`.
-    #[allow(clippy::too_many_arguments)]
     fn copy_lane_pointer_and_globals(
         &self,
         expressions: &mut Arena<Expression>,
         body: &mut Block,
         flat: Handle<Expression>,
-        dst: TileRef,
-        cols: u32,
-        stride: u32,
-        row_base: Handle<Expression>,
-        col_base: Handle<Expression>,
+        layout: CopyLaneLayout,
     ) -> Result<CopyLaneCoords, LowerError> {
+        let CopyLaneLayout {
+            dst,
+            cols,
+            stride,
+            row_base,
+            col_base,
+        } = layout;
         let local_row = self.div_literal_u32_emitted(expressions, flat, cols, body);
         let local_col = self.mod_literal_u32_emitted(expressions, flat, cols, body);
         let global_row = self.add(expressions, body, row_base, local_row);
@@ -661,4 +688,19 @@ pub(super) struct CopyLaneCoords {
     pub global_row: Handle<Expression>,
     pub global_col: Handle<Expression>,
     pub tile_ptr: Handle<Expression>,
+}
+
+#[derive(Clone, Copy)]
+struct TileCoordExprs<'a> {
+    row: &'a Expr,
+    col: &'a Expr,
+}
+
+#[derive(Clone, Copy)]
+struct CopyLaneLayout {
+    dst: TileRef,
+    cols: u32,
+    stride: u32,
+    row_base: Handle<Expression>,
+    col_base: Handle<Expression>,
 }

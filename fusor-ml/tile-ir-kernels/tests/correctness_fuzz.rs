@@ -208,23 +208,23 @@ fn fuzz_qgemm_case(
     let (packed_b, dequantized_b) = pack_random_quantized_matrix(rng, format, k, n);
     let expected = cpu_matmul(&a, &dequantized_b, m, k, n);
     let ir = qmatmul_ir(m, n, k, format, true, &a_layout, &y_layout);
-    assert_kernel_matmul(
+    assert_kernel_matmul(KernelMatmulAssertion {
         device,
         queue,
-        &format!(
+        label: &format!(
             "qgemm {format:?} {} case {case} m={m} n={n} k={k}",
             variant.name()
         ),
-        &ir,
-        bytemuck::cast_slice(&a_physical),
-        bytemuck::cast_slice(&packed_b),
-        &y_layout,
-        m,
-        n,
-        (n as u32, m as u32, 1),
-        &expected,
-        3.0e-2,
-    )
+        ir: &ir,
+        first_input: bytemuck::cast_slice(&a_physical),
+        second_input: bytemuck::cast_slice(&packed_b),
+        y_layout: &y_layout,
+        rows: m,
+        cols: n,
+        dispatch: (n as u32, m as u32, 1),
+        expected: &expected,
+        tolerance: 3.0e-2,
+    })
 }
 
 fn fuzz_qgemm_skewed_activation_case(
@@ -243,20 +243,20 @@ fn fuzz_qgemm_skewed_activation_case(
     let (packed_b, dequantized_b) = pack_random_quantized_matrix(rng, format, k, n);
     let expected = cpu_matmul(&a, &dequantized_b, m, k, n);
     let ir = qmatmul_ir(m, n, k, format, true, &a_layout, &y_layout);
-    assert_kernel_matmul(
+    assert_kernel_matmul(KernelMatmulAssertion {
         device,
         queue,
-        &format!("qgemm {format:?} skewed activation m={m} n={n} k={k}"),
-        &ir,
-        bytemuck::cast_slice(&a_physical),
-        bytemuck::cast_slice(&packed_b),
-        &y_layout,
-        m,
-        n,
-        (n as u32, m as u32, 1),
-        &expected,
-        3.0e-2,
-    )
+        label: &format!("qgemm {format:?} skewed activation m={m} n={n} k={k}"),
+        ir: &ir,
+        first_input: bytemuck::cast_slice(&a_physical),
+        second_input: bytemuck::cast_slice(&packed_b),
+        y_layout: &y_layout,
+        rows: m,
+        cols: n,
+        dispatch: (n as u32, m as u32, 1),
+        expected: &expected,
+        tolerance: 3.0e-2,
+    })
 }
 
 fn fuzz_qgemm_im2col_nhwc_case(
@@ -283,34 +283,43 @@ fn fuzz_qgemm_im2col_nhwc_case(
     );
     let y_layout = matrix_layout(m, n, StorageVariant::Contiguous);
     let a = im2col_nhwc_matrix(
-        &input, batch, input_h, input_w, channels, out_h, out_w, kernel_h, kernel_w,
+        &input,
+        NhwcIm2colSpec {
+            batch,
+            input_h,
+            input_w,
+            channels,
+            out_h,
+            out_w,
+            kernel_h,
+            kernel_w,
+        },
     );
     let (packed_b, dequantized_b) = pack_random_quantized_matrix(rng, format, k, n);
     let expected = cpu_matmul(&a, &dequantized_b, m, k, n);
-    let ir = qmatmul_im2col_nhwc_ir(
-        m,
+    let ir = qmatmul_im2col_nhwc_ir(Im2colQmatmulIr {
         n,
         k,
         format,
-        &input_layout,
-        [out_h, out_w],
-        [kernel_h, kernel_w],
-        &y_layout,
-    );
-    assert_kernel_matmul(
+        input_layout: &input_layout,
+        output_hw: [out_h, out_w],
+        kernel_hw: [kernel_h, kernel_w],
+        y_layout: &y_layout,
+    });
+    assert_kernel_matmul(KernelMatmulAssertion {
         device,
         queue,
-        &format!("qgemm {format:?} im2col_nhwc m={m} n={n} k={k}"),
-        &ir,
-        bytemuck::cast_slice(&input),
-        bytemuck::cast_slice(&packed_b),
-        &y_layout,
-        m,
-        n,
-        (n as u32, m as u32, 1),
-        &expected,
-        3.0e-2,
-    )
+        label: &format!("qgemm {format:?} im2col_nhwc m={m} n={n} k={k}"),
+        ir: &ir,
+        first_input: bytemuck::cast_slice(&input),
+        second_input: bytemuck::cast_slice(&packed_b),
+        y_layout: &y_layout,
+        rows: m,
+        cols: n,
+        dispatch: (n as u32, m as u32, 1),
+        expected: &expected,
+        tolerance: 3.0e-2,
+    })
 }
 
 fn fuzz_qgemv_case(
@@ -331,23 +340,23 @@ fn fuzz_qgemv_case(
     let (packed_b, dequantized_b) = pack_random_quantized_matrix(rng, format, k, n);
     let expected = cpu_matmul(&a, &dequantized_b, m, k, n);
     let ir = qmatmul_ir(m, n, k, format, false, &a_layout, &y_layout);
-    assert_kernel_matmul(
+    assert_kernel_matmul(KernelMatmulAssertion {
         device,
         queue,
-        &format!(
+        label: &format!(
             "qgemv {format:?} {} case {case} n={n} k={k}",
             variant.name()
         ),
-        &ir,
-        bytemuck::cast_slice(&a_physical),
-        bytemuck::cast_slice(&packed_b),
-        &y_layout,
-        m,
-        n,
-        (1, n as u32, 1),
-        &expected,
-        qgemv_tolerance(format),
-    )
+        ir: &ir,
+        first_input: bytemuck::cast_slice(&a_physical),
+        second_input: bytemuck::cast_slice(&packed_b),
+        y_layout: &y_layout,
+        rows: m,
+        cols: n,
+        dispatch: (1, n as u32, 1),
+        expected: &expected,
+        tolerance: qgemv_tolerance(format),
+    })
 }
 
 fn fuzz_qgemv_split_workgroups_case(
@@ -366,20 +375,20 @@ fn fuzz_qgemv_split_workgroups_case(
     let (packed_b, dequantized_b) = pack_random_quantized_matrix(rng, format, k, n);
     let expected = cpu_matmul(&a, &dequantized_b, m, k, n);
     let ir = qmatmul_split_workgroups_ir(m, n, k, format, 2, &a_layout, &y_layout);
-    assert_kernel_matmul(
+    assert_kernel_matmul(KernelMatmulAssertion {
         device,
         queue,
-        &format!("split-grid qgemv {format:?} n={n} k={k}"),
-        &ir,
-        bytemuck::cast_slice(&a_physical),
-        bytemuck::cast_slice(&packed_b),
-        &y_layout,
-        m,
-        n,
-        (2, n.div_ceil(2) as u32, 1),
-        &expected,
-        qgemv_tolerance(format),
-    )
+        label: &format!("split-grid qgemv {format:?} n={n} k={k}"),
+        ir: &ir,
+        first_input: bytemuck::cast_slice(&a_physical),
+        second_input: bytemuck::cast_slice(&packed_b),
+        y_layout: &y_layout,
+        rows: m,
+        cols: n,
+        dispatch: (2, n.div_ceil(2) as u32, 1),
+        expected: &expected,
+        tolerance: qgemv_tolerance(format),
+    })
 }
 
 fn gemm_ir(a_layout: &Layout, b_layout: &Layout, y_layout: &Layout) -> KernelIr {
@@ -458,16 +467,26 @@ fn qmatmul_split_workgroups_ir(
     })
 }
 
-fn qmatmul_im2col_nhwc_ir(
-    _m: usize,
+struct Im2colQmatmulIr<'a> {
     n: usize,
     k: usize,
     format: GgmlQuantFormat,
-    input_layout: &Layout,
+    input_layout: &'a Layout,
     output_hw: [usize; 2],
     kernel_hw: [usize; 2],
-    y_layout: &Layout,
-) -> KernelIr {
+    y_layout: &'a Layout,
+}
+
+fn qmatmul_im2col_nhwc_ir(spec: Im2colQmatmulIr<'_>) -> KernelIr {
+    let Im2colQmatmulIr {
+        n,
+        k,
+        format,
+        input_layout,
+        output_hw,
+        kernel_hw,
+        y_layout,
+    } = spec;
     let input_layout = input_layout.clone();
     let y_layout = y_layout.clone();
     tile::build(move |phase| {
@@ -683,21 +702,36 @@ fn run_three_buffer_kernel(
     Ok(values)
 }
 
-#[allow(clippy::too_many_arguments)]
-fn assert_kernel_matmul(
-    device: &wgpu::Device,
-    queue: &wgpu::Queue,
-    label: &str,
-    ir: &KernelIr,
-    first_input: &[u8],
-    second_input: &[u8],
-    y_layout: &Layout,
+struct KernelMatmulAssertion<'a> {
+    device: &'a wgpu::Device,
+    queue: &'a wgpu::Queue,
+    label: &'a str,
+    ir: &'a KernelIr,
+    first_input: &'a [u8],
+    second_input: &'a [u8],
+    y_layout: &'a Layout,
     rows: usize,
     cols: usize,
     dispatch: (u32, u32, u32),
-    expected: &[f32],
+    expected: &'a [f32],
     tolerance: f32,
-) -> TestResult {
+}
+
+fn assert_kernel_matmul(case: KernelMatmulAssertion<'_>) -> TestResult {
+    let KernelMatmulAssertion {
+        device,
+        queue,
+        label,
+        ir,
+        first_input,
+        second_input,
+        y_layout,
+        rows,
+        cols,
+        dispatch,
+        expected,
+        tolerance,
+    } = case;
     let actual_physical = run_three_buffer_kernel(
         device,
         queue,
@@ -1096,9 +1130,7 @@ fn cpu_matmul(a: &[f32], b: &[f32], m: usize, k: usize, n: usize) -> Vec<f32> {
     y
 }
 
-#[allow(clippy::too_many_arguments)]
-fn im2col_nhwc_matrix(
-    input: &[f32],
+struct NhwcIm2colSpec {
     batch: usize,
     input_h: usize,
     input_w: usize,
@@ -1107,7 +1139,19 @@ fn im2col_nhwc_matrix(
     out_w: usize,
     kernel_h: usize,
     kernel_w: usize,
-) -> Vec<f32> {
+}
+
+fn im2col_nhwc_matrix(input: &[f32], spec: NhwcIm2colSpec) -> Vec<f32> {
+    let NhwcIm2colSpec {
+        batch,
+        input_h,
+        input_w,
+        channels,
+        out_h,
+        out_w,
+        kernel_h,
+        kernel_w,
+    } = spec;
     let m = batch * out_h * out_w;
     let k = kernel_h * kernel_w * channels;
     let mut matrix = vec![0.0; m * k];
@@ -1190,7 +1234,7 @@ fn ggml_formats() -> [GgmlQuantFormat; 12] {
 }
 
 fn qgemv_cols_per_workgroup(format: GgmlQuantFormat) -> usize {
-    format.qgemv_cols_per_workgroup() as usize
+    tile_ir_kernels::qgemv_cols_per_workgroup(format) as usize
 }
 
 fn qgemv_tolerance(format: GgmlQuantFormat) -> f32 {

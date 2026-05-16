@@ -17,9 +17,11 @@ impl<'a> Lowerer<'a> {
                 expressions,
                 scratch,
                 body,
-                &load.mask,
-                spill_depth,
-                &load.fill,
+                MaskedF32Value {
+                    mask: &load.mask,
+                    fill: &load.fill,
+                    spill_depth,
+                },
                 |expressions, block| {
                     let row = self.lower_tile_expr_lane(
                         expressions,
@@ -54,10 +56,12 @@ impl<'a> Lowerer<'a> {
             expressions,
             scratch,
             body,
-            view,
-            &load.mask,
-            &load.fill,
-            spill_depth,
+            StorageLoadLowering {
+                src: view,
+                mask: &load.mask,
+                fill: &load.fill,
+                spill_depth,
+            },
             |lowerer, expressions, accept| {
                 let row = lowerer.lower_tile_expr_lane(
                     expressions,
@@ -90,10 +94,12 @@ impl<'a> Lowerer<'a> {
             expressions,
             scratch,
             body,
-            &load.src,
-            &load.mask,
-            &load.fill,
-            spill_depth,
+            StorageLoadLowering {
+                src: &load.src,
+                mask: &load.mask,
+                fill: &load.fill,
+                spill_depth,
+            },
             |lowerer, expressions, accept| {
                 lowerer.lower_tile_expr_lane(expressions, scratch, accept, &load.index, spill_depth)
             },
@@ -105,43 +111,49 @@ impl<'a> Lowerer<'a> {
     /// true (directly into `body`) and once inside the masked-load accept
     /// block when not. `fill_expr` is the masked-out value, lowered eagerly
     /// only when the mask is not constant true.
-    #[allow(clippy::too_many_arguments)]
     fn lower_storage_load_with(
         &self,
         expressions: &mut Arena<Expression>,
         scratch: ScratchLocals,
         body: &mut Block,
-        src: &StorageView,
-        mask: &Expr,
-        fill_expr: &Expr,
-        spill_depth: usize,
+        request: StorageLoadLowering<'_>,
         index: impl Fn(
             &Self,
             &mut Arena<Expression>,
             &mut Block,
         ) -> Result<Handle<Expression>, LowerError>,
     ) -> Result<Handle<Expression>, LowerError> {
-        if mask.is_constant_true() {
+        if request.mask.is_constant_true() {
             let src_index = index(self, expressions, body)?;
-            let src_ptr = self.storage_dynamic_pointer(expressions, src, src_index, body)?;
+            let src_ptr =
+                self.storage_dynamic_pointer(expressions, request.src, src_index, body)?;
             return Ok(Self::emit_load(expressions, body, src_ptr));
         }
 
-        let element = src.buffer.element;
-        let fill_source = fill_expr.element();
-        let fill = self.lower_tile_expr_lane(expressions, scratch, body, fill_expr, spill_depth)?;
+        let element = request.src.buffer.element;
+        let fill_source = request.fill.element();
+        let fill = self.lower_tile_expr_lane(
+            expressions,
+            scratch,
+            body,
+            request.fill,
+            request.spill_depth,
+        )?;
         let fill = self.cast_tile_value(expressions, body, fill, fill_source, element);
         self.lower_masked_value_to_local(
             expressions,
             scratch,
             body,
-            mask,
-            spill_depth,
-            element,
-            fill,
+            MaskedLocalValue {
+                mask: request.mask,
+                element,
+                fill,
+                spill_depth: request.spill_depth,
+            },
             |expressions, accept| {
                 let src_index = index(self, expressions, accept)?;
-                let src_ptr = self.storage_dynamic_pointer(expressions, src, src_index, accept)?;
+                let src_ptr =
+                    self.storage_dynamic_pointer(expressions, request.src, src_index, accept)?;
                 Ok(Self::emit_load(expressions, accept, src_ptr))
             },
         )
