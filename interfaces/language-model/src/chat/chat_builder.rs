@@ -3,7 +3,7 @@ use crate::ModelConstraints;
 use crate::NoConstraints;
 use crate::ToChatMessage;
 use async_lock::Mutex as AsyncMutex;
-use futures_channel::mpsc::{UnboundedReceiver, UnboundedSender};
+use futures_channel::mpsc::UnboundedReceiver;
 use futures_channel::oneshot::Receiver;
 use futures_util::Future;
 use futures_util::FutureExt;
@@ -607,60 +607,6 @@ impl<'a, M: CreateChatSession, Constraints, Sampler>
             .push(message.into());
         myself
     }
-
-    fn ensure_task_started_with<F>(
-        &mut self,
-        build_future: impl FnOnce(&mut Self, UnboundedSender<String>) -> F,
-    ) where
-        F: Future<Output = Result<BoxedAny, M::Error>> + WasmNotSend + 'static,
-    {
-        if self.task.get().is_some() {
-            return;
-        }
-
-        let (tx, rx) = futures_channel::mpsc::unbounded();
-        let (result_tx, result_rx) = futures_channel::oneshot::channel();
-        self.queued_tokens = Some(rx);
-        self.result = Some(result_rx);
-
-        let future = build_future(self, tx);
-        let wrapped = async move {
-            let result: Result<BoxedAny, M::Error> = future.await;
-            _ = result_tx.send(result);
-        };
-        let task = Box::pin(wrapped);
-        self.task
-            .set(RwLock::new(task))
-            .unwrap_or_else(|_| panic!("Task already set"));
-    }
-
-    fn poll_started_task(&mut self, cx: &mut std::task::Context<'_>) -> Poll<Option<String>> {
-        if let Some(token) = &mut self.queued_tokens {
-            if let Poll::Ready(Some(token)) = token.poll_next_unpin(cx) {
-                return Poll::Ready(Some(token));
-            }
-        }
-
-        let mut task = self.task.get().unwrap().write().unwrap();
-        match task.poll_unpin(cx) {
-            Poll::Ready(_) => {
-                *task = Box::pin(async move {});
-                Poll::Ready(None)
-            }
-            Poll::Pending => Poll::Pending,
-        }
-    }
-
-    fn into_started_result_future<T>(mut self) -> BoxedIntoFuture<'a, Result<T, M::Error>>
-    where
-        T: 'static,
-    {
-        Box::pin(async move {
-            self.task.into_inner().unwrap().into_inner().unwrap().await;
-            let result = self.result.take().unwrap().await.unwrap();
-            result.map(|boxed| *boxed.downcast::<T>().unwrap())
-        })
-    }
 }
 
 impl<M, Sampler> ChatResponseBuilder<'_, M, NoConstraints, Sampler>
@@ -670,12 +616,16 @@ where
     M::ChatSession: WasmNotSendSync + Unpin + 'static,
 {
     fn ensure_unstructured_task_started(&mut self) {
-        self.ensure_task_started_with(|myself, mut tx| {
-            let messages = std::mem::take(&mut myself.chat_session.queued_messages);
-            let sampler = myself
+        if self.task.get().is_none() {
+            let messages = std::mem::take(&mut self.chat_session.queued_messages);
+            let sampler = self
                 .sampler
                 .take()
                 .expect("ChatResponseBuilder cannot be turned into a future twice");
+            let (mut tx, rx) = futures_channel::mpsc::unbounded();
+            let (result_tx, result_rx) = futures_channel::oneshot::channel();
+            self.queued_tokens = Some(rx);
+            self.result = Some(result_rx);
             let all_text = Arc::new(Mutex::new(String::new()));
             let on_token = {
                 let all_text = all_text.clone();
@@ -685,9 +635,9 @@ where
                     Ok(())
                 }
             };
-            let session = myself.chat_session.session_clone();
-            let model = myself.chat_session.model.clone();
-            async move {
+            let session = self.chat_session.session_clone();
+            let model = self.chat_session.model.clone();
+            let future = async move {
                 let session = session?;
                 let mut session = session.lock().await;
                 model
@@ -696,8 +646,16 @@ where
                 let mut all_text = all_text.lock().unwrap();
                 let all_text = std::mem::take(&mut *all_text);
                 Ok(Box::new(all_text) as BoxedAny)
-            }
-        });
+            };
+            let wrapped = async move {
+                let result: Result<BoxedAny, M::Error> = future.await;
+                _ = result_tx.send(result);
+            };
+            let task = Box::pin(wrapped);
+            self.task
+                .set(RwLock::new(task))
+                .unwrap_or_else(|_| panic!("Task already set"));
+        }
     }
 }
 
@@ -716,7 +674,21 @@ where
     ) -> std::task::Poll<Option<Self::Item>> {
         let myself = Pin::get_mut(self);
         myself.ensure_unstructured_task_started();
-        myself.poll_started_task(cx)
+        {
+            if let Some(token) = &mut myself.queued_tokens {
+                if let Poll::Ready(Some(token)) = token.poll_next_unpin(cx) {
+                    return Poll::Ready(Some(token));
+                }
+            }
+        }
+        let mut task = myself.task.get().unwrap().write().unwrap();
+        match task.poll_unpin(cx) {
+            Poll::Ready(_) => {
+                *task = Box::pin(async move {});
+                Poll::Ready(None)
+            }
+            Poll::Pending => Poll::Pending,
+        }
     }
 }
 
@@ -731,7 +703,12 @@ where
 
     fn into_future(mut self) -> Self::IntoFuture {
         self.ensure_unstructured_task_started();
-        self.into_started_result_future()
+
+        Box::pin(async move {
+            self.task.into_inner().unwrap().into_inner().unwrap().await;
+            let result = self.result.take().unwrap().await.unwrap();
+            result.map(|boxed| *boxed.downcast::<String>().unwrap())
+        })
     }
 }
 
@@ -744,23 +721,27 @@ where
     Constraints::Output: WasmNotSend + 'static,
 {
     fn ensure_structured_task_started(&mut self) {
-        self.ensure_task_started_with(|myself, mut tx| {
-            let messages = std::mem::take(&mut myself.chat_session.queued_messages);
-            let sampler = myself
+        if self.task.get().is_none() {
+            let messages = std::mem::take(&mut self.chat_session.queued_messages);
+            let sampler = self
                 .sampler
                 .take()
                 .expect("ChatResponseBuilder cannot be turned into a future twice");
-            let constraints = myself
+            let constraints = self
                 .constraints
                 .take()
                 .expect("ChatResponseBuilder cannot be turned into a future twice");
+            let (mut tx, rx) = futures_channel::mpsc::unbounded();
+            let (result_tx, result_rx) = futures_channel::oneshot::channel();
+            self.queued_tokens = Some(rx);
+            self.result = Some(result_rx);
             let on_token = move |tok: String| {
                 _ = tx.start_send(tok);
                 Ok(())
             };
-            let session = myself.chat_session.session_clone();
-            let model = myself.chat_session.model.clone();
-            async move {
+            let session = self.chat_session.session_clone();
+            let model = self.chat_session.model.clone();
+            let future = async move {
                 let session = session?;
                 let mut session = session.lock().await;
                 model
@@ -773,8 +754,16 @@ where
                     )
                     .await
                     .map(|value| Box::new(value) as BoxedAny)
-            }
-        });
+            };
+            let wrapped = async move {
+                let result: Result<BoxedAny, M::Error> = future.await;
+                _ = result_tx.send(result);
+            };
+            let task = Box::pin(wrapped);
+            self.task
+                .set(RwLock::new(task))
+                .unwrap_or_else(|_| panic!("Task already set"));
+        }
     }
 }
 
@@ -795,7 +784,21 @@ where
     ) -> std::task::Poll<Option<Self::Item>> {
         let myself = Pin::get_mut(self);
         myself.ensure_structured_task_started();
-        myself.poll_started_task(cx)
+        {
+            if let Some(token) = &mut myself.queued_tokens {
+                if let Poll::Ready(Some(token)) = token.poll_next_unpin(cx) {
+                    return Poll::Ready(Some(token));
+                }
+            }
+        }
+        let mut task = myself.task.get().unwrap().write().unwrap();
+        match task.poll_unpin(cx) {
+            Poll::Ready(_) => {
+                *task = Box::pin(async move {});
+                Poll::Ready(None)
+            }
+            Poll::Pending => Poll::Pending,
+        }
     }
 }
 
@@ -812,6 +815,11 @@ where
 
     fn into_future(mut self) -> Self::IntoFuture {
         self.ensure_structured_task_started();
-        self.into_started_result_future()
+
+        Box::pin(async move {
+            self.task.into_inner().unwrap().into_inner().unwrap().await;
+            let result = self.result.take().unwrap().await.unwrap();
+            result.map(|boxed| *boxed.downcast::<Constraints::Output>().unwrap())
+        })
     }
 }
