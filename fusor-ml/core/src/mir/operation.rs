@@ -39,15 +39,12 @@ pub(crate) trait Operation: Debug + 'static {
 
     fn name(&self) -> String;
 
-    /// Hash the structural operation state that affects generated kernel IR.
+    /// Hash structural operation fields that affect generated kernel IR.
     ///
-    /// The default hashes the concrete operation type plus
-    /// `kernel_module_key_with_dispatch`'s MIR inputs, dispatch, and workgroup
-    /// shape. Implementations only override this when generated IR depends on
-    /// fields not represented by that trait-level data.
-    fn hash_kernel_signature(&self, state: &mut FxHasher) {
-        TypeId::of::<Self>().hash(state);
-    }
+    /// The concrete operation type is added by `kernel_module_key_with_dispatch`;
+    /// implementations only hash fields not represented by MIR inputs,
+    /// dispatch, or workgroup shape.
+    fn hash_kernel_fields(&self, _state: &mut FxHasher) {}
 
     fn kernel_module_key_with_dispatch(
         &self,
@@ -61,7 +58,8 @@ pub(crate) trait Operation: Debug + 'static {
             // collide with cache entries produced by an older hash recipe.
             1u64.hash(hasher);
             variant.hash(hasher);
-            self.hash_kernel_signature(hasher);
+            TypeId::of::<Self>().hash(hasher);
+            self.hash_kernel_fields(hasher);
             workgroup_shape
                 .map(|workgroup_shape| workgroup_shape.shape())
                 .hash(hasher);

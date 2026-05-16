@@ -1,8 +1,4 @@
-use std::{
-    any::{Any, TypeId},
-    hash::Hash,
-    sync::OnceLock,
-};
+use std::{any::Any, hash::Hash, sync::OnceLock};
 
 use crate::{
     DataTypeEnum, Layout,
@@ -137,8 +133,7 @@ impl RmsNormOperation {
 }
 
 impl Operation for RmsNormOperation {
-    fn hash_kernel_signature(&self, state: &mut FxHasher) {
-        TypeId::of::<Self>().hash(state);
+    fn hash_kernel_fields(&self, state: &mut FxHasher) {
         self.residual.is_some().hash(state);
         self.bias.is_some().hash(state);
         self.shape.hash(state);

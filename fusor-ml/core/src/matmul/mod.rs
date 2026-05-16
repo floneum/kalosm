@@ -1,4 +1,4 @@
-use std::{any::TypeId, hash::Hash};
+use std::hash::Hash;
 
 use crate::matmul::sgemm_params::gemm_parameters;
 use crate::matmul::sgemv_params::gemv_parameters;
@@ -469,8 +469,7 @@ impl MatMulOperation {
 }
 
 impl Operation for MatMulOperation {
-    fn hash_kernel_signature(&self, state: &mut FxHasher) {
-        TypeId::of::<Self>().hash(state);
+    fn hash_kernel_fields(&self, state: &mut FxHasher) {
         self.datatype.hash(state);
         self.first_shape.hash(state);
         self.second_shape.hash(state);

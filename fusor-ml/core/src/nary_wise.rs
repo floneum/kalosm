@@ -1,7 +1,4 @@
-use std::{
-    any::TypeId,
-    hash::{Hash, Hasher},
-};
+use std::hash::{Hash, Hasher};
 
 use rustc_hash::FxHasher;
 
@@ -566,8 +563,7 @@ pub(crate) struct ExtractedPairedSplit {
 }
 
 impl Operation for NaryOperation {
-    fn hash_kernel_signature(&self, state: &mut FxHasher) {
-        TypeId::of::<Self>().hash(state);
+    fn hash_kernel_fields(&self, state: &mut FxHasher) {
         self.expression.hash(state);
         self.shape.hash(state);
         self.output_datatype.hash(state);
