@@ -8,7 +8,7 @@ use crate::{
     compute_graph::NodeIndex,
     kernel_selection::{Axis, KernelDeviceCaps, KernelShape, ShapeRule, ShapeSelector, eq, range},
     mir::{
-        direct_kernel::DirectKernel,
+        kernel_backend::DirectKernel,
         kernel_backend,
         tile_direct::{
             flatten_matrix_layout, tile_storage_read_with_direct_layout_typed,
@@ -105,10 +105,14 @@ fn coop_gemm_params_from_caps(
     _k: usize,
     caps: KernelDeviceCaps,
 ) -> Option<coop_gemm::CoopGemmParams> {
+    // Apple's coopMatrix instructions execute on 32-thread SIMD groups even
+    // when the device's wgpu-reported subgroup-size range straddles 32 (M-series
+    // reports min=4, max=64). Match `floneum/main`: gate only on the
+    // cooperative-matrix and subgroup capabilities plus workgroup size.
     if !caps.cooperative_matrix_supported
         || !caps.subgroups_supported
-        || caps.min_subgroup_size != 32
-        || caps.max_subgroup_size != 32
+        || caps.max_subgroup_size < 32
+        || caps.min_subgroup_size > 32
         || caps.max_compute_workgroup_size_x < 64
     {
         return None;
@@ -146,10 +150,23 @@ enum DirectTileCoopMatmulVariant {
     Tile64x64,
     Tile64x128,
     Tile128x64,
+    /// (BM=128, BN=256, BK=16, N_PASSES=4, BLOCK=256). Mirrors the
+    /// per-workgroup output footprint of the hand-written `coop_gemm.rs` on
+    /// main: the K axis is short (BK=16) so the inner stride fits a single
+    /// cache line, and the N axis is amortized across four sub-passes that
+    /// reuse the accumulator grid.
+    Tile128x256,
 }
 
 impl DirectTileCoopMatmulVariant {
     fn select(m: u32, k: u32, n: u32, max_workgroup_size_x: u32) -> Self {
+        if k.is_multiple_of(16)
+            && m.is_multiple_of(128)
+            && n.is_multiple_of(256)
+            && max_workgroup_size_x >= 256
+        {
+            return Self::Tile128x256;
+        }
         if k.is_multiple_of(32)
             && m.is_multiple_of(128)
             && n.is_multiple_of(64)
@@ -379,8 +396,8 @@ impl MatMulOperation {
         let use_coop = matches!(self.parameters, MatMulParams::CoopMatMul(_))
             && device.cooperative_matrix_supported()
             && device.subgroups_supported()
-            && device.min_subgroup_size() == 32
-            && device.max_subgroup_size() == 32;
+            && device.max_subgroup_size() >= 32
+            && device.min_subgroup_size() <= 32;
         let coop_variant = if use_coop {
             DirectTileCoopMatmulVariant::select(
                 m,
@@ -414,6 +431,13 @@ impl MatMulOperation {
                         y_view.clone(),
                     );
                     match coop_variant {
+                        DirectTileCoopMatmulVariant::Tile128x256 => {
+                            if tile_ir_kernels::try_batched_coop_matmul_f32::<128, 256, 16>(
+                                phase, &a, &b, &y, shape, &epilogues,
+                            ) {
+                                return;
+                            }
+                        }
                         DirectTileCoopMatmulVariant::Tile128x64 => {
                             if tile_ir_kernels::try_batched_coop_matmul_f32::<128, 64, 32>(
                                 phase, &a, &b, &y, shape, &epilogues,
@@ -532,11 +556,15 @@ impl MatMulOperation {
         let cache_key = self.kernel_cache_key_with_dispatch(variant, None, dispatch_size, &inputs);
 
         kernel_backend::dynamic_kernel_from_ir(
-            device,
+            device.kernel_cache(),
             self.name(),
             cache_key,
             || Some(ir),
-            kernel_backend::buffers_from_tensors([&input_a, &input_b, &output]),
+            [
+                input_a.buffer().clone(),
+                input_b.buffer().clone(),
+                output.buffer().clone(),
+            ],
             dispatch_size,
         )
     }
@@ -780,12 +808,20 @@ mod selection_tests {
 
     #[test]
     fn direct_tile_coop_selector_prefers_largest_supported_tile() {
+        // 1024 is divisible by both 128 (M) and 256 (N), so the N-pass split
+        // variant wins when the workgroup is large enough.
         assert_eq!(
             DirectTileCoopMatmulVariant::select(1024, 1024, 1024, 512),
-            DirectTileCoopMatmulVariant::Tile128x64
+            DirectTileCoopMatmulVariant::Tile128x256
         );
         assert_eq!(
             DirectTileCoopMatmulVariant::select(1024, 1024, 1024, 256),
+            DirectTileCoopMatmulVariant::Tile128x256
+        );
+        // N=128 doesn't divide 256 so Tile128x256 is unavailable; falls back
+        // to Tile128x64.
+        assert_eq!(
+            DirectTileCoopMatmulVariant::select(1024, 1024, 128, 256),
             DirectTileCoopMatmulVariant::Tile128x64
         );
         assert_eq!(

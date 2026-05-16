@@ -3,7 +3,7 @@ use crate::{
     compute_graph::NodeIndex,
     map_layout::MapLayoutOperation,
     mir::{
-        direct_kernel::DirectKernel,
+        kernel_backend::DirectKernel,
         inputs::MirValue,
         operation::Operation,
         workgroup_shape::{Constraint, WorkgroupShape, WorkgroupShapeConstraints},

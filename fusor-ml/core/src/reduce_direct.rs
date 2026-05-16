@@ -2,7 +2,7 @@ use fusor_tile_ir as tile_ir;
 
 use crate::{
     mir::{
-        direct_kernel::DirectKernel, inputs::MirValue, kernel_backend, operation::Operation,
+        kernel_backend::DirectKernel, inputs::MirValue, kernel_backend, operation::Operation,
         workgroup_shape::WorkgroupShape,
     },
     nary_direct::{
@@ -83,7 +83,7 @@ pub(crate) fn build_reduce_direct_kernel(
     let post_chain = operation.post_element_wise.clone();
 
     kernel_backend::run_kernel(
-        &graph.device(),
+        graph.device().kernel_cache(),
         operation.name(),
         cache_key,
         dispatch_size,

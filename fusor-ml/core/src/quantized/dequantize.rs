@@ -8,7 +8,7 @@ use crate::{
     CastTensor, DataType, DataTypeEnum, Device, Layout, LazyTensorData, Tensor, TensorData,
     TensorInfo,
     mir::{
-        direct_kernel::DirectKernel,
+        kernel_backend::DirectKernel,
         kernel_backend,
         workgroup_shape::{Constraint, WorkgroupShapeConstraints},
     },
@@ -148,7 +148,7 @@ impl Operation for DequantizeOperation {
             tile_ir::Shape::new([total]),
         );
         kernel_backend::run_kernel(
-            &graph.device(),
+            graph.device().kernel_cache(),
             self.name(),
             cache_key,
             [dispatch_x, dispatch_y, 1],

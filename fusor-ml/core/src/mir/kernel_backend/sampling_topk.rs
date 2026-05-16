@@ -71,7 +71,7 @@ pub(crate) fn top_k_exactness_flag_data_with_encoder(
         chunk_values_offset: chunk_values.layout().offset().try_into().ok()?,
         chunk_values_stride: chunk_values.layout().strides()[0].try_into().ok()?,
     };
-    let cache_key = kernel_backend::module_key_from(|state| {
+    let cache_key = kernel_backend::KernelCacheKey::from_hash_inputs(|state| {
         kernel_backend::KernelVariantKey::of::<ProveTopKExactKernelVariant>().hash(state);
         TOP_K_BLOCK.hash(state);
         chunks.hash(state);
@@ -86,22 +86,28 @@ pub(crate) fn top_k_exactness_flag_data_with_encoder(
         chunk_values.layout().strides().hash(state);
     });
     let kernel = kernel_backend::run_kernel(
-        device,
+        device.kernel_cache(),
         "prove_top_k_exact_f32",
         cache_key,
         [1, 1, 1],
         |kb| {
             tile_ir_kernels::top_k_exactness(
                 kb,
-                kernel_backend::linear_tensor_ref(top_values),
-                kernel_backend::linear_tensor_ref(chunk_values),
-                kernel_backend::linear_tensor_ref(&flag),
+                top_values.as_kernel_tensor_ref(),
+                chunk_values.as_kernel_tensor_ref(),
+                flag.as_kernel_tensor_ref(),
                 meta,
             )
         },
     )?;
 
-    kernel_backend::run_direct_kernel(device, "prove_top_k_exact_f32 encoder", &kernel, encoder);
+    kernel_backend::run_direct_kernel(
+        device.kernel_cache(),
+        device.wgpu_queue(),
+        "prove_top_k_exact_f32 encoder",
+        &kernel,
+        encoder,
+    );
 
     Some(flag)
 }
@@ -166,7 +172,7 @@ fn chunk_top_k_pair_data_inner_with_encoder(
     let input_offset = input.layout().offset();
     let input_stride = input.layout().strides()[0];
     let has_processors = processors.is_some();
-    let cache_key = kernel_backend::module_key_from(|state| {
+    let cache_key = kernel_backend::KernelCacheKey::from_hash_inputs(|state| {
         kernel_backend::KernelVariantKey::of::<ChunkTopKPairsKernelVariant>().hash(state);
         TOP_K_BLOCK.hash(state);
         TOP_K_CHUNK.hash(state);
@@ -179,20 +185,20 @@ fn chunk_top_k_pair_data_inner_with_encoder(
     });
 
     let kernel = kernel_backend::run_kernel(
-        device,
+        device.kernel_cache(),
         "chunk_top_k_pairs_f32",
         cache_key,
         [chunks.try_into().ok()?, 1, 1],
         |kb| {
             tile_ir_kernels::top_k_chunk(
                 kb,
-                kernel_backend::linear_tensor_ref(input),
-                kernel_backend::linear_tensor_ref(&ids),
-                kernel_backend::linear_tensor_ref(&values),
+                input.as_kernel_tensor_ref(),
+                ids.as_kernel_tensor_ref(),
+                values.as_kernel_tensor_ref(),
                 processors.map(|(previous_tokens, params)| {
                     (
-                        kernel_backend::linear_tensor_ref(previous_tokens),
-                        kernel_backend::linear_tensor_ref(params),
+                        previous_tokens.as_kernel_tensor_ref(),
+                        params.as_kernel_tensor_ref(),
                     )
                 }),
                 tile_ir_kernels::TopKChunkMeta {
@@ -206,7 +212,13 @@ fn chunk_top_k_pair_data_inner_with_encoder(
         },
     )?;
 
-    kernel_backend::run_direct_kernel(device, "chunk_top_k_pairs_f32 encoder", &kernel, encoder);
+    kernel_backend::run_direct_kernel(
+        device.kernel_cache(),
+        device.wgpu_queue(),
+        "chunk_top_k_pairs_f32 encoder",
+        &kernel,
+        encoder,
+    );
 
     Some((ids, values))
 }
@@ -248,7 +260,7 @@ pub(crate) fn merge_sorted_chunk_top_k_pair_data_with_encoder(
         return Some((ids, values));
     }
 
-    let cache_key = kernel_backend::module_key_from(|state| {
+    let cache_key = kernel_backend::KernelCacheKey::from_hash_inputs(|state| {
         kernel_backend::KernelVariantKey::of::<MergeSortedChunkTopKPairsKernelVariant>()
             .hash(state);
         TOP_K_BLOCK.hash(state);
@@ -265,17 +277,17 @@ pub(crate) fn merge_sorted_chunk_top_k_pair_data_with_encoder(
         input_values.layout().strides().hash(state);
     });
     let kernel = kernel_backend::run_kernel(
-        device,
+        device.kernel_cache(),
         "merge_sorted_chunk_top_k_pairs_f32",
         cache_key,
         [1, 1, 1],
         |kb| {
             tile_ir_kernels::top_k_merge(
                 kb,
-                kernel_backend::linear_tensor_ref(input_ids),
-                kernel_backend::linear_tensor_ref(input_values),
-                kernel_backend::linear_tensor_ref(&ids),
-                kernel_backend::linear_tensor_ref(&values),
+                input_ids.as_kernel_tensor_ref(),
+                input_values.as_kernel_tensor_ref(),
+                ids.as_kernel_tensor_ref(),
+                values.as_kernel_tensor_ref(),
                 tile_ir_kernels::MergeTopKMeta {
                     chunks: chunks.try_into().ok()?,
                     chunk_len: chunk_len.try_into().ok()?,
@@ -288,7 +300,8 @@ pub(crate) fn merge_sorted_chunk_top_k_pair_data_with_encoder(
     )?;
 
     kernel_backend::run_direct_kernel(
-        device,
+        device.kernel_cache(),
+        device.wgpu_queue(),
         "merge_sorted_chunk_top_k_pairs_f32 encoder",
         &kernel,
         encoder,

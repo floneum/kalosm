@@ -339,6 +339,32 @@ fn cooperative_dense_f32_matmul_128x64_lowers() {
 }
 
 #[test]
+fn cooperative_dense_f32_matmul_128x256_npass_lowers() {
+    // Exercises the BK=16, N_PASSES=4 variant that mirrors coop_gemm.rs on
+    // main: per-pass B/acc footprint with double-buffered K-pair iteration.
+    let ir = tile::build(|program| {
+        let shape = DenseMatmulShape {
+            batch: 1,
+            m: 128,
+            k: 256,
+            n: 256,
+        };
+        let a = program.storage_read::<F32, 2>(Shape::new([shape.batch * shape.m, shape.k]));
+        let b = program.storage_read::<F32, 2>(Shape::new([shape.batch * shape.k, shape.n]));
+        let y = program.storage_write::<F32, 2>(Shape::new([shape.batch * shape.m, shape.n]));
+        assert!(try_batched_coop_matmul_f32::<128, 256, 16>(
+            program,
+            &a,
+            &b,
+            &y,
+            shape,
+            &DenseMatmulEpilogues::empty(),
+        ));
+    });
+    lower_or_fail(&ir, "cooperative dense f32 128x256 N_PASSES=4 matmul");
+}
+
+#[test]
 fn qdequantize_lowers() {
     let ir = tile::build(|program| {
         let b = quantized_matrix(program, GgmlQuantFormat::Q4K, 256, 4);

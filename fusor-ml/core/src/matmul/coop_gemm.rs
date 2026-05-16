@@ -30,10 +30,14 @@ pub(super) fn optimal_params(
     k: usize,
     device: &Device,
 ) -> Option<CoopGemmParams> {
+    // Apple's coopMatrix instructions run on 32-thread SIMD groups even when
+    // the wgpu-reported subgroup-size range straddles 32. Match
+    // `floneum/main`'s gate: only require coop-matrix + subgroups, not exact
+    // equality of min/max subgroup size.
     if !device.cooperative_matrix_supported()
         || !device.subgroups_supported()
-        || device.min_subgroup_size() != 32
-        || device.max_subgroup_size() != 32
+        || device.max_subgroup_size() < 32
+        || device.min_subgroup_size() > 32
         || device.limits().max_compute_workgroup_size_x < 64
     {
         return None;

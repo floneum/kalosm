@@ -6,7 +6,7 @@ use crate::{
     DataTypeEnum, Device, Tensor, TensorData, TensorInfo,
     compute_graph::NodeIndex,
     mir::{
-        direct_kernel::DirectKernel,
+        kernel_backend::DirectKernel,
         inputs::MirValue,
         kernel_backend,
         operation::Operation,
@@ -179,7 +179,7 @@ impl Operation for QEmbeddingOperation {
         let indexes_buffer = indexes.buffer().clone();
         let output_buffer = output.buffer().clone();
         kernel_backend::run_kernel(
-            &graph.device(),
+            graph.device().kernel_cache(),
             self.name(),
             cache_key,
             dispatch_size,

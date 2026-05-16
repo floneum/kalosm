@@ -530,6 +530,18 @@ impl TensorData {
         &self.buffer
     }
 
+    /// Build a `tile-ir` tensor ref over this tensor's buffer with the
+    /// kernel-side rank-1 linear storage layout (the kernel's `Meta` struct
+    /// already encodes any offset/stride).
+    pub(crate) fn as_kernel_tensor_ref(
+        &self,
+    ) -> fusor_tile_ir::KernelTensorRef<Arc<wgpu::Buffer>> {
+        fusor_tile_ir::KernelTensorRef::new(
+            self.buffer.clone(),
+            fusor_tile_ir_kernels::linear_storage_layout(),
+        )
+    }
+
     pub(crate) fn info(&self) -> &TensorLayoutInfo {
         &self.info
     }

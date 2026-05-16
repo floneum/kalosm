@@ -27,6 +27,7 @@ pollster = "0.4.0"
 petgraph = "0.8.3"
 fusor-tile-ir = { workspace = true }
 fusor-tile-ir-kernels = { workspace = true }
+fusor-tile-ir-runtime = { workspace = true }
 
 [features]
 extra_assertions = []

@@ -8,7 +8,7 @@ use crate::{
 };
 
 use super::{
-    direct_kernel::DirectKernel,
+    kernel_backend::DirectKernel,
     inputs::MirValue,
     kernel_backend,
     workgroup_shape::{WorkgroupShape, WorkgroupShapeConstraints},
@@ -53,7 +53,7 @@ pub(crate) trait Operation: Debug + 'static {
         dispatch_size: [u32; 3],
         inputs: &[MirValue],
     ) -> kernel_backend::KernelCacheKey {
-        kernel_backend::module_key_from(|hasher| {
+        kernel_backend::KernelCacheKey::from_hash_inputs(|hasher| {
             // Version the shared key layout so future changes cannot silently
             // collide with cache entries produced by an older hash recipe.
             1u64.hash(hasher);

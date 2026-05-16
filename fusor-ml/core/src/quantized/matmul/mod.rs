@@ -8,7 +8,7 @@ use crate::{
     },
     matmul::MatMulOperation,
     mir::{
-        direct_kernel::DirectKernel,
+        kernel_backend::DirectKernel,
         inputs::MirValue,
         kernel_backend,
         operation::Operation,
@@ -78,7 +78,7 @@ fn qmatmul_direct_module_key<M: 'static>(
             dispatch_size,
             operation_inputs,
         ),
-        None => kernel_backend::module_key_from(|state| {
+        None => kernel_backend::KernelCacheKey::from_hash_inputs(|state| {
             cache_variant.hash(state);
             outer_hash(&mut *state);
         }),
@@ -644,7 +644,7 @@ impl QMatMulOperation {
                 operation_key,
             );
             if let Some(pipeline) = kernel_backend::three_buffer_pipeline_from_cached_module(
-                device,
+                device.kernel_cache(),
                 &kernel_name,
                 cache_key,
             ) {
@@ -652,7 +652,7 @@ impl QMatMulOperation {
                     .direct_pipeline_cache()
                     .write()
                     .get_or_insert(pipeline_key, || pipeline.clone());
-                return Some(kernel_backend::three_buffer_kernel_with_prepared_pipeline(
+                return Some(kernel_backend::DirectKernel::from_prepared_three_buffer_pipeline(
                     kernel_name.clone(),
                     cache_key,
                     pipeline,
@@ -800,11 +800,11 @@ fn cached_qmatmul_direct_kernel(
         .write()
         .get(pipeline_key)
         .cloned()?;
-    let cache_key = kernel_backend::module_key_from(|state| {
+    let cache_key = kernel_backend::KernelCacheKey::from_hash_inputs(|state| {
         kernel_backend::KernelVariantKey::of::<QMatmulCachedPipelineKernelVariant>().hash(state);
         pipeline_key.hash(state);
     });
-    Some(kernel_backend::three_buffer_kernel_with_prepared_pipeline(
+    Some(kernel_backend::DirectKernel::from_prepared_three_buffer_pipeline(
         kernel_name.to_owned(),
         cache_key,
         pipeline,
@@ -839,7 +839,7 @@ fn qmatmul_direct_kernel_from_ir(
         return Some(kernel);
     }
     let pipeline = kernel_backend::three_buffer_pipeline_from_ir(
-        device,
+        device.kernel_cache(),
         &kernel_name,
         cache_key.clone(),
         build_ir,
@@ -849,7 +849,7 @@ fn qmatmul_direct_kernel_from_ir(
         .write()
         .get_or_insert(pipeline_key, || pipeline.clone())
         .clone();
-    Some(kernel_backend::three_buffer_kernel_with_prepared_pipeline(
+    Some(kernel_backend::DirectKernel::from_prepared_three_buffer_pipeline(
         kernel_name,
         cache_key,
         pipeline,
@@ -1357,7 +1357,7 @@ impl QMatMulOperation {
         let (ir, buffers) = kb.finish();
 
         kernel_backend::dynamic_kernel_from_ir(
-            &graph.device(),
+            graph.device().kernel_cache(),
             kernel_name,
             cache_key,
             move || Some(ir),
@@ -1433,7 +1433,7 @@ mod tests {
     use super::*;
     use crate::{
         compute_graph::{ComputeGraphInner, ComputeGraphNodes},
-        mir::direct_kernel::DirectKernelBinding,
+        mir::kernel_backend::DirectKernelBinding,
         mir::workgroup_shape::WorkgroupShape,
     };
 

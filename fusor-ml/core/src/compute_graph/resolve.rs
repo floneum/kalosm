@@ -6,7 +6,7 @@ use std::{
 
 use crate::{
     DataTypeEnum, Layout,
-    mir::{direct_kernel::PreparedDirectDispatch, inputs::MirValue, operation::Operation},
+    mir::{kernel_backend::PreparedDirectDispatch, inputs::MirValue, operation::Operation},
     nary_direct::eval_nary_expr_on_tiles,
     nary_wise::{ExtractedUnaryChain, NaryExpr, NaryOperation, UnaryFunctionChain},
     quantized::matmul::QMatMulOperation,
@@ -530,7 +530,7 @@ impl Resolver {
                     }
                 }
                 let start = host_trace.then(Instant::now);
-                if let Some(dispatch) = direct_kernel.prepare_dispatch(&device) {
+                if let Some(dispatch) = direct_kernel.prepare_dispatch(device.kernel_cache()) {
                     if let Some(start) = start {
                         let elapsed = start.elapsed();
                         host_profile.prepare_dispatch += elapsed;

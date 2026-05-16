@@ -3085,6 +3085,7 @@ dependencies = [
  "fusor-gguf",
  "fusor-tile-ir",
  "fusor-tile-ir-kernels",
+ "fusor-tile-ir-runtime",
  "fusor-types",
  "futures",
  "futures-channel",
@@ -3164,6 +3165,17 @@ dependencies = [
  "half 2.7.1",
  "naga",
  "pollster",
+ "wgpu",
+]
+
+[[package]]
+name = "fusor-tile-ir-runtime"
+version = "0.1.0"
+dependencies = [
+ "fusor-tile-ir",
+ "lru 0.14.0",
+ "parking_lot",
+ "rustc-hash 2.1.1",
  "wgpu",
 ]
 

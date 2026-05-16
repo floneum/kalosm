@@ -368,15 +368,102 @@ impl<'a> Lowerer<'a> {
         }
         let layout = self.tile_layout(dst)?;
         let [rows, cols] = Self::tile_shape(layout)?;
+        let stride = Self::row_major_tile_stride(layout)?;
+        let local = Self::function_arg(expressions, LOCAL_INVOCATION_INDEX_ARG);
+        let row_base = self.lower_tile_expr(expressions, scratch, body, offsets.row)?;
+        let col_base = self.lower_tile_expr(expressions, scratch, body, offsets.col)?;
+
+        // Vec4 fast path: when both the storage and tile inner strides are 1
+        // and the tile inner extent is a multiple of 4, each lane covers four
+        // consecutive inner-axis elements per pass. Issuing four sequential
+        // loads in a row lets the driver coalesce them into a single wider
+        // transaction on Apple Silicon. Mirrors the hand-written tile-load in
+        // `coop_gemm.rs`.
+        const VEC: u32 = 4;
+        if cols.is_multiple_of(VEC) && Self::storage_has_unit_inner_stride(&src.layout) {
+            let groups_per_row = cols / VEC;
+            let total_groups = rows
+                .checked_mul(groups_per_row)
+                .ok_or(LowerError::UnsupportedOperation(
+                    "workgroup tile size overflow",
+                ))?;
+            return self.lower_copy_passes(
+                expressions,
+                body,
+                local,
+                total_groups,
+                |expressions, flat| {
+                    let mut accept = Block::new();
+                    let local_row =
+                        self.div_literal_u32_emitted(expressions, flat, groups_per_row, &mut accept);
+                    let local_col_group =
+                        self.mod_literal_u32_emitted(expressions, flat, groups_per_row, &mut accept);
+                    let local_col_base = self.mul_literal_u32_emitted(
+                        expressions,
+                        local_col_group,
+                        VEC,
+                        &mut accept,
+                    );
+                    let global_row = self.add(expressions, &mut accept, row_base, local_row);
+                    let global_col_base =
+                        self.add(expressions, &mut accept, col_base, local_col_base);
+                    let storage_index_base = self.storage_index_from_coords(
+                        expressions,
+                        src,
+                        &[global_row, global_col_base],
+                        &mut accept,
+                    )?;
+                    let tile_index_base = self.tile_matrix_index_inline(
+                        expressions,
+                        &mut accept,
+                        local_row,
+                        local_col_base,
+                        stride,
+                    );
+                    let mut values = [None; VEC as usize];
+                    for i in 0..VEC {
+                        let storage_index = self.add_literal_u32_emitted(
+                            expressions,
+                            storage_index_base,
+                            i,
+                            &mut accept,
+                        );
+                        let storage_ptr = self.storage_dynamic_pointer(
+                            expressions,
+                            src,
+                            storage_index,
+                            &mut accept,
+                        )?;
+                        values[i as usize] =
+                            Some(Self::emit_load(expressions, &mut accept, storage_ptr));
+                    }
+                    for i in 0..VEC {
+                        let tile_index = self.add_literal_u32_emitted(
+                            expressions,
+                            tile_index_base,
+                            i,
+                            &mut accept,
+                        );
+                        let tile_ptr =
+                            self.tile_dynamic_pointer(expressions, dst, tile_index, &mut accept)?;
+                        accept.push(
+                            Statement::Store {
+                                pointer: tile_ptr,
+                                value: values[i as usize].expect("loaded above"),
+                            },
+                            Span::default(),
+                        );
+                    }
+                    Ok(accept)
+                },
+            );
+        }
+
         let total = rows
             .checked_mul(cols)
             .ok_or(LowerError::UnsupportedOperation(
                 "workgroup tile size overflow",
             ))?;
-        let stride = Self::row_major_tile_stride(layout)?;
-        let local = Self::function_arg(expressions, LOCAL_INVOCATION_INDEX_ARG);
-        let row_base = self.lower_tile_expr(expressions, scratch, body, offsets.row)?;
-        let col_base = self.lower_tile_expr(expressions, scratch, body, offsets.col)?;
         let lane_layout = CopyLaneLayout {
             dst,
             cols,
@@ -411,6 +498,17 @@ impl<'a> Lowerer<'a> {
 
             Ok(accept)
         })
+    }
+
+    /// True if the storage view's innermost axis is contiguous (stride 1).
+    /// Vec4 loads can only fold to a single transaction when consecutive cols
+    /// land on consecutive storage addresses.
+    fn storage_has_unit_inner_stride(layout: &Layout) -> bool {
+        if !layout.is_affine() {
+            return false;
+        }
+        let strides = layout.affine_strides();
+        strides.last().copied() == Some(1)
     }
 
     fn lower_copy_quant_to_tile(

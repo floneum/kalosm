@@ -3,7 +3,7 @@ use fusor_tile_ir as tile_ir;
 use crate::{
     matmul::MatMulOperation,
     mir::{
-        direct_kernel::DirectKernel, inputs::MirValue, kernel_backend, operation::Operation,
+        kernel_backend::DirectKernel, inputs::MirValue, kernel_backend, operation::Operation,
         workgroup_shape::WorkgroupShape,
     },
     nary_direct::{
@@ -110,7 +110,7 @@ pub(crate) fn build_serial_matmul_direct_kernel(
     let post = operation.post_element_wise.clone();
 
     kernel_backend::run_kernel(
-        &graph.device(),
+        graph.device().kernel_cache(),
         operation.name(),
         cache_key,
         dispatch_size,

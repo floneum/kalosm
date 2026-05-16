@@ -1,12 +1,11 @@
-use std::{hash::Hash, sync::OnceLock};
+use std::{hash::Hash, sync::Arc, sync::OnceLock};
 
 use fusor_tile_ir as tile_ir;
 
 use crate::{
     mir::{
-        direct_kernel::{DirectKernel, DirectKernelBinding},
         inputs::MirValue,
-        kernel_backend,
+        kernel_backend::{self, DirectKernel, DirectKernelBinding},
         operation::Operation,
         workgroup_shape::WorkgroupShape,
     },
@@ -81,17 +80,10 @@ fn build_nary_direct_kernel_with_output_index(
         dispatch_size,
         inputs,
     );
-    let module = if let Some(module) = nary_direct_module_cache().write().get(&module_key) {
-        module.clone()
-    } else {
-        let module = kernel_backend::cached_kernel_ir(&graph.device(), module_key, || {
-            build_nary_tile_ir(operation, &tensors, output_index, dispatch_size)
-        })?;
-        nary_direct_module_cache()
-            .write()
-            .get_or_insert(module_key, || module.clone())
-            .clone()
-    };
+    let naga = kernel_backend::cached_hashed_naga(nary_direct_module_cache(), module_key, || {
+        let ir = build_nary_tile_ir(operation, &tensors, output_index, dispatch_size)?;
+        Some(Arc::new(ir.lower_to_naga().ok()?.module().clone()))
+    })?;
 
     let bindings = tensors
         .iter()
@@ -109,10 +101,10 @@ fn build_nary_direct_kernel_with_output_index(
         format!("nary_direct_out_{output_index}")
     };
 
-    Some(kernel_backend::dynamic_kernel_from_module(
+    Some(DirectKernel::from_naga(
         name,
         module_key,
-        module,
+        naga,
         bindings,
         dispatch_size,
     ))

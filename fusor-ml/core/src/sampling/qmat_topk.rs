@@ -52,7 +52,7 @@ pub(super) fn qmat_logits_data_with_encoder(
         None,
         None,
     )?;
-    kernel.run(device, encoder);
+    kernel.run(device.kernel_cache(), encoder);
 
     Some(logits)
 }

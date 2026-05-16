@@ -92,7 +92,7 @@ impl Operation for MapLayoutOperation {
         _: &crate::compute_graph::ComputeGraphInner,
         _: &crate::mir::workgroup_shape::WorkgroupShape,
         _: &[crate::mir::inputs::MirValue],
-    ) -> Option<crate::mir::direct_kernel::DirectKernel> {
+    ) -> Option<crate::mir::kernel_backend::DirectKernel> {
         None
     }
 

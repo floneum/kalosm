@@ -380,7 +380,7 @@ impl ComputeGraphInner {
                 .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                     label: Some("QMatMul Direct Encoder"),
                 });
-        direct_kernel.run(&device, &mut command_encoder);
+        direct_kernel.run(device.kernel_cache(), &mut command_encoder);
         device.wgpu_queue().submit(Some(command_encoder.finish()));
         device.reset_initialized_buffers();
 

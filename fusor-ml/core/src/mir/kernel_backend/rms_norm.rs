@@ -7,7 +7,7 @@ use crate::{
         Axis, KernelDeviceCaps, KernelShape, ShapeRule, ShapeSelector, multiple_of,
     },
     mir::{
-        direct_kernel::DirectKernel,
+        kernel_backend::DirectKernel,
         inputs::MirValue,
         kernel_backend,
         operation::Operation,
@@ -309,7 +309,7 @@ impl Operation for RmsNormOperation {
             let has_residual = residual.is_some();
             let has_bias = bias.is_some();
             kernel_backend::dynamic_kernel_from_hashed_ir(
-                &graph.device(),
+                graph.device().kernel_cache(),
                 rms_norm_module_cache(),
                 kernel_label,
                 module_key,
@@ -380,7 +380,7 @@ impl Operation for RmsNormOperation {
 
             let post_chain = self.post_element_wise.clone();
             kernel_backend::dynamic_kernel_from_hashed_ir(
-                &graph.device(),
+                graph.device().kernel_cache(),
                 rms_norm_module_cache(),
                 kernel_label,
                 module_key,

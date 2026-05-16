@@ -155,6 +155,34 @@ impl Layout {
         }
     }
 
+    /// Construct a row-major affine layout with `inner_pad` extra elements of
+    /// stride between consecutive inner rows. Used by workgroup-tile
+    /// allocations that need bank-conflict avoidance on the inner axis.
+    pub fn row_major_padded(memory_level: MemoryLevel, shape: Shape, inner_pad: u32) -> Self {
+        if inner_pad == 0 {
+            return Self::contiguous(memory_level, shape);
+        }
+        let rank = shape.rank();
+        assert!(
+            rank >= 1,
+            "row_major_padded requires at least a rank-1 shape",
+        );
+        let dims = shape.dims();
+        let mut strides = vec![1u32; rank];
+        if rank >= 2 {
+            let inner_extent = dims[rank - 1].get();
+            strides[rank - 2] = inner_extent
+                .checked_add(inner_pad)
+                .expect("row_major_padded stride overflow");
+            for axis in (0..rank.saturating_sub(2)).rev() {
+                strides[axis] = strides[axis + 1]
+                    .checked_mul(dims[axis + 1].get())
+                    .expect("row_major_padded stride overflow");
+            }
+        }
+        Self::strided(memory_level, shape, &strides)
+    }
+
     /// Construct a layout with an explicit (possibly non-affine) indexing.
     pub fn with_indexing(
         memory_level: MemoryLevel,

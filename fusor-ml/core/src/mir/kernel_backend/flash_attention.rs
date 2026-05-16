@@ -13,7 +13,7 @@ use crate::{
         Axis, DimConstraint, KernelDeviceCaps, KernelShape, ShapeRule, ShapeSelector, eq, range,
     },
     mir::{
-        direct_kernel::DirectKernel,
+        kernel_backend::DirectKernel,
         inputs::MirValue,
         kernel_backend,
         operation::Operation,
@@ -504,7 +504,7 @@ impl Operation for FlashAttentionOperation {
         }
 
         kernel_backend::dynamic_kernel_from_hashed_ir(
-            &device,
+            device.kernel_cache(),
             flash_attention_module_cache(),
             kernel_label,
             module_key,

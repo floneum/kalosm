@@ -431,7 +431,6 @@ pub fn try_batched_coop_matmul_f32<const BM: usize, const BN: usize, const BK: u
     if epilogues.pre_a.is_some()
         || epilogues.pre_b.is_some()
         || epilogues.post.is_some()
-        || BK != 32
         || !shape.m.is_multiple_of(BM as u32)
         || !shape.n.is_multiple_of(BN as u32)
         || !shape.k.is_multiple_of(BK as u32)
@@ -444,22 +443,43 @@ pub fn try_batched_coop_matmul_f32<const BM: usize, const BN: usize, const BK: u
         return false;
     }
 
-    match (BM, BN) {
-        (64, 64) => batched_coop_matmul_perf::<F32, 64, 64, 32, 2, 2, 128>(program, a, b, y, shape),
-        (64, 128) => {
-            batched_coop_matmul_perf::<F32, 64, 128, 32, 2, 4, 256>(program, a, b, y, shape)
+    // Variants are picked to match `coop_gemm.rs` on main: prefer the
+    // (128x64) per-pass shape with N_PASSES=4 and BK=16 (effective 128x256
+    // output coverage per workgroup) when N divides 256. Fall back to the
+    // single-pass shapes for narrower N. ROW_GROUPS/COL_GROUPS are derived
+    // from BLOCK/SUBGROUP_SIZE so each subgroup owns a 32x32 (or 32x
+    // SUBGROUP_COLS_PER_PASS) MMA grid.
+    match (BM, BN, BK) {
+        (128, 256, 16) => batched_coop_matmul_perf::<F32, 128, 256, 16, 4, 2, 4, 256>(
+            program, a, b, y, shape,
+        ),
+        (64, 64, 32) => {
+            batched_coop_matmul_perf::<F32, 64, 64, 32, 2, 2, 1, 128>(program, a, b, y, shape)
         }
-        (128, 64) => {
-            batched_coop_matmul_perf::<F32, 128, 64, 32, 4, 2, 256>(program, a, b, y, shape)
+        (64, 128, 32) => {
+            batched_coop_matmul_perf::<F32, 64, 128, 32, 2, 4, 1, 256>(program, a, b, y, shape)
         }
-        (128, 128) => {
-            batched_coop_matmul_perf::<F32, 128, 128, 32, 4, 4, 512>(program, a, b, y, shape)
+        (128, 64, 32) => {
+            batched_coop_matmul_perf::<F32, 128, 64, 32, 4, 2, 1, 256>(program, a, b, y, shape)
+        }
+        (128, 128, 32) => {
+            batched_coop_matmul_perf::<F32, 128, 128, 32, 4, 4, 1, 512>(program, a, b, y, shape)
         }
         _ => return false,
     }
     true
 }
 
+/// Cooperative-matrix batched matmul.
+///
+/// Per-workgroup output tile is `BM × BN`. The N axis is split into
+/// `N_PASSES` sub-passes of `BN/N_PASSES` columns each: a smaller B tile and
+/// accumulator grid are reused across passes (matching the pattern in main's
+/// `coop_gemm.rs`). Inside each pass the K loop is double-buffered with two
+/// pairs of workgroup tiles, processing two `BK`-tiles per outer iteration
+/// to amortize barriers; an odd `k_iterations` is closed out with a single
+/// trailing tile. Workgroup tiles are allocated with one element of inner
+/// padding to avoid Apple bank conflicts.
 fn batched_coop_matmul_perf<
     T: CoopElement,
     const BM: usize,
@@ -467,6 +487,7 @@ fn batched_coop_matmul_perf<
     const BK: usize,
     const ROW_GROUPS: u32,
     const COL_GROUPS: u32,
+    const N_PASSES: u32,
     const BLOCK: usize,
 >(
     program: &mut Program,
@@ -477,25 +498,34 @@ fn batched_coop_matmul_perf<
 ) {
     const COOP_DIM: u32 = 8;
     const SUBGROUP_SIZE: u32 = 32;
-    const SUBGROUP_ROWS: u32 = 32;
-    const SUBGROUP_COLS: u32 = 32;
-    debug_assert_eq!(ROW_GROUPS * SUBGROUP_ROWS, BM as u32);
-    debug_assert_eq!(COL_GROUPS * SUBGROUP_COLS, BN as u32);
+    debug_assert!(N_PASSES >= 1, "N_PASSES must be at least 1");
+    debug_assert_eq!(BN as u32 % N_PASSES, 0, "BN must be divisible by N_PASSES");
+    let bn_pass: u32 = BN as u32 / N_PASSES;
+    let subgroup_rows: u32 = BM as u32 / ROW_GROUPS;
+    let subgroup_cols_per_pass: u32 = bn_pass / COL_GROUPS;
+    debug_assert_eq!(BM as u32 % ROW_GROUPS, 0);
+    debug_assert_eq!(bn_pass % COL_GROUPS, 0);
+    debug_assert_eq!(subgroup_rows % COOP_DIM, 0);
+    debug_assert_eq!(subgroup_cols_per_pass % COOP_DIM, 0);
     debug_assert_eq!(ROW_GROUPS * COL_GROUPS * SUBGROUP_SIZE, BLOCK as u32);
+    let tile_rows_per_sg: u32 = subgroup_rows / COOP_DIM;
+    let tile_cols_per_sg: u32 = subgroup_cols_per_pass / COOP_DIM;
 
     let tiles_m = shape.m / BM as u32;
     let tiles_n = shape.n / BN as u32;
     let total_tiles = shape.batch * tiles_m * tiles_n;
     let k_iterations = shape.k / BK as u32;
+    let k_pairs = k_iterations / 2;
+    let k_remainder = k_iterations % 2;
 
-    let a_tile = program.alloc_workgroup_tile::<T>(BM as u32, BK as u32);
-    let b_tile = program.alloc_workgroup_tile::<T>(BK as u32, BN as u32);
-    let a_clone = a;
-    let b_clone = b;
-    let y_clone = y;
-
-    const TILE_ROWS_PER_SG: u32 = SUBGROUP_ROWS / 8;
-    const TILE_COLS_PER_SG: u32 = SUBGROUP_COLS / 8;
+    // +1 inner padding on workgroup tiles avoids Apple shared-memory bank
+    // conflicts on the inner stride (matches `stride_a = block_k + 1` in
+    // `coop_gemm.rs`). Two A and two B tiles let the K loop issue both halves
+    // of a K-pair before barriering.
+    let a_tile_0 = program.alloc_workgroup_tile_padded::<T>(BM as u32, BK as u32, 1);
+    let a_tile_1 = program.alloc_workgroup_tile_padded::<T>(BM as u32, BK as u32, 1);
+    let b_tile_0 = program.alloc_workgroup_tile_padded::<T>(BK as u32, bn_pass, 1);
+    let b_tile_1 = program.alloc_workgroup_tile_padded::<T>(BK as u32, bn_pass, 1);
 
     let grid = dispatch_grid_1d(total_tiles);
     program.program_grid::<BLOCK>(grid, |program| {
@@ -515,46 +545,138 @@ fn batched_coop_matmul_perf<
         let subgroup_id = program.subgroup_id();
         let sg_row = subgroup_id.clone() / COL_GROUPS;
         let sg_col = subgroup_id % COL_GROUPS;
-        let sg_row_base = sg_row * SUBGROUP_ROWS;
-        let sg_col_base = sg_col * SUBGROUP_COLS;
-        let accs = zero_coop_acc_grid(program, TILE_ROWS_PER_SG, TILE_COLS_PER_SG);
+        let sg_row_base = sg_row * subgroup_rows;
+        let sg_col_base_in_pass = sg_col * subgroup_cols_per_pass;
 
-        program.while_true(k_iterations, |program, loop_index| {
-            let k_base = loop_index * BK as u32;
-            program.copy_storage_to_tile(
-                a_tile,
-                a_clone,
-                a_batch_base.clone() + row_base.clone(),
-                &k_base,
-            );
-            program.copy_storage_to_tile(
-                b_tile,
-                b_clone,
-                b_batch_base.clone() + k_base.clone(),
-                &col_base,
-            );
-            program.workgroup_barrier();
+        for n_pass in 0..N_PASSES {
+            let pass_col_base = col_base.clone() + n_pass * bn_pass;
+            let accs = zero_coop_acc_grid(program, tile_rows_per_sg, tile_cols_per_sg);
 
-            let kk_steps = (BK as u32) / COOP_DIM;
-            for kk in 0..kk_steps {
-                let a_frags =
-                    coop_load_a_fragments(program, a_tile, &sg_row_base, kk, TILE_ROWS_PER_SG);
-                let b_frags =
-                    coop_load_b_fragments(program, b_tile, &sg_col_base, kk, TILE_COLS_PER_SG);
-                coop_mma_grid(program, &accs, &a_frags, &b_frags);
+            if k_pairs > 0 {
+                program.while_true(k_pairs, |program, pair_idx| {
+                    let k_base_0 = pair_idx.clone() * (2 * BK as u32);
+                    let k_base_1 = pair_idx * (2 * BK as u32) + BK as u32;
+
+                    // First K-tile of the pair.
+                    program.copy_storage_to_tile(
+                        a_tile_0,
+                        a,
+                        a_batch_base.clone() + row_base.clone(),
+                        &k_base_0,
+                    );
+                    program.copy_storage_to_tile(
+                        b_tile_0,
+                        b,
+                        b_batch_base.clone() + k_base_0.clone(),
+                        &pass_col_base,
+                    );
+                    program.workgroup_barrier();
+
+                    let kk_steps = (BK as u32) / COOP_DIM;
+                    for kk in 0..kk_steps {
+                        let a_frags = coop_load_a_fragments(
+                            program,
+                            a_tile_0,
+                            &sg_row_base,
+                            kk,
+                            tile_rows_per_sg,
+                        );
+                        let b_frags = coop_load_b_fragments(
+                            program,
+                            b_tile_0,
+                            &sg_col_base_in_pass,
+                            kk,
+                            tile_cols_per_sg,
+                        );
+                        coop_mma_grid(program, &accs, &a_frags, &b_frags);
+                    }
+                    program.workgroup_barrier();
+
+                    // Second K-tile of the pair.
+                    program.copy_storage_to_tile(
+                        a_tile_1,
+                        a,
+                        a_batch_base.clone() + row_base.clone(),
+                        &k_base_1,
+                    );
+                    program.copy_storage_to_tile(
+                        b_tile_1,
+                        b,
+                        b_batch_base.clone() + k_base_1.clone(),
+                        &pass_col_base,
+                    );
+                    program.workgroup_barrier();
+
+                    for kk in 0..kk_steps {
+                        let a_frags = coop_load_a_fragments(
+                            program,
+                            a_tile_1,
+                            &sg_row_base,
+                            kk,
+                            tile_rows_per_sg,
+                        );
+                        let b_frags = coop_load_b_fragments(
+                            program,
+                            b_tile_1,
+                            &sg_col_base_in_pass,
+                            kk,
+                            tile_cols_per_sg,
+                        );
+                        coop_mma_grid(program, &accs, &a_frags, &b_frags);
+                    }
+                    program.workgroup_barrier();
+                });
             }
-            program.workgroup_barrier();
-        });
 
-        coop_store_acc_grid(
-            program,
-            &accs,
-            y_clone,
-            Some(&y_batch_base),
-            &row_base,
-            &col_base,
-            &sg_row_base,
-            &sg_col_base,
-        );
+            // Odd k_iterations: a single trailing tile after the pair loop.
+            if k_remainder == 1 {
+                let k_base_epi =
+                    Tile::literal(TileLiteral::U32((k_iterations - 1) * BK as u32));
+                program.copy_storage_to_tile(
+                    a_tile_0,
+                    a,
+                    a_batch_base.clone() + row_base.clone(),
+                    &k_base_epi,
+                );
+                program.copy_storage_to_tile(
+                    b_tile_0,
+                    b,
+                    b_batch_base.clone() + k_base_epi.clone(),
+                    &pass_col_base,
+                );
+                program.workgroup_barrier();
+
+                let kk_steps = (BK as u32) / COOP_DIM;
+                for kk in 0..kk_steps {
+                    let a_frags = coop_load_a_fragments(
+                        program,
+                        a_tile_0,
+                        &sg_row_base,
+                        kk,
+                        tile_rows_per_sg,
+                    );
+                    let b_frags = coop_load_b_fragments(
+                        program,
+                        b_tile_0,
+                        &sg_col_base_in_pass,
+                        kk,
+                        tile_cols_per_sg,
+                    );
+                    coop_mma_grid(program, &accs, &a_frags, &b_frags);
+                }
+                program.workgroup_barrier();
+            }
+
+            coop_store_acc_grid(
+                program,
+                &accs,
+                y,
+                Some(&y_batch_base),
+                &row_base,
+                &pass_col_base,
+                &sg_row_base,
+                &sg_col_base_in_pass,
+            );
+        }
     });
 }

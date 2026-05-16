@@ -79,7 +79,7 @@ pub(crate) fn sample_from_sorted_top_k_data_with_encoder(
         values_stride: values.layout().strides()[0].try_into().ok()?,
         has_exactness_flag,
     };
-    let cache_key = kernel_backend::module_key_from(|state| {
+    let cache_key = kernel_backend::KernelCacheKey::from_hash_inputs(|state| {
         kernel_backend::KernelVariantKey::of::<Mirostat2SortedTopKKernelVariant>().hash(state);
         TOP_K_BLOCK.hash(state);
         top_k.hash(state);
@@ -92,7 +92,7 @@ pub(crate) fn sample_from_sorted_top_k_data_with_encoder(
         has_exactness_flag.hash(state);
     });
     let kernel = kernel_backend::run_kernel(
-        device,
+        device.kernel_cache(),
         "sample_mirostat2_sorted_top_k_f32",
         cache_key,
         [1, 1, 1],
@@ -100,12 +100,12 @@ pub(crate) fn sample_from_sorted_top_k_data_with_encoder(
             tile_ir_kernels::mirostat2(
                 kb,
                 tile_ir_kernels::Mirostat2 {
-                    ids: kernel_backend::linear_tensor_ref(ids),
-                    values: kernel_backend::linear_tensor_ref(values),
-                    state: kernel_backend::linear_tensor_ref(&sampler.state),
-                    params: kernel_backend::linear_tensor_ref(&params),
-                    output: kernel_backend::linear_tensor_ref(&output),
-                    exactness_flag: exactness_flag.map(kernel_backend::linear_tensor_ref),
+                    ids: ids.as_kernel_tensor_ref(),
+                    values: values.as_kernel_tensor_ref(),
+                    state: sampler.state.as_kernel_tensor_ref(),
+                    params: params.as_kernel_tensor_ref(),
+                    output: output.as_kernel_tensor_ref(),
+                    exactness_flag: exactness_flag.map(|t| t.as_kernel_tensor_ref()),
                     meta,
                 },
             )
@@ -113,7 +113,7 @@ pub(crate) fn sample_from_sorted_top_k_data_with_encoder(
     )?;
 
     if let Some(encoder) = encoder {
-        kernel.run(device, encoder);
+        kernel.run(device.kernel_cache(), encoder);
     } else {
         let mut encoder =
             device
@@ -121,7 +121,7 @@ pub(crate) fn sample_from_sorted_top_k_data_with_encoder(
                 .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                     label: Some("sample_mirostat2_sorted_top_k_f32 encoder"),
                 });
-        kernel.run(device, &mut encoder);
+        kernel.run(device.kernel_cache(), &mut encoder);
         device.wgpu_queue().submit(Some(encoder.finish()));
     }
 

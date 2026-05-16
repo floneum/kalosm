@@ -1,0 +1,14 @@
+[package]
+name = "fusor-tile-ir-runtime"
+version = "0.1.0"
+authors = ["Evan Almloff <evanalmloff@gmail.com>"]
+license = "MIT/Apache-2.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+fusor-tile-ir = { workspace = true }
+wgpu = { git = "https://github.com/ealmloff/wgpu", branch = "yield-now", features = ["naga-ir", "static-dxc"] }
+lru = "0.14.0"
+parking_lot = "0.12.3"
+rustc-hash = "2.1.1"

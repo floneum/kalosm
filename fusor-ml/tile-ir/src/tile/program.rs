@@ -238,9 +238,22 @@ impl Program {
 
     /// Allocate a rank-2 workgroup-scope tile of shape `[rows, cols]`.
     pub fn alloc_workgroup_tile<T: Numeric>(&mut self, rows: u32, cols: u32) -> Workgroup<T> {
-        self.alloc_tile::<T>(Layout::contiguous(
+        self.alloc_workgroup_tile_padded::<T>(rows, cols, 0)
+    }
+
+    /// Allocate a rank-2 workgroup-scope tile of shape `[rows, cols]` with
+    /// `inner_pad` extra elements of stride between consecutive rows. Used to
+    /// pad away bank conflicts on the inner axis (e.g. on Apple Silicon).
+    pub fn alloc_workgroup_tile_padded<T: Numeric>(
+        &mut self,
+        rows: u32,
+        cols: u32,
+        inner_pad: u32,
+    ) -> Workgroup<T> {
+        self.alloc_tile::<T>(Layout::row_major_padded(
             MemoryLevel::Workgroup,
             Shape::new([rows, cols]),
+            inner_pad,
         ))
     }
 

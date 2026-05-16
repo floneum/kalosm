@@ -4,7 +4,7 @@ use crate::{
     DataTypeEnum, TILE_SIZE, Tensor, TensorData,
     compute_graph::{ComputeGraphInner, NodeIndex},
     mir::{
-        direct_kernel::DirectKernel,
+        kernel_backend::DirectKernel,
         inputs::MirValue,
         operation::Operation,
         workgroup_shape::{WorkgroupShape, WorkgroupShapeConstraints},
