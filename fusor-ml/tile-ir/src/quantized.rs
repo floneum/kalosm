@@ -1,7 +1,7 @@
 use crate::ir::StorageView;
 
 /// GGML quantization formats represented by the tiled qmatmul path.
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub enum GgmlQuantFormat {
     /// GGML `Q4_0`.
     Q4_0,
@@ -59,7 +59,7 @@ impl GgmlQuantFormat {
 
 /// A packed quantized storage matrix — kernel-input handle pairing a tile-IR
 /// storage view with the quantization format and matrix dimensions.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct QuantizedMatrix {
     /// Storage view containing packed quantized block words.
     pub data: StorageView,

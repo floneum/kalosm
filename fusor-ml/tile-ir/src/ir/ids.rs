@@ -24,7 +24,7 @@ id_newtype!(
 
 id_newtype!(
     /// A storage buffer identifier.
-    pub BufferId
+    pub BufferId, Hash
 );
 
 id_newtype!(
@@ -34,5 +34,5 @@ id_newtype!(
 
 id_newtype!(
     /// A tiny tile identifier for the typed IR.
-    pub TileId
+    pub TileId, Hash
 );

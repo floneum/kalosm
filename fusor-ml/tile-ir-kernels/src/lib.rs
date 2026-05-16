@@ -45,12 +45,15 @@ pub use dispatch::{
     qgemv_subgroups_per_workgroup_for_shape,
 };
 pub use kernels::{
-    flash_attention, flash_decode_small, gemv, linear_storage_layout, matmul,
-    matmul_with_epilogues, mirostat2, qdequantize, qgemv, qgemv_q4k_paired, qgemv_with_epilogue,
-    qmatmul, qmatmul_with_epilogue, quantized_matrix, quantized_matrix_for, rms_norm_vec4,
-    top_k_chunk, top_k_exactness, top_k_merge, FlashAttentionDims, FlashAttentionMeta,
-    FlashDecodeSmallMeta, IntoQgemvEpilogues, MergeTopKMeta, Mirostat2, Mirostat2Meta,
-    Q4KPairedGgml, RmsNormVec4, RmsNormVec4Meta, TensorMeta, TopKChunkMeta, TopKExactnessMeta,
-    QGEMV_Q4K_PAIRED_COLS_PER_WORKGROUP, QGEMV_Q4K_PAIRED_TILE_NAME,
+    batched_matmul_f16_accum_f32_register_with_epilogues,
+    batched_matmul_f16_accum_f32_with_epilogues, batched_matmul_register_with_epilogues,
+    batched_matmul_with_epilogues, flash_attention, flash_decode_small, gemv,
+    linear_storage_layout, matmul, matmul_with_epilogues, mirostat2, qdequantize, qgemv,
+    qgemv_q4k_paired, qgemv_q4k_paired_dispatch, qgemv_with_epilogue, qmatmul,
+    qmatmul_with_epilogue, quantized_matrix, quantized_matrix_for, rms_norm_vec4, top_k_chunk,
+    top_k_exactness, top_k_merge, try_batched_coop_matmul_f32, DenseMatmulShape,
+    FlashAttentionDims, FlashAttentionMeta, FlashDecodeSmallMeta, IntoQgemvEpilogues,
+    MergeTopKMeta, Mirostat2, Mirostat2Meta, Q4KPairedGgml, RmsNormVec4, RmsNormVec4Meta,
+    TensorMeta, TopKChunkMeta, TopKExactnessMeta,
 };
 pub use types::{DenseMatmulEpilogues, PairedEpilogue, QmatmulEpilogues, UnaryEpilogue};

@@ -1,7 +1,7 @@
 use super::ElementType;
 
 /// Floating point literal stored by bits so IR equality remains exact.
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub struct F32Bits(pub u32);
 
 impl F32Bits {
@@ -19,7 +19,7 @@ impl F32Bits {
 /// A typed scalar literal stored by bits so IR equality remains exact. Vector
 /// constants are not literals — they are built by composing scalar literals
 /// (e.g. `Expr::ComposeVector`).
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub enum TileLiteral {
     /// 32-bit floating point literal.
     F32(F32Bits),
@@ -50,8 +50,26 @@ impl TileLiteral {
     }
 }
 
+impl From<f32> for TileLiteral {
+    fn from(value: f32) -> Self {
+        Self::f32(value)
+    }
+}
+
+impl From<u32> for TileLiteral {
+    fn from(value: u32) -> Self {
+        Self::U32(value)
+    }
+}
+
+impl From<bool> for TileLiteral {
+    fn from(value: bool) -> Self {
+        Self::Bool(value)
+    }
+}
+
 /// Unary operation over a tile expression.
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub enum TileUnaryOp {
     /// Exponential.
     Exp,
@@ -96,7 +114,7 @@ pub enum TileUnaryOp {
 }
 
 /// Binary operation over two tile expressions.
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub enum TileBinaryOp {
     /// Addition.
     Add,
@@ -127,7 +145,7 @@ pub enum TileBinaryOp {
 }
 
 /// Cross-lane reduction operation.
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub enum TileReduceOp {
     /// Sum.
     Sum,
@@ -154,7 +172,7 @@ impl TileReduceOp {
 }
 
 /// Comparison operation over tile expressions.
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub enum TileCompareOp {
     /// Less than.
     Lt,

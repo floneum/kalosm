@@ -1,8 +1,6 @@
 //! Quantized GEMV program kernels.
 
-use fusor_tile_ir::tile::{
-    quantized::ggml::BlockCoords, Bound, Mask, Program, QuantizedDot, Storage, Tile,
-};
+use fusor_tile_ir::tile::{Mask, Program, QuantizedDot, Storage, Tile};
 use fusor_tile_ir::{GgmlQuantFormat, QuantizedMatrix, TileLiteral, TileReduceOp, F32};
 
 use crate::dispatch::{
@@ -307,11 +305,15 @@ pub(crate) fn qgemv_q4k_ggml_with_epilogue<
                 std::array::from_fn(|c| {
                     let col = col0.clone() + c as u32;
                     let mask = grid.mask(full_block_iterations, pass.in_bounds.clone(), &col);
-                    let coords = BlockCoords::new(&pass.block, &q4k_lane.iq, &q4k_lane.ir, &col);
-                    program.quantized_dot(QuantizedDot::ggml_q4k(
-                        pass.activations.clone(),
+                    program.quantized_dot(QuantizedDot::q4k_block(
+                        pass.activations.low.clone(),
+                        pass.activations.high.clone(),
+                        pass.activations.sums.clone(),
                         &b_cloned,
-                        coords,
+                        &pass.block,
+                        &q4k_lane.iq,
+                        &q4k_lane.ir,
+                        &col,
                         mask,
                         0.0,
                     ))
@@ -386,11 +388,13 @@ pub(crate) fn qgemv_q6k_ggml_with_epilogue<
                 std::array::from_fn(|c| {
                     let col = col0.clone() + c as u32;
                     let mask = grid.mask(full_block_iterations, pass.in_bounds.clone(), &col);
-                    let coords = BlockCoords::new(&pass.block, &q6k_lane.ip, &q6k_lane.il, &col);
-                    program.quantized_dot(QuantizedDot::ggml_q6k(
+                    program.quantized_dot(QuantizedDot::q6k_block(
                         pass.activations.clone(),
                         &b_cloned,
-                        coords,
+                        &pass.block,
+                        &q6k_lane.ip,
+                        &q6k_lane.il,
+                        &col,
                         mask,
                         0.0,
                     ))
@@ -465,7 +469,7 @@ pub(crate) fn qgemv_perf_with_epilogue<
                     k_base.lt(k_size)
                 };
 
-                let a_bound: [Bound; VALUES_PER_LANE] = std::array::from_fn(|i| {
+                let a_bound: [Tile; VALUES_PER_LANE] = std::array::from_fn(|i| {
                     let scalar = program.load(
                         a.at((0, k_base.clone() + i as u32)),
                         in_bounds_k.clone(),
@@ -475,9 +479,9 @@ pub(crate) fn qgemv_perf_with_epilogue<
                     program.bind(scalar)
                 });
 
-                let a8 = || -> [Tile; 8] { std::array::from_fn(|i| a_bound[i].get()) };
+                let a8 = || -> [Tile; 8] { std::array::from_fn(|i| a_bound[i].clone()) };
                 let an =
-                    || -> [Tile; VALUES_PER_LANE] { std::array::from_fn(|i| a_bound[i].get()) };
+                    || -> [Tile; VALUES_PER_LANE] { std::array::from_fn(|i| a_bound[i].clone()) };
                 std::array::from_fn(|c| {
                     let col = col0.clone() + c as u32;
                     let mask = grid.mask(full_k_iterations, in_bounds_k.clone(), &col);

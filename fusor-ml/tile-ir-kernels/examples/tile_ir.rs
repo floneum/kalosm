@@ -48,8 +48,8 @@ fn fused_rms_norm_silu_ir(rows: u32, cols: u32, eps: f32) -> KernelIr {
 
             let square = x.clone() * x.clone();
             let sum_square = program.reduce_sum(square);
-            let mean_square = tile::Tile::from(sum_square) / tile::Scalar::literal(cols as f32);
-            let inv_rms = (mean_square + tile::Scalar::literal(eps)).inverse_sqrt();
+            let mean_square = sum_square / tile::Tile::literal(cols as f32);
+            let inv_rms = (mean_square + tile::Tile::literal(eps)).inverse_sqrt();
 
             // The normalization reduction feeds directly into the per-element
             // scale and SiLU activation, so callers can fuse the whole block

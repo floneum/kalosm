@@ -1,5 +1,5 @@
 use fusor_tile_ir::{
-    tile::{Range, ScalarIndex, Tile, TileBlock},
+    tile::{Tile, TileBlock},
     TileLiteral,
 };
 
@@ -39,37 +39,13 @@ impl Index for &Tile {
     }
 }
 
-impl Index for Range {
-    fn into_component(self) -> IndexComponent {
-        IndexComponent::Dynamic(Box::new(Tile::from_index(self)))
-    }
-}
-
-impl Index for &Range {
-    fn into_component(self) -> IndexComponent {
-        IndexComponent::Dynamic(Box::new(Tile::from_index(self)))
-    }
-}
-
-impl Index for ScalarIndex {
-    fn into_component(self) -> IndexComponent {
-        IndexComponent::Dynamic(Box::new(Tile::from_index(self)))
-    }
-}
-
-impl Index for &ScalarIndex {
-    fn into_component(self) -> IndexComponent {
-        IndexComponent::Dynamic(Box::new(Tile::from_index(self)))
-    }
-}
-
 /// Convert a rank-`R` list of components into index components.
-pub(super) trait IntoIndex<const R: usize> {
+pub(super) trait IntoIndexExpr<const R: usize> {
     /// Consume the list while preserving component order.
     fn into_indices(self) -> [IndexComponent; R];
 }
 
-impl<I, const R: usize> IntoIndex<R> for [I; R]
+impl<I, const R: usize> IntoIndexExpr<R> for [I; R]
 where
     I: Index,
 {
@@ -78,7 +54,7 @@ where
     }
 }
 
-impl<I> IntoIndex<1> for I
+impl<I> IntoIndexExpr<1> for I
 where
     I: Index,
 {
@@ -87,9 +63,9 @@ where
     }
 }
 
-impl<Prefix, Last> IntoIndex<2> for (Prefix, Last)
+impl<Prefix, Last> IntoIndexExpr<2> for (Prefix, Last)
 where
-    Prefix: IntoIndex<1>,
+    Prefix: IntoIndexExpr<1>,
     Last: Index,
 {
     fn into_indices(self) -> [IndexComponent; 2] {
@@ -98,9 +74,9 @@ where
     }
 }
 
-impl<Prefix, Last> IntoIndex<3> for (Prefix, Last)
+impl<Prefix, Last> IntoIndexExpr<3> for (Prefix, Last)
 where
-    Prefix: IntoIndex<2>,
+    Prefix: IntoIndexExpr<2>,
     Last: Index,
 {
     fn into_indices(self) -> [IndexComponent; 3] {
@@ -109,7 +85,7 @@ where
     }
 }
 
-impl<A, B, C> IntoIndex<3> for (A, B, C)
+impl<A, B, C> IntoIndexExpr<3> for (A, B, C)
 where
     A: Index,
     B: Index,
@@ -124,9 +100,9 @@ where
     }
 }
 
-impl<Prefix, Last> IntoIndex<4> for (Prefix, Last)
+impl<Prefix, Last> IntoIndexExpr<4> for (Prefix, Last)
 where
-    Prefix: IntoIndex<3>,
+    Prefix: IntoIndexExpr<3>,
     Last: Index,
 {
     fn into_indices(self) -> [IndexComponent; 4] {
@@ -135,7 +111,7 @@ where
     }
 }
 
-impl<A, B, C, D> IntoIndex<4> for (A, B, C, D)
+impl<A, B, C, D> IntoIndexExpr<4> for (A, B, C, D)
 where
     A: Index,
     B: Index,
@@ -158,7 +134,7 @@ where
 pub(super) fn index_n<const R: usize>(
     offset: u32,
     strides: [u32; R],
-    components: impl IntoIndex<R>,
+    components: impl IntoIndexExpr<R>,
 ) -> Tile {
     let mut folded_offset = offset;
     let mut dynamic_components = Vec::with_capacity(R);
@@ -192,7 +168,7 @@ pub(super) fn index_n<const R: usize>(
 pub(super) fn reduce_workgroup(
     program: &mut TileBlock<'_>,
     scratch: fusor_tile_ir::TileRef,
-    lane: fusor_tile_ir::tile::Range,
+    lane: fusor_tile_ir::tile::Tile,
     combine: impl Fn(Tile, Tile) -> Tile,
 ) {
     let mut stride = program.block_size() as u32 / 2;

@@ -1,3 +1,5 @@
+use std::hash::Hash;
+
 use fusor_tile_ir_kernels as tile_ir_kernels;
 
 use crate::{
@@ -18,6 +20,8 @@ struct Mirostat2Params {
     random: f32,
     _padding: f32,
 }
+
+struct Mirostat2SortedTopKKernelVariant;
 
 fn mirostat2_params_data(device: &Device, params: GpuMirostat2SamplerParams) -> TensorData {
     let params = Mirostat2Params {
@@ -75,11 +79,18 @@ pub(crate) fn sample_from_sorted_top_k_data_with_encoder(
         values_stride: values.layout().strides()[0].try_into().ok()?,
         has_exactness_flag,
     };
-    let cache_key = format!(
-        "sample_mirostat2_sorted_top_k_f32:backend-lowered:block={TOP_K_BLOCK}:top_k={top_k}:ids={:?}:values={:?}:exact={has_exactness_flag}",
-        ids.layout(),
-        values.layout()
-    );
+    let cache_key = kernel_backend::module_key_from(|state| {
+        kernel_backend::KernelVariantKey::of::<Mirostat2SortedTopKKernelVariant>().hash(state);
+        TOP_K_BLOCK.hash(state);
+        top_k.hash(state);
+        ids.layout().offset().hash(state);
+        ids.layout().shape().hash(state);
+        ids.layout().strides().hash(state);
+        values.layout().offset().hash(state);
+        values.layout().shape().hash(state);
+        values.layout().strides().hash(state);
+        has_exactness_flag.hash(state);
+    });
     let kernel = kernel_backend::run_kernel(
         device,
         "sample_mirostat2_sorted_top_k_f32",

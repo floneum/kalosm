@@ -1,8 +1,6 @@
 //! Quantized matrix multiply program kernels.
 
-use fusor_tile_ir::tile::{
-    CoopAcc, CoopFragment, CoopRole, Program, ScalarIndex, Storage, TileBlock,
-};
+use fusor_tile_ir::tile::{CoopAcc, CoopFragment, CoopRole, Program, Storage, Tile, TileBlock};
 use fusor_tile_ir::{QuantizedMatrix, TileLiteral, TileReduceOp, TileRef, WorkgroupAxis, F32};
 
 use crate::types::{apply_optional_epilogue, cooperative_store_layout_supported, matrix_shape};
@@ -224,7 +222,7 @@ fn zero_coop_acc_grid(
 fn coop_load_a_fragments(
     program: &mut TileBlock<'_>,
     tile: TileRef,
-    sg_row_base: &ScalarIndex,
+    sg_row_base: &Tile,
     kk: u32,
     rows: u32,
 ) -> Vec<CoopFragment<F32, 8, 8>> {
@@ -242,7 +240,7 @@ fn coop_load_a_fragments(
 fn coop_load_b_fragments(
     program: &mut TileBlock<'_>,
     tile: TileRef,
-    sg_col_base: &ScalarIndex,
+    sg_col_base: &Tile,
     kk: u32,
     cols: u32,
 ) -> Vec<CoopFragment<F32, 8, 8>> {
@@ -274,10 +272,10 @@ fn coop_store_acc_grid(
     program: &mut TileBlock<'_>,
     accs: &[Vec<CoopAcc<F32, 8, 8>>],
     y: &Storage<F32, 2>,
-    row_base: &ScalarIndex,
-    col_base: &ScalarIndex,
-    sg_row_base: &ScalarIndex,
-    sg_col_base: &ScalarIndex,
+    row_base: &Tile,
+    col_base: &Tile,
+    sg_row_base: &Tile,
+    sg_col_base: &Tile,
 ) {
     const COOP_DIM: u32 = 8;
     for (r, row_accs) in accs.iter().enumerate() {

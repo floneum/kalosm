@@ -1,7 +1,7 @@
 use super::{BufferId, ElementType, Layout, LocalId, TileId};
 
 /// A storage buffer declaration.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct BufferDecl {
     /// Buffer id.
     pub id: BufferId,
@@ -14,7 +14,7 @@ pub struct BufferDecl {
 }
 
 /// A storage buffer reference.
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub struct BufferRef {
     /// Buffer id.
     pub id: BufferId,
@@ -30,7 +30,7 @@ impl BufferRef {
 }
 
 /// Access required for a storage buffer.
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub enum BufferAccess {
     /// Read-only storage access.
     Read,
@@ -40,7 +40,7 @@ pub enum BufferAccess {
 
 /// A typed workgroup tile declaration. Tiles are always workgroup-level and
 /// always own their storage — the IR has no other shape today.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct TileDecl {
     /// Tile id.
     pub id: TileId,
@@ -51,7 +51,7 @@ pub struct TileDecl {
 }
 
 /// A typed reference to a tile declaration.
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub struct TileRef {
     /// Tile id.
     pub id: TileId,
@@ -69,7 +69,7 @@ impl TileRef {
 /// A typed private per-invocation local. Used both as the declaration in
 /// `KernelIr::locals` and as the reference embedded in `Expr::LoadLocal` /
 /// `TileStmt::StoreLocal` — they carry the same fields.
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub struct LocalRef {
     /// Local id.
     pub id: LocalId,
@@ -85,7 +85,7 @@ impl LocalRef {
 }
 
 /// A shaped view into a storage buffer.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct StorageView {
     /// Referenced storage buffer.
     pub buffer: BufferRef,

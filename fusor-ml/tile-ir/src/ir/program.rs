@@ -2,7 +2,7 @@ use super::*;
 use crate::{LowerError, NagaKernel, QuantizedMatrix};
 
 /// A typed kernel IR emitted by the tile builder.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
 pub struct KernelIr {
     pub(crate) buffers: Vec<BufferDecl>,
     pub(crate) tiles: Vec<TileDecl>,
@@ -35,11 +35,6 @@ impl KernelIr {
     pub fn lower_to_naga(&self) -> Result<NagaKernel, LowerError> {
         crate::lower::lower_to_naga(self)
     }
-
-    /// Return the dispatch grid for kernels that lower to a single tile program.
-    pub fn single_tile_program_grid(&self) -> Option<[u32; 3]> {
-        Some(self.body.grid)
-    }
 }
 
 /// Multiplicand role for a cooperatively-loaded matrix fragment.
@@ -52,7 +47,7 @@ pub enum CoopOperandRole {
 }
 
 /// A Triton-like source tile program over one workgroup tile.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct TileProgramOp {
     /// Dispatch grid.
     pub grid: [u32; 3],
@@ -74,7 +69,7 @@ impl Default for TileProgramOp {
 
 /// Source of a `TileStmt::CopyToWorkgroupTile`. The lowerer dispatches the
 /// per-element copy on this variant — `Quantized` dequantizes on the fly.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum CopySource {
     /// Dense storage source.
     Storage(StorageView),
@@ -83,7 +78,7 @@ pub enum CopySource {
 }
 
 /// One ordered statement in a tile program.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum TileStmt {
     /// Per-lane masked storage write.
     Store(TileStoreStmt),
@@ -160,7 +155,7 @@ pub enum TileStmt {
 }
 
 /// One accumulator carried by a `TileStmt::Fold`.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct FoldAccumulator {
     /// Local id carrying the accumulator.
     pub name: LocalId,
@@ -173,7 +168,7 @@ pub struct FoldAccumulator {
 }
 
 /// A masked tile store emitted by a source tile program.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct TileStoreStmt {
     /// Destination view.
     pub dst: StorageView,
@@ -188,7 +183,7 @@ pub struct TileStoreStmt {
 }
 
 /// A masked rank-1 store emitted by a source tile program.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct TileIndexedStoreStmt {
     /// Destination view.
     pub dst: StorageView,

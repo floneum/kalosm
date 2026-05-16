@@ -603,9 +603,7 @@ fn run_three_buffer_kernel(
     output_len: usize,
     _dispatch: (u32, u32, u32),
 ) -> TestResult<Vec<f32>> {
-    let dispatch = ir
-        .single_tile_program_grid()
-        .ok_or("correctness fuzz expects one tile program")?;
+    let dispatch = ir.body().grid;
     let lowered = ir.lower_to_naga()?;
     let shader = unsafe {
         device.create_shader_module_trusted(

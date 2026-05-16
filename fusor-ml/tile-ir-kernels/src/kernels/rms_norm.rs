@@ -145,7 +145,7 @@ pub fn rms_norm_vec4<B>(
                         TileLiteral::f32(0.0),
                     );
             }
-            let scale = program.vector_splat::<F32, 4>(scale.get());
+            let scale = program.vector_splat::<F32, 4>(scale.clone());
             let weight = program.load(weight.at(col.clone()), mask.clone(), TileLiteral::f32(0.0));
             let mut normalized = value * scale * weight;
             if let Some(bias) = &bias {

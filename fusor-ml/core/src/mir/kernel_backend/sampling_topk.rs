@@ -1,3 +1,5 @@
+use std::hash::Hash;
+
 use fusor_tile_ir_kernels as tile_ir_kernels;
 
 use crate::{
@@ -33,6 +35,10 @@ enum TopKExactnessVariant {
     Ineligible,
     Kernel,
 }
+
+struct ProveTopKExactKernelVariant;
+struct ChunkTopKPairsKernelVariant;
+struct MergeSortedChunkTopKPairsKernelVariant;
 
 fn topk_empty_caps() -> KernelDeviceCaps {
     KernelDeviceCaps {
@@ -175,11 +181,20 @@ pub(crate) fn top_k_exactness_flag_data_with_encoder(
         chunk_values_offset: chunk_values.layout().offset().try_into().ok()?,
         chunk_values_stride: chunk_values.layout().strides()[0].try_into().ok()?,
     };
-    let cache_key = format!(
-        "prove_top_k_exact_f32:block={TOP_K_BLOCK}:chunks={chunks}:candidate_count={candidate_count}:output_per_chunk={output_per_chunk}:top_k={top_k}:top={:?}:chunk={:?}",
-        top_values.layout(),
-        chunk_values.layout()
-    );
+    let cache_key = kernel_backend::module_key_from(|state| {
+        kernel_backend::KernelVariantKey::of::<ProveTopKExactKernelVariant>().hash(state);
+        TOP_K_BLOCK.hash(state);
+        chunks.hash(state);
+        candidate_count.hash(state);
+        output_per_chunk.hash(state);
+        top_k.hash(state);
+        top_values.layout().offset().hash(state);
+        top_values.layout().shape().hash(state);
+        top_values.layout().strides().hash(state);
+        chunk_values.layout().offset().hash(state);
+        chunk_values.layout().shape().hash(state);
+        chunk_values.layout().strides().hash(state);
+    });
     let kernel = kernel_backend::run_kernel(
         device,
         "prove_top_k_exact_f32",
@@ -263,9 +278,17 @@ fn chunk_top_k_pair_data_inner_with_encoder(
     let input_offset = input.layout().offset();
     let input_stride = input.layout().strides()[0];
     let has_processors = processors.is_some();
-    let cache_key = format!(
-        "chunk_top_k_pairs_f32:block={TOP_K_BLOCK}:chunk={TOP_K_CHUNK}:len={input_len}:candidate_count={candidate_count}:output_per_chunk={output_per_chunk}:offset={input_offset}:stride={input_stride}:processors={has_processors}"
-    );
+    let cache_key = kernel_backend::module_key_from(|state| {
+        kernel_backend::KernelVariantKey::of::<ChunkTopKPairsKernelVariant>().hash(state);
+        TOP_K_BLOCK.hash(state);
+        TOP_K_CHUNK.hash(state);
+        input_len.hash(state);
+        candidate_count.hash(state);
+        output_per_chunk.hash(state);
+        input_offset.hash(state);
+        input_stride.hash(state);
+        has_processors.hash(state);
+    });
 
     let kernel = kernel_backend::run_kernel(
         device,
@@ -337,11 +360,22 @@ pub(crate) fn merge_sorted_chunk_top_k_pair_data_with_encoder(
         return Some((ids, values));
     }
 
-    let cache_key = format!(
-        "merge_sorted_chunk_top_k_pairs_f32:block={TOP_K_BLOCK}:chunks={chunks}:chunk_len={chunk_len}:chunk_stride={chunk_stride}:input_len={input_len}:k={output_len}:ids={:?}:values={:?}",
-        input_ids.layout(),
-        input_values.layout()
-    );
+    let cache_key = kernel_backend::module_key_from(|state| {
+        kernel_backend::KernelVariantKey::of::<MergeSortedChunkTopKPairsKernelVariant>()
+            .hash(state);
+        TOP_K_BLOCK.hash(state);
+        chunks.hash(state);
+        chunk_len.hash(state);
+        chunk_stride.hash(state);
+        input_len.hash(state);
+        output_len.hash(state);
+        input_ids.layout().offset().hash(state);
+        input_ids.layout().shape().hash(state);
+        input_ids.layout().strides().hash(state);
+        input_values.layout().offset().hash(state);
+        input_values.layout().shape().hash(state);
+        input_values.layout().strides().hash(state);
+    });
     let kernel = kernel_backend::run_kernel(
         device,
         "merge_sorted_chunk_top_k_pairs_f32",

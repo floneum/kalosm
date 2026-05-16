@@ -1,4 +1,8 @@
-use std::{any::Any, hash::Hash, sync::OnceLock};
+use std::{
+    any::{Any, TypeId},
+    hash::Hash,
+    sync::OnceLock,
+};
 
 use crate::{
     DataTypeEnum, Layout,
@@ -39,6 +43,8 @@ enum RmsNormKernelVariant {
     Tile,
     Vec4,
 }
+
+struct RmsNormDirectKernelVariant;
 
 const RMS_COLS: Axis<1> = Axis;
 
@@ -132,6 +138,7 @@ impl RmsNormOperation {
 
 impl Operation for RmsNormOperation {
     fn hash_kernel_signature(&self, state: &mut FxHasher) {
+        TypeId::of::<Self>().hash(state);
         self.residual.is_some().hash(state);
         self.bias.is_some().hash(state);
         self.shape.hash(state);
@@ -278,8 +285,12 @@ impl Operation for RmsNormOperation {
             RmsNormKernelVariant::Tile => "rms_norm",
             RmsNormKernelVariant::Vec4 => "rms_norm_vec4",
         };
+        let cache_variant =
+            kernel_backend::KernelVariantKey::with_payload::<RmsNormDirectKernelVariant>(|state| {
+                variant.hash(state);
+            });
         let module_key = self.kernel_module_key_with_dispatch(
-            kernel_label,
+            cache_variant,
             Some(workgroup_shape),
             dispatch_size,
             inputs,
@@ -604,9 +615,8 @@ fn build_rms_norm_tile_ir(
                 }
                 value.clone() * value
             });
-            let rms = (tile_ir::tile::Tile::from(sum_square)
-                / tile_ir::tile::Scalar::literal(cols as f32)
-                + tile_ir::tile::Scalar::literal(eps))
+            let rms = (sum_square / tile_ir::tile::Tile::literal(cols as f32)
+                + tile_ir::tile::Tile::literal(eps))
             .unary(tile_ir::TileUnaryOp::Sqrt);
             for chunk in 0..chunks {
                 let col = lane.clone() + chunk * BLOCK as u32;

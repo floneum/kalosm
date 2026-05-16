@@ -17,6 +17,8 @@ use crate::{
 
 use super::QMatrix;
 
+struct DequantizeDirectKernelVariant;
+
 #[derive(Debug, Clone)]
 pub(crate) struct DequantizeOperation {
     pub(crate) matrix: QMatrix,
@@ -134,7 +136,7 @@ impl Operation for DequantizeOperation {
             return None;
         }
         let cache_key = self.kernel_cache_key_with_dispatch(
-            "dequantize_direct",
+            kernel_backend::KernelVariantKey::of::<DequantizeDirectKernelVariant>(),
             Some(_workgroup_shape),
             [dispatch_x, dispatch_y, 1],
             inputs,

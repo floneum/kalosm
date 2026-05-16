@@ -76,14 +76,14 @@ pub fn flash_attention<E: Numeric, B>(
             let batch_idx =
                 program.bind(program.index(row / (meta.dims.q_seq_len * meta.dims.num_heads)));
             let kv_head_idx =
-                program.bind(head_idx.get() / Tile::literal(TileLiteral::U32(groups)));
+                program.bind(head_idx.clone() / Tile::literal(TileLiteral::U32(groups)));
             let kv_lane = program.index(lane.clone() % FLASH_SIMD_WIDTH);
             let out_dim = program.bind(program.index(
                 workgroup_x * FLASH_OUTPUTS_PER_WORKGROUP + (lane.clone() / FLASH_SIMD_WIDTH),
             ));
             let out_valid = program.bind(
                 out_dim
-                    .get()
+                    .clone()
                     .lt(Tile::literal(TileLiteral::U32(meta.dims.head_dim))),
             );
             // Per-iteration scratch locals — used to bridge values across
@@ -106,22 +106,22 @@ pub fn flash_attention<E: Numeric, B>(
                     );
                     let kv_valid = program.bind(
                         kv_idx
-                            .get()
+                            .clone()
                             .lt(Tile::literal(TileLiteral::U32(meta.dims.kv_seq_len))),
                     );
                     program.store_local(&score_local, Tile::literal(TileLiteral::f32(NEG_MAX_F32)));
-                    program.if_then(kv_valid.get(), |program| {
+                    program.if_then(kv_valid.clone(), |program| {
                         let mut products = Vec::with_capacity(meta.dims.head_dim as usize);
                         for dim in 0..meta.dims.head_dim {
                             let q_index = index_n(
                                 meta.q_meta.offset,
                                 q_strides,
-                                (batch_idx.get(), head_idx.get(), q_idx.get(), dim),
+                                (batch_idx.clone(), head_idx.clone(), q_idx.clone(), dim),
                             );
                             let k_index = index_n(
                                 meta.k_meta.offset,
                                 k_strides,
-                                (batch_idx.get(), kv_head_idx.get(), kv_idx.get(), dim),
+                                (batch_idx.clone(), kv_head_idx.clone(), kv_idx.clone(), dim),
                             );
                             let q_value = program
                                 .load(q.at(q_index), Mask::all(), elem_fill)
@@ -139,7 +139,7 @@ pub fn flash_attention<E: Numeric, B>(
                             let mask_index = index_n(
                                 mask_meta.offset,
                                 mask_strides,
-                                (q_idx.get(), kv_idx.get()),
+                                (q_idx.clone(), kv_idx.clone()),
                             );
                             let mask_value = program
                                 .load(mask.at(mask_index), Mask::all(), elem_fill)
@@ -150,48 +150,48 @@ pub fn flash_attention<E: Numeric, B>(
                     });
 
                     let score = program.bind(program.load_local(&score_local));
-                    let block_max = program.bind(program.subgroup_reduce_max(score.get()));
+                    let block_max = program.bind(program.subgroup_reduce_max(score.clone()));
                     let old_m = program.bind(m_state);
-                    let new_m = program.bind(old_m.get().max(block_max.get()));
-                    let raw_exp = (score.get() - new_m.get()).exp();
+                    let new_m = program.bind(old_m.clone().max(block_max.clone()));
+                    let raw_exp = (score.clone() - new_m.clone()).exp();
                     let exp_score = program.bind(Tile::select(
-                        kv_valid.get(),
+                        kv_valid.clone(),
                         raw_exp,
                         Tile::literal(TileLiteral::f32(0.0)),
                     ));
-                    let block_sum = program.bind(program.subgroup_reduce_sum(exp_score.get()));
+                    let block_sum = program.bind(program.subgroup_reduce_sum(exp_score.clone()));
 
                     program.store_local(&weighted_local, Tile::literal(TileLiteral::f32(0.0)));
-                    let valid_value = kv_valid.get().and(out_valid.get());
+                    let valid_value = kv_valid.clone().and(out_valid.clone());
                     program.if_then(valid_value, |program| {
                         let v_index = index_n(
                             meta.v_meta.offset,
                             v_strides,
                             (
-                                batch_idx.get(),
-                                kv_head_idx.get(),
-                                kv_idx.get(),
-                                out_dim.get(),
+                                batch_idx.clone(),
+                                kv_head_idx.clone(),
+                                kv_idx.clone(),
+                                out_dim.clone(),
                             ),
                         );
                         let v_value = program
                             .load(v.at(v_index), Mask::all(), elem_fill)
                             .cast(ElementType::F32);
-                        program.store_local(&weighted_local, exp_score.get() * v_value);
+                        program.store_local(&weighted_local, exp_score.clone() * v_value);
                     });
                     let weighted = program.load_local(&weighted_local);
                     let block_out = program.bind(program.subgroup_reduce_sum(weighted));
 
-                    let old_m_scale = program.bind((old_m.get() - new_m.get()).exp());
-                    let new_s = s_state * old_m_scale.get() + block_sum.get();
-                    let new_o = o_state * old_m_scale.get() + block_out.get();
-                    [new_m.get(), new_s, new_o]
+                    let old_m_scale = program.bind((old_m.clone() - new_m.clone()).exp());
+                    let new_s = s_state * old_m_scale.clone() + block_sum;
+                    let new_o = o_state * old_m_scale + block_out;
+                    [new_m, new_s, new_o]
                 },
             );
 
             let store_valid = kv_lane
                 .eq(Tile::literal(TileLiteral::U32(0)))
-                .and(out_valid.get());
+                .and(out_valid.clone());
             // Bind the fold results so the divide and the `if_then` body share
             // the same SSA values rather than re-emitting the loop materialize.
             let final_o_bound = program.bind(final_o);
@@ -199,11 +199,16 @@ pub fn flash_attention<E: Numeric, B>(
             // Evaluate `final_m` once so the loop fires even though we don't
             // need its value in the post-loop stage.
             program.if_then(store_valid, |program| {
-                let output_value = (final_o_bound.get() / final_s_bound.get()).cast(E::ELEMENT);
+                let output_value = (final_o_bound.clone() / final_s_bound.clone()).cast(E::ELEMENT);
                 let output_index = index_n(
                     meta.output_meta.offset,
                     output_strides,
-                    (batch_idx.get(), head_idx.get(), q_idx.get(), out_dim.get()),
+                    (
+                        batch_idx.clone(),
+                        head_idx.clone(),
+                        q_idx.clone(),
+                        out_dim.clone(),
+                    ),
                 );
                 program.store(output.at(output_index), output_value, Mask::all());
             });

@@ -25,7 +25,7 @@ pub enum Builtin {
 }
 
 /// A rank-1 tile expression evaluated lane-wise.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum Expr {
     Load(TileLoadExpr),
     LoadLinear(TileLinearLoadExpr),
@@ -136,7 +136,7 @@ pub enum Expr {
 }
 
 /// Activation packing for `Expr::QuantizedDot`.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum PackedActivations {
     /// Raw `f32` activations, fed directly to the format's dequant+dot helper.
     F32(Vec<Expr>),
@@ -154,7 +154,7 @@ pub enum PackedActivations {
 /// Quantized-matrix K coordinate. The `Base` variant is a flat K offset; the
 /// `Block` variant carries the per-format block + 2 inner sub-coords (Q4K
 /// uses iq/ir, Q6K uses ip/il — same shape).
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum DotK {
     Base(Box<Expr>),
     Block {
@@ -213,7 +213,7 @@ impl Expr {
 
 /// Source of an `Expr::Load`. The lowerer dispatches on the variant to choose
 /// between a raw storage read and a dequantized read.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum LoadSource {
     Storage(StorageView),
     Quantized(QuantizedMatrix),
@@ -223,7 +223,7 @@ pub enum LoadSource {
 /// `Literal`, but any expression evaluable in the surrounding scope is
 /// allowed (e.g. `ComposeVector` for a vector splat constant). When `src` is
 /// `Quantized`, the load dequantizes on the fly and the result is `f32`.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct TileLoadExpr {
     pub src: LoadSource,
     pub row: Box<Expr>,
@@ -233,7 +233,7 @@ pub struct TileLoadExpr {
 }
 
 /// A masked rank-1 storage load. See `TileLoadExpr` for `fill` semantics.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct TileLinearLoadExpr {
     pub src: StorageView,
     pub index: Box<Expr>,

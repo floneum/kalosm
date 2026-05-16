@@ -10,18 +10,18 @@ macro_rules! tile_reduce_entrypoints {
     ($(($reduce:ident, $loop_reduce:ident, $group_reduce:ident, $subgroup_reduce:ident, $op:ident)),+ $(,)?) => {
         $(
             #[doc = concat!("Reduce `value` across the whole workgroup with `", stringify!($op), "`.")]
-            pub fn $reduce(&mut self, value: Tile) -> Scalar {
+            pub fn $reduce(&mut self, value: Tile) -> Tile {
                 self.reduce(TileReduceOp::$op, value)
             }
 
             #[doc = concat!("Loop-reduce across `iterations` using `", stringify!($op), "`.")]
             #[doc = ""]
-            #[doc = "The body closure receives a `ScalarIndex` bound to the current"]
+            #[doc = "The body closure receives a `Tile` bound to the current"]
             #[doc = "iteration; the returned tile is accumulated per lane and then"]
             #[doc = "cross-lane reduced."]
-            pub fn $loop_reduce<F>(&mut self, iterations: u32, body: F) -> Scalar
+            pub fn $loop_reduce<F>(&mut self, iterations: u32, body: F) -> Tile
             where
-                F: FnOnce(&mut Self, ScalarIndex) -> Tile,
+                F: FnOnce(&mut Self, Tile) -> Tile,
             {
                 self.loop_reduce(TileReduceOp::$op, iterations, body)
             }
@@ -83,7 +83,7 @@ impl TileBlock<'_> {
         body: F,
     ) -> [Tile; N]
     where
-        F: FnOnce(&mut Self, ScalarIndex, [Tile; N]) -> [Tile; N],
+        F: FnOnce(&mut Self, Tile, [Tile; N]) -> [Tile; N],
     {
         assert!(N > 0, "fold must have at least one accumulator");
         let initial_exprs = tiles_to_exprs(initial);
@@ -92,8 +92,8 @@ impl TileBlock<'_> {
         let acc_locals: [LocalRef; N] = std::array::from_fn(|_| self.program.alloc_local::<F32>());
 
         self.stmt_stack.push(Vec::new());
-        let iter_element = ScalarIndex {
-            expr: Box::new(Expr::LoadLocal(iter_var_local)),
+        let iter_element = Tile {
+            expr: Expr::LoadLocal(iter_var_local),
         };
         let acc_tiles: [Tile; N] = std::array::from_fn(|i| Tile {
             expr: Expr::LoadLocal(acc_locals[i]),
@@ -128,7 +128,7 @@ impl TileBlock<'_> {
     /// at IR-build time and produces N tile expressions that all share the
     /// same loop scope; the lowerer materializes a single Naga loop with N
     /// accumulator locals so common subexpressions across the N outputs are
-    /// emitted only once per iteration. The closure receives a `ScalarIndex`
+    /// emitted only once per iteration. The closure receives a `Tile`
     /// bound to this loop's iteration counter.
     pub fn loop_fold_n<const N: usize, F>(
         &mut self,
@@ -138,7 +138,7 @@ impl TileBlock<'_> {
         body: F,
     ) -> [Tile; N]
     where
-        F: FnOnce(&mut Self, ScalarIndex) -> [Tile; N],
+        F: FnOnce(&mut Self, Tile) -> [Tile; N],
     {
         assert!(iterations > 0, "loop_fold_n iterations must be non-zero");
         assert!(N > 0, "loop_fold_n must have at least one accumulator");
@@ -148,8 +148,8 @@ impl TileBlock<'_> {
         let iter_var_local = self.program.alloc_local::<U32>();
 
         self.stmt_stack.push(Vec::new());
-        let iter_index = ScalarIndex {
-            expr: Box::new(Expr::LoadLocal(iter_var_local)),
+        let iter_index = Tile {
+            expr: Expr::LoadLocal(iter_var_local),
         };
         let bodies = body(self, iter_index);
         let body_stmts = self
@@ -210,7 +210,7 @@ impl TileBlock<'_> {
     );
 
     /// Per-lane scalar fold over `iterations` iterations. The body closure
-    /// receives a `ScalarIndex` bound to this loop's iteration counter and
+    /// receives a `Tile` bound to this loop's iteration counter and
     /// returns the per-iteration value to accumulate. Desugars into a
     /// single-accumulator `TileStmt::Fold`; the AST has no dedicated loop-fold
     /// expression.
@@ -222,15 +222,15 @@ impl TileBlock<'_> {
         body: F,
     ) -> Tile
     where
-        F: FnOnce(&mut Self, ScalarIndex) -> Tile,
+        F: FnOnce(&mut Self, Tile) -> Tile,
     {
         assert!(iterations > 0, "loop fold iterations must be non-zero");
         let element = initial.element();
         let acc_local = self.program.alloc_local_element(element);
         let iter_var_local = self.program.alloc_local::<U32>();
         self.stmt_stack.push(Vec::new());
-        let iter_index = ScalarIndex {
-            expr: Box::new(Expr::LoadLocal(iter_var_local)),
+        let iter_index = Tile {
+            expr: Expr::LoadLocal(iter_var_local),
         };
         let value = body(self, iter_index);
         let body_stmts = self.stmt_stack.pop().expect("loop_fold body frame missing");
@@ -285,13 +285,13 @@ impl TileBlock<'_> {
         }
     }
 
-    fn reduce(&mut self, op: TileReduceOp, value: Tile) -> Scalar {
+    fn reduce(&mut self, op: TileReduceOp, value: Tile) -> Tile {
         let block = self.block_size();
         let scratch = self.program.alloc_tile::<F32>(Layout::contiguous(
             MemoryLevel::Workgroup,
             Shape::new([block as u32]),
         ));
-        Scalar {
+        Tile {
             expr: Expr::Reduce {
                 op,
                 iterations: 1,
@@ -303,9 +303,9 @@ impl TileBlock<'_> {
         }
     }
 
-    fn loop_reduce<F>(&mut self, op: TileReduceOp, iterations: u32, body: F) -> Scalar
+    fn loop_reduce<F>(&mut self, op: TileReduceOp, iterations: u32, body: F) -> Tile
     where
-        F: FnOnce(&mut Self, ScalarIndex) -> Tile,
+        F: FnOnce(&mut Self, Tile) -> Tile,
     {
         assert!(iterations > 0, "loop reduce iterations must be non-zero");
         let block = self.block_size();
@@ -314,8 +314,8 @@ impl TileBlock<'_> {
             Shape::new([block as u32]),
         ));
         let iter_var_local = self.program.alloc_local::<U32>();
-        let iter_index = ScalarIndex {
-            expr: Box::new(Expr::LoadLocal(iter_var_local)),
+        let iter_index = Tile {
+            expr: Expr::LoadLocal(iter_var_local),
         };
         // Push a stmt frame to catch any statements the body tries to emit.
         // `Expr::Reduce` is a pure expression — its synthesized loop has no
@@ -332,7 +332,7 @@ impl TileBlock<'_> {
             leaked.is_empty(),
             "loop_reduce body must be a pure expression; use loop_fold for stateful loop bodies"
         );
-        Scalar {
+        Tile {
             expr: Expr::Reduce {
                 op,
                 iterations,

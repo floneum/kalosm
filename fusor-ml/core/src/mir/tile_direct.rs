@@ -78,16 +78,30 @@ pub(crate) fn flatten_matrix_layout(layout: &Layout) -> Option<DirectMatrixLayou
     })
 }
 
+pub(crate) fn tile_storage_read_with_direct_layout_typed<T: tile_ir::Numeric>(
+    phase: &mut tile_ir::tile::Program,
+    view: DirectMatrixLayout,
+) -> tile_ir::tile::Storage<T, 2> {
+    phase.storage_read_with_layout_offset::<T, 2>(view.layout, view.offset)
+}
+
+pub(crate) fn tile_storage_write_with_direct_layout_typed<T: tile_ir::Numeric>(
+    phase: &mut tile_ir::tile::Program,
+    view: DirectMatrixLayout,
+) -> tile_ir::tile::Storage<T, 2> {
+    phase.storage_write_with_layout_offset::<T, 2>(view.layout, view.offset)
+}
+
 pub(crate) fn tile_storage_read_with_direct_layout(
     phase: &mut tile_ir::tile::Program,
     view: DirectMatrixLayout,
 ) -> tile_ir::tile::Storage<tile_ir::F32, 2> {
-    phase.storage_read_with_layout_offset::<tile_ir::F32, 2>(view.layout, view.offset)
+    tile_storage_read_with_direct_layout_typed::<tile_ir::F32>(phase, view)
 }
 
 pub(crate) fn tile_storage_write_with_direct_layout(
     phase: &mut tile_ir::tile::Program,
     view: DirectMatrixLayout,
 ) -> tile_ir::tile::Storage<tile_ir::F32, 2> {
-    phase.storage_write_with_layout_offset::<tile_ir::F32, 2>(view.layout, view.offset)
+    tile_storage_write_with_direct_layout_typed::<tile_ir::F32>(phase, view)
 }

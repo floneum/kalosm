@@ -1,5 +1,6 @@
 use std::marker::PhantomData;
 
+use super::value::boxed_index;
 use super::*;
 use crate::ir::{
     CoopElement, CoopMatrixRole, CoopOperandRole, ElementType, Expr, Numeric, TileRef, TileStmt,
@@ -32,11 +33,11 @@ impl From<CoopRole> for CoopOperandRole {
 
 impl CoopTileLoad {
     /// Create a cooperative tile-load descriptor.
-    pub fn new(tile: TileRef, row: impl IntoIndex, col: impl IntoIndex) -> Self {
+    pub fn new(tile: TileRef, row: impl Into<Tile>, col: impl Into<Tile>) -> Self {
         Self {
             tile,
-            row: row.into_index(),
-            col: col.into_index(),
+            row: boxed_index(row),
+            col: boxed_index(col),
         }
     }
 }
@@ -91,14 +92,14 @@ impl TileBlock<'_> {
         &mut self,
         dst: TileRef,
         src: &Storage<T, 2>,
-        row_offset: impl IntoIndex,
-        col_offset: impl IntoIndex,
+        row_offset: impl Into<Tile>,
+        col_offset: impl Into<Tile>,
     ) {
         self.push_stmt(TileStmt::CopyToWorkgroupTile {
             dst,
             src: crate::ir::CopySource::Storage(src.view.clone()),
-            row_offset: row_offset.into_index(),
-            col_offset: col_offset.into_index(),
+            row_offset: boxed_index(row_offset),
+            col_offset: boxed_index(col_offset),
         });
     }
 
@@ -107,14 +108,14 @@ impl TileBlock<'_> {
         &mut self,
         dst: TileRef,
         src: &crate::quantized::QuantizedMatrix,
-        row_offset: impl IntoIndex,
-        col_offset: impl IntoIndex,
+        row_offset: impl Into<Tile>,
+        col_offset: impl Into<Tile>,
     ) {
         self.push_stmt(TileStmt::CopyToWorkgroupTile {
             dst,
             src: crate::ir::CopySource::Quantized(src.clone()),
-            row_offset: row_offset.into_index(),
-            col_offset: col_offset.into_index(),
+            row_offset: boxed_index(row_offset),
+            col_offset: boxed_index(col_offset),
         });
     }
 
@@ -139,8 +140,8 @@ impl TileBlock<'_> {
     pub fn coop_tile_load(
         &self,
         tile: TileRef,
-        row: impl IntoIndex,
-        col: impl IntoIndex,
+        row: impl Into<Tile>,
+        col: impl Into<Tile>,
     ) -> CoopTileLoad {
         CoopTileLoad::new(tile, row, col)
     }
@@ -208,14 +209,14 @@ impl TileBlock<'_> {
         &mut self,
         acc: &CoopAcc<T, ROWS, COLS>,
         dst: &Storage<T, 2>,
-        row: impl IntoIndex,
-        col: impl IntoIndex,
+        row: impl Into<Tile>,
+        col: impl Into<Tile>,
     ) {
         self.push_stmt(TileStmt::StoreCoopAcc {
             acc: acc.local,
             dst: dst.view.clone(),
-            row: row.into_index(),
-            col: col.into_index(),
+            row: boxed_index(row),
+            col: boxed_index(col),
         });
     }
 }

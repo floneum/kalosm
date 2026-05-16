@@ -1,3 +1,5 @@
+use std::hash::Hash;
+
 use crate::{
     DataTypeEnum, Device, Layout, Tensor, TensorData,
     compute_graph::NodeIndex,
@@ -31,7 +33,7 @@ const QMAT_N: Axis<2> = Axis;
 const QGEMV_K: Axis<0> = Axis;
 const QGEMV_N: Axis<1> = Axis;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 enum QMatmulDirectVariant {
     Q5SmallSingleRow,
     SingleRow,
@@ -43,7 +45,13 @@ enum QMatmulDirectVariant {
     Tile64x64,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct QMatmulDirectFastKernelVariant;
+struct QMatmulDirectEpilogueKernelVariant;
+struct QMatmulCachedPipelineKernelVariant;
+struct QMatmulPairedKernelVariant;
+struct QMatmulPairedExtrasKernelVariant;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 enum QgemvColsVariant {
     Q4KSmallWide4,
     Q4KSmallWide8,
@@ -583,24 +591,42 @@ impl QMatMulOperation {
                 return Some(kernel);
             }
             let cache_key = if let Some((operation, operation_inputs)) = operation_key {
-                let label = format!("qmatmul_direct:{variant:?}:fast");
+                let cache_variant = kernel_backend::KernelVariantKey::with_payload::<
+                    QMatmulDirectFastKernelVariant,
+                >(|state| {
+                    variant.hash(state);
+                });
                 operation.kernel_cache_key_with_dispatch(
-                    &label,
+                    cache_variant,
                     None,
                     dispatch_size,
                     operation_inputs,
                 )
             } else {
-                format!(
-                    "{kernel_name}:direct:{format:?}:m={m}:k={k}:n={n}:dispatch={dispatch_size:?}:{:?}:{:?}",
-                    input.layout(),
-                    output.layout()
-                )
+                kernel_backend::module_key_from(|state| {
+                    kernel_backend::KernelVariantKey::with_payload::<
+                        QMatmulDirectFastKernelVariant,
+                    >(|payload| {
+                        variant.hash(payload);
+                    })
+                    .hash(state);
+                    format.hash(state);
+                    m.hash(state);
+                    k.hash(state);
+                    n.hash(state);
+                    dispatch_size.hash(state);
+                    input.layout().offset().hash(state);
+                    input.layout().shape().hash(state);
+                    input.layout().strides().hash(state);
+                    output.layout().offset().hash(state);
+                    output.layout().shape().hash(state);
+                    output.layout().strides().hash(state);
+                })
             };
             if let Some(pipeline) = kernel_backend::storage3_pipeline_from_cached_module(
                 device,
                 &kernel_name,
-                &cache_key,
+                cache_key,
             ) {
                 matrix
                     .direct_pipeline_cache()
@@ -675,7 +701,7 @@ impl QMatMulOperation {
                 }
             }
         });
-        let dispatch_size = ir.single_tile_program_grid()?;
+        let dispatch_size = ir.body().grid;
         if dispatch_size.iter().any(|dim| *dim > max_workgroups) {
             return None;
         }
@@ -690,14 +716,40 @@ impl QMatMulOperation {
             output.layout(),
         );
         let cache_key = if let Some((operation, operation_inputs)) = operation_key {
-            let label = format!("qmatmul_direct:{variant:?}:epilogue={epilogue_identity:#018x}");
-            operation.kernel_cache_key_with_dispatch(&label, None, dispatch_size, operation_inputs)
-        } else {
-            format!(
-                "{kernel_name}:direct:{format:?}:m={m}:k={k}:n={n}:epilogue={epilogue_identity:#018x}:dispatch={dispatch_size:?}:{:?}:{:?}",
-                input.layout(),
-                output.layout()
+            let cache_variant = kernel_backend::KernelVariantKey::with_payload::<
+                QMatmulDirectEpilogueKernelVariant,
+            >(|state| {
+                variant.hash(state);
+                epilogue_identity.hash(state);
+            });
+            operation.kernel_cache_key_with_dispatch(
+                cache_variant,
+                None,
+                dispatch_size,
+                operation_inputs,
             )
+        } else {
+            kernel_backend::module_key_from(|state| {
+                kernel_backend::KernelVariantKey::with_payload::<
+                    QMatmulDirectEpilogueKernelVariant,
+                >(|payload| {
+                    variant.hash(payload);
+                    epilogue_identity.hash(payload);
+                })
+                .hash(state);
+                format.hash(state);
+                m.hash(state);
+                k.hash(state);
+                n.hash(state);
+                epilogue_identity.hash(state);
+                dispatch_size.hash(state);
+                input.layout().offset().hash(state);
+                input.layout().shape().hash(state);
+                input.layout().strides().hash(state);
+                output.layout().offset().hash(state);
+                output.layout().shape().hash(state);
+                output.layout().strides().hash(state);
+            })
         };
         qmatmul_direct_kernel_from_ir(
             device,
@@ -746,9 +798,13 @@ fn cached_qmatmul_direct_kernel(
         .write()
         .get(pipeline_key)
         .cloned()?;
+    let cache_key = kernel_backend::module_key_from(|state| {
+        kernel_backend::KernelVariantKey::of::<QMatmulCachedPipelineKernelVariant>().hash(state);
+        pipeline_key.hash(state);
+    });
     Some(kernel_backend::storage3_kernel_with_prepared_pipeline(
         kernel_name.to_owned(),
-        "",
+        cache_key,
         pipeline,
         input.buffer().clone(),
         matrix.buffer().clone(),
@@ -762,7 +818,7 @@ fn qmatmul_direct_kernel_from_ir(
     device: &Device,
     cached_kernel_name: String,
     kernel_name: String,
-    cache_key: String,
+    cache_key: kernel_backend::KernelCacheKey,
     matrix: &QMatrix,
     pipeline_key: QMatMulDirectPipelineKey,
     input: &TensorData,
@@ -1155,19 +1211,11 @@ impl QMatMulOperation {
 
         let limits = graph.device().limits();
         let max_workgroups = limits.max_compute_workgroups_per_dimension;
-        let tile_name = tile_ir_kernels::QGEMV_Q4K_PAIRED_TILE_NAME;
-        let cols_per_workgroup = tile_ir_kernels::QGEMV_Q4K_PAIRED_COLS_PER_WORKGROUP;
-        let cols_workgroups = pair_len.div_ceil(cols_per_workgroup);
-        let total_workgroups = cols_workgroups.checked_mul(m)?;
-        let [workgroups_x, _] = split_workgroups_2d(total_workgroups, max_workgroups)?;
-        let dispatch_size = [workgroups_x, total_workgroups.div_ceil(workgroups_x), 1];
-        if dispatch_size.iter().any(|dim| *dim > max_workgroups) {
-            return None;
-        }
+        let (dispatch_size, workgroups_x) =
+            tile_ir_kernels::qgemv_q4k_paired_dispatch(pair_len, m, max_workgroups)?;
 
         let epilogue = paired.epilogue.clone();
         let epilogue_identity = epilogue.identity();
-        let epilogue_label = epilogue.label();
         let kernel_name = self.name();
 
         // Fast path: no extras → existing storage3 cached-pipeline path.
@@ -1182,10 +1230,13 @@ impl QMatMulOperation {
                 input.layout(),
                 output.layout(),
             );
-            let key_label =
-                format!("qmatmul_paired:{tile_name}:{epilogue_label}:{epilogue_identity:#018x}");
+            let cache_variant = kernel_backend::KernelVariantKey::with_payload::<
+                QMatmulPairedKernelVariant,
+            >(|state| {
+                epilogue_identity.hash(state);
+            });
             let cache_key =
-                self.kernel_cache_key_with_dispatch(&key_label, None, dispatch_size, inputs);
+                self.kernel_cache_key_with_dispatch(cache_variant, None, dispatch_size, inputs);
             return qmatmul_direct_kernel_from_ir(
                 &graph.device(),
                 "q_mat_paired".to_owned(),
@@ -1250,10 +1301,13 @@ impl QMatMulOperation {
             })
             .collect();
         let extra_views = extra_views?;
-        let key_label =
-            format!("qmatmul_paired:{tile_name}:{epilogue_label}:{epilogue_identity:#018x}:extras");
+        let cache_variant = kernel_backend::KernelVariantKey::with_payload::<
+            QMatmulPairedExtrasKernelVariant,
+        >(|state| {
+            epilogue_identity.hash(state);
+        });
         let cache_key =
-            self.kernel_cache_key_with_dispatch(&key_label, None, dispatch_size, inputs);
+            self.kernel_cache_key_with_dispatch(cache_variant, None, dispatch_size, inputs);
         // Buffer ordering must match the IR builder's storage declaration
         // order: a (input), b (qmatrix), extras..., y (output).
         let mut buffers: Vec<std::sync::Arc<wgpu::Buffer>> = Vec::with_capacity(3 + extras_count);
@@ -1450,7 +1504,6 @@ mod tests {
         let input: Tensor<2, f32> = Tensor::new(&device, &input_rows);
 
         let result = input.q_mat_mul(&matrix).as_slice().await.unwrap();
-
         assert_eq!(result.shape(), &[1, 2]);
         assert!((result[[0, 0]] - 30.0).abs() < 1e-4);
         assert!((result[[0, 1]] - 70.0).abs() < 1e-4);

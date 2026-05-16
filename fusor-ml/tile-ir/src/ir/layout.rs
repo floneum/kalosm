@@ -3,7 +3,7 @@ use std::num::NonZeroU32;
 /// One sub-axis of a logical axis: extent and stride into the underlying
 /// buffer. Strides may be zero (broadcast) or may collide with other
 /// sub-axes (non-injective views, e.g. im2col).
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub struct SubAxis {
     /// Logical extent of this sub-axis.
     pub extent: u32,
@@ -16,7 +16,7 @@ pub struct SubAxis {
 /// is divided by the product of the trailing sub-axis extents to recover
 /// the head sub-coord, then the remainder is divmod-walked through the
 /// rest. A group with a single sub-axis is the affine case.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct AxisGroup {
     /// Sub-axes that make up one logical axis.
     pub sub_axes: Vec<SubAxis>,
@@ -33,7 +33,7 @@ impl AxisGroup {
 
 /// Logical-to-storage mapping. One [`AxisGroup`] per logical axis; affine
 /// views are the all-single-sub-axis case.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct MultiFlattenMap {
     /// Logical axis groups.
     pub groups: Vec<AxisGroup>,
@@ -127,7 +127,7 @@ fn col_major_strides(shape: &Shape) -> Vec<u32> {
 
 /// A concrete layout for a tile-like value. Holds shape, memory level, and
 /// the logical-to-storage index map.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct Layout {
     shape: Shape,
     indexing: MultiFlattenMap,
@@ -243,7 +243,7 @@ impl Default for Layout {
 }
 
 /// The logical shape of a tile-level operation.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct Shape {
     dims: Vec<NonZeroU32>,
 }
@@ -286,7 +286,7 @@ impl Shape {
 }
 
 /// Where a layout lives in the GPU memory hierarchy.
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub enum MemoryLevel {
     /// Storage buffer memory.
     Storage,

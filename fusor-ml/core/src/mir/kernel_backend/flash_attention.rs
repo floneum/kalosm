@@ -1,4 +1,7 @@
-use std::sync::{Arc, OnceLock};
+use std::{
+    hash::Hash,
+    sync::{Arc, OnceLock},
+};
 
 use fusor_tile_ir as tile_ir;
 use fusor_tile_ir_kernels as tile_ir_kernels;
@@ -38,6 +41,8 @@ enum FlashAttentionKernelVariant {
     Streaming,
     DecodeSmall,
 }
+
+struct FlashAttentionDirectKernelVariant;
 
 const FLASH_Q_SEQ: Axis<3> = Axis;
 const FLASH_KV_SEQ: Axis<4> = Axis;
@@ -445,18 +450,18 @@ impl Operation for FlashAttentionOperation {
             FlashAttentionKernelVariant::Streaming => "flash_attention",
             FlashAttentionKernelVariant::DecodeSmall => "flash_attention_decode",
         };
-        let key_label = if let Some(meta) = decode_meta.as_ref() {
-            format!(
-                "{kernel_label}:block={}:tiled={}:scale={:08x}",
-                meta.decode_block,
-                meta.tiled,
-                self.scale.to_bits()
-            )
-        } else {
-            format!("{kernel_label}:scale={:08x}", self.scale.to_bits())
-        };
+        let cache_variant = kernel_backend::KernelVariantKey::with_payload::<
+            FlashAttentionDirectKernelVariant,
+        >(|state| {
+            variant.hash(state);
+            self.scale.to_bits().hash(state);
+            if let Some(meta) = decode_meta.as_ref() {
+                meta.decode_block.hash(state);
+                meta.tiled.hash(state);
+            }
+        });
         let module_key = self.kernel_module_key_with_dispatch(
-            &key_label,
+            cache_variant,
             Some(workgroup_shape),
             dispatch_size,
             inputs,

@@ -1,6 +1,6 @@
 use std::marker::PhantomData;
 
-use super::value::boxed_u32_literal;
+use super::value::{boxed_index, boxed_u32_literal};
 use super::*;
 use crate::ir::{
     Builtin, Expr, FloatElement, Numeric, ScalarMarker, TileLiteral, TileLoadExpr, TileRef,
@@ -23,11 +23,11 @@ pub struct TileBlock<'a> {
     pub(super) stmt_stack: Vec<Vec<TileStmt>>,
 }
 
-/// Wrap a `Builtin` as a `ScalarIndex` (u32-typed scalar). All `program.*_id`
+/// Wrap a `Builtin` as a u32 tile expression. All `program.*_id`
 /// / `subgroup_*` getters are one-line wrappers over this.
-fn builtin_index(builtin: Builtin) -> ScalarIndex {
-    ScalarIndex {
-        expr: Box::new(Expr::Builtin(builtin)),
+fn builtin_index(builtin: Builtin) -> Tile {
+    Tile {
+        expr: Expr::Builtin(builtin),
     }
 }
 
@@ -46,27 +46,27 @@ pub(super) fn tiles_to_exprs(values: impl IntoIterator<Item = Tile>) -> Vec<Expr
 
 impl TileBlock<'_> {
     /// Workgroup id component for `axis`.
-    pub fn program_id(&self, axis: WorkgroupAxis) -> ScalarIndex {
+    pub fn program_id(&self, axis: WorkgroupAxis) -> Tile {
         builtin_index(Builtin::ProgramId(axis))
     }
 
     /// Subgroup id within the workgroup.
-    pub fn subgroup_id(&self) -> ScalarIndex {
+    pub fn subgroup_id(&self) -> Tile {
         builtin_index(Builtin::SubgroupId)
     }
 
     /// Lane id within the subgroup.
-    pub fn subgroup_lane(&self) -> ScalarIndex {
+    pub fn subgroup_lane(&self) -> Tile {
         builtin_index(Builtin::SubgroupLane)
     }
 
     /// Runtime subgroup size.
-    pub fn subgroup_size(&self) -> ScalarIndex {
+    pub fn subgroup_size(&self) -> Tile {
         builtin_index(Builtin::SubgroupSize)
     }
 
     /// Number of subgroups in the workgroup.
-    pub fn num_subgroups(&self) -> ScalarIndex {
+    pub fn num_subgroups(&self) -> Tile {
         builtin_index(Builtin::NumSubgroups)
     }
 
@@ -82,14 +82,14 @@ impl TileBlock<'_> {
 
     /// This invocation's lane index within the workgroup (`0..BLOCK`).
     /// Lowers to `@builtin(local_invocation_index)`.
-    pub fn lane(&self) -> Range {
-        Range {
-            expr: Box::new(Expr::Builtin(Builtin::Lane)),
+    pub fn lane(&self) -> Tile {
+        Tile {
+            expr: Expr::Builtin(Builtin::Lane),
         }
     }
 
     /// Interpret lanes as row-major coordinates for a tile with `dims`.
-    pub fn lane_tiles<const DIMS: usize>(&self, dims: &[u32; DIMS]) -> [Range; DIMS] {
+    pub fn lane_tiles<const DIMS: usize>(&self, dims: &[u32; DIMS]) -> [Tile; DIMS] {
         assert!(
             DIMS > 0,
             "lane tile coordinates require at least one dimension"
@@ -131,12 +131,14 @@ impl TileBlock<'_> {
     /// });
     /// # let _ = ir;
     /// ```
-    pub fn load<A>(&self, address: A, mask: Mask, fill: impl IntoTileLiteral) -> Tile
-    where
-        A: TileLoadAddress,
-    {
+    pub fn load<T, const R: usize>(
+        &self,
+        address: Address<T, R>,
+        mask: impl Into<Mask>,
+        fill: impl Into<TileLiteral>,
+    ) -> Tile {
         Tile {
-            expr: address.load_expr(mask.expr, fill.into_tile_literal()),
+            expr: address.load_expr(mask.into().expr, fill.into()),
         }
     }
 
@@ -144,17 +146,17 @@ impl TileBlock<'_> {
     pub fn load_quantized(
         &self,
         matrix: &QuantizedMatrix,
-        row: impl IntoIndex,
-        col: impl IntoIndex,
-        mask: Mask,
+        row: impl Into<Tile>,
+        col: impl Into<Tile>,
+        mask: impl Into<Mask>,
         fill: f32,
     ) -> Tile {
         Tile {
             expr: Expr::Load(TileLoadExpr {
                 src: crate::ir::LoadSource::Quantized(matrix.clone()),
-                row: row.into_index(),
-                col: col.into_index(),
-                mask: mask.expr,
+                row: boxed_index(row),
+                col: boxed_index(col),
+                mask: mask.into().expr,
                 fill: f32_fill(fill),
             }),
         }
@@ -169,9 +171,9 @@ impl TileBlock<'_> {
     pub fn load_quantized_block<const N: usize>(
         &mut self,
         matrix: &QuantizedMatrix,
-        k_base: impl IntoIndex,
-        col: impl IntoIndex,
-        mask: Mask,
+        k_base: impl Into<Tile>,
+        col: impl Into<Tile>,
+        mask: impl Into<Mask>,
         fill: f32,
     ) -> [Tile; N] {
         assert!(
@@ -179,9 +181,9 @@ impl TileBlock<'_> {
             "load_quantized_block currently supports N == 8 or N == 16"
         );
         let id = self.program.next_block_dequant_id();
-        let k_base = k_base.into_index();
-        let col = col.into_index();
-        let mask_expr = mask.expr;
+        let k_base = boxed_index(k_base);
+        let col = boxed_index(col);
+        let mask_expr = mask.into().expr;
         let fill_expr: Box<Expr> = f32_fill(fill);
         std::array::from_fn(|lane| Tile {
             expr: Expr::QuantizedBlockLane {
@@ -199,16 +201,19 @@ impl TileBlock<'_> {
 
     /// Bind a subexpression to a private local so subsequent references reuse
     /// the value without re-emitting its computation. Pushes a
-    /// `TileStmt::StoreLocal` at the call site; subsequent `Bound::get()` calls
-    /// return tiles that lower to a load of the bound local.
-    pub fn bind(&mut self, value: Tile) -> Bound {
+    /// `TileStmt::StoreLocal` at the call site; clones of the returned tile
+    /// lower to loads of the bound local.
+    pub fn bind(&mut self, value: impl Into<Tile>) -> Tile {
+        let value = value.into();
         let element = value.expr.element();
         let local = self.program.alloc_local_element(element);
         self.push_stmt(TileStmt::StoreLocal {
             dst: local,
             value: value.expr,
         });
-        Bound { local }
+        Tile {
+            expr: Expr::LoadLocal(local),
+        }
     }
 
     /// Dot product between two float vector tile expressions.
@@ -268,9 +273,9 @@ impl TileBlock<'_> {
     }
 
     /// Create a tile literal.
-    pub fn literal(&self, value: TileLiteral) -> Tile {
+    pub fn literal(&self, value: impl Into<TileLiteral>) -> Tile {
         Tile {
-            expr: Expr::Literal(value),
+            expr: Expr::Literal(value.into()),
         }
     }
 
@@ -290,10 +295,8 @@ impl TileBlock<'_> {
     }
 
     /// Convert an index expression into a u32 tile expression.
-    pub fn index(&self, value: impl IntoIndex) -> Tile {
-        Tile {
-            expr: *value.into_index(),
-        }
+    pub fn index(&self, value: impl Into<Tile>) -> Tile {
+        value.into()
     }
 
     /// Exponential of a tile expression.
@@ -327,7 +330,8 @@ impl TileBlock<'_> {
     }
 
     /// Store a private local.
-    pub fn store_local<T>(&mut self, local: &Local<T>, value: Tile) {
+    pub fn store_local<T>(&mut self, local: &Local<T>, value: impl Into<Tile>) {
+        let value = value.into();
         self.push_stmt(TileStmt::StoreLocal {
             dst: local.local,
             value: value.expr,
@@ -335,33 +339,33 @@ impl TileBlock<'_> {
     }
 
     /// Load a value from workgroup tile storage.
-    pub fn load_workgroup(&self, tile: TileRef, index: impl IntoIndex) -> Tile {
+    pub fn load_workgroup(&self, tile: TileRef, index: impl Into<Tile>) -> Tile {
         Tile {
             expr: Expr::LoadWorkgroup {
                 src: tile,
-                index: index.into_index(),
+                index: boxed_index(index),
             },
         }
     }
 
     /// Store a value into workgroup tile storage.
-    pub fn store_workgroup(&mut self, tile: TileRef, index: impl IntoIndex, value: Tile) {
+    pub fn store_workgroup(&mut self, tile: TileRef, index: impl Into<Tile>, value: Tile) {
         self.push_stmt(TileStmt::StoreWorkgroup {
             dst: tile,
-            index: index.into_index(),
+            index: boxed_index(index),
             value: value.expr,
         });
     }
 
     /// Emit `if condition { ... }`.
-    pub fn if_then(&mut self, condition: Tile, accept: impl FnOnce(&mut Self)) {
+    pub fn if_then(&mut self, condition: impl Into<Tile>, accept: impl FnOnce(&mut Self)) {
         self.if_else(condition, accept, |_| {});
     }
 
     /// Emit `if condition { ... } else { ... }`.
     pub fn if_else(
         &mut self,
-        condition: Tile,
+        condition: impl Into<Tile>,
         accept: impl FnOnce(&mut Self),
         reject: impl FnOnce(&mut Self),
     ) {
@@ -372,7 +376,7 @@ impl TileBlock<'_> {
         reject(self);
         let reject = self.stmt_stack.pop().expect("if reject frame missing");
         self.push_stmt(TileStmt::If {
-            condition: condition.expr,
+            condition: condition.into().expr,
             accept,
             reject,
         });
@@ -394,7 +398,7 @@ impl TileBlock<'_> {
     /// `if condition { break }` — the dominant kernel-side pattern for
     /// counted/conditional `loop_forever` exits. Bare `break_loop` remains for
     /// the unconditional case and for compound break bodies.
-    pub fn break_if(&mut self, condition: Tile) {
+    pub fn break_if(&mut self, condition: impl Into<Tile>) {
         self.if_then(condition, |program| program.break_loop());
     }
 
@@ -404,13 +408,13 @@ impl TileBlock<'_> {
     }
 
     /// Emit a counted `while true` loop. The body closure receives a
-    /// `ScalarIndex` bound to this loop's iteration counter; nested loops each
+    /// `Tile` bound to this loop's iteration counter; nested loops each
     /// own their own index. Desugars into a `TileStmt::Fold` over a counted
     /// range with no accumulators — the AST has no dedicated counted loop
     /// variant.
     pub fn while_true<F>(&mut self, max_iterations: u32, body: F)
     where
-        F: FnOnce(&mut Self, ScalarIndex),
+        F: FnOnce(&mut Self, Tile),
     {
         assert!(
             max_iterations > 0,
@@ -418,8 +422,8 @@ impl TileBlock<'_> {
         );
         let iter_var_local = self.program.alloc_local::<U32>();
         self.stmt_stack.push(Vec::new());
-        let iter_index = ScalarIndex {
-            expr: Box::new(Expr::LoadLocal(iter_var_local)),
+        let iter_index = Tile {
+            expr: Expr::LoadLocal(iter_var_local),
         };
         body(self, iter_index);
         let stmts = self.stmt_stack.pop().expect("while_true frame missing");
@@ -440,11 +444,13 @@ impl TileBlock<'_> {
     }
 
     /// Store to a rank-1 or rank-2 storage address.
-    pub fn store<A>(&mut self, address: A, value: Tile, mask: Mask)
-    where
-        A: TileStoreAddress,
-    {
-        self.push_stmt(address.store_stmt(value.expr, mask.expr));
+    pub fn store<T, const R: usize>(
+        &mut self,
+        address: Address<T, R>,
+        value: Tile,
+        mask: impl Into<Mask>,
+    ) {
+        self.push_stmt(address.store_stmt(value.expr, mask.into().expr));
     }
 }
 

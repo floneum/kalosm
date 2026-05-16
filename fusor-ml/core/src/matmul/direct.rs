@@ -13,6 +13,8 @@ use crate::{
 
 const BLOCK: usize = 256;
 
+struct MatmulSerialDirectKernelVariant;
+
 pub(crate) fn build_serial_matmul_direct_kernel(
     operation: &MatMulOperation,
     graph: &crate::compute_graph::ComputeGraphInner,
@@ -47,7 +49,7 @@ pub(crate) fn build_serial_matmul_direct_kernel(
         .try_fold(1u32, |acc, dim| acc.checked_mul((*dim).try_into().ok()?))?;
     let dispatch_size = distribute_workgroups(total_outputs.div_ceil(BLOCK as u32));
     let cache_key = operation.kernel_cache_key_with_dispatch(
-        "matmul_serial_direct",
+        kernel_backend::KernelVariantKey::of::<MatmulSerialDirectKernelVariant>(),
         Some(_workgroup_shape),
         dispatch_size,
         inputs,
@@ -219,7 +221,7 @@ fn layout_index(meta: &TensorMeta, coords: &[tile_ir::tile::Tile]) -> tile_ir::t
 fn linear_group(
     program: &tile_ir::tile::TileBlock<'_>,
     dispatch_size: [u32; 3],
-) -> tile_ir::tile::ScalarIndex {
+) -> tile_ir::tile::Tile {
     program.program_id(tile_ir::WorkgroupAxis::X)
         + program.program_id(tile_ir::WorkgroupAxis::Y) * dispatch_size[0]
         + program.program_id(tile_ir::WorkgroupAxis::Z)

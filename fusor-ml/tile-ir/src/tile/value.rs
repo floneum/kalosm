@@ -1,11 +1,12 @@
 use std::marker::PhantomData;
-use std::ops::{Add, BitAnd, BitXor, Div, Mul, Rem, Sub};
+use std::ops::{Add, BitAnd, BitOr, BitXor, Div, Mul, Rem, Sub};
 
 use crate::ir::{
     CoopFragmentId, CoopOperandRole, Expr, LocalRef, StorageView, TileBinaryOp, TileCompareOp,
     TileIndexedStoreStmt, TileLinearLoadExpr, TileLiteral, TileLoadExpr, TileStoreStmt,
     TileUnaryOp,
 };
+
 /// Handle to a cooperative-matrix accumulator local.
 #[derive(Copy, Clone)]
 pub struct CoopAcc<T, const ROWS: usize, const COLS: usize> {
@@ -13,8 +14,7 @@ pub struct CoopAcc<T, const ROWS: usize, const COLS: usize> {
     pub(super) _ty: PhantomData<T>,
 }
 
-/// Handle to a cooperatively-loaded fragment SSA value. Reusable across any
-/// number of compatible `coop_mma` calls in the same scope without re-loading.
+/// Handle to a cooperatively-loaded fragment SSA value.
 #[derive(Copy, Clone)]
 pub struct CoopFragment<T, const ROWS: usize, const COLS: usize> {
     pub(super) id: CoopFragmentId,
@@ -22,18 +22,7 @@ pub struct CoopFragment<T, const ROWS: usize, const COLS: usize> {
     pub(super) _ty: PhantomData<T>,
 }
 
-/// Handle to a bound subexpression. Each call to `get()` returns a fresh
-/// `Tile` that lowers to a load from the private local that backs the binding.
-/// Allocating the local and emitting the binding store happens at the call
-/// site of `bind`.
-#[derive(Clone, Copy)]
-pub struct Bound {
-    pub(super) local: LocalRef,
-}
-
-/// Iterator description passed to `TileBlock::fold`. Carries a counted
-/// `0..count` range; future variants (chunks, strided, zip) would extend this
-/// constructor.
+/// Iterator description passed to `TileBlock::fold`.
 #[derive(Clone)]
 pub struct FoldIter {
     pub(crate) count: Box<Expr>,
@@ -46,147 +35,76 @@ pub fn range(count: Tile) -> FoldIter {
     }
 }
 
-impl Bound {
-    /// Load the bound value.
-    pub fn get(&self) -> Tile {
-        Tile {
-            expr: Expr::LoadLocal(self.local),
+/// Storage address for a rank-1 or rank-2 view.
+pub struct Address<T, const R: usize> {
+    pub(super) view: StorageView,
+    pub(super) indices: [Box<Expr>; R],
+    pub(super) _ty: PhantomData<T>,
+}
+
+impl<T, const R: usize> Address<T, R> {
+    pub(super) fn load_expr(self, mask: Box<Expr>, fill: TileLiteral) -> Expr {
+        let mut indices = self.indices.into_iter();
+        match R {
+            1 => {
+                let fill = match self.view.buffer.element {
+                    crate::ElementType::Vector { scalar, lanes } => {
+                        assert!(
+                            (2..=4).contains(&lanes),
+                            "vector load supports 2, 3, or 4 lanes"
+                        );
+                        assert_eq!(
+                            fill.element(),
+                            scalar.element(),
+                            "vector load fill scalar type mismatch"
+                        );
+                        Expr::ComposeVector {
+                            scalar,
+                            lanes,
+                            values: (0..lanes).map(|_| Expr::Literal(fill)).collect(),
+                        }
+                    }
+                    element => {
+                        assert_eq!(fill.element(), element, "linear load fill type mismatch");
+                        Expr::Literal(fill)
+                    }
+                };
+                Expr::LoadLinear(TileLinearLoadExpr {
+                    src: self.view,
+                    index: indices.next().expect("rank-1 address has an index"),
+                    mask,
+                    fill: Box::new(fill),
+                })
+            }
+            2 => Expr::Load(TileLoadExpr {
+                src: crate::ir::LoadSource::Storage(self.view),
+                row: indices.next().expect("rank-2 address has a row"),
+                col: indices.next().expect("rank-2 address has a column"),
+                mask,
+                fill: Box::new(Expr::Literal(fill)),
+            }),
+            _ => panic!("tile storage I/O supports rank-1 and rank-2 addresses"),
         }
     }
-}
 
-/// Rank-2 storage address.
-pub struct Address<T> {
-    pub(super) view: StorageView,
-    pub(super) row: Box<Expr>,
-    pub(super) col: Box<Expr>,
-    pub(super) _ty: PhantomData<T>,
-}
-
-/// Rank-1 storage address.
-pub struct LinearAddress<T> {
-    pub(super) view: StorageView,
-    pub(super) index: Box<Expr>,
-    pub(super) _ty: PhantomData<T>,
-}
-
-/// Convert values accepted by `TileBlock::load` fill parameters into IR
-/// literals.
-pub trait IntoTileLiteral {
-    /// Convert into a tile literal.
-    fn into_tile_literal(self) -> TileLiteral;
-}
-
-impl IntoTileLiteral for TileLiteral {
-    fn into_tile_literal(self) -> TileLiteral {
-        self
-    }
-}
-
-impl IntoTileLiteral for f32 {
-    fn into_tile_literal(self) -> TileLiteral {
-        TileLiteral::f32(self)
-    }
-}
-
-impl IntoTileLiteral for u32 {
-    fn into_tile_literal(self) -> TileLiteral {
-        TileLiteral::U32(self)
-    }
-}
-
-impl IntoTileLiteral for bool {
-    fn into_tile_literal(self) -> TileLiteral {
-        TileLiteral::Bool(self)
-    }
-}
-
-/// Public marker for rank-1 storage addresses accepted by tile storage I/O.
-pub trait Rank1TileAddress {}
-
-/// Public marker for rank-2 storage addresses accepted by tile storage I/O.
-pub trait Rank2TileAddress {}
-
-impl<T> Rank1TileAddress for LinearAddress<T> {}
-impl<T> Rank2TileAddress for Address<T> {}
-
-/// Address types accepted by `TileBlock::load`.
-pub trait TileLoadAddress {
-    #[doc(hidden)]
-    fn load_expr(self, mask: Box<Expr>, fill: TileLiteral) -> Expr;
-}
-
-/// Address types accepted by `TileBlock::store`.
-pub trait TileStoreAddress {
-    #[doc(hidden)]
-    fn store_stmt(self, value: Expr, mask: Box<Expr>) -> crate::ir::TileStmt;
-}
-
-impl<T> TileLoadAddress for Address<T> {
-    fn load_expr(self, mask: Box<Expr>, fill: TileLiteral) -> Expr {
-        Expr::Load(TileLoadExpr {
-            src: crate::ir::LoadSource::Storage(self.view),
-            row: self.row,
-            col: self.col,
-            mask,
-            fill: Box::new(Expr::Literal(fill)),
-        })
-    }
-}
-
-impl<T: crate::ir::Numeric> TileLoadAddress for LinearAddress<T> {
-    fn load_expr(self, mask: Box<Expr>, fill: TileLiteral) -> Expr {
-        let fill = match T::ELEMENT {
-            crate::ElementType::Vector { scalar, lanes } => {
-                assert!(
-                    (2..=4).contains(&lanes),
-                    "vector load supports 2, 3, or 4 lanes"
-                );
-                assert_eq!(
-                    fill.element(),
-                    scalar.element(),
-                    "vector load fill scalar type mismatch"
-                );
-                Expr::ComposeVector {
-                    scalar,
-                    lanes,
-                    values: (0..lanes).map(|_| Expr::Literal(fill)).collect(),
-                }
-            }
-            element => {
-                assert_eq!(fill.element(), element, "linear load fill type mismatch");
-                Expr::Literal(fill)
-            }
-        };
-        Expr::LoadLinear(TileLinearLoadExpr {
-            src: self.view,
-            index: self.index,
-            mask,
-            fill: Box::new(fill),
-        })
-    }
-}
-
-impl<T> TileStoreAddress for Address<T> {
-    fn store_stmt(self, value: Expr, mask: Box<Expr>) -> crate::ir::TileStmt {
-        crate::ir::TileStmt::Store(TileStoreStmt {
-            dst: self.view,
-            row: self.row,
-            col: self.col,
-            value,
-            mask,
-        })
-    }
-}
-
-impl<T> TileStoreAddress for LinearAddress<T> {
-    fn store_stmt(self, value: Expr, mask: Box<Expr>) -> crate::ir::TileStmt {
-        crate::ir::TileStmt::StoreIndexed(TileIndexedStoreStmt {
-            dst: self.view,
-            index: self.index,
-            value,
-            mask,
-        })
+    pub(super) fn store_stmt(self, value: Expr, mask: Box<Expr>) -> crate::ir::TileStmt {
+        let mut indices = self.indices.into_iter();
+        match R {
+            1 => crate::ir::TileStmt::StoreIndexed(TileIndexedStoreStmt {
+                dst: self.view,
+                index: indices.next().expect("rank-1 address has an index"),
+                value,
+                mask,
+            }),
+            2 => crate::ir::TileStmt::Store(TileStoreStmt {
+                dst: self.view,
+                row: indices.next().expect("rank-2 address has a row"),
+                col: indices.next().expect("rank-2 address has a column"),
+                value,
+                mask,
+            }),
+            _ => panic!("tile storage I/O supports rank-1 and rank-2 addresses"),
+        }
     }
 }
 
@@ -196,220 +114,12 @@ pub struct Local<T> {
     pub(super) _ty: PhantomData<T>,
 }
 
-/// Convert builder values into a tile index expression.
-pub trait IntoIndex {
-    /// Consume or clone into an index expression.
-    fn into_index(self) -> Box<Expr>;
-}
-
-/// Scalar u32 index expression.
-#[derive(Clone)]
-pub struct ScalarIndex {
-    pub(super) expr: Box<Expr>,
-}
-
-/// Per-lane u32 index expression.
-#[derive(Clone)]
-pub struct Range {
-    pub(super) expr: Box<Expr>,
-}
-
-impl IntoIndex for ScalarIndex {
-    fn into_index(self) -> Box<Expr> {
-        self.expr
-    }
-}
-
-impl IntoIndex for &ScalarIndex {
-    fn into_index(self) -> Box<Expr> {
-        self.expr.clone()
-    }
-}
-
-impl IntoIndex for Range {
-    fn into_index(self) -> Box<Expr> {
-        self.expr
-    }
-}
-
-impl IntoIndex for &Range {
-    fn into_index(self) -> Box<Expr> {
-        self.expr.clone()
-    }
-}
-
-/// `Box<Expr::Literal(TileLiteral::U32(value)))` — the const-RHS shape every
-/// `Index op u32` overload, `index_compare`, and `Fold`/`Loop` count field
-/// builds.
 pub(super) fn boxed_u32_literal(value: u32) -> Box<Expr> {
     Box::new(Expr::Literal(TileLiteral::U32(value)))
 }
 
-impl IntoIndex for u32 {
-    fn into_index(self) -> Box<Expr> {
-        boxed_u32_literal(self)
-    }
-}
-
-impl IntoIndex for Tile {
-    fn into_index(self) -> Box<Expr> {
-        Box::new(self.expr)
-    }
-}
-
-impl IntoIndex for &Tile {
-    fn into_index(self) -> Box<Expr> {
-        Box::new(self.expr.clone())
-    }
-}
-
-pub(super) fn index_compare(left: Box<Expr>, op: TileCompareOp, value: u32) -> Mask {
-    Mask {
-        expr: Box::new(Expr::Compare {
-            op,
-            left,
-            right: boxed_u32_literal(value),
-        }),
-    }
-}
-
-macro_rules! index_compare_methods {
-    ($($name:ident => $op:ident),+ $(,)?) => {
-        impl Range {
-            $(
-                #[doc = concat!("Compare this range with a u32 using `", stringify!($name), "`.")]
-                pub fn $name(&self, value: u32) -> Mask {
-                    index_compare(self.expr.clone(), TileCompareOp::$op, value)
-                }
-            )+
-        }
-
-        impl ScalarIndex {
-            $(
-                #[doc = concat!("Compare this scalar index with a u32 using `", stringify!($name), "`.")]
-                pub fn $name(&self, value: u32) -> Mask {
-                    index_compare(self.expr.clone(), TileCompareOp::$op, value)
-                }
-            )+
-        }
-    };
-}
-
-index_compare_methods!(lt => Lt, le => Le, gt => Gt, ge => Ge, eq => Eq);
-
-/// Build `$ctor { expr: Expr::Binary(op, self.expr, U32(rhs)) }` — the body
-/// every arm of `impl_index_u32_ops!` produces. The two assert arms (`Div`,
-/// `Rem`) wrap this with a non-zero check on `rhs`.
-impl ScalarIndex {
-    fn binary_u32_lit(self, op: TileBinaryOp, rhs: u32) -> Self {
-        Self {
-            expr: Box::new(Expr::Binary {
-                op,
-                left: self.expr,
-                right: boxed_u32_literal(rhs),
-            }),
-        }
-    }
-}
-
-impl Range {
-    fn binary_u32_lit(self, op: TileBinaryOp, rhs: u32) -> Self {
-        Self {
-            expr: Box::new(Expr::Binary {
-                op,
-                left: self.expr,
-                right: boxed_u32_literal(rhs),
-            }),
-        }
-    }
-}
-
-macro_rules! impl_index_u32_ops {
-    (generic($($generics:tt)+), $ty:ty, $div_msg:literal, $mod_msg:literal) => {
-        impl_index_u32_ops!(@impl [impl<$($generics)+>] $ty, $div_msg, $mod_msg);
-    };
-    ($ty:ty, $div_msg:literal, $mod_msg:literal) => {
-        impl_index_u32_ops!(@impl [impl] $ty, $div_msg, $mod_msg);
-    };
-    (@impl [$($impl_head:tt)*] $ty:ty, $div_msg:literal, $mod_msg:literal) => {
-        impl_index_u32_ops!(@arm [$($impl_head)*] $ty, Add, add, TileBinaryOp::Add);
-        impl_index_u32_ops!(@arm [$($impl_head)*] $ty, Mul, mul, TileBinaryOp::Mul);
-        impl_index_u32_ops!(@arm [$($impl_head)*] $ty, BitAnd, bitand, TileBinaryOp::BitAnd);
-        impl_index_u32_ops!(@arm [$($impl_head)*] $ty, BitXor, bitxor, TileBinaryOp::BitXor);
-        impl_index_u32_ops!(@assert_arm [$($impl_head)*] $ty, Div, div, TileBinaryOp::Div, $div_msg);
-        impl_index_u32_ops!(@assert_arm [$($impl_head)*] $ty, Rem, rem, TileBinaryOp::Rem, $mod_msg);
-    };
-    (@arm [$($impl_head:tt)*] $ty:ty, $trait:ident, $method:ident, $op:expr) => {
-        $($impl_head)* $trait<u32> for $ty {
-            type Output = $ty;
-
-            fn $method(self, rhs: u32) -> Self::Output {
-                self.binary_u32_lit($op, rhs)
-            }
-        }
-    };
-    (@assert_arm [$($impl_head:tt)*] $ty:ty, $trait:ident, $method:ident, $op:expr, $msg:literal) => {
-        $($impl_head)* $trait<u32> for $ty {
-            type Output = $ty;
-
-            fn $method(self, rhs: u32) -> Self::Output {
-                assert!(rhs > 0, $msg);
-                self.binary_u32_lit($op, rhs)
-            }
-        }
-    };
-}
-
-impl_index_u32_ops!(
-    ScalarIndex,
-    "scalar index divisor must be non-zero",
-    "scalar index modulus must be non-zero"
-);
-impl_index_u32_ops!(
-    Range,
-    "tile index divisor must be non-zero",
-    "tile index modulus must be non-zero"
-);
-
-/// `lhs + rhs` as `Expr::Binary { Add, .. }`. Shared by the three `Add`
-/// impls below — `ScalarIndex + ScalarIndex`, `ScalarIndex + Range`, and
-/// `Range + ScalarIndex` all reduce to the same expression.
-fn add_index_exprs(left: Box<Expr>, right: Box<Expr>) -> Box<Expr> {
-    Box::new(Expr::Binary {
-        op: TileBinaryOp::Add,
-        left,
-        right,
-    })
-}
-
-impl Add<ScalarIndex> for ScalarIndex {
-    type Output = ScalarIndex;
-
-    fn add(self, rhs: ScalarIndex) -> Self::Output {
-        ScalarIndex {
-            expr: add_index_exprs(self.expr, rhs.expr),
-        }
-    }
-}
-
-impl Add<Range> for ScalarIndex {
-    type Output = Range;
-
-    fn add(self, rhs: Range) -> Self::Output {
-        Range {
-            expr: add_index_exprs(self.expr, rhs.expr),
-        }
-    }
-}
-
-impl Add<ScalarIndex> for Range {
-    type Output = Range;
-
-    fn add(self, rhs: ScalarIndex) -> Self::Output {
-        Range {
-            expr: add_index_exprs(self.expr, rhs.expr),
-        }
-    }
+pub(super) fn boxed_index(value: impl Into<Tile>) -> Box<Expr> {
+    Box::new(value.into().expr)
 }
 
 /// Per-lane boolean mask.
@@ -427,7 +137,8 @@ impl Mask {
     }
 
     /// Logical conjunction of two masks.
-    pub fn and(self, rhs: Self) -> Self {
+    pub fn and(self, rhs: impl Into<Mask>) -> Self {
+        let rhs = rhs.into();
         Self {
             expr: Box::new(Expr::Binary {
                 op: TileBinaryOp::LogicalAnd,
@@ -436,19 +147,56 @@ impl Mask {
             }),
         }
     }
-}
 
-/// Scalar expression reduced to one workgroup value.
-#[derive(Clone)]
-pub struct Scalar {
-    pub(super) expr: Expr,
-}
-
-impl Scalar {
-    /// Build an f32 scalar literal.
-    pub fn literal(value: f32) -> Self {
+    /// Logical disjunction of two masks.
+    pub fn or(self, rhs: impl Into<Mask>) -> Self {
+        let rhs = rhs.into();
         Self {
-            expr: Expr::Literal(TileLiteral::f32(value)),
+            expr: Box::new(Expr::Binary {
+                op: TileBinaryOp::LogicalOr,
+                left: self.expr,
+                right: rhs.expr,
+            }),
+        }
+    }
+
+    /// Compare this mask with another bool expression.
+    pub fn eq(&self, rhs: impl Into<Tile>) -> Self {
+        Tile::from(self).eq(rhs)
+    }
+
+    /// Compare this mask with another bool expression.
+    pub fn ne(&self, rhs: impl Into<Tile>) -> Self {
+        Tile::from(self).ne(rhs)
+    }
+}
+
+impl From<Tile> for Mask {
+    fn from(value: Tile) -> Self {
+        Self {
+            expr: Box::new(value.expr),
+        }
+    }
+}
+
+impl From<&Tile> for Mask {
+    fn from(value: &Tile) -> Self {
+        Self {
+            expr: Box::new(value.expr.clone()),
+        }
+    }
+}
+
+impl From<Mask> for Tile {
+    fn from(value: Mask) -> Self {
+        Self { expr: *value.expr }
+    }
+}
+
+impl From<&Mask> for Tile {
+    fn from(value: &Mask) -> Self {
+        Self {
+            expr: (*value.expr).clone(),
         }
     }
 }
@@ -457,6 +205,42 @@ impl Scalar {
 #[derive(Clone)]
 pub struct Tile {
     pub(super) expr: Expr,
+}
+
+impl From<TileLiteral> for Tile {
+    fn from(value: TileLiteral) -> Self {
+        Self::literal(value)
+    }
+}
+
+impl From<f32> for Tile {
+    fn from(value: f32) -> Self {
+        Self::literal(TileLiteral::f32(value))
+    }
+}
+
+impl From<u32> for Tile {
+    fn from(value: u32) -> Self {
+        Self::literal(TileLiteral::U32(value))
+    }
+}
+
+impl From<&u32> for Tile {
+    fn from(value: &u32) -> Self {
+        Self::literal(TileLiteral::U32(*value))
+    }
+}
+
+impl From<bool> for Tile {
+    fn from(value: bool) -> Self {
+        Self::literal(TileLiteral::Bool(value))
+    }
+}
+
+impl From<&Tile> for Tile {
+    fn from(value: &Tile) -> Self {
+        value.clone()
+    }
 }
 
 macro_rules! tile_unary_methods {
@@ -473,9 +257,9 @@ macro_rules! tile_unary_methods {
 macro_rules! tile_compare_methods {
     ($($name:ident => $op:ident),+ $(,)?) => {
         $(
-            #[doc = concat!("Compare two tiles with `", stringify!($op), "`.")]
-            pub fn $name(self, rhs: Self) -> Self {
-                Self::compare_bool(TileCompareOp::$op, self, rhs)
+            #[doc = concat!("Compare two tile expressions with `", stringify!($op), "`.")]
+            pub fn $name(&self, rhs: impl Into<Tile>) -> Mask {
+                Mask::from(Self::compare_bool(TileCompareOp::$op, self.clone(), rhs.into()))
             }
         )+
     };
@@ -485,8 +269,8 @@ macro_rules! tile_binary_methods {
     ($($name:ident => $op:ident),+ $(,)?) => {
         $(
             #[doc = concat!("Apply binary `", stringify!($op), "`.")]
-            pub fn $name(self, rhs: Self) -> Self {
-                self.binary(TileBinaryOp::$op, rhs)
+            pub fn $name(self, rhs: impl Into<Tile>) -> Self {
+                self.binary(TileBinaryOp::$op, rhs.into())
             }
         )+
     };
@@ -494,29 +278,24 @@ macro_rules! tile_binary_methods {
 
 impl Tile {
     /// Build a tile literal.
-    pub fn literal(value: TileLiteral) -> Self {
+    pub fn literal(value: impl Into<TileLiteral>) -> Self {
         Self {
-            expr: Expr::Literal(value),
+            expr: Expr::Literal(value.into()),
         }
     }
 
     /// Build a tile from an index expression.
-    pub fn from_index(index: impl IntoIndex) -> Self {
-        Self {
-            expr: *index.into_index(),
-        }
+    pub fn from_index(index: impl Into<Tile>) -> Self {
+        index.into()
     }
 
-    /// Stable structural hash of this tile's expression tree. Used by host-time
-    /// builders (e.g. matmul-epilogue cache keys) to key kernel pipelines on the
-    /// resulting AST without depending on closure identity. Two tiles with
-    /// identical Debug forms hash equal; two tiles with structurally distinct
-    /// expressions hash distinct.
+    /// Stable structural hash of this tile's expression tree.
     pub fn signature_hash(&self) -> u64 {
         use std::collections::hash_map::DefaultHasher;
         use std::hash::{Hash, Hasher};
+
         let mut hasher = DefaultHasher::new();
-        format!("{:?}", self.expr).hash(&mut hasher);
+        self.expr.hash(&mut hasher);
         hasher.finish()
     }
 
@@ -534,7 +313,7 @@ impl Tile {
 
     /// Sigmoid activation: `1 / (1 + exp(-x))`.
     pub fn sigmoid(self) -> Self {
-        let one = Tile::literal(TileLiteral::f32(1.0));
+        let one = Tile::literal(1.0);
         one.clone() / (one + self.neg_unary().exp())
     }
 
@@ -543,13 +322,12 @@ impl Tile {
         self.clone() * self.sigmoid()
     }
 
-    /// GELU activation, tanh approximation:
-    /// `0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))`.
+    /// GELU activation, tanh approximation.
     pub fn gelu(self) -> Self {
-        let half = Tile::literal(TileLiteral::f32(0.5));
-        let one = Tile::literal(TileLiteral::f32(1.0));
-        let coeff = Tile::literal(TileLiteral::f32(0.044_715));
-        let sqrt_2_over_pi = Tile::literal(TileLiteral::f32(0.797_884_6));
+        let half = Tile::literal(0.5);
+        let one = Tile::literal(1.0);
+        let coeff = Tile::literal(0.044_715);
+        let sqrt_2_over_pi = Tile::literal(0.797_884_6);
         let x = self;
         let x_cubed = x.clone() * x.clone() * x.clone();
         let inner = sqrt_2_over_pi * (x.clone() + coeff * x_cubed);
@@ -558,7 +336,7 @@ impl Tile {
 
     /// ReLU activation: `max(x, 0)`.
     pub fn relu(self) -> Self {
-        let zero = Tile::literal(TileLiteral::f32(0.0));
+        let zero = Tile::literal(0.0);
         let condition = Tile::compare_bool(TileCompareOp::Gt, self.clone(), zero.clone());
         Tile::select(condition, self, zero)
     }
@@ -584,7 +362,8 @@ impl Tile {
     }
 
     /// Select between two tile values.
-    pub fn select(condition: Self, accept: Self, reject: Self) -> Self {
+    pub fn select(condition: impl Into<Tile>, accept: Self, reject: Self) -> Self {
+        let condition = condition.into();
         Self {
             expr: Expr::Select {
                 condition: Box::new(condition.expr),
@@ -595,17 +374,14 @@ impl Tile {
     }
 
     /// Compare two tiles producing a `Bool`-typed tile, then optionally
-    /// broadcast `1`/`0` of `output`'s element type via `Select`. Pure builder
-    /// convenience — `Expr::Compare` itself always produces `Bool`.
+    /// broadcast `1`/`0` of `output`'s element type.
     pub fn compare(op: TileCompareOp, left: Self, right: Self, output: crate::ElementType) -> Self {
         let condition = Self::compare_bool(op, left, right);
         if output == crate::ElementType::Bool {
             condition
         } else {
-            let one = TileLiteral::f32(1.0);
-            let zero = TileLiteral::f32(0.0);
-            let one = Tile::literal(one).cast(output);
-            let zero = Tile::literal(zero).cast(output);
+            let one = Tile::literal(1.0).cast(output);
+            let zero = Tile::literal(0.0).cast(output);
             Self::select(condition, one, zero)
         }
     }
@@ -645,26 +421,15 @@ impl Tile {
     );
 }
 
-impl From<Scalar> for Tile {
-    fn from(value: Scalar) -> Self {
-        Self { expr: value.expr }
-    }
-}
-
 macro_rules! impl_tile_binary {
     ($trait:ident, $method:ident, $op:expr) => {
-        impl $trait for Tile {
+        impl<Rhs> $trait<Rhs> for Tile
+        where
+            Rhs: Into<Tile>,
+        {
             type Output = Tile;
 
-            fn $method(self, rhs: Self) -> Self::Output {
-                self.binary($op, rhs)
-            }
-        }
-
-        impl $trait<Scalar> for Tile {
-            type Output = Tile;
-
-            fn $method(self, rhs: Scalar) -> Self::Output {
+            fn $method(self, rhs: Rhs) -> Self::Output {
                 self.binary($op, rhs.into())
             }
         }
@@ -676,3 +441,6 @@ impl_tile_binary!(Sub, sub, TileBinaryOp::Sub);
 impl_tile_binary!(Mul, mul, TileBinaryOp::Mul);
 impl_tile_binary!(Div, div, TileBinaryOp::Div);
 impl_tile_binary!(Rem, rem, TileBinaryOp::Rem);
+impl_tile_binary!(BitAnd, bitand, TileBinaryOp::BitAnd);
+impl_tile_binary!(BitOr, bitor, TileBinaryOp::BitOr);
+impl_tile_binary!(BitXor, bitxor, TileBinaryOp::BitXor);

@@ -13,6 +13,8 @@ use crate::{
 
 const BLOCK: usize = 256;
 
+struct ReduceDirectKernelVariant;
+
 pub(crate) fn build_reduce_direct_kernel(
     operation: &ReduceOperation,
     graph: &crate::compute_graph::ComputeGraphInner,
@@ -38,7 +40,7 @@ pub(crate) fn build_reduce_direct_kernel(
 
     let dispatch_size = operation.dispatch_size(workgroup_shape, inputs);
     let cache_key = operation.kernel_cache_key_with_dispatch(
-        "reduce_direct",
+        kernel_backend::KernelVariantKey::of::<ReduceDirectKernelVariant>(),
         Some(workgroup_shape),
         dispatch_size,
         inputs,
@@ -171,7 +173,7 @@ fn layout_index(meta: &TensorMeta, coords: &[tile_ir::tile::Tile]) -> tile_ir::t
 fn linear_group(
     program: &tile_ir::tile::TileBlock<'_>,
     dispatch_size: [u32; 3],
-) -> tile_ir::tile::ScalarIndex {
+) -> tile_ir::tile::Tile {
     program.program_id(tile_ir::WorkgroupAxis::X)
         + program.program_id(tile_ir::WorkgroupAxis::Y) * dispatch_size[0]
         + program.program_id(tile_ir::WorkgroupAxis::Z)

@@ -1,4 +1,5 @@
 use std::{
+    any::TypeId,
     hash::{Hash, Hasher},
     num::NonZeroUsize,
     sync::Arc,
@@ -27,7 +28,43 @@ pub(crate) struct CompiledKernelModule {
     module: Arc<wgpu::naga::Module>,
 }
 
-pub(crate) type ModuleCache = RwLock<LruCache<[u64; 2], CompiledKernelModule, FxBuildHasher>>;
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) struct KernelCacheKey([u64; 2]);
+
+impl KernelCacheKey {
+    pub(crate) fn from_hash_inputs(hash_inputs: impl Fn(&mut FxHasher)) -> Self {
+        Self(std::array::from_fn(|salt| {
+            let mut hasher = FxHasher::default();
+            (salt as u64).hash(&mut hasher);
+            hash_inputs(&mut hasher);
+            hasher.finish()
+        }))
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) struct KernelVariantKey {
+    type_id: TypeId,
+    payload: u64,
+}
+
+impl KernelVariantKey {
+    pub(crate) fn of<T: 'static>() -> Self {
+        Self {
+            type_id: TypeId::of::<T>(),
+            payload: 0,
+        }
+    }
+
+    pub(crate) fn with_payload<T: 'static>(hash_payload: impl Fn(&mut FxHasher)) -> Self {
+        Self {
+            type_id: TypeId::of::<T>(),
+            payload: hash_value(hash_payload),
+        }
+    }
+}
+
+pub(crate) type ModuleCache = RwLock<LruCache<KernelCacheKey, CompiledKernelModule, FxBuildHasher>>;
 
 pub(crate) fn module_cache(capacity: usize) -> ModuleCache {
     RwLock::new(LruCache::with_hasher(
@@ -38,7 +75,7 @@ pub(crate) fn module_cache(capacity: usize) -> ModuleCache {
 
 pub(crate) fn cached_hashed_kernel_module(
     cache: &'static ModuleCache,
-    key: [u64; 2],
+    key: KernelCacheKey,
     build_module: impl FnOnce() -> Option<CompiledKernelModule>,
 ) -> Option<CompiledKernelModule> {
     if let Some(module) = cache.write().get(&key) {
@@ -60,10 +97,9 @@ fn compile_ir(ir: tile_ir::KernelIr) -> Option<CompiledKernelModule> {
 
 fn cached_kernel_module(
     device: &Device,
-    cache_key: impl Into<String>,
+    cache_key: KernelCacheKey,
     build_module: impl FnOnce() -> Option<CompiledKernelModule>,
 ) -> Option<CompiledKernelModule> {
-    let cache_key = cache_key.into();
     if let Some(module) = device.naga_module_cache().write().get(&cache_key) {
         return Some(CompiledKernelModule {
             module: Arc::new(module.clone()),
@@ -80,7 +116,7 @@ fn cached_kernel_module(
 
 pub(crate) fn cached_kernel_ir(
     device: &Device,
-    cache_key: impl Into<String>,
+    cache_key: KernelCacheKey,
     build_ir: impl FnOnce() -> Option<tile_ir::KernelIr>,
 ) -> Option<CompiledKernelModule> {
     cached_kernel_module(device, cache_key, || compile_ir(build_ir()?))
@@ -97,13 +133,12 @@ pub(crate) fn cached_kernel_ir(
 pub(crate) fn dynamic_kernel_from_ir(
     device: &Device,
     name: impl Into<String>,
-    cache_key: impl Into<String>,
+    cache_key: KernelCacheKey,
     build_ir: impl FnOnce() -> Option<tile_ir::KernelIr>,
     buffers: impl IntoIterator<Item = Arc<wgpu::Buffer>>,
     dispatch_size: [u32; 3],
 ) -> Option<DirectKernel> {
-    let cache_key = cache_key.into();
-    let module = cached_kernel_ir(device, cache_key.clone(), build_ir)?;
+    let module = cached_kernel_ir(device, cache_key, build_ir)?;
     let bindings = bindings_from_module(&module, buffers)?;
     Some(dynamic_kernel_from_module(
         name,
@@ -116,7 +151,7 @@ pub(crate) fn dynamic_kernel_from_ir(
 
 pub(crate) fn dynamic_kernel_from_module(
     name: impl Into<String>,
-    cache_key: impl Into<String>,
+    cache_key: KernelCacheKey,
     module: CompiledKernelModule,
     bindings: Vec<DirectKernelBinding>,
     dispatch_size: [u32; 3],
@@ -180,7 +215,7 @@ pub(crate) fn buffers_from_tensors<const N: usize>(
 pub(crate) fn run_kernel<F>(
     device: &Device,
     name: impl Into<String>,
-    cache_key: impl Into<String>,
+    cache_key: KernelCacheKey,
     dispatch_size: [u32; 3],
     body: F,
 ) -> Option<DirectKernel>
@@ -213,21 +248,16 @@ pub(crate) fn linear_tensor_ref(
 }
 
 /// Hash a module key with the standard salt-pair pattern used by the backend
-/// caches: returns `[u64; 2]` where each lane uses a distinct salt so callers
-/// can derive both an LRU key and a cache string from the same input data.
-pub(crate) fn module_key_from(hash_inputs: impl Fn(&mut FxHasher)) -> [u64; 2] {
-    std::array::from_fn(|salt| {
-        let mut hasher = FxHasher::default();
-        (salt as u64).hash(&mut hasher);
-        hash_inputs(&mut hasher);
-        hasher.finish()
-    })
+/// caches. Each lane uses a distinct salt so one key has enough entropy for
+/// shared module, shader, and pipeline-cache lookups.
+pub(crate) fn module_key_from(hash_inputs: impl Fn(&mut FxHasher)) -> KernelCacheKey {
+    KernelCacheKey::from_hash_inputs(hash_inputs)
 }
 
-/// Format the standard `"{label}:{hi:016x}{lo:016x}"` cache key used by the
-/// hashed-module backend pattern.
-pub(crate) fn hashed_cache_key(label: &str, module_key: [u64; 2]) -> String {
-    format!("{label}:{:016x}{:016x}", module_key[0], module_key[1])
+fn hash_value(hash_inputs: impl Fn(&mut FxHasher)) -> u64 {
+    let mut hasher = FxHasher::default();
+    hash_inputs(&mut hasher);
+    hasher.finish()
 }
 
 /// Build a `DirectKernel` using the hashed two-tier cache pattern: the
@@ -238,19 +268,18 @@ pub(crate) fn dynamic_kernel_from_hashed_ir(
     device: &Device,
     cache: &'static ModuleCache,
     label: &str,
-    module_key: [u64; 2],
+    module_key: KernelCacheKey,
     buffers: impl IntoIterator<Item = Arc<wgpu::Buffer>>,
     dispatch_size: [u32; 3],
     build_ir: impl FnOnce() -> Option<tile_ir::KernelIr>,
 ) -> Option<DirectKernel> {
-    let cache_key = hashed_cache_key(label, module_key);
     let module = cached_hashed_kernel_module(cache, module_key, || {
-        cached_kernel_ir(device, cache_key.clone(), build_ir)
+        cached_kernel_ir(device, module_key, build_ir)
     })?;
     let bindings = bindings_from_module(&module, buffers)?;
     Some(dynamic_kernel_from_module(
         label,
-        cache_key,
+        module_key,
         module,
         bindings,
         dispatch_size,
@@ -276,7 +305,7 @@ pub(crate) fn run_direct_kernel(
 
 pub(crate) fn storage3_kernel_with_prepared_pipeline(
     name: impl Into<String>,
-    cache_key: impl Into<String>,
+    cache_key: KernelCacheKey,
     pipeline: wgpu::ComputePipeline,
     input: Arc<wgpu::Buffer>,
     weight: Arc<wgpu::Buffer>,
@@ -319,7 +348,7 @@ pub(crate) fn prepare_storage3_pipeline(
 pub(crate) fn storage3_pipeline_from_ir(
     device: &Device,
     name: &str,
-    cache_key: impl Into<String>,
+    cache_key: KernelCacheKey,
     build_ir: impl FnOnce() -> Option<tile_ir::KernelIr>,
 ) -> Option<wgpu::ComputePipeline> {
     let module = cached_kernel_ir(device, cache_key, build_ir)?;
@@ -329,12 +358,12 @@ pub(crate) fn storage3_pipeline_from_ir(
 pub(crate) fn storage3_pipeline_from_cached_module(
     device: &Device,
     name: &str,
-    cache_key: &str,
+    cache_key: KernelCacheKey,
 ) -> Option<wgpu::ComputePipeline> {
     let module = device
         .naga_module_cache()
         .write()
-        .get(cache_key)
+        .get(&cache_key)
         .map(|module| CompiledKernelModule {
             module: Arc::new(module.clone()),
         })?;

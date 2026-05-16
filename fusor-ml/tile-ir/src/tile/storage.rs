@@ -1,5 +1,6 @@
 use std::marker::PhantomData;
 
+use super::value::boxed_index;
 use super::*;
 use crate::ir::{AxisGroup, Layout, MultiFlattenMap, Shape, StorageView, SubAxis};
 
@@ -17,47 +18,59 @@ pub struct Storage<T, const R: usize> {
 /// instead of a compile-time [`Numeric`] marker.
 pub struct RuntimeElement;
 
-/// Converts rank-specific index arguments into a typed storage address.
-pub trait StorageIndex<T, const R: usize> {
-    /// Address type produced by this index.
-    type Address;
-
-    /// Build an address against `view`.
-    fn address(self, view: StorageView) -> Self::Address;
+/// Convert rank-specific index syntax into storage address components.
+pub trait StorageIndex<const R: usize> {
+    #[doc(hidden)]
+    fn storage_index(self) -> [Box<crate::ir::Expr>; R];
 }
 
-impl<T, I> StorageIndex<T, 1> for I
+impl<I> StorageIndex<1> for I
 where
-    I: IntoIndex,
+    I: Into<Tile>,
 {
-    type Address = LinearAddress<T>;
-
-    fn address(self, view: StorageView) -> Self::Address {
-        LinearAddress {
-            view,
-            index: self.into_index(),
-            _ty: PhantomData,
-        }
+    fn storage_index(self) -> [Box<crate::ir::Expr>; 1] {
+        [boxed_index(self)]
     }
 }
 
-impl<T, Row, Col> StorageIndex<T, 2> for (Row, Col)
+impl<I> StorageIndex<1> for (I,)
 where
-    Row: IntoIndex,
-    Col: IntoIndex,
+    I: Into<Tile>,
 {
-    type Address = Address<T>;
-
-    fn address(self, view: StorageView) -> Self::Address {
-        let (row, col) = self;
-        Address {
-            view,
-            row: row.into_index(),
-            col: col.into_index(),
-            _ty: PhantomData,
-        }
+    fn storage_index(self) -> [Box<crate::ir::Expr>; 1] {
+        [boxed_index(self.0)]
     }
 }
+
+impl<I, const R: usize> StorageIndex<R> for [I; R]
+where
+    I: Into<Tile>,
+{
+    fn storage_index(self) -> [Box<crate::ir::Expr>; R] {
+        self.map(boxed_index)
+    }
+}
+
+macro_rules! impl_tuple_storage_index {
+    ($rank:literal, $($name:ident),+ $(,)?) => {
+        impl<$($name),+> StorageIndex<$rank> for ($($name,)+)
+        where
+            $($name: Into<Tile>,)+
+        {
+            #[allow(non_snake_case)]
+            fn storage_index(self) -> [Box<crate::ir::Expr>; $rank] {
+                let ($($name,)+) = self;
+                [$(boxed_index($name),)+]
+            }
+        }
+    };
+}
+
+impl_tuple_storage_index!(2, A, B);
+impl_tuple_storage_index!(3, A, B, C);
+impl_tuple_storage_index!(4, A, B, C, D);
+impl_tuple_storage_index!(5, A, B, C, D, E);
+impl_tuple_storage_index!(6, A, B, C, D, E, F);
 
 impl<T, const R: usize> Storage<T, R> {
     /// Underlying storage view.
@@ -66,11 +79,12 @@ impl<T, const R: usize> Storage<T, R> {
     }
 
     /// Address one element in this storage view.
-    pub fn at<I>(&self, index: I) -> I::Address
-    where
-        I: StorageIndex<T, R>,
-    {
-        index.address(self.view.clone())
+    pub fn at(&self, index: impl StorageIndex<R>) -> Address<T, R> {
+        Address {
+            view: self.view.clone(),
+            indices: index.storage_index(),
+            _ty: PhantomData,
+        }
     }
 
     /// Construct a typed storage handle from an existing view. Caller is

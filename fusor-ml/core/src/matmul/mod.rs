@@ -1,4 +1,4 @@
-use std::hash::Hash;
+use std::{any::TypeId, hash::Hash};
 
 use crate::matmul::sgemm_params::gemm_parameters;
 use crate::matmul::sgemv_params::gemv_parameters;
@@ -11,8 +11,8 @@ use crate::{
         direct_kernel::DirectKernel,
         kernel_backend,
         tile_direct::{
-            flatten_matrix_layout, tile_storage_read_with_direct_layout,
-            tile_storage_write_with_direct_layout,
+            flatten_matrix_layout, tile_storage_read_with_direct_layout_typed,
+            tile_storage_write_with_direct_layout_typed,
         },
     },
     nary_direct::apply_unary_function_chain,
@@ -140,6 +140,8 @@ enum DirectTileMatmulVariant {
     MatMul,
 }
 
+struct MatmulTileDirectKernelVariant;
+
 fn direct_tile_matmul_selector() -> ShapeSelector<3, (), DirectTileMatmulVariant> {
     ShapeSelector::new()
         .rule(
@@ -258,7 +260,7 @@ impl MatMulOperation {
     }
 
     fn can_use_direct_tile_matmul(&self) -> bool {
-        self.datatype == DataTypeEnum::F32
+        matches!(self.datatype, DataTypeEnum::F32 | DataTypeEnum::F16)
     }
 
     fn build_direct_tile_matmul(
@@ -271,13 +273,26 @@ impl MatMulOperation {
         let a_view = flatten_matrix_layout(input_a.layout())?;
         let b_view = flatten_matrix_layout(input_b.layout())?;
         let y_view = flatten_matrix_layout(output.layout())?;
-        let m = a_view.rows;
-        let k = a_view.cols;
-        let k_b = b_view.rows;
-        let n = b_view.cols;
-        if k != k_b || y_view.rows != m || y_view.cols != n {
+
+        let rank = self.first_shape.len();
+        let m: u32 = self.first_shape[rank - 2].try_into().ok()?;
+        let k: u32 = self.first_shape[rank - 1].try_into().ok()?;
+        let n: u32 = self.second_shape[rank - 1].try_into().ok()?;
+        let batch: u32 = self.first_shape[..rank - 2]
+            .iter()
+            .try_fold(1usize, |acc, dim| acc.checked_mul(*dim))?
+            .try_into()
+            .ok()?;
+        if a_view.rows != batch.checked_mul(m)?
+            || a_view.cols != k
+            || b_view.rows != batch.checked_mul(k)?
+            || b_view.cols != n
+            || y_view.rows != batch.checked_mul(m)?
+            || y_view.cols != n
+        {
             return None;
         }
+        let shape = tile_ir_kernels::DenseMatmulShape { batch, m, k, n };
 
         let variant = select_direct_tile_matmul_variant(m, k, n);
         let pre_a = self.pre_element_wise[0]
@@ -326,32 +341,105 @@ impl MatMulOperation {
         let epilogue_identity = pre_a.as_ref().map(|e| e.identity()).unwrap_or(0)
             ^ pre_b.as_ref().map(|e| e.identity()).unwrap_or(0)
             ^ post.as_ref().map(|e| e.identity()).unwrap_or(0);
+        let use_coop = matches!(self.parameters, MatMulParams::CoopMatMul(_))
+            && device.cooperative_matrix_supported()
+            && device.subgroups_supported()
+            && device.min_subgroup_size() == 32
+            && device.max_subgroup_size() == 32;
+        let use_shared_tile = m.is_multiple_of(32) && n.is_multiple_of(32) && k.is_multiple_of(8);
+        let datatype = self.datatype;
         let ir = tile_ir::tile::build(move |phase| {
-            let a = tile_storage_read_with_direct_layout(phase, a_view);
-            let b = tile_storage_read_with_direct_layout(phase, b_view);
-            let y = tile_storage_write_with_direct_layout(phase, y_view);
             let epilogues = tile_ir_kernels::DenseMatmulEpilogues {
                 pre_a: pre_a.as_ref(),
                 pre_b: pre_b.as_ref(),
                 post: post.as_ref(),
             };
-            match variant {
-                DirectTileMatmulVariant::Gemv => {
-                    if epilogues.pre_a.is_none()
-                        && epilogues.pre_b.is_none()
-                        && epilogues.post.is_none()
+            match datatype {
+                DataTypeEnum::F32 => {
+                    let a = tile_storage_read_with_direct_layout_typed::<tile_ir::F32>(
+                        phase,
+                        a_view.clone(),
+                    );
+                    let b = tile_storage_read_with_direct_layout_typed::<tile_ir::F32>(
+                        phase,
+                        b_view.clone(),
+                    );
+                    let y = tile_storage_write_with_direct_layout_typed::<tile_ir::F32>(
+                        phase,
+                        y_view.clone(),
+                    );
+                    if use_coop
+                        && tile_ir_kernels::try_batched_coop_matmul_f32::<64, 64, 32>(
+                            phase, &a, &b, &y, shape, &epilogues,
+                        )
                     {
-                        tile_ir_kernels::gemv::<4, 4, 128>(phase, &a, &b, &y)
-                    } else {
-                        tile_ir_kernels::matmul_with_epilogues::<256>(phase, &a, &b, &y, &epilogues)
+                        return;
+                    }
+                    match variant {
+                        DirectTileMatmulVariant::Gemv | DirectTileMatmulVariant::MatMul => {
+                            if use_shared_tile {
+                                tile_ir_kernels::batched_matmul_with_epilogues::<
+                                    tile_ir::F32,
+                                    32,
+                                    32,
+                                    8,
+                                >(
+                                    phase,
+                                    &a,
+                                    &b,
+                                    &y,
+                                    shape,
+                                    tile_ir::TileLiteral::f32(0.0),
+                                    &epilogues,
+                                )
+                            } else {
+                                tile_ir_kernels::batched_matmul_register_with_epilogues::<
+                                    tile_ir::F32,
+                                    32,
+                                    32,
+                                    8,
+                                >(
+                                    phase,
+                                    &a,
+                                    &b,
+                                    &y,
+                                    shape,
+                                    tile_ir::TileLiteral::f32(0.0),
+                                    &epilogues,
+                                )
+                            }
+                        }
                     }
                 }
-                DirectTileMatmulVariant::MatMul => {
-                    tile_ir_kernels::matmul_with_epilogues::<256>(phase, &a, &b, &y, &epilogues)
+                DataTypeEnum::F16 => {
+                    let a = tile_storage_read_with_direct_layout_typed::<tile_ir::F16>(
+                        phase,
+                        a_view.clone(),
+                    );
+                    let b = tile_storage_read_with_direct_layout_typed::<tile_ir::F16>(
+                        phase,
+                        b_view.clone(),
+                    );
+                    let y = tile_storage_write_with_direct_layout_typed::<tile_ir::F16>(
+                        phase,
+                        y_view.clone(),
+                    );
+                    if use_shared_tile {
+                        tile_ir_kernels::batched_matmul_f16_accum_f32_with_epilogues::<32, 32, 8>(
+                            phase, &a, &b, &y, shape, &epilogues,
+                        )
+                    } else {
+                        tile_ir_kernels::batched_matmul_f16_accum_f32_register_with_epilogues::<
+                            32,
+                            32,
+                            8,
+                        >(phase, &a, &b, &y, shape, &epilogues)
+                    }
                 }
+                _ => unreachable!("direct tile matmul only supports f32/f16"),
             }
         });
-        let dispatch_size = ir.single_tile_program_grid()?;
+        let dispatch_size = ir.body().grid;
         let max_workgroups = device.limits().max_compute_workgroups_per_dimension;
         if dispatch_size.iter().any(|dim| *dim > max_workgroups) {
             return None;
@@ -361,12 +449,13 @@ impl MatMulOperation {
             input_b.clone().into(),
             output.clone().into(),
         ];
-        let cache_key = self.kernel_cache_key_with_dispatch(
-            &format!("matmul_tile_direct:epilogue={epilogue_identity:#018x}"),
-            None,
-            dispatch_size,
-            &inputs,
+        let variant = kernel_backend::KernelVariantKey::with_payload::<MatmulTileDirectKernelVariant>(
+            |state| {
+                use_shared_tile.hash(state);
+                epilogue_identity.hash(state);
+            },
         );
+        let cache_key = self.kernel_cache_key_with_dispatch(variant, None, dispatch_size, &inputs);
 
         kernel_backend::dynamic_kernel_from_ir(
             device,
@@ -381,6 +470,7 @@ impl MatMulOperation {
 
 impl Operation for MatMulOperation {
     fn hash_kernel_signature(&self, state: &mut FxHasher) {
+        TypeId::of::<Self>().hash(state);
         self.datatype.hash(state);
         self.first_shape.hash(state);
         self.second_shape.hash(state);
@@ -487,12 +577,10 @@ impl Operation for MatMulOperation {
         let input_b = input_b.as_tensor()?;
         let output = output.as_tensor()?;
         if self.can_use_direct_tile_matmul()
-            && input_a.datatype() == DataTypeEnum::F32
-            && input_b.datatype() == DataTypeEnum::F32
-            && output.datatype() == DataTypeEnum::F32
-            && input_a.layout().rank() == 2
-            && input_b.layout().rank() == 2
-            && output.layout().rank() == 2
+            && input_a.datatype() == self.datatype
+            && input_b.datatype() == self.datatype
+            && output.datatype() == self.datatype
+            && (self.datatype != DataTypeEnum::F16 || graph.device().f16_supported())
             && let Some(kernel) =
                 self.build_direct_tile_matmul(&graph.device(), input_a, input_b, output)
         {

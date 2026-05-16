@@ -34,9 +34,5 @@ pub use coop::{CoopRole, CoopTileLoad};
 pub use grid::build;
 pub use program::Program;
 pub use quantized::QuantizedDot;
-pub use storage::{RuntimeElement, Storage};
-pub use value::{
-    range, Address, Bound, CoopAcc, CoopFragment, FoldIter, IntoIndex, IntoTileLiteral,
-    LinearAddress, Local, Mask, Range, Rank1TileAddress, Rank2TileAddress, Scalar, ScalarIndex,
-    Tile, TileLoadAddress, TileStoreAddress,
-};
+pub use storage::{RuntimeElement, Storage, StorageIndex};
+pub use value::{range, Address, CoopAcc, CoopFragment, FoldIter, Local, Mask, Tile};

@@ -20,6 +20,8 @@ use super::QMatrix;
 
 const BLOCK: usize = 256;
 
+struct QEmbeddingDirectKernelVariant;
+
 #[derive(Debug, Clone)]
 pub(crate) struct QEmbeddingOperation {
     pub(crate) indexes: NodeIndex,
@@ -168,7 +170,7 @@ impl Operation for QEmbeddingOperation {
         let (indexes_offset, indexes_layout) = u32_index_layout(indexes.layout())?;
         let (output_offset, output_layout) = u32_layout_2d(output.layout())?;
         let cache_key = self.kernel_cache_key_with_dispatch(
-            "q_embedding_direct",
+            kernel_backend::KernelVariantKey::of::<QEmbeddingDirectKernelVariant>(),
             Some(workgroup_shape),
             dispatch_size,
             inputs,

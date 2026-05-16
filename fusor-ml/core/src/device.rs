@@ -18,7 +18,7 @@ use wgpu::{
     PipelineLayout, ShaderModule,
 };
 
-use crate::compute_graph::ComputeGraph;
+use crate::{compute_graph::ComputeGraph, mir::kernel_backend::KernelCacheKey};
 
 #[derive(Debug)]
 struct CachedBuffer {
@@ -200,8 +200,8 @@ struct DeviceInner {
     bind_group_layout_cache:
         RwLock<LruCache<Vec<wgpu::BindGroupLayoutEntry>, BindGroupLayout, FxBuildHasher>>,
     pipeline_layout_cache: RwLock<LruCache<BindGroupLayout, wgpu::PipelineLayout, FxBuildHasher>>,
-    naga_module_cache: RwLock<LruCache<String, wgpu::naga::Module, FxBuildHasher>>,
-    shader_module_cache: RwLock<LruCache<String, wgpu::ShaderModule, FxBuildHasher>>,
+    naga_module_cache: RwLock<LruCache<KernelCacheKey, wgpu::naga::Module, FxBuildHasher>>,
+    shader_module_cache: RwLock<LruCache<KernelCacheKey, wgpu::ShaderModule, FxBuildHasher>>,
     compute_pipeline_cache:
         RwLock<LruCache<(PipelineLayout, ShaderModule), wgpu::ComputePipeline, FxBuildHasher>>,
     direct_dynamic_bind_group_cache:
@@ -583,13 +583,13 @@ impl Device {
 
     pub(crate) fn naga_module_cache(
         &self,
-    ) -> &RwLock<LruCache<String, wgpu::naga::Module, FxBuildHasher>> {
+    ) -> &RwLock<LruCache<KernelCacheKey, wgpu::naga::Module, FxBuildHasher>> {
         &self.inner.naga_module_cache
     }
 
     pub(crate) fn shader_module_cache(
         &self,
-    ) -> &RwLock<LruCache<String, wgpu::ShaderModule, FxBuildHasher>> {
+    ) -> &RwLock<LruCache<KernelCacheKey, wgpu::ShaderModule, FxBuildHasher>> {
         &self.inner.shader_module_cache
     }
 

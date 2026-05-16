@@ -2,7 +2,10 @@ use std::sync::Arc;
 
 use wgpu::{CommandEncoder, ComputePass, PipelineCompilationOptions};
 
-use crate::{Device, DirectDynamicBindGroupKey, DirectStorage3BindGroupKey};
+use crate::{
+    Device, DirectDynamicBindGroupKey, DirectStorage3BindGroupKey,
+    mir::kernel_backend::KernelCacheKey,
+};
 
 #[derive(Clone, Debug)]
 pub(crate) enum DirectKernelBinding {
@@ -31,7 +34,7 @@ enum DirectKernelSource {
 #[derive(Debug)]
 pub(crate) struct DirectKernel {
     name: String,
-    cache_key: String,
+    cache_key: KernelCacheKey,
     source: Option<DirectKernelSource>,
     prepared_pipeline: Option<wgpu::ComputePipeline>,
     bindings: DirectKernelBindings,
@@ -47,14 +50,14 @@ pub(crate) struct PreparedDirectDispatch {
 impl DirectKernel {
     pub(super) fn new_with_arc_module(
         name: impl Into<String>,
-        cache_key: impl Into<String>,
+        cache_key: KernelCacheKey,
         module: Arc<wgpu::naga::Module>,
         bindings: Vec<DirectKernelBinding>,
         dispatch_size: [u32; 3],
     ) -> Self {
         Self {
             name: name.into(),
-            cache_key: cache_key.into(),
+            cache_key,
             source: Some(DirectKernelSource::Naga(module)),
             prepared_pipeline: None,
             bindings: DirectKernelBindings::Dynamic(bindings),
@@ -64,7 +67,7 @@ impl DirectKernel {
 
     pub(super) fn new_storage3_with_prepared_pipeline(
         name: impl Into<String>,
-        cache_key: impl Into<String>,
+        cache_key: KernelCacheKey,
         pipeline: wgpu::ComputePipeline,
         input: Arc<wgpu::Buffer>,
         weight: Arc<wgpu::Buffer>,
@@ -73,7 +76,7 @@ impl DirectKernel {
     ) -> Self {
         Self {
             name: name.into(),
-            cache_key: cache_key.into(),
+            cache_key,
             source: None,
             prepared_pipeline: Some(pipeline),
             bindings: DirectKernelBindings::Storage3 {

@@ -1,4 +1,4 @@
-use std::sync::OnceLock;
+use std::{hash::Hash, sync::OnceLock};
 
 use fusor_tile_ir as tile_ir;
 
@@ -16,6 +16,8 @@ use crate::{
 
 const BLOCK: usize = 256;
 const NARY_DIRECT_MODULE_CACHE_SIZE: usize = 1024;
+
+struct NaryDirectKernelVariant;
 
 fn nary_direct_module_cache() -> &'static kernel_backend::ModuleCache {
     static CACHE: OnceLock<kernel_backend::ModuleCache> = OnceLock::new();
@@ -69,18 +71,20 @@ fn build_nary_direct_kernel_with_output_index(
     }
 
     let dispatch_size = operation.dispatch_size(workgroup_shape, inputs);
-    let key_label = format!("nary_direct_out_{output_index}");
+    let variant =
+        kernel_backend::KernelVariantKey::with_payload::<NaryDirectKernelVariant>(|state| {
+            output_index.hash(state);
+        });
     let module_key = operation.kernel_module_key_with_dispatch(
-        &key_label,
+        variant,
         Some(workgroup_shape),
         dispatch_size,
         inputs,
     );
-    let cache_key = kernel_backend::hashed_cache_key("nary", module_key);
     let module = if let Some(module) = nary_direct_module_cache().write().get(&module_key) {
         module.clone()
     } else {
-        let module = kernel_backend::cached_kernel_ir(&graph.device(), cache_key.clone(), || {
+        let module = kernel_backend::cached_kernel_ir(&graph.device(), module_key, || {
             build_nary_tile_ir(operation, &tensors, output_index, dispatch_size)
         })?;
         nary_direct_module_cache()
@@ -102,12 +106,12 @@ fn build_nary_direct_kernel_with_output_index(
     let name = if std::env::var_os("FUSOR_TRACE_DECODE_NAMES").is_some() {
         operation.name()
     } else {
-        cache_key.clone()
+        format!("nary_direct_out_{output_index}")
     };
 
     Some(kernel_backend::dynamic_kernel_from_module(
         name,
-        cache_key,
+        module_key,
         module,
         bindings,
         dispatch_size,
@@ -478,7 +482,7 @@ fn layout_index(meta: &TensorMeta, coords: &[tile_ir::tile::Tile]) -> tile_ir::t
 fn linear_group(
     program: &tile_ir::tile::TileBlock<'_>,
     dispatch_size: [u32; 3],
-) -> tile_ir::tile::ScalarIndex {
+) -> tile_ir::tile::Tile {
     program.program_id(tile_ir::WorkgroupAxis::X)
         + program.program_id(tile_ir::WorkgroupAxis::Y) * dispatch_size[0]
         + program.program_id(tile_ir::WorkgroupAxis::Z)

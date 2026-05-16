@@ -1,4 +1,4 @@
-use std::{fmt::Debug, hash::Hash};
+use std::{any::TypeId, fmt::Debug, hash::Hash};
 
 use rustc_hash::FxHasher;
 
@@ -14,7 +14,7 @@ use super::{
     workgroup_shape::{WorkgroupShape, WorkgroupShapeConstraints},
 };
 
-pub(crate) trait Operation: Debug {
+pub(crate) trait Operation: Debug + 'static {
     fn workgroup_shape_constraints(&self, device: &Device) -> WorkgroupShapeConstraints;
 
     fn dispatch_size(&self, workgroup_shape: &WorkgroupShape, inputs: &[MirValue]) -> [u32; 3];
@@ -41,26 +41,26 @@ pub(crate) trait Operation: Debug {
 
     /// Hash the structural operation state that affects generated kernel IR.
     ///
-    /// The default stays on the object-safe `Operation` surface: operation
-    /// name plus `kernel_module_key_with_dispatch`'s MIR inputs, dispatch, and
-    /// workgroup shape. Implementations only override this when generated IR
-    /// depends on fields not represented by that trait-level data.
+    /// The default hashes the concrete operation type plus
+    /// `kernel_module_key_with_dispatch`'s MIR inputs, dispatch, and workgroup
+    /// shape. Implementations only override this when generated IR depends on
+    /// fields not represented by that trait-level data.
     fn hash_kernel_signature(&self, state: &mut FxHasher) {
-        self.name().hash(state);
+        TypeId::of::<Self>().hash(state);
     }
 
     fn kernel_module_key_with_dispatch(
         &self,
-        label: &str,
+        variant: kernel_backend::KernelVariantKey,
         workgroup_shape: Option<&WorkgroupShape>,
         dispatch_size: [u32; 3],
         inputs: &[MirValue],
-    ) -> [u64; 2] {
+    ) -> kernel_backend::KernelCacheKey {
         kernel_backend::module_key_from(|hasher| {
             // Version the shared key layout so future changes cannot silently
             // collide with cache entries produced by an older hash recipe.
             1u64.hash(hasher);
-            label.hash(hasher);
+            variant.hash(hasher);
             self.hash_kernel_signature(hasher);
             workgroup_shape
                 .map(|workgroup_shape| workgroup_shape.shape())
@@ -75,15 +75,12 @@ pub(crate) trait Operation: Debug {
 
     fn kernel_cache_key_with_dispatch(
         &self,
-        label: &str,
+        variant: kernel_backend::KernelVariantKey,
         workgroup_shape: Option<&WorkgroupShape>,
         dispatch_size: [u32; 3],
         inputs: &[MirValue],
-    ) -> String {
-        kernel_backend::hashed_cache_key(
-            label,
-            self.kernel_module_key_with_dispatch(label, workgroup_shape, dispatch_size, inputs),
-        )
+    ) -> kernel_backend::KernelCacheKey {
+        self.kernel_module_key_with_dispatch(variant, workgroup_shape, dispatch_size, inputs)
     }
 }
 

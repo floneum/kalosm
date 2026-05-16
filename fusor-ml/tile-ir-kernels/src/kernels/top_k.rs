@@ -13,14 +13,14 @@ fn is_finite(value: Tile) -> Tile {
     let finite_magnitude = value
         .unary(TileUnaryOp::Abs)
         .le(Tile::literal(TileLiteral::f32(MAX_F32)));
-    self_equal.and(finite_magnitude)
+    self_equal.and(finite_magnitude).into()
 }
 
 fn better_candidate(value: Tile, id: Tile, best_value: Tile, best_id: Tile) -> Tile {
     let value_greater = value.clone().gt(best_value.clone());
     let value_equal = value.eq(best_value);
     let id_greater = id.gt(best_id);
-    value_greater.or(value_equal.and(id_greater))
+    value_greater.or(value_equal.and(id_greater)).into()
 }
 
 fn load_processor_param_f32(

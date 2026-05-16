@@ -3,9 +3,11 @@ use fusor_tile_ir::{
     NagaKernel, Shape, F32,
 };
 use fusor_tile_ir_kernels::{
-    flash_attention, linear_storage_layout, qdequantize, qgemv, qgemv_q4k_paired, qmatmul,
-    quantized_matrix, rms_norm_vec4, FlashAttentionDims, FlashAttentionMeta, PairedEpilogue,
-    Q4KPairedGgml, RmsNormVec4, RmsNormVec4Meta, TensorMeta,
+    batched_matmul_f16_accum_f32_with_epilogues, batched_matmul_with_epilogues, flash_attention,
+    linear_storage_layout, qdequantize, qgemv, qgemv_q4k_paired, qmatmul, quantized_matrix,
+    rms_norm_vec4, try_batched_coop_matmul_f32, DenseMatmulEpilogues, DenseMatmulShape,
+    FlashAttentionDims, FlashAttentionMeta, PairedEpilogue, Q4KPairedGgml, RmsNormVec4,
+    RmsNormVec4Meta, TensorMeta,
 };
 
 fn lower_or_fail(ir: &fusor_tile_ir::KernelIr, label: &str) -> NagaKernel {
@@ -159,6 +161,82 @@ fn cooperative_qmatmul_lowers() {
         qmatmul::<64, 64, 32>(program, &a, &b, &y, 4);
     });
     lower_or_fail(&ir, "cooperative qmatmul");
+}
+
+#[test]
+fn batched_dense_f32_matmul_lowers() {
+    let ir = tile::build(|program| {
+        let shape = DenseMatmulShape {
+            batch: 3,
+            m: 8,
+            k: 256,
+            n: 4,
+        };
+        let a = program.storage_read::<F32, 2>(Shape::new([shape.batch * shape.m, shape.k]));
+        let b = program.storage_read::<F32, 2>(Shape::new([shape.batch * shape.k, shape.n]));
+        let y = program.storage_write::<F32, 2>(Shape::new([shape.batch * shape.m, shape.n]));
+        batched_matmul_with_epilogues::<F32, 32, 32, 8>(
+            program,
+            &a,
+            &b,
+            &y,
+            shape,
+            fusor_tile_ir::TileLiteral::f32(0.0),
+            &DenseMatmulEpilogues::empty(),
+        );
+    });
+    lower_or_fail(&ir, "batched dense f32 matmul");
+}
+
+#[test]
+fn batched_dense_f16_matmul_lowers() {
+    let ir = tile::build(|program| {
+        let shape = DenseMatmulShape {
+            batch: 2,
+            m: 8,
+            k: 128,
+            n: 4,
+        };
+        let a = program
+            .storage_read::<fusor_tile_ir::F16, 2>(Shape::new([shape.batch * shape.m, shape.k]));
+        let b = program
+            .storage_read::<fusor_tile_ir::F16, 2>(Shape::new([shape.batch * shape.k, shape.n]));
+        let y = program
+            .storage_write::<fusor_tile_ir::F16, 2>(Shape::new([shape.batch * shape.m, shape.n]));
+        batched_matmul_f16_accum_f32_with_epilogues::<32, 32, 8>(
+            program,
+            &a,
+            &b,
+            &y,
+            shape,
+            &DenseMatmulEpilogues::empty(),
+        );
+    });
+    lower_or_fail(&ir, "batched dense f16 matmul");
+}
+
+#[test]
+fn cooperative_dense_f32_matmul_lowers() {
+    let ir = tile::build(|program| {
+        let shape = DenseMatmulShape {
+            batch: 2,
+            m: 64,
+            k: 256,
+            n: 64,
+        };
+        let a = program.storage_read::<F32, 2>(Shape::new([shape.batch * shape.m, shape.k]));
+        let b = program.storage_read::<F32, 2>(Shape::new([shape.batch * shape.k, shape.n]));
+        let y = program.storage_write::<F32, 2>(Shape::new([shape.batch * shape.m, shape.n]));
+        assert!(try_batched_coop_matmul_f32::<64, 64, 32>(
+            program,
+            &a,
+            &b,
+            &y,
+            shape,
+            &DenseMatmulEpilogues::empty(),
+        ));
+    });
+    lower_or_fail(&ir, "cooperative dense f32 matmul");
 }
 
 #[test]

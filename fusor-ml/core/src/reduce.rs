@@ -1,4 +1,4 @@
-use std::hash::Hash;
+use std::{any::TypeId, hash::Hash};
 
 use rustc_hash::FxHasher;
 
@@ -67,6 +67,7 @@ impl ReduceOperation {
 
 impl Operation for ReduceOperation {
     fn hash_kernel_signature(&self, state: &mut FxHasher) {
+        TypeId::of::<Self>().hash(state);
         self.pre_element_wise.hash(state);
         self.function.hash(state);
         self.post_element_wise.hash(state);
