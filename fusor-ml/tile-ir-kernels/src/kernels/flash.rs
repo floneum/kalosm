@@ -1,5 +1,5 @@
 use fusor_tile_ir::{
-    tile::{self, range, Mask, Tile, TileBlock},
+    tile::{self, range, Mask, Tile, TileBlock, Workgroup},
     ElementType, Numeric, TileLiteral, WorkgroupAxis, F32, U32,
 };
 
@@ -125,10 +125,10 @@ pub fn flash_attention<E: Numeric, B>(
                             );
                             let q_value = program
                                 .load(q.at(q_index), Mask::all(), elem_fill)
-                                .cast(ElementType::F32);
+                                .cast::<F32>();
                             let k_value = program
                                 .load(k.at(k_index), Mask::all(), elem_fill)
-                                .cast(ElementType::F32);
+                                .cast::<F32>();
                             products.push(q_value * k_value);
                         }
                         let mut score = program.sum(products)
@@ -143,7 +143,7 @@ pub fn flash_attention<E: Numeric, B>(
                             );
                             let mask_value = program
                                 .load(mask.at(mask_index), Mask::all(), elem_fill)
-                                .cast(ElementType::F32);
+                                .cast::<F32>();
                             score = score + mask_value;
                         }
                         program.store_local(&score_local, score);
@@ -176,7 +176,7 @@ pub fn flash_attention<E: Numeric, B>(
                         );
                         let v_value = program
                             .load(v.at(v_index), Mask::all(), elem_fill)
-                            .cast(ElementType::F32);
+                            .cast::<F32>();
                         program.store_local(&weighted_local, exp_score.clone() * v_value);
                     });
                     let weighted = program.load_local(&weighted_local);
@@ -199,7 +199,7 @@ pub fn flash_attention<E: Numeric, B>(
             // Evaluate `final_m` once so the loop fires even though we don't
             // need its value in the post-loop stage.
             program.if_then(store_valid, |program| {
-                let output_value = (final_o_bound.clone() / final_s_bound.clone()).cast(E::ELEMENT);
+                let output_value = (final_o_bound.clone() / final_s_bound.clone()).cast::<E>();
                 let output_index = index_n(
                     meta.output_meta.offset,
                     output_strides,
@@ -221,10 +221,10 @@ struct DecodeScoreForKv<'a> {
     q: &'a tile::Storage<F32, 1>,
     k: &'a tile::Storage<F32, 1>,
     meta: FlashDecodeSmallMeta,
-    batch_idx: Tile,
-    head_idx: Tile,
-    kv_head_idx: Tile,
-    kv: Tile,
+    batch_idx: Tile<U32>,
+    head_idx: Tile<U32>,
+    kv_head_idx: Tile<U32>,
+    kv: Tile<U32>,
     score_acc: &'a tile::Local<F32>,
     dim_local: &'a tile::Local<U32>,
 }
@@ -276,13 +276,13 @@ fn decode_score_for_kv(program: &mut TileBlock<'_>, request: DecodeScoreForKv<'_
 struct DecodeOutputLoop<'a> {
     v: &'a tile::Storage<F32, 1>,
     output: &'a tile::Storage<F32, 1>,
-    probs: fusor_tile_ir::TileRef,
+    probs: Workgroup<F32>,
     meta: FlashDecodeSmallMeta,
-    batch_idx: Tile,
-    head_idx: Tile,
-    kv_head_idx: Tile,
-    out_dim: Tile,
-    active_kv_len: Tile,
+    batch_idx: Tile<U32>,
+    head_idx: Tile<U32>,
+    kv_head_idx: Tile<U32>,
+    out_dim: Tile<U32>,
+    active_kv_len: Tile<U32>,
     acc: &'a tile::Local<F32>,
     kv_local: &'a tile::Local<U32>,
 }

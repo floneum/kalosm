@@ -35,4 +35,4 @@ pub use grid::build;
 pub use program::Program;
 pub use quantized::QuantizedDot;
 pub use storage::{RuntimeElement, Storage, StorageIndex};
-pub use value::{range, Address, CoopAcc, CoopFragment, FoldIter, Local, Mask, Tile};
+pub use value::{range, Address, CoopAcc, CoopFragment, FoldIter, Local, Mask, Tile, Workgroup};

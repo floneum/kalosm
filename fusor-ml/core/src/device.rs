@@ -206,10 +206,10 @@ struct DeviceInner {
         RwLock<LruCache<(PipelineLayout, ShaderModule), wgpu::ComputePipeline, FxBuildHasher>>,
     direct_dynamic_bind_group_cache:
         RwLock<LruCache<DirectDynamicBindGroupKey, wgpu::BindGroup, FxBuildHasher>>,
-    direct_storage3_bind_group_cache:
+    direct_three_buffer_bind_group_cache:
         RwLock<LruCache<DirectStorage3BindGroupKey, wgpu::BindGroup, FxBuildHasher>>,
-    direct_storage3_bind_group_layout: OnceLock<BindGroupLayout>,
-    direct_storage3_pipeline_layout: OnceLock<PipelineLayout>,
+    direct_three_buffer_bind_group_layout: OnceLock<BindGroupLayout>,
+    direct_three_buffer_pipeline_layout: OnceLock<PipelineLayout>,
     // Cache for buffer allocations, keyed by size in bytes
     buffer_allocation_cache:
         RwLock<LruCache<(u64, BufferUsages), Vec<CachedBuffer>, FxBuildHasher>>,
@@ -359,7 +359,7 @@ impl Device {
             NonZeroUsize::new(DIRECT_DYNAMIC_BIND_GROUP_CACHE_SIZE).unwrap(),
             Default::default(),
         ));
-        let direct_storage3_bind_group_cache = RwLock::new(LruCache::with_hasher(
+        let direct_three_buffer_bind_group_cache = RwLock::new(LruCache::with_hasher(
             NonZeroUsize::new(DIRECT_STORAGE3_BIND_GROUP_CACHE_SIZE).unwrap(),
             Default::default(),
         ));
@@ -381,9 +381,9 @@ impl Device {
             shader_module_cache,
             compute_pipeline_cache,
             direct_dynamic_bind_group_cache,
-            direct_storage3_bind_group_cache,
-            direct_storage3_bind_group_layout: OnceLock::new(),
-            direct_storage3_pipeline_layout: OnceLock::new(),
+            direct_three_buffer_bind_group_cache,
+            direct_three_buffer_bind_group_layout: OnceLock::new(),
+            direct_three_buffer_pipeline_layout: OnceLock::new(),
             buffer_allocation_cache,
             initialized_buffers_dirty: AtomicBool::new(false),
             initialized_buffer_keys,
@@ -510,9 +510,9 @@ impl Device {
         &self.inner.pipeline_layout_cache
     }
 
-    pub(crate) fn direct_storage3_bind_group_layout(&self) -> BindGroupLayout {
+    pub(crate) fn direct_three_buffer_bind_group_layout(&self) -> BindGroupLayout {
         self.inner
-            .direct_storage3_bind_group_layout
+            .direct_three_buffer_bind_group_layout
             .get_or_init(|| {
                 self.wgpu_device()
                     .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -554,10 +554,10 @@ impl Device {
             .clone()
     }
 
-    pub(crate) fn direct_storage3_bind_group_cache(
+    pub(crate) fn direct_three_buffer_bind_group_cache(
         &self,
     ) -> &RwLock<LruCache<DirectStorage3BindGroupKey, wgpu::BindGroup, FxBuildHasher>> {
-        &self.inner.direct_storage3_bind_group_cache
+        &self.inner.direct_three_buffer_bind_group_cache
     }
 
     pub(crate) fn direct_dynamic_bind_group_cache(
@@ -566,11 +566,11 @@ impl Device {
         &self.inner.direct_dynamic_bind_group_cache
     }
 
-    pub(crate) fn direct_storage3_pipeline_layout(&self) -> PipelineLayout {
+    pub(crate) fn direct_three_buffer_pipeline_layout(&self) -> PipelineLayout {
         self.inner
-            .direct_storage3_pipeline_layout
+            .direct_three_buffer_pipeline_layout
             .get_or_init(|| {
-                let bind_group_layout = self.direct_storage3_bind_group_layout();
+                let bind_group_layout = self.direct_three_buffer_bind_group_layout();
                 self.wgpu_device()
                     .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
                         label: Some("direct storage3 pipeline layout"),

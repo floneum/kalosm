@@ -2,7 +2,7 @@
 
 use fusor_tile_ir::tile::{Mask, Program, QuantizedDot, Storage, Tile, TileBlock};
 use fusor_tile_ir::{
-    GgmlQuantFormat, QuantizedMatrix, TileLiteral, TileReduceOp, WorkgroupAxis, F32,
+    GgmlQuantFormat, QuantizedMatrix, TileLiteral, TileReduceOp, WorkgroupAxis, F32, U32,
 };
 
 use crate::grid::{q4k_ggml_iteration, q4k_lane_decomposition, Q4KGgmlIterationRequest};
@@ -134,7 +134,7 @@ fn qgemv_q4k_paired_ggml(program: &mut Program, spec: Q4KPairedGgml<'_>) {
 
         let zero = TileLiteral::f32(0.0);
         let sums: [Tile; PAIRED_DOTS_PER_SUBGROUP] = program
-            .loop_fold_n::<PAIRED_DOTS_PER_SUBGROUP, _>(
+            .loop_fold_n::<PAIRED_DOTS_PER_SUBGROUP, _, _>(
                 TileReduceOp::Sum,
                 block_iterations,
                 [zero; PAIRED_DOTS_PER_SUBGROUP],
@@ -152,7 +152,7 @@ fn qgemv_q4k_paired_ggml(program: &mut Program, spec: Q4KPairedGgml<'_>) {
                         },
                     );
 
-                    let dot = |program: &mut TileBlock<'_>, col: Tile, mask: Mask| {
+                    let dot = |program: &mut TileBlock<'_>, col: Tile<U32>, mask: Mask| {
                         program.quantized_dot(QuantizedDot::q4k_block(
                             pass.activations.low.clone(),
                             pass.activations.high.clone(),

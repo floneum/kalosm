@@ -1,40 +1,33 @@
 //! Quantized matrix multiply program kernels.
 
-use fusor_tile_ir::tile::{CoopAcc, CoopFragment, CoopRole, Program, Storage, Tile, TileBlock};
-use fusor_tile_ir::{QuantizedMatrix, TileLiteral, TileReduceOp, TileRef, WorkgroupAxis, F32};
+use fusor_tile_ir::tile::{Program, Storage};
+use fusor_tile_ir::{QuantizedMatrix, TileLiteral, TileReduceOp, WorkgroupAxis, F32};
 
-use crate::types::{apply_optional_epilogue, cooperative_store_layout_supported, matrix_shape};
+use crate::{
+    kernels::helpers::{
+        coop_load_a_fragments, coop_load_b_fragments, coop_mma_grid, coop_store_acc_grid,
+        zero_coop_acc_grid,
+    },
+    types::{apply_optional_epilogue, cooperative_store_layout_supported, matrix_shape},
+};
 
-/// Top-level quantized matrix multiply.
-///
-/// Picks the qgemv path when `m == 1`, otherwise the scalar/cooperative tiled
-/// qmatmul body.
+/// Top-level quantized matrix multiply with optional activation/output
+/// epilogues. Single-row inputs keep using qgemv; multi-row inputs use the
+/// generalized qmatmul body. Callers with no epilogue pass
+/// `&QmatmulEpilogues::empty()`.
 ///
 /// ```
 /// use fusor_tile_ir::{tile, GgmlQuantFormat, Shape, F32};
-/// use fusor_tile_ir_kernels::{qmatmul, quantized_matrix};
+/// use fusor_tile_ir_kernels::{qmatmul_with_epilogue, quantized_matrix, QmatmulEpilogues};
 ///
 /// let ir = tile::build(|program| {
 ///     let a = program.storage_read::<F32, 2>(Shape::new([8, 256]));
 ///     let b = quantized_matrix(program, GgmlQuantFormat::Q8_0, 256, 16);
 ///     let y = program.storage_write::<F32, 2>(Shape::new([8, 16]));
-///     qmatmul::<8, 4, 8>(program, &a, &b, &y, 4);
+///     qmatmul_with_epilogue::<8, 4, 8>(program, &a, &b, &y, 4, &QmatmulEpilogues::empty());
 /// });
 /// # let _ = ir;
 /// ```
-pub fn qmatmul<const BM: usize, const BN: usize, const BK: usize>(
-    program: &mut Program,
-    a: &Storage<F32, 2>,
-    b: &QuantizedMatrix,
-    y: &Storage<F32, 2>,
-    vector_width: u32,
-) {
-    qmatmul_options::<BM, BN, BK>(program, a, b, y, vector_width, true, 1);
-}
-
-/// Top-level quantized matrix multiply with optional activation/output
-/// epilogues. Single-row inputs keep using qgemv; multi-row inputs use the
-/// generalized qmatmul body.
 pub fn qmatmul_with_epilogue<const BM: usize, const BN: usize, const BK: usize>(
     program: &mut Program,
     a: &Storage<F32, 2>,
@@ -43,77 +36,27 @@ pub fn qmatmul_with_epilogue<const BM: usize, const BN: usize, const BK: usize>(
     vector_width: u32,
     epilogues: &crate::types::QmatmulEpilogues<'_>,
 ) {
-    qmatmul_options_with_epilogue::<BM, BN, BK>(program, a, b, y, vector_width, true, 1, epilogues);
-}
-
-pub(crate) fn qmatmul_options<const BM: usize, const BN: usize, const BK: usize>(
-    program: &mut Program,
-    a: &Storage<F32, 2>,
-    b: &QuantizedMatrix,
-    y: &Storage<F32, 2>,
-    vector_width: u32,
-    use_qgemv: bool,
-    workgroups_x: u32,
-) {
-    qmatmul_options_with_epilogue::<BM, BN, BK>(
-        program,
-        a,
-        b,
-        y,
-        vector_width,
-        use_qgemv,
-        workgroups_x,
-        &crate::types::QmatmulEpilogues::empty(),
-    );
-}
-
-pub(crate) fn qmatmul_options_with_epilogue<const BM: usize, const BN: usize, const BK: usize>(
-    program: &mut Program,
-    a: &Storage<F32, 2>,
-    b: &QuantizedMatrix,
-    y: &Storage<F32, 2>,
-    vector_width: u32,
-    use_qgemv: bool,
-    workgroups_x: u32,
-    epilogues: &crate::types::QmatmulEpilogues<'_>,
-) {
     assert!(
         BM > 0 && BN > 0 && BK > 0,
         "qmatmul tile shape must be non-zero"
     );
     assert!(vector_width > 0, "qmatmul vector width must be non-zero");
-    assert!(workgroups_x > 0, "qmatmul workgroups_x must be non-zero");
     let [m, k] = matrix_shape(&a.view().layout);
     let [y_m, y_n] = matrix_shape(&y.view().layout);
     assert_eq!(k, b.rows, "qmatmul K dimensions must match");
     assert_eq!(m, y_m, "qmatmul output row count must match A");
     assert_eq!(b.cols, y_n, "qmatmul output column count must match B");
 
-    if m == 1 && use_qgemv {
-        super::qgemv::qgemv_with_epilogue::<BN, BK>(program, a, b, y, workgroups_x, epilogues);
+    if m == 1 {
+        super::qgemv::qgemv_with_epilogue::<BN, BK>(program, a, b, y, 1, epilogues);
     } else {
         qmatmul_tile_with_epilogue::<BM, BN, BK>(program, a, b, y, epilogues);
     }
 }
 
-/// Scalar lane-mapped qmatmul body. Public so downstream crates can reproduce
-/// or replace the variant-selection layer above (`qmatmul_options` /
-/// `qmatmul`).
-pub(crate) fn qmatmul_tile<const BM: usize, const BN: usize, const BK: usize>(
-    program: &mut Program,
-    a: &Storage<F32, 2>,
-    b: &QuantizedMatrix,
-    y: &Storage<F32, 2>,
-) {
-    qmatmul_tile_with_epilogue::<BM, BN, BK>(
-        program,
-        a,
-        b,
-        y,
-        &crate::types::QmatmulEpilogues::empty(),
-    );
-}
-
+/// Scalar lane-mapped qmatmul body with optional pre/post epilogues. Public
+/// so downstream crates can reproduce or replace the variant-selection layer
+/// above (`qmatmul_options_with_epilogue` / `qmatmul_with_epilogue`).
 pub(crate) fn qmatmul_tile_with_epilogue<const BM: usize, const BN: usize, const BK: usize>(
     program: &mut Program,
     a: &Storage<F32, 2>,
@@ -136,7 +79,7 @@ pub(crate) fn qmatmul_tile_with_epilogue<const BM: usize, const BN: usize, const
     }
 
     if BM * BN * BK != LANES || !BK.is_power_of_two() {
-        qmatmul_tile::<8, 4, 8>(program, a, b, y);
+        qmatmul_tile_with_epilogue::<8, 4, 8>(program, a, b, y, epilogues);
         return;
     }
     let k_iterations = k.div_ceil(BK as u32);
@@ -166,7 +109,7 @@ pub(crate) fn qmatmul_tile_with_epilogue<const BM: usize, const BN: usize, const
                 },
             );
             let sum =
-                apply_optional_epilogue(epilogues.post, program.group_reduce_sum::<BK>(partial));
+                apply_optional_epilogue(epilogues.post, program.group_reduce_sum::<BK, _>(partial));
             let store_mask = k_lane.eq(0).and(row.lt(m)).and(col.lt(b.cols));
             program.store(y.at((row, col)), sum, store_mask);
         },
@@ -199,92 +142,6 @@ pub(crate) fn qmatmul_try_coop<const BM: usize, const BN: usize, const BK: usize
         _ => return false,
     }
     true
-}
-
-fn zero_coop_acc_grid(
-    program: &mut TileBlock<'_>,
-    rows: u32,
-    cols: u32,
-) -> Vec<Vec<CoopAcc<F32, 8, 8>>> {
-    (0..rows)
-        .map(|_| {
-            (0..cols)
-                .map(|_| {
-                    let acc = program.alloc_coop_acc::<F32, 8, 8>();
-                    program.zero_coop_acc(&acc);
-                    acc
-                })
-                .collect()
-        })
-        .collect()
-}
-
-fn coop_load_a_fragments(
-    program: &mut TileBlock<'_>,
-    tile: TileRef,
-    sg_row_base: &Tile,
-    kk: u32,
-    rows: u32,
-) -> Vec<CoopFragment<F32, 8, 8>> {
-    const COOP_DIM: u32 = 8;
-    (0..rows)
-        .map(|r| {
-            program.coop_load::<F32, 8, 8>(
-                CoopRole::A,
-                program.coop_tile_load(tile, sg_row_base.clone() + r * COOP_DIM, kk * COOP_DIM),
-            )
-        })
-        .collect()
-}
-
-fn coop_load_b_fragments(
-    program: &mut TileBlock<'_>,
-    tile: TileRef,
-    sg_col_base: &Tile,
-    kk: u32,
-    cols: u32,
-) -> Vec<CoopFragment<F32, 8, 8>> {
-    const COOP_DIM: u32 = 8;
-    (0..cols)
-        .map(|c| {
-            program.coop_load::<F32, 8, 8>(
-                CoopRole::B,
-                program.coop_tile_load(tile, kk * COOP_DIM, sg_col_base.clone() + c * COOP_DIM),
-            )
-        })
-        .collect()
-}
-
-fn coop_mma_grid(
-    program: &mut TileBlock<'_>,
-    accs: &[Vec<CoopAcc<F32, 8, 8>>],
-    a_frags: &[CoopFragment<F32, 8, 8>],
-    b_frags: &[CoopFragment<F32, 8, 8>],
-) {
-    for (r, a) in a_frags.iter().enumerate() {
-        for (c, b) in b_frags.iter().enumerate() {
-            program.coop_mma(&accs[r][c], a, b);
-        }
-    }
-}
-
-fn coop_store_acc_grid(
-    program: &mut TileBlock<'_>,
-    accs: &[Vec<CoopAcc<F32, 8, 8>>],
-    y: &Storage<F32, 2>,
-    row_base: &Tile,
-    col_base: &Tile,
-    sg_row_base: &Tile,
-    sg_col_base: &Tile,
-) {
-    const COOP_DIM: u32 = 8;
-    for (r, row_accs) in accs.iter().enumerate() {
-        for (c, acc) in row_accs.iter().enumerate() {
-            let row = row_base.clone() + sg_row_base.clone() + r as u32 * COOP_DIM;
-            let col = col_base.clone() + sg_col_base.clone() + c as u32 * COOP_DIM;
-            program.coop_store(acc, y, row, col);
-        }
-    }
 }
 
 /// Cooperative-matrix qmatmul body. Each workgroup produces one BMxBN output
@@ -359,6 +216,7 @@ pub(crate) fn qmatmul_perf<
             program,
             &accs,
             y_clone,
+            None,
             &row_base,
             &col_base,
             &sg_row_base,

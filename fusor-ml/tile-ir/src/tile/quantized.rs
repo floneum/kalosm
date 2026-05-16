@@ -1,7 +1,7 @@
 use super::block::{f32_fill, tiles_to_exprs};
 use super::value::boxed_index;
 use super::*;
-use crate::ir::{DotK, Expr, PackedActivations};
+use crate::ir::{DotK, Expr, PackedActivations, F32, U32};
 use crate::quantized::QuantizedMatrix;
 
 /// Format-neutral quantized dot expression.
@@ -60,11 +60,11 @@ pub struct QuantizedDot {
 
 impl QuantizedDot {
     fn base_dot<const N: usize>(
-        a: [Tile; N],
+        a: [Tile<F32>; N],
         activations: impl FnOnce(Vec<Expr>) -> PackedActivations,
         matrix: &QuantizedMatrix,
-        k_base: impl Into<Tile>,
-        col: impl Into<Tile>,
+        k_base: impl Into<Tile<U32>>,
+        col: impl Into<Tile<U32>>,
         mask: impl Into<Mask>,
         fill: f32,
     ) -> Self {
@@ -73,7 +73,7 @@ impl QuantizedDot {
             activations: activations(tiles_to_exprs(a)),
             k: DotK::Base(boxed_index(k_base)),
             col: boxed_index(col),
-            mask: mask.into().expr,
+            mask: Box::new(mask.into().expr),
             fill: f32_fill(fill),
             block_n: N as u32,
         }
@@ -83,10 +83,10 @@ impl QuantizedDot {
     ///
     /// `N` must be 8, 16, or 32.
     pub fn f32_activations<const N: usize>(
-        a: [Tile; N],
+        a: [Tile<F32>; N],
         matrix: &QuantizedMatrix,
-        k_base: impl Into<Tile>,
-        col: impl Into<Tile>,
+        k_base: impl Into<Tile<U32>>,
+        col: impl Into<Tile<U32>>,
         mask: impl Into<Mask>,
         fill: f32,
     ) -> Self {
@@ -101,10 +101,10 @@ impl QuantizedDot {
     ///
     /// `N` must be 8 or 16.
     pub fn q8_activations<const N: usize>(
-        a: [Tile; N],
+        a: [Tile<F32>; N],
         matrix: &QuantizedMatrix,
-        k_base: impl Into<Tile>,
-        col: impl Into<Tile>,
+        k_base: impl Into<Tile<U32>>,
+        col: impl Into<Tile<U32>>,
         mask: impl Into<Mask>,
         fill: f32,
     ) -> Self {
@@ -117,14 +117,14 @@ impl QuantizedDot {
 
     /// Build a block-coordinate Q4K dot from prepacked activation terms.
     pub fn q4k_block(
-        low: [Tile; 16],
-        high: [Tile; 16],
-        sums: [Tile; 4],
+        low: [Tile<F32>; 16],
+        high: [Tile<F32>; 16],
+        sums: [Tile<F32>; 4],
         matrix: &QuantizedMatrix,
-        block: impl Into<Tile>,
-        c0: impl Into<Tile>,
-        c1: impl Into<Tile>,
-        col: impl Into<Tile>,
+        block: impl Into<Tile<U32>>,
+        c0: impl Into<Tile<U32>>,
+        c1: impl Into<Tile<U32>>,
+        col: impl Into<Tile<U32>>,
         mask: impl Into<Mask>,
         fill: f32,
     ) -> Self {
@@ -141,7 +141,7 @@ impl QuantizedDot {
                 c1: boxed_index(c1),
             },
             col: boxed_index(col),
-            mask: mask.into().expr,
+            mask: Box::new(mask.into().expr),
             fill: f32_fill(fill),
             block_n: 32,
         }
@@ -149,12 +149,12 @@ impl QuantizedDot {
 
     /// Build a block-coordinate Q6K dot.
     pub fn q6k_block(
-        a: [Tile; 16],
+        a: [Tile<F32>; 16],
         matrix: &QuantizedMatrix,
-        block: impl Into<Tile>,
-        c0: impl Into<Tile>,
-        c1: impl Into<Tile>,
-        col: impl Into<Tile>,
+        block: impl Into<Tile<U32>>,
+        c0: impl Into<Tile<U32>>,
+        c1: impl Into<Tile<U32>>,
+        col: impl Into<Tile<U32>>,
         mask: impl Into<Mask>,
         fill: f32,
     ) -> Self {
@@ -167,7 +167,7 @@ impl QuantizedDot {
                 c1: boxed_index(c1),
             },
             col: boxed_index(col),
-            mask: mask.into().expr,
+            mask: Box::new(mask.into().expr),
             fill: f32_fill(fill),
             block_n: 16,
         }
@@ -176,17 +176,15 @@ impl QuantizedDot {
 
 impl TileBlock<'_> {
     /// Emit a quantized dot tile expression.
-    pub fn quantized_dot(&self, dot: QuantizedDot) -> Tile {
-        Tile {
-            expr: Expr::QuantizedDot {
-                src: dot.src,
-                activations: dot.activations,
-                k: dot.k,
-                col: dot.col,
-                mask: dot.mask,
-                fill: dot.fill,
-                block_n: dot.block_n,
-            },
-        }
+    pub fn quantized_dot(&self, dot: QuantizedDot) -> Tile<F32> {
+        Tile::from_expr(Expr::QuantizedDot {
+            src: dot.src,
+            activations: dot.activations,
+            k: dot.k,
+            col: dot.col,
+            mask: dot.mask,
+            fill: dot.fill,
+            block_n: dot.block_n,
+        })
     }
 }

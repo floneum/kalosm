@@ -303,7 +303,12 @@ pub(crate) fn run_direct_kernel(
     }
 }
 
-pub(crate) fn storage3_kernel_with_prepared_pipeline(
+/// Hot-path specialization for direct kernels that bind exactly 3 storage
+/// buffers (input + weight + output). The dedicated bind-group and pipeline
+/// layouts on [`Device`] let this path skip per-dispatch layout creation. The
+/// only current caller is quantized matmul; generalize to N buffers when a
+/// second caller appears.
+pub(crate) fn three_buffer_kernel_with_prepared_pipeline(
     name: impl Into<String>,
     cache_key: KernelCacheKey,
     pipeline: wgpu::ComputePipeline,
@@ -323,13 +328,13 @@ pub(crate) fn storage3_kernel_with_prepared_pipeline(
     )
 }
 
-pub(crate) fn prepare_storage3_pipeline(
+pub(crate) fn prepare_three_buffer_pipeline(
     device: &Device,
     name: &str,
     module: &CompiledKernelModule,
 ) -> wgpu::ComputePipeline {
     let shader = device.create_naga_shader_module(module.module.as_ref().clone());
-    let pipeline_layout = device.direct_storage3_pipeline_layout();
+    let pipeline_layout = device.direct_three_buffer_pipeline_layout();
     device
         .wgpu_device()
         .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
@@ -345,17 +350,17 @@ pub(crate) fn prepare_storage3_pipeline(
         })
 }
 
-pub(crate) fn storage3_pipeline_from_ir(
+pub(crate) fn three_buffer_pipeline_from_ir(
     device: &Device,
     name: &str,
     cache_key: KernelCacheKey,
     build_ir: impl FnOnce() -> Option<tile_ir::KernelIr>,
 ) -> Option<wgpu::ComputePipeline> {
     let module = cached_kernel_ir(device, cache_key, build_ir)?;
-    Some(prepare_storage3_pipeline(device, name, &module))
+    Some(prepare_three_buffer_pipeline(device, name, &module))
 }
 
-pub(crate) fn storage3_pipeline_from_cached_module(
+pub(crate) fn three_buffer_pipeline_from_cached_module(
     device: &Device,
     name: &str,
     cache_key: KernelCacheKey,
@@ -367,5 +372,5 @@ pub(crate) fn storage3_pipeline_from_cached_module(
         .map(|module| CompiledKernelModule {
             module: Arc::new(module.clone()),
         })?;
-    Some(prepare_storage3_pipeline(device, name, &module))
+    Some(prepare_three_buffer_pipeline(device, name, &module))
 }

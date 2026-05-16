@@ -116,7 +116,7 @@ fn fuzz_gemm_case(
     let a_physical = pack_f32_matrix(&a, m, k, &a_layout);
     let b_physical = pack_f32_matrix(&b, k, n, &b_layout);
     let expected = cpu_matmul(&a, &b, m, k, n);
-    let ir = gemm_ir(&a_layout, &b_layout, &y_layout);
+    let ir = gemm_ir(m, k, n, &a_layout, &b_layout, &y_layout);
     let actual_physical = run_three_buffer_kernel(
         device,
         queue,
@@ -391,36 +391,48 @@ fn fuzz_qgemv_split_workgroups_case(
     })
 }
 
-fn gemm_ir(a_layout: &Layout, b_layout: &Layout, y_layout: &Layout) -> KernelIr {
+fn gemm_ir(
+    m: usize,
+    k: usize,
+    n: usize,
+    a_layout: &Layout,
+    b_layout: &Layout,
+    y_layout: &Layout,
+) -> KernelIr {
     let a_layout = a_layout.clone();
     let b_layout = b_layout.clone();
     let y_layout = y_layout.clone();
+    let shape = tile_ir_kernels::DenseMatmulShape {
+        batch: 1,
+        m: m as u32,
+        k: k as u32,
+        n: n as u32,
+    };
     tile::build(move |phase| {
         let a = phase.storage_read_with_layout::<F32, 2>(a_layout);
         let b = phase.storage_read_with_layout::<F32, 2>(b_layout);
         let y = phase.storage_write_with_layout::<F32, 2>(y_layout);
-        tile_ir_kernels::matmul::<256>(phase, &a, &b, &y);
+        tile_ir_kernels::batched_matmul_with_epilogues::<F32, 32, 32, 256>(
+            phase,
+            &a,
+            &b,
+            &y,
+            shape,
+            &tile_ir_kernels::DenseMatmulEpilogues::empty(),
+        );
     })
 }
 
 fn gemv_ir(
-    _m: usize,
-    _k: usize,
+    m: usize,
+    k: usize,
     _rows_per_workgroup: usize,
     _vector_width: usize,
     a_layout: &Layout,
     x_layout: &Layout,
     y_layout: &Layout,
 ) -> KernelIr {
-    let a_layout = a_layout.clone();
-    let x_layout = x_layout.clone();
-    let y_layout = y_layout.clone();
-    tile::build(move |phase| {
-        let a = phase.storage_read_with_layout::<F32, 2>(a_layout);
-        let x = phase.storage_read_with_layout::<F32, 2>(x_layout);
-        let y = phase.storage_write_with_layout::<F32, 2>(y_layout);
-        tile_ir_kernels::matmul::<256>(phase, &a, &x, &y);
-    })
+    gemm_ir(m, k, 1, a_layout, x_layout, y_layout)
 }
 
 fn qmatmul_ir(
@@ -439,11 +451,32 @@ fn qmatmul_ir(
         let b = tile_ir_kernels::quantized_matrix(phase, format, k as u32, n as u32);
         let y = phase.storage_write_with_layout::<F32, 2>(y_layout);
         if force_gemm {
-            tile_ir_kernels::qmatmul::<8, 4, 8>(phase, &a, &b, &y, 4);
+            tile_ir_kernels::qmatmul_with_epilogue::<8, 4, 8>(
+                phase,
+                &a,
+                &b,
+                &y,
+                4,
+                &tile_ir_kernels::QmatmulEpilogues::empty(),
+            );
         } else if m == 1 {
-            tile_ir_kernels::qgemv::<4, 64>(phase, &a, &b, &y, 4, 1);
+            tile_ir_kernels::qgemv_with_epilogue::<4, 64>(
+                phase,
+                &a,
+                &b,
+                &y,
+                1,
+                Option::<&tile_ir_kernels::UnaryEpilogue>::None,
+            );
         } else {
-            tile_ir_kernels::qmatmul::<8, 4, 8>(phase, &a, &b, &y, 4);
+            tile_ir_kernels::qmatmul_with_epilogue::<8, 4, 8>(
+                phase,
+                &a,
+                &b,
+                &y,
+                4,
+                &tile_ir_kernels::QmatmulEpilogues::empty(),
+            );
         }
     })
 }
@@ -463,7 +496,14 @@ fn qmatmul_split_workgroups_ir(
         let a = phase.storage_read_with_layout::<F32, 2>(a_layout);
         let b = tile_ir_kernels::quantized_matrix(phase, format, k as u32, n as u32);
         let y = phase.storage_write_with_layout::<F32, 2>(y_layout);
-        tile_ir_kernels::qgemv::<4, 64>(phase, &a, &b, &y, 4, workgroups_x);
+        tile_ir_kernels::qgemv_with_epilogue::<4, 64>(
+            phase,
+            &a,
+            &b,
+            &y,
+            workgroups_x,
+            Option::<&tile_ir_kernels::UnaryEpilogue>::None,
+        );
     })
 }
 
@@ -500,7 +540,14 @@ fn qmatmul_im2col_nhwc_ir(spec: Im2colQmatmulIr<'_>) -> KernelIr {
         );
         let b = tile_ir_kernels::quantized_matrix(phase, format, k as u32, n as u32);
         let y = phase.storage_write_with_layout::<F32, 2>(y_layout);
-        tile_ir_kernels::qmatmul::<8, 4, 8>(phase, &a, &b, &y, 4);
+        tile_ir_kernels::qmatmul_with_epilogue::<8, 4, 8>(
+                phase,
+                &a,
+                &b,
+                &y,
+                4,
+                &tile_ir_kernels::QmatmulEpilogues::empty(),
+            );
     })
 }
 

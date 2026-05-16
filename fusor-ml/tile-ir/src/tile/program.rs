@@ -237,7 +237,7 @@ impl Program {
     }
 
     /// Allocate a rank-2 workgroup-scope tile of shape `[rows, cols]`.
-    pub fn alloc_workgroup_tile<T: Numeric>(&mut self, rows: u32, cols: u32) -> TileRef {
+    pub fn alloc_workgroup_tile<T: Numeric>(&mut self, rows: u32, cols: u32) -> Workgroup<T> {
         self.alloc_tile::<T>(Layout::contiguous(
             MemoryLevel::Workgroup,
             Shape::new([rows, cols]),
@@ -245,19 +245,19 @@ impl Program {
     }
 
     /// Allocate a workgroup-scope f32 tile of shape `[rows, cols]`.
-    pub fn alloc_workgroup_tile_f32(&mut self, rows: u32, cols: u32) -> TileRef {
+    pub fn alloc_workgroup_tile_f32(&mut self, rows: u32, cols: u32) -> Workgroup<F32> {
         self.alloc_workgroup_tile::<F32>(rows, cols)
     }
 
     /// Allocate a rank-1 workgroup-scope scratch array.
-    pub fn alloc_workgroup_array<T: Numeric>(&mut self, len: u32) -> TileRef {
+    pub fn alloc_workgroup_array<T: Numeric>(&mut self, len: u32) -> Workgroup<T> {
         self.alloc_tile::<T>(Layout::contiguous(
             MemoryLevel::Workgroup,
             Shape::new([len]),
         ))
     }
 
-    pub(super) fn alloc_tile<T: Numeric>(&mut self, layout: Layout) -> TileRef {
+    pub(super) fn alloc_tile<T: Numeric>(&mut self, layout: Layout) -> Workgroup<T> {
         let id = crate::ir::TileId(post_inc(&mut self.next_tile));
         let tile = TileRef::new(id, T::ELEMENT);
         self.ir.tiles.push(TileDecl {
@@ -265,7 +265,10 @@ impl Program {
             element: T::ELEMENT,
             layout,
         });
-        tile
+        Workgroup {
+            tile,
+            _ty: PhantomData,
+        }
     }
 }
 

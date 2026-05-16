@@ -3,7 +3,6 @@ use std::hash::Hash;
 use fusor_tile_ir_kernels as tile_ir_kernels;
 
 use crate::{
-    kernel_selection::{Axis, KernelDeviceCaps, KernelShape, ShapeRule, ShapeSelector, eq, range},
     mir::kernel_backend,
     sampling::{
         TOP_K_BLOCK, TOP_K_CHUNK,
@@ -13,133 +12,25 @@ use crate::{
 };
 use wgpu::CommandEncoder;
 
-const TOPK_A: Axis<0> = Axis;
-const TOPK_B: Axis<1> = Axis;
-const TOPK_C: Axis<2> = Axis;
-const TOPK_D: Axis<3> = Axis;
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum TopKChunkVariant {
-    Empty,
-    Kernel,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum TopKMergeVariant {
-    Empty,
-    Kernel,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum TopKExactnessVariant {
-    Ineligible,
-    Kernel,
-}
-
 struct ProveTopKExactKernelVariant;
 struct ChunkTopKPairsKernelVariant;
 struct MergeSortedChunkTopKPairsKernelVariant;
 
-fn topk_empty_caps() -> KernelDeviceCaps {
-    KernelDeviceCaps {
-        subgroups_supported: false,
-        cooperative_matrix_supported: false,
-        min_subgroup_size: 0,
-        max_subgroup_size: 0,
-        max_compute_invocations_per_workgroup: 0,
-        max_compute_workgroup_storage_size: 0,
-        max_compute_workgroup_size_x: 0,
-        max_compute_workgroups_per_dimension: 0,
-    }
+/// True when any dimension of the top-k working set is zero; in that case
+/// every top-k kernel short-circuits.
+fn top_k_dims_empty(dims: &[usize]) -> bool {
+    dims.iter().any(|&d| d == 0)
 }
 
-fn topk_nonempty_selector<Variant: Copy>(
-    empty: Variant,
-    kernel: Variant,
-) -> ShapeSelector<3, (), Variant> {
-    ShapeSelector::new()
-        .rule(empty, ShapeRule::new().axis(TOPK_A, eq(0)))
-        .rule(empty, ShapeRule::new().axis(TOPK_B, eq(0)))
-        .rule(empty, ShapeRule::new().axis(TOPK_C, eq(0)))
-        .rule(kernel, ShapeRule::new())
-}
-
-fn topk_chunk_selector() -> ShapeSelector<3, (), TopKChunkVariant> {
-    topk_nonempty_selector(TopKChunkVariant::Empty, TopKChunkVariant::Kernel)
-}
-
-fn select_topk_chunk_variant(
-    input_len: usize,
-    candidate_count: usize,
-    output_per_chunk: usize,
-) -> TopKChunkVariant {
-    topk_chunk_selector()
-        .select(
-            KernelShape::new([input_len, candidate_count, output_per_chunk]),
-            &(),
-            topk_empty_caps(),
-        )
-        .expect("top-k chunk selector has a catch-all rule")
-}
-
-fn topk_merge_selector() -> ShapeSelector<3, (), TopKMergeVariant> {
-    topk_nonempty_selector(TopKMergeVariant::Empty, TopKMergeVariant::Kernel)
-}
-
-fn select_topk_merge_variant(
-    chunks: usize,
-    chunk_len: usize,
-    output_len: usize,
-) -> TopKMergeVariant {
-    topk_merge_selector()
-        .select(
-            KernelShape::new([chunks, chunk_len, output_len]),
-            &(),
-            topk_empty_caps(),
-        )
-        .expect("top-k merge selector has a catch-all rule")
-}
-
-fn topk_exactness_selector() -> ShapeSelector<4, (), TopKExactnessVariant> {
-    ShapeSelector::new()
-        .rule(
-            TopKExactnessVariant::Ineligible,
-            ShapeRule::new().axis(TOPK_D, eq(0)),
-        )
-        .rule(
-            TopKExactnessVariant::Ineligible,
-            ShapeRule::new().when(|shape: KernelShape<4>, _ctx: &(), _caps| {
-                let top_values_len = shape[TOPK_A];
-                let candidate_count = shape[TOPK_B];
-                let output_per_chunk = shape[TOPK_C];
-                let top_k = shape[TOPK_D];
-                top_k == 0 || top_values_len < top_k || candidate_count >= output_per_chunk
-            }),
-        )
-        .rule(
-            TopKExactnessVariant::Kernel,
-            ShapeRule::new()
-                .axis(TOPK_A, range(1024..=8192))
-                .axis(TOPK_B, range(1..=64))
-                .axis(TOPK_C, range(65..=128))
-                .axis(TOPK_D, range(1..=512)),
-        )
-        .rule(TopKExactnessVariant::Kernel, ShapeRule::new())
-}
-
-fn select_topk_exactness_variant(
+/// True when the inputs to `top_k_exactness` can't be sharpened any further
+/// by running the exactness kernel (no candidates per output, or no top_k).
+fn top_k_exactness_ineligible(
     top_values_len: usize,
     candidate_count: usize,
     output_per_chunk: usize,
     top_k: usize,
-) -> TopKExactnessVariant {
-    topk_exactness_selector()
-        .select(
-            KernelShape::new([top_values_len, candidate_count, output_per_chunk, top_k]),
-            &(),
-            topk_empty_caps(),
-        )
-        .expect("top-k exactness selector has a catch-all rule")
+) -> bool {
+    top_k == 0 || top_values_len < top_k || candidate_count >= output_per_chunk
 }
 
 pub(crate) fn top_k_exactness_flag_data_with_encoder(
@@ -159,13 +50,12 @@ pub(crate) fn top_k_exactness_flag_data_with_encoder(
     {
         return None;
     }
-    if select_topk_exactness_variant(
+    if top_k_exactness_ineligible(
         top_values.layout().shape()[0],
         candidate_count,
         output_per_chunk,
         top_k,
-    ) == TopKExactnessVariant::Ineligible
-    {
+    ) {
         return None;
     }
 
@@ -269,9 +159,7 @@ fn chunk_top_k_pair_data_inner_with_encoder(
     let device = input.device();
     let ids = TensorData::new_for_shape(device, &[output_len], DataTypeEnum::U32);
     let values = TensorData::new_for_shape(device, &[output_len], DataTypeEnum::F32);
-    if select_topk_chunk_variant(input_len, candidate_count, output_per_chunk)
-        == TopKChunkVariant::Empty
-    {
+    if top_k_dims_empty(&[input_len, candidate_count, output_per_chunk]) {
         return Some((ids, values));
     }
 
@@ -356,7 +244,7 @@ pub(crate) fn merge_sorted_chunk_top_k_pair_data_with_encoder(
     let output_len = k.min(input_len);
     let ids = TensorData::new_for_shape(device, &[output_len], DataTypeEnum::U32);
     let values = TensorData::new_for_shape(device, &[output_len], DataTypeEnum::F32);
-    if select_topk_merge_variant(chunks, chunk_len, output_len) == TopKMergeVariant::Empty {
+    if top_k_dims_empty(&[chunks, chunk_len, output_len]) {
         return Some((ids, values));
     }
 
@@ -412,38 +300,24 @@ pub(crate) fn merge_sorted_chunk_top_k_pair_data_with_encoder(
 #[cfg(test)]
 mod selection_tests {
     use super::*;
-    use crate::kernel_selection::assert_selector_generates;
 
     #[test]
-    fn topk_chunk_selector_generates_each_variant() {
-        let selector = topk_chunk_selector();
-        assert_selector_generates(
-            &selector,
-            [TopKChunkVariant::Empty, TopKChunkVariant::Kernel]
-                .map(|variant| (variant, (), topk_empty_caps())),
-        );
+    fn empty_dims_short_circuit() {
+        assert!(top_k_dims_empty(&[0, 4, 4]));
+        assert!(top_k_dims_empty(&[4, 0, 4]));
+        assert!(top_k_dims_empty(&[4, 4, 0]));
+        assert!(!top_k_dims_empty(&[1, 1, 1]));
     }
 
     #[test]
-    fn topk_merge_selector_generates_each_variant() {
-        let selector = topk_merge_selector();
-        assert_selector_generates(
-            &selector,
-            [TopKMergeVariant::Empty, TopKMergeVariant::Kernel]
-                .map(|variant| (variant, (), topk_empty_caps())),
-        );
-    }
-
-    #[test]
-    fn topk_exactness_selector_generates_each_variant() {
-        let selector = topk_exactness_selector();
-        assert_selector_generates(
-            &selector,
-            [
-                TopKExactnessVariant::Ineligible,
-                TopKExactnessVariant::Kernel,
-            ]
-            .map(|variant| (variant, (), topk_empty_caps())),
-        );
+    fn exactness_ineligible_matches_old_selector() {
+        // top_k == 0 → ineligible.
+        assert!(top_k_exactness_ineligible(1024, 4, 64, 0));
+        // top_values_len < top_k → ineligible.
+        assert!(top_k_exactness_ineligible(100, 4, 64, 200));
+        // candidate_count >= output_per_chunk → ineligible.
+        assert!(top_k_exactness_ineligible(1024, 64, 64, 16));
+        // Sized values within the eligible window.
+        assert!(!top_k_exactness_ineligible(2048, 4, 128, 32));
     }
 }

@@ -1,7 +1,6 @@
 use fusor_tile_ir::{Layout, MemoryLevel, Shape};
 
 mod flash;
-mod gemv;
 mod helpers;
 mod matmul;
 mod mirostat;
@@ -15,18 +14,15 @@ mod top_k;
 mod types;
 
 pub use flash::{flash_attention, flash_decode_small};
-pub use gemv::gemv;
 pub use matmul::{
-    batched_matmul_f16_accum_f32_register_with_epilogues,
-    batched_matmul_f16_accum_f32_with_epilogues, batched_matmul_register_with_epilogues,
-    batched_matmul_with_epilogues, matmul, matmul_with_epilogues, try_batched_coop_matmul_f32,
-    DenseMatmulShape,
+    batched_gemv_with_epilogues, batched_matmul_register_with_epilogues,
+    batched_matmul_with_epilogues, try_batched_coop_matmul_f32, DenseMatmulShape,
 };
 pub use mirostat::{mirostat2, Mirostat2};
 pub use qdequantize::qdequantize;
-pub use qgemv::{qgemv, qgemv_with_epilogue, IntoQgemvEpilogues};
+pub use qgemv::{qgemv_with_epilogue, IntoQgemvEpilogues};
 pub use qgemv_paired_q4k::{qgemv_q4k_paired, qgemv_q4k_paired_dispatch, Q4KPairedGgml};
-pub use qmatmul::{qmatmul, qmatmul_with_epilogue};
+pub use qmatmul::qmatmul_with_epilogue;
 pub use quantized_matrix::{quantized_matrix, quantized_matrix_for};
 pub use rms_norm::{rms_norm_vec4, RmsNormVec4};
 pub use top_k::{top_k_chunk, top_k_exactness, top_k_merge};

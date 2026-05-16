@@ -14,7 +14,7 @@ fn mirostat_top_value(
     program: &TileBlock<'_>,
     values: &tile::Storage<F32, 1>,
     meta: Mirostat2Meta,
-    index: Tile,
+    index: Tile<U32>,
 ) -> Tile {
     let index = index_n(meta.values_offset, [meta.values_stride], index);
     program.load(values.at(index), Mask::all(), TileLiteral::f32(NEG_MAX_F32))
@@ -24,8 +24,8 @@ fn mirostat_top_id(
     program: &TileBlock<'_>,
     ids: &tile::Storage<U32, 1>,
     meta: Mirostat2Meta,
-    index: Tile,
-) -> Tile {
+    index: Tile<U32>,
+) -> Tile<U32> {
     let index = index_n(meta.ids_offset, [meta.ids_stride], index);
     program.load(ids.at(index), Mask::all(), TileLiteral::U32(u32::MAX))
 }
@@ -35,7 +35,7 @@ fn mirostat_top_weight(
     values: &tile::Storage<F32, 1>,
     meta: Mirostat2Meta,
     max_value: Tile,
-    index: Tile,
+    index: Tile<U32>,
 ) -> Tile {
     (mirostat_top_value(program, values, meta, index) - max_value).exp()
 }
@@ -48,7 +48,7 @@ fn store_sample_result(
     program: &mut TileBlock<'_>,
     output: &tile::Storage<U32, 1>,
     status: u32,
-    token: Tile,
+    token: Tile<U32>,
 ) {
     program.store(
         output.at(0),

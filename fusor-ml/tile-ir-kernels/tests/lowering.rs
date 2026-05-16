@@ -3,11 +3,12 @@ use fusor_tile_ir::{
     NagaKernel, Shape, F32,
 };
 use fusor_tile_ir_kernels::{
-    batched_matmul_f16_accum_f32_with_epilogues, batched_matmul_with_epilogues, flash_attention,
-    linear_storage_layout, qdequantize, qgemv, qgemv_q4k_paired, qmatmul, quantized_matrix,
-    rms_norm_vec4, try_batched_coop_matmul_f32, DenseMatmulEpilogues, DenseMatmulShape,
-    FlashAttentionDims, FlashAttentionMeta, PairedEpilogue, Q4KPairedGgml, RmsNormVec4,
-    RmsNormVec4Meta, TensorMeta,
+    batched_gemv_with_epilogues, batched_matmul_with_epilogues, flash_attention,
+    linear_storage_layout, qdequantize, qgemv_q4k_paired, qgemv_with_epilogue,
+    qmatmul_with_epilogue, quantized_matrix, rms_norm_vec4, try_batched_coop_matmul_f32,
+    DenseMatmulEpilogues, DenseMatmulShape, FlashAttentionDims, FlashAttentionMeta,
+    PairedEpilogue, Q4KPairedGgml, QmatmulEpilogues, RmsNormVec4, RmsNormVec4Meta, TensorMeta,
+    UnaryEpilogue,
 };
 
 fn lower_or_fail(ir: &fusor_tile_ir::KernelIr, label: &str) -> NagaKernel {
@@ -92,7 +93,7 @@ fn qgemv_ir(format: GgmlQuantFormat, rows: u32, cols: u32) -> fusor_tile_ir::Ker
         let a = program.storage_read::<F32, 2>(Shape::new([1, rows]));
         let b = quantized_matrix(program, format, rows, cols);
         let y = program.storage_write::<F32, 2>(Shape::new([1, cols]));
-        qgemv::<4, 64>(program, &a, &b, &y, 4, 1);
+        qgemv_with_epilogue::<4, 64>(program, &a, &b, &y, 1, Option::<&UnaryEpilogue>::None);
     })
 }
 
@@ -147,7 +148,7 @@ fn scalar_qmatmul_lowers() {
         let a = program.storage_read::<F32, 2>(Shape::new([8, 256]));
         let b = quantized_matrix(program, GgmlQuantFormat::Q8_0, 256, 16);
         let y = program.storage_write::<F32, 2>(Shape::new([8, 16]));
-        qmatmul::<8, 4, 8>(program, &a, &b, &y, 4);
+        qmatmul_with_epilogue::<8, 4, 8>(program, &a, &b, &y, 4, &QmatmulEpilogues::empty());
     });
     lower_or_fail(&ir, "scalar qmatmul");
 }
@@ -158,7 +159,7 @@ fn cooperative_qmatmul_lowers() {
         let a = program.storage_read::<F32, 2>(Shape::new([64, 256]));
         let b = quantized_matrix(program, GgmlQuantFormat::Q8_0, 256, 64);
         let y = program.storage_write::<F32, 2>(Shape::new([64, 64]));
-        qmatmul::<64, 64, 32>(program, &a, &b, &y, 4);
+        qmatmul_with_epilogue::<64, 64, 32>(program, &a, &b, &y, 4, &QmatmulEpilogues::empty());
     });
     lower_or_fail(&ir, "cooperative qmatmul");
 }
@@ -181,11 +182,34 @@ fn batched_dense_f32_matmul_lowers() {
             &b,
             &y,
             shape,
-            fusor_tile_ir::TileLiteral::f32(0.0),
             &DenseMatmulEpilogues::empty(),
         );
     });
     lower_or_fail(&ir, "batched dense f32 matmul");
+}
+
+#[test]
+fn batched_dense_f32_gemv_lowers() {
+    let ir = tile::build(|program| {
+        let shape = DenseMatmulShape {
+            batch: 3,
+            m: 5,
+            k: 256,
+            n: 1,
+        };
+        let a = program.storage_read::<F32, 2>(Shape::new([shape.batch * shape.m, shape.k]));
+        let b = program.storage_read::<F32, 2>(Shape::new([shape.batch * shape.k, shape.n]));
+        let y = program.storage_write::<F32, 2>(Shape::new([shape.batch * shape.m, shape.n]));
+        batched_gemv_with_epilogues::<F32, 4, 8, 128>(
+            program,
+            &a,
+            &b,
+            &y,
+            shape,
+            &DenseMatmulEpilogues::empty(),
+        );
+    });
+    lower_or_fail(&ir, "batched dense f32 gemv");
 }
 
 #[test]
@@ -203,7 +227,7 @@ fn batched_dense_f16_matmul_lowers() {
             .storage_read::<fusor_tile_ir::F16, 2>(Shape::new([shape.batch * shape.k, shape.n]));
         let y = program
             .storage_write::<fusor_tile_ir::F16, 2>(Shape::new([shape.batch * shape.m, shape.n]));
-        batched_matmul_f16_accum_f32_with_epilogues::<32, 32, 8>(
+        batched_matmul_with_epilogues::<fusor_tile_ir::F16, 32, 32, 8>(
             program,
             &a,
             &b,
@@ -213,6 +237,33 @@ fn batched_dense_f16_matmul_lowers() {
         );
     });
     lower_or_fail(&ir, "batched dense f16 matmul");
+}
+
+#[test]
+fn batched_dense_f16_gemv_lowers() {
+    let ir = tile::build(|program| {
+        let shape = DenseMatmulShape {
+            batch: 2,
+            m: 5,
+            k: 128,
+            n: 1,
+        };
+        let a = program
+            .storage_read::<fusor_tile_ir::F16, 2>(Shape::new([shape.batch * shape.m, shape.k]));
+        let b = program
+            .storage_read::<fusor_tile_ir::F16, 2>(Shape::new([shape.batch * shape.k, shape.n]));
+        let y = program
+            .storage_write::<fusor_tile_ir::F16, 2>(Shape::new([shape.batch * shape.m, shape.n]));
+        batched_gemv_with_epilogues::<fusor_tile_ir::F16, 4, 8, 128>(
+            program,
+            &a,
+            &b,
+            &y,
+            shape,
+            &DenseMatmulEpilogues::empty(),
+        );
+    });
+    lower_or_fail(&ir, "batched dense f16 gemv");
 }
 
 #[test]
@@ -240,6 +291,54 @@ fn cooperative_dense_f32_matmul_lowers() {
 }
 
 #[test]
+fn cooperative_dense_f32_matmul_128x128_lowers() {
+    let ir = tile::build(|program| {
+        let shape = DenseMatmulShape {
+            batch: 1,
+            m: 128,
+            k: 256,
+            n: 128,
+        };
+        let a = program.storage_read::<F32, 2>(Shape::new([shape.batch * shape.m, shape.k]));
+        let b = program.storage_read::<F32, 2>(Shape::new([shape.batch * shape.k, shape.n]));
+        let y = program.storage_write::<F32, 2>(Shape::new([shape.batch * shape.m, shape.n]));
+        assert!(try_batched_coop_matmul_f32::<128, 128, 32>(
+            program,
+            &a,
+            &b,
+            &y,
+            shape,
+            &DenseMatmulEpilogues::empty(),
+        ));
+    });
+    lower_or_fail(&ir, "cooperative dense f32 128x128 matmul");
+}
+
+#[test]
+fn cooperative_dense_f32_matmul_128x64_lowers() {
+    let ir = tile::build(|program| {
+        let shape = DenseMatmulShape {
+            batch: 1,
+            m: 128,
+            k: 256,
+            n: 64,
+        };
+        let a = program.storage_read::<F32, 2>(Shape::new([shape.batch * shape.m, shape.k]));
+        let b = program.storage_read::<F32, 2>(Shape::new([shape.batch * shape.k, shape.n]));
+        let y = program.storage_write::<F32, 2>(Shape::new([shape.batch * shape.m, shape.n]));
+        assert!(try_batched_coop_matmul_f32::<128, 64, 32>(
+            program,
+            &a,
+            &b,
+            &y,
+            shape,
+            &DenseMatmulEpilogues::empty(),
+        ));
+    });
+    lower_or_fail(&ir, "cooperative dense f32 128x64 matmul");
+}
+
+#[test]
 fn qdequantize_lowers() {
     let ir = tile::build(|program| {
         let b = quantized_matrix(program, GgmlQuantFormat::Q4K, 256, 4);
@@ -247,4 +346,65 @@ fn qdequantize_lowers() {
         qdequantize(program, &b, &y, 1);
     });
     lower_or_fail(&ir, "qdequantize");
+}
+
+/// Regression for the fallback branch in `qmatmul_tile_with_epilogue`. When
+/// `BM*BN*BK != 256` (true for every caller in core's `quantized/matmul`),
+/// the fallback used to drop the epilogue. With a non-identity `post`
+/// epilogue (here: `tanh`), the lowered Naga module must contain a `Tanh`
+/// math call somewhere in the function body.
+fn qmatmul_epilogue_fallback_ir(post: Option<&UnaryEpilogue>) -> fusor_tile_ir::KernelIr {
+    tile::build(|program| {
+        // `m = 2` skips the `m == 1` qgemv branch.
+        // BM*BN*BK = 64*64*32 = 131072 != 256 — forces the fallback path.
+        let a = program.storage_read::<F32, 2>(Shape::new([2, 64]));
+        let b = quantized_matrix(program, GgmlQuantFormat::Q8_0, 64, 64);
+        let y = program.storage_write::<F32, 2>(Shape::new([2, 64]));
+        let epilogues = QmatmulEpilogues { pre: None, post };
+        qmatmul_with_epilogue::<64, 64, 32>(program, &a, &b, &y, 4, &epilogues);
+    })
+}
+
+fn module_uses_tanh(module: &naga::Module) -> bool {
+    module.functions.iter().any(|(_, function)| {
+        function.expressions.iter().any(|(_, expr)| {
+            matches!(
+                expr,
+                naga::Expression::Math {
+                    fun: naga::MathFunction::Tanh,
+                    ..
+                }
+            )
+        })
+    }) || module.entry_points.iter().any(|entry| {
+        entry.function.expressions.iter().any(|(_, expr)| {
+            matches!(
+                expr,
+                naga::Expression::Math {
+                    fun: naga::MathFunction::Tanh,
+                    ..
+                }
+            )
+        })
+    })
+}
+
+#[test]
+fn qmatmul_fallback_preserves_post_epilogue() {
+    let tanh = UnaryEpilogue::new("test_tanh", |tile| tile.tanh());
+    let with_post = qmatmul_epilogue_fallback_ir(Some(&tanh));
+    let lowered = lower_or_fail(&with_post, "qmatmul fallback with tanh post");
+    assert!(
+        module_uses_tanh(lowered.module()),
+        "fallback path dropped the post epilogue: lowered Naga module contains no Tanh call"
+    );
+
+    // Control: same shape, no epilogue. The lowered module must NOT contain
+    // a Tanh call, ruling out a false-positive from unrelated kernel math.
+    let without = qmatmul_epilogue_fallback_ir(None);
+    let lowered = lower_or_fail(&without, "qmatmul fallback no epilogue");
+    assert!(
+        !module_uses_tanh(lowered.module()),
+        "control case unexpectedly contains a Tanh call — test is not specific enough"
+    );
 }

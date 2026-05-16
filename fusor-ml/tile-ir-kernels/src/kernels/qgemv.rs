@@ -39,43 +39,23 @@ impl<'a> IntoQgemvEpilogues<'a> for &'a crate::types::QmatmulEpilogues<'a> {
     }
 }
 
-/// Top-level quantized GEMV entry.
+/// Top-level quantized GEMV with optional pre/post unary epilogues.
 ///
-/// Equivalent to [`crate::qmatmul`] with `BM = 1`.
+/// Equivalent to [`crate::qmatmul_with_epilogue`] with `BM = 1`. Callers
+/// with no epilogue pass `None` (or `Option::<&UnaryEpilogue>::None`).
 ///
 /// ```
 /// use fusor_tile_ir::{tile, GgmlQuantFormat, Shape, F32};
-/// use fusor_tile_ir_kernels::{qgemv, quantized_matrix};
+/// use fusor_tile_ir_kernels::{qgemv_with_epilogue, quantized_matrix, UnaryEpilogue};
 ///
 /// let ir = tile::build(|program| {
 ///     let a = program.storage_read::<F32, 2>(Shape::new([1, 256]));
 ///     let b = quantized_matrix(program, GgmlQuantFormat::Q4K, 256, 128);
 ///     let y = program.storage_write::<F32, 2>(Shape::new([1, 128]));
-///     qgemv::<4, 64>(program, &a, &b, &y, 4, 1);
+///     qgemv_with_epilogue::<4, 64>(program, &a, &b, &y, 1, Option::<&UnaryEpilogue>::None);
 /// });
 /// # let _ = ir;
 /// ```
-pub fn qgemv<const BN: usize, const BK: usize>(
-    program: &mut Program,
-    a: &Storage<F32, 2>,
-    b: &QuantizedMatrix,
-    y: &Storage<F32, 2>,
-    vector_width: u32,
-    workgroups_x: u32,
-) {
-    super::qmatmul::qmatmul_options::<1, BN, BK>(
-        program,
-        a,
-        b,
-        y,
-        vector_width,
-        true,
-        workgroups_x,
-    );
-}
-
-/// Variant of [`qgemv`] that threads optional pre/post unary epilogues through
-/// the underlying qgemv variant chosen by `qgemv_tile`.
 pub fn qgemv_with_epilogue<'a, const BN: usize, const BK: usize>(
     program: &mut Program,
     a: &Storage<F32, 2>,
@@ -284,7 +264,7 @@ pub(crate) fn qgemv_q4k_ggml_with_epilogue<
         let q4k_lane = q4k_lane_decomposition(&lane);
 
         let zero = TileLiteral::f32(0.0);
-        let sums: [Tile; COLS_PER_SUBGROUP] = program.loop_fold_n::<COLS_PER_SUBGROUP, _>(
+        let sums: [Tile; COLS_PER_SUBGROUP] = program.loop_fold_n::<COLS_PER_SUBGROUP, _, _>(
             TileReduceOp::Sum,
             block_iterations,
             [zero; COLS_PER_SUBGROUP],
@@ -367,7 +347,7 @@ pub(crate) fn qgemv_q6k_ggml_with_epilogue<
         let q6k_lane = q6k_lane_decomposition(&lane);
 
         let zero = TileLiteral::f32(0.0);
-        let sums: [Tile; COLS_PER_SUBGROUP] = program.loop_fold_n::<COLS_PER_SUBGROUP, _>(
+        let sums: [Tile; COLS_PER_SUBGROUP] = program.loop_fold_n::<COLS_PER_SUBGROUP, _, _>(
             TileReduceOp::Sum,
             block_iterations,
             [zero; COLS_PER_SUBGROUP],
@@ -457,7 +437,7 @@ pub(crate) fn qgemv_perf_with_epilogue<
         let lane = scope.lane;
 
         let zero = TileLiteral::f32(0.0);
-        let sums: [Tile; COLS_PER_SUBGROUP] = program.loop_fold_n::<COLS_PER_SUBGROUP, _>(
+        let sums: [Tile; COLS_PER_SUBGROUP] = program.loop_fold_n::<COLS_PER_SUBGROUP, _, _>(
             TileReduceOp::Sum,
             k_iterations,
             [zero; COLS_PER_SUBGROUP],

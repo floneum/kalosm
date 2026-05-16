@@ -1,6 +1,6 @@
 use fusor_tile_ir::{
     tile::{self, Mask, Tile, TileBlock},
-    Bool, ElementType, TileLiteral, TileUnaryOp, WorkgroupAxis, F32, U32,
+    Bool, TileLiteral, TileUnaryOp, WorkgroupAxis, F32, U32,
 };
 
 use super::helpers::{index_n, reduce_workgroup, MAX_F32, NEG_MAX_F32, TOP_K_BLOCK};
@@ -8,19 +8,19 @@ use super::types::{MergeTopKMeta, TopKChunkMeta, TopKExactnessMeta};
 
 const TOP_K_CHUNK: u32 = TOP_K_BLOCK as u32;
 
-fn is_finite(value: Tile) -> Tile {
+fn is_finite(value: Tile) -> Mask {
     let self_equal = value.clone().eq(value.clone());
     let finite_magnitude = value
         .unary(TileUnaryOp::Abs)
         .le(Tile::literal(TileLiteral::f32(MAX_F32)));
-    self_equal.and(finite_magnitude).into()
+    self_equal.and(finite_magnitude)
 }
 
-fn better_candidate(value: Tile, id: Tile, best_value: Tile, best_id: Tile) -> Tile {
+fn better_candidate(value: Tile, id: Tile<U32>, best_value: Tile, best_id: Tile<U32>) -> Mask {
     let value_greater = value.clone().gt(best_value.clone());
     let value_equal = value.eq(best_value);
     let id_greater = id.gt(best_id);
-    value_greater.or(value_equal.and(id_greater)).into()
+    value_greater.or(value_equal.and(id_greater))
 }
 
 fn load_processor_param_f32(
@@ -30,7 +30,7 @@ fn load_processor_param_f32(
 ) -> Tile {
     program
         .load(params.at(index), Mask::all(), TileLiteral::U32(0))
-        .bitcast(ElementType::F32)
+        .bitcast::<F32>()
 }
 
 /// Select sorted top-k candidates within each chunk of an input vector.

@@ -24,8 +24,66 @@ use crate::{
 use fusor_gguf::GgmlType;
 use fusor_tile_ir as tile_ir;
 use fusor_tile_ir_kernels as tile_ir_kernels;
+use rustc_hash::FxHasher;
 
 use super::{QMatMulDirectPipelineKey, QMatrix};
+
+/// Hash the qmatmul format and (M, K, N) into `state`. Shared by the cache
+/// keys at every qmatmul-direct call site so they stay in lockstep.
+fn hash_qmatmul_shape(
+    state: &mut FxHasher,
+    format: tile_ir::GgmlQuantFormat,
+    m: u32,
+    k: u32,
+    n: u32,
+) {
+    format.hash(state);
+    m.hash(state);
+    k.hash(state);
+    n.hash(state);
+}
+
+/// Hash the dispatch tuple and input/output layout's offset/shape/strides
+/// into `state`. Shared by qmatmul-direct cache keys whose layout shape
+/// participates in the key.
+fn hash_qmatmul_dispatch_layouts(
+    state: &mut FxHasher,
+    dispatch_size: [u32; 3],
+    input_layout: &Layout,
+    output_layout: &Layout,
+) {
+    dispatch_size.hash(state);
+    input_layout.offset().hash(state);
+    input_layout.shape().hash(state);
+    input_layout.strides().hash(state);
+    output_layout.offset().hash(state);
+    output_layout.shape().hash(state);
+    output_layout.strides().hash(state);
+}
+
+/// Build a qmatmul-direct cache key in either the operation-bound or
+/// module-only path. Both arms wrap the same `KernelVariantKey<M>(payload)`;
+/// the unbound arm additionally hashes `outer` into the module key.
+fn qmatmul_direct_module_key<M: 'static>(
+    payload_hash: impl Fn(&mut FxHasher),
+    outer_hash: impl Fn(&mut FxHasher),
+    dispatch_size: [u32; 3],
+    operation_key: Option<(&dyn Operation, &[MirValue])>,
+) -> kernel_backend::KernelCacheKey {
+    let cache_variant = kernel_backend::KernelVariantKey::with_payload::<M>(payload_hash);
+    match operation_key {
+        Some((operation, operation_inputs)) => operation.kernel_cache_key_with_dispatch(
+            cache_variant,
+            None,
+            dispatch_size,
+            operation_inputs,
+        ),
+        None => kernel_backend::module_key_from(|state| {
+            cache_variant.hash(state);
+            outer_hash(&mut *state);
+        }),
+    }
+}
 
 const QMAT_M: Axis<0> = Axis;
 const QMAT_K: Axis<1> = Axis;
@@ -33,6 +91,17 @@ const QMAT_N: Axis<2> = Axis;
 const QGEMV_K: Axis<0> = Axis;
 const QGEMV_N: Axis<1> = Axis;
 
+/// Chosen kernel for a direct quantized matmul. The `Tile*` variants all
+/// dispatch to `qmatmul_with_epilogue::<BM, BN, BK>` with the matching tile
+/// dimensions; the variant name encodes:
+///   - The output tile shape (`64x64`, `64x128`, …) — selector gating; and
+///   - Whether the call takes the cached-pipeline fast path
+///     ([`Tile64x64Cached`](Self::Tile64x64Cached)) or the IR-build fallback
+///     ([`Tile64x64`](Self::Tile64x64)).
+/// [`Q8Wide64x128`](Self::Q8Wide64x128) shares the IR and dispatch tuple of
+/// [`Tile64x128`](Self::Tile64x128) but a different selector rule (Q8_0 with
+/// `N >= 8192` and a 32 KB workgroup-storage device cap), giving it its own
+/// cache slot for future tuning.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 enum QMatmulDirectVariant {
     Q5SmallSingleRow,
@@ -41,7 +110,11 @@ enum QMatmulDirectVariant {
     Tile128x128,
     Tile128x64,
     Tile64x128,
-    Tile64x64Fast,
+    /// Same IR as [`Tile64x64`](Self::Tile64x64); uses the precomputed
+    /// `[n/64, m/64, 1]` dispatch + storage3 cached-pipeline fast path. The
+    /// `Tile64x64` variant is the IR-build fallback when the precomputed
+    /// dispatch can't be cached.
+    Tile64x64Cached,
     Tile64x64,
 }
 
@@ -131,7 +204,7 @@ fn qmatmul_direct_selector() -> ShapeSelector<3, QMatmulDirectCtx, QMatmulDirect
                 .when(qmatmul_coop_rule_supported),
         )
         .rule(
-            QMatmulDirectVariant::Tile64x64Fast,
+            QMatmulDirectVariant::Tile64x64Cached,
             ShapeRule::new()
                 .axis(QMAT_M, multiple_of(64))
                 .axis(QMAT_K, multiple_of(32))
@@ -439,46 +512,12 @@ impl QMatMulOperation {
         self.matrix.shape[0] as u32
     }
 
+    /// Build a direct quantized-matmul kernel for the supplied tensors.
+    /// `pre_chain`/`post_chain` are pre- and post-element-wise unary chains
+    /// to fuse into the kernel; pass `None` to skip. `operation_key` ties the
+    /// compiled module into an operation-bound cache slot; pass `None` for an
+    /// ad-hoc call (e.g. the sampler path).
     pub(crate) fn direct_kernel_for_tensors(
-        device: &Device,
-        input: &TensorData,
-        matrix: &QMatrix,
-        output: &TensorData,
-        kernel_name: impl Into<String>,
-    ) -> Option<DirectKernel> {
-        Self::direct_kernel_for_tensors_with_epilogue(
-            device,
-            input,
-            matrix,
-            output,
-            kernel_name,
-            None,
-            None,
-        )
-    }
-
-    pub(crate) fn direct_kernel_for_tensors_with_epilogue(
-        device: &Device,
-        input: &TensorData,
-        matrix: &QMatrix,
-        output: &TensorData,
-        kernel_name: impl Into<String>,
-        pre_chain: Option<&UnaryFunctionChain>,
-        post_chain: Option<&UnaryFunctionChain>,
-    ) -> Option<DirectKernel> {
-        Self::direct_kernel_for_tensors_with_epilogue_inner(
-            device,
-            input,
-            matrix,
-            output,
-            kernel_name,
-            pre_chain,
-            post_chain,
-            None,
-        )
-    }
-
-    fn direct_kernel_for_tensors_with_epilogue_inner(
         device: &Device,
         input: &TensorData,
         matrix: &QMatrix,
@@ -557,7 +596,7 @@ impl QMatMulOperation {
             QMatmulDirectVariant::Tile128x128 => Some([n / 128, m / 128, 1]),
             QMatmulDirectVariant::Tile128x64 => Some([n / 64, m / 128, 1]),
             QMatmulDirectVariant::Tile64x128 => Some([n / 128, m / 64, 1]),
-            QMatmulDirectVariant::Tile64x64Fast => Some([n / 64, m / 64, 1]),
+            QMatmulDirectVariant::Tile64x64Cached => Some([n / 64, m / 64, 1]),
             QMatmulDirectVariant::Tile64x64 => None,
         };
         let kernel_name = kernel_name.into();
@@ -590,40 +629,21 @@ impl QMatMulOperation {
             ) {
                 return Some(kernel);
             }
-            let cache_key = if let Some((operation, operation_inputs)) = operation_key {
-                let cache_variant = kernel_backend::KernelVariantKey::with_payload::<
-                    QMatmulDirectFastKernelVariant,
-                >(|state| {
-                    variant.hash(state);
-                });
-                operation.kernel_cache_key_with_dispatch(
-                    cache_variant,
-                    None,
-                    dispatch_size,
-                    operation_inputs,
-                )
-            } else {
-                kernel_backend::module_key_from(|state| {
-                    kernel_backend::KernelVariantKey::with_payload::<
-                        QMatmulDirectFastKernelVariant,
-                    >(|payload| {
-                        variant.hash(payload);
-                    })
-                    .hash(state);
-                    format.hash(state);
-                    m.hash(state);
-                    k.hash(state);
-                    n.hash(state);
-                    dispatch_size.hash(state);
-                    input.layout().offset().hash(state);
-                    input.layout().shape().hash(state);
-                    input.layout().strides().hash(state);
-                    output.layout().offset().hash(state);
-                    output.layout().shape().hash(state);
-                    output.layout().strides().hash(state);
-                })
-            };
-            if let Some(pipeline) = kernel_backend::storage3_pipeline_from_cached_module(
+            let cache_key = qmatmul_direct_module_key::<QMatmulDirectFastKernelVariant>(
+                |state| variant.hash(state),
+                |state| {
+                    hash_qmatmul_shape(state, format, m, k, n);
+                    hash_qmatmul_dispatch_layouts(
+                        state,
+                        dispatch_size,
+                        input.layout(),
+                        output.layout(),
+                    );
+                },
+                dispatch_size,
+                operation_key,
+            );
+            if let Some(pipeline) = kernel_backend::three_buffer_pipeline_from_cached_module(
                 device,
                 &kernel_name,
                 cache_key,
@@ -632,7 +652,7 @@ impl QMatMulOperation {
                     .direct_pipeline_cache()
                     .write()
                     .get_or_insert(pipeline_key, || pipeline.clone());
-                return Some(kernel_backend::storage3_kernel_with_prepared_pipeline(
+                return Some(kernel_backend::three_buffer_kernel_with_prepared_pipeline(
                     kernel_name.clone(),
                     cache_key,
                     pipeline,
@@ -689,7 +709,7 @@ impl QMatMulOperation {
                         phase, &a, &b, &y, 4, &epilogues,
                     );
                 }
-                QMatmulDirectVariant::Tile64x64Fast => {
+                QMatmulDirectVariant::Tile64x64Cached => {
                     tile_ir_kernels::qmatmul_with_epilogue::<64, 64, 32>(
                         phase, &a, &b, &y, 4, &epilogues,
                     );
@@ -715,42 +735,24 @@ impl QMatMulOperation {
             input.layout(),
             output.layout(),
         );
-        let cache_key = if let Some((operation, operation_inputs)) = operation_key {
-            let cache_variant = kernel_backend::KernelVariantKey::with_payload::<
-                QMatmulDirectEpilogueKernelVariant,
-            >(|state| {
+        let cache_key = qmatmul_direct_module_key::<QMatmulDirectEpilogueKernelVariant>(
+            |state| {
                 variant.hash(state);
                 epilogue_identity.hash(state);
-            });
-            operation.kernel_cache_key_with_dispatch(
-                cache_variant,
-                None,
-                dispatch_size,
-                operation_inputs,
-            )
-        } else {
-            kernel_backend::module_key_from(|state| {
-                kernel_backend::KernelVariantKey::with_payload::<
-                    QMatmulDirectEpilogueKernelVariant,
-                >(|payload| {
-                    variant.hash(payload);
-                    epilogue_identity.hash(payload);
-                })
-                .hash(state);
-                format.hash(state);
-                m.hash(state);
-                k.hash(state);
-                n.hash(state);
+            },
+            |state| {
+                hash_qmatmul_shape(state, format, m, k, n);
                 epilogue_identity.hash(state);
-                dispatch_size.hash(state);
-                input.layout().offset().hash(state);
-                input.layout().shape().hash(state);
-                input.layout().strides().hash(state);
-                output.layout().offset().hash(state);
-                output.layout().shape().hash(state);
-                output.layout().strides().hash(state);
-            })
-        };
+                hash_qmatmul_dispatch_layouts(
+                    state,
+                    dispatch_size,
+                    input.layout(),
+                    output.layout(),
+                );
+            },
+            dispatch_size,
+            operation_key,
+        );
         qmatmul_direct_kernel_from_ir(
             device,
             kernel_name.clone(),
@@ -802,7 +804,7 @@ fn cached_qmatmul_direct_kernel(
         kernel_backend::KernelVariantKey::of::<QMatmulCachedPipelineKernelVariant>().hash(state);
         pipeline_key.hash(state);
     });
-    Some(kernel_backend::storage3_kernel_with_prepared_pipeline(
+    Some(kernel_backend::three_buffer_kernel_with_prepared_pipeline(
         kernel_name.to_owned(),
         cache_key,
         pipeline,
@@ -836,7 +838,7 @@ fn qmatmul_direct_kernel_from_ir(
     ) {
         return Some(kernel);
     }
-    let pipeline = kernel_backend::storage3_pipeline_from_ir(
+    let pipeline = kernel_backend::three_buffer_pipeline_from_ir(
         device,
         &kernel_name,
         cache_key.clone(),
@@ -847,7 +849,7 @@ fn qmatmul_direct_kernel_from_ir(
         .write()
         .get_or_insert(pipeline_key, || pipeline.clone())
         .clone();
-    Some(kernel_backend::storage3_kernel_with_prepared_pipeline(
+    Some(kernel_backend::three_buffer_kernel_with_prepared_pipeline(
         kernel_name,
         cache_key,
         pipeline,
@@ -957,7 +959,7 @@ mod selection_tests {
             (QMatmulDirectVariant::Tile128x64, ctx(q4, true), caps(false)),
             (QMatmulDirectVariant::Tile64x128, ctx(q4, true), caps(false)),
             (
-                QMatmulDirectVariant::Tile64x64Fast,
+                QMatmulDirectVariant::Tile64x64Cached,
                 ctx(q4, true),
                 caps(false),
             ),
@@ -1131,7 +1133,7 @@ impl Operation for QMatMulOperation {
         if matrix.datatype() == GgmlType::F32 {
             return self.build_dense_direct_kernel(graph, input, matrix, output);
         }
-        Self::direct_kernel_for_tensors_with_epilogue_inner(
+        Self::direct_kernel_for_tensors(
             &graph.device(),
             input,
             matrix,
@@ -1308,49 +1310,57 @@ impl QMatMulOperation {
         });
         let cache_key =
             self.kernel_cache_key_with_dispatch(cache_variant, None, dispatch_size, inputs);
-        // Buffer ordering must match the IR builder's storage declaration
-        // order: a (input), b (qmatrix), extras..., y (output).
-        let mut buffers: Vec<std::sync::Arc<wgpu::Buffer>> = Vec::with_capacity(3 + extras_count);
-        buffers.push(input.buffer().clone());
-        buffers.push(matrix.buffer().clone());
-        for extra in &extras_tensors {
-            buffers.push(extra.buffer().clone());
-        }
-        buffers.push(output.buffer().clone());
+        // Build IR + binding list together via `KernelBuilder` so the runtime
+        // buffer order can't drift from the IR's storage declaration order.
+        let mut kb = tile_ir::KernelBuilder::<std::sync::Arc<wgpu::Buffer>>::new();
+        let a = kb.read::<tile_ir::F32, 2>(tile_ir::KernelTensorRef::with_offset(
+            input.buffer().clone(),
+            a_view.layout.clone(),
+            a_view.offset,
+        ));
+        let b = tile_ir_kernels::quantized_matrix_for(
+            &mut kb,
+            matrix.buffer().clone(),
+            format,
+            k,
+            pair_len * 2,
+        );
+        let extras: Vec<tile_ir::tile::Storage<tile_ir::F32, 1>> = extra_views
+            .iter()
+            .zip(extras_tensors.iter())
+            .map(|(view, tensor)| {
+                kb.read::<tile_ir::F32, 1>(tile_ir::KernelTensorRef::with_offset(
+                    tensor.buffer().clone(),
+                    view.tile_layout.clone(),
+                    view.offset,
+                ))
+            })
+            .collect();
+        let y = kb.write::<tile_ir::F32, 2>(tile_ir::KernelTensorRef::with_offset(
+            output.buffer().clone(),
+            y_view.layout.clone(),
+            y_view.offset,
+        ));
+        tile_ir_kernels::qgemv_q4k_paired(
+            kb.program(),
+            tile_ir_kernels::Q4KPairedGgml {
+                a: &a,
+                b: &b,
+                y: &y,
+                pair_cols: pair_len,
+                m_rows: m,
+                workgroups_x,
+                epilogue: &epilogue,
+                extras: &extras,
+            },
+        );
+        let (ir, buffers) = kb.finish();
 
         kernel_backend::dynamic_kernel_from_ir(
             &graph.device(),
             kernel_name,
             cache_key,
-            move || {
-                Some(tile_ir::tile::build(move |phase| {
-                    let a = tile_storage_read_with_direct_layout(phase, a_view);
-                    let b = tile_ir_kernels::quantized_matrix(phase, format, k, pair_len * 2);
-                    let extras: Vec<tile_ir::tile::Storage<tile_ir::F32, 1>> = extra_views
-                        .iter()
-                        .map(|view| {
-                            phase.storage_read_with_layout_offset::<tile_ir::F32, 1>(
-                                view.tile_layout.clone(),
-                                view.offset,
-                            )
-                        })
-                        .collect();
-                    let y = tile_storage_write_with_direct_layout(phase, y_view);
-                    tile_ir_kernels::qgemv_q4k_paired(
-                        phase,
-                        tile_ir_kernels::Q4KPairedGgml {
-                            a: &a,
-                            b: &b,
-                            y: &y,
-                            pair_cols: pair_len,
-                            m_rows: m,
-                            workgroups_x,
-                            epilogue: &epilogue,
-                            extras: &extras,
-                        },
-                    );
-                }))
-            },
+            move || Some(ir),
             buffers,
             dispatch_size,
         )

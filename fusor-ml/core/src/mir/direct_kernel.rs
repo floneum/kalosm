@@ -111,10 +111,10 @@ impl DirectKernel {
             output,
         } = &self.bindings
         {
-            let bind_group_layout = device.direct_storage3_bind_group_layout();
+            let bind_group_layout = device.direct_three_buffer_bind_group_layout();
             let bind_group_key = DirectStorage3BindGroupKey::new(input, weight, output);
             let bind_group = device
-                .direct_storage3_bind_group_cache()
+                .direct_three_buffer_bind_group_cache()
                 .write()
                 .get_or_insert(bind_group_key, || {
                     let bind_entries = [
@@ -140,7 +140,7 @@ impl DirectKernel {
                         })
                 })
                 .clone();
-            let pipeline_layout = device.direct_storage3_pipeline_layout();
+            let pipeline_layout = device.direct_three_buffer_pipeline_layout();
             let pipeline = self.pipeline_with_layout(device, pipeline_layout);
             return Some(PreparedDirectDispatch {
                 pipeline,

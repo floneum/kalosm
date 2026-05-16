@@ -134,10 +134,45 @@ fn coop_gemm_params_from_caps(
     (params.wg_threads <= caps.max_compute_workgroup_size_x).then_some(params)
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 enum DirectTileMatmulVariant {
     Gemv,
     MatMul,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+enum DirectTileCoopMatmulVariant {
+    None,
+    Tile64x64,
+    Tile64x128,
+    Tile128x64,
+}
+
+impl DirectTileCoopMatmulVariant {
+    fn select(m: u32, k: u32, n: u32, max_workgroup_size_x: u32) -> Self {
+        if k.is_multiple_of(32)
+            && m.is_multiple_of(128)
+            && n.is_multiple_of(64)
+            && max_workgroup_size_x >= 256
+        {
+            return Self::Tile128x64;
+        }
+        if k.is_multiple_of(32)
+            && m.is_multiple_of(64)
+            && n.is_multiple_of(128)
+            && max_workgroup_size_x >= 256
+        {
+            return Self::Tile64x128;
+        }
+        if k.is_multiple_of(32)
+            && m.is_multiple_of(64)
+            && n.is_multiple_of(64)
+            && max_workgroup_size_x >= 128
+        {
+            return Self::Tile64x64;
+        }
+        Self::None
+    }
 }
 
 struct MatmulTileDirectKernelVariant;
@@ -346,6 +381,16 @@ impl MatMulOperation {
             && device.subgroups_supported()
             && device.min_subgroup_size() == 32
             && device.max_subgroup_size() == 32;
+        let coop_variant = if use_coop {
+            DirectTileCoopMatmulVariant::select(
+                m,
+                k,
+                n,
+                device.limits().max_compute_workgroup_size_x,
+            )
+        } else {
+            DirectTileCoopMatmulVariant::None
+        };
         let use_shared_tile = m.is_multiple_of(32) && n.is_multiple_of(32) && k.is_multiple_of(8);
         let datatype = self.datatype;
         let ir = tile_ir::tile::build(move |phase| {
@@ -368,15 +413,37 @@ impl MatMulOperation {
                         phase,
                         y_view.clone(),
                     );
-                    if use_coop
-                        && tile_ir_kernels::try_batched_coop_matmul_f32::<64, 64, 32>(
-                            phase, &a, &b, &y, shape, &epilogues,
-                        )
-                    {
-                        return;
+                    match coop_variant {
+                        DirectTileCoopMatmulVariant::Tile128x64 => {
+                            if tile_ir_kernels::try_batched_coop_matmul_f32::<128, 64, 32>(
+                                phase, &a, &b, &y, shape, &epilogues,
+                            ) {
+                                return;
+                            }
+                        }
+                        DirectTileCoopMatmulVariant::Tile64x128 => {
+                            if tile_ir_kernels::try_batched_coop_matmul_f32::<64, 128, 32>(
+                                phase, &a, &b, &y, shape, &epilogues,
+                            ) {
+                                return;
+                            }
+                        }
+                        DirectTileCoopMatmulVariant::Tile64x64 => {
+                            if tile_ir_kernels::try_batched_coop_matmul_f32::<64, 64, 32>(
+                                phase, &a, &b, &y, shape, &epilogues,
+                            ) {
+                                return;
+                            }
+                        }
+                        DirectTileCoopMatmulVariant::None => {}
                     }
                     match variant {
-                        DirectTileMatmulVariant::Gemv | DirectTileMatmulVariant::MatMul => {
+                        DirectTileMatmulVariant::Gemv => {
+                            tile_ir_kernels::batched_gemv_with_epilogues::<tile_ir::F32, 4, 8, 128>(
+                                phase, &a, &b, &y, shape, &epilogues,
+                            )
+                        }
+                        DirectTileMatmulVariant::MatMul => {
                             if use_shared_tile {
                                 tile_ir_kernels::batched_matmul_with_epilogues::<
                                     tile_ir::F32,
@@ -384,13 +451,7 @@ impl MatMulOperation {
                                     32,
                                     8,
                                 >(
-                                    phase,
-                                    &a,
-                                    &b,
-                                    &y,
-                                    shape,
-                                    tile_ir::TileLiteral::f32(0.0),
-                                    &epilogues,
+                                    phase, &a, &b, &y, shape, &epilogues,
                                 )
                             } else {
                                 tile_ir_kernels::batched_matmul_register_with_epilogues::<
@@ -399,13 +460,7 @@ impl MatMulOperation {
                                     32,
                                     8,
                                 >(
-                                    phase,
-                                    &a,
-                                    &b,
-                                    &y,
-                                    shape,
-                                    tile_ir::TileLiteral::f32(0.0),
-                                    &epilogues,
+                                    phase, &a, &b, &y, shape, &epilogues,
                                 )
                             }
                         }
@@ -424,16 +479,33 @@ impl MatMulOperation {
                         phase,
                         y_view.clone(),
                     );
-                    if use_shared_tile {
-                        tile_ir_kernels::batched_matmul_f16_accum_f32_with_epilogues::<32, 32, 8>(
-                            phase, &a, &b, &y, shape, &epilogues,
-                        )
-                    } else {
-                        tile_ir_kernels::batched_matmul_f16_accum_f32_register_with_epilogues::<
-                            32,
-                            32,
-                            8,
-                        >(phase, &a, &b, &y, shape, &epilogues)
+                    match variant {
+                        DirectTileMatmulVariant::Gemv => {
+                            tile_ir_kernels::batched_gemv_with_epilogues::<tile_ir::F16, 4, 8, 128>(
+                                phase, &a, &b, &y, shape, &epilogues,
+                            )
+                        }
+                        DirectTileMatmulVariant::MatMul => {
+                            if use_shared_tile {
+                                tile_ir_kernels::batched_matmul_with_epilogues::<
+                                    tile_ir::F16,
+                                    32,
+                                    32,
+                                    8,
+                                >(
+                                    phase, &a, &b, &y, shape, &epilogues,
+                                )
+                            } else {
+                                tile_ir_kernels::batched_matmul_register_with_epilogues::<
+                                    tile_ir::F16,
+                                    32,
+                                    32,
+                                    8,
+                                >(
+                                    phase, &a, &b, &y, shape, &epilogues,
+                                )
+                            }
+                        }
                     }
                 }
                 _ => unreachable!("direct tile matmul only supports f32/f16"),
@@ -452,6 +524,8 @@ impl MatMulOperation {
         let variant = kernel_backend::KernelVariantKey::with_payload::<MatmulTileDirectKernelVariant>(
             |state| {
                 use_shared_tile.hash(state);
+                variant.hash(state);
+                coop_variant.hash(state);
                 epilogue_identity.hash(state);
             },
         );
@@ -702,5 +776,25 @@ mod selection_tests {
                 .expect("variant should generate");
             assert_eq!(selector.select(shape, &(), caps), Some(variant));
         }
+    }
+
+    #[test]
+    fn direct_tile_coop_selector_prefers_largest_supported_tile() {
+        assert_eq!(
+            DirectTileCoopMatmulVariant::select(1024, 1024, 1024, 512),
+            DirectTileCoopMatmulVariant::Tile128x64
+        );
+        assert_eq!(
+            DirectTileCoopMatmulVariant::select(1024, 1024, 1024, 256),
+            DirectTileCoopMatmulVariant::Tile128x64
+        );
+        assert_eq!(
+            DirectTileCoopMatmulVariant::select(1024, 1024, 1024, 128),
+            DirectTileCoopMatmulVariant::Tile64x64
+        );
+        assert_eq!(
+            DirectTileCoopMatmulVariant::select(1000, 1024, 1024, 512),
+            DirectTileCoopMatmulVariant::None
+        );
     }
 }

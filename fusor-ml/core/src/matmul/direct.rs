@@ -6,7 +6,9 @@ use crate::{
         direct_kernel::DirectKernel, inputs::MirValue, kernel_backend, operation::Operation,
         workgroup_shape::WorkgroupShape,
     },
-    nary_direct::apply_unary_function_chain,
+    nary_direct::{
+        ValueTile, apply_unary_function_chain, layout_index, linear_group, output_dims_from_flat,
+    },
     tensor::{DataTypeEnum, TensorData},
     visit_tiled::distribute_workgroups,
 };
@@ -18,7 +20,7 @@ struct MatmulSerialDirectKernelVariant;
 pub(crate) fn build_serial_matmul_direct_kernel(
     operation: &MatMulOperation,
     graph: &crate::compute_graph::ComputeGraphInner,
-    _workgroup_shape: &WorkgroupShape,
+    workgroup_shape: &WorkgroupShape,
     inputs: &[MirValue],
 ) -> Option<DirectKernel> {
     let [input_a, input_b, output] = inputs else {
@@ -50,10 +52,11 @@ pub(crate) fn build_serial_matmul_direct_kernel(
     let dispatch_size = distribute_workgroups(total_outputs.div_ceil(BLOCK as u32));
     let cache_key = operation.kernel_cache_key_with_dispatch(
         kernel_backend::KernelVariantKey::of::<MatmulSerialDirectKernelVariant>(),
-        Some(_workgroup_shape),
+        Some(workgroup_shape),
         dispatch_size,
         inputs,
     );
+
     let a_meta = TensorMeta::new(&input_a)?;
     let b_meta = TensorMeta::new(&input_b)?;
     let y_meta = TensorMeta::new(&output)?;
@@ -69,6 +72,11 @@ pub(crate) fn build_serial_matmul_direct_kernel(
     {
         return None;
     }
+    let acc_dtype = match a_product_dtype {
+        DataTypeEnum::U32 => DataTypeEnum::U32,
+        DataTypeEnum::F32 | DataTypeEnum::F16 => DataTypeEnum::F32,
+    };
+    let result_dtype = a_product_dtype;
     let out_shape = output
         .layout()
         .shape()
@@ -87,11 +95,6 @@ pub(crate) fn build_serial_matmul_direct_kernel(
         .last()
         .copied()
         .and_then(|value| value.try_into().ok())?;
-    let acc_dtype = match a_product_dtype {
-        DataTypeEnum::U32 => DataTypeEnum::U32,
-        DataTypeEnum::F32 | DataTypeEnum::F16 => DataTypeEnum::F32,
-    };
-    let result_dtype = a_product_dtype;
 
     let a_buffer = input_a.buffer().clone();
     let b_buffer = input_b.buffer().clone();
@@ -102,6 +105,9 @@ pub(crate) fn build_serial_matmul_direct_kernel(
     let a_meta_body = a_meta.clone();
     let b_meta_body = b_meta.clone();
     let y_meta_body = y_meta.clone();
+    let pre_a = operation.pre_element_wise[0].clone();
+    let pre_b = operation.pre_element_wise[1].clone();
+    let post = operation.post_element_wise.clone();
 
     kernel_backend::run_kernel(
         &graph.device(),
@@ -109,18 +115,12 @@ pub(crate) fn build_serial_matmul_direct_kernel(
         cache_key,
         dispatch_size,
         move |kb| {
-            let a_storage = kb.read_element::<2>(
-                a_meta_body.element,
-                tile_ir::KernelTensorRef::new(a_buffer, a_layout),
-            );
-            let b_storage = kb.read_element::<2>(
-                b_meta_body.element,
-                tile_ir::KernelTensorRef::new(b_buffer, b_layout),
-            );
-            let y_storage = kb.write_element::<2>(
-                y_meta_body.element,
-                tile_ir::KernelTensorRef::new(y_buffer, y_layout),
-            );
+            let a_tensor = tile_ir::KernelTensorRef::new(a_buffer.clone(), a_layout.clone());
+            let b_tensor = tile_ir::KernelTensorRef::new(b_buffer.clone(), b_layout.clone());
+            let y_tensor = tile_ir::KernelTensorRef::new(y_buffer.clone(), y_layout.clone());
+            let a_storage = storage_read(kb, a_meta_body.datatype, a_tensor);
+            let b_storage = storage_read(kb, b_meta_body.datatype, b_tensor);
+            let y_storage = storage_write(kb, y_meta_body.datatype, y_tensor);
 
             kb.program()
                 .program_grid::<BLOCK>(dispatch_size, |program| {
@@ -128,56 +128,69 @@ pub(crate) fn build_serial_matmul_direct_kernel(
                     let group = linear_group(program, dispatch_size);
                     let flat = group * BLOCK as u32 + lane.clone();
                     let in_bounds = flat.lt(total_outputs);
-                    let dims = output_dims_from_flat(
-                        tile_ir::tile::Tile::from_index(flat.clone()),
-                        &out_shape,
-                    );
-                    let sum = program.loop_fold(
-                        tile_ir::TileReduceOp::Sum,
-                        k,
-                        zero_literal(acc_dtype),
-                        |program, k_iter| {
-                            let k_index = tile_ir::tile::Tile::from_index(k_iter);
+                    let dims = output_dims_from_flat_u32(flat.clone(), &out_shape);
+
+                    let value_at =
+                        |program: &mut tile_ir::tile::TileBlock<'_>,
+                         k_index: tile_ir::tile::Tile<tile_ir::U32>| {
                             let mut a_coords = dims[..rank - 1].to_vec();
                             a_coords.push(k_index.clone());
                             let mut b_coords = dims[..rank - 2].to_vec();
                             b_coords.push(k_index);
                             b_coords.push(dims[rank - 1].clone());
 
-                            let a = program.load(
-                                a_storage.at((0, layout_index(&a_meta_body, &a_coords))),
+                            let a = a_storage.load(
+                                program,
+                                layout_index(&a_meta_body.as_nary_meta(), &a_coords),
                                 in_bounds.clone(),
-                                zero_literal(a_meta_body.datatype),
                             );
-                            let b = program.load(
-                                b_storage.at((0, layout_index(&b_meta_body, &b_coords))),
+                            let b = b_storage.load(
+                                program,
+                                layout_index(&b_meta_body.as_nary_meta(), &b_coords),
                                 in_bounds.clone(),
-                                zero_literal(b_meta_body.datatype),
                             );
                             let (a, a_ty) = apply_unary_function_chain(
-                                a,
+                                a.into_f32(),
                                 a_meta_body.datatype,
-                                &operation.pre_element_wise[0],
+                                &pre_a,
                             )
                             .expect("validated matmul pre_element_wise[0] chain");
                             let (b, b_ty) = apply_unary_function_chain(
-                                b,
+                                b.into_f32(),
                                 b_meta_body.datatype,
-                                &operation.pre_element_wise[1],
+                                &pre_b,
                             )
                             .expect("validated matmul pre_element_wise[1] chain");
-                            let a = cast_tile(a, a_ty, acc_dtype);
-                            let b = cast_tile(b, b_ty, acc_dtype);
-                            a * b
-                        },
-                    );
-                    let sum = cast_tile(sum, acc_dtype, result_dtype);
+                            let a = ValueTile::F32(a).cast_to(a_ty).cast_to(acc_dtype);
+                            let b = ValueTile::F32(b).cast_to(b_ty).cast_to(acc_dtype);
+                            a.binary(tile_ir::TileBinaryOp::Mul, b)
+                        };
+
+                    let sum = match acc_dtype {
+                        DataTypeEnum::F32 => ValueTile::F32(program.loop_fold(
+                            tile_ir::TileReduceOp::Sum,
+                            k,
+                            tile_ir::TileLiteral::f32(0.0),
+                            |program, k_index| value_at(program, k_index).into_f32(),
+                        )),
+                        DataTypeEnum::F16 => unreachable!("matmul accumulates f16 products in f32"),
+                        DataTypeEnum::U32 => ValueTile::U32(program.loop_fold(
+                            tile_ir::TileReduceOp::Sum,
+                            k,
+                            tile_ir::TileLiteral::U32(0),
+                            |program, k_index| value_at(program, k_index).into_u32(),
+                        )),
+                    };
+                    let sum = sum.cast_to(result_dtype);
                     let (sum, sum_ty) =
-                        apply_unary_function_chain(sum, result_dtype, &operation.post_element_wise)
+                        apply_unary_function_chain(sum.into_f32(), result_dtype, &post)
                             .expect("validated matmul post_element_wise chain");
-                    let sum = cast_tile(sum, sum_ty, y_meta_body.datatype);
-                    program.store(
-                        y_storage.at((0, layout_index(&y_meta_body, &dims))),
+                    let sum = ValueTile::F32(sum)
+                        .cast_to(sum_ty)
+                        .cast_to(y_meta_body.datatype);
+                    y_storage.store(
+                        program,
+                        layout_index(&y_meta_body.as_nary_meta(), &dims),
                         sum,
                         in_bounds,
                     );
@@ -187,45 +200,36 @@ pub(crate) fn build_serial_matmul_direct_kernel(
     )
 }
 
-fn output_dims_from_flat(flat: tile_ir::tile::Tile, shape: &[u32]) -> Vec<tile_ir::tile::Tile> {
-    (0..shape.len())
-        .map(|axis| {
-            let divisor = shape[axis + 1..]
-                .iter()
-                .fold(1u32, |acc, dim| acc.saturating_mul(*dim));
-            let quotient = if divisor == 1 {
-                flat.clone()
-            } else {
-                flat.clone() / tile_u32(divisor)
-            };
-            let dim = shape[axis];
-            if dim == 1 {
-                tile_u32(0)
-            } else {
-                quotient % tile_u32(dim)
-            }
-        })
-        .collect()
-}
-
-fn layout_index(meta: &TensorMeta, coords: &[tile_ir::tile::Tile]) -> tile_ir::tile::Tile {
-    let mut index = tile_u32(meta.offset);
-    for (coord, stride) in coords.iter().zip(&meta.strides) {
-        if *stride != 0 {
-            index = index + coord.clone() * tile_u32(*stride);
-        }
+fn storage_read<B>(
+    kb: &mut tile_ir::KernelBuilder<B>,
+    datatype: DataTypeEnum,
+    tensor: tile_ir::KernelTensorRef<B>,
+) -> crate::nary_direct::Storage2 {
+    match datatype {
+        DataTypeEnum::F32 => crate::nary_direct::Storage2::F32(kb.read::<tile_ir::F32, 2>(tensor)),
+        DataTypeEnum::F16 => crate::nary_direct::Storage2::F16(kb.read::<tile_ir::F16, 2>(tensor)),
+        DataTypeEnum::U32 => crate::nary_direct::Storage2::U32(kb.read::<tile_ir::U32, 2>(tensor)),
     }
-    index
 }
 
-fn linear_group(
-    program: &tile_ir::tile::TileBlock<'_>,
-    dispatch_size: [u32; 3],
-) -> tile_ir::tile::Tile {
-    program.program_id(tile_ir::WorkgroupAxis::X)
-        + program.program_id(tile_ir::WorkgroupAxis::Y) * dispatch_size[0]
-        + program.program_id(tile_ir::WorkgroupAxis::Z)
-            * dispatch_size[0].saturating_mul(dispatch_size[1])
+fn storage_write<B>(
+    kb: &mut tile_ir::KernelBuilder<B>,
+    datatype: DataTypeEnum,
+    tensor: tile_ir::KernelTensorRef<B>,
+) -> crate::nary_direct::Storage2 {
+    match datatype {
+        DataTypeEnum::F32 => crate::nary_direct::Storage2::F32(kb.write::<tile_ir::F32, 2>(tensor)),
+        DataTypeEnum::F16 => crate::nary_direct::Storage2::F16(kb.write::<tile_ir::F16, 2>(tensor)),
+        DataTypeEnum::U32 => crate::nary_direct::Storage2::U32(kb.write::<tile_ir::U32, 2>(tensor)),
+    }
+}
+
+fn output_dims_from_flat_u32(
+    flat: tile_ir::tile::Tile<tile_ir::U32>,
+    shape: &[u32],
+) -> Vec<tile_ir::tile::Tile<tile_ir::U32>> {
+    let shape = shape.iter().map(|dim| *dim as usize).collect::<Vec<_>>();
+    output_dims_from_flat(flat, &shape)
 }
 
 fn flat_layout(allocation_len: u32) -> tile_ir::Layout {
@@ -236,42 +240,10 @@ fn flat_layout(allocation_len: u32) -> tile_ir::Layout {
     )
 }
 
-fn cast_tile(
-    value: tile_ir::tile::Tile,
-    source: DataTypeEnum,
-    target: DataTypeEnum,
-) -> tile_ir::tile::Tile {
-    if source == target {
-        value
-    } else {
-        value.cast(tile_element(target))
-    }
-}
-
-fn tile_u32(value: u32) -> tile_ir::tile::Tile {
-    tile_ir::tile::Tile::literal(tile_ir::TileLiteral::U32(value))
-}
-
-fn zero_literal(value: DataTypeEnum) -> tile_ir::TileLiteral {
-    match value {
-        DataTypeEnum::F32 => tile_ir::TileLiteral::F32(tile_ir::F32Bits::new(0.0)),
-        DataTypeEnum::F16 => tile_ir::TileLiteral::F16(half::f16::from_f32(0.0).to_bits()),
-        DataTypeEnum::U32 => tile_ir::TileLiteral::U32(0),
-    }
-}
-
-fn tile_element(value: DataTypeEnum) -> tile_ir::ElementType {
-    match value {
-        DataTypeEnum::F32 => tile_ir::ElementType::F32,
-        DataTypeEnum::F16 => tile_ir::ElementType::F16,
-        DataTypeEnum::U32 => tile_ir::ElementType::U32,
-    }
-}
-
 #[derive(Clone)]
 struct TensorMeta {
     datatype: DataTypeEnum,
-    element: tile_ir::ElementType,
+    shape: Vec<u32>,
     strides: Vec<u32>,
     offset: u32,
     allocation_len: u32,
@@ -281,7 +253,14 @@ impl TensorMeta {
     fn new(tensor: &TensorData) -> Option<Self> {
         Some(Self {
             datatype: tensor.datatype(),
-            element: tile_element(tensor.datatype()),
+            shape: tensor
+                .layout()
+                .shape()
+                .iter()
+                .copied()
+                .map(u32::try_from)
+                .collect::<Result<_, _>>()
+                .ok()?,
             strides: tensor
                 .layout()
                 .strides()
@@ -293,6 +272,16 @@ impl TensorMeta {
             offset: tensor.layout().offset().try_into().ok()?,
             allocation_len: layout_allocation_len(tensor.layout())?,
         })
+    }
+
+    fn as_nary_meta(&self) -> crate::nary_direct::TensorMeta {
+        crate::nary_direct::TensorMeta {
+            datatype: self.datatype,
+            shape: self.shape.clone(),
+            strides: self.strides.clone(),
+            offset: self.offset,
+            allocation_len: self.allocation_len,
+        }
     }
 }
 

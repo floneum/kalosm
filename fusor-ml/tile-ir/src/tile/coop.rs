@@ -4,6 +4,7 @@ use super::value::boxed_index;
 use super::*;
 use crate::ir::{
     CoopElement, CoopMatrixRole, CoopOperandRole, ElementType, Expr, Numeric, TileRef, TileStmt,
+    U32,
 };
 
 /// Workgroup tile coordinates for `TileBlock::mma_from_tiles`.
@@ -33,9 +34,13 @@ impl From<CoopRole> for CoopOperandRole {
 
 impl CoopTileLoad {
     /// Create a cooperative tile-load descriptor.
-    pub fn new(tile: TileRef, row: impl Into<Tile>, col: impl Into<Tile>) -> Self {
+    pub fn new(
+        tile: impl Into<TileRef>,
+        row: impl Into<Tile<U32>>,
+        col: impl Into<Tile<U32>>,
+    ) -> Self {
         Self {
-            tile,
+            tile: tile.into(),
             row: boxed_index(row),
             col: boxed_index(col),
         }
@@ -90,13 +95,13 @@ impl TileBlock<'_> {
     /// Copy a dense storage tile into workgroup memory.
     pub fn copy_storage_to_tile<T: Numeric>(
         &mut self,
-        dst: TileRef,
+        dst: impl Into<TileRef>,
         src: &Storage<T, 2>,
-        row_offset: impl Into<Tile>,
-        col_offset: impl Into<Tile>,
+        row_offset: impl Into<Tile<U32>>,
+        col_offset: impl Into<Tile<U32>>,
     ) {
         self.push_stmt(TileStmt::CopyToWorkgroupTile {
-            dst,
+            dst: dst.into(),
             src: crate::ir::CopySource::Storage(src.view.clone()),
             row_offset: boxed_index(row_offset),
             col_offset: boxed_index(col_offset),
@@ -106,13 +111,13 @@ impl TileBlock<'_> {
     /// Copy and dequantize a quantized matrix tile into workgroup memory.
     pub fn copy_quant_to_tile(
         &mut self,
-        dst: TileRef,
+        dst: impl Into<TileRef>,
         src: &crate::quantized::QuantizedMatrix,
-        row_offset: impl Into<Tile>,
-        col_offset: impl Into<Tile>,
+        row_offset: impl Into<Tile<U32>>,
+        col_offset: impl Into<Tile<U32>>,
     ) {
         self.push_stmt(TileStmt::CopyToWorkgroupTile {
-            dst,
+            dst: dst.into(),
             src: crate::ir::CopySource::Quantized(src.clone()),
             row_offset: boxed_index(row_offset),
             col_offset: boxed_index(col_offset),
@@ -139,9 +144,9 @@ impl TileBlock<'_> {
     /// Build a cooperative tile-load descriptor for later use.
     pub fn coop_tile_load(
         &self,
-        tile: TileRef,
-        row: impl Into<Tile>,
-        col: impl Into<Tile>,
+        tile: impl Into<TileRef>,
+        row: impl Into<Tile<U32>>,
+        col: impl Into<Tile<U32>>,
     ) -> CoopTileLoad {
         CoopTileLoad::new(tile, row, col)
     }
@@ -209,8 +214,8 @@ impl TileBlock<'_> {
         &mut self,
         acc: &CoopAcc<T, ROWS, COLS>,
         dst: &Storage<T, 2>,
-        row: impl Into<Tile>,
-        col: impl Into<Tile>,
+        row: impl Into<Tile<U32>>,
+        col: impl Into<Tile<U32>>,
     ) {
         self.push_stmt(TileStmt::StoreCoopAcc {
             acc: acc.local,

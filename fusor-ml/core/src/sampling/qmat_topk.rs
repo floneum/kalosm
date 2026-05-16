@@ -48,6 +48,9 @@ pub(super) fn qmat_logits_data_with_encoder(
         matrix,
         &logits_2d,
         "q_mat_logits_for_sampler",
+        None,
+        None,
+        None,
     )?;
     kernel.run(device, encoder);
 

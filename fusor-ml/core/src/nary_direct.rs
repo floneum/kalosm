@@ -137,6 +137,192 @@ impl NaryOperation {
     }
 }
 
+#[derive(Clone)]
+pub(crate) enum ValueTile {
+    F32(tile_ir::tile::Tile<tile_ir::F32>),
+    F16(tile_ir::tile::Tile<tile_ir::F16>),
+    U32(tile_ir::tile::Tile<tile_ir::U32>),
+    Bool(tile_ir::tile::Mask),
+}
+
+impl ValueTile {
+    pub(crate) fn cast_to(self, target: DataTypeEnum) -> Self {
+        match (self, target) {
+            (Self::F32(v), DataTypeEnum::F32) => Self::F32(v),
+            (Self::F32(v), DataTypeEnum::F16) => Self::F16(v.cast::<tile_ir::F16>()),
+            (Self::F32(v), DataTypeEnum::U32) => Self::U32(v.cast::<tile_ir::U32>()),
+            (Self::F16(v), DataTypeEnum::F32) => Self::F32(v.cast::<tile_ir::F32>()),
+            (Self::F16(v), DataTypeEnum::F16) => Self::F16(v),
+            (Self::F16(v), DataTypeEnum::U32) => Self::U32(v.cast::<tile_ir::U32>()),
+            (Self::U32(v), DataTypeEnum::F32) => Self::F32(v.cast::<tile_ir::F32>()),
+            (Self::U32(v), DataTypeEnum::F16) => Self::F16(v.cast::<tile_ir::F16>()),
+            (Self::U32(v), DataTypeEnum::U32) => Self::U32(v),
+            (Self::Bool(v), DataTypeEnum::F32) => Self::F32(bool_as_f32(v)),
+            (Self::Bool(v), DataTypeEnum::F16) => Self::F16(bool_as_f32(v).cast::<tile_ir::F16>()),
+            (Self::Bool(v), DataTypeEnum::U32) => Self::U32(bool_as_u32(v)),
+        }
+    }
+
+    pub(crate) fn into_f32(self) -> tile_ir::tile::Tile {
+        match self.cast_to(DataTypeEnum::F32) {
+            Self::F32(v) => v,
+            _ => unreachable!(),
+        }
+    }
+
+    pub(crate) fn into_f16(self) -> tile_ir::tile::Tile<tile_ir::F16> {
+        match self.cast_to(DataTypeEnum::F16) {
+            Self::F16(v) => v,
+            _ => unreachable!(),
+        }
+    }
+
+    pub(crate) fn into_u32(self) -> tile_ir::tile::Tile<tile_ir::U32> {
+        match self.cast_to(DataTypeEnum::U32) {
+            Self::U32(v) => v,
+            _ => unreachable!(),
+        }
+    }
+
+    pub(crate) fn into_mask(self) -> tile_ir::tile::Mask {
+        match self {
+            Self::Bool(v) => v,
+            Self::F32(v) => v.ne(0.0),
+            Self::F16(v) => v.ne(tile_ir::tile::Tile::<tile_ir::F16>::literal_bits(0)),
+            Self::U32(v) => v.ne(0u32),
+        }
+    }
+
+    fn unary(self, op: tile_ir::TileUnaryOp) -> Self {
+        match self {
+            Self::F32(v) => Self::F32(v.unary(op)),
+            Self::F16(v) => Self::F16(v.unary(op)),
+            Self::U32(v) => Self::U32(v.unary(op)),
+            Self::Bool(v) => Self::Bool(v.unary(op)),
+        }
+    }
+
+    pub(crate) fn binary(self, op: tile_ir::TileBinaryOp, rhs: Self) -> Self {
+        match (self, rhs) {
+            (Self::F32(a), Self::F32(b)) => Self::F32(a.binary(op, b)),
+            (Self::F16(a), Self::F16(b)) => Self::F16(a.binary(op, b)),
+            (Self::U32(a), Self::U32(b)) => Self::U32(a.binary(op, b)),
+            (Self::Bool(a), Self::Bool(b)) => Self::Bool(a.binary(op, b)),
+            _ => panic!("nary direct binary op called with mismatched tile types"),
+        }
+    }
+
+    fn compare(self, op: tile_ir::TileCompareOp, rhs: Self, output: DataTypeEnum) -> Self {
+        let mask = match (self, rhs) {
+            (Self::F32(a), Self::F32(b)) => tile_ir::tile::Tile::compare_bool(op, a, b),
+            (Self::F16(a), Self::F16(b)) => tile_ir::tile::Tile::compare_bool(op, a, b),
+            (Self::U32(a), Self::U32(b)) => tile_ir::tile::Tile::compare_bool(op, a, b),
+            (Self::Bool(a), Self::Bool(b)) => tile_ir::tile::Tile::compare_bool(op, a, b),
+            _ => panic!("nary direct compare called with mismatched tile types"),
+        };
+        ValueTile::Bool(mask).cast_to(output)
+    }
+}
+
+fn bool_as_f32(value: tile_ir::tile::Mask) -> tile_ir::tile::Tile {
+    tile_ir::tile::Tile::select(value, 1.0.into(), 0.0.into())
+}
+
+fn bool_as_u32(value: tile_ir::tile::Mask) -> tile_ir::tile::Tile<tile_ir::U32> {
+    tile_ir::tile::Tile::select(value, 1u32.into(), 0u32.into())
+}
+
+pub(crate) enum Storage2 {
+    F32(tile_ir::tile::Storage<tile_ir::F32, 2>),
+    F16(tile_ir::tile::Storage<tile_ir::F16, 2>),
+    U32(tile_ir::tile::Storage<tile_ir::U32, 2>),
+}
+
+impl Storage2 {
+    pub(crate) fn load(
+        &self,
+        program: &tile_ir::tile::TileBlock<'_>,
+        index: tile_ir::tile::Tile<tile_ir::U32>,
+        mask: tile_ir::tile::Mask,
+    ) -> ValueTile {
+        match self {
+            Self::F32(storage) => ValueTile::F32(program.load(
+                storage.at((0u32, index)),
+                mask,
+                zero_literal(DataTypeEnum::F32),
+            )),
+            Self::F16(storage) => ValueTile::F16(program.load(
+                storage.at((0u32, index)),
+                mask,
+                zero_literal(DataTypeEnum::F16),
+            )),
+            Self::U32(storage) => ValueTile::U32(program.load(
+                storage.at((0u32, index)),
+                mask,
+                zero_literal(DataTypeEnum::U32),
+            )),
+        }
+    }
+
+    pub(crate) fn store(
+        &self,
+        program: &mut tile_ir::tile::TileBlock<'_>,
+        index: tile_ir::tile::Tile<tile_ir::U32>,
+        value: ValueTile,
+        mask: tile_ir::tile::Mask,
+    ) {
+        match self {
+            Self::F32(storage) => {
+                if let ValueTile::F32(value) = value.cast_to(DataTypeEnum::F32) {
+                    program.store(storage.at((0u32, index)), value, mask);
+                }
+            }
+            Self::F16(storage) => {
+                if let ValueTile::F16(value) = value.cast_to(DataTypeEnum::F16) {
+                    program.store(storage.at((0u32, index)), value, mask);
+                }
+            }
+            Self::U32(storage) => {
+                if let ValueTile::U32(value) = value.cast_to(DataTypeEnum::U32) {
+                    program.store(storage.at((0u32, index)), value, mask);
+                }
+            }
+        }
+    }
+}
+
+pub(crate) fn declare_storage(
+    phase: &mut tile_ir::tile::Program,
+    meta: &TensorMeta,
+    write: bool,
+) -> Storage2 {
+    let layout = tile_ir::Layout::strided(
+        tile_ir::MemoryLevel::Storage,
+        tile_ir::Shape::new([1, meta.allocation_len]),
+        &[0, 1],
+    );
+    match (meta.datatype, write) {
+        (DataTypeEnum::F32, true) => {
+            Storage2::F32(phase.storage_write_with_layout_offset::<tile_ir::F32, 2>(layout, 0))
+        }
+        (DataTypeEnum::F32, false) => {
+            Storage2::F32(phase.storage_read_with_layout_offset::<tile_ir::F32, 2>(layout, 0))
+        }
+        (DataTypeEnum::F16, true) => {
+            Storage2::F16(phase.storage_write_with_layout_offset::<tile_ir::F16, 2>(layout, 0))
+        }
+        (DataTypeEnum::F16, false) => {
+            Storage2::F16(phase.storage_read_with_layout_offset::<tile_ir::F16, 2>(layout, 0))
+        }
+        (DataTypeEnum::U32, true) => {
+            Storage2::U32(phase.storage_write_with_layout_offset::<tile_ir::U32, 2>(layout, 0))
+        }
+        (DataTypeEnum::U32, false) => {
+            Storage2::U32(phase.storage_read_with_layout_offset::<tile_ir::U32, 2>(layout, 0))
+        }
+    }
+}
+
 fn build_nary_tile_ir(
     operation: &NaryOperation,
     tensors: &[TensorData],
@@ -156,18 +342,7 @@ fn build_nary_tile_ir(
         let storages = tensor_metas
             .iter()
             .enumerate()
-            .map(|(binding, meta)| {
-                let layout = tile_ir::Layout::strided(
-                    tile_ir::MemoryLevel::Storage,
-                    tile_ir::Shape::new([1, meta.allocation_len]),
-                    &[0, 1],
-                );
-                if binding == output_index {
-                    phase.storage_write_element_with_layout_offset::<2>(meta.element, layout, 0)
-                } else {
-                    phase.storage_read_element_with_layout_offset::<2>(meta.element, layout, 0)
-                }
-            })
+            .map(|(binding, meta)| declare_storage(phase, meta, binding == output_index))
             .collect::<Vec<_>>();
 
         phase.program_grid::<BLOCK>(dispatch_size, |program| {
@@ -175,8 +350,7 @@ fn build_nary_tile_ir(
             let group = linear_group(program, dispatch_size);
             let flat_index = group * BLOCK as u32 + lane.clone();
             let in_bounds = flat_index.lt(total_elements);
-            let flat_value = tile_ir::tile::Tile::from_index(flat_index.clone());
-            let dims = output_dims_from_flat(flat_value, &operation.shape);
+            let dims = output_dims_from_flat(flat_index.clone(), &operation.shape);
             let (value, value_ty) = eval_nary_expr(
                 program,
                 &operation.expression,
@@ -185,13 +359,10 @@ fn build_nary_tile_ir(
                 &tensor_metas,
                 in_bounds.clone(),
             );
-            let value = cast_tile(value, value_ty, operation.output_datatype);
+            let value = value.cast_to(operation.output_datatype);
+            debug_assert_eq!(value_ty, operation.output_datatype);
             let output_index_value = layout_index(&tensor_metas[output_index], &dims);
-            program.store(
-                storages[output_index].at((0, output_index_value)),
-                value,
-                in_bounds,
-            );
+            storages[output_index].store(program, output_index_value, value, in_bounds);
         });
     }))
 }
@@ -199,11 +370,11 @@ fn build_nary_tile_ir(
 fn eval_nary_expr(
     program: &mut tile_ir::tile::TileBlock<'_>,
     expr: &NaryExpr,
-    dims: &[tile_ir::tile::Tile],
-    storages: &[tile_ir::tile::Storage<tile_ir::tile::RuntimeElement, 2>],
+    dims: &[tile_ir::tile::Tile<tile_ir::U32>],
+    storages: &[Storage2],
     metas: &[TensorMeta],
     mask: tile_ir::tile::Mask,
-) -> (tile_ir::tile::Tile, DataTypeEnum) {
+) -> (ValueTile, DataTypeEnum) {
     match expr {
         NaryExpr::Op { children, function } => {
             let mut values = children
@@ -212,54 +383,115 @@ fn eval_nary_expr(
                 .map(|(child, expected)| {
                     let (value, ty) =
                         eval_nary_expr(program, child, dims, storages, metas, mask.clone());
-                    (cast_tile(value, ty, *expected), *expected)
+                    (value.cast_to(*expected), ty)
                 })
                 .collect::<Vec<_>>();
             (emit_function(function, &mut values), function.output_type)
         }
         NaryExpr::IndexedInput { input_idx, indices } => {
             let meta = &metas[*input_idx];
-            let storage = &storages[*input_idx];
             let coords = indices
                 .iter()
                 .map(|index| {
-                    let (value, ty) =
+                    let (value, _) =
                         eval_nary_expr(program, index, dims, storages, metas, mask.clone());
-                    cast_tile(value, ty, DataTypeEnum::U32)
+                    match value.cast_to(DataTypeEnum::U32) {
+                        ValueTile::U32(value) => value,
+                        _ => unreachable!(),
+                    }
                 })
                 .collect::<Vec<_>>();
             let index = layout_index(meta, &coords);
-            let value = program.load(storage.at((0, index)), mask, zero_literal(meta.datatype));
+            let value = storages[*input_idx].load(program, index, mask);
             (value, meta.datatype)
         }
-        NaryExpr::DimIndex(dim) => (dims[*dim].clone(), DataTypeEnum::U32),
+        NaryExpr::DimIndex(dim) => (ValueTile::U32(dims[*dim].clone()), DataTypeEnum::U32),
         NaryExpr::Scalar(value) => (tile_literal(*value), value.datatype()),
     }
 }
 
-fn emit_function(
-    function: &NaryFunction,
-    values: &mut [(tile_ir::tile::Tile, DataTypeEnum)],
-) -> tile_ir::tile::Tile {
+fn emit_function(function: &NaryFunction, values: &mut [(ValueTile, DataTypeEnum)]) -> ValueTile {
     match function.op {
-        NaryOp::Add => values[0].0.clone() + values[1].0.clone(),
-        NaryOp::Sub => values[0].0.clone() - values[1].0.clone(),
-        NaryOp::Mul => values[0].0.clone() * values[1].0.clone(),
-        NaryOp::Div => values[0].0.clone() / values[1].0.clone(),
-        NaryOp::Rem => values[0].0.clone() % values[1].0.clone(),
+        NaryOp::Add => values[0]
+            .0
+            .clone()
+            .binary(tile_ir::TileBinaryOp::Add, values[1].0.clone()),
+        NaryOp::Sub => values[0]
+            .0
+            .clone()
+            .binary(tile_ir::TileBinaryOp::Sub, values[1].0.clone()),
+        NaryOp::Mul => values[0]
+            .0
+            .clone()
+            .binary(tile_ir::TileBinaryOp::Mul, values[1].0.clone()),
+        NaryOp::Div => values[0]
+            .0
+            .clone()
+            .binary(tile_ir::TileBinaryOp::Div, values[1].0.clone()),
+        NaryOp::Rem => values[0]
+            .0
+            .clone()
+            .binary(tile_ir::TileBinaryOp::Rem, values[1].0.clone()),
         NaryOp::Pow => values[0]
             .0
             .clone()
             .binary(tile_ir::TileBinaryOp::Pow, values[1].0.clone()),
-        NaryOp::Min => values[0].0.clone().min(values[1].0.clone()),
-        NaryOp::Max => values[0].0.clone().max(values[1].0.clone()),
+        NaryOp::Min => values[0]
+            .0
+            .clone()
+            .binary(tile_ir::TileBinaryOp::Min, values[1].0.clone()),
+        NaryOp::Max => values[0]
+            .0
+            .clone()
+            .binary(tile_ir::TileBinaryOp::Max, values[1].0.clone()),
         NaryOp::Neg => values[0].0.clone().unary(tile_ir::TileUnaryOp::Neg),
-        NaryOp::Cast => values[0].0.clone().cast(tile_element(function.output_type)),
-        NaryOp::Select => tile_ir::tile::Tile::select(
-            values[0].0.clone(),
-            values[1].0.clone(),
-            values[2].0.clone(),
-        ),
+        NaryOp::Cast => values[0].0.clone().cast_to(function.output_type),
+        NaryOp::Select => match values[1].0.clone().cast_to(function.output_type) {
+            ValueTile::F32(a) => {
+                if let ValueTile::F32(b) = values[2].0.clone().cast_to(function.output_type) {
+                    ValueTile::F32(tile_ir::tile::Tile::select(
+                        values[0].0.clone().into_mask(),
+                        a,
+                        b,
+                    ))
+                } else {
+                    unreachable!()
+                }
+            }
+            ValueTile::F16(a) => {
+                if let ValueTile::F16(b) = values[2].0.clone().cast_to(function.output_type) {
+                    ValueTile::F16(tile_ir::tile::Tile::select(
+                        values[0].0.clone().into_mask(),
+                        a,
+                        b,
+                    ))
+                } else {
+                    unreachable!()
+                }
+            }
+            ValueTile::U32(a) => {
+                if let ValueTile::U32(b) = values[2].0.clone().cast_to(function.output_type) {
+                    ValueTile::U32(tile_ir::tile::Tile::select(
+                        values[0].0.clone().into_mask(),
+                        a,
+                        b,
+                    ))
+                } else {
+                    unreachable!()
+                }
+            }
+            ValueTile::Bool(a) => {
+                if let ValueTile::Bool(b) = values[2].0.clone().cast_to(function.output_type) {
+                    ValueTile::Bool(tile_ir::tile::Tile::select(
+                        values[0].0.clone().into_mask(),
+                        a,
+                        b,
+                    ))
+                } else {
+                    unreachable!()
+                }
+            }
+        },
         NaryOp::Exp | NaryOp::ApproximateExp | NaryOp::LessApproximateExp => {
             values[0].0.clone().unary(tile_ir::TileUnaryOp::Exp)
         }
@@ -311,20 +543,47 @@ fn emit_function(
             &values[1],
             function.output_type,
         ),
-        NaryOp::AddConst(scalar) => values[0].0.clone() + tile_literal(scalar),
-        NaryOp::SubConst(scalar) => values[0].0.clone() - tile_literal(scalar),
-        NaryOp::RSubConst(scalar) => tile_literal(scalar) - values[0].0.clone(),
-        NaryOp::MulConst(scalar) => values[0].0.clone() * tile_literal(scalar),
-        NaryOp::DivConst(scalar) => values[0].0.clone() / tile_literal(scalar),
-        NaryOp::RDivConst(scalar) => tile_literal(scalar) / values[0].0.clone(),
-        NaryOp::RemConst(scalar) => values[0].0.clone() % tile_literal(scalar),
-        NaryOp::RRemConst(scalar) => tile_literal(scalar) % values[0].0.clone(),
-        NaryOp::PowConst(scalar) => values[0]
-            .0
-            .clone()
-            .binary(tile_ir::TileBinaryOp::Pow, tile_literal(scalar)),
-        NaryOp::MinConst(scalar) => values[0].0.clone().min(tile_literal(scalar)),
-        NaryOp::MaxConst(scalar) => values[0].0.clone().max(tile_literal(scalar)),
+        NaryOp::AddConst(scalar) => values[0].0.clone().binary(
+            tile_ir::TileBinaryOp::Add,
+            tile_literal(scalar).cast_to(values[0].1),
+        ),
+        NaryOp::SubConst(scalar) => values[0].0.clone().binary(
+            tile_ir::TileBinaryOp::Sub,
+            tile_literal(scalar).cast_to(values[0].1),
+        ),
+        NaryOp::RSubConst(scalar) => tile_literal(scalar)
+            .cast_to(values[0].1)
+            .binary(tile_ir::TileBinaryOp::Sub, values[0].0.clone()),
+        NaryOp::MulConst(scalar) => values[0].0.clone().binary(
+            tile_ir::TileBinaryOp::Mul,
+            tile_literal(scalar).cast_to(values[0].1),
+        ),
+        NaryOp::DivConst(scalar) => values[0].0.clone().binary(
+            tile_ir::TileBinaryOp::Div,
+            tile_literal(scalar).cast_to(values[0].1),
+        ),
+        NaryOp::RDivConst(scalar) => tile_literal(scalar)
+            .cast_to(values[0].1)
+            .binary(tile_ir::TileBinaryOp::Div, values[0].0.clone()),
+        NaryOp::RemConst(scalar) => values[0].0.clone().binary(
+            tile_ir::TileBinaryOp::Rem,
+            tile_literal(scalar).cast_to(values[0].1),
+        ),
+        NaryOp::RRemConst(scalar) => tile_literal(scalar)
+            .cast_to(values[0].1)
+            .binary(tile_ir::TileBinaryOp::Rem, values[0].0.clone()),
+        NaryOp::PowConst(scalar) => values[0].0.clone().binary(
+            tile_ir::TileBinaryOp::Pow,
+            tile_literal(scalar).cast_to(values[0].1),
+        ),
+        NaryOp::MinConst(scalar) => values[0].0.clone().binary(
+            tile_ir::TileBinaryOp::Min,
+            tile_literal(scalar).cast_to(values[0].1),
+        ),
+        NaryOp::MaxConst(scalar) => values[0].0.clone().binary(
+            tile_ir::TileBinaryOp::Max,
+            tile_literal(scalar).cast_to(values[0].1),
+        ),
         NaryOp::EqualConst(scalar) => compare_const(
             tile_ir::TileCompareOp::Eq,
             &values[0],
@@ -358,32 +617,37 @@ fn emit_function(
     }
 }
 
-/// Evaluate a tile-evaluatable `NaryExpr` (no DimIndex, only element-wise
-/// IndexedInput leaves) over a vector of pre-loaded tile values. Used by the
-/// resolver to re-emit captured tensor-level expressions at the tile-IR level
-/// when fusing into kernels that materialize inputs in-register (e.g. the
-/// qgemv paired epilogue).
 pub(crate) fn eval_nary_expr_on_tiles(
     expr: &NaryExpr,
     inputs: &[(tile_ir::tile::Tile, DataTypeEnum)],
     output_dtype: DataTypeEnum,
 ) -> (tile_ir::tile::Tile, DataTypeEnum) {
+    let inputs = inputs
+        .iter()
+        .map(|(tile, dtype)| (ValueTile::F32(tile.clone()).cast_to(*dtype), *dtype))
+        .collect::<Vec<_>>();
+    let (value, dtype) = eval_nary_expr_on_value_tiles(expr, &inputs, output_dtype);
+    (value.into_f32(), dtype)
+}
+
+fn eval_nary_expr_on_value_tiles(
+    expr: &NaryExpr,
+    inputs: &[(ValueTile, DataTypeEnum)],
+    output_dtype: DataTypeEnum,
+) -> (ValueTile, DataTypeEnum) {
     match expr {
         NaryExpr::Op { children, function } => {
             let mut values = children
                 .iter()
                 .zip(&function.input_types)
                 .map(|(child, expected)| {
-                    let (value, ty) = eval_nary_expr_on_tiles(child, inputs, output_dtype);
-                    (cast_tile(value, ty, *expected), *expected)
+                    let (value, ty) = eval_nary_expr_on_value_tiles(child, inputs, output_dtype);
+                    (value.cast_to(*expected), ty)
                 })
                 .collect::<Vec<_>>();
             (emit_function(function, &mut values), function.output_type)
         }
-        NaryExpr::IndexedInput { input_idx, .. } => {
-            let (tile, ty) = inputs[*input_idx].clone();
-            (tile, ty)
-        }
+        NaryExpr::IndexedInput { input_idx, .. } => inputs[*input_idx].clone(),
         NaryExpr::Scalar(value) => (tile_literal(*value), value.datatype()),
         NaryExpr::DimIndex(_) => {
             panic!("eval_nary_expr_on_tiles called with a DimIndex leaf — not supported");
@@ -392,14 +656,16 @@ pub(crate) fn eval_nary_expr_on_tiles(
 }
 
 pub(crate) fn apply_unary_function_chain(
-    mut value: tile_ir::tile::Tile,
-    mut value_ty: DataTypeEnum,
+    value: tile_ir::tile::Tile,
+    value_ty: DataTypeEnum,
     chain: &UnaryFunctionChain,
 ) -> Option<(tile_ir::tile::Tile, DataTypeEnum)> {
     if chain.input_datatype() != value_ty {
         return None;
     }
 
+    let mut value = ValueTile::F32(value).cast_to(value_ty);
+    let mut value_ty = value_ty;
     for function in &chain.functions {
         if function.input_types.as_slice() != [value_ty] {
             return None;
@@ -408,47 +674,49 @@ pub(crate) fn apply_unary_function_chain(
         value = emit_function(function, &mut values);
         value_ty = function.output_type;
     }
-
-    Some((value, value_ty))
+    Some((value.into_f32(), value_ty))
 }
 
-fn tanh_exact(value: tile_ir::tile::Tile) -> tile_ir::tile::Tile {
+fn tanh_exact(value: ValueTile) -> ValueTile {
     let exp_pos = value.clone().unary(tile_ir::TileUnaryOp::Exp);
     let exp_neg = value
         .unary(tile_ir::TileUnaryOp::Neg)
         .unary(tile_ir::TileUnaryOp::Exp);
-    (exp_pos.clone() - exp_neg.clone()) / (exp_pos + exp_neg)
+    exp_pos
+        .clone()
+        .binary(tile_ir::TileBinaryOp::Sub, exp_neg.clone())
+        .binary(
+            tile_ir::TileBinaryOp::Div,
+            exp_pos.binary(tile_ir::TileBinaryOp::Add, exp_neg),
+        )
 }
 
 fn compare_tile(
     op: tile_ir::TileCompareOp,
-    left: &(tile_ir::tile::Tile, DataTypeEnum),
-    right: &(tile_ir::tile::Tile, DataTypeEnum),
+    left: &(ValueTile, DataTypeEnum),
+    right: &(ValueTile, DataTypeEnum),
     output: DataTypeEnum,
-) -> tile_ir::tile::Tile {
-    tile_ir::tile::Tile::compare(
-        op,
-        left.0.clone(),
-        cast_tile(right.0.clone(), right.1, left.1),
-        tile_element(output),
-    )
+) -> ValueTile {
+    left.0
+        .clone()
+        .compare(op, right.0.clone().cast_to(left.1), output)
 }
 
 fn compare_const(
     op: tile_ir::TileCompareOp,
-    left: &(tile_ir::tile::Tile, DataTypeEnum),
+    left: &(ValueTile, DataTypeEnum),
     scalar: NaryScalar,
     output: DataTypeEnum,
-) -> tile_ir::tile::Tile {
-    tile_ir::tile::Tile::compare(
-        op,
-        left.0.clone(),
-        cast_tile(tile_literal(scalar), scalar.datatype(), left.1),
-        tile_element(output),
-    )
+) -> ValueTile {
+    left.0
+        .clone()
+        .compare(op, tile_literal(scalar).cast_to(left.1), output)
 }
 
-fn output_dims_from_flat(flat: tile_ir::tile::Tile, shape: &[usize]) -> Vec<tile_ir::tile::Tile> {
+pub(crate) fn output_dims_from_flat(
+    flat: tile_ir::tile::Tile<tile_ir::U32>,
+    shape: &[usize],
+) -> Vec<tile_ir::tile::Tile<tile_ir::U32>> {
     (0..shape.len())
         .map(|axis| {
             let dim = shape[axis] as u32;
@@ -468,7 +736,10 @@ fn output_dims_from_flat(flat: tile_ir::tile::Tile, shape: &[usize]) -> Vec<tile
         .collect()
 }
 
-fn layout_index(meta: &TensorMeta, coords: &[tile_ir::tile::Tile]) -> tile_ir::tile::Tile {
+pub(crate) fn layout_index(
+    meta: &TensorMeta,
+    coords: &[tile_ir::tile::Tile<tile_ir::U32>],
+) -> tile_ir::tile::Tile<tile_ir::U32> {
     let mut index = tile_u32(meta.offset);
     for (axis, (coord, stride)) in coords.iter().zip(&meta.strides).enumerate() {
         if *stride == 0 || meta.shape.get(axis).copied() == Some(1) {
@@ -479,41 +750,35 @@ fn layout_index(meta: &TensorMeta, coords: &[tile_ir::tile::Tile]) -> tile_ir::t
     index
 }
 
-fn linear_group(
+pub(crate) fn linear_group(
     program: &tile_ir::tile::TileBlock<'_>,
     dispatch_size: [u32; 3],
-) -> tile_ir::tile::Tile {
+) -> tile_ir::tile::Tile<tile_ir::U32> {
     program.program_id(tile_ir::WorkgroupAxis::X)
         + program.program_id(tile_ir::WorkgroupAxis::Y) * dispatch_size[0]
         + program.program_id(tile_ir::WorkgroupAxis::Z)
             * dispatch_size[0].saturating_mul(dispatch_size[1])
 }
 
-fn cast_tile(
-    value: tile_ir::tile::Tile,
-    source: DataTypeEnum,
-    target: DataTypeEnum,
-) -> tile_ir::tile::Tile {
-    if source == target {
-        value
-    } else {
-        value.cast(tile_element(target))
+pub(crate) fn tile_literal(value: NaryScalar) -> ValueTile {
+    match value {
+        NaryScalar::F32(value) => ValueTile::F32(tile_ir::tile::Tile::literal(
+            tile_ir::TileLiteral::F32(tile_ir::F32Bits::new(value)),
+        )),
+        NaryScalar::F16(value) => ValueTile::F16(tile_ir::tile::Tile::literal(
+            tile_ir::TileLiteral::F16(value.to_bits()),
+        )),
+        NaryScalar::U32(value) => ValueTile::U32(tile_ir::tile::Tile::literal(
+            tile_ir::TileLiteral::U32(value),
+        )),
     }
 }
 
-fn tile_literal(value: NaryScalar) -> tile_ir::tile::Tile {
-    tile_ir::tile::Tile::literal(match value {
-        NaryScalar::F32(value) => tile_ir::TileLiteral::F32(tile_ir::F32Bits::new(value)),
-        NaryScalar::F16(value) => tile_ir::TileLiteral::F16(value.to_bits()),
-        NaryScalar::U32(value) => tile_ir::TileLiteral::U32(value),
-    })
-}
-
-fn tile_u32(value: u32) -> tile_ir::tile::Tile {
+pub(crate) fn tile_u32(value: u32) -> tile_ir::tile::Tile<tile_ir::U32> {
     tile_ir::tile::Tile::literal(tile_ir::TileLiteral::U32(value))
 }
 
-fn zero_literal(value: DataTypeEnum) -> tile_ir::TileLiteral {
+pub(crate) fn zero_literal(value: DataTypeEnum) -> tile_ir::TileLiteral {
     match value {
         DataTypeEnum::F32 => tile_ir::TileLiteral::F32(tile_ir::F32Bits::new(0.0)),
         DataTypeEnum::F16 => tile_ir::TileLiteral::F16(half::f16::from_f32(0.0).to_bits()),
@@ -521,29 +786,19 @@ fn zero_literal(value: DataTypeEnum) -> tile_ir::TileLiteral {
     }
 }
 
-fn tile_element(value: DataTypeEnum) -> tile_ir::ElementType {
-    match value {
-        DataTypeEnum::F32 => tile_ir::ElementType::F32,
-        DataTypeEnum::F16 => tile_ir::ElementType::F16,
-        DataTypeEnum::U32 => tile_ir::ElementType::U32,
-    }
-}
-
 #[derive(Clone)]
-struct TensorMeta {
-    datatype: DataTypeEnum,
-    element: tile_ir::ElementType,
-    shape: Vec<u32>,
-    strides: Vec<u32>,
-    offset: u32,
-    allocation_len: u32,
+pub(crate) struct TensorMeta {
+    pub(crate) datatype: DataTypeEnum,
+    pub(crate) shape: Vec<u32>,
+    pub(crate) strides: Vec<u32>,
+    pub(crate) offset: u32,
+    pub(crate) allocation_len: u32,
 }
 
 impl TensorMeta {
     fn new(tensor: &TensorData) -> Option<Self> {
         Some(Self {
             datatype: tensor.datatype(),
-            element: tile_element(tensor.datatype()),
             shape: tensor
                 .layout()
                 .shape()

@@ -2,7 +2,7 @@ use std::marker::PhantomData;
 
 use super::value::boxed_index;
 use super::*;
-use crate::ir::{AxisGroup, Layout, MultiFlattenMap, Shape, StorageView, SubAxis};
+use crate::ir::{AxisGroup, Layout, MultiFlattenMap, Shape, StorageView, SubAxis, U32};
 
 /// Typed handle to a storage buffer view declared on a [`Program`].
 ///
@@ -26,7 +26,7 @@ pub trait StorageIndex<const R: usize> {
 
 impl<I> StorageIndex<1> for I
 where
-    I: Into<Tile>,
+    I: Into<Tile<U32>>,
 {
     fn storage_index(self) -> [Box<crate::ir::Expr>; 1] {
         [boxed_index(self)]
@@ -35,7 +35,7 @@ where
 
 impl<I> StorageIndex<1> for (I,)
 where
-    I: Into<Tile>,
+    I: Into<Tile<U32>>,
 {
     fn storage_index(self) -> [Box<crate::ir::Expr>; 1] {
         [boxed_index(self.0)]
@@ -44,7 +44,7 @@ where
 
 impl<I, const R: usize> StorageIndex<R> for [I; R]
 where
-    I: Into<Tile>,
+    I: Into<Tile<U32>>,
 {
     fn storage_index(self) -> [Box<crate::ir::Expr>; R] {
         self.map(boxed_index)
@@ -55,7 +55,7 @@ macro_rules! impl_tuple_storage_index {
     ($rank:literal, $($name:ident),+ $(,)?) => {
         impl<$($name),+> StorageIndex<$rank> for ($($name,)+)
         where
-            $($name: Into<Tile>,)+
+            $($name: Into<Tile<U32>>,)+
         {
             #[allow(non_snake_case)]
             fn storage_index(self) -> [Box<crate::ir::Expr>; $rank] {

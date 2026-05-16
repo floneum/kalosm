@@ -89,7 +89,14 @@ fn qmatmul_ir(format: GgmlQuantFormat, m: u32, n: u32, k: u32) -> KernelIr {
         let b = tile_ir_kernels::quantized_matrix(phase, format, k, n);
         let y = phase.storage_write::<F32, 2>(Shape::new([m, n]));
 
-        tile_ir_kernels::qmatmul::<8, 4, 8>(phase, &a, &b, &y, 4);
+        tile_ir_kernels::qmatmul_with_epilogue::<8, 4, 8>(
+            phase,
+            &a,
+            &b,
+            &y,
+            4,
+            &tile_ir_kernels::QmatmulEpilogues::empty(),
+        );
     })
 }
 
@@ -99,7 +106,14 @@ fn qgemv_ir(format: GgmlQuantFormat, n: u32, k: u32) -> KernelIr {
         let b = tile_ir_kernels::quantized_matrix(phase, format, k, n);
         let y = phase.storage_write::<F32, 2>(Shape::new([1, n]));
 
-        tile_ir_kernels::qgemv::<4, 64>(phase, &a, &b, &y, 4, 1);
+        tile_ir_kernels::qgemv_with_epilogue::<4, 64>(
+            phase,
+            &a,
+            &b,
+            &y,
+            1,
+            Option::<&tile_ir_kernels::UnaryEpilogue>::None,
+        );
     })
 }
 

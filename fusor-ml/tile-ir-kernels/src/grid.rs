@@ -3,7 +3,7 @@
 //! `tile::build` entry point.
 
 use fusor_tile_ir::tile::{Mask, Storage, Tile, TileBlock};
-use fusor_tile_ir::{TileLiteral, WorkgroupAxis, F32};
+use fusor_tile_ir::{TileLiteral, WorkgroupAxis, F32, U32};
 
 #[derive(Clone)]
 pub(crate) struct Q4KActivations {
@@ -38,7 +38,7 @@ pub(crate) fn qgemv_grid<const SUBGROUPS: u32, const COLS_PER_SUBGROUP: usize>(
 }
 
 impl QgemvGrid {
-    pub(crate) fn mask(self, full_iterations: bool, in_bounds: Mask, col: &Tile) -> Mask {
+    pub(crate) fn mask(self, full_iterations: bool, in_bounds: Mask, col: &Tile<U32>) -> Mask {
         match (full_iterations, self.full_cols) {
             (true, true) => Mask::all(),
             (true, false) => col.lt(self.n_cols),
@@ -50,14 +50,14 @@ impl QgemvGrid {
 
 #[derive(Clone)]
 pub(crate) struct QgemvProgramScope {
-    pub(crate) col0: Tile,
-    pub(crate) lane: Tile,
+    pub(crate) col0: Tile<U32>,
+    pub(crate) lane: Tile<U32>,
 }
 
 pub(crate) struct QgemvStoreTarget<'a> {
     pub(crate) y: &'a Storage<F32, 2>,
-    pub(crate) col0: Tile,
-    pub(crate) lane: Tile,
+    pub(crate) col0: Tile<U32>,
+    pub(crate) lane: Tile<U32>,
     pub(crate) full_cols: bool,
     pub(crate) n_cols: u32,
     pub(crate) epilogues: &'a crate::types::QmatmulEpilogues<'a>,
@@ -101,8 +101,8 @@ pub(crate) fn store_qgemv_sums_with_epilogue<const COLS_PER_SUBGROUP: usize>(
 pub(crate) fn q4k_ggml_activations(
     program: &mut TileBlock<'_>,
     a: &Storage<F32, 2>,
-    row: impl Clone + Into<Tile>,
-    vector_base: &Tile,
+    row: impl Clone + Into<Tile<U32>>,
+    vector_base: &Tile<U32>,
     in_bounds: Mask,
 ) -> Q4KActivations {
     let load_quad = |program: &mut TileBlock<'_>, base: u32| -> [Tile; 16] {
@@ -140,12 +140,12 @@ pub(crate) fn q4k_ggml_activations(
 /// `ix = lane / 8` selects one of 4 K-blocks per workgroup pass and
 /// `(iq, ir) = (it / 4, it % 4)` indexes into the 8-byte sub-block.
 pub(crate) struct Q4KLane {
-    pub(crate) ix: Tile,
-    pub(crate) iq: Tile,
-    pub(crate) ir: Tile,
+    pub(crate) ix: Tile<U32>,
+    pub(crate) iq: Tile<U32>,
+    pub(crate) ir: Tile<U32>,
 }
 
-pub(crate) fn q4k_lane_decomposition(lane: &Tile) -> Q4KLane {
+pub(crate) fn q4k_lane_decomposition(lane: &Tile<U32>) -> Q4KLane {
     let ix = lane.clone() / 8;
     let it = lane.clone() % 8;
     let iq = it.clone() / 4;
@@ -154,13 +154,13 @@ pub(crate) fn q4k_lane_decomposition(lane: &Tile) -> Q4KLane {
 }
 
 pub(crate) struct Q4KGgmlIteration {
-    pub(crate) block: Tile,
+    pub(crate) block: Tile<U32>,
     pub(crate) in_bounds: Mask,
     pub(crate) activations: Q4KActivations,
 }
 
 pub(crate) struct Q4KGgmlIterationRequest<'a, Row> {
-    pub(crate) loop_index: Tile,
+    pub(crate) loop_index: Tile<U32>,
     pub(crate) a: &'a Storage<F32, 2>,
     pub(crate) row: Row,
     pub(crate) block_count: u32,
@@ -174,7 +174,7 @@ pub(crate) fn q4k_ggml_iteration<Row>(
     request: Q4KGgmlIterationRequest<'_, Row>,
 ) -> Q4KGgmlIteration
 where
-    Row: Clone + Into<Tile>,
+    Row: Clone + Into<Tile<U32>>,
 {
     let Q4KGgmlIterationRequest {
         loop_index,
@@ -201,13 +201,13 @@ where
 }
 
 pub(crate) struct Q6KLane {
-    pub(crate) ix: Tile,
-    pub(crate) ip: Tile,
-    pub(crate) il: Tile,
-    pub(crate) l0: Tile,
+    pub(crate) ix: Tile<U32>,
+    pub(crate) ip: Tile<U32>,
+    pub(crate) il: Tile<U32>,
+    pub(crate) l0: Tile<U32>,
 }
 
-pub(crate) fn q6k_lane_decomposition(lane: &Tile) -> Q6KLane {
+pub(crate) fn q6k_lane_decomposition(lane: &Tile<U32>) -> Q6KLane {
     let tid = lane.clone() / 2;
     let ix = lane.clone() % 2;
     let ip = tid.clone() / 8;
@@ -219,8 +219,8 @@ pub(crate) fn q6k_lane_decomposition(lane: &Tile) -> Q6KLane {
 pub(crate) fn q6k_ggml_activations(
     program: &mut TileBlock<'_>,
     a: &Storage<F32, 2>,
-    row: impl Clone + Into<Tile>,
-    vector_base: &Tile,
+    row: impl Clone + Into<Tile<U32>>,
+    vector_base: &Tile<U32>,
     in_bounds: Mask,
 ) -> [Tile; 16] {
     let a_bound: [Tile; 16] = std::array::from_fn(|j| {
@@ -236,13 +236,13 @@ pub(crate) fn q6k_ggml_activations(
 }
 
 pub(crate) struct Q6KGgmlIteration {
-    pub(crate) block: Tile,
+    pub(crate) block: Tile<U32>,
     pub(crate) in_bounds: Mask,
     pub(crate) activations: [Tile; 16],
 }
 
 pub(crate) struct Q6KGgmlIterationRequest<'a, Row> {
-    pub(crate) loop_index: Tile,
+    pub(crate) loop_index: Tile<U32>,
     pub(crate) a: &'a Storage<F32, 2>,
     pub(crate) row: Row,
     pub(crate) block_count: u32,
@@ -256,7 +256,7 @@ pub(crate) fn q6k_ggml_iteration<Row>(
     request: Q6KGgmlIterationRequest<'_, Row>,
 ) -> Q6KGgmlIteration
 where
-    Row: Clone + Into<Tile>,
+    Row: Clone + Into<Tile<U32>>,
 {
     let Q6KGgmlIterationRequest {
         loop_index,
