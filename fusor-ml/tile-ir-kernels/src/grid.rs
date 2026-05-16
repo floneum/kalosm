@@ -5,7 +5,7 @@
 use fusor_tile_ir::tile::{
     Bound, IntoIndex, Mask, Q4KGgmlActivations, ScalarIndex, Storage, Tile, TileBlock,
 };
-use fusor_tile_ir::{F32, TileLiteral, WorkgroupAxis};
+use fusor_tile_ir::{TileLiteral, WorkgroupAxis, F32};
 
 #[derive(Clone, Copy)]
 pub(crate) struct QgemvGrid {

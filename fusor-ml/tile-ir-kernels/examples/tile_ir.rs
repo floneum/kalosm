@@ -1,4 +1,4 @@
-use fusor_tile_ir::{F32, GgmlQuantFormat, KernelIr, Shape, TileLiteral, WorkgroupAxis, tile};
+use fusor_tile_ir::{tile, GgmlQuantFormat, KernelIr, Shape, TileLiteral, WorkgroupAxis, F32};
 use fusor_tile_ir_kernels as tile_ir_kernels;
 
 fn fused_bias_gelu_residual_ir(rows: u32, cols: u32) -> KernelIr {

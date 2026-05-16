@@ -1,7 +1,7 @@
 //! Shape-selection policy for kernel dispatch. Pure functions and enums.
 //!
 //! Const-generic monomorphization stays in the dispatch macros that consume
-//! these enums (see `program/qgemv.rs`). The
+//! these enums (see `kernels/qgemv.rs`). The
 //! compiler must see the const literals at the dispatch site to monomorphize,
 //! so this module never returns a runtime tile triple — it returns a
 //! ShapeKey enum, and a `match` in the builder picks the literal generic
@@ -267,7 +267,7 @@ mod tests {
     //! Snapshot tests pinning the current `(format, rows, cols, env) →
     //! ShapeKey` mapping. These must continue to pass after the inline
     //! `qgemv_ggml_env!` invocations and `if b.cols == ...` heuristics in
-    //! `program/qgemv.rs` are replaced with calls into this module.
+    //! `kernels/qgemv.rs` are replaced with calls into this module.
     //!
     //! Env-var tests use a serial mutex because `std::env::set_var` is
     //! process-global. They also unset the variable on entry to avoid
@@ -304,7 +304,7 @@ mod tests {
     #[test]
     fn q4k_mid_default_unchanged() {
         // Uses the inline `if b.cols == 5120 / 6144` branches from
-        // qgemv_tile (program/qgemv.rs).
+        // qgemv_tile (kernels/qgemv.rs).
         assert_eq!(q4k_default_mid(4096, 4096), QgemvShapeQ4K::Ggml2x2_64);
         assert_eq!(q4k_default_mid(4096, 5120), QgemvShapeQ4K::Ggml4x3_128);
         assert_eq!(q4k_default_mid(4096, 6144), QgemvShapeQ4K::Ggml8x2_256);
@@ -313,7 +313,7 @@ mod tests {
 
     #[test]
     fn q4k_large_default_unchanged() {
-        // Uses the mid-size Q4K branch from program/qgemv.rs.
+        // Uses the mid-size Q4K branch from kernels/qgemv.rs.
         assert_eq!(q4k_default_large(4096, 8192), QgemvShapeQ4K::Ggml4x4_128);
         assert_eq!(q4k_default_large(4096, 16_384), QgemvShapeQ4K::Ggml4x4_128);
         assert_eq!(q4k_default_large(4096, 16_385), QgemvShapeQ4K::Ggml2x4_64);
@@ -322,14 +322,14 @@ mod tests {
 
     #[test]
     fn q4k_tall_default_unchanged() {
-        // Constant 4x2 from program/qgemv.rs.
+        // Constant 4x2 from kernels/qgemv.rs.
         assert_eq!(q4k_default_tall(8192, 4096), QgemvShapeQ4K::Ggml4x2_128);
         assert_eq!(q4k_default_tall(16_384, 2048), QgemvShapeQ4K::Ggml4x2_128);
     }
 
     #[test]
     fn q6k_large_default_unchanged() {
-        // Uses the large/tall Q6K branches from program/qgemv.rs.
+        // Uses the large/tall Q6K branches from kernels/qgemv.rs.
         assert_eq!(q6k_default_large(4096, 8192), QgemvShapeQ6K::Ggml2x2_64);
         assert_eq!(q6k_default_large(4096, 16_384), QgemvShapeQ6K::Ggml2x2_64);
         assert_eq!(q6k_default_large(4096, 16_385), QgemvShapeQ6K::Ggml2x4_64);
@@ -337,7 +337,7 @@ mod tests {
 
     #[test]
     fn q6k_tall_default_unchanged() {
-        // Constant 2x2 from program/qgemv.rs.
+        // Constant 2x2 from kernels/qgemv.rs.
         assert_eq!(q6k_default_tall(8192, 4096), QgemvShapeQ6K::Ggml2x2_64);
     }
 

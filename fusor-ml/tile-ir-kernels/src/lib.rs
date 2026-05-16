@@ -38,7 +38,6 @@
 mod dispatch;
 mod grid;
 mod kernels;
-mod program;
 mod types;
 
 pub use dispatch::{
@@ -46,15 +45,13 @@ pub use dispatch::{
     qgemv_subgroups_per_workgroup_for_shape,
 };
 pub use kernels::{
-    FlashAttentionDims, FlashAttentionMeta, FlashDecodeSmallMeta, MergeTopKMeta, Mirostat2,
-    Mirostat2Meta, RmsNormVec4, RmsNormVec4Meta, TensorMeta, TopKChunkMeta, TopKExactnessMeta,
-    flash_attention, flash_decode_small, linear_storage_layout, mirostat2, rms_norm_vec4,
-    top_k_chunk, top_k_exactness, top_k_merge,
-};
-pub use program::{
-    IntoQgemvEpilogues, Q4KPairedGgml, gemv, matmul, matmul_with_epilogues, qdequantize, qgemv,
-    qgemv_q4k_paired_2x2, qgemv_q4k_paired_2x4, qgemv_q4k_paired_4x1, qgemv_q4k_paired_4x2,
-    qgemv_q4k_paired_4x4, qgemv_q4k_paired_8x1, qgemv_q4k_paired_8x2, qgemv_q4k_paired_ggml,
-    qgemv_with_epilogue, qmatmul, qmatmul_with_epilogue, quantized_matrix, quantized_matrix_for,
+    flash_attention, flash_decode_small, gemv, linear_storage_layout, matmul,
+    matmul_with_epilogues, mirostat2, qdequantize, qgemv, qgemv_q4k_paired_2x2,
+    qgemv_q4k_paired_2x4, qgemv_q4k_paired_4x1, qgemv_q4k_paired_4x2, qgemv_q4k_paired_4x4,
+    qgemv_q4k_paired_8x1, qgemv_q4k_paired_8x2, qgemv_q4k_paired_ggml, qgemv_with_epilogue,
+    qmatmul, qmatmul_with_epilogue, quantized_matrix, quantized_matrix_for, rms_norm_vec4,
+    top_k_chunk, top_k_exactness, top_k_merge, FlashAttentionDims, FlashAttentionMeta,
+    FlashDecodeSmallMeta, IntoQgemvEpilogues, MergeTopKMeta, Mirostat2, Mirostat2Meta,
+    Q4KPairedGgml, RmsNormVec4, RmsNormVec4Meta, TensorMeta, TopKChunkMeta, TopKExactnessMeta,
 };
 pub use types::{DenseMatmulEpilogues, PairedEpilogue, QmatmulEpilogues, UnaryEpilogue};

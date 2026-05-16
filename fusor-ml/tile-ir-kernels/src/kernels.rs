@@ -1,15 +1,33 @@
 use fusor_tile_ir::{Layout, MemoryLevel, Shape};
 
 mod flash;
+mod gemv;
 mod helpers;
+mod matmul;
 mod mirostat;
+mod qdequantize;
+mod qgemv;
+mod qgemv_paired_q4k;
+mod qmatmul;
+mod quantized_matrix;
 mod rms_norm;
 mod top_k;
 mod types;
 
 pub use flash::{flash_attention, flash_decode_small};
-pub use mirostat::{Mirostat2, mirostat2};
-pub use rms_norm::{RmsNormVec4, rms_norm_vec4};
+pub use gemv::gemv;
+pub use matmul::{matmul, matmul_with_epilogues};
+pub use mirostat::{mirostat2, Mirostat2};
+pub use qdequantize::qdequantize;
+pub use qgemv::{qgemv, qgemv_with_epilogue, IntoQgemvEpilogues};
+pub use qgemv_paired_q4k::{
+    qgemv_q4k_paired_2x2, qgemv_q4k_paired_2x4, qgemv_q4k_paired_4x1, qgemv_q4k_paired_4x2,
+    qgemv_q4k_paired_4x4, qgemv_q4k_paired_8x1, qgemv_q4k_paired_8x2, qgemv_q4k_paired_ggml,
+    Q4KPairedGgml,
+};
+pub use qmatmul::{qmatmul, qmatmul_with_epilogue};
+pub use quantized_matrix::{quantized_matrix, quantized_matrix_for};
+pub use rms_norm::{rms_norm_vec4, RmsNormVec4};
 pub use top_k::{top_k_chunk, top_k_exactness, top_k_merge};
 pub use types::{
     FlashAttentionDims, FlashAttentionMeta, FlashDecodeSmallMeta, MergeTopKMeta, Mirostat2Meta,

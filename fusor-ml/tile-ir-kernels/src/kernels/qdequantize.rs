@@ -1,7 +1,7 @@
 //! Quantized dequantization program kernels.
 
 use fusor_tile_ir::tile::{Program, Storage};
-use fusor_tile_ir::{F32, Layout, MemoryLevel, QuantizedMatrix, Shape, StorageView, WorkgroupAxis};
+use fusor_tile_ir::{Layout, MemoryLevel, QuantizedMatrix, Shape, StorageView, WorkgroupAxis, F32};
 
 /// Lane-per-element dequantization.
 ///

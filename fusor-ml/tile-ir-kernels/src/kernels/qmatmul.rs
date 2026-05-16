@@ -1,7 +1,7 @@
 //! Quantized matrix multiply program kernels.
 
 use fusor_tile_ir::tile::{CoopAcc, CoopFragment, Program, ScalarIndex, Storage, TileBlock};
-use fusor_tile_ir::{F32, QuantizedMatrix, TileLiteral, TileReduceOp, TileRef, WorkgroupAxis};
+use fusor_tile_ir::{QuantizedMatrix, TileLiteral, TileReduceOp, TileRef, WorkgroupAxis, F32};
 
 use crate::types::{apply_optional_epilogue, cooperative_store_layout_supported, matrix_shape};
 

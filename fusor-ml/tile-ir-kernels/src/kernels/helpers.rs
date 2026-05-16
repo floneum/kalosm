@@ -1,6 +1,6 @@
 use fusor_tile_ir::{
-    TileLiteral,
     tile::{Range, ScalarIndex, Tile, TileBlock},
+    TileLiteral,
 };
 
 pub(super) const TOP_K_BLOCK: usize = 256;

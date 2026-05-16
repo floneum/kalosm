@@ -4,11 +4,11 @@ use fusor_tile_ir::tile::{
     GgmlBlockCoords, Mask, Program, QuantizedDot, ScalarIndex, Storage, Tile, TileBlock,
 };
 use fusor_tile_ir::{
-    F32, GgmlQuantFormat, QuantizedMatrix, TileLiteral, TileReduceOp, WorkgroupAxis,
+    GgmlQuantFormat, QuantizedMatrix, TileLiteral, TileReduceOp, WorkgroupAxis, F32,
 };
 
-use crate::grid::{Q4KGgmlIterationRequest, q4k_ggml_iteration, q4k_lane_decomposition};
-use crate::types::{PairedEpilogue, matrix_shape};
+use crate::grid::{q4k_ggml_iteration, q4k_lane_decomposition, Q4KGgmlIterationRequest};
+use crate::types::{matrix_shape, PairedEpilogue};
 
 macro_rules! q4k_paired_entrypoints {
     ($(($name:ident, $subgroups:literal, $pairs:literal, $dots:literal, $block:literal)),+ $(,)?) => {

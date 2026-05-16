@@ -1,9 +1,9 @@
 use fusor_tile_ir::{
-    F32, TileLiteral, TileUnaryOp, U32,
     tile::{self, Mask, Tile, TileBlock},
+    TileLiteral, TileUnaryOp, F32, U32,
 };
 
-use super::helpers::{NEG_MAX_F32, TOP_K_BLOCK, index_n};
+use super::helpers::{index_n, NEG_MAX_F32, TOP_K_BLOCK};
 use super::types::Mirostat2Meta;
 
 const GPU_SAMPLE_STATUS_RETRY_NEEDED: u32 = 0;

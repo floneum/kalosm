@@ -1,7 +1,7 @@
 //! Dense GEMV program kernels.
 
 use fusor_tile_ir::tile::{Program, Storage, Tile};
-use fusor_tile_ir::{F32, TileLiteral, TileReduceOp, WorkgroupAxis};
+use fusor_tile_ir::{TileLiteral, TileReduceOp, WorkgroupAxis, F32};
 
 use crate::grid::dot4_sum;
 use crate::types::matrix_shape;

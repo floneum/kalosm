@@ -1,9 +1,9 @@
 use fusor_tile_ir::{
-    ElementType, F32, Numeric, TileLiteral, U32, WorkgroupAxis,
-    tile::{self, Mask, Tile, TileBlock, range},
+    tile::{self, range, Mask, Tile, TileBlock},
+    ElementType, Numeric, TileLiteral, WorkgroupAxis, F32, U32,
 };
 
-use super::helpers::{NEG_MAX_F32, index_n, reduce_workgroup};
+use super::helpers::{index_n, reduce_workgroup, NEG_MAX_F32};
 use super::types::{FlashAttentionMeta, FlashDecodeSmallMeta};
 
 const FLASH_BLOCK: usize = 256;

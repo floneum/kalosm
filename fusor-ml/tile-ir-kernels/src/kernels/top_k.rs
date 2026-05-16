@@ -1,9 +1,9 @@
 use fusor_tile_ir::{
-    Bool, ElementType, F32, TileLiteral, TileUnaryOp, U32, WorkgroupAxis,
     tile::{self, Mask, Tile, TileBlock},
+    Bool, ElementType, TileLiteral, TileUnaryOp, WorkgroupAxis, F32, U32,
 };
 
-use super::helpers::{MAX_F32, NEG_MAX_F32, TOP_K_BLOCK, index_n, reduce_workgroup};
+use super::helpers::{index_n, reduce_workgroup, MAX_F32, NEG_MAX_F32, TOP_K_BLOCK};
 use super::types::{MergeTopKMeta, TopKChunkMeta, TopKExactnessMeta};
 
 const TOP_K_CHUNK: u32 = TOP_K_BLOCK as u32;
