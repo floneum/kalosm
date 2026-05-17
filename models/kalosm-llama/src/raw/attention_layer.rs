@@ -87,34 +87,20 @@ impl PhiFeedForward {
 }
 
 pub struct LlamaFeedForward<F: FloatDataType + SimdElement = f32> {
-    gate: Option<QMatrix>,
-    gate_len: usize,
-    gate_up: Option<QMatrix>,
+    gate: QMatrix,
     gate_bias: Option<Tensor<1, F>>,
     down: QMatrix,
     down_bias: Option<Tensor<1, F>>,
-    up: Option<QMatrix>,
-    up_len: usize,
+    up: QMatrix,
     up_bias: Option<Tensor<1, F>>,
 }
 
 impl<F: FloatDataType + SimdElement> LlamaFeedForward<F> {
     pub(crate) fn new(gate: QMatrix, down: QMatrix, up: QMatrix) -> Self {
-        let gate_len = gate.shape()[0];
-        let up_len = up.shape()[0];
-        let gate_up = QMatrix::concat_rows(&[&gate, &up]);
-        let (gate, up) = if gate_up.is_some() {
-            (None, None)
-        } else {
-            (Some(gate), Some(up))
-        };
         Self {
             gate,
-            gate_len,
-            gate_up,
             down,
             up,
-            up_len,
             gate_bias: None,
             down_bias: None,
             up_bias: None,
@@ -129,23 +115,12 @@ impl<F: FloatDataType + SimdElement> LlamaFeedForward<F> {
         up: QMatrix,
         up_bias: Option<Tensor<1, F>>,
     ) -> Self {
-        let gate_len = gate.shape()[0];
-        let up_len = up.shape()[0];
-        let gate_up = QMatrix::concat_rows(&[&gate, &up]);
-        let (gate, up) = if gate_up.is_some() {
-            (None, None)
-        } else {
-            (Some(gate), Some(up))
-        };
         Self {
             gate,
-            gate_len,
-            gate_up,
             gate_bias,
             down,
             down_bias,
             up,
-            up_len,
             up_bias,
         }
     }
@@ -159,51 +134,20 @@ impl<F: FloatDataType + SimdElement> LlamaFeedForward<F> {
         // All computation happens in f32 for compatibility with SIMD ops
         let x_f32 = x.cast::<f32>();
 
-        let [_b_sz, _seq_len, _hidden] = x.shape();
-        let up_result = if let Some(gate_up) = &self.gate_up {
-            // Natural unfused source. The compute-graph fuser auto-detects
-            // the paired `silu(gate) * up` pattern (with optional bias
-            // broadcasts) and rewrites this to a single paired-mode QMatMul kernel
-            // that applies the epilogue in-register at epilogue time.
-            let gate_up_states = x_f32.q_mat_mul(gate_up);
-            let mut w1 = gate_up_states
-                .narrow(D::Minus1, 0, self.gate_len)
-                .to_concrete();
-            let mut w3 = gate_up_states
-                .narrow(D::Minus1, self.gate_len, self.up_len)
-                .to_concrete();
-            if let Some(ref bias) = self.gate_bias {
-                let bias_f32: Tensor<1, f32> = bias.cast();
-                w1 = w1.add_(&bias_f32);
-            }
-            if let Some(ref bias) = self.up_bias {
-                let bias_f32: Tensor<1, f32> = bias.cast();
-                w3 = w3.add_(&bias_f32);
-            }
-            (w1.silu() * w3).to_concrete()
-        } else {
-            let gate = self
-                .gate
-                .as_ref()
-                .expect("separate gate matrix should exist without fused gate_up");
-            let mut w1 = x_f32.q_mat_mul(gate);
-            if let Some(ref bias) = self.gate_bias {
-                let bias_f32: Tensor<1, f32> = bias.cast();
-                w1 = w1.add_(&bias_f32);
-            }
+        let mut w1 = x_f32.q_mat_mul(&self.gate);
+        if let Some(ref bias) = self.gate_bias {
+            let bias_f32: Tensor<1, f32> = bias.cast();
+            w1 = w1.add_(&bias_f32);
+        }
+        let w1 = w1.silu();
 
-            let up = self
-                .up
-                .as_ref()
-                .expect("separate up matrix should exist without fused gate_up");
-            let mut w3 = x_f32.q_mat_mul(up);
-            if let Some(ref bias) = self.up_bias {
-                let bias_f32: Tensor<1, f32> = bias.cast();
-                w3 = w3.add_(&bias_f32);
-            }
+        let mut w3 = x_f32.q_mat_mul(&self.up);
+        if let Some(ref bias) = self.up_bias {
+            let bias_f32: Tensor<1, f32> = bias.cast();
+            w3 = w3.add_(&bias_f32);
+        }
 
-            (w1.silu() * w3).to_concrete()
-        };
+        let up_result = w1 * w3;
         let mut up = up_result.q_mat_mul(&self.down);
         if let Some(ref bias) = self.down_bias {
             let bias_f32: Tensor<1, f32> = bias.cast();
