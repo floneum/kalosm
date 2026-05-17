@@ -449,25 +449,160 @@ pub fn try_batched_coop_matmul_f32<const BM: usize, const BN: usize, const BK: u
     // single-pass shapes for narrower N. ROW_GROUPS/COL_GROUPS are derived
     // from BLOCK/SUBGROUP_SIZE so each subgroup owns a 32x32 (or 32x
     // SUBGROUP_COLS_PER_PASS) MMA grid.
+    // BK=16 across the board keeps the double-buffered workgroup tile
+    // footprint inside Apple's 32 KB threadgroup-memory limit. With BK=32
+    // the per-WG shared memory for the bigger BM/BN variants overflows
+    // (e.g. Tile128x64 BK=32 double-buffer = ~50 KB), forcing slow paths.
+    // The Tile256x256 variant uses single-buffered tiles because the 256×K
+    // A tile would exceed the limit when doubled; its single-buffer overhead
+    // is amortized by halving global A reads vs Tile128x512.
     match (BM, BN, BK) {
+        (256, 256, 16) => batched_coop_matmul_perf_single::<F32, 256, 256, 16, 8, 1, 8, 256>(
+            program, a, b, y, shape,
+        ),
+        (128, 512, 16) => batched_coop_matmul_perf::<F32, 128, 512, 16, 4, 2, 8, 256>(
+            program, a, b, y, shape,
+        ),
         (128, 256, 16) => batched_coop_matmul_perf::<F32, 128, 256, 16, 4, 2, 4, 256>(
             program, a, b, y, shape,
         ),
-        (64, 64, 32) => {
-            batched_coop_matmul_perf::<F32, 64, 64, 32, 2, 2, 1, 128>(program, a, b, y, shape)
+        (128, 128, 16) => {
+            batched_coop_matmul_perf::<F32, 128, 128, 16, 4, 4, 2, 512>(program, a, b, y, shape)
         }
-        (64, 128, 32) => {
-            batched_coop_matmul_perf::<F32, 64, 128, 32, 2, 4, 1, 256>(program, a, b, y, shape)
+        (128, 64, 16) => {
+            batched_coop_matmul_perf::<F32, 128, 64, 16, 4, 2, 1, 256>(program, a, b, y, shape)
         }
-        (128, 64, 32) => {
-            batched_coop_matmul_perf::<F32, 128, 64, 32, 4, 2, 1, 256>(program, a, b, y, shape)
+        (64, 128, 16) => {
+            batched_coop_matmul_perf::<F32, 64, 128, 16, 2, 4, 2, 256>(program, a, b, y, shape)
         }
-        (128, 128, 32) => {
-            batched_coop_matmul_perf::<F32, 128, 128, 32, 4, 4, 1, 512>(program, a, b, y, shape)
+        (64, 64, 16) => {
+            batched_coop_matmul_perf::<F32, 64, 64, 16, 2, 2, 1, 128>(program, a, b, y, shape)
         }
         _ => return false,
     }
     true
+}
+
+/// Single-buffered cooperative-matrix batched matmul. Trades load/MMA
+/// overlap for half the workgroup-memory footprint of
+/// `batched_coop_matmul_perf` — useful when the doubled tile buffers would
+/// pin the workgroup to 1-per-core occupancy on Apple Silicon (32 KB
+/// threadgroup memory limit).
+fn batched_coop_matmul_perf_single<
+    T: CoopElement,
+    const BM: usize,
+    const BN: usize,
+    const BK: usize,
+    const ROW_GROUPS: u32,
+    const COL_GROUPS: u32,
+    const N_PASSES: u32,
+    const BLOCK: usize,
+>(
+    program: &mut Program,
+    a: &Storage<T, 2>,
+    b: &Storage<T, 2>,
+    y: &Storage<T, 2>,
+    shape: DenseMatmulShape,
+) {
+    const COOP_DIM: u32 = 8;
+    const SUBGROUP_SIZE: u32 = 32;
+    debug_assert!(N_PASSES >= 1);
+    debug_assert_eq!(BN as u32 % N_PASSES, 0);
+    let bn_pass: u32 = BN as u32 / N_PASSES;
+    let subgroup_rows: u32 = BM as u32 / ROW_GROUPS;
+    let subgroup_cols_per_pass: u32 = bn_pass / COL_GROUPS;
+    debug_assert_eq!(BM as u32 % ROW_GROUPS, 0);
+    debug_assert_eq!(bn_pass % COL_GROUPS, 0);
+    debug_assert_eq!(subgroup_rows % COOP_DIM, 0);
+    debug_assert_eq!(subgroup_cols_per_pass % COOP_DIM, 0);
+    debug_assert_eq!(ROW_GROUPS * COL_GROUPS * SUBGROUP_SIZE, BLOCK as u32);
+    let tile_rows_per_sg: u32 = subgroup_rows / COOP_DIM;
+    let tile_cols_per_sg: u32 = subgroup_cols_per_pass / COOP_DIM;
+
+    let tiles_m = shape.m / BM as u32;
+    let tiles_n = shape.n / BN as u32;
+    let total_tiles = shape.batch * tiles_m * tiles_n;
+    let k_iterations = shape.k / BK as u32;
+
+    let a_tile = program.alloc_workgroup_tile_padded::<T>(BM as u32, BK as u32, 1);
+    let b_tile = program.alloc_workgroup_tile_padded::<T>(BK as u32, bn_pass, 1);
+
+    let grid = dispatch_grid_1d(total_tiles);
+    program.program_grid::<BLOCK>(grid, |program| {
+        let tile_id = program.program_id(WorkgroupAxis::X)
+            + program.program_id(WorkgroupAxis::Y) * grid[0]
+            + program.program_id(WorkgroupAxis::Z) * grid[0] * grid[1];
+        let batch = tile_id.clone() / (tiles_m * tiles_n);
+        let local_tile = tile_id % (tiles_m * tiles_n);
+        let m_tile = local_tile.clone() / tiles_n;
+        let n_tile = local_tile % tiles_n;
+        let row_base = m_tile * BM as u32;
+        let col_base = n_tile * BN as u32;
+        let a_batch_base = batch.clone() * shape.m;
+        let b_batch_base = batch.clone() * shape.k;
+        let y_batch_base = batch * shape.m;
+
+        let subgroup_id = program.subgroup_id();
+        let sg_row = subgroup_id.clone() / COL_GROUPS;
+        let sg_col = subgroup_id % COL_GROUPS;
+        let sg_row_base = sg_row * subgroup_rows;
+        let sg_col_base_in_pass = sg_col * subgroup_cols_per_pass;
+
+        for n_pass in 0..N_PASSES {
+            let pass_col_base = col_base.clone() + n_pass * bn_pass;
+            let accs = zero_coop_acc_grid(program, tile_rows_per_sg, tile_cols_per_sg);
+
+            program.while_true(k_iterations, |program, iter_idx| {
+                let k_base = iter_idx * BK as u32;
+                program.copy_storage_to_tile(
+                    a_tile,
+                    a,
+                    a_batch_base.clone() + row_base.clone(),
+                    &k_base,
+                );
+                program.copy_storage_to_tile(
+                    b_tile,
+                    b,
+                    b_batch_base.clone() + k_base.clone(),
+                    &pass_col_base,
+                );
+                program.workgroup_barrier();
+
+                let kk_steps = (BK as u32) / COOP_DIM;
+                for kk in 0..kk_steps {
+                    let a_frags = coop_load_a_fragments(
+                        program,
+                        a_tile,
+                        &sg_row_base,
+                        kk,
+                        tile_rows_per_sg,
+                    );
+                    let b_frags = coop_load_b_fragments(
+                        program,
+                        b_tile,
+                        &sg_col_base_in_pass,
+                        kk,
+                        tile_cols_per_sg,
+                    );
+                    coop_mma_grid(program, &accs, &a_frags, &b_frags);
+                }
+                // Trailing barrier required: next iter overwrites the same
+                // tile that this iter just finished reading via coop loads.
+                program.workgroup_barrier();
+            });
+
+            coop_store_acc_grid(
+                program,
+                &accs,
+                y,
+                Some(&y_batch_base),
+                &row_base,
+                &pass_col_base,
+                &sg_row_base,
+                &sg_col_base_in_pass,
+            );
+        }
+    });
 }
 
 /// Cooperative-matrix batched matmul.
@@ -556,8 +691,14 @@ fn batched_coop_matmul_perf<
                 program.while_true(k_pairs, |program, pair_idx| {
                     let k_base_0 = pair_idx.clone() * (2 * BK as u32);
                     let k_base_1 = pair_idx * (2 * BK as u32) + BK as u32;
+                    let kk_steps = (BK as u32) / COOP_DIM;
 
-                    // First K-tile of the pair.
+                    // Two-barrier K-pair shape: the load into tile_1 happens
+                    // *after* the MMA from tile_0 so the compiler can overlap
+                    // the storage→workgroup copy with the running MMAs (they
+                    // touch disjoint workgroup memory). The barrier-2 of the
+                    // next iter gates this iter's MMA reads of tile_0/tile_1
+                    // against the next iter's writes to the same tiles.
                     program.copy_storage_to_tile(
                         a_tile_0,
                         a,
@@ -572,7 +713,6 @@ fn batched_coop_matmul_perf<
                     );
                     program.workgroup_barrier();
 
-                    let kk_steps = (BK as u32) / COOP_DIM;
                     for kk in 0..kk_steps {
                         let a_frags = coop_load_a_fragments(
                             program,
@@ -590,9 +730,7 @@ fn batched_coop_matmul_perf<
                         );
                         coop_mma_grid(program, &accs, &a_frags, &b_frags);
                     }
-                    program.workgroup_barrier();
 
-                    // Second K-tile of the pair.
                     program.copy_storage_to_tile(
                         a_tile_1,
                         a,
@@ -624,7 +762,10 @@ fn batched_coop_matmul_perf<
                         );
                         coop_mma_grid(program, &accs, &a_frags, &b_frags);
                     }
-                    program.workgroup_barrier();
+                    // No trailing barrier: next iter writes to tile_0 first
+                    // (different from MMA-tile_1 reads above) — barrier-2 of
+                    // the next iter (after its load_0) transitively gates
+                    // any tile_1 races.
                 });
             }
 

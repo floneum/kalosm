@@ -56,10 +56,9 @@ pub fn dynamic_kernel_from_ir(
 ) -> Option<DirectKernel> {
     let cached = cached_kernel(cache, cache_key, build_ir)?;
     let bindings = bindings_from_naga(&cached.naga, buffers)?;
-    Some(DirectKernel::from_naga(
+    Some(DirectKernel::from_cached(
         name,
-        cache_key,
-        cached.naga.clone(),
+        cached,
         bindings,
         dispatch_size,
     ))
@@ -78,13 +77,13 @@ pub fn dynamic_kernel_from_hashed_ir(
     build_ir: impl FnOnce() -> Option<tile_ir::KernelIr>,
 ) -> Option<DirectKernel> {
     let naga = cached_hashed_naga(module_cache, module_key, || {
-        cached_kernel(cache, module_key, build_ir).map(|c| c.naga.clone())
+        Some(Arc::new(build_ir()?.lower_to_naga().ok()?.module().clone()))
     })?;
     let bindings = bindings_from_naga(&naga, buffers)?;
-    Some(DirectKernel::from_naga(
+    let cached = cache.get_or_insert_kernel(module_key, || naga);
+    Some(DirectKernel::from_cached(
         label,
-        module_key,
-        naga,
+        cached,
         bindings,
         dispatch_size,
     ))
@@ -207,13 +206,11 @@ fn bindings_from_naga(
         storages
             .into_iter()
             .zip(buffers)
-            .map(
-                |((binding, read_only), buffer)| DirectKernelBinding::Storage {
-                    binding,
-                    buffer,
-                    read_only,
-                },
-            )
+            .map(|((binding, read_only), buffer)| DirectKernelBinding {
+                binding,
+                buffer,
+                read_only,
+            })
             .collect(),
     )
 }

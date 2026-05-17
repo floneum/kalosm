@@ -120,7 +120,6 @@ enum QMatmulDirectVariant {
 
 struct QMatmulDirectFastKernelVariant;
 struct QMatmulDirectEpilogueKernelVariant;
-struct QMatmulCachedPipelineKernelVariant;
 struct QMatmulPairedKernelVariant;
 struct QMatmulPairedExtrasKernelVariant;
 
@@ -654,7 +653,6 @@ impl QMatMulOperation {
                     .get_or_insert(pipeline_key, || pipeline.clone());
                 return Some(kernel_backend::DirectKernel::from_prepared_three_buffer_pipeline(
                     kernel_name.clone(),
-                    cache_key,
                     pipeline,
                     input.buffer().clone(),
                     matrix.buffer().clone(),
@@ -800,13 +798,8 @@ fn cached_qmatmul_direct_kernel(
         .write()
         .get(pipeline_key)
         .cloned()?;
-    let cache_key = kernel_backend::KernelCacheKey::from_hash_inputs(|state| {
-        kernel_backend::KernelVariantKey::of::<QMatmulCachedPipelineKernelVariant>().hash(state);
-        pipeline_key.hash(state);
-    });
     Some(kernel_backend::DirectKernel::from_prepared_three_buffer_pipeline(
         kernel_name.to_owned(),
-        cache_key,
         pipeline,
         input.buffer().clone(),
         matrix.buffer().clone(),
@@ -851,7 +844,6 @@ fn qmatmul_direct_kernel_from_ir(
         .clone();
     Some(kernel_backend::DirectKernel::from_prepared_three_buffer_pipeline(
         kernel_name,
-        cache_key,
         pipeline,
         input.buffer().clone(),
         matrix.buffer().clone(),
@@ -1486,7 +1478,7 @@ mod tests {
 
         let bindings = kernel.bindings_for_test();
         assert_eq!(bindings.len(), 3);
-        let DirectKernelBinding::Storage {
+        let DirectKernelBinding {
             binding,
             buffer,
             read_only,

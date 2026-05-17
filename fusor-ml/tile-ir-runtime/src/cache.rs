@@ -63,6 +63,7 @@ impl KernelVariantKey {
 
 /// A lowered kernel plus its lazily-built shader module and dynamic-path
 /// compute pipeline. One entry per [`KernelCacheKey`] in [`KernelCache`].
+#[derive(Debug)]
 pub struct CachedKernel {
     pub(crate) naga: Arc<wgpu::naga::Module>,
     pub(crate) shader: OnceLock<wgpu::ShaderModule>,
@@ -288,7 +289,7 @@ impl KernelCache {
     }
 
     /// Get the cached kernel for `key`, or build it from `naga` and insert it.
-    pub(crate) fn get_or_insert_kernel(
+    pub fn get_or_insert_kernel(
         &self,
         key: KernelCacheKey,
         naga: impl FnOnce() -> Arc<wgpu::naga::Module>,
@@ -297,6 +298,12 @@ impl KernelCache {
             .write()
             .get_or_insert(key, || Arc::new(CachedKernel::new(naga())))
             .clone()
+    }
+
+    pub(crate) fn shader_for<'a>(&self, cached: &'a Arc<CachedKernel>) -> &'a wgpu::ShaderModule {
+        cached
+            .shader
+            .get_or_init(|| self.create_naga_shader_module(cached.naga.as_ref().clone()))
     }
 }
 

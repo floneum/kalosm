@@ -8,8 +8,7 @@ use crate::{
     compute_graph::NodeIndex,
     kernel_selection::{Axis, KernelDeviceCaps, KernelShape, ShapeRule, ShapeSelector, eq, range},
     mir::{
-        kernel_backend::DirectKernel,
-        kernel_backend,
+        kernel_backend::{self, DirectKernel},
         tile_direct::{
             flatten_matrix_layout, tile_storage_read_with_direct_layout_typed,
             tile_storage_write_with_direct_layout_typed,
@@ -156,33 +155,69 @@ enum DirectTileCoopMatmulVariant {
     /// cache line, and the N axis is amortized across four sub-passes that
     /// reuse the accumulator grid.
     Tile128x256,
+    /// (BM=128, BN=512, BK=16, N_PASSES=8, BLOCK=256). Same per-pass
+    /// footprint as `Tile128x256` so it fits the same workgroup tile budget,
+    /// but doubles the N coverage per workgroup — halving global A reads for
+    /// big square matmuls. Selected when N divides 512.
+    Tile128x512,
+    /// (BM=256, BN=256, BK=16, N_PASSES=8, BLOCK=256, single-buffered).
+    /// The biggest square output tile that fits the 32 KB threadgroup-memory
+    /// limit (when run single-buffered). Minimizes both A and B global reads
+    /// (sqrt(min) trick); preferred for big square matmuls when there are
+    /// enough output tiles.
+    Tile256x256,
 }
 
 impl DirectTileCoopMatmulVariant {
     fn select(m: u32, k: u32, n: u32, max_workgroup_size_x: u32) -> Self {
-        if k.is_multiple_of(16)
-            && m.is_multiple_of(128)
+        // All variants now use BK=16 to keep double-buffered workgroup tiles
+        // inside Apple's 32 KB threadgroup-memory limit. Heuristic: bigger
+        // tiles only fire when (M/BM)*(N/BN) clears a minimum tile count so
+        // there's enough work for the GPU; smaller matrices fall to smaller
+        // tiles for better parallelism.
+        let tiles_for = |bm: u32, bn: u32| -> u32 { (m / bm) * (n / bn) };
+        if !k.is_multiple_of(16) {
+            return Self::None;
+        }
+        // Tile256x256 single-buffer has lower memory traffic (sqrt-min) but
+        // 2× the barriers of Tile128x512 double-buffer; raise the threshold
+        // so it only fires when the smaller variant doesn't fit (i.e.,
+        // when N is divisible by 256 but not by 512).
+        if m.is_multiple_of(256)
+            && n.is_multiple_of(256)
+            && !n.is_multiple_of(512)
+            && max_workgroup_size_x >= 256
+            && tiles_for(256, 256) >= 256
+        {
+            return Self::Tile256x256;
+        }
+        if m.is_multiple_of(128)
+            && n.is_multiple_of(512)
+            && max_workgroup_size_x >= 256
+            && tiles_for(128, 512) >= 256
+        {
+            return Self::Tile128x512;
+        }
+        if m.is_multiple_of(128)
             && n.is_multiple_of(256)
             && max_workgroup_size_x >= 256
+            && tiles_for(128, 256) >= 256
         {
             return Self::Tile128x256;
         }
-        if k.is_multiple_of(32)
-            && m.is_multiple_of(128)
+        if m.is_multiple_of(128)
             && n.is_multiple_of(64)
             && max_workgroup_size_x >= 256
         {
             return Self::Tile128x64;
         }
-        if k.is_multiple_of(32)
-            && m.is_multiple_of(64)
+        if m.is_multiple_of(64)
             && n.is_multiple_of(128)
             && max_workgroup_size_x >= 256
         {
             return Self::Tile64x128;
         }
-        if k.is_multiple_of(32)
-            && m.is_multiple_of(64)
+        if m.is_multiple_of(64)
             && n.is_multiple_of(64)
             && max_workgroup_size_x >= 128
         {
@@ -431,6 +466,20 @@ impl MatMulOperation {
                         y_view.clone(),
                     );
                     match coop_variant {
+                        DirectTileCoopMatmulVariant::Tile256x256 => {
+                            if tile_ir_kernels::try_batched_coop_matmul_f32::<256, 256, 16>(
+                                phase, &a, &b, &y, shape, &epilogues,
+                            ) {
+                                return;
+                            }
+                        }
+                        DirectTileCoopMatmulVariant::Tile128x512 => {
+                            if tile_ir_kernels::try_batched_coop_matmul_f32::<128, 512, 16>(
+                                phase, &a, &b, &y, shape, &epilogues,
+                            ) {
+                                return;
+                            }
+                        }
                         DirectTileCoopMatmulVariant::Tile128x256 => {
                             if tile_ir_kernels::try_batched_coop_matmul_f32::<128, 256, 16>(
                                 phase, &a, &b, &y, shape, &epilogues,
@@ -439,21 +488,21 @@ impl MatMulOperation {
                             }
                         }
                         DirectTileCoopMatmulVariant::Tile128x64 => {
-                            if tile_ir_kernels::try_batched_coop_matmul_f32::<128, 64, 32>(
+                            if tile_ir_kernels::try_batched_coop_matmul_f32::<128, 64, 16>(
                                 phase, &a, &b, &y, shape, &epilogues,
                             ) {
                                 return;
                             }
                         }
                         DirectTileCoopMatmulVariant::Tile64x128 => {
-                            if tile_ir_kernels::try_batched_coop_matmul_f32::<64, 128, 32>(
+                            if tile_ir_kernels::try_batched_coop_matmul_f32::<64, 128, 16>(
                                 phase, &a, &b, &y, shape, &epilogues,
                             ) {
                                 return;
                             }
                         }
                         DirectTileCoopMatmulVariant::Tile64x64 => {
-                            if tile_ir_kernels::try_batched_coop_matmul_f32::<64, 64, 32>(
+                            if tile_ir_kernels::try_batched_coop_matmul_f32::<64, 64, 16>(
                                 phase, &a, &b, &y, shape, &epilogues,
                             ) {
                                 return;
@@ -808,18 +857,52 @@ mod selection_tests {
 
     #[test]
     fn direct_tile_coop_selector_prefers_largest_supported_tile() {
-        // 1024 is divisible by both 128 (M) and 256 (N), so the N-pass split
-        // variant wins when the workgroup is large enough.
+        // 4096³ (square) hits Tile128x512 — it has fewer barriers than
+        // Tile256x256 because it's double-buffered.
+        assert_eq!(
+            DirectTileCoopMatmulVariant::select(4096, 4096, 4096, 512),
+            DirectTileCoopMatmulVariant::Tile128x512
+        );
+        // Shapes where N is divisible by 256 but not 512 — with enough
+        // tiles — fall to Tile256x256 single-buffer.
+        assert_eq!(
+            DirectTileCoopMatmulVariant::select(8192, 1024, 4352, 512),
+            DirectTileCoopMatmulVariant::Tile256x256
+        );
+        // N=512 doesn't divide 256 on the M side... actually wait, 4096 % 256 == 0.
+        // For shapes where N is divisible by 512 but M isn't by 256, fall to
+        // Tile128x512.
+        assert_eq!(
+            DirectTileCoopMatmulVariant::select(384, 1024, 1024, 512),
+            DirectTileCoopMatmulVariant::Tile128x64
+        );
+        // 1024³ doesn't have enough tiles for Tile128x512 OR Tile128x256;
+        // falls back to Tile128x64 for better parallelism.
         assert_eq!(
             DirectTileCoopMatmulVariant::select(1024, 1024, 1024, 512),
-            DirectTileCoopMatmulVariant::Tile128x256
+            DirectTileCoopMatmulVariant::Tile128x64
         );
+        // 8192x256 has tiles_for(128, 256) = 64*1 = 64 — below the threshold,
+        // so it falls to Tile128x64.
         assert_eq!(
-            DirectTileCoopMatmulVariant::select(1024, 1024, 1024, 256),
+            DirectTileCoopMatmulVariant::select(8192, 1024, 256, 256),
+            DirectTileCoopMatmulVariant::Tile128x64
+        );
+        // M=4096, N=1024 gives tiles_for(128, 256) = 32*4 = 128. Below 256.
+        // Falls to Tile128x64.
+        assert_eq!(
+            DirectTileCoopMatmulVariant::select(4096, 1024, 1024, 256),
+            DirectTileCoopMatmulVariant::Tile128x64
+        );
+        // M=8192, N=512 gives tiles_for(128, 256) = 64*2 = 128 (still <256),
+        // so falls to Tile128x64. To hit Tile128x256 we need a wider shape:
+        // 8192x1024 → 64*4 = 256 ✓.
+        assert_eq!(
+            DirectTileCoopMatmulVariant::select(8192, 1024, 1024, 256),
             DirectTileCoopMatmulVariant::Tile128x256
         );
-        // N=128 doesn't divide 256 so Tile128x256 is unavailable; falls back
-        // to Tile128x64.
+        // N=128 doesn't divide 256 so Tile128x256/Tile128x512 are out; falls
+        // back to Tile128x64.
         assert_eq!(
             DirectTileCoopMatmulVariant::select(1024, 1024, 128, 256),
             DirectTileCoopMatmulVariant::Tile128x64

@@ -278,7 +278,7 @@ fn cooperative_dense_f32_matmul_lowers() {
         let a = program.storage_read::<F32, 2>(Shape::new([shape.batch * shape.m, shape.k]));
         let b = program.storage_read::<F32, 2>(Shape::new([shape.batch * shape.k, shape.n]));
         let y = program.storage_write::<F32, 2>(Shape::new([shape.batch * shape.m, shape.n]));
-        assert!(try_batched_coop_matmul_f32::<64, 64, 32>(
+        assert!(try_batched_coop_matmul_f32::<64, 64, 16>(
             program,
             &a,
             &b,
@@ -302,7 +302,7 @@ fn cooperative_dense_f32_matmul_128x128_lowers() {
         let a = program.storage_read::<F32, 2>(Shape::new([shape.batch * shape.m, shape.k]));
         let b = program.storage_read::<F32, 2>(Shape::new([shape.batch * shape.k, shape.n]));
         let y = program.storage_write::<F32, 2>(Shape::new([shape.batch * shape.m, shape.n]));
-        assert!(try_batched_coop_matmul_f32::<128, 128, 32>(
+        assert!(try_batched_coop_matmul_f32::<128, 128, 16>(
             program,
             &a,
             &b,
@@ -326,7 +326,7 @@ fn cooperative_dense_f32_matmul_128x64_lowers() {
         let a = program.storage_read::<F32, 2>(Shape::new([shape.batch * shape.m, shape.k]));
         let b = program.storage_read::<F32, 2>(Shape::new([shape.batch * shape.k, shape.n]));
         let y = program.storage_write::<F32, 2>(Shape::new([shape.batch * shape.m, shape.n]));
-        assert!(try_batched_coop_matmul_f32::<128, 64, 32>(
+        assert!(try_batched_coop_matmul_f32::<128, 64, 16>(
             program,
             &a,
             &b,

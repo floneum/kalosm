@@ -84,11 +84,15 @@ fn build_nary_direct_kernel_with_output_index(
         let ir = build_nary_tile_ir(operation, &tensors, output_index, dispatch_size)?;
         Some(Arc::new(ir.lower_to_naga().ok()?.module().clone()))
     })?;
+    let cached = graph
+        .device()
+        .kernel_cache()
+        .get_or_insert_kernel(module_key, || naga);
 
     let bindings = tensors
         .iter()
         .enumerate()
-        .map(|(binding, tensor)| DirectKernelBinding::Storage {
+        .map(|(binding, tensor)| DirectKernelBinding {
             binding: binding as u32,
             buffer: tensor.buffer().clone(),
             read_only: binding != output_index,
@@ -101,13 +105,7 @@ fn build_nary_direct_kernel_with_output_index(
         format!("nary_direct_out_{output_index}")
     };
 
-    Some(DirectKernel::from_naga(
-        name,
-        module_key,
-        naga,
-        bindings,
-        dispatch_size,
-    ))
+    Some(DirectKernel::from_cached(name, cached, bindings, dispatch_size))
 }
 
 impl NaryOperation {

@@ -72,7 +72,11 @@ impl Cache {
     pub async fn get_bytes(
         &self,
         source: &FileSource,
-        #[allow(unused_mut)] mut progress: impl FnMut(FileLoadingProgress),
+        #[cfg_attr(
+            any(feature = "tokio", not(target_arch = "wasm32")),
+            allow(unused_mut)
+        )]
+        mut progress: impl FnMut(FileLoadingProgress),
     ) -> Result<Vec<u8>, CacheError> {
         #[cfg(feature = "tokio")]
         {

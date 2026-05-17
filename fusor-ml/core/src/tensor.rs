@@ -704,7 +704,7 @@ impl<D: DataType, const R: usize> Tensor<R, D> {
         #[cfg(feature = "extra_assertions")]
         let caller = std::panic::Location::caller();
         async move {
-            #[allow(unused)]
+            #[cfg_attr(not(feature = "extra_assertions"), allow(unused_variables))]
             let (data, _) = data.materialize();
             #[cfg(not(target_arch = "wasm32"))]
             device.poll_wait();

@@ -291,7 +291,6 @@ fn cmp_logits(a: &Logit, b: &Logit) -> std::cmp::Ordering {
     f32::total_cmp(&b.logit, &a.logit)
 }
 
-#[allow(unused, clippy::all)]
 fn update_state<P: Parser>(
     parser: &P,
     parser_state: &mut P::PartialState,
@@ -341,7 +340,7 @@ fn update_state<P: Parser>(
                     .map_err(|err| LlamaModelError::TokenOutputStreamError(err))?;
                 *unprocessed_token_count += extra_tokens.len();
                 on_token(all_required_next.clone())?;
-                let mut result = parser
+                let result = parser
                     .parse(parser_state, all_required_next.as_bytes())
                     .unwrap_or_else(|_| {
                         unreachable!("Required next should always be valid attempted to add {:?} but got error", all_required_next)

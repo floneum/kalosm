@@ -587,15 +587,8 @@ macro_rules! impl_resolve_tensor_tuple {
                 ))
             }
 
-            #[allow(unused)]
-            #[allow(non_snake_case)]
             fn extract_device(&self) -> Device {
-                let ($($type,)*) = self;
-                $(
-                    let device = $type.device();
-                    return device;
-                )*
-                unreachable!()
+                self.0.device()
             }
         }
     };

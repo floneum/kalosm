@@ -329,7 +329,7 @@ where
         tokens: &[u32],
         images: &[(image::DynamicImage, MediaHints)],
         mut cache: Option<&mut LlamaCache>,
-        #[allow(unused_variables)] tokenizer: &Tokenizer,
+        #[cfg_attr(not(debug_assertions), allow(unused_variables))] tokenizer: &Tokenizer,
         fast_path: &'static str,
         fallback_path: &'static str,
     ) -> Result<PreparedForwardLogits, LlamaModelError> {
@@ -401,7 +401,7 @@ where
         tokens: &[u32],
         images: &[(image::DynamicImage, MediaHints)],
         cache: Option<&mut LlamaCache>,
-        #[allow(unused)] tokenizer: &Tokenizer,
+        tokenizer: &Tokenizer,
     ) -> Pin<
         Box<dyn kalosm_model_types::FutureWasmNotSend<Output = Result<Vec<f32>, LlamaModelError>>>,
     > {
@@ -447,7 +447,7 @@ where
         tokens: &[u32],
         images: &[(image::DynamicImage, MediaHints)],
         cache: Option<&mut LlamaCache>,
-        #[allow(unused)] tokenizer: &Tokenizer,
+        tokenizer: &Tokenizer,
         top_k: usize,
     ) -> Pin<
         Box<
@@ -509,7 +509,7 @@ where
         tokens: &[u32],
         images: &[(image::DynamicImage, MediaHints)],
         cache: Option<&mut LlamaCache>,
-        #[allow(unused)] tokenizer: &Tokenizer,
+        tokenizer: &Tokenizer,
         sampler: &'a mut fusor::GpuMirostat2Sampler,
         previous_tokens: Vec<u32>,
         params: fusor::GpuMirostat2SamplerParams,
@@ -535,7 +535,6 @@ where
                 tokens,
                 images,
                 cache,
-                tokenizer,
                 sampler,
                 previous_tokens,
                 params,
@@ -582,7 +581,6 @@ where
         tokens: &[u32],
         images: &[(image::DynamicImage, MediaHints)],
         mut cache: Option<&mut LlamaCache>,
-        #[allow(unused)] tokenizer: &Tokenizer,
         sampler: &'a mut fusor::GpuMirostat2Sampler,
         previous_tokens: Vec<u32>,
         params: fusor::GpuMirostat2SamplerParams,
