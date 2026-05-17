@@ -138,6 +138,18 @@ async fn gpu_flash_attention_fuses_into_one_kernel() {
     let Some(device) = gpu_device().await else {
         return;
     };
+    let Device::Gpu(gpu) = &device else { return };
+    // The streaming flash kernel is monomorphized per hardware subgroup
+    // width and uses `subgroup_reduce_*`, so it can only target devices
+    // that pin a single supported subgroup size. Devices that report a
+    // variable range (Mesa lavapipe in Linux CI) take the composite path
+    // and won't fuse — skip the fusion assertion there.
+    if !gpu.subgroups_supported()
+        || gpu.min_subgroup_size() != gpu.max_subgroup_size()
+        || !matches!(gpu.min_subgroup_size(), 4 | 8 | 16 | 32 | 64)
+    {
+        return;
+    }
 
     let q_shape = [1, 2, 3, 4];
     let kv_shape = [1, 2, 5, 4];
