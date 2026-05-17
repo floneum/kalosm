@@ -9,8 +9,6 @@ use attention_layer::AttentionVariant;
 use attention_layer::FeedForwardVariant;
 use attention_layer::GroupedAttention;
 use attention_layer::LlamaFeedForward;
-use attention_layer::PairedAttention;
-use attention_layer::PairedAttentionKind;
 use attention_layer::PhiFeedForward;
 use attention_layer::SeparateAttention;
 use fusor::cache::MaskCache;
@@ -322,13 +320,7 @@ where
             let attention_variant = if let Ok(attention_qkv) =
                 source.tensor(&format!("{prefix}.attn_qkv.weight"), device)
             {
-                AttentionVariant::Grouped(GroupedAttention {
-                    attention_qkv,
-                    attention_q_norm: None,
-                    attention_k_norm: None,
-                    bias: None,
-                    interleaved_rope: false,
-                })
+                AttentionVariant::Grouped(GroupedAttention { attention_qkv })
             } else {
                 let q = source.tensor(&format!("{prefix}.attn_q.weight"), device)?;
                 let k = source.tensor(&format!("{prefix}.attn_k.weight"), device)?;
@@ -352,57 +344,22 @@ where
                 let k_norm = source
                     .tensor(&format!("{prefix}.attn_k_norm.weight"), device)
                     .ok();
-                let attention_q_norm = q_norm
-                    .map(|norm| decode_norm(norm, rms_norm_eps))
-                    .transpose()?;
-                let attention_k_norm = k_norm
-                    .map(|norm| decode_norm(norm, rms_norm_eps))
-                    .transpose()?;
-                let interleaved_rope = architecture.as_ref() != "qwen2"
-                    && architecture.as_ref() != "qwen3"
-                    && architecture.as_ref() != "gemma3";
-
-                let fused_qkv = QMatrix::concat_rows(&[&q, &k, &v]);
-                if let Some(attention_qkv) = fused_qkv {
-                    AttentionVariant::Grouped(GroupedAttention {
-                        attention_qkv,
-                        attention_q_norm,
-                        attention_k_norm,
-                        bias,
-                        interleaved_rope,
-                    })
-                } else {
-                    let paired = if let Some(pair) = QMatrix::concat_rows(&[&q, &k]) {
-                        Some((pair, v.clone(), PairedAttentionKind::QueryKey))
-                    } else if let Some(pair) = QMatrix::concat_rows(&[&q, &v]) {
-                        Some((pair, k.clone(), PairedAttentionKind::QueryValue))
-                    } else {
-                        QMatrix::concat_rows(&[&k, &v])
-                            .map(|pair| (pair, q.clone(), PairedAttentionKind::KeyValue))
-                    };
-                    if let Some((attention_pair, attention_single, kind)) = paired {
-                        AttentionVariant::Paired(PairedAttention {
-                            attention_pair,
-                            attention_single,
-                            attention_q_norm,
-                            attention_k_norm,
-                            bias,
-                            kind,
-                            interleaved_rope,
-                        })
-                    } else {
-                        let separate = SeparateAttention {
-                            attention_wq: q,
-                            attention_q_norm,
-                            attention_wk: k,
-                            attention_k_norm,
-                            attention_wv: v,
-                            interleaved_rope,
-                            bias,
-                        };
-                        AttentionVariant::Separate(Box::new(separate))
-                    }
-                }
+                let separate = SeparateAttention {
+                    attention_wq: q,
+                    attention_q_norm: q_norm
+                        .map(|norm| decode_norm(norm, rms_norm_eps))
+                        .transpose()?,
+                    attention_wk: k,
+                    attention_k_norm: k_norm
+                        .map(|norm| decode_norm(norm, rms_norm_eps))
+                        .transpose()?,
+                    attention_wv: v,
+                    interleaved_rope: architecture.as_ref() != "qwen2"
+                        && architecture.as_ref() != "qwen3"
+                        && architecture.as_ref() != "gemma3",
+                    bias,
+                };
+                AttentionVariant::Separate(Box::new(separate))
             };
             let attention_wo = source.tensor(&format!("{prefix}.attn_output.weight"), device)?;
             // Try to read from the up, down and gate weights

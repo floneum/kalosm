@@ -217,8 +217,7 @@ impl<F: FloatDataType + SimdElement> LlamaFeedForward<F> {
 
 pub enum AttentionVariant<F: FloatDataType + SimdElement = f32> {
     Separate(Box<SeparateAttention<F>>),
-    Grouped(GroupedAttention<F>),
-    Paired(PairedAttention<F>),
+    Grouped(GroupedAttention),
 }
 
 pub struct AttentionBias<F: FloatDataType + SimdElement = f32> {
@@ -337,21 +336,13 @@ where
     }
 }
 
-pub struct GroupedAttention<F: FloatDataType + SimdElement = f32> {
+pub struct GroupedAttention {
     pub attention_qkv: QMatrix,
-    pub attention_q_norm: Option<RmsNorm<1, F>>,
-    pub attention_k_norm: Option<RmsNorm<1, F>>,
-    pub bias: Option<AttentionBias<F>>,
-    pub interleaved_rope: bool,
 }
 
-impl<F: FloatDataType + SimdElement + Default> GroupedAttention<F>
-where
-    F: CastTo<f32> + CastTensor<f32>,
-    f32: CastTo<F> + CastTensor<F>,
-{
+impl GroupedAttention {
     #[allow(clippy::too_many_arguments)]
-    fn forward<B>(
+    fn forward<F, B>(
         &self,
         num_heads: usize,
         head_dim: usize,
@@ -362,6 +353,8 @@ where
         pos_ids: Option<&Tensor<2, F>>,
     ) -> (Tensor<4, F>, Tensor<4, F>, Tensor<4, F>)
     where
+        F: FloatDataType + SimdElement + Default + CastTo<f32> + CastTensor<f32>,
+        f32: CastTo<F> + CastTensor<F>,
         B: TensorBacking<3, Elem = F>,
     {
         let [b_sz, seq_len, _] = x.shape();
@@ -370,28 +363,20 @@ where
         let qkv = x_f32.q_mat_mul(&self.attention_qkv);
 
         let query_pos = num_heads * head_dim;
-        let kv_pos = num_key_value_heads * head_dim;
-        let mut query_states = qkv.narrow(D::Minus1, 0, query_pos).to_concrete();
-        let mut key_states = qkv.narrow(D::Minus1, query_pos, kv_pos).to_concrete();
-        let mut value_states = qkv
-            .narrow(D::Minus1, query_pos + kv_pos, kv_pos)
-            .to_concrete();
+        let query_states = qkv.narrow(D::Minus1, 0, query_pos);
+        let key_states = qkv.narrow(D::Minus1, query_pos, num_key_value_heads * head_dim);
+        let value_states = qkv.narrow(
+            D::Minus1,
+            query_pos + num_key_value_heads * head_dim,
+            num_key_value_heads * head_dim,
+        );
 
-        if let Some(bias) = &self.bias {
-            let bq: Tensor<1, f32> = bias.bias_q.cast();
-            let bk: Tensor<1, f32> = bias.bias_k.cast();
-            let bv: Tensor<1, f32> = bias.bias_v.cast();
-            query_states = query_states.add_(&bq);
-            key_states = key_states.add_(&bk);
-            value_states = value_states.add_(&bv);
-        }
-
-        let mut query_states: Tensor<4, F> = query_states
+        let query_states: Tensor<4, F> = query_states
             .reshape([b_sz, seq_len, num_heads, head_dim])
             .transpose(1, 2)
             .to_concrete()
             .cast();
-        let mut key_states: Tensor<4, F> = key_states
+        let key_states: Tensor<4, F> = key_states
             .reshape([b_sz, seq_len, num_key_value_heads, head_dim])
             .transpose(1, 2)
             .to_concrete()
@@ -402,129 +387,8 @@ where
             .to_concrete()
             .cast();
 
-        if let Some(norm) = &self.attention_q_norm {
-            query_states = norm.forward_generic_4d(&query_states);
-        }
-        if let Some(norm) = &self.attention_k_norm {
-            key_states = norm.forward_generic_4d(&key_states);
-        }
-
-        let (query_states, key_states) = rope_cache.forward(
-            &query_states,
-            &key_states,
-            start_pos,
-            pos_ids,
-            self.interleaved_rope,
-        );
-
-        (query_states, key_states, value_states)
-    }
-}
-
-#[derive(Clone, Copy)]
-pub enum PairedAttentionKind {
-    QueryKey,
-    QueryValue,
-    KeyValue,
-}
-
-pub struct PairedAttention<F: FloatDataType + SimdElement = f32> {
-    pub attention_pair: QMatrix,
-    pub attention_single: QMatrix,
-    pub attention_q_norm: Option<RmsNorm<1, F>>,
-    pub attention_k_norm: Option<RmsNorm<1, F>>,
-    pub bias: Option<AttentionBias<F>>,
-    pub kind: PairedAttentionKind,
-    pub interleaved_rope: bool,
-}
-
-impl<F: FloatDataType + SimdElement + Default> PairedAttention<F>
-where
-    F: CastTo<f32> + CastTensor<f32>,
-    f32: CastTo<F> + CastTensor<F>,
-{
-    #[allow(clippy::too_many_arguments)]
-    fn forward<B>(
-        &self,
-        num_heads: usize,
-        head_dim: usize,
-        num_key_value_heads: usize,
-        x: &Tensor<3, F, B>,
-        rope_cache: &RopeImplementation<F>,
-        start_pos: usize,
-        pos_ids: Option<&Tensor<2, F>>,
-    ) -> (Tensor<4, F>, Tensor<4, F>, Tensor<4, F>)
-    where
-        B: TensorBacking<3, Elem = F>,
-    {
-        let [b_sz, seq_len, _] = x.shape();
-        let query_pos = num_heads * head_dim;
-        let kv_pos = num_key_value_heads * head_dim;
-        let x_f32 = x.cast::<f32>();
-        let pair = x_f32.q_mat_mul(&self.attention_pair);
-        let single = x_f32.q_mat_mul(&self.attention_single);
-
-        let (mut query_states, mut key_states, mut value_states) = match self.kind {
-            PairedAttentionKind::QueryKey => {
-                let query = pair.narrow(D::Minus1, 0, query_pos);
-                let key = pair.narrow(D::Minus1, query_pos, kv_pos);
-                (query.to_concrete(), key.to_concrete(), single.to_concrete())
-            }
-            PairedAttentionKind::QueryValue => {
-                let query = pair.narrow(D::Minus1, 0, query_pos);
-                let value = pair.narrow(D::Minus1, query_pos, kv_pos);
-                (
-                    query.to_concrete(),
-                    single.to_concrete(),
-                    value.to_concrete(),
-                )
-            }
-            PairedAttentionKind::KeyValue => {
-                let key = pair.narrow(D::Minus1, 0, kv_pos);
-                let value = pair.narrow(D::Minus1, kv_pos, kv_pos);
-                (single.to_concrete(), key.to_concrete(), value.to_concrete())
-            }
-        };
-
-        if let Some(bias) = &self.bias {
-            let bq: Tensor<1, f32> = bias.bias_q.cast();
-            let bk: Tensor<1, f32> = bias.bias_k.cast();
-            let bv: Tensor<1, f32> = bias.bias_v.cast();
-            query_states = query_states.add_(&bq);
-            key_states = key_states.add_(&bk);
-            value_states = value_states.add_(&bv);
-        }
-
-        let mut query_states: Tensor<4, F> = query_states
-            .reshape([b_sz, seq_len, num_heads, head_dim])
-            .transpose(1, 2)
-            .to_concrete()
-            .cast();
-        let mut key_states: Tensor<4, F> = key_states
-            .reshape([b_sz, seq_len, num_key_value_heads, head_dim])
-            .transpose(1, 2)
-            .to_concrete()
-            .cast();
-        let value_states: Tensor<4, F> = value_states
-            .reshape([b_sz, seq_len, num_key_value_heads, head_dim])
-            .transpose(1, 2)
-            .to_concrete()
-            .cast();
-
-        if let Some(norm) = &self.attention_q_norm {
-            query_states = norm.forward_generic_4d(&query_states);
-        }
-        if let Some(norm) = &self.attention_k_norm {
-            key_states = norm.forward_generic_4d(&key_states);
-        }
-
-        let (query_states, key_states) = rope_cache.forward(
-            &query_states,
-            &key_states,
-            start_pos,
-            pos_ids,
-            self.interleaved_rope,
-        );
+        let (query_states, key_states) =
+            rope_cache.forward(&query_states, &key_states, start_pos, pos_ids, false);
 
         (query_states, key_states, value_states)
     }
@@ -579,15 +443,6 @@ where
                 pos_ids,
             ),
             AttentionVariant::Grouped(ref attention) => attention.forward(
-                num_heads,
-                head_dim,
-                num_key_value_heads,
-                hidden_states,
-                &self.rope_cache,
-                start_pos,
-                pos_ids,
-            ),
-            AttentionVariant::Paired(ref attention) => attention.forward(
                 num_heads,
                 head_dim,
                 num_key_value_heads,
