@@ -122,16 +122,16 @@ where
             .unbounded_send(Task::UnstructuredGeneration(UnstructuredGenerationTask::<
                 F,
             > {
-                settings: InferenceSettings::<F>::new(
-                    text,
+                settings: InferenceSettings::<F> {
+                    prompt: text,
                     images,
-                    session.clone(),
+                    session: session.clone(),
                     sampler,
                     max_tokens,
                     stop_on,
                     seed,
                     gpu_sampler,
-                ),
+                },
                 on_token,
                 finished: tx,
             }))

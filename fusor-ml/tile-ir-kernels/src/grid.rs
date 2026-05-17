@@ -2,15 +2,8 @@
 //! when the kernels split landed. `tile-ir`'s grid.rs still owns the generic
 //! `tile::build` entry point.
 
-use fusor_tile_ir::tile::{Mask, Storage, Tile, TileBlock};
+use fusor_tile_ir::tile::{Mask, Q4KActivations, Storage, Tile, TileBlock};
 use fusor_tile_ir::{TileLiteral, WorkgroupAxis, F32, U32};
-
-#[derive(Clone)]
-pub(crate) struct Q4KActivations {
-    pub(crate) low: [Tile; 16],
-    pub(crate) high: [Tile; 16],
-    pub(crate) sums: [Tile; 4],
-}
 
 #[derive(Clone, Copy)]
 pub(crate) struct QgemvGrid {

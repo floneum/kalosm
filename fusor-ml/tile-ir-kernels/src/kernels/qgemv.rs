@@ -1,6 +1,6 @@
 //! Quantized GEMV program kernels.
 
-use fusor_tile_ir::tile::{Mask, Program, QuantizedDot, Storage, Tile};
+use fusor_tile_ir::tile::{BlockCoord, Mask, Program, QuantizedDot, Storage, Tile};
 use fusor_tile_ir::{GgmlQuantFormat, QuantizedMatrix, TileLiteral, TileReduceOp, F32};
 
 use crate::dispatch::{
@@ -286,13 +286,9 @@ pub(crate) fn qgemv_q4k_ggml_with_epilogue<
                     let col = col0.clone() + c as u32;
                     let mask = grid.mask(full_block_iterations, pass.in_bounds.clone(), &col);
                     program.quantized_dot(QuantizedDot::q4k_block(
-                        pass.activations.low.clone(),
-                        pass.activations.high.clone(),
-                        pass.activations.sums.clone(),
+                        pass.activations.clone(),
                         &b_cloned,
-                        &pass.block,
-                        &q4k_lane.iq,
-                        &q4k_lane.ir,
+                        BlockCoord::new(&pass.block, &q4k_lane.iq, &q4k_lane.ir),
                         &col,
                         mask,
                         0.0,
@@ -371,9 +367,7 @@ pub(crate) fn qgemv_q6k_ggml_with_epilogue<
                     program.quantized_dot(QuantizedDot::q6k_block(
                         pass.activations.clone(),
                         &b_cloned,
-                        &pass.block,
-                        &q6k_lane.ip,
-                        &q6k_lane.il,
+                        BlockCoord::new(&pass.block, &q6k_lane.ip, &q6k_lane.il),
                         &col,
                         mask,
                         0.0,

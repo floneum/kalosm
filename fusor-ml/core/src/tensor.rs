@@ -11,8 +11,8 @@ use tabbycat::Graph;
 use wgpu::COPY_BUFFER_ALIGNMENT;
 
 use crate::{
-    Device, Dim, FlashAttentionOperation, Layout, MatMulOperation, MatMulParams, ReduceFunction,
-    ReduceOperation,
+    Device, Dim, FlashAttentionInputs, FlashAttentionOperation, Layout, MatMulOperation,
+    MatMulParams, ReduceFunction, ReduceOperation,
     compute_graph::NodeIndex,
     map_layout::MapLayoutOperation,
     nary_wise::{NaryExpr, NaryFunction, NaryOperation},
@@ -328,7 +328,7 @@ impl LazyTensorData {
         // axis preserves the zero in the output. Both cases are produced by
         // splatting the identity at `new_shape` — the kernel would otherwise
         // panic on `iterations > 0` in `tile-ir/.../reduce.rs`.
-        if input_shape.iter().any(|&d| d == 0) {
+        if input_shape.contains(&0) {
             let data = TensorData::new_splat_scalar(&device, &new_shape, function.function.initial_value);
             return Self::new(data);
         }
@@ -427,7 +427,7 @@ impl TensorData {
         // Empty tensors (any dim is 0) have no valid indices, so the bounds
         // check below would compare strides * (dim - 1) against a buffer sized
         // for zero elements and spuriously fail.
-        let is_empty = layout.shape().iter().any(|&d| d == 0);
+        let is_empty = layout.shape().contains(&0);
         assert!(
             is_empty
                 || layout.offset()
@@ -1021,17 +1021,17 @@ impl<D: DataType, const R: usize> Tensor<R, D> {
             return None;
         }
 
-        let operation = FlashAttentionOperation::new(
-            self.data.key,
-            k.data.key,
-            v.data.key,
-            mask.map(|mask| mask.data.key),
+        let operation = FlashAttentionOperation::new(FlashAttentionInputs {
+            q: self.data.key,
+            k: k.data.key,
+            v: v.data.key,
+            mask: mask.map(|mask| mask.data.key),
             q_shape,
             k_shape,
             v_shape,
             scale,
-            D::DATA_TYPE,
-        );
+            input_dtype: D::DATA_TYPE,
+        });
         Some(Self::from_parts(self.data.flash_attention(operation)))
     }
 
@@ -1095,7 +1095,7 @@ impl Tensor<1, f32> {
 
         let (input, _) = self.data.materialize();
         if input.datatype() != DataTypeEnum::F32 || input.layout().rank() != 1 {
-            return Ok(cpu_top_k_pairs_from_tensor_data(&input, k).await?);
+            return cpu_top_k_pairs_from_tensor_data(&input, k).await;
         }
 
         let input_len = input.layout().shape()[0];
@@ -1128,22 +1128,24 @@ impl Tensor<1, f32> {
                 output_per_chunk,
                 Some(&mut encoder),
             ) else {
-                return Ok(cpu_top_k_pairs_from_tensor_data(&input, k).await?);
+                return cpu_top_k_pairs_from_tensor_data(&input, k).await;
             };
             if candidate_count >= crate::top_k::TOP_K_CHUNK {
                 let Some((ids, values)) =
                     crate::top_k::merge_sorted_chunk_top_k_pair_data_with_encoder(
                         &ids,
                         &values,
-                        chunks,
-                        crate::top_k::TOP_K_CHUNK,
-                        crate::top_k::TOP_K_CHUNK,
-                        input_len,
-                        k,
+                        crate::top_k::MergeSortedChunkTopKParams {
+                            chunks,
+                            chunk_len: crate::top_k::TOP_K_CHUNK,
+                            chunk_stride: crate::top_k::TOP_K_CHUNK,
+                            input_len,
+                            k,
+                        },
                         Some(&mut encoder),
                     )
                 else {
-                    return Ok(cpu_top_k_pairs_from_tensor_data(&input, k).await?);
+                    return cpu_top_k_pairs_from_tensor_data(&input, k).await;
                 };
                 input.device().wgpu_queue().submit(Some(encoder.finish()));
                 let ids = Tensor::<1, u32>::as_slice_from_tensor_data(&ids).await?;
@@ -1154,15 +1156,17 @@ impl Tensor<1, f32> {
                 crate::top_k::merge_sorted_chunk_top_k_pair_data_with_encoder(
                     &ids,
                     &values,
-                    chunks,
-                    candidate_count,
-                    output_per_chunk,
-                    input_len,
-                    k,
+                    crate::top_k::MergeSortedChunkTopKParams {
+                        chunks,
+                        chunk_len: candidate_count,
+                        chunk_stride: output_per_chunk,
+                        input_len,
+                        k,
+                    },
                     Some(&mut encoder),
                 )
             else {
-                return Ok(cpu_top_k_pairs_from_tensor_data(&input, k).await?);
+                return cpu_top_k_pairs_from_tensor_data(&input, k).await;
             };
             input.device().wgpu_queue().submit(Some(encoder.finish()));
             let merged_ids = Tensor::<1, u32>::as_slice_from_tensor_data(&merged_ids).await?;
@@ -1197,7 +1201,7 @@ impl Tensor<1, f32> {
             }
 
             if candidate_count >= crate::top_k::TOP_K_CHUNK {
-                return Ok(cpu_top_k_pairs_from_tensor_data(&input, k).await?);
+                return cpu_top_k_pairs_from_tensor_data(&input, k).await;
             }
             candidate_count = (candidate_count * 2).min(crate::top_k::TOP_K_CHUNK);
         }

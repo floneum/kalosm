@@ -610,20 +610,18 @@ fn emit_function(function: &NaryFunction, values: &mut [(ValueTile, DataTypeEnum
 pub(crate) fn eval_nary_expr_on_tiles(
     expr: &NaryExpr,
     inputs: &[(tile_ir::tile::Tile, DataTypeEnum)],
-    output_dtype: DataTypeEnum,
 ) -> (tile_ir::tile::Tile, DataTypeEnum) {
     let inputs = inputs
         .iter()
         .map(|(tile, dtype)| (ValueTile::F32(tile.clone()).cast_to(*dtype), *dtype))
         .collect::<Vec<_>>();
-    let (value, dtype) = eval_nary_expr_on_value_tiles(expr, &inputs, output_dtype);
+    let (value, dtype) = eval_nary_expr_on_value_tiles(expr, &inputs);
     (value.into_f32(), dtype)
 }
 
 fn eval_nary_expr_on_value_tiles(
     expr: &NaryExpr,
     inputs: &[(ValueTile, DataTypeEnum)],
-    output_dtype: DataTypeEnum,
 ) -> (ValueTile, DataTypeEnum) {
     match expr {
         NaryExpr::Op { children, function } => {
@@ -631,7 +629,7 @@ fn eval_nary_expr_on_value_tiles(
                 .iter()
                 .zip(&function.input_types)
                 .map(|(child, expected)| {
-                    let (value, ty) = eval_nary_expr_on_value_tiles(child, inputs, output_dtype);
+                    let (value, ty) = eval_nary_expr_on_value_tiles(child, inputs);
                     (value.cast_to(*expected), ty)
                 })
                 .collect::<Vec<_>>();

@@ -1,6 +1,6 @@
 //! Q4K paired-epilogue GEMV program kernels.
 
-use fusor_tile_ir::tile::{Mask, Program, QuantizedDot, Storage, Tile, TileBlock};
+use fusor_tile_ir::tile::{BlockCoord, Mask, Program, QuantizedDot, Storage, Tile, TileBlock};
 use fusor_tile_ir::{
     GgmlQuantFormat, QuantizedMatrix, TileLiteral, TileReduceOp, WorkgroupAxis, F32, U32,
 };
@@ -154,13 +154,9 @@ fn qgemv_q4k_paired_ggml(program: &mut Program, spec: Q4KPairedGgml<'_>) {
 
                     let dot = |program: &mut TileBlock<'_>, col: Tile<U32>, mask: Mask| {
                         program.quantized_dot(QuantizedDot::q4k_block(
-                            pass.activations.low.clone(),
-                            pass.activations.high.clone(),
-                            pass.activations.sums.clone(),
+                            pass.activations.clone(),
                             &b_cloned,
-                            &pass.block,
-                            &q4k_lane.iq,
-                            &q4k_lane.ir,
+                            BlockCoord::new(&pass.block, &q4k_lane.iq, &q4k_lane.ir),
                             &col,
                             mask,
                             0.0,

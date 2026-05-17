@@ -315,6 +315,15 @@ pub(crate) struct LlamaModel<F: FloatDataType + SimdElement = f32> {
     pub(crate) tokenizer: Arc<Tokenizer>,
 }
 
+pub(crate) struct ForwardInputs<'a, F: FloatDataType + SimdElement> {
+    pub(crate) model: &'a Model<F>,
+    pub(crate) device: &'a Device,
+    pub(crate) tokens: &'a [u32],
+    pub(crate) images: &'a [(image::DynamicImage, MediaHints)],
+    pub(crate) cache: Option<&'a mut LlamaCache>,
+    pub(crate) tokenizer: &'a Tokenizer,
+}
+
 impl<F: FloatDataType + SimdElement + Default + FloatOps + MatmulImpl> LlamaModel<F>
 where
     F: CastTo<f32> + CastTensor<f32> + WasmNotSend + WasmNotSync + 'static,
@@ -324,15 +333,20 @@ where
     SumOp: SimdReduceOp<F>,
 {
     fn prepare_forward_logits(
-        model: &Model<F>,
-        device: &Device,
-        tokens: &[u32],
-        images: &[(image::DynamicImage, MediaHints)],
-        mut cache: Option<&mut LlamaCache>,
-        #[cfg_attr(not(debug_assertions), allow(unused_variables))] tokenizer: &Tokenizer,
+        ctx: ForwardInputs<'_, F>,
         fast_path: &'static str,
         fallback_path: &'static str,
     ) -> Result<PreparedForwardLogits, LlamaModelError> {
+        let ForwardInputs {
+            model,
+            device,
+            tokens,
+            images,
+            mut cache,
+            tokenizer,
+        } = ctx;
+        #[cfg(not(debug_assertions))]
+        let _ = tokenizer;
         if tokens.is_empty() {
             return Err(LlamaModelError::EmptyInput);
         }
@@ -377,7 +391,7 @@ where
                     start.elapsed()
                 );
             }
-            if let Some(cache) = cache.as_deref_mut() {
+            if let Some(cache) = cache {
                 cache.detach(device);
             }
         }
@@ -406,12 +420,14 @@ where
         Box<dyn kalosm_model_types::FutureWasmNotSend<Output = Result<Vec<f32>, LlamaModelError>>>,
     > {
         let prepared = match Self::prepare_forward_logits(
-            model,
-            device,
-            tokens,
-            images,
-            cache,
-            tokenizer,
+            ForwardInputs {
+                model,
+                device,
+                tokens,
+                images,
+                cache,
+                tokenizer,
+            },
             "fast_decode_graph",
             "graph_fallback",
         ) {
@@ -455,12 +471,14 @@ where
         >,
     > {
         let prepared = match Self::prepare_forward_logits(
-            model,
-            device,
-            tokens,
-            images,
-            cache,
-            tokenizer,
+            ForwardInputs {
+                model,
+                device,
+                tokens,
+                images,
+                cache,
+                tokenizer,
+            },
             "fast_decode_graph_top_k",
             "graph_fallback_top_k",
         ) {
@@ -504,18 +522,21 @@ where
     }
 
     pub(crate) fn forward_sample_token<'a>(
-        model: &Model<F>,
-        device: &Device,
-        tokens: &[u32],
-        images: &[(image::DynamicImage, MediaHints)],
-        cache: Option<&mut LlamaCache>,
-        tokenizer: &Tokenizer,
+        ctx: ForwardInputs<'_, F>,
         sampler: &'a mut fusor::GpuMirostat2Sampler,
         previous_tokens: Vec<u32>,
         params: fusor::GpuMirostat2SamplerParams,
     ) -> Pin<
         Box<dyn kalosm_model_types::FutureWasmNotSend<Output = Result<u32, LlamaModelError>> + 'a>,
     > {
+        let ForwardInputs {
+            model,
+            device,
+            tokens,
+            images,
+            cache,
+            tokenizer,
+        } = ctx;
         if tokens.is_empty() {
             return Box::pin(async { Err(LlamaModelError::EmptyInput) });
         }
@@ -530,11 +551,14 @@ where
 
         if gpu_fused_logits_sampling_enabled() {
             return Self::forward_sample_token_fused_logits(
-                model,
-                device,
-                tokens,
-                images,
-                cache,
+                ForwardInputs {
+                    model,
+                    device,
+                    tokens,
+                    images,
+                    cache,
+                    tokenizer,
+                },
                 sampler,
                 previous_tokens,
                 params,
@@ -542,12 +566,14 @@ where
         }
 
         let prepared = match Self::prepare_forward_logits(
-            model,
-            device,
-            tokens,
-            images,
-            cache,
-            tokenizer,
+            ForwardInputs {
+                model,
+                device,
+                tokens,
+                images,
+                cache,
+                tokenizer,
+            },
             "fast_decode_graph_sample_token",
             "graph_fallback_sample_token",
         ) {
@@ -576,17 +602,21 @@ where
     }
 
     fn forward_sample_token_fused_logits<'a>(
-        model: &Model<F>,
-        device: &Device,
-        tokens: &[u32],
-        images: &[(image::DynamicImage, MediaHints)],
-        mut cache: Option<&mut LlamaCache>,
+        ctx: ForwardInputs<'_, F>,
         sampler: &'a mut fusor::GpuMirostat2Sampler,
         previous_tokens: Vec<u32>,
         params: fusor::GpuMirostat2SamplerParams,
     ) -> Pin<
         Box<dyn kalosm_model_types::FutureWasmNotSend<Output = Result<u32, LlamaModelError>> + 'a>,
     > {
+        let ForwardInputs {
+            model,
+            device,
+            tokens,
+            images,
+            mut cache,
+            tokenizer: _,
+        } = ctx;
         let trace = decode_trace_enabled();
         let decode_eligible = tokens.len() == 1
             && images.is_empty()
@@ -621,7 +651,7 @@ where
                     start.elapsed()
                 );
             }
-            if let Some(cache) = cache.as_deref_mut() {
+            if let Some(cache) = cache {
                 cache.detach(device);
             }
         }
@@ -915,12 +945,14 @@ where
                             .write()
                             .map_err(|err| LlamaModelError::Session(err.to_string()))?;
                         Self::forward_sample_token(
-                            &self.model,
-                            &self.device,
-                            tokens,
-                            &images,
-                            Some(&mut session_lock),
-                            &self.tokenizer,
+                            ForwardInputs {
+                                model: &self.model,
+                                device: &self.device,
+                                tokens,
+                                images: &images,
+                                cache: Some(&mut session_lock),
+                                tokenizer: &self.tokenizer,
+                            },
                             &mut gpu_sampler.sampler,
                             previous_tokens,
                             params,
@@ -975,12 +1007,14 @@ where
                                 );
                             }
                             Self::forward_sample_token(
-                                &self.model,
-                                &self.device,
-                                &[new_token],
-                                &[],
-                                Some(&mut session_lock),
-                                &self.tokenizer,
+                                ForwardInputs {
+                                    model: &self.model,
+                                    device: &self.device,
+                                    tokens: &[new_token],
+                                    images: &[],
+                                    cache: Some(&mut session_lock),
+                                    tokenizer: &self.tokenizer,
+                                },
                                 &mut gpu_sampler.sampler,
                                 previous_tokens,
                                 params,

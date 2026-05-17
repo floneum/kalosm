@@ -42,7 +42,7 @@ use crate::quantized::QuantizedMatrix;
 ///             Mask::all(),
 ///             0.0,
 ///         ));
-///         let sum = block.group_reduce_sum::<8>(dot);
+///         let sum = block.group_reduce_sum::<8, _>(dot);
 ///         block.store(y.at((0u32, 0u32)), sum, lane.eq(0u32));
 ///     });
 /// });
@@ -117,17 +117,15 @@ impl QuantizedDot {
 
     /// Build a block-coordinate Q4K dot from prepacked activation terms.
     pub fn q4k_block(
-        low: [Tile<F32>; 16],
-        high: [Tile<F32>; 16],
-        sums: [Tile<F32>; 4],
+        activations: Q4KActivations,
         matrix: &QuantizedMatrix,
-        block: impl Into<Tile<U32>>,
-        c0: impl Into<Tile<U32>>,
-        c1: impl Into<Tile<U32>>,
+        coord: BlockCoord,
         col: impl Into<Tile<U32>>,
         mask: impl Into<Mask>,
         fill: f32,
     ) -> Self {
+        let Q4KActivations { low, high, sums } = activations;
+        let BlockCoord { block, c0, c1 } = coord;
         Self {
             src: matrix.clone(),
             activations: PackedActivations::Q4KGgml {
@@ -151,13 +149,12 @@ impl QuantizedDot {
     pub fn q6k_block(
         a: [Tile<F32>; 16],
         matrix: &QuantizedMatrix,
-        block: impl Into<Tile<U32>>,
-        c0: impl Into<Tile<U32>>,
-        c1: impl Into<Tile<U32>>,
+        coord: BlockCoord,
         col: impl Into<Tile<U32>>,
         mask: impl Into<Mask>,
         fill: f32,
     ) -> Self {
+        let BlockCoord { block, c0, c1 } = coord;
         Self {
             src: matrix.clone(),
             activations: PackedActivations::F32(tiles_to_exprs(a)),
@@ -170,6 +167,35 @@ impl QuantizedDot {
             mask: Box::new(mask.into().expr),
             fill: f32_fill(fill),
             block_n: 16,
+        }
+    }
+}
+
+/// Q4K prepacked activation terms used by [`QuantizedDot::q4k_block`].
+#[derive(Clone)]
+pub struct Q4KActivations {
+    pub low: [Tile<F32>; 16],
+    pub high: [Tile<F32>; 16],
+    pub sums: [Tile<F32>; 4],
+}
+
+/// Block-coordinate triple `(block, c0, c1)` used by `*_block` dot constructors.
+pub struct BlockCoord {
+    pub block: Tile<U32>,
+    pub c0: Tile<U32>,
+    pub c1: Tile<U32>,
+}
+
+impl BlockCoord {
+    pub fn new(
+        block: impl Into<Tile<U32>>,
+        c0: impl Into<Tile<U32>>,
+        c1: impl Into<Tile<U32>>,
+    ) -> Self {
+        Self {
+            block: block.into(),
+            c0: c0.into(),
+            c1: c1.into(),
         }
     }
 }

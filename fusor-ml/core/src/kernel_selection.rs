@@ -584,12 +584,8 @@ fn sample_from_hints(
             return Some(value);
         }
     }
-    for value in min..=max.min(min.saturating_add(DIM_SAMPLE_ATTEMPTS - 1)) {
-        if constraint.matches(value) {
-            return Some(value);
-        }
-    }
-    None
+    (min..=max.min(min.saturating_add(DIM_SAMPLE_ATTEMPTS - 1)))
+        .find(|&value| constraint.matches(value))
 }
 
 fn round_up_to_multiple(value: usize, divisor: usize) -> Option<usize> {

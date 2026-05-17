@@ -44,12 +44,16 @@ pub(super) fn qmat_logits_data_with_encoder(
     );
     let kernel = QMatMulOperation::direct_kernel_for_tensors(
         device,
-        &hidden_2d,
-        matrix,
-        &logits_2d,
+        crate::quantized::matmul::DirectKernelTensors {
+            input: &hidden_2d,
+            matrix,
+            output: &logits_2d,
+        },
         "q_mat_logits_for_sampler",
-        None,
-        None,
+        crate::quantized::matmul::DirectKernelChains {
+            pre: None,
+            post: None,
+        },
         None,
     )?;
     kernel.run(device.kernel_cache(), encoder);

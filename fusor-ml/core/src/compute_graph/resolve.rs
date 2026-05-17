@@ -137,7 +137,7 @@ fn print_host_category_profile(profile: FxHashMap<&'static str, ResolveHostCateg
             )
         })
         .collect::<Vec<_>>();
-    profile.sort_by(|a, b| b.5.cmp(&a.5));
+    profile.sort_by_key(|entry| std::cmp::Reverse(entry.5));
     eprintln!("resolve_host_category_profile {profile:?}");
 }
 
@@ -461,7 +461,7 @@ impl Resolver {
                     commands.extend(
                         copies
                             .into_iter()
-                            .map(|copy| CommandRecord::CopyBuffer(copy)),
+                            .map(CommandRecord::CopyBuffer),
                     );
                     let start = host_trace.then(Instant::now);
                     Self::release_dead_intermediates(
@@ -860,11 +860,10 @@ impl Resolver {
             for dep in deps {
                 if let Some(count) = remaining_consumers.get_mut(&dep) {
                     *count = count.saturating_sub(1);
-                    if *count == 0 && !targets.contains(&dep) && !graph.has_live_reference(dep) {
-                        if let Some(node) = graph.nodes.nodes.node_weight_mut(dep) {
+                    if *count == 0 && !targets.contains(&dep) && !graph.has_live_reference(dep)
+                        && let Some(node) = graph.nodes.nodes.node_weight_mut(dep) {
                             node.cached = None;
                         }
-                    }
                 }
             }
         }
@@ -895,7 +894,7 @@ impl Resolver {
         let shape = value.layout().shape();
         let row_elems = *shape.last()?;
         let copy_size = row_elems.checked_mul(element_size)? as u64;
-        if copy_size == 0 || copy_size % wgpu::COPY_BUFFER_ALIGNMENT != 0 {
+        if copy_size == 0 || !copy_size.is_multiple_of(wgpu::COPY_BUFFER_ALIGNMENT) {
             return None;
         }
 
@@ -916,7 +915,7 @@ impl Resolver {
             for dim in (0..outer_rank).rev() {
                 let dim_len = shape[dim];
                 let index = if dim_len == 0 { 0 } else { remaining % dim_len };
-                remaining = if dim_len == 0 { 0 } else { remaining / dim_len };
+                remaining = remaining.checked_div(dim_len).unwrap_or(0);
                 source_element = source_element.checked_add(index * source_strides[dim])?;
                 destination_element =
                     destination_element.checked_add(index * destination_strides[dim])?;
@@ -924,8 +923,8 @@ impl Resolver {
 
             let source_offset = source_element.checked_mul(element_size)? as u64;
             let destination_offset = destination_element.checked_mul(element_size)? as u64;
-            if source_offset % wgpu::COPY_BUFFER_ALIGNMENT != 0
-                || destination_offset % wgpu::COPY_BUFFER_ALIGNMENT != 0
+            if !source_offset.is_multiple_of(wgpu::COPY_BUFFER_ALIGNMENT)
+                || !destination_offset.is_multiple_of(wgpu::COPY_BUFFER_ALIGNMENT)
             {
                 return None;
             }
@@ -1968,7 +1967,6 @@ impl Resolver {
         // closure's slice via `input_slot_to_tile_idx`.
         let expression = split.expression.clone();
         let datatype = qmatmul_op.input_datatype;
-        let output_datatype = split.output_datatype;
         let permutation = input_slot_to_tile_idx.clone();
         let epilogue = fusor_tile_ir_kernels::PairedEpilogue::with_extras(
             "autofused_with_extras",
@@ -1980,7 +1978,7 @@ impl Resolver {
                     .iter()
                     .map(|&tile_idx| (tiles[tile_idx].clone(), datatype))
                     .collect();
-                let (tile, _) = eval_nary_expr_on_tiles(&expression, &inputs, output_datatype);
+                let (tile, _) = eval_nary_expr_on_tiles(&expression, &inputs);
                 tile
             },
         );

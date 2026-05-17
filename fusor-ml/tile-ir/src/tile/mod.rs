@@ -33,6 +33,6 @@ pub use block::TileBlock;
 pub use coop::{CoopRole, CoopTileLoad};
 pub use grid::build;
 pub use program::Program;
-pub use quantized::QuantizedDot;
+pub use quantized::{BlockCoord, Q4KActivations, QuantizedDot};
 pub use storage::{RuntimeElement, Storage, StorageIndex};
 pub use value::{range, Address, CoopAcc, CoopFragment, FoldIter, Local, Mask, Tile, Workgroup};

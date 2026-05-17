@@ -6,9 +6,8 @@ use fusor_tile_ir_kernels::{
     batched_gemv_with_epilogues, batched_matmul_with_epilogues, flash_attention,
     linear_storage_layout, qdequantize, qgemv_q4k_paired, qgemv_with_epilogue,
     qmatmul_with_epilogue, quantized_matrix, rms_norm_vec4, try_batched_coop_matmul,
-    DenseMatmulEpilogues, DenseMatmulShape, FlashAttentionDims, FlashAttentionMeta,
-    PairedEpilogue, Q4KPairedGgml, QmatmulEpilogues, RmsNormVec4, RmsNormVec4Meta, TensorMeta,
-    UnaryEpilogue,
+    DenseMatmulEpilogues, DenseMatmulShape, FlashAttentionDims, FlashAttentionMeta, PairedEpilogue,
+    Q4KPairedGgml, QmatmulEpilogues, RmsNormVec4, RmsNormVec4Meta, TensorMeta, UnaryEpilogue,
 };
 
 fn lower_or_fail(ir: &fusor_tile_ir::KernelIr, label: &str) -> NagaKernel {

@@ -188,7 +188,7 @@ impl PairedKind {
             PairedKind::SwiGLU => x / (1.0 + (-x).exp()),
             PairedKind::GeGLU => {
                 // tanh approximation matching the kernel-side helper
-                0.5 * x * (1.0 + (0.797_884_56 * (x + 0.044_715 * x * x * x)).tanh())
+                0.5 * x * (1.0 + (0.797_884_6 * (x + 0.044_715 * x * x * x)).tanh())
             }
             PairedKind::ReGLU => {
                 if x > 0.0 {

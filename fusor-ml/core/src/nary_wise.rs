@@ -489,7 +489,6 @@ impl NaryOperation {
             inputs: self.inputs.clone(),
             inputs_seen: input_seen,
             expression: self.expression.clone(),
-            output_datatype: self.output_datatype,
         })
     }
 
@@ -559,7 +558,6 @@ pub(crate) struct ExtractedPairedSplit {
     /// be used (unused inputs would point at dead graph nodes).
     pub(crate) inputs_seen: Vec<bool>,
     pub(crate) expression: NaryExpr,
-    pub(crate) output_datatype: DataTypeEnum,
 }
 
 impl Operation for NaryOperation {

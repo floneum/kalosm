@@ -424,28 +424,28 @@ where
 
 pub(crate) struct InferenceSettings<F: FloatDataType + SimdElement = f32> {
     /// The prompt to use.
-    prompt: String,
+    pub(crate) prompt: String,
 
     /// Images in the prompt
-    images: Vec<(image::DynamicImage, MediaHints)>,
+    pub(crate) images: Vec<(image::DynamicImage, MediaHints)>,
 
     /// The token to stop on.
-    stop_on: Option<String>,
+    pub(crate) stop_on: Option<String>,
 
     /// The sampler to use.
-    sampler: std::sync::Arc<std::sync::Mutex<dyn llm_samplers::prelude::Sampler>>,
+    pub(crate) sampler: std::sync::Arc<std::sync::Mutex<dyn llm_samplers::prelude::Sampler>>,
 
     /// The session to use.
-    session: LlamaSession<F>,
+    pub(crate) session: LlamaSession<F>,
 
     /// The maximum number of tokens to generate.
-    max_tokens: u32,
+    pub(crate) max_tokens: u32,
 
     /// The seed to use.
-    seed: Option<u64>,
+    pub(crate) seed: Option<u64>,
 
     /// GPU-side sampler settings for the default generation sampler.
-    gpu_sampler: Option<GpuSamplerConfig>,
+    pub(crate) gpu_sampler: Option<GpuSamplerConfig>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -478,27 +478,3 @@ impl GpuSamplerConfig {
     }
 }
 
-impl<F: FloatDataType + SimdElement> InferenceSettings<F> {
-    pub fn new(
-        prompt: impl ToString,
-        images: Vec<(image::DynamicImage, MediaHints)>,
-        session: LlamaSession<F>,
-        sampler: std::sync::Arc<std::sync::Mutex<dyn llm_samplers::prelude::Sampler>>,
-        max_tokens: u32,
-        stop_on: Option<String>,
-        seed: Option<u64>,
-        gpu_sampler: Option<GpuSamplerConfig>,
-    ) -> Self {
-        let prompt = prompt.to_string();
-        Self {
-            prompt,
-            images,
-            stop_on,
-            sampler,
-            session,
-            max_tokens,
-            seed,
-            gpu_sampler,
-        }
-    }
-}

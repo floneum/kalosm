@@ -122,7 +122,7 @@ pub fn batched_gemv_with_epilogues<
                         Stor::ZERO_STORAGE,
                     );
                     Tile::select(
-                        Tile::from(mask),
+                        mask,
                         apply_optional_epilogue(epilogues.pre_a, Stor::into_accum(loaded)),
                         Tile::literal(TileLiteral::f32(0.0)),
                     )
@@ -136,7 +136,7 @@ pub fn batched_gemv_with_epilogues<
                         Stor::ZERO_STORAGE,
                     );
                     Tile::select(
-                        Tile::from(mask),
+                        mask,
                         apply_optional_epilogue(epilogues.pre_b, Stor::into_accum(loaded)),
                         Tile::literal(TileLiteral::f32(0.0)),
                     )
@@ -243,7 +243,7 @@ pub fn batched_matmul_with_epilogues<
                         Stor::ZERO_STORAGE,
                     );
                     let value = Stor::from_accum(Tile::select(
-                        Tile::from(in_bounds),
+                        in_bounds,
                         apply_optional_epilogue(epilogues.pre_a, Stor::into_accum(loaded)),
                         Tile::literal(TileLiteral::f32(0.0)),
                     ));
@@ -266,7 +266,7 @@ pub fn batched_matmul_with_epilogues<
                         Stor::ZERO_STORAGE,
                     );
                     let value = Stor::from_accum(Tile::select(
-                        Tile::from(in_bounds),
+                        in_bounds,
                         apply_optional_epilogue(epilogues.pre_b, Stor::into_accum(loaded)),
                         Tile::literal(TileLiteral::f32(0.0)),
                     ));
@@ -282,16 +282,12 @@ pub fn batched_matmul_with_epilogues<
                     let mut sum = Tile::literal(TileLiteral::f32(0.0));
                     for kk in 0..BK {
                         let a_value = Stor::into_accum(
-                            program.load_workgroup(
-                                a_tile,
-                                local_row.clone() * BK as u32 + kk as u32,
-                            ),
+                            program
+                                .load_workgroup(a_tile, local_row.clone() * BK as u32 + kk as u32),
                         );
                         let b_value = Stor::into_accum(
-                            program.load_workgroup(
-                                b_tile,
-                                local_col.clone() + kk as u32 * BN as u32,
-                            ),
+                            program
+                                .load_workgroup(b_tile, local_col.clone() + kk as u32 * BN as u32),
                         );
                         sum = sum + a_value * b_value;
                     }
@@ -381,7 +377,7 @@ pub fn batched_matmul_register_with_epilogues<
                         Stor::ZERO_STORAGE,
                     );
                     Tile::select(
-                        Tile::from(in_bounds),
+                        in_bounds,
                         apply_optional_epilogue(epilogues.pre_a, Stor::into_accum(loaded)),
                         Tile::literal(TileLiteral::f32(0.0)),
                     )
@@ -395,7 +391,7 @@ pub fn batched_matmul_register_with_epilogues<
                         Stor::ZERO_STORAGE,
                     );
                     Tile::select(
-                        Tile::from(in_bounds),
+                        in_bounds,
                         apply_optional_epilogue(epilogues.pre_b, Stor::into_accum(loaded)),
                         Tile::literal(TileLiteral::f32(0.0)),
                     )
@@ -423,11 +419,15 @@ pub fn batched_matmul_register_with_epilogues<
     });
 }
 
-
 /// Try to emit a fast cooperative-matrix batched matmul. Returns false
 /// when shape/layout/epilogues require the generic path. Generic over the
 /// storage element so both F32 and F16 use the same dispatch table.
-pub fn try_batched_coop_matmul<T: CoopElement, const BM: usize, const BN: usize, const BK: usize>(
+pub fn try_batched_coop_matmul<
+    T: CoopElement,
+    const BM: usize,
+    const BN: usize,
+    const BK: usize,
+>(
     program: &mut Program,
     a: &Storage<T, 2>,
     b: &Storage<T, 2>,
@@ -614,13 +614,8 @@ fn batched_coop_matmul_perf_single<
 
                 let kk_steps = (BK as u32) / COOP_DIM;
                 for kk in 0..kk_steps {
-                    let a_frags = coop_load_a_fragments(
-                        program,
-                        a_tile,
-                        &sg_row_base,
-                        kk,
-                        tile_rows_per_sg,
-                    );
+                    let a_frags =
+                        coop_load_a_fragments(program, a_tile, &sg_row_base, kk, tile_rows_per_sg);
                     let b_frags = coop_load_b_fragments(
                         program,
                         b_tile,
@@ -816,8 +811,7 @@ fn batched_coop_matmul_perf<
 
             // Odd k_iterations: a single trailing tile after the pair loop.
             if k_remainder == 1 {
-                let k_base_epi =
-                    Tile::literal(TileLiteral::U32((k_iterations - 1) * BK as u32));
+                let k_base_epi = Tile::literal(TileLiteral::U32((k_iterations - 1) * BK as u32));
                 program.copy_storage_to_tile(
                     a_tile_0,
                     a,

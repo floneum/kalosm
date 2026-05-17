@@ -221,18 +221,31 @@ pub(crate) struct FlashAttentionOperation {
     input_dtype: DataTypeEnum,
 }
 
+pub(crate) struct FlashAttentionInputs<'a> {
+    pub(crate) q: NodeIndex,
+    pub(crate) k: NodeIndex,
+    pub(crate) v: NodeIndex,
+    pub(crate) mask: Option<NodeIndex>,
+    pub(crate) q_shape: &'a [usize],
+    pub(crate) k_shape: &'a [usize],
+    pub(crate) v_shape: &'a [usize],
+    pub(crate) scale: f32,
+    pub(crate) input_dtype: DataTypeEnum,
+}
+
 impl FlashAttentionOperation {
-    pub(crate) fn new(
-        q: NodeIndex,
-        k: NodeIndex,
-        v: NodeIndex,
-        mask: Option<NodeIndex>,
-        q_shape: &[usize],
-        k_shape: &[usize],
-        v_shape: &[usize],
-        scale: f32,
-        input_dtype: DataTypeEnum,
-    ) -> Self {
+    pub(crate) fn new(inputs: FlashAttentionInputs<'_>) -> Self {
+        let FlashAttentionInputs {
+            q,
+            k,
+            v,
+            mask,
+            q_shape,
+            k_shape,
+            v_shape,
+            scale,
+            input_dtype,
+        } = inputs;
         assert_eq!(q_shape.len(), 4, "Q must be rank-4");
         assert_eq!(k_shape.len(), 4, "K must be rank-4");
         assert_eq!(v_shape.len(), 4, "V must be rank-4");
@@ -407,11 +420,13 @@ impl Operation for FlashAttentionOperation {
                 dims,
                 self.scale,
                 caps,
-                q_meta.clone(),
-                k_meta.clone(),
-                v_meta.clone(),
-                mask_meta.as_ref(),
-                output_meta.clone(),
+                FlashDecodeSmallTensors {
+                    q: q_meta.clone(),
+                    k: k_meta.clone(),
+                    v: v_meta.clone(),
+                    mask: mask_meta.as_ref(),
+                    output: output_meta.clone(),
+                },
             )?;
             assert_eq!(
                 Some(meta.decode_block),
@@ -519,7 +534,7 @@ impl Operation for FlashAttentionOperation {
                     .as_ref()
                     .map(|_| tile_ir::KernelTensorRef::new((), layout.clone()));
                 let output_ref = tile_ir::KernelTensorRef::new((), layout.clone());
-                let result = if let Some(meta) = decode_meta {
+                if let Some(meta) = decode_meta {
                     let params_ref = tile_ir::KernelTensorRef::new((), layout.clone());
                     tile_ir_kernels::flash_decode_small(
                         &mut kb, q_ref, k_ref, v_ref, output_ref, params_ref, meta,
@@ -557,7 +572,6 @@ impl Operation for FlashAttentionOperation {
                         _ => None,
                     }
                 }?;
-                let _ = result;
                 Some(kb.finish().0)
             },
         )
@@ -609,16 +623,27 @@ impl TensorMeta {
     }
 }
 
+struct FlashDecodeSmallTensors<'a> {
+    q: TensorMeta,
+    k: TensorMeta,
+    v: TensorMeta,
+    mask: Option<&'a TensorMeta>,
+    output: TensorMeta,
+}
+
 fn build_flash_decode_small_meta(
     dims: FlashAttentionDims,
     scale: f32,
     caps: KernelDeviceCaps,
-    q_meta: TensorMeta,
-    k_meta: TensorMeta,
-    v_meta: TensorMeta,
-    mask_meta: Option<&TensorMeta>,
-    output_meta: TensorMeta,
+    tensors: FlashDecodeSmallTensors<'_>,
 ) -> Option<FlashDecodeSmallMeta> {
+    let FlashDecodeSmallTensors {
+        q: q_meta,
+        k: k_meta,
+        v: v_meta,
+        mask: mask_meta,
+        output: output_meta,
+    } = tensors;
     if mask_meta.is_some()
         || dims.q_seq_len != 1
         || dims.head_dim != DECODE_HEAD_DIM
@@ -726,11 +751,13 @@ mod tests {
             decode_dims(DECODE_SMALL_BLOCK + 1),
             1.0,
             caps(DECODE_LARGE_BLOCK),
-            tensor_meta4(),
-            tensor_meta4(),
-            tensor_meta4(),
-            None,
-            tensor_meta4(),
+            FlashDecodeSmallTensors {
+                q: tensor_meta4(),
+                k: tensor_meta4(),
+                v: tensor_meta4(),
+                mask: None,
+                output: tensor_meta4(),
+            },
         )
         .unwrap();
 
@@ -746,11 +773,13 @@ mod tests {
             decode_dims(DECODE_MEDIUM_BLOCK + 1),
             1.0,
             caps(DECODE_MEDIUM_BLOCK),
-            tensor_meta4(),
-            tensor_meta4(),
-            tensor_meta4(),
-            None,
-            tensor_meta4(),
+            FlashDecodeSmallTensors {
+                q: tensor_meta4(),
+                k: tensor_meta4(),
+                v: tensor_meta4(),
+                mask: None,
+                output: tensor_meta4(),
+            },
         );
 
         let meta = meta.unwrap();
@@ -766,11 +795,13 @@ mod tests {
             decode_dims(DECODE_SMALL_BLOCK),
             1.0,
             caps(DECODE_SMALL_BLOCK - 1),
-            tensor_meta4(),
-            tensor_meta4(),
-            tensor_meta4(),
-            None,
-            tensor_meta4(),
+            FlashDecodeSmallTensors {
+                q: tensor_meta4(),
+                k: tensor_meta4(),
+                v: tensor_meta4(),
+                mask: None,
+                output: tensor_meta4(),
+            },
         );
 
         assert!(meta.is_none());
@@ -953,10 +984,10 @@ mod tests {
         let mut max_dim = 0usize;
         let mut max_actual = 0.0f32;
         let mut max_expected = 0.0f32;
-        for head in 0..num_heads {
+        for (head, q_head) in q_data[0].iter().enumerate().take(num_heads) {
             let kv_head = head / groups;
             let expected = cpu_decode_reference(
-                &q_data[0][head][0],
+                &q_head[0],
                 &k_data[0][kv_head],
                 &v_data[0][kv_head],
                 scale,

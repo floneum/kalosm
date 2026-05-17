@@ -123,11 +123,13 @@ async fn sample_processed_logits_to_host(
         let Some((ids, values)) = merge_sorted_chunk_top_k_pair_data_with_encoder(
             &chunk_ids,
             &chunk_values,
-            chunks,
-            candidate_count,
-            output_per_chunk,
-            input_len,
-            top_k,
+            crate::sampling::topk::MergeSortedChunkTopKParams {
+                chunks,
+                chunk_len: candidate_count,
+                chunk_stride: output_per_chunk,
+                input_len,
+                k: top_k,
+            },
             Some(&mut encoder),
         ) else {
             return Ok(None);

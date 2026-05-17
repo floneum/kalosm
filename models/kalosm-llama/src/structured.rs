@@ -13,7 +13,6 @@ use std::{
     fmt::{Debug, Formatter},
     sync::{Arc, Mutex},
 };
-use tokenizers::tokenizer::Tokenizer;
 
 use crate::model::LlamaModelError;
 use crate::token_stream::TokenOutputStream;
@@ -277,7 +276,6 @@ where
             &parser,
             &mut parser_state,
             result,
-            tokenizer,
             &mut token_stream,
             &mut on_token,
             &mut unprocessed_token_count,
@@ -295,7 +293,6 @@ fn update_state<P: Parser>(
     parser: &P,
     parser_state: &mut P::PartialState,
     result: ParseStatus<P::PartialState, P::Output>,
-    tokenizer: &Tokenizer,
     token_stream: &mut TokenOutputStream,
     on_token: &mut impl FnMut(String) -> Result<(), LlamaModelError>,
     unprocessed_token_count: &mut usize,
@@ -312,7 +309,7 @@ fn update_state<P: Parser>(
                 // The token may decode to a string that is a valid prefix of the required next token, but in a way that doesn't let us decode the required next tokens
                 let Some(mut extra_tokens) = token_stream
                     .encode_after(&required_next)
-                    .map_err(|err| LlamaModelError::TokenOutputStreamError(err))?
+                    .map_err(LlamaModelError::TokenOutputStreamError)?
                 else {
                     return Ok(None);
                 };
@@ -326,7 +323,7 @@ fn update_state<P: Parser>(
                 let mut all_required_next = String::new();
                 if let Some(next) = token_stream
                     .peek_next_tokens(extra_tokens.iter().copied())
-                    .map_err(|err| LlamaModelError::TokenOutputStreamError(err))?
+                    .map_err(LlamaModelError::TokenOutputStreamError)?
                 {
                     all_required_next = next;
                 }
@@ -337,7 +334,7 @@ fn update_state<P: Parser>(
                 }
                 token_stream
                     .next_tokens(&extra_tokens)
-                    .map_err(|err| LlamaModelError::TokenOutputStreamError(err))?;
+                    .map_err(LlamaModelError::TokenOutputStreamError)?;
                 *unprocessed_token_count += extra_tokens.len();
                 on_token(all_required_next.clone())?;
                 let result = parser
@@ -349,7 +346,6 @@ fn update_state<P: Parser>(
                     parser,
                     parser_state,
                     result,
-                    tokenizer,
                     token_stream,
                     on_token,
                     unprocessed_token_count,

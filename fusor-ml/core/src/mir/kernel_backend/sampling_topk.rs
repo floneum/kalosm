@@ -19,7 +19,7 @@ struct MergeSortedChunkTopKPairsKernelVariant;
 /// True when any dimension of the top-k working set is zero; in that case
 /// every top-k kernel short-circuits.
 fn top_k_dims_empty(dims: &[usize]) -> bool {
-    dims.iter().any(|&d| d == 0)
+    dims.contains(&0)
 }
 
 /// True when the inputs to `top_k_exactness` can't be sharpened any further
@@ -223,16 +223,27 @@ fn chunk_top_k_pair_data_inner_with_encoder(
     Some((ids, values))
 }
 
+pub(crate) struct MergeSortedChunkTopKParams {
+    pub chunks: usize,
+    pub chunk_len: usize,
+    pub chunk_stride: usize,
+    pub input_len: usize,
+    pub k: usize,
+}
+
 pub(crate) fn merge_sorted_chunk_top_k_pair_data_with_encoder(
     input_ids: &TensorData,
     input_values: &TensorData,
-    chunks: usize,
-    chunk_len: usize,
-    chunk_stride: usize,
-    input_len: usize,
-    k: usize,
+    params: MergeSortedChunkTopKParams,
     encoder: Option<&mut CommandEncoder>,
 ) -> Option<(TensorData, TensorData)> {
+    let MergeSortedChunkTopKParams {
+        chunks,
+        chunk_len,
+        chunk_stride,
+        input_len,
+        k,
+    } = params;
     if input_ids.datatype() != DataTypeEnum::U32 || input_values.datatype() != DataTypeEnum::F32 {
         return None;
     }

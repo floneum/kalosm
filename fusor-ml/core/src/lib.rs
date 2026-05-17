@@ -28,7 +28,7 @@ pub use compute_graph::NodeIndex;
 mod device;
 mod element_wise;
 mod flash_attention;
-pub(crate) use flash_attention::FlashAttentionOperation;
+pub(crate) use flash_attention::{FlashAttentionInputs, FlashAttentionOperation};
 mod index_select;
 #[doc(hidden)]
 pub mod kernel_selection;

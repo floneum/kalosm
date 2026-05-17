@@ -122,15 +122,15 @@ fn conv2d_nchw_ref(
     let out_h = (in_h + 2 * padding[0] - kh) / stride[0] + 1;
     let out_w = (in_w + 2 * padding[1] - kw) / stride[1] + 1;
     let mut out = vec![vec![vec![vec![0.0f32; out_w]; out_h]; out_ch]; batch];
-    for b in 0..batch {
-        for oc in 0..out_ch {
+    for (b, out_b) in out.iter_mut().enumerate() {
+        for (oc, out_oc) in out_b.iter_mut().enumerate() {
             let b0 = bias.map_or(0.0, |bs| bs[oc]);
-            for oh in 0..out_h {
-                for ow in 0..out_w {
+            for (oh, out_oh) in out_oc.iter_mut().enumerate() {
+                for (ow, out_cell) in out_oh.iter_mut().enumerate() {
                     let mut acc = b0;
                     for ic in 0..in_ch {
-                        for ky in 0..kh {
-                            for kx in 0..kw {
+                        for (ky, weight_ky) in weight[oc][ic].iter().enumerate() {
+                            for (kx, weight_val) in weight_ky.iter().enumerate() {
                                 let iy = oh * stride[0] + ky;
                                 let ix = ow * stride[1] + kx;
                                 if iy >= padding[0]
@@ -139,12 +139,12 @@ fn conv2d_nchw_ref(
                                     && ix < padding[1] + in_w
                                 {
                                     let v = input[b][ic][iy - padding[0]][ix - padding[1]];
-                                    acc += v * weight[oc][ic][ky][kx];
+                                    acc += v * weight_val;
                                 }
                             }
                         }
                     }
-                    out[b][oc][oh][ow] = acc;
+                    *out_cell = acc;
                 }
             }
         }
@@ -172,17 +172,17 @@ fn conv3d_ncdhw_ref(
     let out_h = (in_h + 2 * padding[1] - kh) / stride[1] + 1;
     let out_w = (in_w + 2 * padding[2] - kw) / stride[2] + 1;
     let mut out = vec![vec![vec![vec![vec![0.0f32; out_w]; out_h]; out_d]; out_ch]; batch];
-    for b in 0..batch {
-        for oc in 0..out_ch {
+    for (b, out_b) in out.iter_mut().enumerate() {
+        for (oc, out_oc) in out_b.iter_mut().enumerate() {
             let b0 = bias.map_or(0.0, |bs| bs[oc]);
-            for od in 0..out_d {
-                for oh in 0..out_h {
-                    for ow in 0..out_w {
+            for (od, out_od) in out_oc.iter_mut().enumerate() {
+                for (oh, out_oh) in out_od.iter_mut().enumerate() {
+                    for (ow, out_cell) in out_oh.iter_mut().enumerate() {
                         let mut acc = b0;
                         for ic in 0..in_ch {
-                            for kz in 0..kd {
-                                for ky in 0..kh {
-                                    for kx in 0..kw {
+                            for (kz, weight_kz) in weight[oc][ic].iter().enumerate() {
+                                for (ky, weight_ky) in weight_kz.iter().enumerate() {
+                                    for (kx, weight_val) in weight_ky.iter().enumerate() {
                                         let iz = od * stride[0] + kz;
                                         let iy = oh * stride[1] + ky;
                                         let ix = ow * stride[2] + kx;
@@ -195,13 +195,13 @@ fn conv3d_ncdhw_ref(
                                         {
                                             let v = input[b][ic][iz - padding[0]]
                                                 [iy - padding[1]][ix - padding[2]];
-                                            acc += v * weight[oc][ic][kz][ky][kx];
+                                            acc += v * weight_val;
                                         }
                                     }
                                 }
                             }
                         }
-                        out[b][oc][od][oh][ow] = acc;
+                        *out_cell = acc;
                     }
                 }
             }
@@ -218,12 +218,12 @@ fn input_data(total: usize, seed: u32) -> Vec<f32> {
 
 fn vec4_from_flat(flat: &[f32], shape: [usize; 4]) -> Vec<Vec<Vec<Vec<f32>>>> {
     let mut out = vec![vec![vec![vec![0.0f32; shape[3]]; shape[2]]; shape[1]]; shape[0]];
-    for i in 0..shape[0] {
-        for j in 0..shape[1] {
-            for k in 0..shape[2] {
-                for l in 0..shape[3] {
-                    out[i][j][k][l] = flat
-                        [((i * shape[1] + j) * shape[2] + k) * shape[3] + l];
+    let mut iter = flat.iter().copied();
+    for out_i in out.iter_mut() {
+        for out_j in out_i.iter_mut() {
+            for out_k in out_j.iter_mut() {
+                for out_l in out_k.iter_mut() {
+                    *out_l = iter.next().unwrap_or(0.0);
                 }
             }
         }
@@ -234,15 +234,13 @@ fn vec4_from_flat(flat: &[f32], shape: [usize; 4]) -> Vec<Vec<Vec<Vec<f32>>>> {
 fn vec5_from_flat(flat: &[f32], shape: [usize; 5]) -> Vec<Vec<Vec<Vec<Vec<f32>>>>> {
     let mut out =
         vec![vec![vec![vec![vec![0.0f32; shape[4]]; shape[3]]; shape[2]]; shape[1]]; shape[0]];
-    for i in 0..shape[0] {
-        for j in 0..shape[1] {
-            for k in 0..shape[2] {
-                for l in 0..shape[3] {
-                    for m in 0..shape[4] {
-                        let idx = (((i * shape[1] + j) * shape[2] + k) * shape[3] + l)
-                            * shape[4]
-                            + m;
-                        out[i][j][k][l][m] = flat[idx];
+    let mut iter = flat.iter().copied();
+    for out_i in out.iter_mut() {
+        for out_j in out_i.iter_mut() {
+            for out_k in out_j.iter_mut() {
+                for out_l in out_k.iter_mut() {
+                    for out_m in out_l.iter_mut() {
+                        *out_m = iter.next().unwrap_or(0.0);
                     }
                 }
             }

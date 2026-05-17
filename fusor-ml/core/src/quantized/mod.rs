@@ -30,21 +30,24 @@ pub(crate) struct QMatMulDirectPipelineKey {
     output_layout: QMatMulDirectLayoutKey,
 }
 
+#[derive(Clone, Copy)]
+pub(crate) struct QMatMulShape {
+    pub m: u32,
+    pub k: u32,
+    pub n: u32,
+}
+
 impl QMatMulDirectPipelineKey {
     pub(crate) fn new(
         format: GgmlType,
-        m: u32,
-        k: u32,
-        n: u32,
+        shape: QMatMulShape,
         dispatch_size: [u32; 3],
         input_layout: &Layout,
         output_layout: &Layout,
     ) -> Self {
         Self::new_with_epilogue(
             format,
-            m,
-            k,
-            n,
+            shape,
             0,
             dispatch_size,
             input_layout,
@@ -54,14 +57,13 @@ impl QMatMulDirectPipelineKey {
 
     pub(crate) fn new_with_epilogue(
         format: GgmlType,
-        m: u32,
-        k: u32,
-        n: u32,
+        shape: QMatMulShape,
         epilogue_identity: u64,
         dispatch_size: [u32; 3],
         input_layout: &Layout,
         output_layout: &Layout,
     ) -> Self {
+        let QMatMulShape { m, k, n } = shape;
         Self {
             format: format as u8,
             m,

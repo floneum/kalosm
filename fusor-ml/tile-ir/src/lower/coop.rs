@@ -382,11 +382,11 @@ impl<'a> Lowerer<'a> {
         const VEC: u32 = 4;
         if cols.is_multiple_of(VEC) && Self::storage_has_unit_inner_stride(&src.layout) {
             let groups_per_row = cols / VEC;
-            let total_groups = rows
-                .checked_mul(groups_per_row)
-                .ok_or(LowerError::UnsupportedOperation(
-                    "workgroup tile size overflow",
-                ))?;
+            let total_groups =
+                rows.checked_mul(groups_per_row)
+                    .ok_or(LowerError::UnsupportedOperation(
+                        "workgroup tile size overflow",
+                    ))?;
             return self.lower_copy_passes(
                 expressions,
                 body,
@@ -394,10 +394,18 @@ impl<'a> Lowerer<'a> {
                 total_groups,
                 |expressions, flat| {
                     let mut accept = Block::new();
-                    let local_row =
-                        self.div_literal_u32_emitted(expressions, flat, groups_per_row, &mut accept);
-                    let local_col_group =
-                        self.mod_literal_u32_emitted(expressions, flat, groups_per_row, &mut accept);
+                    let local_row = self.div_literal_u32_emitted(
+                        expressions,
+                        flat,
+                        groups_per_row,
+                        &mut accept,
+                    );
+                    let local_col_group = self.mod_literal_u32_emitted(
+                        expressions,
+                        flat,
+                        groups_per_row,
+                        &mut accept,
+                    );
                     let local_col_base = self.mul_literal_u32_emitted(
                         expressions,
                         local_col_group,

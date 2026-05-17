@@ -98,6 +98,7 @@ const QGEMV_N: Axis<1> = Axis;
 ///   - Whether the call takes the cached-pipeline fast path
 ///     ([`Tile64x64Cached`](Self::Tile64x64Cached)) or the IR-build fallback
 ///     ([`Tile64x64`](Self::Tile64x64)).
+///
 /// [`Q8Wide64x128`](Self::Q8Wide64x128) shares the IR and dispatch tuple of
 /// [`Tile64x128`](Self::Tile64x128) but a different selector rule (Q8_0 with
 /// `N >= 8192` and a 32 KB workgroup-storage device cap), giving it its own
@@ -510,7 +511,20 @@ impl QMatMulOperation {
     fn n_size(&self) -> u32 {
         self.matrix.shape[0] as u32
     }
+}
 
+pub(crate) struct DirectKernelTensors<'a> {
+    pub input: &'a TensorData,
+    pub matrix: &'a QMatrix,
+    pub output: &'a TensorData,
+}
+
+pub(crate) struct DirectKernelChains<'a> {
+    pub pre: Option<&'a UnaryFunctionChain>,
+    pub post: Option<&'a UnaryFunctionChain>,
+}
+
+impl QMatMulOperation {
     /// Build a direct quantized-matmul kernel for the supplied tensors.
     /// `pre_chain`/`post_chain` are pre- and post-element-wise unary chains
     /// to fuse into the kernel; pass `None` to skip. `operation_key` ties the
@@ -518,14 +532,20 @@ impl QMatMulOperation {
     /// ad-hoc call (e.g. the sampler path).
     pub(crate) fn direct_kernel_for_tensors(
         device: &Device,
-        input: &TensorData,
-        matrix: &QMatrix,
-        output: &TensorData,
+        tensors: DirectKernelTensors<'_>,
         kernel_name: impl Into<String>,
-        pre_chain: Option<&UnaryFunctionChain>,
-        post_chain: Option<&UnaryFunctionChain>,
+        chains: DirectKernelChains<'_>,
         operation_key: Option<(&dyn Operation, &[MirValue])>,
     ) -> Option<DirectKernel> {
+        let DirectKernelTensors {
+            input,
+            matrix,
+            output,
+        } = tensors;
+        let DirectKernelChains {
+            pre: pre_chain,
+            post: post_chain,
+        } = chains;
         if input.datatype() != DataTypeEnum::F32 || output.datatype() != DataTypeEnum::F32 {
             return None;
         }
@@ -611,9 +631,7 @@ impl QMatMulOperation {
             }
             let pipeline_key = QMatMulDirectPipelineKey::new(
                 matrix.datatype(),
-                m,
-                k,
-                n,
+                crate::quantized::QMatMulShape { m, k, n },
                 dispatch_size,
                 input.layout(),
                 output.layout(),
@@ -725,9 +743,7 @@ impl QMatMulOperation {
         }
         let pipeline_key = QMatMulDirectPipelineKey::new_with_epilogue(
             matrix.datatype(),
-            m,
-            k,
-            n,
+            crate::quantized::QMatMulShape { m, k, n },
             epilogue_identity,
             dispatch_size,
             input.layout(),
@@ -834,7 +850,7 @@ fn qmatmul_direct_kernel_from_ir(
     let pipeline = kernel_backend::three_buffer_pipeline_from_ir(
         device.kernel_cache(),
         &kernel_name,
-        cache_key.clone(),
+        cache_key,
         build_ir,
     )?;
     let pipeline = matrix
@@ -1122,12 +1138,16 @@ impl Operation for QMatMulOperation {
         }
         Self::direct_kernel_for_tensors(
             &graph.device(),
-            input,
-            matrix,
-            output,
+            DirectKernelTensors {
+                input,
+                matrix,
+                output,
+            },
             self.name(),
-            Some(&self.pre_element_wise),
-            Some(&self.post_element_wise),
+            DirectKernelChains {
+                pre: Some(&self.pre_element_wise),
+                post: Some(&self.post_element_wise),
+            },
             Some((self, inputs)),
         )
     }
@@ -1211,9 +1231,11 @@ impl QMatMulOperation {
         if extras_count == 0 {
             let pipeline_key = QMatMulDirectPipelineKey::new_with_epilogue(
                 matrix.datatype(),
-                m,
-                k,
-                pair_len,
+                crate::quantized::QMatMulShape {
+                    m,
+                    k,
+                    n: pair_len,
+                },
                 epilogue_identity,
                 dispatch_size,
                 input.layout(),
