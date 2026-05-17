@@ -22,18 +22,63 @@ use crate::{
     tensor::TensorData,
 };
 
-const BLOCK: usize = 256;
-const SIMD_WIDTH: usize = 32;
-const OUTPUTS_PER_WORKGROUP: usize = BLOCK / SIMD_WIDTH;
 const DECODE_SMALL_BLOCK: u32 = 128;
 const DECODE_MEDIUM_BLOCK: u32 = 512;
 const DECODE_LARGE_BLOCK: u32 = 1024;
 const DECODE_HEAD_DIM: u32 = 128;
 const FLASH_ATTENTION_MODULE_CACHE_SIZE: usize = 128;
+/// Hardware subgroup sizes the streaming flash kernel emits IR for. The
+/// kernel layout assumes one subgroup per output dim and uses subgroup
+/// reductions across a `SIZE`-wide KV chunk, so the runtime subgroup width
+/// must match one of these exactly.
+const FLASH_STREAMING_SUBGROUP_SIZES: &[u32] = &[4, 8, 16, 32, 64];
 
 fn flash_attention_module_cache() -> &'static kernel_backend::ModuleCache {
     static CACHE: OnceLock<kernel_backend::ModuleCache> = OnceLock::new();
     CACHE.get_or_init(|| kernel_backend::module_cache(FLASH_ATTENTION_MODULE_CACHE_SIZE))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn dispatch_streaming_flash_attention(
+    kb: &mut tile_ir::KernelBuilder<()>,
+    q: tile_ir::KernelTensorRef<()>,
+    k: tile_ir::KernelTensorRef<()>,
+    v: tile_ir::KernelTensorRef<()>,
+    mask: Option<tile_ir::KernelTensorRef<()>>,
+    output: tile_ir::KernelTensorRef<()>,
+    meta: tile_ir_kernels::FlashAttentionMeta,
+    input_dtype: DataTypeEnum,
+    subgroup_size: u32,
+) -> Option<()> {
+    macro_rules! emit {
+        ($element:ty, $size:literal) => {
+            tile_ir_kernels::flash_attention::<$element, $size, _>(kb, q, k, v, mask, output, meta)
+        };
+    }
+    match (input_dtype, subgroup_size) {
+        (DataTypeEnum::F32, 4) => emit!(tile_ir::F32, 4),
+        (DataTypeEnum::F32, 8) => emit!(tile_ir::F32, 8),
+        (DataTypeEnum::F32, 16) => emit!(tile_ir::F32, 16),
+        (DataTypeEnum::F32, 32) => emit!(tile_ir::F32, 32),
+        (DataTypeEnum::F32, 64) => emit!(tile_ir::F32, 64),
+        (DataTypeEnum::F16, 4) => emit!(tile_ir::F16, 4),
+        (DataTypeEnum::F16, 8) => emit!(tile_ir::F16, 8),
+        (DataTypeEnum::F16, 16) => emit!(tile_ir::F16, 16),
+        (DataTypeEnum::F16, 32) => emit!(tile_ir::F16, 32),
+        (DataTypeEnum::F16, 64) => emit!(tile_ir::F16, 64),
+        _ => None,
+    }
+}
+
+fn streaming_dispatch_size(dims: FlashAttentionDims, outputs_per_workgroup: u32) -> [u32; 3] {
+    [
+        dims.head_dim.div_ceil(outputs_per_workgroup),
+        dims.batch
+            .checked_mul(dims.num_heads)
+            .and_then(|value| value.checked_mul(dims.q_seq_len))
+            .expect("flash attention row dispatch overflow"),
+        1,
+    ]
 }
 
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
@@ -297,15 +342,17 @@ impl Operation for FlashAttentionOperation {
     }
 
     fn dispatch_size(&self, _workgroup_shape: &WorkgroupShape, _inputs: &[MirValue]) -> [u32; 3] {
+        // The streaming kernel's per-axis dispatch depends on the device's
+        // hardware subgroup size, which isn't known at this layer; the
+        // workgroup-shape pass only uses the row axis (Y/Z) to size local
+        // work. Conservatively report the smallest streaming variant's
+        // per-axis dispatch; `build_direct_kernel` recomputes the real
+        // dispatch with the correct subgroup width before launch.
         let dims = self.dims().expect("flash attention dimensions fit in u32");
-        [
-            dims.head_dim.div_ceil(OUTPUTS_PER_WORKGROUP as u32),
-            dims.batch
-                .checked_mul(dims.num_heads)
-                .and_then(|value| value.checked_mul(dims.q_seq_len))
-                .expect("flash attention row dispatch overflow"),
-            1,
-        ]
+        let outputs_per_workgroup = tile_ir_kernels::flash_outputs_per_workgroup(
+            *FLASH_STREAMING_SUBGROUP_SIZES.last().expect("non-empty"),
+        );
+        streaming_dispatch_size(dims, outputs_per_workgroup)
     }
 
     fn visit_dependencies(&self, f: &mut dyn FnMut(NodeIndex)) {
@@ -348,12 +395,18 @@ impl Operation for FlashAttentionOperation {
         let output = inputs.get(output_index)?.as_tensor()?.clone();
         let device = graph.device();
 
-        if !device.subgroups_supported()
-            || device.min_subgroup_size() > SIMD_WIDTH as u32
-            || device.max_subgroup_size() < SIMD_WIDTH as u32
+        // Streaming kernel: pick the hardware subgroup size and dispatch a
+        // monomorphization tiled to match. wgpu doesn't expose
+        // `requiredSubgroupSize`, so the size has to be pinned by the adapter
+        // itself — bail if the range isn't a single supported value.
+        let streaming_subgroup_size = if device.subgroups_supported()
+            && device.min_subgroup_size() == device.max_subgroup_size()
+            && FLASH_STREAMING_SUBGROUP_SIZES.contains(&device.min_subgroup_size())
         {
+            device.min_subgroup_size()
+        } else {
             return None;
-        }
+        };
 
         let input_dtype = self.input_dtype;
         if !matches!(input_dtype, DataTypeEnum::F32 | DataTypeEnum::F16) {
@@ -443,9 +496,10 @@ impl Operation for FlashAttentionOperation {
             FlashAttentionKernelVariant::Streaming
         };
         let dispatch_size = match variant {
-            FlashAttentionKernelVariant::Streaming => {
-                self.dispatch_size(&WorkgroupShape::new(1, 1, 1), inputs)
-            }
+            FlashAttentionKernelVariant::Streaming => streaming_dispatch_size(
+                dims,
+                tile_ir_kernels::flash_outputs_per_workgroup(streaming_subgroup_size),
+            ),
             FlashAttentionKernelVariant::DecodeSmall => [
                 dims.batch
                     .checked_mul(dims.num_heads)
@@ -470,6 +524,9 @@ impl Operation for FlashAttentionOperation {
         >(|state| {
             variant.hash(state);
             self.scale.to_bits().hash(state);
+            if matches!(variant, FlashAttentionKernelVariant::Streaming) {
+                streaming_subgroup_size.hash(state);
+            }
             if let Some(meta) = decode_meta.as_ref() {
                 meta.decode_block.hash(state);
                 meta.tiled.hash(state);
@@ -550,27 +607,17 @@ impl Operation for FlashAttentionOperation {
                         output_meta: output_tile_meta,
                         dispatch_size,
                     };
-                    match input_dtype {
-                        DataTypeEnum::F32 => tile_ir_kernels::flash_attention::<tile_ir::F32, _>(
-                            &mut kb,
-                            q_ref,
-                            k_ref,
-                            v_ref,
-                            mask_ref,
-                            output_ref,
-                            stream_meta,
-                        ),
-                        DataTypeEnum::F16 => tile_ir_kernels::flash_attention::<tile_ir::F16, _>(
-                            &mut kb,
-                            q_ref,
-                            k_ref,
-                            v_ref,
-                            mask_ref,
-                            output_ref,
-                            stream_meta,
-                        ),
-                        _ => None,
-                    }
+                    dispatch_streaming_flash_attention(
+                        &mut kb,
+                        q_ref,
+                        k_ref,
+                        v_ref,
+                        mask_ref,
+                        output_ref,
+                        stream_meta,
+                        input_dtype,
+                        streaming_subgroup_size,
+                    )
                 }?;
                 Some(kb.finish().0)
             },

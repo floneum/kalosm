@@ -981,15 +981,16 @@ impl<D: DataType, const R: usize> Tensor<R, D> {
         if R != 4 || !matches!(D::DATA_TYPE, DataTypeEnum::F32 | DataTypeEnum::F16) {
             return None;
         }
-        // The streaming flash attention kernel requires the device to expose
-        // 32-wide subgroups (it relies on subgroup reductions across a
-        // SIMD-width chunk of K). Devices like Mesa's lavapipe report smaller
-        // subgroups and would force `build_direct_kernel` to bail later, so
-        // fall back to the composite implementation here.
+        // The streaming flash attention kernel emits a separate
+        // monomorphization per hardware subgroup width and relies on
+        // `subgroup_reduce_*`, so it can only target devices that expose a
+        // fixed, supported subgroup size. wgpu doesn't surface
+        // `requiredSubgroupSize`, so devices that report a variable subgroup
+        // range (e.g. Mesa lavapipe) fall through to the composite path here.
         let device = &self.data.device;
         if !device.subgroups_supported()
-            || device.min_subgroup_size() > 32
-            || device.max_subgroup_size() < 32
+            || device.min_subgroup_size() != device.max_subgroup_size()
+            || !matches!(device.min_subgroup_size(), 4 | 8 | 16 | 32 | 64)
         {
             return None;
         }

@@ -13,7 +13,7 @@ mod rms_norm;
 mod top_k;
 mod types;
 
-pub use flash::{flash_attention, flash_decode_small};
+pub use flash::{flash_attention, flash_decode_small, flash_outputs_per_workgroup};
 pub use matmul::{
     batched_gemv_with_epilogues, batched_matmul_register_with_epilogues,
     batched_matmul_with_epilogues, try_batched_coop_matmul, DenseMatmulShape,

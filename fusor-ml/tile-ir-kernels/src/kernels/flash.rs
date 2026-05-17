@@ -7,8 +7,6 @@ use super::helpers::{index_n, reduce_workgroup, NEG_MAX_F32};
 use super::types::{FlashAttentionMeta, FlashDecodeSmallMeta};
 
 const FLASH_BLOCK: usize = 256;
-const FLASH_SIMD_WIDTH: u32 = 32;
-const FLASH_OUTPUTS_PER_WORKGROUP: u32 = FLASH_BLOCK as u32 / FLASH_SIMD_WIDTH;
 const DECODE_HEAD_DIM: u32 = 128;
 
 fn zero_fill<E: Numeric>() -> TileLiteral {
@@ -19,12 +17,25 @@ fn zero_fill<E: Numeric>() -> TileLiteral {
     }
 }
 
+/// Number of output dimensions a single workgroup writes per KV-axis pass,
+/// given the device's hardware subgroup size. Each subgroup handles one
+/// output dim; the workgroup contains `FLASH_BLOCK / subgroup_size` subgroups.
+pub const fn flash_outputs_per_workgroup(subgroup_size: u32) -> u32 {
+    FLASH_BLOCK as u32 / subgroup_size
+}
+
 /// Build a streaming flash-attention kernel for F32 or F16 tensors.
+///
+/// `SUBGROUP_SIZE` must match the runtime hardware subgroup width on the
+/// target device — the kernel layout assigns one subgroup per output dim and
+/// uses `subgroup_reduce_*` to fold a `SUBGROUP_SIZE`-wide chunk of KV. Pick
+/// the size by reading the device's subgroup caps; pinning is not exposed by
+/// wgpu, so this must come from a fixed `(min == max)` adapter range.
 ///
 /// The metadata supplies tensor strides, offsets, dimensions, scale, and the
 /// dispatch grid. Returns `None` if the tensor ranks or optional mask binding
 /// are inconsistent with the metadata.
-pub fn flash_attention<E: Numeric, B>(
+pub fn flash_attention<E: Numeric, const SUBGROUP_SIZE: u32, B>(
     kb: &mut fusor_tile_ir::KernelBuilder<B>,
     q: fusor_tile_ir::KernelTensorRef<B>,
     k: fusor_tile_ir::KernelTensorRef<B>,
@@ -33,6 +44,10 @@ pub fn flash_attention<E: Numeric, B>(
     output: fusor_tile_ir::KernelTensorRef<B>,
     meta: FlashAttentionMeta,
 ) -> Option<()> {
+    if SUBGROUP_SIZE == 0 || !(FLASH_BLOCK as u32).is_multiple_of(SUBGROUP_SIZE) {
+        return None;
+    }
+    let outputs_per_workgroup = flash_outputs_per_workgroup(SUBGROUP_SIZE);
     let q_strides: [u32; 4] = meta.q_meta.strides.as_slice().try_into().ok()?;
     let k_strides: [u32; 4] = meta.k_meta.strides.as_slice().try_into().ok()?;
     let v_strides: [u32; 4] = meta.v_meta.strides.as_slice().try_into().ok()?;
@@ -77,10 +92,10 @@ pub fn flash_attention<E: Numeric, B>(
                 program.bind(program.index(row / (meta.dims.q_seq_len * meta.dims.num_heads)));
             let kv_head_idx =
                 program.bind(head_idx.clone() / Tile::literal(TileLiteral::U32(groups)));
-            let kv_lane = program.index(lane.clone() % FLASH_SIMD_WIDTH);
-            let out_dim = program.bind(program.index(
-                workgroup_x * FLASH_OUTPUTS_PER_WORKGROUP + (lane.clone() / FLASH_SIMD_WIDTH),
-            ));
+            let kv_lane = program.index(lane.clone() % SUBGROUP_SIZE);
+            let out_dim = program.bind(
+                program.index(workgroup_x * outputs_per_workgroup + (lane.clone() / SUBGROUP_SIZE)),
+            );
             let out_valid = program.bind(
                 out_dim
                     .clone()
@@ -91,7 +106,7 @@ pub fn flash_attention<E: Numeric, B>(
             let score_local = program.private::<F32>();
             let weighted_local = program.private::<F32>();
 
-            let kv_chunks = meta.dims.kv_seq_len.div_ceil(FLASH_SIMD_WIDTH);
+            let kv_chunks = meta.dims.kv_seq_len.div_ceil(SUBGROUP_SIZE);
             let [_final_m, final_s, final_o] = program.fold(
                 range(Tile::literal(TileLiteral::U32(kv_chunks))),
                 [
@@ -102,7 +117,7 @@ pub fn flash_attention<E: Numeric, B>(
                 |program, chunk_idx, [m_state, s_state, o_state]| {
                     let chunk = Tile::from_index(chunk_idx);
                     let kv_idx = program.bind(
-                        chunk * Tile::literal(TileLiteral::U32(FLASH_SIMD_WIDTH)) + kv_lane.clone(),
+                        chunk * Tile::literal(TileLiteral::U32(SUBGROUP_SIZE)) + kv_lane.clone(),
                     );
                     let kv_valid = program.bind(
                         kv_idx

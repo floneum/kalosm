@@ -19,7 +19,7 @@ fn lower_or_fail(ir: &fusor_tile_ir::KernelIr, label: &str) -> NagaKernel {
 fn streaming_flash_attention_regression_shape_lowers_to_naga() {
     let layout = linear_storage_layout();
     let mut kb = KernelBuilder::<()>::new();
-    flash_attention::<F32, ()>(
+    flash_attention::<F32, 32, ()>(
         &mut kb,
         KernelTensorRef::new((), layout.clone()),
         KernelTensorRef::new((), layout.clone()),
