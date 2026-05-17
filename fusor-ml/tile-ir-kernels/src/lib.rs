@@ -50,7 +50,7 @@ pub use kernels::{
     mirostat2, qdequantize,
     qgemv_q4k_paired, qgemv_q4k_paired_dispatch, qgemv_with_epilogue, qmatmul_with_epilogue,
     quantized_matrix, quantized_matrix_for, rms_norm_vec4, top_k_chunk, top_k_exactness,
-    top_k_merge, try_batched_coop_matmul_f32, DenseMatmulShape, FlashAttentionDims,
+    top_k_merge, try_batched_coop_matmul, DenseMatmulShape, FlashAttentionDims,
     FlashAttentionMeta, FlashDecodeSmallMeta, IntoQgemvEpilogues, MergeTopKMeta, Mirostat2,
     Mirostat2Meta, Q4KPairedGgml, RmsNormVec4, RmsNormVec4Meta, TensorMeta, TopKChunkMeta,
     TopKExactnessMeta,

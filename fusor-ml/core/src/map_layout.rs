@@ -108,8 +108,26 @@ impl<const R: usize, T: DataType> Tensor<R, T> {
         }))
     }
 
+    /// Replace the tensor's layout with `new_layout`, treating the underlying
+    /// buffer as a flat blob. The user-supplied offset and strides are absolute
+    /// (in buffer elements), so the input must itself be a contiguous view with
+    /// offset 0 — otherwise the user's strides would compose nonsensically with
+    /// the input's own strides and silently read the wrong elements.
+    ///
+    /// Callers that need to re-layout a non-contiguous view should materialize
+    /// it first (e.g. with `to_concrete()`), or use [`restride`] which composes
+    /// stride specs relative to the input's current strides.
     pub fn restride_layout<const R2: usize>(&self, new_layout: Layout) -> Tensor<R2, T> {
-        self.add_map_layout(MapLayoutOperation::new(self.key(), move |_| {
+        self.add_map_layout(MapLayoutOperation::new(self.key(), move |input_layout| {
+            assert!(
+                input_layout.is_contiguous() && input_layout.offset() == 0,
+                "restride_layout requires a contiguous, offset-0 input — got \
+                 offset={} strides={:?} shape={:?}. Call `.to_concrete()` first, \
+                 or use `restride` for stride composition.",
+                input_layout.offset(),
+                input_layout.strides(),
+                input_layout.shape()
+            );
             new_layout.clone()
         }))
     }

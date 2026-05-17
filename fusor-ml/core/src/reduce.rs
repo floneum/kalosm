@@ -94,7 +94,13 @@ impl Operation for ReduceOperation {
         let total_outputs = output_tensor.layout().shape().iter().product::<usize>() as u32;
         let total_workgroups = total_outputs.div_ceil(workgroup_shape.x());
 
-        distribute_workgroups(total_workgroups)
+        distribute_workgroups(
+            total_workgroups,
+            output_tensor
+                .device()
+                .limits()
+                .max_compute_workgroups_per_dimension,
+        )
     }
 
     fn visit_dependencies(&self, f: &mut dyn FnMut(NodeIndex)) {

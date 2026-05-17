@@ -403,6 +403,9 @@ impl<const R: usize, T: SimdElement + DataType> FuzzGenerator<R, T> {
 /// On GPU the lazy transpose view is preserved, so the op under test sees a
 /// non-contiguous stride layout. On CPU `to_concrete()` materializes the view
 /// into a contiguous backing buffer, so CPU only exercises the contiguous path.
+/// The CPU `to_concrete()` is not an oversight: the CPU backend is contiguous-only
+/// by design (see `TensorBacking` in `cpu/src/lib.rs`), so non-contig stride
+/// coverage on CPU is not reachable from conformance.
 fn make_transposed<const R: usize, T: SimdElement + DataType + Default>(
     tensor: Tensor<R, T>,
     rng: &mut StdRng,
@@ -435,7 +438,7 @@ fn make_transposed<const R: usize, T: SimdElement + DataType + Default>(
 ///
 /// Same materialization caveat as [`make_transposed`]: on GPU the narrowed
 /// view reaches the op under test, but on CPU `to_concrete()` materializes it
-/// into a fresh contiguous buffer.
+/// into a fresh contiguous buffer (CPU backend is contiguous-only by design).
 fn make_sliced<const R: usize, T: SimdElement + DataType + Default>(
     tensor: Tensor<R, T>,
     rng: &mut StdRng,

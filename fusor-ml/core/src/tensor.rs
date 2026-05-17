@@ -316,13 +316,22 @@ impl LazyTensorData {
         let device = self.device.clone();
         let mut info = self.info.clone();
         let dim = function.axis;
-        let new_shape: Box<[usize]> = self
-            .info
-            .shape()
+        let input_shape = self.info.shape();
+        let new_shape: Box<[usize]> = input_shape
             .iter()
             .enumerate()
             .filter_map(|(i, x)| (i != dim).then_some(*x))
             .collect();
+        // Short-circuit empty inputs: any zero-sized dim makes the input
+        // empty. Reducing along the zero axis yields the reduction's identity
+        // value (e.g. 0 for sum, 1 for product); reducing along a different
+        // axis preserves the zero in the output. Both cases are produced by
+        // splatting the identity at `new_shape` — the kernel would otherwise
+        // panic on `iterations > 0` in `tile-ir/.../reduce.rs`.
+        if input_shape.iter().any(|&d| d == 0) {
+            let data = TensorData::new_splat_scalar(&device, &new_shape, function.function.initial_value);
+            return Self::new(data);
+        }
         info = TensorInfo::new(new_shape, info.datatype());
         let key = device.compute_graph().create_reduce(function);
 
@@ -415,15 +424,20 @@ impl TensorData {
     ) -> Self {
         let buffer = buffer.into();
         let buffer_len = buffer.size() / datatype.element_size() as u64;
+        // Empty tensors (any dim is 0) have no valid indices, so the bounds
+        // check below would compare strides * (dim - 1) against a buffer sized
+        // for zero elements and spuriously fail.
+        let is_empty = layout.shape().iter().any(|&d| d == 0);
         assert!(
-            layout.offset()
-                + layout
-                    .strides()
-                    .iter()
-                    .zip(layout.shape().iter())
-                    .map(|(s, dim)| s * dim.saturating_sub(1))
-                    .sum::<usize>()
-                < buffer_len as usize
+            is_empty
+                || layout.offset()
+                    + layout
+                        .strides()
+                        .iter()
+                        .zip(layout.shape().iter())
+                        .map(|(s, dim)| s * dim.saturating_sub(1))
+                        .sum::<usize>()
+                    < buffer_len as usize
         );
         Self {
             device: device.clone(),
@@ -445,6 +459,18 @@ impl TensorData {
         );
 
         Self::new_from_buffer(device, buffer, shape, datatype)
+    }
+
+    pub(crate) fn new_splat_scalar(
+        device: &Device,
+        shape: &[usize],
+        scalar: crate::nary_wise::NaryScalar,
+    ) -> Self {
+        match scalar {
+            crate::nary_wise::NaryScalar::F32(v) => Self::new_splat(device, shape, v),
+            crate::nary_wise::NaryScalar::F16(v) => Self::new_splat(device, shape, v),
+            crate::nary_wise::NaryScalar::U32(v) => Self::new_splat(device, shape, v),
+        }
     }
 
     pub(crate) fn new_splat<D: DataType>(device: &Device, shape: &[usize], data: D) -> Self {

@@ -136,8 +136,19 @@ impl Operation for SliceAssignOperation {
         titled_map_workgroup_size_constraints(&self.operation_shape(), device)
     }
 
-    fn dispatch_size(&self, workgroup_shape: &WorkgroupShape, _inputs: &[MirValue]) -> [u32; 3] {
-        titled_map_dispatch_size(TILE_SIZE, *workgroup_shape, &self.operation_shape())
+    fn dispatch_size(&self, workgroup_shape: &WorkgroupShape, inputs: &[MirValue]) -> [u32; 3] {
+        let max_per_dim = inputs[0]
+            .as_tensor()
+            .unwrap()
+            .device()
+            .limits()
+            .max_compute_workgroups_per_dimension;
+        titled_map_dispatch_size(
+            TILE_SIZE,
+            *workgroup_shape,
+            &self.operation_shape(),
+            max_per_dim,
+        )
     }
 
     fn visit_dependencies(&self, f: &mut dyn FnMut(NodeIndex)) {

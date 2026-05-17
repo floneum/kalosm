@@ -129,7 +129,10 @@ impl Operation for ResizeOperation {
         let input = inputs[1].as_tensor().unwrap();
         let total_workgroups = (input.layout().shape().iter().product::<usize>() as u32)
             .div_ceil(TILE_SIZE * BLOCKSIZE);
-        distribute_workgroups(total_workgroups)
+        distribute_workgroups(
+            total_workgroups,
+            input.device().limits().max_compute_workgroups_per_dimension,
+        )
     }
 
     fn visit_dependencies(&self, f: &mut dyn FnMut(NodeIndex)) {

@@ -5,7 +5,7 @@ use fusor_tile_ir::{
 use fusor_tile_ir_kernels::{
     batched_gemv_with_epilogues, batched_matmul_with_epilogues, flash_attention,
     linear_storage_layout, qdequantize, qgemv_q4k_paired, qgemv_with_epilogue,
-    qmatmul_with_epilogue, quantized_matrix, rms_norm_vec4, try_batched_coop_matmul_f32,
+    qmatmul_with_epilogue, quantized_matrix, rms_norm_vec4, try_batched_coop_matmul,
     DenseMatmulEpilogues, DenseMatmulShape, FlashAttentionDims, FlashAttentionMeta,
     PairedEpilogue, Q4KPairedGgml, QmatmulEpilogues, RmsNormVec4, RmsNormVec4Meta, TensorMeta,
     UnaryEpilogue,
@@ -183,6 +183,7 @@ fn batched_dense_f32_matmul_lowers() {
             &y,
             shape,
             &DenseMatmulEpilogues::empty(),
+            65_535,
         );
     });
     lower_or_fail(&ir, "batched dense f32 matmul");
@@ -207,6 +208,7 @@ fn batched_dense_f32_gemv_lowers() {
             &y,
             shape,
             &DenseMatmulEpilogues::empty(),
+            65_535,
         );
     });
     lower_or_fail(&ir, "batched dense f32 gemv");
@@ -234,6 +236,7 @@ fn batched_dense_f16_matmul_lowers() {
             &y,
             shape,
             &DenseMatmulEpilogues::empty(),
+            65_535,
         );
     });
     lower_or_fail(&ir, "batched dense f16 matmul");
@@ -261,6 +264,7 @@ fn batched_dense_f16_gemv_lowers() {
             &y,
             shape,
             &DenseMatmulEpilogues::empty(),
+            65_535,
         );
     });
     lower_or_fail(&ir, "batched dense f16 gemv");
@@ -278,13 +282,14 @@ fn cooperative_dense_f32_matmul_lowers() {
         let a = program.storage_read::<F32, 2>(Shape::new([shape.batch * shape.m, shape.k]));
         let b = program.storage_read::<F32, 2>(Shape::new([shape.batch * shape.k, shape.n]));
         let y = program.storage_write::<F32, 2>(Shape::new([shape.batch * shape.m, shape.n]));
-        assert!(try_batched_coop_matmul_f32::<64, 64, 16>(
+        assert!(try_batched_coop_matmul::<F32, 64, 64, 16>(
             program,
             &a,
             &b,
             &y,
             shape,
             &DenseMatmulEpilogues::empty(),
+            65_535,
         ));
     });
     lower_or_fail(&ir, "cooperative dense f32 matmul");
@@ -302,13 +307,14 @@ fn cooperative_dense_f32_matmul_128x128_lowers() {
         let a = program.storage_read::<F32, 2>(Shape::new([shape.batch * shape.m, shape.k]));
         let b = program.storage_read::<F32, 2>(Shape::new([shape.batch * shape.k, shape.n]));
         let y = program.storage_write::<F32, 2>(Shape::new([shape.batch * shape.m, shape.n]));
-        assert!(try_batched_coop_matmul_f32::<128, 128, 16>(
+        assert!(try_batched_coop_matmul::<F32, 128, 128, 16>(
             program,
             &a,
             &b,
             &y,
             shape,
             &DenseMatmulEpilogues::empty(),
+            65_535,
         ));
     });
     lower_or_fail(&ir, "cooperative dense f32 128x128 matmul");
@@ -326,13 +332,14 @@ fn cooperative_dense_f32_matmul_128x64_lowers() {
         let a = program.storage_read::<F32, 2>(Shape::new([shape.batch * shape.m, shape.k]));
         let b = program.storage_read::<F32, 2>(Shape::new([shape.batch * shape.k, shape.n]));
         let y = program.storage_write::<F32, 2>(Shape::new([shape.batch * shape.m, shape.n]));
-        assert!(try_batched_coop_matmul_f32::<128, 64, 16>(
+        assert!(try_batched_coop_matmul::<F32, 128, 64, 16>(
             program,
             &a,
             &b,
             &y,
             shape,
             &DenseMatmulEpilogues::empty(),
+            65_535,
         ));
     });
     lower_or_fail(&ir, "cooperative dense f32 128x64 matmul");
@@ -352,13 +359,14 @@ fn cooperative_dense_f32_matmul_128x256_npass_lowers() {
         let a = program.storage_read::<F32, 2>(Shape::new([shape.batch * shape.m, shape.k]));
         let b = program.storage_read::<F32, 2>(Shape::new([shape.batch * shape.k, shape.n]));
         let y = program.storage_write::<F32, 2>(Shape::new([shape.batch * shape.m, shape.n]));
-        assert!(try_batched_coop_matmul_f32::<128, 256, 16>(
+        assert!(try_batched_coop_matmul::<F32, 128, 256, 16>(
             program,
             &a,
             &b,
             &y,
             shape,
             &DenseMatmulEpilogues::empty(),
+            65_535,
         ));
     });
     lower_or_fail(&ir, "cooperative dense f32 128x256 N_PASSES=4 matmul");

@@ -313,6 +313,62 @@ async fn sliding_window_with_cat_padding_matches_expected() {
 }
 
 #[tokio::test]
+async fn restride_and_restride_layout_match_expected_views() {
+    use fusor_types::{Layout, StrideSpec};
+
+    let gen_4x6 = FuzzGenerator::<2, f32>::new([4, 6])
+        .with_seed(520)
+        .with_distribution(Uniform::new(-5.0, 5.0).unwrap());
+
+    // restride with a stride multiplier — pick every other column.
+    // (`permute`, `slice`, and `narrow` already cover the cases that don't use
+    // `dim_with`; this exercises the stride-multiplier path that no other op
+    // exposes.)
+    fusor_conformance::assert(async |x: Tensor<2, f32>| {
+        let [rows, _] = x.shape();
+        x.restride([StrideSpec::dim(0, rows), StrideSpec::dim_with(1, 3, 2)])
+            .to_concrete()
+    })
+    .arg(gen_4x6.clone())
+    .equal_to_resolved_with_device(async |v: Vec<Vec<f32>>, device: Device| {
+        let stepped: Vec<Vec<f32>> = v
+            .iter()
+            .map(|row| (0..3).map(|i| row[i * 2]).collect())
+            .collect();
+        Tensor::new(&device, &stepped)
+    })
+    .compare_with(approx_compare::<2, f32>(0.0))
+    .runs(3)
+    .await
+    .unwrap();
+
+    // restride_layout takes a raw absolute Layout, so by contract its input
+    // must already be contiguous (the op asserts this). FuzzGenerator yields
+    // non-contig views on alternating runs, so build the input from a Device
+    // closure that returns a fresh contiguous tensor.
+    fn input_data() -> Vec<f32> {
+        (0..24).map(|i| ((i as f32) - 12.0) * 0.31).collect()
+    }
+    fusor_conformance::assert(async |x: Tensor<2, f32>| {
+        let new_layout = Layout::from_parts(0, Box::from([4usize, 3]), Box::from([6usize, 2]));
+        x.restride_layout::<2>(new_layout).to_concrete()
+    })
+    .arg(|device: &Device| Tensor::from_slice(device, [4, 6], &input_data()))
+    .equal_to(async |_x: Tensor<2, f32>| {
+        let device = _x.device();
+        let data = input_data();
+        let stepped: Vec<Vec<f32>> = (0..4)
+            .map(|r| (0..3).map(|c| data[r * 6 + c * 2]).collect())
+            .collect();
+        Tensor::new(&device, &stepped)
+    })
+    .compare_with(approx_compare::<2, f32>(0.0))
+    .runs(1)
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
 async fn cat_stack_and_chunk_match_expected_views() {
     // chunk: verify chunk pieces match slices
     for device in available_devices().await {
@@ -336,3 +392,4 @@ async fn cat_stack_and_chunk_match_expected_views() {
         .await;
     }
 }
+

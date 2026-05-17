@@ -133,14 +133,30 @@ where
 
     /// Set the layout directly from a pre-computed Layout.
     ///
-    /// This is a zero-copy operation. The caller is responsible for ensuring
-    /// the layout produces valid memory access patterns.
+    /// The user-supplied offset and strides are absolute (in buffer elements),
+    /// so the input must itself be a contiguous view with offset 0 — otherwise
+    /// the user's strides would compose nonsensically with the input's own
+    /// strides and silently read the wrong elements.
+    ///
+    /// Callers that need to re-layout a non-contiguous view should materialize
+    /// it first (e.g. with `to_concrete()`), or use [`restride`] which composes
+    /// stride specs relative to the input's current strides.
     ///
     /// This operation is lazy and preserves laziness of the inner tensor.
     pub fn restride_layout<const R2: usize>(
         self,
         new_layout: Layout,
     ) -> Tensor<R2, MapLayout<T, R2>> {
+        let input_layout = self.inner.layout();
+        assert!(
+            input_layout.is_contiguous() && input_layout.offset() == 0,
+            "restride_layout requires a contiguous, offset-0 input — got \
+             offset={} strides={:?} shape={:?}. Call `.to_concrete()` first, \
+             or use `restride` for stride composition.",
+            input_layout.offset(),
+            input_layout.strides(),
+            input_layout.shape()
+        );
         Tensor::new(MapLayout::new(self.inner, new_layout))
     }
 

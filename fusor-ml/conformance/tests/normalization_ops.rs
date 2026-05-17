@@ -5,6 +5,39 @@ use fusor::{Device, Tensor};
 use fusor_conformance::{FuzzGenerator, approx_compare};
 use rand::distr::Uniform;
 
+fn softmax_axis0_2d(input: &[Vec<f32>]) -> Vec<Vec<f32>> {
+    let rows = input.len();
+    let cols = input[0].len();
+    let mut out = vec![vec![0.0f32; cols]; rows];
+    for c in 0..cols {
+        let max = (0..rows).map(|r| input[r][c]).fold(f32::NEG_INFINITY, f32::max);
+        let exps: Vec<f32> = (0..rows).map(|r| (input[r][c] - max).exp()).collect();
+        let sum: f32 = exps.iter().sum();
+        for (r, exp) in exps.into_iter().enumerate() {
+            out[r][c] = exp / sum;
+        }
+    }
+    out
+}
+
+fn softmax_middle_axis_3d(input: &[Vec<Vec<f32>>]) -> Vec<Vec<Vec<f32>>> {
+    let batch = input.len();
+    let mid = input[0].len();
+    let cols = input[0][0].len();
+    let mut out = vec![vec![vec![0.0f32; cols]; mid]; batch];
+    for b in 0..batch {
+        for c in 0..cols {
+            let max = (0..mid).map(|m| input[b][m][c]).fold(f32::NEG_INFINITY, f32::max);
+            let exps: Vec<f32> = (0..mid).map(|m| (input[b][m][c] - max).exp()).collect();
+            let sum: f32 = exps.iter().sum();
+            for (m, exp) in exps.into_iter().enumerate() {
+                out[b][m][c] = exp / sum;
+            }
+        }
+    }
+    out
+}
+
 fn norm_weight(feature_count: usize) -> Vec<f32> {
     (0..feature_count)
         .map(|i| 1.0 + ((i % 5) as f32) * 0.25)
@@ -207,4 +240,63 @@ async fn softmax_and_normalization_match_reference_paths() {
     .runs(3)
     .await
     .unwrap();
+}
+
+#[tokio::test]
+async fn softmax_slow_variants_match_reference() {
+    let gen_2d = FuzzGenerator::<2, f32>::new([16..=45, 16..=45])
+        .with_seed(420)
+        .with_distribution(Uniform::new(-4.0, 4.0).unwrap());
+
+    // softmax_slow on the last axis vs host reference
+    fusor_conformance::assert(async |x: Tensor<2, f32>| x.softmax_slow::<1>(1))
+        .arg(gen_2d.clone())
+        .equal_to_resolved_with_device(async |v: Vec<Vec<f32>>, device: Device| {
+            Tensor::new(&device, &softmax_last_dim_2d(&v))
+        })
+        .compare_with(approx_compare::<2, f32>(1e-5))
+        .runs(3)
+        .await
+        .unwrap();
+
+    // softmax_slow_last_dim vs host reference
+    fusor_conformance::assert(async |x: Tensor<2, f32>| x.softmax_slow_last_dim::<1>())
+        .arg(gen_2d.clone())
+        .equal_to_resolved_with_device(async |v: Vec<Vec<f32>>, device: Device| {
+            Tensor::new(&device, &softmax_last_dim_2d(&v))
+        })
+        .compare_with(approx_compare::<2, f32>(1e-5))
+        .runs(3)
+        .await
+        .unwrap();
+
+    // softmax_slow on axis 0 (column-wise) — non-last-dim path
+    fusor_conformance::assert(async |x: Tensor<2, f32>| x.softmax_slow::<1>(0))
+        .arg(gen_2d)
+        .equal_to_resolved_with_device(async |v: Vec<Vec<f32>>, device: Device| {
+            Tensor::new(&device, &softmax_axis0_2d(&v))
+        })
+        .compare_with(approx_compare::<2, f32>(1e-5))
+        .runs(3)
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn softmax_middle_axis_rank3_matches_reference() {
+    // Softmax on the middle dimension of a rank-3 tensor. Existing tests cover
+    // only the last-dim path; this exercises the generic-axis softmax kernel.
+    let gen_mid = FuzzGenerator::<3, f32>::new([2..=3, 16..=24, 16..=24])
+        .with_seed(430)
+        .with_distribution(Uniform::new(-4.0, 4.0).unwrap());
+
+    fusor_conformance::assert(async |x: Tensor<3, f32>| x.softmax::<2>(1))
+        .arg(gen_mid)
+        .equal_to_resolved_with_device(async |v: Vec<Vec<Vec<f32>>>, device: Device| {
+            Tensor::new(&device, &softmax_middle_axis_3d(&v))
+        })
+        .compare_with(approx_compare::<3, f32>(1e-5))
+        .runs(3)
+        .await
+        .unwrap();
 }

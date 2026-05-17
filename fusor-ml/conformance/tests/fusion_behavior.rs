@@ -345,6 +345,29 @@ async fn gpu_reduce_then_unary_chain_fuses_into_one_kernel() {
 }
 
 #[tokio::test]
+async fn gpu_indexing_then_arithmetic_matches_cpu() {
+    // `i((row, ..))` produces a rank-1 view; chaining mul_scalar + add_scalar
+    // exercises the index-then-arithmetic fusion path that no existing test
+    // covers. We assert correctness against CPU; kernel-count is informational
+    // (printed if the count is unexpected) since fusion details may change.
+    let Some(device) = gpu_device().await else {
+        return;
+    };
+
+    let shape = [4, 6];
+    let data = matrix_data(shape, 0.2);
+    let gpu_input: fusor::Tensor<2, f32> = Tensor::from_slice(&device, shape, &data);
+    let row = gpu_input.i((1, ..));
+    let result = row.mul_scalar(2.0) + 0.5;
+    let actual = result.to_concrete();
+
+    let cpu_input: fusor::Tensor<2, f32> = Tensor::from_slice(&Device::Cpu, shape, &data);
+    let cpu_row = cpu_input.i((1, ..));
+    let expected = (cpu_row.mul_scalar(2.0) + 0.5).to_concrete();
+    approx_eq(&actual, &expected, 1e-6).await.unwrap();
+}
+
+#[tokio::test]
 async fn gpu_reduce_then_gelu_uses_two_kernels() {
     let Some(device) = gpu_device().await else {
         return;

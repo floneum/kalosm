@@ -49,7 +49,13 @@ pub(crate) fn build_serial_matmul_direct_kernel(
         .shape()
         .iter()
         .try_fold(1u32, |acc, dim| acc.checked_mul((*dim).try_into().ok()?))?;
-    let dispatch_size = distribute_workgroups(total_outputs.div_ceil(BLOCK as u32));
+    let dispatch_size = distribute_workgroups(
+        total_outputs.div_ceil(BLOCK as u32),
+        graph
+            .device()
+            .limits()
+            .max_compute_workgroups_per_dimension,
+    );
     let cache_key = operation.kernel_cache_key_with_dispatch(
         kernel_backend::KernelVariantKey::of::<MatmulSerialDirectKernelVariant>(),
         Some(workgroup_shape),

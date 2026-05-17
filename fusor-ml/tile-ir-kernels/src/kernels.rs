@@ -16,7 +16,7 @@ mod types;
 pub use flash::{flash_attention, flash_decode_small};
 pub use matmul::{
     batched_gemv_with_epilogues, batched_matmul_register_with_epilogues,
-    batched_matmul_with_epilogues, try_batched_coop_matmul_f32, DenseMatmulShape,
+    batched_matmul_with_epilogues, try_batched_coop_matmul, DenseMatmulShape,
 };
 pub use mirostat::{mirostat2, Mirostat2};
 pub use qdequantize::qdequantize;

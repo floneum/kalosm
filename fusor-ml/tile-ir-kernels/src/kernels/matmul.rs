@@ -28,11 +28,12 @@ pub struct DenseMatmulShape {
     pub n: u32,
 }
 
-fn dispatch_grid_1d(total_workgroups: u32) -> [u32; 3] {
+fn dispatch_grid_1d(total_workgroups: u32, max_per_dim: u32) -> [u32; 3] {
     assert!(total_workgroups > 0, "matmul dispatch must have workgroups");
-    let x = total_workgroups.min(65_535);
+    assert!(max_per_dim > 0, "max_per_dim must be non-zero");
+    let x = total_workgroups.min(max_per_dim);
     let y_needed = total_workgroups.div_ceil(x);
-    let y = y_needed.min(65_535);
+    let y = y_needed.min(max_per_dim);
     let z = y_needed.div_ceil(y).max(1);
     [x, y, z]
 }
@@ -61,6 +62,7 @@ pub fn batched_gemv_with_epilogues<
     y: &Storage<Stor, 2>,
     shape: DenseMatmulShape,
     epilogues: &DenseMatmulEpilogues<'_>,
+    max_workgroups_per_dimension: u32,
 ) {
     const SUBGROUP_SIZE: u32 = 32;
     assert!(ROWS_PER_WORKGROUP > 0, "gemv rows must be non-zero");
@@ -87,7 +89,7 @@ pub fn batched_gemv_with_epilogues<
 
     let row_groups = shape.m.div_ceil(ROWS_PER_WORKGROUP as u32);
     let total_groups = shape.batch * row_groups;
-    let grid = dispatch_grid_1d(total_groups);
+    let grid = dispatch_grid_1d(total_groups, max_workgroups_per_dimension);
     let k_per_iter = SUBGROUP_SIZE * VALUES_PER_LANE as u32;
     let k_iterations = shape.k.div_ceil(k_per_iter);
 
@@ -166,6 +168,7 @@ pub fn batched_matmul_with_epilogues<
     y: &Storage<Stor, 2>,
     shape: DenseMatmulShape,
     epilogues: &DenseMatmulEpilogues<'_>,
+    max_workgroups_per_dimension: u32,
 ) {
     const TM: usize = 4;
     const TN: usize = 4;
@@ -192,7 +195,7 @@ pub fn batched_matmul_with_epilogues<
     let tiles_n = shape.n.div_ceil(BN as u32);
     let total_tiles = shape.batch * tiles_m * tiles_n;
     let k_tiles = shape.k.div_ceil(BK as u32);
-    let grid = dispatch_grid_1d(total_tiles);
+    let grid = dispatch_grid_1d(total_tiles, max_workgroups_per_dimension);
     let a_tile = program.alloc_workgroup_tile::<Stor>(BM as u32, BK as u32);
     let b_tile = program.alloc_workgroup_tile::<Stor>(BK as u32, BN as u32);
 
@@ -209,8 +212,10 @@ pub fn batched_matmul_with_epilogues<
         let lane = program.lane();
         let lane_row = lane.clone() / (BN as u32 / TN as u32);
         let lane_col = lane % (BN as u32 / TN as u32);
-        let row_base = m_tile * BM as u32 + lane_row.clone() * TM as u32;
-        let col_base = n_tile * BN as u32 + lane_col.clone() * TN as u32;
+        let m_tile_base = m_tile * BM as u32;
+        let n_tile_base = n_tile * BN as u32;
+        let row_base = m_tile_base.clone() + lane_row.clone() * TM as u32;
+        let col_base = n_tile_base.clone() + lane_col.clone() * TN as u32;
         let a_batch_base = batch_tile.clone() * shape.m;
         let b_batch_base = batch_tile.clone() * shape.k;
         let y_batch_base = batch_tile * shape.m;
@@ -225,7 +230,7 @@ pub fn batched_matmul_with_epilogues<
                     let flat = program.lane() + (pass * LANES) as u32;
                     let local_row = flat.clone() / BK as u32;
                     let local_k = flat.clone() % BK as u32;
-                    let global_row = row_base.clone() + local_row.clone();
+                    let global_row = m_tile_base.clone() + local_row.clone();
                     let global_k = k_base.clone() + local_k.clone();
                     let in_bounds = tile_active
                         .clone()
@@ -249,7 +254,7 @@ pub fn batched_matmul_with_epilogues<
                     let local_k = flat.clone() / BN as u32;
                     let local_col = flat.clone() % BN as u32;
                     let global_k = k_base.clone() + local_k.clone();
-                    let global_col = col_base.clone() + local_col.clone();
+                    let global_col = n_tile_base.clone() + local_col.clone();
                     let in_bounds = tile_active
                         .clone()
                         .and(flat.clone().lt((BK * BN) as u32))
@@ -329,6 +334,7 @@ pub fn batched_matmul_register_with_epilogues<
     y: &Storage<Stor, 2>,
     shape: DenseMatmulShape,
     epilogues: &DenseMatmulEpilogues<'_>,
+    max_workgroups_per_dimension: u32,
 ) {
     const TM: usize = 4;
     const TN: usize = 4;
@@ -340,7 +346,7 @@ pub fn batched_matmul_register_with_epilogues<
     let tiles_m = shape.m.div_ceil(BM as u32);
     let tiles_n = shape.n.div_ceil(BN as u32);
     let total_tiles = shape.batch * tiles_m * tiles_n;
-    let grid = dispatch_grid_1d(total_tiles);
+    let grid = dispatch_grid_1d(total_tiles, max_workgroups_per_dimension);
 
     program.program_grid::<LANES>(grid, |program| {
         let tile_id = program.program_id(WorkgroupAxis::X)
@@ -418,15 +424,17 @@ pub fn batched_matmul_register_with_epilogues<
 }
 
 
-/// Try to emit a fast cooperative-matrix F32 batched matmul. Returns false
-/// when shape/layout/epilogues require the generic path.
-pub fn try_batched_coop_matmul_f32<const BM: usize, const BN: usize, const BK: usize>(
+/// Try to emit a fast cooperative-matrix batched matmul. Returns false
+/// when shape/layout/epilogues require the generic path. Generic over the
+/// storage element so both F32 and F16 use the same dispatch table.
+pub fn try_batched_coop_matmul<T: CoopElement, const BM: usize, const BN: usize, const BK: usize>(
     program: &mut Program,
-    a: &Storage<F32, 2>,
-    b: &Storage<F32, 2>,
-    y: &Storage<F32, 2>,
+    a: &Storage<T, 2>,
+    b: &Storage<T, 2>,
+    y: &Storage<T, 2>,
     shape: DenseMatmulShape,
     epilogues: &DenseMatmulEpilogues<'_>,
+    max_workgroups_per_dimension: u32,
 ) -> bool {
     if epilogues.pre_a.is_some()
         || epilogues.pre_b.is_some()
@@ -439,7 +447,7 @@ pub fn try_batched_coop_matmul_f32<const BM: usize, const BN: usize, const BK: u
         return false;
     }
     let total_tiles = shape.batch * (shape.m / BM as u32) * (shape.n / BN as u32);
-    if total_tiles > 65_535 {
+    if total_tiles > max_workgroups_per_dimension {
         return false;
     }
 
@@ -457,27 +465,62 @@ pub fn try_batched_coop_matmul_f32<const BM: usize, const BN: usize, const BK: u
     // A tile would exceed the limit when doubled; its single-buffer overhead
     // is amortized by halving global A reads vs Tile128x512.
     match (BM, BN, BK) {
-        (256, 256, 16) => batched_coop_matmul_perf_single::<F32, 256, 256, 16, 8, 1, 8, 256>(
-            program, a, b, y, shape,
+        (256, 256, 16) => batched_coop_matmul_perf_single::<T, 256, 256, 16, 8, 1, 8, 256>(
+            program,
+            a,
+            b,
+            y,
+            shape,
+            max_workgroups_per_dimension,
         ),
-        (128, 512, 16) => batched_coop_matmul_perf::<F32, 128, 512, 16, 4, 2, 8, 256>(
-            program, a, b, y, shape,
+        (128, 512, 16) => batched_coop_matmul_perf::<T, 128, 512, 16, 4, 2, 8, 256>(
+            program,
+            a,
+            b,
+            y,
+            shape,
+            max_workgroups_per_dimension,
         ),
-        (128, 256, 16) => batched_coop_matmul_perf::<F32, 128, 256, 16, 4, 2, 4, 256>(
-            program, a, b, y, shape,
+        (128, 256, 16) => batched_coop_matmul_perf::<T, 128, 256, 16, 4, 2, 4, 256>(
+            program,
+            a,
+            b,
+            y,
+            shape,
+            max_workgroups_per_dimension,
         ),
-        (128, 128, 16) => {
-            batched_coop_matmul_perf::<F32, 128, 128, 16, 4, 4, 2, 512>(program, a, b, y, shape)
-        }
-        (128, 64, 16) => {
-            batched_coop_matmul_perf::<F32, 128, 64, 16, 4, 2, 1, 256>(program, a, b, y, shape)
-        }
-        (64, 128, 16) => {
-            batched_coop_matmul_perf::<F32, 64, 128, 16, 2, 4, 2, 256>(program, a, b, y, shape)
-        }
-        (64, 64, 16) => {
-            batched_coop_matmul_perf::<F32, 64, 64, 16, 2, 2, 1, 128>(program, a, b, y, shape)
-        }
+        (128, 128, 16) => batched_coop_matmul_perf::<T, 128, 128, 16, 4, 4, 2, 512>(
+            program,
+            a,
+            b,
+            y,
+            shape,
+            max_workgroups_per_dimension,
+        ),
+        (128, 64, 16) => batched_coop_matmul_perf::<T, 128, 64, 16, 4, 2, 1, 256>(
+            program,
+            a,
+            b,
+            y,
+            shape,
+            max_workgroups_per_dimension,
+        ),
+        (64, 128, 16) => batched_coop_matmul_perf::<T, 64, 128, 16, 2, 4, 2, 256>(
+            program,
+            a,
+            b,
+            y,
+            shape,
+            max_workgroups_per_dimension,
+        ),
+        (64, 64, 16) => batched_coop_matmul_perf::<T, 64, 64, 16, 2, 2, 1, 128>(
+            program,
+            a,
+            b,
+            y,
+            shape,
+            max_workgroups_per_dimension,
+        ),
         _ => return false,
     }
     true
@@ -503,6 +546,7 @@ fn batched_coop_matmul_perf_single<
     b: &Storage<T, 2>,
     y: &Storage<T, 2>,
     shape: DenseMatmulShape,
+    max_workgroups_per_dimension: u32,
 ) {
     const COOP_DIM: u32 = 8;
     const SUBGROUP_SIZE: u32 = 32;
@@ -527,7 +571,7 @@ fn batched_coop_matmul_perf_single<
     let a_tile = program.alloc_workgroup_tile_padded::<T>(BM as u32, BK as u32, 1);
     let b_tile = program.alloc_workgroup_tile_padded::<T>(BK as u32, bn_pass, 1);
 
-    let grid = dispatch_grid_1d(total_tiles);
+    let grid = dispatch_grid_1d(total_tiles, max_workgroups_per_dimension);
     program.program_grid::<BLOCK>(grid, |program| {
         let tile_id = program.program_id(WorkgroupAxis::X)
             + program.program_id(WorkgroupAxis::Y) * grid[0]
@@ -630,6 +674,7 @@ fn batched_coop_matmul_perf<
     b: &Storage<T, 2>,
     y: &Storage<T, 2>,
     shape: DenseMatmulShape,
+    max_workgroups_per_dimension: u32,
 ) {
     const COOP_DIM: u32 = 8;
     const SUBGROUP_SIZE: u32 = 32;
@@ -662,7 +707,7 @@ fn batched_coop_matmul_perf<
     let b_tile_0 = program.alloc_workgroup_tile_padded::<T>(BK as u32, bn_pass, 1);
     let b_tile_1 = program.alloc_workgroup_tile_padded::<T>(BK as u32, bn_pass, 1);
 
-    let grid = dispatch_grid_1d(total_tiles);
+    let grid = dispatch_grid_1d(total_tiles, max_workgroups_per_dimension);
     program.program_grid::<BLOCK>(grid, |program| {
         let tile_id = program.program_id(WorkgroupAxis::X)
             + program.program_id(WorkgroupAxis::Y) * grid[0]

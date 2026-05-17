@@ -72,6 +72,23 @@ impl KernelDeviceCaps {
             max_compute_workgroups_per_dimension: limits.max_compute_workgroups_per_dimension,
         }
     }
+
+    /// Caps stub representing an Apple Silicon-class compute device. Used by
+    /// selector tests so each callsite only overrides the fields it cares
+    /// about via `..test_caps()` struct-update syntax.
+    #[cfg(test)]
+    pub(crate) fn test_caps() -> Self {
+        Self {
+            subgroups_supported: true,
+            cooperative_matrix_supported: true,
+            min_subgroup_size: 32,
+            max_subgroup_size: 32,
+            max_compute_invocations_per_workgroup: 1024,
+            max_compute_workgroup_storage_size: 64 * 1024,
+            max_compute_workgroup_size_x: 1024,
+            max_compute_workgroups_per_dimension: 65_535,
+        }
+    }
 }
 
 pub trait ShapeRng {
@@ -618,16 +635,7 @@ mod tests {
     }
 
     fn caps() -> KernelDeviceCaps {
-        KernelDeviceCaps {
-            subgroups_supported: true,
-            cooperative_matrix_supported: true,
-            min_subgroup_size: 32,
-            max_subgroup_size: 32,
-            max_compute_invocations_per_workgroup: 1024,
-            max_compute_workgroup_storage_size: 64 * 1024,
-            max_compute_workgroup_size_x: 1024,
-            max_compute_workgroups_per_dimension: 65_535,
-        }
+        KernelDeviceCaps::test_caps()
     }
 
     #[test]

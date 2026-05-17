@@ -664,14 +664,9 @@ mod tests {
 
     fn caps(max_compute_invocations_per_workgroup: u32) -> KernelDeviceCaps {
         KernelDeviceCaps {
-            subgroups_supported: true,
             cooperative_matrix_supported: false,
-            min_subgroup_size: 32,
-            max_subgroup_size: 32,
             max_compute_invocations_per_workgroup,
-            max_compute_workgroup_storage_size: 64 * 1024,
-            max_compute_workgroup_size_x: 1024,
-            max_compute_workgroups_per_dimension: 65_535,
+            ..KernelDeviceCaps::test_caps()
         }
     }
 

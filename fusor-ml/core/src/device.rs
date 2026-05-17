@@ -176,29 +176,15 @@ impl Device {
             // SAFETY: cooperative matrix is an experimental feature that requires opting in
             experimental_features = unsafe { wgpu::ExperimentalFeatures::enabled() };
         }
-        let adapter_limits = adapter.limits();
-        eprintln!(
-            "DBG adapter limits: storage={} wg_size_x={} invocations={} backend={:?}",
-            adapter_limits.max_compute_workgroup_storage_size,
-            adapter_limits.max_compute_workgroup_size_x,
-            adapter_limits.max_compute_invocations_per_workgroup,
-            adapter.get_info().backend,
-        );
         let (device, queue) = adapter
             .request_device(&wgpu::DeviceDescriptor {
                 label: Some("Fusor ML Device"),
                 required_features,
-                required_limits: adapter_limits.clone(),
+                required_limits: adapter.limits(),
                 experimental_features,
                 ..Default::default()
             })
             .await?;
-        eprintln!(
-            "DBG device limits: storage={} wg_size_x={} invocations={}",
-            device.limits().max_compute_workgroup_storage_size,
-            device.limits().max_compute_workgroup_size_x,
-            device.limits().max_compute_invocations_per_workgroup,
-        );
 
         let device = Arc::new(device);
         let queue = Arc::new(queue);

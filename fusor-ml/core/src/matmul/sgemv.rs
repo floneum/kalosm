@@ -4,13 +4,13 @@ pub(crate) fn dispatch_size(
     m: u32,
     n: u32,
     batch_size: u32,
+    max_workgroups_per_dimension: u32,
     _workgroup_shape: &crate::mir::workgroup_shape::WorkgroupShape,
     params: &SgemvParams,
 ) -> [u32; 3] {
     let total = m.div_ceil(params.chunk_size) * n * batch_size;
-    let max = 65_535;
-    let x = total.min(max);
-    let y = total.div_ceil(x).min(max);
+    let x = total.min(max_workgroups_per_dimension);
+    let y = total.div_ceil(x).min(max_workgroups_per_dimension);
     let z = total.div_ceil(x * y);
     [x, y, z]
 }

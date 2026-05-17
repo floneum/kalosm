@@ -121,16 +121,14 @@ pub(crate) fn titled_map_workgroup_size_constraints(
     constraints
 }
 
-pub(crate) const MAX_DISPATCH_DIM: u32 = 65535;
-
-pub(crate) fn distribute_workgroups(total_workgroups: u32) -> [u32; 3] {
+pub(crate) fn distribute_workgroups(total_workgroups: u32, max_per_dim: u32) -> [u32; 3] {
     if total_workgroups == 0 {
         return [1, 1, 1];
     }
 
-    let x = total_workgroups.min(MAX_DISPATCH_DIM);
+    let x = total_workgroups.min(max_per_dim);
     let remaining = total_workgroups.div_ceil(x);
-    let y = remaining.min(MAX_DISPATCH_DIM);
+    let y = remaining.min(max_per_dim);
     let z = total_workgroups.div_ceil(x * y).max(1);
 
     [x, y, z]
@@ -140,11 +138,12 @@ pub(crate) fn titled_map_dispatch_size(
     tile_size: u32,
     workgroup_shape: WorkgroupShape,
     shape: &[usize],
+    max_per_dim: u32,
 ) -> [u32; 3] {
     let total_elements: u64 = shape.iter().map(|&x| x as u64).product();
     let total_tiles = total_elements.div_ceil(tile_size as u64) as u32;
     let workgroup_volume = workgroup_shape.x() * workgroup_shape.y() * workgroup_shape.z();
     let total_workgroups = total_tiles.div_ceil(workgroup_volume);
 
-    distribute_workgroups(total_workgroups)
+    distribute_workgroups(total_workgroups, max_per_dim)
 }

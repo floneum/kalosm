@@ -107,10 +107,16 @@ impl Operation for QEmbeddingOperation {
         constraints
     }
 
-    fn dispatch_size(&self, _workgroup_shape: &WorkgroupShape, _inputs: &[MirValue]) -> [u32; 3] {
+    fn dispatch_size(&self, _workgroup_shape: &WorkgroupShape, inputs: &[MirValue]) -> [u32; 3] {
         let total_elements: u64 = self.out_shape.iter().map(|&x| x as u64).product();
         let total_workgroups = total_elements.div_ceil(BLOCK as u64) as u32;
-        distribute_workgroups(total_workgroups)
+        let max_per_dim = inputs[2]
+            .as_tensor()
+            .unwrap()
+            .device()
+            .limits()
+            .max_compute_workgroups_per_dimension;
+        distribute_workgroups(total_workgroups, max_per_dim)
     }
 
     fn visit_dependencies(&self, f: &mut dyn FnMut(NodeIndex)) {

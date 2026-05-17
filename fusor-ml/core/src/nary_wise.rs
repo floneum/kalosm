@@ -579,9 +579,14 @@ impl Operation for NaryOperation {
     fn dispatch_size(
         &self,
         workgroup_shape: &crate::mir::workgroup_shape::WorkgroupShape,
-        _inputs: &[MirValue],
+        inputs: &[MirValue],
     ) -> [u32; 3] {
-        titled_map_dispatch_size(TILE_SIZE, *workgroup_shape, &self.shape)
+        let first_input: MaybeQData = inputs[0].clone().try_into().unwrap();
+        let max_per_dim = first_input
+            .device()
+            .limits()
+            .max_compute_workgroups_per_dimension;
+        titled_map_dispatch_size(TILE_SIZE, *workgroup_shape, &self.shape, max_per_dim)
     }
 
     fn visit_dependencies(&self, f: &mut dyn FnMut(NodeIndex)) {
