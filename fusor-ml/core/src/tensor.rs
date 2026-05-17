@@ -981,6 +981,18 @@ impl<D: DataType, const R: usize> Tensor<R, D> {
         if R != 4 || !matches!(D::DATA_TYPE, DataTypeEnum::F32 | DataTypeEnum::F16) {
             return None;
         }
+        // The streaming flash attention kernel requires the device to expose
+        // 32-wide subgroups (it relies on subgroup reductions across a
+        // SIMD-width chunk of K). Devices like Mesa's lavapipe report smaller
+        // subgroups and would force `build_direct_kernel` to bail later, so
+        // fall back to the composite implementation here.
+        let device = &self.data.device;
+        if !device.subgroups_supported()
+            || device.min_subgroup_size() > 32
+            || device.max_subgroup_size() < 32
+        {
+            return None;
+        }
         let q_shape = self.shape();
         let k_shape = k.shape();
         let v_shape = v.shape();
