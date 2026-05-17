@@ -6,7 +6,7 @@ use std::{
 
 use crate::{
     DataTypeEnum, Layout,
-    mir::{kernel_backend::PreparedDirectDispatch, inputs::MirValue, operation::Operation},
+    mir::{inputs::MirValue, kernel_backend::PreparedDirectDispatch, operation::Operation},
     nary_direct::eval_nary_expr_on_tiles,
     nary_wise::{ExtractedUnaryChain, NaryExpr, NaryOperation, UnaryFunctionChain},
     quantized::matmul::QMatMulOperation,
@@ -458,11 +458,7 @@ impl Resolver {
                 });
                 if let Some((output, copies)) = slice_copy {
                     graph.set_cached_result(node, output);
-                    commands.extend(
-                        copies
-                            .into_iter()
-                            .map(CommandRecord::CopyBuffer),
-                    );
+                    commands.extend(copies.into_iter().map(CommandRecord::CopyBuffer));
                     let start = host_trace.then(Instant::now);
                     Self::release_dead_intermediates(
                         graph,
@@ -860,10 +856,13 @@ impl Resolver {
             for dep in deps {
                 if let Some(count) = remaining_consumers.get_mut(&dep) {
                     *count = count.saturating_sub(1);
-                    if *count == 0 && !targets.contains(&dep) && !graph.has_live_reference(dep)
-                        && let Some(node) = graph.nodes.nodes.node_weight_mut(dep) {
-                            node.cached = None;
-                        }
+                    if *count == 0
+                        && !targets.contains(&dep)
+                        && !graph.has_live_reference(dep)
+                        && let Some(node) = graph.nodes.nodes.node_weight_mut(dep)
+                    {
+                        node.cached = None;
+                    }
                 }
             }
         }

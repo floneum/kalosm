@@ -10,7 +10,9 @@ fn softmax_axis0_2d(input: &[Vec<f32>]) -> Vec<Vec<f32>> {
     let cols = input[0].len();
     let mut out = vec![vec![0.0f32; cols]; rows];
     for c in 0..cols {
-        let max = (0..rows).map(|r| input[r][c]).fold(f32::NEG_INFINITY, f32::max);
+        let max = (0..rows)
+            .map(|r| input[r][c])
+            .fold(f32::NEG_INFINITY, f32::max);
         let exps: Vec<f32> = (0..rows).map(|r| (input[r][c] - max).exp()).collect();
         let sum: f32 = exps.iter().sum();
         for (r, exp) in exps.into_iter().enumerate() {
@@ -27,7 +29,9 @@ fn softmax_middle_axis_3d(input: &[Vec<Vec<f32>>]) -> Vec<Vec<Vec<f32>>> {
     let mut out = vec![vec![vec![0.0f32; cols]; mid]; batch];
     for b in 0..batch {
         for c in 0..cols {
-            let max = (0..mid).map(|m| input[b][m][c]).fold(f32::NEG_INFINITY, f32::max);
+            let max = (0..mid)
+                .map(|m| input[b][m][c])
+                .fold(f32::NEG_INFINITY, f32::max);
             let exps: Vec<f32> = (0..mid).map(|m| (input[b][m][c] - max).exp()).collect();
             let sum: f32 = exps.iter().sum();
             for (m, exp) in exps.into_iter().enumerate() {

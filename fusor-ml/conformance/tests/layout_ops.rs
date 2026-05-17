@@ -392,4 +392,3 @@ async fn cat_stack_and_chunk_match_expected_views() {
         .await;
     }
 }
-

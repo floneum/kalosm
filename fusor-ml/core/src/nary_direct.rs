@@ -105,7 +105,12 @@ fn build_nary_direct_kernel_with_output_index(
         format!("nary_direct_out_{output_index}")
     };
 
-    Some(DirectKernel::from_cached(name, cached, bindings, dispatch_size))
+    Some(DirectKernel::from_cached(
+        name,
+        cached,
+        bindings,
+        dispatch_size,
+    ))
 }
 
 impl NaryOperation {

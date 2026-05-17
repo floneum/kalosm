@@ -160,9 +160,7 @@ async fn rank4_softmax_last_dim_matches_reference() {
 async fn rank4_rms_norm_fused_matches_reference() {
     const SHAPE: [usize; 4] = [2, 2, 3, 16];
     let data = deterministic_data(SHAPE.iter().product(), 603);
-    let weight: Vec<f32> = (0..SHAPE[3])
-        .map(|i| 1.0 + (i % 5) as f32 * 0.25)
-        .collect();
+    let weight: Vec<f32> = (0..SHAPE[3]).map(|i| 1.0 + (i % 5) as f32 * 0.25).collect();
     let expected_flat = rms_norm_fused_4d(&data, SHAPE, &weight, 1e-5);
 
     for device in available_devices().await {

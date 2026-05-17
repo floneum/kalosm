@@ -394,10 +394,7 @@ async fn middle_axis_rank3_reductions_match_host_reference() {
     fusor_conformance::assert(async |x: Tensor<3, f32>| x.max::<2>(1))
         .arg(fuzz.clone())
         .equal_to_resolved_with_device(async |v: Vec<Vec<Vec<f32>>>, device: Device| {
-            Tensor::new(
-                &device,
-                &reduce_axis3_mid(&v, f32::NEG_INFINITY, f32::max),
-            )
+            Tensor::new(&device, &reduce_axis3_mid(&v, f32::NEG_INFINITY, f32::max))
         })
         .compare_with(approx_compare::<2, f32>(1e-5))
         .runs(3)

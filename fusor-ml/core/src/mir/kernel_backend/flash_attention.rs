@@ -13,9 +13,9 @@ use crate::{
         Axis, DimConstraint, KernelDeviceCaps, KernelShape, ShapeRule, ShapeSelector, eq, range,
     },
     mir::{
-        kernel_backend::DirectKernel,
         inputs::MirValue,
         kernel_backend,
+        kernel_backend::DirectKernel,
         operation::Operation,
         workgroup_shape::{Constraint, WorkgroupShape, WorkgroupShapeConstraints},
     },
@@ -986,12 +986,8 @@ mod tests {
         let mut max_expected = 0.0f32;
         for (head, q_head) in q_data[0].iter().enumerate().take(num_heads) {
             let kv_head = head / groups;
-            let expected = cpu_decode_reference(
-                &q_head[0],
-                &k_data[0][kv_head],
-                &v_data[0][kv_head],
-                scale,
-            );
+            let expected =
+                cpu_decode_reference(&q_head[0], &k_data[0][kv_head], &v_data[0][kv_head], scale);
             for (dim, expected) in expected.into_iter().enumerate() {
                 let actual = actual(head, dim);
                 let error = (actual - expected).abs();

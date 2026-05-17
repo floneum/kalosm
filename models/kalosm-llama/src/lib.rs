@@ -477,4 +477,3 @@ impl GpuSamplerConfig {
         }
     }
 }
-

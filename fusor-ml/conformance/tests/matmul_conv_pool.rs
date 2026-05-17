@@ -193,8 +193,8 @@ fn conv3d_ncdhw_ref(
                                             && ix >= padding[2]
                                             && ix < padding[2] + in_w
                                         {
-                                            let v = input[b][ic][iz - padding[0]]
-                                                [iy - padding[1]][ix - padding[2]];
+                                            let v = input[b][ic][iz - padding[0]][iy - padding[1]]
+                                                [ix - padding[2]];
                                             acc += v * weight_val;
                                         }
                                     }
@@ -251,7 +251,10 @@ fn vec5_from_flat(flat: &[f32], shape: [usize; 5]) -> Vec<Vec<Vec<Vec<Vec<f32>>>
 
 fn flatten4(v: &[Vec<Vec<Vec<f32>>>]) -> Vec<f32> {
     v.iter()
-        .flat_map(|a| a.iter().flat_map(|b| b.iter().flat_map(|c| c.iter().copied())))
+        .flat_map(|a| {
+            a.iter()
+                .flat_map(|b| b.iter().flat_map(|c| c.iter().copied()))
+        })
         .collect()
 }
 
@@ -284,8 +287,13 @@ async fn conv2d_matches_host_reference() {
 
     let input_nested = vec4_from_flat(&input_flat, [BATCH, IN_CH, H, W]);
     let weight_nested = vec4_from_flat(&weight_flat, [OUT_CH, IN_CH, KH, KW]);
-    let expected_nested =
-        conv2d_nchw_ref(&input_nested, &weight_nested, Some(&bias_flat), [1, 1], [1, 1]);
+    let expected_nested = conv2d_nchw_ref(
+        &input_nested,
+        &weight_nested,
+        Some(&bias_flat),
+        [1, 1],
+        [1, 1],
+    );
     let expected_flat = flatten4(&expected_nested);
     let out_shape = [BATCH, OUT_CH, H, W];
 
@@ -293,7 +301,9 @@ async fn conv2d_matches_host_reference() {
         let input = Tensor::from_slice(&device, [BATCH, IN_CH, H, W], &input_flat);
         let weight = Tensor::from_slice(&device, [OUT_CH, IN_CH, KH, KW], &weight_flat);
         let bias = Tensor::from_slice(&device, [OUT_CH], &bias_flat);
-        let actual = input.conv(&weight, Some(&bias), [1, 1], [1, 1]).to_concrete();
+        let actual = input
+            .conv(&weight, Some(&bias), [1, 1], [1, 1])
+            .to_concrete();
         let expected = Tensor::from_slice(&device, out_shape, &expected_flat);
         fusor_conformance::approx_eq(&actual, &expected, 1e-3)
             .await

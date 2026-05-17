@@ -5,7 +5,7 @@ use rustc_hash::FxHasher;
 use crate::{
     TILE_SIZE,
     compute_graph::{ComputeGraphInner, NodeIndex},
-    mir::{kernel_backend::DirectKernel, inputs::MirValue, operation::Operation},
+    mir::{inputs::MirValue, kernel_backend::DirectKernel, operation::Operation},
     tensor::{DataTypeEnum, TensorData},
     visit_tiled::{MaybeQData, titled_map_dispatch_size, titled_map_workgroup_size_constraints},
 };

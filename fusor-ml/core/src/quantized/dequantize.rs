@@ -8,8 +8,8 @@ use crate::{
     CastTensor, DataType, DataTypeEnum, Device, Layout, LazyTensorData, Tensor, TensorData,
     TensorInfo,
     mir::{
-        kernel_backend::DirectKernel,
         kernel_backend,
+        kernel_backend::DirectKernel,
         workgroup_shape::{Constraint, WorkgroupShapeConstraints},
     },
     nary_wise::UnaryFunctionChain,

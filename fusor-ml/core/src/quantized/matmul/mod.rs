@@ -8,9 +8,9 @@ use crate::{
     },
     matmul::MatMulOperation,
     mir::{
-        kernel_backend::DirectKernel,
         inputs::MirValue,
         kernel_backend,
+        kernel_backend::DirectKernel,
         operation::Operation,
         tile_direct::{
             flatten_matrix_layout, tile_storage_read_with_direct_layout,
@@ -669,14 +669,16 @@ impl QMatMulOperation {
                     .direct_pipeline_cache()
                     .write()
                     .get_or_insert(pipeline_key, || pipeline.clone());
-                return Some(kernel_backend::DirectKernel::from_prepared_three_buffer_pipeline(
-                    kernel_name.clone(),
-                    pipeline,
-                    input.buffer().clone(),
-                    matrix.buffer().clone(),
-                    output.buffer().clone(),
-                    dispatch_size,
-                ));
+                return Some(
+                    kernel_backend::DirectKernel::from_prepared_three_buffer_pipeline(
+                        kernel_name.clone(),
+                        pipeline,
+                        input.buffer().clone(),
+                        matrix.buffer().clone(),
+                        output.buffer().clone(),
+                        dispatch_size,
+                    ),
+                );
             }
         }
         let pre_for_ir = pre_epilogue.clone();
@@ -814,14 +816,16 @@ fn cached_qmatmul_direct_kernel(
         .write()
         .get(pipeline_key)
         .cloned()?;
-    Some(kernel_backend::DirectKernel::from_prepared_three_buffer_pipeline(
-        kernel_name.to_owned(),
-        pipeline,
-        input.buffer().clone(),
-        matrix.buffer().clone(),
-        output.buffer().clone(),
-        dispatch_size,
-    ))
+    Some(
+        kernel_backend::DirectKernel::from_prepared_three_buffer_pipeline(
+            kernel_name.to_owned(),
+            pipeline,
+            input.buffer().clone(),
+            matrix.buffer().clone(),
+            output.buffer().clone(),
+            dispatch_size,
+        ),
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -858,14 +862,16 @@ fn qmatmul_direct_kernel_from_ir(
         .write()
         .get_or_insert(pipeline_key, || pipeline.clone())
         .clone();
-    Some(kernel_backend::DirectKernel::from_prepared_three_buffer_pipeline(
-        kernel_name,
-        pipeline,
-        input.buffer().clone(),
-        matrix.buffer().clone(),
-        output.buffer().clone(),
-        dispatch_size,
-    ))
+    Some(
+        kernel_backend::DirectKernel::from_prepared_three_buffer_pipeline(
+            kernel_name,
+            pipeline,
+            input.buffer().clone(),
+            matrix.buffer().clone(),
+            output.buffer().clone(),
+            dispatch_size,
+        ),
+    )
 }
 
 fn split_workgroups_2d(
@@ -1231,11 +1237,7 @@ impl QMatMulOperation {
         if extras_count == 0 {
             let pipeline_key = QMatMulDirectPipelineKey::new_with_epilogue(
                 matrix.datatype(),
-                crate::quantized::QMatMulShape {
-                    m,
-                    k,
-                    n: pair_len,
-                },
+                crate::quantized::QMatMulShape { m, k, n: pair_len },
                 epilogue_identity,
                 dispatch_size,
                 input.layout(),

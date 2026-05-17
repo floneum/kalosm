@@ -2,7 +2,9 @@ use std::sync::Arc;
 
 use wgpu::{CommandEncoder, ComputePass, PipelineCompilationOptions};
 
-use crate::cache::{CachedKernel, DirectDynamicBindGroupKey, DirectStorage3BindGroupKey, KernelCache};
+use crate::cache::{
+    CachedKernel, DirectDynamicBindGroupKey, DirectStorage3BindGroupKey, KernelCache,
+};
 
 #[derive(Clone, Debug)]
 pub struct DirectKernelBinding {

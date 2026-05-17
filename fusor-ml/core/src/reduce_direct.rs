@@ -2,7 +2,7 @@ use fusor_tile_ir as tile_ir;
 
 use crate::{
     mir::{
-        kernel_backend::DirectKernel, inputs::MirValue, kernel_backend, operation::Operation,
+        inputs::MirValue, kernel_backend, kernel_backend::DirectKernel, operation::Operation,
         workgroup_shape::WorkgroupShape,
     },
     nary_direct::{

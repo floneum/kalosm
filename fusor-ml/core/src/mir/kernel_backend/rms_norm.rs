@@ -7,9 +7,9 @@ use crate::{
         Axis, KernelDeviceCaps, KernelShape, ShapeRule, ShapeSelector, multiple_of,
     },
     mir::{
-        kernel_backend::DirectKernel,
         inputs::MirValue,
         kernel_backend,
+        kernel_backend::DirectKernel,
         operation::Operation,
         tile_direct::{
             flatten_matrix_layout, tile_storage_read_with_direct_layout,

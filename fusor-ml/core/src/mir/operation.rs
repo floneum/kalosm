@@ -8,9 +8,9 @@ use crate::{
 };
 
 use super::{
-    kernel_backend::DirectKernel,
     inputs::MirValue,
     kernel_backend,
+    kernel_backend::DirectKernel,
     workgroup_shape::{WorkgroupShape, WorkgroupShapeConstraints},
 };
 

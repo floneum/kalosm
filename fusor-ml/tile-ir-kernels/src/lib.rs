@@ -6,13 +6,13 @@
 //!
 //! ```
 //! use fusor_tile_ir::{tile, GgmlQuantFormat, Shape, F32};
-//! use fusor_tile_ir_kernels::{qgemv, quantized_matrix};
+//! use fusor_tile_ir_kernels::{qgemv_with_epilogue, quantized_matrix, UnaryEpilogue};
 //!
 //! let ir = tile::build(|program| {
 //!     let a = program.storage_read::<F32, 2>(Shape::new([1, 256]));
 //!     let b = quantized_matrix(program, GgmlQuantFormat::Q8_0, 256, 128);
 //!     let y = program.storage_write::<F32, 2>(Shape::new([1, 128]));
-//!     qgemv::<4, 64>(program, &a, &b, &y, 4, 1);
+//!     qgemv_with_epilogue::<4, 64>(program, &a, &b, &y, 1, Option::<&UnaryEpilogue>::None);
 //! });
 //! # let _ = ir;
 //! ```

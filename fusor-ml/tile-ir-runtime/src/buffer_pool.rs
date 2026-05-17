@@ -90,10 +90,7 @@ impl BufferPool {
 
     /// Reset the initialized flag on all cached buffers.
     pub fn reset_initialized_buffers(&self) {
-        if !self
-            .initialized_buffers_dirty
-            .swap(false, Ordering::AcqRel)
-        {
+        if !self.initialized_buffers_dirty.swap(false, Ordering::AcqRel) {
             return;
         }
         let keys = {
@@ -143,7 +140,8 @@ impl BufferPool {
         to_initilize: bool,
     ) -> Arc<wgpu::Buffer> {
         if to_initilize {
-            self.initialized_buffers_dirty.store(true, Ordering::Release);
+            self.initialized_buffers_dirty
+                .store(true, Ordering::Release);
             self.initialized_buffer_keys.lock().push((size, usage));
         }
         self.get_cached_buffer(size, usage, to_initilize)
@@ -160,10 +158,7 @@ impl BufferPool {
                     .write()
                     .get_or_insert_mut((size, usage), Vec::new)
                     .push(CachedBuffer::new(buffer.clone(), to_initilize));
-                if let Some(buffers) = self
-                    .buffer_allocation_cache
-                    .write()
-                    .get_mut(&(size, usage))
+                if let Some(buffers) = self.buffer_allocation_cache.write().get_mut(&(size, usage))
                 {
                     prune_cached_buffers(buffers);
                 }
@@ -177,11 +172,7 @@ impl BufferPool {
     }
 
     /// Get or create a buffer initialized with the supplied bytes.
-    pub fn create_buffer_init(
-        &self,
-        data: &[u8],
-        usage: wgpu::BufferUsages,
-    ) -> Arc<wgpu::Buffer> {
+    pub fn create_buffer_init(&self, data: &[u8], usage: wgpu::BufferUsages) -> Arc<wgpu::Buffer> {
         let padded_len = padded_copy_size(data.len() as u64);
         let buffer = self.create_buffer_inner(padded_len, usage, true);
         let mut write = self

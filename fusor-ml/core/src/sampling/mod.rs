@@ -11,8 +11,8 @@ mod tests;
 
 pub(crate) use pipeline::{mirostat2_sample_token_to_host, qmat_mirostat2_sample_token_to_host};
 pub(crate) use topk::{
-    chunk_top_k_pair_data_with_encoder, merge_sorted_chunk_top_k_pair_data_with_encoder,
-    MergeSortedChunkTopKParams,
+    MergeSortedChunkTopKParams, chunk_top_k_pair_data_with_encoder,
+    merge_sorted_chunk_top_k_pair_data_with_encoder,
 };
 
 pub(crate) const TOP_K_BLOCK: u32 = 256;

@@ -144,7 +144,7 @@ fn bench_candle_with_device(candle_device: candle_core::Device, name: &str, c: &
                             }
                         }
                     },
-                    BatchSize::LargeInput,
+                    BatchSize::PerIteration,
                 );
             },
         );

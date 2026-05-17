@@ -5,8 +5,8 @@ use rustc_hash::FxHasher;
 use crate::{
     Dim, LastRank, LastRankInner, NextRankInner,
     mir::{
-        kernel_backend::DirectKernel,
         inputs::MirValue,
+        kernel_backend::DirectKernel,
         operation::Operation,
         workgroup_shape::{Constraint, WorkgroupShapeConstraints},
     },

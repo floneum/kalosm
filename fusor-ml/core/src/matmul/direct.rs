@@ -3,7 +3,7 @@ use fusor_tile_ir as tile_ir;
 use crate::{
     matmul::MatMulOperation,
     mir::{
-        kernel_backend::DirectKernel, inputs::MirValue, kernel_backend, operation::Operation,
+        inputs::MirValue, kernel_backend, kernel_backend::DirectKernel, operation::Operation,
         workgroup_shape::WorkgroupShape,
     },
     nary_direct::{
@@ -51,10 +51,7 @@ pub(crate) fn build_serial_matmul_direct_kernel(
         .try_fold(1u32, |acc, dim| acc.checked_mul((*dim).try_into().ok()?))?;
     let dispatch_size = distribute_workgroups(
         total_outputs.div_ceil(BLOCK as u32),
-        graph
-            .device()
-            .limits()
-            .max_compute_workgroups_per_dimension,
+        graph.device().limits().max_compute_workgroups_per_dimension,
     );
     let cache_key = operation.kernel_cache_key_with_dispatch(
         kernel_backend::KernelVariantKey::of::<MatmulSerialDirectKernelVariant>(),

@@ -205,22 +205,13 @@ impl DirectTileCoopMatmulVariant {
         {
             return Self::Tile128x256;
         }
-        if m.is_multiple_of(128)
-            && n.is_multiple_of(64)
-            && max_workgroup_size_x >= 256
-        {
+        if m.is_multiple_of(128) && n.is_multiple_of(64) && max_workgroup_size_x >= 256 {
             return Self::Tile128x64;
         }
-        if m.is_multiple_of(64)
-            && n.is_multiple_of(128)
-            && max_workgroup_size_x >= 256
-        {
+        if m.is_multiple_of(64) && n.is_multiple_of(128) && max_workgroup_size_x >= 256 {
             return Self::Tile64x128;
         }
-        if m.is_multiple_of(64)
-            && n.is_multiple_of(64)
-            && max_workgroup_size_x >= 128
-        {
+        if m.is_multiple_of(64) && n.is_multiple_of(64) && max_workgroup_size_x >= 128 {
             return Self::Tile64x64;
         }
         Self::None
@@ -452,190 +443,261 @@ impl MatMulOperation {
         let use_shared_tile = m.is_multiple_of(32) && n.is_multiple_of(32) && k.is_multiple_of(8);
         let max_wg_per_dim = device.limits().max_compute_workgroups_per_dimension;
         let datatype = self.datatype;
-        let ir = tile_ir::tile::build(move |phase| {
-            let epilogues = tile_ir_kernels::DenseMatmulEpilogues {
-                pre_a: pre_a.as_ref(),
-                pre_b: pre_b.as_ref(),
-                post: post.as_ref(),
-            };
-            match datatype {
-                DataTypeEnum::F32 => {
-                    let a = tile_storage_read_with_direct_layout_typed::<tile_ir::F32>(
-                        phase,
-                        a_view.clone(),
-                    );
-                    let b = tile_storage_read_with_direct_layout_typed::<tile_ir::F32>(
-                        phase,
-                        b_view.clone(),
-                    );
-                    let y = tile_storage_write_with_direct_layout_typed::<tile_ir::F32>(
-                        phase,
-                        y_view.clone(),
-                    );
-                    match coop_variant {
-                        DirectTileCoopMatmulVariant::Tile256x256 => {
-                            if tile_ir_kernels::try_batched_coop_matmul::<tile_ir::F32, 256, 256, 16>(
-                                phase, &a, &b, &y, shape, &epilogues, max_wg_per_dim,
-                            ) {
-                                return;
-                            }
-                        }
-                        DirectTileCoopMatmulVariant::Tile128x512 => {
-                            if tile_ir_kernels::try_batched_coop_matmul::<tile_ir::F32, 128, 512, 16>(
-                                phase, &a, &b, &y, shape, &epilogues, max_wg_per_dim,
-                            ) {
-                                return;
-                            }
-                        }
-                        DirectTileCoopMatmulVariant::Tile128x256 => {
-                            if tile_ir_kernels::try_batched_coop_matmul::<tile_ir::F32, 128, 256, 16>(
-                                phase, &a, &b, &y, shape, &epilogues, max_wg_per_dim,
-                            ) {
-                                return;
-                            }
-                        }
-                        DirectTileCoopMatmulVariant::Tile128x64 => {
-                            if tile_ir_kernels::try_batched_coop_matmul::<tile_ir::F32, 128, 64, 16>(
-                                phase, &a, &b, &y, shape, &epilogues, max_wg_per_dim,
-                            ) {
-                                return;
-                            }
-                        }
-                        DirectTileCoopMatmulVariant::Tile64x128 => {
-                            if tile_ir_kernels::try_batched_coop_matmul::<tile_ir::F32, 64, 128, 16>(
-                                phase, &a, &b, &y, shape, &epilogues, max_wg_per_dim,
-                            ) {
-                                return;
-                            }
-                        }
-                        DirectTileCoopMatmulVariant::Tile64x64 => {
-                            if tile_ir_kernels::try_batched_coop_matmul::<tile_ir::F32, 64, 64, 16>(
-                                phase, &a, &b, &y, shape, &epilogues, max_wg_per_dim,
-                            ) {
-                                return;
-                            }
-                        }
-                        DirectTileCoopMatmulVariant::None => {}
-                    }
-                    match variant {
-                        DirectTileMatmulVariant::Gemv => {
-                            tile_ir_kernels::batched_gemv_with_epilogues::<tile_ir::F32, 4, 8, 128>(
-                                phase, &a, &b, &y, shape, &epilogues, max_wg_per_dim,
-                            )
-                        }
-                        DirectTileMatmulVariant::MatMul => {
-                            if use_shared_tile {
-                                tile_ir_kernels::batched_matmul_with_epilogues::<
+        let ir =
+            tile_ir::tile::build(move |phase| {
+                let epilogues = tile_ir_kernels::DenseMatmulEpilogues {
+                    pre_a: pre_a.as_ref(),
+                    pre_b: pre_b.as_ref(),
+                    post: post.as_ref(),
+                };
+                match datatype {
+                    DataTypeEnum::F32 => {
+                        let a = tile_storage_read_with_direct_layout_typed::<tile_ir::F32>(
+                            phase,
+                            a_view.clone(),
+                        );
+                        let b = tile_storage_read_with_direct_layout_typed::<tile_ir::F32>(
+                            phase,
+                            b_view.clone(),
+                        );
+                        let y = tile_storage_write_with_direct_layout_typed::<tile_ir::F32>(
+                            phase,
+                            y_view.clone(),
+                        );
+                        match coop_variant {
+                            DirectTileCoopMatmulVariant::Tile256x256 => {
+                                if tile_ir_kernels::try_batched_coop_matmul::<
                                     tile_ir::F32,
-                                    32,
-                                    32,
-                                    8,
+                                    256,
+                                    256,
+                                    16,
                                 >(
-                                    phase, &a, &b, &y, shape, &epilogues, max_wg_per_dim,
-                                )
-                            } else {
-                                tile_ir_kernels::batched_matmul_register_with_epilogues::<
+                                    phase, &a, &b, &y, shape, &epilogues, max_wg_per_dim
+                                ) {
+                                    return;
+                                }
+                            }
+                            DirectTileCoopMatmulVariant::Tile128x512 => {
+                                if tile_ir_kernels::try_batched_coop_matmul::<
                                     tile_ir::F32,
-                                    32,
-                                    32,
-                                    8,
+                                    128,
+                                    512,
+                                    16,
                                 >(
-                                    phase, &a, &b, &y, shape, &epilogues, max_wg_per_dim,
+                                    phase, &a, &b, &y, shape, &epilogues, max_wg_per_dim
+                                ) {
+                                    return;
+                                }
+                            }
+                            DirectTileCoopMatmulVariant::Tile128x256 => {
+                                if tile_ir_kernels::try_batched_coop_matmul::<
+                                    tile_ir::F32,
+                                    128,
+                                    256,
+                                    16,
+                                >(
+                                    phase, &a, &b, &y, shape, &epilogues, max_wg_per_dim
+                                ) {
+                                    return;
+                                }
+                            }
+                            DirectTileCoopMatmulVariant::Tile128x64 => {
+                                if tile_ir_kernels::try_batched_coop_matmul::<
+                                    tile_ir::F32,
+                                    128,
+                                    64,
+                                    16,
+                                >(
+                                    phase, &a, &b, &y, shape, &epilogues, max_wg_per_dim
+                                ) {
+                                    return;
+                                }
+                            }
+                            DirectTileCoopMatmulVariant::Tile64x128 => {
+                                if tile_ir_kernels::try_batched_coop_matmul::<
+                                    tile_ir::F32,
+                                    64,
+                                    128,
+                                    16,
+                                >(
+                                    phase, &a, &b, &y, shape, &epilogues, max_wg_per_dim
+                                ) {
+                                    return;
+                                }
+                            }
+                            DirectTileCoopMatmulVariant::Tile64x64 => {
+                                if tile_ir_kernels::try_batched_coop_matmul::<
+                                    tile_ir::F32,
+                                    64,
+                                    64,
+                                    16,
+                                >(
+                                    phase, &a, &b, &y, shape, &epilogues, max_wg_per_dim
+                                ) {
+                                    return;
+                                }
+                            }
+                            DirectTileCoopMatmulVariant::None => {}
+                        }
+                        match variant {
+                            DirectTileMatmulVariant::Gemv => {
+                                tile_ir_kernels::batched_gemv_with_epilogues::<
+                                    tile_ir::F32,
+                                    4,
+                                    8,
+                                    128,
+                                >(
+                                    phase, &a, &b, &y, shape, &epilogues, max_wg_per_dim
                                 )
                             }
+                            DirectTileMatmulVariant::MatMul => {
+                                if use_shared_tile {
+                                    tile_ir_kernels::batched_matmul_with_epilogues::<
+                                        tile_ir::F32,
+                                        32,
+                                        32,
+                                        8,
+                                    >(
+                                        phase, &a, &b, &y, shape, &epilogues, max_wg_per_dim
+                                    )
+                                } else {
+                                    tile_ir_kernels::batched_matmul_register_with_epilogues::<
+                                        tile_ir::F32,
+                                        32,
+                                        32,
+                                        8,
+                                    >(
+                                        phase, &a, &b, &y, shape, &epilogues, max_wg_per_dim
+                                    )
+                                }
+                            }
                         }
                     }
-                }
-                DataTypeEnum::F16 => {
-                    let a = tile_storage_read_with_direct_layout_typed::<tile_ir::F16>(
-                        phase,
-                        a_view.clone(),
-                    );
-                    let b = tile_storage_read_with_direct_layout_typed::<tile_ir::F16>(
-                        phase,
-                        b_view.clone(),
-                    );
-                    let y = tile_storage_write_with_direct_layout_typed::<tile_ir::F16>(
-                        phase,
-                        y_view.clone(),
-                    );
-                    match coop_variant {
-                        DirectTileCoopMatmulVariant::Tile256x256 => {
-                            if tile_ir_kernels::try_batched_coop_matmul::<tile_ir::F16, 256, 256, 16>(
-                                phase, &a, &b, &y, shape, &epilogues, max_wg_per_dim,
-                            ) {
-                                return;
-                            }
-                        }
-                        DirectTileCoopMatmulVariant::Tile128x512 => {
-                            if tile_ir_kernels::try_batched_coop_matmul::<tile_ir::F16, 128, 512, 16>(
-                                phase, &a, &b, &y, shape, &epilogues, max_wg_per_dim,
-                            ) {
-                                return;
-                            }
-                        }
-                        DirectTileCoopMatmulVariant::Tile128x256 => {
-                            if tile_ir_kernels::try_batched_coop_matmul::<tile_ir::F16, 128, 256, 16>(
-                                phase, &a, &b, &y, shape, &epilogues, max_wg_per_dim,
-                            ) {
-                                return;
-                            }
-                        }
-                        DirectTileCoopMatmulVariant::Tile128x64 => {
-                            if tile_ir_kernels::try_batched_coop_matmul::<tile_ir::F16, 128, 64, 16>(
-                                phase, &a, &b, &y, shape, &epilogues, max_wg_per_dim,
-                            ) {
-                                return;
-                            }
-                        }
-                        DirectTileCoopMatmulVariant::Tile64x128 => {
-                            if tile_ir_kernels::try_batched_coop_matmul::<tile_ir::F16, 64, 128, 16>(
-                                phase, &a, &b, &y, shape, &epilogues, max_wg_per_dim,
-                            ) {
-                                return;
-                            }
-                        }
-                        DirectTileCoopMatmulVariant::Tile64x64 => {
-                            if tile_ir_kernels::try_batched_coop_matmul::<tile_ir::F16, 64, 64, 16>(
-                                phase, &a, &b, &y, shape, &epilogues, max_wg_per_dim,
-                            ) {
-                                return;
-                            }
-                        }
-                        DirectTileCoopMatmulVariant::None => {}
-                    }
-                    match variant {
-                        DirectTileMatmulVariant::Gemv => {
-                            tile_ir_kernels::batched_gemv_with_epilogues::<tile_ir::F16, 4, 8, 128>(
-                                phase, &a, &b, &y, shape, &epilogues, max_wg_per_dim,
-                            )
-                        }
-                        DirectTileMatmulVariant::MatMul => {
-                            if use_shared_tile {
-                                tile_ir_kernels::batched_matmul_with_epilogues::<
+                    DataTypeEnum::F16 => {
+                        let a = tile_storage_read_with_direct_layout_typed::<tile_ir::F16>(
+                            phase,
+                            a_view.clone(),
+                        );
+                        let b = tile_storage_read_with_direct_layout_typed::<tile_ir::F16>(
+                            phase,
+                            b_view.clone(),
+                        );
+                        let y = tile_storage_write_with_direct_layout_typed::<tile_ir::F16>(
+                            phase,
+                            y_view.clone(),
+                        );
+                        match coop_variant {
+                            DirectTileCoopMatmulVariant::Tile256x256 => {
+                                if tile_ir_kernels::try_batched_coop_matmul::<
                                     tile_ir::F16,
-                                    32,
-                                    32,
-                                    8,
+                                    256,
+                                    256,
+                                    16,
                                 >(
-                                    phase, &a, &b, &y, shape, &epilogues, max_wg_per_dim,
-                                )
-                            } else {
-                                tile_ir_kernels::batched_matmul_register_with_epilogues::<
+                                    phase, &a, &b, &y, shape, &epilogues, max_wg_per_dim
+                                ) {
+                                    return;
+                                }
+                            }
+                            DirectTileCoopMatmulVariant::Tile128x512 => {
+                                if tile_ir_kernels::try_batched_coop_matmul::<
                                     tile_ir::F16,
-                                    32,
-                                    32,
-                                    8,
+                                    128,
+                                    512,
+                                    16,
                                 >(
-                                    phase, &a, &b, &y, shape, &epilogues, max_wg_per_dim,
+                                    phase, &a, &b, &y, shape, &epilogues, max_wg_per_dim
+                                ) {
+                                    return;
+                                }
+                            }
+                            DirectTileCoopMatmulVariant::Tile128x256 => {
+                                if tile_ir_kernels::try_batched_coop_matmul::<
+                                    tile_ir::F16,
+                                    128,
+                                    256,
+                                    16,
+                                >(
+                                    phase, &a, &b, &y, shape, &epilogues, max_wg_per_dim
+                                ) {
+                                    return;
+                                }
+                            }
+                            DirectTileCoopMatmulVariant::Tile128x64 => {
+                                if tile_ir_kernels::try_batched_coop_matmul::<
+                                    tile_ir::F16,
+                                    128,
+                                    64,
+                                    16,
+                                >(
+                                    phase, &a, &b, &y, shape, &epilogues, max_wg_per_dim
+                                ) {
+                                    return;
+                                }
+                            }
+                            DirectTileCoopMatmulVariant::Tile64x128 => {
+                                if tile_ir_kernels::try_batched_coop_matmul::<
+                                    tile_ir::F16,
+                                    64,
+                                    128,
+                                    16,
+                                >(
+                                    phase, &a, &b, &y, shape, &epilogues, max_wg_per_dim
+                                ) {
+                                    return;
+                                }
+                            }
+                            DirectTileCoopMatmulVariant::Tile64x64 => {
+                                if tile_ir_kernels::try_batched_coop_matmul::<
+                                    tile_ir::F16,
+                                    64,
+                                    64,
+                                    16,
+                                >(
+                                    phase, &a, &b, &y, shape, &epilogues, max_wg_per_dim
+                                ) {
+                                    return;
+                                }
+                            }
+                            DirectTileCoopMatmulVariant::None => {}
+                        }
+                        match variant {
+                            DirectTileMatmulVariant::Gemv => {
+                                tile_ir_kernels::batched_gemv_with_epilogues::<
+                                    tile_ir::F16,
+                                    4,
+                                    8,
+                                    128,
+                                >(
+                                    phase, &a, &b, &y, shape, &epilogues, max_wg_per_dim
                                 )
+                            }
+                            DirectTileMatmulVariant::MatMul => {
+                                if use_shared_tile {
+                                    tile_ir_kernels::batched_matmul_with_epilogues::<
+                                        tile_ir::F16,
+                                        32,
+                                        32,
+                                        8,
+                                    >(
+                                        phase, &a, &b, &y, shape, &epilogues, max_wg_per_dim
+                                    )
+                                } else {
+                                    tile_ir_kernels::batched_matmul_register_with_epilogues::<
+                                        tile_ir::F16,
+                                        32,
+                                        32,
+                                        8,
+                                    >(
+                                        phase, &a, &b, &y, shape, &epilogues, max_wg_per_dim
+                                    )
+                                }
                             }
                         }
                     }
+                    _ => unreachable!("direct tile matmul only supports f32/f16"),
                 }
-                _ => unreachable!("direct tile matmul only supports f32/f16"),
-            }
-        });
+            });
         let dispatch_size = ir.body().grid;
         if dispatch_size.iter().any(|dim| *dim > max_wg_per_dim) {
             return None;

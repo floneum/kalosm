@@ -329,7 +329,8 @@ impl LazyTensorData {
         // splatting the identity at `new_shape` — the kernel would otherwise
         // panic on `iterations > 0` in `tile-ir/.../reduce.rs`.
         if input_shape.contains(&0) {
-            let data = TensorData::new_splat_scalar(&device, &new_shape, function.function.initial_value);
+            let data =
+                TensorData::new_splat_scalar(&device, &new_shape, function.function.initial_value);
             return Self::new(data);
         }
         info = TensorInfo::new(new_shape, info.datatype());
@@ -559,9 +560,7 @@ impl TensorData {
     /// Build a `tile-ir` tensor ref over this tensor's buffer with the
     /// kernel-side rank-1 linear storage layout (the kernel's `Meta` struct
     /// already encodes any offset/stride).
-    pub(crate) fn as_kernel_tensor_ref(
-        &self,
-    ) -> fusor_tile_ir::KernelTensorRef<Arc<wgpu::Buffer>> {
+    pub(crate) fn as_kernel_tensor_ref(&self) -> fusor_tile_ir::KernelTensorRef<Arc<wgpu::Buffer>> {
         fusor_tile_ir::KernelTensorRef::new(
             self.buffer.clone(),
             fusor_tile_ir_kernels::linear_storage_layout(),
