@@ -994,18 +994,26 @@ impl<D: DataType, const R: usize> Tensor<R, D> {
         {
             return None;
         }
-        let subgroup_size = device.min_subgroup_size();
         let q_shape = self.shape();
         let k_shape = k.shape();
-        // The streaming kernel assigns one hardware subgroup per output dim
-        // and tiles KV across the subgroup's lanes. When `kv_seq_len` is
-        // strictly less than the subgroup width, the lanes past the KV end
-        // sit on a NEG_MAX score and rely on `subgroup_reduce_*` to ignore
-        // them; that path miscompiles on at least one Windows backend
-        // (WARP / DX12) and drops the valid lanes' contributions with it.
-        // Route those (tiny) shapes through the composite mat_mul + softmax
-        // path which doesn't depend on subgroup semantics.
-        if (k_shape[2] as u32) < subgroup_size {
+        // The streaming and decode_small flash-attention kernels both
+        // miscompile on at least one Windows wgpu backend (WARP / DX12)
+        // when the input is small: the conformance regression at
+        // `flash_attention_matches_cpu_reference_on_varied_shapes`
+        // deterministically reports `actual=-0.34986264 expected=-0.5393032`,
+        // which corresponds to a `subgroup_reduce_sum` that drops the
+        // contributions from valid lanes past lane 0. The streaming kernel
+        // pads lanes-past-`kv_seq_len` with NEG_MAX and `decode_small`
+        // pads with zero, and both rely on the reduction to ignore them;
+        // the Windows shader compiler does not.
+        //
+        // Route any small-`kv_seq_len` shape through the composite
+        // `mat_mul + softmax` path which has no subgroup dependence. 32 is
+        // a safe threshold (the largest hardware subgroup the streaming
+        // kernel monomorphises against) — production-sized attention has
+        // `kv_seq_len` well above that and still gets the fast path.
+        const MIN_DIRECT_KV_SEQ: usize = 32;
+        if k_shape[2] < MIN_DIRECT_KV_SEQ {
             return None;
         }
         let v_shape = v.shape();
