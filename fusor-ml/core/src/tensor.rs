@@ -994,8 +994,20 @@ impl<D: DataType, const R: usize> Tensor<R, D> {
         {
             return None;
         }
+        let subgroup_size = device.min_subgroup_size();
         let q_shape = self.shape();
         let k_shape = k.shape();
+        // The streaming kernel assigns one hardware subgroup per output dim
+        // and tiles KV across the subgroup's lanes. When `kv_seq_len` is
+        // strictly less than the subgroup width, the lanes past the KV end
+        // sit on a NEG_MAX score and rely on `subgroup_reduce_*` to ignore
+        // them; that path miscompiles on at least one Windows backend
+        // (WARP / DX12) and drops the valid lanes' contributions with it.
+        // Route those (tiny) shapes through the composite mat_mul + softmax
+        // path which doesn't depend on subgroup semantics.
+        if (k_shape[2] as u32) < subgroup_size {
+            return None;
+        }
         let v_shape = v.shape();
         if q_shape[0] != k_shape[0]
             || q_shape[0] != v_shape[0]
