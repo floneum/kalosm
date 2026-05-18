@@ -378,7 +378,17 @@ impl MatMulOperation {
         }
         let shape = tile_ir_kernels::DenseMatmulShape { batch, m, k, n };
 
-        let variant = select_direct_tile_matmul_variant(m, k, n);
+        // The Gemv variant and the shared-tile MatMul variant both reduce
+        // through the hardware subgroup; on adapters without
+        // `Features::SUBGROUP` (Mesa lavapipe in Linux CI) those shaders
+        // fail validation. Route to the register-tiled MatMul kernel
+        // instead — it only uses workgroup-local lanes and works
+        // everywhere.
+        let variant = if device.subgroups_supported() {
+            select_direct_tile_matmul_variant(m, k, n)
+        } else {
+            DirectTileMatmulVariant::MatMul
+        };
         let pre_a = self.pre_element_wise[0]
             .functions
             .is_empty()
@@ -440,7 +450,14 @@ impl MatMulOperation {
         } else {
             DirectTileCoopMatmulVariant::None
         };
-        let use_shared_tile = m.is_multiple_of(32) && n.is_multiple_of(32) && k.is_multiple_of(8);
+        // The shared-tile (workgroup-staged) matmul partitions output rows
+        // across subgroups; without subgroup support it would emit invalid
+        // shaders. The register-tiled fallback handles any shape and only
+        // uses workgroup-local lanes.
+        let use_shared_tile = device.subgroups_supported()
+            && m.is_multiple_of(32)
+            && n.is_multiple_of(32)
+            && k.is_multiple_of(8);
         let max_wg_per_dim = device.limits().max_compute_workgroups_per_dimension;
         let datatype = self.datatype;
         let ir =
