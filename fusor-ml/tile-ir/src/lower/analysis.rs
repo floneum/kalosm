@@ -232,11 +232,16 @@ impl<'a> Lowerer<'a> {
     }
 
     fn tile_stmt_uses_cooperative_matrix(stmt: &TileStmt) -> bool {
+        // `CopyToWorkgroupTile` is plain workgroup-memory staging — it only
+        // uses `LocalInvocationIndex`. The real cooperative-matrix signal is
+        // a load/store/MMA against an accumulator. Counting the workgroup
+        // copy here would force SUBGROUP/COOPERATIVE_MATRIX capabilities on
+        // workgroup-only kernels like `qmatmul_workgroup`, breaking adapters
+        // (Mesa lavapipe in Linux CI) without `Features::SUBGROUP`.
         Self::tile_stmt_tree_any(stmt, &mut |s| {
             matches!(
                 s,
                 TileStmt::ZeroCoopAcc { .. }
-                    | TileStmt::CopyToWorkgroupTile { .. }
                     | TileStmt::LoadCoop { .. }
                     | TileStmt::Mma { .. }
                     | TileStmt::StoreCoopAcc { .. }
