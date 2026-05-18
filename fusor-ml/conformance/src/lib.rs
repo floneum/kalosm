@@ -31,10 +31,24 @@ fn require_gpu() -> bool {
 }
 
 /// Return all available devices: always CPU, plus GPU if available.
+///
+/// `FUSOR_CONFORMANCE_REQUIRE_GPU=1` asserts that a GPU adapter is reachable
+/// at all (catches misconfigured CI), but the GPU is only included for
+/// kernel-running tests when the adapter also exposes
+/// `wgpu::Features::SUBGROUP`. The matmul, reduce, and flash-attention
+/// kernels all emit `subgroup_*` ops, so adapters without that feature
+/// (Mesa lavapipe in Linux CI) hit shader-validation errors and would
+/// otherwise force every conformance test to skip the GPU branch with a
+/// panic.
 pub async fn available_devices() -> Vec<Device> {
     let mut devs = vec![Device::Cpu];
     match Device::gpu().await {
-        Ok(gpu) => devs.push(gpu),
+        Ok(Device::Gpu(gpu)) => {
+            if gpu.subgroups_supported() {
+                devs.push(Device::Gpu(gpu));
+            }
+        }
+        Ok(_) => {}
         Err(err) => {
             assert!(
                 !require_gpu(),

@@ -97,9 +97,21 @@ fn matmul(c: &mut Criterion) {
 }
 
 fn bench_candle_with_device(candle_device: candle_core::Device, name: &str, c: &mut Criterion) {
+    // Cap the comparison footprint so the macOS GitHub runner doesn't
+    // SIGKILL the bench. Each iteration holds two host vectors, two GPU
+    // tensors, and the output, so a 4096x4096 square alone is ~256 MB —
+    // criterion's warmup + sample loop ramps that to several GB and the
+    // 7 GB runner OOMs.
+    const CANDLE_MAX_FOOTPRINT_ELEMENTS: usize = 1024 * 1024 * 4; // 16 MB f32 per tensor
     let mut group = c.benchmark_group(name);
     let group = group.sample_size(20);
     for [m, k, n] in SIZES {
+        if m * k > CANDLE_MAX_FOOTPRINT_ELEMENTS
+            || k * n > CANDLE_MAX_FOOTPRINT_ELEMENTS
+            || m * n > CANDLE_MAX_FOOTPRINT_ELEMENTS
+        {
+            continue;
+        }
         let candle_device = candle_device.clone();
         group.bench_with_input(
             BenchmarkId::new(name, format!("{m}x{k} by {k}x{n}")),
