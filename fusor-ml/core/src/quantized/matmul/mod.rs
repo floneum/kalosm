@@ -599,24 +599,40 @@ impl QMatMulOperation {
         let mut qmatmul_workgroups_x = 1;
         let y_supports_coop = tile_cooperative_store_layout_supported(&y_view.layout);
         let variant = select_qmatmul_direct_variant(format, m, k, n, y_supports_coop, caps);
-        let fast_dispatch_size = match variant {
-            QMatmulDirectVariant::Q5SmallSingleRow | QMatmulDirectVariant::SingleRow => {
-                let qgemv_cols_per_workgroup = qgemv_cols_per_workgroup_for_direct(format, k, n);
-                let qgemv_workgroups = n.div_ceil(qgemv_cols_per_workgroup);
-                let [dispatch_x, _] = split_workgroups_2d(qgemv_workgroups, max_workgroups)?;
-                qmatmul_workgroups_x = dispatch_x;
-                Some([
-                    qmatmul_workgroups_x,
-                    qgemv_workgroups.div_ceil(qmatmul_workgroups_x),
-                    1,
-                ])
+        // Every existing variant relies on subgroup ops (qgemv uses
+        // subgroup_reduce_sum, qmatmul shared-tile uses subgroup_id, coop
+        // tiles need the cooperative-matrix extension which itself needs
+        // subgroups). Adapters without `Features::SUBGROUP` (Mesa lavapipe
+        // in Linux CI) hit shader-validation errors on every one of those.
+        // Route through the workgroup-tiled qmatmul/qgemv variants in that
+        // case — same staging strategy as dense `batched_matmul_with_epilogues`,
+        // pure workgroup-memory reductions, no subgroup intrinsics.
+        let use_workgroup_qmatmul = !caps.subgroups_supported;
+        let fast_dispatch_size = if use_workgroup_qmatmul {
+            // The workgroup-tiled kernel computes its own grid inside
+            // `tile::build`; skip the pre-built-pipeline fast path.
+            None
+        } else {
+            match variant {
+                QMatmulDirectVariant::Q5SmallSingleRow | QMatmulDirectVariant::SingleRow => {
+                    let qgemv_cols_per_workgroup =
+                        qgemv_cols_per_workgroup_for_direct(format, k, n);
+                    let qgemv_workgroups = n.div_ceil(qgemv_cols_per_workgroup);
+                    let [dispatch_x, _] = split_workgroups_2d(qgemv_workgroups, max_workgroups)?;
+                    qmatmul_workgroups_x = dispatch_x;
+                    Some([
+                        qmatmul_workgroups_x,
+                        qgemv_workgroups.div_ceil(qmatmul_workgroups_x),
+                        1,
+                    ])
+                }
+                QMatmulDirectVariant::Q8Wide64x128 => Some([n / 128, m / 64, 1]),
+                QMatmulDirectVariant::Tile128x128 => Some([n / 128, m / 128, 1]),
+                QMatmulDirectVariant::Tile128x64 => Some([n / 64, m / 128, 1]),
+                QMatmulDirectVariant::Tile64x128 => Some([n / 128, m / 64, 1]),
+                QMatmulDirectVariant::Tile64x64Cached => Some([n / 64, m / 64, 1]),
+                QMatmulDirectVariant::Tile64x64 => None,
             }
-            QMatmulDirectVariant::Q8Wide64x128 => Some([n / 128, m / 64, 1]),
-            QMatmulDirectVariant::Tile128x128 => Some([n / 128, m / 128, 1]),
-            QMatmulDirectVariant::Tile128x64 => Some([n / 64, m / 128, 1]),
-            QMatmulDirectVariant::Tile64x128 => Some([n / 128, m / 64, 1]),
-            QMatmulDirectVariant::Tile64x64Cached => Some([n / 64, m / 64, 1]),
-            QMatmulDirectVariant::Tile64x64 => None,
         };
         let kernel_name = kernel_name.into();
         // The pre-built-pipeline fast path can only be reused when there's no
@@ -691,6 +707,28 @@ impl QMatMulOperation {
                 pre: pre_for_ir.as_ref(),
                 post: post_for_ir.as_ref(),
             };
+            if use_workgroup_qmatmul {
+                if m == 1 {
+                    tile_ir_kernels::qgemv_workgroup_with_epilogue::<64, 8>(
+                        phase,
+                        &a,
+                        &b,
+                        &y,
+                        &epilogues,
+                        max_workgroups,
+                    );
+                } else {
+                    tile_ir_kernels::qmatmul_workgroup_with_epilogues::<32, 32, 8>(
+                        phase,
+                        &a,
+                        &b,
+                        &y,
+                        &epilogues,
+                        max_workgroups,
+                    );
+                }
+                return;
+            }
             match variant {
                 QMatmulDirectVariant::Q5SmallSingleRow => {
                     tile_ir_kernels::qgemv_with_epilogue::<8, 32>(

@@ -5,9 +5,10 @@ use fusor_tile_ir::{
 use fusor_tile_ir_kernels::{
     batched_gemv_with_epilogues, batched_matmul_with_epilogues, flash_attention,
     linear_storage_layout, qdequantize, qgemv_q4k_paired, qgemv_with_epilogue,
-    qmatmul_with_epilogue, quantized_matrix, rms_norm_vec4, try_batched_coop_matmul,
-    DenseMatmulEpilogues, DenseMatmulShape, FlashAttentionDims, FlashAttentionMeta, PairedEpilogue,
-    Q4KPairedGgml, QmatmulEpilogues, RmsNormVec4, RmsNormVec4Meta, TensorMeta, UnaryEpilogue,
+    qgemv_workgroup_with_epilogue, qmatmul_with_epilogue, qmatmul_workgroup_with_epilogues,
+    quantized_matrix, rms_norm_vec4, try_batched_coop_matmul, DenseMatmulEpilogues,
+    DenseMatmulShape, FlashAttentionDims, FlashAttentionMeta, PairedEpilogue, Q4KPairedGgml,
+    QmatmulEpilogues, RmsNormVec4, RmsNormVec4Meta, TensorMeta, UnaryEpilogue,
 };
 
 fn lower_or_fail(ir: &fusor_tile_ir::KernelIr, label: &str) -> NagaKernel {
@@ -420,6 +421,70 @@ fn module_uses_tanh(module: &naga::Module) -> bool {
             )
         })
     })
+}
+
+#[test]
+fn workgroup_qmatmul_lowers_without_subgroups() {
+    let ir = tile::build(|program| {
+        let a = program.storage_read::<F32, 2>(Shape::new([32, 256]));
+        let b = quantized_matrix(program, GgmlQuantFormat::Q8_0, 256, 32);
+        let y = program.storage_write::<F32, 2>(Shape::new([32, 32]));
+        qmatmul_workgroup_with_epilogues::<32, 32, 8>(
+            program,
+            &a,
+            &b,
+            &y,
+            &QmatmulEpilogues::empty(),
+            65_535,
+        );
+    });
+    let lowered = lower_or_fail(&ir, "workgroup qmatmul");
+    assert!(
+        !module_uses_subgroup(lowered.module()),
+        "workgroup qmatmul emitted subgroup ops"
+    );
+}
+
+#[test]
+fn workgroup_qgemv_lowers_without_subgroups() {
+    let ir = tile::build(|program| {
+        let a = program.storage_read::<F32, 2>(Shape::new([1, 256]));
+        let b = quantized_matrix(program, GgmlQuantFormat::Q4K, 256, 128);
+        let y = program.storage_write::<F32, 2>(Shape::new([1, 128]));
+        qgemv_workgroup_with_epilogue::<64, 8>(
+            program,
+            &a,
+            &b,
+            &y,
+            &QmatmulEpilogues::empty(),
+            65_535,
+        );
+    });
+    let lowered = lower_or_fail(&ir, "workgroup qgemv");
+    assert!(
+        !module_uses_subgroup(lowered.module()),
+        "workgroup qgemv emitted subgroup ops"
+    );
+}
+
+fn module_uses_subgroup(module: &naga::Module) -> bool {
+    let uses_in = |expressions: &naga::Arena<naga::Expression>| {
+        expressions.iter().any(|(_, expr)| {
+            matches!(
+                expr,
+                naga::Expression::SubgroupOperationResult { .. }
+                    | naga::Expression::SubgroupBallotResult
+            )
+        })
+    };
+    module
+        .functions
+        .iter()
+        .any(|(_, f)| uses_in(&f.expressions))
+        || module
+            .entry_points
+            .iter()
+            .any(|entry| uses_in(&entry.function.expressions))
 }
 
 #[test]
