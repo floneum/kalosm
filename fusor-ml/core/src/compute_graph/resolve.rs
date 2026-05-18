@@ -1740,6 +1740,16 @@ impl Resolver {
         graph: &mut ComputeGraphInner,
         node_idx: ExecutionNodeIndex,
     ) -> bool {
+        // The paired-mode QMatMul kernel emitted by this rewrite uses
+        // `subgroup_id` / `subgroup_reduce_*` and has no workgroup-only
+        // fallback. The resolver later panics if `build_direct_kernel`
+        // returns None for any operation it scheduled, so refuse the
+        // rewrite up-front on adapters without `Features::SUBGROUP` (Mesa
+        // lavapipe in Linux CI). The unfused source still resolves via
+        // the regular qmatmul + epilogue kernels.
+        if !graph.device().subgroups_supported() {
+            return false;
+        }
         let trace = std::env::var_os("FUSOR_TRACE_PAIRED_FUSE").is_some();
         let ComputeGraphNodeVariant::Nary(nary) = self.execution_graph[node_idx].variant.clone()
         else {
