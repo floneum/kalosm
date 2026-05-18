@@ -450,14 +450,7 @@ impl MatMulOperation {
         } else {
             DirectTileCoopMatmulVariant::None
         };
-        // The shared-tile (workgroup-staged) matmul partitions output rows
-        // across subgroups; without subgroup support it would emit invalid
-        // shaders. The register-tiled fallback handles any shape and only
-        // uses workgroup-local lanes.
-        let use_shared_tile = device.subgroups_supported()
-            && m.is_multiple_of(32)
-            && n.is_multiple_of(32)
-            && k.is_multiple_of(8);
+        let use_shared_tile = m.is_multiple_of(32) && n.is_multiple_of(32) && k.is_multiple_of(8);
         let max_wg_per_dim = device.limits().max_compute_workgroups_per_dimension;
         let datatype = self.datatype;
         let ir =
