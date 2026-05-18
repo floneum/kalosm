@@ -1247,6 +1247,15 @@ impl QMatMulOperation {
         if matrix.datatype() != GgmlType::Q4K {
             return None;
         }
+        // `qgemv_q4k_paired` emits `subgroup_id` / `subgroup_reduce_*` ops
+        // with no workgroup-only fallback yet, so adapters without
+        // `Features::SUBGROUP` (Mesa lavapipe in Linux CI) trip shader
+        // validation. Bail out so the operation falls back to its
+        // unfused compute graph, which routes the underlying qmatmul
+        // through the workgroup-tiled kernel.
+        if !graph.device().subgroups_supported() {
+            return None;
+        }
         let format = tile_ir::GgmlQuantFormat::Q4K;
         let a_view = flatten_matrix_layout(input.layout())?;
         let y_view = flatten_matrix_layout(output.layout())?;
