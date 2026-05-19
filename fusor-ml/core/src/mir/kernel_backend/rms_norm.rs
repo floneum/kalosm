@@ -26,7 +26,15 @@ use fusor_tile_ir_kernels as tile_ir_kernels;
 use rustc_hash::FxHashMap;
 use rustc_hash::FxHasher;
 
-const BLOCK: usize = 1024;
+// 512 instead of 1024 because Windows wgpu (DX12 / WARP) caps
+// `max_compute_invocations_per_workgroup` at 768, so a 1024-wide
+// workgroup fails pipeline creation on those adapters with
+// `Shader entry point's workgroup size [1024, 1, 1] must be less or
+// equal to the per-dimension limit […] and the total invocation limit
+// […] of 768`. 512 fits every backend wgpu supports (the cooperative
+// matmul also uses 512 for the same reason) and is still wide enough
+// to feed a 128-block subgroup-reduce on Apple Silicon / NVIDIA.
+const BLOCK: usize = 512;
 const RMS_NORM_MODULE_CACHE_SIZE: usize = 128;
 
 fn rms_norm_module_cache() -> &'static kernel_backend::ModuleCache {
