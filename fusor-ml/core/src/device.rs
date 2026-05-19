@@ -271,6 +271,18 @@ impl Device {
             .contains(wgpu::Features::EXPERIMENTAL_COOPERATIVE_MATRIX)
     }
 
+    /// True when the adapter is a software/emulated GPU (Mesa lavapipe,
+    /// Microsoft WARP, etc.) rather than a real hardware compute device.
+    /// Subgroup operations on these adapters are either unsupported or
+    /// emulated buggily on the wgpu Windows-DX12 backend, so kernel
+    /// selection needs to route around the subgroup-only fast paths.
+    pub fn is_software_adapter(&self) -> bool {
+        matches!(
+            self.inner.adapter.get_info().device_type,
+            wgpu::DeviceType::Cpu
+        )
+    }
+
     pub fn wgpu_adapter(&self) -> &wgpu::Adapter {
         &self.inner.adapter
     }

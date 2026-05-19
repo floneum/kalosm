@@ -56,6 +56,12 @@ pub struct KernelDeviceCaps {
     pub max_compute_workgroup_storage_size: u32,
     pub max_compute_workgroup_size_x: u32,
     pub max_compute_workgroups_per_dimension: u32,
+    /// True when the adapter is a software/emulated GPU (Mesa lavapipe,
+    /// Microsoft WARP). Subgroup operations on these adapters are
+    /// emulated and miscompile under the wgpu Windows-DX12 backend, so
+    /// kernels with a workgroup-only fallback should prefer it here even
+    /// when `subgroups_supported` reports true.
+    pub software_adapter: bool,
 }
 
 impl KernelDeviceCaps {
@@ -70,6 +76,7 @@ impl KernelDeviceCaps {
             max_compute_workgroup_storage_size: limits.max_compute_workgroup_storage_size,
             max_compute_workgroup_size_x: limits.max_compute_workgroup_size_x,
             max_compute_workgroups_per_dimension: limits.max_compute_workgroups_per_dimension,
+            software_adapter: device.is_software_adapter(),
         }
     }
 
@@ -87,6 +94,7 @@ impl KernelDeviceCaps {
             max_compute_workgroup_storage_size: 64 * 1024,
             max_compute_workgroup_size_x: 1024,
             max_compute_workgroups_per_dimension: 65_535,
+            software_adapter: false,
         }
     }
 }

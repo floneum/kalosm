@@ -352,6 +352,7 @@ fn select_qgemv_cols_variant(format: tile_ir::GgmlQuantFormat, k: u32, n: u32) -
                 max_compute_workgroup_storage_size: 0,
                 max_compute_workgroup_size_x: 0,
                 max_compute_workgroups_per_dimension: 0,
+                software_adapter: false,
             },
         )
         .expect("qgemv column selector has a catch-all rule")
@@ -607,7 +608,14 @@ impl QMatMulOperation {
         // Route through the workgroup-tiled qmatmul/qgemv variants in that
         // case — same staging strategy as dense `batched_matmul_with_epilogues`,
         // pure workgroup-memory reductions, no subgroup intrinsics.
-        let use_workgroup_qmatmul = !caps.subgroups_supported;
+        //
+        // Software adapters (Microsoft WARP on Windows CI) advertise
+        // `Features::SUBGROUP` but the DX12-backed emulation of
+        // `subgroup_reduce_sum` miscompiles for our qmatmul shaders —
+        // the Windows conformance run reports `actual=0.085 expected=-2.52`
+        // and similarly-large mismatches on every quantized matmul case.
+        // Force the workgroup-tiled fallback on those adapters too.
+        let use_workgroup_qmatmul = !caps.subgroups_supported || caps.software_adapter;
         let fast_dispatch_size = if use_workgroup_qmatmul {
             // The workgroup-tiled kernel computes its own grid inside
             // `tile::build`; skip the pre-built-pipeline fast path.
@@ -1250,10 +1258,13 @@ impl QMatMulOperation {
         // `qgemv_q4k_paired` emits `subgroup_id` / `subgroup_reduce_*` ops
         // with no workgroup-only fallback yet, so adapters without
         // `Features::SUBGROUP` (Mesa lavapipe in Linux CI) trip shader
-        // validation. Bail out so the operation falls back to its
+        // validation. Software adapters (Microsoft WARP on Windows CI)
+        // pass validation but miscompile the DX12 subgroup-reduce
+        // emulation. In both cases bail so the operation falls back to its
         // unfused compute graph, which routes the underlying qmatmul
         // through the workgroup-tiled kernel.
-        if !graph.device().subgroups_supported() {
+        let device = graph.device();
+        if !device.subgroups_supported() || device.is_software_adapter() {
             return None;
         }
         let format = tile_ir::GgmlQuantFormat::Q4K;

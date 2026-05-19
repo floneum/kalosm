@@ -243,6 +243,7 @@ fn select_direct_tile_matmul_variant(m: u32, k: u32, n: u32) -> DirectTileMatmul
                 max_compute_workgroup_storage_size: 0,
                 max_compute_workgroup_size_x: 0,
                 max_compute_workgroups_per_dimension: 0,
+                software_adapter: false,
             },
         )
         .expect("direct tile matmul selector has a catch-all rule")
@@ -383,8 +384,10 @@ impl MatMulOperation {
         // `Features::SUBGROUP` (Mesa lavapipe in Linux CI) those shaders
         // fail validation. Route to the register-tiled MatMul kernel
         // instead — it only uses workgroup-local lanes and works
-        // everywhere.
-        let variant = if device.subgroups_supported() {
+        // everywhere. Software adapters (Microsoft WARP on Windows CI)
+        // advertise `Features::SUBGROUP` but miscompile the DX12
+        // subgroup-reduce emulation, so treat them the same way.
+        let variant = if device.subgroups_supported() && !device.is_software_adapter() {
             select_direct_tile_matmul_variant(m, k, n)
         } else {
             DirectTileMatmulVariant::MatMul
@@ -438,6 +441,7 @@ impl MatMulOperation {
         let use_coop = matches!(self.parameters, MatMulParams::CoopMatMul(_))
             && device.cooperative_matrix_supported()
             && device.subgroups_supported()
+            && !device.is_software_adapter()
             && device.max_subgroup_size() >= 32
             && device.min_subgroup_size() <= 32;
         let coop_variant = if use_coop {
@@ -963,6 +967,7 @@ mod selection_tests {
             max_compute_workgroup_storage_size: 0,
             max_compute_workgroup_size_x: 0,
             max_compute_workgroups_per_dimension: 0,
+            software_adapter: false,
         };
         let mut rng = DeterministicShapeRng::default();
 

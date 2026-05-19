@@ -1745,9 +1745,11 @@ impl Resolver {
         // fallback. The resolver later panics if `build_direct_kernel`
         // returns None for any operation it scheduled, so refuse the
         // rewrite up-front on adapters without `Features::SUBGROUP` (Mesa
-        // lavapipe in Linux CI). The unfused source still resolves via
-        // the regular qmatmul + epilogue kernels.
-        if !graph.device().subgroups_supported() {
+        // lavapipe in Linux CI) and on software adapters that emulate them
+        // buggily (Microsoft WARP on Windows CI). The unfused source still
+        // resolves via the regular qmatmul + epilogue kernels.
+        let device = graph.device();
+        if !device.subgroups_supported() || device.is_software_adapter() {
             return false;
         }
         let trace = std::env::var_os("FUSOR_TRACE_PAIRED_FUSE").is_some();
