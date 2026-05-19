@@ -994,26 +994,36 @@ impl<D: DataType, const R: usize> Tensor<R, D> {
         {
             return None;
         }
+        let subgroup_size = device.min_subgroup_size();
         let q_shape = self.shape();
         let k_shape = k.shape();
-        // The streaming and decode_small flash-attention kernels both
-        // miscompile on at least one Windows wgpu backend (WARP / DX12)
-        // when the input is small: the conformance regression at
-        // `flash_attention_matches_cpu_reference_on_varied_shapes`
-        // deterministically reports `actual=-0.34986264 expected=-0.5393032`,
-        // which corresponds to a `subgroup_reduce_sum` that drops the
-        // contributions from valid lanes past lane 0. The streaming kernel
-        // pads lanes-past-`kv_seq_len` with NEG_MAX and `decode_small`
-        // pads with zero, and both rely on the reduction to ignore them;
-        // the Windows shader compiler does not.
+        // Both flash-attention kernel families pad lanes past `kv_seq_len`
+        // and rely on the reduction step to ignore that padding. On at
+        // least one Windows wgpu backend (WARP / DX12) the reduction
+        // miscompiles when most of the lanes carry the pad value, dropping
+        // contributions from real lanes alongside the padding — the
+        // deterministic `actual=-0.34986264 expected=-0.5393032` regression
+        // at `flash_attention_matches_cpu_reference_on_varied_shapes`. Two
+        // separate guards, because the two kernels have different pad
+        // widths:
         //
-        // Route any small-`kv_seq_len` shape through the composite
-        // `mat_mul + softmax` path which has no subgroup dependence. 32 is
-        // a safe threshold (the largest hardware subgroup the streaming
-        // kernel monomorphises against) — production-sized attention has
-        // `kv_seq_len` well above that and still gets the fast path.
-        const MIN_DIRECT_KV_SEQ: usize = 32;
-        if k_shape[2] < MIN_DIRECT_KV_SEQ {
+        // 1. Streaming kernel pads lanes past `kv_seq_len` within each
+        //    hardware subgroup chunk with `NEG_MAX_F32`, so it only goes
+        //    wrong when `kv_seq_len < subgroup_size`.
+        // 2. Decode-small kernel always runs a 128-wide workgroup and
+        //    pads the unused tail with zero, so it goes wrong whenever
+        //    `kv_seq_len` is meaningfully shorter than that block — i.e.
+        //    on the typical `kv_seq_len < 32` shapes the conformance
+        //    suite exercises.
+        if k_shape[2] < subgroup_size as usize {
+            return None;
+        }
+        const MIN_DECODE_KV_SEQ: usize = 32;
+        let is_decode_candidate = q_shape[2] == 1
+            && q_shape[3] == 128
+            && mask.is_none()
+            && D::DATA_TYPE == DataTypeEnum::F32;
+        if is_decode_candidate && k_shape[2] < MIN_DECODE_KV_SEQ {
             return None;
         }
         let v_shape = v.shape();
