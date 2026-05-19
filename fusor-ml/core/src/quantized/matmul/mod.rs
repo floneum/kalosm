@@ -770,27 +770,57 @@ impl QMatMulOperation {
                 }
                 QMatmulDirectVariant::Q8Wide64x128 | QMatmulDirectVariant::Tile64x128 => {
                     tile_ir_kernels::qmatmul_with_epilogue_caps::<64, 128, 32>(
-                        phase, &a, &b, &y, 4, &epilogues, qmatmul_caps,
+                        phase,
+                        &a,
+                        &b,
+                        &y,
+                        4,
+                        &epilogues,
+                        qmatmul_caps,
                     );
                 }
                 QMatmulDirectVariant::Tile128x128 => {
                     tile_ir_kernels::qmatmul_with_epilogue_caps::<128, 128, 32>(
-                        phase, &a, &b, &y, 4, &epilogues, qmatmul_caps,
+                        phase,
+                        &a,
+                        &b,
+                        &y,
+                        4,
+                        &epilogues,
+                        qmatmul_caps,
                     );
                 }
                 QMatmulDirectVariant::Tile128x64 => {
                     tile_ir_kernels::qmatmul_with_epilogue_caps::<128, 64, 32>(
-                        phase, &a, &b, &y, 4, &epilogues, qmatmul_caps,
+                        phase,
+                        &a,
+                        &b,
+                        &y,
+                        4,
+                        &epilogues,
+                        qmatmul_caps,
                     );
                 }
                 QMatmulDirectVariant::Tile64x64Cached => {
                     tile_ir_kernels::qmatmul_with_epilogue_caps::<64, 64, 32>(
-                        phase, &a, &b, &y, 4, &epilogues, qmatmul_caps,
+                        phase,
+                        &a,
+                        &b,
+                        &y,
+                        4,
+                        &epilogues,
+                        qmatmul_caps,
                     );
                 }
                 QMatmulDirectVariant::Tile64x64 => {
                     tile_ir_kernels::qmatmul_with_epilogue_caps::<64, 64, 32>(
-                        phase, &a, &b, &y, 4, &epilogues, qmatmul_caps,
+                        phase,
+                        &a,
+                        &b,
+                        &y,
+                        4,
+                        &epilogues,
+                        qmatmul_caps,
                     );
                 }
             }
