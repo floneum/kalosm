@@ -707,6 +707,16 @@ impl QMatMulOperation {
         }
         let pre_for_ir = pre_epilogue.clone();
         let post_for_ir = post_epilogue.clone();
+        // The cooperative-matrix qmatmul fast path hardcodes a 32-lane
+        // subgroup partition; report the device's hardware subgroup width
+        // to the kernel so it skips the path on adapters that don't pin
+        // exactly 32 (Microsoft WARP / DX12: 4).
+        let qmatmul_caps = tile_ir_kernels::QmatmulHardwareCaps {
+            subgroup_size: (caps.subgroups_supported
+                && caps.min_subgroup_size == caps.max_subgroup_size
+                && caps.min_subgroup_size == 32)
+                .then_some(32),
+        };
         let ir = tile_ir::tile::build(move |phase| {
             let a = tile_storage_read_with_direct_layout(phase, a_view);
             let b = tile_ir_kernels::quantized_matrix(phase, format, k, n);
@@ -759,28 +769,28 @@ impl QMatMulOperation {
                     );
                 }
                 QMatmulDirectVariant::Q8Wide64x128 | QMatmulDirectVariant::Tile64x128 => {
-                    tile_ir_kernels::qmatmul_with_epilogue::<64, 128, 32>(
-                        phase, &a, &b, &y, 4, &epilogues,
+                    tile_ir_kernels::qmatmul_with_epilogue_caps::<64, 128, 32>(
+                        phase, &a, &b, &y, 4, &epilogues, qmatmul_caps,
                     );
                 }
                 QMatmulDirectVariant::Tile128x128 => {
-                    tile_ir_kernels::qmatmul_with_epilogue::<128, 128, 32>(
-                        phase, &a, &b, &y, 4, &epilogues,
+                    tile_ir_kernels::qmatmul_with_epilogue_caps::<128, 128, 32>(
+                        phase, &a, &b, &y, 4, &epilogues, qmatmul_caps,
                     );
                 }
                 QMatmulDirectVariant::Tile128x64 => {
-                    tile_ir_kernels::qmatmul_with_epilogue::<128, 64, 32>(
-                        phase, &a, &b, &y, 4, &epilogues,
+                    tile_ir_kernels::qmatmul_with_epilogue_caps::<128, 64, 32>(
+                        phase, &a, &b, &y, 4, &epilogues, qmatmul_caps,
                     );
                 }
                 QMatmulDirectVariant::Tile64x64Cached => {
-                    tile_ir_kernels::qmatmul_with_epilogue::<64, 64, 32>(
-                        phase, &a, &b, &y, 4, &epilogues,
+                    tile_ir_kernels::qmatmul_with_epilogue_caps::<64, 64, 32>(
+                        phase, &a, &b, &y, 4, &epilogues, qmatmul_caps,
                     );
                 }
                 QMatmulDirectVariant::Tile64x64 => {
-                    tile_ir_kernels::qmatmul_with_epilogue::<64, 64, 32>(
-                        phase, &a, &b, &y, 4, &epilogues,
+                    tile_ir_kernels::qmatmul_with_epilogue_caps::<64, 64, 32>(
+                        phase, &a, &b, &y, 4, &epilogues, qmatmul_caps,
                     );
                 }
             }

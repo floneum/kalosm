@@ -23,7 +23,7 @@ pub use mirostat::{mirostat2, Mirostat2};
 pub use qdequantize::qdequantize;
 pub use qgemv::{qgemv_with_epilogue, IntoQgemvEpilogues};
 pub use qgemv_paired_q4k::{qgemv_q4k_paired, qgemv_q4k_paired_dispatch, Q4KPairedGgml};
-pub use qmatmul::qmatmul_with_epilogue;
+pub use qmatmul::{qmatmul_with_epilogue, qmatmul_with_epilogue_caps, QmatmulHardwareCaps};
 pub use qmatmul_workgroup::{qgemv_workgroup_with_epilogue, qmatmul_workgroup_with_epilogues};
 pub use quantized_matrix::{quantized_matrix, quantized_matrix_for};
 pub use rms_norm::{rms_norm_vec4, RmsNormVec4};
