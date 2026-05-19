@@ -36,46 +36,6 @@ pub fn qmatmul_with_epilogue<const BM: usize, const BN: usize, const BK: usize>(
     vector_width: u32,
     epilogues: &crate::types::QmatmulEpilogues<'_>,
 ) {
-    qmatmul_with_epilogue_caps::<BM, BN, BK>(
-        program,
-        a,
-        b,
-        y,
-        vector_width,
-        epilogues,
-        QmatmulHardwareCaps::default(),
-    );
-}
-
-/// Hardware capabilities relevant to the qmatmul kernel's variant choice.
-/// Threaded through `qmatmul_with_epilogue_caps` so callers can ask for the
-/// cooperative-matrix fast path only when the device actually supports it
-/// with a 32-lane subgroup. Defaults to "no coop" so the plain
-/// `qmatmul_with_epilogue` entry point stays safe on adapters with smaller
-/// subgroup widths (Microsoft WARP / DX12: 4 lanes).
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct QmatmulHardwareCaps {
-    /// Set to the hardware subgroup width when the device pins a single
-    /// value (`min == max`). Leave as `None` when the device reports a
-    /// variable range or the caller is unsure — the kernel will then
-    /// avoid any code path that depends on a fixed subgroup width.
-    pub subgroup_size: Option<u32>,
-}
-
-/// Variant of [`qmatmul_with_epilogue`] that takes the device's hardware
-/// subgroup width so the dispatcher can opt into the cooperative-matrix
-/// fast path. The plain entry point delegates here with `subgroup_size:
-/// None`, which is correct on every wgpu adapter but slower on hardware
-/// that does support a 32-lane subgroup.
-pub fn qmatmul_with_epilogue_caps<const BM: usize, const BN: usize, const BK: usize>(
-    program: &mut Program,
-    a: &Storage<F32, 2>,
-    b: &QuantizedMatrix,
-    y: &Storage<F32, 2>,
-    vector_width: u32,
-    epilogues: &crate::types::QmatmulEpilogues<'_>,
-    caps: QmatmulHardwareCaps,
-) {
     assert!(
         BM > 0 && BN > 0 && BK > 0,
         "qmatmul tile shape must be non-zero"
@@ -90,7 +50,7 @@ pub fn qmatmul_with_epilogue_caps<const BM: usize, const BN: usize, const BK: us
     if m == 1 {
         super::qgemv::qgemv_with_epilogue::<BN, BK>(program, a, b, y, 1, epilogues);
     } else {
-        qmatmul_tile_with_epilogue::<BM, BN, BK>(program, a, b, y, epilogues, caps);
+        qmatmul_tile_with_epilogue::<BM, BN, BK>(program, a, b, y, epilogues);
     }
 }
 
@@ -103,7 +63,6 @@ pub(crate) fn qmatmul_tile_with_epilogue<const BM: usize, const BN: usize, const
     b: &QuantizedMatrix,
     y: &Storage<F32, 2>,
     epilogues: &crate::types::QmatmulEpilogues<'_>,
-    caps: QmatmulHardwareCaps,
 ) {
     const LANES: usize = 256;
     assert!(
@@ -114,13 +73,13 @@ pub(crate) fn qmatmul_tile_with_epilogue<const BM: usize, const BN: usize, const
 
     if epilogues.pre.is_none()
         && epilogues.post.is_none()
-        && qmatmul_try_coop::<BM, BN, BK>(program, a, b, y, caps)
+        && qmatmul_try_coop::<BM, BN, BK>(program, a, b, y)
     {
         return;
     }
 
     if BM * BN * BK != LANES || !BK.is_power_of_two() {
-        qmatmul_tile_with_epilogue::<8, 4, 8>(program, a, b, y, epilogues, caps);
+        qmatmul_tile_with_epilogue::<8, 4, 8>(program, a, b, y, epilogues);
         return;
     }
     let k_iterations = k.div_ceil(BK as u32);
@@ -165,20 +124,7 @@ pub(crate) fn qmatmul_try_coop<const BM: usize, const BN: usize, const BK: usize
     a: &Storage<F32, 2>,
     b: &QuantizedMatrix,
     y: &Storage<F32, 2>,
-    caps: QmatmulHardwareCaps,
 ) -> bool {
-    // The cooperative-matrix body hardcodes `SUBGROUP_SIZE = 32` and
-    // partitions the workgroup into `ROW_GROUPS * COL_GROUPS = BLOCK / 32`
-    // subgroups. On adapters with a different hardware subgroup width
-    // (Microsoft WARP / DX12 reports 4) the workgroup actually contains
-    // `BLOCK / hw_subgroup_size` subgroups, and `sg_row = subgroup_id /
-    // COL_GROUPS` sweeps far past `ROW_GROUPS` — writes land in unrelated
-    // output tiles and the test sees garbage like `actual=-2.52
-    // expected=0.085`. Require a 32-lane subgroup before taking this path
-    // so the scalar fallback runs everywhere else.
-    if caps.subgroup_size != Some(32) {
-        return false;
-    }
     let [m, k] = matrix_shape(&a.view().layout);
     if BK != 32
         || !(m as usize).is_multiple_of(BM)

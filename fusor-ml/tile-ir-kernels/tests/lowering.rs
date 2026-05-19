@@ -5,11 +5,10 @@ use fusor_tile_ir::{
 use fusor_tile_ir_kernels::{
     batched_gemv_with_epilogues, batched_matmul_with_epilogues, flash_attention,
     linear_storage_layout, qdequantize, qgemv_q4k_paired, qgemv_with_epilogue,
-    qgemv_workgroup_with_epilogue, qmatmul_with_epilogue, qmatmul_with_epilogue_caps,
-    qmatmul_workgroup_with_epilogues, quantized_matrix, rms_norm_vec4, try_batched_coop_matmul,
-    DenseMatmulEpilogues, DenseMatmulShape, FlashAttentionDims, FlashAttentionMeta, PairedEpilogue,
-    Q4KPairedGgml, QmatmulEpilogues, QmatmulHardwareCaps, RmsNormVec4, RmsNormVec4Meta, TensorMeta,
-    UnaryEpilogue,
+    qgemv_workgroup_with_epilogue, qmatmul_with_epilogue, qmatmul_workgroup_with_epilogues,
+    quantized_matrix, rms_norm_vec4, try_batched_coop_matmul, DenseMatmulEpilogues,
+    DenseMatmulShape, FlashAttentionDims, FlashAttentionMeta, PairedEpilogue, Q4KPairedGgml,
+    QmatmulEpilogues, RmsNormVec4, RmsNormVec4Meta, TensorMeta, UnaryEpilogue,
 };
 
 fn lower_or_fail(ir: &fusor_tile_ir::KernelIr, label: &str) -> NagaKernel {
@@ -160,20 +159,7 @@ fn cooperative_qmatmul_lowers() {
         let a = program.storage_read::<F32, 2>(Shape::new([64, 256]));
         let b = quantized_matrix(program, GgmlQuantFormat::Q8_0, 256, 64);
         let y = program.storage_write::<F32, 2>(Shape::new([64, 64]));
-        // Pin `subgroup_size = 32` so `qmatmul_try_coop` takes the
-        // cooperative-matrix path — `qmatmul_with_epilogue`'s default
-        // caps leave it as `None` and route to the scalar fallback.
-        qmatmul_with_epilogue_caps::<64, 64, 32>(
-            program,
-            &a,
-            &b,
-            &y,
-            4,
-            &QmatmulEpilogues::empty(),
-            QmatmulHardwareCaps {
-                subgroup_size: Some(32),
-            },
-        );
+        qmatmul_with_epilogue::<64, 64, 32>(program, &a, &b, &y, 4, &QmatmulEpilogues::empty());
     });
     lower_or_fail(&ir, "cooperative qmatmul");
 }
