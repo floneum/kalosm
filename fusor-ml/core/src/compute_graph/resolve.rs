@@ -1621,10 +1621,16 @@ impl Resolver {
             }
         }
 
-        // Pre-op (QMatMul): fuse element-wise unary upstream of the qmatmul
-        // input into `pre_element_wise`. The qgemv kernels apply this chain to
-        // each loaded activation tile before the dot.
+        // Pre-op (QMatMul): fuse element-wise unary upstream of a single-row
+        // qmatmul input into `pre_element_wise`. For batched/tiled qmatmul,
+        // the transformed activation tile is reloaded for each output-column
+        // tile, so expensive chains like GELU would be recomputed many times.
+        // Keep those chains materialized once instead.
         if let ComputeGraphNodeVariant::QMatMul(qmatmul_op) = &node_variant
+            && qmatmul_op.in_shape[..qmatmul_op.in_shape.len() - 1]
+                .iter()
+                .product::<usize>()
+                == 1
             && !self.check_cached(graph, qmatmul_op.input)
             && let Some(input_exec) = self.get_input_node_in_exec_graph(qmatmul_op.input)
             && let Some(el_op) =

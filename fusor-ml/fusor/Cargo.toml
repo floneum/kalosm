@@ -19,7 +19,7 @@ half = "2.4"
 [dev-dependencies]
 tokio = { version = "1.43.0", features = ["full"] }
 half = "2.4"
-criterion = { version = "0.3", features = ["async_futures"] }
+criterion.workspace = true
 candle-core = { workspace = true }
 candle-nn = { workspace = true }
 candle-transformers = { workspace = true }

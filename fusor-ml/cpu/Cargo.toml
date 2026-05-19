@@ -15,7 +15,7 @@ fusor-types = { path = "../types" }
 half = "2.6"
 
 [dev-dependencies]
-criterion = "0.5"
+criterion.workspace = true
 candle-core = "0.8"
 
 # [[bench]]
