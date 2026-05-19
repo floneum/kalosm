@@ -21,6 +21,7 @@ on:
       - src/**
       - .github/**
       - Cargo.toml
+      - Cargo.lock
 
   pull_request:
     types: [opened, synchronize, reopened, ready_for_review]
@@ -43,10 +44,16 @@ on:
       - src/**
       - .github/**
       - Cargo.toml
+      - Cargo.lock
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
+
+env:
+  CARGO_INCREMENTAL: 0
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
 
 jobs:
   test:
@@ -64,31 +71,50 @@ jobs:
       - name: disable git eol translation
         run: git config --global core.autocrlf false
 
-      - name: Install Rustup using win.rustup.rs
-        shell: powershell
-        run: |
-          $ProgressPreference = "SilentlyContinue"
-          Invoke-WebRequest https://win.rustup.rs/ -OutFile rustup-init.exe
-          .\rustup-init.exe -y --default-host=x86_64-pc-windows-msvc --default-toolchain=none
-          del rustup-init.exe
-          rustup target add ${{ matrix.target }}
-
       - name: checkout
         uses: actions/checkout@v6
 
+      # `dtolnay/rust-toolchain` is a single-step toolchain install that
+      # uses the GitHub Actions toolchain cache; much faster than the
+      # `Invoke-WebRequest win.rustup.rs` dance.
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      # WARP and DXC are small downloads (a few MB each) but redirecting
+      # them through the GitHub Actions cache means we don't pull from
+      # nuget / GitHub releases on every PR run.
+      - name: Cache WARP/DXC downloads
+        id: cache-warp-dxc
+        uses: actions/cache@v4
+        with:
+          path: |
+            warp
+            dxc
+          # Bump the suffix when the WARP / DXC versions below change.
+          key: ${{ runner.os }}-warp-1.0.8-dxc-1.7.2308-v1
+
       - name: Setup WARP
+        if: steps.cache-warp-dxc.outputs.cache-hit != 'true'
         shell: bash
         run: |
           curl -L --retry 5 https://www.nuget.org/api/v2/package/Microsoft.Direct3D.WARP/1.0.8 -o warp.zip
           7z e warp.zip -owarp build/native/amd64/d3d10warp.dll
 
       - name: Setup DXC
+        if: steps.cache-warp-dxc.outputs.cache-hit != 'true'
         shell: bash
         run: |
           curl -L --retry 5 https://github.com/microsoft/DirectXShaderCompiler/releases/download/v1.7.2308/dxc_2023_08_14.zip -o dxc.zip
           7z e dxc.zip -odxc bin/x64/dxcompiler.dll bin/x64/dxil.dll
 
       - uses: Swatinem/rust-cache@v2
+        with:
+          # Distinct from the Linux cache so we don't ever try to restore
+          # x86_64-unknown-linux-gnu artefacts onto x86_64-pc-windows-msvc.
+          shared-key: "windows-stable"
+          cache-all-crates: "true"
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: test
         shell: cmd
@@ -100,7 +126,6 @@ jobs:
         run: |
           rustc -Vv
           cargo -V
-          set RUST_BACKTRACE=1
           mkdir target\debug\deps 2>nul
           copy warp\d3d10warp.dll target\debug\deps\
           copy dxc\dxcompiler.dll target\debug\deps\

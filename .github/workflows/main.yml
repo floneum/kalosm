@@ -21,6 +21,7 @@ on:
       - src/**
       - .github/**
       - Cargo.toml
+      - Cargo.lock
 
   pull_request:
     types: [opened, synchronize, reopened, ready_for_review]
@@ -43,11 +44,23 @@ on:
       - src/**
       - .github/**
       - Cargo.toml
+      - Cargo.lock
 
-# workflow_dispatch:
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
+
+# `CARGO_INCREMENTAL=0` keeps the cache lean — `Swatinem/rust-cache` wipes
+# incremental artifacts before saving, so building them just to throw them
+# away wastes wall time. Backtraces on test failures help diagnose CI-only
+# flakes without re-runs.
+env:
+  CARGO_INCREMENTAL: 0
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  # Bump when the apt dependency list below changes so the next run
+  # rebuilds the apt archive instead of restoring a stale one.
+  APT_CACHE_VERSION: "v1"
 
 jobs:
   check:
@@ -55,11 +68,27 @@ jobs:
     name: Check
     runs-on: ubuntu-24.04
     steps:
+      # Checkout MUST come before `Swatinem/rust-cache` so the cache key
+      # hashes the real `Cargo.lock`. Without it every job gets the same
+      # toolchain-only key and clobbers the previous job's cache.
+      - uses: actions/checkout@v6
+      - uses: awalsh128/cache-apt-pkgs-action@latest
+        with:
+          packages: libwebkit2gtk-4.1-dev libgtk-3-dev libasound2-dev libayatana-appindicator3-dev libxdo-dev
+          version: ${{ env.APT_CACHE_VERSION }}
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - run: sudo apt-get update
-      - run: sudo apt install libwebkit2gtk-4.1-dev libgtk-3-dev libasound2-dev libayatana-appindicator3-dev libxdo-dev
-      - uses: actions/checkout@v6
+        with:
+          # `shared-key` makes every Linux job in this PR share one cache
+          # slot, so once `check` warms the deps `test` / `clippy` /
+          # `docs` all hit it. `cache-all-crates` includes registry
+          # sources (~hundreds of MB) but means dep-only churn doesn't
+          # blow the entire cache.
+          shared-key: "linux-stable"
+          cache-all-crates: "true"
+          # Only push cache from main, so PR-only caches don't churn the
+          # 10GB-per-repo Actions cache budget.
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Check workspace
         run: cargo check --all --examples --tests --features kalosm/language,kalosm/sound,kalosm/vision,kalosm/remote,kalosm/scrape
 
@@ -68,14 +97,20 @@ jobs:
     name: Test Suite
     runs-on: ubuntu-24.04
     steps:
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - run: sudo apt-get update
-      - run: sudo apt install libwebkit2gtk-4.1-dev libgtk-3-dev libasound2-dev libayatana-appindicator3-dev libxdo-dev
       - uses: actions/checkout@v6
+      - uses: awalsh128/cache-apt-pkgs-action@latest
+        with:
+          packages: libwebkit2gtk-4.1-dev libgtk-3-dev libasound2-dev libayatana-appindicator3-dev libxdo-dev
+          version: ${{ env.APT_CACHE_VERSION }}
+      - uses: dtolnay/rust-toolchain@stable
       - uses: humbletim/setup-vulkan-sdk@v1.2.1
         with:
           vulkan-query-version: 1.4.328.1
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: "linux-stable"
+          cache-all-crates: "true"
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Run tests
         env:
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
@@ -89,11 +124,17 @@ jobs:
     name: Docs
     runs-on: ubuntu-24.04
     steps:
+      - uses: actions/checkout@v6
+      - uses: awalsh128/cache-apt-pkgs-action@latest
+        with:
+          packages: libwebkit2gtk-4.1-dev libgtk-3-dev libasound2-dev libayatana-appindicator3-dev libxdo-dev
+          version: ${{ env.APT_CACHE_VERSION }}
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - run: sudo apt-get update
-      - run: sudo apt install libwebkit2gtk-4.1-dev libgtk-3-dev libasound2-dev libayatana-appindicator3-dev libxdo-dev
-      - uses: actions/checkout@v6
+        with:
+          shared-key: "linux-stable"
+          cache-all-crates: "true"
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: cargo test --doc --workspace --features kalosm/language,kalosm/sound,kalosm/vision,kalosm/remote,kalosm/scrape
 
   fmt:
@@ -101,10 +142,10 @@ jobs:
     name: Rustfmt
     runs-on: ubuntu-24.04
     steps:
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - run: rustup component add rustfmt
       - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
       - run: cargo fmt --all -- --check
 
   clippy:
@@ -112,10 +153,17 @@ jobs:
     name: Clippy
     runs-on: ubuntu-24.04
     steps:
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - run: sudo apt-get update
-      - run: sudo apt install libwebkit2gtk-4.1-dev libgtk-3-dev libasound2-dev libayatana-appindicator3-dev libxdo-dev
-      - run: rustup component add clippy
       - uses: actions/checkout@v6
+      - uses: awalsh128/cache-apt-pkgs-action@latest
+        with:
+          packages: libwebkit2gtk-4.1-dev libgtk-3-dev libasound2-dev libayatana-appindicator3-dev libxdo-dev
+          version: ${{ env.APT_CACHE_VERSION }}
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: "linux-stable"
+          cache-all-crates: "true"
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: cargo clippy --workspace --examples --tests --features kalosm/language,kalosm/sound,kalosm/vision,kalosm/remote,kalosm/scrape -- -D warnings

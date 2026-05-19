@@ -1,14 +1,38 @@
 on: [pull_request]
 name: benchmark fusor
+
+# Re-run on a new commit only — let the prior run finish on the old SHA.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+env:
+  CARGO_INCREMENTAL: 0
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+# All benches run on the same macos-latest runner and build the same
+# `fusor-core` deps, so anchor them at one shared cache slot and only
+# save from the base branch to keep the Actions cache from churning.
+# `cache-on-failure: "true"` so a broken bench still leaves a useful
+# cache for the next run.
 jobs:
   qmatmul:
     if: github.event.pull_request.draft == false
     name: qmatmul benchmark
     runs-on: macos-latest
     steps:
+      - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - uses: actions/checkout@v6
+        with:
+          shared-key: "macos-bench"
+          workspaces: fusor-ml/core
+          cache-all-crates: "true"
+          cache-on-failure: "true"
+          # Bench runs only on PRs, so we never see `refs/heads/main`
+          # here; leave save-if at its default (always save) so the PR's
+          # own cache warms across re-runs within the PR.
       - uses: ./.github/actions/criterion-compare
         with:
           cwd: "fusor-ml/core"
@@ -19,9 +43,17 @@ jobs:
     name: matmul benchmark
     runs-on: macos-latest
     steps:
+      - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - uses: actions/checkout@v6
+        with:
+          shared-key: "macos-bench"
+          workspaces: fusor-ml/core
+          cache-all-crates: "true"
+          cache-on-failure: "true"
+          # Bench runs only on PRs, so we never see `refs/heads/main`
+          # here; leave save-if at its default (always save) so the PR's
+          # own cache warms across re-runs within the PR.
       - uses: ./.github/actions/criterion-compare
         with:
           cwd: "fusor-ml/core"
@@ -33,9 +65,17 @@ jobs:
     name: elementwise benchmark
     runs-on: macos-latest
     steps:
+      - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - uses: actions/checkout@v6
+        with:
+          shared-key: "macos-bench"
+          workspaces: fusor-ml/core
+          cache-all-crates: "true"
+          cache-on-failure: "true"
+          # Bench runs only on PRs, so we never see `refs/heads/main`
+          # here; leave save-if at its default (always save) so the PR's
+          # own cache warms across re-runs within the PR.
       - uses: ./.github/actions/criterion-compare
         with:
           cwd: "fusor-ml/core"
@@ -46,9 +86,17 @@ jobs:
     name: fused benchmark
     runs-on: macos-latest
     steps:
+      - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - uses: actions/checkout@v6
+        with:
+          shared-key: "macos-bench"
+          workspaces: fusor-ml/core
+          cache-all-crates: "true"
+          cache-on-failure: "true"
+          # Bench runs only on PRs, so we never see `refs/heads/main`
+          # here; leave save-if at its default (always save) so the PR's
+          # own cache warms across re-runs within the PR.
       - uses: ./.github/actions/criterion-compare
         with:
           cwd: "fusor-ml/core"
@@ -59,9 +107,17 @@ jobs:
     name: reduce benchmark
     runs-on: macos-latest
     steps:
+      - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - uses: actions/checkout@v6
+        with:
+          shared-key: "macos-bench"
+          workspaces: fusor-ml/core
+          cache-all-crates: "true"
+          cache-on-failure: "true"
+          # Bench runs only on PRs, so we never see `refs/heads/main`
+          # here; leave save-if at its default (always save) so the PR's
+          # own cache warms across re-runs within the PR.
       - uses: ./.github/actions/criterion-compare
         with:
           cwd: "fusor-ml/core"
@@ -72,9 +128,17 @@ jobs:
     name: pairwise benchmark
     runs-on: macos-latest
     steps:
+      - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - uses: actions/checkout@v6
+        with:
+          shared-key: "macos-bench"
+          workspaces: fusor-ml/core
+          cache-all-crates: "true"
+          cache-on-failure: "true"
+          # Bench runs only on PRs, so we never see `refs/heads/main`
+          # here; leave save-if at its default (always save) so the PR's
+          # own cache warms across re-runs within the PR.
       - uses: ./.github/actions/criterion-compare
         with:
           cwd: "fusor-ml/core"
