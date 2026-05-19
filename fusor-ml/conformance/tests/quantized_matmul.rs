@@ -356,11 +356,12 @@ async fn q4k_paired_with_bias_resolves_to_single_kernel() {
         panic!("expected GPU device");
     };
     // Paired-mode fusion lowers to a `qgemv_q4k_paired` kernel that uses
-    // `subgroup_*` ops, so adapters without `Features::SUBGROUP` (Mesa
-    // lavapipe in Linux CI) cannot host it and the fuser refuses to
-    // collapse the pattern. The fusion behaviour itself is what this test
-    // asserts, so skip on those adapters.
-    if !gpu_device.subgroups_supported() {
+    // `subgroup_*` ops. The resolver refuses to collapse the pattern when
+    // it can't lower onto subgroup intrinsics — Mesa lavapipe (Linux CI)
+    // has no `Features::SUBGROUP` and Microsoft WARP / DX12 (Windows CI)
+    // advertises it but miscompiles the emulation. Skip the fusion-count
+    // assertion on adapters where the resolver legitimately bails.
+    if !gpu_device.subgroups_supported() || gpu_device.is_software_adapter() {
         return;
     }
     let weight_shape = [4, 512];
@@ -404,11 +405,12 @@ async fn q4k_paired_pattern_resolves_to_single_kernel() {
         panic!("expected GPU device");
     };
     // Paired-mode fusion lowers to a `qgemv_q4k_paired` kernel that uses
-    // `subgroup_*` ops, so adapters without `Features::SUBGROUP` (Mesa
-    // lavapipe in Linux CI) cannot host it and the fuser refuses to
-    // collapse the pattern. The fusion behaviour itself is what this test
-    // asserts, so skip on those adapters.
-    if !gpu_device.subgroups_supported() {
+    // `subgroup_*` ops. The resolver refuses to collapse the pattern when
+    // it can't lower onto subgroup intrinsics — Mesa lavapipe (Linux CI)
+    // has no `Features::SUBGROUP` and Microsoft WARP / DX12 (Windows CI)
+    // advertises it but miscompiles the emulation. Skip the fusion-count
+    // assertion on adapters where the resolver legitimately bails.
+    if !gpu_device.subgroups_supported() || gpu_device.is_software_adapter() {
         return;
     }
 
