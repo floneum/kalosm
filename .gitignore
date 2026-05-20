@@ -1,5 +1,7 @@
 /sandbox
 /target
+/.lavapipe
+/.talvos
 /db
 /documents
 /plugin/target
