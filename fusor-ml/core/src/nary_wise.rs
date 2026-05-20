@@ -259,6 +259,68 @@ impl NaryExpr {
             .all(|(i, idx)| matches!(idx, NaryExpr::DimIndex(d) if *d == i))
     }
 
+    pub(crate) fn uses_input(&self, target_input_idx: usize) -> bool {
+        match self {
+            NaryExpr::Op { children, .. } => {
+                children.iter().any(|c| c.uses_input(target_input_idx))
+            }
+            NaryExpr::IndexedInput { input_idx, indices } => {
+                *input_idx == target_input_idx
+                    || indices.iter().any(|c| c.uses_input(target_input_idx))
+            }
+            NaryExpr::DimIndex(_) | NaryExpr::Scalar(_) => false,
+        }
+    }
+
+    pub(crate) fn elementwise_input_datatype(
+        &self,
+        target_input_idx: usize,
+    ) -> Option<DataTypeEnum> {
+        match self {
+            NaryExpr::Op { children, function } => children
+                .iter()
+                .zip(&function.input_types)
+                .find_map(|(child, input_ty)| {
+                    child
+                        .uses_input(target_input_idx)
+                        .then_some(*input_ty)
+                        .or_else(|| child.elementwise_input_datatype(target_input_idx))
+                }),
+            NaryExpr::IndexedInput { input_idx, indices } => {
+                if *input_idx == target_input_idx && Self::is_elementwise_indices(indices) {
+                    // The parent operation records concrete input tensor dtypes;
+                    // leaf nodes do not. The caller uses the consuming function's
+                    // declared input dtype when the leaf is under an operation.
+                    None
+                } else {
+                    None
+                }
+            }
+            NaryExpr::DimIndex(_) | NaryExpr::Scalar(_) => None,
+        }
+    }
+
+    pub(crate) fn remap_inputs(&self, mapping: &[usize]) -> NaryExpr {
+        match self {
+            NaryExpr::Op { children, function } => NaryExpr::Op {
+                children: children
+                    .iter()
+                    .map(|child| child.remap_inputs(mapping))
+                    .collect(),
+                function: function.clone(),
+            },
+            NaryExpr::IndexedInput { input_idx, indices } => NaryExpr::IndexedInput {
+                input_idx: mapping[*input_idx],
+                indices: indices
+                    .iter()
+                    .map(|index| index.remap_inputs(mapping))
+                    .collect(),
+            },
+            NaryExpr::DimIndex(dim) => NaryExpr::DimIndex(*dim),
+            NaryExpr::Scalar(value) => NaryExpr::Scalar(*value),
+        }
+    }
+
     /// Create a select expression (ternary operator)
     /// Semantics: condition != 0 ? on_true : on_false
     pub fn select(

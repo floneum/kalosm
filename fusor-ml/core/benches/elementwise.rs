@@ -3,7 +3,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use candle_core::backend::BackendDevice;
-use criterion::{BatchSize, black_box};
+use criterion::BatchSize;
 use fusor_core::{Device, Tensor};
 use futures::executor::block_on;
 
@@ -13,72 +13,73 @@ use criterion::{criterion_group, criterion_main};
 
 use criterion::async_executor::FuturesExecutor;
 
+fn candle_gpu_device() -> Option<candle_core::Device> {
+    candle_core::Device::new_cuda(0)
+        .or_else(|_| candle_core::Device::new_metal(0))
+        .ok()
+}
+
 const SIZES: [usize; 3] = [100, 1000, 4000];
 
 fn bench_add_const(c: &mut Criterion) {
+    let mut group = c.benchmark_group("add-const");
+    group.sample_size(20);
+    group.plot_config(
+        criterion::PlotConfiguration::default().summary_scale(criterion::AxisScale::Logarithmic),
+    );
+
     {
-        let mut group = c.benchmark_group("add-const-wgpu");
-        let group = group.sample_size(20);
         for size in SIZES {
             let device = block_on(Device::new()).unwrap();
 
-            group.bench_with_input(
-                BenchmarkId::new("add-const-wgpu", size),
-                &size,
-                move |b, &s| {
-                    let device = device.clone();
-                    b.to_async(FuturesExecutor).iter_custom(async |iters| {
-                        let mut sum = Duration::ZERO;
-                        while sum.is_zero() {
-                            for _ in 0..iters {
-                                let tensor = Tensor::new(&device, &vec![vec![1.; size]; size]);
-                                _ = tensor.as_slice().await.unwrap();
-                                let new = tensor + 1.;
-                                let start = std::time::Instant::now();
-                                new.materialize().await;
-                                sum += start.elapsed();
-                            }
+            group.bench_with_input(BenchmarkId::new("fusor-gpu", size), &size, move |b, &s| {
+                let device = device.clone();
+                b.to_async(FuturesExecutor).iter_custom(async |iters| {
+                    let mut sum = Duration::ZERO;
+                    while sum.is_zero() {
+                        for _ in 0..iters {
+                            let tensor = Tensor::new(&device, &vec![vec![1.; size]; size]);
+                            _ = tensor.as_slice().await.unwrap();
+                            let new = tensor + 1.;
+                            let start = std::time::Instant::now();
+                            new.materialize().await;
+                            sum += start.elapsed();
                         }
-                        sum
-                    })
-                },
-            );
+                    }
+                    sum
+                })
+            });
         }
     }
 
     {
-        let mut group = c.benchmark_group("add-const-ndarray");
-        let group = group.sample_size(20);
         for size in SIZES {
-            group.bench_with_input(
-                BenchmarkId::new("add-const-ndarray", size),
-                &size,
-                move |b, &s| {
-                    b.to_async(FuturesExecutor).iter_batched(
-                        || ndarray::Array2::<f32>::ones((s, s)),
-                        |tensor| async move { tensor.map(|x| x + 1.) },
-                        BatchSize::LargeInput,
-                    );
-                },
-            );
+            group.bench_with_input(BenchmarkId::new("ndarray", size), &size, move |b, &s| {
+                b.to_async(FuturesExecutor).iter_batched(
+                    || ndarray::Array2::<f32>::ones((s, s)),
+                    |tensor| async move { tensor.map(|x| x + 1.) },
+                    BatchSize::LargeInput,
+                );
+            });
         }
     }
 
     {
         let candle_device = candle_core::Device::Cpu;
-        bench_candle_with_device(candle_device, "add-const-candle-cpu", c);
+        bench_candle_with_device(candle_device, "candle-cpu", &mut group);
     }
 
-    #[cfg(target_os = "macos")]
-    {
-        let candle_device = candle_core::Device::Metal(candle_core::MetalDevice::new(0).unwrap());
-        bench_candle_with_device(candle_device, "add-const-candle-metal", c);
+    if let Some(candle_device) = candle_gpu_device() {
+        bench_candle_with_device(candle_device, "candle-gpu", &mut group);
     }
+    group.finish();
 }
 
-fn bench_candle_with_device(candle_device: candle_core::Device, name: &str, c: &mut Criterion) {
-    let mut group = c.benchmark_group(name);
-    let group = group.sample_size(20);
+fn bench_candle_with_device(
+    candle_device: candle_core::Device,
+    name: &str,
+    group: &mut criterion::BenchmarkGroup<'_, criterion::measurement::WallTime>,
+) {
     for size in SIZES {
         let candle_device = candle_device.clone();
         group.bench_with_input(BenchmarkId::new(name, size), &size, move |b, &s| {
@@ -116,13 +117,17 @@ fn bench_candle_with_device(candle_device: candle_core::Device, name: &str, c: &
 }
 
 fn bench_exp_pairwise(c: &mut Criterion) {
+    let mut group = c.benchmark_group("exp");
+    group.sample_size(20);
+    group.plot_config(
+        criterion::PlotConfiguration::default().summary_scale(criterion::AxisScale::Logarithmic),
+    );
+
     {
-        let mut group = c.benchmark_group("exp-wgpu");
-        let group = group.sample_size(20);
         for size in SIZES {
             let device = block_on(Device::new()).unwrap();
 
-            group.bench_with_input(BenchmarkId::new("exp-wgpu", size), &size, move |b, &s| {
+            group.bench_with_input(BenchmarkId::new("fusor-gpu", size), &size, move |b, &s| {
                 let device = device.clone();
                 b.to_async(FuturesExecutor).iter_custom(async |iters| {
                     let mut sum = Duration::ZERO;
@@ -143,38 +148,33 @@ fn bench_exp_pairwise(c: &mut Criterion) {
     }
 
     {
-        let mut group = c.benchmark_group("exp-ndarray");
-        let group = group.sample_size(20);
         for size in SIZES {
-            group.bench_with_input(
-                BenchmarkId::new("exp-ndarray", size),
-                &size,
-                move |b, &s| {
-                    b.to_async(FuturesExecutor).iter_batched(
-                        || ndarray::Array2::<f32>::ones((s, s)),
-                        |tensor| async move { tensor.map(|x| x.exp()) },
-                        BatchSize::LargeInput,
-                    );
-                },
-            );
+            group.bench_with_input(BenchmarkId::new("ndarray", size), &size, move |b, &s| {
+                b.to_async(FuturesExecutor).iter_batched(
+                    || ndarray::Array2::<f32>::ones((s, s)),
+                    |tensor| async move { tensor.map(|x| x.exp()) },
+                    BatchSize::LargeInput,
+                );
+            });
         }
     }
 
     {
         let candle_device = candle_core::Device::Cpu;
-        bench_candle_exp_with_device(candle_device, "exp-candle-cpu", c);
+        bench_candle_exp_with_device(candle_device, "candle-cpu", &mut group);
     }
 
-    #[cfg(target_os = "macos")]
-    {
-        let candle_device = candle_core::Device::Metal(candle_core::MetalDevice::new(0).unwrap());
-        bench_candle_exp_with_device(candle_device, "exp-candle-metal", c);
+    if let Some(candle_device) = candle_gpu_device() {
+        bench_candle_exp_with_device(candle_device, "candle-gpu", &mut group);
     }
+    group.finish();
 }
 
-fn bench_candle_exp_with_device(candle_device: candle_core::Device, name: &str, c: &mut Criterion) {
-    let mut group = c.benchmark_group(name);
-    let group = group.sample_size(20);
+fn bench_candle_exp_with_device(
+    candle_device: candle_core::Device,
+    name: &str,
+    group: &mut criterion::BenchmarkGroup<'_, criterion::measurement::WallTime>,
+) {
     for size in SIZES {
         let candle_device = candle_device.clone();
         group.bench_with_input(BenchmarkId::new(name, size), &size, move |b, &s| {

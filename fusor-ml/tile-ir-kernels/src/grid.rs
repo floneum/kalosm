@@ -82,7 +82,13 @@ pub(crate) fn store_qgemv_sums_with_epilogue<const COLS_PER_SUBGROUP: usize>(
     for (offset, sum) in sums.into_iter().enumerate() {
         let col = target.col0.clone() + offset as u32;
         let reduced = program.subgroup_reduce_sum(sum);
-        let value = crate::types::apply_optional_epilogue(target.epilogues.post, reduced);
+        let extras = target
+            .epilogues
+            .post_extra_col_vectors
+            .iter()
+            .map(|extra| program.load(extra.at(&col), col.lt(target.n_cols), 0.0))
+            .collect::<Vec<_>>();
+        let value = crate::types::apply_qmatmul_post_epilogue(target.epilogues, reduced, extras);
         let mut mask = target.lane.eq(0);
         if !target.full_cols {
             mask = mask.and(col.lt(target.n_cols));

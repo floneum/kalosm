@@ -1,10 +1,11 @@
 use std::sync::Arc;
 
-use fusor_tile_ir::tile::Tile;
-use fusor_tile_ir::{Layout, TileLiteral};
+use fusor_tile_ir::tile::{Storage, Tile};
+use fusor_tile_ir::{Layout, TileLiteral, F32};
 
 type PairedEpilogueBuilder = dyn Fn(&[Tile]) -> Tile + Send + Sync;
 type UnaryEpilogueBuilder = dyn Fn(Tile) -> Tile + Send + Sync;
+type UnaryEpilogueWithExtrasBuilder = dyn Fn(&[Tile]) -> Tile + Send + Sync;
 
 /// Paired matmul epilogue. The matmul produces concatenated `[gate; up]`
 /// columns; the kernel reduces each pair separately and applies this epilogue
@@ -206,6 +207,53 @@ impl std::hash::Hash for UnaryEpilogue {
     }
 }
 
+#[derive(Clone)]
+pub struct UnaryEpilogueWithExtras {
+    label: &'static str,
+    extras_arity: usize,
+    identity: u64,
+    build: Arc<UnaryEpilogueWithExtrasBuilder>,
+}
+
+impl UnaryEpilogueWithExtras {
+    pub fn new<F>(label: &'static str, extras_arity: usize, build: F) -> Self
+    where
+        F: Fn(&[Tile]) -> Tile + Send + Sync + 'static,
+    {
+        let mut values = Vec::with_capacity(1 + extras_arity);
+        values.push(Tile::literal(TileLiteral::f32(f32::from_bits(0x5EED_CA7E))));
+        values.extend((0..extras_arity).map(|idx| {
+            Tile::literal(TileLiteral::f32(f32::from_bits(
+                0x51A7_0000u32.wrapping_add(idx as u32),
+            )))
+        }));
+        let identity = build(&values).signature_hash();
+        Self {
+            label,
+            extras_arity,
+            identity,
+            build: Arc::new(build),
+        }
+    }
+
+    pub fn apply(&self, values: &[Tile]) -> Tile {
+        assert_eq!(values.len(), 1 + self.extras_arity);
+        (self.build)(values)
+    }
+
+    pub fn identity(&self) -> u64 {
+        self.identity
+    }
+
+    pub fn label(&self) -> &'static str {
+        self.label
+    }
+
+    pub fn extras_arity(&self) -> usize {
+        self.extras_arity
+    }
+}
+
 /// Apply the optional epilogue to a tile. Identity (no allocation, no
 /// dispatch) when `epilogue` is `None`. Kernels call this between their
 /// per-output reduce and the store.
@@ -213,6 +261,21 @@ pub(crate) fn apply_optional_epilogue(epilogue: Option<&UnaryEpilogue>, tile: Ti
     match epilogue {
         Some(ep) => ep.apply(tile),
         None => tile,
+    }
+}
+
+pub(crate) fn apply_epilogue_with_extras(
+    epilogue: Option<&UnaryEpilogueWithExtras>,
+    tile: Tile,
+    extras: Vec<Tile>,
+) -> Tile {
+    if let Some(epilogue) = epilogue {
+        let mut values = Vec::with_capacity(1 + extras.len());
+        values.push(tile);
+        values.extend(extras);
+        epilogue.apply(&values)
+    } else {
+        tile
     }
 }
 
@@ -242,8 +305,20 @@ impl<'a> DenseMatmulEpilogues<'a> {
 pub struct QmatmulEpilogues<'a> {
     /// Optional activation transform applied before each dot product.
     pub pre: Option<&'a UnaryEpilogue>,
+    /// Optional activation transform that consumes the loaded activation plus
+    /// per-input-column extra vectors.
+    pub pre_with_extras: Option<&'a UnaryEpilogueWithExtras>,
+    /// Rank-1 vectors indexed by input column and passed after the activation
+    /// tile to `pre_with_extras`.
+    pub pre_extra_col_vectors: &'a [Storage<F32, 1>],
     /// Optional output transform applied after the reduction.
     pub post: Option<&'a UnaryEpilogue>,
+    /// Optional output transform that consumes the reduced output plus
+    /// per-column extra vectors.
+    pub post_with_extras: Option<&'a UnaryEpilogueWithExtras>,
+    /// Rank-1 vectors indexed by output column and passed after the reduced
+    /// output tile to `post_with_extras`.
+    pub post_extra_col_vectors: &'a [Storage<F32, 1>],
 }
 
 impl<'a> QmatmulEpilogues<'a> {
@@ -256,7 +331,11 @@ impl<'a> QmatmulEpilogues<'a> {
     pub fn post(post: &'a UnaryEpilogue) -> Self {
         Self {
             pre: None,
+            pre_with_extras: None,
+            pre_extra_col_vectors: &[],
             post: Some(post),
+            post_with_extras: None,
+            post_extra_col_vectors: &[],
         }
     }
 
@@ -264,8 +343,36 @@ impl<'a> QmatmulEpilogues<'a> {
     pub fn pre(pre: &'a UnaryEpilogue) -> Self {
         Self {
             pre: Some(pre),
+            pre_with_extras: None,
+            pre_extra_col_vectors: &[],
             post: None,
+            post_with_extras: None,
+            post_extra_col_vectors: &[],
         }
+    }
+}
+
+pub(crate) fn apply_qmatmul_pre_epilogue(
+    epilogues: &QmatmulEpilogues<'_>,
+    tile: Tile,
+    extras: Vec<Tile>,
+) -> Tile {
+    if epilogues.pre_with_extras.is_some() {
+        apply_epilogue_with_extras(epilogues.pre_with_extras, tile, extras)
+    } else {
+        apply_optional_epilogue(epilogues.pre, tile)
+    }
+}
+
+pub(crate) fn apply_qmatmul_post_epilogue(
+    epilogues: &QmatmulEpilogues<'_>,
+    tile: Tile,
+    extras: Vec<Tile>,
+) -> Tile {
+    if epilogues.post_with_extras.is_some() {
+        apply_epilogue_with_extras(epilogues.post_with_extras, tile, extras)
+    } else {
+        apply_optional_epilogue(epilogues.post, tile)
     }
 }
 

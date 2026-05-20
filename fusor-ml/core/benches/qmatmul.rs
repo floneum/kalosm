@@ -1,7 +1,6 @@
 #![allow(unused)]
 use std::time::Duration;
 
-use candle_core::MetalDevice;
 use candle_core::backend::BackendDevice;
 use candle_nn::Module;
 use criterion::BatchSize;
@@ -16,6 +15,12 @@ use criterion::{criterion_group, criterion_main};
 use criterion::async_executor::FuturesExecutor;
 use kalosm_common::Cache;
 use kalosm_model_types::FileSource;
+
+fn candle_gpu_device() -> Option<candle_core::Device> {
+    candle_core::Device::new_cuda(0)
+        .or_else(|_| candle_core::Device::new_metal(0))
+        .ok()
+}
 
 fn qmatmul(c: &mut Criterion) {
     use crate::Device;
@@ -56,7 +61,13 @@ fn qmatmul(c: &mut Criterion) {
                 println!("Q matrix metadata: {q_matrix_metadata:?}");
                 let quantization = q_matrix_metadata.ty;
 
-                let mut group = c.benchmark_group(format!("qmatmul-wgpu-{width}-{quantization}"));
+                let group_name = format!("qmatmul-{width}-{quantization}");
+                let mut group = c.benchmark_group(&group_name);
+                group.sample_size(20);
+                group.plot_config(
+                    criterion::PlotConfiguration::default()
+                        .summary_scale(criterion::AxisScale::Logarithmic),
+                );
 
                 let device = block_on(Device::new()).unwrap();
 
@@ -68,58 +79,53 @@ fn qmatmul(c: &mut Criterion) {
                 )
                 .unwrap();
                 let device = device.clone();
-                let random_data = random_data.clone();
-                group.bench_with_input(
-                    BenchmarkId::new("qmatmul-wgpu", size),
-                    &size,
-                    move |b, &s| {
-                        let device = device.clone();
-                        let random_data = random_data.clone();
-                        b.to_async(FuturesExecutor).iter_custom(async |iters| {
-                            let tensor = Tensor::new(&device, &random_data);
-                            tensor.materialize().await;
-                            let mut sum = Duration::ZERO;
-                            while sum.is_zero() {
-                                for _ in 0..iters {
-                                    let start = std::time::Instant::now();
-                                    let new = tensor.q_mat_mul(&q_matrix);
-                                    new.materialize().await;
-                                    sum += start.elapsed();
-                                }
+                let fusor_random_data = random_data.clone();
+                group.bench_with_input(BenchmarkId::new("fusor-gpu", size), &size, move |b, &s| {
+                    let device = device.clone();
+                    let random_data = fusor_random_data.clone();
+                    b.to_async(FuturesExecutor).iter_custom(async |iters| {
+                        let tensor = Tensor::new(&device, &random_data);
+                        tensor.materialize().await;
+                        let mut sum = Duration::ZERO;
+                        while sum.is_zero() {
+                            for _ in 0..iters {
+                                let start = std::time::Instant::now();
+                                let new = tensor.q_mat_mul(&q_matrix);
+                                new.materialize().await;
+                                sum += start.elapsed();
                             }
-                            sum
-                        });
-                    },
-                );
-            }
+                        }
+                        sum
+                    });
+                });
 
-            #[cfg(target_os = "macos")]
-            {
-                let candle_device = candle_core::Device::Metal(MetalDevice::new(0).unwrap());
-                bench_candle_with_device(
-                    &bytes,
-                    size,
-                    random_data.clone(),
-                    candle_device,
-                    "qmatmul-candle-metal",
-                    name,
-                    width,
-                    c,
-                );
-            }
+                if let Some(candle_device) = candle_gpu_device() {
+                    bench_candle_with_device(
+                        &bytes,
+                        size,
+                        random_data.clone(),
+                        candle_device,
+                        "candle-gpu",
+                        name,
+                        width,
+                        &mut group,
+                    );
+                }
 
-            {
-                let candle_device = candle_core::Device::Cpu;
-                bench_candle_with_device(
-                    &bytes,
-                    size,
-                    random_data.clone(),
-                    candle_device,
-                    "qmatmul-candle-cpu",
-                    name,
-                    width,
-                    c,
-                );
+                {
+                    let candle_device = candle_core::Device::Cpu;
+                    bench_candle_with_device(
+                        &bytes,
+                        size,
+                        random_data.clone(),
+                        candle_device,
+                        "candle-cpu",
+                        name,
+                        width,
+                        &mut group,
+                    );
+                }
+                group.finish();
             }
         }
     }
@@ -134,7 +140,7 @@ fn bench_candle_with_device(
     name: &str,
     matrix_name: &str,
     width: usize,
-    c: &mut Criterion,
+    group: &mut criterion::BenchmarkGroup<'_, criterion::measurement::WallTime>,
 ) {
     let mut reader = std::io::Cursor::new(&bytes);
     let candle_metadata = candle_core::quantized::gguf_file::Content::read(&mut reader).unwrap();
@@ -148,9 +154,6 @@ fn bench_candle_with_device(
         )
         .unwrap();
     let candle_q_matrix = candle_core::quantized::QMatMul::from_qtensor(candle_q_tensor).unwrap();
-    let mut group = c.benchmark_group(format!("{name}-{width}-{quantization:?}"));
-    let group = group.sample_size(20);
-
     group.bench_with_input(BenchmarkId::new(name, size), &size, move |b, &s| {
         b.to_async(FuturesExecutor).iter_batched(
             || {

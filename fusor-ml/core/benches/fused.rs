@@ -2,7 +2,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use criterion::{BatchSize, black_box};
+use criterion::BatchSize;
 use fusor_core::{Device, Tensor};
 use futures::executor::block_on;
 
@@ -15,16 +15,20 @@ use criterion::async_executor::FuturesExecutor;
 const SIZES: [usize; 3] = [100, 1000, 4000];
 
 fn fused(c: &mut Criterion) {
+    let mut group = c.benchmark_group("add-const");
+    group.sample_size(20);
+    group.plot_config(
+        criterion::PlotConfiguration::default().summary_scale(criterion::AxisScale::Logarithmic),
+    );
+
     {
-        let mut group = c.benchmark_group("add-const-fused-wgpu");
-        let group = group.sample_size(20);
         for size in SIZES {
             let device = block_on(Device::new()).unwrap();
             let tensor = Tensor::new(&device, &vec![vec![1.; size]; size]);
             block_on(tensor.as_slice()).unwrap();
 
             group.bench_with_input(
-                BenchmarkId::new("add-const-fused-wgpu", size),
+                BenchmarkId::new("fusor-gpu-fused", size),
                 &size,
                 move |b, &s| {
                     let device = device.clone();
@@ -48,15 +52,13 @@ fn fused(c: &mut Criterion) {
     }
 
     {
-        let mut group = c.benchmark_group("add-const-separate-wgpu");
-        let group = group.sample_size(20);
         for size in SIZES {
             let device = block_on(Device::new()).unwrap();
             let tensor = Tensor::new(&device, &vec![vec![1.; size]; size]);
             block_on(tensor.as_slice()).unwrap();
 
             group.bench_with_input(
-                BenchmarkId::new("add-const-separate-wgpu", size),
+                BenchmarkId::new("fusor-gpu-separate", size),
                 &size,
                 move |b, &s| {
                     let device = device.clone();
@@ -80,6 +82,7 @@ fn fused(c: &mut Criterion) {
             );
         }
     }
+    group.finish();
 }
 
 criterion_group!(benches, fused);

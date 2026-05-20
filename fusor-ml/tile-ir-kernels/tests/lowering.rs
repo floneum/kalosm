@@ -394,7 +394,14 @@ fn qmatmul_epilogue_fallback_ir(post: Option<&UnaryEpilogue>) -> fusor_tile_ir::
         let a = program.storage_read::<F32, 2>(Shape::new([2, 64]));
         let b = quantized_matrix(program, GgmlQuantFormat::Q8_0, 64, 64);
         let y = program.storage_write::<F32, 2>(Shape::new([2, 64]));
-        let epilogues = QmatmulEpilogues { pre: None, post };
+        let epilogues = QmatmulEpilogues {
+            pre: None,
+            pre_with_extras: None,
+            pre_extra_col_vectors: &[],
+            post,
+            post_with_extras: None,
+            post_extra_col_vectors: &[],
+        };
         qmatmul_with_epilogue::<64, 64, 32>(program, &a, &b, &y, 4, &epilogues);
     })
 }

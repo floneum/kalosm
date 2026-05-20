@@ -6,10 +6,11 @@ use std::{
 
 use crate::{
     DataTypeEnum, Layout,
+    compute_graph::layout_pass::LayoutPass,
     mir::{inputs::MirValue, kernel_backend::PreparedDirectDispatch, operation::Operation},
     nary_direct::eval_nary_expr_on_tiles,
     nary_wise::{ExtractedUnaryChain, NaryExpr, NaryOperation, UnaryFunctionChain},
-    quantized::matmul::QMatMulOperation,
+    quantized::matmul::{ElementwiseEpilogue, QMatMulOperation},
     tensor::TensorData,
 };
 use petgraph::algo::toposort;
@@ -1143,6 +1144,55 @@ impl Resolver {
             .fold(base.clone(), |layout, map| map.map_layout(&layout))
     }
 
+    fn infer_layout(
+        graph: &ComputeGraphInner,
+        inner_idx: NodeIndex,
+    ) -> Option<crate::TensorLayoutInfo> {
+        let mut pass = LayoutPass::default();
+        pass.visit(graph, inner_idx);
+        pass.output_layout.remove(&inner_idx)
+    }
+
+    fn try_normalize_qmatmul_post_extra(
+        &self,
+        graph: &ComputeGraphInner,
+        extra_inner: NodeIndex,
+        output_shape: &[usize],
+    ) -> Option<NodeIndex> {
+        let last_dim = *output_shape.last()?;
+        let extra_info = Self::infer_layout(graph, extra_inner)?;
+        if extra_info.datatype() != DataTypeEnum::F32 || extra_info.layout().shape() != output_shape
+        {
+            return None;
+        }
+
+        let layout = extra_info.layout();
+        let is_column_broadcast = layout.offset() == 0
+            && layout.strides().last().copied() == Some(1)
+            && layout.shape().last().copied() == Some(last_dim)
+            && layout.strides()[..layout.strides().len().saturating_sub(1)]
+                .iter()
+                .all(|stride| *stride == 0);
+        if !is_column_broadcast {
+            return None;
+        }
+
+        let (base_inner, _) = self
+            .walk_map_layout_chain(extra_inner)
+            .unwrap_or((extra_inner, Vec::new()));
+        let base_info = Self::infer_layout(graph, base_inner)?;
+        let base_layout = base_info.layout();
+        if base_info.datatype() == DataTypeEnum::F32
+            && base_layout.shape() == [last_dim]
+            && base_layout.is_contiguous()
+            && base_layout.offset() == 0
+        {
+            Some(base_inner)
+        } else {
+            None
+        }
+    }
+
     fn check_cached(&self, graph: &ComputeGraphInner, inner_idx: NodeIndex) -> bool {
         graph.get_cached_result(inner_idx).is_some()
     }
@@ -1585,47 +1635,166 @@ impl Resolver {
                     self.remove_node_if_dead(input_exec_idx);
                     return true;
                 }
-                // Parallel QMatMul arm: fold the unary chain into the qmatmul
-                // op's `post_element_wise`. The qgemv kernels consume it via
-                // `qgemv_with_epilogue` and apply it in-register before store.
-                // Only fires for single-row qgemv variants today (multi-row
-                // qmatmul tile paths don't yet support the epilogue parameter).
-                if let ComputeGraphNodeVariant::QMatMul(qmatmul_op) = input_variant {
-                    if el_op.functions.input_datatype() != crate::DataTypeEnum::F32
-                        || el_op.functions.out_datatype() != crate::DataTypeEnum::F32
-                    {
-                        return false;
-                    }
-                    let mut new_q = qmatmul_op.clone();
-                    let mut existing = new_q.post_element_wise.functions.clone();
-                    existing.extend(el_op.functions.functions.iter().cloned());
-                    new_q.post_element_wise = UnaryFunctionChain::new(
-                        existing,
-                        qmatmul_op.post_element_wise.input_datatype(),
-                    );
-
-                    self.execution_graph[node_idx].variant =
-                        ComputeGraphNodeVariant::QMatMul(new_q);
-
-                    let input_inner_of_qmatmul = qmatmul_op.input;
-                    if let Some(idx) = self.get_input_node_in_exec_graph(input_inner_of_qmatmul) {
-                        self.execution_graph.add_edge(idx, node_idx, ());
-                    }
-                    if let Some(edge) = self.execution_graph.find_edge(input_exec_idx, node_idx) {
-                        self.execution_graph.remove_edge(edge);
-                    }
-                    self.add_physical_dependencies(graph, node_idx, &[input_inner_of_qmatmul]);
-                    self.remove_node_if_dead(input_exec_idx);
-                    return true;
-                }
             }
         }
 
-        // Pre-op (QMatMul): fuse element-wise unary upstream of a single-row
-        // qmatmul input into `pre_element_wise`. For batched/tiled qmatmul,
-        // the transformed activation tile is reloaded for each output-column
-        // tile, so expensive chains like GELU would be recomputed many times.
-        // Keep those chains materialized once instead.
+        // Post-op (QMatMul): fuse a general single-input element-wise
+        // expression after qmatmul. This handles composite unary expressions
+        // like GELU, which are not representable as a linear unary chain.
+        if let ComputeGraphNodeVariant::Nary(nary) = &node_variant {
+            for (candidate_input_idx, &input_inner) in nary.inputs.iter().enumerate() {
+                if self.get_input_node_in_exec_graph(input_inner).is_none() {
+                    continue;
+                }
+                let (qmatmul_inner, map_chain) = self
+                    .walk_map_layout_chain(input_inner)
+                    .unwrap_or((input_inner, Vec::new()));
+                let Some(qmatmul_exec_idx) = self.get_input_node_in_exec_graph(qmatmul_inner)
+                else {
+                    continue;
+                };
+                let ComputeGraphNodeVariant::QMatMul(qmatmul_op) =
+                    self.execution_graph[qmatmul_exec_idx].variant.clone()
+                else {
+                    continue;
+                };
+                let mapped_layout = Self::apply_map_layout_chain(
+                    &Layout::contiguous(&qmatmul_op.out_shape),
+                    &map_chain,
+                );
+                if mapped_layout != Layout::contiguous(&nary.shape) {
+                    continue;
+                }
+                if !nary.expression.uses_input(candidate_input_idx)
+                    || nary
+                        .expression
+                        .uses_custom_indexing_for_input(candidate_input_idx)
+                {
+                    continue;
+                };
+                let Some(input_datatype) = nary
+                    .expression
+                    .elementwise_input_datatype(candidate_input_idx)
+                else {
+                    continue;
+                };
+                let mut mapping = vec![usize::MAX; nary.inputs.len()];
+                let mut extras = Vec::new();
+                let mut valid_expression = true;
+                for (input_idx, &nary_input) in nary.inputs.iter().enumerate() {
+                    let (base_inner, chain) = self
+                        .walk_map_layout_chain(nary_input)
+                        .unwrap_or((nary_input, Vec::new()));
+                    if base_inner == qmatmul_inner {
+                        let alias_layout = Self::apply_map_layout_chain(
+                            &Layout::contiguous(&qmatmul_op.out_shape),
+                            &chain,
+                        );
+                        if alias_layout == Layout::contiguous(&nary.shape)
+                            && !nary.expression.uses_custom_indexing_for_input(input_idx)
+                        {
+                            mapping[input_idx] = 0;
+                            continue;
+                        }
+                        valid_expression = false;
+                        break;
+                    }
+
+                    let Some(extra) =
+                        self.try_normalize_qmatmul_post_extra(graph, nary_input, &nary.shape)
+                    else {
+                        valid_expression = false;
+                        break;
+                    };
+                    mapping[input_idx] = extras.len() + 1;
+                    extras.push(extra);
+                }
+                if !valid_expression {
+                    continue;
+                }
+                let expression = nary.expression.remap_inputs(&mapping);
+                if self.check_cached(graph, input_inner)
+                    || input_datatype != crate::DataTypeEnum::F32
+                    || nary.output_datatype != crate::DataTypeEnum::F32
+                {
+                    continue;
+                }
+
+                let post_element_wise_expr =
+                    if let Some(existing) = &qmatmul_op.post_element_wise_expr {
+                        if existing.output_datatype != input_datatype {
+                            continue;
+                        }
+                        let mut mapping = Vec::with_capacity(1 + extras.len());
+                        mapping.push(0);
+                        mapping.extend((0..extras.len()).map(|i| i + 1 + existing.extras.len()));
+                        let shifted_expression = expression.remap_inputs(&mapping);
+                        let (expression, success) = Self::substitute_input_in_expr(
+                            &shifted_expression,
+                            0,
+                            &existing.expression,
+                        );
+                        if !success {
+                            continue;
+                        }
+                        let mut combined_extras = existing.extras.clone();
+                        combined_extras.extend(extras.clone());
+                        ElementwiseEpilogue {
+                            expression,
+                            extras: combined_extras,
+                            input_datatype: existing.input_datatype,
+                            output_datatype: nary.output_datatype,
+                        }
+                    } else {
+                        ElementwiseEpilogue {
+                            expression,
+                            extras: extras.clone(),
+                            input_datatype,
+                            output_datatype: nary.output_datatype,
+                        }
+                    };
+
+                let mut new_q = qmatmul_op.clone();
+                let deps_extras = post_element_wise_expr.extras.clone();
+                new_q.post_element_wise_expr = Some(post_element_wise_expr);
+
+                self.execution_graph[node_idx].variant = ComputeGraphNodeVariant::QMatMul(new_q);
+
+                let input_inner_of_qmatmul = qmatmul_op.input;
+                if let Some(idx) = self.get_input_node_in_exec_graph(input_inner_of_qmatmul) {
+                    self.execution_graph.add_edge(idx, node_idx, ());
+                }
+                for extra in &deps_extras {
+                    if let Some(idx) = self.get_input_node_in_exec_graph(*extra)
+                        && self.execution_graph.find_edge(idx, node_idx).is_none()
+                    {
+                        self.execution_graph.add_edge(idx, node_idx, ());
+                    }
+                }
+                for input in &nary.inputs {
+                    if let Some(input_exec) = self.get_input_node_in_exec_graph(*input) {
+                        if let Some(edge) = self.execution_graph.find_edge(input_exec, node_idx) {
+                            self.execution_graph.remove_edge(edge);
+                        }
+                    }
+                }
+                let mut deps = vec![input_inner_of_qmatmul];
+                deps.extend(deps_extras);
+                self.add_physical_dependencies(graph, node_idx, &deps);
+                for input in &nary.inputs {
+                    if let Some(input_exec) = self.get_input_node_in_exec_graph(*input) {
+                        self.remove_node_if_dead(input_exec);
+                    }
+                }
+                return true;
+            }
+        }
+
+        // Pre-op (QMatMul): fuse a general element-wise expression upstream
+        // of a single-row qmatmul input. For batched/tiled qmatmul, the
+        // transformed activation tile is reloaded for each output-column
+        // tile, so expensive expressions like GELU would be recomputed many
+        // times. Keep those chains materialized once instead.
         if let ComputeGraphNodeVariant::QMatMul(qmatmul_op) = &node_variant
             && qmatmul_op.in_shape[..qmatmul_op.in_shape.len() - 1]
                 .iter()
@@ -1633,35 +1802,147 @@ impl Resolver {
                 == 1
             && !self.check_cached(graph, qmatmul_op.input)
             && let Some(input_exec) = self.get_input_node_in_exec_graph(qmatmul_op.input)
-            && let Some(el_op) =
-                Self::try_get_unary_chain(&self.execution_graph[input_exec].variant)
         {
-            if el_op.functions.input_datatype() != crate::DataTypeEnum::F32
-                || el_op.functions.out_datatype() != crate::DataTypeEnum::F32
-            {
+            let (nary_inner, nary_map_chain) = self
+                .walk_map_layout_chain(qmatmul_op.input)
+                .unwrap_or((qmatmul_op.input, Vec::new()));
+            let Some(nary_exec) = self.get_input_node_in_exec_graph(nary_inner) else {
+                return false;
+            };
+            let ComputeGraphNodeVariant::Nary(nary) =
+                self.execution_graph[nary_exec].variant.clone()
+            else {
+                return false;
+            };
+            let mapped_layout =
+                Self::apply_map_layout_chain(&Layout::contiguous(&nary.shape), &nary_map_chain);
+            if mapped_layout != Layout::contiguous(&qmatmul_op.in_shape) {
                 return false;
             }
-            let mut new_q = qmatmul_op.clone();
-            new_q.input = el_op.value;
-            let mut functions = el_op.functions.functions.clone();
-            functions.extend(new_q.pre_element_wise.functions.iter().cloned());
-            new_q.pre_element_wise =
-                UnaryFunctionChain::new(functions, el_op.functions.input_datatype());
 
-            self.execution_graph[node_idx].variant =
-                ComputeGraphNodeVariant::QMatMul(new_q.clone());
+            for (candidate_input_idx, &primary_input) in nary.inputs.iter().enumerate() {
+                if !nary.expression.uses_input(candidate_input_idx)
+                    || nary
+                        .expression
+                        .uses_custom_indexing_for_input(candidate_input_idx)
+                {
+                    continue;
+                }
+                let Some(input_datatype) = nary
+                    .expression
+                    .elementwise_input_datatype(candidate_input_idx)
+                else {
+                    continue;
+                };
+                if input_datatype != crate::DataTypeEnum::F32
+                    || nary.output_datatype != crate::DataTypeEnum::F32
+                {
+                    continue;
+                }
 
-            if new_q.input != qmatmul_op.input {
+                let (primary_inner, primary_chain) = self
+                    .walk_map_layout_chain(primary_input)
+                    .unwrap_or((primary_input, Vec::new()));
+                let Some(primary_info) = Self::infer_layout(graph, primary_inner) else {
+                    continue;
+                };
+                let primary_layout =
+                    Self::apply_map_layout_chain(primary_info.layout(), &primary_chain);
+                if primary_layout != Layout::contiguous(&nary.shape) {
+                    continue;
+                }
+
+                let mut mapping = vec![usize::MAX; nary.inputs.len()];
+                let mut extras = Vec::new();
+                let mut valid_expression = true;
+                for (input_idx, &nary_input) in nary.inputs.iter().enumerate() {
+                    let (base_inner, chain) = self
+                        .walk_map_layout_chain(nary_input)
+                        .unwrap_or((nary_input, Vec::new()));
+                    if base_inner == primary_inner {
+                        let alias_layout =
+                            Self::apply_map_layout_chain(primary_info.layout(), &chain);
+                        if alias_layout == Layout::contiguous(&nary.shape)
+                            && !nary.expression.uses_custom_indexing_for_input(input_idx)
+                        {
+                            mapping[input_idx] = 0;
+                            continue;
+                        }
+                        valid_expression = false;
+                        break;
+                    }
+
+                    let Some(extra) =
+                        self.try_normalize_qmatmul_post_extra(graph, nary_input, &nary.shape)
+                    else {
+                        valid_expression = false;
+                        break;
+                    };
+                    mapping[input_idx] = extras.len() + 1;
+                    extras.push(extra);
+                }
+                if !valid_expression {
+                    continue;
+                }
+                let expression = nary.expression.remap_inputs(&mapping);
+
+                let pre_element_wise_expr =
+                    if let Some(existing) = &qmatmul_op.pre_element_wise_expr {
+                        if existing.input_datatype != nary.output_datatype {
+                            continue;
+                        }
+                        let mut mapping = Vec::with_capacity(1 + existing.extras.len());
+                        mapping.push(0);
+                        mapping.extend((0..existing.extras.len()).map(|i| i + 1 + extras.len()));
+                        let shifted_existing = existing.expression.remap_inputs(&mapping);
+                        let (expression, success) =
+                            Self::substitute_input_in_expr(&shifted_existing, 0, &expression);
+                        if !success {
+                            continue;
+                        }
+                        let mut combined_extras = extras.clone();
+                        combined_extras.extend(existing.extras.clone());
+                        ElementwiseEpilogue {
+                            expression,
+                            extras: combined_extras,
+                            input_datatype,
+                            output_datatype: existing.output_datatype,
+                        }
+                    } else {
+                        ElementwiseEpilogue {
+                            expression,
+                            extras: extras.clone(),
+                            input_datatype,
+                            output_datatype: nary.output_datatype,
+                        }
+                    };
+
+                let mut new_q = qmatmul_op.clone();
+                let deps_extras = pre_element_wise_expr.extras.clone();
+                new_q.input = primary_inner;
+                new_q.pre_element_wise_expr = Some(pre_element_wise_expr);
+
                 if let Some(edge) = self.execution_graph.find_edge(input_exec, node_idx) {
                     self.execution_graph.remove_edge(edge);
                 }
                 if let Some(new) = self.get_input_node_in_exec_graph(new_q.input) {
                     self.execution_graph.add_edge(new, node_idx, ());
                 }
+                for extra in &deps_extras {
+                    if let Some(idx) = self.get_input_node_in_exec_graph(*extra)
+                        && self.execution_graph.find_edge(idx, node_idx).is_none()
+                    {
+                        self.execution_graph.add_edge(idx, node_idx, ());
+                    }
+                }
+                self.execution_graph[node_idx].variant =
+                    ComputeGraphNodeVariant::QMatMul(new_q.clone());
                 self.remove_node_if_dead(input_exec);
+                let mut deps = vec![new_q.input];
+                deps.extend(deps_extras);
+                self.add_physical_dependencies(graph, node_idx, &deps);
+                return true;
             }
-            self.add_physical_dependencies(graph, node_idx, &[new_q.input]);
-            return true;
         }
 
         // Pre-op: fuse elementwise before matmul inputs
@@ -1740,7 +2021,7 @@ impl Resolver {
     /// The check walks one Nary node back through a pair of MapLayout views to a
     /// common QMatMul, verifies the views form a `[gate; up]` split along the
     /// last dim, and synthesizes a `PairedEpilogue` that re-emits the captured
-    /// unary chain at the tile-IR level via `apply_unary_function_chain`.
+    /// expression at the tile-IR level.
     fn try_fuse_paired_qmatmul(
         &mut self,
         graph: &mut ComputeGraphInner,

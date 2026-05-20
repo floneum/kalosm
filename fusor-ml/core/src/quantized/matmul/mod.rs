@@ -18,8 +18,8 @@ use crate::{
         },
         workgroup_shape::{Constraint, WorkgroupShapeConstraints},
     },
-    nary_direct::apply_unary_function_chain,
-    nary_wise::UnaryFunctionChain,
+    nary_direct::apply_single_input_elementwise_expr,
+    nary_wise::NaryExpr,
 };
 use fusor_gguf::GgmlType;
 use fusor_tile_ir as tile_ir;
@@ -376,7 +376,7 @@ fn qmatmul_operation_inputs(
 }
 
 fn qmatmul_operation_output(inputs: &[MirValue]) -> MirValue {
-    let output_tensor = inputs[2].as_tensor().unwrap();
+    let output_tensor = inputs.last().unwrap().as_tensor().unwrap();
     output_tensor.clone().into()
 }
 
@@ -415,6 +415,14 @@ pub(crate) struct PairedConfig {
     pub(crate) extras: Vec<NodeIndex>,
 }
 
+#[derive(Debug, Clone, Hash)]
+pub(crate) struct ElementwiseEpilogue {
+    pub(crate) expression: NaryExpr,
+    pub(crate) extras: Vec<NodeIndex>,
+    pub(crate) input_datatype: DataTypeEnum,
+    pub(crate) output_datatype: DataTypeEnum,
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct QMatMulOperation {
     pub(crate) input_datatype: DataTypeEnum,
@@ -422,21 +430,17 @@ pub(crate) struct QMatMulOperation {
     pub(crate) matrix: QMatrix,
     pub(crate) in_shape: Box<[usize]>,
     pub(crate) out_shape: Box<[usize]>,
-    /// Unary chain applied to each loaded activation tile in-register before
-    /// the dot product. Populated by the resolver's pre-op arm of
-    /// `try_fuse_into_matmul` when the upstream of the qmatmul is an
-    /// element-wise Nary that can be evaluated tile-locally. Empty by default,
-    /// and must stay empty when `paired.is_some()` (the paired closure
-    /// already encodes any per-tile transformation).
-    pub(crate) pre_element_wise: UnaryFunctionChain,
-    /// Unary chain applied to each output column in-register after the
-    /// reduction and before the store. Empty by default; ignored when
-    /// `paired.is_some()`.
-    pub(crate) post_element_wise: UnaryFunctionChain,
+    /// General single-input element-wise expression applied to each loaded
+    /// activation before the dot product.
+    pub(crate) pre_element_wise_expr: Option<ElementwiseEpilogue>,
+    /// General single-input element-wise expression applied after reduction
+    /// and before store. This covers composite unary expressions like GELU
+    /// that are not representable as a linear unary chain.
+    pub(crate) post_element_wise_expr: Option<ElementwiseEpilogue>,
     /// When `Some`, this operation produces a paired output (`out_shape[-1]`
     /// = `paired.pair_len`, half of `matrix.shape[0]`) and dispatches to the
     /// `qgemv_q4k_paired_*` kernel family. When `None`, it's a plain
-    /// quantized matmul with optional pre/post unary chains.
+    /// quantized matmul with optional pre/post expression epilogues.
     pub(crate) paired: Option<PairedConfig>,
 }
 
@@ -458,8 +462,8 @@ impl QMatMulOperation {
             matrix,
             in_shape: input_shape.into(),
             out_shape,
-            pre_element_wise: UnaryFunctionChain::empty(input_datatype),
-            post_element_wise: UnaryFunctionChain::empty(input_datatype),
+            pre_element_wise_expr: None,
+            post_element_wise_expr: None,
             paired: None,
         }
     }
@@ -495,8 +499,8 @@ impl QMatMulOperation {
             matrix,
             in_shape: input_shape.into(),
             out_shape,
-            pre_element_wise: UnaryFunctionChain::empty(input_datatype),
-            post_element_wise: UnaryFunctionChain::empty(input_datatype),
+            pre_element_wise_expr: None,
+            post_element_wise_expr: None,
             paired: Some(PairedConfig {
                 epilogue,
                 pair_len,
@@ -517,12 +521,14 @@ impl QMatMulOperation {
 pub(crate) struct DirectKernelTensors<'a> {
     pub input: &'a TensorData,
     pub matrix: &'a QMatrix,
+    pub pre_extra_col_vectors: &'a [&'a TensorData],
+    pub post_extra_col_vectors: &'a [&'a TensorData],
     pub output: &'a TensorData,
 }
 
 pub(crate) struct DirectKernelChains<'a> {
-    pub pre: Option<&'a UnaryFunctionChain>,
-    pub post: Option<&'a UnaryFunctionChain>,
+    pub pre_expr: Option<&'a ElementwiseEpilogue>,
+    pub post_expr: Option<&'a ElementwiseEpilogue>,
 }
 
 impl QMatMulOperation {
@@ -541,11 +547,13 @@ impl QMatMulOperation {
         let DirectKernelTensors {
             input,
             matrix,
+            pre_extra_col_vectors,
+            post_extra_col_vectors,
             output,
         } = tensors;
         let DirectKernelChains {
-            pre: pre_chain,
-            post: post_chain,
+            pre_expr,
+            post_expr,
         } = chains;
         if input.datatype() != DataTypeEnum::F32 || output.datatype() != DataTypeEnum::F32 {
             return None;
@@ -570,29 +578,73 @@ impl QMatMulOperation {
         }
 
         // Build the per-tile epilogue closures once. `None` if the resolver
-        // didn't attach a chain; `Some` triggers the `_with_epilogue` kernel
-        // variants. The closures capture the chains by clone so they can live
-        // in the long-lived `tile_ir::tile::build` closure below.
-        let pre_epilogue = pre_chain.filter(|c| !c.functions.is_empty()).map(|chain| {
-            let chain = chain.clone();
-            let datatype = chain.input_datatype();
-            tile_ir_kernels::UnaryEpilogue::new("qmatmul_pre_chain", move |tile| {
-                apply_unary_function_chain(tile, datatype, &chain)
-                    .expect("pre-chain validated at fuse time")
+        // didn't attach an expression; `Some` triggers the `_with_epilogue`
+        // kernel variants. The closures capture expressions by clone so they
+        // can live in the long-lived `tile_ir::tile::build` closure below.
+        let pre_epilogue_with_extras = if let Some(expr) = pre_expr {
+            let expression = expr.expression.clone();
+            let input_datatype = expr.input_datatype;
+            let output_datatype = expr.output_datatype;
+            Some(tile_ir_kernels::UnaryEpilogueWithExtras::new(
+                "qmatmul_pre_expr",
+                pre_extra_col_vectors.len(),
+                move |tile| {
+                    let input = tile[0].clone();
+                    let extras = tile[1..]
+                        .iter()
+                        .cloned()
+                        .map(|value| (crate::nary_direct::ValueTile::F32(value), DataTypeEnum::F32))
+                        .collect::<Vec<_>>();
+                    apply_single_input_elementwise_expr(
+                        input,
+                        input_datatype,
+                        &expression,
+                        output_datatype,
+                        &extras,
+                    )
+                    .expect("pre expression validated at fuse time")
                     .0
-            })
-        });
-        let post_epilogue = post_chain.filter(|c| !c.functions.is_empty()).map(|chain| {
-            let chain = chain.clone();
-            let datatype = chain.input_datatype();
-            tile_ir_kernels::UnaryEpilogue::new("qmatmul_post_chain", move |tile| {
-                apply_unary_function_chain(tile, datatype, &chain)
-                    .expect("post-chain validated at fuse time")
+                },
+            ))
+        } else {
+            None
+        };
+        let post_epilogue_with_extras = if let Some(expr) = post_expr {
+            let expression = expr.expression.clone();
+            let input_datatype = expr.input_datatype;
+            let output_datatype = expr.output_datatype;
+            Some(tile_ir_kernels::UnaryEpilogueWithExtras::new(
+                "qmatmul_post_expr",
+                post_extra_col_vectors.len(),
+                move |tile| {
+                    let input = tile[0].clone();
+                    let extras = tile[1..]
+                        .iter()
+                        .cloned()
+                        .map(|value| (crate::nary_direct::ValueTile::F32(value), DataTypeEnum::F32))
+                        .collect::<Vec<_>>();
+                    apply_single_input_elementwise_expr(
+                        input,
+                        input_datatype,
+                        &expression,
+                        output_datatype,
+                        &extras,
+                    )
+                    .expect("post expression validated at fuse time")
                     .0
-            })
-        });
-        let epilogue_identity = pre_epilogue.as_ref().map(|e| e.identity()).unwrap_or(0)
-            ^ post_epilogue.as_ref().map(|e| e.identity()).unwrap_or(0);
+                },
+            ))
+        } else {
+            None
+        };
+        let epilogue_identity = pre_epilogue_with_extras
+            .as_ref()
+            .map(|e| e.identity())
+            .unwrap_or(0)
+            ^ post_epilogue_with_extras
+                .as_ref()
+                .map(|e| e.identity())
+                .unwrap_or(0);
 
         let limits = device.limits();
         let caps = KernelDeviceCaps::from_device(device);
@@ -646,8 +698,10 @@ impl QMatMulOperation {
         // The pre-built-pipeline fast path can only be reused when there's no
         // epilogue attached — otherwise the cached pipeline encodes the wrong
         // (no-epilogue) kernel. Skip the fast path entirely when fusing.
-        if pre_epilogue.is_none()
-            && post_epilogue.is_none()
+        if pre_extra_col_vectors.is_empty()
+            && post_extra_col_vectors.is_empty()
+            && pre_epilogue_with_extras.is_none()
+            && post_epilogue_with_extras.is_none()
             && let Some(dispatch_size) = fast_dispatch_size
         {
             if dispatch_size.iter().any(|dim| *dim > max_workgroups) {
@@ -705,15 +759,35 @@ impl QMatMulOperation {
                 );
             }
         }
-        let pre_for_ir = pre_epilogue.clone();
-        let post_for_ir = post_epilogue.clone();
+        let pre_with_extras_for_ir = pre_epilogue_with_extras.clone();
+        let post_with_extras_for_ir = post_epilogue_with_extras.clone();
         let ir = tile_ir::tile::build(move |phase| {
             let a = tile_storage_read_with_direct_layout(phase, a_view);
             let b = tile_ir_kernels::quantized_matrix(phase, format, k, n);
+            let pre_extra_storages = pre_extra_col_vectors
+                .iter()
+                .map(|extra| {
+                    let shape = extra.layout().shape();
+                    assert_eq!(shape.len(), 1);
+                    phase.storage_read::<tile_ir::F32, 1>(tile_ir::Shape::new([shape[0] as u32]))
+                })
+                .collect::<Vec<_>>();
+            let post_extra_storages = post_extra_col_vectors
+                .iter()
+                .map(|extra| {
+                    let shape = extra.layout().shape();
+                    assert_eq!(shape.len(), 1);
+                    phase.storage_read::<tile_ir::F32, 1>(tile_ir::Shape::new([shape[0] as u32]))
+                })
+                .collect::<Vec<_>>();
             let y = tile_storage_write_with_direct_layout(phase, y_view);
             let epilogues = tile_ir_kernels::QmatmulEpilogues {
-                pre: pre_for_ir.as_ref(),
-                post: post_for_ir.as_ref(),
+                pre: None,
+                pre_with_extras: pre_with_extras_for_ir.as_ref(),
+                pre_extra_col_vectors: &pre_extra_storages,
+                post: None,
+                post_with_extras: post_with_extras_for_ir.as_ref(),
+                post_extra_col_vectors: &post_extra_storages,
             };
             if use_workgroup_qmatmul {
                 if m == 1 {
@@ -823,6 +897,8 @@ impl QMatMulOperation {
             matrix,
             pipeline_key,
             input,
+            pre_extra_col_vectors,
+            post_extra_col_vectors,
             output,
             dispatch_size,
             || Some(ir),
@@ -883,10 +959,35 @@ fn qmatmul_direct_kernel_from_ir(
     matrix: &QMatrix,
     pipeline_key: QMatMulDirectPipelineKey,
     input: &TensorData,
+    pre_extra_col_vectors: &[&TensorData],
+    post_extra_col_vectors: &[&TensorData],
     output: &TensorData,
     dispatch_size: [u32; 3],
     build_ir: impl FnOnce() -> Option<tile_ir::KernelIr>,
 ) -> Option<DirectKernel> {
+    if !pre_extra_col_vectors.is_empty() || !post_extra_col_vectors.is_empty() {
+        let buffers = std::iter::once(input.buffer().clone())
+            .chain(std::iter::once(matrix.buffer().clone()))
+            .chain(
+                pre_extra_col_vectors
+                    .iter()
+                    .map(|tensor| tensor.buffer().clone()),
+            )
+            .chain(
+                post_extra_col_vectors
+                    .iter()
+                    .map(|tensor| tensor.buffer().clone()),
+            )
+            .chain(std::iter::once(output.buffer().clone()));
+        return kernel_backend::dynamic_kernel_from_ir(
+            device.kernel_cache(),
+            kernel_name,
+            cache_key,
+            build_ir,
+            buffers,
+            dispatch_size,
+        );
+    }
     if let Some(kernel) = cached_qmatmul_direct_kernel(
         &cached_kernel_name,
         matrix,
@@ -1137,6 +1238,16 @@ impl Operation for QMatMulOperation {
 
     fn visit_dependencies(&self, f: &mut dyn FnMut(NodeIndex)) {
         f(self.input);
+        if let Some(epilogue) = &self.pre_element_wise_expr {
+            for extra in &epilogue.extras {
+                f(*extra);
+            }
+        }
+        if let Some(epilogue) = &self.post_element_wise_expr {
+            for extra in &epilogue.extras {
+                f(*extra);
+            }
+        }
         if let Some(paired) = &self.paired {
             for extra in &paired.extras {
                 f(*extra);
@@ -1146,6 +1257,29 @@ impl Operation for QMatMulOperation {
 
     fn inputs(&self, nodes: &crate::compute_graph::ComputeGraphInner) -> Vec<MirValue> {
         let base = qmatmul_operation_inputs(self.input, &self.matrix, &self.out_shape, nodes);
+        if self.paired.is_none() {
+            let pre_extras = self
+                .pre_element_wise_expr
+                .as_ref()
+                .map(|epilogue| epilogue.extras.as_slice())
+                .unwrap_or(&[]);
+            let post_extras = self
+                .post_element_wise_expr
+                .as_ref()
+                .map(|epilogue| epilogue.extras.as_slice())
+                .unwrap_or(&[]);
+            if pre_extras.is_empty() && post_extras.is_empty() {
+                return base;
+            }
+            let mut result = Vec::with_capacity(base.len() + pre_extras.len() + post_extras.len());
+            let (head, tail) = base.split_at(2);
+            result.extend_from_slice(head);
+            for extra in pre_extras.iter().chain(post_extras.iter()) {
+                result.push(nodes.get_cached_result(*extra).unwrap().clone().into());
+            }
+            result.extend_from_slice(tail);
+            return result;
+        }
         let Some(paired) = &self.paired else {
             return base;
         };
@@ -1174,16 +1308,58 @@ impl Operation for QMatMulOperation {
         if let Some(paired) = &self.paired {
             return self.build_paired_direct_kernel(graph, paired, inputs);
         }
-        let [input, matrix, output] = inputs else {
+        if inputs.len() < 3 {
+            return None;
+        }
+        let input = inputs[0].as_tensor()?;
+        let MirValue::QMatrix(matrix) = &inputs[1] else {
             return None;
         };
-        let input = input.as_tensor()?;
-        let MirValue::QMatrix(matrix) = matrix else {
+        let output = inputs.last()?.as_tensor()?;
+        let pre_extra_count = self
+            .pre_element_wise_expr
+            .as_ref()
+            .map(|epilogue| epilogue.extras.len())
+            .unwrap_or(0);
+        let post_extra_count = self
+            .post_element_wise_expr
+            .as_ref()
+            .map(|epilogue| epilogue.extras.len())
+            .unwrap_or(0);
+        if inputs.len() != 3 + pre_extra_count + post_extra_count {
             return None;
-        };
-        let output = output.as_tensor()?;
+        }
+        let extras = &inputs[2..inputs.len() - 1];
+        let pre_extra_col_vectors = extras[..pre_extra_count]
+            .iter()
+            .map(|input| input.as_tensor())
+            .collect::<Option<Vec<_>>>()?;
+        let post_extra_col_vectors = extras[pre_extra_count..]
+            .iter()
+            .map(|input| input.as_tensor())
+            .collect::<Option<Vec<_>>>()?;
         if input.datatype() != DataTypeEnum::F32 || output.datatype() != DataTypeEnum::F32 {
             return None;
+        }
+        for extra in &pre_extra_col_vectors {
+            if extra.datatype() != DataTypeEnum::F32
+                || extra.layout().shape().len() != 1
+                || extra.layout().shape()[0] != input.layout().shape().last().copied().unwrap_or(0)
+                || extra.layout().offset() != 0
+                || extra.layout().strides() != [1]
+            {
+                return None;
+            }
+        }
+        for extra in &post_extra_col_vectors {
+            if extra.datatype() != DataTypeEnum::F32
+                || extra.layout().shape().len() != 1
+                || extra.layout().shape()[0] != output.layout().shape().last().copied().unwrap_or(0)
+                || extra.layout().offset() != 0
+                || extra.layout().strides() != [1]
+            {
+                return None;
+            }
         }
         if matrix.datatype() == GgmlType::F32 {
             return self.build_dense_direct_kernel(graph, input, matrix, output);
@@ -1193,12 +1369,14 @@ impl Operation for QMatMulOperation {
             DirectKernelTensors {
                 input,
                 matrix,
+                pre_extra_col_vectors: &pre_extra_col_vectors,
+                post_extra_col_vectors: &post_extra_col_vectors,
                 output,
             },
             self.name(),
             DirectKernelChains {
-                pre: Some(&self.pre_element_wise),
-                post: Some(&self.post_element_wise),
+                pre_expr: self.pre_element_wise_expr.as_ref(),
+                post_expr: self.post_element_wise_expr.as_ref(),
             },
             Some((self, inputs)),
         )
@@ -1316,6 +1494,8 @@ impl QMatMulOperation {
                 matrix,
                 pipeline_key,
                 input,
+                &[],
+                &[],
                 output,
                 dispatch_size,
                 || {
@@ -1541,8 +1721,8 @@ mod tests {
             matrix: matrix.clone(),
             in_shape: Box::new([1, weight_shape[1]]),
             out_shape: Box::new([1, weight_shape[0]]),
-            pre_element_wise: UnaryFunctionChain::empty(DataTypeEnum::F32),
-            post_element_wise: UnaryFunctionChain::empty(DataTypeEnum::F32),
+            pre_element_wise_expr: None,
+            post_element_wise_expr: None,
             paired: None,
         };
         let kernel = operation

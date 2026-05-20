@@ -39,6 +39,7 @@ members = [
     "fusor-ml/types",
     "fusor-ml/tile-ir",
     "fusor-ml/tile-ir-kernels",
+    "fusor-ml/lavapipe-subgroups",
     "fusor-ml/tile-ir-runtime",
 ]
 

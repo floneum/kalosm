@@ -2,7 +2,6 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use candle_core::MetalDevice;
 use candle_core::backend::BackendDevice;
 use criterion::BatchSize;
 use fusor_core::{Device, Tensor};
@@ -15,6 +14,12 @@ use criterion::{criterion_group, criterion_main};
 
 use criterion::async_executor::FuturesExecutor;
 
+fn candle_gpu_device() -> Option<candle_core::Device> {
+    candle_core::Device::new_cuda(0)
+        .or_else(|_| candle_core::Device::new_metal(0))
+        .ok()
+}
+
 const SIZES: [usize; 3] = [100, 1000, 4000];
 
 fn softmax_slow(tensor: &Tensor<2, f32>) -> Tensor<2, f32> {
@@ -26,9 +31,13 @@ fn softmax_slow(tensor: &Tensor<2, f32>) -> Tensor<2, f32> {
 }
 
 fn bench_softmax(c: &mut Criterion) {
+    let mut group = c.benchmark_group("softmax");
+    group.sample_size(20);
+    group.plot_config(
+        criterion::PlotConfiguration::default().summary_scale(criterion::AxisScale::Logarithmic),
+    );
+
     {
-        let mut group = c.benchmark_group("softmax-slow-wgpu");
-        let group = group.sample_size(20);
         for size in SIZES {
             let device = block_on(Device::new()).unwrap();
 
@@ -36,7 +45,7 @@ fn bench_softmax(c: &mut Criterion) {
                 .map(|_| (0..size).map(|_| rand::random()).collect())
                 .collect();
             group.bench_with_input(
-                BenchmarkId::new("softmax-slow-wgpu", size),
+                BenchmarkId::new("fusor-gpu-slow", size),
                 &size,
                 move |b, &s| {
                     let device = device.clone();
@@ -60,53 +69,49 @@ fn bench_softmax(c: &mut Criterion) {
     }
 
     {
-        let mut group = c.benchmark_group("softmax-wgpu");
-        let group = group.sample_size(20);
         for size in SIZES {
             let device = block_on(Device::new()).unwrap();
 
             let random_data: Vec<Vec<f32>> = (0..size)
                 .map(|_| (0..size).map(|_| rand::random()).collect())
                 .collect();
-            group.bench_with_input(
-                BenchmarkId::new("softmax-wgpu", size),
-                &size,
-                move |b, &s| {
-                    let device = device.clone();
-                    b.to_async(FuturesExecutor).iter_custom(async |iters| {
-                        let mut sum = Duration::ZERO;
-                        while sum.is_zero() {
-                            for _ in 0..iters {
-                                let tensor = Tensor::new(&device, &random_data);
-                                _ = tensor.as_slice().await.unwrap();
-                                let new = tensor.softmax_last_dim();
-                                let start = std::time::Instant::now();
-                                new.materialize().await;
-                                sum += start.elapsed();
-                            }
+            group.bench_with_input(BenchmarkId::new("fusor-gpu", size), &size, move |b, &s| {
+                let device = device.clone();
+                b.to_async(FuturesExecutor).iter_custom(async |iters| {
+                    let mut sum = Duration::ZERO;
+                    while sum.is_zero() {
+                        for _ in 0..iters {
+                            let tensor = Tensor::new(&device, &random_data);
+                            _ = tensor.as_slice().await.unwrap();
+                            let new = tensor.softmax_last_dim();
+                            let start = std::time::Instant::now();
+                            new.materialize().await;
+                            sum += start.elapsed();
                         }
-                        sum
-                    })
-                },
-            );
+                    }
+                    sum
+                })
+            });
         }
     }
 
     {
         let candle_device = candle_core::Device::Cpu;
-        bench_candle_with_device(candle_device, "softmax-candle-cpu", c);
+        bench_candle_with_device(candle_device, "candle-cpu", &mut group);
     }
 
-    #[cfg(target_os = "macos")]
-    {
-        let candle_device = candle_core::Device::Metal(MetalDevice::new(0).unwrap());
-        bench_candle_with_device(candle_device, "softmax-candle-metal", c);
+    if let Some(candle_device) = candle_gpu_device() {
+        bench_candle_with_device(candle_device, "candle-gpu", &mut group);
     }
+
+    group.finish();
 }
 
-fn bench_candle_with_device(candle_device: candle_core::Device, name: &str, c: &mut Criterion) {
-    let mut group = c.benchmark_group(name);
-    let group = group.sample_size(20);
+fn bench_candle_with_device(
+    candle_device: candle_core::Device,
+    name: &str,
+    group: &mut criterion::BenchmarkGroup<'_, criterion::measurement::WallTime>,
+) {
     for size in SIZES {
         let candle_device = candle_device.clone();
         group.bench_with_input(BenchmarkId::new(name, size), &size, move |b, &s| {

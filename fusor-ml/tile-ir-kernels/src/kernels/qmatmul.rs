@@ -8,7 +8,10 @@ use crate::{
         coop_load_a_fragments, coop_load_b_fragments, coop_mma_grid, coop_store_acc_grid,
         zero_coop_acc_grid,
     },
-    types::{apply_optional_epilogue, cooperative_store_layout_supported, matrix_shape},
+    types::{
+        apply_qmatmul_post_epilogue, apply_qmatmul_pre_epilogue,
+        cooperative_store_layout_supported, matrix_shape,
+    },
 };
 
 /// Top-level quantized matrix multiply with optional activation/output
@@ -72,7 +75,9 @@ pub(crate) fn qmatmul_tile_with_epilogue<const BM: usize, const BN: usize, const
     let [m, k] = matrix_shape(&a.view().layout);
 
     if epilogues.pre.is_none()
+        && epilogues.pre_with_extras.is_none()
         && epilogues.post.is_none()
+        && epilogues.post_with_extras.is_none()
         && qmatmul_try_coop::<BM, BN, BK>(program, a, b, y)
     {
         return;
@@ -100,16 +105,24 @@ pub(crate) fn qmatmul_tile_with_epilogue<const BM: usize, const BN: usize, const
                 |program, loop_index| {
                     let k_index = loop_index * BK as u32 + k_lane.clone();
                     let mask = row.lt(m).and(col.lt(b.cols)).and(k_index.lt(k));
-                    let a_value = apply_optional_epilogue(
-                        epilogues.pre,
-                        program.load(a.at((&row, &k_index)), mask.clone(), 0.0),
-                    );
+                    let loaded = program.load(a.at((&row, &k_index)), mask.clone(), 0.0);
+                    let pre_extras = epilogues
+                        .pre_extra_col_vectors
+                        .iter()
+                        .map(|extra| program.load(extra.at(&k_index), k_index.lt(k), 0.0))
+                        .collect::<Vec<_>>();
+                    let a_value = apply_qmatmul_pre_epilogue(epilogues, loaded, pre_extras);
                     let b_value = program.load_quantized(b, &k_index, &col, mask.clone(), 0.0);
                     a_value * b_value
                 },
             );
-            let sum =
-                apply_optional_epilogue(epilogues.post, program.group_reduce_sum::<BK, _>(partial));
+            let reduced = program.group_reduce_sum::<BK, _>(partial);
+            let extras = epilogues
+                .post_extra_col_vectors
+                .iter()
+                .map(|extra| program.load(extra.at(&col), col.lt(b.cols), 0.0))
+                .collect::<Vec<_>>();
+            let sum = apply_qmatmul_post_epilogue(epilogues, reduced, extras);
             let store_mask = k_lane.eq(0).and(row.lt(m)).and(col.lt(b.cols));
             program.store(y.at((row, col)), sum, store_mask);
         },

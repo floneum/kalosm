@@ -25,8 +25,9 @@
 use fusor_tile_ir::tile::{Mask, Program, Storage, Tile, TileBlock, Workgroup};
 use fusor_tile_ir::{QuantizedMatrix, TileLiteral, TileReduceOp, WorkgroupAxis, F32, U32};
 
-use crate::types::{apply_optional_epilogue, matrix_shape, QmatmulEpilogues};
-use crate::UnaryEpilogue;
+use crate::types::{
+    apply_qmatmul_post_epilogue, apply_qmatmul_pre_epilogue, matrix_shape, QmatmulEpilogues,
+};
 
 const QMATMUL_LANES: usize = 64;
 const QGEMV_LANES: usize = 64;
@@ -64,7 +65,7 @@ fn stage_f32_tile_with_pre<const ROWS: usize, const COLS: usize, const LANES: us
     tile_active: &Mask,
     src_rows: u32,
     src_cols: u32,
-    pre: Option<&UnaryEpilogue>,
+    epilogues: &QmatmulEpilogues<'_>,
 ) {
     let tile_elements = (ROWS * COLS) as u32;
     let passes = (ROWS * COLS).div_ceil(LANES);
@@ -81,9 +82,14 @@ fn stage_f32_tile_with_pre<const ROWS: usize, const COLS: usize, const LANES: us
             .and(global_row.clone().lt(src_rows))
             .and(global_col.clone().lt(src_cols));
         let loaded = program.load(src.at((global_row, &global_col)), in_bounds.clone(), 0.0);
+        let pre_extras = epilogues
+            .pre_extra_col_vectors
+            .iter()
+            .map(|extra| program.load(extra.at(&global_col), global_col.lt(src_cols), 0.0))
+            .collect::<Vec<_>>();
         let value = Tile::select(
             in_bounds,
-            apply_optional_epilogue(pre, loaded),
+            apply_qmatmul_pre_epilogue(epilogues, loaded, pre_extras),
             Tile::literal(TileLiteral::f32(0.0)),
         );
         // Re-use the same flat index but only emit the store on lanes that
@@ -202,7 +208,7 @@ pub fn qmatmul_workgroup_with_epilogues<const BM: usize, const BN: usize, const 
                         &tile_active,
                         m,
                         k,
-                        epilogues.pre,
+                        epilogues,
                     );
                     program.copy_quant_to_tile(b_tile, &b_clone, &k_base, &n_tile_base);
                     program.workgroup_barrier();
@@ -225,7 +231,12 @@ pub fn qmatmul_workgroup_with_epilogues<const BM: usize, const BN: usize, const 
             let c = idx % QMATMUL_TN;
             let row = row_base.clone() + r as u32;
             let col = col_base.clone() + c as u32;
-            let value = apply_optional_epilogue(epilogues.post, sum);
+            let extras = epilogues
+                .post_extra_col_vectors
+                .iter()
+                .map(|extra| program.load(extra.at(&col), col.lt(n), 0.0))
+                .collect::<Vec<_>>();
+            let value = apply_qmatmul_post_epilogue(epilogues, sum, extras);
             let mask = tile_active
                 .clone()
                 .and(row.clone().lt(m))
@@ -298,7 +309,7 @@ pub fn qgemv_workgroup_with_epilogue<const BN: usize, const BK: usize>(
                     &tile_active,
                     1,
                     k,
-                    epilogues.pre,
+                    epilogues,
                 );
                 program.copy_quant_to_tile(b_tile, &b_clone, &k_base, &n_tile_base);
                 program.workgroup_barrier();
@@ -317,7 +328,12 @@ pub fn qgemv_workgroup_with_epilogue<const BN: usize, const BK: usize>(
 
         for (idx, sum) in sums.into_iter().enumerate() {
             let col = col_base.clone() + idx as u32;
-            let value = apply_optional_epilogue(epilogues.post, sum);
+            let extras = epilogues
+                .post_extra_col_vectors
+                .iter()
+                .map(|extra| program.load(extra.at(&col), col.lt(n), 0.0))
+                .collect::<Vec<_>>();
+            let value = apply_qmatmul_post_epilogue(epilogues, sum, extras);
             let mask = tile_active.clone().and(col.clone().lt(n));
             program.store(y.at((0u32, col)), value, mask);
         }

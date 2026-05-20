@@ -47,12 +47,14 @@ pub(super) fn qmat_logits_data_with_encoder(
         crate::quantized::matmul::DirectKernelTensors {
             input: &hidden_2d,
             matrix,
+            pre_extra_col_vectors: &[],
+            post_extra_col_vectors: &[],
             output: &logits_2d,
         },
         "q_mat_logits_for_sampler",
         crate::quantized::matmul::DirectKernelChains {
-            pre: None,
-            post: None,
+            pre_expr: None,
+            post_expr: None,
         },
         None,
     )?;

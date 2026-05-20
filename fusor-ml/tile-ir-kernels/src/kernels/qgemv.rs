@@ -28,7 +28,11 @@ impl<'a> IntoQgemvEpilogues<'a> for Option<&'a crate::UnaryEpilogue> {
     fn into_qgemv_epilogues(self) -> crate::types::QmatmulEpilogues<'a> {
         crate::types::QmatmulEpilogues {
             pre: None,
+            pre_with_extras: None,
+            pre_extra_col_vectors: &[],
             post: self,
+            post_with_extras: None,
+            post_extra_col_vectors: &[],
         }
     }
 }
@@ -449,7 +453,14 @@ pub(crate) fn qgemv_perf_with_epilogue<
                         in_bounds_k.clone(),
                         0.0,
                     );
-                    let scalar = crate::types::apply_optional_epilogue(epilogues.pre, scalar);
+                    let k_index = k_base.clone() + i as u32;
+                    let pre_extras = epilogues
+                        .pre_extra_col_vectors
+                        .iter()
+                        .map(|extra| program.load(extra.at(&k_index), k_index.lt(k_size), 0.0))
+                        .collect::<Vec<_>>();
+                    let scalar =
+                        crate::types::apply_qmatmul_pre_epilogue(epilogues, scalar, pre_extras);
                     program.bind(scalar)
                 });
 

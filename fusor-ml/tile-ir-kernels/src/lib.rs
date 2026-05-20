@@ -55,4 +55,6 @@ pub use kernels::{
     FlashDecodeSmallMeta, IntoQgemvEpilogues, MergeTopKMeta, Mirostat2, Mirostat2Meta,
     Q4KPairedGgml, RmsNormVec4, RmsNormVec4Meta, TensorMeta, TopKChunkMeta, TopKExactnessMeta,
 };
-pub use types::{DenseMatmulEpilogues, PairedEpilogue, QmatmulEpilogues, UnaryEpilogue};
+pub use types::{
+    DenseMatmulEpilogues, PairedEpilogue, QmatmulEpilogues, UnaryEpilogue, UnaryEpilogueWithExtras,
+};

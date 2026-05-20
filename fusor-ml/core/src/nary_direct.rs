@@ -670,6 +670,24 @@ pub(crate) fn apply_unary_function_chain(
     Some((value.into_f32(), value_ty))
 }
 
+pub(crate) fn apply_single_input_elementwise_expr(
+    value: tile_ir::tile::Tile,
+    value_ty: DataTypeEnum,
+    expr: &NaryExpr,
+    output_ty: DataTypeEnum,
+    extras: &[(ValueTile, DataTypeEnum)],
+) -> Option<(tile_ir::tile::Tile, DataTypeEnum)> {
+    let value = ValueTile::F32(value).cast_to(value_ty);
+    let mut inputs = Vec::with_capacity(1 + extras.len());
+    inputs.push((value, value_ty));
+    inputs.extend_from_slice(extras);
+    let (value, actual_ty) = eval_nary_expr_on_value_tiles(expr, &inputs);
+    if actual_ty != output_ty {
+        return None;
+    }
+    Some((value.into_f32(), actual_ty))
+}
+
 fn tanh_exact(value: ValueTile) -> ValueTile {
     let exp_pos = value.clone().unary(tile_ir::TileUnaryOp::Exp);
     let exp_neg = value

@@ -167,6 +167,9 @@ fn bench_attention_comparison(c: &mut Criterion) {
 
     let mut group = c.benchmark_group("attention_comparison");
     group.sample_size(10);
+    group.plot_config(
+        criterion::PlotConfiguration::default().summary_scale(criterion::AxisScale::Logarithmic),
+    );
 
     for shape in SIZES {
         let size_str = format!("{}x{}x{}x{}", shape[0], shape[1], shape[2], shape[3]);
