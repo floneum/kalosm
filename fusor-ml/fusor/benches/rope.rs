@@ -18,6 +18,10 @@ fn candle_gpu_device() -> Option<candle_core::Device> {
         .ok()
 }
 
+fn quick_bench() -> bool {
+    std::env::args().any(|arg| arg == "--quick")
+}
+
 // Sizes: [batch_size, num_heads, seq_len, head_dim]
 const SIZES: [[usize; 4]; 8] = [
     [1, 32, 128, 64],  // Small sequence
@@ -71,12 +75,14 @@ async fn setup_fusor_tensors(
 
 fn rope_benchmark(c: &mut Criterion) {
     let mut group = c.benchmark_group("rope");
-    group.sample_size(20);
+    let quick = quick_bench();
+    group.sample_size(if quick { 10 } else { 20 });
     group.plot_config(
         criterion::PlotConfiguration::default().summary_scale(criterion::AxisScale::Logarithmic),
     );
 
-    for [batch, heads, seq_len, head_dim] in SIZES {
+    let sizes = if quick { &SIZES[..1] } else { &SIZES[..] };
+    for &[batch, heads, seq_len, head_dim] in sizes {
         // Composite interleaved (CPU or GPU composite path)
         let device = block_on(async { Device::new().await.unwrap() });
         let device_ref = device.clone();
@@ -160,8 +166,21 @@ fn bench_candle_rope(
     name: &str,
     group: &mut criterion::BenchmarkGroup<'_, criterion::measurement::WallTime>,
 ) {
-    for [batch, heads, seq_len, head_dim] in SIZES {
+    let sizes = if quick_bench() {
+        &SIZES[..1]
+    } else {
+        &SIZES[..]
+    };
+    for &[batch, heads, seq_len, head_dim] in sizes {
         let candle_device = candle_device.clone();
+        let probe = make_candle_rope_tensors(&candle_device, batch, heads, seq_len, head_dim)
+            .and_then(|(input, cos, sin)| candle_nn::rotary_emb::rope_i(&input, &cos, &sin))
+            .and_then(|_| candle_device.synchronize());
+        if let Err(error) = probe {
+            eprintln!("Skipping {name} rope {batch}x{heads}x{seq_len}x{head_dim}: {error}");
+            continue;
+        }
+
         group.bench_with_input(
             BenchmarkId::new(
                 name,
@@ -173,50 +192,14 @@ fn bench_candle_rope(
                     {
                         let candle_device = candle_device.clone();
                         move || {
-                            let pos_shape = [seq_len * 2, head_dim / 2];
-                            let cos_data = (0..pos_shape[0])
-                                .map(|i| {
-                                    (0..pos_shape[1])
-                                        .map(|j| {
-                                            ((i as f32)
-                                                / 10000f32
-                                                    .powf((2 * (j / 2)) as f32 / head_dim as f32))
-                                            .cos()
-                                        })
-                                        .collect::<Vec<_>>()
-                                })
-                                .collect::<Vec<_>>();
-                            let sin_data = (0..pos_shape[0])
-                                .map(|i| {
-                                    (0..pos_shape[1])
-                                        .map(|j| {
-                                            ((i as f32)
-                                                / 10000f32
-                                                    .powf((2 * (j / 2)) as f32 / head_dim as f32))
-                                            .sin()
-                                        })
-                                        .collect::<Vec<_>>()
-                                })
-                                .collect::<Vec<_>>();
-
-                            let cos = candle_core::Tensor::new(cos_data, &candle_device).unwrap();
-                            let sin = candle_core::Tensor::new(sin_data, &candle_device).unwrap();
-
-                            let input_data: Vec<Vec<Vec<Vec<f32>>>> = (0..batch)
-                                .map(|_| {
-                                    (0..heads)
-                                        .map(|_| {
-                                            (0..seq_len)
-                                                .map(|_| (0..head_dim).map(|_| 1.0f32).collect())
-                                                .collect()
-                                        })
-                                        .collect()
-                                })
-                                .collect();
-                            let input =
-                                candle_core::Tensor::new(input_data, &candle_device).unwrap();
-
-                            (input, cos, sin)
+                            make_candle_rope_tensors(
+                                &candle_device,
+                                batch,
+                                heads,
+                                seq_len,
+                                head_dim,
+                            )
+                            .unwrap()
                         }
                     },
                     {
@@ -236,6 +219,52 @@ fn bench_candle_rope(
             },
         );
     }
+}
+
+fn make_candle_rope_tensors(
+    candle_device: &candle_core::Device,
+    batch: usize,
+    heads: usize,
+    seq_len: usize,
+    head_dim: usize,
+) -> candle_core::Result<(
+    candle_core::Tensor,
+    candle_core::Tensor,
+    candle_core::Tensor,
+)> {
+    let pos_shape = [seq_len * 2, head_dim / 2];
+    let cos_data = (0..pos_shape[0])
+        .map(|i| {
+            (0..pos_shape[1])
+                .map(|j| ((i as f32) / 10000f32.powf((2 * (j / 2)) as f32 / head_dim as f32)).cos())
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+    let sin_data = (0..pos_shape[0])
+        .map(|i| {
+            (0..pos_shape[1])
+                .map(|j| ((i as f32) / 10000f32.powf((2 * (j / 2)) as f32 / head_dim as f32)).sin())
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+
+    let cos = candle_core::Tensor::new(cos_data, candle_device)?;
+    let sin = candle_core::Tensor::new(sin_data, candle_device)?;
+
+    let input_data: Vec<Vec<Vec<Vec<f32>>>> = (0..batch)
+        .map(|_| {
+            (0..heads)
+                .map(|_| {
+                    (0..seq_len)
+                        .map(|_| (0..head_dim).map(|_| 1.0f32).collect())
+                        .collect()
+                })
+                .collect()
+        })
+        .collect();
+    let input = candle_core::Tensor::new(input_data, candle_device)?;
+
+    Ok((input, cos, sin))
 }
 
 criterion_group!(benches, rope_benchmark);

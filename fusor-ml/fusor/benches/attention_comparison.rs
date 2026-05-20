@@ -16,6 +16,10 @@ const SIZES: [[usize; 4]; 8] = [
     [1, 8, 128, 128],
 ];
 
+fn quick_bench() -> bool {
+    std::env::args().any(|arg| arg == "--quick")
+}
+
 fn make_input(numel: usize, freq: f32, phase: f32) -> Vec<f32> {
     (0..numel)
         .map(|i| {
@@ -166,12 +170,14 @@ fn bench_attention_comparison(c: &mut Criterion) {
     let gpu_device = block_on(Device::gpu()).ok();
 
     let mut group = c.benchmark_group("attention_comparison");
+    let quick = quick_bench();
     group.sample_size(10);
     group.plot_config(
         criterion::PlotConfiguration::default().summary_scale(criterion::AxisScale::Logarithmic),
     );
 
-    for shape in SIZES {
+    let sizes = if quick { &SIZES[..1] } else { &SIZES[..] };
+    for &shape in sizes {
         let size_str = format!("{}x{}x{}x{}", shape[0], shape[1], shape[2], shape[3]);
         let (q_data, k_data, v_data) = attention_inputs(shape);
 

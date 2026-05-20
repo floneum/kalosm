@@ -1,17 +1,17 @@
 use crate::raw::rope::RopeImplementation;
 
-use fusor::cache::AttentionMask;
-use fusor::cache::KvCache;
-use fusor::layers::Linear;
-use fusor::layers::RmsNorm;
 use fusor::CastTensor;
 use fusor::CastTo;
+use fusor::D;
 use fusor::FloatDataType;
 use fusor::QMatrix;
 use fusor::SimdElement;
 use fusor::Tensor;
 use fusor::TensorBacking;
-use fusor::D;
+use fusor::cache::AttentionMask;
+use fusor::cache::KvCache;
+use fusor::layers::Linear;
+use fusor::layers::RmsNorm;
 
 /// Helper function to do quantized matmul with a generic type F.
 /// Converts F -> f32, performs q_mat_mul, then converts f32 -> F.
@@ -93,10 +93,12 @@ pub struct LlamaFeedForward<F: FloatDataType + SimdElement = f32> {
     down_bias: Option<Tensor<1, F>>,
     up: QMatrix,
     up_bias: Option<Tensor<1, F>>,
+    gate_up: Option<QMatrix>,
 }
 
 impl<F: FloatDataType + SimdElement> LlamaFeedForward<F> {
     pub(crate) fn new(gate: QMatrix, down: QMatrix, up: QMatrix) -> Self {
+        let gate_up = QMatrix::concat_rows(&[&gate, &up]);
         Self {
             gate,
             down,
@@ -104,6 +106,7 @@ impl<F: FloatDataType + SimdElement> LlamaFeedForward<F> {
             gate_bias: None,
             down_bias: None,
             up_bias: None,
+            gate_up,
         }
     }
 
@@ -115,6 +118,11 @@ impl<F: FloatDataType + SimdElement> LlamaFeedForward<F> {
         up: QMatrix,
         up_bias: Option<Tensor<1, F>>,
     ) -> Self {
+        let gate_up = if gate_bias.is_none() && up_bias.is_none() {
+            QMatrix::concat_rows(&[&gate, &up])
+        } else {
+            None
+        };
         Self {
             gate,
             gate_bias,
@@ -122,6 +130,7 @@ impl<F: FloatDataType + SimdElement> LlamaFeedForward<F> {
             down_bias,
             up,
             up_bias,
+            gate_up,
         }
     }
 
@@ -133,6 +142,27 @@ impl<F: FloatDataType + SimdElement> LlamaFeedForward<F> {
     {
         // All computation happens in f32 for compatibility with SIMD ops
         let x_f32 = x.cast::<f32>();
+
+        if let Some(gate_up) = &self.gate_up {
+            let feed_forward_length = self.gate.shape()[0];
+            let gate_up_states = x_f32.q_mat_mul(gate_up);
+            let w1 = gate_up_states
+                .narrow(D::Minus1, 0, feed_forward_length)
+                .to_concrete()
+                .silu();
+            let w3 = gate_up_states
+                .narrow(D::Minus1, feed_forward_length, feed_forward_length)
+                .to_concrete();
+
+            let up_result = w1 * w3;
+            let mut up = up_result.q_mat_mul(&self.down);
+            if let Some(ref bias) = self.down_bias {
+                let bias_f32: Tensor<1, f32> = bias.cast();
+                up = up.add_(&bias_f32);
+            }
+
+            return up.cast();
+        }
 
         let mut w1 = x_f32.q_mat_mul(&self.gate);
         if let Some(ref bias) = self.gate_bias {
@@ -161,6 +191,7 @@ impl<F: FloatDataType + SimdElement> LlamaFeedForward<F> {
 
 pub enum AttentionVariant<F: FloatDataType + SimdElement = f32> {
     Separate(Box<SeparateAttention<F>>),
+    QkGrouped(QkGroupedAttention),
     Grouped(GroupedAttention),
 }
 
@@ -282,6 +313,68 @@ where
 
 pub struct GroupedAttention {
     pub attention_qkv: QMatrix,
+    pub interleaved_rope: bool,
+}
+
+pub struct QkGroupedAttention {
+    pub attention_qk: QMatrix,
+    pub attention_wv: QMatrix,
+    pub interleaved_rope: bool,
+}
+
+impl QkGroupedAttention {
+    #[allow(clippy::too_many_arguments)]
+    fn forward<F, B>(
+        &self,
+        num_heads: usize,
+        head_dim: usize,
+        num_key_value_heads: usize,
+        x: &Tensor<3, F, B>,
+        rope_cache: &RopeImplementation<F>,
+        start_pos: usize,
+        pos_ids: Option<&Tensor<2, F>>,
+    ) -> (Tensor<4, F>, Tensor<4, F>, Tensor<4, F>)
+    where
+        F: FloatDataType + SimdElement + Default + CastTo<f32> + CastTensor<f32>,
+        f32: CastTo<F> + CastTensor<F>,
+        B: TensorBacking<3, Elem = F>,
+    {
+        let [b_sz, seq_len, _] = x.shape();
+        let x_f32 = x.cast::<f32>();
+        let qk = x_f32.q_mat_mul(&self.attention_qk);
+
+        let query_pos = num_heads * head_dim;
+        let key_pos = num_key_value_heads * head_dim;
+        let query_states = qk.narrow(D::Minus1, 0, query_pos);
+        let key_states = qk.narrow(D::Minus1, query_pos, key_pos);
+
+        let query_states: Tensor<4, F> = query_states
+            .reshape([b_sz, seq_len, num_heads, head_dim])
+            .transpose(1, 2)
+            .to_concrete()
+            .cast();
+        let key_states: Tensor<4, F> = key_states
+            .reshape([b_sz, seq_len, num_key_value_heads, head_dim])
+            .transpose(1, 2)
+            .to_concrete()
+            .cast();
+        let value_states: Tensor<4, F> = x_f32
+            .q_mat_mul(&self.attention_wv)
+            .reshape([b_sz, seq_len, num_key_value_heads, head_dim])
+            .transpose(1, 2)
+            .to_concrete()
+            .cast();
+
+        let (query_states, key_states) = rope_cache.forward(
+            &query_states,
+            &key_states,
+            start_pos,
+            pos_ids,
+            self.interleaved_rope,
+        );
+
+        (query_states, key_states, value_states)
+    }
 }
 
 impl GroupedAttention {
@@ -331,8 +424,13 @@ impl GroupedAttention {
             .to_concrete()
             .cast();
 
-        let (query_states, key_states) =
-            rope_cache.forward(&query_states, &key_states, start_pos, pos_ids, false);
+        let (query_states, key_states) = rope_cache.forward(
+            &query_states,
+            &key_states,
+            start_pos,
+            pos_ids,
+            self.interleaved_rope,
+        );
 
         (query_states, key_states, value_states)
     }
@@ -378,6 +476,15 @@ where
 
         let (query_states, key_states, value_states) = match self.attention_variant {
             AttentionVariant::Separate(ref attention) => attention.forward(
+                num_heads,
+                head_dim,
+                num_key_value_heads,
+                hidden_states,
+                &self.rope_cache,
+                start_pos,
+                pos_ids,
+            ),
+            AttentionVariant::QkGrouped(ref attention) => attention.forward(
                 num_heads,
                 head_dim,
                 num_key_value_heads,

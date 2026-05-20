@@ -13,10 +13,10 @@ use llm_samplers::types::Sampler;
 use std::any::Any;
 use std::future::Future;
 
-use crate::model::LlamaModelError;
-use crate::structured::generate_structured;
 pub use crate::Llama;
 use crate::LlamaBuilder;
+use crate::model::LlamaModelError;
+use crate::structured::generate_structured;
 use crate::{
     GpuSamplerConfig, InferenceSettings, LlamaResultFuture, LlamaSession, LlamaSourceError,
     StructuredGenerationTask, Task, UnstructuredGenerationTask,
@@ -100,6 +100,7 @@ where
                         sampler.mu(),
                         sampler.repetition_penalty(),
                         sampler.repetition_penalty_range() as usize,
+                        sampler.top_k().map(|top_k| top_k as usize),
                     )),
                 ),
                 None => (u32::MAX, None, None, None),

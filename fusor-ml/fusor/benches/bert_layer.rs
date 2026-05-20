@@ -22,6 +22,10 @@ fn candle_gpu_device() -> Option<candle_core::Device> {
         .ok()
 }
 
+fn quick_bench() -> bool {
+    std::env::args().any(|arg| arg == "--quick")
+}
+
 // Benchmark LayerNorm operation
 fn layer_norm(c: &mut Criterion) {
     let source = FileSource::HuggingFace {
@@ -40,13 +44,16 @@ fn layer_norm(c: &mut Criterion) {
         });
 
     let mut group = c.benchmark_group("layer_norm");
-    group.sample_size(20);
+    let quick = quick_bench();
+    group.sample_size(if quick { 10 } else { 20 });
     group.plot_config(
         criterion::PlotConfiguration::default().summary_scale(criterion::AxisScale::Logarithmic),
     );
 
-    for batch_size in [1, 32, 512] {
-        for seq_len in [13, 128, 512] {
+    let batch_sizes: &[usize] = if quick { &[1] } else { &[1, 32, 512] };
+    let seq_lens: &[usize] = if quick { &[13] } else { &[13, 128, 512] };
+    for &batch_size in batch_sizes {
+        for &seq_len in seq_lens {
             if batch_size * seq_len >= 512 * 128 {
                 continue;
             }
@@ -197,6 +204,18 @@ fn bench_candle_layer_norm(
 
     let layer_norm = candle_nn::LayerNorm::new(weight, bias, 1e-12);
 
+    let probe = candle_core::Tensor::zeros(
+        &[batch_size, seq_len, hidden_size],
+        candle_core::DType::F32,
+        &candle_device,
+    )
+    .and_then(|tensor| layer_norm.forward(&tensor))
+    .and_then(|_| candle_device.synchronize());
+    if let Err(error) = probe {
+        eprintln!("Skipping {name} layer_norm {batch_size}x{seq_len}: {error}");
+        return;
+    }
+
     group.bench_with_input(
         BenchmarkId::new(name, format!("{batch_size}x{seq_len}")),
         &(batch_size, seq_len),
@@ -243,13 +262,16 @@ fn self_attention(c: &mut Criterion) {
         });
 
     let mut group = c.benchmark_group("self_attention");
-    group.sample_size(20);
+    let quick = quick_bench();
+    group.sample_size(if quick { 10 } else { 20 });
     group.plot_config(
         criterion::PlotConfiguration::default().summary_scale(criterion::AxisScale::Logarithmic),
     );
 
-    for batch_size in [1, 32] {
-        for seq_len in [13, 128] {
+    let batch_sizes: &[usize] = if quick { &[1] } else { &[1, 32] };
+    let seq_lens: &[usize] = if quick { &[13] } else { &[13, 128] };
+    for &batch_size in batch_sizes {
+        for &seq_len in seq_lens {
             if batch_size * seq_len >= 32 * 128 {
                 continue;
             }
@@ -304,17 +326,18 @@ fn self_attention(c: &mut Criterion) {
                                     let v = value.forward(&tensor);
 
                                     let q = q.reshape([batch_size, seq_len, num_heads, head_size]);
-                                    let q = q.transpose(1, 2);
+                                    let q = q.transpose(1, 2).to_concrete();
                                     let k = k.reshape([batch_size, seq_len, num_heads, head_size]);
-                                    let k = k.transpose(1, 2);
+                                    let k = k.transpose(1, 2).to_concrete();
                                     let v = v.reshape([batch_size, seq_len, num_heads, head_size]);
-                                    let v = v.transpose(1, 2);
+                                    let v = v.transpose(1, 2).to_concrete();
 
-                                    let scores =
-                                        q.mat_mul(&k.t()).div_scalar((head_size as f32).sqrt());
-                                    let probs = scores.softmax_last_dim::<3>();
-
-                                    let context = probs.mat_mul(&v);
+                                    let context = q.flash_attention(
+                                        &k,
+                                        &v,
+                                        1.0 / (head_size as f32).sqrt(),
+                                        None,
+                                    );
                                     let context = context.transpose(1, 2);
                                     let output = context.flatten_last_n::<1, _>();
 
@@ -421,6 +444,41 @@ fn bench_candle_self_attention(
     let v_linear = Linear::from_arc(v_weight, Some(v_bias)).unwrap();
 
     let head_size = hidden_size / num_heads;
+    let probe = candle_core::Tensor::zeros(
+        &[batch_size, seq_len, hidden_size],
+        candle_core::DType::F32,
+        &candle_device,
+    )
+    .and_then(|tensor| {
+        let q = q_linear.forward(&tensor)?;
+        let k = k_linear.forward(&tensor)?;
+        let v = v_linear.forward(&tensor)?;
+        let q = q
+            .reshape(&[batch_size, seq_len, num_heads, head_size])?
+            .transpose(1, 2)?
+            .contiguous()?;
+        let k = k
+            .reshape(&[batch_size, seq_len, num_heads, head_size])?
+            .transpose(1, 2)?
+            .contiguous()?;
+        let v = v
+            .reshape(&[batch_size, seq_len, num_heads, head_size])?
+            .transpose(1, 2)?
+            .contiguous()?;
+
+        let k_t = k.transpose(2, 3)?.contiguous()?;
+        let scores = q.matmul(&k_t)?;
+        let scores = (scores / (head_size as f64).sqrt())?;
+        let probs = candle_nn::ops::softmax_last_dim(&scores)?;
+        let context = probs.matmul(&v)?;
+        let context = context.transpose(1, 2)?.contiguous()?;
+        context.flatten_from(2)
+    })
+    .and_then(|_| candle_device.synchronize());
+    if let Err(error) = probe {
+        eprintln!("Skipping {name} self_attention {batch_size}x{seq_len}: {error}");
+        return;
+    }
 
     group.bench_with_input(
         BenchmarkId::new(name, format!("{batch_size}x{seq_len}")),
@@ -508,13 +566,16 @@ fn ffn_block(c: &mut Criterion) {
         });
 
     let mut group = c.benchmark_group("ffn_block");
-    group.sample_size(20);
+    let quick = quick_bench();
+    group.sample_size(if quick { 10 } else { 20 });
     group.plot_config(
         criterion::PlotConfiguration::default().summary_scale(criterion::AxisScale::Logarithmic),
     );
 
-    for batch_size in [1, 32, 512] {
-        for seq_len in [13, 128] {
+    let batch_sizes: &[usize] = if quick { &[1] } else { &[1, 32, 512] };
+    let seq_lens: &[usize] = if quick { &[13] } else { &[13, 128] };
+    for &batch_size in batch_sizes {
+        for &seq_len in seq_lens {
             if batch_size * seq_len >= 512 * 128 {
                 continue;
             }
@@ -654,6 +715,21 @@ fn bench_candle_ffn(
 
     let up_linear = Linear::from_arc(up_weight, Some(up_bias)).unwrap();
     let down_linear = Linear::from_arc(down_weight, Some(down_bias)).unwrap();
+    let probe = candle_core::Tensor::zeros(
+        &[batch_size, seq_len, hidden_size],
+        candle_core::DType::F32,
+        &candle_device,
+    )
+    .and_then(|tensor| {
+        let intermediate = up_linear.forward(&tensor)?;
+        let intermediate = intermediate.gelu()?;
+        down_linear.forward(&intermediate)
+    })
+    .and_then(|_| candle_device.synchronize());
+    if let Err(error) = probe {
+        eprintln!("Skipping {name} ffn_block {batch_size}x{seq_len}: {error}");
+        return;
+    }
 
     group.bench_with_input(
         BenchmarkId::new(name, format!("{batch_size}x{seq_len}")),

@@ -1,11 +1,11 @@
 use std::time::Duration;
 
 use fusor_core::{Device, QMatrix, Tensor};
-use fusor_gguf::{BlockQ4K, GgmlType};
+use fusor_gguf::{BlockQ4K, BlockQ6K, GgmlType};
 
 const M: usize = 1;
-const K: usize = 4096;
-const N: usize = 28672;
+const DEFAULT_K: usize = 4096;
+const DEFAULT_N: usize = 28672;
 const DEFAULT_WARMUP_BATCHES: usize = 3;
 const DEFAULT_MEASURED_BATCHES: usize = 20;
 const DEFAULT_DISPATCHES_PER_BATCH: usize = 16;
@@ -17,8 +17,19 @@ fn env_usize(name: &str, default: usize) -> usize {
         .unwrap_or(default)
 }
 
+fn env_format(name: &str, default: GgmlType) -> GgmlType {
+    match std::env::var(name).as_deref() {
+        Ok("Q4K") | Ok("q4k") => GgmlType::Q4K,
+        Ok("Q6K") | Ok("q6k") => GgmlType::Q6K,
+        _ => default,
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let k = env_usize("FUSOR_QMAT_BENCH_K", DEFAULT_K);
+    let n = env_usize("FUSOR_QMAT_BENCH_N", DEFAULT_N);
+    let format = env_format("FUSOR_QMAT_BENCH_FORMAT", GgmlType::Q4K);
     let warmup_batches = env_usize("FUSOR_QMAT_BENCH_WARMUP_BATCHES", DEFAULT_WARMUP_BATCHES);
     let measured_batches = env_usize(
         "FUSOR_QMAT_BENCH_MEASURED_BATCHES",
@@ -31,12 +42,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     .max(1);
 
     let device = Device::new().await?;
-    let input_data = vec![vec![0.25f32; K]; M];
+    let input_data = vec![vec![0.25f32; k]; M];
     let input: Tensor<2, f32> = Tensor::new(&device, &input_data);
     input.materialize().await;
 
-    let raw_weight = q4k_weight_bytes(N, K);
-    let weight = QMatrix::from_parts(&device, &raw_weight, Box::new([N, K]), GgmlType::Q4K)?;
+    let raw_weight = weight_bytes(n, k, format);
+    let weight = QMatrix::from_parts(&device, &raw_weight, Box::new([n, k]), format)?;
 
     for _ in 0..warmup_batches {
         run_batch(&device, &input, &weight, dispatches_per_batch);
@@ -56,13 +67,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let p90 = percentile_duration(&samples, 90);
     let min = samples.first().copied().unwrap_or_default();
     let max = samples.last().copied().unwrap_or_default();
-    let flops = 2.0 * M as f64 * N as f64 * K as f64;
+    let flops = 2.0 * M as f64 * n as f64 * k as f64;
     let weight_bytes = raw_weight.len() as f64;
 
     println!("bench_llama_qmat_bottleneck");
-    println!("shape: A={M}x{K} B={K}x{N} -> Y={M}x{N}");
-    println!("kernel: q_mat_mul_f32_1x1x4096_Q4k_28672x4096");
-    println!("format: {:?}", GgmlType::Q4K);
+    println!("shape: A={M}x{k} B={k}x{n} -> Y={M}x{n}");
+    println!("kernel: q_mat_mul_f32_1x1x{k}_{format:?}_{n}x{k}");
+    println!("format: {:?}", format);
     println!("warmup_batches: {warmup_batches}");
     println!("measured_batches: {measured_batches}");
     println!("dispatches_per_batch: {dispatches_per_batch}");
@@ -107,15 +118,26 @@ fn run_batch(
     kernels
 }
 
-fn q4k_weight_bytes(rows: usize, cols: usize) -> Vec<u8> {
+fn weight_bytes(rows: usize, cols: usize, format: GgmlType) -> Vec<u8> {
+    match format {
+        GgmlType::Q4K => block_weight_bytes::<BlockQ4K>(rows, cols, "Q4K"),
+        GgmlType::Q6K => block_weight_bytes::<BlockQ6K>(rows, cols, "Q6K"),
+        other => panic!("unsupported benchmark format {other:?}"),
+    }
+}
+
+fn block_weight_bytes<B>(rows: usize, cols: usize, name: &str) -> Vec<u8>
+where
+    B: fusor_gguf::GgufBlock,
+{
     let elements = rows
         .checked_mul(cols)
-        .expect("q4k benchmark shape should not overflow");
+        .expect("qmat benchmark shape should not overflow");
     assert!(
-        elements.is_multiple_of(BlockQ4K::BLOCK_SIZE),
-        "Q4K element count must be divisible by the block size"
+        elements.is_multiple_of(B::BLOCK_SIZE),
+        "{name} element count must be divisible by the block size"
     );
-    vec![0; elements / BlockQ4K::BLOCK_SIZE * std::mem::size_of::<BlockQ4K>()]
+    vec![0; elements / B::BLOCK_SIZE * std::mem::size_of::<B>()]
 }
 
 fn mean_duration(samples: &[Duration]) -> Duration {

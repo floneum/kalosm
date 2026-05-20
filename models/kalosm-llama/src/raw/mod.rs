@@ -1,20 +1,17 @@
 use std::sync::Arc;
 
+use crate::LlamaSourceError;
 use crate::chat_template::HuggingFaceChatTemplate;
 use crate::raw::attention_layer::LlamaAttention;
 use crate::raw::rope::RopeImplementation;
-use crate::LlamaSourceError;
 use attention_layer::AttentionBias;
 use attention_layer::AttentionVariant;
 use attention_layer::FeedForwardVariant;
 use attention_layer::GroupedAttention;
 use attention_layer::LlamaFeedForward;
 use attention_layer::PhiFeedForward;
+use attention_layer::QkGroupedAttention;
 use attention_layer::SeparateAttention;
-use fusor::cache::MaskCache;
-use fusor::layers::Embedding;
-use fusor::layers::Linear;
-use fusor::layers::RmsNorm;
 use fusor::AddOp;
 use fusor::CastTensor;
 use fusor::CastTo;
@@ -28,6 +25,10 @@ use fusor::SimdBinaryOp;
 use fusor::SimdElement;
 use fusor::SimdReduceOp;
 use fusor::SumOp;
+use fusor::cache::MaskCache;
+use fusor::layers::Embedding;
+use fusor::layers::Linear;
+use fusor::layers::RmsNorm;
 use fusor::{Device, Result, Tensor};
 use fusor_gguf::GgufMetadata;
 use fusor_gguf::GgufValue;
@@ -315,12 +316,18 @@ where
             tok_embeddings_q.clone()
         });
         let mut layers = Vec::with_capacity(block_count);
+        let interleaved_rope = architecture.as_ref() != "qwen2"
+            && architecture.as_ref() != "qwen3"
+            && architecture.as_ref() != "gemma3";
         for layer_idx in 0..block_count {
             let prefix = format!("blk.{layer_idx}");
             let attention_variant = if let Ok(attention_qkv) =
                 source.tensor(&format!("{prefix}.attn_qkv.weight"), device)
             {
-                AttentionVariant::Grouped(GroupedAttention { attention_qkv })
+                AttentionVariant::Grouped(GroupedAttention {
+                    attention_qkv,
+                    interleaved_rope,
+                })
             } else {
                 let q = source.tensor(&format!("{prefix}.attn_q.weight"), device)?;
                 let k = source.tensor(&format!("{prefix}.attn_k.weight"), device)?;
@@ -344,22 +351,46 @@ where
                 let k_norm = source
                     .tensor(&format!("{prefix}.attn_k_norm.weight"), device)
                     .ok();
-                let separate = SeparateAttention {
-                    attention_wq: q,
-                    attention_q_norm: q_norm
-                        .map(|norm| decode_norm(norm, rms_norm_eps))
-                        .transpose()?,
-                    attention_wk: k,
-                    attention_k_norm: k_norm
-                        .map(|norm| decode_norm(norm, rms_norm_eps))
-                        .transpose()?,
-                    attention_wv: v,
-                    interleaved_rope: architecture.as_ref() != "qwen2"
-                        && architecture.as_ref() != "qwen3"
-                        && architecture.as_ref() != "gemma3",
-                    bias,
-                };
-                AttentionVariant::Separate(Box::new(separate))
+                if bias.is_none() && q_norm.is_none() && k_norm.is_none() {
+                    if let Some(attention_qkv) = QMatrix::concat_rows(&[&q, &k, &v]) {
+                        AttentionVariant::Grouped(GroupedAttention {
+                            attention_qkv,
+                            interleaved_rope,
+                        })
+                    } else if let Some(attention_qk) = QMatrix::concat_rows(&[&q, &k]) {
+                        AttentionVariant::QkGrouped(QkGroupedAttention {
+                            attention_qk,
+                            attention_wv: v,
+                            interleaved_rope,
+                        })
+                    } else {
+                        let separate = SeparateAttention {
+                            attention_wq: q,
+                            attention_q_norm: None,
+                            attention_wk: k,
+                            attention_k_norm: None,
+                            attention_wv: v,
+                            interleaved_rope,
+                            bias,
+                        };
+                        AttentionVariant::Separate(Box::new(separate))
+                    }
+                } else {
+                    let separate = SeparateAttention {
+                        attention_wq: q,
+                        attention_q_norm: q_norm
+                            .map(|norm| decode_norm(norm, rms_norm_eps))
+                            .transpose()?,
+                        attention_wk: k,
+                        attention_k_norm: k_norm
+                            .map(|norm| decode_norm(norm, rms_norm_eps))
+                            .transpose()?,
+                        attention_wv: v,
+                        interleaved_rope,
+                        bias,
+                    };
+                    AttentionVariant::Separate(Box::new(separate))
+                }
             };
             let attention_wo = source.tensor(&format!("{prefix}.attn_output.weight"), device)?;
             // Try to read from the up, down and gate weights
@@ -636,7 +667,7 @@ where
             let x = layer_in;
             let residual: Tensor<3, f32> = x.cast();
             let x = layer.attention_norm.forward_generic(&x);
-            let mask = (seq_len > 1 || layer.sliding_window_size.is_some()).then(|| {
+            let mask = (seq_len > 1).then(|| {
                 self.masks
                     .get_mask(seq_len, index_pos, layer.sliding_window_size, device)
             });

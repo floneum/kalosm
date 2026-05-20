@@ -1015,7 +1015,7 @@ impl<D: DataType, const R: usize> Tensor<R, D> {
         //    `kv_seq_len` is meaningfully shorter than that block — i.e.
         //    on the typical `kv_seq_len < 32` shapes the conformance
         //    suite exercises.
-        if k_shape[2] < subgroup_size as usize {
+        if device.is_software_adapter() && k_shape[2] < subgroup_size as usize {
             return None;
         }
         const MIN_DECODE_KV_SEQ: usize = 32;
@@ -1023,7 +1023,7 @@ impl<D: DataType, const R: usize> Tensor<R, D> {
             && q_shape[3] == 128
             && mask.is_none()
             && D::DATA_TYPE == DataTypeEnum::F32;
-        if is_decode_candidate && k_shape[2] < MIN_DECODE_KV_SEQ {
+        if is_decode_candidate && device.is_software_adapter() && k_shape[2] < MIN_DECODE_KV_SEQ {
             return None;
         }
         let v_shape = v.shape();

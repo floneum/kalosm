@@ -22,6 +22,10 @@ fn candle_gpu_device() -> Option<candle_core::Device> {
         .ok()
 }
 
+fn quick_bench() -> bool {
+    std::env::args().any(|arg| arg == "--quick")
+}
+
 fn linear(c: &mut Criterion) {
     use candle_core::Module;
     use fusor_gguf::GgufMetadata;
@@ -41,8 +45,15 @@ fn linear(c: &mut Criterion) {
             tokio::fs::read(&path).await.unwrap()
         });
 
-    for size in [1, 512] {
-        for (width, name) in [(1024, "blk.0.attn_q"), (4096, "blk.0.ffn_down")] {
+    let quick = quick_bench();
+    let sizes: &[usize] = if quick { &[1] } else { &[1, 512] };
+    let widths: &[(usize, &str)] = if quick {
+        &[(1024, "blk.0.attn_q")]
+    } else {
+        &[(1024, "blk.0.attn_q"), (4096, "blk.0.ffn_down")]
+    };
+    for &size in sizes {
+        for &(width, name) in widths {
             let random_data: Vec<Vec<f32>> = (0..size)
                 .map(|_| (0..width).map(|_| rand::random()).collect())
                 .collect();
@@ -56,7 +67,7 @@ fn linear(c: &mut Criterion) {
 
                 let group_name = format!("linear-{width}-{quantization}");
                 let mut group = c.benchmark_group(&group_name);
-                group.sample_size(20);
+                group.sample_size(if quick { 10 } else { 20 });
                 group.plot_config(
                     criterion::PlotConfiguration::default()
                         .summary_scale(criterion::AxisScale::Logarithmic),

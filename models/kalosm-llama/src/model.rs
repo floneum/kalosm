@@ -1,9 +1,9 @@
+use crate::LlamaConfigJson;
 use crate::gguf_tokenizer::get_pre_tokenizer;
-use crate::raw::cache::LlamaCache;
 use crate::raw::Model;
+use crate::raw::cache::LlamaCache;
 use crate::token_stream::TokenOutputStream;
 use crate::token_stream::TokenOutputStreamError;
-use crate::LlamaConfigJson;
 use fusor::AddOp;
 use fusor::CastTensor;
 use fusor::CastTo;
@@ -103,11 +103,12 @@ fn decode_trace_enabled() -> bool {
         || std::env::var_os("FUSOR_TRACE_RESOLVE").is_some()
 }
 
-fn gpu_sample_top_k() -> usize {
+fn gpu_sample_top_k(config: &GpuSamplerConfig) -> usize {
     std::env::var("KALOSM_LLAMA_GPU_SAMPLE_TOP_K")
         .ok()
         .and_then(|value| value.parse().ok())
-        .unwrap_or(512)
+        .or(config.top_k)
+        .unwrap_or(16)
         .max(1)
 }
 
@@ -937,7 +938,7 @@ where
                     LlamaGpuSamplerState::new(&self.device, gpu_sampler_config, seed)
                 {
                     let mut next_token = {
-                        let top_k = gpu_sample_top_k();
+                        let top_k = gpu_sample_top_k(&gpu_sampler.config);
                         let previous_tokens = gpu_sampler.previous_tokens(&text_stream);
                         let params = gpu_sampler.params(top_k);
                         let mut session_lock = session
@@ -993,7 +994,7 @@ where
                         }
 
                         next_token = {
-                            let top_k = gpu_sample_top_k();
+                            let top_k = gpu_sample_top_k(&gpu_sampler.config);
                             let previous_tokens = gpu_sampler.previous_tokens(&text_stream);
                             let params = gpu_sampler.params(top_k);
                             let mut session_lock = session

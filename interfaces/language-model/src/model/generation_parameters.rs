@@ -335,6 +335,11 @@ impl GenerationParameters {
         self.repetition_penalty_range
     }
 
+    /// Get the top-k sampling limit to use when generating text.
+    pub fn top_k(&self) -> Option<u32> {
+        self.top_k
+    }
+
     /// Get the maximum length to use when generating text.
     pub fn max_length(&self) -> u32 {
         self.max_length

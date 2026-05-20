@@ -169,20 +169,6 @@ impl TokenOutputStream {
         Ok(Some(new_tokens.to_vec()))
     }
 
-    /// Recalculate the current text
-    pub(crate) fn recalculate_current_text(&mut self) -> Result<(), TokenOutputStreamError> {
-        let current_text = if self.tokens.is_empty() {
-            Default::default()
-        } else {
-            let tokens = &self.tokens[self.prev_index..self.current_index];
-            self.decode(tokens)?.to_string()
-        };
-
-        self.current_text = current_text;
-
-        Ok(())
-    }
-
     /// Returns the next token.
     pub fn next_token(&mut self, token: u32) -> Result<Option<String>, TokenOutputStreamError> {
         let prev_text = &self.current_text;
@@ -192,8 +178,8 @@ impl TokenOutputStream {
             let text = text.split_at(prev_text.len());
             self.prev_index = self.current_index;
             self.current_index = self.tokens.len();
-            self.recalculate_current_text()?;
-            Ok(Some(text.1.to_string()))
+            self.current_text = text.1.to_string();
+            Ok(Some(self.current_text.clone()))
         } else {
             Ok(None)
         }
@@ -211,8 +197,8 @@ impl TokenOutputStream {
             let text = text.split_at(prev_text.len());
             self.prev_index = self.current_index;
             self.current_index = self.tokens.len();
-            self.recalculate_current_text()?;
-            Ok(Some(text.1.to_string()))
+            self.current_text = text.1.to_string();
+            Ok(Some(self.current_text.clone()))
         } else {
             Ok(None)
         }

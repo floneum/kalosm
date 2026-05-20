@@ -44,10 +44,22 @@ async fn main() {
         .await
         .unwrap();
 
+    let prompt_tokens = model
+        .tokenizer()
+        .encode(prompt.as_str(), true)
+        .unwrap()
+        .len();
     let sampler = if std::env::var_os("KALOSM_PROFILE_LLAMA_UNBOUNDED").is_some() {
         GenerationParameters::default()
     } else {
-        GenerationParameters::default().with_max_length((warmup + measured) as u32)
+        GenerationParameters::default().with_max_length((prompt_tokens + warmup + measured) as u32)
+    };
+    let sampler = match std::env::var("KALOSM_PROFILE_LLAMA_TOP_K")
+        .ok()
+        .and_then(|value| value.parse().ok())
+    {
+        Some(top_k) => sampler.with_top_k(top_k),
+        None => sampler,
     };
     let mut stream = model
         .complete(&prompt)

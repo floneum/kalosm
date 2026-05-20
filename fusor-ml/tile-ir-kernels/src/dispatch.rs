@@ -134,14 +134,9 @@ pub(crate) enum QgemvShapeQ6K {
 
 // ----- Q4K mid (rows<=4096, 4096<=cols<8192) -----
 
-/// Default Q4K mid-shape: cols==5120 → 4x3, cols==6144 → 8x2, else 2x2.
+/// Default Q4K mid-shape.
 pub(crate) const fn q4k_default_mid(_rows: u32, cols: u32) -> QgemvShapeQ4K {
-    if cols == 5120 {
-        return QgemvShapeQ4K::Ggml4x3_128;
-    }
-    if cols == 6144 {
-        return QgemvShapeQ4K::Ggml8x2_256;
-    }
+    let _ = cols;
     QgemvShapeQ4K::Ggml2x2_64
 }
 
@@ -166,10 +161,10 @@ pub(crate) fn q4k_mid_override(default: QgemvShapeQ4K) -> QgemvShapeQ4K {
 
 // ----- Q4K large (rows<=4096, cols>=8192) -----
 
-/// Default Q4K large-shape: cols<=16_384 → 4x4, else 2x4.
+/// Default Q4K large-shape.
 pub(crate) const fn q4k_default_large(_rows: u32, cols: u32) -> QgemvShapeQ4K {
-    if cols <= 16_384 {
-        QgemvShapeQ4K::Ggml4x4_128
+    if cols <= 16_384 || cols >= 65_536 {
+        QgemvShapeQ4K::Ggml1x8_32
     } else {
         QgemvShapeQ4K::Ggml2x4_64
     }
@@ -219,13 +214,10 @@ pub(crate) fn q4k_tall_override(default: QgemvShapeQ4K) -> QgemvShapeQ4K {
 
 // ----- Q6K large (rows<=4096, cols>=8192) -----
 
-/// Default Q6K large-shape: cols<=16_384 → 2x2, else 2x4.
+/// Default Q6K large-shape.
 pub(crate) const fn q6k_default_large(_rows: u32, cols: u32) -> QgemvShapeQ6K {
-    if cols <= 16_384 {
-        QgemvShapeQ6K::Ggml2x2_64
-    } else {
-        QgemvShapeQ6K::Ggml2x4_64
-    }
+    let _ = cols;
+    QgemvShapeQ6K::Ggml2x4_64
 }
 
 /// Apply `FUSOR_Q6K_LARGE_TILE` if set. Standard 8-tile set.
@@ -302,41 +294,39 @@ mod tests {
     }
 
     #[test]
-    fn q4k_mid_default_unchanged() {
-        // Uses the inline `if b.cols == 5120 / 6144` branches from
-        // qgemv_tile (kernels/qgemv.rs).
+    fn q4k_mid_default() {
         assert_eq!(q4k_default_mid(4096, 4096), QgemvShapeQ4K::Ggml2x2_64);
-        assert_eq!(q4k_default_mid(4096, 5120), QgemvShapeQ4K::Ggml4x3_128);
-        assert_eq!(q4k_default_mid(4096, 6144), QgemvShapeQ4K::Ggml8x2_256);
+        assert_eq!(q4k_default_mid(4096, 5120), QgemvShapeQ4K::Ggml2x2_64);
+        assert_eq!(q4k_default_mid(4096, 6144), QgemvShapeQ4K::Ggml2x2_64);
         assert_eq!(q4k_default_mid(2048, 7000), QgemvShapeQ4K::Ggml2x2_64);
     }
 
     #[test]
-    fn q4k_large_default_unchanged() {
-        // Uses the mid-size Q4K branch from kernels/qgemv.rs.
-        assert_eq!(q4k_default_large(4096, 8192), QgemvShapeQ4K::Ggml4x4_128);
-        assert_eq!(q4k_default_large(4096, 16_384), QgemvShapeQ4K::Ggml4x4_128);
+    fn q4k_large_default() {
+        assert_eq!(q4k_default_large(4096, 8192), QgemvShapeQ4K::Ggml1x8_32);
+        assert_eq!(q4k_default_large(4096, 16_384), QgemvShapeQ4K::Ggml1x8_32);
         assert_eq!(q4k_default_large(4096, 16_385), QgemvShapeQ4K::Ggml2x4_64);
         assert_eq!(q4k_default_large(4096, 32_768), QgemvShapeQ4K::Ggml2x4_64);
+        assert_eq!(q4k_default_large(4096, 65_536), QgemvShapeQ4K::Ggml1x8_32);
+        assert_eq!(q4k_default_large(4096, 128_256), QgemvShapeQ4K::Ggml1x8_32);
     }
 
     #[test]
-    fn q4k_tall_default_unchanged() {
+    fn q4k_tall_default() {
         // Constant 4x2 from kernels/qgemv.rs.
         assert_eq!(q4k_default_tall(8192, 4096), QgemvShapeQ4K::Ggml4x2_128);
         assert_eq!(q4k_default_tall(16_384, 2048), QgemvShapeQ4K::Ggml4x2_128);
     }
 
     #[test]
-    fn q6k_large_default_unchanged() {
-        // Uses the large/tall Q6K branches from kernels/qgemv.rs.
-        assert_eq!(q6k_default_large(4096, 8192), QgemvShapeQ6K::Ggml2x2_64);
-        assert_eq!(q6k_default_large(4096, 16_384), QgemvShapeQ6K::Ggml2x2_64);
+    fn q6k_large_default() {
+        assert_eq!(q6k_default_large(4096, 8192), QgemvShapeQ6K::Ggml2x4_64);
+        assert_eq!(q6k_default_large(4096, 16_384), QgemvShapeQ6K::Ggml2x4_64);
         assert_eq!(q6k_default_large(4096, 16_385), QgemvShapeQ6K::Ggml2x4_64);
     }
 
     #[test]
-    fn q6k_tall_default_unchanged() {
+    fn q6k_tall_default() {
         // Constant 2x2 from kernels/qgemv.rs.
         assert_eq!(q6k_default_tall(8192, 4096), QgemvShapeQ6K::Ggml2x2_64);
     }
