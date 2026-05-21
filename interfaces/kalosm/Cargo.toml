@@ -7,6 +7,7 @@ description = "A simple interface for pretrained AI models "
 keywords = ["llm", "llama", "whisper", "ocr", "nlp"]
 license = "MIT/Apache-2.0"
 repository = "https://github.com/floneum/floneum"
+autoexamples = false
 
 [dependencies]
 comfy-table = { version = "7.1.0", optional = true }
@@ -32,11 +33,13 @@ features = []
 features = []
 optional = true
 workspace = true
+default-features = false
 
 [dependencies.kalosm-sound]
 features = []
 optional = true
 workspace = true
+default-features = false
 
 [dependencies.kalosm-streams]
 features = []
@@ -46,6 +49,7 @@ workspace = true
 features = []
 optional = true
 workspace = true
+default-features = false
 
 [dependencies.serde]
 version = "1.0.163"
@@ -54,6 +58,7 @@ features = ["derive"]
 [dependencies.surrealdb]
 version = "2.4.0"
 optional = true
+default-features = false
 
 [dependencies.heed]
 version = "0.22"
@@ -64,30 +69,11 @@ version = "0.1.40"
 optional = true
 
 [dev-dependencies]
-axum = "0.7.2"
-scraper = "0.19.0"
-tracing-subscriber = "0.2"
-surrealdb = { version = "2.4.0", features = ["kv-mem", "kv-surrealkv"] }
-anyhow.workspace = true
-image.workspace = true
-tokio = { version = "1", features = ["full"] }
-
-[dev-dependencies.kalosm]
-features = [
-    "sound",
-    "sound-source",
-    "sound-voice-detection",
-    "language",
-    "vision",
-    "remote",
-    "surrealdb",
-    "prompt_annealing",
-]
-workspace = true
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 
 [features]
-default = ["bert", "llama"]
-full = ["language", "vision", "sound", "surrealdb"]
+default = []
+full = ["bert", "llama", "vision", "sound", "sound-denoise", "surrealdb"]
 cuda = [
     "kalosm-language?/cublas",
     "kalosm-vision?/cublas",
@@ -99,142 +85,32 @@ language = [
     "dep:kalosm-model-types",
     "dep:comfy-table",
 ]
-bert = ["kalosm-language?/bert", "dep:kalosm-common"]
-llama = ["kalosm-language?/llama", "dep:kalosm-common"]
-prompt_annealing = ["language", "dep:rand", "dep:thiserror", "dep:tracing"]
+bert = ["language", "kalosm-language/bert", "dep:kalosm-common"]
+llama = ["language", "kalosm-language/llama", "dep:kalosm-common"]
+prompt_annealing = ["bert", "dep:rand", "dep:thiserror", "dep:tracing"]
 metal = [
     "kalosm-language?/metal",
     "kalosm-vision?/metal",
 ]
 sound = ["dep:kalosm-sound"]
-sound-source = ["kalosm-sound?/source"]
-sound-voice-detection = ["kalosm-sound?/voice-detection"]
-surrealdb = ["dep:surrealdb", "dep:heed", "dep:arroy", "dep:thiserror"]
+sound-denoise = ["sound", "kalosm-sound/denoise"]
+sound-source = ["sound", "kalosm-sound/source"]
+sound-voice-detection = ["sound", "kalosm-sound/voice-detection"]
+surrealdb = ["bert", "dep:surrealdb", "dep:heed", "dep:arroy", "dep:thiserror"]
+surrealdb-local = ["surrealdb", "surrealdb/kv-mem", "surrealdb/kv-surrealkv"]
 vision = ["dep:kalosm-vision"]
-openai = ["kalosm-language?/openai"]
-anthropic = ["kalosm-language?/anthropic"]
-remote = ["kalosm-language?/remote"]
-scrape = ["kalosm-language?/scrape"]
-
-[[example]]
-name = "axum"
-required-features = ["language"]
-
-[[example]]
-name = "chat-mistral-2"
-required-features = ["language"]
-
-[[example]]
-name = "phi-3"
-required-features = ["language"]
-
-[[example]]
-name = "chat-tiny-llama"
-required-features = ["language"]
-
-[[example]]
-name = "vision"
-required-features = ["language"]
-
-[[example]]
-name = "chat-with-character"
-required-features = ["language"]
+openai = ["language", "kalosm-language/openai"]
+anthropic = ["language", "kalosm-language/anthropic"]
+remote = ["openai", "anthropic"]
+scrape = ["language", "kalosm-language/scrape"]
 
 [[example]]
 name = "chat"
-required-features = ["language"]
+required-features = ["llama"]
 
-[[example]]
-name = "chunking"
-required-features = ["language"]
-
-[[example]]
-name = "constrained-regex"
-required-features = ["language"]
-
-[[example]]
-name = "constrained-rust-types"
-required-features = ["language"]
-
-[[example]]
-name = "constrained"
-required-features = ["language"]
-
-[[example]]
-name = "crawl"
-required-features = ["language", "scrape"]
-
-[[example]]
-name = "evaluation"
-required-features = ["language"]
-
-[[example]]
-name = "generate-image"
-required-features = ["language"]
-
-[[example]]
-name = "generate-text"
-required-features = ["language"]
-
-[[example]]
-name = "live-qa"
-required-features = ["language", "sound", "surrealdb"]
-
-[[example]]
-name = "llama"
-required-features = ["language"]
-
-[[example]]
-name = "mistral"
-required-features = ["language"]
-
-[[example]]
-name = "mutate"
-required-features = ["language"]
-
-[[example]]
-name = "ocr"
-required-features = ["vision"]
-
-[[example]]
-name = "prompt-annealing"
-required-features = ["language", "prompt_annealing"]
-
-[[example]]
-name = "remote-open-ai-compatable"
-required-features = ["language"]
-
-[[example]]
-name = "claude-3-5-haiku"
-required-features = ["language", "anthropic"]
-
-[[example]]
-name = "gpt-4o-mini"
-required-features = ["language", "openai"]
-
-[[example]]
-name = "segment-image"
-required-features = ["vision"]
-
-[[example]]
-name = "self-chat"
-required-features = ["language"]
-
-[[example]]
-name = "semantic-search"
-required-features = ["language", "surrealdb"]
-
-[[example]]
-name = "rag"
-required-features = ["language", "surrealdb"]
-
-[[example]]
-name = "task"
-required-features = ["language"]
-
-[[example]]
-name = "transcribe"
-required-features = ["sound"]
+[[test]]
+name = "hybrid_test"
+required-features = ["surrealdb-local"]
 
 [package.metadata.docs.rs]
 # Features to pass to Cargo

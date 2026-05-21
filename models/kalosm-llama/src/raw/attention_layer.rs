@@ -282,6 +282,7 @@ where
 
 pub struct GroupedAttention {
     pub attention_qkv: QMatrix,
+    pub interleaved_rope: bool,
 }
 
 impl GroupedAttention {
@@ -331,8 +332,13 @@ impl GroupedAttention {
             .to_concrete()
             .cast();
 
-        let (query_states, key_states) =
-            rope_cache.forward(&query_states, &key_states, start_pos, pos_ids, false);
+        let (query_states, key_states) = rope_cache.forward(
+            &query_states,
+            &key_states,
+            start_pos,
+            pos_ids,
+            self.interleaved_rope,
+        );
 
         (query_states, key_states, value_states)
     }

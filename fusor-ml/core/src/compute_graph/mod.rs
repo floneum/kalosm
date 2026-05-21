@@ -273,6 +273,16 @@ impl ComputeGraphNodeVariant {
             }
             ComputeGraphNodeVariant::QMatMul(op) => {
                 f(op.input);
+                if let Some(epilogue) = &op.pre_element_wise_expr {
+                    for extra in &epilogue.extras {
+                        f(*extra);
+                    }
+                }
+                if let Some(epilogue) = &op.post_element_wise_expr {
+                    for extra in &epilogue.extras {
+                        f(*extra);
+                    }
+                }
                 if let Some(paired) = &op.paired {
                     for extra in &paired.extras {
                         f(*extra);

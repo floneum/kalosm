@@ -315,12 +315,18 @@ where
             tok_embeddings_q.clone()
         });
         let mut layers = Vec::with_capacity(block_count);
+        let interleaved_rope = architecture.as_ref() != "qwen2"
+            && architecture.as_ref() != "qwen3"
+            && architecture.as_ref() != "gemma3";
         for layer_idx in 0..block_count {
             let prefix = format!("blk.{layer_idx}");
             let attention_variant = if let Ok(attention_qkv) =
                 source.tensor(&format!("{prefix}.attn_qkv.weight"), device)
             {
-                AttentionVariant::Grouped(GroupedAttention { attention_qkv })
+                AttentionVariant::Grouped(GroupedAttention {
+                    attention_qkv,
+                    interleaved_rope,
+                })
             } else {
                 let q = source.tensor(&format!("{prefix}.attn_q.weight"), device)?;
                 let k = source.tensor(&format!("{prefix}.attn_k.weight"), device)?;
@@ -354,9 +360,7 @@ where
                         .map(|norm| decode_norm(norm, rms_norm_eps))
                         .transpose()?,
                     attention_wv: v,
-                    interleaved_rope: architecture.as_ref() != "qwen2"
-                        && architecture.as_ref() != "qwen3"
-                        && architecture.as_ref() != "gemma3",
+                    interleaved_rope,
                     bias,
                 };
                 AttentionVariant::Separate(Box::new(separate))
@@ -636,7 +640,7 @@ where
             let x = layer_in;
             let residual: Tensor<3, f32> = x.cast();
             let x = layer.attention_norm.forward_generic(&x);
-            let mask = (seq_len > 1 || layer.sliding_window_size.is_some()).then(|| {
+            let mask = (seq_len > 1).then(|| {
                 self.masks
                     .get_mask(seq_len, index_pos, layer.sliding_window_size, device)
             });

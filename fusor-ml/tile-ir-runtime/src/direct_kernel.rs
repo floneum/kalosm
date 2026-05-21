@@ -43,6 +43,7 @@ pub struct DirectKernel {
 pub struct PreparedDirectDispatch {
     pipeline: wgpu::ComputePipeline,
     bind_group: wgpu::BindGroup,
+    _buffers: Vec<Arc<wgpu::Buffer>>,
     dispatch_size: [u32; 3],
 }
 
@@ -134,6 +135,7 @@ impl DirectKernel {
                 Some(PreparedDirectDispatch {
                     pipeline: pipeline.clone(),
                     bind_group,
+                    _buffers: vec![input.clone(), weight.clone(), output.clone()],
                     dispatch_size: self.dispatch_size,
                 })
             }
@@ -228,6 +230,10 @@ impl DirectKernel {
                 Some(PreparedDirectDispatch {
                     pipeline,
                     bind_group,
+                    _buffers: bindings
+                        .iter()
+                        .map(|binding| binding.buffer.clone())
+                        .collect(),
                     dispatch_size: self.dispatch_size,
                 })
             }

@@ -100,6 +100,7 @@ where
                         sampler.mu(),
                         sampler.repetition_penalty(),
                         sampler.repetition_penalty_range() as usize,
+                        sampler.top_k().map(|top_k| top_k as usize),
                     )),
                 ),
                 None => (u32::MAX, None, None, None),

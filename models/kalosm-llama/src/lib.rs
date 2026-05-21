@@ -456,6 +456,7 @@ pub(crate) struct GpuSamplerConfig {
     pub(crate) mu: f32,
     pub(crate) repetition_penalty: f32,
     pub(crate) repetition_penalty_range: usize,
+    pub(crate) top_k: Option<usize>,
 }
 
 impl GpuSamplerConfig {
@@ -466,6 +467,7 @@ impl GpuSamplerConfig {
         mu: f32,
         repetition_penalty: f32,
         repetition_penalty_range: usize,
+        top_k: Option<usize>,
     ) -> Self {
         Self {
             temperature,
@@ -474,6 +476,7 @@ impl GpuSamplerConfig {
             mu,
             repetition_penalty,
             repetition_penalty_range,
+            top_k,
         }
     }
 }

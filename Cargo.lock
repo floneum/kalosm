@@ -4822,15 +4822,11 @@ dependencies = [
 name = "kalosm"
 version = "0.4.0"
 dependencies = [
- "anyhow",
  "arroy",
- "axum",
  "comfy-table",
  "futures-util",
  "hdrhistogram",
  "heed",
- "image 0.25.10",
- "kalosm",
  "kalosm-common",
  "kalosm-language",
  "kalosm-model-types",
@@ -4838,13 +4834,11 @@ dependencies = [
  "kalosm-streams",
  "kalosm-vision",
  "rand 0.8.5",
- "scraper",
  "serde",
  "surrealdb",
  "thiserror 2.0.18",
  "tokio",
  "tracing",
- "tracing-subscriber 0.2.25",
 ]
 
 [[package]]
@@ -4867,6 +4861,25 @@ dependencies = [
  "wasm-bindgen",
  "wasm-bindgen-futures",
  "web-sys",
+]
+
+[[package]]
+name = "kalosm-examples"
+version = "0.4.0"
+dependencies = [
+ "anyhow",
+ "axum",
+ "comfy-table",
+ "futures-util",
+ "image 0.25.10",
+ "kalosm",
+ "kalosm-language",
+ "kalosm-sample",
+ "kalosm-vision",
+ "serde",
+ "surrealdb",
+ "tokio",
+ "tracing-subscriber 0.2.25",
 ]
 
 [[package]]
@@ -5112,10 +5125,6 @@ dependencies = [
  "segment-anything-rs",
  "tokio",
 ]
-
-[[package]]
-name = "kalosm-workspace"
-version = "0.4.0"
 
 [[package]]
 name = "khronos-egl"

@@ -111,8 +111,8 @@ cd ./kalosm-hello-world
 3. Add Kalosm as a dependency
 
 ```sh
-# You can use `--features language,metal`, `--features language,cuda`, or `--features language,mkl` if your machine supports an accelerator
-cargo add kalosm --features language
+# You can use `--features llama,metal`, `--features llama,cuda`, or `--features llama,mkl` if your machine supports an accelerator
+cargo add kalosm --features llama
 cargo add tokio --features full
 ```
 

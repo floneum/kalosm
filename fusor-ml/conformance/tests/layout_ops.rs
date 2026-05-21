@@ -286,6 +286,35 @@ async fn sliding_window_then_transpose_then_reshape_matches_expected() {
 }
 
 #[tokio::test]
+async fn transpose_reshape_consumed_by_elementwise_matches_expected() {
+    let shape = [1usize, 32, 2, 128];
+    let data = (0..shape.iter().product::<usize>())
+        .map(|i| i as f32 * 0.001)
+        .collect::<Vec<_>>();
+    let mut expected = Vec::with_capacity(data.len());
+    for batch in 0..shape[0] {
+        for seq in 0..shape[2] {
+            for head in 0..shape[1] {
+                for dim in 0..shape[3] {
+                    let index = (((batch * shape[1] + head) * shape[2] + seq) * shape[3]) + dim;
+                    expected.push(data[index] + 0.25);
+                }
+            }
+        }
+    }
+
+    for device in available_devices().await {
+        let input: Tensor<4, f32> = Tensor::from_slice(&device, shape, &data);
+        let produced = input + 0.25;
+        let transposed = produced.transpose(1, 2);
+        let reshaped = transposed.reshape([1, 2, 32 * 128]);
+        let consumed = (reshaped + 0.0).to_concrete();
+        let expected = Tensor::from_slice(&device, [1, 2, 32 * 128], &expected);
+        assert_approx_tensors(consumed, expected, 0.0).await;
+    }
+}
+
+#[tokio::test]
 async fn sliding_window_with_cat_padding_matches_expected() {
     use fusor_types::SlidingWindow;
     // Conv1d-style padding regression: pad an input with `cat`, then sliding-window.

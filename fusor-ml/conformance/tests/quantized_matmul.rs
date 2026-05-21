@@ -166,6 +166,166 @@ async fn q4k_paired_natural_form_matches_cpu_reference() {
     }
 }
 
+#[tokio::test]
+async fn q4k_paired_llama_shape_one_hot_matches_cpu_reference() {
+    use fusor::D;
+
+    let Ok(device) = Device::new().await else {
+        return;
+    };
+    let weight_shape = [14336usize, 4096usize];
+    let pair_len = weight_shape[0] / 2;
+    let input_rows = 48usize;
+    let selected_k = 777usize;
+    let blocks_per_row = weight_shape[1] / BlockQ4K::BLOCK_SIZE;
+    let selected_block_in_row = selected_k / BlockQ4K::BLOCK_SIZE;
+    let selected_offset = selected_k % BlockQ4K::BLOCK_SIZE;
+    let raw_bytes = q4k_raw_bytes(weight_shape);
+    let weights = qmatrix_from_raw_bytes(&device, weight_shape, &raw_bytes, GgmlType::Q4K);
+    let selected_weight = |row: usize| {
+        let block_index = row * blocks_per_row + selected_block_in_row;
+        let offset = block_index * size_of::<BlockQ4K>();
+        assert!(offset + size_of::<BlockQ4K>() <= raw_bytes.len());
+        let block =
+            unsafe { std::ptr::read_unaligned(raw_bytes.as_ptr().add(offset).cast::<BlockQ4K>()) };
+        block.dequantize().as_ref()[selected_offset]
+    };
+    let mut input_data = vec![0.0f32; input_rows * weight_shape[1]];
+    for row in 0..input_rows {
+        input_data[row * weight_shape[1] + selected_k] = 0.125 + row as f32 * 0.01;
+    }
+    let input: Tensor<2, f32> =
+        Tensor::from_slice(&device, [input_rows, weight_shape[1]], &input_data);
+
+    let projected = input.q_mat_mul(&weights);
+    let gate = projected.narrow(D::Minus1, 0, pair_len).to_concrete();
+    let up = projected
+        .narrow(D::Minus1, pair_len, pair_len)
+        .to_concrete();
+    let actual = (gate.silu() * up).to_concrete().as_slice().await.unwrap();
+
+    assert_eq!(actual.shape(), &[input_rows, pair_len]);
+    for row in 0..input_rows {
+        let input_value = input_data[row * weight_shape[1] + selected_k];
+        for col in [0usize, 1, 63, 64, 511, 1024, 4095, pair_len - 1] {
+            let gate = input_value * selected_weight(col);
+            let up = input_value * selected_weight(col + pair_len);
+            let expected = (gate / (1.0 + (-gate).exp())) * up;
+            let actual = actual[[row, col]];
+            let tolerance = 2.0f32.max(expected.abs() * 1.0e-4);
+            assert!(
+                (actual - expected).abs() <= tolerance,
+                "row={row} col={col} actual={actual} expected={expected} tolerance={tolerance}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn q4k_paired_llama_shape_dense_sampled_columns_match_cpu_reference() {
+    use fusor::D;
+
+    let Ok(device) = Device::new().await else {
+        return;
+    };
+    let weight_shape = [14336usize, 4096usize];
+    let pair_len = weight_shape[0] / 2;
+    let input_rows = 48usize;
+    let blocks_per_row = weight_shape[1] / BlockQ4K::BLOCK_SIZE;
+    let raw_bytes = q4k_raw_bytes(weight_shape);
+    let weights = qmatrix_from_raw_bytes(&device, weight_shape, &raw_bytes, GgmlType::Q4K);
+    let block_at = |matrix_row: usize, block_col: usize| {
+        let block_index = matrix_row * blocks_per_row + block_col;
+        let offset = block_index * size_of::<BlockQ4K>();
+        assert!(offset + size_of::<BlockQ4K>() <= raw_bytes.len());
+        unsafe { std::ptr::read_unaligned(raw_bytes.as_ptr().add(offset).cast::<BlockQ4K>()) }
+    };
+    let mut input_data = vec![0.0f32; input_rows * weight_shape[1]];
+    for (index, value) in input_data.iter_mut().enumerate() {
+        let bucket = (index.wrapping_mul(37).wrapping_add(11)) % 101;
+        *value = (bucket as f32 - 50.0) * 0.0025;
+    }
+    let input: Tensor<2, f32> =
+        Tensor::from_slice(&device, [input_rows, weight_shape[1]], &input_data);
+
+    let projected = input.q_mat_mul(&weights);
+    let gate = projected.narrow(D::Minus1, 0, pair_len).to_concrete();
+    let up = projected
+        .narrow(D::Minus1, pair_len, pair_len)
+        .to_concrete();
+    let actual = (gate.silu() * up).to_concrete().as_slice().await.unwrap();
+
+    assert_eq!(actual.shape(), &[input_rows, pair_len]);
+    for row in [0usize, 1, 7, 17, 31, 47] {
+        let input_row = &input_data[row * weight_shape[1]..(row + 1) * weight_shape[1]];
+        for col in [0usize, 1, 63, 64, 511, 1024, 4095, pair_len - 1] {
+            let dot = |matrix_row: usize| {
+                (0..blocks_per_row)
+                    .map(|block_col| {
+                        let block = block_at(matrix_row, block_col);
+                        let weights = block.dequantize();
+                        weights
+                            .as_ref()
+                            .iter()
+                            .enumerate()
+                            .map(|(offset, weight)| {
+                                input_row[block_col * BlockQ4K::BLOCK_SIZE + offset] * *weight
+                            })
+                            .sum::<f32>()
+                    })
+                    .sum::<f32>()
+            };
+            let gate = dot(col);
+            let up = dot(col + pair_len);
+            let expected = (gate / (1.0 + (-gate).exp())) * up;
+            let actual = actual[[row, col]];
+            let tolerance = 2.0f32.max(expected.abs() * 1.0e-4);
+            assert!(
+                (actual - expected).abs() <= tolerance,
+                "row={row} col={col} actual={actual} expected={expected} tolerance={tolerance}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn q4k_q6k_ffn_chain_matches_cpu_reference_for_decode_rows() {
+    let hidden = 512usize;
+    let intermediate = 512usize;
+    let output = 128usize;
+    let gate_bytes = q4k_raw_bytes([intermediate, hidden]);
+    let up_bytes = q4k_raw_bytes([intermediate, hidden]);
+    let down_bytes = q6k_raw_bytes([output, intermediate]);
+
+    fusor_conformance::assert(move |input: Tensor<2, f32>| {
+        let gate_bytes = gate_bytes.clone();
+        let up_bytes = up_bytes.clone();
+        let down_bytes = down_bytes.clone();
+        async move {
+            let device = input.device();
+            let gate =
+                qmatrix_from_raw_bytes(&device, [intermediate, hidden], &gate_bytes, GgmlType::Q4K);
+            let up =
+                qmatrix_from_raw_bytes(&device, [intermediate, hidden], &up_bytes, GgmlType::Q4K);
+            let down =
+                qmatrix_from_raw_bytes(&device, [output, intermediate], &down_bytes, GgmlType::Q6K);
+            let gate_out = input.q_mat_mul(&gate).silu();
+            let up_out = input.q_mat_mul(&up);
+            (gate_out * up_out).q_mat_mul(&down).to_concrete()
+        }
+    })
+    .arg(q_mat_mul_input_fuzz(
+        1,
+        [intermediate, hidden],
+        834,
+        Uniform::new(-0.25, 0.25).unwrap(),
+    ))
+    .compare_with(approx_compare::<2, f32>(5.0))
+    .runs(3)
+    .await
+    .unwrap();
+}
+
 #[derive(Clone, Copy)]
 enum PairedKind {
     SwiGLU,
@@ -672,6 +832,8 @@ quantized_fixture_cases! {
     q4k_large_qgemv_fixture: BlockQ4K, GgmlType::Q4K, [8192, 512], q4k_raw_bytes, 1, 1e-4, 2.0, 827, false;
     q4k_mid_qgemv_fixture: BlockQ4K, GgmlType::Q4K, [4096, 512], q4k_raw_bytes, 1, 1e-4, 2.0, 830, false;
     q4k_tall_qgemv_fixture: BlockQ4K, GgmlType::Q4K, [128, 4608], q4k_raw_bytes, 1, 1e-4, 2.0, 828, false;
+    q4k_tail_rows_wide_output_fixture: BlockQ4K, GgmlType::Q4K, [128, 512], q4k_raw_bytes, 48, 1e-4, 2.0, 832, false;
+    q4k_tail_rows_llama_k_fixture: BlockQ4K, GgmlType::Q4K, [128, 4096], q4k_raw_bytes, 48, 1e-4, 2.0, 833, false;
     q5k_wide_fixture: BlockQ5K, GgmlType::Q5K, [2, 512], q5k_raw_bytes, 3, 1e-4, 1.0, 813, false;
     q6k_wide_fixture: BlockQ6K, GgmlType::Q6K, [2, 512], q6k_raw_bytes, 3, 1e-4, 1.0, 814, false;
     q6k_large_qgemv_fixture: BlockQ6K, GgmlType::Q6K, [8192, 512], q6k_raw_bytes, 1, 1e-4, 1.0, 831, false;
@@ -984,6 +1146,119 @@ async fn q_mat_mul_transposed_input_matches_host_reference() {
             fusor_conformance::approx_eq(&actual, &cpu_result, 5e-2)
                 .await
                 .unwrap();
+        }
+    }
+}
+
+#[tokio::test]
+async fn q_mat_mul_consumes_transpose_reshape_copy_matches_cpu_reference() {
+    let weight_shape = [4usize, 4096usize];
+    let raw_bytes = q8_0_raw_bytes(weight_shape);
+    let input_shape = [1usize, 32usize, 2usize, 128usize];
+    let data = deterministic_input(&input_shape, 1401);
+
+    let cpu_weights =
+        qmatrix_from_raw_bytes(&Device::Cpu, weight_shape, &raw_bytes, GgmlType::Q8_0);
+    let cpu_input: Tensor<4, f32> = Tensor::from_slice(&Device::Cpu, input_shape, &data);
+    let produced = cpu_input + 0.25;
+    let transposed = produced.transpose(1, 2);
+    let reshaped = transposed.reshape([1, 2, 32 * 128]);
+    let cpu_result = reshaped.q_mat_mul(&cpu_weights).to_concrete();
+
+    for device in available_devices().await {
+        let weights = qmatrix_from_raw_bytes(&device, weight_shape, &raw_bytes, GgmlType::Q8_0);
+        let input: Tensor<4, f32> = Tensor::from_slice(&device, input_shape, &data);
+        let produced = input + 0.25;
+        let transposed = produced.transpose(1, 2);
+        let reshaped = transposed.reshape([1, 2, 32 * 128]);
+        let actual = reshaped.q_mat_mul(&weights).to_concrete();
+        fusor_conformance::approx_eq(&actual, &cpu_result, 5e-2)
+            .await
+            .unwrap();
+    }
+}
+
+#[tokio::test]
+async fn q4k_llama_decode_transpose_reshape_qmatmul_matches_one_hot_reference() {
+    let Some(device) = available_devices()
+        .await
+        .into_iter()
+        .find(|device| device.as_gpu().is_some())
+    else {
+        return;
+    };
+    let Some(gpu_device) = device.as_gpu() else {
+        return;
+    };
+    if !gpu_device.subgroup_kernels_supported() {
+        return;
+    }
+
+    for (weight_shape, sample_cols) in [
+        (
+            [5120usize, 4096usize],
+            &[0usize, 1, 63, 64, 511, 1024, 4095, 5119][..],
+        ),
+        (
+            [14336usize, 4096usize],
+            &[0usize, 1, 63, 64, 511, 1024, 4095, 8191, 14335][..],
+        ),
+    ] {
+        assert_q4k_llama_decode_transpose_reshape_shape(&device, weight_shape, sample_cols).await;
+    }
+}
+
+async fn assert_q4k_llama_decode_transpose_reshape_shape(
+    device: &Device,
+    weight_shape: [usize; 2],
+    sample_cols: &[usize],
+) {
+    let [output_cols, hidden] = weight_shape;
+    let input_shape = [1usize, 32usize, 48usize, 128usize];
+    assert_eq!(hidden, input_shape[1] * input_shape[3]);
+    let selected_k = 777usize;
+    let selected_head = selected_k / input_shape[3];
+    let selected_dim = selected_k % input_shape[3];
+    let selected_block_in_row = selected_k / BlockQ4K::BLOCK_SIZE;
+    let selected_offset = selected_k % BlockQ4K::BLOCK_SIZE;
+    let blocks_per_row = hidden / BlockQ4K::BLOCK_SIZE;
+    let raw_bytes = q4k_raw_bytes(weight_shape);
+    let weights = qmatrix_from_raw_bytes(device, weight_shape, &raw_bytes, GgmlType::Q4K);
+
+    let mut input_data = vec![-0.25f32; input_shape.iter().product()];
+    let mut row_values = Vec::with_capacity(input_shape[2]);
+    for row in 0..input_shape[2] {
+        let row_value = 0.125 + row as f32 * 0.01;
+        row_values.push(row_value);
+        let index = ((selected_head * input_shape[2] + row) * input_shape[3]) + selected_dim;
+        input_data[index] = row_value - 0.25;
+    }
+
+    let input: Tensor<4, f32> = Tensor::from_slice(device, input_shape, &input_data);
+    let actual = (input + 0.25)
+        .transpose(1, 2)
+        .reshape([1, input_shape[2], hidden])
+        .q_mat_mul(&weights)
+        .as_slice()
+        .await
+        .unwrap();
+
+    assert_eq!(actual.shape(), &[1, input_shape[2], output_cols]);
+    for row in [0usize, 1, 7, 17, 31, 47] {
+        for &col in sample_cols {
+            let block_index = col * blocks_per_row + selected_block_in_row;
+            let offset = block_index * size_of::<BlockQ4K>();
+            assert!(offset + size_of::<BlockQ4K>() <= raw_bytes.len());
+            let block = unsafe {
+                std::ptr::read_unaligned(raw_bytes.as_ptr().add(offset).cast::<BlockQ4K>())
+            };
+            let expected = row_values[row] * block.dequantize().as_ref()[selected_offset];
+            let actual = actual[[0, row, col]];
+            let tolerance = 1e-2_f32.max(expected.abs() * 1.0e-4);
+            assert!(
+                (actual - expected).abs() <= tolerance,
+                "shape={weight_shape:?} row={row} col={col} actual={actual} expected={expected} tolerance={tolerance}"
+            );
         }
     }
 }

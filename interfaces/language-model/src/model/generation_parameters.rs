@@ -33,6 +33,7 @@ impl PartialEq for GenerationParameters {
             && self.tau == other.tau
             && self.mu == other.mu
             && self.top_p == other.top_p
+            && self.top_k == other.top_k
             && self.repetition_penalty == other.repetition_penalty
             && self.repetition_penalty_range == other.repetition_penalty_range
             && self.max_length == other.max_length
@@ -333,6 +334,11 @@ impl GenerationParameters {
     /// Get the repetition penalty range to use when generating text.
     pub fn repetition_penalty_range(&self) -> u32 {
         self.repetition_penalty_range
+    }
+
+    /// Get the top-k sampling limit to use when generating text.
+    pub fn top_k(&self) -> Option<u32> {
+        self.top_k
     }
 
     /// Get the maximum length to use when generating text.

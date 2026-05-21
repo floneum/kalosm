@@ -1040,14 +1040,10 @@ impl<D: DataType, const R: usize> Tensor<R, D> {
         let q_shape = self.shape();
         let k_shape = k.shape();
         // Both flash-attention kernel families pad lanes past `kv_seq_len`
-        // and rely on the reduction step to ignore that padding. On at
-        // least one Windows wgpu backend (WARP / DX12) the reduction
-        // miscompiles when most of the lanes carry the pad value, dropping
-        // contributions from real lanes alongside the padding — the
-        // deterministic `actual=-0.34986264 expected=-0.5393032` regression
-        // at `flash_attention_matches_cpu_reference_on_varied_shapes`. Two
-        // separate guards, because the two kernels have different pad
-        // widths:
+        // and rely on the reduction step to ignore that padding. Keep the
+        // small-KV guards on software/host-fallback adapters where subgroup
+        // reductions have proven unreliable, but let real GPUs use the fast
+        // decode kernels.
         //
         // 1. Streaming kernel pads lanes past `kv_seq_len` within each
         //    hardware subgroup chunk with `NEG_MAX_F32`, so it only goes
@@ -1057,7 +1053,7 @@ impl<D: DataType, const R: usize> Tensor<R, D> {
         //    `kv_seq_len` is meaningfully shorter than that block — i.e.
         //    on the typical `kv_seq_len < 32` shapes the conformance
         //    suite exercises.
-        if device.backend() == wgpu::Backend::Dx12 && k_shape[2] < subgroup_size as usize {
+        if device.requires_host_fallbacks() && k_shape[2] < subgroup_size as usize {
             return None;
         }
         const MIN_DECODE_KV_SEQ: usize = 32;

@@ -1,5 +1,6 @@
 use std::{
     collections::VecDeque,
+    str::FromStr,
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -13,6 +14,7 @@ use crate::{
     quantized::matmul::{ElementwiseEpilogue, QMatMulOperation},
     tensor::TensorData,
 };
+use fusor_gguf::GgmlType;
 use petgraph::algo::toposort;
 use petgraph::stable_graph::StableGraph;
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -46,6 +48,27 @@ struct CopyBufferRecord {
 enum CommandRecord {
     Dispatch(DispatchRecord),
     CopyBuffer(CopyBufferRecord),
+}
+
+enum QueuedOperation {
+    Generic(Arc<dyn Operation>),
+    QMatMul(QMatMulOperation),
+}
+
+impl QueuedOperation {
+    fn visit_dependencies(&self, f: &mut dyn FnMut(NodeIndex)) {
+        match self {
+            Self::Generic(operation) => operation.visit_dependencies(f),
+            Self::QMatMul(operation) => operation.visit_dependencies(f),
+        }
+    }
+
+    fn inputs(&self, graph: &ComputeGraphInner) -> Vec<MirValue> {
+        match self {
+            Self::Generic(operation) => operation.inputs(graph),
+            Self::QMatMul(operation) => operation.inputs(graph),
+        }
+    }
 }
 
 #[derive(Default)]
@@ -92,6 +115,56 @@ struct ResolveHostCategoryProfile {
     workgroup: Duration,
     build_kernel: Duration,
     prepare_dispatch: Duration,
+}
+
+#[derive(Default)]
+struct OptimizeProfile {
+    iterations: usize,
+    changed: usize,
+    fuse_naries_count: usize,
+    fuse_naries: Duration,
+    fuse_reduce_count: usize,
+    fuse_reduce: Duration,
+    fuse_matmul_count: usize,
+    fuse_matmul: Duration,
+    fuse_paired_qmatmul_count: usize,
+    fuse_paired_qmatmul: Duration,
+    fuse_rmsnorm_count: usize,
+    fuse_rmsnorm: Duration,
+}
+
+impl OptimizeProfile {
+    fn print(&self) {
+        eprintln!(
+            "resolve_optimize_profile iterations={} changed={} \
+fuse_naries_count={} fuse_naries={:?} \
+fuse_reduce_count={} fuse_reduce={:?} \
+fuse_matmul_count={} fuse_matmul={:?} \
+fuse_paired_qmatmul_count={} fuse_paired_qmatmul={:?} \
+fuse_rmsnorm_count={} fuse_rmsnorm={:?}",
+            self.iterations,
+            self.changed,
+            self.fuse_naries_count,
+            self.fuse_naries,
+            self.fuse_reduce_count,
+            self.fuse_reduce,
+            self.fuse_matmul_count,
+            self.fuse_matmul,
+            self.fuse_paired_qmatmul_count,
+            self.fuse_paired_qmatmul,
+            self.fuse_rmsnorm_count,
+            self.fuse_rmsnorm,
+        );
+    }
+}
+
+const DEFAULT_OPTIMIZE_NODE_LIMIT: usize = 512;
+
+fn optimize_node_limit() -> usize {
+    std::env::var("FUSOR_RESOLVE_OPTIMIZE_MAX_NODES")
+        .ok()
+        .and_then(|value| usize::from_str(&value).ok())
+        .unwrap_or(DEFAULT_OPTIMIZE_NODE_LIMIT)
 }
 
 impl ResolveHostProfile {
@@ -265,6 +338,7 @@ fn print_gpu_kernel_profile(
 pub(crate) struct Resolver {
     execution_graph: ExecutionGraph,
     node_mapping: FxHashMap<NodeIndex, ExecutionNodeIndex>,
+    layout_cache: FxHashMap<NodeIndex, Option<crate::TensorLayoutInfo>>,
     targets: Vec<NodeIndex>,
     resolved_set: FxHashSet<NodeIndex>,
 }
@@ -292,6 +366,7 @@ impl Resolver {
             targets,
             execution_graph: Default::default(),
             node_mapping: Default::default(),
+            layout_cache: Default::default(),
             resolved_set,
         }
     }
@@ -325,11 +400,29 @@ impl Resolver {
         // Pass 2: Apply Rewrite Rules
         {
             let start = host_trace.then(Instant::now);
+            let optimize_limit = optimize_node_limit();
+            let skip_large_graph_optimize =
+                optimize_limit != 0 && self.execution_graph.node_count() > optimize_limit;
+            let skip_decode_optimize = skip_large_graph_optimize
+                && self.is_single_token_qmatmul_graph()
+                && std::env::var_os("FUSOR_RESOLVE_OPTIMIZE_DECODE_GRAPHS").is_none();
             if std::env::var_os("FUSOR_RESOLVE_SKIP_OPTIMIZE").is_none() {
-                self.optimize(graph);
+                if skip_decode_optimize {
+                    self.optimize_large_graph(graph);
+                } else if skip_large_graph_optimize {
+                    self.optimize_large_graph(graph);
+                } else {
+                    self.optimize(graph);
+                }
             }
             if let Some(start) = start {
                 host_profile.optimize += start.elapsed();
+            }
+            if host_trace && skip_large_graph_optimize {
+                eprintln!(
+                    "resolve_host_profile optimize_large_graph node_count={} limit={optimize_limit} skipped_decode={skip_decode_optimize}",
+                    self.execution_graph.node_count(),
+                );
             }
         }
 
@@ -412,7 +505,7 @@ impl Resolver {
         let mut host_kernel_count = 0usize;
         let mut dispatch_categories = FxHashMap::<String, usize>::default();
         let mut dispatch_names = FxHashMap::<String, usize>::default();
-        for (node, operation) in queued_operations {
+        for (node, queued_operation) in queued_operations {
             let operation_category = host_category_trace
                 .then(|| {
                     graph
@@ -464,7 +557,7 @@ impl Resolver {
                     let start = host_trace.then(Instant::now);
                     Self::release_dead_intermediates(
                         graph,
-                        &[(node, operation)],
+                        &[&queued_operation],
                         &mut remaining_consumers,
                         &target_set,
                     );
@@ -475,7 +568,7 @@ impl Resolver {
                 }
 
                 let start = host_trace.then(Instant::now);
-                let new_inputs = operation.inputs(graph);
+                let new_inputs = queued_operation.inputs(graph);
                 if let Some(start) = start {
                     let elapsed = start.elapsed();
                     host_profile.inputs += elapsed;
@@ -483,15 +576,98 @@ impl Resolver {
                         host_category_profile.entry(category).or_default().inputs += elapsed;
                     }
                 }
-                if let Some(resolved) = operation.as_resize().and_then(|operation| {
-                    crate::resize::resolve_resize_on_host(operation, &new_inputs)
-                }) {
+                if let QueuedOperation::QMatMul(qmatmul) = &queued_operation {
+                    let start = host_trace.then(Instant::now);
+                    let result = qmatmul.output(graph, &new_inputs);
+                    let MirValue::Tensor(resolved) = result else {
+                        panic!("QMatMul output value is not a tensor");
+                    };
                     graph.set_cached_result(node, resolved);
-                    host_kernel_count += 1;
+                    if let Some(start) = start {
+                        let elapsed = start.elapsed();
+                        host_profile.output += elapsed;
+                        if let Some(category) = operation_category {
+                            host_category_profile.entry(category).or_default().output += elapsed;
+                        }
+                    }
+
+                    let start = host_trace.then(Instant::now);
+                    let constraints = qmatmul.workgroup_shape_constraints(&device);
+                    let workgroup_shape = constraints.solve(max_subgroup_size).unwrap_or_else(|| {
+                        panic!(
+                            "Failed to find a valid qmatmul workgroup shape for constraints {constraints:?}"
+                        )
+                    });
+                    if let Some(start) = start {
+                        let elapsed = start.elapsed();
+                        host_profile.workgroup += elapsed;
+                        if let Some(category) = operation_category {
+                            host_category_profile.entry(category).or_default().workgroup += elapsed;
+                        }
+                    }
+
+                    let start = host_trace.then(Instant::now);
+                    let direct_kernels =
+                        qmatmul.build_direct_kernels(graph, &workgroup_shape, &new_inputs);
+                    if let Some(start) = start {
+                        let elapsed = start.elapsed();
+                        host_profile.build_kernel += elapsed;
+                        if let Some(category) = operation_category {
+                            let profile = host_category_profile.entry(category).or_default();
+                            profile.count += direct_kernels.len().max(1);
+                            profile.build_kernel += elapsed;
+                        }
+                    }
+
+                    for direct_kernel in direct_kernels {
+                        let start = host_trace.then(Instant::now);
+                        if let Some(dispatch) =
+                            direct_kernel.prepare_dispatch(device.kernel_cache())
+                        {
+                            if let Some(start) = start {
+                                let elapsed = start.elapsed();
+                                host_profile.prepare_dispatch += elapsed;
+                                if let Some(category) = operation_category {
+                                    host_category_profile
+                                        .entry(category)
+                                        .or_default()
+                                        .prepare_dispatch += elapsed;
+                                }
+                            }
+                            let (name, category) = if collect_dispatch_metadata {
+                                let name = qmatmul.name();
+                                let category = dispatch_category(&name);
+                                if trace {
+                                    *dispatch_categories.entry(category.clone()).or_default() += 1;
+                                    if trace_names {
+                                        *dispatch_names.entry(name.clone()).or_default() += 1;
+                                    }
+                                }
+                                (Some(name), Some(category))
+                            } else {
+                                (None, None)
+                            };
+                            commands.push(CommandRecord::Dispatch(DispatchRecord {
+                                dispatch,
+                                name,
+                                category,
+                            }));
+                        } else if let Some(start) = start {
+                            let elapsed = start.elapsed();
+                            host_profile.prepare_dispatch += elapsed;
+                            if let Some(category) = operation_category {
+                                host_category_profile
+                                    .entry(category)
+                                    .or_default()
+                                    .prepare_dispatch += elapsed;
+                            }
+                        }
+                    }
+
                     let start = host_trace.then(Instant::now);
                     Self::release_dead_intermediates(
                         graph,
-                        &[(node, operation)],
+                        &[&queued_operation],
                         &mut remaining_consumers,
                         &target_set,
                     );
@@ -500,15 +676,46 @@ impl Resolver {
                     }
                     continue;
                 }
-                if let Some(resolved) = operation.as_slice_assign().and_then(|operation| {
-                    crate::slice_assign::resolve_slice_assign_on_host(operation, &new_inputs)
-                }) {
+
+                let QueuedOperation::Generic(operation) = &queued_operation else {
+                    unreachable!("qmatmul resolver arm returned above");
+                };
+                if let Some(resolved) = device
+                    .requires_host_fallbacks()
+                    .then(|| operation.as_resize())
+                    .flatten()
+                    .and_then(|operation| {
+                        crate::resize::resolve_resize_on_host(operation, &new_inputs)
+                    })
+                {
                     graph.set_cached_result(node, resolved);
                     host_kernel_count += 1;
                     let start = host_trace.then(Instant::now);
                     Self::release_dead_intermediates(
                         graph,
-                        &[(node, operation)],
+                        &[&queued_operation],
+                        &mut remaining_consumers,
+                        &target_set,
+                    );
+                    if let Some(start) = start {
+                        host_profile.release += start.elapsed();
+                    }
+                    continue;
+                }
+                if let Some(resolved) = device
+                    .requires_host_fallbacks()
+                    .then(|| operation.as_slice_assign())
+                    .flatten()
+                    .and_then(|operation| {
+                        crate::slice_assign::resolve_slice_assign_on_host(operation, &new_inputs)
+                    })
+                {
+                    graph.set_cached_result(node, resolved);
+                    host_kernel_count += 1;
+                    let start = host_trace.then(Instant::now);
+                    Self::release_dead_intermediates(
+                        graph,
+                        &[&queued_operation],
                         &mut remaining_consumers,
                         &target_set,
                     );
@@ -529,7 +736,7 @@ impl Resolver {
                     let start = host_trace.then(Instant::now);
                     Self::release_dead_intermediates(
                         graph,
-                        &[(node, operation)],
+                        &[&queued_operation],
                         &mut remaining_consumers,
                         &target_set,
                     );
@@ -550,7 +757,7 @@ impl Resolver {
                     let start = host_trace.then(Instant::now);
                     Self::release_dead_intermediates(
                         graph,
-                        &[(node, operation)],
+                        &[&queued_operation],
                         &mut remaining_consumers,
                         &target_set,
                     );
@@ -571,7 +778,7 @@ impl Resolver {
                     let start = host_trace.then(Instant::now);
                     Self::release_dead_intermediates(
                         graph,
-                        &[(node, operation)],
+                        &[&queued_operation],
                         &mut remaining_consumers,
                         &target_set,
                     );
@@ -667,7 +874,7 @@ impl Resolver {
                 let start = host_trace.then(Instant::now);
                 Self::release_dead_intermediates(
                     graph,
-                    &[(node, operation)],
+                    &[&queued_operation],
                     &mut remaining_consumers,
                     &target_set,
                 );
@@ -768,34 +975,19 @@ impl Resolver {
                         );
                         command_index += 1;
                     }
-                    CommandRecord::Dispatch(_) => {
+                    CommandRecord::Dispatch(record) => {
                         if let Some((query_set, _, _, _)) = &query_resources {
                             if profile_inside_pass_timestamps {
                                 let mut pass = command_encoder.begin_compute_pass(
                                     &wgpu::ComputePassDescriptor {
-                                        label: Some("Resolver Direct Kernels"),
+                                        label: Some("Resolver Direct Kernel"),
                                         timestamp_writes: None,
                                     },
                                 );
-                                while command_index < commands.len() {
-                                    let CommandRecord::Dispatch(record) = &commands[command_index]
-                                    else {
-                                        break;
-                                    };
-                                    pass.write_timestamp(query_set, (dispatch_index * 2) as u32);
-                                    record.dispatch.run(&mut pass);
-                                    pass.write_timestamp(
-                                        query_set,
-                                        (dispatch_index * 2 + 1) as u32,
-                                    );
-                                    dispatch_index += 1;
-                                    command_index += 1;
-                                }
+                                pass.write_timestamp(query_set, (dispatch_index * 2) as u32);
+                                record.dispatch.run(&mut pass);
+                                pass.write_timestamp(query_set, (dispatch_index * 2 + 1) as u32);
                             } else {
-                                let CommandRecord::Dispatch(record) = &commands[command_index]
-                                else {
-                                    unreachable!();
-                                };
                                 let mut pass = command_encoder.begin_compute_pass(
                                     &wgpu::ComputePassDescriptor {
                                         label: Some("Resolver Direct Kernel"),
@@ -811,24 +1003,17 @@ impl Resolver {
                                     },
                                 );
                                 record.dispatch.run(&mut pass);
-                                dispatch_index += 1;
-                                command_index += 1;
                             }
                         } else {
                             let mut pass =
                                 command_encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                                    label: Some("Resolver Direct Kernels"),
+                                    label: Some("Resolver Direct Kernel"),
                                     timestamp_writes: None,
                                 });
-                            while command_index < commands.len() {
-                                let CommandRecord::Dispatch(record) = &commands[command_index]
-                                else {
-                                    break;
-                                };
-                                record.dispatch.run(&mut pass);
-                                command_index += 1;
-                            }
+                            record.dispatch.run(&mut pass);
                         }
+                        dispatch_index += 1;
+                        command_index += 1;
                     }
                 }
             }
@@ -918,11 +1103,11 @@ impl Resolver {
     /// dependencies that were used to build the consumer counts.
     fn release_dead_intermediates(
         graph: &mut ComputeGraphInner,
-        produced_ops: &[(NodeIndex, Arc<dyn Operation>)],
+        produced_ops: &[&QueuedOperation],
         remaining_consumers: &mut FxHashMap<NodeIndex, usize>,
         targets: &FxHashSet<NodeIndex>,
     ) {
-        for (_, op) in produced_ops {
+        for op in produced_ops {
             op.visit_dependencies(&mut |dep| {
                 if let Some(count) = remaining_consumers.get_mut(&dep) {
                     *count = count.saturating_sub(1);
@@ -1080,19 +1265,37 @@ impl Resolver {
         Some(exec_idx)
     }
 
-    fn lower_node(&self, node: &ExecutionNode) -> Option<Arc<dyn Operation>> {
+    fn lower_node(&self, node: &ExecutionNode) -> Option<QueuedOperation> {
         match &node.variant {
-            ComputeGraphNodeVariant::Nary(op) => Some(Arc::new(op.clone())),
-            ComputeGraphNodeVariant::MatMul(op) => Some(Arc::new(op.clone())),
-            ComputeGraphNodeVariant::Reduce(op) => Some(Arc::new(op.clone())),
-            ComputeGraphNodeVariant::FlashAttention(op) => Some(Arc::new(op.clone())),
-            ComputeGraphNodeVariant::GraphOp(op) => Some(op.clone()),
-            ComputeGraphNodeVariant::MapLayout(op) => Some(Arc::new(op.clone())),
-            ComputeGraphNodeVariant::Resize(op) => Some(Arc::new(op.clone())),
-            ComputeGraphNodeVariant::SliceAssign(op) => Some(Arc::new(op.clone())),
-            ComputeGraphNodeVariant::QEmbedding(op) => Some(Arc::new(op.clone())),
-            ComputeGraphNodeVariant::QMatMul(op) => Some(Arc::new(op.clone())),
-            ComputeGraphNodeVariant::Dequantize(op) => Some(Arc::new(op.clone())),
+            ComputeGraphNodeVariant::Nary(op) => {
+                Some(QueuedOperation::Generic(Arc::new(op.clone())))
+            }
+            ComputeGraphNodeVariant::MatMul(op) => {
+                Some(QueuedOperation::Generic(Arc::new(op.clone())))
+            }
+            ComputeGraphNodeVariant::Reduce(op) => {
+                Some(QueuedOperation::Generic(Arc::new(op.clone())))
+            }
+            ComputeGraphNodeVariant::FlashAttention(op) => {
+                Some(QueuedOperation::Generic(Arc::new(op.clone())))
+            }
+            ComputeGraphNodeVariant::GraphOp(op) => Some(QueuedOperation::Generic(op.clone())),
+            ComputeGraphNodeVariant::MapLayout(op) => {
+                Some(QueuedOperation::Generic(Arc::new(op.clone())))
+            }
+            ComputeGraphNodeVariant::Resize(op) => {
+                Some(QueuedOperation::Generic(Arc::new(op.clone())))
+            }
+            ComputeGraphNodeVariant::SliceAssign(op) => {
+                Some(QueuedOperation::Generic(Arc::new(op.clone())))
+            }
+            ComputeGraphNodeVariant::QEmbedding(op) => {
+                Some(QueuedOperation::Generic(Arc::new(op.clone())))
+            }
+            ComputeGraphNodeVariant::QMatMul(op) => Some(QueuedOperation::QMatMul(op.clone())),
+            ComputeGraphNodeVariant::Dequantize(op) => {
+                Some(QueuedOperation::Generic(Arc::new(op.clone())))
+            }
             ComputeGraphNodeVariant::Tensor(_) => None, // Handled in execution loop
         }
     }
@@ -1100,6 +1303,8 @@ impl Resolver {
     // --- Rewrite Engine ---
 
     fn optimize(&mut self, graph: &mut ComputeGraphInner) {
+        let profile_enabled = std::env::var_os("FUSOR_TRACE_OPTIMIZE").is_some();
+        let mut profile = OptimizeProfile::default();
         // The current rewrite rules can only start from Nary nodes (nary
         // fusion, post-op reduce/matmul fusion) or MatMul nodes (pre-op
         // unary fusion). Avoid scanning every QMatMul/RMS/attention node in
@@ -1126,6 +1331,9 @@ impl Resolver {
             .execution_graph
             .node_indices()
             .any(|node| as_rms_norm(&self.execution_graph[node].variant).is_some());
+        let allow_qmatmul_elementwise_fusion = self.execution_graph.node_count()
+            <= DEFAULT_OPTIMIZE_NODE_LIMIT
+            || std::env::var_os("FUSOR_RESOLVE_QMATMUL_ELEMENTWISE_FUSION").is_some();
         let mut worklist: VecDeque<ExecutionNodeIndex> = self
             .execution_graph
             .node_indices()
@@ -1134,27 +1342,86 @@ impl Resolver {
         let mut in_worklist: FxHashSet<ExecutionNodeIndex> = worklist.iter().copied().collect();
 
         while let Some(node_idx) = worklist.pop_front() {
+            profile.iterations += 1;
             in_worklist.remove(&node_idx);
 
             if !self.execution_graph.contains_node(node_idx) {
                 continue;
             }
 
-            // Collect neighbors before optimization (they may need re-processing)
-            let neighbors: Vec<_> = self
+            // Edges are dependency -> consumer, and only downstream nodes can
+            // become newly fusible from these rewrites.
+            let consumers: Vec<_> = self
                 .execution_graph
-                .neighbors_undirected(node_idx)
+                .neighbors_directed(node_idx, petgraph::Direction::Outgoing)
                 .collect();
 
             // 1. Fuse naries together (combine expression trees)
             // 2. Try to fuse resulting nary into specialized ops (reduce, matmul, etc.)
+            let start = profile_enabled.then(Instant::now);
+            // Keep the large-graph fast path to nary fusion by default. The
+            // paired qmatmul rewrite still runs in the full optimizer for
+            // small graphs, but applying it in the decode-sized fast path can
+            // corrupt Llama 3.1 chat output.
             let changed = self.try_fuse_naries(graph, node_idx)
-                || (has_reduce && self.try_fuse_into_reduce(graph, node_idx))
-                || ((has_matmul || has_qmatmul) && self.try_fuse_into_matmul(graph, node_idx))
-                || (has_qmatmul && self.try_fuse_paired_qmatmul(graph, node_idx))
-                || (has_rmsnorm && self.try_fuse_into_rmsnorm(graph, node_idx));
+                || (std::env::var_os("FUSOR_RESOLVE_LARGE_GRAPH_PAIRED_QMATMUL").is_some()
+                    && self.try_fuse_paired_qmatmul(graph, node_idx));
+            if let Some(start) = start {
+                profile.fuse_naries_count += 1;
+                profile.fuse_naries += start.elapsed();
+            }
+
+            let changed = if changed {
+                true
+            } else {
+                let start = profile_enabled.then(Instant::now);
+                let changed = has_reduce && self.try_fuse_into_reduce(graph, node_idx);
+                if let Some(start) = start {
+                    profile.fuse_reduce_count += 1;
+                    profile.fuse_reduce += start.elapsed();
+                }
+                changed
+            };
+
+            let changed = if changed {
+                true
+            } else {
+                let start = profile_enabled.then(Instant::now);
+                let changed = (has_matmul || has_qmatmul)
+                    && self.try_fuse_into_matmul(graph, node_idx, allow_qmatmul_elementwise_fusion);
+                if let Some(start) = start {
+                    profile.fuse_matmul_count += 1;
+                    profile.fuse_matmul += start.elapsed();
+                }
+                changed
+            };
+
+            let changed = if changed {
+                true
+            } else {
+                let start = profile_enabled.then(Instant::now);
+                let changed = has_qmatmul && self.try_fuse_paired_qmatmul(graph, node_idx);
+                if let Some(start) = start {
+                    profile.fuse_paired_qmatmul_count += 1;
+                    profile.fuse_paired_qmatmul += start.elapsed();
+                }
+                changed
+            };
+
+            let changed = if changed {
+                true
+            } else {
+                let start = profile_enabled.then(Instant::now);
+                let changed = has_rmsnorm && self.try_fuse_into_rmsnorm(graph, node_idx);
+                if let Some(start) = start {
+                    profile.fuse_rmsnorm_count += 1;
+                    profile.fuse_rmsnorm += start.elapsed();
+                }
+                changed
+            };
 
             if changed {
+                profile.changed += 1;
                 // Re-add the current node to worklist if it still exists
                 if self.execution_graph.contains_node(node_idx)
                     && self.is_optimization_candidate(node_idx)
@@ -1164,30 +1431,115 @@ impl Resolver {
                     in_worklist.insert(node_idx);
                 }
 
-                // Re-add neighbors that might be affected by this change
-                for neighbor in neighbors {
-                    if self.execution_graph.contains_node(neighbor)
-                        && self.is_optimization_candidate(neighbor)
-                        && !in_worklist.contains(&neighbor)
+                // Re-add consumers that might be affected by this change.
+                for consumer in consumers {
+                    if self.execution_graph.contains_node(consumer)
+                        && self.is_optimization_candidate(consumer)
+                        && !in_worklist.contains(&consumer)
                     {
-                        worklist.push_back(neighbor);
-                        in_worklist.insert(neighbor);
+                        worklist.push_back(consumer);
+                        in_worklist.insert(consumer);
                     }
                 }
 
-                // Also add new neighbors that may have been created
+                // Also add new consumers that may have been created.
                 if self.execution_graph.contains_node(node_idx) {
-                    for neighbor in self.execution_graph.neighbors_undirected(node_idx) {
-                        if self.is_optimization_candidate(neighbor)
-                            && !in_worklist.contains(&neighbor)
+                    for consumer in self
+                        .execution_graph
+                        .neighbors_directed(node_idx, petgraph::Direction::Outgoing)
+                    {
+                        if self.is_optimization_candidate(consumer)
+                            && !in_worklist.contains(&consumer)
                         {
-                            worklist.push_back(neighbor);
-                            in_worklist.insert(neighbor);
+                            worklist.push_back(consumer);
+                            in_worklist.insert(consumer);
                         }
                     }
                 }
             }
         }
+        if profile_enabled {
+            profile.print();
+        }
+    }
+
+    fn optimize_large_graph(&mut self, graph: &mut ComputeGraphInner) {
+        let has_qmatmul = self.execution_graph.node_indices().any(|node| {
+            matches!(
+                self.execution_graph[node].variant,
+                ComputeGraphNodeVariant::QMatMul(_)
+            )
+        });
+        if !has_qmatmul {
+            return;
+        }
+
+        let mut worklist = self
+            .execution_graph
+            .node_indices()
+            .filter(|&node| self.is_large_graph_nary_candidate(node))
+            .collect::<VecDeque<_>>();
+        let mut in_worklist = worklist.iter().copied().collect::<FxHashSet<_>>();
+
+        while let Some(node_idx) = worklist.pop_front() {
+            in_worklist.remove(&node_idx);
+            if !self.execution_graph.contains_node(node_idx) {
+                continue;
+            }
+
+            let consumers = self
+                .execution_graph
+                .neighbors_directed(node_idx, petgraph::Direction::Outgoing)
+                .collect::<Vec<_>>();
+            let changed = self.try_fuse_naries(graph, node_idx);
+
+            if changed {
+                if self.execution_graph.contains_node(node_idx)
+                    && self.is_large_graph_nary_candidate(node_idx)
+                    && !in_worklist.contains(&node_idx)
+                {
+                    worklist.push_back(node_idx);
+                    in_worklist.insert(node_idx);
+                }
+                for consumer in consumers {
+                    if self.execution_graph.contains_node(consumer)
+                        && self.is_large_graph_nary_candidate(consumer)
+                        && !in_worklist.contains(&consumer)
+                    {
+                        worklist.push_back(consumer);
+                        in_worklist.insert(consumer);
+                    }
+                }
+            }
+        }
+    }
+
+    fn is_large_graph_nary_candidate(&self, node_idx: ExecutionNodeIndex) -> bool {
+        let ComputeGraphNodeVariant::Nary(nary) = &self.execution_graph[node_idx].variant else {
+            return false;
+        };
+        nary.shape.last().copied().unwrap_or_default() >= 1024
+    }
+
+    fn is_single_token_qmatmul_graph(&self) -> bool {
+        let mut qmatmul_count = 0usize;
+        let mut single_token_count = 0usize;
+        for node in self.execution_graph.node_indices() {
+            let ComputeGraphNodeVariant::QMatMul(qmatmul) = &self.execution_graph[node].variant
+            else {
+                continue;
+            };
+            qmatmul_count += 1;
+            if qmatmul.in_shape.len() >= 2
+                && qmatmul.in_shape[..qmatmul.in_shape.len() - 1]
+                    .iter()
+                    .product::<usize>()
+                    == 1
+            {
+                single_token_count += 1;
+            }
+        }
+        qmatmul_count >= 16 && single_token_count * 4 >= qmatmul_count * 3
     }
 
     fn is_optimization_candidate(&self, node_idx: ExecutionNodeIndex) -> bool {
@@ -1258,14 +1610,27 @@ impl Resolver {
         pass.output_layout.remove(&inner_idx)
     }
 
+    fn infer_layout_cached(
+        &mut self,
+        graph: &ComputeGraphInner,
+        inner_idx: NodeIndex,
+    ) -> Option<crate::TensorLayoutInfo> {
+        if let Some(layout) = self.layout_cache.get(&inner_idx) {
+            return layout.clone();
+        }
+        let layout = Self::infer_layout(graph, inner_idx);
+        self.layout_cache.insert(inner_idx, layout.clone());
+        layout
+    }
+
     fn try_normalize_qmatmul_post_extra(
-        &self,
+        &mut self,
         graph: &ComputeGraphInner,
         extra_inner: NodeIndex,
         output_shape: &[usize],
     ) -> Option<NodeIndex> {
         let last_dim = *output_shape.last()?;
-        let extra_info = Self::infer_layout(graph, extra_inner)?;
+        let extra_info = self.infer_layout_cached(graph, extra_inner)?;
         if extra_info.datatype() != DataTypeEnum::F32 || extra_info.layout().shape() != output_shape
         {
             return None;
@@ -1285,7 +1650,7 @@ impl Resolver {
         let (base_inner, _) = self
             .walk_map_layout_chain(extra_inner)
             .unwrap_or((extra_inner, Vec::new()));
-        let base_info = Self::infer_layout(graph, base_inner)?;
+        let base_info = self.infer_layout_cached(graph, base_inner)?;
         let base_layout = base_info.layout();
         if base_info.datatype() == DataTypeEnum::F32
             && base_layout.shape() == [last_dim]
@@ -1768,6 +2133,7 @@ impl Resolver {
         &mut self,
         graph: &mut ComputeGraphInner,
         node_idx: ExecutionNodeIndex,
+        allow_qmatmul_elementwise_fusion: bool,
     ) -> bool {
         let node_variant = self.execution_graph[node_idx].variant.clone();
 
@@ -1810,7 +2176,10 @@ impl Resolver {
         // Post-op (QMatMul): fuse a general element-wise expression after
         // qmatmul. This handles composite expressions like GELU and ordered
         // extra inputs whose layouts match the output visitation shape.
-        if let ComputeGraphNodeVariant::Nary(nary) = &node_variant {
+        if allow_qmatmul_elementwise_fusion
+            && let ComputeGraphNodeVariant::Nary(nary) = &node_variant
+            && nary.inputs.len() <= 4
+        {
             for (candidate_input_idx, &input_inner) in nary.inputs.iter().enumerate() {
                 if self.get_input_node_in_exec_graph(input_inner).is_none() {
                     continue;
@@ -1961,7 +2330,8 @@ impl Resolver {
         // transformed activation tile is reloaded for each output-column
         // tile, so expensive expressions like GELU would be recomputed many
         // times. Keep those chains materialized once instead.
-        if let ComputeGraphNodeVariant::QMatMul(qmatmul_op) = &node_variant
+        if allow_qmatmul_elementwise_fusion
+            && let ComputeGraphNodeVariant::QMatMul(qmatmul_op) = &node_variant
             && qmatmul_op.in_shape[..qmatmul_op.in_shape.len() - 1]
                 .iter()
                 .product::<usize>()
@@ -1980,6 +2350,9 @@ impl Resolver {
             else {
                 return false;
             };
+            if nary.inputs.len() > 4 {
+                return false;
+            }
             let mapped_layout =
                 Self::apply_map_layout_chain(&Layout::contiguous(&nary.shape), &nary_map_chain);
             if mapped_layout != Layout::contiguous(&qmatmul_op.in_shape) {
@@ -2009,7 +2382,7 @@ impl Resolver {
                 let (primary_inner, primary_chain) = self
                     .walk_map_layout_chain(primary_input)
                     .unwrap_or((primary_input, Vec::new()));
-                let Some(primary_info) = Self::infer_layout(graph, primary_inner) else {
+                let Some(primary_info) = self.infer_layout_cached(graph, primary_inner) else {
                     continue;
                 };
                 let primary_layout =
@@ -2197,11 +2570,11 @@ impl Resolver {
         // `subgroup_id` / `subgroup_reduce_*` and has no workgroup-only
         // fallback. The resolver later panics if `build_direct_kernel`
         // returns None for any operation it scheduled, so refuse the
-        // rewrite up-front on adapters without `Features::SUBGROUP`. The
+        // rewrite up-front on adapters without a trusted subgroup path. The
         // unfused source still resolves via the regular qmatmul + epilogue
         // kernels.
         let device = graph.device();
-        if !device.subgroups_supported() {
+        if !device.subgroup_kernels_supported() {
             return false;
         }
         let ComputeGraphNodeVariant::Nary(nary) = self.execution_graph[node_idx].variant.clone()
@@ -2296,6 +2669,9 @@ impl Resolver {
         else {
             return false;
         };
+        if qmatmul_op.matrix.datatype() != GgmlType::Q4K {
+            return false;
+        }
 
         // The qmatmul produces a contiguous output of its declared out_shape;
         // apply each MapLayout closure to that base layout to recover the

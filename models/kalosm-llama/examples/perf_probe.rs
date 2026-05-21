@@ -3,6 +3,7 @@
 
 use kalosm_llama::*;
 use prelude::ChatModelExt;
+use prelude::GenerationParameters;
 use prelude::StreamExt;
 use std::time::Instant;
 
@@ -14,10 +15,19 @@ async fn main() {
         .with_system_prompt("The assistant will act like a pirate");
 
     // Warm: short prompt to trigger pipeline cache for the chat path.
-    let _ = chat(&"hi".to_string()).take(4).collect::<Vec<_>>().await;
+    let warmup_sampler = GenerationParameters::new().with_max_length(4);
+    let _ = chat(&"hi".to_string())
+        .with_sampler(warmup_sampler)
+        .collect::<Vec<_>>()
+        .await;
 
     // Measured: same prompt as the user's reported run.
-    let mut response = chat(&"write a short story".to_string()).take(120);
+    let measured_tokens = std::env::var("KALOSM_PERF_PROBE_TOKENS")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(64);
+    let sampler = GenerationParameters::new().with_max_length(measured_tokens);
+    let mut response = chat(&"write a short story".to_string()).with_sampler(sampler);
     let mut first: Option<Instant> = None;
     let mut last: Option<Instant> = None;
     let mut tokens: usize = 0;
