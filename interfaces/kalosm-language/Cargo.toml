@@ -49,6 +49,7 @@ roaring = "0.10.6"
 
 [features]
 default = ["bert", "llama"]
+tokio = ["rbert?/tokio", "kalosm-llama?/tokio"]
 metal = []
 cublas = []
 mkl = []

@@ -607,19 +607,20 @@ impl Resolver {
                     }
 
                     let start = host_trace.then(Instant::now);
-                    let direct_kernels =
-                        qmatmul.build_direct_kernels(graph, &workgroup_shape, &new_inputs);
+                    let direct_kernel_plan = qmatmul
+                        .build_direct_kernels(graph, &workgroup_shape, &new_inputs)
+                        .unwrap_or_else(|error| panic!("{error}"));
                     if let Some(start) = start {
                         let elapsed = start.elapsed();
                         host_profile.build_kernel += elapsed;
                         if let Some(category) = operation_category {
                             let profile = host_category_profile.entry(category).or_default();
-                            profile.count += direct_kernels.len().max(1);
+                            profile.count += direct_kernel_plan.dispatch_count();
                             profile.build_kernel += elapsed;
                         }
                     }
 
-                    for direct_kernel in direct_kernels {
+                    for direct_kernel in direct_kernel_plan.into_kernels() {
                         let start = host_trace.then(Instant::now);
                         if let Some(dispatch) =
                             direct_kernel.prepare_dispatch(device.kernel_cache())

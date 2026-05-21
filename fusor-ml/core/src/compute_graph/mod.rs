@@ -373,13 +373,18 @@ impl ComputeGraphInner {
         Some(())
     }
 
-    fn try_submit_direct_qmatmul(&mut self, operation: &QMatMulOperation) -> Option<TensorData> {
+    fn try_submit_direct_qmatmul(
+        &mut self,
+        operation: &QMatMulOperation,
+    ) -> Option<(TensorData, usize)> {
         self.ensure_tensor_cached(operation.input)?;
 
         let device = self.device();
         let workgroup_shape = crate::mir::workgroup_shape::WorkgroupShape::new(1, 1, 1);
         let inputs = operation.inputs(self);
-        let direct_kernel = operation.build_direct_kernel(self, &workgroup_shape, &inputs)?;
+        let direct_kernel_plan = operation
+            .build_direct_kernels(self, &workgroup_shape, &inputs)
+            .ok()?;
         let MirValue::Tensor(output) = operation.output(self, &inputs) else {
             return None;
         };
@@ -390,11 +395,16 @@ impl ComputeGraphInner {
                 .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                     label: Some("QMatMul Direct Encoder"),
                 });
-        direct_kernel.run(device.kernel_cache(), &mut command_encoder);
-        device.wgpu_queue().submit(Some(command_encoder.finish()));
-        device.reset_initialized_buffers();
+        let total_kernels = direct_kernel_plan.dispatch_count();
+        for direct_kernel in direct_kernel_plan.into_kernels() {
+            direct_kernel.run(device.kernel_cache(), &mut command_encoder);
+        }
+        if total_kernels > 0 {
+            device.wgpu_queue().submit(Some(command_encoder.finish()));
+            device.reset_initialized_buffers();
+        }
 
-        Some(output)
+        Some((output, total_kernels))
     }
 
     fn try_resolve_direct_qmatmul(&mut self, key: NodeIndex) -> Option<ResolverResult> {
@@ -402,11 +412,11 @@ impl ComputeGraphInner {
             ComputeGraphNodeVariant::QMatMul(operation) => operation,
             _ => return None,
         };
-        let output = self.try_submit_direct_qmatmul(&operation)?;
+        let (output, total_kernels) = self.try_submit_direct_qmatmul(&operation)?;
         self.set_cached_result(key, output.clone());
         Some(ResolverResult {
             data: output,
-            total_kernels: 1,
+            total_kernels,
         })
     }
 

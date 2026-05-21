@@ -131,7 +131,12 @@ scrape = ["language", "kalosm/scrape"]
 anyhow = ["dep:anyhow"]
 axum = ["dep:axum"]
 image = ["dep:image"]
-tokio = ["dep:tokio"]
+tokio = [
+    "dep:tokio",
+    "kalosm/tokio",
+    "kalosm-language?/tokio",
+    "kalosm-vision?/tokio",
+]
 tracing-subscriber = ["dep:tracing-subscriber"]
 
 [[example]]

@@ -103,6 +103,12 @@ openai = ["language", "kalosm-language/openai"]
 anthropic = ["language", "kalosm-language/anthropic"]
 remote = ["openai", "anthropic"]
 scrape = ["language", "kalosm-language/scrape"]
+tokio = [
+    "kalosm-common?/tokio",
+    "kalosm-language?/tokio",
+    "kalosm-sound?/tokio",
+    "kalosm-vision?/tokio",
+]
 
 [[example]]
 name = "chat"

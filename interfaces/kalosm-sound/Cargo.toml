@@ -32,9 +32,10 @@ nnnoiseless = { version = "0.5.1", optional = true }
 
 [features]
 default = ["denoise"]
+tokio = ["rwhisper/tokio"]
 denoise = ["dep:nnnoiseless"]
 voice-detection = ["dep:voice_activity_detector", "dep:ort", "dep:ort-sys"]
-source = ["dep:tokio", "dep:cpal"]
+source = ["tokio", "dep:tokio", "dep:cpal"]
 
 [dev-dependencies]
 kalosm = { workspace = true, features = ["sound", "sound-source"], default-features = true }
