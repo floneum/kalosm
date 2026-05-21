@@ -44,6 +44,8 @@ pub enum CoopOperandRole {
     A,
     /// Right-hand MMA operand.
     B,
+    /// Accumulator/post-MMA operand.
+    C,
 }
 
 /// A Triton-like source tile program over one workgroup tile.
@@ -131,12 +133,25 @@ pub enum TileStmt {
         row: Box<Expr>,
         col: Box<Expr>,
     },
+    /// Cooperatively load a C-role fragment from a rank-1 storage vector,
+    /// broadcasting the selected columns across all rows.
+    LoadCoopBroadcast {
+        id: CoopFragmentId,
+        role: CoopOperandRole,
+        scalar: ScalarElement,
+        rows: u32,
+        cols: u32,
+        src: StorageView,
+        col: Box<Expr>,
+    },
     /// `acc += a * b` where `a`/`b` are previously loaded fragments.
     Mma {
         acc: LocalRef,
         a: CoopFragmentId,
         b: CoopFragmentId,
     },
+    /// Initialize an accumulator from a C-role cooperative fragment.
+    SetCoopAcc { acc: LocalRef, c: CoopFragmentId },
     /// Cooperatively store an accumulator to a global storage view.
     StoreCoopAcc {
         acc: LocalRef,

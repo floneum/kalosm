@@ -6,7 +6,10 @@ use crate::mir::operation::Operation;
 use crate::{
     Device, Tensor,
     compute_graph::NodeIndex,
-    kernel_selection::{Axis, KernelDeviceCaps, KernelShape, ShapeRule, ShapeSelector, eq, range},
+    kernel_selection::{
+        Axis, CooperativeMatrixCaps, CooperativeMatrixKind, KernelDeviceCaps, KernelShape,
+        ShapeRule, ShapeSelector, eq, range,
+    },
     mir::{
         kernel_backend::{self, DirectKernel},
         tile_direct::{
@@ -15,7 +18,7 @@ use crate::{
         },
     },
     nary_direct::apply_unary_function_chain,
-    nary_wise::UnaryFunctionChain,
+    nary_wise::{NaryOp, NaryScalar, UnaryFunctionChain},
     tensor::{DataType, DataTypeEnum, TensorData},
 };
 use fusor_tile_ir as tile_ir;
@@ -30,7 +33,7 @@ pub mod sgemv;
 mod sgemv_params;
 
 pub fn get_optimal_params(m: usize, n: usize, k: usize, device: &Device) -> MatMulParams {
-    select_dense_matmul_params(m, n, k, device, true)
+    select_dense_matmul_params(m, n, k, device, &[CooperativeMatrixKind::F32F32M8N8K8])
 }
 
 const DENSE_M: Axis<0> = Axis;
@@ -44,9 +47,17 @@ enum DenseMatmulVariant {
     MatMul,
 }
 
+fn dense_coop_kinds_from_datatype(datatype: DataTypeEnum) -> &'static [CooperativeMatrixKind] {
+    match datatype {
+        DataTypeEnum::F32 => &[CooperativeMatrixKind::F32F32M8N8K8],
+        DataTypeEnum::F16 => &[CooperativeMatrixKind::F16F16M8N8K8],
+        DataTypeEnum::U32 => &[],
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 struct DenseMatmulCtx {
-    allow_coop: bool,
+    coop_kinds: &'static [CooperativeMatrixKind],
 }
 
 fn dense_matmul_selector() -> ShapeSelector<3, DenseMatmulCtx, DenseMatmulVariant> {
@@ -54,14 +65,14 @@ fn dense_matmul_selector() -> ShapeSelector<3, DenseMatmulCtx, DenseMatmulVarian
         .rule(
             DenseMatmulVariant::Coop,
             ShapeRule::new().when(|shape: KernelShape<3>, ctx: &DenseMatmulCtx, caps| {
-                ctx.allow_coop
-                    && coop_gemm_params_from_caps(
-                        shape[DENSE_M],
-                        shape[DENSE_N],
-                        shape[DENSE_K],
-                        caps,
-                    )
-                    .is_some()
+                coop_gemm_params_from_caps(
+                    shape[DENSE_M],
+                    shape[DENSE_N],
+                    shape[DENSE_K],
+                    caps,
+                    ctx.coop_kinds,
+                )
+                .is_some()
             }),
         )
         .rule(
@@ -80,17 +91,17 @@ fn select_dense_matmul_params(
     n: usize,
     k: usize,
     device: &Device,
-    allow_coop: bool,
+    coop_kinds: &'static [CooperativeMatrixKind],
 ) -> MatMulParams {
     let shape = KernelShape::new([m, k, n]);
-    let ctx = DenseMatmulCtx { allow_coop };
+    let ctx = DenseMatmulCtx { coop_kinds };
     let caps = KernelDeviceCaps::from_device(device);
     match dense_matmul_selector()
         .select(shape, &ctx, caps)
         .expect("dense matmul selector has a catch-all rule")
     {
         DenseMatmulVariant::Coop => MatMulParams::CoopMatMul(
-            coop_gemm::optimal_params(m, n, k, device)
+            coop_gemm::optimal_params(m, n, k, device, select_coop_kind(caps, coop_kinds))
                 .expect("coop selector and coop parameter selection disagree"),
         ),
         DenseMatmulVariant::Vector => MatMulParams::Vector(gemv_parameters(m, n, k)),
@@ -103,13 +114,16 @@ fn coop_gemm_params_from_caps(
     n: usize,
     _k: usize,
     caps: KernelDeviceCaps,
+    coop_kinds: &[CooperativeMatrixKind],
 ) -> Option<coop_gemm::CoopGemmParams> {
     // Apple's coopMatrix instructions execute on 32-thread SIMD groups even
     // when the device's wgpu-reported subgroup-size range straddles 32 (M-series
     // reports min=4, max=64). Match `floneum/main`: gate only on the
     // cooperative-matrix and subgroup capabilities plus workgroup size.
-    if !caps.cooperative_matrix_supported
-        || !caps.subgroups_supported
+    if !caps.subgroup_kernels_supported
+        || !coop_kinds
+            .iter()
+            .any(|kind| caps.cooperative_matrix.supports(*kind))
         || caps.max_subgroup_size < 32
         || caps.min_subgroup_size > 32
         || caps.max_compute_workgroup_size_x < 64
@@ -134,7 +148,19 @@ fn coop_gemm_params_from_caps(
         params.wg_threads = 128;
     }
 
+    params.kind = select_coop_kind(caps, coop_kinds);
     (params.wg_threads <= caps.max_compute_workgroup_size_x).then_some(params)
+}
+
+fn select_coop_kind(
+    caps: KernelDeviceCaps,
+    coop_kinds: &[CooperativeMatrixKind],
+) -> CooperativeMatrixKind {
+    coop_kinds
+        .iter()
+        .copied()
+        .find(|kind| caps.cooperative_matrix.supports(*kind))
+        .expect("coop selector called with no supported cooperative matrix kind")
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -236,14 +262,15 @@ fn select_direct_tile_matmul_variant(m: u32, k: u32, n: u32) -> DirectTileMatmul
             &(),
             KernelDeviceCaps {
                 subgroups_supported: false,
-                cooperative_matrix_supported: false,
+                cooperative_matrix: CooperativeMatrixCaps::default(),
                 min_subgroup_size: 0,
                 max_subgroup_size: 0,
                 max_compute_invocations_per_workgroup: 0,
                 max_compute_workgroup_storage_size: 0,
                 max_compute_workgroup_size_x: 0,
                 max_compute_workgroups_per_dimension: 0,
-                software_adapter: false,
+                backend: wgpu::Backend::Noop,
+                subgroup_kernels_supported: false,
             },
         )
         .expect("direct tile matmul selector has a catch-all rule")
@@ -283,13 +310,7 @@ impl MatMulOperation {
             let n = second_shape[second_shape.len() - 1];
             let m = first_shape[first_shape.len() - 2];
             let k = first_shape[first_shape.len() - 1];
-            select_dense_matmul_params(
-                m,
-                n,
-                k,
-                device,
-                matches!(datatype, DataTypeEnum::F32 | DataTypeEnum::F16),
-            )
+            select_dense_matmul_params(m, n, k, device, dense_coop_kinds_from_datatype(datatype))
         });
         Self::new_with_parameters(
             datatype,
@@ -379,15 +400,10 @@ impl MatMulOperation {
         }
         let shape = tile_ir_kernels::DenseMatmulShape { batch, m, k, n };
 
-        // The Gemv variant and the shared-tile MatMul variant both reduce
-        // through the hardware subgroup; on adapters without
-        // `Features::SUBGROUP` (Mesa lavapipe in Linux CI) those shaders
-        // fail validation. Route to the register-tiled MatMul kernel
-        // instead — it only uses workgroup-local lanes and works
-        // everywhere. Software adapters (Microsoft WARP on Windows CI)
-        // advertise `Features::SUBGROUP` but miscompile the DX12
-        // subgroup-reduce emulation, so treat them the same way.
-        let variant = if device.subgroups_supported() && !device.is_software_adapter() {
+        // The Gemv and shared-tile MatMul variants reduce through subgroup
+        // operations. Use the register-tiled kernel unless the device exposes
+        // a subgroup path we trust.
+        let variant = if device.subgroup_kernels_supported() {
             select_direct_tile_matmul_variant(m, k, n)
         } else {
             DirectTileMatmulVariant::MatMul
@@ -438,10 +454,15 @@ impl MatMulOperation {
         let epilogue_identity = pre_a.as_ref().map(|e| e.identity()).unwrap_or(0)
             ^ pre_b.as_ref().map(|e| e.identity()).unwrap_or(0)
             ^ post.as_ref().map(|e| e.identity()).unwrap_or(0);
-        let use_coop = matches!(self.parameters, MatMulParams::CoopMatMul(_))
-            && device.cooperative_matrix_supported()
-            && device.subgroups_supported()
-            && !device.is_software_adapter()
+        let coop_kind = match &self.parameters {
+            MatMulParams::CoopMatMul(params) => Some(params.kind()),
+            _ => None,
+        };
+        let coop_property_supported =
+            coop_kind.is_some_and(|kind| device.cooperative_matrix_caps().supports(kind));
+        let use_coop = coop_kind.is_some()
+            && coop_property_supported
+            && device.subgroup_kernels_supported()
             && device.max_subgroup_size() >= 32
             && device.min_subgroup_size() <= 32;
         let coop_variant = if use_coop {
@@ -600,76 +621,44 @@ impl MatMulOperation {
                             phase,
                             y_view.clone(),
                         );
+                        macro_rules! try_f16_coop {
+                            ($bm:literal, $bn:literal, $bk:literal) => {{
+                                tile_ir_kernels::try_batched_coop_matmul::<
+                                    tile_ir::F16,
+                                    $bm,
+                                    $bn,
+                                    $bk,
+                                >(phase, &a, &b, &y, shape, &epilogues, max_wg_per_dim)
+                            }};
+                        }
                         match coop_variant {
                             DirectTileCoopMatmulVariant::Tile256x256 => {
-                                if tile_ir_kernels::try_batched_coop_matmul::<
-                                    tile_ir::F16,
-                                    256,
-                                    256,
-                                    16,
-                                >(
-                                    phase, &a, &b, &y, shape, &epilogues, max_wg_per_dim
-                                ) {
+                                if try_f16_coop!(256, 256, 16) {
                                     return;
                                 }
                             }
                             DirectTileCoopMatmulVariant::Tile128x512 => {
-                                if tile_ir_kernels::try_batched_coop_matmul::<
-                                    tile_ir::F16,
-                                    128,
-                                    512,
-                                    16,
-                                >(
-                                    phase, &a, &b, &y, shape, &epilogues, max_wg_per_dim
-                                ) {
+                                if try_f16_coop!(128, 512, 16) {
                                     return;
                                 }
                             }
                             DirectTileCoopMatmulVariant::Tile128x256 => {
-                                if tile_ir_kernels::try_batched_coop_matmul::<
-                                    tile_ir::F16,
-                                    128,
-                                    256,
-                                    16,
-                                >(
-                                    phase, &a, &b, &y, shape, &epilogues, max_wg_per_dim
-                                ) {
+                                if try_f16_coop!(128, 256, 16) {
                                     return;
                                 }
                             }
                             DirectTileCoopMatmulVariant::Tile128x64 => {
-                                if tile_ir_kernels::try_batched_coop_matmul::<
-                                    tile_ir::F16,
-                                    128,
-                                    64,
-                                    16,
-                                >(
-                                    phase, &a, &b, &y, shape, &epilogues, max_wg_per_dim
-                                ) {
+                                if try_f16_coop!(128, 64, 16) {
                                     return;
                                 }
                             }
                             DirectTileCoopMatmulVariant::Tile64x128 => {
-                                if tile_ir_kernels::try_batched_coop_matmul::<
-                                    tile_ir::F16,
-                                    64,
-                                    128,
-                                    16,
-                                >(
-                                    phase, &a, &b, &y, shape, &epilogues, max_wg_per_dim
-                                ) {
+                                if try_f16_coop!(64, 128, 16) {
                                     return;
                                 }
                             }
                             DirectTileCoopMatmulVariant::Tile64x64 => {
-                                if tile_ir_kernels::try_batched_coop_matmul::<
-                                    tile_ir::F16,
-                                    64,
-                                    64,
-                                    16,
-                                >(
-                                    phase, &a, &b, &y, shape, &epilogues, max_wg_per_dim
-                                ) {
+                                if try_f16_coop!(64, 64, 16) {
                                     return;
                                 }
                             }
@@ -726,6 +715,7 @@ impl MatMulOperation {
                 use_shared_tile.hash(state);
                 variant.hash(state);
                 coop_variant.hash(state);
+                coop_kind.hash(state);
                 epilogue_identity.hash(state);
             },
         );
@@ -900,6 +890,207 @@ impl Operation for MatMulOperation {
                 .join("x")
         )
     }
+
+    fn as_matmul(&self) -> Option<&MatMulOperation> {
+        Some(self)
+    }
+}
+
+pub(crate) fn resolve_matmul_on_host(
+    operation: &MatMulOperation,
+    inputs: &[crate::mir::inputs::MirValue],
+) -> Option<TensorData> {
+    match operation.datatype {
+        DataTypeEnum::F32 => resolve_matmul_f32(operation, inputs),
+        DataTypeEnum::F16 => {
+            if operation
+                .pre_element_wise
+                .iter()
+                .any(|chain| !chain.functions.is_empty())
+                || !operation.post_element_wise.functions.is_empty()
+            {
+                return None;
+            }
+            resolve_matmul_typed::<half::f16>(inputs)
+        }
+        DataTypeEnum::U32 => None,
+    }
+}
+
+fn resolve_matmul_f32(
+    operation: &MatMulOperation,
+    inputs: &[crate::mir::inputs::MirValue],
+) -> Option<TensorData> {
+    let a = inputs.first()?.as_tensor()?.clone();
+    let b = inputs.get(1)?.as_tensor()?.clone();
+    let output = inputs.get(2)?.as_tensor()?.clone();
+    if a.datatype() != DataTypeEnum::F32 || b.datatype() != DataTypeEnum::F32 {
+        return None;
+    }
+    let a_shape = a.layout().shape().to_vec();
+    let b_shape = b.layout().shape().to_vec();
+    let out_shape = output.layout().shape().to_vec();
+    let rank = out_shape.len();
+    if rank < 2 || a_shape.len() != rank || b_shape.len() != rank {
+        return None;
+    }
+    let m_axis = rank - 2;
+    let n_axis = rank - 1;
+    let k = a_shape[n_axis];
+    let a_values = a.to_host_vec::<f32>();
+    let b_values = b.to_host_vec::<f32>();
+    let total = out_shape.iter().product::<usize>();
+    let mut out = Vec::with_capacity(total);
+    for flat in 0..total {
+        let coords = matmul_coords_from_flat(flat, &out_shape);
+        let mut sum = 0.0;
+        for kk in 0..k {
+            let mut a_coords = coords.clone();
+            a_coords[n_axis] = kk;
+            let mut b_coords = coords.clone();
+            b_coords[m_axis] = kk;
+            let av = apply_matmul_unary_chain_f32(
+                a_values[matmul_row_major_index(&a_shape, &a_coords)],
+                &operation.pre_element_wise[0],
+            )?;
+            let bv = apply_matmul_unary_chain_f32(
+                b_values[matmul_row_major_index(&b_shape, &b_coords)],
+                &operation.pre_element_wise[1],
+            )?;
+            sum += av * bv;
+        }
+        out.push(apply_matmul_unary_chain_f32(
+            sum,
+            &operation.post_element_wise,
+        )?);
+    }
+    Some(TensorData::from_host_slice(
+        output.device(),
+        &out_shape,
+        &out,
+    ))
+}
+
+fn apply_matmul_unary_chain_f32(mut value: f32, chain: &UnaryFunctionChain) -> Option<f32> {
+    for function in &chain.functions {
+        value = match function.op {
+            NaryOp::Neg => -value,
+            NaryOp::Cast => value,
+            NaryOp::Exp | NaryOp::ApproximateExp | NaryOp::LessApproximateExp => value.exp(),
+            NaryOp::Exp2 => value.exp2(),
+            NaryOp::Log => value.ln(),
+            NaryOp::Log2 => value.log2(),
+            NaryOp::Sqrt => value.sqrt(),
+            NaryOp::Sin => value.sin(),
+            NaryOp::Cos => value.cos(),
+            NaryOp::Tan => value.tan(),
+            NaryOp::Tanh | NaryOp::TanhExact => value.tanh(),
+            NaryOp::Abs => value.abs(),
+            NaryOp::AddConst(scalar) => value + matmul_scalar_to_f32(&scalar),
+            NaryOp::SubConst(scalar) => value - matmul_scalar_to_f32(&scalar),
+            NaryOp::RSubConst(scalar) => matmul_scalar_to_f32(&scalar) - value,
+            NaryOp::MulConst(scalar) => value * matmul_scalar_to_f32(&scalar),
+            NaryOp::DivConst(scalar) => value / matmul_scalar_to_f32(&scalar),
+            NaryOp::RDivConst(scalar) => matmul_scalar_to_f32(&scalar) / value,
+            _ => return None,
+        };
+    }
+    Some(value)
+}
+
+fn matmul_scalar_to_f32(value: &NaryScalar) -> f32 {
+    match value {
+        NaryScalar::F32(value) => *value,
+        NaryScalar::F16(value) => value.to_f32(),
+        NaryScalar::U32(value) => *value as f32,
+    }
+}
+
+fn resolve_matmul_typed<D: DataType + MatmulHostValue>(
+    inputs: &[crate::mir::inputs::MirValue],
+) -> Option<TensorData> {
+    let a = inputs.first()?.as_tensor()?.clone();
+    let b = inputs.get(1)?.as_tensor()?.clone();
+    let output = inputs.get(2)?.as_tensor()?.clone();
+    if a.datatype() != D::DATA_TYPE || b.datatype() != D::DATA_TYPE {
+        return None;
+    }
+    let a_shape = a.layout().shape().to_vec();
+    let b_shape = b.layout().shape().to_vec();
+    let out_shape = output.layout().shape().to_vec();
+    let rank = out_shape.len();
+    if rank < 2 || a_shape.len() != rank || b_shape.len() != rank {
+        return None;
+    }
+    let m_axis = rank - 2;
+    let n_axis = rank - 1;
+    let k = a_shape[n_axis];
+    let a_values = a.to_host_vec::<D>();
+    let b_values = b.to_host_vec::<D>();
+    let total = out_shape.iter().product::<usize>();
+    let mut out = Vec::with_capacity(total);
+    for flat in 0..total {
+        let coords = matmul_coords_from_flat(flat, &out_shape);
+        let mut sum = <D as MatmulHostValue>::zero();
+        for kk in 0..k {
+            let mut a_coords = coords.clone();
+            a_coords[n_axis] = kk;
+            let mut b_coords = coords.clone();
+            b_coords[m_axis] = kk;
+            let av = a_values[matmul_row_major_index(&a_shape, &a_coords)];
+            let bv = b_values[matmul_row_major_index(&b_shape, &b_coords)];
+            sum = D::mul_add(sum, av, bv);
+        }
+        out.push(sum);
+    }
+    Some(TensorData::from_host_slice(
+        output.device(),
+        &out_shape,
+        &out,
+    ))
+}
+
+trait MatmulHostValue: DataType + Copy {
+    fn zero() -> Self;
+    fn mul_add(acc: Self, lhs: Self, rhs: Self) -> Self;
+}
+
+impl MatmulHostValue for f32 {
+    fn zero() -> Self {
+        0.0
+    }
+
+    fn mul_add(acc: Self, lhs: Self, rhs: Self) -> Self {
+        acc + lhs * rhs
+    }
+}
+
+impl MatmulHostValue for half::f16 {
+    fn zero() -> Self {
+        half::f16::from_f32(0.0)
+    }
+
+    fn mul_add(acc: Self, lhs: Self, rhs: Self) -> Self {
+        half::f16::from_f32(acc.to_f32() + lhs.to_f32() * rhs.to_f32())
+    }
+}
+
+fn matmul_coords_from_flat(mut flat: usize, shape: &[usize]) -> Vec<usize> {
+    let mut coords = vec![0; shape.len()];
+    for axis in (0..shape.len()).rev() {
+        coords[axis] = flat % shape[axis];
+        flat /= shape[axis];
+    }
+    coords
+}
+
+fn matmul_row_major_index(shape: &[usize], coords: &[usize]) -> usize {
+    let mut index = 0;
+    for (axis, coord) in coords.iter().enumerate() {
+        let stride = shape[axis + 1..].iter().product::<usize>();
+        index += coord * stride;
+    }
+    index
 }
 
 impl<const R: usize, T: DataType> Tensor<R, T> {
@@ -915,12 +1106,19 @@ impl<const R: usize, T: DataType> Tensor<R, T> {
 #[cfg(test)]
 mod selection_tests {
     use super::*;
-    use crate::kernel_selection::DeterministicShapeRng;
+    use crate::kernel_selection::{
+        CooperativeMatrixCaps, CooperativeMatrixKind, DeterministicShapeRng,
+    };
 
     fn caps(coop: bool) -> KernelDeviceCaps {
         KernelDeviceCaps {
             subgroups_supported: coop,
-            cooperative_matrix_supported: coop,
+            cooperative_matrix: if coop {
+                CooperativeMatrixCaps::test_dense_8x8()
+            } else {
+                CooperativeMatrixCaps::default()
+            },
+            subgroup_kernels_supported: coop,
             ..KernelDeviceCaps::test_caps()
         }
     }
@@ -931,17 +1129,19 @@ mod selection_tests {
         let cases = [
             (
                 DenseMatmulVariant::Coop,
-                DenseMatmulCtx { allow_coop: true },
+                DenseMatmulCtx {
+                    coop_kinds: &[CooperativeMatrixKind::F32F32M8N8K8],
+                },
                 caps(true),
             ),
             (
                 DenseMatmulVariant::Vector,
-                DenseMatmulCtx { allow_coop: false },
+                DenseMatmulCtx { coop_kinds: &[] },
                 caps(false),
             ),
             (
                 DenseMatmulVariant::MatMul,
-                DenseMatmulCtx { allow_coop: false },
+                DenseMatmulCtx { coop_kinds: &[] },
                 caps(false),
             ),
         ];
@@ -956,18 +1156,117 @@ mod selection_tests {
     }
 
     #[test]
+    fn dense_selector_gates_coop_by_scalar_property() {
+        let selector = dense_matmul_selector();
+        let shape = KernelShape::new([128, 256, 128]);
+        let f16_ctx = DenseMatmulCtx {
+            coop_kinds: &[CooperativeMatrixKind::F16F16M8N8K8],
+        };
+        let f32_ctx = DenseMatmulCtx {
+            coop_kinds: &[CooperativeMatrixKind::F32F32M8N8K8],
+        };
+
+        assert_eq!(
+            selector.select(shape, &f16_ctx, caps(true)),
+            Some(DenseMatmulVariant::Coop)
+        );
+        assert_eq!(
+            selector.select(shape, &f32_ctx, caps(true)),
+            Some(DenseMatmulVariant::Coop)
+        );
+        assert_eq!(
+            select_coop_kind(caps(true), f16_ctx.coop_kinds),
+            CooperativeMatrixKind::F16F16M8N8K8
+        );
+
+        let only_f32_property = KernelDeviceCaps {
+            cooperative_matrix: CooperativeMatrixCaps::from_properties(
+                wgpu::Features::EXPERIMENTAL_COOPERATIVE_MATRIX,
+                &[wgpu::CooperativeMatrixProperties {
+                    m_size: 8,
+                    n_size: 8,
+                    k_size: 8,
+                    ab_type: wgpu::CooperativeScalarType::F32,
+                    cr_type: wgpu::CooperativeScalarType::F32,
+                    saturating_accumulation: false,
+                }],
+            ),
+            ..caps(true)
+        };
+        assert_eq!(
+            selector.select(shape, &f16_ctx, only_f32_property),
+            Some(DenseMatmulVariant::MatMul)
+        );
+        assert_eq!(
+            selector.select(shape, &f32_ctx, only_f32_property),
+            Some(DenseMatmulVariant::Coop)
+        );
+
+        let only_f16_property = KernelDeviceCaps {
+            cooperative_matrix: CooperativeMatrixCaps::from_properties(
+                wgpu::Features::EXPERIMENTAL_COOPERATIVE_MATRIX | wgpu::Features::SHADER_F16,
+                &[wgpu::CooperativeMatrixProperties {
+                    m_size: 8,
+                    n_size: 8,
+                    k_size: 8,
+                    ab_type: wgpu::CooperativeScalarType::F16,
+                    cr_type: wgpu::CooperativeScalarType::F16,
+                    saturating_accumulation: false,
+                }],
+            ),
+            ..caps(true)
+        };
+        assert_eq!(
+            selector.select(shape, &f16_ctx, only_f16_property),
+            Some(DenseMatmulVariant::Coop)
+        );
+        assert_eq!(
+            selector.select(shape, &f32_ctx, only_f16_property),
+            Some(DenseMatmulVariant::MatMul)
+        );
+        assert_eq!(
+            select_coop_kind(only_f16_property, f16_ctx.coop_kinds),
+            CooperativeMatrixKind::F16F16M8N8K8
+        );
+
+        let only_mixed_f16_property = KernelDeviceCaps {
+            cooperative_matrix: CooperativeMatrixCaps::from_properties(
+                wgpu::Features::EXPERIMENTAL_COOPERATIVE_MATRIX | wgpu::Features::SHADER_F16,
+                &[wgpu::CooperativeMatrixProperties {
+                    m_size: 8,
+                    n_size: 8,
+                    k_size: 8,
+                    ab_type: wgpu::CooperativeScalarType::F16,
+                    cr_type: wgpu::CooperativeScalarType::F32,
+                    saturating_accumulation: false,
+                }],
+            ),
+            ..caps(true)
+        };
+        assert_eq!(
+            selector.select(shape, &f16_ctx, only_mixed_f16_property),
+            Some(DenseMatmulVariant::MatMul)
+        );
+        assert_eq!(
+            selector.select(shape, &f32_ctx, only_mixed_f16_property),
+            Some(DenseMatmulVariant::MatMul)
+        );
+    }
+
+    #[test]
     fn direct_tile_selector_generates_each_variant() {
         let selector = direct_tile_matmul_selector();
         let caps = KernelDeviceCaps {
             subgroups_supported: false,
-            cooperative_matrix_supported: false,
+            cooperative_matrix: CooperativeMatrixCaps::default(),
             min_subgroup_size: 0,
             max_subgroup_size: 0,
             max_compute_invocations_per_workgroup: 0,
             max_compute_workgroup_storage_size: 0,
             max_compute_workgroup_size_x: 0,
             max_compute_workgroups_per_dimension: 0,
-            software_adapter: false,
+            backend: wgpu::Backend::Noop,
+            subgroup_kernels_supported: false,
         };
         let mut rng = DeterministicShapeRng::default();
 

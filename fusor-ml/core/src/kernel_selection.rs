@@ -11,6 +11,99 @@ const DIM_SAMPLE_ATTEMPTS: usize = 128;
 const SHAPE_SAMPLE_ATTEMPTS: usize = 512;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) enum CooperativeMatrixKind {
+    F32F32M8N8K8,
+    F16F16M8N8K8,
+}
+
+impl CooperativeMatrixKind {
+    const fn bit(self) -> u8 {
+        match self {
+            Self::F32F32M8N8K8 => 1 << 0,
+            Self::F16F16M8N8K8 => 1 << 1,
+        }
+    }
+
+    fn from_property(
+        features: wgpu::Features,
+        property: &wgpu::CooperativeMatrixProperties,
+    ) -> Option<Self> {
+        if !cooperative_matrix_property_is_8x8(property) {
+            return None;
+        }
+        match (property.ab_type, property.cr_type) {
+            (wgpu::CooperativeScalarType::F32, wgpu::CooperativeScalarType::F32) => {
+                Some(Self::F32F32M8N8K8)
+            }
+            (wgpu::CooperativeScalarType::F16, wgpu::CooperativeScalarType::F16)
+                if features.contains(wgpu::Features::SHADER_F16) =>
+            {
+                Some(Self::F16F16M8N8K8)
+            }
+            _ => None,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct CooperativeMatrixKindSet(u8);
+
+impl CooperativeMatrixKindSet {
+    fn insert(&mut self, kind: CooperativeMatrixKind) {
+        self.0 |= kind.bit();
+    }
+
+    pub(crate) const fn contains(self, kind: CooperativeMatrixKind) -> bool {
+        self.0 & kind.bit() != 0
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct CooperativeMatrixCaps {
+    supported: CooperativeMatrixKindSet,
+}
+
+impl CooperativeMatrixCaps {
+    pub(crate) fn from_properties(
+        features: wgpu::Features,
+        properties: &[wgpu::CooperativeMatrixProperties],
+    ) -> Self {
+        if !features.contains(wgpu::Features::EXPERIMENTAL_COOPERATIVE_MATRIX) {
+            return Self::default();
+        }
+
+        let mut caps = Self::default();
+        for property in properties {
+            if let Some(kind) = CooperativeMatrixKind::from_property(features, property) {
+                caps.supported.insert(kind);
+            }
+        }
+        caps
+    }
+
+    pub(crate) const fn supports(self, kind: CooperativeMatrixKind) -> bool {
+        self.supported.contains(kind)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_dense_8x8() -> Self {
+        Self {
+            supported: CooperativeMatrixKindSet(
+                CooperativeMatrixKind::F32F32M8N8K8.bit()
+                    | CooperativeMatrixKind::F16F16M8N8K8.bit(),
+            ),
+        }
+    }
+}
+
+fn cooperative_matrix_property_is_8x8(property: &wgpu::CooperativeMatrixProperties) -> bool {
+    property.m_size == 8
+        && property.n_size == 8
+        && property.k_size == 8
+        && !property.saturating_accumulation
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct Axis<const I: usize>;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -49,19 +142,15 @@ const fn axis_index<const I: usize>(_axis: Axis<I>) -> usize {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct KernelDeviceCaps {
     pub subgroups_supported: bool,
-    pub cooperative_matrix_supported: bool,
+    pub cooperative_matrix: CooperativeMatrixCaps,
     pub min_subgroup_size: u32,
     pub max_subgroup_size: u32,
     pub max_compute_invocations_per_workgroup: u32,
     pub max_compute_workgroup_storage_size: u32,
     pub max_compute_workgroup_size_x: u32,
     pub max_compute_workgroups_per_dimension: u32,
-    /// True when the adapter is a software/emulated GPU (Mesa lavapipe,
-    /// Microsoft WARP). Subgroup operations on these adapters are
-    /// emulated and miscompile under the wgpu Windows-DX12 backend, so
-    /// kernels with a workgroup-only fallback should prefer it here even
-    /// when `subgroups_supported` reports true.
-    pub software_adapter: bool,
+    pub backend: wgpu::Backend,
+    pub subgroup_kernels_supported: bool,
 }
 
 impl KernelDeviceCaps {
@@ -69,14 +158,15 @@ impl KernelDeviceCaps {
         let limits = device.limits();
         Self {
             subgroups_supported: device.subgroups_supported(),
-            cooperative_matrix_supported: device.cooperative_matrix_supported(),
+            cooperative_matrix: device.cooperative_matrix_caps(),
             min_subgroup_size: device.min_subgroup_size(),
             max_subgroup_size: device.max_subgroup_size(),
             max_compute_invocations_per_workgroup: limits.max_compute_invocations_per_workgroup,
             max_compute_workgroup_storage_size: limits.max_compute_workgroup_storage_size,
             max_compute_workgroup_size_x: limits.max_compute_workgroup_size_x,
             max_compute_workgroups_per_dimension: limits.max_compute_workgroups_per_dimension,
-            software_adapter: device.is_software_adapter(),
+            backend: device.backend(),
+            subgroup_kernels_supported: device.subgroup_kernels_supported(),
         }
     }
 
@@ -87,14 +177,15 @@ impl KernelDeviceCaps {
     pub(crate) fn test_caps() -> Self {
         Self {
             subgroups_supported: true,
-            cooperative_matrix_supported: true,
+            cooperative_matrix: CooperativeMatrixCaps::test_dense_8x8(),
             min_subgroup_size: 32,
             max_subgroup_size: 32,
             max_compute_invocations_per_workgroup: 1024,
             max_compute_workgroup_storage_size: 64 * 1024,
             max_compute_workgroup_size_x: 1024,
             max_compute_workgroups_per_dimension: 65_535,
-            software_adapter: false,
+            backend: wgpu::Backend::Vulkan,
+            subgroup_kernels_supported: true,
         }
     }
 }
@@ -640,6 +731,86 @@ mod tests {
 
     fn caps() -> KernelDeviceCaps {
         KernelDeviceCaps::test_caps()
+    }
+
+    fn coop_property(
+        ab_type: wgpu::CooperativeScalarType,
+        cr_type: wgpu::CooperativeScalarType,
+    ) -> wgpu::CooperativeMatrixProperties {
+        wgpu::CooperativeMatrixProperties {
+            m_size: 8,
+            n_size: 8,
+            k_size: 8,
+            ab_type,
+            cr_type,
+            saturating_accumulation: false,
+        }
+    }
+
+    #[test]
+    fn cooperative_matrix_caps_require_feature_bit() {
+        let properties = [coop_property(
+            wgpu::CooperativeScalarType::F32,
+            wgpu::CooperativeScalarType::F32,
+        )];
+        let caps = CooperativeMatrixCaps::from_properties(wgpu::Features::empty(), &properties);
+
+        assert_eq!(caps, CooperativeMatrixCaps::default());
+    }
+
+    #[test]
+    fn cooperative_matrix_caps_detect_f32_f32_8x8() {
+        let properties = [coop_property(
+            wgpu::CooperativeScalarType::F32,
+            wgpu::CooperativeScalarType::F32,
+        )];
+        let caps = CooperativeMatrixCaps::from_properties(
+            wgpu::Features::EXPERIMENTAL_COOPERATIVE_MATRIX,
+            &properties,
+        );
+
+        assert!(caps.supports(CooperativeMatrixKind::F32F32M8N8K8));
+        assert!(!caps.supports(CooperativeMatrixKind::F16F16M8N8K8));
+    }
+
+    #[test]
+    fn cooperative_matrix_caps_ignore_mixed_f16_f32_8x8() {
+        let properties = [coop_property(
+            wgpu::CooperativeScalarType::F16,
+            wgpu::CooperativeScalarType::F32,
+        )];
+        let without_shader_f16 = CooperativeMatrixCaps::from_properties(
+            wgpu::Features::EXPERIMENTAL_COOPERATIVE_MATRIX,
+            &properties,
+        );
+        let with_shader_f16 = CooperativeMatrixCaps::from_properties(
+            wgpu::Features::EXPERIMENTAL_COOPERATIVE_MATRIX | wgpu::Features::SHADER_F16,
+            &properties,
+        );
+
+        assert_eq!(without_shader_f16, CooperativeMatrixCaps::default());
+        assert_eq!(with_shader_f16, CooperativeMatrixCaps::default());
+        assert!(!with_shader_f16.supports(CooperativeMatrixKind::F16F16M8N8K8));
+    }
+
+    #[test]
+    fn cooperative_matrix_caps_detect_f16_f16_8x8_only_with_shader_f16() {
+        let properties = [coop_property(
+            wgpu::CooperativeScalarType::F16,
+            wgpu::CooperativeScalarType::F16,
+        )];
+
+        let without_shader_f16 = CooperativeMatrixCaps::from_properties(
+            wgpu::Features::EXPERIMENTAL_COOPERATIVE_MATRIX,
+            &properties,
+        );
+        let with_shader_f16 = CooperativeMatrixCaps::from_properties(
+            wgpu::Features::EXPERIMENTAL_COOPERATIVE_MATRIX | wgpu::Features::SHADER_F16,
+            &properties,
+        );
+
+        assert!(!without_shader_f16.supports(CooperativeMatrixKind::F16F16M8N8K8));
+        assert!(with_shader_f16.supports(CooperativeMatrixKind::F16F16M8N8K8));
     }
 
     #[test]

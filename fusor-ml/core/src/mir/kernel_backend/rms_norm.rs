@@ -665,11 +665,14 @@ fn vector_as_row_layout(layout: &crate::Layout) -> Option<tile_ir::Layout> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{Device, Tensor, kernel_selection::assert_selector_generates};
+    use crate::{
+        Device, Tensor,
+        kernel_selection::{CooperativeMatrixCaps, assert_selector_generates},
+    };
 
     fn caps() -> KernelDeviceCaps {
         KernelDeviceCaps {
-            cooperative_matrix_supported: false,
+            cooperative_matrix: CooperativeMatrixCaps::default(),
             ..KernelDeviceCaps::test_caps()
         }
     }

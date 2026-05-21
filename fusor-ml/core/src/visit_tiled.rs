@@ -1,7 +1,5 @@
-use fusor_gguf::GgmlType;
-
 use crate::{
-    DataTypeEnum, Layout, QMatrix, TensorData,
+    QMatrix, TensorData,
     mir::{
         inputs::MirValue,
         workgroup_shape::{Constraint, WorkgroupShape, WorkgroupShapeConstraints},
@@ -19,27 +17,6 @@ impl MaybeQData {
         match self {
             MaybeQData::Tensor(tensor) => tensor.device(),
             MaybeQData::QMatrix(qmatrix) => qmatrix.device(),
-        }
-    }
-
-    pub(crate) fn layout(&self) -> Layout {
-        match self {
-            MaybeQData::Tensor(tensor) => tensor.layout().clone(),
-            MaybeQData::QMatrix(qmatrix) => Layout::contiguous(qmatrix.shape()),
-        }
-    }
-
-    pub(crate) fn datatype(&self) -> VisitTiledInputType {
-        match self {
-            MaybeQData::Tensor(tensor) => VisitTiledInputType::Dequantized(tensor.datatype()),
-            MaybeQData::QMatrix(qmatrix) => VisitTiledInputType::Quantized(qmatrix.datatype()),
-        }
-    }
-
-    pub(crate) fn owned(&self) -> bool {
-        match self {
-            MaybeQData::Tensor(tensor) => tensor.owned(),
-            MaybeQData::QMatrix(_) => false,
         }
     }
 }
@@ -86,24 +63,6 @@ impl TryFrom<MirValue> for MaybeQData {
             MirValue::QMatrix(qmatrix) => Ok(MaybeQData::QMatrix(qmatrix)),
             _ => Err(()),
         }
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub(crate) enum VisitTiledInputType {
-    Quantized(GgmlType),
-    Dequantized(DataTypeEnum),
-}
-
-impl From<DataTypeEnum> for VisitTiledInputType {
-    fn from(ty: DataTypeEnum) -> Self {
-        Self::Dequantized(ty)
-    }
-}
-
-impl From<GgmlType> for VisitTiledInputType {
-    fn from(ty: GgmlType) -> Self {
-        Self::Quantized(ty)
     }
 }
 

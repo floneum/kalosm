@@ -302,6 +302,34 @@ async fn assert_flash_attention_case(
 }
 
 #[tokio::test]
+async fn flash_attention_subgroup_fallback_preserves_gpu_backend() {
+    let q_shape = [1, 1, 2, 4];
+    let kv_shape = [1, 1, 3, 4];
+    let q_data = attention_data(q_shape.iter().product(), 0.1);
+    let k_data = attention_data(kv_shape.iter().product(), -0.15);
+    let v_data = attention_data(kv_shape.iter().product(), 0.35);
+    let scale = 1.0 / (q_shape[3] as f32).sqrt();
+
+    for device in available_devices().await {
+        let Some(gpu) = device.as_gpu() else {
+            continue;
+        };
+        if gpu.subgroup_kernels_supported() {
+            continue;
+        }
+
+        let q = Tensor::from_slice(&device, q_shape, &q_data);
+        let k = Tensor::from_slice(&device, kv_shape, &k_data);
+        let v = Tensor::from_slice(&device, kv_shape, &v_data);
+        let output = q.flash_attention(&k, &v, scale, None);
+        assert!(
+            output.is_gpu(),
+            "subgroup fallback should preserve the GPU backend"
+        );
+    }
+}
+
+#[tokio::test]
 async fn flash_attention_matches_cpu_reference_on_varied_shapes() {
     for case in [
         FlashCase {

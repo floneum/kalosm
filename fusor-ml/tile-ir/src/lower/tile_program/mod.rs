@@ -72,6 +72,16 @@ pub(in crate::lower) struct CoopFragmentLoad<'a> {
     pub(in crate::lower) cols: u32,
 }
 
+pub(in crate::lower) struct CoopBroadcastLoad<'a> {
+    pub(in crate::lower) id: CoopFragmentId,
+    pub(in crate::lower) src: &'a StorageView,
+    pub(in crate::lower) col: &'a Expr,
+    pub(in crate::lower) role: naga::CooperativeRole,
+    pub(in crate::lower) scalar: ScalarElement,
+    pub(in crate::lower) rows: u32,
+    pub(in crate::lower) cols: u32,
+}
+
 pub(in crate::lower) struct TileFoldLowering<'a> {
     pub(in crate::lower) count: &'a Expr,
     pub(in crate::lower) iter_var: LocalId,

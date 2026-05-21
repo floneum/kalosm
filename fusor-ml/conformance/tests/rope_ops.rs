@@ -2,7 +2,7 @@ mod common;
 
 use common::{reshape4, rope_interleaved_4d, rope_normal_4d};
 use fusor::{Device, RopeCache, Tensor, ToVec1, base_inverse_frequency};
-use fusor_conformance::{FuzzGenerator, approx_compare};
+use fusor_conformance::{FuzzGenerator, GenerateFromDevice, approx_compare, available_devices};
 use rand::distr::Uniform;
 
 fn rope_tables(
@@ -135,11 +135,13 @@ fn cache_expected_output(
     output: CacheOutput,
     op: RopeTensorOp,
 ) -> Tensor<4, f32> {
-    let cos_slice = cos[1..4].to_vec();
-    let sin_slice = sin[1..4].to_vec();
+    let forward = match op {
+        RopeTensorOp::Normal | RopeTensorOp::NormalFused => CacheForward::Normal,
+        RopeTensorOp::Interleaved | RopeTensorOp::InterleavedFused => CacheForward::Interleaved,
+    };
     match output {
-        CacheOutput::Query => apply_rope_op(q, cos_slice, sin_slice, op),
-        CacheOutput::Key => apply_rope_op(k, cos_slice, sin_slice, op),
+        CacheOutput::Query => cache_forward_output(q, k, cos, sin, forward, CacheOutput::Query),
+        CacheOutput::Key => cache_forward_output(q, k, cos, sin, forward, CacheOutput::Key),
     }
 }
 
@@ -201,30 +203,23 @@ macro_rules! assert_rope_ops_match {
 
 macro_rules! assert_cache_path_matches_direct_rope {
     ($gen_q:expr, $gen_k:expr, $cos:expr, $sin:expr, $forward:expr, $output:expr, $expected:expr) => {
-        fusor_conformance::assert({
-            let cos = $cos.clone();
-            let sin = $sin.clone();
-            move |q: Tensor<4, f32>, k: Tensor<4, f32>| {
-                let cos = cos.clone();
-                let sin = sin.clone();
-                async move { cache_forward_output(q, k, cos, sin, $forward, $output) }
-            }
-        })
-        .arg($gen_q.clone())
-        .arg($gen_k.clone())
-        .equal_to({
-            let cos = $cos.clone();
-            let sin = $sin.clone();
-            move |q: Tensor<4, f32>, k: Tensor<4, f32>| {
-                let cos = cos.clone();
-                let sin = sin.clone();
-                async move { cache_expected_output(q, k, cos, sin, $output, $expected) }
-            }
-        })
-        .compare_with(approx_compare::<4, f32>(1e-4))
-        .runs(3)
-        .await
-        .unwrap();
+        for device in available_devices().await {
+            let q = $gen_q.clone().generate(&device, 0);
+            let k = $gen_k.clone().generate(&device, 0);
+            let actual = cache_forward_output(
+                q.clone(),
+                k.clone(),
+                $cos.clone(),
+                $sin.clone(),
+                $forward,
+                $output,
+            );
+            let expected =
+                cache_expected_output(q, k, $cos.clone(), $sin.clone(), $output, $expected);
+            fusor_conformance::approx_eq(&actual, &expected, 1e-4)
+                .await
+                .unwrap();
+        }
     };
 }
 

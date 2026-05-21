@@ -290,6 +290,20 @@ pub(super) fn coop_load_b_fragments<T: CoopElement>(
         .collect()
 }
 
+/// Cooperatively load `cols` C-role fragments from a rank-1 column vector,
+/// broadcasting each 8-column slice across the fragment rows.
+pub(super) fn coop_load_c_broadcast_fragments<T: CoopElement>(
+    program: &mut TileBlock<'_>,
+    vector: &Storage<T, 1>,
+    col_base: &Tile<U32>,
+    cols: u32,
+) -> Vec<CoopFragment<T, 8, 8>> {
+    const COOP_DIM: u32 = 8;
+    (0..cols)
+        .map(|c| program.coop_load_broadcast_cols(vector, col_base.clone() + c * COOP_DIM))
+        .collect()
+}
+
 /// MMA every `a_frag` × `b_frag` pair into the matching accumulator.
 pub(super) fn coop_mma_grid<T: CoopElement>(
     program: &mut TileBlock<'_>,
@@ -300,6 +314,19 @@ pub(super) fn coop_mma_grid<T: CoopElement>(
     for (r, a) in a_frags.iter().enumerate() {
         for (c, b) in b_frags.iter().enumerate() {
             program.coop_mma(&accs[r][c], a, b);
+        }
+    }
+}
+
+/// Initialize every accumulator row from a C-role column-broadcast fragment.
+pub(super) fn coop_set_c_grid<T: CoopElement>(
+    program: &mut TileBlock<'_>,
+    accs: &[Vec<CoopAcc<T, 8, 8>>],
+    c_frags: &[CoopFragment<T, 8, 8>],
+) {
+    for row_accs in accs {
+        for (c, acc) in row_accs.iter().enumerate() {
+            program.coop_set_acc(acc, &c_frags[c]);
         }
     }
 }

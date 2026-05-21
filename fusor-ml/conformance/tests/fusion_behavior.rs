@@ -139,15 +139,7 @@ async fn gpu_flash_attention_fuses_into_one_kernel() {
         return;
     };
     let Device::Gpu(gpu) = &device else { return };
-    // The streaming flash kernel is monomorphized per hardware subgroup
-    // width and uses `subgroup_reduce_*`, so it can only target devices
-    // that pin a single supported subgroup size. Devices that report a
-    // variable range (Mesa lavapipe in Linux CI) take the composite path
-    // and won't fuse — skip the fusion assertion there.
-    if !gpu.subgroups_supported()
-        || gpu.min_subgroup_size() != gpu.max_subgroup_size()
-        || !matches!(gpu.min_subgroup_size(), 4 | 8 | 16 | 32 | 64)
-    {
+    if gpu.fixed_width_subgroup_size().is_none() {
         return;
     }
 
@@ -163,7 +155,9 @@ async fn gpu_flash_attention_fuses_into_one_kernel() {
     let v = Tensor::from_slice(&device, kv_shape, &v_data);
     let result = q.flash_attention(&k, &v, scale, None);
 
-    let gpu_result = result.as_gpu().unwrap();
+    let gpu_result = result
+        .as_gpu()
+        .expect("flash attention fusion test should produce a GPU tensor");
     let kernel_count = gpu_result.count_kernels_to_resolve();
     assert_eq!(
         kernel_count,
@@ -187,6 +181,10 @@ async fn gpu_residual_rms_norm_fuses_into_one_kernel() {
     let Some(device) = gpu_device().await else {
         return;
     };
+    let Device::Gpu(gpu) = &device else { return };
+    if gpu.requires_host_fallbacks() {
+        return;
+    }
 
     let shape = [1, 3, 256];
     let input_data = attention_data(shape.iter().product(), 0.25);
@@ -200,7 +198,9 @@ async fn gpu_residual_rms_norm_fuses_into_one_kernel() {
     let weight = Tensor::from_slice(&device, [shape[2]], &weight_data);
     let result = input.rms_norm_residual_fused::<1, 2, _>(&residual, &weight, None, 1e-5);
 
-    let gpu_result = result.as_gpu().unwrap();
+    let gpu_result = result
+        .as_gpu()
+        .expect("residual rms norm fusion test should produce a GPU tensor");
     let kernel_count = gpu_result.count_kernels_to_resolve();
     assert_eq!(
         kernel_count,
@@ -231,12 +231,6 @@ async fn gpu_nary_fusion_respects_binding_limit() {
         .unwrap()
         .limits()
         .max_storage_buffers_per_shader_stage as usize;
-    if max_storage_buffers > 256 {
-        // DX12/WARP reports a very high storage-buffer limit. Building a
-        // limit-plus-one expression tree there is not a useful conformance
-        // case and can overflow the test thread stack before fusion runs.
-        return;
-    }
     let num_tensors = max_storage_buffers + 1;
 
     let tensors: Vec<Tensor<2, f32>> = (0..num_tensors)

@@ -315,7 +315,6 @@ async fn sliding_window_with_cat_padding_matches_expected() {
 #[tokio::test]
 async fn restride_and_restride_layout_match_expected_views() {
     use fusor_types::{Layout, StrideSpec};
-
     let gen_4x6 = FuzzGenerator::<2, f32>::new([4, 6])
         .with_seed(520)
         .with_distribution(Uniform::new(-5.0, 5.0).unwrap());

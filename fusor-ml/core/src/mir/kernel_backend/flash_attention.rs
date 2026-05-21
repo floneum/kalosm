@@ -152,6 +152,13 @@ fn choose_decode_block(kv_seq_len: u32, caps: KernelDeviceCaps) -> Option<Decode
         return None;
     }
 
+    // Metal currently miscomputes the non-tiled 512/1024-thread decode
+    // variants on some GQA shapes. The 128-thread tiled path has the same
+    // semantics and passes the reference tests, so prefer it on Metal.
+    if caps.backend == wgpu::Backend::Metal {
+        return decode_block_supported(DecodeBlock::Small, caps).then_some(DecodeBlock::Small);
+    }
+
     let mut largest_supported = None;
     for block in DecodeBlock::ALL {
         if !decode_block_supported(block, caps) {
@@ -395,18 +402,12 @@ impl Operation for FlashAttentionOperation {
         let output = inputs.get(output_index)?.as_tensor()?.clone();
         let device = graph.device();
 
-        // Streaming kernel: pick the hardware subgroup size and dispatch a
-        // monomorphization tiled to match. wgpu doesn't expose
-        // `requiredSubgroupSize`, so the size has to be pinned by the adapter
-        // itself — bail if the range isn't a single supported value.
-        let streaming_subgroup_size = if device.subgroups_supported()
-            && device.min_subgroup_size() == device.max_subgroup_size()
-            && FLASH_STREAMING_SUBGROUP_SIZES.contains(&device.min_subgroup_size())
-        {
-            device.min_subgroup_size()
-        } else {
+        // Streaming kernel: pick the effective hardware subgroup size and
+        // dispatch a monomorphization tiled to match.
+        let streaming_subgroup_size = device.fixed_width_subgroup_size()?;
+        if !FLASH_STREAMING_SUBGROUP_SIZES.contains(&streaming_subgroup_size) {
             return None;
-        };
+        }
 
         let input_dtype = self.input_dtype;
         if !matches!(input_dtype, DataTypeEnum::F32 | DataTypeEnum::F16) {
@@ -730,13 +731,16 @@ fn build_flash_decode_small_meta(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{Device, Tensor, kernel_selection::assert_selector_generates};
+    use crate::{
+        Device, Tensor,
+        kernel_selection::{CooperativeMatrixCaps, assert_selector_generates},
+    };
 
     const TEST_HEAD_DIM: usize = DECODE_HEAD_DIM as usize;
 
     fn caps(max_compute_invocations_per_workgroup: u32) -> KernelDeviceCaps {
         KernelDeviceCaps {
-            cooperative_matrix_supported: false,
+            cooperative_matrix: CooperativeMatrixCaps::default(),
             max_compute_invocations_per_workgroup,
             ..KernelDeviceCaps::test_caps()
         }

@@ -29,10 +29,11 @@ impl<'a> IntoQgemvEpilogues<'a> for Option<&'a crate::UnaryEpilogue> {
         crate::types::QmatmulEpilogues {
             pre: None,
             pre_with_extras: None,
-            pre_extra_col_vectors: &[],
+            pre_extra_inputs: &[],
             post: self,
             post_with_extras: None,
-            post_extra_col_vectors: &[],
+            post_extra_inputs: &[],
+            post_acc_init_col_vector: None,
         }
     }
 }
@@ -455,9 +456,16 @@ pub(crate) fn qgemv_perf_with_epilogue<
                     );
                     let k_index = k_base.clone() + i as u32;
                     let pre_extras = epilogues
-                        .pre_extra_col_vectors
+                        .pre_extra_inputs
                         .iter()
-                        .map(|extra| program.load(extra.at(&k_index), k_index.lt(k_size), 0.0))
+                        .map(|extra| match extra {
+                            crate::types::QmatmulExtra::Column(vector) => {
+                                program.load(vector.at(&k_index), k_index.lt(k_size), 0.0)
+                            }
+                            crate::types::QmatmulExtra::Pointwise(tensor) => {
+                                program.load(tensor.at((0, &k_index)), k_index.lt(k_size), 0.0)
+                            }
+                        })
                         .collect::<Vec<_>>();
                     let scalar =
                         crate::types::apply_qmatmul_pre_epilogue(epilogues, scalar, pre_extras);

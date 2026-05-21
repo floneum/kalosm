@@ -10,7 +10,7 @@ use crate::{
         operation::Operation,
         workgroup_shape::{Constraint, WorkgroupShapeConstraints},
     },
-    nary_wise::{NaryScalar, UnaryFunctionChain},
+    nary_wise::{NaryOp, NaryScalar, UnaryFunctionChain},
     visit_tiled::distribute_workgroups,
 };
 use crate::{
@@ -174,6 +174,258 @@ impl Operation for ReduceOperation {
     fn name(&self) -> String {
         format!("reduce_{}", self.function.name())
     }
+
+    fn as_reduce(&self) -> Option<&ReduceOperation> {
+        Some(self)
+    }
+}
+
+pub(crate) fn resolve_reduce_on_host(
+    operation: &ReduceOperation,
+    graph: &crate::compute_graph::ComputeGraphInner,
+    inputs: &[MirValue],
+) -> Option<TensorData> {
+    if !operation.pre_element_wise.functions.is_empty() {
+        return None;
+    }
+    let input = graph.get_cached_result(operation.value)?;
+    let output = inputs.get(1)?.as_tensor()?.clone();
+    let output_shape = output.layout().shape().to_vec();
+    match operation.out_datatype() {
+        DataTypeEnum::F32 => resolve_reduce_f32(operation, &input, &output_shape),
+        DataTypeEnum::F16 => resolve_reduce_typed::<half::f16>(operation, &input, &output_shape),
+        DataTypeEnum::U32 => resolve_reduce_typed::<u32>(operation, &input, &output_shape),
+    }
+}
+
+fn resolve_reduce_f32(
+    operation: &ReduceOperation,
+    input: &TensorData,
+    output_shape: &[usize],
+) -> Option<TensorData> {
+    if input.datatype() != DataTypeEnum::F32 || operation.out_datatype() != DataTypeEnum::F32 {
+        return None;
+    }
+    let input_shape = input.layout().shape().to_vec();
+    let values = input.to_host_vec::<f32>();
+    let total = output_shape.iter().product::<usize>();
+    let mut output = Vec::with_capacity(total);
+    for flat in 0..total {
+        let out_coords = coords_from_flat(flat, output_shape);
+        let mut acc = f32::initial(operation.function.op)?;
+        for reduce_coord in 0..input_shape[operation.axis] {
+            let mut input_coords = Vec::with_capacity(input_shape.len());
+            let mut out_axis = 0;
+            for axis in 0..input_shape.len() {
+                if axis == operation.axis {
+                    input_coords.push(reduce_coord);
+                } else {
+                    input_coords.push(out_coords[out_axis]);
+                    out_axis += 1;
+                }
+            }
+            let value = values[row_major_index(&input_shape, &input_coords)];
+            acc = f32::reduce(operation.function.op, acc, value);
+        }
+        output.push(apply_unary_chain_f32(acc, &operation.post_element_wise)?);
+    }
+    Some(TensorData::from_host_slice(
+        input.device(),
+        output_shape,
+        &output,
+    ))
+}
+
+fn apply_unary_chain_f32(mut value: f32, chain: &UnaryFunctionChain) -> Option<f32> {
+    for function in &chain.functions {
+        value = match function.op {
+            NaryOp::Neg => -value,
+            NaryOp::Cast => value,
+            NaryOp::Exp | NaryOp::ApproximateExp | NaryOp::LessApproximateExp => value.exp(),
+            NaryOp::Exp2 => value.exp2(),
+            NaryOp::Log => value.ln(),
+            NaryOp::Log2 => value.log2(),
+            NaryOp::Sqrt => value.sqrt(),
+            NaryOp::Sin => value.sin(),
+            NaryOp::Cos => value.cos(),
+            NaryOp::Tan => value.tan(),
+            NaryOp::Tanh | NaryOp::TanhExact => value.tanh(),
+            NaryOp::Abs => value.abs(),
+            NaryOp::AddConst(scalar) => value + scalar_to_f32(&scalar),
+            NaryOp::SubConst(scalar) => value - scalar_to_f32(&scalar),
+            NaryOp::RSubConst(scalar) => scalar_to_f32(&scalar) - value,
+            NaryOp::MulConst(scalar) => value * scalar_to_f32(&scalar),
+            NaryOp::DivConst(scalar) => value / scalar_to_f32(&scalar),
+            NaryOp::RDivConst(scalar) => scalar_to_f32(&scalar) / value,
+            _ => return None,
+        };
+    }
+    Some(value)
+}
+
+fn scalar_to_f32(value: &NaryScalar) -> f32 {
+    match value {
+        NaryScalar::F32(value) => *value,
+        NaryScalar::F16(value) => value.to_f32(),
+        NaryScalar::U32(value) => *value as f32,
+    }
+}
+
+fn resolve_reduce_typed<D: DataType + ReduceHostValue>(
+    operation: &ReduceOperation,
+    input: &TensorData,
+    output_shape: &[usize],
+) -> Option<TensorData> {
+    if input.datatype() != D::DATA_TYPE || operation.out_datatype() != D::DATA_TYPE {
+        return None;
+    }
+    let input_shape = input.layout().shape().to_vec();
+    let values = input.to_host_vec::<D>();
+    let total = output_shape.iter().product::<usize>();
+    let mut output = Vec::with_capacity(total);
+    for flat in 0..total {
+        let out_coords = coords_from_flat(flat, output_shape);
+        let mut acc = D::initial(operation.function.op)?;
+        for reduce_coord in 0..input_shape[operation.axis] {
+            let mut input_coords = Vec::with_capacity(input_shape.len());
+            let mut out_axis = 0;
+            for axis in 0..input_shape.len() {
+                if axis == operation.axis {
+                    input_coords.push(reduce_coord);
+                } else {
+                    input_coords.push(out_coords[out_axis]);
+                    out_axis += 1;
+                }
+            }
+            let value = values[row_major_index(&input_shape, &input_coords)];
+            acc = D::reduce(operation.function.op, acc, value);
+        }
+        output.push(D::apply_post(acc, &operation.post_element_wise)?);
+    }
+    Some(TensorData::from_host_slice(
+        input.device(),
+        output_shape,
+        &output,
+    ))
+}
+
+trait ReduceHostValue: DataType + Copy {
+    fn initial(op: ReduceOp) -> Option<Self>;
+    fn reduce(op: ReduceOp, acc: Self, value: Self) -> Self;
+    fn apply_post(value: Self, chain: &UnaryFunctionChain) -> Option<Self>;
+}
+
+impl ReduceHostValue for f32 {
+    fn initial(op: ReduceOp) -> Option<Self> {
+        Some(match op {
+            ReduceOp::Sum => 0.0,
+            ReduceOp::Max => f32::NEG_INFINITY,
+            ReduceOp::Min => f32::INFINITY,
+            ReduceOp::Product => 1.0,
+        })
+    }
+
+    fn reduce(op: ReduceOp, acc: Self, value: Self) -> Self {
+        match op {
+            ReduceOp::Sum => acc + value,
+            ReduceOp::Max => acc.max(value),
+            ReduceOp::Min => acc.min(value),
+            ReduceOp::Product => acc * value,
+        }
+    }
+
+    fn apply_post(value: Self, chain: &UnaryFunctionChain) -> Option<Self> {
+        apply_unary_chain_f32(value, chain)
+    }
+}
+
+impl ReduceHostValue for half::f16 {
+    fn initial(op: ReduceOp) -> Option<Self> {
+        f32::initial(op).map(half::f16::from_f32)
+    }
+
+    fn reduce(op: ReduceOp, acc: Self, value: Self) -> Self {
+        half::f16::from_f32(f32::reduce(op, acc.to_f32(), value.to_f32()))
+    }
+
+    fn apply_post(value: Self, chain: &UnaryFunctionChain) -> Option<Self> {
+        apply_unary_chain_f32(value.to_f32(), chain).map(half::f16::from_f32)
+    }
+}
+
+impl ReduceHostValue for u32 {
+    fn initial(op: ReduceOp) -> Option<Self> {
+        Some(match op {
+            ReduceOp::Sum => 0,
+            ReduceOp::Max => u32::MIN,
+            ReduceOp::Min => u32::MAX,
+            ReduceOp::Product => 1,
+        })
+    }
+
+    fn reduce(op: ReduceOp, acc: Self, value: Self) -> Self {
+        match op {
+            ReduceOp::Sum => acc.wrapping_add(value),
+            ReduceOp::Max => acc.max(value),
+            ReduceOp::Min => acc.min(value),
+            ReduceOp::Product => acc.wrapping_mul(value),
+        }
+    }
+
+    fn apply_post(value: Self, chain: &UnaryFunctionChain) -> Option<Self> {
+        apply_unary_chain_u32(value, chain)
+    }
+}
+
+fn apply_unary_chain_u32(mut value: u32, chain: &UnaryFunctionChain) -> Option<u32> {
+    for function in &chain.functions {
+        value = match function.op {
+            NaryOp::Cast => value,
+            NaryOp::AddConst(scalar) => value.wrapping_add(scalar_to_u32(&scalar)),
+            NaryOp::SubConst(scalar) => value.wrapping_sub(scalar_to_u32(&scalar)),
+            NaryOp::RSubConst(scalar) => scalar_to_u32(&scalar).wrapping_sub(value),
+            NaryOp::MulConst(scalar) => value.wrapping_mul(scalar_to_u32(&scalar)),
+            NaryOp::DivConst(scalar) => value / scalar_to_u32(&scalar),
+            NaryOp::RDivConst(scalar) => scalar_to_u32(&scalar) / value,
+            NaryOp::RemConst(scalar) => value % scalar_to_u32(&scalar),
+            NaryOp::RRemConst(scalar) => scalar_to_u32(&scalar) % value,
+            NaryOp::MinConst(scalar) => value.min(scalar_to_u32(&scalar)),
+            NaryOp::MaxConst(scalar) => value.max(scalar_to_u32(&scalar)),
+            NaryOp::EqualConst(scalar) => (value == scalar_to_u32(&scalar)) as u32,
+            NaryOp::LessConst(scalar) => (value < scalar_to_u32(&scalar)) as u32,
+            NaryOp::LessEqualConst(scalar) => (value <= scalar_to_u32(&scalar)) as u32,
+            NaryOp::GreaterConst(scalar) => (value > scalar_to_u32(&scalar)) as u32,
+            NaryOp::GreaterEqualConst(scalar) => (value >= scalar_to_u32(&scalar)) as u32,
+            _ => return None,
+        };
+    }
+    Some(value)
+}
+
+fn scalar_to_u32(value: &NaryScalar) -> u32 {
+    match value {
+        NaryScalar::F32(value) => *value as u32,
+        NaryScalar::F16(value) => value.to_f32() as u32,
+        NaryScalar::U32(value) => *value,
+    }
+}
+
+fn coords_from_flat(mut flat: usize, shape: &[usize]) -> Vec<usize> {
+    let mut coords = vec![0; shape.len()];
+    for axis in (0..shape.len()).rev() {
+        coords[axis] = flat % shape[axis];
+        flat /= shape[axis];
+    }
+    coords
+}
+
+fn row_major_index(shape: &[usize], coords: &[usize]) -> usize {
+    let mut index = 0;
+    for (axis, coord) in coords.iter().enumerate() {
+        let stride = shape[axis + 1..].iter().product::<usize>();
+        index += coord * stride;
+    }
+    index
 }
 
 #[derive(Clone, Debug, Hash)]
@@ -348,5 +600,42 @@ impl<const N: usize, D: DataType> Tensor<N, D> {
         let dim_idx = dim.resolve();
         let reduced = self.product(dim);
         unsqueeze_dim::<N, O, D>(&reduced, dim_idx)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::nary_wise::NaryFunction;
+
+    #[test]
+    fn typed_reduce_host_apply_f16_post_chain() {
+        let chain = UnaryFunctionChain::new(
+            vec![NaryFunction::unary(
+                Some("abs".to_string()),
+                NaryOp::Abs,
+                DataTypeEnum::F16,
+                DataTypeEnum::F16,
+            )],
+            DataTypeEnum::F16,
+        );
+        let actual =
+            <half::f16 as ReduceHostValue>::apply_post(half::f16::from_f32(-9.0), &chain).unwrap();
+        assert_eq!(actual, half::f16::from_f32(9.0));
+    }
+
+    #[test]
+    fn typed_reduce_host_apply_u32_post_chain() {
+        let chain = UnaryFunctionChain::new(
+            vec![NaryFunction::unary(
+                Some("add_const".to_string()),
+                NaryOp::AddConst(NaryScalar::U32(7)),
+                DataTypeEnum::U32,
+                DataTypeEnum::U32,
+            )],
+            DataTypeEnum::U32,
+        );
+        let actual = <u32 as ReduceHostValue>::apply_post(9, &chain).unwrap();
+        assert_eq!(actual, 16);
     }
 }

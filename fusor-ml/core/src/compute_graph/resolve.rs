@@ -409,6 +409,7 @@ impl Resolver {
         let profile_gpu_kernels = std::env::var_os("FUSOR_TRACE_GPU_KERNELS").is_some();
         let collect_dispatch_metadata = trace || profile_gpu_kernels;
         let mut commands = Vec::<CommandRecord>::with_capacity(queued_operations.len());
+        let mut host_kernel_count = 0usize;
         let mut dispatch_categories = FxHashMap::<String, usize>::default();
         let mut dispatch_names = FxHashMap::<String, usize>::default();
         for (node, operation) in queued_operations {
@@ -481,6 +482,103 @@ impl Resolver {
                     if let Some(category) = operation_category {
                         host_category_profile.entry(category).or_default().inputs += elapsed;
                     }
+                }
+                if let Some(resolved) = operation.as_resize().and_then(|operation| {
+                    crate::resize::resolve_resize_on_host(operation, &new_inputs)
+                }) {
+                    graph.set_cached_result(node, resolved);
+                    host_kernel_count += 1;
+                    let start = host_trace.then(Instant::now);
+                    Self::release_dead_intermediates(
+                        graph,
+                        &[(node, operation)],
+                        &mut remaining_consumers,
+                        &target_set,
+                    );
+                    if let Some(start) = start {
+                        host_profile.release += start.elapsed();
+                    }
+                    continue;
+                }
+                if let Some(resolved) = operation.as_slice_assign().and_then(|operation| {
+                    crate::slice_assign::resolve_slice_assign_on_host(operation, &new_inputs)
+                }) {
+                    graph.set_cached_result(node, resolved);
+                    host_kernel_count += 1;
+                    let start = host_trace.then(Instant::now);
+                    Self::release_dead_intermediates(
+                        graph,
+                        &[(node, operation)],
+                        &mut remaining_consumers,
+                        &target_set,
+                    );
+                    if let Some(start) = start {
+                        host_profile.release += start.elapsed();
+                    }
+                    continue;
+                }
+                if let Some(resolved) = (device.requires_host_fallbacks())
+                    .then(|| operation.as_nary())
+                    .flatten()
+                    .and_then(|operation| {
+                        crate::nary_direct::resolve_nary_on_host(operation, &new_inputs)
+                    })
+                {
+                    graph.set_cached_result(node, resolved);
+                    host_kernel_count += 1;
+                    let start = host_trace.then(Instant::now);
+                    Self::release_dead_intermediates(
+                        graph,
+                        &[(node, operation)],
+                        &mut remaining_consumers,
+                        &target_set,
+                    );
+                    if let Some(start) = start {
+                        host_profile.release += start.elapsed();
+                    }
+                    continue;
+                }
+                if let Some(resolved) = (device.requires_host_fallbacks())
+                    .then(|| operation.as_reduce())
+                    .flatten()
+                    .and_then(|operation| {
+                        crate::reduce::resolve_reduce_on_host(operation, graph, &new_inputs)
+                    })
+                {
+                    graph.set_cached_result(node, resolved);
+                    host_kernel_count += 1;
+                    let start = host_trace.then(Instant::now);
+                    Self::release_dead_intermediates(
+                        graph,
+                        &[(node, operation)],
+                        &mut remaining_consumers,
+                        &target_set,
+                    );
+                    if let Some(start) = start {
+                        host_profile.release += start.elapsed();
+                    }
+                    continue;
+                }
+                if let Some(resolved) = (device.requires_host_fallbacks())
+                    .then(|| operation.as_matmul())
+                    .flatten()
+                    .and_then(|operation| {
+                        crate::matmul::resolve_matmul_on_host(operation, &new_inputs)
+                    })
+                {
+                    graph.set_cached_result(node, resolved);
+                    host_kernel_count += 1;
+                    let start = host_trace.then(Instant::now);
+                    Self::release_dead_intermediates(
+                        graph,
+                        &[(node, operation)],
+                        &mut remaining_consumers,
+                        &target_set,
+                    );
+                    if let Some(start) = start {
+                        host_profile.release += start.elapsed();
+                    }
+                    continue;
                 }
                 let start = host_trace.then(Instant::now);
                 let result = operation.output(graph, &new_inputs);
@@ -582,7 +680,8 @@ impl Resolver {
         let total_kernels = commands
             .iter()
             .filter(|command| matches!(command, CommandRecord::Dispatch(_)))
-            .count();
+            .count()
+            + host_kernel_count;
         if trace {
             let mut categories = dispatch_categories.into_iter().collect::<Vec<_>>();
             categories.sort_by(|a, b| a.0.cmp(&b.0));
@@ -1123,7 +1222,13 @@ impl Resolver {
     ) -> Option<(NodeIndex, Vec<crate::map_layout::MapLayoutOperation>)> {
         let mut chain = Vec::new();
         loop {
-            let exec = self.get_input_node_in_exec_graph(inner)?;
+            let Some(exec) = self.get_input_node_in_exec_graph(inner) else {
+                if chain.is_empty() {
+                    return None;
+                }
+                chain.reverse();
+                return Some((inner, chain));
+            };
             let ComputeGraphNodeVariant::MapLayout(map) =
                 self.execution_graph[exec].variant.clone()
             else {
@@ -1174,7 +1279,7 @@ impl Resolver {
                 .iter()
                 .all(|stride| *stride == 0);
         if !is_column_broadcast {
-            return None;
+            return Some(extra_inner);
         }
 
         let (base_inner, _) = self
@@ -1189,7 +1294,7 @@ impl Resolver {
         {
             Some(base_inner)
         } else {
-            None
+            Some(extra_inner)
         }
     }
 
@@ -1475,14 +1580,15 @@ impl Resolver {
     /// Remove unused inputs and deduplicate, returning new inputs and remapped expression.
     fn deduplicate_inputs(inputs: Vec<NodeIndex>, expr: NaryExpr) -> (Vec<NodeIndex>, NaryExpr) {
         // Collect which input indices are actually used
-        let mut used_indices = FxHashSet::default();
-        Self::collect_used_inputs(&expr, &mut used_indices);
+        let mut seen_indices = FxHashSet::default();
+        let mut used_indices = Vec::new();
+        Self::collect_used_inputs(&expr, &mut seen_indices, &mut used_indices);
 
         // Build mapping: old index -> new index, and collect only used inputs
         let mut new_inputs = Vec::new();
         let mut old_to_new = FxHashMap::default();
 
-        for old_idx in used_indices.iter().copied().collect::<Vec<_>>() {
+        for old_idx in used_indices {
             let node = inputs[old_idx];
             // Check if this node already exists in new_inputs (deduplication)
             let new_idx = if let Some(existing) = new_inputs.iter().position(|&n| n == node) {
@@ -1499,17 +1605,19 @@ impl Resolver {
         (new_inputs, new_expr)
     }
 
-    fn collect_used_inputs(expr: &NaryExpr, used: &mut FxHashSet<usize>) {
+    fn collect_used_inputs(expr: &NaryExpr, seen: &mut FxHashSet<usize>, used: &mut Vec<usize>) {
         match expr {
             NaryExpr::Op { children, .. } => {
                 for child in children {
-                    Self::collect_used_inputs(child, used);
+                    Self::collect_used_inputs(child, seen, used);
                 }
             }
             NaryExpr::IndexedInput { input_idx, indices } => {
-                used.insert(*input_idx);
+                if seen.insert(*input_idx) {
+                    used.push(*input_idx);
+                }
                 for c in indices {
-                    Self::collect_used_inputs(c, used);
+                    Self::collect_used_inputs(c, seen, used);
                 }
             }
             NaryExpr::DimIndex(_) => {}
@@ -1535,6 +1643,67 @@ impl Resolver {
             },
             NaryExpr::DimIndex(dim) => NaryExpr::DimIndex(*dim),
             NaryExpr::Scalar(value) => NaryExpr::Scalar(*value),
+        }
+    }
+
+    fn replace_inputs_in_expr(
+        expr: &NaryExpr,
+        replacements: &[Option<NaryExpr>],
+    ) -> Option<NaryExpr> {
+        match expr {
+            NaryExpr::Op { children, function } => Some(NaryExpr::Op {
+                children: children
+                    .iter()
+                    .map(|child| Self::replace_inputs_in_expr(child, replacements))
+                    .collect::<Option<Vec<_>>>()?,
+                function: function.clone(),
+            }),
+            NaryExpr::IndexedInput { input_idx, indices } => {
+                if let Some(replacement) = replacements.get(*input_idx).and_then(|r| r.as_ref()) {
+                    if NaryExpr::is_elementwise_indices(indices) {
+                        Some(replacement.clone())
+                    } else {
+                        None
+                    }
+                } else {
+                    Some(NaryExpr::IndexedInput {
+                        input_idx: *input_idx,
+                        indices: indices
+                            .iter()
+                            .map(|index| Self::replace_inputs_in_expr(index, replacements))
+                            .collect::<Option<Vec<_>>>()?,
+                    })
+                }
+            }
+            NaryExpr::DimIndex(dim) => Some(NaryExpr::DimIndex(*dim)),
+            NaryExpr::Scalar(value) => Some(NaryExpr::Scalar(*value)),
+        }
+    }
+
+    fn qmatmul_same_base(first: &QMatMulOperation, second: &QMatMulOperation) -> bool {
+        first.input_datatype == second.input_datatype
+            && first.input == second.input
+            && first.matrix == second.matrix
+            && first.in_shape == second.in_shape
+            && first.out_shape == second.out_shape
+            && first.pre_element_wise_expr == second.pre_element_wise_expr
+            && first.paired.is_none()
+            && second.paired.is_none()
+    }
+
+    fn qmatmul_output_expr(
+        qmatmul: &QMatMulOperation,
+        extras: &mut Vec<NodeIndex>,
+        rank: usize,
+    ) -> Option<NaryExpr> {
+        if let Some(epilogue) = &qmatmul.post_element_wise_expr {
+            let mut mapping = Vec::with_capacity(1 + epilogue.extras.len());
+            mapping.push(0);
+            mapping.extend((0..epilogue.extras.len()).map(|i| extras.len() + 1 + i));
+            extras.extend(epilogue.extras.iter().copied());
+            Some(epilogue.expression.remap_inputs(&mapping))
+        } else {
+            Some(NaryExpr::input(0, rank))
         }
     }
 
@@ -1638,9 +1807,9 @@ impl Resolver {
             }
         }
 
-        // Post-op (QMatMul): fuse a general single-input element-wise
-        // expression after qmatmul. This handles composite unary expressions
-        // like GELU, which are not representable as a linear unary chain.
+        // Post-op (QMatMul): fuse a general element-wise expression after
+        // qmatmul. This handles composite expressions like GELU and ordered
+        // extra inputs whose layouts match the output visitation shape.
         if let ComputeGraphNodeVariant::Nary(nary) = &node_variant {
             for (candidate_input_idx, &input_inner) in nary.inputs.iter().enumerate() {
                 if self.get_input_node_in_exec_graph(input_inner).is_none() {
@@ -1678,22 +1847,34 @@ impl Resolver {
                 else {
                     continue;
                 };
-                let mut mapping = vec![usize::MAX; nary.inputs.len()];
                 let mut extras = Vec::new();
+                let mut replacements = vec![None; nary.inputs.len()];
                 let mut valid_expression = true;
                 for (input_idx, &nary_input) in nary.inputs.iter().enumerate() {
                     let (base_inner, chain) = self
                         .walk_map_layout_chain(nary_input)
                         .unwrap_or((nary_input, Vec::new()));
-                    if base_inner == qmatmul_inner {
+                    let base_qmatmul =
+                        self.get_input_node_in_exec_graph(base_inner)
+                            .and_then(|exec| match &self.execution_graph[exec].variant {
+                                ComputeGraphNodeVariant::QMatMul(op) => Some(op.clone()),
+                                _ => None,
+                            });
+                    if let Some(base_qmatmul) = base_qmatmul
+                        && Self::qmatmul_same_base(&qmatmul_op, &base_qmatmul)
+                    {
                         let alias_layout = Self::apply_map_layout_chain(
-                            &Layout::contiguous(&qmatmul_op.out_shape),
+                            &Layout::contiguous(&base_qmatmul.out_shape),
                             &chain,
                         );
                         if alias_layout == Layout::contiguous(&nary.shape)
                             && !nary.expression.uses_custom_indexing_for_input(input_idx)
                         {
-                            mapping[input_idx] = 0;
+                            replacements[input_idx] = Self::qmatmul_output_expr(
+                                &base_qmatmul,
+                                &mut extras,
+                                nary.shape.len(),
+                            );
                             continue;
                         }
                         valid_expression = false;
@@ -1706,13 +1887,18 @@ impl Resolver {
                         valid_expression = false;
                         break;
                     };
-                    mapping[input_idx] = extras.len() + 1;
+                    replacements[input_idx] =
+                        Some(NaryExpr::input(extras.len() + 1, nary.shape.len()));
                     extras.push(extra);
                 }
                 if !valid_expression {
                     continue;
                 }
-                let expression = nary.expression.remap_inputs(&mapping);
+                let Some(expression) =
+                    Self::replace_inputs_in_expr(&nary.expression, &replacements)
+                else {
+                    continue;
+                };
                 if self.check_cached(graph, input_inner)
                     || input_datatype != crate::DataTypeEnum::F32
                     || nary.output_datatype != crate::DataTypeEnum::F32
@@ -1720,39 +1906,16 @@ impl Resolver {
                     continue;
                 }
 
-                let post_element_wise_expr =
-                    if let Some(existing) = &qmatmul_op.post_element_wise_expr {
-                        if existing.output_datatype != input_datatype {
-                            continue;
-                        }
-                        let mut mapping = Vec::with_capacity(1 + extras.len());
-                        mapping.push(0);
-                        mapping.extend((0..extras.len()).map(|i| i + 1 + existing.extras.len()));
-                        let shifted_expression = expression.remap_inputs(&mapping);
-                        let (expression, success) = Self::substitute_input_in_expr(
-                            &shifted_expression,
-                            0,
-                            &existing.expression,
-                        );
-                        if !success {
-                            continue;
-                        }
-                        let mut combined_extras = existing.extras.clone();
-                        combined_extras.extend(extras.clone());
-                        ElementwiseEpilogue {
-                            expression,
-                            extras: combined_extras,
-                            input_datatype: existing.input_datatype,
-                            output_datatype: nary.output_datatype,
-                        }
-                    } else {
-                        ElementwiseEpilogue {
-                            expression,
-                            extras: extras.clone(),
-                            input_datatype,
-                            output_datatype: nary.output_datatype,
-                        }
-                    };
+                let post_element_wise_expr = ElementwiseEpilogue {
+                    expression,
+                    extras: extras.clone(),
+                    input_datatype: qmatmul_op
+                        .post_element_wise_expr
+                        .as_ref()
+                        .map(|existing| existing.input_datatype)
+                        .unwrap_or(input_datatype),
+                    output_datatype: nary.output_datatype,
+                };
 
                 let mut new_q = qmatmul_op.clone();
                 let deps_extras = post_element_wise_expr.extras.clone();
@@ -1761,27 +1924,30 @@ impl Resolver {
                 self.execution_graph[node_idx].variant = ComputeGraphNodeVariant::QMatMul(new_q);
 
                 let input_inner_of_qmatmul = qmatmul_op.input;
-                if let Some(idx) = self.get_input_node_in_exec_graph(input_inner_of_qmatmul) {
-                    self.execution_graph.add_edge(idx, node_idx, ());
-                }
-                for extra in &deps_extras {
-                    if let Some(idx) = self.get_input_node_in_exec_graph(*extra)
-                        && self.execution_graph.find_edge(idx, node_idx).is_none()
-                    {
-                        self.execution_graph.add_edge(idx, node_idx, ());
-                    }
-                }
+                let mut deps = vec![input_inner_of_qmatmul];
+                deps.extend(deps_extras.iter().copied());
                 for input in &nary.inputs {
+                    if deps.contains(input) {
+                        continue;
+                    }
                     if let Some(input_exec) = self.get_input_node_in_exec_graph(*input) {
                         if let Some(edge) = self.execution_graph.find_edge(input_exec, node_idx) {
                             self.execution_graph.remove_edge(edge);
                         }
                     }
                 }
-                let mut deps = vec![input_inner_of_qmatmul];
-                deps.extend(deps_extras);
+                for dep in &deps {
+                    if let Some(idx) = self.get_input_node_in_exec_graph(*dep)
+                        && self.execution_graph.find_edge(idx, node_idx).is_none()
+                    {
+                        self.execution_graph.add_edge(idx, node_idx, ());
+                    }
+                }
                 self.add_physical_dependencies(graph, node_idx, &deps);
                 for input in &nary.inputs {
+                    if deps.contains(input) {
+                        continue;
+                    }
                     if let Some(input_exec) = self.get_input_node_in_exec_graph(*input) {
                         self.remove_node_if_dead(input_exec);
                     }
@@ -2031,35 +2197,20 @@ impl Resolver {
         // `subgroup_id` / `subgroup_reduce_*` and has no workgroup-only
         // fallback. The resolver later panics if `build_direct_kernel`
         // returns None for any operation it scheduled, so refuse the
-        // rewrite up-front on adapters without `Features::SUBGROUP` (Mesa
-        // lavapipe in Linux CI) and on software adapters that emulate them
-        // buggily (Microsoft WARP on Windows CI). The unfused source still
-        // resolves via the regular qmatmul + epilogue kernels.
+        // rewrite up-front on adapters without `Features::SUBGROUP`. The
+        // unfused source still resolves via the regular qmatmul + epilogue
+        // kernels.
         let device = graph.device();
-        if !device.subgroups_supported() || device.is_software_adapter() {
+        if !device.subgroups_supported() {
             return false;
         }
-        let trace = std::env::var_os("FUSOR_TRACE_PAIRED_FUSE").is_some();
         let ComputeGraphNodeVariant::Nary(nary) = self.execution_graph[node_idx].variant.clone()
         else {
             return false;
         };
         let Some(split) = nary.try_extract_paired_split() else {
-            if trace {
-                eprintln!(
-                    "paired-fuse: extract_paired_split failed on nary {:?}",
-                    node_idx
-                );
-            }
             return false;
         };
-        if trace {
-            eprintln!(
-                "paired-fuse: candidate nary {:?} expr={}",
-                node_idx,
-                split.expression.name()
-            );
-        }
 
         // Classify each Nary input as either a matmul-view (MapLayout
         // whose source is the same QMatMul) or an extra (broadcast bias
@@ -2085,14 +2236,6 @@ impl Resolver {
             let Some(exec_idx) = self.get_input_node_in_exec_graph(*input_inner) else {
                 return false;
             };
-            if trace {
-                eprintln!(
-                    "paired-fuse: input slot {} ({:?}) variant={}",
-                    slot_idx,
-                    input_inner,
-                    node_category(&self.execution_graph[exec_idx].variant)
-                );
-            }
             match self.execution_graph[exec_idx].variant.clone() {
                 ComputeGraphNodeVariant::MapLayout(_map) => {
                     // Walk the MapLayout chain to the ultimate source. fusor
@@ -2112,26 +2255,11 @@ impl Resolver {
                             )
                         })
                         .unwrap_or(false);
-                    if trace {
-                        eprintln!(
-                            "paired-fuse:   slot {} chain bottom={:?} source_variant={}",
-                            slot_idx,
-                            source_inner,
-                            source_exec
-                                .map(|e| node_category(&self.execution_graph[e].variant))
-                                .unwrap_or("<none>"),
-                        );
-                    }
                     if source_is_qmatmul {
                         match common_qmatmul_inner {
                             None => common_qmatmul_inner = Some(source_inner),
                             Some(existing) if existing == source_inner => {}
                             Some(_) => {
-                                if trace {
-                                    eprintln!(
-                                        "paired-fuse: matmul-view slots reference different qmatmuls"
-                                    );
-                                }
                                 return false;
                             }
                         }
@@ -2150,12 +2278,6 @@ impl Resolver {
             }
         }
         if matmul_view_slots.len() != 2 {
-            if trace {
-                eprintln!(
-                    "paired-fuse: expected 2 matmul-view slots, found {}",
-                    matmul_view_slots.len()
-                );
-            }
             return false;
         }
         let Some(qmatmul_inner) = common_qmatmul_inner else {
@@ -2172,12 +2294,6 @@ impl Resolver {
         let ComputeGraphNodeVariant::QMatMul(qmatmul_op) =
             self.execution_graph[qmatmul_exec].variant.clone()
         else {
-            if trace {
-                eprintln!(
-                    "paired-fuse: upstream not QMatMul, variant={}",
-                    node_category(&self.execution_graph[qmatmul_exec].variant)
-                );
-            }
             return false;
         };
 
@@ -2224,24 +2340,14 @@ impl Resolver {
         // `IndexedInput(i, _)` slots refer to the original Nary input
         // ordering. Build a permutation: gate_input_idx -> slot 0,
         // up_input_idx -> slot 1, extra_k's input_idx -> slot 2+k.
-        let (gate_input_idx, up_input_idx) = if a_layout.offset() == q_offset
-            && b_layout.offset() == b_expected_offset
-        {
-            (a_slot, b_slot)
-        } else if b_layout.offset() == q_offset && a_layout.offset() == b_expected_offset {
-            (b_slot, a_slot)
-        } else {
-            if trace {
-                eprintln!(
-                    "paired-fuse: layout offsets don't form a [0, N] split (q={} a={} b={} N*s={})",
-                    q_offset,
-                    a_layout.offset(),
-                    b_layout.offset(),
-                    shift,
-                );
-            }
-            return false;
-        };
+        let (gate_input_idx, up_input_idx) =
+            if a_layout.offset() == q_offset && b_layout.offset() == b_expected_offset {
+                (a_slot, b_slot)
+            } else if b_layout.offset() == q_offset && a_layout.offset() == b_expected_offset {
+                (b_slot, a_slot)
+            } else {
+                return false;
+            };
 
         // Permutation: for each captured-NaryExpr input slot, the closure
         // tile-slice index it maps to.
@@ -2290,13 +2396,6 @@ impl Resolver {
             epilogue,
             extras_order,
         );
-
-        if trace {
-            eprintln!(
-                "paired-fuse: rewriting nary {:?} -> paired QMatMul (pair_len={}, extras={})",
-                node_idx, pair_len, extras_count
-            );
-        }
 
         // Rewrite this Nary's variant in place; the produced shape and edges
         // already match the new operation.

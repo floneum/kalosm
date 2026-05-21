@@ -1,6 +1,6 @@
 use fusor_tile_ir::{
     tile, F32Bits, GgmlQuantFormat, KernelBuilder, KernelTensorRef, Layout, MemoryLevel,
-    NagaKernel, Shape, F32,
+    NagaKernel, Shape, F16, F32,
 };
 use fusor_tile_ir_kernels::{
     batched_gemv_with_epilogues, batched_matmul_with_epilogues, flash_attention,
@@ -296,6 +296,31 @@ fn cooperative_dense_f32_matmul_lowers() {
 }
 
 #[test]
+fn cooperative_dense_f16_matmul_lowers() {
+    let ir = tile::build(|program| {
+        let shape = DenseMatmulShape {
+            batch: 2,
+            m: 64,
+            k: 256,
+            n: 64,
+        };
+        let a = program.storage_read::<F16, 2>(Shape::new([shape.batch * shape.m, shape.k]));
+        let b = program.storage_read::<F16, 2>(Shape::new([shape.batch * shape.k, shape.n]));
+        let y = program.storage_write::<F16, 2>(Shape::new([shape.batch * shape.m, shape.n]));
+        assert!(try_batched_coop_matmul::<F16, 64, 64, 16>(
+            program,
+            &a,
+            &b,
+            &y,
+            shape,
+            &DenseMatmulEpilogues::empty(),
+            65_535,
+        ));
+    });
+    lower_or_fail(&ir, "cooperative dense f16 matmul");
+}
+
+#[test]
 fn cooperative_dense_f32_matmul_128x128_lowers() {
     let ir = tile::build(|program| {
         let shape = DenseMatmulShape {
@@ -397,10 +422,11 @@ fn qmatmul_epilogue_fallback_ir(post: Option<&UnaryEpilogue>) -> fusor_tile_ir::
         let epilogues = QmatmulEpilogues {
             pre: None,
             pre_with_extras: None,
-            pre_extra_col_vectors: &[],
+            pre_extra_inputs: &[],
             post,
             post_with_extras: None,
-            post_extra_col_vectors: &[],
+            post_extra_inputs: &[],
+            post_acc_init_col_vector: None,
         };
         qmatmul_with_epilogue::<64, 64, 32>(program, &a, &b, &y, 4, &epilogues);
     })

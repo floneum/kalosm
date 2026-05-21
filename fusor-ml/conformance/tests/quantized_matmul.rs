@@ -4,7 +4,7 @@ use std::mem::size_of;
 
 use common::{matmul2, transpose2};
 use fusor::{Device, QMatrix, Tensor, ToVec2};
-use fusor_conformance::{FuzzGenerator, approx_compare};
+use fusor_conformance::{FuzzGenerator, approx_compare, approx_eq, available_devices};
 use fusor_cpu::{
     BlockQ4_0, BlockQ4K, BlockQ5_0, BlockQ5K, BlockQ6K, BlockQ8_0, ConcreteTensor, GgmlType,
     GgufBlock, QuantizedTensor,
@@ -262,6 +262,9 @@ async fn rmsnorm_post_relu_resolves_to_single_kernel() {
     let Some(gpu_device) = device.as_gpu() else {
         panic!("expected GPU device");
     };
+    if !gpu_device.subgroup_kernels_supported() {
+        return;
+    }
     let cols = 64usize;
     let input_data = vec![vec![0.1f32; cols]; 4];
     let weight_data = vec![1.2f32; cols];
@@ -297,6 +300,9 @@ async fn q4k_qmatmul_pre_relu_resolves_to_single_kernel() {
     let Some(gpu_device) = device.as_gpu() else {
         panic!("expected GPU device");
     };
+    if !gpu_device.subgroup_kernels_supported() {
+        return;
+    }
 
     let weights = qmatrix_from_raw_bytes(&device, weight_shape, &raw_bytes, GgmlType::Q4K);
     let input: Tensor<2, f32> = Tensor::new(&device, &input_data);
@@ -326,6 +332,9 @@ async fn q4k_qmatmul_post_relu_resolves_to_single_kernel() {
     let Some(gpu_device) = device.as_gpu() else {
         panic!("expected GPU device");
     };
+    if gpu_device.requires_host_fallbacks() {
+        return;
+    }
 
     let weights = qmatrix_from_raw_bytes(&device, weight_shape, &raw_bytes, GgmlType::Q4K);
     let input: Tensor<2, f32> = Tensor::new(&device, &input_data);
@@ -342,6 +351,68 @@ async fn q4k_qmatmul_post_relu_resolves_to_single_kernel() {
     );
 }
 
+#[tokio::test]
+async fn q8_0_qmatmul_post_column_add_nonmultiple_applies_epilogue() {
+    let weight_shape = [4, 64];
+    let raw_bytes = q8_0_raw_bytes(weight_shape);
+    let input_shape = [2, weight_shape[1]];
+    let input_data = deterministic_input(&input_shape, 1_031);
+    let bias_data = vec![0.25f32, -0.5, 0.75, -1.0];
+
+    let cpu_weights =
+        qmatrix_from_raw_bytes(&Device::Cpu, weight_shape, &raw_bytes, GgmlType::Q8_0);
+    let cpu_input: Tensor<2, f32> = Tensor::from_slice(&Device::Cpu, input_shape, &input_data);
+    let cpu_bias: Tensor<1, f32> = Tensor::from_slice(&Device::Cpu, [weight_shape[0]], &bias_data);
+    let expected = cpu_input
+        .q_mat_mul(&cpu_weights)
+        .add_(&cpu_bias)
+        .to_concrete();
+
+    for device in available_devices().await {
+        let weights = qmatrix_from_raw_bytes(&device, weight_shape, &raw_bytes, GgmlType::Q8_0);
+        let input: Tensor<2, f32> = Tensor::from_slice(&device, input_shape, &input_data);
+        let bias: Tensor<1, f32> = Tensor::from_slice(&device, [weight_shape[0]], &bias_data);
+        let actual = input.q_mat_mul(&weights).add_(&bias).to_concrete();
+        approx_eq(&actual, &expected, 2.0).await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn q8_0_qmatmul_post_mixed_extras_preserves_binding_order() {
+    let weight_shape = [4, 64];
+    let raw_bytes = q8_0_raw_bytes(weight_shape);
+    let input_shape = [2, weight_shape[1]];
+    let output_shape = [2, weight_shape[0]];
+    let input_data = deterministic_input(&input_shape, 1_047);
+    let residual_data = deterministic_input(&output_shape, 1_211);
+    let bias_data = vec![0.4f32, -0.2, 0.1, -0.6];
+
+    let cpu_weights =
+        qmatrix_from_raw_bytes(&Device::Cpu, weight_shape, &raw_bytes, GgmlType::Q8_0);
+    let cpu_input: Tensor<2, f32> = Tensor::from_slice(&Device::Cpu, input_shape, &input_data);
+    let cpu_residual: Tensor<2, f32> =
+        Tensor::from_slice(&Device::Cpu, output_shape, &residual_data);
+    let cpu_bias: Tensor<1, f32> = Tensor::from_slice(&Device::Cpu, [weight_shape[0]], &bias_data);
+    let cpu_residual_biased = cpu_residual.add_(&cpu_bias);
+    let expected = cpu_input
+        .q_mat_mul(&cpu_weights)
+        .add_(&cpu_residual_biased)
+        .to_concrete();
+
+    for device in available_devices().await {
+        let weights = qmatrix_from_raw_bytes(&device, weight_shape, &raw_bytes, GgmlType::Q8_0);
+        let input: Tensor<2, f32> = Tensor::from_slice(&device, input_shape, &input_data);
+        let residual: Tensor<2, f32> = Tensor::from_slice(&device, output_shape, &residual_data);
+        let bias: Tensor<1, f32> = Tensor::from_slice(&device, [weight_shape[0]], &bias_data);
+        let residual_biased = residual.add_(&bias);
+        let actual = input
+            .q_mat_mul(&weights)
+            .add_(&residual_biased)
+            .to_concrete();
+        approx_eq(&actual, &expected, 2.0).await.unwrap();
+    }
+}
+
 /// Biased FFN pattern: `silu(gate + gate_bias) * (up + up_bias)`.
 /// The fuser detects this as a paired-with-extras pattern (2 matmul views +
 /// 2 broadcast bias vectors) and rewrites it to a single `paired-mode QMatMul`
@@ -355,13 +426,7 @@ async fn q4k_paired_with_bias_resolves_to_single_kernel() {
     let Some(gpu_device) = device.as_gpu() else {
         panic!("expected GPU device");
     };
-    // Paired-mode fusion lowers to a `qgemv_q4k_paired` kernel that uses
-    // `subgroup_*` ops. The resolver refuses to collapse the pattern when
-    // it can't lower onto subgroup intrinsics — Mesa lavapipe (Linux CI)
-    // has no `Features::SUBGROUP` and Microsoft WARP / DX12 (Windows CI)
-    // advertises it but miscompiles the emulation. Skip the fusion-count
-    // assertion on adapters where the resolver legitimately bails.
-    if !gpu_device.subgroups_supported() || gpu_device.is_software_adapter() {
+    if !gpu_device.subgroup_kernels_supported() {
         return;
     }
     let weight_shape = [4, 512];
@@ -404,13 +469,7 @@ async fn q4k_paired_pattern_resolves_to_single_kernel() {
     let Some(gpu_device) = device.as_gpu() else {
         panic!("expected GPU device");
     };
-    // Paired-mode fusion lowers to a `qgemv_q4k_paired` kernel that uses
-    // `subgroup_*` ops. The resolver refuses to collapse the pattern when
-    // it can't lower onto subgroup intrinsics — Mesa lavapipe (Linux CI)
-    // has no `Features::SUBGROUP` and Microsoft WARP / DX12 (Windows CI)
-    // advertises it but miscompiles the emulation. Skip the fusion-count
-    // assertion on adapters where the resolver legitimately bails.
-    if !gpu_device.subgroups_supported() || gpu_device.is_software_adapter() {
+    if !gpu_device.subgroup_kernels_supported() {
         return;
     }
 
@@ -698,21 +757,22 @@ async fn q8_0_dequantize_then_add_matches_cpu_reference() {
 
 #[tokio::test]
 async fn q5_0_q_mat_mul_single_row_splits_large_qgemv_dispatch() {
-    use fusor_conformance::available_devices;
-
     const Q5_0_QGEMV_COLS_PER_WORKGROUP: usize = 8;
+    const QMATMUL_MAX_WORKGROUPS_PER_DIMENSION: usize = 1_024;
 
+    let mut exercised_subgroup_gpu = false;
     for device in available_devices().await {
         let Some(gpu) = device.as_gpu() else {
             continue;
         };
-        if !gpu.subgroups_supported() {
+        if !gpu.subgroup_kernels_supported() {
             continue;
         }
+        exercised_subgroup_gpu = true;
 
-        let output_cols = gpu.limits().max_compute_workgroups_per_dimension as usize
-            * Q5_0_QGEMV_COLS_PER_WORKGROUP
-            + 1;
+        let max_workgroups = (gpu.limits().max_compute_workgroups_per_dimension as usize)
+            .min(QMATMUL_MAX_WORKGROUPS_PER_DIMENSION);
+        let output_cols = max_workgroups * Q5_0_QGEMV_COLS_PER_WORKGROUP + 1;
         let weight_shape = [output_cols, BlockQ5_0::BLOCK_SIZE];
         let raw_bytes =
             vec![0u8; block_count(weight_shape, BlockQ5_0::BLOCK_SIZE) * size_of::<BlockQ5_0>()];
@@ -730,12 +790,9 @@ async fn q5_0_q_mat_mul_single_row_splits_large_qgemv_dispatch() {
         );
     }
 
-    // This regression specifically exercises the `qgemv` dispatch split on a
-    // subgroup-capable GPU. Mesa lavapipe in Linux CI exposes a GPU adapter
-    // without `Features::SUBGROUP`, so there's nothing to exercise there —
-    // skip cleanly rather than asserting a subgroup adapter must be present,
-    // even when `FUSOR_CONFORMANCE_REQUIRE_GPU` is set (which only asserts
-    // *some* GPU is reachable).
+    if !exercised_subgroup_gpu {
+        return;
+    }
 }
 
 fn f32_weight_rows() -> Vec<Vec<f32>> {
@@ -819,7 +876,6 @@ fn deterministic_input(shape: &[usize], seed: u32) -> Vec<f32> {
 
 async fn assert_q_mat_mul_3d_batch(input_rows: usize) {
     use fusor::Device;
-    use fusor_conformance::available_devices;
 
     let weight_shape = [2usize, 64];
     let raw_bytes = q8_0_raw_bytes(weight_shape);
@@ -876,7 +932,6 @@ async fn q_mat_mul_batched_3d_matches_host_reference() {
 #[tokio::test]
 async fn q_mat_mul_transposed_input_matches_host_reference() {
     use fusor::Device;
-    use fusor_conformance::available_devices;
 
     // Build [N, M, B] and transpose(0, 2) -> [B, M, N], matching the deleted
     // `test_fuzz_q_mat_mul_transposed` topology.
@@ -938,8 +993,6 @@ async fn q_mat_mul_batched_matches_unbatched_property() {
     // Batched 3D q_mat_mul produces the same per-batch slice as 2D q_mat_mul
     // applied independently. Replaces
     // `cpu/src/quantized.rs::test_batched_q_mat_mul_matches_unbatched`.
-    use fusor_conformance::available_devices;
-
     let weight_shape = [2usize, 64];
     let raw_bytes = q8_0_raw_bytes(weight_shape);
     let batch = 3;

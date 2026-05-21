@@ -5,14 +5,31 @@ use fusor_tile_ir::{QuantizedMatrix, TileLiteral, TileReduceOp, WorkgroupAxis, F
 
 use crate::{
     kernels::helpers::{
-        coop_load_a_fragments, coop_load_b_fragments, coop_mma_grid, coop_store_acc_grid,
-        zero_coop_acc_grid,
+        coop_load_a_fragments, coop_load_b_fragments, coop_load_c_broadcast_fragments,
+        coop_mma_grid, coop_set_c_grid, coop_store_acc_grid, zero_coop_acc_grid,
     },
     types::{
         apply_qmatmul_post_epilogue, apply_qmatmul_pre_epilogue,
         cooperative_store_layout_supported, matrix_shape,
     },
 };
+
+fn load_qmatmul_extra(
+    program: &mut fusor_tile_ir::tile::TileBlock<'_>,
+    extra: &crate::types::QmatmulExtra<'_>,
+    row: &fusor_tile_ir::tile::Tile<fusor_tile_ir::U32>,
+    col: &fusor_tile_ir::tile::Tile<fusor_tile_ir::U32>,
+    n_cols: u32,
+) -> fusor_tile_ir::tile::Tile<F32> {
+    match extra {
+        crate::types::QmatmulExtra::Column(vector) => {
+            program.load(vector.at(col), col.lt(n_cols), 0.0)
+        }
+        crate::types::QmatmulExtra::Pointwise(tensor) => {
+            program.load(tensor.at((row, col)), col.lt(n_cols), 0.0)
+        }
+    }
+}
 
 /// Top-level quantized matrix multiply with optional activation/output
 /// epilogues. Single-row inputs keep using qgemv; multi-row inputs use the
@@ -78,9 +95,14 @@ pub(crate) fn qmatmul_tile_with_epilogue<const BM: usize, const BN: usize, const
         && epilogues.pre_with_extras.is_none()
         && epilogues.post.is_none()
         && epilogues.post_with_extras.is_none()
-        && qmatmul_try_coop::<BM, BN, BK>(program, a, b, y)
     {
-        return;
+        if let Some(acc_init) = epilogues.post_acc_init_col_vector {
+            if qmatmul_try_coop_acc_init::<BM, BN, BK>(program, a, b, acc_init, y) {
+                return;
+            }
+        } else if qmatmul_try_coop::<BM, BN, BK>(program, a, b, y) {
+            return;
+        }
     }
 
     if BM * BN * BK != LANES || !BK.is_power_of_two() {
@@ -107,9 +129,9 @@ pub(crate) fn qmatmul_tile_with_epilogue<const BM: usize, const BN: usize, const
                     let mask = row.lt(m).and(col.lt(b.cols)).and(k_index.lt(k));
                     let loaded = program.load(a.at((&row, &k_index)), mask.clone(), 0.0);
                     let pre_extras = epilogues
-                        .pre_extra_col_vectors
+                        .pre_extra_inputs
                         .iter()
-                        .map(|extra| program.load(extra.at(&k_index), k_index.lt(k), 0.0))
+                        .map(|extra| load_qmatmul_extra(program, extra, &row, &k_index, k))
                         .collect::<Vec<_>>();
                     let a_value = apply_qmatmul_pre_epilogue(epilogues, loaded, pre_extras);
                     let b_value = program.load_quantized(b, &k_index, &col, mask.clone(), 0.0);
@@ -118,9 +140,9 @@ pub(crate) fn qmatmul_tile_with_epilogue<const BM: usize, const BN: usize, const
             );
             let reduced = program.group_reduce_sum::<BK, _>(partial);
             let extras = epilogues
-                .post_extra_col_vectors
+                .post_extra_inputs
                 .iter()
-                .map(|extra| program.load(extra.at(&col), col.lt(b.cols), 0.0))
+                .map(|extra| load_qmatmul_extra(program, extra, &row, &col, b.cols))
                 .collect::<Vec<_>>();
             let sum = apply_qmatmul_post_epilogue(epilogues, reduced, extras);
             let store_mask = k_lane.eq(0).and(row.lt(m)).and(col.lt(b.cols));
@@ -148,10 +170,38 @@ pub(crate) fn qmatmul_try_coop<const BM: usize, const BN: usize, const BK: usize
         return false;
     }
     match (BM, BN) {
+        (64, 32) => qmatmul_perf::<64, 32, 32, 2, 1, 64>(program, a, b, y),
         (64, 64) => qmatmul_perf::<64, 64, 32, 2, 2, 128>(program, a, b, y),
         (64, 128) => qmatmul_perf::<64, 128, 32, 2, 4, 256>(program, a, b, y),
         (128, 64) => qmatmul_perf::<128, 64, 32, 4, 2, 256>(program, a, b, y),
         (128, 128) => qmatmul_perf::<128, 128, 32, 4, 4, 512>(program, a, b, y),
+        _ => return false,
+    }
+    true
+}
+
+pub(crate) fn qmatmul_try_coop_acc_init<const BM: usize, const BN: usize, const BK: usize>(
+    program: &mut Program,
+    a: &Storage<F32, 2>,
+    b: &QuantizedMatrix,
+    acc_init: &Storage<F32, 1>,
+    y: &Storage<F32, 2>,
+) -> bool {
+    let [m, k] = matrix_shape(&a.view().layout);
+    if BK != 32
+        || !(m as usize).is_multiple_of(BM)
+        || !(b.cols as usize).is_multiple_of(BN)
+        || !(k as usize).is_multiple_of(BK)
+        || !cooperative_store_layout_supported(&y.view().layout)
+    {
+        return false;
+    }
+    match (BM, BN) {
+        (64, 32) => qmatmul_perf_acc_init::<64, 32, 32, 2, 1, 64>(program, a, b, acc_init, y),
+        (64, 64) => qmatmul_perf_acc_init::<64, 64, 32, 2, 2, 128>(program, a, b, acc_init, y),
+        (64, 128) => qmatmul_perf_acc_init::<64, 128, 32, 2, 4, 256>(program, a, b, acc_init, y),
+        (128, 64) => qmatmul_perf_acc_init::<128, 64, 32, 4, 2, 256>(program, a, b, acc_init, y),
+        (128, 128) => qmatmul_perf_acc_init::<128, 128, 32, 4, 4, 512>(program, a, b, acc_init, y),
         _ => return false,
     }
     true
@@ -207,6 +257,93 @@ pub(crate) fn qmatmul_perf<
         let sg_col_base = sg_col * SUBGROUP_COLS;
 
         let accs = zero_coop_acc_grid(program, TILE_ROWS_PER_SG, TILE_COLS_PER_SG);
+
+        program.while_true(k_iterations, |program, loop_index| {
+            let k_base = loop_index * BK as u32;
+            program.copy_storage_to_tile(a_tile, a_clone, &row_base, &k_base);
+            program.copy_quant_to_tile(b_tile, &b_clone, &k_base, &col_base);
+            program.workgroup_barrier();
+
+            let kk_steps = (BK as u32) / COOP_DIM;
+            for kk in 0..kk_steps {
+                let a_frags =
+                    coop_load_a_fragments(program, a_tile, &sg_row_base, kk, TILE_ROWS_PER_SG);
+                let b_frags =
+                    coop_load_b_fragments(program, b_tile, &sg_col_base, kk, TILE_COLS_PER_SG);
+                coop_mma_grid(program, &accs, &a_frags, &b_frags);
+            }
+            program.workgroup_barrier();
+        });
+
+        coop_store_acc_grid(
+            program,
+            &accs,
+            y_clone,
+            None,
+            &row_base,
+            &col_base,
+            &sg_row_base,
+            &sg_col_base,
+        );
+    });
+}
+
+pub(crate) fn qmatmul_perf_acc_init<
+    const BM: usize,
+    const BN: usize,
+    const BK: usize,
+    const ROW_GROUPS: u32,
+    const COL_GROUPS: u32,
+    const BLOCK: usize,
+>(
+    program: &mut Program,
+    a: &Storage<F32, 2>,
+    b: &QuantizedMatrix,
+    acc_init: &Storage<F32, 1>,
+    y: &Storage<F32, 2>,
+) {
+    const COOP_DIM: u32 = 8;
+    const SUBGROUP_SIZE: u32 = 32;
+    const SUBGROUP_ROWS: u32 = 32;
+    const SUBGROUP_COLS: u32 = 32;
+    debug_assert_eq!(ROW_GROUPS * SUBGROUP_ROWS, BM as u32);
+    debug_assert_eq!(COL_GROUPS * SUBGROUP_COLS, BN as u32);
+    debug_assert_eq!(ROW_GROUPS * COL_GROUPS * SUBGROUP_SIZE, BLOCK as u32);
+
+    let [m, k] = matrix_shape(&a.view().layout);
+    let n = b.cols;
+    let n_grid_x = n / BN as u32;
+    let n_grid_y = m / BM as u32;
+    let k_iterations = k / BK as u32;
+
+    let a_tile = program.alloc_workgroup_tile_f32(BM as u32, BK as u32);
+    let b_tile = program.alloc_workgroup_tile_f32(BK as u32, BN as u32);
+    let b_clone = b.clone();
+    let a_clone = a;
+    let acc_init_clone = acc_init;
+    let y_clone = y;
+
+    const TILE_ROWS_PER_SG: u32 = SUBGROUP_ROWS / 8;
+    const TILE_COLS_PER_SG: u32 = SUBGROUP_COLS / 8;
+
+    program.program_grid::<BLOCK>([n_grid_x, n_grid_y, 1], |program| {
+        let row_base = program.program_id(WorkgroupAxis::Y) * BM as u32;
+        let col_base = program.program_id(WorkgroupAxis::X) * BN as u32;
+        let subgroup_id = program.subgroup_id();
+        let sg_row = subgroup_id.clone() / COL_GROUPS;
+        let sg_col = subgroup_id % COL_GROUPS;
+        let sg_row_base = sg_row * SUBGROUP_ROWS;
+        let sg_col_base = sg_col * SUBGROUP_COLS;
+
+        let accs = zero_coop_acc_grid(program, TILE_ROWS_PER_SG, TILE_COLS_PER_SG);
+        let acc_init_col_base = col_base.clone() + sg_col_base.clone();
+        let c_frags = coop_load_c_broadcast_fragments(
+            program,
+            acc_init_clone,
+            &acc_init_col_base,
+            TILE_COLS_PER_SG,
+        );
+        coop_set_c_grid(program, &accs, &c_frags);
 
         program.while_true(k_iterations, |program, loop_index| {
             let k_base = loop_index * BK as u32;

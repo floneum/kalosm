@@ -43,9 +43,7 @@ where
         match device {
             Device::Cpu => Tensor::Cpu(fusor_cpu::Tensor::from_slice(shape, data)),
             Device::Gpu(gpu_device) => {
-                // Create 1D tensor then reshape to desired shape
-                let t1d: fusor_core::Tensor<1, D> = fusor_core::Tensor::new(gpu_device, data);
-                Tensor::Gpu(t1d.reshape(shape))
+                Tensor::Gpu(fusor_core::Tensor::from_slice(gpu_device, shape, data))
             }
         }
     }

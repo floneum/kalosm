@@ -7,7 +7,7 @@ edition = "2024"
 
 [dependencies]
 # Use stable when https://github.com/gfx-rs/wgpu/issues/7712 is resolved
-wgpu = { git = "https://github.com/ealmloff/wgpu", branch = "yield-now", features = ["naga-ir", "static-dxc"] }
+wgpu = { git = "https://github.com/ealmloff/wgpu", branch = "yield-now", features = ["naga-ir", "static-dxc", "vulkan-portability"] }
 env_logger = "0.10.1"
 bytemuck = { version = "1.14", features = ["derive"] }
 futures-util = "0.3.31"

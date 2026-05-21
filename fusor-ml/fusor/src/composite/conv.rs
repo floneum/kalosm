@@ -86,6 +86,14 @@ where
         crate::AddOp: fusor_cpu::SimdBinaryOp<D>,
         fusor_cpu::SumOp: fusor_cpu::SimdReduceOp<D>,
     {
+        if matches!(&self.device(), crate::Device::Gpu(device) if device.requires_host_fallbacks())
+        {
+            let input = tensor_to_cpu(self);
+            let weight = tensor_to_cpu(weight);
+            let bias = bias.map(tensor_to_cpu);
+            return input.conv(&weight, bias.as_ref(), padding, strides);
+        }
+
         // Extract dimensions
         let input_shape = self.shape();
         let weight_shape = weight.shape();
@@ -195,6 +203,31 @@ where
             output_final.add_(&bias_broadcast)
         } else {
             output_final.to_concrete()
+        }
+    }
+}
+
+fn tensor_to_cpu<const R: usize, D>(tensor: &Tensor<R, D>) -> Tensor<R, D>
+where
+    D: SimdElement + DataType + Copy,
+{
+    match tensor {
+        Tensor::Cpu(tensor) => Tensor::Cpu(tensor.clone()),
+        Tensor::Gpu(tensor) => {
+            let shape = *tensor.shape();
+            let slice = pollster::block_on(tensor.as_slice()).expect("failed to read tensor");
+            let total = shape.iter().product();
+            let mut values = Vec::with_capacity(total);
+            for flat in 0..total {
+                let mut index = [0usize; R];
+                let mut rem = flat;
+                for axis in (0..R).rev() {
+                    index[axis] = rem % shape[axis];
+                    rem /= shape[axis];
+                }
+                values.push(slice[index]);
+            }
+            Tensor::Cpu(fusor_cpu::Tensor::from_slice(shape, &values))
         }
     }
 }

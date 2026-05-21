@@ -52,6 +52,9 @@ impl ResizeOperation {
 
         let input = graph.get_cached_result(self.input)?;
         let input_layout = input.layout();
+        if !is_row_major_contiguous(input_layout) {
+            return None;
+        }
 
         // Find the chunks of strides that are contiguous in the input
         let mut contiguous_stride_chunks = Vec::new();
@@ -107,6 +110,17 @@ impl ResizeOperation {
         let input_indices = row_major_indices_from_flat(flat, &self.current_shape)?;
         Some(NaryExpr::indexed_input(0, input_indices))
     }
+}
+
+fn is_row_major_contiguous(layout: &Layout) -> bool {
+    let mut expected_stride = 1usize;
+    for (dim, stride) in layout.shape().iter().zip(layout.strides()).rev() {
+        if *dim > 1 && *stride != expected_stride {
+            return false;
+        }
+        expected_stride = expected_stride.saturating_mul(*dim);
+    }
+    true
 }
 
 impl Operation for ResizeOperation {
@@ -206,6 +220,85 @@ impl Operation for ResizeOperation {
                 .join("x")
         )
     }
+
+    fn as_resize(&self) -> Option<&ResizeOperation> {
+        Some(self)
+    }
+}
+
+pub(crate) fn resolve_resize_on_host(
+    operation: &ResizeOperation,
+    inputs: &[MirValue],
+) -> Option<TensorData> {
+    let input = inputs.first()?.as_tensor()?;
+    match input.datatype() {
+        DataTypeEnum::F32 => resolve_resize_on_host_typed::<f32>(operation, input),
+        DataTypeEnum::F16 => resolve_resize_on_host_typed::<half::f16>(operation, input),
+        DataTypeEnum::U32 => resolve_resize_on_host_typed::<u32>(operation, input),
+    }
+}
+
+fn resolve_resize_on_host_typed<D: crate::DataType>(
+    operation: &ResizeOperation,
+    input: &TensorData,
+) -> Option<TensorData> {
+    let input_values = input.to_host_vec::<D>();
+    let mut output = vec![D::zero(); operation.new_shape.iter().product()];
+    if operation.current_shape.iter().product::<usize>() == output.len()
+        && operation.fill_shape == operation.new_shape
+    {
+        output.copy_from_slice(&input_values);
+        return Some(TensorData::from_host_slice(
+            input.device(),
+            &operation.new_shape,
+            &output,
+        ));
+    }
+
+    let fill_total = operation.fill_shape.iter().product::<usize>();
+    for flat in 0..fill_total {
+        let (input_flat, output_flat) = row_major_flats_from_fill_flat(
+            flat,
+            &operation.fill_shape,
+            &operation.current_shape,
+            &operation.new_shape,
+        )?;
+        output[output_flat] = *input_values.get(input_flat)?;
+    }
+    Some(TensorData::from_host_slice(
+        input.device(),
+        &operation.new_shape,
+        &output,
+    ))
+}
+
+fn row_major_flats_from_fill_flat(
+    flat: usize,
+    fill_shape: &[usize],
+    input_shape: &[usize],
+    output_shape: &[usize],
+) -> Option<(usize, usize)> {
+    if fill_shape.len() != input_shape.len() || fill_shape.len() != output_shape.len() {
+        return None;
+    }
+    let mut input_flat = 0usize;
+    let mut output_flat = 0usize;
+    for axis in 0..fill_shape.len() {
+        let divisor = fill_shape[axis + 1..].iter().product::<usize>();
+        let coord = if fill_shape[axis] == 1 {
+            0
+        } else {
+            (flat / divisor) % fill_shape[axis]
+        };
+        if coord >= input_shape[axis] {
+            return None;
+        }
+        let input_stride = input_shape[axis + 1..].iter().product::<usize>();
+        let output_stride = output_shape[axis + 1..].iter().product::<usize>();
+        input_flat += coord * input_stride;
+        output_flat += coord * output_stride;
+    }
+    Some((input_flat, output_flat))
 }
 
 fn row_major_flat_expr(shape: &[usize]) -> Option<NaryExpr> {

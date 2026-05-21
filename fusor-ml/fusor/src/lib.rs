@@ -1213,7 +1213,17 @@ where
                         n
                     }
                 });
-                let weight_broadcast = weight_t.reshape(weight_shape);
+                let target_shape: [usize; R] = std::array::from_fn(|i| {
+                    if i < R - 2 {
+                        self.shape()[i]
+                    } else if i == R - 2 {
+                        k
+                    } else {
+                        n
+                    }
+                });
+                let weight_reshaped = weight_t.reshape(weight_shape);
+                let weight_broadcast = weight_reshaped.broadcast_as(target_shape);
                 self.mat_mul(&weight_broadcast)
             }
 

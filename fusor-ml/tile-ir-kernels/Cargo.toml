@@ -17,4 +17,4 @@ half = "2.4.1"
 [dev-dependencies]
 naga = { git = "https://github.com/ealmloff/wgpu", branch = "yield-now", package = "naga" }
 pollster = "0.4.0"
-wgpu = { git = "https://github.com/ealmloff/wgpu", branch = "yield-now", features = ["naga-ir", "static-dxc"] }
+wgpu = { git = "https://github.com/ealmloff/wgpu", branch = "yield-now", features = ["naga-ir", "static-dxc", "vulkan-portability"] }

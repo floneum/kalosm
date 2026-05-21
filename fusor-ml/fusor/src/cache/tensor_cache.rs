@@ -17,6 +17,7 @@ pub struct TensorCache<const R: usize, D: SimdElement> {
 impl<const R: usize, D: SimdElement + DataType + Default> TensorCache<R, D>
 where
     crate::AddOp: fusor_cpu::SimdBinaryOp<D>,
+    D: Copy,
 {
     /// Create a new cache with the given concatenation dimension
     pub fn new(concat_dim: usize, max_sequence_len: usize) -> Self {
@@ -53,6 +54,25 @@ where
 
         // If the required size is larger than the max sequence length, cut the start of the cache.
         if required_seq_len > self.max_sequence_len {
+            if matches!(device, Device::Gpu(gpu) if gpu.requires_host_fallbacks())
+                && let Some(cached) = &self.all_data
+            {
+                let all_data =
+                    Self::append_on_host(device, cached, v, self.concat_dim, self.current_seq_len);
+                let all_data_len = all_data.shape()[self.concat_dim];
+                self.all_data = Some(
+                    all_data
+                        .narrow(
+                            self.concat_dim,
+                            all_data_len - self.max_sequence_len,
+                            self.max_sequence_len,
+                        )
+                        .to_concrete(),
+                );
+                self.current_seq_len = self.max_sequence_len;
+                self.allocated_seq_len = self.max_sequence_len;
+                return self.all_data.clone().unwrap();
+            }
             let max_seq_len = self.max_sequence_len;
             let new_start = required_seq_len - max_seq_len;
             let mut tensors = Vec::new();
@@ -78,6 +98,14 @@ where
         }
 
         if let Some(cached) = &mut self.all_data {
+            if matches!(device, Device::Gpu(gpu) if gpu.requires_host_fallbacks()) {
+                let all_data =
+                    Self::append_on_host(device, cached, v, self.concat_dim, self.current_seq_len);
+                self.all_data = Some(all_data);
+                self.current_seq_len = required_seq_len;
+                self.allocated_seq_len = required_seq_len;
+                return self.all_data.clone().unwrap();
+            }
             // Check if we need to grow the allocation
             if required_seq_len > self.allocated_seq_len {
                 // Double the allocation until it's large enough
@@ -103,7 +131,9 @@ where
                 }
             });
             *cached = match (&*cached, v) {
-                (Tensor::Gpu(cached), Tensor::Gpu(v)) => {
+                (Tensor::Gpu(cached), Tensor::Gpu(v))
+                    if !cached.device().requires_host_fallbacks() =>
+                {
                     Tensor::Gpu(cached.slice_assign_in_place(slice, v))
                 }
                 _ => cached.slice_assign(slice, v),
@@ -180,5 +210,81 @@ where
     /// Get the current sequence length
     pub fn current_seq_len(&self) -> usize {
         self.current_seq_len
+    }
+
+    fn tensor_to_vec(tensor: &Tensor<R, D>) -> Vec<D> {
+        match tensor {
+            Tensor::Cpu(tensor) => {
+                let slice = tensor.as_slice();
+                let shape = tensor.shape();
+                let total = shape.iter().product();
+                (0..total)
+                    .map(|flat| {
+                        let index = Self::coords_from_flat(flat, &shape);
+                        slice[index]
+                    })
+                    .collect()
+            }
+            Tensor::Gpu(tensor) => {
+                let slice = pollster::block_on(tensor.as_slice()).expect("failed to read tensor");
+                let shape = tensor.shape();
+                let total = shape.iter().product();
+                (0..total)
+                    .map(|flat| {
+                        let index = Self::coords_from_flat(flat, shape);
+                        slice[index]
+                    })
+                    .collect()
+            }
+        }
+    }
+
+    fn coords_from_flat(mut flat: usize, shape: &[usize]) -> [usize; R] {
+        let mut coords = [0; R];
+        for axis in (0..R).rev() {
+            coords[axis] = flat % shape[axis];
+            flat /= shape[axis];
+        }
+        coords
+    }
+
+    fn flat_from_coords(coords: &[usize; R], shape: &[usize]) -> usize {
+        let mut flat = 0;
+        for axis in 0..R {
+            flat = flat * shape[axis] + coords[axis];
+        }
+        flat
+    }
+
+    fn append_on_host(
+        device: &Device,
+        cached: &Tensor<R, D>,
+        v: &Tensor<R, D>,
+        concat_dim: usize,
+        current_seq_len: usize,
+    ) -> Tensor<R, D> {
+        let cached_shape = cached.shape();
+        let v_shape = v.shape();
+        let mut out_shape = v_shape;
+        out_shape[concat_dim] = current_seq_len + v_shape[concat_dim];
+        let cached_values = Self::tensor_to_vec(cached);
+        let v_values = Self::tensor_to_vec(v);
+        let total = out_shape.iter().product();
+        let mut out = Vec::with_capacity(total);
+        for flat in 0..total {
+            let mut coords = Self::coords_from_flat(flat, &out_shape);
+            if coords[concat_dim] < current_seq_len {
+                out.push(cached_values[Self::flat_from_coords(&coords, &cached_shape)]);
+            } else {
+                coords[concat_dim] -= current_seq_len;
+                out.push(v_values[Self::flat_from_coords(&coords, &v_shape)]);
+            }
+        }
+        match device {
+            Device::Gpu(gpu) if gpu.requires_host_fallbacks() => {
+                Tensor::Cpu(fusor_cpu::Tensor::from_slice(out_shape, &out))
+            }
+            _ => Tensor::from_slice(device, out_shape, &out),
+        }
     }
 }

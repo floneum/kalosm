@@ -29,7 +29,8 @@ where
         + std::ops::Add<Output = D>
         + std::ops::Sub<Output = D>
         + std::ops::Mul<Output = D>
-        + std::ops::Div<Output = D>,
+        + std::ops::Div<Output = D>
+        + Copy,
     AddOp: SimdBinaryOp<D>,
     SubOp: SimdBinaryOp<D>,
     MulOp: SimdBinaryOp<D>,
@@ -61,6 +62,20 @@ where
             (Tensor::Gpu(q), Tensor::Gpu(k), Tensor::Gpu(v))
                 if !matches!(mask, Some((_, MaskKind::BatchKeyMask))) =>
             {
+                if !q.device().subgroup_kernels_supported() {
+                    let cpu_q = tensor4_to_cpu(q);
+                    let cpu_k = tensor4_to_cpu(k);
+                    let cpu_v = tensor4_to_cpu(v);
+                    let cpu_mask = mask.map(|(m, kind)| {
+                        let Tensor::Gpu(mask) = m else {
+                            panic!("Mask must be on the same device as other tensors");
+                        };
+                        (tensor2_to_cpu(mask), kind)
+                    });
+                    let cpu_mask_ref = cpu_mask.as_ref().map(|(mask, kind)| (mask, *kind));
+                    let cpu_output = cpu_q.flash_attention(&cpu_k, &cpu_v, scale, cpu_mask_ref);
+                    return tensor4_to_gpu(cpu_output, q.device());
+                }
                 let gpu_mask = mask.map(|(m, _kind)| match m {
                     Tensor::Gpu(mask) => mask,
                     _ => panic!("Mask must be on the same device as other tensors"),
@@ -198,4 +213,60 @@ where
         // attn_weights @ V -> [batch, num_heads, q_seq_len, head_dim]
         attn_weights.mat_mul(&v_expanded)
     }
+}
+
+fn tensor4_to_cpu<D>(tensor: &fusor_core::Tensor<4, D>) -> Tensor<4, D>
+where
+    D: SimdElement + DataType + Copy,
+{
+    let shape = *tensor.shape();
+    let slice = pollster::block_on(tensor.as_slice()).expect("failed to read tensor");
+    let mut values = Vec::with_capacity(shape.iter().product());
+    for b in 0..shape[0] {
+        for h in 0..shape[1] {
+            for s in 0..shape[2] {
+                for d in 0..shape[3] {
+                    values.push(slice[[b, h, s, d]]);
+                }
+            }
+        }
+    }
+    Tensor::Cpu(fusor_cpu::Tensor::from_slice(shape, &values))
+}
+
+fn tensor4_to_gpu<D>(tensor: Tensor<4, D>, device: &fusor_core::Device) -> Tensor<4, D>
+where
+    D: SimdElement + DataType + Copy,
+{
+    let Tensor::Cpu(tensor) = tensor else {
+        unreachable!("subgroup fallback should produce a CPU tensor");
+    };
+    let shape = tensor.shape();
+    let slice = tensor.as_slice();
+    let mut values = Vec::with_capacity(shape.iter().product());
+    for b in 0..shape[0] {
+        for h in 0..shape[1] {
+            for s in 0..shape[2] {
+                for d in 0..shape[3] {
+                    values.push(slice[[b, h, s, d]]);
+                }
+            }
+        }
+    }
+    Tensor::Gpu(fusor_core::Tensor::from_slice(device, shape, &values))
+}
+
+fn tensor2_to_cpu<D>(tensor: &fusor_core::Tensor<2, D>) -> Tensor<2, D>
+where
+    D: SimdElement + DataType + Copy,
+{
+    let shape = *tensor.shape();
+    let slice = pollster::block_on(tensor.as_slice()).expect("failed to read tensor");
+    let mut values = Vec::with_capacity(shape.iter().product());
+    for row in 0..shape[0] {
+        for col in 0..shape[1] {
+            values.push(slice[[row, col]]);
+        }
+    }
+    Tensor::Cpu(fusor_cpu::Tensor::from_slice(shape, &values))
 }

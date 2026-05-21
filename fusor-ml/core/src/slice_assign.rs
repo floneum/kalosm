@@ -235,6 +235,72 @@ impl Operation for SliceAssignOperation {
                 .join("_")
         )
     }
+
+    fn as_slice_assign(&self) -> Option<&SliceAssignOperation> {
+        Some(self)
+    }
+}
+
+pub(crate) fn resolve_slice_assign_on_host(
+    operation: &SliceAssignOperation,
+    inputs: &[MirValue],
+) -> Option<TensorData> {
+    let input = inputs.first()?.as_tensor()?;
+    match input.datatype() {
+        DataTypeEnum::F32 => resolve_slice_assign_on_host_typed::<f32>(operation, inputs),
+        DataTypeEnum::F16 => resolve_slice_assign_on_host_typed::<half::f16>(operation, inputs),
+        DataTypeEnum::U32 => resolve_slice_assign_on_host_typed::<u32>(operation, inputs),
+    }
+}
+
+fn resolve_slice_assign_on_host_typed<D: crate::DataType>(
+    operation: &SliceAssignOperation,
+    inputs: &[MirValue],
+) -> Option<TensorData> {
+    let input = inputs.first()?.as_tensor()?;
+    let value = inputs.get(1)?.as_tensor()?;
+    let input_values = input.to_host_vec::<D>();
+    let value_values = value.to_host_vec::<D>();
+    let mut output = input_values;
+    let value_shape = operation.value_shape();
+    let total = value_shape.iter().product::<usize>();
+    for flat in 0..total {
+        let coords = row_major_coords(flat, &value_shape);
+        let value_flat = row_major_flat(&coords, &value_shape);
+        let output_coords = coords
+            .iter()
+            .enumerate()
+            .map(|(axis, coord)| coord + operation.slices[axis].start)
+            .collect::<Vec<_>>();
+        let output_flat = row_major_flat(&output_coords, &operation.input_shape);
+        output[output_flat] = value_values[value_flat];
+    }
+    Some(TensorData::from_host_slice(
+        input.device(),
+        &operation.input_shape,
+        &output,
+    ))
+}
+
+fn row_major_coords(flat: usize, shape: &[usize]) -> Vec<usize> {
+    (0..shape.len())
+        .map(|axis| {
+            let divisor = shape[axis + 1..].iter().product::<usize>();
+            if shape[axis] == 1 {
+                0
+            } else {
+                (flat / divisor) % shape[axis]
+            }
+        })
+        .collect()
+}
+
+fn row_major_flat(coords: &[usize], shape: &[usize]) -> usize {
+    coords
+        .iter()
+        .enumerate()
+        .map(|(axis, coord)| coord * shape[axis + 1..].iter().product::<usize>())
+        .sum()
 }
 
 impl<const R: usize, T: crate::DataType> Tensor<R, T> {

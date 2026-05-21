@@ -2,7 +2,7 @@ mod common;
 
 use common::{conv1d_ncw, matmul2, pool1d_ncw};
 use fusor::{Device, Tensor};
-use fusor_conformance::{FuzzGenerator, approx_compare};
+use fusor_conformance::{FuzzGenerator, approx_compare, available_devices, f16_capable_devices};
 use rand::distr::Uniform;
 
 #[tokio::test]
@@ -271,7 +271,6 @@ fn flatten5(v: &[Vec<Vec<Vec<Vec<f32>>>>]) -> Vec<f32> {
 
 #[tokio::test]
 async fn conv2d_matches_host_reference() {
-    use fusor_conformance::available_devices;
     const BATCH: usize = 1;
     const IN_CH: usize = 3;
     const OUT_CH: usize = 4;
@@ -313,7 +312,6 @@ async fn conv2d_matches_host_reference() {
 
 #[tokio::test]
 async fn conv3d_matches_host_reference() {
-    use fusor_conformance::available_devices;
     const BATCH: usize = 1;
     const IN_CH: usize = 2;
     const OUT_CH: usize = 2;
@@ -420,7 +418,6 @@ async fn matmul_attention_4d_matches_host_reference() {
     // for the deleted `fusor/src/lib.rs::test_matmul_cpu_vs_gpu`. Smaller than
     // the original [1, 8, 100, 64] to keep CI fast — the original was a
     // float-precision smoke test, not a timing regression.
-    use fusor_conformance::available_devices;
     const SHAPE: [usize; 4] = [1, 2, 16, 16];
 
     fn data(seed: u32) -> Vec<f32> {
@@ -580,7 +577,6 @@ async fn f16_matmul_coop_tile_matches_host_reference() {
     // smallest coop tile (Tile64x64, BK=16). Without f16 coop support this
     // would fall back to `batched_matmul_with_epilogues<F16, ...>`; with it,
     // dispatch lands on `try_batched_coop_matmul::<F16, 64, 64, 16>`.
-    use fusor_conformance::f16_capable_devices;
     use half::f16;
 
     const M: usize = 64;
@@ -621,7 +617,6 @@ async fn f16_matmul_multi_tile_matches_host_reference() {
     // route to the shared-tile kernel. Multi-tile in M and N is needed so
     // the per-lane offsets that leaked into the cooperative load actually
     // shift global_row/global_col away from the workgroup tile base.
-    use fusor_conformance::f16_capable_devices;
     use half::f16;
 
     const M: usize = 64;

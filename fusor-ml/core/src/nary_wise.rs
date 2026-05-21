@@ -674,62 +674,16 @@ impl Operation for NaryOperation {
             })
             .collect();
 
-        // Check if we can reuse an input allocation for output
-        // We can only reuse if:
-        // 1. The input matches datatype, is owned, and doesn't overlap
-        // 2. The input is NOT accessed with custom indexing (which would cause read/write races)
-        let reuse_index = mir_inputs.iter().enumerate().find_map(|(i, input)| {
-            // Don't reuse if this input is accessed with custom indexing
-            if self.expression.uses_custom_indexing_for_input(i) {
-                return None;
-            }
-            if let Ok(data) = std::convert::TryInto::<MaybeQData>::try_into(input.clone())
-                && data.datatype() == self.output_datatype.into()
-                && data.owned()
-                && !data.layout().allocation_overlaps()
-            {
-                return Some(i);
-            }
-            None
-        });
-
-        if reuse_index.is_none() {
-            // Need to allocate a new output tensor
-            let first_input: MaybeQData = mir_inputs[0].clone().try_into().unwrap();
-            let output_tensor =
-                TensorData::new_for_shape(first_input.device(), &self.shape, self.output_datatype);
-            mir_inputs.push(output_tensor.into());
-        }
+        let first_input: MaybeQData = mir_inputs[0].clone().try_into().unwrap();
+        let output_tensor =
+            TensorData::new_for_shape(first_input.device(), &self.shape, self.output_datatype);
+        mir_inputs.push(output_tensor.into());
 
         mir_inputs
     }
 
     fn output(&self, _nodes: &ComputeGraphInner, inputs: &[MirValue]) -> MirValue {
-        // Check if we reused an input allocation
-        let reuse_index = inputs[..self.inputs.len()]
-            .iter()
-            .enumerate()
-            .find_map(|(i, input)| {
-                // Don't reuse if this input is accessed with custom indexing
-                if self.expression.uses_custom_indexing_for_input(i) {
-                    return None;
-                }
-                if let Ok(data) = std::convert::TryInto::<MaybeQData>::try_into(input.clone())
-                    && data.datatype() == self.output_datatype.into()
-                    && data.owned()
-                    && !data.layout().allocation_overlaps()
-                {
-                    return Some(i);
-                }
-                None
-            });
-
-        if let Some(idx) = reuse_index {
-            inputs[idx].clone()
-        } else {
-            // Output is the last input (newly allocated)
-            inputs.last().unwrap().clone()
-        }
+        inputs.last().unwrap().clone()
     }
 
     fn build_direct_kernel(
@@ -755,5 +709,9 @@ impl Operation for NaryOperation {
                 .collect::<Vec<_>>()
                 .join("x")
         )
+    }
+
+    fn as_nary(&self) -> Option<&NaryOperation> {
+        Some(self)
     }
 }

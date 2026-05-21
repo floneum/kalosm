@@ -21,6 +21,8 @@ pub enum CoopRole {
     A,
     /// Load a B operand fragment.
     B,
+    /// Load a C/accumulator operand fragment.
+    C,
 }
 
 impl From<CoopRole> for CoopOperandRole {
@@ -28,6 +30,7 @@ impl From<CoopRole> for CoopOperandRole {
         match value {
             CoopRole::A => Self::A,
             CoopRole::B => Self::B,
+            CoopRole::C => Self::C,
         }
     }
 }
@@ -184,9 +187,41 @@ impl TileBlock<'_> {
         }
     }
 
+    /// Cooperatively load a rank-1 vector slice as a C-role fragment,
+    /// broadcasting the selected columns across all rows.
+    pub fn coop_load_broadcast_cols<T: CoopElement, const ROWS: usize, const COLS: usize>(
+        &mut self,
+        src: &Storage<T, 1>,
+        col: impl Into<Tile<U32>>,
+    ) -> CoopFragment<T, ROWS, COLS> {
+        assert!(
+            ROWS == 8 || ROWS == 16,
+            "cooperative-matrix rows must be 8 or 16"
+        );
+        assert!(
+            COLS == 8 || COLS == 16,
+            "cooperative-matrix columns must be 8 or 16"
+        );
+        let id = self.program.next_coop_fragment_id();
+        self.push_stmt(TileStmt::LoadCoopBroadcast {
+            id,
+            role: CoopOperandRole::C,
+            scalar: T::SCALAR,
+            rows: ROWS as u32,
+            cols: COLS as u32,
+            src: src.view.clone(),
+            col: boxed_index(col),
+        });
+        CoopFragment {
+            id,
+            role: CoopOperandRole::C,
+            _ty: PhantomData,
+        }
+    }
+
     /// `acc += a * b` where `a`/`b` are fragments previously loaded with the
     /// same scalar and cooperative shape.
-    pub fn coop_mma<T, const ROWS: usize, const COLS: usize>(
+    pub fn coop_mma<T: CoopElement, const ROWS: usize, const COLS: usize>(
         &mut self,
         acc: &CoopAcc<T, ROWS, COLS>,
         a: &CoopFragment<T, ROWS, COLS>,
@@ -206,6 +241,23 @@ impl TileBlock<'_> {
             acc: acc.local,
             a: a.id,
             b: b.id,
+        });
+    }
+
+    /// Initialize `acc` from a C-role cooperative fragment.
+    pub fn coop_set_acc<T, const ROWS: usize, const COLS: usize>(
+        &mut self,
+        acc: &CoopAcc<T, ROWS, COLS>,
+        c: &CoopFragment<T, ROWS, COLS>,
+    ) {
+        assert_eq!(
+            c.role,
+            CoopOperandRole::C,
+            "coop_set_acc operand must be a C-role fragment"
+        );
+        self.push_stmt(TileStmt::SetCoopAcc {
+            acc: acc.local,
+            c: c.id,
         });
     }
 

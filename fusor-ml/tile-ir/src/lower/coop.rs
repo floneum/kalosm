@@ -1,5 +1,5 @@
 use super::*;
-use crate::lower::tile_program::{CoopFragmentLoad, TileFoldLowering};
+use crate::lower::tile_program::{CoopBroadcastLoad, CoopFragmentLoad, TileFoldLowering};
 use naga::{Barrier, CooperativeData, CooperativeRole};
 
 impl<'a> Lowerer<'a> {
@@ -171,6 +171,33 @@ impl<'a> Lowerer<'a> {
                     role: match role {
                         CoopOperandRole::A => CooperativeRole::A,
                         CoopOperandRole::B => CooperativeRole::B,
+                        CoopOperandRole::C => CooperativeRole::C,
+                    },
+                    scalar: *scalar,
+                    rows: *rows,
+                    cols: *cols,
+                },
+            ),
+            TileStmt::LoadCoopBroadcast {
+                id,
+                role,
+                src,
+                col,
+                scalar,
+                rows,
+                cols,
+            } => self.lower_load_coop_broadcast(
+                expressions,
+                scratch,
+                body,
+                CoopBroadcastLoad {
+                    id: *id,
+                    src,
+                    col,
+                    role: match role {
+                        CoopOperandRole::A => CooperativeRole::A,
+                        CoopOperandRole::B => CooperativeRole::B,
+                        CoopOperandRole::C => CooperativeRole::C,
                     },
                     scalar: *scalar,
                     rows: *rows,
@@ -178,6 +205,7 @@ impl<'a> Lowerer<'a> {
                 },
             ),
             TileStmt::Mma { acc, a, b } => self.lower_coop_mma(expressions, body, *acc, *a, *b),
+            TileStmt::SetCoopAcc { acc, c } => self.lower_set_coop_acc(expressions, body, *acc, *c),
             TileStmt::Fold {
                 count,
                 iter_var,
@@ -247,6 +275,54 @@ impl<'a> Lowerer<'a> {
         Ok(())
     }
 
+    fn lower_load_coop_broadcast(
+        &self,
+        expressions: &mut Arena<Expression>,
+        scratch: ScratchLocals,
+        body: &mut Block,
+        request: CoopBroadcastLoad<'_>,
+    ) -> Result<(), LowerError> {
+        let CoopBroadcastLoad {
+            id,
+            src,
+            col,
+            role,
+            scalar,
+            rows,
+            cols,
+        } = request;
+        let layout = self.storage_layout(src)?;
+        if layout.shape().rank() != 1 {
+            return Err(LowerError::UnsupportedOperation(
+                "coop broadcast load expects rank-1 storage",
+            ));
+        }
+        if src.buffer.element != scalar.element() {
+            return Err(LowerError::UnsupportedOperation(
+                "coop broadcast load element mismatch",
+            ));
+        }
+        let col_h = self.lower_tile_expr(expressions, scratch, body, col)?;
+        let ptr = self.storage_dynamic_pointer(expressions, src, col_h, body)?;
+        let stride = self.u32(expressions, 0);
+        let frag = self.emit(
+            expressions,
+            body,
+            Expression::CooperativeLoad {
+                columns: Self::cooperative_size(cols)?,
+                rows: Self::cooperative_size(rows)?,
+                role,
+                data: CooperativeData {
+                    pointer: ptr,
+                    stride,
+                    row_major: true,
+                },
+            },
+        );
+        self.coop_fragment_cache.borrow_mut().insert(id, frag);
+        Ok(())
+    }
+
     fn lower_coop_mma(
         &self,
         expressions: &mut Arena<Expression>,
@@ -277,6 +353,20 @@ impl<'a> Lowerer<'a> {
         Ok(())
     }
 
+    fn lower_set_coop_acc(
+        &self,
+        expressions: &mut Arena<Expression>,
+        body: &mut Block,
+        acc: LocalRef,
+        c_id: CoopFragmentId,
+    ) -> Result<(), LowerError> {
+        let acc_local = self.private_local(acc)?;
+        let c = self.coop_fragment_handle(c_id, "C")?;
+        self.coop_acc_value_cache.borrow_mut().remove(&acc.id);
+        self.store_local(expressions, body, acc_local, c);
+        Ok(())
+    }
+
     /// Look up a previously-loaded coop fragment by id. Both operands of an
     /// MMA need this lookup; `role` is interpolated into the error message
     /// when the fragment isn't in the cache.
@@ -292,6 +382,7 @@ impl<'a> Lowerer<'a> {
             .ok_or(LowerError::UnsupportedOperation(match role {
                 "A" => "coop_mma A fragment not loaded in current scope",
                 "B" => "coop_mma B fragment not loaded in current scope",
+                "C" => "coop C fragment not loaded in current scope",
                 _ => "coop_mma fragment not loaded in current scope",
             }))
     }

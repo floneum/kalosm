@@ -29,6 +29,23 @@ use crate::types::{
     apply_qmatmul_post_epilogue, apply_qmatmul_pre_epilogue, matrix_shape, QmatmulEpilogues,
 };
 
+fn load_qmatmul_extra(
+    program: &mut TileBlock<'_>,
+    extra: &crate::types::QmatmulExtra<'_>,
+    row: &Tile<U32>,
+    col: &Tile<U32>,
+    n_cols: u32,
+) -> Tile<F32> {
+    match extra {
+        crate::types::QmatmulExtra::Column(vector) => {
+            program.load(vector.at(col), col.lt(n_cols), 0.0)
+        }
+        crate::types::QmatmulExtra::Pointwise(tensor) => {
+            program.load(tensor.at((row, col)), col.lt(n_cols), 0.0)
+        }
+    }
+}
+
 const QMATMUL_LANES: usize = 64;
 const QGEMV_LANES: usize = 64;
 const QMATMUL_TM: usize = 4;
@@ -81,11 +98,15 @@ fn stage_f32_tile_with_pre<const ROWS: usize, const COLS: usize, const LANES: us
             .and(within_tile.clone())
             .and(global_row.clone().lt(src_rows))
             .and(global_col.clone().lt(src_cols));
-        let loaded = program.load(src.at((global_row, &global_col)), in_bounds.clone(), 0.0);
+        let loaded = program.load(
+            src.at((global_row.clone(), &global_col)),
+            in_bounds.clone(),
+            0.0,
+        );
         let pre_extras = epilogues
-            .pre_extra_col_vectors
+            .pre_extra_inputs
             .iter()
-            .map(|extra| program.load(extra.at(&global_col), global_col.lt(src_cols), 0.0))
+            .map(|extra| load_qmatmul_extra(program, extra, &global_row, &global_col, src_cols))
             .collect::<Vec<_>>();
         let value = Tile::select(
             in_bounds,
@@ -232,9 +253,9 @@ pub fn qmatmul_workgroup_with_epilogues<const BM: usize, const BN: usize, const 
             let row = row_base.clone() + r as u32;
             let col = col_base.clone() + c as u32;
             let extras = epilogues
-                .post_extra_col_vectors
+                .post_extra_inputs
                 .iter()
-                .map(|extra| program.load(extra.at(&col), col.lt(n), 0.0))
+                .map(|extra| load_qmatmul_extra(program, extra, &row, &col, n))
                 .collect::<Vec<_>>();
             let value = apply_qmatmul_post_epilogue(epilogues, sum, extras);
             let mask = tile_active
@@ -327,11 +348,12 @@ pub fn qgemv_workgroup_with_epilogue<const BN: usize, const BK: usize>(
         );
 
         for (idx, sum) in sums.into_iter().enumerate() {
+            let row = Tile::literal(TileLiteral::U32(0));
             let col = col_base.clone() + idx as u32;
             let extras = epilogues
-                .post_extra_col_vectors
+                .post_extra_inputs
                 .iter()
-                .map(|extra| program.load(extra.at(&col), col.lt(n), 0.0))
+                .map(|extra| load_qmatmul_extra(program, extra, &row, &col, n))
                 .collect::<Vec<_>>();
             let value = apply_qmatmul_post_epilogue(epilogues, sum, extras);
             let mask = tile_active.clone().and(col.clone().lt(n));

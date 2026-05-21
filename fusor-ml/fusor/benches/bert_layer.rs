@@ -303,18 +303,22 @@ fn self_attention(c: &mut Criterion) {
                                     let k = key.forward(&tensor);
                                     let v = value.forward(&tensor);
 
-                                    let q = q.reshape([batch_size, seq_len, num_heads, head_size]);
-                                    let q = q.transpose(1, 2);
-                                    let k = k.reshape([batch_size, seq_len, num_heads, head_size]);
-                                    let k = k.transpose(1, 2);
-                                    let v = v.reshape([batch_size, seq_len, num_heads, head_size]);
-                                    let v = v.transpose(1, 2);
+                                    let q_reshaped =
+                                        q.reshape([batch_size, seq_len, num_heads, head_size]);
+                                    let k_reshaped =
+                                        k.reshape([batch_size, seq_len, num_heads, head_size]);
+                                    let v_reshaped =
+                                        v.reshape([batch_size, seq_len, num_heads, head_size]);
+                                    let q = q_reshaped.transpose(1, 2).to_concrete();
+                                    let k = k_reshaped.transpose(1, 2).to_concrete();
+                                    let v = v_reshaped.transpose(1, 2).to_concrete();
 
-                                    let scores =
-                                        q.mat_mul(&k.t()).div_scalar((head_size as f32).sqrt());
-                                    let probs = scores.softmax_last_dim::<3>();
-
-                                    let context = probs.mat_mul(&v);
+                                    let context = q.flash_attention(
+                                        &k,
+                                        &v,
+                                        1.0 / (head_size as f32).sqrt(),
+                                        None,
+                                    );
                                     let context = context.transpose(1, 2);
                                     let output = context.flatten_last_n::<1, _>();
 

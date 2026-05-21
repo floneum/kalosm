@@ -663,6 +663,7 @@ impl<'a> Lowerer<'a> {
                 dst.element.uses_f16() || src_uses_f16
             }
             TileStmt::StoreCoopAcc { dst, .. } => dst.buffer.element.uses_f16(),
+            TileStmt::LoadCoopBroadcast { scalar, .. } => *scalar == ScalarElement::F16,
             TileStmt::Fold { accumulators, .. } => {
                 accumulators.iter().any(|acc| acc.element.uses_f16())
             }
@@ -671,6 +672,7 @@ impl<'a> Lowerer<'a> {
             | TileStmt::ZeroCoopAcc { .. }
             | TileStmt::Barrier
             | TileStmt::Mma { .. }
+            | TileStmt::SetCoopAcc { .. }
             | TileStmt::Break
             | TileStmt::Return => false,
             TileStmt::LoadCoop { scalar, .. } => *scalar == ScalarElement::F16,

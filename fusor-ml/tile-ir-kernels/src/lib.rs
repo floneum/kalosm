@@ -56,5 +56,6 @@ pub use kernels::{
     Q4KPairedGgml, RmsNormVec4, RmsNormVec4Meta, TensorMeta, TopKChunkMeta, TopKExactnessMeta,
 };
 pub use types::{
-    DenseMatmulEpilogues, PairedEpilogue, QmatmulEpilogues, UnaryEpilogue, UnaryEpilogueWithExtras,
+    DenseMatmulEpilogues, PairedEpilogue, QmatmulEpilogues, QmatmulExtra, UnaryEpilogue,
+    UnaryEpilogueWithExtras,
 };

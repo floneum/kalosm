@@ -1,4 +1,4 @@
-use crate::{Device, MatMulOperation};
+use crate::{Device, MatMulOperation, kernel_selection::CooperativeMatrixKind};
 
 /// Parameters for cooperative matrix matmul.
 #[derive(Debug, Clone, PartialEq, Hash)]
@@ -9,6 +9,7 @@ pub struct CoopGemmParams {
     pub n_passes: u32,
     pub mma_size: u32,
     pub wg_threads: u32,
+    pub(crate) kind: CooperativeMatrixKind,
 }
 
 impl Default for CoopGemmParams {
@@ -20,7 +21,14 @@ impl Default for CoopGemmParams {
             n_passes: 4,
             mma_size: 8,
             wg_threads: 256,
+            kind: CooperativeMatrixKind::F32F32M8N8K8,
         }
+    }
+}
+
+impl CoopGemmParams {
+    pub(crate) fn kind(&self) -> CooperativeMatrixKind {
+        self.kind
     }
 }
 
@@ -29,13 +37,14 @@ pub(super) fn optimal_params(
     n: usize,
     k: usize,
     device: &Device,
+    kind: CooperativeMatrixKind,
 ) -> Option<CoopGemmParams> {
     // Apple's coopMatrix instructions run on 32-thread SIMD groups even when
     // the wgpu-reported subgroup-size range straddles 32. Match
     // `floneum/main`'s gate: only require coop-matrix + subgroups, not exact
     // equality of min/max subgroup size.
-    if !device.cooperative_matrix_supported()
-        || !device.subgroups_supported()
+    if !device.cooperative_matrix_caps().supports(kind)
+        || !device.subgroup_kernels_supported()
         || device.max_subgroup_size() < 32
         || device.min_subgroup_size() > 32
         || device.limits().max_compute_workgroup_size_x < 64
@@ -64,6 +73,7 @@ pub(super) fn optimal_params(
         return None;
     }
 
+    params.kind = kind;
     let _ = k;
     Some(params)
 }

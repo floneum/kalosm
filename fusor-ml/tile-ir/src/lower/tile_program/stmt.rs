@@ -38,7 +38,6 @@ impl<'a> Lowerer<'a> {
     ) -> Result<(), LowerError> {
         self.clear_store_caches(true);
         let value = self.lower_tile_expr(expressions, scratch, body, &store.value)?;
-        let mask = self.lower_tile_expr(expressions, scratch, body, &store.mask)?;
         let mut accept = Block::new();
         let row = self.lower_tile_expr(expressions, scratch, &mut accept, &store.row)?;
         let col = self.lower_tile_expr(expressions, scratch, &mut accept, &store.col)?;
@@ -46,7 +45,19 @@ impl<'a> Lowerer<'a> {
             self.storage_index_from_coords(expressions, &store.dst, &[row, col], &mut accept)?;
         let dst_ptr =
             self.storage_dynamic_pointer(expressions, &store.dst, dst_index, &mut accept)?;
-        Self::push_masked_store(body, mask, accept, dst_ptr, value);
+        if store.mask.is_constant_true() {
+            accept.push(
+                Statement::Store {
+                    pointer: dst_ptr,
+                    value,
+                },
+                Span::default(),
+            );
+            body.extend_block(accept);
+        } else {
+            let mask = self.lower_tile_expr(expressions, scratch, body, &store.mask)?;
+            Self::push_masked_store(body, mask, accept, dst_ptr, value);
+        }
         Ok(())
     }
 
@@ -59,11 +70,22 @@ impl<'a> Lowerer<'a> {
     ) -> Result<(), LowerError> {
         self.clear_store_caches(false);
         let value = self.lower_tile_expr(expressions, scratch, body, &store.value)?;
-        let mask = self.lower_tile_expr(expressions, scratch, body, &store.mask)?;
         let mut accept = Block::new();
         let index = self.lower_tile_expr(expressions, scratch, &mut accept, &store.index)?;
         let dst_ptr = self.storage_dynamic_pointer(expressions, &store.dst, index, &mut accept)?;
-        Self::push_masked_store(body, mask, accept, dst_ptr, value);
+        if store.mask.is_constant_true() {
+            accept.push(
+                Statement::Store {
+                    pointer: dst_ptr,
+                    value,
+                },
+                Span::default(),
+            );
+            body.extend_block(accept);
+        } else {
+            let mask = self.lower_tile_expr(expressions, scratch, body, &store.mask)?;
+            Self::push_masked_store(body, mask, accept, dst_ptr, value);
+        }
         Ok(())
     }
 

@@ -8,7 +8,7 @@ publish = false
 
 [dependencies]
 fusor-tile-ir = { workspace = true }
-wgpu = { git = "https://github.com/ealmloff/wgpu", branch = "yield-now", features = ["naga-ir", "static-dxc"] }
+wgpu = { git = "https://github.com/ealmloff/wgpu", branch = "yield-now", features = ["naga-ir", "static-dxc", "vulkan-portability"] }
 lru = "0.14.0"
 parking_lot = "0.12.3"
 rustc-hash = "2.1.1"

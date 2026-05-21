@@ -1,7 +1,6 @@
 use std::{
     fmt::{Debug, Display},
     marker::PhantomData,
-    num::NonZeroU64,
     ops::{Add, AddAssign, Div, DivAssign, Mul, MulAssign, Range, Sub, SubAssign},
     sync::Arc,
 };
@@ -462,6 +461,71 @@ impl TensorData {
         Self::new_from_buffer(device, buffer, shape, datatype)
     }
 
+    pub(crate) fn from_host_slice<D: DataType>(
+        device: &Device,
+        shape: &[usize],
+        data: &[D],
+    ) -> Self {
+        assert_eq!(data.len(), shape.iter().product());
+        Self::new_inner(device, data.iter(), shape)
+    }
+
+    pub(crate) fn to_host_vec<D: DataType>(&self) -> Vec<D> {
+        use pollster::FutureExt as _;
+
+        async fn read_buffer<D: DataType>(tensor: &TensorData) -> Vec<D> {
+            let buffer = tensor.buffer();
+            let device = tensor.device.wgpu_device();
+            let queue = tensor.device.wgpu_queue();
+            let size = buffer.size();
+            let download = device.create_buffer(&wgpu::BufferDescriptor {
+                size,
+                usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+                mapped_at_creation: false,
+                label: None,
+            });
+            let mut encoder =
+                device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+            encoder.copy_buffer_to_buffer(buffer, 0, &download, 0, size);
+            queue.submit(Some(encoder.finish()));
+            let (sender, receiver) = futures_channel::oneshot::channel();
+            download
+                .slice(..)
+                .map_async(wgpu::MapMode::Read, move |result| {
+                    _ = sender.send(result);
+                });
+            #[cfg(not(target_arch = "wasm32"))]
+            tensor.device.poll_wait();
+            receiver
+                .await
+                .expect("buffer map channel closed")
+                .expect("failed to map tensor buffer");
+            let view = download.slice(..).get_mapped_range();
+            if tensor.layout().shape().len() == 1 {
+                let slice =
+                    TensorSlice::<1, D, _>::new(MappedBuffer { view }, tensor.layout().clone());
+                return (0..slice.shape()[0]).map(|i| slice[[i]]).collect();
+            }
+            let storage = bytemuck::cast_slice::<u8, D>(&view);
+            let layout = tensor.layout();
+            let len = layout.shape().iter().product::<usize>();
+            let mut out = Vec::with_capacity(len);
+            for flat in 0..len {
+                let mut rem = flat;
+                let mut storage_index = layout.offset();
+                for (axis, dim) in layout.shape().iter().enumerate().rev() {
+                    let coord = rem % *dim;
+                    rem /= *dim;
+                    storage_index += coord * layout.strides()[axis];
+                }
+                out.push(storage[storage_index]);
+            }
+            out
+        }
+
+        read_buffer(self).block_on()
+    }
+
     pub(crate) fn new_splat_scalar(
         device: &Device,
         shape: &[usize],
@@ -497,37 +561,17 @@ impl TensorData {
         data: I,
         shape: &[usize],
     ) -> Self {
-        // MODIFIED from: https://github.com/gfx-rs/wgpu/blob/d8833d079833c62b4fd00325d0ba08ec0c8bc309/wgpu/src/util/device.rs#L38
-        fn create_aligned_buffer(
-            element_size: u64,
-            shape: &[usize],
-            device: &Device,
-        ) -> (Arc<wgpu::Buffer>, u64) {
-            let size = element_size * shape.iter().copied().product::<usize>() as u64;
-
-            let padded_size = padded_tensor_size(size);
-
-            let buffer = device.create_buffer(
-                padded_size,
-                wgpu::BufferUsages::STORAGE
-                    | wgpu::BufferUsages::COPY_SRC
-                    | wgpu::BufferUsages::COPY_DST,
-            );
-            (buffer, padded_size)
+        let size = size_of::<D>() as u64 * shape.iter().copied().product::<usize>() as u64;
+        let mut bytes = Vec::with_capacity(size as usize);
+        for value in data {
+            bytes.extend_from_slice(bytemuck::bytes_of(value));
         }
-        let (buffer, padded_size) = create_aligned_buffer(size_of::<D>() as u64, shape, device);
-
-        if let Some(padded_size) = NonZeroU64::new(padded_size) {
-            let write = device
-                .wgpu_queue()
-                .write_buffer_with(&buffer, 0, padded_size);
-            if let Some(mut write) = write {
-                write
-                    .iter_mut()
-                    .zip(data.flat_map(bytemuck::bytes_of))
-                    .for_each(|(dst, src)| *dst = *src);
-            }
-        }
+        let buffer = device.create_buffer_init(
+            &bytes,
+            wgpu::BufferUsages::STORAGE
+                | wgpu::BufferUsages::COPY_SRC
+                | wgpu::BufferUsages::COPY_DST,
+        );
 
         Self::new_from_buffer(device, buffer, shape, D::DATA_TYPE)
     }
@@ -569,11 +613,6 @@ impl TensorData {
 
     pub(crate) fn info(&self) -> &TensorLayoutInfo {
         &self.info
-    }
-
-    /// Check if this is the only reference to the buffer
-    pub(crate) fn owned(&self) -> bool {
-        std::sync::Arc::strong_count(&self.buffer) == 1
     }
 }
 
@@ -641,6 +680,15 @@ impl<D: DataType, const R: usize> Tensor<R, D> {
         Self: fusor_types::FromArray<R, D, T, Device>,
     {
         fusor_types::FromArray::from_array(data, device)
+    }
+
+    pub fn from_slice(device: &Device, shape: [usize; R], data: &[D]) -> Self {
+        assert_eq!(
+            data.len(),
+            shape.iter().product(),
+            "Data length must match shape"
+        );
+        Tensor::new_inner(device, data.iter(), shape)
     }
 
     pub fn splat(device: &Device, value: D, shape: [usize; R]) -> Self {
@@ -770,7 +818,9 @@ impl<D: DataType, const R: usize> Tensor<R, D> {
 
     /// How many kernel calls are needed to fully resolve this tensor
     pub fn count_kernels_to_resolve(&self) -> usize {
-        let (_, count) = self.data.materialize();
+        let (data, count) = self.data.materialize();
+        #[cfg(not(target_arch = "wasm32"))]
+        data.device().poll_wait();
         count
     }
 
@@ -983,18 +1033,10 @@ impl<D: DataType, const R: usize> Tensor<R, D> {
         }
         // The streaming flash attention kernel emits a separate
         // monomorphization per hardware subgroup width and relies on
-        // `subgroup_reduce_*`, so it can only target devices that expose a
-        // fixed, supported subgroup size. wgpu doesn't surface
-        // `requiredSubgroupSize`, so devices that report a variable subgroup
-        // range (e.g. Mesa lavapipe) fall through to the composite path here.
+        // `subgroup_reduce_*`, so it can only target devices where we know the
+        // effective subgroup width.
         let device = &self.data.device;
-        if !device.subgroups_supported()
-            || device.min_subgroup_size() != device.max_subgroup_size()
-            || !matches!(device.min_subgroup_size(), 4 | 8 | 16 | 32 | 64)
-        {
-            return None;
-        }
-        let subgroup_size = device.min_subgroup_size();
+        let subgroup_size = device.fixed_width_subgroup_size()?;
         let q_shape = self.shape();
         let k_shape = k.shape();
         // Both flash-attention kernel families pad lanes past `kv_seq_len`
@@ -1015,7 +1057,7 @@ impl<D: DataType, const R: usize> Tensor<R, D> {
         //    `kv_seq_len` is meaningfully shorter than that block — i.e.
         //    on the typical `kv_seq_len < 32` shapes the conformance
         //    suite exercises.
-        if k_shape[2] < subgroup_size as usize {
+        if device.backend() == wgpu::Backend::Dx12 && k_shape[2] < subgroup_size as usize {
             return None;
         }
         const MIN_DECODE_KV_SEQ: usize = 32;

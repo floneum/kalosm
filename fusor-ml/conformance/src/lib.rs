@@ -902,8 +902,13 @@ where
             };
             for run in 0..self.runs {
                 for device in &devices {
+                    let baseline_device = match device {
+                        Device::Cpu => device.clone(),
+                        Device::Gpu(_) => Device::Cpu,
+                    };
+                    let expected_args = self.generators.generate(&baseline_device, run);
+                    let expected = self.baseline.call_mut(expected_args).await;
                     let args = self.generators.generate(device, run);
-                    let expected = self.baseline.call_mut(args.clone()).await;
                     for to_validate in &mut self.to_validate {
                         let actual = to_validate.call_mut(args.clone()).await;
                         compare_fn(&expected, &actual).await?;

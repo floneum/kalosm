@@ -3077,18 +3077,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "fusor-lavapipe-subgroups"
-version = "0.1.0"
-dependencies = [
- "ash",
- "bytemuck",
- "fusor-tile-ir",
- "fusor-tile-ir-kernels",
- "naga",
- "thiserror 2.0.18",
-]
-
-[[package]]
 name = "fusor-tile-ir"
 version = "0.1.0"
 dependencies = [

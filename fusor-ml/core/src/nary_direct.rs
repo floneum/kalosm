@@ -14,6 +14,7 @@ use crate::{
 };
 
 const BLOCK: usize = 256;
+const SMALL_BLOCK: usize = 1;
 const NARY_DIRECT_MODULE_CACHE_SIZE: usize = 1024;
 
 struct NaryDirectKernelVariant;
@@ -48,6 +49,160 @@ pub(crate) fn build_nary_direct_kernel_to_output(
     )
 }
 
+pub(crate) fn resolve_nary_on_host(
+    operation: &NaryOperation,
+    inputs: &[MirValue],
+) -> Option<TensorData> {
+    match operation.output_datatype {
+        DataTypeEnum::F32 => resolve_nary_f32_on_host(operation, inputs),
+        DataTypeEnum::F16 => resolve_nary_f16_on_host(operation, inputs),
+        DataTypeEnum::U32 => resolve_nary_u32_on_host(operation, inputs),
+    }
+}
+
+pub(crate) fn resolve_nary_f32_on_host(
+    operation: &NaryOperation,
+    inputs: &[MirValue],
+) -> Option<TensorData> {
+    if operation.output_datatype != DataTypeEnum::F32 {
+        return None;
+    }
+    let tensors = inputs
+        .iter()
+        .map(|input| input.as_tensor().cloned())
+        .collect::<Option<Vec<_>>>()?;
+    if tensors
+        .iter()
+        .take(operation.inputs.len())
+        .any(|tensor| !matches!(tensor.datatype(), DataTypeEnum::F32 | DataTypeEnum::U32))
+    {
+        return None;
+    }
+
+    let metas = tensors
+        .iter()
+        .map(TensorMeta::new)
+        .collect::<Option<Vec<_>>>()?;
+    let host_inputs = tensors
+        .iter()
+        .take(operation.inputs.len())
+        .map(|tensor| match tensor.datatype() {
+            DataTypeEnum::F32 => tensor.to_host_vec::<f32>(),
+            DataTypeEnum::U32 => tensor
+                .to_host_vec::<u32>()
+                .into_iter()
+                .map(|value| value as f32)
+                .collect(),
+            DataTypeEnum::F16 => unreachable!("f16 input rejected above"),
+        })
+        .collect::<Vec<_>>();
+    let total = operation.shape.iter().product::<usize>();
+    let mut output = Vec::with_capacity(total);
+    for flat in 0..total {
+        let dims = host_output_dims_from_flat(flat, &operation.shape);
+        output.push(eval_nary_expr_host(
+            &operation.expression,
+            &dims,
+            &metas,
+            &host_inputs,
+        )?);
+    }
+    let device = tensors.first()?.device().clone();
+    Some(TensorData::from_host_slice(
+        &device,
+        &operation.shape,
+        &output,
+    ))
+}
+
+fn resolve_nary_f16_on_host(operation: &NaryOperation, inputs: &[MirValue]) -> Option<TensorData> {
+    let tensors = inputs
+        .iter()
+        .map(|input| input.as_tensor().cloned())
+        .collect::<Option<Vec<_>>>()?;
+    if tensors
+        .iter()
+        .take(operation.inputs.len())
+        .any(|tensor| tensor.datatype() != DataTypeEnum::F16)
+    {
+        return None;
+    }
+
+    let metas = tensors
+        .iter()
+        .map(TensorMeta::new)
+        .collect::<Option<Vec<_>>>()?;
+    let host_inputs = tensors
+        .iter()
+        .take(operation.inputs.len())
+        .map(|tensor| {
+            tensor
+                .to_host_vec::<half::f16>()
+                .into_iter()
+                .map(|value| value.to_f32())
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+    let total = operation.shape.iter().product::<usize>();
+    let mut output = Vec::with_capacity(total);
+    for flat in 0..total {
+        let dims = host_output_dims_from_flat(flat, &operation.shape);
+        output.push(half::f16::from_f32(eval_nary_expr_host(
+            &operation.expression,
+            &dims,
+            &metas,
+            &host_inputs,
+        )?));
+    }
+    let device = tensors.first()?.device().clone();
+    Some(TensorData::from_host_slice(
+        &device,
+        &operation.shape,
+        &output,
+    ))
+}
+
+fn resolve_nary_u32_on_host(operation: &NaryOperation, inputs: &[MirValue]) -> Option<TensorData> {
+    let tensors = inputs
+        .iter()
+        .map(|input| input.as_tensor().cloned())
+        .collect::<Option<Vec<_>>>()?;
+    if tensors
+        .iter()
+        .take(operation.inputs.len())
+        .any(|tensor| tensor.datatype() != DataTypeEnum::U32)
+    {
+        return None;
+    }
+
+    let metas = tensors
+        .iter()
+        .map(TensorMeta::new)
+        .collect::<Option<Vec<_>>>()?;
+    let host_inputs = tensors
+        .iter()
+        .take(operation.inputs.len())
+        .map(TensorData::to_host_vec::<u32>)
+        .collect::<Vec<_>>();
+    let total = operation.shape.iter().product::<usize>();
+    let mut output = Vec::with_capacity(total);
+    for flat in 0..total {
+        let dims = host_output_dims_from_flat(flat, &operation.shape);
+        output.push(eval_nary_expr_u32_host(
+            &operation.expression,
+            &dims,
+            &metas,
+            &host_inputs,
+        )?);
+    }
+    let device = tensors.first()?.device().clone();
+    Some(TensorData::from_host_slice(
+        &device,
+        &operation.shape,
+        &output,
+    ))
+}
+
 fn build_nary_direct_kernel_with_output_index(
     operation: &NaryOperation,
     graph: &crate::compute_graph::ComputeGraphInner,
@@ -69,7 +224,13 @@ fn build_nary_direct_kernel_with_output_index(
         return None;
     }
 
-    let dispatch_size = operation.dispatch_size(workgroup_shape, inputs);
+    let total_elements = total_elements(&operation.shape)?;
+    let small_dispatch = total_elements < BLOCK as u32;
+    let dispatch_size = if small_dispatch {
+        [total_elements, 1, 1]
+    } else {
+        operation.dispatch_size(workgroup_shape, inputs)
+    };
     let variant =
         kernel_backend::KernelVariantKey::with_payload::<NaryDirectKernelVariant>(|state| {
             output_index.hash(state);
@@ -81,7 +242,11 @@ fn build_nary_direct_kernel_with_output_index(
         inputs,
     );
     let naga = kernel_backend::cached_hashed_naga(nary_direct_module_cache(), module_key, || {
-        let ir = build_nary_tile_ir(operation, &tensors, output_index, dispatch_size)?;
+        let ir = if small_dispatch {
+            build_nary_tile_ir::<SMALL_BLOCK>(operation, &tensors, output_index, dispatch_size)?
+        } else {
+            build_nary_tile_ir::<BLOCK>(operation, &tensors, output_index, dispatch_size)?
+        };
         Some(Arc::new(ir.lower_to_naga().ok()?.module().clone()))
     })?;
     let cached = graph
@@ -113,22 +278,223 @@ fn build_nary_direct_kernel_with_output_index(
     ))
 }
 
+fn host_output_dims_from_flat(flat: usize, shape: &[usize]) -> Vec<usize> {
+    (0..shape.len())
+        .map(|axis| {
+            let dim = shape[axis];
+            if dim == 1 {
+                return 0;
+            }
+            let divisor = shape[axis + 1..].iter().product::<usize>();
+            (flat / divisor) % dim
+        })
+        .collect()
+}
+
+fn host_layout_index(meta: &TensorMeta, coords: &[usize]) -> usize {
+    let mut index = 0;
+    for (axis, coord) in coords.iter().enumerate() {
+        let dim = meta.shape.get(axis).copied().unwrap_or(1) as usize;
+        if dim == 1 {
+            continue;
+        }
+        let stride = meta.shape[axis + 1..]
+            .iter()
+            .fold(1usize, |acc, dim| acc * *dim as usize);
+        index += coord * stride;
+    }
+    index
+}
+
+fn eval_nary_expr_host(
+    expr: &NaryExpr,
+    dims: &[usize],
+    metas: &[TensorMeta],
+    inputs: &[Vec<f32>],
+) -> Option<f32> {
+    match expr {
+        NaryExpr::IndexedInput { input_idx, indices } => {
+            let coords = indices
+                .iter()
+                .map(|index| eval_nary_expr_host(index, dims, metas, inputs).map(|v| v as usize))
+                .collect::<Option<Vec<_>>>()?;
+            inputs
+                .get(*input_idx)?
+                .get(host_layout_index(&metas[*input_idx], &coords))
+                .copied()
+        }
+        NaryExpr::DimIndex(dim) => Some(dims[*dim] as f32),
+        NaryExpr::Scalar(value) => Some(scalar_to_f32(value)),
+        NaryExpr::Op { children, function } => {
+            let values = children
+                .iter()
+                .map(|child| eval_nary_expr_host(child, dims, metas, inputs))
+                .collect::<Option<Vec<_>>>()?;
+            let first = values.first().copied().unwrap_or_default();
+            let second = values.get(1).copied().unwrap_or_default();
+            Some(match function.op {
+                NaryOp::Add => first + second,
+                NaryOp::Sub => first - second,
+                NaryOp::Mul => first * second,
+                NaryOp::Div => first / second,
+                NaryOp::Rem => first % second,
+                NaryOp::Pow => first.powf(second),
+                NaryOp::Min => first.min(second),
+                NaryOp::Max => first.max(second),
+                NaryOp::Equal => (first == second) as u32 as f32,
+                NaryOp::Less => (first < second) as u32 as f32,
+                NaryOp::LessEqual => (first <= second) as u32 as f32,
+                NaryOp::Greater => (first > second) as u32 as f32,
+                NaryOp::GreaterEqual => (first >= second) as u32 as f32,
+                NaryOp::Neg => -first,
+                NaryOp::Cast => first,
+                NaryOp::Select => {
+                    if first != 0.0 {
+                        second
+                    } else {
+                        values.get(2).copied().unwrap_or_default()
+                    }
+                }
+                NaryOp::Exp | NaryOp::ApproximateExp | NaryOp::LessApproximateExp => first.exp(),
+                NaryOp::Exp2 => first.exp2(),
+                NaryOp::Log => first.ln(),
+                NaryOp::Log2 => first.log2(),
+                NaryOp::Sqrt => first.sqrt(),
+                NaryOp::Sin => first.sin(),
+                NaryOp::Cos => first.cos(),
+                NaryOp::Tan => first.tan(),
+                NaryOp::Tanh | NaryOp::TanhExact => first.tanh(),
+                NaryOp::Asin => first.asin(),
+                NaryOp::Acos => first.acos(),
+                NaryOp::Atan => first.atan(),
+                NaryOp::Sinh => first.sinh(),
+                NaryOp::Cosh => first.cosh(),
+                NaryOp::Asinh => first.asinh(),
+                NaryOp::Acosh => first.acosh(),
+                NaryOp::Atanh => first.atanh(),
+                NaryOp::Abs => first.abs(),
+                NaryOp::AddConst(scalar) => first + scalar_to_f32(&scalar),
+                NaryOp::SubConst(scalar) => first - scalar_to_f32(&scalar),
+                NaryOp::RSubConst(scalar) => scalar_to_f32(&scalar) - first,
+                NaryOp::MulConst(scalar) => first * scalar_to_f32(&scalar),
+                NaryOp::DivConst(scalar) => first / scalar_to_f32(&scalar),
+                NaryOp::RDivConst(scalar) => scalar_to_f32(&scalar) / first,
+                NaryOp::RemConst(scalar) => first % scalar_to_f32(&scalar),
+                NaryOp::RRemConst(scalar) => scalar_to_f32(&scalar) % first,
+                NaryOp::PowConst(scalar) => first.powf(scalar_to_f32(&scalar)),
+                NaryOp::MinConst(scalar) => first.min(scalar_to_f32(&scalar)),
+                NaryOp::MaxConst(scalar) => first.max(scalar_to_f32(&scalar)),
+                NaryOp::EqualConst(scalar) => (first == scalar_to_f32(&scalar)) as u32 as f32,
+                NaryOp::LessConst(scalar) => (first < scalar_to_f32(&scalar)) as u32 as f32,
+                NaryOp::LessEqualConst(scalar) => (first <= scalar_to_f32(&scalar)) as u32 as f32,
+                NaryOp::GreaterConst(scalar) => (first > scalar_to_f32(&scalar)) as u32 as f32,
+                NaryOp::GreaterEqualConst(scalar) => {
+                    (first >= scalar_to_f32(&scalar)) as u32 as f32
+                }
+            })
+        }
+    }
+}
+
+fn eval_nary_expr_u32_host(
+    expr: &NaryExpr,
+    dims: &[usize],
+    metas: &[TensorMeta],
+    inputs: &[Vec<u32>],
+) -> Option<u32> {
+    match expr {
+        NaryExpr::IndexedInput { input_idx, indices } => {
+            let coords = indices
+                .iter()
+                .map(|index| {
+                    eval_nary_expr_u32_host(index, dims, metas, inputs).map(|v| v as usize)
+                })
+                .collect::<Option<Vec<_>>>()?;
+            inputs
+                .get(*input_idx)?
+                .get(host_layout_index(&metas[*input_idx], &coords))
+                .copied()
+        }
+        NaryExpr::DimIndex(dim) => Some(dims[*dim] as u32),
+        NaryExpr::Scalar(value) => Some(match value {
+            NaryScalar::F32(value) => *value as u32,
+            NaryScalar::F16(value) => value.to_f32() as u32,
+            NaryScalar::U32(value) => *value,
+        }),
+        NaryExpr::Op { children, function } => {
+            let values = children
+                .iter()
+                .map(|child| eval_nary_expr_u32_host(child, dims, metas, inputs))
+                .collect::<Option<Vec<_>>>()?;
+            let first = values.first().copied().unwrap_or_default();
+            let second = values.get(1).copied().unwrap_or_default();
+            Some(match function.op {
+                NaryOp::Add => first.wrapping_add(second),
+                NaryOp::Sub => first.wrapping_sub(second),
+                NaryOp::Mul => first.wrapping_mul(second),
+                NaryOp::Div => first / second,
+                NaryOp::Rem => first % second,
+                NaryOp::Min => first.min(second),
+                NaryOp::Max => first.max(second),
+                NaryOp::Equal => (first == second) as u32,
+                NaryOp::Less => (first < second) as u32,
+                NaryOp::LessEqual => (first <= second) as u32,
+                NaryOp::Greater => (first > second) as u32,
+                NaryOp::GreaterEqual => (first >= second) as u32,
+                NaryOp::Cast => first,
+                NaryOp::Select => {
+                    if first != 0 {
+                        second
+                    } else {
+                        values.get(2).copied().unwrap_or_default()
+                    }
+                }
+                NaryOp::AddConst(scalar) => first.wrapping_add(scalar_to_u32(&scalar)),
+                NaryOp::SubConst(scalar) => first.wrapping_sub(scalar_to_u32(&scalar)),
+                NaryOp::RSubConst(scalar) => scalar_to_u32(&scalar).wrapping_sub(first),
+                NaryOp::MulConst(scalar) => first.wrapping_mul(scalar_to_u32(&scalar)),
+                NaryOp::DivConst(scalar) => first / scalar_to_u32(&scalar),
+                NaryOp::RDivConst(scalar) => scalar_to_u32(&scalar) / first,
+                NaryOp::RemConst(scalar) => first % scalar_to_u32(&scalar),
+                NaryOp::RRemConst(scalar) => scalar_to_u32(&scalar) % first,
+                NaryOp::MinConst(scalar) => first.min(scalar_to_u32(&scalar)),
+                NaryOp::MaxConst(scalar) => first.max(scalar_to_u32(&scalar)),
+                NaryOp::EqualConst(scalar) => (first == scalar_to_u32(&scalar)) as u32,
+                NaryOp::LessConst(scalar) => (first < scalar_to_u32(&scalar)) as u32,
+                NaryOp::LessEqualConst(scalar) => (first <= scalar_to_u32(&scalar)) as u32,
+                NaryOp::GreaterConst(scalar) => (first > scalar_to_u32(&scalar)) as u32,
+                NaryOp::GreaterEqualConst(scalar) => (first >= scalar_to_u32(&scalar)) as u32,
+                _ => return None,
+            })
+        }
+    }
+}
+
+fn scalar_to_f32(value: &NaryScalar) -> f32 {
+    match value {
+        NaryScalar::F32(value) => *value,
+        NaryScalar::F16(value) => value.to_f32(),
+        NaryScalar::U32(value) => *value as f32,
+    }
+}
+
+fn scalar_to_u32(value: &NaryScalar) -> u32 {
+    match value {
+        NaryScalar::F32(value) => *value as u32,
+        NaryScalar::F16(value) => value.to_f32() as u32,
+        NaryScalar::U32(value) => *value,
+    }
+}
+
+fn total_elements(shape: &[usize]) -> Option<u32> {
+    shape
+        .iter()
+        .try_fold(1u32, |acc, dim| acc.checked_mul((*dim).try_into().ok()?))
+}
+
 impl NaryOperation {
     pub(crate) fn output_tensor_index(&self, inputs: &[MirValue]) -> Option<usize> {
-        inputs[..self.inputs.len()]
-            .iter()
-            .enumerate()
-            .find_map(|(i, input)| {
-                if self.expression.uses_custom_indexing_for_input(i) {
-                    return None;
-                }
-                let data = input.as_tensor()?;
-                (data.datatype() == self.output_datatype
-                    && data.owned()
-                    && !data.layout().allocation_overlaps())
-                .then_some(i)
-            })
-            .or_else(|| inputs.len().checked_sub(1))
+        inputs.len().checked_sub(1)
     }
 }
 
@@ -240,6 +606,8 @@ impl Storage2 {
         index: tile_ir::tile::Tile<tile_ir::U32>,
         mask: tile_ir::tile::Mask,
     ) -> ValueTile {
+        let index = tile_ir::tile::Tile::select(mask, index, tile_u32(0));
+        let mask = tile_ir::tile::Mask::all();
         match self {
             Self::F32(storage) => ValueTile::F32(program.load(
                 storage.at((0u32, index)),
@@ -318,16 +686,13 @@ pub(crate) fn declare_storage(
     }
 }
 
-fn build_nary_tile_ir(
+fn build_nary_tile_ir<const BLOCK_SIZE: usize>(
     operation: &NaryOperation,
     tensors: &[TensorData],
     output_index: usize,
     dispatch_size: [u32; 3],
 ) -> Option<tile_ir::KernelIr> {
-    let total_elements = operation
-        .shape
-        .iter()
-        .try_fold(1u32, |acc, dim| acc.checked_mul((*dim).try_into().ok()?))?;
+    let total_elements = total_elements(&operation.shape)?;
     let tensor_metas = tensors
         .iter()
         .map(TensorMeta::new)
@@ -340,10 +705,10 @@ fn build_nary_tile_ir(
             .map(|(binding, meta)| declare_storage(phase, meta, binding == output_index))
             .collect::<Vec<_>>();
 
-        phase.program_grid::<BLOCK>(dispatch_size, |program| {
+        phase.program_grid::<BLOCK_SIZE>(dispatch_size, |program| {
             let lane = program.lane();
             let group = linear_group(program, dispatch_size);
-            let flat_index = group * BLOCK as u32 + lane.clone();
+            let flat_index = group * BLOCK_SIZE as u32 + lane.clone();
             let in_bounds = flat_index.lt(total_elements);
             let dims = output_dims_from_flat(flat_index.clone(), &operation.shape);
             let (value, value_ty) = eval_nary_expr(

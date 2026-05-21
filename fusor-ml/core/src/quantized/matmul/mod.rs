@@ -4,7 +4,8 @@ use crate::{
     DataTypeEnum, Device, Layout, Tensor, TensorData,
     compute_graph::NodeIndex,
     kernel_selection::{
-        Axis, KernelDeviceCaps, KernelShape, ShapeRule, ShapeSelector, eq, multiple_of, range,
+        Axis, CooperativeMatrixCaps, KernelDeviceCaps, KernelShape, ShapeRule, ShapeSelector, eq,
+        multiple_of, range,
     },
     matmul::MatMulOperation,
     mir::{
@@ -19,7 +20,7 @@ use crate::{
         workgroup_shape::{Constraint, WorkgroupShapeConstraints},
     },
     nary_direct::apply_single_input_elementwise_expr,
-    nary_wise::NaryExpr,
+    nary_wise::{NaryExpr, NaryOp},
 };
 use fusor_gguf::GgmlType;
 use fusor_tile_ir as tile_ir;
@@ -27,6 +28,8 @@ use fusor_tile_ir_kernels as tile_ir_kernels;
 use rustc_hash::FxHasher;
 
 use super::{QMatMulDirectPipelineKey, QMatrix};
+
+const QMATMUL_MAX_WORKGROUPS_PER_DIMENSION: u32 = 1_024;
 
 /// Hash the qmatmul format and (M, K, N) into `state`. Shared by the cache
 /// keys at every qmatmul-direct call site so they stay in lockstep.
@@ -116,6 +119,7 @@ enum QMatmulDirectVariant {
     /// `Tile64x64` variant is the IR-build fallback when the precomputed
     /// dispatch can't be cached.
     Tile64x64Cached,
+    Tile64x32,
     Tile64x64,
 }
 
@@ -123,6 +127,8 @@ struct QMatmulDirectFastKernelVariant;
 struct QMatmulDirectEpilogueKernelVariant;
 struct QMatmulPairedKernelVariant;
 struct QMatmulPairedExtrasKernelVariant;
+
+const QMATMUL_DIRECT_KERNEL_GENERATION: u64 = 0x514D_4154_4D49_5831;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 enum QgemvColsVariant {
@@ -152,7 +158,7 @@ fn qmatmul_direct_selector() -> ShapeSelector<3, QMatmulDirectCtx, QMatmulDirect
     ShapeSelector::new()
         .rule(
             QMatmulDirectVariant::Q5SmallSingleRow,
-            ShapeRule::new()
+            ShapeRule::<3, QMatmulDirectCtx>::new()
                 .axis(QMAT_M, eq(1))
                 .axis(QMAT_K, range(0..=1024))
                 .axis(QMAT_N, range(0..=4096))
@@ -205,11 +211,29 @@ fn qmatmul_direct_selector() -> ShapeSelector<3, QMatmulDirectCtx, QMatmulDirect
         )
         .rule(
             QMatmulDirectVariant::Tile64x64Cached,
-            ShapeRule::new()
+            ShapeRule::<3, QMatmulDirectCtx>::new()
                 .axis(QMAT_M, multiple_of(64))
                 .axis(QMAT_K, multiple_of(32))
                 .axis(QMAT_N, multiple_of(64))
-                .when(qmatmul_coop_rule_supported),
+                .when(
+                    |shape: KernelShape<3>, ctx: &QMatmulDirectCtx, caps: KernelDeviceCaps| {
+                        ctx.format != tile_ir::GgmlQuantFormat::Q4K
+                            && qmatmul_coop_rule_supported(shape, ctx, caps)
+                    },
+                ),
+        )
+        .rule(
+            QMatmulDirectVariant::Tile64x32,
+            ShapeRule::new()
+                .axis(QMAT_M, multiple_of(64))
+                .axis(QMAT_K, multiple_of(32))
+                .axis(QMAT_N, multiple_of(32))
+                .when(
+                    |shape: KernelShape<3>, ctx: &QMatmulDirectCtx, caps: KernelDeviceCaps| {
+                        ctx.format == tile_ir::GgmlQuantFormat::Q4K
+                            && qmatmul_coop_rule_supported(shape, ctx, caps)
+                    },
+                ),
         )
         .rule(QMatmulDirectVariant::Tile64x64, ShapeRule::new())
 }
@@ -345,14 +369,15 @@ fn select_qgemv_cols_variant(format: tile_ir::GgmlQuantFormat, k: u32, n: u32) -
             &QgemvColsCtx { format },
             KernelDeviceCaps {
                 subgroups_supported: false,
-                cooperative_matrix_supported: false,
+                cooperative_matrix: CooperativeMatrixCaps::default(),
                 min_subgroup_size: 0,
                 max_subgroup_size: 0,
                 max_compute_invocations_per_workgroup: 0,
                 max_compute_workgroup_storage_size: 0,
                 max_compute_workgroup_size_x: 0,
                 max_compute_workgroups_per_dimension: 0,
-                software_adapter: false,
+                backend: wgpu::Backend::Noop,
+                subgroup_kernels_supported: false,
             },
         )
         .expect("qgemv column selector has a catch-all rule")
@@ -415,7 +440,7 @@ pub(crate) struct PairedConfig {
     pub(crate) extras: Vec<NodeIndex>,
 }
 
-#[derive(Debug, Clone, Hash)]
+#[derive(Debug, Clone, Hash, PartialEq, Eq)]
 pub(crate) struct ElementwiseEpilogue {
     pub(crate) expression: NaryExpr,
     pub(crate) extras: Vec<NodeIndex>,
@@ -521,14 +546,76 @@ impl QMatMulOperation {
 pub(crate) struct DirectKernelTensors<'a> {
     pub input: &'a TensorData,
     pub matrix: &'a QMatrix,
-    pub pre_extra_col_vectors: &'a [&'a TensorData],
-    pub post_extra_col_vectors: &'a [&'a TensorData],
+    pub pre_extra_tensors: &'a [&'a TensorData],
+    pub post_extra_tensors: &'a [&'a TensorData],
     pub output: &'a TensorData,
 }
 
 pub(crate) struct DirectKernelChains<'a> {
     pub pre_expr: Option<&'a ElementwiseEpilogue>,
     pub post_expr: Option<&'a ElementwiseEpilogue>,
+}
+
+fn qmatmul_post_expr_is_column_add(expr: &ElementwiseEpilogue) -> bool {
+    if expr.extras.len() != 1
+        || expr.input_datatype != DataTypeEnum::F32
+        || expr.output_datatype != DataTypeEnum::F32
+    {
+        return false;
+    }
+    let NaryExpr::Op { children, function } = &expr.expression else {
+        return false;
+    };
+    if function.op != NaryOp::Add || children.len() != 2 {
+        return false;
+    }
+    let is_input = |child: &NaryExpr, expected| {
+        matches!(
+            child,
+            NaryExpr::IndexedInput { input_idx, indices }
+                if *input_idx == expected && NaryExpr::is_elementwise_indices(indices)
+        )
+    };
+    (is_input(&children[0], 0) && is_input(&children[1], 1))
+        || (is_input(&children[0], 1) && is_input(&children[1], 0))
+}
+
+fn qmatmul_variant_supports_coop_acc_init(
+    variant: QMatmulDirectVariant,
+    m: u32,
+    k: u32,
+    n: u32,
+    y_supports_coop: bool,
+) -> bool {
+    if !y_supports_coop || m <= 1 || !k.is_multiple_of(32) {
+        return false;
+    }
+    match variant {
+        QMatmulDirectVariant::Q8Wide64x128 | QMatmulDirectVariant::Tile64x128 => {
+            m.is_multiple_of(64) && n.is_multiple_of(128)
+        }
+        QMatmulDirectVariant::Tile128x128 => m.is_multiple_of(128) && n.is_multiple_of(128),
+        QMatmulDirectVariant::Tile128x64 => m.is_multiple_of(128) && n.is_multiple_of(64),
+        QMatmulDirectVariant::Tile64x64Cached | QMatmulDirectVariant::Tile64x64 => {
+            m.is_multiple_of(64) && n.is_multiple_of(64)
+        }
+        QMatmulDirectVariant::Tile64x32 => m.is_multiple_of(64) && n.is_multiple_of(32),
+        QMatmulDirectVariant::Q5SmallSingleRow | QMatmulDirectVariant::SingleRow => false,
+    }
+}
+
+enum QmatmulExtraStorage {
+    Column(tile_ir::tile::Storage<tile_ir::F32, 1>),
+    Pointwise(tile_ir::tile::Storage<tile_ir::F32, 2>),
+}
+
+impl QmatmulExtraStorage {
+    fn as_extra(&self) -> tile_ir_kernels::QmatmulExtra<'_> {
+        match self {
+            Self::Column(storage) => tile_ir_kernels::QmatmulExtra::Column(storage),
+            Self::Pointwise(storage) => tile_ir_kernels::QmatmulExtra::Pointwise(storage),
+        }
+    }
 }
 
 impl QMatMulOperation {
@@ -547,8 +634,8 @@ impl QMatMulOperation {
         let DirectKernelTensors {
             input,
             matrix,
-            pre_extra_col_vectors,
-            post_extra_col_vectors,
+            pre_extra_tensors,
+            post_extra_tensors,
             output,
         } = tensors;
         let DirectKernelChains {
@@ -576,6 +663,63 @@ impl QMatMulOperation {
         if m != y_m || k != matrix.shape[1] as u32 || n != matrix.shape[0] as u32 {
             return None;
         }
+        let pre_extra_pointwise_views = pre_extra_tensors
+            .iter()
+            .map(|extra| {
+                let layout = extra.layout();
+                let column = extra.datatype() == DataTypeEnum::F32
+                    && layout.shape().len() == 1
+                    && layout.shape()[0] == k as usize
+                    && layout.offset() == 0
+                    && layout.strides() == [1];
+                if column {
+                    return Some(None);
+                }
+                if extra.datatype() != DataTypeEnum::F32 || layout.shape() != input.layout().shape()
+                {
+                    return None;
+                }
+                let view = flatten_matrix_layout(layout)?;
+                (view.rows == m && view.cols == k).then_some(Some(view))
+            })
+            .collect::<Option<Vec<_>>>()?;
+        let post_extra_pointwise_views = post_extra_tensors
+            .iter()
+            .map(|extra| {
+                let layout = extra.layout();
+                let column = extra.datatype() == DataTypeEnum::F32
+                    && layout.shape().len() == 1
+                    && layout.shape()[0] == n as usize
+                    && layout.offset() == 0
+                    && layout.strides() == [1];
+                if column {
+                    return Some(None);
+                }
+                if extra.datatype() != DataTypeEnum::F32
+                    || layout.shape() != output.layout().shape()
+                {
+                    return None;
+                }
+                let view = flatten_matrix_layout(layout)?;
+                (view.rows == m && view.cols == n).then_some(Some(view))
+            })
+            .collect::<Option<Vec<_>>>()?;
+        let limits = device.limits();
+        let caps = KernelDeviceCaps::from_device(device);
+        let max_workgroups = effective_qmatmul_max_workgroups_per_dimension(&limits);
+        let mut qmatmul_workgroups_x = 1;
+        let y_supports_coop = tile_cooperative_store_layout_supported(&y_view.layout);
+        let variant = select_qmatmul_direct_variant(format, m, k, n, y_supports_coop, caps);
+        // Every direct variant relies on subgroup operations. Route through
+        // the workgroup-tiled qmatmul/qgemv variants unless the device exposes
+        // a subgroup path we trust.
+        let use_workgroup_qmatmul = !caps.subgroup_kernels_supported;
+        let use_coop_acc_init_epilogue = !use_workgroup_qmatmul
+            && pre_expr.is_none()
+            && post_expr.is_some_and(qmatmul_post_expr_is_column_add)
+            && post_extra_pointwise_views.len() == 1
+            && post_extra_pointwise_views[0].is_none()
+            && qmatmul_variant_supports_coop_acc_init(variant, m, k, n, y_supports_coop);
 
         // Build the per-tile epilogue closures once. `None` if the resolver
         // didn't attach an expression; `Some` triggers the `_with_epilogue`
@@ -587,7 +731,7 @@ impl QMatMulOperation {
             let output_datatype = expr.output_datatype;
             Some(tile_ir_kernels::UnaryEpilogueWithExtras::new(
                 "qmatmul_pre_expr",
-                pre_extra_col_vectors.len(),
+                pre_extra_tensors.len(),
                 move |tile| {
                     let input = tile[0].clone();
                     let extras = tile[1..]
@@ -609,13 +753,15 @@ impl QMatMulOperation {
         } else {
             None
         };
-        let post_epilogue_with_extras = if let Some(expr) = post_expr {
+        let post_epilogue_with_extras = if use_coop_acc_init_epilogue {
+            None
+        } else if let Some(expr) = post_expr {
             let expression = expr.expression.clone();
             let input_datatype = expr.input_datatype;
             let output_datatype = expr.output_datatype;
             Some(tile_ir_kernels::UnaryEpilogueWithExtras::new(
                 "qmatmul_post_expr",
-                post_extra_col_vectors.len(),
+                post_extra_tensors.len(),
                 move |tile| {
                     let input = tile[0].clone();
                     let extras = tile[1..]
@@ -644,30 +790,13 @@ impl QMatMulOperation {
             ^ post_epilogue_with_extras
                 .as_ref()
                 .map(|e| e.identity())
-                .unwrap_or(0);
+                .unwrap_or(0)
+            ^ if use_coop_acc_init_epilogue {
+                0xB1A5_C001u64
+            } else {
+                0
+            };
 
-        let limits = device.limits();
-        let caps = KernelDeviceCaps::from_device(device);
-        let max_workgroups = limits.max_compute_workgroups_per_dimension;
-        let mut qmatmul_workgroups_x = 1;
-        let y_supports_coop = tile_cooperative_store_layout_supported(&y_view.layout);
-        let variant = select_qmatmul_direct_variant(format, m, k, n, y_supports_coop, caps);
-        // Every existing variant relies on subgroup ops (qgemv uses
-        // subgroup_reduce_sum, qmatmul shared-tile uses subgroup_id, coop
-        // tiles need the cooperative-matrix extension which itself needs
-        // subgroups). Adapters without `Features::SUBGROUP` (Mesa lavapipe
-        // in Linux CI) hit shader-validation errors on every one of those.
-        // Route through the workgroup-tiled qmatmul/qgemv variants in that
-        // case — same staging strategy as dense `batched_matmul_with_epilogues`,
-        // pure workgroup-memory reductions, no subgroup intrinsics.
-        //
-        // Software adapters (Microsoft WARP on Windows CI) advertise
-        // `Features::SUBGROUP` but the DX12-backed emulation of
-        // `subgroup_reduce_sum` miscompiles for our qmatmul shaders —
-        // the Windows conformance run reports `actual=0.085 expected=-2.52`
-        // and similarly-large mismatches on every quantized matmul case.
-        // Force the workgroup-tiled fallback on those adapters too.
-        let use_workgroup_qmatmul = !caps.subgroups_supported || caps.software_adapter;
         let fast_dispatch_size = if use_workgroup_qmatmul {
             // The workgroup-tiled kernel computes its own grid inside
             // `tile::build`; skip the pre-built-pipeline fast path.
@@ -691,6 +820,7 @@ impl QMatMulOperation {
                 QMatmulDirectVariant::Tile128x64 => Some([n / 64, m / 128, 1]),
                 QMatmulDirectVariant::Tile64x128 => Some([n / 128, m / 64, 1]),
                 QMatmulDirectVariant::Tile64x64Cached => Some([n / 64, m / 64, 1]),
+                QMatmulDirectVariant::Tile64x32 => Some([n / 32, m / 64, 1]),
                 QMatmulDirectVariant::Tile64x64 => None,
             }
         };
@@ -698,8 +828,8 @@ impl QMatMulOperation {
         // The pre-built-pipeline fast path can only be reused when there's no
         // epilogue attached — otherwise the cached pipeline encodes the wrong
         // (no-epilogue) kernel. Skip the fast path entirely when fusing.
-        if pre_extra_col_vectors.is_empty()
-            && post_extra_col_vectors.is_empty()
+        if pre_extra_tensors.is_empty()
+            && post_extra_tensors.is_empty()
             && pre_epilogue_with_extras.is_none()
             && post_epilogue_with_extras.is_none()
             && let Some(dispatch_size) = fast_dispatch_size
@@ -725,8 +855,12 @@ impl QMatMulOperation {
                 return Some(kernel);
             }
             let cache_key = qmatmul_direct_module_key::<QMatmulDirectFastKernelVariant>(
-                |state| variant.hash(state),
                 |state| {
+                    variant.hash(state);
+                    QMATMUL_DIRECT_KERNEL_GENERATION.hash(state);
+                },
+                |state| {
+                    QMATMUL_DIRECT_KERNEL_GENERATION.hash(state);
                     hash_qmatmul_shape(state, format, m, k, n);
                     hash_qmatmul_dispatch_layouts(
                         state,
@@ -764,30 +898,64 @@ impl QMatMulOperation {
         let ir = tile_ir::tile::build(move |phase| {
             let a = tile_storage_read_with_direct_layout(phase, a_view);
             let b = tile_ir_kernels::quantized_matrix(phase, format, k, n);
-            let pre_extra_storages = pre_extra_col_vectors
+            let pre_extra_storage_defs = pre_extra_tensors
                 .iter()
-                .map(|extra| {
-                    let shape = extra.layout().shape();
-                    assert_eq!(shape.len(), 1);
-                    phase.storage_read::<tile_ir::F32, 1>(tile_ir::Shape::new([shape[0] as u32]))
+                .zip(pre_extra_pointwise_views.iter())
+                .map(|(extra, pointwise_view)| {
+                    if let Some(view) = pointwise_view.clone() {
+                        QmatmulExtraStorage::Pointwise(tile_storage_read_with_direct_layout(
+                            phase, view,
+                        ))
+                    } else {
+                        let shape = extra.layout().shape();
+                        assert_eq!(shape.len(), 1);
+                        QmatmulExtraStorage::Column(phase.storage_read::<tile_ir::F32, 1>(
+                            tile_ir::Shape::new([shape[0] as u32]),
+                        ))
+                    }
                 })
                 .collect::<Vec<_>>();
-            let post_extra_storages = post_extra_col_vectors
+            let pre_extra_storages = pre_extra_storage_defs
                 .iter()
-                .map(|extra| {
-                    let shape = extra.layout().shape();
-                    assert_eq!(shape.len(), 1);
-                    phase.storage_read::<tile_ir::F32, 1>(tile_ir::Shape::new([shape[0] as u32]))
+                .map(QmatmulExtraStorage::as_extra)
+                .collect::<Vec<_>>();
+            let post_extra_storage_defs = post_extra_tensors
+                .iter()
+                .zip(post_extra_pointwise_views.iter())
+                .map(|(extra, pointwise_view)| {
+                    if let Some(view) = pointwise_view.clone() {
+                        QmatmulExtraStorage::Pointwise(tile_storage_read_with_direct_layout(
+                            phase, view,
+                        ))
+                    } else {
+                        let shape = extra.layout().shape();
+                        assert_eq!(shape.len(), 1);
+                        QmatmulExtraStorage::Column(phase.storage_read::<tile_ir::F32, 1>(
+                            tile_ir::Shape::new([shape[0] as u32]),
+                        ))
+                    }
                 })
+                .collect::<Vec<_>>();
+            let post_extra_storages = post_extra_storage_defs
+                .iter()
+                .map(QmatmulExtraStorage::as_extra)
                 .collect::<Vec<_>>();
             let y = tile_storage_write_with_direct_layout(phase, y_view);
             let epilogues = tile_ir_kernels::QmatmulEpilogues {
                 pre: None,
                 pre_with_extras: pre_with_extras_for_ir.as_ref(),
-                pre_extra_col_vectors: &pre_extra_storages,
+                pre_extra_inputs: &pre_extra_storages,
                 post: None,
                 post_with_extras: post_with_extras_for_ir.as_ref(),
-                post_extra_col_vectors: &post_extra_storages,
+                post_extra_inputs: &post_extra_storages,
+                post_acc_init_col_vector: match post_extra_storages.first() {
+                    Some(tile_ir_kernels::QmatmulExtra::Column(storage))
+                        if use_coop_acc_init_epilogue =>
+                    {
+                        Some(*storage)
+                    }
+                    _ => None,
+                },
             };
             if use_workgroup_qmatmul {
                 if m == 1 {
@@ -852,6 +1020,11 @@ impl QMatMulOperation {
                         phase, &a, &b, &y, 4, &epilogues,
                     );
                 }
+                QMatmulDirectVariant::Tile64x32 => {
+                    tile_ir_kernels::qmatmul_with_epilogue::<64, 32, 32>(
+                        phase, &a, &b, &y, 4, &epilogues,
+                    );
+                }
                 QMatmulDirectVariant::Tile64x64 => {
                     tile_ir_kernels::qmatmul_with_epilogue::<64, 64, 32>(
                         phase, &a, &b, &y, 4, &epilogues,
@@ -875,8 +1048,10 @@ impl QMatMulOperation {
             |state| {
                 variant.hash(state);
                 epilogue_identity.hash(state);
+                QMATMUL_DIRECT_KERNEL_GENERATION.hash(state);
             },
             |state| {
+                QMATMUL_DIRECT_KERNEL_GENERATION.hash(state);
                 hash_qmatmul_shape(state, format, m, k, n);
                 epilogue_identity.hash(state);
                 hash_qmatmul_dispatch_layouts(
@@ -897,8 +1072,8 @@ impl QMatMulOperation {
             matrix,
             pipeline_key,
             input,
-            pre_extra_col_vectors,
-            post_extra_col_vectors,
+            pre_extra_tensors,
+            post_extra_tensors,
             output,
             dispatch_size,
             || Some(ir),
@@ -959,22 +1134,22 @@ fn qmatmul_direct_kernel_from_ir(
     matrix: &QMatrix,
     pipeline_key: QMatMulDirectPipelineKey,
     input: &TensorData,
-    pre_extra_col_vectors: &[&TensorData],
-    post_extra_col_vectors: &[&TensorData],
+    pre_extra_tensors: &[&TensorData],
+    post_extra_tensors: &[&TensorData],
     output: &TensorData,
     dispatch_size: [u32; 3],
     build_ir: impl FnOnce() -> Option<tile_ir::KernelIr>,
 ) -> Option<DirectKernel> {
-    if !pre_extra_col_vectors.is_empty() || !post_extra_col_vectors.is_empty() {
+    if !pre_extra_tensors.is_empty() || !post_extra_tensors.is_empty() {
         let buffers = std::iter::once(input.buffer().clone())
             .chain(std::iter::once(matrix.buffer().clone()))
             .chain(
-                pre_extra_col_vectors
+                pre_extra_tensors
                     .iter()
                     .map(|tensor| tensor.buffer().clone()),
             )
             .chain(
-                post_extra_col_vectors
+                post_extra_tensors
                     .iter()
                     .map(|tensor| tensor.buffer().clone()),
             )
@@ -1033,6 +1208,13 @@ fn split_workgroups_2d(
     let x = total_workgroups.min(max_workgroups_per_dimension);
     let y = total_workgroups.div_ceil(x);
     (y <= max_workgroups_per_dimension).then_some([x, y])
+}
+
+fn effective_qmatmul_max_workgroups_per_dimension(limits: &wgpu::Limits) -> u32 {
+    limits
+        .max_compute_workgroups_per_dimension
+        .min(QMATMUL_MAX_WORKGROUPS_PER_DIMENSION)
+        .max(1)
 }
 
 fn tile_cooperative_store_layout_supported(layout: &tile_ir::Layout) -> bool {
@@ -1122,6 +1304,45 @@ mod selection_tests {
             (QMatmulDirectVariant::Tile64x64, ctx(q4, false), caps(false)),
         ];
         assert_selector_generates(&selector, cases);
+    }
+
+    #[test]
+    fn coop_acc_init_only_claims_shapes_the_coop_path_will_take() {
+        assert!(qmatmul_variant_supports_coop_acc_init(
+            QMatmulDirectVariant::Tile64x128,
+            64,
+            512,
+            128,
+            true,
+        ));
+        assert!(!qmatmul_variant_supports_coop_acc_init(
+            QMatmulDirectVariant::Tile64x128,
+            63,
+            512,
+            128,
+            true,
+        ));
+        assert!(!qmatmul_variant_supports_coop_acc_init(
+            QMatmulDirectVariant::Tile64x64,
+            2,
+            512,
+            4,
+            true,
+        ));
+        assert!(!qmatmul_variant_supports_coop_acc_init(
+            QMatmulDirectVariant::Tile64x128,
+            64,
+            510,
+            128,
+            true,
+        ));
+        assert!(!qmatmul_variant_supports_coop_acc_init(
+            QMatmulDirectVariant::Tile64x128,
+            64,
+            512,
+            128,
+            false,
+        ));
     }
 
     #[test]
@@ -1330,34 +1551,42 @@ impl Operation for QMatMulOperation {
             return None;
         }
         let extras = &inputs[2..inputs.len() - 1];
-        let pre_extra_col_vectors = extras[..pre_extra_count]
+        let pre_extra_tensors = extras[..pre_extra_count]
             .iter()
             .map(|input| input.as_tensor())
             .collect::<Option<Vec<_>>>()?;
-        let post_extra_col_vectors = extras[pre_extra_count..]
+        let post_extra_tensors = extras[pre_extra_count..]
             .iter()
             .map(|input| input.as_tensor())
             .collect::<Option<Vec<_>>>()?;
         if input.datatype() != DataTypeEnum::F32 || output.datatype() != DataTypeEnum::F32 {
             return None;
         }
-        for extra in &pre_extra_col_vectors {
-            if extra.datatype() != DataTypeEnum::F32
-                || extra.layout().shape().len() != 1
-                || extra.layout().shape()[0] != input.layout().shape().last().copied().unwrap_or(0)
-                || extra.layout().offset() != 0
-                || extra.layout().strides() != [1]
-            {
+        for extra in &pre_extra_tensors {
+            let layout = extra.layout();
+            let column = extra.datatype() == DataTypeEnum::F32
+                && layout.shape().len() == 1
+                && layout.shape()[0] == input.layout().shape().last().copied().unwrap_or(0)
+                && layout.offset() == 0
+                && layout.strides() == [1];
+            let pointwise = extra.datatype() == DataTypeEnum::F32
+                && layout.shape() == input.layout().shape()
+                && flatten_matrix_layout(layout).is_some();
+            if !column && !pointwise {
                 return None;
             }
         }
-        for extra in &post_extra_col_vectors {
-            if extra.datatype() != DataTypeEnum::F32
-                || extra.layout().shape().len() != 1
-                || extra.layout().shape()[0] != output.layout().shape().last().copied().unwrap_or(0)
-                || extra.layout().offset() != 0
-                || extra.layout().strides() != [1]
-            {
+        for extra in &post_extra_tensors {
+            let layout = extra.layout();
+            let column = extra.datatype() == DataTypeEnum::F32
+                && layout.shape().len() == 1
+                && layout.shape()[0] == output.layout().shape().last().copied().unwrap_or(0)
+                && layout.offset() == 0
+                && layout.strides() == [1];
+            let pointwise = extra.datatype() == DataTypeEnum::F32
+                && layout.shape() == output.layout().shape()
+                && flatten_matrix_layout(layout).is_some();
+            if !column && !pointwise {
                 return None;
             }
         }
@@ -1369,8 +1598,8 @@ impl Operation for QMatMulOperation {
             DirectKernelTensors {
                 input,
                 matrix,
-                pre_extra_col_vectors: &pre_extra_col_vectors,
-                post_extra_col_vectors: &post_extra_col_vectors,
+                pre_extra_tensors: &pre_extra_tensors,
+                post_extra_tensors: &post_extra_tensors,
                 output,
             },
             self.name(),
@@ -1436,13 +1665,9 @@ impl QMatMulOperation {
         // `qgemv_q4k_paired` emits `subgroup_id` / `subgroup_reduce_*` ops
         // with no workgroup-only fallback yet, so adapters without
         // `Features::SUBGROUP` (Mesa lavapipe in Linux CI) trip shader
-        // validation. Software adapters (Microsoft WARP on Windows CI)
-        // pass validation but miscompile the DX12 subgroup-reduce
-        // emulation. In both cases bail so the operation falls back to its
-        // unfused compute graph, which routes the underlying qmatmul
-        // through the workgroup-tiled kernel.
+        // validation.
         let device = graph.device();
-        if !device.subgroups_supported() || device.is_software_adapter() {
+        if !device.subgroups_supported() {
             return None;
         }
         let format = tile_ir::GgmlQuantFormat::Q4K;
@@ -1461,7 +1686,7 @@ impl QMatMulOperation {
         }
 
         let limits = graph.device().limits();
-        let max_workgroups = limits.max_compute_workgroups_per_dimension;
+        let max_workgroups = effective_qmatmul_max_workgroups_per_dimension(&limits);
         let (dispatch_size, workgroups_x) =
             tile_ir_kernels::qgemv_q4k_paired_dispatch(pair_len, m, max_workgroups)?;
 

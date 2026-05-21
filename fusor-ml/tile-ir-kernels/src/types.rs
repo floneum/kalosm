@@ -306,19 +306,31 @@ pub struct QmatmulEpilogues<'a> {
     /// Optional activation transform applied before each dot product.
     pub pre: Option<&'a UnaryEpilogue>,
     /// Optional activation transform that consumes the loaded activation plus
-    /// per-input-column extra vectors.
+    /// ordered extra inputs.
     pub pre_with_extras: Option<&'a UnaryEpilogueWithExtras>,
-    /// Rank-1 vectors indexed by input column and passed after the activation
-    /// tile to `pre_with_extras`.
-    pub pre_extra_col_vectors: &'a [Storage<F32, 1>],
+    /// Ordered extra inputs passed after the activation tile to
+    /// `pre_with_extras`.
+    pub pre_extra_inputs: &'a [QmatmulExtra<'a>],
     /// Optional output transform applied after the reduction.
     pub post: Option<&'a UnaryEpilogue>,
     /// Optional output transform that consumes the reduced output plus
     /// per-column extra vectors.
     pub post_with_extras: Option<&'a UnaryEpilogueWithExtras>,
-    /// Rank-1 vectors indexed by output column and passed after the reduced
-    /// output tile to `post_with_extras`.
-    pub post_extra_col_vectors: &'a [Storage<F32, 1>],
+    /// Ordered extra inputs passed after the reduced output tile to
+    /// `post_with_extras`.
+    pub post_extra_inputs: &'a [QmatmulExtra<'a>],
+    /// Optional rank-1 vector that is added to the accumulator before the
+    /// cooperative store. This is a lowering choice for expressions whose
+    /// post-op can be represented as `acc + column_vector`.
+    pub post_acc_init_col_vector: Option<&'a Storage<F32, 1>>,
+}
+
+#[derive(Clone, Copy)]
+pub enum QmatmulExtra<'a> {
+    /// Rank-1 vector indexed by input/output column.
+    Column(&'a Storage<F32, 1>),
+    /// Rank-2 tensor indexed pointwise by the qmatmul dispatch row/column.
+    Pointwise(&'a Storage<F32, 2>),
 }
 
 impl<'a> QmatmulEpilogues<'a> {
@@ -332,10 +344,11 @@ impl<'a> QmatmulEpilogues<'a> {
         Self {
             pre: None,
             pre_with_extras: None,
-            pre_extra_col_vectors: &[],
+            pre_extra_inputs: &[],
             post: Some(post),
             post_with_extras: None,
-            post_extra_col_vectors: &[],
+            post_extra_inputs: &[],
+            post_acc_init_col_vector: None,
         }
     }
 
@@ -344,10 +357,11 @@ impl<'a> QmatmulEpilogues<'a> {
         Self {
             pre: Some(pre),
             pre_with_extras: None,
-            pre_extra_col_vectors: &[],
+            pre_extra_inputs: &[],
             post: None,
             post_with_extras: None,
-            post_extra_col_vectors: &[],
+            post_extra_inputs: &[],
+            post_acc_init_col_vector: None,
         }
     }
 }

@@ -39,6 +39,26 @@ pub(crate) trait Operation: Debug + 'static {
 
     fn name(&self) -> String;
 
+    fn as_nary(&self) -> Option<&crate::nary_wise::NaryOperation> {
+        None
+    }
+
+    fn as_reduce(&self) -> Option<&crate::reduce::ReduceOperation> {
+        None
+    }
+
+    fn as_matmul(&self) -> Option<&crate::matmul::MatMulOperation> {
+        None
+    }
+
+    fn as_resize(&self) -> Option<&crate::resize::ResizeOperation> {
+        None
+    }
+
+    fn as_slice_assign(&self) -> Option<&crate::slice_assign::SliceAssignOperation> {
+        None
+    }
+
     /// Hash structural operation fields that affect generated kernel IR.
     ///
     /// The concrete operation type is added by `kernel_module_key_with_dispatch`;

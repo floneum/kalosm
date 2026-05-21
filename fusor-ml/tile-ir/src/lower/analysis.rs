@@ -38,6 +38,8 @@ impl<'a> Lowerer<'a> {
             TileStmt::ZeroCoopAcc { .. }
             | TileStmt::Barrier
             | TileStmt::Mma { .. }
+            | TileStmt::LoadCoopBroadcast { .. }
+            | TileStmt::SetCoopAcc { .. }
             | TileStmt::StoreCoopAcc { .. } => {}
             TileStmt::If {
                 condition,
@@ -159,9 +161,11 @@ impl<'a> Lowerer<'a> {
             TileStmt::LoadCoop { row, col, .. } => {
                 Self::tile_expr_any(row, pred) || Self::tile_expr_any(col, pred)
             }
+            TileStmt::LoadCoopBroadcast { col, .. } => Self::tile_expr_any(col, pred),
             TileStmt::ZeroCoopAcc { .. }
             | TileStmt::Barrier
             | TileStmt::Mma { .. }
+            | TileStmt::SetCoopAcc { .. }
             | TileStmt::Break
             | TileStmt::Return => false,
         }
@@ -243,7 +247,9 @@ impl<'a> Lowerer<'a> {
                 s,
                 TileStmt::ZeroCoopAcc { .. }
                     | TileStmt::LoadCoop { .. }
+                    | TileStmt::LoadCoopBroadcast { .. }
                     | TileStmt::Mma { .. }
+                    | TileStmt::SetCoopAcc { .. }
                     | TileStmt::StoreCoopAcc { .. }
             )
         })
