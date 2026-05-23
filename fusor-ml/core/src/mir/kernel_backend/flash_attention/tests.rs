@@ -404,8 +404,7 @@ async fn decode_gqa_non_tiled_large_blocks_match_cpu_reference() {
 
     // On devices that support the larger workgroups, 200 uses the 512
     // block and 600 uses the 1024 block.
-    for (kv_len, expected_block) in [(200usize, DecodeBlock::Medium), (600, DecodeBlock::Large)]
-    {
+    for (kv_len, expected_block) in [(200usize, DecodeBlock::Medium), (600, DecodeBlock::Large)] {
         if choose_decode_block(kv_len as u32, caps) != Some(expected_block) {
             continue;
         }
@@ -449,8 +448,7 @@ async fn streaming_gqa_regression_shape_builds_direct_kernel() {
                     .map(|token| {
                         (0..TEST_HEAD_DIM)
                             .map(|dim| {
-                                let value =
-                                    ((head * 17 + token * 11 + dim * 5) % 41) as f32 - 20.0;
+                                let value = ((head * 17 + token * 11 + dim * 5) % 41) as f32 - 20.0;
                                 value * 0.002
                             })
                             .collect::<Vec<_>>()

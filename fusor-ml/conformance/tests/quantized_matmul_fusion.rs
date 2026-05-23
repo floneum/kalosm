@@ -1,7 +1,7 @@
 mod common;
 
 use common::quantized::{
-    deterministic_input, q4k_raw_bytes, q6k_raw_bytes, q8_0_raw_bytes, q_mat_mul_input_fuzz,
+    deterministic_input, q_mat_mul_input_fuzz, q4k_raw_bytes, q6k_raw_bytes, q8_0_raw_bytes,
     qmatrix_from_raw_bytes,
 };
 use fusor::{Device, Tensor};

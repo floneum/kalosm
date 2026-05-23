@@ -29,7 +29,10 @@ async fn main() {
     while let Some(token) = response.next().await {
         if first_token_at.is_none() {
             first_token_at = Some(t_prefill.elapsed());
-            eprintln!("[timing] first token (prefill): {:.2?}", first_token_at.unwrap());
+            eprintln!(
+                "[timing] first token (prefill): {:.2?}",
+                first_token_at.unwrap()
+            );
         }
         token_count += 1;
         print!("{}", token);

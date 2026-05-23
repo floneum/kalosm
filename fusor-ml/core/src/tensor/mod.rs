@@ -84,6 +84,57 @@ impl<const R: usize, D> Tensor<R, D> {
 
 impl<const R: usize> Tensor<R, f32> {
     pub fn q_mat_mul_add2(&self, other: &QMatrix, first: &Self, second: &Self) -> Self {
+        // When M is unaligned, pad the activation, the two residuals, and
+        // the matmul output back to a multiple of 64/128 so the matmul
+        // kernel takes the coop-tile fast path. The slice at the end
+        // narrows everything back to the caller's shape.
+        if R >= 2 {
+            let in_shape = self.shape();
+            let m = in_shape[R - 2];
+            let n = other.shape()[0];
+            if let Some(padded_m) =
+                crate::quantized::matmul::qmatmul_m_pad_target_pub(m, n)
+            {
+                let mut padded_in_shape = *in_shape;
+                padded_in_shape[R - 2] = padded_m;
+                let device = self.device().clone();
+                let zero_in: Tensor<R, f32> = Tensor::splat(&device, 0.0, padded_in_shape);
+                let mut in_ranges: [Range<usize>; R] =
+                    std::array::from_fn(|i| 0..in_shape[i]);
+                in_ranges[R - 2] = 0..m;
+                let padded_self = zero_in.slice_assign(in_ranges, self);
+
+                // first / second are shaped like the matmul output:
+                // replace dim R-2 with padded_m, keep last dim = N.
+                let first_shape = first.shape();
+                let mut padded_out_shape = *first_shape;
+                padded_out_shape[R - 2] = padded_m;
+                let zero_first: Tensor<R, f32> =
+                    Tensor::splat(&device, 0.0, padded_out_shape);
+                let mut out_ranges: [Range<usize>; R] =
+                    std::array::from_fn(|i| 0..first_shape[i]);
+                out_ranges[R - 2] = 0..m;
+                let padded_first = zero_first.slice_assign(out_ranges.clone(), first);
+                let zero_second: Tensor<R, f32> =
+                    Tensor::splat(&device, 0.0, padded_out_shape);
+                let padded_second = zero_second.slice_assign(out_ranges, second);
+
+                let padded_result =
+                    padded_self.q_mat_mul_add2(other, &padded_first, &padded_second);
+
+                // Narrow result back to original M via a layout view.
+                let result_shape = *padded_result.shape();
+                let specs: [crate::StrideSpec; R] = std::array::from_fn(|i| {
+                    if i == R - 2 {
+                        crate::StrideSpec::dim(i, m)
+                    } else {
+                        crate::StrideSpec::dim(i, result_shape[i])
+                    }
+                });
+                return padded_result.restride(specs);
+            }
+        }
+
         let mut operation = QMatMulOperation::new(
             DataTypeEnum::F32,
             self.shape(),
@@ -147,6 +198,35 @@ impl<const R: usize> Tensor<R, f32> {
             other.shape()[0].is_multiple_of(2),
             "paired q_mat_mul requires an even output dimension"
         );
+        // Pad activation M to unlock the coop-tile matmul path; narrow
+        // the output back to the original M with a layout view.
+        if R >= 2 {
+            let in_shape = self.shape();
+            let m = in_shape[R - 2];
+            let n = other.shape()[0];
+            if let Some(padded_m) =
+                crate::quantized::matmul::qmatmul_m_pad_target_pub(m, n)
+            {
+                let mut padded_in_shape = *in_shape;
+                padded_in_shape[R - 2] = padded_m;
+                let device = self.device().clone();
+                let zero_in: Tensor<R, f32> = Tensor::splat(&device, 0.0, padded_in_shape);
+                let mut in_ranges: [Range<usize>; R] =
+                    std::array::from_fn(|i| 0..in_shape[i]);
+                in_ranges[R - 2] = 0..m;
+                let padded_self = zero_in.slice_assign(in_ranges, self);
+                let padded_result = padded_self.q_mat_mul_paired_silu_product(other);
+                let result_shape = *padded_result.shape();
+                let specs: [crate::StrideSpec; R] = std::array::from_fn(|i| {
+                    if i == R - 2 {
+                        crate::StrideSpec::dim(i, m)
+                    } else {
+                        crate::StrideSpec::dim(i, result_shape[i])
+                    }
+                });
+                return padded_result.restride(specs);
+            }
+        }
         let pair_len = other.shape()[0] / 2;
         let dtype = DataTypeEnum::F32;
         let gate = NaryExpr::input(0, 1);

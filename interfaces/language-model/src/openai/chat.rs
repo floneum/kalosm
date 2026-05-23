@@ -208,11 +208,11 @@ struct OpenAICompatibleChatResponseChoiceMessage {
 impl ChatModel<GenerationParameters> for OpenAICompatibleChatModel {
     fn add_messages_with_callback<'a>(
         &'a self,
-        session: &'a mut Self::ChatSession,
-        messages: &[crate::ChatMessage],
+        mut session: Self::ChatSession,
+        messages: &'a [crate::ChatMessage],
         sampler: GenerationParameters,
         mut on_token: impl FnMut(String) -> Result<(), Self::Error> + Send + Sync + 'static,
-    ) -> impl Future<Output = Result<(), Self::Error>> + Send + 'a {
+    ) -> impl Future<Output = Result<Self::ChatSession, Self::Error>> + Send + 'a {
         let myself = &*self.inner;
         let messages = format_messages(messages);
         let json = build_openai_request_json(&myself.model, messages, &sampler, None);
@@ -220,15 +220,14 @@ impl ChatModel<GenerationParameters> for OpenAICompatibleChatModel {
         async move {
             let mut event_source = build_openai_event_source(&myself.client, &json)?;
 
-            let new_message_text =
-                consume_openai_stream(&mut event_source, &mut on_token).await?;
+            let new_message_text = consume_openai_stream(&mut event_source, &mut on_token).await?;
 
             let new_message =
                 crate::ChatMessage::new(crate::MessageType::ModelAnswer, new_message_text);
 
             session.messages.push(new_message);
 
-            Ok(())
+            Ok(session)
         }
     }
 }
@@ -251,12 +250,15 @@ where
 {
     fn add_message_with_callback_and_constraints<'a>(
         &'a self,
-        session: &'a mut Self::ChatSession,
-        messages: &[crate::ChatMessage],
+        mut session: Self::ChatSession,
+        messages: &'a [crate::ChatMessage],
         sampler: GenerationParameters,
         _: crate::SchemaParser<P>,
         mut on_token: impl FnMut(String) -> Result<(), Self::Error> + Send + Sync + 'static,
-    ) -> impl Future<Output = Result<P, Self::Error>> + Send + 'a {
+    ) -> impl Future<Output = Result<(Self::ChatSession, P), Self::Error>> + Send + 'a
+    where
+        P: 'a,
+    {
         let schema = P::schema();
         let mut schema: serde_json::Result<serde_json::Value> =
             serde_json::from_str(&schema.to_string());
@@ -281,8 +283,7 @@ where
             let json = json?;
             let mut event_source = build_openai_event_source(&myself.client, &json)?;
 
-            let new_message_text =
-                consume_openai_stream(&mut event_source, &mut on_token).await?;
+            let new_message_text = consume_openai_stream(&mut event_source, &mut on_token).await?;
 
             let result = serde_json::from_str::<P>(&new_message_text).map_err(|err| {
                 tracing::error!(
@@ -296,7 +297,7 @@ where
 
             session.messages.push(new_message);
 
-            Ok(result)
+            Ok((session, result))
         }
     }
 }
@@ -381,9 +382,7 @@ async fn consume_openai_stream(
                             ))
                         }
                         FinishReason::FunctionCall => {
-                            return Err(
-                                OpenAICompatibleChatModelError::FunctionCallsNotSupported,
-                            )
+                            return Err(OpenAICompatibleChatModelError::FunctionCallsNotSupported)
                         }
                         _ => break,
                     }
@@ -465,7 +464,7 @@ mod tests {
             )
             .build();
 
-        let mut session = model.new_chat_session().unwrap();
+        let session = model.new_chat_session().unwrap();
 
         let messages = vec![crate::ChatMessage::new(
             crate::MessageType::UserMessage,
@@ -477,9 +476,9 @@ mod tests {
             ),
         )];
         let all_text = Arc::new(RwLock::new(String::new()));
-        model
+        let _session = model
             .add_messages_with_callback(
-                &mut session,
+                session,
                 &messages,
                 GenerationParameters::default().with_seed(1234),
                 {
@@ -512,7 +511,7 @@ mod tests {
             )
             .build();
 
-        let mut session = model.new_chat_session().unwrap();
+        let session = model.new_chat_session().unwrap();
 
         let messages = vec![crate::ChatMessage::new(
             crate::MessageType::UserMessage,
@@ -525,9 +524,9 @@ mod tests {
             primes: Vec<u8>,
         }
 
-        let response: Constraints = model
+        let (_session, response): (_, Constraints) = model
             .add_message_with_callback_and_constraints(
-                &mut session,
+                session,
                 &messages,
                 GenerationParameters::default(),
                 SchemaParser::new(),
@@ -582,9 +581,9 @@ mod tests {
             "What name, if any does this sentence contain: Evan is one of the developers of Kalosm".to_string(),
         )];
 
-            let response: Constraints = model
+            let (next_session, response): (_, Constraints) = model
                 .add_message_with_callback_and_constraints(
-                    &mut session,
+                    session,
                     &messages,
                     GenerationParameters::default(),
                     SchemaParser::new(),
@@ -601,6 +600,7 @@ mod tests {
                 )
                 .await
                 .unwrap();
+            session = next_session;
             println!("{response:?}");
 
             let all_text = all_text.read().unwrap();
@@ -617,9 +617,9 @@ mod tests {
                 "What name, if any does this sentence contain: The earth is round".to_string(),
             )];
 
-            let response: Constraints = model
+            let (next_session, response): (_, Constraints) = model
                 .add_message_with_callback_and_constraints(
-                    &mut session,
+                    session,
                     &messages,
                     GenerationParameters::default(),
                     SchemaParser::new(),
@@ -636,6 +636,7 @@ mod tests {
                 )
                 .await
                 .unwrap();
+            let _ = next_session;
             println!("{response:?}");
 
             let all_text = all_text.read().unwrap();
@@ -682,9 +683,9 @@ mod tests {
                     .to_string(),
             )];
 
-            let response: Constraints = model
+            let (next_session, response): (_, Constraints) = model
                 .add_message_with_callback_and_constraints(
-                    &mut session,
+                    session,
                     &messages,
                     GenerationParameters::default(),
                     SchemaParser::new(),
@@ -701,6 +702,7 @@ mod tests {
                 )
                 .await
                 .unwrap();
+            session = next_session;
             println!("{response:?}");
 
             let all_text = all_text.read().unwrap();
@@ -717,9 +719,9 @@ mod tests {
                 "Does this sentence contain a name: The earth is round".to_string(),
             )];
 
-            let response: Constraints = model
+            let (next_session, response): (_, Constraints) = model
                 .add_message_with_callback_and_constraints(
-                    &mut session,
+                    session,
                     &messages,
                     GenerationParameters::default(),
                     SchemaParser::new(),
@@ -736,6 +738,7 @@ mod tests {
                 )
                 .await
                 .unwrap();
+            let _ = next_session;
             println!("{response:?}");
 
             let all_text = all_text.read().unwrap();

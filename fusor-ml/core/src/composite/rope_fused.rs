@@ -205,12 +205,14 @@ impl RopeFusedOperation {
         let input_val = NaryExpr::input(0, rank);
 
         // Build cos/sin index based on mode
-        let cos_sin_indices = build_cos_sin_indices(dim_seq, dim_last.clone(), self.head_dim, self.mode);
+        let cos_sin_indices =
+            build_cos_sin_indices(dim_seq, dim_last.clone(), self.head_dim, self.mode);
         let cos_val = NaryExpr::indexed_input(1, cos_sin_indices.clone());
         let sin_val = NaryExpr::indexed_input(2, cos_sin_indices);
 
         // Build neighbor access
-        let neighbor_last_dim = build_neighbor_index_component(dim_last.clone(), self.head_dim, self.mode);
+        let neighbor_last_dim =
+            build_neighbor_index_component(dim_last.clone(), self.head_dim, self.mode);
         let neighbor_indices = self.build_indices_with_replaced_last(neighbor_last_dim);
         let neighbor_val = NaryExpr::indexed_input(0, neighbor_indices);
 
@@ -436,7 +438,6 @@ impl RopePairFusedOperation {
         let neighbor_times_sin = NaryExpr::mul(neighbor_val, sin_with_sign, self.datatype);
         NaryExpr::add(input_times_cos, neighbor_times_sin, self.datatype)
     }
-
 }
 
 fn row_major_strides(shape: &[usize; 4]) -> Vec<usize> {

@@ -669,7 +669,6 @@ impl QmatmulExtraStorage {
     }
 }
 
-
 fn qmatrix_direct_quant_format(matrix: &QMatrix) -> Option<tile_ir::GgmlQuantFormat> {
     Some(match matrix.datatype() {
         GgmlType::Q4_0 => tile_ir::GgmlQuantFormat::Q4_0,
@@ -827,9 +826,77 @@ fn qgemv_cols_per_workgroup_for_direct(format: tile_ir::GgmlQuantFormat, k: u32,
     }
 }
 
+/// Public re-export of [`qmatmul_m_pad_target`] for crate-internal callers
+/// outside this module (e.g. the fused `q_mat_mul_*` helpers on `Tensor`).
+pub(crate) fn qmatmul_m_pad_target_pub(m: usize, n: usize) -> Option<usize> {
+    qmatmul_m_pad_target(m, n)
+}
+
+/// When `M` (= `input_shape[R-2]`) is unaligned and would land on the
+/// catch-all `Tile64x64` variant without `coop_acc_init`, return the M
+/// padding target that lets `qmatmul_variant_supports_coop_acc_init` fire.
+/// Returns `None` if no padding helps (M already aligned, M == 1, or
+/// matrix N is too small for any coop tile).
+fn qmatmul_m_pad_target(m: usize, n: usize) -> Option<usize> {
+    // SingleRow path handles M == 1 specially; don't pad.
+    if m <= 1 {
+        return None;
+    }
+    // Already aligned to 64 — selector will already pick a coop variant.
+    if m.is_multiple_of(64) {
+        return None;
+    }
+    // Coop variants all need N % 64 == 0 at minimum.
+    if !n.is_multiple_of(64) {
+        return None;
+    }
+    // Prefer 128-aligned padding when N % 128 == 0 so we can hit
+    // Tile128x128 / Tile128x64.
+    let pad = if n.is_multiple_of(128) { 128 } else { 64 };
+    let padded = m.div_ceil(pad) * pad;
+    Some(padded)
+}
+
 impl<const R: usize> Tensor<R, f32> {
     pub fn q_mat_mul(&self, other: &QMatrix) -> Self {
-        self.add_q_mat_mul(other)
+        if R < 2 {
+            return self.add_q_mat_mul(other);
+        }
+        let in_shape = self.shape();
+        let m = in_shape[R - 2];
+        let n = other.shape()[0];
+        let Some(padded_m) = qmatmul_m_pad_target(m, n) else {
+            return self.add_q_mat_mul(other);
+        };
+
+        // Build padded input shape: replace dim R-2 with padded_m.
+        let mut padded_shape = *in_shape;
+        padded_shape[R - 2] = padded_m;
+
+        // Allocate a zero-filled padded buffer and copy `self` into rows
+        // `0..m`. The trailing `padded_m - m` rows stay zero so they
+        // contribute nothing to the dot product.
+        let device = self.device().clone();
+        let padded_input: Tensor<R, f32> = Tensor::splat(&device, 0.0, padded_shape);
+        let mut ranges: [std::ops::Range<usize>; R] = std::array::from_fn(|i| 0..in_shape[i]);
+        ranges[R - 2] = 0..m;
+        let padded_input = padded_input.slice_assign(ranges, self);
+
+        // Run the aligned matmul.
+        let padded_out = padded_input.add_q_mat_mul(other);
+
+        // Narrow the output back to the caller's M along dim R-2 via
+        // a restride view. All other dims are full-size, so this is a
+        // pure layout change (no copy).
+        let out_shape = *padded_out.shape();
+        let specs: [crate::StrideSpec; R] = std::array::from_fn(|i| {
+            if i == R - 2 {
+                crate::StrideSpec::dim(i, m)
+            } else {
+                crate::StrideSpec::dim(i, out_shape[i])
+            }
+        });
+        padded_out.restride(specs)
     }
 }
 
@@ -838,7 +905,3 @@ impl<const R: usize> Tensor<R, half::f16> {
         self.cast::<f32>().q_mat_mul(other).cast()
     }
 }
-
-
-
-

@@ -469,7 +469,10 @@ impl Resolver {
         }
     }
 
-    pub(super) fn get_input_node_in_exec_graph(&self, inner_input: NodeIndex) -> Option<ExecutionNodeIndex> {
+    pub(super) fn get_input_node_in_exec_graph(
+        &self,
+        inner_input: NodeIndex,
+    ) -> Option<ExecutionNodeIndex> {
         self.node_mapping.get(&inner_input).copied()
     }
 
@@ -594,5 +597,4 @@ impl Resolver {
             }
         }
     }
-
 }

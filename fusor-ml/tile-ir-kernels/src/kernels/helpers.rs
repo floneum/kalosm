@@ -358,9 +358,7 @@ pub(super) fn load_qmatmul_extra(
 ) -> Tile<F32> {
     match extra {
         QmatmulExtra::Column(vector) => program.load(vector.at(col), col.lt(n_cols), 0.0),
-        QmatmulExtra::Pointwise(tensor) => {
-            program.load(tensor.at((row, col)), col.lt(n_cols), 0.0)
-        }
+        QmatmulExtra::Pointwise(tensor) => program.load(tensor.at((row, col)), col.lt(n_cols), 0.0),
     }
 }
 

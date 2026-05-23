@@ -33,11 +33,7 @@ pub const fn qgemv_cols_per_workgroup(format: GgmlQuantFormat) -> u32 {
 ///
 /// This includes the Q4K/Q6K GGML specializations whose column grouping
 /// depends on both K (`rows`) and N (`cols`).
-pub fn qgemv_cols_per_workgroup_for_shape(
-    format: GgmlQuantFormat,
-    rows: u32,
-    cols: u32,
-) -> u32 {
+pub fn qgemv_cols_per_workgroup_for_shape(format: GgmlQuantFormat, rows: u32, cols: u32) -> u32 {
     if matches!(format, GgmlQuantFormat::Q4K) && rows <= 4096 && (4096..8192).contains(&cols) {
         return q4k_mid_override(q4k_default_mid(rows, cols)).cols_per_workgroup();
     }

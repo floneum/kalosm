@@ -693,10 +693,8 @@ where
                     "[timing] vision graph build={:.2?} materialize={:.2?} (mat_only={:.2?})",
                     build_elapsed, materialize_elapsed, mat_elapsed
                 );
-                embeddings = embeddings.slice_assign(
-                    [0..batch_size, range, 0..embed_dim],
-                    &image_embeds_3d,
-                );
+                embeddings =
+                    embeddings.slice_assign([0..batch_size, range, 0..embed_dim], &image_embeds_3d);
             }
             let (new_pos_ids, new_start_time) =
                 vision_encoder.get_rope_index(&tokens, &grid_thw, &self.config, start_time)?;
@@ -738,8 +736,12 @@ where
         F: CastTo<f32> + CastTensor<f32> + Default,
         f32: CastTo<F> + CastTensor<F>,
     {
+        let t_encode = std::time::Instant::now();
         let (mut layer_in, seq_len, index_pos, pos_ids) =
             self.encode_tokens(tokens, images, device, cache.as_deref_mut())?;
+        let _trace_text_prefill = seq_len > 1 && std::env::var_os("KALOSM_TRACE_TEXT").is_some();
+        eprintln!("[timing] encode_tokens (incl. vision): {:.2?} seq_len={}", t_encode.elapsed(), seq_len);
+        let t_text_layers = std::time::Instant::now();
         let trace_layer_nan = seq_len == 1 && std::env::var_os("KALOSM_TRACE_LAYER_NAN").is_some();
         if trace_layer_nan {
             let probe: fusor::Tensor<3, f32> = layer_in.cast();
@@ -827,6 +829,7 @@ where
                 debug_check_nan_f32(&probe, i, "ffn_unfused", index_pos);
             }
         }
+        eprintln!("[timing] text layer loop: {:.2?}", t_text_layers.elapsed());
         let x = self.norm.forward_generic(&layer_in);
         let x = x.i((.., seq_len - 1, ..));
         Ok(x.cast::<f32>())

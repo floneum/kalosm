@@ -4,6 +4,7 @@ use crate::raw::Model;
 use crate::token_stream::TokenOutputStream;
 use crate::token_stream::TokenOutputStreamError;
 use crate::tokenizer::{LlamaTokenizer, LlamaTokenizerError};
+#[cfg(feature = "hf-config-json")]
 use crate::LlamaConfigJson;
 use fusor::AddOp;
 use fusor::CastTensor;
@@ -380,6 +381,7 @@ where
         };
 
         // Download the config file if it exists
+        #[cfg(feature = "hf-config-json")]
         let config_bytes = match &builder.source.config {
             Some(config) => {
                 let config_source = format!("Config ({config})");
@@ -392,6 +394,13 @@ where
                 Some(config_bytes)
             }
             None => None,
+        };
+        #[cfg(not(feature = "hf-config-json"))]
+        let config_bytes: Option<Vec<u8>> = {
+            if builder.source.config.is_some() {
+                return Err(LlamaSourceError::ConfigJsonFeatureDisabled);
+            }
+            None
         };
 
         #[cfg(feature = "vision")]
@@ -443,6 +452,7 @@ where
                     None
                 };
 
+                #[cfg(feature = "hf-config-json")]
                 let config = match config_bytes {
                     Some(config_bytes) => {
                         let config: LlamaConfigJson = serde_json::from_slice(&config_bytes)
@@ -450,6 +460,11 @@ where
                         config.rope_scaling
                     }
                     None => None,
+                };
+                #[cfg(not(feature = "hf-config-json"))]
+                let config = {
+                    let _ = config_bytes;
+                    None
                 };
 
                 let override_stop_token_string = builder.source.override_stop_token_string;

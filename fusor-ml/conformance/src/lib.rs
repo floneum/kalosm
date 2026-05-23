@@ -13,8 +13,9 @@ use rand::rngs::StdRng;
 
 pub use builder::AssertBuilder;
 pub use comparison::{
-    CompareFut, IntoCompare, ItemMismatchError, approx_compare, approx_eq, approx_or_relative_compare,
-    approx_or_relative_eq, eq_with, exact_compare, exact_eq, relative_compare, relative_eq,
+    CompareFut, IntoCompare, ItemMismatchError, approx_compare, approx_eq,
+    approx_or_relative_compare, approx_or_relative_eq, eq_with, exact_compare, exact_eq,
+    relative_compare, relative_eq,
 };
 pub use fuzz::{FuzzGenerator, FuzzSizeSpec, GenerateFromDevice, IntoFuzzShape};
 pub use tuple_macros::{AsyncFnMutTuple, GenTuple, PopTuple, PushTuple, ResolveTensorTuple};

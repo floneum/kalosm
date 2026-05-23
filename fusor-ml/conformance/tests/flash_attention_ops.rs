@@ -319,15 +319,15 @@ async fn flash_attention_decode_tiled_matches_cpu_reference() {
     // to span tile counts (2..=5 tiles) and to land just over the BLOCK=128
     // boundary.
     let shapes = [
-        (16, 2, 129),  // just past one full tile
-        (16, 2, 192),  // mid-second tile
-        (16, 2, 256),  // exactly two full tiles
-        (16, 2, 257),  // just past two full tiles (start of third)
-        (16, 2, 384),  // exactly three full tiles
-        (16, 2, 511),  // last lane of fourth tile inactive
-        (16, 2, 512),  // exactly four full tiles
-        (16, 2, 569),  // five tiles, matches Qwen-3B decode failure
-        (32, 8, 200),  // larger GQA group, kv_seq_len in second tile
+        (16, 2, 129), // just past one full tile
+        (16, 2, 192), // mid-second tile
+        (16, 2, 256), // exactly two full tiles
+        (16, 2, 257), // just past two full tiles (start of third)
+        (16, 2, 384), // exactly three full tiles
+        (16, 2, 511), // last lane of fourth tile inactive
+        (16, 2, 512), // exactly four full tiles
+        (16, 2, 569), // five tiles, matches Qwen-3B decode failure
+        (32, 8, 200), // larger GQA group, kv_seq_len in second tile
     ];
 
     for (num_heads, num_kv_heads, kv_seq_len) in shapes {
@@ -341,8 +341,7 @@ async fn flash_attention_decode_tiled_matches_cpu_reference() {
         };
         // Run each shape several times to catch non-deterministic kernel races.
         for trial in 0..4 {
-            assert_flash_attention_case(case, None, 1e-3)
-                .await;
+            assert_flash_attention_case(case, None, 1e-3).await;
             let _ = trial;
         }
     }
@@ -356,12 +355,7 @@ async fn flash_attention_decode_tiled_matches_cpu_reference() {
 /// inside `flash_decode_small_block`.
 #[tokio::test]
 async fn flash_attention_decode_tiled_with_transposed_q_matches_cpu_reference() {
-    let shapes = [
-        (16, 2, 129),
-        (16, 2, 257),
-        (16, 2, 384),
-        (16, 2, 569),
-    ];
+    let shapes = [(16, 2, 129), (16, 2, 257), (16, 2, 384), (16, 2, 569)];
 
     for (num_heads, num_kv_heads, kv_seq_len) in shapes {
         let head_dim = 128;
@@ -402,11 +396,8 @@ async fn flash_attention_decode_tiled_with_transposed_q_matches_cpu_reference() 
             // it comes out of the QKV matmul before reshape+transpose) and
             // then transpose(1, 2) to get [batch, num_heads, q_seq_len, head_dim]
             // with non-canonical strides — the same layout the model uses.
-            let q_pre: Tensor<4, f32> = Tensor::from_slice(
-                &device,
-                [batch, q_seq_len, num_heads, head_dim],
-                &q_data,
-            );
+            let q_pre: Tensor<4, f32> =
+                Tensor::from_slice(&device, [batch, q_seq_len, num_heads, head_dim], &q_data);
             let q = q_pre.transpose(1, 2).to_concrete();
             let k: Tensor<4, f32> = Tensor::from_slice(
                 &device,
@@ -420,9 +411,7 @@ async fn flash_attention_decode_tiled_with_transposed_q_matches_cpu_reference() 
             );
             // Several trials to catch races.
             for _ in 0..4 {
-                let actual = q
-                    .flash_attention(&k, &v, scale, None)
-                    .to_concrete();
+                let actual = q.flash_attention(&k, &v, scale, None).to_concrete();
                 approx_eq(&actual, &expected, 1e-3).await.unwrap();
             }
         }

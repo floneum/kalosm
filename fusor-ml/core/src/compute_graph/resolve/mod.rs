@@ -376,5 +376,4 @@ impl Resolver {
             resolved_set,
         }
     }
-
 }

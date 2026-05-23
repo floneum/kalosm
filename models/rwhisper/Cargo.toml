@@ -14,14 +14,13 @@ rand.workspace = true
 fusor = { workspace = true, default-features = false }
 fusor-gguf.workspace = true
 byteorder = "1.4.3"
-hf-hub = { version = "0.4.0", default-features = false }
 tokenizers = { workspace = true, features = ["fancy-regex"] }
 serde_json = "1.0.107"
 hound = "3.5"
 rodio = "0.20.1"
-futures-channel = "0.3.31"
+futures-channel = { workspace = true }
 tracing = "0.1.37"
-futures-util = "0.3.28"
+futures-util = { workspace = true }
 thiserror.workspace = true
 
 accelerate-src = { version = "0.3.2", optional = true }
@@ -32,7 +31,6 @@ kalosm-common = { workspace = true }
 kalosm-model-types.workspace = true
 serde = { version = "1.0.209" }
 flate2 = "1.0.35"
-rayon = "1.10.0"
 pollster = "0.4"
 rustfft = "6.4.1"
 

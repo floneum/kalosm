@@ -6,8 +6,8 @@ use crate::{
         workgroup_shape::WorkgroupShape,
     },
     nary_direct::{
-        TensorMeta, ValueTile, apply_unary_function_chain, flat_layout, layout_index,
-        linear_group, output_dims_from_flat,
+        TensorMeta, ValueTile, apply_unary_function_chain, flat_layout, layout_index, linear_group,
+        output_dims_from_flat,
     },
     nary_wise::NaryScalar,
     reduce::{ReduceOp, ReduceOperation},
@@ -215,4 +215,3 @@ fn tile_reduce_op(op: ReduceOp) -> tile_ir::TileReduceOp {
         ReduceOp::Min => tile_ir::TileReduceOp::Min,
     }
 }
-

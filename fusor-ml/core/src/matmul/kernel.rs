@@ -11,8 +11,7 @@ use crate::{
         kernel_backend::{self, DirectKernel},
         operation::Operation,
         tile_direct::{
-            DirectMatrixLayout, flatten_matrix_layout,
-            tile_storage_read_with_direct_layout_typed,
+            DirectMatrixLayout, flatten_matrix_layout, tile_storage_read_with_direct_layout_typed,
             tile_storage_write_with_direct_layout_typed,
         },
     },
@@ -25,7 +24,7 @@ use super::{
     MatMulOperation, MatMulParams, coop_gemm, direct, sgemm, sgemv,
     variants::{
         DirectTileCoopMatmulVariant, DirectTileMatmulVariant, dense_coop_kinds_from_datatype,
-        select_direct_tile_matmul_variant, select_dense_matmul_params,
+        select_dense_matmul_params, select_direct_tile_matmul_variant,
     },
 };
 
@@ -217,41 +216,40 @@ impl MatMulOperation {
         let use_shared_tile = m >= 32 && n >= 32 && k >= 8;
         let max_wg_per_dim = device.limits().max_compute_workgroups_per_dimension;
         let datatype = self.datatype;
-        let ir =
-            tile_ir::tile::build(move |phase| {
-                let epilogues = tile_ir_kernels::DenseMatmulEpilogues {
-                    pre_a: pre_a.as_ref(),
-                    pre_b: pre_b.as_ref(),
-                    post: post.as_ref(),
-                };
-                match datatype {
-                    DataTypeEnum::F32 => dispatch_direct_tile_matmul::<tile_ir::F32>(
-                        phase,
-                        a_view.clone(),
-                        b_view.clone(),
-                        y_view.clone(),
-                        coop_variant,
-                        variant,
-                        use_shared_tile,
-                        shape,
-                        &epilogues,
-                        max_wg_per_dim,
-                    ),
-                    DataTypeEnum::F16 => dispatch_direct_tile_matmul::<tile_ir::F16>(
-                        phase,
-                        a_view.clone(),
-                        b_view.clone(),
-                        y_view.clone(),
-                        coop_variant,
-                        variant,
-                        use_shared_tile,
-                        shape,
-                        &epilogues,
-                        max_wg_per_dim,
-                    ),
-                    _ => unreachable!("direct tile matmul only supports f32/f16"),
-                }
-            });
+        let ir = tile_ir::tile::build(move |phase| {
+            let epilogues = tile_ir_kernels::DenseMatmulEpilogues {
+                pre_a: pre_a.as_ref(),
+                pre_b: pre_b.as_ref(),
+                post: post.as_ref(),
+            };
+            match datatype {
+                DataTypeEnum::F32 => dispatch_direct_tile_matmul::<tile_ir::F32>(
+                    phase,
+                    a_view.clone(),
+                    b_view.clone(),
+                    y_view.clone(),
+                    coop_variant,
+                    variant,
+                    use_shared_tile,
+                    shape,
+                    &epilogues,
+                    max_wg_per_dim,
+                ),
+                DataTypeEnum::F16 => dispatch_direct_tile_matmul::<tile_ir::F16>(
+                    phase,
+                    a_view.clone(),
+                    b_view.clone(),
+                    y_view.clone(),
+                    coop_variant,
+                    variant,
+                    use_shared_tile,
+                    shape,
+                    &epilogues,
+                    max_wg_per_dim,
+                ),
+                _ => unreachable!("direct tile matmul only supports f32/f16"),
+            }
+        });
         let dispatch_size = ir.body().grid;
         if dispatch_size.iter().any(|dim| *dim > max_wg_per_dim) {
             return None;
@@ -440,7 +438,9 @@ impl Operation for MatMulOperation {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn dispatch_direct_tile_matmul<T: tile_ir::CoopElement + tile_ir_kernels::AccumCast<tile_ir::F32>>(
+fn dispatch_direct_tile_matmul<
+    T: tile_ir::CoopElement + tile_ir_kernels::AccumCast<tile_ir::F32>,
+>(
     phase: &mut tile_ir::tile::Program,
     a_view: DirectMatrixLayout,
     b_view: DirectMatrixLayout,
@@ -458,42 +458,78 @@ fn dispatch_direct_tile_matmul<T: tile_ir::CoopElement + tile_ir_kernels::AccumC
     match coop_variant {
         DirectTileCoopMatmulVariant::Tile256x256 => {
             if tile_ir_kernels::try_batched_coop_matmul::<T, 256, 256, 16>(
-                phase, &a, &b, &y, shape, epilogues, max_wg_per_dim,
+                phase,
+                &a,
+                &b,
+                &y,
+                shape,
+                epilogues,
+                max_wg_per_dim,
             ) {
                 return;
             }
         }
         DirectTileCoopMatmulVariant::Tile128x512 => {
             if tile_ir_kernels::try_batched_coop_matmul::<T, 128, 512, 16>(
-                phase, &a, &b, &y, shape, epilogues, max_wg_per_dim,
+                phase,
+                &a,
+                &b,
+                &y,
+                shape,
+                epilogues,
+                max_wg_per_dim,
             ) {
                 return;
             }
         }
         DirectTileCoopMatmulVariant::Tile128x256 => {
             if tile_ir_kernels::try_batched_coop_matmul::<T, 128, 256, 16>(
-                phase, &a, &b, &y, shape, epilogues, max_wg_per_dim,
+                phase,
+                &a,
+                &b,
+                &y,
+                shape,
+                epilogues,
+                max_wg_per_dim,
             ) {
                 return;
             }
         }
         DirectTileCoopMatmulVariant::Tile128x64 => {
             if tile_ir_kernels::try_batched_coop_matmul::<T, 128, 64, 16>(
-                phase, &a, &b, &y, shape, epilogues, max_wg_per_dim,
+                phase,
+                &a,
+                &b,
+                &y,
+                shape,
+                epilogues,
+                max_wg_per_dim,
             ) {
                 return;
             }
         }
         DirectTileCoopMatmulVariant::Tile64x128 => {
             if tile_ir_kernels::try_batched_coop_matmul::<T, 64, 128, 16>(
-                phase, &a, &b, &y, shape, epilogues, max_wg_per_dim,
+                phase,
+                &a,
+                &b,
+                &y,
+                shape,
+                epilogues,
+                max_wg_per_dim,
             ) {
                 return;
             }
         }
         DirectTileCoopMatmulVariant::Tile64x64 => {
             if tile_ir_kernels::try_batched_coop_matmul::<T, 64, 64, 16>(
-                phase, &a, &b, &y, shape, epilogues, max_wg_per_dim,
+                phase,
+                &a,
+                &b,
+                &y,
+                shape,
+                epilogues,
+                max_wg_per_dim,
             ) {
                 return;
             }
@@ -503,17 +539,35 @@ fn dispatch_direct_tile_matmul<T: tile_ir::CoopElement + tile_ir_kernels::AccumC
     match variant {
         DirectTileMatmulVariant::Gemv => {
             tile_ir_kernels::batched_gemv_with_epilogues::<T, 4, 8, 128>(
-                phase, &a, &b, &y, shape, epilogues, max_wg_per_dim,
+                phase,
+                &a,
+                &b,
+                &y,
+                shape,
+                epilogues,
+                max_wg_per_dim,
             )
         }
         DirectTileMatmulVariant::MatMul => {
             if use_shared_tile {
                 tile_ir_kernels::batched_matmul_with_epilogues::<T, 32, 32, 8>(
-                    phase, &a, &b, &y, shape, epilogues, max_wg_per_dim,
+                    phase,
+                    &a,
+                    &b,
+                    &y,
+                    shape,
+                    epilogues,
+                    max_wg_per_dim,
                 )
             } else {
                 tile_ir_kernels::batched_matmul_register_with_epilogues::<T, 32, 32, 8>(
-                    phase, &a, &b, &y, shape, epilogues, max_wg_per_dim,
+                    phase,
+                    &a,
+                    &b,
+                    &y,
+                    shape,
+                    epilogues,
+                    max_wg_per_dim,
                 )
             }
         }

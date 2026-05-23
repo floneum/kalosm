@@ -230,11 +230,7 @@ pub(super) fn direct_tile_matmul_selector() -> ShapeSelector<3, (), DirectTileMa
         .rule(DirectTileMatmulVariant::MatMul, ShapeRule::new())
 }
 
-pub(super) fn select_direct_tile_matmul_variant(
-    m: u32,
-    k: u32,
-    n: u32,
-) -> DirectTileMatmulVariant {
+pub(super) fn select_direct_tile_matmul_variant(m: u32, k: u32, n: u32) -> DirectTileMatmulVariant {
     direct_tile_matmul_selector()
         .select(
             KernelShape::new([m as usize, k as usize, n as usize]),

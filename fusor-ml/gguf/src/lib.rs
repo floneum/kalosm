@@ -9,7 +9,6 @@
 use std::{fmt::Display, mem::offset_of};
 
 use bytemuck::{AnyBitPattern, Contiguous, Pod, Zeroable};
-use enumset::EnumSetType;
 use rustc_hash::FxHashMap;
 
 const GGUF_MAGIC_BYTES: [u8; 4] = *b"GGUF";
@@ -32,7 +31,7 @@ fn check_magic<R: std::io::Read>(reader: &mut R) -> Result<(), GgufReadError> {
 
 pub const DEFAULT_ALIGNMENT: u64 = 32;
 
-#[derive(EnumSetType, Debug, Hash)]
+#[derive(Copy, Clone, Eq, PartialEq, Debug, Hash)]
 pub enum GgmlType {
     F32 = 0,
     F16 = 1,
@@ -792,21 +791,38 @@ impl GgufBlock for BlockQ4_0 {
     fn into_gpu_storage_bytes_f32(self) -> Self::BytesF32 {
         let mut bytes = [0; std::mem::size_of::<BlockQ4_0GpuF32>()];
         let scale_f32 = self.scale.to_f32();
-        pack_field(&mut bytes, offset_of!(BlockQ4_0GpuF32, scale), bytemuck::bytes_of(&scale_f32));
-        pack_field(&mut bytes, offset_of!(BlockQ4_0GpuF32, data), bytemuck::cast_slice(&self.data));
+        pack_field(
+            &mut bytes,
+            offset_of!(BlockQ4_0GpuF32, scale),
+            bytemuck::bytes_of(&scale_f32),
+        );
+        pack_field(
+            &mut bytes,
+            offset_of!(BlockQ4_0GpuF32, data),
+            bytemuck::cast_slice(&self.data),
+        );
         bytes
     }
 
     fn into_gpu_storage_bytes(self) -> Self::Bytes {
         let mut bytes = [0; std::mem::size_of::<BlockQ4_0Gpu>()];
-        pack_field(&mut bytes, offset_of!(BlockQ4_0Gpu, scale), bytemuck::bytes_of(&self.scale));
-        pack_field(&mut bytes, offset_of!(BlockQ4_0Gpu, data), bytemuck::cast_slice(&self.data));
+        pack_field(
+            &mut bytes,
+            offset_of!(BlockQ4_0Gpu, scale),
+            bytemuck::bytes_of(&self.scale),
+        );
+        pack_field(
+            &mut bytes,
+            offset_of!(BlockQ4_0Gpu, data),
+            bytemuck::cast_slice(&self.data),
+        );
         bytes
     }
 
     fn from_gpu_storage_bytes(bytes: Self::Bytes) -> Self {
         let scale = unpack_field::<half::f16>(&bytes, offset_of!(BlockQ4_0Gpu, scale));
-        let data = unpack_field::<[u8; Q4_0_BLOCK_SIZE / 2]>(&bytes, offset_of!(BlockQ4_0Gpu, data));
+        let data =
+            unpack_field::<[u8; Q4_0_BLOCK_SIZE / 2]>(&bytes, offset_of!(BlockQ4_0Gpu, data));
         Self { scale, data }
     }
 
@@ -973,7 +989,11 @@ impl GgufBlock for BlockQ5_0 {
     fn into_gpu_storage_bytes_f32(self) -> Self::BytesF32 {
         let mut bytes = [0; std::mem::size_of::<BlockQ5_0GpuF32>()];
         let scale_f32 = self.scale.to_f32();
-        pack_field(&mut bytes, offset_of!(BlockQ5_0GpuF32, scale), bytemuck::bytes_of(&scale_f32));
+        pack_field(
+            &mut bytes,
+            offset_of!(BlockQ5_0GpuF32, scale),
+            bytemuck::bytes_of(&scale_f32),
+        );
         pack_field(
             &mut bytes,
             offset_of!(BlockQ5_0GpuF32, data_high_bits),
@@ -989,7 +1009,11 @@ impl GgufBlock for BlockQ5_0 {
 
     fn into_gpu_storage_bytes(self) -> Self::Bytes {
         let mut bytes = [0; std::mem::size_of::<BlockQ5_0Gpu>()];
-        pack_field(&mut bytes, offset_of!(BlockQ5_0Gpu, scale), bytemuck::bytes_of(&self.scale));
+        pack_field(
+            &mut bytes,
+            offset_of!(BlockQ5_0Gpu, scale),
+            bytemuck::bytes_of(&self.scale),
+        );
         pack_field(
             &mut bytes,
             offset_of!(BlockQ5_0Gpu, data_high_bits),
@@ -1224,15 +1248,31 @@ impl GgufBlock for BlockQ8_0 {
     fn into_gpu_storage_bytes_f32(self) -> Self::BytesF32 {
         let mut bytes = [0; std::mem::size_of::<BlockQ8_0GpuF32>()];
         let scale_f32 = self.scale.to_f32();
-        pack_field(&mut bytes, offset_of!(BlockQ8_0GpuF32, scale), bytemuck::bytes_of(&scale_f32));
-        pack_field(&mut bytes, offset_of!(BlockQ8_0GpuF32, data), bytemuck::cast_slice(&self.data));
+        pack_field(
+            &mut bytes,
+            offset_of!(BlockQ8_0GpuF32, scale),
+            bytemuck::bytes_of(&scale_f32),
+        );
+        pack_field(
+            &mut bytes,
+            offset_of!(BlockQ8_0GpuF32, data),
+            bytemuck::cast_slice(&self.data),
+        );
         bytes
     }
 
     fn into_gpu_storage_bytes(self) -> Self::Bytes {
         let mut bytes = [0; std::mem::size_of::<BlockQ8_0Gpu>()];
-        pack_field(&mut bytes, offset_of!(BlockQ8_0Gpu, scale), bytemuck::bytes_of(&self.scale));
-        pack_field(&mut bytes, offset_of!(BlockQ8_0Gpu, data), bytemuck::cast_slice(&self.data));
+        pack_field(
+            &mut bytes,
+            offset_of!(BlockQ8_0Gpu, scale),
+            bytemuck::bytes_of(&self.scale),
+        );
+        pack_field(
+            &mut bytes,
+            offset_of!(BlockQ8_0Gpu, data),
+            bytemuck::cast_slice(&self.data),
+        );
         bytes
     }
 
@@ -1424,19 +1464,51 @@ impl GgufBlock for BlockQ4K {
         let mut bytes = [0; std::mem::size_of::<BlockQ4KGpuF32>()];
         let scale_f32 = self.scale.to_f32();
         let min_f32 = self.min.to_f32();
-        pack_field(&mut bytes, offset_of!(BlockQ4KGpuF32, scale), bytemuck::bytes_of(&scale_f32));
-        pack_field(&mut bytes, offset_of!(BlockQ4KGpuF32, min), bytemuck::bytes_of(&min_f32));
-        pack_field(&mut bytes, offset_of!(BlockQ4KGpuF32, scales), bytemuck::bytes_of(&self.scales));
-        pack_field(&mut bytes, offset_of!(BlockQ4KGpuF32, data), bytemuck::cast_slice(&self.data));
+        pack_field(
+            &mut bytes,
+            offset_of!(BlockQ4KGpuF32, scale),
+            bytemuck::bytes_of(&scale_f32),
+        );
+        pack_field(
+            &mut bytes,
+            offset_of!(BlockQ4KGpuF32, min),
+            bytemuck::bytes_of(&min_f32),
+        );
+        pack_field(
+            &mut bytes,
+            offset_of!(BlockQ4KGpuF32, scales),
+            bytemuck::bytes_of(&self.scales),
+        );
+        pack_field(
+            &mut bytes,
+            offset_of!(BlockQ4KGpuF32, data),
+            bytemuck::cast_slice(&self.data),
+        );
         bytes
     }
 
     fn into_gpu_storage_bytes(self) -> Self::Bytes {
         let mut bytes = [0; std::mem::size_of::<BlockQ4KGpu>()];
-        pack_field(&mut bytes, offset_of!(BlockQ4KGpu, scale), bytemuck::bytes_of(&self.scale));
-        pack_field(&mut bytes, offset_of!(BlockQ4KGpu, min), bytemuck::bytes_of(&self.min));
-        pack_field(&mut bytes, offset_of!(BlockQ4KGpu, scales), bytemuck::cast_slice(&self.scales));
-        pack_field(&mut bytes, offset_of!(BlockQ4KGpu, data), bytemuck::cast_slice(&self.data));
+        pack_field(
+            &mut bytes,
+            offset_of!(BlockQ4KGpu, scale),
+            bytemuck::bytes_of(&self.scale),
+        );
+        pack_field(
+            &mut bytes,
+            offset_of!(BlockQ4KGpu, min),
+            bytemuck::bytes_of(&self.min),
+        );
+        pack_field(
+            &mut bytes,
+            offset_of!(BlockQ4KGpu, scales),
+            bytemuck::cast_slice(&self.scales),
+        );
+        pack_field(
+            &mut bytes,
+            offset_of!(BlockQ4KGpu, data),
+            bytemuck::cast_slice(&self.data),
+        );
         bytes
     }
 
@@ -1672,21 +1744,61 @@ impl GgufBlock for BlockQ5K {
         let mut bytes = [0; std::mem::size_of::<BlockQ5KGpuF32>()];
         let scale_f32 = self.scale.to_f32();
         let min_f32 = self.min.to_f32();
-        pack_field(&mut bytes, offset_of!(BlockQ5KGpuF32, scale), bytemuck::bytes_of(&scale_f32));
-        pack_field(&mut bytes, offset_of!(BlockQ5KGpuF32, min), bytemuck::bytes_of(&min_f32));
-        pack_field(&mut bytes, offset_of!(BlockQ5KGpuF32, scales), bytemuck::bytes_of(&self.scales));
-        pack_field(&mut bytes, offset_of!(BlockQ5KGpuF32, qh), bytemuck::bytes_of(&self.qh));
-        pack_field(&mut bytes, offset_of!(BlockQ5KGpuF32, qs), bytemuck::cast_slice(&self.qs));
+        pack_field(
+            &mut bytes,
+            offset_of!(BlockQ5KGpuF32, scale),
+            bytemuck::bytes_of(&scale_f32),
+        );
+        pack_field(
+            &mut bytes,
+            offset_of!(BlockQ5KGpuF32, min),
+            bytemuck::bytes_of(&min_f32),
+        );
+        pack_field(
+            &mut bytes,
+            offset_of!(BlockQ5KGpuF32, scales),
+            bytemuck::bytes_of(&self.scales),
+        );
+        pack_field(
+            &mut bytes,
+            offset_of!(BlockQ5KGpuF32, qh),
+            bytemuck::bytes_of(&self.qh),
+        );
+        pack_field(
+            &mut bytes,
+            offset_of!(BlockQ5KGpuF32, qs),
+            bytemuck::cast_slice(&self.qs),
+        );
         bytes
     }
 
     fn into_gpu_storage_bytes(self) -> Self::Bytes {
         let mut bytes = [0; std::mem::size_of::<BlockQ5KGpu>()];
-        pack_field(&mut bytes, offset_of!(BlockQ5KGpu, scale), bytemuck::bytes_of(&self.scale));
-        pack_field(&mut bytes, offset_of!(BlockQ5KGpu, min), bytemuck::bytes_of(&self.min));
-        pack_field(&mut bytes, offset_of!(BlockQ5KGpu, scales), bytemuck::cast_slice(&self.scales));
-        pack_field(&mut bytes, offset_of!(BlockQ5KGpu, qh), bytemuck::cast_slice(&self.qh));
-        pack_field(&mut bytes, offset_of!(BlockQ5KGpu, qs), bytemuck::cast_slice(&self.qs));
+        pack_field(
+            &mut bytes,
+            offset_of!(BlockQ5KGpu, scale),
+            bytemuck::bytes_of(&self.scale),
+        );
+        pack_field(
+            &mut bytes,
+            offset_of!(BlockQ5KGpu, min),
+            bytemuck::bytes_of(&self.min),
+        );
+        pack_field(
+            &mut bytes,
+            offset_of!(BlockQ5KGpu, scales),
+            bytemuck::cast_slice(&self.scales),
+        );
+        pack_field(
+            &mut bytes,
+            offset_of!(BlockQ5KGpu, qh),
+            bytemuck::cast_slice(&self.qh),
+        );
+        pack_field(
+            &mut bytes,
+            offset_of!(BlockQ5KGpu, qs),
+            bytemuck::cast_slice(&self.qs),
+        );
         bytes
     }
 
@@ -1866,8 +1978,16 @@ impl GgufBlock for BlockQ6K {
             offset_of!(BlockQ6KGpuF32, data_high_bits),
             bytemuck::cast_slice(&self.data_high_bits),
         );
-        pack_field(&mut bytes, offset_of!(BlockQ6KGpuF32, scales), bytemuck::bytes_of(&self.scales));
-        pack_field(&mut bytes, offset_of!(BlockQ6KGpuF32, scale), bytemuck::bytes_of(&scale_f32));
+        pack_field(
+            &mut bytes,
+            offset_of!(BlockQ6KGpuF32, scales),
+            bytemuck::bytes_of(&self.scales),
+        );
+        pack_field(
+            &mut bytes,
+            offset_of!(BlockQ6KGpuF32, scale),
+            bytemuck::bytes_of(&scale_f32),
+        );
         bytes
     }
 
@@ -1883,8 +2003,16 @@ impl GgufBlock for BlockQ6K {
             offset_of!(BlockQ6KGpu, data_high_bits),
             bytemuck::cast_slice(&self.data_high_bits),
         );
-        pack_field(&mut bytes, offset_of!(BlockQ6KGpu, scales), bytemuck::cast_slice(&self.scales));
-        pack_field(&mut bytes, offset_of!(BlockQ6KGpu, scale), bytemuck::bytes_of(&self.scale));
+        pack_field(
+            &mut bytes,
+            offset_of!(BlockQ6KGpu, scales),
+            bytemuck::cast_slice(&self.scales),
+        );
+        pack_field(
+            &mut bytes,
+            offset_of!(BlockQ6KGpu, scale),
+            bytemuck::bytes_of(&self.scale),
+        );
         bytes
     }
 

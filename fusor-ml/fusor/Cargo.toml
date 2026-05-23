@@ -39,7 +39,7 @@ candle-transformers = { workspace = true, features = ["metal"] }
 bench = false
 
 [features]
-default = ["cpu", "gpu", "graphvis"]
+default = ["cpu", "gpu"]
 cpu = ["dep:fusor-cpu"]
 gpu = ["dep:fusor-core", "dep:pollster"]
 graphvis = ["gpu", "fusor-core/graphvis"]

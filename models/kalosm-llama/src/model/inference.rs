@@ -12,7 +12,7 @@ where
         &mut self,
         settings: InferenceSettings<F>,
         mut on_token: crate::BoxedTokenCallback,
-        finished: &futures::channel::oneshot::Sender<Result<(), LlamaModelError>>,
+        finished: &futures_channel::oneshot::Sender<Result<(), LlamaModelError>>,
     ) -> Result<(), LlamaModelError> {
         let InferenceSettings {
             prompt,

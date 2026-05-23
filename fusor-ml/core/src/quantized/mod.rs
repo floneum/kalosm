@@ -314,7 +314,11 @@ impl QMatrix {
             GgmlType::F32 => bytes.into(),
             unsupported => return Err(GgufReadError::UnsupportedDType(unsupported as u32)),
         };
-        let datatype = if ty == GgmlType::F16 { GgmlType::F32 } else { ty };
+        let datatype = if ty == GgmlType::F16 {
+            GgmlType::F32
+        } else {
+            ty
+        };
         let buffer = device.create_buffer_init(
             &storage_bytes,
             wgpu::BufferUsages::STORAGE

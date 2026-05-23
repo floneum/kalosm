@@ -83,12 +83,12 @@ where
 {
     fn add_messages_with_callback<'a>(
         &'a self,
-        session: &'a mut Self::ChatSession,
-        messages: &[ChatMessage],
+        mut session: Self::ChatSession,
+        messages: &'a [ChatMessage],
         sampler: GenerationParameters,
         mut on_token: impl FnMut(String) -> Result<(), Self::Error> + WasmNotSendSync + 'static,
-    ) -> impl Future<Output = Result<(), Self::Error>> + WasmNotSend + 'a {
-        let new_text = get_new_tokens(messages, session, self);
+    ) -> impl Future<Output = Result<Self::ChatSession, Self::Error>> + WasmNotSend + 'a {
+        let new_text = get_new_tokens(messages, &mut session, self);
         let mut content = MessageContent::new();
         for message in messages {
             for chunk in message.content().chunks() {
@@ -116,7 +116,7 @@ where
                 MessageType::ModelAnswer,
                 model_response.read().unwrap().clone(),
             ));
-            Ok(())
+            Ok(session)
         }
     }
 }
@@ -136,18 +136,24 @@ where
 {
     fn add_message_with_callback_and_constraints<'a>(
         &'a self,
-        session: &'a mut Self::ChatSession,
-        messages: &[ChatMessage],
+        mut session: Self::ChatSession,
+        messages: &'a [ChatMessage],
         sampler: GenerationParameters,
         constraints: Constraints,
         mut on_token: impl FnMut(String) -> Result<(), Self::Error> + WasmNotSendSync + 'static,
     ) -> impl Future<
         Output = Result<
-            <Constraints as kalosm_language_model::ModelConstraints>::Output,
+            (
+                Self::ChatSession,
+                <Constraints as kalosm_language_model::ModelConstraints>::Output,
+            ),
             Self::Error,
         >,
     > + WasmNotSend
-           + 'a {
+           + 'a
+    where
+        <Constraints as kalosm_language_model::ModelConstraints>::Output: 'a,
+    {
         let mut content = MessageContent::new();
         for message in messages {
             for chunk in message.content().chunks() {
@@ -156,7 +162,7 @@ where
                 }
             }
         }
-        let new_text = get_new_tokens(messages, session, self);
+        let new_text = get_new_tokens(messages, &mut session, self);
         async move {
             let new_text = new_text?;
             let model_response = Arc::new(RwLock::new(String::new()));
@@ -182,7 +188,7 @@ where
                 MessageType::ModelAnswer,
                 model_response.read().unwrap().clone(),
             ));
-            Ok(result)
+            Ok((session, result))
         }
     }
 }

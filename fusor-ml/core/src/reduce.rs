@@ -346,4 +346,3 @@ impl<const N: usize, D: DataType> Tensor<N, D> {
         unsqueeze_dim::<N, O, D>(&reduced, dim_idx)
     }
 }
-

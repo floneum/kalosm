@@ -74,10 +74,10 @@ pub trait CreateChatSession {
 ///     // Create a new model which implements the CreateChatSession trait
 ///     let llm = Llama::new_chat().await.unwrap();
 ///     // Create a new chat session for the model
-///     let mut chat_session = llm.new_chat_session().unwrap();
-///     // Add a message to the chat session
-///     llm.add_messages_with_callback(
-///         &mut chat_session,
+///     let chat_session = llm.new_chat_session().unwrap();
+///     // Add a message to the chat session — the updated session is returned
+///     let _chat_session = llm.add_messages_with_callback(
+///         chat_session,
 ///         &[ChatMessage::new(MessageType::UserMessage, "Hello, world!")],
 ///         GenerationParameters::new(),
 ///         |token| {
@@ -92,14 +92,18 @@ pub trait CreateChatSession {
 pub trait ChatModel<Sampler = GenerationParameters>: CreateChatSession {
     /// Add messages to the chat session with a callback that is called for each token.
     ///
+    /// The session is taken by value and the updated session is returned in the
+    /// future's output. On error the session is consumed and not returned —
+    /// callers should discard the chat.
+    ///
     /// See [`Chat::add_message`] for nicer API with examples
     fn add_messages_with_callback<'a>(
         &'a self,
-        session: &'a mut Self::ChatSession,
-        messages: &[ChatMessage],
+        session: Self::ChatSession,
+        messages: &'a [ChatMessage],
         sampler: Sampler,
         on_token: impl FnMut(String) -> Result<(), Self::Error> + WasmNotSendSync + 'static,
-    ) -> impl Future<Output = Result<(), Self::Error>> + WasmNotSend + 'a;
+    ) -> impl Future<Output = Result<Self::ChatSession, Self::Error>> + WasmNotSend + 'a;
 }
 
 /// A trait for unstructured chat models that support structured generation. While this trait is implemented for
@@ -115,11 +119,11 @@ pub trait ChatModel<Sampler = GenerationParameters>: CreateChatSession {
 ///     // Create a new model which implements the CreateChatSession trait
 ///     let llm = Llama::new_chat().await.unwrap();
 ///     // Create a new chat session for the model
-///     let mut chat_session = llm.new_chat_session().unwrap();
+///     let chat_session = llm.new_chat_session().unwrap();
 ///     // Create a parser for your data. Any type that implements the `Parse` trait has the `new_parser` method
 ///     let parser = i32::new_parser();
-///     // Add a message to the chat session with the given constraints
-///     let mut result: i32 = llm.add_message_with_callback_and_constraints(&mut chat_session, &[ChatMessage::new(MessageType::UserMessage, "5 + 5")], GenerationParameters::new(), parser, |token| {
+///     // Add a message with the given constraints; both the updated session and the parsed result are returned
+///     let (_chat_session, result): (_, i32) = llm.add_message_with_callback_and_constraints(chat_session, &[ChatMessage::new(MessageType::UserMessage, "5 + 5")], GenerationParameters::new(), parser, |token| {
 ///         println!("{token}");
 ///         Ok(())
 ///     }).await.unwrap();
@@ -131,15 +135,22 @@ pub trait StructuredChatModel<Constraints: ModelConstraints, Sampler = Generatio
 {
     /// Add messages to the chat session with a callback that is called for each token and a constraints the response must follow.
     ///
+    /// The session is taken by value and returned alongside the parsed output.
+    /// On error the session is consumed and not returned.
+    ///
     /// See [`ChatResponseBuilder::with_constraints`] for nicer API with examples
     fn add_message_with_callback_and_constraints<'a>(
         &'a self,
-        session: &'a mut Self::ChatSession,
-        messages: &[ChatMessage],
+        session: Self::ChatSession,
+        messages: &'a [ChatMessage],
         sampler: Sampler,
         constraints: Constraints,
         on_token: impl FnMut(String) -> Result<(), Self::Error> + WasmNotSendSync + 'static,
-    ) -> impl Future<Output = Result<Constraints::Output, Self::Error>> + WasmNotSend + 'a;
+    ) -> impl Future<Output = Result<(Self::ChatSession, Constraints::Output), Self::Error>>
+           + WasmNotSend
+           + 'a
+    where
+        Constraints::Output: 'a;
 }
 
 /// A trait that defines the default constraints for a type with this chat model.

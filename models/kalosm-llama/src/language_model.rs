@@ -91,7 +91,7 @@ where
         sampler: GenerationParameters,
         on_token: impl FnMut(String) -> Result<(), Self::Error> + WasmNotSend + WasmNotSync + 'static,
     ) -> Result<(), Self::Error> {
-        let (tx, rx) = futures::channel::oneshot::channel();
+        let (tx, rx) = futures_channel::oneshot::channel();
         let max_tokens = sampler.max_length();
         let stop_on = sampler.stop_on().map(|s| s.to_string());
         let seed = sampler.seed();
@@ -206,7 +206,7 @@ where
     ) -> impl Future<Output = Result<Constraints::Output, Self::Error>> + WasmNotSend + 'a {
         let mut session = session.clone();
         async move {
-            let (tx, rx) = futures::channel::oneshot::channel();
+            let (tx, rx) = futures_channel::oneshot::channel();
             let seed = sampler.seed();
             let sampler = CpuMirostat2Sampler::new(
                 GpuSamplerConfig::from_generation_parameters(&sampler),

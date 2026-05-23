@@ -20,8 +20,8 @@ tokio = { version = "1.32.0", features = ["rt"], optional = true }
 tracing = "0.1.37"
 
 futures-core = "0.3.30"
-futures-util = "0.3.30"
-futures-channel = "0.3.30"
+futures-util = { workspace = true }
+futures-channel = { workspace = true }
 
 rwhisper.workspace = true
 

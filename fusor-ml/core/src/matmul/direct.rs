@@ -7,8 +7,8 @@ use crate::{
         workgroup_shape::WorkgroupShape,
     },
     nary_direct::{
-        TensorMeta, ValueTile, apply_unary_function_chain, flat_layout, layout_index,
-        linear_group, output_dims_from_flat,
+        TensorMeta, ValueTile, apply_unary_function_chain, flat_layout, layout_index, linear_group,
+        output_dims_from_flat,
     },
     tensor::DataTypeEnum,
     visit_tiled::distribute_workgroups,
@@ -192,12 +192,7 @@ pub(crate) fn build_serial_matmul_direct_kernel(
                     let sum = ValueTile::F32(sum)
                         .cast_to(sum_ty)
                         .cast_to(y_meta_body.datatype);
-                    y_storage.store(
-                        program,
-                        layout_index(&y_meta_body, &dims),
-                        sum,
-                        in_bounds,
-                    );
+                    y_storage.store(program, layout_index(&y_meta_body, &dims), sum, in_bounds);
                 });
             Some(())
         },
@@ -235,4 +230,3 @@ fn output_dims_from_flat_u32(
     let shape = shape.iter().map(|dim| *dim as usize).collect::<Vec<_>>();
     output_dims_from_flat(flat, &shape)
 }
-

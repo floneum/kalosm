@@ -13,23 +13,23 @@ fusor = { workspace = true, default-features = false }
 fusor-gguf = { workspace = true }
 kalosm-tokenizer.workspace = true
 
-ahash = "0.8.12"
 half = { version = "2.3.1" }
 
 tracing = "0.1.37"
 rand.workspace = true
-rayon = { version = "1.8.0" }
+rayon = { version = "1.8.0", optional = true }
 kalosm-sample = { workspace = true, optional = true }
 kalosm-language-model = { workspace = true, features = ["serde"] }
 kalosm-model-types.workspace = true
 kalosm-common = { workspace = true }
 thiserror.workspace = true
-minijinja = { version = "2.5.0", features = ["json", "loader"] }
+minijinja = { version = "2.5.0", features = ["loader"] }
 minijinja-contrib = { version = "2.5.0", features = ["pycompat"] }
-chrono = "0.4.41"
+chrono = { version = "0.4.41", default-features = false, features = ["now", "std"] }
 serde = { version = "1", features = ["derive"] }
-serde_json = "1.0.139"
-futures = "0.3.31"
+serde_json = { version = "1.0.139", optional = true }
+futures-util = { workspace = true }
+futures-channel = { workspace = true }
 pollster = { version = "0.4", optional = true }
 regex = "1"
 tokenizers = { workspace = true, features = ["fancy-regex"], optional = true }
@@ -40,6 +40,7 @@ image = { workspace = true, optional = true }
 getrandom = { version = "0.3", features = ["wasm_js"], optional = true }
 
 [dev-dependencies]
+ahash = "0.8.12"
 tokio = { version = "1.32.0", features = ["full"] }
 tracing-subscriber = "0.3.18"
 pretty_assertions = "1.4.1"
@@ -52,11 +53,13 @@ kalosm-streams.workspace = true
 reqwest = { version = "0.12" }
 
 [features]
-default = ["cpu", "gpu"]
+default = ["gpu"]
 cpu = ["fusor/cpu"]
 gpu = ["fusor/gpu"]
+chat-template-json = ["minijinja/json"]
+hf-config-json = ["dep:serde_json"]
 vision = ["dep:image", "dep:pollster", "kalosm-language-model/media"]
-structured = ["dep:kalosm-sample", "kalosm-language-model/structured"]
+structured = ["dep:kalosm-sample", "kalosm-language-model/structured", "dep:rayon"]
 hf-tokenizer-json = ["dep:tokenizers", "dep:getrandom"]
 
 [[example]]

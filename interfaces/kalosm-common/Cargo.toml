@@ -20,12 +20,12 @@ thiserror.workspace = true
 kalosm-model-types = { workspace = true, features = ["loading-progress-bar"] }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
-futures-channel = "0.3.28"
-futures-util = { version = "0.3.28", default-features = false }
+futures-channel = { workspace = true }
+futures-util = { workspace = true }
 ureq = { version = "3.2.0", default-features = false, features = ["rustls"] }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
-futures-util = "0.3.28"
+futures-util = { workspace = true }
 reqwest = { version = "0.12.12", default-features = false, features = ["stream"] }
 web-sys = { version = "0.3", features = [
     "Navigator",

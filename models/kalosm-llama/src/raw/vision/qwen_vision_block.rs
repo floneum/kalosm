@@ -79,13 +79,17 @@ where
         let t0 = std::time::Instant::now();
         let after_norm = self.norm1.forward_generic(&xs_3d);
         flush(&after_norm);
-        if trace { eprintln!("    norm1: {:.2?}", t0.elapsed()); }
+        if trace {
+            eprintln!("    norm1: {:.2?}", t0.elapsed());
+        }
         let t1 = std::time::Instant::now();
         let after_attention = self
             .attn
             .forward(&after_norm, cu_seqlens, rope_cache, cache)?;
         flush(&after_attention);
-        if trace { eprintln!("    attn:  {:.2?}", t1.elapsed()); }
+        if trace {
+            eprintln!("    attn:  {:.2?}", t1.elapsed());
+        }
 
         // Work in f32 for tensor addition
         let xs_3d_f32: Tensor<3, f32> = xs_3d.cast();
@@ -93,16 +97,22 @@ where
         let t2 = std::time::Instant::now();
         let xs_3d: Tensor<3, F> = (xs_3d_f32 + after_attention_f32).cast();
         flush(&xs_3d);
-        if trace { eprintln!("    res1:  {:.2?}", t2.elapsed()); }
+        if trace {
+            eprintln!("    res1:  {:.2?}", t2.elapsed());
+        }
 
         let t3 = std::time::Instant::now();
         let after_norm2 = self.norm2.forward_generic(&xs_3d);
         flush(&after_norm2);
-        if trace { eprintln!("    norm2: {:.2?}", t3.elapsed()); }
+        if trace {
+            eprintln!("    norm2: {:.2?}", t3.elapsed());
+        }
         let t4 = std::time::Instant::now();
         let mlp_out = self.mlp.forward(&after_norm2);
         flush(&mlp_out);
-        if trace { eprintln!("    mlp:   {:.2?}", t4.elapsed()); }
+        if trace {
+            eprintln!("    mlp:   {:.2?}", t4.elapsed());
+        }
 
         // Work in f32 for tensor addition
         let xs_3d_f32: Tensor<3, f32> = xs_3d.cast();
@@ -110,7 +120,9 @@ where
         let t5 = std::time::Instant::now();
         let out: Tensor<3, F> = (xs_3d_f32 + mlp_out_f32).cast();
         flush(&out);
-        if trace { eprintln!("    res2:  {:.2?}", t5.elapsed()); }
+        if trace {
+            eprintln!("    res2:  {:.2?}", t5.elapsed());
+        }
 
         Ok(out.squeeze(0).to_concrete())
     }
@@ -212,11 +224,17 @@ where
         let sin = rope_cache.sin().narrow(0, 0, seq_len).to_concrete();
         let (query_states, key_states) = q_4d.rope_normal_pair_fused(&k_4d, &cos, &sin);
 
+        // CRITICAL: also force V to a fresh row-major buffer here. We need
+        // V's slices (later, per window) to start from a contiguous tensor;
+        // narrowing a transpose-view produces another non-contiguous view.
         let value_states = v.transpose(0, 1).unsqueeze(0).to_concrete();
         let t_after_rope = std::time::Instant::now();
         if trace_attn {
             value_states.as_gpu().map(|g| g.materialize_sync());
-            eprintln!("      rope:  {:.2?} (incl. q/k/v split + transpose)", t_qkv.elapsed());
+            eprintln!(
+                "      rope:  {:.2?} (incl. q/k/v split + transpose)",
+                t_qkv.elapsed()
+            );
         }
 
         // Cache append (cache uses f32 for SIMD operations)
@@ -226,42 +244,55 @@ where
             Some(cache) => cache.append(&xs.device(), &key_states, &value_states),
         };
 
-        // Mask
-        let mut mask_vec = vec![f32::NEG_INFINITY; seq_len * seq_len];
-        for pair in cu_seqlens.windows(2) {
-            let last = pair[0] as usize;
-            let next = pair[1] as usize;
-            for i in last..next {
-                for j in last..next {
-                    mask_vec[i * seq_len + j] = 0.0;
-                }
-            }
-        }
-
-        let mask_tensor: Tensor<2, f32> = Tensor::new(&xs.device(), &mask_vec)
-            .reshape([seq_len, seq_len])
-            .to_concrete();
-        let mask = AttentionMask::new(mask_tensor);
         if trace_attn {
             eprintln!("      mask:  {:.2?}", t_after_rope.elapsed());
         }
 
-        // query_states is already f32
+        // The attention pattern is block-diagonal per `cu_seqlens`. The dense
+        // masked path runs the full M×M flash kernel even when most of the
+        // mask is -inf — that's where ~95% of vision-encoder GPU time goes.
+        // For window-attention layers we instead slice Q/K/V per window and
+        // run dense (unmasked) flash on each — same arithmetic the
+        // block-diagonal mask intended, but at window² scale (~64²) rather
+        // than seq² (1944²). Full-attention layers (cu_seqlens=[0, seq])
+        // skip the slicing and just run one regular flash call.
+        let t_flash = std::time::Instant::now();
         let query_f32 = query_states;
         let key_f32 = key_states_f32;
         let value_f32 = value_states_f32;
-        let t_flash = std::time::Instant::now();
-        let output = forward_attention_qkv_f32(
-            &query_f32,
-            &key_f32,
-            &value_f32,
-            &self.proj,
-            Some(&mask),
-            self.head_dim,
-            bsz,
-            seq_len,
-            self.embed_dim,
-        );
+        let is_full_attn = cu_seqlens.len() == 2
+            && cu_seqlens[0] == 0
+            && cu_seqlens[1] as usize == seq_len;
+        let attn_out_4d = if is_full_attn {
+            query_f32.flash_attention(&key_f32, &value_f32, 1.0 / (self.head_dim as f64).sqrt() as f32, None)
+        } else {
+            // Slice each window, run flash on it, then cat along seq.
+            let mut window_outputs: Vec<Tensor<4, f32>> = Vec::with_capacity(cu_seqlens.len().saturating_sub(1));
+            for pair in cu_seqlens.windows(2) {
+                let start = pair[0] as usize;
+                let end = pair[1] as usize;
+                let len = end - start;
+                if len == 0 {
+                    continue;
+                }
+                let q_win = query_f32.narrow(2, start, len).to_concrete();
+                let k_win = key_f32.narrow(2, start, len).to_concrete();
+                let v_win = value_f32.narrow(2, start, len).to_concrete();
+                let win_out = q_win.flash_attention(
+                    &k_win,
+                    &v_win,
+                    1.0 / (self.head_dim as f64).sqrt() as f32,
+                    None,
+                );
+                window_outputs.push(win_out);
+            }
+            fusor::cat(window_outputs, 2).to_concrete()
+        };
+
+        // After flash: transpose+reshape to [b_sz, seq, hidden_size] then proj.
+        let attn_output = attn_out_4d.transpose(1, 2);
+        let attn_output = attn_output.reshape([bsz, seq_len, self.embed_dim]);
+        let output: Tensor<3, F> = self.proj.forward_generic(&attn_output.cast());
         if trace_attn {
             output.as_gpu().map(|g| g.materialize_sync());
             eprintln!("      flash+proj: {:.2?}", t_flash.elapsed());

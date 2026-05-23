@@ -1,6 +1,8 @@
 //! Quantized GEMV program kernels.
 
-use fusor_tile_ir::tile::{BlockCoord, Mask, Program, Q4KActivations, QuantizedDot, Storage, Tile, TileBlock};
+use fusor_tile_ir::tile::{
+    BlockCoord, Mask, Program, Q4KActivations, QuantizedDot, Storage, Tile, TileBlock,
+};
 use fusor_tile_ir::{GgmlQuantFormat, QuantizedMatrix, TileLiteral, TileReduceOp, F32, U32};
 
 use crate::dispatch::{

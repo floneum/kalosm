@@ -251,7 +251,10 @@ impl Resolver {
     }
 
     /// Remove unused inputs and deduplicate, returning new inputs and remapped expression.
-    pub(super) fn deduplicate_inputs(inputs: Vec<NodeIndex>, expr: NaryExpr) -> (Vec<NodeIndex>, NaryExpr) {
+    pub(super) fn deduplicate_inputs(
+        inputs: Vec<NodeIndex>,
+        expr: NaryExpr,
+    ) -> (Vec<NodeIndex>, NaryExpr) {
         // Collect which input indices are actually used
         let mut seen_indices = FxHashSet::default();
         let mut used_indices = Vec::new();
@@ -278,7 +281,11 @@ impl Resolver {
         (new_inputs, new_expr)
     }
 
-    pub(super) fn collect_used_inputs(expr: &NaryExpr, seen: &mut FxHashSet<usize>, used: &mut Vec<usize>) {
+    pub(super) fn collect_used_inputs(
+        expr: &NaryExpr,
+        seen: &mut FxHashSet<usize>,
+        used: &mut Vec<usize>,
+    ) {
         match expr {
             NaryExpr::Op { children, .. } => {
                 for child in children {
@@ -298,7 +305,10 @@ impl Resolver {
         }
     }
 
-    pub(super) fn remap_input_indices(expr: &NaryExpr, mapping: &FxHashMap<usize, usize>) -> NaryExpr {
+    pub(super) fn remap_input_indices(
+        expr: &NaryExpr,
+        mapping: &FxHashMap<usize, usize>,
+    ) -> NaryExpr {
         match expr {
             NaryExpr::Op { children, function } => NaryExpr::Op {
                 children: children
@@ -382,7 +392,9 @@ impl Resolver {
 
     /// Try to extract a unary function chain from a node variant.
     /// Only Nary ops with a single input and element-wise access can be converted.
-    pub(super) fn try_get_unary_chain(variant: &ComputeGraphNodeVariant) -> Option<ExtractedUnaryChain> {
+    pub(super) fn try_get_unary_chain(
+        variant: &ComputeGraphNodeVariant,
+    ) -> Option<ExtractedUnaryChain> {
         match variant {
             ComputeGraphNodeVariant::Nary(nary) => nary.try_extract_unary_chain(),
             _ => None,

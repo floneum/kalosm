@@ -224,7 +224,8 @@ impl Resolver {
 
         // Rewrite this Nary's variant in place; the produced shape and edges
         // already match the new operation.
-        self.execution_graph[node_idx].variant = ComputeGraphNodeVariant::QMatMul(Box::new(paired_op));
+        self.execution_graph[node_idx].variant =
+            ComputeGraphNodeVariant::QMatMul(Box::new(paired_op));
 
         // Re-wire incoming dependency edges. The new op consumes the qmatmul
         // input *and* every extra; the matmul views and the qmatmul itself

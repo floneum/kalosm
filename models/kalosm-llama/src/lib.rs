@@ -47,7 +47,7 @@ use fusor::{
     AddOp, CastTo, FloatOps, MatmulImpl, MulOp, SimdBinaryOp, SimdReduceOp, SumOp, WasmNotSend,
     WasmNotSync,
 };
-use futures::FutureExt;
+use futures_util::FutureExt;
 use kalosm_language_model::{TextCompletionBuilder, TextCompletionModelExt};
 pub use kalosm_model_types::FileSource;
 use kalosm_model_types::FutureWasmNotSend;
@@ -116,25 +116,25 @@ struct StructuredGenerationTask<F: FloatDataType + SimdElement = f32> {
 struct UnstructuredGenerationTask<F: FloatDataType + SimdElement = f32> {
     settings: InferenceSettings<F>,
     on_token: BoxedTokenCallback,
-    finished: futures::channel::oneshot::Sender<Result<(), LlamaModelError>>,
+    finished: futures_channel::oneshot::Sender<Result<(), LlamaModelError>>,
 }
 
 struct LlamaTask<F: FloatDataType + SimdElement = f32> {
-    sender: futures::channel::mpsc::UnboundedSender<Task<F>>,
+    sender: futures_channel::mpsc::UnboundedSender<Task<F>>,
     task: Mutex<Pin<Box<dyn FutureWasmNotSend<Output = ()> + 'static>>>,
 }
 
 /// A future that polls the background Llama task when awaited.
 pub(crate) struct LlamaResultFuture<F: FloatDataType + SimdElement, T> {
     llama: Llama<F>,
-    receiver: futures::channel::oneshot::Receiver<T>,
+    receiver: futures_channel::oneshot::Receiver<T>,
 }
 
 impl<F, T> Future for LlamaResultFuture<F, T>
 where
     F: FloatDataType + SimdElement,
 {
-    type Output = Result<T, futures::channel::oneshot::Canceled>;
+    type Output = Result<T, futures_channel::oneshot::Canceled>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let myself = self.get_mut();
@@ -222,9 +222,9 @@ where
 
     #[allow(clippy::too_many_arguments)]
     fn from_build(mut model: LlamaModel<F>) -> Self {
-        use futures::StreamExt;
+        use futures_util::StreamExt;
 
-        let (task_sender, mut task_receiver) = futures::channel::mpsc::unbounded();
+        let (task_sender, mut task_receiver) = futures_channel::mpsc::unbounded();
         let config = model.model.config.clone();
         let tokenizer = model.tokenizer.clone();
 

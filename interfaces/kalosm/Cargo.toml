@@ -11,7 +11,7 @@ autoexamples = false
 
 [dependencies]
 comfy-table = { version = "7.1.0", optional = true }
-futures-util = "0.3.28"
+futures-util = { workspace = true }
 hdrhistogram = { version = "7.5.4", optional = true }
 thiserror = { workspace = true, optional = true }
 rand = { version = "0.8.5", optional = true }
@@ -91,7 +91,7 @@ pollster = "0.4"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 
 [features]
-default = ["cpu", "gpu"]
+default = ["gpu"]
 cpu = [
     "kalosm-language?/cpu",
     "kalosm-llama?/cpu",
@@ -106,6 +106,8 @@ full = [
     "bert",
     "llama-vision",
     "hf-tokenizer-json",
+    "hf-config-json",
+    "chat-template-json",
     "structured",
     "vision",
     "sound",
@@ -130,6 +132,8 @@ structured = [
 ]
 bert = ["language", "dep:rbert"]
 llama = ["language", "dep:kalosm-llama"]
+chat-template-json = ["kalosm-llama?/chat-template-json"]
+hf-config-json = ["kalosm-llama?/hf-config-json"]
 hf-tokenizer-json = ["kalosm-llama?/hf-tokenizer-json"]
 llama-vision = ["llama", "kalosm-llama/vision"]
 documents = ["language", "dep:kalosm-language", "kalosm-language/documents"]

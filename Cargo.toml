@@ -82,12 +82,14 @@ anyhow = "1.0.94"
 image = "0.25"
 rand = "0.9"
 criterion = { version = "0.8", features = ["async_futures"] }
+futures-util = { version = "0.3.31", default-features = false, features = ["std"] }
+futures-channel = { version = "0.3.31", default-features = false, features = ["std"] }
 
 [dependencies]
 anyhow = { workspace = true, optional = true }
 axum = { version = "0.7.2", optional = true }
 comfy-table = { version = "7.1.0", optional = true }
-futures-util = { version = "0.3.28", optional = true }
+futures-util = { workspace = true, optional = true }
 image = { workspace = true, optional = true }
 kalosm = { workspace = true, default-features = false }
 kalosm-language = { workspace = true, default-features = false, optional = true }
@@ -100,13 +102,15 @@ tokio = { version = "1", features = ["macros", "net", "rt-multi-thread"], option
 tracing-subscriber = { version = "0.2", optional = true }
 
 [features]
-default = ["cpu", "gpu"]
+default = ["gpu"]
 cpu = ["kalosm/cpu", "kalosm-language?/cpu"]
 gpu = ["kalosm/gpu", "kalosm-language?/gpu"]
 full = [
     "bert",
     "llama-vision",
     "hf-tokenizer-json",
+    "hf-config-json",
+    "chat-template-json",
     "structured",
     "vision",
     "sound",
@@ -122,6 +126,8 @@ language = [
 structured = ["language", "kalosm/structured", "dep:kalosm-sample"]
 bert = ["language", "kalosm/bert"]
 llama = ["language", "kalosm/llama"]
+chat-template-json = ["kalosm/chat-template-json"]
+hf-config-json = ["kalosm/hf-config-json"]
 hf-tokenizer-json = ["kalosm/hf-tokenizer-json"]
 llama-vision = ["llama", "kalosm/llama-vision"]
 documents = ["language", "kalosm/documents", "dep:kalosm-language"]

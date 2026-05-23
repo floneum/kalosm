@@ -30,7 +30,7 @@ impl HuggingFaceChatTemplate {
         };
         // add the strftime_now function from huggingface templates to the environment
         let strftime_now = |format: String| -> Result<String, minijinja::Error> {
-            let now = chrono::Local::now();
+            let now = chrono::Utc::now();
             let formatted_time = now.format(&format).to_string();
             Ok(formatted_time)
         };
@@ -317,7 +317,7 @@ fn test_mistral_small_chat_template() {
 
     let result = template.format("<s>", "</s>", &inputs, false).unwrap();
     println!("{result}");
-    let now = chrono::Local::now().format("%Y-%m-%d").to_string();
+    let now = chrono::Utc::now().format("%Y-%m-%d").to_string();
     assert_eq!(
         result,
         format!(

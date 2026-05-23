@@ -10,8 +10,8 @@ use std::io::{BufWriter, Write};
 use std::time::Duration;
 use std::time::Instant;
 
-#[tokio::main]
-async fn main() {
+fn main() {
+    pollster::block_on(async {
         let model = Llama::new_chat().await.unwrap();
         let system_prompt = "The assistant will act like a pirate";
 
@@ -58,4 +58,5 @@ async fn main() {
                 println!("\n[{tokens} tokens in {elapsed:.2}s — {rate:.2} tok/s]");
             }
         }
+    });
 }

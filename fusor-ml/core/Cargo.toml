@@ -9,19 +9,18 @@ edition = "2024"
 # Use stable when https://github.com/gfx-rs/wgpu/issues/7712 is resolved
 wgpu = { git = "https://github.com/ealmloff/wgpu", branch = "yield-now", default-features = false, features = ["std", "naga-ir"] }
 bytemuck = { version = "1.14", features = ["derive"] }
-futures-channel = "0.3.31"
+futures-channel = { workspace = true }
 tabbycat = { version = "0.1.3", optional = true }
 half = { version = "2.4.1", features = ["bytemuck"] }
-enumset = "1.1.5"
 fusor-gguf = { workspace = true }
 fusor-types = { workspace = true }
 rustc-hash = "2.1.1"
 thiserror.workspace = true
 parking_lot = "0.12.3"
 tracing = "0.1.41"
-lru = "0.14.0"
+lru = { version = "0.14.0", default-features = false }
 pollster = "0.4.0"
-petgraph = "0.8.3"
+petgraph = { version = "0.8.3", features = ["stable_graph", "std"], default-features = false }
 fusor-tile-ir = { workspace = true }
 fusor-tile-ir-kernels = { workspace = true }
 fusor-tile-ir-runtime = { workspace = true }
@@ -36,7 +35,7 @@ wgpu = { git = "https://github.com/ealmloff/wgpu", branch = "yield-now", default
 wgpu = { git = "https://github.com/ealmloff/wgpu", branch = "yield-now", default-features = false, features = ["vulkan"] }
 
 [features]
-default = ["graphvis"]
+default = []
 extra_assertions = []
 graphvis = ["dep:tabbycat"]
 

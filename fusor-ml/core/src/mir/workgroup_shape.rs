@@ -116,7 +116,6 @@ impl WorkgroupShapeConstraints {
             })
         })
     }
-
 }
 
 fn possible_workgroup_shapes() -> impl Iterator<Item = WorkgroupShape> {
@@ -186,5 +185,4 @@ mod tests {
         assert_eq!(valid_shape.shape(), [4, 1, 1]);
         assert_eq!(valid_shape.linearized(), 4);
     }
-
 }

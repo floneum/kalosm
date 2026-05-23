@@ -574,11 +574,7 @@ async fn matmul_non_contiguous_input_matches_host_reference() {
 /// Run the `M×K · K×N` f16 matmul on every f16-capable device and compare
 /// against the host CPU reference. Both f16 matmul tests below differ only
 /// in the (M, N, K) const params, so this helper holds the shared setup.
-async fn assert_f16_matmul_matches_cpu_reference<
-    const M: usize,
-    const N: usize,
-    const K: usize,
->(
+async fn assert_f16_matmul_matches_cpu_reference<const M: usize, const N: usize, const K: usize>(
     tolerance: half::f16,
 ) {
     use half::f16;

@@ -27,10 +27,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // standard demo image (M=1944 = 1944 patches after merge). N varies by
     // projection; K is 1280 (embed dim) or 3420 (mlp inner / 2).
     let cases: &[(&str, usize, usize, usize)] = &[
-        ("vision_qkv",  1944, 1280, 3840),  // fused qkv projection
-        ("vision_o",    1944, 1280, 1280),  // attention output proj
-        ("vision_mlp_gate_up", 1944, 1280, 6840),  // gate+up fused
-        ("vision_mlp_down",    1944, 3420, 1280),  // down proj
+        ("vision_qkv", 1944, 1280, 3840),         // fused qkv projection
+        ("vision_o", 1944, 1280, 1280),           // attention output proj
+        ("vision_mlp_gate_up", 1944, 1280, 6840), // gate+up fused
+        ("vision_mlp_down", 1944, 3420, 1280),    // down proj
         // Aligned reference shape (M%128=0) so we can see how much faster the
         // coop tile path is for the same K/N when M is friendly.
         ("aligned_ref_1920_qkv", 1920, 1280, 3840),
@@ -114,58 +114,13 @@ fn bench_flash_attention_vision(device: &Device) {
     // in the model. We do this by allocating [1944, 16, 80] and then using
     // restride to expose it as [1, 16, 1944, 80] with the seq/head strides
     // swapped (head: 80, seq: 16*80=1280).
-    let q_pre = Tensor::<3, f32>::splat(device, 0.1, [1944, 16, 80]);
-    let k_pre = Tensor::<3, f32>::splat(device, 0.1, [1944, 16, 80]);
-    let v_pre = Tensor::<3, f32>::splat(device, 0.1, [1944, 16, 80]);
-    q_pre.materialize_sync();
-    k_pre.materialize_sync();
-    v_pre.materialize_sync();
-    use fusor_core::StrideSpec;
-    let restride_to_thsd = |t: &Tensor<3, f32>| -> Tensor<4, f32> {
-        t.restride([
-            StrideSpec::dim(0, 1),
-            StrideSpec::dim(2, 1944),
-            StrideSpec::dim(1, 16),
-            StrideSpec::dim(3, 80),
-        ])
-    };
-    let q_t = restride_to_thsd(&q_pre);
-    let k_t = restride_to_thsd(&k_pre);
-    let v_t = restride_to_thsd(&v_pre);
+    // (the transposed-Q/K/V bench was removed — see kernel-level analysis
+    //  in qwen_vision_block.rs: the issue is V's non-contiguous layout
+    //  defeats coalesced GPU loads in the streaming flash kernel.)
+    let _ = mask;
 
     for _ in 0..WARMUP_BATCHES {
-        let y = q_t.flash_attention(&k_t, &v_t, 1.0 / (80f32).sqrt(), Some(&mask));
-        let key = y.key();
-        device.resolve_batch(&[key]);
-        device.poll_wait();
-        drop(y);
-    }
-    let mut transposed_samples = Vec::with_capacity(MEASURED_BATCHES);
-    for _ in 0..MEASURED_BATCHES {
-        let start = Instant::now();
-        let y = q_t.flash_attention(&k_t, &v_t, 1.0 / (80f32).sqrt(), Some(&mask));
-        let key = y.key();
-        device.resolve_batch(&[key]);
-        device.poll_wait();
-        transposed_samples.push(start.elapsed());
-        drop(y);
-    }
-    let mut sorted_t = transposed_samples.clone();
-    sorted_t.sort_unstable();
-    println!();
-    println!("vision_flash_attention TRANSPOSED Q/K/V (matches model layout):");
-    println!("  mean_ms: {:.3}", mean_duration(&transposed_samples).as_secs_f64() * 1000.0);
-    println!("  p50_ms:  {:.3}", percentile_duration(&sorted_t, 50).as_secs_f64() * 1000.0);
-    println!("  p90_ms:  {:.3}", percentile_duration(&sorted_t, 90).as_secs_f64() * 1000.0);
-    println!("  min_ms:  {:.3}", sorted_t.first().copied().unwrap_or_default().as_secs_f64() * 1000.0);
-
-    for _ in 0..WARMUP_BATCHES {
-        let y = q.flash_attention(
-            &k,
-            &v,
-            1.0 / (80f32).sqrt(),
-            Some(&mask),
-        );
+        let y = q.flash_attention(&k, &v, 1.0 / (80f32).sqrt(), Some(&mask));
         let key = y.key();
         device.resolve_batch(&[key]);
         device.poll_wait();
@@ -175,12 +130,7 @@ fn bench_flash_attention_vision(device: &Device) {
     let mut masked_samples = Vec::with_capacity(MEASURED_BATCHES);
     for _ in 0..MEASURED_BATCHES {
         let start = Instant::now();
-        let y = q.flash_attention(
-            &k,
-            &v,
-            1.0 / (80f32).sqrt(),
-            Some(&mask),
-        );
+        let y = q.flash_attention(&k, &v, 1.0 / (80f32).sqrt(), Some(&mask));
         let key = y.key();
         device.resolve_batch(&[key]);
         device.poll_wait();
@@ -191,10 +141,22 @@ fn bench_flash_attention_vision(device: &Device) {
     sorted_m.sort_unstable();
     println!();
     println!("vision_flash_attention WITH MASK (1944x1944):");
-    println!("  mean_ms: {:.3}", mean_duration(&masked_samples).as_secs_f64() * 1000.0);
-    println!("  p50_ms:  {:.3}", percentile_duration(&sorted_m, 50).as_secs_f64() * 1000.0);
-    println!("  p90_ms:  {:.3}", percentile_duration(&sorted_m, 90).as_secs_f64() * 1000.0);
-    println!("  min_ms:  {:.3}", sorted_m.first().copied().unwrap_or_default().as_secs_f64() * 1000.0);
+    println!(
+        "  mean_ms: {:.3}",
+        mean_duration(&masked_samples).as_secs_f64() * 1000.0
+    );
+    println!(
+        "  p50_ms:  {:.3}",
+        percentile_duration(&sorted_m, 50).as_secs_f64() * 1000.0
+    );
+    println!(
+        "  p90_ms:  {:.3}",
+        percentile_duration(&sorted_m, 90).as_secs_f64() * 1000.0
+    );
+    println!(
+        "  min_ms:  {:.3}",
+        sorted_m.first().copied().unwrap_or_default().as_secs_f64() * 1000.0
+    );
 }
 
 fn bench_matmul(device: &Device, name: &str, m: usize, k: usize, n: usize) {
@@ -244,11 +206,7 @@ fn bench_matmul(device: &Device, name: &str, m: usize, k: usize, n: usize) {
     print_summary(name, m, k, n, &samples, kernels, gflops);
 }
 
-fn run_batch(
-    device: &Device,
-    a: &Tensor<3, f32>,
-    b: &Tensor<3, f32>,
-) -> (Duration, usize) {
+fn run_batch(device: &Device, a: &Tensor<3, f32>, b: &Tensor<3, f32>) -> (Duration, usize) {
     let mut keys = Vec::with_capacity(DISPATCHES_PER_BATCH);
     let mut outputs = Vec::with_capacity(DISPATCHES_PER_BATCH);
     for _ in 0..DISPATCHES_PER_BATCH {

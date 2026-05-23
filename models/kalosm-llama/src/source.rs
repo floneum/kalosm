@@ -2,6 +2,7 @@ use fusor_gguf::GgufReadError;
 use kalosm_common::CacheError;
 use kalosm_model_types::{FileLoadingProgress, FileSource};
 
+#[cfg(feature = "hf-config-json")]
 use crate::raw::RopeScalingConfig;
 
 fn llama_tokenizer() -> FileSource {
@@ -44,6 +45,7 @@ fn qwen3_tokenizer() -> FileSource {
     )
 }
 
+#[cfg(feature = "hf-config-json")]
 #[derive(Debug, serde::Deserialize)]
 pub(crate) struct LlamaConfigJson {
     pub(crate) rope_scaling: Option<RopeScalingConfig>,
@@ -74,7 +76,11 @@ pub enum LlamaSourceError {
     TokenizerJsonFeatureDisabled,
     /// An error occurred while loading the config.
     #[error("Failed to load the config: {0}")]
+    #[cfg(feature = "hf-config-json")]
     Config(#[from] serde_json::Error),
+    /// Loading config.json files requires an explicit feature.
+    #[error("External config.json files require the `hf-config-json` feature")]
+    ConfigJsonFeatureDisabled,
     /// An error occurred while loading the model (from the cache or downloading it).
     #[error("Failed to load the model: {0}")]
     Model(#[from] CacheError),
@@ -164,6 +170,18 @@ impl LlamaSource {
     pub fn with_config(mut self, config: FileSource) -> Self {
         self.config = Some(config);
         self
+    }
+
+    fn with_default_config(self, config: FileSource) -> Self {
+        #[cfg(feature = "hf-config-json")]
+        {
+            self.with_config(config)
+        }
+        #[cfg(not(feature = "hf-config-json"))]
+        {
+            let _ = config;
+            self
+        }
     }
 
     /// Set the cache location to use for the model (defaults DATA_DIR/kalosm/cache)
@@ -507,7 +525,7 @@ impl LlamaSource {
         ))
         .with_hf_tokenizer(llama_v3_tokenizer())
         // https://huggingface.co/unsloth/Meta-Llama-3.1-8B-Instruct/blob/main/config.json
-        .with_config(FileSource::huggingface(
+        .with_default_config(FileSource::huggingface(
             "unsloth/Meta-Llama-3.1-8B-Instruct".to_string(),
             "main".to_string(),
             "config.json".to_string(),
@@ -545,7 +563,7 @@ impl LlamaSource {
             "Llama-3.2-1B-Instruct-Q4_K_M.gguf".to_string(),
         ))
         .with_hf_tokenizer(llama_v3_tokenizer())
-        .with_config(FileSource::huggingface(
+        .with_default_config(FileSource::huggingface(
             "NousResearch/Llama-3.2-1B".to_string(),
             "main".to_string(),
             "config.json".to_string(),
@@ -561,7 +579,7 @@ impl LlamaSource {
             "Llama-3.2-3B-Instruct-Q4_K_M.gguf".to_string(),
         ))
         .with_hf_tokenizer(llama_v3_tokenizer())
-        .with_config(FileSource::huggingface(
+        .with_default_config(FileSource::huggingface(
             "NousResearch/Hermes-3-Llama-3.2-3B".to_string(),
             "main".to_string(),
             "config.json".to_string(),
