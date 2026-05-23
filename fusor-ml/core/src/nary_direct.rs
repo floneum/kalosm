@@ -757,7 +757,7 @@ pub(crate) struct TensorMeta {
 }
 
 impl TensorMeta {
-    fn new(tensor: &TensorData) -> Option<Self> {
+    pub(crate) fn new(tensor: &TensorData) -> Option<Self> {
         Some(Self {
             datatype: tensor.datatype(),
             shape: tensor
@@ -782,7 +782,15 @@ impl TensorMeta {
     }
 }
 
-fn layout_allocation_len(layout: &crate::Layout) -> Option<u32> {
+pub(crate) fn flat_layout(allocation_len: u32) -> tile_ir::Layout {
+    tile_ir::Layout::strided(
+        tile_ir::MemoryLevel::Storage,
+        tile_ir::Shape::new([1, allocation_len]),
+        &[0, 1],
+    )
+}
+
+pub(crate) fn layout_allocation_len(layout: &crate::Layout) -> Option<u32> {
     let max_index = layout
         .shape()
         .iter()

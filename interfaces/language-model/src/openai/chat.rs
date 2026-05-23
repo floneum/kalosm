@@ -215,77 +215,13 @@ impl ChatModel<GenerationParameters> for OpenAICompatibleChatModel {
     ) -> impl Future<Output = Result<(), Self::Error>> + Send + 'a {
         let myself = &*self.inner;
         let messages = format_messages(messages);
-        let mut json = serde_json::json!({
-            "messages": messages,
-            "model": myself.model,
-            "stream": true,
-            "temperature": sampler.temperature,
-        });
-        if let Some(top_p) = sampler.top_p {
-            json["top_p"] = serde_json::json!(top_p);
-        }
-        if let Some(repetition_penalty) = sampler.repetition_penalty {
-            json["frequency_penalty"] = serde_json::json!(repetition_penalty);
-        }
-        if sampler.max_length != u32::MAX {
-            json["max_completion_tokens"] = serde_json::json!(sampler.max_length);
-        }
-        if let Some(seed) = sampler.seed() {
-            json["seed"] = serde_json::json!(seed);
-        }
-        if let Some(stop) = &sampler.stop_on {
-            json["stop"] = serde_json::json!(stop);
-        }
+        let json = build_openai_request_json(&myself.model, messages, &sampler, None);
+
         async move {
-            let api_key = myself.client.resolve_api_key()?;
-            let mut event_source = myself
-                .client
-                .reqwest_client
-                .post(format!("{}/chat/completions", myself.client.base_url()))
-                .header("Content-Type", "application/json")
-                .header("Authorization", format!("Bearer {api_key}"))
-                .json(&json)
-                .eventsource()
-                .unwrap();
+            let mut event_source = build_openai_event_source(&myself.client, &json)?;
 
-            let mut new_message_text = String::new();
-
-            while let Some(event) = event_source.next().await {
-                match event? {
-                    Event::Open => {}
-                    Event::Message(message) => {
-                        let data =
-                            serde_json::from_str::<OpenAICompatibleChatResponse>(&message.data)?;
-                        let first_choice = data
-                            .choices
-                            .into_iter()
-                            .next()
-                            .ok_or(OpenAICompatibleChatModelError::NoMessageChoices)?;
-                        if let Some(content) = first_choice.delta.refusal {
-                            return Err(OpenAICompatibleChatModelError::Refusal(content));
-                        }
-                        if let Some(refusal) = &first_choice.finish_reason {
-                            match refusal {
-                                FinishReason::ContentFilter => {
-                                    return Err(OpenAICompatibleChatModelError::Refusal(
-                                        "ContentFilter".to_string(),
-                                    ))
-                                }
-                                FinishReason::FunctionCall => {
-                                    return Err(
-                                        OpenAICompatibleChatModelError::FunctionCallsNotSupported,
-                                    )
-                                }
-                                _ => return Ok(()),
-                            }
-                        }
-                        if let Some(content) = first_choice.delta.content {
-                            new_message_text += &content;
-                            on_token(content)?;
-                        }
-                    }
-                }
-            }
+            let new_message_text =
+                consume_openai_stream(&mut event_source, &mut on_token).await?;
 
             let new_message =
                 crate::ChatMessage::new(crate::MessageType::ModelAnswer, new_message_text);
@@ -331,93 +267,22 @@ where
         let myself = &*self.inner;
         let json = schema.map(|schema| {
             let messages = format_messages(messages);
-            let mut json = serde_json::json!({
-                "messages": messages,
-                "model": myself.model,
-                "stream": true,
-                "temperature": sampler.temperature,
-                "response_format": {
-                    "type": "json_schema",
-                    "json_schema": {
-                        "name": "response",
-                        "schema": schema,
-                        "strict": true
-                    }
+            let response_format = serde_json::json!({
+                "type": "json_schema",
+                "json_schema": {
+                    "name": "response",
+                    "schema": schema,
+                    "strict": true
                 }
             });
-            if let Some(top_p) = sampler.top_p {
-                json["top_p"] = serde_json::json!(top_p);
-            }
-            if let Some(repetition_penalty) = sampler.repetition_penalty {
-                json["frequency_penalty"] = serde_json::json!(repetition_penalty);
-            }
-            if sampler.max_length != u32::MAX {
-                json["max_completion_tokens"] = serde_json::json!(sampler.max_length);
-            }
-            if let Some(stop) = &sampler.stop_on {
-                json["stop"] = serde_json::json!(stop);
-            }
-            if let Some(seed) = sampler.seed() {
-                json["seed"] = serde_json::json!(seed);
-            }
-            json
+            build_openai_request_json(&myself.model, messages, &sampler, Some(response_format))
         });
         async move {
             let json = json?;
-            let api_key = myself.client.resolve_api_key()?;
-            let mut event_source = myself
-                .client
-                .reqwest_client
-                .post(format!("{}/chat/completions", myself.client.base_url()))
-                .header("Content-Type", "application/json")
-                .header("Authorization", format!("Bearer {api_key}"))
-                .json(&json)
-                .eventsource()
-                .unwrap();
+            let mut event_source = build_openai_event_source(&myself.client, &json)?;
 
-            let mut new_message_text = String::new();
-
-            while let Some(event) = event_source.next().await {
-                match event? {
-                    Event::Open => {}
-                    Event::Message(message) => {
-                        let data =
-                            serde_json::from_str::<OpenAICompatibleChatResponse>(&message.data)
-                                .inspect_err(|err| {
-                                    tracing::error!(
-                                        "Failed to parse streaming response: {:?}\nerror: {err:?}",
-                                        message.data
-                                    )
-                                })?;
-                        let first_choice = data
-                            .choices
-                            .first()
-                            .ok_or(OpenAICompatibleChatModelError::NoMessageChoices)?;
-                        if let Some(content) = &first_choice.delta.refusal {
-                            return Err(OpenAICompatibleChatModelError::Refusal(content.clone()));
-                        }
-                        if let Some(refusal) = &first_choice.finish_reason {
-                            match refusal {
-                                FinishReason::ContentFilter => {
-                                    return Err(OpenAICompatibleChatModelError::Refusal(
-                                        "ContentFilter".to_string(),
-                                    ))
-                                }
-                                FinishReason::FunctionCall => {
-                                    return Err(
-                                        OpenAICompatibleChatModelError::FunctionCallsNotSupported,
-                                    )
-                                }
-                                _ => break,
-                            }
-                        }
-                        if let Some(content) = &first_choice.delta.content {
-                            on_token(content.clone())?;
-                            new_message_text += content;
-                        }
-                    }
-                }
-            }
+            let new_message_text =
+                consume_openai_stream(&mut event_source, &mut on_token).await?;
 
             let result = serde_json::from_str::<P>(&new_message_text).map_err(|err| {
                 tracing::error!(
@@ -434,6 +299,104 @@ where
             Ok(result)
         }
     }
+}
+
+fn build_openai_request_json(
+    model: &str,
+    messages: serde_json::Value,
+    sampler: &GenerationParameters,
+    response_format: Option<serde_json::Value>,
+) -> serde_json::Value {
+    let mut json = serde_json::json!({
+        "messages": messages,
+        "model": model,
+        "stream": true,
+        "temperature": sampler.temperature,
+    });
+    if let Some(response_format) = response_format {
+        json["response_format"] = response_format;
+    }
+    if let Some(top_p) = sampler.top_p {
+        json["top_p"] = serde_json::json!(top_p);
+    }
+    if let Some(repetition_penalty) = sampler.repetition_penalty {
+        json["frequency_penalty"] = serde_json::json!(repetition_penalty);
+    }
+    if sampler.max_length != u32::MAX {
+        json["max_completion_tokens"] = serde_json::json!(sampler.max_length);
+    }
+    if let Some(seed) = sampler.seed() {
+        json["seed"] = serde_json::json!(seed);
+    }
+    if let Some(stop) = &sampler.stop_on {
+        json["stop"] = serde_json::json!(stop);
+    }
+    json
+}
+
+fn build_openai_event_source(
+    client: &OpenAICompatibleClient,
+    json: &serde_json::Value,
+) -> Result<reqwest_eventsource::EventSource, OpenAICompatibleChatModelError> {
+    let api_key = client.resolve_api_key()?;
+    Ok(client
+        .reqwest_client
+        .post(format!("{}/chat/completions", client.base_url()))
+        .header("Content-Type", "application/json")
+        .header("Authorization", format!("Bearer {api_key}"))
+        .json(json)
+        .eventsource()
+        .unwrap())
+}
+
+async fn consume_openai_stream(
+    event_source: &mut reqwest_eventsource::EventSource,
+    on_token: &mut impl FnMut(String) -> Result<(), OpenAICompatibleChatModelError>,
+) -> Result<String, OpenAICompatibleChatModelError> {
+    let mut new_message_text = String::new();
+
+    while let Some(event) = event_source.next().await {
+        match event? {
+            Event::Open => {}
+            Event::Message(message) => {
+                let data = serde_json::from_str::<OpenAICompatibleChatResponse>(&message.data)
+                    .inspect_err(|err| {
+                        tracing::error!(
+                            "Failed to parse streaming response: {:?}\nerror: {err:?}",
+                            message.data
+                        )
+                    })?;
+                let first_choice = data
+                    .choices
+                    .first()
+                    .ok_or(OpenAICompatibleChatModelError::NoMessageChoices)?;
+                if let Some(content) = &first_choice.delta.refusal {
+                    return Err(OpenAICompatibleChatModelError::Refusal(content.clone()));
+                }
+                if let Some(refusal) = &first_choice.finish_reason {
+                    match refusal {
+                        FinishReason::ContentFilter => {
+                            return Err(OpenAICompatibleChatModelError::Refusal(
+                                "ContentFilter".to_string(),
+                            ))
+                        }
+                        FinishReason::FunctionCall => {
+                            return Err(
+                                OpenAICompatibleChatModelError::FunctionCallsNotSupported,
+                            )
+                        }
+                        _ => break,
+                    }
+                }
+                if let Some(content) = &first_choice.delta.content {
+                    on_token(content.clone())?;
+                    new_message_text += content;
+                }
+            }
+        }
+    }
+
+    Ok(new_message_text)
 }
 
 fn format_messages(messages: &[crate::ChatMessage]) -> serde_json::Value {

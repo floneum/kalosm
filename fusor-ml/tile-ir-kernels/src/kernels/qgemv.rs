@@ -1,7 +1,7 @@
 //! Quantized GEMV program kernels.
 
-use fusor_tile_ir::tile::{BlockCoord, Mask, Program, QuantizedDot, Storage, Tile};
-use fusor_tile_ir::{GgmlQuantFormat, QuantizedMatrix, TileLiteral, TileReduceOp, F32};
+use fusor_tile_ir::tile::{BlockCoord, Mask, Program, Q4KActivations, QuantizedDot, Storage, Tile, TileBlock};
+use fusor_tile_ir::{GgmlQuantFormat, QuantizedMatrix, TileLiteral, TileReduceOp, F32, U32};
 
 use crate::dispatch::{
     q4k_default_large, q4k_default_mid, q4k_default_tall, q4k_large_override, q4k_mid_override,
@@ -10,8 +10,8 @@ use crate::dispatch::{
 };
 use crate::grid::{
     dot4_sum, q4k_ggml_iteration, q4k_lane_decomposition, q6k_ggml_iteration,
-    q6k_lane_decomposition, qgemv_grid, qgemv_program_scope, Q4KGgmlIterationRequest,
-    Q6KGgmlIterationRequest, QgemvStoreTarget,
+    q6k_lane_decomposition, qgemv_grid, qgemv_program_scope, Q4KGgmlIterationRequest, Q4KLane,
+    Q6KGgmlIterationRequest, Q6KLane, QgemvStoreTarget,
 };
 use crate::types::matrix_shape;
 
@@ -238,8 +238,177 @@ pub(crate) fn qgemv_tile_with_epilogue<const BN: usize, const BK: usize>(
     }
 }
 
-/// Q4K ggml-format qgemv body with optional pre/post unary epilogues.
-pub(crate) fn qgemv_q4k_ggml_with_epilogue<
+mod ggml_family_sealed {
+    pub trait Sealed {}
+}
+
+/// One ggml-format iteration's outputs as consumed by
+/// `qgemv_ggml_with_epilogue`. Mirrors `Q{4,6}KGgmlIteration` but parameterized
+/// over the format's activation payload.
+struct GgmlIteration<A> {
+    block: Tile<U32>,
+    in_bounds: Mask,
+    activations: A,
+}
+
+/// Sealed local trait abstracting the per-format pieces shared by the two
+/// `qgemv_q{4,6}k_ggml_with_epilogue` functions: the block-count divisor used
+/// to derive `block_iterations`, the lane decomposition, the per-pass
+/// iteration helper, and the format-specific `QuantizedDot` constructor.
+///
+/// All trait items are `pub(crate)`-visible only via the impls below; the
+/// `Sealed` supertrait keeps the implementer set closed to Q4K/Q6K.
+trait GgmlQuantFamily: ggml_family_sealed::Sealed {
+    const FORMAT: GgmlQuantFormat;
+    /// `block_iterations = block_count.div_ceil(BLOCK_DIV)` — 4 for Q4K, 2 for Q6K.
+    const BLOCK_DIV: u32;
+    type Lane;
+    type Activations: Clone;
+
+    fn lane_decomposition(lane: &Tile<U32>) -> Self::Lane;
+
+    fn iteration(
+        program: &mut TileBlock<'_>,
+        loop_index: Tile<U32>,
+        a: &Storage<F32, 2>,
+        block_count: u32,
+        full_block_iterations: bool,
+        lane: &Self::Lane,
+    ) -> GgmlIteration<Self::Activations>;
+
+    fn quantized_dot(
+        activations: Self::Activations,
+        b: &QuantizedMatrix,
+        block: &Tile<U32>,
+        lane: &Self::Lane,
+        col: Tile<U32>,
+        mask: Mask,
+    ) -> QuantizedDot;
+}
+
+/// Q4K ggml family marker.
+enum Q4KFamily {}
+impl ggml_family_sealed::Sealed for Q4KFamily {}
+impl GgmlQuantFamily for Q4KFamily {
+    const FORMAT: GgmlQuantFormat = GgmlQuantFormat::Q4K;
+    const BLOCK_DIV: u32 = 4;
+    type Lane = Q4KLane;
+    type Activations = Q4KActivations;
+
+    fn lane_decomposition(lane: &Tile<U32>) -> Self::Lane {
+        q4k_lane_decomposition(lane)
+    }
+
+    fn iteration(
+        program: &mut TileBlock<'_>,
+        loop_index: Tile<U32>,
+        a: &Storage<F32, 2>,
+        block_count: u32,
+        full_block_iterations: bool,
+        lane: &Self::Lane,
+    ) -> GgmlIteration<Self::Activations> {
+        let pass = q4k_ggml_iteration(
+            program,
+            Q4KGgmlIterationRequest {
+                loop_index,
+                a,
+                row: 0,
+                block_count,
+                full_block_iterations,
+                lane,
+                base_mask: Mask::all(),
+            },
+        );
+        GgmlIteration {
+            block: pass.block,
+            in_bounds: pass.in_bounds,
+            activations: pass.activations,
+        }
+    }
+
+    fn quantized_dot(
+        activations: Self::Activations,
+        b: &QuantizedMatrix,
+        block: &Tile<U32>,
+        lane: &Self::Lane,
+        col: Tile<U32>,
+        mask: Mask,
+    ) -> QuantizedDot {
+        QuantizedDot::q4k_block(
+            activations,
+            b,
+            BlockCoord::new(block, &lane.iq, &lane.ir),
+            col,
+            mask,
+            0.0,
+        )
+    }
+}
+
+/// Q6K ggml family marker.
+enum Q6KFamily {}
+impl ggml_family_sealed::Sealed for Q6KFamily {}
+impl GgmlQuantFamily for Q6KFamily {
+    const FORMAT: GgmlQuantFormat = GgmlQuantFormat::Q6K;
+    const BLOCK_DIV: u32 = 2;
+    type Lane = Q6KLane;
+    type Activations = [Tile<F32>; 16];
+
+    fn lane_decomposition(lane: &Tile<U32>) -> Self::Lane {
+        q6k_lane_decomposition(lane)
+    }
+
+    fn iteration(
+        program: &mut TileBlock<'_>,
+        loop_index: Tile<U32>,
+        a: &Storage<F32, 2>,
+        block_count: u32,
+        full_block_iterations: bool,
+        lane: &Self::Lane,
+    ) -> GgmlIteration<Self::Activations> {
+        let pass = q6k_ggml_iteration(
+            program,
+            Q6KGgmlIterationRequest {
+                loop_index,
+                a,
+                row: 0,
+                block_count,
+                full_block_iterations,
+                lane,
+                base_mask: Mask::all(),
+            },
+        );
+        GgmlIteration {
+            block: pass.block,
+            in_bounds: pass.in_bounds,
+            activations: pass.activations,
+        }
+    }
+
+    fn quantized_dot(
+        activations: Self::Activations,
+        b: &QuantizedMatrix,
+        block: &Tile<U32>,
+        lane: &Self::Lane,
+        col: Tile<U32>,
+        mask: Mask,
+    ) -> QuantizedDot {
+        QuantizedDot::q6k_block(
+            activations,
+            b,
+            BlockCoord::new(block, &lane.ip, &lane.il),
+            col,
+            mask,
+            0.0,
+        )
+    }
+}
+
+/// Format-generic ggml-format qgemv body with optional pre/post unary
+/// epilogues. Monomorphizes to the same IR the per-format
+/// `qgemv_q{4,6}k_ggml_with_epilogue` shims previously produced by hand.
+fn qgemv_ggml_with_epilogue<
+    F: GgmlQuantFamily,
     const SUBGROUPS: u32,
     const COLS_PER_SUBGROUP: usize,
     const BLOCK: usize,
@@ -253,20 +422,20 @@ pub(crate) fn qgemv_q4k_ggml_with_epilogue<
 ) {
     const SUBGROUP_SIZE: u32 = 32;
     debug_assert_eq!(SUBGROUPS * SUBGROUP_SIZE, BLOCK as u32);
-    debug_assert_eq!(b.format, GgmlQuantFormat::Q4K);
+    debug_assert_eq!(b.format, F::FORMAT);
 
     let [_, k] = matrix_shape(&a.view().layout);
     let grid = qgemv_grid::<SUBGROUPS, COLS_PER_SUBGROUP>(b.cols, workgroups_x);
     let block_count = k.div_ceil(256);
-    let block_iterations = block_count.div_ceil(4);
-    let full_block_iterations = block_count.is_multiple_of(4);
+    let block_iterations = block_count.div_ceil(F::BLOCK_DIV);
+    let full_block_iterations = block_count.is_multiple_of(F::BLOCK_DIV);
     let b_cloned = b.clone();
 
     program.program_grid::<BLOCK>([grid.workgroups_x, grid.dispatch_y, 1], |program| {
         let scope = qgemv_program_scope::<COLS_PER_SUBGROUP>(program, grid);
         let col0 = scope.col0;
         let lane = scope.lane;
-        let q4k_lane = q4k_lane_decomposition(&lane);
+        let fmt_lane = F::lane_decomposition(&lane);
 
         let zero = TileLiteral::f32(0.0);
         let sums: [Tile; COLS_PER_SUBGROUP] = program.loop_fold_n::<COLS_PER_SUBGROUP, _, _>(
@@ -274,29 +443,25 @@ pub(crate) fn qgemv_q4k_ggml_with_epilogue<
             block_iterations,
             [zero; COLS_PER_SUBGROUP],
             |program, loop_index| {
-                let pass = q4k_ggml_iteration(
+                let pass = F::iteration(
                     program,
-                    Q4KGgmlIterationRequest {
-                        loop_index,
-                        a,
-                        row: 0,
-                        block_count,
-                        full_block_iterations,
-                        lane: &q4k_lane,
-                        base_mask: Mask::all(),
-                    },
+                    loop_index,
+                    a,
+                    block_count,
+                    full_block_iterations,
+                    &fmt_lane,
                 );
 
                 std::array::from_fn(|c| {
                     let col = col0.clone() + c as u32;
                     let mask = grid.mask(full_block_iterations, pass.in_bounds.clone(), &col);
-                    program.quantized_dot(QuantizedDot::q4k_block(
+                    program.quantized_dot(F::quantized_dot(
                         pass.activations.clone(),
                         &b_cloned,
-                        BlockCoord::new(&pass.block, &q4k_lane.iq, &q4k_lane.ir),
-                        &col,
+                        &pass.block,
+                        &fmt_lane,
+                        col,
                         mask,
-                        0.0,
                     ))
                 })
             },
@@ -317,6 +482,29 @@ pub(crate) fn qgemv_q4k_ggml_with_epilogue<
     });
 }
 
+/// Q4K ggml-format qgemv body with optional pre/post unary epilogues.
+pub(crate) fn qgemv_q4k_ggml_with_epilogue<
+    const SUBGROUPS: u32,
+    const COLS_PER_SUBGROUP: usize,
+    const BLOCK: usize,
+>(
+    program: &mut Program,
+    a: &Storage<F32, 2>,
+    b: &QuantizedMatrix,
+    y: &Storage<F32, 2>,
+    workgroups_x: u32,
+    epilogues: &crate::types::QmatmulEpilogues<'_>,
+) {
+    qgemv_ggml_with_epilogue::<Q4KFamily, SUBGROUPS, COLS_PER_SUBGROUP, BLOCK>(
+        program,
+        a,
+        b,
+        y,
+        workgroups_x,
+        epilogues,
+    )
+}
+
 /// Q6K ggml-format qgemv body with optional pre/post unary epilogues.
 pub(crate) fn qgemv_q6k_ggml_with_epilogue<
     const SUBGROUPS: u32,
@@ -330,70 +518,14 @@ pub(crate) fn qgemv_q6k_ggml_with_epilogue<
     workgroups_x: u32,
     epilogues: &crate::types::QmatmulEpilogues<'_>,
 ) {
-    const SUBGROUP_SIZE: u32 = 32;
-    debug_assert_eq!(SUBGROUPS * SUBGROUP_SIZE, BLOCK as u32);
-    debug_assert_eq!(b.format, GgmlQuantFormat::Q6K);
-
-    let [_, k] = matrix_shape(&a.view().layout);
-    let grid = qgemv_grid::<SUBGROUPS, COLS_PER_SUBGROUP>(b.cols, workgroups_x);
-    let block_count = k.div_ceil(256);
-    let block_iterations = block_count.div_ceil(2);
-    let full_block_iterations = block_count.is_multiple_of(2);
-    let b_cloned = b.clone();
-
-    program.program_grid::<BLOCK>([grid.workgroups_x, grid.dispatch_y, 1], |program| {
-        let scope = qgemv_program_scope::<COLS_PER_SUBGROUP>(program, grid);
-        let col0 = scope.col0;
-        let lane = scope.lane;
-        let q6k_lane = q6k_lane_decomposition(&lane);
-
-        let zero = TileLiteral::f32(0.0);
-        let sums: [Tile; COLS_PER_SUBGROUP] = program.loop_fold_n::<COLS_PER_SUBGROUP, _, _>(
-            TileReduceOp::Sum,
-            block_iterations,
-            [zero; COLS_PER_SUBGROUP],
-            |program, loop_index| {
-                let pass = q6k_ggml_iteration(
-                    program,
-                    Q6KGgmlIterationRequest {
-                        loop_index,
-                        a,
-                        row: 0,
-                        block_count,
-                        full_block_iterations,
-                        lane: &q6k_lane,
-                        base_mask: Mask::all(),
-                    },
-                );
-
-                std::array::from_fn(|c| {
-                    let col = col0.clone() + c as u32;
-                    let mask = grid.mask(full_block_iterations, pass.in_bounds.clone(), &col);
-                    program.quantized_dot(QuantizedDot::q6k_block(
-                        pass.activations.clone(),
-                        &b_cloned,
-                        BlockCoord::new(&pass.block, &q6k_lane.ip, &q6k_lane.il),
-                        &col,
-                        mask,
-                        0.0,
-                    ))
-                })
-            },
-        );
-
-        crate::grid::store_qgemv_sums_with_epilogue(
-            program,
-            sums,
-            QgemvStoreTarget {
-                y,
-                col0,
-                lane,
-                full_cols: grid.full_cols,
-                n_cols: grid.n_cols,
-                epilogues,
-            },
-        );
-    });
+    qgemv_ggml_with_epilogue::<Q6KFamily, SUBGROUPS, COLS_PER_SUBGROUP, BLOCK>(
+        program,
+        a,
+        b,
+        y,
+        workgroups_x,
+        epilogues,
+    )
 }
 
 /// Generic subgroup-partitioned qgemv body with optional pre- and post-reduce

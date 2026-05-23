@@ -375,19 +375,39 @@ where
 
         let cu_seqlens = std::iter::once(0).chain(cu_seqlens).collect::<Vec<_>>();
 
+        let mut total_layer_ns: u128 = 0;
         for (layer_num, blk) in self.blocks.iter().enumerate() {
             let cu_seqlens_now = if self.fullatt_block_indexes.contains(&layer_num) {
                 &cu_seqlens
             } else {
                 &cu_window_seqlens
             };
+            let t_layer = std::time::Instant::now();
             hidden_states = blk.forward(
                 &hidden_states,
                 cu_seqlens_now.as_slice(),
                 &rope_cache,
                 cache.as_deref_mut(),
             )?;
+            // Force flush this layer so timings reflect GPU work, not just
+            // graph construction.
+            hidden_states
+                .as_gpu()
+                .map(|g| g.materialize_sync());
+            let layer_elapsed = t_layer.elapsed();
+            total_layer_ns += layer_elapsed.as_nanos();
+            if layer_num < 3 || layer_num == self.blocks.len() - 1 {
+                eprintln!(
+                    "[timing] vision layer {layer_num}: {:.2?}",
+                    layer_elapsed
+                );
+            }
         }
+        eprintln!(
+            "[timing] vision all {} layers sum: {:.2?}",
+            self.blocks.len(),
+            std::time::Duration::from_nanos(total_layer_ns as u64)
+        );
 
         let hidden_states = self.merger.forward(&hidden_states);
         let reverse_indices = {

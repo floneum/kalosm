@@ -3,6 +3,8 @@ use fusor_tile_ir::{
     CoopElement, FloatElement, Numeric, TileLiteral, F16, F32, U32,
 };
 
+use crate::types::QmatmulExtra;
+
 /// Storage-side conversion to/from an accumulator element type. The
 /// `<F32, F32>` and `<F16, F16>` impls are identity; the `<F16, F32>` impl
 /// inserts the cast pair that lets F16 storage be loaded into F32
@@ -327,6 +329,37 @@ pub(super) fn coop_set_c_grid<T: CoopElement>(
     for row_accs in accs {
         for (c, acc) in row_accs.iter().enumerate() {
             program.coop_set_acc(acc, &c_frags[c]);
+        }
+    }
+}
+
+/// 1D-logical workgroup count dispatched as a 3D grid clamped to
+/// `max_per_dim` in each axis. Shared by dense and quantized matmul
+/// dispatch paths.
+pub(super) fn dispatch_grid_1d(total_workgroups: u32, max_per_dim: u32) -> [u32; 3] {
+    assert!(total_workgroups > 0, "matmul dispatch must have workgroups");
+    assert!(max_per_dim > 0, "max_per_dim must be non-zero");
+    let x = total_workgroups.min(max_per_dim);
+    let y_needed = total_workgroups.div_ceil(x);
+    let y = y_needed.min(max_per_dim);
+    let z = y_needed.div_ceil(y).max(1);
+    [x, y, z]
+}
+
+/// Load the per-output-element extra activation/column for qmatmul: a
+/// column vector indexed by `col` or a pointwise tensor indexed by
+/// `(row, col)`, with an out-of-bound mask falling back to `0.0`.
+pub(super) fn load_qmatmul_extra(
+    program: &mut TileBlock<'_>,
+    extra: &QmatmulExtra<'_>,
+    row: &Tile<U32>,
+    col: &Tile<U32>,
+    n_cols: u32,
+) -> Tile<F32> {
+    match extra {
+        QmatmulExtra::Column(vector) => program.load(vector.at(col), col.lt(n_cols), 0.0),
+        QmatmulExtra::Pointwise(tensor) => {
+            program.load(tensor.at((row, col)), col.lt(n_cols), 0.0)
         }
     }
 }

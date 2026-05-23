@@ -2581,19 +2581,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "env_logger"
-version = "0.10.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4cd405aab171cb85d6735e5c8d9db038c17d3ca007a4d2c25f337935c3d90580"
-dependencies = [
- "humantime",
- "is-terminal",
- "log",
- "regex",
- "termcolor",
-]
-
-[[package]]
 name = "equator"
 version = "0.4.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2957,15 +2944,12 @@ dependencies = [
  "candle-transformers",
  "criterion 0.8.2",
  "enumset",
- "env_logger",
  "fusor-gguf",
  "fusor-tile-ir",
  "fusor-tile-ir-kernels",
  "fusor-tile-ir-runtime",
  "fusor-types",
- "futures",
  "futures-channel",
- "futures-util",
  "half",
  "kalosm-common",
  "kalosm-model-types",

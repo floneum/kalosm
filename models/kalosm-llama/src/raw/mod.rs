@@ -677,10 +677,25 @@ where
         if let Some(vision_encoder) = &self.vision_encoder {
             for ((pixels, grid), range) in images.iter().zip(&grid_thw).zip(image_token_ranges) {
                 let pixels_f: Tensor<2, F> = pixels.cast();
+                let t_vision_build = std::time::Instant::now();
                 let image_embeds = vision_encoder.forward_image(&pixels_f, *grid)?;
+                let build_elapsed = t_vision_build.elapsed();
+                let t_vision_materialize = std::time::Instant::now();
+                // Force the vision graph to flush by materializing through
+                // slice_assign so we can attribute time to vision vs text
+                // prefill stages.
+                let image_embeds_3d = image_embeds.unsqueeze(0);
+                let mat_t = std::time::Instant::now();
+                image_embeds_3d.as_gpu().map(|g| g.materialize_sync());
+                let mat_elapsed = mat_t.elapsed();
+                let materialize_elapsed = t_vision_materialize.elapsed();
+                eprintln!(
+                    "[timing] vision graph build={:.2?} materialize={:.2?} (mat_only={:.2?})",
+                    build_elapsed, materialize_elapsed, mat_elapsed
+                );
                 embeddings = embeddings.slice_assign(
                     [0..batch_size, range, 0..embed_dim],
-                    &image_embeds.unsqueeze(0),
+                    &image_embeds_3d,
                 );
             }
             let (new_pos_ids, new_start_time) =

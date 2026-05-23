@@ -4,8 +4,8 @@ use std::ops::{Add as StdAdd, Div as StdDiv, Mul as StdMul, Rem as StdRem, Sub a
 
 use pulp::Simd;
 
-use crate::{ConcreteTensor, SimdElement, TensorBacking, materialize_expr};
-use fusor_types::Layout;
+use crate::SimdElement;
+use crate::define_tensor_op;
 
 /// Trait for binary operations that have SIMD support
 pub trait SimdBinaryOp<E: SimdElement>: Copy {
@@ -164,86 +164,9 @@ impl_f16_binary_op!(RemOp, |a: half::f16, b: half::f16| half::f16::from_f32(
     a.to_f32() % b.to_f32()
 ));
 
-/// Macro to define binary tensor operations (Add, Sub, Mul, Div)
-macro_rules! define_binary_tensor_op {
-    ($name:ident, $std_trait:ident, $simd_op:ty, $error_msg:literal) => {
-        pub struct $name<
-            E: SimdElement,
-            const R: usize,
-            T1: TensorBacking<R, Elem = E>,
-            T2: TensorBacking<R, Elem = E>,
-        > {
-            lhs: T1,
-            rhs: T2,
-            _marker: std::marker::PhantomData<E>,
-        }
-
-        impl<E, const R: usize, T1, T2> $name<E, R, T1, T2>
-        where
-            E: SimdElement,
-            T1: TensorBacking<R, Elem = E>,
-            T2: TensorBacking<R, Elem = E>,
-        {
-            pub fn new(lhs: T1, rhs: T2) -> Self {
-                Self {
-                    lhs,
-                    rhs,
-                    _marker: std::marker::PhantomData,
-                }
-            }
-        }
-
-        impl<E, const R: usize, T1, T2> crate::LazyBacking for $name<E, R, T1, T2>
-        where
-            E: SimdElement + $std_trait<Output = E> + Default,
-            $simd_op: SimdBinaryOp<E>,
-            T1: TensorBacking<R, Elem = E>,
-            T2: TensorBacking<R, Elem = E>,
-        {
-            type Elem = E;
-
-            #[inline(always)]
-            fn eval_scalar(&self, idx: usize) -> E {
-                <$simd_op>::apply_scalar(self.lhs.eval_scalar(idx), self.rhs.eval_scalar(idx))
-            }
-
-            #[inline(always)]
-            fn eval_simd<S: Simd>(&self, simd: S, base_idx: usize) -> E::Simd<S> {
-                <$simd_op>::apply_simd_vec(
-                    simd,
-                    self.lhs.eval_simd(simd, base_idx),
-                    self.rhs.eval_simd(simd, base_idx),
-                )
-            }
-        }
-
-        impl<E, const R: usize, T1, T2> TensorBacking<R> for $name<E, R, T1, T2>
-        where
-            E: SimdElement + $std_trait<Output = E> + Default,
-            $simd_op: SimdBinaryOp<E>,
-            T1: TensorBacking<R, Elem = E>,
-            T2: TensorBacking<R, Elem = E>,
-        {
-            fn layout(&self) -> Layout {
-                Layout::contiguous(self.lhs.layout().shape())
-            }
-
-            fn to_concrete(&self) -> ConcreteTensor<E, R> {
-                let shape: [usize; R] = self
-                    .lhs
-                    .layout()
-                    .shape()
-                    .try_into()
-                    .expect("Shape length mismatch");
-                materialize_expr(self, shape)
-            }
-        }
-    };
-}
-
 // Binary tensor operations
-define_binary_tensor_op!(Add, StdAdd, AddOp, "Tensor rank mismatch in Add");
-define_binary_tensor_op!(Sub, StdSub, SubOp, "Tensor rank mismatch in Sub");
-define_binary_tensor_op!(Mul, StdMul, MulOp, "Tensor rank mismatch in Mul");
-define_binary_tensor_op!(Div, StdDiv, DivOp, "Tensor rank mismatch in Div");
-define_binary_tensor_op!(Rem, StdRem, RemOp, "Tensor rank mismatch in Rem");
+define_tensor_op!(@binary Add, AddOp, std_trait = StdAdd);
+define_tensor_op!(@binary Sub, SubOp, std_trait = StdSub);
+define_tensor_op!(@binary Mul, MulOp, std_trait = StdMul);
+define_tensor_op!(@binary Div, DivOp, std_trait = StdDiv);
+define_tensor_op!(@binary Rem, RemOp, std_trait = StdRem);

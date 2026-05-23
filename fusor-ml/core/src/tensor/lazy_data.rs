@@ -1,3 +1,4 @@
+#[cfg(feature = "graphvis")]
 use tabbycat::Graph;
 
 use crate::{
@@ -198,6 +199,7 @@ impl LazyTensorData {
         (result.data, result.total_kernels)
     }
 
+    #[cfg(feature = "graphvis")]
     pub fn graphvis(&self) -> Graph {
         self.device.compute_graph().graphvis(self.key)
     }

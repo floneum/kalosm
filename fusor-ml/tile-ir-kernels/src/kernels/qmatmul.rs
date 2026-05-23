@@ -6,30 +6,14 @@ use fusor_tile_ir::{QuantizedMatrix, TileLiteral, TileReduceOp, WorkgroupAxis, F
 use crate::{
     kernels::helpers::{
         coop_load_a_fragments, coop_load_b_fragments, coop_load_c_broadcast_fragments,
-        coop_mma_grid, coop_set_c_grid, coop_store_acc_grid, zero_coop_acc_grid,
+        coop_mma_grid, coop_set_c_grid, coop_store_acc_grid, load_qmatmul_extra,
+        zero_coop_acc_grid,
     },
     types::{
         apply_qmatmul_post_epilogue, apply_qmatmul_pre_epilogue,
         cooperative_store_layout_supported, matrix_shape,
     },
 };
-
-fn load_qmatmul_extra(
-    program: &mut fusor_tile_ir::tile::TileBlock<'_>,
-    extra: &crate::types::QmatmulExtra<'_>,
-    row: &fusor_tile_ir::tile::Tile<fusor_tile_ir::U32>,
-    col: &fusor_tile_ir::tile::Tile<fusor_tile_ir::U32>,
-    n_cols: u32,
-) -> fusor_tile_ir::tile::Tile<F32> {
-    match extra {
-        crate::types::QmatmulExtra::Column(vector) => {
-            program.load(vector.at(col), col.lt(n_cols), 0.0)
-        }
-        crate::types::QmatmulExtra::Pointwise(tensor) => {
-            program.load(tensor.at((row, col)), col.lt(n_cols), 0.0)
-        }
-    }
-}
 
 /// Top-level quantized matrix multiply with optional activation/output
 /// epilogues. Single-row inputs keep using qgemv; multi-row inputs use the

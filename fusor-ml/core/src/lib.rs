@@ -20,7 +20,6 @@ pub use wgpu::{WasmNotSend, WasmNotSendSync, WasmNotSync};
 
 pub use matmul::*;
 pub use resize::ShapeWithOneHole;
-pub use varbuilder::{ShardedVarBuilder, VarBuilder};
 
 mod composite;
 mod compute_graph;
@@ -51,7 +50,6 @@ mod slice_assign;
 mod tensor;
 mod top_k;
 pub use top_k::{GpuMirostat2Sampler, GpuMirostat2SamplerParams};
-mod varbuilder;
 mod visit_tiled;
 
 #[derive(thiserror::Error, Debug)]

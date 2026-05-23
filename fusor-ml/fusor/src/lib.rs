@@ -723,83 +723,58 @@ impl_tensor_scalar_op!(Add, add, +);
 // Broadcasting binary operations that can work with tensors of different ranks.
 // Broadcasting is done at the fusor level using broadcast_as (which dispatches to
 // backend restride), then same-rank operators are applied.
+
+/// Macro to implement broadcasting binary operations for Tensor.
+/// Broadcasts both tensors to a common shape using `broadcast_as` and applies the
+/// same-rank operator.
+macro_rules! impl_tensor_broadcast_op {
+    ($trait:ident, $method:ident, $op:tt, $op_ty:ident) => {
+        impl<const R: usize, D, B> Tensor<R, D, B>
+        where
+            D: SimdElement + DataType + Default,
+            B: TensorBacking<R, Elem = D>,
+        {
+            #[doc = concat!(
+                "Broadcasting ",
+                stringify!($method),
+                ": broadcasts both tensors to a common shape and applies the operation."
+            )]
+            pub fn $method<const R2: usize, const R3: usize, B2>(
+                &self,
+                second: &Tensor<R2, D, B2>,
+            ) -> Tensor<R3, D>
+            where
+                (crate::gpu::Tensor<R, D>, crate::gpu::Tensor<R2, D>):
+                    crate::gpu::MaxRank<R3, D>,
+                (ConcreteTensor<D, R>, ConcreteTensor<D, R2>):
+                    crate::cpu::MaxRank<R3, D>,
+                D: std::ops::$trait<Output = D>,
+                $op_ty: SimdBinaryOp<D>,
+                B2: TensorBacking<R2, Elem = D>,
+            {
+                let out_shape: [usize; R3] =
+                    composite::broadcast_shapes(&self.shape(), &second.shape());
+                let a = self.broadcast_as(out_shape);
+                let b = second.broadcast_as(out_shape);
+                (&a $op &b).to_concrete()
+            }
+        }
+    };
+}
+
+impl_tensor_broadcast_op!(Add, add_, +, AddOp);
+impl_tensor_broadcast_op!(Sub, sub_, -, SubOp);
+impl_tensor_broadcast_op!(Mul, mul_, *, MulOp);
+impl_tensor_broadcast_op!(Div, div_, /, DivOp);
+
+// `pow_` has a different shape from the other broadcast ops (it requires
+// `FloatDataType + FloatOps`, has no SimdBinaryOp bound, and dispatches manually
+// rather than going through an operator), so it stays inline.
 impl<const R: usize, D, B> Tensor<R, D, B>
 where
     D: SimdElement + DataType + Default,
     B: TensorBacking<R, Elem = D>,
 {
-    /// Broadcasting add: broadcasts both tensors to a common shape and adds them.
-    pub fn add_<const R2: usize, const R3: usize, B2>(
-        &self,
-        second: &Tensor<R2, D, B2>,
-    ) -> Tensor<R3, D>
-    where
-        (crate::gpu::Tensor<R, D>, crate::gpu::Tensor<R2, D>): crate::gpu::MaxRank<R3, D>,
-        (ConcreteTensor<D, R>, ConcreteTensor<D, R2>): crate::cpu::MaxRank<R3, D>,
-        D: std::ops::Add<Output = D>,
-        AddOp: SimdBinaryOp<D>,
-        B2: TensorBacking<R2, Elem = D>,
-    {
-        let out_shape: [usize; R3] = composite::broadcast_shapes(&self.shape(), &second.shape());
-        let a = self.broadcast_as(out_shape);
-        let b = second.broadcast_as(out_shape);
-        (&a + &b).to_concrete()
-    }
-
-    /// Broadcasting subtract: broadcasts both tensors to a common shape and subtracts them.
-    pub fn sub_<const R2: usize, const R3: usize, B2>(
-        &self,
-        second: &Tensor<R2, D, B2>,
-    ) -> Tensor<R3, D>
-    where
-        (crate::gpu::Tensor<R, D>, crate::gpu::Tensor<R2, D>): crate::gpu::MaxRank<R3, D>,
-        (ConcreteTensor<D, R>, ConcreteTensor<D, R2>): crate::cpu::MaxRank<R3, D>,
-        D: std::ops::Sub<Output = D>,
-        SubOp: SimdBinaryOp<D>,
-        B2: TensorBacking<R2, Elem = D>,
-    {
-        let out_shape: [usize; R3] = composite::broadcast_shapes(&self.shape(), &second.shape());
-        let a = self.broadcast_as(out_shape);
-        let b = second.broadcast_as(out_shape);
-        (&a - &b).to_concrete()
-    }
-
-    /// Broadcasting multiply: broadcasts both tensors to a common shape and multiplies them.
-    pub fn mul_<const R2: usize, const R3: usize, B2>(
-        &self,
-        second: &Tensor<R2, D, B2>,
-    ) -> Tensor<R3, D>
-    where
-        (crate::gpu::Tensor<R, D>, crate::gpu::Tensor<R2, D>): crate::gpu::MaxRank<R3, D>,
-        (ConcreteTensor<D, R>, ConcreteTensor<D, R2>): crate::cpu::MaxRank<R3, D>,
-        D: std::ops::Mul<Output = D>,
-        MulOp: SimdBinaryOp<D>,
-        B2: TensorBacking<R2, Elem = D>,
-    {
-        let out_shape: [usize; R3] = composite::broadcast_shapes(&self.shape(), &second.shape());
-        let a = self.broadcast_as(out_shape);
-        let b = second.broadcast_as(out_shape);
-        (&a * &b).to_concrete()
-    }
-
-    /// Broadcasting divide: broadcasts both tensors to a common shape and divides them.
-    pub fn div_<const R2: usize, const R3: usize, B2>(
-        &self,
-        second: &Tensor<R2, D, B2>,
-    ) -> Tensor<R3, D>
-    where
-        (crate::gpu::Tensor<R, D>, crate::gpu::Tensor<R2, D>): crate::gpu::MaxRank<R3, D>,
-        (ConcreteTensor<D, R>, ConcreteTensor<D, R2>): crate::cpu::MaxRank<R3, D>,
-        D: std::ops::Div<Output = D>,
-        DivOp: SimdBinaryOp<D>,
-        B2: TensorBacking<R2, Elem = D>,
-    {
-        let out_shape: [usize; R3] = composite::broadcast_shapes(&self.shape(), &second.shape());
-        let a = self.broadcast_as(out_shape);
-        let b = second.broadcast_as(out_shape);
-        (&a / &b).to_concrete()
-    }
-
     /// Broadcasting power: broadcasts both tensors to a common shape and computes power.
     pub fn pow_<const R2: usize, const R3: usize, B2>(
         &self,

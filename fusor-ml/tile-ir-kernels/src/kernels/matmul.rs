@@ -7,7 +7,7 @@ use crate::{
     grid::dot4_sum,
     kernels::helpers::{
         coop_load_a_fragments, coop_load_b_fragments, coop_mma_grid, coop_store_acc_grid,
-        zero_coop_acc_grid, AccumCast,
+        dispatch_grid_1d, zero_coop_acc_grid, AccumCast,
     },
     types::{
         apply_optional_epilogue, cooperative_store_layout_supported, matrix_shape,
@@ -26,16 +26,6 @@ pub struct DenseMatmulShape {
     pub k: u32,
     /// Columns per rhs/output matrix.
     pub n: u32,
-}
-
-fn dispatch_grid_1d(total_workgroups: u32, max_per_dim: u32) -> [u32; 3] {
-    assert!(total_workgroups > 0, "matmul dispatch must have workgroups");
-    assert!(max_per_dim > 0, "max_per_dim must be non-zero");
-    let x = total_workgroups.min(max_per_dim);
-    let y_needed = total_workgroups.div_ceil(x);
-    let y = y_needed.min(max_per_dim);
-    let z = y_needed.div_ceil(y).max(1);
-    [x, y, z]
 }
 
 /// Batched dense GEMV over flattened direct views:

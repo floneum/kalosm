@@ -8,7 +8,7 @@ description = "Unified CPU/GPU tensor abstraction over fusor-cpu and fusor-core"
 
 [dependencies]
 fusor-cpu = { path = "../cpu", optional = true }
-fusor-core = { path = "../core", optional = true }
+fusor-core = { path = "../core", optional = true, default-features = false }
 fusor-gguf = { path = "../gguf" }
 fusor-types = { path = "../types" }
 pollster = { version = "0.4.0", optional = true }
@@ -39,9 +39,10 @@ candle-transformers = { workspace = true, features = ["metal"] }
 bench = false
 
 [features]
-default = ["cpu", "gpu"]
+default = ["cpu", "gpu", "graphvis"]
 cpu = ["dep:fusor-cpu"]
 gpu = ["dep:fusor-core", "dep:pollster"]
+graphvis = ["gpu", "fusor-core/graphvis"]
 
 [[bench]]
 name = "bert_layer"

@@ -6,11 +6,13 @@ use petgraph::prelude::StableGraph;
 use petgraph::visit::EdgeRef;
 use resolve::Resolver;
 use rustc_hash::{FxHashMap, FxHashSet};
+#[cfg(feature = "graphvis")]
 use tabbycat::Graph;
 
 mod layout_pass;
 mod queue;
 mod resolve;
+#[cfg(feature = "graphvis")]
 mod visualize;
 
 use crate::{
@@ -184,6 +186,7 @@ impl ComputeGraph {
         total_kernels
     }
 
+    #[cfg(feature = "graphvis")]
     pub(crate) fn graphvis(&self, root: NodeIndex) -> Graph {
         self.with_mut(|inner| inner.graphvis(root))
     }

@@ -4,6 +4,7 @@ use std::{
     ops::Range,
 };
 
+#[cfg(feature = "graphvis")]
 use tabbycat::Graph;
 use wgpu::COPY_BUFFER_ALIGNMENT;
 
@@ -23,8 +24,8 @@ use crate::{
 pub use fusor_types::TensorSlice;
 
 mod eager_data;
-mod lazy_data;
 mod layout_info;
+mod lazy_data;
 mod sampling;
 mod traits;
 
@@ -647,6 +648,7 @@ impl<D: DataType, const R: usize> Tensor<R, D> {
         &self.data.device
     }
 
+    #[cfg(feature = "graphvis")]
     pub fn graphvis(&self) -> Graph {
         self.data.graphvis()
     }

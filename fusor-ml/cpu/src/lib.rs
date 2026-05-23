@@ -324,6 +324,239 @@ impl_max_rank!(8, 9);
 impl_max_rank!(8, 10);
 impl_max_rank!(9, 10);
 
+/// Canonical macro for defining lazy tensor expression types.
+///
+/// Subsumes the four arities of tensor-op expressions:
+/// - `@unary`: one tensor input (e.g. `Neg`, `Abs`, `Sqrt`, transcendentals)
+/// - `@binary`: two tensor inputs (e.g. `Add`, `Sub`, comparisons)
+/// - `@scalar`: one tensor input + one scalar (e.g. `AddScalar`)
+///
+/// Each variant accepts an optional `, std_trait = $StdTrait` fragment that
+/// adds `E: $StdTrait<Output = E>` to the trait-impl where-clauses. Pairwise
+/// ops use this to require e.g. `E: StdAdd<Output = E>`; comparisons and most
+/// elementwise ops omit it.
+///
+/// The `LazyBacking` impls keep `#[inline(always)]` on both `eval_scalar` and
+/// `eval_simd` so kernel fusion still inlines through the wrapper structs.
+macro_rules! define_tensor_op {
+    // -------- Unary (single tensor input) --------
+    (
+        @unary $name:ident, $simd_op:ty $(, std_trait = $std_trait:ident)?
+    ) => {
+        pub struct $name<E: $crate::SimdElement, const R: usize, T: $crate::TensorBacking<R, Elem = E>> {
+            input: T,
+            _marker: std::marker::PhantomData<E>,
+        }
+
+        impl<E, const R: usize, T> $name<E, R, T>
+        where
+            E: $crate::SimdElement,
+            T: $crate::TensorBacking<R, Elem = E>,
+        {
+            pub fn new(input: T) -> Self {
+                Self {
+                    input,
+                    _marker: std::marker::PhantomData,
+                }
+            }
+        }
+
+        impl<E, const R: usize, T> $crate::LazyBacking for $name<E, R, T>
+        where
+            E: $crate::SimdElement + Default $(+ $std_trait<Output = E>)?,
+            $simd_op: $crate::elementwise::SimdUnaryOp<E>,
+            T: $crate::TensorBacking<R, Elem = E>,
+        {
+            type Elem = E;
+
+            #[inline(always)]
+            fn eval_scalar(&self, idx: usize) -> E {
+                <$simd_op as $crate::elementwise::SimdUnaryOp<E>>::apply_scalar(
+                    self.input.eval_scalar(idx),
+                )
+            }
+
+            #[inline(always)]
+            fn eval_simd<S: pulp::Simd>(&self, simd: S, base_idx: usize) -> E::Simd<S> {
+                <$simd_op as $crate::elementwise::SimdUnaryOp<E>>::apply_simd_vec(
+                    simd,
+                    self.input.eval_simd(simd, base_idx),
+                )
+            }
+        }
+
+        impl<E, const R: usize, T> $crate::TensorBacking<R> for $name<E, R, T>
+        where
+            E: $crate::SimdElement + Default $(+ $std_trait<Output = E>)?,
+            $simd_op: $crate::elementwise::SimdUnaryOp<E>,
+            T: $crate::TensorBacking<R, Elem = E>,
+        {
+            fn layout(&self) -> $crate::Layout {
+                $crate::Layout::contiguous(self.input.layout().shape())
+            }
+
+            fn to_concrete(&self) -> $crate::ConcreteTensor<E, R> {
+                let shape: [usize; R] = self
+                    .input
+                    .layout()
+                    .shape()
+                    .try_into()
+                    .expect("Shape length mismatch");
+                $crate::materialize_expr(self, shape)
+            }
+        }
+    };
+
+    // -------- Binary (two tensor inputs) --------
+    (
+        @binary $name:ident, $simd_op:ty $(, std_trait = $std_trait:ident)?
+    ) => {
+        pub struct $name<
+            E: $crate::SimdElement,
+            const R: usize,
+            T1: $crate::TensorBacking<R, Elem = E>,
+            T2: $crate::TensorBacking<R, Elem = E>,
+        > {
+            lhs: T1,
+            rhs: T2,
+            _marker: std::marker::PhantomData<E>,
+        }
+
+        impl<E, const R: usize, T1, T2> $name<E, R, T1, T2>
+        where
+            E: $crate::SimdElement,
+            T1: $crate::TensorBacking<R, Elem = E>,
+            T2: $crate::TensorBacking<R, Elem = E>,
+        {
+            pub fn new(lhs: T1, rhs: T2) -> Self {
+                Self {
+                    lhs,
+                    rhs,
+                    _marker: std::marker::PhantomData,
+                }
+            }
+        }
+
+        impl<E, const R: usize, T1, T2> $crate::LazyBacking for $name<E, R, T1, T2>
+        where
+            E: $crate::SimdElement + Default $(+ $std_trait<Output = E>)?,
+            $simd_op: $crate::pairwise::SimdBinaryOp<E>,
+            T1: $crate::TensorBacking<R, Elem = E>,
+            T2: $crate::TensorBacking<R, Elem = E>,
+        {
+            type Elem = E;
+
+            #[inline(always)]
+            fn eval_scalar(&self, idx: usize) -> E {
+                <$simd_op as $crate::pairwise::SimdBinaryOp<E>>::apply_scalar(
+                    self.lhs.eval_scalar(idx),
+                    self.rhs.eval_scalar(idx),
+                )
+            }
+
+            #[inline(always)]
+            fn eval_simd<S: pulp::Simd>(&self, simd: S, base_idx: usize) -> E::Simd<S> {
+                <$simd_op as $crate::pairwise::SimdBinaryOp<E>>::apply_simd_vec(
+                    simd,
+                    self.lhs.eval_simd(simd, base_idx),
+                    self.rhs.eval_simd(simd, base_idx),
+                )
+            }
+        }
+
+        impl<E, const R: usize, T1, T2> $crate::TensorBacking<R> for $name<E, R, T1, T2>
+        where
+            E: $crate::SimdElement + Default $(+ $std_trait<Output = E>)?,
+            $simd_op: $crate::pairwise::SimdBinaryOp<E>,
+            T1: $crate::TensorBacking<R, Elem = E>,
+            T2: $crate::TensorBacking<R, Elem = E>,
+        {
+            fn layout(&self) -> $crate::Layout {
+                $crate::Layout::contiguous(self.lhs.layout().shape())
+            }
+
+            fn to_concrete(&self) -> $crate::ConcreteTensor<E, R> {
+                let shape: [usize; R] = self
+                    .lhs
+                    .layout()
+                    .shape()
+                    .try_into()
+                    .expect("Shape length mismatch");
+                $crate::materialize_expr(self, shape)
+            }
+        }
+    };
+
+    // -------- Scalar (tensor + scalar value) --------
+    (
+        @scalar $name:ident, $simd_op:ty $(, std_trait = $std_trait:ident)?
+    ) => {
+        pub struct $name<E: $crate::SimdElement, const R: usize, T: $crate::TensorBacking<R, Elem = E>> {
+            tensor: T,
+            scalar: E,
+        }
+
+        impl<E, const R: usize, T> $name<E, R, T>
+        where
+            E: $crate::SimdElement,
+            T: $crate::TensorBacking<R, Elem = E>,
+        {
+            pub fn new(tensor: T, scalar: E) -> Self {
+                Self { tensor, scalar }
+            }
+        }
+
+        impl<E, const R: usize, T> $crate::LazyBacking for $name<E, R, T>
+        where
+            E: $crate::SimdElement + Default $(+ $std_trait<Output = E>)?,
+            $simd_op: $crate::pairwise::SimdBinaryOp<E>,
+            T: $crate::TensorBacking<R, Elem = E>,
+        {
+            type Elem = E;
+
+            #[inline(always)]
+            fn eval_scalar(&self, idx: usize) -> E {
+                <$simd_op as $crate::pairwise::SimdBinaryOp<E>>::apply_scalar(
+                    self.tensor.eval_scalar(idx),
+                    self.scalar,
+                )
+            }
+
+            #[inline(always)]
+            fn eval_simd<S: pulp::Simd>(&self, simd: S, base_idx: usize) -> E::Simd<S> {
+                <$simd_op as $crate::pairwise::SimdBinaryOp<E>>::apply_simd_vec(
+                    simd,
+                    self.tensor.eval_simd(simd, base_idx),
+                    <E as $crate::SimdElement>::splat(simd, self.scalar),
+                )
+            }
+        }
+
+        impl<E, const R: usize, T> $crate::TensorBacking<R> for $name<E, R, T>
+        where
+            E: $crate::SimdElement + Default $(+ $std_trait<Output = E>)?,
+            $simd_op: $crate::pairwise::SimdBinaryOp<E>,
+            T: $crate::TensorBacking<R, Elem = E>,
+        {
+            fn layout(&self) -> $crate::Layout {
+                $crate::Layout::contiguous(self.tensor.layout().shape())
+            }
+
+            fn to_concrete(&self) -> $crate::ConcreteTensor<E, R> {
+                let shape: [usize; R] = self
+                    .tensor
+                    .layout()
+                    .shape()
+                    .try_into()
+                    .expect("Shape length mismatch");
+                $crate::materialize_expr(self, shape)
+            }
+        }
+    };
+}
+
+pub(crate) use define_tensor_op;
+
 /// Trait for types that support scalar and SIMD evaluation without a rank parameter.
 /// This is a supertrait of `TensorBacking` that allows rank-independent access.
 pub trait LazyBacking: Sync {

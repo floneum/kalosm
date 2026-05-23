@@ -4,6 +4,7 @@ use fusor::{
     SimdElement, Tensor,
 };
 use std::f32::consts::PI;
+use std::sync::{Arc, Mutex};
 
 pub(crate) fn create_inverse_frequency<F>(
     rope_scaling: Option<&RopeScalingConfig>,
@@ -111,10 +112,31 @@ where
     }
 }
 
-#[derive(Clone)]
 pub(crate) struct QwenVLRopeCache<F: FloatDataType + SimdElement = f32> {
     inverse_frequency: Tensor<2, F>,
     mrope_sections: Vec<usize>,
+    // Per-forward-pass memoization. The (cos, sin) returned by
+    // `forward_sin_cos` depends only on `position_ids`; the same tensor is
+    // re-used across every attention layer in a single forward pass, so
+    // recomputing per layer would re-emit ~6 slice_assigns + a matmul + 2
+    // trig kernels per layer (35+ wasted dispatches at 36 layers). Identity
+    // is keyed on the GPU NodeIndex via `key()` because Tensor itself
+    // doesn't implement Hash/Eq, but identical pos_ids tensors always share
+    // their compute-graph key within a pass.
+    // Arc-shared so every layer in the model points at the same memo table:
+    // attention layers clone their `RopeImplementation`, but we want one
+    // cache that fills on the first layer and serves the rest.
+    cached: Arc<Mutex<Option<(u64, Tensor<2, f32>, Tensor<2, f32>)>>>,
+}
+
+impl<F: FloatDataType + SimdElement> Clone for QwenVLRopeCache<F> {
+    fn clone(&self) -> Self {
+        Self {
+            inverse_frequency: self.inverse_frequency.clone(),
+            mrope_sections: self.mrope_sections.clone(),
+            cached: Arc::clone(&self.cached),
+        }
+    }
 }
 
 impl<F: FloatDataType + SimdElement> QwenVLRopeCache<F>
@@ -139,10 +161,38 @@ where
         Ok(Self {
             inverse_frequency,
             mrope_sections,
+            cached: Arc::new(Mutex::new(None)),
         })
     }
 
+    fn position_ids_key(position_ids: &Tensor<2, F>) -> Option<u64> {
+        match position_ids {
+            Tensor::Gpu(g) => Some(g.key().index() as u64),
+            Tensor::Cpu(_) => None,
+        }
+    }
+
     fn forward_sin_cos(&self, position_ids: &Tensor<2, F>) -> (Tensor<2, f32>, Tensor<2, f32>) {
+        let key = Self::position_ids_key(position_ids);
+        if let Some(k) = key {
+            if let Ok(guard) = self.cached.lock() {
+                if let Some((cached_key, cos, sin)) = guard.as_ref() {
+                    if *cached_key == k {
+                        return (cos.clone(), sin.clone());
+                    }
+                }
+            }
+        }
+        let (cos, sin) = self.compute_sin_cos(position_ids);
+        if let Some(k) = key {
+            if let Ok(mut guard) = self.cached.lock() {
+                *guard = Some((k, cos.clone(), sin.clone()));
+            }
+        }
+        (cos, sin)
+    }
+
+    fn compute_sin_cos(&self, position_ids: &Tensor<2, F>) -> (Tensor<2, f32>, Tensor<2, f32>) {
         // Work in f32 for SIMD compatibility
         let inv_freq_f32: Tensor<2, f32> = self.inverse_frequency.cast();
         let position_ids_f32: Tensor<2, f32> = position_ids.cast();
@@ -198,11 +248,13 @@ where
         key: &Tensor<4, F>,
     ) -> (Tensor<4, F>, Tensor<4, F>) {
         let (cos, sin) = self.forward_sin_cos(position_ids);
-        // Rope operations work in f32, then cast back
+        // Rope operations work in f32, then cast back. The fused pair kernel
+        // emits a single GPU dispatch covering both q and k — replaces the
+        // ~16 element-wise kernels per layer that the composite `rope` path
+        // generated (cat+neg+mul+add+slice_assign chain).
         let query_f32: Tensor<4, f32> = query.cast();
         let key_f32: Tensor<4, f32> = key.cast();
-        let key_out = key_f32.rope(&cos, &sin);
-        let query_out = query_f32.rope(&cos, &sin);
+        let (query_out, key_out) = query_f32.rope_normal_pair_fused(&key_f32, &cos, &sin);
         (query_out.cast(), key_out.cast())
     }
 }

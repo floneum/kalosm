@@ -25,45 +25,16 @@
 use fusor_tile_ir::tile::{Mask, Program, Storage, Tile, TileBlock, Workgroup};
 use fusor_tile_ir::{QuantizedMatrix, TileLiteral, TileReduceOp, WorkgroupAxis, F32, U32};
 
+use crate::kernels::helpers::{dispatch_grid_1d, load_qmatmul_extra};
 use crate::types::{
     apply_qmatmul_post_epilogue, apply_qmatmul_pre_epilogue, matrix_shape, QmatmulEpilogues,
 };
-
-fn load_qmatmul_extra(
-    program: &mut TileBlock<'_>,
-    extra: &crate::types::QmatmulExtra<'_>,
-    row: &Tile<U32>,
-    col: &Tile<U32>,
-    n_cols: u32,
-) -> Tile<F32> {
-    match extra {
-        crate::types::QmatmulExtra::Column(vector) => {
-            program.load(vector.at(col), col.lt(n_cols), 0.0)
-        }
-        crate::types::QmatmulExtra::Pointwise(tensor) => {
-            program.load(tensor.at((row, col)), col.lt(n_cols), 0.0)
-        }
-    }
-}
 
 const QMATMUL_LANES: usize = 64;
 const QGEMV_LANES: usize = 64;
 const QMATMUL_TM: usize = 4;
 const QMATMUL_TN: usize = 4;
 const QGEMV_TN: usize = 1;
-
-fn dispatch_grid_1d(total_workgroups: u32, max_per_dim: u32) -> [u32; 3] {
-    assert!(
-        total_workgroups > 0,
-        "qmatmul dispatch must have workgroups"
-    );
-    assert!(max_per_dim > 0, "max_per_dim must be non-zero");
-    let x = total_workgroups.min(max_per_dim);
-    let y_needed = total_workgroups.div_ceil(x);
-    let y = y_needed.min(max_per_dim);
-    let z = y_needed.div_ceil(y).max(1);
-    [x, y, z]
-}
 
 /// Stage `f32` source rows in `[row_base, row_base + ROWS)` and cols in
 /// `[col_base, col_base + COLS)` into the workgroup tile `dst`, applying

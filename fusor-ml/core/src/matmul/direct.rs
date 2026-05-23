@@ -7,9 +7,10 @@ use crate::{
         workgroup_shape::WorkgroupShape,
     },
     nary_direct::{
-        ValueTile, apply_unary_function_chain, layout_index, linear_group, output_dims_from_flat,
+        TensorMeta, ValueTile, apply_unary_function_chain, flat_layout, layout_index,
+        linear_group, output_dims_from_flat,
     },
-    tensor::{DataTypeEnum, TensorData},
+    tensor::DataTypeEnum,
     visit_tiled::distribute_workgroups,
 };
 
@@ -144,12 +145,12 @@ pub(crate) fn build_serial_matmul_direct_kernel(
 
                             let a = a_storage.load(
                                 program,
-                                layout_index(&a_meta_body.as_nary_meta(), &a_coords),
+                                layout_index(&a_meta_body, &a_coords),
                                 in_bounds.clone(),
                             );
                             let b = b_storage.load(
                                 program,
-                                layout_index(&b_meta_body.as_nary_meta(), &b_coords),
+                                layout_index(&b_meta_body, &b_coords),
                                 in_bounds.clone(),
                             );
                             let (a, a_ty) = apply_unary_function_chain(
@@ -193,7 +194,7 @@ pub(crate) fn build_serial_matmul_direct_kernel(
                         .cast_to(y_meta_body.datatype);
                     y_storage.store(
                         program,
-                        layout_index(&y_meta_body.as_nary_meta(), &dims),
+                        layout_index(&y_meta_body, &dims),
                         sum,
                         in_bounds,
                     );
@@ -235,66 +236,3 @@ fn output_dims_from_flat_u32(
     output_dims_from_flat(flat, &shape)
 }
 
-fn flat_layout(allocation_len: u32) -> tile_ir::Layout {
-    tile_ir::Layout::strided(
-        tile_ir::MemoryLevel::Storage,
-        tile_ir::Shape::new([1, allocation_len]),
-        &[0, 1],
-    )
-}
-
-#[derive(Clone)]
-struct TensorMeta {
-    datatype: DataTypeEnum,
-    shape: Vec<u32>,
-    strides: Vec<u32>,
-    offset: u32,
-    allocation_len: u32,
-}
-
-impl TensorMeta {
-    fn new(tensor: &TensorData) -> Option<Self> {
-        Some(Self {
-            datatype: tensor.datatype(),
-            shape: tensor
-                .layout()
-                .shape()
-                .iter()
-                .copied()
-                .map(u32::try_from)
-                .collect::<Result<_, _>>()
-                .ok()?,
-            strides: tensor
-                .layout()
-                .strides()
-                .iter()
-                .copied()
-                .map(u32::try_from)
-                .collect::<Result<Vec<_>, _>>()
-                .ok()?,
-            offset: tensor.layout().offset().try_into().ok()?,
-            allocation_len: layout_allocation_len(tensor.layout())?,
-        })
-    }
-
-    fn as_nary_meta(&self) -> crate::nary_direct::TensorMeta {
-        crate::nary_direct::TensorMeta {
-            datatype: self.datatype,
-            shape: self.shape.clone(),
-            strides: self.strides.clone(),
-            offset: self.offset,
-            allocation_len: self.allocation_len,
-        }
-    }
-}
-
-fn layout_allocation_len(layout: &crate::Layout) -> Option<u32> {
-    let max_index = layout
-        .shape()
-        .iter()
-        .zip(layout.strides())
-        .try_fold(layout.offset(), |acc, (dim, stride)| {
-            acc.checked_add(dim.saturating_sub(1).checked_mul(*stride)?)
-        })?;
-    max_index.checked_add(1)?.try_into().ok()
-}
