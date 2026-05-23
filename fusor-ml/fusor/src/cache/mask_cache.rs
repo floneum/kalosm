@@ -75,43 +75,6 @@ where
             // Pad the mask on the left with zeros
             let mask_tensor = mask.mask();
             let [rows, cols] = mask_tensor.shape();
-            if matches!(device, Device::Gpu(gpu) if gpu.requires_host_fallbacks()) {
-                let mut padded = vec![D::zero(); rows * (seqlen_offset + cols)];
-                let source = match mask_tensor {
-                    Tensor::Cpu(tensor) => {
-                        let slice = tensor.as_slice();
-                        let mut values = Vec::with_capacity(rows * cols);
-                        for row in 0..rows {
-                            for col in 0..cols {
-                                values.push(slice[[row, col]]);
-                            }
-                        }
-                        values
-                    }
-                    Tensor::Gpu(tensor) => {
-                        let slice =
-                            pollster::block_on(tensor.as_slice()).expect("failed to read mask");
-                        let mut values = Vec::with_capacity(rows * cols);
-                        for row in 0..rows {
-                            for col in 0..cols {
-                                values.push(slice[[row, col]]);
-                            }
-                        }
-                        values
-                    }
-                };
-                for row in 0..rows {
-                    for col in 0..cols {
-                        padded[row * (seqlen_offset + cols) + seqlen_offset + col] =
-                            source[row * cols + col];
-                    }
-                }
-                return AttentionMask::new(Tensor::from_slice(
-                    device,
-                    [rows, seqlen_offset + cols],
-                    &padded,
-                ));
-            }
             let zeros: Tensor<2, D> = Tensor::zeros(device, [rows, seqlen_offset + cols]);
             let padded_mask = zeros.slice_assign(
                 [0..rows, seqlen_offset..(seqlen_offset + cols)],

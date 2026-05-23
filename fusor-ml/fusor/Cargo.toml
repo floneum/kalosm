@@ -23,7 +23,7 @@ criterion.workspace = true
 candle-core = { workspace = true }
 candle-nn = { workspace = true }
 candle-transformers = { workspace = true }
-kalosm-common = { workspace = true, features = ["tokio"] }
+kalosm-common = { workspace = true }
 kalosm-model-types.workspace = true
 rand.workspace = true
 futures = "0.3.31"

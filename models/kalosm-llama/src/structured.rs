@@ -2,19 +2,15 @@ use fusor::{
     AddOp, CastTensor, CastTo, FloatDataType, FloatOps, MatmulImpl, MulOp, SimdBinaryOp,
     SimdElement, SimdReduceOp, SumOp, WasmNotSend, WasmNotSync,
 };
-use kalosm_language_model::{ContentChunk, MessageContent};
+#[cfg(feature = "vision")]
+use kalosm_language_model::ContentChunk;
+use kalosm_language_model::MessageContent;
 use kalosm_sample::CreateParserState;
 use kalosm_sample::{LiteralParser, ParseStatus, Parser, ParserExt};
-use llm_samplers::prelude::{Logit, Logits};
-use llm_samplers::types::{HasSamplerResources, Sampler, SamplerError};
-use rand::SeedableRng;
 use rayon::iter::{IntoParallelIterator, ParallelIterator};
-use std::{
-    fmt::{Debug, Formatter},
-    sync::{Arc, Mutex},
-};
 
 use crate::model::LlamaModelError;
+use crate::sampler::{CpuMirostat2Sampler, Logit, Logits};
 use crate::token_stream::TokenOutputStream;
 use crate::{LlamaModel, LlamaSession};
 
@@ -25,10 +21,9 @@ pub(crate) async fn generate_structured<F, P: Parser>(
     session: &mut LlamaSession<F>,
     parser: P,
     parser_state: P::PartialState,
-    mut sampler: Arc<Mutex<dyn Sampler>>,
+    mut sampler: CpuMirostat2Sampler,
     mut on_token: impl FnMut(String) -> Result<(), LlamaModelError>,
     top_k: Option<usize>,
-    seed: Option<u64>,
 ) -> Result<P::Output, LlamaModelError>
 where
     F: FloatDataType
@@ -56,6 +51,7 @@ where
     let tokenizer = &llm.tokenizer;
 
     let prompt_text = prompt.text();
+    #[cfg(feature = "vision")]
     let images = prompt
         .chunks()
         .iter()
@@ -68,20 +64,27 @@ where
                 None
             }
         })
-        .collect::<Result<Vec<_>, _>>()?;
+        .collect::<Result<Vec<crate::LlamaImage>, _>>()?;
+    #[cfg(not(feature = "vision"))]
+    let images: Vec<crate::LlamaImage> = {
+        if prompt.has_media() {
+            return Err(LlamaModelError::MediaUnsupported);
+        }
+        Vec::new()
+    };
     let prompt_tokens = tokenizer
-        .encode_fast(prompt_text, false)
+        .encode(&prompt_text, false)
         .map_err(LlamaModelError::Tokenizer)?;
-    let mut prompt_tokens = prompt_tokens.get_ids();
+    let mut prompt_tokens = prompt_tokens;
 
     // Prompt healing
     // Trim the last token and add what it would decode to into the constraints
-    let last_token = if let Some((last, tokens)) = prompt_tokens.split_last() {
-        if tokenizer.get_added_tokens_decoder().contains_key(last) {
+    let last_token = if let Some(last) = prompt_tokens.last().copied() {
+        if tokenizer.is_added_or_special_token(last) {
             None
         } else {
-            prompt_tokens = tokens;
-            Some(*last)
+            prompt_tokens.pop();
+            Some(last)
         }
     } else {
         None
@@ -89,7 +92,7 @@ where
 
     let mut unprocessed_token_count = prompt_tokens.len();
     let mut token_stream = TokenOutputStream::new(tokenizer.clone());
-    for token in prompt_tokens {
+    for token in &prompt_tokens {
         token_stream
             .next_token(*token)
             .map_err(LlamaModelError::TokenOutputStreamError)?;
@@ -122,11 +125,6 @@ where
     let mut parser_state = parser.create_parser_state();
     let mut strip_required_next = true;
 
-    let mut rng = if let Some(seed) = seed {
-        rand::rngs::StdRng::seed_from_u64(seed)
-    } else {
-        rand::rngs::StdRng::from_os_rng()
-    };
     let mut state_map = vec![];
     let mut logits_indexed = Vec::new();
     let mut token_cache = DetokenizationCache::new();
@@ -149,10 +147,6 @@ where
             )
         }
         .await?;
-        let resources = &mut SamplerResources {
-            previous_tokens: tokens,
-            rng: &mut rng,
-        };
 
         // fill the state map with None for each token
         token_cache.clear(logit_probs.len());
@@ -246,9 +240,9 @@ where
         if !valid_tokens {
             return Err(LlamaModelError::NoValidTokens);
         }
+        let sample_top_k = top_k.unwrap_or(logits.len()).max(1);
         let token_id = sampler
-            .sample_token(resources, &mut logits)
-            .map_err(|err| LlamaModelError::SamplerError(err.into()))?
+            .sample_token(&mut logits, tokens, sample_top_k)
             .ok_or(LlamaModelError::NoValidTokens)?;
 
         unprocessed_token_count = 1;
@@ -286,7 +280,7 @@ where
 }
 
 fn cmp_logits(a: &Logit, b: &Logit) -> std::cmp::Ordering {
-    f32::total_cmp(&b.logit, &a.logit)
+    f32::total_cmp(&b.logit, &a.logit).then_with(|| b.token_id.cmp(&a.token_id))
 }
 
 fn update_state<P: Parser>(
@@ -353,40 +347,6 @@ fn update_state<P: Parser>(
             }
         }
         kalosm_sample::ParseStatus::Finished { result, .. } => Ok(Some(result)),
-    }
-}
-
-struct SamplerResources<'a, 'b, R: rand::Rng> {
-    rng: &'a mut R,
-    previous_tokens: &'b [u32],
-}
-
-impl<R> Debug for SamplerResources<'_, '_, R>
-where
-    R: rand::Rng,
-{
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("SamplerResources")
-            .field("previous_tokens", &self.previous_tokens)
-            .finish()
-    }
-}
-
-impl<R> HasSamplerResources for SamplerResources<'_, '_, R>
-where
-    R: rand::Rng,
-{
-    fn with_rng_mut(
-        &mut self,
-        fun: &mut dyn FnMut(&mut dyn rand::RngCore),
-    ) -> Result<(), SamplerError> {
-        fun(self.rng);
-        Ok(())
-    }
-
-    fn with_last_tokens(&self, fun: &mut dyn FnMut(&[u32])) -> Result<(), SamplerError> {
-        fun(self.previous_tokens);
-        Ok(())
     }
 }
 

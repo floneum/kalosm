@@ -230,10 +230,6 @@ impl Operation for QEmbeddingOperation {
         )
     }
 
-    fn requires_single_kernel_batch(&self) -> bool {
-        true
-    }
-
     fn name(&self) -> String {
         format!(
             "q_embedding_{}_{}x{}",

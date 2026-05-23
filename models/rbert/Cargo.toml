@@ -20,7 +20,7 @@ serde = { version = "1", features = ["derive"] }
 
 kalosm-common = { workspace = true }
 kalosm-model-types.workspace = true
-kalosm-language-model.workspace = true
+kalosm-language-model = { workspace = true, features = ["cache"] }
 pollster = "0.4.0"
 
 [dev-dependencies]
@@ -28,6 +28,3 @@ anyhow.workspace = true
 kalosm = { workspace = true, features = ["language"] }
 postcard = { version = "1.0.8", features = ["use-std"] }
 tokio = { version = "1", features = ["full"] }
-
-[features]
-tokio = ["kalosm-common/tokio"]

@@ -15,6 +15,7 @@ mod top_k;
 mod types;
 
 pub use flash::{flash_attention, flash_decode_small, flash_outputs_per_workgroup};
+pub use helpers::AccumCast;
 pub use matmul::{
     batched_gemv_with_epilogues, batched_matmul_register_with_epilogues,
     batched_matmul_with_epilogues, try_batched_coop_matmul, DenseMatmulShape,
@@ -22,7 +23,9 @@ pub use matmul::{
 pub use mirostat::{mirostat2, Mirostat2};
 pub use qdequantize::qdequantize;
 pub use qgemv::{qgemv_with_epilogue, IntoQgemvEpilogues};
-pub use qgemv_paired_q4k::{qgemv_q4k_paired, qgemv_q4k_paired_dispatch, Q4KPairedGgml};
+pub use qgemv_paired_q4k::{
+    qgemv_q4k_paired, qgemv_q4k_paired_dispatch, Q4KPairedGgml, Q4KPairedShape,
+};
 pub use qmatmul::qmatmul_with_epilogue;
 pub use qmatmul_workgroup::{qgemv_workgroup_with_epilogue, qmatmul_workgroup_with_epilogues};
 pub use quantized_matrix::{quantized_matrix, quantized_matrix_for};

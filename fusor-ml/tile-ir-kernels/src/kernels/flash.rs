@@ -420,6 +420,12 @@ fn flash_decode_small_block<const BLOCK: usize, B>(
             program.store_local(&max_score_local, max_score);
             let max_score = program.load_local(&max_score_local);
 
+            // All lanes load `reduce[0]` (the max) above. Before any lane
+            // overwrites `reduce[lane]` for the denominator accumulator we
+            // need a barrier — without it, lane 0's store to slot 0 races
+            // with other lanes still loading slot 0, which surfaces as
+            // intermittent wrong values for individual heads.
+            program.workgroup_barrier();
             program.store_workgroup(reduce, lane.clone(), Tile::literal(TileLiteral::f32(0.0)));
             program.store_local(&kv_local, lane_value.clone());
             program.loop_forever(|program| {

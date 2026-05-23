@@ -33,29 +33,29 @@ pub const fn qgemv_cols_per_workgroup(format: GgmlQuantFormat) -> u32 {
 ///
 /// This includes the Q4K/Q6K GGML specializations whose column grouping
 /// depends on both K (`rows`) and N (`cols`).
-pub const fn qgemv_cols_per_workgroup_for_shape(
+pub fn qgemv_cols_per_workgroup_for_shape(
     format: GgmlQuantFormat,
     rows: u32,
     cols: u32,
 ) -> u32 {
-    if matches!(format, GgmlQuantFormat::Q4K) && rows <= 4096 && cols >= 4096 && cols < 8192 {
-        return 4;
+    if matches!(format, GgmlQuantFormat::Q4K) && rows <= 4096 && (4096..8192).contains(&cols) {
+        return q4k_mid_override(q4k_default_mid(rows, cols)).cols_per_workgroup();
     }
 
     if matches!(format, GgmlQuantFormat::Q4K) && rows <= 4096 && cols >= 8192 {
-        return 8;
+        return q4k_large_override(q4k_default_large(rows, cols)).cols_per_workgroup();
     }
 
     if matches!(format, GgmlQuantFormat::Q4K) && rows > 4096 && cols <= 4096 {
-        return 8;
+        return q4k_tall_override(q4k_default_tall(rows, cols)).cols_per_workgroup();
     }
 
     if matches!(format, GgmlQuantFormat::Q6K) && rows <= 4096 && cols >= 8192 {
-        return 8;
+        return q6k_large_override(q6k_default_large(rows, cols)).cols_per_workgroup();
     }
 
     if matches!(format, GgmlQuantFormat::Q6K) && rows > 4096 && cols <= 4096 {
-        return 4;
+        return q6k_tall_override(q6k_default_tall(rows, cols)).cols_per_workgroup();
     }
 
     qgemv_subgroups_per_workgroup_for_shape(format, rows, cols) * qgemv_cols_per_subgroup(format)
@@ -117,6 +117,27 @@ pub(crate) enum QgemvShapeQ4K {
     Ggml8x4_256,
 }
 
+impl QgemvShapeQ4K {
+    const fn cols_per_workgroup(self) -> u32 {
+        match self {
+            Self::Ggml1x4_32 => 4,
+            Self::Ggml1x8_32 => 8,
+            Self::Ggml2x2_64 => 4,
+            Self::Ggml2x3_64 => 6,
+            Self::Ggml2x4_64 => 8,
+            Self::Ggml2x8_64 => 16,
+            Self::Ggml4x1_128 => 4,
+            Self::Ggml4x2_128 => 8,
+            Self::Ggml4x3_128 => 12,
+            Self::Ggml4x4_128 => 16,
+            Self::Ggml4x8_128 => 32,
+            Self::Ggml8x1_256 => 8,
+            Self::Ggml8x2_256 => 16,
+            Self::Ggml8x4_256 => 32,
+        }
+    }
+}
+
 /// Tile shape for `qgemv_q6k_ggml::<SUBGROUPS, COLS_PER_SUBGROUP, BLOCK>`.
 /// The Q6K override lists use the standard tile set (no 2x3/4x3, no
 /// 1x_/4x1/8x1 entries).
@@ -130,6 +151,21 @@ pub(crate) enum QgemvShapeQ6K {
     Ggml4x8_128,
     Ggml8x2_256,
     Ggml8x4_256,
+}
+
+impl QgemvShapeQ6K {
+    const fn cols_per_workgroup(self) -> u32 {
+        match self {
+            Self::Ggml2x2_64 => 4,
+            Self::Ggml2x4_64 => 8,
+            Self::Ggml2x8_64 => 16,
+            Self::Ggml4x2_128 => 8,
+            Self::Ggml4x4_128 => 16,
+            Self::Ggml4x8_128 => 32,
+            Self::Ggml8x2_256 => 16,
+            Self::Ggml8x4_256 => 32,
+        }
+    }
 }
 
 // ----- Q4K mid (rows<=4096, 4096<=cols<8192) -----
@@ -166,10 +202,10 @@ pub(crate) fn q4k_mid_override(default: QgemvShapeQ4K) -> QgemvShapeQ4K {
 
 // ----- Q4K large (rows<=4096, cols>=8192) -----
 
-/// Default Q4K large-shape: cols<=16_384 → 4x4, else 2x4.
+/// Default Q4K large-shape: cols<=16_384 → 8x4, else 2x4.
 pub(crate) const fn q4k_default_large(_rows: u32, cols: u32) -> QgemvShapeQ4K {
     if cols <= 16_384 {
-        QgemvShapeQ4K::Ggml4x4_128
+        QgemvShapeQ4K::Ggml8x4_256
     } else {
         QgemvShapeQ4K::Ggml2x4_64
     }
@@ -312,10 +348,10 @@ mod tests {
     }
 
     #[test]
-    fn q4k_large_default_unchanged() {
+    fn q4k_large_default_selected() {
         // Uses the mid-size Q4K branch from kernels/qgemv.rs.
-        assert_eq!(q4k_default_large(4096, 8192), QgemvShapeQ4K::Ggml4x4_128);
-        assert_eq!(q4k_default_large(4096, 16_384), QgemvShapeQ4K::Ggml4x4_128);
+        assert_eq!(q4k_default_large(4096, 8192), QgemvShapeQ4K::Ggml8x4_256);
+        assert_eq!(q4k_default_large(4096, 16_384), QgemvShapeQ4K::Ggml8x4_256);
         assert_eq!(q4k_default_large(4096, 16_385), QgemvShapeQ4K::Ggml2x4_64);
         assert_eq!(q4k_default_large(4096, 32_768), QgemvShapeQ4K::Ggml2x4_64);
     }

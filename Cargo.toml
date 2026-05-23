@@ -17,6 +17,7 @@ bench = false
 members = [
     "models/rbert",
     "models/kalosm-llama",
+    "models/kalosm-tokenizer",
     "models/rwhisper",
     "models/rwuerstchen",
     "models/segment-anything-rs",
@@ -63,6 +64,7 @@ kalosm-learning = { path = "./interfaces/kalosm-learning", version = "0.4.0" }
 kalosm-learning-macro = { path = "./interfaces/kalosm-learning-macro", version = "0.4.0" }
 rbert = { path = "./models/rbert", version = "0.4.0" }
 kalosm-llama = { path = "./models/kalosm-llama", version = "0.4.0" }
+kalosm-tokenizer = { path = "./models/kalosm-tokenizer", version = "0.4.0" }
 rwhisper = { path = "./models/rwhisper", version = "0.4.0" }
 rwuerstchen = { path = "./models/rwuerstchen", version = "0.4.0" }
 segment-anything-rs = { path = "./models/segment-anything-rs", version = "0.4.0" }
@@ -74,7 +76,6 @@ fusor-tile-ir = { path = "./fusor-ml/tile-ir", version = "0.1.0" }
 fusor-tile-ir-kernels = { path = "./fusor-ml/tile-ir-kernels", version = "0.1.0" }
 fusor-tile-ir-runtime = { path = "./fusor-ml/tile-ir-runtime", version = "0.1.0" }
 fusor-types = { path = "./fusor-ml/types", version = "0.1.0" }
-llm-samplers = { git = "https://github.com/ealmloff/llm-samplers" }
 tokenizers = { version = "0.21.0", default-features = false }
 thiserror = "2.0.7"
 anyhow = "1.0.94"
@@ -86,37 +87,54 @@ criterion = { version = "0.8", features = ["async_futures"] }
 anyhow = { workspace = true, optional = true }
 axum = { version = "0.7.2", optional = true }
 comfy-table = { version = "7.1.0", optional = true }
-futures-util = "0.3.28"
+futures-util = { version = "0.3.28", optional = true }
 image = { workspace = true, optional = true }
 kalosm = { workspace = true, default-features = false }
 kalosm-language = { workspace = true, default-features = false, optional = true }
 kalosm-sample = { workspace = true, optional = true }
 kalosm-vision = { workspace = true, default-features = false, optional = true }
-serde = { version = "1.0.163", features = ["derive"] }
+pollster = "0.4"
+serde = { version = "1.0.163", features = ["derive"], optional = true }
 surrealdb = { version = "2.4.0", default-features = false, optional = true }
 tokio = { version = "1", features = ["macros", "net", "rt-multi-thread"], optional = true }
 tracing-subscriber = { version = "0.2", optional = true }
 
 [features]
 default = []
-full = ["bert", "llama", "vision", "sound", "sound-denoise", "surrealdb"]
+full = [
+    "bert",
+    "llama-vision",
+    "hf-tokenizer-json",
+    "structured",
+    "vision",
+    "sound",
+    "sound-denoise",
+    "surrealdb",
+]
 cuda = ["kalosm/cuda"]
 mkl = ["kalosm/mkl"]
 metal = ["kalosm/metal"]
 language = [
     "kalosm/language",
-    "dep:kalosm-language",
-    "dep:kalosm-sample",
-    "dep:comfy-table",
 ]
+structured = ["language", "kalosm/structured", "dep:kalosm-sample"]
 bert = ["language", "kalosm/bert"]
 llama = ["language", "kalosm/llama"]
-prompt_annealing = ["bert", "kalosm/prompt_annealing"]
+hf-tokenizer-json = ["kalosm/hf-tokenizer-json"]
+llama-vision = ["llama", "kalosm/llama-vision"]
+documents = ["language", "kalosm/documents", "dep:kalosm-language"]
+fs-documents = ["documents", "kalosm/fs-documents", "kalosm-language/fs-documents"]
+web-documents = ["documents", "kalosm/web-documents", "kalosm-language/web-documents"]
+chunking = ["documents", "kalosm/chunking", "dep:kalosm-language"]
+vector-db = ["documents", "kalosm/vector-db", "kalosm-language/vector-db"]
+rag = ["web-documents", "chunking", "vector-db", "kalosm/rag"]
+evaluation = ["language", "kalosm/evaluation", "comfy-table"]
+prompt_annealing = ["bert", "evaluation", "kalosm/prompt_annealing"]
 sound = ["kalosm/sound"]
 sound-denoise = ["sound", "kalosm/sound-denoise"]
 sound-source = ["sound", "kalosm/sound-source"]
 sound-voice-detection = ["sound", "kalosm/sound-voice-detection"]
-surrealdb = ["bert", "kalosm/surrealdb", "dep:surrealdb"]
+surrealdb = ["bert", "rag", "kalosm/surrealdb", "dep:surrealdb"]
 surrealdb-local = [
     "surrealdb",
     "kalosm/surrealdb-local",
@@ -127,15 +145,18 @@ vision = ["kalosm/vision", "dep:kalosm-vision"]
 openai = ["language", "kalosm/openai"]
 anthropic = ["language", "kalosm/anthropic"]
 remote = ["openai", "anthropic"]
-scrape = ["language", "kalosm/scrape"]
+scrape = ["language", "kalosm/scrape", "dep:kalosm-language"]
 anyhow = ["dep:anyhow"]
-axum = ["dep:axum"]
+axum = ["dep:axum", "dep:futures-util"]
 image = ["dep:image"]
+sample = ["structured"]
+serde = ["dep:serde"]
+futures-util = ["dep:futures-util"]
+comfy-table = ["dep:comfy-table"]
 tokio = [
     "dep:tokio",
     "kalosm/tokio",
     "kalosm-language?/tokio",
-    "kalosm-vision?/tokio",
 ]
 tracing-subscriber = ["dep:tracing-subscriber"]
 
@@ -147,7 +168,7 @@ required-features = ["llama", "axum", "tokio"]
 [[example]]
 name = "chat"
 path = "interfaces/kalosm/examples/chat.rs"
-required-features = ["llama", "tokio"]
+required-features = ["llama"]
 
 [[example]]
 name = "chat-boxed"
@@ -157,12 +178,12 @@ required-features = ["llama", "remote", "tokio"]
 [[example]]
 name = "chat-constrained"
 path = "interfaces/kalosm/examples/chat-constrained.rs"
-required-features = ["llama", "tokio"]
+required-features = ["llama", "structured", "tokio"]
 
 [[example]]
 name = "chat-constrained-boxed"
 path = "interfaces/kalosm/examples/chat-constrained-boxed.rs"
-required-features = ["llama", "openai", "tokio"]
+required-features = ["llama", "openai", "structured", "serde", "tokio"]
 
 [[example]]
 name = "chat-mistral-2"
@@ -177,12 +198,12 @@ required-features = ["llama", "tokio"]
 [[example]]
 name = "chat-with-character"
 path = "interfaces/kalosm/examples/chat-with-character.rs"
-required-features = ["llama", "tokio"]
+required-features = ["llama", "structured", "tokio"]
 
 [[example]]
 name = "chunking"
 path = "interfaces/kalosm/examples/chunking.rs"
-required-features = ["bert", "llama", "tokio", "tracing-subscriber"]
+required-features = ["bert", "llama", "chunking", "tokio", "tracing-subscriber"]
 
 [[example]]
 name = "claude-3-5-haiku"
@@ -197,17 +218,17 @@ required-features = ["llama", "tokio"]
 [[example]]
 name = "constrained"
 path = "interfaces/kalosm/examples/constrained.rs"
-required-features = ["llama", "tokio"]
+required-features = ["llama", "structured", "tokio"]
 
 [[example]]
 name = "constrained-regex"
 path = "interfaces/kalosm/examples/constrained-regex.rs"
-required-features = ["llama", "tokio"]
+required-features = ["llama", "structured", "tokio"]
 
 [[example]]
 name = "constrained-rust-types"
 path = "interfaces/kalosm/examples/constrained-rust-types.rs"
-required-features = ["llama", "anyhow", "tokio"]
+required-features = ["llama", "structured", "anyhow", "tokio"]
 
 [[example]]
 name = "crawl"
@@ -222,12 +243,12 @@ required-features = ["llama", "tokio"]
 [[example]]
 name = "evaluation"
 path = "interfaces/kalosm/examples/evaluation.rs"
-required-features = ["bert", "llama", "tokio", "tracing-subscriber"]
+required-features = ["bert", "llama", "chunking", "evaluation", "tokio", "tracing-subscriber"]
 
 [[example]]
 name = "generate-image"
 path = "interfaces/kalosm/examples/generate-image.rs"
-required-features = ["vision", "tokio"]
+required-features = ["vision", "futures-util", "tokio"]
 
 [[example]]
 name = "generate-text"
@@ -260,6 +281,7 @@ required-features = [
     "sound-voice-detection",
     "surrealdb-local",
     "anyhow",
+    "futures-util",
     "tokio",
 ]
 
@@ -279,6 +301,9 @@ path = "interfaces/kalosm/examples/mutate.rs"
 required-features = [
     "bert",
     "llama",
+    "chunking",
+    "evaluation",
+    "sample",
     "anyhow",
     "tokio",
     "tracing-subscriber",
@@ -302,7 +327,7 @@ required-features = ["llama", "tokio"]
 [[example]]
 name = "prompt-annealing"
 path = "interfaces/kalosm/examples/prompt-annealing.rs"
-required-features = ["llama", "prompt_annealing", "tokio"]
+required-features = ["llama", "structured", "prompt_annealing", "tokio"]
 
 [[example]]
 name = "qwen"
@@ -332,22 +357,22 @@ required-features = ["llama", "tokio"]
 [[example]]
 name = "semantic-chunk"
 path = "interfaces/kalosm/examples/semantic-chunk.rs"
-required-features = ["bert", "anyhow", "tokio"]
+required-features = ["bert", "web-documents", "chunking", "anyhow", "tokio"]
 
 [[example]]
 name = "semantic-search"
 path = "interfaces/kalosm/examples/semantic-search.rs"
-required-features = ["surrealdb-local", "tokio", "tracing-subscriber"]
+required-features = ["surrealdb-local", "comfy-table", "tokio", "tracing-subscriber"]
 
 [[example]]
 name = "task"
 path = "interfaces/kalosm/examples/task.rs"
-required-features = ["llama", "tokio", "tracing-subscriber"]
+required-features = ["llama", "structured", "tokio", "tracing-subscriber"]
 
 [[example]]
 name = "task-r1"
 path = "interfaces/kalosm/examples/task-r1.rs"
-required-features = ["llama", "tokio"]
+required-features = ["llama", "structured", "tokio"]
 
 [[example]]
 name = "transcribe"
@@ -364,7 +389,7 @@ required-features = [
 [[example]]
 name = "vision"
 path = "interfaces/kalosm/examples/vision.rs"
-required-features = ["llama", "tokio", "tracing-subscriber"]
+required-features = ["llama-vision", "tokio", "tracing-subscriber"]
 
 [profile.dist]
 inherits = "release"

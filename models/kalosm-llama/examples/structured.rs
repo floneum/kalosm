@@ -1,5 +1,6 @@
 #![allow(unused)]
 use kalosm::language::*;
+use kalosm_llama::Llama;
 use std::{io::Write, sync::Arc};
 
 #[tokio::main]

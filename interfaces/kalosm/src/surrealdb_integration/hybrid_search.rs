@@ -2,7 +2,7 @@ use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use surrealdb::{Connection, RecordIdKey};
 
-use kalosm_language::prelude::*;
+use crate::language::*;
 
 use crate::language::{
     DocumentTable, DocumentTableBuilder, DocumentTableCreationError, DocumentTableSearchBuilder,

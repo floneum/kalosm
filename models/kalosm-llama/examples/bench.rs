@@ -38,11 +38,7 @@ async fn main() {
             .unwrap();
         let prompt = "Hello world".repeat(600);
 
-        let tokens = model
-            .tokenizer()
-            .encode(prompt.clone(), false)
-            .unwrap()
-            .len();
+        let tokens = model.tokenizer().encode(&prompt, false).unwrap().len();
         for _ in 0..100 {
             let start_time = std::time::Instant::now();
             let _ = model.complete(&prompt).next().await.unwrap();

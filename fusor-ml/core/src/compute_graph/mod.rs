@@ -63,7 +63,7 @@ impl ComputeGraph {
     }
 
     pub(crate) fn create_q_mat_mul(&self, op: QMatMulOperation) -> NodeIndex {
-        self.create_node(ComputeGraphNodeVariant::QMatMul(op))
+        self.create_node(ComputeGraphNodeVariant::QMatMul(Box::new(op)))
     }
 
     pub(crate) fn create_q_embedding(&self, op: QEmbeddingOperation) -> NodeIndex {
@@ -252,7 +252,7 @@ pub(crate) enum ComputeGraphNodeVariant {
     Dequantize(DequantizeOperation),
     QEmbedding(QEmbeddingOperation),
     MatMul(MatMulOperation),
-    QMatMul(QMatMulOperation),
+    QMatMul(Box<QMatMulOperation>),
     Tensor(TensorData),
     Reduce(ReduceOperation),
     FlashAttention(FlashAttentionOperation),

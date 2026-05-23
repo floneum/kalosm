@@ -69,6 +69,9 @@ pub enum LlamaSourceError {
     /// An error occurred while loading the tokenizer.
     #[error("Failed to load the tokenizer: {0}")]
     Tokenizer(Box<dyn std::error::Error + Send + Sync>),
+    /// Loading tokenizer.json files requires an explicit feature.
+    #[error("External tokenizer.json files require the `hf-tokenizer-json` feature")]
+    TokenizerJsonFeatureDisabled,
     /// An error occurred while loading the config.
     #[error("Failed to load the config: {0}")]
     Config(#[from] serde_json::Error),
@@ -99,6 +102,9 @@ pub enum LlamaSourceError {
     /// The task loading the model panicked.
     #[error("The task loading the model panicked")]
     ModelLoadingPanic,
+    /// The selected model source needs a vision encoder, but the crate was built without the vision feature.
+    #[error("Vision models require the `vision` feature")]
+    VisionFeatureDisabled,
 }
 
 impl LlamaSource {
@@ -140,6 +146,18 @@ impl LlamaSource {
     pub fn with_tokenizer(mut self, tokenizer: FileSource) -> Self {
         self.tokenizer = Some(tokenizer);
         self
+    }
+
+    fn with_hf_tokenizer(self, tokenizer: FileSource) -> Self {
+        #[cfg(feature = "hf-tokenizer-json")]
+        {
+            self.with_tokenizer(tokenizer)
+        }
+        #[cfg(not(feature = "hf-tokenizer-json"))]
+        {
+            let _ = tokenizer;
+            self
+        }
     }
 
     /// Set the config to use for the model. Kalosm will try to load the config from the gguf file if no config is provided.
@@ -205,7 +223,7 @@ impl LlamaSource {
             "main".to_string(),
             "mistral-7b-v0.1.Q4_K_M.gguf".to_string(),
         ))
-        .with_tokenizer(mistral_tokenizer())
+        .with_hf_tokenizer(mistral_tokenizer())
         .with_group_query_attention(8)
     }
 
@@ -216,7 +234,7 @@ impl LlamaSource {
             "main".to_string(),
             "mistral-7b-instruct-v0.1.Q4_K_M.gguf".to_string(),
         ))
-        .with_tokenizer(mistral_tokenizer())
+        .with_hf_tokenizer(mistral_tokenizer())
         .with_group_query_attention(8)
     }
 
@@ -227,7 +245,7 @@ impl LlamaSource {
             "main".to_string(),
             "mistral-7b-instruct-v0.2.Q4_K_M.gguf".to_string(),
         ))
-        .with_tokenizer(mistral_tokenizer())
+        .with_hf_tokenizer(mistral_tokenizer())
         .with_group_query_attention(8)
     }
 
@@ -240,7 +258,7 @@ impl LlamaSource {
                 file: "Codestral-22B-v0.1-Q4_K_M.gguf".to_string(),
             },
         )
-        .with_tokenizer(
+        .with_hf_tokenizer(
             FileSource::HuggingFace {
                 model_id: "mistralai/Codestral-22B-v0.1".to_string(),
                 revision: "main".to_string(),
@@ -257,7 +275,7 @@ impl LlamaSource {
             "main".to_string(),
             "neuralhermes-2.5-mistral-7b.Q4_0.gguf".to_string(),
         ))
-        .with_tokenizer(mistral_tokenizer())
+        .with_hf_tokenizer(mistral_tokenizer())
         .with_group_query_attention(8)
     }
 
@@ -268,7 +286,7 @@ impl LlamaSource {
             "main".to_string(),
             "neural-chat-7b-v3-3.Q4_0.gguf".to_string(),
         ))
-        .with_tokenizer(FileSource::huggingface(
+        .with_hf_tokenizer(FileSource::huggingface(
             "Intel/neural-chat-7b-v3-3".to_string(),
             "main".to_string(),
             "tokenizer.json".to_string(),
@@ -283,7 +301,7 @@ impl LlamaSource {
             "main".to_string(),
             "zephyr-7b-alpha.Q4_K_M.gguf".to_string(),
         ))
-        .with_tokenizer(mistral_tokenizer())
+        .with_hf_tokenizer(mistral_tokenizer())
         .with_group_query_attention(8)
     }
 
@@ -294,7 +312,7 @@ impl LlamaSource {
             "main".to_string(),
             "zephyr-7b-beta.Q4_K_M.gguf".to_string(),
         ))
-        .with_tokenizer(mistral_tokenizer())
+        .with_hf_tokenizer(mistral_tokenizer())
         .with_group_query_attention(8)
     }
 
@@ -305,7 +323,7 @@ impl LlamaSource {
             "main".to_string(),
             "openchat-3.5-0106.Q4_K_M.gguf".to_string(),
         ))
-        .with_tokenizer(FileSource::huggingface(
+        .with_hf_tokenizer(FileSource::huggingface(
             "openchat/openchat-3.5-0106".to_string(),
             "main".to_string(),
             "tokenizer.json".to_string(),
@@ -320,7 +338,7 @@ impl LlamaSource {
             "main".to_string(),
             "starling-lm-7b-alpha.Q4_K_M.gguf".to_string(),
         ))
-        .with_tokenizer(FileSource::huggingface(
+        .with_hf_tokenizer(FileSource::huggingface(
             "berkeley-nest/Starling-LM-7B-alpha".to_string(),
             "main".to_string(),
             "tokenizer.json".to_string(),
@@ -335,7 +353,7 @@ impl LlamaSource {
             "main".to_string(),
             "Starling-LM-7B-beta-Q4_K_M.gguf".to_string(),
         ))
-        .with_tokenizer(FileSource::huggingface(
+        .with_hf_tokenizer(FileSource::huggingface(
             "Nexusflow/Starling-LM-7B-beta".to_string(),
             "main".to_string(),
             "tokenizer.json".to_string(),
@@ -350,7 +368,7 @@ impl LlamaSource {
             "main".to_string(),
             "WizardLM-2-7B-Q4_K_M.gguf".to_string(),
         ))
-        .with_tokenizer(mistral_tokenizer())
+        .with_hf_tokenizer(mistral_tokenizer())
         .with_group_query_attention(8)
     }
 
@@ -361,7 +379,7 @@ impl LlamaSource {
             "main".to_string(),
             "tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf".to_string(),
         ))
-        .with_tokenizer(FileSource::huggingface(
+        .with_hf_tokenizer(FileSource::huggingface(
             "TinyLlama/TinyLlama-1.1B-Chat-v1.0".to_string(),
             "main".to_string(),
             "tokenizer.json".to_string(),
@@ -376,7 +394,7 @@ impl LlamaSource {
             "main".to_string(),
             "tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf".to_string(),
         ))
-        .with_tokenizer(FileSource::huggingface(
+        .with_hf_tokenizer(FileSource::huggingface(
             "TinyLlama/TinyLlama-1.1B-Chat-v1.0".to_string(),
             "main".to_string(),
             "tokenizer.json".to_string(),
@@ -391,7 +409,7 @@ impl LlamaSource {
             "5eef2ce24766d31909c0b269fe90c817a8f263fb".to_string(),
             "Phi-3-mini-4k-instruct-q4.gguf".to_string(),
         ))
-        .with_tokenizer(FileSource::huggingface(
+        .with_hf_tokenizer(FileSource::huggingface(
             "microsoft/Phi-3-mini-4k-instruct".to_string(),
             "main".to_string(),
             "tokenizer.json".to_string(),
@@ -407,7 +425,7 @@ impl LlamaSource {
             "main".to_string(),
             "Phi-3.1-mini-4k-instruct-Q4_K_M.gguf".to_string(),
         ))
-        .with_tokenizer(FileSource::huggingface(
+        .with_hf_tokenizer(FileSource::huggingface(
             "microsoft/Phi-3-mini-4k-instruct".to_string(),
             "main".to_string(),
             "tokenizer.json".to_string(),
@@ -423,7 +441,7 @@ impl LlamaSource {
             "main".to_string(),
             "Phi-3.5-mini-instruct-Q4_K_M.gguf".to_string(),
         ))
-        .with_tokenizer(FileSource::huggingface(
+        .with_hf_tokenizer(FileSource::huggingface(
             "microsoft/Phi-3.5-mini-instruct".to_string(),
             "main".to_string(),
             "tokenizer.json".to_string(),
@@ -439,7 +457,7 @@ impl LlamaSource {
             "main".to_string(),
             "phi-4-Q4_0.gguf".to_string(),
         ))
-        .with_tokenizer(FileSource::huggingface(
+        .with_hf_tokenizer(FileSource::huggingface(
             "microsoft/phi-4".to_string(),
             "main".to_string(),
             "tokenizer.json".to_string(),
@@ -454,7 +472,7 @@ impl LlamaSource {
             "main".to_string(),
             "llama-2-7b.ggmlv3.q4_0.bin".to_string(),
         ))
-        .with_tokenizer(llama_tokenizer())
+        .with_hf_tokenizer(llama_tokenizer())
         .with_group_query_attention(1)
     }
 
@@ -465,7 +483,7 @@ impl LlamaSource {
             "main".to_string(),
             "Meta-Llama-3-8B-Q4_K_M.gguf".to_string(),
         ))
-        .with_tokenizer(llama_v3_tokenizer())
+        .with_hf_tokenizer(llama_v3_tokenizer())
         .with_group_query_attention(1)
     }
 
@@ -476,7 +494,7 @@ impl LlamaSource {
             "main".to_string(),
             "Meta-Llama-3-8B-Instruct-Q5_K_M.gguf".to_string(),
         ))
-        .with_tokenizer(llama_v3_tokenizer())
+        .with_hf_tokenizer(llama_v3_tokenizer())
         .with_group_query_attention(1)
     }
 
@@ -487,7 +505,7 @@ impl LlamaSource {
             "main".to_string(),
             "Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf".to_string(),
         ))
-        .with_tokenizer(llama_v3_tokenizer())
+        .with_hf_tokenizer(llama_v3_tokenizer())
         // https://huggingface.co/unsloth/Meta-Llama-3.1-8B-Instruct/blob/main/config.json
         .with_config(FileSource::huggingface(
             "unsloth/Meta-Llama-3.1-8B-Instruct".to_string(),
@@ -504,7 +522,7 @@ impl LlamaSource {
             "main".to_string(),
             "Meta-Llama-3-8B-Instruct-Q8_0.gguf".to_string(),
         ))
-        .with_tokenizer(llama_v3_tokenizer())
+        .with_hf_tokenizer(llama_v3_tokenizer())
         .with_group_query_attention(1)
     }
 
@@ -515,7 +533,7 @@ impl LlamaSource {
             "main".to_string(),
             "Llama-3-Instruct-8B-SPPO-Iter3-Q4_K_M.gguf".to_string(),
         ))
-        .with_tokenizer(llama_v3_tokenizer())
+        .with_hf_tokenizer(llama_v3_tokenizer())
         .with_group_query_attention(1)
     }
 
@@ -526,7 +544,7 @@ impl LlamaSource {
             "main".to_string(),
             "Llama-3.2-1B-Instruct-Q4_K_M.gguf".to_string(),
         ))
-        .with_tokenizer(llama_v3_tokenizer())
+        .with_hf_tokenizer(llama_v3_tokenizer())
         .with_config(FileSource::huggingface(
             "NousResearch/Llama-3.2-1B".to_string(),
             "main".to_string(),
@@ -542,7 +560,7 @@ impl LlamaSource {
             "main".to_string(),
             "Llama-3.2-3B-Instruct-Q4_K_M.gguf".to_string(),
         ))
-        .with_tokenizer(llama_v3_tokenizer())
+        .with_hf_tokenizer(llama_v3_tokenizer())
         .with_config(FileSource::huggingface(
             "NousResearch/Hermes-3-Llama-3.2-3B".to_string(),
             "main".to_string(),
@@ -558,7 +576,7 @@ impl LlamaSource {
             "main".to_string(),
             "llama-2-13b.ggmlv3.q4_0.bin".to_string(),
         ))
-        .with_tokenizer(llama_tokenizer())
+        .with_hf_tokenizer(llama_tokenizer())
         .with_group_query_attention(1)
     }
 
@@ -569,7 +587,7 @@ impl LlamaSource {
             "main".to_string(),
             "llama-2-70b.ggmlv3.q4_0.bin".to_string(),
         ))
-        .with_tokenizer(llama_tokenizer())
+        .with_hf_tokenizer(llama_tokenizer())
         .with_group_query_attention(8)
     }
 
@@ -580,7 +598,7 @@ impl LlamaSource {
             "main".to_string(),
             "llama-2-7b-chat.ggmlv3.q4_0.bin".to_string(),
         ))
-        .with_tokenizer(llama_tokenizer())
+        .with_hf_tokenizer(llama_tokenizer())
     }
 
     /// A preset for Llama13bChat
@@ -590,7 +608,7 @@ impl LlamaSource {
             "main".to_string(),
             "llama-2-13b-chat.ggmlv3.q4_0.bin".to_string(),
         ))
-        .with_tokenizer(llama_tokenizer())
+        .with_hf_tokenizer(llama_tokenizer())
         .with_group_query_attention(1)
     }
 
@@ -601,7 +619,7 @@ impl LlamaSource {
             "main".to_string(),
             "llama-2-70b-chat.ggmlv3.q4_0.bin".to_string(),
         ))
-        .with_tokenizer(llama_tokenizer())
+        .with_hf_tokenizer(llama_tokenizer())
         .with_group_query_attention(8)
     }
 
@@ -612,7 +630,7 @@ impl LlamaSource {
             "main".to_string(),
             "codellama-7b.Q8_0.gguf".to_string(),
         ))
-        .with_tokenizer(llama_tokenizer())
+        .with_hf_tokenizer(llama_tokenizer())
         .with_group_query_attention(1)
     }
 
@@ -623,7 +641,7 @@ impl LlamaSource {
             "main".to_string(),
             "codellama-13b.Q8_0.gguf".to_string(),
         ))
-        .with_tokenizer(llama_tokenizer())
+        .with_hf_tokenizer(llama_tokenizer())
         .with_group_query_attention(1)
     }
 
@@ -634,7 +652,7 @@ impl LlamaSource {
             "main".to_string(),
             "codellama-34b.Q8_0.gguf".to_string(),
         ))
-        .with_tokenizer(llama_tokenizer())
+        .with_hf_tokenizer(llama_tokenizer())
         .with_group_query_attention(1)
     }
 
@@ -645,7 +663,7 @@ impl LlamaSource {
             "main".to_string(),
             "solar-10.7b-v1.0.Q4_K_M.gguf".to_string(),
         ))
-        .with_tokenizer(FileSource::huggingface(
+        .with_hf_tokenizer(FileSource::huggingface(
             "upstage/SOLAR-10.7B-v1.0".to_string(),
             "main".to_string(),
             "tokenizer.json".to_string(),
@@ -659,7 +677,7 @@ impl LlamaSource {
             "main".to_string(),
             "solar-10.7b-instruct-v1.0.Q4_K_M.gguf".to_string(),
         ))
-        .with_tokenizer(FileSource::huggingface(
+        .with_hf_tokenizer(FileSource::huggingface(
             "upstage/SOLAR-10.7B-Instruct-v1.0".to_string(),
             "main".to_string(),
             "tokenizer.json".to_string(),
@@ -673,7 +691,7 @@ impl LlamaSource {
             "main".to_string(),
             "qwen2.5-0.5b-instruct-q4_k_m.gguf".to_string(),
         ))
-        .with_tokenizer(qwen_tokenizer())
+        .with_hf_tokenizer(qwen_tokenizer())
         .with_group_query_attention(7)
     }
 
@@ -684,7 +702,7 @@ impl LlamaSource {
             "main".to_string(),
             "qwen2.5-1.5b-instruct-q4_k_m.gguf".to_string(),
         ))
-        .with_tokenizer(qwen_tokenizer())
+        .with_hf_tokenizer(qwen_tokenizer())
         .with_group_query_attention(7)
     }
 
@@ -695,7 +713,7 @@ impl LlamaSource {
             "main".to_string(),
             "qwen2.5-3b-instruct-q4_k_m.gguf".to_string(),
         ))
-        .with_tokenizer(qwen_tokenizer())
+        .with_hf_tokenizer(qwen_tokenizer())
         .with_group_query_attention(7)
     }
 
@@ -706,7 +724,7 @@ impl LlamaSource {
             "main".to_string(),
             "Qwen2.5-7B-Instruct-Q4_K_M.gguf".to_string(),
         ))
-        .with_tokenizer(qwen_tokenizer())
+        .with_hf_tokenizer(qwen_tokenizer())
         .with_group_query_attention(7)
     }
 
@@ -720,7 +738,7 @@ impl LlamaSource {
             "main".to_string(),
             "Qwen3-0.6B-Q4_K_M.gguf".to_string(),
         ))
-        .with_tokenizer(qwen3_tokenizer())
+        .with_hf_tokenizer(qwen3_tokenizer())
         .with_group_query_attention(2)
     }
 
@@ -734,7 +752,7 @@ impl LlamaSource {
             "main".to_string(),
             "Qwen3-1.7B-Q4_K_M.gguf".to_string(),
         ))
-        .with_tokenizer(qwen3_tokenizer())
+        .with_hf_tokenizer(qwen3_tokenizer())
         .with_group_query_attention(2)
     }
 
@@ -748,7 +766,7 @@ impl LlamaSource {
             "main".to_string(),
             "Qwen3-4B-Q4_K_M.gguf".to_string(),
         ))
-        .with_tokenizer(qwen3_tokenizer())
+        .with_hf_tokenizer(qwen3_tokenizer())
         .with_group_query_attention(4)
     }
 
@@ -762,7 +780,7 @@ impl LlamaSource {
             "main".to_string(),
             "Qwen3-8B-Q4_K_M.gguf".to_string(),
         ))
-        .with_tokenizer(qwen3_tokenizer())
+        .with_hf_tokenizer(qwen3_tokenizer())
         .with_group_query_attention(4)
     }
 
@@ -776,7 +794,7 @@ impl LlamaSource {
             "main".to_string(),
             "Qwen3-14B-Q4_K_M.gguf".to_string(),
         ))
-        .with_tokenizer(qwen3_tokenizer())
+        .with_hf_tokenizer(qwen3_tokenizer())
         .with_group_query_attention(4)
     }
 
@@ -790,7 +808,7 @@ impl LlamaSource {
             "main".to_string(),
             "Qwen3-32B-Q4_K_M.gguf".to_string(),
         ))
-        .with_tokenizer(qwen3_tokenizer())
+        .with_hf_tokenizer(qwen3_tokenizer())
         .with_group_query_attention(8)
     }
 
@@ -839,7 +857,7 @@ impl LlamaSource {
             "main".to_string(),
             "gemma-3-270m-it-Q4_K_M.gguf".to_string(),
         ))
-        .with_tokenizer(FileSource::huggingface(
+        .with_hf_tokenizer(FileSource::huggingface(
             "google/gemma-3-270m-it".to_string(),
             "main".to_string(),
             "tokenizer.json".to_string(),
@@ -856,7 +874,7 @@ impl LlamaSource {
             "main".to_string(),
             "gemma-3-1b-it-q4_0.gguf".to_string(),
         ))
-        .with_tokenizer(FileSource::huggingface(
+        .with_hf_tokenizer(FileSource::huggingface(
             "google/gemma-3-1b-it".to_string(),
             "main".to_string(),
             "tokenizer.json".to_string(),
@@ -873,7 +891,7 @@ impl LlamaSource {
             "main".to_string(),
             "gemma-3-4b-it-q4_0.gguf".to_string(),
         ))
-        .with_tokenizer(FileSource::huggingface(
+        .with_hf_tokenizer(FileSource::huggingface(
             "google/gemma-3-4b-it".to_string(),
             "main".to_string(),
             "tokenizer.json".to_string(),
@@ -890,7 +908,7 @@ impl LlamaSource {
             "main".to_string(),
             "gemma-3-12b-it-q4_0.gguf".to_string(),
         ))
-        .with_tokenizer(FileSource::huggingface(
+        .with_hf_tokenizer(FileSource::huggingface(
             "google/gemma-3-12b-it".to_string(),
             "main".to_string(),
             "tokenizer.json".to_string(),
@@ -907,7 +925,7 @@ impl LlamaSource {
             "main".to_string(),
             "gemma-3-27b-it-q4_0.gguf".to_string(),
         ))
-        .with_tokenizer(FileSource::huggingface(
+        .with_hf_tokenizer(FileSource::huggingface(
             "google/gemma-3-27b-it".to_string(),
             "main".to_string(),
             "tokenizer.json".to_string(),
@@ -927,7 +945,7 @@ impl LlamaSource {
             revision: "main".into(),
             file: "mmproj-Qwen2.5-VL-3B-Instruct-f16.gguf".into(),
         })
-        .with_tokenizer(kalosm_model_types::FileSource::HuggingFace {
+        .with_hf_tokenizer(kalosm_model_types::FileSource::HuggingFace {
             model_id: "Qwen/Qwen2.5-VL-3B-Instruct".into(),
             revision: "main".into(),
             file: "tokenizer.json".into(),
@@ -946,7 +964,7 @@ impl LlamaSource {
             revision: "main".into(),
             file: "mmproj-Qwen2.5-VL-3B-Instruct-f16.gguf".into(),
         })
-        .with_tokenizer(kalosm_model_types::FileSource::HuggingFace {
+        .with_hf_tokenizer(kalosm_model_types::FileSource::HuggingFace {
             model_id: "Qwen/Qwen2.5-VL-3B-Instruct".into(),
             revision: "main".into(),
             file: "tokenizer.json".into(),
@@ -965,7 +983,7 @@ impl LlamaSource {
             revision: "main".into(),
             file: "mmproj-Qwen2.5-VL-3B-Instruct-f16.gguf".into(),
         })
-        .with_tokenizer(kalosm_model_types::FileSource::HuggingFace {
+        .with_hf_tokenizer(kalosm_model_types::FileSource::HuggingFace {
             model_id: "Qwen/Qwen2.5-VL-3B-Instruct".into(),
             revision: "main".into(),
             file: "tokenizer.json".into(),
@@ -984,7 +1002,7 @@ impl LlamaSource {
             revision: "main".into(),
             file: "mmproj-Qwen2.5-VL-7B-Instruct-f16.gguf".into(),
         })
-        .with_tokenizer(kalosm_model_types::FileSource::HuggingFace {
+        .with_hf_tokenizer(kalosm_model_types::FileSource::HuggingFace {
             model_id: "Qwen/Qwen2.5-VL-7B-Instruct".into(),
             revision: "main".into(),
             file: "tokenizer.json".into(),
@@ -1003,7 +1021,7 @@ impl LlamaSource {
             revision: "main".into(),
             file: "mmproj-Qwen2.5-VL-7B-Instruct-f16.gguf".into(),
         })
-        .with_tokenizer(kalosm_model_types::FileSource::HuggingFace {
+        .with_hf_tokenizer(kalosm_model_types::FileSource::HuggingFace {
             model_id: "Qwen/Qwen2.5-VL-7B-Instruct".into(),
             revision: "main".into(),
             file: "tokenizer.json".into(),
@@ -1022,7 +1040,7 @@ impl LlamaSource {
             revision: "main".into(),
             file: "mmproj-Qwen2.5-VL-7B-Instruct-f16.gguf".into(),
         })
-        .with_tokenizer(kalosm_model_types::FileSource::HuggingFace {
+        .with_hf_tokenizer(kalosm_model_types::FileSource::HuggingFace {
             model_id: "Qwen/Qwen2.5-VL-7B-Instruct".into(),
             revision: "main".into(),
             file: "tokenizer.json".into(),
@@ -1041,7 +1059,7 @@ impl LlamaSource {
             revision: "main".into(),
             file: "mmproj-Qwen2.5-VL-32B-Instruct-f16.gguf".into(),
         })
-        .with_tokenizer(kalosm_model_types::FileSource::HuggingFace {
+        .with_hf_tokenizer(kalosm_model_types::FileSource::HuggingFace {
             model_id: "Qwen/Qwen2.5-VL-32B-Instruct".into(),
             revision: "main".into(),
             file: "tokenizer.json".into(),
@@ -1060,7 +1078,7 @@ impl LlamaSource {
             revision: "main".into(),
             file: "mmproj-Qwen2.5-VL-32B-Instruct-f16.gguf".into(),
         })
-        .with_tokenizer(kalosm_model_types::FileSource::HuggingFace {
+        .with_hf_tokenizer(kalosm_model_types::FileSource::HuggingFace {
             model_id: "Qwen/Qwen2.5-VL-32B-Instruct".into(),
             revision: "main".into(),
             file: "tokenizer.json".into(),
@@ -1086,7 +1104,7 @@ impl LlamaSource {
             revision: "main".into(),
             file: "mmproj-Qwen2.5-VL-32B-Instruct-f16.gguf".into(),
         })
-        .with_tokenizer(kalosm_model_types::FileSource::HuggingFace {
+        .with_hf_tokenizer(kalosm_model_types::FileSource::HuggingFace {
             model_id: "Qwen/Qwen2.5-VL-32B-Instruct".into(),
             revision: "main".into(),
             file: "tokenizer.json".into(),

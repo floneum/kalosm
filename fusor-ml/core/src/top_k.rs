@@ -1,8 +1,8 @@
 pub use crate::sampling::{GpuMirostat2Sampler, GpuMirostat2SamplerParams};
 
 pub(crate) use crate::sampling::{
-    MIN_TOP_K_CANDIDATES_PER_CHUNK, MergeSortedChunkTopKParams, TOP_K_CHUNK,
-    chunk_top_k_pair_data_with_encoder, merge_sorted_chunk_top_k_pair_data_with_encoder,
+    MergeSortedChunkTopKParams, TOP_K_CHUNK, chunk_top_k_pair_data_with_encoder,
+    merge_sorted_chunk_top_k_pair_data_with_encoder, min_top_k_candidates_per_chunk,
     mirostat2_sample_token_to_host, qmat_mirostat2_sample_token_to_host,
 };
 

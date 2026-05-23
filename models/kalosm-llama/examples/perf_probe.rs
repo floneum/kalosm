@@ -26,8 +26,14 @@ async fn main() {
         .ok()
         .and_then(|value| value.parse().ok())
         .unwrap_or(64);
-    let sampler = GenerationParameters::new().with_max_length(measured_tokens);
-    let mut response = chat(&"write a short story".to_string()).with_sampler(sampler);
+    let sampler = if std::env::var_os("KALOSM_PERF_PROBE_UNBOUNDED").is_some() {
+        GenerationParameters::new()
+    } else {
+        GenerationParameters::new().with_max_length(measured_tokens)
+    };
+    let mut response = chat(&"write a short story".to_string())
+        .with_sampler(sampler)
+        .take(measured_tokens as usize);
     let mut first: Option<Instant> = None;
     let mut last: Option<Instant> = None;
     let mut tokens: usize = 0;

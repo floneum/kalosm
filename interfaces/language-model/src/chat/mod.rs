@@ -2,7 +2,6 @@ use crate::GenerationParameters;
 use crate::ModelConstraints;
 use futures_util::Future;
 use kalosm_model_types::{WasmNotSend, WasmNotSendSync};
-use serde::{Deserialize, Serialize};
 use std::fmt::Arguments;
 use std::fmt::Display;
 
@@ -225,21 +224,23 @@ pub fn prompt_input(prompt: impl Display) -> Result<String, std::io::Error> {
 }
 
 /// The type of a chat message
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum MessageType {
     /// A system prompt message. System prompts should always be the first message in a chat session.
-    #[serde(rename = "developer")]
+    #[cfg_attr(feature = "serde", serde(rename = "developer"))]
     SystemPrompt,
     /// A user message.
-    #[serde(rename = "user")]
+    #[cfg_attr(feature = "serde", serde(rename = "user"))]
     UserMessage,
     /// A model answer.
-    #[serde(rename = "assistant")]
+    #[cfg_attr(feature = "serde", serde(rename = "assistant"))]
     ModelAnswer,
 }
 
 /// A single item in the chat history.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct ChatMessage {
     role: MessageType,
     content: MessageContent,

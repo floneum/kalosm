@@ -148,9 +148,7 @@ pub struct KernelDeviceCaps {
     pub max_compute_invocations_per_workgroup: u32,
     pub max_compute_workgroup_storage_size: u32,
     pub max_compute_workgroup_size_x: u32,
-    pub max_compute_workgroups_per_dimension: u32,
     pub backend: wgpu::Backend,
-    pub subgroup_kernels_supported: bool,
 }
 
 impl KernelDeviceCaps {
@@ -164,9 +162,7 @@ impl KernelDeviceCaps {
             max_compute_invocations_per_workgroup: limits.max_compute_invocations_per_workgroup,
             max_compute_workgroup_storage_size: limits.max_compute_workgroup_storage_size,
             max_compute_workgroup_size_x: limits.max_compute_workgroup_size_x,
-            max_compute_workgroups_per_dimension: limits.max_compute_workgroups_per_dimension,
             backend: device.backend(),
-            subgroup_kernels_supported: device.subgroup_kernels_supported(),
         }
     }
 
@@ -183,9 +179,7 @@ impl KernelDeviceCaps {
             max_compute_invocations_per_workgroup: 1024,
             max_compute_workgroup_storage_size: 64 * 1024,
             max_compute_workgroup_size_x: 1024,
-            max_compute_workgroups_per_dimension: 65_535,
             backend: wgpu::Backend::Vulkan,
-            subgroup_kernels_supported: true,
         }
     }
 }

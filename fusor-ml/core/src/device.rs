@@ -95,26 +95,12 @@ fn adapter_preference_rank(adapter: &wgpu::Adapter) -> u8 {
     }
 }
 
-fn adapter_name_matches_host_emulation(name: &str) -> bool {
-    let name = name.to_ascii_lowercase();
-    name.contains("llvmpipe")
-        || name.contains("lavapipe")
-        || name.contains("software rasterizer")
-        || name.contains("warp")
-}
-
-fn adapter_requires_host_fallbacks(info: &wgpu::AdapterInfo) -> bool {
-    matches!(info.device_type, wgpu::DeviceType::Cpu)
-        || adapter_name_matches_host_emulation(&info.name)
-}
-
 struct DeviceInner {
     device: Arc<wgpu::Device>,
     adapter: wgpu::Adapter,
     queue: Arc<wgpu::Queue>,
     kernel_cache: KernelCache,
     buffer_pool: BufferPool,
-    requires_host_fallbacks: bool,
     cooperative_matrix_caps: CooperativeMatrixCaps,
     compute_graph: OnceLock<ComputeGraph>,
 }
@@ -165,8 +151,6 @@ impl Device {
             ..Default::default()
         });
         let adapter = select_adapter(&instance, backends).await?;
-        let adapter_info = adapter.get_info();
-        let requires_host_fallbacks = adapter_requires_host_fallbacks(&adapter_info);
         let adapter_features = adapter.features();
         let mut required_features = wgpu::Features::empty();
         if adapter_features.contains(wgpu::Features::SUBGROUP) {
@@ -188,9 +172,7 @@ impl Device {
             }
         }
         let mut experimental_features = wgpu::ExperimentalFeatures::default();
-        if !requires_host_fallbacks
-            && adapter_features.contains(wgpu::Features::EXPERIMENTAL_COOPERATIVE_MATRIX)
-        {
+        if adapter_features.contains(wgpu::Features::EXPERIMENTAL_COOPERATIVE_MATRIX) {
             required_features |= wgpu::Features::EXPERIMENTAL_COOPERATIVE_MATRIX;
             // SAFETY: cooperative matrix is an experimental feature that requires opting in
             experimental_features = unsafe { wgpu::ExperimentalFeatures::enabled() };
@@ -233,7 +215,6 @@ impl Device {
             queue,
             kernel_cache,
             buffer_pool,
-            requires_host_fallbacks,
             cooperative_matrix_caps,
             compute_graph: OnceLock::new(),
         });
@@ -303,12 +284,8 @@ impl Device {
         self.inner.adapter.get_info().backend
     }
 
-    pub fn subgroup_kernels_supported(&self) -> bool {
-        self.subgroups_supported() && !self.requires_host_fallbacks()
-    }
-
     pub fn fixed_width_subgroup_size(&self) -> Option<u32> {
-        if !self.subgroup_kernels_supported() {
+        if !self.subgroups_supported() {
             return None;
         }
 
@@ -319,9 +296,7 @@ impl Device {
         }
 
         // Apple GPUs execute subgroup operations with 32-wide SIMD groups even
-        // though wgpu reports the broader Metal range. Use the same practical
-        // gate as the cooperative-matrix kernels so Metal does not fall back to
-        // the unfused attention path.
+        // though wgpu reports the broader Metal range.
         if self.backend() == wgpu::Backend::Metal && min <= 32 && max >= 32 {
             return Some(32);
         }
@@ -333,21 +308,8 @@ impl Device {
         self.features().contains(wgpu::Features::SHADER_F16)
     }
 
-    pub fn cooperative_matrix_supported(&self) -> bool {
-        self.features()
-            .contains(wgpu::Features::EXPERIMENTAL_COOPERATIVE_MATRIX)
-    }
-
     pub(crate) fn cooperative_matrix_caps(&self) -> CooperativeMatrixCaps {
-        if self.cooperative_matrix_supported() {
-            self.inner.cooperative_matrix_caps
-        } else {
-            CooperativeMatrixCaps::default()
-        }
-    }
-
-    pub fn requires_host_fallbacks(&self) -> bool {
-        self.inner.requires_host_fallbacks
+        self.inner.cooperative_matrix_caps
     }
 
     pub fn wgpu_adapter(&self) -> &wgpu::Adapter {

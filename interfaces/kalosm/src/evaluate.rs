@@ -8,9 +8,9 @@ use std::ops::RangeInclusive;
 use std::sync::OnceLock;
 
 #[cfg(feature = "bert")]
-use kalosm_language::prelude::Bert;
+use kalosm_language_model::Embedder;
 #[cfg(feature = "bert")]
-use kalosm_language::prelude::Embedder;
+use rbert::Bert;
 
 /// A metric is a way to compare two pieces of data. It is used to evaluate the performance of a model.
 pub trait Metric<T> {

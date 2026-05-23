@@ -23,9 +23,9 @@ path = "../kalosm-model-types"
 optional = true
 features = []
 
-[dependencies.kalosm-common]
+[dependencies.kalosm-language-model]
 version = "0.4.0"
-path = "../kalosm-common"
+path = "../language-model"
 optional = true
 features = []
 
@@ -34,6 +34,21 @@ features = []
 optional = true
 workspace = true
 default-features = false
+
+[dependencies.kalosm-llama]
+features = []
+optional = true
+workspace = true
+
+[dependencies.rbert]
+features = []
+optional = true
+workspace = true
+
+[dependencies.kalosm-sample]
+features = []
+optional = true
+workspace = true
 
 [dependencies.kalosm-sound]
 features = []
@@ -54,6 +69,7 @@ default-features = false
 [dependencies.serde]
 version = "1.0.163"
 features = ["derive"]
+optional = true
 
 [dependencies.surrealdb]
 version = "2.4.0"
@@ -69,25 +85,49 @@ version = "0.1.40"
 optional = true
 
 [dev-dependencies]
+pollster = "0.4"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 
 [features]
 default = []
-full = ["bert", "llama", "vision", "sound", "sound-denoise", "surrealdb"]
+full = [
+    "bert",
+    "llama-vision",
+    "hf-tokenizer-json",
+    "structured",
+    "vision",
+    "sound",
+    "sound-denoise",
+    "surrealdb",
+]
 cuda = [
     "kalosm-language?/cublas",
     "kalosm-vision?/cublas",
 ]
 mkl = ["kalosm-language?/mkl", "kalosm-vision?/mkl"]
 language = [
-    "dep:kalosm-language",
-    "dep:hdrhistogram",
     "dep:kalosm-model-types",
-    "dep:comfy-table",
+    "dep:kalosm-language-model",
+    "kalosm-language-model/serde",
 ]
-bert = ["language", "kalosm-language/bert", "dep:kalosm-common"]
-llama = ["language", "kalosm-language/llama", "dep:kalosm-common"]
-prompt_annealing = ["bert", "dep:rand", "dep:thiserror", "dep:tracing"]
+structured = [
+    "language",
+    "dep:kalosm-sample",
+    "kalosm-language-model/structured",
+    "kalosm-llama?/structured",
+]
+bert = ["language", "dep:rbert"]
+llama = ["language", "dep:kalosm-llama"]
+hf-tokenizer-json = ["kalosm-llama?/hf-tokenizer-json"]
+llama-vision = ["llama", "kalosm-llama/vision"]
+documents = ["language", "dep:kalosm-language", "kalosm-language/documents"]
+fs-documents = ["documents", "kalosm-language/fs-documents"]
+web-documents = ["documents", "kalosm-language/web-documents"]
+chunking = ["documents", "kalosm-language/chunking"]
+vector-db = ["documents", "kalosm-language/vector-db"]
+rag = ["web-documents", "chunking", "vector-db"]
+evaluation = ["language", "dep:comfy-table", "dep:hdrhistogram"]
+prompt_annealing = ["bert", "evaluation", "dep:rand", "dep:thiserror", "dep:tracing"]
 metal = [
     "kalosm-language?/metal",
     "kalosm-vision?/metal",
@@ -96,18 +136,23 @@ sound = ["dep:kalosm-sound"]
 sound-denoise = ["sound", "kalosm-sound/denoise"]
 sound-source = ["sound", "kalosm-sound/source"]
 sound-voice-detection = ["sound", "kalosm-sound/voice-detection"]
-surrealdb = ["bert", "dep:surrealdb", "dep:heed", "dep:arroy", "dep:thiserror"]
+surrealdb = [
+    "bert",
+    "rag",
+    "dep:surrealdb",
+    "dep:heed",
+    "dep:arroy",
+    "dep:thiserror",
+    "dep:serde",
+]
 surrealdb-local = ["surrealdb", "surrealdb/kv-mem", "surrealdb/kv-surrealkv"]
 vision = ["dep:kalosm-vision"]
-openai = ["language", "kalosm-language/openai"]
-anthropic = ["language", "kalosm-language/anthropic"]
+openai = ["language", "kalosm-language-model/openai"]
+anthropic = ["language", "kalosm-language-model/anthropic"]
 remote = ["openai", "anthropic"]
-scrape = ["language", "kalosm-language/scrape"]
+scrape = ["language", "dep:kalosm-language", "kalosm-language/scrape"]
 tokio = [
-    "kalosm-common?/tokio",
     "kalosm-language?/tokio",
-    "kalosm-sound?/tokio",
-    "kalosm-vision?/tokio",
 ]
 
 [[example]]

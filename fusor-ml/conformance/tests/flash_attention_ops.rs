@@ -301,6 +301,134 @@ async fn assert_flash_attention_case(
     }
 }
 
+/// Exercises the **tiled** branch of the Metal decode-small kernel
+/// (`flash_decode_small_block` in `fusor-ml/tile-ir-kernels/src/kernels/flash.rs`).
+/// On Metal `choose_decode_block` always returns `Small` (BLOCK=128), so
+/// `tiled = kv_seq_len > 128`. The rest of the conformance suite never
+/// crosses that boundary with `head_dim = 128`, which is why the Qwen-3B
+/// decode bug (`flash_attention` output entirely NaN for one head at
+/// `kv_seq_len ≈ 569`) slipped through.
+///
+/// Each shape is run multiple times because the failure is non-deterministic
+/// (looks like a workgroup-memory race in the tiled kernel).
+#[tokio::test]
+async fn flash_attention_decode_tiled_matches_cpu_reference() {
+    // (num_heads, num_kv_heads, kv_seq_len)
+    // Shapes specifically chosen to stress the tiled flash_decode_small_block
+    // path. head_dim=128 to force the decode-small kernel; kv_seq_len chosen
+    // to span tile counts (2..=5 tiles) and to land just over the BLOCK=128
+    // boundary.
+    let shapes = [
+        (16, 2, 129),  // just past one full tile
+        (16, 2, 192),  // mid-second tile
+        (16, 2, 256),  // exactly two full tiles
+        (16, 2, 257),  // just past two full tiles (start of third)
+        (16, 2, 384),  // exactly three full tiles
+        (16, 2, 511),  // last lane of fourth tile inactive
+        (16, 2, 512),  // exactly four full tiles
+        (16, 2, 569),  // five tiles, matches Qwen-3B decode failure
+        (32, 8, 200),  // larger GQA group, kv_seq_len in second tile
+    ];
+
+    for (num_heads, num_kv_heads, kv_seq_len) in shapes {
+        let case = FlashCase {
+            batch: 1,
+            num_heads,
+            num_kv_heads,
+            q_seq_len: 1,
+            kv_seq_len,
+            head_dim: 128,
+        };
+        // Run each shape several times to catch non-deterministic kernel races.
+        for trial in 0..4 {
+            assert_flash_attention_case(case, None, 1e-3)
+                .await;
+            let _ = trial;
+        }
+    }
+}
+
+/// Same as the tiled test above, but builds Q with non-canonical strides
+/// (reshape + transpose) — matching how the real attention path produces Q
+/// in `models/kalosm-llama/src/raw/attention_layer.rs`. The kernel reads Q
+/// via `index_n(meta.q_offset, meta.q_strides, ...)`, so different strides
+/// hit different memory addresses and exercise different control flow paths
+/// inside `flash_decode_small_block`.
+#[tokio::test]
+async fn flash_attention_decode_tiled_with_transposed_q_matches_cpu_reference() {
+    let shapes = [
+        (16, 2, 129),
+        (16, 2, 257),
+        (16, 2, 384),
+        (16, 2, 569),
+    ];
+
+    for (num_heads, num_kv_heads, kv_seq_len) in shapes {
+        let head_dim = 128;
+        let batch = 1;
+        let q_seq_len = 1;
+
+        // Build Q starting in [batch, q_seq_len, num_heads, head_dim]
+        // contiguous layout, then transpose(1, 2) to land at the kernel's
+        // expected [batch, num_heads, q_seq_len, head_dim] shape with
+        // non-canonical strides ([H*D, D, H*D, 1] when q_seq_len=1).
+        let q_data = attention_data(batch * num_heads * q_seq_len * head_dim, 0.1);
+        let k_data = attention_data(batch * num_kv_heads * kv_seq_len * head_dim, -0.15);
+        let v_data = attention_data(batch * num_kv_heads * kv_seq_len * head_dim, 0.35);
+        let scale = 1.0 / (head_dim as f32).sqrt();
+
+        // Reference computed on CPU with canonical-stride Q.
+        let q_cpu: Tensor<4, f32> = Tensor::from_slice(
+            &Device::Cpu,
+            [batch, num_heads, q_seq_len, head_dim],
+            &q_data,
+        );
+        let k_cpu: Tensor<4, f32> = Tensor::from_slice(
+            &Device::Cpu,
+            [batch, num_kv_heads, kv_seq_len, head_dim],
+            &k_data,
+        );
+        let v_cpu: Tensor<4, f32> = Tensor::from_slice(
+            &Device::Cpu,
+            [batch, num_kv_heads, kv_seq_len, head_dim],
+            &v_data,
+        );
+        let expected = q_cpu
+            .flash_attention(&k_cpu, &v_cpu, scale, None)
+            .to_concrete();
+
+        for device in available_devices().await {
+            // Lay Q out as [batch, q_seq_len, num_heads, head_dim] (the way
+            // it comes out of the QKV matmul before reshape+transpose) and
+            // then transpose(1, 2) to get [batch, num_heads, q_seq_len, head_dim]
+            // with non-canonical strides — the same layout the model uses.
+            let q_pre: Tensor<4, f32> = Tensor::from_slice(
+                &device,
+                [batch, q_seq_len, num_heads, head_dim],
+                &q_data,
+            );
+            let q = q_pre.transpose(1, 2).to_concrete();
+            let k: Tensor<4, f32> = Tensor::from_slice(
+                &device,
+                [batch, num_kv_heads, kv_seq_len, head_dim],
+                &k_data,
+            );
+            let v: Tensor<4, f32> = Tensor::from_slice(
+                &device,
+                [batch, num_kv_heads, kv_seq_len, head_dim],
+                &v_data,
+            );
+            // Several trials to catch races.
+            for _ in 0..4 {
+                let actual = q
+                    .flash_attention(&k, &v, scale, None)
+                    .to_concrete();
+                approx_eq(&actual, &expected, 1e-3).await.unwrap();
+            }
+        }
+    }
+}
+
 #[tokio::test]
 async fn flash_attention_subgroup_fallback_preserves_gpu_backend() {
     let q_shape = [1, 1, 2, 4];
@@ -314,7 +442,7 @@ async fn flash_attention_subgroup_fallback_preserves_gpu_backend() {
         let Some(gpu) = device.as_gpu() else {
             continue;
         };
-        if gpu.subgroup_kernels_supported() {
+        if gpu.subgroups_supported() {
             continue;
         }
 

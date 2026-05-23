@@ -8,14 +8,16 @@ use fusor::{
     AddOp, CastTensor, CastTo, FloatDataType, FloatOps, MatmulImpl, MulOp, SimdBinaryOp,
     SimdElement, SimdReduceOp, SumOp,
 };
+#[cfg(feature = "structured")]
+use kalosm_language_model::StructuredTextCompletionModel;
 use kalosm_language_model::{
     ChatMessage, ChatModel, ChatSession, ContentChunk, CreateChatSession,
-    CreateTextCompletionSession, MessageContent, MessageType, StructuredChatModel,
-    StructuredTextCompletionModel, TextCompletionModel,
+    CreateTextCompletionSession, GenerationParameters, MessageContent, MessageType,
+    TextCompletionModel,
 };
 use kalosm_model_types::{WasmNotSend, WasmNotSendSync};
+#[cfg(feature = "structured")]
 use kalosm_sample::{CreateParserState, Parser};
-use llm_samplers::types::Sampler;
 use minijinja::ErrorKind;
 
 fn get_new_tokens<F: FloatDataType + SimdElement>(
@@ -70,8 +72,8 @@ where
     }
 }
 
-impl<F: FloatDataType + SimdElement + Default + FloatOps + MatmulImpl, S: Sampler + 'static>
-    ChatModel<S> for Llama<F>
+impl<F: FloatDataType + SimdElement + Default + FloatOps + MatmulImpl>
+    ChatModel<GenerationParameters> for Llama<F>
 where
     F: CastTo<f32> + CastTensor<f32> + WasmNotSendSync + 'static,
     f32: CastTo<F> + CastTensor<F>,
@@ -83,7 +85,7 @@ where
         &'a self,
         session: &'a mut Self::ChatSession,
         messages: &[ChatMessage],
-        sampler: S,
+        sampler: GenerationParameters,
         mut on_token: impl FnMut(String) -> Result<(), Self::Error> + WasmNotSendSync + 'static,
     ) -> impl Future<Output = Result<(), Self::Error>> + WasmNotSend + 'a {
         let new_text = get_new_tokens(messages, session, self);
@@ -119,8 +121,9 @@ where
     }
 }
 
-impl<F: FloatDataType + SimdElement + Default + FloatOps + MatmulImpl, S, Constraints>
-    StructuredChatModel<Constraints, S> for Llama<F>
+#[cfg(feature = "structured")]
+impl<F: FloatDataType + SimdElement + Default + FloatOps + MatmulImpl, Constraints>
+    kalosm_language_model::StructuredChatModel<Constraints, GenerationParameters> for Llama<F>
 where
     F: CastTo<f32> + CastTensor<f32> + WasmNotSendSync + 'static,
     f32: CastTo<F> + CastTensor<F>,
@@ -130,13 +133,12 @@ where
     <Constraints as Parser>::Output: WasmNotSend,
     <Constraints as Parser>::PartialState: WasmNotSend,
     Constraints: CreateParserState + WasmNotSend + 'static,
-    S: Sampler + 'static,
 {
     fn add_message_with_callback_and_constraints<'a>(
         &'a self,
         session: &'a mut Self::ChatSession,
         messages: &[ChatMessage],
-        sampler: S,
+        sampler: GenerationParameters,
         constraints: Constraints,
         mut on_token: impl FnMut(String) -> Result<(), Self::Error> + WasmNotSendSync + 'static,
     ) -> impl Future<

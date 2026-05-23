@@ -25,7 +25,7 @@ tracing = "0.1.37"
 image.workspace = true
 serde = "1.0.193"
 serde_json = "1.0"
-kalosm-common = { workspace = true, features = ["tokio"] }
+kalosm-common = { workspace = true }
 kalosm-model-types = { workspace = true }
 
 [dev-dependencies]

@@ -62,7 +62,7 @@ where
             (Tensor::Gpu(q), Tensor::Gpu(k), Tensor::Gpu(v))
                 if !matches!(mask, Some((_, MaskKind::BatchKeyMask))) =>
             {
-                if !q.device().subgroup_kernels_supported() {
+                if !q.device().subgroups_supported() {
                     let cpu_q = tensor4_to_cpu(q);
                     let cpu_k = tensor4_to_cpu(k);
                     let cpu_v = tensor4_to_cpu(v);

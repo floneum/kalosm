@@ -1234,6 +1234,92 @@ where
             _ => panic!("Cannot mix CPU and GPU tensors in q_mat_mul"),
         }
     }
+
+    pub fn q_mat_mul_paired_silu_product(&self, weights: &crate::QMatrix) -> Tensor<R, f32> {
+        use crate::QMatrix;
+
+        assert_eq!(
+            weights.shape().len(),
+            2,
+            "q_mat_mul_paired_silu_product requires 2D weight tensor, got {}D",
+            weights.shape().len()
+        );
+        assert!(
+            weights.shape()[0].is_multiple_of(2),
+            "q_mat_mul_paired_silu_product requires an even output dimension"
+        );
+
+        match (self, weights) {
+            (Tensor::Gpu(lhs), QMatrix::Gpu(rhs))
+                if weights.ggml_type() == fusor_gguf::GgmlType::Q4K =>
+            {
+                Tensor::Gpu(lhs.q_mat_mul_paired_silu_product(rhs))
+            }
+            _ => {
+                let pair_len = weights.shape()[0] / 2;
+                let projected = self.q_mat_mul(weights);
+                let gate = projected
+                    .narrow(crate::D::Minus1, 0, pair_len)
+                    .to_concrete();
+                let up = projected
+                    .narrow(crate::D::Minus1, pair_len, pair_len)
+                    .to_concrete();
+                (gate.silu() * up).to_concrete()
+            }
+        }
+    }
+
+    pub fn q_mat_mul_add2<B1, B2>(
+        &self,
+        weights: &crate::QMatrix,
+        first: &Tensor<R, f32, B1>,
+        second: &Tensor<R, f32, B2>,
+    ) -> Tensor<R, f32>
+    where
+        B1: TensorBacking<R, Elem = f32>,
+        B2: TensorBacking<R, Elem = f32>,
+    {
+        use crate::QMatrix;
+
+        assert_eq!(
+            weights.shape().len(),
+            2,
+            "q_mat_mul_add2 requires 2D weight tensor, got {}D",
+            weights.shape().len()
+        );
+
+        let output_shape: [usize; R] = std::array::from_fn(|i| {
+            if i + 1 == R {
+                weights.shape()[0]
+            } else {
+                self.shape()[i]
+            }
+        });
+        assert_eq!(
+            first.shape(),
+            output_shape,
+            "first residual shape must match q_mat_mul output shape"
+        );
+        assert_eq!(
+            second.shape(),
+            output_shape,
+            "second residual shape must match q_mat_mul output shape"
+        );
+
+        match (self, weights, first, second) {
+            (Tensor::Gpu(lhs), QMatrix::Gpu(rhs), Tensor::Gpu(first), Tensor::Gpu(second))
+                if weights.ggml_type() != fusor_gguf::GgmlType::F16
+                    && weights.ggml_type() != fusor_gguf::GgmlType::F32 =>
+            {
+                Tensor::Gpu(lhs.q_mat_mul_add2(rhs, first, second))
+            }
+            _ => {
+                let projected = self.q_mat_mul(weights);
+                let with_first = (&projected + first).to_concrete();
+                (&with_first + second).to_concrete()
+            }
+        }
+    }
 }
 
 // Flatten operations

@@ -10,9 +10,6 @@ use std::sync::{Arc, RwLock};
 /// An error that can occur when saving or loading a [`LlamaSession`].
 #[derive(Debug, thiserror::Error)]
 pub enum LlamaSessionLoadingError {
-    /// An error from safetensors while loading or saving a [`LlamaSession`].
-    #[error("Safetensors error: {0}")]
-    Safetensors(#[from] safetensors::SafeTensorError),
     /// An error from candle while loading or saving a [`LlamaSession`].
     #[error("Candle error: {0:?}")]
     Candle(#[from] fusor::Error),

@@ -51,22 +51,13 @@ impl NaryScalar {
     }
 }
 
-#[allow(dead_code)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) enum NaryOp {
     Add,
     Sub,
     Mul,
     Div,
-    Rem,
     Pow,
-    Min,
-    Max,
-    Equal,
-    Less,
-    LessEqual,
-    Greater,
-    GreaterEqual,
     Neg,
     Cast,
     Select,
@@ -695,10 +686,6 @@ impl Operation for NaryOperation {
         crate::nary_direct::build_nary_direct_kernel(self, nodes, workgroup_shape, inputs)
     }
 
-    fn requires_single_kernel_batch(&self) -> bool {
-        true
-    }
-
     fn name(&self) -> String {
         format!(
             "nary_{}_{}",
@@ -709,9 +696,5 @@ impl Operation for NaryOperation {
                 .collect::<Vec<_>>()
                 .join("x")
         )
-    }
-
-    fn as_nary(&self) -> Option<&NaryOperation> {
-        Some(self)
     }
 }

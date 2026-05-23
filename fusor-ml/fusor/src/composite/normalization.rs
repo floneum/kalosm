@@ -311,16 +311,6 @@ where
         match (self, weight, bias) {
             // GPU path - use the optimized fused kernel
             (Tensor::Gpu(input), Tensor::Gpu(gpu_weight), bias_opt) => {
-                if input.device().requires_host_fallbacks() {
-                    let input = tensor_to_cpu(self);
-                    let weight = tensor_to_cpu(weight);
-                    let bias = bias.map(tensor_to_cpu);
-                    return input.rms_norm_fused_cpu_impl::<W, OUT_RANK>(
-                        &weight,
-                        bias.as_ref(),
-                        eps,
-                    );
-                }
                 let gpu_bias = bias_opt.map(|b| match b {
                     Tensor::Gpu(bias) => bias,
                     _ => panic!("Bias must be on GPU when input is on GPU"),
@@ -391,18 +381,6 @@ where
     {
         match (self, residual, weight, bias) {
             (Tensor::Gpu(input), Tensor::Gpu(gpu_residual), Tensor::Gpu(gpu_weight), bias_opt) => {
-                if input.device().requires_host_fallbacks() {
-                    let input = tensor_to_cpu(self);
-                    let residual = tensor_to_cpu(residual);
-                    let weight = tensor_to_cpu(weight);
-                    let bias = bias.map(tensor_to_cpu);
-                    let combined = (&input + &residual).to_concrete();
-                    return combined.rms_norm_fused_cpu_impl::<W, OUT_RANK>(
-                        &weight,
-                        bias.as_ref(),
-                        eps,
-                    );
-                }
                 let gpu_bias = bias_opt.map(|b| match b {
                     Tensor::Gpu(bias) => bias,
                     _ => panic!("Bias must be on GPU when input is on GPU"),
@@ -478,32 +456,6 @@ where
             }
         } else {
             scaled
-        }
-    }
-}
-
-fn tensor_to_cpu<const R: usize, D, B>(tensor: &Tensor<R, D, B>) -> Tensor<R, D>
-where
-    B: TensorBacking<R, Elem = D>,
-    D: SimdElement + DataType + Copy,
-{
-    match tensor {
-        Tensor::Cpu(tensor) => Tensor::Cpu(tensor.to_concrete()),
-        Tensor::Gpu(tensor) => {
-            let shape = *tensor.shape();
-            let slice = pollster::block_on(tensor.as_slice()).expect("failed to read tensor");
-            let total = shape.iter().product();
-            let mut values = Vec::with_capacity(total);
-            for flat in 0..total {
-                let mut index = [0usize; R];
-                let mut rem = flat;
-                for axis in (0..R).rev() {
-                    index[axis] = rem % shape[axis];
-                    rem /= shape[axis];
-                }
-                values.push(slice[index]);
-            }
-            Tensor::Cpu(fusor_cpu::Tensor::from_slice(shape, &values))
         }
     }
 }

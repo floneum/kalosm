@@ -10,4 +10,13 @@ bytemuck = "1.25.0"
 half = "2.4.1"
 naga = { git = "https://github.com/ealmloff/wgpu", branch = "yield-now", package = "naga" }
 pollster = "0.4.0"
-wgpu = { git = "https://github.com/ealmloff/wgpu", branch = "yield-now", features = ["naga-ir", "static-dxc", "vulkan-portability"] }
+wgpu = { git = "https://github.com/ealmloff/wgpu", branch = "yield-now", default-features = false, features = ["std", "naga-ir"] }
+
+[target.'cfg(target_vendor = "apple")'.dependencies]
+wgpu = { git = "https://github.com/ealmloff/wgpu", branch = "yield-now", default-features = false, features = ["metal"] }
+
+[target.'cfg(windows)'.dependencies]
+wgpu = { git = "https://github.com/ealmloff/wgpu", branch = "yield-now", default-features = false, features = ["dx12"] }
+
+[target.'cfg(any(target_os = "linux", target_os = "android", target_os = "freebsd"))'.dependencies]
+wgpu = { git = "https://github.com/ealmloff/wgpu", branch = "yield-now", default-features = false, features = ["vulkan"] }

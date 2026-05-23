@@ -40,7 +40,15 @@ impl Device {
     pub async fn auto() -> Self {
         match Self::gpu().await {
             Ok(gpu) => gpu,
-            Err(_) => Device::Cpu,
+            Err(err) => {
+                if std::env::var_os("KALOSM_TRACE_DECODE_TIMING").is_some()
+                    || std::env::var_os("FUSOR_TRACE_DECODE").is_some()
+                    || std::env::var_os("FUSOR_TRACE_RESOLVE").is_some()
+                {
+                    eprintln!("fusor_device_auto_gpu_error={err}");
+                }
+                Device::Cpu
+            }
         }
     }
 

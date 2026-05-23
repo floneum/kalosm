@@ -33,7 +33,6 @@ tokio = { version = "1.32.0", features = ["full"] }
 anyhow.workspace = true
 
 [features]
-tokio = ["kalosm-common/tokio"]
 flash = ["candle-transformers/flash-attn"]
 accelerate = ["dep:accelerate-src", "candle-core/accelerate", "candle-nn/accelerate", "candle-transformers/accelerate"]
 cuda = ["candle-core/cuda", "candle-nn/cuda", "candle-transformers/cuda"]

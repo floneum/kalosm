@@ -17,12 +17,21 @@ pub(crate) use topk::{
 
 pub(crate) const TOP_K_BLOCK: u32 = 256;
 pub(crate) const TOP_K_CHUNK: usize = TOP_K_BLOCK as usize;
-pub(crate) const MIN_TOP_K_CANDIDATES_PER_CHUNK: usize = 64;
+pub(crate) const DEFAULT_MIN_TOP_K_CANDIDATES_PER_CHUNK: usize = 16;
 pub(crate) const GPU_SAMPLER_PREVIOUS_TOKENS: usize = 64;
 pub(crate) const GPU_SAMPLE_RESULT_WORDS: usize = 2;
 pub(crate) const GPU_SAMPLE_STATUS_RETRY_NEEDED: u32 = 0;
 pub(crate) const GPU_SAMPLE_STATUS_SAMPLED: u32 = 1;
 pub(crate) const GPU_SAMPLE_STATUS_INVALID: u32 = 2;
+
+pub(crate) fn min_top_k_candidates_per_chunk() -> usize {
+    std::env::var("FUSOR_TOP_K_MIN_CANDIDATES_PER_CHUNK")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(DEFAULT_MIN_TOP_K_CANDIDATES_PER_CHUNK)
+        .min(TOP_K_CHUNK)
+}
 
 #[derive(Clone, Copy, Debug)]
 pub struct GpuMirostat2SamplerParams {

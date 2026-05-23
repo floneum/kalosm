@@ -1,13 +1,3 @@
-#[cfg(feature = "sample")]
-use std::hash::Hash;
-#[cfg(feature = "sample")]
-use std::hash::Hasher;
-
-#[cfg(feature = "sample")]
-use llm_samplers::configure::SamplerChainBuilder;
-#[cfg(feature = "sample")]
-use llm_samplers::prelude::*;
-
 /// Parameters to use when generating text.
 #[derive(Debug)]
 pub struct GenerationParameters {
@@ -22,8 +12,6 @@ pub struct GenerationParameters {
     pub(crate) max_length: u32,
     pub(crate) stop_on: Option<String>,
     pub(crate) seed: Option<u64>,
-    #[cfg(feature = "sample")]
-    sampler: Option<(u64, SamplerChain)>,
 }
 
 impl PartialEq for GenerationParameters {
@@ -55,8 +43,6 @@ impl Clone for GenerationParameters {
             max_length: self.max_length,
             stop_on: self.stop_on.clone(),
             seed: None,
-            #[cfg(feature = "sample")]
-            sampler: None,
         }
     }
 }
@@ -64,29 +50,6 @@ impl Clone for GenerationParameters {
 impl Default for GenerationParameters {
     fn default() -> Self {
         Self::new()
-    }
-}
-
-#[cfg(feature = "sample")]
-impl Sampler for GenerationParameters {
-    fn sample<'a>(
-        &mut self,
-        res: &mut dyn HasSamplerResources,
-        logits: &'a mut Logits,
-    ) -> anyhow::Result<&'a mut Logits> {
-        self.with_sampler(|sampler| sampler.sample(res, logits))
-    }
-
-    fn sample_token(
-        &mut self,
-        res: &mut dyn HasSamplerResources,
-        logits: &mut Logits,
-    ) -> anyhow::Result<Option<TID>> {
-        self.with_sampler(|sampler| sampler.sample_token(res, logits))
-    }
-
-    fn sampled_token_id(&self) -> Option<TID> {
-        self.sampler().sampled_token_id()
     }
 }
 
@@ -105,91 +68,7 @@ impl GenerationParameters {
             max_length: u32::MAX,
             stop_on: None,
             seed: None,
-            #[cfg(feature = "sample")]
-            sampler: None,
         }
-    }
-
-    #[cfg(feature = "sample")]
-    fn with_sampler<O>(&mut self, with_sampler: impl FnOnce(&mut SamplerChain) -> O) -> O {
-        let mut hash = std::collections::hash_map::DefaultHasher::new();
-        self.eta.to_le_bytes().hash(&mut hash);
-        self.mu.to_le_bytes().hash(&mut hash);
-        self.repetition_penalty
-            .map(|f| f.to_le_bytes())
-            .hash(&mut hash);
-        self.repetition_penalty_range.hash(&mut hash);
-        self.tau.to_le_bytes().hash(&mut hash);
-        self.top_p.map(|f| f.to_le_bytes()).hash(&mut hash);
-        self.top_k.hash(&mut hash);
-        self.temperature.to_le_bytes().hash(&mut hash);
-        self.max_length.hash(&mut hash);
-        let hash = hash.finish();
-        if let Some((old_hash, sampler)) = &mut self.sampler {
-            if *old_hash == hash {
-                return with_sampler(sampler);
-            }
-        }
-        let mut sampler = self.sampler();
-        let output = with_sampler(&mut sampler);
-        self.sampler = Some((hash, sampler));
-        output
-    }
-
-    #[cfg(feature = "sample")]
-    /// Create a sampler chain from the generation parameters.
-    pub fn sampler(&self) -> SamplerChain {
-        use llm_samplers::configure::SamplerSlot;
-        let GenerationParameters {
-            temperature,
-            tau,
-            eta,
-            mu,
-            repetition_penalty_range,
-            top_p: _,
-            max_length: _,
-            stop_on: _,
-            ..
-        } = self;
-        let temperature = *temperature;
-        let tau = *tau;
-        let eta = *eta;
-        let mu = *mu;
-        let repetition_penalty = self.repetition_penalty();
-        let repetition_penalty_range = *repetition_penalty_range;
-        SamplerChainBuilder::from([
-            (
-                "repetition",
-                SamplerSlot::new_static(move || {
-                    Box::new(
-                        SampleRepetition::default()
-                            .penalty(repetition_penalty)
-                            .last_n(repetition_penalty_range as usize),
-                    )
-                }),
-            ),
-            (
-                "freqpresence",
-                SamplerSlot::new_static(move || Box::new(SampleFreqPresence::default().last_n(64))),
-            ),
-            (
-                "seqrepetition",
-                SamplerSlot::new_static(move || Box::<SampleSeqRepetition>::default()),
-            ),
-            (
-                "temperature",
-                SamplerSlot::new_static(move || {
-                    Box::new(SampleTemperature::default().temperature(temperature))
-                }),
-            ),
-            (
-                "mirostat2",
-                SamplerSlot::new_static(move || {
-                    Box::new(SampleMirostat2::default().tau(tau).eta(eta).mu(mu))
-                }),
-            ),
-        ])
-        .into_chain()
     }
 
     /// Set the top_p parameter to the generation parameters (only used by the OpenAI API).
@@ -198,58 +77,10 @@ impl GenerationParameters {
         self
     }
 
-    /// Set the top_k parameter to the generation parameters (only used by the Anthropic API).
+    /// Set the top_k parameter to the generation parameters.
     pub fn with_top_k(mut self, top_k: u32) -> Self {
         self.top_k = Some(top_k);
         self
-    }
-
-    #[cfg(feature = "sample")]
-    /// Get the mirostat2 sampler from the generation parameters.
-    pub fn mirostat2_sampler(self) -> SampleMirostat2 {
-        SampleMirostat2::default()
-            .tau(self.tau)
-            .eta(self.eta)
-            .mu(self.mu)
-    }
-
-    #[cfg(feature = "sample")]
-    /// Create a sampler chain from the generation parameters without removing any tokens. This can be useful in combination with [`ModelExt::stream_structured_text_with_sampler`] which may pick unlikely tokens.
-    pub fn bias_only_sampler(self) -> SamplerChain {
-        use llm_samplers::configure::SamplerSlot;
-        let GenerationParameters {
-            temperature,
-            repetition_penalty_range,
-            ..
-        } = self;
-        let repetition_penalty = self.repetition_penalty();
-        SamplerChainBuilder::from([
-            (
-                "repetition",
-                SamplerSlot::new_static(move || {
-                    Box::new(
-                        SampleRepetition::default()
-                            .penalty(repetition_penalty)
-                            .last_n(repetition_penalty_range as usize),
-                    )
-                }),
-            ),
-            (
-                "freqpresence",
-                SamplerSlot::new_static(move || Box::new(SampleFreqPresence::default().last_n(64))),
-            ),
-            (
-                "seqrepetition",
-                SamplerSlot::new_static(move || Box::<SampleSeqRepetition>::default()),
-            ),
-            (
-                "temperature",
-                SamplerSlot::new_static(move || {
-                    Box::new(SampleTemperature::default().temperature(temperature))
-                }),
-            ),
-        ])
-        .into_chain()
     }
 
     /// Set the temperature to use when generating text.

@@ -1,13 +1,13 @@
 use super::{NoOpenAIAPIKeyError, OpenAICompatibleClient};
-use crate::{
-    ChatModel, ChatSession, ContentChunk, CreateChatSession, CreateDefaultChatConstraintsForType,
-    GenerationParameters, SchemaParser, StructuredChatModel,
-};
+use crate::{ChatModel, ChatSession, ContentChunk, CreateChatSession, GenerationParameters};
 use futures_util::StreamExt;
 use kalosm_model_types::{ModelBuilder, ModelLoadingProgress};
+#[cfg(feature = "structured")]
 use kalosm_sample::Schema;
 use reqwest_eventsource::{Event, RequestBuilderExt};
-use serde::{de::DeserializeOwned, Deserialize, Serialize};
+#[cfg(feature = "structured")]
+use serde::de::DeserializeOwned;
+use serde::{Deserialize, Serialize};
 use std::{future::Future, sync::Arc};
 use thiserror::Error;
 
@@ -297,17 +297,19 @@ impl ChatModel<GenerationParameters> for OpenAICompatibleChatModel {
     }
 }
 
-impl<T: Schema + DeserializeOwned> CreateDefaultChatConstraintsForType<T>
+#[cfg(feature = "structured")]
+impl<T: Schema + DeserializeOwned> crate::CreateDefaultChatConstraintsForType<T>
     for OpenAICompatibleChatModel
 {
-    type DefaultConstraints = SchemaParser<T>;
+    type DefaultConstraints = crate::SchemaParser<T>;
 
     fn create_default_constraints() -> Self::DefaultConstraints {
-        SchemaParser::new()
+        crate::SchemaParser::new()
     }
 }
 
-impl<P> StructuredChatModel<SchemaParser<P>> for OpenAICompatibleChatModel
+#[cfg(feature = "structured")]
+impl<P> crate::StructuredChatModel<crate::SchemaParser<P>> for OpenAICompatibleChatModel
 where
     P: Schema + DeserializeOwned,
 {
@@ -316,7 +318,7 @@ where
         session: &'a mut Self::ChatSession,
         messages: &[crate::ChatMessage],
         sampler: GenerationParameters,
-        _: SchemaParser<P>,
+        _: crate::SchemaParser<P>,
         mut on_token: impl FnMut(String) -> Result<(), Self::Error> + Send + Sync + 'static,
     ) -> impl Future<Output = Result<P, Self::Error>> + Send + 'a {
         let schema = P::schema();
@@ -478,15 +480,18 @@ fn format_messages(messages: &[crate::ChatMessage]) -> serde_json::Value {
 mod tests {
     use std::sync::{Arc, RwLock};
 
+    #[cfg(feature = "structured")]
     use serde::Deserialize;
 
     use crate::{ChatModelExt, OpenAICompatibleChatModel};
 
     use super::{
         ChatModel, CreateChatSession, GenerationParameters, OpenAICompatibleChatModelBuilder,
-        StructuredChatModel,
     };
+    #[cfg(feature = "structured")]
     use crate::SchemaParser;
+    #[cfg(feature = "structured")]
+    use crate::StructuredChatModel;
 
     #[tokio::test]
     async fn test_gpt_5_mini() {
@@ -535,6 +540,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg(feature = "structured")]
     async fn test_gpt_5_mini_constrained() {
         let model = OpenAICompatibleChatModelBuilder::new()
             .with_model("openai/gpt-5-mini")
@@ -586,6 +592,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg(feature = "structured")]
     async fn test_gpt_4o_mini_constrained_with_option() {
         use kalosm_sample::Schema;
 
@@ -678,6 +685,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg(feature = "structured")]
     async fn test_gpt_4o_mini_constrained_with_unit_enum() {
         use kalosm_sample::Schema;
 

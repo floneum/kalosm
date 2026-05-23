@@ -10,57 +10,95 @@ keywords = ["ai", "llm", "llama", "mistral", "nlp"]
 
 [dependencies]
 futures-util = "0.3.28"
-rand = "0.8.5"
-reqwest = { version = "0.11.18", features = ["stream", "json"] }
-tokio = { version = "1.28.1", features = ["fs"] }
-slab = { version = "0.4.8", features = ["serde"] }
-arroy = "0.6.0"
-heed = "0.22"
-serde = { version = "1.0.163", features = ["derive"] }
-url = "2.4.0"
+rand = { version = "0.8.5", optional = true }
+reqwest = { version = "0.11.18", features = ["stream", "json"], optional = true }
+tokio = { version = "1.28.1", features = ["fs"], optional = true }
+arroy = { version = "0.6.0", optional = true }
+heed = { version = "0.22", optional = true }
+serde = { version = "1.0.163", features = ["derive"], optional = true }
+url = { version = "2.4.0", optional = true }
 tracing = "0.1.37"
-serde_json = "1.0.107"
-chrono = { version = "0.4.31", features = ["serde"] }
-readability = { version = "0.3.0", default-features = false }
-tempfile = "3.8.0"
-rss = { version = "2.0.6", features = ["atom"] }
-scraper = { version = "0.19.0", features = ["atomic"] }
+serde_json = { version = "1.0.107", optional = true }
+chrono = { version = "0.4.31", features = ["serde"], optional = true }
+readability = { version = "0.3.0", default-features = false, optional = true }
+tempfile = { version = "3.8.0", optional = true }
+rss = { version = "2.0.6", features = ["atom"], optional = true }
+scraper = { version = "0.19.0", features = ["atomic"], optional = true }
 kalosm-language-model = { workspace = true }
 headless_chrome = { version = "1.0", optional = true }
-tokio-util = { version = "0.7.9", features = ["rt"] }
+tokio-util = { version = "0.7.9", features = ["rt"], optional = true }
 dashmap = { version = "5.5.3", optional = true }
 rbert = { workspace = true, optional = true }
 kalosm-llama = { workspace = true, optional = true }
 kalosm-streams.workspace = true
-pulldown-cmark = "0.9.3"
-docx-rs = "0.4.7"
-lopdf = { version = "0.35.0", features = ["async"] }
-convert_case = "0.6.0"
+pulldown-cmark = { version = "0.9.3", optional = true }
+docx-rs = { version = "0.4.7", optional = true }
+lopdf = { version = "0.35.0", features = ["async"], optional = true }
+convert_case = { version = "0.6.0", optional = true }
 kalosm-sample = { workspace = true }
-ego-tree = "0.6.2"
+ego-tree = { version = "0.6.2", optional = true }
 image = { version = "0.24.7", optional = true }
-whatlang = "0.16.3"
+whatlang = { version = "0.16.3", optional = true }
 texting_robots = { version = "0.2.2", optional = true }
-half = "2.3.1"
-srx = { version = "0.1.4", features = ["from_xml"] }
-thiserror.workspace = true
-anyhow.workspace = true
-roaring = "0.10.6"
+srx = { version = "0.1.4", features = ["from_xml"], optional = true }
+thiserror = { workspace = true, optional = true }
+anyhow = { workspace = true, optional = true }
+roaring = { version = "0.10.6", optional = true }
 
 [features]
-default = ["bert", "llama"]
-tokio = ["rbert?/tokio", "kalosm-llama?/tokio"]
+default = []
+tokio = ["dep:tokio"]
 metal = []
 cublas = []
 mkl = []
 openai = ["kalosm-language-model/openai"]
 anthropic = ["kalosm-language-model/anthropic"]
 remote = ["kalosm-language-model/remote"]
+documents = ["dep:chrono", "dep:serde", "dep:whatlang"]
+document-extraction = ["documents", "dep:readability", "dep:thiserror", "dep:url"]
+fs-documents = [
+    "document-extraction",
+    "dep:convert_case",
+    "dep:docx-rs",
+    "dep:lopdf",
+    "dep:pulldown-cmark",
+    "dep:tokio",
+]
+web-documents = [
+    "document-extraction",
+    "dep:rand",
+    "dep:reqwest",
+    "dep:rss",
+    "dep:serde_json",
+]
+chunking = [
+    "documents",
+    "dep:ego-tree",
+    "dep:scraper",
+    "dep:srx",
+    "dep:thiserror",
+]
+vector-db = [
+    "documents",
+    "dep:arroy",
+    "dep:heed",
+    "dep:rand",
+    "dep:roaring",
+    "dep:serde",
+    "dep:tempfile",
+    "dep:thiserror",
+]
+rag = ["web-documents", "chunking", "vector-db"]
 scrape = [
+    "web-documents",
+    "chunking",
+    "dep:anyhow",
     "dep:headless_chrome",
     "dep:image",
     "dep:dashmap",
     "dep:texting_robots",
+    "dep:tokio",
+    "dep:tokio-util",
 ]
 bert = ["dep:rbert"]
 llama = ["dep:kalosm-llama"]

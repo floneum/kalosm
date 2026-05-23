@@ -44,7 +44,7 @@ pub(super) fn optimal_params(
     // `floneum/main`'s gate: only require coop-matrix + subgroups, not exact
     // equality of min/max subgroup size.
     if !device.cooperative_matrix_caps().supports(kind)
-        || !device.subgroup_kernels_supported()
+        || !device.subgroups_supported()
         || device.max_subgroup_size() < 32
         || device.min_subgroup_size() > 32
         || device.limits().max_compute_workgroup_size_x < 64

@@ -137,23 +137,6 @@ fn matrix_storage_size(shape: &[usize], datatype: GgmlType) -> Option<u64> {
     }
 }
 
-fn dequantized_storage_bytes<B: GgufBlock>(bytes: &[u8]) -> Box<[u8]>
-where
-    B::Dequantized: AsRef<[f32]>,
-{
-    bytemuck::cast_slice::<_, B>(bytes)
-        .iter()
-        .flat_map(|block| {
-            block
-                .dequantize()
-                .as_ref()
-                .iter()
-                .flat_map(|value| value.to_le_bytes())
-                .collect::<Vec<_>>()
-        })
-        .collect()
-}
-
 #[derive(Clone)]
 pub struct QMatrix {
     device: Device,
@@ -293,55 +276,45 @@ impl QMatrix {
         shape: Box<[usize]>,
         ty: GgmlType,
     ) -> Result<Self, GgufReadError> {
-        let host_fallback_dense = device.requires_host_fallbacks() && ty != GgmlType::Q4K;
-        let storage_bytes: Box<[u8]> = match (ty, host_fallback_dense) {
-            (GgmlType::Q4_0, true) => dequantized_storage_bytes::<BlockQ4_0>(bytes),
-            (GgmlType::Q5_0, true) => dequantized_storage_bytes::<BlockQ5_0>(bytes),
-            (GgmlType::Q8_0, true) => dequantized_storage_bytes::<BlockQ8_0>(bytes),
-            (GgmlType::Q5K, true) => dequantized_storage_bytes::<BlockQ5K>(bytes),
-            (GgmlType::Q6K, true) => dequantized_storage_bytes::<BlockQ6K>(bytes),
-            (GgmlType::Q4_0, false) => bytemuck::cast_slice::<_, BlockQ4_0>(bytes)
+        let storage_bytes: Box<[u8]> = match ty {
+            GgmlType::Q4_0 => bytemuck::cast_slice::<_, BlockQ4_0>(bytes)
                 .iter()
                 .copied()
                 .flat_map(BlockQ4_0::into_gpu_storage_bytes_f32)
                 .collect(),
-            (GgmlType::Q5_0, false) => bytemuck::cast_slice::<_, BlockQ5_0>(bytes)
+            GgmlType::Q5_0 => bytemuck::cast_slice::<_, BlockQ5_0>(bytes)
                 .iter()
                 .copied()
                 .flat_map(BlockQ5_0::into_gpu_storage_bytes_f32)
                 .collect(),
-            (GgmlType::Q8_0, false) => bytemuck::cast_slice::<_, BlockQ8_0>(bytes)
+            GgmlType::Q8_0 => bytemuck::cast_slice::<_, BlockQ8_0>(bytes)
                 .iter()
                 .copied()
                 .flat_map(BlockQ8_0::into_gpu_storage_bytes_f32)
                 .collect(),
-            (GgmlType::Q4K, _) => bytemuck::cast_slice::<_, BlockQ4K>(bytes)
+            GgmlType::Q4K => bytemuck::cast_slice::<_, BlockQ4K>(bytes)
                 .iter()
                 .copied()
                 .flat_map(BlockQ4K::into_gpu_storage_bytes_f32)
                 .collect(),
-            (GgmlType::Q5K, false) => bytemuck::cast_slice::<_, BlockQ5K>(bytes)
+            GgmlType::Q5K => bytemuck::cast_slice::<_, BlockQ5K>(bytes)
                 .iter()
                 .copied()
                 .flat_map(BlockQ5K::into_gpu_storage_bytes_f32)
                 .collect(),
-            (GgmlType::Q6K, false) => bytemuck::cast_slice::<_, BlockQ6K>(bytes)
+            GgmlType::Q6K => bytemuck::cast_slice::<_, BlockQ6K>(bytes)
                 .iter()
                 .copied()
                 .flat_map(BlockQ6K::into_gpu_storage_bytes_f32)
                 .collect(),
-            (GgmlType::F16, _) => bytemuck::cast_slice::<_, half::f16>(bytes)
+            GgmlType::F16 => bytemuck::cast_slice::<_, half::f16>(bytes)
                 .iter()
                 .flat_map(|value| value.to_f32().to_le_bytes())
                 .collect(),
-            (GgmlType::F32, _) => bytes.into(),
-            (unsupported, _) => return Err(GgufReadError::UnsupportedDType(unsupported as u32)),
+            GgmlType::F32 => bytes.into(),
+            unsupported => return Err(GgufReadError::UnsupportedDType(unsupported as u32)),
         };
-        let datatype = if ty == GgmlType::F16 || host_fallback_dense {
-            GgmlType::F32
-        } else {
-            ty
-        };
+        let datatype = if ty == GgmlType::F16 { GgmlType::F32 } else { ty };
         let buffer = device.create_buffer_init(
             &storage_bytes,
             wgpu::BufferUsages::STORAGE

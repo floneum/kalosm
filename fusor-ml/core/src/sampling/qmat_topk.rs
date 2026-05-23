@@ -5,7 +5,7 @@ use crate::{
 };
 use wgpu::CommandEncoder;
 
-use super::{MIN_TOP_K_CANDIDATES_PER_CHUNK, TOP_K_CHUNK};
+use super::{TOP_K_CHUNK, min_top_k_candidates_per_chunk};
 
 pub(super) fn qmat_logits_data_with_encoder(
     hidden: &TensorData,
@@ -66,7 +66,7 @@ pub(super) fn qmat_logits_data_with_encoder(
 pub(super) fn initial_sampler_candidate_count(top_k: usize, chunks: usize) -> usize {
     top_k
         .div_ceil(chunks)
-        .max(MIN_TOP_K_CANDIDATES_PER_CHUNK)
+        .max(min_top_k_candidates_per_chunk())
         .min(top_k)
         .min(TOP_K_CHUNK)
 }

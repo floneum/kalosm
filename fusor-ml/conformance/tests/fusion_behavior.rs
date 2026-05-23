@@ -181,10 +181,7 @@ async fn gpu_residual_rms_norm_fuses_into_one_kernel() {
     let Some(device) = gpu_device().await else {
         return;
     };
-    let Device::Gpu(gpu) = &device else { return };
-    if gpu.requires_host_fallbacks() {
-        return;
-    }
+    let Device::Gpu(_) = &device else { return };
 
     let shape = [1, 3, 256];
     let input_data = attention_data(shape.iter().product(), 0.25);

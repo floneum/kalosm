@@ -134,6 +134,7 @@ fn q4k_paired_epilogue_lowers() {
                 pair_cols,
                 m_rows: 1,
                 workgroups_x: 1,
+                shape: fusor_tile_ir_kernels::Q4KPairedShape::Ggml8x2_256,
                 epilogue: &epilogue,
                 extras: &[],
             },

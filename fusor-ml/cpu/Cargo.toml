@@ -6,17 +6,15 @@ edition = "2024"
 [dependencies]
 aligned-vec = "0.6.4"
 bytemuck = "1.14"
-generativity = "1.1.0"
 pulp = "0.22.2"
-gemm = "0.18"
-rayon = "1.10"
+gemm = { version = "0.19", default-features = false, features = ["std", "rayon"] }
 fusor-gguf = { path = "../gguf" }
 fusor-types = { path = "../types" }
 half = "2.6"
 
 [dev-dependencies]
 criterion.workspace = true
-candle-core = "0.8"
+candle-core.workspace = true
 
 # [[bench]]
 # name = "tensor_ops"

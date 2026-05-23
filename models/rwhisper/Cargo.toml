@@ -36,8 +36,6 @@ rayon = "1.10.0"
 pollster = "0.4"
 rustfft = "6.4.1"
 
-[features]
-tokio = ["kalosm-common/tokio"]
 
 [dev-dependencies]
 kalosm = { workspace = true, features = ["sound", "sound-source"], default-features = true }

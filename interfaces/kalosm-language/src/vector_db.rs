@@ -424,6 +424,7 @@ pub struct VectorDBSearchResult {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct EmbeddingId(pub u32);
 
+#[cfg(all(test, feature = "tokio"))]
 #[tokio::test]
 async fn test_vector_db_get_closest() {
     let db: VectorDB = VectorDB::new().unwrap();

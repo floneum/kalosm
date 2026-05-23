@@ -164,10 +164,6 @@ impl Operation for DequantizeOperation {
         )
     }
 
-    fn requires_single_kernel_batch(&self) -> bool {
-        true
-    }
-
     fn name(&self) -> String {
         format!("dequantize_{}_to_{}", self.matrix.datatype, self.datatype)
     }
