@@ -9,7 +9,7 @@ pub enum Device {
     #[default]
     Cpu,
     /// GPU device - uses fusor-core (wgpu) for GPU-accelerated operations.
-    Gpu(fusor_core::Device),
+    Gpu(crate::gpu::Device),
 }
 
 impl Device {
@@ -27,17 +27,36 @@ impl Device {
 
     /// Create a new GPU device asynchronously.
     pub async fn gpu() -> Result<Self, Error> {
-        let device = fusor_core::Device::new().await?;
-        Ok(Device::Gpu(device))
+        #[cfg(feature = "gpu")]
+        {
+            let device = crate::gpu::Device::new().await?;
+            Ok(Device::Gpu(device))
+        }
+        #[cfg(not(feature = "gpu"))]
+        {
+            Err(Error::msg("GPU backend is disabled"))
+        }
     }
 
     /// Create a new GPU device, blocking until ready.
     pub fn gpu_blocking() -> Result<Self, Error> {
-        pollster::block_on(Self::gpu())
+        #[cfg(feature = "gpu")]
+        {
+            pollster::block_on(Self::gpu())
+        }
+        #[cfg(not(feature = "gpu"))]
+        {
+            Err(Error::msg("GPU backend is disabled"))
+        }
     }
 
     /// Create a device, preferring GPU if available, otherwise falling back to CPU.
     pub async fn auto() -> Self {
+        #[cfg(not(feature = "gpu"))]
+        {
+            return Device::Cpu;
+        }
+        #[cfg(feature = "gpu")]
         match Self::gpu().await {
             Ok(gpu) => gpu,
             Err(err) => {
@@ -66,7 +85,7 @@ impl Device {
 
     /// Returns a reference to the GPU device if this is a GPU device.
     #[inline]
-    pub fn as_gpu(&self) -> Option<&fusor_core::Device> {
+    pub fn as_gpu(&self) -> Option<&crate::gpu::Device> {
         match self {
             Device::Gpu(d) => Some(d),
             _ => None,
@@ -77,7 +96,7 @@ impl Device {
     /// builds one shared execution graph so intermediate buffers can be freed
     /// as soon as every consumer within the batch is computed, keeping peak
     /// memory much lower than resolving one-by-one. On CPU this is a no-op.
-    pub fn resolve_batch(&self, keys: &[fusor_core::NodeIndex]) -> usize {
+    pub fn resolve_batch(&self, keys: &[crate::gpu::NodeIndex]) -> usize {
         if let Device::Gpu(device) = self {
             device.resolve_batch(keys)
         } else {
@@ -87,7 +106,7 @@ impl Device {
 
     /// Rebase already-resolved GPU graph nodes into cached leaf nodes. On CPU
     /// this is a no-op.
-    pub fn detach_cached(&self, keys: &[fusor_core::NodeIndex]) {
+    pub fn detach_cached(&self, keys: &[crate::gpu::NodeIndex]) {
         if let Device::Gpu(device) = self {
             device.detach_cached(keys);
         }

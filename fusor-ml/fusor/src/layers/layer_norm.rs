@@ -1,8 +1,8 @@
 //! Layer normalization implementation.
 
+use crate::cpu::{FloatOps, TensorBacking};
+use crate::gpu::{DataType, FloatDataType};
 use crate::{ConcreteTensor, Device, SimdElement, Tensor, VarBuilder};
-use fusor_core::{DataType, FloatDataType};
-use fusor_cpu::{FloatOps, TensorBacking};
 
 /// Layer Normalization.
 ///
@@ -58,12 +58,12 @@ where
             + std::ops::Sub<Output = D>
             + std::ops::Mul<Output = D>
             + std::ops::Div<Output = D>,
-        crate::AddOp: fusor_cpu::SimdBinaryOp<D>,
-        crate::SubOp: fusor_cpu::SimdBinaryOp<D>,
-        crate::MulOp: fusor_cpu::SimdBinaryOp<D>,
-        crate::DivOp: fusor_cpu::SimdBinaryOp<D>,
-        fusor_cpu::SumOp: fusor_cpu::SimdReduceOp<D>,
-        fusor_cpu::SqrtOp: fusor_cpu::SimdUnaryOp<D>,
+        crate::AddOp: crate::cpu::SimdBinaryOp<D>,
+        crate::SubOp: crate::cpu::SimdBinaryOp<D>,
+        crate::MulOp: crate::cpu::SimdBinaryOp<D>,
+        crate::DivOp: crate::cpu::SimdBinaryOp<D>,
+        crate::cpu::SumOp: crate::cpu::SimdReduceOp<D>,
+        crate::cpu::SqrtOp: crate::cpu::SimdUnaryOp<D>,
         B: TensorBacking<2, Elem = D>,
     {
         // Broadcast weight to input shape
@@ -87,12 +87,12 @@ where
             + std::ops::Sub<Output = D>
             + std::ops::Mul<Output = D>
             + std::ops::Div<Output = D>,
-        crate::AddOp: fusor_cpu::SimdBinaryOp<D>,
-        crate::SubOp: fusor_cpu::SimdBinaryOp<D>,
-        crate::MulOp: fusor_cpu::SimdBinaryOp<D>,
-        crate::DivOp: fusor_cpu::SimdBinaryOp<D>,
-        fusor_cpu::SumOp: fusor_cpu::SimdReduceOp<D>,
-        fusor_cpu::SqrtOp: fusor_cpu::SimdUnaryOp<D>,
+        crate::AddOp: crate::cpu::SimdBinaryOp<D>,
+        crate::SubOp: crate::cpu::SimdBinaryOp<D>,
+        crate::MulOp: crate::cpu::SimdBinaryOp<D>,
+        crate::DivOp: crate::cpu::SimdBinaryOp<D>,
+        crate::cpu::SumOp: crate::cpu::SimdReduceOp<D>,
+        crate::cpu::SqrtOp: crate::cpu::SimdUnaryOp<D>,
         B: TensorBacking<3, Elem = D>,
     {
         // Broadcast weight to input shape

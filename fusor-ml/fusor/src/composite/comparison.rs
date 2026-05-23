@@ -2,9 +2,9 @@
 //!
 //! These operations return tensors with 1.0 for true and 0.0 for false.
 
+use crate::cpu::{EqOp, GtOp, GteOp, LtOp, LteOp, NeOp, SimdBinaryOp};
+use crate::gpu::DataType;
 use crate::{SimdElement, Tensor};
-use fusor_core::DataType;
-use fusor_cpu::{EqOp, GtOp, GteOp, LtOp, LteOp, NeOp, SimdBinaryOp};
 
 impl<const R: usize, D> Tensor<R, D>
 where
@@ -99,7 +99,7 @@ where
         self.dispatch_ref(
             |t| t.as_ref().ne_scalar(scalar).to_concrete(),
             |t| {
-                let eq: fusor_core::Tensor<R, D> = t.eq(scalar);
+                let eq: crate::gpu::Tensor<R, D> = t.eq(scalar);
                 eq.eq(D::zero())
             },
         )

@@ -1,7 +1,7 @@
 //! Linear layer implementation.
 
+use crate::cpu::GgmlType;
 use crate::{CastTensor, CastTo, DataType, Device, QMatrix, SimdElement, Tensor, VarBuilder};
-use fusor_cpu::GgmlType;
 
 /// A linear (fully connected) layer with quantized weights.
 ///
@@ -71,7 +71,7 @@ impl Linear<f32> {
     /// Output shape: (batch, seq_len, out_features)
     pub fn forward<B>(&self, input: &Tensor<3, f32, B>) -> Tensor<3, f32>
     where
-        B: fusor_cpu::TensorBacking<3, Elem = f32>,
+        B: crate::cpu::TensorBacking<3, Elem = f32>,
     {
         let output = input.q_mat_mul(&self.weight);
 
@@ -94,7 +94,7 @@ where
     /// Converts input to f32 for computation, then converts back.
     pub fn forward_generic<B>(&self, input: &Tensor<3, T, B>) -> Tensor<3, T>
     where
-        B: fusor_cpu::TensorBacking<3, Elem = T>,
+        B: crate::cpu::TensorBacking<3, Elem = T>,
     {
         // Cast input to f32
         let input_f32 = input.cast::<f32>();

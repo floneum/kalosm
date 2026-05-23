@@ -1,7 +1,7 @@
 //! Dense matrix multiply program kernels.
 
-use fusor_tile_ir::tile::{Program, Storage, Tile};
-use fusor_tile_ir::{CoopElement, TileLiteral, TileReduceOp, WorkgroupAxis, F32};
+use fusor_tile_ir::tile::{CoopAcc, Program, Storage, Tile, TileBlock};
+use fusor_tile_ir::{CoopElement, TileLiteral, TileReduceOp, WorkgroupAxis, F32, U32};
 
 use crate::{
     grid::dot4_sum,
@@ -526,6 +526,47 @@ pub fn try_batched_coop_matmul<
     true
 }
 
+/// Shared pass-loop scaffolding for the coop-perf matmul variants (single-
+/// and double-buffered). For each of `N_PASSES` column sub-passes, allocates
+/// a fresh accumulator grid, runs the caller-supplied K-loop body, then
+/// cooperatively stores the result. Both variants only differ in the
+/// per-pass K-buffering body, so they share this shell.
+#[inline]
+fn coop_perf_pass_loop<T: CoopElement, F>(
+    program: &mut TileBlock<'_>,
+    n_passes: u32,
+    bn_pass: u32,
+    tile_rows_per_sg: u32,
+    tile_cols_per_sg: u32,
+    y: &Storage<T, 2>,
+    y_batch_base: &Tile<U32>,
+    row_base: &Tile<U32>,
+    col_base: &Tile<U32>,
+    sg_row_base: &Tile<U32>,
+    sg_col_base_in_pass: &Tile<U32>,
+    mut k_body: F,
+) where
+    F: FnMut(&mut TileBlock<'_>, &Tile<U32>, &[Vec<CoopAcc<T, 8, 8>>]),
+{
+    for n_pass in 0..n_passes {
+        let pass_col_base = col_base.clone() + n_pass * bn_pass;
+        let accs = zero_coop_acc_grid(program, tile_rows_per_sg, tile_cols_per_sg);
+
+        k_body(program, &pass_col_base, &accs);
+
+        coop_store_acc_grid(
+            program,
+            &accs,
+            y,
+            Some(y_batch_base),
+            row_base,
+            &pass_col_base,
+            sg_row_base,
+            sg_col_base_in_pass,
+        );
+    }
+}
+
 /// Single-buffered cooperative-matrix batched matmul. Trades load/MMA
 /// overlap for half the workgroup-memory footprint of
 /// `batched_coop_matmul_perf` — useful when the doubled tile buffers would
@@ -592,55 +633,59 @@ fn batched_coop_matmul_perf_single<
         let sg_row_base = sg_row * subgroup_rows;
         let sg_col_base_in_pass = sg_col * subgroup_cols_per_pass;
 
-        for n_pass in 0..N_PASSES {
-            let pass_col_base = col_base.clone() + n_pass * bn_pass;
-            let accs = zero_coop_acc_grid(program, tile_rows_per_sg, tile_cols_per_sg);
-
-            program.while_true(k_iterations, |program, iter_idx| {
-                let k_base = iter_idx * BK as u32;
-                program.copy_storage_to_tile(
-                    a_tile,
-                    a,
-                    a_batch_base.clone() + row_base.clone(),
-                    &k_base,
-                );
-                program.copy_storage_to_tile(
-                    b_tile,
-                    b,
-                    b_batch_base.clone() + k_base.clone(),
-                    &pass_col_base,
-                );
-                program.workgroup_barrier();
-
-                let kk_steps = (BK as u32) / COOP_DIM;
-                for kk in 0..kk_steps {
-                    let a_frags =
-                        coop_load_a_fragments(program, a_tile, &sg_row_base, kk, tile_rows_per_sg);
-                    let b_frags = coop_load_b_fragments(
-                        program,
-                        b_tile,
-                        &sg_col_base_in_pass,
-                        kk,
-                        tile_cols_per_sg,
+        coop_perf_pass_loop(
+            program,
+            N_PASSES,
+            bn_pass,
+            tile_rows_per_sg,
+            tile_cols_per_sg,
+            y,
+            &y_batch_base,
+            &row_base,
+            &col_base,
+            &sg_row_base,
+            &sg_col_base_in_pass,
+            |program, pass_col_base, accs| {
+                program.while_true(k_iterations, |program, iter_idx| {
+                    let k_base = iter_idx * BK as u32;
+                    program.copy_storage_to_tile(
+                        a_tile,
+                        a,
+                        a_batch_base.clone() + row_base.clone(),
+                        &k_base,
                     );
-                    coop_mma_grid(program, &accs, &a_frags, &b_frags);
-                }
-                // Trailing barrier required: next iter overwrites the same
-                // tile that this iter just finished reading via coop loads.
-                program.workgroup_barrier();
-            });
+                    program.copy_storage_to_tile(
+                        b_tile,
+                        b,
+                        b_batch_base.clone() + k_base.clone(),
+                        pass_col_base,
+                    );
+                    program.workgroup_barrier();
 
-            coop_store_acc_grid(
-                program,
-                &accs,
-                y,
-                Some(&y_batch_base),
-                &row_base,
-                &pass_col_base,
-                &sg_row_base,
-                &sg_col_base_in_pass,
-            );
-        }
+                    let kk_steps = (BK as u32) / COOP_DIM;
+                    for kk in 0..kk_steps {
+                        let a_frags = coop_load_a_fragments(
+                            program,
+                            a_tile,
+                            &sg_row_base,
+                            kk,
+                            tile_rows_per_sg,
+                        );
+                        let b_frags = coop_load_b_fragments(
+                            program,
+                            b_tile,
+                            &sg_col_base_in_pass,
+                            kk,
+                            tile_cols_per_sg,
+                        );
+                        coop_mma_grid(program, accs, &a_frags, &b_frags);
+                    }
+                    // Trailing barrier required: next iter overwrites the same
+                    // tile that this iter just finished reading via coop loads.
+                    program.workgroup_barrier();
+                });
+            },
+        );
     });
 }
 
@@ -723,36 +768,120 @@ fn batched_coop_matmul_perf<
         let sg_row_base = sg_row * subgroup_rows;
         let sg_col_base_in_pass = sg_col * subgroup_cols_per_pass;
 
-        for n_pass in 0..N_PASSES {
-            let pass_col_base = col_base.clone() + n_pass * bn_pass;
-            let accs = zero_coop_acc_grid(program, tile_rows_per_sg, tile_cols_per_sg);
+        coop_perf_pass_loop(
+            program,
+            N_PASSES,
+            bn_pass,
+            tile_rows_per_sg,
+            tile_cols_per_sg,
+            y,
+            &y_batch_base,
+            &row_base,
+            &col_base,
+            &sg_row_base,
+            &sg_col_base_in_pass,
+            |program, pass_col_base, accs| {
+                if k_pairs > 0 {
+                    program.while_true(k_pairs, |program, pair_idx| {
+                        let k_base_0 = pair_idx.clone() * (2 * BK as u32);
+                        let k_base_1 = pair_idx * (2 * BK as u32) + BK as u32;
+                        let kk_steps = (BK as u32) / COOP_DIM;
 
-            if k_pairs > 0 {
-                program.while_true(k_pairs, |program, pair_idx| {
-                    let k_base_0 = pair_idx.clone() * (2 * BK as u32);
-                    let k_base_1 = pair_idx * (2 * BK as u32) + BK as u32;
-                    let kk_steps = (BK as u32) / COOP_DIM;
+                        // Two-barrier K-pair shape: the load into tile_1 happens
+                        // *after* the MMA from tile_0 so the compiler can overlap
+                        // the storage→workgroup copy with the running MMAs (they
+                        // touch disjoint workgroup memory). The barrier-2 of the
+                        // next iter gates this iter's MMA reads of tile_0/tile_1
+                        // against the next iter's writes to the same tiles.
+                        program.copy_storage_to_tile(
+                            a_tile_0,
+                            a,
+                            a_batch_base.clone() + row_base.clone(),
+                            &k_base_0,
+                        );
+                        program.copy_storage_to_tile(
+                            b_tile_0,
+                            b,
+                            b_batch_base.clone() + k_base_0.clone(),
+                            pass_col_base,
+                        );
+                        program.workgroup_barrier();
 
-                    // Two-barrier K-pair shape: the load into tile_1 happens
-                    // *after* the MMA from tile_0 so the compiler can overlap
-                    // the storage→workgroup copy with the running MMAs (they
-                    // touch disjoint workgroup memory). The barrier-2 of the
-                    // next iter gates this iter's MMA reads of tile_0/tile_1
-                    // against the next iter's writes to the same tiles.
+                        for kk in 0..kk_steps {
+                            let a_frags = coop_load_a_fragments(
+                                program,
+                                a_tile_0,
+                                &sg_row_base,
+                                kk,
+                                tile_rows_per_sg,
+                            );
+                            let b_frags = coop_load_b_fragments(
+                                program,
+                                b_tile_0,
+                                &sg_col_base_in_pass,
+                                kk,
+                                tile_cols_per_sg,
+                            );
+                            coop_mma_grid(program, accs, &a_frags, &b_frags);
+                        }
+
+                        program.copy_storage_to_tile(
+                            a_tile_1,
+                            a,
+                            a_batch_base.clone() + row_base.clone(),
+                            &k_base_1,
+                        );
+                        program.copy_storage_to_tile(
+                            b_tile_1,
+                            b,
+                            b_batch_base.clone() + k_base_1.clone(),
+                            pass_col_base,
+                        );
+                        program.workgroup_barrier();
+
+                        for kk in 0..kk_steps {
+                            let a_frags = coop_load_a_fragments(
+                                program,
+                                a_tile_1,
+                                &sg_row_base,
+                                kk,
+                                tile_rows_per_sg,
+                            );
+                            let b_frags = coop_load_b_fragments(
+                                program,
+                                b_tile_1,
+                                &sg_col_base_in_pass,
+                                kk,
+                                tile_cols_per_sg,
+                            );
+                            coop_mma_grid(program, accs, &a_frags, &b_frags);
+                        }
+                        // No trailing barrier: next iter writes to tile_0 first
+                        // (different from MMA-tile_1 reads above) — barrier-2 of
+                        // the next iter (after its load_0) transitively gates
+                        // any tile_1 races.
+                    });
+                }
+
+                // Odd k_iterations: a single trailing tile after the pair loop.
+                if k_remainder == 1 {
+                    let k_base_epi =
+                        Tile::literal(TileLiteral::U32((k_iterations - 1) * BK as u32));
                     program.copy_storage_to_tile(
                         a_tile_0,
                         a,
                         a_batch_base.clone() + row_base.clone(),
-                        &k_base_0,
+                        &k_base_epi,
                     );
                     program.copy_storage_to_tile(
                         b_tile_0,
                         b,
-                        b_batch_base.clone() + k_base_0.clone(),
-                        &pass_col_base,
+                        b_batch_base.clone() + k_base_epi.clone(),
+                        pass_col_base,
                     );
                     program.workgroup_barrier();
 
+                    let kk_steps = (BK as u32) / COOP_DIM;
                     for kk in 0..kk_steps {
                         let a_frags = coop_load_a_fragments(
                             program,
@@ -768,95 +897,11 @@ fn batched_coop_matmul_perf<
                             kk,
                             tile_cols_per_sg,
                         );
-                        coop_mma_grid(program, &accs, &a_frags, &b_frags);
+                        coop_mma_grid(program, accs, &a_frags, &b_frags);
                     }
-
-                    program.copy_storage_to_tile(
-                        a_tile_1,
-                        a,
-                        a_batch_base.clone() + row_base.clone(),
-                        &k_base_1,
-                    );
-                    program.copy_storage_to_tile(
-                        b_tile_1,
-                        b,
-                        b_batch_base.clone() + k_base_1.clone(),
-                        &pass_col_base,
-                    );
                     program.workgroup_barrier();
-
-                    for kk in 0..kk_steps {
-                        let a_frags = coop_load_a_fragments(
-                            program,
-                            a_tile_1,
-                            &sg_row_base,
-                            kk,
-                            tile_rows_per_sg,
-                        );
-                        let b_frags = coop_load_b_fragments(
-                            program,
-                            b_tile_1,
-                            &sg_col_base_in_pass,
-                            kk,
-                            tile_cols_per_sg,
-                        );
-                        coop_mma_grid(program, &accs, &a_frags, &b_frags);
-                    }
-                    // No trailing barrier: next iter writes to tile_0 first
-                    // (different from MMA-tile_1 reads above) — barrier-2 of
-                    // the next iter (after its load_0) transitively gates
-                    // any tile_1 races.
-                });
-            }
-
-            // Odd k_iterations: a single trailing tile after the pair loop.
-            if k_remainder == 1 {
-                let k_base_epi = Tile::literal(TileLiteral::U32((k_iterations - 1) * BK as u32));
-                program.copy_storage_to_tile(
-                    a_tile_0,
-                    a,
-                    a_batch_base.clone() + row_base.clone(),
-                    &k_base_epi,
-                );
-                program.copy_storage_to_tile(
-                    b_tile_0,
-                    b,
-                    b_batch_base.clone() + k_base_epi.clone(),
-                    &pass_col_base,
-                );
-                program.workgroup_barrier();
-
-                let kk_steps = (BK as u32) / COOP_DIM;
-                for kk in 0..kk_steps {
-                    let a_frags = coop_load_a_fragments(
-                        program,
-                        a_tile_0,
-                        &sg_row_base,
-                        kk,
-                        tile_rows_per_sg,
-                    );
-                    let b_frags = coop_load_b_fragments(
-                        program,
-                        b_tile_0,
-                        &sg_col_base_in_pass,
-                        kk,
-                        tile_cols_per_sg,
-                    );
-                    coop_mma_grid(program, &accs, &a_frags, &b_frags);
                 }
-                program.workgroup_barrier();
-            }
-
-            coop_store_acc_grid(
-                program,
-                &accs,
-                y,
-                Some(&y_batch_base),
-                &row_base,
-                &pass_col_base,
-                &sg_row_base,
-                &sg_col_base_in_pass,
-            );
-        }
+            },
+        );
     });
 }

@@ -1,11 +1,11 @@
 //! Rotary Position Embeddings (RoPE) that work on both CPU and GPU backends.
 
+use crate::cpu::FloatOps;
+use crate::gpu::{DataType, FloatDataType};
 use crate::{
     AddOp, ConcreteTensor, Device, MulOp, NegOp, SimdBinaryOp, SimdElement, SimdUnaryOp, SubOp,
     Tensor,
 };
-use fusor_core::{DataType, FloatDataType};
-use fusor_cpu::FloatOps;
 
 fn rotate_half<D>(xs: &Tensor<4, D, ConcreteTensor<D, 4>>) -> Tensor<4, D, ConcreteTensor<D, 4>>
 where

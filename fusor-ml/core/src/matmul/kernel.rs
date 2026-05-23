@@ -210,7 +210,11 @@ impl MatMulOperation {
         } else {
             DirectTileCoopMatmulVariant::None
         };
-        let use_shared_tile = m.is_multiple_of(32) && n.is_multiple_of(32) && k.is_multiple_of(8);
+        // The shared-tile kernel uses `div_ceil` for tile counts and
+        // bounds-checks both A/B loads and Y stores, so it is correct for any
+        // M/N/K. The register-tile path is only worth the fixed-overhead win
+        // for shapes too small to amortize the workgroup-memory tile.
+        let use_shared_tile = m >= 32 && n >= 32 && k >= 8;
         let max_wg_per_dim = device.limits().max_compute_workgroups_per_dimension;
         let datatype = self.datatype;
         let ir =

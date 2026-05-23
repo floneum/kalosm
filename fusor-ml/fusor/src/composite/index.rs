@@ -3,8 +3,8 @@
 //! This module provides PyTorch-style tensor indexing via the `i()` method.
 //! Example: `tensor.i((.., 0, ..))` to select a specific index along one dimension.
 
+use crate::gpu::DataType;
 use crate::{ConcreteTensor, SimdElement, Tensor};
-use fusor_core::DataType;
 use std::ops::{Range, RangeFrom, RangeFull, RangeTo};
 
 /// Helper enum for flexible indexing (range or single index)
@@ -106,8 +106,8 @@ where
     D: SimdElement + DataType + Default,
     I1: Into<IndexOp>,
     I2: Into<IndexOp>,
-    fusor_cpu::ConcreteTensor<D, 2>: fusor_cpu::LastRank<1, D>,
-    fusor_core::Tensor<2, D>: fusor_core::LastRank<1, D>,
+    crate::cpu::ConcreteTensor<D, 2>: crate::cpu::LastRank<1, D>,
+    crate::gpu::Tensor<2, D>: crate::gpu::LastRank<1, D>,
 {
     type Output = Tensor<1, D>;
 
@@ -129,8 +129,8 @@ where
     I1: Into<IndexOp>,
     I2: Into<IndexOp>,
     I3: Into<IndexOp>,
-    fusor_cpu::ConcreteTensor<D, 3>: fusor_cpu::LastRank<2, D>,
-    fusor_core::Tensor<3, D>: fusor_core::LastRank<2, D>,
+    crate::cpu::ConcreteTensor<D, 3>: crate::cpu::LastRank<2, D>,
+    crate::gpu::Tensor<3, D>: crate::gpu::LastRank<2, D>,
 {
     type Output = Tensor<2, D>;
 
@@ -158,8 +158,8 @@ where
     I2: Into<IndexOp>,
     I3: Into<IndexOp>,
     I4: Into<IndexOp>,
-    fusor_cpu::ConcreteTensor<D, 4>: fusor_cpu::LastRank<3, D>,
-    fusor_core::Tensor<4, D>: fusor_core::LastRank<3, D>,
+    crate::cpu::ConcreteTensor<D, 4>: crate::cpu::LastRank<3, D>,
+    crate::gpu::Tensor<4, D>: crate::gpu::LastRank<3, D>,
 {
     type Output = Tensor<3, D>;
 

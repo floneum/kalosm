@@ -1,7 +1,7 @@
 //! KV cache implementation for attention layers.
 
+use crate::gpu::DataType;
 use crate::{ConcreteTensor, Device, SimdElement, Tensor};
-use fusor_core::DataType;
 
 use super::TensorCache;
 
@@ -16,7 +16,7 @@ pub struct KvCache<D: SimdElement> {
 
 impl<D: SimdElement + DataType + Default> KvCache<D>
 where
-    crate::AddOp: fusor_cpu::SimdBinaryOp<D>,
+    crate::AddOp: crate::cpu::SimdBinaryOp<D>,
 {
     /// Create a new KV cache
     ///

@@ -62,14 +62,14 @@ kalosm-sound = { path = "./interfaces/kalosm-sound", version = "0.4.0", default-
 kalosm-vision = { path = "./interfaces/kalosm-vision", version = "0.4.0", default-features = false }
 kalosm-learning = { path = "./interfaces/kalosm-learning", version = "0.4.0" }
 kalosm-learning-macro = { path = "./interfaces/kalosm-learning-macro", version = "0.4.0" }
-rbert = { path = "./models/rbert", version = "0.4.0" }
-kalosm-llama = { path = "./models/kalosm-llama", version = "0.4.0" }
+rbert = { path = "./models/rbert", version = "0.4.0", default-features = false }
+kalosm-llama = { path = "./models/kalosm-llama", version = "0.4.0", default-features = false }
 kalosm-tokenizer = { path = "./models/kalosm-tokenizer", version = "0.4.0" }
-rwhisper = { path = "./models/rwhisper", version = "0.4.0" }
+rwhisper = { path = "./models/rwhisper", version = "0.4.0", default-features = false }
 rwuerstchen = { path = "./models/rwuerstchen", version = "0.4.0" }
 segment-anything-rs = { path = "./models/segment-anything-rs", version = "0.4.0" }
 kalosm-ocr = { path = "./models/kalosm-ocr", version = "0.4.0" }
-fusor = { path = "./fusor-ml/fusor", version = "0.1.0" }
+fusor = { path = "./fusor-ml/fusor", version = "0.1.0", default-features = false }
 fusor-core = { path = "./fusor-ml/core", version = "0.1.0" }
 fusor-gguf = { path = "./fusor-ml/gguf", version = "0.1.0" }
 fusor-tile-ir = { path = "./fusor-ml/tile-ir", version = "0.1.0" }
@@ -100,7 +100,9 @@ tokio = { version = "1", features = ["macros", "net", "rt-multi-thread"], option
 tracing-subscriber = { version = "0.2", optional = true }
 
 [features]
-default = []
+default = ["cpu", "gpu"]
+cpu = ["kalosm/cpu", "kalosm-language?/cpu"]
+gpu = ["kalosm/gpu", "kalosm-language?/gpu"]
 full = [
     "bert",
     "llama-vision",

@@ -1,13 +1,13 @@
 //! Normalization operations that work on both CPU and GPU backends.
 
+use crate::cpu::{LastRank as CpuLastRank, MaxOp, SimdReduceOp, SumOp, TensorBacking};
+use crate::gpu::{
+    DataType, FloatDataType, LastRank as GpuLastRank, NextRankInner as GpuNextRankInner,
+};
 use crate::{
     AddOp, ConcreteTensor, DivOp, ExpOp, FloatOps, MulOp, SimdBinaryOp, SimdElement, SimdUnaryOp,
     SqrtOp, SubOp, Tensor,
 };
-use fusor_core::{
-    DataType, FloatDataType, LastRank as GpuLastRank, NextRankInner as GpuNextRankInner,
-};
-use fusor_cpu::{LastRank as CpuLastRank, MaxOp, SimdReduceOp, SumOp, TensorBacking};
 
 impl<const R: usize, D, B> Tensor<R, D, B>
 where
@@ -22,11 +22,11 @@ where
     pub fn softmax<const OUT_RANK: usize>(&self, axis: usize) -> Tensor<R, D>
     where
         ConcreteTensor<D, R>: CpuLastRank<OUT_RANK, D>,
-        fusor_core::Tensor<R, D>: GpuLastRank<OUT_RANK, D>,
-        fusor_core::Tensor<R, f32>: GpuLastRank<OUT_RANK, f32>,
-        fusor_core::Tensor<R, f32>: GpuLastRank<OUT_RANK, f32>,
-        <fusor_core::Tensor<R, D> as fusor_core::LastRankInner>::LastRank:
-            GpuNextRankInner<NextRank = fusor_core::Tensor<R, D>>,
+        crate::gpu::Tensor<R, D>: GpuLastRank<OUT_RANK, D>,
+        crate::gpu::Tensor<R, f32>: GpuLastRank<OUT_RANK, f32>,
+        crate::gpu::Tensor<R, f32>: GpuLastRank<OUT_RANK, f32>,
+        <crate::gpu::Tensor<R, D> as crate::gpu::LastRankInner>::LastRank:
+            GpuNextRankInner<NextRank = crate::gpu::Tensor<R, D>>,
         MaxOp: SimdReduceOp<D>,
         SumOp: SimdReduceOp<D>,
         D: std::ops::Sub<Output = D> + std::ops::Div<Output = D>,
@@ -47,10 +47,10 @@ where
     pub fn softmax_last_dim<const OUT_RANK: usize>(&self) -> Tensor<R, D>
     where
         ConcreteTensor<D, R>: CpuLastRank<OUT_RANK, D>,
-        fusor_core::Tensor<R, D>: GpuLastRank<OUT_RANK, D>,
-        fusor_core::Tensor<R, f32>: GpuLastRank<OUT_RANK, f32>,
-        <fusor_core::Tensor<R, D> as fusor_core::LastRankInner>::LastRank:
-            GpuNextRankInner<NextRank = fusor_core::Tensor<R, D>>,
+        crate::gpu::Tensor<R, D>: GpuLastRank<OUT_RANK, D>,
+        crate::gpu::Tensor<R, f32>: GpuLastRank<OUT_RANK, f32>,
+        <crate::gpu::Tensor<R, D> as crate::gpu::LastRankInner>::LastRank:
+            GpuNextRankInner<NextRank = crate::gpu::Tensor<R, D>>,
         MaxOp: SimdReduceOp<D>,
         SumOp: SimdReduceOp<D>,
         D: std::ops::Sub<Output = D> + std::ops::Div<Output = D>,
@@ -68,10 +68,10 @@ where
     pub fn softmax_slow<const OUT_RANK: usize>(&self, axis: usize) -> Tensor<R, D>
     where
         ConcreteTensor<D, R>: CpuLastRank<OUT_RANK, D>,
-        fusor_core::Tensor<R, D>: GpuLastRank<OUT_RANK, D>,
-        fusor_core::Tensor<R, f32>: GpuLastRank<OUT_RANK, f32>,
-        <fusor_core::Tensor<R, D> as fusor_core::LastRankInner>::LastRank:
-            GpuNextRankInner<NextRank = fusor_core::Tensor<R, D>>,
+        crate::gpu::Tensor<R, D>: GpuLastRank<OUT_RANK, D>,
+        crate::gpu::Tensor<R, f32>: GpuLastRank<OUT_RANK, f32>,
+        <crate::gpu::Tensor<R, D> as crate::gpu::LastRankInner>::LastRank:
+            GpuNextRankInner<NextRank = crate::gpu::Tensor<R, D>>,
         MaxOp: SimdReduceOp<D>,
         SumOp: SimdReduceOp<D>,
         D: std::ops::Sub<Output = D> + std::ops::Div<Output = D>,
@@ -89,10 +89,10 @@ where
     pub fn softmax_slow_last_dim<const OUT_RANK: usize>(&self) -> Tensor<R, D>
     where
         ConcreteTensor<D, R>: CpuLastRank<OUT_RANK, D>,
-        fusor_core::Tensor<R, D>: GpuLastRank<OUT_RANK, D>,
-        fusor_core::Tensor<R, f32>: GpuLastRank<OUT_RANK, f32>,
-        <fusor_core::Tensor<R, D> as fusor_core::LastRankInner>::LastRank:
-            GpuNextRankInner<NextRank = fusor_core::Tensor<R, D>>,
+        crate::gpu::Tensor<R, D>: GpuLastRank<OUT_RANK, D>,
+        crate::gpu::Tensor<R, f32>: GpuLastRank<OUT_RANK, f32>,
+        <crate::gpu::Tensor<R, D> as crate::gpu::LastRankInner>::LastRank:
+            GpuNextRankInner<NextRank = crate::gpu::Tensor<R, D>>,
         MaxOp: SimdReduceOp<D>,
         SumOp: SimdReduceOp<D>,
         D: std::ops::Sub<Output = D> + std::ops::Div<Output = D>,
@@ -107,9 +107,9 @@ where
     fn softmax_cpu_impl<const OUT_RANK: usize>(&self, axis: usize) -> Tensor<R, D>
     where
         ConcreteTensor<D, R>: CpuLastRank<OUT_RANK, D>,
-        fusor_core::Tensor<R, D>: GpuLastRank<OUT_RANK, D>,
-        <fusor_core::Tensor<R, D> as fusor_core::LastRankInner>::LastRank:
-            GpuNextRankInner<NextRank = fusor_core::Tensor<R, D>>,
+        crate::gpu::Tensor<R, D>: GpuLastRank<OUT_RANK, D>,
+        <crate::gpu::Tensor<R, D> as crate::gpu::LastRankInner>::LastRank:
+            GpuNextRankInner<NextRank = crate::gpu::Tensor<R, D>>,
         MaxOp: SimdReduceOp<D>,
         SumOp: SimdReduceOp<D>,
         D: std::ops::Sub<Output = D> + std::ops::Div<Output = D>,
@@ -152,9 +152,9 @@ where
     ) -> Tensor<R, D>
     where
         ConcreteTensor<D, R>: CpuLastRank<OUT_RANK, D>,
-        fusor_core::Tensor<R, D>: GpuLastRank<OUT_RANK, D>,
-        <fusor_core::Tensor<R, D> as fusor_core::LastRankInner>::LastRank:
-            GpuNextRankInner<NextRank = fusor_core::Tensor<R, D>>,
+        crate::gpu::Tensor<R, D>: GpuLastRank<OUT_RANK, D>,
+        <crate::gpu::Tensor<R, D> as crate::gpu::LastRankInner>::LastRank:
+            GpuNextRankInner<NextRank = crate::gpu::Tensor<R, D>>,
         SumOp: SimdReduceOp<D>,
         D: std::ops::Mul<Output = D> + std::ops::Div<Output = D> + std::ops::Add<Output = D>,
         MulOp: SimdBinaryOp<D>,
@@ -206,9 +206,9 @@ where
     ) -> Tensor<R, D>
     where
         ConcreteTensor<D, R>: CpuLastRank<OUT_RANK, D>,
-        fusor_core::Tensor<R, D>: GpuLastRank<OUT_RANK, D>,
-        <fusor_core::Tensor<R, D> as fusor_core::LastRankInner>::LastRank:
-            GpuNextRankInner<NextRank = fusor_core::Tensor<R, D>>,
+        crate::gpu::Tensor<R, D>: GpuLastRank<OUT_RANK, D>,
+        <crate::gpu::Tensor<R, D> as crate::gpu::LastRankInner>::LastRank:
+            GpuNextRankInner<NextRank = crate::gpu::Tensor<R, D>>,
         SumOp: SimdReduceOp<D>,
         D: std::ops::Mul<Output = D>
             + std::ops::Div<Output = D>
@@ -292,21 +292,21 @@ where
     ) -> Tensor<R, D>
     where
         ConcreteTensor<D, R>: CpuLastRank<OUT_RANK, D>,
-        fusor_core::Tensor<R, D>: GpuLastRank<OUT_RANK, D>,
-        fusor_core::Tensor<R, f32>: GpuLastRank<OUT_RANK, f32>,
-        <fusor_core::Tensor<R, D> as fusor_core::LastRankInner>::LastRank:
-            GpuNextRankInner<NextRank = fusor_core::Tensor<R, D>>,
+        crate::gpu::Tensor<R, D>: GpuLastRank<OUT_RANK, D>,
+        crate::gpu::Tensor<R, f32>: GpuLastRank<OUT_RANK, f32>,
+        <crate::gpu::Tensor<R, D> as crate::gpu::LastRankInner>::LastRank:
+            GpuNextRankInner<NextRank = crate::gpu::Tensor<R, D>>,
         SumOp: SimdReduceOp<D>,
         D: std::ops::Mul<Output = D>
             + std::ops::Div<Output = D>
             + std::ops::Add<Output = D>
-            + fusor_core::CastTensor<f32>,
-        f32: fusor_core::CastTensor<D>,
+            + crate::gpu::CastTensor<f32>,
+        f32: crate::gpu::CastTensor<D>,
         MulOp: SimdBinaryOp<D>,
         DivOp: SimdBinaryOp<D>,
         AddOp: SimdBinaryOp<D>,
         SqrtOp: SimdUnaryOp<D>,
-        (fusor_core::Tensor<R, D>, fusor_core::Tensor<W, D>): fusor_core::MaxRank<R, D>,
+        (crate::gpu::Tensor<R, D>, crate::gpu::Tensor<W, D>): crate::gpu::MaxRank<R, D>,
     {
         match (self, weight, bias) {
             // GPU path - use the optimized fused kernel
@@ -333,21 +333,21 @@ where
     ) -> Tensor<R, D>
     where
         ConcreteTensor<D, R>: CpuLastRank<OUT_RANK, D>,
-        fusor_core::Tensor<R, D>: GpuLastRank<OUT_RANK, D>,
-        fusor_core::Tensor<R, f32>: GpuLastRank<OUT_RANK, f32>,
-        <fusor_core::Tensor<R, D> as fusor_core::LastRankInner>::LastRank:
-            GpuNextRankInner<NextRank = fusor_core::Tensor<R, D>>,
+        crate::gpu::Tensor<R, D>: GpuLastRank<OUT_RANK, D>,
+        crate::gpu::Tensor<R, f32>: GpuLastRank<OUT_RANK, f32>,
+        <crate::gpu::Tensor<R, D> as crate::gpu::LastRankInner>::LastRank:
+            GpuNextRankInner<NextRank = crate::gpu::Tensor<R, D>>,
         SumOp: SimdReduceOp<D>,
         D: std::ops::Mul<Output = D>
             + std::ops::Div<Output = D>
             + std::ops::Add<Output = D>
-            + fusor_core::CastTensor<f32>,
-        f32: fusor_core::CastTensor<D>,
+            + crate::gpu::CastTensor<f32>,
+        f32: crate::gpu::CastTensor<D>,
         MulOp: SimdBinaryOp<D>,
         DivOp: SimdBinaryOp<D>,
         AddOp: SimdBinaryOp<D>,
         SqrtOp: SimdUnaryOp<D>,
-        (fusor_core::Tensor<R, D>, fusor_core::Tensor<W, D>): fusor_core::MaxRank<R, D>,
+        (crate::gpu::Tensor<R, D>, crate::gpu::Tensor<W, D>): crate::gpu::MaxRank<R, D>,
     {
         self.rms_norm_fused::<W, OUT_RANK>(weight, None, eps)
     }
@@ -362,22 +362,22 @@ where
     ) -> Tensor<R, D>
     where
         ConcreteTensor<D, R>: CpuLastRank<OUT_RANK, D>,
-        fusor_core::Tensor<R, D>: GpuLastRank<OUT_RANK, D>,
-        fusor_core::Tensor<R, f32>: GpuLastRank<OUT_RANK, f32>,
-        <fusor_core::Tensor<R, D> as fusor_core::LastRankInner>::LastRank:
-            GpuNextRankInner<NextRank = fusor_core::Tensor<R, D>>,
+        crate::gpu::Tensor<R, D>: GpuLastRank<OUT_RANK, D>,
+        crate::gpu::Tensor<R, f32>: GpuLastRank<OUT_RANK, f32>,
+        <crate::gpu::Tensor<R, D> as crate::gpu::LastRankInner>::LastRank:
+            GpuNextRankInner<NextRank = crate::gpu::Tensor<R, D>>,
         SumOp: SimdReduceOp<D>,
         D: std::ops::Mul<Output = D>
             + std::ops::Div<Output = D>
             + std::ops::Add<Output = D>
-            + fusor_core::CastTensor<f32>,
-        f32: fusor_core::CastTensor<D>,
+            + crate::gpu::CastTensor<f32>,
+        f32: crate::gpu::CastTensor<D>,
         MulOp: SimdBinaryOp<D>,
         DivOp: SimdBinaryOp<D>,
         AddOp: SimdBinaryOp<D>,
         SqrtOp: SimdUnaryOp<D>,
         B2: TensorBacking<R, Elem = D>,
-        (fusor_core::Tensor<R, D>, fusor_core::Tensor<W, D>): fusor_core::MaxRank<R, D>,
+        (crate::gpu::Tensor<R, D>, crate::gpu::Tensor<W, D>): crate::gpu::MaxRank<R, D>,
     {
         match (self, residual, weight, bias) {
             (Tensor::Gpu(input), Tensor::Gpu(gpu_residual), Tensor::Gpu(gpu_weight), bias_opt) => {
@@ -409,9 +409,9 @@ where
     ) -> Tensor<R, D>
     where
         ConcreteTensor<D, R>: CpuLastRank<OUT_RANK, D>,
-        fusor_core::Tensor<R, D>: GpuLastRank<OUT_RANK, D>,
-        <fusor_core::Tensor<R, D> as fusor_core::LastRankInner>::LastRank:
-            GpuNextRankInner<NextRank = fusor_core::Tensor<R, D>>,
+        crate::gpu::Tensor<R, D>: GpuLastRank<OUT_RANK, D>,
+        <crate::gpu::Tensor<R, D> as crate::gpu::LastRankInner>::LastRank:
+            GpuNextRankInner<NextRank = crate::gpu::Tensor<R, D>>,
         SumOp: SimdReduceOp<D>,
         D: std::ops::Mul<Output = D> + std::ops::Div<Output = D> + std::ops::Add<Output = D>,
         MulOp: SimdBinaryOp<D>,
@@ -464,7 +464,7 @@ where
 impl<const R: usize, B> Tensor<R, f32, B>
 where
     B: TensorBacking<R, Elem = f32>,
-    fusor_core::Tensor<R, f32>: fusor_core::LastRankInner,
+    crate::gpu::Tensor<R, f32>: crate::gpu::LastRankInner,
 {
     /// Optimized fused layer norm along the last dimension for f32.
     ///
@@ -481,9 +481,9 @@ where
     ) -> Tensor<R, f32>
     where
         ConcreteTensor<f32, R>: CpuLastRank<OUT_RANK, f32>,
-        fusor_core::Tensor<R, f32>: GpuLastRank<OUT_RANK, f32>,
-        <fusor_core::Tensor<R, f32> as fusor_core::LastRankInner>::LastRank:
-            GpuNextRankInner<NextRank = fusor_core::Tensor<R, f32>>,
+        crate::gpu::Tensor<R, f32>: GpuLastRank<OUT_RANK, f32>,
+        <crate::gpu::Tensor<R, f32> as crate::gpu::LastRankInner>::LastRank:
+            GpuNextRankInner<NextRank = crate::gpu::Tensor<R, f32>>,
         SumOp: SimdReduceOp<f32>,
         AddOp: SimdBinaryOp<f32>,
         SubOp: SimdBinaryOp<f32>,
@@ -523,13 +523,13 @@ where
                     }
                     None => None,
                 };
-                let result = fusor_cpu::layer_norm_last_dim_fused(
+                let result = crate::cpu::layer_norm_last_dim_fused(
                     input.inner(),
                     weight.inner(),
                     bias.as_ref().map(|bias| bias.inner()),
                     eps,
                 );
-                Tensor::Cpu(fusor_cpu::Tensor::new(result))
+                Tensor::Cpu(crate::cpu::Tensor::new(result))
             }
             (Tensor::Gpu(_), Tensor::Gpu(_)) => {
                 if matches!(bias, Some(Tensor::Cpu(_))) {
@@ -553,14 +553,14 @@ where
     /// pass through memory, which is significantly faster for large tensors.
     pub fn softmax_last_dim_fused<const OUT_RANK: usize>(&self) -> Tensor<R, f32>
     where
-        fusor_core::Tensor<R, f32>: fusor_core::LastRank<OUT_RANK, f32>,
+        crate::gpu::Tensor<R, f32>: crate::gpu::LastRank<OUT_RANK, f32>,
     {
         self.dispatch_ref(
             |t| {
                 // Make contiguous if needed, then use fused kernel
                 let contiguous = t.as_ref().make_contiguous();
-                let result = fusor_cpu::softmax_last_dim_fused(contiguous.inner());
-                fusor_cpu::Tensor::new(result)
+                let result = crate::cpu::softmax_last_dim_fused(contiguous.inner());
+                crate::cpu::Tensor::new(result)
             },
             |t| t.softmax_last_dim::<OUT_RANK>(),
         )

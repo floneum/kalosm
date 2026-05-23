@@ -1,11 +1,11 @@
 //! Flash attention operations that work on both CPU and GPU backends.
 
+use crate::cpu::{MatmulImpl, MaxOp, SimdReduceOp, SumOp};
+use crate::gpu::{DataType, FloatDataType};
 use crate::{
     AddOp, ConcreteTensor, DivOp, ExpOp, FloatOps, MulOp, SimdBinaryOp, SimdElement, SimdUnaryOp,
     SubOp, Tensor,
 };
-use fusor_core::{DataType, FloatDataType};
-use fusor_cpu::{MatmulImpl, MaxOp, SimdReduceOp, SumOp};
 
 /// Describes how to interpret a 2D attention mask.
 #[derive(Debug, Clone, Copy)]
@@ -59,6 +59,7 @@ where
     ) -> Self {
         match (self, k, v) {
             // GPU path - use the optimized fused kernel (QKMask only)
+            #[cfg(feature = "gpu")]
             (Tensor::Gpu(q), Tensor::Gpu(k), Tensor::Gpu(v))
                 if !matches!(mask, Some((_, MaskKind::BatchKeyMask))) =>
             {
@@ -215,7 +216,8 @@ where
     }
 }
 
-fn tensor4_to_cpu<D>(tensor: &fusor_core::Tensor<4, D>) -> Tensor<4, D>
+#[cfg(feature = "gpu")]
+fn tensor4_to_cpu<D>(tensor: &crate::gpu::Tensor<4, D>) -> Tensor<4, D>
 where
     D: SimdElement + DataType + Copy,
 {
@@ -231,10 +233,11 @@ where
             }
         }
     }
-    Tensor::Cpu(fusor_cpu::Tensor::from_slice(shape, &values))
+    Tensor::Cpu(crate::cpu::Tensor::from_slice(shape, &values))
 }
 
-fn tensor4_to_gpu<D>(tensor: Tensor<4, D>, device: &fusor_core::Device) -> Tensor<4, D>
+#[cfg(feature = "gpu")]
+fn tensor4_to_gpu<D>(tensor: Tensor<4, D>, device: &crate::gpu::Device) -> Tensor<4, D>
 where
     D: SimdElement + DataType + Copy,
 {
@@ -253,10 +256,11 @@ where
             }
         }
     }
-    Tensor::Gpu(fusor_core::Tensor::from_slice(device, shape, &values))
+    Tensor::Gpu(crate::gpu::Tensor::from_slice(device, shape, &values))
 }
 
-fn tensor2_to_cpu<D>(tensor: &fusor_core::Tensor<2, D>) -> Tensor<2, D>
+#[cfg(feature = "gpu")]
+fn tensor2_to_cpu<D>(tensor: &crate::gpu::Tensor<2, D>) -> Tensor<2, D>
 where
     D: SimdElement + DataType + Copy,
 {
@@ -268,5 +272,5 @@ where
             values.push(slice[[row, col]]);
         }
     }
-    Tensor::Cpu(fusor_cpu::Tensor::from_slice(shape, &values))
+    Tensor::Cpu(crate::cpu::Tensor::from_slice(shape, &values))
 }

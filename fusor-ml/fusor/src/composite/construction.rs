@@ -1,7 +1,7 @@
 //! Construction operations that work on both CPU and GPU backends.
 
+use crate::gpu::DataType;
 use crate::{Device, SimdElement, Tensor};
-use fusor_core::DataType;
 use fusor_types::FromArray;
 
 impl<const R: usize, D, T> FromArray<R, D, T, Device> for Tensor<R, D>
@@ -41,9 +41,9 @@ where
         let total_elements: usize = shape.iter().product();
         assert_eq!(data.len(), total_elements, "Data length must match shape");
         match device {
-            Device::Cpu => Tensor::Cpu(fusor_cpu::Tensor::from_slice(shape, data)),
+            Device::Cpu => Tensor::Cpu(crate::cpu::Tensor::from_slice(shape, data)),
             Device::Gpu(gpu_device) => {
-                Tensor::Gpu(fusor_core::Tensor::from_slice(gpu_device, shape, data))
+                Tensor::Gpu(crate::gpu::Tensor::from_slice(gpu_device, shape, data))
             }
         }
     }
@@ -64,10 +64,10 @@ where
         match device {
             Device::Cpu => {
                 let data = vec![value; shape.iter().product()];
-                Tensor::Cpu(fusor_cpu::Tensor::from_slice(shape, &data))
+                Tensor::Cpu(crate::cpu::Tensor::from_slice(shape, &data))
             }
             Device::Gpu(gpu_device) => {
-                Tensor::Gpu(fusor_core::Tensor::splat(gpu_device, value, shape))
+                Tensor::Gpu(crate::gpu::Tensor::splat(gpu_device, value, shape))
             }
         }
     }

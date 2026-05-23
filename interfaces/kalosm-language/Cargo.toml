@@ -28,8 +28,8 @@ kalosm-language-model = { workspace = true }
 headless_chrome = { version = "1.0", optional = true }
 tokio-util = { version = "0.7.9", features = ["rt"], optional = true }
 dashmap = { version = "5.5.3", optional = true }
-rbert = { workspace = true, optional = true }
-kalosm-llama = { workspace = true, optional = true }
+rbert = { workspace = true, optional = true, default-features = false }
+kalosm-llama = { workspace = true, optional = true, default-features = false }
 kalosm-streams.workspace = true
 pulldown-cmark = { version = "0.9.3", optional = true }
 docx-rs = { version = "0.4.7", optional = true }
@@ -46,7 +46,9 @@ anyhow = { workspace = true, optional = true }
 roaring = { version = "0.10.6", optional = true }
 
 [features]
-default = []
+default = ["cpu", "gpu"]
+cpu = ["kalosm-llama?/cpu", "rbert?/cpu"]
+gpu = ["kalosm-llama?/gpu", "rbert?/gpu"]
 tokio = ["dep:tokio"]
 metal = []
 cublas = []

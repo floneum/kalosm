@@ -3,12 +3,12 @@
 //! This module provides `QMatrix`, a runtime dispatch enum that holds either CPU
 //! quantized tensors (`QuantizedTensor`) or GPU quantized matrices (`QMatrix`).
 
-use crate::{Device, Tensor};
-use fusor_core::QMatrix as GpuQMatrix;
-use fusor_cpu::{
+use crate::cpu::{
     ABox, AVec, BlockQ4_0, BlockQ4K, BlockQ5_0, BlockQ5K, BlockQ6K, BlockQ8_0, GgmlType, Layout,
     QuantizedTensor,
 };
+use crate::gpu::QMatrix as GpuQMatrix;
+use crate::{Device, Tensor};
 use half::f16;
 
 /// CPU tensor with F32 data (not quantized).
@@ -185,7 +185,7 @@ impl QMatrix {
         shape: impl Into<Box<[usize]>>,
         bytes: &[u8],
         ty: GgmlType,
-    ) -> Result<Self, fusor_core::GgufReadError> {
+    ) -> Result<Self, crate::gpu::GgufReadError> {
         let shape = shape.into();
         match device {
             Device::Cpu => Ok(match ty {
@@ -232,12 +232,12 @@ impl QMatrix {
     /// Panics if the tensor's rank doesn't match R.
     pub fn dequantize<const R: usize>(&self) -> Tensor<R, f32> {
         match self {
-            QMatrix::CpuQ4_0(t) => Tensor::Cpu(fusor_cpu::Tensor::new(t.dequantize::<R>())),
-            QMatrix::CpuQ5_0(t) => Tensor::Cpu(fusor_cpu::Tensor::new(t.dequantize::<R>())),
-            QMatrix::CpuQ8_0(t) => Tensor::Cpu(fusor_cpu::Tensor::new(t.dequantize::<R>())),
-            QMatrix::CpuQ4K(t) => Tensor::Cpu(fusor_cpu::Tensor::new(t.dequantize::<R>())),
-            QMatrix::CpuQ5K(t) => Tensor::Cpu(fusor_cpu::Tensor::new(t.dequantize::<R>())),
-            QMatrix::CpuQ6K(t) => Tensor::Cpu(fusor_cpu::Tensor::new(t.dequantize::<R>())),
+            QMatrix::CpuQ4_0(t) => Tensor::Cpu(crate::cpu::Tensor::new(t.dequantize::<R>())),
+            QMatrix::CpuQ5_0(t) => Tensor::Cpu(crate::cpu::Tensor::new(t.dequantize::<R>())),
+            QMatrix::CpuQ8_0(t) => Tensor::Cpu(crate::cpu::Tensor::new(t.dequantize::<R>())),
+            QMatrix::CpuQ4K(t) => Tensor::Cpu(crate::cpu::Tensor::new(t.dequantize::<R>())),
+            QMatrix::CpuQ5K(t) => Tensor::Cpu(crate::cpu::Tensor::new(t.dequantize::<R>())),
+            QMatrix::CpuQ6K(t) => Tensor::Cpu(crate::cpu::Tensor::new(t.dequantize::<R>())),
             QMatrix::CpuF32(t) => {
                 let shape = t.shape();
                 assert_eq!(
@@ -248,11 +248,11 @@ impl QMatrix {
                     R
                 );
                 let arr_shape: [usize; R] = shape.try_into().unwrap();
-                let concrete = fusor_cpu::ConcreteTensor::from_parts(
+                let concrete = crate::cpu::ConcreteTensor::from_parts(
                     Layout::contiguous(&arr_shape),
                     t.data().clone(),
                 );
-                Tensor::Cpu(fusor_cpu::Tensor::new(concrete))
+                Tensor::Cpu(crate::cpu::Tensor::new(concrete))
             }
             QMatrix::CpuF16(t) => {
                 let shape = t.shape();
@@ -268,11 +268,11 @@ impl QMatrix {
                 let f32_data: Vec<f32> = t.data().iter().map(|v| v.to_f32()).collect();
                 let mut data = AVec::<f32>::with_capacity(64, f32_data.len());
                 data.extend_from_slice(&f32_data);
-                let concrete = fusor_cpu::ConcreteTensor::from_parts(
+                let concrete = crate::cpu::ConcreteTensor::from_parts(
                     Layout::contiguous(&arr_shape),
                     data.into_boxed_slice(),
                 );
-                Tensor::Cpu(fusor_cpu::Tensor::new(concrete))
+                Tensor::Cpu(crate::cpu::Tensor::new(concrete))
             }
             QMatrix::Gpu(m) => Tensor::Gpu(m.dequantize()),
         }

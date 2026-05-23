@@ -1,8 +1,8 @@
 //! Conv1d layer implementation.
 
+use crate::cpu::FloatOps;
+use crate::gpu::{DataType, FloatDataType};
 use crate::{ConcreteTensor, MatmulImpl, SimdElement, Tensor};
-use fusor_core::{DataType, FloatDataType};
-use fusor_cpu::FloatOps;
 
 /// Configuration for Conv1d layer.
 #[derive(Debug, Clone, Copy)]
@@ -95,9 +95,9 @@ where
         input: &Tensor<3, D, ConcreteTensor<D, 3>>,
     ) -> Tensor<3, D, ConcreteTensor<D, 3>>
     where
-        crate::MulOp: fusor_cpu::SimdBinaryOp<D>,
-        crate::AddOp: fusor_cpu::SimdBinaryOp<D>,
-        fusor_cpu::SumOp: fusor_cpu::SimdReduceOp<D>,
+        crate::MulOp: crate::cpu::SimdBinaryOp<D>,
+        crate::AddOp: crate::cpu::SimdBinaryOp<D>,
+        crate::cpu::SumOp: crate::cpu::SimdReduceOp<D>,
     {
         input.conv(
             &self.weight,

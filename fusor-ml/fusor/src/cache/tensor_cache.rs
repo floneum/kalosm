@@ -1,7 +1,7 @@
 //! Growable tensor cache implementation.
 
+use crate::gpu::DataType;
 use crate::{Device, SimdElement, Tensor, cat};
-use fusor_core::DataType;
 
 /// A growable tensor cache.
 /// This cache manages tensor data with exponentially larger allocations as the sequence length increases.
@@ -16,7 +16,7 @@ pub struct TensorCache<const R: usize, D: SimdElement> {
 
 impl<const R: usize, D: SimdElement + DataType + Default> TensorCache<R, D>
 where
-    crate::AddOp: fusor_cpu::SimdBinaryOp<D>,
+    crate::AddOp: crate::cpu::SimdBinaryOp<D>,
     D: Copy,
 {
     /// Create a new cache with the given concatenation dimension
@@ -113,13 +113,13 @@ where
             // Return only the valid portion of the cache, not the full allocated tensor
             match &*cached {
                 Tensor::Gpu(cached) => {
-                    let specs: [fusor_core::StrideSpec; R] = std::array::from_fn(|i| {
+                    let specs: [crate::gpu::StrideSpec; R] = std::array::from_fn(|i| {
                         let len = if i == self.concat_dim {
                             self.current_seq_len
                         } else {
                             cached.shape()[i]
                         };
-                        fusor_core::StrideSpec::dim(i, len)
+                        crate::gpu::StrideSpec::dim(i, len)
                     });
                     Tensor::Gpu(cached.restride(specs))
                 }
@@ -182,5 +182,4 @@ where
     pub fn current_seq_len(&self) -> usize {
         self.current_seq_len
     }
-
 }

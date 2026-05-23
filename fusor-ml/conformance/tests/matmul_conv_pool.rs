@@ -571,17 +571,17 @@ async fn matmul_non_contiguous_input_matches_host_reference() {
     .unwrap();
 }
 
-#[tokio::test]
-async fn f16_matmul_coop_tile_matches_host_reference() {
-    // Pins the f16 cooperative-matrix path: shape divides cleanly into the
-    // smallest coop tile (Tile64x64, BK=16). Without f16 coop support this
-    // would fall back to `batched_matmul_with_epilogues<F16, ...>`; with it,
-    // dispatch lands on `try_batched_coop_matmul::<F16, 64, 64, 16>`.
+/// Run the `M×K · K×N` f16 matmul on every f16-capable device and compare
+/// against the host CPU reference. Both f16 matmul tests below differ only
+/// in the (M, N, K) const params, so this helper holds the shared setup.
+async fn assert_f16_matmul_matches_cpu_reference<
+    const M: usize,
+    const N: usize,
+    const K: usize,
+>(
+    tolerance: half::f16,
+) {
     use half::f16;
-
-    const M: usize = 64;
-    const N: usize = 64;
-    const K: usize = 64;
 
     fn data(seed: u32, total: usize) -> Vec<f16> {
         (0..total)
@@ -603,10 +603,19 @@ async fn f16_matmul_coop_tile_matches_host_reference() {
         let lhs: Tensor<2, f16> = Tensor::from_slice(&device, [M, K], &lhs_data);
         let rhs: Tensor<2, f16> = Tensor::from_slice(&device, [K, N], &rhs_data);
         let actual = lhs.matmul(&rhs).to_concrete();
-        fusor_conformance::approx_eq(&actual, &expected, f16::from_f32(5e-2))
+        fusor_conformance::approx_eq(&actual, &expected, tolerance)
             .await
             .unwrap();
     }
+}
+
+#[tokio::test]
+async fn f16_matmul_coop_tile_matches_host_reference() {
+    // Pins the f16 cooperative-matrix path: shape divides cleanly into the
+    // smallest coop tile (Tile64x64, BK=16). Without f16 coop support this
+    // would fall back to `batched_matmul_with_epilogues<F16, ...>`; with it,
+    // dispatch lands on `try_batched_coop_matmul::<F16, 64, 64, 16>`.
+    assert_f16_matmul_matches_cpu_reference::<64, 64, 64>(half::f16::from_f32(5e-2)).await;
 }
 
 #[tokio::test]
@@ -617,36 +626,7 @@ async fn f16_matmul_multi_tile_matches_host_reference() {
     // route to the shared-tile kernel. Multi-tile in M and N is needed so
     // the per-lane offsets that leaked into the cooperative load actually
     // shift global_row/global_col away from the workgroup tile base.
-    use half::f16;
-
-    const M: usize = 64;
-    const N: usize = 96;
-    const K: usize = 64;
-
-    fn data(seed: u32, total: usize) -> Vec<f16> {
-        (0..total)
-            .map(|i| {
-                let v = ((i + seed as usize) % 31) as f32;
-                f16::from_f32((v - 15.0) * 0.05)
-            })
-            .collect()
-    }
-
-    let lhs_data = data(0, M * K);
-    let rhs_data = data(7, K * N);
-
-    let cpu_lhs: Tensor<2, f16> = Tensor::from_slice(&Device::Cpu, [M, K], &lhs_data);
-    let cpu_rhs: Tensor<2, f16> = Tensor::from_slice(&Device::Cpu, [K, N], &rhs_data);
-    let expected = cpu_lhs.matmul(&cpu_rhs).to_concrete();
-
-    for device in f16_capable_devices().await {
-        let lhs: Tensor<2, f16> = Tensor::from_slice(&device, [M, K], &lhs_data);
-        let rhs: Tensor<2, f16> = Tensor::from_slice(&device, [K, N], &rhs_data);
-        let actual = lhs.matmul(&rhs).to_concrete();
-        fusor_conformance::approx_eq(&actual, &expected, f16::from_f32(5e-2))
-            .await
-            .unwrap();
-    }
+    assert_f16_matmul_matches_cpu_reference::<64, 96, 64>(half::f16::from_f32(5e-2)).await;
 }
 
 #[tokio::test]

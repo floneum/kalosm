@@ -1,8 +1,8 @@
 //! Math operations that work on both CPU and GPU backends.
 
+use crate::cpu::Mul;
+use crate::gpu::{DataType, FloatDataType};
 use crate::{ConcreteTensor, FloatOps, MulOp, ResolvedTensor, SimdBinaryOp, SimdElement, Tensor};
-use fusor_core::{DataType, FloatDataType};
-use fusor_cpu::Mul;
 
 impl<const R: usize, D> Tensor<R, D>
 where
@@ -36,7 +36,7 @@ where
                     .zip(b_data.iter())
                     .map(|(x, y)| x.powf(*y))
                     .collect();
-                fusor_cpu::Tensor::new(fusor_cpu::ConcreteTensor::from_slice(shape, &result))
+                crate::cpu::Tensor::new(crate::cpu::ConcreteTensor::from_slice(shape, &result))
             },
             |a, b| a.pow(b),
         )
@@ -95,8 +95,8 @@ where
                 };
                 copy_recursive(&ctx, &mut result, 0, 0, 0);
 
-                Tensor::Cpu(fusor_cpu::Tensor::new(
-                    fusor_cpu::ConcreteTensor::from_slice(new_shape, &result),
+                Tensor::Cpu(crate::cpu::Tensor::new(
+                    crate::cpu::ConcreteTensor::from_slice(new_shape, &result),
                 ))
             }
             Tensor::Gpu(t) => Tensor::Gpu(t.resize(new_shape)),

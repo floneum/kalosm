@@ -43,8 +43,8 @@ impl<T: DataType + SimdElement + Default> Embedding<T> {
         indices: &Tensor<N, u32, B>,
     ) -> Tensor<M, T>
     where
-        B: fusor_cpu::TensorBacking<N, Elem = u32>,
-        fusor_core::Tensor<N, u32>: fusor_core::NextRank<M, u32>,
+        B: crate::cpu::TensorBacking<N, Elem = u32>,
+        crate::gpu::Tensor<N, u32>: crate::gpu::NextRank<M, u32>,
         f32: CastTensor<T> + CastTo<T>,
     {
         // Calculate final output dimensions: input_dims + [embedding_dim]

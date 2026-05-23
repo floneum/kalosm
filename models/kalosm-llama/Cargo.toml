@@ -9,7 +9,7 @@ authors = ["Evan Almloff <evanalmloff@gmail.com>"]
 keywords = ["llm", "llama", "mistral", "agents", "nlp"]
 
 [dependencies]
-fusor = { workspace = true }
+fusor = { workspace = true, default-features = false }
 fusor-gguf = { workspace = true }
 kalosm-tokenizer.workspace = true
 
@@ -52,7 +52,9 @@ kalosm-streams.workspace = true
 reqwest = { version = "0.12" }
 
 [features]
-default = []
+default = ["cpu", "gpu"]
+cpu = ["fusor/cpu"]
+gpu = ["fusor/gpu"]
 vision = ["dep:image", "dep:pollster", "kalosm-language-model/media"]
 structured = ["dep:kalosm-sample", "kalosm-language-model/structured"]
 hf-tokenizer-json = ["dep:tokenizers", "dep:getrandom"]
