@@ -193,7 +193,7 @@ impl Operation for FlashAttentionOperation {
             FlashAttentionKernelVariant::StreamingTiled => {
                 tile_ir_kernels::flash_tiled_dispatch_size(
                     dims,
-                    tile_ir_kernels::flash_outputs_per_workgroup(streaming_subgroup_size),
+                    tile_ir_kernels::flash_tiled_outputs_per_workgroup(streaming_subgroup_size),
                     FLASH_STREAMING_TILED_Q_BLOCK,
                 )
             }

@@ -18,15 +18,23 @@ async fn main() {
         .and_then(|value| value.parse::<u64>().ok())
         .unwrap_or(64);
     let t_total = Instant::now();
+    let image_source = if let Ok(url) = std::env::var("KALOSM_VISION_URL") {
+        MediaSource::url(url)
+    } else if let Ok(path) = std::env::var("KALOSM_VISION_IMAGE") {
+        MediaSource::file(path).unwrap()
+    } else {
+        MediaSource::url("https://qianwen-res.oss-cn-beijing.aliyuncs.com/Qwen-VL/assets/demo.jpeg")
+    };
     let mut response = chat(&(
-        MediaChunk::new(
-            MediaSource::url(
-                "https://qianwen-res.oss-cn-beijing.aliyuncs.com/Qwen-VL/assets/demo.jpeg",
-            ),
-            MediaType::Image,
-        ),
+        MediaChunk::new(image_source, MediaType::Image),
         "Describe this image.",
     ));
+    if let Some(seed) = std::env::var("KALOSM_VISION_SEED")
+        .ok()
+        .and_then(|seed| seed.parse::<u64>().ok())
+    {
+        response = response.with_sampler(GenerationParameters::new().with_seed(seed));
+    }
     let mut first_token_at: Option<std::time::Duration> = None;
     let mut token_count = 0u64;
     let t_prefill = Instant::now();

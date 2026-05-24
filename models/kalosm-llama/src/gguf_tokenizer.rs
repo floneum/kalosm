@@ -178,17 +178,6 @@ impl PreTokenizer {
         Ok(Self { regexes })
     }
 
-    fn split<'a>(&self, text: &'a str) -> Vec<&'a str> {
-        let mut buffers = PreTokenizationBuffers::default();
-        self.split_into_ranges(text, &mut buffers);
-        buffers
-            .pieces
-            .iter()
-            .copied()
-            .map(|range| range.as_str(text))
-            .collect()
-    }
-
     fn split_into_ranges(&self, text: &str, buffers: &mut PreTokenizationBuffers) {
         buffers.pieces.clear();
         buffers.next.clear();

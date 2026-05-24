@@ -1,5 +1,3 @@
-#[cfg(feature = "vision")]
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 #[cfg(feature = "vision")]
