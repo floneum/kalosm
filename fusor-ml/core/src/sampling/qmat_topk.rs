@@ -25,6 +25,22 @@ pub(super) fn qmat_logits_data_with_encoder(
     }
 
     let device = hidden.device();
+    let compact_hidden;
+    let hidden = if hidden.layout().offset() == 0 && hidden_stride == 1 {
+        hidden
+    } else if hidden_stride == 1 {
+        compact_hidden = TensorData::new_for_shape(device, &[hidden_len], DataTypeEnum::F32);
+        encoder.copy_buffer_to_buffer(
+            hidden.buffer(),
+            (hidden.layout().offset() * std::mem::size_of::<f32>()) as u64,
+            compact_hidden.buffer(),
+            0,
+            (hidden_len * std::mem::size_of::<f32>()) as u64,
+        );
+        &compact_hidden
+    } else {
+        return None;
+    };
     let logits = TensorData::new_for_shape(device, &[*vocab_len], DataTypeEnum::F32);
     let hidden_2d = TensorData::new_from_parts(
         device,

@@ -4,14 +4,10 @@ use fusor::cache::AttentionMask;
 use fusor::cache::KvCache;
 use fusor::layers::Linear;
 use fusor::layers::RmsNorm;
-use fusor::CastTensor;
-use fusor::CastTo;
-use fusor::FloatDataType;
 use fusor::QMatrix;
-use fusor::SimdElement;
 use fusor::Tensor;
-use fusor::TensorBacking;
 use fusor::D;
+use fusor::{CastTensor, CastTo, FloatDataType, Fusion, SimdElement};
 
 pub enum FeedForwardVariant<F: FloatDataType + SimdElement = f32> {
     // Used by the Llama, Qwen, and Gemma models
@@ -27,7 +23,7 @@ where
 {
     pub(crate) fn forward<B>(&self, x: &Tensor<3, F, B>) -> Tensor<3, F>
     where
-        B: TensorBacking<3, Elem = F>,
+        B: Fusion<3, F>,
     {
         match self {
             FeedForwardVariant::Llama(ffn) => ffn.forward(x),
@@ -42,9 +38,9 @@ where
         second: &Tensor<3, f32, B2>,
     ) -> Option<Tensor<3, F>>
     where
-        B: TensorBacking<3, Elem = F>,
-        B1: TensorBacking<3, Elem = f32>,
-        B2: TensorBacking<3, Elem = f32>,
+        B: Fusion<3, F>,
+        B1: Fusion<3, f32>,
+        B2: Fusion<3, f32>,
     {
         match self {
             FeedForwardVariant::Llama(ffn) => ffn.forward_add_residuals(x, first, second),
@@ -64,7 +60,7 @@ impl PhiFeedForward {
     where
         F: FloatDataType + SimdElement + Default + CastTo<f32> + CastTensor<f32>,
         f32: CastTo<F> + CastTensor<F>,
-        B: TensorBacking<3, Elem = F>,
+        B: Fusion<3, F>,
     {
         // All computation happens in f32 for compatibility with SIMD ops
         let x_f32 = x.cast::<f32>();
@@ -135,7 +131,7 @@ impl<F: FloatDataType + SimdElement> LlamaFeedForward<F> {
     where
         F: CastTo<f32> + CastTensor<f32>,
         f32: CastTo<F> + CastTensor<F>,
-        B: TensorBacking<3, Elem = F>,
+        B: Fusion<3, F>,
     {
         let up_result = self.activation(x);
         let mut up = up_result.q_mat_mul(&self.down);
@@ -157,11 +153,14 @@ impl<F: FloatDataType + SimdElement> LlamaFeedForward<F> {
     where
         F: CastTo<f32> + CastTensor<f32>,
         f32: CastTo<F> + CastTensor<F>,
-        B: TensorBacking<3, Elem = F>,
-        B1: TensorBacking<3, Elem = f32>,
-        B2: TensorBacking<3, Elem = f32>,
+        B: Fusion<3, F>,
+        B1: Fusion<3, f32>,
+        B2: Fusion<3, f32>,
     {
         if self.down_bias.is_some() {
+            return None;
+        }
+        if x.shape()[1] > 1 {
             return None;
         }
 
@@ -173,7 +172,7 @@ impl<F: FloatDataType + SimdElement> LlamaFeedForward<F> {
     fn activation<B>(&self, x: &Tensor<3, F, B>) -> Tensor<3, f32>
     where
         F: CastTo<f32> + CastTensor<f32>,
-        B: TensorBacking<3, Elem = F>,
+        B: Fusion<3, F>,
     {
         // All computation happens in f32 for compatibility with SIMD ops
         let x_f32 = x.cast::<f32>();
@@ -274,7 +273,7 @@ where
         pos_ids: Option<&Tensor<2, F>>,
     ) -> (Tensor<4, F>, Tensor<4, F>, Tensor<4, F>)
     where
-        B: TensorBacking<3, Elem = F>,
+        B: Fusion<3, F>,
     {
         let [b_sz, seq_len, _] = hidden_states.shape();
 
@@ -442,7 +441,7 @@ impl GroupedAttention {
     where
         F: FloatDataType + SimdElement + Default + CastTo<f32> + CastTensor<f32>,
         f32: CastTo<F> + CastTensor<F>,
-        B: TensorBacking<3, Elem = F>,
+        B: Fusion<3, F>,
     {
         let [b_sz, seq_len, _] = x.shape();
         // Compute in f32 for SIMD ops compatibility
@@ -516,7 +515,7 @@ where
         cache: Option<&mut KvCache<f32>>,
     ) -> Tensor<3, F>
     where
-        B: TensorBacking<3, Elem = F>,
+        B: Fusion<3, F>,
     {
         let [b_sz, q_len, _] = hidden_states.shape();
         let hidden_size = self.hidden_size;
@@ -579,7 +578,7 @@ where
         layer_idx: usize,
     ) -> Tensor<3, F>
     where
-        B: TensorBacking<3, Elem = F>,
+        B: Fusion<3, F>,
     {
         let [b_sz, q_len, _] = hidden_states.shape();
         let hidden_size = self.hidden_size;
@@ -629,7 +628,14 @@ where
             &key_f32,
             &value_f32,
             scale as f32,
-            attention_mask.map(|m| (m.mask(), fusor::MaskKind::QKMask)),
+            attention_mask.map(|m| {
+                let kind = if m.is_strict_causal() {
+                    fusor::MaskKind::Causal
+                } else {
+                    fusor::MaskKind::QKMask
+                };
+                (m.mask(), kind)
+            }),
         );
         crate::raw::debug_check_nan_f32(&attn_raw, layer_idx, "flash_out", start_pos);
         let attn_output = attn_raw.transpose(1, 2);
@@ -665,7 +671,14 @@ where
         key_states,
         value_states,
         scale as f32,
-        attention_mask.map(|m| (m.mask(), fusor::MaskKind::QKMask)),
+        attention_mask.map(|m| {
+            let kind = if m.is_strict_causal() {
+                fusor::MaskKind::Causal
+            } else {
+                fusor::MaskKind::QKMask
+            };
+            (m.mask(), kind)
+        }),
     );
 
     let attn_output = attn_output.transpose(1, 2);

@@ -21,7 +21,7 @@ impl Resolver {
         let max_storage_bindings =
             graph.device().limits().max_storage_buffers_per_shader_stage as usize;
 
-        for (input_idx, &input_inner) in nary.inputs.iter().enumerate() {
+        for (_input_idx, &input_inner) in nary.inputs.iter().enumerate() {
             if self.check_cached(graph, input_inner) {
                 continue;
             }
@@ -38,11 +38,27 @@ impl Resolver {
                 continue;
             };
 
-            // Inline: offset input nary's indices to append after current inputs
+            // Inline: offset input nary's indices to append after current inputs.
             let offset = all_inputs.len();
             let inlined = Self::offset_input_indices(&input_nary.expression, offset);
-            let (new_expression, success) =
-                Self::substitute_input_in_expr(&expression, input_idx, &inlined);
+            // `input_inner` may appear in `all_inputs` at multiple slots —
+            // beyond the explicit `input_idx` slot from `nary.inputs`, earlier
+            // fusions in this same loop can have inlined chains that
+            // re-introduce `input_inner` at later slots. Substitute at every
+            // such slot so we don't leave dangling `IndexedInput` references
+            // pointing to a now-fused-away node.
+            let target_slots: Vec<usize> = all_inputs
+                .iter()
+                .enumerate()
+                .filter_map(|(slot, value)| (*value == input_inner).then_some(slot))
+                .collect();
+            let mut new_expression = expression.clone();
+            let mut success = true;
+            for slot in target_slots {
+                let (next, s) = Self::substitute_input_in_expr(&new_expression, slot, &inlined);
+                new_expression = next;
+                success &= s;
+            }
 
             // Only fuse if substitution was successful
             // If not, the expression still references the original input which must remain

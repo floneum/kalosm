@@ -1,6 +1,5 @@
 use std::{
     fmt::{Debug, Display},
-    marker::PhantomData,
     ops::Range,
 };
 
@@ -9,7 +8,7 @@ use tabbycat::Graph;
 use wgpu::COPY_BUFFER_ALIGNMENT;
 
 use crate::{
-    Device, Dim, FlashAttentionInputs, FlashAttentionOperation, MatMulOperation, MatMulParams,
+    Device, FlashAttentionInputs, FlashAttentionOperation, MatMulOperation, MatMulParams,
     ReduceFunction, ReduceOperation,
     compute_graph::NodeIndex,
     map_layout::MapLayoutOperation,
@@ -35,102 +34,87 @@ pub(crate) use eager_data::TensorData;
 pub(crate) use layout_info::{TensorInfo, TensorLayoutInfo};
 pub(crate) use lazy_data::LazyTensorData;
 
-pub struct Tensor<const R: usize, D> {
+pub struct Tensor {
     pub(crate) data: LazyTensorData,
-    datatype: PhantomData<D>,
 }
 
-impl<const R: usize, D: DataType> Display for Tensor<R, D> {
+impl Display for Tensor {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{} x {:?}", self.datatype(), self.shape())
     }
 }
 
-impl<const R: usize, D: DataType> Debug for Tensor<R, D> {
+impl Debug for Tensor {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "Tensor({} x {:?})", self.datatype(), self.shape())
     }
 }
 
-impl<const R: usize, D: DataType> From<TensorData> for Tensor<R, D> {
+impl From<TensorData> for Tensor {
     fn from(value: TensorData) -> Self {
         Self {
             data: LazyTensorData::new(value),
-            datatype: PhantomData,
         }
     }
 }
 
-impl<const R: usize, D> Clone for Tensor<R, D> {
+impl Clone for Tensor {
     fn clone(&self) -> Self {
         Self {
             data: self.data.clone(),
-            datatype: PhantomData,
         }
     }
 }
 
-impl<const R: usize, D> Tensor<R, D> {
+impl Tensor {
     /// Resolve the current tensor value on device and return a fresh leaf tensor
     /// that no longer carries the original compute graph history.
     pub fn detach(&self) -> Self {
         let (data, _) = self.data.materialize();
         Self {
             data: LazyTensorData::new(data),
-            datatype: PhantomData,
         }
     }
 }
 
-impl<const R: usize> Tensor<R, f32> {
+impl Tensor {
     pub fn q_mat_mul_add2(&self, other: &QMatrix, first: &Self, second: &Self) -> Self {
         // When M is unaligned, pad the activation, the two residuals, and
         // the matmul output back to a multiple of 64/128 so the matmul
         // kernel takes the coop-tile fast path. The slice at the end
         // narrows everything back to the caller's shape.
-        if R >= 2 {
+        if self.rank() >= 2 {
             let in_shape = self.shape();
-            let m = in_shape[R - 2];
+            let m_axis = self.rank() - 2;
+            let m = in_shape[m_axis];
             let n = other.shape()[0];
-            if let Some(padded_m) =
-                crate::quantized::matmul::qmatmul_m_pad_target_pub(m, n)
-            {
-                let mut padded_in_shape = *in_shape;
-                padded_in_shape[R - 2] = padded_m;
-                let device = self.device().clone();
-                let zero_in: Tensor<R, f32> = Tensor::splat(&device, 0.0, padded_in_shape);
-                let mut in_ranges: [Range<usize>; R] =
-                    std::array::from_fn(|i| 0..in_shape[i]);
-                in_ranges[R - 2] = 0..m;
-                let padded_self = zero_in.slice_assign(in_ranges, self);
+            if let Some(padded_m) = crate::quantized::matmul::qmatmul_m_pad_target_pub(m, n) {
+                let mut padded_in_shape = in_shape.to_vec();
+                padded_in_shape[m_axis] = padded_m;
+                let padded_self = self.resize(padded_in_shape);
 
                 // first / second are shaped like the matmul output:
                 // replace dim R-2 with padded_m, keep last dim = N.
                 let first_shape = first.shape();
-                let mut padded_out_shape = *first_shape;
-                padded_out_shape[R - 2] = padded_m;
-                let zero_first: Tensor<R, f32> =
-                    Tensor::splat(&device, 0.0, padded_out_shape);
-                let mut out_ranges: [Range<usize>; R] =
-                    std::array::from_fn(|i| 0..first_shape[i]);
-                out_ranges[R - 2] = 0..m;
-                let padded_first = zero_first.slice_assign(out_ranges.clone(), first);
-                let zero_second: Tensor<R, f32> =
-                    Tensor::splat(&device, 0.0, padded_out_shape);
-                let padded_second = zero_second.slice_assign(out_ranges, second);
+                let mut padded_out_shape = first_shape.to_vec();
+                padded_out_shape[m_axis] = padded_m;
+                let padded_first = first.resize(&padded_out_shape);
+                let padded_second = second.resize(&padded_out_shape);
 
                 let padded_result =
                     padded_self.q_mat_mul_add2(other, &padded_first, &padded_second);
 
                 // Narrow result back to original M via a layout view.
-                let result_shape = *padded_result.shape();
-                let specs: [crate::StrideSpec; R] = std::array::from_fn(|i| {
-                    if i == R - 2 {
-                        crate::StrideSpec::dim(i, m)
-                    } else {
-                        crate::StrideSpec::dim(i, result_shape[i])
-                    }
-                });
+                let result_shape = padded_result.shape();
+                let specs: Vec<crate::StrideSpec> = (0..padded_result.rank())
+                    .map(|i| {
+                        if i == m_axis {
+                            crate::StrideSpec::dim(i, m)
+                        } else {
+                            crate::StrideSpec::dim(i, result_shape[i])
+                        }
+                    })
+                    .collect();
                 return padded_result.restride(specs);
             }
         }
@@ -154,9 +138,10 @@ impl<const R: usize> Tensor<R, f32> {
         );
 
         let dtype = DataTypeEnum::F32;
-        let matmul = NaryExpr::input(0, R);
-        let first_residual = NaryExpr::input(1, R);
-        let second_residual = NaryExpr::input(2, R);
+        let rank = self.rank();
+        let matmul = NaryExpr::input(0, rank);
+        let first_residual = NaryExpr::input(1, rank);
+        let second_residual = NaryExpr::input(2, rank);
         let sum = NaryExpr::Op {
             children: vec![matmul, first_residual],
             function: NaryFunction::binary(
@@ -200,30 +185,26 @@ impl<const R: usize> Tensor<R, f32> {
         );
         // Pad activation M to unlock the coop-tile matmul path; narrow
         // the output back to the original M with a layout view.
-        if R >= 2 {
+        if self.rank() >= 2 {
             let in_shape = self.shape();
-            let m = in_shape[R - 2];
+            let m_axis = self.rank() - 2;
+            let m = in_shape[m_axis];
             let n = other.shape()[0];
-            if let Some(padded_m) =
-                crate::quantized::matmul::qmatmul_m_pad_target_pub(m, n)
-            {
-                let mut padded_in_shape = *in_shape;
-                padded_in_shape[R - 2] = padded_m;
-                let device = self.device().clone();
-                let zero_in: Tensor<R, f32> = Tensor::splat(&device, 0.0, padded_in_shape);
-                let mut in_ranges: [Range<usize>; R] =
-                    std::array::from_fn(|i| 0..in_shape[i]);
-                in_ranges[R - 2] = 0..m;
-                let padded_self = zero_in.slice_assign(in_ranges, self);
+            if let Some(padded_m) = crate::quantized::matmul::qmatmul_m_pad_target_pub(m, n) {
+                let mut padded_in_shape = in_shape.to_vec();
+                padded_in_shape[m_axis] = padded_m;
+                let padded_self = self.resize(padded_in_shape);
                 let padded_result = padded_self.q_mat_mul_paired_silu_product(other);
-                let result_shape = *padded_result.shape();
-                let specs: [crate::StrideSpec; R] = std::array::from_fn(|i| {
-                    if i == R - 2 {
-                        crate::StrideSpec::dim(i, m)
-                    } else {
-                        crate::StrideSpec::dim(i, result_shape[i])
-                    }
-                });
+                let result_shape = padded_result.shape();
+                let specs: Vec<crate::StrideSpec> = (0..padded_result.rank())
+                    .map(|i| {
+                        if i == m_axis {
+                            crate::StrideSpec::dim(i, m)
+                        } else {
+                            crate::StrideSpec::dim(i, result_shape[i])
+                        }
+                    })
+                    .collect();
                 return padded_result.restride(specs);
             }
         }
@@ -290,7 +271,7 @@ impl<const R: usize> Tensor<R, f32> {
     }
 }
 
-impl<const R: usize, D, T> fusor_types::FromArray<R, D, T, Device> for Tensor<R, D>
+impl<const R: usize, D, T> fusor_types::FromArray<R, D, T, Device> for Tensor
 where
     D: DataType,
     T: fusor_types::IntoFlatArray<D, R>,
@@ -301,15 +282,20 @@ where
     }
 }
 
-impl<D: DataType, const R: usize> Tensor<R, D> {
-    pub fn new<T>(device: &Device, data: T) -> Self
+impl Tensor {
+    pub fn new<D: DataType, const R: usize, T>(device: &Device, data: T) -> Self
     where
         Self: fusor_types::FromArray<R, D, T, Device>,
     {
         fusor_types::FromArray::from_array(data, device)
     }
 
-    pub fn from_slice(device: &Device, shape: [usize; R], data: &[D]) -> Self {
+    pub fn from_slice<D: DataType>(
+        device: &Device,
+        shape: impl AsRef<[usize]>,
+        data: &[D],
+    ) -> Self {
+        let shape = shape.as_ref();
         assert_eq!(
             data.len(),
             shape.iter().product::<usize>(),
@@ -318,38 +304,40 @@ impl<D: DataType, const R: usize> Tensor<R, D> {
         Tensor::new_inner(device, data.iter(), shape)
     }
 
-    pub fn splat(device: &Device, value: D, shape: [usize; R]) -> Self {
+    pub fn splat<D: DataType>(device: &Device, value: D, shape: impl AsRef<[usize]>) -> Self {
         Self::from_parts(LazyTensorData::new(TensorData::new_splat(
-            device, &shape, value,
+            device,
+            shape.as_ref(),
+            value,
         )))
     }
 
     /// Alias for [`Tensor::splat`]
-    pub fn full(device: &Device, value: D, shape: [usize; R]) -> Self {
+    pub fn full<D: DataType>(device: &Device, value: D, shape: impl AsRef<[usize]>) -> Self {
         Self::splat(device, value, shape)
     }
 
     pub(crate) fn from_parts(data: LazyTensorData) -> Self {
-        debug_assert_eq!(D::DATA_TYPE, data.info.datatype());
-        Self {
-            data,
-            datatype: PhantomData,
-        }
+        Self { data }
     }
 
-    fn new_inner<'a, I: Iterator<Item = &'a D>>(
+    fn new_inner<'a, D: DataType, I: Iterator<Item = &'a D>>(
         device: &Device,
         data: I,
-        shape: [usize; R],
+        shape: impl AsRef<[usize]>,
     ) -> Self {
         Self::from_parts(LazyTensorData::new(TensorData::new_inner(
-            device, data, &shape,
+            device,
+            data,
+            shape.as_ref(),
         )))
     }
 
-    pub(crate) async fn as_slice_from_tensor_data(
+    pub(crate) async fn as_slice_from_tensor_data<const R: usize, D: DataType>(
         tensor: &TensorData,
     ) -> Result<TensorSlice<R, D, MappedBuffer>, wgpu::BufferAsyncError> {
+        assert_eq!(tensor.datatype(), D::DATA_TYPE);
+        assert_eq!(tensor.layout().shape().len(), R);
         let buffer = tensor.buffer();
         let device = tensor.device.wgpu_device();
         let queue = tensor.device.wgpu_queue();
@@ -419,14 +407,14 @@ impl<D: DataType, const R: usize> Tensor<R, D> {
             #[cfg(feature = "extra_assertions")]
             {
                 let mut contains_non_finite = false;
-                if D::DATA_TYPE == DataTypeEnum::F32 {
-                    let data: TensorSlice<R, f32, MappedBuffer> =
+                if data.datatype() == DataTypeEnum::F32 && data.layout().rank() == 1 {
+                    let data: TensorSlice<1, f32, MappedBuffer> =
                         Tensor::as_slice_from_tensor_data(&data).await.unwrap();
                     data.visit_items(|item| {
                         contains_non_finite |= !item.is_finite();
                     });
-                } else if D::DATA_TYPE == DataTypeEnum::F16 {
-                    let data: TensorSlice<R, half::f16, MappedBuffer> =
+                } else if data.datatype() == DataTypeEnum::F16 && data.layout().rank() == 1 {
+                    let data: TensorSlice<1, half::f16, MappedBuffer> =
                         Tensor::as_slice_from_tensor_data(&data).await.unwrap();
                     data.visit_items(|item| {
                         contains_non_finite |= !item.is_finite();
@@ -451,9 +439,11 @@ impl<D: DataType, const R: usize> Tensor<R, D> {
         count
     }
 
-    pub async fn as_slice(
+    pub async fn as_slice<const R: usize, D: DataType>(
         &self,
     ) -> Result<TensorSlice<R, D, MappedBuffer>, wgpu::BufferAsyncError> {
+        self.assert_rank::<R>();
+        self.assert_datatype::<D>();
         #[cfg(not(target_arch = "wasm32"))]
         let start_time = std::time::Instant::now();
         let (tensor, _) = self.data.materialize();
@@ -467,27 +457,41 @@ impl<D: DataType, const R: usize> Tensor<R, D> {
         out
     }
 
-    pub async fn to_scalar(&self) -> Result<D, wgpu::BufferAsyncError> {
-        let slice = self.as_slice().await?;
+    pub async fn to_scalar<D: DataType>(&self) -> Result<D, wgpu::BufferAsyncError> {
+        let slice = self.as_slice::<0, D>().await?;
         Ok(slice.as_scalar())
     }
 
-    pub fn debug_assert_real(self) -> Self
-    where
-        D: FloatDataType,
-    {
+    pub fn debug_assert_real(self) -> Self {
         #[cfg(debug_assertions)]
         {
             use pollster::FutureExt as _;
-            let as_slice = self.as_slice().block_on().unwrap();
-            for item in as_slice.as_slice() {
-                assert!(item.is_finite(), "Tensor contains non-finite value: {item}");
+            if self.rank() == 1 {
+                match self.datatype() {
+                    DataTypeEnum::F32 => {
+                        let as_slice = self.as_slice::<1, f32>().block_on().unwrap();
+                        for item in as_slice.as_slice() {
+                            assert!(item.is_finite(), "Tensor contains non-finite value: {item}");
+                        }
+                    }
+                    DataTypeEnum::F16 => {
+                        let as_slice = self.as_slice::<1, half::f16>().block_on().unwrap();
+                        for item in as_slice.as_slice() {
+                            assert!(item.is_finite(), "Tensor contains non-finite value: {item}");
+                        }
+                    }
+                    DataTypeEnum::U32 => {}
+                }
             }
         }
         self
     }
 
-    pub(crate) fn unary_nary<D2: DataType>(&self, function: NaryFunction) -> Tensor<R, D2> {
+    pub(crate) fn unary_nary<D2: DataType>(&self, function: NaryFunction) -> Tensor {
+        Tensor::from_parts(self.data.unary_nary(function))
+    }
+
+    pub(crate) fn unary_nary_dtype(&self, function: NaryFunction) -> Tensor {
         Tensor::from_parts(self.data.unary_nary(function))
     }
 
@@ -504,7 +508,7 @@ impl<D: DataType, const R: usize> Tensor<R, D> {
                     children: vec![NaryExpr::input(0, rank), NaryExpr::input(0, rank)],
                     function,
                 },
-                shape: self.shape().as_slice().into(),
+                shape: self.shape().into(),
                 output_datatype: info.datatype,
             };
             let key = device.compute_graph().create_nary(nary);
@@ -539,14 +543,15 @@ impl<D: DataType, const R: usize> Tensor<R, D> {
         Self::from_parts(self.data.q_mat_mul(operation))
     }
 
-    pub(crate) fn add_resize<const R2: usize>(&self, op: ResizeOperation) -> Tensor<R2, D> {
-        Tensor {
-            data: self.data.resize(op),
-            datatype: PhantomData,
-        }
+    pub(crate) fn add_resize(&self, op: ResizeOperation) -> Tensor {
+        Tensor::from_parts(self.data.resize(op))
     }
 
-    pub(crate) fn add_slice_assign(&self, other: &Self, slices: [Range<usize>; R]) -> Self {
+    pub(crate) fn add_slice_assign(
+        &self,
+        other: &Self,
+        slices: impl Into<Box<[Range<usize>]>>,
+    ) -> Self {
         let input_shape: Box<[usize]> = self.shape().to_vec().into_boxed_slice();
         let op =
             SliceAssignOperation::new(self.data.key, other.data.key, slices.into(), input_shape);
@@ -554,7 +559,11 @@ impl<D: DataType, const R: usize> Tensor<R, D> {
     }
 
     #[doc(hidden)]
-    pub fn slice_assign_in_place(&self, slices: [Range<usize>; R], value: &Self) -> Self {
+    pub fn slice_assign_in_place(
+        &self,
+        slices: impl Into<Box<[Range<usize>]>>,
+        value: &Self,
+    ) -> Self {
         let input_shape: Box<[usize]> = self.shape().to_vec().into_boxed_slice();
         let op = SliceAssignOperation::new_in_place(
             self.data.key,
@@ -565,23 +574,16 @@ impl<D: DataType, const R: usize> Tensor<R, D> {
         Self::from_parts(self.data.slice_assign(op))
     }
 
-    pub(crate) fn reduce<const OUT: usize>(
-        &self,
-        function: ReduceFunction,
-        dim: impl Dim<R>,
-    ) -> Tensor<OUT, D> {
-        Tensor {
-            data: self.data.reduce(ReduceOperation::new(
-                self.data.key,
-                function,
-                dim.resolve(),
-                self.shape(),
-            )),
-            datatype: PhantomData,
-        }
+    pub(crate) fn reduce(&self, function: ReduceFunction, dim: usize) -> Tensor {
+        Tensor::from_parts(self.data.reduce(ReduceOperation::new(
+            self.data.key,
+            function,
+            dim,
+            self.shape(),
+        )))
     }
 
-    pub(crate) fn add_map_layout<const R2: usize>(&self, op: MapLayoutOperation) -> Tensor<R2, D> {
+    pub(crate) fn add_map_layout(&self, op: MapLayoutOperation) -> Tensor {
         Tensor::from_parts(self.data.map_layout(op))
     }
 
@@ -590,14 +592,25 @@ impl<D: DataType, const R: usize> Tensor<R, D> {
         self.data.key
     }
 
-    pub fn shape(&self) -> &[usize; R] {
-        let shape = self.data.info.shape();
-        match shape.try_into() {
-            Ok(shape) => shape,
-            Err(_) => {
-                panic!("Internal error. Expected a tensor of rank {R}, found shape: {shape:?}")
-            }
-        }
+    pub fn shape(&self) -> &[usize] {
+        self.data.info.shape()
+    }
+
+    pub fn shape_array<const R: usize>(&self) -> &[usize; R] {
+        self.shape().try_into().unwrap_or_else(|_| {
+            panic!(
+                "Expected a tensor of rank {R}, found shape: {:?}",
+                self.shape()
+            )
+        })
+    }
+
+    pub fn assert_rank<const R: usize>(&self) {
+        assert_eq!(self.rank(), R, "unexpected tensor rank");
+    }
+
+    pub fn assert_datatype<D: DataType>(&self) {
+        assert_eq!(self.datatype(), D::DATA_TYPE, "unexpected tensor dtype");
     }
 
     pub fn rank(&self) -> usize {
@@ -608,13 +621,13 @@ impl<D: DataType, const R: usize> Tensor<R, D> {
         self.data.info.datatype()
     }
 
-    pub(crate) fn try_rms_norm_direct<const W: usize>(
+    pub(crate) fn try_rms_norm_direct(
         &self,
-        weight: &Tensor<W, D>,
-        bias: Option<&Tensor<W, D>>,
+        weight: &Tensor,
+        bias: Option<&Tensor>,
         eps: f32,
     ) -> Option<Self> {
-        if D::DATA_TYPE != DataTypeEnum::F32 {
+        if self.datatype() != DataTypeEnum::F32 {
             return None;
         }
         let operation = RmsNormOperation::new(
@@ -627,14 +640,14 @@ impl<D: DataType, const R: usize> Tensor<R, D> {
         Some(Self::from_parts(self.data.rms_norm(operation)))
     }
 
-    pub(crate) fn try_rms_norm_residual_direct<const W: usize>(
+    pub(crate) fn try_rms_norm_residual_direct(
         &self,
         residual: &Self,
-        weight: &Tensor<W, D>,
-        bias: Option<&Tensor<W, D>>,
+        weight: &Tensor,
+        bias: Option<&Tensor>,
         eps: f32,
     ) -> Option<Self> {
-        if D::DATA_TYPE != DataTypeEnum::F32 || self.shape() != residual.shape() {
+        if self.datatype() != DataTypeEnum::F32 || self.shape() != residual.shape() {
             return None;
         }
         let operation = RmsNormOperation::new_with_residual(
@@ -653,9 +666,32 @@ impl<D: DataType, const R: usize> Tensor<R, D> {
         k: &Self,
         v: &Self,
         scale: f32,
-        mask: Option<&Tensor<2, D>>,
+        mask: Option<&Tensor>,
     ) -> Option<Self> {
-        if R != 4 || !matches!(D::DATA_TYPE, DataTypeEnum::F32 | DataTypeEnum::F16) {
+        self.try_flash_attention_direct_inner(k, v, scale, mask, false)
+    }
+
+    pub(crate) fn try_flash_attention_direct_causal(
+        &self,
+        k: &Self,
+        v: &Self,
+        scale: f32,
+    ) -> Option<Self> {
+        self.try_flash_attention_direct_inner(k, v, scale, None, true)
+    }
+
+    fn try_flash_attention_direct_inner(
+        &self,
+        k: &Self,
+        v: &Self,
+        scale: f32,
+        mask: Option<&Tensor>,
+        causal: bool,
+    ) -> Option<Self> {
+        if self.rank() != 4 || !matches!(self.datatype(), DataTypeEnum::F32 | DataTypeEnum::F16) {
+            return None;
+        }
+        if causal && mask.is_some() {
             return None;
         }
         // The streaming flash attention kernel emits a separate
@@ -669,7 +705,8 @@ impl<D: DataType, const R: usize> Tensor<R, D> {
         let is_decode_candidate = q_shape[2] == 1
             && q_shape[3] == 128
             && mask.is_none()
-            && D::DATA_TYPE == DataTypeEnum::F32;
+            && !causal
+            && self.datatype() == DataTypeEnum::F32;
         if is_decode_candidate && k_shape[2] < MIN_DECODE_KV_SEQ {
             return None;
         }
@@ -691,8 +728,14 @@ impl<D: DataType, const R: usize> Tensor<R, D> {
             return None;
         }
         if let Some(mask) = mask
-            && *mask.shape() != [q_shape[2], k_shape[2]]
+            && mask.shape() != [q_shape[2], k_shape[2]]
         {
+            return None;
+        }
+        if causal && q_shape[2] != k_shape[2] {
+            // Causal optimisation only kicks in for self-attention prefill
+            // where q_seq_len == kv_seq_len. Other shapes (e.g. cached decode)
+            // fall back to the masked path.
             return None;
         }
         let batch = u32::try_from(q_shape[0]).ok()?;
@@ -719,7 +762,8 @@ impl<D: DataType, const R: usize> Tensor<R, D> {
             k_shape,
             v_shape,
             scale,
-            input_dtype: D::DATA_TYPE,
+            input_dtype: self.datatype(),
+            causal,
         });
         Some(Self::from_parts(self.data.flash_attention(operation)))
     }

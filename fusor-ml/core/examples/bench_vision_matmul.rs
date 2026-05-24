@@ -14,36 +14,37 @@ const WARMUP_BATCHES: usize = 3;
 const MEASURED_BATCHES: usize = 10;
 const DISPATCHES_PER_BATCH: usize = 4;
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let device = Device::new().await?;
-    println!("bench_vision_matmul");
-    println!("warmup_batches: {WARMUP_BATCHES}");
-    println!("measured_batches: {MEASURED_BATCHES}");
-    println!("dispatches_per_batch: {DISPATCHES_PER_BATCH}");
-    println!();
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    pollster::block_on(async {
+        let device = Device::new().await?;
+        println!("bench_vision_matmul");
+        println!("warmup_batches: {WARMUP_BATCHES}");
+        println!("measured_batches: {MEASURED_BATCHES}");
+        println!("dispatches_per_batch: {DISPATCHES_PER_BATCH}");
+        println!();
 
-    // Shapes that show up in the Qwen2.5-VL vision encoder prefill for the
-    // standard demo image (M=1944 = 1944 patches after merge). N varies by
-    // projection; K is 1280 (embed dim) or 3420 (mlp inner / 2).
-    let cases: &[(&str, usize, usize, usize)] = &[
-        ("vision_qkv", 1944, 1280, 3840),         // fused qkv projection
-        ("vision_o", 1944, 1280, 1280),           // attention output proj
-        ("vision_mlp_gate_up", 1944, 1280, 6840), // gate+up fused
-        ("vision_mlp_down", 1944, 3420, 1280),    // down proj
-        // Aligned reference shape (M%128=0) so we can see how much faster the
-        // coop tile path is for the same K/N when M is friendly.
-        ("aligned_ref_1920_qkv", 1920, 1280, 3840),
-        ("aligned_ref_2048_qkv", 2048, 1280, 3840),
-    ];
+        // Shapes that show up in the Qwen2.5-VL vision encoder prefill for the
+        // standard demo image (M=1944 = 1944 patches after merge). N varies by
+        // projection; K is 1280 (embed dim) or 3420 (mlp inner / 2).
+        let cases: &[(&str, usize, usize, usize)] = &[
+            ("vision_qkv", 1944, 1280, 3840),         // fused qkv projection
+            ("vision_o", 1944, 1280, 1280),           // attention output proj
+            ("vision_mlp_gate_up", 1944, 1280, 6840), // gate+up fused
+            ("vision_mlp_down", 1944, 3420, 1280),    // down proj
+            // Aligned reference shape (M%128=0) so we can see how much faster the
+            // coop tile path is for the same K/N when M is friendly.
+            ("aligned_ref_1920_qkv", 1920, 1280, 3840),
+            ("aligned_ref_2048_qkv", 2048, 1280, 3840),
+        ];
 
-    for &(name, m, k, n) in cases {
-        bench_matmul(&device, name, m, k, n);
-    }
+        for &(name, m, k, n) in cases {
+            bench_matmul(&device, name, m, k, n);
+        }
 
-    bench_flash_attention_vision(&device);
+        bench_flash_attention_vision(&device);
 
-    Ok(())
+        Ok(())
+    })
 }
 
 fn bench_flash_attention_vision(device: &Device) {

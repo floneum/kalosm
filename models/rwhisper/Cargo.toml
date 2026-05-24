@@ -43,5 +43,4 @@ gpu = ["fusor/gpu"]
 kalosm = { workspace = true, features = ["sound", "sound-source"], default-features = true }
 anyhow.workspace = true
 tracing-subscriber = "0.3.19"
-tokio = { version = "1.32.0", features = ["full"] }
 reqwest = "0.12.15"

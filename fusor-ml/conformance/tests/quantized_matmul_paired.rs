@@ -4,9 +4,8 @@ use common::quantized::{
     concrete_to_rows, q_mat_mul_input_fuzz, q4k_raw_bytes, qmatrix_from_raw_bytes,
 };
 use common::{matmul2, transpose2};
-use fusor::{Device, Tensor, ToVec2};
+use fusor::{BlockQ4K, Device, GgmlType, GgufBlock, QuantizedTensor, Tensor, ToVec2};
 use fusor_conformance::approx_compare;
-use fusor_cpu::{BlockQ4K, GgmlType, GgufBlock, QuantizedTensor};
 use rand::distr::Uniform;
 use std::mem::size_of;
 

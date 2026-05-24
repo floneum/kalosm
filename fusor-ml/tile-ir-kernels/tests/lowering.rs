@@ -43,6 +43,7 @@ fn streaming_flash_attention_regression_shape_lowers_to_naga() {
             mask_meta: None,
             output_meta: TensorMeta::new(vec![196_608, 6_144, 128, 1], 0),
             dispatch_size: [16, 1536, 1],
+            causal: false,
         },
     )
     .expect("streaming flash attention should build");

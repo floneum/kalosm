@@ -181,102 +181,102 @@ required-features = ["llama"]
 [[example]]
 name = "chat-boxed"
 path = "interfaces/kalosm/examples/chat-boxed.rs"
-required-features = ["llama", "remote", "tokio"]
+required-features = ["llama", "remote"]
 
 [[example]]
 name = "chat-constrained"
 path = "interfaces/kalosm/examples/chat-constrained.rs"
-required-features = ["llama", "structured", "tokio"]
+required-features = ["llama", "structured"]
 
 [[example]]
 name = "chat-constrained-boxed"
 path = "interfaces/kalosm/examples/chat-constrained-boxed.rs"
-required-features = ["llama", "openai", "structured", "serde", "tokio"]
+required-features = ["llama", "openai", "structured", "serde"]
 
 [[example]]
 name = "chat-mistral-2"
 path = "interfaces/kalosm/examples/chat-mistral-2.rs"
-required-features = ["llama", "tokio"]
+required-features = ["llama"]
 
 [[example]]
 name = "chat-tiny-llama"
 path = "interfaces/kalosm/examples/chat-tiny-llama.rs"
-required-features = ["llama", "tokio"]
+required-features = ["llama"]
 
 [[example]]
 name = "chat-with-character"
 path = "interfaces/kalosm/examples/chat-with-character.rs"
-required-features = ["llama", "structured", "tokio"]
+required-features = ["llama", "structured"]
 
 [[example]]
 name = "chunking"
 path = "interfaces/kalosm/examples/chunking.rs"
-required-features = ["bert", "llama", "chunking", "tokio", "tracing-subscriber"]
+required-features = ["bert", "llama", "chunking", "tracing-subscriber"]
 
 [[example]]
 name = "claude-3-5-haiku"
 path = "interfaces/kalosm/examples/claude-3-5-haiku.rs"
-required-features = ["anthropic", "tokio", "tracing-subscriber"]
+required-features = ["anthropic", "tracing-subscriber"]
 
 [[example]]
 name = "codestral"
 path = "interfaces/kalosm/examples/codestral.rs"
-required-features = ["llama", "tokio"]
+required-features = ["llama"]
 
 [[example]]
 name = "constrained"
 path = "interfaces/kalosm/examples/constrained.rs"
-required-features = ["llama", "structured", "tokio"]
+required-features = ["llama", "structured"]
 
 [[example]]
 name = "constrained-regex"
 path = "interfaces/kalosm/examples/constrained-regex.rs"
-required-features = ["llama", "structured", "tokio"]
+required-features = ["llama", "structured"]
 
 [[example]]
 name = "constrained-rust-types"
 path = "interfaces/kalosm/examples/constrained-rust-types.rs"
-required-features = ["llama", "structured", "anyhow", "tokio"]
+required-features = ["llama", "structured", "anyhow"]
 
 [[example]]
 name = "crawl"
 path = "interfaces/kalosm/examples/crawl.rs"
-required-features = ["scrape", "tokio"]
+required-features = ["scrape"]
 
 [[example]]
 name = "custom_llama_source"
 path = "interfaces/kalosm/examples/custom_llama_source.rs"
-required-features = ["llama", "tokio"]
+required-features = ["llama"]
 
 [[example]]
 name = "evaluation"
 path = "interfaces/kalosm/examples/evaluation.rs"
-required-features = ["bert", "llama", "chunking", "evaluation", "tokio", "tracing-subscriber"]
+required-features = ["bert", "llama", "chunking", "evaluation", "tracing-subscriber"]
 
 [[example]]
 name = "generate-image"
 path = "interfaces/kalosm/examples/generate-image.rs"
-required-features = ["vision", "futures-util", "tokio"]
+required-features = ["vision", "futures-util"]
 
 [[example]]
 name = "generate-text"
 path = "interfaces/kalosm/examples/generate-text.rs"
-required-features = ["llama", "tokio", "tracing-subscriber"]
+required-features = ["llama", "tracing-subscriber"]
 
 [[example]]
 name = "gemma-3"
 path = "interfaces/kalosm/examples/gemma-3.rs"
-required-features = ["llama", "tokio"]
+required-features = ["llama"]
 
 [[example]]
 name = "gpt-4o-mini"
 path = "interfaces/kalosm/examples/gpt-4o-mini.rs"
-required-features = ["openai", "tokio", "tracing-subscriber"]
+required-features = ["openai", "tracing-subscriber"]
 
 [[example]]
 name = "hybrid-search"
 path = "interfaces/kalosm/examples/hybrid-search.rs"
-required-features = ["surrealdb-local", "tokio"]
+required-features = ["surrealdb-local"]
 
 [[example]]
 name = "live-qa"
@@ -290,18 +290,17 @@ required-features = [
     "surrealdb-local",
     "anyhow",
     "futures-util",
-    "tokio",
 ]
 
 [[example]]
 name = "llama"
 path = "interfaces/kalosm/examples/llama.rs"
-required-features = ["llama", "tokio"]
+required-features = ["llama"]
 
 [[example]]
 name = "mistral"
 path = "interfaces/kalosm/examples/mistral.rs"
-required-features = ["llama", "tokio"]
+required-features = ["llama"]
 
 [[example]]
 name = "mutate"
@@ -313,44 +312,43 @@ required-features = [
     "evaluation",
     "sample",
     "anyhow",
-    "tokio",
     "tracing-subscriber",
 ]
 
 [[example]]
 name = "ocr"
 path = "interfaces/kalosm/examples/ocr.rs"
-required-features = ["vision", "image", "tokio"]
+required-features = ["vision", "image"]
 
 [[example]]
 name = "phi-3"
 path = "interfaces/kalosm/examples/phi-3.rs"
-required-features = ["llama", "tokio"]
+required-features = ["llama"]
 
 [[example]]
 name = "phi-4"
 path = "interfaces/kalosm/examples/phi-4.rs"
-required-features = ["llama", "tokio"]
+required-features = ["llama"]
 
 [[example]]
 name = "prompt-annealing"
 path = "interfaces/kalosm/examples/prompt-annealing.rs"
-required-features = ["llama", "structured", "prompt_annealing", "tokio"]
+required-features = ["llama", "structured", "prompt_annealing"]
 
 [[example]]
 name = "qwen"
 path = "interfaces/kalosm/examples/qwen.rs"
-required-features = ["llama", "tokio"]
+required-features = ["llama"]
 
 [[example]]
 name = "rag"
 path = "interfaces/kalosm/examples/rag.rs"
-required-features = ["llama", "surrealdb-local", "anyhow", "tokio"]
+required-features = ["llama", "surrealdb-local", "anyhow"]
 
 [[example]]
 name = "remote-open-ai-compatable"
 path = "interfaces/kalosm/examples/remote-open-ai-compatable.rs"
-required-features = ["openai", "tokio", "tracing-subscriber"]
+required-features = ["openai", "tracing-subscriber"]
 
 [[example]]
 name = "segment-image"
@@ -360,27 +358,27 @@ required-features = ["vision", "image"]
 [[example]]
 name = "self-chat"
 path = "interfaces/kalosm/examples/self-chat.rs"
-required-features = ["llama", "tokio"]
+required-features = ["llama"]
 
 [[example]]
 name = "semantic-chunk"
 path = "interfaces/kalosm/examples/semantic-chunk.rs"
-required-features = ["bert", "web-documents", "chunking", "anyhow", "tokio"]
+required-features = ["bert", "web-documents", "chunking", "anyhow"]
 
 [[example]]
 name = "semantic-search"
 path = "interfaces/kalosm/examples/semantic-search.rs"
-required-features = ["surrealdb-local", "comfy-table", "tokio", "tracing-subscriber"]
+required-features = ["surrealdb-local", "comfy-table", "tracing-subscriber"]
 
 [[example]]
 name = "task"
 path = "interfaces/kalosm/examples/task.rs"
-required-features = ["llama", "structured", "tokio", "tracing-subscriber"]
+required-features = ["llama", "structured", "tracing-subscriber"]
 
 [[example]]
 name = "task-r1"
 path = "interfaces/kalosm/examples/task-r1.rs"
-required-features = ["llama", "structured", "tokio"]
+required-features = ["llama", "structured"]
 
 [[example]]
 name = "transcribe"
@@ -391,13 +389,12 @@ required-features = [
     "sound-source",
     "sound-voice-detection",
     "anyhow",
-    "tokio",
 ]
 
 [[example]]
 name = "vision"
 path = "interfaces/kalosm/examples/vision.rs"
-required-features = ["llama-vision", "tokio", "tracing-subscriber"]
+required-features = ["llama-vision", "tracing-subscriber"]
 
 [profile.dist]
 inherits = "release"

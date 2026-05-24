@@ -4,7 +4,7 @@ use fusor_tile_ir::{
 };
 
 use super::helpers::{index_n, reduce_workgroup, NEG_MAX_F32};
-use super::types::{FlashAttentionMeta, FlashDecodeSmallMeta};
+use super::types::{FlashAttentionDims, FlashAttentionMeta, FlashDecodeSmallMeta};
 
 const FLASH_BLOCK: usize = 256;
 const DECODE_HEAD_DIM: u32 = 128;
@@ -69,6 +69,11 @@ pub fn flash_attention<E: Numeric, const SUBGROUP_SIZE: u32, B>(
     if meta.mask_meta.is_some() != mask.is_some() {
         return None;
     }
+    if meta.causal && meta.mask_meta.is_some() {
+        // Causal mode is mutually exclusive with an explicit additive mask:
+        // the kernel skips out-of-bound kv positions and emits no mask add.
+        return None;
+    }
     let groups = meta.dims.num_heads.checked_div(meta.dims.num_kv_heads)?;
     if groups == 0 {
         return None;
@@ -107,6 +112,7 @@ pub fn flash_attention<E: Numeric, const SUBGROUP_SIZE: u32, B>(
             let weighted_local = program.private::<F32>();
 
             let kv_chunks = meta.dims.kv_seq_len.div_ceil(SUBGROUP_SIZE);
+            let causal = meta.causal;
             let [_final_m, final_s, final_o] = program.fold(
                 range(Tile::literal(TileLiteral::U32(kv_chunks))),
                 [
@@ -117,15 +123,37 @@ pub fn flash_attention<E: Numeric, const SUBGROUP_SIZE: u32, B>(
                 |program, chunk_idx, [m_state, s_state, o_state]| {
                     let chunk = Tile::from_index(chunk_idx);
                     let kv_idx = program.bind(
-                        chunk * Tile::literal(TileLiteral::U32(SUBGROUP_SIZE)) + kv_lane.clone(),
+                        chunk.clone() * Tile::literal(TileLiteral::U32(SUBGROUP_SIZE))
+                            + kv_lane.clone(),
                     );
-                    let kv_valid = program.bind(
+                    let bound_valid = program.bind(
                         kv_idx
                             .clone()
                             .lt(Tile::literal(TileLiteral::U32(meta.dims.kv_seq_len))),
                     );
+                    // For causal attention we additionally restrict to kv <= q.
+                    // We can also skip the per-dim Q·K work for an entire
+                    // chunk when `chunk_start > q_idx`: in that case every
+                    // lane's kv_idx > q_idx and the chunk's contribution is
+                    // zero. We still need to fold (so the post-loop
+                    // accumulator state is correct), but we gate the heavy
+                    // load+dot under `chunk_in_range`.
+                    let (kv_valid, chunk_in_range) = if causal {
+                        let chunk_start = program
+                            .bind(chunk.clone() * Tile::literal(TileLiteral::U32(SUBGROUP_SIZE)));
+                        let chunk_in_range = program.bind(chunk_start.le(q_idx.clone()));
+                        let kv_le_q = kv_idx.clone().le(q_idx.clone());
+                        let kv_valid = program.bind(bound_valid.clone().and(kv_le_q));
+                        (kv_valid, Some(chunk_in_range))
+                    } else {
+                        (bound_valid.clone(), None)
+                    };
                     program.store_local(&score_local, Tile::literal(TileLiteral::f32(NEG_MAX_F32)));
-                    program.if_then(kv_valid.clone(), |program| {
+                    let compute_guard = match &chunk_in_range {
+                        Some(in_range) => kv_valid.clone().and(in_range.clone()),
+                        None => kv_valid.clone(),
+                    };
+                    program.if_then(compute_guard, |program| {
                         let mut products = Vec::with_capacity(meta.dims.head_dim as usize);
                         for dim in 0..meta.dims.head_dim {
                             let q_index = index_n(
@@ -230,6 +258,470 @@ pub fn flash_attention<E: Numeric, const SUBGROUP_SIZE: u32, B>(
         });
     }
     Some(())
+}
+
+/// Q-batched streaming flash attention. Same online-softmax algorithm as
+/// [`flash_attention`], but each workgroup handles `Q_BLOCK` contiguous q_idx
+/// values, caching Q, K, and V slices in workgroup memory so the big
+/// `(kv_seq_len * head_dim)` K traffic and the per-chunk Q reads are reused
+/// across `Q_BLOCK` queries instead of being re-fetched per query.
+///
+/// Layout:
+/// - One workgroup per (batch, head, q_block).
+/// - `FLASH_BLOCK` lanes split into `outputs_per_workgroup` subgroups of
+///   `SUBGROUP_SIZE` lanes each. Each subgroup is pinned to one output dim;
+///   each lane within a subgroup is pinned to one kv position in the chunk.
+/// - Once per workgroup: load `Q[q_block, head_dim]` into workgroup memory.
+/// - Per chunk: cooperatively load `K[chunk_kv_positions, head_dim]` and
+///   `V[chunk_kv_positions, workgroup_out_dims]` into workgroup memory once,
+///   then loop over `Q_BLOCK` queries reusing those loads.
+pub fn flash_attention_tiled<E: Numeric, const SUBGROUP_SIZE: u32, const Q_BLOCK: u32, B>(
+    kb: &mut fusor_tile_ir::KernelBuilder<B>,
+    q: fusor_tile_ir::KernelTensorRef<B>,
+    k: fusor_tile_ir::KernelTensorRef<B>,
+    v: fusor_tile_ir::KernelTensorRef<B>,
+    mask: Option<fusor_tile_ir::KernelTensorRef<B>>,
+    output: fusor_tile_ir::KernelTensorRef<B>,
+    meta: FlashAttentionMeta,
+) -> Option<()> {
+    if SUBGROUP_SIZE == 0 || !(FLASH_BLOCK as u32).is_multiple_of(SUBGROUP_SIZE) || Q_BLOCK == 0 {
+        return None;
+    }
+    let outputs_per_workgroup = flash_outputs_per_workgroup(SUBGROUP_SIZE);
+    let q_strides: [u32; 4] = meta.q_meta.strides.as_slice().try_into().ok()?;
+    let k_strides: [u32; 4] = meta.k_meta.strides.as_slice().try_into().ok()?;
+    let v_strides: [u32; 4] = meta.v_meta.strides.as_slice().try_into().ok()?;
+    let output_strides: [u32; 4] = meta.output_meta.strides.as_slice().try_into().ok()?;
+    let mask_strides: Option<[u32; 2]> = if let Some(mask) = meta.mask_meta.as_ref() {
+        Some(mask.strides.as_slice().try_into().ok()?)
+    } else {
+        None
+    };
+    if meta.dims.batch == 0
+        || meta.dims.num_heads == 0
+        || meta.dims.num_kv_heads == 0
+        || meta.dims.q_seq_len == 0
+        || meta.dims.kv_seq_len == 0
+        || meta.dims.head_dim == 0
+    {
+        return None;
+    }
+    if meta.mask_meta.is_some() != mask.is_some() {
+        return None;
+    }
+    if meta.causal && meta.mask_meta.is_some() {
+        return None;
+    }
+    let groups = meta.dims.num_heads.checked_div(meta.dims.num_kv_heads)?;
+    if groups == 0 {
+        return None;
+    }
+    // Workgroup-memory budgets — keep totals well under the 32KB Apple cap.
+    // K cache: SUBGROUP_SIZE rows × head_dim cols.
+    let k_cache_elems = SUBGROUP_SIZE.checked_mul(meta.dims.head_dim)?;
+    if k_cache_elems > 4096 {
+        return None;
+    }
+    // V cache: SUBGROUP_SIZE rows × outputs_per_workgroup cols.
+    let v_cache_elems = SUBGROUP_SIZE.checked_mul(outputs_per_workgroup)?;
+    if v_cache_elems > 4096 {
+        return None;
+    }
+    // Q cache: Q_BLOCK rows × head_dim cols.
+    let q_cache_elems = Q_BLOCK.checked_mul(meta.dims.head_dim)?;
+    if q_cache_elems > 4096 {
+        return None;
+    }
+
+    let elem_fill = zero_fill::<E>();
+    let q = kb.read::<E, 1>(q);
+    let k = kb.read::<E, 1>(k);
+    let v = kb.read::<E, 1>(v);
+    let mask = mask.map(|m| kb.read::<E, 1>(m));
+    let output = kb.write::<E, 1>(output);
+    let phase = kb.program();
+    {
+        // Allocate workgroup caches once.
+        let k_cache = phase.alloc_workgroup_array::<F32>(k_cache_elems);
+        let v_cache = phase.alloc_workgroup_array::<F32>(v_cache_elems);
+        let q_cache = phase.alloc_workgroup_array::<F32>(q_cache_elems);
+        let q_blocks = meta.dims.q_seq_len.div_ceil(Q_BLOCK);
+        let dispatch_size = [
+            meta.dims.head_dim.div_ceil(outputs_per_workgroup),
+            meta.dims
+                .batch
+                .checked_mul(meta.dims.num_heads)?
+                .checked_mul(q_blocks)?,
+            1,
+        ];
+
+        phase.program_grid::<FLASH_BLOCK>(dispatch_size, |program| {
+            let lane = program.lane();
+            let workgroup_x = program.program_id(WorkgroupAxis::X);
+            let row = program.program_id(WorkgroupAxis::Y);
+            let q_block_idx = program.bind(program.index(row.clone() % q_blocks));
+            let row_over_q = row.clone() / q_blocks;
+            let head_idx = program.bind(program.index(row_over_q.clone() % meta.dims.num_heads));
+            let batch_idx = program.bind(program.index(row_over_q / meta.dims.num_heads));
+            let kv_head_idx =
+                program.bind(head_idx.clone() / Tile::literal(TileLiteral::U32(groups)));
+            let subgroup_idx = program.bind(program.index(lane.clone() / SUBGROUP_SIZE));
+            let kv_lane = program.bind(program.index(lane.clone() % SUBGROUP_SIZE));
+            let out_dim = program
+                .bind(program.index(workgroup_x * outputs_per_workgroup + subgroup_idx.clone()));
+            let out_valid = program.bind(
+                out_dim
+                    .clone()
+                    .lt(Tile::literal(TileLiteral::U32(meta.dims.head_dim))),
+            );
+
+            // Per-query accumulator state, stored in private locals indexed by
+            // q-offset within the workgroup's Q-block. Initialised below.
+            let mut m_locals: Vec<tile::Local<F32>> = Vec::with_capacity(Q_BLOCK as usize);
+            let mut s_locals: Vec<tile::Local<F32>> = Vec::with_capacity(Q_BLOCK as usize);
+            let mut o_locals: Vec<tile::Local<F32>> = Vec::with_capacity(Q_BLOCK as usize);
+            for _ in 0..Q_BLOCK {
+                m_locals.push(program.private::<F32>());
+                s_locals.push(program.private::<F32>());
+                o_locals.push(program.private::<F32>());
+            }
+            for q_offset in 0..Q_BLOCK {
+                program.store_local(
+                    &m_locals[q_offset as usize],
+                    Tile::literal(TileLiteral::f32(NEG_MAX_F32)),
+                );
+                program.store_local(
+                    &s_locals[q_offset as usize],
+                    Tile::literal(TileLiteral::f32(0.0)),
+                );
+                program.store_local(
+                    &o_locals[q_offset as usize],
+                    Tile::literal(TileLiteral::f32(0.0)),
+                );
+            }
+
+            let kv_chunks = meta.dims.kv_seq_len.div_ceil(SUBGROUP_SIZE);
+            let causal = meta.causal;
+
+            // Q-block base index in the q dimension.
+            let q_block_base =
+                program.bind(q_block_idx.clone() * Tile::literal(TileLiteral::U32(Q_BLOCK)));
+
+            // -----------------------------------------------------------
+            // One-shot Q cache load.
+            //
+            // Layout: q_cache[q_offset * head_dim + dim].
+            // Loaded once per workgroup, indexed by lane in strided passes
+            // of FLASH_BLOCK lanes each. Total = Q_BLOCK * head_dim ≤ 4096.
+            //
+            // The original streaming kernel re-loaded Q from global per
+            // (kv_chunk, q_idx, dim, lane) — 256× duplicate reads per
+            // (q_idx, dim) within a workgroup. Caching Q removes that.
+            // -----------------------------------------------------------
+            let total_q_loads = Q_BLOCK * meta.dims.head_dim;
+            let q_passes = total_q_loads.div_ceil(FLASH_BLOCK as u32);
+            for pass in 0..q_passes {
+                let pass_base = pass * FLASH_BLOCK as u32;
+                let idx = program.bind(lane.clone() + Tile::literal(TileLiteral::U32(pass_base)));
+                let q_offset_local = program.bind(idx.clone() / meta.dims.head_dim);
+                let dim_local = program.bind(idx.clone() % meta.dims.head_dim);
+                let q_pos = program.bind(q_block_base.clone() + q_offset_local.clone());
+                let in_bounds = idx
+                    .clone()
+                    .lt(Tile::literal(TileLiteral::U32(total_q_loads)))
+                    .and(
+                        q_pos
+                            .clone()
+                            .lt(Tile::literal(TileLiteral::U32(meta.dims.q_seq_len))),
+                    );
+                let q_index = index_n(
+                    meta.q_meta.offset,
+                    q_strides,
+                    (
+                        batch_idx.clone(),
+                        head_idx.clone(),
+                        q_pos.clone(),
+                        dim_local.clone(),
+                    ),
+                );
+                let q_val = program
+                    .load(q.at(q_index), in_bounds.clone(), elem_fill)
+                    .cast::<F32>();
+                let store_in_bounds = idx
+                    .clone()
+                    .lt(Tile::literal(TileLiteral::U32(total_q_loads)));
+                program.if_then(store_in_bounds, |program| {
+                    program.store_workgroup(q_cache, idx.clone(), q_val);
+                });
+            }
+            program.workgroup_barrier();
+
+            // Per-iteration scratch local used to bridge values across if_then.
+            let score_local = program.private::<F32>();
+
+            // Runtime chunk counter; collapses the kv-chunk dimension into a
+            // single IR loop rather than unrolling `kv_chunks` copies of the
+            // body (which blew up code size for big prefills).
+            let chunk_local = program.private::<U32>();
+            program.store_local(&chunk_local, Tile::literal(TileLiteral::U32(0)));
+            program.loop_forever(|program| {
+                let chunk_tile = program.bind(program.load_local(&chunk_local));
+                program.break_if(
+                    chunk_tile
+                        .clone()
+                        .ge(Tile::literal(TileLiteral::U32(kv_chunks))),
+                );
+                let chunk_start = program
+                    .bind(chunk_tile.clone() * Tile::literal(TileLiteral::U32(SUBGROUP_SIZE)));
+                if causal {
+                    let q_block_last = program.bind(
+                        (q_block_base.clone()
+                            + Tile::literal(TileLiteral::U32(Q_BLOCK.saturating_sub(1))))
+                        .min(Tile::literal(TileLiteral::U32(meta.dims.q_seq_len - 1))),
+                    );
+                    program.break_if(chunk_start.clone().gt(q_block_last));
+                }
+                let kv_idx = program.bind(chunk_start.clone() + kv_lane.clone());
+                let bound_valid = program.bind(
+                    kv_idx
+                        .clone()
+                        .lt(Tile::literal(TileLiteral::U32(meta.dims.kv_seq_len))),
+                );
+
+                // -------------------------------------------------------
+                // Cooperative load of K[chunk kv rows, all head_dim] into
+                // workgroup memory. Indexed by `kv_local * head_dim + dim`.
+                // Strided across FLASH_BLOCK lanes. The k_cache_elems check
+                // above guarantees total ≤ 4096, and we use mask-load + an
+                // if_then-guarded store to handle the last partial pass
+                // (only fires when total_k_loads % FLASH_BLOCK != 0).
+                // -------------------------------------------------------
+                let total_k_loads = SUBGROUP_SIZE * meta.dims.head_dim;
+                let k_passes = total_k_loads.div_ceil(FLASH_BLOCK as u32);
+                let k_aligned = total_k_loads.is_multiple_of(FLASH_BLOCK as u32);
+                for pass in 0..k_passes {
+                    let pass_base = pass * FLASH_BLOCK as u32;
+                    let idx =
+                        program.bind(lane.clone() + Tile::literal(TileLiteral::U32(pass_base)));
+                    let kv_local = program.bind(idx.clone() / meta.dims.head_dim);
+                    let dim_local = program.bind(idx.clone() % meta.dims.head_dim);
+                    let kv_pos = program.bind(chunk_start.clone() + kv_local.clone());
+                    let in_bounds = if k_aligned {
+                        kv_pos
+                            .clone()
+                            .lt(Tile::literal(TileLiteral::U32(meta.dims.kv_seq_len)))
+                    } else {
+                        idx.clone()
+                            .lt(Tile::literal(TileLiteral::U32(total_k_loads)))
+                            .and(
+                                kv_pos
+                                    .clone()
+                                    .lt(Tile::literal(TileLiteral::U32(meta.dims.kv_seq_len))),
+                            )
+                    };
+                    let k_index = index_n(
+                        meta.k_meta.offset,
+                        k_strides,
+                        (
+                            batch_idx.clone(),
+                            kv_head_idx.clone(),
+                            kv_pos.clone(),
+                            dim_local.clone(),
+                        ),
+                    );
+                    let k_val = program
+                        .load(k.at(k_index), in_bounds.clone(), elem_fill)
+                        .cast::<F32>();
+                    if k_aligned {
+                        program.store_workgroup(k_cache, idx.clone(), k_val);
+                    } else {
+                        let store_in_bounds = idx
+                            .clone()
+                            .lt(Tile::literal(TileLiteral::U32(total_k_loads)));
+                        program.if_then(store_in_bounds, |program| {
+                            program.store_workgroup(k_cache, idx.clone(), k_val.clone());
+                        });
+                    }
+                }
+
+                // Cooperative load of V[chunk kv rows, out_dims handled by
+                // workgroup] into workgroup memory. Each lane loads exactly
+                // one V cell at (kv_lane, subgroup_idx).
+                let v_cell_idx =
+                    program.bind(kv_lane.clone() * outputs_per_workgroup + subgroup_idx.clone());
+                let v_in_bounds = bound_valid.clone().and(out_valid.clone());
+                let v_index = index_n(
+                    meta.v_meta.offset,
+                    v_strides,
+                    (
+                        batch_idx.clone(),
+                        kv_head_idx.clone(),
+                        kv_idx.clone(),
+                        out_dim.clone(),
+                    ),
+                );
+                let v_val = program
+                    .load(v.at(v_index), v_in_bounds.clone(), elem_fill)
+                    .cast::<F32>();
+                program.store_workgroup(v_cache, v_cell_idx.clone(), v_val);
+
+                program.workgroup_barrier();
+
+                // -------------------------------------------------------
+                // For each query in the Q block, compute score, update the
+                // online-softmax stats, accumulate weighted V. Q and K both
+                // come from workgroup memory; only the optional mask still
+                // comes from global.
+                // -------------------------------------------------------
+                for q_offset in 0..Q_BLOCK {
+                    let q_idx = program
+                        .bind(q_block_base.clone() + Tile::literal(TileLiteral::U32(q_offset)));
+                    let q_in_range = program.bind(
+                        q_idx
+                            .clone()
+                            .lt(Tile::literal(TileLiteral::U32(meta.dims.q_seq_len))),
+                    );
+
+                    let (kv_valid, chunk_in_range) = if causal {
+                        let chunk_in_range = program.bind(chunk_start.clone().le(q_idx.clone()));
+                        let kv_le_q = kv_idx.clone().le(q_idx.clone());
+                        let kv_valid =
+                            program.bind(bound_valid.clone().and(kv_le_q).and(q_in_range.clone()));
+                        (kv_valid, Some(chunk_in_range))
+                    } else {
+                        let kv_valid = program.bind(bound_valid.clone().and(q_in_range.clone()));
+                        (kv_valid, None)
+                    };
+
+                    program.store_local(&score_local, Tile::literal(TileLiteral::f32(NEG_MAX_F32)));
+                    let compute_guard = match &chunk_in_range {
+                        Some(in_range) => kv_valid.clone().and(in_range.clone()),
+                        None => kv_valid.clone(),
+                    };
+                    program.if_then(compute_guard, |program| {
+                        let mut products = Vec::with_capacity(meta.dims.head_dim as usize);
+                        for dim in 0..meta.dims.head_dim {
+                            // Q from workgroup cache: q_cache[q_offset*head_dim + dim].
+                            let q_cache_idx = Tile::literal(TileLiteral::U32(
+                                q_offset * meta.dims.head_dim + dim,
+                            ));
+                            let q_value = program.load_workgroup(q_cache, q_cache_idx);
+                            // K from workgroup cache: k_cache[kv_lane*head_dim + dim].
+                            let k_cache_idx = kv_lane.clone() * meta.dims.head_dim
+                                + Tile::literal(TileLiteral::U32(dim));
+                            let k_value = program.load_workgroup(k_cache, k_cache_idx);
+                            products.push(q_value * k_value);
+                        }
+                        let mut score = program.sum(products)
+                            * Tile::literal(TileLiteral::f32(meta.scale.get()));
+                        if let (Some(mask), Some(mask_meta), Some(mask_strides)) =
+                            (&mask, meta.mask_meta.as_ref(), mask_strides)
+                        {
+                            let mask_index = index_n(
+                                mask_meta.offset,
+                                mask_strides,
+                                (q_idx.clone(), kv_idx.clone()),
+                            );
+                            let mask_value = program
+                                .load(mask.at(mask_index), Mask::all(), elem_fill)
+                                .cast::<F32>();
+                            score = score + mask_value;
+                        }
+                        program.store_local(&score_local, score);
+                    });
+
+                    let score = program.bind(program.load_local(&score_local));
+                    let block_max = program.bind(program.subgroup_reduce_max(score.clone()));
+                    let old_m = program.bind(program.load_local(&m_locals[q_offset as usize]));
+                    let new_m = program.bind(old_m.clone().max(block_max.clone()));
+                    let raw_exp = (score.clone() - new_m.clone()).exp();
+                    let exp_score = program.bind(Tile::select(
+                        kv_valid.clone(),
+                        raw_exp,
+                        Tile::literal(TileLiteral::f32(0.0)),
+                    ));
+                    let block_sum = program.bind(program.subgroup_reduce_sum(exp_score.clone()));
+
+                    // Weighted V: load V from workgroup cache.
+                    let v_cache_idx =
+                        kv_lane.clone() * outputs_per_workgroup + subgroup_idx.clone();
+                    let v_cached = program.bind(program.load_workgroup(v_cache, v_cache_idx));
+                    let weighted = Tile::select(
+                        kv_valid.clone().and(out_valid.clone()),
+                        exp_score.clone() * v_cached,
+                        Tile::literal(TileLiteral::f32(0.0)),
+                    );
+                    let block_out = program.bind(program.subgroup_reduce_sum(weighted));
+
+                    let old_m_scale = program.bind((old_m.clone() - new_m.clone()).exp());
+                    let old_s = program.load_local(&s_locals[q_offset as usize]);
+                    let new_s = old_s * old_m_scale.clone() + block_sum;
+                    let old_o = program.load_local(&o_locals[q_offset as usize]);
+                    let new_o = old_o * old_m_scale + block_out;
+                    program.store_local(&m_locals[q_offset as usize], new_m);
+                    program.store_local(&s_locals[q_offset as usize], new_s);
+                    program.store_local(&o_locals[q_offset as usize], new_o);
+                }
+
+                // Barrier before next chunk's K/V load overwrites the cache.
+                program.workgroup_barrier();
+
+                program.store_local(
+                    &chunk_local,
+                    chunk_tile + Tile::literal(TileLiteral::U32(1)),
+                );
+            });
+
+            // Write each query's accumulated output.
+            for q_offset in 0..Q_BLOCK {
+                let q_idx =
+                    program.bind(q_block_base.clone() + Tile::literal(TileLiteral::U32(q_offset)));
+                let q_in_range = program.bind(
+                    q_idx
+                        .clone()
+                        .lt(Tile::literal(TileLiteral::U32(meta.dims.q_seq_len))),
+                );
+                let store_valid = kv_lane
+                    .clone()
+                    .eq(Tile::literal(TileLiteral::U32(0)))
+                    .and(out_valid.clone())
+                    .and(q_in_range);
+                let final_o = program.bind(program.load_local(&o_locals[q_offset as usize]));
+                let final_s = program.bind(program.load_local(&s_locals[q_offset as usize]));
+                program.if_then(store_valid, |program| {
+                    let output_value = (final_o.clone() / final_s.clone()).cast::<E>();
+                    let output_index = index_n(
+                        meta.output_meta.offset,
+                        output_strides,
+                        (
+                            batch_idx.clone(),
+                            head_idx.clone(),
+                            q_idx.clone(),
+                            out_dim.clone(),
+                        ),
+                    );
+                    program.store(output.at(output_index), output_value, Mask::all());
+                });
+            }
+        });
+    }
+    Some(())
+}
+
+/// Dispatch grid for the tiled (Q-batched) flash-attention kernel.
+pub fn flash_tiled_dispatch_size(
+    dims: FlashAttentionDims,
+    outputs_per_workgroup: u32,
+    q_block: u32,
+) -> [u32; 3] {
+    [
+        dims.head_dim.div_ceil(outputs_per_workgroup),
+        dims.batch
+            .checked_mul(dims.num_heads)
+            .and_then(|value| value.checked_mul(dims.q_seq_len.div_ceil(q_block)))
+            .expect("flash attention tiled dispatch overflow"),
+        1,
+    ]
 }
 
 struct DecodeScoreForKv<'a> {

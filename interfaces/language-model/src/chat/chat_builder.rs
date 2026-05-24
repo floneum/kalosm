@@ -172,10 +172,7 @@ impl<M: CreateChatSession> Chat<M> {
         self.queued_messages = existing_history;
 
         // Set the new chat session
-        assert!(
-            self.session.is_none(),
-            "Chat session already set"
-        );
+        assert!(self.session.is_none(), "Chat session already set");
         self.session = Some(Ok(session));
 
         self
@@ -255,11 +252,9 @@ impl<M: CreateChatSession> Chat<M> {
     /// Returns `Err(M::Error)` if initialization failed; the error is consumed
     /// and the slot is left empty so future calls can retry.
     fn session_take(&mut self) -> Result<M::ChatSession, M::Error> {
-        let session = self
-            .session
+        self.session
             .take()
-            .unwrap_or_else(|| self.model.new_chat_session());
-        session
+            .unwrap_or_else(|| self.model.new_chat_session())
     }
 
     /// Get a reference to the chat session, initializing it if needed.

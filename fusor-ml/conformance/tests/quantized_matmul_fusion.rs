@@ -4,9 +4,8 @@ use common::quantized::{
     deterministic_input, q_mat_mul_input_fuzz, q4k_raw_bytes, q6k_raw_bytes, q8_0_raw_bytes,
     qmatrix_from_raw_bytes,
 };
-use fusor::{Device, Tensor};
+use fusor::{Device, GgmlType, Tensor};
 use fusor_conformance::{approx_compare, approx_eq, available_devices};
-use fusor_cpu::GgmlType;
 use rand::distr::Uniform;
 
 #[tokio::test]

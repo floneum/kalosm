@@ -13,7 +13,9 @@ impl Resolver {
                     *count = count.saturating_sub(1);
                     if *count == 0 && !targets.contains(&dep) && !graph.has_live_reference(dep) {
                         // All consumers within this execution have been
-                        // processed — free the cached buffer.
+                        // processed and no user-held lazy tensor still
+                        // transitively depends on `dep` — free the cached
+                        // buffer.
                         if let Some(node) = graph.nodes.nodes.node_weight_mut(dep) {
                             node.cached = None;
                         }
@@ -43,7 +45,7 @@ impl Resolver {
                     *count = count.saturating_sub(1);
                     if *count == 0
                         && !targets.contains(&dep)
-                        && !graph.has_live_reference(dep)
+                        && !graph.has_live_lazy_descendant(dep)
                         && let Some(node) = graph.nodes.nodes.node_weight_mut(dep)
                     {
                         node.cached = None;
@@ -465,7 +467,7 @@ impl Resolver {
     ) {
         let inner_idx = self.execution_graph[node_idx].inner_idx;
         for &input in inputs {
-            graph.nodes.nodes.add_edge(input, inner_idx, ());
+            graph.add_dependency_edge(input, inner_idx);
         }
     }
 

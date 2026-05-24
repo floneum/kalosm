@@ -31,58 +31,60 @@ fn source() -> LlamaSource {
     }
 }
 
-#[tokio::main]
-async fn main() {
-    let warmup = env_usize("KALOSM_PROFILE_LLAMA_WARMUP", 4);
-    let measured = env_usize("KALOSM_PROFILE_LLAMA_TOKENS", 16);
-    let prompt = std::env::var("KALOSM_PROFILE_LLAMA_PROMPT")
-        .unwrap_or_else(|_| "Write one compact Rust performance tip:".into());
+fn main() {
+    pollster::block_on(async {
+        let warmup = env_usize("KALOSM_PROFILE_LLAMA_WARMUP", 4);
+        let measured = env_usize("KALOSM_PROFILE_LLAMA_TOKENS", 16);
+        let prompt = std::env::var("KALOSM_PROFILE_LLAMA_PROMPT")
+            .unwrap_or_else(|_| "Write one compact Rust performance tip:".into());
 
-    let model = Llama::builder()
-        .with_source(source())
-        .build_with_loading_handler(|_: ModelLoadingProgress| {})
-        .await
-        .unwrap();
+        let model = Llama::builder()
+            .with_source(source())
+            .build_with_loading_handler(|_: ModelLoadingProgress| {})
+            .await
+            .unwrap();
 
-    let prompt_tokens = model
-        .tokenizer()
-        .encode(prompt.as_str(), true)
-        .unwrap()
-        .len();
-    let sampler = if std::env::var_os("KALOSM_PROFILE_LLAMA_UNBOUNDED").is_some() {
-        GenerationParameters::default()
-    } else {
-        GenerationParameters::default().with_max_length((prompt_tokens + warmup + measured) as u32)
-    };
-    let sampler = match std::env::var("KALOSM_PROFILE_LLAMA_TOP_K")
-        .ok()
-        .and_then(|value| value.parse().ok())
-    {
-        Some(top_k) => sampler.with_top_k(top_k),
-        None => sampler,
-    };
-    let mut stream = model
-        .complete(&prompt)
-        .with_sampler(sampler)
-        .take(warmup + measured);
-    for _ in 0..warmup {
-        if stream.next().await.is_none() {
-            eprintln!("stream ended during warmup");
-            return;
+        let prompt_tokens = model
+            .tokenizer()
+            .encode(prompt.as_str(), true)
+            .unwrap()
+            .len();
+        let sampler = if std::env::var_os("KALOSM_PROFILE_LLAMA_UNBOUNDED").is_some() {
+            GenerationParameters::default()
+        } else {
+            GenerationParameters::default()
+                .with_max_length((prompt_tokens + warmup + measured) as u32)
+        };
+        let sampler = match std::env::var("KALOSM_PROFILE_LLAMA_TOP_K")
+            .ok()
+            .and_then(|value| value.parse().ok())
+        {
+            Some(top_k) => sampler.with_top_k(top_k),
+            None => sampler,
+        };
+        let mut stream = model
+            .complete(&prompt)
+            .with_sampler(sampler)
+            .take(warmup + measured);
+        for _ in 0..warmup {
+            if stream.next().await.is_none() {
+                eprintln!("stream ended during warmup");
+                return;
+            }
         }
-    }
 
-    let start = std::time::Instant::now();
-    let mut tokens = 0usize;
-    while tokens < measured {
-        if stream.next().await.is_none() {
-            break;
+        let start = std::time::Instant::now();
+        let mut tokens = 0usize;
+        while tokens < measured {
+            if stream.next().await.is_none() {
+                break;
+            }
+            tokens += 1;
         }
-        tokens += 1;
-    }
-    let elapsed = start.elapsed();
-    let per_token_ms = elapsed.as_secs_f64() * 1_000.0 / tokens.max(1) as f64;
-    println!(
-        "llama_forward_profile tokens={tokens} elapsed={elapsed:?} per_token_ms={per_token_ms:.3}"
-    );
+        let elapsed = start.elapsed();
+        let per_token_ms = elapsed.as_secs_f64() * 1_000.0 / tokens.max(1) as f64;
+        println!(
+            "llama_forward_profile tokens={tokens} elapsed={elapsed:?} per_token_ms={per_token_ms:.3}"
+        );
+    });
 }

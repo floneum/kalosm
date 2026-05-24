@@ -1,7 +1,7 @@
 //! Conformance: non-f32 dtype coverage.
 //!
 //! `fusor::Tensor` carries `f32`, `f16`, and `u32`. f16 ops route through
-//! a scalar fallback on CPU (`fusor_cpu::F16Scalar`); these tests pin that
+//! a scalar fallback on CPU; these tests pin that
 //! the fallback agrees with the GPU path and host-side reference math.
 //!
 //! `f64`/`i32`/`i64`/`u8` are not part of the unified `fusor::Tensor` enum

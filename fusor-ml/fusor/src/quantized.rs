@@ -232,12 +232,12 @@ impl QMatrix {
     /// Panics if the tensor's rank doesn't match R.
     pub fn dequantize<const R: usize>(&self) -> Tensor<R, f32> {
         match self {
-            QMatrix::CpuQ4_0(t) => Tensor::Cpu(crate::cpu::Tensor::new(t.dequantize::<R>())),
-            QMatrix::CpuQ5_0(t) => Tensor::Cpu(crate::cpu::Tensor::new(t.dequantize::<R>())),
-            QMatrix::CpuQ8_0(t) => Tensor::Cpu(crate::cpu::Tensor::new(t.dequantize::<R>())),
-            QMatrix::CpuQ4K(t) => Tensor::Cpu(crate::cpu::Tensor::new(t.dequantize::<R>())),
-            QMatrix::CpuQ5K(t) => Tensor::Cpu(crate::cpu::Tensor::new(t.dequantize::<R>())),
-            QMatrix::CpuQ6K(t) => Tensor::Cpu(crate::cpu::Tensor::new(t.dequantize::<R>())),
+            QMatrix::CpuQ4_0(t) => Tensor::Cpu(crate::cpu::TypedTensor::new(t.dequantize::<R>())),
+            QMatrix::CpuQ5_0(t) => Tensor::Cpu(crate::cpu::TypedTensor::new(t.dequantize::<R>())),
+            QMatrix::CpuQ8_0(t) => Tensor::Cpu(crate::cpu::TypedTensor::new(t.dequantize::<R>())),
+            QMatrix::CpuQ4K(t) => Tensor::Cpu(crate::cpu::TypedTensor::new(t.dequantize::<R>())),
+            QMatrix::CpuQ5K(t) => Tensor::Cpu(crate::cpu::TypedTensor::new(t.dequantize::<R>())),
+            QMatrix::CpuQ6K(t) => Tensor::Cpu(crate::cpu::TypedTensor::new(t.dequantize::<R>())),
             QMatrix::CpuF32(t) => {
                 let shape = t.shape();
                 assert_eq!(
@@ -252,7 +252,7 @@ impl QMatrix {
                     Layout::contiguous(&arr_shape),
                     t.data().clone(),
                 );
-                Tensor::Cpu(crate::cpu::Tensor::new(concrete))
+                Tensor::Cpu(crate::cpu::TypedTensor::new(concrete))
             }
             QMatrix::CpuF16(t) => {
                 let shape = t.shape();
@@ -272,9 +272,9 @@ impl QMatrix {
                     Layout::contiguous(&arr_shape),
                     data.into_boxed_slice(),
                 );
-                Tensor::Cpu(crate::cpu::Tensor::new(concrete))
+                Tensor::Cpu(crate::cpu::TypedTensor::new(concrete))
             }
-            QMatrix::Gpu(m) => Tensor::Gpu(m.dequantize()),
+            QMatrix::Gpu(m) => Tensor::Gpu(crate::GpuTensor::from_core(m.dequantize::<f32>())),
         }
     }
 }

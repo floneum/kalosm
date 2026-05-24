@@ -28,7 +28,7 @@ image.workspace = true
 tracing = "0.1.37"
 
 [dev-dependencies]
-tokio = { version = "1.32.0", features = ["full"] }
+pollster = "0.4"
 anyhow.workspace = true
 
 [features]

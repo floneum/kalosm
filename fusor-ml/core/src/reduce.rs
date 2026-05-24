@@ -3,7 +3,11 @@ use std::hash::Hash;
 use rustc_hash::FxHasher;
 
 use crate::{
-    Dim, LastRank, LastRankInner, NextRankInner,
+    Layout, Tensor,
+    compute_graph::NodeIndex,
+    tensor::{DataTypeEnum, TensorData},
+};
+use crate::{
     mir::{
         inputs::MirValue,
         kernel_backend::DirectKernel,
@@ -13,29 +17,20 @@ use crate::{
     nary_wise::{NaryScalar, UnaryFunctionChain},
     visit_tiled::distribute_workgroups,
 };
-use crate::{
-    Layout, Tensor,
-    compute_graph::NodeIndex,
-    tensor::{DataType, DataTypeEnum, TensorData},
-};
 
 /// Unsqueeze a reduced tensor back to its original rank by inserting a size-1 dim.
 /// This is equivalent to `tensor.unsqueeze(dim)` but implemented inline to avoid
 /// depending on the removed composite unsqueeze operation.
-fn unsqueeze_dim<const N: usize, const O: usize, D: DataType>(
-    tensor: &Tensor<O, D>,
-    dim_idx: usize,
-) -> Tensor<N, D> {
+fn unsqueeze_dim(tensor: &Tensor, dim_idx: usize) -> Tensor {
     let old_shape = tensor.shape();
-    let new_shape: [usize; N] = std::array::from_fn(|i| {
-        if i < dim_idx {
-            old_shape[i]
-        } else if i == dim_idx {
-            1
-        } else {
-            old_shape[i - 1]
-        }
-    });
+    assert!(
+        dim_idx <= old_shape.len(),
+        "cannot unsqueeze dim {dim_idx} for shape {old_shape:?}"
+    );
+    let mut new_shape = Vec::with_capacity(old_shape.len() + 1);
+    new_shape.extend_from_slice(&old_shape[..dim_idx]);
+    new_shape.push(1);
+    new_shape.extend_from_slice(&old_shape[dim_idx..]);
     tensor.reshape(new_shape)
 }
 
@@ -212,88 +207,53 @@ pub(crate) enum ReduceOp {
     Product,
 }
 
-impl<const N: usize, D: DataType> Tensor<N, D> {
-    pub fn sum<const O: usize>(&self, dim: impl Dim<N>) -> Tensor<O, D>
-    where
-        Self: LastRank<O, D>,
-    {
-        self.reduce(sum_fn::<D>(), dim)
+impl Tensor {
+    pub fn sum(&self, dim: usize) -> Tensor {
+        self.reduce(sum_fn(self.datatype()), dim)
     }
 
-    pub fn sum_keepdim<const O: usize>(&self, dim: impl Dim<N>) -> Self
-    where
-        Self: LastRank<O, D>,
-        <Self as LastRankInner>::LastRank: NextRankInner<NextRank = Self>,
-    {
-        let dim_idx = dim.resolve();
+    pub fn sum_keepdim(&self, dim: usize) -> Self {
         let reduced = self.sum(dim);
-        unsqueeze_dim::<N, O, D>(&reduced, dim_idx)
+        unsqueeze_dim(&reduced, dim)
     }
 }
 
-fn sum_fn<D: DataType>() -> ReduceFunction {
-    ReduceFunction::new(ReduceOp::Sum, zero_for_dtype(D::DATA_TYPE), D::DATA_TYPE).with_name("sum")
+fn sum_fn(datatype: DataTypeEnum) -> ReduceFunction {
+    ReduceFunction::new(ReduceOp::Sum, zero_for_dtype(datatype), datatype).with_name("sum")
 }
 
-impl<const N: usize, T: DataType> Tensor<N, T> {
-    pub fn max<const O: usize>(&self, dim: impl Dim<N>) -> Tensor<O, T>
-    where
-        Self: LastRank<O, T>,
-    {
-        self.reduce(max_fn::<T>(), dim)
+impl Tensor {
+    pub fn max(&self, dim: usize) -> Tensor {
+        self.reduce(max_fn(self.datatype()), dim)
     }
 
-    pub fn max_keepdim<const O: usize>(&self, dim: impl Dim<N>) -> Self
-    where
-        Self: LastRank<O, T>,
-        <Self as LastRankInner>::LastRank: NextRankInner<NextRank = Self>,
-    {
-        let dim_idx = dim.resolve();
+    pub fn max_keepdim(&self, dim: usize) -> Self {
         let reduced = self.max(dim);
-        unsqueeze_dim::<N, O, T>(&reduced, dim_idx)
+        unsqueeze_dim(&reduced, dim)
     }
 }
 
-fn max_fn<D: DataType>() -> ReduceFunction {
-    ReduceFunction::new(
-        ReduceOp::Max,
-        min_scalar_for_dtype(D::DATA_TYPE),
-        D::DATA_TYPE,
-    )
-    .with_name("max")
+fn max_fn(datatype: DataTypeEnum) -> ReduceFunction {
+    ReduceFunction::new(ReduceOp::Max, min_scalar_for_dtype(datatype), datatype).with_name("max")
 }
 
-fn min_fn<D: DataType>() -> ReduceFunction {
-    ReduceFunction::new(
-        ReduceOp::Min,
-        max_scalar_for_dtype(D::DATA_TYPE),
-        D::DATA_TYPE,
-    )
-    .with_name("min")
+fn min_fn(datatype: DataTypeEnum) -> ReduceFunction {
+    ReduceFunction::new(ReduceOp::Min, max_scalar_for_dtype(datatype), datatype).with_name("min")
 }
 
-impl<const N: usize, D: DataType> Tensor<N, D> {
-    pub fn min<const O: usize>(&self, dim: impl Dim<N>) -> Tensor<O, D>
-    where
-        Self: LastRank<O, D>,
-    {
-        self.reduce(min_fn::<D>(), dim)
+impl Tensor {
+    pub fn min(&self, dim: usize) -> Tensor {
+        self.reduce(min_fn(self.datatype()), dim)
     }
 
-    pub fn min_keepdim<const O: usize>(&self, dim: impl Dim<N>) -> Self
-    where
-        Self: LastRank<O, D>,
-        <Self as LastRankInner>::LastRank: NextRankInner<NextRank = Self>,
-    {
-        let dim_idx = dim.resolve();
+    pub fn min_keepdim(&self, dim: usize) -> Self {
         let reduced = self.min(dim);
-        unsqueeze_dim::<N, O, D>(&reduced, dim_idx)
+        unsqueeze_dim(&reduced, dim)
     }
 }
 
-fn product_fn<D: DataType>() -> ReduceFunction {
-    ReduceFunction::new(ReduceOp::Product, one_for_dtype(D::DATA_TYPE), D::DATA_TYPE)
-        .with_name("product")
+fn product_fn(datatype: DataTypeEnum) -> ReduceFunction {
+    ReduceFunction::new(ReduceOp::Product, one_for_dtype(datatype), datatype).with_name("product")
 }
 
 fn zero_for_dtype(dtype: DataTypeEnum) -> NaryScalar {
@@ -328,21 +288,13 @@ fn max_scalar_for_dtype(dtype: DataTypeEnum) -> NaryScalar {
     }
 }
 
-impl<const N: usize, D: DataType> Tensor<N, D> {
-    pub fn product<const O: usize>(&self, dim: impl Dim<N>) -> Tensor<O, D>
-    where
-        Self: LastRank<O, D>,
-    {
-        self.reduce(product_fn::<D>(), dim)
+impl Tensor {
+    pub fn product(&self, dim: usize) -> Tensor {
+        self.reduce(product_fn(self.datatype()), dim)
     }
 
-    pub fn product_keepdim<const O: usize>(&self, dim: impl Dim<N>) -> Self
-    where
-        Self: LastRank<O, D>,
-        <Self as LastRankInner>::LastRank: NextRankInner<NextRank = Self>,
-    {
-        let dim_idx = dim.resolve();
+    pub fn product_keepdim(&self, dim: usize) -> Self {
         let reduced = self.product(dim);
-        unsqueeze_dim::<N, O, D>(&reduced, dim_idx)
+        unsqueeze_dim(&reduced, dim)
     }
 }

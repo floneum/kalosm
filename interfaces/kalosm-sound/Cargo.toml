@@ -40,3 +40,4 @@ source = ["dep:tokio", "dep:cpal"]
 kalosm = { workspace = true, features = ["sound", "sound-source"], default-features = true }
 anyhow.workspace = true
 kalosm-streams.workspace = true
+pollster = "0.4"

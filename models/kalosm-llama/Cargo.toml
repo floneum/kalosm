@@ -41,7 +41,7 @@ getrandom = { version = "0.3", features = ["wasm_js"], optional = true }
 
 [dev-dependencies]
 ahash = "0.8.12"
-tokio = { version = "1.32.0", features = ["full"] }
+pollster = "0.4"
 tracing-subscriber = "0.3.18"
 pretty_assertions = "1.4.1"
 kalosm = { workspace = true, features = [

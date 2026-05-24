@@ -41,7 +41,7 @@ where
         let total_elements: usize = shape.iter().product();
         assert_eq!(data.len(), total_elements, "Data length must match shape");
         match device {
-            Device::Cpu => Tensor::Cpu(crate::cpu::Tensor::from_slice(shape, data)),
+            Device::Cpu => Tensor::Cpu(crate::cpu::TypedTensor::from_slice(shape, data)),
             Device::Gpu(gpu_device) => {
                 Tensor::Gpu(crate::gpu::Tensor::from_slice(gpu_device, shape, data))
             }
@@ -64,7 +64,7 @@ where
         match device {
             Device::Cpu => {
                 let data = vec![value; shape.iter().product()];
-                Tensor::Cpu(crate::cpu::Tensor::from_slice(shape, &data))
+                Tensor::Cpu(crate::cpu::TypedTensor::from_slice(shape, &data))
             }
             Device::Gpu(gpu_device) => {
                 Tensor::Gpu(crate::gpu::Tensor::splat(gpu_device, value, shape))

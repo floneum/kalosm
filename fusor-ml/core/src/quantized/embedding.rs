@@ -239,7 +239,9 @@ impl Operation for QEmbeddingOperation {
 }
 
 impl QMatrix {
-    pub fn index_select_rows(&self, indexes: &Tensor<1, u32>) -> Tensor<2, f32> {
+    pub fn index_select_rows(&self, indexes: &Tensor) -> Tensor {
+        indexes.assert_rank::<1>();
+        indexes.assert_datatype::<u32>();
         assert_eq!(
             self.shape.len(),
             2,
@@ -247,7 +249,7 @@ impl QMatrix {
             self.shape.len()
         );
         if self.datatype == GgmlType::F32 {
-            let dense: Tensor<2, f32> = self.dequantize();
+            let dense = self.dequantize::<f32>();
             return dense.index_select(0, indexes);
         }
         let index_count = indexes.shape()[0];
@@ -267,23 +269,29 @@ mod tests {
 
     use super::*;
 
-    #[tokio::test]
-    async fn q4k_embedding_lookup_matches_dequantized_rows() {
-        let Ok(device) = Device::new().await else {
-            return;
-        };
+    #[test]
+    fn q4k_embedding_lookup_matches_dequantized_rows() {
+        pollster::block_on(async {
+            let Ok(device) = Device::new().await else {
+                return;
+            };
 
-        let shape = [4usize, BlockQ4K::BLOCK_SIZE];
-        let block_count = shape.iter().product::<usize>() / BlockQ4K::BLOCK_SIZE;
-        let raw_bytes = vec![0; block_count * size_of::<BlockQ4K>()];
-        let matrix =
-            QMatrix::from_parts(&device, &raw_bytes, shape.into(), fusor_gguf::GgmlType::Q4K)
+            let shape = [4usize, BlockQ4K::BLOCK_SIZE];
+            let block_count = shape.iter().product::<usize>() / BlockQ4K::BLOCK_SIZE;
+            let raw_bytes = vec![0; block_count * size_of::<BlockQ4K>()];
+            let matrix =
+                QMatrix::from_parts(&device, &raw_bytes, shape.into(), fusor_gguf::GgmlType::Q4K)
+                    .unwrap();
+            let indexes = Tensor::new::<u32, 1, _>(&device, [0u32, 3u32].as_slice());
+
+            let result = matrix
+                .index_select_rows(&indexes)
+                .as_slice::<2, f32>()
+                .await
                 .unwrap();
-        let indexes: Tensor<1, u32> = Tensor::new(&device, [0u32, 3u32].as_slice());
 
-        let result = matrix.index_select_rows(&indexes).as_slice().await.unwrap();
-
-        assert_eq!(result.shape(), &[2, BlockQ4K::BLOCK_SIZE]);
-        assert!(result.as_slice().iter().all(|value| *value == 0.0));
+            assert_eq!(result.shape(), &[2, BlockQ4K::BLOCK_SIZE]);
+            assert!(result.as_slice().iter().all(|value| *value == 0.0));
+        });
     }
 }

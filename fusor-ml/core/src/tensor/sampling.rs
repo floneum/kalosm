@@ -1,7 +1,7 @@
 use super::{DataTypeEnum, Tensor, TensorData};
 use crate::quantized::QMatrix;
 
-impl Tensor<1, f32> {
+impl Tensor {
     pub async fn try_sample_mirostat2_token_q_mat(
         &self,
         matrix: &QMatrix,
@@ -9,6 +9,8 @@ impl Tensor<1, f32> {
         previous_tokens: &[u32],
         params: crate::top_k::GpuMirostat2SamplerParams,
     ) -> Result<Option<u32>, wgpu::BufferAsyncError> {
+        self.assert_rank::<1>();
+        self.assert_datatype::<f32>();
         let (input, _) = self.data.materialize();
         crate::top_k::qmat_mirostat2_sample_token_to_host(
             &input,
@@ -26,6 +28,8 @@ impl Tensor<1, f32> {
         previous_tokens: &[u32],
         params: crate::top_k::GpuMirostat2SamplerParams,
     ) -> Result<u32, wgpu::BufferAsyncError> {
+        self.assert_rank::<1>();
+        self.assert_datatype::<f32>();
         let (input, _) = self.data.materialize();
         if let Some(token) =
             crate::top_k::mirostat2_sample_token_to_host(&input, sampler, previous_tokens, params)
@@ -101,8 +105,8 @@ impl Tensor<1, f32> {
                     return cpu_top_k_pairs_from_tensor_data(&input, k).await;
                 };
                 input.device().wgpu_queue().submit(Some(encoder.finish()));
-                let ids = Tensor::<1, u32>::as_slice_from_tensor_data(&ids).await?;
-                let values = Tensor::<1, f32>::as_slice_from_tensor_data(&values).await?;
+                let ids = Tensor::as_slice_from_tensor_data::<1, u32>(&ids).await?;
+                let values = Tensor::as_slice_from_tensor_data::<1, f32>(&values).await?;
                 return Ok((ids.as_slice().to_vec(), values.as_slice().to_vec()));
             }
             let Some((merged_ids, merged_values)) =
@@ -122,9 +126,9 @@ impl Tensor<1, f32> {
                 return cpu_top_k_pairs_from_tensor_data(&input, k).await;
             };
             input.device().wgpu_queue().submit(Some(encoder.finish()));
-            let merged_ids = Tensor::<1, u32>::as_slice_from_tensor_data(&merged_ids).await?;
-            let merged_values = Tensor::<1, f32>::as_slice_from_tensor_data(&merged_values).await?;
-            let chunk_values = Tensor::<1, f32>::as_slice_from_tensor_data(&values).await?;
+            let merged_ids = Tensor::as_slice_from_tensor_data::<1, u32>(&merged_ids).await?;
+            let merged_values = Tensor::as_slice_from_tensor_data::<1, f32>(&merged_values).await?;
+            let chunk_values = Tensor::as_slice_from_tensor_data::<1, f32>(&values).await?;
             let exact = top_k_chunk_bounds_prove_exact(
                 merged_values.as_slice(),
                 chunk_values.as_slice(),
@@ -140,7 +144,7 @@ impl Tensor<1, f32> {
                 ));
             }
 
-            let ids = Tensor::<1, u32>::as_slice_from_tensor_data(&ids).await?;
+            let ids = Tensor::as_slice_from_tensor_data::<1, u32>(&ids).await?;
             if let Some(top) = top_k_from_chunk_candidates(
                 ids.as_slice(),
                 chunk_values.as_slice(),
@@ -276,7 +280,7 @@ async fn cpu_top_k_pairs_from_tensor_data(
         return Ok((Vec::new(), Vec::new()));
     }
 
-    let values = Tensor::<1, f32>::as_slice_from_tensor_data(input).await?;
+    let values = Tensor::as_slice_from_tensor_data::<1, f32>(input).await?;
     let top = fold_top_k_pairs(
         values
             .as_slice()

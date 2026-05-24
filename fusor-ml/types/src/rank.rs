@@ -169,3 +169,160 @@ macro_rules! impl_rank_traits {
         };
     };
 }
+
+#[doc(hidden)]
+#[macro_export]
+macro_rules! __impl_type_rank_last {
+    ($tensor:ident, $elem_trait:path; $($R:literal),* $(,)?) => {
+        $(
+            impl<T: $elem_trait> LastRankInner for $tensor<T, $R> {
+                type LastRank = $tensor<T, { $R - 1 }>;
+            }
+        )*
+    };
+}
+
+#[doc(hidden)]
+#[macro_export]
+macro_rules! __impl_type_rank_next {
+    ($tensor:ident, $elem_trait:path; $($R:literal),* $(,)?) => {
+        $(
+            impl<T: $elem_trait> NextRankInner for $tensor<T, $R> {
+                type NextRank = $tensor<T, { $R + 1 }>;
+            }
+        )*
+    };
+}
+
+#[doc(hidden)]
+#[macro_export]
+macro_rules! __impl_type_rank_smaller_row {
+    ($tensor:ident, $elem_trait:path; $R:literal; $($DIFF:literal => $OUT:literal),* $(,)?) => {
+        $(
+            impl<T: $elem_trait> SmallerRankInner<$DIFF> for $tensor<T, $R> {
+                type SmallerRank = $tensor<T, $OUT>;
+            }
+        )*
+    };
+}
+
+#[doc(hidden)]
+#[macro_export]
+macro_rules! __impl_type_rank_larger_row {
+    ($tensor:ident, $elem_trait:path; $R:literal; $($DIFF:literal => $OUT:literal),* $(,)?) => {
+        $(
+            impl<T: $elem_trait> LargerRankInner<$DIFF> for $tensor<T, $R> {
+                type LargerRank = $tensor<T, $OUT>;
+            }
+        )*
+    };
+}
+
+#[doc(hidden)]
+#[macro_export]
+macro_rules! __impl_type_rank_max_pair {
+    ($tensor:ident, $elem_trait:path; $R1:literal, $R2:literal) => {
+        impl<T: $elem_trait> MaxRankInner for ($tensor<T, $R1>, $tensor<T, $R2>) {
+            type MaxRank = $tensor<T, $R2>;
+        }
+
+        impl<T: $elem_trait> MaxRankInner for ($tensor<T, $R2>, $tensor<T, $R1>) {
+            type MaxRank = $tensor<T, $R2>;
+        }
+    };
+}
+
+/// Generate rank-relation impls for tensor types whose generic order is
+/// element-then-rank, such as `ConcreteTensor<T, R>`.
+///
+/// The traits `NextRankInner`, `LastRankInner`, `SmallerRankInner`,
+/// `LargerRankInner`, and `MaxRankInner` must be defined locally and in scope.
+#[macro_export]
+macro_rules! impl_type_rank_traits {
+    ($tensor:ident, $elem_trait:path) => {
+        $crate::__impl_type_rank_last!($tensor, $elem_trait; 1, 2, 3, 4, 5, 6, 7, 8, 9, 10);
+        $crate::__impl_type_rank_next!($tensor, $elem_trait; 0, 1, 2, 3, 4, 5, 6, 7, 8, 9);
+
+        $crate::__impl_type_rank_smaller_row!($tensor, $elem_trait; 1; 1 => 0);
+        $crate::__impl_type_rank_smaller_row!($tensor, $elem_trait; 2; 1 => 1, 2 => 0);
+        $crate::__impl_type_rank_smaller_row!($tensor, $elem_trait; 3; 1 => 2, 2 => 1, 3 => 0);
+        $crate::__impl_type_rank_smaller_row!($tensor, $elem_trait; 4; 1 => 3, 2 => 2, 3 => 1, 4 => 0);
+        $crate::__impl_type_rank_smaller_row!($tensor, $elem_trait; 5; 1 => 4, 2 => 3, 3 => 2, 4 => 1, 5 => 0);
+        $crate::__impl_type_rank_smaller_row!($tensor, $elem_trait; 6; 1 => 5, 2 => 4, 3 => 3, 4 => 2, 5 => 1, 6 => 0);
+        $crate::__impl_type_rank_smaller_row!($tensor, $elem_trait; 7; 1 => 6, 2 => 5, 3 => 4, 4 => 3, 5 => 2, 6 => 1, 7 => 0);
+        $crate::__impl_type_rank_smaller_row!($tensor, $elem_trait; 8; 1 => 7, 2 => 6, 3 => 5, 4 => 4, 5 => 3, 6 => 2, 7 => 1, 8 => 0);
+        $crate::__impl_type_rank_smaller_row!($tensor, $elem_trait; 9; 1 => 8, 2 => 7, 3 => 6, 4 => 5, 5 => 4, 6 => 3, 7 => 2, 8 => 1, 9 => 0);
+        $crate::__impl_type_rank_smaller_row!($tensor, $elem_trait; 10; 1 => 9, 2 => 8, 3 => 7, 4 => 6, 5 => 5, 6 => 4, 7 => 3, 8 => 2, 9 => 1, 10 => 0);
+
+        $crate::__impl_type_rank_larger_row!($tensor, $elem_trait; 0; 1 => 1, 2 => 2, 3 => 3, 4 => 4, 5 => 5, 6 => 6, 7 => 7, 8 => 8, 9 => 9, 10 => 10);
+        $crate::__impl_type_rank_larger_row!($tensor, $elem_trait; 1; 1 => 2, 2 => 3, 3 => 4, 4 => 5, 5 => 6, 6 => 7, 7 => 8, 8 => 9, 9 => 10);
+        $crate::__impl_type_rank_larger_row!($tensor, $elem_trait; 2; 1 => 3, 2 => 4, 3 => 5, 4 => 6, 5 => 7, 6 => 8, 7 => 9, 8 => 10);
+        $crate::__impl_type_rank_larger_row!($tensor, $elem_trait; 3; 1 => 4, 2 => 5, 3 => 6, 4 => 7, 5 => 8, 6 => 9, 7 => 10);
+        $crate::__impl_type_rank_larger_row!($tensor, $elem_trait; 4; 1 => 5, 2 => 6, 3 => 7, 4 => 8, 5 => 9, 6 => 10);
+        $crate::__impl_type_rank_larger_row!($tensor, $elem_trait; 5; 1 => 6, 2 => 7, 3 => 8, 4 => 9, 5 => 10);
+        $crate::__impl_type_rank_larger_row!($tensor, $elem_trait; 6; 1 => 7, 2 => 8, 3 => 9, 4 => 10);
+        $crate::__impl_type_rank_larger_row!($tensor, $elem_trait; 7; 1 => 8, 2 => 9, 3 => 10);
+        $crate::__impl_type_rank_larger_row!($tensor, $elem_trait; 8; 1 => 9, 2 => 10);
+        $crate::__impl_type_rank_larger_row!($tensor, $elem_trait; 9; 1 => 10);
+
+        impl<const N: usize, T: $elem_trait> MaxRankInner for ($tensor<T, N>, $tensor<T, N>) {
+            type MaxRank = $tensor<T, N>;
+        }
+
+        $crate::__impl_type_rank_max_pair!($tensor, $elem_trait; 0, 1);
+        $crate::__impl_type_rank_max_pair!($tensor, $elem_trait; 0, 2);
+        $crate::__impl_type_rank_max_pair!($tensor, $elem_trait; 0, 3);
+        $crate::__impl_type_rank_max_pair!($tensor, $elem_trait; 0, 4);
+        $crate::__impl_type_rank_max_pair!($tensor, $elem_trait; 0, 5);
+        $crate::__impl_type_rank_max_pair!($tensor, $elem_trait; 0, 6);
+        $crate::__impl_type_rank_max_pair!($tensor, $elem_trait; 0, 7);
+        $crate::__impl_type_rank_max_pair!($tensor, $elem_trait; 0, 8);
+        $crate::__impl_type_rank_max_pair!($tensor, $elem_trait; 0, 9);
+        $crate::__impl_type_rank_max_pair!($tensor, $elem_trait; 0, 10);
+        $crate::__impl_type_rank_max_pair!($tensor, $elem_trait; 1, 2);
+        $crate::__impl_type_rank_max_pair!($tensor, $elem_trait; 1, 3);
+        $crate::__impl_type_rank_max_pair!($tensor, $elem_trait; 1, 4);
+        $crate::__impl_type_rank_max_pair!($tensor, $elem_trait; 1, 5);
+        $crate::__impl_type_rank_max_pair!($tensor, $elem_trait; 1, 6);
+        $crate::__impl_type_rank_max_pair!($tensor, $elem_trait; 1, 7);
+        $crate::__impl_type_rank_max_pair!($tensor, $elem_trait; 1, 8);
+        $crate::__impl_type_rank_max_pair!($tensor, $elem_trait; 1, 9);
+        $crate::__impl_type_rank_max_pair!($tensor, $elem_trait; 1, 10);
+        $crate::__impl_type_rank_max_pair!($tensor, $elem_trait; 2, 3);
+        $crate::__impl_type_rank_max_pair!($tensor, $elem_trait; 2, 4);
+        $crate::__impl_type_rank_max_pair!($tensor, $elem_trait; 2, 5);
+        $crate::__impl_type_rank_max_pair!($tensor, $elem_trait; 2, 6);
+        $crate::__impl_type_rank_max_pair!($tensor, $elem_trait; 2, 7);
+        $crate::__impl_type_rank_max_pair!($tensor, $elem_trait; 2, 8);
+        $crate::__impl_type_rank_max_pair!($tensor, $elem_trait; 2, 9);
+        $crate::__impl_type_rank_max_pair!($tensor, $elem_trait; 2, 10);
+        $crate::__impl_type_rank_max_pair!($tensor, $elem_trait; 3, 4);
+        $crate::__impl_type_rank_max_pair!($tensor, $elem_trait; 3, 5);
+        $crate::__impl_type_rank_max_pair!($tensor, $elem_trait; 3, 6);
+        $crate::__impl_type_rank_max_pair!($tensor, $elem_trait; 3, 7);
+        $crate::__impl_type_rank_max_pair!($tensor, $elem_trait; 3, 8);
+        $crate::__impl_type_rank_max_pair!($tensor, $elem_trait; 3, 9);
+        $crate::__impl_type_rank_max_pair!($tensor, $elem_trait; 3, 10);
+        $crate::__impl_type_rank_max_pair!($tensor, $elem_trait; 4, 5);
+        $crate::__impl_type_rank_max_pair!($tensor, $elem_trait; 4, 6);
+        $crate::__impl_type_rank_max_pair!($tensor, $elem_trait; 4, 7);
+        $crate::__impl_type_rank_max_pair!($tensor, $elem_trait; 4, 8);
+        $crate::__impl_type_rank_max_pair!($tensor, $elem_trait; 4, 9);
+        $crate::__impl_type_rank_max_pair!($tensor, $elem_trait; 4, 10);
+        $crate::__impl_type_rank_max_pair!($tensor, $elem_trait; 5, 6);
+        $crate::__impl_type_rank_max_pair!($tensor, $elem_trait; 5, 7);
+        $crate::__impl_type_rank_max_pair!($tensor, $elem_trait; 5, 8);
+        $crate::__impl_type_rank_max_pair!($tensor, $elem_trait; 5, 9);
+        $crate::__impl_type_rank_max_pair!($tensor, $elem_trait; 5, 10);
+        $crate::__impl_type_rank_max_pair!($tensor, $elem_trait; 6, 7);
+        $crate::__impl_type_rank_max_pair!($tensor, $elem_trait; 6, 8);
+        $crate::__impl_type_rank_max_pair!($tensor, $elem_trait; 6, 9);
+        $crate::__impl_type_rank_max_pair!($tensor, $elem_trait; 6, 10);
+        $crate::__impl_type_rank_max_pair!($tensor, $elem_trait; 7, 8);
+        $crate::__impl_type_rank_max_pair!($tensor, $elem_trait; 7, 9);
+        $crate::__impl_type_rank_max_pair!($tensor, $elem_trait; 7, 10);
+        $crate::__impl_type_rank_max_pair!($tensor, $elem_trait; 8, 9);
+        $crate::__impl_type_rank_max_pair!($tensor, $elem_trait; 8, 10);
+        $crate::__impl_type_rank_max_pair!($tensor, $elem_trait; 9, 10);
+    };
+}

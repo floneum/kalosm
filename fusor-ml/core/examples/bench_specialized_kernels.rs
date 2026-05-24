@@ -13,50 +13,51 @@ fn env_usize(name: &str, default: usize) -> usize {
         .unwrap_or(default)
 }
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let warmup_batches = env_usize(
-        "FUSOR_SPECIALIZED_BENCH_WARMUP_BATCHES",
-        DEFAULT_WARMUP_BATCHES,
-    );
-    let measured_batches = env_usize(
-        "FUSOR_SPECIALIZED_BENCH_MEASURED_BATCHES",
-        DEFAULT_MEASURED_BATCHES,
-    );
-    let dispatches_per_batch = env_usize(
-        "FUSOR_SPECIALIZED_BENCH_DISPATCHES_PER_BATCH",
-        DEFAULT_DISPATCHES_PER_BATCH,
-    )
-    .max(1);
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    pollster::block_on(async {
+        let warmup_batches = env_usize(
+            "FUSOR_SPECIALIZED_BENCH_WARMUP_BATCHES",
+            DEFAULT_WARMUP_BATCHES,
+        );
+        let measured_batches = env_usize(
+            "FUSOR_SPECIALIZED_BENCH_MEASURED_BATCHES",
+            DEFAULT_MEASURED_BATCHES,
+        );
+        let dispatches_per_batch = env_usize(
+            "FUSOR_SPECIALIZED_BENCH_DISPATCHES_PER_BATCH",
+            DEFAULT_DISPATCHES_PER_BATCH,
+        )
+        .max(1);
 
-    let device = Device::new().await?;
-    println!("bench_specialized_kernels");
-    println!("warmup_batches: {warmup_batches}");
-    println!("measured_batches: {measured_batches}");
-    println!("dispatches_per_batch: {dispatches_per_batch}");
+        let device = Device::new().await?;
+        println!("bench_specialized_kernels");
+        println!("warmup_batches: {warmup_batches}");
+        println!("measured_batches: {measured_batches}");
+        println!("dispatches_per_batch: {dispatches_per_batch}");
 
-    bench_rms_norm_vec4(
-        &device,
-        warmup_batches,
-        measured_batches,
-        dispatches_per_batch,
-    );
-    bench_flash_attention_streaming(
-        &device,
-        warmup_batches,
-        measured_batches,
-        dispatches_per_batch,
-    );
-    bench_flash_attention_decode(
-        &device,
-        warmup_batches,
-        measured_batches,
-        dispatches_per_batch,
-    );
-    bench_top_k_pairs(&device, warmup_batches, measured_batches).await?;
-    bench_mirostat2(&device, warmup_batches, measured_batches).await?;
+        bench_rms_norm_vec4(
+            &device,
+            warmup_batches,
+            measured_batches,
+            dispatches_per_batch,
+        );
+        bench_flash_attention_streaming(
+            &device,
+            warmup_batches,
+            measured_batches,
+            dispatches_per_batch,
+        );
+        bench_flash_attention_decode(
+            &device,
+            warmup_batches,
+            measured_batches,
+            dispatches_per_batch,
+        );
+        bench_top_k_pairs(&device, warmup_batches, measured_batches).await?;
+        bench_mirostat2(&device, warmup_batches, measured_batches).await?;
 
-    Ok(())
+        Ok(())
+    })
 }
 
 fn bench_rms_norm_vec4(

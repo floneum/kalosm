@@ -136,7 +136,7 @@ impl TextRange {
     }
 
     #[inline(always)]
-    fn as_str<'a>(self, text: &'a str) -> &'a str {
+    fn as_str(self, text: &str) -> &str {
         &text[self.start..self.end]
     }
 }

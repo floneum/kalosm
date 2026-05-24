@@ -22,18 +22,20 @@ pub(crate) fn index_select_output_shape(
         .collect()
 }
 
-impl<const R: usize, T: crate::DataType> Tensor<R, T> {
-    pub fn index_select(&self, dimension: usize, indexes: &Tensor<1, u32>) -> Self {
-        assert!(dimension < R);
+impl Tensor {
+    pub fn index_select(&self, dimension: usize, indexes: &Tensor) -> Self {
+        indexes.assert_rank::<1>();
+        indexes.assert_datatype::<u32>();
+        assert!(dimension < self.rank());
         let output_shape = index_select_output_shape(dimension, self.shape(), indexes.shape());
         let nary = NaryOperation {
             inputs: vec![self.key(), indexes.key()],
-            expression: NaryExpr::index_select(R, dimension),
+            expression: NaryExpr::index_select(self.rank(), dimension),
             shape: output_shape.clone(),
-            output_datatype: T::DATA_TYPE,
+            output_datatype: self.datatype(),
         };
         let device = self.device().clone();
-        let info = crate::tensor::TensorInfo::new(output_shape, T::DATA_TYPE);
+        let info = crate::tensor::TensorInfo::new(output_shape, self.datatype());
         let key = device.compute_graph().create_nary(nary);
         Self::from_parts(crate::tensor::LazyTensorData::from_parts(device, info, key))
     }

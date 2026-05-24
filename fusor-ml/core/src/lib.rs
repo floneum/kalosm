@@ -15,6 +15,9 @@ pub use reduce::*;
 pub use tensor::MappedBuffer;
 pub use tensor::*;
 
+#[cfg(feature = "graphvis")]
+pub use tabbycat;
+
 // Re-export wasm-compatible Send/Sync traits
 pub use wgpu::{WasmNotSend, WasmNotSendSync, WasmNotSync};
 

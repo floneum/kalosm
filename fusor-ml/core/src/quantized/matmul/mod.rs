@@ -857,30 +857,37 @@ fn qmatmul_m_pad_target(m: usize, n: usize) -> Option<usize> {
     Some(padded)
 }
 
-impl<const R: usize> Tensor<R, f32> {
+impl Tensor {
     pub fn q_mat_mul(&self, other: &QMatrix) -> Self {
-        if R < 2 {
+        match self.datatype() {
+            DataTypeEnum::F16 => {
+                return self
+                    .cast_to(DataTypeEnum::F32)
+                    .q_mat_mul(other)
+                    .cast_to(DataTypeEnum::F16);
+            }
+            DataTypeEnum::F32 => {}
+            DataTypeEnum::U32 => panic!("q_mat_mul requires f32/f16 tensors"),
+        }
+
+        if self.rank() < 2 {
             return self.add_q_mat_mul(other);
         }
         let in_shape = self.shape();
-        let m = in_shape[R - 2];
+        let m_axis = self.rank() - 2;
+        let m = in_shape[m_axis];
         let n = other.shape()[0];
         let Some(padded_m) = qmatmul_m_pad_target(m, n) else {
             return self.add_q_mat_mul(other);
         };
 
-        // Build padded input shape: replace dim R-2 with padded_m.
-        let mut padded_shape = *in_shape;
-        padded_shape[R - 2] = padded_m;
+        // Build padded input shape: replace the M dim with padded_m.
+        let mut padded_shape = in_shape.to_vec();
+        padded_shape[m_axis] = padded_m;
 
-        // Allocate a zero-filled padded buffer and copy `self` into rows
-        // `0..m`. The trailing `padded_m - m` rows stay zero so they
-        // contribute nothing to the dot product.
-        let device = self.device().clone();
-        let padded_input: Tensor<R, f32> = Tensor::splat(&device, 0.0, padded_shape);
-        let mut ranges: [std::ops::Range<usize>; R] = std::array::from_fn(|i| 0..in_shape[i]);
-        ranges[R - 2] = 0..m;
-        let padded_input = padded_input.slice_assign(ranges, self);
+        // Resize writes zeros outside the copied region so the trailing
+        // `padded_m - m` rows contribute nothing to the dot product.
+        let padded_input = self.resize(padded_shape);
 
         // Run the aligned matmul.
         let padded_out = padded_input.add_q_mat_mul(other);
@@ -888,20 +895,16 @@ impl<const R: usize> Tensor<R, f32> {
         // Narrow the output back to the caller's M along dim R-2 via
         // a restride view. All other dims are full-size, so this is a
         // pure layout change (no copy).
-        let out_shape = *padded_out.shape();
-        let specs: [crate::StrideSpec; R] = std::array::from_fn(|i| {
-            if i == R - 2 {
-                crate::StrideSpec::dim(i, m)
-            } else {
-                crate::StrideSpec::dim(i, out_shape[i])
-            }
-        });
+        let out_shape = padded_out.shape();
+        let specs: Vec<crate::StrideSpec> = (0..padded_out.rank())
+            .map(|i| {
+                if i == m_axis {
+                    crate::StrideSpec::dim(i, m)
+                } else {
+                    crate::StrideSpec::dim(i, out_shape[i])
+                }
+            })
+            .collect();
         padded_out.restride(specs)
-    }
-}
-
-impl<const R: usize> Tensor<R, half::f16> {
-    pub fn q_mat_mul(&self, other: &QMatrix) -> Self {
-        self.cast::<f32>().q_mat_mul(other).cast()
     }
 }

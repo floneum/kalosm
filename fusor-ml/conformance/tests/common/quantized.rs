@@ -2,12 +2,11 @@
 
 use std::mem::size_of;
 
-use fusor::{Device, QMatrix, Tensor};
-use fusor_conformance::{FuzzGenerator, approx_compare};
-use fusor_cpu::{
-    BlockQ4_0, BlockQ4K, BlockQ5_0, BlockQ5K, BlockQ6K, BlockQ8_0, ConcreteTensor, GgmlType,
-    GgufBlock, QuantizedTensor,
+use fusor::{
+    BlockQ4_0, BlockQ4K, BlockQ5_0, BlockQ5K, BlockQ6K, BlockQ8_0, Device, GgmlType, GgufBlock,
+    QMatrix, QuantizedTensor, Tensor, fusion::Concrete,
 };
+use fusor_conformance::{FuzzGenerator, approx_compare};
 use rand::distr::Uniform;
 
 #[derive(Clone)]
@@ -37,7 +36,7 @@ pub fn raw_bytes_buffer<B: GgufBlock>(shape: [usize; 2]) -> Vec<u8> {
     Vec::with_capacity(block_count(shape, B::BLOCK_SIZE) * size_of::<B>())
 }
 
-pub fn concrete_to_rows(tensor: &ConcreteTensor<f32, 2>, shape: [usize; 2]) -> Vec<Vec<f32>> {
+pub fn concrete_to_rows(tensor: &Concrete<f32, 2>, shape: [usize; 2]) -> Vec<Vec<f32>> {
     (0..shape[0])
         .map(|row| (0..shape[1]).map(|col| tensor.get([row, col])).collect())
         .collect()

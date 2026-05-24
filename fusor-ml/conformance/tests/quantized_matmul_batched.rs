@@ -4,9 +4,8 @@ use common::quantized::{
     deterministic_input, q4k_raw_bytes, q8_0_raw_bytes, qmatrix_from_raw_bytes,
 };
 use common::{matmul2, transpose2};
-use fusor::{Device, Tensor, ToVec2};
+use fusor::{BlockQ4K, Device, GgmlType, GgufBlock, Tensor, ToVec2};
 use fusor_conformance::available_devices;
-use fusor_cpu::{BlockQ4K, GgmlType, GgufBlock};
 use std::mem::size_of;
 
 async fn assert_q_mat_mul_3d_batch(input_rows: usize) {

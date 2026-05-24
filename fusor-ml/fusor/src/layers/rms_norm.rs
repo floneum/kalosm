@@ -1,16 +1,15 @@
 //! RMS normalization implementation.
 
-use crate::{
-    CastTensor, CastTo, ConcreteTensor, DataType, Device, SimdElement, Tensor, VarBuilder,
-};
+use crate::fusion::Concrete;
+use crate::{CastTensor, CastTo, DataType, Device, Fusion, SimdElement, Tensor, VarBuilder};
 
 /// Root Mean Square Normalization.
 ///
 /// Normalizes the input over the last dimension without centering.
 /// Formula: output = input / sqrt(mean(x^2) + eps) * weight
 pub struct RmsNorm<const N: usize, T: SimdElement> {
-    weight: Tensor<N, T, ConcreteTensor<T, N>>,
-    bias: Option<Tensor<N, T, ConcreteTensor<T, N>>>,
+    weight: Tensor<N, T, Concrete<T, N>>,
+    bias: Option<Tensor<N, T, Concrete<T, N>>>,
     eps: f32,
 }
 
@@ -27,12 +26,12 @@ impl<const N: usize, T: DataType + SimdElement + Default> RmsNorm<N, T> {
     }
 
     /// Get the weight tensor.
-    pub fn weight(&self) -> &Tensor<N, T, ConcreteTensor<T, N>> {
+    pub fn weight(&self) -> &Tensor<N, T, Concrete<T, N>> {
         &self.weight
     }
 
     /// Get the bias tensor if present.
-    pub fn bias(&self) -> Option<&Tensor<N, T, ConcreteTensor<T, N>>> {
+    pub fn bias(&self) -> Option<&Tensor<N, T, Concrete<T, N>>> {
         self.bias.as_ref()
     }
 
@@ -70,7 +69,7 @@ impl RmsNorm<1, f32> {
     /// Forward pass for 2D input (batch, features).
     pub fn forward_2d<B>(&self, input: &Tensor<2, f32, B>) -> Tensor<2, f32>
     where
-        B: crate::cpu::TensorBacking<2, Elem = f32>,
+        B: Fusion<2, f32>,
     {
         input.rms_norm_fused::<1, 1>(&self.weight, self.bias.as_ref(), self.eps)
     }
@@ -78,7 +77,7 @@ impl RmsNorm<1, f32> {
     /// Forward pass for 3D input (batch, seq_len, features).
     pub fn forward<B>(&self, input: &Tensor<3, f32, B>) -> Tensor<3, f32>
     where
-        B: crate::cpu::TensorBacking<3, Elem = f32>,
+        B: Fusion<3, f32>,
     {
         input.rms_norm_fused::<1, 2>(&self.weight, self.bias.as_ref(), self.eps)
     }
@@ -86,7 +85,7 @@ impl RmsNorm<1, f32> {
     /// Forward pass for 4D input (batch, heads, seq_len, features).
     pub fn forward_4d<B>(&self, input: &Tensor<4, f32, B>) -> Tensor<4, f32>
     where
-        B: crate::cpu::TensorBacking<4, Elem = f32>,
+        B: Fusion<4, f32>,
     {
         input.rms_norm_fused::<1, 3>(&self.weight, self.bias.as_ref(), self.eps)
     }
@@ -103,7 +102,7 @@ where
     /// Converts input to f32 for computation, then converts back.
     pub fn forward_generic<B>(&self, input: &Tensor<3, T, B>) -> Tensor<3, T>
     where
-        B: crate::cpu::TensorBacking<3, Elem = T>,
+        B: Fusion<3, T>,
     {
         // Cast input and weights to f32
         let input_f32 = input.cast::<f32>();
@@ -124,8 +123,8 @@ where
         residual: &Tensor<3, T, B2>,
     ) -> Tensor<3, T>
     where
-        B1: crate::cpu::TensorBacking<3, Elem = T>,
-        B2: crate::cpu::TensorBacking<3, Elem = T>,
+        B1: Fusion<3, T>,
+        B2: Fusion<3, T>,
     {
         let input_f32 = input.cast::<f32>();
         let residual_f32 = residual.cast::<f32>();
@@ -149,8 +148,8 @@ where
         residual: &Tensor<3, f32, B2>,
     ) -> Tensor<3, T>
     where
-        B1: crate::cpu::TensorBacking<3, Elem = f32>,
-        B2: crate::cpu::TensorBacking<3, Elem = f32>,
+        B1: Fusion<3, f32>,
+        B2: Fusion<3, f32>,
     {
         let weight_f32: Tensor<1, f32> = self.weight.cast();
         let bias_f32: Option<Tensor<1, f32>> = self.bias.as_ref().map(|b| b.cast());
@@ -163,7 +162,7 @@ where
     /// Forward pass for 4D input with generic type.
     pub fn forward_generic_4d<B>(&self, input: &Tensor<4, T, B>) -> Tensor<4, T>
     where
-        B: crate::cpu::TensorBacking<4, Elem = T>,
+        B: Fusion<4, T>,
     {
         let input_f32 = input.cast::<f32>();
         let weight_f32: Tensor<1, f32> = self.weight.cast();

@@ -6,8 +6,6 @@ publish = false
 
 [dependencies]
 fusor = { path = "../fusor", features = ["graphvis"] }
-fusor-cpu = { path = "../cpu" }
-fusor-core = { path = "../core", features = ["graphvis"] }
 tokio = { version = "1", features = ["full"] }
 rand = { workspace = true }
 half = "2.4"

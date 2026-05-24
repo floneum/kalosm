@@ -6,7 +6,7 @@
 
 use candle_core::{Device, Tensor as CandleTensor};
 use criterion::{BenchmarkId, Criterion, Throughput, black_box, criterion_group, criterion_main};
-use fusor_cpu::{ConcreteTensor, Tensor};
+use fusor_cpu::__private::{ConcreteTensor, TypedTensor};
 
 /// Benchmark fused operations (single memory pass) vs separate operations (multiple passes)
 fn bench_fusion(c: &mut Criterion) {
@@ -15,9 +15,9 @@ fn bench_fusion(c: &mut Criterion) {
     let mut group = c.benchmark_group("fusion_mul_add_sqrt");
 
     for &size in &sizes {
-        let x = Tensor::from_slice([size], &vec![2.0f32; size]);
-        let y = Tensor::from_slice([size], &vec![3.0f32; size]);
-        let z = Tensor::from_slice([size], &vec![1.0f32; size]);
+        let x = TypedTensor::from_slice([size], &vec![2.0f32; size]);
+        let y = TypedTensor::from_slice([size], &vec![3.0f32; size]);
+        let z = TypedTensor::from_slice([size], &vec![1.0f32; size]);
 
         group.throughput(Throughput::Elements(size as u64));
 
@@ -43,9 +43,9 @@ fn bench_fusion(c: &mut Criterion) {
 
         // Non-fused: compute each step separately with intermediate allocations
         // This is what would happen without fusion - 3 memory traversals
-        let x_tensor = Tensor::new(x.clone());
-        let y_tensor = Tensor::new(y.clone());
-        let z_tensor = Tensor::new(z.clone());
+        let x_tensor = TypedTensor::new(x.clone());
+        let y_tensor = TypedTensor::new(y.clone());
+        let z_tensor = TypedTensor::new(z.clone());
         group.bench_with_input(BenchmarkId::new("separate_ops", size), &size, |b, _| {
             b.iter(|| {
                 let x_ref = black_box(&x_tensor);
@@ -100,18 +100,19 @@ fn bench_long_chain(c: &mut Criterion) {
                 let y_ref = black_box(&y);
 
                 // Build expression tree using references
-                let mul1 = fusor_cpu::Mul::new(x_ref, y_ref);
-                let mul2 = fusor_cpu::Mul::new(x_ref, y_ref);
-                let add1 = fusor_cpu::Add::new(mul1, mul2);
-                let add2 = fusor_cpu::Add::new(add1, x_ref);
-                let result: ConcreteTensor<f32, 1> = fusor_cpu::TensorBacking::to_concrete(&add2);
+                let mul1 = fusor_cpu::__private::Mul::new(x_ref, y_ref);
+                let mul2 = fusor_cpu::__private::Mul::new(x_ref, y_ref);
+                let add1 = fusor_cpu::__private::Add::new(mul1, mul2);
+                let add2 = fusor_cpu::__private::Add::new(add1, x_ref);
+                let result: ConcreteTensor<f32, 1> =
+                    fusor_cpu::__private::TensorBacking::to_concrete(&add2);
                 black_box(result)
             })
         });
 
         // Non-fused: 5 separate operations
-        let x_tensor = Tensor::new(x.clone());
-        let y_tensor = Tensor::new(y.clone());
+        let x_tensor = TypedTensor::new(x.clone());
+        let y_tensor = TypedTensor::new(y.clone());
         group.bench_with_input(BenchmarkId::new("separate_5ops", size), &size, |b, _| {
             b.iter(|| {
                 let x_ref = black_box(&x_tensor);
@@ -163,16 +164,17 @@ fn bench_unary_chain(c: &mut Criterion) {
             b.iter(|| {
                 let x_ref = black_box(&x);
 
-                let neg = fusor_cpu::Neg::new(x_ref);
-                let abs = fusor_cpu::Abs::new(neg);
-                let sqrt = fusor_cpu::Sqrt::new(abs);
-                let result: ConcreteTensor<f32, 1> = fusor_cpu::TensorBacking::to_concrete(&sqrt);
+                let neg = fusor_cpu::__private::Neg::new(x_ref);
+                let abs = fusor_cpu::__private::Abs::new(neg);
+                let sqrt = fusor_cpu::__private::Sqrt::new(abs);
+                let result: ConcreteTensor<f32, 1> =
+                    fusor_cpu::__private::TensorBacking::to_concrete(&sqrt);
                 black_box(result)
             })
         });
 
         // Non-fused: 3 separate operations
-        let x_tensor = Tensor::new(x.clone());
+        let x_tensor = TypedTensor::new(x.clone());
         group.bench_with_input(BenchmarkId::new("separate", size), &size, |b, _| {
             b.iter(|| {
                 let x_ref = black_box(&x_tensor);

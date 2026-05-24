@@ -1,9 +1,6 @@
 use crate::{
-    Device, Tensor,
-    compute_graph::NodeIndex,
-    kernel_selection::CooperativeMatrixKind,
-    nary_wise::UnaryFunctionChain,
-    tensor::{DataType, DataTypeEnum},
+    Device, Tensor, compute_graph::NodeIndex, kernel_selection::CooperativeMatrixKind,
+    nary_wise::UnaryFunctionChain, tensor::DataTypeEnum,
 };
 
 pub mod coop_gemm;
@@ -41,12 +38,14 @@ pub(crate) struct MatMulOperation {
     pub(crate) parameters: MatMulParams,
 }
 
-impl<const R: usize, T: DataType> Tensor<R, T> {
+impl Tensor {
     pub fn mat_mul(&self, other: &Self) -> Self {
+        assert_eq!(self.datatype(), other.datatype());
         self.add_mat_mul(other, None)
     }
 
     pub fn mat_mul_with_parameters(&self, other: &Self, parameters: MatMulParams) -> Self {
+        assert_eq!(self.datatype(), other.datatype());
         self.add_mat_mul(other, Some(parameters))
     }
 }

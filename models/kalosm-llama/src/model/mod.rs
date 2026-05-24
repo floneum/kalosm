@@ -6,20 +6,11 @@ use crate::token_stream::TokenOutputStreamError;
 use crate::tokenizer::{LlamaTokenizer, LlamaTokenizerError};
 #[cfg(feature = "hf-config-json")]
 use crate::LlamaConfigJson;
-use fusor::AddOp;
-use fusor::CastTensor;
-use fusor::CastTo;
-use fusor::Device;
-use fusor::FloatDataType;
-use fusor::FloatOps;
-use fusor::MatmulImpl;
-use fusor::MulOp;
-use fusor::ShardedVarBuilder;
-use fusor::SimdBinaryOp;
-use fusor::SimdElement;
-use fusor::SimdReduceOp;
-use fusor::SumOp;
-use fusor::{WasmNotSend, WasmNotSync};
+use fusor::{
+    AddOp, CastTensor, CastTo, Device, FloatDataType, FloatOps, MatmulImpl, Mirostat2Sampler,
+    Mirostat2SamplerParams, MulOp, ShardedVarBuilder, SimdBinaryOp, SimdElement, SimdReduceOp,
+    SumOp, WasmNotSend, WasmNotSync,
+};
 use fusor_gguf::GgufMetadata;
 use fusor_gguf::GgufValue;
 #[cfg(feature = "vision")]
@@ -99,6 +90,12 @@ fn gpu_fused_logits_sampling_enabled() -> bool {
         .unwrap_or(true)
 }
 
+fn gpu_fused_logits_prewarm_enabled() -> bool {
+    std::env::var_os("KALOSM_LLAMA_GPU_FUSED_LOGITS_PREWARM")
+        .map(|value| value != "0")
+        .unwrap_or(true)
+}
+
 fn decode_trace_enabled() -> bool {
     std::env::var_os("KALOSM_TRACE_DECODE_TIMING").is_some()
         || std::env::var_os("FUSOR_TRACE_DECODE").is_some()
@@ -122,7 +119,7 @@ fn unbounded_decode_reserve_tokens() -> usize {
 }
 
 struct LlamaGpuSamplerState {
-    sampler: fusor::GpuMirostat2Sampler,
+    sampler: Mirostat2Sampler,
     config: GpuSamplerConfig,
     rng: rand::rngs::StdRng,
 }
@@ -134,14 +131,14 @@ impl LlamaGpuSamplerState {
             .map(rand::rngs::StdRng::seed_from_u64)
             .unwrap_or_else(rand::rngs::StdRng::from_os_rng);
         Some(Self {
-            sampler: fusor::GpuMirostat2Sampler::new(gpu_device, config.mu),
+            sampler: Mirostat2Sampler::new(gpu_device, config.mu),
             config,
             rng,
         })
     }
 
-    fn params(&mut self, top_k: usize) -> fusor::GpuMirostat2SamplerParams {
-        fusor::GpuMirostat2SamplerParams {
+    fn params(&mut self, top_k: usize) -> Mirostat2SamplerParams {
+        Mirostat2SamplerParams {
             top_k,
             temperature: self.config.temperature,
             repetition_penalty: self.config.repetition_penalty,
@@ -341,6 +338,44 @@ where
     AddOp: SimdBinaryOp<F>,
     SumOp: SimdReduceOp<F>,
 {
+    async fn prewarm_fused_logits_sampling(model: &Model<F>, device: &Device) {
+        if !gpu_fused_logits_sampling_enabled() || !gpu_fused_logits_prewarm_enabled() {
+            return;
+        }
+        let Some(gpu_device) = device.as_gpu() else {
+            return;
+        };
+        let shape = model.output_matrix().shape();
+        if shape.len() != 2 || shape[1] == 0 {
+            return;
+        }
+
+        let trace = decode_trace_enabled();
+        let start = trace.then(std::time::Instant::now);
+        let hidden_values = vec![0.0f32; shape[1]];
+        let hidden: fusor::Tensor<1, f32> =
+            fusor::Tensor::from_slice(device, [shape[1]], &hidden_values);
+        let mut sampler = Mirostat2Sampler::new(gpu_device, 10.0);
+        let params = Mirostat2SamplerParams {
+            top_k: 16,
+            temperature: 0.8,
+            repetition_penalty: 1.3,
+            tau: 5.0,
+            eta: 0.1,
+            random: 0.5,
+        };
+
+        let _ = hidden
+            .try_sample_mirostat2_token_q_mat(model.output_matrix(), &mut sampler, &[], params)
+            .await;
+        if let Some(start) = start {
+            eprintln!(
+                "prewarm_fused_logits_sampling elapsed={:?}",
+                start.elapsed()
+            );
+        }
+    }
+
     pub(crate) async fn from_builder(
         builder: crate::LlamaBuilder<F>,
         mut handler: impl FnMut(ModelLoadingProgress) + WasmNotSend + WasmNotSync + 'static,
@@ -597,6 +632,7 @@ where
         };
 
         let (model, tokenizer) = load_model()?;
+        Self::prewarm_fused_logits_sampling(&model, &device).await;
 
         Ok(Self {
             model,

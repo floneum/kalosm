@@ -4,15 +4,19 @@
 //! and `fusor-core` (GPU tensors with compute graph batching).
 //!
 //! The key design is:
-//! - `Tensor<CpuT, GpuT>` is a runtime dispatch enum holding either CPU or GPU version
+//! - `Tensor<R, D, B>` is a typed runtime dispatch enum holding either CPU or GPU storage
 //! - CPU kernel fusion is preserved (expression types stay lazy)
 //! - GPU laziness is preserved (compute graph batching)
+
+#[cfg(not(any(feature = "cpu", feature = "gpu")))]
+compile_error!("fusor requires at least one backend feature: `cpu` or `gpu`.");
 
 pub mod cache;
 mod composite;
 mod cpu;
 mod device;
 mod error;
+pub mod fusion;
 mod gpu;
 pub mod layers;
 pub mod quantized;
@@ -30,92 +34,50 @@ pub use composite::{
 };
 pub use device::Device;
 pub use error::Error;
-pub use fusor_types::{FromArray, Layout};
+pub use fusion::Fusion;
+pub use fusor_types::{D, Dim, FromArray, Layout, StrideSpec};
 
 /// Result type for fusor operations.
 pub type Result<T, E = Error> = std::result::Result<T, E>;
-use crate::gpu::TensorSlice;
+use fusor_types::TensorSlice;
 
-// Re-export from fusor-cpu
+pub trait Element: crate::cpu::SimdElement + crate::gpu::DataType {}
+impl<T> Element for T where T: crate::cpu::SimdElement + crate::gpu::DataType {}
+
+pub trait FloatElement: Element + crate::cpu::FloatOps + crate::gpu::FloatDataType {}
+impl<T> FloatElement for T where T: Element + crate::cpu::FloatOps + crate::gpu::FloatDataType {}
+
+pub trait CastElement<T>: crate::cpu::CastTo<T> + crate::gpu::CastTensor<T> {}
+impl<S, T> CastElement<T> for S where S: crate::cpu::CastTo<T> + crate::gpu::CastTensor<T> {}
+
+pub trait MatmulElement: Element + crate::cpu::MatmulImpl {}
+impl<T> MatmulElement for T where T: Element + crate::cpu::MatmulImpl {}
+
+#[allow(unused_imports)]
 pub use crate::cpu::{
-    Abs,
-    // Op types for bounds
-    AbsOp,
-    Acos,
-    AcosOp,
-    Acosh,
-    AcoshOp,
-    Add,
-    AddOp,
-    Asin,
-    AsinOp,
-    Asinh,
-    AsinhOp,
-    Atan,
-    AtanOp,
-    Atanh,
-    AtanhOp,
-    // Cast trait
-    CastTo,
-    ConcreteTensor,
-    Cos,
-    CosOp,
-    Cosh,
-    CoshOp,
-    Div,
-    DivOp,
-    Exp,
-    Exp2,
-    Exp2Op,
-    ExpOp,
-    // Float operations
-    FloatOps,
-    // Conditional operations
-    IsNonZero,
-    Log,
-    Log2,
-    Log2Op,
-    LogOp,
-    MapLayout,
-    // Matmul
-    MatmulImpl,
-    // Reduction ops
-    MaxOp,
-    MinOp,
-    Mul,
-    MulOp,
-    Neg,
-    NegOp,
-    ResolvedTensor,
-    SimdBinaryOp,
-    SimdElement,
-    SimdReduceOp,
-    SimdUnaryOp,
-    Sin,
-    SinOp,
-    Sinh,
-    SinhOp,
-    Sqrt,
-    SqrtOp,
-    Sub,
-    SubOp,
-    SumOp,
-    Tan,
-    TanOp,
-    Tanh,
-    TanhOp,
-    Tensor as CpuTensor,
-    // Backing trait for generic tensor type parameters
-    TensorBacking,
+    AbsOp, AcosOp, AcoshOp, AddOp, AsinOp, AsinhOp, AtanOp, AtanhOp, BlockQ4_0, BlockQ4K,
+    BlockQ5_0, BlockQ5K, BlockQ6K, BlockQ8_0, CastTo, CosOp, CoshOp, DivOp, Exp2Op, ExpOp,
+    FloatOps, GgmlType, GgufBlock, IsNonZero, Log2Op, LogOp, MatmulImpl, MaxOp, MinOp, MulOp,
+    NegOp, QuantizedTensor, RemOp, SimdBinaryOp, SimdElement, SimdReduceOp, SimdUnaryOp, SinOp,
+    SinhOp, SqrtOp, SubOp, SumOp, TanOp, TanhOp,
 };
 
-pub use crate::gpu::Tensor as GpuTensor;
+#[allow(unused_imports)]
+pub(crate) use crate::cpu::{
+    Abs, Acos, Acosh, Add, ConcreteTensor, Cos, Cosh, Div, Exp, Exp2, Log, Log2, MapLayout, Mul,
+    Neg, Rem, ResolvedTensor, Sin, Sinh, Sqrt, Sub, Tan, Tanh, TypedTensor as CpuTensor,
+};
 
-// Re-export from fusor-core for GPU types
+pub(crate) use crate::fusion::BackendFusion as TensorBacking;
+pub(crate) use crate::gpu::Tensor as GpuTensor;
+
+#[allow(unused_imports)]
 pub use crate::gpu::{
-    CastTensor, D, DataType, Dim, FloatDataType, GgufReadError, GpuMirostat2Sampler,
-    GpuMirostat2SamplerParams, LastRank, LastRankInner, MaxRank, NextRank, NextRankInner,
-    NodeIndex, SmallerRank, WasmNotSend, WasmNotSync,
+    CastTensor, DataType, FloatDataType, GgufReadError, NodeIndex, WasmNotSend, WasmNotSync,
+};
+
+pub use crate::gpu::{
+    GpuMirostat2Sampler as Mirostat2Sampler, GpuMirostat2SamplerParams as Mirostat2SamplerParams,
 };
 
 /// Runtime dispatch wrapper - holds either CPU or GPU version of an operation/tensor type.
@@ -125,8 +87,7 @@ pub use crate::gpu::{
 /// - CPU: Expression types stay lazy and fuse at resolve time
 /// - GPU: Operations build a compute graph that batches at resolve time
 #[derive(Clone)]
-pub enum Tensor<const R: usize, D, B: TensorBacking<R, Elem = D> = crate::cpu::ConcreteTensor<D, R>>
-{
+pub enum Tensor<const R: usize, D, B: Fusion<R, D> = crate::fusion::Concrete<D, R>> {
     Cpu(CpuTensor<R, B>),
     Gpu(GpuTensor<R, D>),
 }
@@ -481,9 +442,9 @@ where
 
     pub async fn sample_mirostat2_token(
         &self,
-        sampler: &mut GpuMirostat2Sampler,
+        sampler: &mut Mirostat2Sampler,
         previous_tokens: &[u32],
-        params: GpuMirostat2SamplerParams,
+        params: Mirostat2SamplerParams,
     ) -> Result<u32, Error> {
         match self {
             Tensor::Cpu(_) => {
@@ -503,9 +464,9 @@ where
     pub async fn try_sample_mirostat2_token_q_mat(
         &self,
         weights: &crate::QMatrix,
-        sampler: &mut GpuMirostat2Sampler,
+        sampler: &mut Mirostat2Sampler,
         previous_tokens: &[u32],
-        params: GpuMirostat2SamplerParams,
+        params: Mirostat2SamplerParams,
     ) -> Result<Option<u32>, Error> {
         match (self, weights) {
             (Tensor::Gpu(t), crate::QMatrix::Gpu(weights)) => t
@@ -798,7 +759,7 @@ where
                     .zip(b.inner().data().iter())
                     .map(|(x, y)| x.powf(*y))
                     .collect();
-                Tensor::Cpu(crate::cpu::Tensor::new(ConcreteTensor::from_slice(
+                Tensor::Cpu(crate::cpu::TypedTensor::new(ConcreteTensor::from_slice(
                     out_shape, &result,
                 )))
             }
@@ -857,14 +818,14 @@ where
     /// Approximate exp function (faster but less accurate on GPU, exact on CPU).
     /// Uses a polynomial approximation on GPU for better performance.
     pub fn approximate_exp(&self) -> Tensor<R, D> {
-        self.dispatch_ref(|t| t.as_ref().exp().to_concrete(), |t| t.appoximate_exp())
+        self.dispatch_ref(|t| t.as_ref().exp().to_concrete(), |t| t.approximate_exp())
     }
 
     /// Less approximate exp function (medium accuracy/speed tradeoff on GPU, exact on CPU).
     pub fn less_approximate_exp(&self) -> Tensor<R, D> {
         self.dispatch_ref(
             |t| t.as_ref().exp().to_concrete(),
-            |t| t.less_appoximate_exp(),
+            |t| t.less_approximate_exp(),
         )
     }
 }
@@ -1131,22 +1092,22 @@ where
         match (self, weights) {
             // CPU path - dispatch based on block type
             // eval() returns Tensor<R, ConcreteTensor>, so we need .inner() to get ConcreteTensor
-            (Tensor::Cpu(lhs), QMatrix::CpuQ4_0(rhs)) => Tensor::Cpu(crate::cpu::Tensor::new(
+            (Tensor::Cpu(lhs), QMatrix::CpuQ4_0(rhs)) => Tensor::Cpu(crate::cpu::TypedTensor::new(
                 lhs.to_concrete().inner().q_mat_mul(rhs),
             )),
-            (Tensor::Cpu(lhs), QMatrix::CpuQ5_0(rhs)) => Tensor::Cpu(crate::cpu::Tensor::new(
+            (Tensor::Cpu(lhs), QMatrix::CpuQ5_0(rhs)) => Tensor::Cpu(crate::cpu::TypedTensor::new(
                 lhs.to_concrete().inner().q_mat_mul(rhs),
             )),
-            (Tensor::Cpu(lhs), QMatrix::CpuQ8_0(rhs)) => Tensor::Cpu(crate::cpu::Tensor::new(
+            (Tensor::Cpu(lhs), QMatrix::CpuQ8_0(rhs)) => Tensor::Cpu(crate::cpu::TypedTensor::new(
                 lhs.to_concrete().inner().q_mat_mul(rhs),
             )),
-            (Tensor::Cpu(lhs), QMatrix::CpuQ4K(rhs)) => Tensor::Cpu(crate::cpu::Tensor::new(
+            (Tensor::Cpu(lhs), QMatrix::CpuQ4K(rhs)) => Tensor::Cpu(crate::cpu::TypedTensor::new(
                 lhs.to_concrete().inner().q_mat_mul(rhs),
             )),
-            (Tensor::Cpu(lhs), QMatrix::CpuQ5K(rhs)) => Tensor::Cpu(crate::cpu::Tensor::new(
+            (Tensor::Cpu(lhs), QMatrix::CpuQ5K(rhs)) => Tensor::Cpu(crate::cpu::TypedTensor::new(
                 lhs.to_concrete().inner().q_mat_mul(rhs),
             )),
-            (Tensor::Cpu(lhs), QMatrix::CpuQ6K(rhs)) => Tensor::Cpu(crate::cpu::Tensor::new(
+            (Tensor::Cpu(lhs), QMatrix::CpuQ6K(rhs)) => Tensor::Cpu(crate::cpu::TypedTensor::new(
                 lhs.to_concrete().inner().q_mat_mul(rhs),
             )),
             // F16/F32 are not quantized — dequantize, transpose, and use regular matmul

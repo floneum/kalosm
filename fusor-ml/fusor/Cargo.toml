@@ -7,8 +7,8 @@ license = "MIT/Apache-2.0"
 description = "Unified CPU/GPU tensor abstraction over fusor-cpu and fusor-core"
 
 [dependencies]
-fusor-cpu = { path = "../cpu", optional = true }
-fusor-core = { path = "../core", optional = true, default-features = false }
+fusor-cpu = { path = "../cpu" }
+fusor-core = { path = "../core", default-features = false }
 fusor-gguf = { path = "../gguf" }
 fusor-types = { path = "../types" }
 pollster = { version = "0.4.0", optional = true }
@@ -40,8 +40,8 @@ bench = false
 
 [features]
 default = ["cpu", "gpu"]
-cpu = ["dep:fusor-cpu"]
-gpu = ["dep:fusor-core", "dep:pollster"]
+cpu = []
+gpu = ["dep:pollster"]
 graphvis = ["gpu", "fusor-core/graphvis"]
 
 [[bench]]

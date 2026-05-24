@@ -73,7 +73,8 @@ pub(crate) type LlamaImage = ();
 pub use half::f16;
 
 /// Re-export fusor types needed for the activation type generic
-pub use fusor::{CastTensor, Device, FloatDataType, SimdElement};
+pub use fusor::Device;
+pub use fusor::{CastTensor, FloatDataType, SimdElement};
 
 /// A prelude of commonly used items in kalosm-llama.
 pub mod prelude {

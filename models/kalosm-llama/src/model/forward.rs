@@ -202,9 +202,9 @@ where
 
     pub(crate) fn forward_sample_token<'a>(
         ctx: ForwardInputs<'_, F>,
-        sampler: &'a mut fusor::GpuMirostat2Sampler,
+        sampler: &'a mut fusor::Mirostat2Sampler,
         previous_tokens: Vec<u32>,
-        params: fusor::GpuMirostat2SamplerParams,
+        params: fusor::Mirostat2SamplerParams,
     ) -> Pin<
         Box<dyn kalosm_model_types::FutureWasmNotSend<Output = Result<u32, LlamaModelError>> + 'a>,
     > {
@@ -282,9 +282,9 @@ where
 
     fn forward_sample_token_fused_logits<'a>(
         ctx: ForwardInputs<'_, F>,
-        sampler: &'a mut fusor::GpuMirostat2Sampler,
+        sampler: &'a mut fusor::Mirostat2Sampler,
         previous_tokens: Vec<u32>,
-        params: fusor::GpuMirostat2SamplerParams,
+        params: fusor::Mirostat2SamplerParams,
     ) -> Pin<
         Box<dyn kalosm_model_types::FutureWasmNotSend<Output = Result<u32, LlamaModelError>> + 'a>,
     > {

@@ -8,14 +8,19 @@ use crate::{
 };
 
 /// Describes how to interpret a 2D attention mask.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MaskKind {
     /// Mask is [q_seq_len, kv_seq_len] — applied identically to every (batch, head) pair.
-    /// Used for causal masks in decoder models.
+    /// Used for arbitrary additive masks in decoder models.
     QKMask,
     /// Mask is [batch, kv_seq_len] — per-token validity mask broadcast across heads and queries.
     /// Used for padding masks in encoder/embedding models.
     BatchKeyMask,
+    /// Mask is a strict lower-triangular causal mask of shape [seq_len, seq_len].
+    /// The GPU flash-attention kernel can skip the upper-triangle Q·K work
+    /// entirely and does not load the mask tensor at all. Falls back to
+    /// `QKMask` semantics on backends that don't support the optimisation.
+    Causal,
 }
 
 impl<D> Tensor<4, D, ConcreteTensor<D, 4>>
@@ -58,7 +63,7 @@ where
         mask: Option<(&Tensor<2, D, ConcreteTensor<D, 2>>, MaskKind)>,
     ) -> Self {
         match (self, k, v) {
-            // GPU path - use the optimized fused kernel (QKMask only)
+            // GPU path - use the optimized fused kernel (QKMask/Causal only)
             #[cfg(feature = "gpu")]
             (Tensor::Gpu(q), Tensor::Gpu(k), Tensor::Gpu(v))
                 if !matches!(mask, Some((_, MaskKind::BatchKeyMask))) =>
@@ -76,6 +81,9 @@ where
                     let cpu_mask_ref = cpu_mask.as_ref().map(|(mask, kind)| (mask, *kind));
                     let cpu_output = cpu_q.flash_attention(&cpu_k, &cpu_v, scale, cpu_mask_ref);
                     return tensor4_to_gpu(cpu_output, q.device());
+                }
+                if matches!(mask, Some((_, MaskKind::Causal))) {
+                    return Tensor::Gpu(q.flash_attention_causal(k, v, scale));
                 }
                 let gpu_mask = mask.map(|(m, _kind)| match m {
                     Tensor::Gpu(mask) => mask,
@@ -164,7 +172,7 @@ where
         let scores_masked = if let Some((m, kind)) = mask {
             let m_shape = m.shape();
             let mask_4d: Tensor<4, D, _> = match kind {
-                MaskKind::QKMask => {
+                MaskKind::QKMask | MaskKind::Causal => {
                     // Mask is [q_seq_len, kv_seq_len]
                     assert_eq!(
                         m_shape,
@@ -233,7 +241,7 @@ where
             }
         }
     }
-    Tensor::Cpu(crate::cpu::Tensor::from_slice(shape, &values))
+    Tensor::Cpu(crate::cpu::TypedTensor::from_slice(shape, &values))
 }
 
 #[cfg(feature = "gpu")]
@@ -272,5 +280,5 @@ where
             values.push(slice[[row, col]]);
         }
     }
-    Tensor::Cpu(crate::cpu::Tensor::from_slice(shape, &values))
+    Tensor::Cpu(crate::cpu::TypedTensor::from_slice(shape, &values))
 }

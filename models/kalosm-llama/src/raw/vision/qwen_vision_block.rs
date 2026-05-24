@@ -1,12 +1,13 @@
 use fusor::{
-    cache::{AttentionMask, KvCache},
+    cache::KvCache,
     layers::{Linear, RmsNorm},
-    CastTensor, CastTo, Device, FloatDataType, QMatrix, SimdElement, Tensor, VarBuilder,
+    CastTensor, CastTo, Device, FloatDataType, QMatrix, SimdElement, StrideSpec, Tensor,
+    VarBuilder,
 };
 
 use fusor::RopeCache;
 
-use crate::raw::attention_layer::{forward_attention_qkv_f32, LlamaFeedForward};
+use crate::raw::attention_layer::LlamaFeedForward;
 
 pub(crate) struct VisionBlock<F: FloatDataType + SimdElement> {
     norm1: RmsNorm<1, F>,
@@ -135,11 +136,20 @@ struct VisionAttention<F: FloatDataType + SimdElement> {
     /// vision blocks); one fused matmul of triple output width does the same
     /// arithmetic with a third the dispatch count, and the wider N better
     /// saturates the shared-memory tile reuse.
-    qkv: Linear<F>,
+    qkv: VisionQkv<F>,
     proj: Linear<F>,
     head_count: usize,
     head_dim: usize,
     embed_dim: usize,
+}
+
+enum VisionQkv<F: SimdElement> {
+    Fused(Linear<F>),
+    Split {
+        q: Linear<F>,
+        k: Linear<F>,
+        v: Linear<F>,
+    },
 }
 
 impl<F: FloatDataType + SimdElement + Default> VisionAttention<F>
@@ -157,15 +167,21 @@ where
         let q_w = vb.get("attn_q.weight", device)?;
         let k_w = vb.get("attn_k.weight", device)?;
         let v_w = vb.get("attn_v.weight", device)?;
-        let qkv_weight = QMatrix::concat_rows(&[&q_w, &k_w, &v_w])
-            .expect("qkv weights must concat (same in-dim and quant format)");
         // Concatenate biases on the same axis so the fused matmul's epilogue
         // bias add covers all three projections at once.
         let q_b: Tensor<1, F> = vb.get("attn_q.bias", device)?.dequantize().cast();
         let k_b: Tensor<1, F> = vb.get("attn_k.bias", device)?.dequantize().cast();
         let v_b: Tensor<1, F> = vb.get("attn_v.bias", device)?.dequantize().cast();
-        let qkv_bias: Tensor<1, F> = fusor::cat([q_b, k_b, v_b], 0).to_concrete();
-        let qkv = Linear::new(qkv_weight, Some(qkv_bias));
+        let qkv = if let Some(qkv_weight) = QMatrix::concat_rows(&[&q_w, &k_w, &v_w]) {
+            let qkv_bias: Tensor<1, F> = fusor::cat([q_b, k_b, v_b], 0).to_concrete();
+            VisionQkv::Fused(Linear::new(qkv_weight, Some(qkv_bias)))
+        } else {
+            VisionQkv::Split {
+                q: Linear::new(q_w, Some(q_b)),
+                k: Linear::new(k_w, Some(k_b)),
+                v: Linear::new(v_w, Some(v_b)),
+            }
+        };
         let proj = Linear::new(
             vb.get("attn_out.weight", device)?,
             Some(vb.get("attn_out.bias", device)?.dequantize().cast()),
@@ -194,23 +210,50 @@ where
         // One fused qkv matmul (output is [1, seq, 3 * embed_dim]); narrow
         // out the q/k/v slices as views — narrow is a layout-only op so we
         // pay one matmul + three free splits instead of three matmuls.
-        let qkv: Tensor<3, f32> = self.qkv.forward_generic(xs).cast();
-        if trace_attn {
-            qkv.as_gpu().map(|g| g.materialize_sync());
-            eprintln!("      qkv:   {:.2?}", t_qkv.elapsed());
-        }
-        let q: Tensor<3, f32> = qkv
-            .narrow(2, 0, self.embed_dim)
-            .reshape([seq_len, self.head_count, self.head_dim])
-            .to_concrete();
-        let k: Tensor<3, f32> = qkv
-            .narrow(2, self.embed_dim, self.embed_dim)
-            .reshape([seq_len, self.head_count, self.head_dim])
-            .to_concrete();
-        let v: Tensor<3, f32> = qkv
-            .narrow(2, 2 * self.embed_dim, self.embed_dim)
-            .reshape([seq_len, self.head_count, self.head_dim])
-            .to_concrete();
+        let (q, k, v): (Tensor<3, f32>, Tensor<3, f32>, Tensor<3, f32>) = match &self.qkv {
+            VisionQkv::Fused(qkv) => {
+                let qkv: Tensor<3, f32> = qkv.forward_generic(xs).cast();
+                if trace_attn {
+                    qkv.as_gpu().map(|g| g.materialize_sync());
+                    eprintln!("      qkv:   {:.2?}", t_qkv.elapsed());
+                }
+                let q = qkv
+                    .narrow(2, 0, self.embed_dim)
+                    .reshape([seq_len, self.head_count, self.head_dim])
+                    .to_concrete();
+                let k = qkv
+                    .narrow(2, self.embed_dim, self.embed_dim)
+                    .reshape([seq_len, self.head_count, self.head_dim])
+                    .to_concrete();
+                let v = qkv
+                    .narrow(2, 2 * self.embed_dim, self.embed_dim)
+                    .reshape([seq_len, self.head_count, self.head_dim])
+                    .to_concrete();
+                (q, k, v)
+            }
+            VisionQkv::Split { q, k, v } => {
+                let q = q
+                    .forward_generic(xs)
+                    .cast()
+                    .reshape([seq_len, self.head_count, self.head_dim])
+                    .to_concrete();
+                let k = k
+                    .forward_generic(xs)
+                    .cast()
+                    .reshape([seq_len, self.head_count, self.head_dim])
+                    .to_concrete();
+                let v = v
+                    .forward_generic(xs)
+                    .cast()
+                    .reshape([seq_len, self.head_count, self.head_dim])
+                    .to_concrete();
+                if trace_attn {
+                    v.as_gpu().map(|g| g.materialize_sync());
+                    eprintln!("      qkv:   {:.2?} (split)", t_qkv.elapsed());
+                }
+                (q, k, v)
+            }
+        };
 
         // Transpose to [heads, seq, dim] -> [1, heads, seq, dim] (batch=1) so
         // rope_normal_pair_fused can run as a single GPU kernel per layer
@@ -260,14 +303,18 @@ where
         let query_f32 = query_states;
         let key_f32 = key_states_f32;
         let value_f32 = value_states_f32;
-        let is_full_attn = cu_seqlens.len() == 2
-            && cu_seqlens[0] == 0
-            && cu_seqlens[1] as usize == seq_len;
+        let is_full_attn =
+            cu_seqlens.len() == 2 && cu_seqlens[0] == 0 && cu_seqlens[1] as usize == seq_len;
         let attn_out_4d = if is_full_attn {
-            query_f32.flash_attention(&key_f32, &value_f32, 1.0 / (self.head_dim as f64).sqrt() as f32, None)
+            query_f32.flash_attention(
+                &key_f32,
+                &value_f32,
+                1.0 / (self.head_dim as f64).sqrt() as f32,
+                None,
+            )
         } else {
-            // Slice each window, run flash on it, then cat along seq.
-            let mut window_outputs: Vec<Tensor<4, f32>> = Vec::with_capacity(cu_seqlens.len().saturating_sub(1));
+            let scale = 1.0 / (self.head_dim as f64).sqrt() as f32;
+            let mut windows = Vec::with_capacity(cu_seqlens.len().saturating_sub(1));
             for pair in cu_seqlens.windows(2) {
                 let start = pair[0] as usize;
                 let end = pair[1] as usize;
@@ -275,18 +322,40 @@ where
                 if len == 0 {
                     continue;
                 }
-                let q_win = query_f32.narrow(2, start, len).to_concrete();
-                let k_win = key_f32.narrow(2, start, len).to_concrete();
-                let v_win = value_f32.narrow(2, start, len).to_concrete();
-                let win_out = q_win.flash_attention(
-                    &k_win,
-                    &v_win,
-                    1.0 / (self.head_dim as f64).sqrt() as f32,
-                    None,
-                );
-                window_outputs.push(win_out);
+                windows.push((start, len));
             }
-            fusor::cat(window_outputs, 2).to_concrete()
+
+            let mut run_outputs = Vec::new();
+            let mut window_idx = 0;
+            while window_idx < windows.len() {
+                let (start, len) = windows[window_idx];
+                let mut run_count = 1;
+                while window_idx + run_count < windows.len()
+                    && windows[window_idx + run_count].1 == len
+                {
+                    run_count += 1;
+                }
+
+                let run_specs = [
+                    StrideSpec::dim(1, self.head_count),
+                    StrideSpec::dim_with(2, run_count, len).with_offset(start),
+                    StrideSpec::dim(2, len),
+                    StrideSpec::dim(3, self.head_dim),
+                ];
+                let q_run = query_f32.restride(run_specs).to_concrete();
+                let k_run = key_f32.restride(run_specs).to_concrete();
+                let v_run = value_f32.restride(run_specs).to_concrete();
+
+                let run_out = q_run.flash_attention(&k_run, &v_run, scale, None);
+                let run_out = run_out
+                    .reshape([self.head_count, run_count * len, self.head_dim])
+                    .unsqueeze(0)
+                    .to_concrete();
+                run_outputs.push(run_out);
+                window_idx += run_count;
+            }
+
+            fusor::cat(run_outputs, 2).to_concrete()
         };
 
         // After flash: transpose+reshape to [b_sz, seq, hidden_size] then proj.

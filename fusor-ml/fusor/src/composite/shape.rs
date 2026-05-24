@@ -695,7 +695,7 @@ where
     }
     let len = data.len();
     match device {
-        Device::Cpu => Tensor::Cpu(crate::cpu::Tensor::from_slice([len], &data)),
+        Device::Cpu => Tensor::Cpu(crate::cpu::TypedTensor::from_slice([len], &data)),
         Device::Gpu(gpu_device) => {
             let t1d: crate::gpu::Tensor<1, D> = crate::gpu::Tensor::new(gpu_device, &data);
             Tensor::Gpu(t1d)

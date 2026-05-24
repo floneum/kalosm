@@ -387,13 +387,6 @@ where
                 &rope_cache,
                 cache.as_deref_mut(),
             )?;
-            // Force-flush each layer's output. Each vision layer creates
-            // ~30 narrow + flash + cat nodes (one per attention window) plus
-            // the qkv/proj/mlp matmuls; if we let the whole 32-layer graph
-            // accumulate lazily the resolver schedule explodes (verified:
-            // 350s+ without this flush, 30s with). Per-layer flush keeps
-            // the per-pass graph at a manageable size.
-            hidden_states.as_gpu().map(|g| g.materialize_sync());
         }
 
         let hidden_states = self.merger.forward(&hidden_states);
@@ -492,7 +485,7 @@ async fn test_loading_qwen_vision() {
         }
     }
 
-    // Create random tensor using fusor-core
+    // Create random tensor using fusor
     let hidden_states_data: Vec<f32> = (0..1944 * 1176).map(|_| rand::random()).collect();
     let hidden_states: Tensor<2, f32> = Tensor::new(&device, &hidden_states_data)
         .reshape([1944, 1176])

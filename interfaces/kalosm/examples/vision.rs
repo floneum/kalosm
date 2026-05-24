@@ -13,6 +13,10 @@ async fn main() {
     eprintln!("[timing] model load: {:.2?}", t_load_start.elapsed());
 
     let mut chat = model.chat();
+    let max_tokens = std::env::var("KALOSM_VISION_MAX_TOKENS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(64);
     let t_total = Instant::now();
     let mut response = chat(&(
         MediaChunk::new(
@@ -36,7 +40,7 @@ async fn main() {
         }
         token_count += 1;
         print!("{}", token);
-        if token_count >= 64 {
+        if token_count >= max_tokens {
             break;
         }
     }

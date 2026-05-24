@@ -1,5 +1,5 @@
 use crate::{
-    DataTypeEnum, Layout, SmallerRank, TILE_SIZE, Tensor, TensorData,
+    DataTypeEnum, Layout, TILE_SIZE, Tensor, TensorData,
     compute_graph::NodeIndex,
     map_layout::MapLayoutOperation,
     mir::{
@@ -110,6 +110,44 @@ impl ResizeOperation {
         let input_indices = row_major_indices_from_flat(flat, &self.current_shape)?;
         Some(NaryExpr::indexed_input(0, input_indices))
     }
+
+    fn in_fill_bounds_expression(&self) -> NaryExpr {
+        let mut condition = NaryExpr::scalar(NaryScalar::U32(1));
+        for (dim, &fill) in self.fill_shape.iter().enumerate() {
+            let lt_fill = NaryExpr::unary_op(
+                NaryExpr::DimIndex(dim),
+                "lt_fill",
+                NaryOp::LessConst(NaryScalar::U32(fill as u32)),
+                DataTypeEnum::U32,
+                DataTypeEnum::U32,
+            );
+            condition = NaryExpr::mul(condition, lt_fill, DataTypeEnum::U32);
+        }
+        condition
+    }
+
+    fn zero_expression(datatype: DataTypeEnum) -> NaryExpr {
+        let zero = match datatype {
+            DataTypeEnum::F32 => NaryScalar::F32(0.0),
+            DataTypeEnum::F16 => NaryScalar::F16(half::f16::from_f32(0.0)),
+            DataTypeEnum::U32 => NaryScalar::U32(0),
+        };
+        NaryExpr::scalar(zero)
+    }
+
+    fn expression(&self, datatype: DataTypeEnum) -> Option<NaryExpr> {
+        let copied = self.copy_expression()?;
+        if self.fill_shape == self.new_shape {
+            return Some(copied);
+        }
+        Some(NaryExpr::select(
+            self.in_fill_bounds_expression(),
+            copied,
+            Self::zero_expression(datatype),
+            DataTypeEnum::U32,
+            datatype,
+        ))
+    }
 }
 
 fn is_row_major_contiguous(layout: &Layout) -> bool {
@@ -140,12 +178,15 @@ impl Operation for ResizeOperation {
         _: &crate::mir::workgroup_shape::WorkgroupShape,
         inputs: &[crate::mir::inputs::MirValue],
     ) -> [u32; 3] {
-        let input = inputs[1].as_tensor().unwrap();
-        let total_workgroups = (input.layout().shape().iter().product::<usize>() as u32)
+        let output = inputs[1].as_tensor().unwrap();
+        let total_workgroups = (output.layout().shape().iter().product::<usize>() as u32)
             .div_ceil(TILE_SIZE * BLOCKSIZE);
         distribute_workgroups(
             total_workgroups,
-            input.device().limits().max_compute_workgroups_per_dimension,
+            output
+                .device()
+                .limits()
+                .max_compute_workgroups_per_dimension,
         )
     }
 
@@ -159,9 +200,7 @@ impl Operation for ResizeOperation {
     ) -> Vec<crate::mir::inputs::MirValue> {
         let input = nodes.get_cached_result(self.input).unwrap().clone();
         let output = TensorData::new_for_shape(input.device(), &self.new_shape, input.datatype());
-        let output_sliced =
-            output.slice(&self.fill_shape.iter().map(|x| 0..*x).collect::<Vec<_>>());
-        vec![input.into(), output_sliced.into()]
+        vec![input.into(), output.into()]
     }
 
     fn build_direct_kernel(
@@ -173,8 +212,8 @@ impl Operation for ResizeOperation {
         let input = inputs[0].as_tensor()?;
         let operation = NaryOperation {
             inputs: vec![self.input],
-            expression: self.copy_expression()?,
-            shape: self.fill_shape.clone(),
+            expression: self.expression(input.datatype())?,
+            shape: self.new_shape.clone(),
             output_datatype: input.datatype(),
         };
         crate::nary_direct::build_nary_direct_kernel_to_output(
@@ -274,20 +313,20 @@ fn row_major_indices_from_flat(flat: NaryExpr, shape: &[usize]) -> Option<Vec<Na
     Some(indices)
 }
 
-impl<const R: usize, T: crate::DataType> Tensor<R, T> {
-    pub fn resize(&self, new_shape: [usize; R]) -> Tensor<R, T> {
-        let new_shape = new_shape.into();
+impl Tensor {
+    pub fn resize(&self, new_shape: impl AsRef<[usize]>) -> Tensor {
+        let new_shape: Box<[usize]> = new_shape.as_ref().into();
         let input = self.key();
         self.add_resize(ResizeOperation::new(
             input,
-            (*self.shape()).into(),
+            self.shape().into(),
             new_shape,
-            (*self.shape()).into(),
+            self.shape().into(),
         ))
     }
 
-    pub fn reshape<const R2: usize>(&self, new_shape: impl ShapeWithOneHole<R2>) -> Tensor<R2, T> {
-        let new_shape = new_shape.resolve_shape(self.shape());
+    pub fn reshape(&self, new_shape: impl AsRef<[usize]>) -> Tensor {
+        let new_shape = new_shape.as_ref();
         assert_eq!(
             new_shape.iter().product::<usize>(),
             self.shape().iter().product::<usize>(),
@@ -300,43 +339,51 @@ impl<const R: usize, T: crate::DataType> Tensor<R, T> {
         let input = self.key();
         self.add_resize(ResizeOperation::new(
             input,
-            (*self.shape()).into(),
+            self.shape().into(),
             new_shape.clone(),
             new_shape.clone(),
         ))
     }
 
-    pub fn flatten_last_n<const FROM_END: usize, const O: usize>(&self) -> Tensor<O, T>
-    where
-        Self: SmallerRank<FROM_END, O, T>,
-    {
-        let new_shape = std::array::from_fn(|i| {
-            if i < self.rank() - 1 - FROM_END {
-                self.shape()[i]
-            } else if i == self.rank() - 1 - FROM_END {
-                self.shape()[i..].iter().product()
-            } else {
-                1
-            }
-        });
+    pub fn flatten_last_n(&self, from_end: usize) -> Tensor {
+        assert!(
+            from_end < self.rank(),
+            "flatten_last_n FROM_END must be less than input rank"
+        );
+        let out_rank = self.rank() - from_end;
+        let new_shape: Vec<usize> = (0..out_rank)
+            .map(|i| {
+                if i < self.rank() - 1 - from_end {
+                    self.shape()[i]
+                } else if i == self.rank() - 1 - from_end {
+                    self.shape()[i..].iter().product()
+                } else {
+                    1
+                }
+            })
+            .collect();
         self.reshape(new_shape)
     }
 
-    pub fn flatten_first_n<const FROM_START: usize, const O: usize>(&self) -> Tensor<O, T>
-    where
-        Self: SmallerRank<FROM_START, O, T>,
-    {
-        let new_shape = std::array::from_fn(|i| {
-            if i == 0 {
-                self.shape()[..=FROM_START].iter().product()
-            } else {
-                self.shape()[i + FROM_START]
-            }
-        });
+    pub fn flatten_first_n(&self, from_start: usize) -> Tensor {
+        assert!(
+            from_start < self.rank(),
+            "flatten_first_n FROM_START must be less than input rank"
+        );
+        let out_rank = self.rank() - from_start;
+        let new_shape: Vec<usize> = (0..out_rank)
+            .map(|i| {
+                if i == 0 {
+                    self.shape()[..=from_start].iter().product()
+                } else {
+                    self.shape()[i + from_start]
+                }
+            })
+            .collect();
         self.reshape(new_shape)
     }
 
-    pub fn flatten_all(&self) -> Tensor<1, T> {
+    pub fn flatten_all(&self) -> Tensor {
         let size = self.shape().iter().product();
         self.reshape([size])
     }

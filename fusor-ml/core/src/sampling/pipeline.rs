@@ -64,9 +64,18 @@ pub(crate) async fn qmat_mirostat2_sample_token_to_host(
                 label: Some("qmat_mirostat2_sample_token_to_host encoder"),
             });
 
+    let trace = std::env::var_os("FUSOR_TRACE_DECODE").is_some()
+        || std::env::var_os("FUSOR_TRACE_SAMPLER").is_some();
+    let qmat_start = trace.then(std::time::Instant::now);
     let Some(logits) = qmat_logits_data_with_encoder(hidden, matrix, &mut encoder) else {
         return Ok(None);
     };
+    if let Some(start) = qmat_start {
+        eprintln!(
+            "sampler_trace qmat_logits_setup elapsed={:?}",
+            start.elapsed()
+        );
+    }
 
     let hidden_dump_buffer = if std::env::var_os("FUSOR_DEBUG_SAMPLER").is_some() {
         let hidden_bytes = (std::mem::size_of::<f32>() * hidden_len) as u64;
@@ -184,6 +193,7 @@ async fn sample_processed_logits_to_host(
         });
 
         let output_per_chunk = sampler_output_per_chunk(candidate_count);
+        let topk_start = trace.then(std::time::Instant::now);
         let Some((chunk_ids, chunk_values)) = chunk_top_k_pair_data_with_processors_with_encoder(
             input,
             previous_tokens,
@@ -195,6 +205,10 @@ async fn sample_processed_logits_to_host(
         ) else {
             return Ok(None);
         };
+        if let Some(start) = topk_start {
+            eprintln!("sampler_trace topk_setup elapsed={:?}", start.elapsed());
+        }
+        let merge_start = trace.then(std::time::Instant::now);
         let Some((ids, values)) = merge_sorted_chunk_top_k_pair_data_with_encoder(
             &chunk_ids,
             &chunk_values,
@@ -209,6 +223,10 @@ async fn sample_processed_logits_to_host(
         ) else {
             return Ok(None);
         };
+        if let Some(start) = merge_start {
+            eprintln!("sampler_trace merge_setup elapsed={:?}", start.elapsed());
+        }
+        let exactness_start = trace.then(std::time::Instant::now);
         let exactness_flag = if candidate_count < top_k && candidate_count < TOP_K_CHUNK {
             let Some(flag) = top_k_exactness_flag_data_with_encoder(
                 &values,
@@ -225,6 +243,13 @@ async fn sample_processed_logits_to_host(
         } else {
             None
         };
+        if let Some(start) = exactness_start {
+            eprintln!(
+                "sampler_trace exactness_setup elapsed={:?}",
+                start.elapsed()
+            );
+        }
+        let sample_start = trace.then(std::time::Instant::now);
         let Some(output) = sample_from_sorted_top_k_data_with_encoder(
             &ids,
             &values,
@@ -235,6 +260,9 @@ async fn sample_processed_logits_to_host(
         ) else {
             return Ok(None);
         };
+        if let Some(start) = sample_start {
+            eprintln!("sampler_trace sample_setup elapsed={:?}", start.elapsed());
+        }
 
         let download_size = (std::mem::size_of::<u32>() * GPU_SAMPLE_RESULT_WORDS) as u64;
         let download = device.wgpu_device().create_buffer(&wgpu::BufferDescriptor {
@@ -275,8 +303,13 @@ async fn sample_processed_logits_to_host(
             None
         };
 
+        let submit_start = trace.then(std::time::Instant::now);
         device.wgpu_queue().submit(Some(encoder.finish()));
+        if let Some(start) = submit_start {
+            eprintln!("sampler_trace submit elapsed={:?}", start.elapsed());
+        }
 
+        let map_start = trace.then(std::time::Instant::now);
         let (sender, receiver) = futures_channel::oneshot::channel();
         download
             .slice(..)
@@ -286,6 +319,9 @@ async fn sample_processed_logits_to_host(
         #[cfg(not(target_arch = "wasm32"))]
         device.poll_wait();
         receiver.await.map_err(|_| wgpu::BufferAsyncError)??;
+        if let Some(start) = map_start {
+            eprintln!("sampler_trace map_wait elapsed={:?}", start.elapsed());
+        }
 
         let view = download.slice(..).get_mapped_range();
         let word_size = std::mem::size_of::<u32>();

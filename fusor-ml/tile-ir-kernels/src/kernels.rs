@@ -14,7 +14,10 @@ mod rms_norm;
 mod top_k;
 mod types;
 
-pub use flash::{flash_attention, flash_decode_small, flash_outputs_per_workgroup};
+pub use flash::{
+    flash_attention, flash_attention_tiled, flash_decode_small, flash_outputs_per_workgroup,
+    flash_tiled_dispatch_size,
+};
 pub use helpers::AccumCast;
 pub use matmul::{
     batched_gemv_with_epilogues, batched_matmul_register_with_epilogues,

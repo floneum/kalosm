@@ -3,55 +3,57 @@ use kalosm::language::*;
 use kalosm_llama::Llama;
 use std::{io::Write, sync::Arc};
 
-#[tokio::main]
-async fn main() {
-    let llm = Llama::phi_3().await.unwrap();
-    let prompt = "Generate a list of 4 pets in JSON form with a name, description, color, and diet";
+fn main() {
+    pollster::block_on(async {
+        let llm = Llama::phi_3().await.unwrap();
+        let prompt =
+            "Generate a list of 4 pets in JSON form with a name, description, color, and diet";
 
-    #[derive(Debug, Clone, Parse)]
-    struct Pet {
-        name: String,
-        description: String,
-        color: String,
-        size: Size,
-        diet: Diet,
-    }
+        #[derive(Debug, Clone, Parse)]
+        struct Pet {
+            name: String,
+            description: String,
+            color: String,
+            size: Size,
+            diet: Diet,
+        }
 
-    #[derive(Debug, Clone, Parse)]
-    enum Diet {
-        #[parse(rename = "carnivore")]
-        Carnivore,
-        #[parse(rename = "herbivore")]
-        Herbivore,
-        #[parse(rename = "omnivore")]
-        Omnivore,
-    }
+        #[derive(Debug, Clone, Parse)]
+        enum Diet {
+            #[parse(rename = "carnivore")]
+            Carnivore,
+            #[parse(rename = "herbivore")]
+            Herbivore,
+            #[parse(rename = "omnivore")]
+            Omnivore,
+        }
 
-    #[derive(Debug, Clone, Parse)]
-    enum Size {
-        #[parse(rename = "small")]
-        Small,
-        #[parse(rename = "medium")]
-        Medium,
-        #[parse(rename = "large")]
-        Large,
-    }
+        #[derive(Debug, Clone, Parse)]
+        enum Size {
+            #[parse(rename = "small")]
+            Small,
+            #[parse(rename = "medium")]
+            Medium,
+            #[parse(rename = "large")]
+            Large,
+        }
 
-    println!("# with constraints");
+        println!("# with constraints");
 
-    let task = llm
-        .task("You generate realistic JSON placeholders")
-        .with_constraints(Arc::new(<[Pet; 4] as Parse>::new_parser()));
-    let stream = task.run(prompt);
+        let task = llm
+            .task("You generate realistic JSON placeholders")
+            .with_constraints(Arc::new(<[Pet; 4] as Parse>::new_parser()));
+        let stream = task.run(prompt);
 
-    time_stream(stream).await;
+        time_stream(stream).await;
 
-    println!("\n\n# without constraints");
+        println!("\n\n# without constraints");
 
-    let task = llm.task("You generate realistic JSON placeholders");
-    let stream = task(&prompt);
+        let task = llm.task("You generate realistic JSON placeholders");
+        let stream = task(&prompt);
 
-    time_stream(stream).await;
+        time_stream(stream).await;
+    });
 }
 
 async fn time_stream(mut stream: impl TextStream + Unpin) {

@@ -1,8 +1,7 @@
 //! Conv1d layer implementation.
 
-use crate::cpu::FloatOps;
-use crate::gpu::{DataType, FloatDataType};
-use crate::{ConcreteTensor, MatmulImpl, SimdElement, Tensor};
+use crate::fusion::Concrete;
+use crate::{DataType, FloatDataType, FloatOps, MatmulImpl, SimdElement, Tensor};
 
 /// Configuration for Conv1d layer.
 #[derive(Debug, Clone, Copy)]
@@ -31,8 +30,8 @@ impl Default for Conv1dConfig {
 /// Output shape: (batch, out_channels, out_length)
 /// where out_length = (length + 2*padding - kernel_size) / stride + 1
 pub struct Conv1d<D: SimdElement> {
-    weight: Tensor<3, D, ConcreteTensor<D, 3>>, // (out_channels, in_channels, kernel_size)
-    bias: Option<Tensor<1, D, ConcreteTensor<D, 1>>>, // (out_channels,)
+    weight: Tensor<3, D, Concrete<D, 3>>, // (out_channels, in_channels, kernel_size)
+    bias: Option<Tensor<1, D, Concrete<D, 1>>>, // (out_channels,)
     config: Conv1dConfig,
     in_channels: usize,
     out_channels: usize,
@@ -55,8 +54,8 @@ where
     /// Weight shape: (out_channels, in_channels, kernel_size)
     /// Bias shape: (out_channels,)
     pub fn new(
-        weight: Tensor<3, D, ConcreteTensor<D, 3>>,
-        bias: Option<Tensor<1, D, ConcreteTensor<D, 1>>>,
+        weight: Tensor<3, D, Concrete<D, 3>>,
+        bias: Option<Tensor<1, D, Concrete<D, 1>>>,
         config: Conv1dConfig,
     ) -> Self {
         let shape = weight.shape();
@@ -90,14 +89,11 @@ where
     ///
     /// Input shape: (batch, in_channels, length)
     /// Output shape: (batch, out_channels, out_length)
-    pub fn forward(
-        &self,
-        input: &Tensor<3, D, ConcreteTensor<D, 3>>,
-    ) -> Tensor<3, D, ConcreteTensor<D, 3>>
+    pub fn forward(&self, input: &Tensor<3, D, Concrete<D, 3>>) -> Tensor<3, D, Concrete<D, 3>>
     where
-        crate::MulOp: crate::cpu::SimdBinaryOp<D>,
-        crate::AddOp: crate::cpu::SimdBinaryOp<D>,
-        crate::cpu::SumOp: crate::cpu::SimdReduceOp<D>,
+        crate::MulOp: crate::SimdBinaryOp<D>,
+        crate::AddOp: crate::SimdBinaryOp<D>,
+        crate::SumOp: crate::SimdReduceOp<D>,
     {
         input.conv(
             &self.weight,

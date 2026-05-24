@@ -700,24 +700,26 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn rms_norm_direct_matches_reference() {
-        let Ok(device) = Device::new().await else {
-            return;
-        };
+    #[test]
+    fn rms_norm_direct_matches_reference() {
+        pollster::block_on(async {
+            let Ok(device) = Device::new().await else {
+                return;
+            };
 
-        let input = Tensor::new(&device, &vec![vec![1.0f32, 2.0, 3.0, 4.0]]);
-        let weight = Tensor::new(&device, &vec![0.5f32, 1.0, 1.5, 2.0]);
-        let output = input.try_rms_norm_direct(&weight, None, 1e-5).unwrap();
-        let output = output.as_slice().await.unwrap();
+            let input = Tensor::new::<f32, 2, _>(&device, &vec![vec![1.0f32, 2.0, 3.0, 4.0]]);
+            let weight = Tensor::new::<f32, 1, _>(&device, &vec![0.5f32, 1.0, 1.5, 2.0]);
+            let output = input.try_rms_norm_direct(&weight, None, 1e-5).unwrap();
+            let output = output.as_slice::<2, f32>().await.unwrap();
 
-        let mean_square = (1.0 + 4.0 + 9.0 + 16.0) / 4.0;
-        let rms = f32::sqrt(mean_square + 1e-5);
-        let expected = [1.0 / rms * 0.5, 2.0 / rms, 3.0 / rms * 1.5, 4.0 / rms * 2.0];
+            let mean_square = (1.0 + 4.0 + 9.0 + 16.0) / 4.0;
+            let rms = f32::sqrt(mean_square + 1e-5);
+            let expected = [1.0 / rms * 0.5, 2.0 / rms, 3.0 / rms * 1.5, 4.0 / rms * 2.0];
 
-        for (i, expected) in expected.into_iter().enumerate() {
-            let actual = output[[0, i]];
-            assert!((actual - expected).abs() < 1e-5, "{actual} != {expected}");
-        }
+            for (i, expected) in expected.into_iter().enumerate() {
+                let actual = output[[0, i]];
+                assert!((actual - expected).abs() < 1e-5, "{actual} != {expected}");
+            }
+        });
     }
 }

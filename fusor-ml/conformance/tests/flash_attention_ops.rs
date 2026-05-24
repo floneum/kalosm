@@ -656,3 +656,85 @@ async fn flash_attention_with_batch_key_mask_matches_cpu_reference_on_varied_sha
         .await;
     }
 }
+
+/// Exercises the tiled (Q-batched) streaming flash attention kernel. The
+/// selector switches to that variant when `q_seq_len >= 64` and `head_dim` is
+/// a multiple of 8. Shapes are chosen to span:
+/// - exact Q-block alignment (q_seq_len = 64 = 8*8),
+/// - non-aligned tail (q_seq_len = 72, last block is partially valid),
+/// - non-aligned head_dim and odd kv_seq_len.
+#[tokio::test]
+async fn flash_attention_tiled_matches_cpu_reference_on_varied_shapes() {
+    for case in [
+        FlashCase {
+            batch: 1,
+            num_heads: 2,
+            num_kv_heads: 2,
+            q_seq_len: 64,
+            kv_seq_len: 64,
+            head_dim: 8,
+        },
+        FlashCase {
+            batch: 1,
+            num_heads: 2,
+            num_kv_heads: 1,
+            q_seq_len: 72,
+            kv_seq_len: 80,
+            head_dim: 16,
+        },
+        FlashCase {
+            batch: 2,
+            num_heads: 4,
+            num_kv_heads: 2,
+            q_seq_len: 65,
+            kv_seq_len: 35,
+            head_dim: 8,
+        },
+        FlashCase {
+            batch: 1,
+            num_heads: 4,
+            num_kv_heads: 4,
+            q_seq_len: 128,
+            kv_seq_len: 128,
+            head_dim: 24,
+        },
+    ] {
+        assert_flash_attention_case(case, None, 1e-3).await;
+    }
+}
+
+/// Same as above but with an additive QK mask, exercising the masked path
+/// through the tiled kernel.
+#[tokio::test]
+async fn flash_attention_tiled_with_mask_matches_cpu_reference() {
+    for case in [
+        FlashCase {
+            batch: 1,
+            num_heads: 2,
+            num_kv_heads: 2,
+            q_seq_len: 64,
+            kv_seq_len: 32,
+            head_dim: 8,
+        },
+        FlashCase {
+            batch: 2,
+            num_heads: 2,
+            num_kv_heads: 2,
+            q_seq_len: 96,
+            kv_seq_len: 64,
+            head_dim: 16,
+        },
+    ] {
+        let shape = [case.q_seq_len, case.kv_seq_len];
+        assert_flash_attention_case(
+            case,
+            Some((
+                qk_mask_data(case.q_seq_len, case.kv_seq_len),
+                MaskKind::QKMask,
+                shape,
+            )),
+            1e-3,
+        )
+        .await;
+    }
+}

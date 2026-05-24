@@ -5,9 +5,8 @@ use common::quantized::{
     assert_dequantize_matches_host_reference, assert_q_mat_mul_matches_host_reference, block_count,
     f16_weight_bytes, f32_weight_bytes, f32_weight_rows, q8_0_fixture, qmatrix_from_raw_bytes,
 };
-use fusor::{Device, Tensor};
+use fusor::{BlockQ5_0, Device, GgmlType, GgufBlock, Tensor};
 use fusor_conformance::{approx_compare, available_devices};
-use fusor_cpu::{BlockQ5_0, GgmlType, GgufBlock};
 use rand::distr::Uniform;
 use std::mem::size_of;
 

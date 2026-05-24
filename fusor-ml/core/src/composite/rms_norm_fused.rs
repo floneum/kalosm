@@ -1,69 +1,56 @@
-use crate::{CastTensor, DataType, LastRank, Tensor};
+use crate::{DataTypeEnum, Tensor};
 
-impl<const R: usize, T: DataType> Tensor<R, T> {
-    pub fn rms_norm_fused<const W: usize, const OUT_RANK: usize>(
-        &self,
-        weight: &Tensor<W, T>,
-        bias: Option<&Tensor<W, T>>,
-        eps: f32,
-    ) -> Self
-    where
-        T: CastTensor<f32>,
-        f32: CastTensor<T>,
-        Tensor<R, f32>: LastRank<OUT_RANK, f32>,
-    {
+impl Tensor {
+    pub fn rms_norm_fused(&self, weight: &Tensor, bias: Option<&Tensor>, eps: f32) -> Self {
+        let original_datatype = self.datatype();
+        assert!(
+            matches!(original_datatype, DataTypeEnum::F32 | DataTypeEnum::F16),
+            "rms_norm_fused only supports f32/f16 tensors"
+        );
+        assert_eq!(weight.datatype(), original_datatype);
+        if let Some(bias) = bias {
+            assert_eq!(bias.datatype(), original_datatype);
+        }
         if let Some(output) = self.try_rms_norm_direct(weight, bias, eps) {
             return output;
         }
 
         let hidden_size = *self.shape().last().unwrap() as f32;
-        let mut kept_shape = *self.shape();
-        kept_shape[R - 1] = 1;
+        let last_dim = self.rank() - 1;
+        let mut kept_shape = self.shape().to_vec();
+        kept_shape[last_dim] = 1;
 
-        let input = self.cast::<f32>();
+        let input = self.cast_to(DataTypeEnum::F32);
         let squared = &input * &input;
-        let mean_square = (squared.sum::<OUT_RANK>(crate::D::Minus1) / hidden_size)
-            .reshape(kept_shape)
-            .broadcast_as(*self.shape());
+        let mean_square = (squared.sum(last_dim) / hidden_size)
+            .reshape(&kept_shape)
+            .broadcast_as(self.shape());
         let rms = (mean_square + eps).sqrt();
-        let mut output = (&input / &rms) * &weight.cast::<f32>().broadcast_as(*self.shape());
+        let mut output =
+            (&input / &rms) * &weight.cast_to(DataTypeEnum::F32).broadcast_as(self.shape());
 
         if let Some(bias) = bias {
-            output = &output + &bias.cast::<f32>().broadcast_as(*self.shape());
+            output = &output + &bias.cast_to(DataTypeEnum::F32).broadcast_as(self.shape());
         }
 
-        output.cast::<T>()
+        output.cast_to(original_datatype)
     }
 
-    pub fn rms_norm_fused_no_bias<const W: usize, const OUT_RANK: usize>(
-        &self,
-        weight: &Tensor<W, T>,
-        eps: f32,
-    ) -> Self
-    where
-        T: CastTensor<f32>,
-        f32: CastTensor<T>,
-        Tensor<R, f32>: LastRank<OUT_RANK, f32>,
-    {
-        self.rms_norm_fused::<W, OUT_RANK>(weight, None, eps)
+    pub fn rms_norm_fused_no_bias(&self, weight: &Tensor, eps: f32) -> Self {
+        self.rms_norm_fused(weight, None, eps)
     }
 
-    pub fn rms_norm_residual_fused<const W: usize, const OUT_RANK: usize>(
+    pub fn rms_norm_residual_fused(
         &self,
         residual: &Self,
-        weight: &Tensor<W, T>,
-        bias: Option<&Tensor<W, T>>,
+        weight: &Tensor,
+        bias: Option<&Tensor>,
         eps: f32,
-    ) -> Self
-    where
-        T: CastTensor<f32>,
-        f32: CastTensor<T>,
-        Tensor<R, f32>: LastRank<OUT_RANK, f32>,
-    {
+    ) -> Self {
         if let Some(output) = self.try_rms_norm_residual_direct(residual, weight, bias, eps) {
             return output;
         }
 
-        (self.clone() + residual.clone()).rms_norm_fused::<W, OUT_RANK>(weight, bias, eps)
+        (self.clone() + residual.clone()).rms_norm_fused(weight, bias, eps)
     }
 }

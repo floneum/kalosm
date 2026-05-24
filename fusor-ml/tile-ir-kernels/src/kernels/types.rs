@@ -52,6 +52,11 @@ pub struct FlashAttentionMeta {
     pub output_meta: TensorMeta,
     /// Dispatch grid used for the generated tile program.
     pub dispatch_size: [u32; 3],
+    /// When `true`, the kernel applies a strict lower-triangular causal mask
+    /// (kv_idx <= q_idx) by skipping out-of-bound KV chunks/lanes. The
+    /// `mask_meta` field must be `None` in this case — no additive mask is
+    /// loaded.
+    pub causal: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

@@ -322,92 +322,46 @@ fn decode_max_error(
     (max_error, max_head, max_dim, max_actual, max_expected)
 }
 
-#[tokio::test]
-async fn tiled_decode_attention_matches_cpu_reference() {
-    let Ok(device) = Device::new().await else {
-        return;
-    };
+#[test]
+fn tiled_decode_attention_matches_cpu_reference() {
+    pollster::block_on(async {
+        let Ok(device) = Device::new().await else {
+            return;
+        };
 
-    let kv_len = DECODE_LARGE_BLOCK as usize + 1;
-    let q_data = decode_q();
-    let k_data = decode_k(kv_len);
-    let v_data = decode_v(kv_len);
-    let scale = 1.0 / f32::sqrt(TEST_HEAD_DIM as f32);
+        let kv_len = DECODE_LARGE_BLOCK as usize + 1;
+        let q_data = decode_q();
+        let k_data = decode_k(kv_len);
+        let v_data = decode_v(kv_len);
+        let scale = 1.0 / f32::sqrt(TEST_HEAD_DIM as f32);
 
-    let q = Tensor::new(&device, &q_data);
-    let k = Tensor::new(&device, &k_data);
-    let v = Tensor::new(&device, &v_data);
-    let output = q.try_flash_attention_direct(&k, &v, scale, None).unwrap();
-    let output = output.as_slice().await.unwrap();
-    let (max_error, _, max_dim, max_actual, max_expected) =
-        decode_max_error(1, 1, &q_data, &k_data, &v_data, scale, |_, dim| {
-            output[[0, 0, 0, dim]]
-        });
-    assert!(
-        max_error < 2.0e-4,
-        "dim {max_dim}: actual={max_actual} expected={max_expected} error={max_error}"
-    );
+        let q = Tensor::new(&device, &q_data);
+        let k = Tensor::new(&device, &k_data);
+        let v = Tensor::new(&device, &v_data);
+        let output = q.try_flash_attention_direct(&k, &v, scale, None).unwrap();
+        let output = output.as_slice().await.unwrap();
+        let (max_error, _, max_dim, max_actual, max_expected) =
+            decode_max_error(1, 1, &q_data, &k_data, &v_data, scale, |_, dim| {
+                output[[0, 0, 0, dim]]
+            });
+        assert!(
+            max_error < 2.0e-4,
+            "dim {max_dim}: actual={max_actual} expected={max_expected} error={max_error}"
+        );
+    });
 }
 
-#[tokio::test]
-async fn tiled_decode_attention_gqa_matches_cpu_reference() {
-    let Ok(device) = Device::new().await else {
-        return;
-    };
+#[test]
+fn tiled_decode_attention_gqa_matches_cpu_reference() {
+    pollster::block_on(async {
+        let Ok(device) = Device::new().await else {
+            return;
+        };
 
-    let num_heads = 32;
-    let num_kv_heads = 8;
-    let groups = num_heads / num_kv_heads;
-    let kv_len = DECODE_LARGE_BLOCK as usize + 1;
-    let q_data = decode_q_gqa(num_heads);
-    let k_data = decode_k_gqa(num_kv_heads, kv_len);
-    let v_data = decode_v_gqa(num_kv_heads, kv_len);
-    let scale = 1.0 / f32::sqrt(TEST_HEAD_DIM as f32);
-
-    let q = Tensor::new(&device, &q_data);
-    let k = Tensor::new(&device, &k_data);
-    let v = Tensor::new(&device, &v_data);
-    let output = q.try_flash_attention_direct(&k, &v, scale, None).unwrap();
-    let output = output.as_slice().await.unwrap();
-
-    let (max_error, max_head, max_dim, max_actual, max_expected) = decode_max_error(
-        num_heads,
-        groups,
-        &q_data,
-        &k_data,
-        &v_data,
-        scale,
-        |head, dim| output[[0, head, 0, dim]],
-    );
-    assert!(
-        max_error < 3.0e-4,
-        "head {max_head} dim {max_dim}: actual={max_actual} expected={max_expected} error={max_error}"
-    );
-}
-
-/// Regression test for the non-tiled 512/1024-thread decode blocks.
-/// Before the fix, the per-thread score loop folded its 128 q*k
-/// accumulations into a single deeply-nested Naga expression, which
-/// miscompiled on Metal once the kernel's `workgroup_size` exceeded 128;
-/// the kernel produced all-zero output. The fix emits the dot product as a
-/// shader loop with a function-scope accumulator.
-#[tokio::test]
-async fn decode_gqa_non_tiled_large_blocks_match_cpu_reference() {
-    let Ok(device) = Device::new().await else {
-        return;
-    };
-
-    let num_heads = 32;
-    let num_kv_heads = 8;
-    let groups = num_heads / num_kv_heads;
-    let caps = KernelDeviceCaps::from_device(&device);
-
-    // On devices that support the larger workgroups, 200 uses the 512
-    // block and 600 uses the 1024 block.
-    for (kv_len, expected_block) in [(200usize, DecodeBlock::Medium), (600, DecodeBlock::Large)] {
-        if choose_decode_block(kv_len as u32, caps) != Some(expected_block) {
-            continue;
-        }
+        let num_heads = 32;
+        let num_kv_heads = 8;
+        let groups = num_heads / num_kv_heads;
+        let kv_len = DECODE_LARGE_BLOCK as usize + 1;
         let q_data = decode_q_gqa(num_heads);
         let k_data = decode_k_gqa(num_kv_heads, kv_len);
         let v_data = decode_v_gqa(num_kv_heads, kv_len);
@@ -429,41 +383,97 @@ async fn decode_gqa_non_tiled_large_blocks_match_cpu_reference() {
             |head, dim| output[[0, head, 0, dim]],
         );
         assert!(
-            max_error < 5.0e-4,
-            "kv_len={kv_len} head={max_head} dim={max_dim}: actual={max_actual} expected={max_expected} error={max_error}"
+            max_error < 3.0e-4,
+            "head {max_head} dim {max_dim}: actual={max_actual} expected={max_expected} error={max_error}"
         );
-    }
+    });
 }
 
-#[tokio::test]
-async fn streaming_gqa_regression_shape_builds_direct_kernel() {
-    let Ok(device) = Device::new().await else {
-        return;
-    };
+/// Regression test for the non-tiled 512/1024-thread decode blocks.
+/// Before the fix, the per-thread score loop folded its 128 q*k
+/// accumulations into a single deeply-nested Naga expression, which
+/// miscompiled on Metal once the kernel's `workgroup_size` exceeded 128;
+/// the kernel produced all-zero output. The fix emits the dot product as a
+/// shader loop with a function-scope accumulator.
+#[test]
+fn decode_gqa_non_tiled_large_blocks_match_cpu_reference() {
+    pollster::block_on(async {
+        let Ok(device) = Device::new().await else {
+            return;
+        };
 
-    let q_data = vec![
-        (0..32)
-            .map(|head| {
-                (0..48)
-                    .map(|token| {
-                        (0..TEST_HEAD_DIM)
-                            .map(|dim| {
-                                let value = ((head * 17 + token * 11 + dim * 5) % 41) as f32 - 20.0;
-                                value * 0.002
-                            })
-                            .collect::<Vec<_>>()
-                    })
-                    .collect::<Vec<_>>()
-            })
-            .collect::<Vec<_>>(),
-    ];
-    let k_data = decode_k_gqa(8, 48);
-    let v_data = decode_v_gqa(8, 48);
-    let scale = 1.0 / f32::sqrt(TEST_HEAD_DIM as f32);
+        let num_heads = 32;
+        let num_kv_heads = 8;
+        let groups = num_heads / num_kv_heads;
+        let caps = KernelDeviceCaps::from_device(&device);
 
-    let q = Tensor::new(&device, &q_data);
-    let k = Tensor::new(&device, &k_data);
-    let v = Tensor::new(&device, &v_data);
-    let output = q.try_flash_attention_direct(&k, &v, scale, None).unwrap();
-    output.materialize().await;
+        // On devices that support the larger workgroups, 200 uses the 512
+        // block and 600 uses the 1024 block.
+        for (kv_len, expected_block) in [(200usize, DecodeBlock::Medium), (600, DecodeBlock::Large)]
+        {
+            if choose_decode_block(kv_len as u32, caps) != Some(expected_block) {
+                continue;
+            }
+            let q_data = decode_q_gqa(num_heads);
+            let k_data = decode_k_gqa(num_kv_heads, kv_len);
+            let v_data = decode_v_gqa(num_kv_heads, kv_len);
+            let scale = 1.0 / f32::sqrt(TEST_HEAD_DIM as f32);
+
+            let q = Tensor::new(&device, &q_data);
+            let k = Tensor::new(&device, &k_data);
+            let v = Tensor::new(&device, &v_data);
+            let output = q.try_flash_attention_direct(&k, &v, scale, None).unwrap();
+            let output = output.as_slice().await.unwrap();
+
+            let (max_error, max_head, max_dim, max_actual, max_expected) = decode_max_error(
+                num_heads,
+                groups,
+                &q_data,
+                &k_data,
+                &v_data,
+                scale,
+                |head, dim| output[[0, head, 0, dim]],
+            );
+            assert!(
+                max_error < 5.0e-4,
+                "kv_len={kv_len} head={max_head} dim={max_dim}: actual={max_actual} expected={max_expected} error={max_error}"
+            );
+        }
+    });
+}
+
+#[test]
+fn streaming_gqa_regression_shape_builds_direct_kernel() {
+    pollster::block_on(async {
+        let Ok(device) = Device::new().await else {
+            return;
+        };
+
+        let q_data = vec![
+            (0..32)
+                .map(|head| {
+                    (0..48)
+                        .map(|token| {
+                            (0..TEST_HEAD_DIM)
+                                .map(|dim| {
+                                    let value =
+                                        ((head * 17 + token * 11 + dim * 5) % 41) as f32 - 20.0;
+                                    value * 0.002
+                                })
+                                .collect::<Vec<_>>()
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .collect::<Vec<_>>(),
+        ];
+        let k_data = decode_k_gqa(8, 48);
+        let v_data = decode_v_gqa(8, 48);
+        let scale = 1.0 / f32::sqrt(TEST_HEAD_DIM as f32);
+
+        let q = Tensor::new(&device, &q_data);
+        let k = Tensor::new(&device, &k_data);
+        let v = Tensor::new(&device, &v_data);
+        let output = q.try_flash_attention_direct(&k, &v, scale, None).unwrap();
+        output.materialize().await;
+    });
 }

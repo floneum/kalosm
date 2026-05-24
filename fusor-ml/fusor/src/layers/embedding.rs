@@ -1,6 +1,8 @@
 //! Embedding layer implementation.
 
-use crate::{CastTensor, CastTo, DataType, Device, QMatrix, SimdElement, Tensor, VarBuilder};
+use crate::{
+    CastTensor, CastTo, DataType, Device, Fusion, QMatrix, SimdElement, Tensor, VarBuilder,
+};
 use fusor_gguf::GgmlType;
 
 /// Embedding layer for token/position embeddings.
@@ -43,7 +45,7 @@ impl<T: DataType + SimdElement + Default> Embedding<T> {
         indices: &Tensor<N, u32, B>,
     ) -> Tensor<M, T>
     where
-        B: crate::cpu::TensorBacking<N, Elem = u32>,
+        B: Fusion<N, u32>,
         crate::gpu::Tensor<N, u32>: crate::gpu::NextRank<M, u32>,
         f32: CastTensor<T> + CastTo<T>,
     {
@@ -74,8 +76,10 @@ impl<T: DataType + SimdElement + Default> Embedding<T> {
                 }
                 (Tensor::Gpu(gpu_indices), QMatrix::Gpu(gpu_embeddings)) => {
                     let indices_flat = gpu_indices.flatten_all();
-                    let values = gpu_embeddings.index_select_rows(&indices_flat);
-                    Tensor::Gpu(values.reshape(final_dims).cast())
+                    let values = gpu_embeddings.index_select_rows(indices_flat.as_core());
+                    Tensor::Gpu(crate::GpuTensor::from_core(
+                        values.reshape(final_dims).cast::<T>(),
+                    ))
                 }
                 _ => panic!("Indices and embeddings must be on the same device"),
             };

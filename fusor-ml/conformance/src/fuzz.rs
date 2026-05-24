@@ -229,7 +229,7 @@ impl<const R: usize, T: SimdElement + DataType> FuzzGenerator<R, T> {
 /// non-contiguous stride layout. On CPU `to_concrete()` materializes the view
 /// into a contiguous backing buffer, so CPU only exercises the contiguous path.
 /// The CPU `to_concrete()` is not an oversight: the CPU backend is contiguous-only
-/// by design (see `TensorBacking` in `cpu/src/lib.rs`), so non-contig stride
+/// by design (see the CPU fusion backing in `cpu/src/lib.rs`), so non-contig stride
 /// coverage on CPU is not reachable from conformance.
 fn make_transposed<const R: usize, T: SimdElement + DataType + Default>(
     tensor: Tensor<R, T>,

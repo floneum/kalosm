@@ -9,23 +9,24 @@ const PROBE_TOKENS: usize = 12;
 const WARMUP_TOKENS: usize = 8;
 const DEFAULT_GPU_SAMPLE_TOP_K: &str = "1";
 
-#[tokio::main]
-async fn main() {
-    fn progress(_: ModelLoadingProgress) {}
+fn main() {
+    pollster::block_on(async {
+        fn progress(_: ModelLoadingProgress) {}
 
-    if std::env::var_os("KALOSM_LLAMA_GPU_SAMPLE_TOP_K").is_none() {
-        std::env::set_var("KALOSM_LLAMA_GPU_SAMPLE_TOP_K", DEFAULT_GPU_SAMPLE_TOP_K);
-    }
+        if std::env::var_os("KALOSM_LLAMA_GPU_SAMPLE_TOP_K").is_none() {
+            std::env::set_var("KALOSM_LLAMA_GPU_SAMPLE_TOP_K", DEFAULT_GPU_SAMPLE_TOP_K);
+        }
 
-    let model = Llama::builder()
-        .with_source(LlamaSource::llama_3_1_8b_chat())
-        .with_device(Device::gpu().await.unwrap())
-        .build_with_loading_handler(progress)
-        .await
-        .unwrap();
+        let model = Llama::builder()
+            .with_source(LlamaSource::llama_3_1_8b_chat())
+            .with_device(Device::gpu().await.unwrap())
+            .build_with_loading_handler(progress)
+            .await
+            .unwrap();
 
-    run_probe(&model, "warmup", WARMUP_TOKENS, false).await;
-    run_probe(&model, "steady", PROBE_TOKENS, true).await;
+        run_probe(&model, "warmup", WARMUP_TOKENS, false).await;
+        run_probe(&model, "steady", PROBE_TOKENS, true).await;
+    });
 }
 
 async fn run_probe(model: &Llama, label: &str, tokens_to_generate: usize, print_tokens: bool) {

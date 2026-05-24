@@ -2,8 +2,7 @@ use std::marker::PhantomData;
 
 use crate::raw::cache::LlamaCache;
 use crate::raw::LlamaConfig;
-use fusor::FloatDataType;
-use fusor::SimdElement;
+use fusor::{FloatDataType, SimdElement};
 use kalosm_language_model::TextCompletionSession;
 use std::sync::{Arc, RwLock};
 

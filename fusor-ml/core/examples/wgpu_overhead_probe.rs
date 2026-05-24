@@ -74,50 +74,51 @@ fn print_samples(label: &str, samples: &[Duration]) {
     eprintln!("{label}: median={median:?} min={min:?} max={max:?} samples={samples:?}");
 }
 
-#[tokio::main]
-async fn main() {
-    let repeats = std::env::args()
-        .nth(1)
-        .and_then(|arg| arg.parse::<usize>().ok())
-        .unwrap_or(20);
+fn main() {
+    pollster::block_on(async {
+        let repeats = std::env::args()
+            .nth(1)
+            .and_then(|arg| arg.parse::<usize>().ok())
+            .unwrap_or(20);
 
-    let device = Device::new().await.unwrap();
-    eprintln!("device={:?}", device.wgpu_adapter().get_info());
+        let device = Device::new().await.unwrap();
+        eprintln!("device={:?}", device.wgpu_adapter().get_info());
 
-    let data = vec![vec![1.0f32; 100]; 100];
-    let tensor = Tensor::new(&device, &data);
-    _ = tensor.as_slice().await.unwrap();
-
-    let add = tensor.clone() + 1.0;
-    add.materialize().await;
-
-    let mut callback_only = Vec::with_capacity(repeats);
-    let mut empty_async = Vec::with_capacity(repeats);
-    let mut empty_sync = Vec::with_capacity(repeats);
-    let mut empty_poll_loop = Vec::with_capacity(repeats);
-    let mut leaf_materialize = Vec::with_capacity(repeats);
-    let mut add_materialize = Vec::with_capacity(repeats);
-
-    for _ in 0..repeats {
-        callback_only.push(measure_callback_only(&device).await);
-        empty_async.push(measure_async_empty_submit(&device).await);
-        empty_sync.push(measure_sync_empty_submit(&device));
-        empty_poll_loop.push(measure_poll_loop_empty_submit(&device));
-
-        let start = Instant::now();
-        tensor.materialize().await;
-        leaf_materialize.push(start.elapsed());
+        let data = vec![vec![1.0f32; 100]; 100];
+        let tensor = Tensor::new(&device, &data);
+        _ = tensor.as_slice().await.unwrap();
 
         let add = tensor.clone() + 1.0;
-        let start = Instant::now();
         add.materialize().await;
-        add_materialize.push(start.elapsed());
-    }
 
-    print_samples("callback-only", &callback_only);
-    print_samples("empty-submit-async", &empty_async);
-    print_samples("empty-submit-sync", &empty_sync);
-    print_samples("empty-submit-poll-loop", &empty_poll_loop);
-    print_samples("leaf-materialize", &leaf_materialize);
-    print_samples("add-materialize", &add_materialize);
+        let mut callback_only = Vec::with_capacity(repeats);
+        let mut empty_async = Vec::with_capacity(repeats);
+        let mut empty_sync = Vec::with_capacity(repeats);
+        let mut empty_poll_loop = Vec::with_capacity(repeats);
+        let mut leaf_materialize = Vec::with_capacity(repeats);
+        let mut add_materialize = Vec::with_capacity(repeats);
+
+        for _ in 0..repeats {
+            callback_only.push(measure_callback_only(&device).await);
+            empty_async.push(measure_async_empty_submit(&device).await);
+            empty_sync.push(measure_sync_empty_submit(&device));
+            empty_poll_loop.push(measure_poll_loop_empty_submit(&device));
+
+            let start = Instant::now();
+            tensor.materialize().await;
+            leaf_materialize.push(start.elapsed());
+
+            let add = tensor.clone() + 1.0;
+            let start = Instant::now();
+            add.materialize().await;
+            add_materialize.push(start.elapsed());
+        }
+
+        print_samples("callback-only", &callback_only);
+        print_samples("empty-submit-async", &empty_async);
+        print_samples("empty-submit-sync", &empty_sync);
+        print_samples("empty-submit-poll-loop", &empty_poll_loop);
+        print_samples("leaf-materialize", &leaf_materialize);
+        print_samples("add-materialize", &add_materialize);
+    });
 }

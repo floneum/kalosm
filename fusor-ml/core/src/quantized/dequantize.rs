@@ -170,23 +170,14 @@ impl Operation for DequantizeOperation {
 }
 
 impl QMatrix {
-    pub fn dequantize<const R: usize, T>(&self) -> Tensor<R, T>
+    pub fn dequantize<T>(&self) -> Tensor
     where
         T: DataType,
         f32: CastTensor<T>,
     {
-        assert_eq!(
-            self.shape.len(),
-            R,
-            "Dequantize: expected {}D tensor, got {}D tensor. Shape: {:?}",
-            R,
-            self.shape.len(),
-            self.shape
-        );
-
         if T::DATA_TYPE != DataTypeEnum::F32 {
-            let tensor: Tensor<R, f32> = self.dequantize::<R, f32>();
-            return tensor.cast();
+            let tensor = self.dequantize::<f32>();
+            return tensor.cast::<T>();
         }
 
         // If the types already match, just return a view of the existing data

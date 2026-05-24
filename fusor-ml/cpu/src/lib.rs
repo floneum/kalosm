@@ -6,10 +6,12 @@ use pulp::Simd;
 use pulp::bytemuck::Pod;
 
 // Module declarations
+mod backing;
 mod cast;
 mod comparison;
 mod concrete_tensor;
 mod conditional;
+mod dynamic;
 mod elementwise;
 mod expr;
 mod gather;
@@ -19,6 +21,7 @@ mod matmul;
 mod pairwise;
 mod parallel;
 mod quantized;
+mod rank;
 mod reduce;
 mod scalar;
 mod slice_assign;
@@ -29,24 +32,42 @@ mod tensor;
 /// but this constant provides a clear point for future updates if needed.
 pub(crate) const MAX_SIMD_LANES: usize = 64;
 
-// Re-export public types
-pub use concrete_tensor::ConcreteTensor;
-pub use elementwise::{
+// Public dynamic tensor API.
+pub use dynamic::{
+    CpuDType, CpuElement, DynamicTensor, DynamicTensor as Tensor, DynamicTensorError,
+};
+pub use fusor_types::Layout;
+
+// Internal typed fusion/storage API used by this crate and the fusor facade.
+#[allow(unused_imports)]
+pub(crate) use backing::{LazyBacking, ResolvedTensor, TensorBacking};
+#[allow(unused_imports)]
+pub(crate) use concrete_tensor::ConcreteTensor;
+#[allow(unused_imports)]
+pub(crate) use elementwise::{
     Abs, Acos, Acosh, Asin, Asinh, Atan, Atanh, Cos, Cosh, Exp, Exp2, Log, Log2, Neg, Sin, Sinh,
     Sqrt, Tan, Tanh,
 };
-pub use expr::materialize_expr;
-pub use map_layout::MapLayout;
-pub use pairwise::{Add, Div, Mul, Rem, Sub};
-pub use quantized::{Dequantize, QuantizedTensor};
-pub use scalar::{AddScalar, Broadcast, DivScalar, MulScalar, SubScalar};
-pub use tensor::{FloatOps, Scalar, Tensor};
+#[allow(unused_imports)]
+pub(crate) use expr::materialize_expr;
+#[allow(unused_imports)]
+pub(crate) use map_layout::MapLayout;
+#[allow(unused_imports)]
+pub(crate) use pairwise::{Add, Div, Mul, Rem, Sub};
+#[allow(unused_imports)]
+pub(crate) use quantized::{Dequantize, QuantizedTensor};
+#[allow(unused_imports)]
+pub(crate) use rank::{
+    LargerRank, LargerRankInner, LastRank, LastRankInner, MaxRank, MaxRankInner, NextRank,
+    NextRankInner, SmallerRank, SmallerRankInner,
+};
+#[allow(unused_imports)]
+pub(crate) use scalar::{AddScalar, Broadcast, DivScalar, MulScalar, SubScalar};
+#[allow(unused_imports)]
+pub(crate) use tensor::{FloatOps, Scalar, TypedTensor};
 
 // Re-export FromArray trait from fusor-types
 pub use fusor_types::FromArray;
-
-// Re-export Layout from fusor-types for public API
-pub use fusor_types::Layout;
 
 // Re-export aligned_vec types for use by dependent crates
 pub use aligned_vec::ABox;
@@ -84,245 +105,62 @@ impl Deref for CpuMappedBuffer {
     }
 }
 
-// Re-export operation traits and markers for public bounds
-pub use cast::CastTo;
-pub use comparison::{Eq, EqOp, Gt, GtOp, Gte, GteOp, Lt, LtOp, Lte, LteOp, Ne, NeOp};
-pub use conditional::IsNonZero;
-pub use elementwise::{
+// Internal operation traits and markers.
+#[allow(unused_imports)]
+pub(crate) use cast::CastTo;
+#[allow(unused_imports)]
+pub(crate) use comparison::{Eq, EqOp, Gt, GtOp, Gte, GteOp, Lt, LtOp, Lte, LteOp, Ne, NeOp};
+#[allow(unused_imports)]
+pub(crate) use conditional::IsNonZero;
+#[allow(unused_imports)]
+pub(crate) use elementwise::{
     AbsOp, AcosOp, AcoshOp, AsinOp, AsinhOp, AtanOp, AtanhOp, CosOp, CoshOp, Exp2Op, ExpOp, Log2Op,
     LogOp, NegOp, SimdUnaryOp, SinOp, SinhOp, SqrtOp, TanOp, TanhOp,
 };
-pub use matmul::MatmulImpl;
-pub use pairwise::{AddOp, DivOp, MulOp, RemOp, SimdBinaryOp, SubOp};
-pub use reduce::{
+#[allow(unused_imports)]
+pub(crate) use matmul::MatmulImpl;
+#[allow(unused_imports)]
+pub(crate) use pairwise::{AddOp, DivOp, MulOp, RemOp, SimdBinaryOp, SubOp};
+#[allow(unused_imports)]
+pub(crate) use reduce::{
     MaxOp, MinOp, ProdOp, SimdReduceOp, SumOp, layer_norm_last_dim_fused, softmax_last_dim_fused,
 };
 
 // Re-export internal types used by other modules
 pub(crate) use concrete_tensor::IndexIterator;
 
-// Trait for mapping tensor to its one-rank-smaller type (for axis reductions)
-pub trait LastRankInner {
-    type LastRank;
-}
-
-pub trait LastRank<const R: usize, T: SimdElement>:
-    LastRankInner<LastRank = ConcreteTensor<T, R>>
-{
-}
-
-impl<const R: usize, T: SimdElement, X> LastRank<R, T> for X where
-    X: LastRankInner<LastRank = ConcreteTensor<T, R>>
-{
-}
-
-// Macro to generate LastRankInner implementations for each rank
-macro_rules! impl_last_rank {
-    ($($R:literal),*) => {
-        $(
-            impl<T: SimdElement> LastRankInner for ConcreteTensor<T, $R> {
-                type LastRank = ConcreteTensor<T, { $R - 1 }>;
-            }
-        )*
+#[doc(hidden)]
+pub mod __private {
+    pub use crate::backing::{LazyBacking, ResolvedTensor, TensorBacking};
+    pub use crate::cast::CastTo;
+    pub use crate::comparison::{Eq, EqOp, Gt, GtOp, Gte, GteOp, Lt, LtOp, Lte, LteOp, Ne, NeOp};
+    pub use crate::concrete_tensor::ConcreteTensor;
+    pub use crate::conditional::IsNonZero;
+    pub use crate::elementwise::{
+        Abs, AbsOp, Acos, AcosOp, Acosh, AcoshOp, Asin, AsinOp, Asinh, AsinhOp, Atan, AtanOp,
+        Atanh, AtanhOp, Cos, CosOp, Cosh, CoshOp, Exp, Exp2, Exp2Op, ExpOp, Log, Log2, Log2Op,
+        LogOp, Neg, NegOp, SimdUnaryOp, Sin, SinOp, Sinh, SinhOp, Sqrt, SqrtOp, Tan, TanOp, Tanh,
+        TanhOp,
     };
-}
-
-// Generate for ranks 1-10
-impl_last_rank!(1, 2, 3, 4, 5, 6, 7, 8, 9, 10);
-
-// Trait for mapping tensor to its next-higher rank type (for unsqueeze)
-pub trait NextRankInner {
-    type NextRank;
-}
-
-pub trait NextRank<const R: usize, T: SimdElement>:
-    NextRankInner<NextRank = ConcreteTensor<T, R>>
-{
-}
-
-impl<const R: usize, T: SimdElement, X> NextRank<R, T> for X where
-    X: NextRankInner<NextRank = ConcreteTensor<T, R>>
-{
-}
-
-// Macro to generate NextRankInner implementations for each rank
-macro_rules! impl_next_rank {
-    ($($R:literal),*) => {
-        $(
-            impl<T: SimdElement> NextRankInner for ConcreteTensor<T, $R> {
-                type NextRank = ConcreteTensor<T, { $R + 1 }>;
-            }
-        )*
+    pub use crate::expr::materialize_expr;
+    pub use crate::map_layout::MapLayout;
+    pub use crate::matmul::MatmulImpl;
+    pub use crate::pairwise::{
+        Add, AddOp, Div, DivOp, Mul, MulOp, Rem, RemOp, SimdBinaryOp, Sub, SubOp,
     };
-}
-
-// Generate for ranks 0-9 (so next rank goes up to 10)
-impl_next_rank!(0, 1, 2, 3, 4, 5, 6, 7, 8, 9);
-
-// Trait for mapping tensor to a smaller rank (for squeeze, reduce)
-pub trait SmallerRankInner<const DIFF: usize> {
-    type SmallerRank;
-}
-
-pub trait SmallerRank<const R: usize, const DIFF: usize, T: SimdElement>:
-    SmallerRankInner<DIFF, SmallerRank = ConcreteTensor<T, R>>
-{
-}
-
-impl<const R: usize, const DIFF: usize, T: SimdElement, X> SmallerRank<R, DIFF, T> for X where
-    X: SmallerRankInner<DIFF, SmallerRank = ConcreteTensor<T, R>>
-{
-}
-
-// Macro to generate SmallerRankInner implementations
-macro_rules! impl_smaller_rank {
-    ($R:literal, $($DIFF:literal => $OUT:literal),*) => {
-        $(
-            impl<T: SimdElement> SmallerRankInner<$DIFF> for ConcreteTensor<T, $R> {
-                type SmallerRank = ConcreteTensor<T, $OUT>;
-            }
-        )*
+    pub use crate::quantized::{Dequantize, QuantizedTensor};
+    pub use crate::rank::{
+        LargerRank, LargerRankInner, LastRank, LastRankInner, MaxRank, MaxRankInner, NextRank,
+        NextRankInner, SmallerRank, SmallerRankInner,
     };
-}
-
-// Generate smaller rank mappings
-impl_smaller_rank!(1, 1 => 0);
-impl_smaller_rank!(2, 1 => 1, 2 => 0);
-impl_smaller_rank!(3, 1 => 2, 2 => 1, 3 => 0);
-impl_smaller_rank!(4, 1 => 3, 2 => 2, 3 => 1, 4 => 0);
-impl_smaller_rank!(5, 1 => 4, 2 => 3, 3 => 2, 4 => 1, 5 => 0);
-impl_smaller_rank!(6, 1 => 5, 2 => 4, 3 => 3, 4 => 2, 5 => 1, 6 => 0);
-impl_smaller_rank!(7, 1 => 6, 2 => 5, 3 => 4, 4 => 3, 5 => 2, 6 => 1, 7 => 0);
-impl_smaller_rank!(8, 1 => 7, 2 => 6, 3 => 5, 4 => 4, 5 => 3, 6 => 2, 7 => 1, 8 => 0);
-impl_smaller_rank!(9, 1 => 8, 2 => 7, 3 => 6, 4 => 5, 5 => 4, 6 => 3, 7 => 2, 8 => 1, 9 => 0);
-impl_smaller_rank!(10, 1 => 9, 2 => 8, 3 => 7, 4 => 6, 5 => 5, 6 => 4, 7 => 3, 8 => 2, 9 => 1, 10 => 0);
-
-// Trait for mapping tensor to a larger rank (for unsqueeze, expand)
-pub trait LargerRankInner<const DIFF: usize> {
-    type LargerRank;
-}
-
-pub trait LargerRank<const R: usize, const DIFF: usize, T: SimdElement>:
-    LargerRankInner<DIFF, LargerRank = ConcreteTensor<T, R>>
-{
-}
-
-impl<const R: usize, const DIFF: usize, T: SimdElement, X> LargerRank<R, DIFF, T> for X where
-    X: LargerRankInner<DIFF, LargerRank = ConcreteTensor<T, R>>
-{
-}
-
-// Macro to generate LargerRankInner implementations
-macro_rules! impl_larger_rank {
-    ($R:literal, $($DIFF:literal => $OUT:literal),*) => {
-        $(
-            impl<T: SimdElement> LargerRankInner<$DIFF> for ConcreteTensor<T, $R> {
-                type LargerRank = ConcreteTensor<T, $OUT>;
-            }
-        )*
+    pub use crate::reduce::{
+        MaxOp, MinOp, ProdOp, SimdReduceOp, SumOp, layer_norm_last_dim_fused,
+        softmax_last_dim_fused,
     };
+    pub use crate::scalar::{AddScalar, Broadcast, DivScalar, MulScalar, SubScalar};
+    pub use crate::tensor::{FloatOps, Scalar, TypedTensor};
+    pub use crate::{F16Scalar, SimdElement};
 }
-
-// Generate larger rank mappings
-impl_larger_rank!(0, 1 => 1, 2 => 2, 3 => 3, 4 => 4, 5 => 5, 6 => 6, 7 => 7, 8 => 8, 9 => 9, 10 => 10);
-impl_larger_rank!(1, 1 => 2, 2 => 3, 3 => 4, 4 => 5, 5 => 6, 6 => 7, 7 => 8, 8 => 9, 9 => 10);
-impl_larger_rank!(2, 1 => 3, 2 => 4, 3 => 5, 4 => 6, 5 => 7, 6 => 8, 7 => 9, 8 => 10);
-impl_larger_rank!(3, 1 => 4, 2 => 5, 3 => 6, 4 => 7, 5 => 8, 6 => 9, 7 => 10);
-impl_larger_rank!(4, 1 => 5, 2 => 6, 3 => 7, 4 => 8, 5 => 9, 6 => 10);
-impl_larger_rank!(5, 1 => 6, 2 => 7, 3 => 8, 4 => 9, 5 => 10);
-impl_larger_rank!(6, 1 => 7, 2 => 8, 3 => 9, 4 => 10);
-impl_larger_rank!(7, 1 => 8, 2 => 9, 3 => 10);
-impl_larger_rank!(8, 1 => 9, 2 => 10);
-impl_larger_rank!(9, 1 => 10);
-
-// Trait for mapping two tensors to their max rank (for broadcasting operations)
-pub trait MaxRankInner {
-    type MaxRank;
-}
-
-pub trait MaxRank<const R: usize, T: SimdElement>:
-    MaxRankInner<MaxRank = ConcreteTensor<T, R>>
-{
-}
-
-impl<const R: usize, T: SimdElement, X> MaxRank<R, T> for X where
-    X: MaxRankInner<MaxRank = ConcreteTensor<T, R>>
-{
-}
-
-// Same rank produces same rank
-impl<const N: usize, T: SimdElement> MaxRankInner for (ConcreteTensor<T, N>, ConcreteTensor<T, N>) {
-    type MaxRank = ConcreteTensor<T, N>;
-}
-
-// Macro to generate MaxRankInner implementations for different rank pairs
-macro_rules! impl_max_rank {
-    ($R1:literal, $R2:literal) => {
-        impl<T: SimdElement> MaxRankInner for (ConcreteTensor<T, $R1>, ConcreteTensor<T, $R2>) {
-            type MaxRank = ConcreteTensor<T, $R2>;
-        }
-        impl<T: SimdElement> MaxRankInner for (ConcreteTensor<T, $R2>, ConcreteTensor<T, $R1>) {
-            type MaxRank = ConcreteTensor<T, $R2>;
-        }
-    };
-}
-
-// Generate MaxRank implementations for all rank combinations 0-10
-impl_max_rank!(0, 1);
-impl_max_rank!(0, 2);
-impl_max_rank!(0, 3);
-impl_max_rank!(0, 4);
-impl_max_rank!(0, 5);
-impl_max_rank!(0, 6);
-impl_max_rank!(0, 7);
-impl_max_rank!(0, 8);
-impl_max_rank!(0, 9);
-impl_max_rank!(0, 10);
-impl_max_rank!(1, 2);
-impl_max_rank!(1, 3);
-impl_max_rank!(1, 4);
-impl_max_rank!(1, 5);
-impl_max_rank!(1, 6);
-impl_max_rank!(1, 7);
-impl_max_rank!(1, 8);
-impl_max_rank!(1, 9);
-impl_max_rank!(1, 10);
-impl_max_rank!(2, 3);
-impl_max_rank!(2, 4);
-impl_max_rank!(2, 5);
-impl_max_rank!(2, 6);
-impl_max_rank!(2, 7);
-impl_max_rank!(2, 8);
-impl_max_rank!(2, 9);
-impl_max_rank!(2, 10);
-impl_max_rank!(3, 4);
-impl_max_rank!(3, 5);
-impl_max_rank!(3, 6);
-impl_max_rank!(3, 7);
-impl_max_rank!(3, 8);
-impl_max_rank!(3, 9);
-impl_max_rank!(3, 10);
-impl_max_rank!(4, 5);
-impl_max_rank!(4, 6);
-impl_max_rank!(4, 7);
-impl_max_rank!(4, 8);
-impl_max_rank!(4, 9);
-impl_max_rank!(4, 10);
-impl_max_rank!(5, 6);
-impl_max_rank!(5, 7);
-impl_max_rank!(5, 8);
-impl_max_rank!(5, 9);
-impl_max_rank!(5, 10);
-impl_max_rank!(6, 7);
-impl_max_rank!(6, 8);
-impl_max_rank!(6, 9);
-impl_max_rank!(6, 10);
-impl_max_rank!(7, 8);
-impl_max_rank!(7, 9);
-impl_max_rank!(7, 10);
-impl_max_rank!(8, 9);
-impl_max_rank!(8, 10);
-impl_max_rank!(9, 10);
 
 /// Canonical macro for defining lazy tensor expression types.
 ///
@@ -556,61 +394,6 @@ macro_rules! define_tensor_op {
 }
 
 pub(crate) use define_tensor_op;
-
-/// Trait for types that support scalar and SIMD evaluation without a rank parameter.
-/// This is a supertrait of `TensorBacking` that allows rank-independent access.
-pub trait LazyBacking: Sync {
-    type Elem: SimdElement;
-
-    /// Evaluate at a single scalar index.
-    ///
-    /// This is used for:
-    /// - Tail elements that don't fill a complete SIMD vector
-    /// - Non-contiguous tensor access patterns
-    fn eval_scalar(&self, idx: usize) -> Self::Elem;
-
-    /// Evaluate a SIMD chunk starting at the given base index.
-    ///
-    /// The returned SIMD vector contains multiple consecutive elements
-    /// starting at `base_idx`. The caller must ensure that there are
-    /// enough elements remaining to fill a complete SIMD vector.
-    fn eval_simd<S: Simd>(&self, simd: S, base_idx: usize) -> <Self::Elem as SimdElement>::Simd<S>;
-}
-
-pub trait TensorBacking<const R: usize>: LazyBacking {
-    fn layout(&self) -> Layout;
-    fn to_concrete(&self) -> ConcreteTensor<Self::Elem, R>;
-}
-
-// Blanket implementation for references
-impl<T: LazyBacking + Sync> LazyBacking for &T {
-    type Elem = T::Elem;
-
-    #[inline(always)]
-    fn eval_scalar(&self, idx: usize) -> Self::Elem {
-        (*self).eval_scalar(idx)
-    }
-
-    #[inline(always)]
-    fn eval_simd<S: Simd>(&self, simd: S, base_idx: usize) -> <Self::Elem as SimdElement>::Simd<S> {
-        (*self).eval_simd(simd, base_idx)
-    }
-}
-
-impl<const R: usize, T: TensorBacking<R> + Sync> TensorBacking<R> for &T {
-    fn layout(&self) -> Layout {
-        (*self).layout()
-    }
-
-    fn to_concrete(&self) -> ConcreteTensor<Self::Elem, R> {
-        (*self).to_concrete()
-    }
-}
-
-pub trait ResolvedTensor<const R: usize>: TensorBacking<R> {
-    fn data(&self) -> &ABox<[Self::Elem]>;
-    fn data_mut(&mut self) -> &mut ABox<[Self::Elem]>;
-}
 
 /// Trait for SIMD element types with associated SIMD vector type
 pub trait SimdElement: Sized + Copy + Default + Pod + Sync + Send {

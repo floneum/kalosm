@@ -1,685 +1,879 @@
-#[cfg(feature = "gpu")]
-pub use fusor_core::*;
-
-#[cfg(not(feature = "gpu"))]
-mod disabled {
-    use std::{
-        fmt::{self, Debug, Display},
-        marker::PhantomData,
-        ops::{Add, AddAssign, Div, DivAssign, Mul, MulAssign, Neg, Rem, Sub, SubAssign},
-    };
-
-    use bytemuck::{AnyBitPattern, NoUninit};
-    pub use fusor_types::{D, Dim, Layout, StrideSpec, TensorSlice};
-
-    pub use fusor_gguf::GgufReadError;
-
-    pub trait DataType:
-        Add<Output = Self>
-        + AddAssign
-        + Sub<Output = Self>
-        + SubAssign
-        + Mul<Output = Self>
-        + MulAssign
-        + Div<Output = Self>
-        + DivAssign
-        + PartialOrd
-        + NoUninit
-        + AnyBitPattern
-        + Debug
-        + Display
-        + Send
-        + Sync
-        + 'static
-    {
-        fn zero() -> Self;
-        fn one() -> Self;
-    }
-
-    pub trait FloatDataType: DataType {
-        fn from_f32(value: f32) -> Self;
-        fn is_finite(&self) -> bool;
-    }
-
-    impl DataType for f32 {
-        fn zero() -> Self {
-            0.
-        }
-
-        fn one() -> Self {
-            1.
-        }
-    }
-
-    impl FloatDataType for f32 {
-        fn from_f32(value: f32) -> Self {
-            value
-        }
-
-        fn is_finite(&self) -> bool {
-            f32::is_finite(*self)
-        }
-    }
-
-    impl DataType for half::f16 {
-        fn zero() -> Self {
-            half::f16::from_f32(0.)
-        }
-
-        fn one() -> Self {
-            half::f16::from_f32(1.)
-        }
-    }
-
-    impl FloatDataType for half::f16 {
-        fn from_f32(value: f32) -> Self {
-            half::f16::from_f32(value)
-        }
-
-        fn is_finite(&self) -> bool {
-            half::f16::is_finite(*self)
-        }
-    }
-
-    impl DataType for u32 {
-        fn zero() -> Self {
-            0
-        }
-
-        fn one() -> Self {
-            1
-        }
-    }
-
-    pub use fusor_types::ShapeWithOneHole;
-
-    #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-    pub struct NodeIndex;
-
-    #[derive(Clone, Debug)]
-    pub enum Device {}
-
-    #[derive(Clone, Debug)]
-    pub struct WgpuAdapter;
-
-    #[derive(Clone, Debug)]
-    pub struct WgpuAdapterInfo;
-
-    impl WgpuAdapter {
-        pub fn get_info(&self) -> WgpuAdapterInfo {
-            WgpuAdapterInfo
-        }
-    }
-
-    impl Device {
-        pub fn resolve_batch(&self, _keys: &[NodeIndex]) -> usize {
-            match *self {}
-        }
-
-        pub fn detach_cached(&self, _keys: &[NodeIndex]) {
-            match *self {}
-        }
-
-        pub fn poll_wait(&self) {
-            match *self {}
-        }
-
-        pub fn wgpu_adapter(&self) -> &WgpuAdapter {
-            match *self {}
-        }
-    }
-
-    #[derive(Debug)]
-    pub enum Error {}
-
-    impl fmt::Display for Error {
-        fn fmt(&self, _f: &mut fmt::Formatter<'_>) -> fmt::Result {
-            match *self {}
-        }
-    }
-
-    impl std::error::Error for Error {}
-
-    #[derive(Debug)]
-    pub enum Tensor<const R: usize, T> {
-        Disabled(PhantomData<T>, std::convert::Infallible),
-    }
-
-    impl<const R: usize, T> Clone for Tensor<R, T> {
-        fn clone(&self) -> Self {
-            match self {
-                Tensor::Disabled(_, never) => match *never {},
-            }
-        }
-    }
-
-    #[derive(Debug)]
-    pub enum MappedBuffer {}
-
-    impl std::ops::Deref for MappedBuffer {
-        type Target = [u8];
-
-        fn deref(&self) -> &Self::Target {
-            match *self {}
-        }
-    }
-
-    #[derive(Clone, Debug)]
-    pub enum QMatrix {}
-
-    impl QMatrix {
-        pub fn concat_rows(_matrices: &[&Self]) -> Option<Self> {
-            None
-        }
-
-        pub fn datatype(&self) -> fusor_gguf::GgmlType {
-            match *self {}
-        }
-
-        pub fn shape(&self) -> &[usize] {
-            match *self {}
-        }
-
-        pub fn device(&self) -> &Device {
-            match *self {}
-        }
-
-        pub fn from_raw_bytes(
-            _device: &Device,
-            _shape: impl Into<Box<[usize]>>,
-            _bytes: &[u8],
-            _ty: fusor_gguf::GgmlType,
-        ) -> Result<Self, fusor_gguf::GgufReadError> {
-            unreachable!("GPU backend is disabled")
-        }
-
-        pub fn from_parts(
-            _device: &Device,
-            _bytes: &[u8],
-            _shape: Box<[usize]>,
-            _ty: fusor_gguf::GgmlType,
-        ) -> Result<Self, fusor_gguf::GgufReadError> {
-            unreachable!("GPU backend is disabled")
-        }
-
-        pub fn dequantize<const R: usize, T>(&self) -> Tensor<R, T> {
-            match *self {}
-        }
-
-        pub fn index_select_rows(&self, _indexes: &Tensor<1, u32>) -> Tensor<2, f32> {
-            match *self {}
-        }
-    }
-
-    #[derive(Debug)]
-    pub enum GpuMirostat2Sampler {}
-
-    impl GpuMirostat2Sampler {
-        pub fn new(_device: &Device, _mu: f32) -> Self {
-            unreachable!("GPU backend is disabled")
-        }
-    }
-
-    #[derive(Clone, Copy, Debug)]
-    pub struct GpuMirostat2SamplerParams {
-        pub top_k: usize,
-        pub temperature: f32,
-        pub repetition_penalty: f32,
-        pub tau: f32,
-        pub eta: f32,
-        pub random: f32,
-    }
-
-    pub trait CastTensor<T>: Sized {}
-    impl<S, T> CastTensor<T> for S {}
-
-    pub trait NextRankInner {
-        type NextRank: LastRankInner + NextRankInner;
-    }
-
-    pub trait NextRank<const R: usize, T>: NextRankInner<NextRank = Tensor<R, T>> {}
-
-    impl<const R: usize, T, X> NextRank<R, T> for X where X: NextRankInner<NextRank = Tensor<R, T>> {}
-
-    pub trait LastRankInner {
-        type LastRank: NextRankInner;
-    }
-
-    pub trait LastRank<const R: usize, T>: LastRankInner<LastRank = Tensor<R, T>> {}
-
-    impl<const R: usize, T, X> LastRank<R, T> for X where X: LastRankInner<LastRank = Tensor<R, T>> {}
-
-    pub trait SmallerRankInner<const R: usize> {
-        type SmallerRank;
-        type SmallerByArray;
-    }
-
-    pub trait SmallerRank<const R: usize, const S: usize, T>:
-        SmallerRankInner<R, SmallerRank = Tensor<S, T>, SmallerByArray = [usize; R]>
-    {
-    }
-
-    impl<const R: usize, const S: usize, T, X> SmallerRank<R, S, T> for X where
-        X: SmallerRankInner<R, SmallerRank = Tensor<S, T>, SmallerByArray = [usize; R]>
-    {
-    }
-
-    pub trait LargerRankInner<const R: usize> {
-        type LargerRank;
-        type LargerByArray;
-    }
-
-    pub trait LargerRank<const R: usize, const S: usize, T>:
-        LargerRankInner<R, LargerRank = Tensor<S, T>, LargerByArray = [usize; R]>
-    {
-    }
-
-    impl<const R: usize, const S: usize, T, X> LargerRank<R, S, T> for X where
-        X: LargerRankInner<R, LargerRank = Tensor<S, T>, LargerByArray = [usize; R]>
-    {
-    }
-
-    pub trait MaxRankInner {
-        type MaxRank;
-    }
-
-    pub trait MaxRank<const R: usize, T>: MaxRankInner<MaxRank = Tensor<R, T>> {}
-
-    impl<const R: usize, T, X> MaxRank<R, T> for X where X: MaxRankInner<MaxRank = Tensor<R, T>> {}
-
-    fusor_types::impl_rank_traits!(Tensor);
-
-    pub trait IntoTensorData<const R: usize, T> {}
-    impl<const R: usize, T> IntoTensorData<R, T> for &[T] {}
-    impl<const R: usize, T> IntoTensorData<R, T> for &Vec<T> {}
-    impl<const R: usize, T> IntoTensorData<R, T> for Vec<&[T]> {}
-
-    macro_rules! never {
-        ($value:expr) => {
-            match $value {
-                Tensor::Disabled(_, never) => match *never {},
-            }
-        };
-    }
-
-    impl<const R: usize, D, T> fusor_types::FromArray<R, D, T, Device> for Tensor<R, D>
-    where
-        D: DataType,
-        T: fusor_types::IntoFlatArray<D, R>,
-    {
-        fn from_array(_data: T, _device: &Device) -> Self {
-            unreachable!("GPU backend is disabled")
-        }
-    }
-
-    impl<const R: usize, T> Tensor<R, T> {
-        pub fn new(_device: &Device, _data: impl IntoTensorData<R, T>) -> Self {
-            unreachable!("GPU backend is disabled")
-        }
-
-        pub fn from_slice(_device: &Device, _shape: [usize; R], _data: &[T]) -> Self {
-            unreachable!("GPU backend is disabled")
-        }
-
-        pub fn splat(_device: &Device, _value: T, _shape: [usize; R]) -> Self {
-            unreachable!("GPU backend is disabled")
-        }
-
-        pub fn shape(&self) -> &[usize; R] {
-            never!(self)
-        }
-        pub fn device(&self) -> &Device {
-            never!(self)
-        }
-        pub fn key(&self) -> NodeIndex {
-            never!(self)
-        }
-
-        pub async fn as_slice(&self) -> Result<TensorSlice<R, T, MappedBuffer>, Error>
-        where
-            T: DataType,
-        {
-            never!(self)
-        }
-
-        pub async fn top_k_pairs(&self, _k: usize) -> Result<(Vec<u32>, Vec<f32>), Error> {
-            never!(self)
-        }
-
-        pub async fn sample_mirostat2_token(
-            &self,
-            _sampler: &mut GpuMirostat2Sampler,
-            _previous_tokens: &[u32],
-            _params: GpuMirostat2SamplerParams,
-        ) -> Result<u32, Error> {
-            never!(self)
-        }
-
-        pub async fn try_sample_mirostat2_token_q_mat(
-            &self,
-            _weights: &QMatrix,
-            _sampler: &mut GpuMirostat2Sampler,
-            _previous_tokens: &[u32],
-            _params: GpuMirostat2SamplerParams,
-        ) -> Result<Option<u32>, Error> {
-            never!(self)
-        }
-
-        pub fn reshape<const R2: usize>(
-            &self,
-            _new_shape: impl ShapeWithOneHole<R2>,
-        ) -> Tensor<R2, T> {
-            never!(self)
-        }
-        pub fn restride<const R2: usize>(&self, _specs: [StrideSpec; R2]) -> Tensor<R2, T> {
-            never!(self)
-        }
-        pub fn restride_layout<const R2: usize>(&self, _layout: Layout) -> Tensor<R2, T> {
-            never!(self)
-        }
-        pub fn resize(&self, _new_shape: [usize; R]) -> Tensor<R, T> {
-            never!(self)
-        }
-        pub fn flatten_all(&self) -> Tensor<1, T> {
-            never!(self)
-        }
-        pub fn slice_assign_in_place(
-            &self,
-            _slice: [std::ops::Range<usize>; R],
-            _value: &Self,
-        ) -> Self {
-            never!(self)
-        }
-        pub fn slice_assign(&self, _slice: [std::ops::Range<usize>; R], _value: &Self) -> Self {
-            never!(self)
-        }
-        pub fn softmax(&self, _axis: usize) -> Self {
-            never!(self)
-        }
-        pub fn softmax_last_dim<const R2: usize>(&self) -> Self {
-            never!(self)
-        }
-        pub fn sum<const R2: usize>(&self, _axis: usize) -> Tensor<R2, T> {
-            never!(self)
-        }
-        pub fn max<const R2: usize>(&self, _axis: usize) -> Tensor<R2, T> {
-            never!(self)
-        }
-        pub fn min<const R2: usize>(&self, _axis: usize) -> Tensor<R2, T> {
-            never!(self)
-        }
-        pub fn product<const R2: usize>(&self, _axis: usize) -> Tensor<R2, T> {
-            never!(self)
-        }
-        pub fn add_<const R2: usize, const R3: usize>(
-            &self,
-            _rhs: &Tensor<R2, T>,
-        ) -> Tensor<R3, T> {
-            never!(self)
-        }
-        pub fn sub_<const R2: usize, const R3: usize>(
-            &self,
-            _rhs: &Tensor<R2, T>,
-        ) -> Tensor<R3, T> {
-            never!(self)
-        }
-        pub fn mul_<const R2: usize, const R3: usize>(
-            &self,
-            _rhs: &Tensor<R2, T>,
-        ) -> Tensor<R3, T> {
-            never!(self)
-        }
-        pub fn div_<const R2: usize, const R3: usize>(
-            &self,
-            _rhs: &Tensor<R2, T>,
-        ) -> Tensor<R3, T> {
-            never!(self)
-        }
-        pub fn pow(&self, _rhs: &Self) -> Self {
-            never!(self)
-        }
-        pub fn pow_(&self, _rhs: &Self) -> Self {
-            never!(self)
-        }
-        pub fn cast<T2>(&self) -> Tensor<R, T2>
-        where
-            T: CastTensor<T2>,
-        {
-            never!(self)
-        }
-        pub fn index_select(&self, _dimension: usize, _indexes: &Tensor<1, u32>) -> Self {
-            never!(self)
-        }
-        pub fn mat_mul(&self, _rhs: &Self) -> Self {
-            never!(self)
-        }
-        pub fn matmul(&self, _rhs: &Self) -> Self {
-            never!(self)
-        }
-        pub fn q_mat_mul(&self, _weights: &QMatrix) -> Self {
-            never!(self)
-        }
-        pub fn q_mat_mul_paired_silu_product(&self, _weights: &QMatrix) -> Self {
-            never!(self)
-        }
-        pub fn q_mat_mul_add2(&self, _weights: &QMatrix, _first: &Self, _second: &Self) -> Self {
-            never!(self)
-        }
-        pub fn rope_fused(&self, _cos: &Tensor<2, T>, _sin: &Tensor<2, T>) -> Self {
-            never!(self)
-        }
-        pub fn rope_normal_fused(&self, _cos: &Tensor<2, T>, _sin: &Tensor<2, T>) -> Self {
-            never!(self)
-        }
-        pub fn rope_pair_fused(
-            &self,
-            _k: &Self,
-            _cos: &Tensor<2, T>,
-            _sin: &Tensor<2, T>,
-        ) -> (Self, Self) {
-            never!(self)
-        }
-        pub fn rope_normal_pair_fused(
-            &self,
-            _k: &Self,
-            _cos: &Tensor<2, T>,
-            _sin: &Tensor<2, T>,
-        ) -> (Self, Self) {
-            never!(self)
-        }
-        pub fn rms_norm_fused<const W: usize, const OUT_RANK: usize>(
-            &self,
-            _weight: &Tensor<W, T>,
-            _bias: Option<&Tensor<W, T>>,
-            _eps: f32,
-        ) -> Self {
-            never!(self)
-        }
-        pub fn rms_norm_fused_no_bias<const W: usize, const OUT_RANK: usize>(
-            &self,
-            _weight: &Tensor<W, T>,
-            _eps: f32,
-        ) -> Self {
-            never!(self)
-        }
-        pub fn rms_norm_residual_fused<const W: usize, const OUT_RANK: usize>(
-            &self,
-            _residual: &Self,
-            _weight: &Tensor<W, T>,
-            _bias: Option<&Tensor<W, T>>,
-            _eps: f32,
-        ) -> Self {
-            never!(self)
-        }
-        pub fn appoximate_exp(&self) -> Self {
-            never!(self)
-        }
-        pub fn less_appoximate_exp(&self) -> Self {
-            never!(self)
-        }
-        pub fn tanh_exact(&self) -> Self {
-            never!(self)
-        }
-        pub fn where_cond(&self, _on_true: &Self, _on_false: &Self) -> Self {
-            never!(self)
-        }
-        pub fn eq<D: DataType>(&self, _rhs: T) -> Tensor<R, D> {
-            never!(self)
-        }
-        pub fn ne<D: DataType>(&self, _rhs: T) -> Tensor<R, D> {
-            never!(self)
-        }
-        pub fn lt<D: DataType>(&self, _rhs: T) -> Tensor<R, D> {
-            never!(self)
-        }
-        pub fn lte<D: DataType>(&self, _rhs: T) -> Tensor<R, D> {
-            never!(self)
-        }
-        pub fn mt<D: DataType>(&self, _rhs: T) -> Tensor<R, D> {
-            never!(self)
-        }
-        pub fn mte<D: DataType>(&self, _rhs: T) -> Tensor<R, D> {
-            never!(self)
-        }
-        pub fn pow_elementwise(&self, _exponent: T) -> Self {
-            never!(self)
-        }
-        pub fn max_elementwise(&self, _element: T) -> Self {
-            never!(self)
-        }
-        pub fn min_elementwise(&self, _element: T) -> Self {
-            never!(self)
-        }
-        pub fn to_scalar(&self) -> impl std::future::Future<Output = Result<T, Error>> + '_ {
-            async move { never!(self) }
-        }
-        pub fn abs(&self) -> Self {
-            never!(self)
-        }
-        pub fn sqrt(&self) -> Self {
-            never!(self)
-        }
-        pub fn exp(&self) -> Self {
-            never!(self)
-        }
-        pub fn exp2(&self) -> Self {
-            never!(self)
-        }
-        pub fn log(&self) -> Self {
-            never!(self)
-        }
-        pub fn log2(&self) -> Self {
-            never!(self)
-        }
-        pub fn sin(&self) -> Self {
-            never!(self)
-        }
-        pub fn cos(&self) -> Self {
-            never!(self)
-        }
-        pub fn tan(&self) -> Self {
-            never!(self)
-        }
-        pub fn tanh(&self) -> Self {
-            never!(self)
-        }
-        pub fn asin(&self) -> Self {
-            never!(self)
-        }
-        pub fn acos(&self) -> Self {
-            never!(self)
-        }
-        pub fn atan(&self) -> Self {
-            never!(self)
-        }
-        pub fn sinh(&self) -> Self {
-            never!(self)
-        }
-        pub fn cosh(&self) -> Self {
-            never!(self)
-        }
-        pub fn asinh(&self) -> Self {
-            never!(self)
-        }
-        pub fn acosh(&self) -> Self {
-            never!(self)
-        }
-        pub fn atanh(&self) -> Self {
-            never!(self)
-        }
-    }
-
-    macro_rules! binary_op {
-        ($trait:ident, $method:ident) => {
-            impl<const R: usize, T> $trait for Tensor<R, T> {
-                type Output = Self;
-                fn $method(self, _rhs: Self) -> Self::Output {
-                    never!(&self)
-                }
-            }
-
-            impl<'a, const R: usize, T> $trait<&'a Tensor<R, T>> for Tensor<R, T> {
-                type Output = Self;
-                fn $method(self, _rhs: &'a Tensor<R, T>) -> Self::Output {
-                    never!(&self)
-                }
-            }
-
-            impl<'a, const R: usize, T> $trait<Tensor<R, T>> for &'a Tensor<R, T> {
-                type Output = Tensor<R, T>;
-                fn $method(self, _rhs: Tensor<R, T>) -> Self::Output {
-                    never!(self)
-                }
-            }
-
-            impl<'a, const R: usize, T> $trait for &'a Tensor<R, T> {
-                type Output = Tensor<R, T>;
-                fn $method(self, _rhs: Self) -> Self::Output {
-                    never!(self)
-                }
-            }
-
-            impl<const R: usize, T> $trait<T> for Tensor<R, T> {
-                type Output = Self;
-                fn $method(self, _rhs: T) -> Self::Output {
-                    never!(&self)
-                }
-            }
-
-            impl<'a, const R: usize, T> $trait<T> for &'a Tensor<R, T> {
-                type Output = Tensor<R, T>;
-                fn $method(self, _rhs: T) -> Self::Output {
-                    never!(self)
-                }
-            }
-        };
-    }
-
-    binary_op!(Add, add);
-    binary_op!(Sub, sub);
-    binary_op!(Mul, mul);
-    binary_op!(Div, div);
-    binary_op!(Rem, rem);
-
-    impl<const R: usize, T> Neg for Tensor<R, T> {
-        type Output = Self;
-        fn neg(self) -> Self::Output {
-            never!(&self)
-        }
-    }
-
-    impl<'a, const R: usize, T> Neg for &'a Tensor<R, T> {
-        type Output = Tensor<R, T>;
-        fn neg(self) -> Self::Output {
-            never!(self)
-        }
-    }
-
-    pub trait WasmNotSend: Send {}
-    pub trait WasmNotSync: Sync {}
-    impl<T: Send> WasmNotSend for T {}
-    impl<T: Sync> WasmNotSync for T {}
+use std::{
+    fmt::{Debug, Display},
+    future::Future,
+    marker::PhantomData,
+    ops::{Add, Div, Mul, Neg, Rem, Sub},
+};
+
+pub use fusor_core::{
+    CastTensor, DataType, DataTypeEnum, Device, Dim, Error, FloatDataType, GgufReadError,
+    GpuMirostat2Sampler, GpuMirostat2SamplerParams, Layout, MappedBuffer, MatMulParams, NodeIndex,
+    QMatrix, Result, ShapeWithOneHole, StrideSpec, TensorSlice, WasmNotSend, WasmNotSync,
+};
+
+type CoreTensor = fusor_core::Tensor;
+
+/// Typed facade tensor for GPU values.
+///
+/// The backend tensor is deliberately hidden behind this newtype. Core owns the
+/// dynamic storage and graph handle; this facade carries the rank and dtype
+/// proofs that `fusor` exposes to callers.
+pub struct Tensor<const R: usize, D> {
+    inner: CoreTensor,
+    datatype: PhantomData<D>,
 }
 
-#[cfg(not(feature = "gpu"))]
-pub use disabled::*;
+impl<const R: usize, D> Tensor<R, D> {
+    #[inline]
+    pub(crate) fn from_core_unchecked(inner: CoreTensor) -> Self {
+        Self {
+            inner,
+            datatype: PhantomData,
+        }
+    }
+
+    #[inline]
+    pub(crate) fn as_core(&self) -> &CoreTensor {
+        &self.inner
+    }
+
+    #[inline]
+    pub(crate) fn into_core(self) -> CoreTensor {
+        self.inner
+    }
+}
+
+impl<const R: usize, D: DataType> Tensor<R, D> {
+    #[inline]
+    pub(crate) fn from_core(inner: CoreTensor) -> Self {
+        inner.assert_rank::<R>();
+        inner.assert_datatype::<D>();
+        Self::from_core_unchecked(inner)
+    }
+
+    #[inline]
+    pub fn detach(&self) -> Self {
+        Self::from_core(self.inner.detach())
+    }
+}
+
+impl<const R: usize, D> Clone for Tensor<R, D> {
+    fn clone(&self) -> Self {
+        Self::from_core_unchecked(self.inner.clone())
+    }
+}
+
+impl<const R: usize, D: DataType> Display for Tensor<R, D> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        Display::fmt(&self.inner, f)
+    }
+}
+
+impl<const R: usize, D: DataType> Debug for Tensor<R, D> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        Debug::fmt(&self.inner, f)
+    }
+}
+
+impl<const R: usize, D, T> fusor_types::FromArray<R, D, T, Device> for Tensor<R, D>
+where
+    D: DataType,
+    T: fusor_types::IntoFlatArray<D, R>,
+{
+    fn from_array(data: T, device: &Device) -> Self {
+        Self::from_core(CoreTensor::new::<D, R, T>(device, data))
+    }
+}
+
+impl<const R: usize, D: DataType> Tensor<R, D> {
+    #[inline]
+    pub fn new<T>(device: &Device, data: T) -> Self
+    where
+        Self: fusor_types::FromArray<R, D, T, Device>,
+    {
+        fusor_types::FromArray::from_array(data, device)
+    }
+
+    #[inline]
+    pub fn from_slice(device: &Device, shape: [usize; R], data: &[D]) -> Self {
+        Self::from_core(CoreTensor::from_slice::<D>(device, shape, data))
+    }
+
+    #[inline]
+    pub fn splat(device: &Device, value: D, shape: [usize; R]) -> Self {
+        Self::from_core(CoreTensor::splat::<D>(device, value, shape))
+    }
+
+    #[inline]
+    pub fn full(device: &Device, value: D, shape: [usize; R]) -> Self {
+        Self::splat(device, value, shape)
+    }
+
+    #[inline]
+    pub fn materialize_sync(&self) {
+        self.inner.materialize_sync()
+    }
+
+    #[inline]
+    pub fn materialize(&self) -> impl Future<Output = ()> + 'static {
+        self.inner.materialize()
+    }
+
+    #[inline]
+    pub fn count_kernels_to_resolve(&self) -> usize {
+        self.inner.count_kernels_to_resolve()
+    }
+
+    #[inline]
+    pub async fn as_slice(&self) -> Result<TensorSlice<R, D, MappedBuffer>> {
+        self.inner.as_slice::<R, D>().await.map_err(Error::from)
+    }
+
+    #[inline]
+    pub async fn to_scalar(&self) -> Result<D> {
+        self.inner.to_scalar::<D>().await.map_err(Error::from)
+    }
+
+    #[inline]
+    pub fn debug_assert_real(self) -> Self
+    where
+        D: FloatDataType,
+    {
+        Self::from_core(self.inner.debug_assert_real())
+    }
+
+    #[inline]
+    pub fn key(&self) -> NodeIndex {
+        self.inner.key()
+    }
+
+    #[inline]
+    pub fn shape(&self) -> &[usize; R] {
+        self.inner.shape_array::<R>()
+    }
+
+    #[inline]
+    pub fn rank(&self) -> usize {
+        self.inner.rank()
+    }
+
+    #[inline]
+    pub fn datatype(&self) -> DataTypeEnum {
+        self.inner.datatype()
+    }
+
+    #[inline]
+    pub fn device(&self) -> &Device {
+        self.inner.device()
+    }
+
+    #[cfg(feature = "graphvis")]
+    #[inline]
+    pub fn graphvis(&self) -> fusor_core::tabbycat::Graph {
+        self.inner.graphvis()
+    }
+
+    #[inline]
+    pub fn resize(&self, new_shape: [usize; R]) -> Self {
+        Self::from_core(self.inner.resize(new_shape))
+    }
+
+    #[inline]
+    pub fn reshape<const R2: usize>(&self, new_shape: impl ShapeWithOneHole<R2>) -> Tensor<R2, D> {
+        let new_shape = new_shape.resolve_shape(self.shape());
+        Tensor::from_core(self.inner.reshape(new_shape))
+    }
+
+    #[inline]
+    pub fn restride<const R2: usize>(&self, specs: [StrideSpec; R2]) -> Tensor<R2, D> {
+        Tensor::from_core(self.inner.restride(specs))
+    }
+
+    #[inline]
+    pub fn restride_layout<const R2: usize>(&self, new_layout: Layout) -> Tensor<R2, D> {
+        Tensor::from_core(self.inner.restride_layout(new_layout))
+    }
+
+    #[inline]
+    pub fn flatten_last_n<const FROM_END: usize, const O: usize>(&self) -> Tensor<O, D> {
+        Tensor::from_core(self.inner.flatten_last_n(FROM_END))
+    }
+
+    #[inline]
+    pub fn flatten_first_n<const FROM_START: usize, const O: usize>(&self) -> Tensor<O, D> {
+        Tensor::from_core(self.inner.flatten_first_n(FROM_START))
+    }
+
+    #[inline]
+    pub fn flatten_all(&self) -> Tensor<1, D> {
+        Tensor::from_core(self.inner.flatten_all())
+    }
+
+    #[inline]
+    pub fn slice_assign(&self, slices: [std::ops::Range<usize>; R], value: &Self) -> Self {
+        Self::from_core(self.inner.slice_assign(slices, value.as_core()))
+    }
+
+    #[inline]
+    pub fn slice_assign_in_place(&self, slices: [std::ops::Range<usize>; R], value: &Self) -> Self {
+        Self::from_core(self.inner.slice_assign_in_place(slices, value.as_core()))
+    }
+
+    #[inline]
+    pub fn index_select(&self, dimension: usize, indexes: &Tensor<1, u32>) -> Self {
+        Self::from_core(self.inner.index_select(dimension, indexes.as_core()))
+    }
+
+    #[inline]
+    pub fn mat_mul(&self, other: &Self) -> Self {
+        Self::from_core(self.inner.mat_mul(other.as_core()))
+    }
+
+    #[inline]
+    pub fn mat_mul_with_parameters(&self, other: &Self, parameters: MatMulParams) -> Self {
+        Self::from_core(
+            self.inner
+                .mat_mul_with_parameters(other.as_core(), parameters),
+        )
+    }
+
+    #[inline]
+    pub fn sum<const O: usize>(&self, dim: impl Dim<R>) -> Tensor<O, D> {
+        Tensor::from_core(self.inner.sum(dim.resolve()))
+    }
+
+    #[inline]
+    pub fn sum_keepdim<const O: usize>(&self, dim: impl Dim<R>) -> Self {
+        Self::from_core(self.inner.sum_keepdim(dim.resolve()))
+    }
+
+    #[inline]
+    pub fn max<const O: usize>(&self, dim: impl Dim<R>) -> Tensor<O, D> {
+        Tensor::from_core(self.inner.max(dim.resolve()))
+    }
+
+    #[inline]
+    pub fn max_keepdim<const O: usize>(&self, dim: impl Dim<R>) -> Self {
+        Self::from_core(self.inner.max_keepdim(dim.resolve()))
+    }
+
+    #[inline]
+    pub fn min<const O: usize>(&self, dim: impl Dim<R>) -> Tensor<O, D> {
+        Tensor::from_core(self.inner.min(dim.resolve()))
+    }
+
+    #[inline]
+    pub fn min_keepdim<const O: usize>(&self, dim: impl Dim<R>) -> Self {
+        Self::from_core(self.inner.min_keepdim(dim.resolve()))
+    }
+
+    #[inline]
+    pub fn product<const O: usize>(&self, dim: impl Dim<R>) -> Tensor<O, D> {
+        Tensor::from_core(self.inner.product(dim.resolve()))
+    }
+
+    #[inline]
+    pub fn product_keepdim<const O: usize>(&self, dim: impl Dim<R>) -> Self {
+        Self::from_core(self.inner.product_keepdim(dim.resolve()))
+    }
+
+    #[inline]
+    pub fn eq<D2: DataType>(&self, rhs: D) -> Tensor<R, D2> {
+        Tensor::from_core(self.inner.eq::<D2, D>(rhs))
+    }
+
+    #[inline]
+    pub fn lt<D2: DataType>(&self, rhs: D) -> Tensor<R, D2> {
+        Tensor::from_core(self.inner.lt::<D2, D>(rhs))
+    }
+
+    #[inline]
+    pub fn lte<D2: DataType>(&self, rhs: D) -> Tensor<R, D2> {
+        Tensor::from_core(self.inner.lte::<D2, D>(rhs))
+    }
+
+    #[inline]
+    pub fn mt<D2: DataType>(&self, rhs: D) -> Tensor<R, D2> {
+        Tensor::from_core(self.inner.mt::<D2, D>(rhs))
+    }
+
+    #[inline]
+    pub fn mte<D2: DataType>(&self, rhs: D) -> Tensor<R, D2> {
+        Tensor::from_core(self.inner.mte::<D2, D>(rhs))
+    }
+
+    #[inline]
+    pub fn cast<D2>(&self) -> Tensor<R, D2>
+    where
+        D: CastTensor<D2>,
+        D2: DataType,
+    {
+        Tensor::from_core(self.inner.cast::<D2>())
+    }
+}
+
+impl<const R: usize, D: DataType + FloatDataType> Tensor<R, D> {
+    #[inline]
+    pub fn less_approximate_exp(&self) -> Self {
+        Self::from_core(self.inner.less_approximate_exp())
+    }
+
+    #[inline]
+    pub fn approximate_exp(&self) -> Self {
+        Self::from_core(self.inner.approximate_exp())
+    }
+
+    #[inline]
+    pub fn exp(&self) -> Self {
+        Self::from_core(self.inner.exp())
+    }
+
+    #[inline]
+    pub fn exp2(&self) -> Self {
+        Self::from_core(self.inner.exp2())
+    }
+
+    #[inline]
+    pub fn log(&self) -> Self {
+        Self::from_core(self.inner.log())
+    }
+
+    #[inline]
+    pub fn log2(&self) -> Self {
+        Self::from_core(self.inner.log2())
+    }
+
+    #[inline]
+    pub fn pow_elementwise(&self, exponent: D) -> Self {
+        Self::from_core(self.inner.pow_elementwise(exponent))
+    }
+
+    #[inline]
+    pub fn sqrt(&self) -> Self {
+        Self::from_core(self.inner.sqrt())
+    }
+
+    #[inline]
+    pub fn sin(&self) -> Self {
+        Self::from_core(self.inner.sin())
+    }
+
+    #[inline]
+    pub fn cos(&self) -> Self {
+        Self::from_core(self.inner.cos())
+    }
+
+    #[inline]
+    pub fn tan(&self) -> Self {
+        Self::from_core(self.inner.tan())
+    }
+
+    #[inline]
+    pub fn asin(&self) -> Self {
+        Self::from_core(self.inner.asin())
+    }
+
+    #[inline]
+    pub fn acos(&self) -> Self {
+        Self::from_core(self.inner.acos())
+    }
+
+    #[inline]
+    pub fn atan(&self) -> Self {
+        Self::from_core(self.inner.atan())
+    }
+
+    #[inline]
+    pub fn sinh(&self) -> Self {
+        Self::from_core(self.inner.sinh())
+    }
+
+    #[inline]
+    pub fn cosh(&self) -> Self {
+        Self::from_core(self.inner.cosh())
+    }
+
+    #[inline]
+    pub fn tanh(&self) -> Self {
+        Self::from_core(self.inner.tanh())
+    }
+
+    #[inline]
+    pub fn tanh_exact(&self) -> Self {
+        Self::from_core(self.inner.tanh_exact())
+    }
+
+    #[inline]
+    pub fn asinh(&self) -> Self {
+        Self::from_core(self.inner.asinh())
+    }
+
+    #[inline]
+    pub fn acosh(&self) -> Self {
+        Self::from_core(self.inner.acosh())
+    }
+
+    #[inline]
+    pub fn atanh(&self) -> Self {
+        Self::from_core(self.inner.atanh())
+    }
+
+    #[inline]
+    pub fn abs(&self) -> Self {
+        Self::from_core(self.inner.abs())
+    }
+
+    #[inline]
+    pub fn max_elementwise(&self, element: D) -> Self {
+        Self::from_core(self.inner.max_elementwise(element))
+    }
+
+    #[inline]
+    pub fn min_elementwise(&self, element: D) -> Self {
+        Self::from_core(self.inner.min_elementwise(element))
+    }
+}
+
+impl<const R: usize, D: DataType> Tensor<R, D> {
+    #[inline]
+    pub fn pow(&self, other: &Self) -> Self {
+        Self::from_core(self.inner.pow(other.as_core()))
+    }
+
+    #[inline]
+    pub fn pow_<const R2: usize, const R3: usize>(&self, second: &Tensor<R2, D>) -> Tensor<R3, D> {
+        Tensor::from_core(self.inner.pow_(second.as_core()))
+    }
+
+    #[inline]
+    pub fn add_<const R2: usize, const R3: usize>(&self, second: &Tensor<R2, D>) -> Tensor<R3, D> {
+        Tensor::from_core(self.inner.add_(second.as_core()))
+    }
+
+    #[inline]
+    pub fn sub_<const R2: usize, const R3: usize>(&self, second: &Tensor<R2, D>) -> Tensor<R3, D> {
+        Tensor::from_core(self.inner.sub_(second.as_core()))
+    }
+
+    #[inline]
+    pub fn mul_<const R2: usize, const R3: usize>(&self, second: &Tensor<R2, D>) -> Tensor<R3, D> {
+        Tensor::from_core(self.inner.mul_(second.as_core()))
+    }
+
+    #[inline]
+    pub fn div_<const R2: usize, const R3: usize>(&self, second: &Tensor<R2, D>) -> Tensor<R3, D> {
+        Tensor::from_core(self.inner.div_(second.as_core()))
+    }
+}
+
+impl<const R: usize> Tensor<R, f32> {
+    #[inline]
+    pub fn q_mat_mul(&self, other: &QMatrix) -> Self {
+        Self::from_core(self.inner.q_mat_mul(other))
+    }
+
+    #[inline]
+    pub fn q_mat_mul_add2(&self, other: &QMatrix, first: &Self, second: &Self) -> Self {
+        Self::from_core(
+            self.inner
+                .q_mat_mul_add2(other, first.as_core(), second.as_core()),
+        )
+    }
+
+    #[inline]
+    pub fn q_mat_mul_paired_silu_product(&self, other: &QMatrix) -> Self {
+        Self::from_core(self.inner.q_mat_mul_paired_silu_product(other))
+    }
+}
+
+impl<const R: usize> Tensor<R, half::f16> {
+    #[inline]
+    pub fn q_mat_mul(&self, other: &QMatrix) -> Self {
+        Self::from_core(self.inner.q_mat_mul(other))
+    }
+}
+
+impl<const R: usize, D: DataType> Tensor<R, D> {
+    #[inline]
+    pub fn rms_norm_fused<const W: usize, const OUT_RANK: usize>(
+        &self,
+        weight: &Tensor<W, D>,
+        bias: Option<&Tensor<W, D>>,
+        eps: f32,
+    ) -> Self {
+        assert_eq!(
+            OUT_RANK + 1,
+            R,
+            "rms_norm_fused reduction rank must be input rank - 1"
+        );
+        Self::from_core(self.inner.rms_norm_fused(
+            weight.as_core(),
+            bias.map(|bias| bias.as_core()),
+            eps,
+        ))
+    }
+
+    #[inline]
+    pub fn rms_norm_fused_no_bias<const W: usize, const OUT_RANK: usize>(
+        &self,
+        weight: &Tensor<W, D>,
+        eps: f32,
+    ) -> Self {
+        self.rms_norm_fused::<W, OUT_RANK>(weight, None, eps)
+    }
+
+    #[inline]
+    pub fn rms_norm_residual_fused<const W: usize, const OUT_RANK: usize>(
+        &self,
+        residual: &Self,
+        weight: &Tensor<W, D>,
+        bias: Option<&Tensor<W, D>>,
+        eps: f32,
+    ) -> Self {
+        assert_eq!(
+            OUT_RANK + 1,
+            R,
+            "rms_norm_residual_fused reduction rank must be input rank - 1"
+        );
+        Self::from_core(self.inner.rms_norm_residual_fused(
+            residual.as_core(),
+            weight.as_core(),
+            bias.map(|bias| bias.as_core()),
+            eps,
+        ))
+    }
+}
+
+impl Tensor<1, f32> {
+    #[inline]
+    pub async fn try_sample_mirostat2_token_q_mat(
+        &self,
+        matrix: &QMatrix,
+        sampler: &mut GpuMirostat2Sampler,
+        previous_tokens: &[u32],
+        params: GpuMirostat2SamplerParams,
+    ) -> Result<Option<u32>> {
+        self.inner
+            .try_sample_mirostat2_token_q_mat(matrix, sampler, previous_tokens, params)
+            .await
+            .map_err(Error::from)
+    }
+
+    #[inline]
+    pub async fn sample_mirostat2_token(
+        &self,
+        sampler: &mut GpuMirostat2Sampler,
+        previous_tokens: &[u32],
+        params: GpuMirostat2SamplerParams,
+    ) -> Result<u32> {
+        self.inner
+            .sample_mirostat2_token(sampler, previous_tokens, params)
+            .await
+            .map_err(Error::from)
+    }
+
+    #[inline]
+    pub async fn top_k_pairs(&self, k: usize) -> Result<(Vec<u32>, Vec<f32>)> {
+        self.inner.top_k_pairs(k).await.map_err(Error::from)
+    }
+}
+
+impl<T: DataType> Tensor<4, T> {
+    #[inline]
+    pub fn flash_attention_causal(&self, k: &Self, v: &Self, scale: f32) -> Self {
+        Self::from_core(
+            self.inner
+                .flash_attention_causal(k.as_core(), v.as_core(), scale),
+        )
+    }
+
+    #[inline]
+    pub fn flash_attention(
+        &self,
+        k: &Self,
+        v: &Self,
+        scale: f32,
+        mask: Option<&Tensor<2, T>>,
+    ) -> Self {
+        Self::from_core(self.inner.flash_attention(
+            k.as_core(),
+            v.as_core(),
+            scale,
+            mask.map(|mask| mask.as_core()),
+        ))
+    }
+}
+
+impl<D: DataType> Tensor<4, D> {
+    #[inline]
+    pub fn rope_fused(&self, cos: &Tensor<2, D>, sin: &Tensor<2, D>) -> Self {
+        Self::from_core(self.inner.rope_fused(cos.as_core(), sin.as_core()))
+    }
+
+    #[inline]
+    pub fn rope_normal_fused(&self, cos: &Tensor<2, D>, sin: &Tensor<2, D>) -> Self {
+        Self::from_core(self.inner.rope_normal_fused(cos.as_core(), sin.as_core()))
+    }
+
+    #[inline]
+    pub fn rope_pair_fused(
+        &self,
+        k: &Self,
+        cos: &Tensor<2, D>,
+        sin: &Tensor<2, D>,
+    ) -> (Self, Self) {
+        let (q, k) = self
+            .inner
+            .rope_pair_fused(k.as_core(), cos.as_core(), sin.as_core());
+        (Self::from_core(q), Self::from_core(k))
+    }
+
+    #[inline]
+    pub fn rope_normal_pair_fused(
+        &self,
+        k: &Self,
+        cos: &Tensor<2, D>,
+        sin: &Tensor<2, D>,
+    ) -> (Self, Self) {
+        let (q, k) = self
+            .inner
+            .rope_normal_pair_fused(k.as_core(), cos.as_core(), sin.as_core());
+        (Self::from_core(q), Self::from_core(k))
+    }
+}
+
+impl<const R: usize, D: DataType> Tensor<R, D> {
+    #[inline]
+    pub fn softmax<const R2: usize>(&self, axis: impl Dim<R>) -> Self {
+        assert_eq!(R2 + 1, R, "softmax output rank must be input rank - 1");
+        Self::from_core(self.inner.softmax(axis.resolve()))
+    }
+
+    #[inline]
+    pub fn softmax_last_dim<const R2: usize>(&self) -> Self {
+        assert_eq!(R2 + 1, R, "softmax output rank must be input rank - 1");
+        Self::from_core(self.inner.softmax_last_dim())
+    }
+
+    #[inline]
+    pub fn where_cond<D2: DataType>(
+        self,
+        on_true: &Tensor<R, D2>,
+        on_false: &Tensor<R, D2>,
+    ) -> Tensor<R, D2> {
+        Tensor::from_core(self.inner.where_cond(on_true.as_core(), on_false.as_core()))
+    }
+}
+
+impl<const R: usize, T: DataType> Add<T> for Tensor<R, T> {
+    type Output = Self;
+
+    fn add(self, rhs: T) -> Self::Output {
+        Self::from_core(self.inner + rhs)
+    }
+}
+
+impl<const R: usize, T: DataType> Add<T> for &Tensor<R, T> {
+    type Output = Tensor<R, T>;
+
+    fn add(self, rhs: T) -> Self::Output {
+        Tensor::from_core(self.as_core() + rhs)
+    }
+}
+
+impl<const R: usize, T: DataType> Sub<T> for Tensor<R, T> {
+    type Output = Self;
+
+    fn sub(self, rhs: T) -> Self::Output {
+        Self::from_core(self.inner - rhs)
+    }
+}
+
+impl<const R: usize, T: DataType> Mul<T> for Tensor<R, T> {
+    type Output = Self;
+
+    fn mul(self, rhs: T) -> Self::Output {
+        Self::from_core(self.inner * rhs)
+    }
+}
+
+impl<const R: usize, T: DataType> Mul<T> for &Tensor<R, T> {
+    type Output = Tensor<R, T>;
+
+    fn mul(self, rhs: T) -> Self::Output {
+        Tensor::from_core(self.as_core() * rhs)
+    }
+}
+
+impl<const R: usize, T: DataType> Div<T> for Tensor<R, T> {
+    type Output = Self;
+
+    fn div(self, rhs: T) -> Self::Output {
+        Self::from_core(self.inner / rhs)
+    }
+}
+
+impl<const R: usize> Rem<u32> for Tensor<R, u32> {
+    type Output = Self;
+
+    fn rem(self, rhs: u32) -> Self::Output {
+        Self::from_core(self.inner % rhs)
+    }
+}
+
+macro_rules! impl_scalar_lhs {
+    ($trait:ident, $method:ident, $($t:ty),* $(,)?) => {
+        $(
+            impl<const R: usize> $trait<Tensor<R, $t>> for $t {
+                type Output = Tensor<R, $t>;
+
+                fn $method(self, rhs: Tensor<R, $t>) -> Self::Output {
+                    Tensor::from_core(self.$method(rhs.into_core()))
+                }
+            }
+        )*
+    };
+}
+
+impl_scalar_lhs!(Add, add, f32, half::f16, u32);
+impl_scalar_lhs!(Sub, sub, f32, half::f16, u32);
+impl_scalar_lhs!(Mul, mul, f32, half::f16, u32);
+impl_scalar_lhs!(Div, div, f32, half::f16, u32);
+impl_scalar_lhs!(Rem, rem, f32, half::f16, u32);
+
+macro_rules! impl_pairwise_op {
+    ($trait:ident, $method:ident, $op:tt) => {
+        impl<const R: usize, T: DataType> $trait<Tensor<R, T>> for Tensor<R, T> {
+            type Output = Tensor<R, T>;
+
+            fn $method(self, rhs: Tensor<R, T>) -> Self::Output {
+                Tensor::from_core(self.into_core() $op rhs.into_core())
+            }
+        }
+
+        impl<'a, const R: usize, T: DataType> $trait<&'a Tensor<R, T>> for &'a Tensor<R, T> {
+            type Output = Tensor<R, T>;
+
+            fn $method(self, rhs: &'a Tensor<R, T>) -> Self::Output {
+                Tensor::from_core(self.as_core() $op rhs.as_core())
+            }
+        }
+
+        impl<'a, const R: usize, T: DataType> $trait<Tensor<R, T>> for &'a Tensor<R, T> {
+            type Output = Tensor<R, T>;
+
+            fn $method(self, rhs: Tensor<R, T>) -> Self::Output {
+                Tensor::from_core(self.as_core() $op rhs.into_core())
+            }
+        }
+
+        impl<'a, const R: usize, T: DataType> $trait<&'a Tensor<R, T>> for Tensor<R, T> {
+            type Output = Tensor<R, T>;
+
+            fn $method(self, rhs: &'a Tensor<R, T>) -> Self::Output {
+                Tensor::from_core(self.into_core() $op rhs.as_core())
+            }
+        }
+    };
+}
+
+impl_pairwise_op!(Add, add, +);
+impl_pairwise_op!(Sub, sub, -);
+impl_pairwise_op!(Mul, mul, *);
+impl_pairwise_op!(Div, div, /);
+
+impl<const R: usize, D: DataType> Neg for Tensor<R, D> {
+    type Output = Self;
+
+    fn neg(self) -> Self::Output {
+        Self::from_core(-self.inner)
+    }
+}
+
+impl<const R: usize, D: DataType> Neg for &Tensor<R, D> {
+    type Output = Tensor<R, D>;
+
+    fn neg(self) -> Self::Output {
+        Tensor::from_core(-self.as_core())
+    }
+}
+
+impl<const R: usize, T: DataType> std::iter::Sum for Tensor<R, T> {
+    fn sum<I: Iterator<Item = Self>>(mut iter: I) -> Self {
+        let first = iter.next().expect("Cannot sum over empty iterator");
+        iter.fold(first, |acc, x| acc + x)
+    }
+}
+
+impl<'a, const R: usize, T: DataType> std::iter::Sum<&'a Tensor<R, T>> for Tensor<R, T> {
+    fn sum<I: Iterator<Item = &'a Tensor<R, T>>>(iter: I) -> Self {
+        let mut iter = iter.cloned();
+        let first = iter.next().expect("Cannot sum over empty iterator");
+        iter.fold(first, |acc, x| acc + x)
+    }
+}
+
+pub trait LastRankInner {
+    type LastRank;
+}
+
+pub trait LastRank<const R: usize, T: DataType>: LastRankInner<LastRank = Tensor<R, T>> {}
+
+impl<const R: usize, T: DataType, X> LastRank<R, T> for X where
+    X: LastRankInner<LastRank = Tensor<R, T>>
+{
+}
+
+pub trait NextRankInner {
+    type NextRank;
+}
+
+pub trait NextRank<const R: usize, T: DataType>: NextRankInner<NextRank = Tensor<R, T>> {}
+
+impl<const R: usize, T: DataType, X> NextRank<R, T> for X where
+    X: NextRankInner<NextRank = Tensor<R, T>>
+{
+}
+
+pub trait SmallerRankInner<const DIFF: usize> {
+    type SmallerRank;
+    type SmallerByArray;
+}
+
+pub trait SmallerRank<const DIFF: usize, const R: usize, T: DataType>:
+    SmallerRankInner<DIFF, SmallerRank = Tensor<R, T>>
+{
+}
+
+impl<const DIFF: usize, const R: usize, T: DataType, X> SmallerRank<DIFF, R, T> for X where
+    X: SmallerRankInner<DIFF, SmallerRank = Tensor<R, T>>
+{
+}
+
+pub trait LargerRankInner<const DIFF: usize> {
+    type LargerRank;
+    type LargerByArray;
+}
+
+pub trait LargerRank<const DIFF: usize, const R: usize, T: DataType>:
+    LargerRankInner<DIFF, LargerRank = Tensor<R, T>>
+{
+}
+
+impl<const DIFF: usize, const R: usize, T: DataType, X> LargerRank<DIFF, R, T> for X where
+    X: LargerRankInner<DIFF, LargerRank = Tensor<R, T>>
+{
+}
+
+pub trait MaxRankInner {
+    type MaxRank;
+}
+
+pub trait MaxRank<const R: usize, T: DataType>: MaxRankInner<MaxRank = Tensor<R, T>> {}
+
+impl<const R: usize, T: DataType, X> MaxRank<R, T> for X where
+    X: MaxRankInner<MaxRank = Tensor<R, T>>
+{
+}
+
+fusor_types::impl_rank_traits!(Tensor);

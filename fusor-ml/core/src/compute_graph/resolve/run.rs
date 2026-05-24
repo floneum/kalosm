@@ -483,6 +483,7 @@ impl Resolver {
             let encode_start = host_trace.then(Instant::now);
             let mut dispatch_index = 0usize;
             let mut command_index = 0usize;
+            let dispatches_per_pass = dispatches_per_pass(total_kernels);
             while command_index < commands.len() {
                 match &commands[command_index] {
                     CommandRecord::CopyBuffer(copy) => {
@@ -526,7 +527,11 @@ impl Resolver {
                                 label: Some("Resolver Direct Kernels"),
                                 timestamp_writes: None,
                             });
+                        let mut pass_dispatches = 0usize;
                         while command_index < commands.len() {
+                            if pass_dispatches >= dispatches_per_pass {
+                                break;
+                            }
                             let CommandRecord::Dispatch(record) = &commands[command_index] else {
                                 break;
                             };
@@ -539,6 +544,7 @@ impl Resolver {
                             }
                             dispatch_index += 1;
                             command_index += 1;
+                            pass_dispatches += 1;
                         }
                     }
                 }
@@ -619,4 +625,15 @@ impl Resolver {
             total_kernels,
         }
     }
+}
+
+fn dispatches_per_pass(total_kernels: usize) -> usize {
+    if let Ok(value) = std::env::var("FUSOR_RESOLVE_DISPATCHES_PER_PASS")
+        && let Ok(parsed) = value.parse::<usize>()
+        && parsed > 0
+    {
+        return parsed;
+    }
+
+    if total_kernels >= 1024 { 1 } else { usize::MAX }
 }

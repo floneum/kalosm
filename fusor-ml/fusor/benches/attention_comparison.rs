@@ -2,7 +2,7 @@ use std::{hint::black_box, time::Duration};
 
 use criterion::async_executor::FuturesExecutor;
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
-use fusor::{Device, Tensor, TensorBacking};
+use fusor::{Device, Fusion, Tensor};
 use pollster::block_on;
 
 const SIZES: [[usize; 4]; 8] = [
@@ -54,7 +54,7 @@ async fn setup_tensors(
 
 async fn resolve_tensor<const R: usize, B>(tensor: &Tensor<R, f32, B>)
 where
-    B: TensorBacking<R, Elem = f32>,
+    B: Fusion<R, f32>,
 {
     if let Some(gpu) = tensor.as_gpu() {
         gpu.materialize().await;

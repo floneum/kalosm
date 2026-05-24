@@ -1,16 +1,16 @@
 use crate::{
-    DataType, Layout, Tensor,
+    Layout, Tensor,
     compute_graph::NodeIndex,
     nary_wise::{NaryExpr, NaryOp, NaryScalar},
     tensor::{DataTypeEnum, LazyTensorData, TensorInfo},
 };
 
-impl<D: DataType> Tensor<4, D> {
+impl Tensor {
     /// Apply fused interleaved RoPE (rotary position embedding).
     /// This pairs adjacent elements: (0, 1), (2, 3), etc.
     ///
     /// `cos` and `sin` must already be narrowed to the sequence length.
-    pub fn rope_fused(&self, cos: &Tensor<2, D>, sin: &Tensor<2, D>) -> Tensor<4, D> {
+    pub fn rope_fused(&self, cos: &Tensor, sin: &Tensor) -> Tensor {
         self.rope_fused_impl(cos, sin, RopeMode::Interleaved)
     }
 
@@ -18,7 +18,7 @@ impl<D: DataType> Tensor<4, D> {
     /// This pairs first half with second half: (0, head_dim/2), (1, head_dim/2+1), etc.
     ///
     /// `cos` and `sin` must already be narrowed to the sequence length.
-    pub fn rope_normal_fused(&self, cos: &Tensor<2, D>, sin: &Tensor<2, D>) -> Tensor<4, D> {
+    pub fn rope_normal_fused(&self, cos: &Tensor, sin: &Tensor) -> Tensor {
         self.rope_fused_impl(cos, sin, RopeMode::Normal)
     }
 
@@ -26,12 +26,7 @@ impl<D: DataType> Tensor<4, D> {
     ///
     /// The returned tensors are layout views into one concatenated allocation. This keeps the
     /// decode graph to one RoPE kernel per layer while preserving separate q/k tensor shapes.
-    pub fn rope_pair_fused(
-        &self,
-        k: &Tensor<4, D>,
-        cos: &Tensor<2, D>,
-        sin: &Tensor<2, D>,
-    ) -> (Tensor<4, D>, Tensor<4, D>) {
+    pub fn rope_pair_fused(&self, k: &Tensor, cos: &Tensor, sin: &Tensor) -> (Tensor, Tensor) {
         self.rope_pair_fused_impl(k, cos, sin, RopeMode::Interleaved)
     }
 
@@ -41,27 +36,27 @@ impl<D: DataType> Tensor<4, D> {
     /// decode graph to one RoPE kernel per layer while preserving separate q/k tensor shapes.
     pub fn rope_normal_pair_fused(
         &self,
-        k: &Tensor<4, D>,
-        cos: &Tensor<2, D>,
-        sin: &Tensor<2, D>,
-    ) -> (Tensor<4, D>, Tensor<4, D>) {
+        k: &Tensor,
+        cos: &Tensor,
+        sin: &Tensor,
+    ) -> (Tensor, Tensor) {
         self.rope_pair_fused_impl(k, cos, sin, RopeMode::Normal)
     }
 
-    fn rope_fused_impl(
-        &self,
-        cos: &Tensor<2, D>,
-        sin: &Tensor<2, D>,
-        mode: RopeMode,
-    ) -> Tensor<4, D> {
-        let [_, _, _, head_dim] = *self.shape();
+    fn rope_fused_impl(&self, cos: &Tensor, sin: &Tensor, mode: RopeMode) -> Tensor {
+        self.assert_rank::<4>();
+        cos.assert_rank::<2>();
+        sin.assert_rank::<2>();
+        assert_eq!(self.datatype(), cos.datatype());
+        assert_eq!(self.datatype(), sin.datatype());
+        let [_, _, _, head_dim] = *self.shape_array::<4>();
 
         let operation = RopeFusedOperation {
             input: self.key(),
             cos: cos.key(),
             sin: sin.key(),
             datatype: self.datatype(),
-            shape: (*self.shape()).into(),
+            shape: self.shape().into(),
             mode,
             head_dim,
         }
@@ -72,13 +67,20 @@ impl<D: DataType> Tensor<4, D> {
 
     fn rope_pair_fused_impl(
         &self,
-        k: &Tensor<4, D>,
-        cos: &Tensor<2, D>,
-        sin: &Tensor<2, D>,
+        k: &Tensor,
+        cos: &Tensor,
+        sin: &Tensor,
         mode: RopeMode,
-    ) -> (Tensor<4, D>, Tensor<4, D>) {
-        let q_shape = *self.shape();
-        let k_shape = *k.shape();
+    ) -> (Tensor, Tensor) {
+        self.assert_rank::<4>();
+        k.assert_rank::<4>();
+        cos.assert_rank::<2>();
+        sin.assert_rank::<2>();
+        assert_eq!(self.datatype(), k.datatype());
+        assert_eq!(self.datatype(), cos.datatype());
+        assert_eq!(self.datatype(), sin.datatype());
+        let q_shape = *self.shape_array::<4>();
+        let k_shape = *k.shape_array::<4>();
         assert_eq!(
             q_shape[0], k_shape[0],
             "paired RoPE requires q and k batch dimensions to match"
@@ -123,7 +125,7 @@ impl<D: DataType> Tensor<4, D> {
 
         let device = self.device().clone();
         let key = device.compute_graph().create_nary(operation);
-        let combined: Tensor<1, D> = Tensor::from_parts(LazyTensorData::from_parts(
+        let combined = Tensor::from_parts(LazyTensorData::from_parts(
             device,
             TensorInfo::new(vec![total_elements].into_boxed_slice(), self.datatype()),
             key,

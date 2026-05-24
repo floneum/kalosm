@@ -19,10 +19,11 @@ use crate::{
 
 use super::{
     DECODE_HEAD_DIM, DECODE_SMALL_BLOCK, FLASH_STREAMING_SUBGROUP_SIZES,
-    FlashAttentionDirectKernelVariant, FlashAttentionKernelVariant, FlashAttentionOperation,
-    FlashDecodeSmallTensors, TensorMeta, build_flash_decode_small_meta,
-    dispatch_streaming_flash_attention, flash_attention_module_cache,
-    select_flash_attention_variant, streaming_dispatch_size,
+    FLASH_STREAMING_TILED_Q_BLOCK, FlashAttentionDirectKernelVariant, FlashAttentionKernelVariant,
+    FlashAttentionOperation, FlashDecodeSmallTensors, TensorMeta, build_flash_decode_small_meta,
+    dispatch_streaming_flash_attention, dispatch_streaming_tiled_flash_attention,
+    flash_attention_module_cache, flash_streaming_tiled_eligible, select_flash_attention_variant,
+    streaming_dispatch_size,
 };
 
 impl Operation for FlashAttentionOperation {
@@ -179,6 +180,8 @@ impl Operation for FlashAttentionOperation {
         };
         let variant = if decode_eligible {
             selected_variant.kernel_variant()
+        } else if flash_streaming_tiled_eligible(dims) {
+            FlashAttentionKernelVariant::StreamingTiled
         } else {
             FlashAttentionKernelVariant::Streaming
         };
@@ -187,6 +190,13 @@ impl Operation for FlashAttentionOperation {
                 dims,
                 tile_ir_kernels::flash_outputs_per_workgroup(streaming_subgroup_size),
             ),
+            FlashAttentionKernelVariant::StreamingTiled => {
+                tile_ir_kernels::flash_tiled_dispatch_size(
+                    dims,
+                    tile_ir_kernels::flash_outputs_per_workgroup(streaming_subgroup_size),
+                    FLASH_STREAMING_TILED_Q_BLOCK,
+                )
+            }
             FlashAttentionKernelVariant::DecodeSmall => [
                 dims.batch
                     .checked_mul(dims.num_heads)
@@ -204,6 +214,7 @@ impl Operation for FlashAttentionOperation {
 
         let kernel_label = match variant {
             FlashAttentionKernelVariant::Streaming => "flash_attention",
+            FlashAttentionKernelVariant::StreamingTiled => "flash_attention_tiled",
             FlashAttentionKernelVariant::DecodeSmall => "flash_attention_decode",
         };
         let cache_variant = kernel_backend::KernelVariantKey::with_payload::<
@@ -211,8 +222,13 @@ impl Operation for FlashAttentionOperation {
         >(|state| {
             variant.hash(state);
             self.scale.to_bits().hash(state);
-            if matches!(variant, FlashAttentionKernelVariant::Streaming) {
+            if matches!(
+                variant,
+                FlashAttentionKernelVariant::Streaming
+                    | FlashAttentionKernelVariant::StreamingTiled
+            ) {
                 streaming_subgroup_size.hash(state);
+                self.causal.hash(state);
             }
             if let Some(meta) = decode_meta.as_ref() {
                 meta.decode_block.hash(state);
@@ -234,6 +250,7 @@ impl Operation for FlashAttentionOperation {
         let mask_buffer = mask.as_ref().map(|m| m.buffer().clone());
         let output_buffer = output.buffer().clone();
         let scale = self.scale;
+        let causal = self.causal;
         let q_tile_meta = q_meta.tile.clone();
         let k_tile_meta = k_meta.tile.clone();
         let v_tile_meta = v_meta.tile.clone();
@@ -293,18 +310,34 @@ impl Operation for FlashAttentionOperation {
                         mask_meta: mask_tile_meta,
                         output_meta: output_tile_meta,
                         dispatch_size,
+                        causal,
                     };
-                    dispatch_streaming_flash_attention(
-                        &mut kb,
-                        q_ref,
-                        k_ref,
-                        v_ref,
-                        mask_ref,
-                        output_ref,
-                        stream_meta,
-                        input_dtype,
-                        streaming_subgroup_size,
-                    )
+                    match variant {
+                        FlashAttentionKernelVariant::StreamingTiled => {
+                            dispatch_streaming_tiled_flash_attention(
+                                &mut kb,
+                                q_ref,
+                                k_ref,
+                                v_ref,
+                                mask_ref,
+                                output_ref,
+                                stream_meta,
+                                input_dtype,
+                                streaming_subgroup_size,
+                            )
+                        }
+                        _ => dispatch_streaming_flash_attention(
+                            &mut kb,
+                            q_ref,
+                            k_ref,
+                            v_ref,
+                            mask_ref,
+                            output_ref,
+                            stream_meta,
+                            input_dtype,
+                            streaming_subgroup_size,
+                        ),
+                    }
                 }?;
                 Some(kb.finish().0)
             },

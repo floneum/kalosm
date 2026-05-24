@@ -28,45 +28,46 @@ const TEST_PAIRS :&[(&str, &str)]= &[
     ("APIs facilitate communication between different software systems. They define the methods and data formats applications can use to request and exchange information.", "What is the purpose of APIs in software development?"),
 ];
 
-#[tokio::main]
-async fn main() {
-    tracing_subscriber::fmt::init();
+fn main() {
+    pollster::block_on(async {
+        tracing_subscriber::fmt::init();
 
-    let llm = Llama::new_chat().await.unwrap();
+        let llm = Llama::new_chat().await.unwrap();
 
-    let hypothetical = Hypothetical::builder(llm.clone()).build();
+        let hypothetical = Hypothetical::builder(llm.clone()).build();
 
-    let mut test_cases = TestCases::new();
+        let mut test_cases = TestCases::new();
 
-    for (text, expected) in TEST_PAIRS {
-        let actual = &hypothetical.generate_question(text).await.unwrap()[0];
+        for (text, expected) in TEST_PAIRS {
+            let actual = &hypothetical.generate_question(text).await.unwrap()[0];
 
-        test_cases.push_case(expected.to_string(), actual.clone());
-    }
+            test_cases.push_case(expected.to_string(), actual.clone());
+        }
 
-    let mut bert_distance = BertDistance::new(Bert::new().await.unwrap());
-    let evaluation = test_cases.evaluate(&mut bert_distance).await.normalized();
+        let mut bert_distance = BertDistance::new(Bert::new().await.unwrap());
+        let evaluation = test_cases.evaluate(&mut bert_distance).await.normalized();
 
-    println!("Original\n{evaluation}");
+        println!("Original\n{evaluation}");
 
-    let alternate_examples = [
-        ("While traditional databases rely on a fixed schema, NoSQL databases like MongoDB offer a flexible structure, allowing you to store and retrieve data in a more dynamic way. This flexibility is particularly beneficial for applications with evolving data requirements.", "How does MongoDB differ from traditional databases?"),
-        ("Blockchain technology, beyond cryptocurrencies, is being explored for applications like smart contracts. Smart contracts are self-executing contracts with the terms of the agreement directly written into code.", "How is blockchain technology utilized in the concept of smart contracts?")
-    ];
+        let alternate_examples = [
+            ("While traditional databases rely on a fixed schema, NoSQL databases like MongoDB offer a flexible structure, allowing you to store and retrieve data in a more dynamic way. This flexibility is particularly beneficial for applications with evolving data requirements.", "How does MongoDB differ from traditional databases?"),
+            ("Blockchain technology, beyond cryptocurrencies, is being explored for applications like smart contracts. Smart contracts are self-executing contracts with the terms of the agreement directly written into code.", "How is blockchain technology utilized in the concept of smart contracts?")
+        ];
 
-    let hypothetical = Hypothetical::builder(llm)
-        .with_examples(alternate_examples)
-        .build();
+        let hypothetical = Hypothetical::builder(llm)
+            .with_examples(alternate_examples)
+            .build();
 
-    let mut test_cases = TestCases::new();
+        let mut test_cases = TestCases::new();
 
-    for (text, expected) in TEST_PAIRS {
-        let actual = &hypothetical.generate_question(text).await.unwrap()[0];
+        for (text, expected) in TEST_PAIRS {
+            let actual = &hypothetical.generate_question(text).await.unwrap()[0];
 
-        test_cases.push_case(expected.to_string(), actual.clone());
-    }
+            test_cases.push_case(expected.to_string(), actual.clone());
+        }
 
-    let evaluation = test_cases.evaluate(&mut bert_distance).await.normalized();
+        let evaluation = test_cases.evaluate(&mut bert_distance).await.normalized();
 
-    println!("Alternate\n{evaluation}");
+        println!("Alternate\n{evaluation}");
+    });
 }

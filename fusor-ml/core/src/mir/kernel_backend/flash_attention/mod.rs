@@ -65,6 +65,54 @@ fn dispatch_streaming_flash_attention(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
+fn dispatch_streaming_tiled_flash_attention(
+    kb: &mut tile_ir::KernelBuilder<()>,
+    q: tile_ir::KernelTensorRef<()>,
+    k: tile_ir::KernelTensorRef<()>,
+    v: tile_ir::KernelTensorRef<()>,
+    mask: Option<tile_ir::KernelTensorRef<()>>,
+    output: tile_ir::KernelTensorRef<()>,
+    meta: tile_ir_kernels::FlashAttentionMeta,
+    input_dtype: DataTypeEnum,
+    subgroup_size: u32,
+) -> Option<()> {
+    macro_rules! emit {
+        ($element:ty, $size:literal) => {
+            tile_ir_kernels::flash_attention_tiled::<
+                $element,
+                $size,
+                { FLASH_STREAMING_TILED_Q_BLOCK },
+                _,
+            >(kb, q, k, v, mask, output, meta)
+        };
+    }
+    match (input_dtype, subgroup_size) {
+        (DataTypeEnum::F32, 4) => emit!(tile_ir::F32, 4),
+        (DataTypeEnum::F32, 8) => emit!(tile_ir::F32, 8),
+        (DataTypeEnum::F32, 16) => emit!(tile_ir::F32, 16),
+        (DataTypeEnum::F32, 32) => emit!(tile_ir::F32, 32),
+        (DataTypeEnum::F32, 64) => emit!(tile_ir::F32, 64),
+        (DataTypeEnum::F16, 4) => emit!(tile_ir::F16, 4),
+        (DataTypeEnum::F16, 8) => emit!(tile_ir::F16, 8),
+        (DataTypeEnum::F16, 16) => emit!(tile_ir::F16, 16),
+        (DataTypeEnum::F16, 32) => emit!(tile_ir::F16, 32),
+        (DataTypeEnum::F16, 64) => emit!(tile_ir::F16, 64),
+        _ => None,
+    }
+}
+
+/// Returns true when the per-shape gating for the tiled (Q-batched) streaming
+/// kernel is satisfied. Decode (q_seq_len < threshold) keeps the existing
+/// streaming kernel because the per-workgroup K-cache load offers no reuse
+/// when there's only one query.
+pub(crate) fn flash_streaming_tiled_eligible(dims: FlashAttentionDims) -> bool {
+    dims.q_seq_len >= FLASH_STREAMING_TILED_MIN_Q
+        && dims
+            .head_dim
+            .is_multiple_of(FLASH_STREAMING_TILED_HEAD_DIM_ALIGN)
+}
+
 fn streaming_dispatch_size(dims: FlashAttentionDims, outputs_per_workgroup: u32) -> [u32; 3] {
     [
         dims.head_dim.div_ceil(outputs_per_workgroup),
@@ -79,8 +127,22 @@ fn streaming_dispatch_size(dims: FlashAttentionDims, outputs_per_workgroup: u32)
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
 enum FlashAttentionKernelVariant {
     Streaming,
+    StreamingTiled,
     DecodeSmall,
 }
+
+/// Q-block size used by the tiled (Q-batched) flash attention kernel: each
+/// workgroup processes this many contiguous query rows, sharing one K/V
+/// workgroup-memory load across them.
+pub(crate) const FLASH_STREAMING_TILED_Q_BLOCK: u32 = 8;
+/// Minimum query sequence length to switch to the tiled kernel. Below this
+/// the per-workgroup setup overhead dominates the K/V reuse win.
+pub(crate) const FLASH_STREAMING_TILED_MIN_Q: u32 = 128;
+/// Required head_dim alignment for the tiled kernel. Apple subgroup width is
+/// 32, but we round-robin K loads in groups of 8 (the subgroup-warp width on
+/// Metal); enforce 8-alignment so the cooperative K-cache load issues stay
+/// well-formed without per-lane tail handling.
+pub(crate) const FLASH_STREAMING_TILED_HEAD_DIM_ALIGN: u32 = 8;
 
 struct FlashAttentionDirectKernelVariant;
 
@@ -266,6 +328,7 @@ pub(crate) struct FlashAttentionOperation {
     k_shape: Box<[usize]>,
     scale: f32,
     input_dtype: DataTypeEnum,
+    pub(crate) causal: bool,
 }
 
 pub(crate) struct FlashAttentionInputs<'a> {
@@ -278,6 +341,7 @@ pub(crate) struct FlashAttentionInputs<'a> {
     pub(crate) v_shape: &'a [usize],
     pub(crate) scale: f32,
     pub(crate) input_dtype: DataTypeEnum,
+    pub(crate) causal: bool,
 }
 
 impl FlashAttentionOperation {
@@ -292,6 +356,7 @@ impl FlashAttentionOperation {
             v_shape,
             scale,
             input_dtype,
+            causal,
         } = inputs;
         assert_eq!(q_shape.len(), 4, "Q must be rank-4");
         assert_eq!(k_shape.len(), 4, "K must be rank-4");
@@ -309,6 +374,18 @@ impl FlashAttentionOperation {
             k_shape[1]
         );
 
+        if causal {
+            assert!(
+                mask.is_none(),
+                "causal flash attention cannot accept an additive mask"
+            );
+            assert_eq!(
+                q_shape[2], k_shape[2],
+                "causal flash attention requires q_seq_len == kv_seq_len, got {} vs {}",
+                q_shape[2], k_shape[2]
+            );
+        }
+
         Self {
             q,
             k,
@@ -319,6 +396,7 @@ impl FlashAttentionOperation {
             k_shape: k_shape.into(),
             scale,
             input_dtype,
+            causal,
         }
     }
 

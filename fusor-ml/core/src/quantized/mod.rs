@@ -364,35 +364,37 @@ impl QMatrix {
 mod tests {
     use super::*;
 
-    #[tokio::test]
-    async fn concat_rows_combines_f32_gpu_matrices() {
-        let Ok(device) = Device::new().await else {
-            return;
-        };
+    #[test]
+    fn concat_rows_combines_f32_gpu_matrices() {
+        pollster::block_on(async {
+            let Ok(device) = Device::new().await else {
+                return;
+            };
 
-        let first_raw: Vec<u8> = (1..=8)
-            .map(|value| value as f32)
-            .flat_map(f32::to_le_bytes)
-            .collect();
-        let second_raw: Vec<u8> = (9..=12)
-            .map(|value| value as f32)
-            .flat_map(f32::to_le_bytes)
-            .collect();
-        let first =
-            QMatrix::from_parts(&device, &first_raw, Box::new([2, 4]), GgmlType::F32).unwrap();
-        let second =
-            QMatrix::from_parts(&device, &second_raw, Box::new([1, 4]), GgmlType::F32).unwrap();
+            let first_raw: Vec<u8> = (1..=8)
+                .map(|value| value as f32)
+                .flat_map(f32::to_le_bytes)
+                .collect();
+            let second_raw: Vec<u8> = (9..=12)
+                .map(|value| value as f32)
+                .flat_map(f32::to_le_bytes)
+                .collect();
+            let first =
+                QMatrix::from_parts(&device, &first_raw, Box::new([2, 4]), GgmlType::F32).unwrap();
+            let second =
+                QMatrix::from_parts(&device, &second_raw, Box::new([1, 4]), GgmlType::F32).unwrap();
 
-        let combined = QMatrix::concat_rows(&[&first, &second]).unwrap();
-        let dequantized: crate::Tensor<2, f32> = combined.dequantize();
-        let values = dequantized.as_slice().await.unwrap();
+            let combined = QMatrix::concat_rows(&[&first, &second]).unwrap();
+            let dequantized = combined.dequantize::<f32>();
+            let values = dequantized.as_slice::<2, f32>().await.unwrap();
 
-        assert_eq!(combined.shape(), &[3, 4]);
-        assert_eq!(values.shape(), &[3, 4]);
-        for row in 0..3 {
-            for col in 0..4 {
-                assert_eq!(values[[row, col]], (row * 4 + col + 1) as f32);
+            assert_eq!(combined.shape(), &[3, 4]);
+            assert_eq!(values.shape(), &[3, 4]);
+            for row in 0..3 {
+                for col in 0..4 {
+                    assert_eq!(values[[row, col]], (row * 4 + col + 1) as f32);
+                }
             }
-        }
+        });
     }
 }

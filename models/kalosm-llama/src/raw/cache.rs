@@ -1,6 +1,5 @@
 use fusor::cache::KvCache;
-use fusor::Device;
-use fusor::SimdElement;
+use fusor::{Device, FloatDataType, SimdElement};
 
 use super::LlamaConfig;
 
@@ -21,7 +20,7 @@ pub struct LlamaCache {
 
 impl LlamaCache {
     /// Create a new cache for a model
-    pub fn new<G: fusor::FloatDataType + SimdElement>(config: &LlamaConfig<G>) -> Self {
+    pub fn new<G: FloatDataType + SimdElement>(config: &LlamaConfig<G>) -> Self {
         let max_seq_len = config.context_length;
         let mut blocks = Vec::with_capacity(config.n_layer);
         for layer_idx in 0..config.n_layer {

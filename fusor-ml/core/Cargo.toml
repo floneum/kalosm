@@ -25,6 +25,25 @@ fusor-tile-ir = { workspace = true }
 fusor-tile-ir-kernels = { workspace = true }
 fusor-tile-ir-runtime = { workspace = true }
 
+# Bench-only deps; activated by the `bench` feature. Kept here (not in
+# [dev-dependencies]) so plain `cargo test` doesn't have to compile candle,
+# ndarray, criterion, tokio, etc.
+criterion = { workspace = true, optional = true }
+futures = { version = "0.3.31", optional = true }
+ndarray = { version = "0.16.1", optional = true }
+pretty_assertions = { version = "1.4.1", optional = true }
+num-traits = { version = "0.2.19", optional = true }
+tokio = { version = "1.43.0", features = ["rt", "fs", "macros"], optional = true }
+candle-core = { workspace = true, optional = true }
+candle-nn = { workspace = true, optional = true }
+candle-transformers = { workspace = true, optional = true }
+kalosm-common = { workspace = true, optional = true }
+kalosm-model-types = { workspace = true, optional = true }
+
+# Used by the hello example to fetch a GGUF model; gated by `example-net`
+# so `cargo test` doesn't pull in the full hyper/TLS stack.
+reqwest = { version = "0.12.15", optional = true }
+
 [target.'cfg(target_vendor = "apple")'.dependencies]
 wgpu = { git = "https://github.com/ealmloff/wgpu", branch = "yield-now", default-features = false, features = ["metal"] }
 
@@ -34,55 +53,69 @@ wgpu = { git = "https://github.com/ealmloff/wgpu", branch = "yield-now", default
 [target.'cfg(any(target_os = "linux", target_os = "android", target_os = "freebsd"))'.dependencies]
 wgpu = { git = "https://github.com/ealmloff/wgpu", branch = "yield-now", default-features = false, features = ["vulkan"] }
 
+[target.'cfg(target_os = "macos")'.dependencies]
+candle-core = { workspace = true, optional = true, features = ["metal"] }
+candle-nn = { workspace = true, optional = true, features = ["metal"] }
+candle-transformers = { workspace = true, optional = true, features = ["metal"] }
+
 [features]
 default = []
 extra_assertions = []
 graphvis = ["dep:tabbycat"]
+bench = [
+    "dep:criterion",
+    "dep:futures",
+    "dep:ndarray",
+    "dep:pretty_assertions",
+    "dep:num-traits",
+    "dep:tokio",
+    "dep:candle-core",
+    "dep:candle-nn",
+    "dep:candle-transformers",
+    "dep:kalosm-common",
+    "dep:kalosm-model-types",
+]
+example-net = ["dep:reqwest"]
 
 [dev-dependencies]
-ndarray = "0.16.1"
 rand.workspace = true
-tokio = { version = "1.43.0", features = ["full"] }
-criterion.workspace = true
-pretty_assertions = "1.4.1"
-reqwest = "0.12.15"
-num-traits = "0.2.19"
 tracing-subscriber = "0.3.19"
-candle-core = { workspace = true }
-candle-nn = { workspace = true }
-candle-transformers = { workspace = true }
-kalosm-common = { workspace = true }
-kalosm-model-types.workspace = true
 
-[target.'cfg(target_os = "macos")'.dev-dependencies]
-candle-core = { workspace = true, features = ["metal"] }
-candle-nn = { workspace = true, features = ["metal"] }
-candle-transformers = { workspace = true, features = ["metal"] }
+[[example]]
+name = "hello"
+required-features = ["example-net"]
 
 [[bench]]
 name = "matmul"
 harness = false
+required-features = ["bench"]
 
 [[bench]]
 name = "qmatmul"
 harness = false
+required-features = ["bench"]
 
 [[bench]]
 name = "elementwise"
 harness = false
+required-features = ["bench"]
 
 [[bench]]
 name = "pairwise"
 harness = false
+required-features = ["bench"]
 
 [[bench]]
 name = "fused"
 harness = false
+required-features = ["bench"]
 
 [[bench]]
 name = "reduce"
 harness = false
+required-features = ["bench"]
 
 [[bench]]
 name = "softmax"
 harness = false
+required-features = ["bench"]

@@ -36,7 +36,7 @@ where
                     .zip(b_data.iter())
                     .map(|(x, y)| x.powf(*y))
                     .collect();
-                crate::cpu::Tensor::new(crate::cpu::ConcreteTensor::from_slice(shape, &result))
+                crate::cpu::TypedTensor::new(crate::cpu::ConcreteTensor::from_slice(shape, &result))
             },
             |a, b| a.pow(b),
         )
@@ -95,7 +95,7 @@ where
                 };
                 copy_recursive(&ctx, &mut result, 0, 0, 0);
 
-                Tensor::Cpu(crate::cpu::Tensor::new(
+                Tensor::Cpu(crate::cpu::TypedTensor::new(
                     crate::cpu::ConcreteTensor::from_slice(new_shape, &result),
                 ))
             }

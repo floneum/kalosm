@@ -1,9 +1,6 @@
 use std::{fmt::Debug, sync::Arc};
 
-use crate::{
-    DataType, Layout, MaxRank, Tensor, TensorData, compute_graph::NodeIndex,
-    mir::operation::Operation,
-};
+use crate::{Layout, Tensor, TensorData, compute_graph::NodeIndex, mir::operation::Operation};
 
 type MapLayout = Arc<dyn Fn(&Layout) -> Layout + Send + Sync>;
 
@@ -101,8 +98,9 @@ impl Operation for MapLayoutOperation {
     }
 }
 
-impl<const R: usize, T: DataType> Tensor<R, T> {
-    pub fn restride<const R2: usize>(&self, specs: [crate::StrideSpec; R2]) -> Tensor<R2, T> {
+impl Tensor {
+    pub fn restride(&self, specs: impl Into<Box<[crate::StrideSpec]>>) -> Tensor {
+        let specs = specs.into();
         self.add_map_layout(MapLayoutOperation::new(self.key(), move |layout| {
             layout.restride(&specs)
         }))
@@ -117,7 +115,7 @@ impl<const R: usize, T: DataType> Tensor<R, T> {
     /// Callers that need to re-layout a non-contiguous view should materialize
     /// it first (e.g. with `to_concrete()`), or use [`restride`] which composes
     /// stride specs relative to the input's current strides.
-    pub fn restride_layout<const R2: usize>(&self, new_layout: Layout) -> Tensor<R2, T> {
+    pub fn restride_layout(&self, new_layout: Layout) -> Tensor {
         self.add_map_layout(MapLayoutOperation::new(self.key(), move |input_layout| {
             assert!(
                 input_layout.is_contiguous() && input_layout.offset() == 0,
@@ -132,64 +130,60 @@ impl<const R: usize, T: DataType> Tensor<R, T> {
         }))
     }
 
-    pub(crate) fn broadcast_as<const R2: usize>(&self, out_shape: [usize; R2]) -> Tensor<R2, T> {
-        const {
-            assert!(
-                R2 >= R,
-                "The output dimension must be more than the input dimension"
-            )
-        };
-
+    pub(crate) fn broadcast_as(&self, out_shape: impl AsRef<[usize]>) -> Tensor {
+        let out_shape = out_shape.as_ref();
         let shape = self.shape();
-        let specs: [crate::StrideSpec; R2] = std::array::from_fn(|out_i| {
-            let in_i = out_i as isize - (R2 as isize - R as isize);
-            if in_i < 0 {
-                crate::StrideSpec::dim_with(0, out_shape[out_i], 0)
-            } else {
-                let in_i = in_i as usize;
-                if shape[in_i] == 1 && out_shape[out_i] > 1 {
-                    crate::StrideSpec::dim_with(in_i, out_shape[out_i], 0)
+        assert!(
+            out_shape.len() >= shape.len(),
+            "The output rank must be at least the input rank"
+        );
+        let specs: Vec<crate::StrideSpec> = (0..out_shape.len())
+            .map(|out_i| {
+                let in_i = out_i as isize - (out_shape.len() as isize - shape.len() as isize);
+                if in_i < 0 {
+                    crate::StrideSpec::dim_with(0, out_shape[out_i], 0)
                 } else {
-                    crate::StrideSpec::dim(in_i, out_shape[out_i])
+                    let in_i = in_i as usize;
+                    if shape[in_i] == 1 && out_shape[out_i] > 1 {
+                        crate::StrideSpec::dim_with(in_i, out_shape[out_i], 0)
+                    } else {
+                        crate::StrideSpec::dim(in_i, out_shape[out_i])
+                    }
                 }
-            }
-        });
+            })
+            .collect();
         self.restride(specs)
     }
 
-    pub(crate) fn broadcast_together<const R2: usize, const R3: usize>(
-        first: &Tensor<R, T>,
-        second: &Tensor<R2, T>,
-    ) -> (Tensor<R3, T>, Tensor<R3, T>)
-    where
-        (Tensor<R, T>, Tensor<R2, T>): MaxRank<R3, T>,
-    {
-        const {
-            assert!(
-                R3 == if R > R2 { R } else { R2 },
-                "The output dimension must be the maximum of the two input dimensions"
-            )
-        };
-
-        let shape = if first.rank() > second.rank() {
-            std::array::from_fn(|i| first.shape()[i])
-        } else if first.rank() < second.rank() {
-            std::array::from_fn(|i| second.shape()[i])
-        } else {
-            std::array::from_fn(|i| first.shape()[i].max(second.shape()[i]))
-        };
-        (first.broadcast_as(shape), second.broadcast_as(shape))
+    pub(crate) fn broadcast_together(first: &Tensor, second: &Tensor) -> (Tensor, Tensor) {
+        assert_eq!(first.datatype(), second.datatype());
+        let first_shape = first.shape();
+        let second_shape = second.shape();
+        let rank = first_shape.len().max(second_shape.len());
+        let shape: Vec<usize> = (0..rank)
+            .map(|i| {
+                let a = i + first_shape.len();
+                let b = i + second_shape.len();
+                let a = if a >= rank { first_shape[a - rank] } else { 1 };
+                let b = if b >= rank { second_shape[b - rank] } else { 1 };
+                assert!(
+                    a == b || a == 1 || b == 1,
+                    "Cannot broadcast shapes {:?} and {:?}",
+                    first_shape,
+                    second_shape
+                );
+                a.max(b)
+            })
+            .collect();
+        (first.broadcast_as(&shape), second.broadcast_as(&shape))
     }
 
-    pub(crate) fn broadcast_then_elementwise_op<const R2: usize, const R3: usize>(
-        first: &Tensor<R, T>,
-        second: &Tensor<R2, T>,
-        op: impl Fn(Tensor<R3, T>, Tensor<R3, T>) -> Tensor<R3, T>,
-    ) -> Tensor<R3, T>
-    where
-        (Tensor<R, T>, Tensor<R2, T>): MaxRank<R3, T>,
-    {
-        let (b1, b2) = Self::broadcast_together(first, second);
+    pub(crate) fn broadcast_then_elementwise_op(
+        first: &Tensor,
+        second: &Tensor,
+        op: impl Fn(Tensor, Tensor) -> Tensor,
+    ) -> Tensor {
+        let (b1, b2) = Tensor::broadcast_together(first, second);
         assert_eq!(b1.shape(), b2.shape());
         op(b1, b2)
     }

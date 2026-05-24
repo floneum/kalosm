@@ -233,8 +233,8 @@ impl Operation for SliceAssignOperation {
     }
 }
 
-impl<const R: usize, T: crate::DataType> Tensor<R, T> {
-    pub fn slice_assign(&self, slices: [Range<usize>; R], value: &Self) -> Self {
+impl Tensor {
+    pub fn slice_assign(&self, slices: impl Into<Box<[Range<usize>]>>, value: &Self) -> Self {
         self.add_slice_assign(value, slices)
     }
 }
@@ -243,27 +243,29 @@ impl<const R: usize, T: crate::DataType> Tensor<R, T> {
 mod tests {
     use crate::{Device, Tensor};
 
-    #[tokio::test]
-    async fn slice_assign_in_place_updates_only_slice() {
-        let Ok(device) = Device::new().await else {
-            return;
-        };
+    #[test]
+    fn slice_assign_in_place_updates_only_slice() {
+        pollster::block_on(async {
+            let Ok(device) = Device::new().await else {
+                return;
+            };
 
-        let base_rows = vec![vec![0.0f32; 4]; 3];
-        let value_rows = vec![vec![1.0f32, 2.0], vec![3.0, 4.0]];
-        let base: Tensor<2, f32> = Tensor::new(&device, &base_rows);
-        let value: Tensor<2, f32> = Tensor::new(&device, &value_rows);
+            let base_rows = vec![vec![0.0f32; 4]; 3];
+            let value_rows = vec![vec![1.0f32, 2.0], vec![3.0, 4.0]];
+            let base = Tensor::new::<f32, 2, _>(&device, &base_rows);
+            let value = Tensor::new::<f32, 2, _>(&device, &value_rows);
 
-        let updated = base.slice_assign_in_place([1..3, 1..3], &value);
-        let updated = updated.as_slice().await.unwrap();
+            let updated = base.slice_assign_in_place([1..3, 1..3], &value);
+            let updated = updated.as_slice::<2, f32>().await.unwrap();
 
-        assert_eq!(updated.shape(), &[3, 4]);
-        assert_eq!(updated[[0, 0]], 0.0);
-        assert_eq!(updated[[1, 0]], 0.0);
-        assert_eq!(updated[[1, 1]], 1.0);
-        assert_eq!(updated[[1, 2]], 2.0);
-        assert_eq!(updated[[2, 1]], 3.0);
-        assert_eq!(updated[[2, 2]], 4.0);
-        assert_eq!(updated[[2, 3]], 0.0);
+            assert_eq!(updated.shape(), &[3, 4]);
+            assert_eq!(updated[[0, 0]], 0.0);
+            assert_eq!(updated[[1, 0]], 0.0);
+            assert_eq!(updated[[1, 1]], 1.0);
+            assert_eq!(updated[[1, 2]], 2.0);
+            assert_eq!(updated[[2, 1]], 3.0);
+            assert_eq!(updated[[2, 2]], 4.0);
+            assert_eq!(updated[[2, 3]], 0.0);
+        });
     }
 }

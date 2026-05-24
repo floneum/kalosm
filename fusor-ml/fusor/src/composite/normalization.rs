@@ -36,7 +36,7 @@ where
     {
         match self {
             Tensor::Cpu(_) => self.softmax_cpu_impl(axis),
-            Tensor::Gpu(t) => Tensor::Gpu(t.softmax(axis)),
+            Tensor::Gpu(t) => Tensor::Gpu(t.softmax::<OUT_RANK>(axis)),
         }
     }
 
@@ -529,7 +529,7 @@ where
                     bias.as_ref().map(|bias| bias.inner()),
                     eps,
                 );
-                Tensor::Cpu(crate::cpu::Tensor::new(result))
+                Tensor::Cpu(crate::cpu::TypedTensor::new(result))
             }
             (Tensor::Gpu(_), Tensor::Gpu(_)) => {
                 if matches!(bias, Some(Tensor::Cpu(_))) {
@@ -560,7 +560,7 @@ where
                 // Make contiguous if needed, then use fused kernel
                 let contiguous = t.as_ref().make_contiguous();
                 let result = crate::cpu::softmax_last_dim_fused(contiguous.inner());
-                crate::cpu::Tensor::new(result)
+                crate::cpu::TypedTensor::new(result)
             },
             |t| t.softmax_last_dim::<OUT_RANK>(),
         )

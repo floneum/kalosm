@@ -72,7 +72,8 @@ where
 
         // If we have an offset, we need to pad the mask
         if seqlen_offset > 0 {
-            // Pad the mask on the left with zeros
+            // Pad the mask on the left with zeros — no longer a pure
+            // strict-lower-triangular causal mask, so don't mark it as such.
             let mask_tensor = mask.mask();
             let [rows, cols] = mask_tensor.shape();
             let zeros: Tensor<2, D> = Tensor::zeros(device, [rows, seqlen_offset + cols]);
@@ -104,7 +105,7 @@ where
         }
 
         let mask: Tensor<2, D, ConcreteTensor<D, 2>> = match device {
-            Device::Cpu => Tensor::Cpu(crate::cpu::Tensor::from_slice(
+            Device::Cpu => Tensor::Cpu(crate::cpu::TypedTensor::from_slice(
                 [seq_len, seq_len],
                 &mask_data,
             )),
