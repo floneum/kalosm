@@ -94,6 +94,29 @@ pub struct FlashDecodeSmallMeta {
     pub output_strides: [u32; 4],
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+/// Metadata for a direct softmax kernel over one tensor axis.
+pub struct SoftmaxMeta {
+    /// Logical tensor shape.
+    pub shape: Vec<u32>,
+    /// Softmax axis.
+    pub axis: u32,
+    /// Number of logical rows after removing the softmax axis.
+    pub rows: u32,
+    /// Length of the softmax axis.
+    pub axis_len: u32,
+    /// Workgroup block size used for one axis tile.
+    pub block: u32,
+    /// Number of axis tiles for split softmax.
+    pub split_blocks: u32,
+    /// Input tensor metadata.
+    pub input_meta: TensorMeta,
+    /// Output tensor metadata.
+    pub output_meta: TensorMeta,
+    /// Dispatch grid used by the generated tile program.
+    pub dispatch_size: [u32; 3],
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 /// Vec4 RMS-norm offsets, strides, and scalar parameters.
 pub struct RmsNormVec4Meta {

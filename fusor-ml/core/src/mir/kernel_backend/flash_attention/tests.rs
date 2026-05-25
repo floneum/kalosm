@@ -49,23 +49,23 @@ fn gpu_test_guard() -> MutexGuard<'static, ()> {
 fn decode_block_choice_uses_smallest_covering_supported_block() {
     assert_eq!(
         choose_decode_block(64, caps(DECODE_LARGE_BLOCK)),
-        Some(DecodeBlock::Small)
+        Some(DECODE_SMALL_BLOCK)
     );
     assert_eq!(
         choose_decode_block(200, caps(DECODE_LARGE_BLOCK)),
-        Some(DecodeBlock::Medium)
+        Some(DECODE_MID_BLOCK)
     );
     assert_eq!(
         choose_decode_block(600, caps(DECODE_LARGE_BLOCK)),
-        Some(DecodeBlock::Large)
+        Some(DECODE_LARGE_BLOCK)
     );
     assert_eq!(
         choose_decode_block(600, caps(DECODE_MEDIUM_BLOCK)),
-        Some(DecodeBlock::Medium)
+        Some(DECODE_MEDIUM_BLOCK)
     );
     assert_eq!(
         choose_decode_block(DECODE_LARGE_BLOCK + 1, caps(DECODE_LARGE_BLOCK)),
-        Some(DecodeBlock::Medium)
+        Some(DECODE_MID_BLOCK)
     );
     assert_eq!(
         choose_decode_block(DECODE_SMALL_BLOCK, caps(DECODE_SMALL_BLOCK - 1)),
@@ -80,7 +80,7 @@ fn decode_block_choice_uses_smallest_covering_supported_block() {
                 ..caps(DECODE_LARGE_BLOCK)
             },
         ),
-        Some(DecodeBlock::Medium)
+        Some(DECODE_MID_BLOCK)
     );
 }
 
@@ -101,8 +101,8 @@ fn decode_small_meta_buckets_dynamic_kv_len() {
     .unwrap();
 
     assert_eq!(meta.active_kv_len, DECODE_SMALL_BLOCK + 1);
-    assert_eq!(meta.decode_block, DECODE_MEDIUM_BLOCK);
-    assert_eq!(meta.dims.kv_seq_len, DECODE_MEDIUM_BLOCK);
+    assert_eq!(meta.decode_block, DECODE_MID_BLOCK);
+    assert_eq!(meta.dims.kv_seq_len, DECODE_MID_BLOCK);
     assert_eq!(meta.split_blocks, 1);
     assert!(!meta.tiled);
 }
@@ -207,25 +207,23 @@ fn flash_attention_selector_selects_decode_block_buckets() {
     assert_eq!(
         selector.select(decode_shape(64), &decode_ctx, caps(DECODE_LARGE_BLOCK)),
         Some(FlashAttentionSelectedVariant::DecodeSmall(
-            DecodeBlock::Small
+            DECODE_SMALL_BLOCK
         ))
     );
     assert_eq!(
         selector.select(decode_shape(200), &decode_ctx, caps(DECODE_LARGE_BLOCK)),
-        Some(FlashAttentionSelectedVariant::DecodeSmall(
-            DecodeBlock::Medium
-        ))
+        Some(FlashAttentionSelectedVariant::DecodeSmall(DECODE_MID_BLOCK))
     );
     assert_eq!(
         selector.select(decode_shape(600), &decode_ctx, caps(DECODE_LARGE_BLOCK)),
         Some(FlashAttentionSelectedVariant::DecodeSmall(
-            DecodeBlock::Large
+            DECODE_LARGE_BLOCK
         ))
     );
     assert_eq!(
         selector.select(decode_shape(600), &decode_ctx, caps(DECODE_MEDIUM_BLOCK)),
         Some(FlashAttentionSelectedVariant::DecodeSmall(
-            DecodeBlock::Medium
+            DECODE_MEDIUM_BLOCK
         ))
     );
     assert_eq!(
@@ -234,9 +232,7 @@ fn flash_attention_selector_selects_decode_block_buckets() {
             &decode_ctx,
             caps(DECODE_LARGE_BLOCK)
         ),
-        Some(FlashAttentionSelectedVariant::DecodeSmall(
-            DecodeBlock::Medium
-        ))
+        Some(FlashAttentionSelectedVariant::DecodeSmall(DECODE_MID_BLOCK))
     );
     assert_eq!(
         selector.select(decode_shape(200), &decode_ctx, caps(DECODE_SMALL_BLOCK - 1)),
@@ -255,17 +251,22 @@ fn flash_attention_selector_generates_each_variant() {
     let streaming_ctx = FlashAttentionSelectionCtx { has_mask: true };
     let cases = [
         (
-            FlashAttentionSelectedVariant::DecodeSmall(DecodeBlock::Small),
+            FlashAttentionSelectedVariant::DecodeSmall(DECODE_SMALL_BLOCK),
             decode_ctx,
             caps(DECODE_SMALL_BLOCK),
         ),
         (
-            FlashAttentionSelectedVariant::DecodeSmall(DecodeBlock::Medium),
+            FlashAttentionSelectedVariant::DecodeSmall(DECODE_MID_BLOCK),
+            decode_ctx,
+            caps(DECODE_MID_BLOCK),
+        ),
+        (
+            FlashAttentionSelectedVariant::DecodeSmall(DECODE_MEDIUM_BLOCK),
             decode_ctx,
             caps(DECODE_MEDIUM_BLOCK),
         ),
         (
-            FlashAttentionSelectedVariant::DecodeSmall(DecodeBlock::Large),
+            FlashAttentionSelectedVariant::DecodeSmall(DECODE_LARGE_BLOCK),
             decode_ctx,
             caps(DECODE_LARGE_BLOCK),
         ),
@@ -484,8 +485,7 @@ fn decode_gqa_non_tiled_large_blocks_match_cpu_reference() {
 
         // On devices that support the larger workgroups, 200 uses the 512
         // block and 600 uses the 1024 block.
-        for (kv_len, expected_block) in [(200usize, DecodeBlock::Medium), (600, DecodeBlock::Large)]
-        {
+        for (kv_len, expected_block) in [(200usize, DECODE_MID_BLOCK), (600, DECODE_LARGE_BLOCK)] {
             if choose_decode_block(kv_len as u32, caps) != Some(expected_block) {
                 continue;
             }

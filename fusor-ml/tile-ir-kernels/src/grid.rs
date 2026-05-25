@@ -3,7 +3,7 @@
 //! `tile::build` entry point.
 
 use fusor_tile_ir::tile::{Mask, Q4KActivations, Storage, Tile, TileBlock};
-use fusor_tile_ir::{TileLiteral, WorkgroupAxis, F32, U32};
+use fusor_tile_ir::{F32, TileLiteral, U32, WorkgroupAxis};
 
 #[derive(Clone, Copy)]
 pub(crate) struct QgemvGrid {
@@ -14,11 +14,13 @@ pub(crate) struct QgemvGrid {
     pub(crate) full_cols: bool,
 }
 
-pub(crate) fn qgemv_grid<const SUBGROUPS: u32, const COLS_PER_SUBGROUP: usize>(
+pub(crate) fn qgemv_grid(
+    subgroups: u32,
+    cols_per_subgroup: u32,
     n_cols: u32,
     requested_workgroups_x: u32,
 ) -> QgemvGrid {
-    let cols_per_workgroup = SUBGROUPS * COLS_PER_SUBGROUP as u32;
+    let cols_per_workgroup = subgroups * cols_per_subgroup;
     let total_workgroups = n_cols.div_ceil(cols_per_workgroup);
     let workgroups_x = requested_workgroups_x.min(total_workgroups.max(1));
     QgemvGrid {
@@ -56,14 +58,15 @@ pub(crate) struct QgemvStoreTarget<'a> {
     pub(crate) epilogues: &'a crate::types::QmatmulEpilogues<'a>,
 }
 
-pub(crate) fn qgemv_program_scope<const COLS_PER_SUBGROUP: usize>(
+pub(crate) fn qgemv_program_scope(
     program: &TileBlock<'_>,
     grid: QgemvGrid,
+    cols_per_subgroup: u32,
 ) -> QgemvProgramScope {
     let workgroup = program.program_id(WorkgroupAxis::X)
         + program.program_id(WorkgroupAxis::Y) * grid.workgroups_x;
     let col_group_base = workgroup * grid.cols_per_workgroup;
-    let subgroup_col_base = program.subgroup_id() * COLS_PER_SUBGROUP as u32;
+    let subgroup_col_base = program.subgroup_id() * cols_per_subgroup;
     QgemvProgramScope {
         col0: col_group_base + subgroup_col_base,
         lane: program.subgroup_lane(),
@@ -74,9 +77,9 @@ pub(crate) fn qgemv_program_scope<const COLS_PER_SUBGROUP: usize>(
 /// epilogue between the subgroup reduce and the store. The `pre` slot is
 /// ignored here because pre-epilogues are applied at load sites by the kernel
 /// body.
-pub(crate) fn store_qgemv_sums_with_epilogue<const COLS_PER_SUBGROUP: usize>(
+pub(crate) fn store_qgemv_sums_with_epilogue(
     program: &mut TileBlock<'_>,
-    sums: [Tile; COLS_PER_SUBGROUP],
+    sums: Vec<Tile>,
     target: QgemvStoreTarget<'_>,
 ) {
     for (offset, sum) in sums.into_iter().enumerate() {
@@ -289,14 +292,12 @@ where
     }
 }
 
-pub(crate) fn dot4_sum<const VALUES: usize>(
-    program: &TileBlock<'_>,
-    a: &[Tile; VALUES],
-    b: &[Tile; VALUES],
-) -> Tile {
-    debug_assert!(VALUES >= 4 && VALUES.is_multiple_of(4));
+pub(crate) fn dot4_sum(program: &TileBlock<'_>, a: &[Tile], b: &[Tile]) -> Tile {
+    debug_assert_eq!(a.len(), b.len());
+    let values = a.len();
+    debug_assert!(values >= 4 && values.is_multiple_of(4));
     let mut sum: Option<Tile> = None;
-    for chunk in 0..VALUES / 4 {
+    for chunk in 0..values / 4 {
         let a_vec = std::array::from_fn(|i| a[chunk * 4 + i].clone());
         let b_vec = std::array::from_fn(|i| b[chunk * 4 + i].clone());
         let a_vec = program.compose_vector::<F32, 4>(a_vec);
@@ -307,5 +308,5 @@ pub(crate) fn dot4_sum<const VALUES: usize>(
             None => term,
         });
     }
-    sum.expect("VALUES >= 4")
+    sum.expect("values >= 4")
 }

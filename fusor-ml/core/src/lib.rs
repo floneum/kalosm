@@ -50,6 +50,7 @@ pub(crate) use rms_norm::RmsNormOperation;
 mod resize;
 mod sampling;
 mod slice_assign;
+mod softmax;
 mod tensor;
 mod top_k;
 pub use top_k::{GpuMirostat2Sampler, GpuMirostat2SamplerParams};

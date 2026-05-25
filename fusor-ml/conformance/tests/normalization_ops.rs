@@ -304,3 +304,55 @@ async fn softmax_middle_axis_rank3_matches_reference() {
         .await
         .unwrap();
 }
+
+#[tokio::test]
+async fn softmax_direct_boundary_lengths_match_reference() {
+    let cases = [
+        [3usize, 1usize],
+        [2, 127],
+        [2, 128],
+        [2, 129],
+        [2, 512],
+        [2, 513],
+        [2, 1024],
+        [2, 1025],
+        [2, 4096],
+    ];
+
+    for device in fusor_conformance::available_devices().await {
+        for [rows, cols] in cases {
+            let values = (0..rows * cols)
+                .map(|i| ((i % 37) as f32 - 18.0) * 0.17)
+                .collect::<Vec<_>>();
+            let input = Tensor::from_slice(&device, [rows, cols], &values);
+            let expected_rows = common::reshape2(&values, [rows, cols]);
+            let expected = Tensor::new(&device, &softmax_last_dim_2d(&expected_rows));
+            common::assert_approx_tensors(input.softmax::<1>(1), expected, 1e-5).await;
+        }
+    }
+}
+
+#[tokio::test]
+async fn softmax_direct_transposed_and_middle_axis_match_reference() {
+    for device in fusor_conformance::available_devices().await {
+        let rows = 9usize;
+        let cols = 257usize;
+        let values = (0..rows * cols)
+            .map(|i| ((i % 53) as f32 - 26.0) * 0.11)
+            .collect::<Vec<_>>();
+        let base = Tensor::from_slice(&device, [rows, cols], &values);
+        let input = base.transpose(0, 1);
+        let expected_input = common::transpose2(&common::reshape2(&values, [rows, cols]));
+        let expected = Tensor::new(&device, &softmax_last_dim_2d(&expected_input));
+        common::assert_approx_tensors(input.softmax::<1>(1), expected, 1e-5).await;
+
+        let shape = [2usize, 513usize, 3usize];
+        let values = (0..shape.iter().product::<usize>())
+            .map(|i| ((i % 41) as f32 - 20.0) * 0.13)
+            .collect::<Vec<_>>();
+        let input = Tensor::from_slice(&device, shape, &values);
+        let expected_input = common::reshape3(&values, shape);
+        let expected = Tensor::new(&device, &softmax_middle_axis_3d(&expected_input));
+        common::assert_approx_tensors(input.softmax::<2>(1), expected, 1e-5).await;
+    }
+}

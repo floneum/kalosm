@@ -53,7 +53,7 @@ impl Tensor {
 #[cfg(test)]
 mod selection_tests {
     use super::variants::{
-        DenseMatmulCtx, DenseMatmulVariant, DirectTileCoopMatmulVariant, DirectTileMatmulVariant,
+        DenseMatmulCtx, DenseMatmulVariant, CoopTile, DirectTileMatmulVariant,
         dense_matmul_selector, direct_tile_matmul_selector, select_coop_kind,
     };
     use crate::kernel_selection::{
@@ -234,60 +234,60 @@ mod selection_tests {
         // 4096³ (square) hits Tile128x512 — it has fewer barriers than
         // Tile256x256 because it's double-buffered.
         assert_eq!(
-            DirectTileCoopMatmulVariant::select(4096, 4096, 4096, 512),
-            DirectTileCoopMatmulVariant::Tile128x512
+            CoopTile::select(4096, 4096, 4096, 512),
+            Some(CoopTile::new(128, 512, 16))
         );
         // Shapes where N is divisible by 256 but not 512 — with enough
         // tiles — fall to Tile256x256 single-buffer.
         assert_eq!(
-            DirectTileCoopMatmulVariant::select(8192, 1024, 4352, 512),
-            DirectTileCoopMatmulVariant::Tile256x256
+            CoopTile::select(8192, 1024, 4352, 512),
+            Some(CoopTile::new(256, 256, 16))
         );
         // N=512 doesn't divide 256 on the M side... actually wait, 4096 % 256 == 0.
         // For shapes where N is divisible by 512 but M isn't by 256, fall to
         // Tile128x512.
         assert_eq!(
-            DirectTileCoopMatmulVariant::select(384, 1024, 1024, 512),
-            DirectTileCoopMatmulVariant::Tile128x64
+            CoopTile::select(384, 1024, 1024, 512),
+            Some(CoopTile::new(128, 64, 16))
         );
         // 1024³ doesn't have enough tiles for Tile128x512 OR Tile128x256;
         // falls back to Tile128x64 for better parallelism.
         assert_eq!(
-            DirectTileCoopMatmulVariant::select(1024, 1024, 1024, 512),
-            DirectTileCoopMatmulVariant::Tile128x64
+            CoopTile::select(1024, 1024, 1024, 512),
+            Some(CoopTile::new(128, 64, 16))
         );
         // 8192x256 has tiles_for(128, 256) = 64*1 = 64 — below the threshold,
         // so it falls to Tile128x64.
         assert_eq!(
-            DirectTileCoopMatmulVariant::select(8192, 1024, 256, 256),
-            DirectTileCoopMatmulVariant::Tile128x64
+            CoopTile::select(8192, 1024, 256, 256),
+            Some(CoopTile::new(128, 64, 16))
         );
         // M=4096, N=1024 gives tiles_for(128, 256) = 32*4 = 128. Below 256.
         // Falls to Tile128x64.
         assert_eq!(
-            DirectTileCoopMatmulVariant::select(4096, 1024, 1024, 256),
-            DirectTileCoopMatmulVariant::Tile128x64
+            CoopTile::select(4096, 1024, 1024, 256),
+            Some(CoopTile::new(128, 64, 16))
         );
         // M=8192, N=512 gives tiles_for(128, 256) = 64*2 = 128 (still <256),
         // so falls to Tile128x64. To hit Tile128x256 we need a wider shape:
         // 8192x1024 → 64*4 = 256 ✓.
         assert_eq!(
-            DirectTileCoopMatmulVariant::select(8192, 1024, 1024, 256),
-            DirectTileCoopMatmulVariant::Tile128x256
+            CoopTile::select(8192, 1024, 1024, 256),
+            Some(CoopTile::new(128, 256, 16))
         );
         // N=128 doesn't divide 256 so Tile128x256/Tile128x512 are out; falls
         // back to Tile128x64.
         assert_eq!(
-            DirectTileCoopMatmulVariant::select(1024, 1024, 128, 256),
-            DirectTileCoopMatmulVariant::Tile128x64
+            CoopTile::select(1024, 1024, 128, 256),
+            Some(CoopTile::new(128, 64, 16))
         );
         assert_eq!(
-            DirectTileCoopMatmulVariant::select(1024, 1024, 1024, 128),
-            DirectTileCoopMatmulVariant::Tile64x64
+            CoopTile::select(1024, 1024, 1024, 128),
+            Some(CoopTile::new(64, 64, 16))
         );
         assert_eq!(
-            DirectTileCoopMatmulVariant::select(1000, 1024, 1024, 512),
-            DirectTileCoopMatmulVariant::None
+            CoopTile::select(1000, 1024, 1024, 512),
+            None
         );
     }
 }

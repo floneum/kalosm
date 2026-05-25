@@ -18,6 +18,7 @@ mod kernel;
 mod tests;
 
 const DECODE_SMALL_BLOCK: u32 = 128;
+const DECODE_MID_BLOCK: u32 = 256;
 const DECODE_MEDIUM_BLOCK: u32 = 512;
 const DECODE_LARGE_BLOCK: u32 = 1024;
 const DECODE_HEAD_DIM: u32 = 128;
@@ -33,69 +34,6 @@ fn flash_attention_module_cache() -> &'static kernel_backend::ModuleCache {
     CACHE.get_or_init(|| kernel_backend::module_cache(FLASH_ATTENTION_MODULE_CACHE_SIZE))
 }
 
-/// Dispatches to `$body` for each (element type, subgroup size) pair the
-/// streaming kernels are monomorphized over. `$element` is bound to the
-/// element type and `$size` to the const subgroup width inside the body.
-/// Returns `None` for any (dtype, subgroup_size) combination not in the
-/// table.
-macro_rules! for_each_streaming_variant {
-    ($input_dtype:expr, $subgroup_size:expr, |$element:ident, $size:ident| $body:block) => {
-        match ($input_dtype, $subgroup_size) {
-            (DataTypeEnum::F32, 4) => {
-                type $element = tile_ir::F32;
-                const $size: u32 = 4;
-                $body
-            }
-            (DataTypeEnum::F32, 8) => {
-                type $element = tile_ir::F32;
-                const $size: u32 = 8;
-                $body
-            }
-            (DataTypeEnum::F32, 16) => {
-                type $element = tile_ir::F32;
-                const $size: u32 = 16;
-                $body
-            }
-            (DataTypeEnum::F32, 32) => {
-                type $element = tile_ir::F32;
-                const $size: u32 = 32;
-                $body
-            }
-            (DataTypeEnum::F32, 64) => {
-                type $element = tile_ir::F32;
-                const $size: u32 = 64;
-                $body
-            }
-            (DataTypeEnum::F16, 4) => {
-                type $element = tile_ir::F16;
-                const $size: u32 = 4;
-                $body
-            }
-            (DataTypeEnum::F16, 8) => {
-                type $element = tile_ir::F16;
-                const $size: u32 = 8;
-                $body
-            }
-            (DataTypeEnum::F16, 16) => {
-                type $element = tile_ir::F16;
-                const $size: u32 = 16;
-                $body
-            }
-            (DataTypeEnum::F16, 32) => {
-                type $element = tile_ir::F16;
-                const $size: u32 = 32;
-                $body
-            }
-            (DataTypeEnum::F16, 64) => {
-                type $element = tile_ir::F16;
-                const $size: u32 = 64;
-                $body
-            }
-            _ => None,
-        }
-    };
-}
-
 #[allow(clippy::too_many_arguments)]
 fn dispatch_streaming_flash_attention(
     kb: &mut tile_ir::KernelBuilder<()>,
@@ -108,9 +46,29 @@ fn dispatch_streaming_flash_attention(
     input_dtype: DataTypeEnum,
     subgroup_size: u32,
 ) -> Option<()> {
-    for_each_streaming_variant!(input_dtype, subgroup_size, |Element, SIZE| {
-        tile_ir_kernels::flash_attention::<Element, SIZE, _>(kb, q, k, v, mask, output, meta)
-    })
+    match input_dtype {
+        DataTypeEnum::F32 => tile_ir_kernels::flash_attention::<tile_ir::F32, _>(
+            kb,
+            q,
+            k,
+            v,
+            mask,
+            output,
+            meta,
+            subgroup_size,
+        ),
+        DataTypeEnum::F16 => tile_ir_kernels::flash_attention::<tile_ir::F16, _>(
+            kb,
+            q,
+            k,
+            v,
+            mask,
+            output,
+            meta,
+            subgroup_size,
+        ),
+        _ => None,
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -125,11 +83,31 @@ fn dispatch_streaming_tiled_flash_attention(
     input_dtype: DataTypeEnum,
     subgroup_size: u32,
 ) -> Option<()> {
-    for_each_streaming_variant!(input_dtype, subgroup_size, |Element, SIZE| {
-        tile_ir_kernels::flash_attention_tiled::<Element, SIZE, { FLASH_STREAMING_TILED_Q_BLOCK }, _>(
-            kb, q, k, v, mask, output, meta,
-        )
-    })
+    match input_dtype {
+        DataTypeEnum::F32 => tile_ir_kernels::flash_attention_tiled::<tile_ir::F32, _>(
+            kb,
+            q,
+            k,
+            v,
+            mask,
+            output,
+            meta,
+            subgroup_size,
+            FLASH_STREAMING_TILED_Q_BLOCK,
+        ),
+        DataTypeEnum::F16 => tile_ir_kernels::flash_attention_tiled::<tile_ir::F16, _>(
+            kb,
+            q,
+            k,
+            v,
+            mask,
+            output,
+            meta,
+            subgroup_size,
+            FLASH_STREAMING_TILED_Q_BLOCK,
+        ),
+        _ => None,
+    }
 }
 
 /// Returns true when the per-shape gating for the tiled (Q-batched) streaming
@@ -185,29 +163,21 @@ const FLASH_HEAD_DIM: Axis<5> = Axis;
 type FlashAttentionDims = tile_ir_kernels::FlashAttentionDims;
 type FlashDecodeSmallMeta = tile_ir_kernels::FlashDecodeSmallMeta;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum DecodeBlock {
-    Small,
-    Medium,
-    Large,
-}
-
-impl DecodeBlock {
-    const ALL: [Self; 3] = [Self::Small, Self::Medium, Self::Large];
-
-    fn size(self) -> u32 {
-        match self {
-            Self::Small => DECODE_SMALL_BLOCK,
-            Self::Medium => DECODE_MEDIUM_BLOCK,
-            Self::Large => DECODE_LARGE_BLOCK,
-        }
-    }
-}
+/// Workgroup sizes the decode kernel monomorphizes over, smallest first.
+/// `choose_decode_block` picks the smallest entry that covers the given KV
+/// length and that the device's workgroup-size limits support.
+const DECODE_BLOCKS: [u32; 4] = [
+    DECODE_SMALL_BLOCK,
+    DECODE_MID_BLOCK,
+    DECODE_MEDIUM_BLOCK,
+    DECODE_LARGE_BLOCK,
+];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum FlashAttentionSelectedVariant {
     Streaming,
-    DecodeSmall(DecodeBlock),
+    /// Decode kernel parameterized by its workgroup BLOCK (128/512/1024).
+    DecodeSmall(u32),
 }
 
 impl FlashAttentionSelectedVariant {
@@ -221,7 +191,7 @@ impl FlashAttentionSelectedVariant {
     fn decode_block(self) -> Option<u32> {
         match self {
             Self::Streaming => None,
-            Self::DecodeSmall(block) => Some(block.size()),
+            Self::DecodeSmall(block) => Some(block),
         }
     }
 }
@@ -231,26 +201,26 @@ struct FlashAttentionSelectionCtx {
     has_mask: bool,
 }
 
-fn decode_block_supported(block: DecodeBlock, caps: KernelDeviceCaps) -> bool {
-    let size = block.size();
+fn decode_block_supported(block: u32, caps: KernelDeviceCaps) -> bool {
+    let size = block;
     size <= caps.max_compute_invocations_per_workgroup && size <= caps.max_compute_workgroup_size_x
 }
 
-fn choose_decode_block(kv_seq_len: u32, caps: KernelDeviceCaps) -> Option<DecodeBlock> {
+fn choose_decode_block(kv_seq_len: u32, caps: KernelDeviceCaps) -> Option<u32> {
     if kv_seq_len == 0 {
         return None;
     }
-    if kv_seq_len > DECODE_LARGE_BLOCK && decode_block_supported(DecodeBlock::Medium, caps) {
-        return Some(DecodeBlock::Medium);
+    if kv_seq_len > DECODE_LARGE_BLOCK && decode_block_supported(DECODE_MID_BLOCK, caps) {
+        return Some(DECODE_MID_BLOCK);
     }
 
     let mut largest_supported = None;
-    for block in DecodeBlock::ALL {
+    for block in DECODE_BLOCKS {
         if !decode_block_supported(block, caps) {
             continue;
         }
         largest_supported = Some(block);
-        if kv_seq_len <= block.size() {
+        if kv_seq_len <= block {
             return Some(block);
         }
     }
@@ -261,7 +231,7 @@ fn selected_decode_block_for_shape(
     shape: KernelShape<6>,
     ctx: &FlashAttentionSelectionCtx,
     caps: KernelDeviceCaps,
-) -> Option<DecodeBlock> {
+) -> Option<u32> {
     if ctx.has_mask || shape[FLASH_KV_SEQ] == 0 {
         return None;
     }
@@ -269,7 +239,7 @@ fn selected_decode_block_for_shape(
 }
 
 fn decode_shape_rule(
-    block: DecodeBlock,
+    block: u32,
     kv_constraint: Option<DimConstraint>,
 ) -> ShapeRule<6, FlashAttentionSelectionCtx> {
     let mut rule = ShapeRule::new()
@@ -284,44 +254,58 @@ fn decode_shape_rule(
 }
 
 fn flash_attention_selector()
--> ShapeSelector<6, FlashAttentionSelectionCtx, FlashAttentionSelectedVariant> {
+    -> ShapeSelector<6, FlashAttentionSelectionCtx, FlashAttentionSelectedVariant>
+{
     ShapeSelector::new()
         .rule(
-            FlashAttentionSelectedVariant::DecodeSmall(DecodeBlock::Small),
+            FlashAttentionSelectedVariant::DecodeSmall(DECODE_SMALL_BLOCK),
             decode_shape_rule(
-                DecodeBlock::Small,
+                DECODE_SMALL_BLOCK,
                 Some(range(1..=DECODE_SMALL_BLOCK as usize)),
             ),
         )
         .rule(
-            FlashAttentionSelectedVariant::DecodeSmall(DecodeBlock::Medium),
+            FlashAttentionSelectedVariant::DecodeSmall(DECODE_MID_BLOCK),
             decode_shape_rule(
-                DecodeBlock::Medium,
+                DECODE_MID_BLOCK,
                 Some(range(
-                    (DECODE_SMALL_BLOCK as usize + 1)..=DECODE_MEDIUM_BLOCK as usize,
+                    (DECODE_SMALL_BLOCK as usize + 1)..=DECODE_MID_BLOCK as usize,
                 )),
             ),
         )
         .rule(
-            FlashAttentionSelectedVariant::DecodeSmall(DecodeBlock::Large),
+            FlashAttentionSelectedVariant::DecodeSmall(DECODE_MEDIUM_BLOCK),
             decode_shape_rule(
-                DecodeBlock::Large,
+                DECODE_MEDIUM_BLOCK,
+                Some(range(
+                    (DECODE_MID_BLOCK as usize + 1)..=DECODE_MEDIUM_BLOCK as usize,
+                )),
+            ),
+        )
+        .rule(
+            FlashAttentionSelectedVariant::DecodeSmall(DECODE_LARGE_BLOCK),
+            decode_shape_rule(
+                DECODE_LARGE_BLOCK,
                 Some(range(
                     (DECODE_MEDIUM_BLOCK as usize + 1)..=DECODE_LARGE_BLOCK as usize,
                 )),
             ),
         )
         .rule(
-            FlashAttentionSelectedVariant::DecodeSmall(DecodeBlock::Small),
-            decode_shape_rule(DecodeBlock::Small, None),
+            FlashAttentionSelectedVariant::DecodeSmall(DECODE_SMALL_BLOCK),
+            decode_shape_rule(DECODE_SMALL_BLOCK, None),
         )
         .rule(
-            FlashAttentionSelectedVariant::DecodeSmall(DecodeBlock::Medium),
-            decode_shape_rule(DecodeBlock::Medium, None),
+            FlashAttentionSelectedVariant::DecodeSmall(DECODE_MID_BLOCK),
+            decode_shape_rule(DECODE_MID_BLOCK, None),
         )
         .rule(
-            FlashAttentionSelectedVariant::DecodeSmall(DecodeBlock::Large),
-            decode_shape_rule(DecodeBlock::Large, None),
+            FlashAttentionSelectedVariant::DecodeSmall(DECODE_MEDIUM_BLOCK),
+            decode_shape_rule(DECODE_MEDIUM_BLOCK, None),
+        )
+        .rule(
+            FlashAttentionSelectedVariant::DecodeSmall(DECODE_LARGE_BLOCK),
+            decode_shape_rule(DECODE_LARGE_BLOCK, None),
         )
         .rule(FlashAttentionSelectedVariant::Streaming, ShapeRule::new())
 }
@@ -496,7 +480,7 @@ fn build_flash_decode_small_meta(
     {
         return None;
     }
-    let decode_block = choose_decode_block(dims.kv_seq_len, caps)?.size();
+    let decode_block = choose_decode_block(dims.kv_seq_len, caps)?;
     let tiled = dims.kv_seq_len > decode_block;
     let split_blocks = dims.kv_seq_len.div_ceil(decode_block);
 

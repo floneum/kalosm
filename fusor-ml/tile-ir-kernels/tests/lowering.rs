@@ -20,7 +20,7 @@ fn lower_or_fail(ir: &fusor_tile_ir::KernelIr, label: &str) -> NagaKernel {
 fn streaming_flash_attention_regression_shape_lowers_to_naga() {
     let layout = linear_storage_layout();
     let mut kb = KernelBuilder::<()>::new();
-    flash_attention::<F32, 32, ()>(
+    flash_attention::<F32, ()>(
         &mut kb,
         KernelTensorRef::new((), layout.clone()),
         KernelTensorRef::new((), layout.clone()),
@@ -45,6 +45,7 @@ fn streaming_flash_attention_regression_shape_lowers_to_naga() {
             dispatch_size: [16, 1536, 1],
             causal: false,
         },
+        32,
     )
     .expect("streaming flash attention should build");
     let (ir, _) = kb.finish();
@@ -94,7 +95,7 @@ fn qgemv_ir(format: GgmlQuantFormat, rows: u32, cols: u32) -> fusor_tile_ir::Ker
         let a = program.storage_read::<F32, 2>(Shape::new([1, rows]));
         let b = quantized_matrix(program, format, rows, cols);
         let y = program.storage_write::<F32, 2>(Shape::new([1, cols]));
-        qgemv_with_epilogue::<4, 64>(program, &a, &b, &y, 1, Option::<&UnaryEpilogue>::None);
+        qgemv_with_epilogue(program, &a, &b, &y, 1, Option::<&UnaryEpilogue>::None);
     })
 }
 
@@ -135,7 +136,7 @@ fn q4k_paired_epilogue_lowers() {
                 pair_cols,
                 m_rows: 1,
                 workgroups_x: 1,
-                shape: fusor_tile_ir_kernels::Q4KPairedShape::Ggml8x2_256,
+                shape: fusor_tile_ir_kernels::Q4KPairedShape::new(8, 2, 256),
                 epilogue: &epilogue,
                 extras: &[],
             },
@@ -150,7 +151,7 @@ fn scalar_qmatmul_lowers() {
         let a = program.storage_read::<F32, 2>(Shape::new([8, 256]));
         let b = quantized_matrix(program, GgmlQuantFormat::Q8_0, 256, 16);
         let y = program.storage_write::<F32, 2>(Shape::new([8, 16]));
-        qmatmul_with_epilogue::<8, 4, 8>(program, &a, &b, &y, 4, &QmatmulEpilogues::empty());
+        qmatmul_with_epilogue(program, &a, &b, &y, 4, &QmatmulEpilogues::empty(), 8, 4);
     });
     lower_or_fail(&ir, "scalar qmatmul");
 }
@@ -161,7 +162,7 @@ fn cooperative_qmatmul_lowers() {
         let a = program.storage_read::<F32, 2>(Shape::new([64, 256]));
         let b = quantized_matrix(program, GgmlQuantFormat::Q8_0, 256, 64);
         let y = program.storage_write::<F32, 2>(Shape::new([64, 64]));
-        qmatmul_with_epilogue::<64, 64, 32>(program, &a, &b, &y, 4, &QmatmulEpilogues::empty());
+        qmatmul_with_epilogue(program, &a, &b, &y, 4, &QmatmulEpilogues::empty(), 64, 64);
     });
     lower_or_fail(&ir, "cooperative qmatmul");
 }
@@ -178,7 +179,7 @@ fn batched_dense_f32_matmul_lowers() {
         let a = program.storage_read::<F32, 2>(Shape::new([shape.batch * shape.m, shape.k]));
         let b = program.storage_read::<F32, 2>(Shape::new([shape.batch * shape.k, shape.n]));
         let y = program.storage_write::<F32, 2>(Shape::new([shape.batch * shape.m, shape.n]));
-        batched_matmul_with_epilogues::<F32, 32, 32, 8>(
+        batched_matmul_with_epilogues::<F32>(
             program,
             &a,
             &b,
@@ -203,7 +204,7 @@ fn batched_dense_f32_gemv_lowers() {
         let a = program.storage_read::<F32, 2>(Shape::new([shape.batch * shape.m, shape.k]));
         let b = program.storage_read::<F32, 2>(Shape::new([shape.batch * shape.k, shape.n]));
         let y = program.storage_write::<F32, 2>(Shape::new([shape.batch * shape.m, shape.n]));
-        batched_gemv_with_epilogues::<F32, 4, 8, 128>(
+        batched_gemv_with_epilogues::<F32>(
             program,
             &a,
             &b,
@@ -231,7 +232,7 @@ fn batched_dense_f16_matmul_lowers() {
             .storage_read::<fusor_tile_ir::F16, 2>(Shape::new([shape.batch * shape.k, shape.n]));
         let y = program
             .storage_write::<fusor_tile_ir::F16, 2>(Shape::new([shape.batch * shape.m, shape.n]));
-        batched_matmul_with_epilogues::<fusor_tile_ir::F16, 32, 32, 8>(
+        batched_matmul_with_epilogues::<fusor_tile_ir::F16>(
             program,
             &a,
             &b,
@@ -259,7 +260,7 @@ fn batched_dense_f16_gemv_lowers() {
             .storage_read::<fusor_tile_ir::F16, 2>(Shape::new([shape.batch * shape.k, shape.n]));
         let y = program
             .storage_write::<fusor_tile_ir::F16, 2>(Shape::new([shape.batch * shape.m, shape.n]));
-        batched_gemv_with_epilogues::<fusor_tile_ir::F16, 4, 8, 128>(
+        batched_gemv_with_epilogues::<fusor_tile_ir::F16>(
             program,
             &a,
             &b,
@@ -284,7 +285,7 @@ fn cooperative_dense_f32_matmul_lowers() {
         let a = program.storage_read::<F32, 2>(Shape::new([shape.batch * shape.m, shape.k]));
         let b = program.storage_read::<F32, 2>(Shape::new([shape.batch * shape.k, shape.n]));
         let y = program.storage_write::<F32, 2>(Shape::new([shape.batch * shape.m, shape.n]));
-        assert!(try_batched_coop_matmul::<F32, 64, 64, 16>(
+        assert!(try_batched_coop_matmul::<F32>(
             program,
             &a,
             &b,
@@ -292,6 +293,9 @@ fn cooperative_dense_f32_matmul_lowers() {
             shape,
             &DenseMatmulEpilogues::empty(),
             65_535,
+            64,
+            64,
+            16,
         ));
     });
     lower_or_fail(&ir, "cooperative dense f32 matmul");
@@ -309,7 +313,7 @@ fn cooperative_dense_f16_matmul_lowers() {
         let a = program.storage_read::<F16, 2>(Shape::new([shape.batch * shape.m, shape.k]));
         let b = program.storage_read::<F16, 2>(Shape::new([shape.batch * shape.k, shape.n]));
         let y = program.storage_write::<F16, 2>(Shape::new([shape.batch * shape.m, shape.n]));
-        assert!(try_batched_coop_matmul::<F16, 64, 64, 16>(
+        assert!(try_batched_coop_matmul::<F16>(
             program,
             &a,
             &b,
@@ -317,6 +321,9 @@ fn cooperative_dense_f16_matmul_lowers() {
             shape,
             &DenseMatmulEpilogues::empty(),
             65_535,
+            64,
+            64,
+            16,
         ));
     });
     lower_or_fail(&ir, "cooperative dense f16 matmul");
@@ -334,7 +341,7 @@ fn cooperative_dense_f32_matmul_128x128_lowers() {
         let a = program.storage_read::<F32, 2>(Shape::new([shape.batch * shape.m, shape.k]));
         let b = program.storage_read::<F32, 2>(Shape::new([shape.batch * shape.k, shape.n]));
         let y = program.storage_write::<F32, 2>(Shape::new([shape.batch * shape.m, shape.n]));
-        assert!(try_batched_coop_matmul::<F32, 128, 128, 16>(
+        assert!(try_batched_coop_matmul::<F32>(
             program,
             &a,
             &b,
@@ -342,6 +349,9 @@ fn cooperative_dense_f32_matmul_128x128_lowers() {
             shape,
             &DenseMatmulEpilogues::empty(),
             65_535,
+            128,
+            128,
+            16,
         ));
     });
     lower_or_fail(&ir, "cooperative dense f32 128x128 matmul");
@@ -359,7 +369,7 @@ fn cooperative_dense_f32_matmul_128x64_lowers() {
         let a = program.storage_read::<F32, 2>(Shape::new([shape.batch * shape.m, shape.k]));
         let b = program.storage_read::<F32, 2>(Shape::new([shape.batch * shape.k, shape.n]));
         let y = program.storage_write::<F32, 2>(Shape::new([shape.batch * shape.m, shape.n]));
-        assert!(try_batched_coop_matmul::<F32, 128, 64, 16>(
+        assert!(try_batched_coop_matmul::<F32>(
             program,
             &a,
             &b,
@@ -367,6 +377,9 @@ fn cooperative_dense_f32_matmul_128x64_lowers() {
             shape,
             &DenseMatmulEpilogues::empty(),
             65_535,
+            128,
+            64,
+            16,
         ));
     });
     lower_or_fail(&ir, "cooperative dense f32 128x64 matmul");
@@ -386,7 +399,7 @@ fn cooperative_dense_f32_matmul_128x256_npass_lowers() {
         let a = program.storage_read::<F32, 2>(Shape::new([shape.batch * shape.m, shape.k]));
         let b = program.storage_read::<F32, 2>(Shape::new([shape.batch * shape.k, shape.n]));
         let y = program.storage_write::<F32, 2>(Shape::new([shape.batch * shape.m, shape.n]));
-        assert!(try_batched_coop_matmul::<F32, 128, 256, 16>(
+        assert!(try_batched_coop_matmul::<F32>(
             program,
             &a,
             &b,
@@ -394,6 +407,9 @@ fn cooperative_dense_f32_matmul_128x256_npass_lowers() {
             shape,
             &DenseMatmulEpilogues::empty(),
             65_535,
+            128,
+            256,
+            16,
         ));
     });
     lower_or_fail(&ir, "cooperative dense f32 128x256 N_PASSES=4 matmul");
@@ -430,7 +446,7 @@ fn qmatmul_epilogue_fallback_ir(post: Option<&UnaryEpilogue>) -> fusor_tile_ir::
             post_extra_inputs: &[],
             post_acc_init_col_vector: None,
         };
-        qmatmul_with_epilogue::<64, 64, 32>(program, &a, &b, &y, 4, &epilogues);
+        qmatmul_with_epilogue(program, &a, &b, &y, 4, &epilogues, 64, 64);
     })
 }
 
@@ -464,14 +480,7 @@ fn workgroup_qmatmul_lowers_without_subgroups() {
         let a = program.storage_read::<F32, 2>(Shape::new([32, 256]));
         let b = quantized_matrix(program, GgmlQuantFormat::Q8_0, 256, 32);
         let y = program.storage_write::<F32, 2>(Shape::new([32, 32]));
-        qmatmul_workgroup_with_epilogues::<32, 32, 8>(
-            program,
-            &a,
-            &b,
-            &y,
-            &QmatmulEpilogues::empty(),
-            65_535,
-        );
+        qmatmul_workgroup_with_epilogues(program, &a, &b, &y, &QmatmulEpilogues::empty(), 65_535);
     });
     let lowered = lower_or_fail(&ir, "workgroup qmatmul");
     assert!(
@@ -486,14 +495,7 @@ fn workgroup_qgemv_lowers_without_subgroups() {
         let a = program.storage_read::<F32, 2>(Shape::new([1, 256]));
         let b = quantized_matrix(program, GgmlQuantFormat::Q4K, 256, 128);
         let y = program.storage_write::<F32, 2>(Shape::new([1, 128]));
-        qgemv_workgroup_with_epilogue::<64, 8>(
-            program,
-            &a,
-            &b,
-            &y,
-            &QmatmulEpilogues::empty(),
-            65_535,
-        );
+        qgemv_workgroup_with_epilogue(program, &a, &b, &y, &QmatmulEpilogues::empty(), 65_535);
     });
     let lowered = lower_or_fail(&ir, "workgroup qgemv");
     assert!(

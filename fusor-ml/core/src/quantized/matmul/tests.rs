@@ -30,25 +30,25 @@ mod selection_tests {
         let q4 = tile_ir::GgmlQuantFormat::Q4_0;
         let cases = [
             (
-                QMatmulDirectVariant::Q5SmallSingleRow,
+                QMatmulPath::Q5SmallSingleRow,
                 ctx(tile_ir::GgmlQuantFormat::Q5_0, false),
                 caps(false),
             ),
-            (QMatmulDirectVariant::SingleRow, ctx(q4, false), caps(false)),
+            (QMatmulPath::SingleRow, ctx(q4, false), caps(false)),
             (
-                QMatmulDirectVariant::Q8Wide64x128,
+                QMatmulPath::Q8Wide(QCoopTile::new(64, 128)),
                 ctx(tile_ir::GgmlQuantFormat::Q8_0, false),
                 caps(true),
             ),
-            (QMatmulDirectVariant::Tile128x128, ctx(q4, true), caps(true)),
-            (QMatmulDirectVariant::Tile128x64, ctx(q4, true), caps(false)),
-            (QMatmulDirectVariant::Tile64x128, ctx(q4, true), caps(false)),
+            (QMatmulPath::Tile { tile: QCoopTile::new(128, 128), cached: false }, ctx(q4, true), caps(true)),
+            (QMatmulPath::Tile { tile: QCoopTile::new(128, 64), cached: false }, ctx(q4, true), caps(false)),
+            (QMatmulPath::Tile { tile: QCoopTile::new(64, 128), cached: false }, ctx(q4, true), caps(false)),
             (
-                QMatmulDirectVariant::Tile64x64Cached,
+                QMatmulPath::Tile { tile: QCoopTile::new(64, 64), cached: true },
                 ctx(q4, true),
                 caps(false),
             ),
-            (QMatmulDirectVariant::Tile64x64, ctx(q4, false), caps(false)),
+            (QMatmulPath::Tile { tile: QCoopTile::new(64, 64), cached: false }, ctx(q4, false), caps(false)),
         ];
         assert_selector_generates(&selector, cases);
     }
@@ -56,35 +56,35 @@ mod selection_tests {
     #[test]
     fn coop_acc_init_only_claims_shapes_the_coop_path_will_take() {
         assert!(qmatmul_variant_supports_coop_acc_init(
-            QMatmulDirectVariant::Tile64x128,
+            QMatmulPath::Tile { tile: QCoopTile::new(64, 128), cached: false },
             64,
             512,
             128,
             true,
         ));
         assert!(!qmatmul_variant_supports_coop_acc_init(
-            QMatmulDirectVariant::Tile64x128,
+            QMatmulPath::Tile { tile: QCoopTile::new(64, 128), cached: false },
             63,
             512,
             128,
             true,
         ));
         assert!(!qmatmul_variant_supports_coop_acc_init(
-            QMatmulDirectVariant::Tile64x64,
+            QMatmulPath::Tile { tile: QCoopTile::new(64, 64), cached: false },
             2,
             512,
             4,
             true,
         ));
         assert!(!qmatmul_variant_supports_coop_acc_init(
-            QMatmulDirectVariant::Tile64x128,
+            QMatmulPath::Tile { tile: QCoopTile::new(64, 128), cached: false },
             64,
             510,
             128,
             true,
         ));
         assert!(!qmatmul_variant_supports_coop_acc_init(
-            QMatmulDirectVariant::Tile64x128,
+            QMatmulPath::Tile { tile: QCoopTile::new(64, 128), cached: false },
             64,
             512,
             128,
@@ -92,70 +92,6 @@ mod selection_tests {
         ));
     }
 
-    #[test]
-    fn qgemv_cols_selector_generates_each_variant() {
-        let selector = qgemv_cols_selector();
-        let cases = [
-            (
-                QgemvColsVariant::Q4KSmallWide4,
-                QgemvColsCtx {
-                    format: tile_ir::GgmlQuantFormat::Q4K,
-                },
-            ),
-            (
-                QgemvColsVariant::Q4KSmallWide8,
-                QgemvColsCtx {
-                    format: tile_ir::GgmlQuantFormat::Q4K,
-                },
-            ),
-            (
-                QgemvColsVariant::Q4KLargeNarrow8,
-                QgemvColsCtx {
-                    format: tile_ir::GgmlQuantFormat::Q4K,
-                },
-            ),
-            (
-                QgemvColsVariant::Q6KSmallWide8,
-                QgemvColsCtx {
-                    format: tile_ir::GgmlQuantFormat::Q6K,
-                },
-            ),
-            (
-                QgemvColsVariant::Q6KLargeNarrow4,
-                QgemvColsCtx {
-                    format: tile_ir::GgmlQuantFormat::Q6K,
-                },
-            ),
-            (
-                QgemvColsVariant::Q8WideAccelerated32,
-                QgemvColsCtx {
-                    format: tile_ir::GgmlQuantFormat::Q8_0,
-                },
-            ),
-            (
-                QgemvColsVariant::FormatAccelerated,
-                QgemvColsCtx {
-                    format: tile_ir::GgmlQuantFormat::Q5_0,
-                },
-            ),
-            (
-                QgemvColsVariant::Q5Small8,
-                QgemvColsCtx {
-                    format: tile_ir::GgmlQuantFormat::Q5_0,
-                },
-            ),
-            (
-                QgemvColsVariant::Default4,
-                QgemvColsCtx {
-                    format: tile_ir::GgmlQuantFormat::Q4_0,
-                },
-            ),
-        ];
-        assert_selector_generates(
-            &selector,
-            cases.map(|(variant, ctx)| (variant, ctx, caps(false))),
-        );
-    }
 }
 
 #[cfg(test)]

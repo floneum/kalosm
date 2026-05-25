@@ -22,12 +22,12 @@ fn candle_gpu_device() -> Option<candle_core::Device> {
 
 const SIZES: [usize; 3] = [100, 1000, 4000];
 
-fn softmax_slow(tensor: &Tensor<2, f32>) -> Tensor<2, f32> {
-    let max = tensor.max_keepdim::<1>(1);
-    let shifted = tensor - &max;
+fn softmax_slow(tensor: &Tensor) -> Tensor {
+    let max = tensor.max_keepdim(1);
+    let shifted = tensor.sub_(&max);
     let exp = shifted.exp();
-    let sum = exp.sum_keepdim::<1>(1);
-    &exp / &sum
+    let sum = exp.sum_keepdim(1);
+    exp.div_(&sum)
 }
 
 fn bench_softmax(c: &mut Criterion) {
@@ -54,7 +54,7 @@ fn bench_softmax(c: &mut Criterion) {
                         while sum.is_zero() {
                             for _ in 0..iters {
                                 let tensor = Tensor::new(&device, &random_data);
-                                _ = tensor.as_slice().await.unwrap();
+                                _ = tensor.as_slice::<2, f32>().await.unwrap();
                                 let new = softmax_slow(&tensor);
                                 let start = std::time::Instant::now();
                                 new.materialize().await;
@@ -82,7 +82,7 @@ fn bench_softmax(c: &mut Criterion) {
                     while sum.is_zero() {
                         for _ in 0..iters {
                             let tensor = Tensor::new(&device, &random_data);
-                            _ = tensor.as_slice().await.unwrap();
+                            _ = tensor.as_slice::<2, f32>().await.unwrap();
                             let new = tensor.softmax_last_dim();
                             let start = std::time::Instant::now();
                             new.materialize().await;

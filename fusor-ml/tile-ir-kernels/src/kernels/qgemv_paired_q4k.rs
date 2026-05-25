@@ -8,45 +8,52 @@ use fusor_tile_ir::{
 use crate::grid::{q4k_ggml_iteration, q4k_lane_decomposition, Q4KGgmlIterationRequest};
 use crate::types::{matrix_shape, PairedEpilogue};
 
+/// Tile shape for `qgemv_q4k_paired_ggml::<BLOCK>(…)`. The kernel only
+/// monomorphizes on `block` (the workgroup-size literal); `subgroups` and
+/// `pairs_per_subgroup` ride along as runtime args, and `dots_per_subgroup`
+/// always equals `pairs_per_subgroup * 2`.
 #[derive(Copy, Clone, Debug, Hash, PartialEq, Eq)]
-pub enum Q4KPairedShape {
-    Ggml2x1_64,
-    Ggml2x2_64,
-    Ggml2x4_64,
-    Ggml4x1_128,
-    Ggml4x2_128,
-    Ggml4x4_128,
-    Ggml8x1_256,
-    Ggml8x2_256,
+pub struct Q4KPairedShape {
+    pub subgroups: u32,
+    pub pairs_per_subgroup: u32,
+    pub block: u32,
 }
 
 impl Q4KPairedShape {
-    const fn pairs_per_workgroup(self) -> u32 {
-        match self {
-            Self::Ggml2x1_64 => 2,
-            Self::Ggml2x2_64 => 4,
-            Self::Ggml2x4_64 => 8,
-            Self::Ggml4x1_128 => 4,
-            Self::Ggml4x2_128 => 8,
-            Self::Ggml4x4_128 => 16,
-            Self::Ggml8x1_256 => 8,
-            Self::Ggml8x2_256 => 16,
+    pub const fn new(subgroups: u32, pairs_per_subgroup: u32, block: u32) -> Self {
+        Self {
+            subgroups,
+            pairs_per_subgroup,
+            block,
         }
+    }
+
+    pub const fn pairs_per_workgroup(self) -> u32 {
+        self.subgroups * self.pairs_per_subgroup
     }
 }
 
+const Q4K_PAIRED_TILES: &[(&str, Q4KPairedShape)] = &[
+    ("ggml_2x1", Q4KPairedShape::new(2, 1, 64)),
+    ("ggml_2x2", Q4KPairedShape::new(2, 2, 64)),
+    ("ggml_2x4", Q4KPairedShape::new(2, 4, 64)),
+    ("ggml_4x1", Q4KPairedShape::new(4, 1, 128)),
+    ("ggml_4x2", Q4KPairedShape::new(4, 2, 128)),
+    ("ggml_4x4", Q4KPairedShape::new(4, 4, 128)),
+    ("ggml_8x1", Q4KPairedShape::new(8, 1, 256)),
+    ("ggml_8x2", Q4KPairedShape::new(8, 2, 256)),
+];
+
 fn q4k_paired_shape() -> Q4KPairedShape {
-    match std::env::var("FUSOR_Q4K_PAIRED_TILE").as_deref() {
-        Ok("ggml_2x1") => Q4KPairedShape::Ggml2x1_64,
-        Ok("ggml_2x2") => Q4KPairedShape::Ggml2x2_64,
-        Ok("ggml_2x4") => Q4KPairedShape::Ggml2x4_64,
-        Ok("ggml_4x1") => Q4KPairedShape::Ggml4x1_128,
-        Ok("ggml_4x2") => Q4KPairedShape::Ggml4x2_128,
-        Ok("ggml_4x4") => Q4KPairedShape::Ggml4x4_128,
-        Ok("ggml_8x1") => Q4KPairedShape::Ggml8x1_256,
-        Ok("ggml_8x2") => Q4KPairedShape::Ggml8x2_256,
-        _ => Q4KPairedShape::Ggml4x4_128,
-    }
+    const DEFAULT: Q4KPairedShape = Q4KPairedShape::new(4, 4, 128);
+    let Ok(value) = std::env::var("FUSOR_Q4K_PAIRED_TILE") else {
+        return DEFAULT;
+    };
+    Q4K_PAIRED_TILES
+        .iter()
+        .find(|(name, _)| *name == value)
+        .map(|(_, shape)| *shape)
+        .unwrap_or(DEFAULT)
 }
 
 /// Compute launch geometry for the paired Q4K GEMV kernel.
@@ -92,7 +99,7 @@ pub fn qgemv_q4k_paired_dispatch(
 ///             pair_cols: 4096,
 ///             m_rows: 1,
 ///             workgroups_x: 1,
-///             shape: Q4KPairedShape::Ggml8x2_256,
+///             shape: Q4KPairedShape::new(8, 2, 256),
 ///             epilogue: &epilogue,
 ///             extras: &[],
 ///         },
@@ -120,32 +127,22 @@ pub struct Q4KPairedGgml<'a> {
     pub extras: &'a [Storage<F32, 1>],
 }
 
-/// Build a Q4K paired-epilogue GEMV body.
+/// Build a Q4K paired-epilogue GEMV body. Dispatches on `shape.block` to the
+/// matching `program_grid::<BLOCK>` monomorphization; `subgroups` and
+/// `pairs_per_subgroup` pass through as runtime args.
 pub fn qgemv_q4k_paired(program: &mut Program, spec: Q4KPairedGgml<'_>) {
-    match spec.shape {
-        Q4KPairedShape::Ggml2x1_64 => qgemv_q4k_paired_ggml::<2, 1, 2, 64>(program, spec),
-        Q4KPairedShape::Ggml2x2_64 => qgemv_q4k_paired_ggml::<2, 2, 4, 64>(program, spec),
-        Q4KPairedShape::Ggml2x4_64 => qgemv_q4k_paired_ggml::<2, 4, 8, 64>(program, spec),
-        Q4KPairedShape::Ggml4x1_128 => qgemv_q4k_paired_ggml::<4, 1, 2, 128>(program, spec),
-        Q4KPairedShape::Ggml4x2_128 => qgemv_q4k_paired_ggml::<4, 2, 4, 128>(program, spec),
-        Q4KPairedShape::Ggml4x4_128 => qgemv_q4k_paired_ggml::<4, 4, 8, 128>(program, spec),
-        Q4KPairedShape::Ggml8x1_256 => qgemv_q4k_paired_ggml::<8, 1, 2, 256>(program, spec),
-        Q4KPairedShape::Ggml8x2_256 => qgemv_q4k_paired_ggml::<8, 2, 4, 256>(program, spec),
+    match spec.shape.block {
+        64 => qgemv_q4k_paired_ggml::<64>(program, spec),
+        128 => qgemv_q4k_paired_ggml::<128>(program, spec),
+        256 => qgemv_q4k_paired_ggml::<256>(program, spec),
+        other => panic!("unsupported Q4K paired qgemv BLOCK {other}"),
     }
 }
 
 /// Q4K paired-epilogue qgemv body. The kernel reduces the gate and up halves
 /// of a `[gate; up]` matmul output and applies the supplied `PairedEpilogue`
 /// in-register before the single output store.
-fn qgemv_q4k_paired_ggml<
-    const SUBGROUPS: u32,
-    const PAIRS_PER_SUBGROUP: usize,
-    const DOTS_PER_SUBGROUP: usize,
-    const BLOCK: usize,
->(
-    program: &mut Program,
-    spec: Q4KPairedGgml<'_>,
-) {
+fn qgemv_q4k_paired_ggml<const BLOCK: usize>(program: &mut Program, spec: Q4KPairedGgml<'_>) {
     let Q4KPairedGgml {
         a,
         b,
@@ -153,11 +150,15 @@ fn qgemv_q4k_paired_ggml<
         pair_cols,
         m_rows,
         workgroups_x,
-        shape: _,
+        shape,
         epilogue,
         extras,
     } = spec;
-    debug_assert_eq!(DOTS_PER_SUBGROUP, PAIRS_PER_SUBGROUP * 2);
+    let subgroups = shape.subgroups;
+    let pairs_per_subgroup = shape.pairs_per_subgroup;
+    let pairs_per_subgroup_usize = pairs_per_subgroup as usize;
+    let dots_per_subgroup_usize = pairs_per_subgroup_usize * 2;
+    debug_assert_eq!(shape.block as usize, BLOCK);
     debug_assert_eq!(
         extras.len(),
         epilogue.extras_count(),
@@ -167,7 +168,7 @@ fn qgemv_q4k_paired_ggml<
     debug_assert_eq!(b.cols, pair_cols * 2);
 
     let [_, k] = matrix_shape(&a.view().layout);
-    let cols_per_workgroup = SUBGROUPS * PAIRS_PER_SUBGROUP as u32;
+    let cols_per_workgroup = subgroups * pairs_per_subgroup;
     let cols_workgroups = pair_cols.div_ceil(cols_per_workgroup);
     let m_rows = m_rows.max(1);
     let total_workgroups = cols_workgroups * m_rows;
@@ -186,16 +187,16 @@ fn qgemv_q4k_paired_ggml<
         let col_workgroup = workgroup_idx % cols_workgroups;
         let row_in_bounds = row.clone().lt(m_rows);
         let col_group_base = col_workgroup * cols_per_workgroup;
-        let subgroup_col_base = program.subgroup_id() * PAIRS_PER_SUBGROUP as u32;
+        let subgroup_col_base = program.subgroup_id() * pairs_per_subgroup;
         let col0 = col_group_base + subgroup_col_base;
         let lane = program.subgroup_lane();
         let q4k_lane = q4k_lane_decomposition(&lane);
 
         let zero = TileLiteral::f32(0.0);
-        let sums: [Tile; DOTS_PER_SUBGROUP] = program.loop_fold_n::<DOTS_PER_SUBGROUP, _, _>(
+        let sums: Vec<Tile> = program.loop_fold_vec(
             TileReduceOp::Sum,
             block_iterations,
-            [zero; DOTS_PER_SUBGROUP],
+            vec![zero; dots_per_subgroup_usize],
             |program, loop_index| {
                 let pass = q4k_ggml_iteration(
                     program,
@@ -221,28 +222,30 @@ fn qgemv_q4k_paired_ggml<
                     ))
                 };
 
-                std::array::from_fn(|idx| {
-                    let offset = idx % PAIRS_PER_SUBGROUP;
-                    let gate = col0.clone() + offset as u32;
-                    let col = if idx < PAIRS_PER_SUBGROUP {
-                        gate.clone()
-                    } else {
-                        gate.clone() + pair_cols
-                    };
-                    let mask = if full_cols {
-                        pass.in_bounds.clone()
-                    } else {
-                        pass.in_bounds.clone().and(gate.lt(pair_cols))
-                    };
-                    dot(program, col, mask)
-                })
+                (0..dots_per_subgroup_usize)
+                    .map(|idx| {
+                        let offset = idx % pairs_per_subgroup_usize;
+                        let gate = col0.clone() + offset as u32;
+                        let col = if idx < pairs_per_subgroup_usize {
+                            gate.clone()
+                        } else {
+                            gate.clone() + pair_cols
+                        };
+                        let mask = if full_cols {
+                            pass.in_bounds.clone()
+                        } else {
+                            pass.in_bounds.clone().and(gate.lt(pair_cols))
+                        };
+                        dot(program, col, mask)
+                    })
+                    .collect()
             },
         );
 
-        for offset in 0..PAIRS_PER_SUBGROUP {
+        for offset in 0..pairs_per_subgroup_usize {
             let col = col0.clone() + offset as u32;
             let gate = program.subgroup_reduce_sum(sums[offset].clone());
-            let up = program.subgroup_reduce_sum(sums[offset + PAIRS_PER_SUBGROUP].clone());
+            let up = program.subgroup_reduce_sum(sums[offset + pairs_per_subgroup_usize].clone());
             let store_lane = if full_cols {
                 lane.eq(0)
             } else {

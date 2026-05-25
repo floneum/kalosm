@@ -1,10 +1,10 @@
-//! Shape-selection policy for kernel dispatch. Pure functions and enums.
+//! Shape-selection policy for kernel dispatch. Pure functions and shape keys.
 //!
 //! Const-generic monomorphization stays in the dispatch macros that consume
-//! these enums (see `kernels/qgemv.rs`). The
+//! these shape keys (see `kernels/qgemv.rs`). The
 //! compiler must see the const literals at the dispatch site to monomorphize,
-//! so this module never returns a runtime tile triple — it returns a
-//! ShapeKey enum, and a `match` in the builder picks the literal generic
+//! so this module returns a small shape key, and a `match` in the builder picks
+//! the literal generic
 //! arguments.
 //!
 //! The mapping from environment variables and `(rows, cols)` heuristics to
@@ -92,207 +92,157 @@ pub const fn qgemv_subgroups_per_workgroup_for_shape(
     }
 }
 
-/// Tile shape for `qgemv_q4k_ggml::<SUBGROUPS, COLS_PER_SUBGROUP, BLOCK>`.
-/// The `1x4_32` etc. tiles are only reachable through the Q4K large-tile
-/// override list; the default selection never emits them.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub(crate) enum QgemvShapeQ4K {
-    Ggml1x4_32,
-    Ggml1x8_32,
-    Ggml2x2_64,
-    Ggml2x3_64,
-    Ggml2x4_64,
-    Ggml2x8_64,
-    Ggml4x1_128,
-    Ggml4x2_128,
-    Ggml4x3_128,
-    Ggml4x4_128,
-    Ggml4x8_128,
-    Ggml8x1_256,
-    Ggml8x2_256,
-    Ggml8x4_256,
+pub(crate) struct QgemvShape {
+    pub subgroups: u32,
+    pub cols_per_subgroup: u32,
+    pub block: u32,
 }
 
-impl QgemvShapeQ4K {
-    const fn cols_per_workgroup(self) -> u32 {
-        match self {
-            Self::Ggml1x4_32 => 4,
-            Self::Ggml1x8_32 => 8,
-            Self::Ggml2x2_64 => 4,
-            Self::Ggml2x3_64 => 6,
-            Self::Ggml2x4_64 => 8,
-            Self::Ggml2x8_64 => 16,
-            Self::Ggml4x1_128 => 4,
-            Self::Ggml4x2_128 => 8,
-            Self::Ggml4x3_128 => 12,
-            Self::Ggml4x4_128 => 16,
-            Self::Ggml4x8_128 => 32,
-            Self::Ggml8x1_256 => 8,
-            Self::Ggml8x2_256 => 16,
-            Self::Ggml8x4_256 => 32,
+impl QgemvShape {
+    const fn new(subgroups: u32, cols_per_subgroup: u32, block: u32) -> Self {
+        Self {
+            subgroups,
+            cols_per_subgroup,
+            block,
         }
     }
-}
 
-/// Tile shape for `qgemv_q6k_ggml::<SUBGROUPS, COLS_PER_SUBGROUP, BLOCK>`.
-/// The Q6K override lists use the standard tile set (no 2x3/4x3, no
-/// 1x_/4x1/8x1 entries).
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub(crate) enum QgemvShapeQ6K {
-    Ggml2x2_64,
-    Ggml2x4_64,
-    Ggml2x8_64,
-    Ggml4x2_128,
-    Ggml4x4_128,
-    Ggml4x8_128,
-    Ggml8x2_256,
-    Ggml8x4_256,
-}
-
-impl QgemvShapeQ6K {
     const fn cols_per_workgroup(self) -> u32 {
-        match self {
-            Self::Ggml2x2_64 => 4,
-            Self::Ggml2x4_64 => 8,
-            Self::Ggml2x8_64 => 16,
-            Self::Ggml4x2_128 => 8,
-            Self::Ggml4x4_128 => 16,
-            Self::Ggml4x8_128 => 32,
-            Self::Ggml8x2_256 => 16,
-            Self::Ggml8x4_256 => 32,
-        }
+        self.subgroups * self.cols_per_subgroup
     }
 }
 
 // ----- Q4K mid (rows<=4096, 4096<=cols<8192) -----
 
 /// Default Q4K mid-shape: cols==5120 → 4x3, cols==6144 → 8x2, else 2x2.
-pub(crate) const fn q4k_default_mid(_rows: u32, cols: u32) -> QgemvShapeQ4K {
+pub(crate) const fn q4k_default_mid(_rows: u32, cols: u32) -> QgemvShape {
     if cols == 5120 {
-        return QgemvShapeQ4K::Ggml4x3_128;
+        return QgemvShape::new(4, 3, 128);
     }
     if cols == 6144 {
-        return QgemvShapeQ4K::Ggml8x2_256;
+        return QgemvShape::new(8, 2, 256);
     }
-    QgemvShapeQ4K::Ggml2x2_64
+    QgemvShape::new(2, 2, 64)
 }
 
 /// Apply `FUSOR_Q4K_MID_TILE` if set; otherwise return the default. The set
 /// of accepted env values is exactly the inline `qgemv_ggml_env!` table that
 /// used to live in `qgemv_tile`.
-pub(crate) fn q4k_mid_override(default: QgemvShapeQ4K) -> QgemvShapeQ4K {
-    match std::env::var("FUSOR_Q4K_MID_TILE").as_deref() {
-        Ok("ggml_2x2") => QgemvShapeQ4K::Ggml2x2_64,
-        Ok("ggml_2x3") => QgemvShapeQ4K::Ggml2x3_64,
-        Ok("ggml_2x4") => QgemvShapeQ4K::Ggml2x4_64,
-        Ok("ggml_2x8") => QgemvShapeQ4K::Ggml2x8_64,
-        Ok("ggml_4x2") => QgemvShapeQ4K::Ggml4x2_128,
-        Ok("ggml_4x3") => QgemvShapeQ4K::Ggml4x3_128,
-        Ok("ggml_4x4") => QgemvShapeQ4K::Ggml4x4_128,
-        Ok("ggml_4x8") => QgemvShapeQ4K::Ggml4x8_128,
-        Ok("ggml_8x2") => QgemvShapeQ4K::Ggml8x2_256,
-        Ok("ggml_8x4") => QgemvShapeQ4K::Ggml8x4_256,
-        _ => default,
-    }
+/// Per-context env override tables. Each entry maps an env-var token to the
+/// `QgemvShape` it selects. Different contexts (mid / large / tall, Q4K vs
+/// Q6K) accept different subsets of the 14 total shapes.
+const Q4K_MID_TILES: &[(&str, QgemvShape)] = &[
+    ("ggml_2x2", QgemvShape::new(2, 2, 64)),
+    ("ggml_2x3", QgemvShape::new(2, 3, 64)),
+    ("ggml_2x4", QgemvShape::new(2, 4, 64)),
+    ("ggml_2x8", QgemvShape::new(2, 8, 64)),
+    ("ggml_4x2", QgemvShape::new(4, 2, 128)),
+    ("ggml_4x3", QgemvShape::new(4, 3, 128)),
+    ("ggml_4x4", QgemvShape::new(4, 4, 128)),
+    ("ggml_4x8", QgemvShape::new(4, 8, 128)),
+    ("ggml_8x2", QgemvShape::new(8, 2, 256)),
+    ("ggml_8x4", QgemvShape::new(8, 4, 256)),
+];
+
+const Q4K_LARGE_TILES: &[(&str, QgemvShape)] = &[
+    ("ggml_1x4", QgemvShape::new(1, 4, 32)),
+    ("ggml_1x8", QgemvShape::new(1, 8, 32)),
+    ("ggml_2x2", QgemvShape::new(2, 2, 64)),
+    ("ggml_2x4", QgemvShape::new(2, 4, 64)),
+    ("ggml_2x8", QgemvShape::new(2, 8, 64)),
+    ("ggml_4x1", QgemvShape::new(4, 1, 128)),
+    ("ggml_4x2", QgemvShape::new(4, 2, 128)),
+    ("ggml_4x4", QgemvShape::new(4, 4, 128)),
+    ("ggml_4x8", QgemvShape::new(4, 8, 128)),
+    ("ggml_8x1", QgemvShape::new(8, 1, 256)),
+    ("ggml_8x2", QgemvShape::new(8, 2, 256)),
+    ("ggml_8x4", QgemvShape::new(8, 4, 256)),
+];
+
+const STANDARD_8_TILES: &[(&str, QgemvShape)] = &[
+    ("ggml_2x2", QgemvShape::new(2, 2, 64)),
+    ("ggml_2x4", QgemvShape::new(2, 4, 64)),
+    ("ggml_2x8", QgemvShape::new(2, 8, 64)),
+    ("ggml_4x2", QgemvShape::new(4, 2, 128)),
+    ("ggml_4x4", QgemvShape::new(4, 4, 128)),
+    ("ggml_4x8", QgemvShape::new(4, 8, 128)),
+    ("ggml_8x2", QgemvShape::new(8, 2, 256)),
+    ("ggml_8x4", QgemvShape::new(8, 4, 256)),
+];
+
+fn env_tile_override(var: &str, table: &[(&str, QgemvShape)], default: QgemvShape) -> QgemvShape {
+    let Ok(value) = std::env::var(var) else {
+        return default;
+    };
+    table
+        .iter()
+        .find(|(name, _)| *name == value)
+        .map(|(_, shape)| *shape)
+        .unwrap_or(default)
+}
+
+pub(crate) fn q4k_mid_override(default: QgemvShape) -> QgemvShape {
+    env_tile_override("FUSOR_Q4K_MID_TILE", Q4K_MID_TILES, default)
 }
 
 // ----- Q4K large (rows<=4096, cols>=8192) -----
 
 /// Default Q4K large-shape: cols<=16_384 → 8x4, else 2x4.
-pub(crate) const fn q4k_default_large(_rows: u32, cols: u32) -> QgemvShapeQ4K {
+pub(crate) const fn q4k_default_large(_rows: u32, cols: u32) -> QgemvShape {
     if cols <= 16_384 {
-        QgemvShapeQ4K::Ggml8x4_256
+        QgemvShape::new(8, 4, 256)
     } else {
-        QgemvShapeQ4K::Ggml2x4_64
+        QgemvShape::new(2, 4, 64)
     }
 }
 
 /// Apply `FUSOR_Q4K_LARGE_TILE` if set. Carries the same tile list as the
 /// inline macro: adds 1x4/1x8/4x1/8x1 (no 2x3/4x3 entries).
-pub(crate) fn q4k_large_override(default: QgemvShapeQ4K) -> QgemvShapeQ4K {
-    match std::env::var("FUSOR_Q4K_LARGE_TILE").as_deref() {
-        Ok("ggml_1x4") => QgemvShapeQ4K::Ggml1x4_32,
-        Ok("ggml_1x8") => QgemvShapeQ4K::Ggml1x8_32,
-        Ok("ggml_2x2") => QgemvShapeQ4K::Ggml2x2_64,
-        Ok("ggml_2x4") => QgemvShapeQ4K::Ggml2x4_64,
-        Ok("ggml_2x8") => QgemvShapeQ4K::Ggml2x8_64,
-        Ok("ggml_4x1") => QgemvShapeQ4K::Ggml4x1_128,
-        Ok("ggml_4x2") => QgemvShapeQ4K::Ggml4x2_128,
-        Ok("ggml_4x4") => QgemvShapeQ4K::Ggml4x4_128,
-        Ok("ggml_4x8") => QgemvShapeQ4K::Ggml4x8_128,
-        Ok("ggml_8x1") => QgemvShapeQ4K::Ggml8x1_256,
-        Ok("ggml_8x2") => QgemvShapeQ4K::Ggml8x2_256,
-        Ok("ggml_8x4") => QgemvShapeQ4K::Ggml8x4_256,
-        _ => default,
-    }
+pub(crate) fn q4k_large_override(default: QgemvShape) -> QgemvShape {
+    env_tile_override("FUSOR_Q4K_LARGE_TILE", Q4K_LARGE_TILES, default)
 }
 
 // ----- Q4K tall (rows>4096, cols<=4096) -----
 
 /// Default Q4K tall-shape: 4x2.
-pub(crate) const fn q4k_default_tall(_rows: u32, _cols: u32) -> QgemvShapeQ4K {
-    QgemvShapeQ4K::Ggml4x2_128
+pub(crate) const fn q4k_default_tall(_rows: u32, _cols: u32) -> QgemvShape {
+    QgemvShape::new(4, 2, 128)
 }
 
 /// Apply `FUSOR_Q4K_TALL_TILE` if set. Standard 8-tile set.
-pub(crate) fn q4k_tall_override(default: QgemvShapeQ4K) -> QgemvShapeQ4K {
-    match std::env::var("FUSOR_Q4K_TALL_TILE").as_deref() {
-        Ok("ggml_2x2") => QgemvShapeQ4K::Ggml2x2_64,
-        Ok("ggml_2x4") => QgemvShapeQ4K::Ggml2x4_64,
-        Ok("ggml_2x8") => QgemvShapeQ4K::Ggml2x8_64,
-        Ok("ggml_4x2") => QgemvShapeQ4K::Ggml4x2_128,
-        Ok("ggml_4x4") => QgemvShapeQ4K::Ggml4x4_128,
-        Ok("ggml_4x8") => QgemvShapeQ4K::Ggml4x8_128,
-        Ok("ggml_8x2") => QgemvShapeQ4K::Ggml8x2_256,
-        Ok("ggml_8x4") => QgemvShapeQ4K::Ggml8x4_256,
-        _ => default,
-    }
+pub(crate) fn q4k_tall_override(default: QgemvShape) -> QgemvShape {
+    env_tile_override("FUSOR_Q4K_TALL_TILE", STANDARD_8_TILES, default)
 }
 
 // ----- Q6K large (rows<=4096, cols>=8192) -----
 
 /// Default Q6K large-shape: cols<=16_384 → 2x2, else 2x4.
-pub(crate) const fn q6k_default_large(_rows: u32, cols: u32) -> QgemvShapeQ6K {
+pub(crate) const fn q6k_default_large(_rows: u32, cols: u32) -> QgemvShape {
     if cols <= 16_384 {
-        QgemvShapeQ6K::Ggml2x2_64
+        QgemvShape::new(2, 2, 64)
     } else {
-        QgemvShapeQ6K::Ggml2x4_64
+        QgemvShape::new(2, 4, 64)
     }
 }
 
 /// Apply `FUSOR_Q6K_LARGE_TILE` if set. Standard 8-tile set.
-pub(crate) fn q6k_large_override(default: QgemvShapeQ6K) -> QgemvShapeQ6K {
-    q6k_standard_override("FUSOR_Q6K_LARGE_TILE", default)
+pub(crate) fn q6k_large_override(default: QgemvShape) -> QgemvShape {
+    env_tile_override("FUSOR_Q6K_LARGE_TILE", STANDARD_8_TILES, default)
 }
 
 // ----- Q6K tall (rows>4096, cols<=4096) -----
 
 /// Default Q6K tall-shape: 2x2.
-pub(crate) const fn q6k_default_tall(_rows: u32, _cols: u32) -> QgemvShapeQ6K {
-    QgemvShapeQ6K::Ggml2x2_64
+pub(crate) const fn q6k_default_tall(_rows: u32, _cols: u32) -> QgemvShape {
+    QgemvShape::new(2, 2, 64)
 }
 
 /// Apply `FUSOR_Q6K_TALL_TILE` if set. Standard 8-tile set.
-pub(crate) fn q6k_tall_override(default: QgemvShapeQ6K) -> QgemvShapeQ6K {
-    q6k_standard_override("FUSOR_Q6K_TALL_TILE", default)
+pub(crate) fn q6k_tall_override(default: QgemvShape) -> QgemvShape {
+    env_tile_override("FUSOR_Q6K_TALL_TILE", STANDARD_8_TILES, default)
 }
 
-/// Q6K's "standard 8-tile set" override table. Both `q6k_large_override` and
-/// `q6k_tall_override` accept the same set of env values; the only difference
-/// is which env var name they read.
-fn q6k_standard_override(var: &str, default: QgemvShapeQ6K) -> QgemvShapeQ6K {
-    match std::env::var(var).as_deref() {
-        Ok("ggml_2x2") => QgemvShapeQ6K::Ggml2x2_64,
-        Ok("ggml_2x4") => QgemvShapeQ6K::Ggml2x4_64,
-        Ok("ggml_2x8") => QgemvShapeQ6K::Ggml2x8_64,
-        Ok("ggml_4x2") => QgemvShapeQ6K::Ggml4x2_128,
-        Ok("ggml_4x4") => QgemvShapeQ6K::Ggml4x4_128,
-        Ok("ggml_4x8") => QgemvShapeQ6K::Ggml4x8_128,
-        Ok("ggml_8x2") => QgemvShapeQ6K::Ggml8x2_256,
-        Ok("ggml_8x4") => QgemvShapeQ6K::Ggml8x4_256,
-        _ => default,
-    }
-}
 
 #[cfg(test)]
 mod tests {
@@ -337,66 +287,66 @@ mod tests {
     fn q4k_mid_default_unchanged() {
         // Uses the inline `if b.cols == 5120 / 6144` branches from
         // qgemv_tile (kernels/qgemv.rs).
-        assert_eq!(q4k_default_mid(4096, 4096), QgemvShapeQ4K::Ggml2x2_64);
-        assert_eq!(q4k_default_mid(4096, 5120), QgemvShapeQ4K::Ggml4x3_128);
-        assert_eq!(q4k_default_mid(4096, 6144), QgemvShapeQ4K::Ggml8x2_256);
-        assert_eq!(q4k_default_mid(2048, 7000), QgemvShapeQ4K::Ggml2x2_64);
+        assert_eq!(q4k_default_mid(4096, 4096), QgemvShape::new(2, 2, 64));
+        assert_eq!(q4k_default_mid(4096, 5120), QgemvShape::new(4, 3, 128));
+        assert_eq!(q4k_default_mid(4096, 6144), QgemvShape::new(8, 2, 256));
+        assert_eq!(q4k_default_mid(2048, 7000), QgemvShape::new(2, 2, 64));
     }
 
     #[test]
     fn q4k_large_default_selected() {
         // Uses the mid-size Q4K branch from kernels/qgemv.rs.
-        assert_eq!(q4k_default_large(4096, 8192), QgemvShapeQ4K::Ggml8x4_256);
-        assert_eq!(q4k_default_large(4096, 16_384), QgemvShapeQ4K::Ggml8x4_256);
-        assert_eq!(q4k_default_large(4096, 16_385), QgemvShapeQ4K::Ggml2x4_64);
-        assert_eq!(q4k_default_large(4096, 32_768), QgemvShapeQ4K::Ggml2x4_64);
+        assert_eq!(q4k_default_large(4096, 8192), QgemvShape::new(8, 4, 256));
+        assert_eq!(q4k_default_large(4096, 16_384), QgemvShape::new(8, 4, 256));
+        assert_eq!(q4k_default_large(4096, 16_385), QgemvShape::new(2, 4, 64));
+        assert_eq!(q4k_default_large(4096, 32_768), QgemvShape::new(2, 4, 64));
     }
 
     #[test]
     fn q4k_tall_default_unchanged() {
         // Constant 4x2 from kernels/qgemv.rs.
-        assert_eq!(q4k_default_tall(8192, 4096), QgemvShapeQ4K::Ggml4x2_128);
-        assert_eq!(q4k_default_tall(16_384, 2048), QgemvShapeQ4K::Ggml4x2_128);
+        assert_eq!(q4k_default_tall(8192, 4096), QgemvShape::new(4, 2, 128));
+        assert_eq!(q4k_default_tall(16_384, 2048), QgemvShape::new(4, 2, 128));
     }
 
     #[test]
     fn q6k_large_default_unchanged() {
         // Uses the large/tall Q6K branches from kernels/qgemv.rs.
-        assert_eq!(q6k_default_large(4096, 8192), QgemvShapeQ6K::Ggml2x2_64);
-        assert_eq!(q6k_default_large(4096, 16_384), QgemvShapeQ6K::Ggml2x2_64);
-        assert_eq!(q6k_default_large(4096, 16_385), QgemvShapeQ6K::Ggml2x4_64);
+        assert_eq!(q6k_default_large(4096, 8192), QgemvShape::new(2, 2, 64));
+        assert_eq!(q6k_default_large(4096, 16_384), QgemvShape::new(2, 2, 64));
+        assert_eq!(q6k_default_large(4096, 16_385), QgemvShape::new(2, 4, 64));
     }
 
     #[test]
     fn q6k_tall_default_unchanged() {
         // Constant 2x2 from kernels/qgemv.rs.
-        assert_eq!(q6k_default_tall(8192, 4096), QgemvShapeQ6K::Ggml2x2_64);
+        assert_eq!(q6k_default_tall(8192, 4096), QgemvShape::new(2, 2, 64));
     }
 
     #[test]
     fn q4k_mid_override_table_unchanged() {
         with_env("FUSOR_Q4K_MID_TILE", None, || {
             assert_eq!(
-                q4k_mid_override(QgemvShapeQ4K::Ggml2x2_64),
-                QgemvShapeQ4K::Ggml2x2_64
+                q4k_mid_override(QgemvShape::new(2, 2, 64)),
+                QgemvShape::new(2, 2, 64)
             );
         });
         let cases = [
-            ("ggml_2x2", QgemvShapeQ4K::Ggml2x2_64),
-            ("ggml_2x3", QgemvShapeQ4K::Ggml2x3_64),
-            ("ggml_2x4", QgemvShapeQ4K::Ggml2x4_64),
-            ("ggml_2x8", QgemvShapeQ4K::Ggml2x8_64),
-            ("ggml_4x2", QgemvShapeQ4K::Ggml4x2_128),
-            ("ggml_4x3", QgemvShapeQ4K::Ggml4x3_128),
-            ("ggml_4x4", QgemvShapeQ4K::Ggml4x4_128),
-            ("ggml_4x8", QgemvShapeQ4K::Ggml4x8_128),
-            ("ggml_8x2", QgemvShapeQ4K::Ggml8x2_256),
-            ("ggml_8x4", QgemvShapeQ4K::Ggml8x4_256),
+            ("ggml_2x2", QgemvShape::new(2, 2, 64)),
+            ("ggml_2x3", QgemvShape::new(2, 3, 64)),
+            ("ggml_2x4", QgemvShape::new(2, 4, 64)),
+            ("ggml_2x8", QgemvShape::new(2, 8, 64)),
+            ("ggml_4x2", QgemvShape::new(4, 2, 128)),
+            ("ggml_4x3", QgemvShape::new(4, 3, 128)),
+            ("ggml_4x4", QgemvShape::new(4, 4, 128)),
+            ("ggml_4x8", QgemvShape::new(4, 8, 128)),
+            ("ggml_8x2", QgemvShape::new(8, 2, 256)),
+            ("ggml_8x4", QgemvShape::new(8, 4, 256)),
         ];
         for (val, expect) in cases {
             with_env("FUSOR_Q4K_MID_TILE", Some(val), || {
                 assert_eq!(
-                    q4k_mid_override(QgemvShapeQ4K::Ggml4x4_128),
+                    q4k_mid_override(QgemvShape::new(4, 4, 128)),
                     expect,
                     "FUSOR_Q4K_MID_TILE={val}"
                 );
@@ -405,8 +355,8 @@ mod tests {
         // Unrecognized value falls through to default.
         with_env("FUSOR_Q4K_MID_TILE", Some("nonsense"), || {
             assert_eq!(
-                q4k_mid_override(QgemvShapeQ4K::Ggml4x4_128),
-                QgemvShapeQ4K::Ggml4x4_128
+                q4k_mid_override(QgemvShape::new(4, 4, 128)),
+                QgemvShape::new(4, 4, 128)
             );
         });
     }
@@ -414,23 +364,23 @@ mod tests {
     #[test]
     fn q4k_large_override_table_unchanged() {
         let cases = [
-            ("ggml_1x4", QgemvShapeQ4K::Ggml1x4_32),
-            ("ggml_1x8", QgemvShapeQ4K::Ggml1x8_32),
-            ("ggml_2x2", QgemvShapeQ4K::Ggml2x2_64),
-            ("ggml_2x4", QgemvShapeQ4K::Ggml2x4_64),
-            ("ggml_2x8", QgemvShapeQ4K::Ggml2x8_64),
-            ("ggml_4x1", QgemvShapeQ4K::Ggml4x1_128),
-            ("ggml_4x2", QgemvShapeQ4K::Ggml4x2_128),
-            ("ggml_4x4", QgemvShapeQ4K::Ggml4x4_128),
-            ("ggml_4x8", QgemvShapeQ4K::Ggml4x8_128),
-            ("ggml_8x1", QgemvShapeQ4K::Ggml8x1_256),
-            ("ggml_8x2", QgemvShapeQ4K::Ggml8x2_256),
-            ("ggml_8x4", QgemvShapeQ4K::Ggml8x4_256),
+            ("ggml_1x4", QgemvShape::new(1, 4, 32)),
+            ("ggml_1x8", QgemvShape::new(1, 8, 32)),
+            ("ggml_2x2", QgemvShape::new(2, 2, 64)),
+            ("ggml_2x4", QgemvShape::new(2, 4, 64)),
+            ("ggml_2x8", QgemvShape::new(2, 8, 64)),
+            ("ggml_4x1", QgemvShape::new(4, 1, 128)),
+            ("ggml_4x2", QgemvShape::new(4, 2, 128)),
+            ("ggml_4x4", QgemvShape::new(4, 4, 128)),
+            ("ggml_4x8", QgemvShape::new(4, 8, 128)),
+            ("ggml_8x1", QgemvShape::new(8, 1, 256)),
+            ("ggml_8x2", QgemvShape::new(8, 2, 256)),
+            ("ggml_8x4", QgemvShape::new(8, 4, 256)),
         ];
         for (val, expect) in cases {
             with_env("FUSOR_Q4K_LARGE_TILE", Some(val), || {
                 assert_eq!(
-                    q4k_large_override(QgemvShapeQ4K::Ggml4x4_128),
+                    q4k_large_override(QgemvShape::new(4, 4, 128)),
                     expect,
                     "FUSOR_Q4K_LARGE_TILE={val}"
                 );
@@ -441,19 +391,19 @@ mod tests {
     #[test]
     fn q4k_tall_override_table_unchanged() {
         let cases = [
-            ("ggml_2x2", QgemvShapeQ4K::Ggml2x2_64),
-            ("ggml_2x4", QgemvShapeQ4K::Ggml2x4_64),
-            ("ggml_2x8", QgemvShapeQ4K::Ggml2x8_64),
-            ("ggml_4x2", QgemvShapeQ4K::Ggml4x2_128),
-            ("ggml_4x4", QgemvShapeQ4K::Ggml4x4_128),
-            ("ggml_4x8", QgemvShapeQ4K::Ggml4x8_128),
-            ("ggml_8x2", QgemvShapeQ4K::Ggml8x2_256),
-            ("ggml_8x4", QgemvShapeQ4K::Ggml8x4_256),
+            ("ggml_2x2", QgemvShape::new(2, 2, 64)),
+            ("ggml_2x4", QgemvShape::new(2, 4, 64)),
+            ("ggml_2x8", QgemvShape::new(2, 8, 64)),
+            ("ggml_4x2", QgemvShape::new(4, 2, 128)),
+            ("ggml_4x4", QgemvShape::new(4, 4, 128)),
+            ("ggml_4x8", QgemvShape::new(4, 8, 128)),
+            ("ggml_8x2", QgemvShape::new(8, 2, 256)),
+            ("ggml_8x4", QgemvShape::new(8, 4, 256)),
         ];
         for (val, expect) in cases {
             with_env("FUSOR_Q4K_TALL_TILE", Some(val), || {
                 assert_eq!(
-                    q4k_tall_override(QgemvShapeQ4K::Ggml4x2_128),
+                    q4k_tall_override(QgemvShape::new(4, 2, 128)),
                     expect,
                     "FUSOR_Q4K_TALL_TILE={val}"
                 );
@@ -464,19 +414,19 @@ mod tests {
     #[test]
     fn q6k_large_override_table_unchanged() {
         let cases = [
-            ("ggml_2x2", QgemvShapeQ6K::Ggml2x2_64),
-            ("ggml_2x4", QgemvShapeQ6K::Ggml2x4_64),
-            ("ggml_2x8", QgemvShapeQ6K::Ggml2x8_64),
-            ("ggml_4x2", QgemvShapeQ6K::Ggml4x2_128),
-            ("ggml_4x4", QgemvShapeQ6K::Ggml4x4_128),
-            ("ggml_4x8", QgemvShapeQ6K::Ggml4x8_128),
-            ("ggml_8x2", QgemvShapeQ6K::Ggml8x2_256),
-            ("ggml_8x4", QgemvShapeQ6K::Ggml8x4_256),
+            ("ggml_2x2", QgemvShape::new(2, 2, 64)),
+            ("ggml_2x4", QgemvShape::new(2, 4, 64)),
+            ("ggml_2x8", QgemvShape::new(2, 8, 64)),
+            ("ggml_4x2", QgemvShape::new(4, 2, 128)),
+            ("ggml_4x4", QgemvShape::new(4, 4, 128)),
+            ("ggml_4x8", QgemvShape::new(4, 8, 128)),
+            ("ggml_8x2", QgemvShape::new(8, 2, 256)),
+            ("ggml_8x4", QgemvShape::new(8, 4, 256)),
         ];
         for (val, expect) in cases {
             with_env("FUSOR_Q6K_LARGE_TILE", Some(val), || {
                 assert_eq!(
-                    q6k_large_override(QgemvShapeQ6K::Ggml2x2_64),
+                    q6k_large_override(QgemvShape::new(2, 2, 64)),
                     expect,
                     "FUSOR_Q6K_LARGE_TILE={val}"
                 );
@@ -487,19 +437,19 @@ mod tests {
     #[test]
     fn q6k_tall_override_table_unchanged() {
         let cases = [
-            ("ggml_2x2", QgemvShapeQ6K::Ggml2x2_64),
-            ("ggml_2x4", QgemvShapeQ6K::Ggml2x4_64),
-            ("ggml_2x8", QgemvShapeQ6K::Ggml2x8_64),
-            ("ggml_4x2", QgemvShapeQ6K::Ggml4x2_128),
-            ("ggml_4x4", QgemvShapeQ6K::Ggml4x4_128),
-            ("ggml_4x8", QgemvShapeQ6K::Ggml4x8_128),
-            ("ggml_8x2", QgemvShapeQ6K::Ggml8x2_256),
-            ("ggml_8x4", QgemvShapeQ6K::Ggml8x4_256),
+            ("ggml_2x2", QgemvShape::new(2, 2, 64)),
+            ("ggml_2x4", QgemvShape::new(2, 4, 64)),
+            ("ggml_2x8", QgemvShape::new(2, 8, 64)),
+            ("ggml_4x2", QgemvShape::new(4, 2, 128)),
+            ("ggml_4x4", QgemvShape::new(4, 4, 128)),
+            ("ggml_4x8", QgemvShape::new(4, 8, 128)),
+            ("ggml_8x2", QgemvShape::new(8, 2, 256)),
+            ("ggml_8x4", QgemvShape::new(8, 4, 256)),
         ];
         for (val, expect) in cases {
             with_env("FUSOR_Q6K_TALL_TILE", Some(val), || {
                 assert_eq!(
-                    q6k_tall_override(QgemvShapeQ6K::Ggml2x2_64),
+                    q6k_tall_override(QgemvShape::new(2, 2, 64)),
                     expect,
                     "FUSOR_Q6K_TALL_TILE={val}"
                 );

@@ -187,7 +187,7 @@ impl QMatMulOperation {
             None
         } else {
             match variant {
-                QMatmulDirectVariant::Q5SmallSingleRow | QMatmulDirectVariant::SingleRow => {
+                QMatmulPath::Q5SmallSingleRow | QMatmulPath::SingleRow => {
                     let qgemv_cols_per_workgroup =
                         qgemv_cols_per_workgroup_for_direct(format, k, n);
                     let qgemv_workgroups = n.div_ceil(qgemv_cols_per_workgroup);
@@ -199,13 +199,13 @@ impl QMatMulOperation {
                         1,
                     ])
                 }
-                QMatmulDirectVariant::Q8Wide64x128 => Some([n / 128, m / 64, 1]),
-                QMatmulDirectVariant::Tile128x128 => Some([n / 128, m / 128, 1]),
-                QMatmulDirectVariant::Tile128x64 => Some([n / 64, m / 128, 1]),
-                QMatmulDirectVariant::Tile64x128 => Some([n / 128, m / 64, 1]),
-                QMatmulDirectVariant::Tile64x64Cached => Some([n / 64, m / 64, 1]),
-                QMatmulDirectVariant::Tile64x32 => Some([n / 32, m / 64, 1]),
-                QMatmulDirectVariant::Tile64x64 => None,
+                // The IR-build fallback (cached=false catch-all) is the only
+                // path that defers the dispatch to the IR builder; every
+                // tile-aligned coop variant has a precomputed `[n/BN, m/BM, 1]`.
+                QMatmulPath::Tile { cached: false, tile } if tile == QCoopTile::new(64, 64) => None,
+                QMatmulPath::Q8Wide(tile) | QMatmulPath::Tile { tile, .. } => {
+                    Some([n / tile.bn, m / tile.bm, 1])
+                }
             }
         };
         let kernel_name = kernel_name.into();
@@ -343,7 +343,7 @@ impl QMatMulOperation {
             };
             if use_workgroup_qmatmul {
                 if m == 1 {
-                    tile_ir_kernels::qgemv_workgroup_with_epilogue::<64, 8>(
+                    tile_ir_kernels::qgemv_workgroup_with_epilogue(
                         phase,
                         &a,
                         &b,
@@ -352,7 +352,7 @@ impl QMatMulOperation {
                         max_workgroups,
                     );
                 } else {
-                    tile_ir_kernels::qmatmul_workgroup_with_epilogues::<32, 32, 8>(
+                    tile_ir_kernels::qmatmul_workgroup_with_epilogues(
                         phase,
                         &a,
                         &b,
@@ -363,9 +363,13 @@ impl QMatMulOperation {
                 }
                 return;
             }
-            match variant {
-                QMatmulDirectVariant::Q5SmallSingleRow => {
-                    tile_ir_kernels::qgemv_with_epilogue::<8, 32>(
+            // Map the selected variant to its (BM, BN) cooperative tile
+            // dimensions. The first two single-row variants short-circuit to
+            // qgemv; the rest share the qmatmul_with_epilogue entry point.
+            // (BK is pinned to 32 inside the coop dispatcher.)
+            let tile = match variant {
+                QMatmulPath::Q5SmallSingleRow | QMatmulPath::SingleRow => {
+                    tile_ir_kernels::qgemv_with_epilogue(
                         phase,
                         &a,
                         &b,
@@ -373,48 +377,13 @@ impl QMatMulOperation {
                         qmatmul_workgroups_x,
                         &epilogues,
                     );
+                    return;
                 }
-                QMatmulDirectVariant::SingleRow => {
-                    tile_ir_kernels::qgemv_with_epilogue::<4, 64>(
-                        phase,
-                        &a,
-                        &b,
-                        &y,
-                        qmatmul_workgroups_x,
-                        &epilogues,
-                    );
-                }
-                QMatmulDirectVariant::Q8Wide64x128 | QMatmulDirectVariant::Tile64x128 => {
-                    tile_ir_kernels::qmatmul_with_epilogue::<64, 128, 32>(
-                        phase, &a, &b, &y, 4, &epilogues,
-                    );
-                }
-                QMatmulDirectVariant::Tile128x128 => {
-                    tile_ir_kernels::qmatmul_with_epilogue::<128, 128, 32>(
-                        phase, &a, &b, &y, 4, &epilogues,
-                    );
-                }
-                QMatmulDirectVariant::Tile128x64 => {
-                    tile_ir_kernels::qmatmul_with_epilogue::<128, 64, 32>(
-                        phase, &a, &b, &y, 4, &epilogues,
-                    );
-                }
-                QMatmulDirectVariant::Tile64x64Cached => {
-                    tile_ir_kernels::qmatmul_with_epilogue::<64, 64, 32>(
-                        phase, &a, &b, &y, 4, &epilogues,
-                    );
-                }
-                QMatmulDirectVariant::Tile64x32 => {
-                    tile_ir_kernels::qmatmul_with_epilogue::<64, 32, 32>(
-                        phase, &a, &b, &y, 4, &epilogues,
-                    );
-                }
-                QMatmulDirectVariant::Tile64x64 => {
-                    tile_ir_kernels::qmatmul_with_epilogue::<64, 64, 32>(
-                        phase, &a, &b, &y, 4, &epilogues,
-                    );
-                }
-            }
+                QMatmulPath::Q8Wide(tile) | QMatmulPath::Tile { tile, .. } => tile,
+            };
+            tile_ir_kernels::qmatmul_with_epilogue(
+                phase, &a, &b, &y, 4, &epilogues, tile.bm, tile.bn,
+            );
         });
         let dispatch_size = ir.body().grid;
         if dispatch_size.iter().any(|dim| *dim > max_workgroups) {

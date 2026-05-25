@@ -1,4 +1,4 @@
-use fusor_tile_ir::{TileLiteral, TileReduceOp, Vector, WorkgroupAxis, F32};
+use fusor_tile_ir::{F32, TileLiteral, TileReduceOp, Vector, WorkgroupAxis};
 
 use super::types::RmsNormVec4Meta;
 use fusor_tile_ir::tile::Tile;
@@ -125,7 +125,7 @@ pub fn rms_norm_vec4<B>(
                 program.vector_dot::<F32, 4>(value.clone(), value)
             },
         );
-        let total_sum = program.group_reduce_sum::<RMS_NORM_VEC4_BLOCK, _>(partial_sum);
+        let total_sum = program.group_reduce_sum(RMS_NORM_VEC4_BLOCK as u32, partial_sum);
         let mean = total_sum / Tile::literal(TileLiteral::f32(meta.cols as f32));
         let scale = (mean + Tile::literal(TileLiteral::f32(eps))).inverse_sqrt();
         let scale = program.bind(scale);

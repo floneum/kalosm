@@ -23,11 +23,11 @@
 //!   body uses 1x1.
 
 use fusor_tile_ir::tile::{Mask, Program, Storage, Tile, TileBlock, Workgroup};
-use fusor_tile_ir::{QuantizedMatrix, TileLiteral, TileReduceOp, WorkgroupAxis, F32, U32};
+use fusor_tile_ir::{F32, QuantizedMatrix, TileLiteral, TileReduceOp, U32, WorkgroupAxis};
 
 use crate::kernels::helpers::{dispatch_grid_1d, load_qmatmul_extra};
 use crate::types::{
-    apply_qmatmul_post_epilogue, apply_qmatmul_pre_epilogue, matrix_shape, QmatmulEpilogues,
+    QmatmulEpilogues, apply_qmatmul_post_epilogue, apply_qmatmul_pre_epilogue, matrix_shape,
 };
 
 const QMATMUL_LANES: usize = 64;
@@ -44,7 +44,7 @@ const QGEMV_TN: usize = 1;
 /// (qgemv passes a 1xBK tile to a 64-lane workgroup; the unused lanes
 /// would otherwise corrupt adjacent workgroup memory).
 #[allow(clippy::too_many_arguments)]
-fn stage_f32_tile_with_pre<const ROWS: usize, const COLS: usize, const LANES: usize>(
+fn stage_f32_tile_with_pre(
     program: &mut TileBlock<'_>,
     dst: Workgroup<F32>,
     src: &Storage<F32, 2>,
@@ -54,13 +54,16 @@ fn stage_f32_tile_with_pre<const ROWS: usize, const COLS: usize, const LANES: us
     src_rows: u32,
     src_cols: u32,
     epilogues: &QmatmulEpilogues<'_>,
+    rows: u32,
+    cols: u32,
+    lanes: u32,
 ) {
-    let tile_elements = (ROWS * COLS) as u32;
-    let passes = (ROWS * COLS).div_ceil(LANES);
+    let tile_elements = rows * cols;
+    let passes = (rows * cols).div_ceil(lanes);
     for pass in 0..passes {
-        let flat = program.lane() + (pass * LANES) as u32;
-        let local_row = flat.clone() / COLS as u32;
-        let local_col = flat.clone() % COLS as u32;
+        let flat = program.lane() + pass * lanes;
+        let local_row = flat.clone() / cols;
+        let local_col = flat.clone() % cols;
         let global_row = row_base.clone() + local_row.clone();
         let global_col = col_base.clone() + local_col.clone();
         let within_tile = flat.clone().lt(tile_elements);
@@ -99,30 +102,27 @@ fn stage_f32_tile_with_pre<const ROWS: usize, const COLS: usize, const LANES: us
 ///
 /// Layout: `A_tile` is row-major `BM x BK` (index = row*BK + k), `B_tile` is
 /// row-major `BK x BN` (index = k*BN + col).
-fn accumulate_register_tile_from_workgroup<
-    const BN: usize,
-    const BK: usize,
-    const TM: usize,
-    const TN: usize,
->(
+fn accumulate_register_tile_from_workgroup(
     program: &mut TileBlock<'_>,
     a_tile: Workgroup<F32>,
     b_tile: Workgroup<F32>,
     lane_row: &Tile<U32>,
     lane_col: &Tile<U32>,
+    bn: u32,
+    bk: u32,
+    tm: u32,
+    tn: u32,
 ) -> Vec<Tile> {
-    (0..TM * TN)
+    (0..tm * tn)
         .map(|idx| {
-            let r = idx / TN;
-            let c = idx % TN;
-            let local_row = lane_row.clone() * TM as u32 + r as u32;
-            let local_col = lane_col.clone() * TN as u32 + c as u32;
+            let r = idx / tn;
+            let c = idx % tn;
+            let local_row = lane_row.clone() * tm + r;
+            let local_col = lane_col.clone() * tn + c;
             let mut sum = Tile::literal(TileLiteral::f32(0.0));
-            for kk in 0..BK {
-                let a_value =
-                    program.load_workgroup(a_tile, local_row.clone() * BK as u32 + kk as u32);
-                let b_value =
-                    program.load_workgroup(b_tile, local_col.clone() + kk as u32 * BN as u32);
+            for kk in 0..bk {
+                let a_value = program.load_workgroup(a_tile, local_row.clone() * bk + kk);
+                let b_value = program.load_workgroup(b_tile, local_col.clone() + kk * bn);
                 sum = sum + a_value * b_value;
             }
             sum
@@ -137,7 +137,7 @@ fn accumulate_register_tile_from_workgroup<
 ///
 /// `BM` and `BN` must equal 32 (matches the `4x4` register tile across 64
 /// lanes). `BK` is the K-axis staging chunk.
-pub fn qmatmul_workgroup_with_epilogues<const BM: usize, const BN: usize, const BK: usize>(
+pub fn qmatmul_workgroup_with_epilogues(
     program: &mut Program,
     a: &Storage<F32, 2>,
     b: &QuantizedMatrix,
@@ -145,12 +145,12 @@ pub fn qmatmul_workgroup_with_epilogues<const BM: usize, const BN: usize, const 
     epilogues: &QmatmulEpilogues<'_>,
     max_workgroups_per_dimension: u32,
 ) {
-    assert!(
-        BM > 0 && BN > 0 && BK > 0,
-        "qmatmul tile shape must be non-zero"
-    );
-    assert_eq!(BM, 32, "workgroup-tiled qmatmul currently expects BM=32");
-    assert_eq!(BN, 32, "workgroup-tiled qmatmul currently expects BN=32");
+    // BM/BN are pinned to the 4x4-register-tile geometry across QMATMUL_LANES.
+    // BK is the K-axis staging chunk per pass.
+    const BM: u32 = 32;
+    const BN: u32 = 32;
+    const BK: u32 = 8;
+    let bk = BK;
 
     let [m, k] = matrix_shape(&a.view().layout);
     let n = b.cols;
@@ -159,13 +159,13 @@ pub fn qmatmul_workgroup_with_epilogues<const BM: usize, const BN: usize, const 
     assert_eq!(m, y_m, "qmatmul output row count must match A");
     assert_eq!(n, y_n, "qmatmul output column count must match B");
 
-    let tiles_m = m.div_ceil(BM as u32);
-    let tiles_n = n.div_ceil(BN as u32);
+    let tiles_m = m.div_ceil(BM);
+    let tiles_n = n.div_ceil(BN);
     let total_tiles = tiles_m * tiles_n;
-    let k_tiles = k.div_ceil(BK as u32);
+    let k_tiles = k.div_ceil(bk);
     let grid = dispatch_grid_1d(total_tiles, max_workgroups_per_dimension);
-    let a_tile = program.alloc_workgroup_tile_f32(BM as u32, BK as u32);
-    let b_tile = program.alloc_workgroup_tile_f32(BK as u32, BN as u32);
+    let a_tile = program.alloc_workgroup_tile_f32(BM, bk);
+    let b_tile = program.alloc_workgroup_tile_f32(bk, BN);
     let b_clone = b.clone();
 
     program.program_grid::<QMATMUL_LANES>(grid, |program| {
@@ -177,10 +177,10 @@ pub fn qmatmul_workgroup_with_epilogues<const BM: usize, const BN: usize, const 
         let n_tile = tile_id % tiles_n;
 
         let lane = program.lane();
-        let lane_row = lane.clone() / (BN as u32 / QMATMUL_TN as u32);
-        let lane_col = lane % (BN as u32 / QMATMUL_TN as u32);
-        let m_tile_base = m_tile * BM as u32;
-        let n_tile_base = n_tile * BN as u32;
+        let lane_row = lane.clone() / (BN / QMATMUL_TN as u32);
+        let lane_col = lane % (BN / QMATMUL_TN as u32);
+        let m_tile_base = m_tile * BM;
+        let n_tile_base = n_tile * BN;
         let row_base = m_tile_base.clone() + lane_row.clone() * QMATMUL_TM as u32;
         let col_base = n_tile_base.clone() + lane_col.clone() * QMATMUL_TN as u32;
 
@@ -190,8 +190,8 @@ pub fn qmatmul_workgroup_with_epilogues<const BM: usize, const BN: usize, const 
                 k_tiles,
                 [TileLiteral::f32(0.0); QMATMUL_TM * QMATMUL_TN],
                 |program, k_tile| {
-                    let k_base = k_tile * BK as u32;
-                    stage_f32_tile_with_pre::<BM, BK, QMATMUL_LANES>(
+                    let k_base = k_tile * bk;
+                    stage_f32_tile_with_pre(
                         program,
                         a_tile,
                         a,
@@ -201,14 +201,24 @@ pub fn qmatmul_workgroup_with_epilogues<const BM: usize, const BN: usize, const 
                         m,
                         k,
                         epilogues,
+                        BM,
+                        bk,
+                        QMATMUL_LANES as u32,
                     );
                     program.copy_quant_to_tile(b_tile, &b_clone, &k_base, &n_tile_base);
                     program.workgroup_barrier();
 
-                    let chunk_vec =
-                        accumulate_register_tile_from_workgroup::<BN, BK, QMATMUL_TM, QMATMUL_TN>(
-                            program, a_tile, b_tile, &lane_row, &lane_col,
-                        );
+                    let chunk_vec = accumulate_register_tile_from_workgroup(
+                        program,
+                        a_tile,
+                        b_tile,
+                        &lane_row,
+                        &lane_col,
+                        BN,
+                        bk,
+                        QMATMUL_TM as u32,
+                        QMATMUL_TN as u32,
+                    );
                     let mut chunk_iter = chunk_vec.into_iter();
                     let chunk: [Tile; QMATMUL_TM * QMATMUL_TN] = std::array::from_fn(|_| {
                         program.bind(chunk_iter.next().expect("register tile size matches"))
@@ -242,7 +252,7 @@ pub fn qmatmul_workgroup_with_epilogues<const BM: usize, const BN: usize, const 
 /// All `QGEMV_LANES` lanes fan out across the BN columns of one output tile.
 /// Stages A's single row into workgroup memory and reuses
 /// [`accumulate_register_tile_from_workgroup`] with `TM = 1`, `TN = 1`.
-pub fn qgemv_workgroup_with_epilogue<const BN: usize, const BK: usize>(
+pub fn qgemv_workgroup_with_epilogue(
     program: &mut Program,
     a: &Storage<F32, 2>,
     b: &QuantizedMatrix,
@@ -250,11 +260,11 @@ pub fn qgemv_workgroup_with_epilogue<const BN: usize, const BK: usize>(
     epilogues: &QmatmulEpilogues<'_>,
     max_workgroups_per_dimension: u32,
 ) {
-    assert!(BN > 0 && BK > 0, "qgemv tile shape must be non-zero");
-    assert_eq!(
-        BN, QGEMV_LANES,
-        "workgroup-tiled qgemv currently expects BN=64 (one column per lane)"
-    );
+    // BN is pinned to QGEMV_LANES (one column per lane). BK is the K-axis
+    // staging chunk per pass.
+    const BN: u32 = QGEMV_LANES as u32;
+    const BK: u32 = 8;
+    let bk = BK;
 
     let [m, k] = matrix_shape(&a.view().layout);
     let n = b.cols;
@@ -264,12 +274,12 @@ pub fn qgemv_workgroup_with_epilogue<const BN: usize, const BK: usize>(
     assert_eq!(y_m, 1, "qgemv output must be single-row");
     assert_eq!(n, y_n, "qgemv output column count must match B");
 
-    let tiles_n = n.div_ceil(BN as u32);
-    let k_tiles = k.div_ceil(BK as u32);
+    let tiles_n = n.div_ceil(BN);
+    let k_tiles = k.div_ceil(bk);
     let grid = dispatch_grid_1d(tiles_n, max_workgroups_per_dimension);
     // BM=1 logical row tile. Reuse the f32 stager with ROWS=1.
-    let a_tile = program.alloc_workgroup_tile_f32(1, BK as u32);
-    let b_tile = program.alloc_workgroup_tile_f32(BK as u32, BN as u32);
+    let a_tile = program.alloc_workgroup_tile_f32(1, bk);
+    let b_tile = program.alloc_workgroup_tile_f32(bk, BN);
     let b_clone = b.clone();
 
     program.program_grid::<QGEMV_LANES>(grid, |program| {
@@ -278,7 +288,7 @@ pub fn qgemv_workgroup_with_epilogue<const BN: usize, const BK: usize>(
             + program.program_id(WorkgroupAxis::Z) * grid[0] * grid[1];
         let tile_active = tile_id.clone().lt(tiles_n);
         let n_tile = tile_id;
-        let n_tile_base = n_tile * BN as u32;
+        let n_tile_base = n_tile * BN;
 
         let lane = program.lane();
         let lane_row = Tile::literal(TileLiteral::U32(0));
@@ -291,8 +301,8 @@ pub fn qgemv_workgroup_with_epilogue<const BN: usize, const BK: usize>(
             k_tiles,
             [TileLiteral::f32(0.0); QGEMV_TN],
             |program, k_tile| {
-                let k_base = k_tile * BK as u32;
-                stage_f32_tile_with_pre::<1, BK, QGEMV_LANES>(
+                let k_base = k_tile * bk;
+                stage_f32_tile_with_pre(
                     program,
                     a_tile,
                     a,
@@ -302,12 +312,23 @@ pub fn qgemv_workgroup_with_epilogue<const BN: usize, const BK: usize>(
                     1,
                     k,
                     epilogues,
+                    1,
+                    bk,
+                    QGEMV_LANES as u32,
                 );
                 program.copy_quant_to_tile(b_tile, &b_clone, &k_base, &n_tile_base);
                 program.workgroup_barrier();
 
-                let chunk_vec = accumulate_register_tile_from_workgroup::<BN, BK, 1, QGEMV_TN>(
-                    program, a_tile, b_tile, &lane_row, &lane_col,
+                let chunk_vec = accumulate_register_tile_from_workgroup(
+                    program,
+                    a_tile,
+                    b_tile,
+                    &lane_row,
+                    &lane_col,
+                    BN,
+                    bk,
+                    1,
+                    QGEMV_TN as u32,
                 );
                 let mut chunk_iter = chunk_vec.into_iter();
                 let chunk: [Tile; QGEMV_TN] = std::array::from_fn(|_| {

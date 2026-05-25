@@ -42,7 +42,7 @@ use crate::quantized::QuantizedMatrix;
 ///             Mask::all(),
 ///             0.0,
 ///         ));
-///         let sum = block.group_reduce_sum::<8, _>(dot);
+///         let sum = block.group_reduce_sum(8, dot);
 ///         block.store(y.at((0u32, 0u32)), sum, lane.eq(0u32));
 ///     });
 /// });
@@ -59,8 +59,8 @@ pub struct QuantizedDot {
 }
 
 impl QuantizedDot {
-    fn base_dot<const N: usize>(
-        a: [Tile<F32>; N],
+    fn base_dot(
+        a: Vec<Tile<F32>>,
         activations: impl FnOnce(Vec<Expr>) -> PackedActivations,
         matrix: &QuantizedMatrix,
         k_base: impl Into<Tile<U32>>,
@@ -68,6 +68,7 @@ impl QuantizedDot {
         mask: impl Into<Mask>,
         fill: f32,
     ) -> Self {
+        let block_n = a.len() as u32;
         Self {
             src: matrix.clone(),
             activations: activations(tiles_to_exprs(a)),
@@ -75,7 +76,7 @@ impl QuantizedDot {
             col: boxed_index(col),
             mask: Box::new(mask.into().expr),
             fill: f32_fill(fill),
-            block_n: N as u32,
+            block_n,
         }
     }
 
@@ -90,8 +91,22 @@ impl QuantizedDot {
         mask: impl Into<Mask>,
         fill: f32,
     ) -> Self {
+        Self::f32_activations_vec(a.to_vec(), matrix, k_base, col, mask, fill)
+    }
+
+    /// Runtime-sized variant of [`f32_activations`]. `a.len()` must be 8, 16,
+    /// or 32 (the same set the const-generic version supports).
+    pub fn f32_activations_vec(
+        a: Vec<Tile<F32>>,
+        matrix: &QuantizedMatrix,
+        k_base: impl Into<Tile<U32>>,
+        col: impl Into<Tile<U32>>,
+        mask: impl Into<Mask>,
+        fill: f32,
+    ) -> Self {
+        let n = a.len();
         assert!(
-            N == 8 || N == 16 || N == 32,
+            n == 8 || n == 16 || n == 32,
             "f32 activation dot currently supports N == 8, N == 16, or N == 32"
         );
         Self::base_dot(a, PackedActivations::F32, matrix, k_base, col, mask, fill)
@@ -108,8 +123,21 @@ impl QuantizedDot {
         mask: impl Into<Mask>,
         fill: f32,
     ) -> Self {
+        Self::q8_activations_vec(a.to_vec(), matrix, k_base, col, mask, fill)
+    }
+
+    /// Runtime-sized variant of [`q8_activations`]. `a.len()` must be 8 or 16.
+    pub fn q8_activations_vec(
+        a: Vec<Tile<F32>>,
+        matrix: &QuantizedMatrix,
+        k_base: impl Into<Tile<U32>>,
+        col: impl Into<Tile<U32>>,
+        mask: impl Into<Mask>,
+        fill: f32,
+    ) -> Self {
+        let n = a.len();
         assert!(
-            N == 8 || N == 16,
+            n == 8 || n == 16,
             "q8 activation dot currently supports N == 8 or N == 16"
         );
         Self::base_dot(a, PackedActivations::Q8, matrix, k_base, col, mask, fill)

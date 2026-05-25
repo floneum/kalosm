@@ -23,7 +23,7 @@ use crate::{
 use super::{
     MatMulOperation, MatMulParams, coop_gemm, direct, sgemm, sgemv,
     variants::{
-        DirectTileCoopMatmulVariant, DirectTileMatmulVariant, dense_coop_kinds_from_datatype,
+        CoopTile, DirectTileMatmulVariant, dense_coop_kinds_from_datatype,
         select_dense_matmul_params, select_direct_tile_matmul_variant,
     },
 };
@@ -200,14 +200,9 @@ impl MatMulOperation {
             && device.max_subgroup_size() >= 32
             && device.min_subgroup_size() <= 32;
         let coop_variant = if use_coop {
-            DirectTileCoopMatmulVariant::select(
-                m,
-                k,
-                n,
-                device.limits().max_compute_workgroup_size_x,
-            )
+            CoopTile::select(m, k, n, device.limits().max_compute_workgroup_size_x)
         } else {
-            DirectTileCoopMatmulVariant::None
+            None
         };
         // The shared-tile kernel uses `div_ceil` for tile counts and
         // bounds-checks both A/B loads and Y stores, so it is correct for any
@@ -445,7 +440,7 @@ fn dispatch_direct_tile_matmul<
     a_view: DirectMatrixLayout,
     b_view: DirectMatrixLayout,
     y_view: DirectMatrixLayout,
-    coop_variant: DirectTileCoopMatmulVariant,
+    coop_variant: Option<CoopTile>,
     variant: DirectTileMatmulVariant,
     use_shared_tile: bool,
     shape: tile_ir_kernels::DenseMatmulShape,
@@ -455,39 +450,35 @@ fn dispatch_direct_tile_matmul<
     let a = tile_storage_read_with_direct_layout_typed::<T>(phase, a_view);
     let b = tile_storage_read_with_direct_layout_typed::<T>(phase, b_view);
     let y = tile_storage_write_with_direct_layout_typed::<T>(phase, y_view);
-    macro_rules! try_coop_tile {
-        ($m:literal, $n:literal, $k:literal) => {
-            if tile_ir_kernels::try_batched_coop_matmul::<T, $m, $n, $k>(
-                phase, &a, &b, &y, shape, epilogues, max_wg_per_dim,
-            ) {
-                return;
-            }
-        };
-    }
-    match coop_variant {
-        DirectTileCoopMatmulVariant::Tile256x256 => try_coop_tile!(256, 256, 16),
-        DirectTileCoopMatmulVariant::Tile128x512 => try_coop_tile!(128, 512, 16),
-        DirectTileCoopMatmulVariant::Tile128x256 => try_coop_tile!(128, 256, 16),
-        DirectTileCoopMatmulVariant::Tile128x64 => try_coop_tile!(128, 64, 16),
-        DirectTileCoopMatmulVariant::Tile64x128 => try_coop_tile!(64, 128, 16),
-        DirectTileCoopMatmulVariant::Tile64x64 => try_coop_tile!(64, 64, 16),
-        DirectTileCoopMatmulVariant::None => {}
+    if let Some(tile) = coop_variant
+        && tile_ir_kernels::try_batched_coop_matmul::<T>(
+            phase,
+            &a,
+            &b,
+            &y,
+            shape,
+            epilogues,
+            max_wg_per_dim,
+            tile.bm,
+            tile.bn,
+            tile.bk,
+        )
+    {
+        return;
     }
     match variant {
-        DirectTileMatmulVariant::Gemv => {
-            tile_ir_kernels::batched_gemv_with_epilogues::<T, 4, 8, 128>(
-                phase,
-                &a,
-                &b,
-                &y,
-                shape,
-                epilogues,
-                max_wg_per_dim,
-            )
-        }
+        DirectTileMatmulVariant::Gemv => tile_ir_kernels::batched_gemv_with_epilogues::<T>(
+            phase,
+            &a,
+            &b,
+            &y,
+            shape,
+            epilogues,
+            max_wg_per_dim,
+        ),
         DirectTileMatmulVariant::MatMul => {
             if use_shared_tile {
-                tile_ir_kernels::batched_matmul_with_epilogues::<T, 32, 32, 8>(
+                tile_ir_kernels::batched_matmul_with_epilogues::<T>(
                     phase,
                     &a,
                     &b,
@@ -497,7 +488,7 @@ fn dispatch_direct_tile_matmul<
                     max_wg_per_dim,
                 )
             } else {
-                tile_ir_kernels::batched_matmul_register_with_epilogues::<T, 32, 32, 8>(
+                tile_ir_kernels::batched_matmul_register_with_epilogues::<T>(
                     phase,
                     &a,
                     &b,

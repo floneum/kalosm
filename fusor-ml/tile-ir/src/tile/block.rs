@@ -3,8 +3,8 @@ use std::marker::PhantomData;
 use super::value::{boxed_index, boxed_u32_literal};
 use super::*;
 use crate::ir::{
-    Bool, Builtin, Expr, FloatElement, Numeric, ScalarMarker, TileLiteral, TileLoadExpr, TileStmt,
-    TileUnaryOp, Vector, WorkgroupAxis, F16, F32, U32,
+    Bool, Builtin, Expr, F16, F32, FloatElement, Numeric, ScalarMarker, TileLiteral, TileLoadExpr,
+    TileStmt, TileUnaryOp, U32, Vector, WorkgroupAxis,
 };
 use crate::quantized::QuantizedMatrix;
 
@@ -120,6 +120,36 @@ impl TileBlock<'_> {
                 lane: lane as u32,
             })
         })
+    }
+    pub fn load_quantized_block_vec(
+        &mut self,
+        lanes: u32,
+        matrix: &QuantizedMatrix,
+        k_base: impl Into<Tile<U32>>,
+        col: impl Into<Tile<U32>>,
+        mask: impl Into<Mask>,
+        fill: f32,
+    ) -> Vec<Tile<F32>> {
+        assert!(lanes == 8 || lanes == 16);
+        let id = self.program.next_block_dequant_id();
+        let k_base = boxed_index(k_base);
+        let col = boxed_index(col);
+        let mask = Box::new(mask.into().expr);
+        let fill = f32_fill(fill);
+        (0..lanes)
+            .map(|lane| {
+                Tile::from_expr(Expr::QuantizedBlockLane {
+                    id,
+                    src: matrix.clone(),
+                    k_base: k_base.clone(),
+                    col: col.clone(),
+                    mask: mask.clone(),
+                    fill: fill.clone(),
+                    block_n: lanes,
+                    lane,
+                })
+            })
+            .collect()
     }
     pub fn bind<T: Numeric>(&mut self, value: impl Into<Tile<T>>) -> Tile<T> {
         let value = value.into();

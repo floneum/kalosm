@@ -146,78 +146,68 @@ pub(super) enum DirectTileMatmulVariant {
     MatMul,
 }
 
+/// (BM, BN, BK) tile dimensions for a cooperative-matrix matmul tile. The
+/// `select` helper below returns `Option<CoopTile>` (`None` = no coop variant
+/// fits the shape); the kernel layer uses the tuple to look up the matching
+/// ROW_GROUPS/COL_GROUPS/N_PASSES/BLOCK in its internal table.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub(super) enum DirectTileCoopMatmulVariant {
-    None,
-    Tile64x64,
-    Tile64x128,
-    Tile128x64,
-    /// (BM=128, BN=256, BK=16, N_PASSES=4, BLOCK=256). Mirrors the
-    /// per-workgroup output footprint of the hand-written `coop_gemm.rs` on
-    /// main: the K axis is short (BK=16) so the inner stride fits a single
-    /// cache line, and the N axis is amortized across four sub-passes that
-    /// reuse the accumulator grid.
-    Tile128x256,
-    /// (BM=128, BN=512, BK=16, N_PASSES=8, BLOCK=256). Same per-pass
-    /// footprint as `Tile128x256` so it fits the same workgroup tile budget,
-    /// but doubles the N coverage per workgroup — halving global A reads for
-    /// big square matmuls. Selected when N divides 512.
-    Tile128x512,
-    /// (BM=256, BN=256, BK=16, N_PASSES=8, BLOCK=256, single-buffered).
-    /// The biggest square output tile that fits the 32 KB threadgroup-memory
-    /// limit (when run single-buffered). Minimizes both A and B global reads
-    /// (sqrt(min) trick); preferred for big square matmuls when there are
-    /// enough output tiles.
-    Tile256x256,
+pub(super) struct CoopTile {
+    pub(super) bm: u32,
+    pub(super) bn: u32,
+    pub(super) bk: u32,
 }
 
-impl DirectTileCoopMatmulVariant {
-    pub(super) fn select(m: u32, k: u32, n: u32, max_workgroup_size_x: u32) -> Self {
-        // All variants now use BK=16 to keep double-buffered workgroup tiles
-        // inside Apple's 32 KB threadgroup-memory limit. Heuristic: bigger
-        // tiles only fire when (M/BM)*(N/BN) clears a minimum tile count so
-        // there's enough work for the GPU; smaller matrices fall to smaller
-        // tiles for better parallelism.
+impl CoopTile {
+    pub(super) const fn new(bm: u32, bn: u32, bk: u32) -> Self {
+        Self { bm, bn, bk }
+    }
+
+    /// Pick a cooperative-matrix tile for the given (m, k, n) shape, returning
+    /// `None` when no coop tile fits. All entries use BK=16 to keep
+    /// double-buffered workgroup tiles inside Apple's 32 KB limit; the
+    /// (256, 256, 16) entry runs single-buffered in the inner perf kernel.
+    /// Heuristic: bigger tiles only fire when (M/BM)*(N/BN) clears a minimum
+    /// tile count so there's enough work for the GPU.
+    pub(super) fn select(m: u32, k: u32, n: u32, max_workgroup_size_x: u32) -> Option<Self> {
         let tiles_for = |bm: u32, bn: u32| -> u32 { (m / bm) * (n / bn) };
         if !k.is_multiple_of(16) {
-            return Self::None;
+            return None;
         }
         // Tile256x256 single-buffer has lower memory traffic (sqrt-min) but
-        // 2× the barriers of Tile128x512 double-buffer; raise the threshold
-        // so it only fires when the smaller variant doesn't fit (i.e.,
-        // when N is divisible by 256 but not by 512).
+        // 2× the barriers of Tile128x512 double-buffer; only fires when N
+        // is divisible by 256 but not by 512.
         if m.is_multiple_of(256)
             && n.is_multiple_of(256)
             && !n.is_multiple_of(512)
             && max_workgroup_size_x >= 256
             && tiles_for(256, 256) >= 256
         {
-            return Self::Tile256x256;
+            return Some(Self::new(256, 256, 16));
         }
         if m.is_multiple_of(128)
             && n.is_multiple_of(512)
             && max_workgroup_size_x >= 256
             && tiles_for(128, 512) >= 256
         {
-            return Self::Tile128x512;
+            return Some(Self::new(128, 512, 16));
         }
         if m.is_multiple_of(128)
             && n.is_multiple_of(256)
             && max_workgroup_size_x >= 256
             && tiles_for(128, 256) >= 256
         {
-            return Self::Tile128x256;
+            return Some(Self::new(128, 256, 16));
         }
         if m.is_multiple_of(128) && n.is_multiple_of(64) && max_workgroup_size_x >= 256 {
-            return Self::Tile128x64;
+            return Some(Self::new(128, 64, 16));
         }
         if m.is_multiple_of(64) && n.is_multiple_of(128) && max_workgroup_size_x >= 256 {
-            return Self::Tile64x128;
+            return Some(Self::new(64, 128, 16));
         }
         if m.is_multiple_of(64) && n.is_multiple_of(64) && max_workgroup_size_x >= 128 {
-            return Self::Tile64x64;
+            return Some(Self::new(64, 64, 16));
         }
-        Self::None
+        None
     }
 }
 

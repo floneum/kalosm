@@ -18,8 +18,8 @@ macro_rules! tile_reduce_entrypoints {
             {
                 self.loop_reduce(TileReduceOp::$op, iterations, body)
             }
-            pub fn $group_reduce<const GROUP: usize, T: Numeric>(&mut self, value: Tile<T>) -> Tile<T> {
-                self.group_reduce::<GROUP, T>(TileReduceOp::$op, value)
+            pub fn $group_reduce<T: Numeric>(&mut self, group_size: u32, value: Tile<T>) -> Tile<T> {
+                self.group_reduce::<T>(TileReduceOp::$op, group_size, value)
             }
             pub fn $subgroup_reduce<T: Numeric>(&self, value: Tile<T>) -> Tile<T> {
                 self.subgroup_reduce(TileReduceOp::$op, value)
@@ -100,19 +100,46 @@ impl TileBlock<'_> {
     where
         F: FnOnce(&mut Self, Tile<U32>) -> [Tile<T>; N],
     {
+        let result = self.loop_fold_vec(op, iterations, initials.to_vec(), |slf, iter| {
+            body(slf, iter).to_vec()
+        });
+        let mut iter = result.into_iter();
+        std::array::from_fn(|_| iter.next().expect("loop_fold_vec returned wrong arity"))
+    }
+
+    /// Runtime-sized variant of [`loop_fold_n`]. The number of accumulators
+    /// is determined by `initials.len()`; the body closure must return a Vec
+    /// of the same length.
+    pub fn loop_fold_vec<T: Numeric, F>(
+        &mut self,
+        op: TileReduceOp,
+        iterations: u32,
+        initials: Vec<TileLiteral>,
+        body: F,
+    ) -> Vec<Tile<T>>
+    where
+        F: FnOnce(&mut Self, Tile<U32>) -> Vec<Tile<T>>,
+    {
+        let n = initials.len();
         assert!(iterations > 0);
-        assert!(N > 0);
-        for initial in initials {
+        assert!(n > 0);
+        for initial in &initials {
             assert_eq!(initial.element(), T::ELEMENT);
         }
-        let acc_locals: [LocalRef; N] = std::array::from_fn(|_| self.program.alloc_local::<T>());
+        let acc_locals: Vec<LocalRef> = (0..n).map(|_| self.program.alloc_local::<T>()).collect();
         let iter_var_local = self.program.alloc_local::<U32>();
         self.stmt_stack.push(Vec::new());
         let bodies = body(self, Tile::from_expr(Expr::LoadLocal(iter_var_local)));
+        assert_eq!(
+            bodies.len(),
+            n,
+            "loop_fold_vec body returned {} lanes, expected {n}",
+            bodies.len()
+        );
         let body_stmts = self
             .stmt_stack
             .pop()
-            .expect("loop_fold_n body frame missing");
+            .expect("loop_fold_vec body frame missing");
         let binary_op = op.binary();
         let accumulators = bodies
             .into_iter()
@@ -134,7 +161,10 @@ impl TileBlock<'_> {
             body: body_stmts,
             accumulators,
         });
-        std::array::from_fn(|i| Tile::from_expr(Expr::LoadLocal(acc_locals[i])))
+        acc_locals
+            .into_iter()
+            .map(|local| Tile::from_expr(Expr::LoadLocal(local)))
+            .collect()
     }
 
     tile_reduce_entrypoints!(
@@ -203,16 +233,17 @@ impl TileBlock<'_> {
         })
     }
 
-    fn group_reduce<const GROUP: usize, T: Numeric>(
+    fn group_reduce<T: Numeric>(
         &mut self,
         op: TileReduceOp,
+        group_size: u32,
         value: Tile<T>,
     ) -> Tile<T> {
-        let block = self.block_size();
-        assert!(GROUP > 0 && GROUP <= block && GROUP.is_power_of_two());
+        let block = self.block_size() as u32;
+        assert!(group_size > 0 && group_size <= block && group_size.is_power_of_two());
         let scratch = self.program.alloc_tile::<T>(Layout::contiguous(
             MemoryLevel::Workgroup,
-            Shape::new([block as u32]),
+            Shape::new([block]),
         ));
         Tile::from_expr(Expr::Reduce {
             op,
@@ -220,7 +251,7 @@ impl TileBlock<'_> {
             iter_var: None,
             value: Box::new(value.expr),
             scratch: scratch.into(),
-            group_size: GROUP as u32,
+            group_size,
         })
     }
 

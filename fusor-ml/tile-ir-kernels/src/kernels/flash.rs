@@ -1,9 +1,10 @@
 use fusor_tile_ir::{
-    tile::{self, range, Mask, Tile, TileBlock, Workgroup},
-    ElementType, Numeric, TileLiteral, WorkgroupAxis, F32, U32,
+    ElementType, F32, Numeric, TileLiteral, U32, WorkgroupAxis,
+    tile::{self, Mask, Tile, TileBlock, Workgroup, range},
 };
 
-use super::helpers::{index_n, reduce_workgroup, NEG_MAX_F32};
+use super::helpers::{NEG_MAX_F32, index_n, reduce_workgroup};
+use super::softmax::{softmax_partial_scale, workgroup_softmax_block};
 use super::types::{FlashAttentionDims, FlashAttentionMeta, FlashDecodeSmallMeta};
 
 const FLASH_BLOCK: usize = 256;
@@ -36,16 +37,16 @@ pub const fn flash_tiled_outputs_per_workgroup(subgroup_size: u32) -> u32 {
 
 /// Build a streaming flash-attention kernel for F32 or F16 tensors.
 ///
-/// `SUBGROUP_SIZE` must match the runtime hardware subgroup width on the
+/// `subgroup_size` must match the runtime hardware subgroup width on the
 /// target device — the kernel layout assigns one subgroup per output dim and
-/// uses `subgroup_reduce_*` to fold a `SUBGROUP_SIZE`-wide chunk of KV. Pick
+/// uses `subgroup_reduce_*` to fold a `subgroup_size`-wide chunk of KV. Pick
 /// the size by reading the device's subgroup caps; pinning is not exposed by
 /// wgpu, so this must come from a fixed `(min == max)` adapter range.
 ///
 /// The metadata supplies tensor strides, offsets, dimensions, scale, and the
 /// dispatch grid. Returns `None` if the tensor ranks or optional mask binding
 /// are inconsistent with the metadata.
-pub fn flash_attention<E: Numeric, const SUBGROUP_SIZE: u32, B>(
+pub fn flash_attention<E: Numeric, B>(
     kb: &mut fusor_tile_ir::KernelBuilder<B>,
     q: fusor_tile_ir::KernelTensorRef<B>,
     k: fusor_tile_ir::KernelTensorRef<B>,
@@ -53,11 +54,12 @@ pub fn flash_attention<E: Numeric, const SUBGROUP_SIZE: u32, B>(
     mask: Option<fusor_tile_ir::KernelTensorRef<B>>,
     output: fusor_tile_ir::KernelTensorRef<B>,
     meta: FlashAttentionMeta,
+    subgroup_size: u32,
 ) -> Option<()> {
-    if SUBGROUP_SIZE == 0 || !(FLASH_BLOCK as u32).is_multiple_of(SUBGROUP_SIZE) {
+    if subgroup_size == 0 || !(FLASH_BLOCK as u32).is_multiple_of(subgroup_size) {
         return None;
     }
-    let outputs_per_workgroup = flash_outputs_per_workgroup(SUBGROUP_SIZE);
+    let outputs_per_workgroup = flash_outputs_per_workgroup(subgroup_size);
     let q_strides: [u32; 4] = meta.q_meta.strides.as_slice().try_into().ok()?;
     let k_strides: [u32; 4] = meta.k_meta.strides.as_slice().try_into().ok()?;
     let v_strides: [u32; 4] = meta.v_meta.strides.as_slice().try_into().ok()?;
@@ -107,9 +109,9 @@ pub fn flash_attention<E: Numeric, const SUBGROUP_SIZE: u32, B>(
                 program.bind(program.index(row / (meta.dims.q_seq_len * meta.dims.num_heads)));
             let kv_head_idx =
                 program.bind(head_idx.clone() / Tile::literal(TileLiteral::U32(groups)));
-            let kv_lane = program.index(lane.clone() % SUBGROUP_SIZE);
+            let kv_lane = program.index(lane.clone() % subgroup_size);
             let out_dim = program.bind(
-                program.index(workgroup_x * outputs_per_workgroup + (lane.clone() / SUBGROUP_SIZE)),
+                program.index(workgroup_x * outputs_per_workgroup + (lane.clone() / subgroup_size)),
             );
             let out_valid = program.bind(
                 out_dim
@@ -121,7 +123,7 @@ pub fn flash_attention<E: Numeric, const SUBGROUP_SIZE: u32, B>(
             let score_local = program.private::<F32>();
             let weighted_local = program.private::<F32>();
 
-            let kv_chunks = meta.dims.kv_seq_len.div_ceil(SUBGROUP_SIZE);
+            let kv_chunks = meta.dims.kv_seq_len.div_ceil(subgroup_size);
             let causal = meta.causal;
             let [_final_m, final_s, final_o] = program.fold(
                 range(Tile::literal(TileLiteral::U32(kv_chunks))),
@@ -133,7 +135,7 @@ pub fn flash_attention<E: Numeric, const SUBGROUP_SIZE: u32, B>(
                 |program, chunk_idx, [m_state, s_state, o_state]| {
                     let chunk = Tile::from_index(chunk_idx);
                     let kv_idx = program.bind(
-                        chunk.clone() * Tile::literal(TileLiteral::U32(SUBGROUP_SIZE))
+                        chunk.clone() * Tile::literal(TileLiteral::U32(subgroup_size))
                             + kv_lane.clone(),
                     );
                     let bound_valid = program.bind(
@@ -150,7 +152,7 @@ pub fn flash_attention<E: Numeric, const SUBGROUP_SIZE: u32, B>(
                     // load+dot under `chunk_in_range`.
                     let (kv_valid, chunk_in_range) = if causal {
                         let chunk_start = program
-                            .bind(chunk.clone() * Tile::literal(TileLiteral::U32(SUBGROUP_SIZE)));
+                            .bind(chunk.clone() * Tile::literal(TileLiteral::U32(subgroup_size)));
                         let chunk_in_range = program.bind(chunk_start.le(q_idx.clone()));
                         let kv_le_q = kv_idx.clone().le(q_idx.clone());
                         let kv_valid = program.bind(bound_valid.clone().and(kv_le_q));
@@ -271,21 +273,21 @@ pub fn flash_attention<E: Numeric, const SUBGROUP_SIZE: u32, B>(
 }
 
 /// Q-batched streaming flash attention. Same online-softmax algorithm as
-/// [`flash_attention`], but each workgroup handles `Q_BLOCK` contiguous q_idx
+/// [`flash_attention`], but each workgroup handles `q_block` contiguous q_idx
 /// values, caching Q, K, and V slices in workgroup memory so the big
 /// `(kv_seq_len * head_dim)` K traffic and the per-chunk Q reads are reused
-/// across `Q_BLOCK` queries instead of being re-fetched per query.
+/// across `q_block` queries instead of being re-fetched per query.
 ///
 /// Layout:
 /// - One workgroup per (batch, head, q_block).
-/// - `FLASH_BLOCK` lanes split into subgroups of `SUBGROUP_SIZE` lanes each.
+/// - `FLASH_BLOCK` lanes split into subgroups of `subgroup_size` lanes each.
 ///   Each subgroup is pinned to one kv position per lane and accumulates a
 ///   short run of output dims serially, reusing the same QK score.
 /// - Once per workgroup: load `Q[q_block, head_dim]` into workgroup memory.
 /// - Per chunk: cooperatively load `K[chunk_kv_positions, head_dim]` and
 ///   `V[chunk_kv_positions, workgroup_out_dims]` into workgroup memory once,
-///   then loop over `Q_BLOCK` queries reusing those loads.
-pub fn flash_attention_tiled<E: Numeric, const SUBGROUP_SIZE: u32, const Q_BLOCK: u32, B>(
+///   then loop over `q_block` queries reusing those loads.
+pub fn flash_attention_tiled<E: Numeric, B>(
     kb: &mut fusor_tile_ir::KernelBuilder<B>,
     q: fusor_tile_ir::KernelTensorRef<B>,
     k: fusor_tile_ir::KernelTensorRef<B>,
@@ -293,11 +295,13 @@ pub fn flash_attention_tiled<E: Numeric, const SUBGROUP_SIZE: u32, const Q_BLOCK
     mask: Option<fusor_tile_ir::KernelTensorRef<B>>,
     output: fusor_tile_ir::KernelTensorRef<B>,
     meta: FlashAttentionMeta,
+    subgroup_size: u32,
+    q_block: u32,
 ) -> Option<()> {
-    if SUBGROUP_SIZE == 0 || !(FLASH_BLOCK as u32).is_multiple_of(SUBGROUP_SIZE) || Q_BLOCK == 0 {
+    if subgroup_size == 0 || !(FLASH_BLOCK as u32).is_multiple_of(subgroup_size) || q_block == 0 {
         return None;
     }
-    let outputs_per_workgroup = flash_tiled_outputs_per_workgroup(SUBGROUP_SIZE);
+    let outputs_per_workgroup = flash_tiled_outputs_per_workgroup(subgroup_size);
     let q_strides: [u32; 4] = meta.q_meta.strides.as_slice().try_into().ok()?;
     let k_strides: [u32; 4] = meta.k_meta.strides.as_slice().try_into().ok()?;
     let v_strides: [u32; 4] = meta.v_meta.strides.as_slice().try_into().ok()?;
@@ -327,18 +331,18 @@ pub fn flash_attention_tiled<E: Numeric, const SUBGROUP_SIZE: u32, const Q_BLOCK
         return None;
     }
     // Workgroup-memory budgets — keep totals well under the 32KB Apple cap.
-    // K cache: SUBGROUP_SIZE rows × head_dim cols.
-    let k_cache_elems = SUBGROUP_SIZE.checked_mul(meta.dims.head_dim)?;
+    // K cache: subgroup_size rows × head_dim cols.
+    let k_cache_elems = subgroup_size.checked_mul(meta.dims.head_dim)?;
     if k_cache_elems > 4096 {
         return None;
     }
-    // V cache: SUBGROUP_SIZE rows × outputs_per_workgroup cols.
-    let v_cache_elems = SUBGROUP_SIZE.checked_mul(outputs_per_workgroup)?;
+    // V cache: subgroup_size rows × outputs_per_workgroup cols.
+    let v_cache_elems = subgroup_size.checked_mul(outputs_per_workgroup)?;
     if v_cache_elems > 4096 {
         return None;
     }
-    // Q cache: Q_BLOCK rows × head_dim cols.
-    let q_cache_elems = Q_BLOCK.checked_mul(meta.dims.head_dim)?;
+    // Q cache: q_block rows × head_dim cols.
+    let q_cache_elems = q_block.checked_mul(meta.dims.head_dim)?;
     if q_cache_elems > 4096 {
         return None;
     }
@@ -354,7 +358,7 @@ pub fn flash_attention_tiled<E: Numeric, const SUBGROUP_SIZE: u32, const Q_BLOCK
         let k_cache = phase.alloc_workgroup_array::<F32>(k_cache_elems);
         let v_cache = phase.alloc_workgroup_array::<F32>(v_cache_elems);
         let q_cache = phase.alloc_workgroup_array::<F32>(q_cache_elems);
-        let q_blocks = meta.dims.q_seq_len.div_ceil(Q_BLOCK);
+        let q_blocks = meta.dims.q_seq_len.div_ceil(q_block);
         let dispatch_size = [
             meta.dims.head_dim.div_ceil(outputs_per_workgroup),
             meta.dims
@@ -374,8 +378,8 @@ pub fn flash_attention_tiled<E: Numeric, const SUBGROUP_SIZE: u32, const Q_BLOCK
             let batch_idx = program.bind(program.index(row_over_q / meta.dims.num_heads));
             let kv_head_idx =
                 program.bind(head_idx.clone() / Tile::literal(TileLiteral::U32(groups)));
-            let subgroup_idx = program.bind(program.index(lane.clone() / SUBGROUP_SIZE));
-            let kv_lane = program.bind(program.index(lane.clone() % SUBGROUP_SIZE));
+            let subgroup_idx = program.bind(program.index(lane.clone() / subgroup_size));
+            let kv_lane = program.bind(program.index(lane.clone() % subgroup_size));
             let out_dim_base = program.bind(
                 workgroup_x * outputs_per_workgroup
                     + subgroup_idx.clone() * TILED_OUTS_PER_SUBGROUP,
@@ -396,18 +400,18 @@ pub fn flash_attention_tiled<E: Numeric, const SUBGROUP_SIZE: u32, const Q_BLOCK
 
             // Per-query accumulator state, stored in private locals indexed by
             // q-offset within the workgroup's Q-block. Initialised below.
-            let mut m_locals: Vec<tile::Local<F32>> = Vec::with_capacity(Q_BLOCK as usize);
-            let mut s_locals: Vec<tile::Local<F32>> = Vec::with_capacity(Q_BLOCK as usize);
+            let mut m_locals: Vec<tile::Local<F32>> = Vec::with_capacity(q_block as usize);
+            let mut s_locals: Vec<tile::Local<F32>> = Vec::with_capacity(q_block as usize);
             let mut o_locals: Vec<tile::Local<F32>> =
-                Vec::with_capacity((Q_BLOCK * TILED_OUTS_PER_SUBGROUP) as usize);
-            for _ in 0..Q_BLOCK {
+                Vec::with_capacity((q_block * TILED_OUTS_PER_SUBGROUP) as usize);
+            for _ in 0..q_block {
                 m_locals.push(program.private::<F32>());
                 s_locals.push(program.private::<F32>());
                 for _ in 0..TILED_OUTS_PER_SUBGROUP {
                     o_locals.push(program.private::<F32>());
                 }
             }
-            for q_offset in 0..Q_BLOCK {
+            for q_offset in 0..q_block {
                 program.store_local(
                     &m_locals[q_offset as usize],
                     Tile::literal(TileLiteral::f32(NEG_MAX_F32)),
@@ -422,25 +426,25 @@ pub fn flash_attention_tiled<E: Numeric, const SUBGROUP_SIZE: u32, const Q_BLOCK
                 }
             }
 
-            let kv_chunks = meta.dims.kv_seq_len.div_ceil(SUBGROUP_SIZE);
+            let kv_chunks = meta.dims.kv_seq_len.div_ceil(subgroup_size);
             let causal = meta.causal;
 
             // Q-block base index in the q dimension.
             let q_block_base =
-                program.bind(q_block_idx.clone() * Tile::literal(TileLiteral::U32(Q_BLOCK)));
+                program.bind(q_block_idx.clone() * Tile::literal(TileLiteral::U32(q_block)));
 
             // -----------------------------------------------------------
             // One-shot Q cache load.
             //
             // Layout: q_cache[q_offset * head_dim + dim].
             // Loaded once per workgroup, indexed by lane in strided passes
-            // of FLASH_BLOCK lanes each. Total = Q_BLOCK * head_dim ≤ 4096.
+            // of FLASH_BLOCK lanes each. Total = q_block * head_dim ≤ 4096.
             //
             // The original streaming kernel re-loaded Q from global per
             // (kv_chunk, q_idx, dim, lane) — 256× duplicate reads per
             // (q_idx, dim) within a workgroup. Caching Q removes that.
             // -----------------------------------------------------------
-            let total_q_loads = Q_BLOCK * meta.dims.head_dim;
+            let total_q_loads = q_block * meta.dims.head_dim;
             let q_passes = total_q_loads.div_ceil(FLASH_BLOCK as u32);
             for pass in 0..q_passes {
                 let pass_base = pass * FLASH_BLOCK as u32;
@@ -494,11 +498,11 @@ pub fn flash_attention_tiled<E: Numeric, const SUBGROUP_SIZE: u32, const Q_BLOCK
                         .ge(Tile::literal(TileLiteral::U32(kv_chunks))),
                 );
                 let chunk_start = program
-                    .bind(chunk_tile.clone() * Tile::literal(TileLiteral::U32(SUBGROUP_SIZE)));
+                    .bind(chunk_tile.clone() * Tile::literal(TileLiteral::U32(subgroup_size)));
                 if causal {
                     let q_block_last = program.bind(
                         (q_block_base.clone()
-                            + Tile::literal(TileLiteral::U32(Q_BLOCK.saturating_sub(1))))
+                            + Tile::literal(TileLiteral::U32(q_block.saturating_sub(1))))
                         .min(Tile::literal(TileLiteral::U32(meta.dims.q_seq_len - 1))),
                     );
                     program.break_if(chunk_start.clone().gt(q_block_last));
@@ -518,7 +522,7 @@ pub fn flash_attention_tiled<E: Numeric, const SUBGROUP_SIZE: u32, const Q_BLOCK
                 // if_then-guarded store to handle the last partial pass
                 // (only fires when total_k_loads % FLASH_BLOCK != 0).
                 // -------------------------------------------------------
-                let total_k_loads = SUBGROUP_SIZE * meta.dims.head_dim;
+                let total_k_loads = subgroup_size * meta.dims.head_dim;
                 let k_passes = total_k_loads.div_ceil(FLASH_BLOCK as u32);
                 let k_aligned = total_k_loads.is_multiple_of(FLASH_BLOCK as u32);
                 for pass in 0..k_passes {
@@ -601,7 +605,7 @@ pub fn flash_attention_tiled<E: Numeric, const SUBGROUP_SIZE: u32, const Q_BLOCK
                 // come from workgroup memory; only the optional mask still
                 // comes from global.
                 // -------------------------------------------------------
-                for q_offset in 0..Q_BLOCK {
+                for q_offset in 0..q_block {
                     let q_idx = program
                         .bind(q_block_base.clone() + Tile::literal(TileLiteral::U32(q_offset)));
                     let q_in_range = program.bind(
@@ -704,7 +708,7 @@ pub fn flash_attention_tiled<E: Numeric, const SUBGROUP_SIZE: u32, const Q_BLOCK
             });
 
             // Write each query's accumulated output.
-            for q_offset in 0..Q_BLOCK {
+            for q_offset in 0..q_block {
                 let q_idx =
                     program.bind(q_block_base.clone() + Tile::literal(TileLiteral::U32(q_offset)));
                 let q_in_range = program.bind(
@@ -887,7 +891,6 @@ fn flash_decode_small_block<const BLOCK: usize, B>(
     let output = kb.write::<F32, 1>(output);
     let params = kb.read::<U32, 1>(params);
     let phase = kb.program();
-    let scores = phase.alloc_workgroup_array::<F32>(BLOCK as u32);
     let probs = phase.alloc_workgroup_array::<F32>(BLOCK as u32);
     let reduce = phase.alloc_workgroup_array::<F32>(BLOCK as u32);
 
@@ -908,6 +911,7 @@ fn flash_decode_small_block<const BLOCK: usize, B>(
         let item = program.private::<U32>();
         let dim = program.private::<U32>();
         let score_acc = program.private::<F32>();
+        let score_local = program.private::<F32>();
         let max_score_local = program.private::<F32>();
 
         if meta.tiled {
@@ -1073,16 +1077,7 @@ fn flash_decode_small_block<const BLOCK: usize, B>(
         }
 
         let kv_valid = lane_value.clone().lt(active_kv_len.clone());
-        program.store_workgroup(
-            scores,
-            lane.clone(),
-            Tile::literal(TileLiteral::f32(NEG_MAX_F32)),
-        );
-        program.store_workgroup(
-            reduce,
-            lane.clone(),
-            Tile::literal(TileLiteral::f32(NEG_MAX_F32)),
-        );
+        program.store_local(&score_local, Tile::literal(TileLiteral::f32(NEG_MAX_F32)));
         program.if_then(kv_valid.clone(), |program| {
             let score = decode_score_for_kv(
                 program,
@@ -1098,34 +1093,22 @@ fn flash_decode_small_block<const BLOCK: usize, B>(
                     dim_local: &dim,
                 },
             );
-            program.store_workgroup(scores, lane.clone(), score.clone());
-            program.store_workgroup(reduce, lane.clone(), score);
+            program.store_local(&score_local, score);
         });
-        program.workgroup_barrier();
-        reduce_workgroup(program, reduce, lane.clone(), |lhs, rhs| lhs.max(rhs));
-        let max_score = program.load_workgroup(reduce, 0);
-        program.store_local(&max_score_local, max_score);
-        let max_score = program.load_local(&max_score_local);
-
-        // All lanes load `reduce[0]` (the max) above. Before any lane
-        // overwrites `reduce[lane]` for the denominator accumulator we need a
-        // barrier; otherwise lane 0 can race with lanes still loading slot 0.
-        program.workgroup_barrier();
-        let score_value = program.load_workgroup(scores, lane.clone());
-        let raw_prob = (score_value - max_score).exp();
-        let prob = Tile::select(
+        let stats = workgroup_softmax_block(
+            program,
+            lane.clone(),
+            program.load_local(&score_local),
             kv_valid.clone(),
-            raw_prob,
-            Tile::literal(TileLiteral::f32(0.0)),
+            reduce,
+            Some(probs),
         );
-        program.store_workgroup(probs, lane.clone(), prob.clone());
-        program.store_workgroup(reduce, lane.clone(), prob);
-        program.workgroup_barrier();
-        reduce_workgroup(program, reduce, lane.clone(), |lhs, rhs| lhs + rhs);
-        let denom = program.load_workgroup(reduce, 0);
         program.if_then(kv_valid, |program| {
-            let prob = program.load_workgroup(probs, lane.clone()) / denom.clone();
-            program.store_workgroup(probs, lane.clone(), prob);
+            program.store_workgroup(
+                probs,
+                lane.clone(),
+                stats.prob.clone() / stats.denom.clone(),
+            );
         });
         program.workgroup_barrier();
 
@@ -1170,7 +1153,6 @@ fn flash_decode_split_partials_block<const BLOCK: usize, B>(
     let scratch = kb.write::<F32, 1>(scratch);
     let params = kb.read::<U32, 1>(params);
     let phase = kb.program();
-    let scores = phase.alloc_workgroup_array::<F32>(BLOCK as u32);
     let probs = phase.alloc_workgroup_array::<F32>(BLOCK as u32);
     let reduce = phase.alloc_workgroup_array::<F32>(BLOCK as u32);
 
@@ -1207,18 +1189,9 @@ fn flash_decode_split_partials_block<const BLOCK: usize, B>(
             let acc = program.private::<F32>();
             let dim = program.private::<U32>();
             let score_acc = program.private::<F32>();
-            let max_score_local = program.private::<F32>();
+            let score_local = program.private::<F32>();
 
-            program.store_workgroup(
-                scores,
-                lane.clone(),
-                Tile::literal(TileLiteral::f32(NEG_MAX_F32)),
-            );
-            program.store_workgroup(
-                reduce,
-                lane.clone(),
-                Tile::literal(TileLiteral::f32(NEG_MAX_F32)),
-            );
+            program.store_local(&score_local, Tile::literal(TileLiteral::f32(NEG_MAX_F32)));
             program.if_then(kv_valid.clone(), |program| {
                 let score = decode_score_for_kv(
                     program,
@@ -1234,30 +1207,16 @@ fn flash_decode_split_partials_block<const BLOCK: usize, B>(
                         dim_local: &dim,
                     },
                 );
-                program.store_workgroup(scores, lane.clone(), score.clone());
-                program.store_workgroup(reduce, lane.clone(), score);
+                program.store_local(&score_local, score);
             });
-            program.workgroup_barrier();
-            reduce_workgroup(program, reduce, lane.clone(), |lhs, rhs| lhs.max(rhs));
-            let max_score = program.load_workgroup(reduce, 0);
-            program.store_local(&max_score_local, max_score);
-            let max_score = program.load_local(&max_score_local);
-
-            // See the non-tiled decode path above: lane 0 must not overwrite
-            // `reduce[0]` before every lane has copied the max out.
-            program.workgroup_barrier();
-            let score_value = program.load_workgroup(scores, lane.clone());
-            let raw_prob = (score_value - max_score.clone()).exp();
-            let prob = Tile::select(
+            let stats = workgroup_softmax_block(
+                program,
+                lane.clone(),
+                program.load_local(&score_local),
                 kv_valid.clone(),
-                raw_prob,
-                Tile::literal(TileLiteral::f32(0.0)),
+                reduce,
+                Some(probs),
             );
-            program.store_workgroup(probs, lane.clone(), prob.clone());
-            program.store_workgroup(reduce, lane.clone(), prob);
-            program.workgroup_barrier();
-            reduce_workgroup(program, reduce, lane.clone(), |lhs, rhs| lhs + rhs);
-            let denom = program.load_workgroup(reduce, 0);
 
             let scratch_base = program.bind(
                 (row.clone() * Tile::literal(TileLiteral::U32(meta.split_blocks))
@@ -1269,12 +1228,12 @@ fn flash_decode_split_partials_block<const BLOCK: usize, B>(
                 |program| {
                     program.store(
                         scratch.at(scratch_base.clone() + DECODE_HEAD_DIM),
-                        denom,
+                        stats.denom.clone(),
                         Mask::all(),
                     );
                     program.store(
                         scratch.at(scratch_base.clone() + DECODE_HEAD_DIM + 1),
-                        max_score.clone(),
+                        stats.max.clone(),
                         Mask::all(),
                     );
                 },
@@ -1338,6 +1297,7 @@ pub fn flash_decode_split_partials<B>(
     }
     match meta.decode_block {
         128 => flash_decode_split_partials_block::<128, B>(kb, q, k, v, scratch, params, meta),
+        256 => flash_decode_split_partials_block::<256, B>(kb, q, k, v, scratch, params, meta),
         512 => flash_decode_split_partials_block::<512, B>(kb, q, k, v, scratch, params, meta),
         1024 => flash_decode_split_partials_block::<1024, B>(kb, q, k, v, scratch, params, meta),
         _ => return None,
@@ -1396,7 +1356,7 @@ pub fn flash_decode_split_reduce<B>(
                     Mask::all(),
                     TileLiteral::f32(NEG_MAX_F32),
                 );
-                let scale = (block_max - max_score.clone()).exp();
+                let scale = softmax_partial_scale(block_max, max_score.clone());
                 denom = denom + block_denom * scale.clone();
                 let partial = program.load(
                     scratch.at(block_base + out_dim.clone()),
@@ -1434,6 +1394,7 @@ pub fn flash_decode_small<B>(
     }
     match meta.decode_block {
         128 => flash_decode_small_block::<128, B>(kb, q, k, v, output, params, meta),
+        256 => flash_decode_small_block::<256, B>(kb, q, k, v, output, params, meta),
         512 => flash_decode_small_block::<512, B>(kb, q, k, v, output, params, meta),
         1024 => flash_decode_small_block::<1024, B>(kb, q, k, v, output, params, meta),
         _ => return None,

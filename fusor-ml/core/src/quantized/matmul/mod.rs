@@ -7,8 +7,7 @@ use crate::{
     DataTypeEnum, Device, Layout, Tensor, TensorData,
     compute_graph::NodeIndex,
     kernel_selection::{
-        Axis, CooperativeMatrixCaps, KernelDeviceCaps, KernelShape, ShapeRule, ShapeSelector, eq,
-        multiple_of, range,
+        Axis, KernelDeviceCaps, KernelShape, ShapeRule, ShapeSelector, eq, multiple_of, range,
     },
     matmul::MatMulOperation,
     mir::{
@@ -97,36 +96,39 @@ fn qmatmul_direct_module_key<M: 'static>(
 const QMAT_M: Axis<0> = Axis;
 const QMAT_K: Axis<1> = Axis;
 const QMAT_N: Axis<2> = Axis;
-const QGEMV_K: Axis<0> = Axis;
-const QGEMV_N: Axis<1> = Axis;
 
-/// Chosen kernel for a direct quantized matmul. The `Tile*` variants all
-/// dispatch to `qmatmul_with_epilogue::<BM, BN, BK>` with the matching tile
-/// dimensions; the variant name encodes:
-///   - The output tile shape (`64x64`, `64x128`, …) — selector gating; and
-///   - Whether the call takes the cached-pipeline fast path
-///     ([`Tile64x64Cached`](Self::Tile64x64Cached)) or the IR-build fallback
-///     ([`Tile64x64`](Self::Tile64x64)).
-///
-/// [`Q8Wide64x128`](Self::Q8Wide64x128) shares the IR and dispatch tuple of
-/// [`Tile64x128`](Self::Tile64x128) but a different selector rule (Q8_0 with
-/// `N >= 8192` and a 32 KB workgroup-storage device cap), giving it its own
-/// cache slot for future tuning.
+/// (BM, BN) tile dimensions for a cooperative-matrix qmatmul tile. BK is
+/// pinned to 32 (cooperative-matrix MMA shape: 8x8x8 along K, 4 lanes per
+/// subgroup) so it isn't carried in the struct.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-enum QMatmulDirectVariant {
-    Q5SmallSingleRow,
+pub(super) struct QCoopTile {
+    pub bm: u32,
+    pub bn: u32,
+}
+
+impl QCoopTile {
+    pub(super) const fn new(bm: u32, bn: u32) -> Self {
+        Self { bm, bn }
+    }
+}
+
+/// Chosen kernel path for a direct quantized matmul.
+///
+/// - [`SingleRow`](Self::SingleRow) / [`Q5SmallSingleRow`](Self::Q5SmallSingleRow):
+///   single-row qgemv specializations; the [`QCoopTile`] payload is not used.
+/// - [`Q8Wide`](Self::Q8Wide): Q8_0-specific tile path that shares the IR of
+///   [`Tile`](Self::Tile) `{tile=(64, 128)}` but lives in its own cache slot
+///   (selector rule gates on Q8_0 + N>=8192 + 32 KB workgroup storage).
+/// - [`Tile`](Self::Tile) `{cached: true}` uses the precomputed
+///   `[n/64, m/64, 1]` dispatch + storage3 cached-pipeline fast path
+///   (previously `Tile64x64Cached`); `cached: false` is the IR-build path
+///   used by every other tile geometry including the unaligned catch-all.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+enum QMatmulPath {
     SingleRow,
-    Q8Wide64x128,
-    Tile128x128,
-    Tile128x64,
-    Tile64x128,
-    /// Same IR as [`Tile64x64`](Self::Tile64x64); uses the precomputed
-    /// `[n/64, m/64, 1]` dispatch + storage3 cached-pipeline fast path. The
-    /// `Tile64x64` variant is the IR-build fallback when the precomputed
-    /// dispatch can't be cached.
-    Tile64x64Cached,
-    Tile64x32,
-    Tile64x64,
+    Q5SmallSingleRow,
+    Q8Wide(QCoopTile),
+    Tile { tile: QCoopTile, cached: bool },
 }
 
 struct QMatmulDirectFastKernelVariant;
@@ -137,34 +139,23 @@ struct QMatmulPairedDenseFallbackKernelVariant;
 
 const QMATMUL_DIRECT_KERNEL_GENERATION: u64 = 0x514D_4154_4D49_5831;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-enum QgemvColsVariant {
-    Q4KSmallWide4,
-    Q4KSmallWide8,
-    Q4KLargeNarrow8,
-    Q6KSmallWide8,
-    Q6KLargeNarrow4,
-    Q8WideAccelerated32,
-    FormatAccelerated,
-    Q5Small8,
-    Default4,
-}
-
 #[derive(Clone, Copy, Debug)]
 struct QMatmulDirectCtx {
     format: tile_ir::GgmlQuantFormat,
     y_supports_coop: bool,
 }
 
-#[derive(Clone, Copy, Debug)]
-struct QgemvColsCtx {
-    format: tile_ir::GgmlQuantFormat,
-}
-
-fn qmatmul_direct_selector() -> ShapeSelector<3, QMatmulDirectCtx, QMatmulDirectVariant> {
+fn qmatmul_direct_selector() -> ShapeSelector<3, QMatmulDirectCtx, QMatmulPath> {
+    /// Helper to build a `Tile` variant with a given tile + cached flag.
+    const fn tile(bm: u32, bn: u32, cached: bool) -> QMatmulPath {
+        QMatmulPath::Tile {
+            tile: QCoopTile::new(bm, bn),
+            cached,
+        }
+    }
     ShapeSelector::new()
         .rule(
-            QMatmulDirectVariant::Q5SmallSingleRow,
+            QMatmulPath::Q5SmallSingleRow,
             ShapeRule::<3, QMatmulDirectCtx>::new()
                 .axis(QMAT_M, eq(1))
                 .axis(QMAT_K, range(0..=1024))
@@ -172,11 +163,11 @@ fn qmatmul_direct_selector() -> ShapeSelector<3, QMatmulDirectCtx, QMatmulDirect
                 .when_ctx(|ctx: &QMatmulDirectCtx| ctx.format == tile_ir::GgmlQuantFormat::Q5_0),
         )
         .rule(
-            QMatmulDirectVariant::SingleRow,
+            QMatmulPath::SingleRow,
             ShapeRule::new().axis(QMAT_M, eq(1)),
         )
         .rule(
-            QMatmulDirectVariant::Q8Wide64x128,
+            QMatmulPath::Q8Wide(QCoopTile::new(64, 128)),
             ShapeRule::new()
                 .axis(QMAT_M, multiple_of(64))
                 .axis(QMAT_K, range(0..=1024))
@@ -189,7 +180,7 @@ fn qmatmul_direct_selector() -> ShapeSelector<3, QMatmulDirectCtx, QMatmulDirect
                 }),
         )
         .rule(
-            QMatmulDirectVariant::Tile128x128,
+            tile(128, 128, false),
             ShapeRule::new()
                 .axis(QMAT_M, multiple_of(128))
                 .axis(QMAT_K, multiple_of(32))
@@ -201,7 +192,7 @@ fn qmatmul_direct_selector() -> ShapeSelector<3, QMatmulDirectCtx, QMatmulDirect
                 }),
         )
         .rule(
-            QMatmulDirectVariant::Tile128x64,
+            tile(128, 64, false),
             ShapeRule::new()
                 .axis(QMAT_M, multiple_of(128))
                 .axis(QMAT_K, multiple_of(32))
@@ -209,7 +200,7 @@ fn qmatmul_direct_selector() -> ShapeSelector<3, QMatmulDirectCtx, QMatmulDirect
                 .when(qmatmul_coop_rule_supported),
         )
         .rule(
-            QMatmulDirectVariant::Tile64x128,
+            tile(64, 128, false),
             ShapeRule::new()
                 .axis(QMAT_M, multiple_of(64))
                 .axis(QMAT_K, multiple_of(32))
@@ -217,7 +208,7 @@ fn qmatmul_direct_selector() -> ShapeSelector<3, QMatmulDirectCtx, QMatmulDirect
                 .when(qmatmul_coop_rule_supported),
         )
         .rule(
-            QMatmulDirectVariant::Tile64x64Cached,
+            tile(64, 64, true), // Tile64x64Cached
             ShapeRule::<3, QMatmulDirectCtx>::new()
                 .axis(QMAT_M, multiple_of(64))
                 .axis(QMAT_K, multiple_of(32))
@@ -230,7 +221,7 @@ fn qmatmul_direct_selector() -> ShapeSelector<3, QMatmulDirectCtx, QMatmulDirect
                 ),
         )
         .rule(
-            QMatmulDirectVariant::Tile64x32,
+            tile(64, 32, false),
             ShapeRule::new()
                 .axis(QMAT_M, multiple_of(64))
                 .axis(QMAT_K, multiple_of(32))
@@ -242,7 +233,7 @@ fn qmatmul_direct_selector() -> ShapeSelector<3, QMatmulDirectCtx, QMatmulDirect
                     },
                 ),
         )
-        .rule(QMatmulDirectVariant::Tile64x64, ShapeRule::new())
+        .rule(tile(64, 64, false), ShapeRule::new())
 }
 
 fn qmatmul_coop_rule_supported(
@@ -260,7 +251,7 @@ fn select_qmatmul_direct_variant(
     n: u32,
     y_supports_coop: bool,
     caps: KernelDeviceCaps,
-) -> QMatmulDirectVariant {
+) -> QMatmulPath {
     let shape = KernelShape::new([m as usize, k as usize, n as usize]);
     let ctx = QMatmulDirectCtx {
         format,
@@ -271,134 +262,6 @@ fn select_qmatmul_direct_variant(
         .expect("quantized matmul selector has a catch-all rule")
 }
 
-/// `.when_ctx(...)` predicate that matches a single quantization format.
-fn qgemv_format(f: tile_ir::GgmlQuantFormat) -> impl Fn(&QgemvColsCtx) -> bool {
-    move |ctx| ctx.format == f
-}
-
-/// `.when(...)` predicate that matches a single quantization format plus
-/// an extra shape constraint.
-fn qgemv_format_and(
-    f: tile_ir::GgmlQuantFormat,
-    pred: impl Fn(KernelShape<2>) -> bool,
-) -> impl Fn(KernelShape<2>, &QgemvColsCtx, KernelDeviceCaps) -> bool {
-    move |shape, ctx, _caps| ctx.format == f && pred(shape)
-}
-
-fn qgemv_cols_selector() -> ShapeSelector<2, QgemvColsCtx, QgemvColsVariant> {
-    use tile_ir::GgmlQuantFormat::{Q4K, Q5_0, Q6K, Q8_0};
-
-    // Many of the rules below come in pairs: a first rule with bounded axis
-    // ranges (so the shape generator in selection tests can synthesize a
-    // matching shape) and a broader fallback rule using a `.when()` predicate
-    // that covers shapes beyond the bounded range. Both rules return the
-    // same variant; the bounded rule exists for `generate_for`, the broader
-    // rule for runtime catch-all of the same intent.
-    ShapeSelector::new()
-        .rule(
-            QgemvColsVariant::Q4KSmallWide4,
-            ShapeRule::new()
-                .axis(QGEMV_K, range(0..=4096))
-                .axis(QGEMV_N, range(4096..8192))
-                .when_ctx(qgemv_format(Q4K)),
-        )
-        .rule(
-            QgemvColsVariant::Q4KSmallWide8,
-            ShapeRule::new()
-                .axis(QGEMV_K, range(0..=4096))
-                .axis(QGEMV_N, range(8192..=16384))
-                .when_ctx(qgemv_format(Q4K)),
-        )
-        .rule(
-            QgemvColsVariant::Q4KSmallWide8,
-            ShapeRule::new().axis(QGEMV_K, range(0..=4096)).when(
-                qgemv_format_and(Q4K, |shape| shape[QGEMV_N] >= 8192),
-            ),
-        )
-        .rule(
-            QgemvColsVariant::Q4KLargeNarrow8,
-            ShapeRule::new().axis(QGEMV_N, range(0..=4096)).when(
-                qgemv_format_and(Q4K, |shape| shape[QGEMV_K] > 4096),
-            ),
-        )
-        .rule(
-            QgemvColsVariant::Q6KSmallWide8,
-            ShapeRule::new()
-                .axis(QGEMV_K, range(0..=4096))
-                .axis(QGEMV_N, range(8192..=16384))
-                .when_ctx(qgemv_format(Q6K)),
-        )
-        .rule(
-            QgemvColsVariant::Q6KSmallWide8,
-            ShapeRule::new().axis(QGEMV_K, range(0..=4096)).when(
-                qgemv_format_and(Q6K, |shape| shape[QGEMV_N] >= 8192),
-            ),
-        )
-        .rule(
-            QgemvColsVariant::Q6KLargeNarrow4,
-            ShapeRule::new().axis(QGEMV_N, range(0..=4096)).when(
-                qgemv_format_and(Q6K, |shape| shape[QGEMV_K] > 4096),
-            ),
-        )
-        .rule(
-            QgemvColsVariant::Q8WideAccelerated32,
-            ShapeRule::new()
-                .axis(QGEMV_K, range(0..=1024))
-                .axis(QGEMV_N, range(8192..=16384))
-                .when_ctx(qgemv_format(Q8_0)),
-        )
-        .rule(
-            QgemvColsVariant::Q8WideAccelerated32,
-            ShapeRule::new().axis(QGEMV_K, range(0..=1024)).when(
-                qgemv_format_and(Q8_0, |shape| shape[QGEMV_N] >= 8192),
-            ),
-        )
-        .rule(
-            QgemvColsVariant::FormatAccelerated,
-            ShapeRule::new()
-                .axis(QGEMV_K, range(2048..=4096))
-                .axis(QGEMV_N, range(2048..=4096))
-                .when_ctx(qgemv_format(Q5_0)),
-        )
-        .rule(
-            QgemvColsVariant::FormatAccelerated,
-            ShapeRule::new().when(|shape: KernelShape<2>, ctx: &QgemvColsCtx, _caps| {
-                ctx.format == Q4K
-                    || ctx.format == Q6K
-                    || (ctx.format == Q5_0
-                        && shape[QGEMV_K]
-                            .checked_mul(shape[QGEMV_N])
-                            .is_some_and(|elements| elements >= 4 * 1024 * 1024))
-            }),
-        )
-        .rule(
-            QgemvColsVariant::Q5Small8,
-            ShapeRule::new()
-                .axis(QGEMV_K, range(0..=1024))
-                .axis(QGEMV_N, range(0..=4096))
-                .when_ctx(qgemv_format(Q5_0)),
-        )
-        .rule(QgemvColsVariant::Default4, ShapeRule::new())
-}
-
-fn select_qgemv_cols_variant(format: tile_ir::GgmlQuantFormat, k: u32, n: u32) -> QgemvColsVariant {
-    qgemv_cols_selector()
-        .select(
-            KernelShape::new([k as usize, n as usize]),
-            &QgemvColsCtx { format },
-            KernelDeviceCaps {
-                subgroups_supported: false,
-                cooperative_matrix: CooperativeMatrixCaps::default(),
-                min_subgroup_size: 0,
-                max_subgroup_size: 0,
-                max_compute_invocations_per_workgroup: 0,
-                max_compute_workgroup_storage_size: 0,
-                max_compute_workgroup_size_x: 0,
-                backend: wgpu::Backend::Noop,
-            },
-        )
-        .expect("qgemv column selector has a catch-all rule")
-}
 
 fn matmul_m_size(shape: &[usize]) -> u32 {
     shape[shape.len() - 2] as u32
@@ -644,7 +507,7 @@ fn qmatmul_post_expr_is_column_add(expr: &ElementwiseEpilogue) -> bool {
 }
 
 fn qmatmul_variant_supports_coop_acc_init(
-    variant: QMatmulDirectVariant,
+    variant: QMatmulPath,
     m: u32,
     k: u32,
     n: u32,
@@ -653,19 +516,13 @@ fn qmatmul_variant_supports_coop_acc_init(
     if !y_supports_coop || m <= 1 || !k.is_multiple_of(32) {
         return false;
     }
-    match variant {
-        QMatmulDirectVariant::Q8Wide64x128 | QMatmulDirectVariant::Tile64x128 => {
-            m.is_multiple_of(64) && n.is_multiple_of(128)
-        }
-        QMatmulDirectVariant::Tile128x128 => m.is_multiple_of(128) && n.is_multiple_of(128),
-        QMatmulDirectVariant::Tile128x64 => m.is_multiple_of(128) && n.is_multiple_of(64),
-        QMatmulDirectVariant::Tile64x64Cached | QMatmulDirectVariant::Tile64x64 => {
-            m.is_multiple_of(64) && n.is_multiple_of(64)
-        }
-        QMatmulDirectVariant::Tile64x32 => m.is_multiple_of(64) && n.is_multiple_of(32),
-        QMatmulDirectVariant::Q5SmallSingleRow | QMatmulDirectVariant::SingleRow => false,
-    }
+    let tile = match variant {
+        QMatmulPath::Q8Wide(tile) | QMatmulPath::Tile { tile, .. } => tile,
+        QMatmulPath::Q5SmallSingleRow | QMatmulPath::SingleRow => return false,
+    };
+    m.is_multiple_of(tile.bm) && n.is_multiple_of(tile.bn)
 }
+
 
 enum QmatmulExtraStorage {
     Column(tile_ir::tile::Storage<tile_ir::F32, 1>),
@@ -822,20 +679,46 @@ fn tile_cooperative_store_layout_supported(layout: &tile_ir::Layout) -> bool {
     strides[0] == 1 || strides[1] == 1
 }
 
+/// Output columns per workgroup for the direct qgemv path, by (format, K, N).
+/// Each branch below corresponds to one rule of the former `QgemvColsVariant`
+/// selector — collapsed to its numeric value here.
 fn qgemv_cols_per_workgroup_for_direct(format: tile_ir::GgmlQuantFormat, k: u32, n: u32) -> u32 {
-    match select_qgemv_cols_variant(format, k, n) {
-        QgemvColsVariant::Q4KSmallWide4 => 4,
-        QgemvColsVariant::Q4KSmallWide8 => 8,
-        QgemvColsVariant::Q4KLargeNarrow8 => 8,
-        QgemvColsVariant::Q6KSmallWide8 => 8,
-        QgemvColsVariant::Q6KLargeNarrow4 => 4,
-        QgemvColsVariant::Q8WideAccelerated32 => 4 * 8,
-        QgemvColsVariant::FormatAccelerated => {
-            tile_ir_kernels::qgemv_cols_per_workgroup_for_shape(format, k, n)
-        }
-        QgemvColsVariant::Q5Small8 => 8,
-        QgemvColsVariant::Default4 => 4,
+    use tile_ir::GgmlQuantFormat::{Q4K, Q5_0, Q6K, Q8_0};
+    // Q4K specializations.
+    if format == Q4K && k <= 4096 && (4096..8192).contains(&n) {
+        return 4; // was Q4KSmallWide4
     }
+    if format == Q4K && k <= 4096 && n >= 8192 {
+        return 8; // was Q4KSmallWide8
+    }
+    if format == Q4K && n <= 4096 && k > 4096 {
+        return 8; // was Q4KLargeNarrow8
+    }
+    // Q6K specializations.
+    if format == Q6K && k <= 4096 && n >= 8192 {
+        return 8; // was Q6KSmallWide8
+    }
+    if format == Q6K && n <= 4096 && k > 4096 {
+        return 4; // was Q6KLargeNarrow4
+    }
+    // Q8_0 wide.
+    if format == Q8_0 && k <= 1024 && n >= 8192 {
+        return 32; // was Q8WideAccelerated32
+    }
+    // FormatAccelerated: Q5_0 mid (K,N both 2048..=4096), Q4K/Q6K general,
+    // or Q5_0 large (K*N >= 4M). Delegates to the format-aware helper.
+    let q5_mid = format == Q5_0 && (2048..=4096).contains(&k) && (2048..=4096).contains(&n);
+    let q5_large = format == Q5_0
+        && (k as u64)
+            .checked_mul(n as u64)
+            .is_some_and(|elements| elements >= 4 * 1024 * 1024);
+    if q5_mid || format == Q4K || format == Q6K || q5_large {
+        return tile_ir_kernels::qgemv_cols_per_workgroup_for_shape(format, k, n);
+    }
+    if format == Q5_0 && k <= 1024 && n <= 4096 {
+        return 8; // was Q5Small8
+    }
+    4 // was Default4
 }
 
 /// Public re-export of [`qmatmul_m_pad_target`] for crate-internal callers

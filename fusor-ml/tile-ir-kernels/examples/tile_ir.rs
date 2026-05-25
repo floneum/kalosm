@@ -89,13 +89,15 @@ fn qmatmul_ir(format: GgmlQuantFormat, m: u32, n: u32, k: u32) -> KernelIr {
         let b = tile_ir_kernels::quantized_matrix(phase, format, k, n);
         let y = phase.storage_write::<F32, 2>(Shape::new([m, n]));
 
-        tile_ir_kernels::qmatmul_with_epilogue::<8, 4, 8>(
+        tile_ir_kernels::qmatmul_with_epilogue(
             phase,
             &a,
             &b,
             &y,
             4,
             &tile_ir_kernels::QmatmulEpilogues::empty(),
+            8,
+            4,
         );
     })
 }
@@ -106,7 +108,7 @@ fn qgemv_ir(format: GgmlQuantFormat, n: u32, k: u32) -> KernelIr {
         let b = tile_ir_kernels::quantized_matrix(phase, format, k, n);
         let y = phase.storage_write::<F32, 2>(Shape::new([1, n]));
 
-        tile_ir_kernels::qgemv_with_epilogue::<4, 64>(
+        tile_ir_kernels::qgemv_with_epilogue(
             phase,
             &a,
             &b,
@@ -127,7 +129,7 @@ fn qgemv_with_silu_epilogue_ir(format: GgmlQuantFormat, n: u32, k: u32) -> Kerne
         // the quantized dot product, then injects this epilogue before the
         // store so activation fusion does not need a second dispatch.
         let silu = tile_ir_kernels::UnaryEpilogue::new("silu", |value| value.silu());
-        tile_ir_kernels::qgemv_with_epilogue::<4, 64>(phase, &a, &b, &y, 1, Some(&silu));
+        tile_ir_kernels::qgemv_with_epilogue(phase, &a, &b, &y, 1, Some(&silu));
     })
 }
 
