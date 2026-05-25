@@ -360,7 +360,7 @@ where
         match self {
             Tensor::Cpu(t) => Ok(t.as_slice().map_bytes(EitherMappedBuffer::Cpu)),
             Tensor::Gpu(t) => {
-                let mapped = t.as_slice().await.map_err(|err| Error::Gpu(err.into()))?;
+                let mapped = t.as_slice().await.map_err(Error::Gpu)?;
                 Ok(mapped.map_bytes(EitherMappedBuffer::Gpu))
             }
         }
@@ -431,10 +431,7 @@ where
                 Ok(top)
             }
             Tensor::Gpu(t) => {
-                let (ids, values) = t
-                    .top_k_pairs(k)
-                    .await
-                    .map_err(|err| Error::Gpu(err.into()))?;
+                let (ids, values) = t.top_k_pairs(k).await.map_err(Error::Gpu)?;
                 Ok(ids.into_iter().zip(values).collect())
             }
         }
@@ -457,7 +454,7 @@ where
             Tensor::Gpu(t) => t
                 .sample_mirostat2_token(sampler, previous_tokens, params)
                 .await
-                .map_err(|err| Error::Gpu(err.into())),
+                .map_err(Error::Gpu),
         }
     }
 
@@ -472,7 +469,7 @@ where
             (Tensor::Gpu(t), crate::QMatrix::Gpu(weights)) => t
                 .try_sample_mirostat2_token_q_mat(weights, sampler, previous_tokens, params)
                 .await
-                .map_err(|err| Error::Gpu(err.into())),
+                .map_err(Error::Gpu),
             _ => Ok(None),
         }
     }
@@ -1344,7 +1341,7 @@ where
                 Ok(slice.as_scalar())
             }
             Tensor::Gpu(t) => {
-                let result = t.to_scalar().await.map_err(|e| Error::Gpu(e.into()))?;
+                let result = t.to_scalar().await.map_err(Error::Gpu)?;
                 Ok(result)
             }
         }

@@ -522,6 +522,7 @@ pub fn try_batched_coop_matmul<
 /// cooperatively stores the result. Both variants only differ in the
 /// per-pass K-buffering body, so they share this shell.
 #[inline]
+#[allow(clippy::too_many_arguments)]
 fn coop_perf_pass_loop<T: CoopElement, F>(
     program: &mut TileBlock<'_>,
     n_passes: u32,

@@ -126,8 +126,10 @@ pub(crate) struct QwenVLRopeCache<F: FloatDataType + SimdElement = f32> {
     // Arc-shared so every layer in the model points at the same memo table:
     // attention layers clone their `RopeImplementation`, but we want one
     // cache that fills on the first layer and serves the rest.
-    cached: Arc<Mutex<Option<(u64, Tensor<2, f32>, Tensor<2, f32>)>>>,
+    cached: Arc<Mutex<Option<QwenVLRopeCacheEntry>>>,
 }
+
+type QwenVLRopeCacheEntry = (u64, Tensor<2, f32>, Tensor<2, f32>);
 
 impl<F: FloatDataType + SimdElement> Clone for QwenVLRopeCache<F> {
     fn clone(&self) -> Self {
@@ -275,51 +277,53 @@ fn split<const R: usize, T: DataType + SimdElement>(
 }
 
 #[cfg(test)]
-#[tokio::test]
-async fn test_rope_cache() {
-    use fusor::{Device, RopeCache, Tensor};
+#[test]
+fn test_rope_cache() {
+    pollster::block_on(async {
+        use fusor::{Device, RopeCache, Tensor};
 
-    let config: LlamaConfig<f32> = LlamaConfig::mock_test();
-    let device = Device::new().await.unwrap();
-    let cache = RopeCache::new(
-        config.head_dimension,
-        config.context_length,
-        config.rope_theta,
-        &device,
-    )
-    .unwrap();
-
-    let expected_cos: Tensor<2, f32> = Tensor::new(
-        &device,
-        &[
-            1.0000f32, 0.5403f32, -0.4161f32, -0.9900f32, -0.6536f32, 0.2837f32,
-        ],
-    )
-    .reshape([6, 1])
-    .to_concrete();
-    let expected_sin: Tensor<2, f32> = Tensor::new(
-        &device,
-        &[
-            0.0000f32, 0.8415f32, 0.9093f32, 0.1411f32, -0.7568f32, -0.9589f32,
-        ],
-    )
-    .reshape([6, 1])
-    .to_concrete();
-
-    let cos_error: f32 = (cache.cos().clone() - expected_cos)
-        .abs()
-        .sum(0)
-        .sum(0)
-        .to_scalar()
-        .await
+        let config: LlamaConfig<f32> = LlamaConfig::mock_test();
+        let device = Device::new().await.unwrap();
+        let cache = RopeCache::new(
+            config.head_dimension,
+            config.context_length,
+            config.rope_theta,
+            &device,
+        )
         .unwrap();
-    assert!(cos_error < 1e-2);
-    let sin_error: f32 = (cache.sin().clone() - expected_sin)
-        .abs()
-        .sum(0)
-        .sum(0)
-        .to_scalar()
-        .await
-        .unwrap();
-    assert!(sin_error < 1e-2);
+
+        let expected_cos: Tensor<2, f32> = Tensor::new(
+            &device,
+            &[
+                1.0000f32, 0.5403f32, -0.4161f32, -0.9900f32, -0.6536f32, 0.2837f32,
+            ],
+        )
+        .reshape([6, 1])
+        .to_concrete();
+        let expected_sin: Tensor<2, f32> = Tensor::new(
+            &device,
+            &[
+                0.0000f32, 0.8415f32, 0.9093f32, 0.1411f32, -0.7568f32, -0.9589f32,
+            ],
+        )
+        .reshape([6, 1])
+        .to_concrete();
+
+        let cos_error: f32 = (cache.cos().clone() - expected_cos)
+            .abs()
+            .sum(0)
+            .sum(0)
+            .to_scalar()
+            .await
+            .unwrap();
+        assert!(cos_error < 1e-2);
+        let sin_error: f32 = (cache.sin().clone() - expected_sin)
+            .abs()
+            .sum(0)
+            .sum(0)
+            .to_scalar()
+            .await
+            .unwrap();
+        assert!(sin_error < 1e-2);
+    })
 }

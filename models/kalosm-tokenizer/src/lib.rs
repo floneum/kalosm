@@ -1229,6 +1229,7 @@ fn append_candidate_range(
     next_candidate_new_tokens.extend_from_slice(new_tokens);
 }
 
+#[allow(clippy::too_many_arguments)]
 fn append_lookup_candidate(
     merges: &MergeLookup,
     left: u32,

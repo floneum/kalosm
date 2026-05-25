@@ -86,7 +86,7 @@ fn main() {
 
         let data = vec![vec![1.0f32; 100]; 100];
         let tensor = Tensor::new(&device, &data);
-        _ = tensor.as_slice().await.unwrap();
+        _ = tensor.as_slice::<2, f32>().await.unwrap();
 
         let add = tensor.clone() + 1.0;
         add.materialize().await;

@@ -72,6 +72,8 @@ pub struct FlashDecodeSmallMeta {
     pub decode_block: u32,
     /// Whether to use the tiled decode path for long active KV lengths.
     pub tiled: bool,
+    /// Number of KV tiles used by the split decode path.
+    pub split_blocks: u32,
     /// Query-heads per KV-head group.
     pub groups: u32,
     /// Query tensor element offset.

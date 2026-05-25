@@ -626,6 +626,54 @@ async fn f16_matmul_multi_tile_matches_host_reference() {
 }
 
 #[tokio::test]
+async fn matmul_non_affine_prefix_matches_host_reference() {
+    // 4D matmul with permuted batch dimensions. The contiguous source has
+    // strides `[B1*M*K, M*K, K, 1]`; permuting `[0, 1, 2, 3] -> [1, 0, 2, 3]`
+    // gives strides `[M*K, B1*M*K, K, 1]`, which is not affine across the
+    // batch prefix (`strides[0] != strides[1] * shape[1]`). This forces
+    // `flatten_matrix_layout` down the `MultiFlattenMap` branch instead of
+    // the affine `Layout::strided` fast path. Regression test for dense
+    // matmul handling of arbitrary strided inputs.
+    const B0: usize = 2;
+    const B1: usize = 3;
+    const M: usize = 4;
+    const K: usize = 5;
+    const N: usize = 6;
+
+    fn data(seed: u32, total: usize) -> Vec<f32> {
+        (0..total)
+            .map(|i| {
+                let v = ((i + seed as usize) % 31) as f32;
+                (v - 15.0) * 0.05
+            })
+            .collect()
+    }
+
+    let lhs_data = data(0, B0 * B1 * M * K);
+    let rhs_data = data(7, B0 * B1 * K * N);
+
+    let cpu_lhs = Tensor::from_slice(&Device::Cpu, [B0, B1, M, K], &lhs_data);
+    let cpu_rhs = Tensor::from_slice(&Device::Cpu, [B0, B1, K, N], &rhs_data);
+    // Swap the batch dims so the prefix becomes non-affine.
+    let expected = cpu_lhs
+        .permute([1, 0, 2, 3])
+        .matmul(&cpu_rhs.permute([1, 0, 2, 3]))
+        .to_concrete();
+
+    for device in available_devices().await {
+        let lhs = Tensor::from_slice(&device, [B0, B1, M, K], &lhs_data);
+        let rhs = Tensor::from_slice(&device, [B0, B1, K, N], &rhs_data);
+        let actual = lhs
+            .permute([1, 0, 2, 3])
+            .matmul(&rhs.permute([1, 0, 2, 3]))
+            .to_concrete();
+        fusor_conformance::approx_eq(&actual, &expected, 1e-3)
+            .await
+            .unwrap();
+    }
+}
+
+#[tokio::test]
 async fn matmul_large_fuzzed() {
     const M: usize = 256;
     const K: usize = 256;

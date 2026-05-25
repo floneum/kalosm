@@ -51,9 +51,9 @@ fn bench_flash_attention_vision(device: &Device) {
     // Mirror the vision attention shape: 16 heads, seq=1944, head_dim=80,
     // unmasked self-attention (the per-window mask is dense and irrelevant
     // to throughput).
-    let q = Tensor::<4, f32>::splat(device, 0.1, [1, 16, 1944, 80]);
-    let k = Tensor::<4, f32>::splat(device, 0.1, [1, 16, 1944, 80]);
-    let v = Tensor::<4, f32>::splat(device, 0.1, [1, 16, 1944, 80]);
+    let q = Tensor::splat(device, 0.1f32, [1, 16, 1944, 80]);
+    let k = Tensor::splat(device, 0.1f32, [1, 16, 1944, 80]);
+    let v = Tensor::splat(device, 0.1f32, [1, 16, 1944, 80]);
     q.materialize_sync();
     k.materialize_sync();
     v.materialize_sync();
@@ -103,7 +103,7 @@ fn bench_flash_attention_vision(device: &Device) {
     println!("  min_ms:  {:.3}", min.as_secs_f64() * 1000.0);
 
     // Now bench WITH a mask (matches vision attention call site).
-    let mask: Tensor<2, f32> = Tensor::<2, f32>::splat(device, 0.0, [1944, 1944]);
+    let mask: Tensor = Tensor::splat(device, 0.0f32, [1944, 1944]);
     mask.materialize_sync();
 
     // Bench with TRANSPOSED Q/K/V layout — the model produces Q via
@@ -161,8 +161,8 @@ fn bench_flash_attention_vision(device: &Device) {
 }
 
 fn bench_matmul(device: &Device, name: &str, m: usize, k: usize, n: usize) {
-    let a = Tensor::<3, f32>::splat(device, 0.001, [1, m, k]);
-    let b = Tensor::<3, f32>::splat(device, 0.001, [1, k, n]);
+    let a = Tensor::splat(device, 0.001f32, [1, m, k]);
+    let b = Tensor::splat(device, 0.001f32, [1, k, n]);
     a.materialize_sync();
     b.materialize_sync();
 
@@ -207,7 +207,7 @@ fn bench_matmul(device: &Device, name: &str, m: usize, k: usize, n: usize) {
     print_summary(name, m, k, n, &samples, kernels, gflops);
 }
 
-fn run_batch(device: &Device, a: &Tensor<3, f32>, b: &Tensor<3, f32>) -> (Duration, usize) {
+fn run_batch(device: &Device, a: &Tensor, b: &Tensor) -> (Duration, usize) {
     let mut keys = Vec::with_capacity(DISPATCHES_PER_BATCH);
     let mut outputs = Vec::with_capacity(DISPATCHES_PER_BATCH);
     for _ in 0..DISPATCHES_PER_BATCH {

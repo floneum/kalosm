@@ -1104,6 +1104,13 @@ fn flash_decode_small_block<const BLOCK: usize, B>(
         program.workgroup_barrier();
         reduce_workgroup(program, reduce, lane.clone(), |lhs, rhs| lhs.max(rhs));
         let max_score = program.load_workgroup(reduce, 0);
+        program.store_local(&max_score_local, max_score);
+        let max_score = program.load_local(&max_score_local);
+
+        // All lanes load `reduce[0]` (the max) above. Before any lane
+        // overwrites `reduce[lane]` for the denominator accumulator we need a
+        // barrier; otherwise lane 0 can race with lanes still loading slot 0.
+        program.workgroup_barrier();
         let score_value = program.load_workgroup(scores, lane.clone());
         let raw_prob = (score_value - max_score).exp();
         let prob = Tile::select(
@@ -1146,6 +1153,267 @@ fn flash_decode_small_block<const BLOCK: usize, B>(
             );
         });
     });
+}
+
+fn flash_decode_split_partials_block<const BLOCK: usize, B>(
+    kb: &mut fusor_tile_ir::KernelBuilder<B>,
+    q: fusor_tile_ir::KernelTensorRef<B>,
+    k: fusor_tile_ir::KernelTensorRef<B>,
+    v: fusor_tile_ir::KernelTensorRef<B>,
+    scratch: fusor_tile_ir::KernelTensorRef<B>,
+    params: fusor_tile_ir::KernelTensorRef<B>,
+    meta: FlashDecodeSmallMeta,
+) {
+    let q = kb.read::<F32, 1>(q);
+    let k = kb.read::<F32, 1>(k);
+    let v = kb.read::<F32, 1>(v);
+    let scratch = kb.write::<F32, 1>(scratch);
+    let params = kb.read::<U32, 1>(params);
+    let phase = kb.program();
+    let scores = phase.alloc_workgroup_array::<F32>(BLOCK as u32);
+    let probs = phase.alloc_workgroup_array::<F32>(BLOCK as u32);
+    let reduce = phase.alloc_workgroup_array::<F32>(BLOCK as u32);
+
+    phase.program_grid::<BLOCK>(
+        [
+            meta.dims.batch * meta.dims.num_heads * meta.split_blocks,
+            1,
+            1,
+        ],
+        |program| {
+            let lane = program.lane();
+            let tile = program.program_id(WorkgroupAxis::X);
+            let rows = Tile::literal(TileLiteral::U32(meta.dims.batch * meta.dims.num_heads));
+            let row = program.bind(tile.clone() % rows.clone());
+            let split_block = program.bind(tile / rows);
+            let active_kv_len = program.load(
+                params.at(0),
+                Mask::all(),
+                TileLiteral::U32(meta.active_kv_len),
+            );
+            let head_idx = program.index(row.clone() % meta.dims.num_heads);
+            let batch_idx = program.index(row.clone() / meta.dims.num_heads);
+            let kv_head_idx = head_idx.clone() / Tile::literal(TileLiteral::U32(meta.groups));
+            let lane_value = program.index(lane.clone());
+            let tile_base = program
+                .bind(split_block.clone() * Tile::literal(TileLiteral::U32(meta.decode_block)));
+            let tile_end = program.bind(
+                (tile_base.clone() + Tile::literal(TileLiteral::U32(meta.decode_block)))
+                    .min(active_kv_len.clone()),
+            );
+            let kv = program.bind(tile_base.clone() + lane_value.clone());
+            let kv_valid = kv.clone().lt(tile_end.clone());
+            let item = program.private::<U32>();
+            let acc = program.private::<F32>();
+            let dim = program.private::<U32>();
+            let score_acc = program.private::<F32>();
+            let max_score_local = program.private::<F32>();
+
+            program.store_workgroup(
+                scores,
+                lane.clone(),
+                Tile::literal(TileLiteral::f32(NEG_MAX_F32)),
+            );
+            program.store_workgroup(
+                reduce,
+                lane.clone(),
+                Tile::literal(TileLiteral::f32(NEG_MAX_F32)),
+            );
+            program.if_then(kv_valid.clone(), |program| {
+                let score = decode_score_for_kv(
+                    program,
+                    DecodeScoreForKv {
+                        q: &q,
+                        k: &k,
+                        meta,
+                        batch_idx: batch_idx.clone(),
+                        head_idx: head_idx.clone(),
+                        kv_head_idx: kv_head_idx.clone(),
+                        kv: kv.clone(),
+                        score_acc: &score_acc,
+                        dim_local: &dim,
+                    },
+                );
+                program.store_workgroup(scores, lane.clone(), score.clone());
+                program.store_workgroup(reduce, lane.clone(), score);
+            });
+            program.workgroup_barrier();
+            reduce_workgroup(program, reduce, lane.clone(), |lhs, rhs| lhs.max(rhs));
+            let max_score = program.load_workgroup(reduce, 0);
+            program.store_local(&max_score_local, max_score);
+            let max_score = program.load_local(&max_score_local);
+
+            // See the non-tiled decode path above: lane 0 must not overwrite
+            // `reduce[0]` before every lane has copied the max out.
+            program.workgroup_barrier();
+            let score_value = program.load_workgroup(scores, lane.clone());
+            let raw_prob = (score_value - max_score.clone()).exp();
+            let prob = Tile::select(
+                kv_valid.clone(),
+                raw_prob,
+                Tile::literal(TileLiteral::f32(0.0)),
+            );
+            program.store_workgroup(probs, lane.clone(), prob.clone());
+            program.store_workgroup(reduce, lane.clone(), prob);
+            program.workgroup_barrier();
+            reduce_workgroup(program, reduce, lane.clone(), |lhs, rhs| lhs + rhs);
+            let denom = program.load_workgroup(reduce, 0);
+
+            let scratch_base = program.bind(
+                (row.clone() * Tile::literal(TileLiteral::U32(meta.split_blocks))
+                    + split_block.clone())
+                    * Tile::literal(TileLiteral::U32(DECODE_HEAD_DIM + 2)),
+            );
+            program.if_then(
+                lane_value.clone().eq(Tile::literal(TileLiteral::U32(0))),
+                |program| {
+                    program.store(
+                        scratch.at(scratch_base.clone() + DECODE_HEAD_DIM),
+                        denom,
+                        Mask::all(),
+                    );
+                    program.store(
+                        scratch.at(scratch_base.clone() + DECODE_HEAD_DIM + 1),
+                        max_score.clone(),
+                        Mask::all(),
+                    );
+                },
+            );
+
+            let out_condition = lane_value
+                .clone()
+                .lt(Tile::literal(TileLiteral::U32(DECODE_HEAD_DIM)));
+            program.if_then(out_condition, |program| {
+                program.store_local(&acc, Tile::literal(TileLiteral::f32(0.0)));
+                program.store_local(&item, Tile::literal(TileLiteral::U32(0)));
+                program.loop_forever(|program| {
+                    let item_value = program.load_local(&item);
+                    let block_done = item_value
+                        .clone()
+                        .ge(Tile::literal(TileLiteral::U32(BLOCK as u32)));
+                    let kv = tile_base.clone() + item_value.clone();
+                    let kv_done = kv.clone().ge(tile_end.clone());
+                    program.break_if(block_done.or(kv_done));
+                    let prob = program.load_workgroup(probs, item_value.clone());
+                    let v_index = index_n(
+                        meta.v_offset,
+                        meta.v_strides,
+                        (
+                            batch_idx.clone(),
+                            kv_head_idx.clone(),
+                            kv,
+                            lane_value.clone(),
+                        ),
+                    );
+                    let v_value = program.load(v.at(v_index), Mask::all(), TileLiteral::f32(0.0));
+                    let current = program.load_local(&acc);
+                    program.store_local(&acc, current + prob * v_value);
+                    program.store_local(&item, item_value + Tile::literal(TileLiteral::U32(1)));
+                });
+                program.store(
+                    scratch.at(scratch_base.clone() + lane_value.clone()),
+                    program.load_local(&acc),
+                    Mask::all(),
+                );
+            });
+        },
+    );
+}
+
+pub fn flash_decode_split_partials<B>(
+    kb: &mut fusor_tile_ir::KernelBuilder<B>,
+    q: fusor_tile_ir::KernelTensorRef<B>,
+    k: fusor_tile_ir::KernelTensorRef<B>,
+    v: fusor_tile_ir::KernelTensorRef<B>,
+    scratch: fusor_tile_ir::KernelTensorRef<B>,
+    params: fusor_tile_ir::KernelTensorRef<B>,
+    meta: FlashDecodeSmallMeta,
+) -> Option<()> {
+    if meta.dims.head_dim != DECODE_HEAD_DIM
+        || meta.decode_block == 0
+        || meta.groups == 0
+        || meta.split_blocks < 2
+    {
+        return None;
+    }
+    match meta.decode_block {
+        128 => flash_decode_split_partials_block::<128, B>(kb, q, k, v, scratch, params, meta),
+        512 => flash_decode_split_partials_block::<512, B>(kb, q, k, v, scratch, params, meta),
+        1024 => flash_decode_split_partials_block::<1024, B>(kb, q, k, v, scratch, params, meta),
+        _ => return None,
+    }
+    Some(())
+}
+
+pub fn flash_decode_split_reduce<B>(
+    kb: &mut fusor_tile_ir::KernelBuilder<B>,
+    scratch: fusor_tile_ir::KernelTensorRef<B>,
+    output: fusor_tile_ir::KernelTensorRef<B>,
+    meta: FlashDecodeSmallMeta,
+) -> Option<()> {
+    if meta.dims.head_dim != DECODE_HEAD_DIM || meta.groups == 0 || meta.split_blocks < 2 {
+        return None;
+    }
+    let output_strides: [u32; 4] = meta.output_strides;
+    let scratch = kb.read::<F32, 1>(scratch);
+    let output = kb.write::<F32, 1>(output);
+    let phase = kb.program();
+    phase.program_grid::<{ DECODE_HEAD_DIM as usize }>(
+        [meta.dims.batch * meta.dims.num_heads, 1, 1],
+        |program| {
+            let lane = program.lane();
+            let row = program.program_id(WorkgroupAxis::X);
+            let out_dim = program.index(lane.clone());
+            let head_idx = program.index(row.clone() % meta.dims.num_heads);
+            let batch_idx = program.index(row.clone() / meta.dims.num_heads);
+            let row_base = program.bind(
+                row.clone()
+                    * Tile::literal(TileLiteral::U32(meta.split_blocks * (DECODE_HEAD_DIM + 2))),
+            );
+            let mut max_score = Tile::literal(TileLiteral::f32(NEG_MAX_F32));
+            for split_block in 0..meta.split_blocks {
+                let block_base = row_base.clone() + split_block * (DECODE_HEAD_DIM + 2);
+                let block_max = program.load(
+                    scratch.at(block_base + DECODE_HEAD_DIM + 1),
+                    Mask::all(),
+                    TileLiteral::f32(NEG_MAX_F32),
+                );
+                max_score = max_score.max(block_max);
+            }
+            let max_score = program.bind(max_score);
+
+            let mut denom = Tile::literal(TileLiteral::f32(0.0));
+            let mut acc = Tile::literal(TileLiteral::f32(0.0));
+            for split_block in 0..meta.split_blocks {
+                let block_base = row_base.clone() + split_block * (DECODE_HEAD_DIM + 2);
+                let block_denom = program.load(
+                    scratch.at(block_base.clone() + DECODE_HEAD_DIM),
+                    Mask::all(),
+                    TileLiteral::f32(0.0),
+                );
+                let block_max = program.load(
+                    scratch.at(block_base.clone() + DECODE_HEAD_DIM + 1),
+                    Mask::all(),
+                    TileLiteral::f32(NEG_MAX_F32),
+                );
+                let scale = (block_max - max_score.clone()).exp();
+                denom = denom + block_denom * scale.clone();
+                let partial = program.load(
+                    scratch.at(block_base + out_dim.clone()),
+                    Mask::all(),
+                    TileLiteral::f32(0.0),
+                );
+                acc = acc + partial * scale;
+            }
+            let output_index = index_n(
+                meta.output_offset,
+                output_strides,
+                (batch_idx, head_idx, 0, out_dim),
+            );
+            program.store(output.at(output_index), acc / denom, Mask::all());
+        },
+    );
+    Some(())
 }
 
 /// Build the small F32 decode-attention kernel.

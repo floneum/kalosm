@@ -25,7 +25,7 @@ fn scalar_value<T: DataType>(value: &T) -> NaryScalar {
 
 fn scalar_op<T: DataType>(input: &Tensor, name: &'static str, operation: NaryOp) -> Tensor {
     input.assert_datatype::<T>();
-    input.unary_nary::<T>(NaryFunction::unary(
+    input.unary_nary(NaryFunction::unary(
         Some(name.to_string()),
         operation,
         T::DATA_TYPE,
@@ -160,7 +160,7 @@ impl Rem<u32> for Tensor {
 impl Tensor {
     /// Check if each value in the tensor is equal to the given value. Returns 1 for true and 0 for false.
     pub fn eq<D: DataType, T: DataType>(&self, rhs: T) -> Tensor {
-        self.unary_nary::<D>(NaryFunction::unary(
+        self.unary_nary(NaryFunction::unary(
             Some("equal_const".to_string()),
             NaryOp::EqualConst(scalar_value(&rhs)),
             T::DATA_TYPE,
@@ -170,7 +170,7 @@ impl Tensor {
 
     /// Check if each value in the tensor is less than the given value. Returns 1 for true and 0 for false.
     pub fn lt<D: DataType, T: DataType>(&self, rhs: T) -> Tensor {
-        self.unary_nary::<D>(NaryFunction::unary(
+        self.unary_nary(NaryFunction::unary(
             Some("lt_const".to_string()),
             NaryOp::LessConst(scalar_value(&rhs)),
             T::DATA_TYPE,
@@ -180,7 +180,7 @@ impl Tensor {
 
     /// Check if each value in the tensor is less than or equal to the given value.
     pub fn lte<D: DataType, T: DataType>(&self, rhs: T) -> Tensor {
-        self.unary_nary::<D>(NaryFunction::unary(
+        self.unary_nary(NaryFunction::unary(
             Some("lte_const".to_string()),
             NaryOp::LessEqualConst(scalar_value(&rhs)),
             T::DATA_TYPE,
@@ -190,7 +190,7 @@ impl Tensor {
 
     /// Check if each value in the tensor is greater than the given value.
     pub fn mt<D: DataType, T: DataType>(&self, rhs: T) -> Tensor {
-        self.unary_nary::<D>(NaryFunction::unary(
+        self.unary_nary(NaryFunction::unary(
             Some("mt_const".to_string()),
             NaryOp::GreaterConst(scalar_value(&rhs)),
             T::DATA_TYPE,
@@ -200,7 +200,7 @@ impl Tensor {
 
     /// Check if each value in the tensor is greater than or equal to the given value.
     pub fn mte<D: DataType, T: DataType>(&self, rhs: T) -> Tensor {
-        self.unary_nary::<D>(NaryFunction::unary(
+        self.unary_nary(NaryFunction::unary(
             Some("mte_const".to_string()),
             NaryOp::GreaterEqualConst(scalar_value(&rhs)),
             T::DATA_TYPE,

@@ -695,23 +695,21 @@ unsafe fn avx2_i8x32_signed_dot(
     qy: std::arch::x86_64::__m256i,
 ) -> i32 {
     use std::arch::x86_64::*;
-    unsafe {
-        // Sign trick for signed × signed dot product
-        let qxabs = _mm256_sign_epi8(qx_signed, qx_signed);
-        let qysign = _mm256_sign_epi8(qy, qx_signed);
-        // maddubs: pairs of u8 × i8 → saturated i16, then madd to i32
-        let prod16 = _mm256_maddubs_epi16(qxabs, qysign);
-        let prod32 = _mm256_madd_epi16(prod16, _mm256_set1_epi16(1));
-        // Horizontal sum of 8 i32 lanes
-        let hi128 = _mm256_extracti128_si256(prod32, 1);
-        let lo128 = _mm256_castsi256_si128(prod32);
-        let sum128 = _mm_add_epi32(lo128, hi128);
-        let hi64 = _mm_shuffle_epi32(sum128, 0x4E);
-        let sum64 = _mm_add_epi32(sum128, hi64);
-        let hi32 = _mm_shuffle_epi32(sum64, 0xB1);
-        let result = _mm_add_epi32(sum64, hi32);
-        _mm_cvtsi128_si32(result)
-    }
+    // Sign trick for signed × signed dot product
+    let qxabs = _mm256_sign_epi8(qx_signed, qx_signed);
+    let qysign = _mm256_sign_epi8(qy, qx_signed);
+    // maddubs: pairs of u8 × i8 → saturated i16, then madd to i32
+    let prod16 = _mm256_maddubs_epi16(qxabs, qysign);
+    let prod32 = _mm256_madd_epi16(prod16, _mm256_set1_epi16(1));
+    // Horizontal sum of 8 i32 lanes
+    let hi128 = _mm256_extracti128_si256(prod32, 1);
+    let lo128 = _mm256_castsi256_si128(prod32);
+    let sum128 = _mm_add_epi32(lo128, hi128);
+    let hi64 = _mm_shuffle_epi32(sum128, 0x4E);
+    let sum64 = _mm_add_epi32(sum128, hi64);
+    let hi32 = _mm_shuffle_epi32(sum64, 0xB1);
+    let result = _mm_add_epi32(sum64, hi32);
+    _mm_cvtsi128_si32(result)
 }
 
 pub trait GgufBlock: Pod + Sized + Sync {

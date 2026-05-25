@@ -45,6 +45,7 @@ impl WhisperSource {
     /// Build a `WhisperSource` from the per-asset (repo, file) parts. Each
     /// of the public constructors below differs only in these parts, so the
     /// constructor body is a single call into this helper.
+    #[allow(clippy::too_many_arguments)]
     fn from_parts(
         model_repo: &str,
         model_file: &str,

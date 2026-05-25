@@ -1,5 +1,5 @@
 use fusor::{Device, MaskKind, Tensor};
-use fusor_conformance::{approx_eq, available_devices, f16_capable_devices};
+use fusor_conformance::{ItemMismatchError, approx_eq, available_devices, f16_capable_devices};
 use half::f16;
 
 #[derive(Clone, Copy)]
@@ -213,7 +213,7 @@ async fn assert_flash_attention_case(
     case: FlashCase,
     mask: Option<(Vec<f32>, MaskKind, [usize; 2])>,
     tol: f32,
-) {
+) -> Result<(), ItemMismatchError> {
     let q_data = attention_data(
         case.batch * case.num_heads * case.q_seq_len * case.head_dim,
         0.1,
@@ -297,37 +297,37 @@ async fn assert_flash_attention_case(
         } else {
             q.flash_attention(&k, &v, scale, None).to_concrete()
         };
-        approx_eq(&actual, &expected, tol).await.unwrap();
+        approx_eq(&actual, &expected, tol).await?;
     }
+    Ok(())
 }
 
-/// Exercises the **tiled** branch of the Metal decode-small kernel
-/// (`flash_decode_small_block` in `fusor-ml/tile-ir-kernels/src/kernels/flash.rs`).
-/// On Metal `choose_decode_block` always returns `Small` (BLOCK=128), so
-/// `tiled = kv_seq_len > 128`. The rest of the conformance suite never
-/// crosses that boundary with `head_dim = 128`, which is why the Qwen-3B
-/// decode bug (`flash_attention` output entirely NaN for one head at
-/// `kv_seq_len ≈ 569`) slipped through.
+/// Exercises the decode-small direct kernel. Cases up to 1024 use a single
+/// workgroup; longer cases use the split partial/reduce path.
 ///
-/// Each shape is run multiple times because the failure is non-deterministic
-/// (looks like a workgroup-memory race in the tiled kernel).
+/// Earlier Qwen-3B coverage kept the 569-token shape because that was the
+/// first observed race in the old 128-wide tiled path.
+///
+/// Each shape is run multiple times because earlier decode failures were
+/// non-deterministic workgroup-memory races.
 #[tokio::test]
 async fn flash_attention_decode_tiled_matches_cpu_reference() {
     // (num_heads, num_kv_heads, kv_seq_len)
-    // Shapes specifically chosen to stress the tiled flash_decode_small_block
-    // path. head_dim=128 to force the decode-small kernel; kv_seq_len chosen
-    // to span tile counts (2..=5 tiles) and to land just over the BLOCK=128
-    // boundary.
+    // Shapes specifically chosen to stress decode block boundaries and the
+    // tiled flash_decode_small_block path. head_dim=128 forces the decode-small
+    // kernel; kv_seq_len spans the old 128-wide tiled failure cases and values
+    // beyond the largest 1024-wide block.
     let shapes = [
-        (16, 2, 129), // just past one full tile
-        (16, 2, 192), // mid-second tile
-        (16, 2, 256), // exactly two full tiles
-        (16, 2, 257), // just past two full tiles (start of third)
-        (16, 2, 384), // exactly three full tiles
-        (16, 2, 511), // last lane of fourth tile inactive
-        (16, 2, 512), // exactly four full tiles
-        (16, 2, 569), // five tiles, matches Qwen-3B decode failure
-        (32, 8, 200), // larger GQA group, kv_seq_len in second tile
+        (16, 2, 129),  // just past one full tile
+        (16, 2, 192),  // mid-second tile
+        (16, 2, 256),  // exactly two full tiles
+        (16, 2, 257),  // just past two full tiles (start of third)
+        (16, 2, 384),  // exactly three full tiles
+        (16, 2, 511),  // last lane of fourth tile inactive
+        (16, 2, 512),  // exactly four full tiles
+        (16, 2, 569),  // five tiles, matches Qwen-3B decode failure
+        (16, 2, 1025), // split decode past the largest single workgroup block
+        (32, 8, 200),  // larger GQA group, kv_seq_len in second tile
     ];
 
     for (num_heads, num_kv_heads, kv_seq_len) in shapes {
@@ -339,10 +339,15 @@ async fn flash_attention_decode_tiled_matches_cpu_reference() {
             kv_seq_len,
             head_dim: 128,
         };
-        // Run each shape several times to catch non-deterministic kernel races.
         for trial in 0..4 {
-            assert_flash_attention_case(case, None, 1e-3).await;
-            let _ = trial;
+            let tol = if kv_seq_len > 1024 { 5e-3 } else { 1e-3 };
+            assert_flash_attention_case(case, None, tol)
+                .await
+                .unwrap_or_else(|error| {
+                    panic!(
+                        "shape heads={num_heads} kv_heads={num_kv_heads} kv_seq={kv_seq_len} trial={trial}: {error:?}"
+                    )
+                });
         }
     }
 }
@@ -482,7 +487,7 @@ async fn flash_attention_matches_cpu_reference_on_varied_shapes() {
             head_dim: 128,
         },
     ] {
-        assert_flash_attention_case(case, None, 1e-4).await;
+        assert_flash_attention_case(case, None, 1e-4).await.unwrap();
     }
 }
 
@@ -524,7 +529,8 @@ async fn flash_attention_with_qk_mask_matches_cpu_reference_on_varied_shapes() {
             )),
             1e-4,
         )
-        .await;
+        .await
+        .unwrap();
     }
 }
 
@@ -556,7 +562,7 @@ async fn flash_attention_gqa_matches_cpu_reference_on_varied_shapes() {
             head_dim: 4,
         },
     ] {
-        assert_flash_attention_case(case, None, 1e-4).await;
+        assert_flash_attention_case(case, None, 1e-4).await.unwrap();
     }
 }
 
@@ -611,7 +617,9 @@ async fn flash_attention_with_kv_cache_matches_cpu_reference_on_varied_shapes() 
         // an all-zero mask, mirroring the pre-migration test.
         let mask = vec![0.0f32; case.q_seq_len * case.kv_seq_len];
         let shape = [case.q_seq_len, case.kv_seq_len];
-        assert_flash_attention_case(case, Some((mask, MaskKind::QKMask, shape)), 1e-3).await;
+        assert_flash_attention_case(case, Some((mask, MaskKind::QKMask, shape)), 1e-3)
+            .await
+            .unwrap();
     }
 }
 
@@ -653,7 +661,8 @@ async fn flash_attention_with_batch_key_mask_matches_cpu_reference_on_varied_sha
             )),
             1e-4,
         )
-        .await;
+        .await
+        .unwrap();
     }
 }
 
@@ -699,7 +708,7 @@ async fn flash_attention_tiled_matches_cpu_reference_on_varied_shapes() {
             head_dim: 24,
         },
     ] {
-        assert_flash_attention_case(case, None, 1e-3).await;
+        assert_flash_attention_case(case, None, 1e-3).await.unwrap();
     }
 }
 
@@ -735,6 +744,7 @@ async fn flash_attention_tiled_with_mask_matches_cpu_reference() {
             )),
             1e-3,
         )
-        .await;
+        .await
+        .unwrap();
     }
 }

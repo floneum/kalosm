@@ -99,8 +99,9 @@ async fn run_blocks(device: &fusor::Device, flush_every: Option<usize>) -> Vec<f
         // materializing the running tensor every N blocks.
         if let Some(n) = flush_every
             && (block + 1) % n == 0
+            && let Some(g) = xs.as_gpu()
         {
-            xs.as_gpu().map(|g| g.materialize_sync());
+            g.materialize_sync();
         }
     }
 

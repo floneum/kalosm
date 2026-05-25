@@ -21,7 +21,7 @@ impl Resolver {
         let max_storage_bindings =
             graph.device().limits().max_storage_buffers_per_shader_stage as usize;
 
-        for (_input_idx, &input_inner) in nary.inputs.iter().enumerate() {
+        for &input_inner in nary.inputs.iter() {
             if self.check_cached(graph, input_inner) {
                 continue;
             }

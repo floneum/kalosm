@@ -367,6 +367,7 @@ where
             on_token,
         );
         // Double box prevents a rust compiler error with lifetimes. See https://github.com/rust-lang/rust/issues/102211
+        #[allow(clippy::type_complexity)]
         let future: Pin<Box<dyn Future<Output = Result<(S::ChatSession, T), _>> + Send>> =
             Box::pin(future);
         Box::pin(async move {

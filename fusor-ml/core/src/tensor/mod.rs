@@ -487,7 +487,7 @@ impl Tensor {
         self
     }
 
-    pub(crate) fn unary_nary<D2: DataType>(&self, function: NaryFunction) -> Tensor {
+    pub(crate) fn unary_nary(&self, function: NaryFunction) -> Tensor {
         Tensor::from_parts(self.data.unary_nary(function))
     }
 

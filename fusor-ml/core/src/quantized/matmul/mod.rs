@@ -271,36 +271,54 @@ fn select_qmatmul_direct_variant(
         .expect("quantized matmul selector has a catch-all rule")
 }
 
+/// `.when_ctx(...)` predicate that matches a single quantization format.
+fn qgemv_format(f: tile_ir::GgmlQuantFormat) -> impl Fn(&QgemvColsCtx) -> bool {
+    move |ctx| ctx.format == f
+}
+
+/// `.when(...)` predicate that matches a single quantization format plus
+/// an extra shape constraint.
+fn qgemv_format_and(
+    f: tile_ir::GgmlQuantFormat,
+    pred: impl Fn(KernelShape<2>) -> bool,
+) -> impl Fn(KernelShape<2>, &QgemvColsCtx, KernelDeviceCaps) -> bool {
+    move |shape, ctx, _caps| ctx.format == f && pred(shape)
+}
+
 fn qgemv_cols_selector() -> ShapeSelector<2, QgemvColsCtx, QgemvColsVariant> {
+    use tile_ir::GgmlQuantFormat::{Q4K, Q5_0, Q6K, Q8_0};
+
+    // Many of the rules below come in pairs: a first rule with bounded axis
+    // ranges (so the shape generator in selection tests can synthesize a
+    // matching shape) and a broader fallback rule using a `.when()` predicate
+    // that covers shapes beyond the bounded range. Both rules return the
+    // same variant; the bounded rule exists for `generate_for`, the broader
+    // rule for runtime catch-all of the same intent.
     ShapeSelector::new()
         .rule(
             QgemvColsVariant::Q4KSmallWide4,
             ShapeRule::new()
                 .axis(QGEMV_K, range(0..=4096))
                 .axis(QGEMV_N, range(4096..8192))
-                .when_ctx(|ctx: &QgemvColsCtx| ctx.format == tile_ir::GgmlQuantFormat::Q4K),
+                .when_ctx(qgemv_format(Q4K)),
         )
         .rule(
             QgemvColsVariant::Q4KSmallWide8,
             ShapeRule::new()
                 .axis(QGEMV_K, range(0..=4096))
                 .axis(QGEMV_N, range(8192..=16384))
-                .when_ctx(|ctx: &QgemvColsCtx| ctx.format == tile_ir::GgmlQuantFormat::Q4K),
+                .when_ctx(qgemv_format(Q4K)),
         )
         .rule(
             QgemvColsVariant::Q4KSmallWide8,
             ShapeRule::new().axis(QGEMV_K, range(0..=4096)).when(
-                |shape: KernelShape<2>, ctx: &QgemvColsCtx, _caps| {
-                    ctx.format == tile_ir::GgmlQuantFormat::Q4K && shape[QGEMV_N] >= 8192
-                },
+                qgemv_format_and(Q4K, |shape| shape[QGEMV_N] >= 8192),
             ),
         )
         .rule(
             QgemvColsVariant::Q4KLargeNarrow8,
             ShapeRule::new().axis(QGEMV_N, range(0..=4096)).when(
-                |shape: KernelShape<2>, ctx: &QgemvColsCtx, _caps| {
-                    ctx.format == tile_ir::GgmlQuantFormat::Q4K && shape[QGEMV_K] > 4096
-                },
+                qgemv_format_and(Q4K, |shape| shape[QGEMV_K] > 4096),
             ),
         )
         .rule(
@@ -308,22 +326,18 @@ fn qgemv_cols_selector() -> ShapeSelector<2, QgemvColsCtx, QgemvColsVariant> {
             ShapeRule::new()
                 .axis(QGEMV_K, range(0..=4096))
                 .axis(QGEMV_N, range(8192..=16384))
-                .when_ctx(|ctx: &QgemvColsCtx| ctx.format == tile_ir::GgmlQuantFormat::Q6K),
+                .when_ctx(qgemv_format(Q6K)),
         )
         .rule(
             QgemvColsVariant::Q6KSmallWide8,
             ShapeRule::new().axis(QGEMV_K, range(0..=4096)).when(
-                |shape: KernelShape<2>, ctx: &QgemvColsCtx, _caps| {
-                    ctx.format == tile_ir::GgmlQuantFormat::Q6K && shape[QGEMV_N] >= 8192
-                },
+                qgemv_format_and(Q6K, |shape| shape[QGEMV_N] >= 8192),
             ),
         )
         .rule(
             QgemvColsVariant::Q6KLargeNarrow4,
             ShapeRule::new().axis(QGEMV_N, range(0..=4096)).when(
-                |shape: KernelShape<2>, ctx: &QgemvColsCtx, _caps| {
-                    ctx.format == tile_ir::GgmlQuantFormat::Q6K && shape[QGEMV_K] > 4096
-                },
+                qgemv_format_and(Q6K, |shape| shape[QGEMV_K] > 4096),
             ),
         )
         .rule(
@@ -331,14 +345,12 @@ fn qgemv_cols_selector() -> ShapeSelector<2, QgemvColsCtx, QgemvColsVariant> {
             ShapeRule::new()
                 .axis(QGEMV_K, range(0..=1024))
                 .axis(QGEMV_N, range(8192..=16384))
-                .when_ctx(|ctx: &QgemvColsCtx| ctx.format == tile_ir::GgmlQuantFormat::Q8_0),
+                .when_ctx(qgemv_format(Q8_0)),
         )
         .rule(
             QgemvColsVariant::Q8WideAccelerated32,
             ShapeRule::new().axis(QGEMV_K, range(0..=1024)).when(
-                |shape: KernelShape<2>, ctx: &QgemvColsCtx, _caps| {
-                    ctx.format == tile_ir::GgmlQuantFormat::Q8_0 && shape[QGEMV_N] >= 8192
-                },
+                qgemv_format_and(Q8_0, |shape| shape[QGEMV_N] >= 8192),
             ),
         )
         .rule(
@@ -346,14 +358,14 @@ fn qgemv_cols_selector() -> ShapeSelector<2, QgemvColsCtx, QgemvColsVariant> {
             ShapeRule::new()
                 .axis(QGEMV_K, range(2048..=4096))
                 .axis(QGEMV_N, range(2048..=4096))
-                .when_ctx(|ctx: &QgemvColsCtx| ctx.format == tile_ir::GgmlQuantFormat::Q5_0),
+                .when_ctx(qgemv_format(Q5_0)),
         )
         .rule(
             QgemvColsVariant::FormatAccelerated,
             ShapeRule::new().when(|shape: KernelShape<2>, ctx: &QgemvColsCtx, _caps| {
-                ctx.format == tile_ir::GgmlQuantFormat::Q4K
-                    || ctx.format == tile_ir::GgmlQuantFormat::Q6K
-                    || (ctx.format == tile_ir::GgmlQuantFormat::Q5_0
+                ctx.format == Q4K
+                    || ctx.format == Q6K
+                    || (ctx.format == Q5_0
                         && shape[QGEMV_K]
                             .checked_mul(shape[QGEMV_N])
                             .is_some_and(|elements| elements >= 4 * 1024 * 1024))
@@ -364,7 +376,7 @@ fn qgemv_cols_selector() -> ShapeSelector<2, QgemvColsCtx, QgemvColsVariant> {
             ShapeRule::new()
                 .axis(QGEMV_K, range(0..=1024))
                 .axis(QGEMV_N, range(0..=4096))
-                .when_ctx(|ctx: &QgemvColsCtx| ctx.format == tile_ir::GgmlQuantFormat::Q5_0),
+                .when_ctx(qgemv_format(Q5_0)),
         )
         .rule(QgemvColsVariant::Default4, ShapeRule::new())
 }

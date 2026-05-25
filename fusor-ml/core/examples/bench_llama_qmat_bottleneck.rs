@@ -55,13 +55,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         let (samples, kernels) = if rank3 {
             let input_data = vec![vec![vec![0.25f32; k]; m]];
-            let input: Tensor<3, f32> = Tensor::new(&device, &input_data);
+            let input: Tensor = Tensor::new(&device, &input_data);
             input.materialize().await;
             let first_data = vec![vec![vec![0.0f32; n]; m]];
-            let first: Tensor<3, f32> = Tensor::new(&device, &first_data);
+            let first: Tensor = Tensor::new(&device, &first_data);
             first.materialize().await;
             let second_data = vec![vec![vec![0.0f32; n]; m]];
-            let second: Tensor<3, f32> = Tensor::new(&device, &second_data);
+            let second: Tensor = Tensor::new(&device, &second_data);
             second.materialize().await;
             measure_qmat(
                 &device,
@@ -75,13 +75,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             )
         } else {
             let input_data = vec![vec![0.25f32; k]; m];
-            let input: Tensor<2, f32> = Tensor::new(&device, &input_data);
+            let input: Tensor = Tensor::new(&device, &input_data);
             input.materialize().await;
             let first_data = vec![vec![0.0f32; n]; m];
-            let first: Tensor<2, f32> = Tensor::new(&device, &first_data);
+            let first: Tensor = Tensor::new(&device, &first_data);
             first.materialize().await;
             let second_data = vec![vec![0.0f32; n]; m];
-            let second: Tensor<2, f32> = Tensor::new(&device, &second_data);
+            let second: Tensor = Tensor::new(&device, &second_data);
             second.materialize().await;
             measure_qmat(
                 &device,
@@ -139,11 +139,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     })
 }
 
-fn measure_qmat<const R: usize>(
+#[allow(clippy::too_many_arguments)]
+fn measure_qmat(
     device: &Device,
-    input: &Tensor<R, f32>,
+    input: &Tensor,
     weight: &QMatrix,
-    add2: Option<(&Tensor<R, f32>, &Tensor<R, f32>)>,
+    add2: Option<(&Tensor, &Tensor)>,
     warmup_batches: usize,
     measured_batches: usize,
     dispatches_per_batch: usize,
@@ -164,11 +165,11 @@ fn measure_qmat<const R: usize>(
     (samples, kernels)
 }
 
-fn run_batch<const R: usize>(
+fn run_batch(
     device: &Device,
-    input: &Tensor<R, f32>,
+    input: &Tensor,
     weight: &QMatrix,
-    add2: Option<(&Tensor<R, f32>, &Tensor<R, f32>)>,
+    add2: Option<(&Tensor, &Tensor)>,
     dispatches: usize,
     paired: bool,
 ) -> usize {

@@ -455,85 +455,22 @@ fn dispatch_direct_tile_matmul<
     let a = tile_storage_read_with_direct_layout_typed::<T>(phase, a_view);
     let b = tile_storage_read_with_direct_layout_typed::<T>(phase, b_view);
     let y = tile_storage_write_with_direct_layout_typed::<T>(phase, y_view);
+    macro_rules! try_coop_tile {
+        ($m:literal, $n:literal, $k:literal) => {
+            if tile_ir_kernels::try_batched_coop_matmul::<T, $m, $n, $k>(
+                phase, &a, &b, &y, shape, epilogues, max_wg_per_dim,
+            ) {
+                return;
+            }
+        };
+    }
     match coop_variant {
-        DirectTileCoopMatmulVariant::Tile256x256 => {
-            if tile_ir_kernels::try_batched_coop_matmul::<T, 256, 256, 16>(
-                phase,
-                &a,
-                &b,
-                &y,
-                shape,
-                epilogues,
-                max_wg_per_dim,
-            ) {
-                return;
-            }
-        }
-        DirectTileCoopMatmulVariant::Tile128x512 => {
-            if tile_ir_kernels::try_batched_coop_matmul::<T, 128, 512, 16>(
-                phase,
-                &a,
-                &b,
-                &y,
-                shape,
-                epilogues,
-                max_wg_per_dim,
-            ) {
-                return;
-            }
-        }
-        DirectTileCoopMatmulVariant::Tile128x256 => {
-            if tile_ir_kernels::try_batched_coop_matmul::<T, 128, 256, 16>(
-                phase,
-                &a,
-                &b,
-                &y,
-                shape,
-                epilogues,
-                max_wg_per_dim,
-            ) {
-                return;
-            }
-        }
-        DirectTileCoopMatmulVariant::Tile128x64 => {
-            if tile_ir_kernels::try_batched_coop_matmul::<T, 128, 64, 16>(
-                phase,
-                &a,
-                &b,
-                &y,
-                shape,
-                epilogues,
-                max_wg_per_dim,
-            ) {
-                return;
-            }
-        }
-        DirectTileCoopMatmulVariant::Tile64x128 => {
-            if tile_ir_kernels::try_batched_coop_matmul::<T, 64, 128, 16>(
-                phase,
-                &a,
-                &b,
-                &y,
-                shape,
-                epilogues,
-                max_wg_per_dim,
-            ) {
-                return;
-            }
-        }
-        DirectTileCoopMatmulVariant::Tile64x64 => {
-            if tile_ir_kernels::try_batched_coop_matmul::<T, 64, 64, 16>(
-                phase,
-                &a,
-                &b,
-                &y,
-                shape,
-                epilogues,
-                max_wg_per_dim,
-            ) {
-                return;
-            }
-        }
+        DirectTileCoopMatmulVariant::Tile256x256 => try_coop_tile!(256, 256, 16),
+        DirectTileCoopMatmulVariant::Tile128x512 => try_coop_tile!(128, 512, 16),
+        DirectTileCoopMatmulVariant::Tile128x256 => try_coop_tile!(128, 256, 16),
+        DirectTileCoopMatmulVariant::Tile128x64 => try_coop_tile!(128, 64, 16),
+        DirectTileCoopMatmulVariant::Tile64x128 => try_coop_tile!(64, 128, 16),
+        DirectTileCoopMatmulVariant::Tile64x64 => try_coop_tile!(64, 64, 16),
         DirectTileCoopMatmulVariant::None => {}
     }
     match variant {

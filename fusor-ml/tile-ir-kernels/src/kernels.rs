@@ -15,8 +15,9 @@ mod top_k;
 mod types;
 
 pub use flash::{
-    flash_attention, flash_attention_tiled, flash_decode_small, flash_outputs_per_workgroup,
-    flash_tiled_dispatch_size, flash_tiled_outputs_per_workgroup,
+    flash_attention, flash_attention_tiled, flash_decode_small, flash_decode_split_partials,
+    flash_decode_split_reduce, flash_outputs_per_workgroup, flash_tiled_dispatch_size,
+    flash_tiled_outputs_per_workgroup,
 };
 pub use helpers::AccumCast;
 pub use matmul::{

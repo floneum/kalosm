@@ -2,7 +2,9 @@ use super::*;
 use crate::{
     Device, Tensor,
     kernel_selection::{CooperativeMatrixCaps, assert_selector_generates},
+    mir::workgroup_shape::WorkgroupShape,
 };
+use std::sync::{Mutex, MutexGuard, OnceLock};
 
 const TEST_HEAD_DIM: usize = DECODE_HEAD_DIM as usize;
 
@@ -36,6 +38,13 @@ fn decode_shape(kv_seq_len: usize) -> KernelShape<6> {
     KernelShape::new([1, 32, 8, 1, kv_seq_len, DECODE_HEAD_DIM as usize])
 }
 
+fn gpu_test_guard() -> MutexGuard<'static, ()> {
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 #[test]
 fn decode_block_choice_uses_smallest_covering_supported_block() {
     assert_eq!(
@@ -56,11 +65,22 @@ fn decode_block_choice_uses_smallest_covering_supported_block() {
     );
     assert_eq!(
         choose_decode_block(DECODE_LARGE_BLOCK + 1, caps(DECODE_LARGE_BLOCK)),
-        Some(DecodeBlock::Large)
+        Some(DecodeBlock::Medium)
     );
     assert_eq!(
         choose_decode_block(DECODE_SMALL_BLOCK, caps(DECODE_SMALL_BLOCK - 1)),
         None
+    );
+
+    assert_eq!(
+        choose_decode_block(
+            200,
+            KernelDeviceCaps {
+                backend: wgpu::Backend::Metal,
+                ..caps(DECODE_LARGE_BLOCK)
+            },
+        ),
+        Some(DecodeBlock::Medium)
     );
 }
 
@@ -83,7 +103,58 @@ fn decode_small_meta_buckets_dynamic_kv_len() {
     assert_eq!(meta.active_kv_len, DECODE_SMALL_BLOCK + 1);
     assert_eq!(meta.decode_block, DECODE_MEDIUM_BLOCK);
     assert_eq!(meta.dims.kv_seq_len, DECODE_MEDIUM_BLOCK);
+    assert_eq!(meta.split_blocks, 1);
     assert!(!meta.tiled);
+}
+
+#[test]
+fn decode_module_key_uses_bucketed_kv_len() {
+    let meta = build_flash_decode_small_meta(
+        decode_dims(DECODE_SMALL_BLOCK + 1),
+        1.0,
+        caps(DECODE_LARGE_BLOCK),
+        FlashDecodeSmallTensors {
+            q: tensor_meta4(),
+            k: tensor_meta4(),
+            v: tensor_meta4(),
+            mask: None,
+            output: tensor_meta4(),
+        },
+    )
+    .unwrap();
+    let mut next_token_meta = meta;
+    next_token_meta.active_kv_len += 1;
+
+    let workgroup_shape = WorkgroupShape::new(1, 1, 1);
+    let dispatch_size = [meta.dims.batch * meta.dims.num_heads, 1, 1];
+    let key = kernel::flash_decode_module_key(
+        Some(&workgroup_shape),
+        dispatch_size,
+        DataTypeEnum::F32,
+        1.0,
+        &meta,
+    );
+    let next_token_key = kernel::flash_decode_module_key(
+        Some(&workgroup_shape),
+        dispatch_size,
+        DataTypeEnum::F32,
+        1.0,
+        &next_token_meta,
+    );
+
+    assert_eq!(key, next_token_key);
+
+    let mut different_stride_meta = meta;
+    different_stride_meta.k_strides[1] += DECODE_HEAD_DIM;
+    let different_stride_key = kernel::flash_decode_module_key(
+        Some(&workgroup_shape),
+        dispatch_size,
+        DataTypeEnum::F32,
+        1.0,
+        &different_stride_meta,
+    );
+
+    assert_ne!(key, different_stride_key);
 }
 
 #[test]
@@ -105,6 +176,7 @@ fn decode_small_meta_tiles_with_largest_supported_block() {
     assert_eq!(meta.active_kv_len, DECODE_MEDIUM_BLOCK + 1);
     assert_eq!(meta.decode_block, DECODE_MEDIUM_BLOCK);
     assert_eq!(meta.dims.kv_seq_len, DECODE_MEDIUM_BLOCK);
+    assert_eq!(meta.split_blocks, 2);
     assert!(meta.tiled);
 }
 
@@ -163,7 +235,7 @@ fn flash_attention_selector_selects_decode_block_buckets() {
             caps(DECODE_LARGE_BLOCK)
         ),
         Some(FlashAttentionSelectedVariant::DecodeSmall(
-            DecodeBlock::Large
+            DecodeBlock::Medium
         ))
     );
     assert_eq!(
@@ -324,6 +396,7 @@ fn decode_max_error(
 
 #[test]
 fn tiled_decode_attention_matches_cpu_reference() {
+    let _guard = gpu_test_guard();
     pollster::block_on(async {
         let Ok(device) = Device::new().await else {
             return;
@@ -353,6 +426,7 @@ fn tiled_decode_attention_matches_cpu_reference() {
 
 #[test]
 fn tiled_decode_attention_gqa_matches_cpu_reference() {
+    let _guard = gpu_test_guard();
     pollster::block_on(async {
         let Ok(device) = Device::new().await else {
             return;
@@ -397,6 +471,7 @@ fn tiled_decode_attention_gqa_matches_cpu_reference() {
 /// shader loop with a function-scope accumulator.
 #[test]
 fn decode_gqa_non_tiled_large_blocks_match_cpu_reference() {
+    let _guard = gpu_test_guard();
     pollster::block_on(async {
         let Ok(device) = Device::new().await else {
             return;
@@ -444,6 +519,7 @@ fn decode_gqa_non_tiled_large_blocks_match_cpu_reference() {
 
 #[test]
 fn streaming_gqa_regression_shape_builds_direct_kernel() {
+    let _guard = gpu_test_guard();
     pollster::block_on(async {
         let Ok(device) = Device::new().await else {
             return;

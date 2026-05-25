@@ -33,6 +33,69 @@ fn flash_attention_module_cache() -> &'static kernel_backend::ModuleCache {
     CACHE.get_or_init(|| kernel_backend::module_cache(FLASH_ATTENTION_MODULE_CACHE_SIZE))
 }
 
+/// Dispatches to `$body` for each (element type, subgroup size) pair the
+/// streaming kernels are monomorphized over. `$element` is bound to the
+/// element type and `$size` to the const subgroup width inside the body.
+/// Returns `None` for any (dtype, subgroup_size) combination not in the
+/// table.
+macro_rules! for_each_streaming_variant {
+    ($input_dtype:expr, $subgroup_size:expr, |$element:ident, $size:ident| $body:block) => {
+        match ($input_dtype, $subgroup_size) {
+            (DataTypeEnum::F32, 4) => {
+                type $element = tile_ir::F32;
+                const $size: u32 = 4;
+                $body
+            }
+            (DataTypeEnum::F32, 8) => {
+                type $element = tile_ir::F32;
+                const $size: u32 = 8;
+                $body
+            }
+            (DataTypeEnum::F32, 16) => {
+                type $element = tile_ir::F32;
+                const $size: u32 = 16;
+                $body
+            }
+            (DataTypeEnum::F32, 32) => {
+                type $element = tile_ir::F32;
+                const $size: u32 = 32;
+                $body
+            }
+            (DataTypeEnum::F32, 64) => {
+                type $element = tile_ir::F32;
+                const $size: u32 = 64;
+                $body
+            }
+            (DataTypeEnum::F16, 4) => {
+                type $element = tile_ir::F16;
+                const $size: u32 = 4;
+                $body
+            }
+            (DataTypeEnum::F16, 8) => {
+                type $element = tile_ir::F16;
+                const $size: u32 = 8;
+                $body
+            }
+            (DataTypeEnum::F16, 16) => {
+                type $element = tile_ir::F16;
+                const $size: u32 = 16;
+                $body
+            }
+            (DataTypeEnum::F16, 32) => {
+                type $element = tile_ir::F16;
+                const $size: u32 = 32;
+                $body
+            }
+            (DataTypeEnum::F16, 64) => {
+                type $element = tile_ir::F16;
+                const $size: u32 = 64;
+                $body
+            }
+            _ => None,
+        }
+    };
+}
+
 #[allow(clippy::too_many_arguments)]
 fn dispatch_streaming_flash_attention(
     kb: &mut tile_ir::KernelBuilder<()>,
@@ -45,24 +108,9 @@ fn dispatch_streaming_flash_attention(
     input_dtype: DataTypeEnum,
     subgroup_size: u32,
 ) -> Option<()> {
-    macro_rules! emit {
-        ($element:ty, $size:literal) => {
-            tile_ir_kernels::flash_attention::<$element, $size, _>(kb, q, k, v, mask, output, meta)
-        };
-    }
-    match (input_dtype, subgroup_size) {
-        (DataTypeEnum::F32, 4) => emit!(tile_ir::F32, 4),
-        (DataTypeEnum::F32, 8) => emit!(tile_ir::F32, 8),
-        (DataTypeEnum::F32, 16) => emit!(tile_ir::F32, 16),
-        (DataTypeEnum::F32, 32) => emit!(tile_ir::F32, 32),
-        (DataTypeEnum::F32, 64) => emit!(tile_ir::F32, 64),
-        (DataTypeEnum::F16, 4) => emit!(tile_ir::F16, 4),
-        (DataTypeEnum::F16, 8) => emit!(tile_ir::F16, 8),
-        (DataTypeEnum::F16, 16) => emit!(tile_ir::F16, 16),
-        (DataTypeEnum::F16, 32) => emit!(tile_ir::F16, 32),
-        (DataTypeEnum::F16, 64) => emit!(tile_ir::F16, 64),
-        _ => None,
-    }
+    for_each_streaming_variant!(input_dtype, subgroup_size, |Element, SIZE| {
+        tile_ir_kernels::flash_attention::<Element, SIZE, _>(kb, q, k, v, mask, output, meta)
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -77,29 +125,11 @@ fn dispatch_streaming_tiled_flash_attention(
     input_dtype: DataTypeEnum,
     subgroup_size: u32,
 ) -> Option<()> {
-    macro_rules! emit {
-        ($element:ty, $size:literal) => {
-            tile_ir_kernels::flash_attention_tiled::<
-                $element,
-                $size,
-                { FLASH_STREAMING_TILED_Q_BLOCK },
-                _,
-            >(kb, q, k, v, mask, output, meta)
-        };
-    }
-    match (input_dtype, subgroup_size) {
-        (DataTypeEnum::F32, 4) => emit!(tile_ir::F32, 4),
-        (DataTypeEnum::F32, 8) => emit!(tile_ir::F32, 8),
-        (DataTypeEnum::F32, 16) => emit!(tile_ir::F32, 16),
-        (DataTypeEnum::F32, 32) => emit!(tile_ir::F32, 32),
-        (DataTypeEnum::F32, 64) => emit!(tile_ir::F32, 64),
-        (DataTypeEnum::F16, 4) => emit!(tile_ir::F16, 4),
-        (DataTypeEnum::F16, 8) => emit!(tile_ir::F16, 8),
-        (DataTypeEnum::F16, 16) => emit!(tile_ir::F16, 16),
-        (DataTypeEnum::F16, 32) => emit!(tile_ir::F16, 32),
-        (DataTypeEnum::F16, 64) => emit!(tile_ir::F16, 64),
-        _ => None,
-    }
+    for_each_streaming_variant!(input_dtype, subgroup_size, |Element, SIZE| {
+        tile_ir_kernels::flash_attention_tiled::<Element, SIZE, { FLASH_STREAMING_TILED_Q_BLOCK }, _>(
+            kb, q, k, v, mask, output, meta,
+        )
+    })
 }
 
 /// Returns true when the per-shape gating for the tiled (Q-batched) streaming
@@ -129,6 +159,8 @@ enum FlashAttentionKernelVariant {
     Streaming,
     StreamingTiled,
     DecodeSmall,
+    DecodeSplitPartials,
+    DecodeSplitReduce,
 }
 
 /// Q-block size used by the tiled (Q-batched) flash attention kernel: each
@@ -208,12 +240,8 @@ fn choose_decode_block(kv_seq_len: u32, caps: KernelDeviceCaps) -> Option<Decode
     if kv_seq_len == 0 {
         return None;
     }
-
-    // Metal currently miscomputes the non-tiled 512/1024-thread decode
-    // variants on some GQA shapes. The 128-thread tiled path has the same
-    // semantics and passes the reference tests, so prefer it on Metal.
-    if caps.backend == wgpu::Backend::Metal {
-        return decode_block_supported(DecodeBlock::Small, caps).then_some(DecodeBlock::Small);
+    if kv_seq_len > DECODE_LARGE_BLOCK && decode_block_supported(DecodeBlock::Medium, caps) {
+        return Some(DecodeBlock::Medium);
     }
 
     let mut largest_supported = None;
@@ -470,6 +498,7 @@ fn build_flash_decode_small_meta(
     }
     let decode_block = choose_decode_block(dims.kv_seq_len, caps)?.size();
     let tiled = dims.kv_seq_len > decode_block;
+    let split_blocks = dims.kv_seq_len.div_ceil(decode_block);
 
     let groups = dims.num_heads.checked_div(dims.num_kv_heads)?;
     if groups == 0 {
@@ -485,6 +514,7 @@ fn build_flash_decode_small_meta(
         active_kv_len: dims.kv_seq_len,
         decode_block,
         tiled,
+        split_blocks,
         groups,
         q_offset: q_meta.tile.offset,
         k_offset: k_meta.tile.offset,

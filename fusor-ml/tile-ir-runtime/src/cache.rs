@@ -113,6 +113,21 @@ impl DirectStorage3BindGroupKey {
     }
 }
 
+#[derive(Debug)]
+pub(crate) struct CachedDirectBindGroup {
+    pub(crate) bind_group: wgpu::BindGroup,
+    _buffers: Vec<Arc<wgpu::Buffer>>,
+}
+
+impl CachedDirectBindGroup {
+    pub(crate) fn new(bind_group: wgpu::BindGroup, buffers: Vec<Arc<wgpu::Buffer>>) -> Self {
+        Self {
+            bind_group,
+            _buffers: buffers,
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct DirectDynamicBindGroupKey {
     entries: Vec<DirectDynamicBindGroupEntryKey>,
@@ -158,9 +173,9 @@ pub struct KernelCache {
         RwLock<LruCache<BindGroupLayout, PipelineLayout, FxBuildHasher>>,
     pub(crate) kernels: RwLock<LruCache<KernelCacheKey, Arc<CachedKernel>, FxBuildHasher>>,
     pub(crate) direct_dynamic_bind_group_cache:
-        RwLock<LruCache<DirectDynamicBindGroupKey, wgpu::BindGroup, FxBuildHasher>>,
+        RwLock<LruCache<DirectDynamicBindGroupKey, CachedDirectBindGroup, FxBuildHasher>>,
     pub(crate) direct_three_buffer_bind_group_cache:
-        RwLock<LruCache<DirectStorage3BindGroupKey, wgpu::BindGroup, FxBuildHasher>>,
+        RwLock<LruCache<DirectStorage3BindGroupKey, CachedDirectBindGroup, FxBuildHasher>>,
     direct_three_buffer_bind_group_layout: OnceLock<BindGroupLayout>,
     direct_three_buffer_pipeline_layout: OnceLock<PipelineLayout>,
 }

@@ -66,8 +66,8 @@ fn bench_rms_norm_vec4(
     measured_batches: usize,
     dispatches_per_batch: usize,
 ) {
-    let input = Tensor::<2, f32>::splat(device, 0.25, [64, 4096]);
-    let weight = Tensor::<1, f32>::splat(device, 1.0, [4096]);
+    let input = Tensor::splat(device, 0.25f32, [64, 4096]);
+    let weight = Tensor::splat(device, 1.0f32, [4096]);
     input.materialize_sync();
     weight.materialize_sync();
 
@@ -76,7 +76,7 @@ fn bench_rms_norm_vec4(
         warmup_batches,
         measured_batches,
         dispatches_per_batch,
-        || input.rms_norm_fused::<1, 1>(&weight, None, 1e-5),
+        || input.rms_norm_fused(&weight, None, 1e-5),
         device,
     );
 }
@@ -87,9 +87,9 @@ fn bench_flash_attention_streaming(
     measured_batches: usize,
     dispatches_per_batch: usize,
 ) {
-    let q = Tensor::<4, f32>::splat(device, 0.125, [1, 32, 48, 128]);
-    let k = Tensor::<4, f32>::splat(device, 0.25, [1, 8, 48, 128]);
-    let v = Tensor::<4, f32>::splat(device, 0.5, [1, 8, 48, 128]);
+    let q = Tensor::splat(device, 0.125f32, [1, 32, 48, 128]);
+    let k = Tensor::splat(device, 0.25f32, [1, 8, 48, 128]);
+    let v = Tensor::splat(device, 0.5f32, [1, 8, 48, 128]);
     q.materialize_sync();
     k.materialize_sync();
     v.materialize_sync();
@@ -110,9 +110,9 @@ fn bench_flash_attention_decode(
     measured_batches: usize,
     dispatches_per_batch: usize,
 ) {
-    let q = Tensor::<4, f32>::splat(device, 0.125, [1, 32, 1, 128]);
-    let k = Tensor::<4, f32>::splat(device, 0.25, [1, 8, 512, 128]);
-    let v = Tensor::<4, f32>::splat(device, 0.5, [1, 8, 512, 128]);
+    let q = Tensor::splat(device, 0.125f32, [1, 32, 1, 128]);
+    let k = Tensor::splat(device, 0.25f32, [1, 8, 512, 128]);
+    let v = Tensor::splat(device, 0.5f32, [1, 8, 512, 128]);
     q.materialize_sync();
     k.materialize_sync();
     v.materialize_sync();
@@ -127,7 +127,7 @@ fn bench_flash_attention_decode(
     );
 }
 
-fn bench_tensor_case<const R: usize, F>(
+fn bench_tensor_case<F>(
     name: &str,
     warmup_batches: usize,
     measured_batches: usize,
@@ -135,7 +135,7 @@ fn bench_tensor_case<const R: usize, F>(
     mut make_output: F,
     device: &Device,
 ) where
-    F: FnMut() -> Tensor<R, f32>,
+    F: FnMut() -> Tensor,
 {
     for _ in 0..warmup_batches {
         run_tensor_batch(dispatches_per_batch, &mut make_output, device);
@@ -157,13 +157,9 @@ fn bench_tensor_case<const R: usize, F>(
     );
 }
 
-fn run_tensor_batch<const R: usize, F>(
-    dispatches: usize,
-    make_output: &mut F,
-    device: &Device,
-) -> (Duration, usize)
+fn run_tensor_batch<F>(dispatches: usize, make_output: &mut F, device: &Device) -> (Duration, usize)
 where
-    F: FnMut() -> Tensor<R, f32>,
+    F: FnMut() -> Tensor,
 {
     let mut outputs = Vec::with_capacity(dispatches);
     let mut keys = Vec::with_capacity(dispatches);
@@ -188,7 +184,7 @@ async fn bench_top_k_pairs(
     measured_batches: usize,
 ) -> Result<(), wgpu::BufferAsyncError> {
     let logits_data = bench_logits(8192);
-    let logits = Tensor::<1, f32>::new(device, &logits_data);
+    let logits = Tensor::new(device, &logits_data);
     logits.materialize_sync();
 
     for _ in 0..warmup_batches {
@@ -212,7 +208,7 @@ async fn bench_mirostat2(
     measured_batches: usize,
 ) -> Result<(), wgpu::BufferAsyncError> {
     let logits_data = bench_logits(8192);
-    let logits = Tensor::<1, f32>::new(device, &logits_data);
+    let logits = Tensor::new(device, &logits_data);
     logits.materialize_sync();
     let params = GpuMirostat2SamplerParams {
         top_k: 512,

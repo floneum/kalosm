@@ -1,4 +1,4 @@
-use std::{hash::Hash, sync::Arc};
+use std::{any::TypeId, hash::Hash, sync::Arc};
 
 use fusor_tile_ir as tile_ir;
 use fusor_tile_ir_kernels as tile_ir_kernels;
@@ -20,11 +20,91 @@ use crate::{
 use super::{
     DECODE_HEAD_DIM, DECODE_SMALL_BLOCK, FLASH_STREAMING_SUBGROUP_SIZES,
     FLASH_STREAMING_TILED_Q_BLOCK, FlashAttentionDirectKernelVariant, FlashAttentionKernelVariant,
-    FlashAttentionOperation, FlashDecodeSmallTensors, TensorMeta, build_flash_decode_small_meta,
-    dispatch_streaming_flash_attention, dispatch_streaming_tiled_flash_attention,
-    flash_attention_module_cache, flash_streaming_tiled_eligible, select_flash_attention_variant,
-    streaming_dispatch_size,
+    FlashAttentionOperation, FlashDecodeSmallMeta, FlashDecodeSmallTensors, TensorMeta,
+    build_flash_decode_small_meta, dispatch_streaming_flash_attention,
+    dispatch_streaming_tiled_flash_attention, flash_attention_module_cache,
+    flash_streaming_tiled_eligible, select_flash_attention_variant, streaming_dispatch_size,
 };
+
+fn flash_decode_cache_variant(
+    variant: FlashAttentionKernelVariant,
+    scale: f32,
+    meta: &FlashDecodeSmallMeta,
+) -> kernel_backend::KernelVariantKey {
+    kernel_backend::KernelVariantKey::with_payload::<FlashAttentionDirectKernelVariant>(|state| {
+        variant.hash(state);
+        scale.to_bits().hash(state);
+        meta.decode_block.hash(state);
+        meta.tiled.hash(state);
+        meta.split_blocks.hash(state);
+    })
+}
+
+fn hash_flash_decode_dims(
+    state: &mut rustc_hash::FxHasher,
+    dims: &tile_ir_kernels::FlashAttentionDims,
+) {
+    dims.batch.hash(state);
+    dims.num_heads.hash(state);
+    dims.num_kv_heads.hash(state);
+    dims.q_seq_len.hash(state);
+    dims.kv_seq_len.hash(state);
+    dims.head_dim.hash(state);
+}
+
+pub(super) fn flash_decode_module_key(
+    workgroup_shape: Option<&WorkgroupShape>,
+    dispatch_size: [u32; 3],
+    input_dtype: DataTypeEnum,
+    scale: f32,
+    meta: &FlashDecodeSmallMeta,
+) -> kernel_backend::KernelCacheKey {
+    flash_decode_module_key_for_variant(
+        FlashAttentionKernelVariant::DecodeSmall,
+        workgroup_shape,
+        dispatch_size,
+        input_dtype,
+        scale,
+        meta,
+    )
+}
+
+fn flash_decode_module_key_for_variant(
+    decode_variant: FlashAttentionKernelVariant,
+    workgroup_shape: Option<&WorkgroupShape>,
+    dispatch_size: [u32; 3],
+    input_dtype: DataTypeEnum,
+    scale: f32,
+    meta: &FlashDecodeSmallMeta,
+) -> kernel_backend::KernelCacheKey {
+    let variant = flash_decode_cache_variant(decode_variant, scale, meta);
+    kernel_backend::KernelCacheKey::from_hash_inputs(|state| {
+        // Decode kernels take the active KV length from a params buffer. Do
+        // not hash `active_kv_len`, or every generated token would miss the
+        // module cache even though the IR is otherwise bucketed by block size.
+        2u64.hash(state);
+        variant.hash(state);
+        TypeId::of::<FlashAttentionOperation>().hash(state);
+        workgroup_shape
+            .map(|workgroup_shape| workgroup_shape.shape())
+            .hash(state);
+        dispatch_size.hash(state);
+        input_dtype.hash(state);
+        hash_flash_decode_dims(state, &meta.dims);
+        meta.decode_block.hash(state);
+        meta.tiled.hash(state);
+        meta.split_blocks.hash(state);
+        meta.groups.hash(state);
+        meta.q_offset.hash(state);
+        meta.k_offset.hash(state);
+        meta.v_offset.hash(state);
+        meta.output_offset.hash(state);
+        meta.q_strides.hash(state);
+        meta.k_strides.hash(state);
+        meta.v_strides.hash(state);
+        meta.output_strides.hash(state);
+    })
+}
 
 impl Operation for FlashAttentionOperation {
     fn workgroup_shape_constraints(&self, _device: &crate::Device) -> WorkgroupShapeConstraints {
@@ -204,6 +284,10 @@ impl Operation for FlashAttentionOperation {
                 1,
                 1,
             ],
+            FlashAttentionKernelVariant::DecodeSplitPartials
+            | FlashAttentionKernelVariant::DecodeSplitReduce => {
+                unreachable!("split decode kernels are built as a sequence")
+            }
         };
         if dispatch_size
             .iter()
@@ -212,35 +296,147 @@ impl Operation for FlashAttentionOperation {
             return None;
         }
 
+        if let Some(meta) = decode_meta.filter(|meta| meta.tiled) {
+            let rows = meta
+                .dims
+                .batch
+                .checked_mul(meta.dims.num_heads)
+                .expect("flash split decode row overflow");
+            let scratch_elements =
+                rows as u64 * meta.split_blocks as u64 * (DECODE_HEAD_DIM as u64 + 2);
+            let scratch_buffer = device.create_buffer(
+                scratch_elements * std::mem::size_of::<f32>() as u64,
+                wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+            );
+            let params = [meta.active_kv_len, 0, 0, 0];
+            let params_buffer = device.create_buffer_init(
+                bytemuck::cast_slice(&params),
+                wgpu::BufferUsages::STORAGE
+                    | wgpu::BufferUsages::COPY_DST
+                    | wgpu::BufferUsages::COPY_SRC,
+            );
+            let partial_dispatch = [
+                rows.checked_mul(meta.split_blocks)
+                    .expect("flash split decode partial dispatch overflow"),
+                1,
+                1,
+            ];
+            let reduce_dispatch = [rows, 1, 1];
+            let layout = tile_ir_kernels::linear_storage_layout();
+
+            let partial_key = flash_decode_module_key_for_variant(
+                FlashAttentionKernelVariant::DecodeSplitPartials,
+                Some(workgroup_shape),
+                partial_dispatch,
+                input_dtype,
+                self.scale,
+                &meta,
+            );
+            let partial_buffers = vec![
+                q.buffer().clone(),
+                k.buffer().clone(),
+                v.buffer().clone(),
+                scratch_buffer.clone(),
+                params_buffer,
+            ];
+            let partial_layout = layout.clone();
+            let partial_kernel = kernel_backend::dynamic_kernel_from_hashed_ir(
+                device.kernel_cache(),
+                flash_attention_module_cache(),
+                "flash_attention_decode_split_partials",
+                partial_key,
+                partial_buffers,
+                partial_dispatch,
+                move || {
+                    let mut kb = tile_ir::KernelBuilder::<()>::new();
+                    let q_ref = tile_ir::KernelTensorRef::new((), partial_layout.clone());
+                    let k_ref = tile_ir::KernelTensorRef::new((), partial_layout.clone());
+                    let v_ref = tile_ir::KernelTensorRef::new((), partial_layout.clone());
+                    let scratch_ref = tile_ir::KernelTensorRef::new((), partial_layout.clone());
+                    let params_ref = tile_ir::KernelTensorRef::new((), partial_layout);
+                    tile_ir_kernels::flash_decode_split_partials(
+                        &mut kb,
+                        q_ref,
+                        k_ref,
+                        v_ref,
+                        scratch_ref,
+                        params_ref,
+                        meta,
+                    )?;
+                    Some(kb.finish().0)
+                },
+            )?;
+
+            let reduce_key = flash_decode_module_key_for_variant(
+                FlashAttentionKernelVariant::DecodeSplitReduce,
+                Some(workgroup_shape),
+                reduce_dispatch,
+                input_dtype,
+                self.scale,
+                &meta,
+            );
+            let reduce_buffers = vec![scratch_buffer, output.buffer().clone()];
+            let reduce_layout = layout.clone();
+            let reduce_kernel = kernel_backend::dynamic_kernel_from_hashed_ir(
+                device.kernel_cache(),
+                flash_attention_module_cache(),
+                "flash_attention_decode_split_reduce",
+                reduce_key,
+                reduce_buffers,
+                reduce_dispatch,
+                move || {
+                    let mut kb = tile_ir::KernelBuilder::<()>::new();
+                    let scratch_ref = tile_ir::KernelTensorRef::new((), reduce_layout.clone());
+                    let output_ref = tile_ir::KernelTensorRef::new((), reduce_layout);
+                    tile_ir_kernels::flash_decode_split_reduce(
+                        &mut kb,
+                        scratch_ref,
+                        output_ref,
+                        meta,
+                    )?;
+                    Some(kb.finish().0)
+                },
+            )?;
+
+            return Some(kernel_backend::DirectKernel::sequence(
+                "flash_attention_decode_split",
+                vec![partial_kernel, reduce_kernel],
+            ));
+        }
+
         let kernel_label = match variant {
             FlashAttentionKernelVariant::Streaming => "flash_attention",
             FlashAttentionKernelVariant::StreamingTiled => "flash_attention_tiled",
             FlashAttentionKernelVariant::DecodeSmall => "flash_attention_decode",
+            FlashAttentionKernelVariant::DecodeSplitPartials => {
+                "flash_attention_decode_split_partials"
+            }
+            FlashAttentionKernelVariant::DecodeSplitReduce => "flash_attention_decode_split_reduce",
         };
-        let cache_variant = kernel_backend::KernelVariantKey::with_payload::<
-            FlashAttentionDirectKernelVariant,
-        >(|state| {
-            variant.hash(state);
-            self.scale.to_bits().hash(state);
-            if matches!(
-                variant,
-                FlashAttentionKernelVariant::Streaming
-                    | FlashAttentionKernelVariant::StreamingTiled
-            ) {
+        let module_key = if let Some(meta) = decode_meta.as_ref() {
+            flash_decode_module_key(
+                Some(workgroup_shape),
+                dispatch_size,
+                input_dtype,
+                self.scale,
+                meta,
+            )
+        } else {
+            let cache_variant = kernel_backend::KernelVariantKey::with_payload::<
+                FlashAttentionDirectKernelVariant,
+            >(|state| {
+                variant.hash(state);
+                self.scale.to_bits().hash(state);
                 streaming_subgroup_size.hash(state);
                 self.causal.hash(state);
-            }
-            if let Some(meta) = decode_meta.as_ref() {
-                meta.decode_block.hash(state);
-                meta.tiled.hash(state);
-            }
-        });
-        let module_key = self.kernel_module_key_with_dispatch(
-            cache_variant,
-            Some(workgroup_shape),
-            dispatch_size,
-            inputs,
-        );
+            });
+            self.kernel_module_key_with_dispatch(
+                cache_variant,
+                Some(workgroup_shape),
+                dispatch_size,
+                inputs,
+            )
+        };
 
         let _ = output_index; // Bindings are derived from the kernel IR.
         let layout = tile_ir_kernels::linear_storage_layout();

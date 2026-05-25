@@ -292,7 +292,7 @@ impl GGUFPreTokenizerConfig {
             }
         }
         for bucket in &mut special_token_matches {
-            bucket.sort_unstable_by(|(left, _), (right, _)| right.len().cmp(&left.len()));
+            bucket.sort_unstable_by_key(|(left, _)| std::cmp::Reverse(left.len()));
         }
 
         let merges = merges

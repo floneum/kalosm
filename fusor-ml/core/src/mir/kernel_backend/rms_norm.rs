@@ -1,4 +1,8 @@
-use std::{any::Any, hash::Hash, sync::OnceLock};
+use std::{
+    any::Any,
+    hash::Hash,
+    sync::{Arc, OnceLock},
+};
 
 use crate::{
     DataTypeEnum, Layout,
@@ -40,6 +44,26 @@ const RMS_NORM_MODULE_CACHE_SIZE: usize = 128;
 fn rms_norm_module_cache() -> &'static kernel_backend::ModuleCache {
     static CACHE: OnceLock<kernel_backend::ModuleCache> = OnceLock::new();
     CACHE.get_or_init(|| kernel_backend::module_cache(RMS_NORM_MODULE_CACHE_SIZE))
+}
+
+fn collect_rms_buffers(
+    input: &TensorData,
+    residual: Option<&TensorData>,
+    weight: &TensorData,
+    bias: Option<&TensorData>,
+    output: &TensorData,
+) -> Vec<Arc<wgpu::Buffer>> {
+    let mut buffers = Vec::with_capacity(5);
+    buffers.push(input.buffer().clone());
+    if let Some(residual) = residual {
+        buffers.push(residual.buffer().clone());
+    }
+    buffers.push(weight.buffer().clone());
+    if let Some(bias) = bias {
+        buffers.push(bias.buffer().clone());
+    }
+    buffers.push(output.buffer().clone());
+    buffers
 }
 
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
@@ -299,21 +323,12 @@ impl Operation for RmsNormOperation {
             inputs,
         );
 
-        if let Some(meta) = vec4_meta {
-            // Collect buffers in the SAME order as the IR builder declares
-            // them (input, residual?, weight, bias?, output), so the closure
-            // can be deferred to cache-miss only.
-            let mut buffers = Vec::with_capacity(5);
-            buffers.push(input.buffer().clone());
-            if let Some(residual) = residual {
-                buffers.push(residual.buffer().clone());
-            }
-            buffers.push(weight.buffer().clone());
-            if let Some(bias) = bias {
-                buffers.push(bias.buffer().clone());
-            }
-            buffers.push(output.buffer().clone());
+        // Collect buffers in the SAME order as the IR builder declares
+        // them (input, residual?, weight, bias?, output), so the IR-build
+        // closure can be deferred to cache-miss only.
+        let buffers = collect_rms_buffers(input, residual, weight, bias, output);
 
+        if let Some(meta) = vec4_meta {
             let has_residual = residual.is_some();
             let has_bias = bias.is_some();
             kernel_backend::dynamic_kernel_from_hashed_ir(
@@ -375,17 +390,6 @@ impl Operation for RmsNormOperation {
                 },
             )
         } else {
-            let mut buffers = Vec::with_capacity(5);
-            buffers.push(input.buffer().clone());
-            if let Some(residual) = residual {
-                buffers.push(residual.buffer().clone());
-            }
-            buffers.push(weight.buffer().clone());
-            if let Some(bias) = bias {
-                buffers.push(bias.buffer().clone());
-            }
-            buffers.push(output.buffer().clone());
-
             let post_chain = self.post_element_wise.clone();
             kernel_backend::dynamic_kernel_from_hashed_ir(
                 graph.device().kernel_cache(),

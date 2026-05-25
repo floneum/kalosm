@@ -289,8 +289,13 @@ impl<T: Class> TextClassifier<T> {
 }
 
 #[cfg(test)]
-#[tokio::test]
-async fn simplified() -> Result<(), Box<dyn std::error::Error>> {
+#[test]
+fn simplified() -> Result<(), Box<dyn std::error::Error>> {
+    pollster::block_on(simplified_inner())
+}
+
+#[cfg(test)]
+async fn simplified_inner() -> Result<(), Box<dyn std::error::Error>> {
     use crate::{Class, Classifier, ClassifierConfig};
     use rbert::{Bert, BertSource};
 

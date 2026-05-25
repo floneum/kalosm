@@ -3,7 +3,8 @@ use std::sync::Arc;
 use wgpu::{CommandEncoder, ComputePass, PipelineCompilationOptions};
 
 use crate::cache::{
-    CachedKernel, DirectDynamicBindGroupKey, DirectStorage3BindGroupKey, KernelCache,
+    CachedDirectBindGroup, CachedKernel, DirectDynamicBindGroupKey, DirectStorage3BindGroupKey,
+    KernelCache,
 };
 
 #[derive(Clone, Debug)]
@@ -31,6 +32,9 @@ enum DirectKernelKind {
         weight: Arc<wgpu::Buffer>,
         output: Arc<wgpu::Buffer>,
     },
+    /// Ordered multi-dispatch kernel. This is used by operations that need a
+    /// scratch-buffer pass followed by a reduction pass.
+    Sequence(Vec<DirectKernel>),
 }
 
 #[derive(Debug)]
@@ -41,9 +45,13 @@ pub struct DirectKernel {
 }
 
 pub struct PreparedDirectDispatch {
+    steps: Vec<PreparedDirectDispatchStep>,
+    _buffers: Vec<Arc<wgpu::Buffer>>,
+}
+
+struct PreparedDirectDispatchStep {
     pipeline: wgpu::ComputePipeline,
     bind_group: wgpu::BindGroup,
-    _buffers: Vec<Arc<wgpu::Buffer>>,
     dispatch_size: [u32; 3],
 }
 
@@ -81,6 +89,14 @@ impl DirectKernel {
         }
     }
 
+    pub fn sequence(name: impl Into<String>, kernels: Vec<DirectKernel>) -> Self {
+        Self {
+            name: name.into(),
+            dispatch_size: [1, 1, 1],
+            kind: DirectKernelKind::Sequence(kernels),
+        }
+    }
+
     pub fn run(&self, cache: &KernelCache, command_encoder: &mut CommandEncoder) {
         let Some(dispatch) = self.prepare_dispatch(cache) else {
             return;
@@ -93,18 +109,30 @@ impl DirectKernel {
     }
 
     pub fn prepare_dispatch(&self, cache: &KernelCache) -> Option<PreparedDirectDispatch> {
-        let [x, y, z] = self.dispatch_size;
-        if x * y * z == 0 {
-            return None;
-        }
-
         match &self.kind {
+            DirectKernelKind::Sequence(kernels) => {
+                let mut steps = Vec::new();
+                let mut buffers = Vec::new();
+                for kernel in kernels {
+                    let dispatch = kernel.prepare_dispatch(cache)?;
+                    steps.extend(dispatch.steps);
+                    buffers.extend(dispatch._buffers);
+                }
+                (!steps.is_empty()).then_some(PreparedDirectDispatch {
+                    steps,
+                    _buffers: buffers,
+                })
+            }
             DirectKernelKind::Storage3 {
                 pipeline,
                 input,
                 weight,
                 output,
             } => {
+                let [x, y, z] = self.dispatch_size;
+                if x * y * z == 0 {
+                    return None;
+                }
                 let bind_group_layout = cache.direct_three_buffer_bind_group_layout();
                 let bind_group_key = DirectStorage3BindGroupKey::new(input, weight, output);
                 let bind_group = cache
@@ -125,21 +153,33 @@ impl DirectKernel {
                                 resource: output.as_entire_binding(),
                             },
                         ];
-                        cache.device.create_bind_group(&wgpu::BindGroupDescriptor {
-                            label: Some(&self.name),
-                            layout: &bind_group_layout,
-                            entries: &bind_entries,
-                        })
+                        let bind_group =
+                            cache.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                                label: Some(&self.name),
+                                layout: &bind_group_layout,
+                                entries: &bind_entries,
+                            });
+                        CachedDirectBindGroup::new(
+                            bind_group,
+                            vec![input.clone(), weight.clone(), output.clone()],
+                        )
                     })
+                    .bind_group
                     .clone();
                 Some(PreparedDirectDispatch {
-                    pipeline: pipeline.clone(),
-                    bind_group,
+                    steps: vec![PreparedDirectDispatchStep {
+                        pipeline: pipeline.clone(),
+                        bind_group,
+                        dispatch_size: self.dispatch_size,
+                    }],
                     _buffers: vec![input.clone(), weight.clone(), output.clone()],
-                    dispatch_size: self.dispatch_size,
                 })
             }
             DirectKernelKind::Dynamic { cached, bindings } => {
+                let [x, y, z] = self.dispatch_size;
+                if x * y * z == 0 {
+                    return None;
+                }
                 let layout_entries = bindings
                     .iter()
                     .map(|binding| wgpu::BindGroupLayoutEntry {
@@ -185,12 +225,21 @@ impl DirectKernel {
                                 resource: b.buffer.as_entire_binding(),
                             })
                             .collect::<Vec<_>>();
-                        cache.device.create_bind_group(&wgpu::BindGroupDescriptor {
-                            label: Some(&self.name),
-                            layout: &bind_group_layout,
-                            entries: &bind_entries,
-                        })
+                        let bind_group =
+                            cache.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                                label: Some(&self.name),
+                                layout: &bind_group_layout,
+                                entries: &bind_entries,
+                            });
+                        CachedDirectBindGroup::new(
+                            bind_group,
+                            bindings
+                                .iter()
+                                .map(|binding| binding.buffer.clone())
+                                .collect(),
+                        )
                     })
+                    .bind_group
                     .clone();
 
                 let pipeline_layout = cache
@@ -228,13 +277,15 @@ impl DirectKernel {
                     .clone();
 
                 Some(PreparedDirectDispatch {
-                    pipeline,
-                    bind_group,
+                    steps: vec![PreparedDirectDispatchStep {
+                        pipeline,
+                        bind_group,
+                        dispatch_size: self.dispatch_size,
+                    }],
                     _buffers: bindings
                         .iter()
                         .map(|binding| binding.buffer.clone())
                         .collect(),
-                    dispatch_size: self.dispatch_size,
                 })
             }
         }
@@ -265,15 +316,32 @@ impl DirectKernel {
                     read_only: false,
                 },
             ],
+            DirectKernelKind::Sequence(kernels) => kernels
+                .iter()
+                .flat_map(|kernel| kernel.bindings_for_test())
+                .collect(),
         }
     }
 }
 
 impl PreparedDirectDispatch {
-    pub fn run<'a>(&'a self, pass: &mut ComputePass<'a>) {
-        let [x, y, z] = self.dispatch_size;
-        pass.set_pipeline(&self.pipeline);
-        pass.set_bind_group(0, &self.bind_group, &[]);
+    pub fn step_count(&self) -> usize {
+        self.steps.len()
+    }
+
+    pub fn run_step<'a>(&'a self, pass: &mut ComputePass<'a>, step_index: usize) {
+        let Some(step) = self.steps.get(step_index) else {
+            return;
+        };
+        let [x, y, z] = step.dispatch_size;
+        pass.set_pipeline(&step.pipeline);
+        pass.set_bind_group(0, &step.bind_group, &[]);
         pass.dispatch_workgroups(x, y, z);
+    }
+
+    pub fn run<'a>(&'a self, pass: &mut ComputePass<'a>) {
+        for step_index in 0..self.step_count() {
+            self.run_step(pass, step_index);
+        }
     }
 }
