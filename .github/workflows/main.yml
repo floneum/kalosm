@@ -103,24 +103,42 @@ jobs:
           packages: libwebkit2gtk-4.1-dev libgtk-3-dev libasound2-dev libayatana-appindicator3-dev libxdo-dev mesa-vulkan-drivers vulkan-tools
           version: ${{ env.APT_CACHE_VERSION }}
       - uses: dtolnay/rust-toolchain@stable
-      - uses: humbletim/setup-vulkan-sdk@v1.2.1
-        with:
-          vulkan-query-version: 1.4.328.1
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: "linux-stable"
           cache-all-crates: "true"
           save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Configure lavapipe
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          icd_dir=/usr/share/vulkan/icd.d
+          if [[ ! -d "$icd_dir" ]]; then
+            echo "Vulkan ICD directory was not installed: $icd_dir" >&2
+            exit 1
+          fi
+
+          lvp_icd="$(find "$icd_dir" -maxdepth 1 -name 'lvp_icd*.json' -print -quit)"
+          if [[ -z "$lvp_icd" ]]; then
+            echo "Lavapipe ICD not found in $icd_dir" >&2
+            ls -la "$icd_dir" >&2
+            exit 1
+          fi
+
+          echo "Using lavapipe ICD: $lvp_icd"
+          echo "VK_DRIVER_FILES=$lvp_icd" >> "$GITHUB_ENV"
+          echo "WGPU_BACKEND=vulkan" >> "$GITHUB_ENV"
+          echo "MESA_SHADER_CACHE_DISABLE=1" >> "$GITHUB_ENV"
+          echo "LIBGL_ALWAYS_SOFTWARE=1" >> "$GITHUB_ENV"
+
+          VK_DRIVER_FILES="$lvp_icd" WGPU_BACKEND=vulkan MESA_SHADER_CACHE_DISABLE=1 LIBGL_ALWAYS_SOFTWARE=1 vulkaninfo --summary
       - name: Run tests
         env:
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           FUSOR_CONFORMANCE_REQUIRE_GPU: "1"
-          MESA_SHADER_CACHE_DISABLE: "1"
-          VK_DRIVER_FILES: /usr/share/vulkan/icd.d/lvp_icd.x86_64.json
-          VK_ICD_FILENAMES: /usr/share/vulkan/icd.d/lvp_icd.x86_64.json
-          WGPU_BACKEND: vulkan
         run: cargo test --lib --bins --tests --examples --workspace --features kalosm/language,kalosm/sound,kalosm/vision,kalosm/remote,kalosm/scrape --exclude fusor-core --exclude rbert --exclude rwhisper --exclude kalosm-learning
 
   doc:
