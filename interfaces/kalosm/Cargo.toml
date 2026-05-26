@@ -87,7 +87,10 @@ version = "0.1.40"
 optional = true
 
 [dev-dependencies]
+anyhow.workspace = true
+image.workspace = true
 pollster = "0.4"
+rodio = "0.20.1"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 
 [features]

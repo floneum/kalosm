@@ -640,9 +640,20 @@ impl<'a, C: Connection, R, M: Embedder, K: Chunker> HybridSearchBuilder<'a, C, R
     /// * `weight` - Weight for semantic score (0.0 to 1.0)
     ///
     /// # Example
-    /// ```rust,ignore
+    /// ```rust,no_run
+    /// # use kalosm::language::*;
+    /// # use surrealdb::Connection;
+    /// # fn configure_builder<'a, C, R, M, K>(
+    /// #     builder: HybridSearchBuilder<'a, C, R, M, K>,
+    /// # ) where
+    /// #     C: Connection,
+    /// #     M: Embedder,
+    /// #     K: Chunker,
+    /// # {
     /// // Setting semantic weight to 0.8 will set keyword weight to 0.2
-    /// builder.with_semantic_weight(0.8)
+    /// let builder = builder.with_semantic_weight(0.8);
+    /// # let _ = builder;
+    /// # }
     /// ```
     pub fn with_semantic_weight(mut self, weight: f32) -> Self {
         self.semantic_weight = weight.clamp(0.0, 1.0);
@@ -661,9 +672,20 @@ impl<'a, C: Connection, R, M: Embedder, K: Chunker> HybridSearchBuilder<'a, C, R
     /// * `weight` - Weight for keyword score (0.0 to 1.0)
     ///
     /// # Example
-    /// ```rust,ignore
+    /// ```rust,no_run
+    /// # use kalosm::language::*;
+    /// # use surrealdb::Connection;
+    /// # fn configure_builder<'a, C, R, M, K>(
+    /// #     builder: HybridSearchBuilder<'a, C, R, M, K>,
+    /// # ) where
+    /// #     C: Connection,
+    /// #     M: Embedder,
+    /// #     K: Chunker,
+    /// # {
     /// // Setting keyword weight to 0.4 will set semantic weight to 0.6
-    /// builder.with_keyword_weight(0.4)
+    /// let builder = builder.with_keyword_weight(0.4);
+    /// # let _ = builder;
+    /// # }
     /// ```
     pub fn with_keyword_weight(mut self, weight: f32) -> Self {
         self.keyword_weight = weight.clamp(0.0, 1.0);

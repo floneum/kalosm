@@ -55,8 +55,8 @@ fn matmul(c: &mut Criterion) {
                             for _ in 0..iters {
                                 let tensor1 = Tensor::new(&device, &vec![vec![1.; k]; m]);
                                 let tensor2 = Tensor::new(&device, &vec![vec![1.; n]; k]);
-                                _ = tensor1.as_slice().await.unwrap();
-                                _ = tensor2.as_slice().await.unwrap();
+                                _ = tensor1.as_slice::<2, f32>().await.unwrap();
+                                _ = tensor2.as_slice::<2, f32>().await.unwrap();
                                 let new = tensor1.mat_mul(&tensor2);
                                 let start = std::time::Instant::now();
                                 new.materialize().await;

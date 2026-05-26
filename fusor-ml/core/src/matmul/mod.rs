@@ -53,7 +53,7 @@ impl Tensor {
 #[cfg(test)]
 mod selection_tests {
     use super::variants::{
-        DenseMatmulCtx, DenseMatmulVariant, CoopTile, DirectTileMatmulVariant,
+        CoopTile, DenseMatmulCtx, DenseMatmulVariant, DirectTileMatmulVariant,
         dense_matmul_selector, direct_tile_matmul_selector, select_coop_kind,
     };
     use crate::kernel_selection::{
@@ -285,9 +285,6 @@ mod selection_tests {
             CoopTile::select(1024, 1024, 1024, 128),
             Some(CoopTile::new(64, 64, 16))
         );
-        assert_eq!(
-            CoopTile::select(1000, 1024, 1024, 512),
-            None
-        );
+        assert_eq!(CoopTile::select(1000, 1024, 1024, 512), None);
     }
 }

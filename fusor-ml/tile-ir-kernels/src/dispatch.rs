@@ -243,7 +243,6 @@ pub(crate) fn q6k_tall_override(default: QgemvShape) -> QgemvShape {
     env_tile_override("FUSOR_Q6K_TALL_TILE", STANDARD_8_TILES, default)
 }
 
-
 #[cfg(test)]
 mod tests {
     //! Snapshot tests pinning the current `(format, rows, cols, env) →

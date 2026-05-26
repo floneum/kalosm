@@ -1,17 +1,17 @@
 //! Dense matrix multiply program kernels.
 
 use fusor_tile_ir::tile::{CoopAcc, Program, Storage, Tile, TileBlock};
-use fusor_tile_ir::{CoopElement, F32, TileLiteral, TileReduceOp, U32, WorkgroupAxis};
+use fusor_tile_ir::{CoopElement, TileLiteral, TileReduceOp, WorkgroupAxis, F32, U32};
 
 use crate::{
     grid::dot4_sum,
     kernels::helpers::{
-        AccumCast, coop_load_a_fragments, coop_load_b_fragments, coop_mma_grid,
-        coop_store_acc_grid, dispatch_grid_1d, zero_coop_acc_grid,
+        coop_load_a_fragments, coop_load_b_fragments, coop_mma_grid, coop_store_acc_grid,
+        dispatch_grid_1d, zero_coop_acc_grid, AccumCast,
     },
     types::{
-        DenseMatmulEpilogues, apply_optional_epilogue, cooperative_store_layout_supported,
-        matrix_shape,
+        apply_optional_epilogue, cooperative_store_layout_supported, matrix_shape,
+        DenseMatmulEpilogues,
     },
 };
 

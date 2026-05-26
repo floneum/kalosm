@@ -40,7 +40,7 @@ fn bench_sum_reduce(c: &mut Criterion) {
                     while sum.is_zero() {
                         for _ in 0..iters {
                             let tensor = Tensor::new(&device, &vec![vec![1.; size]; size]);
-                            _ = tensor.as_slice().await.unwrap();
+                            _ = tensor.as_slice::<2, f32>().await.unwrap();
                             let new = tensor.sum(0);
                             let start = std::time::Instant::now();
                             new.materialize().await;

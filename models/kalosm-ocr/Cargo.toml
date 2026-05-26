@@ -29,6 +29,7 @@ kalosm-model-types = { workspace = true }
 
 [dev-dependencies]
 pollster = "0.4"
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 
 [features]
 flash = ["candle-transformers/flash-attn"]

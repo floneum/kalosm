@@ -22,19 +22,19 @@ pub use flash::{
 };
 pub use helpers::AccumCast;
 pub use matmul::{
-    DenseMatmulShape, batched_gemv_with_epilogues, batched_matmul_register_with_epilogues,
-    batched_matmul_with_epilogues, try_batched_coop_matmul,
+    batched_gemv_with_epilogues, batched_matmul_register_with_epilogues,
+    batched_matmul_with_epilogues, try_batched_coop_matmul, DenseMatmulShape,
 };
-pub use mirostat::{Mirostat2, mirostat2};
+pub use mirostat::{mirostat2, Mirostat2};
 pub use qdequantize::qdequantize;
-pub use qgemv::{IntoQgemvEpilogues, qgemv_with_epilogue};
+pub use qgemv::{qgemv_with_epilogue, IntoQgemvEpilogues};
 pub use qgemv_paired_q4k::{
-    Q4KPairedGgml, Q4KPairedShape, qgemv_q4k_paired, qgemv_q4k_paired_dispatch,
+    qgemv_q4k_paired, qgemv_q4k_paired_dispatch, Q4KPairedGgml, Q4KPairedShape,
 };
 pub use qmatmul::qmatmul_with_epilogue;
 pub use qmatmul_workgroup::{qgemv_workgroup_with_epilogue, qmatmul_workgroup_with_epilogues};
 pub use quantized_matrix::{quantized_matrix, quantized_matrix_for};
-pub use rms_norm::{RmsNormVec4, rms_norm_vec4};
+pub use rms_norm::{rms_norm_vec4, RmsNormVec4};
 pub use softmax::{softmax, softmax_partials, softmax_reduce, softmax_write};
 pub use top_k::{top_k_chunk, top_k_exactness, top_k_merge};
 pub use types::{

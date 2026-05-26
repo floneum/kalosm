@@ -12,7 +12,7 @@ env:
   RUST_BACKTRACE: 1
 
 # All benches run on the same macos-latest runner and build the same
-# `fusor-core` deps, so anchor them at one shared cache slot and only
+# `fusor` deps, so anchor them at one shared cache slot and only
 # save from the base branch to keep the Actions cache from churning.
 # `cache-on-failure: "true"` so a broken bench still leaves a useful
 # cache for the next run.
@@ -27,7 +27,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: "macos-bench"
-          workspaces: fusor-ml/core
+          workspaces: fusor-ml/fusor
           cache-all-crates: "true"
           cache-on-failure: "true"
           # Bench runs only on PRs, so we never see `refs/heads/main`
@@ -35,9 +35,10 @@ jobs:
           # own cache warms across re-runs within the PR.
       - uses: ./.github/actions/criterion-compare
         with:
-          cwd: "fusor-ml/core"
+          cwd: "fusor-ml/fusor"
           benchName: "qmatmul"
           branchName: ${{ github.base_ref }}
+          baseFallbackCwd: "fusor-ml/core"
   matmul:
     if: github.event.pull_request.draft == false
     name: matmul benchmark
@@ -48,7 +49,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: "macos-bench"
-          workspaces: fusor-ml/core
+          workspaces: fusor-ml/fusor
           cache-all-crates: "true"
           cache-on-failure: "true"
           # Bench runs only on PRs, so we never see `refs/heads/main`
@@ -56,9 +57,10 @@ jobs:
           # own cache warms across re-runs within the PR.
       - uses: ./.github/actions/criterion-compare
         with:
-          cwd: "fusor-ml/core"
+          cwd: "fusor-ml/fusor"
           benchName: "matmul"
           branchName: ${{ github.base_ref }}
+          baseFallbackCwd: "fusor-ml/core"
           criterionArgs: "--sample-size 10"
   elementwise:
     if: github.event.pull_request.draft == false
@@ -70,7 +72,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: "macos-bench"
-          workspaces: fusor-ml/core
+          workspaces: fusor-ml/fusor
           cache-all-crates: "true"
           cache-on-failure: "true"
           # Bench runs only on PRs, so we never see `refs/heads/main`
@@ -78,9 +80,10 @@ jobs:
           # own cache warms across re-runs within the PR.
       - uses: ./.github/actions/criterion-compare
         with:
-          cwd: "fusor-ml/core"
+          cwd: "fusor-ml/fusor"
           benchName: "elementwise"
           branchName: ${{ github.base_ref }}
+          baseFallbackCwd: "fusor-ml/core"
   fused:
     if: github.event.pull_request.draft == false
     name: fused benchmark
@@ -91,7 +94,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: "macos-bench"
-          workspaces: fusor-ml/core
+          workspaces: fusor-ml/fusor
           cache-all-crates: "true"
           cache-on-failure: "true"
           # Bench runs only on PRs, so we never see `refs/heads/main`
@@ -99,9 +102,10 @@ jobs:
           # own cache warms across re-runs within the PR.
       - uses: ./.github/actions/criterion-compare
         with:
-          cwd: "fusor-ml/core"
+          cwd: "fusor-ml/fusor"
           benchName: "fused"
           branchName: ${{ github.base_ref }}
+          baseFallbackCwd: "fusor-ml/core"
   reduce:
     if: github.event.pull_request.draft == false
     name: reduce benchmark
@@ -112,7 +116,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: "macos-bench"
-          workspaces: fusor-ml/core
+          workspaces: fusor-ml/fusor
           cache-all-crates: "true"
           cache-on-failure: "true"
           # Bench runs only on PRs, so we never see `refs/heads/main`
@@ -120,9 +124,10 @@ jobs:
           # own cache warms across re-runs within the PR.
       - uses: ./.github/actions/criterion-compare
         with:
-          cwd: "fusor-ml/core"
+          cwd: "fusor-ml/fusor"
           benchName: "reduce"
           branchName: ${{ github.base_ref }}
+          baseFallbackCwd: "fusor-ml/core"
   pairwise:
     if: github.event.pull_request.draft == false
     name: pairwise benchmark
@@ -133,7 +138,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: "macos-bench"
-          workspaces: fusor-ml/core
+          workspaces: fusor-ml/fusor
           cache-all-crates: "true"
           cache-on-failure: "true"
           # Bench runs only on PRs, so we never see `refs/heads/main`
@@ -141,6 +146,7 @@ jobs:
           # own cache warms across re-runs within the PR.
       - uses: ./.github/actions/criterion-compare
         with:
-          cwd: "fusor-ml/core"
+          cwd: "fusor-ml/fusor"
           benchName: "pairwise"
           branchName: ${{ github.base_ref }}
+          baseFallbackCwd: "fusor-ml/core"

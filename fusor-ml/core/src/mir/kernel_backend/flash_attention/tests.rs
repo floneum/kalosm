@@ -413,7 +413,7 @@ fn tiled_decode_attention_matches_cpu_reference() {
         let k = Tensor::new(&device, &k_data);
         let v = Tensor::new(&device, &v_data);
         let output = q.try_flash_attention_direct(&k, &v, scale, None).unwrap();
-        let output = output.as_slice().await.unwrap();
+        let output = output.as_slice::<4, f32>().await.unwrap();
         let (max_error, _, max_dim, max_actual, max_expected) =
             decode_max_error(1, 1, &q_data, &k_data, &v_data, scale, |_, dim| {
                 output[[0, 0, 0, dim]]
@@ -446,7 +446,7 @@ fn tiled_decode_attention_gqa_matches_cpu_reference() {
         let k = Tensor::new(&device, &k_data);
         let v = Tensor::new(&device, &v_data);
         let output = q.try_flash_attention_direct(&k, &v, scale, None).unwrap();
-        let output = output.as_slice().await.unwrap();
+        let output = output.as_slice::<4, f32>().await.unwrap();
 
         let (max_error, max_head, max_dim, max_actual, max_expected) = decode_max_error(
             num_heads,
@@ -498,7 +498,7 @@ fn decode_gqa_non_tiled_large_blocks_match_cpu_reference() {
             let k = Tensor::new(&device, &k_data);
             let v = Tensor::new(&device, &v_data);
             let output = q.try_flash_attention_direct(&k, &v, scale, None).unwrap();
-            let output = output.as_slice().await.unwrap();
+            let output = output.as_slice::<4, f32>().await.unwrap();
 
             let (max_error, max_head, max_dim, max_actual, max_expected) = decode_max_error(
                 num_heads,

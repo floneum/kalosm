@@ -60,7 +60,7 @@ env:
   RUST_BACKTRACE: 1
   # Bump when the apt dependency list below changes so the next run
   # rebuilds the apt archive instead of restoring a stale one.
-  APT_CACHE_VERSION: "v1"
+  APT_CACHE_VERSION: "v2"
 
 jobs:
   check:
@@ -100,7 +100,7 @@ jobs:
       - uses: actions/checkout@v6
       - uses: awalsh128/cache-apt-pkgs-action@latest
         with:
-          packages: libwebkit2gtk-4.1-dev libgtk-3-dev libasound2-dev libayatana-appindicator3-dev libxdo-dev
+          packages: libwebkit2gtk-4.1-dev libgtk-3-dev libasound2-dev libayatana-appindicator3-dev libxdo-dev mesa-vulkan-drivers vulkan-tools
           version: ${{ env.APT_CACHE_VERSION }}
       - uses: dtolnay/rust-toolchain@stable
       - uses: humbletim/setup-vulkan-sdk@v1.2.1
@@ -117,6 +117,10 @@ jobs:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           FUSOR_CONFORMANCE_REQUIRE_GPU: "1"
+          MESA_SHADER_CACHE_DISABLE: "1"
+          VK_DRIVER_FILES: /usr/share/vulkan/icd.d/lvp_icd.x86_64.json
+          WGPU_ADAPTER_NAME: llvmpipe
+          WGPU_BACKEND: vulkan
         run: cargo test --lib --bins --tests --examples --workspace --features kalosm/language,kalosm/sound,kalosm/vision,kalosm/remote,kalosm/scrape --exclude fusor-core --exclude rbert --exclude rwhisper --exclude kalosm-learning
 
   doc:
@@ -135,7 +139,7 @@ jobs:
           shared-key: "linux-stable"
           cache-all-crates: "true"
           save-if: ${{ github.ref == 'refs/heads/main' }}
-      - run: cargo test --doc --workspace --features kalosm/language,kalosm/sound,kalosm/vision,kalosm/remote,kalosm/scrape
+      - run: cargo test --doc --workspace --features kalosm/language,kalosm/llama,kalosm/bert,kalosm/structured,kalosm/fs-documents,kalosm/sound,kalosm/sound-denoise,kalosm/sound-source,kalosm/sound-voice-detection,kalosm/vision,kalosm/remote,kalosm/scrape,kalosm/surrealdb-local
 
   fmt:
     if: github.event.pull_request.draft == false

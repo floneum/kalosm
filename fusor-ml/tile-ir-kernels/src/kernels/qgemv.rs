@@ -3,17 +3,17 @@
 use fusor_tile_ir::tile::{
     BlockCoord, Mask, Program, Q4KActivations, QuantizedDot, Storage, Tile, TileBlock,
 };
-use fusor_tile_ir::{F32, GgmlQuantFormat, QuantizedMatrix, TileLiteral, TileReduceOp, U32};
+use fusor_tile_ir::{GgmlQuantFormat, QuantizedMatrix, TileLiteral, TileReduceOp, F32, U32};
 
 use crate::dispatch::{
-    QgemvShape, q4k_default_large, q4k_default_mid, q4k_default_tall, q4k_large_override,
-    q4k_mid_override, q4k_tall_override, q6k_default_large, q6k_default_tall, q6k_large_override,
-    q6k_tall_override, qgemv_subgroups_per_workgroup_for_shape,
+    q4k_default_large, q4k_default_mid, q4k_default_tall, q4k_large_override, q4k_mid_override,
+    q4k_tall_override, q6k_default_large, q6k_default_tall, q6k_large_override, q6k_tall_override,
+    qgemv_subgroups_per_workgroup_for_shape, QgemvShape,
 };
 use crate::grid::{
-    Q4KGgmlIterationRequest, Q4KLane, Q6KGgmlIterationRequest, Q6KLane, QgemvStoreTarget, dot4_sum,
-    q4k_ggml_iteration, q4k_lane_decomposition, q6k_ggml_iteration, q6k_lane_decomposition,
-    qgemv_grid, qgemv_program_scope,
+    dot4_sum, q4k_ggml_iteration, q4k_lane_decomposition, q6k_ggml_iteration,
+    q6k_lane_decomposition, qgemv_grid, qgemv_program_scope, Q4KGgmlIterationRequest, Q4KLane,
+    Q6KGgmlIterationRequest, Q6KLane, QgemvStoreTarget,
 };
 use crate::types::matrix_shape;
 

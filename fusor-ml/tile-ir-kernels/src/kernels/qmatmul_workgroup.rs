@@ -23,11 +23,11 @@
 //!   body uses 1x1.
 
 use fusor_tile_ir::tile::{Mask, Program, Storage, Tile, TileBlock, Workgroup};
-use fusor_tile_ir::{F32, QuantizedMatrix, TileLiteral, TileReduceOp, U32, WorkgroupAxis};
+use fusor_tile_ir::{QuantizedMatrix, TileLiteral, TileReduceOp, WorkgroupAxis, F32, U32};
 
 use crate::kernels::helpers::{dispatch_grid_1d, load_qmatmul_extra};
 use crate::types::{
-    QmatmulEpilogues, apply_qmatmul_post_epilogue, apply_qmatmul_pre_epilogue, matrix_shape,
+    apply_qmatmul_post_epilogue, apply_qmatmul_pre_epilogue, matrix_shape, QmatmulEpilogues,
 };
 
 const QMATMUL_LANES: usize = 64;

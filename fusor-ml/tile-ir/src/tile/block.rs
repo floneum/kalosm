@@ -3,8 +3,8 @@ use std::marker::PhantomData;
 use super::value::{boxed_index, boxed_u32_literal};
 use super::*;
 use crate::ir::{
-    Bool, Builtin, Expr, F16, F32, FloatElement, Numeric, ScalarMarker, TileLiteral, TileLoadExpr,
-    TileStmt, TileUnaryOp, U32, Vector, WorkgroupAxis,
+    Bool, Builtin, Expr, FloatElement, Numeric, ScalarMarker, TileLiteral, TileLoadExpr, TileStmt,
+    TileUnaryOp, Vector, WorkgroupAxis, F16, F32, U32,
 };
 use crate::quantized::QuantizedMatrix;
 

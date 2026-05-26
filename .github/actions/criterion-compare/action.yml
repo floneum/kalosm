@@ -8,6 +8,10 @@ inputs:
   cwd:
     description: Directory where the benchmark crate lives.
     required: true
+  baseFallbackCwd:
+    description: Optional fallback crate directory for the base branch when a benchmark target moved.
+    required: false
+    default: ""
   benchName:
     description: Criterion benchmark target to run.
     required: true
@@ -25,8 +29,13 @@ runs:
 
     - name: Benchmark changes
       shell: bash
-      working-directory: ${{ inputs.cwd }}
-      run: cargo bench --bench "${{ inputs.benchName }}" -- ${{ inputs.criterionArgs }} --save-baseline changes
+      run: |
+        set -euo pipefail
+        feature_args=()
+        if awk '/^\[/{ in_features = ($0 == "[features]"); next } in_features && /^[[:space:]]*bench[[:space:]]*=/{ found=1 } END { exit found ? 0 : 1 }' "${{ inputs.cwd }}/Cargo.toml"; then
+          feature_args=(--features bench)
+        fi
+        (cd "${{ inputs.cwd }}" && cargo bench "${feature_args[@]}" --bench "${{ inputs.benchName }}" -- ${{ inputs.criterionArgs }} --save-baseline changes)
 
     - name: Fetch base branch
       shell: bash
@@ -38,12 +47,54 @@ runs:
 
     - name: Benchmark base
       shell: bash
-      working-directory: ${{ inputs.cwd }}
-      run: cargo bench --bench "${{ inputs.benchName }}" -- ${{ inputs.criterionArgs }} --save-baseline base
+      run: |
+        set -euo pipefail
+        bench_name="${{ inputs.benchName }}"
+        bench_cwd="${{ inputs.cwd }}"
+
+        has_bench_target() {
+          local cargo_toml="$1/Cargo.toml"
+          [ -f "$cargo_toml" ] || return 1
+          awk -v bench="$bench_name" '
+            /^\[\[bench\]\]/ {
+              if (in_bench && name == bench) found = 1
+              in_bench = 1
+              name = ""
+              next
+            }
+            /^\[/ {
+              if (in_bench && name == bench) found = 1
+              in_bench = 0
+            }
+            in_bench && /^[[:space:]]*name[[:space:]]*=/ {
+              name = $0
+              sub(/^[^=]*=[[:space:]]*"/, "", name)
+              sub(/".*$/, "", name)
+            }
+            END {
+              if (in_bench && name == bench) found = 1
+              exit found ? 0 : 1
+            }
+          ' "$cargo_toml"
+        }
+
+        if ! has_bench_target "$bench_cwd" && [ -n "${{ inputs.baseFallbackCwd }}" ] && has_bench_target "${{ inputs.baseFallbackCwd }}"; then
+          bench_cwd="${{ inputs.baseFallbackCwd }}"
+        fi
+
+        if ! has_bench_target "$bench_cwd"; then
+          echo "Benchmark target '$bench_name' was not found in '$bench_cwd'." >&2
+          exit 1
+        fi
+
+        feature_args=()
+        if awk '/^\[/{ in_features = ($0 == "[features]"); next } in_features && /^[[:space:]]*bench[[:space:]]*=/{ found=1 } END { exit found ? 0 : 1 }' "$bench_cwd/Cargo.toml"; then
+          feature_args=(--features bench)
+        fi
+        (cd "$bench_cwd" && cargo bench "${feature_args[@]}" --bench "$bench_name" -- ${{ inputs.criterionArgs }} --save-baseline base)
 
     - name: Compare baselines
       shell: bash
-      working-directory: ${{ inputs.cwd }}
       run: |
         set -o pipefail
         {

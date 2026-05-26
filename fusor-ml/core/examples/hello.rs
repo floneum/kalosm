@@ -31,7 +31,7 @@ fn main() {
         let device = device.clone();
         let random_data = random_data.clone();
         let tensor = Tensor::new(&device, &random_data);
-        _ = tensor.as_slice().await.unwrap();
+        _ = tensor.as_slice::<2, f32>().await.unwrap();
         for _ in 0..1 {
             let new = tensor.q_mat_mul(&q_matrix);
             new.materialize().await;

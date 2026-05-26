@@ -42,7 +42,7 @@ impl From<heed::Error> for VectorDbError {
 /// ```rust, no_run
 /// # use kalosm_language::prelude::*;
 /// # use kalosm_language_model::*;
-/// # use rbert::*;
+/// # use kalosm::language::Bert;
 /// # use std::collections::HashMap;
 /// # #[tokio::main]
 /// # async fn main() {

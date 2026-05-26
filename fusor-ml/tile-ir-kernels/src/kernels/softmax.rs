@@ -1,10 +1,10 @@
 use fusor_tile_ir::{
-    ElementType, F32, Numeric, TileLiteral, U32, WorkgroupAxis,
     tile::{Mask, Tile, TileBlock, Workgroup},
+    ElementType, Numeric, TileLiteral, WorkgroupAxis, F32, U32,
 };
 
 use super::{
-    helpers::{NEG_MAX_F32, reduce_workgroup},
+    helpers::{reduce_workgroup, NEG_MAX_F32},
     types::SoftmaxMeta,
 };
 

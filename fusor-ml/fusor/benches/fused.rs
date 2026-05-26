@@ -25,7 +25,7 @@ fn fused(c: &mut Criterion) {
         for size in SIZES {
             let device = block_on(Device::new()).unwrap();
             let tensor = Tensor::new(&device, &vec![vec![1.; size]; size]);
-            block_on(tensor.as_slice()).unwrap();
+            block_on(tensor.as_slice::<2, f32>()).unwrap();
 
             group.bench_with_input(
                 BenchmarkId::new("fusor-gpu-fused", size),
@@ -37,7 +37,7 @@ fn fused(c: &mut Criterion) {
                         while sum.is_zero() {
                             for _ in 0..iters {
                                 let tensor = Tensor::new(&device, &vec![vec![1.; size]; size]);
-                                _ = tensor.as_slice().await.unwrap();
+                                _ = tensor.as_slice::<2, f32>().await.unwrap();
                                 let new = (tensor + 1.) + 1.;
                                 let start = std::time::Instant::now();
                                 new.materialize().await;
@@ -55,7 +55,7 @@ fn fused(c: &mut Criterion) {
         for size in SIZES {
             let device = block_on(Device::new()).unwrap();
             let tensor = Tensor::new(&device, &vec![vec![1.; size]; size]);
-            block_on(tensor.as_slice()).unwrap();
+            block_on(tensor.as_slice::<2, f32>()).unwrap();
 
             group.bench_with_input(
                 BenchmarkId::new("fusor-gpu-separate", size),
@@ -68,7 +68,7 @@ fn fused(c: &mut Criterion) {
                             for _ in 0..iters {
                                 for _ in 0..2 {
                                     let tensor = Tensor::new(&device, &vec![vec![1.; size]; size]);
-                                    _ = tensor.as_slice().await.unwrap();
+                                    _ = tensor.as_slice::<2, f32>().await.unwrap();
                                     let new = tensor + 1.;
                                     let start = std::time::Instant::now();
                                     new.materialize().await;

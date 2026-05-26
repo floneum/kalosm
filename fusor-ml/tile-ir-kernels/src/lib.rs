@@ -12,7 +12,7 @@
 //!     let a = program.storage_read::<F32, 2>(Shape::new([1, 256]));
 //!     let b = quantized_matrix(program, GgmlQuantFormat::Q8_0, 256, 128);
 //!     let y = program.storage_write::<F32, 2>(Shape::new([1, 128]));
-//!     qgemv_with_epilogue::<4, 64>(program, &a, &b, &y, 1, Option::<&UnaryEpilogue>::None);
+//!     qgemv_with_epilogue(program, &a, &b, &y, 1, Option::<&UnaryEpilogue>::None);
 //! });
 //! # let _ = ir;
 //! ```
@@ -45,9 +45,6 @@ pub use dispatch::{
     qgemv_subgroups_per_workgroup_for_shape,
 };
 pub use kernels::{
-    AccumCast, DenseMatmulShape, FlashAttentionDims, FlashAttentionMeta, FlashDecodeSmallMeta,
-    IntoQgemvEpilogues, MergeTopKMeta, Mirostat2, Mirostat2Meta, Q4KPairedGgml, Q4KPairedShape,
-    RmsNormVec4, RmsNormVec4Meta, SoftmaxMeta, TensorMeta, TopKChunkMeta, TopKExactnessMeta,
     batched_gemv_with_epilogues, batched_matmul_register_with_epilogues,
     batched_matmul_with_epilogues, flash_attention, flash_attention_tiled, flash_decode_small,
     flash_decode_split_partials, flash_decode_split_reduce, flash_outputs_per_workgroup,
@@ -56,7 +53,10 @@ pub use kernels::{
     qgemv_workgroup_with_epilogue, qmatmul_with_epilogue, qmatmul_workgroup_with_epilogues,
     quantized_matrix, quantized_matrix_for, rms_norm_vec4, softmax, softmax_partials,
     softmax_reduce, softmax_write, top_k_chunk, top_k_exactness, top_k_merge,
-    try_batched_coop_matmul,
+    try_batched_coop_matmul, AccumCast, DenseMatmulShape, FlashAttentionDims, FlashAttentionMeta,
+    FlashDecodeSmallMeta, IntoQgemvEpilogues, MergeTopKMeta, Mirostat2, Mirostat2Meta,
+    Q4KPairedGgml, Q4KPairedShape, RmsNormVec4, RmsNormVec4Meta, SoftmaxMeta, TensorMeta,
+    TopKChunkMeta, TopKExactnessMeta,
 };
 pub use types::{
     DenseMatmulEpilogues, PairedEpilogue, QmatmulEpilogues, QmatmulExtra, UnaryEpilogue,

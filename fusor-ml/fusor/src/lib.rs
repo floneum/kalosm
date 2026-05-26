@@ -1341,8 +1341,8 @@ where
                 Ok(slice.as_scalar())
             }
             Tensor::Gpu(t) => {
-                let result = t.to_scalar().await.map_err(Error::Gpu)?;
-                Ok(result)
+                let slice = t.as_slice().await.map_err(Error::Gpu)?;
+                Ok(slice.as_scalar())
             }
         }
     }

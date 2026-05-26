@@ -21,6 +21,7 @@ kalosm-common = { workspace = true, features = ["candle"] }
 pollster = "0.4"
 rbert.workspace = true
 anyhow.workspace = true
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 
 [features]
 metal = ["candle-core/metal", "candle-nn/metal", "kalosm-common/metal"]

@@ -254,8 +254,7 @@ fn decode_shape_rule(
 }
 
 fn flash_attention_selector()
-    -> ShapeSelector<6, FlashAttentionSelectionCtx, FlashAttentionSelectedVariant>
-{
+-> ShapeSelector<6, FlashAttentionSelectionCtx, FlashAttentionSelectedVariant> {
     ShapeSelector::new()
         .rule(
             FlashAttentionSelectedVariant::DecodeSmall(DECODE_SMALL_BLOCK),

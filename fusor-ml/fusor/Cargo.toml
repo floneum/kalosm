@@ -29,6 +29,7 @@ rand.workspace = true
 futures = "0.3.31"
 fusor-core = { path = "../core" }
 fusor-gguf = { path = "../gguf" }
+ndarray = "0.16.1"
 
 [target.'cfg(target_os = "macos")'.dev-dependencies]
 candle-core = { workspace = true, features = ["metal"] }
@@ -58,4 +59,32 @@ harness = false
 
 [[bench]]
 name = "attention_comparison"
+harness = false
+
+[[bench]]
+name = "matmul"
+harness = false
+
+[[bench]]
+name = "qmatmul"
+harness = false
+
+[[bench]]
+name = "elementwise"
+harness = false
+
+[[bench]]
+name = "pairwise"
+harness = false
+
+[[bench]]
+name = "fused"
+harness = false
+
+[[bench]]
+name = "reduce"
+harness = false
+
+[[bench]]
+name = "softmax"
 harness = false

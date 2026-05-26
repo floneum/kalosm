@@ -202,7 +202,10 @@ impl QMatMulOperation {
                 // The IR-build fallback (cached=false catch-all) is the only
                 // path that defers the dispatch to the IR builder; every
                 // tile-aligned coop variant has a precomputed `[n/BN, m/BM, 1]`.
-                QMatmulPath::Tile { cached: false, tile } if tile == QCoopTile::new(64, 64) => None,
+                QMatmulPath::Tile {
+                    cached: false,
+                    tile,
+                } if tile == QCoopTile::new(64, 64) => None,
                 QMatmulPath::Q8Wide(tile) | QMatmulPath::Tile { tile, .. } => {
                     Some([n / tile.bn, m / tile.bm, 1])
                 }

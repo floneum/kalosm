@@ -40,15 +40,46 @@ mod selection_tests {
                 ctx(tile_ir::GgmlQuantFormat::Q8_0, false),
                 caps(true),
             ),
-            (QMatmulPath::Tile { tile: QCoopTile::new(128, 128), cached: false }, ctx(q4, true), caps(true)),
-            (QMatmulPath::Tile { tile: QCoopTile::new(128, 64), cached: false }, ctx(q4, true), caps(false)),
-            (QMatmulPath::Tile { tile: QCoopTile::new(64, 128), cached: false }, ctx(q4, true), caps(false)),
             (
-                QMatmulPath::Tile { tile: QCoopTile::new(64, 64), cached: true },
+                QMatmulPath::Tile {
+                    tile: QCoopTile::new(128, 128),
+                    cached: false,
+                },
+                ctx(q4, true),
+                caps(true),
+            ),
+            (
+                QMatmulPath::Tile {
+                    tile: QCoopTile::new(128, 64),
+                    cached: false,
+                },
                 ctx(q4, true),
                 caps(false),
             ),
-            (QMatmulPath::Tile { tile: QCoopTile::new(64, 64), cached: false }, ctx(q4, false), caps(false)),
+            (
+                QMatmulPath::Tile {
+                    tile: QCoopTile::new(64, 128),
+                    cached: false,
+                },
+                ctx(q4, true),
+                caps(false),
+            ),
+            (
+                QMatmulPath::Tile {
+                    tile: QCoopTile::new(64, 64),
+                    cached: true,
+                },
+                ctx(q4, true),
+                caps(false),
+            ),
+            (
+                QMatmulPath::Tile {
+                    tile: QCoopTile::new(64, 64),
+                    cached: false,
+                },
+                ctx(q4, false),
+                caps(false),
+            ),
         ];
         assert_selector_generates(&selector, cases);
     }
@@ -56,42 +87,56 @@ mod selection_tests {
     #[test]
     fn coop_acc_init_only_claims_shapes_the_coop_path_will_take() {
         assert!(qmatmul_variant_supports_coop_acc_init(
-            QMatmulPath::Tile { tile: QCoopTile::new(64, 128), cached: false },
+            QMatmulPath::Tile {
+                tile: QCoopTile::new(64, 128),
+                cached: false
+            },
             64,
             512,
             128,
             true,
         ));
         assert!(!qmatmul_variant_supports_coop_acc_init(
-            QMatmulPath::Tile { tile: QCoopTile::new(64, 128), cached: false },
+            QMatmulPath::Tile {
+                tile: QCoopTile::new(64, 128),
+                cached: false
+            },
             63,
             512,
             128,
             true,
         ));
         assert!(!qmatmul_variant_supports_coop_acc_init(
-            QMatmulPath::Tile { tile: QCoopTile::new(64, 64), cached: false },
+            QMatmulPath::Tile {
+                tile: QCoopTile::new(64, 64),
+                cached: false
+            },
             2,
             512,
             4,
             true,
         ));
         assert!(!qmatmul_variant_supports_coop_acc_init(
-            QMatmulPath::Tile { tile: QCoopTile::new(64, 128), cached: false },
+            QMatmulPath::Tile {
+                tile: QCoopTile::new(64, 128),
+                cached: false
+            },
             64,
             510,
             128,
             true,
         ));
         assert!(!qmatmul_variant_supports_coop_acc_init(
-            QMatmulPath::Tile { tile: QCoopTile::new(64, 128), cached: false },
+            QMatmulPath::Tile {
+                tile: QCoopTile::new(64, 128),
+                cached: false
+            },
             64,
             512,
             128,
             false,
         ));
     }
-
 }
 
 #[cfg(test)]

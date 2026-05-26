@@ -32,3 +32,4 @@ gpu = ["fusor/gpu"]
 anyhow.workspace = true
 kalosm = { workspace = true, features = ["language"] }
 postcard = { version = "1.0.8", features = ["use-std"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }

@@ -137,7 +137,7 @@ pub struct Device {
 
 impl Device {
     pub async fn new() -> Result<Self, crate::Error> {
-        let dx_compiler = wgpu::Dx12Compiler::from_env().unwrap_or(wgpu::Dx12Compiler::StaticDxc);
+        let dx_compiler = wgpu::Dx12Compiler::from_env().unwrap_or_default();
         let backends = wgpu::Backends::from_env().unwrap_or(wgpu::Backends::all());
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
             backends,

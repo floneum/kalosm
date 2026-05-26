@@ -162,10 +162,7 @@ fn qmatmul_direct_selector() -> ShapeSelector<3, QMatmulDirectCtx, QMatmulPath> 
                 .axis(QMAT_N, range(0..=4096))
                 .when_ctx(|ctx: &QMatmulDirectCtx| ctx.format == tile_ir::GgmlQuantFormat::Q5_0),
         )
-        .rule(
-            QMatmulPath::SingleRow,
-            ShapeRule::new().axis(QMAT_M, eq(1)),
-        )
+        .rule(QMatmulPath::SingleRow, ShapeRule::new().axis(QMAT_M, eq(1)))
         .rule(
             QMatmulPath::Q8Wide(QCoopTile::new(64, 128)),
             ShapeRule::new()
@@ -261,7 +258,6 @@ fn select_qmatmul_direct_variant(
         .select(shape, &ctx, caps)
         .expect("quantized matmul selector has a catch-all rule")
 }
-
 
 fn matmul_m_size(shape: &[usize]) -> u32 {
     shape[shape.len() - 2] as u32
@@ -522,7 +518,6 @@ fn qmatmul_variant_supports_coop_acc_init(
     };
     m.is_multiple_of(tile.bm) && n.is_multiple_of(tile.bn)
 }
-
 
 enum QmatmulExtraStorage {
     Column(tile_ir::tile::Storage<tile_ir::F32, 1>),

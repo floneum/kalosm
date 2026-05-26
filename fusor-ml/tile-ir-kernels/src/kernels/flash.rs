@@ -1,9 +1,9 @@
 use fusor_tile_ir::{
-    ElementType, F32, Numeric, TileLiteral, U32, WorkgroupAxis,
-    tile::{self, Mask, Tile, TileBlock, Workgroup, range},
+    tile::{self, range, Mask, Tile, TileBlock, Workgroup},
+    ElementType, Numeric, TileLiteral, WorkgroupAxis, F32, U32,
 };
 
-use super::helpers::{NEG_MAX_F32, index_n, reduce_workgroup};
+use super::helpers::{index_n, reduce_workgroup, NEG_MAX_F32};
 use super::softmax::{softmax_partial_scale, workgroup_softmax_block};
 use super::types::{FlashAttentionDims, FlashAttentionMeta, FlashDecodeSmallMeta};
 

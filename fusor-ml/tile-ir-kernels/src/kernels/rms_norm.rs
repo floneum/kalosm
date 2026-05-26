@@ -1,4 +1,4 @@
-use fusor_tile_ir::{F32, TileLiteral, TileReduceOp, Vector, WorkgroupAxis};
+use fusor_tile_ir::{TileLiteral, TileReduceOp, Vector, WorkgroupAxis, F32};
 
 use super::types::RmsNormVec4Meta;
 use fusor_tile_ir::tile::Tile;

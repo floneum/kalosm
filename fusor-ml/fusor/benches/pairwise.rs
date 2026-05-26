@@ -37,7 +37,7 @@ fn bench_add(c: &mut Criterion) {
                     while sum.is_zero() {
                         for _ in 0..iters {
                             let tensor = Tensor::new(&device, &vec![vec![1.; size]; size]);
-                            _ = tensor.as_slice().await.unwrap();
+                            _ = tensor.as_slice::<2, f32>().await.unwrap();
                             let new = &tensor + &tensor;
                             let start = std::time::Instant::now();
                             new.materialize().await;
@@ -84,7 +84,7 @@ fn bench_mul(c: &mut Criterion) {
                             for _ in 0..iters {
                                 let tensor1 = Tensor::new(&device, &vec![vec![1.; size]; size]);
                                 let tensor2 = Tensor::new(&device, &vec![vec![1.; size]; size]);
-                                _ = tensor2.as_slice().await.unwrap();
+                                _ = tensor2.as_slice::<2, f32>().await.unwrap();
                                 let new = &tensor1 * &tensor2;
                                 let start = std::time::Instant::now();
                                 new.materialize().await;
