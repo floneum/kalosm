@@ -36,6 +36,23 @@ const QMATMUL_TM: usize = 4;
 const QMATMUL_TN: usize = 4;
 const QGEMV_TN: usize = 1;
 
+struct RegisterTileWorkgroups {
+    a: Workgroup<F32>,
+    b: Workgroup<F32>,
+}
+
+struct RegisterTileLane<'a> {
+    row: &'a Tile<U32>,
+    col: &'a Tile<U32>,
+}
+
+struct RegisterTileShape {
+    bn: u32,
+    bk: u32,
+    tm: u32,
+    tn: u32,
+}
+
 /// Stage `f32` source rows in `[row_base, row_base + ROWS)` and cols in
 /// `[col_base, col_base + COLS)` into the workgroup tile `dst`, applying
 /// `pre` per element. Cooperative across all `LANES` workgroup lanes. Pads
@@ -104,25 +121,21 @@ fn stage_f32_tile_with_pre(
 /// row-major `BK x BN` (index = k*BN + col).
 fn accumulate_register_tile_from_workgroup(
     program: &mut TileBlock<'_>,
-    a_tile: Workgroup<F32>,
-    b_tile: Workgroup<F32>,
-    lane_row: &Tile<U32>,
-    lane_col: &Tile<U32>,
-    bn: u32,
-    bk: u32,
-    tm: u32,
-    tn: u32,
+    tiles: RegisterTileWorkgroups,
+    lane: RegisterTileLane<'_>,
+    shape: RegisterTileShape,
 ) -> Vec<Tile> {
+    let RegisterTileShape { bn, bk, tm, tn } = shape;
     (0..tm * tn)
         .map(|idx| {
             let r = idx / tn;
             let c = idx % tn;
-            let local_row = lane_row.clone() * tm + r;
-            let local_col = lane_col.clone() * tn + c;
+            let local_row = lane.row.clone() * tm + r;
+            let local_col = lane.col.clone() * tn + c;
             let mut sum = Tile::literal(TileLiteral::f32(0.0));
             for kk in 0..bk {
-                let a_value = program.load_workgroup(a_tile, local_row.clone() * bk + kk);
-                let b_value = program.load_workgroup(b_tile, local_col.clone() + kk * bn);
+                let a_value = program.load_workgroup(tiles.a, local_row.clone() * bk + kk);
+                let b_value = program.load_workgroup(tiles.b, local_col.clone() + kk * bn);
                 sum = sum + a_value * b_value;
             }
             sum
@@ -210,14 +223,20 @@ pub fn qmatmul_workgroup_with_epilogues(
 
                     let chunk_vec = accumulate_register_tile_from_workgroup(
                         program,
-                        a_tile,
-                        b_tile,
-                        &lane_row,
-                        &lane_col,
-                        BN,
-                        bk,
-                        QMATMUL_TM as u32,
-                        QMATMUL_TN as u32,
+                        RegisterTileWorkgroups {
+                            a: a_tile,
+                            b: b_tile,
+                        },
+                        RegisterTileLane {
+                            row: &lane_row,
+                            col: &lane_col,
+                        },
+                        RegisterTileShape {
+                            bn: BN,
+                            bk,
+                            tm: QMATMUL_TM as u32,
+                            tn: QMATMUL_TN as u32,
+                        },
                     );
                     let mut chunk_iter = chunk_vec.into_iter();
                     let chunk: [Tile; QMATMUL_TM * QMATMUL_TN] = std::array::from_fn(|_| {
@@ -321,14 +340,20 @@ pub fn qgemv_workgroup_with_epilogue(
 
                 let chunk_vec = accumulate_register_tile_from_workgroup(
                     program,
-                    a_tile,
-                    b_tile,
-                    &lane_row,
-                    &lane_col,
-                    BN,
-                    bk,
-                    1,
-                    QGEMV_TN as u32,
+                    RegisterTileWorkgroups {
+                        a: a_tile,
+                        b: b_tile,
+                    },
+                    RegisterTileLane {
+                        row: &lane_row,
+                        col: &lane_col,
+                    },
+                    RegisterTileShape {
+                        bn: BN,
+                        bk,
+                        tm: 1,
+                        tn: QGEMV_TN as u32,
+                    },
                 );
                 let mut chunk_iter = chunk_vec.into_iter();
                 let chunk: [Tile; QGEMV_TN] = std::array::from_fn(|_| {

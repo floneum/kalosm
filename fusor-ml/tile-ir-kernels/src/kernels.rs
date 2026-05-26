@@ -18,12 +18,13 @@ mod types;
 pub use flash::{
     flash_attention, flash_attention_tiled, flash_decode_small, flash_decode_split_partials,
     flash_decode_split_reduce, flash_outputs_per_workgroup, flash_tiled_dispatch_size,
-    flash_tiled_outputs_per_workgroup,
+    flash_tiled_outputs_per_workgroup, FlashAttentionTensors,
 };
 pub use helpers::AccumCast;
 pub use matmul::{
     batched_gemv_with_epilogues, batched_matmul_register_with_epilogues,
-    batched_matmul_with_epilogues, try_batched_coop_matmul, DenseMatmulShape,
+    batched_matmul_with_epilogues, try_batched_coop_matmul, DenseCoopMatmulTile, DenseMatmulShape,
+    DenseMatmulTensors,
 };
 pub use mirostat::{mirostat2, Mirostat2};
 pub use qdequantize::qdequantize;

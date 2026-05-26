@@ -11,6 +11,15 @@ const FLASH_BLOCK: usize = 256;
 const DECODE_HEAD_DIM: u32 = 128;
 const TILED_OUTS_PER_SUBGROUP: u32 = 4;
 
+/// Runtime tensor bindings consumed by the streaming flash-attention kernels.
+pub struct FlashAttentionTensors<B> {
+    pub q: fusor_tile_ir::KernelTensorRef<B>,
+    pub k: fusor_tile_ir::KernelTensorRef<B>,
+    pub v: fusor_tile_ir::KernelTensorRef<B>,
+    pub mask: Option<fusor_tile_ir::KernelTensorRef<B>>,
+    pub output: fusor_tile_ir::KernelTensorRef<B>,
+}
+
 fn zero_fill<E: Numeric>() -> TileLiteral {
     match E::ELEMENT {
         ElementType::F32 => TileLiteral::f32(0.0),
@@ -48,14 +57,17 @@ pub const fn flash_tiled_outputs_per_workgroup(subgroup_size: u32) -> u32 {
 /// are inconsistent with the metadata.
 pub fn flash_attention<E: Numeric, B>(
     kb: &mut fusor_tile_ir::KernelBuilder<B>,
-    q: fusor_tile_ir::KernelTensorRef<B>,
-    k: fusor_tile_ir::KernelTensorRef<B>,
-    v: fusor_tile_ir::KernelTensorRef<B>,
-    mask: Option<fusor_tile_ir::KernelTensorRef<B>>,
-    output: fusor_tile_ir::KernelTensorRef<B>,
+    tensors: FlashAttentionTensors<B>,
     meta: FlashAttentionMeta,
     subgroup_size: u32,
 ) -> Option<()> {
+    let FlashAttentionTensors {
+        q,
+        k,
+        v,
+        mask,
+        output,
+    } = tensors;
     if subgroup_size == 0 || !(FLASH_BLOCK as u32).is_multiple_of(subgroup_size) {
         return None;
     }
@@ -289,15 +301,18 @@ pub fn flash_attention<E: Numeric, B>(
 ///   then loop over `q_block` queries reusing those loads.
 pub fn flash_attention_tiled<E: Numeric, B>(
     kb: &mut fusor_tile_ir::KernelBuilder<B>,
-    q: fusor_tile_ir::KernelTensorRef<B>,
-    k: fusor_tile_ir::KernelTensorRef<B>,
-    v: fusor_tile_ir::KernelTensorRef<B>,
-    mask: Option<fusor_tile_ir::KernelTensorRef<B>>,
-    output: fusor_tile_ir::KernelTensorRef<B>,
+    tensors: FlashAttentionTensors<B>,
     meta: FlashAttentionMeta,
     subgroup_size: u32,
     q_block: u32,
 ) -> Option<()> {
+    let FlashAttentionTensors {
+        q,
+        k,
+        v,
+        mask,
+        output,
+    } = tensors;
     if subgroup_size == 0 || !(FLASH_BLOCK as u32).is_multiple_of(subgroup_size) || q_block == 0 {
         return None;
     }

@@ -384,9 +384,7 @@ impl QMatMulOperation {
                 }
                 QMatmulPath::Q8Wide(tile) | QMatmulPath::Tile { tile, .. } => tile,
             };
-            tile_ir_kernels::qmatmul_with_epilogue(
-                phase, &a, &b, &y, 4, &epilogues, tile.bm, tile.bn,
-            );
+            tile_ir_kernels::qmatmul_with_epilogue(phase, &a, &b, &y, &epilogues, tile.bm, tile.bn);
         });
         let dispatch_size = ir.body().grid;
         if dispatch_size.iter().any(|dim| *dim > max_workgroups) {

@@ -6,9 +6,10 @@ use fusor_tile_ir_kernels::{
     batched_gemv_with_epilogues, batched_matmul_with_epilogues, flash_attention,
     linear_storage_layout, qdequantize, qgemv_q4k_paired, qgemv_with_epilogue,
     qgemv_workgroup_with_epilogue, qmatmul_with_epilogue, qmatmul_workgroup_with_epilogues,
-    quantized_matrix, rms_norm_vec4, try_batched_coop_matmul, DenseMatmulEpilogues,
-    DenseMatmulShape, FlashAttentionDims, FlashAttentionMeta, PairedEpilogue, Q4KPairedGgml,
-    QmatmulEpilogues, RmsNormVec4, RmsNormVec4Meta, TensorMeta, UnaryEpilogue,
+    quantized_matrix, rms_norm_vec4, try_batched_coop_matmul, DenseCoopMatmulTile,
+    DenseMatmulEpilogues, DenseMatmulShape, DenseMatmulTensors, FlashAttentionDims,
+    FlashAttentionMeta, FlashAttentionTensors, PairedEpilogue, Q4KPairedGgml, QmatmulEpilogues,
+    RmsNormVec4, RmsNormVec4Meta, TensorMeta, UnaryEpilogue,
 };
 
 fn lower_or_fail(ir: &fusor_tile_ir::KernelIr, label: &str) -> NagaKernel {
@@ -22,11 +23,13 @@ fn streaming_flash_attention_regression_shape_lowers_to_naga() {
     let mut kb = KernelBuilder::<()>::new();
     flash_attention::<F32, ()>(
         &mut kb,
-        KernelTensorRef::new((), layout.clone()),
-        KernelTensorRef::new((), layout.clone()),
-        KernelTensorRef::new((), layout.clone()),
-        None,
-        KernelTensorRef::new((), layout),
+        FlashAttentionTensors {
+            q: KernelTensorRef::new((), layout.clone()),
+            k: KernelTensorRef::new((), layout.clone()),
+            v: KernelTensorRef::new((), layout.clone()),
+            mask: None,
+            output: KernelTensorRef::new((), layout),
+        },
         FlashAttentionMeta {
             dims: FlashAttentionDims {
                 batch: 1,
@@ -151,7 +154,7 @@ fn scalar_qmatmul_lowers() {
         let a = program.storage_read::<F32, 2>(Shape::new([8, 256]));
         let b = quantized_matrix(program, GgmlQuantFormat::Q8_0, 256, 16);
         let y = program.storage_write::<F32, 2>(Shape::new([8, 16]));
-        qmatmul_with_epilogue(program, &a, &b, &y, 4, &QmatmulEpilogues::empty(), 8, 4);
+        qmatmul_with_epilogue(program, &a, &b, &y, &QmatmulEpilogues::empty(), 8, 4);
     });
     lower_or_fail(&ir, "scalar qmatmul");
 }
@@ -162,7 +165,7 @@ fn cooperative_qmatmul_lowers() {
         let a = program.storage_read::<F32, 2>(Shape::new([64, 256]));
         let b = quantized_matrix(program, GgmlQuantFormat::Q8_0, 256, 64);
         let y = program.storage_write::<F32, 2>(Shape::new([64, 64]));
-        qmatmul_with_epilogue(program, &a, &b, &y, 4, &QmatmulEpilogues::empty(), 64, 64);
+        qmatmul_with_epilogue(program, &a, &b, &y, &QmatmulEpilogues::empty(), 64, 64);
     });
     lower_or_fail(&ir, "cooperative qmatmul");
 }
@@ -287,15 +290,19 @@ fn cooperative_dense_f32_matmul_lowers() {
         let y = program.storage_write::<F32, 2>(Shape::new([shape.batch * shape.m, shape.n]));
         assert!(try_batched_coop_matmul::<F32>(
             program,
-            &a,
-            &b,
-            &y,
+            DenseMatmulTensors {
+                a: &a,
+                b: &b,
+                y: &y,
+            },
             shape,
             &DenseMatmulEpilogues::empty(),
             65_535,
-            64,
-            64,
-            16,
+            DenseCoopMatmulTile {
+                bm: 64,
+                bn: 64,
+                bk: 16,
+            },
         ));
     });
     lower_or_fail(&ir, "cooperative dense f32 matmul");
@@ -315,15 +322,19 @@ fn cooperative_dense_f16_matmul_lowers() {
         let y = program.storage_write::<F16, 2>(Shape::new([shape.batch * shape.m, shape.n]));
         assert!(try_batched_coop_matmul::<F16>(
             program,
-            &a,
-            &b,
-            &y,
+            DenseMatmulTensors {
+                a: &a,
+                b: &b,
+                y: &y,
+            },
             shape,
             &DenseMatmulEpilogues::empty(),
             65_535,
-            64,
-            64,
-            16,
+            DenseCoopMatmulTile {
+                bm: 64,
+                bn: 64,
+                bk: 16,
+            },
         ));
     });
     lower_or_fail(&ir, "cooperative dense f16 matmul");
@@ -343,15 +354,19 @@ fn cooperative_dense_f32_matmul_128x128_lowers() {
         let y = program.storage_write::<F32, 2>(Shape::new([shape.batch * shape.m, shape.n]));
         assert!(try_batched_coop_matmul::<F32>(
             program,
-            &a,
-            &b,
-            &y,
+            DenseMatmulTensors {
+                a: &a,
+                b: &b,
+                y: &y,
+            },
             shape,
             &DenseMatmulEpilogues::empty(),
             65_535,
-            128,
-            128,
-            16,
+            DenseCoopMatmulTile {
+                bm: 128,
+                bn: 128,
+                bk: 16,
+            },
         ));
     });
     lower_or_fail(&ir, "cooperative dense f32 128x128 matmul");
@@ -371,15 +386,19 @@ fn cooperative_dense_f32_matmul_128x64_lowers() {
         let y = program.storage_write::<F32, 2>(Shape::new([shape.batch * shape.m, shape.n]));
         assert!(try_batched_coop_matmul::<F32>(
             program,
-            &a,
-            &b,
-            &y,
+            DenseMatmulTensors {
+                a: &a,
+                b: &b,
+                y: &y,
+            },
             shape,
             &DenseMatmulEpilogues::empty(),
             65_535,
-            128,
-            64,
-            16,
+            DenseCoopMatmulTile {
+                bm: 128,
+                bn: 64,
+                bk: 16,
+            },
         ));
     });
     lower_or_fail(&ir, "cooperative dense f32 128x64 matmul");
@@ -401,15 +420,19 @@ fn cooperative_dense_f32_matmul_128x256_npass_lowers() {
         let y = program.storage_write::<F32, 2>(Shape::new([shape.batch * shape.m, shape.n]));
         assert!(try_batched_coop_matmul::<F32>(
             program,
-            &a,
-            &b,
-            &y,
+            DenseMatmulTensors {
+                a: &a,
+                b: &b,
+                y: &y,
+            },
             shape,
             &DenseMatmulEpilogues::empty(),
             65_535,
-            128,
-            256,
-            16,
+            DenseCoopMatmulTile {
+                bm: 128,
+                bn: 256,
+                bk: 16,
+            },
         ));
     });
     lower_or_fail(&ir, "cooperative dense f32 128x256 N_PASSES=4 matmul");
@@ -446,7 +469,7 @@ fn qmatmul_epilogue_fallback_ir(post: Option<&UnaryEpilogue>) -> fusor_tile_ir::
             post_extra_inputs: &[],
             post_acc_init_col_vector: None,
         };
-        qmatmul_with_epilogue(program, &a, &b, &y, 4, &epilogues, 64, 64);
+        qmatmul_with_epilogue(program, &a, &b, &y, &epilogues, 64, 64);
     })
 }
 

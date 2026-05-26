@@ -1,5 +1,11 @@
 use super::*;
 
+// Some backends report very large storage-buffer limits. Treat those as an
+// upper bound for correctness, not a useful target for fusing one expression:
+// enormous n-ary trees are expensive to clone/lower and can overflow the
+// smaller Windows test-thread stack before they provide any practical win.
+const MAX_NARY_FUSION_STORAGE_BINDINGS: usize = 64;
+
 impl Resolver {
     pub(super) fn try_fuse_naries(
         &mut self,
@@ -18,8 +24,9 @@ impl Resolver {
         let mut fused_execs = Vec::new();
 
         // Get the max storage buffers limit from GPU
-        let max_storage_bindings =
-            graph.device().limits().max_storage_buffers_per_shader_stage as usize;
+        let max_storage_bindings = (graph.device().limits().max_storage_buffers_per_shader_stage
+            as usize)
+            .min(MAX_NARY_FUSION_STORAGE_BINDINGS);
 
         for &input_inner in nary.inputs.iter() {
             if self.check_cached(graph, input_inner) {

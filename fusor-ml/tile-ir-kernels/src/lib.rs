@@ -53,10 +53,10 @@ pub use kernels::{
     qgemv_workgroup_with_epilogue, qmatmul_with_epilogue, qmatmul_workgroup_with_epilogues,
     quantized_matrix, quantized_matrix_for, rms_norm_vec4, softmax, softmax_partials,
     softmax_reduce, softmax_write, top_k_chunk, top_k_exactness, top_k_merge,
-    try_batched_coop_matmul, AccumCast, DenseMatmulShape, FlashAttentionDims, FlashAttentionMeta,
-    FlashDecodeSmallMeta, IntoQgemvEpilogues, MergeTopKMeta, Mirostat2, Mirostat2Meta,
-    Q4KPairedGgml, Q4KPairedShape, RmsNormVec4, RmsNormVec4Meta, SoftmaxMeta, TensorMeta,
-    TopKChunkMeta, TopKExactnessMeta,
+    try_batched_coop_matmul, AccumCast, DenseCoopMatmulTile, DenseMatmulShape, DenseMatmulTensors,
+    FlashAttentionDims, FlashAttentionMeta, FlashAttentionTensors, FlashDecodeSmallMeta,
+    IntoQgemvEpilogues, MergeTopKMeta, Mirostat2, Mirostat2Meta, Q4KPairedGgml, Q4KPairedShape,
+    RmsNormVec4, RmsNormVec4Meta, SoftmaxMeta, TensorMeta, TopKChunkMeta, TopKExactnessMeta,
 };
 pub use types::{
     DenseMatmulEpilogues, PairedEpilogue, QmatmulEpilogues, QmatmulExtra, UnaryEpilogue,

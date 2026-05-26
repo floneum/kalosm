@@ -46,6 +46,21 @@ impl<'a> IntoQgemvEpilogues<'a> for &'a crate::types::QmatmulEpilogues<'a> {
     }
 }
 
+#[derive(Clone, Copy)]
+struct QgemvTensors<'a> {
+    a: &'a Storage<F32, 2>,
+    b: &'a QuantizedMatrix,
+    y: &'a Storage<F32, 2>,
+}
+
+const fn qgemv_shape(block: u32, subgroups: u32, cols_per_subgroup: u32) -> QgemvShape {
+    QgemvShape {
+        subgroups,
+        cols_per_subgroup,
+        block,
+    }
+}
+
 /// Top-level quantized GEMV with optional pre/post unary epilogues.
 ///
 /// Equivalent to [`crate::qmatmul_with_epilogue`] with `BM = 1`. Callers
@@ -77,45 +92,45 @@ pub fn qgemv_with_epilogue<'a>(
 
 /// Variant-dispatched Q4K ggml qgemv. Picks the right monomorphization for
 /// the supplied shape and threads optional unary epilogues through it.
-pub(crate) fn qgemv_q4k_dispatch_with_epilogue(
+fn qgemv_q4k_dispatch_with_epilogue(
     program: &mut Program,
     shape: impl Into<QgemvShape>,
-    a: &Storage<F32, 2>,
-    b: &QuantizedMatrix,
-    y: &Storage<F32, 2>,
+    tensors: QgemvTensors<'_>,
     workgroups_x: u32,
     epilogues: &crate::types::QmatmulEpilogues<'_>,
 ) {
     let shape = shape.into();
-    let s = shape.subgroups;
-    let c = shape.cols_per_subgroup;
     match shape.block {
-        32 => qgemv_q4k_ggml_with_epilogue::<32>(program, a, b, y, workgroups_x, epilogues, s, c),
-        64 => qgemv_q4k_ggml_with_epilogue::<64>(program, a, b, y, workgroups_x, epilogues, s, c),
-        128 => qgemv_q4k_ggml_with_epilogue::<128>(program, a, b, y, workgroups_x, epilogues, s, c),
-        256 => qgemv_q4k_ggml_with_epilogue::<256>(program, a, b, y, workgroups_x, epilogues, s, c),
+        32 => qgemv_q4k_ggml_with_epilogue::<32>(program, tensors, workgroups_x, epilogues, shape),
+        64 => qgemv_q4k_ggml_with_epilogue::<64>(program, tensors, workgroups_x, epilogues, shape),
+        128 => {
+            qgemv_q4k_ggml_with_epilogue::<128>(program, tensors, workgroups_x, epilogues, shape)
+        }
+        256 => {
+            qgemv_q4k_ggml_with_epilogue::<256>(program, tensors, workgroups_x, epilogues, shape)
+        }
         other => panic!("unsupported Q4K qgemv BLOCK {other}"),
     }
 }
 
 /// Variant-dispatched Q6K ggml qgemv. Same role as the Q4K dispatch helper,
 /// but for Q6K shapes.
-pub(crate) fn qgemv_q6k_dispatch_with_epilogue(
+fn qgemv_q6k_dispatch_with_epilogue(
     program: &mut Program,
     shape: impl Into<QgemvShape>,
-    a: &Storage<F32, 2>,
-    b: &QuantizedMatrix,
-    y: &Storage<F32, 2>,
+    tensors: QgemvTensors<'_>,
     workgroups_x: u32,
     epilogues: &crate::types::QmatmulEpilogues<'_>,
 ) {
     let shape = shape.into();
-    let s = shape.subgroups;
-    let c = shape.cols_per_subgroup;
     match shape.block {
-        64 => qgemv_q6k_ggml_with_epilogue::<64>(program, a, b, y, workgroups_x, epilogues, s, c),
-        128 => qgemv_q6k_ggml_with_epilogue::<128>(program, a, b, y, workgroups_x, epilogues, s, c),
-        256 => qgemv_q6k_ggml_with_epilogue::<256>(program, a, b, y, workgroups_x, epilogues, s, c),
+        64 => qgemv_q6k_ggml_with_epilogue::<64>(program, tensors, workgroups_x, epilogues, shape),
+        128 => {
+            qgemv_q6k_ggml_with_epilogue::<128>(program, tensors, workgroups_x, epilogues, shape)
+        }
+        256 => {
+            qgemv_q6k_ggml_with_epilogue::<256>(program, tensors, workgroups_x, epilogues, shape)
+        }
         other => panic!("unsupported Q6K qgemv BLOCK {other}"),
     }
 }
@@ -131,106 +146,141 @@ pub(crate) fn qgemv_tile_with_epilogue(
 ) {
     let [m, _] = matrix_shape(&a.view().layout);
     assert_eq!(m, 1, "qgemv requires a single input row");
+    let tensors = QgemvTensors { a, b, y };
 
     match b.format {
         GgmlQuantFormat::Q8_0 => {
             if b.cols >= 8192 {
                 return qgemv_perf_with_epilogue::<128>(
                     program,
-                    a,
-                    b,
-                    y,
+                    tensors,
                     workgroups_x,
                     ep,
-                    4,
-                    8,
+                    qgemv_shape(128, 4, 8),
                     8,
                 );
             }
-            qgemv_perf_with_epilogue::<128>(program, a, b, y, workgroups_x, ep, 4, 4, 8)
+            qgemv_perf_with_epilogue::<128>(
+                program,
+                tensors,
+                workgroups_x,
+                ep,
+                qgemv_shape(128, 4, 4),
+                8,
+            )
         }
-        GgmlQuantFormat::Q8_1 => {
-            qgemv_perf_with_epilogue::<128>(program, a, b, y, workgroups_x, ep, 4, 4, 8)
-        }
+        GgmlQuantFormat::Q8_1 => qgemv_perf_with_epilogue::<128>(
+            program,
+            tensors,
+            workgroups_x,
+            ep,
+            qgemv_shape(128, 4, 4),
+            8,
+        ),
         GgmlQuantFormat::Q4K => {
             if b.rows <= 4096 && b.cols >= 4096 && b.cols < 8192 {
                 let shape = q4k_mid_override(q4k_default_mid(b.rows, b.cols));
-                return qgemv_q4k_dispatch_with_epilogue(program, shape, a, b, y, workgroups_x, ep);
+                return qgemv_q4k_dispatch_with_epilogue(program, shape, tensors, workgroups_x, ep);
             }
             if b.rows <= 4096 && b.cols <= 4096 {
                 return qgemv_perf_with_epilogue::<256>(
                     program,
-                    a,
-                    b,
-                    y,
+                    tensors,
                     workgroups_x,
                     ep,
-                    8,
-                    4,
+                    qgemv_shape(256, 8, 4),
                     16,
                 );
             }
             if b.rows <= 4096 && b.cols >= 8192 {
                 let shape = q4k_large_override(q4k_default_large(b.rows, b.cols));
-                return qgemv_q4k_dispatch_with_epilogue(program, shape, a, b, y, workgroups_x, ep);
+                return qgemv_q4k_dispatch_with_epilogue(program, shape, tensors, workgroups_x, ep);
             }
             if b.rows > 4096 && b.cols <= 4096 {
                 let shape = q4k_tall_override(q4k_default_tall(b.rows, b.cols));
-                return qgemv_q4k_dispatch_with_epilogue(program, shape, a, b, y, workgroups_x, ep);
+                return qgemv_q4k_dispatch_with_epilogue(program, shape, tensors, workgroups_x, ep);
             }
             if qgemv_subgroups_per_workgroup_for_shape(b.format, b.rows, b.cols) == 8 {
                 return qgemv_perf_with_epilogue::<256>(
                     program,
-                    a,
-                    b,
-                    y,
+                    tensors,
                     workgroups_x,
                     ep,
-                    8,
-                    8,
+                    qgemv_shape(256, 8, 8),
                     8,
                 );
             }
-            qgemv_perf_with_epilogue::<128>(program, a, b, y, workgroups_x, ep, 4, 8, 8)
+            qgemv_perf_with_epilogue::<128>(
+                program,
+                tensors,
+                workgroups_x,
+                ep,
+                qgemv_shape(128, 4, 8),
+                8,
+            )
         }
-        GgmlQuantFormat::Q5_0 => {
-            qgemv_perf_with_epilogue::<64>(program, a, b, y, workgroups_x, ep, 2, 4, 16)
-        }
+        GgmlQuantFormat::Q5_0 => qgemv_perf_with_epilogue::<64>(
+            program,
+            tensors,
+            workgroups_x,
+            ep,
+            qgemv_shape(64, 2, 4),
+            16,
+        ),
         GgmlQuantFormat::Q4_0
         | GgmlQuantFormat::Q4_1
         | GgmlQuantFormat::Q5_1
-        | GgmlQuantFormat::Q2K => {
-            qgemv_perf_with_epilogue::<64>(program, a, b, y, workgroups_x, ep, 2, 4, 8)
-        }
-        GgmlQuantFormat::Q3K | GgmlQuantFormat::Q8K => {
-            qgemv_perf_with_epilogue::<64>(program, a, b, y, workgroups_x, ep, 2, 2, 8)
-        }
-        GgmlQuantFormat::Q5K => {
-            qgemv_perf_with_epilogue::<64>(program, a, b, y, workgroups_x, ep, 2, 1, 8)
-        }
+        | GgmlQuantFormat::Q2K => qgemv_perf_with_epilogue::<64>(
+            program,
+            tensors,
+            workgroups_x,
+            ep,
+            qgemv_shape(64, 2, 4),
+            8,
+        ),
+        GgmlQuantFormat::Q3K | GgmlQuantFormat::Q8K => qgemv_perf_with_epilogue::<64>(
+            program,
+            tensors,
+            workgroups_x,
+            ep,
+            qgemv_shape(64, 2, 2),
+            8,
+        ),
+        GgmlQuantFormat::Q5K => qgemv_perf_with_epilogue::<64>(
+            program,
+            tensors,
+            workgroups_x,
+            ep,
+            qgemv_shape(64, 2, 1),
+            8,
+        ),
         GgmlQuantFormat::Q6K => {
             if b.rows <= 4096 && b.cols >= 8192 {
                 let shape = q6k_large_override(q6k_default_large(b.rows, b.cols));
-                return qgemv_q6k_dispatch_with_epilogue(program, shape, a, b, y, workgroups_x, ep);
+                return qgemv_q6k_dispatch_with_epilogue(program, shape, tensors, workgroups_x, ep);
             }
             if b.rows > 4096 && b.cols <= 4096 {
                 let shape = q6k_tall_override(q6k_default_tall(b.rows, b.cols));
-                return qgemv_q6k_dispatch_with_epilogue(program, shape, a, b, y, workgroups_x, ep);
+                return qgemv_q6k_dispatch_with_epilogue(program, shape, tensors, workgroups_x, ep);
             }
             if qgemv_subgroups_per_workgroup_for_shape(b.format, b.rows, b.cols) == 4 {
                 return qgemv_perf_with_epilogue::<128>(
                     program,
-                    a,
-                    b,
-                    y,
+                    tensors,
                     workgroups_x,
                     ep,
-                    4,
-                    4,
+                    qgemv_shape(128, 4, 4),
                     8,
                 );
             }
-            qgemv_perf_with_epilogue::<256>(program, a, b, y, workgroups_x, ep, 8, 4, 16)
+            qgemv_perf_with_epilogue::<256>(
+                program,
+                tensors,
+                workgroups_x,
+                ep,
+                qgemv_shape(256, 8, 4),
+                16,
+            )
         }
     }
 }
@@ -406,15 +456,16 @@ impl GgmlQuantFamily for Q6KFamily {
 /// `qgemv_q{4,6}k_ggml_with_epilogue` shims previously produced by hand.
 fn qgemv_ggml_with_epilogue<F: GgmlQuantFamily, const BLOCK: usize>(
     program: &mut Program,
-    a: &Storage<F32, 2>,
-    b: &QuantizedMatrix,
-    y: &Storage<F32, 2>,
+    tensors: QgemvTensors<'_>,
     workgroups_x: u32,
     epilogues: &crate::types::QmatmulEpilogues<'_>,
-    subgroups: u32,
-    cols_per_subgroup: u32,
+    shape: QgemvShape,
 ) {
     const SUBGROUP_SIZE: u32 = 32;
+    let QgemvTensors { a, b, y } = tensors;
+    let subgroups = shape.subgroups;
+    let cols_per_subgroup = shape.cols_per_subgroup;
+    debug_assert_eq!(shape.block, BLOCK as u32);
     debug_assert_eq!(subgroups * SUBGROUP_SIZE, BLOCK as u32);
     debug_assert_eq!(b.format, F::FORMAT);
 
@@ -480,67 +531,44 @@ fn qgemv_ggml_with_epilogue<F: GgmlQuantFamily, const BLOCK: usize>(
 }
 
 /// Q4K ggml-format qgemv body with optional pre/post unary epilogues.
-pub(crate) fn qgemv_q4k_ggml_with_epilogue<const BLOCK: usize>(
+fn qgemv_q4k_ggml_with_epilogue<const BLOCK: usize>(
     program: &mut Program,
-    a: &Storage<F32, 2>,
-    b: &QuantizedMatrix,
-    y: &Storage<F32, 2>,
+    tensors: QgemvTensors<'_>,
     workgroups_x: u32,
     epilogues: &crate::types::QmatmulEpilogues<'_>,
-    subgroups: u32,
-    cols_per_subgroup: u32,
+    shape: QgemvShape,
 ) {
-    qgemv_ggml_with_epilogue::<Q4KFamily, BLOCK>(
-        program,
-        a,
-        b,
-        y,
-        workgroups_x,
-        epilogues,
-        subgroups,
-        cols_per_subgroup,
-    )
+    qgemv_ggml_with_epilogue::<Q4KFamily, BLOCK>(program, tensors, workgroups_x, epilogues, shape)
 }
 
 /// Q6K ggml-format qgemv body with optional pre/post unary epilogues.
-pub(crate) fn qgemv_q6k_ggml_with_epilogue<const BLOCK: usize>(
+fn qgemv_q6k_ggml_with_epilogue<const BLOCK: usize>(
     program: &mut Program,
-    a: &Storage<F32, 2>,
-    b: &QuantizedMatrix,
-    y: &Storage<F32, 2>,
+    tensors: QgemvTensors<'_>,
     workgroups_x: u32,
     epilogues: &crate::types::QmatmulEpilogues<'_>,
-    subgroups: u32,
-    cols_per_subgroup: u32,
+    shape: QgemvShape,
 ) {
-    qgemv_ggml_with_epilogue::<Q6KFamily, BLOCK>(
-        program,
-        a,
-        b,
-        y,
-        workgroups_x,
-        epilogues,
-        subgroups,
-        cols_per_subgroup,
-    )
+    qgemv_ggml_with_epilogue::<Q6KFamily, BLOCK>(program, tensors, workgroups_x, epilogues, shape)
 }
 
 /// Generic subgroup-partitioned qgemv body with optional pre- and post-reduce
 /// epilogues, covering the formats that don't have a dedicated `qgemv_q*_ggml`
 /// path. `pre` is applied to each loaded activation tile before the dot;
 /// `post` is applied to each per-output tile before the store.
-pub(crate) fn qgemv_perf_with_epilogue<const BLOCK: usize>(
+fn qgemv_perf_with_epilogue<const BLOCK: usize>(
     program: &mut Program,
-    a: &Storage<F32, 2>,
-    b: &QuantizedMatrix,
-    y: &Storage<F32, 2>,
+    tensors: QgemvTensors<'_>,
     workgroups_x: u32,
     epilogues: &crate::types::QmatmulEpilogues<'_>,
-    subgroups: u32,
-    cols_per_subgroup: u32,
+    shape: QgemvShape,
     values_per_lane: u32,
 ) {
     const SUBGROUP_SIZE: u32 = 32;
+    let QgemvTensors { a, b, y } = tensors;
+    let subgroups = shape.subgroups;
+    let cols_per_subgroup = shape.cols_per_subgroup;
+    debug_assert_eq!(shape.block, BLOCK as u32);
     debug_assert_eq!(subgroups * SUBGROUP_SIZE, BLOCK as u32);
     debug_assert!(values_per_lane == 8 || values_per_lane == 16 || values_per_lane == 32);
     debug_assert!(matches!(cols_per_subgroup, 1 | 2 | 4 | 8));

@@ -453,15 +453,19 @@ fn dispatch_direct_tile_matmul<
     if let Some(tile) = coop_variant
         && tile_ir_kernels::try_batched_coop_matmul::<T>(
             phase,
-            &a,
-            &b,
-            &y,
+            tile_ir_kernels::DenseMatmulTensors {
+                a: &a,
+                b: &b,
+                y: &y,
+            },
             shape,
             epilogues,
             max_wg_per_dim,
-            tile.bm,
-            tile.bn,
-            tile.bk,
+            tile_ir_kernels::DenseCoopMatmulTile {
+                bm: tile.bm,
+                bn: tile.bn,
+                bk: tile.bk,
+            },
         )
     {
         return;

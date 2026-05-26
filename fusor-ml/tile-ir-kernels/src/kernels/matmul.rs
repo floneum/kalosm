@@ -28,6 +28,32 @@ pub struct DenseMatmulShape {
     pub n: u32,
 }
 
+/// Direct storage bindings for dense matrix multiplication kernels.
+#[derive(Clone, Copy)]
+pub struct DenseMatmulTensors<'a, T> {
+    pub a: &'a Storage<T, 2>,
+    pub b: &'a Storage<T, 2>,
+    pub y: &'a Storage<T, 2>,
+}
+
+/// Cooperative-matrix tile geometry requested by the dense matmul dispatcher.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DenseCoopMatmulTile {
+    pub bm: u32,
+    pub bn: u32,
+    pub bk: u32,
+}
+
+#[derive(Clone, Copy)]
+struct CoopTileEntry {
+    tile: DenseCoopMatmulTile,
+    row_groups: u32,
+    col_groups: u32,
+    n_passes: u32,
+    block: usize,
+    single_buffered: bool,
+}
+
 /// Batched dense GEMV over flattened direct views:
 /// A is `[batch * m, k]`, B is `[batch * k, 1]`, Y is `[batch * m, 1]`.
 ///
@@ -400,16 +426,14 @@ pub fn batched_matmul_register_with_epilogues<Stor: AccumCast<F32>>(
 /// storage element so both F32 and F16 use the same dispatch table.
 pub fn try_batched_coop_matmul<T: CoopElement>(
     program: &mut Program,
-    a: &Storage<T, 2>,
-    b: &Storage<T, 2>,
-    y: &Storage<T, 2>,
+    tensors: DenseMatmulTensors<'_, T>,
     shape: DenseMatmulShape,
     epilogues: &DenseMatmulEpilogues<'_>,
     max_workgroups_per_dimension: u32,
-    bm: u32,
-    bn: u32,
-    bk: u32,
+    tile: DenseCoopMatmulTile,
 ) -> bool {
+    let DenseMatmulTensors { a, b, y } = tensors;
+    let DenseCoopMatmulTile { bm, bn, bk } = tile;
     if epilogues.pre_a.is_some()
         || epilogues.pre_b.is_some()
         || epilogues.post.is_some()
@@ -434,25 +458,98 @@ pub fn try_batched_coop_matmul<T: CoopElement>(
     // overhead is amortized by halving global A reads vs (128, 512, 16).
     //
     // Schema: (bm, bn, bk, row_groups, col_groups, n_passes, block, single_buffered).
-    const COOP_TILE_TABLE: &[(u32, u32, u32, u32, u32, u32, usize, bool)] = &[
-        (256, 256, 16, 8, 1, 8, 256, true),
-        (128, 512, 16, 4, 2, 8, 256, false),
-        (128, 256, 16, 4, 2, 4, 256, false),
-        (128, 128, 16, 4, 4, 2, 512, false),
-        (128, 64, 16, 4, 2, 1, 256, false),
-        (64, 128, 16, 2, 4, 2, 256, false),
-        (64, 64, 16, 2, 2, 1, 128, false),
+    const COOP_TILE_TABLE: &[CoopTileEntry] = &[
+        CoopTileEntry {
+            tile: DenseCoopMatmulTile {
+                bm: 256,
+                bn: 256,
+                bk: 16,
+            },
+            row_groups: 8,
+            col_groups: 1,
+            n_passes: 8,
+            block: 256,
+            single_buffered: true,
+        },
+        CoopTileEntry {
+            tile: DenseCoopMatmulTile {
+                bm: 128,
+                bn: 512,
+                bk: 16,
+            },
+            row_groups: 4,
+            col_groups: 2,
+            n_passes: 8,
+            block: 256,
+            single_buffered: false,
+        },
+        CoopTileEntry {
+            tile: DenseCoopMatmulTile {
+                bm: 128,
+                bn: 256,
+                bk: 16,
+            },
+            row_groups: 4,
+            col_groups: 2,
+            n_passes: 4,
+            block: 256,
+            single_buffered: false,
+        },
+        CoopTileEntry {
+            tile: DenseCoopMatmulTile {
+                bm: 128,
+                bn: 128,
+                bk: 16,
+            },
+            row_groups: 4,
+            col_groups: 4,
+            n_passes: 2,
+            block: 512,
+            single_buffered: false,
+        },
+        CoopTileEntry {
+            tile: DenseCoopMatmulTile {
+                bm: 128,
+                bn: 64,
+                bk: 16,
+            },
+            row_groups: 4,
+            col_groups: 2,
+            n_passes: 1,
+            block: 256,
+            single_buffered: false,
+        },
+        CoopTileEntry {
+            tile: DenseCoopMatmulTile {
+                bm: 64,
+                bn: 128,
+                bk: 16,
+            },
+            row_groups: 2,
+            col_groups: 4,
+            n_passes: 2,
+            block: 256,
+            single_buffered: false,
+        },
+        CoopTileEntry {
+            tile: DenseCoopMatmulTile {
+                bm: 64,
+                bn: 64,
+                bk: 16,
+            },
+            row_groups: 2,
+            col_groups: 2,
+            n_passes: 1,
+            block: 128,
+            single_buffered: false,
+        },
     ];
-    let Some(&(_, _, _, row_groups, col_groups, n_passes, block, single_buffered)) =
-        COOP_TILE_TABLE
-            .iter()
-            .find(|&&(m, n, k, ..)| (m, n, k) == (bm, bn, bk))
-    else {
+    let Some(entry) = COOP_TILE_TABLE.iter().find(|entry| entry.tile == tile) else {
         return false;
     };
     macro_rules! dispatch_block {
         ($block:literal) => {{
-            if single_buffered {
+            if entry.single_buffered {
                 batched_coop_matmul_perf_single::<T, $block>(
                     program,
                     a,
@@ -463,9 +560,9 @@ pub fn try_batched_coop_matmul<T: CoopElement>(
                     bm,
                     bn,
                     bk,
-                    row_groups,
-                    col_groups,
-                    n_passes,
+                    entry.row_groups,
+                    entry.col_groups,
+                    entry.n_passes,
                 );
             } else {
                 batched_coop_matmul_perf::<T, $block>(
@@ -478,14 +575,14 @@ pub fn try_batched_coop_matmul<T: CoopElement>(
                     bm,
                     bn,
                     bk,
-                    row_groups,
-                    col_groups,
-                    n_passes,
+                    entry.row_groups,
+                    entry.col_groups,
+                    entry.n_passes,
                 );
             }
         }};
     }
-    match block {
+    match entry.block {
         128 => dispatch_block!(128),
         256 => dispatch_block!(256),
         512 => dispatch_block!(512),

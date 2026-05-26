@@ -94,7 +94,6 @@ fn qmatmul_ir(format: GgmlQuantFormat, m: u32, n: u32, k: u32) -> KernelIr {
             &a,
             &b,
             &y,
-            4,
             &tile_ir_kernels::QmatmulEpilogues::empty(),
             8,
             4,

@@ -119,7 +119,7 @@ jobs:
           FUSOR_CONFORMANCE_REQUIRE_GPU: "1"
           MESA_SHADER_CACHE_DISABLE: "1"
           VK_DRIVER_FILES: /usr/share/vulkan/icd.d/lvp_icd.x86_64.json
-          WGPU_ADAPTER_NAME: llvmpipe
+          VK_ICD_FILENAMES: /usr/share/vulkan/icd.d/lvp_icd.x86_64.json
           WGPU_BACKEND: vulkan
         run: cargo test --lib --bins --tests --examples --workspace --features kalosm/language,kalosm/sound,kalosm/vision,kalosm/remote,kalosm/scrape --exclude fusor-core --exclude rbert --exclude rwhisper --exclude kalosm-learning
 

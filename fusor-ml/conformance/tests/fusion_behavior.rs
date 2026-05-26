@@ -228,7 +228,10 @@ async fn gpu_nary_fusion_respects_binding_limit() {
         .unwrap()
         .limits()
         .max_storage_buffers_per_shader_stage as usize;
-    let num_tensors = max_storage_buffers + 1;
+    // Match the resolver's pragmatic fusion cap so adapters with huge
+    // advertised binding limits still exercise the split path without
+    // building a pathological expression tree.
+    let num_tensors = max_storage_buffers.min(64) + 1;
 
     let tensors: Vec<Tensor<2, f32>> = (0..num_tensors)
         .map(|i| Tensor::from_slice(&device, shape, &matrix_data(shape, i as f32 * 0.3)))

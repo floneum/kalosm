@@ -28,7 +28,7 @@ use crate::{
 ///     let a = program.storage_read::<F32, 2>(Shape::new([8, 256]));
 ///     let b = quantized_matrix(program, GgmlQuantFormat::Q8_0, 256, 16);
 ///     let y = program.storage_write::<F32, 2>(Shape::new([8, 16]));
-///     qmatmul_with_epilogue(program, &a, &b, &y, 4, &QmatmulEpilogues::empty(), 64, 64);
+///     qmatmul_with_epilogue(program, &a, &b, &y, &QmatmulEpilogues::empty(), 64, 64);
 /// });
 /// # let _ = ir;
 /// ```
@@ -37,13 +37,11 @@ pub fn qmatmul_with_epilogue(
     a: &Storage<F32, 2>,
     b: &QuantizedMatrix,
     y: &Storage<F32, 2>,
-    vector_width: u32,
     epilogues: &crate::types::QmatmulEpilogues<'_>,
     bm: u32,
     bn: u32,
 ) {
     assert!(bm > 0 && bn > 0, "qmatmul tile shape must be non-zero");
-    assert!(vector_width > 0, "qmatmul vector width must be non-zero");
     let [m, k] = matrix_shape(&a.view().layout);
     let [y_m, y_n] = matrix_shape(&y.view().layout);
     assert_eq!(k, b.rows, "qmatmul K dimensions must match");
