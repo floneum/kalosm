@@ -374,7 +374,7 @@ fn eval_nary_expr(
     mask: tile_ir::tile::Mask,
 ) -> (ValueTile, DataTypeEnum) {
     if let Some(value) =
-        eval_left_associative_binary_chain(program, expr, dims, storages, metas, mask.clone())
+        eval_associative_binary_tree(program, expr, dims, storages, metas, mask.clone())
     {
         return value;
     }
@@ -414,7 +414,7 @@ fn eval_nary_expr(
     }
 }
 
-fn eval_left_associative_binary_chain(
+fn eval_associative_binary_tree(
     program: &mut tile_ir::tile::TileBlock<'_>,
     expr: &NaryExpr,
     dims: &[tile_ir::tile::Tile<tile_ir::U32>],
@@ -422,43 +422,48 @@ fn eval_left_associative_binary_chain(
     metas: &[TensorMeta],
     mask: tile_ir::tile::Mask,
 ) -> Option<(ValueTile, DataTypeEnum)> {
-    let NaryExpr::Op { function, .. } = expr else {
-        return None;
-    };
-    let op = left_associative_tile_op(function)?;
-    let datatype = function.output_type;
-
-    let mut current = expr;
-    let mut rhs_values = Vec::new();
-    while let NaryExpr::Op { children, function } = current {
-        let Some(current_op) = left_associative_tile_op(function) else {
-            break;
-        };
-        if current_op != op || function.output_type != datatype {
-            break;
-        }
-        let [left, right] = children.as_slice() else {
-            break;
-        };
-        rhs_values.push(right);
-        current = left;
-    }
-
-    if rhs_values.is_empty() {
-        return None;
-    }
-
-    let (value, _) = eval_nary_expr(program, current, dims, storages, metas, mask.clone());
+    let (op, datatype, terms) = flatten_associative_binary_terms(expr)?;
+    let mut terms = terms.into_iter();
+    let first = terms.next()?;
+    let (value, _) = eval_nary_expr(program, first, dims, storages, metas, mask.clone());
     let mut value = value.cast_to(datatype);
-    for rhs in rhs_values.into_iter().rev() {
-        let (rhs, _) = eval_nary_expr(program, rhs, dims, storages, metas, mask.clone());
+    for term in terms {
+        let (rhs, _) = eval_nary_expr(program, term, dims, storages, metas, mask.clone());
         value = value.binary(op, rhs.cast_to(datatype));
     }
 
     Some((value, datatype))
 }
 
-fn left_associative_tile_op(function: &NaryFunction) -> Option<tile_ir::TileBinaryOp> {
+fn flatten_associative_binary_terms(
+    expr: &NaryExpr,
+) -> Option<(tile_ir::TileBinaryOp, DataTypeEnum, Vec<&NaryExpr>)> {
+    let NaryExpr::Op { function, .. } = expr else {
+        return None;
+    };
+    let op = associative_tile_op(function)?;
+    let datatype = function.output_type;
+
+    let mut stack = vec![expr];
+    let mut terms = Vec::new();
+    while let Some(current) = stack.pop() {
+        match current {
+            NaryExpr::Op { children, function }
+                if associative_tile_op(function) == Some(op)
+                    && function.output_type == datatype
+                    && children.len() == 2 =>
+            {
+                stack.push(&children[1]);
+                stack.push(&children[0]);
+            }
+            _ => terms.push(current),
+        }
+    }
+
+    (terms.len() > 1).then_some((op, datatype, terms))
+}
+
+fn associative_tile_op(function: &NaryFunction) -> Option<tile_ir::TileBinaryOp> {
     let [left, right] = function.input_types.as_slice() else {
         return None;
     };
@@ -654,6 +659,20 @@ fn eval_nary_expr_on_value_tiles(
     expr: &NaryExpr,
     inputs: &[(ValueTile, DataTypeEnum)],
 ) -> (ValueTile, DataTypeEnum) {
+    if let Some((op, datatype, terms)) = flatten_associative_binary_terms(expr) {
+        let mut terms = terms.into_iter();
+        let first = terms
+            .next()
+            .expect("associative expression should have at least two terms");
+        let (value, _) = eval_nary_expr_on_value_tiles(first, inputs);
+        let mut value = value.cast_to(datatype);
+        for term in terms {
+            let (rhs, _) = eval_nary_expr_on_value_tiles(term, inputs);
+            value = value.binary(op, rhs.cast_to(datatype));
+        }
+        return (value, datatype);
+    }
+
     match expr {
         NaryExpr::Op { children, function } => {
             let mut values = children
