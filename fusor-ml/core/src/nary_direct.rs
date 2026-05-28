@@ -430,10 +430,7 @@ fn eval_left_associative_binary_chain(
 
     let mut current = expr;
     let mut rhs_values = Vec::new();
-    loop {
-        let NaryExpr::Op { children, function } = current else {
-            break;
-        };
+    while let NaryExpr::Op { children, function } = current {
         let Some(current_op) = left_associative_tile_op(function) else {
             break;
         };
