@@ -373,6 +373,12 @@ fn eval_nary_expr(
     metas: &[TensorMeta],
     mask: tile_ir::tile::Mask,
 ) -> (ValueTile, DataTypeEnum) {
+    if let Some(value) =
+        eval_left_associative_binary_chain(program, expr, dims, storages, metas, mask.clone())
+    {
+        return value;
+    }
+
     match expr {
         NaryExpr::Op { children, function } => {
             let mut values = children
@@ -405,6 +411,68 @@ fn eval_nary_expr(
         }
         NaryExpr::DimIndex(dim) => (ValueTile::U32(dims[*dim].clone()), DataTypeEnum::U32),
         NaryExpr::Scalar(value) => (tile_literal(*value), value.datatype()),
+    }
+}
+
+fn eval_left_associative_binary_chain(
+    program: &mut tile_ir::tile::TileBlock<'_>,
+    expr: &NaryExpr,
+    dims: &[tile_ir::tile::Tile<tile_ir::U32>],
+    storages: &[Storage2],
+    metas: &[TensorMeta],
+    mask: tile_ir::tile::Mask,
+) -> Option<(ValueTile, DataTypeEnum)> {
+    let NaryExpr::Op { function, .. } = expr else {
+        return None;
+    };
+    let op = left_associative_tile_op(function)?;
+    let datatype = function.output_type;
+
+    let mut current = expr;
+    let mut rhs_values = Vec::new();
+    loop {
+        let NaryExpr::Op { children, function } = current else {
+            break;
+        };
+        let Some(current_op) = left_associative_tile_op(function) else {
+            break;
+        };
+        if current_op != op || function.output_type != datatype {
+            break;
+        }
+        let [left, right] = children.as_slice() else {
+            break;
+        };
+        rhs_values.push(right);
+        current = left;
+    }
+
+    if rhs_values.is_empty() {
+        return None;
+    }
+
+    let (value, _) = eval_nary_expr(program, current, dims, storages, metas, mask.clone());
+    let mut value = value.cast_to(datatype);
+    for rhs in rhs_values.into_iter().rev() {
+        let (rhs, _) = eval_nary_expr(program, rhs, dims, storages, metas, mask.clone());
+        value = value.binary(op, rhs.cast_to(datatype));
+    }
+
+    Some((value, datatype))
+}
+
+fn left_associative_tile_op(function: &NaryFunction) -> Option<tile_ir::TileBinaryOp> {
+    let [left, right] = function.input_types.as_slice() else {
+        return None;
+    };
+    if *left != function.output_type || *right != function.output_type {
+        return None;
+    }
+
+    match function.op {
+        NaryOp::Add => Some(tile_ir::TileBinaryOp::Add),
+        NaryOp::Mul => Some(tile_ir::TileBinaryOp::Mul),
+        _ => None,
     }
 }
 

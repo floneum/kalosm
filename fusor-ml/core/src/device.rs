@@ -264,6 +264,16 @@ impl Device {
         self.inner.adapter.limits()
     }
 
+    pub(crate) fn nary_direct_input_binding_budget(&self) -> usize {
+        let limits = self.limits();
+        let storage_bindings = limits.max_storage_buffers_per_shader_stage as usize;
+        let bind_group_bindings = limits.max_bindings_per_bind_group as usize;
+
+        // The direct n-ary kernel binds every unique input tensor plus one
+        // output tensor, all as storage buffers in a single bind group.
+        storage_bindings.min(bind_group_bindings).saturating_sub(1)
+    }
+
     pub fn features(&self) -> wgpu::Features {
         self.inner.device.features()
     }

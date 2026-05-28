@@ -1,11 +1,5 @@
 use super::*;
 
-// Some backends report very large storage-buffer limits. Treat those as an
-// upper bound for correctness, not a useful target for fusing one expression:
-// enormous n-ary trees are expensive to clone/lower and can overflow the
-// smaller Windows test-thread stack before they provide any practical win.
-const MAX_NARY_FUSION_STORAGE_BINDINGS: usize = 64;
-
 impl Resolver {
     pub(super) fn try_fuse_naries(
         &mut self,
@@ -23,10 +17,7 @@ impl Resolver {
         let mut all_inputs = nary.inputs.clone();
         let mut fused_execs = Vec::new();
 
-        // Get the max storage buffers limit from GPU
-        let max_storage_bindings = (graph.device().limits().max_storage_buffers_per_shader_stage
-            as usize)
-            .min(MAX_NARY_FUSION_STORAGE_BINDINGS);
+        let max_fused_inputs = graph.device().nary_direct_input_binding_budget();
 
         for &input_inner in nary.inputs.iter() {
             if self.check_cached(graph, input_inner) {
@@ -70,30 +61,14 @@ impl Resolver {
             // Only fuse if substitution was successful
             // If not, the expression still references the original input which must remain
             if success {
-                // Check if fusing would exceed the GPU's per-stage buffer limit.
-                // On Metal, `max_buffers_per_stage` is 31 and covers ALL buffer
-                // types (storage + uniform) plus an implicit sizes buffer added
-                // by wgpu. Each unique tensor input needs at least 1 storage
-                // binding, and there will also be a small number of uniform
-                // "info" bindings (for tensor shape/stride metadata), plus the
-                // output storage binding, plus the wgpu sizes buffer.
-                //
-                // We use `max_storage_bindings` (which equals `max_buffers_per_stage`
-                // on Metal = 31) as the hard ceiling and reserve slots for:
-                //   - 1 output storage binding
-                //   - 1 wgpu sizes buffer
-                //   - up to `info_headroom` uniform info bindings
-                let info_headroom = 4usize;
-                let max_fused_inputs = max_storage_bindings.saturating_sub(2 + info_headroom);
-
-                // Count unique inputs after potential merge (duplicates share a binding)
+                // Count unique inputs after potential merge (duplicates share a binding).
                 let unique_inputs: FxHashSet<_> = all_inputs
                     .iter()
                     .chain(input_nary.inputs.iter())
                     .copied()
                     .collect();
 
-                if unique_inputs.len() >= max_fused_inputs {
+                if unique_inputs.len() > max_fused_inputs {
                     // Skip fusion - would exceed GPU binding limit
                     continue;
                 }
