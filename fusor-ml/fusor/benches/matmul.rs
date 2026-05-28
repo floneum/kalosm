@@ -12,9 +12,14 @@ use criterion::{criterion_group, criterion_main};
 
 use criterion::async_executor::FuturesExecutor;
 
-fn candle_gpu_device() -> Option<candle_core::Device> {
+fn candle_gpu_device() -> Option<(candle_core::Device, &'static str)> {
+    #[cfg(target_os = "macos")]
+    if let Ok(device) = candle_core::Device::new_metal(0) {
+        return Some((device, "matmul-candle-metal"));
+    }
+
     candle_core::Device::new_cuda(0)
-        .or_else(|_| candle_core::Device::new_metal(0))
+        .map(|device| (device, "matmul-candle-cuda"))
         .ok()
 }
 
@@ -34,18 +39,30 @@ const SIZES: [[usize; 3]; 12] = [
 ];
 
 fn matmul(c: &mut Criterion) {
-    let mut group = c.benchmark_group("matmul");
-    group.sample_size(20);
-    group.plot_config(
-        criterion::PlotConfiguration::default().summary_scale(criterion::AxisScale::Logarithmic),
-    );
+    bench_fusor(c);
+
+    if let Some((candle_device, name)) = candle_gpu_device() {
+        bench_candle_with_device(candle_device, name, c);
+    }
+
+    {
+        let candle_device = candle_core::Device::Cpu;
+        bench_candle_with_device(candle_device, "matmul-candle-cpu", c);
+    }
+
+    bench_ndarray(c);
+}
+
+fn bench_fusor(c: &mut Criterion) {
+    let mut group = c.benchmark_group("matmul-wgpu");
+    configure_matmul_group(&mut group);
     {
         let device = block_on(Device::new()).unwrap();
 
         for [m, k, n] in SIZES {
             let device = device.clone();
             group.bench_with_input(
-                BenchmarkId::new("fusor-gpu", format!("{m}x{k} by {k}x{n}")),
+                BenchmarkId::new("matmul-wgpu", format!("{m}x{k} by {k}x{n}")),
                 &(m, k, n),
                 move |b, &(m, k, n)| {
                     let device = device.clone();
@@ -69,43 +86,45 @@ fn matmul(c: &mut Criterion) {
             );
         }
     }
+    group.finish();
+}
 
-    if let Some(candle_device) = candle_gpu_device() {
-        bench_candle_with_device(candle_device, "candle-gpu", &mut group);
-    }
-
-    {
-        let candle_device = candle_core::Device::Cpu;
-        bench_candle_with_device(candle_device, "candle-cpu", &mut group);
-    }
-
-    {
-        for [m, k, n] in SIZES {
-            group.bench_with_input(
-                BenchmarkId::new("ndarray", format!("{m}x{k} by {k}x{n}")),
-                &(m, k, n),
-                move |b, &(m, k, n)| {
-                    b.to_async(FuturesExecutor).iter_batched(
-                        || {
-                            let matrix1 = ndarray::Array2::<f32>::ones((m, k));
-                            let matrix2 = ndarray::Array2::<f32>::ones((k, n));
-                            (matrix1, matrix2)
-                        },
-                        |(tensor_a, tensor_b)| async move { tensor_a.dot(&tensor_b) },
-                        BatchSize::LargeInput,
-                    );
-                },
-            );
-        }
+fn bench_ndarray(c: &mut Criterion) {
+    let mut group = c.benchmark_group("matmul-ndarray");
+    group.sample_size(20);
+    configure_matmul_group(&mut group);
+    for [m, k, n] in SIZES {
+        group.bench_with_input(
+            BenchmarkId::new("matmul-ndarray", format!("{m}x{k} by {k}x{n}")),
+            &(m, k, n),
+            move |b, &(m, k, n)| {
+                b.to_async(FuturesExecutor).iter_batched(
+                    || {
+                        let matrix1 = ndarray::Array2::<f32>::ones((m, k));
+                        let matrix2 = ndarray::Array2::<f32>::ones((k, n));
+                        (matrix1, matrix2)
+                    },
+                    |(tensor_a, tensor_b)| async move { tensor_a.dot(&tensor_b) },
+                    BatchSize::LargeInput,
+                );
+            },
+        );
     }
     group.finish();
 }
 
-fn bench_candle_with_device(
-    candle_device: candle_core::Device,
-    name: &str,
+fn configure_matmul_group(
     group: &mut criterion::BenchmarkGroup<'_, criterion::measurement::WallTime>,
 ) {
+    group.plot_config(
+        criterion::PlotConfiguration::default().summary_scale(criterion::AxisScale::Logarithmic),
+    );
+}
+
+fn bench_candle_with_device(candle_device: candle_core::Device, name: &str, c: &mut Criterion) {
+    let mut group = c.benchmark_group(name);
+    group.sample_size(20);
+    configure_matmul_group(&mut group);
     // Cap the comparison footprint so the macOS GitHub runner doesn't
     // SIGKILL the bench. Each iteration holds two host vectors, two GPU
     // tensors, and the output, so a 4096x4096 square alone is ~256 MB —
@@ -168,6 +187,7 @@ fn bench_candle_with_device(
             },
         );
     }
+    group.finish();
 }
 
 criterion_group!(benches, matmul);

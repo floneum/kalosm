@@ -61,7 +61,7 @@ jobs:
           benchName: "matmul"
           branchName: ${{ github.base_ref }}
           baseFallbackCwd: "fusor-ml/core"
-          criterionArgs: "--sample-size 10"
+          criterionArgs: "matmul-wgpu --sample-size 10 --warm-up-time 1 --measurement-time 2"
   elementwise:
     if: github.event.pull_request.draft == false
     name: elementwise benchmark
