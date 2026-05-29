@@ -76,7 +76,8 @@ impl<T: DataType + SimdElement + Default> Embedding<T> {
                 }
                 (Tensor::Gpu(gpu_indices), QMatrix::Gpu(gpu_embeddings)) => {
                     let indices_flat = gpu_indices.flatten_all();
-                    let values = gpu_embeddings.index_select_rows(indices_flat.as_core());
+                    let values =
+                        gpu_embeddings.index_select_rows_to(indices_flat.as_core(), T::DATA_TYPE);
                     Tensor::Gpu(crate::GpuTensor::from_core(
                         values.reshape(final_dims).cast::<T>(),
                     ))

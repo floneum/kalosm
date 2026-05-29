@@ -1,15 +1,16 @@
 use fusor_tile_ir::{
-    tile, F32Bits, GgmlQuantFormat, KernelBuilder, KernelTensorRef, Layout, MemoryLevel,
-    NagaKernel, Shape, F16, F32,
+    tile, ElementType, F32Bits, GgmlQuantFormat, KernelBuilder, KernelTensorRef, Layout,
+    MemoryLevel, NagaKernel, Shape, F16, F32,
 };
 use fusor_tile_ir_kernels::{
     batched_gemv_with_epilogues, batched_matmul_with_epilogues, flash_attention,
     linear_storage_layout, qdequantize, qgemv_q4k_paired, qgemv_with_epilogue,
-    qgemv_workgroup_with_epilogue, qmatmul_with_epilogue, qmatmul_workgroup_with_epilogues,
-    quantized_matrix, rms_norm_vec4, try_batched_coop_matmul, DenseCoopMatmulTile,
-    DenseMatmulEpilogues, DenseMatmulShape, DenseMatmulTensors, FlashAttentionDims,
-    FlashAttentionMeta, FlashAttentionTensors, PairedEpilogue, Q4KPairedGgml, QmatmulEpilogues,
-    RmsNormVec4, RmsNormVec4Meta, TensorMeta, UnaryEpilogue,
+    qgemv_workgroup_f16_with_epilogue, qgemv_workgroup_with_epilogue, qmatmul_with_epilogue,
+    qmatmul_workgroup_f16_with_epilogues, qmatmul_workgroup_with_epilogues, quantized_matrix,
+    rms_norm_vec4, try_batched_coop_matmul, DenseCoopMatmulTile, DenseMatmulEpilogues,
+    DenseMatmulShape, DenseMatmulTensors, FlashAttentionDims, FlashAttentionMeta,
+    FlashAttentionTensors, PairedEpilogue, Q4KPairedGgml, QmatmulEpilogues, RmsNormVec4,
+    RmsNormVec4Meta, TensorMeta, UnaryEpilogue,
 };
 
 fn lower_or_fail(ir: &fusor_tile_ir::KernelIr, label: &str) -> NagaKernel {
@@ -115,6 +116,12 @@ fn q4k_ggml_qgemv_lowers() {
 }
 
 #[test]
+fn q4k_native_ggml_qgemv_lowers() {
+    let ir = qgemv_ir(GgmlQuantFormat::Q4KNative, 4096, 8192);
+    lower_or_fail(&ir, "q4k native ggml qgemv");
+}
+
+#[test]
 fn q6k_ggml_qgemv_lowers() {
     let ir = qgemv_ir(GgmlQuantFormat::Q6K, 4096, 8192);
     lower_or_fail(&ir, "q6k ggml qgemv");
@@ -146,6 +153,34 @@ fn q4k_paired_epilogue_lowers() {
         );
     });
     lower_or_fail(&ir, "q4k paired qgemv");
+}
+
+#[test]
+fn q4k_native_paired_epilogue_lowers() {
+    let ir = tile::build(|program| {
+        let rows = 4096;
+        let pair_cols = 4096;
+        let a = program.storage_read::<F32, 2>(Shape::new([1, rows]));
+        let b = quantized_matrix(program, GgmlQuantFormat::Q4KNative, rows, pair_cols * 2);
+        let y = program.storage_write::<F32, 2>(Shape::new([1, pair_cols]));
+        let epilogue =
+            PairedEpilogue::with_extras("mul", 0, |tiles| tiles[0].clone() * tiles[1].clone());
+        qgemv_q4k_paired(
+            program,
+            Q4KPairedGgml {
+                a: &a,
+                b: &b,
+                y: &y,
+                pair_cols,
+                m_rows: 1,
+                workgroups_x: 1,
+                shape: fusor_tile_ir_kernels::Q4KPairedShape::new(8, 2, 256),
+                epilogue: &epilogue,
+                extras: &[],
+            },
+        );
+    });
+    lower_or_fail(&ir, "q4k native paired qgemv");
 }
 
 #[test]
@@ -442,10 +477,30 @@ fn cooperative_dense_f32_matmul_128x256_npass_lowers() {
 fn qdequantize_lowers() {
     let ir = tile::build(|program| {
         let b = quantized_matrix(program, GgmlQuantFormat::Q4K, 256, 4);
-        let y = program.storage_write::<F32, 1>(Shape::new([1024]));
+        let y = program.storage_write_element::<1>(ElementType::F32, Shape::new([1024]));
         qdequantize(program, &b, &y, 1);
     });
     lower_or_fail(&ir, "qdequantize");
+}
+
+#[test]
+fn q4k_native_qdequantize_lowers() {
+    let ir = tile::build(|program| {
+        let b = quantized_matrix(program, GgmlQuantFormat::Q4KNative, 256, 4);
+        let y = program.storage_write_element::<1>(ElementType::F32, Shape::new([1024]));
+        qdequantize(program, &b, &y, 1);
+    });
+    lower_or_fail(&ir, "q4k native qdequantize");
+}
+
+#[test]
+fn qdequantize_f16_output_lowers() {
+    let ir = tile::build(|program| {
+        let b = quantized_matrix(program, GgmlQuantFormat::Q4KNative, 256, 4);
+        let y = program.storage_write_element::<1>(ElementType::F16, Shape::new([1024]));
+        qdequantize(program, &b, &y, 1);
+    });
+    lower_or_fail(&ir, "qdequantize f16 output");
 }
 
 /// Regression for the fallback branch in `qmatmul_tile_with_epilogue`. When
@@ -513,6 +568,32 @@ fn workgroup_qmatmul_lowers_without_subgroups() {
 }
 
 #[test]
+fn f16_staged_workgroup_qmatmul_lowers_without_subgroups() {
+    let ir = tile::build(|program| {
+        let a = program.storage_read::<F32, 2>(Shape::new([32, 256]));
+        let b = quantized_matrix(program, GgmlQuantFormat::Q4KNative, 256, 32);
+        let y = program.storage_write::<F32, 2>(Shape::new([32, 32]));
+        qmatmul_workgroup_f16_with_epilogues(
+            program,
+            &a,
+            &b,
+            &y,
+            &QmatmulEpilogues::empty(),
+            65_535,
+        );
+    });
+    let lowered = lower_or_fail(&ir, "f16 staged workgroup qmatmul");
+    assert!(
+        module_uses_f16(lowered.module()),
+        "f16 staged workgroup qmatmul did not allocate f16 scratch"
+    );
+    assert!(
+        !module_uses_subgroup(lowered.module()),
+        "f16 staged workgroup qmatmul emitted subgroup ops"
+    );
+}
+
+#[test]
 fn workgroup_qgemv_lowers_without_subgroups() {
     let ir = tile::build(|program| {
         let a = program.storage_read::<F32, 2>(Shape::new([1, 256]));
@@ -524,6 +605,40 @@ fn workgroup_qgemv_lowers_without_subgroups() {
     assert!(
         !module_uses_subgroup(lowered.module()),
         "workgroup qgemv emitted subgroup ops"
+    );
+}
+
+#[test]
+fn f16_staged_workgroup_qgemv_lowers_without_subgroups() {
+    let ir = tile::build(|program| {
+        let a = program.storage_read::<F32, 2>(Shape::new([1, 256]));
+        let b = quantized_matrix(program, GgmlQuantFormat::Q4KNative, 256, 128);
+        let y = program.storage_write::<F32, 2>(Shape::new([1, 128]));
+        qgemv_workgroup_f16_with_epilogue(program, &a, &b, &y, &QmatmulEpilogues::empty(), 65_535);
+    });
+    let lowered = lower_or_fail(&ir, "f16 staged workgroup qgemv");
+    assert!(
+        module_uses_f16(lowered.module()),
+        "f16 staged workgroup qgemv did not allocate f16 scratch"
+    );
+    assert!(
+        !module_uses_subgroup(lowered.module()),
+        "f16 staged workgroup qgemv emitted subgroup ops"
+    );
+}
+
+#[test]
+fn q4k_native_workgroup_qgemv_lowers_without_subgroups() {
+    let ir = tile::build(|program| {
+        let a = program.storage_read::<F32, 2>(Shape::new([1, 256]));
+        let b = quantized_matrix(program, GgmlQuantFormat::Q4KNative, 256, 128);
+        let y = program.storage_write::<F32, 2>(Shape::new([1, 128]));
+        qgemv_workgroup_with_epilogue(program, &a, &b, &y, &QmatmulEpilogues::empty(), 65_535);
+    });
+    let lowered = lower_or_fail(&ir, "q4k native workgroup qgemv");
+    assert!(
+        !module_uses_subgroup(lowered.module()),
+        "native workgroup qgemv emitted subgroup ops"
     );
 }
 
@@ -545,6 +660,18 @@ fn module_uses_subgroup(module: &naga::Module) -> bool {
             .entry_points
             .iter()
             .any(|entry| uses_in(&entry.function.expressions))
+}
+
+fn module_uses_f16(module: &naga::Module) -> bool {
+    module.types.iter().any(|(_, ty)| {
+        matches!(
+            ty.inner,
+            naga::TypeInner::Scalar(naga::Scalar {
+                kind: naga::ScalarKind::Float,
+                width: 2,
+            })
+        )
+    })
 }
 
 #[test]

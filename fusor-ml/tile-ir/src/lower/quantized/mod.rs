@@ -96,18 +96,18 @@ pub(super) enum AffineDequantSpec {
 impl AffineDequantSpec {
     pub(super) fn for_format(format: GgmlQuantFormat) -> Option<Self> {
         Some(match format {
-            GgmlQuantFormat::Q4_0 => Self::Centered {
+            GgmlQuantFormat::Q4_0 | GgmlQuantFormat::Q4_0Native => Self::Centered {
                 nibble: AffineNibble::Q4 { data_offset: 1 },
                 center: 8.0,
             },
-            GgmlQuantFormat::Q5_0 => Self::Centered {
+            GgmlQuantFormat::Q5_0 | GgmlQuantFormat::Q5_0Native => Self::Centered {
                 nibble: AffineNibble::Q5 {
                     high_offset: 1,
                     data_offset: 2,
                 },
                 center: 16.0,
             },
-            GgmlQuantFormat::Q8_0 => Self::Q8 { data_offset: 1 },
+            GgmlQuantFormat::Q8_0 | GgmlQuantFormat::Q8_0Native => Self::Q8 { data_offset: 1 },
             GgmlQuantFormat::Q4_1 => Self::ScaleMin {
                 nibble: AffineNibble::Q4 { data_offset: 2 },
             },
@@ -121,8 +121,11 @@ impl AffineDequantSpec {
             GgmlQuantFormat::Q2K
             | GgmlQuantFormat::Q3K
             | GgmlQuantFormat::Q4K
+            | GgmlQuantFormat::Q4KNative
             | GgmlQuantFormat::Q5K
+            | GgmlQuantFormat::Q5KNative
             | GgmlQuantFormat::Q6K
+            | GgmlQuantFormat::Q6KNative
             | GgmlQuantFormat::Q8K => return None,
         })
     }

@@ -249,6 +249,9 @@ impl<'a> Lowerer<'a> {
         if self.f16_ty.is_some() {
             capabilities |= naga::valid::Capabilities::SHADER_FLOAT16;
         }
+        if Self::uses_shader_float16_in_float32(self.ir) {
+            capabilities |= naga::valid::Capabilities::SHADER_FLOAT16_IN_FLOAT32;
+        }
         if Self::uses_subgroup_reduce(self.ir) || self.subgroup_usage.subgroup_id {
             capabilities |= naga::valid::Capabilities::SUBGROUP;
         }

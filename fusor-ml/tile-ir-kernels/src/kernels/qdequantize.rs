@@ -1,16 +1,18 @@
 //! Quantized dequantization program kernels.
 
-use fusor_tile_ir::tile::{Program, Storage};
-use fusor_tile_ir::{Layout, MemoryLevel, QuantizedMatrix, Shape, StorageView, WorkgroupAxis, F32};
+use fusor_tile_ir::tile::{Program, RuntimeElement, Storage};
+use fusor_tile_ir::{
+    ElementType, Layout, MemoryLevel, QuantizedMatrix, Shape, StorageView, WorkgroupAxis,
+};
 
 /// Lane-per-element dequantization.
 ///
-/// Emits one f32 per quantized element of `b` and writes them to a row-major
-/// `y` of `b.rows * b.cols` floats.
+/// Emits one dense f32/f16 element per quantized element of `b` and writes it
+/// to a row-major `y` of `b.rows * b.cols` elements.
 pub fn qdequantize(
     program: &mut Program,
     b: &QuantizedMatrix,
-    y: &Storage<F32, 1>,
+    y: &Storage<RuntimeElement, 1>,
     workgroups_x: u32,
 ) {
     const BLOCK: usize = 256;
@@ -23,11 +25,15 @@ pub fn qdequantize(
         b.rows
             .checked_mul(b.cols)
             .expect("qdequantize output element count overflow"),
-        "qdequantize output must contain one dense f32 per quantized element"
+        "qdequantize output must contain one dense element per quantized element"
     );
     assert!(
         y.view().layout.is_row_major(),
         "qdequantize output must be row-major"
+    );
+    assert!(
+        matches!(y.view().buffer.element, ElementType::F32 | ElementType::F16),
+        "qdequantize output must be f32 or f16"
     );
 
     let total = b
@@ -36,7 +42,7 @@ pub fn qdequantize(
         .expect("qdequantize output element count overflow");
     let workgroups = total.div_ceil(BLOCK as u32);
     let dispatch_y = workgroups.div_ceil(workgroups_x);
-    let y = Storage::<F32, 2>::from_view(StorageView {
+    let y = Storage::<RuntimeElement, 2>::from_view(StorageView {
         buffer: y.view().buffer,
         offset: y.view().offset,
         layout: Layout::contiguous(MemoryLevel::Storage, Shape::new([1, total])),
@@ -54,6 +60,6 @@ pub fn qdequantize(
             mask.clone(),
             0.0,
         );
-        program.store(y.at((0, flat)), value, mask);
+        program.store_element(y.at((0, flat)), value, mask);
     });
 }

@@ -16,21 +16,89 @@ use crate::{
     visit_tiled::distribute_workgroups,
 };
 
-use super::QMatrix;
+use super::{QMatrix, QMatrixStorageLayout};
 
 const BLOCK: usize = 256;
 
 struct QEmbeddingDirectKernelVariant;
+
+#[allow(clippy::too_many_arguments)]
+fn emit_qembedding_kernel(
+    kb: &mut tile_ir::KernelBuilder<std::sync::Arc<wgpu::Buffer>>,
+    matrix_buffer: std::sync::Arc<wgpu::Buffer>,
+    indexes_buffer: std::sync::Arc<wgpu::Buffer>,
+    output_buffer: std::sync::Arc<wgpu::Buffer>,
+    output_element: tile_ir::ElementType,
+    format: tile_ir::GgmlQuantFormat,
+    embedding_dim: u32,
+    num_embeddings: u32,
+    total: u32,
+    dispatch_size: [u32; 3],
+    indexes_offset: u32,
+    indexes_layout: tile_ir::Layout,
+    output_offset: u32,
+    output_layout: tile_ir::Layout,
+) -> Option<()> {
+    let q = tile_ir_kernels::quantized_matrix_for(
+        kb,
+        matrix_buffer,
+        format,
+        embedding_dim,
+        num_embeddings,
+    );
+    let indexes = kb.read::<tile_ir::U32, 2>(tile_ir::KernelTensorRef::with_offset(
+        indexes_buffer,
+        indexes_layout,
+        indexes_offset,
+    ));
+    let y = kb.write_element::<2>(
+        output_element,
+        tile_ir::KernelTensorRef::with_offset(output_buffer, output_layout, output_offset),
+    );
+
+    kb.program()
+        .program_grid::<BLOCK>(dispatch_size, |program| {
+            let lane = program.lane();
+            let group = program.program_id(tile_ir::WorkgroupAxis::X)
+                + program.program_id(tile_ir::WorkgroupAxis::Y) * dispatch_size[0];
+            let flat = group * BLOCK as u32 + lane;
+            let in_bounds = flat.clone().lt(total);
+            let dim = flat.clone() % embedding_dim;
+            let index_pos = flat / embedding_dim;
+            let token = program.load(
+                indexes.at((0, index_pos.clone())),
+                in_bounds.clone(),
+                tile_ir::TileLiteral::U32(0),
+            );
+            let value = program.load_quantized(&q, dim.clone(), token, in_bounds.clone(), 0.0);
+            program.store_element(y.at((index_pos, dim)), value, in_bounds);
+        });
+    Some(())
+}
+
+fn datatype_element(datatype: DataTypeEnum) -> Option<tile_ir::ElementType> {
+    Some(match datatype {
+        DataTypeEnum::F32 => tile_ir::ElementType::F32,
+        DataTypeEnum::F16 => tile_ir::ElementType::F16,
+        DataTypeEnum::U32 => return None,
+    })
+}
 
 #[derive(Debug, Clone)]
 pub(crate) struct QEmbeddingOperation {
     pub(crate) indexes: NodeIndex,
     pub(crate) matrix: QMatrix,
     pub(crate) out_shape: Box<[usize]>,
+    pub(crate) datatype: DataTypeEnum,
 }
 
 impl QEmbeddingOperation {
-    pub(crate) fn new(indexes: NodeIndex, index_count: usize, matrix: QMatrix) -> Self {
+    pub(crate) fn new(
+        indexes: NodeIndex,
+        index_count: usize,
+        matrix: QMatrix,
+        datatype: DataTypeEnum,
+    ) -> Self {
         assert_eq!(
             matrix.shape.len(),
             2,
@@ -42,21 +110,40 @@ impl QEmbeddingOperation {
             indexes,
             matrix,
             out_shape: Box::new([index_count, embedding_dim]),
+            datatype,
         }
     }
 
     fn direct_quant_format(&self) -> Option<tile_ir::GgmlQuantFormat> {
         Some(match self.matrix.datatype {
+            GgmlType::Q4_0 if self.matrix.storage_layout() == QMatrixStorageLayout::Native => {
+                tile_ir::GgmlQuantFormat::Q4_0Native
+            }
             GgmlType::Q4_0 => tile_ir::GgmlQuantFormat::Q4_0,
             GgmlType::Q4_1 => tile_ir::GgmlQuantFormat::Q4_1,
+            GgmlType::Q5_0 if self.matrix.storage_layout() == QMatrixStorageLayout::Native => {
+                tile_ir::GgmlQuantFormat::Q5_0Native
+            }
             GgmlType::Q5_0 => tile_ir::GgmlQuantFormat::Q5_0,
             GgmlType::Q5_1 => tile_ir::GgmlQuantFormat::Q5_1,
+            GgmlType::Q8_0 if self.matrix.storage_layout() == QMatrixStorageLayout::Native => {
+                tile_ir::GgmlQuantFormat::Q8_0Native
+            }
             GgmlType::Q8_0 => tile_ir::GgmlQuantFormat::Q8_0,
             GgmlType::Q8_1 => tile_ir::GgmlQuantFormat::Q8_1,
             GgmlType::Q2K => tile_ir::GgmlQuantFormat::Q2K,
             GgmlType::Q3K => tile_ir::GgmlQuantFormat::Q3K,
+            GgmlType::Q4K if self.matrix.storage_layout() == QMatrixStorageLayout::Native => {
+                tile_ir::GgmlQuantFormat::Q4KNative
+            }
             GgmlType::Q4K => tile_ir::GgmlQuantFormat::Q4K,
+            GgmlType::Q5K if self.matrix.storage_layout() == QMatrixStorageLayout::Native => {
+                tile_ir::GgmlQuantFormat::Q5KNative
+            }
             GgmlType::Q5K => tile_ir::GgmlQuantFormat::Q5K,
+            GgmlType::Q6K if self.matrix.storage_layout() == QMatrixStorageLayout::Native => {
+                tile_ir::GgmlQuantFormat::Q6KNative
+            }
             GgmlType::Q6K => tile_ir::GgmlQuantFormat::Q6K,
             GgmlType::Q8K => tile_ir::GgmlQuantFormat::Q8K,
             GgmlType::F16 | GgmlType::F32 => return None,
@@ -128,7 +215,7 @@ impl Operation for QEmbeddingOperation {
             .get_result(self.indexes)
             .expect("QEmbedding indexes must be resolved before kernel launch");
         let device = nodes.device();
-        let output = TensorData::new_for_shape(&device, &self.out_shape, DataTypeEnum::F32);
+        let output = TensorData::new_for_shape(&device, &self.out_shape, self.datatype);
         vec![self.matrix.clone().into(), indexes.into(), output.into()]
     }
 
@@ -154,7 +241,11 @@ impl Operation for QEmbeddingOperation {
         };
         let indexes = indexes.as_tensor()?;
         let output = output.as_tensor()?;
-        if indexes.datatype() != DataTypeEnum::U32 || output.datatype() != DataTypeEnum::F32 {
+        if indexes.datatype() != DataTypeEnum::U32
+            || output.datatype() != self.datatype
+            || !matches!(self.datatype, DataTypeEnum::F32 | DataTypeEnum::F16)
+            || (self.datatype == DataTypeEnum::F16 && !graph.device().f16_supported())
+        {
             return None;
         }
         let [index_count, embedding_dim] = self.out_shape.as_ref() else {
@@ -190,41 +281,23 @@ impl Operation for QEmbeddingOperation {
             cache_key,
             dispatch_size,
             move |kb| {
-                let q = tile_ir_kernels::quantized_matrix_for(
+                let output_datatype = self.datatype;
+                emit_qembedding_kernel(
                     kb,
                     matrix_buffer,
+                    indexes_buffer,
+                    output_buffer,
+                    datatype_element(output_datatype)?,
                     format,
                     embedding_dim,
                     num_embeddings,
-                );
-                let indexes = kb.read::<tile_ir::U32, 2>(tile_ir::KernelTensorRef::with_offset(
-                    indexes_buffer,
-                    indexes_layout,
+                    total,
+                    dispatch_size,
                     indexes_offset,
-                ));
-                let y = kb.write::<tile_ir::F32, 2>(tile_ir::KernelTensorRef::with_offset(
-                    output_buffer,
-                    output_layout,
+                    indexes_layout,
                     output_offset,
-                ));
-                kb.program()
-                    .program_grid::<BLOCK>(dispatch_size, |program| {
-                        let lane = program.lane();
-                        let group = program.program_id(tile_ir::WorkgroupAxis::X)
-                            + program.program_id(tile_ir::WorkgroupAxis::Y) * dispatch_size[0];
-                        let flat = group * BLOCK as u32 + lane;
-                        let in_bounds = flat.clone().lt(total);
-                        let dim = flat.clone() % embedding_dim;
-                        let index_pos = flat / embedding_dim;
-                        let token = program.load(
-                            indexes.at((0, index_pos.clone())),
-                            in_bounds.clone(),
-                            tile_ir::TileLiteral::U32(0),
-                        );
-                        let value =
-                            program.load_quantized(&q, dim.clone(), token, in_bounds.clone(), 0.0);
-                        program.store(y.at((index_pos, dim)), value, in_bounds);
-                    });
+                    output_layout,
+                )?;
                 Some(())
             },
         )
@@ -240,6 +313,10 @@ impl Operation for QEmbeddingOperation {
 
 impl QMatrix {
     pub fn index_select_rows(&self, indexes: &Tensor) -> Tensor {
+        self.index_select_rows_to(indexes, DataTypeEnum::F32)
+    }
+
+    pub fn index_select_rows_to(&self, indexes: &Tensor, datatype: DataTypeEnum) -> Tensor {
         indexes.assert_rank::<1>();
         indexes.assert_datatype::<u32>();
         assert_eq!(
@@ -248,14 +325,24 @@ impl QMatrix {
             "quantized row index_select requires a 2D table, got {}D",
             self.shape.len()
         );
-        if self.datatype == GgmlType::F32 {
-            let dense = self.dequantize::<f32>();
-            return dense.index_select(0, indexes);
+        if matches!(self.datatype, GgmlType::F32 | GgmlType::F16) {
+            let dense = if datatype == DataTypeEnum::F16 {
+                self.dequantize::<half::f16>()
+            } else {
+                self.dequantize::<f32>()
+            };
+            return dense.index_select(0, indexes).cast_to(datatype);
         }
         let index_count = indexes.shape()[0];
         let device = self.device.clone();
-        let operation = QEmbeddingOperation::new(indexes.key(), index_count, self.clone());
-        let info = TensorInfo::new(operation.out_shape.clone(), DataTypeEnum::F32);
+        let datatype = if datatype == DataTypeEnum::F16 && !self.device.f16_supported() {
+            DataTypeEnum::F32
+        } else {
+            datatype
+        };
+        let operation =
+            QEmbeddingOperation::new(indexes.key(), index_count, self.clone(), datatype);
+        let info = TensorInfo::new(operation.out_shape.clone(), datatype);
         let key = device.compute_graph().create_q_embedding(operation);
         Tensor::from_parts(LazyTensorData::from_parts(device, info, key))
     }

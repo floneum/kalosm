@@ -82,6 +82,7 @@ fn hash_mir_value(state: &mut FxHasher, value: &MirValue) {
     match value {
         MirValue::QMatrix(matrix) => {
             matrix.datatype().hash(state);
+            matrix.storage_layout().hash(state);
             matrix.shape().hash(state);
         }
         MirValue::Tensor(tensor) => {

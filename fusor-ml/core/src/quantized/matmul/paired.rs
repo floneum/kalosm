@@ -40,7 +40,10 @@ impl QMatMulOperation {
         if !device.subgroups_supported() {
             return None;
         }
-        let format = tile_ir::GgmlQuantFormat::Q4K;
+        let format = match matrix.storage_layout() {
+            QMatrixStorageLayout::Native => tile_ir::GgmlQuantFormat::Q4KNative,
+            QMatrixStorageLayout::GpuF32Scales => tile_ir::GgmlQuantFormat::Q4K,
+        };
         let a_view = flatten_matrix_layout(input.layout())?;
         let y_view = flatten_matrix_layout(output.layout())?;
         let m = a_view.rows;
@@ -73,6 +76,7 @@ impl QMatMulOperation {
         if extras_count == 0 {
             let pipeline_key = QMatMulDirectPipelineKey::new_with_epilogue(
                 matrix.datatype(),
+                matrix.storage_layout(),
                 crate::quantized::QMatMulShape { m, k, n: pair_len },
                 paired_identity,
                 dispatch_size,
@@ -264,6 +268,14 @@ impl QMatMulOperation {
         let mut dense_strides = vec![0; rank];
         dense_strides[rank - 2] = 1;
         dense_strides[rank - 1] = k;
+        let matrix_datatype = match matrix.datatype() {
+            GgmlType::F32 => DataTypeEnum::F32,
+            GgmlType::F16 => DataTypeEnum::F16,
+            _ => return None,
+        };
+        if input.datatype() != matrix_datatype || output.datatype() != matrix_datatype {
+            return None;
+        }
         let dense_weight_t = TensorData::new_from_parts(
             matrix.device(),
             matrix.buffer().clone(),
@@ -272,11 +284,11 @@ impl QMatMulOperation {
                 dense_shape.into_boxed_slice(),
                 dense_strides.into_boxed_slice(),
             ),
-            DataTypeEnum::F32,
+            matrix_datatype,
         );
         let device = graph.device();
         let dense_matmul = MatMulOperation::new(
-            DataTypeEnum::F32,
+            matrix_datatype,
             self.input,
             self.input,
             input.layout().shape(),
@@ -304,10 +316,10 @@ impl QMatMulOperation {
         matrix: &QMatrix,
         output: &TensorData,
     ) -> Option<Vec<DirectKernel>> {
-        if input.datatype() != DataTypeEnum::F32 || output.datatype() != DataTypeEnum::F32 {
+        if input.datatype() != output.datatype() {
             return None;
         }
-        if matrix.datatype() == GgmlType::F32 {
+        if matches!(matrix.datatype(), GgmlType::F32 | GgmlType::F16) {
             return self
                 .build_dense_direct_kernel(graph, input, matrix, output)
                 .map(|kernel| vec![kernel]);
@@ -327,6 +339,7 @@ impl QMatMulOperation {
             shape: matrix.shape.clone(),
             buffer: dense_weight.buffer().clone(),
             datatype: GgmlType::F32,
+            storage_layout: QMatrixStorageLayout::Native,
             direct_pipeline_cache: matrix.direct_pipeline_cache.clone(),
         };
         let matmul_kernel = self.build_dense_direct_kernel(graph, input, &dense_matrix, output)?;

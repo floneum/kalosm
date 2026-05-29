@@ -41,7 +41,7 @@ impl<'a> Lowerer<'a> {
                         masked,
                     },
                     |expressions, k_base, col, body| match (src.format, block_n) {
-                        (GgmlQuantFormat::Q8_0, 8) => {
+                        (GgmlQuantFormat::Q8_0 | GgmlQuantFormat::Q8_0Native, 8) => {
                             let a8: [Handle<Expression>; 8] =
                                 a_handles.as_slice().try_into().map_err(|_| {
                                     LowerError::UnsupportedOperation(
@@ -50,7 +50,7 @@ impl<'a> Lowerer<'a> {
                                 })?;
                             self.dequantize_q8_0_dot8(expressions, src, k_base, col, &a8, body)
                         }
-                        (GgmlQuantFormat::Q6K, 8) => {
+                        (GgmlQuantFormat::Q6K | GgmlQuantFormat::Q6KNative, 8) => {
                             let a8: [Handle<Expression>; 8] =
                                 a_handles.as_slice().try_into().map_err(|_| {
                                     LowerError::UnsupportedOperation(
@@ -59,7 +59,7 @@ impl<'a> Lowerer<'a> {
                                 })?;
                             self.dequantize_q6k_dot8(expressions, src, k_base, col, &a8, body)
                         }
-                        (GgmlQuantFormat::Q4K, 8 | 16 | 32) => {
+                        (GgmlQuantFormat::Q4K | GgmlQuantFormat::Q4KNative, 8 | 16 | 32) => {
                             self.q4k_f32_dot(expressions, src, k_base, col, &a_handles, body)
                         }
                         _ => Err(LowerError::UnsupportedOperation(
@@ -88,22 +88,10 @@ impl<'a> Lowerer<'a> {
                         masked,
                     },
                     |expressions, k_base, col, body| match (src.format, block_n) {
-                        (GgmlQuantFormat::Q4K, 8 | 16) => self.q4k_q8_activation_dot(
-                            expressions,
-                            src,
-                            k_base,
-                            col,
-                            &a_packs,
-                            body,
-                        ),
-                        (GgmlQuantFormat::Q6K, 8 | 16) => self.q6k_q8_activation_dot(
-                            expressions,
-                            src,
-                            k_base,
-                            col,
-                            &a_packs,
-                            body,
-                        ),
+                        (GgmlQuantFormat::Q4K | GgmlQuantFormat::Q4KNative, 8 | 16) => self
+                            .q4k_q8_activation_dot(expressions, src, k_base, col, &a_packs, body),
+                        (GgmlQuantFormat::Q6K | GgmlQuantFormat::Q6KNative, 8 | 16) => self
+                            .q6k_q8_activation_dot(expressions, src, k_base, col, &a_packs, body),
                         _ => Err(LowerError::UnsupportedOperation(
                             "q8 activation dot only supports Q4K/Q6K dot8/dot16",
                         )),
@@ -123,9 +111,9 @@ impl<'a> Lowerer<'a> {
                         "q4k ggml dot requires 16 low activations, 16 high activations, and 4 sums",
                     ));
                 }
-                if !matches!(src.format, GgmlQuantFormat::Q4K) {
+                if !src.format.is_q4k_family() {
                     return Err(LowerError::UnsupportedOperation(
-                        "q4k ggml dot only supports the Q4K format",
+                        "q4k ggml dot only supports Q4K formats",
                     ));
                 }
 
@@ -196,9 +184,9 @@ impl<'a> Lowerer<'a> {
                         "q6k ggml dot requires 16 activations",
                     ));
                 }
-                if !matches!(src.format, GgmlQuantFormat::Q6K) {
+                if !src.format.is_q6k_family() {
                     return Err(LowerError::UnsupportedOperation(
-                        "q6k ggml dot only supports the Q6K format",
+                        "q6k ggml dot only supports Q6K formats",
                     ));
                 }
 
@@ -348,19 +336,19 @@ impl<'a> Lowerer<'a> {
         body: &mut Block,
     ) -> Result<Vec<Handle<Expression>>, LowerError> {
         match (src.format, block_n) {
-            (GgmlQuantFormat::Q8_0, 8) => {
+            (GgmlQuantFormat::Q8_0 | GgmlQuantFormat::Q8_0Native, 8) => {
                 self.dequantize_q8_0_values8(expressions, src, k_base, col, body)
             }
-            (GgmlQuantFormat::Q4K, 8) => {
+            (GgmlQuantFormat::Q4K | GgmlQuantFormat::Q4KNative, 8) => {
                 self.dequantize_q4k_values8(expressions, src, k_base, col, body)
             }
-            (GgmlQuantFormat::Q6K, 8) => {
+            (GgmlQuantFormat::Q6K | GgmlQuantFormat::Q6KNative, 8) => {
                 self.dequantize_q6k_values8(expressions, src, k_base, col, body)
             }
-            (GgmlQuantFormat::Q6K, 16) => {
+            (GgmlQuantFormat::Q6K | GgmlQuantFormat::Q6KNative, 16) => {
                 self.dequantize_q6k_values16(expressions, src, k_base, col, body)
             }
-            (GgmlQuantFormat::Q5_0, 16) => {
+            (GgmlQuantFormat::Q5_0 | GgmlQuantFormat::Q5_0Native, 16) => {
                 self.dequantize_q5_0_values16(expressions, src, k_base, col, body)
             }
             (_, 8 | 16) => self.dequantize_qvalues(expressions, src, k_base, col, block_n, body),

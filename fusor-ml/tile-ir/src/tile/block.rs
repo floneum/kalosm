@@ -3,8 +3,8 @@ use std::marker::PhantomData;
 use super::value::{boxed_index, boxed_u32_literal};
 use super::*;
 use crate::ir::{
-    Bool, Builtin, Expr, FloatElement, Numeric, ScalarMarker, TileLiteral, TileLoadExpr, TileStmt,
-    TileUnaryOp, Vector, WorkgroupAxis, F16, F32, U32,
+    Bool, Builtin, ElementType, Expr, FloatElement, Numeric, ScalarMarker, TileLiteral,
+    TileLoadExpr, TileStmt, TileUnaryOp, Vector, WorkgroupAxis, F16, F32, U32,
 };
 use crate::quantized::QuantizedMatrix;
 
@@ -325,8 +325,29 @@ impl TileBlock<'_> {
     ) {
         self.push_stmt(address.store_stmt(value.expr, mask.into().expr));
     }
+    pub fn store_element<T: Numeric, const R: usize>(
+        &mut self,
+        address: Address<RuntimeElement, R>,
+        value: Tile<T>,
+        mask: impl Into<Mask>,
+    ) {
+        let target = address.view.buffer.element;
+        let value = cast_expr_to_element(value.expr, target);
+        self.push_stmt(address.store_stmt(value, mask.into().expr));
+    }
 }
 
 fn validate_vector_lanes(lanes: usize, op: &str) {
     assert!((2..=4).contains(&lanes), "{op} supports 2, 3, or 4 lanes");
+}
+
+fn cast_expr_to_element(value: Expr, target: ElementType) -> Expr {
+    if value.element() == target {
+        value
+    } else {
+        Expr::Cast {
+            value: Box::new(value),
+            to: target,
+        }
+    }
 }

@@ -1,9 +1,7 @@
 //! Q4K paired-epilogue GEMV program kernels.
 
 use fusor_tile_ir::tile::{BlockCoord, Mask, Program, QuantizedDot, Storage, Tile, TileBlock};
-use fusor_tile_ir::{
-    GgmlQuantFormat, QuantizedMatrix, TileLiteral, TileReduceOp, WorkgroupAxis, F32, U32,
-};
+use fusor_tile_ir::{QuantizedMatrix, TileLiteral, TileReduceOp, WorkgroupAxis, F32, U32};
 
 use crate::grid::{q4k_ggml_iteration, q4k_lane_decomposition, Q4KGgmlIterationRequest};
 use crate::types::{matrix_shape, PairedEpilogue};
@@ -164,7 +162,7 @@ fn qgemv_q4k_paired_ggml<const BLOCK: usize>(program: &mut Program, spec: Q4KPai
         epilogue.extras_count(),
         "kernel extras count must match epilogue arity"
     );
-    debug_assert_eq!(b.format, GgmlQuantFormat::Q4K);
+    debug_assert!(b.format.is_q4k_family());
     debug_assert_eq!(b.cols, pair_cols * 2);
 
     let [_, k] = matrix_shape(&a.view().layout);

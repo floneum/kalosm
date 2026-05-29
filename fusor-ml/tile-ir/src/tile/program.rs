@@ -119,6 +119,21 @@ impl Program {
         storage_read_with_layout_offset,
         storage_write_with_layout_offset(layout: Layout, offset: u32) => (layout, offset)
     );
+    element_storage_accessors!(
+        storage_read_element,
+        storage_write_element(shape: Shape) => (
+            Layout::contiguous(MemoryLevel::Storage, shape),
+            0
+        )
+    );
+    element_storage_accessors!(
+        storage_read_element_with_layout,
+        storage_write_element_with_layout(layout: Layout) => (layout, 0)
+    );
+    element_storage_accessors!(
+        storage_read_element_with_layout_offset,
+        storage_write_element_with_layout_offset(layout: Layout, offset: u32) => (layout, offset)
+    );
 
     fn storage_with_layout_and_access<T: Numeric, const R: usize>(
         &mut self,
@@ -147,11 +162,6 @@ impl Program {
             _ty: PhantomData,
         }
     }
-
-    element_storage_accessors!(
-        storage_read_element_with_layout_offset,
-        storage_write_element_with_layout_offset(layout: Layout, offset: u32) => (layout, offset)
-    );
 
     fn storage_view_with_layout_and_access<const R: usize>(
         &mut self,

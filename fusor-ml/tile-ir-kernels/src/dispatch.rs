@@ -24,6 +24,14 @@ use fusor_tile_ir::GgmlQuantFormat;
 
 // ===== qgemv shapes (Q4K and Q6K ggml paths) =====
 
+const fn is_q4k_family(format: GgmlQuantFormat) -> bool {
+    format.is_q4k_family()
+}
+
+const fn is_q6k_family(format: GgmlQuantFormat) -> bool {
+    format.is_q6k_family()
+}
+
 /// Default qgemv output columns handled by one workgroup for `format`.
 pub const fn qgemv_cols_per_workgroup(format: GgmlQuantFormat) -> u32 {
     qgemv_subgroups_per_workgroup(format) * qgemv_cols_per_subgroup(format)
@@ -34,23 +42,23 @@ pub const fn qgemv_cols_per_workgroup(format: GgmlQuantFormat) -> u32 {
 /// This includes the Q4K/Q6K GGML specializations whose column grouping
 /// depends on both K (`rows`) and N (`cols`).
 pub fn qgemv_cols_per_workgroup_for_shape(format: GgmlQuantFormat, rows: u32, cols: u32) -> u32 {
-    if matches!(format, GgmlQuantFormat::Q4K) && rows <= 4096 && (4096..8192).contains(&cols) {
+    if is_q4k_family(format) && rows <= 4096 && (4096..8192).contains(&cols) {
         return q4k_mid_override(q4k_default_mid(rows, cols)).cols_per_workgroup();
     }
 
-    if matches!(format, GgmlQuantFormat::Q4K) && rows <= 4096 && cols >= 8192 {
+    if is_q4k_family(format) && rows <= 4096 && cols >= 8192 {
         return q4k_large_override(q4k_default_large(rows, cols)).cols_per_workgroup();
     }
 
-    if matches!(format, GgmlQuantFormat::Q4K) && rows > 4096 && cols <= 4096 {
+    if is_q4k_family(format) && rows > 4096 && cols <= 4096 {
         return q4k_tall_override(q4k_default_tall(rows, cols)).cols_per_workgroup();
     }
 
-    if matches!(format, GgmlQuantFormat::Q6K) && rows <= 4096 && cols >= 8192 {
+    if is_q6k_family(format) && rows <= 4096 && cols >= 8192 {
         return q6k_large_override(q6k_default_large(rows, cols)).cols_per_workgroup();
     }
 
-    if matches!(format, GgmlQuantFormat::Q6K) && rows > 4096 && cols <= 4096 {
+    if is_q6k_family(format) && rows > 4096 && cols <= 4096 {
         return q6k_tall_override(q6k_default_tall(rows, cols)).cols_per_workgroup();
     }
 
@@ -60,21 +68,27 @@ pub fn qgemv_cols_per_workgroup_for_shape(format: GgmlQuantFormat, rows: u32, co
 pub(crate) const fn qgemv_cols_per_subgroup(format: GgmlQuantFormat) -> u32 {
     match format {
         GgmlQuantFormat::Q2K => 4,
-        GgmlQuantFormat::Q4_0 | GgmlQuantFormat::Q4_1 | GgmlQuantFormat::Q5_1 => 4,
-        GgmlQuantFormat::Q5_0 => 4,
+        GgmlQuantFormat::Q4_0
+        | GgmlQuantFormat::Q4_0Native
+        | GgmlQuantFormat::Q4_1
+        | GgmlQuantFormat::Q5_1 => 4,
+        GgmlQuantFormat::Q5_0 | GgmlQuantFormat::Q5_0Native => 4,
         GgmlQuantFormat::Q3K | GgmlQuantFormat::Q8K => 2,
-        GgmlQuantFormat::Q4K => 8,
-        GgmlQuantFormat::Q6K => 4,
-        GgmlQuantFormat::Q8_0 | GgmlQuantFormat::Q8_1 => 4,
-        GgmlQuantFormat::Q5K => 1,
+        GgmlQuantFormat::Q4K | GgmlQuantFormat::Q4KNative => 8,
+        GgmlQuantFormat::Q6K | GgmlQuantFormat::Q6KNative => 4,
+        GgmlQuantFormat::Q8_0 | GgmlQuantFormat::Q8_0Native | GgmlQuantFormat::Q8_1 => 4,
+        GgmlQuantFormat::Q5K | GgmlQuantFormat::Q5KNative => 1,
     }
 }
 
 pub(crate) const fn qgemv_subgroups_per_workgroup(format: GgmlQuantFormat) -> u32 {
     match format {
         GgmlQuantFormat::Q4K
+        | GgmlQuantFormat::Q4KNative
         | GgmlQuantFormat::Q6K
+        | GgmlQuantFormat::Q6KNative
         | GgmlQuantFormat::Q8_0
+        | GgmlQuantFormat::Q8_0Native
         | GgmlQuantFormat::Q8_1 => 4,
         _ => 2,
     }
@@ -87,7 +101,7 @@ pub const fn qgemv_subgroups_per_workgroup_for_shape(
     _cols: u32,
 ) -> u32 {
     match format {
-        GgmlQuantFormat::Q6K if rows > 4096 => 8,
+        format if format.is_q6k_family() && rows > 4096 => 8,
         _ => qgemv_subgroups_per_workgroup(format),
     }
 }

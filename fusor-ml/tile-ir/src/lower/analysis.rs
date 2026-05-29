@@ -86,6 +86,34 @@ impl<'a> Lowerer<'a> {
         Self::tile_programs_expr_any(ir, |expr| matches!(expr, Expr::SubgroupReduce { .. }))
     }
 
+    pub(super) fn uses_shader_float16_in_float32(ir: &KernelIr) -> bool {
+        Self::tile_programs_expr_any(ir, Self::expr_uses_native_f16_scales)
+            || ir.body().body.iter().any(|stmt| {
+                Self::tile_stmt_tree_any(stmt, &mut |stmt| {
+                    matches!(
+                        stmt,
+                        TileStmt::CopyToWorkgroupTile {
+                            src: CopySource::Quantized(matrix),
+                            ..
+                        } if matrix.format.has_native_f16_scales()
+                    )
+                })
+            })
+    }
+
+    fn expr_uses_native_f16_scales(expr: &Expr) -> bool {
+        match expr {
+            Expr::Load(load) => matches!(
+                &load.src,
+                LoadSource::Quantized(matrix) if matrix.format.has_native_f16_scales()
+            ),
+            Expr::QuantizedBlockLane { src, .. } | Expr::QuantizedDot { src, .. } => {
+                src.format.has_native_f16_scales()
+            }
+            _ => false,
+        }
+    }
+
     pub(super) fn subgroup_index_usage(ir: &KernelIr) -> SubgroupIndexUsage {
         let mut usage = SubgroupIndexUsage::default();
         Self::tile_programs_expr_any(ir, |expr| {

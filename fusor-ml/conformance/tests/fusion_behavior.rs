@@ -223,10 +223,7 @@ async fn gpu_nary_fusion_respects_binding_limit() {
     };
 
     let shape = [3, 4];
-    let limits = device.as_gpu().unwrap().limits();
-    let max_fused_inputs = (limits.max_storage_buffers_per_shader_stage as usize)
-        .min(limits.max_bindings_per_bind_group as usize)
-        .saturating_sub(1);
+    let max_fused_inputs = device.as_gpu().unwrap().nary_direct_input_binding_budget();
     let num_tensors = max_fused_inputs.saturating_add(1).max(2);
 
     let tensors: Vec<Tensor<2, f32>> = (0..num_tensors)

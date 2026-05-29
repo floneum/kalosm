@@ -33,7 +33,11 @@ pub use qgemv_paired_q4k::{
     qgemv_q4k_paired, qgemv_q4k_paired_dispatch, Q4KPairedGgml, Q4KPairedShape,
 };
 pub use qmatmul::qmatmul_with_epilogue;
-pub use qmatmul_workgroup::{qgemv_workgroup_with_epilogue, qmatmul_workgroup_with_epilogues};
+pub use qmatmul_workgroup::{
+    qgemv_workgroup_f16_with_epilogue, qgemv_workgroup_storage_f16_with_epilogue,
+    qgemv_workgroup_with_epilogue, qmatmul_workgroup_f16_with_epilogues,
+    qmatmul_workgroup_storage_f16_with_epilogues, qmatmul_workgroup_with_epilogues,
+};
 pub use quantized_matrix::{quantized_matrix, quantized_matrix_for};
 pub use rms_norm::{rms_norm_vec4, RmsNormVec4};
 pub use softmax::{softmax, softmax_partials, softmax_reduce, softmax_write};

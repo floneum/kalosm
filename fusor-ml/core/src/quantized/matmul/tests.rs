@@ -332,6 +332,112 @@ mod tests {
     }
 
     #[test]
+    fn q4k_native_dequantize_matches_patterned_blocks() {
+        pollster::block_on(async {
+            let Ok(device) = Device::new().await else {
+                return;
+            };
+
+            let shape = [4usize, 4096usize];
+            let raw_bytes = patterned_q4k_bytes(shape);
+            let matrix =
+                QMatrix::from_parts(&device, &raw_bytes, shape.into(), GgmlType::Q4K).unwrap();
+            let blocks: &[BlockQ4K] = bytemuck::cast_slice(&raw_bytes);
+
+            let result = matrix
+                .dequantize::<f32>()
+                .as_slice::<2, f32>()
+                .await
+                .unwrap();
+
+            let blocks_per_row = shape[1] / BlockQ4K::BLOCK_SIZE;
+            for row in 0..shape[0] {
+                for offset in 0..shape[1] {
+                    let block = &blocks[row * blocks_per_row + offset / BlockQ4K::BLOCK_SIZE];
+                    let expected = block.dequantize();
+                    let actual = result[[row, offset]];
+                    let expected = expected.as_ref()[offset % BlockQ4K::BLOCK_SIZE];
+                    assert!(
+                        (actual - expected).abs() <= 1e-6,
+                        "row={row} offset={offset} actual={actual} expected={expected}"
+                    );
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn q4k_native_small_multirow_qmatmul_matches_one_hot_reference() {
+        pollster::block_on(async {
+            let Ok(device) = Device::new().await else {
+                return;
+            };
+
+            let weight_shape = [4usize, 4096usize];
+            let input_shape = [8usize, weight_shape[1]];
+            let selected_k = 777usize;
+            let selected_block_in_row = selected_k / BlockQ4K::BLOCK_SIZE;
+            let selected_offset = selected_k % BlockQ4K::BLOCK_SIZE;
+            let blocks_per_row = weight_shape[1] / BlockQ4K::BLOCK_SIZE;
+            let raw_bytes = patterned_q4k_bytes(weight_shape);
+            let matrix =
+                QMatrix::from_parts(&device, &raw_bytes, weight_shape.into(), GgmlType::Q4K)
+                    .unwrap();
+            let blocks: &[BlockQ4K] = bytemuck::cast_slice(&raw_bytes);
+            let selected_weights = (0..weight_shape[0])
+                .map(|row| {
+                    let block = &blocks[row * blocks_per_row + selected_block_in_row];
+                    block.dequantize().as_ref()[selected_offset]
+                })
+                .collect::<Vec<_>>();
+            let mut input_values = vec![0.0f32; input_shape.iter().product()];
+            for row in 0..input_shape[0] {
+                input_values[row * weight_shape[1] + selected_k] = 0.125 + row as f32 * 0.01;
+            }
+            let input = Tensor::from_slice::<f32>(&device, input_shape, &input_values);
+            let result = input.q_mat_mul(&matrix).as_slice::<2, f32>().await.unwrap();
+
+            assert_eq!(result.shape(), &[input_shape[0], weight_shape[0]]);
+            for row in 0..input_shape[0] {
+                let scale = input_values[row * weight_shape[1] + selected_k];
+                for col in 0..weight_shape[0] {
+                    let actual = result[[row, col]];
+                    let expected = scale * selected_weights[col];
+                    assert!(
+                        (actual - expected).abs() <= 1e-3,
+                        "row={row} col={col} actual={actual} expected={expected}"
+                    );
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn q4k_native_small_multirow_qmatmul_zero_input_produces_zero() {
+        pollster::block_on(async {
+            let Ok(device) = Device::new().await else {
+                return;
+            };
+
+            let weight_shape = [4usize, 4096usize];
+            let input_shape = [8usize, weight_shape[1]];
+            let raw_bytes = patterned_q4k_bytes(weight_shape);
+            let matrix =
+                QMatrix::from_parts(&device, &raw_bytes, weight_shape.into(), GgmlType::Q4K)
+                    .unwrap();
+            let input_values = vec![0.0f32; input_shape.iter().product()];
+            let input = Tensor::from_slice::<f32>(&device, input_shape, &input_values);
+
+            let result = input.q_mat_mul(&matrix).as_slice::<2, f32>().await.unwrap();
+
+            assert_eq!(result.shape(), &[input_shape[0], weight_shape[0]]);
+            for value in result.as_slice() {
+                assert_eq!(*value, 0.0);
+            }
+        });
+    }
+
+    #[test]
     fn q4k_multirow_qmatmul_large_grid_matches_one_hot_reference() {
         pollster::block_on(async {
             let Ok(device) = Device::new().await else {

@@ -24,13 +24,13 @@ impl<'a> Lowerer<'a> {
             high: a_high,
             sums,
         } = activations;
-        if matrix.format != GgmlQuantFormat::Q4K
+        if !matrix.format.is_q4k_family()
             || a_low.len() != 16
             || a_high.len() != 16
             || sums.len() != 4
         {
             return Err(LowerError::UnsupportedOperation(
-                "q4k ggml dot requires Q4K, 16 low/high activations, and 4 sums",
+                "q4k ggml dot requires a Q4K format, 16 low/high activations, and 4 sums",
             ));
         }
         let GgmlBlockCoords {
@@ -40,14 +40,25 @@ impl<'a> Lowerer<'a> {
             col,
         } = coords;
 
-        let base = self.quantized_block_base(expressions, matrix, block, col, 37, body);
-        let d = self.load_word_f32(expressions, matrix, base, 0, body)?;
-        let dmin = self.load_word_f32(expressions, matrix, base, 1, body)?;
+        let base = self.quantized_block_base(
+            expressions,
+            matrix,
+            block,
+            col,
+            matrix.format.block_words(),
+            body,
+        );
+        let (d, dmin) = self.q4k_load_d_dmin(expressions, matrix, base, body)?;
+        let (scale_offset, min_offset, extra_offset) = match matrix.format {
+            GgmlQuantFormat::Q4K => (2, 3, 4),
+            GgmlQuantFormat::Q4KNative => (1, 2, 3),
+            _ => unreachable!("q4k family checked above"),
+        };
 
         let scale_shift = self.shl_lit(expressions, body, iq, 4);
-        let sc0 = self.load_word(expressions, matrix, base, 2, body)?;
-        let sc1 = self.load_word(expressions, matrix, base, 3, body)?;
-        let sc2 = self.load_word(expressions, matrix, base, 4, body)?;
+        let sc0 = self.load_word(expressions, matrix, base, scale_offset, body)?;
+        let sc1 = self.load_word(expressions, matrix, base, min_offset, body)?;
+        let sc2 = self.load_word(expressions, matrix, base, extra_offset, body)?;
         let sc0 = self.shr(expressions, body, sc0, scale_shift);
         let sc1 = self.shr(expressions, body, sc1, scale_shift);
         let sc2 = self.shr(expressions, body, sc2, scale_shift);
@@ -100,12 +111,13 @@ impl<'a> Lowerer<'a> {
         } else {
             Self::q4k_ggml_accumulate_word_scalar
         };
+        let data_base = self.q4k_data_word_offset(matrix.format)?;
         for j in 0..2 {
-            let word_off = self.add_lit(expressions, body, data_offset, 5 + j as u32);
+            let word_off = self.add_lit(expressions, body, data_offset, data_base + j as u32);
             let word = self.load_word_dynamic(expressions, matrix, base, word_off, body)?;
             accumulate(self, expressions, body, word, a_low, j, &mut first_sums);
 
-            let word_off = self.add_lit(expressions, body, data_offset, 21 + j as u32);
+            let word_off = self.add_lit(expressions, body, data_offset, data_base + 16 + j as u32);
             let word = self.load_word_dynamic(expressions, matrix, base, word_off, body)?;
             accumulate(self, expressions, body, word, a_high, j, &mut second_sums);
         }
@@ -156,9 +168,9 @@ impl<'a> Lowerer<'a> {
         a: &[Handle<Expression>],
         body: &mut Block,
     ) -> Result<Handle<Expression>, LowerError> {
-        if matrix.format != GgmlQuantFormat::Q6K || a.len() != 16 {
+        if !matrix.format.is_q6k_family() || a.len() != 16 {
             return Err(LowerError::UnsupportedOperation(
-                "q6k ggml dot requires Q6K and 16 activations",
+                "q6k ggml dot requires a Q6K format and 16 activations",
             ));
         }
         let GgmlBlockCoords {
@@ -168,8 +180,15 @@ impl<'a> Lowerer<'a> {
             col,
         } = coords;
 
-        let base = self.quantized_block_base(expressions, matrix, block, col, 53, body);
-        let d = self.load_word_f32(expressions, matrix, base, 52, body)?;
+        let base = self.quantized_block_base(
+            expressions,
+            matrix,
+            block,
+            col,
+            matrix.format.block_words(),
+            body,
+        );
+        let d = self.q6k_load_d(expressions, matrix, base, body)?;
 
         let l0 = self.shl_lit(expressions, body, il, 2);
         let low_base = self.shl_lit(expressions, body, ip, 6);
@@ -292,9 +311,9 @@ impl<'a> Lowerer<'a> {
         a: &Q8ActivationPacks,
         body: &mut Block,
     ) -> Result<Handle<Expression>, LowerError> {
-        if matrix.format != GgmlQuantFormat::Q6K {
+        if !matrix.format.is_q6k_family() {
             return Err(LowerError::UnsupportedOperation(
-                "q6k x q8 activation dot only supports Q6K",
+                "q6k x q8 activation dot only supports Q6K formats",
             ));
         }
 
@@ -559,9 +578,15 @@ impl<'a> Lowerer<'a> {
         col: Handle<Expression>,
         body: &mut Block,
     ) -> Result<Q4KBlockParts, LowerError> {
-        let base = self.quantized_block_base(expressions, matrix, block, col, 37, body);
-        let d = self.load_word_f32(expressions, matrix, base, 0, body)?;
-        let dmin = self.load_word_f32(expressions, matrix, base, 1, body)?;
+        let base = self.quantized_block_base(
+            expressions,
+            matrix,
+            block,
+            col,
+            matrix.format.block_words(),
+            body,
+        );
+        let (d, dmin) = self.q4k_load_d_dmin(expressions, matrix, base, body)?;
         let group = self.shr_lit(expressions, body, q_base, 5);
         let (scale_byte, min_byte) =
             self.q4k_scale_min_bytes(expressions, matrix, base, group, body)?;
@@ -604,9 +629,10 @@ impl<'a> Lowerer<'a> {
             self.shr_lit(expressions, body, byte_index, 2)
         };
 
+        let data_base = self.q4k_data_word_offset(matrix.format)?;
         let mut offsets = Vec::with_capacity(WORDS);
         for word in 0..WORDS {
-            offsets.push(self.add_lit(expressions, body, data_word, 5 + word as u32));
+            offsets.push(self.add_lit(expressions, body, data_word, data_base + word as u32));
         }
 
         let mut words = Vec::with_capacity(WORDS);

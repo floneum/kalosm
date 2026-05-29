@@ -627,7 +627,11 @@ impl Tensor {
         bias: Option<&Tensor>,
         eps: f32,
     ) -> Option<Self> {
-        if self.datatype() != DataTypeEnum::F32 {
+        if !matches!(self.datatype(), DataTypeEnum::F32 | DataTypeEnum::F16)
+            || self.datatype() != weight.datatype()
+            || bias.is_some_and(|bias| bias.datatype() != self.datatype())
+            || (self.datatype() == DataTypeEnum::F16 && !self.device().f16_supported())
+        {
             return None;
         }
         let operation = RmsNormOperation::new(
@@ -647,7 +651,13 @@ impl Tensor {
         bias: Option<&Tensor>,
         eps: f32,
     ) -> Option<Self> {
-        if self.datatype() != DataTypeEnum::F32 || self.shape() != residual.shape() {
+        if !matches!(self.datatype(), DataTypeEnum::F32 | DataTypeEnum::F16)
+            || self.shape() != residual.shape()
+            || residual.datatype() != self.datatype()
+            || weight.datatype() != self.datatype()
+            || bias.is_some_and(|bias| bias.datatype() != self.datatype())
+            || (self.datatype() == DataTypeEnum::F16 && !self.device().f16_supported())
+        {
             return None;
         }
         let operation = RmsNormOperation::new_with_residual(

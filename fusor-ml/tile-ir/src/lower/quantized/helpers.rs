@@ -43,6 +43,171 @@ impl<'a> Lowerer<'a> {
         Ok(self.bitcast_f32(e, body, word))
     }
 
+    pub(in crate::lower) fn load_f16_pair_word_f32(
+        &self,
+        e: &mut Arena<Expression>,
+        matrix: &QuantizedMatrix,
+        base: Handle<Expression>,
+        offset: u32,
+        body: &mut Block,
+    ) -> Result<(Handle<Expression>, Handle<Expression>), LowerError> {
+        let word = self.load_word(e, matrix, base, offset, body)?;
+        let pair = self.math1(e, body, MathFunction::Unpack2x16float, word);
+        let low = self.vec4_component(e, body, pair, 0);
+        let high = self.vec4_component(e, body, pair, 1);
+        Ok((low, high))
+    }
+
+    pub(in crate::lower) fn load_f16_low_word_f32(
+        &self,
+        e: &mut Arena<Expression>,
+        matrix: &QuantizedMatrix,
+        base: Handle<Expression>,
+        offset: u32,
+        body: &mut Block,
+    ) -> Result<Handle<Expression>, LowerError> {
+        Ok(self
+            .load_f16_pair_word_f32(e, matrix, base, offset, body)?
+            .0)
+    }
+
+    pub(in crate::lower) fn load_affine_scale_f32(
+        &self,
+        e: &mut Arena<Expression>,
+        matrix: &QuantizedMatrix,
+        base: Handle<Expression>,
+        offset: u32,
+        body: &mut Block,
+    ) -> Result<Handle<Expression>, LowerError> {
+        match matrix.format {
+            GgmlQuantFormat::Q4_0Native
+            | GgmlQuantFormat::Q5_0Native
+            | GgmlQuantFormat::Q8_0Native => {
+                self.load_f16_low_word_f32(e, matrix, base, offset, body)
+            }
+            _ => self.load_word_f32(e, matrix, base, offset, body),
+        }
+    }
+
+    pub(in crate::lower) fn q4k_data_word_offset(
+        &self,
+        format: GgmlQuantFormat,
+    ) -> Result<u32, LowerError> {
+        match format {
+            GgmlQuantFormat::Q4K => Ok(5),
+            GgmlQuantFormat::Q4KNative => Ok(4),
+            _ => Err(LowerError::UnsupportedOperation(
+                "q4k storage offsets require a Q4K format",
+            )),
+        }
+    }
+
+    fn q4k_scale_word_offsets(
+        &self,
+        format: GgmlQuantFormat,
+    ) -> Result<(u32, u32, u32), LowerError> {
+        match format {
+            GgmlQuantFormat::Q4K => Ok((2, 3, 4)),
+            GgmlQuantFormat::Q4KNative => Ok((1, 2, 3)),
+            _ => Err(LowerError::UnsupportedOperation(
+                "q4k scale offsets require a Q4K format",
+            )),
+        }
+    }
+
+    pub(in crate::lower) fn q4k_load_d_dmin(
+        &self,
+        e: &mut Arena<Expression>,
+        matrix: &QuantizedMatrix,
+        base: Handle<Expression>,
+        body: &mut Block,
+    ) -> Result<(Handle<Expression>, Handle<Expression>), LowerError> {
+        match matrix.format {
+            GgmlQuantFormat::Q4K => Ok((
+                self.load_word_f32(e, matrix, base, 0, body)?,
+                self.load_word_f32(e, matrix, base, 1, body)?,
+            )),
+            GgmlQuantFormat::Q4KNative => self.load_f16_pair_word_f32(e, matrix, base, 0, body),
+            _ => Err(LowerError::UnsupportedOperation(
+                "q4k d/dmin load requires a Q4K format",
+            )),
+        }
+    }
+
+    pub(in crate::lower) fn q5k_data_word_offset(
+        &self,
+        format: GgmlQuantFormat,
+    ) -> Result<u32, LowerError> {
+        match format {
+            GgmlQuantFormat::Q5K => Ok(13),
+            GgmlQuantFormat::Q5KNative => Ok(12),
+            _ => Err(LowerError::UnsupportedOperation(
+                "q5k storage offsets require a Q5K format",
+            )),
+        }
+    }
+
+    pub(in crate::lower) fn q5k_qh_word_offset(
+        &self,
+        format: GgmlQuantFormat,
+    ) -> Result<u32, LowerError> {
+        match format {
+            GgmlQuantFormat::Q5K => Ok(5),
+            GgmlQuantFormat::Q5KNative => Ok(4),
+            _ => Err(LowerError::UnsupportedOperation(
+                "q5k qh offset requires a Q5K format",
+            )),
+        }
+    }
+
+    fn q5k_scale_word_offsets(
+        &self,
+        format: GgmlQuantFormat,
+    ) -> Result<(u32, u32, u32), LowerError> {
+        match format {
+            GgmlQuantFormat::Q5K => Ok((2, 3, 4)),
+            GgmlQuantFormat::Q5KNative => Ok((1, 2, 3)),
+            _ => Err(LowerError::UnsupportedOperation(
+                "q5k scale offsets require a Q5K format",
+            )),
+        }
+    }
+
+    pub(in crate::lower) fn q5k_load_d_dmin(
+        &self,
+        e: &mut Arena<Expression>,
+        matrix: &QuantizedMatrix,
+        base: Handle<Expression>,
+        body: &mut Block,
+    ) -> Result<(Handle<Expression>, Handle<Expression>), LowerError> {
+        match matrix.format {
+            GgmlQuantFormat::Q5K => Ok((
+                self.load_word_f32(e, matrix, base, 0, body)?,
+                self.load_word_f32(e, matrix, base, 1, body)?,
+            )),
+            GgmlQuantFormat::Q5KNative => self.load_f16_pair_word_f32(e, matrix, base, 0, body),
+            _ => Err(LowerError::UnsupportedOperation(
+                "q5k d/dmin load requires a Q5K format",
+            )),
+        }
+    }
+
+    pub(in crate::lower) fn q6k_load_d(
+        &self,
+        e: &mut Arena<Expression>,
+        matrix: &QuantizedMatrix,
+        base: Handle<Expression>,
+        body: &mut Block,
+    ) -> Result<Handle<Expression>, LowerError> {
+        match matrix.format {
+            GgmlQuantFormat::Q6K => self.load_word_f32(e, matrix, base, 52, body),
+            GgmlQuantFormat::Q6KNative => self.load_f16_low_word_f32(e, matrix, base, 52, body),
+            _ => Err(LowerError::UnsupportedOperation(
+                "q6k d load requires a Q6K format",
+            )),
+        }
+    }
+
     pub(in crate::lower) fn load_word_dynamic(
         &self,
         e: &mut Arena<Expression>,
@@ -94,11 +259,19 @@ impl<'a> Lowerer<'a> {
     ) -> Result<Handle<Expression>, LowerError> {
         let high = self.cmp_lit(e, body, BinaryOperator::GreaterEqual, group, 4);
         let lane = self.and_lit(e, body, group, 3);
-        let low_word = self.load_word(e, matrix, base, if min { 3 } else { 2 }, body)?;
+        let (scale_offset, min_offset, extra_offset) =
+            self.q5k_scale_word_offsets(matrix.format)?;
+        let low_word = self.load_word(
+            e,
+            matrix,
+            base,
+            if min { min_offset } else { scale_offset },
+            body,
+        )?;
         let low_byte = self.byte_at(e, body, low_word, lane);
         let low_scale = self.and_lit(e, body, low_byte, 0x3f);
 
-        let extra_word = self.load_word(e, matrix, base, 4, body)?;
+        let extra_word = self.load_word(e, matrix, base, extra_offset, body)?;
         let extra_byte = self.byte_at(e, body, extra_word, lane);
         let lsb = if min {
             let shifted = self.shr_lit(e, body, extra_byte, 4);
@@ -122,10 +295,12 @@ impl<'a> Lowerer<'a> {
     ) -> Result<(Handle<Expression>, Handle<Expression>), LowerError> {
         let high = self.cmp_lit(e, body, BinaryOperator::GreaterEqual, group, 4);
         let lane = self.and_lit(e, body, group, 3);
+        let (scale_offset, min_offset, extra_offset) =
+            self.q4k_scale_word_offsets(matrix.format)?;
 
-        let scale_word = self.load_word(e, matrix, base, 2, body)?;
-        let min_word = self.load_word(e, matrix, base, 3, body)?;
-        let extra_word = self.load_word(e, matrix, base, 4, body)?;
+        let scale_word = self.load_word(e, matrix, base, scale_offset, body)?;
+        let min_word = self.load_word(e, matrix, base, min_offset, body)?;
+        let extra_word = self.load_word(e, matrix, base, extra_offset, body)?;
 
         let scale_low_byte = self.byte_at(e, body, scale_word, lane);
         let min_low_byte = self.byte_at(e, body, min_word, lane);

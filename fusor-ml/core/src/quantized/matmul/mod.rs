@@ -17,7 +17,8 @@ use crate::{
         operation::Operation,
         tile_direct::{
             flatten_matrix_layout, tile_storage_read_with_direct_layout,
-            tile_storage_write_with_direct_layout,
+            tile_storage_read_with_direct_layout_typed, tile_storage_write_with_direct_layout,
+            tile_storage_write_with_direct_layout_typed,
         },
         workgroup_shape::{Constraint, WorkgroupShapeConstraints},
     },
@@ -29,7 +30,9 @@ use fusor_tile_ir as tile_ir;
 use fusor_tile_ir_kernels as tile_ir_kernels;
 use rustc_hash::FxHasher;
 
-use super::{QMatMulDirectPipelineKey, QMatrix, dequantize::DequantizeOperation};
+use super::{
+    QMatMulDirectPipelineKey, QMatrix, QMatrixStorageLayout, dequantize::DequantizeOperation,
+};
 
 mod kernel;
 mod paired;
@@ -137,7 +140,7 @@ struct QMatmulPairedKernelVariant;
 struct QMatmulPairedExtrasKernelVariant;
 struct QMatmulPairedDenseFallbackKernelVariant;
 
-const QMATMUL_DIRECT_KERNEL_GENERATION: u64 = 0x514D_4154_4D49_5831;
+const QMATMUL_DIRECT_KERNEL_GENERATION: u64 = 0x514D_4154_4D49_5832;
 
 #[derive(Clone, Copy, Debug)]
 struct QMatmulDirectCtx {
@@ -160,7 +163,7 @@ fn qmatmul_direct_selector() -> ShapeSelector<3, QMatmulDirectCtx, QMatmulPath> 
                 .axis(QMAT_M, eq(1))
                 .axis(QMAT_K, range(0..=1024))
                 .axis(QMAT_N, range(0..=4096))
-                .when_ctx(|ctx: &QMatmulDirectCtx| ctx.format == tile_ir::GgmlQuantFormat::Q5_0),
+                .when_ctx(|ctx: &QMatmulDirectCtx| ctx.format.is_q5_0_family()),
         )
         .rule(QMatmulPath::SingleRow, ShapeRule::new().axis(QMAT_M, eq(1)))
         .rule(
@@ -170,7 +173,7 @@ fn qmatmul_direct_selector() -> ShapeSelector<3, QMatmulDirectCtx, QMatmulPath> 
                 .axis(QMAT_K, range(0..=1024))
                 .axis(QMAT_N, multiple_of(128))
                 .when(|shape: KernelShape<3>, ctx: &QMatmulDirectCtx, caps| {
-                    ctx.format == tile_ir::GgmlQuantFormat::Q8_0
+                    ctx.format.is_q8_0_family()
                         && shape[QMAT_N] >= 8192
                         && caps.max_compute_invocations_per_workgroup >= 512
                         && caps.max_compute_workgroup_storage_size >= 32 * 1024
@@ -212,8 +215,7 @@ fn qmatmul_direct_selector() -> ShapeSelector<3, QMatmulDirectCtx, QMatmulPath> 
                 .axis(QMAT_N, multiple_of(64))
                 .when(
                     |shape: KernelShape<3>, ctx: &QMatmulDirectCtx, caps: KernelDeviceCaps| {
-                        ctx.format != tile_ir::GgmlQuantFormat::Q4K
-                            && qmatmul_coop_rule_supported(shape, ctx, caps)
+                        !ctx.format.is_q4k_family() && qmatmul_coop_rule_supported(shape, ctx, caps)
                     },
                 ),
         )
@@ -225,8 +227,7 @@ fn qmatmul_direct_selector() -> ShapeSelector<3, QMatmulDirectCtx, QMatmulPath> 
                 .axis(QMAT_N, multiple_of(32))
                 .when(
                     |shape: KernelShape<3>, ctx: &QMatmulDirectCtx, caps: KernelDeviceCaps| {
-                        ctx.format == tile_ir::GgmlQuantFormat::Q4K
-                            && qmatmul_coop_rule_supported(shape, ctx, caps)
+                        ctx.format.is_q4k_family() && qmatmul_coop_rule_supported(shape, ctx, caps)
                     },
                 ),
         )
@@ -535,16 +536,34 @@ impl QmatmulExtraStorage {
 
 fn qmatrix_direct_quant_format(matrix: &QMatrix) -> Option<tile_ir::GgmlQuantFormat> {
     Some(match matrix.datatype() {
+        GgmlType::Q4_0 if matrix.storage_layout() == QMatrixStorageLayout::Native => {
+            tile_ir::GgmlQuantFormat::Q4_0Native
+        }
         GgmlType::Q4_0 => tile_ir::GgmlQuantFormat::Q4_0,
         GgmlType::Q4_1 => tile_ir::GgmlQuantFormat::Q4_1,
+        GgmlType::Q5_0 if matrix.storage_layout() == QMatrixStorageLayout::Native => {
+            tile_ir::GgmlQuantFormat::Q5_0Native
+        }
         GgmlType::Q5_0 => tile_ir::GgmlQuantFormat::Q5_0,
         GgmlType::Q5_1 => tile_ir::GgmlQuantFormat::Q5_1,
+        GgmlType::Q8_0 if matrix.storage_layout() == QMatrixStorageLayout::Native => {
+            tile_ir::GgmlQuantFormat::Q8_0Native
+        }
         GgmlType::Q8_0 => tile_ir::GgmlQuantFormat::Q8_0,
         GgmlType::Q8_1 => tile_ir::GgmlQuantFormat::Q8_1,
         GgmlType::Q2K => tile_ir::GgmlQuantFormat::Q2K,
         GgmlType::Q3K => tile_ir::GgmlQuantFormat::Q3K,
+        GgmlType::Q4K if matrix.storage_layout() == QMatrixStorageLayout::Native => {
+            tile_ir::GgmlQuantFormat::Q4KNative
+        }
         GgmlType::Q4K => tile_ir::GgmlQuantFormat::Q4K,
+        GgmlType::Q5K if matrix.storage_layout() == QMatrixStorageLayout::Native => {
+            tile_ir::GgmlQuantFormat::Q5KNative
+        }
         GgmlType::Q5K => tile_ir::GgmlQuantFormat::Q5K,
+        GgmlType::Q6K if matrix.storage_layout() == QMatrixStorageLayout::Native => {
+            tile_ir::GgmlQuantFormat::Q6KNative
+        }
         GgmlType::Q6K => tile_ir::GgmlQuantFormat::Q6K,
         GgmlType::Q8K => tile_ir::GgmlQuantFormat::Q8K,
         GgmlType::F16 | GgmlType::F32 => return None,
@@ -678,39 +697,39 @@ fn tile_cooperative_store_layout_supported(layout: &tile_ir::Layout) -> bool {
 /// Each branch below corresponds to one rule of the former `QgemvColsVariant`
 /// selector — collapsed to its numeric value here.
 fn qgemv_cols_per_workgroup_for_direct(format: tile_ir::GgmlQuantFormat, k: u32, n: u32) -> u32 {
-    use tile_ir::GgmlQuantFormat::{Q4K, Q5_0, Q6K, Q8_0};
     // Q4K specializations.
-    if format == Q4K && k <= 4096 && (4096..8192).contains(&n) {
+    if format.is_q4k_family() && k <= 4096 && (4096..8192).contains(&n) {
         return 4; // was Q4KSmallWide4
     }
-    if format == Q4K && k <= 4096 && n >= 8192 {
+    if format.is_q4k_family() && k <= 4096 && n >= 8192 {
         return 8; // was Q4KSmallWide8
     }
-    if format == Q4K && n <= 4096 && k > 4096 {
+    if format.is_q4k_family() && n <= 4096 && k > 4096 {
         return 8; // was Q4KLargeNarrow8
     }
     // Q6K specializations.
-    if format == Q6K && k <= 4096 && n >= 8192 {
+    if format.is_q6k_family() && k <= 4096 && n >= 8192 {
         return 8; // was Q6KSmallWide8
     }
-    if format == Q6K && n <= 4096 && k > 4096 {
+    if format.is_q6k_family() && n <= 4096 && k > 4096 {
         return 4; // was Q6KLargeNarrow4
     }
     // Q8_0 wide.
-    if format == Q8_0 && k <= 1024 && n >= 8192 {
+    if format.is_q8_0_family() && k <= 1024 && n >= 8192 {
         return 32; // was Q8WideAccelerated32
     }
     // FormatAccelerated: Q5_0 mid (K,N both 2048..=4096), Q4K/Q6K general,
     // or Q5_0 large (K*N >= 4M). Delegates to the format-aware helper.
-    let q5_mid = format == Q5_0 && (2048..=4096).contains(&k) && (2048..=4096).contains(&n);
-    let q5_large = format == Q5_0
+    let q5_mid =
+        format.is_q5_0_family() && (2048..=4096).contains(&k) && (2048..=4096).contains(&n);
+    let q5_large = format.is_q5_0_family()
         && (k as u64)
             .checked_mul(n as u64)
             .is_some_and(|elements| elements >= 4 * 1024 * 1024);
-    if q5_mid || format == Q4K || format == Q6K || q5_large {
+    if q5_mid || format.is_q4k_family() || format.is_q6k_family() || q5_large {
         return tile_ir_kernels::qgemv_cols_per_workgroup_for_shape(format, k, n);
     }
-    if format == Q5_0 && k <= 1024 && n <= 4096 {
+    if format.is_q5_0_family() && k <= 1024 && n <= 4096 {
         return 8; // was Q5Small8
     }
     4 // was Default4
@@ -750,13 +769,7 @@ fn qmatmul_m_pad_target(m: usize, n: usize) -> Option<usize> {
 impl Tensor {
     pub fn q_mat_mul(&self, other: &QMatrix) -> Self {
         match self.datatype() {
-            DataTypeEnum::F16 => {
-                return self
-                    .cast_to(DataTypeEnum::F32)
-                    .q_mat_mul(other)
-                    .cast_to(DataTypeEnum::F16);
-            }
-            DataTypeEnum::F32 => {}
+            DataTypeEnum::F16 | DataTypeEnum::F32 => {}
             DataTypeEnum::U32 => panic!("q_mat_mul requires f32/f16 tensors"),
         }
 

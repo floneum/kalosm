@@ -149,7 +149,7 @@ pub(crate) fn qgemv_tile_with_epilogue(
     let tensors = QgemvTensors { a, b, y };
 
     match b.format {
-        GgmlQuantFormat::Q8_0 => {
+        GgmlQuantFormat::Q8_0 | GgmlQuantFormat::Q8_0Native => {
             if b.cols >= 8192 {
                 return qgemv_perf_with_epilogue::<128>(
                     program,
@@ -177,7 +177,7 @@ pub(crate) fn qgemv_tile_with_epilogue(
             qgemv_shape(128, 4, 4),
             8,
         ),
-        GgmlQuantFormat::Q4K => {
+        GgmlQuantFormat::Q4K | GgmlQuantFormat::Q4KNative => {
             if b.rows <= 4096 && b.cols >= 4096 && b.cols < 8192 {
                 let shape = q4k_mid_override(q4k_default_mid(b.rows, b.cols));
                 return qgemv_q4k_dispatch_with_epilogue(program, shape, tensors, workgroups_x, ep);
@@ -219,7 +219,7 @@ pub(crate) fn qgemv_tile_with_epilogue(
                 8,
             )
         }
-        GgmlQuantFormat::Q5_0 => qgemv_perf_with_epilogue::<64>(
+        GgmlQuantFormat::Q5_0 | GgmlQuantFormat::Q5_0Native => qgemv_perf_with_epilogue::<64>(
             program,
             tensors,
             workgroups_x,
@@ -228,6 +228,7 @@ pub(crate) fn qgemv_tile_with_epilogue(
             16,
         ),
         GgmlQuantFormat::Q4_0
+        | GgmlQuantFormat::Q4_0Native
         | GgmlQuantFormat::Q4_1
         | GgmlQuantFormat::Q5_1
         | GgmlQuantFormat::Q2K => qgemv_perf_with_epilogue::<64>(
@@ -246,7 +247,7 @@ pub(crate) fn qgemv_tile_with_epilogue(
             qgemv_shape(64, 2, 2),
             8,
         ),
-        GgmlQuantFormat::Q5K => qgemv_perf_with_epilogue::<64>(
+        GgmlQuantFormat::Q5K | GgmlQuantFormat::Q5KNative => qgemv_perf_with_epilogue::<64>(
             program,
             tensors,
             workgroups_x,
@@ -254,7 +255,7 @@ pub(crate) fn qgemv_tile_with_epilogue(
             qgemv_shape(64, 2, 1),
             8,
         ),
-        GgmlQuantFormat::Q6K => {
+        GgmlQuantFormat::Q6K | GgmlQuantFormat::Q6KNative => {
             if b.rows <= 4096 && b.cols >= 8192 {
                 let shape = q6k_large_override(q6k_default_large(b.rows, b.cols));
                 return qgemv_q6k_dispatch_with_epilogue(program, shape, tensors, workgroups_x, ep);
@@ -306,11 +307,12 @@ struct GgmlIteration<A> {
 /// All trait items are `pub(crate)`-visible only via the impls below; the
 /// `Sealed` supertrait keeps the implementer set closed to Q4K/Q6K.
 trait GgmlQuantFamily: ggml_family_sealed::Sealed {
-    const FORMAT: GgmlQuantFormat;
     /// `block_iterations = block_count.div_ceil(BLOCK_DIV)` — 4 for Q4K, 2 for Q6K.
     const BLOCK_DIV: u32;
     type Lane;
     type Activations: Clone;
+
+    fn supports_format(format: GgmlQuantFormat) -> bool;
 
     fn lane_decomposition(lane: &Tile<U32>) -> Self::Lane;
 
@@ -337,10 +339,13 @@ trait GgmlQuantFamily: ggml_family_sealed::Sealed {
 enum Q4KFamily {}
 impl ggml_family_sealed::Sealed for Q4KFamily {}
 impl GgmlQuantFamily for Q4KFamily {
-    const FORMAT: GgmlQuantFormat = GgmlQuantFormat::Q4K;
     const BLOCK_DIV: u32 = 4;
     type Lane = Q4KLane;
     type Activations = Q4KActivations;
+
+    fn supports_format(format: GgmlQuantFormat) -> bool {
+        format.is_q4k_family()
+    }
 
     fn lane_decomposition(lane: &Tile<U32>) -> Self::Lane {
         q4k_lane_decomposition(lane)
@@ -396,10 +401,13 @@ impl GgmlQuantFamily for Q4KFamily {
 enum Q6KFamily {}
 impl ggml_family_sealed::Sealed for Q6KFamily {}
 impl GgmlQuantFamily for Q6KFamily {
-    const FORMAT: GgmlQuantFormat = GgmlQuantFormat::Q6K;
     const BLOCK_DIV: u32 = 2;
     type Lane = Q6KLane;
     type Activations = [Tile<F32>; 16];
+
+    fn supports_format(format: GgmlQuantFormat) -> bool {
+        format.is_q6k_family()
+    }
 
     fn lane_decomposition(lane: &Tile<U32>) -> Self::Lane {
         q6k_lane_decomposition(lane)
@@ -467,7 +475,7 @@ fn qgemv_ggml_with_epilogue<F: GgmlQuantFamily, const BLOCK: usize>(
     let cols_per_subgroup = shape.cols_per_subgroup;
     debug_assert_eq!(shape.block, BLOCK as u32);
     debug_assert_eq!(subgroups * SUBGROUP_SIZE, BLOCK as u32);
-    debug_assert_eq!(b.format, F::FORMAT);
+    debug_assert!(F::supports_format(b.format));
 
     let [_, k] = matrix_shape(&a.view().layout);
     let grid = qgemv_grid(subgroups, cols_per_subgroup, b.cols, workgroups_x);
@@ -579,7 +587,7 @@ fn qgemv_perf_with_epilogue<const BLOCK: usize>(
     let k_size = k;
     let full_k_iterations = k.is_multiple_of(k_per_iter);
     let b_cloned = b.clone();
-    let q6k_vocab_f32_dot = b.format == GgmlQuantFormat::Q6K && b.rows <= 4096 && b.cols >= 65_536;
+    let q6k_vocab_f32_dot = b.format.is_q6k_family() && b.rows <= 4096 && b.cols >= 65_536;
     let cols_per_subgroup_usize = cols_per_subgroup as usize;
     program.program_grid::<BLOCK>([grid.workgroups_x, grid.dispatch_y, 1], |program| {
         let scope = qgemv_program_scope(program, grid, cols_per_subgroup);
@@ -626,7 +634,7 @@ fn qgemv_perf_with_epilogue<const BLOCK: usize>(
                     .map(|c| {
                         let col = col0.clone() + c;
                         let mask = grid.mask(full_k_iterations, in_bounds_k.clone(), &col);
-                        if b_cloned.format == GgmlQuantFormat::Q8_0
+                        if b_cloned.format.is_q8_0_family()
                             && values_per_lane == 8
                             && grid.n_cols >= 8192
                         {
@@ -639,7 +647,7 @@ fn qgemv_perf_with_epilogue<const BLOCK: usize>(
                                 0.0,
                             ));
                         }
-                        if b_cloned.format == GgmlQuantFormat::Q4K
+                        if b_cloned.format.is_q4k_family()
                             && (values_per_lane == 8
                                 || values_per_lane == 16
                                 || values_per_lane == 32)
@@ -653,7 +661,7 @@ fn qgemv_perf_with_epilogue<const BLOCK: usize>(
                                 0.0,
                             ));
                         }
-                        if b_cloned.format == GgmlQuantFormat::Q6K && values_per_lane == 8 {
+                        if b_cloned.format.is_q6k_family() && values_per_lane == 8 {
                             return program.quantized_dot(QuantizedDot::f32_activations_vec(
                                 a_bound.clone(),
                                 &b_cloned,
@@ -663,7 +671,7 @@ fn qgemv_perf_with_epilogue<const BLOCK: usize>(
                                 0.0,
                             ));
                         }
-                        if b_cloned.format == GgmlQuantFormat::Q6K && !q6k_vocab_f32_dot {
+                        if b_cloned.format.is_q6k_family() && !q6k_vocab_f32_dot {
                             return program.quantized_dot(QuantizedDot::q8_activations_vec(
                                 a_bound.clone(),
                                 &b_cloned,

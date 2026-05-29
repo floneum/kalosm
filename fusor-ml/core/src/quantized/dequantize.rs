@@ -15,9 +15,37 @@ use crate::{
     nary_wise::UnaryFunctionChain,
 };
 
-use super::QMatrix;
+use super::{QMatrix, QMatrixStorageLayout};
 
 struct DequantizeDirectKernelVariant;
+
+fn emit_qdequantize_kernel(
+    kb: &mut tile_ir::KernelBuilder<std::sync::Arc<wgpu::Buffer>>,
+    matrix_buffer: std::sync::Arc<wgpu::Buffer>,
+    output_buffer: std::sync::Arc<wgpu::Buffer>,
+    output_layout: tile_ir::Layout,
+    output_element: tile_ir::ElementType,
+    format: tile_ir::GgmlQuantFormat,
+    k: u32,
+    n: u32,
+    dispatch_x: u32,
+) -> Option<()> {
+    let q = tile_ir_kernels::quantized_matrix_for(kb, matrix_buffer, format, k, n);
+    let y = kb.write_element::<1>(
+        output_element,
+        tile_ir::KernelTensorRef::new(output_buffer, output_layout),
+    );
+    tile_ir_kernels::qdequantize(kb.program(), &q, &y, dispatch_x);
+    Some(())
+}
+
+fn datatype_element(datatype: DataTypeEnum) -> Option<tile_ir::ElementType> {
+    Some(match datatype {
+        DataTypeEnum::F32 => tile_ir::ElementType::F32,
+        DataTypeEnum::F16 => tile_ir::ElementType::F16,
+        DataTypeEnum::U32 => return None,
+    })
+}
 
 #[derive(Debug, Clone)]
 pub(crate) struct DequantizeOperation {
@@ -37,16 +65,34 @@ impl DequantizeOperation {
 
     fn direct_quant_format(&self) -> Option<tile_ir::GgmlQuantFormat> {
         Some(match self.matrix.datatype {
+            GgmlType::Q4_0 if self.matrix.storage_layout() == QMatrixStorageLayout::Native => {
+                tile_ir::GgmlQuantFormat::Q4_0Native
+            }
             GgmlType::Q4_0 => tile_ir::GgmlQuantFormat::Q4_0,
             GgmlType::Q4_1 => tile_ir::GgmlQuantFormat::Q4_1,
+            GgmlType::Q5_0 if self.matrix.storage_layout() == QMatrixStorageLayout::Native => {
+                tile_ir::GgmlQuantFormat::Q5_0Native
+            }
             GgmlType::Q5_0 => tile_ir::GgmlQuantFormat::Q5_0,
             GgmlType::Q5_1 => tile_ir::GgmlQuantFormat::Q5_1,
+            GgmlType::Q8_0 if self.matrix.storage_layout() == QMatrixStorageLayout::Native => {
+                tile_ir::GgmlQuantFormat::Q8_0Native
+            }
             GgmlType::Q8_0 => tile_ir::GgmlQuantFormat::Q8_0,
             GgmlType::Q8_1 => tile_ir::GgmlQuantFormat::Q8_1,
             GgmlType::Q2K => tile_ir::GgmlQuantFormat::Q2K,
             GgmlType::Q3K => tile_ir::GgmlQuantFormat::Q3K,
+            GgmlType::Q4K if self.matrix.storage_layout() == QMatrixStorageLayout::Native => {
+                tile_ir::GgmlQuantFormat::Q4KNative
+            }
             GgmlType::Q4K => tile_ir::GgmlQuantFormat::Q4K,
+            GgmlType::Q5K if self.matrix.storage_layout() == QMatrixStorageLayout::Native => {
+                tile_ir::GgmlQuantFormat::Q5KNative
+            }
             GgmlType::Q5K => tile_ir::GgmlQuantFormat::Q5K,
+            GgmlType::Q6K if self.matrix.storage_layout() == QMatrixStorageLayout::Native => {
+                tile_ir::GgmlQuantFormat::Q6KNative
+            }
             GgmlType::Q6K => tile_ir::GgmlQuantFormat::Q6K,
             GgmlType::Q8K => tile_ir::GgmlQuantFormat::Q8K,
             GgmlType::F16 | GgmlType::F32 => return None,
@@ -100,7 +146,10 @@ impl Operation for DequantizeOperation {
         _workgroup_shape: &crate::mir::workgroup_shape::WorkgroupShape,
         inputs: &[MirValue],
     ) -> Option<DirectKernel> {
-        if self.datatype != DataTypeEnum::F32 || !self.post_dequantize.functions.is_empty() {
+        if !matches!(self.datatype, DataTypeEnum::F32 | DataTypeEnum::F16)
+            || !self.post_dequantize.functions.is_empty()
+            || (self.datatype == DataTypeEnum::F16 && !graph.device().f16_supported())
+        {
             return None;
         }
         let [matrix, output] = inputs else {
@@ -110,7 +159,7 @@ impl Operation for DequantizeOperation {
             return None;
         };
         let output = output.as_tensor()?;
-        if output.datatype() != DataTypeEnum::F32 {
+        if output.datatype() != self.datatype {
             return None;
         }
 
@@ -147,18 +196,24 @@ impl Operation for DequantizeOperation {
             tile_ir::MemoryLevel::Storage,
             tile_ir::Shape::new([total]),
         );
+        let output_datatype = self.datatype;
         kernel_backend::run_kernel(
             graph.device().kernel_cache(),
             self.name(),
             cache_key,
             [dispatch_x, dispatch_y, 1],
             move |kb| {
-                let q = tile_ir_kernels::quantized_matrix_for(kb, matrix_buffer, format, k, n);
-                let y = kb.write::<tile_ir::F32, 1>(tile_ir::KernelTensorRef::new(
+                emit_qdequantize_kernel(
+                    kb,
+                    matrix_buffer,
                     output_buffer,
                     output_layout,
-                ));
-                tile_ir_kernels::qdequantize(kb.program(), &q, &y, dispatch_x);
+                    datatype_element(output_datatype)?,
+                    format,
+                    k,
+                    n,
+                    dispatch_x,
+                )?;
                 Some(())
             },
         )
@@ -175,20 +230,24 @@ impl QMatrix {
         T: DataType,
         f32: CastTensor<T>,
     {
-        if T::DATA_TYPE != DataTypeEnum::F32 {
+        if T::DATA_TYPE == DataTypeEnum::F16 && !self.device.f16_supported() {
             let tensor = self.dequantize::<f32>();
             return tensor.cast::<T>();
         }
 
-        // If the types already match, just return a view of the existing data
-        if self.datatype == GgmlType::F32 {
+        if matches!(self.datatype, GgmlType::F32 | GgmlType::F16) {
             let device = &self.device;
             let buffer = self.buffer.clone();
             let layout = Layout::contiguous(&self.shape);
-            let datatype = T::DATA_TYPE;
-            return Tensor::from_parts(LazyTensorData::new(TensorData::new_from_parts(
+            let datatype = match self.datatype {
+                GgmlType::F32 => DataTypeEnum::F32,
+                GgmlType::F16 => DataTypeEnum::F16,
+                _ => unreachable!("dense matrix datatype checked above"),
+            };
+            let tensor = Tensor::from_parts(LazyTensorData::new(TensorData::new_from_parts(
                 device, buffer, layout, datatype,
             )));
+            return tensor.cast_to(T::DATA_TYPE);
         }
 
         let device = self.device.clone();

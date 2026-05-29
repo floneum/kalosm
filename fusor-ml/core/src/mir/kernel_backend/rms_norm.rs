@@ -16,8 +16,8 @@ use crate::{
         kernel_backend::DirectKernel,
         operation::Operation,
         tile_direct::{
-            flatten_matrix_layout, tile_storage_read_with_direct_layout,
-            tile_storage_write_with_direct_layout,
+            flatten_matrix_layout, tile_storage_read_with_direct_layout_typed,
+            tile_storage_write_with_direct_layout_typed,
         },
         workgroup_shape::{Constraint, WorkgroupShape, WorkgroupShapeConstraints},
     },
@@ -243,11 +243,13 @@ impl Operation for RmsNormOperation {
         };
         let output = inputs.get(output_index)?.as_tensor()?;
 
-        if input.datatype() != DataTypeEnum::F32
-            || residual.is_some_and(|residual| residual.datatype() != DataTypeEnum::F32)
-            || weight.datatype() != DataTypeEnum::F32
-            || output.datatype() != DataTypeEnum::F32
-            || bias.is_some_and(|bias| bias.datatype() != DataTypeEnum::F32)
+        let storage_datatype = input.datatype();
+        if !matches!(storage_datatype, DataTypeEnum::F32 | DataTypeEnum::F16)
+            || (storage_datatype == DataTypeEnum::F16 && !graph.device().f16_supported())
+            || residual.is_some_and(|residual| residual.datatype() != storage_datatype)
+            || weight.datatype() != storage_datatype
+            || output.datatype() != storage_datatype
+            || bias.is_some_and(|bias| bias.datatype() != storage_datatype)
         {
             return None;
         }
@@ -281,9 +283,8 @@ impl Operation for RmsNormOperation {
         // post-element-wise chain; force the tile path when fusion has
         // attached one. (The tile path applies the chain inline below.)
         let post_chain_nonempty = !self.post_element_wise.functions.is_empty();
-        let vec4_meta = graph
-            .device()
-            .subgroups_supported()
+        let vec4_meta = (graph.device().subgroups_supported()
+            && storage_datatype == DataTypeEnum::F32)
             .then(|| {
                 if post_chain_nonempty {
                     return None;
@@ -407,6 +408,7 @@ impl Operation for RmsNormOperation {
                         output_view,
                         self.eps,
                         post_chain,
+                        storage_datatype,
                     )
                 },
             )
@@ -548,7 +550,43 @@ fn build_rms_norm_tile_ir(
     output_view: crate::mir::tile_direct::DirectMatrixLayout,
     eps: f32,
     post_chain: UnaryFunctionChain,
+    storage_datatype: DataTypeEnum,
 ) -> Option<tile_ir::KernelIr> {
+    match storage_datatype {
+        DataTypeEnum::F32 => build_rms_norm_tile_ir_typed::<tile_ir::F32>(
+            input_view,
+            residual_view,
+            weight,
+            bias,
+            output_view,
+            eps,
+            post_chain,
+        ),
+        DataTypeEnum::F16 => build_rms_norm_tile_ir_typed::<tile_ir::F16>(
+            input_view,
+            residual_view,
+            weight,
+            bias,
+            output_view,
+            eps,
+            post_chain,
+        ),
+        DataTypeEnum::U32 => None,
+    }
+}
+
+fn build_rms_norm_tile_ir_typed<Stor>(
+    input_view: crate::mir::tile_direct::DirectMatrixLayout,
+    residual_view: Option<crate::mir::tile_direct::DirectMatrixLayout>,
+    weight: &TensorData,
+    bias: Option<&TensorData>,
+    output_view: crate::mir::tile_direct::DirectMatrixLayout,
+    eps: f32,
+    post_chain: UnaryFunctionChain,
+) -> Option<tile_ir::KernelIr>
+where
+    Stor: tile_ir::FloatElement + tile_ir_kernels::AccumCast<tile_ir::F32>,
+{
     let rows = input_view.rows;
     let cols = input_view.cols;
     let input_storage_layout = input_view.layout.clone();
@@ -569,7 +607,7 @@ fn build_rms_norm_tile_ir(
     };
 
     Some(tile_ir::tile::build(move |phase| {
-        let input = tile_storage_read_with_direct_layout(
+        let input = tile_storage_read_with_direct_layout_typed::<Stor>(
             phase,
             crate::mir::tile_direct::DirectMatrixLayout {
                 rows,
@@ -579,7 +617,7 @@ fn build_rms_norm_tile_ir(
             },
         );
         let residual = residual_storage_layout.map(|layout| {
-            tile_storage_read_with_direct_layout(
+            tile_storage_read_with_direct_layout_typed::<Stor>(
                 phase,
                 crate::mir::tile_direct::DirectMatrixLayout {
                     rows,
@@ -589,15 +627,14 @@ fn build_rms_norm_tile_ir(
                 },
             )
         });
-        let weight =
-            phase.storage_read_with_layout_offset::<tile_ir::F32, 2>(weight_layout, weight_offset);
+        let weight = phase.storage_read_with_layout_offset::<Stor, 2>(weight_layout, weight_offset);
         let bias = bias_layout.map(|layout| {
-            phase.storage_read_with_layout_offset::<tile_ir::F32, 2>(
+            phase.storage_read_with_layout_offset::<Stor, 2>(
                 layout,
                 bias_offset.expect("bias offset exists when bias layout exists"),
             )
         });
-        let output = tile_storage_write_with_direct_layout(
+        let output = tile_storage_write_with_direct_layout_typed::<Stor>(
             phase,
             crate::mir::tile_direct::DirectMatrixLayout {
                 rows,
@@ -614,11 +651,18 @@ fn build_rms_norm_tile_ir(
             let sum_square = program.loop_reduce_sum(chunks, |program, loop_index| {
                 let reduce_col = loop_index * BLOCK as u32 + lane.clone();
                 let reduce_mask = reduce_col.clone().lt(cols);
-                let mut value =
-                    program.load(input.at((&row, &reduce_col)), reduce_mask.clone(), 0.0);
+                let mut value = Stor::into_accum(program.load(
+                    input.at((&row, &reduce_col)),
+                    reduce_mask.clone(),
+                    Stor::ZERO_STORAGE,
+                ));
                 if let Some(residual) = &residual {
-                    value =
-                        value + program.load(residual.at((&row, &reduce_col)), reduce_mask, 0.0);
+                    value = value
+                        + Stor::into_accum(program.load(
+                            residual.at((&row, &reduce_col)),
+                            reduce_mask,
+                            Stor::ZERO_STORAGE,
+                        ));
                 }
                 value.clone() * value
             });
@@ -628,14 +672,31 @@ fn build_rms_norm_tile_ir(
             for chunk in 0..chunks {
                 let col = lane.clone() + chunk * BLOCK as u32;
                 let mask = col.lt(cols);
-                let mut value = program.load(input.at((&row, &col)), mask.clone(), 0.0);
+                let mut value = Stor::into_accum(program.load(
+                    input.at((&row, &col)),
+                    mask.clone(),
+                    Stor::ZERO_STORAGE,
+                ));
                 if let Some(residual) = &residual {
-                    value = value + program.load(residual.at((&row, &col)), mask.clone(), 0.0);
+                    value = value
+                        + Stor::into_accum(program.load(
+                            residual.at((&row, &col)),
+                            mask.clone(),
+                            Stor::ZERO_STORAGE,
+                        ));
                 }
-                let weight = program.load(weight.at((0, &col)), mask.clone(), 0.0);
+                let weight = Stor::into_accum(program.load(
+                    weight.at((0, &col)),
+                    mask.clone(),
+                    Stor::ZERO_STORAGE,
+                ));
                 let mut normalized = value / rms.clone() * weight;
                 if let Some(bias) = &bias {
-                    let bias_value = program.load(bias.at((0, &col)), mask.clone(), 0.0);
+                    let bias_value = Stor::into_accum(program.load(
+                        bias.at((0, &col)),
+                        mask.clone(),
+                        Stor::ZERO_STORAGE,
+                    ));
                     normalized = normalized + bias_value;
                 }
                 // Apply any fused post-element-wise chain in-register before
@@ -647,7 +708,7 @@ fn build_rms_norm_tile_ir(
                             .expect("rms_norm post-chain validated at fuse time");
                     normalized = val;
                 }
-                program.store(output.at((&row, col)), normalized, mask);
+                program.store(output.at((&row, col)), Stor::from_accum(normalized), mask);
             }
         });
     }))

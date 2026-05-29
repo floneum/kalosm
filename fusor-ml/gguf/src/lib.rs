@@ -2331,6 +2331,21 @@ mod vec_dot_tests {
     }
 
     #[test]
+    fn test_q4_k_raw_bytes_match_native_gpu_storage() {
+        let block = BlockQ4K {
+            scale: half::f16::from_f32(0.123),
+            min: half::f16::from_f32(0.456),
+            scales: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12],
+            data: std::array::from_fn(|i| (i * 3) as u8),
+        };
+
+        assert_eq!(
+            bytemuck::bytes_of(&block),
+            block.into_gpu_storage_bytes().as_ref()
+        );
+    }
+
+    #[test]
     fn test_q5_k_vec_dot_vs_dequantize() {
         let block = BlockQ5K {
             scale: half::f16::from_f32(0.1),
@@ -2341,6 +2356,22 @@ mod vec_dot_tests {
         };
         let (act_block, dequant_acts) = q8k_test_activation();
         assert_vec_dot_matches_dequantize(&block, &act_block, &dequant_acts, 0.10, "Q5_K");
+    }
+
+    #[test]
+    fn test_q5_k_raw_bytes_match_native_gpu_storage() {
+        let block = BlockQ5K {
+            scale: half::f16::from_f32(0.123),
+            min: half::f16::from_f32(0.456),
+            scales: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12],
+            qh: std::array::from_fn(|i| i as u8),
+            qs: std::array::from_fn(|i| (i * 2) as u8),
+        };
+
+        assert_eq!(
+            bytemuck::bytes_of(&block),
+            block.into_gpu_storage_bytes().as_ref()
+        );
     }
 
     #[test]

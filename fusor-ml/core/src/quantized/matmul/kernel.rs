@@ -26,10 +26,23 @@ impl QMatMulOperation {
             pre_expr,
             post_expr,
         } = chains;
-        if input.datatype() != DataTypeEnum::F32 || output.datatype() != DataTypeEnum::F32 {
+        if input.datatype() != output.datatype() {
             return None;
         }
-        if matrix.datatype() == GgmlType::F32 {
+        let f16_storage = match input.datatype() {
+            DataTypeEnum::F32 => false,
+            DataTypeEnum::F16 if device.f16_supported() => true,
+            DataTypeEnum::F16 | DataTypeEnum::U32 => return None,
+        };
+        if f16_storage
+            && (!pre_extra_tensors.is_empty()
+                || !post_extra_tensors.is_empty()
+                || pre_expr.is_some()
+                || post_expr.is_some())
+        {
+            return None;
+        }
+        if matches!(matrix.datatype(), GgmlType::F32 | GgmlType::F16) {
             return None;
         }
         let input_rank = input.layout().shape().len();
@@ -97,7 +110,8 @@ impl QMatMulOperation {
         // Every direct variant relies on subgroup operations. Route through
         // the workgroup-tiled qmatmul/qgemv variants unless the device exposes
         // a subgroup path we trust.
-        let use_workgroup_qmatmul = !caps.subgroups_supported;
+        let use_workgroup_qmatmul = !caps.subgroups_supported || f16_storage;
+        let use_f16_workgroup_tiles = use_workgroup_qmatmul && device.f16_supported();
         let use_coop_acc_init_epilogue = !use_workgroup_qmatmul
             && pre_expr.is_none()
             && post_expr.is_some_and(qmatmul_post_expr_is_column_add)
@@ -179,8 +193,13 @@ impl QMatMulOperation {
                 0xB1A5_C001u64
             } else {
                 0
-            };
-
+            }
+            ^ if use_f16_workgroup_tiles {
+                0xF16C_A5A5u64
+            } else {
+                0
+            }
+            ^ if f16_storage { 0xF16F_0001u64 } else { 0 };
         let fast_dispatch_size = if use_workgroup_qmatmul {
             // The workgroup-tiled kernel computes its own grid inside
             // `tile::build`; skip the pre-built-pipeline fast path.
@@ -226,6 +245,7 @@ impl QMatMulOperation {
             }
             let pipeline_key = QMatMulDirectPipelineKey::new(
                 matrix.datatype(),
+                matrix.storage_layout(),
                 crate::quantized::QMatMulShape { m, k, n },
                 dispatch_size,
                 input.layout(),
@@ -283,6 +303,32 @@ impl QMatMulOperation {
         let pre_with_extras_for_ir = pre_epilogue_with_extras.clone();
         let post_with_extras_for_ir = post_epilogue_with_extras.clone();
         let ir = tile_ir::tile::build(move |phase| {
+            if f16_storage {
+                let a = tile_storage_read_with_direct_layout_typed::<tile_ir::F16>(phase, a_view);
+                let b = tile_ir_kernels::quantized_matrix(phase, format, k, n);
+                let y = tile_storage_write_with_direct_layout_typed::<tile_ir::F16>(phase, y_view);
+                let epilogues = tile_ir_kernels::QmatmulEpilogues::default();
+                if m == 1 {
+                    tile_ir_kernels::qgemv_workgroup_storage_f16_with_epilogue(
+                        phase,
+                        &a,
+                        &b,
+                        &y,
+                        &epilogues,
+                        max_workgroups,
+                    );
+                } else {
+                    tile_ir_kernels::qmatmul_workgroup_storage_f16_with_epilogues(
+                        phase,
+                        &a,
+                        &b,
+                        &y,
+                        &epilogues,
+                        max_workgroups,
+                    );
+                }
+                return;
+            }
             let a = tile_storage_read_with_direct_layout(phase, a_view);
             let b = tile_ir_kernels::quantized_matrix(phase, format, k, n);
             let pre_extra_storage_defs = pre_extra_tensors
@@ -346,23 +392,45 @@ impl QMatMulOperation {
             };
             if use_workgroup_qmatmul {
                 if m == 1 {
-                    tile_ir_kernels::qgemv_workgroup_with_epilogue(
-                        phase,
-                        &a,
-                        &b,
-                        &y,
-                        &epilogues,
-                        max_workgroups,
-                    );
+                    if use_f16_workgroup_tiles {
+                        tile_ir_kernels::qgemv_workgroup_f16_with_epilogue(
+                            phase,
+                            &a,
+                            &b,
+                            &y,
+                            &epilogues,
+                            max_workgroups,
+                        );
+                    } else {
+                        tile_ir_kernels::qgemv_workgroup_with_epilogue(
+                            phase,
+                            &a,
+                            &b,
+                            &y,
+                            &epilogues,
+                            max_workgroups,
+                        );
+                    }
                 } else {
-                    tile_ir_kernels::qmatmul_workgroup_with_epilogues(
-                        phase,
-                        &a,
-                        &b,
-                        &y,
-                        &epilogues,
-                        max_workgroups,
-                    );
+                    if use_f16_workgroup_tiles {
+                        tile_ir_kernels::qmatmul_workgroup_f16_with_epilogues(
+                            phase,
+                            &a,
+                            &b,
+                            &y,
+                            &epilogues,
+                            max_workgroups,
+                        );
+                    } else {
+                        tile_ir_kernels::qmatmul_workgroup_with_epilogues(
+                            phase,
+                            &a,
+                            &b,
+                            &y,
+                            &epilogues,
+                            max_workgroups,
+                        );
+                    }
                 }
                 return;
             }
@@ -392,6 +460,7 @@ impl QMatMulOperation {
         }
         let pipeline_key = QMatMulDirectPipelineKey::new_with_epilogue(
             matrix.datatype(),
+            matrix.storage_layout(),
             crate::quantized::QMatMulShape { m, k, n },
             epilogue_identity,
             dispatch_size,
@@ -583,7 +652,17 @@ impl Operation for QMatMulOperation {
             .iter()
             .map(|input| input.as_tensor())
             .collect::<Option<Vec<_>>>()?;
-        if input.datatype() != DataTypeEnum::F32 || output.datatype() != DataTypeEnum::F32 {
+        if input.datatype() != output.datatype()
+            || !matches!(input.datatype(), DataTypeEnum::F32 | DataTypeEnum::F16)
+        {
+            return None;
+        }
+        if input.datatype() == DataTypeEnum::F16
+            && (!pre_extra_tensors.is_empty()
+                || !post_extra_tensors.is_empty()
+                || self.pre_element_wise_expr.is_some()
+                || self.post_element_wise_expr.is_some())
+        {
             return None;
         }
         for extra in &pre_extra_tensors {
@@ -614,7 +693,7 @@ impl Operation for QMatMulOperation {
                 return None;
             }
         }
-        if matrix.datatype() == GgmlType::F32 {
+        if matches!(matrix.datatype(), GgmlType::F32 | GgmlType::F16) {
             return self.build_dense_direct_kernel(graph, input, matrix, output);
         }
         Self::direct_kernel_for_tensors(

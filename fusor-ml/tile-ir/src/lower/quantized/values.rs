@@ -20,15 +20,24 @@ impl<'a> Lowerer<'a> {
             match matrix.format {
                 GgmlQuantFormat::Q2K => self.dequant_q2k(expressions, matrix, base, q, body)?,
                 GgmlQuantFormat::Q3K => self.dequant_q3k(expressions, matrix, base, q, body)?,
-                GgmlQuantFormat::Q4K => self.dequant_q4k(expressions, matrix, base, q, body)?,
-                GgmlQuantFormat::Q5K => self.dequant_q5k(expressions, matrix, base, q, body)?,
-                GgmlQuantFormat::Q6K => self.dequant_q6k(expressions, matrix, base, q, body)?,
+                GgmlQuantFormat::Q4K | GgmlQuantFormat::Q4KNative => {
+                    self.dequant_q4k(expressions, matrix, base, q, body)?
+                }
+                GgmlQuantFormat::Q5K | GgmlQuantFormat::Q5KNative => {
+                    self.dequant_q5k(expressions, matrix, base, q, body)?
+                }
+                GgmlQuantFormat::Q6K | GgmlQuantFormat::Q6KNative => {
+                    self.dequant_q6k(expressions, matrix, base, q, body)?
+                }
                 GgmlQuantFormat::Q8K => self.dequant_q8k(expressions, matrix, base, q, body)?,
                 GgmlQuantFormat::Q4_0
+                | GgmlQuantFormat::Q4_0Native
                 | GgmlQuantFormat::Q4_1
                 | GgmlQuantFormat::Q5_0
+                | GgmlQuantFormat::Q5_0Native
                 | GgmlQuantFormat::Q5_1
                 | GgmlQuantFormat::Q8_0
+                | GgmlQuantFormat::Q8_0Native
                 | GgmlQuantFormat::Q8_1 => unreachable!("affine formats handled above"),
             }
         };
@@ -61,9 +70,9 @@ impl<'a> Lowerer<'a> {
         col: Handle<Expression>,
         body: &mut Block,
     ) -> Result<Vec<Handle<Expression>>, LowerError> {
-        if matrix.format != GgmlQuantFormat::Q8_0 {
+        if !matrix.format.is_q8_0_family() {
             return Err(LowerError::UnsupportedOperation(
-                "q8_0 vector dequantizer only supports Q8_0",
+                "q8_0 vector dequantizer only supports Q8_0 formats",
             ));
         }
 
@@ -84,9 +93,9 @@ impl<'a> Lowerer<'a> {
         a: &[Handle<Expression>; 8],
         body: &mut Block,
     ) -> Result<Handle<Expression>, LowerError> {
-        if matrix.format != GgmlQuantFormat::Q8_0 {
+        if !matrix.format.is_q8_0_family() {
             return Err(LowerError::UnsupportedOperation(
-                "q8_0 dot8 only supports Q8_0",
+                "q8_0 dot8 only supports Q8_0 formats",
             ));
         }
 
@@ -108,8 +117,13 @@ impl<'a> Lowerer<'a> {
         let q = self.and_lit(expressions, body, k_base, 31);
         let col_block = self.mul_literal_u32_emitted(expressions, col, matrix.rows / 32, body);
         let block_index = self.add(expressions, body, col_block, block);
-        let base = self.mul_literal_u32_emitted(expressions, block_index, 9, body);
-        let scale = self.load_word_f32(expressions, matrix, base, 0, body)?;
+        let base = self.mul_literal_u32_emitted(
+            expressions,
+            block_index,
+            matrix.format.block_words(),
+            body,
+        );
+        let scale = self.load_affine_scale_f32(expressions, matrix, base, 0, body)?;
         let q_word = self.shr_lit(expressions, body, q, 2);
         let word0_off = self.add_lit(expressions, body, q_word, 1);
         let word1_off = self.add_lit(expressions, body, q_word, 2);
@@ -143,23 +157,29 @@ impl<'a> Lowerer<'a> {
         col: Handle<Expression>,
         body: &mut Block,
     ) -> Result<Vec<Handle<Expression>>, LowerError> {
-        if matrix.format != GgmlQuantFormat::Q4K {
+        if !matrix.format.is_q4k_family() {
             return Err(LowerError::UnsupportedOperation(
-                "q4k vector dequantizer only supports Q4K",
+                "q4k vector dequantizer only supports Q4K formats",
             ));
         }
 
         let block = self.div_literal_u32_emitted(expressions, k_base, 256, body);
         let q_base = self.and_lit(expressions, body, k_base, 255);
-        let base = self.quantized_block_base(expressions, matrix, block, col, 37, body);
+        let base = self.quantized_block_base(
+            expressions,
+            matrix,
+            block,
+            col,
+            matrix.format.block_words(),
+            body,
+        );
 
-        let d = self.load_word_f32(expressions, matrix, base, 0, body)?;
-        let dmin = self.load_word_f32(expressions, matrix, base, 1, body)?;
+        let (d, dmin) = self.q4k_load_d_dmin(expressions, matrix, base, body)?;
         let group = self.shr_lit(expressions, body, q_base, 5);
-        let scale_byte = self.k_scale(expressions, matrix, base, group, false, body)?;
+        let (scale_byte, min_byte) =
+            self.q4k_scale_min_bytes(expressions, matrix, base, group, body)?;
         let scale_f = self.as_f32(expressions, body, scale_byte);
         let scale = self.mul(expressions, body, scale_f, d);
-        let min_byte = self.k_scale(expressions, matrix, base, group, true, body)?;
         let min_f = self.as_f32(expressions, body, min_byte);
         let min = self.mul(expressions, body, min_f, dmin);
 
@@ -174,8 +194,9 @@ impl<'a> Lowerer<'a> {
             in_group,
         );
         let data_word = self.shr_lit(expressions, body, byte_index, 2);
-        let word0_off = self.add_lit(expressions, body, data_word, 5);
-        let word1_off = self.add_lit(expressions, body, data_word, 6);
+        let data_base = self.q4k_data_word_offset(matrix.format)?;
+        let word0_off = self.add_lit(expressions, body, data_word, data_base);
+        let word1_off = self.add_lit(expressions, body, data_word, data_base + 1);
         let word0 = self.load_word_dynamic(expressions, matrix, base, word0_off, body)?;
         let word1 = self.load_word_dynamic(expressions, matrix, base, word1_off, body)?;
         let group_low = self.and_lit(expressions, body, group, 1);
@@ -204,9 +225,9 @@ impl<'a> Lowerer<'a> {
         col: Handle<Expression>,
         body: &mut Block,
     ) -> Result<Vec<Handle<Expression>>, LowerError> {
-        if matrix.format != GgmlQuantFormat::Q5_0 {
+        if !matrix.format.is_q5_0_family() {
             return Err(LowerError::UnsupportedOperation(
-                "q5_0 vector dequantizer only supports Q5_0",
+                "q5_0 vector dequantizer only supports Q5_0 formats",
             ));
         }
 
@@ -214,8 +235,13 @@ impl<'a> Lowerer<'a> {
         let q_base = self.and_lit(expressions, body, k_base, 31);
         let col_block = self.mul_literal_u32_emitted(expressions, col, matrix.rows / 32, body);
         let block_index = self.bin(expressions, body, BinaryOperator::Add, col_block, block);
-        let base = self.mul_literal_u32_emitted(expressions, block_index, 6, body);
-        let scale = self.load_word_f32(expressions, matrix, base, 0, body)?;
+        let base = self.mul_literal_u32_emitted(
+            expressions,
+            block_index,
+            matrix.format.block_words(),
+            body,
+        );
+        let scale = self.load_affine_scale_f32(expressions, matrix, base, 0, body)?;
         let qh = self.load_word(expressions, matrix, base, 1, body)?;
         let high = self.cmp_lit(expressions, body, BinaryOperator::GreaterEqual, q_base, 16);
         let sixteen = self.u32(expressions, 16);
@@ -259,9 +285,16 @@ impl<'a> Lowerer<'a> {
     ) -> Result<Q6KBlockParts, LowerError> {
         let block = self.div_literal_u32_emitted(expressions, k_base, 256, body);
         let q_base = self.and_lit(expressions, body, k_base, 255);
-        let base = self.quantized_block_base(expressions, matrix, block, col, 53, body);
+        let base = self.quantized_block_base(
+            expressions,
+            matrix,
+            block,
+            col,
+            matrix.format.block_words(),
+            body,
+        );
 
-        let d = self.load_word_f32(expressions, matrix, base, 52, body)?;
+        let d = self.q6k_load_d(expressions, matrix, base, body)?;
         let chunk = self.shr_lit(expressions, body, q_base, 7);
         let local = self.and_lit(expressions, body, q_base, 127);
         let high_byte_index = self.and_lit(expressions, body, local, 31);
@@ -374,9 +407,9 @@ impl<'a> Lowerer<'a> {
         col: Handle<Expression>,
         body: &mut Block,
     ) -> Result<Vec<Handle<Expression>>, LowerError> {
-        if matrix.format != GgmlQuantFormat::Q6K {
+        if !matrix.format.is_q6k_family() {
             return Err(LowerError::UnsupportedOperation(
-                "q6k vector dequantizer only supports Q6K",
+                "q6k vector dequantizer only supports Q6K formats",
             ));
         }
 
@@ -414,9 +447,9 @@ impl<'a> Lowerer<'a> {
         a: &[Handle<Expression>; 8],
         body: &mut Block,
     ) -> Result<Handle<Expression>, LowerError> {
-        if matrix.format != GgmlQuantFormat::Q6K {
+        if !matrix.format.is_q6k_family() {
             return Err(LowerError::UnsupportedOperation(
-                "q6k dot8 only supports Q6K",
+                "q6k dot8 only supports Q6K formats",
             ));
         }
 
@@ -485,9 +518,9 @@ impl<'a> Lowerer<'a> {
         pack_offset: usize,
         body: &mut Block,
     ) -> Result<Handle<Expression>, LowerError> {
-        if matrix.format != GgmlQuantFormat::Q4K || a.len < pack_offset + 2 {
+        if !matrix.format.is_q4k_family() || a.len < pack_offset + 2 {
             return Err(LowerError::UnsupportedOperation(
-                "q4k x q8 activation dot requires Q4K and two activation packs",
+                "q4k x q8 activation dot requires a Q4K format and two activation packs",
             ));
         }
 
@@ -515,9 +548,9 @@ impl<'a> Lowerer<'a> {
         a: &[Handle<Expression>],
         body: &mut Block,
     ) -> Result<Handle<Expression>, LowerError> {
-        if matrix.format != GgmlQuantFormat::Q4K || a.is_empty() || !a.len().is_multiple_of(8) {
+        if !matrix.format.is_q4k_family() || a.is_empty() || !a.len().is_multiple_of(8) {
             return Err(LowerError::UnsupportedOperation(
-                "q4k f32 dot requires Q4K and a multiple of 8 activation values",
+                "q4k f32 dot requires a Q4K format and a multiple of 8 activation values",
             ));
         }
         if a.len() == 32 {

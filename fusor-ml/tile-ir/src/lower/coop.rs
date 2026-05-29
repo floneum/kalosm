@@ -619,7 +619,7 @@ impl<'a> Lowerer<'a> {
         src: &QuantizedMatrix,
         offsets: TileCoordExprs<'_>,
     ) -> Result<(), LowerError> {
-        if dst.element != ElementType::F32 {
+        if !matches!(dst.element, ElementType::F32 | ElementType::F16) {
             return Err(LowerError::TileElementMismatch {
                 tile: dst.id,
                 declared: dst.element,
@@ -633,8 +633,13 @@ impl<'a> Lowerer<'a> {
         // divides the tile-row dimension. Otherwise we fall back to one
         // dequant per invocation per pass.
         let n = match src.format {
-            GgmlQuantFormat::Q8_0 | GgmlQuantFormat::Q4K | GgmlQuantFormat::Q6K => 8,
-            GgmlQuantFormat::Q5_0 => 16,
+            GgmlQuantFormat::Q8_0
+            | GgmlQuantFormat::Q8_0Native
+            | GgmlQuantFormat::Q4K
+            | GgmlQuantFormat::Q4KNative
+            | GgmlQuantFormat::Q6K
+            | GgmlQuantFormat::Q6KNative => 8,
+            GgmlQuantFormat::Q5_0 | GgmlQuantFormat::Q5_0Native => 16,
             _ => 0,
         };
         let local = Self::function_arg(expressions, LOCAL_INVOCATION_INDEX_ARG);
@@ -680,39 +685,75 @@ impl<'a> Lowerer<'a> {
                         self.tile_dynamic_pointer(expressions, dst, tile_index, &mut accept)?;
                     tile_ptrs.push(ptr);
                 }
+                let last_lane =
+                    self.add_literal_u32_emitted(expressions, global_k_base, n - 1, &mut accept);
+                let row_ok = self.cmp_lit(
+                    expressions,
+                    &mut accept,
+                    BinaryOperator::Less,
+                    last_lane,
+                    src.rows,
+                );
+                let col_ok = self.cmp_lit(
+                    expressions,
+                    &mut accept,
+                    BinaryOperator::Less,
+                    global_col,
+                    src.cols,
+                );
+                let in_bounds = self.bin(
+                    expressions,
+                    &mut accept,
+                    BinaryOperator::LogicalAnd,
+                    row_ok,
+                    col_ok,
+                );
+
+                let mut in_bounds_body = Block::new();
                 let values = match (src.format, n) {
-                    (GgmlQuantFormat::Q8_0, 8) => self.dequantize_q8_0_values8(
-                        expressions,
-                        src,
-                        global_k_base,
-                        global_col,
-                        &mut accept,
-                    )?,
-                    (GgmlQuantFormat::Q4K, 8) => self.dequantize_q4k_values8(
-                        expressions,
-                        src,
-                        global_k_base,
-                        global_col,
-                        &mut accept,
-                    )?,
-                    (GgmlQuantFormat::Q6K, 8) => self.dequantize_q6k_values8(
-                        expressions,
-                        src,
-                        global_k_base,
-                        global_col,
-                        &mut accept,
-                    )?,
-                    (GgmlQuantFormat::Q5_0, 16) => self.dequantize_q5_0_values16(
-                        expressions,
-                        src,
-                        global_k_base,
-                        global_col,
-                        &mut accept,
-                    )?,
+                    (GgmlQuantFormat::Q8_0 | GgmlQuantFormat::Q8_0Native, 8) => self
+                        .dequantize_q8_0_values8(
+                            expressions,
+                            src,
+                            global_k_base,
+                            global_col,
+                            &mut in_bounds_body,
+                        )?,
+                    (GgmlQuantFormat::Q4K | GgmlQuantFormat::Q4KNative, 8) => self
+                        .dequantize_q4k_values8(
+                            expressions,
+                            src,
+                            global_k_base,
+                            global_col,
+                            &mut in_bounds_body,
+                        )?,
+                    (GgmlQuantFormat::Q6K | GgmlQuantFormat::Q6KNative, 8) => self
+                        .dequantize_q6k_values8(
+                            expressions,
+                            src,
+                            global_k_base,
+                            global_col,
+                            &mut in_bounds_body,
+                        )?,
+                    (GgmlQuantFormat::Q5_0 | GgmlQuantFormat::Q5_0Native, 16) => self
+                        .dequantize_q5_0_values16(
+                            expressions,
+                            src,
+                            global_k_base,
+                            global_col,
+                            &mut in_bounds_body,
+                        )?,
                     _ => unreachable!(),
                 };
-                for (ptr, value) in tile_ptrs.into_iter().zip(values) {
-                    accept.push(
+                for (ptr, value) in tile_ptrs.iter().copied().zip(values) {
+                    let value = self.cast_tile_value(
+                        expressions,
+                        &mut in_bounds_body,
+                        value,
+                        ElementType::F32,
+                        dst.element,
+                    );
+                    in_bounds_body.push(
                         Statement::Store {
                             pointer: ptr,
                             value,
@@ -720,6 +761,33 @@ impl<'a> Lowerer<'a> {
                         Span::default(),
                     );
                 }
+
+                let zero_f32 = self.f32(expressions, 0.0);
+                let zero = self.cast_tile_value(
+                    expressions,
+                    &mut accept,
+                    zero_f32,
+                    ElementType::F32,
+                    dst.element,
+                );
+                let mut out_of_bounds_body = Block::new();
+                for ptr in tile_ptrs {
+                    out_of_bounds_body.push(
+                        Statement::Store {
+                            pointer: ptr,
+                            value: zero,
+                        },
+                        Span::default(),
+                    );
+                }
+                accept.push(
+                    Statement::If {
+                        condition: in_bounds,
+                        accept: in_bounds_body,
+                        reject: out_of_bounds_body,
+                    },
+                    Span::default(),
+                );
                 Ok(accept)
             })?;
             return Ok(());
@@ -741,12 +809,70 @@ impl<'a> Lowerer<'a> {
                 global_col,
                 tile_ptr,
             } = self.copy_lane_pointer_and_globals(expressions, &mut accept, flat, lane_layout)?;
-            let value =
-                self.dequantize_qvalue(expressions, src, global_row, global_col, &mut accept)?;
-            accept.push(
+            let row_ok = self.cmp_lit(
+                expressions,
+                &mut accept,
+                BinaryOperator::Less,
+                global_row,
+                src.rows,
+            );
+            let col_ok = self.cmp_lit(
+                expressions,
+                &mut accept,
+                BinaryOperator::Less,
+                global_col,
+                src.cols,
+            );
+            let in_bounds = self.bin(
+                expressions,
+                &mut accept,
+                BinaryOperator::LogicalAnd,
+                row_ok,
+                col_ok,
+            );
+            let mut in_bounds_body = Block::new();
+            let value = self.dequantize_qvalue(
+                expressions,
+                src,
+                global_row,
+                global_col,
+                &mut in_bounds_body,
+            )?;
+            let value = self.cast_tile_value(
+                expressions,
+                &mut in_bounds_body,
+                value,
+                ElementType::F32,
+                dst.element,
+            );
+            in_bounds_body.push(
                 Statement::Store {
                     pointer: tile_ptr,
                     value,
+                },
+                Span::default(),
+            );
+            let zero_f32 = self.f32(expressions, 0.0);
+            let zero = self.cast_tile_value(
+                expressions,
+                &mut accept,
+                zero_f32,
+                ElementType::F32,
+                dst.element,
+            );
+            let mut out_of_bounds_body = Block::new();
+            out_of_bounds_body.push(
+                Statement::Store {
+                    pointer: tile_ptr,
+                    value: zero,
+                },
+                Span::default(),
+            );
+            accept.push(
+                Statement::If {
+                    condition: in_bounds,
+                    accept: in_bounds_body,
+                    reject: out_of_bounds_body,
                 },
                 Span::default(),
             );

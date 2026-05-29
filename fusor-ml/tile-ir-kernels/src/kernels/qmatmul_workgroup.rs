@@ -12,8 +12,8 @@
 //! the subgroup.
 //!
 //! The bodies share three building blocks:
-//! - [`stage_f32_tile_with_pre`] — cooperative per-lane staging of a dense
-//!   f32 source into a workgroup tile, applying the optional pre-activation
+//! - [`stage_storage_tile_with_pre`] — cooperative per-lane staging of a dense
+//!   source into a workgroup tile, applying the optional pre-activation
 //!   epilogue per element. Used for A in both kernels.
 //! - `program.copy_quant_to_tile` (from `fusor_tile_ir`) — per-lane
 //!   dequantize-into-workgroup-tile for B.
@@ -23,9 +23,9 @@
 //!   body uses 1x1.
 
 use fusor_tile_ir::tile::{Mask, Program, Storage, Tile, TileBlock, Workgroup};
-use fusor_tile_ir::{QuantizedMatrix, TileLiteral, TileReduceOp, WorkgroupAxis, F32, U32};
+use fusor_tile_ir::{QuantizedMatrix, TileLiteral, TileReduceOp, WorkgroupAxis, F16, F32, U32};
 
-use crate::kernels::helpers::{dispatch_grid_1d, load_qmatmul_extra};
+use crate::kernels::helpers::{dispatch_grid_1d, load_qmatmul_extra, AccumCast};
 use crate::types::{
     apply_qmatmul_post_epilogue, apply_qmatmul_pre_epilogue, matrix_shape, QmatmulEpilogues,
 };
@@ -36,9 +36,9 @@ const QMATMUL_TM: usize = 4;
 const QMATMUL_TN: usize = 4;
 const QGEMV_TN: usize = 1;
 
-struct RegisterTileWorkgroups {
-    a: Workgroup<F32>,
-    b: Workgroup<F32>,
+struct RegisterTileWorkgroups<Staging: AccumCast<F32>> {
+    a: Workgroup<Staging>,
+    b: Workgroup<Staging>,
 }
 
 struct RegisterTileLane<'a> {
@@ -61,10 +61,10 @@ struct RegisterTileShape {
 /// (qgemv passes a 1xBK tile to a 64-lane workgroup; the unused lanes
 /// would otherwise corrupt adjacent workgroup memory).
 #[allow(clippy::too_many_arguments)]
-fn stage_f32_tile_with_pre(
+fn stage_storage_tile_with_pre<Stor: AccumCast<F32>, Staging: AccumCast<F32>>(
     program: &mut TileBlock<'_>,
-    dst: Workgroup<F32>,
-    src: &Storage<F32, 2>,
+    dst: Workgroup<Staging>,
+    src: &Storage<Stor, 2>,
     row_base: &Tile<U32>,
     col_base: &Tile<U32>,
     tile_active: &Mask,
@@ -92,8 +92,9 @@ fn stage_f32_tile_with_pre(
         let loaded = program.load(
             src.at((global_row.clone(), &global_col)),
             in_bounds.clone(),
-            0.0,
+            Stor::ZERO_STORAGE,
         );
+        let loaded = Stor::into_accum(loaded);
         let pre_extras = epilogues
             .pre_extra_inputs
             .iter()
@@ -104,6 +105,7 @@ fn stage_f32_tile_with_pre(
             apply_qmatmul_pre_epilogue(epilogues, loaded, pre_extras),
             Tile::literal(TileLiteral::f32(0.0)),
         );
+        let value = Staging::from_accum(value);
         // Re-use the same flat index but only emit the store on lanes that
         // map to an actual tile slot.
         let flat_for_store = flat.clone();
@@ -119,9 +121,9 @@ fn stage_f32_tile_with_pre(
 ///
 /// Layout: `A_tile` is row-major `BM x BK` (index = row*BK + k), `B_tile` is
 /// row-major `BK x BN` (index = k*BN + col).
-fn accumulate_register_tile_from_workgroup(
+fn accumulate_register_tile_from_workgroup<Staging: AccumCast<F32>>(
     program: &mut TileBlock<'_>,
-    tiles: RegisterTileWorkgroups,
+    tiles: RegisterTileWorkgroups<Staging>,
     lane: RegisterTileLane<'_>,
     shape: RegisterTileShape,
 ) -> Vec<Tile> {
@@ -134,8 +136,12 @@ fn accumulate_register_tile_from_workgroup(
             let local_col = lane.col.clone() * tn + c;
             let mut sum = Tile::literal(TileLiteral::f32(0.0));
             for kk in 0..bk {
-                let a_value = program.load_workgroup(tiles.a, local_row.clone() * bk + kk);
-                let b_value = program.load_workgroup(tiles.b, local_col.clone() + kk * bn);
+                let a_value = Staging::into_accum(
+                    program.load_workgroup(tiles.a, local_row.clone() * bk + kk),
+                );
+                let b_value = Staging::into_accum(
+                    program.load_workgroup(tiles.b, local_col.clone() + kk * bn),
+                );
                 sum = sum + a_value * b_value;
             }
             sum
@@ -158,6 +164,65 @@ pub fn qmatmul_workgroup_with_epilogues(
     epilogues: &QmatmulEpilogues<'_>,
     max_workgroups_per_dimension: u32,
 ) {
+    qmatmul_workgroup_with_epilogues_impl::<F32, F32>(
+        program,
+        a,
+        b,
+        y,
+        epilogues,
+        max_workgroups_per_dimension,
+    );
+}
+
+/// F16-staged variant of [`qmatmul_workgroup_with_epilogues`]. This requires
+/// shader-f16 support but otherwise shares the f32 implementation and keeps
+/// f32 accumulation/output.
+pub fn qmatmul_workgroup_f16_with_epilogues(
+    program: &mut Program,
+    a: &Storage<F32, 2>,
+    b: &QuantizedMatrix,
+    y: &Storage<F32, 2>,
+    epilogues: &QmatmulEpilogues<'_>,
+    max_workgroups_per_dimension: u32,
+) {
+    qmatmul_workgroup_with_epilogues_impl::<F32, F16>(
+        program,
+        a,
+        b,
+        y,
+        epilogues,
+        max_workgroups_per_dimension,
+    );
+}
+
+/// F16-storage and F16-staged variant of [`qmatmul_workgroup_with_epilogues`].
+/// Accumulates in f32 and writes f16 outputs directly.
+pub fn qmatmul_workgroup_storage_f16_with_epilogues(
+    program: &mut Program,
+    a: &Storage<F16, 2>,
+    b: &QuantizedMatrix,
+    y: &Storage<F16, 2>,
+    epilogues: &QmatmulEpilogues<'_>,
+    max_workgroups_per_dimension: u32,
+) {
+    qmatmul_workgroup_with_epilogues_impl::<F16, F16>(
+        program,
+        a,
+        b,
+        y,
+        epilogues,
+        max_workgroups_per_dimension,
+    );
+}
+
+fn qmatmul_workgroup_with_epilogues_impl<Stor: AccumCast<F32>, Staging: AccumCast<F32>>(
+    program: &mut Program,
+    a: &Storage<Stor, 2>,
+    b: &QuantizedMatrix,
+    y: &Storage<Stor, 2>,
+    epilogues: &QmatmulEpilogues<'_>,
+    max_workgroups_per_dimension: u32,
+) {
     // BM/BN are pinned to the 4x4-register-tile geometry across QMATMUL_LANES.
     // BK is the K-axis staging chunk per pass.
     const BM: u32 = 32;
@@ -177,8 +242,8 @@ pub fn qmatmul_workgroup_with_epilogues(
     let total_tiles = tiles_m * tiles_n;
     let k_tiles = k.div_ceil(bk);
     let grid = dispatch_grid_1d(total_tiles, max_workgroups_per_dimension);
-    let a_tile = program.alloc_workgroup_tile_f32(BM, bk);
-    let b_tile = program.alloc_workgroup_tile_f32(bk, BN);
+    let a_tile = program.alloc_workgroup_tile::<Staging>(BM, bk);
+    let b_tile = program.alloc_workgroup_tile::<Staging>(bk, BN);
     let b_clone = b.clone();
 
     program.program_grid::<QMATMUL_LANES>(grid, |program| {
@@ -204,7 +269,7 @@ pub fn qmatmul_workgroup_with_epilogues(
                 [TileLiteral::f32(0.0); QMATMUL_TM * QMATMUL_TN],
                 |program, k_tile| {
                     let k_base = k_tile * bk;
-                    stage_f32_tile_with_pre(
+                    stage_storage_tile_with_pre(
                         program,
                         a_tile,
                         a,
@@ -258,6 +323,7 @@ pub fn qmatmul_workgroup_with_epilogues(
                 .map(|extra| load_qmatmul_extra(program, extra, &row, &col, n))
                 .collect::<Vec<_>>();
             let value = apply_qmatmul_post_epilogue(epilogues, sum, extras);
+            let value = Stor::from_accum(value);
             let mask = tile_active
                 .clone()
                 .and(row.clone().lt(m))
@@ -279,6 +345,64 @@ pub fn qgemv_workgroup_with_epilogue(
     epilogues: &QmatmulEpilogues<'_>,
     max_workgroups_per_dimension: u32,
 ) {
+    qgemv_workgroup_with_epilogue_impl::<F32, F32>(
+        program,
+        a,
+        b,
+        y,
+        epilogues,
+        max_workgroups_per_dimension,
+    );
+}
+
+/// F16-staged variant of [`qgemv_workgroup_with_epilogue`]. Requires
+/// shader-f16 support; accumulation and output remain f32.
+pub fn qgemv_workgroup_f16_with_epilogue(
+    program: &mut Program,
+    a: &Storage<F32, 2>,
+    b: &QuantizedMatrix,
+    y: &Storage<F32, 2>,
+    epilogues: &QmatmulEpilogues<'_>,
+    max_workgroups_per_dimension: u32,
+) {
+    qgemv_workgroup_with_epilogue_impl::<F32, F16>(
+        program,
+        a,
+        b,
+        y,
+        epilogues,
+        max_workgroups_per_dimension,
+    );
+}
+
+/// F16-storage and F16-staged variant of [`qgemv_workgroup_with_epilogue`].
+/// Accumulates in f32 and writes f16 outputs directly.
+pub fn qgemv_workgroup_storage_f16_with_epilogue(
+    program: &mut Program,
+    a: &Storage<F16, 2>,
+    b: &QuantizedMatrix,
+    y: &Storage<F16, 2>,
+    epilogues: &QmatmulEpilogues<'_>,
+    max_workgroups_per_dimension: u32,
+) {
+    qgemv_workgroup_with_epilogue_impl::<F16, F16>(
+        program,
+        a,
+        b,
+        y,
+        epilogues,
+        max_workgroups_per_dimension,
+    );
+}
+
+fn qgemv_workgroup_with_epilogue_impl<Stor: AccumCast<F32>, Staging: AccumCast<F32>>(
+    program: &mut Program,
+    a: &Storage<Stor, 2>,
+    b: &QuantizedMatrix,
+    y: &Storage<Stor, 2>,
+    epilogues: &QmatmulEpilogues<'_>,
+    max_workgroups_per_dimension: u32,
+) {
     // BN is pinned to QGEMV_LANES (one column per lane). BK is the K-axis
     // staging chunk per pass.
     const BN: u32 = QGEMV_LANES as u32;
@@ -297,8 +421,8 @@ pub fn qgemv_workgroup_with_epilogue(
     let k_tiles = k.div_ceil(bk);
     let grid = dispatch_grid_1d(tiles_n, max_workgroups_per_dimension);
     // BM=1 logical row tile. Reuse the f32 stager with ROWS=1.
-    let a_tile = program.alloc_workgroup_tile_f32(1, bk);
-    let b_tile = program.alloc_workgroup_tile_f32(bk, BN);
+    let a_tile = program.alloc_workgroup_tile::<Staging>(1, bk);
+    let b_tile = program.alloc_workgroup_tile::<Staging>(bk, BN);
     let b_clone = b.clone();
 
     program.program_grid::<QGEMV_LANES>(grid, |program| {
@@ -321,7 +445,7 @@ pub fn qgemv_workgroup_with_epilogue(
             [TileLiteral::f32(0.0); QGEMV_TN],
             |program, k_tile| {
                 let k_base = k_tile * bk;
-                stage_f32_tile_with_pre(
+                stage_storage_tile_with_pre(
                     program,
                     a_tile,
                     a,
@@ -373,6 +497,7 @@ pub fn qgemv_workgroup_with_epilogue(
                 .map(|extra| load_qmatmul_extra(program, extra, &row, &col, n))
                 .collect::<Vec<_>>();
             let value = apply_qmatmul_post_epilogue(epilogues, sum, extras);
+            let value = Stor::from_accum(value);
             let mask = tile_active.clone().and(col.clone().lt(n));
             program.store(y.at((0u32, col)), value, mask);
         }
