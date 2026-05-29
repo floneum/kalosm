@@ -7,7 +7,8 @@ use crate::{
     DataTypeEnum, Device, Layout, Tensor, TensorData,
     compute_graph::NodeIndex,
     kernel_selection::{
-        Axis, KernelDeviceCaps, KernelShape, ShapeRule, ShapeSelector, eq, multiple_of, range,
+        Axis, CooperativeMatrixKind, KernelDeviceCaps, KernelShape, ShapeRule, ShapeSelector, eq,
+        multiple_of, range,
     },
     matmul::MatMulOperation,
     mir::{
@@ -148,6 +149,15 @@ struct QMatmulDirectCtx {
     y_supports_coop: bool,
 }
 
+fn qmatmul_coop_supported(caps: KernelDeviceCaps) -> bool {
+    caps.subgroups_supported
+        && caps.min_subgroup_size <= 32
+        && caps.max_subgroup_size >= 32
+        && caps
+            .cooperative_matrix
+            .supports(CooperativeMatrixKind::F32F32M8N8K8)
+}
+
 fn qmatmul_direct_selector() -> ShapeSelector<3, QMatmulDirectCtx, QMatmulPath> {
     /// Helper to build a `Tile` variant with a given tile + cached flag.
     const fn tile(bm: u32, bn: u32, cached: bool) -> QMatmulPath {
@@ -174,6 +184,7 @@ fn qmatmul_direct_selector() -> ShapeSelector<3, QMatmulDirectCtx, QMatmulPath> 
                 .axis(QMAT_N, multiple_of(128))
                 .when(|shape: KernelShape<3>, ctx: &QMatmulDirectCtx, caps| {
                     ctx.format.is_q8_0_family()
+                        && qmatmul_coop_rule_supported(shape, ctx, caps)
                         && shape[QMAT_N] >= 8192
                         && caps.max_compute_invocations_per_workgroup >= 512
                         && caps.max_compute_workgroup_storage_size >= 32 * 1024
@@ -237,9 +248,9 @@ fn qmatmul_direct_selector() -> ShapeSelector<3, QMatmulDirectCtx, QMatmulPath> 
 fn qmatmul_coop_rule_supported(
     shape: KernelShape<3>,
     ctx: &QMatmulDirectCtx,
-    _caps: KernelDeviceCaps,
+    caps: KernelDeviceCaps,
 ) -> bool {
-    ctx.y_supports_coop && shape[QMAT_M] > 1
+    qmatmul_coop_supported(caps) && ctx.y_supports_coop && shape[QMAT_M] > 1
 }
 
 fn select_qmatmul_direct_variant(
@@ -737,7 +748,14 @@ fn qgemv_cols_per_workgroup_for_direct(format: tile_ir::GgmlQuantFormat, k: u32,
 
 /// Public re-export of [`qmatmul_m_pad_target`] for crate-internal callers
 /// outside this module (e.g. the fused `q_mat_mul_*` helpers on `Tensor`).
-pub(crate) fn qmatmul_m_pad_target_pub(m: usize, n: usize) -> Option<usize> {
+pub(crate) fn qmatmul_m_pad_target_pub(device: &Device, m: usize, n: usize) -> Option<usize> {
+    qmatmul_m_pad_target_for_caps(m, n, KernelDeviceCaps::from_device(device))
+}
+
+fn qmatmul_m_pad_target_for_caps(m: usize, n: usize, caps: KernelDeviceCaps) -> Option<usize> {
+    if !qmatmul_coop_supported(caps) {
+        return None;
+    }
     qmatmul_m_pad_target(m, n)
 }
 
@@ -780,7 +798,7 @@ impl Tensor {
         let m_axis = self.rank() - 2;
         let m = in_shape[m_axis];
         let n = other.shape()[0];
-        let Some(padded_m) = qmatmul_m_pad_target(m, n) else {
+        let Some(padded_m) = qmatmul_m_pad_target_pub(self.device(), m, n) else {
             return self.add_q_mat_mul(other);
         };
 

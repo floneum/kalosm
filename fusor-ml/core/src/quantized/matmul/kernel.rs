@@ -107,10 +107,10 @@ impl QMatMulOperation {
         let mut qmatmul_workgroups_x = 1;
         let y_supports_coop = tile_cooperative_store_layout_supported(&y_view.layout);
         let variant = select_qmatmul_direct_variant(format, m, k, n, y_supports_coop, caps);
-        // Every direct variant relies on subgroup operations. Route through
-        // the workgroup-tiled qmatmul/qgemv variants unless the device exposes
-        // a subgroup path we trust.
-        let use_workgroup_qmatmul = !caps.subgroups_supported || f16_storage;
+        // Every direct multi-row variant relies on cooperative-matrix or
+        // subgroup-specialized IR. Route devices without the F32 coop path
+        // through the workgroup-tiled qmatmul/qgemv variants.
+        let use_workgroup_qmatmul = !qmatmul_coop_supported(caps) || f16_storage;
         let use_f16_workgroup_tiles = use_workgroup_qmatmul && device.f16_supported();
         let use_coop_acc_init_epilogue = !use_workgroup_qmatmul
             && pre_expr.is_none()

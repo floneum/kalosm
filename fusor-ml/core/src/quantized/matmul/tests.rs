@@ -3,7 +3,7 @@ use super::*;
 #[cfg(test)]
 mod selection_tests {
     use super::*;
-    use crate::kernel_selection::assert_selector_generates;
+    use crate::kernel_selection::{CooperativeMatrixCaps, assert_selector_generates};
 
     fn caps(high_tile_limits: bool) -> KernelDeviceCaps {
         KernelDeviceCaps {
@@ -14,6 +14,13 @@ mod selection_tests {
                 16 * 1024
             },
             ..KernelDeviceCaps::test_caps()
+        }
+    }
+
+    fn no_coop_caps(high_tile_limits: bool) -> KernelDeviceCaps {
+        KernelDeviceCaps {
+            cooperative_matrix: CooperativeMatrixCaps::default(),
+            ..caps(high_tile_limits)
         }
     }
 
@@ -37,7 +44,7 @@ mod selection_tests {
             (QMatmulPath::SingleRow, ctx(q4, false), caps(false)),
             (
                 QMatmulPath::Q8Wide(QCoopTile::new(64, 128)),
-                ctx(tile_ir::GgmlQuantFormat::Q8_0, false),
+                ctx(tile_ir::GgmlQuantFormat::Q8_0, true),
                 caps(true),
             ),
             (
@@ -82,6 +89,29 @@ mod selection_tests {
             ),
         ];
         assert_selector_generates(&selector, cases);
+    }
+
+    #[test]
+    fn qmatmul_direct_selector_requires_coop_capability_for_coop_tiles() {
+        let selector = qmatmul_direct_selector();
+        let shape = KernelShape::new([128, 4096, 5120]);
+        let q4k = tile_ir::GgmlQuantFormat::Q4K;
+        assert_eq!(
+            selector.select(shape, &ctx(q4k, true), no_coop_caps(true)),
+            Some(QMatmulPath::Tile {
+                tile: QCoopTile::new(64, 64),
+                cached: false
+            })
+        );
+        assert!(!qmatmul_coop_supported(no_coop_caps(true)));
+        assert_eq!(
+            qmatmul_m_pad_target_for_caps(48, 5120, no_coop_caps(true)),
+            None
+        );
+        assert_eq!(
+            qmatmul_m_pad_target_for_caps(48, 5120, caps(true)),
+            Some(128)
+        );
     }
 
     #[test]

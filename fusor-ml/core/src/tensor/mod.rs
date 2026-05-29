@@ -88,7 +88,9 @@ impl Tensor {
             let m_axis = self.rank() - 2;
             let m = in_shape[m_axis];
             let n = other.shape()[0];
-            if let Some(padded_m) = crate::quantized::matmul::qmatmul_m_pad_target_pub(m, n) {
+            if let Some(padded_m) =
+                crate::quantized::matmul::qmatmul_m_pad_target_pub(self.device(), m, n)
+            {
                 let mut padded_in_shape = in_shape.to_vec();
                 padded_in_shape[m_axis] = padded_m;
                 let padded_self = self.resize(padded_in_shape);
@@ -190,7 +192,9 @@ impl Tensor {
             let m_axis = self.rank() - 2;
             let m = in_shape[m_axis];
             let n = other.shape()[0];
-            if let Some(padded_m) = crate::quantized::matmul::qmatmul_m_pad_target_pub(m, n) {
+            if let Some(padded_m) =
+                crate::quantized::matmul::qmatmul_m_pad_target_pub(self.device(), m, n)
+            {
                 let mut padded_in_shape = in_shape.to_vec();
                 padded_in_shape[m_axis] = padded_m;
                 let padded_self = self.resize(padded_in_shape);
