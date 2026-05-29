@@ -144,7 +144,7 @@ mod selection_tests {
 mod tests {
     use std::{mem::size_of, sync::Arc};
 
-    use fusor_gguf::{BlockQ4_0, BlockQ4K, BlockQ6K, BlockQ8_0, GgufBlock};
+    use fusor_gguf::{BlockQ4_0, BlockQ4K, BlockQ5K, BlockQ6K, BlockQ8_0, GgufBlock};
 
     use super::*;
     use crate::{
@@ -221,7 +221,13 @@ mod tests {
                 QMatrix::from_parts(&device, &raw_bytes, weight_shape.into(), GgmlType::Q4_0)
                     .unwrap();
 
-            let compact_len = block_count * size_of::<<BlockQ4_0 as GgufBlock>::BytesF32>();
+            let compact_len = block_count
+                * match matrix.storage_layout() {
+                    QMatrixStorageLayout::Native => size_of::<<BlockQ4_0 as GgufBlock>::AsBytes>(),
+                    QMatrixStorageLayout::GpuF32Scales => {
+                        size_of::<<BlockQ4_0 as GgufBlock>::BytesF32>()
+                    }
+                };
             let dense_len = element_count * size_of::<f32>();
             assert_eq!(matrix.buffer().size(), padded_copy_size(compact_len as u64));
             assert!(matrix.buffer().size() < padded_copy_size(dense_len as u64));
@@ -749,6 +755,94 @@ mod tests {
             assert_eq!(result.shape(), &[1, 2]);
             assert!((result[[0, 0]] - 528.0).abs() < 1e-3);
             assert!((result[[0, 1]] + 528.0).abs() < 1e-3);
+        });
+    }
+
+    #[test]
+    fn q4_0_qgemv_matches_expected_values() {
+        pollster::block_on(async {
+            let Ok(device) = Device::new().await else {
+                return;
+            };
+
+            fn q4_0_block(scale: f32, packed: u8) -> Vec<u8> {
+                let mut bytes = Vec::with_capacity(18);
+                bytes.extend_from_slice(&half::f16::from_f32(scale).to_bits().to_le_bytes());
+                bytes.extend(std::iter::repeat_n(packed, 16));
+                bytes
+            }
+
+            let mut raw_bytes = Vec::new();
+            raw_bytes.extend(q4_0_block(1.0, 0x99));
+            raw_bytes.extend(q4_0_block(1.0, 0x77));
+            let matrix =
+                QMatrix::from_parts(&device, &raw_bytes, Box::new([2, 32]), GgmlType::Q4_0)
+                    .unwrap();
+            let input_rows = vec![(1..=32).map(|value| value as f32).collect::<Vec<_>>()];
+            let input = Tensor::new::<f32, 2, _>(&device, &input_rows);
+
+            let result = input.q_mat_mul(&matrix).as_slice::<2, f32>().await.unwrap();
+
+            assert_eq!(result.shape(), &[1, 2]);
+            assert!((result[[0, 0]] - 528.0).abs() < 1e-3);
+            assert!((result[[0, 1]] + 528.0).abs() < 1e-3);
+        });
+    }
+
+    #[test]
+    fn q8_0_qgemv_matches_expected_values() {
+        pollster::block_on(async {
+            let Ok(device) = Device::new().await else {
+                return;
+            };
+
+            fn q8_0_block(scale: f32, value: i8) -> Vec<u8> {
+                let mut bytes = Vec::with_capacity(34);
+                bytes.extend_from_slice(&half::f16::from_f32(scale).to_bits().to_le_bytes());
+                bytes.extend(std::iter::repeat_n(value as u8, 32));
+                bytes
+            }
+
+            let mut raw_bytes = Vec::new();
+            raw_bytes.extend(q8_0_block(1.0, 1));
+            raw_bytes.extend(q8_0_block(1.0, -1));
+            let matrix =
+                QMatrix::from_parts(&device, &raw_bytes, Box::new([2, 32]), GgmlType::Q8_0)
+                    .unwrap();
+            let input_rows = vec![(1..=32).map(|value| value as f32).collect::<Vec<_>>()];
+            let input = Tensor::new::<f32, 2, _>(&device, &input_rows);
+
+            let result = input.q_mat_mul(&matrix).as_slice::<2, f32>().await.unwrap();
+
+            assert_eq!(result.shape(), &[1, 2]);
+            assert!((result[[0, 0]] - 528.0).abs() < 1e-3);
+            assert!((result[[0, 1]] + 528.0).abs() < 1e-3);
+        });
+    }
+
+    #[test]
+    fn q5k_qgemv_matches_expected_values() {
+        pollster::block_on(async {
+            let Ok(device) = Device::new().await else {
+                return;
+            };
+
+            let mut raw_bytes = Vec::with_capacity(size_of::<BlockQ5K>());
+            push_f16(&mut raw_bytes, 1.0);
+            push_f16(&mut raw_bytes, 0.0);
+            raw_bytes.extend([1, 1, 1, 1, 0, 0, 0, 0, 1, 1, 1, 1]);
+            raw_bytes.extend(std::iter::repeat_n(0, BlockQ5K::QH_SIZE));
+            raw_bytes.extend(std::iter::repeat_n(0x11, BlockQ5K::QS_SIZE));
+            let matrix =
+                QMatrix::from_parts(&device, &raw_bytes, Box::new([1, 256]), GgmlType::Q5K)
+                    .unwrap();
+            let input_rows = vec![(1..=256).map(|value| value as f32).collect::<Vec<_>>()];
+            let input = Tensor::new::<f32, 2, _>(&device, &input_rows);
+
+            let result = input.q_mat_mul(&matrix).as_slice::<2, f32>().await.unwrap();
+
+            assert_eq!(result.shape(), &[1, 1]);
+            assert!((result[[0, 0]] - 32896.0).abs() < 1e-2);
         });
     }
 

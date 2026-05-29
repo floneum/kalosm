@@ -115,20 +115,38 @@ impl<'a> Lowerer<'a> {
     ) -> Result<Q8_0BlockParts, LowerError> {
         let block = self.div_literal_u32_emitted(expressions, k_base, 32, body);
         let q = self.and_lit(expressions, body, k_base, 31);
-        let col_block = self.mul_literal_u32_emitted(expressions, col, matrix.rows / 32, body);
-        let block_index = self.add(expressions, body, col_block, block);
-        let base = self.mul_literal_u32_emitted(
+        let base = self.quantized_block_base(
             expressions,
-            block_index,
+            matrix,
+            block,
+            col,
             matrix.format.block_words(),
             body,
         );
         let scale = self.load_affine_scale_f32(expressions, matrix, base, 0, body)?;
         let q_word = self.shr_lit(expressions, body, q, 2);
-        let word0_off = self.add_lit(expressions, body, q_word, 1);
-        let word1_off = self.add_lit(expressions, body, q_word, 2);
-        let word0 = self.load_word_dynamic(expressions, matrix, base, word0_off, body)?;
-        let word1 = self.load_word_dynamic(expressions, matrix, base, word1_off, body)?;
+        let data_byte = self.shl_lit(expressions, body, q_word, 2);
+        let data_byte = self.add_lit(
+            expressions,
+            body,
+            data_byte,
+            self.q8_0_data_byte_offset(matrix.format)?,
+        );
+        let word0 = self.load_word_at_block_dynamic_byte_offset(
+            expressions,
+            matrix,
+            base,
+            data_byte,
+            body,
+        )?;
+        let word1_byte = self.add_lit(expressions, body, data_byte, 4);
+        let word1 = self.load_word_at_block_dynamic_byte_offset(
+            expressions,
+            matrix,
+            base,
+            word1_byte,
+            body,
+        )?;
         Ok(Q8_0BlockParts {
             scale,
             words: [word0, word1],
@@ -233,25 +251,55 @@ impl<'a> Lowerer<'a> {
 
         let block = self.div_literal_u32_emitted(expressions, k_base, 32, body);
         let q_base = self.and_lit(expressions, body, k_base, 31);
-        let col_block = self.mul_literal_u32_emitted(expressions, col, matrix.rows / 32, body);
-        let block_index = self.bin(expressions, body, BinaryOperator::Add, col_block, block);
-        let base = self.mul_literal_u32_emitted(
+        let base = self.quantized_block_base(
             expressions,
-            block_index,
+            matrix,
+            block,
+            col,
             matrix.format.block_words(),
             body,
         );
         let scale = self.load_affine_scale_f32(expressions, matrix, base, 0, body)?;
-        let qh = self.load_word(expressions, matrix, base, 1, body)?;
+        let qh = self.load_word_at_block_byte_offset(
+            expressions,
+            matrix,
+            base,
+            self.q5_0_high_byte_offset(matrix.format)?,
+            body,
+        )?;
         let high = self.cmp_lit(expressions, body, BinaryOperator::GreaterEqual, q_base, 16);
         let sixteen = self.u32(expressions, 16);
         let zero = self.u32(expressions, 0);
         let high_base = self.select(expressions, body, high, sixteen, zero);
         let words = [
-            self.load_word(expressions, matrix, base, 2, body)?,
-            self.load_word(expressions, matrix, base, 3, body)?,
-            self.load_word(expressions, matrix, base, 4, body)?,
-            self.load_word(expressions, matrix, base, 5, body)?,
+            self.load_word_at_block_byte_offset(
+                expressions,
+                matrix,
+                base,
+                self.q5_0_data_byte_offset(matrix.format)?,
+                body,
+            )?,
+            self.load_word_at_block_byte_offset(
+                expressions,
+                matrix,
+                base,
+                self.q5_0_data_byte_offset(matrix.format)? + 4,
+                body,
+            )?,
+            self.load_word_at_block_byte_offset(
+                expressions,
+                matrix,
+                base,
+                self.q5_0_data_byte_offset(matrix.format)? + 8,
+                body,
+            )?,
+            self.load_word_at_block_byte_offset(
+                expressions,
+                matrix,
+                base,
+                self.q5_0_data_byte_offset(matrix.format)? + 12,
+                body,
+            )?,
         ];
 
         let mut values = Vec::with_capacity(16);
@@ -354,7 +402,7 @@ impl<'a> Lowerer<'a> {
             local_scale_index,
         );
         let scale_byte =
-            self.load_byte_dynamic(expressions, matrix, base, scale_index, 48, body)?;
+            self.load_byte_dynamic(expressions, matrix, base, scale_index, 192, body)?;
         let scale = self.signed_byte_f32(expressions, body, scale_byte);
         let scale = self.mul(expressions, body, scale, d);
 

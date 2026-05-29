@@ -13,7 +13,12 @@ impl<'a> Lowerer<'a> {
         let blocks_per_col = matrix.rows / matrix.format.block_elements();
         let col_block = self.mul_literal_u32_emitted(e, col, blocks_per_col, body);
         let block_index = self.add(e, body, col_block, block);
-        self.mul_literal_u32_emitted(e, block_index, block_words, body)
+        let stride = if matrix.format.uses_byte_addressed_blocks() {
+            matrix.format.block_bytes()
+        } else {
+            block_words
+        };
+        self.mul_literal_u32_emitted(e, block_index, stride, body)
     }
 
     pub(in crate::lower) fn load_word(
@@ -24,6 +29,10 @@ impl<'a> Lowerer<'a> {
         offset: u32,
         body: &mut Block,
     ) -> Result<Handle<Expression>, LowerError> {
+        if matrix.format.uses_byte_addressed_blocks() {
+            let byte_offset = self.add_lit(e, body, base, offset * 4);
+            return self.load_word_at_byte_offset(e, matrix, byte_offset, body);
+        }
         let index = self.add_lit(e, body, base, offset);
         self.load_word_at(e, matrix, index, body)
     }
@@ -89,6 +98,45 @@ impl<'a> Lowerer<'a> {
         }
     }
 
+    pub(in crate::lower) fn q8_0_data_byte_offset(
+        &self,
+        format: GgmlQuantFormat,
+    ) -> Result<u32, LowerError> {
+        match format {
+            GgmlQuantFormat::Q8_0 => Ok(4),
+            GgmlQuantFormat::Q8_0Native => Ok(2),
+            _ => Err(LowerError::UnsupportedOperation(
+                "q8_0 data offset requires a Q8_0 format",
+            )),
+        }
+    }
+
+    pub(in crate::lower) fn q5_0_high_byte_offset(
+        &self,
+        format: GgmlQuantFormat,
+    ) -> Result<u32, LowerError> {
+        match format {
+            GgmlQuantFormat::Q5_0 => Ok(4),
+            GgmlQuantFormat::Q5_0Native => Ok(2),
+            _ => Err(LowerError::UnsupportedOperation(
+                "q5_0 high-bit offset requires a Q5_0 format",
+            )),
+        }
+    }
+
+    pub(in crate::lower) fn q5_0_data_byte_offset(
+        &self,
+        format: GgmlQuantFormat,
+    ) -> Result<u32, LowerError> {
+        match format {
+            GgmlQuantFormat::Q5_0 => Ok(8),
+            GgmlQuantFormat::Q5_0Native => Ok(6),
+            _ => Err(LowerError::UnsupportedOperation(
+                "q5_0 data offset requires a Q5_0 format",
+            )),
+        }
+    }
+
     pub(in crate::lower) fn q4k_data_word_offset(
         &self,
         format: GgmlQuantFormat,
@@ -102,7 +150,14 @@ impl<'a> Lowerer<'a> {
         }
     }
 
-    fn q4k_scale_word_offsets(
+    pub(in crate::lower) fn q4k_data_byte_offset(
+        &self,
+        format: GgmlQuantFormat,
+    ) -> Result<u32, LowerError> {
+        Ok(self.q4k_data_word_offset(format)? * 4)
+    }
+
+    pub(in crate::lower) fn q4k_scale_word_offsets(
         &self,
         format: GgmlQuantFormat,
     ) -> Result<(u32, u32, u32), LowerError> {
@@ -147,6 +202,13 @@ impl<'a> Lowerer<'a> {
         }
     }
 
+    pub(in crate::lower) fn q5k_data_byte_offset(
+        &self,
+        format: GgmlQuantFormat,
+    ) -> Result<u32, LowerError> {
+        Ok(self.q5k_data_word_offset(format)? * 4)
+    }
+
     pub(in crate::lower) fn q5k_qh_word_offset(
         &self,
         format: GgmlQuantFormat,
@@ -158,6 +220,13 @@ impl<'a> Lowerer<'a> {
                 "q5k qh offset requires a Q5K format",
             )),
         }
+    }
+
+    pub(in crate::lower) fn q5k_qh_byte_offset(
+        &self,
+        format: GgmlQuantFormat,
+    ) -> Result<u32, LowerError> {
+        Ok(self.q5k_qh_word_offset(format)? * 4)
     }
 
     fn q5k_scale_word_offsets(
@@ -216,8 +285,45 @@ impl<'a> Lowerer<'a> {
         offset: Handle<Expression>,
         body: &mut Block,
     ) -> Result<Handle<Expression>, LowerError> {
+        if matrix.format.uses_byte_addressed_blocks() {
+            let offset_bytes = self.shl_lit(e, body, offset, 2);
+            let byte_offset = self.add(e, body, base, offset_bytes);
+            return self.load_word_at_byte_offset(e, matrix, byte_offset, body);
+        }
         let index = self.add(e, body, base, offset);
         self.load_word_at(e, matrix, index, body)
+    }
+
+    pub(in crate::lower) fn load_word_at_block_byte_offset(
+        &self,
+        e: &mut Arena<Expression>,
+        matrix: &QuantizedMatrix,
+        base: Handle<Expression>,
+        byte_offset: u32,
+        body: &mut Block,
+    ) -> Result<Handle<Expression>, LowerError> {
+        if !matrix.format.uses_byte_addressed_blocks() {
+            debug_assert!(byte_offset.is_multiple_of(4));
+            return self.load_word(e, matrix, base, byte_offset / 4, body);
+        }
+        let global_byte = self.add_lit(e, body, base, byte_offset);
+        self.load_word_at_byte_offset(e, matrix, global_byte, body)
+    }
+
+    pub(in crate::lower) fn load_word_at_block_dynamic_byte_offset(
+        &self,
+        e: &mut Arena<Expression>,
+        matrix: &QuantizedMatrix,
+        base: Handle<Expression>,
+        byte_offset: Handle<Expression>,
+        body: &mut Block,
+    ) -> Result<Handle<Expression>, LowerError> {
+        if !matrix.format.uses_byte_addressed_blocks() {
+            let word_offset = self.shr_lit(e, body, byte_offset, 2);
+            return self.load_word_dynamic(e, matrix, base, word_offset, body);
+        }
+        let global_byte = self.add(e, body, base, byte_offset);
+        self.load_word_at_byte_offset(e, matrix, global_byte, body)
     }
 
     pub(in crate::lower) fn load_word_pair_dynamic(
@@ -366,26 +472,64 @@ impl<'a> Lowerer<'a> {
         self.and_lit(e, body, shifted, 0xff)
     }
 
-    /// Load `matrix.data[word_offset + byte_index >> 2]` and extract the
-    /// `byte_index & 3`-th byte. The dequantizers all index packed-byte arrays
-    /// this way: `byte_index >> 2` picks the word and `byte_index & 3` picks
-    /// the byte within the word. `word_offset` is the constant word offset to
-    /// the start of the byte array (e.g. 5 for q4k data, 32/48 for q6k high
-    /// nibbles / scales).
+    /// Load `matrix.data[byte_offset + byte_index]` and extract that byte.
+    /// Word-based formats convert their block-word base to a byte base here;
+    /// raw native formats with non-u32 block strides pass an already-byte
+    /// addressed block base.
     pub(in crate::lower) fn load_byte_dynamic(
         &self,
         e: &mut Arena<Expression>,
         matrix: &QuantizedMatrix,
         base: Handle<Expression>,
         byte_index: Handle<Expression>,
-        word_offset: u32,
+        byte_offset: u32,
         body: &mut Block,
     ) -> Result<Handle<Expression>, LowerError> {
-        let word_base = self.shr_lit(e, body, byte_index, 2);
-        let word_off = self.add_lit(e, body, word_base, word_offset);
-        let word = self.load_word_dynamic(e, matrix, base, word_off, body)?;
-        let lane = self.and_lit(e, body, byte_index, 3);
+        let block_byte_base = if matrix.format.uses_byte_addressed_blocks() {
+            base
+        } else {
+            self.shl_lit(e, body, base, 2)
+        };
+        let local_byte = self.add_lit(e, body, byte_index, byte_offset);
+        let global_byte = self.add(e, body, block_byte_base, local_byte);
+        self.load_byte_at_global_byte(e, matrix, global_byte, body)
+    }
+
+    pub(in crate::lower) fn load_byte_at_global_byte(
+        &self,
+        e: &mut Arena<Expression>,
+        matrix: &QuantizedMatrix,
+        byte_offset: Handle<Expression>,
+        body: &mut Block,
+    ) -> Result<Handle<Expression>, LowerError> {
+        let word_index = self.shr_lit(e, body, byte_offset, 2);
+        let word = self.load_word_at(e, matrix, word_index, body)?;
+        let lane = self.and_lit(e, body, byte_offset, 3);
         Ok(self.byte_at(e, body, word, lane))
+    }
+
+    pub(in crate::lower) fn load_word_at_byte_offset(
+        &self,
+        e: &mut Arena<Expression>,
+        matrix: &QuantizedMatrix,
+        byte_offset: Handle<Expression>,
+        body: &mut Block,
+    ) -> Result<Handle<Expression>, LowerError> {
+        let byte_offset_1 = self.add_lit(e, body, byte_offset, 1);
+        let byte_offset_2 = self.add_lit(e, body, byte_offset, 2);
+        let byte_offset_3 = self.add_lit(e, body, byte_offset, 3);
+        let bytes = [
+            self.load_byte_at_global_byte(e, matrix, byte_offset, body)?,
+            self.load_byte_at_global_byte(e, matrix, byte_offset_1, body)?,
+            self.load_byte_at_global_byte(e, matrix, byte_offset_2, body)?,
+            self.load_byte_at_global_byte(e, matrix, byte_offset_3, body)?,
+        ];
+        let b1 = self.shl_lit(e, body, bytes[1], 8);
+        let b2 = self.shl_lit(e, body, bytes[2], 16);
+        let b3 = self.shl_lit(e, body, bytes[3], 24);
+        let lo = self.or(e, body, bytes[0], b1);
+        let hi = self.or(e, body, b2, b3);
+        Ok(self.or(e, body, lo, hi))
     }
 
     pub(in crate::lower) fn signed_byte_f32(

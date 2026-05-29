@@ -96,28 +96,40 @@ pub(super) enum AffineDequantSpec {
 impl AffineDequantSpec {
     pub(super) fn for_format(format: GgmlQuantFormat) -> Option<Self> {
         Some(match format {
-            GgmlQuantFormat::Q4_0 | GgmlQuantFormat::Q4_0Native => Self::Centered {
-                nibble: AffineNibble::Q4 { data_offset: 1 },
+            GgmlQuantFormat::Q4_0 => Self::Centered {
+                nibble: AffineNibble::Q4 { data_offset: 4 },
                 center: 8.0,
             },
-            GgmlQuantFormat::Q5_0 | GgmlQuantFormat::Q5_0Native => Self::Centered {
+            GgmlQuantFormat::Q4_0Native => Self::Centered {
+                nibble: AffineNibble::Q4 { data_offset: 2 },
+                center: 8.0,
+            },
+            GgmlQuantFormat::Q5_0 => Self::Centered {
                 nibble: AffineNibble::Q5 {
-                    high_offset: 1,
-                    data_offset: 2,
+                    high_offset: 4,
+                    data_offset: 8,
                 },
                 center: 16.0,
             },
-            GgmlQuantFormat::Q8_0 | GgmlQuantFormat::Q8_0Native => Self::Q8 { data_offset: 1 },
+            GgmlQuantFormat::Q5_0Native => Self::Centered {
+                nibble: AffineNibble::Q5 {
+                    high_offset: 2,
+                    data_offset: 6,
+                },
+                center: 16.0,
+            },
+            GgmlQuantFormat::Q8_0 => Self::Q8 { data_offset: 4 },
+            GgmlQuantFormat::Q8_0Native => Self::Q8 { data_offset: 2 },
             GgmlQuantFormat::Q4_1 => Self::ScaleMin {
-                nibble: AffineNibble::Q4 { data_offset: 2 },
+                nibble: AffineNibble::Q4 { data_offset: 8 },
             },
             GgmlQuantFormat::Q5_1 => Self::ScaleMin {
                 nibble: AffineNibble::Q5 {
-                    high_offset: 2,
-                    data_offset: 3,
+                    high_offset: 8,
+                    data_offset: 12,
                 },
             },
-            GgmlQuantFormat::Q8_1 => Self::Q8 { data_offset: 2 },
+            GgmlQuantFormat::Q8_1 => Self::Q8 { data_offset: 8 },
             GgmlQuantFormat::Q2K
             | GgmlQuantFormat::Q3K
             | GgmlQuantFormat::Q4K

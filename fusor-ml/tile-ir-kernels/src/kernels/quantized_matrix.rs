@@ -50,7 +50,8 @@ pub fn quantized_matrix(
     let blocks_per_col = rows / format.block_elements();
     let words = blocks_per_col
         .checked_mul(cols)
-        .and_then(|blocks| blocks.checked_mul(format.block_words()))
+        .and_then(|blocks| blocks.checked_mul(format.block_bytes()))
+        .map(|bytes| bytes.div_ceil(4))
         .expect("quantized matrix word count overflow");
     let data: Storage<U32, 1> = program.storage_read(Shape::new([words]));
     QuantizedMatrix {

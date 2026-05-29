@@ -133,7 +133,7 @@ impl<'a> Lowerer<'a> {
         offsets: Q5BlockOffsets,
         body: &mut Block,
     ) -> Result<Handle<Expression>, LowerError> {
-        let qh = self.load_word(e, matrix, base, offsets.high, body)?;
+        let qh = self.load_word_at_block_byte_offset(e, matrix, base, offsets.high, body)?;
         let high = self.cmp_lit(e, body, BinaryOperator::GreaterEqual, q, 16);
         let (q_local, low, high4) =
             self.q_block_byte_nibbles(e, matrix, base, q, offsets.data, body)?;
@@ -198,7 +198,7 @@ impl<'a> Lowerer<'a> {
         let min_quant_f = self.as_f32(e, body, min_quant);
         let min = self.mul(e, body, min_quant_f, dmin);
         let parts =
-            self.dequant_q23k_quant_f(e, matrix, base, Q23KQuantIndices { q, group }, 4, body)?;
+            self.dequant_q23k_quant_f(e, matrix, base, Q23KQuantIndices { q, group }, 16, body)?;
         let scaled = self.mul(e, body, parts.quant_f, scale);
         Ok(self.sub(e, body, scaled, min))
     }
@@ -217,7 +217,7 @@ impl<'a> Lowerer<'a> {
         let scale_quant_f = self.center_quant_by_32(e, body, scale_quant);
         let scale = self.mul(e, body, scale_quant_f, d);
         let parts =
-            self.dequant_q23k_quant_f(e, matrix, base, Q23KQuantIndices { q, group }, 8, body)?;
+            self.dequant_q23k_quant_f(e, matrix, base, Q23KQuantIndices { q, group }, 32, body)?;
         let hmask_index = self.add(e, body, parts.pair_offset, parts.q_local);
         let hbyte = self.load_byte_dynamic(e, matrix, base, hmask_index, 0, body)?;
         let hmask_bit_pair = self.shr_lit(e, body, parts.group_in_chunk, 1);
@@ -248,7 +248,7 @@ impl<'a> Lowerer<'a> {
         q: Handle<Expression>,
         body: &mut Block,
     ) -> Result<Handle<Expression>, LowerError> {
-        self.dequant_q8_scaled(e, matrix, base, q, 1, body)
+        self.dequant_q8_scaled(e, matrix, base, q, 4, body)
     }
 
     pub(in crate::lower) fn dequant_q8_scaled(
@@ -305,7 +305,7 @@ impl<'a> Lowerer<'a> {
                 dmin,
                 self.k_scale(e, matrix, base, group, false, body)?,
                 self.k_scale(e, matrix, base, group, true, body)?,
-                self.q5k_data_word_offset(matrix.format)?,
+                self.q5k_data_byte_offset(matrix.format)?,
             )
         } else {
             let (d, dmin) = self.q4k_load_d_dmin(e, matrix, base, body)?;
@@ -315,7 +315,7 @@ impl<'a> Lowerer<'a> {
                 dmin,
                 scale_byte,
                 min_byte,
-                self.q4k_data_word_offset(matrix.format)?,
+                self.q4k_data_byte_offset(matrix.format)?,
             )
         };
         let scale_f = self.as_f32(e, body, scale_byte);
@@ -339,7 +339,7 @@ impl<'a> Lowerer<'a> {
                 matrix,
                 base,
                 qh_byte_index,
-                self.q5k_qh_word_offset(matrix.format)?,
+                self.q5k_qh_byte_offset(matrix.format)?,
                 body,
             )?;
             let qh_bit_index = self.shr_lit(e, body, q, 5);
@@ -396,7 +396,7 @@ impl<'a> Lowerer<'a> {
             high_chunk_base,
             high_byte_index,
         );
-        let high_byte = self.load_byte_dynamic(e, matrix, base, high_index, 32, body)?;
+        let high_byte = self.load_byte_dynamic(e, matrix, base, high_index, 128, body)?;
         let high_shift = self.shl_lit(e, body, low_group, 1);
         let high_shifted = self.shr(e, body, high_byte, high_shift);
         let high2 = self.and_lit(e, body, high_shifted, 3);
@@ -419,7 +419,7 @@ impl<'a> Lowerer<'a> {
             scale_chunk_base,
             local_scale_index,
         );
-        let scale_byte = self.load_byte_dynamic(e, matrix, base, scale_index, 48, body)?;
+        let scale_byte = self.load_byte_dynamic(e, matrix, base, scale_index, 192, body)?;
         let scale = self.signed_byte_f32(e, body, scale_byte);
         let scale = self.mul(e, body, scale, d);
         let quant_f = self.as_f32(e, body, quant);

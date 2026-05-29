@@ -137,7 +137,7 @@ fn quantized_native_storage_size<B: GgufBlock>(element_count: usize) -> Option<u
 
     let blocks = element_count / B::BLOCK_SIZE;
     blocks
-        .checked_mul(size_of::<B::Bytes>())
+        .checked_mul(size_of::<B::AsBytes>())
         .and_then(|bytes| u64::try_from(bytes).ok())
 }
 
@@ -415,38 +415,18 @@ impl QMatrix {
     ) -> Result<Self, GgufReadError> {
         let storage_layout = qmatrix_storage_layout_for_parts(ty, device.f16_supported());
         let storage_bytes: Cow<'_, [u8]> = match (ty, storage_layout) {
-            (GgmlType::Q4_0, QMatrixStorageLayout::Native) => Cow::Owned(
-                bytemuck::cast_slice::<_, BlockQ4_0>(bytes)
-                    .iter()
-                    .copied()
-                    .flat_map(BlockQ4_0::into_gpu_storage_bytes)
-                    .collect(),
-            ),
-            // Q4_K/Q5_K raw GGUF bytes already match the native shader block
-            // layout, so avoid the load-time block repack entirely.
-            (GgmlType::Q4K, QMatrixStorageLayout::Native) => Cow::Borrowed(bytes),
-            (GgmlType::Q5_0, QMatrixStorageLayout::Native) => Cow::Owned(
-                bytemuck::cast_slice::<_, BlockQ5_0>(bytes)
-                    .iter()
-                    .copied()
-                    .flat_map(BlockQ5_0::into_gpu_storage_bytes)
-                    .collect(),
-            ),
-            (GgmlType::Q8_0, QMatrixStorageLayout::Native) => Cow::Owned(
-                bytemuck::cast_slice::<_, BlockQ8_0>(bytes)
-                    .iter()
-                    .copied()
-                    .flat_map(BlockQ8_0::into_gpu_storage_bytes)
-                    .collect(),
-            ),
-            (GgmlType::Q5K, QMatrixStorageLayout::Native) => Cow::Borrowed(bytes),
-            (GgmlType::Q6K, QMatrixStorageLayout::Native) => Cow::Owned(
-                bytemuck::cast_slice::<_, BlockQ6K>(bytes)
-                    .iter()
-                    .copied()
-                    .flat_map(BlockQ6K::into_gpu_storage_bytes)
-                    .collect(),
-            ),
+            // Native storage is the raw GGUF block stream. Odd-sized block
+            // formats are handled by byte-addressed shader loads; the buffer
+            // pool may still add final-buffer padding for wgpu copy alignment.
+            (
+                GgmlType::Q4_0
+                | GgmlType::Q5_0
+                | GgmlType::Q8_0
+                | GgmlType::Q4K
+                | GgmlType::Q5K
+                | GgmlType::Q6K,
+                QMatrixStorageLayout::Native,
+            ) => Cow::Borrowed(bytes),
             (GgmlType::Q4_0, QMatrixStorageLayout::GpuF32Scales) => Cow::Owned(
                 bytemuck::cast_slice::<_, BlockQ4_0>(bytes)
                     .iter()
@@ -575,6 +555,47 @@ mod tests {
             qmatrix_storage_layout_for_parts_with_env(GgmlType::Q4K, true, Some("0")),
             QMatrixStorageLayout::GpuF32Scales
         );
+    }
+
+    #[test]
+    fn native_storage_size_uses_raw_gguf_block_bytes() {
+        for (ty, block_elements, bytes) in [
+            (
+                GgmlType::Q4_0,
+                <BlockQ4_0 as GgufBlock>::BLOCK_SIZE,
+                size_of::<<BlockQ4_0 as GgufBlock>::AsBytes>(),
+            ),
+            (
+                GgmlType::Q5_0,
+                <BlockQ5_0 as GgufBlock>::BLOCK_SIZE,
+                size_of::<<BlockQ5_0 as GgufBlock>::AsBytes>(),
+            ),
+            (
+                GgmlType::Q8_0,
+                <BlockQ8_0 as GgufBlock>::BLOCK_SIZE,
+                size_of::<<BlockQ8_0 as GgufBlock>::AsBytes>(),
+            ),
+            (
+                GgmlType::Q4K,
+                <BlockQ4K as GgufBlock>::BLOCK_SIZE,
+                size_of::<<BlockQ4K as GgufBlock>::AsBytes>(),
+            ),
+            (
+                GgmlType::Q5K,
+                <BlockQ5K as GgufBlock>::BLOCK_SIZE,
+                size_of::<<BlockQ5K as GgufBlock>::AsBytes>(),
+            ),
+            (
+                GgmlType::Q6K,
+                <BlockQ6K as GgufBlock>::BLOCK_SIZE,
+                size_of::<<BlockQ6K as GgufBlock>::AsBytes>(),
+            ),
+        ] {
+            assert_eq!(
+                matrix_storage_size(&[block_elements, 1], ty, QMatrixStorageLayout::Native),
+                Some(bytes as u64)
+            );
+        }
     }
 
     #[test]
