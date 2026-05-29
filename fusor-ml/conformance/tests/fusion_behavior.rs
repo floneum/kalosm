@@ -223,7 +223,13 @@ async fn gpu_nary_fusion_respects_binding_limit() {
     };
 
     let shape = [3, 4];
-    let max_fused_inputs = device.as_gpu().unwrap().nary_direct_input_binding_budget();
+    let gpu = device.as_gpu().unwrap();
+    // Software adapters can report descriptor limits too high to build a
+    // practical limit-plus-one stress case.
+    if gpu.is_cpu_adapter() {
+        return;
+    }
+    let max_fused_inputs = gpu.nary_direct_input_binding_budget();
     let num_tensors = max_fused_inputs.saturating_add(1).max(2);
 
     let tensors: Vec<Tensor<2, f32>> = (0..num_tensors)
