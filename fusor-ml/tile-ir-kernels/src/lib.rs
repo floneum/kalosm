@@ -22,14 +22,14 @@
 //!
 //! ```
 //! use fusor_tile_ir::{
-//!     GgmlQuantFormat, KernelBuilder, KernelTensorRef, Layout, MemoryLevel, Shape, F32,
+//!     ElementType, GgmlQuantFormat, KernelBuilder, KernelTensorRef, Layout, MemoryLevel, Shape,
 //! };
 //! use fusor_tile_ir_kernels::{qdequantize, quantized_matrix_for};
 //!
 //! let mut kb = KernelBuilder::<&'static str>::new();
 //! let q = quantized_matrix_for(&mut kb, "matrix", GgmlQuantFormat::Q4K, 256, 4);
 //! let layout = Layout::contiguous(MemoryLevel::Storage, Shape::new([1024]));
-//! let y = kb.write::<F32, 1>(KernelTensorRef::new("output", layout));
+//! let y = kb.write_element::<1>(ElementType::F32, KernelTensorRef::new("output", layout));
 //! qdequantize(kb.program(), &q, &y, 1);
 //! let (_ir, bindings) = kb.finish();
 //! assert_eq!(bindings, ["matrix", "output"]);
