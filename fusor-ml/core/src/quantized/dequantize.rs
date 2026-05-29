@@ -19,8 +19,7 @@ use super::{QMatrix, QMatrixStorageLayout};
 
 struct DequantizeDirectKernelVariant;
 
-fn emit_qdequantize_kernel(
-    kb: &mut tile_ir::KernelBuilder<std::sync::Arc<wgpu::Buffer>>,
+struct QDequantizeKernelParams {
     matrix_buffer: std::sync::Arc<wgpu::Buffer>,
     output_buffer: std::sync::Arc<wgpu::Buffer>,
     output_layout: tile_ir::Layout,
@@ -29,13 +28,24 @@ fn emit_qdequantize_kernel(
     k: u32,
     n: u32,
     dispatch_x: u32,
+}
+
+fn emit_qdequantize_kernel(
+    kb: &mut tile_ir::KernelBuilder<std::sync::Arc<wgpu::Buffer>>,
+    params: QDequantizeKernelParams,
 ) -> Option<()> {
-    let q = tile_ir_kernels::quantized_matrix_for(kb, matrix_buffer, format, k, n);
-    let y = kb.write_element::<1>(
-        output_element,
-        tile_ir::KernelTensorRef::new(output_buffer, output_layout),
+    let q = tile_ir_kernels::quantized_matrix_for(
+        kb,
+        params.matrix_buffer,
+        params.format,
+        params.k,
+        params.n,
     );
-    tile_ir_kernels::qdequantize(kb.program(), &q, &y, dispatch_x);
+    let y = kb.write_element::<1>(
+        params.output_element,
+        tile_ir::KernelTensorRef::new(params.output_buffer, params.output_layout),
+    );
+    tile_ir_kernels::qdequantize(kb.program(), &q, &y, params.dispatch_x);
     Some(())
 }
 
@@ -205,14 +215,16 @@ impl Operation for DequantizeOperation {
             move |kb| {
                 emit_qdequantize_kernel(
                     kb,
-                    matrix_buffer,
-                    output_buffer,
-                    output_layout,
-                    datatype_element(output_datatype)?,
-                    format,
-                    k,
-                    n,
-                    dispatch_x,
+                    QDequantizeKernelParams {
+                        matrix_buffer,
+                        output_buffer,
+                        output_layout,
+                        output_element: datatype_element(output_datatype)?,
+                        format,
+                        k,
+                        n,
+                        dispatch_x,
+                    },
                 )?;
                 Some(())
             },

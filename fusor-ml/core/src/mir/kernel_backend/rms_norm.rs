@@ -400,16 +400,16 @@ impl Operation for RmsNormOperation {
                 buffers,
                 dispatch_size,
                 || {
-                    build_rms_norm_tile_ir(
+                    build_rms_norm_tile_ir(RmsNormTileIrParams {
                         input_view,
                         residual_view,
                         weight,
                         bias,
                         output_view,
-                        self.eps,
+                        eps: self.eps,
                         post_chain,
                         storage_datatype,
-                    )
+                    })
                 },
             )
         }
@@ -542,34 +542,36 @@ fn matrix_strides(strides: Vec<u32>) -> Option<[u32; 2]> {
     strides.try_into().ok()
 }
 
-fn build_rms_norm_tile_ir(
+struct RmsNormTileIrParams<'a> {
     input_view: crate::mir::tile_direct::DirectMatrixLayout,
     residual_view: Option<crate::mir::tile_direct::DirectMatrixLayout>,
-    weight: &TensorData,
-    bias: Option<&TensorData>,
+    weight: &'a TensorData,
+    bias: Option<&'a TensorData>,
     output_view: crate::mir::tile_direct::DirectMatrixLayout,
     eps: f32,
     post_chain: UnaryFunctionChain,
     storage_datatype: DataTypeEnum,
-) -> Option<tile_ir::KernelIr> {
-    match storage_datatype {
+}
+
+fn build_rms_norm_tile_ir(params: RmsNormTileIrParams<'_>) -> Option<tile_ir::KernelIr> {
+    match params.storage_datatype {
         DataTypeEnum::F32 => build_rms_norm_tile_ir_typed::<tile_ir::F32>(
-            input_view,
-            residual_view,
-            weight,
-            bias,
-            output_view,
-            eps,
-            post_chain,
+            params.input_view,
+            params.residual_view,
+            params.weight,
+            params.bias,
+            params.output_view,
+            params.eps,
+            params.post_chain,
         ),
         DataTypeEnum::F16 => build_rms_norm_tile_ir_typed::<tile_ir::F16>(
-            input_view,
-            residual_view,
-            weight,
-            bias,
-            output_view,
-            eps,
-            post_chain,
+            params.input_view,
+            params.residual_view,
+            params.weight,
+            params.bias,
+            params.output_view,
+            params.eps,
+            params.post_chain,
         ),
         DataTypeEnum::U32 => None,
     }
