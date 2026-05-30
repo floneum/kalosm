@@ -432,6 +432,19 @@ impl Decoder {
                     .unwrap()
             };
             token_mask.push(!self.is_special(next_token));
+            // Debug: print top 5 tokens and their probabilities
+            if i < 5 {
+                let logits_sm = logits.softmax(0);
+                let logits_slice = logits_sm.as_slice().await.unwrap();
+                let logits_data = logits_slice.as_slice();
+
+                let mut indexed: Vec<(usize, f32)> = logits_data
+                    .iter()
+                    .enumerate()
+                    .map(|(i, v)| (i, *v))
+                    .collect();
+                indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+            }
             // After the final pass if word level timestamps are requested, we stop decoding
             if task.word_level_time_stamps && tokens.last() == Some(&self.eot_token) {
                 break;

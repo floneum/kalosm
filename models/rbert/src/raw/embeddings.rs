@@ -2,7 +2,7 @@
 //!
 //! Bert embeddings contain word embeddings, embeddings about the token type and position information.
 
-use fusor::layers::{Embedding, LayerNormNd};
+use fusor::layers::{Embedding, LayerNorm};
 use fusor::{Device, VarBuilder};
 use fusor::{Result, Tensor};
 
@@ -11,7 +11,7 @@ pub(crate) struct BertEmbeddings {
     word_embeddings: Embedding<f32>,
     position_embeddings: Option<Embedding<f32>>,
     token_type_embeddings: Embedding<f32>,
-    layer_norm: LayerNormNd<f32>,
+    layer_norm: LayerNorm<1, f32>,
     span: tracing::Span,
 }
 
@@ -24,7 +24,7 @@ impl BertEmbeddings {
         let word_embeddings = Embedding::load(device, &mut vb.pp("token_embd"))?;
         let position_embeddings = Embedding::load(device, &mut vb.pp("position_embd"))?;
         let token_type_embeddings = Embedding::load(device, &mut vb.pp("token_types"))?;
-        let layer_norm = LayerNormNd::load(
+        let layer_norm = LayerNorm::load(
             device,
             &mut vb.pp("token_embd_norm"),
             config.layer_norm_eps as _,

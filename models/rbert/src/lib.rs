@@ -167,7 +167,6 @@ pub enum Pooling {
 }
 
 /// An embedding model that can be either BERT or Qwen
-#[allow(clippy::large_enum_variant)]
 pub enum EmbeddingModel {
     /// A BERT-style embedding model
     Bert(BertModel),

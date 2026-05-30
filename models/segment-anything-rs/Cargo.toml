@@ -17,6 +17,12 @@ thiserror.workspace = true
 tracing = "0.1.37"
 image.workspace = true
 
+[features]
+cuda = []
+cudnn = []
+mkl = []
+metal = []
+
 [dev-dependencies]
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 pollster = "0.4"
