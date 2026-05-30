@@ -125,6 +125,7 @@ fn App() -> Element {
     let mut error = use_signal(|| None::<String>);
     let mut extraction = use_signal(Extraction::default);
     let mut status = use_signal(|| "idle".to_string());
+    let mut editing = use_signal(|| false);
 
     // One extraction pipeline: watch the inputs, debounce, run.
     // `use_resource` re-runs the async body whenever any tracked signal
@@ -317,19 +318,31 @@ fn App() -> Element {
                 }
             }
 
-            div { class: "split",
-                textarea {
-                    class: "editor",
-                    spellcheck: "false",
-                    value: "{current_text}",
-                    oninput: move |e: FormEvent| text.set(e.value()),
-                }
-                article { class: "article",
-                    if is_loaded {
-                        { render_article(&current_text, &cur_extraction) }
-                    } else {
-                        div { class: "placeholder",
-                            "load a model to begin reading."
+            div { class: "stage",
+                if editing() {
+                    textarea {
+                        class: "editor",
+                        spellcheck: "false",
+                        value: "{current_text}",
+                        onmounted: move |e: MountedEvent| async move {
+                            // Explicit focus so a click anywhere outside reliably
+                            // fires `blur` and swaps us back into reading mode.
+                            let _ = e.set_focus(true).await;
+                        },
+                        oninput: move |e: FormEvent| text.set(e.value()),
+                        onblur: move |_| editing.set(false),
+                    }
+                } else {
+                    article {
+                        class: "article",
+                        ondoubleclick: move |_| editing.set(true),
+                        title: "double-click to edit",
+                        if is_loaded {
+                            { render_article(&current_text, &cur_extraction) }
+                        } else {
+                            div { class: "placeholder",
+                                "load a model to begin reading."
+                            }
                         }
                     }
                 }
