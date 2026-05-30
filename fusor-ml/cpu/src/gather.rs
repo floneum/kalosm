@@ -7,8 +7,6 @@
 use pulp::Simd;
 
 use crate::MAX_SIMD_LANES;
-#[allow(unused_imports)]
-use crate::SimdElement;
 
 // Architecture-specific gather implementations
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
@@ -141,6 +139,7 @@ where
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
     {
         // Use type_id to dispatch to specialized implementations
+        use crate::SimdElement;
         use std::any::TypeId;
         let type_id = TypeId::of::<T>();
 

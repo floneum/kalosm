@@ -1,10 +1,10 @@
 //! Activation functions that work on both CPU and GPU backends.
 
+use crate::gpu::{DataType, FloatDataType};
 use crate::{
     AddOp, DivOp, ExpOp, FloatOps, MulOp, NegOp, SimdBinaryOp, SimdElement, SimdUnaryOp, TanhOp,
     Tensor,
 };
-use fusor_core::{DataType, FloatDataType};
 
 impl<const R: usize, D> Tensor<R, D>
 where
@@ -22,7 +22,7 @@ where
             + std::ops::Add<Output = D>
             + std::ops::Div<Output = D>
             + std::ops::Mul<Output = D>
-            + fusor_cpu::Scalar,
+            + crate::cpu::Scalar,
         AddOp: SimdBinaryOp<D>,
         DivOp: SimdBinaryOp<D>,
         MulOp: SimdBinaryOp<D>,
@@ -47,7 +47,7 @@ where
         AddOp: SimdBinaryOp<D>,
         MulOp: SimdBinaryOp<D>,
         TanhOp: SimdUnaryOp<D>,
-        D: fusor_cpu::Scalar,
+        D: crate::cpu::Scalar,
     {
         let coeff = D::from_f32((2.0 / std::f32::consts::PI).sqrt());
 

@@ -23,6 +23,7 @@
 #![warn(missing_docs)]
 
 pub use futures_util::StreamExt;
+#[cfg(feature = "structured")]
 pub use kalosm_sample;
 
 #[cfg(feature = "openai")]

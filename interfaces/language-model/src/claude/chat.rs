@@ -1,13 +1,15 @@
 use super::{AnthropicCompatibleClient, NoAnthropicAPIKeyError};
 use crate::{
-    ChatMessage, ChatModel, ChatSession, ContentChunk, CreateChatSession,
-    CreateDefaultChatConstraintsForType, GenerationParameters, SchemaParser, StructuredChatModel,
+    ChatMessage, ChatModel, ChatSession, ContentChunk, CreateChatSession, GenerationParameters,
 };
 use futures_util::StreamExt;
 use kalosm_model_types::{ModelBuilder, ModelLoadingProgress};
+#[cfg(feature = "structured")]
 use kalosm_sample::Schema;
 use reqwest_eventsource::{Event, RequestBuilderExt};
-use serde::{de::DeserializeOwned, Deserialize, Serialize};
+#[cfg(feature = "structured")]
+use serde::de::DeserializeOwned;
+use serde::{Deserialize, Serialize};
 use std::{future::Future, sync::Arc};
 use thiserror::Error;
 
@@ -312,11 +314,11 @@ enum AnthropicCompatibleChatResponseContentBlockDeltaMessage {
 impl ChatModel<GenerationParameters> for AnthropicCompatibleChatModel {
     fn add_messages_with_callback<'a>(
         &'a self,
-        session: &'a mut Self::ChatSession,
-        messages: &[ChatMessage],
+        mut session: Self::ChatSession,
+        messages: &'a [ChatMessage],
         sampler: GenerationParameters,
         mut on_token: impl FnMut(String) -> Result<(), Self::Error> + Send + Sync + 'static,
-    ) -> impl Future<Output = Result<(), Self::Error>> + Send + 'a {
+    ) -> impl Future<Output = Result<Self::ChatSession, Self::Error>> + Send + 'a {
         let (system_prompt, filtered) = extract_system_prompt(messages);
         let messages = format_messages(&filtered);
         let myself = &*self.inner;
@@ -349,33 +351,38 @@ impl ChatModel<GenerationParameters> for AnthropicCompatibleChatModel {
 
             session.messages.push(new_message);
 
-            Ok(())
+            Ok(session)
         }
     }
 }
 
-impl<T: Schema + DeserializeOwned> CreateDefaultChatConstraintsForType<T>
+#[cfg(feature = "structured")]
+impl<T: Schema + DeserializeOwned> crate::CreateDefaultChatConstraintsForType<T>
     for AnthropicCompatibleChatModel
 {
-    type DefaultConstraints = SchemaParser<T>;
+    type DefaultConstraints = crate::SchemaParser<T>;
 
     fn create_default_constraints() -> Self::DefaultConstraints {
-        SchemaParser::new()
+        crate::SchemaParser::new()
     }
 }
 
-impl<P> StructuredChatModel<SchemaParser<P>> for AnthropicCompatibleChatModel
+#[cfg(feature = "structured")]
+impl<P> crate::StructuredChatModel<crate::SchemaParser<P>> for AnthropicCompatibleChatModel
 where
     P: Schema + DeserializeOwned,
 {
     fn add_message_with_callback_and_constraints<'a>(
         &'a self,
-        session: &'a mut Self::ChatSession,
-        messages: &[ChatMessage],
+        mut session: Self::ChatSession,
+        messages: &'a [ChatMessage],
         sampler: GenerationParameters,
-        _: SchemaParser<P>,
+        _: crate::SchemaParser<P>,
         mut on_token: impl FnMut(String) -> Result<(), Self::Error> + Send + Sync + 'static,
-    ) -> impl Future<Output = Result<P, Self::Error>> + Send + 'a {
+    ) -> impl Future<Output = Result<(Self::ChatSession, P), Self::Error>> + Send + 'a
+    where
+        P: 'a,
+    {
         let schema = P::schema();
         let mut schema: serde_json::Result<serde_json::Value> =
             serde_json::from_str(&schema.to_string());
@@ -432,7 +439,7 @@ where
                 crate::ChatMessage::new(crate::MessageType::ModelAnswer, new_message_text);
             session.messages.push(new_message);
 
-            Ok(result)
+            Ok((session, result))
         }
     }
 }
@@ -582,13 +589,16 @@ fn format_messages(messages: &[&crate::ChatMessage]) -> serde_json::Value {
 mod tests {
     use std::sync::{Arc, RwLock};
 
+    #[cfg(feature = "structured")]
     use serde::Deserialize;
 
     use super::{
         AnthropicCompatibleChatModelBuilder, AnthropicCompatibleChatResponse,
         AnthropicCompatibleChatResponseContentBlockDeltaMessage, ChatModel, CreateChatSession,
-        GenerationParameters, StructuredChatModel,
+        GenerationParameters,
     };
+    #[cfg(feature = "structured")]
+    use crate::StructuredChatModel;
 
     #[tokio::test]
     async fn test_claude_4_6_haiku() {
@@ -596,7 +606,7 @@ mod tests {
             .with_claude_haiku_4_5()
             .build();
 
-        let mut session = model.new_chat_session().unwrap();
+        let session = model.new_chat_session().unwrap();
 
         let messages = vec![
             crate::ChatMessage::new(
@@ -614,8 +624,8 @@ mod tests {
             ),
         ];
         let all_text = Arc::new(RwLock::new(String::new()));
-        model
-            .add_messages_with_callback(&mut session, &messages, GenerationParameters::default(), {
+        let _session = model
+            .add_messages_with_callback(session, &messages, GenerationParameters::default(), {
                 let all_text = all_text.clone();
                 move |token| {
                     let mut all_text = all_text.write().unwrap();
@@ -635,6 +645,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "structured")]
     fn test_remove_unsupported_properties() {
         let mut schema = serde_json::json!({
             "type": "object",
@@ -796,12 +807,13 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg(feature = "structured")]
     async fn test_claude_haiku_4_5_constrained() {
         let model = AnthropicCompatibleChatModelBuilder::new()
             .with_claude_haiku_4_5()
             .build();
 
-        let mut session = model.new_chat_session().unwrap();
+        let session = model.new_chat_session().unwrap();
 
         let messages = vec![crate::ChatMessage::new(
             crate::MessageType::UserMessage,
@@ -814,9 +826,9 @@ mod tests {
             primes: Vec<u8>,
         }
 
-        let response: Constraints = model
+        let (_session, response): (_, Constraints) = model
             .add_message_with_callback_and_constraints(
-                &mut session,
+                session,
                 &messages,
                 GenerationParameters::default(),
                 crate::SchemaParser::new(),
@@ -843,6 +855,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg(feature = "structured")]
     async fn test_claude_haiku_4_5_constrained_with_enum() {
         let model = AnthropicCompatibleChatModelBuilder::new()
             .with_claude_haiku_4_5()
@@ -869,9 +882,9 @@ mod tests {
                     .to_string(),
             )];
 
-            let response: Constraints = model
+            let (next_session, response): (_, Constraints) = model
                 .add_message_with_callback_and_constraints(
-                    &mut session,
+                    session,
                     &messages,
                     GenerationParameters::default(),
                     crate::SchemaParser::new(),
@@ -888,6 +901,7 @@ mod tests {
                 )
                 .await
                 .unwrap();
+            session = next_session;
             println!("{response:?}");
 
             let all_text = all_text.read().unwrap();
@@ -903,9 +917,9 @@ mod tests {
                 "Does this sentence contain a name: The earth is round".to_string(),
             )];
 
-            let response: Constraints = model
+            let (next_session, response): (_, Constraints) = model
                 .add_message_with_callback_and_constraints(
-                    &mut session,
+                    session,
                     &messages,
                     GenerationParameters::default(),
                     crate::SchemaParser::new(),
@@ -922,6 +936,7 @@ mod tests {
                 )
                 .await
                 .unwrap();
+            let _ = next_session;
             println!("{response:?}");
 
             let all_text = all_text.read().unwrap();

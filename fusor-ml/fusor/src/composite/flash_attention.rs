@@ -1,21 +1,26 @@
 //! Flash attention operations that work on both CPU and GPU backends.
 
+use crate::cpu::{MatmulImpl, MaxOp, SimdReduceOp, SumOp};
+use crate::gpu::{DataType, FloatDataType};
 use crate::{
     AddOp, ConcreteTensor, DivOp, ExpOp, FloatOps, MulOp, SimdBinaryOp, SimdElement, SimdUnaryOp,
     SubOp, Tensor,
 };
-use fusor_core::{DataType, FloatDataType};
-use fusor_cpu::{MatmulImpl, MaxOp, SimdReduceOp, SumOp};
 
 /// Describes how to interpret a 2D attention mask.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MaskKind {
     /// Mask is [q_seq_len, kv_seq_len] — applied identically to every (batch, head) pair.
-    /// Used for causal masks in decoder models.
+    /// Used for arbitrary additive masks in decoder models.
     QKMask,
     /// Mask is [batch, kv_seq_len] — per-token validity mask broadcast across heads and queries.
     /// Used for padding masks in encoder/embedding models.
     BatchKeyMask,
+    /// Mask is a strict lower-triangular causal mask of shape [seq_len, seq_len].
+    /// The GPU flash-attention kernel can skip the upper-triangle Q·K work
+    /// entirely and does not load the mask tensor at all. Falls back to
+    /// `QKMask` semantics on backends that don't support the optimisation.
+    Causal,
 }
 
 impl<D> Tensor<4, D, ConcreteTensor<D, 4>>
@@ -29,7 +34,8 @@ where
         + std::ops::Add<Output = D>
         + std::ops::Sub<Output = D>
         + std::ops::Mul<Output = D>
-        + std::ops::Div<Output = D>,
+        + std::ops::Div<Output = D>
+        + Copy,
     AddOp: SimdBinaryOp<D>,
     SubOp: SimdBinaryOp<D>,
     MulOp: SimdBinaryOp<D>,
@@ -57,10 +63,28 @@ where
         mask: Option<(&Tensor<2, D, ConcreteTensor<D, 2>>, MaskKind)>,
     ) -> Self {
         match (self, k, v) {
-            // GPU path - use the optimized fused kernel (QKMask only)
+            // GPU path - use the optimized fused kernel (QKMask/Causal only)
+            #[cfg(feature = "gpu")]
             (Tensor::Gpu(q), Tensor::Gpu(k), Tensor::Gpu(v))
                 if !matches!(mask, Some((_, MaskKind::BatchKeyMask))) =>
             {
+                if !q.device().subgroups_supported() {
+                    let cpu_q = tensor4_to_cpu(q);
+                    let cpu_k = tensor4_to_cpu(k);
+                    let cpu_v = tensor4_to_cpu(v);
+                    let cpu_mask = mask.map(|(m, kind)| {
+                        let Tensor::Gpu(mask) = m else {
+                            panic!("Mask must be on the same device as other tensors");
+                        };
+                        (tensor2_to_cpu(mask), kind)
+                    });
+                    let cpu_mask_ref = cpu_mask.as_ref().map(|(mask, kind)| (mask, *kind));
+                    let cpu_output = cpu_q.flash_attention(&cpu_k, &cpu_v, scale, cpu_mask_ref);
+                    return tensor4_to_gpu(cpu_output, q.device());
+                }
+                if matches!(mask, Some((_, MaskKind::Causal))) {
+                    return Tensor::Gpu(q.flash_attention_causal(k, v, scale));
+                }
                 let gpu_mask = mask.map(|(m, _kind)| match m {
                     Tensor::Gpu(mask) => mask,
                     _ => panic!("Mask must be on the same device as other tensors"),
@@ -148,7 +172,7 @@ where
         let scores_masked = if let Some((m, kind)) = mask {
             let m_shape = m.shape();
             let mask_4d: Tensor<4, D, _> = match kind {
-                MaskKind::QKMask => {
+                MaskKind::QKMask | MaskKind::Causal => {
                     // Mask is [q_seq_len, kv_seq_len]
                     assert_eq!(
                         m_shape,
@@ -198,4 +222,63 @@ where
         // attn_weights @ V -> [batch, num_heads, q_seq_len, head_dim]
         attn_weights.mat_mul(&v_expanded)
     }
+}
+
+#[cfg(feature = "gpu")]
+fn tensor4_to_cpu<D>(tensor: &crate::gpu::Tensor<4, D>) -> Tensor<4, D>
+where
+    D: SimdElement + DataType + Copy,
+{
+    let shape = *tensor.shape();
+    let slice = pollster::block_on(tensor.as_slice()).expect("failed to read tensor");
+    let mut values = Vec::with_capacity(shape.iter().product());
+    for b in 0..shape[0] {
+        for h in 0..shape[1] {
+            for s in 0..shape[2] {
+                for d in 0..shape[3] {
+                    values.push(slice[[b, h, s, d]]);
+                }
+            }
+        }
+    }
+    Tensor::Cpu(crate::cpu::TypedTensor::from_slice(shape, &values))
+}
+
+#[cfg(feature = "gpu")]
+fn tensor4_to_gpu<D>(tensor: Tensor<4, D>, device: &crate::gpu::Device) -> Tensor<4, D>
+where
+    D: SimdElement + DataType + Copy,
+{
+    let Tensor::Cpu(tensor) = tensor else {
+        unreachable!("subgroup fallback should produce a CPU tensor");
+    };
+    let shape = tensor.shape();
+    let slice = tensor.as_slice();
+    let mut values = Vec::with_capacity(shape.iter().product());
+    for b in 0..shape[0] {
+        for h in 0..shape[1] {
+            for s in 0..shape[2] {
+                for d in 0..shape[3] {
+                    values.push(slice[[b, h, s, d]]);
+                }
+            }
+        }
+    }
+    Tensor::Gpu(crate::gpu::Tensor::from_slice(device, shape, &values))
+}
+
+#[cfg(feature = "gpu")]
+fn tensor2_to_cpu<D>(tensor: &crate::gpu::Tensor<2, D>) -> Tensor<2, D>
+where
+    D: SimdElement + DataType + Copy,
+{
+    let shape = *tensor.shape();
+    let slice = pollster::block_on(tensor.as_slice()).expect("failed to read tensor");
+    let mut values = Vec::with_capacity(shape.iter().product());
+    for row in 0..shape[0] {
+        for col in 0..shape[1] {
+            values.push(slice[[row, col]]);
+        }
+    }
+    Tensor::Cpu(crate::cpu::TypedTensor::from_slice(shape, &values))
 }

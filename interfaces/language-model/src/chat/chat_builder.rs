@@ -2,7 +2,6 @@ use crate::GenerationParameters;
 use crate::ModelConstraints;
 use crate::NoConstraints;
 use crate::ToChatMessage;
-use async_lock::Mutex as AsyncMutex;
 use futures_channel::mpsc::UnboundedReceiver;
 use futures_channel::oneshot::Receiver;
 use futures_util::Future;
@@ -53,8 +52,12 @@ use super::StructuredChatModel;
 #[doc = include_str!("../../docs/chat.md")]
 pub struct Chat<M: CreateChatSession> {
     model: Arc<M>,
-    #[allow(clippy::type_complexity)]
-    session: OnceLock<Result<Arc<AsyncMutex<M::ChatSession>>, M::Error>>,
+    /// The current session, or `None` if it has not been initialized yet or has
+    /// been moved into an in-flight [`ChatResponseBuilder`]. Initialized lazily
+    /// on first use. If a generation future fails or is dropped mid-stream,
+    /// this slot stays `None` and the next call will re-initialize via
+    /// [`CreateChatSession::new_chat_session`].
+    session: Option<Result<M::ChatSession, M::Error>>,
     queued_messages: Vec<ChatMessage>,
 }
 
@@ -71,20 +74,17 @@ impl<M: CreateChatSession> Clone for Chat<M> {
     fn clone(&self) -> Self {
         let model = self.model.clone();
         let mut queued_messages = self.queued_messages.clone();
-        let session = OnceLock::new();
-        if let Some(Ok(old_session)) = self.session.get() {
-            #[cfg(target_arch = "wasm32")]
-            let old_session = old_session.try_lock().unwrap();
-            #[cfg(not(target_arch = "wasm32"))]
-            let old_session = old_session.lock_blocking();
-            if let Ok(old_session) = old_session.try_clone() {
-                session
-                    .set(Ok(Arc::new(AsyncMutex::new(old_session))))
-                    .unwrap_or_else(|_| panic!("Chat session should be empty initially"));
-            } else {
-                queued_messages.extend_from_slice(&old_session.history());
-            }
-        }
+        let session = match self.session.as_ref() {
+            Some(Ok(old_session)) => match old_session.try_clone() {
+                Ok(cloned) => Some(Ok(cloned)),
+                Err(_) => {
+                    queued_messages.extend_from_slice(&old_session.history());
+                    None
+                }
+            },
+            // Session in flight (None) or previously failed (Some(Err)) — start fresh.
+            _ => None,
+        };
 
         Self {
             session,
@@ -111,7 +111,7 @@ impl<M: CreateChatSession> Chat<M> {
     pub fn new(model: M) -> Chat<M> {
         Self {
             model: Arc::new(model),
-            session: OnceLock::new(),
+            session: None,
             queued_messages: Vec::new(),
         }
     }
@@ -132,13 +132,11 @@ impl<M: CreateChatSession> Chat<M> {
     /// ```
     pub fn with_system_prompt(mut self, system_prompt: impl ToString) -> Self {
         #[cfg(debug_assertions)]
-        if let Some(Ok(session)) = self.session.get() {
-            if let Some(session) = session.try_lock() {
-                let mut existing_history = session.history();
-                existing_history.extend_from_slice(&self.queued_messages);
-                if !existing_history.is_empty() {
-                    tracing::error!("System prompt should be the first message in the history. System prompt was added to the end of the history: {:?}", existing_history);
-                }
+        if let Some(Ok(session)) = self.session.as_ref() {
+            let mut existing_history = session.history();
+            existing_history.extend_from_slice(&self.queued_messages);
+            if !existing_history.is_empty() {
+                tracing::error!("System prompt should be the first message in the history. System prompt was added to the end of the history: {:?}", existing_history);
             }
         }
 
@@ -174,9 +172,8 @@ impl<M: CreateChatSession> Chat<M> {
         self.queued_messages = existing_history;
 
         // Set the new chat session
-        self.session
-            .set(Ok(Arc::new(AsyncMutex::new(session))))
-            .unwrap_or_else(|_| panic!("Chat session already set"));
+        assert!(self.session.is_none(), "Chat session already set");
+        self.session = Some(Ok(session));
 
         self
     }
@@ -251,26 +248,16 @@ impl<M: CreateChatSession> Chat<M> {
         }
     }
 
-    fn session_clone(&mut self) -> Result<Arc<AsyncMutex<M::ChatSession>>, M::Error> {
-        let session = self.session.get_or_init(|| {
-            self.model
-                .new_chat_session()
-                .map(|session| Arc::new(AsyncMutex::new(session)))
-        });
-
-        match session {
-            Ok(session) => Ok(session.clone()),
-            Err(_) => {
-                let session_owned = self.session.take().unwrap();
-                match session_owned {
-                    Ok(_) => unreachable!(),
-                    Err(session_err) => Err(session_err),
-                }
-            }
-        }
+    /// Take the session out of the chat, initializing it lazily if necessary.
+    /// Returns `Err(M::Error)` if initialization failed; the error is consumed
+    /// and the slot is left empty so future calls can retry.
+    fn session_take(&mut self) -> Result<M::ChatSession, M::Error> {
+        self.session
+            .take()
+            .unwrap_or_else(|| self.model.new_chat_session())
     }
 
-    /// Get a reference to the chat session or an error if the session failed to load.
+    /// Get a reference to the chat session, initializing it if needed.
     ///
     /// You can use the session to get the chat history:
     /// ```rust, no_run
@@ -288,22 +275,11 @@ impl<M: CreateChatSession> Chat<M> {
     /// println!("{:?}", history);
     /// # }
     /// ```
-    pub fn session(&self) -> Result<impl Deref<Target = M::ChatSession> + use<'_, M>, &M::Error> {
-        match self
-            .session
-            .get_or_init(|| {
-                self.model
-                    .new_chat_session()
-                    .map(|session| Arc::new(AsyncMutex::new(session)))
-            })
-            .as_ref()
-        {
-            #[cfg(target_arch = "wasm32")]
-            Ok(session) => Ok(session.try_lock().unwrap()),
-            #[cfg(not(target_arch = "wasm32"))]
-            Ok(session) => Ok(session.lock_blocking()),
-            Err(err) => Err(err),
+    pub fn session(&mut self) -> Result<&M::ChatSession, &M::Error> {
+        if self.session.is_none() {
+            self.session = Some(self.model.new_chat_session());
         }
+        self.session.as_ref().unwrap().as_ref()
     }
 }
 
@@ -451,7 +427,7 @@ pub struct ChatResponseBuilder<
     sampler: Option<Sampler>,
     task: OnceLock<RwLock<BoxedTaskFuture>>,
     #[allow(clippy::type_complexity)]
-    result: Option<Receiver<Result<BoxedAny, M::Error>>>,
+    result: Option<Receiver<Result<(M::ChatSession, BoxedAny), M::Error>>>,
     queued_tokens: Option<UnboundedReceiver<String>>,
 }
 
@@ -635,20 +611,23 @@ where
                     Ok(())
                 }
             };
-            let session = self.chat_session.session_clone();
+            // Take ownership of the session — the slot stays `None` for the
+            // duration of generation. If the response is dropped mid-stream,
+            // the session is dropped with the future and the next call will
+            // re-initialize.
+            let session = self.chat_session.session_take();
             let model = self.chat_session.model.clone();
             let future = async move {
                 let session = session?;
-                let mut session = session.lock().await;
-                model
-                    .add_messages_with_callback(&mut session, &messages, sampler, on_token)
+                let updated = model
+                    .add_messages_with_callback(session, &messages, sampler, on_token)
                     .await?;
                 let mut all_text = all_text.lock().unwrap();
                 let all_text = std::mem::take(&mut *all_text);
-                Ok(Box::new(all_text) as BoxedAny)
+                Ok((updated, Box::new(all_text) as BoxedAny))
             };
             let wrapped = async move {
-                let result: Result<BoxedAny, M::Error> = future.await;
+                let result: Result<(M::ChatSession, BoxedAny), M::Error> = future.await;
                 _ = result_tx.send(result);
             };
             let task = Box::pin(wrapped);
@@ -685,6 +664,14 @@ where
         match task.poll_unpin(cx) {
             Poll::Ready(_) => {
                 *task = Box::pin(async move {});
+                drop(task);
+                // The result channel is ready as soon as the task completes.
+                // Pluck the updated session out and put it back into Chat.
+                if let Some(rx) = myself.result.as_mut() {
+                    if let Ok(Some(Ok((session, _)))) = rx.try_recv() {
+                        myself.chat_session.session = Some(Ok(session));
+                    }
+                }
                 Poll::Ready(None)
             }
             Poll::Pending => Poll::Pending,
@@ -707,7 +694,13 @@ where
         Box::pin(async move {
             self.task.into_inner().unwrap().into_inner().unwrap().await;
             let result = self.result.take().unwrap().await.unwrap();
-            result.map(|boxed| *boxed.downcast::<String>().unwrap())
+            match result {
+                Ok((session, boxed)) => {
+                    self.chat_session.session = Some(Ok(session));
+                    Ok(*boxed.downcast::<String>().unwrap())
+                }
+                Err(err) => Err(err),
+            }
         })
     }
 }
@@ -739,24 +732,23 @@ where
                 _ = tx.start_send(tok);
                 Ok(())
             };
-            let session = self.chat_session.session_clone();
+            let session = self.chat_session.session_take();
             let model = self.chat_session.model.clone();
             let future = async move {
                 let session = session?;
-                let mut session = session.lock().await;
-                model
+                let (updated, value) = model
                     .add_message_with_callback_and_constraints(
-                        &mut session,
+                        session,
                         &messages,
                         sampler,
                         constraints,
                         on_token,
                     )
-                    .await
-                    .map(|value| Box::new(value) as BoxedAny)
+                    .await?;
+                Ok((updated, Box::new(value) as BoxedAny))
             };
             let wrapped = async move {
-                let result: Result<BoxedAny, M::Error> = future.await;
+                let result: Result<(M::ChatSession, BoxedAny), M::Error> = future.await;
                 _ = result_tx.send(result);
             };
             let task = Box::pin(wrapped);
@@ -795,6 +787,12 @@ where
         match task.poll_unpin(cx) {
             Poll::Ready(_) => {
                 *task = Box::pin(async move {});
+                drop(task);
+                if let Some(rx) = myself.result.as_mut() {
+                    if let Ok(Some(Ok((session, _)))) = rx.try_recv() {
+                        myself.chat_session.session = Some(Ok(session));
+                    }
+                }
                 Poll::Ready(None)
             }
             Poll::Pending => Poll::Pending,
@@ -819,7 +817,13 @@ where
         Box::pin(async move {
             self.task.into_inner().unwrap().into_inner().unwrap().await;
             let result = self.result.take().unwrap().await.unwrap();
-            result.map(|boxed| *boxed.downcast::<Constraints::Output>().unwrap())
+            match result {
+                Ok((session, boxed)) => {
+                    self.chat_session.session = Some(Ok(session));
+                    Ok(*boxed.downcast::<Constraints::Output>().unwrap())
+                }
+                Err(err) => Err(err),
+            }
         })
     }
 }

@@ -4,7 +4,7 @@ use std::ops::Deref;
 
 use bytemuck::{AnyBitPattern, NoUninit};
 
-use fusor_core::TensorSlice;
+use crate::gpu::TensorSlice;
 
 /// Extension trait for TensorSlice to convert to Vec types
 pub trait ToVec {

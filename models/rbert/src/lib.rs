@@ -83,7 +83,6 @@ impl BertBuilder {
         self
     }
 
-    #[cfg(feature = "tokio")]
     /// Set the cache location to use for the model (defaults DATA_DIR/kalosm/cache)
     pub fn with_cache(mut self, cache: kalosm_common::Cache) -> Self {
         self.cache = cache;

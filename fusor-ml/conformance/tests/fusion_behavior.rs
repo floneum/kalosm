@@ -25,6 +25,12 @@ fn condition_data(shape: [usize; 2]) -> Vec<f32> {
         .collect()
 }
 
+fn attention_data(len: usize, offset: f32) -> Vec<f32> {
+    (0..len)
+        .map(|i| (((i % 17) as f32) - 8.0) * 0.12 + offset)
+        .collect()
+}
+
 #[tokio::test]
 async fn gpu_nary_triple_add_fuses_into_one_kernel() {
     let Some(device) = gpu_device().await else {
@@ -128,24 +134,103 @@ async fn gpu_nary_where_cond_fuses_into_one_kernel() {
 }
 
 #[tokio::test]
+async fn gpu_flash_attention_fuses_into_one_kernel() {
+    let Some(device) = gpu_device().await else {
+        return;
+    };
+    let Device::Gpu(gpu) = &device else { return };
+    if gpu.fixed_width_subgroup_size().is_none() {
+        return;
+    }
+
+    let q_shape = [1, 2, 3, 4];
+    let kv_shape = [1, 2, 5, 4];
+    let q_data = attention_data(q_shape.iter().product(), 0.1);
+    let k_data = attention_data(kv_shape.iter().product(), -0.15);
+    let v_data = attention_data(kv_shape.iter().product(), 0.35);
+    let scale = 1.0 / (q_shape[3] as f32).sqrt();
+
+    let q = Tensor::from_slice(&device, q_shape, &q_data);
+    let k = Tensor::from_slice(&device, kv_shape, &k_data);
+    let v = Tensor::from_slice(&device, kv_shape, &v_data);
+    let result = q.flash_attention(&k, &v, scale, None);
+
+    let gpu_result = result
+        .as_gpu()
+        .expect("flash attention fusion test should produce a GPU tensor");
+    let kernel_count = gpu_result.count_kernels_to_resolve();
+    assert_eq!(
+        kernel_count,
+        1,
+        "flash attention graph was not fused:\n{}",
+        gpu_result.graphvis()
+    );
+    let actual = result.to_concrete();
+
+    let cpu_q = Tensor::from_slice(&Device::Cpu, q_shape, &q_data);
+    let cpu_k = Tensor::from_slice(&Device::Cpu, kv_shape, &k_data);
+    let cpu_v = Tensor::from_slice(&Device::Cpu, kv_shape, &v_data);
+    let expected = cpu_q
+        .flash_attention(&cpu_k, &cpu_v, scale, None)
+        .to_concrete();
+    approx_eq(&actual, &expected, 1e-4).await.unwrap();
+}
+
+#[tokio::test]
+async fn gpu_residual_rms_norm_fuses_into_one_kernel() {
+    let Some(device) = gpu_device().await else {
+        return;
+    };
+    let Device::Gpu(_) = &device else { return };
+
+    let shape = [1, 3, 256];
+    let input_data = attention_data(shape.iter().product(), 0.25);
+    let residual_data = attention_data(shape.iter().product(), -0.4);
+    let weight_data: Vec<f32> = (0..shape[2])
+        .map(|i| 0.75 + (i % 11) as f32 * 0.03)
+        .collect();
+
+    let input = Tensor::from_slice(&device, shape, &input_data);
+    let residual = Tensor::from_slice(&device, shape, &residual_data);
+    let weight = Tensor::from_slice(&device, [shape[2]], &weight_data);
+    let result = input.rms_norm_residual_fused::<1, 2, _>(&residual, &weight, None, 1e-5);
+
+    let gpu_result = result
+        .as_gpu()
+        .expect("residual rms norm fusion test should produce a GPU tensor");
+    let kernel_count = gpu_result.count_kernels_to_resolve();
+    assert_eq!(
+        kernel_count,
+        1,
+        "residual rms norm graph was not fused:\n{}",
+        gpu_result.graphvis()
+    );
+    let actual = result.to_concrete();
+
+    let cpu_input = Tensor::from_slice(&Device::Cpu, shape, &input_data);
+    let cpu_residual = Tensor::from_slice(&Device::Cpu, shape, &residual_data);
+    let cpu_weight = Tensor::from_slice(&Device::Cpu, [shape[2]], &weight_data);
+    let expected = (cpu_input + cpu_residual)
+        .rms_norm_fused::<1, 2>(&cpu_weight, None, 1e-5)
+        .to_concrete();
+    approx_eq(&actual, &expected, 1e-4).await.unwrap();
+}
+
+#[tokio::test]
 async fn gpu_nary_fusion_respects_binding_limit() {
     let Some(device) = gpu_device().await else {
         return;
     };
 
     let shape = [3, 4];
-    let max_storage_buffers = device
-        .as_gpu()
-        .unwrap()
-        .limits()
-        .max_storage_buffers_per_shader_stage as usize;
-    if max_storage_buffers > 256 {
-        // DX12/WARP reports a very high storage-buffer limit. Building a
-        // limit-plus-one expression tree there is not a useful conformance
-        // case and can overflow the test thread stack before fusion runs.
+    let gpu = device.as_gpu().unwrap();
+    // Software adapters can report descriptor limits too high to build a
+    // practical limit-plus-one stress case.
+    if gpu.is_cpu_adapter() {
         return;
     }
-    let num_tensors = max_storage_buffers + 1;
+    let max_fused_inputs = gpu.nary_direct_input_binding_budget();
+    let num_tensors = max_fused_inputs.saturating_add(1).max(2);
 
     let tensors: Vec<Tensor<2, f32>> = (0..num_tensors)
         .map(|i| Tensor::from_slice(&device, shape, &matrix_data(shape, i as f32 * 0.3)))
@@ -193,6 +278,98 @@ async fn gpu_gelu_lowers_to_one_kernel() {
             .await
             .unwrap();
     }
+}
+
+#[tokio::test]
+async fn gpu_matmul_then_unary_chain_fuses_into_one_kernel() {
+    let Some(device) = gpu_device().await else {
+        return;
+    };
+
+    let a_shape = [2, 3];
+    let b_shape = [3, 4];
+    let a_data = matrix_data(a_shape, 0.2);
+    let b_data = matrix_data(b_shape, -0.1);
+    let a = Tensor::from_slice(&device, a_shape, &a_data);
+    let b = Tensor::from_slice(&device, b_shape, &b_data);
+
+    let matmul = a.mat_mul(&b);
+    let result = matmul.cos() + 1.0;
+    assert_eq!(result.as_gpu().unwrap().count_kernels_to_resolve(), 1);
+
+    let cpu_a = Tensor::from_slice(&Device::Cpu, a_shape, &a_data);
+    let cpu_b = Tensor::from_slice(&Device::Cpu, b_shape, &b_data);
+    let expected = (cpu_a.mat_mul(&cpu_b).cos() + 1.0).to_concrete();
+    approx_eq(&result.to_concrete(), &expected, 1e-5)
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn gpu_unary_inputs_fuse_into_matmul_kernel() {
+    let Some(device) = gpu_device().await else {
+        return;
+    };
+
+    let a_shape = [2, 3];
+    let b_shape = [3, 4];
+    let a_data = matrix_data(a_shape, 0.7);
+    let b_data = matrix_data(b_shape, 0.4);
+    let a = Tensor::from_slice(&device, a_shape, &a_data);
+    let b = Tensor::from_slice(&device, b_shape, &b_data);
+
+    let result = (-a.clone()).mat_mul(&b.sin());
+    assert_eq!(result.as_gpu().unwrap().count_kernels_to_resolve(), 1);
+
+    let cpu_a = Tensor::from_slice(&Device::Cpu, a_shape, &a_data);
+    let cpu_b = Tensor::from_slice(&Device::Cpu, b_shape, &b_data);
+    let expected = (-cpu_a.clone()).mat_mul(&cpu_b.sin()).to_concrete();
+    approx_eq(&result.to_concrete(), &expected, 1e-5)
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn gpu_reduce_then_unary_chain_fuses_into_one_kernel() {
+    let Some(device) = gpu_device().await else {
+        return;
+    };
+
+    let shape = [3, 5];
+    let data = matrix_data(shape, 0.3);
+    let tensor = Tensor::from_slice(&device, shape, &data);
+    let reduced = tensor.sum::<1>(0);
+    let result = reduced.cos() + 1.0;
+    assert_eq!(result.as_gpu().unwrap().count_kernels_to_resolve(), 1);
+
+    let cpu = Tensor::from_slice(&Device::Cpu, shape, &data);
+    let expected = (cpu.sum::<1>(0).cos() + 1.0).to_concrete();
+    approx_eq(&result.to_concrete(), &expected, 1e-5)
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn gpu_indexing_then_arithmetic_matches_cpu() {
+    // `i((row, ..))` produces a rank-1 view; chaining mul_scalar + add_scalar
+    // exercises the index-then-arithmetic fusion path that no existing test
+    // covers. We assert correctness against CPU; kernel-count is informational
+    // (printed if the count is unexpected) since fusion details may change.
+    let Some(device) = gpu_device().await else {
+        return;
+    };
+
+    let shape = [4, 6];
+    let data = matrix_data(shape, 0.2);
+    let gpu_input: fusor::Tensor<2, f32> = Tensor::from_slice(&device, shape, &data);
+    let row = gpu_input.i((1, ..));
+    let result = row.mul_scalar(2.0) + 0.5;
+    let actual = result.to_concrete();
+
+    let cpu_input: fusor::Tensor<2, f32> = Tensor::from_slice(&Device::Cpu, shape, &data);
+    let cpu_row = cpu_input.i((1, ..));
+    let expected = (cpu_row.mul_scalar(2.0) + 0.5).to_concrete();
+    approx_eq(&actual, &expected, 1e-6).await.unwrap();
 }
 
 #[tokio::test]

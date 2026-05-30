@@ -1,126 +1,107 @@
 //! Axis reduction operations that work on both CPU and GPU backends.
 
-use crate::{ConcreteTensor, DivOp, FloatOps, SimdBinaryOp, SimdElement, Tensor};
-use fusor_core::{DataType, FloatDataType, LastRank as GpuLastRank};
-use fusor_cpu::{
+use crate::cpu::{
     LastRank as CpuLastRank, MaxOp, MinOp, ProdOp, SimdReduceOp, SumOp, TensorBacking,
 };
+use crate::gpu::{DataType, FloatDataType, LastRank as GpuLastRank};
+use crate::{ConcreteTensor, DivOp, FloatOps, SimdBinaryOp, SimdElement, Tensor};
+
+/// Emit a rank-reducing axis reduction method that dispatches CPU/GPU.
+///
+/// `$method` is the public name (e.g. `sum`).
+/// `$op` is the SIMD reduce op marker (e.g. `SumOp`).
+/// `$cpu_method` is the CPU tensor method (e.g. `sum_axis`).
+/// `$gpu_method` is the GPU tensor method (e.g. `sum`).
+macro_rules! axis_reduce {
+    ($(#[$meta:meta])* $method:ident, $op:ident, $cpu_method:ident, $gpu_method:ident) => {
+        $(#[$meta])*
+        pub fn $method<const OUT_RANK: usize>(
+            &self,
+            axis: usize,
+        ) -> Tensor<OUT_RANK, D, ConcreteTensor<D, OUT_RANK>>
+        where
+            ConcreteTensor<D, R>: CpuLastRank<OUT_RANK, D>,
+            crate::gpu::Tensor<R, D>: GpuLastRank<OUT_RANK, D>,
+            $op: SimdReduceOp<D>,
+        {
+            self.dispatch_ref(
+                |t| t.as_ref().$cpu_method::<OUT_RANK>(axis),
+                |t| t.$gpu_method(axis),
+            )
+        }
+    };
+}
+
+/// Emit a keepdim variant that calls the rank-reducing form then reshapes.
+///
+/// `$method` is the public name (e.g. `sum_keepdim`).
+/// `$base` is the rank-reducing method to call (e.g. `sum`).
+macro_rules! axis_reduce_keepdim {
+    ($(#[$meta:meta])* $method:ident, $base:ident, $op:ident) => {
+        $(#[$meta])*
+        pub fn $method<const OUT_RANK: usize>(&self, axis: usize) -> Tensor<R, D>
+        where
+            ConcreteTensor<D, R>: CpuLastRank<OUT_RANK, D>,
+            crate::gpu::Tensor<R, D>: GpuLastRank<OUT_RANK, D>,
+            $op: SimdReduceOp<D>,
+        {
+            let mut kept_shape = self.shape();
+            kept_shape[axis] = 1;
+            self.$base::<OUT_RANK>(axis).reshape(kept_shape).to_concrete()
+        }
+    };
+}
 
 impl<const R: usize, D, B> Tensor<R, D, B>
 where
     D: SimdElement + DataType + FloatDataType + FloatOps + Default,
     B: TensorBacking<R, Elem = D>,
 {
-    /// Sum along a specific axis, reducing the tensor rank by 1.
-    ///
-    /// # Arguments
-    /// * `axis` - The axis to reduce along (0 to R-1)
-    ///
-    /// # Type Parameters
-    /// - `OUT_RANK`: The output tensor rank (must be R - 1)
-    pub fn sum<const OUT_RANK: usize>(
-        &self,
-        axis: usize,
-    ) -> Tensor<OUT_RANK, D, ConcreteTensor<D, OUT_RANK>>
-    where
-        ConcreteTensor<D, R>: CpuLastRank<OUT_RANK, D>,
-        fusor_core::Tensor<R, D>: GpuLastRank<OUT_RANK, D>,
-        SumOp: SimdReduceOp<D>,
-    {
-        self.dispatch_ref(|t| t.as_ref().sum_axis::<OUT_RANK>(axis), |t| t.sum(axis))
-    }
+    axis_reduce!(
+        /// Sum along a specific axis, reducing the tensor rank by 1.
+        ///
+        /// # Arguments
+        /// * `axis` - The axis to reduce along (0 to R-1)
+        ///
+        /// # Type Parameters
+        /// - `OUT_RANK`: The output tensor rank (must be R - 1)
+        sum, SumOp, sum_axis, sum
+    );
 
-    /// Maximum along a specific axis, reducing the tensor rank by 1.
-    pub fn max<const OUT_RANK: usize>(
-        &self,
-        axis: usize,
-    ) -> Tensor<OUT_RANK, D, ConcreteTensor<D, OUT_RANK>>
-    where
-        ConcreteTensor<D, R>: CpuLastRank<OUT_RANK, D>,
-        fusor_core::Tensor<R, D>: GpuLastRank<OUT_RANK, D>,
-        MaxOp: SimdReduceOp<D>,
-    {
-        self.dispatch_ref(|t| t.as_ref().max_axis::<OUT_RANK>(axis), |t| t.max(axis))
-    }
+    axis_reduce!(
+        /// Maximum along a specific axis, reducing the tensor rank by 1.
+        max, MaxOp, max_axis, max
+    );
 
-    /// Minimum along a specific axis, reducing the tensor rank by 1.
-    pub fn min<const OUT_RANK: usize>(
-        &self,
-        axis: usize,
-    ) -> Tensor<OUT_RANK, D, ConcreteTensor<D, OUT_RANK>>
-    where
-        ConcreteTensor<D, R>: CpuLastRank<OUT_RANK, D>,
-        fusor_core::Tensor<R, D>: GpuLastRank<OUT_RANK, D>,
-        MinOp: SimdReduceOp<D>,
-    {
-        self.dispatch_ref(|t| t.as_ref().min_axis::<OUT_RANK>(axis), |t| t.min(axis))
-    }
+    axis_reduce!(
+        /// Minimum along a specific axis, reducing the tensor rank by 1.
+        min, MinOp, min_axis, min
+    );
 
-    /// Product along a specific axis, reducing the tensor rank by 1.
-    pub fn product<const OUT_RANK: usize>(
-        &self,
-        axis: usize,
-    ) -> Tensor<OUT_RANK, D, ConcreteTensor<D, OUT_RANK>>
-    where
-        ConcreteTensor<D, R>: CpuLastRank<OUT_RANK, D>,
-        fusor_core::Tensor<R, D>: GpuLastRank<OUT_RANK, D>,
-        ProdOp: SimdReduceOp<D>,
-    {
-        self.dispatch_ref(
-            |t| t.as_ref().prod_axis::<OUT_RANK>(axis),
-            |t| t.product(axis),
-        )
-    }
+    axis_reduce!(
+        /// Product along a specific axis, reducing the tensor rank by 1.
+        product, ProdOp, prod_axis, product
+    );
 
-    /// Product along a specific axis, keeping the reduced dimension with size 1.
-    pub fn product_keepdim<const OUT_RANK: usize>(&self, axis: usize) -> Tensor<R, D>
-    where
-        ConcreteTensor<D, R>: CpuLastRank<OUT_RANK, D>,
-        fusor_core::Tensor<R, D>: GpuLastRank<OUT_RANK, D>,
-        ProdOp: SimdReduceOp<D>,
-    {
-        let mut kept_shape = self.shape();
-        kept_shape[axis] = 1;
-        self.product::<OUT_RANK>(axis)
-            .reshape(kept_shape)
-            .to_concrete()
-    }
+    axis_reduce_keepdim!(
+        /// Product along a specific axis, keeping the reduced dimension with size 1.
+        product_keepdim, product, ProdOp
+    );
 
-    /// Sum along a specific axis, keeping the reduced dimension with size 1.
-    pub fn sum_keepdim<const OUT_RANK: usize>(&self, axis: usize) -> Tensor<R, D>
-    where
-        ConcreteTensor<D, R>: CpuLastRank<OUT_RANK, D>,
-        fusor_core::Tensor<R, D>: GpuLastRank<OUT_RANK, D>,
-        SumOp: SimdReduceOp<D>,
-    {
-        let mut kept_shape = self.shape();
-        kept_shape[axis] = 1;
-        self.sum::<OUT_RANK>(axis).reshape(kept_shape).to_concrete()
-    }
+    axis_reduce_keepdim!(
+        /// Sum along a specific axis, keeping the reduced dimension with size 1.
+        sum_keepdim, sum, SumOp
+    );
 
-    /// Max along a specific axis, keeping the reduced dimension with size 1.
-    pub fn max_keepdim<const OUT_RANK: usize>(&self, axis: usize) -> Tensor<R, D>
-    where
-        ConcreteTensor<D, R>: CpuLastRank<OUT_RANK, D>,
-        fusor_core::Tensor<R, D>: GpuLastRank<OUT_RANK, D>,
-        MaxOp: SimdReduceOp<D>,
-    {
-        let mut kept_shape = self.shape();
-        kept_shape[axis] = 1;
-        self.max::<OUT_RANK>(axis).reshape(kept_shape).to_concrete()
-    }
+    axis_reduce_keepdim!(
+        /// Max along a specific axis, keeping the reduced dimension with size 1.
+        max_keepdim, max, MaxOp
+    );
 
-    /// Min along a specific axis, keeping the reduced dimension with size 1.
-    pub fn min_keepdim<const OUT_RANK: usize>(&self, axis: usize) -> Tensor<R, D>
-    where
-        ConcreteTensor<D, R>: CpuLastRank<OUT_RANK, D>,
-        fusor_core::Tensor<R, D>: GpuLastRank<OUT_RANK, D>,
-        MinOp: SimdReduceOp<D>,
-    {
-        let mut kept_shape = self.shape();
-        kept_shape[axis] = 1;
-        self.min::<OUT_RANK>(axis).reshape(kept_shape).to_concrete()
-    }
+    axis_reduce_keepdim!(
+        /// Min along a specific axis, keeping the reduced dimension with size 1.
+        min_keepdim, min, MinOp
+    );
 
     /// Mean along a specific axis, reducing the tensor rank by 1.
     pub fn mean<const OUT_RANK: usize>(
@@ -129,7 +110,7 @@ where
     ) -> Tensor<OUT_RANK, D, ConcreteTensor<D, OUT_RANK>>
     where
         ConcreteTensor<D, R>: CpuLastRank<OUT_RANK, D>,
-        fusor_core::Tensor<R, D>: GpuLastRank<OUT_RANK, D>,
+        crate::gpu::Tensor<R, D>: GpuLastRank<OUT_RANK, D>,
         SumOp: SimdReduceOp<D>,
         D: std::ops::Div<Output = D>,
         DivOp: SimdBinaryOp<D>,
@@ -144,7 +125,7 @@ where
     pub fn mean_keepdim<const OUT_RANK: usize>(&self, axis: usize) -> Tensor<R, D>
     where
         ConcreteTensor<D, R>: CpuLastRank<OUT_RANK, D>,
-        fusor_core::Tensor<R, D>: GpuLastRank<OUT_RANK, D>,
+        crate::gpu::Tensor<R, D>: GpuLastRank<OUT_RANK, D>,
         SumOp: SimdReduceOp<D>,
         D: std::ops::Div<Output = D>,
         DivOp: SimdBinaryOp<D>,
@@ -164,7 +145,7 @@ where
     ) -> Tensor<OUT_RANK, D, ConcreteTensor<D, OUT_RANK>>
     where
         ConcreteTensor<D, R>: CpuLastRank<OUT_RANK, D>,
-        fusor_core::Tensor<R, D>: GpuLastRank<OUT_RANK, D>,
+        crate::gpu::Tensor<R, D>: GpuLastRank<OUT_RANK, D>,
         SumOp: SimdReduceOp<D>,
         D: std::ops::Mul<Output = D> + std::ops::Sub<Output = D> + std::ops::Div<Output = D>,
         crate::MulOp: SimdBinaryOp<D>,
@@ -185,7 +166,7 @@ where
     pub fn var_keepdim<const OUT_RANK: usize>(&self, axis: usize) -> Tensor<R, D>
     where
         ConcreteTensor<D, R>: CpuLastRank<OUT_RANK, D>,
-        fusor_core::Tensor<R, D>: GpuLastRank<OUT_RANK, D>,
+        crate::gpu::Tensor<R, D>: GpuLastRank<OUT_RANK, D>,
         SumOp: SimdReduceOp<D>,
         D: std::ops::Mul<Output = D> + std::ops::Sub<Output = D> + std::ops::Div<Output = D>,
         crate::MulOp: SimdBinaryOp<D>,

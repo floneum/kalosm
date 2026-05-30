@@ -1,9 +1,10 @@
 use std::any::{Any, TypeId};
 
 use futures_util::Stream;
-use kalosm_language::{prelude::*, rbert::BertLoadingError};
 use rand::{random, seq::index::sample, Rng};
+use rbert::BertLoadingError;
 
+use crate::language::*;
 use crate::{BertDistance, Metric, TestCases};
 
 /// A builder for [`PromptAnnealer`].

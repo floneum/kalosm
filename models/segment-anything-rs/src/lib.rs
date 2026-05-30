@@ -26,6 +26,7 @@ use candle_core::{Device, Tensor};
 use candle_nn::VarBuilder;
 use candle_transformers::models::segment_anything::sam::{self, Sam};
 use image::{DynamicImage, GenericImage, GenericImageView, ImageBuffer, Rgba};
+use kalosm_common::CacheError;
 
 /// A builder for [`SegmentAnything`].
 #[derive(Default)]
@@ -159,7 +160,7 @@ pub enum LoadSegmentAnythingError {
     LoadModel(#[from] candle_core::Error),
     /// An error that can occur when downloading a [`SegmentAnything`] model from Hugging Face.
     #[error("Failed to download model from Hugging Face: {0}")]
-    DownloadModel(#[from] hf_hub::api::sync::ApiError),
+    DownloadModel(#[from] CacheError),
 }
 
 /// An error that can occur when running a [`SegmentAnything`] model.
@@ -188,9 +189,12 @@ impl SegmentAnything {
     fn new(settings: SegmentAnythingBuilder) -> Result<Self, LoadSegmentAnythingError> {
         let SegmentAnythingBuilder { source } = settings;
         let model = {
-            let api = hf_hub::api::sync::Api::new()?;
-            let api = api.model(source.model);
-            api.get(&source.filename)?
+            let source = kalosm_model_types::FileSource::huggingface(
+                source.model,
+                "main".to_string(),
+                source.filename,
+            );
+            pollster::block_on(kalosm_common::Cache::default().get(&source, |_| {}))?
         };
         // Currently, candle doesn't support some operations that are required for segment anything
         // let device = kalosm_common::accelerated_device_if_available()?;

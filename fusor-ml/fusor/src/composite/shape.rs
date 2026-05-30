@@ -2,9 +2,9 @@
 
 use std::ops::Range;
 
+use crate::cpu::{MapLayout, TensorBacking};
+use crate::gpu::{DataType, Dim, ShapeWithOneHole};
 use crate::{ConcreteTensor, Device, SimdElement, Tensor};
-use fusor_core::{DataType, Dim, ShapeWithOneHole};
-use fusor_cpu::{MapLayout, TensorBacking};
 use fusor_types::{Layout, SlidingWindow, StrideSpec};
 
 fn validate_permutation(axes: &[usize]) {
@@ -287,8 +287,8 @@ where
     /// * `dim` - The dimension to squeeze (must have size 1)
     pub fn squeeze<const R2: usize>(&self, dim: usize) -> Tensor<R2, D, MapLayout<&B, R2>>
     where
-        ConcreteTensor<D, R>: fusor_cpu::LastRank<R2, D>,
-        fusor_core::Tensor<R, D>: fusor_core::LastRank<R2, D>,
+        ConcreteTensor<D, R>: crate::cpu::LastRank<R2, D>,
+        crate::gpu::Tensor<R, D>: crate::gpu::LastRank<R2, D>,
     {
         let shape = self.shape();
         let rank = shape.len();
@@ -313,8 +313,8 @@ where
     /// * `dim` - Where to insert the new dimension
     pub fn unsqueeze<const R2: usize>(&self, dim: usize) -> Tensor<R2, D, MapLayout<&B, R2>>
     where
-        ConcreteTensor<D, R>: fusor_cpu::NextRank<R2, D>,
-        fusor_core::Tensor<R, D>: fusor_core::NextRank<R2, D>,
+        ConcreteTensor<D, R>: crate::cpu::NextRank<R2, D>,
+        crate::gpu::Tensor<R, D>: crate::gpu::NextRank<R2, D>,
     {
         assert!(
             dim <= R,
@@ -351,8 +351,8 @@ where
         axes: [usize; DIFF],
     ) -> Tensor<R2, D, MapLayout<&B, R2>>
     where
-        ConcreteTensor<D, R>: fusor_cpu::SmallerRank<R2, DIFF, D>,
-        fusor_core::Tensor<R, D>: fusor_core::SmallerRank<DIFF, R2, D>,
+        ConcreteTensor<D, R>: crate::cpu::SmallerRank<R2, DIFF, D>,
+        crate::gpu::Tensor<R, D>: crate::gpu::SmallerRank<DIFF, R2, D>,
     {
         let shape = self.shape();
         let rank = shape.len();
@@ -389,8 +389,8 @@ where
         axes: [usize; DIFF],
     ) -> Tensor<R2, D, MapLayout<&B, R2>>
     where
-        ConcreteTensor<D, R>: fusor_cpu::LargerRank<R2, DIFF, D>,
-        fusor_core::Tensor<R, D>: fusor_core::LargerRank<DIFF, R2, D>,
+        ConcreteTensor<D, R>: crate::cpu::LargerRank<R2, DIFF, D>,
+        crate::gpu::Tensor<R, D>: crate::gpu::LargerRank<DIFF, R2, D>,
     {
         let new_rank = R + DIFF;
         for &axis in &axes {
@@ -438,8 +438,8 @@ where
         windows: [SlidingWindow; DIFF],
     ) -> Tensor<R2, D, MapLayout<&B, R2>>
     where
-        ConcreteTensor<D, R>: fusor_cpu::LargerRank<R2, DIFF, D>,
-        fusor_core::Tensor<R, D>: fusor_core::LargerRank<DIFF, R2, D>,
+        ConcreteTensor<D, R>: crate::cpu::LargerRank<R2, DIFF, D>,
+        crate::gpu::Tensor<R, D>: crate::gpu::LargerRank<DIFF, R2, D>,
     {
         let shape = self.shape();
         let mut sorted_windows = windows;
@@ -503,8 +503,8 @@ where
         dim: usize,
     ) -> Tensor<R2, D>
     where
-        ConcreteTensor<D, R>: fusor_cpu::NextRank<R2, D>,
-        fusor_core::Tensor<R, D>: fusor_core::NextRank<R2, D>,
+        ConcreteTensor<D, R>: crate::cpu::NextRank<R2, D>,
+        crate::gpu::Tensor<R, D>: crate::gpu::NextRank<R2, D>,
     {
         stack(tensors, dim)
     }
@@ -621,8 +621,8 @@ pub fn stack<const R: usize, const R2: usize, D, B>(
 ) -> Tensor<R2, D, ConcreteTensor<D, R2>>
 where
     D: SimdElement + DataType + Default,
-    ConcreteTensor<D, R>: fusor_cpu::NextRank<R2, D>,
-    fusor_core::Tensor<R, D>: fusor_core::NextRank<R2, D>,
+    ConcreteTensor<D, R>: crate::cpu::NextRank<R2, D>,
+    crate::gpu::Tensor<R, D>: crate::gpu::NextRank<R2, D>,
     B: TensorBacking<R, Elem = D>,
 {
     // Unsqueeze each tensor at the target dim, then cat along that dim
@@ -695,9 +695,9 @@ where
     }
     let len = data.len();
     match device {
-        Device::Cpu => Tensor::Cpu(fusor_cpu::Tensor::from_slice([len], &data)),
+        Device::Cpu => Tensor::Cpu(crate::cpu::TypedTensor::from_slice([len], &data)),
         Device::Gpu(gpu_device) => {
-            let t1d: fusor_core::Tensor<1, D> = fusor_core::Tensor::new(gpu_device, &data);
+            let t1d: crate::gpu::Tensor<1, D> = crate::gpu::Tensor::new(gpu_device, &data);
             Tensor::Gpu(t1d)
         }
     }

@@ -12,7 +12,9 @@ keywords = ["ai", "segment-anything", "segmentation", "computer-vision"]
 candle-core.workspace = true
 candle-nn.workspace = true
 candle-transformers.workspace = true
-hf-hub = { version = "0.4.0" }
+kalosm-common.workspace = true
+kalosm-model-types.workspace = true
+pollster = "0.4"
 thiserror.workspace = true
 
 accelerate-src = { version = "0.3.2", optional = true }

@@ -2,7 +2,7 @@ use rustc_hash::FxHashMap;
 
 use crate::{Layout, TensorLayoutInfo, nary_wise::NaryOperation};
 
-use super::{ComputeGraphNodeVariant, NodeIndex, queue::ComputeQueue};
+use super::{ComputeGraphNodeVariant, GraphOperation, NodeIndex, queue::ComputeQueue};
 
 #[derive(Default)]
 pub(crate) struct LayoutPass {
@@ -27,13 +27,15 @@ impl LayoutPass {
                 ComputeGraphNodeVariant::Nary(op) => self.visit_nary(node, op),
                 ComputeGraphNodeVariant::MatMul(op) => self.visit_mat_mul(node, op),
                 ComputeGraphNodeVariant::QMatMul(op) => self.visit_q_mat_mul(node, op),
+                ComputeGraphNodeVariant::QEmbedding(op) => self.visit_q_embedding(node, op),
                 ComputeGraphNodeVariant::Reduce(op) => self.visit_reduce(node, op),
+                ComputeGraphNodeVariant::FlashAttention(op) => self.visit_flash_attention(node, op),
+                ComputeGraphNodeVariant::GraphOp(op) => self.visit_graph_op(node, op.as_ref()),
                 ComputeGraphNodeVariant::MapLayout(op) => self.visit_map_layout(node, op),
                 ComputeGraphNodeVariant::Resize(op) => self.visit_resize(node, op),
                 ComputeGraphNodeVariant::SliceAssign(op) => self.visit_slice_assign(node, op),
                 ComputeGraphNodeVariant::Tensor(op) => self.visit_tensor(node, op),
                 ComputeGraphNodeVariant::Dequantize(op) => self.visit_dequantize(node, op),
-                ComputeGraphNodeVariant::Custom(op) => self.visit_custom(node, op),
             }
         }
     }
@@ -90,6 +92,23 @@ impl LayoutPass {
         );
     }
 
+    fn visit_q_embedding(
+        &mut self,
+        key: NodeIndex,
+        operation: &crate::quantized::embedding::QEmbeddingOperation,
+    ) {
+        let Some(_) = self.output_layout.get(&operation.indexes) else {
+            self.queue.push_back(operation.indexes);
+            self.queue.push_back(key);
+            return;
+        };
+        let output_layout = Layout::contiguous(&operation.out_shape);
+        self.output_layout.insert(
+            key,
+            TensorLayoutInfo::new(output_layout, crate::DataTypeEnum::F32),
+        );
+    }
+
     fn visit_reduce(&mut self, key: NodeIndex, operation: &crate::ReduceOperation) {
         let dim = operation.axis;
         let Some(input_layout) = self.output_layout.get(&operation.value) else {
@@ -108,6 +127,71 @@ impl LayoutPass {
         self.output_layout.insert(
             key,
             TensorLayoutInfo::new(new_layout, input_layout.datatype()),
+        );
+    }
+
+    fn visit_graph_op(&mut self, key: NodeIndex, operation: &dyn GraphOperation) {
+        let mut dependencies = Vec::new();
+        operation.visit_dependencies(&mut |dependency| {
+            dependencies.push(dependency);
+        });
+
+        let mut missing_dependency = false;
+        for dependency in dependencies {
+            if !self.output_layout.contains_key(&dependency) {
+                self.queue.push_back(dependency);
+                missing_dependency = true;
+            }
+        }
+        if missing_dependency {
+            self.queue.push_back(key);
+            return;
+        }
+
+        let output_layout = operation
+            .output_layout(&self.output_layout)
+            .unwrap_or_else(|| {
+                panic!(
+                    "graph operation {} could not infer output layout",
+                    operation.category()
+                )
+            });
+        self.output_layout.insert(key, output_layout);
+    }
+
+    fn visit_flash_attention(
+        &mut self,
+        key: NodeIndex,
+        operation: &crate::FlashAttentionOperation,
+    ) {
+        let Some(q_layout) = self.output_layout.get(&operation.q) else {
+            self.queue.push_back(operation.q);
+            self.queue.push_back(key);
+            return;
+        };
+        if !self.output_layout.contains_key(&operation.k) {
+            self.queue.push_back(operation.k);
+            self.queue.push_back(key);
+            return;
+        }
+        if !self.output_layout.contains_key(&operation.v) {
+            self.queue.push_back(operation.v);
+            self.queue.push_back(key);
+            return;
+        }
+        if let Some(mask) = operation.mask
+            && !self.output_layout.contains_key(&mask)
+        {
+            self.queue.push_back(mask);
+            self.queue.push_back(key);
+            return;
+        }
+        self.output_layout.insert(
+            key,
+            TensorLayoutInfo::new(
+                Layout::contiguous(&operation.out_shape),
+                q_layout.datatype(),
+            ),
         );
     }
 
@@ -156,7 +240,13 @@ impl LayoutPass {
             self.queue.push_back(key);
             return;
         };
-        self.output_layout.insert(key, input_layout.clone());
+        self.output_layout.insert(
+            key,
+            TensorLayoutInfo::new(
+                Layout::contiguous(input_layout.shape()),
+                input_layout.datatype(),
+            ),
+        );
     }
 
     fn visit_tensor(&mut self, key: NodeIndex, operation: &crate::tensor::TensorData) {
@@ -173,26 +263,5 @@ impl LayoutPass {
         let new_layout = Layout::contiguous(matrix.shape());
         self.output_layout
             .insert(key, TensorLayoutInfo::new(new_layout, operation.datatype));
-    }
-
-    fn visit_custom(
-        &mut self,
-        key: NodeIndex,
-        operation: &std::sync::Arc<dyn crate::mir::operation::Operation + Send + Sync>,
-    ) {
-        let mut dependencies = Vec::new();
-        operation.visit_dependencies(&mut |dep| {
-            dependencies.push(dep);
-        });
-
-        for dependency in dependencies {
-            if !self.output_layout.contains_key(&dependency) {
-                self.queue.push_back(dependency);
-                self.queue.push_back(key);
-                return;
-            }
-        }
-        self.output_layout
-            .insert(key, operation.output_layout(&self.output_layout));
     }
 }

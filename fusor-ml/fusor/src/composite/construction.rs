@@ -1,85 +1,15 @@
 //! Construction operations that work on both CPU and GPU backends.
 
+use crate::gpu::DataType;
 use crate::{Device, SimdElement, Tensor};
-use fusor_core::DataType;
 use fusor_types::FromArray;
 
-impl<D: DataType + SimdElement + Default> FromArray<0, D, (), Device> for Tensor<0, D> {
-    fn from_array(data: (), device: &Device) -> Self {
-        match device {
-            Device::Cpu => Tensor::Cpu(FromArray::from_array(data, &())),
-            Device::Gpu(gpu_device) => Tensor::Gpu(FromArray::from_array(data, gpu_device)),
-        }
-    }
-}
-
-impl<'a, I, D: DataType + SimdElement + Default + Copy> FromArray<1, D, I, Device> for Tensor<1, D>
+impl<const R: usize, D, T> FromArray<R, D, T, Device> for Tensor<R, D>
 where
-    I: IntoIterator<Item = &'a D, IntoIter: ExactSizeIterator>,
+    D: DataType + SimdElement + Default,
+    T: fusor_types::IntoFlatArray<D, R>,
 {
-    fn from_array(data: I, device: &Device) -> Self {
-        match device {
-            Device::Cpu => Tensor::Cpu(FromArray::from_array(data, &())),
-            Device::Gpu(gpu_device) => Tensor::Gpu(FromArray::from_array(data, gpu_device)),
-        }
-    }
-}
-
-impl<'a, I, I2, D: DataType + SimdElement + Default + Copy> FromArray<2, D, I, Device>
-    for Tensor<2, D>
-where
-    I: IntoIterator<Item = I2, IntoIter: ExactSizeIterator>,
-    I2: IntoIterator<Item = &'a D, IntoIter: ExactSizeIterator>,
-{
-    fn from_array(data: I, device: &Device) -> Self {
-        match device {
-            Device::Cpu => Tensor::Cpu(FromArray::from_array(data, &())),
-            Device::Gpu(gpu_device) => Tensor::Gpu(FromArray::from_array(data, gpu_device)),
-        }
-    }
-}
-
-impl<'a, I, I2, I3, D: DataType + SimdElement + Default + Copy> FromArray<3, D, I, Device>
-    for Tensor<3, D>
-where
-    I: IntoIterator<Item = I2, IntoIter: ExactSizeIterator>,
-    I2: IntoIterator<Item = I3, IntoIter: ExactSizeIterator>,
-    I3: IntoIterator<Item = &'a D, IntoIter: ExactSizeIterator>,
-{
-    fn from_array(data: I, device: &Device) -> Self {
-        match device {
-            Device::Cpu => Tensor::Cpu(FromArray::from_array(data, &())),
-            Device::Gpu(gpu_device) => Tensor::Gpu(FromArray::from_array(data, gpu_device)),
-        }
-    }
-}
-
-impl<'a, I, I2, I3, I4, D: DataType + SimdElement + Default + Copy> FromArray<4, D, I, Device>
-    for Tensor<4, D>
-where
-    I: IntoIterator<Item = I2, IntoIter: ExactSizeIterator>,
-    I2: IntoIterator<Item = I3, IntoIter: ExactSizeIterator>,
-    I3: IntoIterator<Item = I4, IntoIter: ExactSizeIterator>,
-    I4: IntoIterator<Item = &'a D, IntoIter: ExactSizeIterator>,
-{
-    fn from_array(data: I, device: &Device) -> Self {
-        match device {
-            Device::Cpu => Tensor::Cpu(FromArray::from_array(data, &())),
-            Device::Gpu(gpu_device) => Tensor::Gpu(FromArray::from_array(data, gpu_device)),
-        }
-    }
-}
-
-impl<'a, I, I2, I3, I4, I5, D: DataType + SimdElement + Default + Copy> FromArray<5, D, I, Device>
-    for Tensor<5, D>
-where
-    I: IntoIterator<Item = I2, IntoIter: ExactSizeIterator>,
-    I2: IntoIterator<Item = I3, IntoIter: ExactSizeIterator>,
-    I3: IntoIterator<Item = I4, IntoIter: ExactSizeIterator>,
-    I4: IntoIterator<Item = I5, IntoIter: ExactSizeIterator>,
-    I5: IntoIterator<Item = &'a D, IntoIter: ExactSizeIterator>,
-{
-    fn from_array(data: I, device: &Device) -> Self {
+    fn from_array(data: T, device: &Device) -> Self {
         match device {
             Device::Cpu => Tensor::Cpu(FromArray::from_array(data, &())),
             Device::Gpu(gpu_device) => Tensor::Gpu(FromArray::from_array(data, gpu_device)),
@@ -111,11 +41,9 @@ where
         let total_elements: usize = shape.iter().product();
         assert_eq!(data.len(), total_elements, "Data length must match shape");
         match device {
-            Device::Cpu => Tensor::Cpu(fusor_cpu::Tensor::from_slice(shape, data)),
+            Device::Cpu => Tensor::Cpu(crate::cpu::TypedTensor::from_slice(shape, data)),
             Device::Gpu(gpu_device) => {
-                // Create 1D tensor then reshape to desired shape
-                let t1d: fusor_core::Tensor<1, D> = fusor_core::Tensor::new(gpu_device, data);
-                Tensor::Gpu(t1d.reshape(shape))
+                Tensor::Gpu(crate::gpu::Tensor::from_slice(gpu_device, shape, data))
             }
         }
     }
@@ -136,10 +64,10 @@ where
         match device {
             Device::Cpu => {
                 let data = vec![value; shape.iter().product()];
-                Tensor::Cpu(fusor_cpu::Tensor::from_slice(shape, &data))
+                Tensor::Cpu(crate::cpu::TypedTensor::from_slice(shape, &data))
             }
             Device::Gpu(gpu_device) => {
-                Tensor::Gpu(fusor_core::Tensor::splat(gpu_device, value, shape))
+                Tensor::Gpu(crate::gpu::Tensor::splat(gpu_device, value, shape))
             }
         }
     }

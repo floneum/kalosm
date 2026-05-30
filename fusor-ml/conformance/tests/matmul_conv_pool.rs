@@ -2,7 +2,7 @@ mod common;
 
 use common::{conv1d_ncw, matmul2, pool1d_ncw};
 use fusor::{Device, Tensor};
-use fusor_conformance::{FuzzGenerator, approx_compare};
+use fusor_conformance::{FuzzGenerator, approx_compare, available_devices, f16_capable_devices};
 use rand::distr::Uniform;
 
 #[tokio::test]
@@ -105,6 +105,254 @@ async fn conv_and_pool_match_host_reference() {
         .unwrap();
 }
 
+fn conv2d_nchw_ref(
+    input: &[Vec<Vec<Vec<f32>>>],
+    weight: &[Vec<Vec<Vec<f32>>>],
+    bias: Option<&[f32]>,
+    padding: [usize; 2],
+    stride: [usize; 2],
+) -> Vec<Vec<Vec<Vec<f32>>>> {
+    let batch = input.len();
+    let in_ch = input[0].len();
+    let in_h = input[0][0].len();
+    let in_w = input[0][0][0].len();
+    let out_ch = weight.len();
+    let kh = weight[0][0].len();
+    let kw = weight[0][0][0].len();
+    let out_h = (in_h + 2 * padding[0] - kh) / stride[0] + 1;
+    let out_w = (in_w + 2 * padding[1] - kw) / stride[1] + 1;
+    let mut out = vec![vec![vec![vec![0.0f32; out_w]; out_h]; out_ch]; batch];
+    for (b, out_b) in out.iter_mut().enumerate() {
+        for (oc, out_oc) in out_b.iter_mut().enumerate() {
+            let b0 = bias.map_or(0.0, |bs| bs[oc]);
+            for (oh, out_oh) in out_oc.iter_mut().enumerate() {
+                for (ow, out_cell) in out_oh.iter_mut().enumerate() {
+                    let mut acc = b0;
+                    for ic in 0..in_ch {
+                        for (ky, weight_ky) in weight[oc][ic].iter().enumerate() {
+                            for (kx, weight_val) in weight_ky.iter().enumerate() {
+                                let iy = oh * stride[0] + ky;
+                                let ix = ow * stride[1] + kx;
+                                if iy >= padding[0]
+                                    && iy < padding[0] + in_h
+                                    && ix >= padding[1]
+                                    && ix < padding[1] + in_w
+                                {
+                                    let v = input[b][ic][iy - padding[0]][ix - padding[1]];
+                                    acc += v * weight_val;
+                                }
+                            }
+                        }
+                    }
+                    *out_cell = acc;
+                }
+            }
+        }
+    }
+    out
+}
+
+fn conv3d_ncdhw_ref(
+    input: &[Vec<Vec<Vec<Vec<f32>>>>],
+    weight: &[Vec<Vec<Vec<Vec<f32>>>>],
+    bias: Option<&[f32]>,
+    padding: [usize; 3],
+    stride: [usize; 3],
+) -> Vec<Vec<Vec<Vec<Vec<f32>>>>> {
+    let batch = input.len();
+    let in_ch = input[0].len();
+    let in_d = input[0][0].len();
+    let in_h = input[0][0][0].len();
+    let in_w = input[0][0][0][0].len();
+    let out_ch = weight.len();
+    let kd = weight[0][0].len();
+    let kh = weight[0][0][0].len();
+    let kw = weight[0][0][0][0].len();
+    let out_d = (in_d + 2 * padding[0] - kd) / stride[0] + 1;
+    let out_h = (in_h + 2 * padding[1] - kh) / stride[1] + 1;
+    let out_w = (in_w + 2 * padding[2] - kw) / stride[2] + 1;
+    let mut out = vec![vec![vec![vec![vec![0.0f32; out_w]; out_h]; out_d]; out_ch]; batch];
+    for (b, out_b) in out.iter_mut().enumerate() {
+        for (oc, out_oc) in out_b.iter_mut().enumerate() {
+            let b0 = bias.map_or(0.0, |bs| bs[oc]);
+            for (od, out_od) in out_oc.iter_mut().enumerate() {
+                for (oh, out_oh) in out_od.iter_mut().enumerate() {
+                    for (ow, out_cell) in out_oh.iter_mut().enumerate() {
+                        let mut acc = b0;
+                        for ic in 0..in_ch {
+                            for (kz, weight_kz) in weight[oc][ic].iter().enumerate() {
+                                for (ky, weight_ky) in weight_kz.iter().enumerate() {
+                                    for (kx, weight_val) in weight_ky.iter().enumerate() {
+                                        let iz = od * stride[0] + kz;
+                                        let iy = oh * stride[1] + ky;
+                                        let ix = ow * stride[2] + kx;
+                                        if iz >= padding[0]
+                                            && iz < padding[0] + in_d
+                                            && iy >= padding[1]
+                                            && iy < padding[1] + in_h
+                                            && ix >= padding[2]
+                                            && ix < padding[2] + in_w
+                                        {
+                                            let v = input[b][ic][iz - padding[0]][iy - padding[1]]
+                                                [ix - padding[2]];
+                                            acc += v * weight_val;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        *out_cell = acc;
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
+fn input_data(total: usize, seed: u32) -> Vec<f32> {
+    (0..total)
+        .map(|i| (((i + seed as usize) % 23) as f32 - 11.0) * 0.13)
+        .collect()
+}
+
+fn vec4_from_flat(flat: &[f32], shape: [usize; 4]) -> Vec<Vec<Vec<Vec<f32>>>> {
+    let mut out = vec![vec![vec![vec![0.0f32; shape[3]]; shape[2]]; shape[1]]; shape[0]];
+    let mut iter = flat.iter().copied();
+    for out_i in out.iter_mut() {
+        for out_j in out_i.iter_mut() {
+            for out_k in out_j.iter_mut() {
+                for out_l in out_k.iter_mut() {
+                    *out_l = iter.next().unwrap_or(0.0);
+                }
+            }
+        }
+    }
+    out
+}
+
+fn vec5_from_flat(flat: &[f32], shape: [usize; 5]) -> Vec<Vec<Vec<Vec<Vec<f32>>>>> {
+    let mut out =
+        vec![vec![vec![vec![vec![0.0f32; shape[4]]; shape[3]]; shape[2]]; shape[1]]; shape[0]];
+    let mut iter = flat.iter().copied();
+    for out_i in out.iter_mut() {
+        for out_j in out_i.iter_mut() {
+            for out_k in out_j.iter_mut() {
+                for out_l in out_k.iter_mut() {
+                    for out_m in out_l.iter_mut() {
+                        *out_m = iter.next().unwrap_or(0.0);
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
+fn flatten4(v: &[Vec<Vec<Vec<f32>>>]) -> Vec<f32> {
+    v.iter()
+        .flat_map(|a| {
+            a.iter()
+                .flat_map(|b| b.iter().flat_map(|c| c.iter().copied()))
+        })
+        .collect()
+}
+
+fn flatten5(v: &[Vec<Vec<Vec<Vec<f32>>>>]) -> Vec<f32> {
+    v.iter()
+        .flat_map(|a| {
+            a.iter().flat_map(|b| {
+                b.iter()
+                    .flat_map(|c| c.iter().flat_map(|d| d.iter().copied()))
+            })
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn conv2d_matches_host_reference() {
+    const BATCH: usize = 1;
+    const IN_CH: usize = 3;
+    const OUT_CH: usize = 4;
+    const H: usize = 8;
+    const W: usize = 8;
+    const KH: usize = 3;
+    const KW: usize = 3;
+    let input_flat = input_data(BATCH * IN_CH * H * W, 340);
+    let weight_flat: Vec<f32> = (0..OUT_CH * IN_CH * KH * KW)
+        .map(|i| ((i as i32 % 17) - 8) as f32 * 0.05)
+        .collect();
+    let bias_flat: Vec<f32> = [0.1, -0.2, 0.3, -0.4].to_vec();
+
+    let input_nested = vec4_from_flat(&input_flat, [BATCH, IN_CH, H, W]);
+    let weight_nested = vec4_from_flat(&weight_flat, [OUT_CH, IN_CH, KH, KW]);
+    let expected_nested = conv2d_nchw_ref(
+        &input_nested,
+        &weight_nested,
+        Some(&bias_flat),
+        [1, 1],
+        [1, 1],
+    );
+    let expected_flat = flatten4(&expected_nested);
+    let out_shape = [BATCH, OUT_CH, H, W];
+
+    for device in available_devices().await {
+        let input = Tensor::from_slice(&device, [BATCH, IN_CH, H, W], &input_flat);
+        let weight = Tensor::from_slice(&device, [OUT_CH, IN_CH, KH, KW], &weight_flat);
+        let bias = Tensor::from_slice(&device, [OUT_CH], &bias_flat);
+        let actual = input
+            .conv(&weight, Some(&bias), [1, 1], [1, 1])
+            .to_concrete();
+        let expected = Tensor::from_slice(&device, out_shape, &expected_flat);
+        fusor_conformance::approx_eq(&actual, &expected, 1e-3)
+            .await
+            .unwrap();
+    }
+}
+
+#[tokio::test]
+async fn conv3d_matches_host_reference() {
+    const BATCH: usize = 1;
+    const IN_CH: usize = 2;
+    const OUT_CH: usize = 2;
+    const DD: usize = 4;
+    const H: usize = 4;
+    const W: usize = 4;
+    const KD: usize = 3;
+    const KH: usize = 3;
+    const KW: usize = 3;
+    let input_flat = input_data(BATCH * IN_CH * DD * H * W, 350);
+    let weight_flat: Vec<f32> = (0..OUT_CH * IN_CH * KD * KH * KW)
+        .map(|i| ((i as i32 % 13) - 6) as f32 * 0.07)
+        .collect();
+    let bias_flat: Vec<f32> = [0.05, -0.05].to_vec();
+
+    let input_nested = vec5_from_flat(&input_flat, [BATCH, IN_CH, DD, H, W]);
+    let weight_nested = vec5_from_flat(&weight_flat, [OUT_CH, IN_CH, KD, KH, KW]);
+    let expected_nested = conv3d_ncdhw_ref(
+        &input_nested,
+        &weight_nested,
+        Some(&bias_flat),
+        [1, 1, 1],
+        [1, 1, 1],
+    );
+    let expected_flat = flatten5(&expected_nested);
+    let out_shape = [BATCH, OUT_CH, DD, H, W];
+
+    for device in available_devices().await {
+        let input = Tensor::from_slice(&device, [BATCH, IN_CH, DD, H, W], &input_flat);
+        let weight = Tensor::from_slice(&device, [OUT_CH, IN_CH, KD, KH, KW], &weight_flat);
+        let bias = Tensor::from_slice(&device, [OUT_CH], &bias_flat);
+        let actual = input
+            .conv(&weight, Some(&bias), [1, 1, 1], [1, 1, 1])
+            .to_concrete();
+        let expected = Tensor::from_slice(&device, out_shape, &expected_flat);
+        fusor_conformance::approx_eq(&actual, &expected, 1e-3)
+            .await
+            .unwrap();
+    }
+}
+
 #[tokio::test]
 async fn matmul_identity_matrix() {
     const M: usize = 2;
@@ -170,7 +418,6 @@ async fn matmul_attention_4d_matches_host_reference() {
     // for the deleted `fusor/src/lib.rs::test_matmul_cpu_vs_gpu`. Smaller than
     // the original [1, 8, 100, 64] to keep CI fast — the original was a
     // float-precision smoke test, not a timing regression.
-    use fusor_conformance::available_devices;
     const SHAPE: [usize; 4] = [1, 2, 16, 16];
 
     fn data(seed: u32) -> Vec<f32> {
@@ -322,6 +569,108 @@ async fn matmul_non_contiguous_input_matches_host_reference() {
     .runs(3)
     .await
     .unwrap();
+}
+
+/// Run the `M×K · K×N` f16 matmul on every f16-capable device and compare
+/// against the host CPU reference. Both f16 matmul tests below differ only
+/// in the (M, N, K) const params, so this helper holds the shared setup.
+async fn assert_f16_matmul_matches_cpu_reference<const M: usize, const N: usize, const K: usize>(
+    tolerance: half::f16,
+) {
+    use half::f16;
+
+    fn data(seed: u32, total: usize) -> Vec<f16> {
+        (0..total)
+            .map(|i| {
+                let v = ((i + seed as usize) % 31) as f32;
+                f16::from_f32((v - 15.0) * 0.05)
+            })
+            .collect()
+    }
+
+    let lhs_data = data(0, M * K);
+    let rhs_data = data(7, K * N);
+
+    let cpu_lhs: Tensor<2, f16> = Tensor::from_slice(&Device::Cpu, [M, K], &lhs_data);
+    let cpu_rhs: Tensor<2, f16> = Tensor::from_slice(&Device::Cpu, [K, N], &rhs_data);
+    let expected = cpu_lhs.matmul(&cpu_rhs).to_concrete();
+
+    for device in f16_capable_devices().await {
+        let lhs: Tensor<2, f16> = Tensor::from_slice(&device, [M, K], &lhs_data);
+        let rhs: Tensor<2, f16> = Tensor::from_slice(&device, [K, N], &rhs_data);
+        let actual = lhs.matmul(&rhs).to_concrete();
+        fusor_conformance::approx_eq(&actual, &expected, tolerance)
+            .await
+            .unwrap();
+    }
+}
+
+#[tokio::test]
+async fn f16_matmul_coop_tile_matches_host_reference() {
+    // Pins the f16 cooperative-matrix path: shape divides cleanly into the
+    // smallest coop tile (Tile64x64, BK=16). Without f16 coop support this
+    // would fall back to `batched_matmul_with_epilogues<F16, ...>`; with it,
+    // dispatch lands on `try_batched_coop_matmul::<F16, 64, 64, 16>`.
+    assert_f16_matmul_matches_cpu_reference::<64, 64, 64>(half::f16::from_f32(5e-2)).await;
+}
+
+#[tokio::test]
+async fn f16_matmul_multi_tile_matches_host_reference() {
+    // Regression for the cooperative-load bug in
+    // `batched_matmul_with_epilogues`: f16 matmul disables coop selection
+    // (allow_coop is f32-only), and tile-aligned shapes with m>32 / n>64
+    // route to the shared-tile kernel. Multi-tile in M and N is needed so
+    // the per-lane offsets that leaked into the cooperative load actually
+    // shift global_row/global_col away from the workgroup tile base.
+    assert_f16_matmul_matches_cpu_reference::<64, 96, 64>(half::f16::from_f32(5e-2)).await;
+}
+
+#[tokio::test]
+async fn matmul_non_affine_prefix_matches_host_reference() {
+    // 4D matmul with permuted batch dimensions. The contiguous source has
+    // strides `[B1*M*K, M*K, K, 1]`; permuting `[0, 1, 2, 3] -> [1, 0, 2, 3]`
+    // gives strides `[M*K, B1*M*K, K, 1]`, which is not affine across the
+    // batch prefix (`strides[0] != strides[1] * shape[1]`). This forces
+    // `flatten_matrix_layout` down the `MultiFlattenMap` branch instead of
+    // the affine `Layout::strided` fast path. Regression test for dense
+    // matmul handling of arbitrary strided inputs.
+    const B0: usize = 2;
+    const B1: usize = 3;
+    const M: usize = 4;
+    const K: usize = 5;
+    const N: usize = 6;
+
+    fn data(seed: u32, total: usize) -> Vec<f32> {
+        (0..total)
+            .map(|i| {
+                let v = ((i + seed as usize) % 31) as f32;
+                (v - 15.0) * 0.05
+            })
+            .collect()
+    }
+
+    let lhs_data = data(0, B0 * B1 * M * K);
+    let rhs_data = data(7, B0 * B1 * K * N);
+
+    let cpu_lhs = Tensor::from_slice(&Device::Cpu, [B0, B1, M, K], &lhs_data);
+    let cpu_rhs = Tensor::from_slice(&Device::Cpu, [B0, B1, K, N], &rhs_data);
+    // Swap the batch dims so the prefix becomes non-affine.
+    let expected = cpu_lhs
+        .permute([1, 0, 2, 3])
+        .matmul(&cpu_rhs.permute([1, 0, 2, 3]))
+        .to_concrete();
+
+    for device in available_devices().await {
+        let lhs = Tensor::from_slice(&device, [B0, B1, M, K], &lhs_data);
+        let rhs = Tensor::from_slice(&device, [B0, B1, K, N], &rhs_data);
+        let actual = lhs
+            .permute([1, 0, 2, 3])
+            .matmul(&rhs.permute([1, 0, 2, 3]))
+            .to_concrete();
+        fusor_conformance::approx_eq(&actual, &expected, 1e-3)
+            .await
+            .unwrap();
+    }
 }
 
 #[tokio::test]

@@ -1,7 +1,6 @@
 #![allow(unused)]
 use std::time::Duration;
 
-use candle_core::MetalDevice;
 use candle_core::backend::BackendDevice;
 use candle_nn::Module;
 use criterion::BatchSize;
@@ -16,6 +15,12 @@ use criterion::{criterion_group, criterion_main};
 use criterion::async_executor::FuturesExecutor;
 use kalosm_common::Cache;
 use kalosm_model_types::FileSource;
+
+fn candle_gpu_device() -> Option<candle_core::Device> {
+    candle_core::Device::new_cuda(0)
+        .or_else(|_| candle_core::Device::new_metal(0))
+        .ok()
+}
 
 // Benchmark LayerNorm operation
 fn layer_norm(c: &mut Criterion) {
@@ -33,6 +38,12 @@ fn layer_norm(c: &mut Criterion) {
             let path = cache.get(&source, |_| {}).await.unwrap();
             tokio::fs::read(&path).await.unwrap()
         });
+
+    let mut group = c.benchmark_group("layer_norm");
+    group.sample_size(20);
+    group.plot_config(
+        criterion::PlotConfiguration::default().summary_scale(criterion::AxisScale::Logarithmic),
+    );
 
     for batch_size in [1, 32, 512] {
         for seq_len in [13, 128, 512] {
@@ -66,13 +77,10 @@ fn layer_norm(c: &mut Criterion) {
                     .ok()
                     .map(|b| b.dequantize());
 
-                let mut group =
-                    c.benchmark_group(format!("layer_norm-fusor-{batch_size}x{seq_len}"));
-
                 let device = device.clone();
                 let random_data = random_data.clone();
                 group.bench_with_input(
-                    BenchmarkId::new("layer_norm-fusor", format!("{batch_size}x{seq_len}")),
+                    BenchmarkId::new("fusor-gpu", format!("{batch_size}x{seq_len}")),
                     &(batch_size, seq_len),
                     move |b, &(batch_size, seq_len)| {
                         let device = device.clone();
@@ -124,26 +132,25 @@ fn layer_norm(c: &mut Criterion) {
                     layer_norm_shape,
                     random_data.clone(),
                     candle_device,
-                    "layer_norm-candle-cpu",
-                    c,
+                    "candle-cpu",
+                    &mut group,
                 );
             }
 
-            // Candle LayerNorm benchmark on Metal (macOS only)
-            #[cfg(target_os = "macos")]
-            {
-                let candle_device = candle_core::Device::Metal(MetalDevice::new(0).unwrap());
+            // Candle LayerNorm benchmark on GPU.
+            if let Some(candle_device) = candle_gpu_device() {
                 bench_candle_layer_norm(
                     &bytes,
                     layer_norm_shape,
                     random_data.clone(),
                     candle_device,
-                    "layer_norm-candle-metal",
-                    c,
+                    "candle-gpu",
+                    &mut group,
                 );
             }
         }
     }
+    group.finish();
 }
 
 /// Common shape parameters for the BERT block benches; bundled to keep
@@ -161,7 +168,7 @@ fn bench_candle_layer_norm(
     random_data: Vec<Vec<Vec<f32>>>,
     candle_device: candle_core::Device,
     name: &str,
-    c: &mut Criterion,
+    group: &mut criterion::BenchmarkGroup<'_, criterion::measurement::WallTime>,
 ) {
     let BertShape {
         batch_size,
@@ -189,9 +196,6 @@ fn bench_candle_layer_norm(
         .unwrap();
 
     let layer_norm = candle_nn::LayerNorm::new(weight, bias, 1e-12);
-
-    let mut group = c.benchmark_group(format!("{name}-{batch_size}x{seq_len}"));
-    group.sample_size(20);
 
     group.bench_with_input(
         BenchmarkId::new(name, format!("{batch_size}x{seq_len}")),
@@ -238,6 +242,12 @@ fn self_attention(c: &mut Criterion) {
             tokio::fs::read(&path).await.unwrap()
         });
 
+    let mut group = c.benchmark_group("self_attention");
+    group.sample_size(20);
+    group.plot_config(
+        criterion::PlotConfiguration::default().summary_scale(criterion::AxisScale::Logarithmic),
+    );
+
     for batch_size in [1, 32] {
         for seq_len in [13, 128] {
             if batch_size * seq_len >= 32 * 128 {
@@ -265,13 +275,10 @@ fn self_attention(c: &mut Criterion) {
                 let key = Linear::load(&device, &mut var_builder.pp("blk.0.attn_k")).unwrap();
                 let value = Linear::load(&device, &mut var_builder.pp("blk.0.attn_v")).unwrap();
 
-                let mut group =
-                    c.benchmark_group(format!("self_attention-fusor-{batch_size}x{seq_len}"));
-
                 let device = device.clone();
                 let random_data = random_data.clone();
                 group.bench_with_input(
-                    BenchmarkId::new("self_attention-fusor", format!("{batch_size}x{seq_len}")),
+                    BenchmarkId::new("fusor-gpu", format!("{batch_size}x{seq_len}")),
                     &(batch_size, seq_len),
                     move |b, &(batch_size, seq_len)| {
                         let device = device.clone();
@@ -296,18 +303,22 @@ fn self_attention(c: &mut Criterion) {
                                     let k = key.forward(&tensor);
                                     let v = value.forward(&tensor);
 
-                                    let q = q.reshape([batch_size, seq_len, num_heads, head_size]);
-                                    let q = q.transpose(1, 2);
-                                    let k = k.reshape([batch_size, seq_len, num_heads, head_size]);
-                                    let k = k.transpose(1, 2);
-                                    let v = v.reshape([batch_size, seq_len, num_heads, head_size]);
-                                    let v = v.transpose(1, 2);
+                                    let q_reshaped =
+                                        q.reshape([batch_size, seq_len, num_heads, head_size]);
+                                    let k_reshaped =
+                                        k.reshape([batch_size, seq_len, num_heads, head_size]);
+                                    let v_reshaped =
+                                        v.reshape([batch_size, seq_len, num_heads, head_size]);
+                                    let q = q_reshaped.transpose(1, 2).to_concrete();
+                                    let k = k_reshaped.transpose(1, 2).to_concrete();
+                                    let v = v_reshaped.transpose(1, 2).to_concrete();
 
-                                    let scores =
-                                        q.mat_mul(&k.t()).div_scalar((head_size as f32).sqrt());
-                                    let probs = scores.softmax_last_dim::<3>();
-
-                                    let context = probs.mat_mul(&v);
+                                    let context = q.flash_attention(
+                                        &k,
+                                        &v,
+                                        1.0 / (head_size as f32).sqrt(),
+                                        None,
+                                    );
                                     let context = context.transpose(1, 2);
                                     let output = context.flatten_last_n::<1, _>();
 
@@ -327,17 +338,15 @@ fn self_attention(c: &mut Criterion) {
                 seq_len,
                 hidden_size,
             };
-            #[cfg(target_os = "macos")]
-            {
-                let candle_device = candle_core::Device::Metal(MetalDevice::new(0).unwrap());
+            if let Some(candle_device) = candle_gpu_device() {
                 bench_candle_self_attention(
                     &bytes,
                     attn_shape,
                     num_heads,
                     random_data.clone(),
                     candle_device,
-                    "self_attention-candle-metal",
-                    c,
+                    "candle-gpu",
+                    &mut group,
                 );
             }
 
@@ -349,12 +358,13 @@ fn self_attention(c: &mut Criterion) {
                     num_heads,
                     random_data.clone(),
                     candle_device,
-                    "self_attention-candle-cpu",
-                    c,
+                    "candle-cpu",
+                    &mut group,
                 );
             }
         }
     }
+    group.finish();
 }
 
 fn bench_candle_self_attention(
@@ -364,7 +374,7 @@ fn bench_candle_self_attention(
     random_data: Vec<Vec<Vec<f32>>>,
     candle_device: candle_core::Device,
     name: &str,
-    c: &mut Criterion,
+    group: &mut criterion::BenchmarkGroup<'_, criterion::measurement::WallTime>,
 ) {
     let BertShape {
         batch_size,
@@ -415,9 +425,6 @@ fn bench_candle_self_attention(
     let v_linear = Linear::from_arc(v_weight, Some(v_bias)).unwrap();
 
     let head_size = hidden_size / num_heads;
-
-    let mut group = c.benchmark_group(format!("{name}-{batch_size}x{seq_len}"));
-    group.sample_size(20);
 
     group.bench_with_input(
         BenchmarkId::new(name, format!("{batch_size}x{seq_len}")),
@@ -504,6 +511,12 @@ fn ffn_block(c: &mut Criterion) {
             tokio::fs::read(&path).await.unwrap()
         });
 
+    let mut group = c.benchmark_group("ffn_block");
+    group.sample_size(20);
+    group.plot_config(
+        criterion::PlotConfiguration::default().summary_scale(criterion::AxisScale::Logarithmic),
+    );
+
     for batch_size in [1, 32, 512] {
         for seq_len in [13, 128] {
             if batch_size * seq_len >= 512 * 128 {
@@ -529,13 +542,10 @@ fn ffn_block(c: &mut Criterion) {
                 let ffn_down =
                     Linear::load(&device, &mut var_builder.pp("blk.0.ffn_down")).unwrap();
 
-                let mut group =
-                    c.benchmark_group(format!("ffn_block-fusor-{batch_size}x{seq_len}"));
-
                 let device = device.clone();
                 let random_data = random_data.clone();
                 group.bench_with_input(
-                    BenchmarkId::new("ffn_block-fusor", format!("{batch_size}x{seq_len}")),
+                    BenchmarkId::new("fusor-gpu", format!("{batch_size}x{seq_len}")),
                     &(batch_size, seq_len),
                     move |b, &(batch_size, seq_len)| {
                         let device = device.clone();
@@ -577,16 +587,14 @@ fn ffn_block(c: &mut Criterion) {
                 seq_len,
                 hidden_size,
             };
-            #[cfg(target_os = "macos")]
-            {
-                let candle_device = candle_core::Device::Metal(MetalDevice::new(0).unwrap());
+            if let Some(candle_device) = candle_gpu_device() {
                 bench_candle_ffn(
                     &bytes,
                     ffn_shape,
                     random_data.clone(),
                     candle_device,
-                    "ffn_block-candle-metal",
-                    c,
+                    "candle-gpu",
+                    &mut group,
                 );
             }
 
@@ -597,12 +605,13 @@ fn ffn_block(c: &mut Criterion) {
                     ffn_shape,
                     random_data.clone(),
                     candle_device,
-                    "ffn_block-candle-cpu",
-                    c,
+                    "candle-cpu",
+                    &mut group,
                 );
             }
         }
     }
+    group.finish();
 }
 
 fn bench_candle_ffn(
@@ -611,7 +620,7 @@ fn bench_candle_ffn(
     random_data: Vec<Vec<Vec<f32>>>,
     candle_device: candle_core::Device,
     name: &str,
-    c: &mut Criterion,
+    group: &mut criterion::BenchmarkGroup<'_, criterion::measurement::WallTime>,
 ) {
     let BertShape {
         batch_size,
@@ -649,9 +658,6 @@ fn bench_candle_ffn(
 
     let up_linear = Linear::from_arc(up_weight, Some(up_bias)).unwrap();
     let down_linear = Linear::from_arc(down_weight, Some(down_bias)).unwrap();
-
-    let mut group = c.benchmark_group(format!("{name}-{batch_size}x{seq_len}"));
-    group.sample_size(20);
 
     group.bench_with_input(
         BenchmarkId::new(name, format!("{batch_size}x{seq_len}")),

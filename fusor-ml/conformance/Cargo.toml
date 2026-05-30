@@ -5,9 +5,7 @@ edition = "2024"
 publish = false
 
 [dependencies]
-fusor = { path = "../fusor" }
-fusor-cpu = { path = "../cpu" }
-fusor-core = { path = "../core" }
+fusor = { path = "../fusor", features = ["graphvis"] }
 tokio = { version = "1", features = ["full"] }
 rand = { workspace = true }
 half = "2.4"

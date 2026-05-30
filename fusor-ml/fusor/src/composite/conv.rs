@@ -1,7 +1,7 @@
 //! Convolution operations that work on both CPU and GPU backends.
 
+use crate::gpu::{DataType, FloatDataType};
 use crate::{ConcreteTensor, FloatOps, MatmulImpl, SimdElement, Tensor};
-use fusor_core::{DataType, FloatDataType};
 use fusor_types::SlidingWindow;
 
 impl<const R: usize, D> Tensor<R, D>
@@ -80,11 +80,11 @@ where
         strides: [usize; DIFF],
     ) -> Self
     where
-        ConcreteTensor<D, R>: fusor_cpu::LargerRank<R2, DIFF, D>,
-        fusor_core::Tensor<R, D>: fusor_core::LargerRank<DIFF, R2, D>,
-        crate::MulOp: fusor_cpu::SimdBinaryOp<D>,
-        crate::AddOp: fusor_cpu::SimdBinaryOp<D>,
-        fusor_cpu::SumOp: fusor_cpu::SimdReduceOp<D>,
+        ConcreteTensor<D, R>: crate::cpu::LargerRank<R2, DIFF, D>,
+        crate::gpu::Tensor<R, D>: crate::gpu::LargerRank<DIFF, R2, D>,
+        crate::MulOp: crate::cpu::SimdBinaryOp<D>,
+        crate::AddOp: crate::cpu::SimdBinaryOp<D>,
+        crate::cpu::SumOp: crate::cpu::SimdReduceOp<D>,
     {
         // Extract dimensions
         let input_shape = self.shape();

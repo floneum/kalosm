@@ -5,8 +5,7 @@
 //! `cpu/src/slice_assign.rs::{test_slice_assign_out_of_bounds, test_slice_assign_shape_mismatch}`,
 //! and `cpu/src/quantized.rs::{test_invalid_shape_not_multiple_of_block_size, test_invalid_block_count}`.
 
-use fusor::{Device, QMatrix, Tensor};
-use fusor_cpu::GgmlType;
+use fusor::{Device, GgmlType, QMatrix, Tensor};
 
 #[test]
 #[should_panic]

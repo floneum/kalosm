@@ -1,16 +1,18 @@
 //! Layer normalization implementation.
 
-use crate::{ConcreteTensor, Device, SimdElement, Tensor, VarBuilder};
-use fusor_core::{DataType, FloatDataType};
-use fusor_cpu::{FloatOps, TensorBacking};
+use crate::fusion::Concrete;
+use crate::{
+    DataType, Device, DivOp, FloatDataType, FloatOps, Fusion, MulOp, SimdBinaryOp, SimdElement,
+    SimdReduceOp, SimdUnaryOp, SqrtOp, SubOp, SumOp, Tensor, VarBuilder,
+};
 
 /// Layer Normalization.
 ///
 /// Normalizes the input over the last dimension.
 /// Formula: output = (input - mean) / sqrt(variance + eps) * weight + bias
 pub struct LayerNorm<const N: usize, D: SimdElement> {
-    weight: Tensor<N, D, ConcreteTensor<D, N>>,
-    bias: Option<Tensor<N, D, ConcreteTensor<D, N>>>,
+    weight: Tensor<N, D, Concrete<D, N>>,
+    bias: Option<Tensor<N, D, Concrete<D, N>>>,
     eps: f32,
 }
 
@@ -22,20 +24,20 @@ where
     ///
     /// Weight and bias should have shape (normalized_dim,).
     pub fn new(
-        weight: Tensor<N, D, ConcreteTensor<D, N>>,
-        bias: Option<Tensor<N, D, ConcreteTensor<D, N>>>,
+        weight: Tensor<N, D, Concrete<D, N>>,
+        bias: Option<Tensor<N, D, Concrete<D, N>>>,
         eps: f32,
     ) -> Self {
         Self { weight, bias, eps }
     }
 
     /// Get the weight tensor.
-    pub fn weight(&self) -> &Tensor<N, D, ConcreteTensor<D, N>> {
+    pub fn weight(&self) -> &Tensor<N, D, Concrete<D, N>> {
         &self.weight
     }
 
     /// Get the bias tensor if present.
-    pub fn bias(&self) -> Option<&Tensor<N, D, ConcreteTensor<D, N>>> {
+    pub fn bias(&self) -> Option<&Tensor<N, D, Concrete<D, N>>> {
         self.bias.as_ref()
     }
 
@@ -52,19 +54,19 @@ where
     /// Forward pass for 2D input (batch, features).
     ///
     /// Normalizes over the last dimension (features).
-    pub fn forward_2d<B>(&self, input: &Tensor<2, D, B>) -> Tensor<2, D, ConcreteTensor<D, 2>>
+    pub fn forward_2d<B>(&self, input: &Tensor<2, D, B>) -> Tensor<2, D, Concrete<D, 2>>
     where
         D: std::ops::Add<Output = D>
             + std::ops::Sub<Output = D>
             + std::ops::Mul<Output = D>
             + std::ops::Div<Output = D>,
-        crate::AddOp: fusor_cpu::SimdBinaryOp<D>,
-        crate::SubOp: fusor_cpu::SimdBinaryOp<D>,
-        crate::MulOp: fusor_cpu::SimdBinaryOp<D>,
-        crate::DivOp: fusor_cpu::SimdBinaryOp<D>,
-        fusor_cpu::SumOp: fusor_cpu::SimdReduceOp<D>,
-        fusor_cpu::SqrtOp: fusor_cpu::SimdUnaryOp<D>,
-        B: TensorBacking<2, Elem = D>,
+        crate::AddOp: SimdBinaryOp<D>,
+        SubOp: SimdBinaryOp<D>,
+        MulOp: SimdBinaryOp<D>,
+        DivOp: SimdBinaryOp<D>,
+        SumOp: SimdReduceOp<D>,
+        SqrtOp: SimdUnaryOp<D>,
+        B: Fusion<2, D>,
     {
         // Broadcast weight to input shape
         let weight_broadcast: Tensor<2, D, _> = self.weight.broadcast_as(input.shape());
@@ -81,19 +83,19 @@ where
     /// Forward pass for 3D input (batch, seq_len, features).
     ///
     /// Normalizes over the last dimension (features).
-    pub fn forward<B>(&self, input: &Tensor<3, D, B>) -> Tensor<3, D, ConcreteTensor<D, 3>>
+    pub fn forward<B>(&self, input: &Tensor<3, D, B>) -> Tensor<3, D, Concrete<D, 3>>
     where
         D: std::ops::Add<Output = D>
             + std::ops::Sub<Output = D>
             + std::ops::Mul<Output = D>
             + std::ops::Div<Output = D>,
-        crate::AddOp: fusor_cpu::SimdBinaryOp<D>,
-        crate::SubOp: fusor_cpu::SimdBinaryOp<D>,
-        crate::MulOp: fusor_cpu::SimdBinaryOp<D>,
-        crate::DivOp: fusor_cpu::SimdBinaryOp<D>,
-        fusor_cpu::SumOp: fusor_cpu::SimdReduceOp<D>,
-        fusor_cpu::SqrtOp: fusor_cpu::SimdUnaryOp<D>,
-        B: TensorBacking<3, Elem = D>,
+        crate::AddOp: SimdBinaryOp<D>,
+        SubOp: SimdBinaryOp<D>,
+        MulOp: SimdBinaryOp<D>,
+        DivOp: SimdBinaryOp<D>,
+        SumOp: SimdReduceOp<D>,
+        SqrtOp: SimdUnaryOp<D>,
+        B: Fusion<3, D>,
     {
         // Broadcast weight to input shape
         let weight_broadcast: Tensor<3, D, _> = self.weight.broadcast_as(input.shape());
@@ -115,7 +117,7 @@ impl LayerNorm<1, f32> {
     /// as it computes mean, variance, and normalization in fewer passes.
     pub fn forward_fused<B>(&self, input: &Tensor<3, f32, B>) -> Tensor<3, f32>
     where
-        B: TensorBacking<3, Elem = f32>,
+        B: Fusion<3, f32>,
     {
         input.layer_norm_last_dim_fused::<2, 1, _, _>(&self.weight, self.bias.as_ref(), self.eps)
     }

@@ -1,7 +1,7 @@
 use rustc_hash::FxHashMap;
 
 use super::queue::ComputeQueue;
-use super::{ComputeGraphInner, ComputeGraphNodeVariant, NodeIndex, layout_pass};
+use super::{ComputeGraphInner, ComputeGraphNodeVariant, GraphOperation, NodeIndex, layout_pass};
 use tabbycat::Graph;
 use tabbycat::{Edge, GraphBuilder, GraphType, Identity, Stmt, StmtList};
 
@@ -57,7 +57,17 @@ impl GraphVisPass {
     ) {
         let input = self.identities.get(&operation.input).unwrap();
         let output_layout = self.layout_pass.output_layout.get(&key).unwrap();
-        let id = Identity::quoted(format!("qmatmul ({}) #{:?}", output_layout, key));
+        let label = operation
+            .paired
+            .as_ref()
+            .map(|p| p.epilogue.label())
+            .unwrap_or("");
+        let header = if label.is_empty() {
+            format!("qmatmul ({}) #{:?}", output_layout, key)
+        } else {
+            format!("qmatmul_{label} ({}) #{:?}", output_layout, key)
+        };
+        let id = Identity::quoted(header);
         self.statements.push(Stmt::Node {
             id: id.clone(),
             port: None,
@@ -86,6 +96,66 @@ impl GraphVisPass {
         self.statements.push(Stmt::Edge(
             Edge::head_node(input.clone(), None).arrow_to_node(id.clone(), None),
         ));
+        self.identities.insert(key, id.clone());
+    }
+
+    fn visit_graph_op(&mut self, key: NodeIndex, operation: &dyn GraphOperation) {
+        let output_layout = self.layout_pass.output_layout.get(&key).unwrap();
+        let id = Identity::quoted(format!(
+            "{} ({}) #{:?}",
+            operation.category(),
+            output_layout,
+            key
+        ));
+        self.statements.push(Stmt::Node {
+            id: id.clone(),
+            port: None,
+            attr: None,
+        });
+
+        let mut dependencies = Vec::new();
+        operation.visit_dependencies(&mut |dependency| {
+            dependencies.push(dependency);
+        });
+        for dependency in dependencies {
+            let dependency = self.identities.get(&dependency).unwrap();
+            self.statements.push(Stmt::Edge(
+                Edge::head_node(dependency.clone(), None).arrow_to_node(id.clone(), None),
+            ));
+        }
+        self.identities.insert(key, id.clone());
+    }
+
+    fn visit_flash_attention(
+        &mut self,
+        key: NodeIndex,
+        operation: &crate::FlashAttentionOperation,
+    ) {
+        let q = self.identities.get(&operation.q).unwrap();
+        let k = self.identities.get(&operation.k).unwrap();
+        let v = self.identities.get(&operation.v).unwrap();
+        let output_layout = self.layout_pass.output_layout.get(&key).unwrap();
+        let id = Identity::quoted(format!("flash_attention ({}) #{:?}", output_layout, key));
+        self.statements.push(Stmt::Node {
+            id: id.clone(),
+            port: None,
+            attr: None,
+        });
+        self.statements.push(Stmt::Edge(
+            Edge::head_node(q.clone(), None).arrow_to_node(id.clone(), None),
+        ));
+        self.statements.push(Stmt::Edge(
+            Edge::head_node(k.clone(), None).arrow_to_node(id.clone(), None),
+        ));
+        self.statements.push(Stmt::Edge(
+            Edge::head_node(v.clone(), None).arrow_to_node(id.clone(), None),
+        ));
+        if let Some(mask) = operation.mask {
+            let mask = self.identities.get(&mask).unwrap();
+            self.statements.push(Stmt::Edge(
+                Edge::head_node(mask.clone(), None).arrow_to_node(id.clone(), None),
+            ));
+        }
         self.identities.insert(key, id.clone());
     }
 
@@ -161,6 +231,25 @@ impl GraphVisPass {
         self.identities.insert(key, id.clone());
     }
 
+    fn visit_q_embedding(
+        &mut self,
+        key: NodeIndex,
+        operation: &crate::quantized::embedding::QEmbeddingOperation,
+    ) {
+        let indexes = self.identities.get(&operation.indexes).unwrap();
+        let output_layout = self.layout_pass.output_layout.get(&key).unwrap();
+        let id = Identity::quoted(format!("q_embedding ({}) #{:?}", output_layout, key));
+        self.statements.push(Stmt::Node {
+            id: id.clone(),
+            port: None,
+            attr: None,
+        });
+        self.statements.push(Stmt::Edge(
+            Edge::head_node(indexes.clone(), None).arrow_to_node(id.clone(), None),
+        ));
+        self.identities.insert(key, id.clone());
+    }
+
     fn visit_tensor(&mut self, key: NodeIndex, _operation: &crate::tensor::TensorData) {
         let output_layout = self.layout_pass.output_layout.get(&key).unwrap();
         let id = Identity::quoted(format!("tensor ({}) #{:?}", output_layout, key));
@@ -168,27 +257,6 @@ impl GraphVisPass {
             id: id.clone(),
             port: None,
             attr: None,
-        });
-        self.identities.insert(key, id.clone());
-    }
-
-    fn visit_custom(
-        &mut self,
-        key: NodeIndex,
-        operation: &std::sync::Arc<dyn crate::mir::operation::Operation + Send + Sync>,
-    ) {
-        let output_layout = self.layout_pass.output_layout.get(&key).unwrap();
-        let id = Identity::quoted(format!("custom ({}) #{:?}", output_layout, key));
-        self.statements.push(Stmt::Node {
-            id: id.clone(),
-            port: None,
-            attr: None,
-        });
-        operation.visit_dependencies(&mut |dep| {
-            let dep_id = self.identities.get(&dep).unwrap();
-            self.statements.push(Stmt::Edge(
-                Edge::head_node(dep_id.clone(), None).arrow_to_node(id.clone(), None),
-            ));
         });
         self.identities.insert(key, id.clone());
     }
@@ -239,7 +307,16 @@ impl ComputeGraphInner {
                 ComputeGraphNodeVariant::Nary(op) => graph_vis_pass.visit_nary(node, op),
                 ComputeGraphNodeVariant::MatMul(op) => graph_vis_pass.visit_mat_mul(node, op),
                 ComputeGraphNodeVariant::QMatMul(op) => graph_vis_pass.visit_q_mat_mul(node, op),
+                ComputeGraphNodeVariant::QEmbedding(op) => {
+                    graph_vis_pass.visit_q_embedding(node, op)
+                }
                 ComputeGraphNodeVariant::Reduce(op) => graph_vis_pass.visit_reduce(node, op),
+                ComputeGraphNodeVariant::FlashAttention(op) => {
+                    graph_vis_pass.visit_flash_attention(node, op)
+                }
+                ComputeGraphNodeVariant::GraphOp(op) => {
+                    graph_vis_pass.visit_graph_op(node, op.as_ref())
+                }
                 ComputeGraphNodeVariant::MapLayout(op) => graph_vis_pass.visit_map_layout(node, op),
                 ComputeGraphNodeVariant::Resize(op) => graph_vis_pass.visit_resize(node, op),
                 ComputeGraphNodeVariant::SliceAssign(op) => {
@@ -249,7 +326,6 @@ impl ComputeGraphInner {
                 ComputeGraphNodeVariant::Dequantize(op) => {
                     graph_vis_pass.visit_dequantize(node, op)
                 }
-                ComputeGraphNodeVariant::Custom(op) => graph_vis_pass.visit_custom(node, op),
             }
         }
 

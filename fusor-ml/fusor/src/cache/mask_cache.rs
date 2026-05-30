@@ -1,7 +1,7 @@
 //! Mask cache implementation for efficient attention mask management.
 
+use crate::gpu::FloatDataType;
 use crate::{ConcreteTensor, Device, SimdElement, Tensor};
-use fusor_core::FloatDataType;
 
 use super::AttentionMask;
 
@@ -24,7 +24,8 @@ impl<D: SimdElement> Default for MaskCache<D> {
 
 impl<D: SimdElement + FloatDataType + Default> MaskCache<D>
 where
-    crate::AddOp: fusor_cpu::SimdBinaryOp<D>,
+    crate::AddOp: crate::cpu::SimdBinaryOp<D>,
+    D: Copy,
 {
     /// Get or create a causal mask for the given sequence length
     ///
@@ -71,7 +72,8 @@ where
 
         // If we have an offset, we need to pad the mask
         if seqlen_offset > 0 {
-            // Pad the mask on the left with zeros
+            // Pad the mask on the left with zeros — no longer a pure
+            // strict-lower-triangular causal mask, so don't mark it as such.
             let mask_tensor = mask.mask();
             let [rows, cols] = mask_tensor.shape();
             let zeros: Tensor<2, D> = Tensor::zeros(device, [rows, seqlen_offset + cols]);
@@ -103,13 +105,13 @@ where
         }
 
         let mask: Tensor<2, D, ConcreteTensor<D, 2>> = match device {
-            Device::Cpu => Tensor::Cpu(fusor_cpu::Tensor::from_slice(
+            Device::Cpu => Tensor::Cpu(crate::cpu::TypedTensor::from_slice(
                 [seq_len, seq_len],
                 &mask_data,
             )),
             Device::Gpu(gpu) => {
                 let data_chunks: Vec<&[D]> = mask_data.chunks(seq_len).collect();
-                Tensor::Gpu(fusor_core::Tensor::new(gpu, data_chunks))
+                Tensor::Gpu(crate::gpu::Tensor::new(gpu, data_chunks))
             }
         };
         AttentionMask::new(mask)

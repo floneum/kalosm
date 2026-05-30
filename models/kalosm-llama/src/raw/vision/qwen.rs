@@ -485,7 +485,7 @@ async fn test_loading_qwen_vision() {
         }
     }
 
-    // Create random tensor using fusor-core
+    // Create random tensor using fusor
     let hidden_states_data: Vec<f32> = (0..1944 * 1176).map(|_| rand::random()).collect();
     let hidden_states: Tensor<2, f32> = Tensor::new(&device, &hidden_states_data)
         .reshape([1944, 1176])
