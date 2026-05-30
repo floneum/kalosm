@@ -39,7 +39,6 @@ const SEGMENT_EVERYTHING_BATCH_SIZE: usize = 64;
 #[derive(Default)]
 pub struct SegmentAnythingBuilder {
     source: SegmentAnythingSource,
-    device: Option<Device>,
     local_path: Option<std::path::PathBuf>,
 }
 
@@ -47,14 +46,6 @@ impl SegmentAnythingBuilder {
     /// Sets the source of the model.
     pub fn source(mut self, source: SegmentAnythingSource) -> Self {
         self.source = source;
-        self
-    }
-
-    /// Sets the fusor device used to load and run the model.
-    ///
-    /// When not specified, the builder prefers GPU and falls back to CPU.
-    pub fn device(mut self, device: Device) -> Self {
-        self.device = Some(device);
         self
     }
 
@@ -73,12 +64,9 @@ impl SegmentAnythingBuilder {
     }
 }
 
-/// Supported Segment Anything checkpoint architectures.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SegmentAnythingArchitecture {
-    /// MobileSAM TinyViT checkpoint layout.
+enum SegmentAnythingArchitecture {
     MobileSamTiny,
-    /// Original SAM ViT-B checkpoint layout.
     SamVitB,
 }
 
@@ -91,9 +79,6 @@ pub struct SegmentAnythingSource {
 
 impl SegmentAnythingSource {
     /// Creates a new [`SegmentAnythingSource`] for a SAM ViT-B checkpoint.
-    ///
-    /// Use [`SegmentAnythingSource::with_architecture`] for custom MobileSAM
-    /// TinyViT checkpoints.
     pub fn new(model: impl Into<String>, filename: impl Into<String>) -> Self {
         Self {
             model: model.into(),
@@ -102,16 +87,18 @@ impl SegmentAnythingSource {
         }
     }
 
-    /// Sets the architecture used to interpret the GGUF tensor names.
-    pub fn with_architecture(mut self, architecture: SegmentAnythingArchitecture) -> Self {
-        self.architecture = architecture;
-        self
+    /// Creates a new [`SegmentAnythingSource`] for a MobileSAM TinyViT checkpoint.
+    pub fn mobile_sam_tiny(model: impl Into<String>, filename: impl Into<String>) -> Self {
+        Self {
+            model: model.into(),
+            filename: filename.into(),
+            architecture: SegmentAnythingArchitecture::MobileSamTiny,
+        }
     }
 
     /// Create the tiny SAM model source.
     pub fn tiny() -> Self {
-        Self::new("Demonthos/MobileSamGguf", "mobile_sam-tiny-vitt.gguf")
-            .with_architecture(SegmentAnythingArchitecture::MobileSamTiny)
+        Self::mobile_sam_tiny("Demonthos/MobileSamGguf", "mobile_sam-tiny-vitt.gguf")
     }
 
     /// Create a normal sized model source.
@@ -245,11 +232,7 @@ impl SegmentAnything {
     }
 
     async fn new(settings: SegmentAnythingBuilder) -> Result<Self, LoadSegmentAnythingError> {
-        let SegmentAnythingBuilder {
-            source,
-            device,
-            local_path,
-        } = settings;
+        let SegmentAnythingBuilder { source, local_path } = settings;
         let model_path = match local_path {
             Some(path) => path,
             None => {
@@ -258,10 +241,7 @@ impl SegmentAnything {
                 kalosm_common::Cache::default().get(&source, |_| {}).await?
             }
         };
-        let device = match device {
-            Some(device) => device,
-            None => Device::auto().await,
-        };
+        let device = Device::auto().await;
         let mut reader = std::io::BufReader::new(std::fs::File::open(&model_path)?);
         let mut vb = VarBuilder::from_gguf(&mut reader)
             .map_err(|e| fusor::Error::msg(format!("Failed to read GGUF: {e}")))?;
