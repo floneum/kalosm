@@ -12,6 +12,12 @@ use criterion::{criterion_group, criterion_main};
 
 use criterion::async_executor::FuturesExecutor;
 
+fn candle_gpu_device() -> Option<candle_core::Device> {
+    candle_core::Device::new_cuda(0)
+        .or_else(|_| candle_core::Device::new_metal(0))
+        .ok()
+}
+
 // Sizes: [batch_size, num_heads, seq_len, head_dim]
 const SIZES: [[usize; 4]; 8] = [
     [1, 32, 128, 64],  // Small sequence
@@ -64,7 +70,11 @@ async fn setup_fusor_tensors(
 }
 
 fn rope_benchmark(c: &mut Criterion) {
-    let mut group = c.benchmark_group("rope-fusor");
+    let mut group = c.benchmark_group("rope");
+    group.sample_size(20);
+    group.plot_config(
+        criterion::PlotConfiguration::default().summary_scale(criterion::AxisScale::Logarithmic),
+    );
 
     for [batch, heads, seq_len, head_dim] in SIZES {
         // Composite interleaved (CPU or GPU composite path)
@@ -72,7 +82,7 @@ fn rope_benchmark(c: &mut Criterion) {
         let device_ref = device.clone();
         group.bench_with_input(
             BenchmarkId::new(
-                "rope_interleaved",
+                "fusor-gpu-interleaved",
                 format!("{}x{}x{}x{}", batch, heads, seq_len, head_dim),
             ),
             &(batch, heads, seq_len, head_dim),
@@ -104,7 +114,7 @@ fn rope_benchmark(c: &mut Criterion) {
         let device_ref = device.clone();
         group.bench_with_input(
             BenchmarkId::new(
-                "rope_fused",
+                "fusor-gpu-fused",
                 format!("{}x{}x{}x{}", batch, heads, seq_len, head_dim),
             ),
             &(batch, heads, seq_len, head_dim),
@@ -131,31 +141,30 @@ fn rope_benchmark(c: &mut Criterion) {
             },
         );
     }
-    group.finish();
 
-    // Benchmark candle's rope_i on Metal (macOS only)
-    #[cfg(target_os = "macos")]
-    {
-        let candle_device = candle_core::Device::Metal(candle_core::MetalDevice::new(0).unwrap());
-        bench_candle_rope(candle_device, "rope-candle-metal", c);
+    // Benchmark candle's rope_i on GPU.
+    if let Some(candle_device) = candle_gpu_device() {
+        bench_candle_rope(candle_device, "candle-gpu", &mut group);
     }
 
     // Benchmark candle's rope_i on CPU
     {
         let candle_device = candle_core::Device::Cpu;
-        bench_candle_rope(candle_device, "rope-candle-cpu", c);
+        bench_candle_rope(candle_device, "candle-cpu", &mut group);
     }
+    group.finish();
 }
 
-fn bench_candle_rope(candle_device: candle_core::Device, name: &str, c: &mut Criterion) {
-    let mut group = c.benchmark_group(name);
-    let group = group.sample_size(20);
-
+fn bench_candle_rope(
+    candle_device: candle_core::Device,
+    name: &str,
+    group: &mut criterion::BenchmarkGroup<'_, criterion::measurement::WallTime>,
+) {
     for [batch, heads, seq_len, head_dim] in SIZES {
         let candle_device = candle_device.clone();
         group.bench_with_input(
             BenchmarkId::new(
-                "rope_i",
+                name,
                 format!("{}x{}x{}x{}", batch, heads, seq_len, head_dim),
             ),
             &(batch, heads, seq_len, head_dim),

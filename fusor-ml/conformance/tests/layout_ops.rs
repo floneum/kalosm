@@ -286,49 +286,31 @@ async fn sliding_window_then_transpose_then_reshape_matches_expected() {
 }
 
 #[tokio::test]
-async fn transpose_then_reshape_preserves_logical_order() {
-    let input_data: Vec<f32> = (0..24).map(|i| i as f32).collect();
-    let mut expected = Vec::new();
-    for b in 0..2 {
-        for col in 0..4 {
-            for row in 0..3 {
-                expected.push(input_data[(b * 3 + row) * 4 + col]);
+async fn transpose_reshape_consumed_by_elementwise_matches_expected() {
+    let shape = [1usize, 32, 2, 128];
+    let data = (0..shape.iter().product::<usize>())
+        .map(|i| i as f32 * 0.001)
+        .collect::<Vec<_>>();
+    let mut expected = Vec::with_capacity(data.len());
+    for batch in 0..shape[0] {
+        for seq in 0..shape[2] {
+            for head in 0..shape[1] {
+                for dim in 0..shape[3] {
+                    let index = (((batch * shape[1] + head) * shape[2] + seq) * shape[3]) + dim;
+                    expected.push(data[index] + 0.25);
+                }
             }
         }
     }
 
     for device in available_devices().await {
-        let input: Tensor<3, f32> = Tensor::from_slice(&device, [2, 3, 4], &input_data);
-        let output = input
-            .transpose(1, 2)
-            .reshape([2, 12])
-            .to_concrete()
-            .reshape([24])
-            .to_concrete();
-        let expected = Tensor::from_slice(&device, [24], &expected);
-        assert_approx_tensors(output, expected, 0.0).await;
-    }
-}
-
-#[tokio::test]
-async fn broadcast_then_reshape_preserves_repeated_logical_values() {
-    let input_data: Vec<f32> = (0..24).map(|i| i as f32 * 0.25 - 3.0).collect();
-    let repeats = 5;
-    let mut expected = Vec::with_capacity(repeats * input_data.len());
-    for _ in 0..repeats {
-        expected.extend(input_data.iter().copied());
-    }
-
-    for device in available_devices().await {
-        let input: Tensor<4, f32> = Tensor::from_slice(&device, [1, 2, 3, 4], &input_data);
-        let repeated = input
-            .reshape([1, 1, 2, 3, 4])
-            .broadcast_as([1, repeats, 2, 3, 4])
-            .to_concrete()
-            .reshape([repeats, 2, 3, 4])
-            .to_concrete();
-        let expected = Tensor::from_slice(&device, [repeats, 2, 3, 4], &expected);
-        assert_approx_tensors(repeated, expected, 0.0).await;
+        let input: Tensor<4, f32> = Tensor::from_slice(&device, shape, &data);
+        let produced = input + 0.25;
+        let transposed = produced.transpose(1, 2);
+        let reshaped = transposed.reshape([1, 2, 32 * 128]);
+        let consumed = (reshaped + 0.0).to_concrete();
+        let expected = Tensor::from_slice(&device, [1, 2, 32 * 128], &expected);
+        assert_approx_tensors(consumed, expected, 0.0).await;
     }
 }
 
@@ -357,6 +339,61 @@ async fn sliding_window_with_cat_padding_matches_expected() {
         let expected = Tensor::new(&device, &expected_rows);
         assert_approx_tensors(reshaped, expected, 0.0).await;
     }
+}
+
+#[tokio::test]
+async fn restride_and_restride_layout_match_expected_views() {
+    use fusor_types::{Layout, StrideSpec};
+    let gen_4x6 = FuzzGenerator::<2, f32>::new([4, 6])
+        .with_seed(520)
+        .with_distribution(Uniform::new(-5.0, 5.0).unwrap());
+
+    // restride with a stride multiplier — pick every other column.
+    // (`permute`, `slice`, and `narrow` already cover the cases that don't use
+    // `dim_with`; this exercises the stride-multiplier path that no other op
+    // exposes.)
+    fusor_conformance::assert(async |x: Tensor<2, f32>| {
+        let [rows, _] = x.shape();
+        x.restride([StrideSpec::dim(0, rows), StrideSpec::dim_with(1, 3, 2)])
+            .to_concrete()
+    })
+    .arg(gen_4x6.clone())
+    .equal_to_resolved_with_device(async |v: Vec<Vec<f32>>, device: Device| {
+        let stepped: Vec<Vec<f32>> = v
+            .iter()
+            .map(|row| (0..3).map(|i| row[i * 2]).collect())
+            .collect();
+        Tensor::new(&device, &stepped)
+    })
+    .compare_with(approx_compare::<2, f32>(0.0))
+    .runs(3)
+    .await
+    .unwrap();
+
+    // restride_layout takes a raw absolute Layout, so by contract its input
+    // must already be contiguous (the op asserts this). FuzzGenerator yields
+    // non-contig views on alternating runs, so build the input from a Device
+    // closure that returns a fresh contiguous tensor.
+    fn input_data() -> Vec<f32> {
+        (0..24).map(|i| ((i as f32) - 12.0) * 0.31).collect()
+    }
+    fusor_conformance::assert(async |x: Tensor<2, f32>| {
+        let new_layout = Layout::from_parts(0, Box::from([4usize, 3]), Box::from([6usize, 2]));
+        x.restride_layout::<2>(new_layout).to_concrete()
+    })
+    .arg(|device: &Device| Tensor::from_slice(device, [4, 6], &input_data()))
+    .equal_to(async |_x: Tensor<2, f32>| {
+        let device = _x.device();
+        let data = input_data();
+        let stepped: Vec<Vec<f32>> = (0..4)
+            .map(|r| (0..3).map(|c| data[r * 6 + c * 2]).collect())
+            .collect();
+        Tensor::new(&device, &stepped)
+    })
+    .compare_with(approx_compare::<2, f32>(0.0))
+    .runs(1)
+    .await
+    .unwrap();
 }
 
 #[tokio::test]

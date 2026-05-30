@@ -3,12 +3,9 @@
 //! This module provides PyTorch-style tensor indexing via the `i()` method.
 //! Example: `tensor.i((.., 0, ..))` to select a specific index along one dimension.
 
+use crate::gpu::DataType;
 use crate::{ConcreteTensor, SimdElement, Tensor};
-use fusor_core::DataType;
 use std::ops::{Range, RangeFrom, RangeFull, RangeTo};
-
-// Note: TensorIndex traits are complex and rank-dependent.
-// We provide direct implementations for common use cases.
 
 /// Helper enum for flexible indexing (range or single index)
 #[derive(Clone)]
@@ -66,141 +63,126 @@ impl IndexOp {
     }
 }
 
-// Implement i() for 2D tensors
-impl<D> Tensor<2, D, ConcreteTensor<D, 2>>
+/// Converts rank-specific index tuples into tensor indexing operations.
+pub trait TensorIndex<const R: usize, D>
 where
     D: SimdElement + DataType + Default,
 {
-    /// Index into a 2D tensor. Returns a 1D tensor when one index is specified,
-    /// or a 2D tensor when ranges are used.
-    pub fn i<I1, I2>(&self, (i1, i2): (I1, I2)) -> Tensor<1, D>
+    /// Tensor produced by the indexing operation.
+    type Output;
+
+    /// Apply this index to `tensor`.
+    fn index(self, tensor: &Tensor<R, D, ConcreteTensor<D, R>>) -> Self::Output;
+}
+
+impl<const R: usize, D> Tensor<R, D, ConcreteTensor<D, R>>
+where
+    D: SimdElement + DataType + Default,
+{
+    /// Index into a tensor, reducing exactly one indexed dimension.
+    pub fn i<I>(&self, index: I) -> I::Output
     where
-        I1: Into<IndexOp>,
-        I2: Into<IndexOp>,
-        fusor_cpu::ConcreteTensor<D, 2>: fusor_cpu::LastRank<1, D>,
-        fusor_core::Tensor<2, D>: fusor_core::LastRank<1, D>,
+        I: TensorIndex<R, D>,
     {
-        let i1 = i1.into();
-        let i2 = i2.into();
-        let shape = self.shape();
-
-        let slices = [i1.to_range(shape[0]), i2.to_range(shape[1])];
-
-        let sliced = self.slice(slices).to_concrete();
-
-        // Squeeze dimensions that were indexed with a single value
-        if i2.removes_dim() {
-            sliced.squeeze::<1>(1).to_concrete()
-        } else if i1.removes_dim() {
-            sliced.squeeze::<1>(0).to_concrete()
-        } else {
-            panic!("i() on 2D tensor with two ranges should return 2D tensor, use slice() instead")
-        }
+        index.index(self)
     }
 }
 
-// Implement i() for 3D tensors
-impl<D> Tensor<3, D, ConcreteTensor<D, 3>>
+fn removed_dim<const R: usize>(removes: [bool; R]) -> usize {
+    let num_removes = removes.iter().filter(|&&removed| removed).count();
+    assert!(
+        num_removes == 1,
+        "i() expects exactly one index (not range) to reduce rank, got {} indices",
+        num_removes
+    );
+    removes
+        .iter()
+        .position(|&removed| removed)
+        .expect("checked exactly one removed dimension")
+}
+
+impl<D, I1, I2> TensorIndex<2, D> for (I1, I2)
 where
     D: SimdElement + DataType + Default,
+    I1: Into<IndexOp>,
+    I2: Into<IndexOp>,
+    crate::cpu::ConcreteTensor<D, 2>: crate::cpu::LastRank<1, D>,
+    crate::gpu::Tensor<2, D>: crate::gpu::LastRank<1, D>,
 {
-    /// Index into a 3D tensor.
-    pub fn i<I1, I2, I3>(&self, (i1, i2, i3): (I1, I2, I3)) -> Tensor<2, D>
-    where
-        I1: Into<IndexOp>,
-        I2: Into<IndexOp>,
-        I3: Into<IndexOp>,
-        fusor_cpu::ConcreteTensor<D, 3>: fusor_cpu::LastRank<2, D>,
-        fusor_core::Tensor<3, D>: fusor_core::LastRank<2, D>,
-    {
+    type Output = Tensor<1, D>;
+
+    fn index(self, tensor: &Tensor<2, D, ConcreteTensor<D, 2>>) -> Self::Output {
+        let (i1, i2) = self;
+        let i1 = i1.into();
+        let i2 = i2.into();
+        let shape = tensor.shape();
+        let slices = [i1.to_range(shape[0]), i2.to_range(shape[1])];
+        let sliced = tensor.slice(slices).to_concrete();
+        let dim = removed_dim([i1.removes_dim(), i2.removes_dim()]);
+        sliced.squeeze::<1>(dim).to_concrete()
+    }
+}
+
+impl<D, I1, I2, I3> TensorIndex<3, D> for (I1, I2, I3)
+where
+    D: SimdElement + DataType + Default,
+    I1: Into<IndexOp>,
+    I2: Into<IndexOp>,
+    I3: Into<IndexOp>,
+    crate::cpu::ConcreteTensor<D, 3>: crate::cpu::LastRank<2, D>,
+    crate::gpu::Tensor<3, D>: crate::gpu::LastRank<2, D>,
+{
+    type Output = Tensor<2, D>;
+
+    fn index(self, tensor: &Tensor<3, D, ConcreteTensor<D, 3>>) -> Self::Output {
+        let (i1, i2, i3) = self;
         let i1 = i1.into();
         let i2 = i2.into();
         let i3 = i3.into();
-        let shape = self.shape();
-
+        let shape = tensor.shape();
         let slices = [
             i1.to_range(shape[0]),
             i2.to_range(shape[1]),
             i3.to_range(shape[2]),
         ];
-
-        let sliced = self.slice(slices).to_concrete();
-
-        // Count how many dimensions are being removed
-        let removes = [i1.removes_dim(), i2.removes_dim(), i3.removes_dim()];
-        let num_removes: usize = removes.iter().filter(|&&x| x).count();
-
-        if num_removes != 1 {
-            panic!(
-                "i() on 3D tensor expects exactly one index (not range) to reduce to 2D, got {} indices",
-                num_removes
-            );
-        }
-
-        // Squeeze from last to first to keep indices valid
-        if removes[2] {
-            sliced.squeeze::<2>(2).to_concrete()
-        } else if removes[1] {
-            sliced.squeeze::<2>(1).to_concrete()
-        } else {
-            sliced.squeeze::<2>(0).to_concrete()
-        }
+        let sliced = tensor.slice(slices).to_concrete();
+        let dim = removed_dim([i1.removes_dim(), i2.removes_dim(), i3.removes_dim()]);
+        sliced.squeeze::<2>(dim).to_concrete()
     }
 }
 
-// Implement i() for 4D tensors
-impl<D> Tensor<4, D, ConcreteTensor<D, 4>>
+impl<D, I1, I2, I3, I4> TensorIndex<4, D> for (I1, I2, I3, I4)
 where
     D: SimdElement + DataType + Default,
+    I1: Into<IndexOp>,
+    I2: Into<IndexOp>,
+    I3: Into<IndexOp>,
+    I4: Into<IndexOp>,
+    crate::cpu::ConcreteTensor<D, 4>: crate::cpu::LastRank<3, D>,
+    crate::gpu::Tensor<4, D>: crate::gpu::LastRank<3, D>,
 {
-    /// Index into a 4D tensor.
-    pub fn i<I1, I2, I3, I4>(&self, (i1, i2, i3, i4): (I1, I2, I3, I4)) -> Tensor<3, D>
-    where
-        I1: Into<IndexOp>,
-        I2: Into<IndexOp>,
-        I3: Into<IndexOp>,
-        I4: Into<IndexOp>,
-        fusor_cpu::ConcreteTensor<D, 4>: fusor_cpu::LastRank<3, D>,
-        fusor_core::Tensor<4, D>: fusor_core::LastRank<3, D>,
-    {
+    type Output = Tensor<3, D>;
+
+    fn index(self, tensor: &Tensor<4, D, ConcreteTensor<D, 4>>) -> Self::Output {
+        let (i1, i2, i3, i4) = self;
         let i1 = i1.into();
         let i2 = i2.into();
         let i3 = i3.into();
         let i4 = i4.into();
-        let shape = self.shape();
-
+        let shape = tensor.shape();
         let slices = [
             i1.to_range(shape[0]),
             i2.to_range(shape[1]),
             i3.to_range(shape[2]),
             i4.to_range(shape[3]),
         ];
-
-        let sliced = self.slice(slices).to_concrete();
-
-        let removes = [
+        let sliced = tensor.slice(slices).to_concrete();
+        let dim = removed_dim([
             i1.removes_dim(),
             i2.removes_dim(),
             i3.removes_dim(),
             i4.removes_dim(),
-        ];
-        let num_removes: usize = removes.iter().filter(|&&x| x).count();
-
-        if num_removes != 1 {
-            panic!(
-                "i() on 4D tensor expects exactly one index (not range) to reduce to 3D, got {} indices",
-                num_removes
-            );
-        }
-
-        if removes[3] {
-            sliced.squeeze::<3>(3).to_concrete()
-        } else if removes[2] {
-            sliced.squeeze::<3>(2).to_concrete()
-        } else if removes[1] {
-            sliced.squeeze::<3>(1).to_concrete()
-        } else {
-            sliced.squeeze::<3>(0).to_concrete()
-        }
+        ]);
+        sliced.squeeze::<3>(dim).to_concrete()
     }
 }

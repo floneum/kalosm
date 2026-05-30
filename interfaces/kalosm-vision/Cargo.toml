@@ -16,7 +16,7 @@ segment-anything-rs.workspace = true
 
 [dev-dependencies]
 kalosm = { workspace = true, features = ["vision"], default-features = true }
-futures-util = "0.3.28"
+futures-util = { workspace = true }
 tokio = { version = "1", features = ["full"] }
 
 [features]

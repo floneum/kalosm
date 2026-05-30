@@ -1,7 +1,7 @@
 //! Convolution operations that work on both CPU and GPU backends.
 
+use crate::gpu::{DataType, FloatDataType};
 use crate::{ConcreteTensor, FloatOps, MatmulImpl, SimdElement, Tensor};
-use fusor_core::{DataType, FloatDataType};
 use fusor_types::SlidingWindow;
 
 impl<const R: usize, D> Tensor<R, D>
@@ -93,11 +93,11 @@ where
         strides: [usize; DIFF],
     ) -> Self
     where
-        ConcreteTensor<D, R>: fusor_cpu::LargerRank<R2, DIFF, D>,
-        fusor_core::Tensor<R, D>: fusor_core::LargerRank<DIFF, R2, D>,
-        crate::MulOp: fusor_cpu::SimdBinaryOp<D>,
-        crate::AddOp: fusor_cpu::SimdBinaryOp<D>,
-        fusor_cpu::SumOp: fusor_cpu::SimdReduceOp<D>,
+        ConcreteTensor<D, R>: crate::cpu::LargerRank<R2, DIFF, D>,
+        crate::gpu::Tensor<R, D>: crate::gpu::LargerRank<DIFF, R2, D>,
+        crate::MulOp: crate::cpu::SimdBinaryOp<D>,
+        crate::AddOp: crate::cpu::SimdBinaryOp<D>,
+        crate::cpu::SumOp: crate::cpu::SimdReduceOp<D>,
     {
         // Extract dimensions
         let input_shape = self.shape();
@@ -222,11 +222,11 @@ where
         groups: usize,
     ) -> Self
     where
-        ConcreteTensor<D, R>: fusor_cpu::LargerRank<R2, DIFF, D>,
-        fusor_core::Tensor<R, D>: fusor_core::LargerRank<DIFF, R2, D>,
-        crate::MulOp: fusor_cpu::SimdBinaryOp<D>,
-        crate::AddOp: fusor_cpu::SimdBinaryOp<D>,
-        fusor_cpu::SumOp: fusor_cpu::SimdReduceOp<D>,
+        ConcreteTensor<D, R>: crate::cpu::LargerRank<R2, DIFF, D>,
+        crate::gpu::Tensor<R, D>: crate::gpu::LargerRank<DIFF, R2, D>,
+        crate::MulOp: crate::cpu::SimdBinaryOp<D>,
+        crate::AddOp: crate::cpu::SimdBinaryOp<D>,
+        crate::cpu::SumOp: crate::cpu::SimdReduceOp<D>,
     {
         let input_shape = self.shape();
         let weight_shape = weight.shape();
@@ -346,7 +346,7 @@ mod tests {
     async fn test_pad_with_zeros_asymmetric_cpu() {
         // Asymmetric padding: 2 zeros on the left, 1 on the right, axis=1.
         let data: Vec<f32> = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
-        let input: Tensor<2, f32> = Tensor::Cpu(fusor_cpu::Tensor::from_slice([2, 3], &data));
+        let input: Tensor<2, f32> = Tensor::Cpu(crate::cpu::TypedTensor::from_slice([2, 3], &data));
         let padded = input.pad_with_zeros(1, 2, 1);
 
         assert_eq!(padded.shape(), [2, 6]);
@@ -365,7 +365,7 @@ mod tests {
     #[tokio::test]
     async fn test_pad_with_zeros_left_only_cpu() {
         let data: Vec<f32> = vec![7.0, 8.0, 9.0];
-        let input: Tensor<1, f32> = Tensor::Cpu(fusor_cpu::Tensor::from_slice([3], &data));
+        let input: Tensor<1, f32> = Tensor::Cpu(crate::cpu::TypedTensor::from_slice([3], &data));
         let padded = input.pad_with_zeros(0, 3, 0);
 
         assert_eq!(padded.shape(), [6]);
@@ -378,7 +378,7 @@ mod tests {
     #[tokio::test]
     async fn test_pad_with_zeros_right_only_cpu() {
         let data: Vec<f32> = vec![1.0, 2.0];
-        let input: Tensor<1, f32> = Tensor::Cpu(fusor_cpu::Tensor::from_slice([2], &data));
+        let input: Tensor<1, f32> = Tensor::Cpu(crate::cpu::TypedTensor::from_slice([2], &data));
         let padded = input.pad_with_zeros(0, 0, 4);
 
         assert_eq!(padded.shape(), [6]);
@@ -391,7 +391,7 @@ mod tests {
     #[tokio::test]
     async fn test_pad_with_zeros_zero_returns_self_cpu() {
         let data: Vec<f32> = vec![5.0, 6.0, 7.0];
-        let input: Tensor<1, f32> = Tensor::Cpu(fusor_cpu::Tensor::from_slice([3], &data));
+        let input: Tensor<1, f32> = Tensor::Cpu(crate::cpu::TypedTensor::from_slice([3], &data));
         let padded = input.pad_with_zeros(0, 0, 0);
         assert_eq!(padded.shape(), [3]);
         let result = padded.as_slice().await.unwrap();
@@ -405,15 +405,16 @@ mod tests {
         // Input: (batch=1, in_channels=1, length=5)
         let input_data = [1.0f32, 2.0, 3.0, 4.0, 5.0];
         let input: Tensor<3, f32> =
-            Tensor::Cpu(fusor_cpu::Tensor::from_slice([1, 1, 5], &input_data));
+            Tensor::Cpu(crate::cpu::TypedTensor::from_slice([1, 1, 5], &input_data));
 
         // Weight: (out_channels=1, in_channels=1, kernel_size=3)
         let weight_data = [0.2f32, 0.5, 0.3];
         let weight: Tensor<3, f32> =
-            Tensor::Cpu(fusor_cpu::Tensor::from_slice([1, 1, 3], &weight_data));
+            Tensor::Cpu(crate::cpu::TypedTensor::from_slice([1, 1, 3], &weight_data));
 
         let bias_val = 0.1f32;
-        let bias: Tensor<1, f32> = Tensor::Cpu(fusor_cpu::Tensor::from_slice([1], &[bias_val]));
+        let bias: Tensor<1, f32> =
+            Tensor::Cpu(crate::cpu::TypedTensor::from_slice([1], &[bias_val]));
 
         // Perform convolution with stride 1 and no padding
         let output = input.conv(&weight, Some(&bias), [0], [1]);
@@ -453,15 +454,16 @@ mod tests {
         // Input: (batch=1, in_channels=1, length=5)
         let input_data = [1.0f32, 2.0, 3.0, 4.0, 5.0];
         let input: Tensor<3, f32> =
-            Tensor::Cpu(fusor_cpu::Tensor::from_slice([1, 1, 5], &input_data));
+            Tensor::Cpu(crate::cpu::TypedTensor::from_slice([1, 1, 5], &input_data));
 
         // Weight: (out_channels=1, in_channels=1, kernel_size=3)
         let weight_data = [0.2f32, 0.5, 0.3];
         let weight: Tensor<3, f32> =
-            Tensor::Cpu(fusor_cpu::Tensor::from_slice([1, 1, 3], &weight_data));
+            Tensor::Cpu(crate::cpu::TypedTensor::from_slice([1, 1, 3], &weight_data));
 
         let bias_val = 0.1f32;
-        let bias: Tensor<1, f32> = Tensor::Cpu(fusor_cpu::Tensor::from_slice([1], &[bias_val]));
+        let bias: Tensor<1, f32> =
+            Tensor::Cpu(crate::cpu::TypedTensor::from_slice([1], &[bias_val]));
         let stride = 2;
 
         let output = input.conv(&weight, Some(&bias), [0], [stride]);
@@ -501,12 +503,12 @@ mod tests {
         // Input: (1, 1, 3)
         let input_data = [1.0f32, 2.0, 3.0];
         let input: Tensor<3, f32> =
-            Tensor::Cpu(fusor_cpu::Tensor::from_slice([1, 1, 3], &input_data));
+            Tensor::Cpu(crate::cpu::TypedTensor::from_slice([1, 1, 3], &input_data));
 
         // Weight: (1, 1, 3)
         let weight_data = [1.0f32, 1.0, 1.0];
         let weight: Tensor<3, f32> =
-            Tensor::Cpu(fusor_cpu::Tensor::from_slice([1, 1, 3], &weight_data));
+            Tensor::Cpu(crate::cpu::TypedTensor::from_slice([1, 1, 3], &weight_data));
 
         let output = input.conv(&weight, None, [1], [1]);
 
@@ -530,13 +532,17 @@ mod tests {
     async fn test_conv_2d_simple_cpu() {
         // Input: (batch=1, in_channels=1, height=4, width=4)
         let input_data: Vec<f32> = (0..16).map(|i| i as f32).collect();
-        let input: Tensor<4, f32> =
-            Tensor::Cpu(fusor_cpu::Tensor::from_slice([1, 1, 4, 4], &input_data));
+        let input: Tensor<4, f32> = Tensor::Cpu(crate::cpu::TypedTensor::from_slice(
+            [1, 1, 4, 4],
+            &input_data,
+        ));
 
         // Weight: (out_channels=1, in_channels=1, kH=3, kW=3) - all ones
         let weight_data = vec![1.0f32; 9];
-        let weight: Tensor<4, f32> =
-            Tensor::Cpu(fusor_cpu::Tensor::from_slice([1, 1, 3, 3], &weight_data));
+        let weight: Tensor<4, f32> = Tensor::Cpu(crate::cpu::TypedTensor::from_slice(
+            [1, 1, 3, 3],
+            &weight_data,
+        ));
 
         let output = input.conv(&weight, None, [0, 0], [1, 1]);
         assert_eq!(output.shape(), [1, 1, 2, 2]);
@@ -586,8 +592,10 @@ mod tests {
             1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, // ch0
             10.0, 20.0, 30.0, 40.0, 50.0, 60.0, 70.0, 80.0, 90.0, // ch1
         ];
-        let input: Tensor<4, f32> =
-            Tensor::Cpu(fusor_cpu::Tensor::from_slice([1, 2, 3, 3], &input_data));
+        let input: Tensor<4, f32> = Tensor::Cpu(crate::cpu::TypedTensor::from_slice(
+            [1, 2, 3, 3],
+            &input_data,
+        ));
 
         // Weight: (out_channels=1, in_channels=2, kH=2, kW=2)
         // For ch0: [[1, 0], [0, 0]]
@@ -596,8 +604,10 @@ mod tests {
             1.0, 0.0, 0.0, 0.0, // ch0 kernel
             0.0, 0.0, 0.0, 1.0, // ch1 kernel
         ];
-        let weight: Tensor<4, f32> =
-            Tensor::Cpu(fusor_cpu::Tensor::from_slice([1, 2, 2, 2], &weight_data));
+        let weight: Tensor<4, f32> = Tensor::Cpu(crate::cpu::TypedTensor::from_slice(
+            [1, 2, 2, 2],
+            &weight_data,
+        ));
 
         let output = input.conv(&weight, None, [0, 0], [1, 1]);
         assert_eq!(output.shape(), [1, 1, 2, 2]);
@@ -636,13 +646,17 @@ mod tests {
     async fn test_conv_2d_strided_cpu() {
         // Input: (batch=1, in_channels=1, height=4, width=4)
         let input_data: Vec<f32> = (0..16).map(|i| i as f32).collect();
-        let input: Tensor<4, f32> =
-            Tensor::Cpu(fusor_cpu::Tensor::from_slice([1, 1, 4, 4], &input_data));
+        let input: Tensor<4, f32> = Tensor::Cpu(crate::cpu::TypedTensor::from_slice(
+            [1, 1, 4, 4],
+            &input_data,
+        ));
 
         // Weight: (out_channels=1, in_channels=1, kH=2, kW=2) - all ones
         let weight_data = vec![1.0f32; 4];
-        let weight: Tensor<4, f32> =
-            Tensor::Cpu(fusor_cpu::Tensor::from_slice([1, 1, 2, 2], &weight_data));
+        let weight: Tensor<4, f32> = Tensor::Cpu(crate::cpu::TypedTensor::from_slice(
+            [1, 1, 2, 2],
+            &weight_data,
+        ));
 
         // Stride 2: output should be (1, 1, 2, 2) since (4-2)/2+1 = 2
         let output = input.conv(&weight, None, [0, 0], [2, 2]);
@@ -689,8 +703,10 @@ mod tests {
         // Input: (batch=1, in_channels=2, height=4, width=4)
         let mut input_data: Vec<f32> = (0..16).map(|i| i as f32).collect(); // ch0
         input_data.extend((0..16).map(|i| (i as f32) * 10.0)); // ch1
-        let input: Tensor<4, f32> =
-            Tensor::Cpu(fusor_cpu::Tensor::from_slice([1, 2, 4, 4], &input_data));
+        let input: Tensor<4, f32> = Tensor::Cpu(crate::cpu::TypedTensor::from_slice(
+            [1, 2, 4, 4],
+            &input_data,
+        ));
 
         // Weight: (out_channels=1, in_channels=2, kH=2, kW=2)
         // ch0 kernel: [[1,0],[0,0]], ch1 kernel: [[0,0],[0,1]]
@@ -698,8 +714,10 @@ mod tests {
             1.0, 0.0, 0.0, 0.0, // ch0 kernel
             0.0, 0.0, 0.0, 1.0, // ch1 kernel
         ];
-        let weight: Tensor<4, f32> =
-            Tensor::Cpu(fusor_cpu::Tensor::from_slice([1, 2, 2, 2], &weight_data));
+        let weight: Tensor<4, f32> = Tensor::Cpu(crate::cpu::TypedTensor::from_slice(
+            [1, 2, 2, 2],
+            &weight_data,
+        ));
 
         // Stride 2
         let output = input.conv(&weight, None, [0, 0], [2, 2]);
@@ -751,16 +769,18 @@ mod tests {
         for i in 0..16 {
             input_data.push(100.0 + i as f32);
         }
-        let input: Tensor<4, f32, ConcreteTensor<f32, 4>> =
-            Tensor::Cpu(fusor_cpu::Tensor::from_slice([1, 2, 4, 4], &input_data));
+        let input: Tensor<4, f32, ConcreteTensor<f32, 4>> = Tensor::Cpu(
+            crate::cpu::TypedTensor::from_slice([1, 2, 4, 4], &input_data),
+        );
 
         // Depthwise conv: weight (2, 1, 3, 3)
         // Channel 0 kernel: all ones -> sum 3x3 window
         // Channel 1 kernel: center-only (identity-like for 3x3)
         let mut weight_data = vec![1.0f32; 9]; // ch0: all ones
         weight_data.extend_from_slice(&[0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0]); // ch1: center only
-        let weight: Tensor<4, f32, ConcreteTensor<f32, 4>> =
-            Tensor::Cpu(fusor_cpu::Tensor::from_slice([2, 1, 3, 3], &weight_data));
+        let weight: Tensor<4, f32, ConcreteTensor<f32, 4>> = Tensor::Cpu(
+            crate::cpu::TypedTensor::from_slice([2, 1, 3, 3], &weight_data),
+        );
 
         let config = ConvNdConfig::<2> {
             padding: [0, 0],
@@ -836,13 +856,15 @@ mod tests {
             1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, // ch1
             10.0, 20.0, 30.0, 40.0, 50.0, 60.0, 70.0, 80.0, 90.0,
         ];
-        let input: Tensor<4, f32, ConcreteTensor<f32, 4>> =
-            Tensor::Cpu(fusor_cpu::Tensor::from_slice([1, 2, 3, 3], &input_data));
+        let input: Tensor<4, f32, ConcreteTensor<f32, 4>> = Tensor::Cpu(
+            crate::cpu::TypedTensor::from_slice([1, 2, 3, 3], &input_data),
+        );
 
         // Weight (2, 1, 3, 3): all ones for both channels
         let weight_data = vec![1.0f32; 18]; // 2 * 9
-        let weight: Tensor<4, f32, ConcreteTensor<f32, 4>> =
-            Tensor::Cpu(fusor_cpu::Tensor::from_slice([2, 1, 3, 3], &weight_data));
+        let weight: Tensor<4, f32, ConcreteTensor<f32, 4>> = Tensor::Cpu(
+            crate::cpu::TypedTensor::from_slice([2, 1, 3, 3], &weight_data),
+        );
 
         let config = ConvNdConfig::<2> {
             padding: [1, 1],
@@ -891,7 +913,7 @@ mod tests {
         // Channel 0: [1, 2, 3, 4], Channel 1: [5, 6, 7, 8]
         let input_data = [1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0];
         let input: Tensor<3, f32> =
-            Tensor::Cpu(fusor_cpu::Tensor::from_slice([1, 2, 4], &input_data));
+            Tensor::Cpu(crate::cpu::TypedTensor::from_slice([1, 2, 4], &input_data));
 
         // Weight: (3, 2, 2) - 3 output channels, 2 input channels, kernel size 2
         // out_ch 0: [[1, 0], [0, 1]]
@@ -903,7 +925,7 @@ mod tests {
             1.0, 1.0, 1.0, 1.0, // out_channel 2
         ];
         let weight: Tensor<3, f32> =
-            Tensor::Cpu(fusor_cpu::Tensor::from_slice([3, 2, 2], &weight_data));
+            Tensor::Cpu(crate::cpu::TypedTensor::from_slice([3, 2, 2], &weight_data));
 
         let output = input.conv(&weight, None, [0], [1]);
 
@@ -939,17 +961,23 @@ mod tests {
         // not the last spatial dim. Use out_channels=3 with spatial dims 2x2
         // so that out_channels != any spatial dim.
         let input_data: Vec<f32> = vec![0.0; 4 * 4];
-        let input: Tensor<4, f32> =
-            Tensor::Cpu(fusor_cpu::Tensor::from_slice([1, 1, 4, 4], &input_data));
+        let input: Tensor<4, f32> = Tensor::Cpu(crate::cpu::TypedTensor::from_slice(
+            [1, 1, 4, 4],
+            &input_data,
+        ));
 
         // Weight: (out_channels=3, in_channels=1, kH=3, kW=3) — all zeros
         let weight_data = vec![0.0f32; 3 * 3 * 3];
-        let weight: Tensor<4, f32> =
-            Tensor::Cpu(fusor_cpu::Tensor::from_slice([3, 1, 3, 3], &weight_data));
+        let weight: Tensor<4, f32> = Tensor::Cpu(crate::cpu::TypedTensor::from_slice(
+            [3, 1, 3, 3],
+            &weight_data,
+        ));
 
         // Bias: [10, 20, 30] — one per output channel
-        let bias: Tensor<1, f32> =
-            Tensor::Cpu(fusor_cpu::Tensor::from_slice([3], &[10.0f32, 20.0, 30.0]));
+        let bias: Tensor<1, f32> = Tensor::Cpu(crate::cpu::TypedTensor::from_slice(
+            [3],
+            &[10.0f32, 20.0, 30.0],
+        ));
 
         let output = input.conv(&weight, Some(&bias), [0, 0], [1, 1]);
         // Output shape: (1, 3, 2, 2)
@@ -1010,13 +1038,15 @@ mod tests {
             .collect();
 
         // Reference on CPU using per-group narrow + conv + cat.
-        let weight_cpu: Tensor<4, f32> = Tensor::Cpu(fusor_cpu::Tensor::from_slice(
+        let weight_cpu: Tensor<4, f32> = Tensor::Cpu(crate::cpu::TypedTensor::from_slice(
             [out_channels, ipg, kh, kw],
             &weight_data,
         ));
-        let bias_cpu: Tensor<1, f32> =
-            Tensor::Cpu(fusor_cpu::Tensor::from_slice([out_channels], &bias_data));
-        let input_cpu: Tensor<4, f32> = Tensor::Cpu(fusor_cpu::Tensor::from_slice(
+        let bias_cpu: Tensor<1, f32> = Tensor::Cpu(crate::cpu::TypedTensor::from_slice(
+            [out_channels],
+            &bias_data,
+        ));
+        let input_cpu: Tensor<4, f32> = Tensor::Cpu(crate::cpu::TypedTensor::from_slice(
             [1, in_channels, h, w],
             &input_data,
         ));
@@ -1097,11 +1127,11 @@ mod tests {
             .map(|i| (i as f32 * 0.0091).cos() * 0.5)
             .collect();
 
-        let weight_cpu: Tensor<4, f32> = Tensor::Cpu(fusor_cpu::Tensor::from_slice(
+        let weight_cpu: Tensor<4, f32> = Tensor::Cpu(crate::cpu::TypedTensor::from_slice(
             [out_channels, ipg, kh, kw],
             &weight_data,
         ));
-        let input_cpu: Tensor<4, f32> = Tensor::Cpu(fusor_cpu::Tensor::from_slice(
+        let input_cpu: Tensor<4, f32> = Tensor::Cpu(crate::cpu::TypedTensor::from_slice(
             [1, in_channels, h, w],
             &input_data,
         ));
@@ -1201,12 +1231,14 @@ mod tests {
             let out_gpu = a_grouped_gpu.mat_mul(&b_gpu).to_concrete();
             let out_slice = out_gpu.as_slice().await.unwrap();
 
-            let a_flat_cpu: Tensor<2, f32> =
-                Tensor::Cpu(fusor_cpu::Tensor::from_slice([m, groups * k], &a_data));
+            let a_flat_cpu: Tensor<2, f32> = Tensor::Cpu(crate::cpu::TypedTensor::from_slice(
+                [m, groups * k],
+                &a_data,
+            ));
             let a_3d_cpu: Tensor<3, f32> = a_flat_cpu.reshape([m, groups, k]).to_concrete();
             let a_grouped_cpu = a_3d_cpu.transpose(0, 1).to_concrete();
             let b_cpu: Tensor<3, f32> =
-                Tensor::Cpu(fusor_cpu::Tensor::from_slice([groups, k, 1], &b_data));
+                Tensor::Cpu(crate::cpu::TypedTensor::from_slice([groups, k, 1], &b_data));
             let out_cpu = a_grouped_cpu.mat_mul(&b_cpu).to_concrete();
             let ref_slice = out_cpu.as_slice().await.unwrap();
 
@@ -1300,11 +1332,11 @@ mod tests {
         let actual = actual_slice.as_slice();
 
         // CPU reference via per-group narrow + conv.
-        let weight_cpu: Tensor<4, f32> = Tensor::Cpu(fusor_cpu::Tensor::from_slice(
+        let weight_cpu: Tensor<4, f32> = Tensor::Cpu(crate::cpu::TypedTensor::from_slice(
             [groups, 1, kh, kw],
             &weight_data,
         ));
-        let input_cpu: Tensor<4, f32> = Tensor::Cpu(fusor_cpu::Tensor::from_slice(
+        let input_cpu: Tensor<4, f32> = Tensor::Cpu(crate::cpu::TypedTensor::from_slice(
             [1, in_channels, h, w],
             &input_data,
         ));
@@ -1493,11 +1525,11 @@ mod tests {
             .map(|i| (i as f32 * 0.0091).cos() * 0.5)
             .collect();
 
-        let weight_cpu: Tensor<4, f32> = Tensor::Cpu(fusor_cpu::Tensor::from_slice(
+        let weight_cpu: Tensor<4, f32> = Tensor::Cpu(crate::cpu::TypedTensor::from_slice(
             [groups, 1, kh, kw],
             &weight_data,
         ));
-        let input_cpu: Tensor<4, f32> = Tensor::Cpu(fusor_cpu::Tensor::from_slice(
+        let input_cpu: Tensor<4, f32> = Tensor::Cpu(crate::cpu::TypedTensor::from_slice(
             [1, groups, h, w],
             &input_data,
         ));

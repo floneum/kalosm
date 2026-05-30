@@ -1,5 +1,7 @@
 #![allow(dead_code)]
 
+pub mod quantized;
+
 use fusor::{DataType, Device, SimdElement, Tensor};
 use fusor_conformance::{approx_compare, available_devices, exact_compare};
 

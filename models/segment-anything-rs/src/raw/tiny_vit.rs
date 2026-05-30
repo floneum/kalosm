@@ -4,7 +4,7 @@
 //! so ConvNdBN becomes plain ConvNd here.
 
 use fusor::layers::{ConvNd, ConvNdConfig, LayerNormNd, Linear};
-use fusor::{ConcreteTensor, Device, Tensor, TensorBacking, VarBuilder};
+use fusor::{Concrete, Device, Fusion, Tensor, VarBuilder};
 
 use super::Result;
 
@@ -27,7 +27,7 @@ impl ConvNdBN {
         Ok(Self { conv })
     }
 
-    fn forward(&self, xs: &Tensor<4, f32, impl TensorBacking<4, Elem = f32>>) -> Tensor<4, f32> {
+    fn forward(&self, xs: &Tensor<4, f32, impl Fusion<4, f32>>) -> Tensor<4, f32> {
         self.conv.forward(xs)
     }
 }
@@ -49,10 +49,7 @@ impl PatchEmbed {
         Ok(Self { conv1, conv2 })
     }
 
-    pub(crate) fn forward(
-        &self,
-        xs: &Tensor<4, f32, impl TensorBacking<4, Elem = f32>>,
-    ) -> Tensor<4, f32> {
+    pub(crate) fn forward(&self, xs: &Tensor<4, f32, impl Fusion<4, f32>>) -> Tensor<4, f32> {
         let xs = self.conv1.forward(xs);
         let xs = xs.gelu();
         self.conv2.forward(&xs)
@@ -89,10 +86,7 @@ impl MBConv {
         })
     }
 
-    fn forward(
-        &self,
-        xs: &Tensor<4, f32, ConcreteTensor<f32, 4>>,
-    ) -> Tensor<4, f32, ConcreteTensor<f32, 4>> {
+    fn forward(&self, xs: &Tensor<4, f32, Concrete<f32, 4>>) -> Tensor<4, f32, Concrete<f32, 4>> {
         let shortcut = xs;
         let out = self.conv1.forward(xs);
         let out = out.gelu();
@@ -140,7 +134,7 @@ impl PatchMerging {
         })
     }
 
-    fn forward(&self, xs: &Tensor<3, f32, impl TensorBacking<3, Elem = f32>>) -> Tensor<3, f32> {
+    fn forward(&self, xs: &Tensor<3, f32, impl Fusion<3, f32>>) -> Tensor<3, f32> {
         let shape = xs.shape();
         let b = shape[0];
         let _l = shape[1];
@@ -221,7 +215,7 @@ impl ConvLayer {
         Ok(Self { blocks, downsample })
     }
 
-    pub(crate) fn forward(&self, xs: &Tensor<4, f32, ConcreteTensor<f32, 4>>) -> Tensor<3, f32> {
+    pub(crate) fn forward(&self, xs: &Tensor<4, f32, Concrete<f32, 4>>) -> Tensor<3, f32> {
         let mut xs = xs.clone();
         for block in &self.blocks {
             xs = block.forward(&xs);
@@ -262,7 +256,7 @@ impl TinyMlp {
         Ok(Self { norm, fc1, fc2 })
     }
 
-    fn forward(&self, xs: &Tensor<3, f32, impl TensorBacking<3, Elem = f32>>) -> Tensor<3, f32> {
+    fn forward(&self, xs: &Tensor<3, f32, impl Fusion<3, f32>>) -> Tensor<3, f32> {
         let xs = self.norm.forward(xs);
         let xs = self.fc1.forward(&xs);
         let xs = xs.gelu();
@@ -276,7 +270,7 @@ struct TinyAttention {
     norm: LayerNormNd<f32>,
     qkv: Linear<f32>,
     proj: Linear<f32>,
-    ab: Tensor<3, f32, ConcreteTensor<f32, 3>>, // (num_heads, n_points, n_points)
+    ab: Tensor<3, f32, Concrete<f32, 3>>, // (num_heads, n_points, n_points)
     key_dim: usize,
     num_heads: usize,
     d: usize,
@@ -345,7 +339,7 @@ impl TinyAttention {
         })
     }
 
-    fn forward(&self, xs: &Tensor<3, f32, impl TensorBacking<3, Elem = f32>>) -> Tensor<3, f32> {
+    fn forward(&self, xs: &Tensor<3, f32, impl Fusion<3, f32>>) -> Tensor<3, f32> {
         let shape = xs.shape();
         let b = shape[0];
         let n = shape[1];
@@ -674,10 +668,7 @@ impl TinyViT {
         })
     }
 
-    pub fn forward(
-        &self,
-        xs: &Tensor<4, f32, impl TensorBacking<4, Elem = f32>>,
-    ) -> Tensor<4, f32> {
+    pub fn forward(&self, xs: &Tensor<4, f32, impl Fusion<4, f32>>) -> Tensor<4, f32> {
         // PatchEmbed: (B, C, H, W) -> (B, C', H/4, W/4)
         let xs = self.patch_embed.forward(xs);
 

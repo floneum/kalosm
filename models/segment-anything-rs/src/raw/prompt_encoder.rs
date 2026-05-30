@@ -1,12 +1,12 @@
 //! Prompt encoder: encodes points, boxes, and masks into embeddings.
 
 use fusor::layers::{ConvNd, ConvNdConfig, Embedding, LayerNormNd};
-use fusor::{ConcreteTensor, Device, Tensor, TensorBacking, VarBuilder};
+use fusor::{Concrete, Device, Fusion, Tensor, VarBuilder};
 
 use super::Result;
 
 pub(crate) struct PositionEmbeddingRandom {
-    pub(crate) positional_encoding_gaussian_matrix: Tensor<2, f32, ConcreteTensor<f32, 2>>,
+    pub(crate) positional_encoding_gaussian_matrix: Tensor<2, f32, Concrete<f32, 2>>,
 }
 
 impl PositionEmbeddingRandom {
@@ -67,7 +67,7 @@ impl PositionEmbeddingRandom {
 
     fn forward_with_coords(
         &self,
-        coords_input: &Tensor<3, f32, impl TensorBacking<3, Elem = f32>>,
+        coords_input: &Tensor<3, f32, impl Fusion<3, f32>>,
         image_size: (usize, usize),
     ) -> Tensor<3, f32> {
         // Normalize coordinates by image size

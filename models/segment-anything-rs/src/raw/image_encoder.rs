@@ -1,7 +1,7 @@
 //! ViT-based image encoder for SAM.
 
 use fusor::layers::{ConvNd, ConvNdConfig, LayerNormNd, Linear};
-use fusor::{ConcreteTensor, Device, Tensor, TensorBacking, VarBuilder};
+use fusor::{Concrete, Device, Fusion, Tensor, VarBuilder};
 
 use super::{Activation, MlpBlock, Result};
 
@@ -25,7 +25,7 @@ impl PatchEmbed {
         Ok(Self { proj })
     }
 
-    fn forward(&self, xs: &Tensor<4, f32, impl TensorBacking<4, Elem = f32>>) -> Tensor<4, f32> {
+    fn forward(&self, xs: &Tensor<4, f32, impl Fusion<4, f32>>) -> Tensor<4, f32> {
         let out = self.proj.forward(xs);
         // (B, C, H, W) -> (B, H, W, C)
         let out = out.transpose(1, 2);
@@ -39,8 +39,8 @@ struct Attention {
     proj: Linear<f32>,
     num_heads: usize,
     scale: f32,
-    rel_pos_h: Option<Tensor<2, f32, ConcreteTensor<f32, 2>>>,
-    rel_pos_w: Option<Tensor<2, f32, ConcreteTensor<f32, 2>>>,
+    rel_pos_h: Option<Tensor<2, f32, Concrete<f32, 2>>>,
+    rel_pos_w: Option<Tensor<2, f32, Concrete<f32, 2>>>,
 }
 
 impl Attention {
@@ -179,8 +179,8 @@ impl Attention {
 fn get_rel_pos(
     q_size: usize,
     k_size: usize,
-    rel_pos: &Tensor<2, f32, ConcreteTensor<f32, 2>>,
-) -> Tensor<3, f32, ConcreteTensor<f32, 3>> {
+    rel_pos: &Tensor<2, f32, Concrete<f32, 2>>,
+) -> Tensor<3, f32, Concrete<f32, 3>> {
     // For SAM, q_size == k_size and rel_pos has shape (2*q_size-1, head_dim)
     let device = rel_pos.device();
 
@@ -277,7 +277,7 @@ impl Block {
 fn window_partition(
     xs: &Tensor<4, f32>,
     window_size: usize,
-) -> (Tensor<4, f32, ConcreteTensor<f32, 4>>, (usize, usize)) {
+) -> (Tensor<4, f32, Concrete<f32, 4>>, (usize, usize)) {
     let shape = xs.shape();
     let b = shape[0];
     let h = shape[1];
@@ -305,7 +305,7 @@ fn window_partition(
     // -> flatten first 3 dims -> (b * n_windows, ws, ws, c)
     let n_h = h_p / window_size;
     let n_w = w_p / window_size;
-    let windows: Tensor<4, f32, ConcreteTensor<f32, 4>> = xs
+    let windows: Tensor<4, f32, Concrete<f32, 4>> = xs
         .reshape([b, n_h, window_size, n_w, window_size, c])
         .transpose(2, 3) // (b, n_h, n_w, ws, ws, c)
         .reshape([b * n_h * n_w, window_size, window_size, c])
@@ -319,7 +319,7 @@ fn window_unpartition(
     window_size: usize,
     (h_p, w_p): (usize, usize),
     (h, w): (usize, usize),
-) -> Tensor<4, f32, ConcreteTensor<f32, 4>> {
+) -> Tensor<4, f32, Concrete<f32, 4>> {
     let shape = windows.shape();
     let total = shape[0];
     let c = shape[3];
@@ -331,7 +331,7 @@ fn window_unpartition(
     // tensor is non-contiguous, and the following `reshape` flattens windows
     // back into the spatial dims with a stride pattern that requires
     // contiguous backing storage.
-    let xs: Tensor<4, f32, ConcreteTensor<f32, 4>> = windows
+    let xs: Tensor<4, f32, Concrete<f32, 4>> = windows
         .reshape([b, n_h, n_w, window_size, window_size, c])
         .transpose(2, 3) // (b, n_h, ws, n_w, ws, c)
         .to_concrete()
@@ -362,7 +362,7 @@ pub struct ImageEncoderViT {
     neck_ln1: LayerNormNd<f32>,
     neck_conv2: ConvNd<2, 4, f32>,
     neck_ln2: LayerNormNd<f32>,
-    pos_embed: Option<Tensor<4, f32, ConcreteTensor<f32, 4>>>,
+    pos_embed: Option<Tensor<4, f32, Concrete<f32, 4>>>,
 }
 
 impl ImageEncoderViT {
@@ -433,10 +433,7 @@ impl ImageEncoderViT {
         })
     }
 
-    pub fn forward(
-        &self,
-        xs: &Tensor<4, f32, impl TensorBacking<4, Elem = f32>>,
-    ) -> Tensor<4, f32> {
+    pub fn forward(&self, xs: &Tensor<4, f32, impl Fusion<4, f32>>) -> Tensor<4, f32> {
         let xs = self.patch_embed.forward(xs); // (B, H, W, C)
 
         let mut xs: Tensor<4, f32> = match &self.pos_embed {
@@ -465,8 +462,8 @@ impl ImageEncoderViT {
 /// LayerNormNd<f32> helper for BHWC tensors (normalizes last dim).
 fn layer_norm_bhwc(
     norm: &LayerNormNd<f32>,
-    input: &Tensor<4, f32, impl TensorBacking<4, Elem = f32>>,
-) -> Tensor<4, f32, ConcreteTensor<f32, 4>> {
+    input: &Tensor<4, f32, impl Fusion<4, f32>>,
+) -> Tensor<4, f32, Concrete<f32, 4>> {
     let [b, h, w, c] = input.shape();
     // Flatten to 3D (b*h, w, c) for layer_norm, then reshape back
     let flat = input.reshape([b * h, w, c]);

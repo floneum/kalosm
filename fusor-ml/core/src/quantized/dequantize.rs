@@ -1,16 +1,61 @@
 use fusor_gguf::GgmlType;
+use fusor_tile_ir as tile_ir;
+use fusor_tile_ir_kernels as tile_ir_kernels;
 
-use crate::Layout;
 use crate::mir::inputs::MirValue;
 use crate::mir::operation::Operation;
-use crate::mir::workgroup_shape::WorkgroupShapeConstraints;
 use crate::{
-    DataType, DataTypeEnum, Device, LazyTensorData, Tensor, TensorData, TensorInfo,
-    mir::kernel::GenericKernel, nary_wise::UnaryFunctionChain,
+    CastTensor, DataType, DataTypeEnum, Device, Layout, LazyTensorData, Tensor, TensorData,
+    TensorInfo,
+    mir::{
+        kernel_backend,
+        kernel_backend::DirectKernel,
+        workgroup_shape::{Constraint, WorkgroupShapeConstraints},
+    },
+    nary_wise::UnaryFunctionChain,
 };
-use std::fmt::Write;
 
-use super::{QMatrix, dequantize_block};
+use super::{QMatrix, QMatrixStorageLayout};
+
+struct DequantizeDirectKernelVariant;
+
+struct QDequantizeKernelParams {
+    matrix_buffer: std::sync::Arc<wgpu::Buffer>,
+    output_buffer: std::sync::Arc<wgpu::Buffer>,
+    output_layout: tile_ir::Layout,
+    output_element: tile_ir::ElementType,
+    format: tile_ir::GgmlQuantFormat,
+    k: u32,
+    n: u32,
+    dispatch_x: u32,
+}
+
+fn emit_qdequantize_kernel(
+    kb: &mut tile_ir::KernelBuilder<std::sync::Arc<wgpu::Buffer>>,
+    params: QDequantizeKernelParams,
+) -> Option<()> {
+    let q = tile_ir_kernels::quantized_matrix_for(
+        kb,
+        params.matrix_buffer,
+        params.format,
+        params.k,
+        params.n,
+    );
+    let y = kb.write_element::<1>(
+        params.output_element,
+        tile_ir::KernelTensorRef::new(params.output_buffer, params.output_layout),
+    );
+    tile_ir_kernels::qdequantize(kb.program(), &q, &y, params.dispatch_x);
+    Some(())
+}
+
+fn datatype_element(datatype: DataTypeEnum) -> Option<tile_ir::ElementType> {
+    Some(match datatype {
+        DataTypeEnum::F32 => tile_ir::ElementType::F32,
+        DataTypeEnum::F16 => tile_ir::ElementType::F16,
+        DataTypeEnum::U32 => return None,
+    })
+}
 
 #[derive(Debug, Clone)]
 pub(crate) struct DequantizeOperation {
@@ -28,17 +73,53 @@ impl DequantizeOperation {
         }
     }
 
-    fn elements_per_block(&self) -> u32 {
-        self.matrix.datatype.block_size() as u32
+    fn direct_quant_format(&self) -> Option<tile_ir::GgmlQuantFormat> {
+        Some(match self.matrix.datatype {
+            GgmlType::Q4_0 if self.matrix.storage_layout() == QMatrixStorageLayout::Native => {
+                tile_ir::GgmlQuantFormat::Q4_0Native
+            }
+            GgmlType::Q4_0 => tile_ir::GgmlQuantFormat::Q4_0,
+            GgmlType::Q4_1 => tile_ir::GgmlQuantFormat::Q4_1,
+            GgmlType::Q5_0 if self.matrix.storage_layout() == QMatrixStorageLayout::Native => {
+                tile_ir::GgmlQuantFormat::Q5_0Native
+            }
+            GgmlType::Q5_0 => tile_ir::GgmlQuantFormat::Q5_0,
+            GgmlType::Q5_1 => tile_ir::GgmlQuantFormat::Q5_1,
+            GgmlType::Q8_0 if self.matrix.storage_layout() == QMatrixStorageLayout::Native => {
+                tile_ir::GgmlQuantFormat::Q8_0Native
+            }
+            GgmlType::Q8_0 => tile_ir::GgmlQuantFormat::Q8_0,
+            GgmlType::Q8_1 => tile_ir::GgmlQuantFormat::Q8_1,
+            GgmlType::Q2K => tile_ir::GgmlQuantFormat::Q2K,
+            GgmlType::Q3K => tile_ir::GgmlQuantFormat::Q3K,
+            GgmlType::Q4K if self.matrix.storage_layout() == QMatrixStorageLayout::Native => {
+                tile_ir::GgmlQuantFormat::Q4KNative
+            }
+            GgmlType::Q4K => tile_ir::GgmlQuantFormat::Q4K,
+            GgmlType::Q5K if self.matrix.storage_layout() == QMatrixStorageLayout::Native => {
+                tile_ir::GgmlQuantFormat::Q5KNative
+            }
+            GgmlType::Q5K => tile_ir::GgmlQuantFormat::Q5K,
+            GgmlType::Q6K if self.matrix.storage_layout() == QMatrixStorageLayout::Native => {
+                tile_ir::GgmlQuantFormat::Q6KNative
+            }
+            GgmlType::Q6K => tile_ir::GgmlQuantFormat::Q6K,
+            GgmlType::Q8K => tile_ir::GgmlQuantFormat::Q8K,
+            GgmlType::F16 | GgmlType::F32 => return None,
+        })
     }
 }
 
 impl Operation for DequantizeOperation {
     fn workgroup_shape_constraints(
         &self,
-        _: &Device,
+        _device: &Device,
     ) -> crate::mir::workgroup_shape::WorkgroupShapeConstraints {
-        WorkgroupShapeConstraints::new()
+        let mut constraints = WorkgroupShapeConstraints::new();
+        constraints.add_constraint(0, Constraint::Equals(16));
+        constraints.add_constraint(1, Constraint::Equals(16));
+        constraints.add_constraint(2, Constraint::Equals(1));
+        constraints
     }
 
     fn dispatch_size(
@@ -46,46 +127,22 @@ impl Operation for DequantizeOperation {
         workgroup_shape: &crate::mir::workgroup_shape::WorkgroupShape,
         _: &[MirValue],
     ) -> [u32; 3] {
-        // Linearize dispatch for high-dimensional tensors
-        let elements_per_block = self.elements_per_block();
-        let total_blocks: u32 = self
+        let total = self
             .matrix
             .shape
             .iter()
-            .enumerate()
-            .map(|(i, &n)| {
-                if i == self.matrix.shape.len() - 1 {
-                    (n as u32).div_ceil(elements_per_block)
-                } else {
-                    n as u32
-                }
-            })
-            .product();
-
-        let workgroup_volume = workgroup_shape.x() * workgroup_shape.y() * workgroup_shape.z();
-        let total_workgroups = total_blocks.div_ceil(workgroup_volume);
-
-        // Distribute workgroups across x, y, z dimensions
-        let max_per_dim = self
-            .matrix
-            .device
-            .limits()
-            .max_compute_workgroups_per_dimension;
-        let workgroup_size_x = total_workgroups.min(max_per_dim);
-        let remaining = total_workgroups.div_ceil(workgroup_size_x);
-        let workgroup_size_y = remaining.min(max_per_dim);
-        let workgroup_size_z = total_workgroups.div_ceil(workgroup_size_x * workgroup_size_y);
-
-        [workgroup_size_x, workgroup_size_y, workgroup_size_z]
+            .try_fold(1u32, |acc, dim| acc.checked_mul((*dim).try_into().ok()?))
+            .unwrap_or(u32::MAX);
+        let lanes = workgroup_shape.x() * workgroup_shape.y() * workgroup_shape.z();
+        [total.div_ceil(lanes), 1, 1]
     }
 
     fn visit_dependencies(&self, _: &mut dyn FnMut(crate::compute_graph::NodeIndex)) {}
 
     fn inputs(&self, nodes: &crate::compute_graph::ComputeGraphInner) -> Vec<MirValue> {
         let shape = &self.matrix.shape;
-        let datatype = self.datatype;
-        let output_tensor = TensorData::new_for_shape(&nodes.device(), shape, datatype);
-        vec![MirValue::from(self.matrix.clone()), output_tensor.into()]
+        let output_tensor = TensorData::new_for_shape(&nodes.device(), shape, self.datatype);
+        vec![self.matrix.clone().into(), output_tensor.into()]
     }
 
     fn output(&self, _: &crate::compute_graph::ComputeGraphInner, inputs: &[MirValue]) -> MirValue {
@@ -93,86 +150,85 @@ impl Operation for DequantizeOperation {
         output_tensor.into()
     }
 
-    fn build_kernel(
+    fn build_direct_kernel(
         &self,
-        _: &crate::compute_graph::ComputeGraphInner,
-        workgroup_shape: &crate::mir::workgroup_shape::WorkgroupShape,
-        _: &[MirValue],
-        kernel: &mut GenericKernel,
-    ) {
-        let datatype = self.datatype;
-        let rank = self.matrix.shape.len() as u32;
-
-        let input = kernel.add_q_matrix_input(rank, self.matrix.datatype);
-        let output = kernel.add_tensor_input(rank, true, datatype);
-
-        let post_element_wise = self.post_dequantize.add_functions(kernel);
-        let process_output = |input: &str| {
-            post_element_wise
-                .iter()
-                .fold(input.to_string(), |acc, f| f.call(vec![acc]))
+        graph: &crate::compute_graph::ComputeGraphInner,
+        _workgroup_shape: &crate::mir::workgroup_shape::WorkgroupShape,
+        inputs: &[MirValue],
+    ) -> Option<DirectKernel> {
+        if !matches!(self.datatype, DataTypeEnum::F32 | DataTypeEnum::F16)
+            || !self.post_dequantize.functions.is_empty()
+            || (self.datatype == DataTypeEnum::F16 && !graph.device().f16_supported())
+        {
+            return None;
+        }
+        let [matrix, output] = inputs else {
+            return None;
         };
-
-        let elements_per_block = self.elements_per_block();
-
-        // Linearize the global index to handle more than 3D inputs
-        let linearized_workgroup_index = workgroup_shape.linearized_workgroup_index(kernel);
-        let local_id = kernel.workgroup_local_index();
-        writeln!(
-            kernel,
-            "let flat_global_id = ({linearized_workgroup_index}) * BLOCKSIZE + {local_id};"
-        )
-        .unwrap();
-
-        // Convert flat index to multi-dimensional indices (row-major order)
-        writeln!(kernel, "var remaining_index = flat_global_id;").unwrap();
-        for dim in (0..rank).rev() {
-            let shape_binding = output.shape_binding(dim);
-            let divisor = if dim == rank - 1 {
-                format!("(({shape_binding} + {elements_per_block} - 1u) / {elements_per_block}u)")
-            } else {
-                format!("{shape_binding}")
-            };
-            writeln!(kernel, "let index_{dim} = remaining_index % {divisor};").unwrap();
-            if dim > 0 {
-                writeln!(kernel, "remaining_index = remaining_index / {divisor};").unwrap();
-            }
+        let MirValue::QMatrix(matrix) = matrix else {
+            return None;
+        };
+        let output = output.as_tensor()?;
+        if output.datatype() != self.datatype {
+            return None;
         }
 
-        write!(kernel, "let chunk = {input}[").unwrap();
-        input.strided_index(kernel, (0..).map(|i| format!("index_{i}")));
-        writeln!(kernel, "];").unwrap();
-
-        dequantize_block(
-            kernel,
-            self.matrix.datatype,
-            "chunk".to_string(),
-            datatype,
-            |i, data, kernel| {
-                let indexes: Box<[_]> = (0..rank)
-                    .map(|dim| {
-                        let base = format!("index_{dim}");
-                        if dim == rank - 1 {
-                            format!("{base} * {elements_per_block} + {i}")
-                        } else {
-                            base
-                        }
-                    })
-                    .collect();
-                output.check_bounds(kernel, indexes.clone(), |kernel| {
-                    write!(kernel, "let output_index = ").unwrap();
-                    output.strided_index(kernel, indexes);
-                    writeln!(kernel, ";").unwrap();
-
-                    writeln!(
-                        kernel,
-                        "{output}[output_index] = {};",
-                        process_output(&data)
-                    )
-                    .unwrap();
-                });
-            },
+        let format = self.direct_quant_format()?;
+        let k = *self.matrix.shape.last()? as u32;
+        let n: u32 = self
+            .matrix
+            .shape
+            .iter()
+            .rev()
+            .skip(1)
+            .try_fold(1u32, |acc, dim| acc.checked_mul((*dim).try_into().ok()?))?;
+        let total = k.checked_mul(n)?;
+        let workgroups = total.div_ceil(256);
+        let max_workgroups = graph
+            .device()
+            .limits()
+            .max_compute_workgroups_per_dimension
+            .max(1);
+        let dispatch_x = workgroups.min(max_workgroups);
+        let dispatch_y = workgroups.div_ceil(dispatch_x);
+        if dispatch_y > max_workgroups {
+            return None;
+        }
+        let cache_key = self.kernel_cache_key_with_dispatch(
+            kernel_backend::KernelVariantKey::of::<DequantizeDirectKernelVariant>(),
+            Some(_workgroup_shape),
+            [dispatch_x, dispatch_y, 1],
+            inputs,
         );
+        let matrix_buffer = matrix.buffer().clone();
+        let output_buffer = output.buffer().clone();
+        let output_layout = tile_ir::Layout::contiguous(
+            tile_ir::MemoryLevel::Storage,
+            tile_ir::Shape::new([total]),
+        );
+        let output_datatype = self.datatype;
+        kernel_backend::run_kernel(
+            graph.device().kernel_cache(),
+            self.name(),
+            cache_key,
+            [dispatch_x, dispatch_y, 1],
+            move |kb| {
+                emit_qdequantize_kernel(
+                    kb,
+                    QDequantizeKernelParams {
+                        matrix_buffer,
+                        output_buffer,
+                        output_layout,
+                        output_element: datatype_element(output_datatype)?,
+                        format,
+                        k,
+                        n,
+                        dispatch_x,
+                    },
+                )?;
+                Some(())
+            },
+        )
     }
 
     fn name(&self) -> String {
@@ -181,40 +237,39 @@ impl Operation for DequantizeOperation {
 }
 
 impl QMatrix {
-    pub fn dequantize<const R: usize, T: DataType>(&self) -> Tensor<R, T> {
-        assert_eq!(
-            self.shape.len(),
-            R,
-            "Dequantize: expected {}D tensor, got {}D tensor. Shape: {:?}",
-            R,
-            self.shape.len(),
-            self.shape
-        );
+    pub fn dequantize<T>(&self) -> Tensor
+    where
+        T: DataType,
+        f32: CastTensor<T>,
+    {
+        if T::DATA_TYPE == DataTypeEnum::F16 && !self.device.f16_supported() {
+            let tensor = self.dequantize::<f32>();
+            return tensor.cast::<T>();
+        }
 
-        // If the types already match, just return a view of the existing data
-        // Note: Only use f16 directly if the device supports it
-        if self.datatype == GgmlType::F32 && T::WGSL_TYPE == DataTypeEnum::F32
-            || self.datatype == GgmlType::F16
-                && T::WGSL_TYPE == DataTypeEnum::F16
-                && self.device.f16_supported()
-        {
+        if matches!(self.datatype, GgmlType::F32 | GgmlType::F16) {
             let device = &self.device;
             let buffer = self.buffer.clone();
             let layout = Layout::contiguous(&self.shape);
-            let datatype = T::WGSL_TYPE;
-            return Tensor::from_parts(LazyTensorData::new(TensorData::new_from_parts(
+            let datatype = match self.datatype {
+                GgmlType::F32 => DataTypeEnum::F32,
+                GgmlType::F16 => DataTypeEnum::F16,
+                _ => unreachable!("dense matrix datatype checked above"),
+            };
+            let tensor = Tensor::from_parts(LazyTensorData::new(TensorData::new_from_parts(
                 device, buffer, layout, datatype,
             )));
+            return tensor.cast_to(T::DATA_TYPE);
         }
 
         let device = self.device.clone();
         let key = device
             .compute_graph()
-            .dequantize(self.clone(), T::WGSL_TYPE);
+            .dequantize(self.clone(), T::DATA_TYPE);
 
         let data = LazyTensorData::from_parts(
             device,
-            TensorInfo::new(self.shape().into(), T::WGSL_TYPE),
+            TensorInfo::new(self.shape().into(), T::DATA_TYPE),
             key,
         );
 

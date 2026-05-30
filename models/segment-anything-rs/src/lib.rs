@@ -34,7 +34,7 @@ pub(crate) async fn gpu_device_for_test() -> Option<Device> {
     }
 }
 
-use fusor::{ConcreteTensor, Device, Tensor, ToVec1, VarBuilder};
+use fusor::{Concrete, Device, Tensor, ToVec1, VarBuilder};
 use image::{DynamicImage, GenericImage, GenericImageView, ImageBuffer, Rgba};
 use raw::sam::{
     build_point_grid, Sam, CROP_NMS_THRESH, IMAGE_SIZE, MODEL_MASK_THRESHOLD, PRED_IOU_THRESH,
@@ -349,7 +349,7 @@ impl SegmentAnything {
         ))
     }
 
-    fn image_to_tensor(&self, image: DynamicImage) -> Tensor<3, f32, ConcreteTensor<f32, 3>> {
+    fn image_to_tensor(&self, image: DynamicImage) -> Tensor<3, f32, Concrete<f32, 3>> {
         let image = {
             let resize_longest = IMAGE_SIZE;
             let (height, width) = (image.height(), image.width());
@@ -370,7 +370,7 @@ impl SegmentAnything {
         let data_f32: Vec<f32> = data.iter().map(|&v| v as f32).collect();
         let device = &self.device;
         // (H, W, 3) -> permute to (3, H, W)
-        let image: Tensor<3, f32, ConcreteTensor<f32, 3>> =
+        let image: Tensor<3, f32, Concrete<f32, 3>> =
             Tensor::from_slice(device, [height, width, 3], &data_f32)
                 .transpose(1, 2) // (H, 3, W)
                 .transpose(0, 1) // (3, H, W)
@@ -855,7 +855,7 @@ mod tests {
     /// This reproduces the exact chain from PositionEmbeddingRandom::pe_encoding().
     #[tokio::test]
     async fn test_dual_consumer_gpu_bug() {
-        use fusor::{ConcreteTensor, Device, Tensor};
+        use fusor::{Concrete, Device, Tensor};
 
         let gguf_path = fetch_tiny_gguf_path();
 
@@ -873,7 +873,7 @@ mod tests {
 
         fn build_pe_shared(
             device: &Device,
-            gm: &Tensor<2, f32, ConcreteTensor<f32, 2>>,
+            gm: &Tensor<2, f32, Concrete<f32, 2>>,
             h: usize,
             w: usize,
         ) -> Tensor<3, f32> {
@@ -899,7 +899,7 @@ mod tests {
 
         fn build_pe_separate(
             device: &Device,
-            gm: &Tensor<2, f32, ConcreteTensor<f32, 2>>,
+            gm: &Tensor<2, f32, Concrete<f32, 2>>,
             h: usize,
             w: usize,
         ) -> Tensor<3, f32> {
@@ -1106,13 +1106,13 @@ mod tests {
 
         // Read masks via reshape+as_slice (the pattern used in segment_everything)
         let total_mask = batch * n_masks * mask_pixels;
-        let masks_flat: Tensor<1, f32, ConcreteTensor<f32, 1>> =
+        let masks_flat: Tensor<1, f32, Concrete<f32, 1>> =
             batched_masks.reshape([total_mask]).to_concrete();
         let masks_slice = masks_flat.as_slice().await.unwrap();
         let batched_masks_data = masks_slice.to_vec1();
 
         let total_iou = batch * n_masks;
-        let iou_flat: Tensor<1, f32, ConcreteTensor<f32, 1>> =
+        let iou_flat: Tensor<1, f32, Concrete<f32, 1>> =
             batched_iou.reshape([total_iou]).to_concrete();
         let iou_slice = iou_flat.as_slice().await.unwrap();
         let batched_iou_data = iou_slice.to_vec1();
@@ -1130,13 +1130,13 @@ mod tests {
             );
             let ms = masks.shape();
             let m_total = ms[0] * ms[1] * ms[2] * ms[3];
-            let mf: Tensor<1, f32, ConcreteTensor<f32, 1>> = masks.reshape([m_total]).to_concrete();
+            let mf: Tensor<1, f32, Concrete<f32, 1>> = masks.reshape([m_total]).to_concrete();
             let ms_data = mf.as_slice().await.unwrap();
             unbatched_masks_data.extend(ms_data.to_vec1());
 
             let is = iou.shape();
             let i_total = is[0] * is[1];
-            let if_: Tensor<1, f32, ConcreteTensor<f32, 1>> = iou.reshape([i_total]).to_concrete();
+            let if_: Tensor<1, f32, Concrete<f32, 1>> = iou.reshape([i_total]).to_concrete();
             let is_data = if_.as_slice().await.unwrap();
             unbatched_iou_data.extend(is_data.to_vec1());
         }

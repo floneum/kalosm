@@ -16,7 +16,7 @@
 //!   (`image_encoder.*`, `prompt_encoder.*`, `mask_decoder.*`).
 
 use fusor::layers::Linear;
-use fusor::{Device, Tensor, TensorBacking, VarBuilder};
+use fusor::{Device, Fusion, Tensor, VarBuilder};
 
 pub mod image_encoder;
 pub mod mask_decoder;
@@ -85,10 +85,7 @@ impl MlpBlock {
         })
     }
 
-    pub fn forward(
-        &self,
-        xs: &Tensor<3, f32, impl TensorBacking<3, Elem = f32>>,
-    ) -> Tensor<3, f32> {
+    pub fn forward(&self, xs: &Tensor<3, f32, impl Fusion<3, f32>>) -> Tensor<3, f32> {
         let xs = self.lin1.forward(xs);
         let xs = match self.activation {
             Activation::Gelu => xs.gelu(),

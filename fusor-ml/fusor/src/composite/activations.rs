@@ -1,10 +1,10 @@
 //! Activation functions that work on both CPU and GPU backends.
 
+use crate::gpu::{DataType, FloatDataType};
 use crate::{
     AddOp, DivOp, ExpOp, FloatOps, MulOp, NegOp, SimdBinaryOp, SimdElement, SimdUnaryOp, TanhOp,
     Tensor,
 };
-use fusor_core::{DataType, FloatDataType};
 
 /// Maximum |x| fed to `tanh` on GPU before WGSL's `(e^x - e^-x) / (e^x + e^-x)`
 /// implementation overflows f32. tanh is saturated outside ±10 anyway.
@@ -31,7 +31,7 @@ where
             + std::ops::Add<Output = D>
             + std::ops::Div<Output = D>
             + std::ops::Mul<Output = D>
-            + fusor_cpu::Scalar,
+            + crate::cpu::Scalar,
         AddOp: SimdBinaryOp<D>,
         DivOp: SimdBinaryOp<D>,
         MulOp: SimdBinaryOp<D>,
@@ -50,14 +50,17 @@ where
             + std::ops::Add<Output = D>
             + std::ops::Div<Output = D>
             + std::ops::Mul<Output = D>
-            + fusor_cpu::Scalar,
+            + crate::cpu::Scalar,
         AddOp: SimdBinaryOp<D>,
         DivOp: SimdBinaryOp<D>,
         MulOp: SimdBinaryOp<D>,
         NegOp: SimdUnaryOp<D>,
         ExpOp: SimdUnaryOp<D>,
     {
-        (self * &self.sigmoid()).to_concrete()
+        let neg_self = -self;
+        let exp_neg = neg_self.exp();
+        let one_plus_exp = exp_neg + D::from_f32(1.0);
+        (self / one_plus_exp).to_concrete()
     }
 
     /// Gaussian Error Linear Unit activation (approximate).
@@ -69,7 +72,7 @@ where
         AddOp: SimdBinaryOp<D>,
         MulOp: SimdBinaryOp<D>,
         TanhOp: SimdUnaryOp<D>,
-        D: fusor_cpu::Scalar,
+        D: crate::cpu::Scalar,
     {
         let coeff = D::from_f32((2.0 / std::f32::consts::PI).sqrt());
 
@@ -120,7 +123,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_relu_cpu() {
-        let t: Tensor<1, f32> = Tensor::Cpu(fusor_cpu::Tensor::from_slice(
+        let t: Tensor<1, f32> = Tensor::Cpu(crate::cpu::TypedTensor::from_slice(
             [6],
             &[1.0, -2.0, -3.0, 4.0, 5.0, -6.0],
         ));
@@ -146,7 +149,7 @@ mod tests {
     #[tokio::test]
     async fn test_sigmoid_cpu() {
         let data = [0.0f32, 1.0, -1.0, 2.0, -2.0, 5.0];
-        let t: Tensor<1, f32> = Tensor::Cpu(fusor_cpu::Tensor::from_slice([6], &data));
+        let t: Tensor<1, f32> = Tensor::Cpu(crate::cpu::TypedTensor::from_slice([6], &data));
         let result = t.sigmoid();
         let slice = result.as_slice().await.unwrap();
 
@@ -166,7 +169,8 @@ mod tests {
     async fn test_sigmoid_cpu_vs_gpu() {
         let data: Vec<f32> = (0..256).map(|i| ((i as f32) - 128.0) * 0.1).collect();
 
-        let cpu_tensor: Tensor<1, f32> = Tensor::Cpu(fusor_cpu::Tensor::from_slice([256], &data));
+        let cpu_tensor: Tensor<1, f32> =
+            Tensor::Cpu(crate::cpu::TypedTensor::from_slice([256], &data));
         let cpu_slice = cpu_tensor.sigmoid().as_slice().await.unwrap();
 
         let Some(gpu_device) = crate::gpu_device_for_test().await else {
@@ -191,7 +195,7 @@ mod tests {
     #[tokio::test]
     async fn test_silu_cpu() {
         let data = [1.0f32, -2.0, -3.0, 4.0, 5.0, -6.0];
-        let t: Tensor<1, f32> = Tensor::Cpu(fusor_cpu::Tensor::from_slice([6], &data));
+        let t: Tensor<1, f32> = Tensor::Cpu(crate::cpu::TypedTensor::from_slice([6], &data));
         let result = t.silu();
         let slice = result.as_slice().await.unwrap();
 
@@ -211,7 +215,7 @@ mod tests {
     #[tokio::test]
     async fn test_gelu_cpu() {
         let data = [1.0f32, -2.0, -3.0, 4.0, 5.0, -5.0];
-        let t: Tensor<1, f32> = Tensor::Cpu(fusor_cpu::Tensor::from_slice([6], &data));
+        let t: Tensor<1, f32> = Tensor::Cpu(crate::cpu::TypedTensor::from_slice([6], &data));
         let result = t.gelu();
         let slice = result.as_slice().await.unwrap();
 
@@ -270,7 +274,7 @@ mod tests {
             .collect();
 
         let cpu_tensor: Tensor<3, f32> =
-            Tensor::Cpu(fusor_cpu::Tensor::from_slice([1, 100, 1536], &data));
+            Tensor::Cpu(crate::cpu::TypedTensor::from_slice([1, 100, 1536], &data));
         let cpu_slice = cpu_tensor.gelu().as_slice().await.unwrap();
 
         let Some(gpu_device) = crate::gpu_device_for_test().await else {

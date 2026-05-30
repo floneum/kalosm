@@ -1,4 +1,4 @@
-use kalosm_language::prelude::*;
+use crate::language::*;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use std::future::{Future, IntoFuture};

@@ -1,7 +1,7 @@
 //! Pooling operations that work on both CPU and GPU backends.
 
+use crate::gpu::{DataType, FloatDataType};
 use crate::{ConcreteTensor, FloatOps, SimdElement, Tensor};
-use fusor_core::{DataType, FloatDataType};
 use fusor_types::SlidingWindow;
 
 /// Configuration for pooling operations
@@ -56,13 +56,13 @@ where
         with: fn(&Tensor<O, D, ConcreteTensor<D, O>>, usize) -> Self,
     ) -> Self
     where
-        ConcreteTensor<D, R>: fusor_cpu::LargerRank<R2, DIFF, D>,
-        fusor_core::Tensor<R, D>: fusor_core::LargerRank<DIFF, R2, D>,
-        ConcreteTensor<D, R2>: fusor_cpu::NextRank<R3, D>,
-        fusor_core::Tensor<R2, D>: fusor_core::NextRank<R3, D>,
-        fusor_core::Tensor<R3, D>: fusor_core::SmallerRank<DIFF, O, D>,
-        ConcreteTensor<D, O>: fusor_cpu::LastRank<R, D>,
-        fusor_core::Tensor<O, D>: fusor_core::LastRank<R, D>,
+        ConcreteTensor<D, R>: crate::cpu::LargerRank<R2, DIFF, D>,
+        crate::gpu::Tensor<R, D>: crate::gpu::LargerRank<DIFF, R2, D>,
+        ConcreteTensor<D, R2>: crate::cpu::NextRank<R3, D>,
+        crate::gpu::Tensor<R2, D>: crate::gpu::NextRank<R3, D>,
+        crate::gpu::Tensor<R3, D>: crate::gpu::SmallerRank<DIFF, O, D>,
+        ConcreteTensor<D, O>: crate::cpu::LastRank<R, D>,
+        crate::gpu::Tensor<O, D>: crate::gpu::LastRank<R, D>,
     {
         let pools: [PoolSize; DIFF] = pools.map(|p| p.into());
 
@@ -89,14 +89,14 @@ where
         pools: [impl Into<PoolSize>; DIFF],
     ) -> Self
     where
-        ConcreteTensor<D, R>: fusor_cpu::LargerRank<R2, DIFF, D>,
-        fusor_core::Tensor<R, D>: fusor_core::LargerRank<DIFF, R2, D>,
-        ConcreteTensor<D, R2>: fusor_cpu::NextRank<R3, D>,
-        fusor_core::Tensor<R2, D>: fusor_core::NextRank<R3, D>,
-        fusor_core::Tensor<R3, D>: fusor_core::SmallerRank<DIFF, O, D>,
-        ConcreteTensor<D, O>: fusor_cpu::LastRank<R, D>,
-        fusor_core::Tensor<O, D>: fusor_core::LastRank<R, D>,
-        fusor_cpu::MaxOp: fusor_cpu::SimdReduceOp<D>,
+        ConcreteTensor<D, R>: crate::cpu::LargerRank<R2, DIFF, D>,
+        crate::gpu::Tensor<R, D>: crate::gpu::LargerRank<DIFF, R2, D>,
+        ConcreteTensor<D, R2>: crate::cpu::NextRank<R3, D>,
+        crate::gpu::Tensor<R2, D>: crate::gpu::NextRank<R3, D>,
+        crate::gpu::Tensor<R3, D>: crate::gpu::SmallerRank<DIFF, O, D>,
+        ConcreteTensor<D, O>: crate::cpu::LastRank<R, D>,
+        crate::gpu::Tensor<O, D>: crate::gpu::LastRank<R, D>,
+        crate::cpu::MaxOp: crate::cpu::SimdReduceOp<D>,
     {
         self.pool(pools, Tensor::max)
     }
@@ -109,14 +109,14 @@ where
         pools: [impl Into<PoolSize>; DIFF],
     ) -> Self
     where
-        ConcreteTensor<D, R>: fusor_cpu::LargerRank<R2, DIFF, D>,
-        fusor_core::Tensor<R, D>: fusor_core::LargerRank<DIFF, R2, D>,
-        ConcreteTensor<D, R2>: fusor_cpu::NextRank<R3, D>,
-        fusor_core::Tensor<R2, D>: fusor_core::NextRank<R3, D>,
-        fusor_core::Tensor<R3, D>: fusor_core::SmallerRank<DIFF, O, D>,
-        ConcreteTensor<D, O>: fusor_cpu::LastRank<R, D>,
-        fusor_core::Tensor<O, D>: fusor_core::LastRank<R, D>,
-        fusor_cpu::MinOp: fusor_cpu::SimdReduceOp<D>,
+        ConcreteTensor<D, R>: crate::cpu::LargerRank<R2, DIFF, D>,
+        crate::gpu::Tensor<R, D>: crate::gpu::LargerRank<DIFF, R2, D>,
+        ConcreteTensor<D, R2>: crate::cpu::NextRank<R3, D>,
+        crate::gpu::Tensor<R2, D>: crate::gpu::NextRank<R3, D>,
+        crate::gpu::Tensor<R3, D>: crate::gpu::SmallerRank<DIFF, O, D>,
+        ConcreteTensor<D, O>: crate::cpu::LastRank<R, D>,
+        crate::gpu::Tensor<O, D>: crate::gpu::LastRank<R, D>,
+        crate::cpu::MinOp: crate::cpu::SimdReduceOp<D>,
     {
         self.pool(pools, Tensor::min)
     }

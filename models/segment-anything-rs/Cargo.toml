@@ -9,7 +9,7 @@ authors = ["Evan Almloff <evanalmloff@gmail.com>"]
 keywords = ["ai", "segment-anything", "segmentation", "computer-vision"]
 
 [dependencies]
-fusor = { workspace = true }
+fusor = { workspace = true, features = ["cpu", "gpu"] }
 fusor-gguf = { workspace = true }
 hf-hub = { version = "0.4.0" }
 thiserror.workspace = true

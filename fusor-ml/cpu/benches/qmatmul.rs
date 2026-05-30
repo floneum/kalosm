@@ -1,6 +1,7 @@
 use aligned_vec::AVec;
 use criterion::{BenchmarkId, Criterion, Throughput, black_box, criterion_group, criterion_main};
-use fusor_cpu::{BlockQ8_0, ConcreteTensor, QuantizedTensor, Tensor};
+use fusor_cpu::__private::{ConcreteTensor, QuantizedTensor, TypedTensor};
+use fusor_cpu::BlockQ8_0;
 use half::f16;
 
 /// Helper to create a Q8_0 block from scale and data
@@ -63,7 +64,7 @@ fn bench_qmatmul(c: &mut Criterion) {
             &(m, k, n),
             |b, &(m, k, n)| {
                 let lhs_data: Vec<f32> = (0..m * k).map(|i| (i as f32) * 0.01).collect();
-                let lhs = Tensor::from_slice([m, k], &lhs_data);
+                let lhs = TypedTensor::from_slice([m, k], &lhs_data);
 
                 let rhs_shape = [k, n];
                 let num_blocks = (k * n) / 32;
@@ -80,7 +81,7 @@ fn bench_qmatmul(c: &mut Criterion) {
 
                 b.iter(|| {
                     let rhs_dequant = rhs.dequantize();
-                    let rhs_tensor = Tensor::new(rhs_dequant);
+                    let rhs_tensor = TypedTensor::new(rhs_dequant);
                     black_box(lhs.clone().matmul(black_box(rhs_tensor)))
                 });
             },

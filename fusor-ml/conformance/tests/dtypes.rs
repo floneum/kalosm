@@ -1,7 +1,7 @@
 //! Conformance: non-f32 dtype coverage.
 //!
 //! `fusor::Tensor` carries `f32`, `f16`, and `u32`. f16 ops route through
-//! a scalar fallback on CPU (`fusor_cpu::F16Scalar`); these tests pin that
+//! a scalar fallback on CPU; these tests pin that
 //! the fallback agrees with the GPU path and host-side reference math.
 //!
 //! `f64`/`i32`/`i64`/`u8` are not part of the unified `fusor::Tensor` enum
@@ -205,5 +205,18 @@ async fn f16_reductions_match_host_reference() {
         fusor_conformance::approx_eq(&actual, &expected, f16::from_f32(1e-3))
             .await
             .unwrap();
+    }
+}
+
+#[tokio::test]
+async fn f16_reduce_post_abs_matches_host_reference() {
+    let data = [-1.0f32, -2.0, -3.0, -4.0, -5.0, -6.0];
+    let expected_values = [9.0f32, 12.0];
+
+    for device in f16_capable_devices().await {
+        let input: Tensor<2, f16> = Tensor::from_slice(&device, [3, 2], &f16s(&data));
+        let actual = input.sum::<1>(0).abs().to_concrete();
+        let expected: Tensor<1, f16> = Tensor::from_slice(&device, [2], &f16s(&expected_values));
+        assert_approx_f16(&actual, &expected, f16::from_f32(1e-2)).await;
     }
 }

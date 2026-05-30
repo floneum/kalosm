@@ -1,11 +1,14 @@
+# This is a "virtual package" for workspace examples.
+# It is not published, but it lets `cargo run --example NAME` work from the repository root.
 [package]
-name = "kalosm-workspace"
+name = "kalosm-examples"
 version = "0.4.0"
 edition = "2021"
 authors = ["Evan Almloff <evanalmloff@gmail.com>"]
 license = "MIT/Apache-2.0"
 repository = "https://github.com/floneum/floneum"
 publish = false
+autoexamples = false
 
 [lib]
 bench = false
@@ -14,6 +17,7 @@ bench = false
 members = [
     "models/rbert",
     "models/kalosm-llama",
+    "models/kalosm-tokenizer",
     "models/rwhisper",
     "models/rwuerstchen",
     "models/segment-anything-rs",
@@ -37,13 +41,16 @@ members = [
     "fusor-ml/conformance",
     "fusor-ml/fusor",
     "fusor-ml/types",
+    "fusor-ml/tile-ir",
+    "fusor-ml/tile-ir-kernels",
+    "fusor-ml/tile-ir-runtime",
 ]
 
 [workspace.dependencies]
 candle-core = { version = "0.9.0" }
 candle-nn = { version = "0.9.0" }
 candle-transformers = { version = "0.9.0" }
-kalosm = { path = "./interfaces/kalosm", version = "0.4.0" }
+kalosm = { path = "./interfaces/kalosm", version = "0.4.0", default-features = false }
 kalosm-sample = { path = "./interfaces/kalosm-sample", version = "0.4.0" }
 kalosm-parse-macro = { path = "./interfaces/kalosm-parse-macro", version = "0.4.0" }
 kalosm-common = { path = "./interfaces/kalosm-common", version = "0.4.0" }
@@ -51,26 +58,343 @@ kalosm-model-types = { path = "./interfaces/kalosm-model-types", version = "0.4.
 kalosm-language-model = { path = "./interfaces/language-model", version = "0.4.0" }
 kalosm-streams = { path = "./interfaces/kalosm-streams", version = "0.4.0" }
 kalosm-language = { path = "./interfaces/kalosm-language", version = "0.4.0", default-features = false }
-kalosm-sound = { path = "./interfaces/kalosm-sound", version = "0.4.0" }
-kalosm-vision = { path = "./interfaces/kalosm-vision", version = "0.4.0" }
+kalosm-sound = { path = "./interfaces/kalosm-sound", version = "0.4.0", default-features = false }
+kalosm-vision = { path = "./interfaces/kalosm-vision", version = "0.4.0", default-features = false }
 kalosm-learning = { path = "./interfaces/kalosm-learning", version = "0.4.0" }
 kalosm-learning-macro = { path = "./interfaces/kalosm-learning-macro", version = "0.4.0" }
-rbert = { path = "./models/rbert", version = "0.4.0" }
-kalosm-llama = { path = "./models/kalosm-llama", version = "0.4.0" }
-rwhisper = { path = "./models/rwhisper", version = "0.4.0" }
+rbert = { path = "./models/rbert", version = "0.4.0", default-features = false }
+kalosm-llama = { path = "./models/kalosm-llama", version = "0.4.0", default-features = false }
+kalosm-tokenizer = { path = "./models/kalosm-tokenizer", version = "0.4.0" }
+rwhisper = { path = "./models/rwhisper", version = "0.4.0", default-features = false }
 rwuerstchen = { path = "./models/rwuerstchen", version = "0.4.0" }
 segment-anything-rs = { path = "./models/segment-anything-rs", version = "0.5.0" }
 kalosm-ocr = { path = "./models/kalosm-ocr", version = "0.4.0" }
-fusor = { path = "./fusor-ml/fusor", version = "0.1.0" }
+fusor = { path = "./fusor-ml/fusor", version = "0.1.0", default-features = false }
 fusor-core = { path = "./fusor-ml/core", version = "0.1.0" }
 fusor-gguf = { path = "./fusor-ml/gguf", version = "0.1.0" }
+fusor-tile-ir = { path = "./fusor-ml/tile-ir", version = "0.1.0" }
+fusor-tile-ir-kernels = { path = "./fusor-ml/tile-ir-kernels", version = "0.1.0" }
+fusor-tile-ir-runtime = { path = "./fusor-ml/tile-ir-runtime", version = "0.1.0" }
 fusor-types = { path = "./fusor-ml/types", version = "0.1.0" }
-llm-samplers = { git = "https://github.com/ealmloff/llm-samplers" }
 tokenizers = { version = "0.21.0", default-features = false }
 thiserror = "2.0.7"
 anyhow = "1.0.94"
 image = "0.25"
 rand = "0.9"
+criterion = { version = "0.8", features = ["async_futures"] }
+futures-util = { version = "0.3.31", default-features = false, features = ["std"] }
+futures-channel = { version = "0.3.31", default-features = false, features = ["std"] }
+
+[dependencies]
+anyhow = { workspace = true, optional = true }
+axum = { version = "0.7.2", optional = true }
+comfy-table = { version = "7.1.0", optional = true }
+futures-util = { workspace = true, optional = true }
+image = { workspace = true, optional = true }
+kalosm = { workspace = true, default-features = false }
+kalosm-language = { workspace = true, default-features = false, optional = true }
+kalosm-sample = { workspace = true, optional = true }
+kalosm-vision = { workspace = true, default-features = false, optional = true }
+pollster = "0.4"
+serde = { version = "1.0.163", features = ["derive"], optional = true }
+surrealdb = { version = "2.4.0", default-features = false, optional = true }
+tokio = { version = "1", features = ["macros", "net", "rt-multi-thread"], optional = true }
+tracing-subscriber = { version = "0.2", optional = true }
+
+[features]
+default = ["gpu"]
+cpu = ["kalosm/cpu", "kalosm-language?/cpu"]
+gpu = ["kalosm/gpu", "kalosm-language?/gpu"]
+full = [
+    "bert",
+    "llama-vision",
+    "hf-tokenizer-json",
+    "hf-config-json",
+    "chat-template-json",
+    "structured",
+    "vision",
+    "sound",
+    "sound-denoise",
+    "surrealdb",
+]
+cuda = ["kalosm/cuda"]
+mkl = ["kalosm/mkl"]
+metal = ["kalosm/metal"]
+language = [
+    "kalosm/language",
+]
+structured = ["language", "kalosm/structured", "dep:kalosm-sample"]
+bert = ["language", "kalosm/bert"]
+llama = ["language", "kalosm/llama"]
+chat-template-json = ["kalosm/chat-template-json"]
+hf-config-json = ["kalosm/hf-config-json"]
+hf-tokenizer-json = ["kalosm/hf-tokenizer-json"]
+llama-vision = ["llama", "kalosm/llama-vision"]
+documents = ["language", "kalosm/documents", "dep:kalosm-language"]
+fs-documents = ["documents", "kalosm/fs-documents", "kalosm-language/fs-documents"]
+web-documents = ["documents", "kalosm/web-documents", "kalosm-language/web-documents"]
+chunking = ["documents", "kalosm/chunking", "dep:kalosm-language"]
+vector-db = ["documents", "kalosm/vector-db", "kalosm-language/vector-db"]
+rag = ["web-documents", "chunking", "vector-db", "kalosm/rag"]
+evaluation = ["language", "kalosm/evaluation", "comfy-table"]
+prompt_annealing = ["bert", "evaluation", "kalosm/prompt_annealing"]
+sound = ["kalosm/sound"]
+sound-denoise = ["sound", "kalosm/sound-denoise"]
+sound-source = ["sound", "kalosm/sound-source"]
+sound-voice-detection = ["sound", "kalosm/sound-voice-detection"]
+surrealdb = ["bert", "rag", "kalosm/surrealdb", "dep:surrealdb"]
+surrealdb-local = [
+    "surrealdb",
+    "kalosm/surrealdb-local",
+    "surrealdb/kv-mem",
+    "surrealdb/kv-surrealkv",
+]
+vision = ["kalosm/vision", "dep:kalosm-vision"]
+openai = ["language", "kalosm/openai"]
+anthropic = ["language", "kalosm/anthropic"]
+remote = ["openai", "anthropic"]
+scrape = ["language", "kalosm/scrape", "dep:kalosm-language"]
+anyhow = ["dep:anyhow"]
+axum = ["dep:axum", "dep:futures-util"]
+image = ["dep:image"]
+sample = ["structured"]
+serde = ["dep:serde"]
+futures-util = ["dep:futures-util"]
+comfy-table = ["dep:comfy-table"]
+tokio = [
+    "dep:tokio",
+    "kalosm/tokio",
+    "kalosm-language?/tokio",
+]
+tracing-subscriber = ["dep:tracing-subscriber"]
+
+[[example]]
+name = "axum"
+path = "interfaces/kalosm/examples/axum.rs"
+required-features = ["llama", "axum", "tokio"]
+
+[[example]]
+name = "chat"
+path = "interfaces/kalosm/examples/chat.rs"
+required-features = ["llama"]
+
+[[example]]
+name = "chat-boxed"
+path = "interfaces/kalosm/examples/chat-boxed.rs"
+required-features = ["llama", "remote"]
+
+[[example]]
+name = "chat-constrained"
+path = "interfaces/kalosm/examples/chat-constrained.rs"
+required-features = ["llama", "structured"]
+
+[[example]]
+name = "chat-constrained-boxed"
+path = "interfaces/kalosm/examples/chat-constrained-boxed.rs"
+required-features = ["llama", "openai", "structured", "serde"]
+
+[[example]]
+name = "chat-mistral-2"
+path = "interfaces/kalosm/examples/chat-mistral-2.rs"
+required-features = ["llama"]
+
+[[example]]
+name = "chat-tiny-llama"
+path = "interfaces/kalosm/examples/chat-tiny-llama.rs"
+required-features = ["llama"]
+
+[[example]]
+name = "chat-with-character"
+path = "interfaces/kalosm/examples/chat-with-character.rs"
+required-features = ["llama", "structured"]
+
+[[example]]
+name = "chunking"
+path = "interfaces/kalosm/examples/chunking.rs"
+required-features = ["bert", "llama", "chunking", "tracing-subscriber"]
+
+[[example]]
+name = "claude-3-5-haiku"
+path = "interfaces/kalosm/examples/claude-3-5-haiku.rs"
+required-features = ["anthropic", "tracing-subscriber"]
+
+[[example]]
+name = "codestral"
+path = "interfaces/kalosm/examples/codestral.rs"
+required-features = ["llama"]
+
+[[example]]
+name = "constrained"
+path = "interfaces/kalosm/examples/constrained.rs"
+required-features = ["llama", "structured"]
+
+[[example]]
+name = "constrained-regex"
+path = "interfaces/kalosm/examples/constrained-regex.rs"
+required-features = ["llama", "structured"]
+
+[[example]]
+name = "constrained-rust-types"
+path = "interfaces/kalosm/examples/constrained-rust-types.rs"
+required-features = ["llama", "structured", "anyhow"]
+
+[[example]]
+name = "crawl"
+path = "interfaces/kalosm/examples/crawl.rs"
+required-features = ["scrape"]
+
+[[example]]
+name = "custom_llama_source"
+path = "interfaces/kalosm/examples/custom_llama_source.rs"
+required-features = ["llama"]
+
+[[example]]
+name = "evaluation"
+path = "interfaces/kalosm/examples/evaluation.rs"
+required-features = ["bert", "llama", "chunking", "evaluation", "tracing-subscriber"]
+
+[[example]]
+name = "generate-image"
+path = "interfaces/kalosm/examples/generate-image.rs"
+required-features = ["vision", "futures-util"]
+
+[[example]]
+name = "generate-text"
+path = "interfaces/kalosm/examples/generate-text.rs"
+required-features = ["llama", "tracing-subscriber"]
+
+[[example]]
+name = "gemma-3"
+path = "interfaces/kalosm/examples/gemma-3.rs"
+required-features = ["llama"]
+
+[[example]]
+name = "gpt-4o-mini"
+path = "interfaces/kalosm/examples/gpt-4o-mini.rs"
+required-features = ["openai", "tracing-subscriber"]
+
+[[example]]
+name = "hybrid-search"
+path = "interfaces/kalosm/examples/hybrid-search.rs"
+required-features = ["surrealdb-local"]
+
+[[example]]
+name = "live-qa"
+path = "interfaces/kalosm/examples/live-qa.rs"
+required-features = [
+    "llama",
+    "sound",
+    "sound-denoise",
+    "sound-source",
+    "sound-voice-detection",
+    "surrealdb-local",
+    "anyhow",
+    "futures-util",
+]
+
+[[example]]
+name = "llama"
+path = "interfaces/kalosm/examples/llama.rs"
+required-features = ["llama"]
+
+[[example]]
+name = "mistral"
+path = "interfaces/kalosm/examples/mistral.rs"
+required-features = ["llama"]
+
+[[example]]
+name = "mutate"
+path = "interfaces/kalosm/examples/mutate.rs"
+required-features = [
+    "bert",
+    "llama",
+    "chunking",
+    "evaluation",
+    "sample",
+    "anyhow",
+    "tracing-subscriber",
+]
+
+[[example]]
+name = "ocr"
+path = "interfaces/kalosm/examples/ocr.rs"
+required-features = ["vision", "image"]
+
+[[example]]
+name = "phi-3"
+path = "interfaces/kalosm/examples/phi-3.rs"
+required-features = ["llama"]
+
+[[example]]
+name = "phi-4"
+path = "interfaces/kalosm/examples/phi-4.rs"
+required-features = ["llama"]
+
+[[example]]
+name = "prompt-annealing"
+path = "interfaces/kalosm/examples/prompt-annealing.rs"
+required-features = ["llama", "structured", "prompt_annealing"]
+
+[[example]]
+name = "qwen"
+path = "interfaces/kalosm/examples/qwen.rs"
+required-features = ["llama"]
+
+[[example]]
+name = "rag"
+path = "interfaces/kalosm/examples/rag.rs"
+required-features = ["llama", "surrealdb-local", "anyhow"]
+
+[[example]]
+name = "remote-open-ai-compatable"
+path = "interfaces/kalosm/examples/remote-open-ai-compatable.rs"
+required-features = ["openai", "tracing-subscriber"]
+
+[[example]]
+name = "segment-image"
+path = "interfaces/kalosm/examples/segment-image.rs"
+required-features = ["vision", "image"]
+
+[[example]]
+name = "self-chat"
+path = "interfaces/kalosm/examples/self-chat.rs"
+required-features = ["llama"]
+
+[[example]]
+name = "semantic-chunk"
+path = "interfaces/kalosm/examples/semantic-chunk.rs"
+required-features = ["bert", "web-documents", "chunking", "anyhow"]
+
+[[example]]
+name = "semantic-search"
+path = "interfaces/kalosm/examples/semantic-search.rs"
+required-features = ["surrealdb-local", "comfy-table", "tracing-subscriber"]
+
+[[example]]
+name = "task"
+path = "interfaces/kalosm/examples/task.rs"
+required-features = ["llama", "structured", "tracing-subscriber"]
+
+[[example]]
+name = "task-r1"
+path = "interfaces/kalosm/examples/task-r1.rs"
+required-features = ["llama", "structured"]
+
+[[example]]
+name = "transcribe"
+path = "interfaces/kalosm/examples/transcribe.rs"
+required-features = [
+    "sound",
+    "sound-denoise",
+    "sound-source",
+    "sound-voice-detection",
+    "anyhow",
+]
+
+[[example]]
+name = "vision"
+path = "interfaces/kalosm/examples/vision.rs"
+required-features = ["llama-vision", "tracing-subscriber"]
 
 [profile.dist]
 inherits = "release"

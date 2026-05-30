@@ -1,7 +1,7 @@
 //! KV cache implementation for attention layers.
 
+use crate::gpu::DataType;
 use crate::{ConcreteTensor, Device, SimdElement, Tensor};
-use fusor_core::DataType;
 
 use super::TensorCache;
 
@@ -16,7 +16,7 @@ pub struct KvCache<D: SimdElement> {
 
 impl<D: SimdElement + DataType + Default> KvCache<D>
 where
-    crate::AddOp: fusor_cpu::SimdBinaryOp<D>,
+    crate::AddOp: crate::cpu::SimdBinaryOp<D>,
 {
     /// Create a new KV cache
     ///
@@ -59,6 +59,28 @@ where
         let keys = self.key.append(device, k);
         let values = self.value.append(device, v);
         (keys, values)
+    }
+
+    /// Reserve enough key/value sequence storage to avoid growth during future appends.
+    pub fn reserve(
+        &mut self,
+        device: &Device,
+        target_seq_len: usize,
+        keys: &mut Vec<crate::NodeIndex>,
+    ) {
+        if let Some(key) = self.key.reserve(device, target_seq_len) {
+            keys.push(key);
+        }
+        if let Some(key) = self.value.reserve(device, target_seq_len) {
+            keys.push(key);
+        }
+    }
+
+    /// Add live key/value GPU nodes to a batch of already-resolved nodes that
+    /// should be rebased to graph leaves.
+    pub fn detach_keys(&self, keys: &mut Vec<crate::NodeIndex>) {
+        self.key.detach_key(keys);
+        self.value.detach_key(keys);
     }
 
     /// Get the current sequence length

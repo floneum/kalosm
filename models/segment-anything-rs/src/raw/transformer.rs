@@ -1,7 +1,7 @@
 //! TwoWayTransformer for cross-attention between queries and image embeddings.
 
 use fusor::layers::{LayerNormNd, Linear};
-use fusor::{ConcreteTensor, Device, Tensor, TensorBacking, VarBuilder};
+use fusor::{Concrete, Device, Fusion, Tensor, VarBuilder};
 
 use super::{Activation, MlpBlock, Result};
 
@@ -41,7 +41,7 @@ impl Attention {
         })
     }
 
-    fn separate_heads(&self, x: &Tensor<3, f32>) -> Tensor<4, f32, ConcreteTensor<f32, 4>> {
+    fn separate_heads(&self, x: &Tensor<3, f32>) -> Tensor<4, f32, Concrete<f32, 4>> {
         let shape = x.shape();
         let b = shape[0];
         let n = shape[1];
@@ -52,7 +52,7 @@ impl Attention {
             .to_concrete()
     }
 
-    fn recombine_heads(&self, x: &Tensor<4, f32>) -> Tensor<3, f32, ConcreteTensor<f32, 3>> {
+    fn recombine_heads(&self, x: &Tensor<4, f32>) -> Tensor<3, f32, Concrete<f32, 3>> {
         let shape = x.shape();
         let b = shape[0];
         let n_heads = shape[1];
@@ -65,9 +65,9 @@ impl Attention {
 
     fn forward(
         &self,
-        q: &Tensor<3, f32, impl TensorBacking<3, Elem = f32>>,
-        k: &Tensor<3, f32, impl TensorBacking<3, Elem = f32>>,
-        v: &Tensor<3, f32, impl TensorBacking<3, Elem = f32>>,
+        q: &Tensor<3, f32, impl Fusion<3, f32>>,
+        k: &Tensor<3, f32, impl Fusion<3, f32>>,
+        v: &Tensor<3, f32, impl Fusion<3, f32>>,
     ) -> Tensor<3, f32> {
         let q = self.q_proj.forward(q);
         let k = self.k_proj.forward(k);
@@ -149,10 +149,10 @@ impl TwoWayAttentionBlock {
 
     fn forward(
         &self,
-        queries: &Tensor<3, f32, impl TensorBacking<3, Elem = f32>>,
-        keys: &Tensor<3, f32, impl TensorBacking<3, Elem = f32>>,
-        query_pe: &Tensor<3, f32, impl TensorBacking<3, Elem = f32>>,
-        key_pe: &Tensor<3, f32, impl TensorBacking<3, Elem = f32>>,
+        queries: &Tensor<3, f32, impl Fusion<3, f32>>,
+        keys: &Tensor<3, f32, impl Fusion<3, f32>>,
+        query_pe: &Tensor<3, f32, impl Fusion<3, f32>>,
+        key_pe: &Tensor<3, f32, impl Fusion<3, f32>>,
     ) -> (Tensor<3, f32>, Tensor<3, f32>) {
         // Self attention block
         let queries: Tensor<3, f32> = if self.skip_first_layer_pe {

@@ -1,25 +1,111 @@
-use std::fmt::Write;
+use std::hash::{Hash, Hasher};
+
+use rustc_hash::FxHasher;
 
 use crate::{
     TILE_SIZE,
     compute_graph::{ComputeGraphInner, NodeIndex},
-    mir::{function::Function, inputs::MirValue, kernel::GenericKernel, operation::Operation},
+    mir::{inputs::MirValue, kernel_backend::DirectKernel, operation::Operation},
     tensor::{DataTypeEnum, TensorData},
-    visit_tiled::{
-        MaybeQData, build_visit_tiled_kernel, titled_map_dispatch_size,
-        titled_map_workgroup_size_constraints,
-    },
+    visit_tiled::{MaybeQData, titled_map_dispatch_size, titled_map_workgroup_size_constraints},
 };
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum NaryScalar {
+    F32(f32),
+    F16(half::f16),
+    U32(u32),
+}
+
+impl PartialEq for NaryScalar {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::F32(a), Self::F32(b)) => a.to_bits() == b.to_bits(),
+            (Self::F16(a), Self::F16(b)) => a.to_bits() == b.to_bits(),
+            (Self::U32(a), Self::U32(b)) => a == b,
+            _ => false,
+        }
+    }
+}
+
+impl Eq for NaryScalar {}
+
+impl Hash for NaryScalar {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        std::mem::discriminant(self).hash(state);
+        match self {
+            Self::F32(value) => value.to_bits().hash(state),
+            Self::F16(value) => value.to_bits().hash(state),
+            Self::U32(value) => value.hash(state),
+        }
+    }
+}
+
+impl NaryScalar {
+    pub(crate) fn datatype(self) -> DataTypeEnum {
+        match self {
+            Self::F32(_) => DataTypeEnum::F32,
+            Self::F16(_) => DataTypeEnum::F16,
+            Self::U32(_) => DataTypeEnum::U32,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) enum NaryOp {
+    Add,
+    Sub,
+    Mul,
+    Div,
+    Pow,
+    Neg,
+    Cast,
+    Select,
+    Exp,
+    Exp2,
+    Log,
+    Log2,
+    Sqrt,
+    Sin,
+    Cos,
+    Tan,
+    Tanh,
+    TanhExact,
+    Asin,
+    Acos,
+    Atan,
+    Sinh,
+    Cosh,
+    Asinh,
+    Acosh,
+    Atanh,
+    Abs,
+    ApproximateExp,
+    LessApproximateExp,
+    AddConst(NaryScalar),
+    SubConst(NaryScalar),
+    RSubConst(NaryScalar),
+    MulConst(NaryScalar),
+    DivConst(NaryScalar),
+    RDivConst(NaryScalar),
+    RemConst(NaryScalar),
+    RRemConst(NaryScalar),
+    PowConst(NaryScalar),
+    MinConst(NaryScalar),
+    MaxConst(NaryScalar),
+    EqualConst(NaryScalar),
+    LessConst(NaryScalar),
+    LessEqualConst(NaryScalar),
+    GreaterConst(NaryScalar),
+    GreaterEqualConst(NaryScalar),
+}
 
 /// A function that can be applied in the expression tree.
 /// Supports any arity (unary, binary, etc.)
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub(crate) struct NaryFunction {
     pub(crate) name: Option<String>,
-    /// WGSL code, e.g. "let output = a + b;" or "let output = sin(input);"
-    pub(crate) operation: String,
-    /// Input parameter names, e.g. ["a", "b"] for binary, ["input"] for unary
-    pub(crate) input_names: Vec<String>,
+    pub(crate) op: NaryOp,
     pub(crate) input_types: Vec<DataTypeEnum>,
     pub(crate) output_type: DataTypeEnum,
 }
@@ -29,35 +115,44 @@ impl NaryFunction {
         self.name.as_deref().unwrap_or("op")
     }
 
-    /// Create a unary NaryFunction from WGSL operation code.
+    pub fn new(
+        name: Option<String>,
+        op: NaryOp,
+        input_types: Vec<DataTypeEnum>,
+        output_type: DataTypeEnum,
+    ) -> Self {
+        Self {
+            name,
+            op,
+            input_types,
+            output_type,
+        }
+    }
+
     pub fn unary(
         name: Option<String>,
-        operation: String,
+        op: NaryOp,
         input_type: DataTypeEnum,
         output_type: DataTypeEnum,
     ) -> Self {
         Self {
             name,
-            operation,
-            input_names: vec!["input".to_string()],
+            op,
             input_types: vec![input_type],
             output_type,
         }
     }
 
-    /// Create a binary NaryFunction from WGSL operation code.
-    /// The operation should use `a` and `b` as input variable names.
     pub fn binary(
         name: Option<String>,
-        operation: String,
+        op: NaryOp,
         input_a_type: DataTypeEnum,
         input_b_type: DataTypeEnum,
         output_type: DataTypeEnum,
     ) -> Self {
         Self {
             name,
-            operation,
-            input_names: vec!["a".to_string(), "b".to_string()],
+            op,
             input_types: vec![input_a_type, input_b_type],
             output_type,
         }
@@ -66,7 +161,7 @@ impl NaryFunction {
 
 /// A chain of unary functions used for pre/post processing in reduce/matmul/dequantize.
 /// Each function takes a single input and produces a single output; the chain is applied sequentially.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Hash)]
 pub(crate) struct UnaryFunctionChain {
     input_datatype: DataTypeEnum,
     pub(crate) functions: Vec<NaryFunction>,
@@ -87,33 +182,13 @@ impl UnaryFunctionChain {
         }
     }
 
-    pub fn add_functions(
-        &self,
-        kernel: &mut crate::mir::kernel::GenericKernel,
-    ) -> Vec<crate::mir::function::Function> {
-        let mut input_datatype = self.input_datatype;
-        self.functions
-            .iter()
-            .rev()
-            .map(|f| {
-                let function = kernel.add_function(
-                    f.output_type,
-                    f.operation.clone(),
-                    [("input".to_string(), input_datatype.to_string())],
-                );
-                input_datatype = f.output_type;
-                function
-            })
-            .collect()
-    }
-
     pub fn input_datatype(&self) -> DataTypeEnum {
         self.input_datatype
     }
 
     pub fn out_datatype(&self) -> DataTypeEnum {
-        if let Some(first) = self.functions.first() {
-            first.output_type
+        if let Some(last) = self.functions.last() {
+            last.output_type
         } else {
             self.input_datatype
         }
@@ -128,7 +203,7 @@ pub(crate) struct ExtractedUnaryChain {
 }
 
 /// Expression tree node supporting any arity operations
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub(crate) enum NaryExpr {
     /// Operation with N children (supports unary, binary, or more)
     Op {
@@ -146,6 +221,7 @@ pub(crate) enum NaryExpr {
     },
     /// Get current output dimension index
     DimIndex(usize),
+    Scalar(NaryScalar),
 }
 
 impl NaryExpr {
@@ -162,12 +238,78 @@ impl NaryExpr {
         NaryExpr::IndexedInput { input_idx, indices }
     }
 
+    pub fn scalar(value: NaryScalar) -> Self {
+        NaryExpr::Scalar(value)
+    }
+
     /// Check if indices represent element-wise access (just DimIndex(0), DimIndex(1), ..., DimIndex(rank-1))
     pub(crate) fn is_elementwise_indices(indices: &[NaryExpr]) -> bool {
         indices
             .iter()
             .enumerate()
             .all(|(i, idx)| matches!(idx, NaryExpr::DimIndex(d) if *d == i))
+    }
+
+    pub(crate) fn uses_input(&self, target_input_idx: usize) -> bool {
+        match self {
+            NaryExpr::Op { children, .. } => {
+                children.iter().any(|c| c.uses_input(target_input_idx))
+            }
+            NaryExpr::IndexedInput { input_idx, indices } => {
+                *input_idx == target_input_idx
+                    || indices.iter().any(|c| c.uses_input(target_input_idx))
+            }
+            NaryExpr::DimIndex(_) | NaryExpr::Scalar(_) => false,
+        }
+    }
+
+    pub(crate) fn elementwise_input_datatype(
+        &self,
+        target_input_idx: usize,
+    ) -> Option<DataTypeEnum> {
+        match self {
+            NaryExpr::Op { children, function } => children
+                .iter()
+                .zip(&function.input_types)
+                .find_map(|(child, input_ty)| {
+                    child
+                        .uses_input(target_input_idx)
+                        .then_some(*input_ty)
+                        .or_else(|| child.elementwise_input_datatype(target_input_idx))
+                }),
+            NaryExpr::IndexedInput { input_idx, indices } => {
+                if *input_idx == target_input_idx && Self::is_elementwise_indices(indices) {
+                    // The parent operation records concrete input tensor dtypes;
+                    // leaf nodes do not. The caller uses the consuming function's
+                    // declared input dtype when the leaf is under an operation.
+                    None
+                } else {
+                    None
+                }
+            }
+            NaryExpr::DimIndex(_) | NaryExpr::Scalar(_) => None,
+        }
+    }
+
+    pub(crate) fn remap_inputs(&self, mapping: &[usize]) -> NaryExpr {
+        match self {
+            NaryExpr::Op { children, function } => NaryExpr::Op {
+                children: children
+                    .iter()
+                    .map(|child| child.remap_inputs(mapping))
+                    .collect(),
+                function: function.clone(),
+            },
+            NaryExpr::IndexedInput { input_idx, indices } => NaryExpr::IndexedInput {
+                input_idx: mapping[*input_idx],
+                indices: indices
+                    .iter()
+                    .map(|index| index.remap_inputs(mapping))
+                    .collect(),
+            },
+            NaryExpr::DimIndex(dim) => NaryExpr::DimIndex(*dim),
+            NaryExpr::Scalar(value) => NaryExpr::Scalar(*value),
+        }
     }
 
     /// Create a select expression (ternary operator)
@@ -181,20 +323,12 @@ impl NaryExpr {
     ) -> NaryExpr {
         NaryExpr::Op {
             children: vec![condition, on_true, on_false],
-            function: NaryFunction {
-                name: Some("select".to_string()),
-                operation: format!(
-                    "let output = select(on_false, on_true, condition != {}(0));",
-                    condition_type
-                ),
-                input_names: vec![
-                    "condition".to_string(),
-                    "on_true".to_string(),
-                    "on_false".to_string(),
-                ],
-                input_types: vec![condition_type, output_type, output_type],
+            function: NaryFunction::new(
+                Some("select".to_string()),
+                NaryOp::Select,
+                vec![condition_type, output_type, output_type],
                 output_type,
-            },
+            ),
         }
     }
 
@@ -202,13 +336,13 @@ impl NaryExpr {
     pub fn mul(a: NaryExpr, b: NaryExpr, datatype: DataTypeEnum) -> NaryExpr {
         NaryExpr::Op {
             children: vec![a, b],
-            function: NaryFunction {
-                name: Some("mul".to_string()),
-                operation: "let output = a * b;".to_string(),
-                input_names: vec!["a".to_string(), "b".to_string()],
-                input_types: vec![datatype, datatype],
-                output_type: datatype,
-            },
+            function: NaryFunction::binary(
+                Some("mul".to_string()),
+                NaryOp::Mul,
+                datatype,
+                datatype,
+                datatype,
+            ),
         }
     }
 
@@ -216,13 +350,13 @@ impl NaryExpr {
     pub fn add(a: NaryExpr, b: NaryExpr, datatype: DataTypeEnum) -> NaryExpr {
         NaryExpr::Op {
             children: vec![a, b],
-            function: NaryFunction {
-                name: Some("add".to_string()),
-                operation: "let output = a + b;".to_string(),
-                input_names: vec!["a".to_string(), "b".to_string()],
-                input_types: vec![datatype, datatype],
-                output_type: datatype,
-            },
+            function: NaryFunction::binary(
+                Some("add".to_string()),
+                NaryOp::Add,
+                datatype,
+                datatype,
+                datatype,
+            ),
         }
     }
 
@@ -230,13 +364,7 @@ impl NaryExpr {
     pub fn neg(a: NaryExpr, datatype: DataTypeEnum) -> NaryExpr {
         NaryExpr::Op {
             children: vec![a],
-            function: NaryFunction {
-                name: Some("neg".to_string()),
-                operation: "let output = -input;".to_string(),
-                input_names: vec!["input".to_string()],
-                input_types: vec![datatype],
-                output_type: datatype,
-            },
+            function: NaryFunction::unary(Some("neg".to_string()), NaryOp::Neg, datatype, datatype),
         }
     }
 
@@ -244,19 +372,13 @@ impl NaryExpr {
     pub fn unary_op(
         a: NaryExpr,
         name: &str,
-        operation: impl Into<String>,
+        op: NaryOp,
         input_type: DataTypeEnum,
         output_type: DataTypeEnum,
     ) -> NaryExpr {
         NaryExpr::Op {
             children: vec![a],
-            function: NaryFunction {
-                name: Some(name.to_string()),
-                operation: operation.into(),
-                input_names: vec!["input".to_string()],
-                input_types: vec![input_type],
-                output_type,
-            },
+            function: NaryFunction::unary(Some(name.to_string()), op, input_type, output_type),
         }
     }
 
@@ -309,6 +431,7 @@ impl NaryExpr {
                 }
             }
             NaryExpr::DimIndex(_) => false,
+            NaryExpr::Scalar(_) => false,
         }
     }
 
@@ -328,6 +451,7 @@ impl NaryExpr {
                 }
             }
             NaryExpr::DimIndex(dim) => format!("dim_{}", dim),
+            NaryExpr::Scalar(value) => format!("{value:?}"),
         }
     }
 }
@@ -345,217 +469,157 @@ pub(crate) struct NaryOperation {
 }
 
 impl NaryOperation {
-    /// Generate WGSL code for evaluating the expression tree.
-    /// Returns (value_string, actual_datatype) where actual_datatype is the type of the returned value.
-    #[allow(clippy::too_many_arguments)]
-    fn generate_expr_code(
-        &self,
-        expr: &NaryExpr,
-        kernel: &mut GenericKernel,
-        input_values: &[String],
-        input_tensors: &[crate::visit_tiled::MaybeQTensorInput],
-        input_datatypes: &[DataTypeEnum],
-        current_dims: &[String],
-        temp_counter: &mut usize,
-        functions_cache: &mut Vec<(String, Vec<DataTypeEnum>, Function)>,
-    ) -> (String, DataTypeEnum) {
-        match expr {
-            NaryExpr::Op { children, function } => {
-                // Recursively evaluate all children
-                let child_results: Vec<(String, DataTypeEnum)> = children
-                    .iter()
-                    .map(|child| {
-                        self.generate_expr_code(
-                            child,
-                            kernel,
-                            input_values,
-                            input_tensors,
-                            input_datatypes,
-                            current_dims,
-                            temp_counter,
-                            functions_cache,
-                        )
-                    })
-                    .collect();
-
-                // Cast child values to expected types if needed
-                let child_values: Vec<String> = child_results
-                    .iter()
-                    .zip(&function.input_types)
-                    .map(|((value, actual_type), expected_type)| {
-                        if actual_type == expected_type {
-                            value.clone()
-                        } else {
-                            // Insert type cast
-                            format!("{}({})", expected_type, value)
-                        }
-                    })
-                    .collect();
-
-                // Check if we already have this function cached (by operation AND types)
-                let func = if let Some((_, _, cached_func)) =
-                    functions_cache.iter().find(|(op, types, _)| {
-                        *op == function.operation && *types == function.input_types
-                    }) {
-                    cached_func.clone()
-                } else {
-                    // Create the function with proper input names and types
-                    let func = kernel.add_function(
-                        function.output_type,
-                        function.operation.clone(),
-                        function
-                            .input_names
-                            .iter()
-                            .zip(&function.input_types)
-                            .map(|(name, ty)| (name.clone(), ty.to_string())),
-                    );
-                    functions_cache.push((
-                        function.operation.clone(),
-                        function.input_types.clone(),
-                        func.clone(),
-                    ));
-                    func
-                };
-
-                // Generate temp variable for result
-                let temp_name = format!("tmp_{}", *temp_counter);
-                *temp_counter += 1;
-
-                // Call function with child values
-                writeln!(kernel, "let {temp_name} = {};", func.call(child_values)).unwrap();
-
-                (temp_name, function.output_type)
-            }
-            NaryExpr::IndexedInput { input_idx, indices } => {
-                use crate::visit_tiled::MaybeQTensorInput;
-
-                let actual_type = input_datatypes[*input_idx];
-
-                // Check if this is element-wise access (can use pre-computed value)
-                if NaryExpr::is_elementwise_indices(indices) {
-                    (input_values[*input_idx].clone(), actual_type)
-                } else {
-                    // Custom indexing - evaluate each index expression
-                    let dims: Vec<String> = indices
-                        .iter()
-                        .map(|idx_expr| {
-                            let (value, _) = self.generate_expr_code(
-                                idx_expr,
-                                kernel,
-                                input_values,
-                                input_tensors,
-                                input_datatypes,
-                                current_dims,
-                                temp_counter,
-                                functions_cache,
-                            );
-                            value
-                        })
-                        .collect();
-
-                    let custom_idx_var = format!("custom_idx_{}", *temp_counter);
-                    *temp_counter += 1;
-
-                    write!(kernel, "let {} = ", custom_idx_var).unwrap();
-                    match &input_tensors[*input_idx] {
-                        MaybeQTensorInput::Tensor(t) => {
-                            t.strided_index(kernel, dims);
-                        }
-                        MaybeQTensorInput::QTensor(_) => {
-                            panic!("Custom indexing not supported for quantized tensors");
-                        }
-                    }
-                    writeln!(kernel, ";").unwrap();
-
-                    (
-                        format!("{}[{}]", input_tensors[*input_idx], custom_idx_var),
-                        actual_type,
-                    )
-                }
-            }
-            NaryExpr::DimIndex(dim) => {
-                // Return the current dimension variable directly
-                (current_dims[*dim].clone(), DataTypeEnum::U32)
-            }
-        }
-    }
-
     /// Attempt to extract a unary function chain from this NaryOperation.
     /// This will only succeed if there is only a single input to the operation.
     pub(crate) fn try_extract_unary_chain(&self) -> Option<ExtractedUnaryChain> {
-        if self.inputs.len() == 1 {
-            let output_datatype = self.output_datatype;
-            let value = self.inputs[0];
-            let input_datatype = match &self.expression {
-                NaryExpr::Op { function, .. } => function.input_types[0],
-                NaryExpr::IndexedInput { .. } => output_datatype,
-                NaryExpr::DimIndex(_) => return None,
-            };
+        if self.inputs.len() != 1 {
+            return None;
+        }
 
-            fn collect_functions(
-                expr: &NaryExpr,
-                function_body: &mut String,
-                out_id: &mut usize,
-            ) -> std::fmt::Result {
-                let this_output = *out_id;
-                match expr {
-                    NaryExpr::Op { children, function } => {
-                        let mut inputs = Vec::new();
-                        for child in children {
-                            *out_id += 1;
-                            inputs.push(*out_id);
-                            collect_functions(child, function_body, out_id)?;
-                        }
-                        let default_value = match function.output_type {
-                            DataTypeEnum::F32 => "0.0",
-                            DataTypeEnum::F16 => "f16(0.0)",
-                            DataTypeEnum::U32 => "0u",
-                        };
-                        writeln!(function_body, "var output_{this_output} = {default_value};",)?;
-                        writeln!(function_body, "{{",)?;
-                        for (i, input_id) in inputs.iter().enumerate() {
-                            writeln!(
-                                function_body,
-                                "    let {} = output_{};",
-                                function.input_names[i], input_id
-                            )?;
-                        }
-                        writeln!(function_body, "{}", function.operation)?;
-                        writeln!(function_body, "    output_{} = output;", this_output,)?;
-                        writeln!(function_body, "}}",)?;
-                        Ok(())
-                    }
-                    NaryExpr::IndexedInput { indices, .. } => {
-                        if NaryExpr::is_elementwise_indices(indices) {
-                            writeln!(function_body, "let output_{this_output} = input;")
-                        } else {
-                            Err(std::fmt::Error)
-                        }
-                    }
-                    NaryExpr::DimIndex(_) => Err(std::fmt::Error),
-                }
-            }
+        let mut functions = Vec::new();
+        if !Self::collect_unary_chain(&self.expression, &mut functions)? {
+            return None;
+        }
+        if functions.is_empty() {
+            return None;
+        }
 
-            let mut function_body = String::new();
-            let mut out_id = 0;
-            if collect_functions(&self.expression, &mut function_body, &mut out_id).is_err() {
+        let input_datatype = functions.first()?.input_types.first().copied()?;
+        let mut current = input_datatype;
+        for function in &functions {
+            if function.input_types.as_slice() != [current] {
                 return None;
             }
-            writeln!(function_body, "let output = output_0;").unwrap();
-            let nary_func =
-                NaryFunction::unary(None, function_body, input_datatype, output_datatype);
+            current = function.output_type;
+        }
+        if current != self.output_datatype {
+            return None;
+        }
 
-            Some(ExtractedUnaryChain {
-                value,
-                functions: UnaryFunctionChain::new(vec![nary_func], input_datatype),
-            })
-        } else {
-            None
+        Some(ExtractedUnaryChain {
+            value: self.inputs[0],
+            functions: UnaryFunctionChain::new(functions, input_datatype),
+        })
+    }
+
+    fn collect_unary_chain(expr: &NaryExpr, functions: &mut Vec<NaryFunction>) -> Option<bool> {
+        match expr {
+            NaryExpr::IndexedInput { input_idx, indices } => {
+                Some(*input_idx == 0 && NaryExpr::is_elementwise_indices(indices))
+            }
+            NaryExpr::Op { children, function } => {
+                if children.len() != 1 || function.input_types.len() != 1 {
+                    return None;
+                }
+                if !Self::collect_unary_chain(&children[0], functions)? {
+                    return Some(false);
+                }
+                functions.push(function.clone());
+                Some(true)
+            }
+            NaryExpr::DimIndex(_) | NaryExpr::Scalar(_) => None,
+        }
+    }
+
+    /// Recognize a tile-IR-evaluatable expression over a paired-split pattern:
+    /// two of the inputs are the gate/up halves of a `q_mat_mul` output, and
+    /// any remaining inputs are per-column broadcast tensors (e.g. bias
+    /// vectors) accessed as `IndexedInput(k, [DimIndex(last_axis)])`. The
+    /// resolver uses this to auto-detect both the no-bias and biased FFN
+    /// patterns and synthesize a `PairedEpilogue` that captures the whole
+    /// expression.
+    pub(crate) fn try_extract_paired_split(&self) -> Option<ExtractedPairedSplit> {
+        if self.inputs.len() < 2 {
+            return None;
+        }
+        let output_rank = self.shape.len();
+        if !Self::expr_is_paired_evaluatable(&self.expression, output_rank) {
+            return None;
+        }
+        let mut input_seen = vec![false; self.inputs.len()];
+        Self::collect_input_usage_n(&self.expression, &mut input_seen, output_rank)?;
+        Some(ExtractedPairedSplit {
+            inputs: self.inputs.clone(),
+            inputs_seen: input_seen,
+            expression: self.expression.clone(),
+        })
+    }
+
+    /// An expression is paired-evaluatable when every input access is either
+    /// fully element-wise (matmul-view inputs: gate/up) or a single
+    /// `DimIndex(output_rank - 1)` access into a 1D broadcast tensor
+    /// (per-column extras: bias vectors). Other structures (DimIndex outside
+    /// IndexedInput leaves, non-trivial index arithmetic) block fusion.
+    fn expr_is_paired_evaluatable(expr: &NaryExpr, output_rank: usize) -> bool {
+        match expr {
+            NaryExpr::Op { children, .. } => children
+                .iter()
+                .all(|c| Self::expr_is_paired_evaluatable(c, output_rank)),
+            NaryExpr::IndexedInput { indices, .. } => {
+                NaryExpr::is_elementwise_indices(indices)
+                    || Self::is_last_dim_broadcast(indices, output_rank)
+            }
+            NaryExpr::Scalar(_) => true,
+            NaryExpr::DimIndex(_) => false,
+        }
+    }
+
+    /// `indices` describes a 1D-broadcast access whose only index is the
+    /// output's last-dim coordinate (e.g. `bias[col]` where `col` is the
+    /// kernel's output column). Bias vectors hit this branch.
+    fn is_last_dim_broadcast(indices: &[NaryExpr], output_rank: usize) -> bool {
+        if output_rank == 0 || indices.len() != 1 {
+            return false;
+        }
+        matches!(&indices[0], NaryExpr::DimIndex(d) if *d == output_rank - 1)
+    }
+
+    fn collect_input_usage_n(expr: &NaryExpr, seen: &mut [bool], output_rank: usize) -> Option<()> {
+        match expr {
+            NaryExpr::Op { children, .. } => {
+                for child in children {
+                    Self::collect_input_usage_n(child, seen, output_rank)?;
+                }
+                Some(())
+            }
+            NaryExpr::IndexedInput { input_idx, indices } => {
+                if *input_idx >= seen.len() {
+                    return None;
+                }
+                if !NaryExpr::is_elementwise_indices(indices)
+                    && !Self::is_last_dim_broadcast(indices, output_rank)
+                {
+                    return None;
+                }
+                seen[*input_idx] = true;
+                Some(())
+            }
+            NaryExpr::Scalar(_) => Some(()),
+            NaryExpr::DimIndex(_) => None,
         }
     }
 }
 
+/// Result of extracting a paired-split FFN pattern from an NaryOperation. The
+/// expression is preserved verbatim — the resolver re-emits it at the tile-IR
+/// level inside the qgemv kernel, substituting the actual `gate` / `up` /
+/// `extras...` tile values for each `IndexedInput` leaf.
+pub(crate) struct ExtractedPairedSplit {
+    pub(crate) inputs: Vec<NodeIndex>,
+    /// `inputs_seen[i]` is `true` if the captured expression references
+    /// `IndexedInput(i, ...)` anywhere. The resolver requires all inputs to
+    /// be used (unused inputs would point at dead graph nodes).
+    pub(crate) inputs_seen: Vec<bool>,
+    pub(crate) expression: NaryExpr,
+}
+
 impl Operation for NaryOperation {
+    fn hash_kernel_fields(&self, state: &mut FxHasher) {
+        self.expression.hash(state);
+        self.shape.hash(state);
+        self.output_datatype.hash(state);
+    }
+
     fn workgroup_shape_constraints(
         &self,
         device: &crate::Device,
@@ -566,9 +630,14 @@ impl Operation for NaryOperation {
     fn dispatch_size(
         &self,
         workgroup_shape: &crate::mir::workgroup_shape::WorkgroupShape,
-        _inputs: &[MirValue],
+        inputs: &[MirValue],
     ) -> [u32; 3] {
-        titled_map_dispatch_size(TILE_SIZE, *workgroup_shape, &self.shape)
+        let first_input: MaybeQData = inputs[0].clone().try_into().unwrap();
+        let max_per_dim = first_input
+            .device()
+            .limits()
+            .max_compute_workgroups_per_dimension;
+        titled_map_dispatch_size(TILE_SIZE, *workgroup_shape, &self.shape, max_per_dim)
     }
 
     fn visit_dependencies(&self, f: &mut dyn FnMut(NodeIndex)) {
@@ -596,153 +665,25 @@ impl Operation for NaryOperation {
             })
             .collect();
 
-        // Check if we can reuse an input allocation for output
-        // We can only reuse if:
-        // 1. The input matches datatype, is owned, and doesn't overlap
-        // 2. The input is NOT accessed with custom indexing (which would cause read/write races)
-        let reuse_index = mir_inputs.iter().enumerate().find_map(|(i, input)| {
-            // Don't reuse if this input is accessed with custom indexing
-            if self.expression.uses_custom_indexing_for_input(i) {
-                return None;
-            }
-            if let Ok(data) = std::convert::TryInto::<MaybeQData>::try_into(input.clone())
-                && data.datatype() == self.output_datatype.into()
-                && data.owned()
-                && !data.layout().allocation_overlaps()
-            {
-                return Some(i);
-            }
-            None
-        });
-
-        if reuse_index.is_none() {
-            // Need to allocate a new output tensor
-            let first_input: MaybeQData = mir_inputs[0].clone().try_into().unwrap();
-            let output_tensor =
-                TensorData::new_for_shape(first_input.device(), &self.shape, self.output_datatype);
-            mir_inputs.push(output_tensor.into());
-        }
+        let first_input: MaybeQData = mir_inputs[0].clone().try_into().unwrap();
+        let output_tensor =
+            TensorData::new_for_shape(first_input.device(), &self.shape, self.output_datatype);
+        mir_inputs.push(output_tensor.into());
 
         mir_inputs
     }
 
     fn output(&self, _nodes: &ComputeGraphInner, inputs: &[MirValue]) -> MirValue {
-        // Check if we reused an input allocation
-        let reuse_index = inputs[..self.inputs.len()]
-            .iter()
-            .enumerate()
-            .find_map(|(i, input)| {
-                // Don't reuse if this input is accessed with custom indexing
-                if self.expression.uses_custom_indexing_for_input(i) {
-                    return None;
-                }
-                if let Ok(data) = std::convert::TryInto::<MaybeQData>::try_into(input.clone())
-                    && data.datatype() == self.output_datatype.into()
-                    && data.owned()
-                    && !data.layout().allocation_overlaps()
-                {
-                    return Some(i);
-                }
-                None
-            });
-
-        if let Some(idx) = reuse_index {
-            inputs[idx].clone()
-        } else {
-            // Output is the last input (newly allocated)
-            inputs.last().unwrap().clone()
-        }
+        inputs.last().unwrap().clone()
     }
 
-    fn build_kernel(
+    fn build_direct_kernel(
         &self,
-        graph: &ComputeGraphInner,
-        _workgroup_shape: &crate::mir::workgroup_shape::WorkgroupShape,
+        nodes: &ComputeGraphInner,
+        workgroup_shape: &crate::mir::workgroup_shape::WorkgroupShape,
         inputs: &[MirValue],
-        kernel: &mut GenericKernel,
-    ) {
-        // Determine output tensor index
-        let reuse_index = inputs[..self.inputs.len()]
-            .iter()
-            .enumerate()
-            .find_map(|(i, input)| {
-                // Don't reuse if this input is accessed with custom indexing
-                if self.expression.uses_custom_indexing_for_input(i) {
-                    return None;
-                }
-                if let Ok(data) = std::convert::TryInto::<MaybeQData>::try_into(input.clone())
-                    && data.datatype() == self.output_datatype.into()
-                    && data.owned()
-                    && !data.layout().allocation_overlaps()
-                {
-                    return Some(i);
-                }
-                None
-            });
-
-        let output_tensor_index = reuse_index.unwrap_or(self.inputs.len());
-
-        // Collect inputs with datatypes and ranks for all inputs
-        let tiled_inputs: Vec<_> = inputs
-            .iter()
-            .filter_map(|input| {
-                let result: Result<MaybeQData, _> = input.clone().try_into();
-                result.ok()
-            })
-            .map(|data| {
-                let datatype = data.datatype();
-                let input_rank = data.layout().shape().len() as u32;
-                crate::visit_tiled::VisitTiledInput::new(datatype, input_rank)
-            })
-            .collect();
-
-        // Extract DataTypeEnum for each input for type checking during code generation
-        let input_datatypes: Vec<DataTypeEnum> = tiled_inputs
-            .iter()
-            .take(self.inputs.len())
-            .map(|input| match input.datatype {
-                crate::visit_tiled::VisitTiledInputType::Quantized(_) => DataTypeEnum::F32, // Quantized dequantizes to f32
-                crate::visit_tiled::VisitTiledInputType::Dequantized(d) => d,
-            })
-            .collect();
-
-        let mut functions_cache: Vec<(String, Vec<DataTypeEnum>, Function)> = Vec::new();
-
-        let device = graph.device();
-        build_visit_tiled_kernel(
-            &device,
-            &self.shape,
-            TILE_SIZE,
-            tiled_inputs,
-            output_tensor_index,
-            |kernel, indexes, tensors, values| {
-                let input_values: Vec<_> = values[..self.inputs.len()].to_vec();
-                let input_tensors = &tensors[..self.inputs.len()];
-                let output_index = &indexes[output_tensor_index];
-                let output_tensor = &tensors[output_tensor_index];
-
-                let mut temp_counter = 0;
-
-                // Extract dimension variables (dim_0, dim_1, ..., dim_N)
-                let rank = self.shape.len();
-                let current_dims: Vec<String> = (0..rank).map(|i| format!("dim_{}", i)).collect();
-
-                // Generate expression tree evaluation
-                let (result, _result_type) = self.generate_expr_code(
-                    &self.expression,
-                    kernel,
-                    &input_values,
-                    input_tensors,
-                    &input_datatypes,
-                    &current_dims,
-                    &mut temp_counter,
-                    &mut functions_cache,
-                );
-
-                format!("{output_tensor}[{output_index}] = {result};")
-            },
-            kernel,
-        );
+    ) -> Option<DirectKernel> {
+        crate::nary_direct::build_nary_direct_kernel(self, nodes, workgroup_shape, inputs)
     }
 
     fn name(&self) -> String {

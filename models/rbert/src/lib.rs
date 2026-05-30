@@ -83,7 +83,6 @@ impl BertBuilder {
         self
     }
 
-    #[cfg(feature = "tokio")]
     /// Set the cache location to use for the model (defaults DATA_DIR/kalosm/cache)
     pub fn with_cache(mut self, cache: kalosm_common::Cache) -> Self {
         self.cache = cache;
@@ -168,6 +167,7 @@ pub enum Pooling {
 }
 
 /// An embedding model that can be either BERT or Qwen
+#[allow(clippy::large_enum_variant)]
 pub enum EmbeddingModel {
     /// A BERT-style embedding model
     Bert(BertModel),

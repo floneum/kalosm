@@ -254,9 +254,9 @@ impl<M: CreateTextCompletionSession, Constraints, Sampler>
     /// # #[tokio::main]
     /// # async fn main() {
     /// let model = Llama::new().await.unwrap();
-    /// // Create the sampler to use for the text completion
-    /// let sampler = GenerationParameters::default().sampler();
-    /// // Create a completion request with the sampler
+    /// // Create the generation parameters to use for the text completion
+    /// let sampler = GenerationParameters::default().with_temperature(0.8);
+    /// // Create a completion request with the generation parameters
     /// let mut stream = model
     ///     .complete("Here is a list of 5 primes: ")
     ///     .with_sampler(sampler);

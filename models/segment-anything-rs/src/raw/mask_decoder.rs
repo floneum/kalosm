@@ -1,7 +1,7 @@
 //! Mask decoder: predicts masks from image+prompt embeddings.
 
 use fusor::layers::{Embedding, LayerNormNd, Linear};
-use fusor::{ConcreteTensor, Device, Tensor, VarBuilder};
+use fusor::{Concrete, Device, Tensor, VarBuilder};
 
 use super::transformer::TwoWayTransformer;
 use super::Result;
@@ -31,14 +31,14 @@ const UPSCALE_KERNEL_HW: [usize; 2] = [2, 2];
 /// This is intentionally local to the SAM port rather than exposed as a generic
 /// `fusor` layer.
 struct SamPixelShuffleUpscale2x2 {
-    weight: Tensor<4, f32, ConcreteTensor<f32, 4>>,
-    bias: Option<Tensor<1, f32, ConcreteTensor<f32, 1>>>,
+    weight: Tensor<4, f32, Concrete<f32, 4>>,
+    bias: Option<Tensor<1, f32, Concrete<f32, 1>>>,
 }
 
 impl SamPixelShuffleUpscale2x2 {
     fn load(device: &Device, vb: &mut VarBuilder) -> Result<Self> {
         let weight: Tensor<4, f32> = vb.get("weight", device)?.dequantize();
-        let bias: Option<Tensor<1, f32, ConcreteTensor<f32, 1>>> =
+        let bias: Option<Tensor<1, f32, Concrete<f32, 1>>> =
             vb.get("bias", device).ok().map(|b| b.dequantize());
         let weight_shape = weight.shape();
         let kh = weight_shape[2];
@@ -58,8 +58,8 @@ impl SamPixelShuffleUpscale2x2 {
 
     fn forward(
         &self,
-        input: &Tensor<4, f32, ConcreteTensor<f32, 4>>,
-    ) -> Tensor<4, f32, ConcreteTensor<f32, 4>> {
+        input: &Tensor<4, f32, Concrete<f32, 4>>,
+    ) -> Tensor<4, f32, Concrete<f32, 4>> {
         let shape = input.shape();
         let b = shape[0];
         let in_ch = shape[1];
@@ -334,10 +334,7 @@ impl MaskDecoder {
 }
 
 /// Equivalent to torch.repeat_interleave for 4D tensors along dim 0.
-fn repeat_interleave_4d(
-    img: &Tensor<4, f32>,
-    repeats: usize,
-) -> Tensor<4, f32, ConcreteTensor<f32, 4>> {
+fn repeat_interleave_4d(img: &Tensor<4, f32>, repeats: usize) -> Tensor<4, f32, Concrete<f32, 4>> {
     let shape = img.shape();
     let b = shape[0];
     let c = shape[1];
@@ -355,7 +352,7 @@ fn repeat_interleave_4d(
 mod tests {
     use super::*;
 
-    async fn to_vec<const R: usize>(tensor: &Tensor<R, f32, ConcreteTensor<f32, R>>) -> Vec<f32> {
+    async fn to_vec<const R: usize>(tensor: &Tensor<R, f32, Concrete<f32, R>>) -> Vec<f32> {
         let len = tensor.shape().iter().product::<usize>();
         tensor
             .reshape([len])

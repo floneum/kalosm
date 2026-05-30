@@ -8,8 +8,6 @@ use parking_lot::RwLock;
 use rustc_hash::FxBuildHasher;
 use std::{num::NonZeroUsize, sync::OnceLock};
 
-use crate::mir::kernel::GenericKernel;
-
 const MAX_WORKGROUP_SIZE: u32 = 256;
 
 #[derive(Debug, Clone, Copy)]
@@ -54,14 +52,6 @@ impl WorkgroupShape {
 
     pub(crate) fn shape(&self) -> [u32; 3] {
         self.shape
-    }
-
-    pub(crate) fn linearized_workgroup_index(&self, kernel: &mut GenericKernel) -> String {
-        // Use num_workgroups builtin to correctly compute flat workgroup index
-        // when workgroups are spread across multiple dispatch dimensions
-        let wg = kernel.workgroup_index();
-        let nw = kernel.num_workgroups();
-        format!("({wg}.x + {wg}.y * {nw}.x + {wg}.z * {nw}.x * {nw}.y)")
     }
 }
 
@@ -125,12 +115,6 @@ impl WorkgroupShapeConstraints {
                     }
             })
         })
-    }
-
-    pub(crate) fn merge(&mut self, other: &Self) {
-        for (i, constraints) in other.shape.iter().enumerate() {
-            self.shape[i].extend(constraints.clone());
-        }
     }
 }
 
@@ -200,27 +184,5 @@ mod tests {
         let valid_shape = constraints.solve(TEST_MAX_SUBGROUP_SIZE).unwrap();
         assert_eq!(valid_shape.shape(), [4, 1, 1]);
         assert_eq!(valid_shape.linearized(), 4);
-    }
-
-    #[test]
-    fn test_many_workgroup_shape_constraints() {
-        let mut constraints = WorkgroupShapeConstraints::new();
-        constraints.add_constraint(0, Constraint::Equals(4));
-        constraints.add_constraint(1, Constraint::LessThan(3));
-
-        let mut constraints2 = WorkgroupShapeConstraints::new();
-        constraints2.add_constraint(1, Constraint::Equals(2));
-
-        let mut merged = WorkgroupShapeConstraints::new();
-        merged.merge(&constraints);
-        merged.merge(&constraints2);
-        for shape in merged.possible() {
-            assert_eq!(shape.shape()[0], 4);
-            assert!(shape.shape()[1] < 3);
-        }
-
-        let valid_shape = merged.solve(TEST_MAX_SUBGROUP_SIZE).unwrap();
-        assert_eq!(valid_shape.shape(), [4, 2, 1]);
-        assert_eq!(valid_shape.linearized(), 8);
     }
 }

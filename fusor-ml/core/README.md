@@ -42,6 +42,4 @@ Operations required for a Llama implementation:
 ## Resources
 
 - https://github.com/googlefonts/compute-shader-101
-- https://google.github.io/tour-of-wgsl/
-- https://www.w3.org/TR/WGSL/
 - https://siboehm.com/articles/22/CUDA-MMM

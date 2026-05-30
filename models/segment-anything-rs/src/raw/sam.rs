@@ -1,6 +1,6 @@
 //! Top-level Sam model: ties together image encoder, prompt encoder, and mask decoder.
 
-use fusor::{ConcreteTensor, Device, Tensor, TensorBacking, VarBuilder};
+use fusor::{Concrete, Device, Fusion, Tensor, VarBuilder};
 
 use super::image_encoder::ImageEncoderViT;
 use super::mask_decoder::MaskDecoder;
@@ -33,7 +33,7 @@ pub(crate) enum ImageEncoder {
 }
 
 impl ImageEncoder {
-    fn forward(&self, xs: &Tensor<4, f32, impl TensorBacking<4, Elem = f32>>) -> Tensor<4, f32> {
+    fn forward(&self, xs: &Tensor<4, f32, impl Fusion<4, f32>>) -> Tensor<4, f32> {
         match self {
             Self::Original(vit) => vit.forward(xs),
             Self::TinyViT(vit) => vit.forward(xs),
@@ -140,7 +140,7 @@ impl Sam {
     }
 
     /// Compute image embeddings.
-    pub fn embeddings(&self, img: &Tensor<3, f32, ConcreteTensor<f32, 3>>) -> Tensor<4, f32> {
+    pub fn embeddings(&self, img: &Tensor<3, f32, Concrete<f32, 3>>) -> Tensor<4, f32> {
         let img = self.preprocess(img);
         // Add batch dim: (C, H, W) -> (1, C, H, W)
         let shape = img.shape();
@@ -153,7 +153,7 @@ impl Sam {
     /// Points format: `(x, y, is_foreground)` where x,y are in [0,1] normalized coords.
     pub fn forward(
         &self,
-        img: &Tensor<3, f32, ConcreteTensor<f32, 3>>,
+        img: &Tensor<3, f32, Concrete<f32, 3>>,
         points: &[(f64, f64, bool)],
         multimask_output: bool,
     ) -> (Tensor<4, f32>, Tensor<2, f32>) {

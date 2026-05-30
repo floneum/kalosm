@@ -1,11 +1,11 @@
 //! Rotary Position Embeddings (RoPE) that work on both CPU and GPU backends.
 
+use crate::cpu::FloatOps;
+use crate::gpu::{DataType, FloatDataType};
 use crate::{
     AddOp, ConcreteTensor, Device, MulOp, NegOp, SimdBinaryOp, SimdElement, SimdUnaryOp, SubOp,
     Tensor,
 };
-use fusor_core::{DataType, FloatDataType};
-use fusor_cpu::FloatOps;
 
 fn rotate_half<D>(xs: &Tensor<4, D, ConcreteTensor<D, 4>>) -> Tensor<4, D, ConcreteTensor<D, 4>>
 where
@@ -158,6 +158,72 @@ where
             _ => panic!("All tensors must be on the same device"),
         }
     }
+
+    /// Apply fused interleaved RoPE to query and key tensors together.
+    ///
+    /// On GPU this emits one direct fused kernel for both outputs. On CPU, it delegates to the
+    /// existing per-tensor composite implementation.
+    pub fn rope_pair_fused(
+        &self,
+        k: &Self,
+        cos: &Tensor<2, D, ConcreteTensor<D, 2>>,
+        sin: &Tensor<2, D, ConcreteTensor<D, 2>>,
+    ) -> (Self, Self) {
+        let sequence_length = self.shape()[2];
+        assert_eq!(
+            sequence_length,
+            k.shape()[2],
+            "paired RoPE requires q and k sequence dimensions to match"
+        );
+        let cos_narrow: Tensor<2, D, ConcreteTensor<D, 2>> =
+            cos.narrow(0, 0, sequence_length).to_concrete();
+        let sin_narrow: Tensor<2, D, ConcreteTensor<D, 2>> =
+            sin.narrow(0, 0, sequence_length).to_concrete();
+        match (self, k, &cos_narrow, &sin_narrow) {
+            (Tensor::Gpu(q), Tensor::Gpu(k), Tensor::Gpu(cos), Tensor::Gpu(sin)) => {
+                let (q, k) = q.rope_pair_fused(k, cos, sin);
+                (Tensor::Gpu(q), Tensor::Gpu(k))
+            }
+            (Tensor::Cpu(_), Tensor::Cpu(_), Tensor::Cpu(_), Tensor::Cpu(_)) => (
+                self.rope_interleaved(&cos_narrow, &sin_narrow),
+                k.rope_interleaved(&cos_narrow, &sin_narrow),
+            ),
+            _ => panic!("All tensors must be on the same device"),
+        }
+    }
+
+    /// Apply fused normal RoPE to query and key tensors together.
+    ///
+    /// On GPU this emits one direct fused kernel for both outputs. On CPU, it delegates to the
+    /// existing per-tensor composite implementation.
+    pub fn rope_normal_pair_fused(
+        &self,
+        k: &Self,
+        cos: &Tensor<2, D, ConcreteTensor<D, 2>>,
+        sin: &Tensor<2, D, ConcreteTensor<D, 2>>,
+    ) -> (Self, Self) {
+        let sequence_length = self.shape()[2];
+        assert_eq!(
+            sequence_length,
+            k.shape()[2],
+            "paired RoPE requires q and k sequence dimensions to match"
+        );
+        let cos_narrow: Tensor<2, D, ConcreteTensor<D, 2>> =
+            cos.narrow(0, 0, sequence_length).to_concrete();
+        let sin_narrow: Tensor<2, D, ConcreteTensor<D, 2>> =
+            sin.narrow(0, 0, sequence_length).to_concrete();
+        match (self, k, &cos_narrow, &sin_narrow) {
+            (Tensor::Gpu(q), Tensor::Gpu(k), Tensor::Gpu(cos), Tensor::Gpu(sin)) => {
+                let (q, k) = q.rope_normal_pair_fused(k, cos, sin);
+                (Tensor::Gpu(q), Tensor::Gpu(k))
+            }
+            (Tensor::Cpu(_), Tensor::Cpu(_), Tensor::Cpu(_), Tensor::Cpu(_)) => (
+                self.rope(&cos_narrow, &sin_narrow),
+                k.rope(&cos_narrow, &sin_narrow),
+            ),
+            _ => panic!("All tensors must be on the same device"),
+        }
+    }
 }
 
 /// Pre-computed sin/cos tables for Rotary Position Embeddings.
@@ -225,10 +291,7 @@ impl RopeCache {
         let cos = self.cos.narrow(0, start_pos, seq_len).to_concrete();
         let sin = self.sin.narrow(0, start_pos, seq_len).to_concrete();
 
-        let q = q.rope_normal_fused(&cos, &sin);
-        let k = k.rope_normal_fused(&cos, &sin);
-
-        (q, k)
+        q.rope_normal_pair_fused(k, &cos, &sin)
     }
 
     /// Apply interleaved RoPE to query and key tensors.
@@ -244,10 +307,7 @@ impl RopeCache {
         let cos = self.cos.narrow(0, start_pos, seq_len).to_concrete();
         let sin = self.sin.narrow(0, start_pos, seq_len).to_concrete();
 
-        let q = q.rope_fused(&cos, &sin);
-        let k = k.rope_fused(&cos, &sin);
-
-        (q, k)
+        q.rope_pair_fused(k, &cos, &sin)
     }
 
     /// Access the raw sin tensor `[context_length, head_dim/2]`.

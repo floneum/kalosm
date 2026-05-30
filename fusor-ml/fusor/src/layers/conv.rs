@@ -1,8 +1,9 @@
 //! N-dimensional convolution layer.
 
-use crate::{ConcreteTensor, Device, MatmulImpl, SimdElement, Tensor, VarBuilder};
-use fusor_core::{DataType, FloatDataType, LargerRank};
-use fusor_cpu::{FloatOps, TensorBacking};
+use crate::fusion::Concrete;
+use crate::{
+    DataType, Device, FloatDataType, FloatOps, Fusion, MatmulImpl, SimdElement, Tensor, VarBuilder,
+};
 
 /// Configuration for an N-D convolution.
 #[derive(Debug, Clone, Copy)]
@@ -28,8 +29,8 @@ impl<const SPATIAL: usize> Default for ConvNdConfig<SPATIAL> {
 /// `(batch, channels, ...spatial)`.
 /// Weight has shape `(out_channels, in_channels / groups, ...kernel)`.
 pub struct ConvNd<const SPATIAL: usize, const RANK: usize, D: SimdElement> {
-    weight: Tensor<RANK, D, ConcreteTensor<D, RANK>>,
-    bias: Option<Tensor<1, D, ConcreteTensor<D, 1>>>,
+    weight: Tensor<RANK, D, Concrete<D, RANK>>,
+    bias: Option<Tensor<1, D, Concrete<D, 1>>>,
     config: ConvNdConfig<SPATIAL>,
     in_channels: usize,
     out_channels: usize,
@@ -44,8 +45,8 @@ where
     /// `weight` shape: `(out_channels, in_channels / groups, ...kernel)`.
     /// `bias` shape: `(out_channels,)`.
     pub fn new(
-        weight: Tensor<RANK, D, ConcreteTensor<D, RANK>>,
-        bias: Option<Tensor<1, D, ConcreteTensor<D, 1>>>,
+        weight: Tensor<RANK, D, Concrete<D, RANK>>,
+        bias: Option<Tensor<1, D, Concrete<D, 1>>>,
         config: ConvNdConfig<SPATIAL>,
     ) -> Self {
         // RANK = SPATIAL + 2 (batch + channels + spatial). Compile-time so a
@@ -116,14 +117,14 @@ where
     pub fn forward<B, const R2: usize>(
         &self,
         input: &Tensor<RANK, D, B>,
-    ) -> Tensor<RANK, D, ConcreteTensor<D, RANK>>
+    ) -> Tensor<RANK, D, Concrete<D, RANK>>
     where
-        B: TensorBacking<RANK, Elem = D>,
-        crate::MulOp: fusor_cpu::SimdBinaryOp<D>,
-        crate::AddOp: fusor_cpu::SimdBinaryOp<D>,
-        fusor_cpu::SumOp: fusor_cpu::SimdReduceOp<D>,
-        ConcreteTensor<D, RANK>: fusor_cpu::LargerRank<R2, SPATIAL, D>,
-        fusor_core::Tensor<RANK, D>: LargerRank<SPATIAL, R2, D>,
+        B: Fusion<RANK, D>,
+        crate::MulOp: crate::cpu::SimdBinaryOp<D>,
+        crate::AddOp: crate::cpu::SimdBinaryOp<D>,
+        crate::cpu::SumOp: crate::cpu::SimdReduceOp<D>,
+        Concrete<D, RANK>: crate::cpu::LargerRank<R2, SPATIAL, D>,
+        crate::gpu::Tensor<RANK, D>: crate::gpu::LargerRank<SPATIAL, R2, D>,
     {
         let input = input.to_concrete();
 
@@ -154,7 +155,7 @@ impl<const SPATIAL: usize, const RANK: usize> ConvNd<SPATIAL, RANK, f32> {
         config: ConvNdConfig<SPATIAL>,
     ) -> crate::Result<Self> {
         let weight: Tensor<RANK, f32> = vb.get("weight", device)?.dequantize();
-        let bias: Option<Tensor<1, f32, ConcreteTensor<f32, 1>>> =
+        let bias: Option<Tensor<1, f32, Concrete<f32, 1>>> =
             vb.get("bias", device).ok().map(|b| b.dequantize());
 
         Ok(Self::new(weight.to_concrete(), bias, config))
@@ -180,16 +181,17 @@ mod tests {
     async fn test_conv1d_simple() {
         let weight_data = [0.2f32, 0.5, 0.3];
         let weight: Tensor<3, f32> =
-            Tensor::Cpu(fusor_cpu::Tensor::from_slice([1, 1, 3], &weight_data));
+            Tensor::Cpu(crate::cpu::TypedTensor::from_slice([1, 1, 3], &weight_data));
 
         let bias_data = [0.1f32];
-        let bias: Tensor<1, f32> = Tensor::Cpu(fusor_cpu::Tensor::from_slice([1], &bias_data));
+        let bias: Tensor<1, f32> =
+            Tensor::Cpu(crate::cpu::TypedTensor::from_slice([1], &bias_data));
 
         let conv = ConvNd::<1, 3, _>::new(weight, Some(bias), ConvNdConfig::<1>::default());
 
         let input_data = [1.0f32, 2.0, 3.0, 4.0, 5.0];
         let input: Tensor<3, f32> =
-            Tensor::Cpu(fusor_cpu::Tensor::from_slice([1, 1, 5], &input_data));
+            Tensor::Cpu(crate::cpu::TypedTensor::from_slice([1, 1, 5], &input_data));
 
         let output = conv.forward(&input);
         let result = output.as_slice().await.unwrap();
@@ -204,7 +206,7 @@ mod tests {
     async fn test_conv1d_with_padding() {
         let weight_data = [1.0f32, 1.0, 1.0];
         let weight: Tensor<3, f32> =
-            Tensor::Cpu(fusor_cpu::Tensor::from_slice([1, 1, 3], &weight_data));
+            Tensor::Cpu(crate::cpu::TypedTensor::from_slice([1, 1, 3], &weight_data));
 
         let config = ConvNdConfig::<1> {
             padding: [1],
@@ -214,7 +216,7 @@ mod tests {
 
         let input_data = [1.0f32, 2.0, 3.0];
         let input: Tensor<3, f32> =
-            Tensor::Cpu(fusor_cpu::Tensor::from_slice([1, 1, 3], &input_data));
+            Tensor::Cpu(crate::cpu::TypedTensor::from_slice([1, 1, 3], &input_data));
 
         let output = conv.forward(&input);
         let result = output.as_slice().await.unwrap();
@@ -229,7 +231,7 @@ mod tests {
     async fn test_conv1d_properties() {
         let weight_data = [0.0f32; 6];
         let weight: Tensor<3, f32> =
-            Tensor::Cpu(fusor_cpu::Tensor::from_slice([2, 3, 1], &weight_data));
+            Tensor::Cpu(crate::cpu::TypedTensor::from_slice([2, 3, 1], &weight_data));
 
         let config = ConvNdConfig::<1> {
             padding: [2],
@@ -258,12 +260,16 @@ mod tests {
             groups: 1,
         };
 
-        let weight_cpu: Tensor<3, f32> =
-            Tensor::Cpu(fusor_cpu::Tensor::from_slice([384, 80, 3], &weight_data));
+        let weight_cpu: Tensor<3, f32> = Tensor::Cpu(crate::cpu::TypedTensor::from_slice(
+            [384, 80, 3],
+            &weight_data,
+        ));
         let bias_cpu: Tensor<1, f32> =
-            Tensor::Cpu(fusor_cpu::Tensor::from_slice([384], &bias_data));
-        let input_cpu: Tensor<3, f32> =
-            Tensor::Cpu(fusor_cpu::Tensor::from_slice([1, 80, 3000], &input_data));
+            Tensor::Cpu(crate::cpu::TypedTensor::from_slice([384], &bias_data));
+        let input_cpu: Tensor<3, f32> = Tensor::Cpu(crate::cpu::TypedTensor::from_slice(
+            [1, 80, 3000],
+            &input_data,
+        ));
         let conv_cpu = ConvNd::<1, 3, _>::new(weight_cpu, Some(bias_cpu), config);
         let output_cpu = conv_cpu.forward(&input_cpu);
         let result_cpu = output_cpu.as_slice().await.unwrap();

@@ -4,8 +4,8 @@ use std::ops::Neg as StdNeg;
 
 use pulp::Simd;
 
-use crate::{ConcreteTensor, SimdElement, TensorBacking, materialize_expr};
-use fusor_types::Layout;
+use crate::SimdElement;
+use crate::define_tensor_op;
 
 /// Trait for unary operations that have SIMD support
 pub trait SimdUnaryOp<E: SimdElement>: Copy {
@@ -258,149 +258,27 @@ impl_f16_unary_op!(AtanhOp, |x: half::f16| half::f16::from_f32(
     x.to_f32().atanh()
 ));
 
-/// Macro to define unary tensor operations (Neg, Abs, Sqrt)
-macro_rules! define_unary_tensor_op {
-    ($name:ident, $simd_op:ty) => {
-        pub struct $name<E: SimdElement, const R: usize, T: TensorBacking<R, Elem = E>> {
-            input: T,
-            _marker: std::marker::PhantomData<E>,
-        }
-
-        impl<E, const R: usize, T> $name<E, R, T>
-        where
-            E: SimdElement,
-            T: TensorBacking<R, Elem = E>,
-        {
-            pub fn new(input: T) -> Self {
-                Self {
-                    input,
-                    _marker: std::marker::PhantomData,
-                }
-            }
-        }
-
-        impl<E, const R: usize, T> crate::LazyBacking for $name<E, R, T>
-        where
-            E: SimdElement + Default,
-            $simd_op: SimdUnaryOp<E>,
-            T: TensorBacking<R, Elem = E>,
-        {
-            type Elem = E;
-
-            #[inline(always)]
-            fn eval_scalar(&self, idx: usize) -> E {
-                <$simd_op>::apply_scalar(self.input.eval_scalar(idx))
-            }
-
-            #[inline(always)]
-            fn eval_simd<S: Simd>(&self, simd: S, base_idx: usize) -> E::Simd<S> {
-                <$simd_op>::apply_simd_vec(simd, self.input.eval_simd(simd, base_idx))
-            }
-        }
-
-        impl<E, const R: usize, T> TensorBacking<R> for $name<E, R, T>
-        where
-            E: SimdElement + Default,
-            $simd_op: SimdUnaryOp<E>,
-            T: TensorBacking<R, Elem = E>,
-        {
-            fn layout(&self) -> Layout {
-                Layout::contiguous(self.input.layout().shape())
-            }
-
-            fn to_concrete(&self) -> ConcreteTensor<E, R> {
-                let shape: [usize; R] = self
-                    .input
-                    .layout()
-                    .shape()
-                    .try_into()
-                    .expect("Shape length mismatch");
-                materialize_expr(self, shape)
-            }
-        }
-    };
-    ($name:ident, $simd_op:ty, $std_trait:ident) => {
-        pub struct $name<E: SimdElement, const R: usize, T: TensorBacking<R, Elem = E>> {
-            input: T,
-            _marker: std::marker::PhantomData<E>,
-        }
-
-        impl<E, const R: usize, T> $name<E, R, T>
-        where
-            E: SimdElement,
-            T: TensorBacking<R, Elem = E>,
-        {
-            pub fn new(input: T) -> Self {
-                Self {
-                    input,
-                    _marker: std::marker::PhantomData,
-                }
-            }
-        }
-
-        impl<E, const R: usize, T> crate::LazyBacking for $name<E, R, T>
-        where
-            E: SimdElement + $std_trait<Output = E> + Default,
-            $simd_op: SimdUnaryOp<E>,
-            T: TensorBacking<R, Elem = E>,
-        {
-            type Elem = E;
-
-            #[inline(always)]
-            fn eval_scalar(&self, idx: usize) -> E {
-                <$simd_op>::apply_scalar(self.input.eval_scalar(idx))
-            }
-
-            #[inline(always)]
-            fn eval_simd<S: Simd>(&self, simd: S, base_idx: usize) -> E::Simd<S> {
-                <$simd_op>::apply_simd_vec(simd, self.input.eval_simd(simd, base_idx))
-            }
-        }
-
-        impl<E, const R: usize, T> TensorBacking<R> for $name<E, R, T>
-        where
-            E: SimdElement + $std_trait<Output = E> + Default,
-            $simd_op: SimdUnaryOp<E>,
-            T: TensorBacking<R, Elem = E>,
-        {
-            fn layout(&self) -> Layout {
-                Layout::contiguous(self.input.layout().shape())
-            }
-
-            fn to_concrete(&self) -> ConcreteTensor<E, R> {
-                let shape: [usize; R] = self
-                    .input
-                    .layout()
-                    .shape()
-                    .try_into()
-                    .expect("Shape length mismatch");
-                materialize_expr(self, shape)
-            }
-        }
-    };
-}
-
 // Unary tensor operations
-define_unary_tensor_op!(Neg, NegOp, StdNeg);
-define_unary_tensor_op!(Abs, AbsOp);
-define_unary_tensor_op!(Sqrt, SqrtOp);
+define_tensor_op!(@unary Neg, NegOp, std_trait = StdNeg);
+define_tensor_op!(@unary Abs, AbsOp);
+define_tensor_op!(@unary Sqrt, SqrtOp);
 
 // Transcendental tensor operations
-define_unary_tensor_op!(Exp, ExpOp);
-define_unary_tensor_op!(Exp2, Exp2Op);
-define_unary_tensor_op!(Log, LogOp);
-define_unary_tensor_op!(Log2, Log2Op);
-define_unary_tensor_op!(Sin, SinOp);
-define_unary_tensor_op!(Cos, CosOp);
-define_unary_tensor_op!(Tan, TanOp);
-define_unary_tensor_op!(Tanh, TanhOp);
+define_tensor_op!(@unary Exp, ExpOp);
+define_tensor_op!(@unary Exp2, Exp2Op);
+define_tensor_op!(@unary Log, LogOp);
+define_tensor_op!(@unary Log2, Log2Op);
+define_tensor_op!(@unary Sin, SinOp);
+define_tensor_op!(@unary Cos, CosOp);
+define_tensor_op!(@unary Tan, TanOp);
+define_tensor_op!(@unary Tanh, TanhOp);
 
 // Additional inverse trig and hyperbolic tensor operations
-define_unary_tensor_op!(Asin, AsinOp);
-define_unary_tensor_op!(Acos, AcosOp);
-define_unary_tensor_op!(Atan, AtanOp);
-define_unary_tensor_op!(Sinh, SinhOp);
-define_unary_tensor_op!(Cosh, CoshOp);
-define_unary_tensor_op!(Asinh, AsinhOp);
-define_unary_tensor_op!(Acosh, AcoshOp);
-define_unary_tensor_op!(Atanh, AtanhOp);
+define_tensor_op!(@unary Asin, AsinOp);
+define_tensor_op!(@unary Acos, AcosOp);
+define_tensor_op!(@unary Atan, AtanOp);
+define_tensor_op!(@unary Sinh, SinhOp);
+define_tensor_op!(@unary Cosh, CoshOp);
+define_tensor_op!(@unary Asinh, AsinhOp);
+define_tensor_op!(@unary Acosh, AcoshOp);
+define_tensor_op!(@unary Atanh, AtanhOp);
