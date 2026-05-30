@@ -16,18 +16,12 @@ pub const IMAGE_SIZE: usize = 1024;
 /// this coincidence so a single `IMAGE_SIZE / VIT_PATCH_SIZE` constant works
 /// for the prompt-encoder geometry. SAM2 variants must NOT reuse this constant.
 const VIT_PATCH_SIZE: usize = 16;
-pub(crate) const PRED_IOU_THRESH: f32 = 0.78;
-pub(crate) const STABILITY_SCORE_OFFSET: f32 = 1.0;
-pub(crate) const STABILITY_SCORE_THRESHOLD: f32 = 0.88;
-pub(crate) const MODEL_MASK_THRESHOLD: f32 = 0.0;
-pub(crate) const CROP_NMS_THRESH: f32 = 0.7;
-
 /// Pixel-mean used to normalize input images (matches Meta's SAM checkpoint).
 const PIXEL_MEAN: [f32; 3] = [123.675, 116.28, 103.53];
 /// Pixel-std used to normalize input images.
 const PIXEL_STD: [f32; 3] = [58.395, 57.12, 57.375];
 
-pub(crate) enum ImageEncoder {
+enum ImageEncoder {
     Original(Box<ImageEncoderViT>),
     TinyViT(Box<TinyViT>),
 }
@@ -43,9 +37,9 @@ impl ImageEncoder {
 
 /// The Segment Anything Model.
 pub struct Sam {
-    pub(crate) image_encoder: ImageEncoder,
-    pub(crate) prompt_encoder: PromptEncoder,
-    pub(crate) mask_decoder: MaskDecoder,
+    image_encoder: ImageEncoder,
+    prompt_encoder: PromptEncoder,
+    mask_decoder: MaskDecoder,
 }
 
 impl Sam {

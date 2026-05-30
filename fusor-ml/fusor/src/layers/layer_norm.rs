@@ -6,6 +6,54 @@ use crate::{
     SimdReduceOp, SimdUnaryOp, SqrtOp, SubOp, SumOp, Tensor, VarBuilder,
 };
 
+fn dequantize_vector_f32(
+    tensor: crate::QMatrix,
+    name: &str,
+) -> crate::Result<Tensor<1, f32, Concrete<f32, 1>>> {
+    match tensor.shape().len() {
+        1 => {
+            let tensor: Tensor<1, f32> = tensor.dequantize();
+            Ok(tensor.to_concrete())
+        }
+        2 => {
+            let tensor: Tensor<2, f32> = tensor.dequantize();
+            let shape = tensor.shape();
+            if shape[0] == 1 {
+                Ok(tensor.squeeze(0).to_concrete())
+            } else if shape[1] == 1 {
+                Ok(tensor.squeeze(1).to_concrete())
+            } else {
+                Err(crate::Error::VarBuilder(format!(
+                    "{name} must be a vector or squeezed vector, got shape {shape:?}",
+                )))
+            }
+        }
+        rank => Err(crate::Error::VarBuilder(format!(
+            "{name} must be rank 1 or 2, got rank {rank}",
+        ))),
+    }
+}
+
+fn load_vector_f32(
+    device: &Device,
+    vb: &mut VarBuilder,
+    name: &str,
+) -> crate::Result<Tensor<1, f32, Concrete<f32, 1>>> {
+    let tensor = vb.get(name, device)?;
+    dequantize_vector_f32(tensor, name)
+}
+
+fn load_optional_vector_f32(
+    device: &Device,
+    vb: &mut VarBuilder,
+    name: &str,
+) -> crate::Result<Option<Tensor<1, f32, Concrete<f32, 1>>>> {
+    let Ok(tensor) = vb.get(name, device) else {
+        return Ok(None);
+    };
+    dequantize_vector_f32(tensor, name).map(Some)
+}
+
 /// Layer Normalization.
 ///
 /// Normalizes the input over the last dimension.
@@ -128,37 +176,9 @@ impl LayerNorm<1, f32> {
     /// - weight: Tensor with shape matching the normalized dimension
     /// - bias (optional): Tensor with same shape as weight
     pub fn load(device: &Device, vb: &mut VarBuilder, eps: f32) -> crate::Result<Self> {
-        let weight_q = vb.get("weight", device)?;
-        let weight_shape = weight_q.shape();
-
-        // Handle both 1D and 2D weight formats
-        let weight: Tensor<1, f32> = if weight_shape.len() == 1 {
-            weight_q.dequantize()
-        } else {
-            let weight_2d: Tensor<2, f32> = weight_q.dequantize();
-            // Squeeze to 1D
-            if weight_2d.shape()[0] == 1 {
-                weight_2d.squeeze(0).to_concrete()
-            } else {
-                weight_2d.squeeze(1).to_concrete()
-            }
-        };
-
-        let bias = vb.get("bias", device).ok().map(|b| {
-            let bias_shape = b.shape();
-            if bias_shape.len() == 1 {
-                b.dequantize()
-            } else {
-                let bias_2d: Tensor<2, f32> = b.dequantize();
-                if bias_2d.shape()[0] == 1 {
-                    bias_2d.squeeze(0).to_concrete()
-                } else {
-                    bias_2d.squeeze(1).to_concrete()
-                }
-            }
-        });
-
-        Ok(Self::new(weight.to_concrete(), bias, eps))
+        let weight = load_vector_f32(device, vb, "weight")?;
+        let bias = load_optional_vector_f32(device, vb, "bias")?;
+        Ok(Self::new(weight, bias, eps))
     }
 }
 
@@ -283,35 +303,9 @@ where
 impl LayerNormNd<f32> {
     /// Load a last-dim LayerNorm from a `VarBuilder`. Bias is optional.
     pub fn load(device: &Device, vb: &mut VarBuilder, eps: f32) -> crate::Result<Self> {
-        let weight_q = vb.get("weight", device)?;
-        let weight_shape = weight_q.shape();
-
-        let weight: Tensor<1, f32> = if weight_shape.len() == 1 {
-            weight_q.dequantize()
-        } else {
-            let weight_2d: Tensor<2, f32> = weight_q.dequantize();
-            if weight_2d.shape()[0] == 1 {
-                weight_2d.squeeze(0).to_concrete()
-            } else {
-                weight_2d.squeeze(1).to_concrete()
-            }
-        };
-
-        let bias = vb.get("bias", device).ok().map(|b| {
-            let bias_shape = b.shape();
-            if bias_shape.len() == 1 {
-                b.dequantize()
-            } else {
-                let bias_2d: Tensor<2, f32> = b.dequantize();
-                if bias_2d.shape()[0] == 1 {
-                    bias_2d.squeeze(0).to_concrete()
-                } else {
-                    bias_2d.squeeze(1).to_concrete()
-                }
-            }
-        });
-
-        Ok(Self::new(weight.to_concrete(), bias, eps))
+        let weight = load_vector_f32(device, vb, "weight")?;
+        let bias = load_optional_vector_f32(device, vb, "bias")?;
+        Ok(Self::new(weight, bias, eps))
     }
 
     /// Load a LayerNorm that normalizes `axis`. Bias is optional.
@@ -321,10 +315,9 @@ impl LayerNormNd<f32> {
         axis: usize,
         eps: f32,
     ) -> crate::Result<Self> {
-        let weight: Tensor<1, f32> = vb.get("weight", device)?.dequantize();
-        let bias: Option<Tensor<1, f32, Concrete<f32, 1>>> =
-            vb.get("bias", device).ok().map(|b| b.dequantize());
-        Ok(Self::new_over_axis(weight.to_concrete(), bias, axis, eps))
+        let weight = load_vector_f32(device, vb, "weight")?;
+        let bias = load_optional_vector_f32(device, vb, "bias")?;
+        Ok(Self::new_over_axis(weight, bias, axis, eps))
     }
 
     /// Fused CPU fast path for normalizing the last dim of a rank-3 tensor.
