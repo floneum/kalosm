@@ -257,9 +257,9 @@ fn top_k_logits_from_full(logits: &[f32], k: usize) -> Vec<Logit> {
 /// An error that can occur when running a [`LlamaModel`].
 #[derive(Debug, thiserror::Error)]
 pub enum LlamaModelError {
-    /// An error from candle while running the model.
-    #[error("Candle error: {0}")]
-    Candle(#[from] fusor::Error),
+    /// An error from Fusor while running the model.
+    #[error("Fusor error: {0}")]
+    Fusor(#[from] fusor::Error),
 
     /// An error from the tokenizer while running the model.
     #[error("Tokenizer error: {0}")]

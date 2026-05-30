@@ -15,11 +15,5 @@ kalosm-model-types.workspace = true
 thiserror.workspace = true
 image.workspace = true
 
-[features]
-cuda = []
-cudnn = []
-mkl = []
-metal = []
-
 [dev-dependencies]
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }

@@ -15,8 +15,3 @@ segment-anything-rs.workspace = true
 [dev-dependencies]
 kalosm = { workspace = true, features = ["vision"], default-features = true }
 tokio = { version = "1", features = ["full"] }
-
-[features]
-metal = ["segment-anything-rs/metal"]
-cublas = ["segment-anything-rs/cuda"]
-mkl = ["segment-anything-rs/mkl"]

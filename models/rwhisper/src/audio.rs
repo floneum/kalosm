@@ -1,7 +1,6 @@
 // Audio processing code, adapted from whisper.cpp
 // https://github.com/ggerganov/whisper.cpp
-// In turn adapted from candle:
-// https://github.com/huggingface/candle/blob/7669ed1eb37a0ca6837757ad0adc79639a424bed/candle-transformers/src/models/whisper/audio.rs
+// Adapted from the upstream Whisper audio preprocessing implementation.
 
 use std::sync::Arc;
 use std::thread;

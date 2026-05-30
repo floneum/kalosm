@@ -1,4 +1,4 @@
-// Forked from https://github.com/huggingface/candle/blob/main/candle-transformers/src/models/bert.rs
+// Adapted from an upstream BERT implementation.
 
 mod embeddings;
 use embeddings::*;

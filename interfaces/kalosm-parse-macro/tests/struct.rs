@@ -19,26 +19,6 @@ fn empty_struct_schema() {
     )
 }
 
-#[cfg(any(feature = "metal", feature = "cuda"))]
-#[tokio::test]
-async fn empty_struct() {
-    use kalosm::language::*;
-
-    let model = Llama::builder()
-        .with_source(LlamaSource::tiny_llama_1_1b_chat())
-        .build()
-        .await
-        .unwrap();
-
-    let task = model
-        .task("You generate json")
-        .with_constraints(std::sync::Arc::new(EmptyNamedStruct::new_parser()));
-
-    let output = task.run("What is the capital of France?").await.unwrap();
-
-    assert_eq!(output, EmptyNamedStruct {});
-}
-
 /// A named struct
 #[derive(Parse, Schema, Clone)]
 struct NamedStruct {
@@ -78,54 +58,10 @@ fn named_struct_schema() {
     );
 }
 
-#[cfg(any(feature = "metal", feature = "cuda"))]
-#[tokio::test]
-async fn named_struct() {
-    use kalosm::language::*;
-
-    let model = Llama::builder()
-        .with_source(LlamaSource::tiny_llama_1_1b_chat())
-        .build()
-        .await
-        .unwrap();
-
-    let task = model
-        .task("You generate json")
-        .with_constraints(std::sync::Arc::new(NamedStruct::new_parser()));
-
-    let output = task.run("What is the capital of France?", &model).await;
-    println!("{output}");
-
-    assert!(output.contains("\"field name\":"));
-    assert!(output.contains("\"age\":"));
-}
-
 #[derive(Parse, Schema, Clone)]
 struct WithStruct {
     #[parse(with = kalosm_sample::StringParser::new(1..=10))]
     name: String,
     #[parse(rename = "field name")]
     age: u32,
-}
-
-#[cfg(any(feature = "metal", feature = "cuda"))]
-#[tokio::test]
-async fn with_struct() {
-    use kalosm::language::*;
-
-    let model = Llama::builder()
-        .with_source(LlamaSource::tiny_llama_1_1b_chat())
-        .build()
-        .await
-        .unwrap();
-
-    let task = model
-        .task("You generate json")
-        .with_constraints(std::sync::Arc::new(WithStruct::new_parser()));
-
-    let output = task.run("What is the capital of France?", &model).await;
-    println!("{output}");
-
-    assert!(output.contains("\"name\":"));
-    assert!(output.contains("\"field name\":"));
 }

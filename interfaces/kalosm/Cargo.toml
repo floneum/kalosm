@@ -117,11 +117,6 @@ full = [
     "sound-denoise",
     "surrealdb",
 ]
-cuda = [
-    "kalosm-language?/cublas",
-    "kalosm-vision?/cublas",
-]
-mkl = ["kalosm-language?/mkl", "kalosm-vision?/mkl"]
 language = [
     "dep:kalosm-model-types",
     "dep:kalosm-language-model",
@@ -147,10 +142,6 @@ vector-db = ["documents", "kalosm-language/vector-db"]
 rag = ["web-documents", "chunking", "vector-db"]
 evaluation = ["language", "dep:comfy-table", "dep:hdrhistogram"]
 prompt_annealing = ["bert", "evaluation", "dep:rand", "dep:thiserror", "dep:tracing"]
-metal = [
-    "kalosm-language?/metal",
-    "kalosm-vision?/metal",
-]
 sound = ["dep:kalosm-sound"]
 sound-denoise = ["sound", "kalosm-sound/denoise"]
 sound-source = ["sound", "kalosm-sound/source"]
