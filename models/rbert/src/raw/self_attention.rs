@@ -43,6 +43,7 @@ impl BertSelfAttention {
         attention_mask: Option<&Tensor<2, u32>>,
     ) -> Tensor<3, f32> {
         let _enter = self.span.enter();
+        let scale = 1.0 / (self.attention_head_size as f32).sqrt();
         let query_layer = self.query.forward(hidden_states);
         let key_layer = self.key.forward(hidden_states);
         let value_layer = self.value.forward(hidden_states);
@@ -51,7 +52,6 @@ impl BertSelfAttention {
         let key_layer = self.transpose_for_scores(&key_layer);
         let value_layer = self.transpose_for_scores(&value_layer);
 
-        let scale = 1.0 / (self.attention_head_size as f32).sqrt();
         let mask = attention_mask.map(super::utils::attention_mask_to_bias);
 
         let context_layer = {

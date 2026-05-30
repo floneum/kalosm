@@ -1,4 +1,4 @@
-<h1 align="center">Floneum</h1>
+<h1 align="center">Kalosm</h1>
 <div align="center">
   <!-- Crates version -->
   <a href="https://crates.io/crates/kalosm">
@@ -21,15 +21,14 @@
   </a>
 </div>
 
-Floneum is an ecosystem of crates that make it easy to develop applications that use local or remote AI models. There are three main projects in this repo:
+Kalosm is an ecosystem of crates that make it easy to develop applications that use local or remote AI models. There are try main projects in this repo:
 
 - [Kalosm](./interfaces/kalosm): A simple interface for pre-trained models in rust
-- [Floneum Editor (preview)](./floneum/floneum): A graphical editor for local AI workflows. See the [user documentation](https://floneum.com/docs/user/) or [plugin documentation](https://floneum.com/docs/developer/) for more information.
 - [Fusor](./fusor-ml/core): A runtime for quantized ML inference. Fusor uses WGPU to run models on any accelerator natively or in the browser
 
 ## Kalosm
 
-[Kalosm](./interfaces/kalosm/) is a simple interface for pre-trained models in Rust that backs Floneum. It makes it easy to interact with pre-trained, language, audio, and image models.
+[Kalosm](./interfaces/kalosm/) is a simple interface for pre-trained models in Rust. It makes it easy to interact with pre-trained, language, audio, and image models.
 
 ### Model Support
 
@@ -53,15 +52,6 @@ Kalosm also supports a variety of utilities around pre-trained models. These inc
 - [Extracting, formatting and retrieving context for LLMs](./interfaces/kalosm/examples/context_extraction.rs): [Extract context from txt/html/docx/md/pdf](./interfaces/kalosm/examples/context_extraction.rs) [chunk that context](./interfaces/kalosm/examples/chunking.rs) [then search for relevant context with vector database integrations](./interfaces/kalosm/examples/semantic-search.rs)
 - [Transcribing audio from your microphone or file](./interfaces/kalosm/examples/transcribe.rs)
 - [Crawling and scraping content from web pages](./interfaces/kalosm/examples/crawl.rs)
-
-### Performance
-
-Kalosm uses the [candle](https://github.com/huggingface/candle) machine learning library to run models in pure rust. It supports quantized and accelerated models with performance on par with `llama.cpp`:
-
-**Mistral 7b**
-| Accelerator | Kalosm | llama.cpp |
-| ------ | --------- | --------- |
-| Metal (M2) | 39 t/s | 27 t/s |
 
 ### Structured Generation
 
@@ -120,8 +110,8 @@ cd ./kalosm-hello-world
 3. Add Kalosm as a dependency
 
 ```sh
-# You can use `--features language,metal`, `--features language,cuda`, or `--features language,mkl` if your machine supports an accelerator
-cargo add kalosm --features language
+# You can use `--features llama,metal`, `--features llama,cuda`, or `--features llama,mkl` if your machine supports an accelerator
+cargo add kalosm --features llama
 cargo add tokio --features full
 ```
 
@@ -154,7 +144,7 @@ cargo run --release
 
 ## Fusor
 
-⚠️ Fusor is still early in development and is not ready for production use. Fusor will serve as the backend for Kalosm and Floneum in the 0.5 release to enable web and AMD support
+⚠️ Fusor is still early in development and is not ready for production use. Fusor will serve as the backend for Kalosm in the 0.5 release to enable web and AMD support
 
 [Fusor](./fusor-ml/core) is a WGPU runtime for quantized ML inference. Fusor works with the gguf file format to load quantized models. It targets uses WebGpu to target many different accelerators including Nvidia GPUs, AMD GPUs, and Metal. Most ML frameworks contain hand optimized kernels that perform a series of operations together. Fusor uses a kernel fusion compiler to make merge custom operation chains into an optimized kernel without dropping down to the shader code. This compiles to a single kernel:
 ```rust, ignore

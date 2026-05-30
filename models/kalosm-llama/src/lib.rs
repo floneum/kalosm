@@ -32,10 +32,13 @@ mod gguf_tokenizer;
 mod language_model;
 mod model;
 mod raw;
+mod sampler;
 mod session;
 mod source;
+#[cfg(feature = "structured")]
 mod structured;
 mod token_stream;
+mod tokenizer;
 
 pub use crate::chat::LlamaChatSession;
 use crate::model::LlamaModel;
@@ -44,11 +47,12 @@ use fusor::{
     AddOp, CastTo, FloatOps, MatmulImpl, MulOp, SimdBinaryOp, SimdReduceOp, SumOp, WasmNotSend,
     WasmNotSync,
 };
-use futures::FutureExt;
-use kalosm_language_model::{MediaHints, TextCompletionBuilder, TextCompletionModelExt};
+use futures_util::FutureExt;
+use kalosm_language_model::{TextCompletionBuilder, TextCompletionModelExt};
 pub use kalosm_model_types::FileSource;
 use kalosm_model_types::FutureWasmNotSend;
 use kalosm_model_types::ModelLoadingProgress;
+#[cfg(feature = "structured")]
 use kalosm_sample::{LiteralParser, StopOn};
 use model::LlamaModelError;
 use raw::LlamaConfig;
@@ -58,13 +62,19 @@ use std::ops::Deref;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::task::{Context, Poll};
-use tokenizers::Tokenizer;
+pub use tokenizer::{LlamaTokenizer, LlamaTokenizerError};
+
+#[cfg(feature = "vision")]
+pub(crate) type LlamaImage = (image::DynamicImage, kalosm_language_model::MediaHints);
+#[cfg(not(feature = "vision"))]
+pub(crate) type LlamaImage = ();
 
 /// Re-export half::f16 for users who want to use f16 activation types
 pub use half::f16;
 
 /// Re-export fusor types needed for the activation type generic
-pub use fusor::{CastTensor, Device, FloatDataType, SimdElement};
+pub use fusor::Device;
+pub use fusor::{CastTensor, FloatDataType, SimdElement};
 
 /// A prelude of commonly used items in kalosm-llama.
 pub mod prelude {
@@ -84,20 +94,22 @@ pub(crate) type BoxedTokenCallback = Box<dyn FnMut(String) -> Result<(), LlamaMo
 use std::future::Future;
 use std::pin::Pin;
 
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(all(feature = "structured", not(target_arch = "wasm32")))]
 type BoxedRunner<F> = Box<
     dyn for<'a> FnOnce(&'a LlamaModel<F>) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>> + Send,
 >;
-#[cfg(target_arch = "wasm32")]
+#[cfg(all(feature = "structured", target_arch = "wasm32"))]
 type BoxedRunner<F> =
     Box<dyn for<'a> FnOnce(&'a LlamaModel<F>) -> Pin<Box<dyn Future<Output = ()> + 'a>>>;
 
 enum Task<F: FloatDataType + SimdElement = f32> {
     UnstructuredGeneration(UnstructuredGenerationTask<F>),
+    #[cfg(feature = "structured")]
     StructuredGeneration(StructuredGenerationTask<F>),
 }
 
 #[allow(clippy::type_complexity)]
+#[cfg(feature = "structured")]
 struct StructuredGenerationTask<F: FloatDataType + SimdElement = f32> {
     runner: BoxedRunner<F>,
 }
@@ -105,25 +117,25 @@ struct StructuredGenerationTask<F: FloatDataType + SimdElement = f32> {
 struct UnstructuredGenerationTask<F: FloatDataType + SimdElement = f32> {
     settings: InferenceSettings<F>,
     on_token: BoxedTokenCallback,
-    finished: futures::channel::oneshot::Sender<Result<(), LlamaModelError>>,
+    finished: futures_channel::oneshot::Sender<Result<(), LlamaModelError>>,
 }
 
 struct LlamaTask<F: FloatDataType + SimdElement = f32> {
-    sender: futures::channel::mpsc::UnboundedSender<Task<F>>,
+    sender: futures_channel::mpsc::UnboundedSender<Task<F>>,
     task: Mutex<Pin<Box<dyn FutureWasmNotSend<Output = ()> + 'static>>>,
 }
 
 /// A future that polls the background Llama task when awaited.
 pub(crate) struct LlamaResultFuture<F: FloatDataType + SimdElement, T> {
     llama: Llama<F>,
-    receiver: futures::channel::oneshot::Receiver<T>,
+    receiver: futures_channel::oneshot::Receiver<T>,
 }
 
 impl<F, T> Future for LlamaResultFuture<F, T>
 where
     F: FloatDataType + SimdElement,
 {
-    type Output = Result<T, futures::channel::oneshot::Canceled>;
+    type Output = Result<T, futures_channel::oneshot::Canceled>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let myself = self.get_mut();
@@ -142,7 +154,7 @@ where
 /// A quantized Llama language model with support for streaming generation.
 pub struct Llama<F: FloatDataType + SimdElement = f32> {
     config: Arc<LlamaConfig<F>>,
-    tokenizer: Arc<Tokenizer>,
+    tokenizer: Arc<LlamaTokenizer>,
     inner: Arc<LlamaTask<F>>,
 }
 
@@ -205,15 +217,15 @@ where
     SumOp: SimdReduceOp<F>,
 {
     /// Get the tokenizer for the model.
-    pub fn tokenizer(&self) -> &Arc<Tokenizer> {
+    pub fn tokenizer(&self) -> &Arc<LlamaTokenizer> {
         &self.tokenizer
     }
 
     #[allow(clippy::too_many_arguments)]
     fn from_build(mut model: LlamaModel<F>) -> Self {
-        use futures::StreamExt;
+        use futures_util::StreamExt;
 
-        let (task_sender, mut task_receiver) = futures::channel::mpsc::unbounded();
+        let (task_sender, mut task_receiver) = futures_channel::mpsc::unbounded();
         let config = model.model.config.clone();
         let tokenizer = model.tokenizer.clone();
 
@@ -232,6 +244,7 @@ where
                         }
                         _ = finished.send(result);
                     }
+                    #[cfg(feature = "structured")]
                     Task::StructuredGeneration(StructuredGenerationTask { runner }) => {
                         runner(&model).await;
                     }
@@ -250,6 +263,7 @@ where
     }
 
     /// Get the default constraints for an assistant response. It parses any text until the end of the assistant's response.
+    #[cfg(feature = "structured")]
     pub fn default_assistant_constraints(&self) -> StopOn<String> {
         let end_token = self.config.stop_token_string.clone();
 
@@ -257,6 +271,7 @@ where
     }
 
     /// Get the constraints that end the assistant's response.
+    #[cfg(feature = "structured")]
     pub fn end_assistant_marker_constraints(&self) -> LiteralParser {
         let end_token = self.config.stop_token_string.clone();
 
@@ -382,7 +397,8 @@ where
     /// Build the model with a handler for progress as the download and loading progresses.
     ///
     /// ```rust, no_run
-    /// use kalosm::language::*;
+    /// use kalosm_llama::prelude::*;
+    /// use kalosm_model_types::ModelLoadingProgress;
     /// # #[tokio::main]
     /// # async fn main() -> Result<(), anyhow::Error> {
     /// // Create a new llama model with a loading handler
@@ -424,46 +440,70 @@ where
 
 pub(crate) struct InferenceSettings<F: FloatDataType + SimdElement = f32> {
     /// The prompt to use.
-    prompt: String,
+    pub(crate) prompt: String,
 
     /// Images in the prompt
-    images: Vec<(image::DynamicImage, MediaHints)>,
+    pub(crate) images: Vec<LlamaImage>,
 
     /// The token to stop on.
-    stop_on: Option<String>,
+    pub(crate) stop_on: Option<String>,
 
     /// The sampler to use.
-    sampler: std::sync::Arc<std::sync::Mutex<dyn llm_samplers::prelude::Sampler>>,
+    pub(crate) sampler: GpuSamplerConfig,
 
     /// The session to use.
-    session: LlamaSession<F>,
+    pub(crate) session: LlamaSession<F>,
 
     /// The maximum number of tokens to generate.
-    max_tokens: u32,
+    pub(crate) max_tokens: u32,
 
     /// The seed to use.
-    seed: Option<u64>,
+    pub(crate) seed: Option<u64>,
 }
 
-impl<F: FloatDataType + SimdElement> InferenceSettings<F> {
-    pub fn new(
-        prompt: impl ToString,
-        images: Vec<(image::DynamicImage, MediaHints)>,
-        session: LlamaSession<F>,
-        sampler: std::sync::Arc<std::sync::Mutex<dyn llm_samplers::prelude::Sampler>>,
-        max_tokens: u32,
-        stop_on: Option<String>,
-        seed: Option<u64>,
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct GpuSamplerConfig {
+    pub(crate) temperature: f32,
+    pub(crate) tau: f32,
+    pub(crate) eta: f32,
+    pub(crate) mu: f32,
+    pub(crate) repetition_penalty: f32,
+    pub(crate) repetition_penalty_range: usize,
+    pub(crate) top_k: Option<usize>,
+}
+
+impl GpuSamplerConfig {
+    pub(crate) fn new(
+        temperature: f32,
+        tau: f32,
+        eta: f32,
+        mu: f32,
+        repetition_penalty: f32,
+        repetition_penalty_range: usize,
+        top_k: Option<usize>,
     ) -> Self {
-        let prompt = prompt.to_string();
         Self {
-            prompt,
-            images,
-            stop_on,
-            sampler,
-            session,
-            max_tokens,
-            seed,
+            temperature,
+            tau,
+            eta,
+            mu,
+            repetition_penalty,
+            repetition_penalty_range,
+            top_k,
         }
+    }
+
+    pub(crate) fn from_generation_parameters(
+        sampler: &kalosm_language_model::GenerationParameters,
+    ) -> Self {
+        Self::new(
+            sampler.temperature(),
+            sampler.tau(),
+            sampler.eta(),
+            sampler.mu(),
+            sampler.repetition_penalty(),
+            sampler.repetition_penalty_range() as usize,
+            sampler.top_k().map(|top_k| top_k as usize),
+        )
     }
 }

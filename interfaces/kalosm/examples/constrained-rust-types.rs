@@ -15,24 +15,25 @@ struct Account {
     age: u8,
 }
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
-    // Download default chat model or get the model from the cache
-    let llm = Llama::new_chat().await?;
+fn main() -> anyhow::Result<()> {
+    pollster::block_on(async {
+        // Download default chat model or get the model from the cache
+        let llm = Llama::new_chat().await?;
 
-    // Create a task that generates a list of accounts
-    let task = llm
-        .task("You generate accounts based on a description of the account holder")
-        // The typed combinator constraints the task for the default parser for the type you get out. (In
-        // this case, Account)
-        .typed();
+        // Create a task that generates a list of accounts
+        let task = llm
+            .task("You generate accounts based on a description of the account holder")
+            // The typed combinator constraints the task for the default parser for the type you get out. (In
+            // this case, Account)
+            .typed();
 
-    // Task can be called like a function with the input to the task. You can await the stream, modify the
-    // constraints, or sampler
-    let account: Account =
-        task(&"Candice is the CEO of a fortune 500 company. She is a 30 years old.").await?;
+        // Task can be called like a function with the input to the task. You can await the stream, modify the
+        // constraints, or sampler
+        let account: Account =
+            task(&"Candice is the CEO of a fortune 500 company. She is a 30 years old.").await?;
 
-    println!("{account:#?}");
+        println!("{account:#?}");
 
-    Ok(())
+        Ok(())
+    })
 }

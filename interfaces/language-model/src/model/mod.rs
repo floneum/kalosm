@@ -1,4 +1,5 @@
 use kalosm_model_types::{WasmNotSend, WasmNotSendSync};
+#[cfg(feature = "structured")]
 use kalosm_sample::Parser;
 use std::{convert::Infallible, future::Future};
 
@@ -109,6 +110,7 @@ pub trait ModelConstraints {
     type Output;
 }
 
+#[cfg(feature = "structured")]
 impl<P: Parser> ModelConstraints for P {
     type Output = <P as Parser>::Output;
 }
@@ -239,7 +241,7 @@ pub trait StructuredTextCompletionModel<
 /// Remove JSON Schema properties that are not supported by structured output APIs
 /// (e.g. Anthropic, OpenAI). This strips validation-only keywords like `minLength`,
 /// `pattern`, `minimum`, `maxItems`, etc. that would cause API errors.
-#[cfg(any(feature = "anthropic", feature = "openai"))]
+#[cfg(all(feature = "structured", any(feature = "anthropic", feature = "openai")))]
 pub(crate) fn remove_unsupported_schema_properties(schema: &mut serde_json::Value) {
     match schema {
         serde_json::Value::Null

@@ -63,59 +63,60 @@ const THING_QUESTIONS: &[&str] = &[
     "What is the most spoken language in the United States?",
 ];
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Create a new Bert model
-    let bert = Bert::new().await?;
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    pollster::block_on(async {
+        // Create a new Bert model
+        let bert = Bert::new().await?;
 
-    // Create a dataset for the classifier
-    let dev = accelerated_device_if_available()?;
-    let mut dataset = TextClassifierDatasetBuilder::<MyClass, _>::new(&bert);
-    for question in PEOPLE_QUESTIONS {
-        dataset.add(question, MyClass::Person).await?;
-    }
-    for sentence in THING_QUESTIONS {
-        dataset.add(sentence, MyClass::Thing).await?;
-    }
-    let dataset = dataset.build(&dev)?;
+        // Create a dataset for the classifier
+        let dev = accelerated_device_if_available()?;
+        let mut dataset = TextClassifierDatasetBuilder::<MyClass, _>::new(&bert);
+        for question in PEOPLE_QUESTIONS {
+            dataset.add(question, MyClass::Person).await?;
+        }
+        for sentence in THING_QUESTIONS {
+            dataset.add(sentence, MyClass::Thing).await?;
+        }
+        let dataset = dataset.build(&dev)?;
 
-    let classifier =
-        TextClassifier::<MyClass>::new(Classifier::new(&dev, ClassifierConfig::new())?);
+        let classifier =
+            TextClassifier::<MyClass>::new(Classifier::new(&dev, ClassifierConfig::new())?);
 
-    classifier.train(
-        &dataset, // The dataset to train on
-        10,       // The number of epochs to train for
-        0.003,    // The learning rate
-        5,        // The batch size
-        |progress| match progress {
-            ClassifierProgress::EpochFinished { epoch, accuracy } => {
-                println!("Epoch {epoch} accuracy: {accuracy}");
-            }
-            ClassifierProgress::BatchFinished { batch, loss } => {
-                println!("Batch {batch} loss: {loss}");
-            }
-        },
-    )?;
+        classifier.train(
+            &dataset, // The dataset to train on
+            10,       // The number of epochs to train for
+            0.003,    // The learning rate
+            5,        // The batch size
+            |progress| match progress {
+                ClassifierProgress::EpochFinished { epoch, accuracy } => {
+                    println!("Epoch {epoch} accuracy: {accuracy}");
+                }
+                ClassifierProgress::BatchFinished { batch, loss } => {
+                    println!("Batch {batch} loss: {loss}");
+                }
+            },
+        )?;
 
-    let config = classifier.config();
-    classifier.save("classifier.safetensors")?;
-    let classifier = Classifier::<MyClass>::load("classifier.safetensors", &dev, config)?;
+        let config = classifier.config();
+        classifier.save("classifier.safetensors")?;
+        let classifier = Classifier::<MyClass>::load("classifier.safetensors", &dev, config)?;
 
-    let tests = [
-        "Who is the president of Russia?",
-        "What is the capital of Russia?",
-        "Who invented the TV?",
-        "What is the best way to learn a how to ride a bike?",
-    ];
+        let tests = [
+            "Who is the president of Russia?",
+            "What is the capital of Russia?",
+            "Who invented the TV?",
+            "What is the best way to learn a how to ride a bike?",
+        ];
 
-    for test in &tests {
-        let input = bert.embed(test).await?;
-        let input = input.vector();
-        let class = classifier.run(input)?;
-        println!();
-        println!("{test}");
-        println!("{:?} {:?}", &input[..5], class);
-    }
+        for test in &tests {
+            let input = bert.embed(test).await?;
+            let input = input.vector();
+            let class = classifier.run(input)?;
+            println!();
+            println!("{test}");
+            println!("{:?} {:?}", &input[..5], class);
+        }
 
-    Ok(())
+        Ok(())
+    })
 }

@@ -1,0 +1,1046 @@
+use super::*;
+
+impl<'a> Lowerer<'a> {
+    pub(in crate::lower) fn quantized_block_base(
+        &self,
+        e: &mut Arena<Expression>,
+        matrix: &QuantizedMatrix,
+        block: Handle<Expression>,
+        col: Handle<Expression>,
+        block_words: u32,
+        body: &mut Block,
+    ) -> Handle<Expression> {
+        let blocks_per_col = matrix.rows / matrix.format.block_elements();
+        let col_block = self.mul_literal_u32_emitted(e, col, blocks_per_col, body);
+        let block_index = self.add(e, body, col_block, block);
+        let stride = if matrix.format.uses_byte_addressed_blocks() {
+            matrix.format.block_bytes()
+        } else {
+            block_words
+        };
+        self.mul_literal_u32_emitted(e, block_index, stride, body)
+    }
+
+    pub(in crate::lower) fn load_word(
+        &self,
+        e: &mut Arena<Expression>,
+        matrix: &QuantizedMatrix,
+        base: Handle<Expression>,
+        offset: u32,
+        body: &mut Block,
+    ) -> Result<Handle<Expression>, LowerError> {
+        if matrix.format.uses_byte_addressed_blocks() {
+            let byte_offset = self.add_lit(e, body, base, offset * 4);
+            return self.load_word_at_byte_offset(e, matrix, byte_offset, body);
+        }
+        let index = self.add_lit(e, body, base, offset);
+        self.load_word_at(e, matrix, index, body)
+    }
+
+    /// `load_word(...) → bitcast_f32(...)`. The dominant scale-read pattern
+    /// in every K-quant block: a single u32 word at a known offset reinterpreted
+    /// as `f32` (the per-block `d` / `dmin` scales).
+    pub(in crate::lower) fn load_word_f32(
+        &self,
+        e: &mut Arena<Expression>,
+        matrix: &QuantizedMatrix,
+        base: Handle<Expression>,
+        offset: u32,
+        body: &mut Block,
+    ) -> Result<Handle<Expression>, LowerError> {
+        let word = self.load_word(e, matrix, base, offset, body)?;
+        Ok(self.bitcast_f32(e, body, word))
+    }
+
+    pub(in crate::lower) fn load_f16_pair_word_f32(
+        &self,
+        e: &mut Arena<Expression>,
+        matrix: &QuantizedMatrix,
+        base: Handle<Expression>,
+        offset: u32,
+        body: &mut Block,
+    ) -> Result<(Handle<Expression>, Handle<Expression>), LowerError> {
+        let word = self.load_word(e, matrix, base, offset, body)?;
+        let pair = self.math1(e, body, MathFunction::Unpack2x16float, word);
+        let low = self.vec4_component(e, body, pair, 0);
+        let high = self.vec4_component(e, body, pair, 1);
+        Ok((low, high))
+    }
+
+    pub(in crate::lower) fn load_f16_low_word_f32(
+        &self,
+        e: &mut Arena<Expression>,
+        matrix: &QuantizedMatrix,
+        base: Handle<Expression>,
+        offset: u32,
+        body: &mut Block,
+    ) -> Result<Handle<Expression>, LowerError> {
+        Ok(self
+            .load_f16_pair_word_f32(e, matrix, base, offset, body)?
+            .0)
+    }
+
+    pub(in crate::lower) fn load_affine_scale_f32(
+        &self,
+        e: &mut Arena<Expression>,
+        matrix: &QuantizedMatrix,
+        base: Handle<Expression>,
+        offset: u32,
+        body: &mut Block,
+    ) -> Result<Handle<Expression>, LowerError> {
+        match matrix.format {
+            GgmlQuantFormat::Q4_0Native
+            | GgmlQuantFormat::Q5_0Native
+            | GgmlQuantFormat::Q8_0Native => {
+                self.load_f16_low_word_f32(e, matrix, base, offset, body)
+            }
+            _ => self.load_word_f32(e, matrix, base, offset, body),
+        }
+    }
+
+    pub(in crate::lower) fn q8_0_data_byte_offset(
+        &self,
+        format: GgmlQuantFormat,
+    ) -> Result<u32, LowerError> {
+        match format {
+            GgmlQuantFormat::Q8_0 => Ok(4),
+            GgmlQuantFormat::Q8_0Native => Ok(2),
+            _ => Err(LowerError::UnsupportedOperation(
+                "q8_0 data offset requires a Q8_0 format",
+            )),
+        }
+    }
+
+    pub(in crate::lower) fn q5_0_high_byte_offset(
+        &self,
+        format: GgmlQuantFormat,
+    ) -> Result<u32, LowerError> {
+        match format {
+            GgmlQuantFormat::Q5_0 => Ok(4),
+            GgmlQuantFormat::Q5_0Native => Ok(2),
+            _ => Err(LowerError::UnsupportedOperation(
+                "q5_0 high-bit offset requires a Q5_0 format",
+            )),
+        }
+    }
+
+    pub(in crate::lower) fn q5_0_data_byte_offset(
+        &self,
+        format: GgmlQuantFormat,
+    ) -> Result<u32, LowerError> {
+        match format {
+            GgmlQuantFormat::Q5_0 => Ok(8),
+            GgmlQuantFormat::Q5_0Native => Ok(6),
+            _ => Err(LowerError::UnsupportedOperation(
+                "q5_0 data offset requires a Q5_0 format",
+            )),
+        }
+    }
+
+    pub(in crate::lower) fn q4k_data_word_offset(
+        &self,
+        format: GgmlQuantFormat,
+    ) -> Result<u32, LowerError> {
+        match format {
+            GgmlQuantFormat::Q4K => Ok(5),
+            GgmlQuantFormat::Q4KNative => Ok(4),
+            _ => Err(LowerError::UnsupportedOperation(
+                "q4k storage offsets require a Q4K format",
+            )),
+        }
+    }
+
+    pub(in crate::lower) fn q4k_data_byte_offset(
+        &self,
+        format: GgmlQuantFormat,
+    ) -> Result<u32, LowerError> {
+        Ok(self.q4k_data_word_offset(format)? * 4)
+    }
+
+    pub(in crate::lower) fn q4k_scale_word_offsets(
+        &self,
+        format: GgmlQuantFormat,
+    ) -> Result<(u32, u32, u32), LowerError> {
+        match format {
+            GgmlQuantFormat::Q4K => Ok((2, 3, 4)),
+            GgmlQuantFormat::Q4KNative => Ok((1, 2, 3)),
+            _ => Err(LowerError::UnsupportedOperation(
+                "q4k scale offsets require a Q4K format",
+            )),
+        }
+    }
+
+    pub(in crate::lower) fn q4k_load_d_dmin(
+        &self,
+        e: &mut Arena<Expression>,
+        matrix: &QuantizedMatrix,
+        base: Handle<Expression>,
+        body: &mut Block,
+    ) -> Result<(Handle<Expression>, Handle<Expression>), LowerError> {
+        match matrix.format {
+            GgmlQuantFormat::Q4K => Ok((
+                self.load_word_f32(e, matrix, base, 0, body)?,
+                self.load_word_f32(e, matrix, base, 1, body)?,
+            )),
+            GgmlQuantFormat::Q4KNative => self.load_f16_pair_word_f32(e, matrix, base, 0, body),
+            _ => Err(LowerError::UnsupportedOperation(
+                "q4k d/dmin load requires a Q4K format",
+            )),
+        }
+    }
+
+    pub(in crate::lower) fn q5k_data_word_offset(
+        &self,
+        format: GgmlQuantFormat,
+    ) -> Result<u32, LowerError> {
+        match format {
+            GgmlQuantFormat::Q5K => Ok(13),
+            GgmlQuantFormat::Q5KNative => Ok(12),
+            _ => Err(LowerError::UnsupportedOperation(
+                "q5k storage offsets require a Q5K format",
+            )),
+        }
+    }
+
+    pub(in crate::lower) fn q5k_data_byte_offset(
+        &self,
+        format: GgmlQuantFormat,
+    ) -> Result<u32, LowerError> {
+        Ok(self.q5k_data_word_offset(format)? * 4)
+    }
+
+    pub(in crate::lower) fn q5k_qh_word_offset(
+        &self,
+        format: GgmlQuantFormat,
+    ) -> Result<u32, LowerError> {
+        match format {
+            GgmlQuantFormat::Q5K => Ok(5),
+            GgmlQuantFormat::Q5KNative => Ok(4),
+            _ => Err(LowerError::UnsupportedOperation(
+                "q5k qh offset requires a Q5K format",
+            )),
+        }
+    }
+
+    pub(in crate::lower) fn q5k_qh_byte_offset(
+        &self,
+        format: GgmlQuantFormat,
+    ) -> Result<u32, LowerError> {
+        Ok(self.q5k_qh_word_offset(format)? * 4)
+    }
+
+    fn q5k_scale_word_offsets(
+        &self,
+        format: GgmlQuantFormat,
+    ) -> Result<(u32, u32, u32), LowerError> {
+        match format {
+            GgmlQuantFormat::Q5K => Ok((2, 3, 4)),
+            GgmlQuantFormat::Q5KNative => Ok((1, 2, 3)),
+            _ => Err(LowerError::UnsupportedOperation(
+                "q5k scale offsets require a Q5K format",
+            )),
+        }
+    }
+
+    pub(in crate::lower) fn q5k_load_d_dmin(
+        &self,
+        e: &mut Arena<Expression>,
+        matrix: &QuantizedMatrix,
+        base: Handle<Expression>,
+        body: &mut Block,
+    ) -> Result<(Handle<Expression>, Handle<Expression>), LowerError> {
+        match matrix.format {
+            GgmlQuantFormat::Q5K => Ok((
+                self.load_word_f32(e, matrix, base, 0, body)?,
+                self.load_word_f32(e, matrix, base, 1, body)?,
+            )),
+            GgmlQuantFormat::Q5KNative => self.load_f16_pair_word_f32(e, matrix, base, 0, body),
+            _ => Err(LowerError::UnsupportedOperation(
+                "q5k d/dmin load requires a Q5K format",
+            )),
+        }
+    }
+
+    pub(in crate::lower) fn q6k_load_d(
+        &self,
+        e: &mut Arena<Expression>,
+        matrix: &QuantizedMatrix,
+        base: Handle<Expression>,
+        body: &mut Block,
+    ) -> Result<Handle<Expression>, LowerError> {
+        match matrix.format {
+            GgmlQuantFormat::Q6K => self.load_word_f32(e, matrix, base, 52, body),
+            GgmlQuantFormat::Q6KNative => self.load_f16_low_word_f32(e, matrix, base, 52, body),
+            _ => Err(LowerError::UnsupportedOperation(
+                "q6k d load requires a Q6K format",
+            )),
+        }
+    }
+
+    pub(in crate::lower) fn load_word_dynamic(
+        &self,
+        e: &mut Arena<Expression>,
+        matrix: &QuantizedMatrix,
+        base: Handle<Expression>,
+        offset: Handle<Expression>,
+        body: &mut Block,
+    ) -> Result<Handle<Expression>, LowerError> {
+        if matrix.format.uses_byte_addressed_blocks() {
+            let offset_bytes = self.shl_lit(e, body, offset, 2);
+            let byte_offset = self.add(e, body, base, offset_bytes);
+            return self.load_word_at_byte_offset(e, matrix, byte_offset, body);
+        }
+        let index = self.add(e, body, base, offset);
+        self.load_word_at(e, matrix, index, body)
+    }
+
+    pub(in crate::lower) fn load_word_at_block_byte_offset(
+        &self,
+        e: &mut Arena<Expression>,
+        matrix: &QuantizedMatrix,
+        base: Handle<Expression>,
+        byte_offset: u32,
+        body: &mut Block,
+    ) -> Result<Handle<Expression>, LowerError> {
+        if !matrix.format.uses_byte_addressed_blocks() {
+            debug_assert!(byte_offset.is_multiple_of(4));
+            return self.load_word(e, matrix, base, byte_offset / 4, body);
+        }
+        let global_byte = self.add_lit(e, body, base, byte_offset);
+        self.load_word_at_byte_offset(e, matrix, global_byte, body)
+    }
+
+    pub(in crate::lower) fn load_word_at_block_dynamic_byte_offset(
+        &self,
+        e: &mut Arena<Expression>,
+        matrix: &QuantizedMatrix,
+        base: Handle<Expression>,
+        byte_offset: Handle<Expression>,
+        body: &mut Block,
+    ) -> Result<Handle<Expression>, LowerError> {
+        if !matrix.format.uses_byte_addressed_blocks() {
+            let word_offset = self.shr_lit(e, body, byte_offset, 2);
+            return self.load_word_dynamic(e, matrix, base, word_offset, body);
+        }
+        let global_byte = self.add(e, body, base, byte_offset);
+        self.load_word_at_byte_offset(e, matrix, global_byte, body)
+    }
+
+    pub(in crate::lower) fn load_word_pair_dynamic(
+        &self,
+        e: &mut Arena<Expression>,
+        matrix: &QuantizedMatrix,
+        base: Handle<Expression>,
+        word_base: Handle<Expression>,
+        first_offset: u32,
+        body: &mut Block,
+    ) -> Result<[Handle<Expression>; 2], LowerError> {
+        let word0_off = self.add_lit(e, body, word_base, first_offset);
+        let word1_off = self.add_lit(e, body, word_base, first_offset + 1);
+        Ok([
+            self.load_word_dynamic(e, matrix, base, word0_off, body)?,
+            self.load_word_dynamic(e, matrix, base, word1_off, body)?,
+        ])
+    }
+
+    pub(in crate::lower) fn load_word_at(
+        &self,
+        e: &mut Arena<Expression>,
+        matrix: &QuantizedMatrix,
+        index: Handle<Expression>,
+        body: &mut Block,
+    ) -> Result<Handle<Expression>, LowerError> {
+        let ptr = self.storage_dynamic_pointer(e, &matrix.data, index, body)?;
+        Ok(self.emit(e, body, Expression::Load { pointer: ptr }))
+    }
+
+    pub(in crate::lower) fn k_scale(
+        &self,
+        e: &mut Arena<Expression>,
+        matrix: &QuantizedMatrix,
+        base: Handle<Expression>,
+        group: Handle<Expression>,
+        min: bool,
+        body: &mut Block,
+    ) -> Result<Handle<Expression>, LowerError> {
+        let high = self.cmp_lit(e, body, BinaryOperator::GreaterEqual, group, 4);
+        let lane = self.and_lit(e, body, group, 3);
+        let (scale_offset, min_offset, extra_offset) =
+            self.q5k_scale_word_offsets(matrix.format)?;
+        let low_word = self.load_word(
+            e,
+            matrix,
+            base,
+            if min { min_offset } else { scale_offset },
+            body,
+        )?;
+        let low_byte = self.byte_at(e, body, low_word, lane);
+        let low_scale = self.and_lit(e, body, low_byte, 0x3f);
+
+        let extra_word = self.load_word(e, matrix, base, extra_offset, body)?;
+        let extra_byte = self.byte_at(e, body, extra_word, lane);
+        let lsb = if min {
+            let shifted = self.shr_lit(e, body, extra_byte, 4);
+            self.and_lit(e, body, shifted, 0x0f)
+        } else {
+            self.and_lit(e, body, extra_byte, 0x0f)
+        };
+        let msb_bits = self.and_lit(e, body, low_byte, 0xc0);
+        let msb = self.shr_lit(e, body, msb_bits, 2);
+        let high_scale = self.or(e, body, lsb, msb);
+        Ok(self.select(e, body, high, high_scale, low_scale))
+    }
+
+    pub(in crate::lower) fn q4k_scale_min_bytes(
+        &self,
+        e: &mut Arena<Expression>,
+        matrix: &QuantizedMatrix,
+        base: Handle<Expression>,
+        group: Handle<Expression>,
+        body: &mut Block,
+    ) -> Result<(Handle<Expression>, Handle<Expression>), LowerError> {
+        let high = self.cmp_lit(e, body, BinaryOperator::GreaterEqual, group, 4);
+        let lane = self.and_lit(e, body, group, 3);
+        let (scale_offset, min_offset, extra_offset) =
+            self.q4k_scale_word_offsets(matrix.format)?;
+
+        let scale_word = self.load_word(e, matrix, base, scale_offset, body)?;
+        let min_word = self.load_word(e, matrix, base, min_offset, body)?;
+        let extra_word = self.load_word(e, matrix, base, extra_offset, body)?;
+
+        let scale_low_byte = self.byte_at(e, body, scale_word, lane);
+        let min_low_byte = self.byte_at(e, body, min_word, lane);
+        let extra_byte = self.byte_at(e, body, extra_word, lane);
+
+        let scale_low = self.and_lit(e, body, scale_low_byte, 0x3f);
+        let scale_lsb = self.and_lit(e, body, extra_byte, 0x0f);
+        let scale_msb_bits = self.and_lit(e, body, scale_low_byte, 0xc0);
+        let scale_msb = self.shr_lit(e, body, scale_msb_bits, 2);
+        let scale_high = self.or(e, body, scale_lsb, scale_msb);
+        let scale = self.select(e, body, high, scale_high, scale_low);
+
+        let min_low = self.and_lit(e, body, min_low_byte, 0x3f);
+        let min_lsb_shifted = self.shr_lit(e, body, extra_byte, 4);
+        let min_lsb = self.and_lit(e, body, min_lsb_shifted, 0x0f);
+        let min_msb_bits = self.and_lit(e, body, min_low_byte, 0xc0);
+        let min_msb = self.shr_lit(e, body, min_msb_bits, 2);
+        let min_high = self.or(e, body, min_lsb, min_msb);
+        let min = self.select(e, body, high, min_high, min_low);
+
+        Ok((scale, min))
+    }
+
+    pub(in crate::lower) fn q3k_scale(
+        &self,
+        e: &mut Arena<Expression>,
+        matrix: &QuantizedMatrix,
+        base: Handle<Expression>,
+        group: Handle<Expression>,
+        body: &mut Block,
+    ) -> Result<Handle<Expression>, LowerError> {
+        let s0 = self.load_word(e, matrix, base, 24, body)?;
+        let s1 = self.load_word(e, matrix, base, 25, body)?;
+        let s2 = self.load_word(e, matrix, base, 26, body)?;
+        let lane = self.and_lit(e, body, group, 3);
+        let group_word_bit = self.and_lit(e, body, group, 4);
+        let zero = self.u32(e, 0);
+        let use_s1 = self.bin(e, body, BinaryOperator::NotEqual, group_word_bit, zero);
+        let scale_word = self.select(e, body, use_s1, s1, s0);
+        let scale_byte = self.byte_at(e, body, scale_word, lane);
+        let low_nibble = self.and_lit(e, body, scale_byte, 0x0f);
+        let high_nibble = self.shr_lit(e, body, scale_byte, 4);
+        let use_high_nibble = self.cmp_lit(e, body, BinaryOperator::GreaterEqual, group, 8);
+        let low = self.select(e, body, use_high_nibble, high_nibble, low_nibble);
+        let extra_byte = self.byte_at(e, body, s2, lane);
+        let high_shift = self.shr_lit(e, body, group, 2);
+        let high_shift = self.shl_lit(e, body, high_shift, 1);
+        let high = self.shr(e, body, extra_byte, high_shift);
+        let high = self.and_lit(e, body, high, 3);
+        let high = self.shl_lit(e, body, high, 4);
+        Ok(self.or(e, body, low, high))
+    }
+
+    pub(in crate::lower) fn byte_at(
+        &self,
+        e: &mut Arena<Expression>,
+        body: &mut Block,
+        word: Handle<Expression>,
+        byte: Handle<Expression>,
+    ) -> Handle<Expression> {
+        let shift = self.shl_lit(e, body, byte, 3);
+        let shifted = self.shr(e, body, word, shift);
+        self.and_lit(e, body, shifted, 0xff)
+    }
+
+    /// Load `matrix.data[byte_offset + byte_index]` and extract that byte.
+    /// Word-based formats convert their block-word base to a byte base here;
+    /// raw native formats with non-u32 block strides pass an already-byte
+    /// addressed block base.
+    pub(in crate::lower) fn load_byte_dynamic(
+        &self,
+        e: &mut Arena<Expression>,
+        matrix: &QuantizedMatrix,
+        base: Handle<Expression>,
+        byte_index: Handle<Expression>,
+        byte_offset: u32,
+        body: &mut Block,
+    ) -> Result<Handle<Expression>, LowerError> {
+        let block_byte_base = if matrix.format.uses_byte_addressed_blocks() {
+            base
+        } else {
+            self.shl_lit(e, body, base, 2)
+        };
+        let local_byte = self.add_lit(e, body, byte_index, byte_offset);
+        let global_byte = self.add(e, body, block_byte_base, local_byte);
+        self.load_byte_at_global_byte(e, matrix, global_byte, body)
+    }
+
+    pub(in crate::lower) fn load_byte_at_global_byte(
+        &self,
+        e: &mut Arena<Expression>,
+        matrix: &QuantizedMatrix,
+        byte_offset: Handle<Expression>,
+        body: &mut Block,
+    ) -> Result<Handle<Expression>, LowerError> {
+        let word_index = self.shr_lit(e, body, byte_offset, 2);
+        let word = self.load_word_at(e, matrix, word_index, body)?;
+        let lane = self.and_lit(e, body, byte_offset, 3);
+        Ok(self.byte_at(e, body, word, lane))
+    }
+
+    pub(in crate::lower) fn load_word_at_byte_offset(
+        &self,
+        e: &mut Arena<Expression>,
+        matrix: &QuantizedMatrix,
+        byte_offset: Handle<Expression>,
+        body: &mut Block,
+    ) -> Result<Handle<Expression>, LowerError> {
+        let byte_offset_1 = self.add_lit(e, body, byte_offset, 1);
+        let byte_offset_2 = self.add_lit(e, body, byte_offset, 2);
+        let byte_offset_3 = self.add_lit(e, body, byte_offset, 3);
+        let bytes = [
+            self.load_byte_at_global_byte(e, matrix, byte_offset, body)?,
+            self.load_byte_at_global_byte(e, matrix, byte_offset_1, body)?,
+            self.load_byte_at_global_byte(e, matrix, byte_offset_2, body)?,
+            self.load_byte_at_global_byte(e, matrix, byte_offset_3, body)?,
+        ];
+        let b1 = self.shl_lit(e, body, bytes[1], 8);
+        let b2 = self.shl_lit(e, body, bytes[2], 16);
+        let b3 = self.shl_lit(e, body, bytes[3], 24);
+        let lo = self.or(e, body, bytes[0], b1);
+        let hi = self.or(e, body, b2, b3);
+        Ok(self.or(e, body, lo, hi))
+    }
+
+    pub(in crate::lower) fn signed_byte_f32(
+        &self,
+        e: &mut Arena<Expression>,
+        body: &mut Block,
+        byte: Handle<Expression>,
+    ) -> Handle<Expression> {
+        let bias = self.u32(e, 128);
+        let biased = self.bin(e, body, BinaryOperator::ExclusiveOr, byte, bias);
+        let as_i32 = self.as_i32(e, body, biased);
+        let offset = self.i32(e, 128);
+        let signed = self.sub(e, body, as_i32, offset);
+        self.as_f32(e, body, signed)
+    }
+
+    pub(in crate::lower) fn emit(
+        &self,
+        e: &mut Arena<Expression>,
+        body: &mut Block,
+        expr: Expression,
+    ) -> Handle<Expression> {
+        let value = e.append(expr, Span::default());
+        body.push(
+            Statement::Emit(Self::single_expression_range(e, value)),
+            Span::default(),
+        );
+        value
+    }
+
+    pub(in crate::lower) fn load_local(
+        &self,
+        e: &mut Arena<Expression>,
+        body: &mut Block,
+        local: Handle<LocalVariable>,
+    ) -> Handle<Expression> {
+        let pointer = self.local_var(e, local);
+        Self::emit_load(e, body, pointer)
+    }
+
+    pub(in crate::lower) fn bin(
+        &self,
+        e: &mut Arena<Expression>,
+        body: &mut Block,
+        op: BinaryOperator,
+        left: Handle<Expression>,
+        right: Handle<Expression>,
+    ) -> Handle<Expression> {
+        self.emit(e, body, Expression::Binary { op, left, right })
+    }
+
+    /// Apply a binary operator with a u32 literal RHS. Shared by `cmp_lit`,
+    /// `shr_lit`, `shl_lit`, `and_lit`.
+    pub(in crate::lower) fn bin_lit(
+        &self,
+        e: &mut Arena<Expression>,
+        body: &mut Block,
+        op: BinaryOperator,
+        left: Handle<Expression>,
+        right: u32,
+    ) -> Handle<Expression> {
+        let right = self.u32(e, right);
+        self.bin(e, body, op, left, right)
+    }
+
+    /// Compare with a u32 literal RHS. Returns the resulting Bool handle.
+    pub(in crate::lower) fn cmp_lit(
+        &self,
+        e: &mut Arena<Expression>,
+        body: &mut Block,
+        op: BinaryOperator,
+        left: Handle<Expression>,
+        right: u32,
+    ) -> Handle<Expression> {
+        self.bin_lit(e, body, op, left, right)
+    }
+
+    pub(in crate::lower) fn select(
+        &self,
+        e: &mut Arena<Expression>,
+        body: &mut Block,
+        condition: Handle<Expression>,
+        accept: Handle<Expression>,
+        reject: Handle<Expression>,
+    ) -> Handle<Expression> {
+        self.emit(
+            e,
+            body,
+            Expression::Select {
+                condition,
+                accept,
+                reject,
+            },
+        )
+    }
+
+    pub(in crate::lower) fn shr(
+        &self,
+        e: &mut Arena<Expression>,
+        body: &mut Block,
+        left: Handle<Expression>,
+        right: Handle<Expression>,
+    ) -> Handle<Expression> {
+        self.bin(e, body, BinaryOperator::ShiftRight, left, right)
+    }
+
+    pub(in crate::lower) fn shr_lit(
+        &self,
+        e: &mut Arena<Expression>,
+        body: &mut Block,
+        left: Handle<Expression>,
+        right: u32,
+    ) -> Handle<Expression> {
+        self.bin_lit(e, body, BinaryOperator::ShiftRight, left, right)
+    }
+
+    pub(in crate::lower) fn shl_lit(
+        &self,
+        e: &mut Arena<Expression>,
+        body: &mut Block,
+        left: Handle<Expression>,
+        right: u32,
+    ) -> Handle<Expression> {
+        self.bin_lit(e, body, BinaryOperator::ShiftLeft, left, right)
+    }
+
+    pub(in crate::lower) fn and_lit(
+        &self,
+        e: &mut Arena<Expression>,
+        body: &mut Block,
+        left: Handle<Expression>,
+        right: u32,
+    ) -> Handle<Expression> {
+        self.bin_lit(e, body, BinaryOperator::And, left, right)
+    }
+
+    pub(in crate::lower) fn add_lit(
+        &self,
+        e: &mut Arena<Expression>,
+        body: &mut Block,
+        left: Handle<Expression>,
+        right: u32,
+    ) -> Handle<Expression> {
+        self.add_literal_u32_emitted(e, left, right, body)
+    }
+
+    pub(in crate::lower) fn add(
+        &self,
+        e: &mut Arena<Expression>,
+        body: &mut Block,
+        left: Handle<Expression>,
+        right: Handle<Expression>,
+    ) -> Handle<Expression> {
+        self.bin(e, body, BinaryOperator::Add, left, right)
+    }
+
+    pub(in crate::lower) fn or(
+        &self,
+        e: &mut Arena<Expression>,
+        body: &mut Block,
+        left: Handle<Expression>,
+        right: Handle<Expression>,
+    ) -> Handle<Expression> {
+        self.bin(e, body, BinaryOperator::InclusiveOr, left, right)
+    }
+
+    pub(in crate::lower) fn sub(
+        &self,
+        e: &mut Arena<Expression>,
+        body: &mut Block,
+        left: Handle<Expression>,
+        right: Handle<Expression>,
+    ) -> Handle<Expression> {
+        self.bin(e, body, BinaryOperator::Subtract, left, right)
+    }
+
+    pub(in crate::lower) fn mul(
+        &self,
+        e: &mut Arena<Expression>,
+        body: &mut Block,
+        left: Handle<Expression>,
+        right: Handle<Expression>,
+    ) -> Handle<Expression> {
+        self.bin(e, body, BinaryOperator::Multiply, left, right)
+    }
+
+    pub(in crate::lower) fn div(
+        &self,
+        e: &mut Arena<Expression>,
+        body: &mut Block,
+        left: Handle<Expression>,
+        right: Handle<Expression>,
+    ) -> Handle<Expression> {
+        self.bin(e, body, BinaryOperator::Divide, left, right)
+    }
+
+    pub(in crate::lower) fn math1(
+        &self,
+        e: &mut Arena<Expression>,
+        body: &mut Block,
+        fun: MathFunction,
+        arg: Handle<Expression>,
+    ) -> Handle<Expression> {
+        self.emit(
+            e,
+            body,
+            Expression::Math {
+                fun,
+                arg,
+                arg1: None,
+                arg2: None,
+                arg3: None,
+            },
+        )
+    }
+
+    pub(in crate::lower) fn math2(
+        &self,
+        e: &mut Arena<Expression>,
+        body: &mut Block,
+        fun: MathFunction,
+        arg: Handle<Expression>,
+        arg1: Handle<Expression>,
+    ) -> Handle<Expression> {
+        self.emit(
+            e,
+            body,
+            Expression::Math {
+                fun,
+                arg,
+                arg1: Some(arg1),
+                arg2: None,
+                arg3: None,
+            },
+        )
+    }
+
+    pub(in crate::lower) fn dot4_i8_packed(
+        &self,
+        e: &mut Arena<Expression>,
+        body: &mut Block,
+        left: Handle<Expression>,
+        right: Handle<Expression>,
+    ) -> Handle<Expression> {
+        let dot = self.math2(e, body, MathFunction::Dot4I8Packed, left, right);
+        self.as_f32(e, body, dot)
+    }
+
+    pub(in crate::lower) fn compose_f32_vec4(
+        &self,
+        e: &mut Arena<Expression>,
+        body: &mut Block,
+        components: [Handle<Expression>; 4],
+    ) -> Handle<Expression> {
+        self.emit(
+            e,
+            body,
+            Expression::Compose {
+                ty: self.f32_vec4_ty,
+                components: components.to_vec(),
+            },
+        )
+    }
+
+    pub(in crate::lower) fn dot_f32_vec4(
+        &self,
+        e: &mut Arena<Expression>,
+        body: &mut Block,
+        left: Handle<Expression>,
+        right: Handle<Expression>,
+    ) -> Handle<Expression> {
+        self.math2(e, body, MathFunction::Dot, left, right)
+    }
+
+    pub(in crate::lower) fn vec4_component(
+        &self,
+        e: &mut Arena<Expression>,
+        body: &mut Block,
+        vector: Handle<Expression>,
+        index: u32,
+    ) -> Handle<Expression> {
+        self.emit(
+            e,
+            body,
+            Expression::AccessIndex {
+                base: vector,
+                index,
+            },
+        )
+    }
+
+    pub(in crate::lower) fn u8_lane_f32(
+        &self,
+        e: &mut Arena<Expression>,
+        body: &mut Block,
+        word: Handle<Expression>,
+        lane: u32,
+    ) -> Handle<Expression> {
+        let shifted = if lane == 0 {
+            word
+        } else {
+            self.shr_lit(e, body, word, lane * 8)
+        };
+        let byte = self.and_lit(e, body, shifted, 0xff);
+        self.as_f32(e, body, byte)
+    }
+
+    /// `as_f32(quant) - 32.0`. Both Q3K scales and Q6K quants are stored
+    /// unsigned with a +32 bias; subtracting 32 recenters them around zero.
+    pub(in crate::lower) fn center_quant_by_32(
+        &self,
+        e: &mut Arena<Expression>,
+        body: &mut Block,
+        quant: Handle<Expression>,
+    ) -> Handle<Expression> {
+        let quant = self.as_f32(e, body, quant);
+        let center = self.f32(e, 32.0);
+        self.sub(e, body, quant, center)
+    }
+
+    pub(in crate::lower) fn q4k_ggml_accumulate_word_scalar(
+        &self,
+        e: &mut Arena<Expression>,
+        body: &mut Block,
+        word: Handle<Expression>,
+        activations: &[Handle<Expression>],
+        pair: usize,
+        sums: &mut [Handle<Expression>; 4],
+    ) {
+        let high_word = self.shr_lit(e, body, word, 16);
+        let entries = [
+            (word, 0usize, pair * 4, 0x000f_u32),
+            (word, 1usize, pair * 4 + 1, 0x0f00_u32),
+            (word, 2usize, pair * 4 + 8, 0x00f0_u32),
+            (word, 3usize, pair * 4 + 9, 0xf000_u32),
+            (high_word, 0usize, pair * 4 + 2, 0x000f_u32),
+            (high_word, 1usize, pair * 4 + 3, 0x0f00_u32),
+            (high_word, 2usize, pair * 4 + 10, 0x00f0_u32),
+            (high_word, 3usize, pair * 4 + 11, 0xf000_u32),
+        ];
+
+        for (source, sum_index, activation_index, mask) in entries {
+            let masked = self.and_lit(e, body, source, mask);
+            let quant = self.as_f32(e, body, masked);
+            let term = self.mul(e, body, activations[activation_index], quant);
+            sums[sum_index] = self.add(e, body, sums[sum_index], term);
+        }
+    }
+
+    pub(in crate::lower) fn q4k_ggml_accumulate_word_vector(
+        &self,
+        e: &mut Arena<Expression>,
+        body: &mut Block,
+        word: Handle<Expression>,
+        activations: &[Handle<Expression>],
+        pair: usize,
+        sums: &mut [Handle<Expression>; 4],
+    ) {
+        let high_word = self.shr_lit(e, body, word, 16);
+        for (source, activation_base) in [(word, pair * 4), (high_word, pair * 4 + 2)] {
+            let q0 = self.and_lit(e, body, source, 0x000f);
+            let q0 = self.as_f32(e, body, q0);
+            let q1 = self.and_lit(e, body, source, 0x0f00);
+            let q1 = self.as_f32(e, body, q1);
+            let q2 = self.and_lit(e, body, source, 0x00f0);
+            let q2 = self.as_f32(e, body, q2);
+            let q3 = self.and_lit(e, body, source, 0xf000);
+            let q3 = self.as_f32(e, body, q3);
+            let quant_vec = self.compose_f32_vec4(e, body, [q0, q1, q2, q3]);
+            let activation_vec = self.compose_f32_vec4(
+                e,
+                body,
+                [
+                    activations[activation_base],
+                    activations[activation_base + 1],
+                    activations[activation_base + 8],
+                    activations[activation_base + 9],
+                ],
+            );
+            let terms = self.mul(e, body, activation_vec, quant_vec);
+            for (sum_index, sum) in sums.iter_mut().enumerate() {
+                let term = self.vec4_component(e, body, terms, sum_index as u32);
+                *sum = self.add(e, body, *sum, term);
+            }
+        }
+    }
+
+    pub(in crate::lower) fn pack_i8x4(
+        &self,
+        e: &mut Arena<Expression>,
+        body: &mut Block,
+        values: Vec<Handle<Expression>>,
+    ) -> Result<Handle<Expression>, LowerError> {
+        let components: [Handle<Expression>; 4] = values
+            .try_into()
+            .map_err(|_| LowerError::UnsupportedOperation("pack_i8x4 requires 4 values"))?;
+        let vec = self.emit(
+            e,
+            body,
+            Expression::Compose {
+                ty: self.i32_vec4_ty,
+                components: components.to_vec(),
+            },
+        );
+        Ok(self.math1(e, body, MathFunction::Pack4xI8Clamp, vec))
+    }
+
+    pub(in crate::lower) fn as_i32(
+        &self,
+        e: &mut Arena<Expression>,
+        body: &mut Block,
+        value: Handle<Expression>,
+    ) -> Handle<Expression> {
+        self.cast_as(e, body, value, ScalarKind::Sint, Some(4))
+    }
+
+    pub(in crate::lower) fn as_f32(
+        &self,
+        e: &mut Arena<Expression>,
+        body: &mut Block,
+        value: Handle<Expression>,
+    ) -> Handle<Expression> {
+        self.cast_as(e, body, value, ScalarKind::Float, Some(4))
+    }
+
+    pub(in crate::lower) fn bitcast_f32(
+        &self,
+        e: &mut Arena<Expression>,
+        body: &mut Block,
+        value: Handle<Expression>,
+    ) -> Handle<Expression> {
+        self.cast_as(e, body, value, ScalarKind::Float, None)
+    }
+
+    /// Emit `Expression::As`. Wraps the convert/no-convert variants used by
+    /// `as_i32`, `as_f32`, `bitcast_f32`, and `cast_tile_value`.
+    pub(in crate::lower) fn cast_as(
+        &self,
+        e: &mut Arena<Expression>,
+        body: &mut Block,
+        value: Handle<Expression>,
+        kind: ScalarKind,
+        convert: Option<naga::Bytes>,
+    ) -> Handle<Expression> {
+        self.emit(
+            e,
+            body,
+            Expression::As {
+                expr: value,
+                kind,
+                convert,
+            },
+        )
+    }
+
+    /// Append an `Expression::LocalVariable` reference. LocalVariable
+    /// expressions are pure pointers; Naga doesn't require an `Emit`
+    /// statement for them, so this is a plain append.
+    pub(in crate::lower) fn local_var(
+        &self,
+        e: &mut Arena<Expression>,
+        local: Handle<LocalVariable>,
+    ) -> Handle<Expression> {
+        e.append(Expression::LocalVariable(local), Span::default())
+    }
+
+    /// Append an `Expression::GlobalVariable` reference. Same rationale as
+    /// `local_var`: globals are pure pointers and don't need an `Emit`.
+    pub(in crate::lower) fn global_var(
+        &self,
+        e: &mut Arena<Expression>,
+        global: Handle<GlobalVariable>,
+    ) -> Handle<Expression> {
+        e.append(Expression::GlobalVariable(global), Span::default())
+    }
+
+    /// `*local = value;` — appends the LocalVariable pointer expression and
+    /// pushes a `Statement::Store`. Used by helpers that materialise SSA
+    /// values back into named locals.
+    pub(in crate::lower) fn store_local(
+        &self,
+        e: &mut Arena<Expression>,
+        body: &mut Block,
+        local: Handle<LocalVariable>,
+        value: Handle<Expression>,
+    ) {
+        let pointer = self.local_var(e, local);
+        body.push(Statement::Store { pointer, value }, Span::default());
+    }
+
+    pub(in crate::lower) fn u32(
+        &self,
+        e: &mut Arena<Expression>,
+        value: u32,
+    ) -> Handle<Expression> {
+        e.append(Expression::Literal(Literal::U32(value)), Span::default())
+    }
+
+    pub(in crate::lower) fn i32(
+        &self,
+        e: &mut Arena<Expression>,
+        value: i32,
+    ) -> Handle<Expression> {
+        e.append(Expression::Literal(Literal::I32(value)), Span::default())
+    }
+
+    pub(in crate::lower) fn f32(
+        &self,
+        e: &mut Arena<Expression>,
+        value: f32,
+    ) -> Handle<Expression> {
+        e.append(Expression::Literal(Literal::F32(value)), Span::default())
+    }
+}

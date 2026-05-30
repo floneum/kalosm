@@ -5,8 +5,9 @@ use std::{
     sync::Arc,
 };
 
+#[cfg(feature = "media")]
 use image::ImageResult;
-use serde::{Deserialize, Serialize};
+#[cfg(feature = "media")]
 use thiserror::Error;
 
 /// The contents of a chat message. The message can contain chunks of interleaved text and media.
@@ -33,7 +34,8 @@ use thiserror::Error;
 /// contents += MediaSource::url("https://example.com/image.png");
 /// contents += MediaSource::try_from(PathBuf::from("path/to/file.png")).unwrap();
 /// ```
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct MessageContent {
     chunks: Vec<ContentChunk>,
 }
@@ -95,7 +97,15 @@ impl MessageContent {
             .collect()
     }
 
+    /// Returns true if this message contains any media chunks.
+    pub fn has_media(&self) -> bool {
+        self.chunks
+            .iter()
+            .any(|chunk| matches!(chunk, ContentChunk::Media(_)))
+    }
+
     /// Collect all images from the message content.
+    #[cfg(feature = "media")]
     pub async fn images(&self) -> Result<Vec<image::DynamicImage>, ImageFetchError> {
         let mut images = Vec::new();
         for chunk in &self.chunks {
@@ -120,6 +130,7 @@ impl MessageContent {
     }
 
     /// Collect all images that are loaded in memory. This will not return any images from [`MediaSourceVariant::Url`].
+    #[cfg(feature = "media")]
     pub fn images_in_memory(&self) -> ImageResult<Vec<image::DynamicImage>> {
         self.chunks
             .iter()
@@ -139,6 +150,7 @@ impl MessageContent {
     }
 
     /// Resolve all media sources and returned the message content with only [`MediaSourceVariant::Bytes`].
+    #[cfg(feature = "media")]
     pub async fn resolve_media_sources(&self) -> Result<Self, ImageFetchError> {
         let mut resolved_chunks = Vec::new();
         for chunk in &self.chunks {
@@ -173,6 +185,7 @@ impl MessageContent {
 }
 
 /// An error that can occur when fetching images from a URL.
+#[cfg(feature = "media")]
 #[derive(Error, Debug)]
 pub enum ImageFetchError {
     /// An error that occurs when fetching a URL.
@@ -244,7 +257,8 @@ where
 }
 
 /// A chunk of content in a chat message.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum ContentChunk {
     /// A text chunk.
     Text(String),
@@ -305,7 +319,8 @@ impl TryFrom<PathBuf> for ContentChunk {
 }
 
 /// A chunk of media content that can be used with a LLM.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct MediaChunk {
     media_type: MediaType,
     source: MediaSource,
@@ -345,7 +360,8 @@ impl MediaChunk {
 }
 
 /// Additional hints the LLM backend may use to process the media content.
-#[derive(Default, Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Default, Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct MediaHints {
     min_pixels: Option<u32>,
     max_pixels: Option<u32>,
@@ -385,7 +401,8 @@ impl MediaHints {
 
 /// The type of a [`MediaChunk`].
 #[non_exhaustive]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum MediaType {
     /// An image media type (e.g. PNG, JPEG).
     Image,
@@ -405,7 +422,8 @@ pub enum MediaType {
 /// // or a file path.
 /// let source = MediaSource::try_from(PathBuf::from("path/to/file.png")).unwrap();
 /// ```
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct MediaSource {
     variant: MediaSourceVariant,
 }
@@ -496,14 +514,16 @@ impl From<&[u8]> for MediaSource {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 enum MediaSourceVariant {
     Url(String),
-    #[serde(serialize_with = "serialize_bytes")]
-    #[serde(deserialize_with = "deserialize_bytes")]
+    #[cfg_attr(feature = "serde", serde(serialize_with = "serialize_bytes"))]
+    #[cfg_attr(feature = "serde", serde(deserialize_with = "deserialize_bytes"))]
     Bytes(Arc<[u8]>),
 }
 
+#[cfg(feature = "serde")]
 fn serialize_bytes<S>(bytes: &Arc<[u8]>, serializer: S) -> Result<S::Ok, S::Error>
 where
     S: serde::Serializer,
@@ -511,11 +531,12 @@ where
     serializer.serialize_bytes(&bytes[..])
 }
 
+#[cfg(feature = "serde")]
 fn deserialize_bytes<'de, D>(deserializer: D) -> Result<Arc<[u8]>, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
-    let bytes = Vec::<u8>::deserialize(deserializer)?;
+    let bytes = <Vec<u8> as serde::Deserialize>::deserialize(deserializer)?;
     Ok(bytes.into())
 }
 

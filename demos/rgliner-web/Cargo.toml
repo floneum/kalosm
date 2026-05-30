@@ -6,7 +6,7 @@ publish = false
 
 [dependencies]
 dioxus = { version = "=0.7.2", features = ["web"] }
-rgliner = { path = "../../models/rgliner", default-features = false }
+rgliner = { path = "../../models/rgliner" }
 getrandom = { version = "0.3", features = ["wasm_js"] }
 tracing = "0.1"
 dioxus-primitives = { git = "https://github.com/DioxusLabs/components", version = "0.0.1", default-features = false }

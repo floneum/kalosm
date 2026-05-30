@@ -1,21 +1,17 @@
 use std::sync::Arc;
 
-use llm_samplers::types::{HasSamplerResources, Logits, Sampler, SamplerError};
-use rand::SeedableRng;
+use crate::sampler::{CpuMirostat2Sampler, Logits};
+use crate::tokenizer::{LlamaTokenizer, LlamaTokenizerError};
+#[cfg(feature = "structured")]
 use rayon::iter::{IntoParallelIterator, ParallelExtend, ParallelIterator};
 use thiserror::Error;
-use tokenizers::tokenizer::Tokenizer;
 
 /// An error that can occur when performing streaming detokenization.
 #[derive(Debug, Error)]
 pub enum TokenOutputStreamError {
     /// An error that can occur when tokenizing.
     #[error("Tokenization error: {0}")]
-    TokenizationError(tokenizers::Error),
-
-    /// An error that can occur when sampling.
-    #[error("Sampler error: {0}")]
-    SamplerError(Box<dyn std::error::Error + Send + Sync>),
+    TokenizationError(#[from] LlamaTokenizerError),
 
     /// The sampler did not sample any tokens.
     #[error("No token sampled")]
@@ -25,7 +21,7 @@ pub enum TokenOutputStreamError {
 /// This is a wrapper around a tokenizer to ensure that tokens can be returned to the user in a
 /// streaming way rather than having to wait for the full decoding.
 pub struct TokenOutputStream {
-    tokenizer: Arc<Tokenizer>,
+    tokenizer: Arc<LlamaTokenizer>,
     tokens: Vec<u32>,
     current_text: String,
     prev_index: usize,
@@ -34,7 +30,7 @@ pub struct TokenOutputStream {
 
 impl TokenOutputStream {
     /// Creates a new token output stream.
-    pub fn new(tokenizer: Arc<Tokenizer>) -> Self {
+    pub fn new(tokenizer: Arc<LlamaTokenizer>) -> Self {
         Self {
             tokenizer,
             current_text: Default::default(),
@@ -45,57 +41,17 @@ impl TokenOutputStream {
     }
 
     fn decode(&self, tokens: &[u32]) -> Result<String, TokenOutputStreamError> {
-        self.tokenizer
-            .decode(tokens, false)
-            .map_err(TokenOutputStreamError::TokenizationError)
+        self.tokenizer.decode(tokens, false).map_err(Into::into)
     }
 
     /// Samples a token from the logits.
     pub fn sample_token(
         &self,
-        sampler: &mut impl Sampler,
+        sampler: &mut CpuMirostat2Sampler,
         mut logits: Logits,
         stop_on: Option<&str>,
-        seed: Option<u64>,
+        top_k: usize,
     ) -> Result<u32, TokenOutputStreamError> {
-        struct SamplerResources<'a, 'b, R: rand::Rng> {
-            rng: &'a mut R,
-            previous_tokens: &'b [u32],
-        }
-
-        impl<R> std::fmt::Debug for SamplerResources<'_, '_, R>
-        where
-            R: rand::Rng,
-        {
-            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-                f.debug_struct("SamplerResources")
-                    .field("previous_tokens", &self.previous_tokens)
-                    .finish()
-            }
-        }
-
-        impl<R> HasSamplerResources for SamplerResources<'_, '_, R>
-        where
-            R: rand::Rng,
-        {
-            fn with_rng_mut(
-                &mut self,
-                fun: &mut dyn FnMut(&mut dyn rand::RngCore),
-            ) -> Result<(), SamplerError> {
-                fun(self.rng);
-                Ok(())
-            }
-
-            fn with_last_tokens(&self, fun: &mut dyn FnMut(&[u32])) -> Result<(), SamplerError> {
-                fun(self.previous_tokens);
-                Ok(())
-            }
-        }
-        let mut rng = if let Some(seed) = seed {
-            rand::rngs::StdRng::seed_from_u64(seed)
-        } else {
-            rand::rngs::StdRng::from_os_rng()
-        };
         let tokenizer = &self.tokenizer;
         let previous_tokens = &self.tokens;
 
@@ -125,24 +81,18 @@ impl TokenOutputStream {
                 let token = tokenizer.decode(&[tid], false).unwrap();
                 let combined = end_tokens.clone() + &token;
                 if combined.contains(stop_on) && !combined.ends_with(stop_on) {
-                    // if the token contains a stop_on token, but not the end of the string, set the probability to 0
-                    logit.prob = 0.0;
+                    // If the token contains a stop string, but not at the end, remove it from sampling.
+                    logit.logit = f32::NEG_INFINITY;
                 }
             }
         }
-        logits
-            .sample_token(
-                &mut SamplerResources {
-                    previous_tokens,
-                    rng: &mut rng,
-                },
-                sampler,
-            )
-            .map_err(|err| TokenOutputStreamError::SamplerError(err.into()))?
+        sampler
+            .sample_token(&mut logits, previous_tokens, top_k)
             .ok_or(TokenOutputStreamError::NoTokenSampled)
     }
 
     /// Encode a string into a list of tokens after the current tokens.
+    #[cfg(feature = "structured")]
     pub(crate) fn encode_after(
         &self,
         text: &str,
@@ -150,9 +100,8 @@ impl TokenOutputStream {
         let all_text = self.current_text.clone() + text;
         let tokens_with_current_tokens = self
             .tokenizer
-            .encode_fast(all_text, false)
+            .encode(&all_text, false)
             .map_err(TokenOutputStreamError::TokenizationError)?;
-        let tokens_with_current_tokens = tokens_with_current_tokens.get_ids();
 
         let index_length = self.current_index - self.prev_index;
 
@@ -200,6 +149,7 @@ impl TokenOutputStream {
     }
 
     /// Returns the next tokens
+    #[cfg(feature = "structured")]
     pub fn next_tokens(
         &mut self,
         tokens: &[u32],
@@ -219,6 +169,7 @@ impl TokenOutputStream {
     }
 
     /// Peek encoding many next tokens (in sequence)
+    #[cfg(feature = "structured")]
     pub fn peek_next_tokens(
         &self,
         tokens: impl IntoIterator<Item = u32>,
@@ -236,6 +187,7 @@ impl TokenOutputStream {
     }
 
     /// Peek many possible next tokens in parallel
+    #[cfg(feature = "structured")]
     pub fn peek_tokens(
         &self,
         tokens: impl IntoParallelIterator<Item = u32>,
@@ -260,6 +212,7 @@ impl TokenOutputStream {
     }
 
     /// Peek the next token.
+    #[cfg(feature = "structured")]
     pub fn peek_token(&self, token: u32) -> Result<Option<String>, TokenOutputStreamError> {
         let prev_text = &self.current_text;
         let prev_text_len = prev_text.len();

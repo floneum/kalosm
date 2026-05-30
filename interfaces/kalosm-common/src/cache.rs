@@ -1,26 +1,21 @@
 use kalosm_model_types::{FileLoadingProgress, FileSource};
+#[cfg(not(target_arch = "wasm32"))]
+use std::path::Path;
 use std::path::PathBuf;
-
-#[cfg(feature = "tokio")]
-use tokio::fs::{File, OpenOptions};
-#[cfg(feature = "tokio")]
-use tokio::io::AsyncWriteExt;
 
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum CacheError {
-    #[cfg(feature = "tokio")]
-    #[error("Hugging Face API error: {0}")]
-    HuggingFaceApi(#[from] hf_hub::api::tokio::ApiError),
-    #[cfg(feature = "tokio")]
-    #[error("Unable to get file metadata for {0}: {1}")]
-    UnableToGetFileMetadata(PathBuf, #[source] tokio::io::Error),
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
+    #[cfg(target_arch = "wasm32")]
     #[error("HTTP error: {0}")]
     Http(#[from] reqwest::Error),
+    #[cfg(not(target_arch = "wasm32"))]
+    #[error("HTTP error: {0}")]
+    Http(#[from] Box<ureq::Error>),
     #[error("Unexpected status code: {0}")]
-    UnexpectedStatusCode(reqwest::StatusCode),
+    UnexpectedStatusCode(u16),
     #[cfg(target_arch = "wasm32")]
     #[error("OPFS not available: {0}")]
     OpfsNotAvailable(String),
@@ -72,138 +67,60 @@ impl Cache {
     pub async fn get_bytes(
         &self,
         source: &FileSource,
-        #[allow(unused_mut)] mut progress: impl FnMut(FileLoadingProgress),
+        #[cfg_attr(not(target_arch = "wasm32"), allow(unused_mut))] mut progress: impl FnMut(
+            FileLoadingProgress,
+        ),
     ) -> Result<Vec<u8>, CacheError> {
-        #[cfg(feature = "tokio")]
+        #[cfg(not(target_arch = "wasm32"))]
         {
-            let path = self.get(source, progress).await;
-            tokio::fs::read(path?).await.map_err(CacheError::from)
+            let cache = self.clone();
+            let source = source.clone();
+            run_on_download_thread(
+                move |progress| cache.get_bytes_blocking(&source, progress),
+                progress,
+            )
+            .await
         }
-        #[cfg(not(feature = "tokio"))]
+        #[cfg(target_arch = "wasm32")]
         {
-            #[cfg(target_arch = "wasm32")]
-            {
-                use crate::opfs::is_opfs_available;
+            use crate::opfs::is_opfs_available;
 
-                // Try OPFS-backed caching first
-                if is_opfs_available().await {
-                    match self.get_bytes_opfs(source, &mut progress).await {
-                        Ok(bytes) => return Ok(bytes),
-                        Err(e) => {
-                            tracing::warn!("OPFS caching failed, falling back to in-memory: {}", e);
-                        }
+            // Try OPFS-backed caching first
+            if is_opfs_available().await {
+                match self.get_bytes_opfs(source, &mut progress).await {
+                    Ok(bytes) => return Ok(bytes),
+                    Err(e) => {
+                        tracing::warn!("OPFS caching failed, falling back to in-memory: {}", e);
                     }
                 }
-
-                // Fallback to in-memory streaming (no caching)
-                self.get_bytes_memory(source, progress).await
             }
 
-            #[cfg(not(target_arch = "wasm32"))]
-            {
-                self.get_bytes_memory(source, progress).await
-            }
+            // Fallback to in-memory streaming (no caching)
+            self.get_bytes_memory(source, progress).await
         }
     }
 
     /// Get the file from the cache, downloading it if necessary
-    #[cfg(feature = "tokio")]
+    #[cfg(not(target_arch = "wasm32"))]
     pub async fn get(
         &self,
         source: &FileSource,
         progress: impl FnMut(FileLoadingProgress),
     ) -> Result<PathBuf, CacheError> {
-        use hf_hub::{Repo, RepoType};
-        match source {
-            FileSource::HuggingFace {
-                model_id,
-                revision,
-                file,
-            } => {
-                let token = self.huggingface_token.clone().or_else(huggingface_token);
-
-                let repo = Repo::with_revision(
-                    model_id.to_string(),
-                    RepoType::Model,
-                    revision.to_string(),
-                );
-                let api = hf_hub::api::tokio::Api::new()?.repo(repo);
-                let url = api.url(file);
-                let client = reqwest::Client::new();
-                tracing::trace!("Fetching metadata for {file} from {url}");
-                let response = client
-                    .head(&url)
-                    .with_authorization_header(token.clone())
-                    .send()
-                    .await;
-
-                let path = self.location.join(model_id).join(revision);
-                let complete_download = path.join(file);
-
-                // Quick check without lock - if file exists and is up-to-date, return it
-                if is_file_current(&complete_download, &response).await {
-                    return Ok(complete_download);
-                }
-
-                // Need to download - acquire lock to prevent race conditions
-                let lock_path = path.join(format!("{file}.lock"));
-                tokio::fs::create_dir_all(&path).await?;
-
-                // Acquire exclusive lock using blocking task to avoid blocking async runtime
-                let lock_path_clone = lock_path.clone();
-                let _lock_file = tokio::task::spawn_blocking(move || {
-                    let file = std::fs::File::create(&lock_path_clone)?;
-                    file.lock()?;
-                    Ok::<_, std::io::Error>(file)
-                })
-                .await
-                .map_err(|e| CacheError::Io(std::io::Error::other(e)))??;
-
-                // Double-check if file was downloaded while we were waiting for lock
-                if is_file_current(&complete_download, &response).await {
-                    let _ = tokio::fs::remove_file(&lock_path).await;
-                    return Ok(complete_download);
-                }
-
-                let incomplete_download = path.join(format!("{file}.partial"));
-
-                tracing::trace!("Downloading into {:?}", incomplete_download);
-
-                let download_result = download_into(
-                    url,
-                    &incomplete_download,
-                    response?,
-                    client,
-                    token,
-                    progress,
-                )
-                .await;
-
-                if let Err(e) = download_result {
-                    let _ = tokio::fs::remove_file(&lock_path).await;
-                    return Err(e);
-                }
-
-                // Rename the file to remove the .partial extension
-                let rename_result =
-                    tokio::fs::rename(&incomplete_download, &complete_download).await;
-
-                // Release lock and clean up lock file
-                let _ = tokio::fs::remove_file(&lock_path).await;
-
-                rename_result?;
-
-                Ok(complete_download)
-            }
-            FileSource::Local(path) => Ok(path.clone()),
-        }
+        let cache = self.clone();
+        let source = source.clone();
+        run_on_download_thread(
+            move |progress| cache.get_path_blocking(&source, progress),
+            progress,
+        )
+        .await
     }
 
     /// WASM: Get bytes using OPFS for persistent caching
     ///
     /// Uses file size comparison with Content-Length to determine if a file is complete.
     /// No .partial files - writes directly to the final filename.
-    #[cfg(all(not(feature = "tokio"), target_arch = "wasm32"))]
+    #[cfg(target_arch = "wasm32")]
     async fn get_bytes_opfs(
         &self,
         source: &FileSource,
@@ -327,7 +244,7 @@ impl Cache {
                         .and_then(|s| s.parse::<u64>().ok());
                     (total.or(expected_size), false)
                 } else {
-                    return Err(CacheError::UnexpectedStatusCode(status));
+                    return Err(CacheError::UnexpectedStatusCode(status.as_u16()));
                 };
 
                 let actual_start = if resuming { start_offset } else { 0 };
@@ -421,13 +338,12 @@ impl Cache {
     }
 
     /// Fallback: Get bytes in-memory without caching (original WASM behavior)
-    #[cfg(not(feature = "tokio"))]
+    #[cfg(target_arch = "wasm32")]
     async fn get_bytes_memory(
         &self,
         source: &FileSource,
         mut progress: impl FnMut(FileLoadingProgress),
     ) -> Result<Vec<u8>, CacheError> {
-        use futures_util::StreamExt;
         use reqwest::StatusCode;
         use std::str::FromStr;
 
@@ -465,38 +381,43 @@ impl Cache {
 
                 let status = response.status();
                 if !(status == StatusCode::OK || status == StatusCode::PARTIAL_CONTENT) {
-                    return Err(CacheError::UnexpectedStatusCode(status));
+                    return Err(CacheError::UnexpectedStatusCode(status.as_u16()));
                 }
 
                 let mut current_progress = 0;
                 let mut bytes = Vec::new();
-                let mut stream = response.bytes_stream();
 
-                while let Some(chunk) = stream.next().await {
-                    let chunk = chunk?;
-                    bytes.extend_from_slice(&chunk);
-                    tracing::trace!("wrote chunk of size {}", chunk.len());
-                    current_progress += chunk.len() as u64;
-                    if let Some(length) = length {
-                        progress(FileLoadingProgress {
-                            progress: current_progress,
-                            cached_size: 0,
-                            size: length,
-                            start_time: None,
-                        });
+                #[cfg(target_arch = "wasm32")]
+                {
+                    use futures_util::StreamExt;
+
+                    let mut stream = response.bytes_stream();
+                    while let Some(chunk) = stream.next().await {
+                        let chunk = chunk?;
+                        bytes.extend_from_slice(&chunk);
+                        tracing::trace!("wrote chunk of size {}", chunk.len());
+                        current_progress += chunk.len() as u64;
+                        if let Some(length) = length {
+                            progress(FileLoadingProgress {
+                                progress: current_progress,
+                                cached_size: 0,
+                                size: length,
+                                start_time: None,
+                            });
+                        }
                     }
                 }
 
                 Ok(bytes)
             }
             _ => Err(CacheError::Io(std::io::Error::other(
-                "Local file access not supported without the 'tokio' feature",
+                "Local file access not supported on WASM",
             ))),
         }
     }
 
     /// Check if the file exists in the cache (async version for WASM)
-    #[cfg(all(not(feature = "tokio"), target_arch = "wasm32"))]
+    #[cfg(target_arch = "wasm32")]
     pub async fn exists_async(&self, source: &FileSource) -> bool {
         use crate::opfs::{is_opfs_available, sanitize_name, OpfsCache};
 
@@ -534,12 +455,109 @@ impl Cache {
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
+impl Cache {
+    fn get_bytes_blocking(
+        &self,
+        source: &FileSource,
+        progress: &mut dyn FnMut(FileLoadingProgress),
+    ) -> Result<Vec<u8>, CacheError> {
+        let path = self.get_path_blocking(source, progress)?;
+        std::fs::read(path).map_err(CacheError::from)
+    }
+
+    fn get_path_blocking(
+        &self,
+        source: &FileSource,
+        progress: &mut dyn FnMut(FileLoadingProgress),
+    ) -> Result<PathBuf, CacheError> {
+        match source {
+            FileSource::Local(path) => Ok(path.clone()),
+            FileSource::HuggingFace {
+                model_id,
+                revision,
+                file,
+            } => {
+                let cache_dir = self.location.join(model_id).join(revision);
+                let complete_download = cache_dir.join(file);
+                if std::env::var_os("KALOSM_CACHE_OFFLINE").is_some() && complete_download.exists()
+                {
+                    return Ok(complete_download);
+                }
+
+                let token = self.huggingface_token.clone().or_else(huggingface_token);
+                let url = huggingface_resolve_url(model_id, revision, file);
+                let agent = ureq::Agent::new_with_defaults();
+                let head = with_ureq_auth(agent.head(&url), token.clone())
+                    .call()
+                    .map_err(ureq_error);
+
+                if is_file_current_blocking(&complete_download, head.as_ref()) {
+                    return Ok(complete_download);
+                }
+
+                let head = head?;
+                std::fs::create_dir_all(&cache_dir)?;
+                if let Some(parent) = complete_download.parent() {
+                    std::fs::create_dir_all(parent)?;
+                }
+
+                let lock_path = complete_download.with_file_name(format!(
+                    "{}.lock",
+                    complete_download
+                        .file_name()
+                        .map(|name| name.to_string_lossy())
+                        .unwrap_or_else(|| "download".into())
+                ));
+                if let Some(parent) = lock_path.parent() {
+                    std::fs::create_dir_all(parent)?;
+                }
+                let lock_file = std::fs::File::create(&lock_path)?;
+                lock_file.lock()?;
+
+                if is_file_current_blocking(&complete_download, Ok(&head)) {
+                    drop(lock_file);
+                    let _ = std::fs::remove_file(lock_path);
+                    return Ok(complete_download);
+                }
+
+                let incomplete_download = partial_download_path(&complete_download);
+                let download_result = download_into_blocking(
+                    &agent,
+                    &url,
+                    &incomplete_download,
+                    &head,
+                    token,
+                    progress,
+                );
+
+                match download_result {
+                    Ok(()) => {
+                        if let Some(parent) = complete_download.parent() {
+                            std::fs::create_dir_all(parent)?;
+                        }
+                        std::fs::rename(&incomplete_download, &complete_download)?;
+                        drop(lock_file);
+                        let _ = std::fs::remove_file(&lock_path);
+                        Ok(complete_download)
+                    }
+                    Err(err) => {
+                        drop(lock_file);
+                        let _ = std::fs::remove_file(&lock_path);
+                        Err(err)
+                    }
+                }
+            }
+        }
+    }
+}
+
 #[allow(clippy::derivable_impls)]
 impl Default for Cache {
     fn default() -> Self {
         Self {
             location: {
-                #[cfg(feature = "tokio")]
+                #[cfg(not(target_arch = "wasm32"))]
                 {
                     // Try various locations in order of preference
                     dirs::data_dir()
@@ -550,7 +568,7 @@ impl Default for Cache {
                         .join("kalosm")
                         .join("cache")
                 }
-                #[cfg(not(feature = "tokio"))]
+                #[cfg(target_arch = "wasm32")]
                 {
                     Default::default()
                 }
@@ -560,18 +578,58 @@ impl Default for Cache {
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
+enum DownloadThreadEvent<T> {
+    Progress(FileLoadingProgress),
+    Done(Result<T, CacheError>),
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+async fn run_on_download_thread<T, F>(
+    task: F,
+    mut progress: impl FnMut(FileLoadingProgress),
+) -> Result<T, CacheError>
+where
+    T: Send + 'static,
+    F: FnOnce(&mut dyn FnMut(FileLoadingProgress)) -> Result<T, CacheError> + Send + 'static,
+{
+    use futures_channel::mpsc;
+    use futures_util::StreamExt;
+
+    let (events_tx, mut events_rx) = mpsc::unbounded();
+    std::thread::spawn(move || {
+        let progress_tx = events_tx.clone();
+        let mut thread_progress = move |progress| {
+            let _ = progress_tx.unbounded_send(DownloadThreadEvent::Progress(progress));
+        };
+        let result = task(&mut thread_progress);
+        let _ = events_tx.unbounded_send(DownloadThreadEvent::Done(result));
+    });
+
+    while let Some(event) = events_rx.next().await {
+        match event {
+            DownloadThreadEvent::Progress(update) => progress(update),
+            DownloadThreadEvent::Done(result) => return result,
+        }
+    }
+
+    Err(CacheError::Io(std::io::Error::other(
+        "download thread terminated without returning a result",
+    )))
+}
+
 /// Check if the local file exists and is up-to-date compared to the server's Last-Modified header.
 /// Returns true if the file can be used as-is, false if it needs to be downloaded.
-#[cfg(feature = "tokio")]
-async fn is_file_current(
-    path: &std::path::Path,
-    response: &Result<reqwest::Response, reqwest::Error>,
+#[cfg(not(target_arch = "wasm32"))]
+fn is_file_current_blocking(
+    path: &Path,
+    response: Result<&ureq::http::Response<ureq::Body>, &CacheError>,
 ) -> bool {
     if !path.exists() {
         return false;
     }
 
-    let Ok(metadata) = tokio::fs::metadata(path).await else {
+    let Ok(metadata) = std::fs::metadata(path) else {
         return false;
     };
 
@@ -579,57 +637,58 @@ async fn is_file_current(
         return false;
     };
 
-    // If the server says the file hasn't been modified since we downloaded it, we can use the local file
+    // If the server says the file hasn't been modified since we downloaded it, we can use the local file.
     if let Some(last_updated) = response
-        .as_ref()
         .ok()
-        .and_then(|response| response.headers().get(reqwest::header::LAST_MODIFIED))
+        .and_then(|response| response.headers().get(ureq::http::header::LAST_MODIFIED))
         .and_then(|last_updated| last_updated.to_str().ok())
         .and_then(|s| httpdate::parse_http_date(s).ok())
     {
         last_updated <= file_last_modified
     } else {
-        // If we're offline or the server doesn't provide Last-Modified, use the local file
+        // If we're offline or the server doesn't provide Last-Modified, use the local file.
         true
     }
 }
 
-#[cfg(feature = "tokio")]
-async fn download_into<U: reqwest::IntoUrl>(
-    url: U,
-    file: &PathBuf,
-    head: reqwest::Response,
-    client: reqwest::Client,
+#[cfg(not(target_arch = "wasm32"))]
+fn download_into_blocking(
+    agent: &ureq::Agent,
+    url: &str,
+    file: &Path,
+    head: &ureq::http::Response<ureq::Body>,
     token: Option<String>,
-    mut progress: impl FnMut(FileLoadingProgress),
+    progress: &mut dyn FnMut(FileLoadingProgress),
 ) -> Result<(), CacheError> {
-    use reqwest::header::{HeaderValue, CONTENT_LENGTH, RANGE};
-    use reqwest::StatusCode;
-    use std::str::FromStr;
+    use std::io::{Read, Write};
+    use ureq::http::header::{CONTENT_LENGTH, RANGE};
+    use ureq::http::StatusCode;
 
     let length = head
         .headers()
         .get(CONTENT_LENGTH)
         .and_then(|v| v.to_str().ok())
-        .and_then(|s| u64::from_str(s).ok());
+        .and_then(|s| s.parse::<u64>().ok());
 
-    let (start, mut output_file) = if let Ok(metadata) = tokio::fs::metadata(file).await {
-        let start = metadata.len();
-        let output_file = OpenOptions::new().append(true).open(file).await?;
-        (start, output_file)
-    } else {
-        if let Some(parent) = file.parent() {
-            tokio::fs::create_dir_all(parent).await?;
-        }
-        (0, File::create(file).await?)
-    };
+    if let Some(parent) = file.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
 
+    let mut start = std::fs::metadata(file)
+        .map(|metadata| metadata.len())
+        .unwrap_or(0);
+    if length.is_some_and(|length| start > length) {
+        let _ = std::fs::remove_file(file);
+        start = 0;
+    }
+
+    let start_time = Some(std::time::Instant::now());
     if let Some(length) = length {
         progress(FileLoadingProgress {
             progress: start,
             cached_size: start,
             size: length,
-            start_time: Some(std::time::Instant::now()),
+            start_time,
         });
     }
 
@@ -639,38 +698,65 @@ async fn download_into<U: reqwest::IntoUrl>(
             progress: start,
             cached_size: start,
             size: length.unwrap_or(0),
-            start_time: Some(std::time::Instant::now()),
+            start_time,
         });
         return Ok(());
     }
 
-    let range = length
-        .and_then(|length| HeaderValue::from_str(&format!("bytes={}-{}", start, length - 1)).ok());
-
-    tracing::trace!("Fetching range {:?}", range);
-    let mut request = client.get(url).with_authorization_header(token);
-    if let Some(range) = range {
+    let mut request = with_ureq_auth(agent.get(url), token);
+    if start > 0 {
+        let range = if let Some(length) = length {
+            format!("bytes={}-{}", start, length - 1)
+        } else {
+            format!("bytes={start}-")
+        };
+        tracing::trace!("Fetching range {range}");
         request = request.header(RANGE, range);
     }
-    let mut response = request.send().await?;
 
+    let mut response = request.call().map_err(ureq_error)?;
     let status = response.status();
     if !(status == StatusCode::OK || status == StatusCode::PARTIAL_CONTENT) {
-        return Err(CacheError::UnexpectedStatusCode(status));
+        return Err(CacheError::UnexpectedStatusCode(status.as_u16()));
     }
 
-    let mut current_progress = start;
+    let mut output_file = if start > 0 && status == StatusCode::OK {
+        start = 0;
+        if let Some(length) = length {
+            progress(FileLoadingProgress {
+                progress: 0,
+                cached_size: 0,
+                size: length,
+                start_time,
+            });
+        }
+        std::fs::File::create(file)?
+    } else {
+        std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(file)?
+    };
 
-    while let Some(chunk) = response.chunk().await? {
-        output_file.write_all(&chunk).await?;
-        tracing::trace!("wrote chunk of size {}", chunk.len());
-        current_progress += chunk.len() as u64;
+    let mut current_progress = start;
+    let cached_size = start;
+    let mut buffer = [0; 64 * 1024];
+    let mut reader = response.body_mut().as_reader();
+    loop {
+        let bytes_read = reader.read(&mut buffer)?;
+        if bytes_read == 0 {
+            break;
+        }
+
+        output_file.write_all(&buffer[..bytes_read])?;
+        tracing::trace!("wrote chunk of size {bytes_read}");
+        current_progress += bytes_read as u64;
         if let Some(length) = length {
             progress(FileLoadingProgress {
                 progress: current_progress,
-                cached_size: start,
+                cached_size,
                 size: length,
-                start_time: Some(std::time::Instant::now()),
+                start_time,
             });
         }
     }
@@ -680,10 +766,47 @@ async fn download_into<U: reqwest::IntoUrl>(
     Ok(())
 }
 
+#[cfg(not(target_arch = "wasm32"))]
+fn partial_download_path(path: &Path) -> PathBuf {
+    let mut partial = path.to_path_buf();
+    let extension = path
+        .extension()
+        .map(|extension| {
+            let mut extension = extension.to_os_string();
+            extension.push(".partial");
+            extension
+        })
+        .unwrap_or_else(|| "partial".into());
+    partial.set_extension(extension);
+    partial
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn with_ureq_auth(
+    request: ureq::RequestBuilder<ureq::typestate::WithoutBody>,
+    token: Option<String>,
+) -> ureq::RequestBuilder<ureq::typestate::WithoutBody> {
+    if let Some(token) = token {
+        request.header(ureq::http::header::AUTHORIZATION, format!("Bearer {token}"))
+    } else {
+        request
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn ureq_error(err: ureq::Error) -> CacheError {
+    match err {
+        ureq::Error::StatusCode(status) => CacheError::UnexpectedStatusCode(status),
+        err => CacheError::Http(Box::new(err)),
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
 trait RequestBuilderExt {
     fn with_authorization_header(self, token: Option<String>) -> Self;
 }
 
+#[cfg(target_arch = "wasm32")]
 impl RequestBuilderExt for reqwest::RequestBuilder {
     fn with_authorization_header(self, token: Option<String>) -> Self {
         if let Some(token) = token {
@@ -694,28 +817,29 @@ impl RequestBuilderExt for reqwest::RequestBuilder {
     }
 }
 
-#[cfg(test)]
-#[tokio::test]
-async fn downloads_work() {
-    let url = "https://httpbin.org/range/102400?duration=2";
-    let file = PathBuf::from("download.bin");
-    let progress = |p| {
-        println!("Progress: {p:?}");
-    };
-    let client = reqwest::Client::new();
-    let response = client.head(url).send().await.unwrap();
-    download_into(url, &file, response, client, None, progress)
-        .await
-        .unwrap();
-    assert!(file.exists());
-    tokio::fs::remove_file(file).await.unwrap();
+fn huggingface_token() -> Option<String> {
+    if cfg!(target_arch = "wasm32") {
+        return None;
+    }
+
+    if let Ok(token) = std::env::var("HF_TOKEN") {
+        let token = token.trim().to_string();
+        if !token.is_empty() {
+            return Some(token);
+        }
+    }
+
+    let token_path = std::env::var_os("HF_HOME")
+        .map(PathBuf::from)
+        .or_else(|| dirs::home_dir().map(|home| home.join(".cache").join("huggingface")))
+        .map(|path| path.join("token"))?;
+
+    let token = std::fs::read_to_string(token_path).ok()?;
+    let token = token.trim().to_string();
+    (!token.is_empty()).then_some(token)
 }
 
-fn huggingface_token() -> Option<String> {
-    cfg!(not(target_arch = "wasm32"))
-        .then(|| {
-            let cache = hf_hub::Cache::default();
-            cache.token().or_else(|| std::env::var("HF_TOKEN").ok())
-        })
-        .flatten()
+#[cfg(not(target_arch = "wasm32"))]
+fn huggingface_resolve_url(model_id: &str, revision: &str, file: &str) -> String {
+    format!("https://huggingface.co/{model_id}/resolve/{revision}/{file}")
 }

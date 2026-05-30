@@ -152,6 +152,32 @@ macro_rules! impl_matmul_naive {
 
 impl_matmul_naive!(i8, i16, i32, i64, u8, u16, u32, u64);
 
+// f16 matmul: route through f32 to avoid catastrophic precision loss in the
+// inner accumulator. The naive implementation accumulates in `T::default()`
+// which for f16 is zero, but each add is f16-precision; routing through f32
+// keeps accumulation in higher precision.
+impl MatmulImpl for half::f16 {
+    #[inline]
+    fn matmul_contiguous(
+        lhs: &[Self],
+        rhs: &[Self],
+        out: &mut [Self],
+        m: usize,
+        k: usize,
+        n: usize,
+    ) {
+        for i in 0..m {
+            for j in 0..n {
+                let mut sum = 0.0f32;
+                for l in 0..k {
+                    sum += lhs[i * k + l].to_f32() * rhs[l * n + j].to_f32();
+                }
+                out[i * n + j] = half::f16::from_f32(sum);
+            }
+        }
+    }
+}
+
 /// Extract a batch matrix from a non-contiguous tensor into a contiguous buffer
 #[inline]
 fn extract_batch_matrix<T: SimdElement + Copy, const R: usize>(

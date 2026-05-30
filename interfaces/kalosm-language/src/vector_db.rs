@@ -42,7 +42,7 @@ impl From<heed::Error> for VectorDbError {
 /// ```rust, no_run
 /// # use kalosm_language::prelude::*;
 /// # use kalosm_language_model::*;
-/// # use rbert::*;
+/// # use kalosm::language::Bert;
 /// # use std::collections::HashMap;
 /// # #[tokio::main]
 /// # async fn main() {
@@ -424,6 +424,7 @@ pub struct VectorDBSearchResult {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct EmbeddingId(pub u32);
 
+#[cfg(all(test, feature = "tokio"))]
 #[tokio::test]
 async fn test_vector_db_get_closest() {
     let db: VectorDB = VectorDB::new().unwrap();

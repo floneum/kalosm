@@ -1,8 +1,8 @@
 //! Math operations that work on both CPU and GPU backends.
 
+use crate::cpu::Mul;
+use crate::gpu::{DataType, FloatDataType};
 use crate::{ConcreteTensor, FloatOps, MulOp, ResolvedTensor, SimdBinaryOp, SimdElement, Tensor};
-use fusor_core::{DataType, FloatDataType};
-use fusor_cpu::Mul;
 
 impl<const R: usize, D> Tensor<R, D>
 where
@@ -36,7 +36,7 @@ where
                     .zip(b_data.iter())
                     .map(|(x, y)| x.powf(*y))
                     .collect();
-                fusor_cpu::Tensor::new(fusor_cpu::ConcreteTensor::from_slice(shape, &result))
+                crate::cpu::TypedTensor::new(crate::cpu::ConcreteTensor::from_slice(shape, &result))
             },
             |a, b| a.pow(b),
         )
@@ -95,33 +95,11 @@ where
                 };
                 copy_recursive(&ctx, &mut result, 0, 0, 0);
 
-                Tensor::Cpu(fusor_cpu::Tensor::new(
-                    fusor_cpu::ConcreteTensor::from_slice(new_shape, &result),
+                Tensor::Cpu(crate::cpu::TypedTensor::new(
+                    crate::cpu::ConcreteTensor::from_slice(new_shape, &result),
                 ))
             }
             Tensor::Gpu(t) => Tensor::Gpu(t.resize(new_shape)),
-        }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[tokio::test]
-    async fn test_sqr_cpu() {
-        let data = [1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0];
-        let t: Tensor<1, f32> = Tensor::Cpu(fusor_cpu::Tensor::from_slice([6], &data));
-        let result = t.sqr();
-        let slice = result.as_slice().await.unwrap();
-
-        for i in 0..6 {
-            let expected = data[i] * data[i];
-            assert!(
-                (slice[[i]] - expected).abs() < 0.001,
-                "Mismatch at index {}",
-                i
-            );
         }
     }
 }

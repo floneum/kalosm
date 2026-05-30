@@ -15,7 +15,7 @@ use tokenizers::Tokenizer;
 
 use super::{DecodingResult, Segment};
 use crate::{
-    audio, config::*, quantized::TextDecoderCache, Task, TaskType, TokenChunk, WhisperBuilder,
+    audio, config::*, quantized::TextDecoderCache, Task, TokenChunk, WhisperBuilder,
     WhisperLanguage,
 };
 use kalosm_common::CacheError;
@@ -173,7 +173,6 @@ impl WhisperInner {
                 &mel,
                 pcm_data.len(),
                 Task {
-                    task_type: TaskType::Unset,
                     word_level_time_stamps,
                     without_timestamps: true,
                 },
@@ -313,11 +312,6 @@ impl Decoder {
         let mut tokens = vec![self.sot_token];
         if let Some(language_token) = self.language_token {
             tokens.push(language_token);
-        }
-        match task.task_type {
-            TaskType::Transcribe => tokens.push(self.transcribe_token),
-            TaskType::Translate => tokens.push(self.translate_token),
-            TaskType::Unset => {}
         }
         if task.without_timestamps {
             tokens.push(self.no_timestamps_token);

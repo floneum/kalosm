@@ -1,0 +1,13 @@
+[package]
+name = "fusor-conformance"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+fusor = { path = "../fusor", features = ["graphvis"] }
+tokio = { version = "1", features = ["full"] }
+rand = { workspace = true }
+half = "2.4"
+fusor-types = { path = "../types" }
+thiserror.workspace = true

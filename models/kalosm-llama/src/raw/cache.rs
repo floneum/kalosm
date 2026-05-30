@@ -1,5 +1,5 @@
 use fusor::cache::KvCache;
-use fusor::SimdElement;
+use fusor::{Device, FloatDataType, SimdElement};
 
 use super::LlamaConfig;
 
@@ -20,7 +20,7 @@ pub struct LlamaCache {
 
 impl LlamaCache {
     /// Create a new cache for a model
-    pub fn new<G: fusor::FloatDataType + SimdElement>(config: &LlamaConfig<G>) -> Self {
+    pub fn new<G: FloatDataType + SimdElement>(config: &LlamaConfig<G>) -> Self {
         let max_seq_len = config.context_length;
         let mut blocks = Vec::with_capacity(config.n_layer);
         for layer_idx in 0..config.n_layer {
@@ -49,6 +49,33 @@ impl LlamaCache {
     pub fn clear(&mut self) {
         for block in &mut self.blocks {
             block.reset()
+        }
+    }
+
+    pub(crate) fn reserve_decode(&mut self, device: &Device, additional_tokens: usize) {
+        if additional_tokens == 0 || self.tokens.is_empty() {
+            return;
+        }
+        let target_seq_len = self.tokens.len().saturating_add(additional_tokens);
+        let mut keys = Vec::with_capacity(self.blocks.len() * 2);
+        for block in &mut self.blocks {
+            block.reserve(device, target_seq_len, &mut keys);
+        }
+        if !keys.is_empty() {
+            device.resolve_batch(&keys);
+            if let Some(device) = device.as_gpu() {
+                device.poll_wait();
+            }
+        }
+    }
+
+    pub(crate) fn detach(&mut self, device: &Device) {
+        let mut keys = Vec::with_capacity(self.blocks.len() * 2);
+        for block in &mut self.blocks {
+            block.detach_keys(&mut keys);
+        }
+        if !keys.is_empty() {
+            device.detach_cached(&keys);
         }
     }
 }

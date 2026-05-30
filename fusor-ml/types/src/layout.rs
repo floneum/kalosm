@@ -84,6 +84,51 @@ impl From<[usize; 3]> for SlidingWindow {
     }
 }
 
+/// Specifies how one output dimension maps to an input dimension's stride.
+///
+/// Used with [`Layout::restride`] to create views with arbitrary stride patterns.
+/// Each output dimension references an input dimension and optionally scales its stride.
+/// An optional offset shifts the starting position along that input dimension.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct StrideSpec {
+    /// Which input dimension's stride to use.
+    pub input_dim: usize,
+    /// Multiplier applied to the input stride.
+    pub multiplier: usize,
+    /// Size of this output dimension.
+    pub size: usize,
+    /// Starting element offset along the input dimension.
+    pub offset: usize,
+}
+
+impl StrideSpec {
+    /// Map to an input dimension's stride with multiplier 1 and offset 0.
+    pub fn dim(input_dim: usize, size: usize) -> Self {
+        Self {
+            input_dim,
+            multiplier: 1,
+            size,
+            offset: 0,
+        }
+    }
+
+    /// Map to an input dimension's stride with a custom multiplier and offset 0.
+    pub fn dim_with(input_dim: usize, size: usize, multiplier: usize) -> Self {
+        Self {
+            input_dim,
+            multiplier,
+            size,
+            offset: 0,
+        }
+    }
+
+    /// Set the starting offset along the input dimension.
+    pub fn with_offset(mut self, offset: usize) -> Self {
+        self.offset = offset;
+        self
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct Layout {
     offset: usize,
@@ -452,6 +497,37 @@ impl Layout {
         );
 
         Self::contiguous(new_shape)
+    }
+
+    /// Create a new layout by mapping output dimensions to input dimensions' strides.
+    ///
+    /// Each [`StrideSpec`] specifies which input dimension's stride to use, a multiplier,
+    /// the output dimension's size, and an optional starting offset along that input
+    /// dimension. This is relative to the current strides, so it composes correctly when
+    /// upstream layout changes (e.g. from a GPU optimizer) modify the strides.
+    pub fn restride(&self, specs: &[StrideSpec]) -> Self {
+        let new_shape: Box<[usize]> = specs.iter().map(|s| s.size).collect();
+        let new_strides: Box<[usize]> = specs
+            .iter()
+            .map(|s| {
+                if s.multiplier == 0 {
+                    0
+                } else {
+                    self.strides[s.input_dim] * s.multiplier
+                }
+            })
+            .collect();
+        let additional_offset: usize = specs
+            .iter()
+            .map(|s| {
+                if s.offset == 0 {
+                    0
+                } else {
+                    s.offset * self.strides[s.input_dim]
+                }
+            })
+            .sum();
+        Self::from_parts(self.offset + additional_offset, new_shape, new_strides)
     }
 
     /// Narrow the layout along a given dimension.

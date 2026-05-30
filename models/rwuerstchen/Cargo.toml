@@ -13,7 +13,6 @@ candle-core.workspace = true
 candle-nn.workspace = true
 candle-transformers.workspace = true
 tokenizers.workspace = true
-hf-hub = { version = "0.4.0", default-features = false }
 
 accelerate-src = { version = "0.3.2", optional = true }
 intel-mkl-src = { version = "0.8.1", features = ["mkl-static-lp64-iomp"], optional = true }
@@ -23,14 +22,15 @@ kalosm-common = { workspace = true, features = ["candle"] }
 kalosm-language-model.workspace = true
 kalosm-model-types.workspace = true
 
-futures-util = "0.3.28"
-futures-channel = "0.3.31"
+futures-util = { workspace = true }
+futures-channel = { workspace = true }
 image.workspace = true
 tracing = "0.1.37"
 
 [dev-dependencies]
-tokio = { version = "1.32.0", features = ["full"] }
+pollster = "0.4"
 anyhow.workspace = true
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 
 [features]
 flash = ["candle-transformers/flash-attn"]

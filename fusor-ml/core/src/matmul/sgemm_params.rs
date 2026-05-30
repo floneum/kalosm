@@ -32,7 +32,6 @@ pub fn gemm_parameters(m: usize, n: usize, k: usize) -> SgemmParams {
     let diff_mn = (m - n).abs();
     let diff_nk = (n - k).abs();
     let diff_mk = (m - k).abs();
-    let m_eq_n = if m_u == n_u { 1.0 } else { 0.0 };
     let m_eq_k = if m_u == k_u { 1.0 } else { 0.0 };
     let gcd_mn = gcd(m_u, n_u) as f32;
     let gcd_nk = gcd(n_u, k_u) as f32;
@@ -205,15 +204,9 @@ pub fn gemm_parameters(m: usize, n: usize, k: usize) -> SgemmParams {
         } else {
             SgemmParams::new(false, 32u32, 128u32, 8u32, 4u32, 4u32)
         }
-    } else if log2_k <= 10.5f32 {
-        if m_eq_n <= 0.5f32 {
-            SgemmParams::new(false, 32u32, 64u32, 8u32, 4u32, 4u32)
-        } else {
-            SgemmParams::new(false, 32u32, 64u32, 16u32, 4u32, 4u32)
-        }
-    } else if sum_dim <= 4608f32 {
-        SgemmParams::new(false, 32u32, 32u32, 16u32, 4u32, 4u32)
     } else {
-        SgemmParams::new(false, 64u32, 64u32, 16u32, 4u32, 4u32)
+        // Large matrices (sum_dim > 3264, min_dim > 768):
+        // Use 64 threads, small shared memory, high work-per-thread for Apple Silicon occupancy
+        SgemmParams::new(false, 48u32, 32u32, 8u32, 6u32, 4u32)
     }
 }

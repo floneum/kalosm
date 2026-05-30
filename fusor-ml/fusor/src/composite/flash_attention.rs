@@ -1,21 +1,26 @@
 //! Flash attention operations that work on both CPU and GPU backends.
 
+use crate::cpu::{MatmulImpl, MaxOp, SimdReduceOp, SumOp};
+use crate::gpu::{DataType, FloatDataType};
 use crate::{
     AddOp, ConcreteTensor, DivOp, ExpOp, FloatOps, MulOp, SimdBinaryOp, SimdElement, SimdUnaryOp,
     SubOp, Tensor,
 };
-use fusor_core::{DataType, FloatDataType};
-use fusor_cpu::{MatmulImpl, MaxOp, SimdReduceOp, SumOp};
 
 /// Describes how to interpret a 2D attention mask.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MaskKind {
     /// Mask is [q_seq_len, kv_seq_len] — applied identically to every (batch, head) pair.
-    /// Used for causal masks in decoder models.
+    /// Used for arbitrary additive masks in decoder models.
     QKMask,
     /// Mask is [batch, kv_seq_len] — per-token validity mask broadcast across heads and queries.
     /// Used for padding masks in encoder/embedding models.
     BatchKeyMask,
+    /// Mask is a strict lower-triangular causal mask of shape [seq_len, seq_len].
+    /// The GPU flash-attention kernel can skip the upper-triangle Q·K work
+    /// entirely and does not load the mask tensor at all. Falls back to
+    /// `QKMask` semantics on backends that don't support the optimisation.
+    Causal,
 }
 
 impl<D> Tensor<4, D, ConcreteTensor<D, 4>>
@@ -29,7 +34,8 @@ where
         + std::ops::Add<Output = D>
         + std::ops::Sub<Output = D>
         + std::ops::Mul<Output = D>
-        + std::ops::Div<Output = D>,
+        + std::ops::Div<Output = D>
+        + Copy,
     AddOp: SimdBinaryOp<D>,
     SubOp: SimdBinaryOp<D>,
     MulOp: SimdBinaryOp<D>,
@@ -57,10 +63,28 @@ where
         mask: Option<(&Tensor<2, D, ConcreteTensor<D, 2>>, MaskKind)>,
     ) -> Self {
         match (self, k, v) {
-            // GPU path - use the optimized fused kernel (QKMask only)
+            // GPU path - use the optimized fused kernel (QKMask/Causal only)
+            #[cfg(feature = "gpu")]
             (Tensor::Gpu(q), Tensor::Gpu(k), Tensor::Gpu(v))
                 if !matches!(mask, Some((_, MaskKind::BatchKeyMask))) =>
             {
+                if !q.device().subgroups_supported() {
+                    let cpu_q = tensor4_to_cpu(q);
+                    let cpu_k = tensor4_to_cpu(k);
+                    let cpu_v = tensor4_to_cpu(v);
+                    let cpu_mask = mask.map(|(m, kind)| {
+                        let Tensor::Gpu(mask) = m else {
+                            panic!("Mask must be on the same device as other tensors");
+                        };
+                        (tensor2_to_cpu(mask), kind)
+                    });
+                    let cpu_mask_ref = cpu_mask.as_ref().map(|(mask, kind)| (mask, *kind));
+                    let cpu_output = cpu_q.flash_attention(&cpu_k, &cpu_v, scale, cpu_mask_ref);
+                    return tensor4_to_gpu(cpu_output, q.device());
+                }
+                if matches!(mask, Some((_, MaskKind::Causal))) {
+                    return Tensor::Gpu(q.flash_attention_causal(k, v, scale));
+                }
                 let gpu_mask = mask.map(|(m, _kind)| match m {
                     Tensor::Gpu(mask) => mask,
                     _ => panic!("Mask must be on the same device as other tensors"),
@@ -148,7 +172,7 @@ where
         let scores_masked = if let Some((m, kind)) = mask {
             let m_shape = m.shape();
             let mask_4d: Tensor<4, D, _> = match kind {
-                MaskKind::QKMask => {
+                MaskKind::QKMask | MaskKind::Causal => {
                     // Mask is [q_seq_len, kv_seq_len]
                     assert_eq!(
                         m_shape,
@@ -200,161 +224,61 @@ where
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[tokio::test]
-    async fn test_flash_attention_cpu() {
-        // Test flash attention - 4D tensors [batch, heads, seq, dim]
-        let q_data = vec![1.0f32, 0.0, 0.0, 1.0];
-        let k_data = vec![1.0f32, 0.0, 0.0, 1.0];
-        let v_data = vec![1.0f32, 2.0, 3.0, 4.0];
-
-        let q: Tensor<4, f32> = Tensor::Cpu(fusor_cpu::Tensor::from_slice([1, 1, 2, 2], &q_data));
-        let k: Tensor<4, f32> = Tensor::Cpu(fusor_cpu::Tensor::from_slice([1, 1, 2, 2], &k_data));
-        let v: Tensor<4, f32> = Tensor::Cpu(fusor_cpu::Tensor::from_slice([1, 1, 2, 2], &v_data));
-
-        let scale = 1.0 / (2.0_f32.sqrt());
-
-        let output = q.flash_attention(&k, &v, scale, None);
-        let result = output.as_slice().await.unwrap();
-
-        // Verify output shape
-        assert_eq!(result.shape(), &[1, 1, 2, 2]);
-
-        // Verify output is finite (not NaN or infinity)
-        for i in 0..2 {
-            for j in 0..2 {
-                let val = result[[0, 0, i, j]];
-                assert!(
-                    val.is_finite(),
-                    "Non-finite value at [{}, {}]: {}",
-                    i,
-                    j,
-                    val
-                );
-            }
-        }
-    }
-
-    #[tokio::test]
-    async fn test_flash_attention_cpu_with_mask() {
-        // Test flash attention with causal mask
-        let q_data = vec![1.0f32, 0.0, 0.0, 1.0];
-        let k_data = vec![1.0f32, 0.0, 0.0, 1.0];
-        let v_data = vec![1.0f32, 2.0, 3.0, 4.0];
-
-        let q: Tensor<4, f32> = Tensor::Cpu(fusor_cpu::Tensor::from_slice([1, 1, 2, 2], &q_data));
-        let k: Tensor<4, f32> = Tensor::Cpu(fusor_cpu::Tensor::from_slice([1, 1, 2, 2], &k_data));
-        let v: Tensor<4, f32> = Tensor::Cpu(fusor_cpu::Tensor::from_slice([1, 1, 2, 2], &v_data));
-
-        // Causal mask: [[0, -inf], [0, 0]]
-        let neg_inf = f32::NEG_INFINITY;
-        let mask_data = vec![0.0f32, neg_inf, 0.0, 0.0];
-        let mask: Tensor<2, f32> = Tensor::Cpu(fusor_cpu::Tensor::from_slice([2, 2], &mask_data));
-
-        let scale = 1.0 / (2.0_f32.sqrt());
-
-        let output = q.flash_attention(&k, &v, scale, Some((&mask, MaskKind::QKMask)));
-        let result = output.as_slice().await.unwrap();
-
-        // With causal mask, first row should only attend to first position
-        // So first row output should equal first row of V
-        let tolerance = 0.01;
-        assert!(
-            (result[[0, 0, 0, 0]] - v_data[0]).abs() < tolerance,
-            "First position should attend only to itself with causal mask: got {}, expected {}",
-            result[[0, 0, 0, 0]],
-            v_data[0]
-        );
-        assert!(
-            (result[[0, 0, 0, 1]] - v_data[1]).abs() < tolerance,
-            "First position should attend only to itself with causal mask: got {}, expected {}",
-            result[[0, 0, 0, 1]],
-            v_data[1]
-        );
-    }
-
-    #[tokio::test]
-    async fn test_flash_attention_gqa_cpu() {
-        // Test GQA where K/V have fewer heads than Q
-        // Q: [1, 4, 2, 2] - 4 heads
-        // K/V: [1, 2, 2, 2] - 2 heads (each shared by 2 Q heads)
-        let q_data: Vec<f32> = (0..16).map(|i| (i as f32) * 0.1).collect();
-        let k_data: Vec<f32> = (0..8).map(|i| (i as f32) * 0.1 + 1.0).collect();
-        let v_data: Vec<f32> = (0..8).map(|i| (i as f32) * 0.1 + 2.0).collect();
-
-        let q: Tensor<4, f32> = Tensor::Cpu(fusor_cpu::Tensor::from_slice([1, 4, 2, 2], &q_data));
-        let k: Tensor<4, f32> = Tensor::Cpu(fusor_cpu::Tensor::from_slice([1, 2, 2, 2], &k_data));
-        let v: Tensor<4, f32> = Tensor::Cpu(fusor_cpu::Tensor::from_slice([1, 2, 2, 2], &v_data));
-
-        let scale = 1.0 / (2.0_f32.sqrt());
-
-        let output = q.flash_attention(&k, &v, scale, None);
-        let result = output.as_slice().await.unwrap();
-
-        // Verify output shape matches Q shape
-        assert_eq!(result.shape(), &[1, 4, 2, 2]);
-
-        // Verify output is finite
-        for h in 0..4 {
-            for s in 0..2 {
-                for d in 0..2 {
-                    let val = result[[0, h, s, d]];
-                    assert!(
-                        val.is_finite(),
-                        "Non-finite value at [0, {}, {}, {}]: {}",
-                        h,
-                        s,
-                        d,
-                        val
-                    );
+#[cfg(feature = "gpu")]
+fn tensor4_to_cpu<D>(tensor: &crate::gpu::Tensor<4, D>) -> Tensor<4, D>
+where
+    D: SimdElement + DataType + Copy,
+{
+    let shape = *tensor.shape();
+    let slice = pollster::block_on(tensor.as_slice()).expect("failed to read tensor");
+    let mut values = Vec::with_capacity(shape.iter().product());
+    for b in 0..shape[0] {
+        for h in 0..shape[1] {
+            for s in 0..shape[2] {
+                for d in 0..shape[3] {
+                    values.push(slice[[b, h, s, d]]);
                 }
             }
         }
     }
+    Tensor::Cpu(crate::cpu::TypedTensor::from_slice(shape, &values))
+}
 
-    #[tokio::test]
-    async fn test_flash_attention_cpu_with_batch_key_mask() {
-        // Test flash attention with a BatchKeyMask (padding mask)
-        // batch=2, heads=1, seq_len=3, dim=2
-        // Second sentence has last token masked (padding)
-        let q_data: Vec<f32> = (0..12).map(|i| (i as f32) * 0.1).collect();
-        let k_data: Vec<f32> = (0..12).map(|i| (i as f32) * 0.1 + 1.0).collect();
-        let v_data: Vec<f32> = (0..12).map(|i| (i as f32) * 0.1 + 2.0).collect();
-
-        let q: Tensor<4, f32> = Tensor::Cpu(fusor_cpu::Tensor::from_slice([2, 1, 3, 2], &q_data));
-        let k: Tensor<4, f32> = Tensor::Cpu(fusor_cpu::Tensor::from_slice([2, 1, 3, 2], &k_data));
-        let v: Tensor<4, f32> = Tensor::Cpu(fusor_cpu::Tensor::from_slice([2, 1, 3, 2], &v_data));
-
-        // BatchKeyMask: [batch=2, kv_seq_len=3]
-        // First sentence: all tokens valid. Second sentence: last token is padding.
-        let neg_inf = f32::NEG_INFINITY;
-        let mask_data = vec![0.0f32, 0.0, 0.0, 0.0, 0.0, neg_inf];
-        let mask: Tensor<2, f32> = Tensor::Cpu(fusor_cpu::Tensor::from_slice([2, 3], &mask_data));
-
-        let scale = 1.0 / (2.0_f32.sqrt());
-        let output = q.flash_attention(&k, &v, scale, Some((&mask, MaskKind::BatchKeyMask)));
-        let result = output.as_slice().await.unwrap();
-
-        assert_eq!(result.shape(), &[2, 1, 3, 2]);
-
-        // Verify all values are finite
-        for b in 0..2 {
-            for s in 0..3 {
-                for d in 0..2 {
-                    let val = result[[b, 0, s, d]];
-                    assert!(
-                        val.is_finite(),
-                        "Non-finite value at [{}, 0, {}, {}]: {}",
-                        b,
-                        s,
-                        d,
-                        val
-                    );
+#[cfg(feature = "gpu")]
+fn tensor4_to_gpu<D>(tensor: Tensor<4, D>, device: &crate::gpu::Device) -> Tensor<4, D>
+where
+    D: SimdElement + DataType + Copy,
+{
+    let Tensor::Cpu(tensor) = tensor else {
+        unreachable!("subgroup fallback should produce a CPU tensor");
+    };
+    let shape = tensor.shape();
+    let slice = tensor.as_slice();
+    let mut values = Vec::with_capacity(shape.iter().product());
+    for b in 0..shape[0] {
+        for h in 0..shape[1] {
+            for s in 0..shape[2] {
+                for d in 0..shape[3] {
+                    values.push(slice[[b, h, s, d]]);
                 }
             }
         }
     }
+    Tensor::Gpu(crate::gpu::Tensor::from_slice(device, shape, &values))
+}
+
+#[cfg(feature = "gpu")]
+fn tensor2_to_cpu<D>(tensor: &crate::gpu::Tensor<2, D>) -> Tensor<2, D>
+where
+    D: SimdElement + DataType + Copy,
+{
+    let shape = *tensor.shape();
+    let slice = pollster::block_on(tensor.as_slice()).expect("failed to read tensor");
+    let mut values = Vec::with_capacity(shape.iter().product());
+    for row in 0..shape[0] {
+        for col in 0..shape[1] {
+            values.push(slice[[row, col]]);
+        }
+    }
+    Tensor::Cpu(crate::cpu::TypedTensor::from_slice(shape, &values))
 }

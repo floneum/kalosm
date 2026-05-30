@@ -8,6 +8,7 @@ pub use dasp;
 pub use rodio;
 pub use rwhisper::*;
 
+#[cfg(any(feature = "voice-detection", feature = "denoise"))]
 mod transform;
-#[allow(unused)]
+#[cfg(any(feature = "voice-detection", feature = "denoise"))]
 pub use transform::*;

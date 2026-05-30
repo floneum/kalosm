@@ -1,0 +1,222 @@
+use super::*;
+
+impl<'a> Lowerer<'a> {
+    pub(in crate::lower) fn lower_tile_loop_reduce_value(
+        &self,
+        expressions: &mut Arena<Expression>,
+        scratch: ScratchLocals,
+        body: &mut Block,
+        value: &Expr,
+        spec: TileLoopReduceSpec,
+    ) -> Result<Handle<Expression>, LowerError> {
+        let element = value.element();
+        let acc = self.tile_expr_spill_local(scratch, element, 0)?;
+        let initial = expressions.append(
+            Self::tile_reduce_identity(spec.op, element),
+            Span::default(),
+        );
+        self.store_local(expressions, body, acc, initial);
+
+        let iter_var_local = self.private_local(LocalRef::new(spec.iter_var, ElementType::U32))?;
+        self.emit_counted_loop(
+            expressions,
+            scratch,
+            body,
+            spec.iterations,
+            |expressions, loop_body, loop_index| {
+                // Bind the loop's iter_var local so the value expression's
+                // LoadLocal(iter_var) references resolve to the current index.
+                self.store_local(expressions, loop_body, iter_var_local, loop_index);
+                // Cache entries reference values scoped to the outer block. Snapshot
+                // expression-handle caches, but drop q8 activation locals because the
+                // loop body may overwrite the shared scratch slots.
+                let saved = self.snapshot_tile_loop_caches();
+                let value = self.lower_tile_expr_lane(
+                    expressions,
+                    scratch,
+                    loop_body,
+                    value,
+                    spec.spill_depth + 1,
+                )?;
+                self.restore_tile_loop_caches(saved);
+                let acc_ptr = self.local_var(expressions, acc);
+                let acc_value = Self::emit_load(expressions, loop_body, acc_ptr);
+                let reduced = self.emit(
+                    expressions,
+                    loop_body,
+                    Self::tile_reduce_expression(spec.op, acc_value, value),
+                );
+                self.store_local(expressions, loop_body, acc, reduced);
+                Ok(())
+            },
+        )?;
+
+        let acc_ptr = self.local_var(expressions, acc);
+        Ok(Self::emit_load(expressions, body, acc_ptr))
+    }
+
+    pub(in crate::lower) fn lower_tile_reduce_value(
+        &self,
+        expressions: &mut Arena<Expression>,
+        body: &mut Block,
+        value: Handle<Expression>,
+        scratch_tile: TileRef,
+        op: TileReduceOp,
+        group_size: u32,
+    ) -> Result<Handle<Expression>, LowerError> {
+        if group_size == 0
+            || !group_size.is_power_of_two()
+            || group_size > self.workgroup_invocations
+            || !self.workgroup_invocations.is_multiple_of(group_size)
+        {
+            return Err(LowerError::UnsupportedOperation(
+                "tile reduce requires a power-of-two group size that divides the block",
+            ));
+        }
+
+        let lane = Self::function_arg(expressions, LOCAL_INVOCATION_INDEX_ARG);
+        let lane_ptr = self.tile_dynamic_pointer(expressions, scratch_tile, lane, body)?;
+        body.push(
+            Statement::Store {
+                pointer: lane_ptr,
+                value,
+            },
+            Span::default(),
+        );
+        body.push(
+            Statement::ControlBarrier(Barrier::WORK_GROUP),
+            Span::default(),
+        );
+
+        let (compare_index, result_index) = if group_size == self.workgroup_invocations {
+            let zero = self.u32(expressions, 0);
+            (lane, zero)
+        } else {
+            let group_offset = self.mod_literal_u32_emitted(expressions, lane, group_size, body);
+            let group_base = self.emit(
+                expressions,
+                body,
+                Expression::Binary {
+                    op: BinaryOperator::Subtract,
+                    left: lane,
+                    right: group_offset,
+                },
+            );
+            (group_offset, group_base)
+        };
+
+        let mut stride = group_size / 2;
+        while stride > 0 {
+            let limit = self.u32(expressions, stride);
+            let participates = self.emit(
+                expressions,
+                body,
+                Expression::Binary {
+                    op: BinaryOperator::Less,
+                    left: compare_index,
+                    right: limit,
+                },
+            );
+            let accept =
+                self.lower_tile_reduce_step(expressions, scratch_tile, lane, stride, op)?;
+            body.push(
+                Statement::If {
+                    condition: participates,
+                    accept,
+                    reject: Block::new(),
+                },
+                Span::default(),
+            );
+            body.push(
+                Statement::ControlBarrier(Barrier::WORK_GROUP),
+                Span::default(),
+            );
+            stride /= 2;
+        }
+
+        let result_ptr =
+            self.tile_dynamic_pointer(expressions, scratch_tile, result_index, body)?;
+        Ok(Self::emit_load(expressions, body, result_ptr))
+    }
+
+    pub(in crate::lower) fn lower_tile_reduce_step(
+        &self,
+        expressions: &mut Arena<Expression>,
+        scratch_tile: TileRef,
+        lane: Handle<Expression>,
+        stride: u32,
+        op: TileReduceOp,
+    ) -> Result<Block, LowerError> {
+        let mut body = Block::new();
+        let rhs_index = self.add_literal_u32_emitted(expressions, lane, stride, &mut body);
+        let lhs_ptr = self.tile_dynamic_pointer(expressions, scratch_tile, lane, &mut body)?;
+        let rhs_ptr = self.tile_dynamic_pointer(expressions, scratch_tile, rhs_index, &mut body)?;
+        let lhs = Self::emit_load(expressions, &mut body, lhs_ptr);
+        let rhs = Self::emit_load(expressions, &mut body, rhs_ptr);
+        let reduced = self.emit(
+            expressions,
+            &mut body,
+            Self::tile_reduce_expression(op, lhs, rhs),
+        );
+        body.push(
+            Statement::Store {
+                pointer: lhs_ptr,
+                value: reduced,
+            },
+            Span::default(),
+        );
+        Ok(body)
+    }
+
+    pub(in crate::lower) fn lower_tile_subgroup_reduce_value(
+        &self,
+        expressions: &mut Arena<Expression>,
+        body: &mut Block,
+        value: Handle<Expression>,
+        op: TileReduceOp,
+        element: ElementType,
+    ) -> Result<Handle<Expression>, LowerError> {
+        let subgroup_op = match op {
+            TileReduceOp::Sum => SubgroupOperation::Add,
+            TileReduceOp::Product => SubgroupOperation::Mul,
+            TileReduceOp::Max => SubgroupOperation::Max,
+            TileReduceOp::Min => SubgroupOperation::Min,
+        };
+        let result_ty = match element {
+            ElementType::F32 => self.f32_ty,
+            ElementType::F16 => self.f16_ty.ok_or(LowerError::UnsupportedOperation(
+                "subgroup reduce on f16 requires f16 capability",
+            ))?,
+            ElementType::U32 => self.u32_ty,
+            ElementType::Vector { .. } => {
+                return Err(LowerError::UnsupportedOperation(
+                    "subgroup reduce on vector values is not supported",
+                ));
+            }
+            ElementType::Bool => {
+                return Err(LowerError::UnsupportedOperation(
+                    "subgroup reduce on bool values is not supported",
+                ));
+            }
+            ElementType::CoopMatrix { .. } => {
+                return Err(LowerError::UnsupportedOperation(
+                    "subgroup reduce on cooperative-matrix values is not supported",
+                ));
+            }
+        };
+        let result = expressions.append(
+            Expression::SubgroupOperationResult { ty: result_ty },
+            Span::default(),
+        );
+        body.push(
+            Statement::SubgroupCollectiveOperation {
+                op: subgroup_op,
+                collective_op: CollectiveOperation::Reduce,
+                argument: value,
+                result,
+            },
+            Span::default(),
+        );
+        Ok(result)
+    }
+}

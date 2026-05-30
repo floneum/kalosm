@@ -290,17 +290,8 @@ where
 
 #[derive(Clone, Copy, Debug)]
 struct Task {
-    task_type: TaskType,
     word_level_time_stamps: bool,
     without_timestamps: bool,
-}
-
-#[allow(dead_code)]
-#[derive(Clone, Copy, Debug)]
-enum TaskType {
-    Transcribe,
-    Translate,
-    Unset,
 }
 
 /// A builder with configuration for a Whisper model.

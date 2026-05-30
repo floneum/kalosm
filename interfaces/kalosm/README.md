@@ -393,9 +393,9 @@ use kalosm::vision::*;
 
 #[tokio::main]
 async fn main() {
-    let model = SegmentAnything::builder().build().unwrap();
+    let model = SegmentAnything::builder().build().await.unwrap();
     let image = image::open("examples/landscape.jpg").unwrap();
-    let images = model.segment_everything(image).unwrap();
+    let images = model.segment_everything(image).await.unwrap();
     for (i, img) in images.iter().enumerate() {
         img.save(&format!("{}.png", i)).unwrap();
     }

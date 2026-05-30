@@ -91,7 +91,7 @@ impl QwenSelfAttention {
         // The mask should be [b_sz, seq_len] where 1 = valid, 0 = pad
         // Flash attention expects None for no mask, or a mask tensor
         // Note: We use a large negative value instead of NEG_INFINITY because
-        // WGSL shaders don't support inf literals. -10000 is enough to effectively
+        // the GPU shader path does not support inf literals. -10000 is enough to effectively
         // zero out masked positions after softmax.
         const MASK_NEG_VALUE: f32 = -10000.0;
         let mask: Option<Tensor<2, f32>> = attention_mask.map(|m| {

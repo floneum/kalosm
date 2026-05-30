@@ -168,7 +168,6 @@ impl GlinerBuilder {
     }
 
     /// Set the cache location.
-    #[cfg(feature = "tokio")]
     pub fn with_cache(mut self, cache: Cache) -> Self {
         self.cache = cache;
         self

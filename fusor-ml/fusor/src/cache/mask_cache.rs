@@ -1,7 +1,7 @@
 //! Mask cache implementation for efficient attention mask management.
 
+use crate::gpu::FloatDataType;
 use crate::{ConcreteTensor, Device, SimdElement, Tensor};
-use fusor_core::FloatDataType;
 
 use super::AttentionMask;
 
@@ -24,7 +24,8 @@ impl<D: SimdElement> Default for MaskCache<D> {
 
 impl<D: SimdElement + FloatDataType + Default> MaskCache<D>
 where
-    crate::AddOp: fusor_cpu::SimdBinaryOp<D>,
+    crate::AddOp: crate::cpu::SimdBinaryOp<D>,
+    D: Copy,
 {
     /// Get or create a causal mask for the given sequence length
     ///
@@ -71,7 +72,8 @@ where
 
         // If we have an offset, we need to pad the mask
         if seqlen_offset > 0 {
-            // Pad the mask on the left with zeros
+            // Pad the mask on the left with zeros — no longer a pure
+            // strict-lower-triangular causal mask, so don't mark it as such.
             let mask_tensor = mask.mask();
             let [rows, cols] = mask_tensor.shape();
             let zeros: Tensor<2, D> = Tensor::zeros(device, [rows, seqlen_offset + cols]);
@@ -103,74 +105,15 @@ where
         }
 
         let mask: Tensor<2, D, ConcreteTensor<D, 2>> = match device {
-            Device::Cpu => Tensor::Cpu(fusor_cpu::Tensor::from_slice(
+            Device::Cpu => Tensor::Cpu(crate::cpu::TypedTensor::from_slice(
                 [seq_len, seq_len],
                 &mask_data,
             )),
             Device::Gpu(gpu) => {
                 let data_chunks: Vec<&[D]> = mask_data.chunks(seq_len).collect();
-                Tensor::Gpu(fusor_core::Tensor::new(gpu, data_chunks))
+                Tensor::Gpu(crate::gpu::Tensor::new(gpu, data_chunks))
             }
         };
         AttentionMask::new(mask)
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[tokio::test]
-    async fn test_mask_cache() {
-        let device = Device::cpu();
-        let cache: MaskCache<f32> = MaskCache::default();
-
-        let mask1 = cache.get_mask(3, 0, None, &device);
-        let mask2 = cache.get_mask(3, 0, None, &device);
-
-        // Should be cached (same shape)
-        assert_eq!(mask1.mask().shape(), [3, 3]);
-        assert_eq!(mask2.mask().shape(), [3, 3]);
-
-        let mask3 = cache.get_mask(5, 0, None, &device);
-        assert_eq!(mask3.mask().shape(), [5, 5]);
-    }
-
-    #[tokio::test]
-    async fn test_mask_cache_with_offset() {
-        let device = Device::cpu();
-        let cache: MaskCache<f32> = MaskCache::default();
-
-        // Test with seqlen_offset
-        let mask = cache.get_mask(2, 3, None, &device);
-        // Mask should be padded: [2, 3+2] = [2, 5]
-        assert_eq!(mask.mask().shape(), [2, 5]);
-    }
-
-    #[tokio::test]
-    async fn test_mask_cache_sliding_window() {
-        let device = Device::cpu();
-        let cache: MaskCache<f32> = MaskCache::default();
-
-        let mask = cache.get_mask(4, 0, Some(2), &device);
-        assert_eq!(mask.mask().shape(), [4, 4]);
-
-        let mask_data = mask.mask().clone().as_slice().await.unwrap();
-
-        // Should match the sliding window pattern:
-        // Row 0: [0, -inf, -inf, -inf] (can only attend to self)
-        // Row 1: [0, 0, -inf, -inf] (can attend to 0,1)
-        // Row 2: [-inf, 0, 0, -inf] (can attend to 1,2 - sliding window of 2)
-        // Row 3: [-inf, -inf, 0, 0] (can attend to 2,3 - sliding window of 2)
-        assert_eq!(mask_data[[0, 0]], 0.0);
-        assert_eq!(mask_data[[0, 1]], f32::NEG_INFINITY);
-        assert_eq!(mask_data[[1, 0]], 0.0);
-        assert_eq!(mask_data[[1, 1]], 0.0);
-        assert_eq!(mask_data[[2, 0]], f32::NEG_INFINITY);
-        assert_eq!(mask_data[[2, 1]], 0.0);
-        assert_eq!(mask_data[[2, 2]], 0.0);
-        assert_eq!(mask_data[[3, 1]], f32::NEG_INFINITY);
-        assert_eq!(mask_data[[3, 2]], 0.0);
-        assert_eq!(mask_data[[3, 3]], 0.0);
     }
 }
