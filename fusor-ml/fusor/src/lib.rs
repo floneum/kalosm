@@ -37,17 +37,6 @@ pub use error::Error;
 pub use fusion::{Concrete, Fusion};
 pub use fusor_types::{D, Dim, FromArray, Layout, StrideSpec};
 
-#[cfg(test)]
-pub(crate) async fn gpu_device_for_test() -> Option<Device> {
-    match Device::new().await {
-        Ok(device) => Some(device),
-        Err(err) => {
-            eprintln!("skipping GPU-only test: {err}");
-            None
-        }
-    }
-}
-
 /// Result type for fusor operations.
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 use fusor_types::TensorSlice;

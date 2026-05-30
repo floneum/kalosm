@@ -188,7 +188,7 @@ fn get_rel_pos(
     let k_scale = f32::max(1.0, q_size as f32 / k_size as f32);
     let offset = (k_size as f32 - 1.0) * q_scale;
 
-    // Compute relative coordinate indices entirely on the CPU — these are
+    // Compute relative coordinate indices entirely on the CPU - these are
     // deterministic integer offsets derived from q_size and k_size.
     let rc_data: Vec<u32> = (0..q_size)
         .flat_map(|q| {

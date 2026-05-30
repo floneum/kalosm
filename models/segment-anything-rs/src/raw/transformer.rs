@@ -188,7 +188,7 @@ impl TwoWayAttentionBlock {
 }
 
 /// Two-way attention transformer used inside `MaskDecoder`. Alternates
-/// token→image and image→token cross-attention. `forward` takes
+/// token-to-image and image-to-token cross-attention. `forward` takes
 /// `(image_embedding: (B, C, H, W), image_pe: (B, C, H, W), point_embedding:
 /// (B, N, C))` and returns the updated `(queries, keys)` 3D tensors.
 pub struct TwoWayTransformer {

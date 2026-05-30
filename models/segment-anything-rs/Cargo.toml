@@ -10,11 +10,9 @@ keywords = ["ai", "segment-anything", "segmentation", "computer-vision"]
 
 [dependencies]
 fusor = { workspace = true, features = ["cpu", "gpu"] }
-fusor-gguf = { workspace = true }
-hf-hub = { version = "0.4.0" }
+kalosm-common = { workspace = true }
+kalosm-model-types.workspace = true
 thiserror.workspace = true
-
-tracing = "0.1.37"
 image.workspace = true
 
 [features]
@@ -25,4 +23,3 @@ metal = []
 
 [dev-dependencies]
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
-pollster = "0.4"

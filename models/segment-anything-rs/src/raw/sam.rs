@@ -12,7 +12,7 @@ const PROMPT_EMBED_DIM: usize = 256;
 /// The expected image size (both width and height) for the SAM model.
 pub const IMAGE_SIZE: usize = 1024;
 /// Patch size for the standard ViT image encoder. The TinyViT/MobileSAM encoder
-/// also happens to downsample by 16 across its full stride stack — we rely on
+/// also happens to downsample by 16 across its full stride stack - we rely on
 /// this coincidence so a single `IMAGE_SIZE / VIT_PATCH_SIZE` constant works
 /// for the prompt-encoder geometry. SAM2 variants must NOT reuse this constant.
 const VIT_PATCH_SIZE: usize = 16;
@@ -353,7 +353,7 @@ fn build_point_tensors(
     (pts, lbls)
 }
 
-/// Build a uniform `n_per_side × n_per_side` grid of normalized `(x, y)`
+/// Build a uniform `n_per_side` by `n_per_side` grid of normalized `(x, y)`
 /// coordinates in `(0, 1)`. Used as the prompt grid for `segment_everything`.
 pub(crate) fn build_point_grid(n_per_side: usize) -> Vec<(f64, f64)> {
     let offset = 1f64 / (2 * n_per_side) as f64;

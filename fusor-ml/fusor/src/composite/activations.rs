@@ -7,7 +7,7 @@ use crate::{
 };
 
 /// Maximum |x| fed to `tanh` on GPU before WGSL's `(e^x - e^-x) / (e^x + e^-x)`
-/// implementation overflows f32. tanh is saturated outside ±10 anyway.
+/// implementation overflows f32. tanh is saturated outside +/-10 anyway.
 const TANH_INPUT_CLAMP: f32 = 15.0;
 /// Lower clamp on `1 + tanh(x)`; mathematically the value lives in [0, 2] but
 /// driver-specific tanh precision can drift slightly below 0.
@@ -89,7 +89,7 @@ where
         let tanh_input = inner * coeff;
 
         // WGSL's tanh(x) computes (e^x - e^-x)/(e^x + e^-x); e^x overflows f32
-        // for x > ~88, producing NaN on GPU. For |x| > 10, tanh(x) ≈ ±1, so
+        // for x > ~88, producing NaN on GPU. For |x| > 10, tanh(x) ~= +/-1, so
         // clamping to TANH_INPUT_CLAMP is mathematically inert but prevents NaN.
         let tanh_input = tanh_input.clamp(
             D::from_f32(-TANH_INPUT_CLAMP),
@@ -101,7 +101,7 @@ where
             .tanh_exact()
             .clamp(D::from_f32(-1.0), D::from_f32(1.0));
 
-        // 1 + tanh(...) — mathematically in [0, 2]. Clamp defensively against
+        // 1 + tanh(...) - mathematically in [0, 2]. Clamp defensively against
         // driver-specific tanh precision that can return values slightly outside [-1, 1].
         let one_plus_tanh = (&tanh_result + D::from_f32(1.0)).clamp(
             D::from_f32(ONE_PLUS_TANH_MIN),

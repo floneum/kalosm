@@ -2,16 +2,12 @@
 //!
 //! # GGUF tensor naming contract
 //!
-//! Weights are loaded from GGUF files produced by `convert_to_gguf.py`. The
-//! Rust loader keys off these conventions; changing them on either side will
-//! silently mis-load:
+//! Weights are loaded from GGUF files using these tensor naming conventions;
+//! changing them will silently mis-load:
 //!
-//! - The architecture is detected by `convert_to_gguf.py` from the substring
-//!   `"patch_embed.seq"` in the source state-dict (TinyViT / MobileSAM) vs.
-//!   the standard ViT-B layout.
 //! - TinyViT's fused `Conv2dBN` blocks expect a single tensor name with
 //!   `.c.weight` (conv) and `.bn.weight` / `.bn.bias` (batch-norm) suffixes;
-//!   the converter folds the BN stats into the conv kernel before writing.
+//!   the GGUF weights fold the BN stats into the conv kernel.
 //! - All other naming is the upstream Meta SegmentAnything PyTorch layout
 //!   (`image_encoder.*`, `prompt_encoder.*`, `mask_decoder.*`).
 

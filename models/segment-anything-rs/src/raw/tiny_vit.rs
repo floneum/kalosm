@@ -576,7 +576,7 @@ impl BasicLayer {
 /// TinyViT image encoder used by Mobile-SAM.
 ///
 /// `forward` takes a `(B, 3, IMG_SIZE, IMG_SIZE)` input and returns
-/// `(B, neck_dim, IMG_SIZE/16, IMG_SIZE/16)` features — same output shape as
+/// `(B, neck_dim, IMG_SIZE/16, IMG_SIZE/16)` features - same output shape as
 /// the standard `ImageEncoderViT` so both can plug into the prompt encoder.
 pub struct TinyViT {
     pub(crate) patch_embed: PatchEmbed,
@@ -681,7 +681,7 @@ impl TinyViT {
 
         // Reshape from BLC to BCHW. After all stages, L = (IMG_SIZE / total_stride)^2.
         // We assume a square spatial layout (h == w) and derive it from L at
-        // runtime rather than hard-coding 64×64 for the 1024-px Mobile-SAM.
+        // runtime rather than hard-coding 64 by 64 for the 1024-px Mobile-SAM.
         let shape = xs.shape();
         let b = shape[0];
         let l = shape[1];
