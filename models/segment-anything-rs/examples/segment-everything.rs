@@ -10,7 +10,7 @@ async fn main() {
     let image_path =
         std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/landscape.jpg");
     let image = image::open(&image_path).unwrap();
-    let masks = model.segment_everything(image.clone()).await.unwrap();
+    let masks = model.segment_everything(image).await.unwrap();
 
     for (i, mask) in masks.iter().enumerate() {
         mask.save(format!("{i}.png")).unwrap();

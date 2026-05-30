@@ -25,8 +25,7 @@ const UPSCALE_KERNEL_HW: [usize; 2] = [2, 2];
 /// Mathematically equivalent to `ConvTranspose2d(in, out, kernel=2, stride=2)`,
 /// but implemented as a `(in_ch, out_ch * 4)` matmul followed by a
 /// pixel-shuffle because stride == kernel means output windows never overlap
-/// (so no per-pixel accumulation is required). The equivalence to
-/// `ConvTranspose2d` is locked down by `test_upscale_matches_conv_transpose`.
+/// (so no per-pixel accumulation is required).
 ///
 /// This is intentionally local to the SAM port rather than exposed as a generic
 /// `fusor` layer.
