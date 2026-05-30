@@ -19,9 +19,7 @@ members = [
     "models/kalosm-llama",
     "models/kalosm-tokenizer",
     "models/rwhisper",
-    "models/rwuerstchen",
     "models/segment-anything-rs",
-    "models/kalosm-ocr",
     "interfaces/kalosm",
     "interfaces/kalosm-language",
     "interfaces/language-model",
@@ -29,8 +27,6 @@ members = [
     "interfaces/kalosm-vision",
     "interfaces/kalosm-sound",
     "interfaces/kalosm-streams",
-    "interfaces/kalosm-learning",
-    "interfaces/kalosm-learning-macro",
     "interfaces/kalosm-parse-macro",
     "interfaces/kalosm-common",
     "interfaces/kalosm-model-types",
@@ -60,15 +56,11 @@ kalosm-streams = { path = "./interfaces/kalosm-streams", version = "0.4.0" }
 kalosm-language = { path = "./interfaces/kalosm-language", version = "0.4.0", default-features = false }
 kalosm-sound = { path = "./interfaces/kalosm-sound", version = "0.4.0", default-features = false }
 kalosm-vision = { path = "./interfaces/kalosm-vision", version = "0.4.0", default-features = false }
-kalosm-learning = { path = "./interfaces/kalosm-learning", version = "0.4.0" }
-kalosm-learning-macro = { path = "./interfaces/kalosm-learning-macro", version = "0.4.0" }
 rbert = { path = "./models/rbert", version = "0.4.0", default-features = false }
 kalosm-llama = { path = "./models/kalosm-llama", version = "0.4.0", default-features = false }
 kalosm-tokenizer = { path = "./models/kalosm-tokenizer", version = "0.4.0" }
 rwhisper = { path = "./models/rwhisper", version = "0.4.0", default-features = false }
-rwuerstchen = { path = "./models/rwuerstchen", version = "0.4.0" }
 segment-anything-rs = { path = "./models/segment-anything-rs", version = "0.5.0" }
-kalosm-ocr = { path = "./models/kalosm-ocr", version = "0.4.0" }
 fusor = { path = "./fusor-ml/fusor", version = "0.1.0", default-features = false }
 fusor-core = { path = "./fusor-ml/core", version = "0.1.0" }
 fusor-gguf = { path = "./fusor-ml/gguf", version = "0.1.0" }
@@ -254,11 +246,6 @@ path = "interfaces/kalosm/examples/evaluation.rs"
 required-features = ["bert", "llama", "chunking", "evaluation", "tracing-subscriber"]
 
 [[example]]
-name = "generate-image"
-path = "interfaces/kalosm/examples/generate-image.rs"
-required-features = ["vision", "futures-util"]
-
-[[example]]
 name = "generate-text"
 path = "interfaces/kalosm/examples/generate-text.rs"
 required-features = ["llama", "tracing-subscriber"]
@@ -314,11 +301,6 @@ required-features = [
     "anyhow",
     "tracing-subscriber",
 ]
-
-[[example]]
-name = "ocr"
-path = "interfaces/kalosm/examples/ocr.rs"
-required-features = ["vision", "image"]
 
 [[example]]
 name = "phi-3"
